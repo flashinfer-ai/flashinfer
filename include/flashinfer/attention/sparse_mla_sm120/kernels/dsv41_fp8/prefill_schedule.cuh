@@ -45,7 +45,7 @@ struct Dsv41MixedCachePrefillSchedule
                                                                      local);
         }
         if (!sec.extra && role_tid < BI)
-          *reinterpret_cast<uint4*>(sm.kv_scale_bufs[buf] + role_tid * KV::SCALE_BYTES_PER_TOKEN) =
+          *reinterpret_cast<uint4*>(sm.kv_scale_buf(buf) + role_tid * KV::SCALE_BYTES_PER_TOKEN) =
               __ldg(reinterpret_cast<const uint4*>(scales));
         __threadfence_block();
         GatherSync::wait();
@@ -60,7 +60,7 @@ struct Dsv41MixedCachePrefillSchedule
             cp_async_bulk_g2s_l2hint(raw + RAW_SCALE_OFFSET + role_tid * Raw::SCALE_BYTES, scales,
                                      Raw::SCALE_BYTES, ready + buf, policy);
           } else {
-            cp_async_bulk_g2s_l2hint(sm.kv_bufs[buf] + role_tid * KV::KV_SMEM_STRIDE, data,
+            cp_async_bulk_g2s_l2hint(sm.kv_buf(buf) + role_tid * KV::KV_SMEM_STRIDE, data,
                                      KV::D_NOPE, sm.mbar_kv + buf, policy);
           }
         }
@@ -75,8 +75,8 @@ struct Dsv41MixedCachePrefillSchedule
         if (sec.extra) {
           Transaction::wait(ready + buf, Cursor::phase(extra_tile++));
           if (Cursor::reuses(tile)) KvFree::acquire(buf);
-          kernels::dsv41_fp8::convert_raw<Plan>(Plan::raw(scratch, buf), sm.kv_bufs[buf],
-                                                sm.kv_scale_bufs[buf], role_tid,
+          kernels::dsv41_fp8::convert_raw<Plan>(Plan::raw(scratch, buf), sm.kv_buf(buf),
+                                                sm.kv_scale_buf(buf), role_tid,
                                                 [&](int row) { return sec.index(row, BI) >= 0; });
         }
         RawFree::release(buf);

@@ -28,13 +28,10 @@
 
 """Analytical ``chunks_per_block`` model for SM120 sparse-MLA decode kernels.
 
-The old per-shape sweep profiled with synthetic indices drawn from a tiny
-pool, so the working set was L2-resident and the tuned cpb was distorted on
-some GPUs. Instead, six fixed measurements calibrate three hardware
-constants once per device (in ``autotune()`` tuning mode), and a closed-form
-model picks cpb per call, with an L2-footprint guard rail for the head-tile
-reuse window (see :func:`select_cpb`). Without calibrated constants the
-launcher's built-in heuristic is used.
+Explicit analytical calibration fits hardware constants from six measurements.
+The closed-form model estimates CPB when no matching configuration profile is
+available, with an L2-footprint guard for the head-tile reuse window
+(see :func:`select_cpb`). Without constants the launcher's heuristic is used.
 
 The model prices a call as the exact list-scheduling makespan of its active
 blocks on ``sm_count`` SMs (see :func:`predict_time_s`): blocks of a split
@@ -47,25 +44,15 @@ round, the sawtooth the ceil form cannot see — and whose ``beta`` merge term
 was unidentifiable from the measurement grid (it fit to zero on every
 family, and non-zero values poisoned the latency-regime picks).
 
-The same tuning-mode pass also measures the decode/prefill crossover per
-decode-instantiated ``(num_heads, topk)`` config (:func:`calibrate_crossover`)
-and persists it as ``decode_max_tokens`` in the same JSON document (schema
-version 3; only current-schema files load — files at any other version count
-as absent, so their families recalibrate on the next tuning-mode pass). The
-runtime decode/prefill routing in :mod:`._policy` consults it;
-absent entries keep the historical decode-first policy.
-
-Finally, tuning-mode decode-form calls refine the model's cpb pick for the
-exact shape being warmed (:func:`refine_cpb`): the pick +/- a small candidate
-window is timed and the measured best persists as a per-shape override. The
-model remains the proposal and the fallback for every shape never warmed
-(off-grid ``num_heads``, dual-cache calls, non-tuning processes).
-
-DSV4.1 and NVFP4 skip the analytical model: each exact cache configuration
-stores one measured per-bucket profile (:func:`_calibrate_dsv41`). Tuning-mode
-DSV4.1 selection of an off-grid token count measures that count once
-(:func:`refine_dsv41`), and the exact entry then takes priority over
-nearest-up bucket interpolation.
+Ordinary execution consumes configuration-keyed profiles with eight independent
+token buckets (:func:`_calibrate_ordinary`). Tuning-mode selection of an off-grid
+token count measures that count once (:func:`refine_ordinary`); exact entries
+precede nearest-up bucket interpolation. These profiles are the only measured
+phase/CPB source. The sampler and eligibility check share :func:`profile_layout`.
+Legal layouts outside that sample use analytical estimates or the C++ heuristic.
+Legacy crossover and exact-override helpers remain available for explicit
+experiments, but execution neither reads nor starts them. NVFP4 keeps its
+independently owned profiles.
 """
 
 from __future__ import annotations
@@ -96,8 +83,8 @@ _HPB = 16  # head tile per block
 
 _SCHEMA_VERSION = 3
 # v3: NVFP4 selections moved from phase-encoded crossover/override entries to
-# per-bucket profile records, and DSV4.1 profiles may carry refined exact-T
-# entries. Only current-schema files load; stale families recalibrate.
+# per-bucket profile records. Ordinary profiles carry variants 0..4 and exact-T
+# entries. This unreleased schema is not shared with older development checkouts.
 
 _CALIBRATION_MODELS = {
     family: model for model, family in MODEL_FAMILIES.items() if family != "glm_nsa"
@@ -155,7 +142,7 @@ _MEASUREMENTS = (
 # glm53_nope decode is instantiated at topk=2176 only (N=34 chunks, fixed),
 # so M1/M2 isolate the streaming term by varying cpb (17 vs 33) at identical
 # token/head counts instead of varying N. The wide cpb gap keeps the signal
-# well above min-of-iters timing noise. M5 is the latency point.
+# well above timing noise. M5 is the latency point.
 _MEASUREMENTS_GLM53_NOPE = (
     (64, 64, 2176, 17),
     (64, 64, 2176, 33),
@@ -188,9 +175,10 @@ _MEASUREMENTS_DOTS3_SWA = (
 _POOL_BYTES_TARGET = 2 << 30  # >> L2, so calibration traffic is DRAM-faithful
 _POOL_BYTES_MIN = 512 << 20
 _WARMUP_ITERS = 3
-# Rotation grows with device L2 and is bounded by index memory, not call count.
 _TIMED_BATCHES = 5
-_MIN_BATCH_CALLS = 8
+_MIN_BATCH_CALLS = 10
+_TIMING_PROTOCOL = "cold_l2_per_call_graph_v1"
+_SAMPLE_KIND = "full_capacity_canonical_layout_cold_l2_per_call"
 
 
 class CalibrationError(RuntimeError):
@@ -480,15 +468,89 @@ def calibration_batch_count(
     *,
     max_batch_calls: int | None = None,
 ) -> int:
-    """Number of rotating index sets needed to evict one call's KV footprint."""
-    l2 = _device_l2(device)
-    footprint = max(1, num_tokens * total_topk * bytes_per_token)
-    count = max(_MIN_BATCH_CALLS, l2 // footprint + 2)
+    """Fixed sample count; cache eviction is independent of index reuse."""
+    _device_l2(device)
+    count = _MIN_BATCH_CALLS
     if max_batch_calls is not None and count > max_batch_calls:
-        raise CalibrationError("calibration batch cap cannot satisfy L2 reuse distance")
+        raise CalibrationError("calibration batch cap cannot satisfy sample count")
     if count * num_tokens * total_topk * 4 > 64 << 20:
-        raise CalibrationError("calibration rotation exceeds 64 MiB index budget")
+        raise CalibrationError("calibration samples exceed 64 MiB index budget")
     return count
+
+
+class _ColdCallGraph:
+    """Stable per-call external-event intervals, each preceded by L2 eviction.
+
+    The random int32 buffer is four times the queried L2 capacity. In-place
+    addition reads and writes every element without producing compressible
+    constant cache lines. Eviction is capacity traffic, not a cache invalidate.
+    """
+
+    def __init__(self, call, argument_sets, device):
+        if not argument_sets:
+            raise ValueError("calibration requires at least one argument set")
+        self.device = device
+        self.call = call
+        self.argument_sets = argument_sets
+        with torch.cuda.device(device):
+            if torch.cuda.is_current_stream_capturing():
+                raise CalibrationError(
+                    "calibration timing must not run under CUDA graph capture"
+                )
+            l2 = _device_l2(device)
+            props = torch.cuda.get_device_properties(device)
+            if int(getattr(props, "multi_processor_count", 0) or 0) <= 0:
+                raise CalibrationError("calibration requires a queried device SM count")
+            self.stream = torch.cuda.Stream(device=device)
+            self.stream.wait_stream(torch.cuda.current_stream(device))
+            with torch.cuda.stream(self.stream):
+                try:
+                    self.eviction = torch.randint(
+                        -(1 << 31),
+                        1 << 31,
+                        (l2,),
+                        dtype=torch.int32,
+                        device=device,
+                        generator=torch.Generator(device=device).manual_seed(17),
+                    )
+                except torch.cuda.OutOfMemoryError as error:
+                    raise CalibrationError(
+                        "cannot allocate 4xL2 eviction buffer"
+                    ) from error
+                for i in range(_WARMUP_ITERS):
+                    self.eviction.add_(1)
+                    call(*argument_sets[i % len(argument_sets)])
+                self.events = [
+                    (
+                        torch.cuda.Event(enable_timing=True, external=True),
+                        torch.cuda.Event(enable_timing=True, external=True),
+                    )
+                    for _ in argument_sets
+                ]
+                for start, end in self.events:
+                    start.record(self.stream)
+                    end.record(self.stream)
+                self.stream.synchronize()
+                self.graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(self.graph, stream=self.stream):
+                    for args, (start, end) in zip(
+                        argument_sets, self.events, strict=True
+                    ):
+                        self.eviction.add_(1)
+                        start.record(self.stream)
+                        call(*args)
+                        end.record(self.stream)
+            self.sample()
+
+    def sample(self) -> list[float]:
+        """Replay once and read every seconds/call sample before event reuse."""
+        with torch.cuda.device(self.device), torch.cuda.stream(self.stream):
+            self.graph.replay()
+            self.stream.synchronize()
+            samples = [start.elapsed_time(end) / 1e3 for start, end in self.events]
+        if any(not math.isfinite(value) or value <= 0 for value in samples):
+            raise CalibrationError("invalid per-call CUDA event duration")
+        return samples
 
 
 def time_calibration_calls(
@@ -496,29 +558,24 @@ def time_calibration_calls(
     argument_sets: list[tuple[Any, ...]],
     device: torch.device,
 ) -> float:
-    """Return steady-state seconds/call on the target device's current stream."""
-    if not argument_sets:
-        raise ValueError("calibration requires at least one argument set")
-    with torch.cuda.device(device):
-        if torch.cuda.is_current_stream_capturing():
-            raise CalibrationError(
-                "calibration timing must not run under CUDA graph capture"
-            )
-        stream = torch.cuda.current_stream(device)
-        for i in range(_WARMUP_ITERS):
-            call(*argument_sets[i % len(argument_sets)])
-        torch.cuda.synchronize(device)
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        best = float("inf")
-        for _ in range(_TIMED_BATCHES):
-            start.record(stream)
-            for args in argument_sets:
-                call(*args)
-            end.record(stream)
-            torch.cuda.synchronize(device)
-            best = min(best, start.elapsed_time(end) / 1e3 / len(argument_sets))
-        return best
+    """Mean seconds/call; each graph invocation starts with cold L2.
+
+    Eviction, event setup, host enqueue and synchronization are outside each
+    measured interval. The initial graph replay is discarded.
+    """
+    graph = _ColdCallGraph(call, argument_sets, device)
+    samples = [value for _ in range(_TIMED_BATCHES) for value in graph.sample()]
+    return sum(samples) / len(samples)
+
+
+def _balanced_timings(candidates, measure) -> dict:
+    """Equal samples in forward and reverse order, without best-of bias."""
+    forward = {candidate: measure(candidate) for candidate in candidates}
+    reverse = {candidate: measure(candidate) for candidate in reversed(candidates)}
+    return {
+        candidate: (forward[candidate] + reverse[candidate]) / 2
+        for candidate in candidates
+    }
 
 
 def _time_call_fresh_indices(
@@ -529,26 +586,11 @@ def _time_call_fresh_indices(
     device: torch.device,
     bytes_per_token: int,
 ) -> float:
-    """Steady-state time (seconds) of one call: min over ``_TIMED_BATCHES``
-    batches of the per-call mean, each batch enqueuing its calls back-to-back
-    under a single sync.
+    """Mean cold-L2 seconds/call over deterministic full-pool index samples.
 
-    The queued batch keeps the GPU busy across call boundaries, so per-call
-    launch latency overlaps execution — the regime production runs in (a
-    graph-replayed decode step pays no per-kernel launch gap). A per-rep
-    sync instead exposes one launch gap per call, which distorted small-T
-    measurements by a fixed ~7us.
-
-    L2 fidelity: every call in a batch gathers under a different pre-drawn
-    full-pool uniform index set. Consecutive sets overlap by
-    ~footprint/pool, and the batch length is sized so a set's reuse distance
-    ((K-1) calls x per-call gather footprint) exceeds L2 — reusing one index
-    set across reps makes the working set L2-resident after warmup and
-    understates the DRAM-bound steady state (this tainted earlier calibration
-    rounds: decode looked artificially fast). The draws run before timing.
+    Inputs are generated before capture and retained across graph replays;
+    explicit per-call eviction, not index rotation, establishes cold L2.
     """
-    # A set recurs after K-1 intervening calls. Unknown L2 capacity or an
-    # insufficient batch cap is a measurement failure, not a warm-cache fallback.
     k = calibration_batch_count(
         num_tokens,
         topk,
@@ -683,11 +725,10 @@ def calibrate(
     """Calibrate the cpb model constants for ``family`` on ``device``.
 
     Drives the real decode kernel over a ~2 GiB KV pool (halved on OOM down
-    to 512 MiB), timing queued batches over rotating fresh full-pool uniform
-    index sets (:func:`_time_call_fresh_indices`) so the measured working
-    set stays DRAM-resident and launch latency stays off the clock, then fits
-    the three constants to six fixed shapes by Levenberg-Marquardt on
-    relative residuals.
+    to 512 MiB), measuring mean per-call cold-L2 graph latency over full-pool
+    uniform index sets (:func:`_time_call_fresh_indices`). Eviction and host
+    enqueue are outside the event intervals. Fits the three constants to six
+    fixed shapes by Levenberg-Marquardt on relative residuals.
     ``module_getter`` returns the loaded TVM-FFI kernel module.
     """
     if family not in _BYTES_PER_TOKEN:
@@ -997,9 +1038,11 @@ def calibrate_crossover(
         for num_heads, topk in pairs:
             best = 0
             for num_tokens in _CROSSOVER_PROBED_T:
-                t_dec = time_decode(num_tokens, num_heads, topk, model_type)
-                t_pre = time_prefill(num_tokens, num_heads, topk, model_type)
-                if t_dec <= _CROSSOVER_MARGIN * t_pre:
+                measured = _balanced_timings(
+                    [time_decode, time_prefill],
+                    lambda timer: timer(num_tokens, num_heads, topk, model_type),
+                )
+                if measured[time_decode] <= _CROSSOVER_MARGIN * measured[time_prefill]:
                     best = num_tokens
             table[f"{prefix}|{num_heads}|{topk}"] = best
     return table
@@ -1038,17 +1081,17 @@ def refine_cpb(
     kv_cache, num_slots = _allocate_kv_pool(family, device)
     build_call = _make_decode_call_builder(module_getter(), family, device, kv_cache)
     model_type = _model_type_for_family(family)
-    best_cpb, best_t = center, float("inf")
     lo = max(1, center - _REFINE_WINDOW)
     hi = min(n, center + _REFINE_WINDOW)
-    for cpb in range(lo, hi + 1):
+
+    def measure(cpb):
         call = build_call(num_tokens, num_heads, topk, model_type, cpb)
-        t = _time_call_fresh_indices(
+        return _time_call_fresh_indices(
             call, num_tokens, topk, num_slots, device, _BYTES_PER_TOKEN[family]
         )
-        if t < best_t:
-            best_cpb, best_t = cpb, t
-    return best_cpb
+
+    measured = _balanced_timings(list(range(lo, hi + 1)), measure)
+    return min(measured, key=measured.get)
 
 
 def default_cache_path() -> pathlib.Path:
@@ -1118,7 +1161,7 @@ def _parse_payload_devices(devices: dict) -> tuple[dict, dict, dict]:
                     variants = (
                         ("decode_splitk", "prefill_streaming")
                         if profile.get("request", {}).get("family") == "dsv4_nvfp4"
-                        else (0, 1)
+                        else (0, 1, 2, 3, 4)
                     )
                     for bucket in buckets.values():
                         if bucket["variant"] not in variants or bucket["cpb"] < 1:
@@ -1308,18 +1351,22 @@ def get_constants(device: torch.device, family: str) -> Optional[CpbConstants]:
 
 
 def _read_payload_for_merge(path: pathlib.Path) -> dict:
-    """Existing cache content to merge into. Only current-schema files merge;
-    anything else starts fresh (stale entries recalibrate on the next
-    tuning-mode pass)."""
+    """Merge only matching schema and timing protocol; stale data recalibrates."""
     try:
         existing = json.loads(path.read_text())
     except (OSError, ValueError):
         existing = None
-    if isinstance(existing, dict) and existing.get("schema_version") == (
-        _SCHEMA_VERSION
+    if (
+        isinstance(existing, dict)
+        and existing.get("schema_version") == _SCHEMA_VERSION
+        and existing.get("timing_protocol") == _TIMING_PROTOCOL
     ):
         return existing
-    return {"schema_version": _SCHEMA_VERSION, "devices": {}}
+    return {
+        "schema_version": _SCHEMA_VERSION,
+        "timing_protocol": _TIMING_PROTOCOL,
+        "devices": {},
+    }
 
 
 def publish_calibration(
@@ -1538,8 +1585,43 @@ def save_cpb_override(
 _PROFILE_T = (1, 4, 8, 16, 24, 32, 48, 64)
 
 
+def _profile_page_pitch(page: int, bpt: int) -> int:
+    return (page * bpt + 15) // 16 * 16
+
+
+def profile_layout(
+    model, heads, topk, page, extra_topk=0, extra_page=0, extra_fp4=False
+):
+    facts = format_info(model)
+    bpt = facts["bytes_per_token"]
+    extra_bpt = facts["fp4_bytes_per_token"] if extra_fp4 else bpt
+    return dict(
+        row_stride_bytes=bpt,
+        page_stride_bytes=_profile_page_pitch(page, bpt),
+        extra_page_stride_bytes=_profile_page_pitch(extra_page, extra_bpt)
+        if extra_topk
+        else 0,
+        indices_stride=topk,
+        extra_indices_stride=extra_topk,
+        lse_stride=heads,
+    )
+
+
+def canonical_profile_layout(metadata) -> bool:
+    expected = profile_layout(
+        metadata.model,
+        metadata.heads,
+        metadata.topk,
+        metadata.page_size,
+        metadata.extra_topk,
+        metadata.extra_page_size,
+        metadata.extra_fp4,
+    )
+    return all(getattr(metadata, name) == value for name, value in expected.items())
+
+
 @dataclass(frozen=True)
-class _Dsv41Request:
+class _OrdinaryRequest:
     heads: int
     topk: int
     compute_precision: str = "default"
@@ -1550,6 +1632,13 @@ class _Dsv41Request:
     has_topk_length: bool = False
     has_extra_topk_length: bool = False
     has_attn_sink: bool = False
+    family: str = "dsv4_1"
+
+    @property
+    def model(self) -> int:
+        return next(
+            model for model, family in MODEL_FAMILIES.items() if family == self.family
+        )
 
     @property
     def effective(self) -> dict:
@@ -1561,20 +1650,37 @@ class _Dsv41Request:
             "has_attn_sink",
         ):
             values[name] = bool(values[name])
-        values["compute_precision"] = (
-            "bf16" if self.compute_precision == "bf16" else "fp8"
-        )
-        return {"family": "dsv4_1", "strategy": "queued_rotation_v1", **values}
+        if self.family == "dsv4_1":
+            values["compute_precision"] = (
+                "bf16" if self.compute_precision == "bf16" else "fp8"
+            )
+        return {"strategy": _TIMING_PROTOCOL, **values}
 
     @property
     def key(self) -> str:
         return json.dumps(self.effective, sort_keys=True)
 
     def validate(self) -> None:
+        if self.family not in MODEL_FAMILIES.values():
+            raise ValueError("unsupported ordinary family")
         if self.compute_precision not in ("default", "fp8", "bf16"):
             raise ValueError("unsupported compute_precision")
-        if not 1 <= self.heads <= 128 or self.topk <= 0 or self.primary_page_size <= 0:
-            raise ValueError("invalid DSV4.1 heads/topk/page size")
+        if self.family != "dsv4_1" and (
+            self.compute_precision != "default" or self.extra_kv_fp4
+        ):
+            raise ValueError("explicit precision and extra FP4 require DSV4.1")
+        facts = format_info(self.model)
+        if (
+            not 1 <= self.heads <= facts["max_heads"]
+            or self.topk < facts["min_topk"]
+            or self.primary_page_size <= 0
+        ):
+            raise ValueError(
+                f"requires 1<=num_heads<={facts['max_heads']}, "
+                f"topk>={facts['min_topk']}, and positive page size"
+            )
+        if self.extra_topk and self.family not in ("dsv4", "dsv4_1"):
+            raise ValueError("extra cache is unsupported by this family")
         if self.extra_topk < 0 or (self.extra_topk > 0 and self.extra_page_size <= 0):
             raise ValueError("extra cache requires positive topk and page size")
         if not self.extra_topk and (
@@ -1601,25 +1707,38 @@ def get_profile(key: str, device: torch.device) -> dict | None:
         return None if value is None else json.loads(json.dumps(value))
 
 
-def get_dsv41_profile(request: _Dsv41Request, device: torch.device) -> dict | None:
+def get_ordinary_profile(
+    request: _OrdinaryRequest, device: torch.device
+) -> dict | None:
     return get_profile(request.key, device)
 
 
 def _profile_pool(
-    request: _Dsv41Request, device: torch.device, page: int, pool_bytes: int, fp4: bool
+    request: _OrdinaryRequest,
+    device: torch.device,
+    page: int,
+    pool_bytes: int,
+    fp4: bool,
 ) -> tuple[torch.Tensor, int]:
     from ._api import dsv41_fp4_quantize_pack_sparse_mla_cache
 
-    facts = format_info(5)
+    facts = format_info(request.model)
     bpt = facts["fp4_bytes_per_token"] if fp4 else facts["bytes_per_token"]
     while True:
         pages = max(1, pool_bytes // (page * bpt))
         _check_pool_capacity(device, pages * page * bpt)
         cache = None
         try:
-            cache = torch.empty((pages, page * bpt), dtype=torch.uint8, device=device)
+            pitch = _profile_page_pitch(page, bpt)
+            cache = torch.empty_strided(
+                (pages, page * bpt), (pitch, 1), dtype=torch.uint8, device=device
+            )
             if not fp4:
-                _initialize_fp8_pool(cache, "dsv4_1", page)
+                _initialize_fp8_pool(
+                    cache,
+                    "dsv3_2" if request.family == "glm_nsa" else request.family,
+                    page,
+                )
             else:
                 generator = torch.Generator(device=device).manual_seed(2)
                 chunk = max(1, _SAMPLE_CHUNK_BYTES // (page * facts["query_dim"] * 8))
@@ -1643,14 +1762,14 @@ def _profile_pool(
             del cache
             if pool_bytes <= _POOL_BYTES_MIN:
                 raise CalibrationError(
-                    "cannot initialize DSV4.1 profile pool"
+                    f"cannot initialize {request.family} profile pool"
                 ) from None
             pool_bytes //= 2
             torch.cuda.empty_cache()
 
 
 @dataclass(frozen=True)
-class _Dsv41MeasureContext:
+class _OrdinaryMeasureContext:
     """Device-resident pools and capabilities shared across profile buckets."""
 
     device: torch.device
@@ -1663,15 +1782,18 @@ class _Dsv41MeasureContext:
     module: Any
 
 
-def _dsv41_measure_context(
-    request: _Dsv41Request, device: torch.device
-) -> _Dsv41MeasureContext:
+def _ordinary_measure_context(
+    request: _OrdinaryRequest, device: torch.device
+) -> _OrdinaryMeasureContext:
     from ._execution import get_sparse_mla_sm120_module
 
     props = torch.cuda.get_device_properties(device)
     caps = (props.multi_processor_count, props.shared_memory_per_block_optin)
-    facts = format_info(5)
-    main_bytes = request.topk * facts["bytes_per_token"]
+    facts = format_info(request.model)
+    active_topk = (
+        min(request.topk, facts["min_topk"]) if facts["min_topk"] > 1 else request.topk
+    )
+    main_bytes = active_topk * facts["bytes_per_token"]
     extra_bpt = (
         facts["fp4_bytes_per_token"]
         if request.extra_kv_fp4
@@ -1700,7 +1822,7 @@ def _dsv41_measure_context(
             ),
             request.extra_kv_fp4,
         )
-    return _Dsv41MeasureContext(
+    return _OrdinaryMeasureContext(
         device=device,
         main=main,
         slots=slots,
@@ -1712,8 +1834,8 @@ def _dsv41_measure_context(
     )
 
 
-def _measure_dsv41_bucket(
-    request: _Dsv41Request, ctx: _Dsv41MeasureContext, tokens: int
+def _measure_ordinary_bucket(
+    request: _OrdinaryRequest, ctx: _OrdinaryMeasureContext, tokens: int
 ) -> dict:
     from ._execution import (
         AttentionMetadata,
@@ -1722,14 +1844,7 @@ def _measure_dsv41_bucket(
     )
 
     device = ctx.device
-    facts = format_info(5)
-    main_bytes = request.topk * facts["bytes_per_token"]
-    extra_bpt = (
-        facts["fp4_bytes_per_token"]
-        if request.extra_kv_fp4
-        else facts["bytes_per_token"]
-    )
-    extra_bytes = request.extra_topk * extra_bpt
+    facts = format_info(request.model)
     generator = torch.Generator(device=device).manual_seed(3)
     q = (
         torch.randn(
@@ -1741,7 +1856,9 @@ def _measure_dsv41_bucket(
         .clamp_(-1, 1)
         .to(torch.bfloat16)
     )
-    output = torch.empty_like(q)
+    output = torch.empty(
+        (tokens, request.heads, facts["value_dim"]), dtype=torch.bfloat16, device=device
+    )
     lse = torch.empty((tokens, request.heads), device=device)
     lengths = (
         torch.full((tokens,), request.topk, dtype=torch.int32, device=device)
@@ -1757,35 +1874,39 @@ def _measure_dsv41_bucket(
         torch.zeros((request.heads,), device=device) if request.has_attn_sink else None
     )
     metadata = AttentionMetadata(
-        5,
-        tokens,
-        request.heads,
-        request.topk,
-        request.extra_topk,
-        request.primary_page_size,
-        request.extra_page_size,
-        ctx.main.stride(0),
-        0 if ctx.extra is None else ctx.extra.stride(0),
-        facts["bytes_per_token"],
-        request.topk,
-        request.extra_topk,
-        request.heads,
-        lengths is not None,
-        extra_lengths is not None,
-        sink is not None,
-        request.extra_kv_fp4,
-        0,
+        model=request.model,
+        tokens=tokens,
+        heads=request.heads,
+        topk=request.topk,
+        extra_topk=request.extra_topk,
+        page_size=request.primary_page_size,
+        extra_page_size=request.extra_page_size,
+        has_lengths=lengths is not None,
+        has_extra_lengths=extra_lengths is not None,
+        has_sink=sink is not None,
+        extra_fp4=request.extra_kv_fp4,
+        variant=0,
+        **profile_layout(
+            request.model,
+            request.heads,
+            request.topk,
+            request.primary_page_size,
+            request.extra_topk,
+            request.extra_page_size,
+            request.extra_kv_fp4,
+        ),
     )
     legal = metadata_candidates(
         metadata, request.effective["compute_precision"], *ctx.caps
     )
     if 0 not in legal:
-        raise CalibrationError("no legal DSV4.1 decode candidate for profile")
-    footprint = tokens * (main_bytes + extra_bytes)
-    count = max(_MIN_BATCH_CALLS, 4 * ctx.l2 // footprint + 2)
+        raise CalibrationError(
+            f"no legal {request.family} decode candidate for profile"
+        )
+    count = calibration_batch_count(
+        tokens, request.topk + request.extra_topk, facts["bytes_per_token"], device
+    )
     index_bytes = count * tokens * (request.topk + request.extra_topk) * 4
-    if index_bytes > 64 << 20:
-        raise CalibrationError("profile rotation exceeds bounded 64 MiB index budget")
     indices = torch.randint(
         ctx.slots,
         (count, tokens, request.topk),
@@ -1804,13 +1925,6 @@ def _measure_dsv41_bucket(
         if ctx.extra is not None
         else None
     )
-    distinct = torch.unique(indices).numel() * facts["bytes_per_token"]
-    if extra_indices is not None:
-        distinct += torch.unique(extra_indices).numel() * extra_bpt
-    if distinct - footprint <= 2 * ctx.l2:
-        raise CalibrationError(
-            "profile distinct rotation footprint does not exceed 2xL2"
-        )
     arguments = [
         (indices[i], None if extra_indices is None else extra_indices[i])
         for i in range(count)
@@ -1849,11 +1963,29 @@ def _measure_dsv41_bucket(
 
         return time_calibration_calls(call, arguments, device)
 
-    decoded = {cpb: timed(0, cpb) for cpb in range(1, legal[0] + 1)}
+    from ._policy import KernelVariant, prefill_variant
+
+    pf = prefill_variant(
+        request.model,
+        request.heads,
+        request.topk,
+        request.primary_page_size,
+        request.extra_topk > 0,
+        0,
+    )
+    if request.compute_precision == "bf16":
+        pf = KernelVariant.PREFILL_SG
+    candidates = [(0, cpb) for cpb in range(1, legal[0] + 1)]
+    if pf is not None and int(pf) in legal:
+        candidates.append((int(pf), 1))
+    measured = _balanced_timings(candidates, lambda candidate: timed(*candidate))
+    decoded = {cpb: measured[(0, cpb)] for cpb in range(1, legal[0] + 1)}
     best = min(decoded, key=lambda cpb: (decoded[cpb], -cpb))
-    prefill = timed(1, 1) if 1 in legal else None
+    prefill = measured.get((int(pf), 1)) if pf is not None else None
     variant = (
-        0 if prefill is None or decoded[best] <= _CROSSOVER_MARGIN * prefill else 1
+        0
+        if prefill is None or decoded[best] <= _CROSSOVER_MARGIN * prefill
+        else int(pf)
     )
     return {
         "variant": variant,
@@ -1862,23 +1994,24 @@ def _measure_dsv41_bucket(
         "prefill_s": prefill,
         "decode_candidates_s": decoded,
         "prefill_absent": None if prefill is not None else "metadata_ineligible",
-        "rotation_calls": count,
+        "sample_calls": count,
         "index_bytes": index_bytes,
-        "distinct_rotation_bytes": distinct,
+        "timing_protocol": _TIMING_PROTOCOL,
     }
 
 
 @_target_calibration
-def _measure_dsv41(request: _Dsv41Request, device: torch.device) -> dict:
+def _measure_ordinary(request: _OrdinaryRequest, device: torch.device) -> dict:
     request.validate()
-    ctx = _dsv41_measure_context(request, device)
+    ctx = _ordinary_measure_context(request, device)
     buckets = {
-        str(tokens): _measure_dsv41_bucket(request, ctx, tokens)
+        str(tokens): _measure_ordinary_bucket(request, ctx, tokens)
         for tokens in _PROFILE_T
     }
     return {
         "request": request.effective,
-        "sample_kind": "full_capacity_canonical_layout",
+        "sample_kind": _SAMPLE_KIND,
+        "timing_protocol": _TIMING_PROTOCOL,
         "caps": {
             "sm_count": ctx.caps[0],
             "shared_bytes": ctx.caps[1],
@@ -1893,8 +2026,8 @@ def _measure_dsv41(request: _Dsv41Request, device: torch.device) -> dict:
 
 
 @_target_calibration
-def refine_dsv41(
-    request: _Dsv41Request, device: torch.device, tokens: int
+def refine_ordinary(
+    request: _OrdinaryRequest, device: torch.device, tokens: int
 ) -> dict | None:
     """Measure one exact token count and merge it into the stored profile.
 
@@ -1908,8 +2041,8 @@ def refine_dsv41(
     profile = get_profile(request.key, device)
     if profile is None or str(tokens) in profile["buckets"]:
         return None
-    ctx = _dsv41_measure_context(request, device)
-    entry = _measure_dsv41_bucket(request, ctx, tokens)
+    ctx = _ordinary_measure_context(request, device)
+    entry = _measure_ordinary_bucket(request, ctx, tokens)
     entry["provenance"] = "refined"
     with _store_lock:
         profile = get_profile(request.key, device)
@@ -1918,16 +2051,18 @@ def refine_dsv41(
         profile["buckets"][str(tokens)] = entry
         persisted = publish_calibration(
             device,
-            "dsv4_1",
+            request.family,
             profiles={request.key: profile},
             profile_buckets={request.key: {str(tokens): entry}},
         )
     return {**entry, "persisted": persisted}
 
 
-def _calibrate_dsv41(request: _Dsv41Request, device: torch.device, force: bool) -> dict:
+def _calibrate_ordinary(
+    request: _OrdinaryRequest, device: torch.device, force: bool
+) -> dict:
     with _store_lock:
-        old = get_dsv41_profile(request, device)
+        old = get_ordinary_profile(request, device)
         if old is not None and not force:
             _, state = _activate_store()
             return {
@@ -1937,7 +2072,7 @@ def _calibrate_dsv41(request: _Dsv41Request, device: torch.device, force: bool) 
             }
     started = time.monotonic()
     try:
-        profile = _measure_dsv41(request, device)
+        profile = _measure_ordinary(request, device)
     except (CalibrationError, RuntimeError) as error:
         mark_calibration_failed(device, request.key)
         return {
@@ -1948,8 +2083,10 @@ def _calibrate_dsv41(request: _Dsv41Request, device: torch.device, force: bool) 
             "persisted": False,
         }
     profile["elapsed_s"] = time.monotonic() - started
-    persisted = publish_calibration(device, "dsv4_1", profiles={request.key: profile})
-    failed = _store_projection("dsv4_1", "failed")
+    persisted = publish_calibration(
+        device, request.family, profiles={request.key: profile}
+    )
+    failed = _store_projection(request.family, "failed")
     failed.discard((_device_key(device), request.key))
     return {**profile, "status": "measured", "persisted": persisted}
 
@@ -1957,8 +2094,7 @@ def _calibrate_dsv41(request: _Dsv41Request, device: torch.device, force: bool) 
 # ── Public calibration entry point ─────────────────────────────────────────
 
 
-# ("<grid heads>", "<grid topks>", min_topk)
-def _family_specs() -> dict[str, tuple[tuple[int, ...], tuple[int, ...], int]]:
+def _family_specs() -> dict[str, tuple[tuple[int, ...], tuple[int, ...]]]:
     from ._policy import (
         _CALIBRATION_HEADS,
         _DECODE_DSV3_2_TOPKS,
@@ -1972,19 +2108,17 @@ def _family_specs() -> dict[str, tuple[tuple[int, ...], tuple[int, ...], int]]:
 
     v32_topks = tuple(sorted(_DECODE_DSV3_2_TOPKS))
     return {
-        "dsv4": (_CALIBRATION_HEADS, tuple(sorted(_DECODE_DSV4_TOPKS)), 1),
-        "dsv4_1": (_CALIBRATION_HEADS, (_DECODE_DSV4_1_TOPK,), 1),
-        "dsv3_2": (_CALIBRATION_HEADS, v32_topks, 1),
-        "glm_nsa": (_CALIBRATION_HEADS, v32_topks, 1),
+        "dsv4": (_CALIBRATION_HEADS, tuple(sorted(_DECODE_DSV4_TOPKS))),
+        "dsv4_1": (_CALIBRATION_HEADS, (_DECODE_DSV4_1_TOPK,)),
+        "dsv3_2": (_CALIBRATION_HEADS, v32_topks),
+        "glm_nsa": (_CALIBRATION_HEADS, v32_topks),
         "glm53_nope": (
             tuple(sorted({h for h, _ in _DECODE_GLM53_NOPE_CALIBRATION_GRID})),
             (_DECODE_GLM53_NOPE_TOPK,),
-            1,
         ),
         "dots3_swa": (
             tuple(sorted({h for h, _ in _DECODE_DOTS3_SWA_CALIBRATION_GRID})),
             (_DECODE_DOTS3_SWA_TOPK,),
-            513,
         ),
     }
 
@@ -2002,9 +2136,9 @@ class SparseMLASm120CalibrationReport:
     constants_present : tuple[str, ...]
         Families whose cpb constants were already on disk (skipped).
     entries_calibrated : int
-        Crossover ``(family, num_heads, topk)`` entries newly measured.
+        Configuration profiles newly measured.
     entries_skipped : int
-        Requested crossover entries already present (idempotent default).
+        Requested configuration profiles already present (idempotent default).
     failed : tuple[str, ...]
         Human-readable per-family/per-entry failures, if any. Calibration
         failures are collected here instead of raised so a multi-family call
@@ -2046,10 +2180,10 @@ def calibrate_sparse_mla_sm120(
 ) -> SparseMLASm120CalibrationReport:
     """Calibrate the SM120 sparse-MLA decode model on ``device`` and persist it.
 
-    One call does both layers: the per-family cpb constants (measured when
-    absent, or always when ``force=True``) and then the decode/prefill
-    crossover entry for every requested ``(family, num_heads, topk)``
-    combination. Results merge into the JSON cache (see
+    Measures a configuration-keyed decode/prefill profile for every requested
+    family/head/topk combination, plus analytical constants for families that
+    use model estimates. Each profile has independent phase/CPB choices at eight
+    token buckets. Results merge into the JSON cache (see
     :func:`default_cache_path`) and take effect in-process immediately (the
     ``_constants_version`` bump self-invalidates the plan memoization).
 
@@ -2085,24 +2219,29 @@ def calibrate_sparse_mla_sm120(
     families : Optional[tuple[str, ...]]
         Subset of ``{"dsv4", "dsv3_2", "glm_nsa", "glm53_nope",
         "dots3_swa", "dsv4_1"}``; defaults to all, including DSV4.1 single
-        FP8 only. ``dsv3_2`` and ``glm_nsa`` share constants and one sweep.
+        FP8 only. ``dsv3_2`` and ``glm_nsa`` share analytical constants,
+        but their measured configuration profiles are independent.
     force : bool
         Re-measure complete units; failed measurements retain old profiles.
     compute_precision : str
         DSV4.1 ``default``/``fp8`` share FP8 profiles; ``bf16`` is independent.
+        Other families accept ``default``, preserving their ordinary numerical route.
     primary_page_size, extra_page_size : int
-        DSV4.1 main and extra page sizes. Extra page size is zero without extra KV.
+        Positive main and extra page sizes. Extra page size is zero without extra KV.
     extra_topk : int
         Extra-cache candidate capacity, zero for a single cache.
     extra_kv_fp4 : bool
         Quantize the extra DSV4.1 cache with the existing FP4 packer.
     has_topk_length, has_extra_topk_length, has_attn_sink : bool
         Presence flags. Samples use full-capacity lengths and a finite zero sink.
-        Nondefault extended configuration requires only the DSV4.1 family.
+        Secondary caches require a family that supports them (DSV4 or DSV4.1).
 
-    DSV4.1 profiles measure all eight token buckets, independent phase decisions
+    Ordinary profiles measure all eight token buckets, independent phase decisions
     and complete decode CPB sweeps. Each exact H/K/cache configuration counts as
-    one entry. Profiles do not certify arbitrary ragged distributions. Runtime
+    one entry. Profiles apply only to packed payload rows, minimally 16B-aligned
+    page pitches and dense main/extra indices and LSE. Noncanonical layouts skip
+    profile lookup and automatic measurement. Profiles do not certify arbitrary
+    ragged distributions. Runtime
     token counts use an exact refined entry when tuning measured one, else the
     next larger bucket; counts above 64 require legal prefill.
 
@@ -2146,31 +2285,23 @@ def calibrate_sparse_mla_sm120(
         has_extra_topk_length,
         has_attn_sink,
     )
-    if extended != ("default", 64, 0, 0, False, False, False, False) and any(
-        f != "dsv4_1" for f in fams
-    ):
-        raise ValueError("extended calibration configuration requires only DSV4.1")
     requests = []
-    if "dsv4_1" in fams:
-        grid_heads, grid_topks, _ = specs["dsv4_1"]
+    for family in fams:
+        grid_heads, grid_topks = specs[family]
         for h in heads if heads is not None else grid_heads:
             for k in topks if topks is not None else grid_topks:
-                request = _Dsv41Request(h, k, *extended)
-                request.validate()
-                requests.append(request)
+                requests.append(_OrdinaryRequest(h, k, *extended, family=family))
 
     # Validate every requested combination up front; nothing is measured or
     # written when any combination is out of envelope.
     invalid = []
-    for fam in fams:
-        grid_heads, grid_topks, min_topk = specs[fam]
-        for h in tuple(heads) if heads is not None else grid_heads:
-            for k in tuple(topks) if topks is not None else grid_topks:
-                if not (1 <= h <= 128 and k >= min_topk):
-                    invalid.append(
-                        f"{fam}(num_heads={h}, topk={k}) "
-                        f"[need 1<=num_heads<=128, topk>={min_topk}]"
-                    )
+    for request in requests:
+        try:
+            request.validate()
+        except ValueError as error:
+            invalid.append(
+                f"{request.family}(num_heads={request.heads}, topk={request.topk}): {error}"
+            )
     if invalid:
         raise ValueError(
             "calibrate_sparse_mla_sm120: combinations outside the decode "
@@ -2184,73 +2315,36 @@ def calibrate_sparse_mla_sm120(
     entries_skipped = 0
 
     persisted = True
-    profiles = tuple(_calibrate_dsv41(request, device, force) for request in requests)
+    profiles = tuple(
+        _calibrate_ordinary(request, device, force) for request in requests
+    )
     for profile in profiles:
         entries_calibrated += profile["status"] == "measured"
         entries_skipped += profile["status"] == "reused"
         if profile["status"] == "failed":
-            failed.append(f"dsv4_1: {profile['error']}")
+            failed.append(f"{profile['request']['family']}: {profile['error']}")
         persisted = persisted and profile["persisted"]
     cpb_families = sorted({_CPB_FAMILY_ALIAS.get(f, f) for f in fams if f != "dsv4_1"})
     for cpb_family in cpb_families:
+        if any(
+            p["status"] == "failed"
+            and _CPB_FAMILY_ALIAS.get(p["request"]["family"], p["request"]["family"])
+            == cpb_family
+            for p in profiles
+        ):
+            continue
         existing = None if force else get_constants(device, cpb_family)
-        requested = [f for f in fams if _CPB_FAMILY_ALIAS.get(f, f) == cpb_family]
-        pairs: set[tuple[int, int]] = set()
-        for fam in requested:
-            grid_heads, grid_topks, _ = specs[fam]
-            for h in tuple(heads) if heads is not None else grid_heads:
-                for k in tuple(topks) if topks is not None else grid_topks:
-                    if (
-                        existing is not None
-                        and get_decode_max_tokens(device, fam, h, k) is not None
-                    ):
-                        entries_skipped += 1
-                    else:
-                        pairs.add((h, k))
+        if existing is not None:
+            constants_present.append(cpb_family)
+            continue
         try:
-            c = (
-                existing
-                if existing is not None
-                else calibrate(_get_sparse_mla_sm120_decode_module, cpb_family, device)
-            )
-            table = (
-                calibrate_crossover(
-                    _get_sparse_mla_sm120_decode_module(),
-                    device,
-                    cpb_family,
-                    c,
-                    grid_override=sorted(pairs),
-                )
-                if pairs
-                else {}
-            )
+            c = calibrate(_get_sparse_mla_sm120_decode_module, cpb_family, device)
         except (CalibrationError, torch.cuda.OutOfMemoryError, RuntimeError) as error:
             failed.append(f"{cpb_family}: {error}")
             mark_calibration_failed(device, cpb_family)
             continue
-        if existing is None or table:
-            persisted = (
-                publish_calibration(
-                    device,
-                    cpb_family,
-                    constants=c if existing is None else None,
-                    crossover=table,
-                    replace_family=force,
-                    replace_family_if_absent=existing is None and not force,
-                )
-                and persisted
-            )
-        else:
-            _, state = _activate_store()
-            persisted = persisted and not state["overlay"]
-        if existing is None:
-            constants_calibrated.append(cpb_family)
-        else:
-            constants_present.append(cpb_family)
-        for fam in requested:
-            for h, k in pairs:
-                if f"{fam}|{h}|{k}" in table:
-                    entries_calibrated += 1
+        persisted = publish_calibration(device, cpb_family, constants=c) and persisted
+        constants_calibrated.append(cpb_family)
 
     return SparseMLASm120CalibrationReport(
         device=_device_key(device),

@@ -184,7 +184,7 @@ __device__ __forceinline__ void sparse_mla_prefill_math_pc(
 #pragma unroll 1
     for (int ti = 0; ti < actual_ni; ti++) {
       const int buf = ti & 1;
-      uint8_t* kv_smem = sm.kv_bufs[buf];
+      uint8_t* kv_smem = sm.kv_buf(buf);
       uint8_t* wfp8_buf = sm.w_fp8 + buf * L::SMEM_W_FP8_ONE_PARITY;
       float* wsc_buf = sm.w_head_sc_all + buf * (CT::N_V_CHUNKS * HPB);
       float* alpha_buf = sm.alpha_buf + buf * HPB;
@@ -225,7 +225,7 @@ __device__ __forceinline__ void sparse_mla_prefill_math_pc(
             scale_f = reinterpret_cast<const float*>(kv_gid_base + KV::D_NOPE)[blk];
           } else {
             scale_f = fp32_from_exponent_byte(
-                sm.kv_scale_bufs[buf][(qk_nb + gid) * KV::SCALE_BYTES_PER_TOKEN + blk]);
+                sm.kv_scale_buf(buf)[(qk_nb + gid) * KV::SCALE_BYTES_PER_TOKEN + blk]);
           }
 #pragma unroll
           for (int ks = 0; ks < KV::QUANT_TILE / 16; ks++) {
@@ -262,7 +262,7 @@ __device__ __forceinline__ void sparse_mla_prefill_math_pc(
           if constexpr (KV::SCALE_IN_KV_SMEM) {
             k_scale_base = kv_gid_base + KV::D_NOPE;
           } else {
-            k_scale_base = sm.kv_scale_bufs[buf] + (qk_nb + gid) * KV::SCALE_BYTES_PER_TOKEN;
+            k_scale_base = sm.kv_scale_buf(buf) + (qk_nb + gid) * KV::SCALE_BYTES_PER_TOKEN;
           }
           uint8_t sfb = qk_k_scale_selector<KV>(k_scale_base, blk);
           qk_fp8_scale_group_16x8<KV>(acc0, acc1, acc2, acc3, sm.q_nope_fp8, kv_warp_base, blk, sfa,
@@ -325,9 +325,9 @@ __device__ __forceinline__ void sparse_mla_prefill_math_pc(
           vsc_cache[vc][1] = reinterpret_cast<const float*>(e1_base + KV::D_NOPE)[vc];
         } else {
           vsc_cache[vc][0] =
-              fp32_from_exponent_byte(sm.kv_scale_bufs[buf][e0i * KV::SCALE_BYTES_PER_TOKEN + vc]);
+              fp32_from_exponent_byte(sm.kv_scale_buf(buf)[e0i * KV::SCALE_BYTES_PER_TOKEN + vc]);
           vsc_cache[vc][1] =
-              fp32_from_exponent_byte(sm.kv_scale_bufs[buf][e1i * KV::SCALE_BYTES_PER_TOKEN + vc]);
+              fp32_from_exponent_byte(sm.kv_scale_buf(buf)[e1i * KV::SCALE_BYTES_PER_TOKEN + vc]);
         }
         float ws00 = w0 * vsc_cache[vc][0], ws01 = w1 * vsc_cache[vc][1];
         float ws10 = w2 * vsc_cache[vc][0], ws11 = w3 * vsc_cache[vc][1];
@@ -413,7 +413,7 @@ __device__ __forceinline__ void sparse_mla_prefill_math_pc(
 #pragma unroll 1
     for (int ti = 0; ti < actual_ni; ti++) {
       const int buf = ti & 1;
-      const uint8_t* kv_smem = sm.kv_bufs[buf];
+      const uint8_t* kv_smem = sm.kv_buf(buf);
       const uint8_t* wfp8_buf = sm.w_fp8 + buf * L::SMEM_W_FP8_ONE_PARITY;
       const float* wsc_buf = sm.w_head_sc_all + buf * (CT::N_V_CHUNKS * HPB);
       const float* alpha_buf = sm.alpha_buf + buf * HPB;
@@ -475,7 +475,7 @@ __device__ __forceinline__ void sparse_mla_prefill_math_pc(
 
     // The main loop is done with the KV double buffer; reuse its first half
     // to stage the BF16 output (same fit argument as the serial path).
-    bf16* staging_bf16 = reinterpret_cast<bf16*>(sm.kv_bufs[0]);
+    bf16* staging_bf16 = reinterpret_cast<bf16*>(sm.kv_buf(0));
     constexpr int BF16_STAGING_STRIDE = KV::D_V;
     static_assert(HPB * BF16_STAGING_STRIDE * sizeof(bf16) <= L::SMEM_KV_BUF,
                   "BF16 output staging overruns the KV buffer it reuses");
@@ -638,11 +638,11 @@ __global__ void __launch_bounds__((Fp8PrefillResources<MT, QkMode, GatherSchedul
     auto issue_tile = [&](int t, int staged) {
       const int buf = t & 1;
       io_gather_scales<MT, PAGE_BLOCK_SIZE, Cfg::BI, Cfg::IO_THREADS>(
-          sm.kv_scale_bufs[buf], staged, KV_cache, io_tid, kv_stride_bytes, pg);
+          sm.kv_scale_buf(buf), staged, KV_cache, io_tid, kv_stride_bytes, pg);
       __threadfence_block();
       io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE, Cfg::L2_EVICT_FIRST, Cfg::BI, Cfg::IO_THREADS>(
-          sm.kv_bufs[buf], staged, KV_cache, sm.mbar_kv + buf, io_tid, kv_stride_bytes,
-          kv_l2_policy, pg);
+          sm.kv_buf(buf), staged, KV_cache, sm.mbar_kv + buf, io_tid, kv_stride_bytes, kv_l2_policy,
+          pg);
     };
 
     int staged = load_idx(0);
@@ -722,7 +722,7 @@ __global__ void __launch_bounds__((Fp8PrefillResources<MT, QkMode, GatherSchedul
 // ── Main loop — QK + softmax + XV ───────────────────────────
 #pragma unroll 1
     for (int ti = 0; ti < actual_ni; ti++) {
-      uint8_t* kv_smem = sm.kv_bufs[ti & 1];
+      uint8_t* kv_smem = sm.kv_buf(ti & 1);
       const int32_t* ib = idx_base + ti * Cfg::BI;
 
       for (int i = threadIdx.x; i < CT::N_V_CHUNKS * HPB; i += Cfg::MATH_THREADS)
@@ -753,7 +753,7 @@ __global__ void __launch_bounds__((Fp8PrefillResources<MT, QkMode, GatherSchedul
           const uint8_t* k_sc =
               KV::SCALE_IN_KV_SMEM
                   ? kv_gid_base + KV::D_NOPE
-                  : sm.kv_scale_bufs[ti & 1] + (qk_nb + gid) * KV::SCALE_BYTES_PER_TOKEN;
+                  : sm.kv_scale_buf(ti & 1) + (qk_nb + gid) * KV::SCALE_BYTES_PER_TOKEN;
           qk_bf16_from_fp8_nope_16x8<KV>(qk_storage, sm.q_nope_bf16, 0, kv_gid_base, k_sc, lane);
         } else {
 #pragma unroll
@@ -766,7 +766,7 @@ __global__ void __launch_bounds__((Fp8PrefillResources<MT, QkMode, GatherSchedul
             if constexpr (KV::SCALE_IN_KV_SMEM) {
               k_scale_base = kv_gid_base + KV::D_NOPE;
             } else {
-              k_scale_base = sm.kv_scale_bufs[ti & 1] + (qk_nb + gid) * KV::SCALE_BYTES_PER_TOKEN;
+              k_scale_base = sm.kv_scale_buf(ti & 1) + (qk_nb + gid) * KV::SCALE_BYTES_PER_TOKEN;
             }
             uint8_t sfb = qk_k_scale_selector<KV>(k_scale_base, blk);
             qk_fp8_scale_group_16x8<KV>(acc0, acc1, acc2, acc3, sm.q_nope_fp8, kv_warp_base, blk,
@@ -884,9 +884,9 @@ __global__ void __launch_bounds__((Fp8PrefillResources<MT, QkMode, GatherSchedul
             vsc_cache[vc][1] = reinterpret_cast<const float*>(e1_base + KV::D_NOPE)[vc];
           } else {
             vsc_cache[vc][0] = fp32_from_exponent_byte(
-                sm.kv_scale_bufs[ti & 1][e0i * KV::SCALE_BYTES_PER_TOKEN + vc]);
+                sm.kv_scale_buf(ti & 1)[e0i * KV::SCALE_BYTES_PER_TOKEN + vc]);
             vsc_cache[vc][1] = fp32_from_exponent_byte(
-                sm.kv_scale_bufs[ti & 1][e1i * KV::SCALE_BYTES_PER_TOKEN + vc]);
+                sm.kv_scale_buf(ti & 1)[e1i * KV::SCALE_BYTES_PER_TOKEN + vc]);
           }
           float ws00 = w0 * vsc_cache[vc][0], ws01 = w1 * vsc_cache[vc][1];
           float ws10 = w2 * vsc_cache[vc][0], ws11 = w3 * vsc_cache[vc][1];
@@ -1073,7 +1073,7 @@ __global__ void __launch_bounds__((Fp8PrefillResources<MT, QkMode, GatherSchedul
     // reused to stage the BF16 output. At the default tile this is slack;
     // DOTS3_SWA needs 16 * 1024 * 2 = 32768 B against a 32 * 1040 = 33280 B
     // buffer, so the fit is checked rather than assumed.
-    bf16* staging_bf16 = reinterpret_cast<bf16*>(sm.kv_bufs[0]);
+    bf16* staging_bf16 = reinterpret_cast<bf16*>(sm.kv_buf(0));
     constexpr int BF16_STAGING_STRIDE = KV::D_V;
     static_assert(HPB * BF16_STAGING_STRIDE * sizeof(bf16) <= L::SMEM_KV_BUF,
                   "BF16 output staging overruns the KV buffer it reuses");

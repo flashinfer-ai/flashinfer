@@ -14,6 +14,36 @@ def require_sm12x():
         pytest.skip("Sparse-MLA SM120 requires SM12x.")
 
 
+@pytest.fixture
+def sm120_module():
+    from flashinfer.jit.core import current_compilation_context
+    from flashinfer.jit.cpp_ext import is_cuda_version_at_least
+
+    if not any(
+        major == 12 for major, _ in current_compilation_context.TARGET_CUDA_ARCHS
+    ):
+        pytest.skip("Sparse-MLA compiled queries require an SM12x compilation target.")
+    if not is_cuda_version_at_least("12.9"):
+        pytest.skip("Sparse-MLA compiled queries require CUDA >= 12.9.")
+
+
+@pytest.fixture
+def ordinary_format_facts(monkeypatch):
+    from flashinfer.mla._sparse_mla_sm120 import _calibration
+
+    facts = {
+        model: dict(
+            max_heads=128,
+            min_topk=513 if model == 4 else 1,
+            bytes_per_token=width,
+            fp4_bytes_per_token=288,
+        )
+        for model, width in enumerate((656, 584, 656, 528, 1160, 528))
+    }
+    monkeypatch.setattr(_calibration, "format_info", facts.__getitem__)
+    return facts
+
+
 # Quantization helpers.
 
 

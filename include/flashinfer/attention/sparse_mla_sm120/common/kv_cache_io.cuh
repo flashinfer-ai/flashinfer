@@ -69,14 +69,13 @@ struct KVIOTraits {
 };
 
 struct PageGeom {
-  int pbs;
   size_t footer;
   flashinfer::uint_fastdiv divisor;
 };
 
 __device__ __forceinline__ PageGeom page_geom(int pbs, int row_bytes,
                                               flashinfer::uint_fastdiv divisor) {
-  return {pbs, (size_t)pbs * (size_t)row_bytes, divisor};
+  return {(size_t)pbs * (size_t)row_bytes, divisor};
 }
 
 __device__ __forceinline__ void page_divmod(int idx, const PageGeom pg, int& bi, int& li) {

@@ -32,7 +32,7 @@ struct Dsv41PrefillGatherSchedule {
       scales = page + Dsv41Fp8Layout::scale_offset(sec.page_block_size, local);
     }
     if (tid < Cfg::BI)
-      *reinterpret_cast<uint4*>(sm.kv_scale_bufs[buf] + tid * KV::SCALE_BYTES_PER_TOKEN) =
+      *reinterpret_cast<uint4*>(sm.kv_scale_buf(buf) + tid * KV::SCALE_BYTES_PER_TOKEN) =
           __ldg(reinterpret_cast<const uint4*>(scales));
     __threadfence_block();
     flashinfer::sparse_mla_sm120::pipeline::RoleSync<GATHER_BARRIER, Cfg::IO_THREADS>::wait();
@@ -40,7 +40,7 @@ struct Dsv41PrefillGatherSchedule {
       flashinfer::sparse_mla_sm120::pipeline::BulkReady::expect(sm.mbar_kv + buf,
                                                                 Cfg::BI * KV::D_NOPE);
     if (tid < Cfg::BI)
-      cp_async_bulk_g2s_l2hint(sm.kv_bufs[buf] + tid * KV::KV_SMEM_STRIDE, data, KV::D_NOPE,
+      cp_async_bulk_g2s_l2hint(sm.kv_buf(buf) + tid * KV::KV_SMEM_STRIDE, data, KV::D_NOPE,
                                sm.mbar_kv + buf, policy);
   }
 };

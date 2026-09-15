@@ -142,13 +142,16 @@ class AttentionMetadata(NamedTuple):
     variant: int
 
 
+@functools.cache
 def metadata_candidates(
     metadata: AttentionMetadata, precision: str, sm_count: int, max_shared_bytes: int
 ) -> Mapping[int, int]:
     """Legal variants and resolver-owned chunk capacities for actual metadata."""
     numeric = _precision_code(precision)
-    return dict(
-        query("metadata_candidates", metadata, numeric, sm_count, max_shared_bytes)
+    return MappingProxyType(
+        dict(
+            query("metadata_candidates", metadata, numeric, sm_count, max_shared_bytes)
+        )
     )
 
 

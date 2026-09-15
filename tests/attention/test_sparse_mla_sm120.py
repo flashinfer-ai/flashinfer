@@ -286,7 +286,7 @@ def test_sparse_mla_sm120_decode_dsv4_padded_row_rejected() -> None:
     out_lse = torch.zeros((num_tokens, num_heads), dtype=torch.float32, device=device)
     mid_out, mid_lse = _make_decode_scratch(num_tokens, num_heads, topk, d_v, device)
 
-    with pytest.raises(RuntimeError, match="tightly packed"):
+    with pytest.raises(ValueError, match="tightly packed"):
         sparse_mla_sm120_paged_attention(
             q,
             kv_padded,
@@ -333,9 +333,7 @@ def test_sparse_mla_sm120_decode_dsv4_indices_rows_checked() -> None:
     out_lse = torch.zeros((num_tokens, num_heads), dtype=torch.float32, device=device)
     mid_out, mid_lse = _make_decode_scratch(num_tokens, num_heads, topk, d_v, device)
 
-    with pytest.raises(
-        RuntimeError, match="indices leading dimension must match num_tokens"
-    ):
+    with pytest.raises(ValueError, match="indices shape/stride mismatch"):
         sparse_mla_sm120_paged_attention(
             q,
             kv_packed,
@@ -687,12 +685,7 @@ def test_sparse_mla_sm120_decode_dsv4_topk_length_truncation(
 
 
 def test_sparse_mla_sm120_decode_unsupported_shape_fails_before_prefill() -> None:
-    """A shape served by neither decode nor the prefill envelope raises.
-
-    num_heads=256 is past the runtime-H decode ceiling (128) and outside
-    every prefill head set, so the planner's None is converted to the
-    diagnostic ValueError.
-    """
+    """Compiled metadata validation rejects heads outside every route."""
     device = torch.device("cuda")
     num_tokens, num_heads, topk = 1, 256, 384
     d_qk = d_v = 512
@@ -705,7 +698,7 @@ def test_sparse_mla_sm120_decode_unsupported_shape_fails_before_prefill() -> Non
     )
     out_lse = torch.empty((num_tokens, num_heads), dtype=torch.float32, device=device)
 
-    with pytest.raises(ValueError, match="prefill envelope both reject"):
+    with pytest.raises(ValueError, match="unsupported tokens/heads"):
         sparse_mla_sm120_paged_attention(
             q,
             kv_cache,
@@ -2180,7 +2173,7 @@ def test_sparse_mla_sm120_decode_dsv4_fp4_extra_requires_dsv4_1() -> None:
         num_tokens, num_heads, topk, d_v, device, extra_topk=extra_topk
     )
 
-    with pytest.raises(RuntimeError, match="requires a DSV4_1 main cache"):
+    with pytest.raises((ValueError, RuntimeError), match="requires DSV41 dual cache"):
         sm.sparse_mla_sm120_decode_dsv4(
             q,
             main_packed,
@@ -4311,9 +4304,8 @@ def test_sparse_mla_sm120_decode_form_prefill_fallback(num_heads: int) -> None:
     torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
 
 
-def test_sparse_mla_sm120_crossover_routing_spy(monkeypatch) -> None:
-    """Injected crossover (decode_max_tokens=8): T=8 routes to the decode
-    kernel, T=16 routes to prefill; both match the reference."""
+def test_sparse_mla_sm120_profile_routing_spy(monkeypatch) -> None:
+    """Profile buckets select decode at T=8 and prefill at T=16, both reference-correct."""
     from flashinfer.mla import _sparse_mla_sm120 as sm
     from flashinfer.mla._sparse_mla_sm120 import _calibration as cpb_mod
 
@@ -4335,10 +4327,16 @@ def test_sparse_mla_sm120_crossover_routing_spy(monkeypatch) -> None:
     kv_dequant = dequantize_kv_dsv4(kv_packed)
     sm_scale = d_qk**-0.5
 
-    # Publish the crossover and invalidate prepared entries through its epoch.
-    dev_key = cpb_mod._device_key(device)
-    monkeypatch.setattr(cpb_mod, "_maybe_load_disk", lambda: None)
-    monkeypatch.setitem(cpb_mod._crossover, dev_key, {"dsv4|64|512": 8})
+    monkeypatch.setattr(
+        cpb_mod,
+        "get_ordinary_profile",
+        lambda request, device: {
+            "buckets": {
+                str(t): {"variant": 0 if t <= 8 else 2, "cpb": 1}
+                for t in cpb_mod._PROFILE_T
+            }
+        },
+    )
     monkeypatch.setattr(cpb_mod, "_constants_version", cpb_mod._constants_version + 1)
 
     from flashinfer.mla._sparse_mla_sm120 import _prepared as prepared
@@ -4375,11 +4373,8 @@ def test_sparse_mla_sm120_crossover_routing_spy(monkeypatch) -> None:
         torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
 
 
-def test_sparse_mla_sm120_crossover_cuda_graph(monkeypatch) -> None:
-    """Crossover dispatch under CUDA graphs (dsv4, H=128, topk=1024): with an
-    injected decode_max_tokens=16 a T=8 capture bakes in decode split-K and a
-    T=32 capture bakes in prefill; both replay correctly on fresh data. A T=8
-    capture without crossover constants pins the uncalibrated decode default."""
+def test_sparse_mla_sm120_profile_cuda_graph(monkeypatch) -> None:
+    """Profile-selected decode and prefill replay correctly on fresh data."""
     from flashinfer.mla import _sparse_mla_sm120 as sm
     from flashinfer.mla._sparse_mla_sm120 import _calibration as cpb_mod
 
@@ -4493,8 +4488,16 @@ def test_sparse_mla_sm120_crossover_cuda_graph(monkeypatch) -> None:
     assert calls["decode"] == 1
     replay_and_check(*res)
 
-    # Injected crossover decode_max_tokens=16: T=8 -> decode, T=32 -> prefill.
-    monkeypatch.setitem(cpb_mod._crossover, dev_key, {"dsv4|128|1024": 16})
+    monkeypatch.setattr(
+        cpb_mod,
+        "get_ordinary_profile",
+        lambda request, device: {
+            "buckets": {
+                str(t): {"variant": 0 if t <= 16 else 2, "cpb": 1}
+                for t in cpb_mod._PROFILE_T
+            }
+        },
+    )
     monkeypatch.setattr(cpb_mod, "_constants_version", cpb_mod._constants_version + 1)
     res = capture(8)
     assert calls["decode"] == 1
@@ -4505,11 +4508,7 @@ def test_sparse_mla_sm120_crossover_cuda_graph(monkeypatch) -> None:
 
 
 def test_sparse_mla_sm120_runner_scratch_follows_routing(monkeypatch) -> None:
-    """Runner-internal split-K scratch is allocated only when the call routes
-    to a decode kernel, and is cached on the runner (grown on demand): with an
-    injected decode_max_tokens=8 crossover, T=16 routes to prefill and leaves
-    the scratch untouched, T=4/T=8 decode calls allocate and grow it, and a
-    smaller repeat call reuses the grown buffers."""
+    """Each prepared decode shape owns scratch; prefill needs none and repeats reuse it."""
     from flashinfer.mla import _sparse_mla_sm120 as sm
     from flashinfer.mla._sparse_mla_sm120 import _calibration as cpb_mod
 
@@ -4531,10 +4530,16 @@ def test_sparse_mla_sm120_runner_scratch_follows_routing(monkeypatch) -> None:
     kv_dequant = dequantize_kv_dsv4(kv_packed)
     sm_scale = d_qk**-0.5
 
-    # Publish the crossover and invalidate prepared entries through its epoch.
-    dev_key = cpb_mod._device_key(device)
-    monkeypatch.setattr(cpb_mod, "_maybe_load_disk", lambda: None)
-    monkeypatch.setitem(cpb_mod._crossover, dev_key, {"dsv4|64|512": 8})
+    monkeypatch.setattr(
+        cpb_mod,
+        "get_ordinary_profile",
+        lambda request, device: {
+            "buckets": {
+                str(t): {"variant": 0 if t <= 8 else 2, "cpb": 1}
+                for t in cpb_mod._PROFILE_T
+            }
+        },
+    )
     monkeypatch.setattr(cpb_mod, "_constants_version", cpb_mod._constants_version + 1)
 
     runner = sm._SparseMLAPagedAttentionRunner()

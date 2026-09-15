@@ -138,12 +138,8 @@ _DECODE_GLM53_NOPE_TOPK = 2176
 _DECODE_DOTS3_SWA_TOPK = 576
 _DECODE_DSV4_1_TOPK = 512  # the V4.1 indexer topk
 
-# Crossover-calibration grids: the (num_heads, topk) pairs the tuning-mode
-# sweep times on both paths. Deliberately NOT the full eligibility envelope —
-# calibrating every head count and topk width would explode the sweep. Every
-# grid head count hits a dedicated instantiation, so the sweep times exactly
-# the kernels production decode calls launch; off-grid shapes keep the
-# decode-first default until a measured entry exists.
+# Default profile sampling grids, not the eligibility envelope. Explicit
+# calibration requests may use any shape allowed by the compiled capabilities.
 _CALIBRATION_HEADS = (8, 16, 32, 64, 128)
 _DECODE_DSV4_CALIBRATION_GRID = frozenset(
     (h, k) for h in _CALIBRATION_HEADS for k in _DECODE_DSV4_TOPKS
@@ -187,11 +183,14 @@ class PlannedCall:
     cpb: int  # decode only; -1 selects the C++ heuristic
 
 
+canonical_profile_layout = _cpb.canonical_profile_layout
+
+
 def profile_selection(metadata, device, precision: str) -> Optional[PlannedCall]:
-    if metadata.model != _MODEL_TYPE_DSV4_1:
+    if not canonical_profile_layout(metadata):
         return None
     m = metadata
-    request = _cpb._Dsv41Request(
+    request = _cpb._OrdinaryRequest(
         m.heads,
         m.topk,
         precision,
@@ -202,8 +201,9 @@ def profile_selection(metadata, device, precision: str) -> Optional[PlannedCall]
         m.has_lengths,
         m.has_extra_lengths,
         m.has_sink,
+        family=_MODEL_TYPE_TO_FAMILY[m.model],
     )
-    profile = _cpb.get_dsv41_profile(request, device)
+    profile = _cpb.get_ordinary_profile(request, device)
     tuner = AutoTuner.get()
     stack = tuner._get_skip_ops_stack()
     allowed = tuner.is_tuning_mode and not (stack and "sparse_mla_sm120" in stack[-1])
@@ -213,7 +213,7 @@ def profile_selection(metadata, device, precision: str) -> Optional[PlannedCall]
         and not _cpb._target_capturing(device)
         and not _cpb.is_calibration_failed(device, request.key)
     ):
-        result = _cpb._calibrate_dsv41(request, device, False)
+        result = _cpb._calibrate_ordinary(request, device, False)
         profile = result if result["status"] != "failed" else None
     if profile is None:
         return None
@@ -226,15 +226,24 @@ def profile_selection(metadata, device, precision: str) -> Optional[PlannedCall]
         # Tuning mode: measure this exact token count once so the selection
         # stops interpolating from the canonical grid.
         try:
-            refined = _cpb.refine_dsv41(request, device, m.tokens)
+            refined = _cpb.refine_ordinary(request, device, m.tokens)
         except (CalibrationError, RuntimeError) as error:
-            logger.debug("DSV4.1 refine skipped at tokens=%d: %s", m.tokens, error)
+            logger.debug(
+                "%s refine skipped at tokens=%d: %s", request.family, m.tokens, error
+            )
             refined = None
         if refined is not None:
-            profile = _cpb.get_dsv41_profile(request, device)
+            profile = _cpb.get_ordinary_profile(request, device)
     bucket = _cpb._profile_bucket(profile, m.tokens)
     if bucket is None:
-        return PlannedCall(KernelVariant.PREFILL_SG, -1)
+        pf = (
+            KernelVariant.PREFILL_SG
+            if precision == "bf16"
+            else prefill_variant(
+                m.model, m.heads, m.topk, m.page_size, m.extra_topk > 0, 0
+            )
+        )
+        return None if pf is None else PlannedCall(pf, -1)
     return PlannedCall(KernelVariant(bucket["variant"]), bucket["cpb"])
 
 
@@ -244,17 +253,17 @@ def filter_metadata_selection(
     precision: str,
     sm_count: int,
     max_shared_bytes: int,
+    preference: int = 0,
 ) -> Optional[PlannedCall]:
     from ._execution import metadata_candidates
 
-    inline_page_gap = (
-        metadata.model
-        in (_MODEL_TYPE_DSV3_2, _MODEL_TYPE_GLM_NSA, _MODEL_TYPE_GLM53_NOPE)
-        and metadata.page_stride_bytes != metadata.page_size * metadata.row_stride_bytes
-    )
-    if metadata.model != _MODEL_TYPE_DSV4_1 and not inline_page_gap:
-        return selected
     legal = metadata_candidates(metadata, precision, sm_count, max_shared_bytes)
+    if (
+        preference == _PREFILL_IMPL_SWAPAB
+        and (selected is None or selected.variant is not KernelVariant.DECODE_SPLITK)
+        and int(KernelVariant.PREFILL_SWAPAB) not in legal
+    ):
+        raise ValueError("prefill_impl='swapab' is unsupported for actual metadata")
     if selected is not None and int(selected.variant) in legal:
         return selected
     if int(KernelVariant.DECODE_SPLITK) in legal:
@@ -455,65 +464,6 @@ def _resolve_cpb(
     with _cpb._store_lock:
         c = _cpb.get_constants(device, cpb_family)
         scope_epoch = _cpb._constants_version
-    tuner = AutoTuner.get()
-    tuning = (
-        family != "dsv4_1"
-        and tuner.is_tuning_mode
-        and not _cpb._target_capturing(device)
-    )
-    # autotune(skip_ops={"sparse_mla_sm120"}) opts out of the multi-second
-    # calibration passes too, not only of choose_one.
-    skip_stack = tuner._get_skip_ops_stack()
-    skipped = bool(skip_stack) and "sparse_mla_sm120" in skip_stack[-1]
-    if (
-        c is None
-        and tuning
-        and not skipped
-        and not _cpb.is_calibration_failed(device, cpb_family)
-    ):
-        from ._execution import (
-            get_sparse_mla_sm120_module as _get_sparse_mla_sm120_decode_module,
-        )
-
-        try:
-            c = _cpb.calibrate(_get_sparse_mla_sm120_decode_module, cpb_family, device)
-        except (CalibrationError, torch.cuda.OutOfMemoryError, RuntimeError) as e:
-            logger.warning(
-                "SM120 sparse-MLA %s cpb calibration failed (%s); "
-                "falling back to the C++ heuristic for this process.",
-                cpb_family,
-                e,
-            )
-            _cpb.mark_calibration_failed(device, cpb_family)
-        else:
-            _cpb.save_constants(device, cpb_family, c)
-    if (
-        c is not None
-        and tuning
-        and not skipped
-        and not _cpb.is_crossover_failed(device, family)
-        and not _cpb.crossover_grid_complete(device, family)
-    ):
-        from ._execution import (
-            get_sparse_mla_sm120_module as _get_sparse_mla_sm120_decode_module,
-        )
-
-        try:
-            # glm_nsa crossover entries are produced by the dsv3_2 crossover
-            # calibration (shared kernel; separate key space).
-            table = _cpb.calibrate_crossover(
-                _get_sparse_mla_sm120_decode_module(), device, cpb_family, c
-            )
-        except (CalibrationError, torch.cuda.OutOfMemoryError, RuntimeError) as e:
-            logger.warning(
-                "SM120 sparse-MLA %s crossover calibration failed (%s); "
-                "keeping the decode-first routing default for this process.",
-                family,
-                e,
-            )
-            _cpb.mark_crossover_failed(device, family)
-        else:
-            _cpb.save_crossover(device, table)
     if c is None:
         return -1
     hot_key = (
@@ -530,59 +480,15 @@ def _resolve_cpb(
         _cpb_hot_cache.clear()
         _cpb_hot_epoch = _cpb._constants_version
     cpb = _cpb_hot_cache.get(hot_key)
-    if cpb is None or (tuning and not skipped):
-        single_cache_cpb_override = (
-            _cpb.get_cpb_override(device, cpb_family, num_heads, topk, num_tokens)
-            if extra_topk == 0
-            else None
+    if cpb is None:
+        cpb = _cpb.select_cpb(
+            num_tokens,
+            num_heads,
+            topk,
+            extra_topk,
+            c,
+            chunk_width=_cpb._CHUNK_WIDTH[cpb_family],
         )
-        cpb = single_cache_cpb_override
-        if (
-            cpb is None
-            and tuning
-            and not skipped
-            # Refinement measures single-cache shapes only; dual-cache picks
-            # stay on the model (their measured pick error is within ~6%).
-            and extra_topk == 0
-        ):
-            from ._execution import (
-                get_sparse_mla_sm120_module as _get_sparse_mla_sm120_decode_module,
-            )
-
-            try:
-                cpb = _cpb.refine_cpb(
-                    _get_sparse_mla_sm120_decode_module,
-                    cpb_family,
-                    device,
-                    c,
-                    num_tokens,
-                    num_heads,
-                    topk,
-                )
-            except (CalibrationError, torch.cuda.OutOfMemoryError, RuntimeError) as e:
-                logger.warning(
-                    "SM120 sparse-MLA %s cpb refinement failed at T=%d H=%d "
-                    "topk=%d (%s); using the model pick.",
-                    cpb_family,
-                    num_tokens,
-                    num_heads,
-                    topk,
-                    e,
-                )
-                cpb = None
-            else:
-                _cpb.save_cpb_override(
-                    device, cpb_family, num_heads, topk, num_tokens, cpb
-                )
-        if cpb is None:
-            cpb = _cpb.select_cpb(
-                num_tokens,
-                num_heads,
-                topk,
-                extra_topk,
-                c,
-                chunk_width=_cpb._CHUNK_WIDTH[cpb_family],
-            )
         _cpb_hot_cache[hot_key] = cpb
     return cpb
 
@@ -607,14 +513,11 @@ def plan(
     compute_precision: str = "default",
     extra_page_block_size: int = 0,
 ) -> Optional[PlannedCall]:
-    """Route one call to a kernel variant; None when no envelope serves it.
+    """Decode-first fallback when no configuration profile selects the call.
 
-    Policy: a decode-instantiated decode-form call takes DECODE_SPLITK up to
-    the calibrated ``decode_max_tokens`` crossover for
-    ``(model_type, num_heads, topk)`` (decode-first when uncalibrated);
-    everything else takes the prefill variant from :func:`prefill_variant`.
-    A forced swapab preference raises ValueError on ineligible shapes rather
-    than returning None."""
+    Compiled capabilities define eligibility; analytical constants only estimate
+    decode CPB. Forced prefill preferences do not change a legal decode phase.
+    """
     if compute_precision != "default":
         if compute_precision not in ("fp8", "bf16"):
             raise ValueError(f"unsupported compute_precision={compute_precision!r}")
@@ -683,9 +586,7 @@ def plan(
     if not decode_ok and pf is None:
         return None
     cpb = -1
-    if decode_ok and not (
-        model_type == _MODEL_TYPE_DSV4_1 and (has_extra or page_block_size != 64)
-    ):
+    if decode_ok and model_type != _MODEL_TYPE_DSV4_1:
         cpb = _resolve_cpb(
             device,
             _MODEL_TYPE_TO_FAMILY[model_type],
@@ -694,18 +595,5 @@ def plan(
             topk,
             extra_topk,
         )
-    # Dual DSV4_1 gathers need separate calibration, including the FP4 format.
-    crossover = (
-        None
-        if model_type == _MODEL_TYPE_DSV4_1 and (has_extra or page_block_size != 64)
-        else _cpb.get_decode_max_tokens(
-            device, _MODEL_TYPE_TO_FAMILY[model_type], num_heads, topk
-        )
-    )
-    variant = _select_calibrated_variant(
-        decode_eligible=decode_ok,
-        decode_variant=KernelVariant.DECODE_SPLITK,
-        prefill_variant=pf,
-        decode_preferred=(None if crossover is None else num_tokens <= crossover),
-    )
+    variant = KernelVariant.DECODE_SPLITK if decode_ok else pf
     return PlannedCall(variant, cpb if variant is KernelVariant.DECODE_SPLITK else -1)
