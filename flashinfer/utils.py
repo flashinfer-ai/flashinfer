@@ -274,6 +274,104 @@ def _get_cache_alibi_slopes_buf(
     return buf
 
 
+def _check_alibi_slopes(
+    alibi_slopes: Optional[torch.Tensor],
+    num_qo_heads: int,
+    device: torch.device,
+    pos_encoding_mode: str,
+    *,
+    require_alibi_mode: bool = True,
+) -> Optional[torch.Tensor]:
+    r"""Validate caller-supplied ALiBi slopes and return them unchanged.
+
+    ``alibi_slopes`` must hold one ``float32`` slope per local query head
+    (shape ``[num_qo_heads]``), be contiguous and live on ``device``. Unless
+    ``require_alibi_mode`` is false (a custom JIT module decides itself how the
+    tensor is used) it also requires ``pos_encoding_mode="ALIBI"``. ``None``
+    means the built-in slopes of :func:`get_alibi_slopes` are used.
+    """
+    if alibi_slopes is None:
+        return None
+    if not isinstance(alibi_slopes, torch.Tensor):
+        raise TypeError(
+            f"alibi_slopes must be a torch.Tensor, got {type(alibi_slopes).__name__}"
+        )
+    if require_alibi_mode and pos_encoding_mode != "ALIBI":
+        raise ValueError(
+            'alibi_slopes requires pos_encoding_mode="ALIBI", got '
+            f"pos_encoding_mode={pos_encoding_mode!r}"
+        )
+    check_shape_dtype_device(
+        alibi_slopes, (num_qo_heads,), torch.float32, device, "alibi_slopes"
+    )
+    if not alibi_slopes.is_contiguous():
+        raise ValueError("alibi_slopes must be contiguous")
+    return alibi_slopes
+
+
+def _check_alibi_slopes_backend(
+    alibi_slopes: Optional[torch.Tensor],
+    backend: str,
+    jit_tensor_names: Optional[Sequence[str]],
+) -> None:
+    r"""Reject caller-supplied ALiBi slopes where no kernel would read them.
+
+    A custom JIT module (``jit_tensor_names`` is its additional tensor list)
+    reads the tensor only if it declares ``maybe_alibi_slopes``. Otherwise only
+    the ``fa2`` kernels do; ``"auto"`` is accepted because it resolves to
+    ``fa2`` for ALiBi.
+    """
+    if alibi_slopes is None:
+        return
+    if jit_tensor_names is not None:
+        if "maybe_alibi_slopes" in jit_tensor_names:
+            return
+        raise NotImplementedError(
+            "alibi_slopes was passed but the JIT module does not declare the "
+            "maybe_alibi_slopes additional tensor"
+        )
+    if backend in ("auto", "fa2"):
+        return
+    raise NotImplementedError(
+        f"alibi_slopes is only supported by the fa2 backend, got backend={backend!r}"
+    )
+
+
+def _resolve_alibi_slopes(
+    alibi_slopes: Optional[torch.Tensor], num_qo_heads: int, device: torch.device
+) -> torch.Tensor:
+    r"""Slopes handed to a kernel: the caller's tensor, else the cached built-in ones."""
+    if alibi_slopes is None:
+        return _get_cache_alibi_slopes_buf(num_qo_heads, device)
+    if alibi_slopes.numel() != num_qo_heads:
+        raise ValueError(
+            f"alibi_slopes has {alibi_slopes.numel()} entries but q has "
+            f"{num_qo_heads} heads"
+        )
+    return alibi_slopes
+
+
+def _stage_alibi_slopes(
+    alibi_slopes: Optional[torch.Tensor], buf: Optional[torch.Tensor]
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    r"""Copy validated slopes into a wrapper-owned buffer with a stable address.
+
+    Returns ``(active, buf)``: ``active`` is ``buf`` holding the new values, or
+    ``None`` when no slopes were passed. Reusing ``buf`` keeps the pointer that
+    a captured CUDA graph reads valid across ``plan()`` calls.
+    """
+    if alibi_slopes is None:
+        return None, buf
+    if (
+        buf is None
+        or buf.shape != alibi_slopes.shape
+        or buf.device != alibi_slopes.device
+    ):
+        buf = torch.empty_like(alibi_slopes)
+    buf.copy_(alibi_slopes)
+    return buf, buf
+
+
 def canonicalize_torch_dtype(dtype: Union[torch.dtype, str]) -> torch.dtype:
     if isinstance(dtype, str):
         return getattr(torch, dtype)
