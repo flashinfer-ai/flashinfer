@@ -37,7 +37,7 @@ import math
 
 import cutlass
 import cutlass.cute as cute
-from .direct_q1_metadata import DirectQ1MetadataView, HeadIndexedMetadataView
+from .direct_sparse_metadata import DirectSparseMetadataView, HeadIndexedMetadataView
 from cuda.bindings import driver as cuda_drv
 from cutlass import Float32, Int32, Int64
 from cutlass.experimental import primitives as prims
@@ -121,7 +121,7 @@ def _reduction_q_group_idx(
 @cute.jit
 def _reduction_active_splits_kv(
     cfg: cutlass.Constexpr[FmhaDecodeConfig],
-    g_seqlens_kv: cute.Pointer | DirectQ1MetadataView,
+    g_seqlens_kv: cute.Pointer | DirectSparseMetadataView,
     b_idx: Int32,
     h_r: Int32,
     logical_output_row_idx: Int32,
@@ -140,7 +140,7 @@ def _reduction_active_splits_kv(
 @cute.jit
 def _reduce_exact_splits_body(
     o_iter: cute.Pointer,
-    g_seqlens_kv: cute.Pointer | DirectQ1MetadataView,
+    g_seqlens_kv: cute.Pointer | DirectSparseMetadataView,
     g_cu_seqlens_q: cute.Pointer,
     g_partial_o: cute.Pointer,
     g_partial_stats: cute.Pointer,
@@ -165,7 +165,7 @@ def _reduce_exact_splits_body(
     if cutlass.const_expr(
         cfg.use_q_token_kv_block_sparse_route
         and not cfg.shares_sparse_pattern
-        and not isinstance(g_seqlens_kv, DirectQ1MetadataView)
+        and not isinstance(g_seqlens_kv, DirectSparseMetadataView)
     ):
         g_seqlens_kv = HeadIndexedMetadataView(g_seqlens_kv, grid_h_k, h_k_idx)
     # Flatten batch and KV-head so the partial buffers use one contiguous
@@ -303,7 +303,7 @@ def _reduce_exact_splits_body(
 @cute.kernel
 def decode_gen_separate_reduction_kernel(
     o_iter: cute.Pointer,
-    g_seqlens_kv: cute.Pointer | DirectQ1MetadataView,
+    g_seqlens_kv: cute.Pointer | DirectSparseMetadataView,
     g_cu_seqlens_q: cute.Pointer,
     g_partial_o: cute.Pointer,
     g_partial_stats: cute.Pointer,
@@ -449,7 +449,7 @@ def _store_parallel_reduction_output(
 @cute.kernel
 def decode_gen_parallel_separate_reduction_kernel(
     o_iter: cute.Pointer,
-    g_seqlens_kv: cute.Pointer | DirectQ1MetadataView,
+    g_seqlens_kv: cute.Pointer | DirectSparseMetadataView,
     g_cu_seqlens_q: cute.Pointer,
     g_partial_o: cute.Pointer,
     g_partial_stats: cute.Pointer,
@@ -487,7 +487,7 @@ def decode_gen_parallel_separate_reduction_kernel(
     if cutlass.const_expr(
         cfg.use_q_token_kv_block_sparse_route
         and not cfg.shares_sparse_pattern
-        and not isinstance(g_seqlens_kv, DirectQ1MetadataView)
+        and not isinstance(g_seqlens_kv, DirectSparseMetadataView)
     ):
         g_seqlens_kv = HeadIndexedMetadataView(g_seqlens_kv, grid_h_k, h_k_idx)
     cluster_rank = cute.arch.block_idx_in_cluster()
@@ -835,7 +835,7 @@ def decode_gen_parallel_separate_reduction_kernel(
 def fmha_decode_separate_reduction_launch(
     problem_shape: tuple[Int32, Int32, Int32, Int32, Int32],
     o_iter: cute.Pointer,
-    seqlens_kv_iter: cute.Pointer | DirectQ1MetadataView,
+    seqlens_kv_iter: cute.Pointer | DirectSparseMetadataView,
     cu_seqlens_q_iter: cute.Pointer,
     partial_o_iter: cute.Pointer,
     partial_stats_iter: cute.Pointer,

@@ -42,7 +42,10 @@ from flashinfer.trace.templates.attention import (
     prims_ts_paged_block_sparse_wrapper_trace_dispatch,
 )
 
-from ._block_sparse.common import _validate_contiguous_route_mode
+from ._block_sparse.common import (
+    _num_sparse_pattern_heads,
+    _validate_contiguous_route_mode,
+)
 from ._block_sparse.config import _validate_block_sparse_static_profile
 from ._block_sparse.inspection import (
     _inspect_block_sparse_bsr,
@@ -478,7 +481,9 @@ def block_sparse_attention(
         batch_size=static.batch_size,
         seq_len_q=static.seq_len_q,
         seq_len_kv=static.seq_len_kv,
-        num_kv_heads=1 if static.share_pattern_across_kv_heads else static.num_kv_heads,
+        num_kv_heads=_num_sparse_pattern_heads(
+            static.num_kv_heads, static.share_pattern_across_kv_heads
+        ),
         q_block_size=static.q_block_size,
         kv_block_size=static.kv_block_size,
         use_kv_valid_bits=static.use_kv_valid_bits,
@@ -858,7 +863,9 @@ def block_sparse_attention_with_paged_kv_cache(
         batch_size=static.batch_size,
         seq_len_q=static.seq_len_q,
         seq_len_kv=static.seq_len_kv,
-        num_kv_heads=1 if static.share_pattern_across_kv_heads else static.num_kv_heads,
+        num_kv_heads=_num_sparse_pattern_heads(
+            static.num_kv_heads, static.share_pattern_across_kv_heads
+        ),
         q_block_size=static.q_block_size,
         kv_block_size=static.kv_block_size,
         use_kv_valid_bits=static.use_kv_valid_bits,

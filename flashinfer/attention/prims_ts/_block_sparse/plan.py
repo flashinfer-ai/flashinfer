@@ -24,7 +24,11 @@ import torch
 
 from flashinfer.utils import ceil_div
 
-from .common import _SIGNED_INT32_MAX, _block_sparse_proxy_summary_geometry
+from .common import (
+    _SIGNED_INT32_MAX,
+    _block_sparse_proxy_summary_geometry,
+    _num_sparse_pattern_heads,
+)
 from .compiler import _get_compiled_block_sparse
 from .config import (
     _BlockSparseStaticProfile,
@@ -193,7 +197,9 @@ def _build_block_sparse_plan_state(
         assert sparse_format == "bsr" and not use_proxy_routes
     num_rows = (
         static.batch_size
-        * (1 if static.share_pattern_across_kv_heads else static.num_kv_heads)
+        * _num_sparse_pattern_heads(
+            static.num_kv_heads, static.share_pattern_across_kv_heads
+        )
         * ceil_div(static.seq_len_q, static.q_block_size)
     )
     if num_rows > _SIGNED_INT32_MAX:

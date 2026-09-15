@@ -772,15 +772,15 @@ def _make_case(group_size: int, block_topk: int, storage_page_size: int = 16):
 @pytest.mark.parametrize("position_dtype", (torch.int32, torch.int64))
 @pytest.mark.parametrize("page_size", (16, 784))
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_direct_q1_metadata_views_match_materialized_graph_replay(
+def test_direct_sparse_metadata_views_match_materialized_graph_replay(
     packed: bool, position_dtype: torch.dtype, page_size: int
 ) -> None:
     """Lazy views preserve causal-prefix, tail, strided-input and inert-row semantics."""
     import cutlass
     import cutlass.cute as cute
     from cuda.bindings import driver as cuda_drv
-    from flashinfer.attention.prims_ts.kernels.fmha_decode.direct_q1_metadata import (
-        DirectQ1MetadataView,
+    from flashinfer.attention.prims_ts.kernels.fmha_decode.direct_sparse_metadata import (
+        DirectSparseMetadataView,
     )
 
     rows, topk, model_len = 24, 512, 8192
@@ -824,7 +824,7 @@ def test_direct_q1_metadata_views_match_materialized_graph_replay(
 
     @cute.jit
     def launch(raw, qo, output, seq, stream):
-        pages = DirectQ1MetadataView(
+        pages = DirectSparseMetadataView(
             raw,
             qo,
             packed=packed,
@@ -833,7 +833,7 @@ def test_direct_q1_metadata_views_match_materialized_graph_replay(
             page_capacity=capacity,
             lengths=False,
         )
-        lengths = DirectQ1MetadataView(
+        lengths = DirectSparseMetadataView(
             raw,
             qo,
             packed=packed,

@@ -21,6 +21,7 @@ import torch
 
 from flashinfer.utils import ceil_div
 
+from .common import _num_sparse_pattern_heads
 from .config import _BlockSparseCompileKey, _make_block_sparse_config
 
 
@@ -44,7 +45,9 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
     )
 
     config = _make_block_sparse_config(key)
-    pattern_heads = 1 if key.share_pattern_across_kv_heads else key.num_kv_heads
+    pattern_heads = _num_sparse_pattern_heads(
+        key.num_kv_heads, key.share_pattern_across_kv_heads
+    )
     prepare_kwargs = {
         "batch_size": key.batch_size,
         "num_kv_heads": pattern_heads,

@@ -32,6 +32,7 @@ from flashinfer.trace.templates.attention import (
 )
 
 from . import _q_token_kv_block_sparse_policy as _sparse_policy
+from ._block_sparse.common import _num_sparse_pattern_heads
 
 PagedKVCache = Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]
 
@@ -1423,7 +1424,7 @@ def _get_compiled_decode(
 
     from .kernels.fmha_decode.fmha_decode_config import FmhaDecodeConfig
     from .kernels.fmha_decode.fmha_decode_kernel import fmha_decode_launch
-    from .kernels.fmha_decode.direct_q1_metadata import DirectQ1MetadataView
+    from .kernels.fmha_decode.direct_sparse_metadata import DirectSparseMetadataView
 
     direct_q1_spec = compile_spec.direct_q1_spec
 
@@ -1486,7 +1487,9 @@ def _get_compiled_decode(
     ) -> None:
         """Adapt TVM-FFI tensors to the dense block-table pointer launcher."""
 
-        pattern_heads = 1 if static_cfg.shares_sparse_pattern else static_num_kv_heads
+        pattern_heads = _num_sparse_pattern_heads(
+            static_num_kv_heads, static_cfg.shares_sparse_pattern
+        )
         batch_size = Int32(cute.size(seq_lens)) // Int32(pattern_heads)
         q_offsets_iter = cu_seqlens_q.iterator
         total_q_tokens = batch_size * Int32(static_seq_len_q)
@@ -1501,7 +1504,7 @@ def _get_compiled_decode(
         lengths_iter = seq_lens.iterator
         pages_iter = block_table.iterator
         if cutlass.const_expr(direct_q1_spec is not None):
-            lengths_iter = DirectQ1MetadataView(
+            lengths_iter = DirectSparseMetadataView(
                 direct_q1_inputs,
                 cu_seqlens_q,
                 packed=static_cfg.use_variable_seqlens_q,
@@ -1512,7 +1515,7 @@ def _get_compiled_decode(
                 fragment_size=static_cfg.num_tokens_per_page,
                 lengths=True,
             )
-            pages_iter = DirectQ1MetadataView(
+            pages_iter = DirectSparseMetadataView(
                 direct_q1_inputs,
                 cu_seqlens_q,
                 packed=static_cfg.use_variable_seqlens_q,
@@ -1595,8 +1598,8 @@ def _get_compiled_decode(
         ) -> None:
             """Adapt TVM-FFI tensors to the raw standalone split reducer."""
 
-            pattern_heads = (
-                1 if static_cfg.shares_sparse_pattern else static_num_kv_heads
+            pattern_heads = _num_sparse_pattern_heads(
+                static_num_kv_heads, static_cfg.shares_sparse_pattern
             )
             batch_size = Int32(cute.size(seq_lens)) // Int32(pattern_heads)
             q_offsets_iter = cu_seqlens_q.iterator
@@ -1605,7 +1608,7 @@ def _get_compiled_decode(
 
             lengths_iter = seq_lens.iterator
             if cutlass.const_expr(direct_q1_spec is not None):
-                lengths_iter = DirectQ1MetadataView(
+                lengths_iter = DirectSparseMetadataView(
                     direct_q1_inputs,
                     cu_seqlens_q,
                     packed=static_cfg.use_variable_seqlens_q,
@@ -1709,7 +1712,7 @@ def _get_compiled_decode(
             assumed_align=assumed_align,
         )
 
-    pattern_heads = 1 if cfg.shares_sparse_pattern else num_kv_heads
+    pattern_heads = _num_sparse_pattern_heads(num_kv_heads, cfg.shares_sparse_pattern)
     metadata_rows = batch_size * pattern_heads
     seq_lens_fake = fake_compact(Int32, (metadata_rows,), 4)
     cu_seqlens_q_fake = fake_compact(
@@ -3198,8 +3201,8 @@ def _prepare_prims_ts_batch_decode_plan(
     normalized_cache = _normalize_native_paged_kv_cache(
         kv_cache, expected_device=query.device
     )
-    pattern_heads = (
-        1 if share_pattern_across_kv_heads else normalized_cache.num_kv_heads
+    pattern_heads = _num_sparse_pattern_heads(
+        normalized_cache.num_kv_heads, share_pattern_across_kv_heads
     )
     if metadata_rows % pattern_heads:
         raise ValueError("metadata rows must be divisible by the pattern head count")
