@@ -4,7 +4,16 @@ flashinfer.kda_decode
 =====================
 
 Key-Driven Attention (KDA) decode API. The CuTe-DSL kernel lives under
-``flashinfer.kda_kernels``; this module is the public entry point.
+``flashinfer.kda_kernels``.
+
+.. deprecated::
+
+    ``flashinfer.kda_decode.recurrent_kda`` is deprecated and now a shim over
+    the decode dispatcher shared with :func:`flashinfer.recurrent_kda`, which
+    is the canonical entry point: it serves this same decode contract, accepts
+    a superset of what this one accepts, and defaults to ``backend="auto"``.
+    Calling it emits a :class:`DeprecationWarning`. ``fused_kda_decode`` and
+    ``packed_kda_decode`` are unaffected and remain here.
 
 The public ``recurrent_kda`` API supports standard decode with one token per
 sequence (``T=1``) and packed speculative decode with two or more tokens per
