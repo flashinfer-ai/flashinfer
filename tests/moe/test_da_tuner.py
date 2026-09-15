@@ -1,11 +1,14 @@
 """Host-only tests for distribution-aware MoE tuning policy."""
 
 import math
+from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 import torch
 
 from flashinfer.fused_moe.da_moe import _local_load_spectrum
+from flashinfer.fused_moe.da_runtime import run_dist_aware_tactic
 from flashinfer.fused_moe.da_tuner import (
     DAPlanCompiler,
     DAProfileSelection,
@@ -13,6 +16,39 @@ from flashinfer.fused_moe.da_tuner import (
     RoutingRealizationKey,
 )
 from flashinfer.fused_moe.tactic_search import FactorizedTactic
+
+
+def test_da_runtime_falls_back_when_topk_exceeds_local_shard() -> None:
+    """A valid EP shape outside the synthetic workload model stays on NoDA."""
+    baseline_tactic = (16, 7)
+    calls: list[object] = []
+
+    result = run_dist_aware_tactic(
+        backend="prims_ts",
+        custom_op="test::moe",
+        tuner=cast(Any, None),
+        config=cast(Any, None),
+        runner=cast(Any, None),
+        runtime=SimpleNamespace(backend="prims_ts"),
+        tuning_config=cast(Any, None),
+        inputs=[],
+        runner_kwargs={},
+        baseline_tactic=baseline_tactic,
+        routing_input_mode=0,
+        routing_id_index=0,
+        routing_weight_index=1,
+        num_experts=1024,
+        local_expert_offset=0,
+        num_local_experts=16,
+        top_k=32,
+        routing_method_type=0,
+        routed_scaling_factor=1.0,
+        run_fixed_tactic=lambda tactic: calls.append(tactic) or "ordinary",
+        finish_switch=lambda: pytest.fail("ineligible DA shape entered capture"),
+    )
+
+    assert result == "ordinary"
+    assert calls == [baseline_tactic]
 
 
 def _selection(

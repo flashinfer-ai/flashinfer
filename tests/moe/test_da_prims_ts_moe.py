@@ -227,6 +227,48 @@ def test_nvfp4_da_public_graph_lifecycle(monkeypatch, routing_input_mode):
     assert all(row["capture_policy"] != "noda_capture_fallback" for row in rows)
 
 
+def test_nvfp4_da_supports_1024_experts_and_topk32(monkeypatch) -> None:
+    """PrimsTS DA must tune and replay the full expert and top-k domain."""
+    if not torch.cuda.is_available():
+        pytest.skip("PrimsTS DA requires CUDA")
+    if get_compute_capability(torch.device("cuda")) not in ((10, 0), (10, 3)):
+        pytest.skip("This PrimsTS DA runtime test requires SM100 or SM103")
+    if not is_prims_ts_available():
+        pytest.skip("PrimsTS dependencies are unavailable")
+
+    monkeypatch.setenv("FLASHINFER_DA_BASELINE_GUARD", "0")
+    shape = BenchmarkShape(
+        num_tokens=64,
+        num_experts=1024,
+        local_num_experts=64,
+        local_expert_offset=480,
+        top_k=32,
+        hidden_size=1024,
+        intermediate_size=1024,
+        n_group=1,
+        topk_group=1,
+        tune_max_num_tokens=64,
+    )
+    rows = _benchmark_precision(
+        "nvfp4",
+        shape,
+        ("uniform", "ddist:4"),
+        cache=None,
+        tune=True,
+        warmup=0,
+        iterations=2,
+        backend="prims_ts",
+    )
+
+    assert {str(row["status"]) for row in rows} == {"pass"}
+    assert {int(row["num_experts"]) for row in rows} == {1024}
+    assert {int(row["top_k"]) for row in rows} == {32}
+    assert {str(row["capture_policy"]) for row in rows} <= {
+        "da_single_body",
+        "da_switch",
+    }
+
+
 @pytest.mark.parametrize(
     "precision",
     ("bf16", "mxfp4", "w4a16", "fp8_per_tensor", "fp8_block", "mxfp8"),
