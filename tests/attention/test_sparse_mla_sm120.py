@@ -379,6 +379,8 @@ _DSV4_DECODE_CONFIGS = [
     (128, 192),
     (128, 256),
     (128, 1024),
+    # DeepSeek-V4.1-Flash production shape: TP4 shard of 64 heads at topk=1152.
+    (16, 1152),
     # Runtime-H instantiation: arbitrary head counts ride the NUM_HEADS=0
     # kernel (zero-Q-padded tile, HPB-aligned scratch). 12 exercises the
     # in-block pad path, 24 a remainder second block, 80 an exact multiple.

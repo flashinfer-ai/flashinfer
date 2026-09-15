@@ -83,7 +83,9 @@ def test_supported_configs_families() -> None:
     assert dsv4.page_block_size == 64
     assert dsv4.max_num_tokens == _DECODE_MAX_TOKENS
     assert dsv4.max_num_heads == 128
-    assert dsv4.topks == frozenset({128, 192, 256, 512, 1024})  # calibrated values
+    assert dsv4.topks == frozenset(
+        {128, 192, 256, 512, 1024, 1152}
+    )  # calibrated values
     assert dsv4.min_topk == 1
     # DSv4 dual-cache prefill accepts 128-token secondary pages
     # (DeepSeek V4.1-Flash compress_ratio=1 layers).
@@ -193,9 +195,9 @@ def test_supported_helpers() -> None:
     dsv4 = supported_sparse_mla_sm120_configs()["dsv4"]
     # Runtime-H instantiation: every head count in [1, 128] is served.
     assert dsv4.supported_num_heads() == tuple(range(1, 129))
-    assert dsv4.supported_topk(64) == (128, 192, 256, 512, 1024)
-    assert dsv4.supported_topk() == (128, 192, 256, 512, 1024)
-    assert dsv4.supported_topk(48) == (128, 192, 256, 512, 1024)  # any H <= 128
+    assert dsv4.supported_topk(64) == (128, 192, 256, 512, 1024, 1152)
+    assert dsv4.supported_topk() == (128, 192, 256, 512, 1024, 1152)
+    assert dsv4.supported_topk(48) == (128, 192, 256, 512, 1024, 1152)  # any H <= 128
     assert dsv4.supported_topk(256) == ()  # beyond the runtime-H ceiling
 
     dsv3_2 = supported_sparse_mla_sm120_configs()["dsv3_2"]
