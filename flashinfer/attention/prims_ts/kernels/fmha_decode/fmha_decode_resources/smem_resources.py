@@ -45,7 +45,7 @@ from ...._block_sparse.common import (
     _prepared_kv_routes_are_block_aligned,
 )
 from ..fmha_decode_config import FmhaDecodeConfig
-from ..direct_q1_metadata import DirectQ1MetadataView
+from ..direct_sparse_metadata import DirectSparseMetadataView
 from ..fmha_decode_constants import (
     KV_INST0,
     KV_INST1,
@@ -1317,7 +1317,7 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
 
     cfg: Constexpr[FmhaDecodeConfig] = None
     stage_page_ids_per_tile: Constexpr[bool] = False
-    page_idx_kv: cute.Pointer | DirectQ1MetadataView | None = None
+    page_idx_kv: cute.Pointer | DirectSparseMetadataView | None = None
     q_token_kv_block_sparse_page_memberships: cute.Pointer | None = None
     seqlens_kv: cute.Pointer | None = None
     use_native_paged_kv: Constexpr[bool] = False
@@ -1660,7 +1660,7 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
         return cached_page_ids
 
     @cute.jit
-    def _prefetch_q1_pages_async(
+    def _prefetch_page_offsets_async(
         self,
         stage_info,
         source,
@@ -1671,16 +1671,18 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
         warp_rank,
         route_state,
     ):
-        """Stage Q1 IDs with 4-byte cp.async, then map them before publication.
+        """Stage int32 IDs with cp.async and resolve direct inputs in place.
 
         Copy and mapping use the same lane ownership, so the per-thread
         wait suffices before in-place mapping. The existing TS full barrier
         then publishes all lanes' final locators to the TMA load task.
+        Materialized locators need no translation. Direct inputs contain only
+        selected block IDs; their causal tail locators are synthesized here.
         """
         entries = self.page_ids_per_stage
         stage_base = stage_info.stage_idx * Int32(entries)
         source_last = last
-        if cutlass.const_expr(isinstance(source, DirectQ1MetadataView)):
+        if cutlass.const_expr(isinstance(source, DirectSparseMetadataView)):
             blocks = source.values[0]
             row, _, visible = route_state
             safe_row = cute.math.min(
@@ -1712,7 +1714,7 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
                 copy_bytes = Int32(0)
                 if slot <= source_last:
                     source_slot = slot
-                    if cutlass.const_expr(isinstance(source, DirectQ1MetadataView)):
+                    if cutlass.const_expr(isinstance(source, DirectSparseMetadataView)):
                         source_slot = slot // Int32(source.fragments_per_block)
                     copy_bytes = Int32(4)
                 prims.cp_async_shared_global(
@@ -1728,7 +1730,7 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
             offset = owner + Int32(group * stride)
             if offset < Int32(entries):
                 slot = first + offset
-                if cutlass.const_expr(isinstance(source, DirectQ1MetadataView)):
+                if cutlass.const_expr(isinstance(source, DirectSparseMetadataView)):
                     locator = Int32(-1)
                     if slot <= last:
                         logical = Int32(self._smem_page_offsets[stage_base + offset])
@@ -1787,7 +1789,7 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
             page_idx_kv = self.page_idx_kv
         smem_page_offsets = self._smem_page_offsets
         direct_route = None
-        if cutlass.const_expr(isinstance(page_idx_kv, DirectQ1MetadataView)):
+        if cutlass.const_expr(isinstance(page_idx_kv, DirectSparseMetadataView)):
             direct_route = page_idx_kv.resolve_route(logical_b_idx)
             if cutlass.const_expr(self.holds_encoded_locator_window):
                 # The allocation covers the planned maximum, but a shorter
@@ -1851,17 +1853,26 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
                             ]
                         )
                         if cutlass.const_expr(
-                            cfg.tile_size_kv // cfg.num_tokens_per_page < 4
+                            (cfg.tile_size_kv // cfg.num_tokens_per_page)
+                            % Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIPS_PER_WORD
+                            != 0
                         ):
-                            # KV64/KV128 fragments can start a split in the
-                            # middle of a packed word. Rebase bytes to the
-                            # CTA's local page zero without reading past the
-                            # producer's live prefix.
-                            byte_offset = (raw_tile_base * pages_per_tile) & Int32(3)
+                            # A tile boundary need not align with a packed
+                            # membership word. Rebase to this CTA's first page
+                            # without reading beyond the live byte prefix.
+                            byte_offset = (raw_tile_base * pages_per_tile) % Int32(
+                                Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIPS_PER_WORD
+                            )
                             if byte_offset != Int32(0):
-                                membership_word >>= byte_offset * Int32(8)
+                                membership_word >>= byte_offset * Int32(
+                                    Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIP_BITS
+                                )
                                 if (
-                                    first_logical_page_idx + Int32(4) - byte_offset
+                                    first_logical_page_idx
+                                    + Int32(
+                                        Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIPS_PER_WORD
+                                    )
+                                    - byte_offset
                                     <= page_idx_ub
                                 ):
                                     following = Uint32(
@@ -1873,7 +1884,15 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
                                         ]
                                     )
                                     membership_word |= following << (
-                                        (Int32(4) - byte_offset) * Int32(8)
+                                        (
+                                            Int32(
+                                                Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIPS_PER_WORD
+                                            )
+                                            - byte_offset
+                                        )
+                                        * Int32(
+                                            Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIP_BITS
+                                        )
                                     )
                         # The producer owns only the live byte prefix. Mask the
                         # final word here so padding bytes remain unobservable
@@ -1902,7 +1921,7 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
                 first_tile = Int32(
                     _decode_gen_task_cache(stage_info)[_TASK_CACHE_KV_RAW_TILE_BASE]
                 )
-            self._prefetch_q1_pages_async(
+            self._prefetch_page_offsets_async(
                 stage_info,
                 page_idx_kv,
                 page_table_offset,
@@ -1944,7 +1963,7 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
                         & (grouped_logical_page_idx <= page_idx_ub)
                     ):
                         if cutlass.const_expr(
-                            isinstance(page_idx_kv, DirectQ1MetadataView)
+                            isinstance(page_idx_kv, DirectSparseMetadataView)
                         ):
                             page_locator = page_idx_kv.load_page(
                                 direct_route, grouped_logical_page_idx
@@ -1972,7 +1991,7 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
                 page_locator = Int32(-1)
                 if (page_warp_rank == Int32(0)) & (logical_page_idx <= page_idx_ub):
                     if cutlass.const_expr(
-                        isinstance(page_idx_kv, DirectQ1MetadataView)
+                        isinstance(page_idx_kv, DirectSparseMetadataView)
                     ):
                         page_locator = page_idx_kv.load_page(
                             direct_route, logical_page_idx

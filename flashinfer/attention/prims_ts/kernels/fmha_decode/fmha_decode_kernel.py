@@ -34,7 +34,7 @@ import math
 import cutlass
 import cutlass.experimental.cuda as cuda
 import cutlass.cute as cute
-from .direct_q1_metadata import DirectQ1MetadataView, HeadIndexedMetadataView
+from .direct_sparse_metadata import DirectSparseMetadataView, HeadIndexedMetadataView
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 from cuda.bindings import driver as cuda_drv
@@ -583,6 +583,9 @@ def _build_decode_gen_schedule(
         and cfg.kv_block_size in (8, 16)
         and cfg.num_insts_kv == 2
     )
+    # Independent K0/K1/V0/V1 data rings share identical native sparse locators.
+    # A held route is published once and retained through the final V issue;
+    # only schedules that replace locators per tile need separate K/V state.
     use_separate_kv_page_offset_resources = (
         use_dense_page_offsets
         and use_per_inst_kv_resources
@@ -2129,9 +2132,9 @@ def _run_decode_gen_active(
     g_h_k: Int32,
     g_scale_s_log2_e: Float32,
     g_output_scale: Float32,
-    g_seqlens_kv: cute.Pointer | DirectQ1MetadataView,
+    g_seqlens_kv: cute.Pointer | DirectSparseMetadataView,
     g_cu_seqlens_q: cute.Pointer,
-    g_page_idx_kv: cute.Pointer | DirectQ1MetadataView,
+    g_page_idx_kv: cute.Pointer | DirectSparseMetadataView,
     g_page_table_stride: Int64,
     g_page_table_capacity: Int32,
     g_q_token_kv_block_sparse_page_memberships: cute.Pointer,
@@ -2468,9 +2471,9 @@ def _run_decode_gen_runtime_prefix(
     g_h_k: Int32,
     g_scale_s_log2_e: Float32,
     g_output_scale: Float32,
-    g_seqlens_kv: cute.Pointer | DirectQ1MetadataView,
+    g_seqlens_kv: cute.Pointer | DirectSparseMetadataView,
     g_cu_seqlens_q: cute.Pointer,
-    g_page_idx_kv: cute.Pointer | DirectQ1MetadataView,
+    g_page_idx_kv: cute.Pointer | DirectSparseMetadataView,
     g_page_table_stride: Int64,
     g_page_table_capacity: Int32,
     g_q_token_kv_block_sparse_page_memberships: cute.Pointer,
@@ -2646,9 +2649,9 @@ def decode_gen_kernel(
     g_h_k: Int32,
     g_scale_s_log2_e: Float32,
     g_output_scale: Float32,
-    g_seqlens_kv: cute.Pointer | DirectQ1MetadataView,
+    g_seqlens_kv: cute.Pointer | DirectSparseMetadataView,
     g_cu_seqlens_q: cute.Pointer,
-    g_page_idx_kv: cute.Pointer | DirectQ1MetadataView,
+    g_page_idx_kv: cute.Pointer | DirectSparseMetadataView,
     g_page_table_stride: Int64,
     g_page_table_capacity: Int32,
     g_q_token_kv_block_sparse_page_memberships: cute.Pointer,
@@ -2678,7 +2681,7 @@ def decode_gen_kernel(
     if cutlass.const_expr(
         cfg.use_q_token_kv_block_sparse_route and not cfg.shares_sparse_pattern
     ):
-        if cutlass.const_expr(isinstance(g_page_idx_kv, DirectQ1MetadataView)):
+        if cutlass.const_expr(isinstance(g_page_idx_kv, DirectSparseMetadataView)):
             g_page_idx_kv = g_page_idx_kv.with_head(h_k_idx)
         else:
             g_seqlens_kv = HeadIndexedMetadataView(g_seqlens_kv, g_h_k, h_k_idx)
@@ -2860,10 +2863,10 @@ def fmha_decode_launch(
     k_iter: cute.Pointer,
     v_iter: cute.Pointer,
     o_iter: cute.Pointer,
-    seqlens_kv_iter: cute.Pointer | DirectQ1MetadataView,
+    seqlens_kv_iter: cute.Pointer | DirectSparseMetadataView,
     cu_seqlens_q_iter: cute.Pointer,
     total_q_tokens: Int32,
-    page_idx_kv_iter: cute.Pointer | DirectQ1MetadataView,
+    page_idx_kv_iter: cute.Pointer | DirectSparseMetadataView,
     q_token_kv_block_sparse_page_memberships_iter: cute.Pointer,
     partial_o_iter: cute.Pointer,
     partial_stats_iter: cute.Pointer,

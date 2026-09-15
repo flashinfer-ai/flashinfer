@@ -38,8 +38,14 @@ class HeadIndexedMetadataView:
         return values[Int64(route) * Int64(heads) + Int64(head)]
 
 
-class DirectQ1MetadataView:
-    """Resolve one query's semantic blocks at physical-fragment consumers."""
+class DirectSparseMetadataView:
+    """Lazy sparse metadata resolved from raw inputs for one query per route.
+
+    The combined G1 path skips metadata construction: attention resolves block
+    IDs, causal tails, physical locators and lengths directly from the inputs.
+    G1 means one token per route, not one token per request; packed and fixed
+    requests may each contain several routes. Split reduction can still run.
+    """
 
     def __init__(
         self,
@@ -70,7 +76,7 @@ class DirectQ1MetadataView:
 
     def __new_from_mlir_values__(self, values):
         new = cutlass.new_from_mlir_values(self.values, values)
-        return DirectQ1MetadataView(
+        return DirectSparseMetadataView(
             new[:4],
             new[4],
             packed=self.packed,
@@ -84,7 +90,7 @@ class DirectQ1MetadataView:
         )
 
     def with_head(self, head):
-        return DirectQ1MetadataView(
+        return DirectSparseMetadataView(
             self.values[:4],
             self.values[4],
             packed=self.packed,

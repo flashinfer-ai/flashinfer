@@ -43,6 +43,7 @@ import torch
 from flashinfer.api_logging import flashinfer_experimental_api
 
 from ...utils import device_support_pdl
+from ._block_sparse.common import _num_sparse_pattern_heads
 
 _Q_TOKEN_KV_BLOCK_SPARSE_MIN_BLOCK_SIZE = 4
 _Q_TOKEN_KV_BLOCK_SPARSE_BLOCK_SIZES = (4, 8, 16, 32, 64, 128)
@@ -987,7 +988,9 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
     )
     if not isinstance(share_pattern_across_kv_heads, bool):
         raise TypeError("share_pattern_across_kv_heads must be a bool")
-    pattern_heads = 1 if share_pattern_across_kv_heads else num_kv_heads
+    pattern_heads = _num_sparse_pattern_heads(
+        num_kv_heads, share_pattern_across_kv_heads
+    )
     metadata_rows = groups * pattern_heads
     fragment_size = math.gcd(sparse_block_size, storage_page_size)
     block_capacity = min(
@@ -1312,7 +1315,7 @@ def _build_prims_ts_q_token_kv_block_sparse_metadata(
         share_pattern_across_kv_heads,
     )
     rows, block_topk = block_indices.shape[0], block_indices.shape[-1]
-    pattern_heads = 1 if share_pattern_across_kv_heads else block_indices.shape[1]
+    pattern_heads = block_indices.shape[1] if block_indices.ndim == 3 else 1
     use_packed_q = qo_indptr is not None
     if use_packed_q:
         _validate_q_token_kv_block_sparse_qo_indptr_tensor(
