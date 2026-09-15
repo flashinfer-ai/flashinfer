@@ -243,12 +243,14 @@ def prims_ts_bf16_moe_op(
         )
         return unpack_trtllm_moe_output(intermediate_output, output, do_finalize, None)
 
-    from flashinfer.fused_moe.da_moe import DA_MAX_EXPERTS
+    from flashinfer.fused_moe.da_moe import DA_MAX_EXPERTS, DA_MAX_TOP_K
 
     # DA requires finalization because the runtime-selected tactic may change the
     # intermediate output format. The finalize kernel captured in the CUDA Graph
     # normalizes that format.
-    if not (do_finalize and 0 < num_experts <= DA_MAX_EXPERTS):
+    if not (
+        do_finalize and 0 < num_experts <= DA_MAX_EXPERTS and 0 < top_k <= DA_MAX_TOP_K
+    ):
         return run_selected_tactic(tactic)
 
     from flashinfer.prims_ts.moe.da_runtime import run_prims_ts_da

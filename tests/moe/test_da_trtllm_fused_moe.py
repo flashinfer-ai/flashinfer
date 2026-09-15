@@ -277,6 +277,66 @@ def test_long_multi_tile_routing_handles_local_and_nonlocal_experts() -> None:
     assert metadata.slots[0].num_tokens_per_expert[0] == 0
 
 
+@pytest.mark.parametrize(
+    "routing_input_mode",
+    (RoutingInputMode.PackedPrecomputed, RoutingInputMode.UnpackedPrecomputed),
+)
+def test_fused_multi_tile_routing_supports_da_capacity_bounds(
+    routing_input_mode: RoutingInputMode,
+) -> None:
+    """The fused preamble must cover 1024 global experts and top-k 32."""
+    require_sm100()
+    num_tokens = 257
+    num_experts = 1024
+    top_k = 32
+    local_expert_offset = 480
+    num_local_experts = 64
+    tile_ns = (8, 32)
+    token_index = torch.arange(num_tokens, device="cuda", dtype=torch.int32).unsqueeze(
+        1
+    )
+    topk_index = torch.arange(top_k, device="cuda", dtype=torch.int32).unsqueeze(0)
+    expert_ids = (token_index * 37 + topk_index * 53) % num_experts
+    routing_weights = torch.full(
+        (num_tokens, top_k),
+        1.0 / top_k,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    if routing_input_mode is RoutingInputMode.PackedPrecomputed:
+        routing_ids = expert_ids.bitwise_left_shift(16).bitwise_or(
+            routing_weights.view(torch.int16).to(torch.int32).bitwise_and(0xFFFF)
+        )
+        routing_weights_arg = None
+    else:
+        routing_ids = expert_ids
+        routing_weights_arg = routing_weights
+
+    metadata = trtllm_moe_allocate_routing_metadata_multi_tile(
+        routing_ids,
+        num_experts=num_experts,
+        top_k=top_k,
+        local_expert_offset=local_expert_offset,
+        num_local_experts=num_local_experts,
+        tile_ns=tile_ns,
+        routing_input_mode=routing_input_mode,
+        topk_weights=routing_weights_arg,
+    )
+    populate_trtllm_moe_routing_metadata_(metadata, routing_ids, routing_weights_arg)
+    torch.cuda.synchronize()
+
+    expected_counts = torch.bincount(
+        expert_ids.flatten().to(torch.int64), minlength=num_experts
+    ).to(torch.int32)
+    local_mask = torch.zeros(num_experts, device="cuda", dtype=torch.bool)
+    local_mask[local_expert_offset : local_expert_offset + num_local_experts] = True
+    expected_counts[~local_mask] = 0
+    expected_live = local_mask[expert_ids.to(torch.int64)].flatten()
+    for slot in metadata.slots:
+        assert torch.equal(slot.num_tokens_per_expert, expected_counts)
+        assert torch.equal(slot.expanded_idx_to_permuted_idx >= 0, expected_live)
+
+
 def test_fused_multi_tile_routing_uses_one_kernel_node() -> None:
     """Fused population captures one kernel instead of one kernel per tile."""
     require_sm100()
