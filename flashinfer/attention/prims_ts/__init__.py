@@ -37,6 +37,7 @@ from .mla_decode import (
     batch_mla_decode_with_paged_kv_cache,
     get_prims_ts_batch_mla_decode_workspace_size,
     prims_ts_batch_mla_decode_with_kv_cache,
+    should_use_prims_ts_balanced_mla,
 )
 
 __all__ = [
@@ -56,4 +57,5 @@ __all__ = [
     "batch_mla_decode_with_paged_kv_cache",
     "get_prims_ts_batch_mla_decode_workspace_size",
     "prims_ts_batch_mla_decode_with_kv_cache",
+    "should_use_prims_ts_balanced_mla",
 ]

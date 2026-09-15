@@ -14,9 +14,10 @@
 
 """Task-scheduled paged MLA decode with a plan/run lifecycle."""
 
-from collections.abc import Callable
-from dataclasses import dataclass, field
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field, replace
 import functools
+from types import MappingProxyType
 from typing import Any, Literal, Optional, cast
 
 import torch
@@ -28,6 +29,7 @@ from flashinfer.trace.templates.attention import (
     prims_ts_decode_mla_wrapper_trace_dispatch,
 )
 
+from ._balanced_gate import should_use_prims_ts_balanced_mla
 from ._tensor_aliasing import (
     _validate_out_does_not_overlap_inputs,
     _validate_tensor_does_not_overlap_inputs,
@@ -131,6 +133,8 @@ class _MLADecodePlanState:
     compiled: Callable[..., object]
     policy: tuple[tuple[str, object], ...]
     split_kv: int
+    balanced_plan: Any = field(compare=False, hash=False, repr=False, default=None)
+    planned_seq_lens: Optional[tuple[int, ...]] = None
 
 
 @dataclass(frozen=True)
@@ -250,6 +254,22 @@ def _validate_mla_policy_coordinate_span(
         raise RuntimeError(
             "MLA Int32 extent safety assumes a padded K/V coordinate span no "
             f"larger than {_MLA_MAX_KV_COORDINATE_SPAN}, got {span}"
+        )
+
+
+def _validate_balanced_1cta_packed_coordinate(
+    *,
+    batch_size: int,
+    num_head_tiles: int,
+    descriptor_capacity: int,
+) -> None:
+    """Keep the balanced 1CTA work-queue coordinate in signed Int32."""
+
+    max_coordinate = batch_size * num_head_tiles * descriptor_capacity - 1
+    if max_coordinate > _INT32_MAX:
+        raise NotImplementedError(
+            "balanced 1CTA packed work coordinate must fit in a signed int32; "
+            f"got maximum coordinate {max_coordinate}"
         )
 
 
@@ -451,8 +471,15 @@ def _validate_mla_run_metadata(
         q_lengths = (state.max_seq_len_q,) * state.batch_size
 
     seq_lens_host = tuple(int(value) for value in seq_lens.tolist())
-    if any(seq_len <= 0 for seq_len in seq_lens_host):
-        raise ValueError("every runtime request must contain at least one KV token")
+    minimum_seq_len = 0 if state.balanced_plan is not None else 1
+    if any(seq_len < minimum_seq_len for seq_len in seq_lens_host):
+        requirement = "non-negative" if minimum_seq_len == 0 else "positive"
+        raise ValueError(f"every runtime K/V length must be {requirement}")
+    if state.planned_seq_lens is not None and seq_lens_host != state.planned_seq_lens:
+        raise ValueError(
+            "balanced MLA live seq_lens must exactly match the installed "
+            "schedule; call replan() with the new CPU lengths before run()"
+        )
     runtime_max_kv_len = max(seq_lens_host)
     if runtime_max_kv_len > state.max_kv_len:
         raise ValueError(
@@ -477,7 +504,7 @@ def _validate_mla_run_metadata(
         for request_idx, (q_len, kv_len) in enumerate(
             zip(q_lengths, seq_lens_host, strict=True)
         ):
-            if q_len > kv_len:
+            if kv_len > 0 and q_len > kv_len:
                 raise ValueError(
                     "causal MLA decode requires every per-request Q length "
                     "to be no greater than its K/V length; request "
@@ -720,6 +747,7 @@ def _resolve_mla_decode_launch_spec(
     output_dtype_key: str,
     mask_type: str,
     seq_len_q: int = 1,
+    balanced: bool = False,
 ):
     """Resolve and cache MLA policy/workspace without compiling."""
 
@@ -731,10 +759,12 @@ def _resolve_mla_decode_launch_spec(
 
     from .kernels.mla_decode.kernel_policy import (
         resolve_mla_kernel_policy,
+        select_balanced_decode_mla_kernel_policy,
         select_mla_ts_kernel,
     )
     from .kernels.mla_decode.helpers.query import FlatQueryTileLayout
     from .kernels.mla_decode.throughput_2cta.config import (
+        compute_balanced_workspace_size,
         compute_split_kv,
         compute_workspace_size as compute_2cta_workspace_size,
     )
@@ -804,9 +834,17 @@ def _resolve_mla_decode_launch_spec(
             one_cta_split_kv=one_cta_split_kv,
             two_cta_split_kv=two_cta_split_kv,
         )
+        if balanced and policy_source == "auto":
+            balanced_decode_policy = select_balanced_decode_mla_kernel_policy(
+                num_heads,
+                seq_len_q,
+            )
+            if balanced_decode_policy is not None:
+                requested_policy = balanced_decode_policy
         use_throughput_latency = requested_policy == "throughput_latency_1cta"
 
         kernel: Any
+        policy: tuple[tuple[str, object], ...]
         if use_throughput_latency:
             max_active_clusters = max_active_one_cta_clusters
             launch_shape = one_cta_launch_shape
@@ -862,14 +900,30 @@ def _resolve_mla_decode_launch_spec(
                 explicit_split_kv=None,
                 explicit_persistent=None,
                 mask_type=mask_type,
+                use_balanced_scheduler=balanced,
             )
             final_cfg = kernel._make_config()
             split_kv = int(final_cfg.num_ctas_per_seq_kv)
-            workspace_size = compute_1cta_workspace_size(
-                cfg=final_cfg,
-                partial_o_dtype=cutlass.BFloat16,
-                lse_dtype=cutlass.Float32,
-            )
+            if balanced:
+                _validate_balanced_1cta_packed_coordinate(
+                    batch_size=batch_size,
+                    num_head_tiles=int(final_cfg.num_ctas_for_all_heads),
+                    descriptor_capacity=int(kernel.balanced_descriptor_capacity),
+                )
+                workspace_size = compute_balanced_workspace_size(
+                    num_heads=int(launch_shape.num_heads_q),
+                    seq_len_q=int(launch_shape.seq_len_q),
+                    latent_dim=kv_lora_rank,
+                    partial_capacity=kernel.balanced_partial_capacity,
+                    partial_o_dtype=cutlass.BFloat16,
+                    lse_dtype=cutlass.Float32,
+                )
+            else:
+                workspace_size = compute_1cta_workspace_size(
+                    cfg=final_cfg,
+                    partial_o_dtype=cutlass.BFloat16,
+                    lse_dtype=cutlass.Float32,
+                )
             separate_reducer_impl, reducer_cluster_size = _separate_reducer_provenance(
                 kernel,
                 split_kv=split_kv,
@@ -897,6 +951,26 @@ def _resolve_mla_decode_launch_spec(
                 ("separate_reducer_impl", separate_reducer_impl),
                 ("reducer_cluster_size", reducer_cluster_size),
             )
+            if balanced:
+                policy += (
+                    ("balanced_scheduler", True),
+                    (
+                        "balanced_num_partitions",
+                        int(kernel.balanced_num_partitions),
+                    ),
+                    (
+                        "balanced_descriptor_capacity",
+                        int(kernel.balanced_descriptor_capacity),
+                    ),
+                    (
+                        "balanced_partial_capacity",
+                        int(kernel.balanced_partial_capacity),
+                    ),
+                    (
+                        "balanced_reducer_capacity",
+                        int(kernel.balanced_reducer_capacity),
+                    ),
+                )
         else:
             max_active_clusters = max_active_two_cta_clusters
             launch_shape = two_cta_launch_shape
@@ -919,12 +993,12 @@ def _resolve_mla_decode_launch_spec(
             )
             if not decision.implementation_ready:
                 raise NotImplementedError(decision.reason)
-            split_kv = two_cta_split_kv
+            split_kv = min(max_active_clusters, 127) if balanced else two_cta_split_kv
             work_clusters = batch_size * launch_shape.num_tiles * max(split_kv, 1)
             # Dynamic cluster stealing only helps once logical work exceeds a
             # resident wave.  Within one wave every cluster already launches,
             # so the CLC producer/response pipeline is pure overhead.
-            is_persistent = work_clusters > max_active_clusters
+            is_persistent = balanced or work_clusters > max_active_clusters
             kernel = MlaDecodeTs(
                 acc_dtype=cutlass.Float32,
                 lse_dtype=cutlass.Float32,
@@ -934,7 +1008,7 @@ def _resolve_mla_decode_launch_spec(
                 page_size=page_size,
                 is_persistent=is_persistent,
                 is_var_seq=False,
-                is_var_split_kv=False,
+                is_var_split_kv=balanced,
                 static_split_kv=split_kv,
                 static_seq_len_k=None,
                 qkv_dtype=qkv_dtype_name,
@@ -943,17 +1017,31 @@ def _resolve_mla_decode_launch_spec(
                 num_heads=num_heads,
                 seq_len_q=seq_len_q,
                 batch_size=batch_size,
+                use_balanced_scheduler=balanced,
                 mask_type=mask_type,
             )
-            workspace_size = compute_2cta_workspace_size(
-                tile_size_q=int(launch_shape.tile_size_q),
-                num_q_tiles=int(launch_shape.num_tiles),
-                latent_dim=kv_lora_rank,
-                batch_size=batch_size,
-                split_kv=split_kv,
-                partial_o_dtype=cutlass.BFloat16,
-                lse_dtype=cutlass.Float32,
-            )
+            if balanced:
+                balanced_rows, balanced_query_tiles = (
+                    kernel._effective_reduction_shape()
+                )
+                workspace_size = compute_balanced_workspace_size(
+                    num_heads=balanced_rows,
+                    seq_len_q=balanced_query_tiles,
+                    latent_dim=kv_lora_rank,
+                    partial_capacity=kernel.balanced_partial_capacity,
+                    partial_o_dtype=cutlass.BFloat16,
+                    lse_dtype=cutlass.Float32,
+                )
+            else:
+                workspace_size = compute_2cta_workspace_size(
+                    tile_size_q=int(launch_shape.tile_size_q),
+                    num_q_tiles=int(launch_shape.num_tiles),
+                    latent_dim=kv_lora_rank,
+                    batch_size=batch_size,
+                    split_kv=split_kv,
+                    partial_o_dtype=cutlass.BFloat16,
+                    lse_dtype=cutlass.Float32,
+                )
             separate_reducer_impl, reducer_cluster_size = _separate_reducer_provenance(
                 kernel,
                 split_kv=split_kv,
@@ -973,11 +1061,28 @@ def _resolve_mla_decode_launch_spec(
                 ("use_persistent_scheduler", bool(is_persistent)),
                 (
                     "use_clc_dynamic_persistent_scheduler",
-                    bool(is_persistent and qkv_dtype_name == "bf16"),
+                    bool(is_persistent and qkv_dtype_name == "bf16" and not balanced),
                 ),
                 ("separate_reducer_impl", separate_reducer_impl),
                 ("reducer_cluster_size", reducer_cluster_size),
             )
+            if balanced:
+                policy += (
+                    ("balanced_scheduler", True),
+                    ("balanced_num_partitions", int(max_active_clusters)),
+                    (
+                        "balanced_descriptor_capacity",
+                        int(batch_size + max_active_clusters),
+                    ),
+                    (
+                        "balanced_partial_capacity",
+                        int(kernel.balanced_partial_capacity),
+                    ),
+                    (
+                        "balanced_reducer_capacity",
+                        int(kernel.balanced_reducer_capacity),
+                    ),
+                )
         _validate_mla_policy_coordinate_span(policy)
 
     return _MLADecodeLaunchSpec(
@@ -1151,6 +1256,39 @@ def _get_compiled_mla_decode(
         stride_order=(0,),
         assumed_align=4,
     )
+    block_split_kvs_fake = None
+    balanced_work_descriptors_fake = None
+    balanced_partition_offsets_fake = None
+    balanced_combine_descriptors_fake = None
+    balanced_num_combine_descriptors_fake = None
+    balanced = bool(getattr(kernel, "use_balanced_scheduler", False))
+    if balanced:
+        descriptor_capacity = int(kernel.balanced_descriptor_capacity)
+        num_partitions = int(kernel.balanced_num_partitions)
+        balanced_work_descriptors_fake = cute.runtime.make_fake_tensor(
+            cutlass.Int32,
+            (descriptor_capacity, 4),
+            stride=(4, 1),
+            assumed_align=16,
+        )
+        balanced_partition_offsets_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32,
+            (num_partitions + 1,),
+            stride_order=(0,),
+            assumed_align=16,
+        )
+        balanced_combine_descriptors_fake = cute.runtime.make_fake_tensor(
+            cutlass.Int32,
+            (int(kernel.balanced_reducer_capacity), 4),
+            stride=(4, 1),
+            assumed_align=16,
+        )
+        balanced_num_combine_descriptors_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32,
+            (1,),
+            stride_order=(0,),
+            assumed_align=16,
+        )
     qo_indptr_fake = None
     if packed_query:
         runtime_num_q_offsets = cute.sym_int()
@@ -1165,7 +1303,7 @@ def _get_compiled_mla_decode(
     # Task objects carry loop-local state through generated control flow, so
     # select the public staged frontend for this compilation.
     with torch.cuda.device(device_index):
-        compiled = cute.compile[cute.FrontendNext](
+        compile_args = [
             kernel,
             q_latent_fake,
             q_rope_fake,
@@ -1178,10 +1316,25 @@ def _get_compiled_mla_decode(
             cutlass.Int32(compile_spec.split_kv),
             cache_seqs_fake,
             qo_indptr_fake,
-            None,
-            cutlass.Float32(1.0),
-            cutlass.Float32(1.0),
-            stream_fake,
+            block_split_kvs_fake,
+        ]
+        compile_args.extend(
+            [
+                balanced_work_descriptors_fake,
+                balanced_partition_offsets_fake,
+                balanced_combine_descriptors_fake,
+                balanced_num_combine_descriptors_fake,
+            ]
+        )
+        compile_args.extend(
+            [
+                cutlass.Float32(1.0),
+                cutlass.Float32(1.0),
+                stream_fake,
+            ]
+        )
+        compiled = cute.compile[cute.FrontendNext](
+            *compile_args,
             options=_COMPILE_OPTIONS,
         )
     return compiled
@@ -1201,6 +1354,7 @@ def get_prims_ts_batch_mla_decode_workspace_size(
     kv_dtype: Optional[torch.dtype] = None,
     out_dtype: torch.dtype = torch.bfloat16,
     mask_type: Literal["dense", "causal"] = "causal",
+    balanced: bool = False,
     device=None,
 ) -> int:
     """Return caller-workspace bytes for one automatic MLA policy.
@@ -1215,6 +1369,13 @@ def get_prims_ts_batch_mla_decode_workspace_size(
     scratch and the internal FP32 LSE tensor. Allocate a contiguous
     ``torch.int8`` or ``torch.uint8`` CUDA buffer; MLA does not require its
     contents to be initialized before first use.
+
+    Set ``balanced=True`` to resolve the same balanced kernel policy used by
+    :meth:`BatchMLADecodePagedTSWrapper.plan_balanced`. The returned size
+    includes balanced split-partial scratch and the private FP32 LSE tensor.
+    It intentionally excludes the replay-stable work, partition, combine, and
+    count descriptors: those fixed-address tensors are separately allocated
+    and owned by the balanced wrapper plan.
     """
 
     batch_size = _validate_positive_int(batch_size, "batch_size")
@@ -1234,10 +1395,16 @@ def get_prims_ts_batch_mla_decode_workspace_size(
         max_seq_len_q=max_seq_len_q,
     )
     _validate_mask(mask_type)
+    if not isinstance(balanced, bool):
+        raise TypeError("balanced must be a bool")
     if kv_dtype is None:
         kv_dtype = q_dtype
     _validate_mla_dtype_pair(q_dtype, kv_dtype, out_dtype)
-    _, device_index = _resolve_cuda_device(device)
+    resolved_device, device_index = _resolve_cuda_device(device)
+    if balanced:
+        from ._balanced_plan import require_balanced_mla_calibration
+
+        require_balanced_mla_calibration(resolved_device)
 
     spec = _resolve_mla_decode_launch_spec(
         device_index,
@@ -1252,6 +1419,7 @@ def get_prims_ts_batch_mla_decode_workspace_size(
         _dtype_key(out_dtype),
         mask_type,
         max_seq_len_q,
+        balanced,
     )
     return _make_mla_workspace_layout(
         spec.kernel_workspace_bytes, batch_size, num_heads, max_seq_len_q
@@ -1382,6 +1550,8 @@ def _launch_mla_decode(
     split_kv: int,
     workspace: _MLAWorkspaceViews,
     compiled: Callable[..., object],
+    balanced_plan: Any = None,
+    uses_extended_2cta_abi: bool = True,
 ) -> torch.Tensor:
     """Form the dimension-first views and launch one compiled MLA kernel."""
 
@@ -1403,7 +1573,17 @@ def _launch_mla_decode(
     c_latent = runtime.normalized_cache[..., :kv_lora_rank].permute(1, 2, 0)
     c_rope = runtime.normalized_cache[..., kv_lora_rank:].permute(1, 2, 0)
     page_offsets = block_tables.transpose(0, 1)
-    compiled(
+    block_split_kvs = None
+    balanced_work_descriptors = None
+    balanced_partition_offsets = None
+    balanced_combine_descriptors = None
+    balanced_num_combine_descriptors = None
+    if balanced_plan is not None:
+        balanced_work_descriptors = balanced_plan.work_descriptors
+        balanced_partition_offsets = balanced_plan.partition_offsets
+        balanced_combine_descriptors = balanced_plan.combine_descriptors
+        balanced_num_combine_descriptors = balanced_plan.num_combine_descriptors
+    launch_args = [
         q_latent,
         q_rope,
         c_latent,
@@ -1415,10 +1595,18 @@ def _launch_mla_decode(
         split_kv,
         seq_lens,
         qo_indptr,
-        None,
-        runtime.bmm1_scale,
-        runtime.bmm2_scale,
+        block_split_kvs,
+    ]
+    launch_args.extend(
+        [
+            balanced_work_descriptors,
+            balanced_partition_offsets,
+            balanced_combine_descriptors,
+            balanced_num_combine_descriptors,
+        ]
     )
+    launch_args.extend([runtime.bmm1_scale, runtime.bmm2_scale])
+    compiled(*launch_args)
     return runtime.out
 
 
@@ -1638,6 +1826,7 @@ def prims_ts_batch_mla_decode_with_kv_cache(
         split_kv=spec.split_kv,
         workspace=workspace,
         compiled=compiled,
+        uses_extended_2cta_abi=dict(spec.policy)["kernel"] == "throughput_2cta",
     )
 
 
@@ -1649,8 +1838,30 @@ class BatchMLADecodePagedTSWrapper:
         """Initialize an unplanned task-scheduled paged-MLA wrapper."""
         self._plan_state: Optional[_MLADecodePlanState] = None
 
-    @flashinfer_api
-    def plan(
+    @property
+    def plan_info(self) -> Mapping[str, object]:
+        """Return immutable policy and balanced cost-model provenance.
+
+        The returned mappings are snapshots. For balanced plans, request this
+        property again after :meth:`replan` to observe the newly selected
+        workload bucket and coefficients.
+        """
+
+        state = self._plan_state
+        if state is None:
+            raise RuntimeError("plan() must be called before plan_info is available")
+        balanced_plan = state.balanced_plan
+        return MappingProxyType(
+            {
+                "policy": MappingProxyType(dict(state.policy)),
+                "balanced": balanced_plan is not None,
+                "cost_model": (
+                    balanced_plan.cost_model_info if balanced_plan is not None else None
+                ),
+            }
+        )
+
+    def _plan(
         self,
         device: int | str | torch.device,
         batch_size: int,
@@ -1667,14 +1878,17 @@ class BatchMLADecodePagedTSWrapper:
         o_data_type: torch.dtype,
         mask_type: Literal["dense", "causal"] = "causal",
         workspace_buffer: Optional[torch.Tensor] = None,
+        balanced: bool = False,
+        balanced_seq_lens: Optional[list[int] | tuple[int, ...] | torch.Tensor] = None,
+        balanced_bootstrap_cost: Optional[Any] = None,
     ) -> None:
         """Compile one static MLA shape and bind its reusable workspace.
 
-        Planning consumes only compile-time geometry, capacity, dtype, and
-        storage-mode inputs. Request metadata belongs exclusively to
-        :meth:`run` and is never retained by the wrapper. A successful re-plan
-        atomically replaces the previous immutable state; a failed re-plan
-        leaves that state usable.
+        Standard planning consumes only compile-time geometry, capacity,
+        dtype, and storage-mode inputs. Balanced planning additionally retains
+        the normalized K/V lengths and replay-stable schedule descriptors.
+        A successful re-plan atomically replaces the previous immutable state;
+        a failed re-plan leaves that state usable.
 
         ``packed_query=False`` selects fixed ``[B, SQ, H, 576]`` query storage,
         where ``SQ`` is exactly ``max_seq_len_q``. ``packed_query=True`` selects
@@ -1709,10 +1923,24 @@ class BatchMLADecodePagedTSWrapper:
             must be 32-byte aligned and large enough for the selected plan.
             When omitted, planning allocates the buffer. The retained buffer
             is exclusive to one in-flight launch or graph replay.
+        balanced : bool, optional
+            Use replay-stable compact balanced scheduling.
+        balanced_seq_lens : sequence or CPU torch.Tensor, optional
+            Initial K/V lengths used to build a balanced schedule. Required
+            when ``balanced=True``; later schedules may be installed in-place
+            with :meth:`replan` without changing captured tensor addresses.
         """
 
         if not isinstance(packed_query, bool):
             raise TypeError("packed_query must be a bool")
+        if not isinstance(balanced, bool):
+            raise TypeError("balanced must be a bool")
+        if balanced and balanced_seq_lens is None:
+            raise ValueError("balanced=True requires balanced_seq_lens")
+        if not balanced and balanced_seq_lens is not None:
+            raise ValueError("balanced_seq_lens requires balanced=True")
+        if not balanced and balanced_bootstrap_cost is not None:
+            raise ValueError("balanced_bootstrap_cost requires balanced=True")
         _validate_mask(mask_type)
         batch_size = _validate_positive_int(batch_size, "batch_size")
         _validate_mla_int32_extent(batch_size, "batch_size")
@@ -1728,6 +1956,14 @@ class BatchMLADecodePagedTSWrapper:
         )
         _validate_mla_dtype_pair(q_data_type, kv_data_type, o_data_type)
         device, device_index = _resolve_cuda_device(device)
+        balanced_calibration = None
+        if balanced and balanced_bootstrap_cost is None:
+            from ._balanced_plan import require_balanced_mla_calibration
+
+            # Fail before policy compilation or any CUDA allocation. Production
+            # balanced execution must never silently inherit another device's
+            # split-cost model.
+            balanced_calibration = require_balanced_mla_calibration(device)
         required_page_columns = _ceil_div(max_kv_len, page_size)
 
         spec_key = (
@@ -1743,6 +1979,7 @@ class BatchMLADecodePagedTSWrapper:
             _dtype_key(o_data_type),
             mask_type,
             max_seq_len_q,
+            balanced,
         )
         spec = _resolve_mla_decode_launch_spec(*spec_key)
         compile_spec = _make_mla_decode_compile_spec(
@@ -1773,6 +2010,36 @@ class BatchMLADecodePagedTSWrapper:
             )
         workspace = _bind_mla_workspace(workspace_buffer, workspace_layout)
         compiled = _get_compiled_mla_decode(compile_spec)
+        balanced_plan = None
+        planned_seq_lens = None
+        if balanced:
+            from ._balanced_plan import BalancedMLADecodePlan
+
+            resolved_policy = dict(policy)
+            balanced_plan = BalancedMLADecodePlan(
+                batch_size=batch_size,
+                num_partitions=int(resolved_policy["balanced_num_partitions"]),
+                device=device,
+                k_tile_tokens=int(resolved_policy["tile_size_kv"]),
+                cost=balanced_bootstrap_cost,
+                kernel_family=(
+                    "1cta"
+                    if resolved_policy["kernel"] == "throughput_latency_1cta"
+                    else "2cta"
+                ),
+                dtype_name=_kernel_dtype_name(_dtype_key(q_data_type)),
+                calibration=balanced_calibration,
+                cost_source="calibration-bootstrap",
+            )
+            assert balanced_seq_lens is not None
+            normalized_seq_lens = balanced_plan._normalize_seq_lens(balanced_seq_lens)
+            if any(seq_len > max_kv_len for seq_len in normalized_seq_lens):
+                raise ValueError(
+                    "every balanced K/V length must be non-negative and no larger "
+                    f"than max_kv_len ({max_kv_len})"
+                )
+            balanced_plan._replan_normalized(normalized_seq_lens)
+            planned_seq_lens = normalized_seq_lens
 
         # Publish only after validation, compilation, allocation, and binding
         # succeed, so a failed re-plan leaves the previous plan usable.
@@ -1797,7 +2064,333 @@ class BatchMLADecodePagedTSWrapper:
             compiled=compiled,
             policy=policy,
             split_kv=int(dict(policy)["split_kv"]),
+            balanced_plan=balanced_plan,
+            planned_seq_lens=planned_seq_lens,
         )
+
+    @flashinfer_api
+    def plan(
+        self,
+        device: int | str | torch.device,
+        batch_size: int,
+        num_heads: int,
+        kv_lora_rank: int,
+        qk_rope_head_dim: int,
+        page_size: int,
+        max_kv_len: int,
+        *,
+        max_seq_len_q: int,
+        packed_query: bool,
+        q_data_type: torch.dtype,
+        kv_data_type: torch.dtype,
+        o_data_type: torch.dtype,
+        mask_type: Literal["dense", "causal"] = "causal",
+        workspace_buffer: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Compile and bind a standard task-scheduled MLA decode plan.
+
+        Planning resolves and compiles the kernel and allocates scratch, so it
+        must run eagerly outside CUDA Graph capture. One wrapper represents one
+        static batch bucket and attention geometry. Query, K/V cache, page
+        tables, sequence lengths, and output are bound by :meth:`run`, which
+        permits compatible sequential attention layers to share a wrapper.
+
+        The retained workspace is mutable and exclusive to one in-flight run.
+        Concurrent streams therefore need separate wrappers/workspaces or
+        explicit stream ordering. Retain the wrapper, a caller-owned workspace,
+        and all captured runtime buffers for the lifetime of any graph that
+        references them. Warm and validate representative inputs eagerly, then
+        capture ``run(validate=False, out=...)``.
+
+        Parameters
+        ----------
+        device : int, str, or torch.device
+            CUDA device on which the plan executes.
+        batch_size : int
+            Exact runtime request count for this batch bucket.
+        num_heads, kv_lora_rank, qk_rope_head_dim, page_size : int
+            Static MLA head geometry and K/V page size.
+        max_kv_len, max_seq_len_q : int
+            Static per-request K/V and Q capacities.
+        packed_query : bool
+            Select packed ``[total_q, H, 576]`` rather than fixed
+            ``[B, SQ, H, 576]`` query storage.
+        q_data_type, kv_data_type, o_data_type : torch.dtype
+            Query, K/V, and output dtypes used to compile the plan.
+        mask_type : {"dense", "causal"}
+            Attention mask mode.
+        workspace_buffer : torch.Tensor, optional
+            Caller-owned contiguous int8 or uint8 scratch on ``device``. It
+            must be 32-byte aligned and at least the size returned by
+            :func:`get_prims_ts_batch_mla_decode_workspace_size`. If omitted,
+            the wrapper allocates and retains the scratch buffer.
+        """
+
+        self._plan(
+            device,
+            batch_size,
+            num_heads,
+            kv_lora_rank,
+            qk_rope_head_dim,
+            page_size,
+            max_kv_len,
+            max_seq_len_q=max_seq_len_q,
+            packed_query=packed_query,
+            q_data_type=q_data_type,
+            kv_data_type=kv_data_type,
+            o_data_type=o_data_type,
+            mask_type=mask_type,
+            workspace_buffer=workspace_buffer,
+        )
+
+    @flashinfer_api
+    def plan_balanced(
+        self,
+        device: int | str | torch.device,
+        batch_size: int,
+        num_heads: int,
+        kv_lora_rank: int,
+        qk_rope_head_dim: int,
+        page_size: int,
+        max_kv_len: int,
+        *,
+        max_seq_len_q: int,
+        packed_query: bool,
+        q_data_type: torch.dtype,
+        kv_data_type: torch.dtype,
+        o_data_type: torch.dtype,
+        seq_lens: list[int] | tuple[int, ...] | torch.Tensor,
+        mask_type: Literal["dense", "causal"] = "causal",
+        workspace_buffer: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Compile a balanced plan and seed its replay-stable schedule.
+
+        Balanced planning is replay-compatible host work, but is not capture
+        safe: it compiles/allocates, builds descriptors, and synchronizes the
+        planning stream. Create one wrapper per static batch bucket and
+        compatible attention geometry outside capture. Query, cache, metadata,
+        and output remain run-owned, so compatible sequential layers may reuse
+        one wrapper and schedule. The mutable schedule and workspace must not
+        be used concurrently; independent streams require separate wrappers or
+        explicit ordering.
+
+        Before each replay whose K/V lengths change, call :meth:`replan` once
+        with the new CPU lengths, update the live CUDA ``seq_lens`` and page
+        tables, and order those updates before replay. A captured nonvalidating
+        run requires its live lengths to exactly match the last planned lengths.
+        Retain the wrapper, optional caller workspace, descriptors, metadata,
+        and output buffers for the graph lifetime.
+
+        Balanced planning requires a checked-in cost model for the exact GPU
+        product, compute capability, and SM count. An uncalibrated device is
+        rejected before compilation or allocation. Run
+        ``benchmarks/bench_prims_ts_balanced_mla_cost_model.py`` on that device
+        and add its measured models to the calibration registry before use.
+
+        Parameters
+        ----------
+        device : int, str, or torch.device
+            CUDA device on which the plan executes.
+        batch_size : int
+            Exact runtime request count for this batch bucket.
+        num_heads, kv_lora_rank, qk_rope_head_dim, page_size : int
+            Static MLA head geometry and K/V page size.
+        max_kv_len, max_seq_len_q : int
+            Static per-request K/V and Q capacities.
+        packed_query : bool
+            Select packed rather than fixed query storage.
+        q_data_type, kv_data_type, o_data_type : torch.dtype
+            Query, K/V, and output dtypes used to compile the plan.
+        seq_lens : sequence or CPU torch.Tensor
+            Initial non-negative K/V lengths used to build the schedule. Zero
+            marks an inactive request slot whose output is deterministically
+            filled with zero.
+        mask_type : {"dense", "causal"}
+            Attention mask mode.
+        workspace_buffer : torch.Tensor, optional
+            Caller-owned scratch sized with
+            :func:`get_prims_ts_batch_mla_decode_workspace_size` using
+            ``balanced=True``. Schedule descriptors are allocated separately
+            and retained by this wrapper.
+
+        Examples
+        --------
+        Compile and capture once, then refill stable descriptors before replay::
+
+            workspace_bytes = get_prims_ts_batch_mla_decode_workspace_size(
+                batch_size, num_heads, 512, 64, page_size, max_kv_len,
+                balanced=True, device="cuda"
+            )
+            workspace = torch.empty(workspace_bytes, dtype=torch.int8, device="cuda")
+            wrapper = BatchMLADecodePagedTSWrapper()
+            wrapper.plan_balanced(
+                "cuda", batch_size, num_heads, 512, 64, page_size, max_kv_len,
+                max_seq_len_q=1, packed_query=False,
+                q_data_type=torch.bfloat16, kv_data_type=torch.bfloat16,
+                o_data_type=torch.bfloat16, seq_lens=host_lengths,
+                workspace_buffer=workspace,
+            )
+            wrapper.run(query, cache, page_table, seq_lens, out=out)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                wrapper.run(
+                    query, cache, page_table, seq_lens,
+                    out=out, validate=False,
+                )
+
+            wrapper.replan(next_host_lengths)
+            seq_lens.copy_(next_device_lengths)
+            page_table.copy_(next_page_table)
+            graph.replay()
+        """
+
+        self._plan(
+            device,
+            batch_size,
+            num_heads,
+            kv_lora_rank,
+            qk_rope_head_dim,
+            page_size,
+            max_kv_len,
+            max_seq_len_q=max_seq_len_q,
+            packed_query=packed_query,
+            q_data_type=q_data_type,
+            kv_data_type=kv_data_type,
+            o_data_type=o_data_type,
+            mask_type=mask_type,
+            workspace_buffer=workspace_buffer,
+            balanced=True,
+            balanced_seq_lens=seq_lens,
+        )
+
+    @flashinfer_api
+    def plan_auto(
+        self,
+        device: int | str | torch.device,
+        batch_size: int,
+        num_heads: int,
+        kv_lora_rank: int,
+        qk_rope_head_dim: int,
+        page_size: int,
+        max_kv_len: int,
+        *,
+        max_seq_len_q: int,
+        packed_query: bool,
+        q_data_type: torch.dtype,
+        kv_data_type: torch.dtype,
+        o_data_type: torch.dtype,
+        seq_lens: list[int] | tuple[int, ...] | torch.Tensor,
+        expected_mean_seq_len: Optional[int] = None,
+        expected_max_seq_len: Optional[int] = None,
+        mask_type: Literal["dense", "causal"] = "causal",
+        workspace_buffer: Optional[torch.Tensor] = None,
+    ) -> bool:
+        """Install the capture-stable production-selected MLA decode plan.
+
+        This method selects between :meth:`plan` and :meth:`plan_balanced`
+        using only values that must remain fixed for the lifetime of a CUDA
+        graph. The user declares the expected mean and maximum K/V sequence
+        lengths either as arguments or through
+        ``FLASHINFER_MLA_EXPECTED_MEAN_SEQ_LEN`` and
+        ``FLASHINFER_MLA_EXPECTED_MAX_SEQ_LEN``. Arguments take precedence.
+
+        The gate admits balanced decode when the expected maximum is at least
+        twice the expected mean, the expected total K/V work clears the
+        calibrated per-head/dtype threshold, and the batch-size threshold is
+        met. Uniform and nearly uniform workloads therefore use the standard
+        scheduler. The actual ``seq_lens`` seed the balanced schedule only
+        after admission and never affect which kernel is selected.
+
+        Returns ``True`` when a balanced plan was installed and ``False`` when
+        the standard plan was installed. If the result is ``True``, call
+        :meth:`replan` before replays whose live lengths change. Explicit
+        :meth:`plan` and :meth:`plan_balanced` remain the force-standard and
+        force-balanced APIs, respectively.
+
+        Inactive padding is route-dependent. Balanced plans accept a zero K/V
+        length and publish zero output for that slot; standard plans require a
+        positive dummy length and a valid page. Therefore every ``seq_lens``
+        entry must be positive whenever this gate can select standard. Turning
+        runtime validation off does not add inactive-slot semantics. An
+        integration that requires zero-length graph padding must either supply
+        positive dummy metadata for the standard route or explicitly force a
+        balanced plan.
+
+        When supplying caller-owned scratch, first call
+        :func:`should_use_prims_ts_balanced_mla` with the same static inputs,
+        then pass its result as ``balanced`` to
+        :func:`get_prims_ts_batch_mla_decode_workspace_size`. A blanket
+        ``balanced=True`` size query requires exact device calibration even
+        when this gate would select standard. Omitting ``workspace_buffer``
+        lets this method allocate for the selected route directly.
+
+        This wrapper consumes dense page tables with page size 16, 32, 64, or
+        128 and returns only the attention output. Its internal LSE scratch is
+        not a public graph-stable result, so it is not yet suitable for a
+        backend mode (such as DCP) that requires LSE. CSR token indices or a
+        page-size-1 cache require a separate adapter rather than direct
+        substitution.
+        """
+
+        use_balanced = should_use_prims_ts_balanced_mla(
+            batch_size=batch_size,
+            num_heads=num_heads,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            max_kv_len=max_kv_len,
+            max_seq_len_q=max_seq_len_q,
+            q_dtype=q_data_type,
+            kv_dtype=kv_data_type,
+            expected_mean_seq_len=expected_mean_seq_len,
+            expected_max_seq_len=expected_max_seq_len,
+        )
+        self._plan(
+            device,
+            batch_size,
+            num_heads,
+            kv_lora_rank,
+            qk_rope_head_dim,
+            page_size,
+            max_kv_len,
+            max_seq_len_q=max_seq_len_q,
+            packed_query=packed_query,
+            q_data_type=q_data_type,
+            kv_data_type=kv_data_type,
+            o_data_type=o_data_type,
+            mask_type=mask_type,
+            workspace_buffer=workspace_buffer,
+            balanced=use_balanced,
+            balanced_seq_lens=seq_lens if use_balanced else None,
+        )
+        return use_balanced
+
+    @flashinfer_api
+    def replan(self, seq_lens: list[int] | tuple[int, ...] | torch.Tensor) -> None:
+        """Refill a balanced plan in-place before replaying captured runs.
+
+        ``seq_lens`` must be CPU-resident. The caller remains responsible for
+        updating the live CUDA ``seq_lens`` tensor used by the attention math;
+        this method updates only the compact scheduling descriptors. Replanning
+        is not capture safe and currently synchronizes the active CUDA stream
+        before returning. Order the live metadata update and subsequent replay
+        after it. A validating run checks that its live lengths exactly match
+        the most recent successful replan. A zero length marks an inactive slot
+        and produces deterministic zero output for all of that slot's Q rows.
+        """
+
+        state = self._plan_state
+        if state is None:
+            raise RuntimeError("plan() must be called before replan()")
+        if state.balanced_plan is None:
+            raise RuntimeError("replan() requires a balanced plan")
+        normalized = state.balanced_plan._normalize_seq_lens(seq_lens)
+        if any(seq_len > state.max_kv_len for seq_len in normalized):
+            raise ValueError(
+                "every re-planned KV length must be non-negative and no larger "
+                f"than max_kv_len ({state.max_kv_len})"
+            )
+        state.balanced_plan._replan_normalized(normalized)
+        self._plan_state = replace(state, planned_seq_lens=normalized)
 
     @flashinfer_api(trace=prims_ts_decode_mla_wrapper_trace_dispatch)
     def run(
@@ -1821,7 +2414,10 @@ class BatchMLADecodePagedTSWrapper:
         values, scales, aliases, and every static capacity are checked before
         launch. These checks synchronize metadata to the host. Set
         ``validate=False`` only after validating representative inputs, and use
-        it for ``torch.compile`` or CUDA graph capture.
+        it for ``torch.compile`` or CUDA graph capture. For a balanced plan,
+        nonvalidating execution requires live ``seq_lens`` to match the most
+        recently planned lengths; that invariant cannot be checked without
+        synchronizing.
 
         Parameters
         ----------
@@ -1833,7 +2429,9 @@ class BatchMLADecodePagedTSWrapper:
             Runtime physical-page table with one inner-contiguous,
             non-overlapping row per request. Inter-row padding is accepted.
         seq_lens : torch.Tensor
-            Runtime K/V lengths with one element per request.
+            Runtime K/V lengths with one element per request. Balanced plans
+            accept zero as an inactive slot and publish zero for its output;
+            standard plans require positive lengths.
         qo_indptr : torch.Tensor, optional
             Runtime cumulative query offsets for a packed-query plan.
         bmm1_scale, bmm2_scale : float
@@ -1910,6 +2508,7 @@ class BatchMLADecodePagedTSWrapper:
             split_kv=state.split_kv,
             workspace=state.workspace_views,
             compiled=state.compiled,
+            balanced_plan=getattr(state, "balanced_plan", None),
         )
 
 
@@ -2113,4 +2712,5 @@ __all__ = [
     "batch_mla_decode_with_paged_kv_cache",
     "get_prims_ts_batch_mla_decode_workspace_size",
     "prims_ts_batch_mla_decode_with_kv_cache",
+    "should_use_prims_ts_balanced_mla",
 ]

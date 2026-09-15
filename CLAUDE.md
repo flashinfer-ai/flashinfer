@@ -39,6 +39,8 @@ FlashInfer is a GPU kernel library for LLM serving that uses **JIT (Just-In-Time
 | Override MoE EP knob-cache path | `export FLASHINFER_MOE_EP_KNOB_CACHE=/path/to/knobs.json` |
 | Disable MoE EP fused staging kernel | `export FLASHINFER_MEGA_FUSED_STAGE=0` |
 | Enable distribution-aware MoE autotune and kernel dispatch (experimental; TRT-LLM MoE only) | `export FLASHINFER_DIST_AWARE_AUTOTUNE=1` |
+| Declare expected mean K/V length for PrimsTS MLA balanced auto-routing | `export FLASHINFER_MLA_EXPECTED_MEAN_SEQ_LEN=<tokens>` |
+| Declare expected maximum K/V length for PrimsTS MLA balanced auto-routing | `export FLASHINFER_MLA_EXPECTED_MAX_SEQ_LEN=<tokens>` |
 
 The minimum Python version used by CI and build tooling is defined in
 `.python-version`. CI Docker images use a stable Conda environment name and

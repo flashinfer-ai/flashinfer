@@ -57,7 +57,14 @@ from .config import (
     MlaDecodeConfig,
     make_mla_decode_config,
 )
-from ..helpers.constants import MAX_MLA_SPLITS_KV, TMEM_DEALLOC_MBAR_THREADS
+from ..helpers.constants import (
+    MAX_MLA_SPLITS_KV,
+    TMEM_DEALLOC_MBAR_THREADS,
+    TMEM_LIFECYCLE_BARRIER_ID,
+    balanced_partial_capacity,
+    balanced_reducer_capacity,
+    balanced_work_descriptor_capacity,
+)
 from ..helpers.mask import MaskType, mask_visible_k_length, normalize_mask_type
 from ..helpers.query import (
     FlatQueryTileLayout,
@@ -95,7 +102,7 @@ from .parallel_reduction import (
     PARALLEL_REDUCTION_THREADS,
     run_parallel_reduction_kernel,
 )
-from .reduction import run_reduction_kernel
+from .reduction import run_reduction_kernel, zero_balanced_inactive_outputs
 from ..helpers.tile_scheduler import (
     MLAStaticTileSchedulerParams,
     MLAStaticTileScheduler,
@@ -158,6 +165,7 @@ def build_mla_decode_task_manager(
     split_kv=None,
     logical_num_heads_q=128,
     logical_seq_len_q=1,
+    use_balanced_scheduler=False,
     tiled_mma_qk=None,
     verbose=False,
     exhaustive_deadlock_race_check=True,
@@ -432,6 +440,7 @@ def build_mla_decode_task_manager(
         softmax_scale_log2=None,  # set at runtime
         smem_exchange=None,  # set at runtime
         split_kv=None,  # set at runtime
+        use_balanced_scheduler=use_balanced_scheduler,
         cu_seqlens_q=cu_seqlens_q,
         logical_num_heads_q=logical_num_heads_q,
         logical_seq_len_q=logical_seq_len_q,
@@ -721,6 +730,7 @@ class MlaDecodeTs:
         num_heads=128,
         seq_len_q=1,
         batch_size=1,
+        use_balanced_scheduler=False,
         mask_type: MaskType | str = MaskType.CAUSAL,
     ):
         """
@@ -803,6 +813,25 @@ class MlaDecodeTs:
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
         self.batch_size = batch_size
+        self.use_balanced_scheduler = use_balanced_scheduler
+        self.balanced_num_partitions = max_active_clusters
+        self.balanced_descriptor_capacity = (
+            balanced_work_descriptor_capacity(batch_size, max_active_clusters)
+            if use_balanced_scheduler
+            else 0
+        )
+        self.balanced_partial_capacity = (
+            balanced_partial_capacity(batch_size, max_active_clusters)
+            if use_balanced_scheduler
+            else 0
+        )
+        self.balanced_reducer_capacity = (
+            balanced_reducer_capacity(batch_size, max_active_clusters)
+            if use_balanced_scheduler
+            else 0
+        )
+        if use_balanced_scheduler and not is_persistent:
+            raise ValueError("balanced MLA scheduling requires a persistent launch")
         self.mask_type = normalize_mask_type(mask_type)
         self.query_tile_layout = FlatQueryTileLayout.for_tile(
             num_heads, seq_len_q, mma_qk_tiler_mn[0]
@@ -852,6 +881,11 @@ class MlaDecodeTs:
             self.query_tile_layout,
             self.num_q_tiles,
             self.tail_q_rows,
+            self.use_balanced_scheduler,
+            self.balanced_num_partitions,
+            self.balanced_descriptor_capacity,
+            self.balanced_partial_capacity,
+            self.balanced_reducer_capacity,
             self._parallel_reduction_shape_is_eligible,
             self.use_parallel_reduction,
             self.parallel_reduction_topology,
@@ -929,7 +963,11 @@ class MlaDecodeTs:
         split_kv: cutlass.Int32,
         cache_seqs: cute.Tensor,
         cu_seqlens_q: cute.Tensor | None,
-        block_split_kvs: cute.Tensor,
+        block_split_kvs: cute.Tensor | None,
+        balanced_work_descriptors: cute.Tensor | None,
+        balanced_partition_offsets: cute.Tensor | None,
+        balanced_combine_descriptors: cute.Tensor | None,
+        balanced_num_combine_descriptors: cute.Tensor | None,
         softmax_scale: cutlass.Float32,
         output_scale: cutlass.Float32,
         stream: object,
@@ -948,8 +986,7 @@ class MlaDecodeTs:
             is_var_split_kv=self.is_var_split_kv,
             mask_type=self.mask_type,
         )
-        physical_tile_rows = self.mma_qk_tiler_mn[0]
-        num_query_tiles = self.num_q_tiles
+        physical_tile_rows, num_query_tiles = self._effective_reduction_shape()
         # Fixed public tensors retain [H,D,SQ,B]/[H,SQ,B]; variable-Q tensors
         # compact batches into [H,D,totalQ]/[H,totalQ]. The scheduler/workspace
         # use physical flat-query tile coordinates, while resources map
@@ -1143,9 +1180,19 @@ class MlaDecodeTs:
             cfg.cluster_shape_mnk,
             kernel_split_kv,
         )
-        use_clc_dynamic = self.is_persistent and not cfg.is_fp8_qkv()
+        use_clc_dynamic = (
+            self.is_persistent
+            and not cfg.is_fp8_qkv()
+            and not self.use_balanced_scheduler
+        )
         clc_tile_sched_params = None
-        if cutlass.const_expr(use_clc_dynamic):
+        if cutlass.const_expr(self.use_balanced_scheduler):
+            grid = (
+                cfg.cluster_shape_mnk[0] * self.max_active_clusters,
+                1,
+                1,
+            )
+        elif cutlass.const_expr(use_clc_dynamic):
             # Keep the physical query-tile dimension in grid X and flatten
             # only split/batch into grid Z.  Besides avoiding a hot-path
             # S/B decode for every stolen tile, this preserves the natural
@@ -1165,18 +1212,25 @@ class MlaDecodeTs:
             )
 
         # Initialize workspace for split_kv > 1
+        workspace_split_capacity = kernel_split_kv
+        workspace_batch_size = batch_size
+        if cutlass.const_expr(self.use_balanced_scheduler):
+            workspace_split_capacity = Int32(self.balanced_partial_capacity)
+            workspace_batch_size = Int32(1)
         acc_o, acc_lse = self.initialize_workspace(
             Int32(physical_tile_rows),
             cfg.latent_dim,  # D
             Int32(num_query_tiles),
-            batch_size,
-            kernel_split_kv,
+            workspace_batch_size,
+            workspace_split_capacity,
             workspace,
         )
         # A one-wave producer can publish its dependent reducer launch while
         # retiring, hiding launch latency without admitting reducer CTAs into
         # an actively grid-striding persistent producer.
-        use_one_wave_reducer_pdl = acc_o is not None and not self.is_persistent
+        use_reducer_pdl = acc_o is not None and (
+            not self.is_persistent or self.use_balanced_scheduler
+        )
 
         self.split_kv_kernel(
             tma_desc_q_latent,
@@ -1195,6 +1249,8 @@ class MlaDecodeTs:
             cache_seqs,
             cu_seqlens_q,
             block_split_kvs,
+            balanced_work_descriptors,
+            balanced_partition_offsets,
             softmax_scale_log2,
             output_scale,
             tile_sched_params,
@@ -1205,7 +1261,7 @@ class MlaDecodeTs:
             cluster=cfg.cluster_shape_mnk,
             stream=stream,
             min_blocks_per_mp=1,
-            use_pdl=use_one_wave_reducer_pdl,
+            use_pdl=use_reducer_pdl,
         )
 
         # Reduction kernel: combine per-split results when split_kv > 1
@@ -1231,10 +1287,23 @@ class MlaDecodeTs:
                     cluster=[topology.cluster_size, 1, 1],
                     stream=stream,
                     min_blocks_per_mp=1,
-                    use_pdl=use_one_wave_reducer_pdl,
+                    use_pdl=use_reducer_pdl,
                 )
             else:
-                logical_query_rows = self.num_heads * self.seq_len_q
+                reduction_grid = (
+                    ceil_div(
+                        self.num_heads * self.seq_len_q,
+                        REDUCTION_ROWS_PER_CTA,
+                    ),
+                    1,
+                    batch_size,
+                )
+                if cutlass.const_expr(self.use_balanced_scheduler):
+                    reduction_grid = (
+                        ceil_div(physical_tile_rows, REDUCTION_ROWS_PER_CTA),
+                        num_query_tiles,
+                        Int32(self.balanced_reducer_capacity),
+                    )
                 self.reduction_kernel(
                     o,
                     lse,
@@ -1244,12 +1313,10 @@ class MlaDecodeTs:
                     cache_seqs,
                     cu_seqlens_q,
                     block_split_kvs,
+                    balanced_combine_descriptors,
+                    balanced_num_combine_descriptors,
                 ).launch(
-                    grid=(
-                        ceil_div(logical_query_rows, REDUCTION_ROWS_PER_CTA),
-                        1,
-                        batch_size,
-                    ),
+                    grid=reduction_grid,
                     block=[REDUCTION_ROWS_PER_CTA * REDUCTION_THREADS_PER_ROW, 1, 1],
                     smem=(
                         REDUCTION_ROWS_PER_CTA
@@ -1259,7 +1326,7 @@ class MlaDecodeTs:
                     ),
                     stream=stream,
                     min_blocks_per_mp=2,
-                    use_pdl=use_one_wave_reducer_pdl,
+                    use_pdl=use_reducer_pdl,
                 )
 
     @cute.kernel
@@ -1280,7 +1347,9 @@ class MlaDecodeTs:
         split_kv: cutlass.Int32,
         cache_seqs: cute.Tensor,
         cu_seqlens_q: cute.Tensor | None,
-        block_split_kvs: cute.Tensor,
+        block_split_kvs: cute.Tensor | None,
+        balanced_work_descriptors: cute.Tensor | None,
+        balanced_partition_offsets: cute.Tensor | None,
         softmax_scale_log2: cutlass.Float32,
         output_scale: cutlass.Float32,
         tile_sched_params: MLAStaticTileSchedulerParams,
@@ -1300,8 +1369,12 @@ class MlaDecodeTs:
             is_var_split_kv=self.is_var_split_kv,
             mask_type=self.mask_type,
         )
-        num_query_tiles = self.num_q_tiles
-        use_clc_dynamic = self.is_persistent and not cfg.is_fp8_qkv()
+        _, num_query_tiles = self._effective_reduction_shape()
+        use_clc_dynamic = (
+            self.is_persistent
+            and not cfg.is_fp8_qkv()
+            and not self.use_balanced_scheduler
+        )
         tiled_mma_qk = None
         if cutlass.const_expr(cfg.is_fp8_qkv()):
             tiled_mma_qk = sm100_utils.make_trivial_tiled_mma(
@@ -1381,7 +1454,10 @@ class MlaDecodeTs:
             Int64, 1, space=cutlass.AddressSpace.smem, alignment=8
         )
         clc_response_ptr = None
-        if cutlass.const_expr(use_clc_dynamic):
+        if cutlass.const_expr(self.use_balanced_scheduler):
+            cluster_idx = cute.arch.block_idx()[0] % Int32(cfg.cluster_shape_mnk[0])
+            blk_coord = (cluster_idx, Int32(0), Int32(0), Int32(0))
+        elif cutlass.const_expr(use_clc_dynamic):
             # Keep both response stages in the ordinary dynamic-SMEM arena.
             # ``alloc_smem`` creates a separately rounded static section, which
             # needlessly exceeds this kernel's near-capacity SMEM budget.
@@ -1413,7 +1489,9 @@ class MlaDecodeTs:
         # Remove once the compiler scopes nctaid reads per task.
         # Tile decomposition — compute blk_coord from ctaid.x WITHOUT creating
         # a full tile scheduler.
-        if cutlass.const_expr(use_clc_dynamic):
+        if cutlass.const_expr(self.use_balanced_scheduler):
+            pass
+        elif cutlass.const_expr(use_clc_dynamic):
             query_cluster_idx, _, split_batch_idx = cute.arch.block_idx()
             seq_q_idx = query_cluster_idx // Int32(cfg.cluster_shape_mnk[0])
             cluster_idx = query_cluster_idx % Int32(cfg.cluster_shape_mnk[0])
@@ -1518,7 +1596,11 @@ class MlaDecodeTs:
                 if cutlass.const_expr(self.static_split_kv is not None)
                 else split_kv
             )
-            if cutlass.const_expr(
+            if cutlass.const_expr(self.use_balanced_scheduler):
+                # The persistent work queue replaces this physical launch
+                # coordinate with a packed descriptor before task execution.
+                split_kv_cap = max_split_kv
+            elif cutlass.const_expr(
                 self.static_split_kv is not None and not self.is_var_split_kv
             ):
                 split_kv_cap = max_split_kv
@@ -1537,9 +1619,8 @@ class MlaDecodeTs:
             )
             exit_early = k_tile_count <= Int32(0)
             if cutlass.const_expr(self.is_persistent):
-                # A physical persistent CTA may own an empty initial split but
-                # later grid-stride to a nonempty batch/Q tile. Let MlaTask
-                # skip empty logical tiles instead of terminating the CTA.
+                # A physical grid-stride/CLC CTA may own an empty initial
+                # split but later advance to a nonempty batch/Q tile.
                 exit_early = False
 
         if exit_early:
@@ -1614,6 +1695,9 @@ class MlaDecodeTs:
                 cache_seqs=cache_seqs,
                 split_kv=max_split_kv,
                 block_split_kvs=block_split_kvs,
+                balanced_work_descriptors=balanced_work_descriptors,
+                balanced_partition_offsets=balanced_partition_offsets,
+                use_balanced_scheduler=self.use_balanced_scheduler,
                 is_var_split_kv=self.is_var_split_kv,
                 cfg=cfg,
                 static_split_kv=self.static_split_kv,
@@ -1655,6 +1739,7 @@ class MlaDecodeTs:
                 split_kv=max_split_kv,
                 logical_num_heads_q=self.num_heads,
                 logical_seq_len_q=self.seq_len_q,
+                use_balanced_scheduler=self.use_balanced_scheduler,
                 tiled_mma_qk=tiled_mma_qk,
             )
 
@@ -1723,9 +1808,21 @@ class MlaDecodeTs:
             named_res["gmem_o"].smem_exchange = epilogue_exchange_arr.data_ptr().toint(
                 Int32
             )
-            named_res["gmem_o"].split_kv = max_split_kv
+            named_res["gmem_o"].split_kv = (
+                Int32(self.balanced_partial_capacity)
+                if cutlass.const_expr(self.use_balanced_scheduler)
+                else max_split_kv
+            )
 
             task_manager.run()
+
+        if cutlass.const_expr(acc_o is not None and self.use_balanced_scheduler):
+            # All producer work, including workspace stores, must finish before
+            # any CTA releases the dependent reducer.
+            prims.barrier_cta_sync(
+                barrier_id=TMEM_LIFECYCLE_BARRIER_ID,
+                thread_count=cfg.threads_per_cta,
+            )
 
         # TMEM deallocation (MMA warp)
         if warp_idx == cfg.mma_warp_id:
@@ -1748,6 +1845,10 @@ class MlaDecodeTs:
             if cutlass.const_expr(acc_o is not None and not self.is_persistent):
                 if prims.elect_sync():
                     prims.griddepcontrol(kind=prims.GridDepAction.LAUNCH_DEPENDENTS)
+        if cutlass.const_expr(acc_o is not None and self.use_balanced_scheduler):
+            thread_idx, _, _ = cute.arch.thread_idx()
+            if thread_idx == Int32(0):
+                prims.griddepcontrol(kind=prims.GridDepAction.LAUNCH_DEPENDENTS)
 
     @cute.jit
     def initialize_workspace(
@@ -1799,7 +1900,9 @@ class MlaDecodeTs:
         split_kv: cutlass.Int32,
         cache_seqs: cute.Tensor,
         cu_seqlens_q: cute.Tensor | None,
-        block_split_kvs: cute.Tensor,
+        block_split_kvs: cute.Tensor | None,
+        balanced_combine_descriptors: cute.Tensor | None,
+        balanced_num_combine_descriptors: cute.Tensor | None,
     ):
         """Dispatch the throughput 2CTA split-KV reduction body."""
         cfg = make_mla_decode_config(
@@ -1811,22 +1914,66 @@ class MlaDecodeTs:
             o_dtype=self.out_dtype,
             mask_type=self.mask_type,
         )
-        if cutlass.const_expr(not self.is_persistent):
+        if cutlass.const_expr(not self.is_persistent or self.use_balanced_scheduler):
             prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
-        run_reduction_kernel(
-            self,
-            output,
-            lse,
-            acc_output,
-            acc_lse,
-            split_kv,
-            cache_seqs,
-            cu_seqlens_q,
-            block_split_kvs,
-            cfg,
-            self.reduction_split_capacity,
-            REDUCTION_ROWS_PER_CTA,
-        )
+        if cutlass.const_expr(self.use_balanced_scheduler):
+            _, _, combine_slot = cute.arch.block_idx()
+            # The producer omits zero-KV requests. Keep the compact fixed grid
+            # and stride it over all logical request slots to publish zero O
+            # and -inf private LSE without a second launch or another graph.
+            zero_balanced_inactive_outputs(
+                self,
+                output,
+                lse,
+                cache_seqs,
+                cu_seqlens_q,
+                cfg,
+                self.balanced_reducer_capacity,
+                REDUCTION_ROWS_PER_CTA,
+            )
+            if combine_slot < Int32(balanced_num_combine_descriptors[Int32(0)]):
+                batch_idx = Int32(balanced_combine_descriptors[combine_slot, Int32(0)])
+                split_count = Int32(
+                    balanced_combine_descriptors[combine_slot, Int32(1)]
+                )
+                split_begin = Int32(
+                    balanced_combine_descriptors[combine_slot, Int32(2)]
+                )
+                run_reduction_kernel(
+                    self,
+                    output,
+                    lse,
+                    acc_output,
+                    acc_lse,
+                    split_kv,
+                    cache_seqs,
+                    cu_seqlens_q,
+                    block_split_kvs,
+                    split_count,
+                    split_begin,
+                    cfg,
+                    self.reduction_split_capacity,
+                    REDUCTION_ROWS_PER_CTA,
+                    batch_idx,
+                )
+        else:
+            run_reduction_kernel(
+                self,
+                output,
+                lse,
+                acc_output,
+                acc_lse,
+                split_kv,
+                cache_seqs,
+                cu_seqlens_q,
+                block_split_kvs,
+                Int32(0),
+                Int32(0),
+                cfg,
+                self.reduction_split_capacity,
+                REDUCTION_ROWS_PER_CTA,
+                Int32(0),
+            )
 
     @cute.kernel
     def parallel_reduction_kernel(
@@ -1851,7 +1998,7 @@ class MlaDecodeTs:
             o_dtype=self.out_dtype,
             mask_type=self.mask_type,
         )
-        if cutlass.const_expr(not self.is_persistent):
+        if cutlass.const_expr(not self.is_persistent or self.use_balanced_scheduler):
             prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
         topology = self.parallel_reduction_topology
         run_parallel_reduction_kernel(

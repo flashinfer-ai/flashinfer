@@ -75,6 +75,41 @@ def row_prefix_active_split_count(
     return (row_k_tile_total + tiles_per_split - 1) // tiles_per_split
 
 
+def equal_split_row_prefix_active_split_count(
+    row_k_tile_total: int,
+    request_k_tile_total: int,
+    split_count: int,
+) -> int:
+    """Return equal-split pieces intersecting a row's request-prefix K domain.
+
+    Balanced schedules divide the full request into quotient/remainder pieces:
+    the first ``request_k_tile_total % split_count`` pieces have one extra
+    tile. A causal row can end inside any of those pieces, so its active count
+    must be reconstructed from the same boundaries rather than a uniform ceil
+    span derived from the row-visible K length.
+    """
+
+    _validate_partition_inputs(request_k_tile_total, split_count)
+    if row_k_tile_total < 0:
+        raise ValueError("row_k_tile_total must be non-negative")
+    if request_k_tile_total == 0:
+        return 0
+    if split_count > request_k_tile_total:
+        raise ValueError("split_count cannot exceed nonempty request tiles")
+    row_k_tile_total = min(row_k_tile_total, request_k_tile_total)
+    if row_k_tile_total == 0:
+        return 0
+
+    piece_base, piece_remainder = divmod(request_k_tile_total, split_count)
+    large_piece_size = piece_base + 1
+    large_piece_tiles = piece_remainder * large_piece_size
+    large_visible_tiles = min(row_k_tile_total, large_piece_tiles)
+    large_piece_count = (large_visible_tiles + large_piece_size - 1) // large_piece_size
+    small_visible_tiles = max(row_k_tile_total - large_piece_tiles, 0)
+    small_piece_count = (small_visible_tiles + piece_base - 1) // piece_base
+    return min(large_piece_count + small_piece_count, split_count)
+
+
 @cute.jit
 def runtime_split_kv_cap(
     max_split_kv,
@@ -151,3 +186,36 @@ def runtime_row_prefix_active_split_count(
     # The row K domain was clipped to the group's prefix, making the extra
     # group-active quotient and min redundant.
     return row_active_splits
+
+
+@cute.jit
+def runtime_equal_split_row_prefix_active_split_count(
+    row_k_tile_total,
+    request_k_tile_total,
+    split_count,
+):
+    """Device form of :func:`equal_split_row_prefix_active_split_count`."""
+
+    request_k_tile_total = cute.math.max(Int32(request_k_tile_total), Int32(0))
+    row_k_tile_total = cute.math.max(
+        cute.math.min(Int32(row_k_tile_total), request_k_tile_total),
+        Int32(0),
+    )
+    split_count = cute.math.max(Int32(split_count), Int32(1))
+    piece_base = request_k_tile_total // split_count
+    piece_remainder = request_k_tile_total - piece_base * split_count
+    large_piece_size = piece_base + Int32(1)
+    large_piece_tiles = piece_remainder * large_piece_size
+    large_visible_tiles = cute.math.min(row_k_tile_total, large_piece_tiles)
+    large_piece_count = (
+        large_visible_tiles + large_piece_size - Int32(1)
+    ) // large_piece_size
+    small_visible_tiles = cute.math.max(
+        row_k_tile_total - large_piece_tiles,
+        Int32(0),
+    )
+    small_piece_divisor = cute.math.max(piece_base, Int32(1))
+    small_piece_count = (
+        small_visible_tiles + small_piece_divisor - Int32(1)
+    ) // small_piece_divisor
+    return cute.math.min(large_piece_count + small_piece_count, split_count)

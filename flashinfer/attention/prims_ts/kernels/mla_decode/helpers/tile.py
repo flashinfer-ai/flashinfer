@@ -20,7 +20,12 @@ from cutlass import Int32
 
 from cutlass.experimental.task_scheduling.resources import StageInfo
 
-from .layout import _TASK_CACHE_SEQ_LEN_KV
+from .layout import (
+    _TASK_CACHE_DESCRIPTOR_TILE_COUNT,
+    _TASK_CACHE_K_TILE_START,
+    _TASK_CACHE_PARTIAL_IDX,
+    _TASK_CACHE_SEQ_LEN_KV,
+)
 from .mask import MaskType, mask_visible_k_length
 from .query import (
     flat_query_row_state,
@@ -338,28 +343,34 @@ def runtime_seq_len_kv_from_task_cache(
 ):
     """Return the CTA-visible KV domain from the task-cached raw length."""
     seq_len_kv = Int32(task_cache[_TASK_CACHE_SEQ_LEN_KV])
-    if cutlass.const_expr(cfg.mask_type == MaskType.DENSE.value):
-        return seq_len_kv
-    _, logical_seq_len_q = query_batch_bounds(
-        cu_seqlens_q,
-        batch_idx,
-        cfg.logical_seq_len_q,
-    )
-    _, _, logical_q_idx, _, _ = flat_query_row_state(
-        Int32(cfg.tile_size_q - 1),
-        cta_idx_q,
-        cfg.tile_size_q,
-        cfg.logical_num_heads_q,
-        cfg.logical_seq_len_q,
-        cu_seqlens_q,
-        batch_idx,
-    )
-    return mask_visible_k_length(
-        cfg.mask_type,
-        seq_len_kv,
-        logical_q_idx,
-        logical_seq_len_q,
-    )
+    if cutlass.const_expr(cfg.mask_type != MaskType.DENSE.value):
+        _, logical_seq_len_q = query_batch_bounds(
+            cu_seqlens_q,
+            batch_idx,
+            cfg.logical_seq_len_q,
+        )
+        _, _, logical_q_idx, _, _ = flat_query_row_state(
+            Int32(cfg.tile_size_q - 1),
+            cta_idx_q,
+            cfg.tile_size_q,
+            cfg.logical_num_heads_q,
+            cfg.logical_seq_len_q,
+            cu_seqlens_q,
+            batch_idx,
+        )
+        seq_len_kv = mask_visible_k_length(
+            cfg.mask_type,
+            seq_len_kv,
+            logical_q_idx,
+            logical_seq_len_q,
+        )
+    if cutlass.const_expr(cfg.use_balanced_scheduler == 1):
+        descriptor_end_k = (
+            Int32(task_cache[_TASK_CACHE_K_TILE_START])
+            + Int32(task_cache[_TASK_CACHE_DESCRIPTOR_TILE_COUNT])
+        ) * Int32(cfg.tile_size_kv)
+        seq_len_kv = cute.math.min(seq_len_kv, descriptor_end_k)
+    return seq_len_kv
 
 
 @cute.jit
@@ -368,8 +379,11 @@ def global_kv_tile_idx(
     local_tile_idx,
     seq_len_kv,
     cta_idx_kv,
+    task_cache=None,
 ):
     """Map a local KV tile id to the global KV tile id for split-KV mode."""
+    if cutlass.const_expr(cfg.use_balanced_scheduler == 1):
+        return Int32(task_cache[_TASK_CACHE_K_TILE_START]) + local_tile_idx
     if cutlass.const_expr(cfg.use_multi_ctas_kv != 1):
         return local_tile_idx
     return Int32(cta_idx_kv) * runtime_local_kv_tiles(cfg, seq_len_kv) + local_tile_idx
@@ -396,6 +410,8 @@ def batch_idx_for_stage_cfg(attr, cfg: MlaConfig, stage_info: StageInfo):
         _cta_idx_q, _cta_idx_head_dim, batch_head_idx = stage_info.work_tile.tile_idx
         del _cta_idx_q, _cta_idx_head_dim
         batch_head_idx = Int32(batch_head_idx)
+        if cutlass.const_expr(cfg.use_balanced_scheduler == 1):
+            batch_head_idx = batch_head_idx // Int32(cfg.balanced_descriptor_capacity)
         return batch_head_idx // Int32(cfg.num_ctas_for_all_heads)
     return Int32(attr)
 
@@ -407,6 +423,8 @@ def head_idx_for_stage(attr, cfg: MlaConfig, stage_info: StageInfo):
         _cta_idx_q, _cta_idx_head_dim, batch_head_idx = stage_info.work_tile.tile_idx
         del _cta_idx_q, _cta_idx_head_dim
         batch_head_idx = Int32(batch_head_idx)
+        if cutlass.const_expr(cfg.use_balanced_scheduler == 1):
+            batch_head_idx = batch_head_idx // Int32(cfg.balanced_descriptor_capacity)
         head_tile_idx = batch_head_idx % Int32(cfg.num_ctas_for_all_heads)
         return head_tile_idx * Int32(cfg.tile_size_q)
     return Int32(attr)
@@ -425,8 +443,12 @@ def cta_idx_head_dim_v_for_stage(attr, stage_info: StageInfo):
 
 
 @cute.jit
-def cta_idx_kv_for_stage(attr, stage_info: StageInfo):
+def cta_idx_kv_for_stage(attr, stage_info: StageInfo, task_cache=None, cfg=None):
     """Return the KV CTA index, defaulting to zero for non-split KV."""
+    if cutlass.const_expr(
+        task_cache is not None and cfg is not None and cfg.use_balanced_scheduler == 1
+    ):
+        return Int32(task_cache[_TASK_CACHE_PARTIAL_IDX])
     if cutlass.const_expr(attr is None):
         return Int32(0)
     return Int32(attr)
