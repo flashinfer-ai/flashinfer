@@ -120,7 +120,7 @@ def get_cake_fmha_request_ordered_fp8q_manifest() -> dict[str, Any]:
 _FP8Q_SPLIT_MANIFEST_NAME = (
     "cake_fmha_request_ordered_paged_decode_fp8q_split_manifest.json"
 )
-_FP8Q_SPLIT_CONTRACT = {
+_FP8Q_SPLIT_CONTRACT: dict[str, Any] = {
     "query_dtype": "float8_e4m3fn",
     "output_dtype": "bfloat16",
     "kv_dtype": "float8_e4m3fn",
