@@ -1826,7 +1826,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     f"cute-dsl decode backend does not support "
                     f"pos_encoding_mode={pos_encoding_mode!r}"
                 )
-            self._max_kv_len = int(max(kv_lens_arr_host).item())
+            self._max_kv_len = int(kv_lens_arr_host.max().item())
             kv_splits = None
             if fixed_split_size > 0:
                 fixed_split_len = fixed_split_size * page_size
@@ -1864,7 +1864,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             )
         elif self._backend == "trtllm-gen":
             assert logits_soft_cap == 0.0
-            self._max_kv_len = max(kv_lens_arr_host).item()
+            self._max_kv_len = kv_lens_arr_host.max().item()
             # Allocated once per plan and reused across run() launches. The
             # trtllm-gen kernel self-resets the counters at the end of each
             # launch, so no per-launch re-zeroing is needed.
@@ -1918,7 +1918,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             )
             self._plan_info = self._cached_module.plan()  # None
         elif self.use_tensor_cores:
-            self._max_kv_len = max(kv_lens_arr_host).item()
+            self._max_kv_len = kv_lens_arr_host.max().item()
             if self._jit_module is not None:
                 self._cached_module = self._jit_module
             else:
