@@ -167,6 +167,10 @@ struct RouterLaunchConfig {
   RouterKernels kernels;
 };
 
+inline void CheckCudaDriver(CUresult status) {
+  TVM_FFI_ICHECK(status == CUDA_SUCCESS) << "CUDA driver error " << static_cast<int>(status);
+}
+
 inline RouterLaunchConfig GetRouterLaunchConfig(int32_t device_id) {
   static std::mutex mutex;
   static std::unordered_map<int32_t, RouterLaunchConfig> cache;
@@ -188,95 +192,76 @@ inline RouterLaunchConfig GetRouterLaunchConfig(int32_t device_id) {
   TVM_FFI_ICHECK(cooperative_launch != 0)
       << "AlphaMoE fused router requires cooperative-launch support";
   const RouterKernels kernels = GetRouterKernels(minor);
-  const auto device = tvm::ffi::cuda_api::GetDeviceHandle(device_id);
-  TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(tvm::ffi::cuda_api::SetKernelMaxDynamicSharedMem(
-      kernels[0]->GetHandle(), alphamoe_router_large_generated::kSmemTotal, device));
   CUfunction large_function = nullptr;
-  TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(
-      cuKernelGetFunction(&large_function, kernels[0]->GetHandle()));
+  CheckCudaDriver(
+      cuKernelGetFunction(&large_function, reinterpret_cast<CUkernel>(kernels[0]->GetHandle())));
   int large_active = 0;
-  TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(cuOccupancyMaxActiveBlocksPerMultiprocessor(
+  CheckCudaDriver(cuOccupancyMaxActiveBlocksPerMultiprocessor(
       &large_active, large_function, alphamoe_router_large_generated::kThreads,
       alphamoe_router_large_generated::kSmemTotal));
   TVM_FFI_ICHECK(large_active > 0) << "AlphaMoE large has zero occupancy";
-  TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(tvm::ffi::cuda_api::SetKernelMaxDynamicSharedMem(
-      kernels[1]->GetHandle(), alphamoe_router_large_routed_generated::kSmemTotal, device));
   CUfunction large_routed_function = nullptr;
-  TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(
-      cuKernelGetFunction(&large_routed_function, kernels[1]->GetHandle()));
+  CheckCudaDriver(cuKernelGetFunction(&large_routed_function,
+                                      reinterpret_cast<CUkernel>(kernels[1]->GetHandle())));
   int large_routed_active = 0;
-  TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(cuOccupancyMaxActiveBlocksPerMultiprocessor(
+  CheckCudaDriver(cuOccupancyMaxActiveBlocksPerMultiprocessor(
       &large_routed_active, large_routed_function, alphamoe_router_large_routed_generated::kThreads,
       alphamoe_router_large_routed_generated::kSmemTotal));
   TVM_FFI_ICHECK(large_routed_active > 0) << "AlphaMoE large_routed has zero occupancy";
-  TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(tvm::ffi::cuda_api::SetKernelMaxDynamicSharedMem(
-      kernels[2]->GetHandle(), alphamoe_router_medium_generated::kSmemTotal, device));
   CUfunction medium_function = nullptr;
-  TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(
-      cuKernelGetFunction(&medium_function, kernels[2]->GetHandle()));
+  CheckCudaDriver(
+      cuKernelGetFunction(&medium_function, reinterpret_cast<CUkernel>(kernels[2]->GetHandle())));
   int medium_active = 0;
-  TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(cuOccupancyMaxActiveBlocksPerMultiprocessor(
+  CheckCudaDriver(cuOccupancyMaxActiveBlocksPerMultiprocessor(
       &medium_active, medium_function, alphamoe_router_medium_generated::kThreads,
       alphamoe_router_medium_generated::kSmemTotal));
   TVM_FFI_ICHECK(medium_active > 0) << "AlphaMoE medium has zero occupancy";
-  TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(tvm::ffi::cuda_api::SetKernelMaxDynamicSharedMem(
-      kernels[3]->GetHandle(), alphamoe_router_medium_routed_generated::kSmemTotal, device));
   CUfunction medium_routed_function = nullptr;
-  TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(
-      cuKernelGetFunction(&medium_routed_function, kernels[3]->GetHandle()));
+  CheckCudaDriver(cuKernelGetFunction(&medium_routed_function,
+                                      reinterpret_cast<CUkernel>(kernels[3]->GetHandle())));
   int medium_routed_active = 0;
-  TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(cuOccupancyMaxActiveBlocksPerMultiprocessor(
+  CheckCudaDriver(cuOccupancyMaxActiveBlocksPerMultiprocessor(
       &medium_routed_active, medium_routed_function,
       alphamoe_router_medium_routed_generated::kThreads,
       alphamoe_router_medium_routed_generated::kSmemTotal));
   TVM_FFI_ICHECK(medium_routed_active > 0) << "AlphaMoE medium_routed has zero occupancy";
-  TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(tvm::ffi::cuda_api::SetKernelMaxDynamicSharedMem(
-      kernels[4]->GetHandle(), alphamoe_router_small_generated::kSmemTotal, device));
   CUfunction small_function = nullptr;
-  TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(
-      cuKernelGetFunction(&small_function, kernels[4]->GetHandle()));
+  CheckCudaDriver(
+      cuKernelGetFunction(&small_function, reinterpret_cast<CUkernel>(kernels[4]->GetHandle())));
   int small_active = 0;
-  TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(cuOccupancyMaxActiveBlocksPerMultiprocessor(
+  CheckCudaDriver(cuOccupancyMaxActiveBlocksPerMultiprocessor(
       &small_active, small_function, alphamoe_router_small_generated::kThreads,
       alphamoe_router_small_generated::kSmemTotal));
   TVM_FFI_ICHECK(small_active > 0) << "AlphaMoE small has zero occupancy";
-  TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(tvm::ffi::cuda_api::SetKernelMaxDynamicSharedMem(
-      kernels[5]->GetHandle(), alphamoe_router_small_routed_generated::kSmemTotal, device));
   CUfunction small_routed_function = nullptr;
-  TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(
-      cuKernelGetFunction(&small_routed_function, kernels[5]->GetHandle()));
+  CheckCudaDriver(cuKernelGetFunction(&small_routed_function,
+                                      reinterpret_cast<CUkernel>(kernels[5]->GetHandle())));
   int small_routed_active = 0;
-  TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(cuOccupancyMaxActiveBlocksPerMultiprocessor(
+  CheckCudaDriver(cuOccupancyMaxActiveBlocksPerMultiprocessor(
       &small_routed_active, small_routed_function, alphamoe_router_small_routed_generated::kThreads,
       alphamoe_router_small_routed_generated::kSmemTotal));
   TVM_FFI_ICHECK(small_routed_active > 0) << "AlphaMoE small_routed has zero occupancy";
-  TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(tvm::ffi::cuda_api::SetKernelMaxDynamicSharedMem(
-      kernels[6]->GetHandle(), alphamoe_router_tiny_generated::kSmemTotal, device));
   CUfunction tiny_function = nullptr;
-  TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(
-      cuKernelGetFunction(&tiny_function, kernels[6]->GetHandle()));
+  CheckCudaDriver(
+      cuKernelGetFunction(&tiny_function, reinterpret_cast<CUkernel>(kernels[6]->GetHandle())));
   int tiny_active = 0;
-  TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(cuOccupancyMaxActiveBlocksPerMultiprocessor(
+  CheckCudaDriver(cuOccupancyMaxActiveBlocksPerMultiprocessor(
       &tiny_active, tiny_function, alphamoe_router_tiny_generated::kThreads,
       alphamoe_router_tiny_generated::kSmemTotal));
   TVM_FFI_ICHECK(tiny_active > 0) << "AlphaMoE tiny has zero occupancy";
-  TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(tvm::ffi::cuda_api::SetKernelMaxDynamicSharedMem(
-      kernels[7]->GetHandle(), alphamoe_router_tiny_routed_generated::kSmemTotal, device));
   CUfunction tiny_routed_function = nullptr;
-  TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(
-      cuKernelGetFunction(&tiny_routed_function, kernels[7]->GetHandle()));
+  CheckCudaDriver(cuKernelGetFunction(&tiny_routed_function,
+                                      reinterpret_cast<CUkernel>(kernels[7]->GetHandle())));
   int tiny_routed_active = 0;
-  TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(cuOccupancyMaxActiveBlocksPerMultiprocessor(
+  CheckCudaDriver(cuOccupancyMaxActiveBlocksPerMultiprocessor(
       &tiny_routed_active, tiny_routed_function, alphamoe_router_tiny_routed_generated::kThreads,
       alphamoe_router_tiny_routed_generated::kSmemTotal));
   TVM_FFI_ICHECK(tiny_routed_active > 0) << "AlphaMoE tiny_routed has zero occupancy";
-  TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(tvm::ffi::cuda_api::SetKernelMaxDynamicSharedMem(
-      kernels[8]->GetHandle(), alphamoe_router_large_tail_generated::kSmemTotal, device));
   CUfunction large_tail_function = nullptr;
-  TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(
-      cuKernelGetFunction(&large_tail_function, kernels[8]->GetHandle()));
+  CheckCudaDriver(cuKernelGetFunction(&large_tail_function,
+                                      reinterpret_cast<CUkernel>(kernels[8]->GetHandle())));
   int large_tail_active = 0;
-  TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(cuOccupancyMaxActiveBlocksPerMultiprocessor(
+  CheckCudaDriver(cuOccupancyMaxActiveBlocksPerMultiprocessor(
       &large_tail_active, large_tail_function, alphamoe_router_large_tail_generated::kThreads,
       alphamoe_router_large_tail_generated::kSmemTotal));
   TVM_FFI_ICHECK(large_tail_active > 0) << "AlphaMoE large_tail has zero occupancy";
@@ -292,16 +277,14 @@ inline void LaunchRouterKernel(tvm::ffi::CubinKernel& kernel, unsigned int grid_
                                unsigned int threads, unsigned int smem, bool cooperative,
                                cudaStream_t stream, void** args) {
   if (cooperative) {
-    CUlaunchAttribute attribute{};
-    attribute.id = CU_LAUNCH_ATTRIBUTE_COOPERATIVE;
-    attribute.value.cooperative = 1;
-    CUlaunchConfig launch{};
-    launch.gridDimX = grid_x;
-    launch.gridDimY = launch.gridDimZ = 1;
-    launch.blockDimX = threads;
-    launch.blockDimY = launch.blockDimZ = 1;
-    launch.sharedMemBytes = smem;
-    launch.hStream = stream;
+    cudaLaunchAttribute attribute{};
+    attribute.id = cudaLaunchAttributeCooperative;
+    attribute.val.cooperative = 1;
+    cudaLaunchConfig_t launch{};
+    launch.gridDim = {grid_x, 1, 1};
+    launch.blockDim = {threads, 1, 1};
+    launch.dynamicSmemBytes = smem;
+    launch.stream = stream;
     launch.attrs = &attribute;
     launch.numAttrs = 1;
     TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(kernel.LaunchEx(args, launch));

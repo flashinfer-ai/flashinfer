@@ -116,7 +116,7 @@ def get_alphamoe_nvrtc_spec(source_dir: Path, selected_archs):
     digest.update((source_dir.parent / "alphamoe_fused_router.cu").read_bytes())
     for key in _ENTRIES:
         digest.update((source_dir / f"{key}.cu").read_bytes())
-    flags = ["-DTVM_FFI_CUBIN_LAUNCHER_USE_DRIVER_API=1"]
-    flags += [f"-DFLASHINFER_ALPHAMOE_{arch.upper()}=1" for arch in arches]
+    # TVM-FFI uses the CUDA Runtime API by default on CUDA 12.8 and newer.
+    flags = [f"-DFLASHINFER_ALPHAMOE_{arch.upper()}=1" for arch in arches]
     factory = functools.partial(_prepare_cubins, source_dir=source_dir, arches=arches)
     return digest.hexdigest()[:20], flags, factory
