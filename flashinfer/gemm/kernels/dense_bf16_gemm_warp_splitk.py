@@ -20,14 +20,11 @@ from cutlass.cute import experimental as cute_ext
 from cutlass.cute.nvgpu import warp
 from cutlass.cute.runtime import from_dlpack
 
-from ...jit.cute_dsl_core import build_and_load_cute_dsl_kernel
-
-
 _MMA_SHAPE = (16, 8, 16)
 _COMPUTE_WARPS = 4
 _A_LOADER_WARPS = 2
 _A_LOADER_THREADS = _A_LOADER_WARPS * 32
-_MAX_M = 32
+_MAX_M = 16
 # Ring depth cap: cold-read bandwidth saturates around 12 stages (96 KB in
 # flight), so deeper rings only enlarge the tactic space.
 _MAX_STAGES = 16
@@ -35,7 +32,7 @@ _MAX_STAGES = 16
 # code size stay proportionate (64 tiles of 256 elements = K 16384).
 _MAX_K_TILES = 64
 _SUPPORTED_OUTPUT_TILES = (16, 32)
-_SUPPORTED_TOKEN_TILES = (8, 16, 32)
+_SUPPORTED_TOKEN_TILES = (8, 16)
 _SUPPORTED_K_TILES = (128, 256)
 _SUPPORTED_B_LOADER_WARPS = (1, 2)
 _SMEM_CAPACITY = cutlass.utils.get_smem_capacity_in_bytes("sm_100")
@@ -345,7 +342,7 @@ def default_tactic(m: int, n: int, k: int) -> WarpSplitKTactic:
     # Splitting M over two half-size token tiles doubles the CTA count at the
     # cost of a second pass over each weight tile; that only pays while the
     # doubled grid still fits in one wave.
-    token_tile = 8 if m <= 8 else 16 if m <= 16 else 32
+    token_tile = 8 if m <= 8 else 16
     if token_tile > 8 and 2 * (n // output_tile) <= sm_count:
         token_tile //= 2
     # Two B-loader warps pay off once the ring is reused (long K); for a handful
@@ -384,8 +381,6 @@ def autotune_tactics(m: int, n: int, k: int) -> list[WarpSplitKTactic]:
         if n % output_tile:
             continue
         for token_tile in _SUPPORTED_TOKEN_TILES:
-            if token_tile > 16 and m <= 16:
-                continue  # a 32-token tile only pays for M > 16
             for k_tile in _SUPPORTED_K_TILES:
                 if k % k_tile:
                     continue
@@ -778,46 +773,42 @@ class CpAsyncWarpSplitKKernel:
                     ].to(output.element_type)
 
 
-def _from_dlpack(tensor: _torch.Tensor):
-    return from_dlpack(tensor, assumed_align=32)
+def _from_dlpack(tensor: _torch.Tensor, *, dynamic_m: bool = False):
+    tensor = from_dlpack(tensor, assumed_align=32)
+    if dynamic_m:
+        # Only M varies; the row stride and N/K extents stay static.
+        tensor = tensor.mark_compact_shape_dynamic(
+            mode=0, stride_order=(0, 1), divisibility=1
+        )
+    return tensor
 
 
 @functools.cache
 def _compile(
     device_index: int,
     dtype,
-    m: int,
     n: int,
     k: int,
     tactic: WarpSplitKTactic,
     use_pdl: bool,
     has_bias: bool,
 ):
-    def compile_kernel():
+    with _torch.cuda.device(device_index):
         return cute_ext.compile(
             CpAsyncWarpSplitKKernel(tactic, use_pdl, has_bias),
             *(
-                _from_dlpack(tensor)
-                for tensor in (
-                    _torch.empty((n, k), device="cuda", dtype=dtype),
-                    _torch.empty((m, k), device="cuda", dtype=dtype),
-                    _torch.empty((n,), device="cuda", dtype=dtype),
-                    _torch.empty((m, n), device="cuda", dtype=dtype),
+                _from_dlpack(
+                    _torch.empty(shape, device="cuda", dtype=dtype),
+                    dynamic_m=dynamic_m,
+                )
+                for shape, dynamic_m in (
+                    ((n, k), False),
+                    ((_MAX_M, k), True),
+                    ((n,), False),
+                    ((_MAX_M, n), True),
                 )
             ),
-            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-            options="--enable-tvm-ffi",
-        )
-
-    with _torch.cuda.device(device_index):
-        return build_and_load_cute_dsl_kernel(
-            "dense_bf16_gemm_warp_splitk",
-            f"{str(dtype).removeprefix('torch.')}_m{m}_n{n}_k{k}"
-            f"_out{tactic.output_tile}_token{tactic.token_tile}_kt{tactic.k_tile}"
-            f"_stages{tactic.stages}_bl{tactic.b_loader_warps}"
-            f"_pdl{int(use_pdl)}_bias{int(has_bias)}",
-            compile_kernel,
-            extra_key_files=(__file__,),
+            _cuda.CUstream(_torch.cuda.current_stream().cuda_stream),
         )
 
 
@@ -827,16 +818,15 @@ def run_warp_splitk_dense(a, b, out, pdl: bool, tactic: WarpSplitKTactic, bias=N
     device_index = a.device.index
     assert device_index is not None
     with _torch.cuda.device(a.device):
-        compiled = _compile(
-            device_index, a.dtype, m, n, k, tactic, pdl, bias is not None
-        )
+        compiled = _compile(device_index, a.dtype, n, k, tactic, pdl, bias is not None)
         # Without bias the kernel never reads its bias argument; pass a row of
         # ``out`` so the launch signature stays fixed.
         compiled(
-            b.T,
-            a,
-            bias if bias is not None else out[0],
-            out,
+            _from_dlpack(b.T),
+            _from_dlpack(a, dynamic_m=True),
+            _from_dlpack(bias if bias is not None else out[0]),
+            _from_dlpack(out, dynamic_m=True),
+            _cuda.CUstream(_torch.cuda.current_stream(a.device).cuda_stream),
         )
     return out
 
