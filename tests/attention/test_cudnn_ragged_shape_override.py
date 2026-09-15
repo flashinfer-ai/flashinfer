@@ -1,0 +1,192 @@
+"""The cuDNN ragged prefill graph is built once per length class with cuDNN's
+execute-time shape override and fed the real (batch, max_seq_len) on every call,
+so a serving stream of changing shapes builds no new execution plans (one build
+is 55-70 ms). These tests pin the cache-shape function, count graph builds across
+a stream of shapes, and check numerics against FA2 in both length classes.
+"""
+
+import pytest
+import torch
+
+import flashinfer
+from flashinfer.cudnn import prefill as cudnn_prefill
+from flashinfer.cudnn.prefill import (
+    _OVERRIDE_CACHE_BATCH,
+    _OVERRIDE_CACHE_SEQ_LONG,
+    _OVERRIDE_SHORT_SEQ,
+    _override_cache_shape,
+)
+from flashinfer.utils import is_sm100a_supported
+
+
+@pytest.mark.parametrize(
+    "b,s_q,s_kv,expected",
+    [
+        (3, 4, 4, (_OVERRIDE_CACHE_BATCH, _OVERRIDE_SHORT_SEQ)),
+        (64, 128, 128, (_OVERRIDE_CACHE_BATCH, _OVERRIDE_SHORT_SEQ)),
+        (64, 129, 128, (_OVERRIDE_CACHE_BATCH, _OVERRIDE_CACHE_SEQ_LONG)),
+        (16, 1000, 4096, (_OVERRIDE_CACHE_BATCH, _OVERRIDE_CACHE_SEQ_LONG)),
+        (16, 70000, 70000, (_OVERRIDE_CACHE_BATCH, 131072)),
+        (5000, 1000, 1000, (8192, _OVERRIDE_CACHE_SEQ_LONG)),
+    ],
+)
+def test_override_cache_shape(b, s_q, s_kv, expected):
+    assert _override_cache_shape(b, s_q, s_kv) == expected
+
+
+def _indptr(lens):
+    t = torch.zeros(len(lens) + 1, dtype=torch.int32)
+    t[1:] = torch.cumsum(torch.tensor(lens, dtype=torch.int32), 0)
+    return t
+
+
+def _cudnn_override_available():
+    if not torch.cuda.is_available() or not is_sm100a_supported(torch.device("cuda")):
+        return False
+    return (
+        cudnn_prefill._cudnn_supports_direct_seqlens(torch.bfloat16)
+        and cudnn_prefill._cudnn_version_supports_shape_override()
+    )
+
+
+requires_override = pytest.mark.skipif(
+    not _cudnn_override_available(),
+    reason="needs SM100, cuDNN>=9.24 and cudnn-frontend>=1.29",
+)
+
+
+def _run(backend, lens, hq, hkv, d, causal=True, ws=None, dvo=None):
+    dvo = d if dvo is None else dvo
+    indptr = _indptr(lens)
+    T = int(indptr[-1])
+    g = torch.Generator(device="cuda").manual_seed(0)
+    q = torch.randn(T, hq, d, dtype=torch.bfloat16, device="cuda", generator=g)
+    k = torch.randn(T, hkv, d, dtype=torch.bfloat16, device="cuda", generator=g)
+    v = torch.randn(T, hkv, dvo, dtype=torch.bfloat16, device="cuda", generator=g)
+    ws = (
+        ws
+        if ws is not None
+        else torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+    )
+    w = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(ws, "NHD", backend=backend)
+    w.plan(
+        indptr,
+        indptr,
+        hq,
+        hkv,
+        d,
+        head_dim_vo=dvo,
+        causal=causal,
+        q_data_type=torch.bfloat16,
+    )
+    return w.run(q, k, v, return_lse=True)
+
+
+def _assert_matches_fa2(lens, hq, hkv, d, causal=True, dvo=None):
+    o_c, lse_c = _run("cudnn", lens, hq, hkv, d, causal, dvo=dvo)
+    o_f, lse_f = _run("fa2", lens, hq, hkv, d, causal, dvo=dvo)
+    assert o_c.shape == o_f.shape and lse_c.shape == lse_f.shape
+    torch.testing.assert_close(o_c.float(), o_f.float(), atol=2e-2, rtol=2e-2)
+    finite = torch.isfinite(lse_f)
+    assert torch.equal(torch.isfinite(lse_c), finite)
+    torch.testing.assert_close(lse_c[finite], lse_f[finite], atol=5e-3, rtol=5e-3)
+
+
+@requires_override
+def test_shape_stream_builds_one_graph_per_length_class():
+    ws = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+    hq, hkv, d = 32, 8, 128
+    torch.manual_seed(7)
+    _run("cudnn", [50, 166, 7], hq, hkv, d, ws=ws)  # long class, may build
+    _run("cudnn", [4] * 9, hq, hkv, d, ws=ws)  # short class, may build
+    before = cudnn_prefill._prefill_graph_builds
+    for _ in range(12):
+        b = int(torch.randint(1, 40, (1,)))
+        lens = torch.randint(1, 2048, (b,)).tolist()
+        _run("cudnn", lens, hq, hkv, d, ws=ws)
+        lens = [int(torch.randint(1, _OVERRIDE_SHORT_SEQ + 1, (1,)))] * int(
+            torch.randint(1, 200, (1,))
+        )
+        _run("cudnn", lens, hq, hkv, d, ws=ws)
+    assert cudnn_prefill._prefill_graph_builds == before, (
+        "a new (batch, max_len) rebuilt the cuDNN graph"
+    )
+
+
+@requires_override
+def test_exact_declaration_rebuilds_per_shape(monkeypatch):
+    monkeypatch.setenv("FLASHINFER_CUDNN_PREFILL_SHAPE_OVERRIDE", "0")
+    hq, hkv, d = 32, 8, 128
+    _run("cudnn", [50, 166, 7], hq, hkv, d)
+    before = cudnn_prefill._prefill_graph_builds
+    _run("cudnn", [50, 166, 7, 9], hq, hkv, d)
+    assert cudnn_prefill._prefill_graph_builds == before + 1
+    _assert_matches_fa2([50, 166, 7, 9], hq, hkv, d)
+
+
+@requires_override
+@pytest.mark.parametrize("causal", [True, False])
+@pytest.mark.parametrize(
+    "lens",
+    [
+        [50, 166, 7],  # long class
+        [4] * 13,  # short class (short-row engine)
+        [128] * 3 + [1],  # short class upper edge
+        [1, 777, 0, 300],  # zero-length row
+        [2000, 5, 1500],
+    ],
+)
+def test_override_matches_fa2(lens, causal):
+    _assert_matches_fa2(lens, 32, 8, 128, causal)
+
+
+@requires_override
+def test_override_matches_fa2_mla_dims():
+    # DeepSeek-style prefill: 128 MHA heads, d_qk=192, d_vo=128 (V strides differ from Q/K).
+    _assert_matches_fa2([700, 33, 1200], 128, 128, 192, dvo=128)
+
+
+@requires_override
+def test_override_handles_strided_views():
+    hq, d = 32, 128
+    lens = [777, 1, 1500, 96]
+    indptr = _indptr(lens)
+    T = int(indptr[-1])
+    qkv = torch.randn(T, 3, hq, d, dtype=torch.bfloat16, device="cuda")
+    q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]
+    ws = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+    outs = {}
+    for backend, (qq, kk, vv) in (
+        ("cudnn", (q, k, v)),
+        ("fa2", (q.contiguous(), k.contiguous(), v.contiguous())),
+    ):
+        w = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(ws, "NHD", backend=backend)
+        w.plan(
+            indptr,
+            indptr,
+            hq,
+            hq,
+            d,
+            head_dim_vo=d,
+            causal=True,
+            q_data_type=torch.bfloat16,
+        )
+        outs[backend] = w.run(qq, kk, vv, return_lse=True)
+    torch.testing.assert_close(
+        outs["cudnn"][0].float(), outs["fa2"][0].float(), atol=2e-2, rtol=2e-2
+    )
+    torch.testing.assert_close(outs["cudnn"][1], outs["fa2"][1], atol=5e-3, rtol=5e-3)
+
+
+@requires_override
+def test_cache_shape_growth_when_exceeded(monkeypatch):
+    # A row longer than the long cache shape moves to a bigger power-of-two cache
+    # shape (one more build), and stays correct.
+    monkeypatch.setattr(cudnn_prefill, "_OVERRIDE_CACHE_SEQ_LONG", 512)
+    hq, hkv, d = 32, 8, 128
+    _run("cudnn", [300, 400], hq, hkv, d)
+    before = cudnn_prefill._prefill_graph_builds
+    _assert_matches_fa2([300, 900], hq, hkv, d)
+    assert cudnn_prefill._prefill_graph_builds == before + 1
+    _run("cudnn", [1000, 20], hq, hkv, d)  # same grown cache shape (1024): no build
+    assert cudnn_prefill._prefill_graph_builds == before + 1
