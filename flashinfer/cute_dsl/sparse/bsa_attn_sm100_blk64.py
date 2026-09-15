@@ -37,6 +37,7 @@ from .sm100_blk64.dispatch_helpers import (
     dynamic_tensors_compile_key,
     sm100_blk64_auto_kv_splits,
     sm100_blk64_auto_fp8_kv_splits,
+    sm103_blk64_use_sage_fp8_ldred,
     build_sm100_blk64_kv_split_offsets,
     resolve_sm100_blk64_split_workspace,
     choose_sm100_blk64_use_clc,
@@ -80,8 +81,9 @@ def bsa_attn_sm100_blk64_fwd(
         q2k_block_index: Block index tensor (batch, num_heads, num_q_blocks, max_kv_blocks), int32.
         block_sparse_num: Number of KV blocks each Q block attends to (>= 1).
             Ignored when q2k_block_nums is provided.
-        block_sizes: Actual token count per KV block (num_kv_blocks,), int32.  Pass None to
-            skip per-block padding masking (assumes all blocks are full).
+        block_sizes: Actual token count per KV block, int32, rank-1 (num_kv_blocks,),
+            rank-2 (batch, num_kv_blocks), or rank-3 (batch, num_heads, num_kv_blocks).
+            Pass None to skip per-block padding masking (assumes all blocks are full).
         q2k_block_nums: Per-(batch, head, q_block) number of KV blocks to attend to,
             (batch, num_heads, num_q_blocks) int32.  When None, uses fixed block_sparse_num.
         softmax_scale: Softmax scale (default: 1/sqrt(head_dim)).
@@ -97,9 +99,10 @@ def bsa_attn_sm100_blk64_fwd(
         q_scale, k_scale, v_scale: Sage FP8 quantization scales. All three
             must be provided together to enable the FP8 path (q/k/v must then
             be float8_e4m3fn); otherwise all three must be None and q/k/v must
-            be bfloat16. The FP8 path additionally requires batch_size == 1,
-            num_head in (4, 8), q2k_block_nums is None, and block_sizes is
-            None (upstream kernel limits, not specific to this integration).
+            be bfloat16. The FP8 path accepts positive batch/head counts,
+            non-64-aligned Q/KV tails (masked natively in-kernel), per-Q-block
+            ``q2k_block_nums``, and rank-1/2/3 ``block_sizes`` -- the same
+            dynamic-shape contract as the BF16 path.
 
     Returns:
         (out, lse) where lse is None if return_lse is False.
@@ -200,11 +203,21 @@ def bsa_attn_sm100_blk64_fwd(
     q2k_block_index = maybe_contiguous(q2k_block_index)
 
     has_block_sizes = block_sizes is not None and block_sizes.numel() > 0
+    block_sizes_mode = 0
     if has_block_sizes:
         block_sizes = maybe_contiguous(block_sizes)
         assert block_sizes.dtype == torch.int32
         assert block_sizes.device == q_bhsd.device
-        assert block_sizes.shape == (num_kv_blocks,)
+        if block_sizes.ndim == 1:
+            assert block_sizes.shape == (num_kv_blocks,)
+            block_sizes_mode = 1
+        elif block_sizes.ndim == 2:
+            assert block_sizes.shape == (batch_size, num_kv_blocks)
+            block_sizes_mode = 2
+        else:
+            assert block_sizes.ndim == 3
+            assert block_sizes.shape == (batch_size, num_head, num_kv_blocks)
+            block_sizes_mode = 3
     else:
         block_sizes = None
 
@@ -238,6 +251,7 @@ def bsa_attn_sm100_blk64_fwd(
             (num_kv_blocks,), 64, dtype=torch.int32, device=q_bhsd.device
         )
         has_block_sizes = True
+        block_sizes_mode = 1
 
     validate_sm100_blk64_int32_bounds(
         q_bhsd,
@@ -261,11 +275,16 @@ def bsa_attn_sm100_blk64_fwd(
 
     if auto_kv_splits:
         if is_sage_fp8:
-            # Sage-FP8 requires a uniform top-k (validate_sm100_blk64_fp8_sage
-            # rejects q2k_block_nums), so uniform_block_sparse_num is always
-            # the FP8 heuristic's topk_num.
+            # With variable q2k_block_nums, uniform_block_sparse_num is 0 (no
+            # single top-k); fall back to the block-index capacity as the
+            # heuristic's topk_num, matching upstream's policy_topk.
+            fp8_topk_num = (
+                int(q2k_block_index.shape[-1])
+                if has_variable_block_nums
+                else uniform_block_sparse_num
+            )
             kv_splits_i = sm100_blk64_auto_fp8_kv_splits(
-                uniform_block_sparse_num, num_head, seqlen_q
+                fp8_topk_num, num_head, seqlen_q, batch_size
             )
         else:
             kv_splits_i = sm100_blk64_auto_kv_splits(
@@ -342,6 +361,14 @@ def bsa_attn_sm100_blk64_fwd(
         else cuda.CUstream(torch.cuda.current_stream(q_bhsd.device).cuda_stream)
     )
 
+    use_sage_ldred_rowmax = is_sage_fp8 and sm103_blk64_use_sage_fp8_ldred(
+        arch,
+        batch_size,
+        num_head,
+        seqlen_q,
+        kv_splits_i,
+    )
+
     compile_key = dynamic_tensors_compile_key(
         "sm100_blk64_fwd",
         (
@@ -358,6 +385,7 @@ def bsa_attn_sm100_blk64_fwd(
             has_variable_block_nums,
             allow_empty_block_nums,
             has_block_sizes,
+            block_sizes_mode,
             kv_splits_i,
             out_bhsd.dtype,
             is_persistent,
@@ -365,6 +393,7 @@ def bsa_attn_sm100_blk64_fwd(
             "bhsd_native",
             use_int64_kv_strides,
             is_sage_fp8,
+            use_sage_ldred_rowmax,
             "tvm_ffi_env_stream_v1",
         ),
         (
@@ -416,7 +445,9 @@ def bsa_attn_sm100_blk64_fwd(
             use_clc_scheduler=use_clc_scheduler,
             allow_empty_block_nums=allow_empty_block_nums,
             has_block_sizes=has_block_sizes,
+            block_sizes_mode=block_sizes_mode,
             num_splits=kv_splits_i,
+            use_sage_ldred_rowmax=use_sage_ldred_rowmax,
             use_int64_kv_strides=use_int64_kv_strides,
         )
 

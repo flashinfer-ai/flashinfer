@@ -264,6 +264,7 @@ def sm100_blk64_auto_fp8_kv_splits(
     topk_num: int,
     heads: int = 4,
     seqlen_q: int = 64,
+    batch: int = 1,
 ) -> int:
     """Choose KV splits for the Sage-FP8 blk64 path.
 
@@ -273,14 +274,12 @@ def sm100_blk64_auto_fp8_kv_splits(
     ``sm100_blk64_auto_kv_splits``/``sm100_blk64_kv_splits_from_count``, a
     heuristic tuned on BF16 shapes with no FP8 validation. Thresholds below
     are upstream's, tuned separately on FP8 shapes ("SLA 0709") -- not
-    re-derived here. ``batch`` is intentionally not a parameter: Sage-FP8
-    blk64 requires batch_size == 1 (enforced by
-    ``validate_sm100_blk64_fp8_sage``), matching upstream's omission of it
-    from this formula.
+    re-derived here. ``batch`` (fix/sm100-fp8-parity, commit 50afbc7) counts
+    toward ``q_tiles`` now that Sage-FP8 accepts batch_size > 1.
     """
     topk_num = int(topk_num)
     heads = int(heads)
-    q_tiles = heads * ceil_div_int(seqlen_q, 64)
+    q_tiles = int(batch) * heads * ceil_div_int(seqlen_q, 64)
     if q_tiles >= 512:
         # SLA-scale Q already exposes thousands of independent CTAs.
         # Splitting medium top-k rows only adds FP32 partial workspace and a
@@ -297,6 +296,32 @@ def sm100_blk64_auto_fp8_kv_splits(
     elif 224 <= topk_num < 400:
         return 8
     return 16
+
+
+_SM103_SAGE_FP8_LDRED_MIN_Q_TILES = 512
+
+
+def sm103_blk64_use_sage_fp8_ldred(
+    arch: int,
+    batch_size: int,
+    heads: int,
+    seqlen_q: int,
+    kv_splits: int,
+) -> bool:
+    """Use the 16-token hardware ld.red row-max only where it wins on SM103.
+
+    Ported from upstream Block-Sparse-Attention/bsa_attn_interface.py's
+    ``_sm103_blk64_use_sage_fp8_ldred`` (fix/sm100-fp8-parity, commit
+    f89ae28): the hardware-reduced tmem load only pays off once a CTA
+    processes enough independent Q tiles to hide the extra reduction
+    latency, and it requires an unsplit kernel (kv_splits == 1).
+    """
+    q_tiles = int(batch_size) * int(heads) * ceil_div_int(int(seqlen_q), 64)
+    return (
+        int(arch) == 103
+        and int(kv_splits) == 1
+        and q_tiles >= _SM103_SAGE_FP8_LDRED_MIN_Q_TILES
+    )
 
 
 def build_sm100_blk64_kv_split_offsets(
@@ -834,30 +859,22 @@ def validate_sm100_blk64_fp8_sage(
     k_scale: torch.Tensor,
     v_scale: torch.Tensor,
 ) -> None:
-    """Enforce the Sage FP8 v1 contract's hard limits (fixed top-k, full blocks).
+    """Enforce the Sage FP8 contract's remaining hard limits.
 
     These limits come from the upstream kernel itself, not from this
     integration -- surfaced early (at plan()/dispatch time) with a clear
     message so they are not mistaken for a migration regression.
+
+    Positive batch/head counts, per-Q-block ``q2k_block_nums``, and rank-1/2/3
+    ``block_sizes`` (masking padding inside physically 64-aligned KV blocks,
+    or a non-64-aligned K/V tail) are all supported -- shape/dtype/device are
+    validated generically by the caller (see the ``has_block_sizes`` handling
+    in ``bsa_attn_sm100_blk64_fwd``), same as the BF16 path.
     """
-    if batch_size != 1:
+    if batch_size < 1 or num_head < 1:
         raise ValueError(
-            "Sage FP8 blk64 requires batch_size == 1 (upstream kernel limit)"
-        )
-    if num_head not in (4, 8):
-        raise ValueError(
-            f"Sage FP8 blk64 requires num_head in (4, 8), got {num_head} "
-            "(upstream kernel limit)"
-        )
-    if q2k_block_nums is not None and q2k_block_nums.numel() > 0:
-        raise ValueError(
-            "Sage FP8 blk64 requires a uniform top-k (q2k_block_nums must be "
-            "None); variable per-row KV counts are not supported yet"
-        )
-    if block_sizes is not None and block_sizes.numel() > 0:
-        raise ValueError(
-            "Sage FP8 blk64 requires full 64-token KV blocks (block_sizes must "
-            "be None); partial/padded KV blocks are not supported yet"
+            "Sage FP8 blk64 requires positive batch and head counts, got "
+            f"batch_size={batch_size}, num_head={num_head}"
         )
     if (
         q_scale.dtype != torch.float32
