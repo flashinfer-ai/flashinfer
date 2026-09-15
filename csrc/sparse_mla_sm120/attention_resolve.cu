@@ -120,12 +120,12 @@ ExecutionPlan resolve_attention(const AttentionMetadata& m, NumericRoute request
       << "extra FP4 requires DSV41 dual cache";
   TVM_FFI_ICHECK(!dual || mt == ModelType::DSV4 || mt == ModelType::DSV4_1)
       << "sparse-MLA has no dual-cache form";
-  TVM_FFI_ICHECK(
-      !dual ||
-      (m.extra_page_size > 0 && m.extra_indices_stride >= size_t(m.extra_topk) &&
-       m.extra_page_stride_bytes >=
-           size_t(m.extra_page_size) * (m.extra_fp4 ? Dsv41Fp4Layout::BYTES_PER_TOKEN : bpt) &&
-       m.extra_page_stride_bytes % 16 == 0))
+  TVM_FFI_ICHECK(!dual || (main_page_supported(mt, m.extra_page_size) &&
+                           m.extra_indices_stride >= size_t(m.extra_topk) &&
+                           m.extra_page_stride_bytes >=
+                               size_t(m.extra_page_size) *
+                                   (m.extra_fp4 ? Dsv41Fp4Layout::BYTES_PER_TOKEN : bpt) &&
+                           m.extra_page_stride_bytes % 16 == 0))
       << "invalid extra page layout";
   TVM_FFI_ICHECK(mt != ModelType::DOTS3_SWA ||
                  m.topk >= DecodeTileCfg<ModelType::DOTS3_SWA>::WINDOW)
@@ -202,9 +202,6 @@ ExecutionPlan resolve_attention(const AttentionMetadata& m, NumericRoute request
     } else {
       TVM_FFI_ICHECK(m.variant == 3 ? (mt == ModelType::DSV4 && dual) : !dual)
           << "sparse-MLA MG dual metadata mismatch";
-      TVM_FFI_ICHECK(!dual ||
-                     visit_extra_page(m.extra_page_size, [](auto) { return true; }).supported)
-          << "unsupported sparse-MLA extra page size for MG_DUAL";
       p.implementation = dual && !m.has_lengths && !m.has_extra_lengths && m.extra_topk % 64 == 0
                              ? Implementation::FullTile
                              : Implementation::MG;
@@ -265,8 +262,8 @@ ffi::Array<int64_t> candidates(int64_t model, int64_t heads, int64_t topk, int64
                       dual ? 64 : 0,
                       int(page),
                       dual ? int(extra_page) : 0,
-                      size_t(page) * format.bytes_per_token,
-                      dual ? size_t(extra_page) * format.bytes_per_token : 0,
+                      (size_t(page) * format.bytes_per_token + 15) / 16 * 16,
+                      dual ? (size_t(extra_page) * format.bytes_per_token + 15) / 16 * 16 : 0,
                       format.bytes_per_token,
                       size_t(topk),
                       dual ? 64u : 0u,
@@ -361,12 +358,6 @@ ffi::Array<int64_t> main_page_sizes(int64_t model) {
   ffi::Array<int64_t> result;
   const auto mt = static_cast<ModelType>(model);
   if (runtime_page(mt)) return result;  // any positive page size
-  if (mt == ModelType::DSV4) {
-#define PAGE(P) result.push_back(P);
-    SPARSE_MLA_DSV4_MAIN_PAGES(PAGE)
-#undef PAGE
-    return result;
-  }
   result.push_back(FixedPageSize);
   return result;
 }

@@ -3542,7 +3542,9 @@ def test_sparse_mla_sm120_dsv4_page32(page_block_size: int, num_tokens: int) -> 
     torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
 
 
-@pytest.mark.parametrize("main_pbs,extra_pbs", [(32, 64), (32, 2)])
+@pytest.mark.parametrize(
+    "main_pbs,extra_pbs", [(32, 64), (32, 2), (256, 128), (256, 2), (64, 128)]
+)
 @pytest.mark.parametrize("num_tokens", [1, 128])
 def test_sparse_mla_sm120_dsv4_page32_dual(
     main_pbs: int, extra_pbs: int, num_tokens: int
@@ -4696,7 +4698,7 @@ _ENVELOPE_PROBES = [
     ("mg", 1, 64, 384, 64, False),  # runtime topk: between the old pins
     ("mg", 1, 64, 100, 64, False),  # ragged topk (not a whole tile)
     ("mg", 1, 17, 128, 64, False),  # dsv4 H off boundary
-    ("mg", 1, 64, 512, 32, False),  # pbs mismatch
+    ("mg", 1, 64, 512, 32, False),  # runtime DSV4 page
     ("mg", 1, 64, 512, 64, True),  # dual-cache must use MG_DUAL
     # PREFILL_MG_DUAL: DSV4 only, any whole-tile topk, extra cache present.
     ("mg_dual", 1, 32, 128, 64, True),

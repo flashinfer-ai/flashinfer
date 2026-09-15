@@ -188,7 +188,8 @@ PrefillLaunchResult launch_prefill_mg(const bf16* Q, const uint8_t* KV_cache,
                                       const int32_t* indices, const float* attn_sink, bf16* output,
                                       float* out_lse, float sm_scale, int num_tokens, int topk,
                                       size_t page_stride_bytes, size_t out_lse_stride_elems,
-                                      const int* topk_length_ptr, cudaStream_t stream) {
+                                      const int* topk_length_ptr, cudaStream_t stream,
+                                      int runtime_page_size = PAGE_BLOCK_SIZE) {
   constexpr size_t smem_bytes = SmemLayoutMG<MT, QkMode>::TOTAL;
   constexpr int MG_HEADS_PER_CTA_LOCAL = MG_N_HG_T * HPB;
   static_assert(NUM_HEADS % MG_HEADS_PER_CTA_LOCAL == 0 || (MG_N_HG_T == 1 && NUM_HEADS < HPB),
@@ -212,21 +213,24 @@ PrefillLaunchResult launch_prefill_mg(const bf16* Q, const uint8_t* KV_cache,
                          attn_sink,
                          topk_length_ptr,
                          /*topk_length_extra=*/(const int*)nullptr};
+  cold.page_block_size = runtime_page_size;
+  if constexpr (MT == ModelType::DSV4)
+    cold.main_div = flashinfer::uint_fastdiv(uint32_t(runtime_page_size));
   cudaLaunchConfig_t config{grid, block, smem_bytes, stream, nullptr, 0};
   void* args[] = {(void*)&Q,       (void*)&KV_cache,  (void*)&indices, (void*)&output,
                   (void*)&out_lse, (void*)&attn_sink, (void*)&cold};
   return {cudaLaunchKernelExC(&config, (const void*)kernel, args), "cudaLaunchKernelExC"};
 }
 
-// Dual-cache MG dispatcher. `topk` and `topk_extra` are runtime;
-// PAGE_BLOCK_SIZE_EXTRA stays template because it changes the KV stride.
+// Dual-cache MG keeps extra-page-2 as a template for the W-FP8 row XOR.
 template <ModelType MT, int NUM_HEADS, int PAGE_BLOCK_SIZE, int PAGE_BLOCK_SIZE_EXTRA,
           int MG_N_HG_T = MG_N_HG_DEFAULT>
 PrefillLaunchResult launch_prefill_mg_dual_fulltile(
     const bf16* Q, const uint8_t* KV_cache, const int32_t* indices, const uint8_t* KV_cache_extra,
     const int32_t* indices_extra, const float* attn_sink, bf16* output, float* out_lse,
     float sm_scale, int num_tokens, int topk, int topk_extra, size_t page_stride_bytes,
-    size_t extra_page_stride_bytes, size_t out_lse_stride_elems, cudaStream_t stream) {
+    size_t extra_page_stride_bytes, size_t out_lse_stride_elems, cudaStream_t stream,
+    int runtime_page_size, int runtime_extra_page_size) {
   constexpr size_t smem_bytes = SmemLayoutMG<MT, QkComputeMode::BF16>::TOTAL;
   constexpr int MG_HEADS_PER_CTA_LOCAL = MG_N_HG_T * HPB;
   static_assert(NUM_HEADS % MG_HEADS_PER_CTA_LOCAL == 0 || (MG_N_HG_T == 1 && NUM_HEADS < HPB),
@@ -251,6 +255,12 @@ PrefillLaunchResult launch_prefill_mg_dual_fulltile(
                          attn_sink,
                          /*topk_length=*/(const int*)nullptr,
                          /*topk_length_extra=*/(const int*)nullptr};
+  cold.page_block_size = runtime_page_size;
+  if constexpr (MT == ModelType::DSV4)
+    cold.main_div = flashinfer::uint_fastdiv(uint32_t(runtime_page_size));
+  cold.extra_page_block_size = runtime_extra_page_size;
+  if constexpr (MT == ModelType::DSV4)
+    cold.extra_div = flashinfer::uint_fastdiv(uint32_t(runtime_extra_page_size));
   cudaLaunchConfig_t config{grid, block, smem_bytes, stream, nullptr, 0};
   void* args[] = {(void*)&Q,
                   (void*)&KV_cache,
@@ -273,7 +283,8 @@ PrefillLaunchResult launch_prefill_mg_dual(const bf16* Q, const uint8_t* KV_cach
                                            int num_tokens, int topk, int topk_extra,
                                            size_t page_stride_bytes, size_t extra_page_stride_bytes,
                                            size_t out_lse_stride_elems, const int* topk_length_ptr,
-                                           const int* topk_length_extra_ptr, cudaStream_t stream) {
+                                           const int* topk_length_extra_ptr, cudaStream_t stream,
+                                           int runtime_page_size, int runtime_extra_page_size) {
   constexpr size_t smem_bytes = SmemLayoutMG<MT, QkMode>::TOTAL;
   constexpr int MG_HEADS_PER_CTA_LOCAL = MG_N_HG_T * HPB;
   static_assert(NUM_HEADS % MG_HEADS_PER_CTA_LOCAL == 0 || (MG_N_HG_T == 1 && NUM_HEADS < HPB),
@@ -291,6 +302,12 @@ PrefillLaunchResult launch_prefill_mg_dual(const bf16* Q, const uint8_t* KV_cach
   PrefillColdParams cold{
       sm_scale, num_tokens, page_stride_bytes, extra_page_stride_bytes, out_lse_stride_elems,
       topk,     topk_extra, attn_sink,         topk_length_ptr,         topk_length_extra_ptr};
+  cold.page_block_size = runtime_page_size;
+  if constexpr (MT == ModelType::DSV4)
+    cold.main_div = flashinfer::uint_fastdiv(uint32_t(runtime_page_size));
+  cold.extra_page_block_size = runtime_extra_page_size;
+  if constexpr (MT == ModelType::DSV4)
+    cold.extra_div = flashinfer::uint_fastdiv(uint32_t(runtime_extra_page_size));
   cudaLaunchConfig_t config{grid, block, smem_bytes, stream, nullptr, 0};
   void* args[] = {(void*)&Q,
                   (void*)&KV_cache,
@@ -413,20 +430,17 @@ inline PrefillLaunchResult dispatch_dsv4_single(
     const bf16* Q, const uint8_t* KV, const int32_t* indices, const float* attn_sink, bf16* output,
     float* out_lse, float sm_scale, int num_tokens, size_t page_stride_bytes,
     size_t out_lse_stride_elems, const int* topk_length_ptr, cudaStream_t stream) {
-  auto page = [&](auto pbs) {
-    return execution::visit_prefill_heads<ModelType::DSV4, 2>(num_heads, [&](auto head) {
-      constexpr int H = decltype(head)::value, P = decltype(pbs)::value;
-      constexpr int groups = H <= HPB ? 1 : MG_N_HG_DEFAULT;
-      if (plan.numeric == execution::NumericRoute::QkBF16PvFP8)
-        return launch_prefill_mg<ModelType::DSV4, QkComputeMode::BF16, H, P, groups>(
-            Q, KV, indices, attn_sink, output, out_lse, sm_scale, num_tokens, topk,
-            page_stride_bytes, out_lse_stride_elems, topk_length_ptr, stream);
-      return launch_prefill_mg<ModelType::DSV4, QkComputeMode::FP8, H, P, groups>(
+  return execution::visit_prefill_heads<ModelType::DSV4, 2>(num_heads, [&](auto head) {
+    constexpr int H = decltype(head)::value;
+    constexpr int groups = H <= HPB ? 1 : MG_N_HG_DEFAULT;
+    if (plan.numeric == execution::NumericRoute::QkBF16PvFP8)
+      return launch_prefill_mg<ModelType::DSV4, QkComputeMode::BF16, H, 0, groups>(
           Q, KV, indices, attn_sink, output, out_lse, sm_scale, num_tokens, topk, page_stride_bytes,
-          out_lse_stride_elems, topk_length_ptr, stream);
-    });
-  };
-  return execution::visit_dsv4_main_page(page_block_size, page);
+          out_lse_stride_elems, topk_length_ptr, stream, page_block_size);
+    return launch_prefill_mg<ModelType::DSV4, QkComputeMode::FP8, H, 0, groups>(
+        Q, KV, indices, attn_sink, output, out_lse, sm_scale, num_tokens, topk, page_stride_bytes,
+        out_lse_stride_elems, topk_length_ptr, stream, page_block_size);
+  });
 }
 
 inline PrefillLaunchResult dispatch_dsv4_dual(
@@ -436,26 +450,23 @@ inline PrefillLaunchResult dispatch_dsv4_dual(
     const float* attn_sink, bf16* output, float* out_lse, float sm_scale, int num_tokens,
     size_t page_stride_bytes, size_t extra_page_stride_bytes, size_t out_lse_stride_elems,
     const int* topk_length_ptr, const int* topk_length_extra_ptr, cudaStream_t stream) {
-  auto main_page = [&](auto mpbs) {
-    auto page = [&](auto pbs) {
-      return execution::visit_prefill_heads<ModelType::DSV4, 3>(num_heads, [&](auto head) {
-        constexpr int H = decltype(head)::value, P = decltype(pbs)::value,
-                      MP = decltype(mpbs)::value;
-        constexpr int groups = H <= HPB ? 1 : MG_N_HG_DEFAULT;
-        if (plan.implementation == execution::Implementation::FullTile)
-          return launch_prefill_mg_dual_fulltile<ModelType::DSV4, H, MP, P, groups>(
-              Q, KV, indices, KV_extra, idx_extra, attn_sink, output, out_lse, sm_scale, num_tokens,
-              topk, topk_extra, page_stride_bytes, extra_page_stride_bytes, out_lse_stride_elems,
-              stream);
-        return launch_prefill_mg_dual<ModelType::DSV4, QkComputeMode::BF16, H, MP, P, groups>(
+  auto page = [&](auto pbs) {
+    return execution::visit_prefill_heads<ModelType::DSV4, 3>(num_heads, [&](auto head) {
+      constexpr int H = decltype(head)::value, P = decltype(pbs)::value;
+      constexpr int groups = H <= HPB ? 1 : MG_N_HG_DEFAULT;
+      if (plan.implementation == execution::Implementation::FullTile)
+        return launch_prefill_mg_dual_fulltile<ModelType::DSV4, H, 0, P, groups>(
             Q, KV, indices, KV_extra, idx_extra, attn_sink, output, out_lse, sm_scale, num_tokens,
             topk, topk_extra, page_stride_bytes, extra_page_stride_bytes, out_lse_stride_elems,
-            topk_length_ptr, topk_length_extra_ptr, stream);
-      });
-    };
-    return execution::visit_extra_page(extra_page_block_size, page);
+            stream, page_block_size, extra_page_block_size);
+      return launch_prefill_mg_dual<ModelType::DSV4, QkComputeMode::BF16, H, 0, P, groups>(
+          Q, KV, indices, KV_extra, idx_extra, attn_sink, output, out_lse, sm_scale, num_tokens,
+          topk, topk_extra, page_stride_bytes, extra_page_stride_bytes, out_lse_stride_elems,
+          topk_length_ptr, topk_length_extra_ptr, stream, page_block_size, extra_page_block_size);
+    });
   };
-  return execution::visit_dsv4_main_page(page_block_size, main_page);
+  if (extra_page_block_size == 2) return page(std::integral_constant<int, 2>{});
+  return page(std::integral_constant<int, 0>{});
 }
 
 }  // namespace

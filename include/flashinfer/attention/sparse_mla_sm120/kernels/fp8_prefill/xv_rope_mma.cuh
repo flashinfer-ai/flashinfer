@@ -130,7 +130,9 @@ __device__ __forceinline__ void xv_rope_mma_mg(float acc_rope[N_HG][4], const fl
                                                const int32_t* __restrict__ tile_indices,
                                                int valid_len, const uint8_t* __restrict__ KV_cache,
                                                int mwarp, int lane, size_t stride_kv_block,
-                                               bf16* weight_smem) {
+                                               bf16* weight_smem,
+                                               const uint8_t* const* tile_addresses = nullptr,
+                                               PageGeom pg = {}) {
   if constexpr (!KVCacheTraits<MT>::V_HAS_ROPE) return;
 
   using KV = KVCacheTraits<MT>;
@@ -159,10 +161,21 @@ __device__ __forceinline__ void xv_rope_mma_mg(float acc_rope[N_HG][4], const fl
     int k_base = ks * 16;
 
     auto load_rope_v = [&](int entry_offset) -> uint16_t {
+      if constexpr (MT == ModelType::DSV4) {
+        if (tile_addresses != nullptr) {
+          const bf16* rp =
+              reinterpret_cast<const bf16*>(tile_addresses[entry_offset] + KV::KV_ROPE_GMEM_OFFSET);
+          return *reinterpret_cast<const uint16_t*>(&rp[dim_n]);
+        }
+      }
       int idx = mask_idx_past_len(tile_indices[entry_offset], entry_offset, valid_len);
       if (idx < 0) return 0;
       const uint8_t* base;
-      if constexpr (KV::SCALE_IN_KV_SMEM) {
+      if constexpr (PAGE_BLOCK_SIZE == 0) {
+        int bi, li;
+        page_divmod(idx, pg, bi, li);
+        base = KV_cache + (size_t)bi * stride_kv_block + (size_t)li * IO::IO_STRIDE;
+      } else if constexpr (KV::SCALE_IN_KV_SMEM) {
         base = KV_cache + (size_t)idx * IO::IO_STRIDE;
       } else {
         constexpr int pbs = PAGE_BLOCK_SIZE;

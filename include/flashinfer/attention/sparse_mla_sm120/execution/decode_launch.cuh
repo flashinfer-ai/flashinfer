@@ -37,12 +37,19 @@ cudaError_t launch_decode(const AttentionParams& p, const ExecutionPlan& plan,
       cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
   if (result != cudaSuccess) return result;
   const int cpb = plan.cpb;
+  const auto pages = [&]() {
+    if constexpr (MT == ModelType::DSV4)
+      return Dsv4PageDivisors{flashinfer::uint_fastdiv(uint32_t(p.page_size)),
+                              flashinfer::uint_fastdiv(uint32_t(p.extra_page_size))};
+    else
+      return p.page_size;
+  }();
   kernel<<<dim3(p.num_tokens, h_blocks, p.allocated_splits), dim3(block_threads), smem_bytes,
            stream>>>(p.q, p.kv, p.indices, p.mid_out, p.mid_lse, p.topk_length, p.extra_kv,
                      p.extra_indices, p.extra_topk_length, p.extra_topk, p.extra_page_size,
                      p.extra_page_stride_bytes, p.num_tokens, q_heads, p.topk, p.allocated_splits,
                      cpb, p.sm_scale, p.page_stride_bytes, p.indices_stride_elems,
-                     p.extra_indices_stride_elems, p.page_size);
+                     p.extra_indices_stride_elems, pages);
   result = cudaGetLastError();
   if (result != cudaSuccess) return result;
   constexpr int MERGE_THREADS = 64;

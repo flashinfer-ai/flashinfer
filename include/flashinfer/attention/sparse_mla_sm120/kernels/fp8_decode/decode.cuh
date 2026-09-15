@@ -15,6 +15,7 @@
 #include "../../compute/online_softmax.cuh"
 #include "../../compute/q_stage.cuh"
 #include "../../compute/warp_tiles.cuh"
+#include "../../execution/attention_params.cuh"
 #include "../../model/kv_cache_traits.cuh"
 #include "../../model/scale_convert.cuh"
 #include "../../pipeline/staged_pipeline.cuh"
@@ -69,7 +70,8 @@ __global__ void __launch_bounds__(
         int scratch_split_stride, int chunks_per_block, float sm_scale, size_t page_stride_bytes,
         // Row strides of (extra_)indices; either may exceed the row width when the
         // caller views a wider persistent buffer (last dim must stay contiguous).
-        size_t indices_stride_elems, size_t extra_indices_stride_elems, int main_page_block_size) {
+        size_t indices_stride_elems, size_t extra_indices_stride_elems,
+        std::conditional_t<MT == ModelType::DSV4, Dsv4PageDivisors, int> pages) {
   using KV = KVCacheTraits<MT>;
   using Cfg = DecodeTileCfg<MT, GatherSchedule::RAW_PIPELINE>;
   static_assert(MT == ModelType::DSV4 || MT == ModelType::DOTS3_SWA || MT == ModelType::DSV4_1,
@@ -86,7 +88,12 @@ __global__ void __launch_bounds__(
   constexpr int IO_STRIDE = D_NOPE + D_ROPE_C * 2;
   using CacheLayout = std::conditional_t<MT == ModelType::DSV4_1, Dsv41Fp8Layout,
                                          FooterScaleLayout<IO_STRIDE, SCALE_BYTES_PER_TOKEN>>;
-  const int pbs = MT == ModelType::DSV4_1 ? main_page_block_size : PAGE_BLOCK_SIZE;
+  const int pbs = [&]() {
+    if constexpr (MT == ModelType::DSV4)
+      return int(uint32_t(pages.main));
+    else
+      return MT == ModelType::DSV4_1 ? pages : PAGE_BLOCK_SIZE;
+  }();
   // Kernel always computes a full HPB×CAND tile (zero-Q-padded for unused
   // head slots). NUM_HEADS == 0 selects the runtime-head-count instantiation:
   // one kernel per model type serves any num_heads <= 128. Q/output carry the
@@ -273,10 +280,13 @@ __global__ void __launch_bounds__(
         is_extra ? (extra_indices + (size_t)t_idx * extra_indices_stride_elems) : idx_base;
     const uint8_t* section_kv = is_extra ? extra_KV_cache : KV_cache;
     const size_t section_stride = is_extra ? extra_page_stride_bytes : page_stride_bytes;
-    // Page block size of THIS section. Main is compile-time constexpr (typ.
-    // 64); extra is runtime (DSv4 C128A passes 2). The 8-cycle runtime div
-    // is dwarfed by the cp.async.bulk that follows.
     const int section_pbs = is_extra ? pbs_extra : pbs;
+    auto page_index = [&](int idx) {
+      if constexpr (MT == ModelType::DSV4)
+        return int(uint32_t(idx) / (is_extra ? pages.extra : pages.main));
+      else
+        return idx / section_pbs;
+    };
     uint8_t* kv_fp8_dst = sm.kv_fp8(buf);
     bf16* kv_rope_dst = sm.kv_rope(buf);
     uint8_t* kv_sc_dst = sm.kv_sc(buf);
@@ -309,7 +319,7 @@ __global__ void __launch_bounds__(
       }
       if (idx_raw[e] >= 0) {
         const int idx = idx_raw[e];
-        const int block_idx_g = idx / section_pbs;
+        const int block_idx_g = page_index(idx);
         const int local_idx_g = idx - block_idx_g * section_pbs;
         const uint8_t* scale_base =
             section_kv + (size_t)block_idx_g * section_stride +
@@ -339,7 +349,7 @@ __global__ void __launch_bounds__(
       // slot: a NaN there would leak through 0 * NaN in the value MMA.
       const bool valid = idx_raw[e] >= 0;
       const int idx = valid ? idx_raw[e] : 0;
-      const int block_idx_g = idx / section_pbs;
+      const int block_idx_g = page_index(idx);
       const int local_idx_g = idx - block_idx_g * section_pbs;
       const uint8_t* data_base = valid ? section_kv + (size_t)block_idx_g * section_stride +
                                              CacheLayout::data_offset(size_t(local_idx_g))

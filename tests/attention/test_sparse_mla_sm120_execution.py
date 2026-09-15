@@ -1045,3 +1045,87 @@ def test_scratch_rebind_uses_dense_prefix():
     out, lse = _decode_scratch_views(mid, mlse, 2, 13, 2, 512)
     assert out.is_contiguous() and lse.is_contiguous()
     assert out.data_ptr() == mid.data_ptr() and lse.data_ptr() == mlse.data_ptr()
+
+
+@pytest.mark.parametrize(
+    "tokens,heads,full", [(2, 8, False), (128, 64, False), (128, 64, True)]
+)
+def test_dsv4_integer_pages_graph_and_alignment(tokens, heads, full, sm12x):
+    from flashinfer.mla import SparseMLASm120Wrapper
+    from tests.attention.sparse_mla_test_utils import (
+        dequantize_kv_dsv4,
+        _ref_sparse_attn,
+    )
+
+    torch.manual_seed(529)
+    q = torch.randn(tokens, heads, 512, device="cuda", dtype=torch.bfloat16) * 0.1
+    out = torch.empty_like(q)
+    idx = torch.randint(1, 193, (tokens, 128), device="cuda", dtype=torch.int32)
+    idx[:, 2] = -1
+    lengths = (
+        None if full else torch.full((tokens,), 121, device="cuda", dtype=torch.int32)
+    )
+    if lengths is not None:
+        idx[:, 121:] = 2147483647
+    wrapper = SparseMLASm120Wrapper()
+    captures = []
+    for page, extra_page in [(96, 192), (3, 65)]:
+        caches, virtual = [], []
+        for p in (page, extra_page):
+            packed = quantize_kv_dsv4(
+                torch.randn(
+                    (193 + p - 1) // p, p, 1, 512, device="cuda", dtype=torch.bfloat16
+                )
+                * 0.1
+            )
+            virtual.append(dequantize_kv_dsv4(packed).reshape(-1, 512)[:193])
+            pitch = (p * 584 + 15) // 16 * 16
+            cache = torch.empty_strided(
+                packed.shape, (pitch, 584, 584, 1), device="cuda", dtype=torch.uint8
+            )
+            cache.copy_(packed)
+            raw = cache.as_strided((packed.shape[0], p * 584), (pitch, 1))
+            raw[0, :576] = 255
+            raw[0, p * 576 : p * 576 + 8] = 255
+            caches.append(cache)
+        ri = (
+            idx
+            if full
+            else torch.where(
+                torch.arange(128, device="cuda")[None, :] < lengths[:, None], idx, -1
+            )
+        )
+        ref_indices = torch.cat([ri, torch.where(ri >= 0, ri + 193, -1)], -1)
+        expected, _ = _ref_sparse_attn(
+            q, torch.cat(virtual).reshape(-1, 1, 1, 512), ref_indices, 512**-0.5, 512
+        )
+
+        def call():
+            wrapper.run(
+                q,
+                caches[0],
+                idx,
+                out,
+                512**-0.5,
+                topk_length=lengths,
+                extra_kv_cache=caches[1],
+                extra_indices=idx,
+                extra_topk_length=lengths,
+            )
+
+        call()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(out, expected, atol=0.005, rtol=0.05)
+        saved = out.clone()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            call()
+            call()
+        captures.append((graph, caches, saved))
+    for graph, _caches, saved in captures:
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out, saved)
+    bad = torch.empty(2, 3, 1, 584, device="cuda", dtype=torch.uint8)
+    with pytest.raises((ValueError, RuntimeError), match="16B-aligned"):
+        wrapper.run(q, bad, idx, out, 512**-0.5)

@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <flashinfer/fastdiv.cuh>
 
 using bf16 = __nv_bfloat16;
 
@@ -24,6 +25,13 @@ struct PrefillColdParams {
   const int32_t* extra_indices = nullptr;
   int extra_page_block_size = 0;
   int page_block_size = 64;
+  flashinfer::uint_fastdiv main_div;
+  flashinfer::uint_fastdiv extra_div;
+};
+
+struct Dsv4PageDivisors {
+  flashinfer::uint_fastdiv main;
+  flashinfer::uint_fastdiv extra;
 };
 
 // Copyright (c) 2026 by FlashInfer team.

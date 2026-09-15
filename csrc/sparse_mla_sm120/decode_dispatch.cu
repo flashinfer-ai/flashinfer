@@ -18,18 +18,10 @@ cudaError_t dispatch_decode(const execution::AttentionParams& params,
                                       execution::FixedPageSize>(params, plan, stream);          \
     });
   if (mt == ModelType::DSV4)
-    // DSV4 instantiates its main page sizes (SPARSE_MLA_DSV4_MAIN_PAGES) as
-    // separate kernels so the page divisor stays a compile-time constant.
-    return execution::visit_decode_heads<ModelType::DSV4>(
-        plan.specialized_heads, [&](auto head) -> cudaError_t {
-          constexpr int H = decltype(head)::value;
-          if (params.page_size == 32)
-            return execution::launch_decode<ModelType::DSV4, H, 32>(params, plan, stream);
-          if (params.page_size == execution::FixedPageSize)
-            return execution::launch_decode<ModelType::DSV4, H, execution::FixedPageSize>(
-                params, plan, stream);
-          return cudaErrorInvalidValue;
-        });
+    return execution::visit_decode_heads<ModelType::DSV4>(plan.specialized_heads, [&](auto head) {
+      return execution::launch_decode<ModelType::DSV4, decltype(head)::value, 0>(params, plan,
+                                                                                 stream);
+    });
   MODEL(DOTS3_SWA)
   MODEL(DSV4_1)
 #undef MODEL
