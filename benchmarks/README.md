@@ -252,6 +252,7 @@ The output CSV will contain detailed metrics including:
 | `--head_dim_kpe`         | Head dimension for KPE (MLA attention).                                                                    |
 | `--q_dtype`              | Data type for the query tensor. Default: bfloat16. Supports float16, bfloat16, fp8_e4m3, and fp8_e5m2 where the selected backend permits them. |
 | `--kv_dtype`             | Data type for the key and value tensors. Default: bfloat16. Supports float16, bfloat16, fp8_e4m3, and fp8_e5m2 where the selected backend permits them. |
+| `--v_dtype`              | Data type for the value tensor. Default: same as kv_dtype. Only the prims-ts backend accepts a V dtype different from kv_dtype, and only as `--kv_dtype bfloat16 --v_dtype fp8_e4m3` (QK-BF16/PV-FP8); other backends then read the FP8-rounded V in kv_dtype. |
 | `--out_dtype`            | Data type for the output tensor. Default: same as q_dtype. Backend-dependent; PrimTS context accepts bfloat16, float16, or fp8_e4m3, while PrimTS FP8 decode accepts float16 or fp8_e4m3. FP8 ragged comparisons with non-PrimTS backends require bfloat16 or float16. |
 | `--causal`               | Use causal attention masking for context/prefill. Multi-query FMHA and MLA decode use bottom-right causal masking automatically. |
 | `--random_actual_seq_len`| Use random sequence lengths up to max length. If False, use max length.                                    |

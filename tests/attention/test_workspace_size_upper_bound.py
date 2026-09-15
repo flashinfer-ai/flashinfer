@@ -404,24 +404,31 @@ def test_decode_sizing_and_bounding_ask_the_resolver_the_same_question(monkeypat
     assert calls[0] == calls[1]
 
 
-def test_plan_and_sizing_share_the_backend_resolvers():
-    """A structural guard: only the shared helpers decide `auto`.
+def _class_source(module, class_name):
+    """The source of one class, so a guard can be scoped to it."""
+    source = pathlib.Path(module.__file__).read_text()
+    start = source.index(f"class {class_name}")
+    rest = source[start + 1 :]
+    end = rest.find("\nclass ")
+    return rest if end < 0 else rest[:end]
+
+
+def test_paged_wrappers_share_the_backend_resolvers():
+    """A structural guard: the paged wrappers decide `auto` in one place.
 
     Sizing that resolved `auto` separately from the plan it sizes for is the
-    defect these helpers exist to prevent, so no wrapper path may keep its own
-    copy of the selection.
+    defect these helpers exist to prevent. The scope is the paged wrappers:
+    the ragged prefill wrapper deliberately reselects per plan, which is its
+    own contract and not this one.
     """
-    prefill_source = pathlib.Path(prefill_module.__file__).read_text()
-    decode_source = pathlib.Path(decode_module.__file__).read_text()
+    paged_prefill = _class_source(prefill_module, "BatchPrefillWithPagedKVCacheWrapper")
+    paged_decode = _class_source(decode_module, "BatchDecodeWithPagedKVCacheWrapper")
 
-    # The only direct calls left are inside the helpers and the module-level
-    # functional entry points, which take no wrapper state.
-    assert prefill_source.count("self._backend = determine_attention_backend(") == 0
-    assert decode_source.count("self._backend = determine_attention_backend(") == 0
-    # plan(), workspace_size() and workspace_size_upper_bound() all go through
-    # the helper, whose definition is the third occurrence in each file.
-    assert prefill_source.count("_resolve_prefill_backend(") >= 4
-    assert decode_source.count("_resolve_decode_tensor_core_backend(") >= 4
+    assert "determine_attention_backend(" not in paged_prefill
+    assert "determine_attention_backend(" not in paged_decode
+    # plan(), workspace_size() and workspace_size_upper_bound(), each once.
+    assert paged_prefill.count("_resolve_prefill_backend(") == 3
+    assert paged_decode.count("_resolve_decode_tensor_core_backend(") == 3
 
 
 # ---------------------------------------------------------------------------
