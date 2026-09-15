@@ -1308,8 +1308,8 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
     independent of the number of KV instances. Consumers address each tile's
     slice and reuse it for K, V and all head-dimension stages through the V
     tail. K/V data buffers advance independently of this held offset stage.
-    Nonpersistent Q1 uses int32 cp.async copies, with in-place mapping for
-    raw logical IDs before the producer publishes the stage.
+    Native sparse routes use int32 cp.async copies, with in-place mapping for
+    direct raw IDs before the producer publishes the stage.
 
     Other paged-KV schedules stage one tile or an aligned 32-ID window. Native
     page rows have a fixed dense stride and a sequence-length-bounded prefix.
@@ -1322,6 +1322,7 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
     seqlens_kv: cute.Pointer | None = None
     use_native_paged_kv: Constexpr[bool] = False
     page_table_stride: cutlass.Int64 = None
+    num_heads_kv: Int32 = None
     q_token_kv_block_sparse_page_membership_stride: Int32 = None
     max_seq_len_kv: Int32 = None
     h_k_idx: Int32 = None
@@ -1760,12 +1761,23 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
             Int32(_decode_gen_task_cache(stage_info)[_TASK_CACHE_KV_RAW_TILE_BASE])
             + local_tile_idx
         )
-        _, logical_b_idx = _logical_head_batch(stage_info, self.h_k_idx, self.b_idx)
+        logical_h_idx, logical_b_idx = _logical_head_batch(
+            stage_info, self.h_k_idx, self.b_idx
+        )
+        metadata_row = cutlass.Int64(logical_b_idx)
+        if cutlass.const_expr(
+            cfg.uses_q_token_kv_block_sparse_page_route
+            and cfg.use_persistent_scheduler
+            and not cfg.shares_sparse_pattern
+        ):
+            metadata_row = metadata_row * cutlass.Int64(
+                self.num_heads_kv
+            ) + cutlass.Int64(logical_h_idx)
         pages_per_tile = Int32(cfg.tile_size_kv // cfg.num_tokens_per_page)
         if cutlass.const_expr(self.use_native_paged_kv):
             task_cache = _decode_gen_task_cache(stage_info)
             page_idx_ub = Int32(task_cache[_TASK_CACHE_KV_PAGE_IDX_UB])
-            page_table_offset = cutlass.Int64(logical_b_idx) * self.page_table_stride
+            page_table_offset = metadata_row * self.page_table_stride
             page_idx_kv = self.page_idx_kv
         else:
             if cutlass.const_expr(self.seqlens_kv is None):
@@ -1790,6 +1802,10 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
         smem_page_offsets = self._smem_page_offsets
         direct_route = None
         if cutlass.const_expr(isinstance(page_idx_kv, DirectSparseMetadataView)):
+            if cutlass.const_expr(
+                cfg.use_persistent_scheduler and not cfg.shares_sparse_pattern
+            ):
+                page_idx_kv = page_idx_kv.with_head(logical_h_idx)
             direct_route = page_idx_kv.resolve_route(logical_b_idx)
             if cutlass.const_expr(self.holds_encoded_locator_window):
                 # The allocation covers the planned maximum, but a shorter
@@ -1819,7 +1835,7 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
             and section == FmhaStage.Head
             and inst_id == KV_INST0
         ):
-            # One page-offset producer warp cooperatively stages the separate
+            # Page-offset producer warps cooperatively stage the separate
             # packed membership row. Each Uint32 supplies four page bytes to
             # Softmax, independent of the plain Int32 locator table below.
             assert self.q_token_kv_block_sparse_page_memberships is not None
@@ -1830,13 +1846,18 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
             membership_word_base = (raw_tile_base * pages_per_tile) // Int32(
                 Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIPS_PER_WORD
             )
-            membership_table_offset = cutlass.Int64(logical_b_idx) * cutlass.Int64(
+            membership_table_offset = metadata_row * cutlass.Int64(
                 self.q_token_kv_block_sparse_page_membership_stride
             )
+            membership_threads = cfg.page_offsets_num_warps * 32
             for membership_vector_idx in cutlass.range_constexpr(
-                (membership_words + 31) // 32
+                (membership_words + membership_threads - 1) // membership_threads
             ):
-                membership_word_idx = lane_idx + Int32(membership_vector_idx * 32)
+                membership_word_idx = (
+                    page_warp_rank * Int32(32)
+                    + lane_idx
+                    + Int32(membership_vector_idx * membership_threads)
+                )
                 if membership_word_idx < Int32(membership_words):
                     membership_word = Uint32(0)
                     first_logical_page_idx = (
@@ -1860,8 +1881,8 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
                             # A tile boundary need not align with a packed
                             # membership word. Rebase to this CTA's first page
                             # without reading beyond the live byte prefix.
-                            byte_offset = (raw_tile_base * pages_per_tile) % Int32(
-                                Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIPS_PER_WORD
+                            byte_offset = (raw_tile_base * pages_per_tile) & Int32(
+                                Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIPS_PER_WORD - 1
                             )
                             if byte_offset != Int32(0):
                                 membership_word >>= byte_offset * Int32(
@@ -1911,10 +1932,7 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
                         membership_word_idx
                     ] = membership_word
         if cutlass.const_expr(
-            self.use_native_paged_kv
-            and cfg.uses_q_token_kv_block_sparse_page_route
-            and cfg.max_seq_len_q == 1
-            and not cfg.use_persistent_scheduler
+            self.use_native_paged_kv and cfg.uses_q_token_kv_block_sparse_page_route
         ):
             first_tile = tile_idx
             if cutlass.const_expr(self.holds_encoded_locator_window):
