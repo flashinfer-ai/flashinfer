@@ -78,7 +78,7 @@ def _compile(m, n, k, tactic, *, compute_capability=None):
     import cutlass
     import cutlass.cute as cute
 
-    from ....cute_dsl.utils import get_max_active_clusters
+    from ....cute_dsl import utils as cute_dsl_utils
     from ....jit.cute_dsl_core import build_and_load_cute_dsl_kernel
     from ... import gemm_mm_fp4_cute_dsl as helpers
     from .. import dense_blockscaled_gemm_sm120_b12x as b12x
@@ -96,7 +96,7 @@ def _compile(m, n, k, tactic, *, compute_capability=None):
     ):
         raise ValueError("Invalid SM121 single-CTA tactic")
     # This nonpersistent specialization must launch every output tile.
-    mac = 544 if single_tile else get_max_active_clusters(1)
+    mac = 544 if single_tile else cute_dsl_utils.get_max_active_clusters(1)
     if family == "raw":
         if len(tactic) == 6:
             _, epi_m, epi_n, swizzle, elected, raster_m = tactic
@@ -263,7 +263,7 @@ def _compile(m, n, k, tactic, *, compute_capability=None):
         compile_fn,
         extra_key_files=(
             __file__,
-            policy.__file__,
+            cute_dsl_utils.__file__,
             module.__file__,
             blockscaled_gemm_dispatch.__file__,
             helpers.__file__,
