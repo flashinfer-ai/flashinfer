@@ -26,6 +26,8 @@ _VECTOR_WIDTH = 8
 _SUPPORTED_BLOCK_SIZES = (32, 64, 96, 128, 192, 256, 384)
 _SUPPORTED_OUTPUTS_PER_BLOCK = (1, 2, 4)
 _MAX_M = 32
+# Base budget for unrolled B prefetch: 128 16-byte vectors/thread, not registers.
+_B_PREFETCH_VECTOR_BUDGET = 128
 _COMPILE_OPTIONS = "--ptxas-options -maxrregcount=64"
 
 
@@ -86,12 +88,7 @@ def default_tactic(m: int, n: int, k: int) -> DirectTactic:
 
 
 def autotune_tactics(m: int, n: int, k: int) -> list[DirectTactic]:
-    """Enumerate the compact tactic space used by FlashInfer autotuning.
-
-    Block sizes cover every configuration exercised in the H100/B200 sweep;
-    output grouping spans the measured 1/2/4-column choices.  Row tiling stays
-    at the occupancy-oriented default to keep JIT cost bounded.
-    """
+    """Bound whole-K prefetch expansion while retaining the default tactic."""
     try:
         default = default_tactic(m, n, k)
     except ValueError:
@@ -107,6 +104,11 @@ def autotune_tactics(m: int, n: int, k: int) -> list[DirectTactic]:
             try:
                 validate_tactic(tactic, m, n, k)
             except ValueError:
+                continue
+            if k // (block_size * _VECTOR_WIDTH) * outputs_per_block > max(
+                _B_PREFETCH_VECTOR_BUDGET,
+                k // (default.block_size * _VECTOR_WIDTH) * default.outputs_per_block,
+            ):
                 continue
             tactics.append(tactic)
     return list(dict.fromkeys(tactics))
