@@ -4,6 +4,7 @@
 
 import builtins
 import dataclasses
+import math
 
 import pytest
 import torch
@@ -407,3 +408,136 @@ def test_native_fp4_all_finite_codes():
     scale_values = scales.to(torch.uint8).view(torch.float8_e4m3fn).double()
     expected = (lut[codes] * scale_values[:, None]).bfloat16()
     assert torch.equal(out.view(torch.int16), expected.view(torch.int16))
+
+
+@pytest.mark.parametrize("scale_code", [0, 1, 127])
+@pytest.mark.parametrize("batch,compressed_k", [(1, 0), (128, 512), (None, 512)])
+def test_e8m0_scale_boundary_changed_graph(batch, compressed_k, scale_code):
+    gate()
+    if batch is None:
+        batch = torch.cuda.get_device_properties(0).multi_processor_count + 1
+    # 256 * E8M0(code) is normal BF16 even for code 0. Choose Q so every
+    # channel contributes exactly 2 to QK, making both output and LSE analytic.
+    q = torch.full(
+        (batch, 1, 64, 512),
+        2.0 ** (120 - scale_code),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    data = torch.full((64, 512), 256.0, device="cuda").to(torch.float8_e4m3fn)
+    scales = torch.full((64, 16), scale_code, device="cuda", dtype=torch.uint8)
+    swa = pack(data.view(torch.uint8), scales, 528)
+    wi = torch.zeros((batch, 1, 128), device="cuda", dtype=torch.int32)
+    main = (
+        torch.full((1, 64, 1, 288), 255, device="cuda", dtype=torch.uint8)
+        if compressed_k
+        else None
+    )
+    ci = (
+        torch.full((batch, 1, compressed_k), -1, device="cuda", dtype=torch.int32)
+        if compressed_k
+        else None
+    )
+    sink = torch.full((64,), -math.inf, device="cuda")
+    args = q, swa, main, wi, ci, sink
+    out, lse, plan = deepseek_v41_decode(*args)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        deepseek_v41_decode(*args, plan=plan)
+    expected_value = 256.0 * 2.0 ** (scale_code - 127)
+    for replay in range(2):
+        if replay:
+            q.mul_(0.5)
+        out.fill_(math.nan)
+        lse.fill_(math.nan)
+        if plan.workspace is not None:
+            plan.workspace.fill_(-1)
+        graph.replay()
+        # Absolute tolerance would hide the original all-zero output bug.
+        torch.testing.assert_close(
+            out,
+            torch.full_like(out, expected_value),
+            rtol=0,
+            atol=0,
+        )
+        expected_lse = math.log(128) + (1024 >> replay) * 512**-0.5
+        torch.testing.assert_close(
+            lse.double(),
+            torch.full_like(lse, expected_lse, dtype=torch.float64),
+            rtol=0,
+            atol=1e-5,
+        )
+
+
+def test_mxfp8_all_finite_codes():
+    gate()
+    import cuda.bindings.driver as cuda
+    import cutlass
+    import cutlass.cute as cute
+    import cutlass.utils as utils
+    from cutlass.cute.runtime import from_dlpack
+    from flashinfer.experimental.deepseek_v41.hca_v41 import (
+        BlackwellV41MixedCacheDecode,
+    )
+
+    decoder = BlackwellV41MixedCacheDecode(
+        acc_dtype=cutlass.Float32,
+        lse_dtype=cutlass.Float32,
+        mma_qk_tiler_mn=(64, 64),
+        mma_pv_tiler_mn=(64, 128),
+        max_active_clusters=1,
+        page_size_cmp=64,
+        skip_correction_threshold=6.0,
+        is_persistent=False,
+        is_var_seq=True,
+        is_var_split_kv=False,
+    )
+
+    @cute.kernel
+    def convert(words: cute.Tensor, scales: cute.Tensor, out: cute.Tensor):
+        tid = cute.arch.thread_idx()[0]
+        i = cute.arch.block_idx()[0] * 128 + tid
+        storage = utils.SmemAllocator().allocate(128 * 16 * 2, 128)
+        smem = cute.make_tensor(
+            cute.recast_ptr(storage, dtype=cutlass.BFloat16),
+            cute.make_layout(128 * 16),
+        )
+        if i < words.shape[0]:
+            chunk = cute.make_rmem_tensor(cute.make_layout(4), cutlass.Int32)
+            for j in cutlass.range_constexpr(4):
+                chunk[j] = words[i, j]
+            # Exercise the actual vector decode, FP32 multiply, BF16 cast and
+            # swizzled shared store, including gradual underflow and signed zero.
+            decoder._store_fp8_chunk(chunk, scales[i], smem.iterator, tid * 16)
+            for j in cutlass.range_constexpr(16):
+                out[i, j] = smem[decoder._swz(tid * 16 + j)]
+
+    @cute.jit
+    def launch(words, scales, out, stream: cuda.CUstream):
+        convert(words, scales, out).launch(
+            grid=(cute.ceil_div(words.shape[0], 128), 1, 1),
+            block=(128, 1, 1),
+            stream=stream,
+        )
+
+    # Every E4M3 data byte crossed with every finite E8M0 scale. Permuting
+    # lanes also checks the two 8-element halves of the production conversion.
+    codes = (torch.arange(256, device="cuda") ^ 0x53).to(torch.uint8)
+    data = codes.repeat(255, 1).reshape(-1, 16)
+    scales = torch.arange(255, device="cuda", dtype=torch.int32).repeat_interleave(16)
+    words = data.view(torch.int32)
+    out = torch.full(data.shape, math.nan, device="cuda", dtype=torch.bfloat16)
+    tensors = [from_dlpack(x) for x in (words, scales, out)]
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    compiled = cute.compile(launch, *tensors, stream)
+    compiled(*tensors, stream)
+    expected = (
+        data.view(torch.float8_e4m3fn).double()
+        * torch.exp2(scales.double() - 127)[:, None]
+    ).bfloat16()
+    finite = torch.isfinite(expected)
+    assert finite.any() and (~finite).any()
+    # Bitwise comparison preserves the sign of zero and covers subnormal BF16.
+    assert torch.equal(
+        out.view(torch.int16)[finite], expected.view(torch.int16)[finite]
+    )

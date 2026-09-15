@@ -2042,7 +2042,10 @@ class BlackwellV41MixedCacheDecode:
     @cute.jit
     def _e8m0_to_f32(self, byte: cutlass.Int32) -> cutlass.Float32:
         bits = cute.make_rmem_tensor(cute.make_layout(1), cutlass.Int32)
-        bits[0] = (byte & 255) << 23
+        # E8M0 has no zero encoding: code 0 is 2**-127, a FP32 subnormal.
+        # Shifting that code into the FP32 exponent would silently produce 0.
+        code = byte & 255
+        bits[0] = cutlass.Int32(0x00400000) if code == 0 else code << 23
         return cute.make_tensor(
             cute.recast_ptr(bits.iterator, dtype=cutlass.Float32), bits.layout
         )[0]
