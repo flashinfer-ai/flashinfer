@@ -698,6 +698,8 @@ def _create_shared_ep_weights(rank, world_size, device):
             sf_vec_size=16,
             sf_use_ue8m0=False,
             is_sf_swizzled_layout=False,
+            # Untimed preparation needs normal stream ordering for global_scale.
+            enable_pdl=False,
         )
         return (
             packed.view(num_local_experts, rows, cols // 2),
