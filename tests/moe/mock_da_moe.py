@@ -288,6 +288,8 @@ class MockDAMoERunner:
         self,
         *,
         num_experts: int = MockMoERunner.MAX_NUM_EXPERTS,
+        local_expert_offset: int = 0,
+        num_local_experts: int | None = None,
         dtype: torch.dtype = torch.bfloat16,
         tuning_config: TuningConfig | None = None,
         max_workspace_lanes: int = 1,
@@ -295,9 +297,15 @@ class MockDAMoERunner:
         """Layer DA orchestration around one dtype-agnostic MockMoERunner."""
         # Standalone fixed-body runner reused for eager, tuning, and DA bodies.
         self._moe_runner = MockMoERunner(num_experts=num_experts, dtype=dtype)
+        if num_local_experts is None:
+            num_local_experts = num_experts
+        self._local_expert_offset = local_expert_offset
+        self._num_local_experts = num_local_experts
         # DA state owner layered around the stable fixed-body runner.
         self._dispatcher = DAMoEDispatcher(
             num_experts=self.num_experts,
+            local_expert_offset=local_expert_offset,
+            num_local_experts=num_local_experts,
             max_workspace_lanes=max_workspace_lanes,
         )
         # Generic autotuner controls reused by normal and value-aware profiling.
@@ -601,6 +609,8 @@ class MockDAMoERunner:
                 resources.selected_body,
                 resources.parallel_work,
                 self.num_experts,
+                self._local_expert_offset,
+                self._num_local_experts,
                 plan.num_selector_exemplars,
                 body_tactic_ids,
                 expected_capture_id,
