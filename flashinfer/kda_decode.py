@@ -63,6 +63,119 @@ except (ImportError, RuntimeError):
 _RECURRENT_KDA_AVAILABLE = _run_recurrent_kda is not None
 
 
+def _dispatch_recurrent_kda_decode(
+    *,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    A_log: Optional[torch.Tensor],
+    dt_bias: Optional[torch.Tensor],
+    scale: Optional[float],
+    initial_state: Optional[torch.Tensor],
+    output_final_state: bool,
+    use_qk_l2norm_in_kernel: bool,
+    use_gate_in_kernel: bool,
+    lower_bound: Optional[float],
+    cu_seqlens: Optional[torch.Tensor],
+    ssm_state_indices: Optional[torch.Tensor],
+    num_spec_tokens: Optional[int],
+    num_accepted_tokens: Optional[torch.Tensor],
+    output: Optional[torch.Tensor],
+    initial_state_source: Optional[torch.Tensor],
+    initial_state_indices: Optional[torch.Tensor],
+    beta_is_logit: bool,
+    disable_state_update: bool,
+    correction_cache: Optional[torch.Tensor],
+    kg_cache: Optional[torch.Tensor],
+    backend: Literal["cute-dsl", "cake", "auto"],
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """The one decode contract, shared by both public ``recurrent_kda`` facades.
+
+    Every parameter is keyword-only and without a default, so a caller that
+    forgets to forward one fails loudly instead of silently taking a default
+    that diverges from the other facade.
+
+    Backend validation stays with the callers: the phase-neutral facade accepts
+    ``"cudnn"`` and resolves it before reaching decode, while the decode facade
+    does not accept it at all.
+    """
+    if (correction_cache is not None or kg_cache is not None) and (
+        not disable_state_update
+    ):
+        raise ValueError(
+            "correction_cache/kg_cache are speculative-verify caches and "
+            "require disable_state_update=True"
+        )
+    if disable_state_update:
+        if backend == "cake":
+            raise ValueError(
+                "backend='cake' has no frozen-state kernels; "
+                "disable_state_update=True requires the CuTe-DSL backends"
+            )
+        if output_final_state:
+            raise ValueError(
+                "output_final_state=True is incompatible with "
+                "disable_state_update=True (no state is produced)"
+            )
+        if num_accepted_tokens is not None:
+            raise ValueError(
+                "num_accepted_tokens applies to the state-updating fused "
+                "spec path, not the frozen-verify mode"
+            )
+        return _run_frozen_recurrent_kda(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            scale=scale,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            use_gate_in_kernel=use_gate_in_kernel,
+            lower_bound=lower_bound,
+            cu_seqlens=cu_seqlens,
+            ssm_state_indices=ssm_state_indices,
+            num_spec_tokens=num_spec_tokens,
+            output=output,
+            initial_state=initial_state,
+            initial_state_source=initial_state_source,
+            initial_state_indices=initial_state_indices,
+            beta_is_logit=beta_is_logit,
+            correction_cache=correction_cache,
+            kg_cache=kg_cache,
+        )
+    if _run_recurrent_kda is None:
+        raise NotImplementedError("recurrent KDA backend is unavailable")
+
+    return _run_recurrent_kda(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        scale=scale,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        use_gate_in_kernel=use_gate_in_kernel,
+        lower_bound=lower_bound,
+        cu_seqlens=cu_seqlens,
+        ssm_state_indices=ssm_state_indices,
+        num_spec_tokens=num_spec_tokens,
+        num_accepted_tokens=num_accepted_tokens,
+        output=output,
+        initial_state_source=initial_state_source,
+        initial_state_indices=initial_state_indices,
+        beta_is_logit=beta_is_logit,
+        backend=backend,
+    )
+
+
 @flashinfer_api(trace=recurrent_kda_trace)
 def recurrent_kda(
     q: torch.Tensor,
@@ -209,56 +322,7 @@ def recurrent_kda(
         raise ValueError(
             f"backend must be 'cute-dsl', 'cake', or 'auto', got {backend!r}"
         )
-    if (correction_cache is not None or kg_cache is not None) and (
-        not disable_state_update
-    ):
-        raise ValueError(
-            "correction_cache/kg_cache are speculative-verify caches and "
-            "require disable_state_update=True"
-        )
-    if disable_state_update:
-        if backend == "cake":
-            raise ValueError(
-                "backend='cake' has no frozen-state kernels; "
-                "disable_state_update=True requires the CuTe-DSL backends"
-            )
-        if output_final_state:
-            raise ValueError(
-                "output_final_state=True is incompatible with "
-                "disable_state_update=True (no state is produced)"
-            )
-        if num_accepted_tokens is not None:
-            raise ValueError(
-                "num_accepted_tokens applies to the state-updating fused "
-                "spec path, not the frozen-verify mode"
-            )
-        return _run_frozen_recurrent_kda(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-            A_log=A_log,
-            dt_bias=dt_bias,
-            scale=scale,
-            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-            use_gate_in_kernel=use_gate_in_kernel,
-            lower_bound=lower_bound,
-            cu_seqlens=cu_seqlens,
-            ssm_state_indices=ssm_state_indices,
-            num_spec_tokens=num_spec_tokens,
-            output=output,
-            initial_state=initial_state,
-            initial_state_source=initial_state_source,
-            initial_state_indices=initial_state_indices,
-            beta_is_logit=beta_is_logit,
-            correction_cache=correction_cache,
-            kg_cache=kg_cache,
-        )
-    if _run_recurrent_kda is None:
-        raise NotImplementedError("recurrent KDA backend is unavailable")
-
-    run_kwargs = dict(
+    return _dispatch_recurrent_kda_decode(
         q=q,
         k=k,
         v=v,
@@ -280,8 +344,11 @@ def recurrent_kda(
         initial_state_source=initial_state_source,
         initial_state_indices=initial_state_indices,
         beta_is_logit=beta_is_logit,
+        disable_state_update=disable_state_update,
+        correction_cache=correction_cache,
+        kg_cache=kg_cache,
+        backend=backend,
     )
-    return _run_recurrent_kda(**run_kwargs, backend=backend)
 
 
 @flashinfer_api(trace=packed_kda_decode_trace)
