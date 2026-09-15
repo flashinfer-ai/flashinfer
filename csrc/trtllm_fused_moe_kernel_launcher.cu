@@ -3064,13 +3064,12 @@ void trtllm_moe_run_finalize(TensorView gemm2_output, TensorView output, TensorV
                           num_experts, top_k, hidden_size, enable_pdl, use_routing_scales_on_input);
 }
 
-void trtllm_moe_run_deepseek_fp8_activation(TensorView gemm1_output, TensorView gemm1_output_scale,
-                                            TensorView activation_output,
-                                            TensorView activation_output_scale,
-                                            TensorView expanded_idx_to_permuted_idx,
-                                            TensorView total_num_padded_tokens, int64_t num_tokens,
-                                            int64_t top_k, int64_t intermediate_size,
-                                            int64_t activation_type, bool enable_pdl) {
+void trtllm_moe_run_deepseek_fp8_activation(
+    TensorView gemm1_output, TensorView gemm1_output_scale, TensorView activation_output,
+    TensorView activation_output_scale, TensorView total_num_padded_tokens,
+    TensorView cta_idx_xy_to_mn_limit, TensorView num_non_exiting_ctas, int64_t tile_tokens_dim,
+    int64_t num_tokens, int64_t top_k, int64_t intermediate_size, int64_t activation_type,
+    bool enable_pdl) {
   TVM_FFI_ICHECK_EQ(gemm1_output.dtype(), dl_uint8)
       << "DeepSeek FP8 activation: gemm1_output must be uint8 FP8 storage.";
   TVM_FFI_ICHECK_EQ(gemm1_output_scale.dtype(), dl_float32)
@@ -3079,13 +3078,27 @@ void trtllm_moe_run_deepseek_fp8_activation(TensorView gemm1_output, TensorView 
       << "DeepSeek FP8 activation: activation_output must be uint8 FP8 storage.";
   TVM_FFI_ICHECK_EQ(activation_output_scale.dtype(), dl_float32)
       << "DeepSeek FP8 activation: activation_output_scale must be float32.";
-  TVM_FFI_ICHECK_EQ(expanded_idx_to_permuted_idx.dtype(), dl_int32)
-      << "DeepSeek FP8 activation: expanded_idx_to_permuted_idx must be int32.";
-  TVM_FFI_ICHECK_EQ(total_num_padded_tokens.dtype(), dl_int32)
-      << "DeepSeek FP8 activation: total_num_padded_tokens must be int32.";
+  auto check_metadata = [&](TensorView const& tensor, int64_t min_size, char const* name) {
+    CHECK_INPUT_AND_TYPE(tensor, dl_int32);
+    CHECK_DEVICE(tensor, activation_output);
+    CHECK_DIM(1, tensor);
+    TVM_FFI_ICHECK_GE(tensor.size(0), min_size) << name << " is too small.";
+  };
+  check_metadata(total_num_padded_tokens, 1, "total_num_padded_tokens");
+  check_metadata(num_non_exiting_ctas, 1, "num_non_exiting_ctas");
+
+  CHECK_DIM(2, gemm1_output_scale);
+  TVM_FFI_ICHECK_GT(tile_tokens_dim, 0);
+  TVM_FFI_ICHECK_LE(tile_tokens_dim, std::numeric_limits<int32_t>::max());
+  // Routing allocates GEMM1 scales for its maximum padded rows. Validate the full
+  // CTA capacity without reading the device-side count or synchronizing the stream.
+  auto const max_num_padded_tokens = gemm1_output_scale.size(1);
+  auto const max_num_ctas =
+      max_num_padded_tokens / tile_tokens_dim + (max_num_padded_tokens % tile_tokens_dim != 0);
+  check_metadata(cta_idx_xy_to_mn_limit, max_num_ctas, "cta_idx_xy_to_mn_limit");
 
   auto const activation = validateAndCastActivationType(activation_type);
-  moe::dev::activation::Data activationData;
+  moe::dev::activation::Data activationData{};
   activationData.mDtypeElt = btg::Dtype::E4m3;
   activationData.mUsePdl = enable_pdl;
   activationData.mUseDeepSeekFp8 = true;
@@ -3097,10 +3110,11 @@ void trtllm_moe_run_deepseek_fp8_activation(TensorView gemm1_output, TensorView 
       static_cast<int32_t>(intermediate_size * (isGatedActivation(activation) ? 2 : 1));
   activationData.topK = static_cast<int32_t>(top_k);
   activationData.numTokens = static_cast<int32_t>(num_tokens);
-  activationData.expandedIdxToPermutedIdx =
-      static_cast<int32_t*>(const_cast<void*>(expanded_idx_to_permuted_idx.data_ptr()));
   activationData.totalNumPaddedTokens =
       static_cast<int32_t*>(const_cast<void*>(total_num_padded_tokens.data_ptr()));
+  activationData.ctaIdxXyToMnLimit = static_cast<int32_t const*>(cta_idx_xy_to_mn_limit.data_ptr());
+  activationData.numNonExitingCtas = static_cast<int32_t const*>(num_non_exiting_ctas.data_ptr());
+  activationData.tileTokensDim = static_cast<int32_t>(tile_tokens_dim);
 
   cudaStream_t stream = get_stream(activation_output.device());
   moe::dev::activation::run(activationData, stream);
