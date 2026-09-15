@@ -1638,6 +1638,79 @@ class BlockSparseAttentionWrapper:
         pass
 
 
+def _build_variable_block_sparse_metadata(
+    block_mask_map: torch.Tensor,
+    block_row_sz: torch.Tensor,
+    block_col_sz: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build page-size-one CSR indices; copy only scheduler metadata to the host."""
+    device = block_mask_map.device
+    num_heads, num_rows, num_cols = block_mask_map.shape
+    zero = torch.zeros(1, dtype=torch.int64, device=device)
+    block_indptr = torch.cumsum(
+        block_mask_map * block_col_sz[:, None, :], dim=-1, dtype=torch.int64
+    )
+    qo_indptr = torch.cat(
+        [zero, torch.cumsum(block_row_sz.reshape(-1), 0, dtype=torch.int64)]
+    )
+    kv_indptr = torch.cat([zero, torch.cumsum(block_indptr[:, :, -1].reshape(-1), 0)])
+    col_indptr = torch.cumsum(block_col_sz.reshape(-1), 0, dtype=torch.int64)
+
+    # The CPU scheduler needs these two small indptr arrays. Their single
+    # blocking copy also supplies the exact allocation size, avoiding nonzero
+    # and repeat_interleave's separate device-to-host synchronization points.
+    indptr_size = num_heads * num_rows + 1
+    metadata_host = torch.cat([qo_indptr, kv_indptr, col_indptr[-1:]]).cpu()
+    q_total = int(metadata_host[indptr_size - 1])
+    nnz = int(metadata_host[2 * indptr_size - 1])
+    kv_total = int(metadata_host[-1])
+    if min(q_total, nnz, kv_total) < 0 or max(q_total, nnz, kv_total) > 2**31 - 1:
+        raise ValueError("Variable block-sparse attention indices must fit in int32")
+
+    qo_indptr_host = metadata_host[:indptr_size].to(torch.int32)
+    kv_indptr_host = metadata_host[indptr_size : 2 * indptr_size].to(torch.int32)
+    qo_indptr = qo_indptr.to(torch.int32)
+    kv_indptr = kv_indptr.to(torch.int32)
+    kv_indices = torch.empty(nnz, dtype=torch.int32, device=device)
+    if nnz:
+        kernel = None
+        if get_compute_capability(device)[0] >= 8:
+            try:
+                from .triton.sparse import _expand_variable_block_sparse_indices
+
+                kernel = _expand_variable_block_sparse_indices
+            except ModuleNotFoundError as error:
+                if error.name != "triton":
+                    raise
+        if kernel is not None:
+            with torch.cuda.device(device):
+                kernel[(num_heads * num_rows * num_cols,)](
+                    block_indptr,
+                    col_indptr,
+                    kv_indptr,
+                    kv_indices,
+                    num_rows,
+                    num_cols,
+                    BLOCK_SIZE=256,
+                )
+        else:
+            # Keep older architectures and installations without Triton usable.
+            # output_size avoids repeat_interleave's allocation-size host sync.
+            lengths = (block_mask_map * block_col_sz[:, None, :]).reshape(-1)
+            starts = torch.cumsum(lengths, 0) - lengths
+            bases = (
+                (col_indptr - block_col_sz.reshape(-1))
+                .reshape(num_heads, 1, num_cols)
+                .expand(-1, num_rows, -1)
+                .reshape(-1)
+            )
+            kv_indices = (
+                torch.repeat_interleave(bases - starts, lengths, output_size=nnz)
+                + torch.arange(nnz, device=device)
+            ).to(torch.int32)
+    return qo_indptr, kv_indptr, kv_indices, qo_indptr_host, kv_indptr_host
+
+
 class VariableBlockSparseAttentionWrapper:
     r"""Wrapper class for attention computation with a block-sparse matrix as attention mask.
     This API supports variable block sizes provided by ``block_row_sz`` and ``block_col_sz``.
@@ -1818,6 +1891,11 @@ class VariableBlockSparseAttentionWrapper:
         :meth:`run_return_lse` calls, auxiliary data structures will be created
         during this call and cached for multiple kernel runs.
 
+        Token indices are constructed on the GPU. Planning transfers only the
+        compact row pointers to the CPU scheduler and synchronizes that copy;
+        planning cannot be captured in a CUDA graph. The planned attention
+        execution remains graph-capturable.
+
         The ``num_qo_heads`` must be a multiple of ``num_kv_heads``. If ``num_qo_heads``
         is not equal to ``num_kv_heads``, the function will use
         `grouped query attention <https://arxiv.org/abs/2305.13245>`_.
@@ -1835,104 +1913,29 @@ class VariableBlockSparseAttentionWrapper:
         num_blocks_row = block_row_sz.shape[-1]
         num_blocks_col = block_col_sz.shape[-1]
 
-        # q layout: [seq_len, num_kv_heads, gqa_group_size, head_dim]
-        # padded into: [seq_len * num_kv_heads, 1, gqa_group_size, head_dim]
-        qo_indptr = torch.cat(
-            [
-                torch.zeros(1, dtype=torch.int32, device=block_row_sz.device),
-                torch.cumsum(block_row_sz.flatten(), dim=0, dtype=torch.int32),
-            ],
-            dim=0,
-        )
-        qo_indptr_host = qo_indptr.to("cpu", non_blocking=non_blocking)
-        last_block_len = torch.full(
-            (num_blocks_row * num_kv_heads,),
-            1,
-            dtype=torch.int32,
-            device=block_mask_map.device,
-        )  # We use page_size == 1 for variable length support
-
-        # HND kv layout: [num_kv_heads, num_blocks, block_size, head_dim]
-        # padded into: [num_kv_heads * num_blocks, block_size, 1, head_dim]
-        # for customized attention mask for each kv_head
-        # NOTE(Yilong): This could be perf bottleneck. Consider Triton implementation.
-        def _block_mask_map_to_expanded_indices(
-            block_mask_map: torch.Tensor,  # [H, R, C] bool / {0,1}
-            block_col_sz: torch.Tensor,  # [H, C]     int
-        ) -> Tuple[torch.Tensor, torch.Tensor]:
-            """
-            Args:
-                block_mask_map:  bool/int  [num_kv_heads, num_blocks_row, num_blocks_col]
-                block_col_sz:    int32/64  [num_kv_heads, num_blocks_col]
-            Returns:
-                kv_indptr:  [H*R + 1]  int32  —  CSR indptr
-                kv_indices: [nnz]      int32  —  token indices per (head, row)
-            """
-            device = block_mask_map.device
-            dtype_i = torch.int32
-
-            # 1) Calculate the total length of each row (head, row)
-            row_lengths = (block_mask_map * block_col_sz[:, None, :]).sum(-1)  # [H,R]
-            kv_indptr = torch.cat(
-                [
-                    torch.zeros(1, dtype=dtype_i, device=device),
-                    torch.cumsum(row_lengths.flatten(), 0),
-                ],
-                dim=0,
-            )
-
-            # 2) Calculate the offset of each column block within its head
-            col_offset = (
-                torch.cumsum(block_col_sz.to(dtype_i), 1) - block_col_sz
-            )  # [H,C]
-            head_len = block_col_sz.sum(1, dtype=dtype_i)
-            head_offset = torch.cumsum(head_len, 0) - head_len
-
-            # 3) Find all selected (h,r,c)
-            h_idx, r_idx, c_idx = block_mask_map.nonzero(as_tuple=True)
-            lengths = block_col_sz[h_idx, c_idx].to(dtype_i)  # [N]
-            base = head_offset[h_idx] + col_offset[h_idx, c_idx]  # [N]
-
-            # 4) Expand variable-length column blocks into token-level indices
-            cum = torch.cumsum(lengths, 0)
-            starts = torch.repeat_interleave(cum - lengths, lengths)  # [total]
-            offsets_within = torch.arange(cum[-1], device=device) - starts
-            kv_indices = torch.repeat_interleave(base, lengths) + offsets_within
-
-            return kv_indptr.to(dtype=dtype_i, device=device), kv_indices.to(
-                dtype=dtype_i, device=device
-            )
-
-        kv_indptr, kv_indices = _block_mask_map_to_expanded_indices(
-            block_mask_map, block_col_sz
-        )
-        kv_indptr_host = kv_indptr.to("cpu", non_blocking=non_blocking)
-        kv_indices_host = kv_indices.to("cpu", non_blocking=non_blocking)
-
-        self._qo_indptr = qo_indptr.to(self.device, non_blocking=non_blocking)
-        self._paged_kv_indptr_buf = kv_indptr.to(self.device, non_blocking=non_blocking)
-        self._paged_kv_indices_buf = kv_indices.to(
-            self.device, non_blocking=non_blocking
-        )
-        self._paged_kv_last_page_len = last_block_len.to(
-            self.device, non_blocking=non_blocking
-        )
-        torch.cuda.synchronize()  # for non-blocking copy
-        self._mask_mode = MaskMode.CAUSAL.value if causal else MaskMode.NON_CAUSAL.value
-
-        # Sanity check
         assert num_qo_heads % num_kv_heads == 0, (
             "num_qo_heads must be a multiple of num_kv_heads"
         )
-        assert num_blocks_row * num_kv_heads + 1 == kv_indptr_host.shape[0]
-        assert kv_indptr_host[-1].item() == kv_indices_host.shape[0], (
-            f"{kv_indptr_host[-1].item()} != {kv_indices_host.shape[0]}"
+        assert block_mask_map.shape == (num_kv_heads, num_blocks_row, num_blocks_col)
+        assert block_row_sz.shape == (num_kv_heads, num_blocks_row)
+        assert block_col_sz.shape == (num_kv_heads, num_blocks_col)
+
+        (
+            self._qo_indptr,
+            self._paged_kv_indptr_buf,
+            self._paged_kv_indices_buf,
+            qo_indptr_host,
+            kv_indptr_host,
+        ) = _build_variable_block_sparse_metadata(
+            block_mask_map.to(self.device, non_blocking=non_blocking),
+            block_row_sz.to(self.device, non_blocking=non_blocking),
+            block_col_sz.to(self.device, non_blocking=non_blocking),
         )
-        assert num_kv_heads == block_mask_map.shape[0]
-        assert num_kv_heads == block_row_sz.shape[0]
-        assert num_kv_heads == block_col_sz.shape[0]
-        assert num_blocks_row == block_mask_map.shape[1]
-        assert num_blocks_col == block_mask_map.shape[2]
+        # Page size one represents variable column-block lengths.
+        self._paged_kv_last_page_len = torch.ones(
+            num_blocks_row * num_kv_heads, dtype=torch.int32, device=self.device
+        )
+        self._mask_mode = MaskMode.CAUSAL.value if causal else MaskMode.NON_CAUSAL.value
 
         if self._backend == "auto":
             self._backend = determine_attention_backend(
