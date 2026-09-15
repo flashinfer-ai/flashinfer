@@ -651,6 +651,42 @@ def test_batch_fast_decode_tensor_cores_cuda_graph(
     torch.testing.assert_close(lse, lse_tensor_cores, rtol=1e-3, atol=1e-3)
 
 
+@pytest.mark.parametrize("batch_size", [1, 17])
+@pytest.mark.parametrize("page_size", [1, 16])
+@pytest.mark.parametrize("pass_seq_lens", [False, True])
+def test_batch_decode_tensor_cores_plan_max_kv_len(
+    batch_size, page_size, pass_seq_lens
+):
+    """plan() derives the longest KV length from the page table or from
+    seq_lens. A single request is the one-element case of the reduction."""
+    torch.manual_seed(batch_size * 31 + page_size)
+    kv_lens = torch.randint(1, 513, (batch_size,), dtype=torch.int32)
+    num_pages = (kv_lens + page_size - 1) // page_size
+    kv_indptr = torch.nn.functional.pad(
+        torch.cumsum(num_pages, 0, dtype=torch.int32), (1, 0)
+    )
+
+    wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        torch.empty(16 * 1024 * 1024, dtype=torch.uint8, device="cuda"),
+        "NHD",
+        use_tensor_cores=True,
+    )
+    wrapper.plan(
+        kv_indptr.cuda(),
+        torch.arange(int(kv_indptr[-1]), dtype=torch.int32, device="cuda"),
+        (kv_lens - (num_pages - 1) * page_size).cuda(),
+        8,
+        8,
+        128,
+        page_size,
+        q_data_type=torch.float16,
+        seq_lens=kv_lens.cuda() if pass_seq_lens else None,
+    )
+
+    assert type(wrapper._max_kv_len) is int
+    assert wrapper._max_kv_len == int(kv_lens.max())
+
+
 if __name__ == "__main__":
     test_batch_decode_tensor_cores_with_fast_plan(
         5, 4, 4096, 2048, True, 1, 4, 1, 128, "HND", "NONE"
