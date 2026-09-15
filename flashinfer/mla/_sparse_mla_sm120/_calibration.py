@@ -433,6 +433,18 @@ def _initialize_fp8_pool(cache: torch.Tensor, family: str, page_size: int) -> No
             data[..., offset : offset + rope * 2].copy_(values.view(torch.uint8))
 
 
+def _is_cuda_oom(error: BaseException) -> bool:
+    if isinstance(error, torch.cuda.OutOfMemoryError):
+        return True
+    accelerator_error = getattr(torch, "AcceleratorError", None)
+    if accelerator_error is None or not isinstance(error, accelerator_error):
+        return False
+    code = getattr(error, "error_code", None)
+    if code is not None:
+        return code == 2
+    return "CUDA error: out of memory" in str(error)
+
+
 def _allocate_kv_pool(family: str, device: torch.device) -> tuple[torch.Tensor, int]:
     """Allocate and initialize a finite 64-token-page pool, halving on OOM."""
     w = 64 * _BYTES_PER_TOKEN[family]
@@ -444,7 +456,9 @@ def _allocate_kv_pool(family: str, device: torch.device) -> tuple[torch.Tensor, 
             kv_cache = torch.empty(pool_bytes // w, w, dtype=torch.uint8, device=device)
             _initialize_fp8_pool(kv_cache, family, 64)
             return kv_cache, kv_cache.shape[0] * 64
-        except torch.cuda.OutOfMemoryError:
+        except RuntimeError as error:
+            if not _is_cuda_oom(error):
+                raise
             del kv_cache
             if pool_bytes <= _POOL_BYTES_MIN:
                 raise CalibrationError(
@@ -452,12 +466,13 @@ def _allocate_kv_pool(family: str, device: torch.device) -> tuple[torch.Tensor, 
                     "for sparse-MLA cpb calibration"
                 ) from None
             pool_bytes //= 2
-            with (
-                torch.cuda.device(device)
-                if device.type == "cuda"
-                else contextlib.nullcontext()
-            ):
-                torch.cuda.empty_cache()
+        # Leave the handler first: its traceback can retain initializer tensors.
+        with (
+            torch.cuda.device(device)
+            if device.type == "cuda"
+            else contextlib.nullcontext()
+        ):
+            torch.cuda.empty_cache()
 
 
 def calibration_batch_count(
@@ -513,7 +528,9 @@ class _ColdCallGraph:
                         device=device,
                         generator=torch.Generator(device=device).manual_seed(17),
                     )
-                except torch.cuda.OutOfMemoryError as error:
+                except RuntimeError as error:
+                    if not _is_cuda_oom(error):
+                        raise
                     raise CalibrationError(
                         "cannot allocate 4xL2 eviction buffer"
                     ) from error
@@ -728,7 +745,8 @@ def calibrate(
     to 512 MiB), measuring mean per-call cold-L2 graph latency over full-pool
     uniform index sets (:func:`_time_call_fresh_indices`). Eviction and host
     enqueue are outside the event intervals. Fits the three constants to six
-    fixed shapes by Levenberg-Marquardt on relative residuals.
+    fixed shapes by Levenberg-Marquardt on relative residuals. If the fit is
+    implausible, remeasure all six shapes once using the same pool and module.
     ``module_getter`` returns the loaded TVM-FFI kernel module.
     """
     if family not in _BYTES_PER_TOKEN:
@@ -808,55 +826,63 @@ def calibrate(
             ]
         )
 
-    theta = np.log(np.array([5e-13, 1.5e-10, 6e-6]))
-    r = resid(theta)
-    cost = 0.5 * float(r @ r)
-    lam = 1e-3
-    for _ in range(64):
-        jac = np.empty((len(measurements), 3))
-        for j in range(3):
-            h = 1e-4
-            theta_p = theta.copy()
-            theta_p[j] += h
-            theta_m = theta.copy()
-            theta_m[j] -= h
-            jac[:, j] = (resid(theta_p) - resid(theta_m)) / (2 * h)
-        grad = jac.T @ r
-        step_matrix = jac.T @ jac + lam * np.diag(
-            np.maximum(np.diag(jac.T @ jac), 1e-24)
-        )
-        try:
-            delta = np.linalg.solve(step_matrix, -grad)
-        except np.linalg.LinAlgError:
-            break
-        theta_new = theta + delta
-        if not np.all(np.isfinite(theta_new)):
-            break
-        r_new = resid(theta_new)
-        cost_new = 0.5 * float(r_new @ r_new)
-        if np.isfinite(cost_new) and cost_new < cost:
-            theta, r, cost = theta_new, r_new, cost_new
-            lam = max(lam / 4.0, 1e-12)
-            if np.max(np.abs(delta)) < 1e-6:
+    for attempt in range(2):
+        if attempt:
+            t = [measure(*m) for m in measurements]
+        theta = np.log(np.array([5e-13, 1.5e-10, 6e-6]))
+        r = resid(theta)
+        cost = 0.5 * float(r @ r)
+        lam = 1e-3
+        for _ in range(64):
+            jac = np.empty((len(measurements), 3))
+            for j in range(3):
+                h = 1e-4
+                theta_p = theta.copy()
+                theta_p[j] += h
+                theta_m = theta.copy()
+                theta_m[j] -= h
+                jac[:, j] = (resid(theta_p) - resid(theta_m)) / (2 * h)
+            grad = jac.T @ r
+            step_matrix = jac.T @ jac + lam * np.diag(
+                np.maximum(np.diag(jac.T @ jac), 1e-24)
+            )
+            try:
+                delta = np.linalg.solve(step_matrix, -grad)
+            except np.linalg.LinAlgError:
                 break
-        else:
-            lam *= 8.0
-            if lam > 1e12:
+            theta_new = theta + delta
+            if not np.all(np.isfinite(theta_new)):
                 break
+            r_new = resid(theta_new)
+            cost_new = 0.5 * float(r_new @ r_new)
+            if np.isfinite(cost_new) and cost_new < cost:
+                theta, r, cost = theta_new, r_new, cost_new
+                lam = max(lam / 4.0, 1e-12)
+                if np.max(np.abs(delta)) < 1e-6:
+                    break
+            else:
+                lam *= 8.0
+                if lam > 1e12:
+                    break
 
-    inv_bw, inv_rsm, c0 = (float(v) for v in np.exp(theta))
-    rel_rms = float(np.sqrt(2.0 * cost / len(measurements)))
-    if (
-        not all(np.isfinite([inv_bw, inv_rsm, c0]))
-        or inv_bw <= 0
-        or inv_rsm <= 0
-        or c0 <= 0
-        or rel_rms > 0.25
-    ):
-        raise CalibrationError(
-            f"implausible cpb calibration constants for {family}: inv_bw={inv_bw}, "
-            f"inv_rsm={inv_rsm}, c0={c0} (relative rms residual {rel_rms:.3f})"
-        )
+        inv_bw, inv_rsm, c0 = (float(v) for v in np.exp(theta))
+        rel_rms = float(np.sqrt(2.0 * cost / len(measurements)))
+        if (
+            not all(np.isfinite([inv_bw, inv_rsm, c0]))
+            or inv_bw <= 0
+            or inv_rsm <= 0
+            or c0 <= 0
+            or rel_rms > 0.25
+        ):
+            diagnostic = (
+                f"implausible cpb calibration constants for {family}: inv_bw={inv_bw}, "
+                f"inv_rsm={inv_rsm}, c0={c0} (relative rms residual {rel_rms:.3f})"
+            )
+            if attempt == 0:
+                logger.warning("%s; remeasuring once", diagnostic)
+                continue
+            raise CalibrationError(diagnostic)
+        break
     return CpbConstants(
         inv_bw=inv_bw,
         inv_rsm=inv_rsm,
@@ -1758,14 +1784,16 @@ def _profile_pool(
                     cache[start : start + count].copy_(packed.view(count, page * bpt))
                     del latent, packed
             return cache, pages * page
-        except torch.cuda.OutOfMemoryError:
-            del cache
+        except RuntimeError as error:
+            if not _is_cuda_oom(error):
+                raise
+            cache = latent = packed = None
             if pool_bytes <= _POOL_BYTES_MIN:
                 raise CalibrationError(
                     f"cannot initialize {request.family} profile pool"
                 ) from None
             pool_bytes //= 2
-            torch.cuda.empty_cache()
+        torch.cuda.empty_cache()
 
 
 @dataclass(frozen=True)
@@ -2187,20 +2215,40 @@ def calibrate_sparse_mla_sm120(
     :func:`default_cache_path`) and take effect in-process immediately (the
     ``_constants_version`` bump self-invalidates the plan memoization).
 
-    The default is idempotent skip-existing: frameworks may call this
-    unconditionally on every startup warmup. ``force=True`` re-measures even
-    present entries — the escape hatch after a kernel upgrade changes the
-    measured optimum.
+    The default skips existing profiles and constants. An explicit call retries
+    missing or previously failed configurations; ``force=True`` also re-measures
+    present entries, for example after a kernel upgrade changes the optimum.
+    Failed measurements retain previously published profiles. Analytical fitting
+    is separate from profile publication: a fit failure does not roll back a
+    successfully measured profile, nor certify that profile's timing quality.
 
-    Calibration also runs lazily on the first decode call under
-    ``autotune(tuning_mode=True)`` when entries are absent;
-    ``autotune(..., skip_ops={"sparse_mla_sm120"})`` opts out of those
-    passes. Neither entry point may run under CUDA graph capture.
+    For startup without calibration competing with model loading or memory
+    profiling, stop serving and pre-calibrate the intended configurations on an
+    idle GPU in a separate process. Check the report's ``failed`` and
+    ``persisted`` fields, then exit that process before starting the service.
+    Use the same cache directory and target device in both processes. During
+    service warmup, ``autotune(True, skip_ops={"sparse_mla_sm120"})`` consumes
+    cached profiles but disables new calibration and exact-token refinement.
+    This does not remove ordinary eager execution scratch allocations.
 
-    Measure on an idle GPU (the protocol is timing-sensitive), and calibrate
-    per machine — the constants are device-local. A full default sweep (all
-    families, grid heads x grid topks) takes on the order of minutes; a
-    single ``(family, heads, topks)`` combination is seconds.
+    Without that skip, missing profiles are measured lazily under
+    ``autotune(tuning_mode=True)``. A cached configuration can still trigger
+    refinement for an off-grid token count within the decode envelope. With
+    measurement disabled, an existing exact entry or the next larger token
+    bucket is used instead. Neither calibration entry point may run under CUDA
+    graph capture. The disk key includes the device and effective family,
+    heads, topk, precision, cache page sizes and presence flags, not just the
+    model name. Old schema or timing-protocol caches are not reused.
+
+    NVFP4 KV uses its separate calibration API and
+    ``skip_ops={"sparse_mla_sm120_nvfp4"}``; weight-only NVFP4 quantization
+    does not imply NVFP4 KV. Include both skip names when both KV paths are used.
+
+    Calibration is timing-sensitive: neither bounded fit remeasurement nor
+    configuration profiles eliminate interference from concurrent GPU work.
+    Calibrate per machine on an idle GPU. A full default sweep (all families,
+    grid heads x grid topks) takes on the order of minutes; a single
+    ``(family, heads, topks)`` combination is seconds.
 
     Parameters
     ----------

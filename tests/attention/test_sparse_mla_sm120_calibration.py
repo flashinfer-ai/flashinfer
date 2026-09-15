@@ -849,22 +849,64 @@ def test_memory_regime_requires_known_l2_and_sufficient_pool(monkeypatch):
         cpb_mod.calibration_batch_count(1, 128, 584, torch.device("cpu"))
 
 
-def test_initializer_oom_retries_but_non_oom_propagates(monkeypatch):
+@pytest.fixture
+def accelerator_error(monkeypatch):
+    class AcceleratorError(RuntimeError):
+        pass
+
+    monkeypatch.setattr(torch, "AcceleratorError", AcceleratorError, raising=False)
+
+    def make(code=2, message="CUDA error: out of memory"):
+        error = AcceleratorError(message)
+        if code is not None:
+            error.error_code = code
+        return error
+
+    return make
+
+
+def test_cuda_oom_classification(accelerator_error):
+    assert cpb_mod._is_cuda_oom(torch.cuda.OutOfMemoryError("allocation"))
+    assert cpb_mod._is_cuda_oom(accelerator_error(message="allocation failed"))
+    assert cpb_mod._is_cuda_oom(accelerator_error(None))
+    assert not cpb_mod._is_cuda_oom(accelerator_error(700))
+    assert not cpb_mod._is_cuda_oom(accelerator_error(None, "out of memory"))
+    assert not cpb_mod._is_cuda_oom(RuntimeError("CUDA error: out of memory"))
+
+
+@pytest.mark.parametrize("accelerator", [False, True])
+def test_initializer_oom_retries_but_non_oom_propagates(
+    monkeypatch, accelerator_error, accelerator
+):
     monkeypatch.setattr(cpb_mod, "_BYTES_PER_TOKEN", {"dsv4": 8})
     monkeypatch.setattr(cpb_mod, "_POOL_BYTES_TARGET", 4096)
     monkeypatch.setattr(cpb_mod, "_POOL_BYTES_MIN", 1024)
     monkeypatch.setattr(cpb_mod, "_check_pool_capacity", lambda *args: None)
-    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
-    calls = []
+    import weakref
+
+    calls, released = [], []
+
+    def empty_cache():
+        assert all(ref() is None for ref in released)
+
+    monkeypatch.setattr(torch.cuda, "empty_cache", empty_cache)
 
     def initialize(cache, *args):
         calls.append(cache.numel())
         if len(calls) == 1:
-            raise torch.cuda.OutOfMemoryError("synthetic generation")
+            released.append(weakref.ref(cache))
+            raise (
+                accelerator_error()
+                if accelerator
+                else torch.cuda.OutOfMemoryError("synthetic generation")
+            )
         cache.zero_()
 
     monkeypatch.setattr(cpb_mod, "_initialize_fp8_pool", initialize)
-    result, slots = cpb_mod._allocate_kv_pool("dsv4", torch.device("cpu"))
+    try:
+        result, slots = cpb_mod._allocate_kv_pool("dsv4", torch.device("cpu"))
+    except RuntimeError as error:
+        pytest.fail(f"pool did not recover: {error}", pytrace=False)
     assert calls == [4096, 2048] and result.numel() == 2048 and slots == 256
     monkeypatch.setattr(
         cpb_mod, "_initialize_fp8_pool", Mock(side_effect=RuntimeError("bad pack"))
@@ -1105,15 +1147,27 @@ def test_balanced_timing_preserves_candidates_and_averages_rounds():
     assert order == [1, 2, 3, 3, 2, 1]
 
 
-def test_timer_eviction_oom_does_not_fall_back(fake_cuda, monkeypatch):
+@pytest.mark.parametrize("accelerator", [False, True])
+def test_timer_eviction_oom_does_not_fall_back(
+    fake_cuda, monkeypatch, accelerator_error, accelerator
+):
     def fail(*args, **kwargs):
-        raise torch.cuda.OutOfMemoryError("eviction allocation")
+        raise (
+            accelerator_error()
+            if accelerator
+            else torch.cuda.OutOfMemoryError("eviction allocation")
+        )
 
     monkeypatch.setattr(torch, "randint", fail)
-    with pytest.raises(cpb_mod.CalibrationError, match="4xL2"):
-        cpb_mod.time_calibration_calls(
-            lambda: pytest.fail("must not measure warm"), [()], torch.device("cuda:1")
-        )
+    try:
+        with pytest.raises(cpb_mod.CalibrationError, match="4xL2"):
+            cpb_mod.time_calibration_calls(
+                lambda: pytest.fail("must not measure warm"),
+                [()],
+                torch.device("cuda:1"),
+            )
+    except RuntimeError as error:
+        pytest.fail(f"eviction failure escaped: {error}", pytrace=False)
     assert fake_cuda["current"] == 0
 
 
@@ -1950,6 +2004,19 @@ def test_refine_nvfp4_merges_exact_token_entry(store, monkeypatch):
     assert native.refine_nvfp4(store, tokens=65, **fields) is None
     assert not calls
 
+    with monkeypatch.context() as patch:
+        patch.setattr(native, "_eligible", lambda *args: (True, True))
+        patch.setattr(native, "_plan_memo", {})
+        patch.setattr(
+            native.AutoTuner,
+            "get",
+            lambda: SimpleNamespace(
+                is_tuning_mode=True,
+                _get_skip_ops_stack=lambda: [{"sparse_mla_sm120_nvfp4"}],
+            ),
+        )
+        selected = native.plan_nvfp4_sparse_mla_sm120(5, device=store, **fields)
+        assert selected.cpb == 1 and calls == []
     entry = native.refine_nvfp4(store, tokens=5, **fields)
     assert calls == [5]
     assert entry["provenance"] == "refined" and entry["cpb"] == 3
@@ -2022,6 +2089,17 @@ def test_profile_selection_refines_exact_tokens_in_tuning(
         False,
         0,
     )
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            policy.AutoTuner,
+            "get",
+            lambda: SimpleNamespace(
+                is_tuning_mode=True,
+                _get_skip_ops_stack=lambda: [{"sparse_mla_sm120"}],
+            ),
+        )
+        assert policy.profile_selection(m, store, "fp8").cpb == 1
+        assert refined == []
     selected = policy.profile_selection(m, store, "fp8")
     assert refined == [5]
     assert selected.variant == 1 and selected.cpb == 3
@@ -2216,3 +2294,218 @@ def test_ordinary_fallback_does_not_start_legacy_measurement(store, monkeypatch)
         cpb_mod, "calibrate", lambda *args: pytest.fail("legacy measurement")
     )
     assert policy._resolve_cpb(store, "dsv4_1", 5, 16, 128, 0) == -1
+
+
+@pytest.mark.parametrize("pool_kind", ["profile_fp8", "profile_fp4", "nvfp4"])
+def test_profile_pool_initialization_releases_before_retry(
+    monkeypatch, accelerator_error, pool_kind
+):
+    import weakref
+    from flashinfer.mla._sparse_mla_sm120 import _api, _dsv4_nvfp4
+
+    device = torch.device("cpu")
+    facts = {"bytes_per_token": 8, "fp4_bytes_per_token": 8, "query_dim": 8}
+    monkeypatch.setattr(cpb_mod, "format_info", lambda *args: facts)
+    monkeypatch.setattr(native, "dsv4_nvfp4_format_info", lambda: facts)
+    monkeypatch.setattr(cpb_mod, "_check_pool_capacity", lambda *args: None)
+    monkeypatch.setattr(cpb_mod, "_POOL_BYTES_MIN", 1024)
+    monkeypatch.setattr(native, "_POOL_BYTES_TARGET", 4096)
+    monkeypatch.setattr(native, "_POOL_BYTES_MIN", 1024)
+    monkeypatch.setattr(native, "_MIN_POOL_PER_SEGMENT", 512)
+    released, calls, sizes = [], [], []
+    original_empty = torch.empty
+    original_strided = torch.empty_strided
+
+    def allocate(original, *args, **kwargs):
+        tensor = original(*args, **kwargs)
+        released.append(weakref.ref(tensor))
+        sizes.append(tensor.numel())
+        return tensor
+
+    monkeypatch.setattr(
+        torch, "empty", lambda *a, **k: allocate(original_empty, *a, **k)
+    )
+    monkeypatch.setattr(
+        torch, "empty_strided", lambda *a, **k: allocate(original_strided, *a, **k)
+    )
+
+    def empty_cache():
+        assert all(ref() is None for ref in released)
+
+    monkeypatch.setattr(torch.cuda, "empty_cache", empty_cache)
+
+    def initialize(tensor, *args):
+        calls.append(tensor.numel())
+        # Fail in the secondary NVFP4 pool, retaining the successful primary too.
+        if len(calls) == (2 if pool_kind == "nvfp4" else 1):
+            released.append(weakref.ref(tensor))
+            raise accelerator_error()
+        return tensor.to(torch.uint8)
+
+    monkeypatch.setattr(cpb_mod, "_initialize_fp8_pool", initialize)
+    monkeypatch.setattr(_api, "dsv41_fp4_quantize_pack_sparse_mla_cache", initialize)
+    monkeypatch.setattr(_dsv4_nvfp4, "nvfp4_quantize_pack_sparse_mla_cache", initialize)
+    try:
+        if pool_kind == "nvfp4":
+            main, _, extra, _ = native._allocate_calibration_pools(
+                device, 64, 128, 128, 64
+            )
+            assert main.numel() == extra.numel() == 1024
+            assert sizes == [2048, 2048, 1024, 1024]
+        else:
+            result, _ = cpb_mod._profile_pool(
+                cpb_mod._OrdinaryRequest(16, 128),
+                device,
+                64,
+                4096,
+                pool_kind == "profile_fp4",
+            )
+            assert result.numel() == 2048 and sizes == [4096, 2048]
+    except RuntimeError as error:
+        pytest.fail(f"pool did not recover: {error}", pytrace=False)
+
+
+@pytest.fixture
+def analytical_format(monkeypatch):
+    monkeypatch.setattr(cpb_mod, "_BYTES_PER_TOKEN", {"dsv4": 584})
+    monkeypatch.setattr(cpb_mod, "_CHUNK_WIDTH", {"dsv4": 64})
+
+
+@pytest.mark.parametrize("second_pass", [True, False])
+def test_calibrate_remeasures_bad_fit_once_reusing_pool(
+    monkeypatch, analytical_format, second_pass
+):
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(multi_processor_count=148, L2_cache_size=0),
+    )
+    pool = Mock(return_value=(object(), 4096))
+    module = Mock(return_value=object())
+    builder = Mock(return_value=lambda *args: args)
+    monkeypatch.setattr(cpb_mod, "_allocate_kv_pool", pool)
+    monkeypatch.setattr(cpb_mod, "_make_decode_call_builder", builder)
+    reference = replace(_C, inv_bw=5e-13, inv_rsm=1.5e-10, c0=6e-6)
+    good = [
+        predict_time_s(t, h, k, 0, c, reference) for t, h, k, c in cpb_mod._MEASUREMENTS
+    ]
+    bad = [good[i] * (100 if i == 0 else 1) for i in range(6)]
+    samples = iter(bad + (good if second_pass else bad))
+    timer = Mock(side_effect=lambda *args: next(samples))
+    monkeypatch.setattr(cpb_mod, "_time_call_fresh_indices", timer)
+    if second_pass:
+        result = cpb_mod.calibrate(module, "dsv4", torch.device("cpu"))
+        predictions = [
+            predict_time_s(t, h, k, 0, c, result)
+            for t, h, k, c in cpb_mod._MEASUREMENTS
+        ]
+        assert predictions == pytest.approx(good, rel=1e-3)
+    else:
+        with pytest.raises(cpb_mod.CalibrationError, match="relative rms residual"):
+            cpb_mod.calibrate(module, "dsv4", torch.device("cpu"))
+    assert timer.call_count == 12
+    pool.assert_called_once()
+    module.assert_called_once()
+    builder.assert_called_once()
+
+
+def test_calibrate_does_not_retry_launch_failure(monkeypatch, analytical_format):
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda d: SimpleNamespace(multi_processor_count=148),
+    )
+    monkeypatch.setattr(cpb_mod, "_allocate_kv_pool", lambda *a: (object(), 4096))
+    monkeypatch.setattr(
+        cpb_mod, "_make_decode_call_builder", lambda *a: lambda *a: None
+    )
+    timer = Mock(side_effect=RuntimeError("launch failed"))
+    monkeypatch.setattr(cpb_mod, "_time_call_fresh_indices", timer)
+    with pytest.raises(RuntimeError, match="launch failed"):
+        cpb_mod.calibrate(lambda: object(), "dsv4", torch.device("cpu"))
+    timer.assert_called_once()
+
+
+def test_pool_allocation_limits_and_non_oom_propagation(
+    monkeypatch, accelerator_error, analytical_format
+):
+    monkeypatch.setattr(cpb_mod, "_POOL_BYTES_TARGET", 4096)
+    monkeypatch.setattr(cpb_mod, "_POOL_BYTES_MIN", 1024)
+    monkeypatch.setattr(native, "_POOL_BYTES_TARGET", 4096)
+    monkeypatch.setattr(native, "_POOL_BYTES_MIN", 1024)
+    monkeypatch.setattr(cpb_mod, "_check_pool_capacity", lambda *args: None)
+    monkeypatch.setattr(cpb_mod, "format_info", lambda *args: {"bytes_per_token": 8})
+    request = cpb_mod._OrdinaryRequest(16, 128)
+    device = torch.device("cpu")
+    for name, target, call in [
+        ("empty", torch, lambda: cpb_mod._allocate_kv_pool("dsv4", device)),
+        (
+            "empty_strided",
+            torch,
+            lambda: cpb_mod._profile_pool(request, device, 64, 4096, False),
+        ),
+        (
+            "_allocate_cache_pool",
+            native,
+            lambda: native._allocate_calibration_pools(device, 64, 128, 0, 0),
+        ),
+    ]:
+        with monkeypatch.context() as patch:
+            allocations = []
+            code = [2]
+
+            def fail(*args, **kwargs):
+                allocations.append(args)
+                raise accelerator_error(code[0])
+
+            patch.setattr(target, name, fail)
+            empty = Mock()
+            patch.setattr(torch.cuda, "empty_cache", empty)
+            try:
+                with pytest.raises(cpb_mod.CalibrationError):
+                    call()
+            except RuntimeError as error:
+                pytest.fail(f"unclassified allocation failure: {error}", pytrace=False)
+            assert len(allocations) == 3 and empty.call_count == 2
+            code[0] = 700
+            with pytest.raises(torch.AcceleratorError) as caught:
+                call()
+            assert caught.value.error_code == 700
+            assert len(allocations) == 4 and empty.call_count == 2
+
+
+def test_eviction_non_oom_propagates(fake_cuda, monkeypatch, accelerator_error):
+    error = accelerator_error(700)
+    monkeypatch.setattr(torch, "randint", Mock(side_effect=error))
+    with pytest.raises(torch.AcceleratorError) as caught:
+        cpb_mod.time_calibration_calls(
+            lambda: pytest.fail("must not launch"), [()], torch.device("cuda:1")
+        )
+    assert caught.value is error
+
+
+def test_public_fit_failure_retains_new_profile_and_explicit_retry(
+    store, monkeypatch, ordinary_format_facts
+):
+    measured = Mock(
+        side_effect=lambda request, device: {
+            "request": request.effective,
+            "buckets": {str(t): {"variant": 0, "cpb": 2} for t in cpb_mod._PROFILE_T},
+        }
+    )
+    monkeypatch.setattr(cpb_mod, "_measure_ordinary", measured)
+    fit = Mock(side_effect=cpb_mod.CalibrationError("relative rms residual 0.400"))
+    monkeypatch.setattr(cpb_mod, "calibrate", fit)
+    kwargs = dict(families=("dsv4",), heads=(16,), topks=(128,))
+    first = cpb_mod.calibrate_sparse_mla_sm120(store, **kwargs)
+    assert first.failed and first.entries_calibrated == 1
+    request = cpb_mod._OrdinaryRequest(16, 128, family="dsv4")
+    assert cpb_mod.get_ordinary_profile(request, store)["buckets"]["4"]["cpb"] == 2
+    fit.side_effect = None
+    fit.return_value = _C
+    second = cpb_mod.calibrate_sparse_mla_sm120(store, **kwargs)
+    assert not second.failed and second.entries_skipped == 1
+    assert second.constants_calibrated == ("dsv4",)
+    assert fit.call_count == 2 and measured.call_count == 1

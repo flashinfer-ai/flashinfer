@@ -425,7 +425,9 @@ def _allocate_calibration_pools(
             else:
                 extra_slots = 0
             return primary_cache, primary_slots, extra_cache, extra_slots
-        except torch.cuda.OutOfMemoryError:
+        except RuntimeError as error:
+            if not _cpb._is_cuda_oom(error):
+                raise
             del primary_cache, extra_cache
             if total_bytes <= _POOL_BYTES_MIN:
                 raise CalibrationError(
@@ -433,7 +435,7 @@ def _allocate_calibration_pools(
                     "sparse-MLA calibration"
                 ) from None
             total_bytes //= 2
-            torch.cuda.empty_cache()
+        torch.cuda.empty_cache()
 
 
 def _make_index_sets(
@@ -707,8 +709,21 @@ def calibrate_nvfp4_sparse_mla_sm120(
     """Calibrate one exact NVFP4 sparse-MLA shape family on an idle GPU.
 
     This is intentionally kept in the internal module while the cache ABI and
-    public calibration surface are under upstream review.  Normal serving
-    warmup invokes it lazily inside ``autotune(True)``.
+    public calibration surface are under upstream review. Normal serving
+    warmup invokes it lazily inside ``autotune(True)``. To avoid calibration
+    competing with startup memory profiling, stop serving, run this in a
+    separate process on an idle GPU, check the report's ``persisted`` field,
+    and exit that process before service startup. In service warmup use
+    ``autotune(True, skip_ops={"sparse_mla_sm120_nvfp4"})`` to consume cached
+    profiles without new measurement or off-grid token refinement. Use the
+    same cache directory and target device. Ordinary eager scratch allocations
+    remain; concurrent GPU work can still contaminate calibration measurements.
+
+    This API is for NVFP4 KV, not merely NVFP4 model weights. The profile key
+    includes the device and this call's shape/cache/presence configuration.
+    Old schema or timing-protocol caches are not reused. Explicit calls retry
+    missing or failed configurations; ``force=True`` re-measures present ones,
+    retaining old profiles if measurement raises.
     """
     device = torch.device(device)
     if torch.cuda.is_current_stream_capturing():
