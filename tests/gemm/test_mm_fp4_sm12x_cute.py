@@ -295,6 +295,8 @@ def test_sm121_defaults_preserve_other_devices_and_unmeasured_shapes():
         )
         assert not policy.compatible(m, n, k, expected, compute_capability=(12, 0))
     larger = [
+        ((512, 8192, 4096), ("cooperative", 128, 64, 256)),
+        ((1024, 7168, 4608), ("raw", 64, 32, 8, False, True, 256, True)),
         ((512, 8192, 8192), ("cooperative", 128, 64, 256)),
         ((512, 8192, 7168), ("cooperative", 128, 64, 256)),
         ((1024, 9216, 7168), ("raw", 64, 32, 8, False, True, 256, True)),
@@ -308,6 +310,7 @@ def test_sm121_defaults_preserve_other_devices_and_unmeasured_shapes():
         ((256, 5120, 17408), ("cooperative", 128, 128, 256)),
         ((512, 34816, 5120), ("cooperative", 128, 128, 256)),
         ((512, 5120, 17408), ("cooperative", 128, 64, 256)),
+        ((1024, 34816, 5120), ("cooperative", 256, 128, 128)),
         ((1024, 5120, 17408), ("raw", 64, 32, 8, False, True, 256, True)),
     ]
     for shape, preferred in larger:
@@ -329,7 +332,16 @@ def test_sm121_defaults_preserve_other_devices_and_unmeasured_shapes():
         for m in [17, 31, 33, 63, 65, 127, 129, 257, 513, 1025]
         for n, k in [(34816, 5120), (5120, 17408)]
     ]
-    neighbors += [(1024, 34816, 5120)]
+    neighbors += [
+        (256, 8192, 4096),
+        (1024, 8192, 4096),
+        (512, 8320, 4096),
+        (512, 8192, 4352),
+        (512, 7168, 4608),
+        (2048, 7168, 4608),
+        (1024, 7296, 4608),
+        (1024, 7168, 4864),
+    ]
     neighbors += [
         (256, 8192, 8192),
         (1024, 8192, 8192),
@@ -403,6 +415,8 @@ def test_sm121_defaults_preserve_other_devices_and_unmeasured_shapes():
         (1024, 9216, 7168),
         (512, 8192, 8192),
         (512, 8192, 7168),
+        (512, 8192, 4096),
+        (1024, 7168, 4608),
     ],
 )
 def test_sm121_measured_default_public_graph_and_cached_choice(m, n, k, monkeypatch):
@@ -411,6 +425,7 @@ def test_sm121_measured_default_public_graph_and_cached_choice(m, n, k, monkeypa
         pytest.skip("New defaults are qualified only on SM121")
     _, operands = make_inputs(m, n, k, 42)
     alpha = torch.tensor(1.25, dtype=torch.float32, device="cuda")
+    torch.cuda.synchronize()
     expected = mm_fp4(*operands, alpha, backend="cutlass")
     out = torch.empty_like(expected)
     runner, tuner = get_runner(), AutoTuner.get()
@@ -446,11 +461,13 @@ def test_sm121_measured_default_public_graph_and_cached_choice(m, n, k, monkeypa
         with torch.cuda.graph(graph):
             mm_fp4(*operands, alpha, out=out, backend="cute-dsl")
         _, changed = make_inputs(m, n, k, 123)
+        reference_alpha = torch.tensor(-0.75, dtype=torch.float32, device="cuda")
+        torch.cuda.synchronize()
+        changed_expected = mm_fp4(*changed, reference_alpha, backend="cutlass")
         for live, update in zip(operands, changed, strict=True):
             live.copy_(update)
-        alpha.fill_(-0.75)
-        changed_expected = mm_fp4(*operands, alpha, backend="cutlass")
         out.fill_(float("nan"))
+        alpha.fill_(-0.75)
         graph.replay()
         _assert_bits(out, changed_expected)
         # The new default does not silently migrate an existing cached choice.
