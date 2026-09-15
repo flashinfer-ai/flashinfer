@@ -135,6 +135,8 @@ __device__ __forceinline__ void wait_ge(int* ptr, int target_val, int thread_idx
 
 // ==================== Multi-CTA Radix Top-K Mask Logits ====================
 
+constexpr uint32_t RADIX_TOPK_MAX_DETERMINISTIC_CTAS_PER_GROUP = 256;
+
 // Global state for multi-CTA radix reduction (one per group)
 struct RadixRowState {
   uint32_t histogram[3][256];  // Triple-buffered histograms for 1-barrier-per-round
@@ -142,10 +144,14 @@ struct RadixRowState {
   uint32_t prefix;             // Accumulated prefix (high bits of k-th element)
   int arrival_counter;         // For inter-CTA synchronization
   int output_counter;          // For collecting top-k indices (RadixTopK)
-  float sum_topk;              // For RenormProb: sum of top-k elements
+  // For RenormProb: each CTA of the group deposits its partial sum of the kept
+  // elements here; after the group barrier every CTA reduces the slots in index
+  // order, so the normalizer is bit-identical across CTAs and across launches.
+  // (A float atomicAdd here made the renormalized probabilities differ in the
+  // last bits from call to call, which desynchronizes tensor-parallel ranks
+  // that each run the kernel on identical input.)
+  float cta_sum_topk[RADIX_TOPK_MAX_DETERMINISTIC_CTAS_PER_GROUP];
 };
-
-constexpr uint32_t RADIX_TOPK_MAX_DETERMINISTIC_CTAS_PER_GROUP = 256;
 
 struct RadixDeterministicCollectScratch {
   uint32_t gt_count[RADIX_TOPK_MAX_DETERMINISTIC_CTAS_PER_GROUP];
@@ -1850,22 +1856,19 @@ __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKRenormProbKernel_Multi
       __syncthreads();
 
       if constexpr (!SINGLE_CTA) {
-        // Multi-CTA: atomic add to global sum
+        // Multi-CTA: deposit this CTA's partial sum in its own slot, then reduce
+        // the slots in a fixed order on every CTA. Unlike a float atomicAdd this
+        // is deterministic: the result does not depend on CTA arrival order.
         if (tx == 0) {
-          if (cta_in_group == 0) {
-            state->sum_topk = 0.0f;  // First CTA initializes
-          }
+          state->cta_sum_topk[cta_in_group] = block_sum;
         }
-        // Barrier for initialization
-        AdvanceRadixGroupBarrier(state, barrier_phase, ctas_per_group, tx);
-
-        if (tx == 0 && block_sum > 0) {
-          atomicAdd(&state->sum_topk, block_sum);
-        }
-
         // Barrier to ensure all CTAs have contributed
         AdvanceRadixGroupBarrier(state, barrier_phase, ctas_per_group, tx);
-        normalizer = math::ptx_rcp(max(state->sum_topk, 1e-8f));
+        float group_sum = 0.0f;
+        for (uint32_t c = 0; c < ctas_per_group; ++c) {
+          group_sum += state->cta_sum_topk[c];
+        }
+        normalizer = math::ptx_rcp(max(group_sum, 1e-8f));
       } else {
         // Single-CTA: use block_sum directly
         if (tx == 0) {
@@ -1945,22 +1948,19 @@ __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKRenormProbKernel_Multi
     __syncthreads();
 
     if constexpr (!SINGLE_CTA) {
-      // Multi-CTA: atomic add to global sum
+      // Multi-CTA: deposit this CTA's partial sum in its own slot, then reduce
+      // the slots in a fixed order on every CTA. Unlike a float atomicAdd this
+      // is deterministic: the result does not depend on CTA arrival order.
       if (tx == 0) {
-        if (cta_in_group == 0) {
-          state->sum_topk = 0.0f;  // First CTA initializes
-        }
+        state->cta_sum_topk[cta_in_group] = block_sum;
       }
-      // Barrier for initialization
-      AdvanceRadixGroupBarrier(state, barrier_phase, ctas_per_group, tx);
-
-      if (tx == 0 && block_sum > 0) {
-        atomicAdd(&state->sum_topk, block_sum);
-      }
-
       // Barrier to ensure all CTAs have contributed
       AdvanceRadixGroupBarrier(state, barrier_phase, ctas_per_group, tx);
-      normalizer = math::ptx_rcp(max(state->sum_topk, 1e-8f));
+      float group_sum = 0.0f;
+      for (uint32_t c = 0; c < ctas_per_group; ++c) {
+        group_sum += state->cta_sum_topk[c];
+      }
+      normalizer = math::ptx_rcp(max(group_sum, 1e-8f));
     } else {
       // Single-CTA: use block_sum directly
       if (tx == 0) {
@@ -2036,6 +2036,10 @@ cudaError_t RadixTopKRenormProbMultiCTA(DType* probs, DType* renormed_prob, IdTy
 
   const uint32_t smem_size = fixed_smem_aligned + chunk_size * sizeof(OrderedType);
   const bool single_cta = (ctas_per_group == 1);
+  if (!single_cta && ctas_per_group > RADIX_TOPK_MAX_DETERMINISTIC_CTAS_PER_GROUP) {
+    // RadixRowState::cta_sum_topk holds one partial sum per CTA of the group.
+    return cudaErrorInvalidValue;
+  }
 
   // Calculate number of groups (how many rows to process concurrently)
   uint32_t num_groups = std::min(static_cast<uint32_t>(num_sms) / ctas_per_group, batch_size);
