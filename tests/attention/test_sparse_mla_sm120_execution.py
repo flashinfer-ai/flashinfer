@@ -1030,11 +1030,10 @@ def test_standalone_scratch_type_and_layout_rejected(issue, sm12x):
         _standalone_call(t)
 
 
-def test_standalone_v32_page_size_rejected(sm12x):
+def test_standalone_v32_runtime_page(sm12x):
     t = _standalone_case("v32", 16)
     t["cache"] = t["cache"][:, :32]
-    with pytest.raises(RuntimeError, match="page.*64"):
-        _standalone_call(t, "v32")
+    _standalone_call(t, "v32")
 
 
 def test_scratch_rebind_uses_dense_prefix():
@@ -1129,3 +1128,111 @@ def test_dsv4_integer_pages_graph_and_alignment(tokens, heads, full, sm12x):
     bad = torch.empty(2, 3, 1, 584, device="cuda", dtype=torch.uint8)
     with pytest.raises((ValueError, RuntimeError), match="16B-aligned"):
         wrapper.run(q, bad, idx, out, 512**-0.5)
+
+
+@pytest.mark.parametrize("page", [3, 96])
+def test_v32_page_gap_overrides_prefill_crossover(page, monkeypatch, sm12x):
+    from flashinfer.mla import SparseMLASm120Wrapper
+    from flashinfer.mla._sparse_mla_sm120 import _calibration, _policy
+    from flashinfer.mla._sparse_mla_sm120 import _sparse_mla_sm120_paged_attention
+    from tests.attention.sparse_mla_test_utils import (
+        quantize_kv_dsv3_2,
+        dequantize_kv_dsv3_2,
+        _ref_sparse_attn,
+    )
+
+    torch.manual_seed(418)
+    packed = quantize_kv_dsv3_2(
+        torch.randn(4, page, 1, 576, device="cuda", dtype=torch.bfloat16) * 0.1
+    )
+    pitch = page * 672 + 16
+    cache = torch.empty_strided(
+        (4, page, 1, 672), (pitch, 672, 672, 1), device="cuda", dtype=torch.uint8
+    )
+    cache.fill_(255)
+    cache[..., :656].copy_(packed)
+    q = torch.randn(2, 64, 576, device="cuda", dtype=torch.bfloat16) * 0.1
+    idx = torch.randint(0, 4 * page, (2, 128), device="cuda", dtype=torch.int32)
+    idx[:, 3] = -1
+    expected, el = _ref_sparse_attn(
+        q, dequantize_kv_dsv3_2(packed), idx, 576**-0.5, 512
+    )
+    out = torch.empty(2, 64, 512, device="cuda", dtype=torch.bfloat16)
+    lse = torch.empty(2, 64, device="cuda")
+    mid = torch.empty(2, 64, 2, 512, device="cuda", dtype=torch.bfloat16)
+    mlse = torch.empty(2, 64, 2, device="cuda")
+    monkeypatch.setattr(_calibration, "get_decode_max_tokens", lambda *args: 0)
+    assert (
+        _policy.plan(2, 64, 128, 0, page, False, 0, q.device).variant
+        != _policy.KernelVariant.DECODE_SPLITK
+    )
+    wrapper = SparseMLASm120Wrapper()
+    for functional in [False, True]:
+
+        def call():
+            if functional:
+                _sparse_mla_sm120_paged_attention(
+                    q, cache, idx, out, lse, 576**-0.5, mid_out=mid, mid_lse=mlse
+                )
+            else:
+                wrapper.run(q, cache, idx, out, 576**-0.5, out_lse=lse)
+
+        call()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(out, expected, atol=0.005, rtol=0.05)
+        torch.testing.assert_close(lse, el, atol=0.02, rtol=0.02)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            call()
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(out, expected, atol=0.005, rtol=0.05)
+
+
+@pytest.mark.parametrize("tokens,page", [(2, 3), (128, 65)])
+def test_dots3_runtime_footer_page(tokens, page, sm12x):
+    from flashinfer.mla import SparseMLASm120Wrapper
+    from tests.attention.sparse_mla_test_utils import (
+        quantize_kv_dots3_swa,
+        dequantize_kv_dots3_swa,
+        _ref_sparse_attn,
+    )
+
+    torch.manual_seed(671)
+    packed = quantize_kv_dots3_swa(
+        torch.randn(4, page, 1, 1088, device="cuda", dtype=torch.bfloat16) * 0.1
+    )
+    virtual = dequantize_kv_dots3_swa(packed)
+    pitch = (page * 1160 + 15) // 16 * 16
+    cache = torch.empty_strided(
+        (4, page, 1, 1160), (pitch, 1160, 1160, 1), device="cuda", dtype=torch.uint8
+    )
+    cache.copy_(packed)
+    raw = cache.as_strided((4, page * 1160), (pitch, 1))
+    raw[0, :1152] = 255
+    raw[0, page * 1152 : page * 1152 + 8] = 255
+    q = torch.randn(tokens, 8, 1088, device="cuda", dtype=torch.bfloat16) * 0.1
+    idx = torch.randint(1, 4 * page, (tokens, 576), device="cuda", dtype=torch.int32)
+    idx[:, 3] = -1
+    idx[:, 513:] = 2147483647
+    ref_idx = idx.clone()
+    ref_idx[:, 513:] = -1
+    expected, el = _ref_sparse_attn(q, virtual, ref_idx, 1088**-0.5, 1024)
+    out = torch.empty(tokens, 8, 1024, device="cuda", dtype=torch.bfloat16)
+    lse = torch.empty(tokens, 8, device="cuda")
+    wrapper = SparseMLASm120Wrapper(d_v=1024)
+
+    def call():
+        wrapper.run(q, cache, idx, out, 1088**-0.5, out_lse=lse)
+
+    call()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, expected, atol=0.005, rtol=0.05)
+    torch.testing.assert_close(lse, el, atol=0.02, rtol=0.02)
+    saved = out.clone()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        call()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, saved)

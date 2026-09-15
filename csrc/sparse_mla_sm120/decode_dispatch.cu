@@ -14,8 +14,10 @@ cudaError_t dispatch_decode(const execution::AttentionParams& params,
 #define MODEL(M)                                                                                \
   if (mt == ModelType::M)                                                                       \
     return execution::visit_decode_heads<ModelType::M>(plan.specialized_heads, [&](auto head) { \
-      return execution::launch_decode<ModelType::M, decltype(head)::value,                      \
-                                      execution::FixedPageSize>(params, plan, stream);          \
+      return execution::launch_decode<                                                          \
+          ModelType::M, decltype(head)::value,                                                  \
+          (ModelType::M == ModelType::DOTS3_SWA ? 0 : execution::FixedPageSize)>(params, plan,  \
+                                                                                 stream);       \
     });
   if (mt == ModelType::DSV4)
     return execution::visit_decode_heads<ModelType::DSV4>(plan.specialized_heads, [&](auto head) {

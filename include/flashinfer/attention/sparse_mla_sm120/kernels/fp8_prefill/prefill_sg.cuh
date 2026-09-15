@@ -65,7 +65,8 @@ using flashinfer::sparse_mla_sm120::pipeline::SlotRelease;
 //   QkMode:              QkComputeMode (FP8 / BF16) for the QK MMA; XV is always FP8
 //   NUM_HEADS:       8, 16, 32, 64, 128 (NUM_HEADS < HPB=16 zero-pads + gates;
 //                    NUM_HEADS > HPB replicates one CTA per 16-head tile)
-//   PAGE_BLOCK_SIZE: 64; DSV4_1 gathers instead use cold's runtime page sizes.
+//   PAGE_BLOCK_SIZE: footer geometry; inline models use cold's runtime row stride.
+//                    DSV4_1 gathers use cold's runtime page sizes.
 //
 // topk is runtime (cold.topk): the indices row width, a whole number of
 // PrefillTileCfg<MT>::BI candidate tiles.
@@ -127,7 +128,13 @@ __device__ __forceinline__ void sparse_mla_prefill_math_pc(
   using KvFree = Fp8PrefillSync::KvFree<Cfg::IO_THREADS, Cfg::MATH_THREADS>;
 
   const float sm_scale = cold.sm_scale;
-  const size_t page_stride_bytes = cold.page_stride_bytes;
+  const size_t kv_stride_bytes = cold.kv_stride_bytes;
+  const PageGeom pg = [&]() {
+    if constexpr (PAGE_BLOCK_SIZE == 0)
+      return page_geom(cold.page_block_size, KVIOTraits<MT>::IO_STRIDE, cold.main_div);
+    else
+      return PageGeom{};
+  }();
   const int topk = cold.topk;
   const int extra_len = prefill_extra_length(cold, s_i);
   const int actual_ni = (topk_len + Cfg::BI - 1) / Cfg::BI + (extra_len + Cfg::BI - 1) / Cfg::BI;
@@ -197,7 +204,7 @@ __device__ __forceinline__ void sparse_mla_prefill_math_pc(
       mask1_cur = mask1_nxt;
 
       const uint8_t* entry_base_gid =
-          prefill_kv_entry_base<MT, PAGE_BLOCK_SIZE>(KV_cache, idx_rope, page_stride_bytes);
+          prefill_kv_entry_base<MT, PAGE_BLOCK_SIZE>(KV_cache, idx_rope, kv_stride_bytes, pg);
       KVRopePrefetch<MT> rope_pf = prefetch_kv_rope<MT>(
           reinterpret_cast<const bf16*>(entry_base_gid + KV::KV_ROPE_GMEM_OFFSET), lane);
 
@@ -514,7 +521,13 @@ __global__ void __launch_bounds__((Fp8PrefillResources<MT, QkMode, GatherSchedul
                               __grid_constant__ const PrefillColdParams cold) {
   const float sm_scale = cold.sm_scale;
   const int num_tokens = cold.num_tokens;
-  const size_t page_stride_bytes = cold.page_stride_bytes;
+  const size_t kv_stride_bytes = cold.kv_stride_bytes;
+  const PageGeom pg = [&]() {
+    if constexpr (PAGE_BLOCK_SIZE == 0)
+      return page_geom(cold.page_block_size, KVIOTraits<MT>::IO_STRIDE, cold.main_div);
+    else
+      return PageGeom{};
+  }();
   using KV = KVCacheTraits<MT>;
   using Cfg = PrefillTileCfg<MT>;
   // CT pinned to FP8: XV always uses FP8 W; QkMode only flips the QK side.
@@ -625,11 +638,11 @@ __global__ void __launch_bounds__((Fp8PrefillResources<MT, QkMode, GatherSchedul
     auto issue_tile = [&](int t, int staged) {
       const int buf = t & 1;
       io_gather_scales<MT, PAGE_BLOCK_SIZE, Cfg::BI, Cfg::IO_THREADS>(
-          sm.kv_scale_bufs[buf], staged, KV_cache, io_tid, page_stride_bytes);
+          sm.kv_scale_bufs[buf], staged, KV_cache, io_tid, kv_stride_bytes, pg);
       __threadfence_block();
       io_bulk_gather_tile<MT, PAGE_BLOCK_SIZE, Cfg::L2_EVICT_FIRST, Cfg::BI, Cfg::IO_THREADS>(
-          sm.kv_bufs[buf], staged, KV_cache, sm.mbar_kv + buf, io_tid, page_stride_bytes,
-          kv_l2_policy);
+          sm.kv_bufs[buf], staged, KV_cache, sm.mbar_kv + buf, io_tid, kv_stride_bytes,
+          kv_l2_policy, pg);
     };
 
     int staged = load_idx(0);
@@ -645,7 +658,7 @@ __global__ void __launch_bounds__((Fp8PrefillResources<MT, QkMode, GatherSchedul
         const int next = load_idx(ti + 3);
         // Warm L2 for tile ti+2; its index LDG was issued an iteration ago.
         io_bulk_prefetch_l2<MT, PAGE_BLOCK_SIZE, Cfg::L2_EVICT_FIRST, Cfg::BI, Cfg::IO_THREADS>(
-            pf, KV_cache, io_tid, page_stride_bytes, kv_l2_policy);
+            pf, KV_cache, io_tid, kv_stride_bytes, kv_l2_policy, pg);
         issue_tile(ti + 1, staged);
         staged = pf;
         pf = next;
@@ -727,7 +740,7 @@ __global__ void __launch_bounds__((Fp8PrefillResources<MT, QkMode, GatherSchedul
         // Only this lane's own entry is needed for the QK rope prefetch — the
         // XV rope MMA re-derives its addresses from `ib` inside xv_rope_mma.
         const uint8_t* entry_base_gid =
-            prefill_kv_entry_base<MT, PAGE_BLOCK_SIZE>(KV_cache, idx_rope, page_stride_bytes);
+            prefill_kv_entry_base<MT, PAGE_BLOCK_SIZE>(KV_cache, idx_rope, kv_stride_bytes, pg);
 
         KVRopePrefetch<MT> rope_pf = prefetch_kv_rope<MT>(
             reinterpret_cast<const bf16*>(entry_base_gid + KV::KV_ROPE_GMEM_OFFSET), lane);
@@ -996,9 +1009,9 @@ __global__ void __launch_bounds__((Fp8PrefillResources<MT, QkMode, GatherSchedul
         static_assert(Cfg::BI == BI && Cfg::MATH_WARPS == N_MATH_WARPS,
                       "xv_rope_mma is hardcoded to the 64/8 tile; parameterize it before running a "
                       "V_HAS_ROPE model at a different BI");
-        xv_rope_mma<MT, PAGE_BLOCK_SIZE>(
-            acc_rope, w0, w1, w2, w3, ib, min(Cfg::BI, topk_len - ti * Cfg::BI), KV_cache, mwarp,
-            lane, page_stride_bytes, reinterpret_cast<bf16*>(sm.w_fp8));
+        xv_rope_mma<MT, PAGE_BLOCK_SIZE>(acc_rope, w0, w1, w2, w3, ib,
+                                         min(Cfg::BI, topk_len - ti * Cfg::BI), KV_cache, mwarp,
+                                         lane, kv_stride_bytes, reinterpret_cast<bf16*>(sm.w_fp8));
       }
 
       Fp8PrefillSync::KvFree<Cfg::IO_THREADS, Cfg::MATH_THREADS>::release(ti & 1);

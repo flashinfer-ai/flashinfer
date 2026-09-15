@@ -280,7 +280,6 @@ void SparseMlaSm120DecodeDsv3_2(TensorView q, TensorView kv_cache, TensorView in
 
   const PagedKVLayout kv_layout =
       parse_paged_kv_layout(kv_cache, bytes_per_token(mt), /*inline_scale=*/true, "kv_cache");
-  TVM_FFI_ICHECK_EQ(kv_layout.page_block_size, 64) << "decode-v32 requires page_block_size=64";
 
   const int* topk_len_ptr =
       topk_length.has_value() ? static_cast<const int*>(topk_length.value().data_ptr()) : nullptr;
@@ -302,7 +301,7 @@ void SparseMlaSm120DecodeDsv3_2(TensorView q, TensorView kv_cache, TensorView in
                                               num_heads,
                                               topk,
                                               0,
-                                              64,
+                                              kv_layout.page_block_size,
                                               0,
                                               kv_layout.stride_kv_block,
                                               0,

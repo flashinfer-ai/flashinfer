@@ -13,7 +13,7 @@ using bf16 = __nv_bfloat16;
 struct PrefillColdParams {
   float sm_scale;
   int num_tokens;
-  size_t page_stride_bytes;
+  size_t kv_stride_bytes;  // Inline row stride or footer page stride.
   size_t extra_page_stride_bytes;
   size_t out_lse_stride_elems;
   int topk;

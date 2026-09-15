@@ -4166,13 +4166,7 @@ def test_sparse_mla_sm120_mg_scale_reuse_graph() -> None:
 
 
 def test_sparse_mla_sm120_inline_scale_rejects_padded_block_stride() -> None:
-    """Inline-scale caches with inter-block gaps fail at the entry.
-
-    The prefill kernels address inline-scale caches as a flat token array, so
-    blocks must pack rows back-to-back — and crossover can route any
-    decode-form call there, so the rejection cannot wait for a
-    prefill-routed call.
-    """
+    """Large prefill-only calls cannot consume inline-cache page gaps."""
     q, kv_packed, indices, sm_scale, d_v, _, _ = _make_dsv3_2_prefill_case(
         64, num_tokens=128
     )
@@ -4187,7 +4181,7 @@ def test_sparse_mla_sm120_inline_scale_rejects_padded_block_stride() -> None:
 
     output = torch.zeros(128, 64, d_v, dtype=torch.bfloat16, device=q.device)
     out_lse = torch.zeros(128, 64, dtype=torch.float32, device=q.device)
-    with pytest.raises(ValueError, match="pack rows"):
+    with pytest.raises(ValueError, match="prefill envelope both reject"):
         sparse_mla_sm120_paged_attention(
             q, kv, indices, output, out_lse, sm_scale, d_v=d_v
         )

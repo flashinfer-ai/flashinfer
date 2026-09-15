@@ -41,6 +41,8 @@ cudaError_t launch_decode(const AttentionParams& p, const ExecutionPlan& plan,
     if constexpr (MT == ModelType::DSV4)
       return Dsv4PageDivisors{flashinfer::uint_fastdiv(uint32_t(p.page_size)),
                               flashinfer::uint_fastdiv(uint32_t(p.extra_page_size))};
+    else if constexpr (MT == ModelType::DOTS3_SWA)
+      return flashinfer::uint_fastdiv(uint32_t(p.page_size));
     else
       return p.page_size;
   }();

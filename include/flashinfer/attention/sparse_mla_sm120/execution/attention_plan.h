@@ -14,7 +14,9 @@ namespace flashinfer::sparse_mla_sm120::execution {
 constexpr int DecodeMaxHeads = 128;
 constexpr int FixedPageSize = 64;
 constexpr bool runtime_page(ModelType model) {
-  return model == ModelType::DSV4 || model == ModelType::DSV4_1;
+  return model == ModelType::DSV4 || model == ModelType::DSV4_1 || model == ModelType::DSV3_2 ||
+         model == ModelType::GLM_NSA || model == ModelType::GLM53_NOPE ||
+         model == ModelType::DOTS3_SWA;
 }
 
 constexpr bool main_page_supported(ModelType model, int page) {

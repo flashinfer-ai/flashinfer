@@ -65,7 +65,7 @@ template <ModelType MT>
 __device__ __forceinline__ void io_bulk_gather_tile_swapab(uint8_t* dst, int idx,
                                                            const uint8_t* __restrict__ kv_ptr,
                                                            uint64_t* mbar, int io_tid,
-                                                           size_t stride_kv_block,
+                                                           size_t row_stride_bytes,
                                                            uint64_t cache_policy) {
   constexpr int STRIDE = SmemLayoutSwapAB<MT>::KV_STRIDE;
   static_assert(BI <= IO_THREADS, "per-thread index staging assumes one candidate per IO thread");
@@ -75,11 +75,8 @@ __device__ __forceinline__ void io_bulk_gather_tile_swapab(uint8_t* dst, int idx
   if (io_tid >= BI) return;
 
   // The smem row packs the payload only (KV_STRIDE); the gmem row advance is
-  // the runtime stride, which may be wider than the payload (a legacy 656B
-  // vLLM pool serving a 528B GLM53_NOPE payload). swapAB is only eligible at
-  // page_block_size 64, so the advance is stride_kv_block / 64.
-  const uint8_t* src = idx >= 0 ? kv_ptr + (size_t)idx * inline_row_advance(stride_kv_block, 64)
-                                : sparse_mla_zero_row;
+  // the validated row stride, which may be wider than the payload.
+  const uint8_t* src = idx >= 0 ? kv_ptr + (size_t)idx * row_stride_bytes : sparse_mla_zero_row;
   cp_async_bulk_g2s_l2hint(dst + io_tid * STRIDE, src, STRIDE, mbar, cache_policy);
 }
 
@@ -88,12 +85,11 @@ __device__ __forceinline__ void io_bulk_gather_tile_swapab(uint8_t* dst, int idx
 template <ModelType MT>
 __device__ __forceinline__ void io_bulk_prefetch_l2_swapab(int idx,
                                                            const uint8_t* __restrict__ kv_ptr,
-                                                           int io_tid, size_t stride_kv_block,
+                                                           int io_tid, size_t row_stride_bytes,
                                                            uint64_t cache_policy) {
   constexpr int STRIDE = SmemLayoutSwapAB<MT>::KV_STRIDE;
   if (io_tid >= BI || idx < 0) return;
-  cp_async_bulk_prefetch_l2_hint(kv_ptr + (size_t)idx * inline_row_advance(stride_kv_block, 64),
-                                 STRIDE, cache_policy);
+  cp_async_bulk_prefetch_l2_hint(kv_ptr + (size_t)idx * row_stride_bytes, STRIDE, cache_policy);
 }
 
 template <ModelType MT, int NUM_HEADS>
@@ -161,8 +157,8 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
       // the ring phases rather than falling behind into a retired phase.
       Ring::Free::wait(sm.mbar_wr + buf, wr_phase);
       io_bulk_gather_tile_swapab<MT>(sm.kv_bufs[buf], staged, KV_cache, sm.mbar_kv + buf, io_tid,
-                                     cold.page_stride_bytes, kv_l2_policy);
-      io_bulk_prefetch_l2_swapab<MT>(pf, KV_cache, io_tid, cold.page_stride_bytes, kv_l2_policy);
+                                     cold.kv_stride_bytes, kv_l2_policy);
+      io_bulk_prefetch_l2_swapab<MT>(pf, KV_cache, io_tid, cold.kv_stride_bytes, kv_l2_policy);
       staged = pf;
       pf = next;
       if (buf == 1) wr_phase ^= 1;
