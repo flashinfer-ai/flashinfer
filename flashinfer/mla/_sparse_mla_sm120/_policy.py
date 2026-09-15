@@ -247,7 +247,12 @@ def filter_metadata_selection(
 ) -> Optional[PlannedCall]:
     from ._execution import metadata_candidates
 
-    if metadata.model != _MODEL_TYPE_DSV4_1:
+    inline_page_gap = (
+        metadata.model
+        in (_MODEL_TYPE_DSV3_2, _MODEL_TYPE_GLM_NSA, _MODEL_TYPE_GLM53_NOPE)
+        and metadata.page_stride_bytes != metadata.page_size * metadata.row_stride_bytes
+    )
+    if metadata.model != _MODEL_TYPE_DSV4_1 and not inline_page_gap:
         return selected
     legal = metadata_candidates(metadata, precision, sm_count, max_shared_bytes)
     if selected is not None and int(selected.variant) in legal:

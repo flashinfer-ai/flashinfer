@@ -425,9 +425,8 @@ def test_error_message_names_both_mismatches() -> None:
     assert "num_heads=256 exceeds the decode envelope [1, 128]" in msg
 
 
-def test_error_message_names_page_block_size_mismatch() -> None:
-    """An uninstantiated page size is named; valid pairs are not blamed.
-    dots3_swa has a single fixed page; dsv4 lists its instantiated set."""
+def test_error_message_accepts_runtime_page_block_size() -> None:
+    """Positive runtime pages are not blamed for a dispatch failure."""
     msg = _decode_dispatch_error_message(
         num_tokens=1,
         num_heads=64,
@@ -437,8 +436,10 @@ def test_error_message_names_page_block_size_mismatch() -> None:
         model_type=_MODEL_TYPE_DOTS3_SWA,
         extra_topk=0,
     )
-    assert "page_block_size=32 is unsupported" in msg
-    assert "instantiated only for page_block_size=64" in msg
+    assert "page_block_size=32 is unsupported" not in msg
+    config = supported_sparse_mla_sm120_configs()["dots3_swa"]
+    assert config.page_block_size_is_runtime
+    assert not config.page_block_sizes
     # (num_heads=64, topk=1024) is inside the envelope, so the Mismatch
     # reasons blame neither (the shape summary echo is expected).
     assert "num_heads=64 exceeds" not in msg

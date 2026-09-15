@@ -37,7 +37,7 @@ static bool launch_decode_dsv3_2_impl(int num_heads, int topk, const bf16* Q,
                                       int num_tokens, int num_splits, int chunks_per_block_override,
                                       float sm_scale, size_t stride_kv_block,
                                       size_t stride_indices_token, int stride_kv_row,
-                                      size_t stride_out_lse, cudaStream_t stream) {
+                                      size_t stride_out_lse, int page_size, cudaStream_t stream) {
   using KV = KVCacheTraits<MT>;
   static_assert(KV::D_QK == 576 || (MT == ModelType::GLM53_NOPE && KV::D_QK == 512));
   // NUM_HEADS == 0 is the runtime-head-count instantiation: num_heads (<= 128)
@@ -59,7 +59,7 @@ static bool launch_decode_dsv3_2_impl(int num_heads, int topk, const bf16* Q,
   // Grand total ≈ 98 KB (under 99 KB sm120a carveout, 1 block/SM).
   constexpr int DYN_SMEM_BYTES = Dsv32DecodeSmem<MT>::LAUNCH_BYTES;
 
-  auto kernel = sparse_mla_decode_dsv3_2_kernel<MT, NUM_HEADS, execution::FixedPageSize>;
+  auto kernel = sparse_mla_decode_dsv3_2_kernel<MT, NUM_HEADS>;
   DSV32_CUDA_CHECK(
       cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, DYN_SMEM_BYTES));
 
@@ -72,7 +72,8 @@ static bool launch_decode_dsv3_2_impl(int num_heads, int topk, const bf16* Q,
   dim3 block1(DSV32_BLOCK_THREADS);
   kernel<<<grid1, block1, DYN_SMEM_BYTES, stream>>>(
       Q, KV_cache, indices, mid_out, mid_lse, topk_length, num_tokens, q_heads, topk, num_splits,
-      chunks_per_block, sm_scale, stride_kv_block, stride_indices_token, stride_kv_row);
+      chunks_per_block, sm_scale, stride_kv_block, stride_indices_token, stride_kv_row,
+      flashinfer::uint_fastdiv(uint32_t(page_size)));
   DSV32_CUDA_CHECK(cudaGetLastError());
 
   // Stage 2: reuse decode-dsv4 merge kernel (D_V=512 identical for both).
@@ -98,7 +99,7 @@ cudaError_t dispatch_dsv32_heads(const execution::AttentionParams& p,
         p.num_heads, p.topk, p.q, p.kv, p.indices, p.mid_out, p.mid_lse, p.topk_length, p.output,
         p.out_lse, p.attn_sink, p.num_tokens, p.allocated_splits, plan.cpb, p.sm_scale,
         p.page_stride_bytes, p.indices_stride_elems, plan.metadata.row_stride_bytes,
-        p.out_lse_stride_elems, stream);
+        p.out_lse_stride_elems, plan.metadata.page_size, stream);
     return cudaSuccess;
   });
 }

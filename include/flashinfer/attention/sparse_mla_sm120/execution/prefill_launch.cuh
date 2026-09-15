@@ -149,7 +149,7 @@ PrefillLaunchResult launch_prefill_swapab(const bf16* Q, const uint8_t* KV_cache
                                           bf16* output, float* out_lse, float sm_scale,
                                           int num_tokens, int topk, size_t page_stride_bytes,
                                           size_t out_lse_stride_elems, const int* topk_length_ptr,
-                                          cudaStream_t stream) {
+                                          cudaStream_t stream, const PrefillColdParams& cold) {
   using CT = ComputeTraitsSwapAB<MT>;
   using L = SmemLayoutSwapAB<MT>;
   static_assert(KVCacheTraits<MT>::SCALE_IN_KV_SMEM && KVCacheTraits<MT>::D_NOPE == D_V,
@@ -163,17 +163,6 @@ PrefillLaunchResult launch_prefill_swapab(const bf16* Q, const uint8_t* KV_cache
   static bool configured[kMaxCachedCudaDevices] = {};
   const auto configured_result = configure_dynamic_smem_per_device(kernel, smem_bytes, configured);
   if (configured_result.error != cudaSuccess) return configured_result;
-
-  PrefillColdParams cold{sm_scale,
-                         num_tokens,
-                         page_stride_bytes,
-                         /*extra_page_stride_bytes=*/(size_t)0,
-                         out_lse_stride_elems,
-                         topk,
-                         /*topk_extra=*/0,
-                         attn_sink,
-                         topk_length_ptr,
-                         /*topk_length_extra=*/(const int*)nullptr};
   cudaLaunchConfig_t config{grid, block, smem_bytes, stream, nullptr, 0};
   void* args[] = {(void*)&Q,      (void*)&KV_cache, (void*)&indices, (void*)&attn_sink,
                   (void*)&output, (void*)&out_lse,  (void*)&cold};
@@ -189,7 +178,8 @@ PrefillLaunchResult launch_prefill_mg(const bf16* Q, const uint8_t* KV_cache,
                                       float* out_lse, float sm_scale, int num_tokens, int topk,
                                       size_t page_stride_bytes, size_t out_lse_stride_elems,
                                       const int* topk_length_ptr, cudaStream_t stream,
-                                      int runtime_page_size = PAGE_BLOCK_SIZE) {
+                                      int runtime_page_size = PAGE_BLOCK_SIZE,
+                                      const PrefillColdParams* prepared = nullptr) {
   constexpr size_t smem_bytes = SmemLayoutMG<MT, QkMode>::TOTAL;
   constexpr int MG_HEADS_PER_CTA_LOCAL = MG_N_HG_T * HPB;
   static_assert(NUM_HEADS % MG_HEADS_PER_CTA_LOCAL == 0 || (MG_N_HG_T == 1 && NUM_HEADS < HPB),
@@ -214,6 +204,7 @@ PrefillLaunchResult launch_prefill_mg(const bf16* Q, const uint8_t* KV_cache,
                          topk_length_ptr,
                          /*topk_length_extra=*/(const int*)nullptr};
   cold.page_block_size = runtime_page_size;
+  if (prepared != nullptr) cold = *prepared;
   if constexpr (MT == ModelType::DSV4)
     cold.main_div = flashinfer::uint_fastdiv(uint32_t(runtime_page_size));
   cudaLaunchConfig_t config{grid, block, smem_bytes, stream, nullptr, 0};
@@ -324,57 +315,47 @@ PrefillLaunchResult launch_prefill_mg_dual(const bf16* Q, const uint8_t* KV_cach
 // swapAB (warp specialized, 64 heads/CTA), DSV3_2 family. Any runtime topk
 // width is served (GLM53_NOPE's 2176 folds the 128-token indexer tail into
 // the 2048 sparse selection).
-// swapAB takes no PBS template parameter (the KV stride is runtime), but the
-// envelope is pbs=64 like every other instantiation.
 template <ModelType MT>
-inline PrefillLaunchResult dispatch_v32_swapab(int num_heads, int topk, int page_block_size,
-                                               const bf16* Q, const uint8_t* KV,
-                                               const int32_t* indices, const float* attn_sink,
-                                               bf16* output, float* out_lse, float sm_scale,
-                                               int num_tokens, size_t page_stride_bytes,
-                                               size_t out_lse_stride_elems,
-                                               const int* topk_length_ptr, cudaStream_t stream) {
-  if (page_block_size != execution::FixedPageSize) return false;
+inline PrefillLaunchResult dispatch_v32_swapab(
+    int num_heads, int topk, int page_block_size, const bf16* Q, const uint8_t* KV,
+    const int32_t* indices, const float* attn_sink, bf16* output, float* out_lse, float sm_scale,
+    int num_tokens, size_t page_stride_bytes, size_t out_lse_stride_elems,
+    const int* topk_length_ptr, cudaStream_t stream, const PrefillColdParams& cold) {
+  if (page_block_size <= 0) return false;
   return execution::visit_prefill_heads<MT, 4>(num_heads, [&](auto head) {
     return launch_prefill_swapab<MT, decltype(head)::value>(
         Q, KV, indices, attn_sink, output, out_lse, sm_scale, num_tokens, topk, page_stride_bytes,
-        out_lse_stride_elems, topk_length_ptr, stream);
+        out_lse_stride_elems, topk_length_ptr, stream, cold);
   });
 }
 
-// SG (single-group, 16 heads/CTA). PBS=64 matches the V32 decode
-// (`kernels/dsv32_fp8/decode.cuh`). NH=8 covers small-TP shards; the SG kernel
-// zero-pads invalid head slots up to HPB=16 internally and gates write-back
-// by VALID_HPB.
 template <ModelType MT>
 inline PrefillLaunchResult dispatch_v32_sg(int num_heads, int topk, int page_block_size,
                                            const bf16* Q, const uint8_t* KV, const int32_t* indices,
                                            const float* attn_sink, bf16* output, float* out_lse,
                                            float sm_scale, int num_tokens, size_t page_stride_bytes,
                                            size_t out_lse_stride_elems, const int* topk_length_ptr,
-                                           cudaStream_t stream) {
-  if (page_block_size != execution::FixedPageSize) return false;
+                                           cudaStream_t stream, const PrefillColdParams& cold) {
+  if (page_block_size <= 0) return false;
   return execution::visit_prefill_heads<MT, 1>(num_heads, [&](auto head) {
     return launch_prefill_sg<MT, QkComputeMode::FP8, decltype(head)::value, 64>(
         Q, KV, indices, attn_sink, output, out_lse, sm_scale, num_tokens, topk, page_stride_bytes,
-        out_lse_stride_elems, topk_length_ptr, stream);
+        out_lse_stride_elems, topk_length_ptr, stream, &cold);
   });
 }
 
-// Single-cache MG (multi-group, 32 heads/CTA).
 template <ModelType MT>
 inline PrefillLaunchResult dispatch_v32_mg(int num_heads, int topk, int page_block_size,
                                            const bf16* Q, const uint8_t* KV, const int32_t* indices,
                                            const float* attn_sink, bf16* output, float* out_lse,
                                            float sm_scale, int num_tokens, size_t page_stride_bytes,
                                            size_t out_lse_stride_elems, const int* topk_length_ptr,
-                                           cudaStream_t stream) {
-  if (page_block_size != execution::FixedPageSize) return false;
-
+                                           cudaStream_t stream, const PrefillColdParams& cold) {
+  if (page_block_size <= 0) return false;
   return execution::visit_prefill_heads<MT, 2>(num_heads, [&](auto head) {
     return launch_prefill_mg<MT, QkComputeMode::FP8, decltype(head)::value, 64>(
         Q, KV, indices, attn_sink, output, out_lse, sm_scale, num_tokens, topk, page_stride_bytes,
-        out_lse_stride_elems, topk_length_ptr, stream);
+        out_lse_stride_elems, topk_length_ptr, stream, page_block_size, &cold);
   });
 }
 
@@ -387,19 +368,22 @@ inline PrefillLaunchResult dispatch_v32_mg(int num_heads, int topk, int page_blo
 // 576 is the tightest multiple of the BI=32 tile that covers the window. The
 // window itself is baked into PrefillTilePrimary, so a caller passing no
 // topk_length still gets a correctly bounded scan.
-inline PrefillLaunchResult dispatch_dots3_swa_sg(int num_heads, int topk, int page_block_size,
-                                                 const bf16* Q, const uint8_t* KV,
-                                                 const int32_t* indices, const float* attn_sink,
-                                                 bf16* output, float* out_lse, float sm_scale,
-                                                 int num_tokens, size_t page_stride_bytes,
-                                                 size_t out_lse_stride_elems,
-                                                 const int* topk_length_ptr, cudaStream_t stream) {
-  if (page_block_size != execution::FixedPageSize) return false;
+inline PrefillLaunchResult dispatch_dots3_swa_sg(
+    int num_heads, int topk, int page_block_size, const bf16* Q, const uint8_t* KV,
+    const int32_t* indices, const float* attn_sink, bf16* output, float* out_lse, float sm_scale,
+    int num_tokens, size_t page_stride_bytes, size_t out_lse_stride_elems,
+    const int* topk_length_ptr, cudaStream_t stream, const PrefillColdParams& cold) {
+  if (page_block_size <= 0) return false;
 
   return execution::visit_prefill_heads<ModelType::DOTS3_SWA, 1>(num_heads, [&](auto head) {
-    return launch_prefill_sg<ModelType::DOTS3_SWA, QkComputeMode::FP8, decltype(head)::value, 64>(
+    if (page_block_size == execution::FixedPageSize)
+      return launch_prefill_sg<ModelType::DOTS3_SWA, QkComputeMode::FP8, decltype(head)::value,
+                               execution::FixedPageSize>(
+          Q, KV, indices, attn_sink, output, out_lse, sm_scale, num_tokens, topk, page_stride_bytes,
+          out_lse_stride_elems, topk_length_ptr, stream, &cold);
+    return launch_prefill_sg<ModelType::DOTS3_SWA, QkComputeMode::FP8, decltype(head)::value, 0>(
         Q, KV, indices, attn_sink, output, out_lse, sm_scale, num_tokens, topk, page_stride_bytes,
-        out_lse_stride_elems, topk_length_ptr, stream);
+        out_lse_stride_elems, topk_length_ptr, stream, &cold);
   });
 }
 

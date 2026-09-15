@@ -57,7 +57,7 @@ __device__ __forceinline__ void prefill_mg_impl(
 
   const float sm_scale = cold.sm_scale;
   const int num_tokens = cold.num_tokens;
-  const size_t page_stride_bytes = cold.page_stride_bytes;
+  const size_t kv_stride_bytes = cold.kv_stride_bytes;
   [[maybe_unused]] const size_t extra_page_stride_bytes =
       DUAL_CACHE ? cold.extra_page_stride_bytes : (size_t)0;
   using KV = KVCacheTraits<MT>;
@@ -181,15 +181,15 @@ __device__ __forceinline__ void prefill_mg_impl(
                                                              extra_page_stride_bytes, pg_extra);
           } else {
             address =
-                prefill_kv_entry_base<MT, PAGE_MAIN>(KV_cache, staged, page_stride_bytes, pg_main);
+                prefill_kv_entry_base<MT, PAGE_MAIN>(KV_cache, staged, kv_stride_bytes, pg_main);
             io_gather_scales<MT, PAGE_MAIN, BI, IO_THREADS>(sm.kv_scale_buf(buf), staged, KV_cache,
-                                                            io_tid, page_stride_bytes, pg_main);
+                                                            io_tid, kv_stride_bytes, pg_main);
           }
         } else {
           address =
-              prefill_kv_entry_base<MT, PAGE_MAIN>(KV_cache, staged, page_stride_bytes, pg_main);
+              prefill_kv_entry_base<MT, PAGE_MAIN>(KV_cache, staged, kv_stride_bytes, pg_main);
           io_gather_scales<MT, PAGE_MAIN, BI, IO_THREADS>(sm.kv_scale_buf(buf), staged, KV_cache,
-                                                          io_tid, page_stride_bytes, pg_main);
+                                                          io_tid, kv_stride_bytes, pg_main);
         }
         if (io_tid == 0) BulkReady::expect(sm.mbar_kv(buf), BI * KV::KV_SMEM_COPY_BYTES);
         if (io_tid < BI) {
@@ -215,11 +215,11 @@ __device__ __forceinline__ void prefill_mg_impl(
         }
       }
       io_gather_scales<MT, PAGE_MAIN, BI, IO_THREADS>(sm.kv_scale_buf(buf), staged, KV_cache,
-                                                      io_tid, page_stride_bytes, pg_main);
+                                                      io_tid, kv_stride_bytes, pg_main);
       __threadfence_block();
       io_bulk_gather_tile<MT, PAGE_MAIN, true, BI, IO_THREADS>(
-          sm.kv_buf(buf), staged, KV_cache, sm.mbar_kv(buf), io_tid, page_stride_bytes,
-          kv_l2_policy, pg_main);
+          sm.kv_buf(buf), staged, KV_cache, sm.mbar_kv(buf), io_tid, kv_stride_bytes, kv_l2_policy,
+          pg_main);
     };
 
     int staged = load_idx(0);
@@ -304,17 +304,17 @@ __device__ __forceinline__ void prefill_mg_impl(
       // Per-tile data source. Single-cache: always main. Dual: route on phase.
       const int32_t* ib;
       const uint8_t* kv_global;
-      size_t page_stride_bytes_now;
+      size_t kv_stride_bytes_now;
       bool is_main = true;
       if constexpr (DUAL_CACHE) {
         is_main = (ti < main_ni);
         ib = is_main ? (idx_base + ti * BI) : (idx_base_extra + (ti - main_ni) * BI);
         kv_global = is_main ? KV_cache : KV_cache_extra;
-        page_stride_bytes_now = is_main ? page_stride_bytes : extra_page_stride_bytes;
+        kv_stride_bytes_now = is_main ? kv_stride_bytes : extra_page_stride_bytes;
       } else {
         ib = idx_base + ti * BI;
         kv_global = KV_cache;
-        page_stride_bytes_now = page_stride_bytes;
+        kv_stride_bytes_now = kv_stride_bytes;
       }
 
       // The store handoff publishes every IO writer; KvFree retires all XV
@@ -334,14 +334,14 @@ __device__ __forceinline__ void prefill_mg_impl(
         if constexpr (DUAL_CACHE) {
           if (is_main) {
             entry_base_gid =
-                prefill_kv_entry_base<MT, PAGE_MAIN>(KV_cache, idx, page_stride_bytes, pg_main);
+                prefill_kv_entry_base<MT, PAGE_MAIN>(KV_cache, idx, kv_stride_bytes, pg_main);
           } else {
             entry_base_gid = prefill_kv_entry_base<MT, PAGE_EXTRA>(
                 KV_cache_extra, idx, extra_page_stride_bytes, pg_extra);
           }
         } else {
           entry_base_gid =
-              prefill_kv_entry_base<MT, PAGE_MAIN>(KV_cache, idx, page_stride_bytes, pg_main);
+              prefill_kv_entry_base<MT, PAGE_MAIN>(KV_cache, idx, kv_stride_bytes, pg_main);
         }
       }
 
@@ -796,21 +796,21 @@ __device__ __forceinline__ void prefill_mg_impl(
         if constexpr (REUSE_ADDRESS) {
           auto addresses = reinterpret_cast<const uint8_t* const*>(smem_raw + LMG::OFF_KV_ADDRESS);
           xv_rope_mma_mg<MT, PAGE_MAIN, MG_N_HG>(
-              acc_rope, p, ib, valid_len, kv_global, mwarp, lane, page_stride_bytes_now,
+              acc_rope, p, ib, valid_len, kv_global, mwarp, lane, kv_stride_bytes_now,
               reinterpret_cast<bf16*>(sm.w_fp8()), addresses + (ti & 1) * BI);
         } else if constexpr (DUAL_CACHE) {
           if (is_main) {
             xv_rope_mma_mg<MT, PAGE_MAIN, MG_N_HG>(
-                acc_rope, p, ib, valid_len, kv_global, mwarp, lane, page_stride_bytes_now,
+                acc_rope, p, ib, valid_len, kv_global, mwarp, lane, kv_stride_bytes_now,
                 reinterpret_cast<bf16*>(sm.w_fp8()), nullptr, pg_main);
           } else {
             xv_rope_mma_mg<MT, PAGE_EXTRA, MG_N_HG>(
-                acc_rope, p, ib, valid_len, kv_global, mwarp, lane, page_stride_bytes_now,
+                acc_rope, p, ib, valid_len, kv_global, mwarp, lane, kv_stride_bytes_now,
                 reinterpret_cast<bf16*>(sm.w_fp8()), nullptr, pg_extra);
           }
         } else {
           xv_rope_mma_mg<MT, PAGE_MAIN, MG_N_HG>(
-              acc_rope, p, ib, valid_len, kv_global, mwarp, lane, page_stride_bytes_now,
+              acc_rope, p, ib, valid_len, kv_global, mwarp, lane, kv_stride_bytes_now,
               reinterpret_cast<bf16*>(sm.w_fp8()), nullptr, pg_main);
         }
       }

@@ -73,7 +73,7 @@ __device__ __forceinline__ PrefillSection prefill_section(const PrefillColdParam
   }
   return {kv,
           indices + (size_t)token * cold.topk,
-          cold.page_stride_bytes,
+          cold.kv_stride_bytes,
           tile,
           main_len,
           cold.page_block_size,
@@ -98,7 +98,7 @@ struct Fp8PrefillSync {
 
 template <ModelType MT, int PAGE_BLOCK_SIZE>
 __device__ __forceinline__ const uint8_t* prefill_kv_entry_base(
-    const uint8_t* __restrict__ kv_global, int idx, size_t stride_kv_block, PageGeom pg = {}) {
+    const uint8_t* __restrict__ kv_global, int idx, size_t kv_stride_bytes, PageGeom pg = {}) {
   using KV = KVCacheTraits<MT>;
   using IO = KVIOTraits<MT>;
   // Addressing mode follows the scale layout, not V_HAS_ROPE: an inline-scale
@@ -114,18 +114,18 @@ __device__ __forceinline__ const uint8_t* prefill_kv_entry_base(
   idx = valid ? idx : 0;
   const uint8_t* base;
   if constexpr (PAGE_BLOCK_SIZE == 0) {
-    static_assert(MT == ModelType::DSV4);
+    static_assert(MT == ModelType::DSV4 || MT == ModelType::DOTS3_SWA);
     int bi, li;
     page_divmod(idx, pg, bi, li);
-    base = kv_global + (size_t)bi * stride_kv_block + (size_t)li * IO::IO_STRIDE;
+    base = kv_global + (size_t)bi * kv_stride_bytes + (size_t)li * IO::IO_STRIDE;
   } else if constexpr (!KV::SCALE_IN_KV_SMEM) {
     const int bi = idx / PAGE_BLOCK_SIZE;
     const int li = idx % PAGE_BLOCK_SIZE;
-    base = kv_global + (size_t)bi * stride_kv_block + (size_t)li * IO::IO_STRIDE;
+    base = kv_global + (size_t)bi * kv_stride_bytes + (size_t)li * IO::IO_STRIDE;
   } else {
     // Flat inline array: the row advance is the runtime stride (payload 528
     // for GLM53_NOPE; a legacy 656B vLLM pool advances by 656).
-    base = kv_global + (size_t)idx * inline_row_advance(stride_kv_block, PAGE_BLOCK_SIZE);
+    base = kv_global + ((size_t)idx * (kv_stride_bytes >> 4) << 4);
   }
   return valid ? base : sparse_mla_zero_row;
 }

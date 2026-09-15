@@ -583,23 +583,11 @@ def get_sparse_mla_sm120_module():
         kv_pbs = _packed_kv_page_block_size(
             kv_cache, model_type=model_type, name="kv_cache"
         )
-        if model_type in (
+        inline_page_gap = model_type in (
             _MODEL_TYPE_DSV3_2,
             _MODEL_TYPE_GLM_NSA,
             _MODEL_TYPE_GLM53_NOPE,
-        ) and not _inline_cache_block_contiguous(kv_cache):
-            # Inline-scale prefill kernels address the cache as a flat token
-            # array with a runtime row stride — and crossover can route any
-            # decode-form call there, so the restriction cannot wait for a
-            # prefill-routed call to fire. Padded rows are honored everywhere;
-            # only inter-block gaps are rejected.
-            raise ValueError(
-                "inline-scale (DSv3.2/GLM) KV caches must pack rows "
-                "contiguously within each block through this entry (padded "
-                "rows are fine): prefill-routed calls address the cache as a "
-                "flat token array, and the calibrated crossover can route "
-                "decode-form calls to prefill"
-            )
+        ) and not _inline_cache_block_contiguous(kv_cache)
         extra_topk = int(extra_indices.size(-1)) if extra_indices is not None else 0
         planned = plan(
             num_tokens,
@@ -613,6 +601,31 @@ def get_sparse_mla_sm120_module():
             extra_topk=extra_topk,
             extra_fp4=extra_fp4,
         )
+        if inline_page_gap:
+            from ._prepared import device_caps, validate_metadata
+            from ._policy import filter_metadata_selection
+
+            metadata = validate_metadata(
+                q,
+                kv_cache,
+                indices,
+                output,
+                topk_length,
+                attn_sink,
+                extra_kv_cache,
+                extra_indices,
+                extra_topk_length,
+                out_lse,
+                mid_out,
+                mid_lse,
+                model=model_type,
+                is_dsv4_nvfp4=False,
+                extra_fp4=extra_fp4,
+                value_dim=d_v,
+            )
+            planned = filter_metadata_selection(
+                planned, metadata, "default", *device_caps(q.device)
+            )
         if planned is None:
             # Neither the decode instantiations nor the prefill envelope
             # serves this shape.

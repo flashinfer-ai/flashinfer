@@ -5,6 +5,8 @@
 
 #pragma once
 
+#include <flashinfer/fastdiv.cuh>
+
 #include "../../arch/cp_async.cuh"
 #include "../../arch/matrix_memory.cuh"
 #include "../../arch/mma_sm120.cuh"
@@ -46,7 +48,7 @@ namespace flashinfer::sparse_mla_sm120 {
 
 // No minBlocksPerSM hint on launch_bounds: kernel is smem-bound at 1
 // block/SM regardless.
-template <ModelType MT, int NUM_HEADS, int PAGE_BLOCK_SIZE>
+template <ModelType MT, int NUM_HEADS>
 __global__ void __launch_bounds__(DSV32_BLOCK_THREADS) sparse_mla_decode_dsv3_2_kernel(
     const bf16* __restrict__ Q,               // [num_tokens, num_heads, d_qk=576] bf16
     const uint8_t* __restrict__ KV_cache,     // FP8 paged (V32 INLINE layout, 656 B/token)
@@ -62,7 +64,7 @@ __global__ void __launch_bounds__(DSV32_BLOCK_THREADS) sparse_mla_decode_dsv3_2_
     // Per-token advance in the KV cache. Equals KV::BYTES_PER_TOKEN for a packed
     // cache, but is larger when the caller pads rows to share one KV cache
     // group across layer geometries; the payload stays at the row start.
-    int stride_kv_row) {
+    int stride_kv_row, flashinfer::uint_fastdiv page_divisor) {
   using KV = KVCacheTraits<MT>;
   static_assert(KV::D_QK == 576 || (MT == ModelType::GLM53_NOPE && KV::D_QK == 512));
   constexpr int D_NOPE = KV::D_NOPE;                                // 512
@@ -77,7 +79,8 @@ __global__ void __launch_bounds__(DSV32_BLOCK_THREADS) sparse_mla_decode_dsv3_2_
   // INLINE: bulk covers nope + scales together (528 B), rope follows at
   // gmem offset KV_ROPE_GMEM_OFFSET=528 with 128 B/entry.
   constexpr int KV_ROPE_OFFSET = KV::KV_ROPE_GMEM_OFFSET;  // 528
-  constexpr int pbs = PAGE_BLOCK_SIZE;
+  const int pbs = int(uint32_t(page_divisor));
+  const size_t page_gap_bytes = stride_kv_block - size_t(pbs) * stride_kv_row;
   // Heads actually populated per CTA tile. NUM_HEADS == 0 selects the
   // runtime-head-count instantiation (one kernel per model type, any
   // num_heads <= 128): Q/output carry the true num_heads stride, the mid
@@ -190,11 +193,9 @@ __global__ void __launch_bounds__(DSV32_BLOCK_THREADS) sparse_mla_decode_dsv3_2_
       // zero row is wide enough to cover the rope tail as well.
       static_assert(KV_SMEM_STRIDE + D_ROPE_C * (int)sizeof(bf16) <= SPARSE_MLA_ZERO_ROW_BYTES);
       const int idx = (idx_raw >= 0) ? idx_raw : 0;
-      const int block_idx_g = idx / pbs;
-      const int local_idx_g = idx - block_idx_g * pbs;
-      const uint8_t* data_base = (idx_raw >= 0) ? KV_cache + (size_t)block_idx_g * stride_kv_block +
-                                                      (size_t)local_idx_g * (size_t)stride_kv_row
-                                                : sparse_mla_zero_row;
+      size_t offset = size_t(idx) * stride_kv_row;
+      if (page_gap_bytes != 0) offset += size_t(uint32_t(idx) / page_divisor) * page_gap_bytes;
+      const uint8_t* data_base = idx_raw >= 0 ? KV_cache + offset : sparse_mla_zero_row;
       // Bulk 1: NoPE + INLINE scales (528 B) → sm_kv_fp8 slot.
       cp_async_bulk_g2s(kv_fp8_dst + (size_t)entry_idx * KV_SMEM_STRIDE, data_base,
                         V2_BULK_NOPESC_BYTES, sm.mbar_full(buf));

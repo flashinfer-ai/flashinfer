@@ -71,7 +71,10 @@ __global__ void __launch_bounds__(
         // Row strides of (extra_)indices; either may exceed the row width when the
         // caller views a wider persistent buffer (last dim must stay contiguous).
         size_t indices_stride_elems, size_t extra_indices_stride_elems,
-        std::conditional_t<MT == ModelType::DSV4, Dsv4PageDivisors, int> pages) {
+        std::conditional_t<
+            MT == ModelType::DSV4, Dsv4PageDivisors,
+            std::conditional_t<MT == ModelType::DOTS3_SWA, flashinfer::uint_fastdiv, int>>
+            pages) {
   using KV = KVCacheTraits<MT>;
   using Cfg = DecodeTileCfg<MT, GatherSchedule::RAW_PIPELINE>;
   static_assert(MT == ModelType::DSV4 || MT == ModelType::DOTS3_SWA || MT == ModelType::DSV4_1,
@@ -91,8 +94,10 @@ __global__ void __launch_bounds__(
   const int pbs = [&]() {
     if constexpr (MT == ModelType::DSV4)
       return int(uint32_t(pages.main));
+    else if constexpr (MT == ModelType::DOTS3_SWA)
+      return int(uint32_t(pages));
     else
-      return MT == ModelType::DSV4_1 ? pages : PAGE_BLOCK_SIZE;
+      return pages;
   }();
   // Kernel always computes a full HPB×CAND tile (zero-Q-padded for unused
   // head slots). NUM_HEADS == 0 selects the runtime-head-count instantiation:
@@ -284,6 +289,8 @@ __global__ void __launch_bounds__(
     auto page_index = [&](int idx) {
       if constexpr (MT == ModelType::DSV4)
         return int(uint32_t(idx) / (is_extra ? pages.extra : pages.main));
+      else if constexpr (MT == ModelType::DOTS3_SWA)
+        return int(uint32_t(idx) / pages);
       else
         return idx / section_pbs;
     };
