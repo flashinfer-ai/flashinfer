@@ -56,6 +56,44 @@ inline __device__ float silu(float x) { return x / (1.0f + expf(-x)); }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// Gated SwiGLU with the optional OAI controls, matching the fused FC1 epilogue of the trtllm-gen
+// cubins:
+//   xGlu    = clamp(xGlu, max=limit)
+//   xLinear = clamp(xLinear, -limit, limit)
+//   out     = xGlu * sigmoid(alpha * xGlu) * (xLinear + beta)
+// With no parameters set this is exactly silu(xGlu) * xLinear, bit-for-bit, so the common path is
+// unchanged. The per-expert scalars are looked up per element rather than hoisted: they are the
+// same address for every thread of a tile and stay resident in L1, and this kernel is bandwidth
+// bound on the FC1 output anyway.
+template <typename KernelParams>
+inline __device__ float gatedSilu(KernelParams const& params, int32_t permutedIdx, float xLinear,
+                                  float xGlu) {
+  if (params.gatedActAlphaPtr == nullptr && params.gatedActBetaPtr == nullptr &&
+      params.gatedActClampLimitPtr == nullptr) {
+    return silu(xGlu) * xLinear;
+  }
+
+  // Permuted tokens are grouped per expert and padded to tileTokensDim, so the tile index is the
+  // FC1 GEMM's batch index. tileTokensDim is a runtime value (not always a power of two), hence
+  // the division; it is off the default path and negligible next to the global loads.
+  int32_t const localExpertIdx = params.ctaIdxXyToBatchIdx[permutedIdx / params.tileTokensDim];
+
+  if (params.gatedActClampLimitPtr != nullptr) {
+    float const limit = params.gatedActClampLimitPtr[localExpertIdx];
+    xGlu = fminf(xGlu, limit);
+    xLinear = fmaxf(fminf(xLinear, limit), -limit);
+  }
+  float const alpha =
+      params.gatedActAlphaPtr != nullptr ? params.gatedActAlphaPtr[localExpertIdx] : 1.0f;
+  float const beta =
+      params.gatedActBetaPtr != nullptr ? params.gatedActBetaPtr[localExpertIdx] : 0.0f;
+  // x * sigmoid(alpha * x), i.e. silu(x) generalized by alpha.
+  float const act = xGlu / (1.0f + expf(-alpha * xGlu));
+  return act * (xLinear + beta);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 template <typename KernelParams>
 __global__ void activationKernel(KernelParams params) {
   using Type = typename KernelParams::Type;
@@ -84,8 +122,7 @@ __global__ void activationKernel(KernelParams params) {
         float x1 = (float)params.inPtr[baseIdx];
         float x2 = (float)params.inPtr[baseIdx + params.innerDim / 2];
 
-        float act = silu(x2);
-        Type out = (Type)(act * x1);
+        Type out = (Type)gatedSilu(params, permutedIdx, x1, x2);
 
         int64_t const outIdx = (int64_t)permutedIdx * (params.innerDim / 2) + hiddenIdx;
         params.outPtr[outIdx] = out;
@@ -242,6 +279,10 @@ __global__ void activationDeepSeekKernel(KernelParams params) {
           dataX2Arr[tokenInCtaIdx] = 0.0f;
           outArr[tokenInCtaIdx] = 0.0f;
           absOutArr[tokenInCtaIdx] = 0.0f;
+          // The loop below stops writing this at the tail of the token range, and the
+          // activation loop needs a defined value to decide whether a per-expert lookup
+          // is in range.
+          permutedIdxArr[tokenInCtaIdx] = -1;
         }
 #pragma unroll
         for (int tokenInCtaIdx = 0; tokenInCtaIdx < NumTokensPerCta; tokenInCtaIdx++) {
@@ -278,8 +319,10 @@ __global__ void activationDeepSeekKernel(KernelParams params) {
         for (int tokenInCtaIdx = 0; tokenInCtaIdx < NumTokensPerCta; tokenInCtaIdx++) {
           float x1 = scale1Arr[tokenInCtaIdx] * dataX1Arr[tokenInCtaIdx];
           float x2 = scale2Arr[tokenInCtaIdx] * dataX2Arr[tokenInCtaIdx];
-          float act = silu(x2);
-          float out = act * x1;
+          // Padding lanes keep permutedIdx == -1 and contribute a zeroed x1/x2, so skip the
+          // per-expert lookup for them instead of indexing ctaIdxXyToBatchIdx out of range.
+          int const permutedIdx = permutedIdxArr[tokenInCtaIdx];
+          float out = permutedIdx == -1 ? silu(x2) * x1 : gatedSilu(params, permutedIdx, x1, x2);
           outArr[tokenInCtaIdx] = out;
           absOutArr[tokenInCtaIdx] = fabsf(out);
         }

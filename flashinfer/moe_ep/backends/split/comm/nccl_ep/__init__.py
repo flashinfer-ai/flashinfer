@@ -1,11 +1,16 @@
 """NCCL-EP backend (nccl-ep-v0.1.0).
 
-As of ``nccl-ep-v0.1.0`` the backend is driven entirely by the **nccl4py**
-Python package's ``nccl.ep`` API — there is no longer an in-tree
-``libnccl_ep.so`` to dlopen or a flat ``nccl_ep`` ctypes module to import.
-The ``nccl`` package (the released ``nccl4py`` wheel, a base dependency of
-flashinfer-python) self-loads its native library; we just import ``nccl.ep``
-lazily in :mod:`.fleet` / :mod:`.handle`.
+As of ``nccl-ep-v0.1.0`` the backend is driven entirely by the ``nccl.ep``
+API — there is no longer an in-tree ``libnccl_ep.so`` to dlopen or a flat
+``nccl_ep`` ctypes module to import. ``nccl.ep`` self-loads its native
+library; we just import it lazily in :mod:`.fleet` / :mod:`.handle`.
+
+``nccl.ep`` ships in the **nccl-extensions** wheel (a base dependency of
+flashinfer-python), which installs into the same ``nccl`` namespace package
+as nccl4py. It used to ship in nccl4py itself; nccl4py 0.4.1 dropped
+``nccl/ep`` when the EP and M2N libraries moved out to
+https://github.com/NVIDIA/nccl-extensions. nccl4py is still required — and
+comes in transitively — for ``nccl.core.Communicator``.
 
 Availability is probed via :func:`flashinfer.moe_ep._probe_nccl_ep`, which checks
 that ``nccl.ep`` is importable.

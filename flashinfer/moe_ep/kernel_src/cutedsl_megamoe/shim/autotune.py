@@ -38,7 +38,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 import torch
 
-from .tuner import is_valid
+from .tuner import default_knobs, is_valid
 
 # Shared base of the sweep restriction (values that won every profile so far).
 _SWEEP_BASE: Dict[str, Any] = {
@@ -112,6 +112,16 @@ def mxfp8_candidates(
     return out
 
 
+def bf16_candidates() -> List[Dict[str, Any]]:
+    """Return the currently supported BF16 tuning candidate.
+
+    This is intentionally a one-entry autotune surface. Keeping the same
+    collective autotune lifecycle as the other Mega kernels means additional
+    validated geometries can be added without changing the public API.
+    """
+    return [default_knobs(0, dtype="bf16")]
+
+
 def autotune_knobs(
     frontend: Any,
     launch: Callable[[], None],
@@ -120,6 +130,7 @@ def autotune_knobs(
     label: str,
     warmup_iters: int = 3,
     timed_iters: int = 10,
+    on_winner: Optional[Callable[[Dict[str, Any], float], None]] = None,
 ) -> Dict[str, Any]:
     """Time each candidate on the live problem and apply the winner.
 
@@ -127,11 +138,21 @@ def autotune_knobs(
     ``launch`` is a zero-arg closure that runs one synchronized forward with
     the caller's real staged inputs (e.g. a ``nvfp4_mega_moe(...)`` call).
 
+    ``on_winner`` (optional) is called once with ``(winner, p50_seconds)``
+    after the winner is applied — used to persist the result in the knob
+    cache. It runs on every rank; the callback decides who writes.
+
     COLLECTIVE: every EP rank must call this in the same iteration with the
     same ``candidates`` (order included).  Returns the winning knob dict.
     """
     if not candidates:
         raise ValueError("autotune_knobs needs a non-empty candidate list.")
+
+    from .comm import ensure_not_capturing
+
+    # The sweep barriers, compiles per candidate, wall-clock times with
+    # internal syncs, and all_reduces -- none of it can run mid-capture.
+    ensure_not_capturing("knobs='auto' collective autotune sweep")
 
     import torch.distributed as dist
 
@@ -178,6 +199,8 @@ def autotune_knobs(
         )
     winner = candidates[best]
     frontend.apply_knobs(winner)
+    if on_winner is not None:
+        on_winner(winner, float(t[best]))
     if rank == 0:
         ranked = sorted(zip(t.tolist(), candidates, strict=False), key=lambda kv: kv[0])
         summary = "\n".join(f"    {us * 1e6:10.1f} us  {knobs}" for us, knobs in ranked)
@@ -226,14 +249,34 @@ def autotune_nvfp4_mega_moe(
             sync=True,
         )
 
+    cfg = symm_buffer._frontend.config
     if candidates is None:
         # Session-aware default sweep: prune ikr when the config can't run it
         # and quantized-combine-invalid combos up front.
-        cfg = symm_buffer._frontend.config
         candidates = nvfp4_candidates(
             combine_format=COMBINE_FORMAT_NAMES[cfg.combine_dtype],
             allow_in_kernel_fc2_reduce=cfg.apply_topk_in_fc1,
         )
+
+    def _record(winner: Dict[str, Any], p50_s: float) -> None:
+        # Persist for future pure-lookup engine starts; rank 0 writes (the
+        # winner is identical on all ranks after the all_reduce).
+        if cfg.rank == 0:
+            from .knob_cache import record_knobs
+
+            record_knobs(
+                winner,
+                dtype="nvfp4",
+                world_size=cfg.world_size,
+                hidden=cfg.hidden,
+                intermediate=cfg.intermediate,
+                num_experts=cfg.num_total_experts,
+                topk=cfg.num_topk,
+                max_tokens=cfg.num_tokens_per_rank,
+                combine_dtype=cfg.combine_dtype,
+                p50_us=p50_s * 1e6,
+                source="autotune",
+            )
 
     return autotune_knobs(
         symm_buffer._frontend,
@@ -242,6 +285,7 @@ def autotune_nvfp4_mega_moe(
         label="nvfp4_mega",
         warmup_iters=warmup_iters,
         timed_iters=timed_iters,
+        on_winner=_record,
     )
 
 
@@ -275,10 +319,30 @@ def autotune_mxfp8_mega_moe(
             sync=True,
         )
 
+    cfg = symm_buffer._frontend.config
     if candidates is None:
         candidates = mxfp8_candidates(
-            in_kernel_fc2_reduce=symm_buffer._frontend.config.in_kernel_fc2_reduce,
+            in_kernel_fc2_reduce=cfg.in_kernel_fc2_reduce,
         )
+
+    def _record(winner: Dict[str, Any], p50_s: float) -> None:
+        # Persist for future pure-lookup engine starts; rank 0 writes (the
+        # winner is identical on all ranks after the all_reduce).
+        if cfg.rank == 0:
+            from .knob_cache import record_knobs
+
+            record_knobs(
+                winner,
+                dtype=cfg.kind,
+                world_size=cfg.world_size,
+                hidden=cfg.hidden,
+                intermediate=cfg.intermediate,
+                num_experts=cfg.num_total_experts,
+                topk=cfg.num_topk,
+                max_tokens=cfg.num_tokens_per_rank,
+                p50_us=p50_s * 1e6,
+                source="autotune",
+            )
 
     return autotune_knobs(
         symm_buffer._frontend,
@@ -287,13 +351,59 @@ def autotune_mxfp8_mega_moe(
         label="mxfp8_mega",
         warmup_iters=warmup_iters,
         timed_iters=timed_iters,
+        on_winner=_record,
+    )
+
+
+def autotune_bf16_mega_moe(
+    y: torch.Tensor,
+    transformed_l1: Any,
+    transformed_l2: Any,
+    symm_buffer: Any,
+    *,
+    num_tokens: Optional[int] = None,
+    gate_up_clamp: Optional[float] = None,
+    activation_clamp: Optional[float] = None,
+    candidates: Optional[List[Dict[str, Any]]] = None,
+    warmup_iters: int = 3,
+    timed_iters: int = 10,
+) -> Dict[str, Any]:
+    """Autotune the BF16 MegaMoE session on its supported geometry.
+
+    The initial candidate list has exactly one fixed-geometry configuration.
+    It still uses the collective autotune path so later supported geometries
+    can be introduced without changing runtime behavior.
+    """
+    from .bf16 import bf16_mega_moe
+
+    def launch() -> None:
+        bf16_mega_moe(
+            y,
+            transformed_l1,
+            transformed_l2,
+            symm_buffer,
+            num_tokens=num_tokens,
+            gate_up_clamp=gate_up_clamp,
+            activation_clamp=activation_clamp,
+            sync=True,
+        )
+
+    return autotune_knobs(
+        symm_buffer._frontend,
+        launch,
+        bf16_candidates() if candidates is None else candidates,
+        label="bf16_mega",
+        warmup_iters=warmup_iters,
+        timed_iters=timed_iters,
     )
 
 
 __all__ = [
     "autotune_knobs",
+    "autotune_bf16_mega_moe",
     "autotune_mxfp8_mega_moe",
     "autotune_nvfp4_mega_moe",
+    "bf16_candidates",
     "mxfp8_candidates",
     "nvfp4_candidates",
 ]

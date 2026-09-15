@@ -4,6 +4,7 @@ from flashinfer.artifacts import (
     get_subdir_file_list,
 )
 
+import pytest
 import responses
 
 from flashinfer.jit.cubin_loader import safe_urljoin
@@ -278,6 +279,50 @@ def test_get_available_cubin_files_non_200_response():
     assert available_cubin_files == ()
 
 
+def test_get_checksums_unreachable_pin_raises(monkeypatch, tmp_path):
+    """An artifact pin whose checksums.txt cannot be fetched must fail loudly.
+
+    Guards the diagnosis path exercised by #4280: a pin added to `cubin_dirs`
+    without a published (or, in tests, mocked) manifest used to surface as a bare
+    FileNotFoundError on a local cache path, which reads like a corrupt cache
+    rather than an unreachable pin. `download_file` is stubbed rather than mocked
+    over HTTP so the test does not pay its 4 retries of exponential backoff.
+    """
+    from flashinfer import artifacts
+
+    monkeypatch.setattr(artifacts, "FLASHINFER_CUBIN_DIR", tmp_path / "cubins")
+    monkeypatch.setattr(artifacts, "download_file", lambda *args, **kwargs: False)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        artifacts.get_checksums([artifact_paths.DEEPGEMM])
+    # The pin must be named -- that is the whole point of the error.
+    assert artifact_paths.DEEPGEMM in str(excinfo.value)
+
+
+def test_get_checksums_falls_back_to_cached_manifest(monkeypatch, tmp_path):
+    """A failed refresh must not invalidate an already-cached manifest.
+
+    Offline / FLASHINFER_NO_DOWNLOAD setups rely on the on-disk copy.
+    """
+    from flashinfer import artifacts
+
+    cubin_dir = tmp_path / "cubins"
+    monkeypatch.setattr(artifacts, "FLASHINFER_CUBIN_DIR", cubin_dir)
+    monkeypatch.setattr(artifacts, "download_file", lambda *args, **kwargs: False)
+
+    cached = cubin_dir / safe_urljoin(artifact_paths.DEEPGEMM, "checksums.txt")
+    cached.parent.mkdir(parents=True)
+    cached.write_text("abc123 kernel.fp8_m_grouped_gemm.007d9ebdca7e.cubin\n")
+
+    checksums = artifacts.get_checksums([artifact_paths.DEEPGEMM])
+    assert checksums == {
+        safe_urljoin(
+            artifact_paths.DEEPGEMM,
+            "kernel.fp8_m_grouped_gemm.007d9ebdca7e.cubin",
+        ): "abc123"
+    }
+
+
 @responses.activate
 def test_get_subdir_file_list(monkeypatch, tmp_path):
     _mock_file_index_responses()
@@ -410,6 +455,36 @@ f9a0b1c2d3e4 kernel.fp8_m_grouped_gemm.0457375eb02f.cubin
         if "include/flashInferMetaInfo.h" in url
         or "include/flashinferMetaInfo.h" in url
     ]
+    # FMHA, GEMM, BMM.
     assert len(meta_info_headers) == 3, (
         f"Meta info headers count mismatch. Expected 3, got {len(meta_info_headers)}. Headers found: {meta_info_headers}"
     )
+
+    by_path = dict(cubin_files)
+    assert len(by_path) == len(cubin_files), "duplicate paths in cubin file list"
+
+
+def test_get_checksums_keys_by_full_path(monkeypatch, tmp_path):
+    """Two pins shipping the same kernel filename must keep separate hashes.
+
+    Keying the checksum map by bare filename let whichever subdir was processed
+    last overwrite the earlier one, which then failed verification for every
+    shared name.
+    """
+    from flashinfer import artifacts
+
+    cubin_dir = tmp_path / "cubins"
+    monkeypatch.setattr(artifacts, "FLASHINFER_CUBIN_DIR", cubin_dir)
+    monkeypatch.setattr(artifacts, "download_file", lambda *args, **kwargs: False)
+
+    shared_name = "kernel.fp8_m_grouped_gemm.007d9ebdca7e.cubin"
+    for subdir, sha in (("pin-a/", "aaaa1111"), ("pin-b/", "bbbb2222")):
+        cached = cubin_dir / safe_urljoin(subdir, "checksums.txt")
+        cached.parent.mkdir(parents=True)
+        cached.write_text(f"{sha} {shared_name}\n")
+
+    checksums = artifacts.get_checksums(["pin-a/", "pin-b/"])
+    assert checksums == {
+        safe_urljoin("pin-a/", shared_name): "aaaa1111",
+        safe_urljoin("pin-b/", shared_name): "bbbb2222",
+    }

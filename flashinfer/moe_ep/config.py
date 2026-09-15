@@ -88,6 +88,14 @@ class BootstrapConfig:
     rank: int
     stream: int = 0  # int representation of a cudaStream_t; 0 = default stream
     auto_bootstrap: bool = True
+    # CUDA device ordinal to bind for this rank. None = derive from the
+    # LOCAL_RANK env var, falling back to ``rank`` (torchrun convention).
+    # Host frameworks that already bound their worker's device (possibly
+    # under a remapped CUDA_VISIBLE_DEVICES, where the derived ordinal would
+    # point at the wrong or a nonexistent GPU) should pass
+    # ``torch.cuda.current_device()``. Keyword-only so it does not shift the
+    # positional binding of the pre-existing fields below.
+    device: Optional[int] = field(default=None, kw_only=True)
     nccl_comm: Optional[int] = (
         None  # int representation of ncclComm_t; None = derive from PG
     )
@@ -105,6 +113,8 @@ class BootstrapConfig:
             raise ValueError(f"world_size must be positive, got {self.world_size}")
         if not (0 <= self.rank < self.world_size):
             raise ValueError(f"rank {self.rank} not in [0, {self.world_size})")
+        if self.device is not None and self.device < 0:
+            raise ValueError(f"device must be non-negative, got {self.device}")
 
 
 @dataclass(frozen=True)
@@ -196,6 +206,12 @@ class DispatchOutput:
     (the received tokens are front-packed) while the transport buffer stays sized to
     the static ``max_recv_tokens_per_rank`` budget (nccl-ep v0.1 does not resize the
     buffer itself). ``None`` → the consumer must fall back to the full static buffer.
+
+    ``expert_scales`` carries the per-block dequantization scales when the
+    transport quantized the tokens in-flight (``FleetAlgoKnobQuantization``
+    with an FP8 type on nixl_ep — the library returns ``(fp8_data, scales)``
+    and both are surfaced). ``None`` when dispatch was not quantized or the
+    backend does not produce scales.
     """
 
     expert_tensors: "torch.Tensor"
@@ -204,6 +220,7 @@ class DispatchOutput:
     recv_topk_weights: Optional["torch.Tensor"] = None
     expert_counts: Optional["torch.Tensor"] = None
     recv_total_counter: Optional["torch.Tensor"] = None
+    expert_scales: Optional["torch.Tensor"] = None
 
     def get_num_tokens(self) -> int:
         """Resolve ``num_tokens`` to an int, evaluating a deferred thunk if present."""

@@ -28,11 +28,14 @@ using CacheElemConverter = ElemTypeConverter<CACHE_ELEM_ENUM>;
 using CacheElem = CacheElemConverter::Type;
 constexpr uint32_t validElemsPerHead = HEAD_ELEMS;
 constexpr bool isMLA = IS_MLA;
-static_assert((isMLA || validElemsPerHead <= 256) &&
+static_assert((isMLA || validElemsPerHead <= 512) &&
               (sizeof(CacheElem) * validElemsPerHead) % 16 == 0);
 constexpr uint32_t headElems =
-    validElemsPerHead <= 64 ? 64 : (validElemsPerHead <= 128 ? 128 : (isMLA ? 576 : 256));
-static_assert(headElems == 64 || headElems == 128 || headElems == 256 || headElems == 576,
+    validElemsPerHead <= 64
+        ? 64
+        : (validElemsPerHead <= 128 ? 128 : (isMLA ? 576 : (validElemsPerHead <= 256 ? 256 : 512)));
+static_assert(headElems == 64 || headElems == 128 || headElems == 256 || headElems == 512 ||
+                  headElems == 576,
               "not implemented");
 constexpr uint32_t beamWidth = BEAM_WIDTH;
 constexpr uint32_t headGrpSize = HEAD_GRP_SIZE;

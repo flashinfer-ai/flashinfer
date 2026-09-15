@@ -150,7 +150,7 @@ def _triton_convert_rs_e4m3_kernel(
     PTX cvt.rs.satfinite.e4m3x4.f32 packs 4 fp8 outputs into a 32-bit
     register; the reversed source-register order {$4,$3,$2,$1} is
     load-bearing — see _stochastic_round_fp8x4_e4m3 in
-    triton_reference/checkpointing_state_update.py for the full rationale.
+    triton_reference/replay_selective_state_update.py for the full rationale.
     """
     pid = tl.program_id(0)
     offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)

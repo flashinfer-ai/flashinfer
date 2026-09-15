@@ -52,6 +52,7 @@ from .comm import (
     _CompiledMega,
     _compute_peer_offsets,
     bootstrap_dist,
+    ensure_not_capturing,
     free_sym_tensor,
     reset_compiled_mega_workspaces,
     resolve_gate_up_clamp,
@@ -100,6 +101,7 @@ class MegaMoENvfp4Config:
     epi_flag_batch: Tuple[int, int] = (1, 1)
     non_ubulk_fc2_store: bool = True
     in_kernel_fc2_reduce: bool = False
+    defer_topk_reduce: bool = False
     token_back_mode: Literal[
         "epi_warps", "standalone_warps", "reuse_dispatch_warps"
     ] = "epi_warps"
@@ -127,9 +129,12 @@ class MegaMoENvfp4Config:
                 "num_total_experts must be divisible by world_size "
                 f"({self.num_total_experts} % {self.world_size} != 0)."
             )
-        if self.hidden % 128 != 0 or self.intermediate % 128 != 0:
+        # The GEMM tiles are tail-safe (ceil-div K/M loops, TMA OOB zero-fill,
+        # predicated epilogue stores); 64 covers the TMA 16B row alignment and
+        # SF-word packing. 128-misaligned shapes exist (gpt-oss: 2880).
+        if self.hidden % 64 != 0 or self.intermediate % 64 != 0:
             raise ValueError(
-                "hidden and intermediate must be multiples of 128 "
+                "hidden and intermediate must be multiples of 64 "
                 f"(got hidden={self.hidden}, intermediate={self.intermediate})."
             )
         if self.token_back_mode not in (
@@ -164,6 +169,15 @@ class MegaMoENvfp4Config:
                 "in_kernel_fc2_reduce requires apply_topk_in_fc1=True; the REDG "
                 "path can only atomic-add terms whose topk score was already "
                 "absorbed before fc2."
+            )
+        if self.defer_topk_reduce and (
+            self.in_kernel_fc2_reduce
+            or self.combine_dtype != "bf16"
+            or not self.apply_topk_in_fc1
+        ):
+            raise ValueError(
+                "defer_topk_reduce requires in_kernel_fc2_reduce=False, "
+                "combine_dtype='bf16', and apply_topk_in_fc1=True."
             )
         if self.group_hint is not None and self.group_hint <= 0:
             raise ValueError(
@@ -242,6 +256,7 @@ class MegaMoENvfp4Frontend:
         """Update ``gate_up_clamp`` and invalidate compile cache when it changes."""
         if self._gate_up_clamp == clamp:
             return
+        ensure_not_capturing("set_gate_up_clamp (clamp change)")
         self._release_workspace()
         self._gate_up_clamp = clamp
         self._invalidate_compile_cache()
@@ -257,6 +272,7 @@ class MegaMoENvfp4Frontend:
         new_config = with_knobs(self.config, knobs)
         if new_config == self._config:
             return
+        ensure_not_capturing("apply_knobs (config change)")
         self._release_workspace()
         self._config = new_config
         self._invalidate_compile_cache()
@@ -307,6 +323,11 @@ class MegaMoENvfp4Frontend:
         a validated-once fast path: validation and cute-tensor construction
         run only when the launch cache misses.
         """
+        if self.config.defer_topk_reduce:
+            raise RuntimeError(
+                "run() cannot return an unreduced output when "
+                "defer_topk_reduce=True; use the terminal adapter"
+            )
         resolved = self._resolve_num_tokens(inputs, num_tokens)
         if resolved == 0:
             return None
@@ -336,7 +357,9 @@ class MegaMoENvfp4Frontend:
             inputs.output_activation.zero_()
         mega.compiled(**mega.launch_kwargs)
 
-        if sync:
+        # Zero-break capture gate: a device synchronize would abort stream
+        # capture, so skip it there (the graph replays under stream semantics).
+        if sync and not torch.cuda.is_current_stream_capturing():
             torch.cuda.synchronize()
         return mega.launch_output
 
@@ -379,6 +402,29 @@ class MegaMoENvfp4Frontend:
                 compiled(**runtime_kwargs)
 
         return thunk
+
+    def deferred_topk_reduce_workspace(
+        self,
+    ) -> Tuple[torch.Tensor, torch.Tensor, dict]:
+        """Return a zero-copy combine view and its canonical root descriptor."""
+        if not self.config.defer_topk_reduce:
+            raise RuntimeError("deferred TopK-reduce mode is not enabled")
+        mega = self._mega
+        if mega is None or mega.compiled is None:
+            raise RuntimeError(
+                "deferred TopK-reduce workspace is unavailable before compilation"
+            )
+        descriptor = mega.kernel.deferred_topk_reduce_region()
+        root = mega.shared_workspace
+        byte_offset = int(descriptor["byte_offset"])
+        nbytes = int(descriptor["nbytes"])
+        raw = root.narrow(0, byte_offset, nbytes)
+        partials = raw.view(torch.bfloat16).view(tuple(descriptor["shape"]))
+        if partials.data_ptr() != root.data_ptr() + byte_offset:
+            raise RuntimeError("borrowed combine view does not match its root offset")
+        if partials.data_ptr() % int(descriptor["alignment"]):
+            raise RuntimeError("borrowed combine view violates canonical alignment")
+        return partials, root, dict(descriptor)
 
     @staticmethod
     def _launch_cache_key(inputs: MegaMoENvfp4Inputs, num_tokens: int) -> tuple:
@@ -429,6 +475,7 @@ class MegaMoENvfp4Frontend:
             c.epi_flag_batch,
             c.non_ubulk_fc2_store,
             c.in_kernel_fc2_reduce,
+            c.defer_topk_reduce,
             c.token_back_mode,
             c.combine_dtype,
             c.apply_topk_in_fc1,
@@ -441,6 +488,7 @@ class MegaMoENvfp4Frontend:
         if self._mega is not None and self._mega_key == key:
             return self._mega
 
+        ensure_not_capturing("cute.compile + symmetric-heap allocation")
         self._release_workspace()
 
         import cutlass
@@ -488,6 +536,7 @@ class MegaMoENvfp4Frontend:
             fc2_output_dtype=cutlass.BFloat16,
             non_ubulk_fc2_store=c.non_ubulk_fc2_store,
             in_kernel_fc2_reduce=c.in_kernel_fc2_reduce,
+            defer_topk_reduce=c.defer_topk_reduce,
             token_back_mode=c.token_back_mode,
             apply_topk_in_fc1=c.apply_topk_in_fc1,
             gate_up_clamp=self._gate_up_clamp,
@@ -542,6 +591,7 @@ class MegaMoENvfp4Frontend:
 
     def _release_workspace(self) -> None:
         if self._mega is not None:
+            ensure_not_capturing("workspace release (symmetric-heap free)")
             free_sym_tensor(self._mega.shared_workspace)
 
     @staticmethod
@@ -764,7 +814,11 @@ class MegaMoENvfp4Frontend:
 
     @staticmethod
     def _to_cute(
-        tensor: torch.Tensor, assumed_align: int = 16, *, static_layout: bool = False
+        tensor: torch.Tensor,
+        assumed_align: int = 16,
+        *,
+        static_layout: bool = False,
+        dynamic_compact_shape_modes: tuple[int, ...] = (),
     ):
         import cutlass.torch as cutlass_torch
 
@@ -772,7 +826,13 @@ class MegaMoENvfp4Frontend:
         if static_layout:
             return cute_tensor
         leading_dim = cutlass_torch.get_leading_dim(tensor)
-        return cute_tensor.mark_layout_dynamic(leading_dim=leading_dim)
+        cute_tensor = cute_tensor.mark_layout_dynamic(leading_dim=leading_dim)
+        for mode in dynamic_compact_shape_modes:
+            cute_tensor = cute_tensor.mark_compact_shape_dynamic(
+                mode=mode,
+                stride_order=tensor.dim_order(),
+            )
+        return cute_tensor
 
     def _build_mega_runtime_kwargs(
         self,
@@ -796,15 +856,22 @@ class MegaMoENvfp4Frontend:
             rank_idx=c.rank,
             num_max_ranks=c.world_size,
         )
+        dynamic_weight_modes = (0,) if c.num_experts_per_rank == 1 else ()
 
         return dict(
             activation=self._to_cute(inputs.activation),
             activation_sf=self._to_cute(inputs.activation_sf),
             topk_idx=self._to_cute(inputs.topk_idx),
             topk_weights=self._to_cute(inputs.topk_weights),
-            fc1_weight=self._to_cute(inputs.fc1_weight),
+            fc1_weight=self._to_cute(
+                inputs.fc1_weight,
+                dynamic_compact_shape_modes=dynamic_weight_modes,
+            ),
             fc1_weight_sf=self._to_cute(inputs.fc1_weight_sf),
-            fc2_weight=self._to_cute(inputs.fc2_weight),
+            fc2_weight=self._to_cute(
+                inputs.fc2_weight,
+                dynamic_compact_shape_modes=dynamic_weight_modes,
+            ),
             fc2_weight_sf=self._to_cute(inputs.fc2_weight_sf),
             fc1_alpha=self._to_cute(inputs.fc1_alpha, assumed_align=4),
             fc2_alpha=self._to_cute(inputs.fc2_alpha, assumed_align=4),
@@ -980,6 +1047,7 @@ def get_symm_buffer_for_mega_moe(
     activation_clamp: Optional[float] = None,
     apply_topk_in_fc1: bool = True,
     in_kernel_fc2_reduce: bool = False,
+    defer_topk_reduce: bool = False,
     combine_dtype: Literal["bf16", "mxfp8", "nvfp4"] = "bf16",
     fc1_alpha: Optional[PerExpertEpilogue] = None,
     fc2_alpha: Optional[PerExpertEpilogue] = None,
@@ -1020,9 +1088,9 @@ def get_symm_buffer_for_mega_moe(
     Expert weights are not allocated here; supply kernel-ready
     ``(weight, scale)`` tuples to :func:`nvfp4_mega_moe` instead.
     """
-    if hidden % 128 != 0 or intermediate % 128 != 0:
+    if hidden % 64 != 0 or intermediate % 64 != 0:
         raise ValueError(
-            "MegaMoE requires hidden and intermediate to be multiples of 128."
+            "MegaMoE requires hidden and intermediate to be multiples of 64."
         )
     if num_total_experts % world_size != 0:
         raise ValueError("num_total_experts must be divisible by world_size.")
@@ -1033,16 +1101,30 @@ def get_symm_buffer_for_mega_moe(
     )
     num_experts_per_rank = num_total_experts // world_size
 
-    from .tuner import default_knobs, with_knobs
+    from .knob_cache import resolve_knobs
+    from .tuner import with_knobs
 
-    # Token-count heuristic picks the perf/tile tactic by compile-time buffer
-    # size (num_max_tokens); an explicit knobs= dict overrides it entirely.
-    resolved_knobs = dict(knobs) if knobs is not None else default_knobs(num_max_tokens)
-    if knobs is None and combine_dtype != "bf16":
+    # knobs=None -> pure lookup: offline-tuned cache entry for this session
+    # key when present, else the built-in token-count heuristic.  An explicit
+    # knobs= dict overrides both entirely.
+    if knobs is not None:
+        resolved_knobs, knob_source = dict(knobs), "explicit"
+    else:
+        resolved_knobs, knob_source = resolve_knobs(
+            dtype="nvfp4",
+            world_size=world_size,
+            hidden=hidden,
+            intermediate=intermediate,
+            num_experts=num_total_experts,
+            topk=num_topk,
+            max_tokens=num_max_tokens,
+            combine_dtype=combine_dtype,
+        )
+    if knob_source == "heuristic" and combine_dtype != "bf16":
         # The measured profiles pick the token-back mode freely, but a
         # quantized combine wire is only wired for dispatch-warp token-back;
-        # explicit knobs are the caller's contract and are left untouched (the
-        # config validation rejects incompatible combos).
+        # explicit/cached knobs are the caller's/tuner's contract and are left
+        # untouched (the config validation rejects incompatible combos).
         resolved_knobs["token_back_mode"] = "reuse_dispatch_warps"
 
     cfg = MegaMoENvfp4Config(
@@ -1056,6 +1138,7 @@ def get_symm_buffer_for_mega_moe(
         gate_up_clamp=clamp,
         apply_topk_in_fc1=apply_topk_in_fc1,
         in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+        defer_topk_reduce=defer_topk_reduce,
         combine_dtype=combine_dtype,
         # Constructed valid even before knobs land: quantized combine rejects
         # the default epi_warps token-back in __post_init__.
@@ -1064,6 +1147,12 @@ def get_symm_buffer_for_mega_moe(
         ),
     )
     cfg = with_knobs(cfg, resolved_knobs)
+    if cfg.in_kernel_fc2_reduce != in_kernel_fc2_reduce:
+        # in_kernel_fc2_reduce is a caller-owned CORRECTNESS choice (it makes
+        # the combine accumulation order nondeterministic); cached/heuristic
+        # perf knobs must not flip it. Explicit knobs dicts already bypassed
+        # resolution above and keep full control.
+        cfg = dataclasses.replace(cfg, in_kernel_fc2_reduce=in_kernel_fc2_reduce)
     frontend = MegaMoENvfp4Frontend(cfg)
 
     hidden_sf_cols = ceil_div(hidden, Nvfp4BlockSize)
@@ -1133,7 +1222,7 @@ def get_symm_buffer_for_mega_moe(
 
 
 def nvfp4_mega_moe(
-    y: torch.Tensor,
+    y: Optional[torch.Tensor],
     transformed_l1: TransformedWeights,
     transformed_l2: TransformedWeights,
     symm_buffer: MegaMoESymmBuffer,
@@ -1143,7 +1232,7 @@ def nvfp4_mega_moe(
     activation_clamp: Optional[float] = None,
     fast_math: bool = True,
     sync: bool = False,
-) -> None:
+) -> Optional[torch.Tensor]:
     """Launch the fused CuTeDSL NVFP4 MegaMoE kernel (dispatch + fc1 + fc2 + combine).
 
     Caller must stage ``symm_buffer.x`` / routing slices before calling.
@@ -1180,14 +1269,34 @@ def nvfp4_mega_moe(
         raise ValueError(
             f"num_tokens must be in [0, {symm_buffer.num_max_tokens}], got {n}."
         )
-    if n == 0 and symm_buffer._frontend.config.fc2_reduces_topk:
-        return
-    if y.shape != (n, symm_buffer.hidden):
-        raise ValueError(
-            f"y must be ({n}, {symm_buffer.hidden}), got {tuple(y.shape)}."
-        )
-    if y.dtype != torch.bfloat16:
-        raise ValueError(f"y must be bfloat16, got {y.dtype}.")
+    # n == 0 used to shortcut here without ever calling frontend.run() below.
+    # That's unsafe for in_kernel_fc2_reduce (fc2_reduces_topk): this
+    # session's EP peers rely on every rank physically launching the kernel
+    # every round (its persistent CTA grid -- get_grid_shape() -- is sized
+    # from hardware occupancy, not num_tokens, so even a 0-token round still
+    # runs the warp-specialized dispatch / token-back / tail-cleanup logic
+    # peers' cross-rank REDG combine depends on -- see the MXFP8 shim's
+    # mxfp8_mega_moe() for the identical bug, root cause, and fix, verified
+    # end-to-end against a real SGLang server). A rank that takes this
+    # shortcut instead silently skips that round's participation,
+    # desynchronizing the session's cross-rank bookkeeping -- peers'
+    # subsequent launches then wait on a signal this rank never posts,
+    # deadlocking within tens of rounds under real (unsynchronized,
+    # per-rank-independent) traffic.
+    #
+    # n == 0 needs no special case at all: it's just the degenerate instance
+    # of the padding scheme every other n already uses below (staging
+    # already marks unrouted rows as "no work" when num_tokens=0, exactly
+    # like it pads the tail for any other n), so falling through to the same
+    # full-buffer frontend.run() call every nonzero n takes is correct, not
+    # just safe.
+    if y is not None:
+        if y.shape != (n, symm_buffer.hidden):
+            raise ValueError(
+                f"y must be ({n}, {symm_buffer.hidden}), got {tuple(y.shape)}."
+            )
+        if y.dtype != torch.bfloat16:
+            raise ValueError(f"y must be bfloat16, got {y.dtype}.")
 
     fc1_weight, fc1_weight_sf = transformed_l1
     fc2_weight, fc2_weight_sf = transformed_l2
@@ -1219,10 +1328,17 @@ def nvfp4_mega_moe(
     # full padded buffer (topk_idx[n:] == -1 marks the pad rows) and copy the
     # live [:n] rows out -- matches the reference driver, which does not slice.
     out = symm_buffer._frontend.run(inputs, num_tokens=None, sync=False)
-    if out is not None:
-        y.copy_(out[:n])
-    if sync:
+    if y is None:
+        # Zero-copy: the caller consumes the workspace view under stream
+        # ordering (valid until the next launch on this session's buffers).
+        result = out[:n] if out is not None else symm_buffer.output_activation[:0]
+    else:
+        result = None
+        if out is not None:
+            y.copy_(out[:n])
+    if sync and not torch.cuda.is_current_stream_capturing():
         torch.cuda.synchronize()
+    return result
 
 
 def nvfp4_mega_launch_thunk(
@@ -1376,6 +1492,7 @@ def create_dummy_inputs(
     *,
     gate_up_clamp: Optional[float] = None,
     activation_clamp: Optional[float] = None,
+    combine_dtype: Literal["bf16", "mxfp8", "nvfp4"] = "bf16",
     fc1_alpha: Optional[PerExpertEpilogue] = None,
     fc2_alpha: Optional[PerExpertEpilogue] = None,
     fc1_norm_const: Optional[PerExpertEpilogue] = None,
@@ -1391,7 +1508,9 @@ def create_dummy_inputs(
     Mirrors ``dummy_fp8_fp4_mega_moe.create_dummy_inputs`` for the NVFP4 path.
     When ``fc1_alpha`` / ``fc2_alpha`` / ``fc1_norm_const`` are omitted, random
     per-local-expert values are generated from ``seed`` (see
-    :func:`make_dummy_epilogue_params`).
+    :func:`make_dummy_epilogue_params`).  ``combine_dtype`` is forwarded to
+    :func:`get_symm_buffer_for_mega_moe` so tuning/benchmark sessions exercise
+    the same combine wire the deployment will use.
     """
     if num_tokens < 0 or num_tokens > num_max_tokens:
         raise ValueError(
@@ -1421,6 +1540,7 @@ def create_dummy_inputs(
         rank,
         world_size,
         gate_up_clamp=clamp,
+        combine_dtype=combine_dtype,
         fc1_alpha=fc1_alpha,
         fc2_alpha=fc2_alpha,
         fc1_norm_const=fc1_norm_const,

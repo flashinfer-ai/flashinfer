@@ -8,9 +8,28 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=scripts/jit_cache_build_common.sh
 source "${SCRIPT_DIR}/jit_cache_build_common.sh"
 
+finish_sccache_stats() {
+  local exit_code=$?
+  cleanup_jit_cache_python_build || true
+  collect_sccache_stats || true
+  return "${exit_code}"
+}
+
+trap finish_sccache_stats EXIT
+
+PYTHON_VERSION_FILE="${SCRIPT_DIR}/../.python-version"
+PYTHON_VERSION="$(tr -d '[:space:]' < "${PYTHON_VERSION_FILE}")"
+if [[ ! "${PYTHON_VERSION}" =~ ^3\.[0-9]+$ ]]; then
+  echo "Invalid Python version in ${PYTHON_VERSION_FILE}: ${PYTHON_VERSION}" >&2
+  exit 2
+fi
+PYTHON_ABI="cp${PYTHON_VERSION//./}"
+
 echo "=========================================="
 echo "Building flashinfer-jit-cache wheel"
 echo "=========================================="
+
+: "${PYTORCH_INDEX:?PYTORCH_INDEX must be set}"
 
 compute_jit_cache_parallelism
 
@@ -19,6 +38,7 @@ echo "CUDA Version: ${CUDA_VERSION}"
 echo "CPU Architecture: ${ARCH}"
 echo "CUDA Major: ${CUDA_MAJOR}"
 echo "CUDA Minor: ${CUDA_MINOR}"
+echo "PyTorch Index: ${PYTORCH_INDEX}"
 echo "FlashInfer Local Version: ${FLASHINFER_LOCAL_VERSION}"
 echo "CUDA Architectures: ${FLASHINFER_CUDA_ARCH_LIST}"
 echo "Dev Release Suffix: ${FLASHINFER_DEV_RELEASE_SUFFIX}"
@@ -39,24 +59,25 @@ mkdir -p "$CONDA_pkgs_dirs" "$XDG_CACHE_HOME"
 export HOME=/tmp/home
 mkdir -p $HOME
 export PATH="$HOME/.local/bin:$PATH"
-export PATH="/opt/python/cp312-cp312/bin:$PATH"
+export PATH="/opt/python/${PYTHON_ABI}-${PYTHON_ABI}/bin:$PATH"
 export LD_LIBRARY_PATH="/usr/local/cuda/lib64:/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH"
 
+EXPECTED_CUDA_VERSION="${CUDA_MAJOR}.${CUDA_MINOR}"
+validate_jit_cache_cuda_toolchain "${EXPECTED_CUDA_VERSION}"
+
 echo "::group::Install build system"
-pip install --upgrade build
+setup_jit_cache_python_build python3 "${EXPECTED_CUDA_VERSION}" "${PYTORCH_INDEX}"
 echo "::endgroup::"
 
 # Optional: set up sccache for compiler caching with S3 backend
 if [ -n "$SCCACHE_BUCKET" ]; then
-  echo "::group::Install sccache"
   export SCCACHE_BUCKET
   setup_sccache "cuda${CUDA_MAJOR}${CUDA_MINOR}-$(uname -m)" "$(cd .. && pwd -P)"
-  echo "::endgroup::"
 fi
 
 # Clean any previous builds
 echo "Cleaning previous builds..."
-rm -rf dist build *.egg-info
+rm -rf -- dist build ./*.egg-info
 
 # Build the wheel using the build module for better isolation
 echo "Building wheel..."
@@ -84,13 +105,6 @@ if [ -n "${OUTPUT_DIR}" ]; then
     echo "Copying wheels to output directory: ${OUTPUT_DIR}"
     mkdir -p "${OUTPUT_DIR}"
     cp -v dist/*.whl "${OUTPUT_DIR}/"
-fi
-
-# Print sccache stats if enabled
-if [ -n "$SCCACHE_BUCKET" ]; then
-  echo "::group::sccache stats"
-  sccache --show-stats
-  echo "::endgroup::"
 fi
 
 echo ""

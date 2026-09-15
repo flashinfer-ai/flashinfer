@@ -114,6 +114,7 @@ finish_aot_memory_monitoring() {
     if [ "$exit_code" -ne 0 ]; then
         print_aot_memory_diagnostics
     fi
+    collect_sccache_stats || true
 }
 
 trap finish_aot_memory_monitoring EXIT
@@ -187,8 +188,13 @@ echo ""
 echo "========================================"
 echo "Installing flashinfer package"
 echo "========================================"
+FLASHINFER_EDITABLE_SPEC="."
+if [[ "${CUDA_VERSION}" == 13* ]]; then
+    FLASHINFER_EDITABLE_SPEC=".[cu13]"
+fi
 run_with_aot_memory_monitor "pip_install_flashinfer_editable" \
-    pip install -e . -v || {
+    env FLASHINFER_BUILD_NO_PIP=1 \
+    pip install --no-build-isolation --no-deps -e "${FLASHINFER_EDITABLE_SPEC}" -v || {
     echo "ERROR: Failed to install flashinfer package"
     exit 1
 }
@@ -211,8 +217,14 @@ echo "Building flashinfer-jit-cache wheel"
 echo "========================================"
 cd flashinfer-jit-cache
 rm -rf dist build *.egg-info
+# The image satisfies this package's build requires except wheel, until the
+# images carrying it are rolled out.
+python -c "import wheel" 2>/dev/null || pip install --no-deps wheel
+# --no-isolation keeps build from re-downloading torch, but it then verifies the
+# build requires transitively, and the image's torch declares an nvidia-cudnn
+# wheel the image does not install. Testing what the image ships is the point.
 run_with_aot_memory_monitor "build_flashinfer_jit_cache_wheel" \
-    python -m build --wheel
+    python -m build --wheel --no-isolation --skip-dependency-check
 
 # Get the built wheel file
 WHEEL_FILE=$(ls -t dist/*.whl | head -n 1)
@@ -254,12 +266,6 @@ run_with_aot_memory_monitor "verify_all_modules_compiled" python scripts/verify_
     exit 1
 }
 echo "✓ All modules verified successfully"
-
-echo ""
-echo "========================================"
-echo "sccache stats"
-echo "========================================"
-sccache --show-stats
 
 echo ""
 echo "========================================"

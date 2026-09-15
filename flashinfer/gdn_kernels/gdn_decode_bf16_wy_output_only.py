@@ -38,7 +38,6 @@ import cuda.bindings.driver as cuda
 import cutlass
 from cutlass import const_expr
 import cutlass.cute as cute
-import cutlass.cute.experimental  # noqa: F401  # side effect: registers cute.experimental.jit
 import cutlass.utils as utils
 from cutlass.cute.arch import sync_threads
 from cutlass.cute.nvgpu import cpasync
@@ -47,6 +46,8 @@ from cutlass.cute.runtime import from_dlpack
 from cutlass.cute.typing import Int32, Int64
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T as mlir_T
+
+from .dtype_compat import as_bf16
 
 
 device = torch.device("cuda:0")
@@ -694,7 +695,7 @@ class GdnDecodeKernel:
         # (log_alpha=0) cannot reach the real rows through the causal prefix-sum.
         self._ab_native = bool(ab_native)
 
-    @cute.experimental.jit
+    @cute.jit
     def __call__(
         self,
         gQ: cute.Tensor,
@@ -764,7 +765,7 @@ class GdnDecodeKernel:
             min_blocks_per_mp=self._min_blocks_per_mp,
         )
 
-    @cute.experimental.kernel
+    @cute.kernel
     def kernel(
         self,
         gQ: cute.Tensor,
@@ -1943,14 +1944,29 @@ class GdnDecodeKernel:
 # ============================================================================
 
 _CACHE: dict = {}
+
+
+def _compile_options(device: torch.device) -> tuple:
+    major, minor = torch.cuda.get_device_capability(device)
+    return (cute.GPUArch(f"sm_{major}{minor}a"),) if major == 12 else ()
+
+
 # Persistent pre-zeroed T=16 input staging buffers for the T<16 path, keyed by
-# (device, B, H, HK, HV, K, V, dtype, T). Reused across calls so short-T decode
-# pays only a T-row copy-in (no per-call F.pad realloc/re-zero).
+# (stream, device, B, H, HK, HV, K, V, dtype, T). Reused across calls so short-T
+# decode pays only a T-row copy-in (no per-call F.pad realloc/re-zero). The
+# CUDA stream is part of the key because the buffers are mutable: two same-shape
+# calls on different streams would otherwise share one buffer, and the second
+# call's copy-in can overwrite it while the first call's kernel is still reading
+# (observed corrupting outputs by ~0.37 absmax). Same-stream reuse is safe —
+# stream order guarantees the kernel consumes the buffer before the next copy-in.
+# A destroyed stream leaves a stale entry; harmless because a recycled stream
+# handle re-stages valid rows on first use and the zero tail rows never change.
 _STAGE: dict = {}
 # When False, the T<16 path assumes the staging buffers already hold the current
 # inputs and skips the per-call copy-in. Set this only when the producer writes
 # q/k/v/a/b directly into the persistent T=16 buffers (the fixed-buffer serving
-# pattern) or to benchmark the bare kernel. Default True = always safe drop-in.
+# pattern, one buffer set per stream) or to benchmark the bare kernel.
+# Default True = always safe drop-in.
 _RESTAGE = True
 # (native-short-T) When set, the T<T_KERNEL path passes q/k to the kernel as the
 # real [B,T,...] tensors (no host staging copy) and the kernel loads only those T
@@ -2085,6 +2101,11 @@ def gated_delta_rule_mtp(
     assert initial_state_source.dtype == torch.bfloat16, (
         f"initial_state_source must be bf16 (pool, HV, V, K); got {initial_state_source.dtype}."
     )
+    # bf16-only kernel: any other dtype would be reinterpreted, not converted.
+    q, k, v, a, b = as_bf16(q, k, v, a, b)
+    assert output is None or output.dtype == torch.bfloat16, (
+        f"output must be bf16; got {output.dtype}."
+    )
 
     B, T, H, K_dim = q.shape
     HV = v.shape[2]
@@ -2101,6 +2122,18 @@ def gated_delta_rule_mtp(
         initial_state_indices = torch.arange(B, dtype=torch.int32, device=device)
     else:
         initial_state_indices = initial_state_indices.contiguous()
+        assert initial_state_indices.dtype in (torch.int32, torch.int64), (
+            f"initial_state_indices must be int32 or int64; "
+            f"got {initial_state_indices.dtype}."
+        )
+        # Kernel loads indices as int32; convert rather than reinterpret.
+        if initial_state_indices.dtype != torch.int32:
+            iinfo = torch.iinfo(torch.int32)
+            assert (
+                int(initial_state_indices.min()) >= iinfo.min
+                and int(initial_state_indices.max()) <= iinfo.max
+            ), "initial_state_indices must fit in int32 before narrowing"
+            initial_state_indices = initial_state_indices.to(torch.int32)
     _io_dtype = q.dtype
     HK = k.shape[2]
 
@@ -2161,7 +2194,8 @@ def gated_delta_rule_mtp(
             _ab_native_flag = True
             # q, k, v and a, b all stay native [B, T, ...].
         elif _native:
-            skey: tuple = (str(device), B, HV, str(_io_dtype), T, "ab")
+            _stream = torch.cuda.current_stream(device).cuda_stream
+            skey: tuple = (_stream, str(device), B, HV, str(_io_dtype), T, "ab")
             buf = _STAGE.get(skey)
             _fresh = buf is None
             if _fresh:
@@ -2178,7 +2212,19 @@ def gated_delta_rule_mtp(
             a, b = ab, bb
             # q, k, v stay as the native [B, T, ...] tensors.
         else:
-            skey = (str(device), B, H, HK, HV, K_dim, V_dim, str(_io_dtype), T)
+            _stream = torch.cuda.current_stream(device).cuda_stream
+            skey = (
+                _stream,
+                str(device),
+                B,
+                H,
+                HK,
+                HV,
+                K_dim,
+                V_dim,
+                str(_io_dtype),
+                T,
+            )
             buf = _STAGE.get(skey)
             _fresh = buf is None
             if _fresh:
@@ -2236,8 +2282,10 @@ def gated_delta_rule_mtp(
     # compile and read H0 with the wrong strides -> ~3e-01 garbage outputs. Found
     # by the intense correctness sweep; invisible to the tests/benches, which use
     # one HV per process.
+    cc = torch.cuda.get_device_capability(device)
     cache_key: tuple = (
         str(device),
+        cc,
         mbp,
         t_disc,
         n_valid,
@@ -2297,16 +2345,19 @@ def gated_delta_rule_mtp(
     ]
 
     if cache_key not in _CACHE:
-        _CACHE[cache_key] = cute.compile(
-            GdnDecodeKernel(
-                disable_state_update=True,
-                min_blocks_per_mp=mbp,
-                t_input=t_disc,
-                n_valid=n_valid,
-                qkv_row_stride=_qkv_rs,
-                ab_native=_ab_native_flag,
-            ),
-            *args,
+        kernel = GdnDecodeKernel(
+            disable_state_update=True,
+            min_blocks_per_mp=mbp,
+            t_input=t_disc,
+            n_valid=n_valid,
+            qkv_row_stride=_qkv_rs,
+            ab_native=_ab_native_flag,
+        )
+        options = _compile_options(device)
+        _CACHE[cache_key] = (
+            cute.compile[options](kernel, *args)
+            if options
+            else cute.compile(kernel, *args)
         )
     _CACHE[cache_key](*args)
 

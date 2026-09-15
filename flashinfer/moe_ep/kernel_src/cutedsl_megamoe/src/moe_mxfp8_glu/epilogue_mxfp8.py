@@ -17,23 +17,42 @@ try:
 except ImportError:  # pragma: no cover -- fallback for wheels without cute.iket
     from src.iket_compat import iket
 from cutlass.cute.nvgpu import cpasync, tcgen05
+from cutlass.cute.typing import AddressSpace
 import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 import cutlass.utils.blackwell_helpers as sm100_utils
 
-from cutlass.cutlass_dsl import Int64
+from cutlass._mlir import ir
+from cutlass._mlir.dialects import arith as _arith
+from cutlass._mlir.dialects import llvm
+from cutlass.cutlass_dsl import dsl_user_op, Int32 as _epi_Int32, Int64
 
 from src.flag_batch import GpuReleaseFlagBatchTracker
 from src.token_comm import CombineFormat, TokenSrcMetadata
 from src.ptx_helpers import stg_e8m0_from_f32, stg_e8m0x8_from_f32
 
+from moe_nvfp4_swapab.contract import (
+    Contract,
+    FunctionMapping,
+    Space,
+    TensorWithContract,
+    assert_contract_equivalent,
+)
 from moe_nvfp4_swapab.fc1_fc2_fuse_sched import BlockPhase
+from common.megamoe_constants import Nvfp4BlockSize
 
 from common.moe_utils import fmin, fmax, swiglu_act, quant_sfd_row
 from cutlass.cute.typing import Float32
 from moe_nvfp4_swapab.epilogue import (
     _TmemTranspose16x32Core,
+    _red_add_release_gpu_s32,
     _red_add_relaxed_sys_v2_bf16x2,
+    SwapABSwigluFp4Epilogue,
+    EpilogueTokenTile,
+    Fc2AccLoadAndPack,
+    TmemTranspose16x32Packed,
+    Fc2UnpackPermuteStg,
+    Region,
 )
 
 Fc1GateUpInterleave = 32
@@ -151,7 +170,7 @@ class GluMxfp8Epilogue:
         static_expert_shape: Optional[Tuple[int, int, int]] = None,
         fc2_in_kernel_topk_reduce: bool = False,
         token_back_by_dispatch: bool = False,
-        epi_flag_batch: Union[int, Tuple[int, int]] = 1,
+        epi_flag_batch: Tuple[int, int] = (1, 1),
         apply_topk_in_fc1: bool = False,
         generate_c: bool = False,
         use_stg_fc1: bool = False,
@@ -243,12 +262,8 @@ class GluMxfp8Epilogue:
             and (self._cta_tile_n // EpilogueTileN == 8)
         )
         self._epi_tile_c = (self._cta_tile_m, 2 * Fc1GateUpInterleave)
-        if isinstance(epi_flag_batch, tuple):
-            self._epi_fc1_batch = max(1, epi_flag_batch[0])
-            self._epi_fc2_batch = max(1, epi_flag_batch[1])
-        else:
-            self._epi_fc1_batch = max(1, epi_flag_batch)
-            self._epi_fc2_batch = max(1, epi_flag_batch)
+        self._epi_fc1_batch = max(1, epi_flag_batch[0])
+        self._epi_fc2_batch = max(1, epi_flag_batch[1])
 
         self.glu_clamp = cutlass.Float32(glu_clamp) if glu_clamp is not None else None
 
@@ -538,9 +553,12 @@ class GluMxfp8Epilogue:
         real_fc1_output, _ = sched_ext.get_gmem_tensor(
             "d", gmem_fc1_output, work_tile_info
         )
-        real_fc1_output_sf, _ = sched_ext.get_gmem_tensor(
-            "sfd", gmem_fc1_output_sf, work_tile_info
-        )
+        if cutlass.const_expr(self.fc1_output_dtype.width == 8):
+            real_fc1_output_sf, _ = sched_ext.get_gmem_tensor(
+                "sfd", gmem_fc1_output_sf, work_tile_info
+            )
+        else:
+            real_fc1_output_sf = None
         real_topk_scores, _ = sched_ext.get_gmem_tensor(
             "topk", gmem_topk_scores, work_tile_info
         )
@@ -550,21 +568,18 @@ class GluMxfp8Epilogue:
             c_n_base = work_tile_info.tile_n_idx * cutlass.Int32(self._subtile_cnt)
 
         acc_pipeline.consumer_wait(acc_consumer_state)
-        iket.range_push("mxfp8_fc1_epi_tile")
-
-        if cutlass.const_expr(self._overlapping_accum):
-            acc_stage_col_offset = cutlass.Int32(acc_consumer_state.phase) * (
-                256 - self._num_sf_tmem_cols
-            )
-        else:
-            acc_stage_col_offset = (
-                cutlass.Int32(acc_consumer_state.index) * self._cta_tile_n
-            )
+        iket.range_push("fc1_epi_tile")
 
         subtile_cnt = self._subtile_cnt
+        if cutlass.const_expr(self._overlapping_accum):
+            # Start subtile: last for odd turn, first for even.
+            start_subtile = subtile_cnt - 1 if is_odd_turn else 0
+        else:
+            # Standard double buffering walks the subtiles front to back.
+            start_subtile = 0
         tmem_gate, tmem_up = self._subtile_local_tmem_tensor_pair(
             tmem_acc_tensor,
-            subtile_cnt - 1 if is_odd_turn else 0,
+            start_subtile,
             warp_idx,
         )
         tmem_forward_cols = Fc1GateUpInterleave * 2
@@ -572,8 +587,11 @@ class GluMxfp8Epilogue:
             if is_odd_turn:
                 tmem_forward_cols = -Fc1GateUpInterleave * 2
 
-        layout_sf = cute.make_layout(4)
-        rmem_sf = cute.make_rmem_tensor(layout_sf.shape, self.acc_dtype)
+        if cutlass.const_expr(self.fc1_output_dtype.width == 8):
+            layout_sf = cute.make_layout(4)
+            rmem_sf = cute.make_rmem_tensor(layout_sf.shape, self.acc_dtype)
+        else:
+            rmem_sf = None
 
         # ── Set up RMEM→SMEM copy atom (direct CopyUniversalOp) ──
         r2s_copy_atom = cute.make_copy_atom(
@@ -645,7 +663,8 @@ class GluMxfp8Epilogue:
         if not cutlass.const_expr(self._overlapping_accum):
             self._acc_pipeline_consumer_release(acc_pipeline, acc_consumer_state, True)
 
-        self._stg_sf_fc1(rmem_sf, real_fc1_output_sf, work_tile_info, tidx)
+        if cutlass.const_expr(self.fc1_output_dtype.width == 8):
+            self._stg_sf_fc1(rmem_sf, real_fc1_output_sf, work_tile_info, tidx)
 
         # ── TMA store: 4 stores (one per warp group) after all subtiles ──
         if cutlass.const_expr(not self._use_stg_fc1):
@@ -668,6 +687,22 @@ class GluMxfp8Epilogue:
                 )
 
         iket.range_pop()
+
+    @cute.jit
+    def _swiglu_act(
+        self,
+        t_swiglu: cute.Tensor,
+        t_up: cute.Tensor,
+        t_gate: cute.Tensor,
+        prob: Optional[Float32] = None,
+    ) -> None:
+        """SwiGLU hook consumed by ``_run_fc1_subtile``.
+
+        Subclasses override this to bind a different implementation (the
+        multiplication association order is part of each pipeline's numerical
+        contract with its host reference).
+        """
+        swiglu_act(t_swiglu, t_up, t_gate, prob)
 
     @cute.jit
     def _run_fc1_subtile(
@@ -697,7 +732,7 @@ class GluMxfp8Epilogue:
         c_pipeline,
     ) -> None:
         """MXFP8 fc1 subtile: GLU + E8M0 SF + fp8 R2S."""
-        iket.range_push("mxfp8_fc1_epilogue_subtile")
+        iket.range_push("fc1_epilogue_subtile")
 
         r_layout = cute.make_layout((((Fc1GateUpInterleave,), 1),), stride=(((1,), 0),))
         r_gate = cute.make_rmem_tensor(r_layout.shape, self.acc_dtype)
@@ -710,9 +745,10 @@ class GluMxfp8Epilogue:
         cute.copy(atom_t2r, tmem_gate_tensor, r_gate)
         cute.copy(atom_t2r, tmem_up_tensor, r_up)
 
-        self._acc_pipeline_consumer_release(
-            acc_pipeline, acc_consumer_state, acc_is_release
-        )
+        if cutlass.const_expr(self._overlapping_accum):
+            self._acc_pipeline_consumer_release(
+                acc_pipeline, acc_consumer_state, acc_is_release
+            )
 
         # ── generate_c: store raw gate+up to GMEM C tensor via SMEM staging ──
         if cutlass.const_expr(self._generate_c):
@@ -746,25 +782,31 @@ class GluMxfp8Epilogue:
             topk = Float32(real_topk_scores[token_in_tile])
 
         swiglu = cute.make_rmem_tensor(r_layout.shape, self.acc_dtype)
-        swiglu_act(swiglu, r_up, r_gate, topk)
+        self._swiglu_act(swiglu, r_up, r_gate, topk)
 
         c = cute.make_rmem_tensor(r_layout.shape, self.fc1_output_dtype)
-        qpvscale = quant_sfd_row(
-            swiglu,
-            c,
-            norm_const,
-            self._sf_vec_size,
-            self.sf_dtype,
-            self.fc1_output_dtype,
-        )
-        if subtile_idx == 0:
-            rmem_sf[0] = qpvscale
-        elif subtile_idx == 1:
-            rmem_sf[1] = qpvscale
-        elif subtile_idx == 2:
-            rmem_sf[2] = qpvscale
-        elif subtile_idx == 3:
-            rmem_sf[3] = qpvscale
+        if cutlass.const_expr(self.fc1_output_dtype.width == 8):
+            # Quantized hand-off: fp8 data + E8M0 block scale.
+            qpvscale = quant_sfd_row(
+                swiglu,
+                c,
+                norm_const,
+                self._sf_vec_size,
+                self.sf_dtype,
+                self.fc1_output_dtype,
+            )
+            if subtile_idx == 0:
+                rmem_sf[0] = qpvscale
+            elif subtile_idx == 1:
+                rmem_sf[1] = qpvscale
+            elif subtile_idx == 2:
+                rmem_sf[2] = qpvscale
+            elif subtile_idx == 3:
+                rmem_sf[3] = qpvscale
+        else:
+            # Plain-data hand-off: direct cast to the fc1 output dtype (the
+            # fc1_output workspace is reloaded as fc2's A operand).
+            c.store(swiglu.load().to(self.fc1_output_dtype))
 
         thread_in_warp = tidx % WarpThreadCount
         if cutlass.const_expr(self._use_stg_fc1):
@@ -894,7 +936,7 @@ class GluMxfp8Epilogue:
         via ``Fc2OutputDest``; for token_back_by_dispatch the epilogue writes to
         the local ``fc2_output_workspace`` pool instead.
         """
-        iket.range_push("mxfp8_fc2_epilogue_subtile")
+        iket.range_push("fc2_epilogue_subtile")
 
         fc2_subtile_cnt = self._cta_tile_n // EpilogueTileN  # = 8
         hidden_group = (
@@ -1200,27 +1242,16 @@ class GluMxfp8Epilogue:
             work_tile_info,
         )
         acc_pipeline.consumer_wait(acc_consumer_state)
-        iket.range_push("mxfp8_fc2_epi_tile")
-
-        # For overlapping_accum: phase selects which TMEM stage holds the result,
-        # mirroring the fc1 epilogue formula.  When a cluster processes an fc1 tile
-        # before fc2, acc_consumer_state.phase is 1 and the result lives in the
-        # second physical stage (col offset 256-num_sf_tmem_cols).  Hardcoding 0
-        # reads the wrong stage for phase=1 clusters.
-        # For non-overlapping: stage index selects the physical region.
-        if cutlass.const_expr(self._overlapping_accum):
-            acc_stage_col_offset = cutlass.Int32(acc_consumer_state.phase) * (
-                256 - self._num_sf_tmem_cols
-            )
-        else:
-            acc_stage_col_offset = (
-                cutlass.Int32(acc_consumer_state.index) * self._cta_tile_n
-            )
+        iket.range_push("fc2_epi_tile")
 
         fc2_subtile_cnt = self._cta_tile_n // EpilogueTileN  # = 8
 
-        # Start subtile mirrors fc1: last for odd turn, first for even.
-        start_subtile = fc2_subtile_cnt - 1 if is_odd_turn else 0
+        if cutlass.const_expr(self._overlapping_accum):
+            # Start subtile mirrors fc1: last for odd turn, first for even.
+            start_subtile = fc2_subtile_cnt - 1 if is_odd_turn else 0
+        else:
+            # Standard double buffering walks the subtiles front to back.
+            start_subtile = 0
         tmem_t = self._subtile_fc2_tmem_tensor(
             tmem_acc_tensor,
             cutlass.Int32(start_subtile),
@@ -1341,17 +1372,19 @@ class GluMxfp8Epilogue:
         acc_pipeline,
         sched_consumer,
         sched_ext,
-        smem_fc1_output_buffer: cute.Tensor,
+        smem_fc1_output_buffer: Optional[cute.Tensor],
         tma_atom_fc1_output: cute.CopyAtom,
         gmem_fc1_output: cute.Tensor,
-        gmem_fc1_output_sf: cute.Tensor,
         gmem_topk_scores: cute.Tensor,
         gmem_fc2_output: cute.Tensor,
         gmem_fc1_done_counter: cute.Tensor,
         warp_idx: int,
         tidx,
-        alpha,
-        norm_const,
+        # Quantisation operands; subclasses without an SF plane leave them
+        # None (their fc1 task-tile overrides ignore the forwarded values).
+        gmem_fc1_output_sf: Optional[cute.Tensor] = None,
+        alpha=None,
+        norm_const=None,
         token_comm_args=None,
         # generate_c: pass real sC / tma_atom_c / tma_tensor_c when True;
         # pass smem_fc1_output_buffer / tma_atom_fc1_output / gmem_fc1_output as
@@ -1361,11 +1394,21 @@ class GluMxfp8Epilogue:
         gmem_c: cute.Tensor = None,
     ) -> None:
         """
-        Run the full MXFP8 fc1+fc2-fused epilogue task-tile loop.
+        Run the full fc1+fc2-fused epilogue task-tile loop.
 
         ``token_comm_args`` (MegaMoE path) is forwarded to the fc2 task tile so
         the fc2 STG is routed to the source rank's combine output.
         """
+        # Trace-time contract: ``smem_fc1_output_buffer=None`` is legal only
+        # for the direct-STG fc1 path — every dereference below sits behind a
+        # ``const_expr(use_stg_fc1)`` gate keyed on the same flag, so the TMA
+        # branches are never traced when the buffer is absent.  A new,
+        # ungated use would only fail in the use_stg_fc1=True compile; this
+        # assert pins the failure to the entry point instead.
+        assert self._use_stg_fc1 or smem_fc1_output_buffer is not None, (
+            "smem_fc1_output_buffer=None requires use_stg_fc1=True (the TMA "
+            "fc1-output store path consumes the sD staging buffer)"
+        )
         acc_consumer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Consumer, self._num_acc_pipeline_stages
         )
@@ -1403,7 +1446,13 @@ class GluMxfp8Epilogue:
         )
 
         while work_tile_info.is_valid_tile:
-            acc_stage_index = 0 if is_odd_turn else 1
+            if cutlass.const_expr(self._overlapping_accum):
+                # Overlap-acc: the stage parity follows the odd-turn flip.
+                acc_stage_index = 0 if is_odd_turn else 1
+            else:
+                # Standard double buffering: the consumer stage index mirrors
+                # the MMA warp's producer stage index.
+                acc_stage_index = acc_consumer_state.index
             tmem_acc_stage_tesnor = tmem_acc_tensor[(None, None, None, acc_stage_index)]
 
             if work_tile_info.phase == cutlass.Int32(BlockPhase.Linear1):

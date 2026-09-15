@@ -45,7 +45,17 @@ from ..cute_dsl.utils import get_cutlass_dtype, get_num_sm
 # =============================================================================
 
 FLOAT8_E4M3_MAX = 448.0  # Maximum value representable in FP8 E4M3
+FLOAT8_E5M2_MAX = 57344.0  # Maximum value representable in FP8 E5M2
 COPY_BITS = 128  # 128-bit vectorized loads
+
+
+def get_fp8_max(dtype) -> float:
+    """Maximum finite value of a supported FP8 output dtype."""
+    if dtype is cutlass.Float8E4M3FN:
+        return FLOAT8_E4M3_MAX
+    if dtype is cutlass.Float8E5M2:
+        return FLOAT8_E5M2_MAX
+    raise ValueError(f"Unsupported FP8 output dtype: {dtype}")
 
 
 # =============================================================================
@@ -300,6 +310,295 @@ def cvt_and_store_2xf32_to_e4m3_hw(
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
     )
+
+
+@dsl_user_op
+def cvt_and_store_f32_to_e5m2_hw(val: Float32, addr: Int64, *, loc=None, ip=None):
+    """Convert float32 to E5M2 and store single byte — hardware path (sm_89+)."""
+    llvm.inline_asm(
+        None,
+        [Float32(val).ir_value(loc=loc, ip=ip), Int64(addr).ir_value(loc=loc, ip=ip)],
+        """
+        {
+            .reg .b16 fp8_pair;
+            .reg .f32 zero;
+            mov.f32 zero, 0f00000000;
+            cvt.rn.satfinite.e5m2x2.f32 fp8_pair, zero, $0;
+            st.global.b8 [$1], fp8_pair;
+        }
+        """,
+        "f,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def cvt_and_store_f32_to_e5m2_sw(val: Float32, addr: Int64, *, loc=None, ip=None):
+    """Convert float32 to E5M2 and store single byte — software path (all architectures).
+
+    Same bit-manipulation scheme as cvt_and_store_f32_to_e4m3_sw with the
+    constants rederived for E5M2 (1 sign bit, 5 exponent bits with bias=15,
+    2 mantissa bits). The caller must clamp the value to [-57344, 57344]:
+      - Normal range (f32 biased exp >= 113): direct extraction with RNE
+      - Denormal range (f32 biased exp in [110..112]): shift mantissa with
+        implicit bit, RNE
+      - Underflow (abs <= 2^-17): flush to zero (RNE midpoint to min denorm)
+    """
+    llvm.inline_asm(
+        None,
+        [Float32(val).ir_value(loc=loc, ip=ip), Int64(addr).ir_value(loc=loc, ip=ip)],
+        """
+        {
+            .reg .b32 fbits, sign8, abs_bits, f32_exp, f32_mant;
+            .reg .b32 e5m2_exp, e5m2_mant, norm_raw;
+            .reg .b32 rbit, sticky, odd_bit, radj;
+            .reg .b32 shift, dmant3, denorm_raw;
+            .reg .b32 dr_bit, dsticky, dadj;
+            .reg .b32 e5m2_raw, tmp, tmp2;
+            .reg .pred p_zero, p_denorm;
+
+            // Bitcast float to int and extract sign/exponent/mantissa
+            mov.b32 fbits, $0;
+            shr.u32 sign8, fbits, 24;
+            and.b32 sign8, sign8, 128;
+            and.b32 abs_bits, fbits, 0x7FFFFFFF;
+            shr.u32 f32_exp, abs_bits, 23;
+            and.b32 f32_mant, abs_bits, 0x007FFFFF;
+
+            // === Normal path (f32 biased exp >= 113, i.e. e5m2 exp >= 1) ===
+            sub.u32 e5m2_exp, f32_exp, 112;
+            shr.u32 e5m2_mant, f32_mant, 21;
+            shl.b32 norm_raw, e5m2_exp, 2;
+            or.b32  norm_raw, norm_raw, e5m2_mant;
+
+            // Round-to-nearest-even: round up if round_bit AND (sticky OR odd)
+            shr.u32 rbit, f32_mant, 20;
+            and.b32 rbit, rbit, 1;
+            and.b32 sticky, f32_mant, 0x000FFFFF;
+            and.b32 odd_bit, e5m2_mant, 1;
+            or.b32  tmp, sticky, odd_bit;
+            min.u32 tmp, tmp, 1;
+            and.b32 radj, tmp, rbit;
+            add.u32 norm_raw, norm_raw, radj;
+            min.u32 norm_raw, norm_raw, 123;
+
+            // === Denormal path (f32 biased exp in {110,111,112}) ===
+            sub.u32 shift, 113, f32_exp;
+            shr.u32 tmp, f32_mant, 21;
+            or.b32  dmant3, tmp, 4;
+            shr.u32 denorm_raw, dmant3, shift;
+
+            // RNE rounding for denormals
+            sub.u32 tmp, shift, 1;
+            shr.u32 dr_bit, dmant3, tmp;
+            and.b32 dr_bit, dr_bit, 1;
+            shl.b32 tmp2, 1, tmp;
+            sub.u32 tmp2, tmp2, 1;
+            and.b32 dsticky, dmant3, tmp2;
+            and.b32 tmp, f32_mant, 0x001FFFFF;
+            or.b32  dsticky, dsticky, tmp;
+            and.b32 odd_bit, denorm_raw, 1;
+            or.b32  tmp, dsticky, odd_bit;
+            min.u32 tmp, tmp, 1;
+            and.b32 dadj, tmp, dr_bit;
+            add.u32 denorm_raw, denorm_raw, dadj;
+
+            // Select between normal/denormal, then apply zero flush
+            setp.le.u32 p_denorm, f32_exp, 112;
+            selp.u32 e5m2_raw, denorm_raw, norm_raw, p_denorm;
+            setp.le.u32 p_zero, abs_bits, 0x37000000;
+            selp.u32 e5m2_raw, 0, e5m2_raw, p_zero;
+
+            // Apply sign and store single byte
+            or.b32  e5m2_raw, e5m2_raw, sign8;
+            st.global.b8 [$1], e5m2_raw;
+        }
+        """,
+        "f,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def cvt_and_store_8xf32_to_e5m2_hw(
+    v0: Float32,
+    v1: Float32,
+    v2: Float32,
+    v3: Float32,
+    v4: Float32,
+    v5: Float32,
+    v6: Float32,
+    v7: Float32,
+    addr: Int64,
+    *,
+    loc=None,
+    ip=None,
+):
+    """Convert 8 float32 values to E5M2 and store as one 64-bit global store (sm_89+)."""
+    llvm.inline_asm(
+        None,
+        [
+            Float32(v0).ir_value(loc=loc, ip=ip),
+            Float32(v1).ir_value(loc=loc, ip=ip),
+            Float32(v2).ir_value(loc=loc, ip=ip),
+            Float32(v3).ir_value(loc=loc, ip=ip),
+            Float32(v4).ir_value(loc=loc, ip=ip),
+            Float32(v5).ir_value(loc=loc, ip=ip),
+            Float32(v6).ir_value(loc=loc, ip=ip),
+            Float32(v7).ir_value(loc=loc, ip=ip),
+            Int64(addr).ir_value(loc=loc, ip=ip),
+        ],
+        """
+        {
+            .reg .b16 p01, p23, p45, p67;
+            .reg .b32 lo, hi;
+            cvt.rn.satfinite.e5m2x2.f32 p01, $1, $0;
+            cvt.rn.satfinite.e5m2x2.f32 p23, $3, $2;
+            cvt.rn.satfinite.e5m2x2.f32 p45, $5, $4;
+            cvt.rn.satfinite.e5m2x2.f32 p67, $7, $6;
+            mov.b32 lo, {p01, p23};
+            mov.b32 hi, {p45, p67};
+            st.global.v2.b32 [$8], {lo, hi};
+        }
+        """,
+        "f,f,f,f,f,f,f,f,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def cvt_and_store_4xf32_to_e5m2_hw(
+    v0: Float32,
+    v1: Float32,
+    v2: Float32,
+    v3: Float32,
+    addr: Int64,
+    *,
+    loc=None,
+    ip=None,
+):
+    """Convert 4 float32 values to E5M2 and store as one 32-bit global store (sm_89+)."""
+    llvm.inline_asm(
+        None,
+        [
+            Float32(v0).ir_value(loc=loc, ip=ip),
+            Float32(v1).ir_value(loc=loc, ip=ip),
+            Float32(v2).ir_value(loc=loc, ip=ip),
+            Float32(v3).ir_value(loc=loc, ip=ip),
+            Int64(addr).ir_value(loc=loc, ip=ip),
+        ],
+        """
+        {
+            .reg .b16 p01, p23;
+            .reg .b32 packed;
+            cvt.rn.satfinite.e5m2x2.f32 p01, $1, $0;
+            cvt.rn.satfinite.e5m2x2.f32 p23, $3, $2;
+            mov.b32 packed, {p01, p23};
+            st.global.b32 [$4], packed;
+        }
+        """,
+        "f,f,f,f,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def cvt_and_store_2xf32_to_e5m2_hw(
+    v0: Float32, v1: Float32, addr: Int64, *, loc=None, ip=None
+):
+    """Convert 2 float32 values to E5M2 and store as one 16-bit global store (sm_89+)."""
+    llvm.inline_asm(
+        None,
+        [
+            Float32(v0).ir_value(loc=loc, ip=ip),
+            Float32(v1).ir_value(loc=loc, ip=ip),
+            Int64(addr).ir_value(loc=loc, ip=ip),
+        ],
+        """
+        {
+            .reg .b16 packed;
+            cvt.rn.satfinite.e5m2x2.f32 packed, $1, $0;
+            st.global.b16 [$2], packed;
+        }
+        """,
+        "f,f,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+# =============================================================================
+# FP8 dtype dispatch wrappers
+# =============================================================================
+
+
+@cute.jit
+def cvt_and_store_f32_to_fp8_hw(val: Float32, addr: Int64, dtype: cutlass.Constexpr):
+    if cutlass.const_expr(dtype is cutlass.Float8E5M2):
+        cvt_and_store_f32_to_e5m2_hw(val, addr)
+    else:
+        cvt_and_store_f32_to_e4m3_hw(val, addr)
+
+
+@cute.jit
+def cvt_and_store_f32_to_fp8_sw(val: Float32, addr: Int64, dtype: cutlass.Constexpr):
+    if cutlass.const_expr(dtype is cutlass.Float8E5M2):
+        cvt_and_store_f32_to_e5m2_sw(val, addr)
+    else:
+        cvt_and_store_f32_to_e4m3_sw(val, addr)
+
+
+@cute.jit
+def cvt_and_store_8xf32_to_fp8_hw(
+    v0: Float32,
+    v1: Float32,
+    v2: Float32,
+    v3: Float32,
+    v4: Float32,
+    v5: Float32,
+    v6: Float32,
+    v7: Float32,
+    addr: Int64,
+    dtype: cutlass.Constexpr,
+):
+    if cutlass.const_expr(dtype is cutlass.Float8E5M2):
+        cvt_and_store_8xf32_to_e5m2_hw(v0, v1, v2, v3, v4, v5, v6, v7, addr)
+    else:
+        cvt_and_store_8xf32_to_e4m3_hw(v0, v1, v2, v3, v4, v5, v6, v7, addr)
+
+
+@cute.jit
+def cvt_and_store_4xf32_to_fp8_hw(
+    v0: Float32,
+    v1: Float32,
+    v2: Float32,
+    v3: Float32,
+    addr: Int64,
+    dtype: cutlass.Constexpr,
+):
+    if cutlass.const_expr(dtype is cutlass.Float8E5M2):
+        cvt_and_store_4xf32_to_e5m2_hw(v0, v1, v2, v3, addr)
+    else:
+        cvt_and_store_4xf32_to_e4m3_hw(v0, v1, v2, v3, addr)
+
+
+@cute.jit
+def cvt_and_store_2xf32_to_fp8_hw(
+    v0: Float32, v1: Float32, addr: Int64, dtype: cutlass.Constexpr
+):
+    if cutlass.const_expr(dtype is cutlass.Float8E5M2):
+        cvt_and_store_2xf32_to_e5m2_hw(v0, v1, addr)
+    else:
+        cvt_and_store_2xf32_to_e4m3_hw(v0, v1, addr)
 
 
 def has_hw_fp8_cvt(device: torch.device = None) -> bool:
@@ -713,6 +1012,7 @@ _TORCH_DTYPE_TO_STR_MAP = {
     torch.bfloat16: "bfloat16",
     torch.float32: "float32",
     torch.float8_e4m3fn: "float8_e4m3fn",
+    torch.float8_e5m2: "float8_e5m2",
 }
 
 
@@ -724,7 +1024,9 @@ def _torch_dtype_to_str(dtype: torch.dtype) -> str:
 __all__ = [
     # Constants
     "FLOAT8_E4M3_MAX",
+    "FLOAT8_E5M2_MAX",
     "COPY_BITS",
+    "get_fp8_max",
     # PTX intrinsics
     "rcp_approx_ftz",
     "cvt_and_store_f32_to_e4m3_hw",
@@ -732,6 +1034,16 @@ __all__ = [
     "cvt_and_store_8xf32_to_e4m3_hw",
     "cvt_and_store_4xf32_to_e4m3_hw",
     "cvt_and_store_2xf32_to_e4m3_hw",
+    "cvt_and_store_f32_to_e5m2_hw",
+    "cvt_and_store_f32_to_e5m2_sw",
+    "cvt_and_store_8xf32_to_e5m2_hw",
+    "cvt_and_store_4xf32_to_e5m2_hw",
+    "cvt_and_store_2xf32_to_e5m2_hw",
+    "cvt_and_store_f32_to_fp8_hw",
+    "cvt_and_store_f32_to_fp8_sw",
+    "cvt_and_store_8xf32_to_fp8_hw",
+    "cvt_and_store_4xf32_to_fp8_hw",
+    "cvt_and_store_2xf32_to_fp8_hw",
     "has_hw_fp8_cvt",
     "get_ptr_as_int64",
     # PTX intrinsics - Cluster operations
