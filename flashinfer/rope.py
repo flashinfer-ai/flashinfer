@@ -32,16 +32,53 @@ from .trace.templates.rope import (
     apply_rope_with_cos_sin_cache_inplace_trace,
     apply_rope_with_cos_sin_cache_trace,
     mla_rope_quantize_fp8_trace,
+    qk_rmsnorm_rope_store_hy3_trace_dispatch,
     rope_quantize_fp8_append_paged_kv_cache_trace,
     rope_quantize_fp8_trace,
 )
 from .jit.rope import gen_rope_module
+from .jit.rope_hy3 import gen_qk_norm_rope_hy3_module
 from .utils import register_custom_op, register_fake_op
 
 
 @functools.cache
 def get_rope_module():
     return gen_rope_module().build_and_load()
+
+
+@functools.cache
+def get_qk_norm_rope_hy3_module():
+    return gen_qk_norm_rope_hy3_module().build_and_load()
+
+
+@functools.cache
+def _is_sm100_device(device_index: int) -> bool:
+    """Cache the capability probe so it never enters the decode hot path."""
+
+    return torch.cuda.get_device_capability(device_index) == (10, 0)
+
+
+@functools.cache
+def _qk_norm_rope_hy3_empty_placeholders(
+    device_index: int, output_dtype: torch.dtype
+) -> Tuple[torch.Tensor, ...]:
+    """Return distinct zero-sized tensors for optional FFI arguments.
+
+    Distinct storages avoid aliasing mutable and immutable custom-op arguments,
+    while caching keeps placeholder creation out of the per-token hot path.
+    """
+    device = torch.device("cuda", device_index)
+    return (
+        torch.empty(0, dtype=torch.float32, device=device),  # q norm
+        torch.empty(0, dtype=torch.float32, device=device),  # k norm
+        torch.empty(0, dtype=torch.float32, device=device),  # k scale
+        torch.empty(0, dtype=torch.float32, device=device),  # v scale
+        torch.empty(0, dtype=torch.float32, device=device),  # q scale inverse
+        torch.empty(0, dtype=torch.float32, device=device),  # output q scale
+        torch.empty(0, dtype=torch.int32, device=device),  # split-k flag
+        torch.empty(0, dtype=output_dtype, device=device),  # output k
+        torch.empty(0, dtype=output_dtype, device=device),  # output v
+    )
 
 
 @register_custom_op("flashinfer::apply_rope", mutates_args=("q_rope", "k_rope"))
@@ -337,6 +374,105 @@ def _fake_rope_quantize_fp8_append_paged_kv_cache(
     quant_scale_kv: float,
     interleave: bool,
     enable_pdl: bool,
+) -> None:
+    pass
+
+
+@register_custom_op(
+    "flashinfer::qk_rmsnorm_rope_append_paged_kv_cache_hy3",
+    mutates_args=(
+        "output_q",
+        "output_q_scale",
+        "split_k_flag",
+        "output_k",
+        "output_v",
+        "key_cache",
+        "value_cache",
+    ),
+)
+def _qk_rmsnorm_rope_append_paged_kv_cache_hy3(
+    packed_qkv: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    sequence_lengths: torch.Tensor,
+    q_indptr: torch.Tensor,
+    block_table: torch.Tensor,
+    q_norm_weight: torch.Tensor,
+    k_norm_weight: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    q_scale_inverse: torch.Tensor,
+    output_q: torch.Tensor,
+    output_q_scale: torch.Tensor,
+    split_k_flag: torch.Tensor,
+    output_k: torch.Tensor,
+    output_v: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    is_prefill: bool,
+    norm_policy: int,
+    quant_policy: int,
+    max_sequence_length: int,
+    fp8_upper_bound: float,
+    use_output_k: bool,
+    use_output_v: bool,
+    enable_sm100_uniform_decode: bool,
+) -> None:
+    get_qk_norm_rope_hy3_module().qk_rmsnorm_rope_append_paged_kv_cache_hy3(
+        packed_qkv,
+        cos_sin_cache,
+        sequence_lengths,
+        q_indptr,
+        block_table,
+        q_norm_weight,
+        k_norm_weight,
+        k_scale,
+        v_scale,
+        q_scale_inverse,
+        output_q,
+        output_q_scale,
+        split_k_flag,
+        output_k,
+        output_v,
+        key_cache,
+        value_cache,
+        is_prefill,
+        norm_policy,
+        quant_policy,
+        max_sequence_length,
+        fp8_upper_bound,
+        use_output_k,
+        use_output_v,
+        enable_sm100_uniform_decode,
+    )
+
+
+@register_fake_op("flashinfer::qk_rmsnorm_rope_append_paged_kv_cache_hy3")
+def _fake_qk_rmsnorm_rope_append_paged_kv_cache_hy3(
+    packed_qkv: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    sequence_lengths: torch.Tensor,
+    q_indptr: torch.Tensor,
+    block_table: torch.Tensor,
+    q_norm_weight: torch.Tensor,
+    k_norm_weight: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    q_scale_inverse: torch.Tensor,
+    output_q: torch.Tensor,
+    output_q_scale: torch.Tensor,
+    split_k_flag: torch.Tensor,
+    output_k: torch.Tensor,
+    output_v: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    is_prefill: bool,
+    norm_policy: int,
+    quant_policy: int,
+    max_sequence_length: int,
+    fp8_upper_bound: float,
+    use_output_k: bool,
+    use_output_v: bool,
+    enable_sm100_uniform_decode: bool,
 ) -> None:
     pass
 
@@ -1548,6 +1684,330 @@ def rope_quantize_fp8(
     )
 
     return q_rope_out, k_rope_out, q_nope_out, k_nope_out
+
+
+@flashinfer_api(trace=qk_rmsnorm_rope_store_hy3_trace_dispatch)
+def qk_rmsnorm_rope_append_paged_kv_cache_hy3(
+    packed_qkv: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    sequence_lengths: torch.Tensor,
+    q_indptr: torch.Tensor,
+    block_table: torch.Tensor,
+    paged_kv_cache: Tuple[torch.Tensor, torch.Tensor],
+    is_prefill: bool,
+    q_norm_weight: Optional[torch.Tensor] = None,
+    k_norm_weight: Optional[torch.Tensor] = None,
+    norm_policy: int = 0,
+    quant_policy: Optional[int] = None,
+    k_scale: Optional[torch.Tensor] = None,
+    v_scale: Optional[torch.Tensor] = None,
+    q_scale_inverse: Optional[torch.Tensor] = None,
+    max_sequence_length: int = 0,
+    fp8_upper_bound: float = 448.0,
+    out_q: Optional[torch.Tensor] = None,
+    out_q_scale: Optional[torch.Tensor] = None,
+    split_k_flag: Optional[torch.Tensor] = None,
+    out_k: Optional[torch.Tensor] = None,
+    out_v: Optional[torch.Tensor] = None,
+    uniform_one_token_decode: bool = False,
+) -> Tuple[
+    torch.Tensor,
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+]:
+    r"""Fuse per-head Q/K RMSNorm, NeoX RoPE, and NHD paged-KV storage.
+
+    This operator consumes a packed BF16 ``[Q, K, V]`` projection and writes
+    the transformed query plus K/V cache data in one CUDA launch.  It preserves
+    the cache-tail zero-fill side effect required by the originating serving
+    pipeline and supports both BF16 and FP8 E4M3 output/cache paths.
+
+    ``norm_policy`` selects the ordering: ``0`` disables normalization, ``1``
+    applies RoPE then RMSNorm, and ``2`` applies RMSNorm then RoPE.  The two
+    supported local-head configurations are ``8Q/1KV`` and ``64Q/8KV``, both
+    with QK/V head dimension 128.  Norm weights are float32 by source contract:
+    the originating CUDA entry receives ``const float*`` weights and performs
+    the reduction/multiply in float32.  Prefill, decode, and multi-token
+    prediction layouts are represented by ``q_indptr`` and
+    ``sequence_lengths``.
+
+    For FP8 caches, ``quant_policy=1`` uses a dynamic per-token/per-Q-head
+    scale and returns it; ``quant_policy=2`` consumes ``q_scale_inverse``.
+    K and V always consume scalar ``k_scale`` and ``v_scale``.  The cache dtype
+    determines the output dtype and must be BF16 or ``float8_e4m3fn``.
+
+    Passing ``out_k`` or ``out_v`` preserves the source behavior: that value is
+    written to the contiguous output instead of the corresponding cache entry;
+    final-page cache-tail clearing still occurs.  All output buffers may be
+    preallocated for CUDA-graph-stable addresses.
+
+    ``uniform_one_token_decode`` is a trusted scheduling contract, not a hint.
+    Set it only when ``q_indptr`` is exactly ``[0, 1, ..., batch_size]`` and no
+    graph-padding/ragged request is present.  On an SM100 device, the previously
+    measured narrow FP8 dynamic-Q/norm2/64Q8KV/B>=256 case then maps each row
+    directly to its request, reuses RoPE coefficients from registers, and
+    clears the final cache-page tail inside the compute CTA.  It defaults to
+    ``False``; all other shapes and non-SM100 devices use the source-faithful
+    fallback.
+
+    Parameters
+    ----------
+    packed_qkv : torch.Tensor
+        Contiguous BF16 tensor of shape ``[num_rows, (Q + 2 * KV) * 128]``.
+    cos_sin_cache : torch.Tensor
+        Float32 NeoX cache of shape ``[max_position, 128]``; the first and
+        second halves contain cosine and sine respectively.
+    sequence_lengths : torch.Tensor
+        Int32 final sequence length for each request, shape ``[batch]``.
+    q_indptr : torch.Tensor
+        Int32 row indptr, shape ``[batch + 1]``.  Absolute token positions are
+        derived as ``row + sequence_lengths[request] - q_indptr[request + 1]``.
+    block_table : torch.Tensor
+        Int32 physical-page table, shape ``[batch, max_pages_per_request]``.
+    paged_kv_cache : Tuple[torch.Tensor, torch.Tensor]
+        Contiguous NHD key/value caches shaped
+        ``[num_pages, page_size, num_kv_heads, 128]``.
+    is_prefill : bool
+        Whether rows use the prefill position and dynamic-scale layout.
+    q_norm_weight : Optional[torch.Tensor]
+        Float32 Q RMSNorm weight of shape ``[128]`` when normalization is
+        enabled.
+    k_norm_weight : Optional[torch.Tensor]
+        Float32 K RMSNorm weight of shape ``[128]`` when normalization is
+        enabled.
+    norm_policy : int
+        ``0`` disables normalization, ``1`` runs RoPE then RMSNorm, and ``2``
+        runs RMSNorm then RoPE.
+    quant_policy : Optional[int]
+        ``0`` for BF16, ``1`` for dynamic-Q FP8, or ``2`` for static-Q FP8.
+        The default is inferred from the cache dtype.
+    k_scale : Optional[torch.Tensor]
+        Scalar scale consumed when writing an FP8 K cache.
+    v_scale : Optional[torch.Tensor]
+        Scalar scale consumed when writing an FP8 V cache.
+    q_scale_inverse : Optional[torch.Tensor]
+        Scalar inverse Q scale required by static-Q FP8.
+    max_sequence_length : int
+        Maximum sequence length used to size dynamic-Q prefill scale output.
+    fp8_upper_bound : float
+        Saturation bound for FP8 conversion.
+    out_q : Optional[torch.Tensor]
+        Optional preallocated transformed-Q output.
+    out_q_scale : Optional[torch.Tensor]
+        Optional preallocated dynamic-Q FP8 scale output.
+    split_k_flag : Optional[torch.Tensor]
+        Optional preallocated per-request/per-KV-head completion flags for the
+        FP8 path.
+    out_k : Optional[torch.Tensor]
+        Optional contiguous K output. When present, K is written here instead
+        of to the paged cache.
+    out_v : Optional[torch.Tensor]
+        Optional contiguous V output. When present, V is written here instead
+        of to the paged cache.
+    uniform_one_token_decode : bool
+        Enables the B200 direct row-to-request schedule. The caller must
+        guarantee ``q_indptr == arange(batch_size + 1)``.
+
+    Returns
+    -------
+    Tuple[Tensor, Optional[Tensor], Optional[Tensor], Optional[Tensor], Optional[Tensor]]
+        ``(out_q, q_scale, split_k_flag, out_k, out_v)``.  Inapplicable outputs
+        are returned as ``None``.
+    """
+    if not packed_qkv.is_cuda:
+        raise ValueError("packed_qkv must be a CUDA tensor")
+    if len(paged_kv_cache) != 2:
+        raise ValueError("paged_kv_cache must be a (key_cache, value_cache) tuple")
+    key_cache, value_cache = paged_kv_cache
+    if packed_qkv.ndim != 2:
+        raise ValueError("packed_qkv must have shape [num_rows, hidden]")
+    if key_cache.ndim != 4 or value_cache.ndim != 4:
+        raise ValueError("key_cache and value_cache must be rank-4 NHD tensors")
+
+    num_rows = packed_qkv.shape[0]
+    batch_size = sequence_lengths.shape[0]
+    num_kv_heads = key_cache.shape[2]
+    qk_head_dim = key_cache.shape[3]
+    v_head_dim = value_cache.shape[3]
+    q_width = packed_qkv.shape[1] - num_kv_heads * (qk_head_dim + v_head_dim)
+    if q_width < 0 or qk_head_dim <= 0 or q_width % qk_head_dim != 0:
+        raise ValueError(
+            "packed_qkv hidden dimension is incompatible with cache shapes"
+        )
+    num_q_heads = q_width // qk_head_dim
+    if (num_q_heads, num_kv_heads) not in ((8, 1), (64, 8)):
+        raise ValueError(
+            "supported (num_q_heads, num_kv_heads) pairs are (8, 1) and (64, 8)"
+        )
+    if qk_head_dim != 128 or v_head_dim != 128:
+        raise ValueError("qk_head_dim and v_head_dim must both be 128")
+    if norm_policy not in (0, 1, 2):
+        raise ValueError("norm_policy must be 0, 1, or 2")
+
+    (
+        empty_q_norm,
+        empty_k_norm,
+        empty_k_scale,
+        empty_v_scale,
+        empty_q_scale_inverse,
+        empty_output_q_scale,
+        empty_split_k_flag,
+        empty_output_k,
+        empty_output_v,
+    ) = _qk_norm_rope_hy3_empty_placeholders(packed_qkv.get_device(), key_cache.dtype)
+    if norm_policy == 0:
+        if q_norm_weight is not None or k_norm_weight is not None:
+            raise ValueError("norm weights must be None when norm_policy=0")
+        q_norm_weight = empty_q_norm
+        k_norm_weight = empty_k_norm
+    elif q_norm_weight is None or k_norm_weight is None:
+        raise ValueError(
+            "q_norm_weight and k_norm_weight are required when norm_policy>0"
+        )
+    elif q_norm_weight.dtype != torch.float32 or k_norm_weight.dtype != torch.float32:
+        raise ValueError("q_norm_weight and k_norm_weight must be float32")
+
+    fp8 = key_cache.dtype == torch.float8_e4m3fn
+    if quant_policy is None:
+        quant_policy = 1 if fp8 else 0
+    if fp8:
+        if value_cache.dtype != torch.float8_e4m3fn:
+            raise ValueError("both FP8 caches must have float8_e4m3fn dtype")
+        if quant_policy not in (1, 2):
+            raise ValueError("FP8 quant_policy must be 1 (dynamic Q) or 2 (static Q)")
+        if k_scale is None or v_scale is None:
+            raise ValueError("FP8 cache output requires k_scale and v_scale")
+        if quant_policy == 2 and q_scale_inverse is None:
+            raise ValueError("static-Q quantization requires q_scale_inverse")
+        if quant_policy == 1 and q_scale_inverse is not None:
+            raise ValueError("dynamic-Q quantization does not consume q_scale_inverse")
+        if quant_policy == 1 and is_prefill and max_sequence_length <= 0:
+            raise ValueError("dynamic-Q prefill requires max_sequence_length > 0")
+    else:
+        if key_cache.dtype != torch.bfloat16 or value_cache.dtype != torch.bfloat16:
+            raise ValueError("paged caches must be bfloat16 or float8_e4m3fn")
+        if quant_policy != 0:
+            raise ValueError("BF16 cache output requires quant_policy=0")
+        if k_scale is not None or v_scale is not None or q_scale_inverse is not None:
+            raise ValueError("BF16 cache output does not consume quantization scales")
+        k_scale = empty_k_scale
+        v_scale = empty_v_scale
+
+    if q_scale_inverse is None:
+        q_scale_inverse = empty_q_scale_inverse
+
+    output_dtype = key_cache.dtype
+    expected_q_shape = (num_rows, num_q_heads, qk_head_dim)
+    if out_q is None:
+        out_q = torch.empty(
+            expected_q_shape, dtype=output_dtype, device=packed_qkv.device
+        )
+    elif tuple(out_q.shape) != expected_q_shape or out_q.dtype != output_dtype:
+        raise ValueError(
+            f"out_q must have shape {expected_q_shape} and dtype {output_dtype}"
+        )
+
+    q_scale_result: Optional[torch.Tensor]
+    if fp8 and quant_policy == 1:
+        expected_scale_shape: Tuple[int, ...]
+        if is_prefill:
+            aligned_length = (max_sequence_length + 127) // 128 * 128
+            expected_scale_shape = (batch_size, num_q_heads, aligned_length)
+        else:
+            expected_scale_shape = (num_rows, num_q_heads)
+        if out_q_scale is None:
+            out_q_scale = torch.empty(
+                expected_scale_shape, dtype=torch.float32, device=packed_qkv.device
+            )
+        elif (
+            tuple(out_q_scale.shape) != expected_scale_shape
+            or out_q_scale.dtype != torch.float32
+        ):
+            raise ValueError(
+                f"out_q_scale must have shape {expected_scale_shape} and dtype float32"
+            )
+        q_scale_result = out_q_scale
+    else:
+        if out_q_scale is not None:
+            raise ValueError("out_q_scale is only valid for dynamic-Q FP8")
+        out_q_scale = empty_output_q_scale
+        q_scale_result = None
+
+    split_k_result: Optional[torch.Tensor]
+    if fp8:
+        expected_flag_shape = (batch_size, num_kv_heads)
+        if split_k_flag is None:
+            split_k_flag = torch.empty(
+                expected_flag_shape, dtype=torch.int32, device=packed_qkv.device
+            )
+        elif (
+            tuple(split_k_flag.shape) != expected_flag_shape
+            or split_k_flag.dtype != torch.int32
+        ):
+            raise ValueError(
+                f"split_k_flag must have shape {expected_flag_shape} and dtype int32"
+            )
+        split_k_result = split_k_flag
+    else:
+        if split_k_flag is not None:
+            raise ValueError("split_k_flag is only valid for FP8")
+        split_k_flag = empty_split_k_flag
+        split_k_result = None
+
+    expected_k_shape = (num_rows, num_kv_heads, qk_head_dim)
+    expected_v_shape = (num_rows, num_kv_heads, v_head_dim)
+    if out_k is not None and (
+        tuple(out_k.shape) != expected_k_shape or out_k.dtype != output_dtype
+    ):
+        raise ValueError(
+            f"out_k must have shape {expected_k_shape} and dtype {output_dtype}"
+        )
+    if out_v is not None and (
+        tuple(out_v.shape) != expected_v_shape or out_v.dtype != output_dtype
+    ):
+        raise ValueError(
+            f"out_v must have shape {expected_v_shape} and dtype {output_dtype}"
+        )
+    output_k_arg = out_k if out_k is not None else empty_output_k
+    output_v_arg = out_v if out_v is not None else empty_output_v
+
+    # Python only establishes the user-provided scheduling contract and device
+    # capability here.  The C++ entry repeats the complete dtype/shape/policy
+    # gate before selecting the specialized kernel, so duplicating it on every
+    # decode step would add host-side launch latency without adding safety.
+    enable_sm100_uniform_decode = bool(
+        uniform_one_token_decode and _is_sm100_device(packed_qkv.get_device())
+    )
+    _qk_rmsnorm_rope_append_paged_kv_cache_hy3(
+        packed_qkv,
+        cos_sin_cache,
+        sequence_lengths,
+        q_indptr,
+        block_table,
+        q_norm_weight,
+        k_norm_weight,
+        k_scale,
+        v_scale,
+        q_scale_inverse,
+        out_q,
+        out_q_scale,
+        split_k_flag,
+        output_k_arg,
+        output_v_arg,
+        key_cache,
+        value_cache,
+        is_prefill,
+        norm_policy,
+        quant_policy,
+        max_sequence_length,
+        fp8_upper_bound,
+        out_k is not None,
+        out_v is not None,
+        enable_sm100_uniform_decode,
+    )
+    return out_q, q_scale_result, split_k_result, out_k, out_v
 
 
 @flashinfer_api(trace=rope_quantize_fp8_append_paged_kv_cache_trace)
