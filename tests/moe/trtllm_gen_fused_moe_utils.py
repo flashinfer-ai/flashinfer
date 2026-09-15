@@ -2760,6 +2760,45 @@ def routing_reference_minimax2(
     return permute_info, scores
 
 
+def routing_reference_sqrt_softplus(
+    expert_logits,
+    routing_bias,
+    top_k,
+    num_experts,
+    padding,
+    routed_scaling_factor,
+    norm_topk_prob=True,
+):
+    """sqrt(softplus) + Bias -> TopK -> ScaledSumNormalize routing reference (DeepSeek-V4).
+
+    Pinned against the DeepSeek-V4.1 reference gate and the SGLang / vLLM
+    sqrtsoftplus routers: the correction bias steers expert *selection* only,
+    the routing weights are the un-biased ``sqrt(softplus(logit))`` scores,
+    renormalized by their sum (``norm_topk_prob``) and then multiplied by
+    ``routed_scaling_factor``. Routing is ungrouped.
+    """
+    scores = torch.sqrt(torch.nn.functional.softplus(expert_logits.float()))
+    selection_scores = scores.clone()
+    if routing_bias is not None:
+        selection_scores = selection_scores + routing_bias.float()
+    _, topk_idx = torch.topk(selection_scores, k=top_k, dim=-1)
+
+    # Weights use the un-biased sqrt-softplus scores.
+    raw_weights = torch.gather(scores, -1, topk_idx)
+    if norm_topk_prob:
+        raw_weights = raw_weights / (raw_weights.sum(dim=-1, keepdim=True) + 1e-20)
+    if routed_scaling_factor is not None:
+        raw_weights = raw_weights * routed_scaling_factor
+    raw_weights = raw_weights.to(expert_logits.dtype)
+
+    dense = torch.zeros_like(scores, dtype=expert_logits.dtype)
+    for i in range(topk_idx.shape[0]):
+        for j in range(topk_idx.shape[1]):
+            dense[i, topk_idx[i, j]] = raw_weights[i, j]
+    permute_info = routing_reference(dense, top_k, padding)
+    return permute_info, dense
+
+
 def check_accuracy(a, b, atol, rtol, percent):
     """Unified accuracy checking function with detailed error reporting."""
     if not torch.isfinite(a).all():
@@ -3983,6 +4022,16 @@ def run_moe_test(
     elif routing_method_type == RoutingMethodType.Sigmoid:
         permute_info, scores = routing_reference_sigmoid_renorm(
             expert_logits, top_k, num_experts, padding, norm_topk_prob=False
+        )
+    elif routing_method_type == RoutingMethodType.SqrtSoftplus:
+        permute_info, scores = routing_reference_sqrt_softplus(
+            expert_logits,
+            routing_bias,
+            top_k,
+            num_experts,
+            padding,
+            routed_scaling,
+            norm_topk_prob=norm_topk_prob,
         )
     elif routing_method_type == RoutingMethodType.TopKSigmoid:
         permute_info, scores = routing_reference_topk_sigmoid(

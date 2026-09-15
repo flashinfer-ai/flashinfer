@@ -156,6 +156,54 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mPtrRoutingReplayOut = routing_replay_out;
 
     moe::dev::routing::routingCustom::run(routingData, stream);
+  } else if (routingMethodType == RoutingMethodType::SqrtSoftplus) {
+    FLASHINFER_CHECK(numFusedSharedExpert == 0,
+                     "SqrtSoftplus routing method does not support fusing shared expert");
+    FLASHINFER_CHECK(nGroup <= 1 && topkGroup <= 1,
+                     "SqrtSoftplus routing is ungrouped: got nGroup=", nGroup,
+                     " topkGroup=", topkGroup);
+    // DeepSeek-V4 family (scoring_func="sqrtsoftplus", ungrouped noaux_tc):
+    // sqrt(softplus(logit)) + bias → topK → renormalize the un-biased sqrt-softplus scores
+    // (norm_topk_prob) → routed_scaling_factor. The bias steers selection only. Same dual-score
+    // contract as the MiniMax2 branch above with a different score transform.
+    moe::dev::routing::routingCustom::Data routingData;
+
+    routingData.mDtypeOutput = btg::Dtype::Bfloat16;
+    routingData.mDtypeInput = dtypeLogits;
+    routingData.mUsePdl = enable_pdl;
+    routingData.mPreprocessType = moe::dev::routing::RoutingPreprocessType::SqrtSoftplusBias;
+    routingData.mPostprocessType = moe::dev::routing::RoutingPostprocessType::ScaledSumNormalize;
+    routingData.mNormTopkProb = normTopkProb;
+    routingData.mPtrRoutingBias = routingBias;
+    routingData.mDtypeBias = dtypeBias;
+    routingData.mRouteScale = routedScalingFactor;
+    routingData.mSumEpsilon = 1e-20f;
+
+    routingData.mPtrScores = expertIds == nullptr ? routingLogits : nullptr;
+    routingData.mPtrTopKIds = expertIds;
+    routingData.mPtrTopKPacked = routingExpertIndexes;
+    routingData.mPtrExpertCounts = expertCountHistogram;
+    routingData.mPtrPermutedIdxSize = permutedIdxSize;
+    routingData.mPtrExpandedIdxToPermutedIdx = expandedIdxToPermutedIdx;
+    routingData.mPtrPermutedIdxToExpandedIdx = permutedIdxToExpandedIdx;
+    routingData.mPtrPermutedIdxToTokenIdx = permutedIdxToTokenIdx;
+    routingData.mPtrTopKWeights = expertWeights;
+
+    routingData.mPtrCtaIdxXyToBatchIdx = ctaIdxXyToBatchIdx;
+    routingData.mPtrCtaIdxXyToMnLimit = ctaIdxXyToMnLimit;
+    routingData.mPtrNumNonExitingCtas = numNonExitingCtas;
+
+    routingData.mNumTokens = numTokens;
+    routingData.mNumExperts = numExperts;
+    routingData.mTopK = topK;
+    routingData.mPaddingLog2 = computeLog2(mTileTokensDim);
+    routingData.mTileTokensDim = mTileTokensDim;
+    routingData.mLocalExpertsStartIdx = localExpertOffset;
+    routingData.mLocalExpertsStrideLog2 = 0;
+    routingData.mNumLocalExperts = localNumExperts;
+    routingData.mPtrRoutingReplayOut = routing_replay_out;
+
+    moe::dev::routing::routingCustom::run(routingData, stream);
   } else if (routingMethodType == RoutingMethodType::DeepSeekV3) {
     FLASHINFER_CHECK(topK <= 22, "For DeepSeek routing method, must have topK <= 22");
     FLASHINFER_CHECK(topkGroup <= 4, "For DeepSeek routing method, must have topkGroup <= 4");

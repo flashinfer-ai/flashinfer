@@ -30,6 +30,10 @@ class RoutingMethodType(IntEnum):
     TopKSigmoid = (9,)
     # Unspecified
     Unspecified = (10,)
+    # SqrtSoftplus: sqrt(softplus) + Bias -> TopK -> ScaledSumNormalize of the un-biased scores
+    # (DeepSeek-V4 family, scoring_func="sqrtsoftplus"). Appended after Unspecified so the
+    # existing values stay stable.
+    SqrtSoftplus = (11,)
 
     # Eval-safe repr (``RoutingMethodType.Default`` rather than IntEnum's default
     # ``<RoutingMethodType.Default: 0>``) so configs that embed this member
