@@ -89,8 +89,8 @@ __device__ __forceinline__ void compute_qk(
       s[j] += math::shfl_xor_sync(s[j], offset);
     }
     // Inline per-(token, head) FP8 K scale: dequantize the QK dot product before the
-    // softmax. The per-row scale is staged in shared memory; k_scale points at this
-    // thread's (tz) slice of the buffer, so row j is k_scale[j].
+    // softmax. k_scale points at this thread's (tz) slice of the smem buffer, so row j is
+    // k_scale[j].
     if constexpr (USE_INLINE_SF) {
       s[j] *= k_scale[j];
     }
@@ -146,9 +146,8 @@ __device__ __forceinline__ void update_local_state(const T* smem, const float* s
   for (uint32_t j = 0; j < tile_size; ++j) {
     vec_t<float, vec_size> v_vec;
     v_vec.cast_load(smem + (j * bdx + tx) * vec_size);
-    // Inline per-(token, head) FP8 V scale: dequantize V after the softmax. The per-row
-    // scale is staged in shared memory; v_scale points at this thread's (tz) slice of the
-    // buffer, so row j is v_scale[j].
+    // Inline per-(token, head) FP8 V scale: dequantize V after the softmax. v_scale points
+    // at this thread's (tz) slice of the smem buffer, so row j is v_scale[j].
     const float s_scaled = USE_INLINE_SF ? (s[j] * v_scale[j]) : s[j];
 #pragma unroll
     for (uint32_t i = 0; i < vec_size; ++i) {
@@ -267,9 +266,7 @@ __global__ void SingleDecodeWithKVCacheKernel(const __grid_constant__ Params par
                bdz * bdy * head_dim * sizeof(float));
   // FP8 inline per-(token, head) float32 scale staging (one float per KV row for K and V).
   // Loaded with cp.async in the same cp.async group as the K/V data, so a tile's scale
-  // lands in smem with the tile. One stage per pipeline stage: iteration `iter` stages
-  // the scale for tile `iter + num_stages_smem` into stage `iter % num_stages_smem`,
-  // consumed `num_stages_smem` iterations later, so the stages must not alias.
+  // lands in smem with the tile. One stage per pipeline stage.
   constexpr uint32_t CTA_TILE_KV = bdy * tile_size_per_bdx * bdz;
   constexpr uint32_t scale_smem_bytes =
       USE_INLINE_SF ? (2 * num_stages_smem * CTA_TILE_KV * sizeof(float)) : 0;
@@ -549,11 +546,9 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
                bdz * bdy * head_dim * sizeof(float));
   // FP8 inline per-(token, head) float32 scale staging (one float per KV row for K and V).
   // Loaded with cp.async in the same cp.async group as the K/V data, so a tile's scale
-  // lands in smem with the tile. One stage per pipeline stage (staged for tile
-  // `iter + num_stages_smem` into stage `iter % num_stages_smem`, consumed
-  // `num_stages_smem` iterations later, so the stages must not alias). Placed after
-  // kv_offset_smem (both live in the main loop); smem_md time-shares kv_offset_smem's
-  // start (used only at the end, in sync_state), so it does not conflict.
+  // lands in smem with the tile. One stage per pipeline stage. Placed after kv_offset_smem;
+  // smem_md time-shares kv_offset_smem's start (used only at the end, in sync_state), so it
+  // does not conflict.
   constexpr uint32_t CTA_TILE_KV = bdy * tile_size_per_bdx * bdz;
   constexpr uint32_t kv_offset_bytes = tile_size_per_bdx * bdx * bdy * bdz * sizeof(size_t);
   constexpr uint32_t scale_smem_bytes =

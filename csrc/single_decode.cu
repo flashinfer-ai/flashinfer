@@ -52,8 +52,7 @@ void single_decode_with_kv_cache(TensorView q, TensorView k, TensorView v, Tenso
   unsigned int head_dim_qk = q.size(1);
   // The KV tensor's last dim: head_dim_vo plus the inline float32 scale (4B) padded to
   // 16B (= head_dim_vo + 16) for inline scale, or just head_dim_vo otherwise. The shared
-  // K/V stride is based on this padded last dim; v is enforced contiguous by CHECK_INPUT(v),
-  // so the shape-derived stride matches v.stride().
+  // K/V stride is based on this padded last dim.
   unsigned int head_dim_vo_pad = v.size(2);
   // Derive the actual head dim from the V tensor (not Q) so the QK/VO equality check
   // below stays a real validation.

@@ -345,8 +345,7 @@ def gen_attention(
         use_sliding_window_,
         use_logits_soft_cap_,
     ):
-        # One-byte (FP8) large-head modules stay SM100+-only, matching the
-        # non-inline FA2 path.
+        # One-byte (FP8) large-head modules stay SM100+-only.
         if (head_dim_qk > 256 or head_dim_vo > 256) and not has_sm10_or_newer:
             continue
         yield from gen_fa2(

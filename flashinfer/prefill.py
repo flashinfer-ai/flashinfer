@@ -1474,7 +1474,7 @@ def single_prefill_with_kv_cache(
                 "architecture (only fp16 is supported on SM75)"
             )
         # head_dim_qk = Q head_dim = K slot - 16; head_dim_vo = V slot - 16. K and V may
-        # have different head dims (asymmetric QK/VO plans), matching the non-inline path.
+        # have different head dims (asymmetric QK/VO plans).
         assert q.shape[-1] % 16 == 0, (
             "use_inline_sf requires the query head_dim to be a multiple of 16, "
             f"got {q.shape[-1]}"
