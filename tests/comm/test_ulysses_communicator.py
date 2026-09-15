@@ -219,7 +219,7 @@ def test_out_storage_overlap_is_rejected_before_backend_launch(monkeypatch):
         "ulysses_a2a",
         lambda *args, **kwargs: pytest.fail("backend must not be launched"),
     )
-    with pytest.raises(ValueError, match="must not overlap input storage"):
+    with pytest.raises(ValueError, match="must not alias the input"):
         comm.scatter_heads(x, out=overlapping)
 
 
@@ -722,7 +722,7 @@ def test_chunk_exchange_world_size_one_is_identity():
     x = torch.arange(8, dtype=torch.float16).reshape(1, 1, 1, 8)
     assert comm.exchange_chunks(x) is x
     out = torch.empty_like(x)
-    assert comm.exchange_chunks(x, out) is out
+    assert comm.exchange_chunks(x, out=out) is out
     assert torch.equal(out, x)
 
 
@@ -1127,7 +1127,7 @@ def test_nvlink_kernel_is_none_without_an_armed_nvlink_backend(gloo_pg, monkeypa
 @requires_cuda
 def test_w1_destination_passing_and_workspace(gloo_pg, monkeypatch):
     _forbid_ipc_and_jit(monkeypatch)
-    comm = _make_w1(gloo_pg, monkeypatch, max_elems=4096)
+    comm = _make_w1(gloo_pg, monkeypatch, max_bytes=4096 * 2)
     x = torch.randn(2, 8, 4, 16, dtype=torch.float16, device="cuda")
     out = torch.empty_like(x)
     workspace = comm.create_workspace(max_elems=x.numel())
@@ -1145,8 +1145,8 @@ def test_w1_destination_passing_and_workspace(gloo_pg, monkeypatch):
         comm.scatter_heads(x, workspace=object())
     with pytest.raises(ValueError, match="capacity"):
         comm.scatter_heads(x, workspace=comm.create_workspace(max_elems=x.numel() - 1))
-    with pytest.raises(ValueError, match="exceeds communicator"):
-        comm.create_workspace(max_elems=comm.max_elems + 1)
+    with pytest.raises(ValueError, match="exceeds the communicator"):
+        comm.create_workspace(max_elems=comm.max_bytes // comm.dtype.itemsize + 1)
     with pytest.raises(ValueError, match="workspace send buffer"):
         comm.scatter_heads(
             x,
@@ -2748,6 +2748,7 @@ def test_head_chunk_forced_nccl(world_size, dtype_name):
 
 def test_head_chunk_forced_nvlink():
     _run_multi_rank("_head_chunk_body", 2, ("nvlink", "bfloat16"), allow_skip=True)
+
 
 @pytest.mark.parametrize(
     ("world_size", "dtype_name"),
