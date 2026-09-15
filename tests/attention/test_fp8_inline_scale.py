@@ -92,8 +92,7 @@ def _check(
     - correctness: ``o_fp8`` (inline-scale kernel) vs ``o_ref`` (16-bit on dequant)
     - quantization: ``o_orig`` (16-bit on original) vs ``o_fp8`` > 0.995
 
-    ``correctness_thresh`` is relaxed for asymmetric head_dim (192), where the
-    FP8 path uses a different MMA tiling than the 16-bit path.
+    ``correctness_thresh`` is relaxed for asymmetric head_dim (192).
     """
     cos_correct = _cos(o_fp8, o_ref)
     assert cos_correct > correctness_thresh, (
@@ -570,13 +569,10 @@ def test_single_prefill_inline_scale_asym_head_dim(q_dtype):
 # ---------------------------------------------------------------------------
 # 7. cta128 (long-q) tiling coverage
 #
-# FA2DetermineCtaTileQ (include/flashinfer/utils.cuh) picks CTA_TILE_Q=128 when
-# ``packed_qo_len > 64 and head_dim < 256``; the tests above use qo_len<=32
-# (CTA_TILE_Q=64). These cases use a long qo_len to cover the CTA_TILE_Q=128
-# tiling. Only e4m3 is used: the tiling is independent of the FP8 dtype.
+# The tests above use qo_len<=32 (CTA_TILE_Q=64); these use qo_len=128 to
+# cover the CTA_TILE_Q=128 tiling. Only e4m3: the tiling is dtype-independent.
 # ---------------------------------------------------------------------------
 def _sizes_cta128():
-    # qo_len=128 -> packed_qo_len 128 (mha) / 256 (gqa), both > 64 -> CTA_TILE_Q=128.
     # kv_len == qo_len so causal masking is well-defined.
     return dict(batch_size=3, qo_len=128, kv_len=128)
 
@@ -762,11 +758,9 @@ def test_batch_prefill_paged_inline_scale_cta128(head_dim, q_dtype, gqa, causal)
 # ---------------------------------------------------------------------------
 # 8. negative / validation tests
 #
-# The inline-scale feature adds host-side validation at plan() and run() time;
-# the fix commits (V-dtype check, custom-JIT-module use_inline_sf check) are the
-# newest. These tests pin the error paths so a regression that silently drops a
-# check is caught. They use one small fixed config (head_dim 128, e4m3, fp16,
-# MHA) because they exercise validation, not kernel numerics.
+# Pin the plan()/run() error paths so a regression that silently drops a check
+# is caught. One small fixed config (head_dim 128, e4m3, fp16, MHA) since these
+# exercise validation, not kernel numerics.
 # ---------------------------------------------------------------------------
 _NEG = dict(head_dim=128, qo_len=16, kv_len=16, batch=2, heads=4, page=16)
 
@@ -929,6 +923,28 @@ def test_ragged_prefill_plan_rejects_non_fa2_backend():
         )
 
 
+def test_ragged_prefill_plan_auto_backend_pinned_to_fa2_with_inline_sf():
+    # use_inline_sf requires the fa2 backend; with backend="auto" the plan
+    # must still end up on fa2.
+    c = _NEG
+    dev = "cuda:0"
+    qo_indptr = torch.arange(0, c["batch"] + 1, dtype=torch.int32).to(dev) * c["qo_len"]
+    kv_indptr = torch.arange(0, c["batch"] + 1, dtype=torch.int32).to(dev) * c["kv_len"]
+    ws = torch.empty(_WS, dtype=torch.uint8, device=dev)
+    fi = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(ws, backend="auto")
+    fi.plan(
+        qo_indptr,
+        kv_indptr,
+        c["heads"],
+        c["heads"],
+        c["head_dim"],
+        q_data_type=torch.float16,
+        kv_data_type=torch.float8_e4m3fn,
+        use_inline_sf=True,
+    )
+    assert fi._backend == "fa2"
+
+
 def test_ragged_prefill_run_rejects_v_dtype_mismatch():
     # k is the planned e4m3; v is e5m2 -> run() must reject the dtype mismatch.
     c = _NEG
@@ -1057,8 +1073,45 @@ def test_paged_prefill_plan_rejects_non_fa2_backend():
         )
 
 
+def test_paged_prefill_plan_auto_backend_pinned_to_fa2_with_inline_sf():
+    # use_inline_sf requires the fa2 backend; with backend="auto" the plan
+    # must still end up on fa2.
+    c = _NEG
+    dev = "cuda:0"
+    qo_indptr = torch.arange(0, c["batch"] + 1, dtype=torch.int32).to(dev) * c["qo_len"]
+    (paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len, *_rest) = _paged_kv(
+        c["batch"],
+        c["kv_len"],
+        c["page"],
+        c["heads"],
+        c["head_dim"],
+        torch.float16,
+        torch.float8_e4m3fn,
+        dev,
+        "HND",
+    )
+    ws = torch.empty(_WS, dtype=torch.uint8, device=dev)
+    fi = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        ws, kv_layout="HND", backend="auto"
+    )
+    fi.plan(
+        qo_indptr,
+        paged_kv_indptr,
+        paged_kv_indices,
+        paged_kv_last_page_len,
+        c["heads"],
+        c["heads"],
+        c["head_dim"],
+        c["page"],
+        q_data_type=torch.float16,
+        kv_data_type=torch.float8_e4m3fn,
+        use_inline_sf=True,
+    )
+    assert fi._backend == "fa2"
+
+
 def test_paged_prefill_run_rejects_v_dtype_mismatch():
-    # e5m2 cache vs e4m3 plan; paged K/V share a dtype, so the k-dtype check fires first.
+    # e5m2 cache vs e4m3 plan -> run() must reject the dtype mismatch.
     c = _NEG
     dev = "cuda:0"
     qo_indptr = torch.arange(0, c["batch"] + 1, dtype=torch.int32).to(dev) * c["qo_len"]
@@ -1219,8 +1272,7 @@ def test_decode_batch_run_rejects_bad_k_slot():
 
 
 # -- custom JIT module: use_inline_sf must match the built module ----------
-# The check reads only _jit_module/_jit_use_inline_sf and fires before plan()
-# uses the module, so we fake a non-inline-sf module without compiling.
+# The custom module is faked (no compilation) so plan() hits the mismatch check.
 
 
 def test_paged_prefill_plan_rejects_jit_inline_sf_mismatch():
@@ -1286,11 +1338,7 @@ def test_ragged_prefill_plan_rejects_jit_inline_sf_mismatch():
 # 9. split-KV (flash-decoding) coverage for batch decode
 #
 # A long kv_len with a small batch drives the decode kernel onto the split-KV
-# path (the KV range is partitioned across CTAs and the partial results are
-# reduced). This exercises the inline-scale decode kernel under split-KV.
-# NOTE: verify offline that split-KV is actually taken for these sizes (e.g.
-# via FLASHINFER_LOGLEVEL=3, or by confirming the split-kv workspace is used);
-# the numerics check below is valid regardless of which path is taken.
+# path.
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("use_tensor_cores", [False, True])
 def test_batch_decode_paged_inline_scale_split_kv(use_tensor_cores):
