@@ -47,6 +47,11 @@ def proxy_score_sm90(
 
     if decode:
         if kv_fp8:
+            # The fp8 decode schedule indexes a log2 table keyed on Hq.
+            if q.shape[1] not in (1, 2, 4):
+                raise NotImplementedError(
+                    f"SM90 fp8 proxy decode supports Hq in (1, 2, 4), got {q.shape[1]}"
+                )
             from .cute_dsl.proxy_score_decode_sm90 import run as _decode
         else:
             from .cute_dsl.proxy_score_decode_bf16_sm90 import run as _decode
