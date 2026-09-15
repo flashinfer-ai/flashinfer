@@ -329,8 +329,17 @@ struct SmemPtrs {
   bf16* q_nope_bf16;
   float* q_nope_sc;
   bf16* q_rope;
-  uint8_t* kv_bufs[2];
-  uint8_t* kv_scale_bufs[2];  // nullptr for DSV3_2 (inline scales)
+  char* base;
+
+  __device__ __forceinline__ uint8_t* kv_buf(int slot) const {
+    return reinterpret_cast<uint8_t*>(base + L::OFF_KV0 + slot * L::SMEM_KV_BUF);
+  }
+  __device__ __forceinline__ uint8_t* kv_scale_buf(int slot) const {
+    if constexpr (L::NEED_SCALE_BUF)
+      return reinterpret_cast<uint8_t*>(base + L::OFF_KV_SC0 + slot * L::SMEM_KV_SCALE_BUF);
+    else
+      return nullptr;
+  }
   float* reduce_buf;
   float* sum_reduce_buf;
   float* m_smem;
@@ -346,15 +355,7 @@ struct SmemPtrs {
     s.q_nope_bf16 = (bf16*)(base + L::OFF_Q_NOPE);
     s.q_nope_sc = (float*)(base + L::OFF_Q_SC);
     s.q_rope = (bf16*)(base + L::OFF_Q_ROPE);
-    s.kv_bufs[0] = (uint8_t*)(base + L::OFF_KV0);
-    s.kv_bufs[1] = (uint8_t*)(base + L::OFF_KV1);
-    if constexpr (L::NEED_SCALE_BUF) {
-      s.kv_scale_bufs[0] = (uint8_t*)(base + L::OFF_KV_SC0);
-      s.kv_scale_bufs[1] = (uint8_t*)(base + L::OFF_KV_SC1);
-    } else {
-      s.kv_scale_bufs[0] = nullptr;
-      s.kv_scale_bufs[1] = nullptr;
-    }
+    s.base = base;
     s.reduce_buf = (float*)(base + L::OFF_REDUCE);
     s.sum_reduce_buf = (float*)(base + L::OFF_SUM_RED);
     s.m_smem = (float*)(base + L::OFF_M);

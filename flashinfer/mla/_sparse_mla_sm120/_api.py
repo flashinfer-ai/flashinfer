@@ -34,15 +34,16 @@ Wrapper and functional entry points share prepared execution in
 DSv3.2, GLM-NSA, DSV4, GLM53_NOPE, DOTS3_SWA and explicit DSV4.1 storage
 are supported. DSV4 NVFP4 has its own format and calibration policy.
 
-Default ordinary routing uses the crossover and CPB policy in
-:mod:`._policy`: eligible calls up to 64 tokens decode unless
-calibration prefers prefill; larger calls prefill when supported. Missing
-calibration keeps decode-first and the launcher's CPB heuristic.
-Explicit DSV4.1 FP8/BF16 routes remain untuned, with decode CPB=1.
+All ordinary families use configuration profiles for the canonical probe
+layout: packed payload rows, minimally aligned page pitches, dense indices and
+LSE. Other legal layouts use decode-first/model estimates, not those measured
+phase/CPB results. Profiles select independent token buckets or exact refined
+entries. Actual metadata legality takes precedence over the selected phase.
+Explicit DSV4.1 FP8/BF16 without a matching profile uses decode CPB=1.
 
 Ordinary FP8 prefill requires whole 64-wide index tiles and family-specific
 heads; DOTS3_SWA additionally requires topk >= 513. Full-BF16 DSV4.1 prefill
-instead supports runtime H=1..128 and positive ragged topk. DSV4 NVFP4
+supports runtime H=1..128 and positive ragged topk. DSV4 NVFP4
 has a separate compiled envelope. The public config query describes decode
 capabilities and loads a compiled host module on its first use; import alone
 neither compiles nor initializes CUDA. Eligibility and workspace facts come
@@ -74,7 +75,7 @@ from ...utils import (
 
 # Package-root compatibility exports also expose the decode capability probes.
 from ._policy import (
-    _BI,
+    _BI,  # noqa: F401 (compatibility export)
     _DECODE_DSV3_2_DISPATCH,  # noqa: F401  (vLLM probe surface)
     _DECODE_DSV4_DISPATCH,  # noqa: F401  (vLLM probe surface)
     _DECODE_DSV4_1_DISPATCH,  # noqa: F401  (vLLM probe surface)
@@ -87,8 +88,8 @@ from ._policy import (
     _MODEL_TYPE_DSV3_2,
     _MODEL_TYPE_DSV4,
     _MODEL_TYPE_DSV4_1,
-    _MODEL_TYPE_GLM53_NOPE,
-    _MODEL_TYPE_GLM_NSA,
+    _MODEL_TYPE_GLM53_NOPE,  # noqa: F401 (compatibility export)
+    _MODEL_TYPE_GLM_NSA,  # noqa: F401 (compatibility export)
     _MODEL_TYPE_DOTS3_SWA,
     _DECODE_GLM53_NOPE_DISPATCH,  # noqa: F401  (vLLM probe surface)
     _DECODE_GLM53_NOPE_TOPK,
@@ -97,10 +98,10 @@ from ._policy import (
     _decode_scratch_heads,
     _MODEL_TYPE_TO_FAMILY,
     _D_V,
-    KernelVariant,
+    KernelVariant,  # noqa: F401 (compatibility export)
     _normalize_prefill_impl,
-    _resolve_cpb,
-    plan,
+    _resolve_cpb,  # noqa: F401 (compatibility export)
+    plan,  # noqa: F401 (compatibility export)
 )
 
 # Public calibration API, re-exported for the flashinfer.mla lazy export.
@@ -427,13 +428,10 @@ def _bytes_per_token_for_model_type(model_type: int) -> int:
 
 
 def _inline_cache_block_contiguous(kv_cache: torch.Tensor) -> bool:
-    """Block-contiguity predicate for inline-scale (DSv3.2/GLM) caches.
+    """Compatibility probe for inline-scale prefill block contiguity.
 
-    Inline-scale kernels address the cache as a flat token array with a
-    runtime row stride, so padded *rows* (a wider last dim or a sliced view)
-    are fine, but pages must pack rows back-to-back. The FFI binding
-    re-checks the same invariant; this only produces an earlier, clearer
-    error at the wrapper layer.
+    Decode also supports page gaps. Routing uses compiled metadata candidates,
+    not this predicate.
     """
     if kv_cache.is_contiguous():
         return True
@@ -571,8 +569,7 @@ def get_sparse_mla_sm120_module():
         mid_lse: Optional[torch.Tensor],
         extra_fp4: bool,
     ) -> None:
-        num_tokens, num_heads, d_qk = q.shape
-        topk = indices.shape[-1]
+        num_tokens = q.shape[0]
         _require_d_v(d_v, model_type)
         _check_last_dim(output, "output", model_type)
         if num_tokens == 0:
@@ -580,120 +577,9 @@ def get_sparse_mla_sm120_module():
             # launch would hit a grid.x=0 CUDA error.
             return
 
-        kv_pbs = _packed_kv_page_block_size(
-            kv_cache, model_type=model_type, name="kv_cache"
-        )
-        inline_page_gap = model_type in (
-            _MODEL_TYPE_DSV3_2,
-            _MODEL_TYPE_GLM_NSA,
-            _MODEL_TYPE_GLM53_NOPE,
-        ) and not _inline_cache_block_contiguous(kv_cache)
-        extra_topk = int(extra_indices.size(-1)) if extra_indices is not None else 0
-        planned = plan(
-            num_tokens,
-            num_heads,
-            topk,
-            model_type,
-            kv_pbs,
-            extra_kv_cache is not None,
-            prefill_impl,
-            q.device,
-            extra_topk=extra_topk,
-            extra_fp4=extra_fp4,
-        )
-        if inline_page_gap:
-            from ._prepared import device_caps, validate_metadata
-            from ._policy import filter_metadata_selection
+        from ._prepared import caller_run
 
-            metadata = validate_metadata(
-                q,
-                kv_cache,
-                indices,
-                output,
-                topk_length,
-                attn_sink,
-                extra_kv_cache,
-                extra_indices,
-                extra_topk_length,
-                out_lse,
-                mid_out,
-                mid_lse,
-                model=model_type,
-                is_dsv4_nvfp4=False,
-                extra_fp4=extra_fp4,
-                value_dim=d_v,
-            )
-            planned = filter_metadata_selection(
-                planned, metadata, "default", *device_caps(q.device)
-            )
-        if planned is None:
-            # Neither the decode instantiations nor the prefill envelope
-            # serves this shape.
-            raise ValueError(
-                _decode_dispatch_error_message(
-                    num_tokens=num_tokens,
-                    num_heads=num_heads,
-                    topk=topk,
-                    d_qk=d_qk,
-                    page_block_size=kv_pbs,
-                    model_type=model_type,
-                    extra_topk=extra_topk,
-                )
-            )
-        if planned.variant is KernelVariant.DECODE_SPLITK:
-            if model_type in (
-                _MODEL_TYPE_DSV4,
-                _MODEL_TYPE_DOTS3_SWA,
-                _MODEL_TYPE_DSV4_1,
-            ):
-                num_splits = _decode_dsv4_num_splits(topk, extra_topk, model_type)
-                mid_out_view, mid_lse_view = _decode_scratch_views(
-                    mid_out, mid_lse, num_tokens, num_heads, num_splits, d_v
-                )
-                # FFI binding extracts the true block stride from
-                # kv_cache.stride(0), so paged layouts with padded strides
-                # and microbench 2-D layouts both work.
-                sparse_mla_sm120_decode_dsv4(
-                    q,
-                    kv_cache,
-                    indices,
-                    mid_out_view,
-                    mid_lse_view,
-                    output,
-                    out_lse,
-                    sm_scale,
-                    topk_length=topk_length,
-                    attn_sink=attn_sink,
-                    extra_kv_cache=extra_kv_cache,
-                    extra_indices=extra_indices,
-                    extra_topk_length=extra_topk_length,
-                    chunks_per_block=planned.cpb,
-                    model_type=model_type,
-                    extra_fp4=extra_fp4,
-                )
-                return
-
-            num_splits = (topk + _BI - 1) // _BI
-            mid_out_view, mid_lse_view = _decode_scratch_views(
-                mid_out, mid_lse, num_tokens, num_heads, num_splits, d_v
-            )
-            sparse_mla_sm120_decode_dsv3_2(
-                q,
-                kv_cache,
-                indices,
-                mid_out_view,
-                mid_lse_view,
-                output,
-                out_lse,
-                sm_scale,
-                topk_length=topk_length,
-                attn_sink=attn_sink,
-                model_type=model_type,
-                chunks_per_block=planned.cpb,
-            )
-            return
-
-        module.sparse_mla_sm120_paged_attention(
+        caller_run(
             q,
             kv_cache,
             indices,
@@ -701,12 +587,15 @@ def get_sparse_mla_sm120_module():
             out_lse,
             sm_scale,
             model_type,
-            int(planned.variant),
+            prefill_impl,
+            d_v,
             topk_length,
             attn_sink,
             extra_kv_cache,
             extra_indices,
             extra_topk_length,
+            mid_out,
+            mid_lse,
             extra_fp4,
         )
 
@@ -745,8 +634,11 @@ def _sparse_mla_sm120_paged_attention(
     r"""Internal Sparse-MLA paged attention on SM120.
 
     Routes decode-form calls (``num_tokens <= 64``) to decode or prefill per
-    the calibrated crossover policy, and larger calls to prefill. Mutates
-    ``output`` and ``out_lse`` in place.
+    the configuration profile, and larger calls to prefill. Mutates
+    ``output`` and ``out_lse`` in place. Shares prepared metadata plans with
+    functional execution; plans retain no caller tensors. Warm each metadata
+    shape before graph capture, and keep caller buffers alive while its graph
+    lives. Eager profile updates replace plans; recapture to use new choices.
 
     Parameters
     ----------
@@ -761,24 +653,24 @@ def _sparse_mla_sm120_paged_attention(
         ``[num_blocks, 1, page_block_size, bytes]``, or NHD
         ``[num_blocks, page_block_size, 1, bytes]``. The SM120 binding derives
         page size and block stride from the tensor metadata without
-        materializing a layout conversion. Padded block strides are honored
-        only for footer-scale models (DSv4 / DOTS3_SWA). Inline-scale
-        (DSv3.2 / GLM) caches take the row advance as a runtime stride, so
-        padded rows (a wider last dim, e.g. a legacy 656B pool serving the
-        528B GLM53_NOPE payload) work in both decode and prefill as long as
-        blocks pack rows contiguously. Cache origins and page strides must be
-        16-byte aligned; inline row strides must also be aligned. Footer rows
-        remain packed. Flat GLM53_NOPE pages use 528 bytes per token; expose
-        the token axis in a 3D/4D view for a padded 656-byte pool.
+        materializing a layout conversion. Footer-scale models honor padded
+        block strides in decode and prefill. Inline-scale (DSv3.2 / GLM)
+        caches support padded rows in both phases, but page gaps only in decode.
+        Cache origins and page strides must be 16-byte aligned; inline row
+        strides must also be aligned. Footer rows remain packed. Flat
+        GLM53_NOPE pages use 528 bytes per token; expose the token axis in a
+        3D/4D view for a padded 656-byte pool.
     indices : torch.Tensor
         Paged slot IDs per query token, shape ``[num_tokens, topk]`` or
         ``[num_tokens, 1, topk]``, dtype int32. ``-1`` marks invalid /
         out-of-window slots; masked slots gather a dedicated zero row, so
         arbitrary cache contents (including NaNs) cannot contaminate valid
         outputs, and slots past ``topk_length`` are never gathered regardless
-        of the padding contents. Prefill-routed calls require
-        ``topk % 64 == 0`` (whole 64-wide index tiles) and, for DOTS3_SWA,
-        ``topk >= 513`` so the sliding window fits the buffer.
+        of the padding contents. Prefill requires dense main and extra index
+        rows. Short calls fall back to legal decode when actual metadata rules
+        out the calibrated prefill choice; larger calls without a legal route
+        raise an error. Ordinary prefill requires ``topk % 64 == 0``;
+        DOTS3_SWA additionally requires ``topk >= 513`` to fit its sliding window.
     output : torch.Tensor
         In-place output, shape ``[num_tokens, num_heads, d_v]``, dtype bf16.
     out_lse : torch.Tensor
@@ -828,7 +720,8 @@ def _sparse_mla_sm120_paged_attention(
         Pre-allocated split-K LSE scratch, shape
         ``[>=num_tokens, >=num_heads, >=num_splits]``, dtype float32. Pair with
         ``mid_out`` when the call dispatches to a decode kernel; the head
-        dimension follows the same rule as ``mid_out``.
+        dimension follows the same rule as ``mid_out``. Both scratch arguments
+        are ignored, including their metadata, when prefill is selected.
     prefill_impl : Optional[str]
         Prefill-kernel override for calls that dispatch to prefill. ``None``
         or ``"auto"`` keeps the default order (swapAB preferred where
@@ -837,23 +730,20 @@ def _sparse_mla_sm120_paged_attention(
         family, single cache, whole-tile ``topk``, ``num_heads`` in
         {64, 128}); ``"mg"`` forces the non-swapAB SG/MG path. For the DSV4
         family ``"mg"`` and ``None`` are no-ops on dispatch, and ``"swapab"``
-        always raises.
+        always raises. Pitch and page-gap restrictions are checked only when
+        prefill is selected; legal decode calls keep their runtime layouts.
 
     Notes
     -----
     Requires SM120a / SM121a (block-scaled MXFP8 MMA + cp.async.bulk TMA).
     """
-    model_type = _resolve_model_type(q.shape[-1], kv_scale_format)
-    _require_d_v(d_v, model_type)
-    _check_last_dim(output, "output", model_type)
-    # The secondary cache is an all-or-nothing argument group: without this
-    # check, extra_indices without extra_kv_cache would reach the planner as
-    # has_extra=False with extra_topk>0, and could be forwarded to a
-    # single-cache variant alongside the null cache.
     if (extra_kv_cache is None) != (extra_indices is None):
         raise ValueError("extra_kv_cache and extra_indices must be provided together")
     if extra_kv_cache is None and extra_topk_length is not None:
         raise ValueError("extra_topk_length requires extra_kv_cache and extra_indices")
+    model_type = _resolve_model_type(q.shape[-1], kv_scale_format)
+    _require_d_v(d_v, model_type)
+    _check_last_dim(output, "output", model_type)
     if extra_fp4 and model_type != _MODEL_TYPE_DSV4_1:
         raise ValueError(
             "extra_fp4 (V41_FP4 extra cache) requires a DSV4_1 main cache "
@@ -1059,9 +949,10 @@ class _SparseMLAPagedAttentionRunner:
 
         ``prefill_impl`` (``None``/``"auto"``/``"swapab"``/``"mg"``) overrides
         the prefill-kernel selection for calls that dispatch to prefill;
-        ``"swapab"`` raises ``ValueError`` on shapes outside its envelope
-        (DSV3_2 family, single cache, whole-tile ``topk``, ``num_heads`` in
-        {64, 128}) and is a no-op distinction for DSV4, where only the
+        ``"swapab"`` raises ``ValueError`` when the actual metadata is outside
+        its envelope, including pitched indices or page gaps, even for short
+        calls. A legal swapAB preference does not force a decode-form call to
+        prefill. ``"mg"`` is a no-op distinction for DSV4, where only the
         non-swapAB path exists. NVFP4 accepts ``None``, ``"auto"``, or
         ``"mg"`` and uses its separately calibrated streaming/split-K planner.
         NVFP4 also accepts ``indices``/``extra_indices`` as either
@@ -1147,15 +1038,15 @@ def sparse_mla_sm120_decode_dsv3_2(
 ) -> torch.Tensor:
     """Sparse-MLA paged decode (DSv3.2 / GLM-NSA kernel) on SM120.
 
-    Cache pages must contain 64 tokens. Contiguous scratch uses head capacity
-    8 for H=8, otherwise ceil(H/16)*16, and allocated (not active) split stride.
+    Positive runtime page sizes, aligned page gaps and pitched index rows are
+    supported. Contiguous scratch uses head capacity 8 for H=8, otherwise
+    ceil(H/16)*16, and allocated (not active) split stride.
 
-    ``chunks_per_block`` follows the same contract as the DSv4 decode helper:
-    an explicit value is used directly; otherwise the calibrated analytical
-    model picks one when its constants are available (calibrated once per
-    device during ``autotune()`` tuning mode), falling back to the C++
-    heuristic. DSv3.2 and GLM-NSA share the same calibrated constants;
-    GLM53_NOPE has its own constants entry.
+    An explicit ``chunks_per_block`` is used directly. Otherwise a matching
+    configuration profile supplies decode CPB, even if its bucket prefers
+    prefill. Missing profiles use analytical constants or the C++ heuristic.
+    This helper remains decode-only. DSv3.2 and GLM-NSA share analytical
+    constants, but their measured profiles remain separate.
     """
     _check_last_dim(output, "output", int(model_type))
     _check_last_dim(mid_out, "mid_out", int(model_type))
@@ -1163,20 +1054,36 @@ def sparse_mla_sm120_decode_dsv3_2(
         # Empty request: a kernel launch would hit a grid.x=0 CUDA error.
         return output
 
-    module = _get_sparse_mla_sm120_decode_module()
-    num_splits = _decode_dsv4_num_splits(indices.shape[-1], model_type=int(model_type))
-
     if chunks_per_block is not None:
+        module = _get_sparse_mla_sm120_decode_module()
+        num_splits = _decode_dsv4_num_splits(
+            indices.shape[-1], model_type=int(model_type)
+        )
         cpb_override = int(chunks_per_block)
     else:
-        cpb_override = _resolve_cpb(
-            q.device,
-            _MODEL_TYPE_TO_FAMILY[int(model_type)],
-            q.shape[0],
-            q.shape[1],
-            indices.shape[-1],
+        from ._prepared import caller_run
+
+        caller_run(
+            q,
+            kv_cache,
+            indices,
+            output,
+            out_lse,
+            sm_scale,
+            int(model_type),
             0,
+            _expected_d_v(int(model_type)),
+            topk_length,
+            attn_sink,
+            None,
+            None,
+            None,
+            mid_out,
+            mid_lse,
+            False,
+            decode_only=True,
         )
+        return output
 
     module.sparse_mla_sm120_decode_dsv3_2(
         q,
@@ -1218,18 +1125,11 @@ def sparse_mla_sm120_decode_dsv4(
 ) -> torch.Tensor:
     r"""Sparse-MLA paged decode (DSv4 standalone kernel) on SM120.
 
-    The decode-dsv4 path is the split-K decode variant where each block handles
-    ``chunks_per_block`` chunks of 64 candidates each. The wall-time-optimal
-    value is shape-dependent; this wrapper picks it per call with the
-    calibrated analytical model in :mod:`._calibration`.
-
-    Behaviour:
-
-    - ``chunks_per_block`` explicitly given → use that value directly.
-    - Otherwise, if calibrated model constants are available for this device
-      (calibrated once per device in ``autotune()`` tuning mode and cached on
-      disk) → use the model's choice.
-    - Otherwise → fall back to the C++ closed-form heuristic.
+    This helper stays decode-only. An explicit ``chunks_per_block`` is used
+    directly; otherwise a matching configuration profile supplies decode CPB,
+    even when that bucket selects prefill for ordinary attention. A missing
+    profile uses analytical constants when available, then the C++ heuristic.
+    Default calls reuse the shared prepared execution boundary.
 
     Parameters
     ----------
@@ -1273,8 +1173,8 @@ def sparse_mla_sm120_decode_dsv4(
         Per-token effective top-k length for the secondary cache, ``[T]``
         int32.
     chunks_per_block : Optional[int]
-        Explicit override. If ``None``, the calibrated model picks a value when
-        available, else the C++ heuristic is used.
+        Explicit override. If ``None``, use the matching profile's decode CPB,
+        otherwise analytical constants or the C++ heuristic.
     extra_fp4 : bool
         The extra cache holds V41_FP4 rows (288 B/token: 256 B packed E2M1 +
         32 B E4M3-G16 scales; FlashMLA ``tests/quant.py``) instead of the main
@@ -1301,24 +1201,36 @@ def sparse_mla_sm120_decode_dsv4(
         # Empty request: a kernel launch would hit a grid.x=0 CUDA error.
         return output
 
-    module = _get_sparse_mla_sm120_decode_module()
-    topk = indices.shape[-1]  # 2D [T, topk] or 3D [T, 1, topk]
-    extra_topk = extra_indices.shape[-1] if extra_indices is not None else 0
-    num_splits = _decode_dsv4_num_splits(topk, extra_topk, model_type)
-
     if chunks_per_block is not None:
+        module = _get_sparse_mla_sm120_decode_module()
+        topk = indices.shape[-1]
+        extra_topk = extra_indices.shape[-1] if extra_indices is not None else 0
+        num_splits = _decode_dsv4_num_splits(topk, extra_topk, model_type)
         cpb_override = int(chunks_per_block)
-    elif model_type == _MODEL_TYPE_DSV4_1 and extra_kv_cache is not None:
-        cpb_override = -1
     else:
-        cpb_override = _resolve_cpb(
-            q.device,
-            _MODEL_TYPE_TO_FAMILY[model_type],
-            q.shape[0],
-            q.shape[1],
-            topk,
-            extra_topk,
+        from ._prepared import caller_run
+
+        caller_run(
+            q,
+            kv_cache,
+            indices,
+            output,
+            out_lse,
+            sm_scale,
+            model_type,
+            0,
+            _expected_d_v(model_type),
+            topk_length,
+            attn_sink,
+            extra_kv_cache,
+            extra_indices,
+            extra_topk_length,
+            mid_out,
+            mid_lse,
+            extra_fp4,
+            decode_only=True,
         )
+        return output
 
     module.sparse_mla_sm120_decode_dsv4(
         q,

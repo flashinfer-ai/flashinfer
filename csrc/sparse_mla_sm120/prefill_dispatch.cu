@@ -24,11 +24,12 @@ PrefillLaunchResult dispatch_prefill(const execution::AttentionParams& p,
                          p.topk_length,       p.extra_topk_length,
                          p.extra_kv,          p.extra_indices,
                          m.extra_page_size,   m.page_size};
-  if (mt == ModelType::DSV3_2 || mt == ModelType::GLM_NSA || mt == ModelType::GLM53_NOPE)
-    cold.kv_stride_bytes = m.row_stride_bytes;
-#define SINGLE_ARGS                                                                     \
-  m.heads, m.topk, m.page_size, p.q, p.kv, p.indices, p.attn_sink, p.output, p.out_lse, \
-      p.sm_scale, m.tokens, m.page_stride_bytes, m.lse_stride, p.topk_length, stream
+  if (cache_format_info(mt).inline_scale) cold.kv_stride_bytes = m.row_stride_bytes;
+  if (mt == ModelType::DSV4 || mt == ModelType::DOTS3_SWA) {
+    cold.main_div = flashinfer::uint_fastdiv(uint32_t(m.page_size));
+    if (m.extra_topk > 0) cold.extra_div = flashinfer::uint_fastdiv(uint32_t(m.extra_page_size));
+  }
+#define SINGLE_ARGS m.heads, p.q, p.kv, p.indices, p.attn_sink, p.output, p.out_lse, stream
 #define V32(FN)                                            \
   switch (mt) {                                            \
     case ModelType::DSV3_2:                                \
@@ -51,21 +52,15 @@ PrefillLaunchResult dispatch_prefill(const execution::AttentionParams& p,
           return dispatch_dsv41_sg<Dsv41MixedCachePrefillSchedule>(SINGLE_ARGS, cold);
         return dispatch_dsv41_sg<Dsv41PrefillGatherSchedule>(SINGLE_ARGS, cold);
       }
-      if (mt == ModelType::DOTS3_SWA) {
-        cold.main_div = flashinfer::uint_fastdiv(uint32_t(m.page_size));
-        return dispatch_dots3_swa_sg(SINGLE_ARGS, cold);
-      }
+      if (mt == ModelType::DOTS3_SWA) return dispatch_dots3_swa_sg(SINGLE_ARGS, cold);
       V32(dispatch_v32_sg);
     }
     case execution::Implementation::MG:
     case execution::Implementation::FullTile: {
       if (m.extra_topk > 0)
-        return dispatch_dsv4_dual(plan, m.heads, m.topk, m.extra_topk, m.page_size,
-                                  m.extra_page_size, p.q, p.kv, p.indices, p.extra_kv,
-                                  p.extra_indices, p.attn_sink, p.output, p.out_lse, p.sm_scale,
-                                  m.tokens, m.page_stride_bytes, m.extra_page_stride_bytes,
-                                  m.lse_stride, p.topk_length, p.extra_topk_length, stream);
-      if (mt == ModelType::DSV4) return dispatch_dsv4_single(plan, SINGLE_ARGS);
+        return dispatch_dsv4_dual(plan, m.heads, p.q, p.kv, p.indices, p.extra_kv, p.extra_indices,
+                                  p.attn_sink, p.output, p.out_lse, stream, cold);
+      if (mt == ModelType::DSV4) return dispatch_dsv4_single(plan, SINGLE_ARGS, cold);
       V32(dispatch_v32_mg);
     }
     default:

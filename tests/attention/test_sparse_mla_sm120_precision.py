@@ -1,3 +1,5 @@
+from contextlib import contextmanager
+
 import pytest
 import torch
 
@@ -10,11 +12,44 @@ from tests.attention.sparse_mla_test_utils import (
 )
 
 
+@contextmanager
+def _no_capture_allocations(wrapper, device):
+    prepared = tuple(wrapper._prepared_calls.values())
+    resources = tuple((entry, entry.mid, entry.mlse, entry.lse) for entry in prepared)
+    allocated = torch.cuda.memory_stats(device)["allocation.all.allocated"]
+    yield
+    assert torch.cuda.memory_stats(device)["allocation.all.allocated"] == allocated
+    assert tuple(map(id, wrapper._prepared_calls.values())) == tuple(map(id, prepared))
+    for entry, mid, mlse, lse in resources:
+        assert entry.mid is mid and entry.mlse is mlse and entry.lse is lse
+
+
+def _kernel_only_graph(topology):
+    import re
+
+    nodes = re.findall(r'"graph_\d+_node_\d+"\[.*?\];', topology, re.DOTALL)
+    assert nodes and all('label="{KERNEL' in node for node in nodes)
+
+
 def _require_sm12x():
     from flashinfer.utils import is_sm12x_supported
 
     if not torch.cuda.is_available() or not is_sm12x_supported(torch.device("cuda")):
         pytest.skip("Sparse-MLA SM120 requires SM12x.")
+
+
+def test_capture_allocation_guard_tracks_allocations_not_live_bytes():
+    _require_sm12x()
+    wrapper = SparseMLASm120Wrapper(
+        compute_precision="bf16", kv_scale_format="ue8m0_g32"
+    )
+    device = torch.device("cuda")
+    unrelated = torch.empty(1 << 20, device=device)
+    with _no_capture_allocations(wrapper, device):
+        del unrelated
+    with pytest.raises(AssertionError), _no_capture_allocations(wrapper, device):
+        temporary = torch.empty(1024, device=device)
+        del temporary
 
 
 @pytest.mark.parametrize("precision", ["default", "fp8", "bf16"])
@@ -65,6 +100,19 @@ def test_precision_single_cache_and_capture_requires_warmup(precision, monkeypat
 
 
 def test_precision_planner_isolation(monkeypatch):
+    from flashinfer.mla._sparse_mla_sm120 import _execution as execution
+
+    def no_compilation(*args, **kwargs):
+        raise AssertionError("pure planner isolation must not load a compiled module")
+
+    monkeypatch.setattr(execution, "get_sparse_mla_sm120_module", no_compilation)
+
+    def candidates(model, heads, topk, page, extra):
+        assert (model, heads, topk, page, extra) == (5, 13, 128, 61, True)
+        return frozenset({0})
+
+    monkeypatch.setattr(planner, "_candidates", candidates)
+
     def old_calibration(*args, **kwargs):
         raise AssertionError("explicit precision consulted legacy calibration")
 
@@ -181,14 +229,13 @@ def test_fp8_prefill_cross_bucket_graphs(mixed, tmp_path):
         assert torch.equal(pitched_lse, lse)
         graph = torch.cuda.CUDAGraph(keep_graph=True)
         graph.enable_debug_mode()
-        with torch.cuda.graph(graph):
-            allocated = torch.cuda.memory_allocated()
+        with torch.cuda.graph(graph), _no_capture_allocations(wrapper, nq.device):
             wrapper.run(nq, main, ni, output, 512**-0.5, **kw)
-            assert torch.cuda.memory_allocated() == allocated
         graph.instantiate()
         dot = tmp_path / f"route-{nt}.dot"
         graph.debug_dump(str(dot))
         topology = dot.read_text()
+        _kernel_only_graph(topology)
         if nt > 64:
             assert "sparse_mla_prefill_kernel" in topology
             assert "sparse_mla_decode" not in topology
@@ -327,14 +374,13 @@ def test_nvfp4_precision_cross_bucket_graphs(extra_pbs, tmp_path):
             torch.testing.assert_close(lse, rlse, atol=0.02, rtol=0.02)
         graph = torch.cuda.CUDAGraph(keep_graph=True)
         graph.enable_debug_mode()
-        with torch.cuda.graph(graph):
-            allocated = torch.cuda.memory_allocated()
+        with torch.cuda.graph(graph), _no_capture_allocations(wrapper, q.device):
             wrapper.run(q, main, idx, output, 512**-0.5, prefill_impl="auto", **kw)
-            assert torch.cuda.memory_allocated() == allocated
         graph.instantiate()
         dot = tmp_path / f"dsv4-nvfp4-{nt}.dot"
         graph.debug_dump(str(dot))
         topology = dot.read_text()
+        _kernel_only_graph(topology)
         selected = list(wrapper._prepared_calls.values())[-1].plan
         kernels = [line for line in topology.splitlines() if "sparse_mla_" in line]
         if selected.inspect()["implementation"] == "dsv4_nvfp4_prefill":
@@ -480,15 +526,14 @@ def test_bf16_prefill_runtime_shapes(heads, topk, mixed, tmp_path):
         expected = output.clone(), lse.clone()
         graph = torch.cuda.CUDAGraph(keep_graph=True)
         graph.enable_debug_mode()
-        with torch.cuda.graph(graph):
-            allocated = torch.cuda.memory_allocated()
+        with torch.cuda.graph(graph), _no_capture_allocations(wrapper, query.device):
             wrapper.run(query, main, indices, output, 512**-0.5, out_lse=lse, **kw)
-            assert torch.cuda.memory_allocated() == allocated
         graph.instantiate()
         dot = tmp_path / f"bf16-{nt}.dot"
         graph.debug_dump(str(dot))
+        text = dot.read_text()
+        _kernel_only_graph(text)
         if nt > 64:
-            text = dot.read_text()
             assert "sparse_mla_prefill_dsv41_bf16_kernel" in text
             assert "sparse_mla_decode" not in text
         states.append((graph, output, lse, expected, query, indices, kw))
@@ -496,6 +541,44 @@ def test_bf16_prefill_runtime_shapes(heads, topk, mixed, tmp_path):
         graph.replay()
         torch.cuda.synchronize()
         assert torch.equal(output, expected[0]) and torch.equal(lse, expected[1])
+
+
+@pytest.mark.parametrize("tokens", [4, 65])
+def test_bf16_fp4_extra_exact_codes_and_scales(tokens):
+    from tests.attention.sparse_mla_test_utils import dequantize_kv_dsv4_1_fp4
+
+    _require_sm12x()
+    device = torch.device("cuda")
+    main = torch.zeros(1, 1, 1, 528, dtype=torch.uint8, device=device)
+    extra = torch.empty(1, 1, 1, 288, dtype=torch.uint8, device=device)
+    raw = extra.view(-1)
+    raw[:256] = torch.arange(256, device=device).to(torch.uint8)
+    raw[256:] = torch.tensor(
+        [1, 7, 8, 16, 32, 48, 56, 64, 80, 96, 112, 126, 129, 136, 184, 254] * 2,
+        device=device,
+        dtype=torch.uint8,
+    )
+    query = torch.zeros(tokens, 13, 512, device=device, dtype=torch.bfloat16)
+    indices = torch.full((tokens, 1), -1, device=device, dtype=torch.int32)
+    extra_indices = torch.zeros_like(indices)
+    wrapper = SparseMLASm120Wrapper(
+        kv_scale_format="ue8m0_g32", extra_kv_fp4=True, compute_precision="bf16"
+    )
+    output = torch.empty_like(query)
+    kwargs = dict(extra_kv_cache=extra, extra_indices=extra_indices)
+    lse = wrapper.run(
+        query, main, indices, output, 512**-0.5, return_lse=True, **kwargs
+    )
+    expected = dequantize_kv_dsv4_1_fp4(extra).reshape(1, 1, 512).expand_as(output)
+    torch.testing.assert_close(output, expected, atol=0, rtol=0)
+    assert torch.count_nonzero(lse) == 0
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        wrapper.run(query, main, indices, output, 512**-0.5, **kwargs)
+    output.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output, expected, atol=0, rtol=0)
 
 
 def test_bf16_prefill_optional_lengths_and_empty_rows():

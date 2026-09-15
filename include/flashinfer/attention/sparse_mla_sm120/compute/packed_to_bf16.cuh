@@ -10,9 +10,10 @@ __device__ __forceinline__ __nv_bfloat162 decode_e2m1_or_e4m3_pair_bf16(uint32_t
                                                                         bool is_e2m1) {
   uint32_t half_pair;
   if (is_e2m1) {
-    asm("{ .reg .b8 x; mov.b32 {x,_,_,_}, %1; cvt.rn.f16x2.e2m1x2 %0,x; }"
+    // Match CUDA's fp4 intrinsic: ptxas 12.9 miscompiles the mov.b32 byte unpack.
+    asm("{ .reg .b8 x, unused; mov.b16 {x,unused}, %1; cvt.rn.f16x2.e2m1x2 %0,x; }"
         : "=r"(half_pair)
-        : "r"(raw));
+        : "h"(uint16_t(raw)));
   } else {
     asm("cvt.rn.f16x2.e4m3x2 %0,%1;" : "=r"(half_pair) : "h"(uint16_t(raw)));
   }

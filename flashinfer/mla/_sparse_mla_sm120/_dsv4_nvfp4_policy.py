@@ -135,7 +135,7 @@ def _request_key(
     return json.dumps(
         {
             "family": _FAMILY,
-            "strategy": "queued_rotation_v1",
+            "strategy": _cpb._TIMING_PROTOCOL,
             "heads": num_heads,
             "topk": topk,
             "primary_page_size": primary_page_size,
@@ -319,9 +319,8 @@ def plan_nvfp4_sparse_mla_sm120(
                 profile = _cpb.get_profile(key, device)
                 scope_epoch = _cpb._constants_version
 
-    # Each bucket stores its own selection.  The shared selector consumes the
-    # decision directly, so NVFP4 does not inherit FP8's monotonic crossover
-    # assumption; a missing profile keeps the decode-first fallback.
+    # Each bucket stores its own selection; a missing profile keeps the
+    # decode-first fallback.
     bucket = (
         None
         if profile is None or num_tokens > _DECODE_MAX_TOKENS
@@ -668,13 +667,16 @@ def _measure_nvfp4_bucket(
     chunk = dsv4_nvfp4_format_info()["chunk_width"]
     num_splits = (topk + chunk - 1) // chunk
     num_splits += (extra_topk + chunk - 1) // chunk
-    best_cpb = 1
-    best_decode_us = float("inf")
-    for cpb in range(1, num_splits + 1):
-        latency_us = _time_indexed_calls(build_decode(cpb), index_sets, ctx.device)
-        if latency_us <= best_decode_us:
-            best_cpb, best_decode_us = cpb, latency_us
-    measured_prefill_us = _time_indexed_calls(prefill, index_sets, ctx.device)
+    candidates = list(range(1, num_splits + 1)) + [0]
+    measured = _cpb._balanced_timings(
+        candidates,
+        lambda cpb: _time_indexed_calls(
+            build_decode(cpb) if cpb else prefill, index_sets, ctx.device
+        ),
+    )
+    best_cpb = min(range(1, num_splits + 1), key=lambda cpb: (measured[cpb], -cpb))
+    best_decode_us = measured[best_cpb]
+    measured_prefill_us = measured[0]
     use_decode = best_decode_us <= _CROSSOVER_MARGIN * measured_prefill_us
     return {
         "variant": (
@@ -792,7 +794,8 @@ def calibrate_nvfp4_sparse_mla_sm120(
     }
     profile = {
         "request": json.loads(key),
-        "sample_kind": "full_capacity_canonical_layout",
+        "sample_kind": _cpb._SAMPLE_KIND,
+        "timing_protocol": _cpb._TIMING_PROTOCOL,
         "buckets": buckets,
     }
     persisted = _cpb.publish_calibration(device, _FAMILY, profiles={key: profile})

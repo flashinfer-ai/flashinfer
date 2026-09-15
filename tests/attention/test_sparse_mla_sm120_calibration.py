@@ -49,6 +49,9 @@ from flashinfer.mla._sparse_mla_sm120._calibration import (
     predict_time_s,
     select_cpb,
 )
+from tests.attention import sparse_mla_test_utils
+
+ordinary_format_facts = sparse_mla_test_utils.ordinary_format_facts
 from flashinfer.utils import is_sm12x_supported
 
 requires_sm12x = pytest.mark.skipif(
@@ -230,7 +233,7 @@ def test_model_cpb_accuracy_guard(
     dsv4_constants: CpbConstants, num_tokens, topk
 ) -> None:
     """Model-picked cpb is within 1.25x of the best swept cpb, measured with
-    the calibration timing protocol (queued batches, L2-cold indices) so the
+    the calibration timing protocol (per-call cold-L2 graph events) so the
     guard certifies the regime production calibration runs in."""
     from flashinfer.mla._sparse_mla_sm120 import (
         _get_sparse_mla_sm120_decode_module,
@@ -253,8 +256,9 @@ def test_model_cpb_accuracy_guard(
             call, num_tokens, topk, num_slots, device, c.bytes_per_chunk // 64
         )
 
-    swept = {cpb: run(cpb) for cpb in range(1, num_splits + 1)}
-    heuristic_t = run(-1)
+    measured = cpb_mod._balanced_timings(list(range(1, num_splits + 1)) + [-1], run)
+    heuristic_t = measured.pop(-1)
+    swept = measured
     model_cpb = select_cpb(num_tokens, num_heads, topk, 0, c)
     model_t = swept[model_cpb]
     best_cpb = min(swept, key=swept.get)
@@ -330,8 +334,8 @@ def test_model_cpb_accuracy_guard_dual_cache(
     sm_scale = d_qk**-0.5
 
     def run(cpb_override: int) -> float:
-        # The timing helper rotates fresh main-cache indices per call; the
-        # extra-cache set stays fixed (within-row uniform across candidates).
+        # Both caches are evicted before every timed call; the extra indices
+        # stay fixed and identical across candidates.
         def call(indices: torch.Tensor) -> None:
             module.sparse_mla_sm120_decode_dsv4(
                 q,
@@ -357,8 +361,9 @@ def test_model_cpb_accuracy_guard_dual_cache(
             call, num_tokens, topk, kv_cache.shape[0] * 64, device, bpt
         )
 
-    swept = {cpb: run(cpb) for cpb in range(1, num_splits + 1)}
-    heuristic_t = run(-1)
+    measured = cpb_mod._balanced_timings(list(range(1, num_splits + 1)) + [-1], run)
+    heuristic_t = measured.pop(-1)
+    swept = measured
     model_cpb = select_cpb(num_tokens, num_heads, topk, extra_topk, c)
     model_t = swept[model_cpb]
     best_cpb = min(swept, key=swept.get)
@@ -380,9 +385,7 @@ def test_model_cpb_accuracy_guard_dual_cache(
 def test_refine_cpb_beats_or_matches_model(
     monkeypatch, tmp_path, dsv4_constants: CpbConstants
 ) -> None:
-    """refine_cpb's measured pick never loses to the model pick under the same
-    timing protocol, persists to disk, and _resolve_cpb serves the override
-    ahead of the model (tuning mode off)."""
+    """Explicit legacy refinement persists without becoming an execution source."""
     from flashinfer.mla._sparse_mla_sm120 import (
         _get_sparse_mla_sm120_decode_module,
         _resolve_cpb,
@@ -431,8 +434,8 @@ def test_refine_cpb_beats_or_matches_model(
     assert (
         cpb_mod.get_cpb_override(device, "dsv4", num_heads, topk, num_tokens) == refined
     )
-    assert _resolve_cpb(device, "dsv4", num_tokens, num_heads, topk, 0) == refined
-    # An unrefined shape still falls through to the model pick.
+    assert _resolve_cpb(device, "dsv4", num_tokens, num_heads, topk, 0) == model_cpb
+    # Legacy overrides remain inspectable but are not an execution source.
     assert _resolve_cpb(
         device, "dsv4", num_tokens + 1, num_heads, topk, 0
     ) == select_cpb(num_tokens + 1, num_heads, topk, 0, c)
@@ -449,8 +452,6 @@ def test_model_path_dual_cache_wiring(monkeypatch, tmp_path) -> None:
     """Public wrapper + extra cache + injected constants: select_cpb's cpb
     (covering the extra chunks) reaches the kernel as cpb_override, with
     num_splits spanning both index sets."""
-    from types import SimpleNamespace
-
     from flashinfer.mla._sparse_mla_sm120 import _api as sm
 
     device = torch.device("cuda")
@@ -492,20 +493,18 @@ def test_model_path_dual_cache_wiring(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("FLASHINFER_AUTOTUNE_DIR", str(tmp_path))
     cpb_mod.save_constants(device, "dsv4", _C)
 
-    real_module = sm._get_sparse_mla_sm120_decode_module()
-    real_call = real_module.sparse_mla_sm120_decode_dsv4
+    from flashinfer.mla._sparse_mla_sm120 import _prepared as prepared
+
+    real_call = prepared.PreparedCall.execute
     recorded = {}
 
-    def spy(*args):
-        recorded["num_splits"] = args[7]
-        recorded["cpb_override"] = args[-2]  # trailing arg is extra_fp4
-        return real_call(*args)
+    def spy(self, *args, **kwargs):
+        facts = self.plan.inspect()
+        recorded["num_splits"] = facts["scratch_split_stride"]
+        recorded["cpb_override"] = facts["cpb"]
+        return real_call(self, *args, **kwargs)
 
-    monkeypatch.setattr(
-        sm,
-        "_get_sparse_mla_sm120_decode_module",
-        lambda: SimpleNamespace(sparse_mla_sm120_decode_dsv4=spy),
-    )
+    monkeypatch.setattr(prepared.PreparedCall, "execute", spy)
 
     sm.sparse_mla_sm120_decode_dsv4(
         q,
@@ -526,104 +525,18 @@ def test_model_path_dual_cache_wiring(monkeypatch, tmp_path) -> None:
     )
 
 
-@requires_sm12x
-def test_glm_nsa_decode_uses_dsv3_2_cpb_family(clean_cpb_state, monkeypatch) -> None:
-    """GLM_NSA decode shares the dsv3_2 cpb constants (same kernel and ABI):
-    non-tuning picks up injected dsv3_2 constants, and tuning mode calibrates
-    under the "dsv3_2" family key instead of raising ValueError on the
-    unknown "glm_nsa" key. Crossover keys stay glm_nsa-flavored (produced by
-    the dsv3_2 crossover calibration, which covers both key spaces)."""
-    from types import SimpleNamespace
+def test_glm_nsa_estimate_uses_dsv3_2_constants(clean_cpb_state, monkeypatch) -> None:
+    from flashinfer.mla._sparse_mla_sm120 import _policy as policy
 
-    from flashinfer.autotuner import AutoTuner
-    from flashinfer.mla._sparse_mla_sm120 import _api as sm
-    from flashinfer.mla._sparse_mla_sm120 import _MODEL_TYPE_GLM_NSA
-
-    device = torch.device("cuda")
-    num_tokens, num_heads, topk = 2, 64, 2048
-    d_qk, d_v = 576, 512
-    num_splits = -(-topk // 64)
-
-    kv_cache = torch.empty(256, 64 * 656, dtype=torch.uint8, device=device)
-    cpb_mod._initialize_fp8_pool(kv_cache, "dsv3_2", 64)
-    q = torch.randn(num_tokens, num_heads, d_qk, device=device).to(torch.bfloat16)
-    indices = torch.randint(
-        0, kv_cache.shape[0] * 64, (num_tokens, topk), dtype=torch.int32, device=device
-    )
-    mid_out = torch.empty(
-        num_tokens, num_heads, num_splits, d_v, dtype=torch.bfloat16, device=device
-    )
-    mid_lse = torch.empty(
-        num_tokens, num_heads, num_splits, dtype=torch.float32, device=device
-    )
-    output = torch.empty(
-        num_tokens, num_heads, d_v, dtype=torch.bfloat16, device=device
-    )
-    out_lse = torch.empty(num_tokens, num_heads, dtype=torch.float32, device=device)
-
-    real_module = sm._get_sparse_mla_sm120_decode_module()
-    real_call = real_module.sparse_mla_sm120_decode_dsv3_2
-    recorded = {}
-
-    def spy(*args):
-        recorded["cpb_override"] = args[-1]
-        return real_call(*args)
-
-    monkeypatch.setattr(
-        sm,
-        "_get_sparse_mla_sm120_decode_module",
-        lambda: SimpleNamespace(sparse_mla_sm120_decode_dsv3_2=spy),
-    )
-
-    def call() -> None:
-        sm.sparse_mla_sm120_decode_dsv3_2(
-            q,
-            kv_cache,
-            indices,
-            mid_out,
-            mid_lse,
-            output,
-            out_lse,
-            d_qk**-0.5,
-            model_type=_MODEL_TYPE_GLM_NSA,
-        )
-
-    expected_cpb = select_cpb(num_tokens, num_heads, topk, 0, _C)
-
-    # Non-tuning: injected dsv3_2 constants drive the GLM_NSA decode call.
+    monkeypatch.setattr(cpb_mod, "_CHUNK_WIDTH", {"dsv3_2": 64})
+    device = torch.device("cpu")
     cpb_mod.save_constants(device, "dsv3_2", _C)
-    call()
-    assert recorded["cpb_override"] == expected_cpb
-
-    # Tuning mode with an empty cache: calibrate + crossover calibrate run
-    # under the dsv3_2 family key, not the unknown glm_nsa key.
-    cpb_mod._constants.clear()
-    cpb_mod._crossover.clear()
-    seen = {}
-
-    def fake_calibrate(module_getter, family, dev):
-        seen["calibrate"] = family
-        return _C
-
-    def fake_calibrate_crossover(module, dev, family, c):
-        seen["calibrate_crossover"] = family
-        return {"dsv3_2|64|2048": 32, "glm_nsa|64|2048": 32}
-
-    def fake_refine(module_getter, family, dev, c, t, h, k):
-        seen["refine_cpb"] = family
-        return select_cpb(t, h, k, 0, c)
-
-    monkeypatch.setattr(cpb_mod, "calibrate", fake_calibrate)
-    monkeypatch.setattr(cpb_mod, "calibrate_crossover", fake_calibrate_crossover)
-    monkeypatch.setattr(cpb_mod, "refine_cpb", fake_refine)
-    monkeypatch.setattr(AutoTuner.get(), "is_tuning_mode", True)
-    call()
-    assert seen == {
-        "calibrate": "dsv3_2",
-        "calibrate_crossover": "dsv3_2",
-        "refine_cpb": "dsv3_2",
-    }
-    assert recorded["cpb_override"] == expected_cpb
+    assert policy._resolve_cpb(device, "glm_nsa", 2, 64, 2048, 0) == select_cpb(
+        2, 64, 2048, 0, _C
+    )
+    assert cpb_mod._OrdinaryRequest(64, 2048, family="glm_nsa").key != (
+        cpb_mod._OrdinaryRequest(64, 2048, family="dsv3_2").key
+    )
 
 
 # ── Public calibration API (calibrate_sparse_mla_sm120) ────────────────────
@@ -643,7 +556,9 @@ def test_public_calibrate_validates_envelope(clean_cpb_state) -> None:
     assert "bogus_family" in str(exc.value)
 
 
-def test_public_calibrate_lists_all_invalid_combinations(clean_cpb_state) -> None:
+def test_public_calibrate_lists_all_invalid_combinations(
+    clean_cpb_state, ordinary_format_facts
+) -> None:
     import flashinfer.mla
 
     with pytest.raises(ValueError) as exc:
@@ -697,34 +612,41 @@ def test_public_calibrate_offgrid_shape_idempotent_force(clean_cpb_state) -> Non
     # Disk: the JSON document carries every requested entry, incl. the
     # off-grid (80, 384) one.
     payload = json.loads((clean_cpb_state / "sparse_mla_sm120_cpb.json").read_text())
-    xo = payload["devices"]["0:Fake GPU"]["decode_max_tokens"]
+    profiles = payload["devices"]["0:Fake GPU"]["profiles"]
     for h in (64, 80):
         for k in (384, 512):
-            assert f"dsv4|{h}|{k}" in xo
-    # Off-grid H=80: the prefill envelope has no H=80 instantiation, so
-    # decode always wins by construction. Off-grid topk=384 at H=64 is
-    # prefill-served (topk is a runtime kernel argument), so its entry is a
-    # measured crossover in [0, 64], not forced.
-    assert xo["dsv4|80|384"] == 64
-    assert xo["dsv4|80|512"] == 64
-    assert 0 <= xo["dsv4|64|384"] <= 64
+            request = cpb_mod._OrdinaryRequest(h, k, family="dsv4")
+            profile = profiles[request.key]
+            assert set(profile["buckets"]) == {str(t) for t in cpb_mod._PROFILE_T}
+            if h == 80:
+                assert all(b["variant"] == 0 for b in profile["buckets"].values())
+    from flashinfer.mla._sparse_mla_sm120._execution import AttentionMetadata
 
-    # The (64, 512) entry must be a real measured crossover below 64 on this
-    # GPU class, and plan() must read the new crossover on this call.
-    dmt = cpb_mod.get_decode_max_tokens(device, "dsv4", 64, 512)
-    assert dmt is not None and dmt < 64
-    planned = plan_mod.plan(
+    metadata = AttentionMetadata(
+        1,
         t_probe,
         h_probe,
         k_probe,
-        plan_mod._MODEL_TYPE_DSV4,
+        0,
         64,
+        0,
+        64 * 584,
+        0,
+        584,
+        k_probe,
+        0,
+        h_probe,
         False,
-        plan_mod._PREFILL_IMPL_AUTO,
-        device,
+        False,
+        False,
+        False,
+        0,
     )
-    assert planned is not None
-    assert planned.variant is plan_mod.KernelVariant.PREFILL_MG
+    selected = plan_mod.profile_selection(metadata, device, "default")
+    bucket = profiles[cpb_mod._OrdinaryRequest(h_probe, k_probe, family="dsv4").key][
+        "buckets"
+    ][str(t_probe)]
+    assert int(selected.variant) == bucket["variant"] and selected.cpb == bucket["cpb"]
 
     # Idempotent second call: everything already present.
     report2 = calibrate(device, families=("dsv4",), heads=(64, 80), topks=(384, 512))
@@ -768,7 +690,7 @@ def test_tuning_calibration_honors_skip_ops(clean_cpb_state, monkeypatch) -> Non
     from flashinfer.mla._sparse_mla_sm120 import _api as sm
 
     device = torch.device("cuda")
-    num_tokens, num_heads, topk = 2, 64, 512
+    num_tokens, num_heads, topk = 4, 64, 512
     d_qk, d_v = 512, 512
     num_splits = -(-topk // 64)
 
@@ -789,23 +711,16 @@ def test_tuning_calibration_honors_skip_ops(clean_cpb_state, monkeypatch) -> Non
     )
     out_lse = torch.empty(num_tokens, num_heads, dtype=torch.float32, device=device)
 
-    seen = {}
+    seen = []
 
-    def fake_calibrate(module_getter, family, dev):
-        seen["calibrate"] = family
-        return _C
+    def measure(request, dev):
+        seen.append(request.family)
+        return {
+            "status": "calibrated",
+            "buckets": {str(t): {"variant": 2, "cpb": 2} for t in cpb_mod._PROFILE_T},
+        }
 
-    def fake_calibrate_crossover(module, dev, family, c):
-        seen["calibrate_crossover"] = family
-        return {}
-
-    def fake_refine(module_getter, family, dev, c, t, h, k):
-        seen["refine_cpb"] = family
-        return 1
-
-    monkeypatch.setattr(cpb_mod, "calibrate", fake_calibrate)
-    monkeypatch.setattr(cpb_mod, "calibrate_crossover", fake_calibrate_crossover)
-    monkeypatch.setattr(cpb_mod, "refine_cpb", fake_refine)
+    monkeypatch.setattr(cpb_mod, "_measure_ordinary", measure)
 
     def call() -> None:
         sm.sparse_mla_sm120_decode_dsv4(
@@ -814,15 +729,17 @@ def test_tuning_calibration_honors_skip_ops(clean_cpb_state, monkeypatch) -> Non
 
     with autotune(True, skip_ops={"sparse_mla_sm120"}):
         call()
-    assert seen == {}
+    assert seen == []
 
     with autotune(True):
         call()
-    assert seen == {
-        "calibrate": "dsv4",
-        "calibrate_crossover": "dsv4",
-        "refine_cpb": "dsv4",
-    }
+        call()
+    assert seen == ["dsv4"]
+    from flashinfer.mla._sparse_mla_sm120 import _prepared as prepared
+
+    current = list(prepared._functional_plans.values())[-1]
+    assert current.plan.inspect()["variant"] == 0
+    assert current.plan.inspect()["cpb"] == 2
 
 
 def test_single_cache_override_does_not_leak_into_dual(monkeypatch):
@@ -851,10 +768,11 @@ def test_single_cache_override_does_not_leak_into_dual(monkeypatch):
 
     monkeypatch.setattr(cpb_mod, "get_cpb_override", override)
     monkeypatch.setattr(cpb_mod, "select_cpb", model_pick)
+    monkeypatch.setattr(cpb_mod, "_CHUNK_WIDTH", {"dsv4": 64})
     for _ in range(2):
-        assert plan._resolve_cpb(torch.device("cpu"), "dsv4", 4, 32, 512, 0) == 7
+        assert plan._resolve_cpb(torch.device("cpu"), "dsv4", 4, 32, 512, 0) == 2
         assert plan._resolve_cpb(torch.device("cpu"), "dsv4", 4, 32, 512, 128) == 2
-    assert len(reads) == 1 and picks == [128]
+    assert reads == [] and picks == [0, 128]
 
 
 def test_finite_synthetic_inline_and_footer(monkeypatch):
@@ -922,7 +840,7 @@ def test_memory_regime_requires_known_l2_and_sufficient_pool(monkeypatch):
     with pytest.raises(cpb_mod.CalibrationError, match="L2"):
         cpb_mod._check_pool_capacity(torch.device("cpu"), 1024)
     cpb_mod._check_pool_capacity(torch.device("cpu"), 4096)
-    with pytest.raises(cpb_mod.CalibrationError, match="reuse"):
+    with pytest.raises(cpb_mod.CalibrationError, match="sample count"):
         cpb_mod.calibration_batch_count(1, 1, 1, torch.device("cpu"), max_batch_calls=8)
     monkeypatch.setattr(
         torch.cuda, "get_device_properties", lambda dev: SimpleNamespace()
@@ -1036,22 +954,45 @@ def fake_cuda(monkeypatch):
     def record(operation):
         state["operations"].append((operation, state["current"]))
 
+    class Stream:
+        def __init__(self, device=None):
+            pass
+
+        def wait_stream(self, other):
+            record("wait")
+
+        def synchronize(self):
+            record("synchronize")
+
     class Event:
-        def __init__(self, *, enable_timing):
-            assert enable_timing
+        def __init__(self, *, enable_timing, external=False):
+            assert enable_timing and external
             record("event")
 
         def record(self, stream):
-            assert stream == ("stream", 1)
             record("record")
 
         def elapsed_time(self, other):
             record("elapsed")
-            return 2.0
+            return float(sum(name == "elapsed" for name, _ in state["operations"]))
 
-    def synchronize(target):
-        assert torch.device(target).index == 1
-        record("synchronize")
+    class Graph:
+        def replay(self):
+            record("replay")
+
+    @contextmanager
+    def stream_context(stream):
+        yield
+
+    @contextmanager
+    def graph_context(graph, stream):
+        record("begin")
+        yield
+        record("end")
+
+    class Buffer:
+        def add_(self, value):
+            record("flush")
 
     def capturing():
         record("capture")
@@ -1059,9 +1000,21 @@ def fake_cuda(monkeypatch):
 
     monkeypatch.setattr(torch.cuda, "device", device)
     monkeypatch.setattr(torch.cuda, "Event", Event)
-    monkeypatch.setattr(torch.cuda, "synchronize", synchronize)
+    monkeypatch.setattr(torch.cuda, "Stream", Stream)
+    monkeypatch.setattr(torch.cuda, "stream", stream_context)
+    monkeypatch.setattr(torch.cuda, "CUDAGraph", Graph)
+    monkeypatch.setattr(torch.cuda, "graph", graph_context)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", capturing)
-    monkeypatch.setattr(torch.cuda, "current_stream", lambda target: ("stream", 1))
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda target: Stream())
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda target: SimpleNamespace(L2_cache_size=1024, multi_processor_count=4),
+    )
+    monkeypatch.setattr(
+        torch, "Generator", lambda **kwargs: SimpleNamespace(manual_seed=lambda n: None)
+    )
+    monkeypatch.setattr(torch, "randint", lambda *args, **kwargs: Buffer())
     monkeypatch.setattr(cpb_mod, "_WARMUP_ITERS", 2)
     monkeypatch.setattr(cpb_mod, "_TIMED_BATCHES", 2)
     return state
@@ -1072,11 +1025,118 @@ def test_timer_uses_target_device_and_restores_current(fake_cuda):
         fake_cuda["operations"].append((f"call:{value}", fake_cuda["current"]))
 
     elapsed = cpb_mod.time_calibration_calls(call, [(1,), (2,)], torch.device("cuda:1"))
-    assert elapsed == 0.001
+    assert elapsed == pytest.approx(0.0045)
     assert fake_cuda["current"] == 0
     assert fake_cuda["operations"][0] == ("capture", 1)
     assert all(device == 1 for _, device in fake_cuda["operations"])
-    assert sum(name.startswith("call:") for name, _ in fake_cuda["operations"]) == 6
+    operations = [name for name, _ in fake_cuda["operations"]]
+    assert operations[operations.index("begin") + 1 : operations.index("end")] == [
+        "flush",
+        "record",
+        "call:1",
+        "record",
+        "flush",
+        "record",
+        "call:2",
+        "record",
+    ]
+    assert operations.count("replay") == 3
+
+
+@requires_sm12x
+def test_cold_timer_gpu_graph_topology(monkeypatch):
+    graph_type = torch.cuda.CUDAGraph
+
+    def make_graph():
+        graph = graph_type(keep_graph=True)
+        graph.enable_debug_mode()
+        return graph
+
+    monkeypatch.setattr(torch.cuda, "CUDAGraph", make_graph)
+    target = torch.device("cuda", torch.cuda.current_device())
+    output = torch.ones(1024, device=target)
+    timer = cpb_mod._ColdCallGraph(lambda: output.mul_(1.01), [()] * 2, target)
+    before = timer.eviction.clone()
+    torch.cuda.synchronize(target)
+    samples = timer.sample()
+    assert len(samples) == 2 and all(value > 0 for value in samples)
+    assert torch.equal(timer.eviction, before + 2)
+    assert (
+        timer.eviction.numel() * timer.eviction.element_size()
+        == 4 * cpb_mod._device_l2(target)
+    )
+    nodes = timer.graph.get_graph_data()["nodes"]
+    assert len(nodes) == 8
+    by_id = {node["index"]: node for node in nodes}
+    roots = [node for node in nodes if not node["dependencies"]]
+    assert len(roots) == 1
+    node = roots[0]
+    for i in range(8):
+        if i % 4 in (1, 3):
+            assert node["node_type"] == "event_record"
+        else:
+            assert node["node_type"] == "kernel"
+            assert ("add" if i % 4 == 0 else "Mul") in node["kernel_name"]
+        if i < 7:
+            assert len(node["dependents"]) == 1
+            node = by_id[node["dependents"][0]]
+        else:
+            assert not node["dependents"]
+
+
+def test_timer_requires_device_sm_count(fake_cuda, monkeypatch):
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _: SimpleNamespace(L2_cache_size=1024),
+    )
+    with pytest.raises(cpb_mod.CalibrationError, match="SM"):
+        cpb_mod.time_calibration_calls(lambda: None, [()], torch.device("cuda:1"))
+
+
+def test_balanced_timing_preserves_candidates_and_averages_rounds():
+    order = []
+
+    def measure(candidate):
+        order.append(candidate)
+        return len(order)
+
+    assert cpb_mod._balanced_timings([1, 2, 3], measure) == {1: 3.5, 2: 3.5, 3: 3.5}
+    assert order == [1, 2, 3, 3, 2, 1]
+
+
+def test_timer_eviction_oom_does_not_fall_back(fake_cuda, monkeypatch):
+    def fail(*args, **kwargs):
+        raise torch.cuda.OutOfMemoryError("eviction allocation")
+
+    monkeypatch.setattr(torch, "randint", fail)
+    with pytest.raises(cpb_mod.CalibrationError, match="4xL2"):
+        cpb_mod.time_calibration_calls(
+            lambda: pytest.fail("must not measure warm"), [()], torch.device("cuda:1")
+        )
+    assert fake_cuda["current"] == 0
+
+
+def test_queued_protocol_is_not_reused_or_merged(store):
+    request = cpb_mod._OrdinaryRequest(16, 128, family="dsv4")
+    profile = {
+        "request": request.effective,
+        "buckets": {str(t): {"variant": 0, "cpb": 1} for t in cpb_mod._PROFILE_T},
+    }
+    cpb_mod.publish_calibration(
+        store, "dsv4", constants=_C, profiles={request.key: profile}
+    )
+    path = cpb_mod.default_cache_path()
+    payload = json.loads(path.read_text())
+    payload.pop("timing_protocol", None)
+    path.write_text(json.dumps(payload))
+    assert cpb_mod.get_constants(store, "dsv4") is None
+    assert cpb_mod.get_profile(request.key, store) is None
+    cpb_mod.save_constants(store, "dsv3_2", _C)
+    assert cpb_mod.get_constants(store, "dsv4") is None
+    assert cpb_mod.get_profile(request.key, store) is None
+    assert cpb_mod.get_constants(store, "dsv3_2") == _C
+    assert json.loads(path.read_text())["timing_protocol"] == cpb_mod._TIMING_PROTOCOL
 
 
 def test_timer_capture_refuses_before_warmup(fake_cuda):
@@ -1283,6 +1343,7 @@ def test_conditional_overlay_rechecked_on_replay(store, monkeypatch) -> None:
         json.dumps(
             {
                 "schema_version": cpb_mod._SCHEMA_VERSION,
+                "timing_protocol": cpb_mod._TIMING_PROTOCOL,
                 "devices": {
                     str(store): {
                         "dsv4": cpb_mod.asdict(replace(_C, c0=3e-6)),
@@ -1345,32 +1406,40 @@ def test_write_failure_overlay_does_not_cross_path(store, monkeypatch, tmp_path)
     assert cpb_mod.get_constants(store, "dsv4") is None
 
 
-def test_public_force_keeps_old_unit_on_measurement_failure(store, monkeypatch):
+def test_public_force_keeps_old_unit_on_measurement_failure(
+    store, monkeypatch, ordinary_format_facts
+):
     from flashinfer.mla._sparse_mla_sm120 import _execution as execution
 
     cpb_mod.publish_calibration(
         store, "dsv4", constants=_C, crossover={"dsv4|16|128": 8}
     )
     before = cpb_mod.default_cache_path().read_bytes()
-    monkeypatch.setattr(cpb_mod, "_family_specs", lambda: {"dsv4": ((16,), (128,), 1)})
+    monkeypatch.setattr(cpb_mod, "_family_specs", lambda: {"dsv4": ((16,), (128,))})
     monkeypatch.setattr(execution, "get_sparse_mla_sm120_module", lambda: object())
     monkeypatch.setattr(cpb_mod, "calibrate", lambda *args: replace(_C, c0=9e-6))
 
     def failed(*args, **kwargs):
         raise cpb_mod.CalibrationError("measurement failed")
 
-    monkeypatch.setattr(cpb_mod, "calibrate_crossover", failed)
+    monkeypatch.setattr(cpb_mod, "_measure_ordinary", failed)
     report = cpb_mod.calibrate_sparse_mla_sm120(store, families=("dsv4",), force=True)
     assert report.failed and report.constants_calibrated == ()
     assert cpb_mod.default_cache_path().read_bytes() == before
     assert cpb_mod.get_constants(store, "dsv4") == _C
     monkeypatch.setattr(
-        cpb_mod, "calibrate_crossover", lambda *args, **kwargs: {"dsv4|16|128": 4}
+        cpb_mod,
+        "_measure_ordinary",
+        lambda request, device: {
+            "request": request.effective,
+            "buckets": {str(t): {"variant": 0, "cpb": 2} for t in cpb_mod._PROFILE_T},
+        },
     )
     report = cpb_mod.calibrate_sparse_mla_sm120(store, families=("dsv4",), force=True)
     assert not report.failed and report.persisted
     assert cpb_mod.get_constants(store, "dsv4").c0 == 9e-6
-    assert cpb_mod.get_decode_max_tokens(store, "dsv4", 16, 128) == 4
+    assert cpb_mod.get_decode_max_tokens(store, "dsv4", 16, 128) == 8
+    assert report.profiles[0]["buckets"]["4"]["cpb"] == 2
     monkeypatch.setattr(
         cpb_mod.os, "replace", lambda *args: (_ for _ in ()).throw(OSError("read only"))
     )
@@ -1522,6 +1591,7 @@ def test_save_publishes_on_disk_sibling_entries(clean_cpb_state) -> None:
         json.dumps(
             {
                 "schema_version": cpb_mod._SCHEMA_VERSION,
+                "timing_protocol": cpb_mod._TIMING_PROTOCOL,
                 "devices": {
                     cpb_mod._device_key(device): {"dsv3_2": cpb_mod.asdict(sibling)}
                 },
@@ -1567,6 +1637,7 @@ def test_stale_schema_read_once_until_changed(isolated_cpb):
             json.dumps(
                 {
                     "schema_version": cpb_mod._SCHEMA_VERSION,
+                    "timing_protocol": cpb_mod._TIMING_PROTOCOL,
                     "devices": {
                         "0:Test GPU": {"glm53_nope": cpb_mod.asdict(constants)}
                     },
@@ -1576,6 +1647,33 @@ def test_stale_schema_read_once_until_changed(isolated_cpb):
         os.utime(path, (old + 1, old + 1))
         assert cpb_mod.get_constants(device, "glm53_nope") == constants
         assert read.call_count == 2
+
+
+def test_ordinary_profile_configuration_identity(store, monkeypatch):
+    from flashinfer.mla._sparse_mla_sm120._calibration import _OrdinaryRequest
+
+    canonical = _OrdinaryRequest(16, 128, family="dsv4")
+    dual = replace(
+        canonical,
+        primary_page_size=65,
+        extra_topk=64,
+        extra_page_size=3,
+        has_topk_length=True,
+        has_attn_sink=True,
+    )
+    assert canonical.key != dual.key
+    assert canonical.effective["compute_precision"] == "default"
+    assert _OrdinaryRequest(16, 128).effective["compute_precision"] == "fp8"
+    profile = {
+        "request": dual.effective,
+        "buckets": {
+            str(t): {"variant": 3 if t in (4, 16) else 0, "cpb": 2}
+            for t in cpb_mod._PROFILE_T
+        },
+    }
+    cpb_mod.publish_calibration(store, "dsv4", profiles={dual.key: profile})
+    assert cpb_mod.get_profile(canonical.key, store) is None
+    assert cpb_mod.get_profile(dual.key, store)["buckets"]["4"]["variant"] == 3
 
 
 def test_legacy_glm_calibration_invalidated(isolated_cpb):
@@ -1610,7 +1708,9 @@ def test_legacy_glm_calibration_invalidated(isolated_cpb):
     )
 
 
-def test_public_profile_reuse_force_and_failure(store, monkeypatch):
+def test_public_profile_reuse_force_and_failure(
+    store, monkeypatch, ordinary_format_facts
+):
     calls = []
 
     def measure(request, device):
@@ -1624,7 +1724,7 @@ def test_public_profile_reuse_force_and_failure(store, monkeypatch):
             },
         }
 
-    monkeypatch.setattr(cpb_mod, "_measure_dsv41", measure)
+    monkeypatch.setattr(cpb_mod, "_measure_ordinary", measure)
     kwargs = dict(
         families=("dsv4_1",),
         heads=(16,),
@@ -1644,13 +1744,15 @@ def test_public_profile_reuse_force_and_failure(store, monkeypatch):
     def fail(*args):
         raise cpb_mod.CalibrationError("launch failed")
 
-    monkeypatch.setattr(cpb_mod, "_measure_dsv41", fail)
+    monkeypatch.setattr(cpb_mod, "_measure_ordinary", fail)
     failed = cpb_mod.calibrate_sparse_mla_sm120(store, force=True, **kwargs)
     assert failed.failed and failed.entries_calibrated == 0
     assert cpb_mod.default_cache_path().read_bytes() == before
 
 
-def test_public_preflight_and_default_six_families(store, monkeypatch):
+def test_public_preflight_and_default_six_families(
+    store, monkeypatch, ordinary_format_facts
+):
     from flashinfer.mla._sparse_mla_sm120 import _execution as execution
 
     with pytest.raises(ValueError, match="DSV4.1"):
@@ -1665,8 +1767,10 @@ def test_public_preflight_and_default_six_families(store, monkeypatch):
     monkeypatch.setattr(execution, "get_sparse_mla_sm120_module", lambda: object())
 
     def profile(request, device):
-        requested.add("dsv4_1")
-        assert request.effective["compute_precision"] == "fp8"
+        requested.add(request.family)
+        assert request.effective["compute_precision"] == (
+            "fp8" if request.family == "dsv4_1" else "default"
+        )
         assert request.extra_topk == 0
         return {
             "request": request.effective,
@@ -1680,7 +1784,7 @@ def test_public_preflight_and_default_six_families(store, monkeypatch):
     monkeypatch.setattr(cpb_mod, "get_constants", lambda *args: _C)
     monkeypatch.setattr(cpb_mod, "get_decode_max_tokens", crossover_lookup)
     monkeypatch.setattr(cpb_mod, "calibrate_crossover", lambda *args, **kwargs: {})
-    monkeypatch.setattr(cpb_mod, "_measure_dsv41", profile)
+    monkeypatch.setattr(cpb_mod, "_measure_ordinary", profile)
     report = cpb_mod.calibrate_sparse_mla_sm120(store)
     assert not report.failed
     assert requested == {
@@ -1693,11 +1797,16 @@ def test_public_preflight_and_default_six_families(store, monkeypatch):
     }
 
 
-def test_runtime_exact_lookup_unknown_persistence_and_precision(store, monkeypatch):
+def test_runtime_exact_lookup_unknown_persistence_and_precision(
+    store, monkeypatch, ordinary_format_facts
+):
     from flashinfer.mla._sparse_mla_sm120 import _policy as policy
     from flashinfer.mla._sparse_mla_sm120._execution import AttentionMetadata
 
-    request = cpb_mod._Dsv41Request(16, 128)
+    monkeypatch.setattr(
+        policy, "_candidates", lambda *args: {(5, 16, 128, 64, False): (0, 1)}[args]
+    )
+    request = cpb_mod._OrdinaryRequest(16, 128)
     profile = {
         "request": request.effective,
         "buckets": {
@@ -1748,14 +1857,17 @@ def test_runtime_exact_lookup_unknown_persistence_and_precision(store, monkeypat
         is None
     )
     assert (
-        cpb_mod._profile_bucket(cpb_mod.get_dsv41_profile(request, store), 65) is None
+        cpb_mod._profile_bucket(cpb_mod.get_ordinary_profile(request, store), 65)
+        is None
     )
     assert policy.profile_selection(m._replace(tokens=65), store, "fp8").variant == 1
     assert policy.profile_selection(m._replace(tokens=4), store, "fp8").variant == 1
 
 
-def test_refine_dsv41_merges_exact_token_entry(store, monkeypatch):
-    request = cpb_mod._Dsv41Request(16, 128)
+def test_refine_ordinary_merges_exact_token_entry(
+    store, monkeypatch, ordinary_format_facts
+):
+    request = cpb_mod._OrdinaryRequest(16, 128)
     profile = {
         "request": request.effective,
         "buckets": {
@@ -1771,23 +1883,23 @@ def test_refine_dsv41_merges_exact_token_entry(store, monkeypatch):
         calls.append(tokens)
         return {"variant": 1, "cpb": 3, "decode_s": 2e-5, "prefill_s": 1e-5}
 
-    monkeypatch.setattr(cpb_mod, "_dsv41_measure_context", lambda *args: object())
-    monkeypatch.setattr(cpb_mod, "_measure_dsv41_bucket", measure)
+    monkeypatch.setattr(cpb_mod, "_ordinary_measure_context", lambda *args: object())
+    monkeypatch.setattr(cpb_mod, "_measure_ordinary_bucket", measure)
 
     # Canonical-grid buckets and out-of-range counts are not refined.
-    assert cpb_mod.refine_dsv41(request, store, 8) is None
-    assert cpb_mod.refine_dsv41(request, store, 65) is None
+    assert cpb_mod.refine_ordinary(request, store, 8) is None
+    assert cpb_mod.refine_ordinary(request, store, 65) is None
     assert not calls
 
-    entry = cpb_mod.refine_dsv41(request, store, 5)
+    entry = cpb_mod.refine_ordinary(request, store, 5)
     assert calls == [5]
     assert entry["provenance"] == "refined" and entry["cpb"] == 3
-    stored = cpb_mod.get_dsv41_profile(request, store)
+    stored = cpb_mod.get_ordinary_profile(request, store)
     assert stored["buckets"]["5"]["provenance"] == "refined"
     # The exact entry wins over nearest-up bucket interpolation.
     assert cpb_mod._profile_bucket(stored, 5)["cpb"] == 3
     # Repeat refinement is a no-op.
-    assert cpb_mod.refine_dsv41(request, store, 5) is None
+    assert cpb_mod.refine_ordinary(request, store, 5) is None
     assert calls == [5]
 
 
@@ -1850,12 +1962,17 @@ def test_refine_nvfp4_merges_exact_token_entry(store, monkeypatch):
     assert calls == [5]
 
 
-def test_profile_selection_refines_exact_tokens_in_tuning(store, monkeypatch):
+def test_profile_selection_refines_exact_tokens_in_tuning(
+    store, monkeypatch, ordinary_format_facts
+):
     from types import SimpleNamespace
     from flashinfer.mla._sparse_mla_sm120 import _policy as policy
     from flashinfer.mla._sparse_mla_sm120._execution import AttentionMetadata
 
-    request = cpb_mod._Dsv41Request(16, 128)
+    monkeypatch.setattr(
+        policy, "_candidates", lambda *args: {(5, 16, 128, 64, False): (0, 1)}[args]
+    )
+    request = cpb_mod._OrdinaryRequest(16, 128)
     profile = {
         "request": request.effective,
         "buckets": {
@@ -1874,7 +1991,7 @@ def test_profile_selection_refines_exact_tokens_in_tuning(store, monkeypatch):
 
     def fake_refine(req, device, tokens):
         refined.append(tokens)
-        current = cpb_mod.get_dsv41_profile(req, device)
+        current = cpb_mod.get_ordinary_profile(req, device)
         current["buckets"][str(tokens)] = {
             "variant": 1,
             "cpb": 3,
@@ -1884,7 +2001,7 @@ def test_profile_selection_refines_exact_tokens_in_tuning(store, monkeypatch):
         cpb_mod.publish_calibration(device, "dsv4_1", profiles={req.key: current})
         return current["buckets"][str(tokens)]
 
-    monkeypatch.setattr(cpb_mod, "refine_dsv41", fake_refine)
+    monkeypatch.setattr(cpb_mod, "refine_ordinary", fake_refine)
     m = AttentionMetadata(
         5,
         5,
@@ -1916,15 +2033,15 @@ def test_profile_selection_refines_exact_tokens_in_tuning(store, monkeypatch):
 
 
 @pytest.fixture(params=["dsv4_1", "dsv4_nvfp4"])
-def refined_profile(request, store, monkeypatch):
+def refined_profile(request, store, monkeypatch, ordinary_format_facts):
     family = request.param
     if family == "dsv4_1":
-        req = cpb_mod._Dsv41Request(16, 128)
+        req = cpb_mod._OrdinaryRequest(16, 128)
         key = req.key
         module = cpb_mod
-        context_name = "_dsv41_measure_context"
-        measure_name = "_measure_dsv41_bucket"
-        refine = lambda: cpb_mod.refine_dsv41(req, store, 5)
+        context_name = "_ordinary_measure_context"
+        measure_name = "_measure_ordinary_bucket"
+        refine = lambda: cpb_mod.refine_ordinary(req, store, 5)
         variant = 0
     else:
         fields = dict(
@@ -2082,7 +2199,7 @@ def test_refined_overlay_merges_then_full_profile_replaces(
     assert cpb_mod.get_profile(case.key, store) == case.profile
 
 
-def test_dsv41_fallback_does_not_start_legacy_measurement(store, monkeypatch):
+def test_ordinary_fallback_does_not_start_legacy_measurement(store, monkeypatch):
     from types import SimpleNamespace
     from flashinfer.mla._sparse_mla_sm120 import _policy as policy
     from flashinfer.mla._sparse_mla_sm120 import _execution as execution

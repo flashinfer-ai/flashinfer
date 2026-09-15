@@ -28,7 +28,8 @@
 
 """Dispatch-table and config-query tests for sparse-MLA SM120.
 
-Config queries and diagnostics use real compiled capabilities without a GPU.
+Config queries and diagnostics use real compiled capabilities and require an
+SM12x compilation target with CUDA >= 12.9, even without a visible GPU.
 Tests using ``known_crossover`` or ``planner_state`` inject recorded capability
 answers and reject module loading. These answers are checked against compiled
 modules in ``test_sparse_mla_sm120_execution.py``.
@@ -44,6 +45,10 @@ import torch
 
 import flashinfer
 from flashinfer.mla._sparse_mla_sm120 import _dsv4_nvfp4_policy as native_policy
+from tests.attention import sparse_mla_test_utils
+
+ordinary_format_facts = sparse_mla_test_utils.ordinary_format_facts
+sm120_module = sparse_mla_test_utils.sm120_module
 from flashinfer.mla import (
     SparseMLASm120DecodeConfig,
     supported_sparse_mla_sm120_configs,
@@ -88,7 +93,7 @@ ORDINARY_CANDIDATES = {
     (1, 64, 128, 64, True): (0, 3),
     (1, 64, 256, 64, True): (0, 3),
     (1, 64, 384, 64, False): (0, 2),
-    (1, 64, 512, 32, False): (),
+    (1, 64, 512, 32, False): (0, 2),
     (1, 64, 512, 64, False): (0, 2),
     (1, 64, 1000, 64, True): (0,),
     (1, 64, 2048, 64, False): (0, 2),
@@ -147,10 +152,13 @@ def test_wrapper_construction_does_not_load_module(monkeypatch):
     block_module_loading(monkeypatch)
     from flashinfer.mla._sparse_mla_sm120 import _SparseMLAPagedAttentionRunner
 
-    _SparseMLAPagedAttentionRunner()
-    _SparseMLAPagedAttentionRunner(kv_cache_format="nvfp4")
+    _SparseMLAPagedAttentionRunner(device="cpu")
+    _SparseMLAPagedAttentionRunner(kv_cache_format="nvfp4", device="cpu")
     _SparseMLAPagedAttentionRunner(
-        kv_scale_format="ue8m0_g32", extra_kv_fp4=True, compute_precision="bf16"
+        kv_scale_format="ue8m0_g32",
+        extra_kv_fp4=True,
+        compute_precision="bf16",
+        device="cpu",
     )
 
 
@@ -193,7 +201,7 @@ assert torch.cuda.is_initialized() == initialized
     )
 
 
-def test_downstream_decode_dispatch_iteration() -> None:
+def test_downstream_decode_dispatch_iteration(sm120_module) -> None:
     supported_heads = frozenset(h for h, k in _DECODE_DSV4_DISPATCH)
     assert supported_heads == frozenset({8, 16, 32, 64, 128})
     pairs = tuple(_DECODE_DSV4_DISPATCH)
@@ -204,8 +212,13 @@ def test_downstream_decode_dispatch_iteration() -> None:
     assert (48, 384) not in pairs
 
 
-def test_supported_configs_families() -> None:
+def test_supported_configs_families(sm120_module, ordinary_format_facts) -> None:
     """The query API mirrors the decode dispatch envelopes exactly."""
+    from flashinfer.mla._sparse_mla_sm120._execution import format_info
+
+    for model, fields in ordinary_format_facts.items():
+        compiled = format_info(model)
+        assert fields == {name: compiled[name] for name in fields}
     configs = supported_sparse_mla_sm120_configs()
     assert set(configs) == {
         "dsv4",
@@ -279,7 +292,7 @@ def test_supported_configs_families() -> None:
     assert "SparseMLASm120DecodeConfig" in dir(flashinfer.mla)
 
 
-def test_supported_configs_nvfp4_envelope() -> None:
+def test_supported_configs_nvfp4_envelope(sm120_module) -> None:
     """The shared query API exposes the exact, independently keyed NVFP4 set."""
     configs = supported_sparse_mla_sm120_configs(kv_cache_format="nvfp4")
     assert set(configs) == {"dsv4"}
@@ -316,7 +329,7 @@ def test_nvfp4_exact_head_scratch_view() -> None:
     assert lse_view.shape == (2, 16, 2)
 
 
-def test_supported_helpers() -> None:
+def test_supported_helpers(sm120_module) -> None:
     """supported_num_heads / supported_topk return sorted tuples."""
     dsv4 = supported_sparse_mla_sm120_configs()["dsv4"]
     # Runtime-H instantiation: every head count in [1, 128] is served.
@@ -330,7 +343,7 @@ def test_supported_helpers() -> None:
     assert dsv3_2.supported_topk(64) == (128, 512, 1024, 2048)
 
 
-def test_supports_decode_matches_dispatch_predicates() -> None:
+def test_supports_decode_matches_dispatch_predicates(sm120_module) -> None:
     """config.supports_decode agrees with the plan-layer decode predicate
     (model_type resolved from d_qk), on and off the calibrated grid (topk is
     a runtime kernel argument)."""
@@ -353,7 +366,7 @@ def test_supports_decode_matches_dispatch_predicates() -> None:
             )
 
 
-def test_supports_decode_rejects_mismatches() -> None:
+def test_supports_decode_rejects_mismatches(sm120_module) -> None:
     """supports_decode is False only outside the envelope axes."""
     dsv4 = supported_sparse_mla_sm120_configs()["dsv4"]
     assert dsv4.supports_decode(64, 384)  # arbitrary topk rides runtime-topk
@@ -377,7 +390,7 @@ def test_supports_decode_rejects_mismatches() -> None:
     assert not dots3.supports_decode(64, 512)
 
 
-def test_error_message_names_topk_mismatch() -> None:
+def test_error_message_names_topk_mismatch(sm120_module) -> None:
     """A sub-minimum topk is named with the family minimum."""
     msg = _decode_dispatch_error_message(
         num_tokens=5,
@@ -396,7 +409,7 @@ def test_error_message_names_topk_mismatch() -> None:
     assert "page_block_size=64 is unsupported" not in msg
 
 
-def test_error_message_names_num_heads_mismatch() -> None:
+def test_error_message_names_num_heads_mismatch(sm120_module) -> None:
     """A head count past the runtime-H ceiling names the envelope."""
     msg = _decode_dispatch_error_message(
         num_tokens=1,
@@ -410,7 +423,7 @@ def test_error_message_names_num_heads_mismatch() -> None:
     assert "num_heads=256 exceeds the decode envelope [1, 128]" in msg
 
 
-def test_error_message_names_both_mismatches() -> None:
+def test_error_message_names_both_mismatches(sm120_module) -> None:
     """Both num_heads and topk out of envelope are reported together."""
     msg = _decode_dispatch_error_message(
         num_tokens=1,
@@ -425,7 +438,7 @@ def test_error_message_names_both_mismatches() -> None:
     assert "num_heads=256 exceeds the decode envelope [1, 128]" in msg
 
 
-def test_error_message_accepts_runtime_page_block_size() -> None:
+def test_error_message_accepts_runtime_page_block_size(sm120_module) -> None:
     """Positive runtime pages are not blamed for a dispatch failure."""
     msg = _decode_dispatch_error_message(
         num_tokens=1,
@@ -463,7 +476,7 @@ def test_error_message_accepts_runtime_page_block_size() -> None:
     assert "topk=256 is below" not in msg
 
 
-def test_error_message_dsv3_2_family() -> None:
+def test_error_message_dsv3_2_family(sm120_module) -> None:
     """DSv3.2 and GLM-NSA report their family name; a legal topk is not
     blamed (any width >= 1 is served)."""
     for model_type, family in (
@@ -484,7 +497,7 @@ def test_error_message_dsv3_2_family() -> None:
         assert "is below" not in msg  # topk=192 is legal; not blamed
 
 
-def test_error_message_keeps_shape_summary_format() -> None:
+def test_error_message_keeps_shape_summary_format(sm120_module) -> None:
     """Callers grepping for the pre-existing message shape keep working.
 
     (The shape itself is decode-eligible under runtime-topk; the builder is
@@ -523,14 +536,17 @@ def test_plan_swapab_rejections(known_crossover) -> None:
         _normalize_prefill_impl("sg")
 
 
-def test_extra_cache_args_pairing() -> None:
+def test_extra_cache_args_pairing(monkeypatch) -> None:
     """extra_kv_cache / extra_indices / extra_topk_length are an
     all-or-nothing group: a mismatch must raise before planning (previously
     extra_indices alone reached the planner as has_extra=False with
     extra_topk>0). The check precedes any module load, so CPU tensors
     suffice; this exercises the same funnel the runner path calls."""
-    from flashinfer.mla._sparse_mla_sm120 import _sparse_mla_sm120_paged_attention
+    from flashinfer.mla._sparse_mla_sm120 import _sparse_mla_sm120_paged_attention, _api
 
+    monkeypatch.setattr(
+        _api, "_resolve_model_type", lambda *args: pytest.fail("early format query")
+    )
     q = torch.zeros(2, 16, 512, dtype=torch.bfloat16)
     kv = torch.zeros(4, 64, 584, dtype=torch.uint8)
     idx = torch.zeros(2, 128, dtype=torch.int32)
@@ -676,21 +692,9 @@ def test_plan_arbitrary_num_heads_rides_runtime_h(known_crossover) -> None:
     )
 
 
-@pytest.mark.parametrize(
-    "family_key,model_type,num_heads,topk,above_variant",
-    [
-        ("dsv4", _MODEL_TYPE_DSV4, 64, 512, "PREFILL_MG"),
-        ("glm53_nope", _MODEL_TYPE_GLM53_NOPE, 32, 2176, "PREFILL_MG"),
-        ("dots3_swa", _MODEL_TYPE_DOTS3_SWA, 64, 576, "PREFILL_SG"),
-        ("dsv4_1", _MODEL_TYPE_DSV4_1, 64, 512, "PREFILL_SG"),
-    ],
-)
-def test_plan_crossover_injection(
-    known_crossover, family_key, model_type, num_heads, topk, above_variant
-) -> None:
-    """An injected crossover=8 applies to the family key space: T<=8 decodes,
-    T>8 prefills (MG where instantiated, SG for the SG-only family)."""
+def test_plan_ignores_legacy_crossover(known_crossover) -> None:
     plan_mod, table = known_crossover
+    family_key, model_type, num_heads, topk = "dsv4", _MODEL_TYPE_DSV4, 64, 512
     table[f"{family_key}|{num_heads}|{topk}"] = 8
     planned = plan_mod.plan(
         8,
@@ -716,47 +720,22 @@ def test_plan_crossover_injection(
         torch.device("cpu"),
     )
     assert planned is not None
-    assert planned.variant is getattr(plan_mod.KernelVariant, above_variant)
+    assert planned.variant is plan_mod.KernelVariant.DECODE_SPLITK
 
 
-def test_plan_crossover_zero_always_prefill(known_crossover) -> None:
-    """decode_max_tokens=0 (decode never wins) routes even T=1 to prefill."""
-    plan_mod, table = known_crossover
-    table["dsv3_2|64|2048"] = 0
-    planned = plan_mod.plan(
-        1,
+def test_plan_runtime_page(known_crossover) -> None:
+    plan_mod, _ = known_crossover
+    selected = plan_mod.plan(
+        8,
         64,
-        2048,
-        _MODEL_TYPE_DSV3_2,
-        64,
+        512,
+        _MODEL_TYPE_DSV4,
+        32,
         False,
         plan_mod._PREFILL_IMPL_AUTO,
         torch.device("cpu"),
     )
-    # Auto prefill prefers swapAB at this shape.
-    assert (
-        planned is not None and planned.variant is plan_mod.KernelVariant.PREFILL_SWAPAB
-    )
-
-
-def test_plan_page_block_size_mismatch(known_crossover) -> None:
-    """A non-64 page size is served by neither envelope (pbs=64 is hardwired
-    in every instantiation); the planner returns None instead of letting C++
-    launch with a mismatched stride."""
-    plan_mod, _ = known_crossover
-    assert (
-        plan_mod.plan(
-            8,
-            64,
-            512,
-            _MODEL_TYPE_DSV4,
-            32,
-            False,
-            plan_mod._PREFILL_IMPL_AUTO,
-            torch.device("cpu"),
-        )
-        is None
-    )
+    assert selected.variant is plan_mod.KernelVariant.DECODE_SPLITK
 
 
 def test_plan_prefill_impl_pref(known_crossover) -> None:
@@ -967,7 +946,7 @@ def test_plan_dots3_swa_decode_and_prefill(known_crossover) -> None:
         )
 
 
-def test_resolve_model_type_dsv4_1_explicit_only() -> None:
+def test_resolve_model_type_dsv4_1_explicit_only(sm120_module) -> None:
     """DSV4_1 and GLM53_NOPE share a 528B size, not a scale format;
     the same compact cache is too short for DSV4, DSV3_2, and GLM_NSA."""
     from flashinfer.mla._sparse_mla_sm120 import _packed_kv_page_block_size
@@ -992,6 +971,48 @@ def test_resolve_model_type_dsv4_1_explicit_only() -> None:
             ValueError, match=r"kv_cache last dim must be >= \d+, got 528"
         ):
             _packed_kv_page_block_size(compact, model_type=model_type, name="kv_cache")
+
+
+def test_ordinary_noncanonical_does_not_consume_legacy_exact(monkeypatch):
+    from flashinfer.mla._sparse_mla_sm120 import _policy as plan_mod
+    from flashinfer.mla._sparse_mla_sm120 import _calibration as cpb
+
+    block_module_loading(monkeypatch)
+    candidates = {
+        (1, 16, 128, 96, False): (0,),
+        (1, 16, 128, 64, True): (0, 3),
+        (1, 16, 128, 64, False): (0, 1, 2),
+    }
+    monkeypatch.setattr(
+        plan_mod, "_candidates", lambda *args: frozenset(candidates[args[:5]])
+    )
+    monkeypatch.setattr(plan_mod, "format_info", lambda model: {"page_size": 64})
+    monkeypatch.setattr(
+        cpb,
+        "get_decode_max_tokens",
+        lambda *args: pytest.fail("noncanonical crossover lookup"),
+    )
+    monkeypatch.setattr(cpb, "get_constants", lambda *args: None)
+    for kwargs in [
+        dict(page_block_size=96),
+        dict(has_extra=True, extra_topk=64),
+        dict(),
+        dict(prefill_impl_pref=2),
+    ]:
+        args = dict(
+            num_tokens=4,
+            num_heads=16,
+            topk=128,
+            model_type=1,
+            page_block_size=64,
+            has_extra=False,
+            prefill_impl_pref=0,
+            device=torch.device("cpu"),
+        )
+        args.update(kwargs)
+        selected = plan_mod.plan(**args)
+        assert selected.variant is plan_mod.KernelVariant.DECODE_SPLITK
+        assert selected.cpb == -1
 
 
 def test_plan_dsv4_1_dual_isolates_single_cache_calibration(
@@ -1165,6 +1186,100 @@ def test_sparse_mla_sm120_wrapper_public_export() -> None:
 
     assert SparseMLASm120Wrapper is _SparseMLAPagedAttentionRunner
     assert "SparseMLASm120Wrapper" in dir(flashinfer.mla)
+
+
+def test_noncanonical_layout_skips_profile_lookup_and_measurement(
+    monkeypatch, ordinary_format_facts
+):
+    from flashinfer.mla._sparse_mla_sm120 import (
+        _execution as execution,
+        _policy as policy,
+    )
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("noncanonical layout consumed or generated a profile")
+
+    for name in ("get_ordinary_profile", "_calibrate_ordinary", "refine_ordinary"):
+        monkeypatch.setattr(policy._cpb, name, forbidden)
+    canonical = execution.AttentionMetadata(
+        model=1,
+        tokens=4,
+        heads=16,
+        topk=128,
+        extra_topk=64,
+        page_size=3,
+        extra_page_size=65,
+        has_lengths=False,
+        has_extra_lengths=False,
+        has_sink=False,
+        extra_fp4=False,
+        variant=0,
+        **policy._cpb.profile_layout(1, 16, 128, 3, 64, 65),
+    )
+    assert policy.canonical_profile_layout(canonical)
+    assert (
+        policy.profile_selection(
+            canonical._replace(indices_stride=144), torch.device("cpu"), "default"
+        )
+        is None
+    )
+
+
+def test_forced_swapab_checks_actual_metadata_without_forcing_decode_phase(
+    sm120_module,
+):
+    from flashinfer.mla._sparse_mla_sm120 import (
+        _execution as execution,
+        _policy as policy,
+    )
+
+    metadata = execution.AttentionMetadata(
+        0,
+        4,
+        64,
+        128,
+        0,
+        64,
+        0,
+        64 * 656,
+        0,
+        656,
+        128,
+        0,
+        64,
+        False,
+        False,
+        False,
+        False,
+        0,
+    )
+    selected = policy.PlannedCall(policy.KernelVariant.DECODE_SPLITK, -1)
+    assert (
+        policy.filter_metadata_selection(
+            selected, metadata, "default", 188, 101376, preference=1
+        )
+        == selected
+    )
+    assert (
+        policy.filter_metadata_selection(
+            selected,
+            metadata._replace(indices_stride=144),
+            "default",
+            188,
+            101376,
+            preference=1,
+        )
+        == selected
+    )
+    with pytest.raises(ValueError, match="swapab.*metadata"):
+        policy.filter_metadata_selection(
+            policy.PlannedCall(policy.KernelVariant.PREFILL_SWAPAB, -1),
+            metadata._replace(indices_stride=144, tokens=128),
+            "default",
+            188,
+            101376,
+            preference=1,
+        )
 
 
 def test_actual_metadata_policy_filters_measured_prefill(monkeypatch):
