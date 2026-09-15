@@ -108,12 +108,12 @@ FP8-query request-ordered route
 ------------------------------
 
 An explicit ``query_dtype=torch.float8_e4m3fn`` plan selects a separate
-FP8 E4M3-query/FP8 E4M3-KV route with BF16 output. It currently supports batch
-64, six query tokens per request, 32 query heads, two KV heads, head dimension
+FP8 E4M3-query/FP8 E4M3-KV route with BF16 output. It supports batches
+64, 128, 160, 192, 224 and 256, six query tokens per request, 32 query heads, two KV heads, head dimension
 256 and page size 64 on a 152-SM SM103 device. Every KV length must be at least
 six; split execution and LSE output are unavailable for this export.
 
-Queries are contiguous ``[384, 32, 256]``. K/V use HND views
+Queries are contiguous ``[batch_size * 6, 32, 256]``. K/V use HND views
 ``[pages, 2, 64, 256]`` with strides ``[32768, 256, 512, 1]``, directly viewing
 native ``[pages, 64, 2, 256]`` storage. Use shared contiguous int32 page tables,
 a device int32 request permutation, and device FP32 log2 QK/output scales.

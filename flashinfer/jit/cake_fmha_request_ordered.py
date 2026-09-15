@@ -45,7 +45,7 @@ _FP8Q_CONTRACT: dict[str, Any] = {
     "head_dim": 256,
     "page_size": 64,
     "q_len": 6,
-    "batch_sizes": [64],
+    "batch_sizes": [64, 128, 160, 192, 224, 256],
     "minimum_kv_len": 6,
     "write_lse": False,
     "kv_strides": [32768, 256, 512, 1],

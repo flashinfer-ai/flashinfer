@@ -1,7 +1,7 @@
 {
   "schema": "flashinfer.cake_fmha_request_ordered_fp8q.v1",
   "target": "sm_103a",
-  "module_count": 1,
+  "module_count": 6,
   "contract": {
     "query_dtype": "float8_e4m3fn",
     "output_dtype": "bfloat16",
@@ -13,7 +13,12 @@
     "page_size": 64,
     "q_len": 6,
     "batch_sizes": [
-      64
+      64,
+      128,
+      160,
+      192,
+      224,
+      256
     ],
     "minimum_kv_len": 6,
     "write_lse": false,
@@ -43,6 +48,91 @@
       "compile_options": [
         "--use_fast_math"
       ]
+    },
+    {
+      "name": "cake_fmha_request_ordered_paged_decode_fp8q_fbb3f38bece34f929238",
+      "arch": "sm_103a",
+      "closure_sha256": "b3ee487a11d80113d39e2a6411910bf4d92d97e973b213cc1bfd98b16ca853d8",
+      "binding_mode": "embedded_cubin",
+      "module_ident": "cake_fmha_request_ordered_paged_decode_fp8q_fbb3f38bece34f929238_sm_103a",
+      "kernel_symbol": "kernel_cake_fmha_request_ordered_paged_decode_fp8q_fbb3f38bece34f929238",
+      "ffi_entry": "run",
+      "tma_workspace_bytes": 384,
+      "device_path": "generated/sm_103a/cake_fmha_request_ordered_paged_decode_fp8q_fbb3f38bece34f929238_kernel.cu",
+      "device_sha256": "6614d227bd96acc19d943a8d884a424bb3a31a2d81e02b6eb39345aad512300d",
+      "binding_path": "generated/sm_103a/cake_fmha_request_ordered_paged_decode_fp8q_fbb3f38bece34f929238_binding.cpp",
+      "binding_sha256": "fa3b4d5ef4d55da3cce3877d0bb9212521d9a4deb9ea0d466fa7fe611cc0cf64",
+      "compile_options": [
+        "--use_fast_math"
+      ]
+    },
+    {
+      "name": "cake_fmha_request_ordered_paged_decode_fp8q_0607d4d8ea2669e46f6f",
+      "arch": "sm_103a",
+      "closure_sha256": "30a7891ed9d689444f79f31ec2a3658b1136eeeb5a0d17d199ff76d6566cdab0",
+      "binding_mode": "embedded_cubin",
+      "module_ident": "cake_fmha_request_ordered_paged_decode_fp8q_0607d4d8ea2669e46f6f_sm_103a",
+      "kernel_symbol": "kernel_cake_fmha_request_ordered_paged_decode_fp8q_0607d4d8ea2669e46f6f",
+      "ffi_entry": "run",
+      "tma_workspace_bytes": 384,
+      "device_path": "generated/sm_103a/cake_fmha_request_ordered_paged_decode_fp8q_0607d4d8ea2669e46f6f_kernel.cu",
+      "device_sha256": "c7256295318622229ced910f9cbaaf9b0bf3220b905f669532184aba722ad293",
+      "binding_path": "generated/sm_103a/cake_fmha_request_ordered_paged_decode_fp8q_0607d4d8ea2669e46f6f_binding.cpp",
+      "binding_sha256": "2e79cdf19fdbf272844005acbf874e0eea13338e2845b2030d221a1c422dd8d5",
+      "compile_options": [
+        "--use_fast_math"
+      ]
+    },
+    {
+      "name": "cake_fmha_request_ordered_paged_decode_fp8q_cf76b65dee7da79c4a04",
+      "arch": "sm_103a",
+      "closure_sha256": "dc2474c6246775eb578f6a4131e9be9b3b67f85b97752f70ac9809412a83ea34",
+      "binding_mode": "embedded_cubin",
+      "module_ident": "cake_fmha_request_ordered_paged_decode_fp8q_cf76b65dee7da79c4a04_sm_103a",
+      "kernel_symbol": "kernel_cake_fmha_request_ordered_paged_decode_fp8q_cf76b65dee7da79c4a04",
+      "ffi_entry": "run",
+      "tma_workspace_bytes": 384,
+      "device_path": "generated/sm_103a/cake_fmha_request_ordered_paged_decode_fp8q_cf76b65dee7da79c4a04_kernel.cu",
+      "device_sha256": "eb65a35909462ad40af63b1746fe154d16a70d6fe46d3bb2dc6b57d3df1afd83",
+      "binding_path": "generated/sm_103a/cake_fmha_request_ordered_paged_decode_fp8q_cf76b65dee7da79c4a04_binding.cpp",
+      "binding_sha256": "384351e94ebd9382cfca2966432323b06f10a4bf6cd2ff676bae13962c386b57",
+      "compile_options": [
+        "--use_fast_math"
+      ]
+    },
+    {
+      "name": "cake_fmha_request_ordered_paged_decode_fp8q_af7d20345e54bff78c22",
+      "arch": "sm_103a",
+      "closure_sha256": "485ddadab6cc31c8f45978a31ef370b4d957b9c592550e252260591d5af8f25a",
+      "binding_mode": "embedded_cubin",
+      "module_ident": "cake_fmha_request_ordered_paged_decode_fp8q_af7d20345e54bff78c22_sm_103a",
+      "kernel_symbol": "kernel_cake_fmha_request_ordered_paged_decode_fp8q_af7d20345e54bff78c22",
+      "ffi_entry": "run",
+      "tma_workspace_bytes": 384,
+      "device_path": "generated/sm_103a/cake_fmha_request_ordered_paged_decode_fp8q_af7d20345e54bff78c22_kernel.cu",
+      "device_sha256": "a7eecacf292d90e62739631a937e8cd52263530f78deb6309825d50173b1f59d",
+      "binding_path": "generated/sm_103a/cake_fmha_request_ordered_paged_decode_fp8q_af7d20345e54bff78c22_binding.cpp",
+      "binding_sha256": "68fcfb704d20266cae3d786697b31f3585f5e0c5fa6c5e8175766ba714d88fef",
+      "compile_options": [
+        "--use_fast_math"
+      ]
+    },
+    {
+      "name": "cake_fmha_request_ordered_paged_decode_fp8q_dec80cbc02bb6f7f6138",
+      "arch": "sm_103a",
+      "closure_sha256": "65d22417cdedf436d51bd276cb555f0df85e980b7ff6327f8bd2edd929a30919",
+      "binding_mode": "embedded_cubin",
+      "module_ident": "cake_fmha_request_ordered_paged_decode_fp8q_dec80cbc02bb6f7f6138_sm_103a",
+      "kernel_symbol": "kernel_cake_fmha_request_ordered_paged_decode_fp8q_dec80cbc02bb6f7f6138",
+      "ffi_entry": "run",
+      "tma_workspace_bytes": 384,
+      "device_path": "generated/sm_103a/cake_fmha_request_ordered_paged_decode_fp8q_dec80cbc02bb6f7f6138_kernel.cu",
+      "device_sha256": "60318cbf5f3058391aaf177291f18772724e3a892e0d7b0e0851246febd70aad",
+      "binding_path": "generated/sm_103a/cake_fmha_request_ordered_paged_decode_fp8q_dec80cbc02bb6f7f6138_binding.cpp",
+      "binding_sha256": "8bd4eac53a2eaafef047a6556bffe2c5b88062a59d821c7c4fadcb85e6a863fe",
+      "compile_options": [
+        "--use_fast_math"
+      ]
     }
   ],
   "bindings": [
@@ -59,6 +149,86 @@
         128
       ],
       "total_tiles": 128,
+      "write_lse": false,
+      "query_dtype": "float8_e4m3fn"
+    },
+    {
+      "module_name": "cake_fmha_request_ordered_paged_decode_fp8q_fbb3f38bece34f929238",
+      "batch_size": 128,
+      "q_len": 6,
+      "num_q_heads": 32,
+      "num_kv_heads": 2,
+      "workspace_parts": 1,
+      "grid": [
+        1,
+        1,
+        256
+      ],
+      "total_tiles": 256,
+      "write_lse": false,
+      "query_dtype": "float8_e4m3fn"
+    },
+    {
+      "module_name": "cake_fmha_request_ordered_paged_decode_fp8q_0607d4d8ea2669e46f6f",
+      "batch_size": 160,
+      "q_len": 6,
+      "num_q_heads": 32,
+      "num_kv_heads": 2,
+      "workspace_parts": 1,
+      "grid": [
+        1,
+        1,
+        320
+      ],
+      "total_tiles": 320,
+      "write_lse": false,
+      "query_dtype": "float8_e4m3fn"
+    },
+    {
+      "module_name": "cake_fmha_request_ordered_paged_decode_fp8q_cf76b65dee7da79c4a04",
+      "batch_size": 192,
+      "q_len": 6,
+      "num_q_heads": 32,
+      "num_kv_heads": 2,
+      "workspace_parts": 1,
+      "grid": [
+        1,
+        1,
+        384
+      ],
+      "total_tiles": 384,
+      "write_lse": false,
+      "query_dtype": "float8_e4m3fn"
+    },
+    {
+      "module_name": "cake_fmha_request_ordered_paged_decode_fp8q_af7d20345e54bff78c22",
+      "batch_size": 224,
+      "q_len": 6,
+      "num_q_heads": 32,
+      "num_kv_heads": 2,
+      "workspace_parts": 1,
+      "grid": [
+        1,
+        1,
+        448
+      ],
+      "total_tiles": 448,
+      "write_lse": false,
+      "query_dtype": "float8_e4m3fn"
+    },
+    {
+      "module_name": "cake_fmha_request_ordered_paged_decode_fp8q_dec80cbc02bb6f7f6138",
+      "batch_size": 256,
+      "q_len": 6,
+      "num_q_heads": 32,
+      "num_kv_heads": 2,
+      "workspace_parts": 1,
+      "grid": [
+        1,
+        1,
+        512
+      ],
+      "total_tiles": 512,
       "write_lse": false,
       "query_dtype": "float8_e4m3fn"
     }

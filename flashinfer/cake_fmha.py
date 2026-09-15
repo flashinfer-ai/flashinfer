@@ -369,7 +369,8 @@ def plan_cake_fmha_request_ordered_paged_decode(
     capture, then update the contents of the device ``request_order`` tensor
     in place between replays. An explicit num_kv_splits selects an exported
     split schedule; unavailable split/LSE combinations raise ValueError.
-    FP8 E4M3 queries select a separate B64/Q6, 32Q/2KV export with BF16
+    FP8 E4M3 queries select separate Q6, 32Q/2KV exports for batches
+    64, 128, 160, 192, 224 and 256 with BF16
     output, shared page tables, native HND views, and KV lengths at least six.
     """
 
