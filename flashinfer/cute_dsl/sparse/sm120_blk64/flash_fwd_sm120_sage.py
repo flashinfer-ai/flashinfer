@@ -117,9 +117,18 @@ class BlockSparseAttnForwardSageSm120Blk64(BatchedStaticSchedulerMixin):
             "Only block_size_n=64 is supported in this kernel."
         )
         self.num_threads = 128
-        # kv_stage is fixed at 1: the Sage kernel's smem and register footprint
-        # (INT8 Q/K + FP8 V tiles + FP8 P fragment + FP32/FP16 accumulators)
-        # leaves insufficient resources on SM120 to open a second pipeline stage.
+        # kv_stage is fixed at 1. Measured on SM120 (ncu, block_size=128):
+        # 230 registers/thread and 41KB dynamic smem/block (Q 8KB + K 8KB +
+        # V 8KB + O 16KB), both independently capping occupancy at 2
+        # blocks/SM (65536 regs/SM -> floor(65536/(230*128))=2;
+        # 100KB smem/SM -> floor(100KB/41KB)=2). kv_stage=2 compiles fine
+        # (doubling K/V to 56KB/block is still far under the ~100KB/block
+        # opt-in max), but it is not a net win: it drops the *smem* block
+        # limit to floor(100KB/56KB)=1 while leaving the register-derived
+        # limit at 2 (tSrK/tOrV stay single fragments regardless of depth),
+        # so smem becomes the new, tighter bottleneck -- occupancy would
+        # regress from 2 blocks/SM to 1. So kv_stage=1 isn't "the only
+        # value that fits"; it's the higher-occupancy choice.
         # V's smem index is therefore always 0 (== K_consumer_state.index when
         # kv_stage == 1), which is why it is hardcoded rather than tracked via
         # V_consumer_state.index.
