@@ -146,6 +146,25 @@ class TestB12xUnifiedValidation:
             RoutingInputMode.PackedPrecomputed,
         )
 
+    @pytest.mark.parametrize("runner_type", (B12xNvfp4Runner, B12xW4A16Runner))
+    def test_b12x_pack_inputs_rejects_from_logits(self, runner_type):
+        runner = runner_type.__new__(runner_type)
+        runner._built = True
+        runner.config = self._config(
+            B12xNvfp4Config() if runner_type is B12xNvfp4Runner else B12xW4A16Config(),
+            QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4)
+            if runner_type is B12xNvfp4Runner
+            else QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.BF16),
+        )
+        act = MoEActivationPack(
+            torch.empty(2, 64, dtype=torch.bfloat16),
+            None,
+            routing_input_mode=RoutingInputMode.FromLogits,
+            routing_logits=torch.empty(2, 4, dtype=torch.float32),
+        )
+        with pytest.raises(NotImplementedError, match="routing_input_mode"):
+            runner.pack_inputs(act, MoEWeightPack())
+
     def test_b12x_constructor_defers_idempotent_wrapper_build(self, monkeypatch):
         import flashinfer.fused_moe.cute_dsl as cute_dsl
 
@@ -500,7 +519,7 @@ def _make_b12x_layer_and_packs(
 
     act_pack = MoEActivationPack(
         hidden_states_q=tensors["x_bf16"],
-        hidden_states_scale=torch.empty(0, device="cuda"),
+        hidden_states_scale=None,
         topk_ids=tensors["token_selected_experts"],
         topk_weights=tensors["token_final_scales"],
     )

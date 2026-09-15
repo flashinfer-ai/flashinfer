@@ -244,12 +244,12 @@ class MoELayer:
             )
 
         # Cross-backend winner cache, keyed by (num_tokens tuning bucket,
-        # routing input mode).  See the MoELayer reuse contract (CR4): the
-        # fastest backend can differ across token-count buckets, so each bucket
-        # caches its own winner; the mode qualifier keeps a winner tuned for
-        # one routing input style (e.g. pre-routed → CuteDSL) from being
-        # dispatched a pack it cannot execute (FromLogits).
-        self._winners: Dict[Tuple[int, Any], Tuple[_RunnerT, Any]] = {}
+        # routing input mode, activation-pack kind).  See the MoELayer reuse
+        # contract (CR4): the fastest backend can differ across token-count
+        # buckets, so each bucket caches its own winner; the mode and kind
+        # qualifiers keep a winner tuned for one routing style or activation
+        # layout from being dispatched a pack it cannot execute.
+        self._winners: Dict[Tuple[int, Any, str], Tuple[_RunnerT, Any]] = {}
         # Backend key selected on the most recent call (introspection hook).
         self._last_winner_backend: Optional[str] = None
 
@@ -296,25 +296,34 @@ class MoELayer:
                 f"Reconstruct MoELayer with a larger ceiling."
             )
 
-        # Only runners that can execute this pack's routing input mode compete.
-        # Not every backend has an in-kernel router (CuteDSL is pre-routed-only),
-        # so a FromLogits pack must never reach an incapable runner — neither
-        # here nor via a winner cached under the other mode, hence the
-        # mode-qualified cache key below.
+        # Only runners that can execute this pack's routing input mode and
+        # activation layout compete. Not every backend has an in-kernel router
+        # (CuteDSL is pre-routed-only), and NVFP4 packed-FP4 cannot share a pack
+        # with NVFP4 BF16-in-kernel, so a mismatched pack must never reach an
+        # incapable runner — neither here nor via a winner cached under the
+        # other mode or layout, hence the qualified cache key below.
         mode = act_pack.routing_input_mode
-        runners = [r for r in self.runners if mode in r.supported_routing_modes]
-        if not runners:
+        kind = act_pack.activation_pack_kind
+        mode_runners = [r for r in self.runners if mode in r.supported_routing_modes]
+        if not mode_runners:
             raise NotImplementedError(
                 f"MoELayer: none of the usable backends "
                 f"{[r.backend_key for r in self.runners]} support "
                 f"routing_input_mode={mode!r}."
             )
+        runners = [r for r in mode_runners if r.pack_kind_for_config() == kind]
+        if not runners:
+            raise NotImplementedError(
+                f"MoELayer: none of the usable backends "
+                f"{[r.backend_key for r in mode_runners]} support "
+                f"activation_pack_kind={kind!r}."
+            )
 
         bucket = map_to_hybrid_bucket(act_pack.num_tokens, ceiling)
-        winner = self._winners.get((bucket, mode))
+        winner = self._winners.get((bucket, mode, kind))
         if winner is None:
             winner = self._select_winner(act_pack, weight_pack, runners)
-            self._winners[(bucket, mode)] = winner
+            self._winners[(bucket, mode, kind)] = winner
         runner, tactic = winner
         self._last_winner_backend = runner.backend_key
 

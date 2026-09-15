@@ -68,6 +68,7 @@ from .api import (
     SwiGLUStep,
     # Unified config and pack types
     ActivationType,
+    ActivationPackKind,
     MoEActivationPack,
     MoEConfig,
     MoEWeightPack,
@@ -461,6 +462,11 @@ class MoERunner(TunableRunner):
 
     backend_key: ClassVar[str] = ""
     supported_routing_modes: tuple[RoutingInputMode, ...] = ()
+    # Layout token, or pair → token for multi-pair runners. Empty until a
+    # concrete runner declares it; check_support fails closed.
+    supported_activation_pack_kind: ClassVar[
+        str | dict[tuple[QuantFormat, QuantFormat], str]
+    ] = ""
     supported_quant_variants: ClassVar[tuple[tuple[QuantFormat, QuantFormat], ...]] = ()
     supported_output_formats: ClassVar[tuple[QuantFormat, ...]] = (QuantFormat.BF16,)
     # Default to no activations; each concrete runner must declare its support.
@@ -529,6 +535,22 @@ class MoERunner(TunableRunner):
             raise NotImplementedError(
                 f"{type(self).__name__} does not support output={quant.output.name}; "
                 f"supported outputs are {names}."
+            )
+        declared_kind = type(self).supported_activation_pack_kind
+        if isinstance(declared_kind, dict):
+            if set(declared_kind) != set(self.supported_quant_variants):
+                raise NotImplementedError(
+                    f"{type(self).__name__} declares per-quantization activation "
+                    "pack kinds that do not match supported_quant_variants."
+                )
+            if not all(declared_kind.values()):
+                raise NotImplementedError(
+                    f"{type(self).__name__} declares an empty activation pack "
+                    "kind for at least one MMA pair."
+                )
+        elif not declared_kind:
+            raise NotImplementedError(
+                f"{type(self).__name__} must declare supported_activation_pack_kind."
             )
         if self.supported_activation_classes_by_quant:
             # Strict lookup: a runner that declares per-quant capabilities must
@@ -609,6 +631,60 @@ class MoERunner(TunableRunner):
                 f"{type(self).__name__}.build() must be called before execution."
             )
 
+    def pack_kind_for_config(self) -> str:
+        """Layout token this instance consumes for its current ``quant.pair``."""
+        declared = type(self).supported_activation_pack_kind
+        if isinstance(declared, dict):
+            pair = self.config.quant.pair
+            try:
+                return declared[pair]
+            except KeyError:
+                quant = self.config.quant
+                raise NotImplementedError(
+                    f"{type(self).__name__} declares per-quantization activation "
+                    "pack kinds but has no entry for "
+                    f"weight={quant.weight.name}, activation={quant.activation.name}."
+                ) from None
+        if not declared:
+            raise NotImplementedError(
+                f"{type(self).__name__} must declare supported_activation_pack_kind."
+            )
+        return declared
+
+    def _require_pack_compatible(self, act: MoEActivationPack) -> None:
+        """Reject packs this runner cannot execute (direct ``pack_inputs`` path).
+
+        ``MoELayer`` already drops incompatible runners before autotune; this
+        guard keeps tests and benchmarks that call ``pack_inputs`` directly
+        from forwarding a wrong routing mode or activation layout.
+        """
+        mode = act.routing_input_mode
+        if mode not in self.supported_routing_modes:
+            supported = tuple(m.name for m in self.supported_routing_modes)
+            raise NotImplementedError(
+                f"{type(self).__name__} does not support "
+                f"routing_input_mode={mode!r} (supported: {supported})."
+            )
+        expected = self.pack_kind_for_config()
+        kind = act.activation_pack_kind
+        if kind != expected:
+            raise NotImplementedError(
+                f"{type(self).__name__} requires activation_pack_kind={expected!r}, "
+                f"got {kind!r}."
+            )
+
+    def pack_inputs(
+        self, act: MoEActivationPack, weights: MoEWeightPack
+    ) -> List[torch.Tensor]:
+        self._require_built()
+        self._require_pack_compatible(act)
+        return self._pack_inputs(act, weights)
+
+    def _pack_inputs(
+        self, act: MoEActivationPack, weights: MoEWeightPack
+    ) -> List[torch.Tensor]:
+        raise NotImplementedError(f"{type(self).__name__} must implement _pack_inputs.")
+
     # Anything the profiled tensor shapes cannot reveal has to be listed here.
     # One stable tuple feeds both __hash__ (in-memory) and the persisted key,
     # which excludes runner_hash. Shapes already in the profile are omitted.
@@ -674,6 +750,7 @@ class CakeWarpDecodeRunner(MoERunner):
     backend_key = "cake"
     supported_routing_modes = (RoutingInputMode.UnpackedPrecomputed,)
     supported_quant_variants = ((QuantFormat.NVFP4, QuantFormat.NVFP4),)
+    supported_activation_pack_kind = ActivationPackKind.NVFP4_PACKED
     supported_activation_classes = (SwiGLU, SiLU)
     supports_expert_parallelism = False
 
@@ -1126,7 +1203,7 @@ class CakeWarpDecodeRunner(MoERunner):
         if not tensor.is_contiguous():
             raise ValueError(f"{name} must be contiguous.")
 
-    def pack_inputs(
+    def _pack_inputs(
         self, act: MoEActivationPack, weights: MoEWeightPack
     ) -> List[torch.Tensor]:
         """Validate and flatten the exact warp-decode TVM-FFI input ABI."""
@@ -1412,6 +1489,7 @@ class _CutlassRunnerBase(MoERunner):
     """
 
     supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
+    supported_activation_pack_kind = ActivationPackKind.BF16
     # Fail closed like MoERunner: every concrete CUTLASS runner declares its own
     # activations after proving the matching preparation geometry and numerical
     # coverage. A SwiGLU default would let a runner added later inherit support
@@ -1744,7 +1822,7 @@ class _CutlassRunnerBase(MoERunner):
         self._workspace_num_tokens = capacity
         self._workspace_hidden_size = hidden_size
 
-    def pack_inputs(
+    def _pack_inputs(
         self, act: MoEActivationPack, weights: MoEWeightPack
     ) -> List[torch.Tensor]:
         self._require_built()
@@ -2214,6 +2292,7 @@ class CutlassFp8PerTensorRunner(_CutlassRunnerBase):
 
     backend_key = "cutlass_fp8_per_tensor"
     supported_quant_variants = ((QuantFormat.FP8PerTensor, QuantFormat.FP8PerTensor),)
+    supported_activation_pack_kind = ActivationPackKind.FP8_E4M3_SCALAR
     supported_activation_classes = _CUTLASS_SEMANTIC_ACTIVATIONS
     _supported_archs = _CUTLASS_FP8_ARCHS
     _x_dtype = torch.float8_e4m3fn
@@ -2338,6 +2417,7 @@ class CutlassMxfp8Mxfp4Runner(_CutlassRunnerBase):
 
     backend_key = "cutlass_mxfp8_mxfp4"
     supported_quant_variants = ((QuantFormat.MXFP4, QuantFormat.MXFP8),)
+    supported_activation_pack_kind = ActivationPackKind.MXFP8_SWIZZLED
     supported_activation_classes = _CUTLASS_SEMANTIC_ACTIVATIONS
     _supported_archs = _CUTLASS_MXFP8_MXFP4_ARCHS
     _x_dtype = torch.float8_e4m3fn
@@ -2427,6 +2507,7 @@ class CutlassMxfp8Runner(_CutlassRunnerBase):
 
     backend_key = "cutlass_mxfp8"
     supported_quant_variants = ((QuantFormat.MXFP8, QuantFormat.MXFP8),)
+    supported_activation_pack_kind = ActivationPackKind.MXFP8_SWIZZLED
     supported_activation_classes = _CUTLASS_SEMANTIC_ACTIVATIONS
     _supported_archs = _CUTLASS_MXFP8_ARCHS
     _x_dtype = torch.float8_e4m3fn
@@ -2896,6 +2977,7 @@ class CuTileBf16Runner(MoERunner):
     backend_key = "cutile_bf16"
     supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
     supported_quant_variants = ((QuantFormat.BF16, QuantFormat.BF16),)
+    supported_activation_pack_kind = ActivationPackKind.BF16
     supported_activation_classes = _CUTLASS_SEMANTIC_ACTIVATIONS
     supports_expert_parallelism = False
     _block_sizes: ClassVar[tuple[int, ...]] = (32, 64, 128)
@@ -3159,7 +3241,7 @@ class CuTileBf16Runner(MoERunner):
             )
         return self._factorized_tactics(inputs)
 
-    def pack_inputs(
+    def _pack_inputs(
         self, act: MoEActivationPack, weights: MoEWeightPack
     ) -> List[torch.Tensor]:
         hidden_states, num_tokens, hidden_size = self._validate_inputs(act)
@@ -3603,7 +3685,7 @@ class CuTileNvfp4Runner(CuTileBf16Runner):
             )
         return self._factorized_w4a4_tactics(inputs)
 
-    def pack_inputs(
+    def _pack_inputs(
         self, act: MoEActivationPack, weights: MoEWeightPack
     ) -> List[torch.Tensor]:
         hidden_states, num_tokens, hidden_size = self._validate_inputs(act)
@@ -3790,6 +3872,11 @@ class CuteDslRunner(MoERunner):
         (QuantFormat.MXFP4, QuantFormat.MXFP8),
         (QuantFormat.NVFP4, QuantFormat.BF16),
     )
+    supported_activation_pack_kind = {
+        (QuantFormat.NVFP4, QuantFormat.NVFP4): ActivationPackKind.NVFP4_PACKED,
+        (QuantFormat.MXFP4, QuantFormat.MXFP8): ActivationPackKind.MXFP8,
+        (QuantFormat.NVFP4, QuantFormat.BF16): ActivationPackKind.BF16,
+    }
     supported_activation_classes = (SwiGLU, GeGLUTanh, ReLU2, SiTU)
 
     def _check_support(self) -> None:
@@ -3968,7 +4055,7 @@ class CuteDslRunner(MoERunner):
             inputs, tactic=tactic, do_preparation=do_preparation, **kwargs
         )
 
-    def pack_inputs(
+    def _pack_inputs(
         self, act: MoEActivationPack, weights: MoEWeightPack
     ) -> List[torch.Tensor]:
         """Translate packs into the selected CuTe DSL runner's input list.
@@ -4222,6 +4309,11 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
         (QuantFormat.MXFP4, QuantFormat.MXFP8),
         (QuantFormat.MXFP4, QuantFormat.BF16),
     )
+    supported_activation_pack_kind = {
+        (QuantFormat.NVFP4, QuantFormat.NVFP4): ActivationPackKind.NVFP4_PACKED,
+        (QuantFormat.MXFP4, QuantFormat.MXFP8): ActivationPackKind.MXFP8,
+        (QuantFormat.MXFP4, QuantFormat.BF16): ActivationPackKind.BF16,
+    }
     supports_fused_shared_experts = True
     supported_activation_classes_by_quant: ClassVar[
         dict[tuple[QuantFormat, QuantFormat], tuple[type[ActivationConfig], ...]]
@@ -4509,7 +4601,7 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
                 raise ValueError(f"{name} must be contiguous.")
         return scale
 
-    def pack_inputs(
+    def _pack_inputs(
         self, act: MoEActivationPack, weights: MoEWeightPack
     ) -> List[torch.Tensor]:
         """Translate Packs → the ``MoeRunnerInputs`` list ``core.MoERunner`` expects.
@@ -4748,6 +4840,13 @@ class TrtllmFp8BlockRunner(_TrtllmRunnerBase):
         (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8),
         (QuantFormat.MXFP8, QuantFormat.MXFP8),
     )
+    supported_activation_pack_kind = {
+        (
+            QuantFormat.DeepSeekFp8,
+            QuantFormat.DeepSeekFp8,
+        ): ActivationPackKind.FP8_BLOCK,
+        (QuantFormat.MXFP8, QuantFormat.MXFP8): ActivationPackKind.MXFP8,
+    }
     supports_fused_shared_experts = True
     supported_activation_classes_by_quant: ClassVar[
         dict[tuple[QuantFormat, QuantFormat], tuple[type[ActivationConfig], ...]]
@@ -4946,7 +5045,7 @@ class TrtllmFp8BlockRunner(_TrtllmRunnerBase):
         )
         return scale
 
-    def pack_inputs(
+    def _pack_inputs(
         self, act: MoEActivationPack, weights: MoEWeightPack
     ) -> List[torch.Tensor]:
         self._require_built()
@@ -5106,6 +5205,7 @@ class TrtllmFp8PerTensorRunner(_TrtllmRunnerBase):
         RoutingInputMode.FromLogits,
     )
     supported_quant_variants = ((QuantFormat.FP8PerTensor, QuantFormat.FP8PerTensor),)
+    supported_activation_pack_kind = ActivationPackKind.FP8_E4M3
     # The per-tensor cubin manifest has SwiGLU and ReLU2 epilogues. GeGLU is
     # representable by the enum but has no matching generated kernel.
     supported_activation_classes = (SwiGLU, ReLU2)
@@ -5265,7 +5365,7 @@ class TrtllmFp8PerTensorRunner(_TrtllmRunnerBase):
                     f"{tensor.dtype} {tuple(tensor.shape)}."
                 )
 
-    def pack_inputs(
+    def _pack_inputs(
         self, act: MoEActivationPack, weights: MoEWeightPack
     ) -> List[torch.Tensor]:
         self._require_built()
@@ -5403,6 +5503,7 @@ class TrtllmBf16RoutedRunner(_TrtllmRunnerBase):
         RoutingInputMode.FromLogits,
     )
     supported_quant_variants = ((QuantFormat.BF16, QuantFormat.BF16),)
+    supported_activation_pack_kind = ActivationPackKind.BF16
     # The BF16 cubin manifest currently contains SwiGLU and ReLU2. GeGLU and
     # SiTU are represented by the launcher enum but have no matching kernels.
     supported_activation_classes = (SwiGLU, ReLU2)
@@ -5488,7 +5589,7 @@ class TrtllmBf16RoutedRunner(_TrtllmRunnerBase):
             inputs, tactic, do_preparation, kwargs.pop("launch_state", None)
         )
 
-    def pack_inputs(
+    def _pack_inputs(
         self, act: MoEActivationPack, weights: MoEWeightPack
     ) -> List[torch.Tensor]:
         """Translate Packs → the ``MoeRunnerInputs`` list for the bf16 path.
@@ -5634,6 +5735,7 @@ class TrtllmMxInt4RoutedRunner(_TrtllmRunnerBase):
         RoutingInputMode.FromLogits,
     )
     supported_quant_variants = ((QuantFormat.MXINT4, QuantFormat.BF16),)
+    supported_activation_pack_kind = ActivationPackKind.BF16
     supported_activation_classes = (SwiGLU,)
 
     def _check_support(self) -> None:
@@ -5718,7 +5820,7 @@ class TrtllmMxInt4RoutedRunner(_TrtllmRunnerBase):
             inputs, tactic, do_preparation, kwargs.pop("launch_state", None)
         )
 
-    def pack_inputs(
+    def _pack_inputs(
         self, act: MoEActivationPack, weights: MoEWeightPack
     ) -> List[torch.Tensor]:
         self._require_built()
@@ -5899,6 +6001,7 @@ class _B12xRunner(MoERunner):
 
     backend_key: ClassVar[str] = ""
     supports_expert_parallelism = False
+    supported_activation_pack_kind = ActivationPackKind.BF16
     required_weight_keys: ClassVar[tuple[str, ...]] = ()
 
     # Kernel activation name, resolved in _check_support() rather than
@@ -6016,7 +6119,7 @@ class _B12xRunner(MoERunner):
             source_format="modelopt",
         )
 
-    def pack_inputs(
+    def _pack_inputs(
         self, act: MoEActivationPack, weights: MoEWeightPack
     ) -> List[torch.Tensor]:
         self._require_built()

@@ -1059,9 +1059,11 @@ class CutlassNvfp4Config:
     and ``intermediate_size`` must be divisible by 16 (the NVFP4 scale-vector
     size). Activations stay BF16; the kernel quantizes them internally.
 
-    This config is not in the default backend search list. TRTLLM NVFP4 uses
-    a quantized activation pack, so the two contracts cannot share one
-    ``MoEActivationPack``. Select it explicitly with
+    This config is not in the default backend search list. TRTLLM / CuteDSL
+    NVFP4 uses a packed-FP4 activation layout, so the two contracts cannot
+    share one ``MoEActivationPack``. Mixed ``BackendOptions`` are allowed:
+    ``MoELayer`` keeps only runners whose activation-pack kind matches the
+    call. Select this backend alone with
     ``BackendOptions((CutlassNvfp4Config(),))``.
     """
 
@@ -1111,7 +1113,9 @@ class CutlassFp8PerTensorConfig:
     CUTLASS activation semantics and
     ``do_finalize=True``. Not in the default backend search list: TRTLLM
     per-tensor FP8 folds the activation scale into the weight view, so the two
-    contracts cannot share one pack without a conversion.
+    contracts cannot share one pack without a conversion. Mixed
+    ``BackendOptions`` are allowed; ``MoELayer`` keeps only the matching
+    activation-pack kind.
     """
 
     @classmethod
@@ -1711,6 +1715,93 @@ class MoEConfig:
 
 
 # ---------------------------------------------------------------------------
+# Activation-pack layout tokens
+# ---------------------------------------------------------------------------
+# Tokens describe tensor layout, not an MMA pair. BF16 activations with no
+# scale are ``bf16`` whether the layer's pair is BF16×BF16, NVFP4×NVFP4
+# (CUTLASS / b12x / cuTile), or W4A16. ``MoELayer`` already filters runners by
+# ``quant.pair`` at construct time; these tokens only split layouts that can
+# coexist on one remaining runner set.
+
+
+class ActivationPackKind:
+    """Layout token inferred from ``MoEActivationPack`` dtypes and scale shape."""
+
+    BF16 = "bf16"
+    NVFP4_PACKED = "nvfp4_packed"
+    FP8_E4M3 = "fp8_e4m3"
+    FP8_E4M3_SCALAR = "fp8_e4m3_scalar"
+    FP8_BLOCK = "fp8_block"
+    MXFP8 = "mxfp8"
+    MXFP8_SWIZZLED = "mxfp8_swizzled"
+    UNKNOWN = "unknown"
+
+
+def _round_up(value: int, divisor: int) -> int:
+    return ((value + divisor - 1) // divisor) * divisor
+
+
+def infer_activation_pack_kind(act: "MoEActivationPack") -> str:
+    """Return the layout token for ``act``, or ``unknown`` when it is ambiguous.
+
+    Fail-closed: leftover scales on a BF16 payload, or a scale shape that
+    matches no known contract, do not map onto a competing backend.
+    """
+    hidden = act.hidden_states_q
+    scale = act.hidden_states_scale
+    per_token = act.per_token_scale
+    if hidden.ndim != 2:
+        return ActivationPackKind.UNKNOWN
+    num_tokens, width = int(hidden.shape[0]), int(hidden.shape[1])
+
+    if hidden.dtype is torch.uint8:
+        expected_scale = (num_tokens, width // 8)
+        if (
+            scale is not None
+            and width % 8 == 0
+            and scale.ndim == 2
+            and scale.dtype in (torch.uint8, torch.float8_e4m3fn)
+            and tuple(scale.shape) == expected_scale
+        ):
+            return ActivationPackKind.NVFP4_PACKED
+        return ActivationPackKind.UNKNOWN
+
+    if hidden.dtype is torch.bfloat16:
+        if scale is None and per_token is None:
+            return ActivationPackKind.BF16
+        return ActivationPackKind.UNKNOWN
+
+    if hidden.dtype is torch.float8_e4m3fn:
+        if per_token is not None:
+            return ActivationPackKind.UNKNOWN
+        if scale is None:
+            return ActivationPackKind.FP8_E4M3
+        if scale.ndim == 0 and scale.dtype is torch.float32:
+            return ActivationPackKind.FP8_E4M3_SCALAR
+        if (
+            scale.ndim == 2
+            and scale.dtype is torch.float32
+            and width % 128 == 0
+            and tuple(scale.shape) == (width // 128, num_tokens)
+        ):
+            return ActivationPackKind.FP8_BLOCK
+        token_major = (num_tokens, width // 32) if width % 32 == 0 else None
+        if (
+            token_major is not None
+            and scale.ndim == 2
+            and scale.dtype in (torch.uint8, torch.float8_e4m3fn)
+            and tuple(scale.shape) == token_major
+        ):
+            return ActivationPackKind.MXFP8
+        swizzled = _round_up(num_tokens, 128) * _round_up(width // 32, 4)
+        if scale.dtype is torch.uint8 and scale.numel() == swizzled:
+            return ActivationPackKind.MXFP8_SWIZZLED
+        return ActivationPackKind.UNKNOWN
+
+    return ActivationPackKind.UNKNOWN
+
+
+# ---------------------------------------------------------------------------
 # Activation / weight packs for autotuned pre-routed and FromLogits paths
 # ---------------------------------------------------------------------------
 # These are the runner-level inputs used by MoELayer (plan §1).
@@ -1760,10 +1851,11 @@ class MoEActivationPack:
 
     Activation encoding depends on the MMA pair on ``QuantConfig``:
 
-    * NVFP4×NVFP4 with ``TrtllmFp4Config`` or ``CuteDslConfig``: packed
+    * NVFP4×NVFP4 packed (``TrtllmFp4Config`` / ``CuteDslConfig`` / Cake):
       ``uint8 [M, H/2]`` values with ``float8_e4m3fn [M, H/16]`` block scales.
-    * NVFP4×NVFP4 with ``CutlassNvfp4Config``: raw ``bfloat16 [M, H]`` values
-      without an activation scale.
+    * NVFP4×NVFP4 BF16-in-kernel (``CutlassNvfp4Config`` / ``B12xNvfp4Config`` /
+      ``CuTileNvfp4Config``): raw ``bfloat16 [M, H]`` values with
+      ``hidden_states_scale=None``.
     * MXFP4×MXFP8 (W4A8): ``float8_e4m3fn [M, H]`` MXFP8 values with token-major
       ``float8_e4m3fn [M, H/32]`` tensors carrying UE8M0 scale bytes, matching
       the TRTLLM FP4 launcher ABI.
@@ -1804,6 +1896,10 @@ class MoEActivationPack:
       BF16, block-FP8, per-tensor-FP8, and MxInt4 runners support this mode;
       ``MoELayer`` dispatches a logits pack only to capable backends (see each runner's
       ``supported_routing_modes``).
+
+    ``activation_pack_kind`` is inferred from dtypes and scale shape (not stored).
+    ``MoELayer`` keeps only runners whose declared kind matches this pack, the
+    same way it filters ``routing_input_mode``.
 
     ``topk_ids`` / ``topk_weights`` follow the routed-MoE naming convention (gh #2425); they
     keep the field positions of the former ``selected_experts`` / ``final_scales``, so
@@ -1957,6 +2053,11 @@ class MoEActivationPack:
                 continue
             parts.append(f"{f.name}={_tensor_summary(value)}")
         return f"MoEActivationPack({', '.join(parts)})"
+
+    @property
+    def activation_pack_kind(self) -> str:
+        """Layout token inferred from ``hidden_states_q`` and its scales."""
+        return infer_activation_pack_kind(self)
 
 
 @dataclass
