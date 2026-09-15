@@ -1,3 +1,6 @@
+import hashlib
+from pathlib import Path
+
 from flashinfer.artifacts import (
     ArtifactPath,
     get_available_cubin_files,
@@ -488,3 +491,70 @@ def test_get_checksums_keys_by_full_path(monkeypatch, tmp_path):
         safe_urljoin("pin-a/", shared_name): "aaaa1111",
         safe_urljoin("pin-b/", shared_name): "bbbb2222",
     }
+
+
+def test_download_artifacts_reuses_checksum_verified_cache(monkeypatch, tmp_path):
+    """Valid cached artifacts are reused; missing or corrupt files are fetched."""
+    from flashinfer import artifacts
+
+    cubin_dir = tmp_path / "cubins"
+    monkeypatch.setattr(artifacts, "FLASHINFER_CUBIN_DIR", cubin_dir)
+    monkeypatch.setattr(artifacts, "FLASHINFER_CUBINS_REPOSITORY", "https://example/")
+
+    payloads = {
+        "pin/cached.cubin": b"already cached",
+        "pin/corrupt.cubin": b"replacement",
+        "pin/missing.cubin": b"downloaded",
+    }
+    cubin_files = [
+        (name, hashlib.sha256(payload).hexdigest())
+        for name, payload in payloads.items()
+    ]
+    monkeypatch.setattr(artifacts, "get_subdir_file_list", lambda: iter(cubin_files))
+
+    cached_path = cubin_dir / "pin/cached.cubin"
+    cached_path.parent.mkdir(parents=True)
+    cached_path.write_bytes(payloads["pin/cached.cubin"])
+    (cubin_dir / "pin/corrupt.cubin").write_bytes(b"bad cache entry")
+
+    downloads = []
+
+    def fake_download(source, destination, **_kwargs):
+        name = source.removeprefix("https://example/")
+        downloads.append(name)
+        destination_path = Path(destination)
+        destination_path.write_bytes(payloads[name])
+        return True
+
+    monkeypatch.setattr(artifacts, "download_file", fake_download)
+
+    artifacts.download_artifacts()
+
+    assert downloads == ["pin/corrupt.cubin", "pin/missing.cubin"]
+    for name, payload in payloads.items():
+        assert (cubin_dir / name).read_bytes() == payload
+
+
+def test_download_artifacts_rejects_bad_download_after_cache_miss(
+    monkeypatch, tmp_path
+):
+    """A successful HTTP result still must match the expected checksum."""
+    from flashinfer import artifacts
+
+    cubin_dir = tmp_path / "cubins"
+    monkeypatch.setattr(artifacts, "FLASHINFER_CUBIN_DIR", cubin_dir)
+    monkeypatch.setattr(artifacts, "FLASHINFER_CUBINS_REPOSITORY", "https://example/")
+    monkeypatch.setattr(
+        artifacts,
+        "get_subdir_file_list",
+        lambda: iter([("pin/file.cubin", hashlib.sha256(b"expected").hexdigest())]),
+    )
+
+    def fake_download(_source, destination, **_kwargs):
+        Path(destination).write_bytes(b"unexpected")
+        return True
+
+    monkeypatch.setattr(artifacts, "download_file", fake_download)
+
+    with pytest.raises(RuntimeError, match="checksum mismatch"):
+        artifacts.download_artifacts()
