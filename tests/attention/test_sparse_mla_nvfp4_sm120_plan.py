@@ -168,7 +168,7 @@ def test_nvfp4_planner_rejects_shapes_outside_both_envelopes(
     planner_state,
 ) -> None:
     assert _plan(8, num_heads=8) is None
-    assert _plan(8, topk=256) is None
+    assert _plan(8, topk=192) is None
     assert _plan(8, primary_page_size=32) is None
     assert _plan(8, extra_topk=512, extra_page_size=1) is None
     with pytest.raises(ValueError, match="has_extra_topk_length"):
