@@ -157,7 +157,7 @@ class MegaMoEHopperFp8Config:
     # pre-reduced in fp32 on the expert rank and ONE row per contributing
     # rank crosses the wire (inbox keyed by rank instead of topk slot).
     # Requires token_back_mode="reuse_dispatch_warps" and
-    # apply_topk_in_fc1=True; COLLECTIVE (wire format) like dedup_dispatch.
+    # apply_routing_weights_before_fc2=True; COLLECTIVE like dedup_dispatch.
     grouped_token_back: bool = False
     # Combine wire format: "bf16" (default), or the per-32 e8m0 quantized
     # fp8 wires "32e4m3xe8m0" / "32e5m2xe8m0" (halved return bytes; the
@@ -210,7 +210,7 @@ class MegaMoEHopperFp8Config:
     # before FC1-output quantization (the driver's ref_compute_graph switch).
     # False leaves the staged FC2 terms unweighted and applies scores in the
     # standalone TopkReduce; Form B (ikr) requires True.
-    apply_topk_in_fc1: bool = True
+    apply_routing_weights_before_fc2: bool = True
     gate_up_clamp: Optional[float] = None
     enable_iket: bool = False
 
@@ -308,15 +308,18 @@ class MegaMoEHopperFp8Config:
                     "grouped_token_back and in_kernel_fc2_reduce both "
                     "collapse the combine; enable only one."
                 )
-            if not self.apply_topk_in_fc1:
+            if not self.apply_routing_weights_before_fc2:
                 raise ValueError(
-                    "grouped_token_back requires apply_topk_in_fc1=True "
+                    "grouped_token_back requires "
+                    "apply_routing_weights_before_fc2=True "
                     "(the group pre-reduce is a plain sum)."
                 )
-        if self.in_kernel_fc2_reduce and not self.apply_topk_in_fc1:
+        if self.in_kernel_fc2_reduce and not self.apply_routing_weights_before_fc2:
             # Kernel invariant: the Form B REDG path collapses topk before a
             # separate reducer could apply routing weights.
-            raise ValueError("in_kernel_fc2_reduce requires apply_topk_in_fc1=True.")
+            raise ValueError(
+                "in_kernel_fc2_reduce requires apply_routing_weights_before_fc2=True."
+            )
         if not self.force_static_sched:
             raise ValueError(
                 "The Hopper FP8 v1 kernel only implements "
@@ -667,7 +670,7 @@ class MegaMoEHopperFp8Frontend:
             c.in_kernel_fc2_reduce,
             c.resolved_token_back_mode,
             c.tail_split_pairs,
-            c.apply_topk_in_fc1,
+            c.apply_routing_weights_before_fc2,
             self._gate_up_clamp,
             c.enable_iket,
         )
@@ -771,7 +774,7 @@ class MegaMoEHopperFp8Frontend:
             max_tokens_per_rank=c.num_tokens_per_rank,
             hidden=c.hidden,
             fc2_in_kernel_topk_reduce=c.in_kernel_fc2_reduce,
-            apply_topk_in_fc1=c.apply_topk_in_fc1,
+            apply_topk_in_fc1=c.apply_routing_weights_before_fc2,
             token_back_mode=c.resolved_token_back_mode,
             epi_flag_batch=c.epi_flag_batch,
             flag_batch=c.flag_batch,
@@ -1362,7 +1365,7 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
     fc1_early_done_publish: bool = False,
     fold_producer_warps: bool = True,
     generate_c: bool = False,
-    apply_topk_in_fc1: bool = True,
+    apply_routing_weights_before_fc2: bool = True,
     load_balance_mode: Literal["static", "atomic_counter"] = "static",
     # None = the heuristic table's per-bucket value (manual geometry: the
     # kernel default / FP8_TAIL_SPLIT override); an explicit bool wins.
@@ -1532,7 +1535,7 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
         fc1_early_done_publish=fc1_early_done_publish,
         fold_producer_warps=fold_producer_warps,
         generate_c=generate_c,
-        apply_topk_in_fc1=apply_topk_in_fc1,
+        apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
         load_balance_mode=load_balance_mode,
         group_hint=group_hint,
         tail_split_pairs=bool(tail_split_pairs),

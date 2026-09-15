@@ -1276,7 +1276,7 @@ def _run_nvfp4_routing_rounds(
     alpha_source="config",
     activation_params=None,
     with_norm=False,
-    apply_topk_in_fc1=False,
+    apply_routing_weights_before_fc2=False,
     check_graph=False,
 ):
     """One public layer reuses its workspace across skew, empty sources and refill."""
@@ -1367,7 +1367,15 @@ def _run_nvfp4_routing_rounds(
                 enable_in_kernel_fc2_reduce=in_kernel_fc2_reduce,
                 knobs={**knobs, "in_kernel_fc2_reduce": in_kernel_fc2_reduce},
                 **activation_params,
-                **({"apply_topk_in_fc1": apply_topk_in_fc1} if mode == "w4a16" else {}),
+                **(
+                    {
+                        "apply_routing_weights_before_fc2": (
+                            apply_routing_weights_before_fc2
+                        ),
+                    }
+                    if mode == "w4a16"
+                    else {}
+                ),
                 **(alphas if alpha_source == "config" else {}),
             )
         ),
@@ -1425,7 +1433,7 @@ def _run_nvfp4_routing_rounds(
                     weights,
                     mode=mode,
                     **alphas,
-                    apply_topk_in_fc1=apply_topk_in_fc1,
+                    apply_routing_weights_before_fc2=(apply_routing_weights_before_fc2),
                     in_kernel_fc2_reduce=in_kernel_fc2_reduce,
                 )
             elif mode == "w4a4":
@@ -1468,7 +1476,9 @@ def _run_nvfp4_routing_rounds(
                         weights,
                         mode=mode,
                         **alphas,
-                        apply_topk_in_fc1=apply_topk_in_fc1,
+                        apply_routing_weights_before_fc2=(
+                            apply_routing_weights_before_fc2
+                        ),
                     )
                     assert not torch.equal(y, reference)
                 graph.replay()
@@ -1488,7 +1498,7 @@ def _run_nvfp4_routing_rounds(
 @pytest.mark.gpu_4
 @pytest.mark.arch_blackwell
 @pytest.mark.parametrize(
-    "activation_params,with_norm,alpha_source,apply_topk_in_fc1,token_back_mode",
+    "activation_params,with_norm,alpha_source,apply_routing_weights_before_fc2,token_back_mode",
     [
         pytest.param({}, True, "runtime", False, "epi_warps", id="swiglu-norm"),
         pytest.param(
@@ -1526,7 +1536,11 @@ def _run_nvfp4_routing_rounds(
     ],
 )
 def test_nvfp4_w4a16_epilogue_contract(
-    activation_params, with_norm, alpha_source, apply_topk_in_fc1, token_back_mode
+    activation_params,
+    with_norm,
+    alpha_source,
+    apply_routing_weights_before_fc2,
+    token_back_mode,
 ):
     """Opt-in activations and normalization retain the EP-aware bit-exact contract."""
     _require_cuda()
@@ -1545,7 +1559,7 @@ def test_nvfp4_w4a16_epilogue_contract(
         activation_params=activation_params,
         with_norm=with_norm,
         alpha_source=alpha_source,
-        apply_topk_in_fc1=apply_topk_in_fc1,
+        apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
         check_graph=True,
     )
 
@@ -1741,7 +1755,7 @@ def test_nvfp4_cutedsl_mega_kernel_is_registered():
     assert kernel.kernel_name() == "sm100_nvfp4_nvfp4_bf16_cutedsl"
 
 
-def test_nvfp4_cutedsl_config_exposes_ikr_and_combine_dtype():
+def test_nvfp4_cutedsl_config_exposes_reducer_controls():
     """The TRT-LLM-import knobs are plumbed through the FI backend config."""
     from flashinfer.moe_ep import Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
@@ -1753,6 +1767,13 @@ def test_nvfp4_cutedsl_config_exposes_ikr_and_combine_dtype():
     )
     assert cfg.combine_dtype == "bf16"
     assert create_mega_kernel(cfg).kernel_name() == "sm100_nvfp4_nvfp4_bf16_cutedsl"
+
+    persistent_cfg = Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+        intermediate_size=128,
+        top_k=2,
+        use_persistent_finalize_kernel=True,
+    )
+    assert persistent_cfg.use_persistent_finalize_kernel
 
     cfg_q = Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
         intermediate_size=128,
@@ -1813,8 +1834,12 @@ def test_nvfp4_shim_config_rejects_invalid_ikr_combos():
             token_back_mode="reuse_dispatch_warps",
         )
     # ikr requires the topk score folded before fc2.
-    with pytest.raises(ValueError, match="apply_topk_in_fc1"):
-        MegaMoENvfp4Config(**base, in_kernel_fc2_reduce=True, apply_topk_in_fc1=False)
+    with pytest.raises(ValueError, match="apply_routing_weights_before_fc2"):
+        MegaMoENvfp4Config(
+            **base,
+            in_kernel_fc2_reduce=True,
+            apply_routing_weights_before_fc2=False,
+        )
     # ikr also needs the session's permission.
     with pytest.raises(ValueError, match="enable_in_kernel_fc2_reduce"):
         MegaMoENvfp4Config(

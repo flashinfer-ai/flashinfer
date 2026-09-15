@@ -138,6 +138,7 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
             gate_up_clamp=_resolve_gate_up_clamp(k),
             activation_clamp=k.activation_clamp,
             enable_in_kernel_fc2_reduce=k.enable_in_kernel_fc2_reduce,
+            use_persistent_finalize_kernel=k.use_persistent_finalize_kernel,
             knobs=k.knobs if isinstance(k.knobs, dict) else None,
         )
 

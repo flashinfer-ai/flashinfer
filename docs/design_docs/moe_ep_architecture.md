@@ -388,8 +388,9 @@ classDiagram
 **Mega weights:** with `preprocess_weights=True` (default), canonical bf16 or pre-quantized `MoEWeightPack` is transformed at init. With `preprocess_weights=False`, supply `MegaConfig.transformed_weights` (from `preprocess_*_mega_weights`).
 
 BF16×NVFP4 stages BF16 inputs and defaults to ordered FP32 combine inside MegaMoE.
-Routing weights apply after FC2 by default; `apply_topk_in_fc1=True` applies them
-before the BF16 FC1 handoff, with a different rounding contract.
+Routing weights apply after FC2 by default;
+`apply_routing_weights_before_fc2=True` applies them before the BF16 FC1
+handoff, with a different rounding contract.
 
 **Mega activations:** with `quantize_input=True` (default), bf16 `[T, hidden]` is quantized into symm workspace at forward. Non-bf16 with `quantize_input=True` raises `MoEEpConfigError`; use `quantize_input=False` and pre-quantized activations plus `MoEEpTensors.scales`.
 BF16-activation backends ignore `quantize_input` and copy BF16 inputs.

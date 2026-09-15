@@ -44,7 +44,7 @@ def make_workspace_config(
             activation=k.activation,
             situ_beta=k.situ_beta,
             situ_linear_beta=k.situ_linear_beta,
-            apply_topk_at_fc1=k.apply_topk_in_fc1,
+            apply_routing_weights_before_fc2=k.apply_routing_weights_before_fc2,
             max_sm_count=k.max_sm_count,
             **tuning,
         )

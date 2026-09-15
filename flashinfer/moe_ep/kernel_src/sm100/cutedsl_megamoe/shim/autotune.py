@@ -67,8 +67,8 @@ def nvfp4_candidates(
     the one-time compile cost) when ``enable_in_kernel_fc2_reduce`` adds the
     ikr axis; quantized ``combine_format`` values prune to the valid subset
     (dispatch-warp token-back only, no ikr).  Leave the permission unset when
-    the session cannot run ikr (``apply_topk_in_fc1=False``) or must stay
-    deterministic.
+    the session cannot run ikr (``apply_routing_weights_before_fc2=False``) or
+    must stay deterministic.
     """
     out: List[Dict[str, Any]] = []
     for tile in ((256, 128, 256), (256, 256, 256)):
@@ -380,7 +380,7 @@ def autotune_nvfp4_mega_moe(
         candidates = nvfp4_candidates(
             combine_format=COMBINE_FORMAT_NAMES[cfg.combine_dtype],
             enable_in_kernel_fc2_reduce=(
-                cfg.enable_in_kernel_fc2_reduce and cfg.apply_topk_in_fc1
+                cfg.enable_in_kernel_fc2_reduce and cfg.apply_routing_weights_before_fc2
             ),
         )
 

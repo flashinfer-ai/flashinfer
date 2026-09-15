@@ -137,7 +137,7 @@ rounding.
 For [K3 routed experts](https://huggingface.co/moonshotai/Kimi-K3/blob/main/config.json),
 use H=3584, I=3072, 896 total experts, top-k=16,
 `activation="situ"`, `situ_beta=4.0`, and `situ_linear_beta=25.0`.
-Set `apply_topk_in_fc1=False` to apply routing weights after FC2; the default
+Set `apply_routing_weights_before_fc2=False` to apply routing weights after FC2; the default
 applies them before intermediate quantization and can round differently.
 The geometry regression uses synthetic checkpoint-format tensors. It does
 not cover the model's latent projections, shared experts, or engine integration.

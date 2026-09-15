@@ -25,12 +25,12 @@ import tempfile
 import warnings
 from typing import Any, Dict, List, Optional, Tuple
 
-_CACHE_VERSION = 1
+_CACHE_VERSION = 2
 _KEY_FIELDS = (
     "backend_revision",
     "kernel_variant",
     "allow_nondeterministic",
-    "apply_topk_at_fc1",
+    "apply_routing_weights_before_fc2",
     "device",
     "dtype",
     "world_size",
@@ -123,7 +123,7 @@ def lookup_knobs(
     kernel_variant: str = "inference",
     device: Optional[str] = None,
     allow_nondeterministic: bool = False,
-    apply_topk_at_fc1: bool = True,
+    apply_routing_weights_before_fc2: bool = True,
     activation: str = "swiglu",
     situ_beta: Optional[float] = None,
     situ_linear_beta: Optional[float] = None,
@@ -137,7 +137,7 @@ def lookup_knobs(
         backend_revision="sm107-block-scaled-1667b47a-runtime-options-v1",
         kernel_variant=kernel_variant,
         allow_nondeterministic=allow_nondeterministic,
-        apply_topk_at_fc1=apply_topk_at_fc1,
+        apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
         activation=activation,
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
@@ -187,7 +187,7 @@ def record_knobs(
     p50_us: Optional[float] = None,
     source: str = "autotune",
     allow_nondeterministic: bool = False,
-    apply_topk_at_fc1: bool = True,
+    apply_routing_weights_before_fc2: bool = True,
     activation: str = "swiglu",
     situ_beta: Optional[float] = None,
     situ_linear_beta: Optional[float] = None,
@@ -209,7 +209,7 @@ def record_knobs(
         backend_revision="sm107-block-scaled-1667b47a-runtime-options-v1",
         kernel_variant=kernel_variant,
         allow_nondeterministic=allow_nondeterministic,
-        apply_topk_at_fc1=apply_topk_at_fc1,
+        apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
         activation=activation,
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
@@ -324,7 +324,7 @@ def resolve_knobs(
     combine_dtype: str = "bf16",
     kernel_variant: str = "inference",
     allow_nondeterministic: bool = False,
-    apply_topk_at_fc1: bool = True,
+    apply_routing_weights_before_fc2: bool = True,
     activation: str = "swiglu",
     situ_beta: Optional[float] = None,
     situ_linear_beta: Optional[float] = None,
@@ -345,7 +345,7 @@ def resolve_knobs(
         combine_dtype=combine_dtype,
         kernel_variant=kernel_variant,
         allow_nondeterministic=allow_nondeterministic,
-        apply_topk_at_fc1=apply_topk_at_fc1,
+        apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
         activation=activation,
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,

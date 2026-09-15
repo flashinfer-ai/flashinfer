@@ -6,16 +6,12 @@ replace, what to audit) lives in `SKILL.md`.
 
 ## Upstream
 
-- **Vendored commit**: not recorded — the current `src/` drop was taken
-  2026-07-13, before this VENDOR.md existed (it landed in flashinfer via
-  PR #3980). The next full re-sync MUST pin the upstream SHA here. Until
-  then the only pinned points are the two files synced ahead of the drop
-  (see pending diffs below, `50117315d`).
-- **Last synced**: 2026-07-13 (full drop); 2026-08-10 partial re-sync of
-  `inputs_process.py` + `host_utils.py` (see pending diffs).
-- **Vendored subset**: the four kernel packages only (`common/`, `src/`,
-  `moe_mxfp8_glu/`, `moe_nvfp4_swapab/`) under `src/` — no repo scaffolding
-  (`ci/`, `tester/`, `tests/`, `scripts/`, `pyproject.toml`, …).
+- **Vendored commit**: `fa662f345980f75776ae0c85d2e5c188918ded26`
+- **Last synced**: 2026-09-29
+- **Vendored subset**: the six kernel packages only (`common/`, `src/`,
+  `moe_bf16_glu/`, `moe_mxfp8_glu/`, `moe_mxfp8_bf16_glu/`,
+  `moe_nvfp4_swapab/`) under `src/` — no repo scaffolding (`ci/`, `tester/`,
+  `tests/`, `scripts/`, `pyproject.toml`, …).
 
 ## Policy
 
@@ -29,35 +25,22 @@ replace, what to audit) lives in `SKILL.md`.
 
 ## Pending local diffs vs upstream
 
-- `src/src/inputs_process.py` is synced **ahead** of the recorded drop, to
-  upstream commit `50117315dbcd2ffb1e8c1c4dab4be9b42cad24ab`
-  (`src/inputs_process.py` in the internal repo), taken 2026-08-10: the kernel team's fix for the fused activation-quant
-  staging breaking on CuTe-DSL 4.7 (mxfp8 path reworked so each lane owns one
-  contiguous 16-byte fp8 store, lane pairs reduce the 32-element block amax
-  via shuffle; plus a hidden-size row-alignment guard in `__init__`).
-  ONLY this one file is ahead: at that commit upstream also renamed
-  `common/host_utils.py`'s `mxfp8_quantize_per_block_32` to `..._row`, and
-  pulling that file forward breaks the rest of the recorded drop (shim
-  `kernel_helpers`, `mega_reference*.py` — the rename ripples through
-  `mega_reference.py`'s changed return signature into the runners). Known
-  cost: the harness at the bottom of `inputs_process.py`
-  (`python -m src.inputs_process`) fails its **mxfp8** case with an
-  ImportError against the recorded-drop `host_utils` — the nvfp4 cases and
-  every shim/kernel path are unaffected (the kernel code imports
-  `host_utils` nowhere). The harness was validated green (3/3 cases, dsl
-  4.6.1 + 4.7.0) with the newer `host_utils` before this was understood.
-  Resolves at the next full re-sync once the tree moves past that commit.
-- `src/moe_nvfp4_swapab/kernel_fc12.py` carries the flashinfer-upstream
-  singleton-expert TMA-modes fix (flashinfer-ai/flashinfer `4fbac49f`,
-  PR #4296, applied 2026-08-12 during the TOT merge): the compact expert
-  mode of singleton weight tensors stays dynamic so the runtime expert
-  extent remains visible in FC1/FC2 weight TMA descriptors. Confirm the
-  kernel-team repo has an equivalent before the next re-sync.
-- `src/moe_nvfp4_swapab/runner_common.py` carries a local
-  `_check_triton_flat_index` guard (added for PR #4113 review) on the
-  int32-indexed Triton helpers (`_rcp_approx_kernel`, `_swiglu_pair_kernel`);
-  `_pack_fp4_kernel` is exempt because it widens its flat index to int64 for
-  the > 2**31-element combine round-trip. Send upstream on the next re-sync.
+Compared with the reference upstream branch, the tracked differences are:
+
+- **Persistent top-k reduction:** upstream MR !63 commit
+  `4d51560753607a5b33ada5eb2ae913b0023dae3b` carries the one-cursor
+  fixed-grid scheduler. It is integrated behind `topk_reduce_persistent` in
+  `src/moe_nvfp4_swapab/megamoe_kernel.py` and
+  `src/moe_mxfp8_glu/megamoe_kernel_mxfp8.py`, and
+  `src/moe_mxfp8_bf16_glu/megamoe_kernel_mxfp8_bf16.py`; all integrations
+  honor the vendored `skip_topk_reduce` path.
+- **Activation controls:** `src/moe_nvfp4_swapab/{epilogue_refactor,kernel_fc12,megamoe_kernel}.py`
+  retain FlashInfer's custom SwiGLU alpha/beta parameters and allow
+  `situ_linear_beta=None`; upstream implements standard SwiGLU and requires
+  both positive SiTU beta values.
+- **Vendored-subset imports:** `src/moe_mxfp8_glu/runner_col_requant.py`
+  uses package-local helpers and lazily imports its checker so importing the
+  runner does not require omitted test scaffolding.
 
 ## Related trees
 

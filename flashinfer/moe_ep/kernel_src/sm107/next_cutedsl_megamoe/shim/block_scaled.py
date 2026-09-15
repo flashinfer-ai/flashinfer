@@ -145,7 +145,7 @@ class Sm107BlockScaledMoeConfig:
     gate_up_clamp: Optional[float] = None
     reduce_topk_in_kernel: bool = False
     token_back_mode: Sm107TokenBackMode = "epi_warps"
-    apply_topk_at_fc1: bool = True
+    apply_routing_weights_before_fc2: bool = True
     max_sm_count: Optional[int] = None
     activation: Literal["swiglu", "situ"] = "swiglu"
     situ_beta: Optional[float] = None
@@ -199,7 +199,11 @@ class Sm107BlockScaledMoeConfig:
                 raise ValueError(f"{name} must be a positive Python integer.")
         if type(self.rank) is not int or not (0 <= self.rank < self.world_size):
             raise ValueError(f"invalid rank/world_size {self.rank}/{self.world_size}.")
-        for name in ("fc2_use_bulk", "reduce_topk_in_kernel", "apply_topk_at_fc1"):
+        for name in (
+            "fc2_use_bulk",
+            "reduce_topk_in_kernel",
+            "apply_routing_weights_before_fc2",
+        ):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{name} must be a Python bool.")
         if self.num_total_experts > 16384:
@@ -355,10 +359,11 @@ class Sm107BlockScaledMoeConfig:
                 f"fc2_tma_stages must be in [1, {tiler[1] // 64}] for tiler N "
                 f"{tiler[1]}."
             )
-        if self.reduce_topk_in_kernel and not self.apply_topk_at_fc1:
+        if self.reduce_topk_in_kernel and not self.apply_routing_weights_before_fc2:
             raise ValueError(
-                "reduce_topk_in_kernel requires apply_topk_at_fc1=True (the "
-                "in-kernel reduce red-adds already-weighted terms)."
+                "reduce_topk_in_kernel requires "
+                "apply_routing_weights_before_fc2=True (the in-kernel reduce "
+                "red-adds already-weighted terms)."
             )
 
         if self.kernel_variant == "genphase":
@@ -614,7 +619,7 @@ class Sm107BlockScaledSymmBuffer:
                 "topk": cfg.num_topk,
                 "topk_index_dtype": cutlass.Int32,
                 "max_tokens_per_rank": cfg.padded_tokens_per_rank,
-                "apply_topk_at_fc1": cfg.apply_topk_at_fc1,
+                "apply_topk_at_fc1": cfg.apply_routing_weights_before_fc2,
             }
         )
         impl_fields = {
@@ -799,7 +804,7 @@ def get_symm_buffer_for_sm107_block_scaled_mega_moe(
     gate_up_clamp: Optional[float] = None,
     reduce_topk_in_kernel: bool = False,
     token_back_mode: Sm107TokenBackMode = "epi_warps",
-    apply_topk_at_fc1: bool = True,
+    apply_routing_weights_before_fc2: bool = True,
     max_sm_count: Optional[int] = None,
     activation: Literal["swiglu", "situ"] = "swiglu",
     situ_beta: Optional[float] = None,
@@ -836,7 +841,7 @@ def get_symm_buffer_for_sm107_block_scaled_mega_moe(
         gate_up_clamp=gate_up_clamp,
         reduce_topk_in_kernel=reduce_topk_in_kernel,
         token_back_mode=token_back_mode,
-        apply_topk_at_fc1=apply_topk_at_fc1,
+        apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
         max_sm_count=max_sm_count,
         activation=activation,
         situ_beta=situ_beta,

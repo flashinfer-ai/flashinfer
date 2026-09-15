@@ -155,6 +155,7 @@ def _megakernel_config(
     problem: dict,
     *,
     in_kernel_fc2_reduce: bool = False,
+    use_persistent_finalize_kernel: bool = False,
     knobs: dict | None = None,
 ):
     from flashinfer.moe_ep import Sm100_Bf16_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
@@ -166,6 +167,7 @@ def _megakernel_config(
         gate_up_clamp=problem["gate_up_clamp"],
         fast_math=problem["fast_math"],
         enable_in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+        use_persistent_finalize_kernel=use_persistent_finalize_kernel,
         knobs=knobs,
     )
 
@@ -174,6 +176,7 @@ def _reference_mixed_mega_moe(
     problem: dict,
     *,
     in_kernel_fc2_reduce: bool = False,
+    use_persistent_finalize_kernel: bool = False,
     knobs: dict | None = None,
 ):
     import torch
@@ -204,6 +207,7 @@ def _reference_mixed_mega_moe(
         kind=problem["kind"],
         gate_up_clamp=problem["gate_up_clamp"],
         enable_in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+        use_persistent_finalize_kernel=use_persistent_finalize_kernel,
         knobs=knobs,
     )
     num_tokens = problem["num_tokens"]
@@ -245,6 +249,7 @@ def _run_mega_layer(
     world_size,
     *,
     in_kernel_fc2_reduce: bool = False,
+    use_persistent_finalize_kernel: bool = False,
     knobs: dict | None = None,
 ):
     import torch
@@ -269,7 +274,10 @@ def _run_mega_layer(
     problem = _mega_problem(rank, world_size)
     kernel = create_mega_kernel(
         _megakernel_config(
-            problem, in_kernel_fc2_reduce=in_kernel_fc2_reduce, knobs=knobs
+            problem,
+            in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+            use_persistent_finalize_kernel=use_persistent_finalize_kernel,
+            knobs=knobs,
         )
     )
     runtime = bootstrap_moe_ep_runtime(
@@ -288,7 +296,10 @@ def _run_mega_layer(
             weights=MoEWeightPack(w13=problem["w13"], w2=problem["w2"]),
             backend=MegaConfig(
                 megakernel=_megakernel_config(
-                    problem, in_kernel_fc2_reduce=in_kernel_fc2_reduce, knobs=knobs
+                    problem,
+                    in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+                    use_persistent_finalize_kernel=use_persistent_finalize_kernel,
+                    knobs=knobs,
                 ),
                 preprocess_weights=True,
             ),
@@ -304,7 +315,10 @@ def _run_mega_layer(
         torch.cuda.synchronize()
         dist.barrier()
         y_ref = _reference_mixed_mega_moe(
-            problem, in_kernel_fc2_reduce=in_kernel_fc2_reduce, knobs=knobs
+            problem,
+            in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+            use_persistent_finalize_kernel=use_persistent_finalize_kernel,
+            knobs=knobs,
         )
         dist.barrier()
         assert y_layer.shape == (problem["num_tokens"], problem["hidden"])
@@ -426,7 +440,7 @@ def _run_mega_torch_oracle(rank, world_size, *, in_kernel_fc2_reduce: bool = Fal
                 ),
                 ref_compute_graph="deepgemm",
                 gate_up_clamp=problem["gate_up_clamp"],
-                apply_topk_in_fc1=True,
+                apply_routing_weights_before_fc2=True,
             )
             yk = y_kernel.to(torch.float32)
             y_ref = combine_ref[rank].to(torch.float32).sum(dim=1)
@@ -456,6 +470,25 @@ def test_moe_ep_bf16_mxfp8_cutedsl_mega_layer_matches_reference():
         pytest.skip("needs >=4 ranks")
     rank = _run_mega_layer(rank, world_size)
     print(f"rank {rank}: sm100_bf16_mxfp8_bf16_cutedsl mega layer matches reference")
+
+
+@cuda_13_required
+@pytest.mark.gpu_4
+@pytest.mark.arch_blackwell
+def test_moe_ep_bf16_mxfp8_cutedsl_mega_layer_persistent_finalize():
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size < 4:
+        pytest.skip("needs >=4 ranks")
+    rank = _run_mega_layer(
+        rank,
+        world_size,
+        use_persistent_finalize_kernel=True,
+    )
+    print(
+        f"rank {rank}: sm100_bf16_mxfp8_bf16_cutedsl mega layer "
+        "(persistent finalize) matches reference"
+    )
 
 
 @cuda_13_required
