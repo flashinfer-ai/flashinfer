@@ -2751,14 +2751,14 @@ def _resolve_q_token_kv_block_sparse_decode_config(
         "tile_size_kv": _sparse_policy.TILE_SIZE_KV,
         "head_dim_per_stage_kv": launch.head_dim_per_stage_kv,
         "num_insts_kv": launch.num_insts_kv,
-        "use_persistent_scheduler": False,
+        "use_persistent_scheduler": launch.use_persistent_scheduler,
         "correction_num_warps": 4,
         "mma_warp_idx": 12,
-        # Direct G1 resolves both indexer and storage-page indirections in
-        # the main kernel. Use the two free slots beside MMA warp 12 to
-        # stage independent KV tiles concurrently, without enlarging the CTA.
-        # This producer count is independent of the one/two-instance MMA cadence.
-        "page_offsets_warp_idx": 14 if seq_len_q == 1 else 13,
+        # CLC uses the control slot beside MMA; page producers occupy the
+        # remaining slots. TMA issuers keep their own complete warp groups.
+        "scheduler_warp_idx": 13,
+        "clc_load_warp_idx": 16,
+        "page_offsets_warp_idx": 14,
         "page_offsets_num_warps": 2 if seq_len_q == 1 else 1,
         "load_warp_idx": 16,
         # FP8's predicated TMA helper constructs coordinates in every load

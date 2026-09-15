@@ -11,7 +11,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shared host-only sparse grouping, TileQ and split-KV decisions."""
+"""Host-only sparse policy shared by group recommendation and launch planning.
+
+Reuse common FMHA geometry, split and scheduler selection. Explicit G remains
+caller-owned; only the recommendation evaluates alternative groups.
+"""
 
 from dataclasses import dataclass
 
@@ -30,6 +34,7 @@ class SparseLaunch:
     splits_kv: int
     head_dim_per_stage_kv: int
     o_stages: int
+    use_persistent_scheduler: bool
 
     @property
     def use_keeps_mma_ab(self) -> bool:
@@ -55,6 +60,7 @@ def select_sparse_launch(
     """
     from .kernels.fmha_decode.fmha_decode_config import (
         MIN_LOOP_ITERS_PER_SPLIT,
+        _select_auto_launch_mode,
         enumerate_grouped_q_mma_candidates,
         select_splits_kv,
     )
@@ -117,6 +123,18 @@ def select_sparse_launch(
         splits_kv=splits,
         head_dim_per_stage_kv=128 if head_dim == 256 else 0,
         o_stages=1 if head_dim == 256 and candidate.variant == "keeps_mma_ab" else 2,
+        use_persistent_scheduler=(
+            splits == 1
+            and _select_auto_launch_mode(
+                batch_size=num_routes,
+                num_heads_kv=num_kv_heads,
+                seq_len_kv=work_tokens,
+                tile_size_kv=TILE_SIZE_KV,
+                split_kv=False,
+                service_capacity=multi_processor_count,
+            )
+            == "persistent"
+        ),
     )
 
 

@@ -109,6 +109,13 @@ IDs, with no full-context bitmap or scan. Shared patterns prepare one row per
 group; independent patterns prepare one per group and KV head. G1 resolves
 selected blocks and the causal tail inside attention, without a metadata launch.
 
+Nonsplit sparse grids larger than one service wave use the common CLC
+persistent scheduler. Each work item resolves its own request, query group and
+KV-head metadata. Page producers stage locators with `cp.async`; grouped
+membership storage is retained until all softmax consumers finish the item.
+The same paths support fixed and packed Q, including partial and empty packed
+groups. `split_kv=False` disables splitting, not persistent scheduling.
+
 The production specialization supports D64/D128/D256, matching FP16/BF16
 Q/K/V/output, or FP8 E4M3 Q/K/V with FP16/BF16 output. It is causal and
 non-windowed, uses KV128 for Q1--Q8, and requires
@@ -205,8 +212,6 @@ pytest -q \
   tests/attention/test_attention_ts_context.py \
   tests/attention/test_attention_ts_decode.py \
   tests/attention/test_attention_ts_q_token_kv_block_sparse_metadata.py \
-  tests/attention/test_attention_ts_sparse_shapes.py \
-  tests/attention/test_attention_ts_sparse_patterns.py \
   tests/attention/test_attention_ts_block_sparse.py \
   tests/attention/test_attention_ts_mask.py \
   tests/attention/test_attention_ts_mla_decode.py

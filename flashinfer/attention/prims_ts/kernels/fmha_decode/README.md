@@ -7,13 +7,13 @@ packed variable-length queries over a paged K/V cache.
 
 The public API describes attention semantics and cache metadata. Tile shapes
 and launch policy are selected internally for the problem and GPU. Fixed-Q
-plans may use direct, persistent, or split-KV execution. Packed-Q and
-sliding-window plans remain nonsplit, but may use direct or CLC-persistent
-execution. There is no public scheduler or tuning knob and no fallback to
-another attention backend.
+and packed-Q plans may use direct, persistent, or split-KV execution according
+to the caller's split permission. Sliding-window plans remain nonsplit, but
+may use direct or CLC-persistent execution. There is no public scheduler or
+tuning knob and no fallback to another attention backend.
 
 For eligible nonsplit grids with more than one resident wave, cluster launch
-control (CLC) assigns work to resident CTAs. Underfilled fixed-Q grids may
+control (CLC) assigns work to resident CTAs. Underfilled fixed- or packed-Q grids may
 instead split the K/V sequence and reduce partial outputs; other grids use the
 direct static launch.
 

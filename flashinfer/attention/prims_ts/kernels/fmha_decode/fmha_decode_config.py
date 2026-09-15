@@ -1425,16 +1425,11 @@ class FmhaDecodeConfig:
             raise ValueError(
                 "paged-KV staging supports 1, 2, 4, 8, 16, or 32 pages per KV tile"
             )
-        dual_q1_page_staging = (
-            self.page_offsets_num_warps == 2
-            and self.uses_q_token_kv_block_sparse_page_route
-            and self.max_seq_len_q == 1
-            and not self.use_persistent_scheduler
-        )
-        if self.page_offsets_num_warps != 1 and not dual_q1_page_staging:
+        max_page_producers = 2 if self.uses_q_token_kv_block_sparse_page_route else 1
+        if not 1 <= self.page_offsets_num_warps <= max_page_producers:
             raise ValueError(
                 "paged-KV page-offset staging requires one producer warp, "
-                "or two for nonpersistent Q1 sparse routes"
+                "or up to two for QToken-KvBlock-Sparse-Attention"
             )
 
     def validate_block_sparse_profile(self, *, heads_q_per_kv: int) -> None:
@@ -2052,7 +2047,6 @@ class FmhaDecodeConfig:
             and self.uses_q_token_kv_block_sparse_page_route
             and self.mask_type == CAUSAL
             and not self.use_cluster_smem_reduction
-            and not self.use_persistent_scheduler
             and not self.use_attention_sinks
         )
         kv128_profile = (
@@ -2064,9 +2058,9 @@ class FmhaDecodeConfig:
         )
         if not (common_profile and kv128_profile):
             raise ValueError(
-                "QToken-KvBlock-Sparse-Attention grouped KeepsMmaAb requires an encoded page-4 Q group "
+                "QToken-KvBlock-Sparse-Attention grouped KeepsMmaAb requires an encoded sparse Q group "
                 "that fits Q64/Q128, a supported D64/D128/D256 KV128 recipe, "
-                "and a supported causal direct or split launch"
+                "and a supported causal direct, persistent or split launch"
             )
 
     @property
@@ -2931,6 +2925,7 @@ def _select_auto_launch_mode(
     persistent_min_waves: int = 1,
     persistent_min_tiles_per_cta: int = 1,
     split_kv: bool = True,
+    service_capacity: int | None = None,
 ) -> str:
     """Pick the launch mode that best matches the kernel's parallelism budget.
 
@@ -2964,8 +2959,9 @@ def _select_auto_launch_mode(
     """
     if seq_len_kv <= 0 or batch_size <= 0 or num_heads_kv <= 0 or num_q_tiles <= 0:
         return "static"
-    hardware_info = utils.HardwareInfo()
-    sm_count = hardware_info.get_device_multiprocessor_count()
+    sm_count = service_capacity
+    if sm_count is None:
+        sm_count = utils.HardwareInfo().get_device_multiprocessor_count()
     sm_count = FALLBACK_SM_COUNT_B200 if sm_count <= 0 else sm_count
     ctas = batch_size * num_heads_kv * num_q_tiles
     waves = ctas / sm_count

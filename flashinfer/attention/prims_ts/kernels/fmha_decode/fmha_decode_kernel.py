@@ -98,6 +98,7 @@ from .fmha_decode_resources.helpers_kv_tile_idx import _runtime_active_splits_kv
 from .fmha_decode_tasks import (
     PackedDecodeWorkQueue,
     ScheduleTokenThrottleResource,
+    SparseMembershipLifetimeResource,
     _prefetch_prepared_sparse_row,
     create_block_sparse_load_tasks_per_inst,
     create_correction_task,
@@ -867,6 +868,30 @@ def _build_decode_gen_schedule(
             ),
             name="schedule_token_throttle",
         )
+    membership_lifetime = None
+    if use_clc_dynamic and cfg.uses_q_token_kv_block_sparse_page_membership:
+        # Page IDs are consumed by Load, but membership bytes are consumed by
+        # Softmax. Do not overwrite the next work item's membership row until
+        # every score stream has finished reading the current one.
+        membership_lifetime = SparseMembershipLifetimeResource(
+            name="sparseMembershipLifetime",
+            pipeline_config=PipelineConfig(
+                num_stages=1,
+                num_bytes=0,
+                producer_group=page_offsets_grp,
+                consumer_group=pipeline.CooperativeGroup(
+                    Agent.Thread,
+                    WARP_SIZE
+                    * (
+                        cfg.softmax0_num_warps
+                        + (0 if use_one_inst_qkv else cfg.softmax1_num_warps)
+                    ),
+                ),
+                pipeline_type=PipelineType.AsyncAsync,
+                cta_layout_vmnk=cta_layout,
+                advance_on_wait=True,
+            ),
+        )
     smem_q = SmemQResource(
         pipeline_config=smem_q_cfg,
         cfg=cfg,
@@ -894,6 +919,7 @@ def _build_decode_gen_schedule(
             stage_page_ids_per_tile=stage_page_ids_per_tile,
             page_idx_kv=page_idx_kv,
             page_table_stride=page_table_stride,
+            num_heads_kv=num_heads_kv,
             q_token_kv_block_sparse_page_memberships=q_token_kv_block_sparse_page_memberships,
             q_token_kv_block_sparse_page_membership_stride=q_token_kv_block_sparse_page_membership_stride,
             seqlens_kv=kv_seqlens,
@@ -916,6 +942,7 @@ def _build_decode_gen_schedule(
                 stage_page_ids_per_tile=stage_page_ids_per_tile,
                 page_idx_kv=page_idx_kv,
                 page_table_stride=page_table_stride,
+                num_heads_kv=num_heads_kv,
                 q_token_kv_block_sparse_page_memberships=q_token_kv_block_sparse_page_memberships,
                 q_token_kv_block_sparse_page_membership_stride=q_token_kv_block_sparse_page_membership_stride,
                 seqlens_kv=kv_seqlens,
@@ -1395,6 +1422,7 @@ def _build_decode_gen_schedule(
                 domain_bias=0,
                 warp_idx=page_offsets_warp_idx,
                 num_warps=cfg.page_offsets_num_warps,
+                membership_lifetime=membership_lifetime,
                 block_table_capacity=page_table_capacity
                 if use_native_paged_kv
                 else None,
@@ -1414,6 +1442,7 @@ def _build_decode_gen_schedule(
                 domain_bias=0,
                 warp_idx=page_offsets_warp_idx,
                 num_warps=cfg.page_offsets_num_warps,
+                membership_lifetime=membership_lifetime,
                 block_table_capacity=page_table_capacity
                 if use_native_paged_kv
                 else None,
@@ -1480,6 +1509,7 @@ def _build_decode_gen_schedule(
         cfg,
         domain=softmax_domain,
         domain_bias=1,
+        membership_lifetime=membership_lifetime,
         **task_runtime_kwargs,
     )
     softmax1_task = None
@@ -1495,6 +1525,7 @@ def _build_decode_gen_schedule(
             cfg,
             domain=softmax_domain,
             domain_bias=1,
+            membership_lifetime=membership_lifetime,
             **task_runtime_kwargs,
         )
     if use_one_inst_qkv:
@@ -1668,6 +1699,13 @@ def _build_decode_gen_schedule(
         resource_dependency_graph[smem_p1].append(sparse_softmax_metadata1)
         resource_dependency_graph[tmem_softmax_local1].append(sparse_softmax_metadata1)
         resource_dependency_graph[tmem_softmax_global1].append(sparse_softmax_metadata1)
+    if membership_lifetime is not None:
+        resource_dependency_graph[membership_lifetime] = []
+        for resource in (smem_p0, tmem_softmax_local0, tmem_softmax_global0):
+            resource_dependency_graph[resource].append(membership_lifetime)
+        if not use_one_inst_qkv:
+            for resource in (smem_p1, tmem_softmax_local1, tmem_softmax_global1):
+                resource_dependency_graph[resource].append(membership_lifetime)
     if tmem_stats_done0 is not None:
         resource_dependency_graph[tmem_s0].append(tmem_stats_done0)
         resource_dependency_graph[tmem_stats_done0] = [tmem_softmax_local0]
@@ -1772,6 +1810,8 @@ def _build_decode_gen_schedule(
         smem_allocator.add_resource(work_queue)
     if schedule_token_throttle is not None:
         smem_allocator.add_resource(schedule_token_throttle)
+    if membership_lifetime is not None:
+        smem_allocator.add_resource(membership_lifetime)
     smem_allocator.add_resource(smem_q)
     if smem_page_offsets is not None:
         smem_allocator.add_resource(smem_page_offsets)
@@ -2679,7 +2719,9 @@ def decode_gen_kernel(
     """Dispatch one static Q/split tile and drain padded launch slots safely."""
     q_group_cta_idx, h_k_idx, b_idx = cute.arch.block_idx()
     if cutlass.const_expr(
-        cfg.use_q_token_kv_block_sparse_route and not cfg.shares_sparse_pattern
+        cfg.use_q_token_kv_block_sparse_route
+        and not cfg.shares_sparse_pattern
+        and not cfg.use_persistent_scheduler
     ):
         if cutlass.const_expr(isinstance(g_page_idx_kv, DirectSparseMetadataView)):
             g_page_idx_kv = g_page_idx_kv.with_head(h_k_idx)
