@@ -2958,10 +2958,18 @@ _DSV4_PREFILL_DUAL_HEADS = [8, 16, 32, 64, 128]
 
 # (num_heads, topk, extra_topk, extra_pbs). topk=512: DeepSeek V4 Vision
 # primary candidate set (H=32/64 shards, both extra-cache page layouts).
+# (512, 128) / (512, 256): DeepSeek-V4.1's hierarchical candidate pool, which
+# pages its extra KV cache at 128 and 256 tokens.
 _DSV4_PREFILL_DUAL_CONFIGS = [
     (num_heads, 128, extra_topk, extra_pbs)
     for num_heads in _DSV4_PREFILL_DUAL_HEADS
-    for extra_topk, extra_pbs in [(128, 64), (512, 64), (512, 2)]
+    for extra_topk, extra_pbs in [
+        (128, 64),
+        (512, 64),
+        (512, 2),
+        (512, 128),
+        (512, 256),
+    ]
 ] + [
     (32, 512, 512, 64),
     (32, 512, 128, 2),
@@ -3129,10 +3137,15 @@ def test_sparse_mla_sm120_prefill_dsv4_dual_accepts_singleton_s_q_indices() -> N
 
 @pytest.mark.parametrize("num_heads", [8, 64])
 @pytest.mark.parametrize("extra_topk_len", [0, 128, 768])
+@pytest.mark.parametrize("extra_pbs", [64, 128, 256])
 def test_sparse_mla_sm120_prefill_dsv4_dual_extra_topk_length_truncation(
-    num_heads: int, extra_topk_len: int
+    num_heads: int, extra_topk_len: int, extra_pbs: int
 ) -> None:
-    """DSv4 dual-cache prefill honors extra_topk_length."""
+    """DSv4 dual-cache prefill honors extra_topk_length.
+
+    The length-aware shapes bypass the full-tile dispatcher, so every extra
+    cache page size needs its own coverage here.
+    """
     torch.manual_seed(0)
     device = torch.device("cuda")
     num_tokens = 128
@@ -3140,7 +3153,6 @@ def test_sparse_mla_sm120_prefill_dsv4_dual_extra_topk_length_truncation(
     topk = 128
     main_pbs = 64
     extra_topk = 512
-    extra_pbs = 64
 
     main_num_blocks = 64
     main_s_kv = main_num_blocks * main_pbs
