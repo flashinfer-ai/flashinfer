@@ -307,6 +307,8 @@ def test_blackwell_prefill_workspace_not_in_compile_cache():
 
     # White-box: no workspace tensors may live in the compile-cache value.
     cache = prefill_mod._get_compiled_cache(
+        prefill_mod.gdn_device_target(device).compile_key,
+        prefill_mod.get_num_sm(device),
         str(x1["q"].dtype),
         str(x1["initial_state"].dtype),
         HQ,
