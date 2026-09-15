@@ -45,6 +45,8 @@ FlashInfer is a GPU kernel library for LLM serving that uses **JIT (Just-In-Time
 | Prims-TS debug checks / task-manager verify | `export FLASHINFER_PRIMS_TS_DEBUG_CHECKS=1` |
 | Override Prims-TS CuTe-DSL compile options | `export FLASHINFER_PRIMS_TS_COMPILE_OPTIONS="--opt-level 2"` |
 | Configure NVFP4 4over6 quantization (preferred over the env vars) | `nvfp4_quantize(..., nvfp4_4over6=NVFP44Over6Config(e4m3_max=256))` |
+| Declare expected mean K/V length for PrimsTS MLA balanced auto-routing | `export FLASHINFER_MLA_EXPECTED_MEAN_SEQ_LEN=<tokens>` |
+| Declare expected maximum K/V length for PrimsTS MLA balanced auto-routing | `export FLASHINFER_MLA_EXPECTED_MAX_SEQ_LEN=<tokens>` |
 
 The minimum Python version used by CI and build tooling is defined in
 `.python-version`. CI Docker images use a stable Conda environment name and

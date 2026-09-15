@@ -289,6 +289,9 @@ class MlaWorkQueue(WorkQueue):
     cache_seqs: Any = None  # cache_seqs tensor for k_tile_count
     split_kv: Any = None  # maximum split slots in the launch/workspace
     block_split_kvs: Any = None  # optional per-batch split caps
+    balanced_work_descriptors: Any = None
+    balanced_partition_offsets: Any = None
+    use_balanced_scheduler: cutlass.Constexpr[bool] = False
     is_var_split_kv: cutlass.Constexpr[bool] = False
     cfg: Any = None  # MlaDecodeConfig for tile sizes
     static_split_kv: cutlass.Constexpr = None
@@ -310,6 +313,9 @@ class MlaWorkQueue(WorkQueue):
         cache_seqs=None,
         split_kv=None,
         block_split_kvs=None,
+        balanced_work_descriptors=None,
+        balanced_partition_offsets=None,
+        use_balanced_scheduler=False,
         is_var_split_kv=False,
         cfg=None,
         static_split_kv=None,
@@ -324,6 +330,7 @@ class MlaWorkQueue(WorkQueue):
         **kwargs,
     ):
         self.use_clc_dynamic = use_clc_dynamic
+        self.use_balanced_scheduler = use_balanced_scheduler
         if use_clc_dynamic:
             WorkQueue.__init__(
                 self,
@@ -338,6 +345,8 @@ class MlaWorkQueue(WorkQueue):
         self.cache_seqs = cache_seqs
         self.split_kv = split_kv
         self.block_split_kvs = block_split_kvs
+        self.balanced_work_descriptors = balanced_work_descriptors
+        self.balanced_partition_offsets = balanced_partition_offsets
         self.is_var_split_kv = is_var_split_kv
         self.cfg = cfg
         self.static_split_kv = static_split_kv
@@ -527,6 +536,93 @@ class MlaWorkQueue(WorkQueue):
         return work_tile.k_tile_count <= Int32(0)
 
     @cute.jit
+    def _work_tile_from_balanced_descriptor(
+        self,
+        descriptor_idx,
+        seq_q_idx,
+        is_valid,
+    ):
+        """Decode one compact descriptor into the ordinary MLA tile value."""
+
+        cluster_width = Int32(self.tile_sched_params.cluster_shape_mnk[0])
+        cluster_idx = cute.arch.block_idx()[0] % cluster_width
+        descriptor_capacity = Int32(self.balanced_work_descriptors.shape[0])
+        safe_descriptor_idx = cute.math.min(
+            cute.math.max(Int32(descriptor_idx), Int32(0)),
+            descriptor_capacity - Int32(1),
+        )
+        request_idx = Int32(
+            self.balanced_work_descriptors[safe_descriptor_idx, Int32(0)]
+        )
+        request_idx = cute.math.min(
+            cute.math.max(request_idx, Int32(0)),
+            self.tile_sched_params.problem_shape_b - Int32(1),
+        )
+        k_tile_start = cute.math.max(
+            Int32(self.balanced_work_descriptors[safe_descriptor_idx, Int32(1)]),
+            Int32(0),
+        )
+        k_tile_end = cute.math.max(
+            Int32(self.balanced_work_descriptors[safe_descriptor_idx, Int32(2)]),
+            k_tile_start,
+        )
+        descriptor_tile_count = k_tile_end - k_tile_start
+        split_info = Int32(
+            self.balanced_work_descriptors[safe_descriptor_idx, Int32(3)]
+        )
+        is_split = split_info & Int32(1)
+        partial_idx = is_split * ((split_info >> Int32(1)) & Int32(0xFFF)) - (
+            Int32(1) - is_split
+        )
+
+        # Compute only the shared mask-visible K extent here.  Calling the
+        # rectangular split helper would also read block_split_kvs, which is
+        # deliberately absent from the packed balanced ABI.
+        K = Int32(self.cache_seqs[request_idx])
+        _, q_len = query_batch_bounds(
+            self.cu_seqlens_q,
+            request_idx,
+            self.logical_seq_len_q,
+        )
+        query_tile_has_rows = runtime_flat_query_tile_has_rows(
+            seq_q_idx,
+            self.cfg.mma_qk_tiler[0],
+            self.logical_num_heads_q,
+            self.logical_seq_len_q,
+            self.cu_seqlens_q,
+            request_idx,
+        )
+        if cutlass.const_expr(
+            self.cfg.mask_type == MaskType.CAUSAL.value and self.logical_seq_len_q > 1
+        ):
+            _, _, logical_q_idx, _, _ = flat_query_row_state(
+                Int32(self.cfg.mma_qk_tiler[0] - 1),
+                seq_q_idx,
+                self.cfg.mma_qk_tiler[0],
+                self.logical_num_heads_q,
+                self.logical_seq_len_q,
+                self.cu_seqlens_q,
+                request_idx,
+            )
+            K = mask_visible_k_length(self.cfg.mask_type, K, logical_q_idx, q_len)
+        K = K if query_tile_has_rows else Int32(0)
+        k_tile_total = (K + Int32(self.cfg.mma_qk_tiler[1] - 1)) // Int32(
+            self.cfg.mma_qk_tiler[1]
+        )
+        k_tile_count = cute.math.min(
+            descriptor_tile_count,
+            cute.math.max(k_tile_total - k_tile_start, Int32(0)),
+        )
+        k_tile_count = k_tile_count if is_valid else Int32(0)
+        return MlaTsWorkTileInfo(
+            (cluster_idx, seq_q_idx, request_idx, partial_idx),
+            is_valid,
+            K,
+            k_tile_count,
+            k_tile_start,
+        )
+
+    @cute.jit
     def _work_tile_from_linear_idx(self, current_work_linear_idx):
         params = self.tile_sched_params
         current_work_cluster_batch, cluster_idx = (
@@ -639,6 +735,9 @@ class PageOffsetWindowResource(HighThroughputMlaResource):
     cached_window_page: cutlass.Constexpr[TaskLocalVariable] = (
         TaskLocalVariable.uninitialized()
     )
+    prefetched_window_page: cutlass.Constexpr[TaskLocalVariable] = (
+        TaskLocalVariable.uninitialized()
+    )
     _task_local_specs: ClassVar[tuple[tuple, ...]] = (
         (
             "cached_k_pages",
@@ -664,6 +763,12 @@ class PageOffsetWindowResource(HighThroughputMlaResource):
             Int32(0),
             "Per-lane page id retained across one 32-entry page-table window.",
         ),
+        (
+            "prefetched_window_page",
+            Int32,
+            Int32(0),
+            "Next per-lane page-table window prefetched ahead of consumption.",
+        ),
     )
 
     @consumer_work(
@@ -673,6 +778,7 @@ class PageOffsetWindowResource(HighThroughputMlaResource):
             cached_v_pages,
             cached_next_v_pages,
             cached_window_page,
+            prefetched_window_page,
         ),
     )
     @cute.jit
@@ -697,6 +803,7 @@ class PageOffsetWindowResource(HighThroughputMlaResource):
                 space=cutlass.AddressSpace.rmem,
             ),
             Int32(0),
+            Int32(0),
         )
 
     @consumer_work(
@@ -705,6 +812,7 @@ class PageOffsetWindowResource(HighThroughputMlaResource):
             cached_v_pages,
             cached_next_v_pages,
             cached_window_page,
+            prefetched_window_page,
         )
     )
     @cute.jit
@@ -716,6 +824,7 @@ class PageOffsetWindowResource(HighThroughputMlaResource):
         cached_v_pages,
         cached_next_v_pages,
         cached_window_page,
+        prefetched_window_page,
         init_v_cache: cutlass.Constexpr[bool] = False,
     ):
         """Load and reuse one warp-wide 32-page-ID window.
@@ -734,19 +843,36 @@ class PageOffsetWindowResource(HighThroughputMlaResource):
         pages_per_k_tile = cutlass.const_expr(cfg.pages_per_k_tile)
         page_window_tiles = cutlass.const_expr(32 // pages_per_k_tile)
         page_window_mask = cutlass.const_expr(page_window_tiles - 1)
+        prefetch_window_pos = cutlass.const_expr(page_window_tiles // 2)
         page_offsets_batch = self.page_offsets[None, blk_coord[2]]
         lane_idx = cute.arch.thread_idx()[0] & Int32(31)
+        window_pos = local_k_index & Int32(page_window_mask)
 
-        if (local_k_index & Int32(page_window_mask)) == Int32(0):
-            logical_page_idx = global_k_index * Int32(pages_per_k_tile) + lane_idx
-            bounded_page_idx = cute.math.min(
-                logical_page_idx, Int32(page_offsets_batch.shape[0] - 1)
+        if window_pos == Int32(0):
+            if local_k_index == Int32(0):
+                logical_page_idx = global_k_index * Int32(pages_per_k_tile) + lane_idx
+                bounded_page_idx = cute.math.min(
+                    logical_page_idx, Int32(page_offsets_batch.shape[0] - 1)
+                )
+                cached_window_page = Int32(page_offsets_batch[bounded_page_idx])
+            else:
+                cached_window_page = prefetched_window_page
+
+        # Start the next coalesced page-table window while several current
+        # K/V tiles remain to hide its scoreboard latency behind TMA issue.
+        if window_pos == Int32(prefetch_window_pos):
+            next_window_k_index = global_k_index + Int32(
+                page_window_tiles - prefetch_window_pos
             )
-            cached_window_page = Int32(page_offsets_batch[bounded_page_idx])
+            next_logical_page_idx = (
+                next_window_k_index * Int32(pages_per_k_tile) + lane_idx
+            )
+            next_bounded_page_idx = cute.math.min(
+                next_logical_page_idx, Int32(page_offsets_batch.shape[0] - 1)
+            )
+            prefetched_window_page = Int32(page_offsets_batch[next_bounded_page_idx])
 
-        page_lane_base = (local_k_index & Int32(page_window_mask)) * Int32(
-            pages_per_k_tile
-        )
+        page_lane_base = window_pos * Int32(pages_per_k_tile)
         cta_v = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
         cached_k = cached_k_pages
         cached_v = cached_v_pages
@@ -790,7 +916,13 @@ class PageOffsetWindowResource(HighThroughputMlaResource):
                     kind=prims.Shfl.IDX,
                 )
             )
-        return cached_k, cached_v, cached_next_v, cached_window_page
+        return (
+            cached_k,
+            cached_v,
+            cached_next_v,
+            cached_window_page,
+            prefetched_window_page,
+        )
 
     @consumer_work(
         work_attrs=WorkAttr.AUXILIARY,
@@ -3046,6 +3178,7 @@ class GmemOResource(HighThroughputMlaResource):
     softmax_scale_log2: Any = None
     smem_exchange: Any = None  # SMEM for row_sum exchange (as Int32 base addr)
     split_kv: Any = None
+    use_balanced_scheduler: cutlass.Constexpr[bool] = False
     cu_seqlens_q: Any = None
     logical_num_heads_q: cutlass.Constexpr[int] = 128
     logical_seq_len_q: cutlass.Constexpr[int] = 1
@@ -3063,6 +3196,27 @@ class GmemOResource(HighThroughputMlaResource):
             self.cu_seqlens_q,
             batch_idx,
         )
+
+    @cute.jit
+    def _store_bf16_output_fragment(self, output_base, qk_acc_regs) -> None:
+        """Store one normalized split-workspace fragment as 16-byte vectors."""
+        for load_idx in cutlass.range_constexpr(4):
+            for j in cutlass.range_constexpr(4):
+                offset = (
+                    load_idx * TCGEN05_32B_REGS_PER_LOAD
+                    + j * BF16_OUTPUT_VECTOR_ELEMENTS
+                )
+                vec_bf16 = qk_acc_regs.load(offset, BF16_OUTPUT_VECTOR_ELEMENTS).to(
+                    cutlass.BFloat16
+                )
+                (
+                    output_base
+                    + load_idx * TCGEN05_32B_REGS_PER_LOAD
+                    + j * BF16_OUTPUT_VECTOR_ELEMENTS
+                ).nvvm_store_ext(
+                    vec_bf16,
+                    evict="noallocate",
+                )
 
     @producer_work
     @cute.jit
@@ -3138,6 +3292,11 @@ class GmemOResource(HighThroughputMlaResource):
         batch_idx = blk_coord[2]
         split_kv_idx = blk_coord[3]
         row_in_tile = head_tile_idx * tile_h + g_i
+        write_partial = Boolean(self.partial_output is not None)
+        if cutlass.const_expr(self.use_balanced_scheduler):
+            # Negative partial indices identify one-piece requests and bypass
+            # the reducer, matching the compact balanced descriptor ABI.
+            write_partial = split_kv_idx >= Int32(0)
         (
             storage_flat_query_row,
             logical_head_idx,
@@ -3181,44 +3340,63 @@ class GmemOResource(HighThroughputMlaResource):
                 if cutlass.const_expr(self.partial_output is not None):
                     # Split-KV partial O uses BF16 workspace storage.  LSE and
                     # the eventual cross-split accumulation remain FP32.
-                    S_q = (
-                        cutlass.Int32(self.partial_output.shape[3])
-                        if self.partial_output is not None
-                        else Int32(1)
-                    )
-                    o_base_ptr = (
-                        self.partial_output.iterator.raw_ptr()
-                        + Int64(row_in_tile) * Int64(self.split_kv) * Int64(D)
-                        + Int64(split_kv_idx) * Int64(D)
-                        + Int64(seq_q_idx)
-                        * Int64(self.split_kv)
-                        * Int64(physical_tile_rows)
-                        * Int64(D)
-                        + Int64(batch_idx)
-                        * Int64(physical_tile_rows)
-                        * Int64(self.split_kv)
-                        * Int64(S_q)
-                        * Int64(D)
-                    )
-                    output_base = o_base_ptr + iter_n * tile_d + g_j
-                    for load_idx in cutlass.range_constexpr(num_tmem_loads):
-                        for j in cutlass.range_constexpr(4):
-                            offset = (
-                                load_idx * TCGEN05_32B_REGS_PER_LOAD
-                                + j * BF16_OUTPUT_VECTOR_ELEMENTS
+                    if cutlass.const_expr(self.use_balanced_scheduler):
+                        if write_partial:
+                            o_base_ptr = (
+                                self.partial_output.iterator.raw_ptr()
+                                + Int64(row_in_tile) * Int64(self.split_kv) * Int64(D)
+                                + Int64(split_kv_idx) * Int64(D)
+                                + Int64(seq_q_idx)
+                                * Int64(self.split_kv)
+                                * Int64(physical_tile_rows)
+                                * Int64(D)
                             )
-                            vec_f32 = qk_acc_regs.load(
-                                offset, BF16_OUTPUT_VECTOR_ELEMENTS
+                            self._store_bf16_output_fragment(
+                                o_base_ptr + iter_n * tile_d + g_j,
+                                qk_acc_regs,
                             )
-                            vec_partial = vec_f32.to(cutlass.BFloat16)
-                            (
-                                output_base
-                                + load_idx * TCGEN05_32B_REGS_PER_LOAD
-                                + j * BF16_OUTPUT_VECTOR_ELEMENTS
-                            ).nvvm_store_ext(
-                                vec_partial,
-                                evict="noallocate",
+                        else:
+                            if cutlass.const_expr(self.cu_seqlens_q is not None):
+                                o_base_ptr = self.output.iterator.raw_ptr() + Int64(
+                                    storage_flat_query_row
+                                ) * Int64(D)
+                            else:
+                                public_s_q = cutlass.Int32(self.output.shape[2])
+                                o_base_ptr = (
+                                    self.output.iterator.raw_ptr()
+                                    + Int64(logical_head_idx) * Int64(D)
+                                    + Int64(logical_q_idx)
+                                    * Int64(logical_num_heads_q)
+                                    * Int64(D)
+                                    + Int64(batch_idx)
+                                    * Int64(logical_num_heads_q)
+                                    * Int64(D)
+                                    * Int64(public_s_q)
+                                )
+                            self._store_bf16_output_fragment(
+                                o_base_ptr + iter_n * tile_d + g_j,
+                                qk_acc_regs,
                             )
+                    else:
+                        S_q = cutlass.Int32(self.partial_output.shape[3])
+                        o_base_ptr = (
+                            self.partial_output.iterator.raw_ptr()
+                            + Int64(row_in_tile) * Int64(self.split_kv) * Int64(D)
+                            + Int64(split_kv_idx) * Int64(D)
+                            + Int64(seq_q_idx)
+                            * Int64(self.split_kv)
+                            * Int64(physical_tile_rows)
+                            * Int64(D)
+                            + Int64(batch_idx)
+                            * Int64(physical_tile_rows)
+                            * Int64(self.split_kv)
+                            * Int64(S_q)
+                            * Int64(D)
+                        )
+                        self._store_bf16_output_fragment(
+                            o_base_ptr + iter_n * tile_d + g_j,
+                            qk_acc_regs,
+                        )
                 else:
                     # 16-bit output (split_kv == 1, direct output)
                     if cutlass.const_expr(self.cu_seqlens_q is not None):
@@ -3317,24 +3495,48 @@ class GmemOResource(HighThroughputMlaResource):
             ) = self._query_row_state(lse_row_in_tile, seq_q_idx, batch_idx)
             if lse_row_in_tile < physical_tile_rows and lse_query_is_valid:
                 if cutlass.const_expr(self.partial_lse is not None):
-                    S_q = (
-                        cutlass.Int32(self.partial_lse.shape[2])
-                        if self.partial_lse is not None
-                        else Int32(1)
-                    )
-                    lse_base_ptr = (
-                        self.partial_lse.iterator.raw_ptr()
-                        + Int64(lse_row_in_tile) * Int64(self.split_kv)
-                        + Int64(split_kv_idx)
-                        + Int64(seq_q_idx)
-                        * Int64(physical_tile_rows)
-                        * Int64(self.split_kv)
-                        + Int64(batch_idx)
-                        * Int64(physical_tile_rows)
-                        * Int64(self.split_kv)
-                        * Int64(S_q)
-                    )
-                    lse_base_ptr.store(lse)
+                    if cutlass.const_expr(self.use_balanced_scheduler):
+                        if write_partial:
+                            lse_base_ptr = (
+                                self.partial_lse.iterator.raw_ptr()
+                                + Int64(lse_row_in_tile) * Int64(self.split_kv)
+                                + Int64(split_kv_idx)
+                                + Int64(seq_q_idx)
+                                * Int64(physical_tile_rows)
+                                * Int64(self.split_kv)
+                            )
+                            lse_base_ptr.store(lse)
+                        elif cutlass.const_expr(self.cu_seqlens_q is not None):
+                            lse_base_ptr = (
+                                self.lse.iterator.raw_ptr() + storage_flat_lse_row
+                            )
+                            lse_base_ptr.store(lse)
+                        else:
+                            public_s_q = cutlass.Int32(self.lse.shape[1])
+                            lse_base_ptr = (
+                                self.lse.iterator.raw_ptr()
+                                + Int64(logical_lse_head_idx)
+                                + Int64(logical_lse_q_idx) * Int64(logical_num_heads_q)
+                                + Int64(batch_idx)
+                                * Int64(logical_num_heads_q)
+                                * Int64(public_s_q)
+                            )
+                            lse_base_ptr.store(lse)
+                    else:
+                        S_q = cutlass.Int32(self.partial_lse.shape[2])
+                        lse_base_ptr = (
+                            self.partial_lse.iterator.raw_ptr()
+                            + Int64(lse_row_in_tile) * Int64(self.split_kv)
+                            + Int64(split_kv_idx)
+                            + Int64(seq_q_idx)
+                            * Int64(physical_tile_rows)
+                            * Int64(self.split_kv)
+                            + Int64(batch_idx)
+                            * Int64(physical_tile_rows)
+                            * Int64(self.split_kv)
+                            * Int64(S_q)
+                        )
+                        lse_base_ptr.store(lse)
                 elif cutlass.const_expr(self.lse is not None):
                     if cutlass.const_expr(self.cu_seqlens_q is not None):
                         lse_base_ptr = (
@@ -3419,6 +3621,9 @@ class GmemOResource(HighThroughputMlaResource):
         batch_idx = blk_coord[2]
         split_kv_idx = blk_coord[3]
         row_in_tile = head_tile_idx * tile_h + g_i
+        write_partial = Boolean(self.partial_output is not None)
+        if cutlass.const_expr(self.use_balanced_scheduler):
+            write_partial = split_kv_idx >= Int32(0)
         (
             storage_flat_query_row,
             logical_head_idx,
@@ -3429,42 +3634,73 @@ class GmemOResource(HighThroughputMlaResource):
 
         if row_in_tile < physical_tile_rows and query_is_valid:
             if cutlass.const_expr(self.partial_output is not None):
-                S_q = (
-                    cutlass.Int32(self.partial_output.shape[3])
-                    if self.partial_output is not None
-                    else Int32(1)
-                )
-                o_base_ptr = (
-                    self.partial_output.iterator.raw_ptr()
-                    + Int64(row_in_tile) * Int64(self.split_kv) * Int64(D)
-                    + Int64(split_kv_idx) * Int64(D)
-                    + Int64(seq_q_idx)
-                    * Int64(self.split_kv)
-                    * Int64(physical_tile_rows)
-                    * Int64(D)
-                    + Int64(batch_idx)
-                    * Int64(physical_tile_rows)
-                    * Int64(self.split_kv)
-                    * Int64(S_q)
-                    * Int64(D)
-                )
-                output_base = o_base_ptr + iter_n * tile_d + g_j
-                for load_idx in cutlass.range_constexpr(num_tmem_loads):
-                    for j in cutlass.range_constexpr(4):
-                        offset = (
-                            load_idx * TCGEN05_32B_REGS_PER_LOAD
-                            + j * BF16_OUTPUT_VECTOR_ELEMENTS
+                if cutlass.const_expr(self.use_balanced_scheduler):
+                    # Use integer addresses across the runtime one-piece branch;
+                    # CuTe cannot form a pointer-valued SSA phi here.
+                    o_base_addr = Int64(0)
+                    if write_partial:
+                        o_base_addr = (
+                            self.partial_output.iterator.raw_ptr().toint(Int64)
+                            + Int64(row_in_tile)
+                            * Int64(self.split_kv)
+                            * Int64(D)
+                            * Int64(2)
+                            + Int64(split_kv_idx) * Int64(D) * Int64(2)
+                            + Int64(seq_q_idx)
+                            * Int64(self.split_kv)
+                            * Int64(physical_tile_rows)
+                            * Int64(D)
+                            * Int64(2)
                         )
-                        vec_f32 = qk_acc_regs.load(offset, BF16_OUTPUT_VECTOR_ELEMENTS)
-                        vec_partial = vec_f32.to(cutlass.BFloat16)
-                        (
-                            output_base
-                            + load_idx * TCGEN05_32B_REGS_PER_LOAD
-                            + j * BF16_OUTPUT_VECTOR_ELEMENTS
-                        ).nvvm_store_ext(
-                            vec_partial,
-                            evict="noallocate",
-                        )
+                    else:
+                        if cutlass.const_expr(self.cu_seqlens_q is not None):
+                            o_base_addr = self.output.iterator.raw_ptr().toint(
+                                Int64
+                            ) + Int64(storage_flat_query_row) * Int64(D) * Int64(2)
+                        else:
+                            public_s_q = cutlass.Int32(self.output.shape[2])
+                            o_base_addr = (
+                                self.output.iterator.raw_ptr().toint(Int64)
+                                + Int64(logical_head_idx) * Int64(D) * Int64(2)
+                                + Int64(logical_q_idx)
+                                * Int64(logical_num_heads_q)
+                                * Int64(D)
+                                * Int64(2)
+                                + Int64(batch_idx)
+                                * Int64(logical_num_heads_q)
+                                * Int64(D)
+                                * Int64(public_s_q)
+                                * Int64(2)
+                            )
+                    o_base_ptr = cutlass.inttoptr(
+                        o_base_addr,
+                        mem_space=1,
+                        dtype=cutlass.BFloat16,
+                    )
+                    self._store_bf16_output_fragment(
+                        o_base_ptr + iter_n * tile_d + g_j,
+                        qk_acc_regs,
+                    )
+                else:
+                    S_q = cutlass.Int32(self.partial_output.shape[3])
+                    o_base_ptr = (
+                        self.partial_output.iterator.raw_ptr()
+                        + Int64(row_in_tile) * Int64(self.split_kv) * Int64(D)
+                        + Int64(split_kv_idx) * Int64(D)
+                        + Int64(seq_q_idx)
+                        * Int64(self.split_kv)
+                        * Int64(physical_tile_rows)
+                        * Int64(D)
+                        + Int64(batch_idx)
+                        * Int64(physical_tile_rows)
+                        * Int64(self.split_kv)
+                        * Int64(S_q)
+                        * Int64(D)
+                    )
+                    self._store_bf16_output_fragment(
+                        o_base_ptr + iter_n * tile_d + g_j,
+                        qk_acc_regs,
+                    )
             else:
                 if cutlass.const_expr(self.cu_seqlens_q is not None):
                     o_base_ptr = self.output.iterator.raw_ptr() + Int64(
@@ -3555,23 +3791,56 @@ class GmemOResource(HighThroughputMlaResource):
                 ) = self._query_row_state(lse_row_in_tile, seq_q_idx, batch_idx)
                 if lse_row_in_tile < physical_tile_rows and lse_query_is_valid:
                     if cutlass.const_expr(self.partial_lse is not None):
-                        S_q = (
-                            cutlass.Int32(self.partial_lse.shape[2])
-                            if self.partial_lse is not None
-                            else Int32(1)
-                        )
-                        lse_base_ptr = (
-                            self.partial_lse.iterator.raw_ptr()
-                            + Int64(lse_row_in_tile) * Int64(self.split_kv)
-                            + Int64(split_kv_idx)
-                            + Int64(seq_q_idx)
-                            * Int64(physical_tile_rows)
-                            * Int64(self.split_kv)
-                            + Int64(batch_idx)
-                            * Int64(physical_tile_rows)
-                            * Int64(self.split_kv)
-                            * Int64(S_q)
-                        )
+                        if cutlass.const_expr(self.use_balanced_scheduler):
+                            lse_base_addr = Int64(0)
+                            if write_partial:
+                                lse_base_addr = (
+                                    self.partial_lse.iterator.raw_ptr().toint(Int64)
+                                    + Int64(lse_row_in_tile)
+                                    * Int64(self.split_kv)
+                                    * Int64(4)
+                                    + Int64(split_kv_idx) * Int64(4)
+                                    + Int64(seq_q_idx)
+                                    * Int64(physical_tile_rows)
+                                    * Int64(self.split_kv)
+                                    * Int64(4)
+                                )
+                            elif cutlass.const_expr(self.cu_seqlens_q is not None):
+                                lse_base_addr = self.lse.iterator.raw_ptr().toint(
+                                    Int64
+                                ) + Int64(storage_flat_lse_row) * Int64(4)
+                            else:
+                                public_s_q = cutlass.Int32(self.lse.shape[1])
+                                lse_base_addr = (
+                                    self.lse.iterator.raw_ptr().toint(Int64)
+                                    + Int64(logical_lse_head_idx) * Int64(4)
+                                    + Int64(logical_lse_q_idx)
+                                    * Int64(logical_num_heads_q)
+                                    * Int64(4)
+                                    + Int64(batch_idx)
+                                    * Int64(logical_num_heads_q)
+                                    * Int64(public_s_q)
+                                    * Int64(4)
+                                )
+                            lse_base_ptr = cutlass.inttoptr(
+                                lse_base_addr,
+                                mem_space=1,
+                                dtype=Float32,
+                            )
+                        else:
+                            S_q = cutlass.Int32(self.partial_lse.shape[2])
+                            lse_base_ptr = (
+                                self.partial_lse.iterator.raw_ptr()
+                                + Int64(lse_row_in_tile) * Int64(self.split_kv)
+                                + Int64(split_kv_idx)
+                                + Int64(seq_q_idx)
+                                * Int64(physical_tile_rows)
+                                * Int64(self.split_kv)
+                                + Int64(batch_idx)
+                                * Int64(physical_tile_rows)
+                                * Int64(self.split_kv)
+                                * Int64(S_q)
+                            )
                         lse_base_ptr.store(lse)
                     elif cutlass.const_expr(self.lse is not None):
                         if cutlass.const_expr(self.cu_seqlens_q is not None):

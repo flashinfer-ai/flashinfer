@@ -143,6 +143,11 @@ class TmemOResource(MlaResource):
     @cute.jit
     def _tail_has_prior_o(self, stage_info: StageInfo):
         """Return whether tail PV should accumulate into existing O state."""
+        if cutlass.const_expr(self.cfg.use_balanced_scheduler == 1):
+            # Balanced descriptors have independent, runtime K spans.  The
+            # configured split geometry is only a workspace capacity and
+            # cannot describe whether this descriptor executed a loop body.
+            return stage_info.loop_end > Int32(0)
         batch_idx = batch_idx_for_stage_cfg(self.batch_idx, self.cfg, stage_info)
         cta_idx_q = cta_idx_q_for_stage(self.cta_idx_q, stage_info)
         seq_len_kv = runtime_seq_len_kv_from_task_cache(

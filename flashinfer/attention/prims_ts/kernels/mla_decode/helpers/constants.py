@@ -96,6 +96,28 @@ SUPPORTED_MLA_PAGE_SIZES = (16, 32, 64, 128)
 # workspace/scheduler split capacity.
 MAX_MLA_SPLITS_KV = 128
 
+
+def balanced_work_descriptor_capacity(batch_size: int, num_partitions: int) -> int:
+    """Return the graph-stable capacity for all balanced producer work."""
+
+    return batch_size + num_partitions
+
+
+def balanced_partial_capacity(batch_size: int, num_partitions: int) -> int:
+    """Return the compact capacity used only by genuinely split work."""
+
+    return min(
+        balanced_work_descriptor_capacity(batch_size, num_partitions),
+        2 * num_partitions,
+    )
+
+
+def balanced_reducer_capacity(batch_size: int, num_partitions: int) -> int:
+    """Return fixed physical request slots in the compact balanced reducer."""
+
+    return min(batch_size, num_partitions)
+
+
 # Throughput 2CTA epilogue maps 128 local threads onto two 64-row groups and
 # 128-column output halves for vectorized GMEM publication.
 EPILOGUE_THREAD_TILE_THREADS = 128

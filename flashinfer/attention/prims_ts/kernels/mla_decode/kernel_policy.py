@@ -115,6 +115,26 @@ def select_default_mla_kernel_policy(
     return "throughput_2cta"
 
 
+def select_balanced_decode_mla_kernel_policy(
+    num_heads: int,
+    seq_len_q: int,
+) -> MlaKernelPolicy | None:
+    """Choose the measured balanced family for single-token decode.
+
+    Balanced scheduling replaces the ordinary split topology, so its family
+    choice must not inherit the default path's direct-output preference. The
+    calibrated Blackwell decode crossover is after 32 query heads. Multi-token
+    query shapes retain the ordinary automatic selector until separately
+    calibrated.
+    """
+
+    if seq_len_q != 1:
+        return None
+    if num_heads <= 32:
+        return "throughput_latency_1cta"
+    return "throughput_2cta"
+
+
 def resolve_mla_kernel_policy(
     policy: str | None,
     num_heads: int,
