@@ -33,6 +33,7 @@ gemm_bf16_N4096_K4096.json
 gemm_fp4_N2048_K7168_block_size16.json
 gemm_fp8_N1536_K7168.json
 gemm_fp8_nt_groupwise_n1536_k7168.json
+group_gemm_fp8_nt_groupwise_contiguous_g2_n128_k128.json
 gemm_mxfp8_N4096_K4096.json
 gemm_nvfp4_svdquant_N3072_K_packed1536_rank32.json
 gemma_fused_add_rmsnorm_h4608.json
@@ -57,6 +58,11 @@ mla_paged_decode_h16_ckv512_kpe64_ps64.json
 attention_ts_decode_tuple_multi_q_sq4_h32_kv4_d128_ps32.json
 prims_ts_batch_decode_tuple_multi_q_sq4_h32_kv4_d128_ps32_s2048.json
 prims_ts_decode_wrapper_tuple_multi_q_causal_sq4_maxq4_maxk2048_wl-1_pf0_um0_h32_kv4_d128_ps32.json
+prims_ts_decode_wrapper_tuple_multi_q_causal_plan_seq_lens_sq4_maxq4_maxk2048_wl-1_pf1_um1_h32_kv4_d128_ps32.json
+attention_ts_decode_tuple_encoded_page4_multi_q_sq4_h32_kv4_d128_sps4_ps32.json
+prims_ts_batch_decode_tuple_encoded_page4_multi_q_sq4_h32_kv4_d128_sps4_s2048_ps32.json
+prims_ts_decode_wrapper_tuple_encoded_page4_multi_q_causal_sq4_maxq4_maxk2048_wl-1_pf0_um0_h32_kv4_d128_sps4_ps32.json
+prims_ts_decode_wrapper_tuple_encoded_page4_multi_q_causal_plan_seq_lens_sq4_maxq4_maxk2048_wl-1_pf1_um1_h32_kv4_d128_sps4_ps32.json
 prims_ts_decode_mla_one_shot_h128_d_qk576_ckv512_kpe64_ps32_sq4.json
 prims_ts_batch_decode_mla_h128_d_qk576_ckv512_kpe64_ps32_s2048_sq4.json
 prims_ts_decode_mla_wrapper_causal_maxq4_maxk2048_h128_d_qk576_ckv512_kpe64_ps32_sq4.json
@@ -471,6 +477,19 @@ with contextlib.suppress(Exception):
     b_scale_g = torch.ones(N // BS, K // BS, dtype=torch.float32, device=device)
     flashinfer.gemm.gemm_fp8_nt_groupwise(
         a_g, b_g, a_scale_g, b_scale_g, backend="trtllm"
+    )
+
+# Contiguous grouped FP8: two experts, with a partial final M tile.
+with contextlib.suppress(Exception):
+    from flashinfer.trace.templates.gemm import (
+        group_gemm_fp8_nt_groupwise_contiguous_trace,
+    )
+
+    contiguous_inputs = group_gemm_fp8_nt_groupwise_contiguous_trace.init(
+        M=129, num_groups=2, N=128, K=128, device=device
+    )
+    flashinfer.gemm.group_gemm_fp8_nt_groupwise_contiguous(
+        **contiguous_inputs, validate_indices=True
     )
 
 # ── GEMM mxfp8 (Blackwell SM100+: M×4096@4096×4096, block=32) ────────────────
@@ -2060,99 +2079,109 @@ with contextlib.suppress(Exception):
 
 # PrimTS FMHA decode: causal SQ4 through the one-shot, caller-workspace, and
 # reusable-wrapper public surfaces (SM100/SM103 only).
-with contextlib.suppress(Exception):
-    from flashinfer.attention.prims_ts.decode import (
-        BatchDecodePagedTSWrapper as _PrimTSDecodeWrapper,
-        batch_decode_with_paged_kv_cache as _attention_ts_decode,
-        get_prims_ts_batch_decode_workspace_size as _prims_ts_fmha_ws_size,
-        prims_ts_batch_decode_with_kv_cache as _prims_ts_fmha_decode,
-    )
+for _pts_semantic_PS in (32, 4):
+    with contextlib.suppress(Exception):
+        from flashinfer.attention.prims_ts.decode import (
+            BatchDecodePagedTSWrapper as _PrimTSDecodeWrapper,
+            batch_decode_with_paged_kv_cache as _attention_ts_decode,
+            get_prims_ts_batch_decode_workspace_size as _prims_ts_fmha_ws_size,
+            prims_ts_batch_decode_with_kv_cache as _prims_ts_fmha_decode,
+        )
 
-    _pts_B, _pts_SQ, _pts_SK = 4, 4, 2048
-    _pts_Hq, _pts_Hkv, _pts_D, _pts_PS = 32, 4, 128, 32
-    _pts_pages_per_request = _pts_SK // _pts_PS
-    _pts_num_pages = _pts_B * _pts_pages_per_request
-    _pts_q = torch.randn(
-        _pts_B,
-        _pts_SQ,
-        _pts_Hq,
-        _pts_D,
-        dtype=torch.bfloat16,
-        device=device,
-    )
-    _pts_k = torch.randn(
-        _pts_num_pages,
-        _pts_Hkv,
-        _pts_PS,
-        _pts_D,
-        dtype=torch.bfloat16,
-        device=device,
-    )
-    _pts_v = torch.randn_like(_pts_k)
-    _pts_indices = torch.arange(_pts_num_pages, dtype=torch.int32, device=device)
-    _pts_block_tables = _pts_indices.view(_pts_B, _pts_pages_per_request)
-    _pts_seq_lens = torch.full((_pts_B,), _pts_SK, dtype=torch.int32, device=device)
-    _pts_cache = (_pts_k, _pts_v)
+        _pts_B, _pts_SQ, _pts_SK = 4, 4, 2048
+        _pts_Hq, _pts_Hkv, _pts_D, _pts_PS = 32, 4, 128, 32
+        _pts_pages_per_request = _pts_SK // _pts_PS
+        _pts_num_pages = _pts_B * _pts_pages_per_request
+        _pts_q = torch.randn(
+            _pts_B,
+            _pts_SQ,
+            _pts_Hq,
+            _pts_D,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        _pts_k = torch.randn(
+            _pts_num_pages,
+            _pts_Hkv,
+            _pts_PS,
+            _pts_D,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        _pts_v = torch.randn_like(_pts_k)
+        _pts_semantic_pages = _pts_SK // _pts_semantic_PS
+        _pts_indices = torch.arange(
+            _pts_B * _pts_semantic_pages, dtype=torch.int32, device=device
+        )
+        _pts_block_tables = _pts_indices.view(_pts_B, _pts_semantic_pages)
+        _pts_seq_lens = torch.full((_pts_B,), _pts_SK, dtype=torch.int32, device=device)
+        _pts_cache = (_pts_k, _pts_v)
 
-    _attention_ts_decode(
-        _pts_q,
-        _pts_cache,
-        _pts_block_tables,
-        _pts_seq_lens,
-        seq_len_q=_pts_SQ,
-        mask_type="causal",
-    )
+        _attention_ts_decode(
+            _pts_q,
+            _pts_cache,
+            _pts_block_tables,
+            _pts_seq_lens,
+            seq_len_q=_pts_SQ,
+            mask_type="causal",
+            page_size=_pts_semantic_PS,
+        )
 
-    _pts_workspace_size = _prims_ts_fmha_ws_size(
-        _pts_B,
-        _pts_Hq,
-        _pts_Hkv,
-        _pts_D,
-        _pts_PS,
-        _pts_SK,
-        seq_len_q=_pts_SQ,
-        q_dtype=_pts_q.dtype,
-        kv_dtype=_pts_k.dtype,
-        out_dtype=torch.bfloat16,
-        mask_type="causal",
-        device=_pts_q.device,
-    )
-    _pts_workspace = torch.zeros(_pts_workspace_size, dtype=torch.int8, device=device)
-    _prims_ts_fmha_decode(
-        _pts_q,
-        _pts_cache,
-        _pts_workspace,
-        _pts_block_tables,
-        _pts_seq_lens,
-        _pts_SK,
-        seq_len_q=_pts_SQ,
-        mask_type="causal",
-        kv_layout="HND",
-    )
+        _pts_workspace_size = _prims_ts_fmha_ws_size(
+            _pts_B,
+            _pts_Hq,
+            _pts_Hkv,
+            _pts_D,
+            _pts_semantic_PS,
+            _pts_SK,
+            seq_len_q=_pts_SQ,
+            q_dtype=_pts_q.dtype,
+            kv_dtype=_pts_k.dtype,
+            out_dtype=torch.bfloat16,
+            mask_type="causal",
+            device=_pts_q.device,
+            storage_page_size=_pts_PS,
+        )
+        _pts_workspace = torch.zeros(
+            _pts_workspace_size, dtype=torch.int8, device=device
+        )
+        _prims_ts_fmha_decode(
+            _pts_q,
+            _pts_cache,
+            _pts_workspace,
+            _pts_block_tables,
+            _pts_seq_lens,
+            _pts_SK,
+            seq_len_q=_pts_SQ,
+            mask_type="causal",
+            kv_layout="HND",
+            page_size=_pts_semantic_PS,
+        )
 
-    _pts_wrapper = _PrimTSDecodeWrapper(kv_layout="HND")
-    _pts_wrapper.plan(
-        _pts_q.device,
-        _pts_B,
-        _pts_Hq,
-        _pts_Hkv,
-        _pts_D,
-        _pts_PS,
-        _pts_SK,
-        max_seq_len_q=_pts_SQ,
-        packed_query=False,
-        q_data_type=_pts_q.dtype,
-        kv_data_type=_pts_k.dtype,
-        o_data_type=torch.bfloat16,
-        mask_type="causal",
-        workspace_buffer=_pts_workspace,
-    )
-    _pts_wrapper.run(
-        _pts_q,
-        _pts_cache,
-        _pts_seq_lens,
-        _pts_block_tables,
-    )
+        _pts_wrapper = _PrimTSDecodeWrapper(kv_layout="HND")
+        _pts_wrapper.plan(
+            _pts_q.device,
+            _pts_B,
+            _pts_Hq,
+            _pts_Hkv,
+            _pts_D,
+            _pts_semantic_PS,
+            _pts_SK,
+            max_seq_len_q=_pts_SQ,
+            packed_query=False,
+            q_data_type=_pts_q.dtype,
+            kv_data_type=_pts_k.dtype,
+            o_data_type=torch.bfloat16,
+            mask_type="causal",
+            workspace_buffer=_pts_workspace,
+            storage_page_size=_pts_PS,
+        )
+        _pts_wrapper.run(
+            _pts_q,
+            _pts_cache,
+            _pts_seq_lens,
+            _pts_block_tables,
+        )
 
 # PrimTS MLA decode: the same causal SQ4 contract through all three public
 # surfaces (SM100/SM103 only).
@@ -2576,9 +2605,10 @@ with contextlib.suppress(Exception):
             causal=True,
         )
 
-# ── Paged MQA logits (attn_scores) — DeepSeek MLA sparse indexer (SM100/SM103) ──
+# ── Paged MQA logits (attn_scores) — DeepSeek MLA sparse indexer (SM100/SM103/SM107) ──
 # FP8 (per-token fp32 KV scale) and FP4 (MXFP4 block-scaled). Traces dump before
-# launch, so the JSONs appear on any GPU; the kernels require SM100/SM103. Inputs
+# launch, so the JSONs appear on any GPU; the kernels require SM100/SM103 or
+# Rubin (SM107). Inputs
 # are built with each template's own init (H=64, D=128).
 with contextlib.suppress(Exception):
     import flashinfer.attn_scores  # noqa: F401  (triggers @flashinfer_api registration)
@@ -2595,7 +2625,7 @@ with contextlib.suppress(Exception):
         num_heads=64,
         head_dim=128,
         block_size=64,
-        max_context_len=4096,
+        max_seq_len=4096,
         device=device,
     )
 
@@ -2605,19 +2635,19 @@ with contextlib.suppress(Exception):
             _fp8_in["q"],
             _fp8_in["kv_fused"],
             _fp8_in["weights"],
-            _fp8_in["context_lens"],
-            _fp8_in["block_table"],
-            _fp8_in["max_context_len"],
+            _fp8_in["block_tables"],
+            _fp8_in["seq_lens"],
+            _fp8_in["max_seq_len"],
         )
 
     with contextlib.suppress(Exception):
         _fp4_in = _fp4_pmqa_trace.init(**_pmqa_kw)
         flashinfer.fp4_paged_mqa_logits(
             _fp4_in["q"],
-            _fp4_in["sf_q"],
+            _fp4_in["q_sf"],
             _fp4_in["kv_fused"],
             _fp4_in["weights"],
-            _fp4_in["context_lens"],
-            _fp4_in["block_table"],
-            _fp4_in["max_context_len"],
+            _fp4_in["block_tables"],
+            _fp4_in["seq_lens"],
+            _fp4_in["max_seq_len"],
         )
