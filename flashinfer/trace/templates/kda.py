@@ -12,18 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""TraceTemplate for recurrent Key-Driven Attention (KDA) decode."""
+"""TraceTemplates for recurrent Key-Driven Attention (KDA)."""
 
 from ..template import Const, Scalar, Tensor, TraceTemplate, Var
 
 
-recurrent_kda_trace = TraceTemplate(
+# Shared by the phase-neutral facade and the deprecated decode facade, which
+# accept the same call and so must describe it identically; only the name and
+# the stage they advertise differ.
+_RECURRENT_KDA_FIELDS = dict(
     op_type="kda",
-    name_prefix="recurrent_kda",
-    description=(
-        "Recurrent Key-Driven Attention decode with per-key-dimension gating "
-        "and an optional read-only committed-state source."
-    ),
     axes={
         "batch_size": Var(description="Number of input batch rows."),
         "seq_len": Var(description="Tokens carried by each input batch row."),
@@ -124,7 +122,32 @@ recurrent_kda_trace = TraceTemplate(
         "head_dim in (64, 128)",
         "num_checkpoint_offsets == num_sequences + 1",
     ],
+)
+
+
+recurrent_kda_trace = TraceTemplate(
+    name_prefix="recurrent_kda",
+    description=(
+        "Recurrent Key-Driven Attention with per-key-dimension gating and an "
+        "optional read-only committed-state source. Classifies the call's "
+        "phase and serves prefill or decode accordingly."
+    ),
+    # Two stages because this facade serves both, unlike every other template
+    # here; the decode-only variant below keeps the single decode stage.
+    tags=["stage:prefill", "stage:decode", "status:verified"],
+    **_RECURRENT_KDA_FIELDS,
+)
+
+
+recurrent_kda_decode_trace = TraceTemplate(
+    name_prefix="recurrent_kda_decode",
+    description=(
+        "Recurrent Key-Driven Attention decode reached through the deprecated "
+        "flashinfer.kda_decode.recurrent_kda facade, which dispatches decode "
+        "directly without classifying the call's phase."
+    ),
     tags=["stage:decode", "status:verified"],
+    **_RECURRENT_KDA_FIELDS,
 )
 
 

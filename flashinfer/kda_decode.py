@@ -31,7 +31,7 @@ from .api_logging import flashinfer_api
 from .trace.templates.kda import (
     fused_kda_decode_trace,
     packed_kda_decode_trace,
-    recurrent_kda_trace,
+    recurrent_kda_decode_trace,
 )
 
 try:
@@ -176,7 +176,7 @@ def _dispatch_recurrent_kda_decode(
     )
 
 
-@flashinfer_api(trace=recurrent_kda_trace)
+@flashinfer_api(trace=recurrent_kda_decode_trace)
 def recurrent_kda(
     q: torch.Tensor,
     k: torch.Tensor,

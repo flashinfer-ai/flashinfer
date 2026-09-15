@@ -275,6 +275,39 @@ def test_recurrent_kda_fi_trace():
     assert defn["axes"]["head_dim"]["value"] == head_dim
 
 
+def test_recurrent_kda_facades_trace_under_distinct_names():
+    """Two public APIs must not share one trace label.
+
+    The ``fi_api`` tag always told them apart, but the name did not, so a
+    trace inventory could not attribute a definition to a facade.
+    """
+    import flashinfer.kda
+    import flashinfer.kda_decode
+
+    batch_size, num_q_heads, num_v_heads, head_dim = 4, 8, 16, 128
+    q = torch.empty(batch_size, 1, num_q_heads, head_dim, dtype=torch.bfloat16)
+    v = torch.empty(batch_size, 1, num_v_heads, head_dim, dtype=torch.bfloat16)
+    call = dict(
+        q=q,
+        k=torch.empty_like(q),
+        v=v,
+        g=torch.empty_like(v),
+        beta=torch.empty(batch_size, 1, num_v_heads, dtype=torch.bfloat16),
+    )
+
+    canonical = flashinfer.kda.recurrent_kda.fi_trace(**call)
+    deprecated = flashinfer.kda_decode.recurrent_kda.fi_trace(**call)
+
+    assert canonical["name"] == "recurrent_kda_q8_v16_d128"
+    assert deprecated["name"] == "recurrent_kda_decode_q8_v16_d128"
+
+    # The canonical facade serves both phases; the decode facade serves one.
+    assert "stage:prefill" in canonical["tags"]
+    assert "stage:decode" in canonical["tags"]
+    assert "stage:prefill" not in deprecated["tags"]
+    assert "stage:decode" in deprecated["tags"]
+
+
 def test_ssd_combined_trace_dispatch_exposes_exact_finite_matrix():
     from flashinfer.trace.templates.mamba import ssd_combined_trace_dispatch
 
