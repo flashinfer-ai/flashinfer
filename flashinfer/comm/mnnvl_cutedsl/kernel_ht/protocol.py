@@ -80,6 +80,29 @@ HT_FINALIZE_GB300_TP16_H8192_K10 = HTFinalizeTuning(
 HT_ALL_REDUCE_GB300_TP8_H8192 = HTAllReduceTuning()
 HT_ALL_REDUCE_GB300_TP16_H8192 = HTAllReduceTuning()
 
+# hidden_size=5120, bf16, TP4 only.
+#
+# HT shards a token across tp ranks and then across reduction threads. At
+# hidden=5120 a token is 640 bf16x8 packs, so packs_per_reduction_shard is
+# 640/tp: 160 at tp=4 (a multiple of one 32-thread reduction warp) but 80 at
+# tp=8 and 40 at tp=16, neither of which divides evenly across any legal
+# reduction-warp count. tp=8/tp=16 are therefore unreachable for this hidden
+# size with knobs alone -- an exhaustive sweep of the 1080 combinations finds
+# none -- so the H5120 profiles route their large-M ranges to BT instead and
+# only tp=4 carries HT presets. Lifting that would need a predicated tail in
+# the HT reduction loop, i.e. a kernel change rather than a tuning change.
+#
+# reduction_warps is pinned to 1 for the same reason (160 % 64 != 0), and
+# consumer_threads * 8 * vectors_per_thread must divide 5120, so 128x5 tiles a
+# whole token per shard -- the structural analogue of the H8192 512x2 preset.
+HT_FINALIZE_GB300_TP4_H5120_K6 = HTFinalizeTuning(
+    consumer_threads=128, vectors_per_thread=5, reduction_warps=1
+)
+HT_FINALIZE_GB300_TP4_H5120_K3 = HT_FINALIZE_GB300_TP4_H5120_K6
+HT_ALL_REDUCE_GB300_TP4_H5120 = HTAllReduceTuning(
+    consumer_threads=128, vectors_per_thread=5, reduction_warps=1
+)
+
 
 @dataclass(slots=True)
 class HTProtocolState:
@@ -261,6 +284,7 @@ class HTProtocol:
         include_shared_expert: bool,
         add_residual: bool,
         write_residual_output: bool,
+        apply_rms_norm: bool = True,
         finalize_tunings: tuple[HTFinalizeTuning, ...],
         all_reduce_tunings: tuple[HTAllReduceTuning, ...],
         group: dist.ProcessGroup,
@@ -276,6 +300,16 @@ class HTProtocol:
         self.include_shared_expert = include_shared_expert
         self.add_residual = add_residual
         self.write_residual_output = write_residual_output
+        if not apply_rms_norm:
+            # This kernel is warp-specialised: a dedicated RMS warp group
+            # owns the sum-of-squares, its named barriers and its shared
+            # staging, so the norm is not a guardable block the way it is
+            # in the LL and BT tails.
+            raise NotImplementedError(
+                "apply_rms_norm=False is not supported by the "
+                "high-throughput protocol; select the LL or BT protocol"
+            )
+        self.apply_rms_norm = apply_rms_norm
 
         self.finalize_kernels = {
             tuning: FinalizeAllReduceRMSNormHTKernel(
