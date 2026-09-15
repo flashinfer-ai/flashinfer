@@ -24,7 +24,7 @@ from typing import ClassVar
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import BFloat16, Float16, Float32, Int32, Int64, Uint32
+from cutlass import BFloat16, Float16, Float32, Float8E4M3FN, Int8, Int32, Int64, Uint32
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.experimental import primitives as prims
@@ -36,9 +36,36 @@ from cutlass.experimental.task_scheduling.resources import (
 )
 
 from ..fmha_decode_config import FmhaDecodeConfig
+from ..fmha_decode_constants import (
+    FP8_MMA_K_STEP,
+    FP8_P_QUANT_LOG2_SCALE,
+    FP16_MMA_K_STEP,
+)
 
 Constexpr = cutlass.Constexpr
 NEG_FLT_MAX = -3.4028235e38
+# INT8 Q/K scores are accumulated on top of the bit pattern of ``1.5 * 2**23``:
+# every integer in ``[2**23, 2**24)`` is an FP32 number with unit spacing, and
+# every INT8 dot product satisfies ``|score| <= 128 * 128 * 128 = 2**21`` for
+# ``D = 128`` (the only Sage head dimension), so the final INT32 accumulator
+# ``bias + score`` is exactly the FP32 number ``12582912.0 + score``. The
+# softmax reads the scores as FP32 without a per-element conversion; the max
+# pass subtracts the bias once per scale group and the exp pass folds
+# ``-bias * multiplier`` into each group's exponent addend.
+INT32_SCORE_BIAS = 12582912.0
+# The bias is written by one ``kind::f16`` MMA step before the INT8 K steps.
+# Both operands read the same BF16 tile, whose every K = 16 row is
+# ``[1024, 1024, 1024, 0]`` repeated: the twelve nonzero products ``2**20``
+# sum to exactly ``1.5 * 2**23`` (every product and partial sum is a multiple
+# of ``2**20`` below ``2**24``). One shared operand descriptor keeps the MMA
+# warp's live state small. The tile is stored as unswizzled K-major 32-byte
+# rows whose 8x16-byte core matrices are 128 bytes apart along the row and
+# 256 bytes apart between eight-row groups; every 16-byte chunk holds the
+# pattern, so the two packed words alternate with the word index.
+INT32_SCORE_SEED_MMA_K = 16
+INT32_SCORE_SEED_TILE_WORDS = (0x44804480, 0x00004480)
+INT32_SCORE_SEED_TILE_LBO = 128
+INT32_SCORE_SEED_TILE_SBO = 256
 fadd2 = partial(cute.arch.add_packed_f32x2, ftz=False, rnd="rn")
 fmul2 = partial(cute.arch.mul_packed_f32x2, ftz=False, rnd="rn")
 ffma2 = partial(cute.arch.fma_packed_f32x2, ftz=False, rnd="rn")
@@ -154,14 +181,35 @@ def _swaps_routed_coordinate(
     return atom_origin, atom_origin + Int32(token_offset) + lane_k_offset
 
 
-def _mma_kind_for_qkv(cfg: FmhaDecodeConfig) -> prims.Tcgen05MMAKind:
-    """Select the tcgen05 MMA opcode family used for Q/K/V operands."""
-    return prims.Tcgen05MMAKind.F8F6F4 if cfg.use_fp8_qkv else prims.Tcgen05MMAKind.F16
+def _mma_kind_for_qk(cfg: FmhaDecodeConfig) -> prims.Tcgen05MMAKind:
+    """Select the tcgen05 MMA kind of BMM1 from the Q/K dtype.
+
+    Int8 accumulates INT32 scores; E4M3 and the 16-bit types accumulate FP32.
+    """
+    if cfg.q_dtype == Int8:
+        return prims.Tcgen05MMAKind.INT8
+    return prims.Tcgen05MMAKind.F8F6F4 if cfg.use_8bit_qkv else prims.Tcgen05MMAKind.F16
+
+
+def _mma_kind_for_pv(cfg: FmhaDecodeConfig) -> prims.Tcgen05MMAKind:
+    """Select the tcgen05 MMA kind of BMM2 from the V (and hence P) dtype."""
+    if cfg.value_dtype == Float8E4M3FN:
+        return prims.Tcgen05MMAKind.F8F6F4
+    return prims.Tcgen05MMAKind.F16
+
+
+def _qk_accumulator_dtype(cfg: FmhaDecodeConfig) -> type:
+    """Return the type BMM1 accumulates one score as: Int32 for Int8 Q/K.
+
+    INT32 scores are accumulated on top of ``INT32_SCORE_BIAS``, so the
+    softmax reads every score tile as FP32.
+    """
+    return Int32 if cfg.uses_int32_scores else Float32
 
 
 def _mma_k_step(cfg: FmhaDecodeConfig) -> int:
     """Return the K dimension advanced by one tcgen05 MMA instruction."""
-    return 32 if cfg.use_fp8_qkv else 16
+    return FP8_MMA_K_STEP if cfg.use_8bit_qkv else FP16_MMA_K_STEP
 
 
 @cute.jit
@@ -354,7 +402,7 @@ def _pack_float2_to_bf16(v0: Float32, v1: Float32) -> Int32:
 
 def _qkv_smem_swizzle(cfg: FmhaDecodeConfig) -> prims.Tcgen05SmemSwizzle:
     """Select the tcgen05 SMEM swizzle for staged Q/K/V tiles."""
-    if cfg.use_fp8_qkv and cfg.headdim == 64:
+    if cfg.use_8bit_qkv and cfg.headdim == 64:
         return prims.Tcgen05SmemSwizzle.SWIZZLE_64B
     return prims.Tcgen05SmemSwizzle.SWIZZLE_128B
 
@@ -379,7 +427,7 @@ def _major_k_stride_bytes(dtype_bytes: int, headdim: int) -> int:
 @cute.jit
 def _fp8_log2_quant_scale() -> Float32:
     """Return log2 scaling used by FP8 probability quantization."""
-    return Float32(8.8073549)
+    return Float32(FP8_P_QUANT_LOG2_SCALE)
 
 
 def _neg_max_f32() -> Float32:

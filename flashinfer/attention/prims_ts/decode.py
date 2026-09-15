@@ -661,14 +661,28 @@ def _dtype_key(dtype: torch.dtype) -> str:
         torch.float16: "float16",
         torch.bfloat16: "bfloat16",
         torch.float8_e4m3fn: "float8_e4m3fn",
+        torch.int8: "int8",
     }
     try:
         return keys[dtype]
     except KeyError as error:
         raise NotImplementedError(
             "attention-ts decode supports torch.float16, torch.bfloat16, "
-            f"and torch.float8_e4m3fn; got {dtype}"
+            f"torch.float8_e4m3fn, and torch.int8; got {dtype}"
         ) from error
+
+
+def _cutlass_dtype(dtype_key: str):
+    """Return the cutlass numeric type named by a ``_dtype_key`` result."""
+
+    import cutlass
+
+    return {
+        "float16": cutlass.Float16,
+        "bfloat16": cutlass.BFloat16,
+        "float8_e4m3fn": cutlass.Float8E4M3FN,
+        "int8": cutlass.Int8,
+    }[dtype_key]
 
 
 def _validate_dtype_pair(
@@ -703,11 +717,12 @@ def _validate_dtype_pair(
         raise NotImplementedError(
             "attention-ts decode supports FP16->FP16, BF16->BF16, "
             + (
-                "FP8-E4M3->FP16/BF16, and FP8-E4M3->FP8-E4M3; got "
+                "FP8-E4M3->FP16/BF16, and FP8-E4M3->FP8-E4M3; "
                 if allow_fp8_bf16_output
-                else "FP8-E4M3->FP16, and FP8-E4M3->FP8-E4M3; got "
+                else "FP8-E4M3->FP16, and FP8-E4M3->FP8-E4M3; "
             )
-            + f"{q_dtype}->{output_dtype}"
+            + "INT8 Q/K are supported only with Sage scales through "
+            + f"BlockSparseTSWrapper; got {q_dtype}->{output_dtype}"
         )
 
 
@@ -1156,8 +1171,6 @@ def _resolve_decode_launch_spec(
         page_size if storage_page_size is None else storage_page_size,
     )
 
-    import cutlass
-
     from .kernels.fmha_decode.fmha_decode_config import (
         MIN_LOOP_ITERS_PER_SPLIT,
         get_max_active_clusters_for_cluster_size,
@@ -1169,13 +1182,8 @@ def _resolve_decode_launch_spec(
         raise ValueError("the cached TS decode compiler accepts HND only")
     if q_dtype_key != kv_dtype_key:
         raise ValueError("the cached TS decode compiler requires one QKV dtype")
-    dtype_map = {
-        "float16": cutlass.Float16,
-        "bfloat16": cutlass.BFloat16,
-        "float8_e4m3fn": cutlass.Float8E4M3FN,
-    }
-    qkv_dtype = dtype_map[q_dtype_key]
-    output_dtype = dtype_map[output_dtype_key]
+    qkv_dtype = _cutlass_dtype(q_dtype_key)
+    output_dtype = _cutlass_dtype(output_dtype_key)
 
     def make_config(
         args: object | None = None,
@@ -1413,13 +1421,8 @@ def _get_compiled_decode(
     from .kernels.fmha_decode.fmha_decode_config import FmhaDecodeConfig
     from .kernels.fmha_decode.fmha_decode_kernel import fmha_decode_launch
 
-    dtype_map = {
-        "float16": cutlass.Float16,
-        "bfloat16": cutlass.BFloat16,
-        "float8_e4m3fn": cutlass.Float8E4M3FN,
-    }
-    qkv_dtype = dtype_map[q_dtype_key]
-    output_dtype = dtype_map[output_dtype_key]
+    qkv_dtype = _cutlass_dtype(q_dtype_key)
+    output_dtype = _cutlass_dtype(output_dtype_key)
     cfg = FmhaDecodeConfig(**dict(compile_spec.config_items))
     storage_page_size = int(cfg.effective_storage_tokens_per_page)
     partial_dtype = output_dtype

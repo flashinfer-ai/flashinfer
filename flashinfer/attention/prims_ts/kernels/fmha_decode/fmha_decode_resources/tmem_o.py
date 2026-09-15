@@ -36,7 +36,12 @@ from cutlass.experimental.task_scheduling.resources import (
     producer_work,
 )
 
-from ..fmha_decode_constants import KV_INST0
+from ..fmha_decode_constants import (
+    KV_INST0,
+    PACKED_REGISTER_BYTES,
+    SMEM_DESC_UNIT_BYTES,
+    SWIZZLE_128B_ROW_BYTES,
+)
 from ..fmha_decode_config import FmhaDecodeConfig
 from ...tcgen05_compat import tcgen05_mma_ws
 from .helpers_common import (
@@ -47,7 +52,7 @@ from .helpers_common import (
     _decode_gen_task_cache,
     _freeze_smem_descriptor,
     _mma_k_step,
-    _mma_kind_for_qkv,
+    _mma_kind_for_pv,
 )
 
 
@@ -234,13 +239,16 @@ class TmemOResource(DecodeGenResourceBase):
         fragment_idx: Constexpr[int],
         initial_scale_d,
     ) -> None:
-        """Issue the two MMA K-steps covered by one streamed P fragment.
+        """Issue the MMA K-steps covered by one streamed P fragment.
 
         ``p_tmem_addr`` is already the base of the fragment selected by
-        ``wait_p_fragment``. Only the two local K-step offsets are added here;
-        ``fragment_idx`` must not be applied to the TMEM address again. KV256
-        issues the WS 2x2 instruction over its two spatial halves; KV128 issues
-        the plain M=128 instruction and advances V by one K16 slice per step.
+        ``wait_p_fragment``. Only the local K-step offsets are added here;
+        ``fragment_idx`` must not be applied to the TMEM address again. A K32
+        fragment is two K16 steps for 16-bit operands and one K32 step for
+        FP8. KV256 issues the WS 2x2 instruction over its two spatial halves,
+        whose V is staged as KV64 blocks; KV128 issues the plain M=128
+        instruction over one contiguous V tile. Every K step spans
+        ``mma_k_step`` swizzled 128-byte V rows.
         """
         cfg = self.cfg
         assert cfg.streams_tmem_p_fragments
@@ -256,29 +264,44 @@ class TmemOResource(DecodeGenResourceBase):
         _, mma_m, mma_n, a_major, b_major = _pv_mma_operand_contract_for_config(cfg)
         idesc = prims.Tcgen05InstrDesc.build(
             c_dtype=Float32,
-            a_dtype=cfg.q_dtype,
-            b_dtype=cfg.q_dtype,
+            a_dtype=cfg.value_dtype,
+            b_dtype=cfg.value_dtype,
             a_major=a_major,
             b_major=b_major,
             n_dim=mma_n,
             m_dim=mma_m,
         )
-        first_k_step = fragment_idx * 2
+        mma_k_step = _mma_k_step(cfg)
+        k_steps_per_fragment = cfg.pv_mma_steps_per_fragment
+        first_k_step = fragment_idx * k_steps_per_fragment
+        # One K step covers ``mma_k_step`` swizzled V rows, and one packed P
+        # column holds four bytes of the K-major P row.
+        k_step_desc_units = mma_k_step * SWIZZLE_128B_ROW_BYTES // SMEM_DESC_UNIT_BYTES
+        p_cols_per_k_step = mma_k_step * cfg.q_dtype_bytes // PACKED_REGISTER_BYTES
         if prims.elect_sync():
-            for local_k_step in cutlass.range_constexpr(2):
+            for local_k_step in cutlass.range_constexpr(k_steps_per_fragment):
                 k_step = first_k_step + local_k_step
                 p_operand = prims.make_tmem_ptr(
-                    p_tmem_addr + Int32(local_k_step * 8), Int32
+                    p_tmem_addr + Int32(local_k_step * p_cols_per_k_step), Int32
                 )
                 scale_d = initial_scale_d or fragment_idx != 0 or local_k_step != 0
                 if cutlass.const_expr(cfg.uses_ws_2x2_datapath):
-                    # V holds four K64 atoms; jump between atoms every four
-                    # K16 steps.
+                    # V holds four KV64 blocks in two spatial pairs; jump to
+                    # the next pair once the K steps have covered 64 tokens.
+                    k_steps_per_block = 64 // mma_k_step
+                    block_pair_desc_units = (
+                        2
+                        * 64
+                        * cfg.headdim
+                        * cfg.kv_dtype_bytes
+                        // SMEM_DESC_UNIT_BYTES
+                    )
                     iter_v_desc = v_desc + Int32(
-                        (k_step // 4) * cfg.headdim * 16 + (k_step % 4) * 128
+                        (k_step // k_steps_per_block) * block_pair_desc_units
+                        + (k_step % k_steps_per_block) * k_step_desc_units
                     )
                     tcgen05_mma_ws(
-                        _mma_kind_for_qkv(cfg),
+                        _mma_kind_for_pv(cfg),
                         tmem_col,
                         p_operand,
                         iter_v_desc,
@@ -286,9 +309,9 @@ class TmemOResource(DecodeGenResourceBase):
                         scale_d,
                     )
                 else:
-                    iter_v_desc = v_desc + Int32(k_step * 128)
+                    iter_v_desc = v_desc + Int32(k_step * k_step_desc_units)
                     prims.tcgen05_mma(
-                        _mma_kind_for_qkv(cfg),
+                        _mma_kind_for_pv(cfg),
                         prims.CTAGroup.CTA_1,
                         tmem_col,
                         p_operand,
@@ -349,8 +372,8 @@ class TmemOResource(DecodeGenResourceBase):
             )
             idesc = prims.Tcgen05InstrDesc.build(
                 c_dtype=Float32,
-                a_dtype=cfg.q_dtype,
-                b_dtype=cfg.q_dtype,
+                a_dtype=cfg.value_dtype,
+                b_dtype=cfg.value_dtype,
                 a_major=a_major,
                 b_major=b_major,
                 n_dim=mma_n,
@@ -381,7 +404,7 @@ class TmemOResource(DecodeGenResourceBase):
                     else:
                         a_desc, b_desc = v_desc, p_operand
                     prims.tcgen05_mma(
-                        _mma_kind_for_qkv(cfg),
+                        _mma_kind_for_pv(cfg),
                         prims.CTAGroup.CTA_1,
                         tmem_col,
                         a_desc,
@@ -395,11 +418,11 @@ class TmemOResource(DecodeGenResourceBase):
                         # slice, including the 16-bit 128-token jump across
                         # split SMEM rows.
                         v_desc = v_desc + Int32(
-                            (cfg.headdim * 2) if cfg.use_fp8_qkv else 128
+                            (cfg.headdim * 2) if cfg.use_8bit_qkv else 128
                         )
                         if cutlass.const_expr(not cfg.uses_tmem_p):
                             if cutlass.const_expr(
-                                not cfg.use_fp8_qkv
+                                not cfg.use_8bit_qkv
                                 and cfg.tile_size_kv == 128
                                 and ki == 3
                             ):
@@ -429,8 +452,8 @@ class TmemOResource(DecodeGenResourceBase):
             )
             idesc = prims.Tcgen05InstrDesc.build(
                 c_dtype=Float32,
-                a_dtype=cfg.q_dtype,
-                b_dtype=cfg.q_dtype,
+                a_dtype=cfg.value_dtype,
+                b_dtype=cfg.value_dtype,
                 a_major=a_major,
                 b_major=b_major,
                 n_dim=mma_n,
@@ -455,7 +478,7 @@ class TmemOResource(DecodeGenResourceBase):
                     else:
                         a_desc, b_desc = v_desc, p_operand
                     prims.tcgen05_mma(
-                        _mma_kind_for_qkv(cfg),
+                        _mma_kind_for_pv(cfg),
                         prims.CTAGroup.CTA_1,
                         tmem_col,
                         a_desc,
@@ -470,11 +493,11 @@ class TmemOResource(DecodeGenResourceBase):
                         # Advance V and P to the next MMA-K slice inside the
                         # staged head-dim tile.
                         v_desc = v_desc + Int32(
-                            (cfg.head_dim_kv_stage * 2) if cfg.use_fp8_qkv else 128
+                            (cfg.head_dim_kv_stage * 2) if cfg.use_8bit_qkv else 128
                         )
                         if cutlass.const_expr(not cfg.uses_tmem_p):
                             if cutlass.const_expr(
-                                not cfg.use_fp8_qkv
+                                not cfg.use_8bit_qkv
                                 and cfg.tile_size_kv == 128
                                 and ki == 3
                             ):
