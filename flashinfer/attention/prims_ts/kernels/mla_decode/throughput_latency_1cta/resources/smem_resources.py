@@ -808,10 +808,13 @@ class SmemPageOffsetsResource(MlaResource):
         if cutlass.const_expr(cfg.sparse_direct):
             batch_idx = batch_idx_for_stage_cfg(self.batch_idx, cfg, stage_info)
             cta_idx_q = cta_idx_q_for_stage(self.cta_idx_q, stage_info)
-            cta_idx_kv = cta_idx_kv_for_stage(self.cta_idx_kv, stage_info)
+            task_cache = decode_gen_task_cache(stage_info)
+            cta_idx_kv = cta_idx_kv_for_stage(
+                self.cta_idx_kv, stage_info, task_cache, cfg
+            )
             seq_len_kv = runtime_seq_len_kv_from_task_cache(
                 cfg,
-                decode_gen_task_cache(stage_info),
+                task_cache,
                 cta_idx_q,
                 self.cu_seqlens_q,
                 batch_idx,
@@ -1762,10 +1765,11 @@ class SmemKvResource(MlaResource):
         )
         batch_idx = batch_idx_for_stage_cfg(self.batch_idx, cfg, stage_info)
         cta_idx_q = cta_idx_q_for_stage(self.cta_idx_q, stage_info)
-        cta_idx_kv = cta_idx_kv_for_stage(self.cta_idx_kv, stage_info)
+        task_cache = decode_gen_task_cache(stage_info)
+        cta_idx_kv = cta_idx_kv_for_stage(self.cta_idx_kv, stage_info, task_cache, cfg)
         seq_len_kv = runtime_seq_len_kv_from_task_cache(
             cfg,
-            decode_gen_task_cache(stage_info),
+            task_cache,
             cta_idx_q,
             self.cu_seqlens_q,
             batch_idx,

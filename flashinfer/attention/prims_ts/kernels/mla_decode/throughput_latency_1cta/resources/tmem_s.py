@@ -293,6 +293,24 @@ class TmemSResource(MlaResource):
         del stage_info
         return self._make_initial_softmax_vars()
 
+    @consumer_work(work_attrs=WorkAttr.AUXILIARY)
+    @cute.jit
+    def reset_keeps_softmax_work_tile_scratch(self, stage_info: StageInfo) -> None:
+        """Reset the shared q64 online-softmax state for one work tile."""
+        del stage_info
+        if cutlass.const_expr(self.cfg.kernel_variant == "keeps_mma_ab"):
+            state_ptr = self._softmax_scratch.data_ptr(cute.arch.thread_idx()[0])
+            state_ptr.store(
+                float_to_u32_bits(neg_max_f32()),
+                is_volatile=True,
+                alignment=4,
+            )
+            softmax_sum_state_ptr(state_ptr).store(
+                float_to_u32_bits(Float32(0.0)),
+                is_volatile=True,
+                alignment=4,
+            )
+
     @producer_work(work_attrs=WorkAttr.AUXILIARY)
     @cute.jit
     def reset_softmax_work_tile_state(self, stage_info: StageInfo) -> None:
@@ -671,6 +689,8 @@ class TmemSResource(MlaResource):
                         self.cu_seqlens_q,
                         self.cp_rank,
                     )
+                    if cutlass.const_expr(cfg.use_balanced_scheduler == 1):
+                        row_seq_len_kv = cute.math.min(seq_len_kv, row_seq_len_kv)
                 for reg_idx in cutlass.range_constexpr(num_s_regs_per_thread(cfg)):
                     token_idx = tile_offset_k + local_col_base + Int32(reg_idx)
                     if invalid_sparse_token(
@@ -718,6 +738,9 @@ class TmemSResource(MlaResource):
                             self.cu_seqlens_q,
                             self.cp_rank,
                         )
+                        if cutlass.const_expr(cfg.use_balanced_scheduler == 1):
+                            seq_len_kv_0 = cute.math.min(seq_len_kv, seq_len_kv_0)
+                            seq_len_kv_1 = cute.math.min(seq_len_kv, seq_len_kv_1)
                     s_base = repeat_idx * 4
                     s_second_panel_base = q_repeats * 4 + s_base
                     token_idx = tile_offset_k + local_idx_k0

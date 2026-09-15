@@ -21,6 +21,7 @@ _SWA_LAZY_EXPORTS = frozenset(
 _PRIMS_TS_LAZY_EXPORTS = frozenset(
     {
         "get_prims_ts_batch_mla_decode_workspace_size",
+        "should_use_prims_ts_balanced_mla",
     }
 )
 

@@ -165,6 +165,9 @@ class MlaConfig(Nvfp4KVConfig):
     num_ctas_for_all_heads: int = 1
     num_ctas_per_head_dim: int = 1
     head_dim_per_cta_v: int = 512
+    use_balanced_scheduler: int = 0
+    balanced_descriptor_capacity: int = 0
+    balanced_partial_capacity: int = 0
     head_dim_per_stage_kv: int = 128
     head_dim_per_stage_v: int = 128
     num_tokens_per_page: int = 32
@@ -916,6 +919,7 @@ def keeps_mma_ab_config_kwargs(
     qkv_dtype: str,
     *,
     sparse_d576: bool = False,
+    use_balanced_scheduler: bool = False,
 ) -> dict[str, int]:
     """Return keeps-MMA-AB scheduler, pipeline, and register traits."""
 
@@ -923,11 +927,15 @@ def keeps_mma_ab_config_kwargs(
     q_stages = 1
     if qkv_dtype == "e4m3":
         kv_stages = 8
-        q_stages = MlaConfig.q_stages
+        q_stages = 1 if use_balanced_scheduler else MlaConfig.q_stages
 
     use_persistent_scheduler = profile.use_persistent_scheduler
     use_clc_dynamic_persistent_scheduler = profile.use_clc_dynamic_persistent_scheduler
-    if profile.use_multi_ctas_kv == 1:
+    if profile.use_multi_ctas_kv == 1 and not use_balanced_scheduler:
+        # Ordinary keeps-MMA-AB multi-CTA profiles use the rectangular launch
+        # and standalone reducer. Balanced profiles instead require their
+        # descriptor-backed persistent queue even though they also publish
+        # split partials.
         use_persistent_scheduler = 0
         use_clc_dynamic_persistent_scheduler = 0
 
@@ -1740,6 +1748,9 @@ def make_throughput_latency_mla_config(
     mask_type: MaskType | str = MaskType.CAUSAL,
     softmax_rescale_threshold_log2: float = 0.0,
     sparse_profile=None,
+    use_balanced_scheduler: bool = False,
+    balanced_descriptor_capacity: int = 0,
+    balanced_partial_capacity: int = 0,
 ) -> MlaConfig:
     """Return throughput-latency 1CTA MLA traits for a concrete profile.
 
@@ -1818,6 +1829,17 @@ def make_throughput_latency_mla_config(
     elif isinstance(profile, str):
         tile_size_q = tile_size_q_from_profile_name(profile)
     max_active_clusters = validate_max_active_clusters(max_active_clusters)
+    if use_balanced_scheduler:
+        if balanced_descriptor_capacity <= 0:
+            raise ValueError(
+                "balanced_descriptor_capacity must be positive for balanced scheduling"
+            )
+        if balanced_partial_capacity <= 0:
+            raise ValueError(
+                "balanced_partial_capacity must be positive for balanced scheduling"
+            )
+        if o_dtype != "bf16":
+            raise ValueError("balanced 1CTA MLA requires BF16 output storage")
 
     head_dim_qk = latent_dim + rope_dim
     selected_profile = resolve_throughput_latency_mla_profile(
@@ -1841,10 +1863,26 @@ def make_throughput_latency_mla_config(
         selected_profile,
         explicit_persistent,
     )
-    if selected_profile.use_persistent_scheduler and selected_profile.use_multi_ctas_kv:
-        # Persistent work queues enumerate Q/head-dimension tiles, not KV
-        # splits. Direct MlaProfile callers must obey the same restriction
-        # as persistent_override_profile, or only split zero gets produced.
+    if use_balanced_scheduler:
+        # Retain the selected Q/V decomposition and task graph, but replace its
+        # rectangular split policy with the descriptor-backed persistent queue.
+        # A non-unit split value keeps the established partial-output path
+        # enabled; descriptor ranges, rather than this value, own the K domain.
+        balanced_split_capacity = min(
+            127,
+            max_active_clusters,
+            max(1, ceil(seq_len_kv / MlaConfig.tile_size_kv)),
+        )
+        selected_profile = replace(
+            selected_profile,
+            num_ctas_per_seq_kv=balanced_split_capacity,
+            use_persistent_scheduler=1,
+            use_clc_dynamic_persistent_scheduler=0,
+            use_multi_ctas_kv=1,
+            use_cluster_reduction=0,
+        )
+    elif selected_profile.use_persistent_scheduler and selected_profile.use_multi_ctas_kv:
+        # The ordinary persistent queue does not enumerate KV splits.
         raise ValueError(
             "1CTA persistent scheduling is not supported with split-KV; "
             "use split_kv=1 or nonpersistent scheduling"
@@ -1949,6 +1987,9 @@ def make_throughput_latency_mla_config(
             selected_profile.use_clc_dynamic_persistent_scheduler
         ),
         persistent_wave_sm_count=persistent_wave_sm_count,
+        use_balanced_scheduler=int_flag(use_balanced_scheduler),
+        balanced_descriptor_capacity=balanced_descriptor_capacity,
+        balanced_partial_capacity=balanced_partial_capacity,
     )
     config_kwargs.update(dtype_config_kwargs(qkv_dtype, o_dtype))
     if selected_profile.kernel_variant == "keeps_mma_ab":
@@ -1957,6 +1998,7 @@ def make_throughput_latency_mla_config(
                 selected_profile,
                 qkv_dtype,
                 sparse_d576=sparse_d576,
+                use_balanced_scheduler=use_balanced_scheduler,
             )
         )
     cfg = MlaConfig(**config_kwargs)
