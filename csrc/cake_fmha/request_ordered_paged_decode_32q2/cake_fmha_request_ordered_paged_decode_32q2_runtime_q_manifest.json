@@ -1,0 +1,75 @@
+{
+  "binding_count": 2,
+  "bindings": [
+    {
+      "module_name": "cake_fmha_request_ordered_paged_decode_32q2_runtime_q_1b59550a82ae20044666",
+      "write_lse": false
+    },
+    {
+      "module_name": "cake_fmha_request_ordered_paged_decode_32q2_runtime_q_0c98c7f35100446deb10",
+      "write_lse": true
+    }
+  ],
+  "contract": {
+    "head_dim": 256,
+    "kv_dtype": "float8_e4m3fn",
+    "num_kv_heads": 2,
+    "num_q_heads": 32,
+    "num_split": 1,
+    "ordered": true,
+    "page_size": 64,
+    "q_groups_per_kv": 2,
+    "q_len": {
+      "excluding": [
+        1,
+        6
+      ],
+      "kind": "uniform_positive_integer",
+      "value_source": "grid.x"
+    },
+    "query_heads_per_work_group": 8,
+    "query_output_dtype": "bfloat16",
+    "request_order": "optional_device_int32",
+    "softmax_accumulation_dtype": "float32",
+    "workspace_parts": 1
+  },
+  "module_count": 2,
+  "modules": [
+    {
+      "arch": "sm_103a",
+      "binding_mode": "embedded_cubin",
+      "binding_path": "generated/sm_103a/cake_fmha_request_ordered_paged_decode_32q2_runtime_q_0c98c7f35100446deb10_binding.cpp",
+      "binding_sha256": "4f6b26354f6ed9d2048fdc1c06ec093a44b2e3c1e1210fca60d421d14ffd5c17",
+      "closure_sha256": "c42acedf4a1fdc77cef27a03ea287de2346b284dc6e61f1e4c1a2372db1b1aba",
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "device_path": "generated/sm_103a/cake_fmha_request_ordered_paged_decode_32q2_runtime_q_0c98c7f35100446deb10_kernel.cu",
+      "device_sha256": "a1e720a076998efe87267b46633612aa83961de2edb615a204fa80daf5cd6f78",
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_fmha_request_ordered_paged_decode_32q2_runtime_q_0c98c7f35100446deb10",
+      "module_ident": "cake_fmha_request_ordered_paged_decode_32q2_runtime_q_0c98c7f35100446deb10_sm_103a",
+      "name": "cake_fmha_request_ordered_paged_decode_32q2_runtime_q_0c98c7f35100446deb10",
+      "tma_workspace_bytes": 384
+    },
+    {
+      "arch": "sm_103a",
+      "binding_mode": "embedded_cubin",
+      "binding_path": "generated/sm_103a/cake_fmha_request_ordered_paged_decode_32q2_runtime_q_1b59550a82ae20044666_binding.cpp",
+      "binding_sha256": "b0b47705e9e5d8195f0f62135b613d8d749cb112fb0a8d90e9507768ab1073fb",
+      "closure_sha256": "1f7f252fe2e06d93b35bff83ec779c0d9fe7af4e67550283b9e3895d55851189",
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "device_path": "generated/sm_103a/cake_fmha_request_ordered_paged_decode_32q2_runtime_q_1b59550a82ae20044666_kernel.cu",
+      "device_sha256": "c04fc4697e55013ab484d15f928951503f06f05ad1e13de0e360baef9c5a6977",
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_fmha_request_ordered_paged_decode_32q2_runtime_q_1b59550a82ae20044666",
+      "module_ident": "cake_fmha_request_ordered_paged_decode_32q2_runtime_q_1b59550a82ae20044666_sm_103a",
+      "name": "cake_fmha_request_ordered_paged_decode_32q2_runtime_q_1b59550a82ae20044666",
+      "tma_workspace_bytes": 384
+    }
+  ],
+  "schema": "flashinfer.cake_fmha_request_ordered_runtime_q.v1",
+  "target": "sm_103a"
+}

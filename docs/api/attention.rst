@@ -160,6 +160,24 @@ must be invoked once eagerly to initialize its TMA descriptors before capture.
 After that prewarm, changing only the order tensor contents does not require
 recapture.
 
+The planner's optional ``num_kv_splits`` selects an exported split schedule;
+omitting it preserves the ordinary schedule selection. For 32 query heads and
+2 KV heads, the generated schedules include Q1 with 4 splits and Q6 with 2
+splits when ``write_lse=True``, and fused Q6 with 6 splits when
+``write_lse=False``. An unavailable combination raises ``ValueError``.
+Use the returned plan unchanged: fused and unfused schedules have different
+launch layouts, and device lengths and request order remain mutable on replay.
+
+Split plans require a zero-initialized ``multi_ctas_kv_counter_buffer`` with
+at least ``batch * q_len * (num_q_heads // 8)`` int32 elements. Their uint8
+workspace must contain at least
+``32 MiB + batch * q_len * num_q_heads * plan.workspace_parts * (256 * 2 + 4)``
+bytes. When ``plan.write_lse`` is true, also pass a contiguous FP32 ``lse``
+tensor with shape ``[batch * q_len, num_q_heads]``. Allocate these buffers
+before capture and retain them with the graph. Query tensors produced inside
+capture use :class:`flashinfer.cake_fmha.CakeFmhaRequestOrderedCapture` and its
+normal finalization step before replay.
+
 .. currentmodule:: flashinfer
 
 .. autosummary::

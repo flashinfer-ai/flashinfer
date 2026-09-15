@@ -64,6 +64,16 @@ package.
 
 .. currentmodule:: flashinfer.cake_fmha
 
+The SM103a request-ordered BF16-query/FP8-KV path also accepts an explicit
+six-part plan for six-query decode with 32 query heads and two KV heads,
+without returning LSE. Each workgroup handles the 16 query heads associated
+with one KV head, so the authenticated plan has grid ``(6, 2, batch_size)``.
+The logical tensor layout, completion-buffer allocation and descriptor
+capture API remain unchanged. Call
+``flashinfer.plan_cake_fmha_request_ordered_paged_decode`` before graph capture
+to obtain the current plan; a plan carrying the previous four-workgroup grid
+does not authenticate against this exported route.
+
 .. autosummary::
     :toctree: ../generated
 
@@ -84,3 +94,53 @@ The same implementation can also be selected on the existing APIs with
         max_kv_len,
         backend="cake",
     )
+
+Single-request six-query split route
+------------------------------------
+
+For one request with six query tokens, 32 query heads, two KV heads,
+head dimension 256 and page size 64, explicitly setting ``num_kv_splits=76``
+selects the O-only split route. This route requires at least 43,671,552 bytes
+in ``workspace_buffer`` and the existing separate 24-element completion buffer.
+The default route and LSE-returning routes are unchanged.
+
+FP8-query request-ordered route
+------------------------------
+
+An explicit ``query_dtype=torch.float8_e4m3fn`` plan selects a separate
+FP8 E4M3-query/FP8 E4M3-KV route with BF16 output. It supports batches
+64, 128, 160, 192, 224 and 256, six query tokens per request, 32 query heads, two KV heads, head dimension
+256 and page size 64 on a 152-SM SM103 device. Every KV length must be at least
+six; split execution and LSE output are unavailable for this export.
+
+Queries are contiguous ``[batch_size * 6, 32, 256]``. K/V use HND views
+``[pages, 2, 64, 256]`` with strides ``[32768, 256, 512, 1]``, directly viewing
+native ``[pages, 64, 2, 256]`` storage. Use shared contiguous int32 page tables,
+a device int32 request permutation, and device FP32 log2 QK/output scales.
+The kernel reads these caller buffers directly without external gather or
+scatter. The default BF16-query planner and its existing routes are unchanged.
+
+The existing ``CakeFmhaRequestOrderedCapture`` protocol applies. Give each live
+graph binding its own 128-byte-aligned uint8 workspace of at least 388 bytes,
+warm an ordinary invocation, record with the capture object, and finalize it
+before replay. Keep its workspace alive with the graph. Tensor contents may
+change in place while their storage, shape and minimum-length contract remain
+valid.
+
+
+Low-batch FP8 query plans
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+The request-order planner also supports Q6, 32 query heads, 2 KV heads,
+head dimension 256, and page size 64 for batch 8 with eight KV splits and
+batches 27 or 32 with two splits. The selected public decode call launches
+the generated producer followed by its FP32 partial reducer on the same
+stream. Caller Q/K/V, page tables, sequence lengths, scales and request
+order keep their storage; there is no external gather/scatter.
+
+These plans accept ``write_lse=True`` for FP32 base2 LSE. Their caller-owned,
+128-byte-aligned uint8 workspace must contain at least
+``384 + (batch * 6 * 32 * splits * 258 + 1) * 4`` bytes. Allocate a separate
+workspace for each live graph binding and use
+``CakeFmhaRequestOrderedCapture`` to prepare descriptors before replay.
+The graph includes both the producer and reducer launches.

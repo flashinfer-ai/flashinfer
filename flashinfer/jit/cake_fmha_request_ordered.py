@@ -34,6 +34,187 @@ _CONTRACT = {
 }
 
 
+_FP8Q_MANIFEST_NAME = "cake_fmha_request_ordered_paged_decode_fp8q_manifest.json"
+_FP8Q_CONTRACT: dict[str, Any] = {
+    "query_dtype": "float8_e4m3fn",
+    "output_dtype": "bfloat16",
+    "kv_dtype": "float8_e4m3fn",
+    "softmax_accumulation_dtype": "float32",
+    "num_q_heads": 32,
+    "num_kv_heads": 2,
+    "head_dim": 256,
+    "page_size": 64,
+    "q_len": 6,
+    "batch_sizes": [64, 128, 160, 192, 224, 256],
+    "minimum_kv_len": 6,
+    "write_lse": False,
+    "kv_strides": [32768, 256, 512, 1],
+    "shared_page_table": True,
+    "request_order": "device_int32_permutation",
+}
+
+
+def _fp8q_source_root(*, split: bool = False) -> Path:
+    directory = "request_ordered_paged_decode_fp8q" + ("_split" if split else "")
+    manifest_name = _FP8Q_SPLIT_MANIFEST_NAME if split else _FP8Q_MANIFEST_NAME
+    installed = jit_env.FLASHINFER_CSRC_DIR / "cake_fmha" / directory
+    checkout = Path(__file__).resolve().parents[2] / "csrc" / "cake_fmha" / directory
+    for candidate in (installed, checkout):
+        if (candidate / manifest_name).is_file():
+            return candidate
+    raise FileNotFoundError("request-ordered FP8-Q sources were not found")
+
+
+@functools.cache
+def get_cake_fmha_request_ordered_fp8q_manifest() -> dict[str, Any]:
+    """Authenticate the independent FP8-query, BF16-output export contract."""
+    root = _fp8q_source_root()
+    manifest = json.loads((root / _FP8Q_MANIFEST_NAME).read_text(encoding="utf-8"))
+    _require(
+        manifest.get("schema") == "flashinfer.cake_fmha_request_ordered_fp8q.v1",
+        "FP8-Q schema",
+    )
+    _require(manifest.get("target") == "sm_103a", "FP8-Q target")
+    _require(manifest.get("contract") == _FP8Q_CONTRACT, "FP8-Q contract")
+    modules, bindings = manifest.get("modules"), manifest.get("bindings")
+    _require(
+        isinstance(modules, list) and isinstance(bindings, list), "FP8-Q inventory"
+    )
+    names = _verify_modules(root, modules)
+    _require(
+        len(modules) == len(bindings) == len(_FP8Q_CONTRACT["batch_sizes"]),
+        "FP8-Q inventory count",
+    )
+    _require(manifest.get("module_count") == len(modules), "FP8-Q module count")
+    seen = set()
+    for binding in bindings:
+        batch = binding.get("batch_size")
+        _require(
+            batch in _FP8Q_CONTRACT["batch_sizes"] and batch not in seen, "FP8-Q batch"
+        )
+        seen.add(batch)
+        expected = dict(
+            batch_size=batch,
+            q_len=6,
+            num_q_heads=32,
+            num_kv_heads=2,
+            workspace_parts=1,
+            grid=[1, 1, batch * 2],
+            total_tiles=batch * 2,
+            write_lse=False,
+            query_dtype="float8_e4m3fn",
+        )
+        _require(
+            {key: value for key, value in binding.items() if key != "module_name"}
+            == expected,
+            "FP8-Q binding",
+        )
+        _require(binding.get("module_name") in names, "FP8-Q module binding")
+    _require(
+        {binding["module_name"] for binding in bindings} == names,
+        "FP8-Q module coverage",
+    )
+    return manifest
+
+
+_FP8Q_SPLIT_MANIFEST_NAME = (
+    "cake_fmha_request_ordered_paged_decode_fp8q_split_manifest.json"
+)
+_FP8Q_SPLIT_CONTRACT: dict[str, Any] = {
+    "query_dtype": "float8_e4m3fn",
+    "output_dtype": "bfloat16",
+    "kv_dtype": "float8_e4m3fn",
+    "num_q_heads": 32,
+    "num_kv_heads": 2,
+    "head_dim": 256,
+    "page_size": 64,
+    "q_len": 6,
+    "batch_splits": [[8, 8], [27, 2], [32, 2]],
+    "minimum_kv_len": 6,
+    "write_lse": [False, True],
+    "lse_base": 2,
+    "partial_dtype": "float32",
+    "kv_strides": [32768, 256, 512, 1],
+    "shared_page_table": True,
+    "request_order": "device_int32_permutation",
+}
+
+
+@functools.cache
+def get_cake_fmha_request_ordered_fp8q_split_manifest() -> dict[str, Any]:
+    """Authenticate compound FP8-query producer/reducer plans."""
+    root = _fp8q_source_root(split=True)
+    manifest = json.loads(
+        (root / _FP8Q_SPLIT_MANIFEST_NAME).read_text(encoding="utf-8")
+    )
+    _require(
+        manifest.get("schema") == "flashinfer.cake_fmha_request_ordered_fp8q_split.v1",
+        "FP8-Q split schema",
+    )
+    _require(manifest.get("target") == "sm_103a", "FP8-Q split target")
+    _require(manifest.get("contract") == _FP8Q_SPLIT_CONTRACT, "FP8-Q split contract")
+    modules, bindings = manifest.get("modules"), manifest.get("bindings")
+    _require(
+        isinstance(modules, list) and isinstance(bindings, list),
+        "FP8-Q split inventory",
+    )
+    _require(
+        len(modules) == manifest.get("module_count") == 7 and len(bindings) == 6,
+        "FP8-Q split inventory count",
+    )
+    producers = [m for m in modules if m.get("tma_workspace_bytes") == 384]
+    reducers = [m for m in modules if m.get("tma_workspace_bytes") == 0]
+    _require(len(producers) == 3 and len(reducers) == 4, "FP8-Q split module roles")
+    producer_names = _verify_modules(root, producers)
+    reducer_names = _verify_modules(root, reducers, tma_workspace_bytes=0)
+    seen = set()
+    for row in bindings:
+        batch, splits, write_lse = (
+            row.get("batch_size"),
+            row.get("workspace_parts"),
+            row.get("write_lse"),
+        )
+        _require(
+            [batch, splits] in _FP8Q_SPLIT_CONTRACT["batch_splits"]
+            and type(write_lse) is bool,
+            "FP8-Q split geometry",
+        )
+        _require((batch, write_lse) not in seen, "FP8-Q split duplicate binding")
+        seen.add((batch, write_lse))
+        expected = dict(
+            batch_size=batch,
+            q_len=6,
+            num_q_heads=32,
+            num_kv_heads=2,
+            workspace_parts=splits,
+            grid=[1, 1, batch * 2 * splits],
+            total_tiles=batch * 2 * splits,
+            write_lse=write_lse,
+            query_dtype="float8_e4m3fn",
+            reducer_grid=[batch * 6 * 32, 1, 1],
+        )
+        _require(
+            {
+                k: v
+                for k, v in row.items()
+                if k not in ("module_name", "reducer_module_name")
+            }
+            == expected,
+            "FP8-Q split binding",
+        )
+        _require(
+            row.get("module_name") in producer_names
+            and row.get("reducer_module_name") in reducer_names,
+            "FP8-Q split module binding",
+        )
+    _require(
+        {row["module_name"] for row in bindings} == producer_names
+        and {row["reducer_module_name"] for row in bindings} == reducer_names,
+        "FP8-Q split module coverage",
+    )
+    return manifest
+
+
 @dataclass(frozen=True)
 class CakeFmhaRequestOrderedModuleSpec:
     """One authenticated generated source pair."""
@@ -54,18 +235,22 @@ def _require(condition: bool, message: str) -> None:
         raise ValueError(f"invalid request-ordered FMHA manifest: {message}")
 
 
-def _source_root() -> Path:
-    installed = (
-        jit_env.FLASHINFER_CSRC_DIR / "cake_fmha" / "request_ordered_paged_decode"
+def _source_root(
+    num_q_heads: int = 8, num_kv_heads: int = 1, *, runtime_q: bool = False
+) -> Path:
+    _require((num_q_heads, num_kv_heads) in ((8, 1), (32, 2)), "head geometry")
+    suffix = "_32q2" if (num_q_heads, num_kv_heads) == (32, 2) else ""
+    directory = "request_ordered_paged_decode" + suffix
+    manifest_name = (
+        "cake_fmha_request_ordered_paged_decode"
+        + suffix
+        + ("_runtime_q" if runtime_q else "")
+        + "_manifest.json"
     )
-    checkout = (
-        Path(__file__).resolve().parents[2]
-        / "csrc"
-        / "cake_fmha"
-        / "request_ordered_paged_decode"
-    )
+    installed = jit_env.FLASHINFER_CSRC_DIR / "cake_fmha" / directory
+    checkout = Path(__file__).resolve().parents[2] / "csrc" / "cake_fmha" / directory
     for candidate in (installed, checkout):
-        if (candidate / _MANIFEST_NAME).is_file():
+        if (candidate / manifest_name).is_file():
             return candidate
     raise FileNotFoundError(
         "request-ordered Cake FMHA sources were not found; checked "
@@ -100,22 +285,9 @@ def _verified_source(root: Path, value: object, digest: object, label: str) -> P
     return path
 
 
-@functools.cache
-def get_cake_fmha_request_ordered_manifest() -> dict[str, Any]:
-    """Load and authenticate the generated-program route ledger."""
-
-    root = _source_root()
-    payload: Any = json.loads((root / _MANIFEST_NAME).read_text())
-    _require(isinstance(payload, dict), "root")
-    _require(payload.get("schema") == _SCHEMA, "schema")
-    _require(payload.get("target") == "sm_103a", "target")
-    _require(payload.get("shape_count") == 43, "shape_count")
-    _require(payload.get("module_count") == 13, "module_count")
-    _require(payload.get("contract") == _CONTRACT, "contract")
-    modules = payload.get("modules")
-    routes = payload.get("routes")
-    _require(isinstance(modules, list) and len(modules) == 13, "modules")
-    _require(isinstance(routes, list) and len(routes) == 43, "routes")
+def _verify_modules(
+    root: Path, modules: list[dict[str, Any]], *, tma_workspace_bytes: int = 384
+) -> set[str]:
     names: set[str] = set()
     for index, module in enumerate(modules):
         _require(isinstance(module, dict), f"modules[{index}]")
@@ -165,8 +337,81 @@ def get_cake_fmha_request_ordered_manifest() -> dict[str, Any]:
             f"modules[{index}].compile_options",
         )
         _require(
-            module.get("tma_workspace_bytes") == 384,
+            module.get("tma_workspace_bytes") == tma_workspace_bytes,
             f"modules[{index}].tma_workspace_bytes",
+        )
+    return names
+
+
+_B1_Q6_S76_BINDING: dict[str, Any] = {
+    "name": "b1_q6_s76",
+    "batch_size": 1,
+    "q_len": 6,
+    "num_q_heads": 32,
+    "num_kv_heads": 2,
+    "num_kv_splits": 76,
+    "write_lse": False,
+    "ordered": True,
+    "grid": [76, 2, 1],
+    "workspace_parts": 76,
+    "total_tiles": 1,
+    "scratch_layout": {
+        "schema": "peer_split_major_padded128_pair_stats_v21",
+        "partial_o_elements_per_batch": 4980736,
+        "partial_stats_elements_per_batch": 38912,
+        "kv_groups": 2,
+        "splits": 76,
+        "padded_rows": 128,
+        "live_rows": 96,
+        "head_dim": 256,
+        "stats_fields": ["raw_max", "sum"],
+        "partial_o_dtype": "bfloat16",
+        "partial_stats_dtype": "float32",
+    },
+}
+
+
+@functools.cache
+def get_cake_fmha_request_ordered_manifest(
+    num_q_heads: int = 8, num_kv_heads: int = 1
+) -> dict[str, Any]:
+    """Load and authenticate the generated-program route ledger."""
+
+    root = _source_root(num_q_heads, num_kv_heads)
+    suffix = "_32q2" if (num_q_heads, num_kv_heads) == (32, 2) else ""
+    manifest_name = "cake_fmha_request_ordered_paged_decode" + suffix + "_manifest.json"
+    payload: Any = json.loads((root / manifest_name).read_text())
+    _require(isinstance(payload, dict), "root")
+    _require(payload.get("schema") == _SCHEMA, "schema")
+    _require(payload.get("target") == "sm_103a", "target")
+    _require(payload.get("shape_count") == 43, "shape_count")
+    supplemental = payload.get("supplemental_bindings", [])
+    _require(isinstance(supplemental, list), "supplemental_bindings")
+    _require(
+        len(supplemental) in ((0, 1) if suffix else (0,)), "supplemental_bindings count"
+    )
+    module_count = 13 + len(supplemental)
+    _require(payload.get("module_count") == module_count, "module_count")
+    expected_contract = dict(
+        _CONTRACT, num_q_heads=num_q_heads, num_kv_heads=num_kv_heads
+    )
+    if suffix:
+        expected_contract.update(
+            q_groups_per_kv=[1, 2], query_heads_per_work_group=[8, 16]
+        )
+    _require(payload.get("contract") == expected_contract, "contract")
+    modules = payload.get("modules")
+    routes = payload.get("routes")
+    _require(isinstance(modules, list) and len(modules) == module_count, "modules")
+    _require(isinstance(routes, list) and len(routes) == 43, "routes")
+    names = _verify_modules(root, modules)
+    for binding in supplemental:
+        _require(isinstance(binding, dict), "supplemental binding")
+        _require(binding.get("module_name") in names, "supplemental module_name")
+        _require(
+            {key: value for key, value in binding.items() if key != "module_name"}
+            == _B1_Q6_S76_BINDING,
+            "supplemental B1/Q6/S76 binding",
         )
     route_names: set[str] = set()
     for index, route in enumerate(routes):
@@ -181,6 +426,72 @@ def get_cake_fmha_request_ordered_manifest() -> dict[str, Any]:
         plan = route.get("build_plan")
         _require(isinstance(plan, dict), f"routes[{index}].build_plan")
         _require(plan.get("q_len") in (1, 6), f"routes[{index}].build_plan.q_len")
+        if suffix:
+            wide_q6 = plan.get("fused_q6") is True and plan.get("write_lse") is False
+            _require(
+                plan.get("num_q_heads") == 32
+                and plan.get("num_kv_heads") == 2
+                and plan.get("q_groups_per_kv") == (1 if wide_q6 else 2)
+                and plan.get("query_heads_per_work_group", 8) == (16 if wide_q6 else 8),
+                f"routes[{index}].build_plan.head_geometry",
+            )
+            _require(
+                route.get("args", {}).get("params", {}).get("num_qo_heads") == 32
+                and route.get("args", {}).get("params", {}).get("num_kv_heads") == 2,
+                f"routes[{index}].args.head_geometry",
+            )
+    return payload
+
+
+@functools.cache
+def get_cake_fmha_request_ordered_runtime_q_manifest(
+    num_q_heads: int = 8, num_kv_heads: int = 1
+) -> dict[str, Any]:
+    """Authenticate the supplemental bindings whose query length is grid.x."""
+    root = _source_root(num_q_heads, num_kv_heads, runtime_q=True)
+    suffix = "_32q2" if (num_q_heads, num_kv_heads) == (32, 2) else ""
+    stem = "cake_fmha_request_ordered_paged_decode" + suffix + "_runtime_q"
+    payload: Any = json.loads((root / (stem + "_manifest.json")).read_text())
+    _require(isinstance(payload, dict), "root")
+    _require(
+        payload.get("schema") == "flashinfer.cake_fmha_request_ordered_runtime_q.v1",
+        "schema",
+    )
+    _require(payload.get("target") == "sm_103a", "target")
+    _require(payload.get("module_count") == 2, "module_count")
+    _require(payload.get("binding_count") == 2, "binding_count")
+    expected_contract = dict(
+        _CONTRACT,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        q_groups_per_kv=num_q_heads // num_kv_heads // 8,
+        query_heads_per_work_group=8,
+        q_len={
+            "kind": "uniform_positive_integer",
+            "excluding": [1, 6],
+            "value_source": "grid.x",
+        },
+        ordered=True,
+        num_split=1,
+        workspace_parts=1,
+    )
+    _require(payload.get("contract") == expected_contract, "contract")
+    modules = payload.get("modules")
+    bindings = payload.get("bindings")
+    _require(isinstance(modules, list) and len(modules) == 2, "modules")
+    _require(isinstance(bindings, list) and len(bindings) == 2, "bindings")
+    names = _verify_modules(root, modules)
+    _require(all(name.startswith(stem + "_") for name in names), "module prefix")
+    for index, binding in enumerate(bindings):
+        _require(isinstance(binding, dict), f"bindings[{index}]")
+        _require(binding.get("module_name") in names, f"bindings[{index}].module_name")
+        _require(type(binding.get("write_lse")) is bool, f"bindings[{index}].write_lse")
+    _require(
+        {binding["write_lse"] for binding in bindings} == {False, True}, "LSE modes"
+    )
+    _require(
+        {binding["module_name"] for binding in bindings} == names, "binding modules"
+    )
     return payload
 
 
@@ -188,8 +499,26 @@ def get_cake_fmha_request_ordered_manifest() -> dict[str, Any]:
 def get_cake_fmha_request_ordered_module_spec(
     name: str,
 ) -> CakeFmhaRequestOrderedModuleSpec:
-    root = _source_root()
-    manifest = get_cake_fmha_request_ordered_manifest()
+    geometry = (
+        (32, 2)
+        if name.startswith("cake_fmha_request_ordered_paged_decode_32q2_")
+        else (8, 1)
+    )
+    if name.startswith("cake_fmha_request_ordered_paged_decode_fp8q_split_"):
+        root = _fp8q_source_root(split=True)
+        manifest = get_cake_fmha_request_ordered_fp8q_split_manifest()
+    elif name.startswith("cake_fmha_request_ordered_paged_decode_fp8q_"):
+        root = _fp8q_source_root()
+        manifest = get_cake_fmha_request_ordered_fp8q_manifest()
+    else:
+        runtime_q = "_runtime_q_" in name
+        root = _source_root(*geometry, runtime_q=runtime_q)
+        reader = (
+            get_cake_fmha_request_ordered_runtime_q_manifest
+            if runtime_q
+            else get_cake_fmha_request_ordered_manifest
+        )
+        manifest = reader(*geometry)
     matches = [module for module in manifest["modules"] if module["name"] == name]
     if len(matches) != 1:
         raise ValueError(f"unknown request-ordered FMHA module: {name}")
@@ -221,12 +550,20 @@ def get_cake_fmha_request_ordered_module_spec(
         f"module {name} embedded-cubin declaration",
     )
     _require(
-        binding.count(
-            f"EmbedCubinModule_{spec.module_ident}::Global()->mod.GetKernel("
-            f'"{spec.kernel_symbol}")'
-        )
-        == 1,
-        f"module {name} kernel lookup",
+        (
+            binding.count(
+                f"EmbedCubinModule_{spec.module_ident}::Global()->mod.GetKernel("
+                f'"{spec.kernel_symbol}")'
+            )
+            == 2
+            if spec.tma_workspace_bytes
+            else binding.count(
+                f"TVM_FFI_EMBED_CUBIN_GET_KERNEL({spec.module_ident}, "
+                f'"{spec.kernel_symbol}")'
+            )
+            == 1
+        ),
+        f"module {name} ordinary and capture kernel lookups",
     )
     _require(
         binding.count(f"TVM_FFI_DLL_EXPORT_TYPED_FUNC({spec.ffi_entry},") == 1,
@@ -447,7 +784,7 @@ def load_cake_fmha_request_ordered_module(name: str):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
         raise RuntimeError("request-ordered Cake FMHA requires compute capability 10.3")
     spec = get_cake_fmha_request_ordered_module_spec(name)
-    root = _source_root()
+    root = spec.binding_path.parents[2]
     cubin, build_directory = _cached_cubin(spec)
     result = cpp.load_inline(
         build_directory.name,
