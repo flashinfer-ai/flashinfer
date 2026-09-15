@@ -189,6 +189,7 @@ def test_cudnn_backend_matches_default(
     num_sab_heads = max(num_q_heads, num_v_heads)
     state = inputs["initial_state"]
 
+    # Exercise FlashInfer's default backend before comparing against cuDNN.
     ref_out, ref_state = chunk_gated_delta_rule(
         inputs["q"],
         inputs["k"],
