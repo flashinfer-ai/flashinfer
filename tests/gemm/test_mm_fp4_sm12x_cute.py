@@ -309,10 +309,10 @@ def test_sm121_defaults_preserve_other_devices_and_unmeasured_shapes():
         ((8192, 34816, 5120), ("raw", 32, 64, 13, True, True, 256, False)),
         ((2048, 34816, 5120), ("cooperative", 256, 128, 128)),
         ((2048, 5120, 17408), ("raw", 64, 32, 8, False, True, 256, True)),
-        ((2000, 1856, 2688), ("cooperative", 128, 128, 256)),
-        ((2000, 2688, 1856), ("cooperative", 128, 128, 256)),
-        ((2000, 2688, 3712), ("cooperative", 128, 128, 256)),
-        ((2000, 3712, 2688), ("cooperative", 128, 128, 256)),
+        ((2000, 1856, 2688), ("cooperative", 128, 128, 128)),
+        ((2000, 2688, 1856), ("cooperative", 128, 128, 128)),
+        ((2000, 2688, 3712), ("cooperative", 128, 128, 128)),
+        ((2000, 3712, 2688), ("cooperative", 128, 128, 128)),
         ((512, 8192, 4096), ("cooperative", 128, 64, 256)),
         ((1024, 7168, 4608), ("raw", 64, 32, 8, False, True, 256, True)),
         ((512, 8192, 8192), ("cooperative", 128, 64, 256)),
@@ -341,6 +341,13 @@ def test_sm121_defaults_preserve_other_devices_and_unmeasured_shapes():
             policy.compatible(*shape, t, compute_capability=(12, 1)) for t in choices
         )
         assert not policy.compatible(*shape, preferred, compute_capability=(12, 0))
+        if preferred == ("cooperative", 128, 128, 128):
+            previous = ("cooperative", 128, 128, 256)
+            assert policy.compatible(*shape, previous, compute_capability=(12, 1))
+            assert previous not in policy.valid_tactics(
+                *shape, compute_capability=(12, 1)
+            )
+            assert not policy.compatible(*shape, previous, compute_capability=(12, 0))
         assert policy.default_tactic(
             *shape, compute_capability=(12, 0)
         ) == policy.default_tactic(*shape)
@@ -570,6 +577,8 @@ def test_sm121_measured_default_public_graph_and_cached_choice(m, n, k, monkeypa
         _assert_bits(out, changed_expected)
         # The new default does not silently migrate an existing cached choice.
         legacy_choices = [policy.default_tactic(m, n, k)]
+        if preferred == ("cooperative", 128, 128, 128):
+            legacy_choices.append(("cooperative", 128, 128, 256))
         if (m, n, k) == (1024, 512, 7168):
             legacy_choices.append(("cooperative", 128, 64, 256))
         for legacy in legacy_choices:

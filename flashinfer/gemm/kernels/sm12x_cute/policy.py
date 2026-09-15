@@ -48,7 +48,7 @@ def _sm121_tactic(m, n, k, compute_capability):
         (2000, 1856, 2688),
         (2000, 2688, 1856),
     ):
-        return ("cooperative", 128, 128, 256)
+        return ("cooperative", 128, 128, 128)
     if compute_capability == (12, 1) and (m, n, k) == (512, 8192, 4096):
         return ("cooperative", 128, 64, 256)
     if compute_capability == (12, 1) and (m, n, k) == (1024, 7168, 4608):
@@ -130,6 +130,11 @@ def compatible(m, n, k, tactic, *, compute_capability=None):
         or tactic == -1
         or tactic in choices
         or tactic in legacy_choices
+        or (
+            tactic == ("cooperative", 128, 128, 256)
+            and _sm121_tactic(m, n, k, compute_capability)
+            == ("cooperative", 128, 128, 128)
+        )
         or (
             compute_capability == (12, 1)
             and (m, n, k) == (1024, 512, 7168)

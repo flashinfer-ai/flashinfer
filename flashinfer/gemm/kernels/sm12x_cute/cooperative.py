@@ -257,6 +257,7 @@ class DenseGemmKernel:
         self.sfb_tiles_per_block = self.sfb_tile_shape_nk[0] // mma_tiler_mn[1]
         self.cluster_shape_mnk = (1, 1, 1)  # Always (1,1,1) on the current target
         if self.tile_shape_mnk not in (
+            (128, 128, 128),
             (128, 128, 256),
             (128, 64, 256),
             (256, 128, 128),
