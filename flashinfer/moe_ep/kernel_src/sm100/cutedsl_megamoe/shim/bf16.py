@@ -98,7 +98,7 @@ class MegaMoEBf16Inputs:
     topk_weights: torch.Tensor
     fc1_weight: torch.Tensor
     fc2_weight: torch.Tensor
-    combine_output: torch.Tensor
+    output_activation: torch.Tensor
 
 
 class MegaMoEBf16Frontend:
@@ -222,6 +222,7 @@ class MegaMoEBf16Frontend:
             max_tokens_per_rank=c.num_tokens_per_rank,
             hidden=c.hidden,
             fc2_in_kernel_topk_reduce=c.in_kernel_fc2_reduce,
+            skip_topk_reduce=False,
             token_back_by_dispatch=c.token_back_mode != "epi_warps",
             token_back_mode=c.token_back_mode,
             epi_flag_batch=c.epi_flag_batch,
@@ -270,9 +271,11 @@ class MegaMoEBf16Frontend:
             "fc1_weight": self._to_cute(inputs.fc1_weight),
             "fc2_weight": self._to_cute(inputs.fc2_weight),
             "fc1_c": None,
-            "combine_output": self._to_cute(inputs.combine_output),
+            "output_activation": self._to_cute(inputs.output_activation),
             "local_workspace": self._to_cute(mega.local_workspace, static_layout=True),
-            "shared_workspace": self._to_cute(mega.shared_workspace),
+            "shared_workspace": self._to_cute(
+                mega.shared_workspace, static_layout=True
+            ),
             "peer_rank_ptr_mapper_host": mapper,
             "stream": cuda.CUstream(torch.cuda.current_stream().cuda_stream),
         }
@@ -293,18 +296,18 @@ class MegaMoEBf16Frontend:
             inputs.topk_weights.data_ptr(),
             inputs.fc1_weight.data_ptr(),
             inputs.fc2_weight.data_ptr(),
-            inputs.combine_output.data_ptr(),
+            inputs.output_activation.data_ptr(),
             torch.cuda.current_stream().cuda_stream,
         )
         if mega.launch_key != key:
             mega.launch_kwargs = self._runtime_kwargs(inputs, mega)
             mega.launch_key = key
         if self.config.in_kernel_fc2_reduce:
-            inputs.combine_output.zero_()
+            inputs.output_activation.zero_()
         mega.compiled(**mega.launch_kwargs)
         if sync and not torch.cuda.is_current_stream_capturing():
             torch.cuda.synchronize()
-        return inputs.combine_output[:n]
+        return inputs.output_activation[:n]
 
     def make_launch_thunk(self, inputs: MegaMoEBf16Inputs) -> Callable[[], None]:
         self._validate(inputs, inputs.activation.shape[0])
@@ -314,7 +317,7 @@ class MegaMoEBf16Frontend:
         if self.config.in_kernel_fc2_reduce:
 
             def thunk():
-                inputs.combine_output.zero_()
+                inputs.output_activation.zero_()
                 compiled(**kwargs)
 
             return thunk
@@ -365,9 +368,13 @@ class MegaMoEBf16Frontend:
             or inputs.fc2_weight.dtype != torch.bfloat16
         ):
             raise ValueError("BF16 MegaMoE weights must be bfloat16.")
-        topk_dim = 1 if c.in_kernel_fc2_reduce else c.num_topk
-        if inputs.combine_output.shape != (c.num_tokens_per_rank, topk_dim, c.hidden):
-            raise ValueError("combine_output has an invalid shape.")
+        if not inputs.output_activation.is_cuda or inputs.output_activation.shape != (
+            c.num_tokens_per_rank,
+            c.hidden,
+        ):
+            raise ValueError("output_activation has an invalid shape.")
+        if inputs.output_activation.dtype != torch.bfloat16:
+            raise ValueError("output_activation must be bfloat16.")
 
     def _release_workspace(self) -> None:
         if self._mega is not None:
@@ -387,18 +394,10 @@ class MegaMoEBf16SymmBuffer:
     x: torch.Tensor
     topk_idx: torch.Tensor
     topk_weights: torch.Tensor
-    combine_output: torch.Tensor
-    reduced_output: torch.Tensor
+    output_activation: torch.Tensor
     _frontend: MegaMoEBf16Frontend
     _sym_roots: list[torch.Tensor] = field(default_factory=list)
     _destroyed: bool = False
-
-    @property
-    def kernel_combine_output(self) -> torch.Tensor:
-        """The tensor the kernel writes: reduced rows under ikr, else partials."""
-        if self._frontend.config.in_kernel_fc2_reduce:
-            return self.reduced_output
-        return self.combine_output
 
     def destroy(self) -> None:
         if not self._destroyed:
@@ -474,9 +473,7 @@ def get_symm_buffer_for_bf16_mega_moe(
     topk_idx = sym_zeros((num_max_tokens, num_topk), torch.int64)
     topk_idx.fill_(-1)
     topk_weights = sym_zeros((num_max_tokens, num_topk), torch.float32)
-    # We need to allocate both since we dont always know what final knobs will be selected
-    combine_output = sym_zeros((num_max_tokens, num_topk, hidden), torch.bfloat16)
-    reduced_output = sym_zeros((num_max_tokens, 1, hidden), torch.bfloat16)
+    output_activation = sym_zeros((num_max_tokens, hidden), torch.bfloat16)
     return MegaMoEBf16SymmBuffer(
         num_total_experts,
         num_max_tokens,
@@ -488,10 +485,9 @@ def get_symm_buffer_for_bf16_mega_moe(
         x,
         topk_idx,
         topk_weights,
-        combine_output,
-        reduced_output,
+        output_activation,
         MegaMoEBf16Frontend(cfg),
-        [x, topk_idx, topk_weights, combine_output, reduced_output],
+        [x, topk_idx, topk_weights, output_activation],
     )
 
 
@@ -511,7 +507,6 @@ def bf16_mega_moe(
     if symm_buffer._destroyed:
         raise RuntimeError("symm_buffer.destroy() was already called.")
     n = symm_buffer.num_max_tokens if num_tokens is None else num_tokens
-    in_kernel_reduce = symm_buffer._frontend.config.in_kernel_fc2_reduce
     if y is not None and (
         y.shape != (n, symm_buffer.hidden) or y.dtype != torch.bfloat16
     ):
@@ -528,19 +523,14 @@ def bf16_mega_moe(
             symm_buffer.topk_weights,
             transformed_l1[0],
             transformed_l2[0],
-            symm_buffer.kernel_combine_output,
+            symm_buffer.output_activation,
         ),
         num_tokens=n,
         sync=False,
     )
-    if in_kernel_reduce:
-        out = result[:, 0]
-        if y is not None:
-            y.copy_(out)
-    else:
-        # Reduce straight into the result buffer
-        out = y if y is not None else symm_buffer.reduced_output[:n, 0]
-        torch.sum(result, dim=1, out=out)
+    out = result
+    if y is not None:
+        y.copy_(out)
 
     if sync and not torch.cuda.is_current_stream_capturing():
         torch.cuda.synchronize()
@@ -675,22 +665,10 @@ def bf16_mega_launch_thunk(
             symm_buffer.topk_weights,
             transformed_l1[0],
             transformed_l2[0],
-            symm_buffer.kernel_combine_output,
+            symm_buffer.output_activation,
         )
     )
-    if symm_buffer._frontend.config.in_kernel_fc2_reduce:
-        return launch
-
-    # Form A's host reduce is part of the forward; a thunk without it would
-    # under-report the deterministic path against ikr.
-    partials = symm_buffer.combine_output
-    out = symm_buffer.reduced_output[:, 0]
-
-    def thunk() -> None:
-        launch()
-        torch.sum(partials, dim=1, out=out)
-
-    return thunk
+    return launch
 
 
 __all__ = [

@@ -15,7 +15,9 @@ Phase-3 exposes two BF16 epilogue-warp combine forms:
 
 * static expert shape;
 * DeepGEMM routing semantics (top-k score is absorbed by FC1);
-* Form A writes one ``(token, topk, hidden)`` result per route;
+* Form A writes one ``(token, topk, hidden)`` result per route to internal
+  shared-workspace staging;
+  ``TopkReduce`` collapses those results unless skipped;
 * Form B atomically reduces routes into ``(token, 1, hidden)``;
 * epilogue-warps direct peer STG or reuse of the dispatch warps for token-back;
 * no activation scale-factor sideband.
@@ -35,6 +37,7 @@ import cutlass.cute as cute
 from cutlass.cute.typing import AddressSpace
 from cutlass.cutlass_dsl import Int64
 
+from common.host_utils import get_cutedsl_target_arch
 from moe_mxfp8_bf16_glu.kernel_mxfp8_bf16_glu_fc12 import (
     Sm100SwapABMxfp8Bf16Fc12Kernel,
 )
@@ -46,6 +49,7 @@ from moe_nvfp4_swapab.megamoe_kernel import (
     _layout_regions,
     _round_up,
 )
+from moe_nvfp4_swapab.topk_reduce import TopkReduce
 from src.token_comm import (
     CombineFormat,
     TokenCommArgs as ExtractedTokenCommArgs,
@@ -82,6 +86,7 @@ class Sm100MegaMoEMxfp8Bf16Kernel(Sm100SwapABMxfp8Bf16Fc12Kernel):
         max_tokens_per_rank: int,
         hidden: int,
         fc2_in_kernel_topk_reduce: bool = False,
+        skip_topk_reduce: bool = False,
         token_back_by_dispatch: bool = False,
         token_back_mode: Literal[
             "epi_warps", "standalone_warps", "reuse_dispatch_warps"
@@ -165,6 +170,10 @@ class Sm100MegaMoEMxfp8Bf16Kernel(Sm100SwapABMxfp8Bf16Fc12Kernel):
             raise NotImplementedError(
                 "Phase-3 supports BF16 Form-A/Form-B combine only."
             )
+        if skip_topk_reduce and fc2_in_kernel_topk_reduce:
+            raise ValueError(
+                "skip_topk_reduce requires fc2_in_kernel_topk_reduce=False."
+            )
 
         super().__init__(
             mma_tiler_mnk=mma_tiler_mnk,
@@ -205,6 +214,7 @@ class Sm100MegaMoEMxfp8Bf16Kernel(Sm100SwapABMxfp8Bf16Fc12Kernel):
         self.hidden = hidden
         self.combine_format = combine_format
         self.fc2_in_kernel_topk_reduce = fc2_in_kernel_topk_reduce
+        self.skip_topk_reduce = skip_topk_reduce
         self.token_back_by_dispatch = token_back_by_dispatch
         self.token_back_mode = token_back_mode
         self.token_back_standalone = False
@@ -470,7 +480,7 @@ class Sm100MegaMoEMxfp8Bf16Kernel(Sm100SwapABMxfp8Bf16Fc12Kernel):
 
     def _build_shared_region_specs(self) -> List[_RegionSpec]:
         max_slot = self.max_tokens_per_rank * self.num_topk
-        return [
+        specs = [
             _RegionSpec(
                 "expert_recv_count",
                 cutlass.Int64,
@@ -500,10 +510,39 @@ class Sm100MegaMoEMxfp8Bf16Kernel(Sm100SwapABMxfp8Bf16Fc12Kernel):
                 16,
             ),
         ]
+        if not self.fc2_in_kernel_topk_reduce:
+            specs.append(
+                _RegionSpec(
+                    "combine_quant",
+                    cutlass.BFloat16,
+                    (
+                        self.max_tokens_per_rank,
+                        self.num_topk,
+                        self.hidden,
+                    ),
+                    128,
+                )
+            )
+        return specs
 
     def get_workspace_sizes(self) -> Tuple[int, int]:
         """Return ``(local_workspace_bytes, shared_workspace_bytes)``."""
         return self._local_total, self._shared_total
+
+    def skip_topk_reduce_region(self) -> Dict[str, Any]:
+        """Describe the borrowed BF16 ``combine_quant`` staging region."""
+        if not self.skip_topk_reduce:
+            raise RuntimeError("skip_topk_reduce mode is not enabled")
+        spec = self._shared_region_by_name["combine_quant"]
+        return {
+            "name": spec.name,
+            "byte_offset": self._shared_offsets[spec.name],
+            "nbytes": spec.nbytes,
+            "shape": spec.shape,
+            "stride": spec.stride_row_major,
+            "dtype": "bfloat16",
+            "alignment": spec.align,
+        }
 
     @staticmethod
     def _make_typed_view(
@@ -611,7 +650,7 @@ class Sm100MegaMoEMxfp8Bf16Kernel(Sm100SwapABMxfp8Bf16Fc12Kernel):
         fc1_weight_sf: cute.Tensor,
         fc2_weight: cute.Tensor,
         fc2_weight_sf: cute.Tensor,
-        combine_output: cute.Tensor,
+        output_activation: cute.Tensor,
         local_workspace: cute.Tensor,
         shared_workspace: cute.Tensor,
     ) -> None:
@@ -624,7 +663,7 @@ class Sm100MegaMoEMxfp8Bf16Kernel(Sm100SwapABMxfp8Bf16Fc12Kernel):
             ("fc1_weight_sf", fc1_weight_sf, 2),
             ("fc2_weight", fc2_weight, 3),
             ("fc2_weight_sf", fc2_weight_sf, 2),
-            ("combine_output", combine_output, 3),
+            ("output_activation", output_activation, 2),
             ("local_workspace", local_workspace, 1),
             ("shared_workspace", shared_workspace, 1),
         ):
@@ -650,10 +689,10 @@ class Sm100MegaMoEMxfp8Bf16Kernel(Sm100SwapABMxfp8Bf16Fc12Kernel):
             raise TypeError("both weight scale tensors must be E8M0FNU.")
         if cutlass.const_expr(
             activation.element_type is not cutlass.BFloat16
-            or combine_output.element_type is not cutlass.BFloat16
+            or output_activation.element_type is not cutlass.BFloat16
         ):
             raise TypeError(
-                "activation and combine_output must be BFloat16."
+                "activation and output_activation must be BFloat16."
             )
         if cutlass.const_expr(
             topk_idx.element_type is not cutlass.Int64
@@ -687,14 +726,9 @@ class Sm100MegaMoEMxfp8Bf16Kernel(Sm100SwapABMxfp8Bf16Fc12Kernel):
             ("fc2_weight.experts", fc2_weight.shape[0], experts),
             ("fc2_weight.K", fc2_weight.shape[1], down),
             ("fc2_weight.M", fc2_weight.shape[2], hidden),
-            ("combine_output.tokens", combine_output.shape[0],
+            ("output_activation.tokens", output_activation.shape[0],
              self.max_tokens_per_rank),
-            (
-                "combine_output.topk",
-                combine_output.shape[1],
-                1 if self.fc2_in_kernel_topk_reduce else self.num_topk,
-            ),
-            ("combine_output.hidden", combine_output.shape[2], hidden),
+            ("output_activation.hidden", output_activation.shape[1], hidden),
             ("fc1_weight_sf.experts", fc1_weight_sf.shape[0], experts),
             (
                 "fc1_weight_sf.storage",
@@ -765,7 +799,7 @@ class Sm100MegaMoEMxfp8Bf16Kernel(Sm100SwapABMxfp8Bf16Fc12Kernel):
             ("fc1_weight_sf storage", fc1_weight_sf.stride[1]),
             ("fc2_weight down/K", fc2_weight.stride[1]),
             ("fc2_weight_sf storage", fc2_weight_sf.stride[1]),
-            ("combine_output hidden", combine_output.stride[2]),
+            ("output_activation hidden", output_activation.stride[1]),
             ("local_workspace", local_workspace.stride[0]),
             ("shared_workspace", shared_workspace.stride[0]),
         ):
@@ -789,14 +823,14 @@ class Sm100MegaMoEMxfp8Bf16Kernel(Sm100SwapABMxfp8Bf16Fc12Kernel):
         fc1_weight_sf: cute.Tensor,
         fc2_weight: cute.Tensor,
         fc2_weight_sf: cute.Tensor,
-        combine_output: cute.Tensor,
+        output_activation: cute.Tensor,
         local_workspace: cute.Tensor,
         shared_workspace: cute.Tensor,
         peer_rank_ptr_mapper_host,
         max_active_clusters: cutlass.Constexpr,
         stream,
     ) -> None:
-        """Launch dispatch, mixed FC12, and direct BF16 combine."""
+        """Launch dispatch, mixed FC12, combine, and optional TopkReduce."""
         self._validate_public_inputs(
             activation,
             topk_idx,
@@ -805,7 +839,7 @@ class Sm100MegaMoEMxfp8Bf16Kernel(Sm100SwapABMxfp8Bf16Fc12Kernel):
             fc1_weight_sf,
             fc2_weight,
             fc2_weight_sf,
-            combine_output,
+            output_activation,
             local_workspace,
             shared_workspace,
         )
@@ -829,6 +863,16 @@ class Sm100MegaMoEMxfp8Bf16Kernel(Sm100SwapABMxfp8Bf16Fc12Kernel):
             (self.hidden, 1),
             self._local_region_by_name["l1_token_buffer"].align,
         )
+        if cutlass.const_expr(self.fc2_in_kernel_topk_reduce):
+            combine_target = cute.make_tensor(
+                output_activation.iterator,
+                cute.make_layout(
+                    (self.max_tokens_per_rank, 1, self.hidden),
+                    stride=(self.hidden, self.hidden, 1),
+                ),
+            )
+        else:
+            combine_target = self._view_shared(shared_workspace, "combine_quant")
         l1_topk_weights_buffer = self._view_local(
             local_workspace, "l1_topk_weights_buffer"
         )
@@ -888,14 +932,14 @@ class Sm100MegaMoEMxfp8Bf16Kernel(Sm100SwapABMxfp8Bf16Fc12Kernel):
                 local_workspace, "fc2_done_counter"
             )
             combine_output_for_comm = cute.recast_tensor(
-                combine_output, cutlass.Uint8
+                combine_target, cutlass.Uint8
             )
             fc2_output_target = fc2_output_workspace_native
         else:
             fc2_output_workspace_u8 = None
             fc2_done_counter = None
-            combine_output_for_comm = combine_output
-            fc2_output_target = combine_output
+            combine_output_for_comm = combine_target
+            fc2_output_target = combine_target
 
         expert_recv_count = self._view_shared(
             shared_workspace, "expert_recv_count"
@@ -984,6 +1028,22 @@ class Sm100MegaMoEMxfp8Bf16Kernel(Sm100SwapABMxfp8Bf16Fc12Kernel):
             load_balance_counter=load_balance_counter,
             token_comm_args=token_comm_args,
         )
+
+        if cutlass.const_expr(
+            not self.fc2_in_kernel_topk_reduce and not self.skip_topk_reduce
+        ):
+            TopkReduce(
+                self.hidden,
+                self.num_topk,
+                self.combine_format,
+                sm_arch=get_cutedsl_target_arch(),
+            )(
+                combine_target,
+                None,
+                output_activation,
+                None,
+                stream,
+            )
 
     # ------------------------------------------------------------------
     # Token communication hooks consumed by the mixed FC12 base

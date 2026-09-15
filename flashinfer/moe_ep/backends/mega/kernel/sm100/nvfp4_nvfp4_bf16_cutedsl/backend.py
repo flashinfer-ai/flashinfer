@@ -304,6 +304,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             fc2_alpha=workspace.fc2_alpha,
             fc1_norm_const=workspace.fc1_norm_const,
             output_activation=workspace.output_activation,
+            num_valid_tokens=workspace.num_valid_tokens,
         )
 
     def _prepared_thunk_state(
@@ -417,6 +418,8 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
                 workspace_root,
                 key[3],
             )
+        if workspace._frontend.config.topk_reduce_persistent:
+            workspace.num_valid_tokens.fill_(num_tokens)
         thunk()
         if reducer_state is not None:
             reducer, partials, workspace_root, stream = reducer_state

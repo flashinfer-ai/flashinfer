@@ -24,7 +24,7 @@ from __future__ import annotations
 import importlib
 
 # --- eager: light, import-safe (no cutlass/nvshmem pulled at module load) ---
-from common.host_utils import kind_data_dtype, mxfp8_quantize_per_block_32
+from common.host_utils import kind_data_dtype, mxfp8_quantize_per_block_32_row
 from common.megamoe_constants import Mxfp8BlockSize, Nvfp4BlockSize
 from moe_nvfp4_swapab.runner_common import (
     Mxfp8ScaleDtype,
@@ -34,6 +34,8 @@ from moe_nvfp4_swapab.runner_common import (
     round_up,
     to_blocked,
 )
+
+mxfp8_quantize_per_block_32 = mxfp8_quantize_per_block_32_row
 
 # --- lazy: pull cutlass transitively; imported only on first attribute access
 #     (which happens inside the backend/test call sites, never at package load).

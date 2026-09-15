@@ -68,7 +68,6 @@ _KIND_TO_TORCH_DTYPE = {
 
 def _kind_to_cutlass_dtype(kind: str):
     import cutlass
-
     return {
         "bf16": cutlass.BFloat16,
     }[kind]
@@ -102,11 +101,7 @@ def _make_bf16_tensor(
         n *= s
     if perf_run:
         bits = torch.randint(
-            -32768,
-            32768,
-            (n,),
-            dtype=torch.int16,
-            device="cuda",
+            -32768, 32768, (n,), dtype=torch.int16, device="cuda",
             generator=torch_rng,
         )
         nan_inf = (bits & 0x7F80) == 0x7F80
@@ -163,9 +158,13 @@ class MegaMoEBf16Tester(MegaMoETester):
                 f"got {problem.intermediate}."
             )
         if problem.hidden % 32 != 0:
-            raise ValueError(f"hidden must be a multiple of 32; got {problem.hidden}.")
+            raise ValueError(
+                f"hidden must be a multiple of 32; got {problem.hidden}."
+            )
         if not (1 <= problem.num_topk <= 32):
-            raise ValueError(f"num_topk must be in [1, 32]; got {problem.num_topk}.")
+            raise ValueError(
+                f"num_topk must be in [1, 32]; got {problem.num_topk}."
+            )
 
     # ------------------------------------------------------------------
     # Step 1: deterministic input + weight generation (BF16)
@@ -184,40 +183,27 @@ class MegaMoEBf16Tester(MegaMoETester):
 
         # ---- Activation (BF16).
         self._global_activation = _make_bf16_tensor(
-            self._torch_cuda_rng,
-            (num_ranks, num_tokens_per_rank, hidden),
+            self._torch_cuda_rng, (num_ranks, num_tokens_per_rank, hidden),
             perf_run=self.misc.perf_run,
         )
 
         # ---- Routing table.
         if problem.route_distribution == "balanced":
             topk_idx_np = _generate_topk_idx_balanced(
-                num_ranks,
-                num_tokens_per_rank,
-                num_topk,
-                problem.num_total_experts,
-                rng,
+                num_ranks, num_tokens_per_rank, num_topk,
+                problem.num_total_experts, rng,
             )
         else:
             topk_idx_np = _generate_topk_idx_power_law(
-                num_ranks,
-                num_tokens_per_rank,
-                num_topk,
-                problem.num_total_experts,
-                problem.power_law_exponent,
-                rng,
+                num_ranks, num_tokens_per_rank, num_topk,
+                problem.num_total_experts, problem.power_law_exponent, rng,
             )
         topk_weights = _generate_topk_weights(
-            num_ranks,
-            num_tokens_per_rank,
-            num_topk,
-            self._torch_cuda_rng,
+            num_ranks, num_tokens_per_rank, num_topk, self._torch_cuda_rng,
         )
         if self.rank == 0:
             _print_remote_rank_comm_matrices(
-                topk_idx_np,
-                num_ranks,
-                problem.num_total_experts,
+                topk_idx_np, num_ranks, problem.num_total_experts,
             )
         self._global_topk_idx = torch.from_numpy(topk_idx_np).cuda()
         self._global_topk_weights = topk_weights
@@ -244,8 +230,7 @@ class MegaMoEBf16Tester(MegaMoETester):
         own_topk_weights = self._global_topk_weights[self.rank]
 
         self.my_activation = _sym_zeros(
-            (num_tokens_per_rank, hidden),
-            torch.bfloat16,
+            (num_tokens_per_rank, hidden), torch.bfloat16,
         )
         self.my_activation.copy_(own_activation)
 
@@ -262,14 +247,19 @@ class MegaMoEBf16Tester(MegaMoETester):
         self.my_fc1_weight = self._global_fc1_weight[self.rank]
         self.my_fc2_weight = self._global_fc2_weight[self.rank]
 
-        # ---- Combine output on sym heap.
-        # Form B (token-back reduce): (T, 1, H); kernel reduces topk axis.
-        # Form A / token_back_by_dispatch: (T, K, H); host reduces topk axis.
-        combine_topk = 1 if self.impl.in_kernel_fc2_reduce else num_topk
-        self.combine_output = _sym_zeros(
-            (num_tokens_per_rank, combine_topk, hidden),
-            problem.fc2_output_dtype,
-        )
+        # Form B atomically accumulates into a symmetric output; Form A writes
+        # internal shared-workspace staging then reduces into this local output.
+        if self.impl.in_kernel_fc2_reduce:
+            self.output_activation = _sym_zeros(
+                (num_tokens_per_rank, hidden),
+                problem.fc2_output_dtype,
+            )
+        else:
+            self.output_activation = torch.empty(
+                (num_tokens_per_rank, hidden),
+                dtype=problem.fc2_output_dtype,
+                device="cuda",
+            )
 
         torch.cuda.synchronize()
         self._check_cuda_rng_consistency()
@@ -315,29 +305,40 @@ class MegaMoEBf16Tester(MegaMoETester):
     # ------------------------------------------------------------------
 
     def validate(self) -> None:
-        """Compare the rank's combine output against the reference.
+        """Compare the rank's final output against the reference.
 
         * **Form A / token_back_by_dispatch**: kernel writes per-(token, topk)
-          cells into ``(T, K, H)``; host reduces the topk axis on both sides.
+          cells into ``(T, K, H)``; ``TopkReduce`` emits the 2D output.
         * **Form B (token-back reduce)**: kernel writes topk-reduced into
           ``(T, 1, H)``; compare directly against the reference's topk-summed
           view.
         """
         if self.misc.skip_ref_check:
             return
-        if self.combine_output is None:
+        if self.impl.skip_topk_reduce:
+            if self.combine_output_ref is None:
+                raise RuntimeError("validate requires compute_reference first.")
+            actual_reduced = self._skip_topk_reduce_staging().to(torch.float32).sum(dim=1)
+            ref_reduced = self.combine_output_ref.to(torch.float32).sum(dim=1)
+            compare_and_report_mismatches(
+                actual_reduced,
+                ref_reduced,
+                name=f"combine_quant[rank{self.rank}]",
+                atol=1e-2,
+                rtol=1e-2,
+            )
+            self._validate_c_output()
+            return
+        if self.output_activation is None:
             raise RuntimeError("validate requires run_kernel first.")
         if self.combine_output_ref is None:
             raise RuntimeError("validate requires compute_reference first.")
 
         if self.impl.in_kernel_fc2_reduce:
-            # Form B: combine_output is (T, 1, H); squeeze topk=1.
-            actual_reduced = self.combine_output[:, 0, :].to(torch.float32)
-            # Reference is (T, K, H); sum over K to match.
+            actual_reduced = self.output_activation.to(torch.float32)
             ref_reduced = self.combine_output_ref.to(torch.float32).sum(dim=1)
         else:
-            # Form A / token_back_by_dispatch: (T, K, H) -> sum over K.
-            actual_reduced = self.combine_output.to(torch.float32).sum(dim=1)
+            actual_reduced = self.output_activation.to(torch.float32)
             ref_reduced = self.combine_output_ref.to(torch.float32).sum(dim=1)
 
         # bf16-grade tolerance; the K-axis fp32 sum adds at most ~K bf16 ULPs,
@@ -346,12 +347,24 @@ class MegaMoEBf16Tester(MegaMoETester):
         compare_and_report_mismatches(
             actual_reduced,
             ref_reduced,
-            name=f"combine_output[rank{self.rank}]",
+            name=f"output_activation[rank{self.rank}]",
             atol=1e-2,
             rtol=1e-2,
         )
 
         self._validate_c_output()
+
+    def _skip_topk_reduce_staging(self) -> torch.Tensor:
+        """Return the internal Form-A combine staging as a BF16 torch view."""
+        if self._kernel is None or self.shared_workspace is None:
+            raise RuntimeError("skip-topk staging is unavailable before run_kernel.")
+        descriptor = self._kernel.skip_topk_reduce_region()
+        raw = self.shared_workspace.narrow(
+            0,
+            int(descriptor["byte_offset"]),
+            int(descriptor["nbytes"]),
+        )
+        return raw.view(torch.bfloat16).view(tuple(descriptor["shape"]))
 
     def _validate_c_output(self) -> None:
         """Compare kernel c_output vs reference pre-SwiGLU fc1 gate+up per expert.
@@ -385,7 +398,9 @@ class MegaMoEBf16Tester(MegaMoETester):
         md_off = kernel._local_offsets["token_src_metadata"]
         pool_cap = kernel.pool_token_capacity
         metadata = (
-            self.local_workspace[md_off : md_off + pool_cap * 8].view(torch.int64).cpu()
+            self.local_workspace[md_off : md_off + pool_cap * 8]
+            .view(torch.int64)
+            .cpu()
         )
         tpb = kernel.token_padding_block
         num_topk = self.problem.num_topk
@@ -393,9 +408,7 @@ class MegaMoEBf16Tester(MegaMoETester):
         topk_cpu = self._global_topk_idx.cpu()
 
         print(f"\n{'=' * 60}")
-        print(
-            f"[generate_c][rank{self.rank}] kernel c_output vs reference fc1 gate+up:"
-        )
+        print(f"[generate_c][rank{self.rank}] kernel c_output vs reference fc1 gate+up:")
         any_checked = False
         pool_base = 0
         for e in range(self.problem.num_experts_per_rank):
@@ -414,7 +427,9 @@ class MegaMoEBf16Tester(MegaMoETester):
             hi = packed >> 32
             src_rank = (hi >> 16) & 0xFFFF
             src_topk = hi & 0xFFFF
-            kernel_keys = (src_rank * tokens_per_rank + src_token) * num_topk + src_topk
+            kernel_keys = (
+                src_rank * tokens_per_rank + src_token
+            ) * num_topk + src_topk
 
             # Reference rows for this expert, in ascending-key order.
             global_expert = self.rank * self.problem.num_experts_per_rank + e
@@ -468,7 +483,7 @@ class MegaMoEBf16Tester(MegaMoETester):
             or self.my_topk_weights is None
             or self.my_fc1_weight is None
             or self.my_fc2_weight is None
-            or self.combine_output is None
+            or self.output_activation is None
         ):
             raise RuntimeError("run_kernel requires generate_inputs first.")
 
@@ -489,8 +504,12 @@ class MegaMoEBf16Tester(MegaMoETester):
             self.problem.hidden,
         )
 
-        cluster_size = self.impl.cluster_shape_mnk[0] * self.impl.cluster_shape_mnk[1]
-        max_active_clusters = utils.HardwareInfo().get_max_active_clusters(cluster_size)
+        cluster_size = (
+            self.impl.cluster_shape_mnk[0] * self.impl.cluster_shape_mnk[1]
+        )
+        max_active_clusters = utils.HardwareInfo().get_max_active_clusters(
+            cluster_size
+        )
         group_hint = self.impl.group_hint
         if group_hint is None:
             group_hint = max_active_clusters
@@ -518,6 +537,7 @@ class MegaMoEBf16Tester(MegaMoETester):
             max_tokens_per_rank=self.problem.num_tokens_per_rank,
             hidden=self.problem.hidden,
             fc2_in_kernel_topk_reduce=self.impl.in_kernel_fc2_reduce,
+            skip_topk_reduce=self.impl.skip_topk_reduce,
             token_back_by_dispatch=self.impl.token_back_by_dispatch,
             token_back_mode=self.impl.token_back_mode,
             epi_flag_batch=self.impl.epi_flag_batch,
@@ -546,8 +566,7 @@ class MegaMoEBf16Tester(MegaMoETester):
             # (unlike lean fc12 where it's the post-SwiGLU half-size).
             self._c_output = torch.zeros(
                 (tokens_sum, self.problem.intermediate),
-                dtype=torch.bfloat16,
-                device="cuda",
+                dtype=torch.bfloat16, device="cuda",
             )
             self._c_valid_tokens_per_expert = valid_tokens
             self._c_data_physical_offsets = doff[:-1]
@@ -556,12 +575,9 @@ class MegaMoEBf16Tester(MegaMoETester):
         self.allocate_workspaces()
 
         # -- 3. Torch -> cute --
-        def _to_cute(
-            tensor: torch.Tensor, assumed_align: int = 16, force_static_layout=False
-        ):
+        def _to_cute(tensor: torch.Tensor, assumed_align: int = 16, force_static_layout=False):
             cute_tensor = cutlass_torch.from_dlpack(
-                tensor,
-                assumed_align=assumed_align,
+                tensor, assumed_align=assumed_align,
             )
             if force_static_layout:
                 return cute_tensor
@@ -573,7 +589,7 @@ class MegaMoEBf16Tester(MegaMoETester):
         topk_weights_cute = _to_cute(self.my_topk_weights)
         fc1_weight_cute = _to_cute(self.my_fc1_weight)
         fc2_weight_cute = _to_cute(self.my_fc2_weight)
-        combine_output_cute = _to_cute(self.combine_output)
+        output_activation_cute = _to_cute(self.output_activation)
         local_workspace_cute = _to_cute(self.local_workspace, force_static_layout=True)
         shared_workspace_cute = _to_cute(self.shared_workspace)
 
@@ -593,7 +609,7 @@ class MegaMoEBf16Tester(MegaMoETester):
             topk_weights=topk_weights_cute,
             fc1_weight=fc1_weight_cute,
             fc2_weight=fc2_weight_cute,
-            combine_output=combine_output_cute,
+            output_activation=output_activation_cute,
             local_workspace=local_workspace_cute,
             shared_workspace=shared_workspace_cute,
             peer_rank_ptr_mapper_host=peer_rank_ptr_mapper_host,
@@ -613,10 +629,10 @@ class MegaMoEBf16Tester(MegaMoETester):
         # -- 5. Launch (with optional profile-friendly barriers) --
         if self.misc.profile_friendly:
             import nvtx
-
             torch.cuda.synchronize()
             _dist_active = (
-                torch.distributed.is_available() and torch.distributed.is_initialized()
+                torch.distributed.is_available()
+                and torch.distributed.is_initialized()
             )
             if _dist_active:
                 torch.distributed.barrier()
@@ -639,15 +655,14 @@ class MegaMoEBf16Tester(MegaMoETester):
 # =============================================================================
 
 
+
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="MegaMoE BF16 GLU multi-rank fused dispatch+fc12+combine runner",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
-        "--kind",
-        type=str,
-        default="bf16",
+        "--kind", type=str, default="bf16",
         choices=["bf16"],
         help="Data element format for activations and weights.",
     )
@@ -657,26 +672,18 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hidden", type=int, default=2048)
     parser.add_argument("--intermediate", type=int, default=1024)
     parser.add_argument(
-        "--fc2_output_dtype",
-        type=_parse_output_dtype,
-        default=torch.bfloat16,
+        "--fc2_output_dtype", type=_parse_output_dtype, default=torch.bfloat16,
     )
     parser.add_argument(
-        "--route_distribution",
-        type=str,
-        default="balanced",
+        "--route_distribution", type=str, default="balanced",
         choices=["balanced", "power_law"],
     )
     parser.add_argument(
-        "--power_law_exponent",
-        type=float,
-        default=1.0,
+        "--power_law_exponent", type=float, default=1.0,
         help="Zipf exponent for --route_distribution power_law.",
     )
     parser.add_argument(
-        "--gate_up_clamp",
-        type=float,
-        default=None,
+        "--gate_up_clamp", type=float, default=None,
         help="DeepSeek-V4 swiglu_limit: clamp gate/up pre-activations before SiLU.",
     )
 
@@ -684,16 +691,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mma_tiler_mnk", type=str, default="256,256,64")
     parser.add_argument("--cluster_shape_mnk", type=str, default="2,1,1")
     parser.add_argument("--use_2cta_instrs", action="store_true", default=True)
-    parser.add_argument(
-        "--enable_static_expert_shape", action="store_true", default=False
-    )
+    parser.add_argument("--enable_static_expert_shape", action="store_true", default=False)
     parser.add_argument("--dynamic_sched", action="store_true", default=False)
     parser.add_argument("--clc_bundle_size", type=int, default=None)
     parser.add_argument("--num_sched_stages", type=int, default=None)
     parser.add_argument(
-        "--load_balance_mode",
-        type=str,
-        default="static",
+        "--load_balance_mode", type=str, default="static",
         choices=["static", "atomic_counter"],
     )
     parser.add_argument("--group_hint", type=int, default=None)
@@ -705,49 +708,43 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--perf_iters", type=int, default=10)
     parser.add_argument("--enable_debug_checks", action="store_true", default=False)
     parser.add_argument(
-        "--ref_compute_graph",
-        type=str,
-        default="deepgemm",
+        "--ref_compute_graph", type=str, default="deepgemm",
         choices=["transformers", "deepgemm"],
     )
     parser.add_argument("--enable_iket", action="store_true", default=False)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument(
-        "--in_kernel_fc2_reduce",
-        action="store_true",
-        default=False,
-        help="Form B: in-kernel topk-reduce to combine_output[t, 0, :] — "
-        "epilogue REDG under epi_warps, cp.reduce bulk-add under the "
-        "token-back modes.",
+        "--in_kernel_fc2_reduce", action="store_true", default=False,
+        help="Form B: in-kernel topk-reduce to output_activation[t, :] — "
+             "epilogue REDG under epi_warps, cp.reduce bulk-add under the "
+             "token-back modes.",
     )
     parser.add_argument(
-        "--generate_c",
+        "--skip_topk_reduce",
         action="store_true",
         default=False,
+        help="Leave Form-A per-topk BF16 shared-workspace staging unreduced.",
+    )
+    parser.add_argument(
+        "--generate_c", action="store_true", default=False,
         help="Store raw pre-SwiGLU fc1 accumulator (gate+up, BF16) to a separate tensor.",
     )
     parser.add_argument(
-        "--use_stg_fc1",
-        action="store_true",
-        default=False,
+        "--use_stg_fc1", action="store_true", default=False,
         help="Write fc1 BF16 output directly to GMEM via STG instead of R2S+TMA. "
-        "Eliminates sD SMEM staging; may increase AB pipeline stages.",
+             "Eliminates sD SMEM staging; may increase AB pipeline stages.",
     )
     parser.add_argument(
-        "--token_back_mode",
-        type=str,
-        default="epi_warps",
+        "--token_back_mode", type=str, default="epi_warps",
         choices=["epi_warps", "standalone_warps", "reuse_dispatch_warps"],
         help="Where the cross-rank fc2 push-back runs: epi_warps (epilogue "
-        "STG redirect, form A, default), standalone_warps (dedicated "
-        "warps 12-15), or reuse_dispatch_warps (dispatch warps 8-11).",
+             "STG redirect, form A, default), standalone_warps (dedicated "
+             "warps 12-15), or reuse_dispatch_warps (dispatch warps 8-11).",
     )
     parser.add_argument(
-        "--epi_flag_batch",
-        type=str,
-        default="2,4",
+        "--epi_flag_batch", type=str, default="2,4",
         help="Done-counter publish batching as 'fc1,fc2' (e.g. '2,4'). "
-        "Each component must be in [1, 32].",
+             "Each component must be in [1, 32].",
     )
     return parser
 
@@ -765,7 +762,6 @@ def main(argv: Optional[List[str]] = None) -> int:
             init_dist_and_nvshmem,
             finalize_dist_and_nvshmem,
         )
-
         _local_rank, rank, world_size, _ = init_dist_and_nvshmem()
 
     problem = TokenCommProblemDesc(
@@ -793,6 +789,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         group_hint=args.group_hint,
         non_ubulk_fc2_store=True,
         in_kernel_fc2_reduce=args.in_kernel_fc2_reduce,
+        skip_topk_reduce=args.skip_topk_reduce,
         token_back_mode=args.token_back_mode,
         epi_flag_batch=_parse_tuple(args.epi_flag_batch),
         flag_batch=1,
@@ -840,12 +837,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         torch.cuda.synchronize()
         try:
             import nvshmem.core
-
             for sym_tensor in (
                 tester.my_activation,
-                tester.my_topk_idx,
-                tester.my_topk_weights,
-                tester.combine_output,
+                tester.my_topk_idx, tester.my_topk_weights,
                 tester.shared_workspace,
             ):
                 if sym_tensor is not None:
@@ -856,7 +850,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             tester.my_activation = None
             tester.my_topk_idx = None
             tester.my_topk_weights = None
-            tester.combine_output = None
+            tester.output_activation = None
             tester.shared_workspace = None
         except ImportError:
             pass

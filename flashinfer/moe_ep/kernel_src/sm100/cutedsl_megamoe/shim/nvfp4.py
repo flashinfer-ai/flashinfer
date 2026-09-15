@@ -104,6 +104,7 @@ class MegaMoENvfp4Config:
     enable_in_kernel_fc2_reduce: bool = False
     in_kernel_fc2_reduce: bool = False
     defer_topk_reduce: bool = False
+    topk_reduce_persistent: bool = False
     token_back_mode: Literal[
         "epi_warps", "standalone_warps", "reuse_dispatch_warps"
     ] = "epi_warps"
@@ -268,6 +269,7 @@ class MegaMoENvfp4Inputs:
     fc2_alpha: torch.Tensor
     fc1_norm_const: torch.Tensor
     output_activation: torch.Tensor
+    num_valid_tokens: torch.Tensor
 
 
 class MegaMoENvfp4Frontend:
@@ -345,6 +347,7 @@ class MegaMoENvfp4Frontend:
         inputs: MegaMoENvfp4Inputs,
         *,
         num_tokens: Optional[int] = None,
+        valid_num_tokens: Optional[int] = None,
         sync: bool = True,
         reset_counters: bool = False,
         reduce_topk: bool = True,
@@ -375,8 +378,16 @@ class MegaMoENvfp4Frontend:
                 "defer_topk_reduce=True; use the terminal adapter"
             )
         resolved = self._resolve_num_tokens(inputs, num_tokens)
+        valid = resolved if valid_num_tokens is None else valid_num_tokens
+        if not 0 <= valid <= inputs.activation.shape[0]:
+            raise ValueError(
+                f"valid_num_tokens must be in [0, {inputs.activation.shape[0]}], "
+                f"got {valid}."
+            )
         if resolved == 0:
             return None
+        if self.config.topk_reduce_persistent:
+            inputs.num_valid_tokens.fill_(valid)
         key = self._launch_cache_key(inputs, resolved)
         mega = self._mega
         if mega is None or mega.compiled is None or mega.launch_key != key:
@@ -431,6 +442,8 @@ class MegaMoENvfp4Frontend:
         launch_inputs = self._prepare_launch_inputs(inputs, num_tokens=num_tokens)
         if launch_inputs is None:
             return lambda: None
+        if self.config.topk_reduce_persistent and num_tokens is not None:
+            inputs.num_valid_tokens.fill_(launch_inputs.activation.shape[0])
         mega = self._ensure_mega_compiled(inputs)
         runtime_kwargs = self._build_mega_runtime_kwargs(launch_inputs, mega)
         compiled = mega.compiled
@@ -460,7 +473,7 @@ class MegaMoENvfp4Frontend:
             raise RuntimeError(
                 "deferred TopK-reduce workspace is unavailable before compilation"
             )
-        descriptor = mega.kernel.deferred_topk_reduce_region()
+        descriptor = mega.kernel.skip_topk_reduce_region()
         root = mega.shared_workspace
         byte_offset = int(descriptor["byte_offset"])
         nbytes = int(descriptor["nbytes"])
@@ -491,6 +504,7 @@ class MegaMoENvfp4Frontend:
             t.fc2_alpha.data_ptr(),
             t.fc1_norm_const.data_ptr(),
             t.output_activation.data_ptr(),
+            t.num_valid_tokens.data_ptr(),
             num_tokens,
             torch.cuda.current_stream().cuda_stream,
         )
@@ -522,6 +536,7 @@ class MegaMoENvfp4Frontend:
             c.non_ubulk_fc2_store,
             c.in_kernel_fc2_reduce,
             c.defer_topk_reduce,
+            c.topk_reduce_persistent,
             c.token_back_mode,
             c.combine_dtype,
             c.apply_topk_in_fc1,
@@ -587,7 +602,8 @@ class MegaMoENvfp4Frontend:
             fc2_output_dtype=cutlass.BFloat16,
             non_ubulk_fc2_store=c.non_ubulk_fc2_store,
             in_kernel_fc2_reduce=c.in_kernel_fc2_reduce,
-            defer_topk_reduce=c.defer_topk_reduce,
+            skip_topk_reduce=c.defer_topk_reduce,
+            topk_reduce_persistent=c.topk_reduce_persistent,
             token_back_mode=c.token_back_mode,
             apply_topk_in_fc1=c.apply_topk_in_fc1,
             gate_up_clamp=self._gate_up_clamp,
@@ -697,6 +713,7 @@ class MegaMoENvfp4Frontend:
             fc2_alpha=inputs.fc2_alpha,
             fc1_norm_const=inputs.fc1_norm_const,
             output_activation=inputs.output_activation[tok],
+            num_valid_tokens=inputs.num_valid_tokens,
         )
 
     def _validate_inputs(
@@ -779,6 +796,14 @@ class MegaMoENvfp4Frontend:
             raise ValueError(
                 "output_activation must be bfloat16, got "
                 f"{inputs.output_activation.dtype}."
+            )
+        _require_cuda("num_valid_tokens", inputs.num_valid_tokens)
+        if (
+            inputs.num_valid_tokens.shape != (1,)
+            or inputs.num_valid_tokens.dtype != torch.int32
+        ):
+            raise ValueError(
+                "num_valid_tokens must be a CUDA int32 tensor of shape (1,)."
             )
         if inputs.topk_idx.shape != (buf_tokens, c.num_topk):
             raise ValueError(
@@ -935,6 +960,15 @@ class MegaMoENvfp4Frontend:
             shared_workspace=self._to_cute_ptr(mega.shared_workspace),
             peer_rank_ptr_mapper_host=peer_rank_ptr_mapper_host,
             stream=stream,
+            num_valid_tokens=(
+                self._to_cute(
+                    inputs.num_valid_tokens,
+                    assumed_align=4,
+                    static_layout=True,
+                )
+                if c.topk_reduce_persistent
+                else None
+            ),
         )
 
     @staticmethod
@@ -1060,6 +1094,7 @@ class MegaMoESymmBuffer:
     topk_idx: torch.Tensor
     topk_weights: torch.Tensor
     output_activation: torch.Tensor
+    num_valid_tokens: torch.Tensor
     fc1_alpha: torch.Tensor
     fc2_alpha: torch.Tensor
     fc1_norm_const: torch.Tensor
@@ -1102,6 +1137,7 @@ def get_symm_buffer_for_mega_moe(
     apply_topk_in_fc1: bool = True,
     enable_in_kernel_fc2_reduce: bool = False,
     defer_topk_reduce: bool = False,
+    topk_reduce_persistent: bool = False,
     combine_dtype: Literal["bf16", "mxfp8", "nvfp4"] = "bf16",
     fc1_alpha: Optional[PerExpertEpilogue] = None,
     fc2_alpha: Optional[PerExpertEpilogue] = None,
@@ -1134,6 +1170,9 @@ def get_symm_buffer_for_mega_moe(
     internal combine staging disappears from ``shared_workspace``.  Requires
     ``apply_topk_in_fc1=True`` and a bf16 combine wire; the accumulation order
     is nondeterministic (compare with a tolerance, not bit-exact).
+
+    ``topk_reduce_persistent`` keeps the standalone top-k reducer's grid fixed
+    across token counts. It is ignored when that reducer is not used.
 
     ``combine_dtype`` selects the cross-rank combine wire format: ``"bf16"``
     (default, exact), ``"mxfp8"`` (fp8+e8m0 SF, 2x less combine traffic), or
@@ -1201,6 +1240,7 @@ def get_symm_buffer_for_mega_moe(
         apply_topk_in_fc1=apply_topk_in_fc1,
         enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
         defer_topk_reduce=defer_topk_reduce,
+        topk_reduce_persistent=topk_reduce_persistent,
         combine_dtype=combine_dtype,
         # Constructed valid even before knobs land: quantized combine rejects
         # the default epi_warps token-back in __post_init__.
@@ -1247,6 +1287,9 @@ def get_symm_buffer_for_mega_moe(
     # internal combine staging.
     output_activation = sym_zeros((num_max_tokens, hidden), torch.bfloat16)
     sym_roots.append(output_activation)
+    num_valid_tokens = torch.full(
+        (1,), num_max_tokens, dtype=torch.int32, device="cuda"
+    )
     fc1_alpha = _resolve_per_expert_epilogue(
         "fc1_alpha",
         fc1_alpha,
@@ -1276,6 +1319,7 @@ def get_symm_buffer_for_mega_moe(
         topk_idx=topk_idx,
         topk_weights=topk_weights,
         output_activation=output_activation,
+        num_valid_tokens=num_valid_tokens,
         fc1_alpha=fc1_alpha,
         fc2_alpha=fc2_alpha,
         fc1_norm_const=fc1_norm_const,
@@ -1392,13 +1436,19 @@ def nvfp4_mega_moe(
         fc2_alpha=symm_buffer.fc2_alpha,
         fc1_norm_const=symm_buffer.fc1_norm_const,
         output_activation=symm_buffer.output_activation,
+        num_valid_tokens=symm_buffer.num_valid_tokens,
     )
 
     # The kernel reduces the top-k combine internally and writes the final 2D
     # (T, hidden) output; no host-side form-A reduction is needed.  Launch the
     # full padded buffer (topk_idx[n:] == -1 marks the pad rows) and copy the
     # live [:n] rows out -- matches the reference driver, which does not slice.
-    out = symm_buffer._frontend.run(inputs, num_tokens=None, sync=False)
+    out = symm_buffer._frontend.run(
+        inputs,
+        num_tokens=None,
+        valid_num_tokens=n,
+        sync=False,
+    )
     if y is None:
         # Zero-copy: the caller consumes the workspace view under stream
         # ordering (valid until the next launch on this session's buffers).
@@ -1443,6 +1493,7 @@ def nvfp4_mega_launch_thunk(
         fc2_alpha=symm_buffer.fc2_alpha,
         fc1_norm_const=symm_buffer.fc1_norm_const,
         output_activation=symm_buffer.output_activation,
+        num_valid_tokens=symm_buffer.num_valid_tokens,
     )
     return symm_buffer._frontend.make_launch_thunk(inputs)
 
@@ -1677,6 +1728,7 @@ def create_dummy_inputs(
     # launch covers the full buffer and relies on topk_idx[n:] == -1.
     symm_buffer.topk_idx[num_tokens:].fill_(-1)
     symm_buffer.topk_weights[:num_tokens].copy_(topk_weights.to(torch.float32))
+    symm_buffer.num_valid_tokens.fill_(num_tokens)
 
     y = torch.empty(num_tokens, hidden, device="cuda", dtype=torch.bfloat16)
     return y, transformed_l1, transformed_l2, symm_buffer
