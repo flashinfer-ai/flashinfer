@@ -264,6 +264,10 @@ class CuteDslFusedMoESm90Runner(TunableRunner):
         limited to at least eight routed rows per expert and weight matrices
         below 48 MiB when more than 16 experts are local. GEMM2 multicast
         needs I >= 192; M-major raster is considered only at M=128, I <= 384.
+
+        The list depends only on the problem shapes and the global expert
+        count, never on the local shard, so expert-parallel ranks tuning
+        under ``set_autotune_process_group`` profile identical sequences.
         """
         x, w2_weight = inputs[0], inputs[4]
         num_tokens, hidden_size = x.shape
@@ -279,8 +283,8 @@ class CuteDslFusedMoESm90Runner(TunableRunner):
             swizzles = GEMM1_SWIZZLE_SIZES
             if (
                 routed_rows <= tile_size
-                or routed_rows < 8 * self.num_local_experts
-                or (expert_b_bytes >= 48 * 1024 * 1024 and self.num_local_experts > 16)
+                or routed_rows < 8 * self.num_experts
+                or (expert_b_bytes >= 48 * 1024 * 1024 and self.num_experts > 16)
             ):
                 swizzles = (1,)
 

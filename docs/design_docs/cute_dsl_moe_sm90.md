@@ -98,6 +98,16 @@ is always "up" and the following odd subtile its "gate"; the epilogue emits
 `tile_n % 64 == 0`: the 32-column interleave makes each complete up/gate
 pair 64 columns.
 
+**Persistent-walk swizzle** (`swizzle_size`, tuned over 1/8/16): the
+persistent scheduler walks the (M-tile, N-tile) grid N-fast, so an
+expert's weight tile is streamed from HBM once per M-tile row. A swizzle
+of `s` groups the walk into blocks of `s` M-tiles, so the CTAs of one
+wave share the expert's B tiles through L2 and fetch them once per block.
+It is a pure schedule reorder (bitwise-identical output), and the tuner
+profiles it only where it can pay: batches with at least eight routed
+rows per expert (an expert spans several M-tiles) and expert weights that
+fit in L2 (below 48 MiB per expert, or at most 16 experts).
+
 ## 4. GEMM2 — `Sm90ContiguousGroupedGemmFinalizeFusionKernel`
 
 `out[token(r)] += scale(r) * (intermediate[r] @ w2[e].T)` (fused mode) or
@@ -168,7 +178,12 @@ Autotuning compares candidates, including the fixed default, using CUDA
 graph replay to exclude host launch overhead. Winners are cached per token
 bucket. Calls use the cached winner or the fixed default unless a tactic
 is explicitly selected. Tactic validation belongs to candidate selection,
-keeping dispatch lightweight.
+keeping dispatch lightweight: a persisted winner of another tactic schema
+fails at its first dispatch with a `ValueError` naming the expected
+structure, so tuning caches are re-tuned after a schema change rather
+than validated on every call. Candidate lists depend only on the problem
+shapes and the global expert count, so expert-parallel ranks that tune
+together profile identical sequences.
 
 Compiled kernels are reused within a process. Loading saved tuning results
 still requires compiling the selected kernels, so applications must warm
@@ -237,14 +252,14 @@ faster):
 | Mixtral-8x7B (4096/14336/8/2) | 1 -> 14336 | 1.06x | 1.06x | 0.95x | 1.00x | 1.06x |
 | | 4 -> 3584 | 1.19x | 1.11x | 1.08x | 1.05x | 1.07x |
 
-All 70 cells pass the variance gate; their geo-mean speedup is **1.19x**,
-and CuTe-DSL is faster in 65. The per-model geo-mean ranges from **1.06x**
-for Mixtral-8x7B to **1.41x** for Qwen3-30B-A3B and Qwen3-Next-80B-A3B.
-The advantage grows with TP (smaller per-rank I) and is largest at T=1
-decode (up to 2.34x) and at T >= 4096. The losses are DeepSeek-V3 at TP1
-T=4096 (0.90x) and Mixtral-8x7B at TP1 T=1024 (0.95x); Qwen3-Next-80B-A3B
-at TP1 T=256 (0.99x) and the Kimi-K2 TP1 T=256 and Mixtral-8x7B TP1
-T=4096 cells (1.00x) are ties. Across cells, CuTe-DSL's between-round CV
+All 70 cells pass the variance gate; their geo-mean speedup is **1.19x**.
+CuTe-DSL is faster in 62 cells, at 1.00x in 5 (Qwen3-235B-A22B,
+GLM-4.5-Air, Kimi-K2 and DeepSeek-V3 at TP1 T=256, Mixtral-8x7B at TP1
+T=4096) and slower in 3: DeepSeek-V3 at TP1 T=4096 (0.90x), Mixtral-8x7B
+at TP1 T=1024 (0.95x) and Qwen3-Next-80B-A3B at TP1 T=256 (0.99x). The per-model geo-mean ranges
+from **1.06x** for Mixtral-8x7B to **1.41x** for Qwen3-30B-A3B and
+Qwen3-Next-80B-A3B. The advantage grows with TP (smaller per-rank I) and
+is largest at T=1 decode (up to 2.34x) and at T >= 4096. Across cells, CuTe-DSL's between-round CV
 has median 0.17%, p95 2.20%, and maximum 2.88%; the baseline's has median
 0.15%, p95 2.16%, and maximum 4.65%.
 
