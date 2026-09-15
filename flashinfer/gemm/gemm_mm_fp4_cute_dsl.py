@@ -178,6 +178,18 @@ def _make_blockscaled_gemm_compile_fn(
 
     from cutlass.cute.runtime import make_ptr
 
+    from .kernels.dense_blockscaled_gemm_sm103 import (
+        Sm103BlockScaledPersistentDenseGemmKernel,
+    )
+
+    c_assumed_align = (
+        32
+        if isinstance(gemm, Sm103BlockScaledPersistentDenseGemmKernel)
+        and not gemm.use_tma_store
+        and not swap_ab
+        else 16
+    )
+
     def compile_kernel():
         sym_m = cute.sym_int()
         sym_k = cute.sym_int()
@@ -200,14 +212,14 @@ def _make_blockscaled_gemm_compile_fn(
                 c_cutlass_dtype,
                 (sym_n, sym_m),
                 stride_order=(0, 1),
-                assumed_align=16,
+                assumed_align=c_assumed_align,
             )
         else:
             c_fake = cute.runtime.make_fake_compact_tensor(
                 c_cutlass_dtype,
                 (sym_m, sym_n),
                 stride_order=(1, 0),
-                assumed_align=16,
+                assumed_align=c_assumed_align,
             )
 
         a_sf_ptr = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, 16)
