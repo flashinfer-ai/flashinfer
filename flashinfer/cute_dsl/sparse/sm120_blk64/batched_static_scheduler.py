@@ -29,9 +29,13 @@ class BatchedStaticSchedulerMixin:
     def get_grid_config(self, seqlen_q, num_qo_heads, batch_size):
         tile_size_m = self.tile_shape_qk[0]
         num_q_tiles = cute.ceil_div(seqlen_q, tile_size_m)
-        return (num_q_tiles, num_qo_heads, batch_size)
+        # Keep heads adjacent in the launch order for each Q tile. VSA prefix
+        # tiles carry much more KV work than video tiles; scheduling every head
+        # of those tiles together avoids injecting another long-running CTA
+        # after an entire head's light video region has already launched.
+        return (num_qo_heads, num_q_tiles, batch_size)
 
     def get_work_desc(self):
-        qo_tile_idx, qo_head_idx, batch_idx = cute.arch.block_idx()
+        qo_head_idx, qo_tile_idx, batch_idx = cute.arch.block_idx()
         kv_head_idx = qo_head_idx // self.gqa_ratio
         return BatchedStaticWorkDesc(qo_tile_idx, qo_head_idx, kv_head_idx, batch_idx)
