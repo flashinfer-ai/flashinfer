@@ -537,6 +537,7 @@ def get_batch_prefill_module(backend, *args):
         module = get_trtllm_gen_prefill_module()
         plan_func = module.plan
         workspace_size_func = None
+        workspace_size_upper_bound_func = None
         ragged_run_func = module.ragged_run
         paged_run_func = module.paged_run
     elif backend == "fa2":
@@ -547,6 +548,9 @@ def get_batch_prefill_module(backend, *args):
         )
         plan_func = module.plan
         workspace_size_func = getattr(module, "workspace_size", None)
+        workspace_size_upper_bound_func = getattr(
+            module, "workspace_size_upper_bound", None
+        )
         ragged_run_func = module.ragged_run
         paged_run_func = module.paged_run
     else:
@@ -554,6 +558,9 @@ def get_batch_prefill_module(backend, *args):
         module = gen_batch_prefill_module(backend, *args).build_and_load()
         plan_func = module.plan
         workspace_size_func = getattr(module, "workspace_size", None)
+        workspace_size_upper_bound_func = getattr(
+            module, "workspace_size_upper_bound", None
+        )
         ragged_run_func = module.ragged_run
         paged_run_func = module.paged_run
 
@@ -1000,6 +1007,7 @@ def get_batch_prefill_module(backend, *args):
     return SimpleNamespace(
         plan=plan_func,
         workspace_size=workspace_size_func,
+        workspace_size_upper_bound=workspace_size_upper_bound_func,
         ragged_run=ragged_run,
         paged_run=paged_run,
         prewarm_paged_kv_stride_variant=prewarm_paged_kv_stride_variant,
@@ -1010,6 +1018,9 @@ def get_batch_prefill_module(backend, *args):
 def get_batch_prefill_jit_module(module_name: str, jit_module: Any):
     plan_func = jit_module.plan
     workspace_size_func = getattr(jit_module, "workspace_size", None)
+    workspace_size_upper_bound_func = getattr(
+        jit_module, "workspace_size_upper_bound", None
+    )
     ragged_run_func = jit_module.ragged_run
     paged_run_func = jit_module.paged_run
 
@@ -1152,6 +1163,7 @@ def get_batch_prefill_jit_module(module_name: str, jit_module: Any):
     return SimpleNamespace(
         plan=plan_func,
         workspace_size=workspace_size_func,
+        workspace_size_upper_bound=workspace_size_upper_bound_func,
         ragged_run=ragged_run,
         paged_run=paged_run,
     )

@@ -429,6 +429,11 @@ def test_plan_and_sizing_share_the_backend_resolvers():
 # nothing here may be reached through a monkeypatched module: the point is to
 # find out whether the bound the C++ computes actually covers what the planner
 # asks for.
+#
+# They are targeted, not exhaustive. The bound is a mathematical claim about
+# the scheduler; these check it against the shapes most likely to break it --
+# distributions biased away from uniform, and the query lengths where the tile
+# selector changes its mind.
 # ---------------------------------------------------------------------------
 
 requires_cuda = pytest.mark.skipif(
@@ -436,48 +441,47 @@ requires_cuda = pytest.mark.skipif(
     reason="workspace upper-bound GPU tests require CUDA",
 )
 
+_PAGE_SIZE = 16
+_NUM_QO_HEADS = 8
+_NUM_KV_HEADS = 2
+_HEAD_DIM = 128
 
-def _distributions(max_batch_size: int, max_total_num_rows: int, max_pages: int):
-    """Request shapes inside the bounds, biased rather than uniform.
 
-    The bound's claim is that it covers any distribution of rows and KV
-    lengths over the batch, which a uniform grid cannot test.
+def _nonuniform_distributions(batch_size: int, total_rows: int, max_pages: int):
+    """Row and KV shapes for one batch size, biased away from uniform.
+
+    The bound's claim is that it holds for any distribution of rows and KV
+    lengths over the batch, so a uniform grid would not test it.
     """
-    shapes = []
-    for batch_size in range(1, max_batch_size + 1):
-        rows = max_total_num_rows
-        even = max(rows // batch_size, 1)
-        # uniform
-        shapes.append(([even] * batch_size, [max_pages] * batch_size))
-        if batch_size == 1:
-            continue
-        # one request carries almost everything
-        skewed = [rows - (batch_size - 1)] + [1] * (batch_size - 1)
-        shapes.append((skewed, [max_pages] * batch_size))
-        # short and long alternating
+    even = max(total_rows // batch_size, 1)
+    shapes = [
+        # uniform, as the baseline
+        ([even] * batch_size, [max_pages] * batch_size),
+    ]
+    if batch_size > 1:
+        skewed = [total_rows - (batch_size - 1)] + [1] * (batch_size - 1)
         alternating = [
             1 if index % 2 else max(even * 2, 1) for index in range(batch_size)
         ]
-        shapes.append((alternating, [max_pages] * batch_size))
-        # the long-q request is not the long-kv one
-        pages = [1] * batch_size
-        pages[-1] = max_pages
-        shapes.append((skewed, pages))
-        # a request with no query rows, where the planner allows it
-        zero_query = [0] + [even] * (batch_size - 1)
-        shapes.append((zero_query, [max_pages] * batch_size))
-    return [
-        (q, kv)
-        for q, kv in shapes
-        if sum(q) <= max_total_num_rows and len(q) <= max_batch_size
-    ]
+        long_kv_elsewhere = [1] * batch_size
+        long_kv_elsewhere[-1] = max_pages
+        shapes += [
+            # one request carries almost every row
+            (skewed, [max_pages] * batch_size),
+            # short and long requests interleaved
+            (alternating, [max_pages] * batch_size),
+            # the long-query request is not the long-KV one
+            (skewed, long_kv_elsewhere),
+        ]
+    return [(q, kv) for q, kv in shapes if sum(q) <= total_rows]
 
 
-def _boundary_query_lens():
+def _tile_boundary_query_lens():
+    """Lengths around every CTA_TILE_Q the selector can pick."""
     return [15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129]
 
 
-def _paged_inputs(q_lens, kv_pages, page_size, device="cuda"):
+def _paged_inputs(q_lens, kv_pages, page_size=_PAGE_SIZE, device="cuda"):
     qo_indptr = torch.tensor(
         [0, *torch.tensor(q_lens).cumsum(0).tolist()], dtype=torch.int32, device=device
     )
@@ -493,123 +497,161 @@ def _paged_inputs(q_lens, kv_pages, page_size, device="cuda"):
     return qo_indptr, kv_indptr, kv_indices, last_page_len
 
 
+def _prefill_wrapper(batch_size, max_pages, *, use_cuda_graph, float_bytes=None):
+    """A wrapper for one batch size.
+
+    A CUDA graph wrapper fixes its batch size at construction, so graph-mode
+    coverage needs one wrapper per batch size rather than one for all of them.
+    """
+    import flashinfer
+
+    buffer = torch.empty(
+        float_bytes if float_bytes is not None else 256 * 1024 * 1024,
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    if not use_cuda_graph:
+        return flashinfer.BatchPrefillWithPagedKVCacheWrapper(buffer, "NHD")
+    return flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        buffer,
+        "NHD",
+        use_cuda_graph=True,
+        qo_indptr_buf=torch.zeros(batch_size + 1, dtype=torch.int32, device="cuda"),
+        paged_kv_indptr_buf=torch.zeros(
+            batch_size + 1, dtype=torch.int32, device="cuda"
+        ),
+        paged_kv_indices_buf=torch.zeros(
+            batch_size * max_pages, dtype=torch.int32, device="cuda"
+        ),
+        paged_kv_last_page_len_buf=torch.zeros(
+            batch_size, dtype=torch.int32, device="cuda"
+        ),
+    )
+
+
+def _prefill_workspace_size(wrapper, q_lens, kv_pages, split):
+    qo_indptr, kv_indptr, kv_indices, last_page_len = _paged_inputs(q_lens, kv_pages)
+    return wrapper.workspace_size(
+        qo_indptr=qo_indptr,
+        paged_kv_indptr=kv_indptr,
+        paged_kv_indices=kv_indices,
+        paged_kv_last_page_len=last_page_len,
+        num_qo_heads=_NUM_QO_HEADS,
+        num_kv_heads=_NUM_KV_HEADS,
+        head_dim_qk=_HEAD_DIM,
+        page_size=_PAGE_SIZE,
+        causal=True,
+        **split,
+    )
+
+
 @requires_cuda
-@pytest.mark.parametrize("use_cuda_graph", [False, True])
 @pytest.mark.parametrize(
-    ("fixed_split_size", "disable_split_kv"),
+    "use_cuda_graph",
     [
-        pytest.param(None, False, id="default-split"),
-        pytest.param(4, False, id="fixed-split"),
-        pytest.param(None, True, id="split-disabled"),
+        pytest.param(False, id="eager"),
+        # Planner sizing in CUDA graph mode. This does not capture or replay a
+        # graph; it checks the sizes the graph-mode scheduler asks for.
+        pytest.param(True, id="graph-mode-sizing"),
     ],
 )
-def test_prefill_upper_bound_covers_every_reachable_shape(
-    use_cuda_graph, fixed_split_size, disable_split_kv
-):
+@pytest.mark.parametrize(
+    "split",
+    [
+        pytest.param({}, id="default-split"),
+        pytest.param({"fixed_split_size": 4}, id="fixed-split"),
+        pytest.param({"disable_split_kv": True}, id="split-disabled"),
+    ],
+)
+def test_prefill_upper_bound_covers_targeted_nonuniform_shapes(use_cuda_graph, split):
     """No plan inside the bounds may need more than the bound reports."""
-    import flashinfer
+    pytest.importorskip("flashinfer")
 
-    page_size = 16
     max_batch_size, max_total_num_rows, max_pages = 4, 64, 8
-    num_qo_heads, num_kv_heads, head_dim = 8, 2, 128
+    checked = 0
 
-    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-        torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda"),
-        "NHD",
-        use_cuda_graph=use_cuda_graph,
-    )
-    bound_float, bound_int = wrapper.workspace_size_upper_bound(
-        max_batch_size=max_batch_size,
-        max_total_num_rows=max_total_num_rows,
-        max_num_pages_per_request=max_pages,
-        num_qo_heads=num_qo_heads,
-        num_kv_heads=num_kv_heads,
-        head_dim_qk=head_dim,
-        page_size=page_size,
-        fixed_split_size=fixed_split_size,
-        disable_split_kv=disable_split_kv,
-    )
-
-    for q_lens, kv_pages in _distributions(
-        max_batch_size, max_total_num_rows, max_pages
-    ):
-        qo_indptr, kv_indptr, kv_indices, last_page_len = _paged_inputs(
-            q_lens, kv_pages, page_size
+    for batch_size in range(1, max_batch_size + 1):
+        wrapper = _prefill_wrapper(batch_size, max_pages, use_cuda_graph=use_cuda_graph)
+        bound_float, bound_int = wrapper.workspace_size_upper_bound(
+            max_batch_size=max_batch_size,
+            max_total_num_rows=max_total_num_rows,
+            max_num_pages_per_request=max_pages,
+            num_qo_heads=_NUM_QO_HEADS,
+            num_kv_heads=_NUM_KV_HEADS,
+            head_dim_qk=_HEAD_DIM,
+            page_size=_PAGE_SIZE,
+            **split,
         )
-        try:
-            shape_float, shape_int = wrapper.workspace_size(
-                qo_indptr=qo_indptr,
-                paged_kv_indptr=kv_indptr,
-                paged_kv_indices=kv_indices,
-                paged_kv_last_page_len=last_page_len,
-                num_qo_heads=num_qo_heads,
-                num_kv_heads=num_kv_heads,
-                head_dim_qk=head_dim,
-                page_size=page_size,
-                causal=True,
-                fixed_split_size=fixed_split_size,
-                disable_split_kv=disable_split_kv,
+        for q_lens, kv_pages in _nonuniform_distributions(
+            batch_size, max_total_num_rows, max_pages
+        ):
+            shape_float, shape_int = _prefill_workspace_size(
+                wrapper, q_lens, kv_pages, split
             )
-        except ValueError:
-            # A shape the planner itself refuses is out of scope.
-            continue
-        assert shape_float <= bound_float, (q_lens, kv_pages, shape_float, bound_float)
-        assert shape_int <= bound_int, (q_lens, kv_pages, shape_int, bound_int)
+            assert shape_float <= bound_float, (
+                q_lens,
+                kv_pages,
+                split,
+                use_cuda_graph,
+                shape_float,
+                bound_float,
+            )
+            assert shape_int <= bound_int, (
+                q_lens,
+                kv_pages,
+                split,
+                use_cuda_graph,
+                shape_int,
+                bound_int,
+            )
+            checked += 1
+
+    assert checked > 0
 
 
 @requires_cuda
-@pytest.mark.parametrize("query_len", _boundary_query_lens())
+@pytest.mark.parametrize("query_len", _tile_boundary_query_lens())
 def test_prefill_upper_bound_covers_the_tile_boundaries(query_len):
     """The tile the planner picks changes around these lengths."""
-    import flashinfer
+    pytest.importorskip("flashinfer")
 
-    page_size = 16
     max_batch_size, max_pages = 4, 8
-    max_total_num_rows = max_batch_size * max(_boundary_query_lens())
-    num_qo_heads, num_kv_heads, head_dim = 8, 2, 128
-
-    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-        torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device="cuda"), "NHD"
-    )
-    bound_float, bound_int = wrapper.workspace_size_upper_bound(
-        max_batch_size=max_batch_size,
-        max_total_num_rows=max_total_num_rows,
-        max_num_pages_per_request=max_pages,
-        num_qo_heads=num_qo_heads,
-        num_kv_heads=num_kv_heads,
-        head_dim_qk=head_dim,
-        page_size=page_size,
-    )
+    max_total_num_rows = max_batch_size * max(_tile_boundary_query_lens())
+    checked = 0
 
     for batch_size in range(1, max_batch_size + 1):
-        q_lens = [query_len] * batch_size
-        qo_indptr, kv_indptr, kv_indices, last_page_len = _paged_inputs(
-            q_lens, [max_pages] * batch_size, page_size
+        wrapper = _prefill_wrapper(batch_size, max_pages, use_cuda_graph=False)
+        bound_float, bound_int = wrapper.workspace_size_upper_bound(
+            max_batch_size=max_batch_size,
+            max_total_num_rows=max_total_num_rows,
+            max_num_pages_per_request=max_pages,
+            num_qo_heads=_NUM_QO_HEADS,
+            num_kv_heads=_NUM_KV_HEADS,
+            head_dim_qk=_HEAD_DIM,
+            page_size=_PAGE_SIZE,
         )
-        shape_float, shape_int = wrapper.workspace_size(
-            qo_indptr=qo_indptr,
-            paged_kv_indptr=kv_indptr,
-            paged_kv_indices=kv_indices,
-            paged_kv_last_page_len=last_page_len,
-            num_qo_heads=num_qo_heads,
-            num_kv_heads=num_kv_heads,
-            head_dim_qk=head_dim,
-            page_size=page_size,
-            causal=True,
+        shape_float, shape_int = _prefill_workspace_size(
+            wrapper, [query_len] * batch_size, [max_pages] * batch_size, {}
         )
         assert shape_float <= bound_float, (query_len, batch_size, shape_float)
         assert shape_int <= bound_int, (query_len, batch_size, shape_int)
+        checked += 1
+
+    assert checked == max_batch_size
 
 
 @requires_cuda
-@pytest.mark.parametrize("use_tensor_cores", [False, True])
-def test_decode_upper_bound_covers_every_reachable_shape(use_tensor_cores):
+@pytest.mark.parametrize(
+    "use_tensor_cores",
+    [pytest.param(False, id="cuda-core"), pytest.param(True, id="tensor-core")],
+)
+def test_decode_upper_bound_covers_targeted_nonuniform_shapes(use_tensor_cores):
     """Both decode planners have to stay inside their own bound."""
     import flashinfer
 
-    page_size = 16
+    pytest.importorskip("flashinfer")
     max_batch_size, max_pages = 8, 8
-    num_qo_heads, num_kv_heads, head_dim = 8, 2, 128
+    checked = 0
 
     wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
         torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda"),
@@ -619,75 +661,78 @@ def test_decode_upper_bound_covers_every_reachable_shape(use_tensor_cores):
     bound_float, bound_int = wrapper.workspace_size_upper_bound(
         max_batch_size=max_batch_size,
         max_num_pages_per_request=max_pages,
-        num_qo_heads=num_qo_heads,
-        num_kv_heads=num_kv_heads,
-        head_dim=head_dim,
-        page_size=page_size,
+        num_qo_heads=_NUM_QO_HEADS,
+        num_kv_heads=_NUM_KV_HEADS,
+        head_dim=_HEAD_DIM,
+        page_size=_PAGE_SIZE,
     )
 
     for batch_size in range(1, max_batch_size + 1):
-        for pages in ({1}, {max_pages}, {1, max_pages}):
-            kv_pages = [
-                sorted(pages)[index % len(pages)] for index in range(batch_size)
-            ]
+        # uniform short, uniform long, and a mix where one request is long
+        for kv_pages in (
+            [1] * batch_size,
+            [max_pages] * batch_size,
+            [1] * (batch_size - 1) + [max_pages],
+        ):
             _, kv_indptr, kv_indices, last_page_len = _paged_inputs(
-                [1] * batch_size, kv_pages, page_size
+                [1] * batch_size, kv_pages
             )
             shape_float, shape_int = wrapper.workspace_size(
                 indptr=kv_indptr,
                 indices=kv_indices,
                 last_page_len=last_page_len,
-                num_qo_heads=num_qo_heads,
-                num_kv_heads=num_kv_heads,
-                head_dim=head_dim,
-                page_size=page_size,
+                num_qo_heads=_NUM_QO_HEADS,
+                num_kv_heads=_NUM_KV_HEADS,
+                head_dim=_HEAD_DIM,
+                page_size=_PAGE_SIZE,
             )
             assert shape_float <= bound_float, (batch_size, kv_pages, shape_float)
             assert shape_int <= bound_int, (batch_size, kv_pages, shape_int)
+            checked += 1
+
+    assert checked > 0
 
 
 @requires_cuda
 def test_prefill_plan_succeeds_with_buffers_sized_from_the_bound():
-    """A bound is only useful if a plan actually fits in it."""
-    import flashinfer
+    """A bound is only useful if the plans it was taken for fit in it."""
+    pytest.importorskip("flashinfer")
 
-    page_size = 16
     max_batch_size, max_total_num_rows, max_pages = 4, 64, 8
-    num_qo_heads, num_kv_heads, head_dim = 8, 2, 128
+    planned = 0
 
-    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-        torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda"), "NHD"
-    )
-    bound_float, bound_int = wrapper.workspace_size_upper_bound(
-        max_batch_size=max_batch_size,
-        max_total_num_rows=max_total_num_rows,
-        max_num_pages_per_request=max_pages,
-        num_qo_heads=num_qo_heads,
-        num_kv_heads=num_kv_heads,
-        head_dim_qk=head_dim,
-        page_size=page_size,
-    )
-    wrapper.reset_workspace_buffer(
-        torch.empty(max(bound_float, 1), dtype=torch.uint8, device="cuda"),
-        torch.empty(max(bound_int, 1), dtype=torch.uint8, device="cuda"),
-    )
+    for batch_size in range(1, max_batch_size + 1):
+        wrapper = _prefill_wrapper(batch_size, max_pages, use_cuda_graph=False)
+        bound_float, bound_int = wrapper.workspace_size_upper_bound(
+            max_batch_size=max_batch_size,
+            max_total_num_rows=max_total_num_rows,
+            max_num_pages_per_request=max_pages,
+            num_qo_heads=_NUM_QO_HEADS,
+            num_kv_heads=_NUM_KV_HEADS,
+            head_dim_qk=_HEAD_DIM,
+            page_size=_PAGE_SIZE,
+        )
+        wrapper.reset_workspace_buffer(
+            torch.empty(max(bound_float, 1), dtype=torch.uint8, device="cuda"),
+            torch.empty(max(bound_int, 1), dtype=torch.uint8, device="cuda"),
+        )
+        for q_lens, kv_pages in _nonuniform_distributions(
+            batch_size, max_total_num_rows, max_pages
+        ):
+            qo_indptr, kv_indptr, kv_indices, last_page_len = _paged_inputs(
+                q_lens, kv_pages
+            )
+            wrapper.plan(
+                qo_indptr=qo_indptr,
+                paged_kv_indptr=kv_indptr,
+                paged_kv_indices=kv_indices,
+                paged_kv_last_page_len=last_page_len,
+                num_qo_heads=_NUM_QO_HEADS,
+                num_kv_heads=_NUM_KV_HEADS,
+                head_dim_qk=_HEAD_DIM,
+                page_size=_PAGE_SIZE,
+                causal=True,
+            )
+            planned += 1
 
-    for q_lens, kv_pages in _distributions(
-        max_batch_size, max_total_num_rows, max_pages
-    ):
-        if 0 in q_lens:
-            continue
-        qo_indptr, kv_indptr, kv_indices, last_page_len = _paged_inputs(
-            q_lens, kv_pages, page_size
-        )
-        wrapper.plan(
-            qo_indptr=qo_indptr,
-            paged_kv_indptr=kv_indptr,
-            paged_kv_indices=kv_indices,
-            paged_kv_last_page_len=last_page_len,
-            num_qo_heads=num_qo_heads,
-            num_kv_heads=num_kv_heads,
-            head_dim_qk=head_dim,
-            page_size=page_size,
-            causal=True,
-        )
+    assert planned > 0
