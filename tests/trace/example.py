@@ -33,6 +33,7 @@ gemm_bf16_N4096_K4096.json
 gemm_fp4_N2048_K7168_block_size16.json
 gemm_fp8_N1536_K7168.json
 gemm_fp8_nt_groupwise_n1536_k7168.json
+group_gemm_fp8_nt_groupwise_contiguous_g2_n128_k128.json
 gemm_mxfp8_N4096_K4096.json
 gemm_nvfp4_svdquant_N3072_K_packed1536_rank32.json
 gemma_fused_add_rmsnorm_h4608.json
@@ -471,6 +472,19 @@ with contextlib.suppress(Exception):
     b_scale_g = torch.ones(N // BS, K // BS, dtype=torch.float32, device=device)
     flashinfer.gemm.gemm_fp8_nt_groupwise(
         a_g, b_g, a_scale_g, b_scale_g, backend="trtllm"
+    )
+
+# Contiguous grouped FP8: two experts, with a partial final M tile.
+with contextlib.suppress(Exception):
+    from flashinfer.trace.templates.gemm import (
+        group_gemm_fp8_nt_groupwise_contiguous_trace,
+    )
+
+    contiguous_inputs = group_gemm_fp8_nt_groupwise_contiguous_trace.init(
+        M=129, num_groups=2, N=128, K=128, device=device
+    )
+    flashinfer.gemm.group_gemm_fp8_nt_groupwise_contiguous(
+        **contiguous_inputs, validate_indices=True
     )
 
 # ── GEMM mxfp8 (Blackwell SM100+: M×4096@4096×4096, block=32) ────────────────
@@ -2576,9 +2590,10 @@ with contextlib.suppress(Exception):
             causal=True,
         )
 
-# ── Paged MQA logits (attn_scores) — DeepSeek MLA sparse indexer (SM100/SM103) ──
+# ── Paged MQA logits (attn_scores) — DeepSeek MLA sparse indexer (SM100/SM103/SM107) ──
 # FP8 (per-token fp32 KV scale) and FP4 (MXFP4 block-scaled). Traces dump before
-# launch, so the JSONs appear on any GPU; the kernels require SM100/SM103. Inputs
+# launch, so the JSONs appear on any GPU; the kernels require SM100/SM103 or
+# Rubin (SM107). Inputs
 # are built with each template's own init (H=64, D=128).
 with contextlib.suppress(Exception):
     import flashinfer.attn_scores  # noqa: F401  (triggers @flashinfer_api registration)
@@ -2595,7 +2610,7 @@ with contextlib.suppress(Exception):
         num_heads=64,
         head_dim=128,
         block_size=64,
-        max_context_len=4096,
+        max_seq_len=4096,
         device=device,
     )
 
@@ -2605,19 +2620,19 @@ with contextlib.suppress(Exception):
             _fp8_in["q"],
             _fp8_in["kv_fused"],
             _fp8_in["weights"],
-            _fp8_in["context_lens"],
-            _fp8_in["block_table"],
-            _fp8_in["max_context_len"],
+            _fp8_in["block_tables"],
+            _fp8_in["seq_lens"],
+            _fp8_in["max_seq_len"],
         )
 
     with contextlib.suppress(Exception):
         _fp4_in = _fp4_pmqa_trace.init(**_pmqa_kw)
         flashinfer.fp4_paged_mqa_logits(
             _fp4_in["q"],
-            _fp4_in["sf_q"],
+            _fp4_in["q_sf"],
             _fp4_in["kv_fused"],
             _fp4_in["weights"],
-            _fp4_in["context_lens"],
-            _fp4_in["block_table"],
-            _fp4_in["max_context_len"],
+            _fp4_in["block_tables"],
+            _fp4_in["seq_lens"],
+            _fp4_in["max_seq_len"],
         )
