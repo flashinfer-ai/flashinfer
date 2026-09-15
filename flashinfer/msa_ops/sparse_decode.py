@@ -350,13 +350,14 @@ def msa_sparse_decode_attention(
     import cutlass
     import cutlass.cute as cute
 
-    from ..utils import is_sm12x_supported
+    from ..utils import is_sm12x_supported, is_sm90a_supported
     from .cute_dsl.sparse_decode_sm12x import SparseDecodeForwardSm12x
     from ._common import _q_offset_explicit
 
-    if not is_sm12x_supported(q.device):
+    sm90 = is_sm90a_supported(q.device)
+    if not (sm90 or is_sm12x_supported(q.device)):
         raise RuntimeError(
-            "msa_sparse_decode_attention requires SM120 or SM121 and CUDA >= 12.8"
+            "msa_sparse_decode_attention requires SM90, SM120 or SM121 and CUDA >= 12.8"
         )
     if q.ndim != 3:
         raise ValueError("q must be 3D (total_q, num_qo_heads, head_dim)")
@@ -390,6 +391,28 @@ def msa_sparse_decode_attention(
     # of msa_topk_select's output).
     if not q2k_indices.is_contiguous():
         raise ValueError("q2k_indices must be contiguous")
+
+    if sm90:
+        if return_softmax_lse:
+            raise NotImplementedError("SM90 msa_sparse_decode_attention does not return an LSE")
+        if page_table is None or seqused_k is None:
+            raise NotImplementedError(
+                "SM90 msa_sparse_decode_attention requires the paged KV layout"
+            )
+        if k_scale is not None or v_scale is not None:
+            raise NotImplementedError("SM90 msa_sparse_decode_attention has no dequant path")
+        if softmax_scale is not None and softmax_scale != head_dim**-0.5:
+            raise NotImplementedError(
+                "SM90 msa_sparse_decode_attention uses the default softmax scale"
+            )
+        from ._sm90_dispatch import sparse_decode_sm90
+
+        out = torch.empty(
+            (total_q, num_qo_heads, head_dim), dtype=compute_dtype, device=q.device
+        )
+        return sparse_decode_sm90(
+            q, k, v, q2k_indices, page_table, seqused_k, out
+        )
     topk = q2k_indices.shape[2]
     if topk <= 0:
         raise ValueError("q2k_indices topk dimension must be positive")

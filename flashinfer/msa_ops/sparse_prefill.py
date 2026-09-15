@@ -20,7 +20,7 @@ import torch
 
 from ..api_logging import flashinfer_api
 from ..trace.templates.msa import msa_sparse_attention_trace
-from ..utils import is_sm12x_supported
+from ..utils import is_sm12x_supported, is_sm90a_supported
 from ._blackwell_sm100 import (
     MSASparseAttentionWorkspace,
     blackwell_msa_sparse_attention,
@@ -202,9 +202,10 @@ def msa_sparse_attention(
             "MSASparseAttentionWorkspace is only used by the compute "
             "capability 10.0/10.3 backend"
         )
-    if not is_sm12x_supported(q.device):
+    sm90 = is_sm90a_supported(q.device)
+    if not (sm90 or is_sm12x_supported(q.device)):
         raise RuntimeError(
-            "msa_sparse_attention requires SM120 or SM121 (Blackwell) and CUDA >= 12.8"
+            "msa_sparse_attention requires SM90, SM120 or SM121 and CUDA >= 12.8"
         )
     compute_dtype = q.dtype
     if q.dtype not in (torch.bfloat16, torch.float16):
@@ -227,6 +228,21 @@ def msa_sparse_attention(
     topk = q2k_indices.shape[2]
     if softmax_scale is None:
         softmax_scale = head_dim**-0.5
+
+    if sm90:
+        if return_softmax_lse or return_temperature_lse:
+            raise NotImplementedError("SM90 msa_sparse_attention does not return an LSE")
+        if page_table is None or seqused_k is None:
+            raise NotImplementedError("SM90 msa_sparse_attention requires the paged KV layout")
+        if softmax_scale != head_dim**-0.5:
+            raise NotImplementedError("SM90 msa_sparse_attention uses the default softmax scale")
+        from ._sm90_dispatch import sparse_prefill_sm90
+
+        out = torch.zeros((total_q, num_qo_heads, head_dim), dtype=q.dtype, device=q.device)
+        return sparse_prefill_sm90(
+            q, k, v, q2k_indices, cu_seqlens_q, page_table, seqused_k, out,
+            q_offset=q_offset if isinstance(q_offset, torch.Tensor) else None,
+        )
 
     kv_fp8 = k.dtype == torch.float8_e4m3fn
     kv_nvfp4 = k.dtype == torch.uint8
