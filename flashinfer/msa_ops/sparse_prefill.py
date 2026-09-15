@@ -236,6 +236,14 @@ def msa_sparse_attention(
             raise NotImplementedError("SM90 msa_sparse_attention requires the paged KV layout")
         if softmax_scale != head_dim**-0.5:
             raise NotImplementedError("SM90 msa_sparse_attention uses the default softmax scale")
+        if (
+            k_scale is not None
+            or v_scale is not None
+            or k_global_scale is not None
+            or v_global_scale is not None
+        ):
+            # Silently dropping a scale would return plausible, wrong numbers.
+            raise NotImplementedError("SM90 msa_sparse_attention has no dequant path")
         from ._sm90_dispatch import sparse_prefill_sm90
 
         out = torch.zeros((total_q, num_qo_heads, head_dim), dtype=q.dtype, device=q.device)

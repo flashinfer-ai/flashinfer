@@ -399,7 +399,13 @@ def msa_sparse_decode_attention(
             raise NotImplementedError(
                 "SM90 msa_sparse_decode_attention requires the paged KV layout"
             )
-        if k_scale is not None or v_scale is not None:
+        if (
+            k_scale is not None
+            or v_scale is not None
+            or k_global_scale is not None
+            or v_global_scale is not None
+        ):
+            # Silently dropping a scale would return plausible, wrong numbers.
             raise NotImplementedError("SM90 msa_sparse_decode_attention has no dequant path")
         if softmax_scale is not None and softmax_scale != head_dim**-0.5:
             raise NotImplementedError(
