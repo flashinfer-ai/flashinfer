@@ -177,6 +177,23 @@ static_assert(Kernel_traits_nl_sliding_or_chunked::CTAS_PER_HEAD == 1, "");
 static_assert(Kernel_traits_nl_sliding_or_chunked::MASK_VERSION == 4, "");
 {% endif %}
 
+{% if bidirectional_sliding_window_mask == "1" %}
+using Kernel_traits_nl_bidirectional_sliding_window = fmha::{{ kernel_traits }}<
+    fmha::{{ instruction_traits }},
+    {{ kv_loop_step }},
+    {{ head_size }},
+    {{ head_size_v }},
+    {{ noloop_step }},
+    1,
+    {{ warps_m }} * {{ warps_n }},
+    {{ ctas_per_head }},
+    {{ kernel_flags }} | 0x200 /* no_loop flag */,
+    /*bidirectional sliding window mask*/ 5>;
+
+static_assert(Kernel_traits_nl_bidirectional_sliding_window::CTAS_PER_HEAD == 1, "");
+static_assert(Kernel_traits_nl_bidirectional_sliding_window::MASK_VERSION == 5, "");
+{% endif %}
+
 extern "C"
 __global__
 void {{ kernel_name }}_nl({{ params_type }} params){
@@ -209,6 +226,18 @@ void {{ sliding_or_chunked_causal_kernel_name }}_nl({{ params_type }} params){
 }
 {% endif %}
 
+{% if bidirectional_sliding_window_mask == "1" %}
+extern "C"
+__global__
+void {{ bidirectional_sliding_window_kernel_name }}_nl({{ params_type }} params){
+{% if kernel_variant == "flash_attention" %}
+  fused_multihead_attention::device_flash_attention_nl<Kernel_traits_nl_bidirectional_sliding_window>(params);
+{% else %}
+  fused_multihead_attention::device_1xN_nl<Kernel_traits_nl_bidirectional_sliding_window>(params);
+{% endif %}
+}
+{% endif %}
+
 void {{ launcher_name }}_nl(
     const {{ params_type }} &params,
     const Launch_params &launch_params,
@@ -234,6 +263,16 @@ void {{ launcher_name }}_nl(
                                             smem_size));
     }
     {{ sliding_or_chunked_causal_kernel_name }}_nl<<<grid, Kernel_traits_nl_sliding_or_chunked::THREADS, Kernel_traits_nl_sliding_or_chunked::BYTES_PER_SMEM, stream>>>(params);
+{% endif %}
+{% if bidirectional_sliding_window_mask == "1" %}
+  } else if( launch_params.attention_mask_type == Attention_mask_type::BIDIRECTIONAL_SLIDING_WINDOW ) {
+    constexpr int smem_size = Kernel_traits_nl_bidirectional_sliding_window::BYTES_PER_SMEM;
+    if( smem_size >= 48*1024 ) {
+        FMHA_CHECK_CUDA(cudaFuncSetAttribute({{ bidirectional_sliding_window_kernel_name }}_nl,
+                                            cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                            smem_size));
+    }
+    {{ bidirectional_sliding_window_kernel_name }}_nl<<<grid, Kernel_traits_nl_bidirectional_sliding_window::THREADS, Kernel_traits_nl_bidirectional_sliding_window::BYTES_PER_SMEM, stream>>>(params);
 {% endif %}
   } else {
     constexpr int smem_size = Kernel_traits_nl::BYTES_PER_SMEM;
@@ -303,6 +342,23 @@ static_assert(Kernel_traits_nl_tiled_sliding_or_chunked::CTAS_PER_HEAD == 1, "")
 static_assert(Kernel_traits_nl_tiled_sliding_or_chunked::MASK_VERSION == 4, "");
 {% endif %}
 
+{% if bidirectional_sliding_window_mask == "1" %}
+using Kernel_traits_nl_tiled_bidirectional_sliding_window = fmha::{{ kernel_traits }}<
+    fmha::{{ instruction_traits }},
+    {{ kv_loop_step }},
+    {{ head_size }},
+    {{ head_size_v }},
+    {{ noloop_step }},
+    {{ warps_m }},
+    {{ warps_n }},
+    {{ ctas_per_head }},
+    {{ kernel_flags }} | 0x200 /* no_loop flag */,
+    /*bidirectional sliding window mask*/ 5>;
+
+static_assert(Kernel_traits_nl_tiled_bidirectional_sliding_window::CTAS_PER_HEAD == 1, "");
+static_assert(Kernel_traits_nl_tiled_bidirectional_sliding_window::MASK_VERSION == 5, "");
+{% endif %}
+
 {% else %} // !reload_q
 // Tiled (granular) variant: uses the same Kernel_traits_nl with USE_GRANULAR_TILING
 // in the flags for correct tile decomposition (CTA_O_TILE_K computed from K_PER_MMA
@@ -350,6 +406,18 @@ void {{ sliding_or_chunked_causal_kernel_name }}_nl_tiled({{ params_type }} para
 }
 {% endif %}
 
+{% if kernel_variant == "flash_attention" and bidirectional_sliding_window_mask == "1" %}
+extern "C"
+__global__
+void {{ bidirectional_sliding_window_kernel_name }}_nl_tiled({{ params_type }} params){
+{% if reload_q %}
+  fused_multihead_attention::device_flash_attention_nl_tiled<Kernel_traits_nl_tiled_bidirectional_sliding_window>(params);
+{% else %}
+  fused_multihead_attention::device_flash_attention_nl<Kernel_traits_nl_bidirectional_sliding_window>(params);
+{% endif %}
+}
+{% endif %}
+
 void {{ launcher_name }}_nl_tiled(
     const {{ params_type }} &params,
     const Launch_params &launch_params,
@@ -392,6 +460,16 @@ void {{ launcher_name }}_nl_tiled(
     }
     {{ sliding_or_chunked_causal_kernel_name }}_nl_tiled<<<grid, Kernel_traits_nl_tiled_sliding_or_chunked::THREADS, Kernel_traits_nl_tiled_sliding_or_chunked::BYTES_PER_SMEM, stream>>>(params);
 {% endif %}
+{% if bidirectional_sliding_window_mask == "1" %}
+  } else if( launch_params.attention_mask_type == Attention_mask_type::BIDIRECTIONAL_SLIDING_WINDOW ) {
+    constexpr int smem_size = Kernel_traits_nl_tiled_bidirectional_sliding_window::BYTES_PER_SMEM;
+    if( smem_size >= 48*1024 ) {
+        FMHA_CHECK_CUDA(cudaFuncSetAttribute({{ bidirectional_sliding_window_kernel_name }}_nl_tiled,
+                                            cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                            smem_size));
+    }
+    {{ bidirectional_sliding_window_kernel_name }}_nl_tiled<<<grid, Kernel_traits_nl_tiled_bidirectional_sliding_window::THREADS, Kernel_traits_nl_tiled_bidirectional_sliding_window::BYTES_PER_SMEM, stream>>>(params);
+{% endif %}
   } else {
     constexpr int smem_size = Kernel_traits_nl_tiled::BYTES_PER_SMEM;
     if( smem_size >= 48*1024 ) {
@@ -419,6 +497,16 @@ void {{ launcher_name }}_nl_tiled(
                                             smem_size));
     }
     {{ sliding_or_chunked_causal_kernel_name }}_nl_tiled<<<grid, Kernel_traits_nl_sliding_or_chunked::THREADS, Kernel_traits_nl_sliding_or_chunked::BYTES_PER_SMEM, stream>>>(params);
+{% endif %}
+{% if bidirectional_sliding_window_mask == "1" %}
+  } else if( launch_params.attention_mask_type == Attention_mask_type::BIDIRECTIONAL_SLIDING_WINDOW ) {
+    constexpr int smem_size = Kernel_traits_nl_bidirectional_sliding_window::BYTES_PER_SMEM;
+    if( smem_size >= 48*1024 ) {
+        FMHA_CHECK_CUDA(cudaFuncSetAttribute({{ bidirectional_sliding_window_kernel_name }}_nl_tiled,
+                                            cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                            smem_size));
+    }
+    {{ bidirectional_sliding_window_kernel_name }}_nl_tiled<<<grid, Kernel_traits_nl_bidirectional_sliding_window::THREADS, Kernel_traits_nl_bidirectional_sliding_window::BYTES_PER_SMEM, stream>>>(params);
 {% endif %}
   } else {
     constexpr int smem_size = Kernel_traits_nl::BYTES_PER_SMEM;
