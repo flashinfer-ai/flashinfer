@@ -183,7 +183,7 @@ def test_output_only_state_not_written():
 
 def test_output_only_matches_recurrent_kda():
     """Outputs match flashinfer.recurrent_kda run token-by-token."""
-    from flashinfer.kda_decode import recurrent_kda
+    from flashinfer import recurrent_kda
 
     B, T, H, HV = 2, 8, 4, 4
     q, k, v, _, beta, h0, idx, _, _ = _make_inputs(B, T, H, HV, seed=3)
