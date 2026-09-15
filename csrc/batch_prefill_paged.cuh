@@ -148,7 +148,8 @@ void BatchPrefillWithPagedKVCacheRun(TensorView float_workspace_buffer,
             status = flashinfer::BatchPrefillWithPagedKVCacheDispatched<
                 /*SAME_KV_STRIDES=*/SAME_KV_STRIDES, CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO,
                 POS_ENCODING_MODE, /*use_fp16_qk_reduction=*/USE_FP16_QK_REDUCTION, MASK_MODE,
-                AttentionVariant, PagedParams>(params, tmp_v, tmp_s, enable_pdl, stream);
+                USE_INLINE_SF, AttentionVariant, PagedParams>(params, tmp_v, tmp_s, enable_pdl,
+                                                              stream);
           });
           return true;
         });
@@ -160,15 +161,15 @@ void BatchPrefillWithPagedKVCacheRun(TensorView float_workspace_buffer,
         DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
           status = flashinfer::BatchPrefillWithPagedKVCacheDispatched<
               /*SAME_KV_STRIDES=*/true, CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE,
-              /*use_fp16_qk_reduction=*/USE_FP16_QK_REDUCTION, MASK_MODE, AttentionVariant,
-              PagedParams>(params, tmp_v, tmp_s, enable_pdl, stream);
+              /*use_fp16_qk_reduction=*/USE_FP16_QK_REDUCTION, MASK_MODE, USE_INLINE_SF,
+              AttentionVariant, PagedParams>(params, tmp_v, tmp_s, enable_pdl, stream);
         });
 #elif PAGED_KV_STRIDE_MODE == PAGED_KV_STRIDE_MODE_INDEPENDENT
         DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
           status = flashinfer::BatchPrefillWithPagedKVCacheDispatched<
               /*SAME_KV_STRIDES=*/false, CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE,
-              /*use_fp16_qk_reduction=*/USE_FP16_QK_REDUCTION, MASK_MODE, AttentionVariant,
-              PagedParams>(params, tmp_v, tmp_s, enable_pdl, stream);
+              /*use_fp16_qk_reduction=*/USE_FP16_QK_REDUCTION, MASK_MODE, USE_INLINE_SF,
+              AttentionVariant, PagedParams>(params, tmp_v, tmp_s, enable_pdl, stream);
         });
 #else
 #error "Unsupported PAGED_KV_STRIDE_MODE"
