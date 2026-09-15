@@ -6811,7 +6811,8 @@ def mm_mxfp8(
         problems include it as the last heuristic candidate.
         - The ``"b12x"`` backend (SM120/SM121) is a warp-level MMA kernel with
           small-M decode tiles. It requires CUDA 13+, nvidia-cutlass-dsl >=
-          4.6.0, 1D swizzled 128x4 scales, and K divisible by 128.
+          4.6.0, 1D swizzled 128x4 scales, and K divisible by 32. Partial
+          BK128 tails are handled natively.
         - The ``"cute-dsl"`` backend currently requires swizzled 1D scales
           (``mxfp8_quantize(..., is_sf_swizzled_layout=True)``).
         - The ``"cutedsl_low_latency"`` backend requires SM100/SM103, ``M <= 8``,
