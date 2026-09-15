@@ -3571,11 +3571,14 @@ def _trtllm_batch_decode_with_kv_cache_mla_impl(
 
         If ``return_lse`` is True and this is None, a buffer will be
         allocated by the backend.
+        The SM120/SM121 ``sparse`` backend writes base-2 LSEs; multiply by
+        ``ln(2)`` to convert to natural-log units.
     return_lse : bool = False
         Whether to return LSE values. Supported by ``trtllm-gen``,
         ``cute-dsl``, and ``sparse`` backends. When True, the function
         returns ``(out, lse)``. With compact variable Q, LSE is currently
         supported only by monolithic CuTeDSL.
+        See ``lse`` above for the SM120/SM121 sparse backend's log base.
     cute_dsl_impl : str = "auto"
         Which cute-dsl implementation to use. Honored when
         ``backend="cute-dsl"`` and when ``backend="auto"`` considers the
