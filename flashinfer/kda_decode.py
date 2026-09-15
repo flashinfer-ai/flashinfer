@@ -23,6 +23,7 @@ Kernel implementations are in ``flashinfer.kda_kernels``; callers may
 explicitly select Cake or use its narrow native auto-dispatch contract.
 """
 
+import warnings
 from typing import Literal, Optional
 
 import torch
@@ -61,6 +62,10 @@ except (ImportError, RuntimeError):
 # None when the CuTe DSL is missing or cannot target this device
 # (see flashinfer/kda_kernels/__init__.py).
 _RECURRENT_KDA_AVAILABLE = _run_recurrent_kda is not None
+
+# What an omitted backend on the deprecated decode facade resolves to. Held
+# separately from the signature default so the two stay distinguishable.
+_RELEASED_DECODE_BACKEND: Literal["cute-dsl"] = "cute-dsl"
 
 
 def _dispatch_recurrent_kda_decode(
@@ -203,9 +208,15 @@ def recurrent_kda(
     disable_state_update: bool = False,
     correction_cache: Optional[torch.Tensor] = None,
     kg_cache: Optional[torch.Tensor] = None,
-    backend: Literal["cute-dsl", "cake", "auto"] = "cute-dsl",
+    backend: Optional[Literal["cute-dsl", "cake", "auto"]] = None,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     r"""Recurrent KDA (Kimi Delta Attention) decode kernel.
+
+    .. deprecated::
+        Call :func:`flashinfer.recurrent_kda` instead. It serves this same
+        decode contract, accepts a superset of what this entry point accepts,
+        and defaults to ``backend="auto"``. This facade remains a thin shim
+        and is scheduled for removal in a future release.
 
     This public API supports the existing CuTe DSL implementation and an
     explicit exported Cake backend in
@@ -304,13 +315,18 @@ def recurrent_kda(
             ``[num_slots, HV, T_max, 2*K]`` receiving the raw (unnormalized) key
             in ``[..., :K]`` and the raw gate in ``[..., K:]`` per token,
             matching the vLLM RecoverSSM cache convention.
-        backend (Literal["cute-dsl", "cake", "auto"]):
+        backend (Optional[Literal["cute-dsl", "cake", "auto"]]):
             Implementation backend. ``"cute-dsl"`` preserves the existing
             FlashInfer implementation. ``"cake"`` strictly selects an
             exported Cake kernel and raises when the call does not match one
             of its supported contracts. ``"auto"`` selects Cake only for its
             equal-head/D128/T1 unbounded-softplus contract, preserving CuTe
-            DSL for every other decode surface. Default: ``"cute-dsl"``.
+            DSL for every other decode surface. Omitting it resolves to
+            ``"cute-dsl"``, the released default for this facade; ``None`` is
+            recorded as "not requested" rather than as that choice, so a
+            future release can converge omitted calls onto
+            :func:`flashinfer.recurrent_kda`'s ``"auto"`` without overriding
+            callers who asked for ``"cute-dsl"`` by name.
 
     Returns:
         Tuple of ``(output, final_state)`` where ``final_state`` is ``None``
@@ -318,6 +334,17 @@ def recurrent_kda(
         :func:`flashinfer.kda_kernels.recurrent_kda.run_recurrent_kda` for the
         backend implementation.
     """
+    warnings.warn(
+        "flashinfer.kda_decode.recurrent_kda is deprecated and is now a shim "
+        "over the shared decode dispatcher. Call flashinfer.recurrent_kda "
+        "instead: it serves this same decode contract, accepts a superset of "
+        "what this entry point accepts, and defaults to backend='auto'. "
+        "Scheduled for removal in a future release.",
+        DeprecationWarning,
+        stacklevel=3,
+    )
+    if backend is None:
+        backend = _RELEASED_DECODE_BACKEND
     if backend == "cudnn":
         # Deliberately narrower than the phase-neutral facade's enum: cuDNN's
         # engine serves ordinary multi-token prefill only.

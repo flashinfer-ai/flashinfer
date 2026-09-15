@@ -30,6 +30,13 @@ kda_decode_module = importlib.import_module("flashinfer.kda_decode")
 recurrent_module = importlib.import_module("flashinfer.kda_kernels.recurrent_kda")
 cake_decode_jit_module = importlib.import_module("flashinfer.jit.cake_kda_decode")
 
+# This file is the deprecated facade's regression suite, so its own deprecation
+# is expected rather than a finding. Matched by message so unrelated
+# DeprecationWarnings still surface.
+pytestmark = pytest.mark.filterwarnings(
+    "ignore:flashinfer.kda_decode.recurrent_kda is deprecated:DeprecationWarning"
+)
+
 _D = 128
 _T = 5
 _VARIANT_PREFIX = "d128_t5_precomputed_gram_split"
@@ -285,6 +292,31 @@ def test_public_backend_option_rejects_unknown_value_cpu(monkeypatch):
     tensors = [object() for _ in range(5)]
     with pytest.raises(ValueError, match="backend must be"):
         recurrent_kda(*tensors, backend="unknown")
+
+
+def test_decode_facade_deprecation_points_at_the_canonical_entry_point_cpu(
+    monkeypatch,
+):
+    """The shim warns, and blames the caller's line rather than its own."""
+    monkeypatch.setattr(
+        kda_decode_module, "_run_recurrent_kda", lambda **kwargs: (object(), None)
+    )
+    tensors = [object() for _ in range(5)]
+    with pytest.warns(DeprecationWarning, match=r"flashinfer\.recurrent_kda") as record:
+        recurrent_kda(*tensors)
+    assert record[0].filename == __file__
+
+
+def test_omitted_backend_stays_distinguishable_from_explicit_cute_dsl_cpu():
+    """``None`` records "not requested", which an explicit value cannot.
+
+    Both resolve to ``"cute-dsl"`` today -- see
+    ``test_public_backend_option_forwards_to_kernel_layer_cpu`` -- so the only
+    thing this pins is that the distinction survives, which is what lets a
+    later release converge omitted calls onto ``"auto"`` without overriding
+    callers who named ``"cute-dsl"``.
+    """
+    assert inspect.signature(recurrent_kda).parameters["backend"].default is None
 
 
 def test_decode_facade_rejects_cudnn_by_naming_the_phase_neutral_facade_cpu(
