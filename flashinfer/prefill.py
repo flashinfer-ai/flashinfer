@@ -4676,7 +4676,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         elif self._jit_module is not None:
             self._cached_module = self._jit_module
         else:
-            if self._requested_backend == "auto":
+            # use_inline_sf pins the backend to fa2 (validation block above), so
+            # skip auto-resolution/upgrades that would override it.
+            if self._requested_backend == "auto" and not use_inline_sf:
                 self._backend = determine_attention_backend(
                     self.device,
                     PosEncodingMode[pos_encoding_mode].value,
