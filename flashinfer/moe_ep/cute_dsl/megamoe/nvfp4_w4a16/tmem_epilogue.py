@@ -202,11 +202,15 @@ class TmemTranspose16x32:
             self.output[r] = self._src_regs[self._PermR1[r]]
 
     def r1_store(self) -> None:
+        # Scratch rounds reuse the same TMEM. Complete prior loads before
+        # overwriting it, and this store before the next round's loads.
+        cute.arch.fence_view_async_tmem_load()
         cute.copy(
             self._atom_st16x128,
             self._rmem_copy_view(self.output, 16),
             self._tmem_src_full,
         )
+        cute.arch.fence_view_async_tmem_store()
 
     # -- R2 ------------------------------------------------------------------
 
@@ -218,11 +222,13 @@ class TmemTranspose16x32:
         )
 
     def r2_store(self) -> None:
+        cute.arch.fence_view_async_tmem_load()
         cute.copy(
             self._atom_st32x32,
             self._rmem_copy_view(self._src_regs, 16),
             self._tmem_dst_full,
         )
+        cute.arch.fence_view_async_tmem_store()
 
     # -- R3 ------------------------------------------------------------------
 
@@ -245,11 +251,13 @@ class TmemTranspose16x32:
             self.output[r] = self._src_regs[self._PermR3[r]]
 
     def r3_store(self) -> None:
+        cute.arch.fence_view_async_tmem_load()
         cute.copy(
             self._atom_st32x32,
             self._rmem_copy_view(self.output, 16),
             self._tmem_dst_full,
         )
+        cute.arch.fence_view_async_tmem_store()
 
     # -- R4 ------------------------------------------------------------------
 
