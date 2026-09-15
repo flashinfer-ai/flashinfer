@@ -1932,6 +1932,9 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void ChainSpeculativ
   float sum_relu_q_minus_p = 0;
   vec_t<float, VEC_SIZE> q_vec, p_vec;
   float relu_q_minus_p[VEC_SIZE];
+  // Accumulate per thread across tiles and reduce once, as MinPSamplingFromProbKernel does.
+  // Nothing in the loop reads the running total, so the per-tile reduction is not needed.
+  float threadlocal_sum_relu_q_minus_p = 0;
 #pragma unroll 2
   for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
     q_vec.fill(0);
@@ -1948,12 +1951,12 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void ChainSpeculativ
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; ++j) {
       relu_q_minus_p[j] = max(q_vec[j] - p_vec[j], 0.0f);
+      threadlocal_sum_relu_q_minus_p += relu_q_minus_p[j];
     }
-    sum_relu_q_minus_p +=
-        BlockReduce<float, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
-            .Sum<VEC_SIZE>(relu_q_minus_p);
-    __syncthreads();
   }
+  sum_relu_q_minus_p =
+      BlockReduce<float, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage.block_prim.reduce)
+          .Sum(threadlocal_sum_relu_q_minus_p);
   if (tx == 0) {
     temp_storage.block_aggregate.value = sum_relu_q_minus_p;
   }
