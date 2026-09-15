@@ -21,6 +21,15 @@ import triton
 import triton.language as tl
 
 from ....utils import ceil_div
+from ._moe_utils.moe_route_meta import (
+    count_expert_kernel as _count_expert_kernel,
+)
+from ._moe_utils.moe_route_meta import (
+    route_assign_decode_kernel as _route_assign_decode_kernel,
+)
+from ._moe_utils.moe_route_meta import (
+    route_assign_kernel as _route_assign_kernel,
+)
 from ._moe_utils.sm12x_blockscaled_layout import (
     SF_M_ALIGN,
     UE8M0_PACK_NUM,
@@ -178,112 +187,6 @@ def make_mxfp8_q0_route_workspace(
         q_out,
         scale_out,
     )
-
-
-@triton.jit
-def _count_expert_kernel(
-    topk_ids, counts, total_pairs: tl.constexpr, block_n: tl.constexpr
-):
-    expert_idx = tl.program_id(0)
-    offs = tl.arange(0, block_n)
-    acc = tl.zeros((block_n,), dtype=tl.int32)
-    for pair_begin in tl.range(0, total_pairs, block_n):
-        pair_idx = pair_begin + offs
-        expert = tl.load(topk_ids + pair_idx, mask=pair_idx < total_pairs, other=-1)
-        acc += tl.where(expert == expert_idx, 1, 0)
-    tl.store(counts + expert_idx, tl.sum(acc))
-
-
-@triton.jit
-def _route_assign_kernel(
-    topk_ids,
-    topk_weights,
-    offsets,
-    expert_cursor,
-    token_map,
-    token_weights,
-    dst_rows,
-    scale_dst_rows,
-    total_pairs: tl.constexpr,
-    top_k: tl.constexpr,
-    scale_align: tl.constexpr,
-    block_n: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    offs = tl.arange(0, block_n)
-    pair_idx = pid * block_n + offs
-    valid = pair_idx < total_pairs
-    expert = tl.load(topk_ids + pair_idx, mask=valid, other=0)
-    routed_row = tl.atomic_add(expert_cursor + expert, 1, mask=valid, sem="relaxed")
-    token_idx = pair_idx // top_k
-    expert_begin = tl.load(offsets + expert, mask=valid, other=0)
-    scale_begin = (
-        (expert_begin + expert * (scale_align - 1)) // scale_align
-    ) * scale_align
-    tl.store(token_map + routed_row, token_idx, mask=valid)
-    tl.store(
-        token_weights + routed_row,
-        tl.load(topk_weights + pair_idx, mask=valid, other=0.0),
-        mask=valid,
-    )
-    tl.store(dst_rows + pair_idx, routed_row, mask=valid)
-    tl.store(
-        scale_dst_rows + pair_idx, scale_begin + routed_row - expert_begin, mask=valid
-    )
-
-
-@triton.jit
-def _route_assign_decode_kernel(
-    topk_ids,
-    topk_weights,
-    offsets,
-    token_map,
-    token_weights,
-    dst_rows,
-    scale_dst_rows,
-    scale_out,
-    total_pairs: tl.constexpr,
-    top_k: tl.constexpr,
-    num_experts: tl.constexpr,
-    scale_align: tl.constexpr,
-    block_n: tl.constexpr,
-    total_scale: tl.constexpr,
-    padded_rows: tl.constexpr,
-    s_som: tl.constexpr,
-    s_sok: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    offs = tl.arange(0, block_n)
-    valid = offs < total_pairs
-    experts = tl.load(topk_ids + offs, mask=valid, other=num_experts)
-
-    flat = pid * block_n + offs
-    k_block = flat // padded_rows
-    scale_row = flat - k_block * padded_rows
-    tl.store(
-        scale_out + k_block * s_som + scale_row * s_sok, 0, mask=flat < total_scale
-    )
-
-    expert_prefix = tl.sum(tl.where(valid & (experts < pid), 1, 0), 0)
-    tl.store(offsets + pid, expert_prefix, mask=pid < num_experts)
-    tl.store(offsets + num_experts, total_pairs, mask=pid == 0)
-
-    pair_expert = tl.load(topk_ids + pid, mask=pid < total_pairs, other=0)
-    expert_begin = tl.sum(tl.where(valid & (experts < pair_expert), 1, 0), 0)
-    rank = tl.sum(tl.where(valid & (experts == pair_expert) & (offs < pid), 1, 0), 0)
-    routed_row = expert_begin + rank
-    scale_begin = (
-        (expert_begin + pair_expert * (scale_align - 1)) // scale_align
-    ) * scale_align
-    token_idx = pid // top_k
-    tl.store(token_map + routed_row, token_idx, mask=pid < total_pairs)
-    tl.store(
-        token_weights + routed_row,
-        tl.load(topk_weights + pid, mask=pid < total_pairs, other=0.0),
-        mask=pid < total_pairs,
-    )
-    tl.store(dst_rows + pid, routed_row, mask=pid < total_pairs)
-    tl.store(scale_dst_rows + pid, scale_begin + rank, mask=pid < total_pairs)
 
 
 @triton.jit

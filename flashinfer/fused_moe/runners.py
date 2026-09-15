@@ -5953,7 +5953,7 @@ class SM12xMxfp8Mxfp4Runner(MoERunner):
 
     backend_key = "sm12x_mxfp8_mxfp4"
     supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
-    supported_quant_variants = (QuantVariant.MXFP4,)
+    supported_quant_variants = ((QuantFormat.MXFP4, QuantFormat.MXFP8),)
     supported_activation_classes = (SwiGLU, SiTU)
     supports_expert_parallelism = False
     required_weight_keys = (
