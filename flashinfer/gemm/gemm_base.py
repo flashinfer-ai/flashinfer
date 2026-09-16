@@ -2525,7 +2525,7 @@ def _cute_dsl_cublaslt_fallback_bf16_gemm_runner(compute_capability: int):
     return CuteDSLCublasltFallbackBf16Runner(compute_capability)
 
 
-def _cute_dsl_bf16_runners(inputs: List[torch.Tensor]) -> List[TunableRunner]:
+def _cute_dsl_bf16_runners(inputs: List[torch.Tensor]) -> List[_CuteDSLBf16Runner]:
     """Return the runners of ``backend="cute-dsl"`` for ``inputs``, best first.
 
     Keep every available runner for synthesized buckets: low-M kernels serve
