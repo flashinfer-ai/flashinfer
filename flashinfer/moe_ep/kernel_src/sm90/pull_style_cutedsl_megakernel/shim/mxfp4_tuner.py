@@ -1418,6 +1418,13 @@ def validate_hopper_mxfp4_tactic(
         raise TypeError(f"tactic must be a mapping, got {type(tactic).__name__}")
 
     if mode == "fused":
+        # The frozen 17-field layout identity remains byte-for-byte valid.
+        # Complete new identities additionally carry both strategy fields;
+        # the host strategy normalizer delegates only the core back here.
+        if "fc2_tail_n8" in tactic or "fc1_ready_mode" in tactic:
+            from .mxfp4_optimization import normalize_mxfp4_optimization_tactic
+
+            return normalize_mxfp4_optimization_tactic(tactic)
         _require_exact_fields(tactic, _FUSED_FIELDS, _IMPLEMENTATION[mode])
         if tactic["swap_ab"] is not True:
             raise ValueError("MXFP4 fused requires swap_ab=true")
@@ -1837,18 +1844,30 @@ def hopper_mxfp4_cache_provenance_sha256(
             tuple(sorted(records, key=lambda record: str(record["candidate_id"])))
         )
 
+    payload = {
+        "execution_mode": mode,
+        "routing_profile": profile,
+        "runtime_candidate_union_sha256": candidate_union_sha256,
+        "tuning_provenance": dict(
+            hopper_mxfp4_tuning_provenance(
+                execution_mode=mode,
+                routing_profile=profile,
+            )
+        ),
+    }
+    if mode == "fused":
+        from ..src.moe_hopper_fp8.mxfp4_policy import MXFP4_OPTIMIZATION_VERSION
+
+        # Shape and world size are already separate knob-cache key fields.
+        # This domain version binds eligibility/code changes without rewriting
+        # frozen manifests. Split intentionally retains its old payload/hash.
+        payload["optimization_domain"] = {
+            "implementation": MXFP4_OPTIMIZATION_VERSION,
+            "fc2_tail_n8": [False, True],
+            "fc1_ready_mode": ["tile", "k256"],
+        }
     canonical = json.dumps(
-        {
-            "execution_mode": mode,
-            "routing_profile": profile,
-            "runtime_candidate_union_sha256": candidate_union_sha256,
-            "tuning_provenance": dict(
-                hopper_mxfp4_tuning_provenance(
-                    execution_mode=mode,
-                    routing_profile=profile,
-                )
-            ),
-        },
+        payload,
         ensure_ascii=True,
         separators=(",", ":"),
         sort_keys=True,

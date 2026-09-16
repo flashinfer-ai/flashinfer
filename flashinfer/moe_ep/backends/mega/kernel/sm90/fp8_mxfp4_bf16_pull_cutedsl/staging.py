@@ -24,6 +24,8 @@ def staged_tokens(workspace_topk_idx: torch.Tensor) -> int | None:
 
 def _quantize_e4m3_per_token_full_hidden(
     hidden_states: torch.Tensor,
+    *,
+    safe_quantization: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize each full hidden row with one FP32 dequant scale."""
     if hidden_states.ndim != 2:
@@ -33,6 +35,10 @@ def _quantize_e4m3_per_token_full_hidden(
         )
     fp32 = hidden_states.to(torch.float32)
     absmax = fp32.abs().amax(dim=1, keepdim=True)
+    if safe_quantization:
+        from .safe_quantize import quantize_from_amax
+
+        return quantize_from_amax(fp32, absmax)
     scale = (absmax / _E4M3_MAX).clamp_min(_PER_TOKEN_SCALE_EPS)
     quantized = (fp32 / scale).to(_E4M3_DTYPE)
     return quantized, scale.to(torch.float32).contiguous()
@@ -135,6 +141,7 @@ def stage_mega_moe_inputs(
     *,
     quantize_input: bool,
     scales: torch.Tensor | None = None,
+    safe_quantization: bool = False,
 ) -> None:
     """Stage E4M3 tokens and one-per-token scales into symmetric buffers.
 
@@ -142,6 +149,9 @@ def stage_mega_moe_inputs(
     row. Pre-staged input supplies E4M3 payload plus logical FP32 [T, 1]
     dequant scales. In both cases the physical symmetric scale wire is [T, 4]
     with all four columns equal.
+
+    Safe tiny-value quantization is enabled only by the fused Mega backend.
+    The default retains the split path's existing arithmetic and input contract.
     """
     _validate_stage_targets(
         hidden_states,
@@ -160,7 +170,9 @@ def stage_mega_moe_inputs(
         return
 
     if quantize_input:
-        quantized, logical_scale = _quantize_e4m3_per_token_full_hidden(hidden_states)
+        quantized, logical_scale = _quantize_e4m3_per_token_full_hidden(
+            hidden_states, safe_quantization=safe_quantization
+        )
     else:
         if scales is None:
             raise ValueError("pre-staged MXFP4 input requires FP32 [T, 1] scales")

@@ -56,6 +56,7 @@ from .hopper_fp8 import (
     _kind_to_cutlass_dtype,
     _sym_zeros_byte_view_1b,
 )
+from ..src.moe_hopper_fp8.mxfp4_policy import resolve_mxfp4_optimizations
 
 
 _MXFP4_MMA_TILER_DEFAULT = (128, 32, 128)
@@ -78,6 +79,7 @@ _MXFP4_COMPILE_IDENTITY = (
     "residual64",
     "gateup8",
     "fused_layout_v2",
+    "fused_local_v1",
 )
 
 # The generic knob-cache schema has a single string ``dtype`` axis. Encode
@@ -87,7 +89,7 @@ _MXFP4_COMPILE_IDENTITY = (
 _MXFP4_TUNING_DTYPE_ID = (
     "sm90_w_mxfp4_e2m1_k32_a_fp8_e4m3_per_token_full_hidden_"
     "humming_v1_fold_m64_k128_gateup8_packedk2_residual64_"
-    "swapab_fused_layout_v2"
+    "swapab_fused_layout_v2_fused_local_v1"
 )
 
 
@@ -98,10 +100,10 @@ def _validate_complete_mxfp4_tactic(
 
     if not isinstance(knobs, dict):
         raise ValueError(f"{source} must provide an MXFP4 knob dict.")
-    from .mxfp4_tuner import validate_hopper_mxfp4_tactic
+    from .mxfp4_optimization import normalize_mxfp4_optimization_tactic
 
     try:
-        return validate_hopper_mxfp4_tactic(knobs, execution_mode="fused")
+        return normalize_mxfp4_optimization_tactic(knobs)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{source}: {exc}") from exc
 
@@ -122,6 +124,10 @@ class MegaMoEHopperMxfp4Config(MegaMoEHopperFp8Config):
     fp8_accum_mode: Literal["1xacc"] = "1xacc"
     swap_ab: bool = True
     mma_tiler_mnk: Tuple[int, int, int] = _MXFP4_MMA_TILER_DEFAULT
+    # Local layout improvements are derived defaults, not tuning axes.
+    # Only these two bounded performance strategies are optional.
+    fc2_tail_n8: bool = field(default=False, kw_only=True)
+    fc1_ready_mode: Literal["tile", "k256"] = field(default="tile", kw_only=True)
     routing_profile: str = field(
         default=SM90_ROUTING_PROFILE_BLOCK_PERMUTATION,
         kw_only=True,
@@ -215,6 +221,28 @@ class MegaMoEHopperMxfp4Config(MegaMoEHopperFp8Config):
                     f"Hopper MXFP4 x FP8 requires {name} ({logical_k}) "
                     f"divisible by MMA tile K={tile_k}."
                 )
+        # Validate the final model/layout/protocol before any symmetric input
+        # or kernel workspace is allocated.
+        _ = self.optimizations
+
+    @property
+    def optimizations(self):
+        folded = self.fold_producer_warps and self.active_dispatch_warps == 1
+        return resolve_mxfp4_optimizations(
+            fp8_scale_mode=self.fp8_scale_mode,
+            mma_tiler_mnk=self.mma_tiler_mnk,
+            cluster_shape_mnk=self.cluster_shape_mnk,
+            static_expert_shape=(self.num_experts_per_rank, self.fc1_out, self.hidden),
+            world_size=self.world_size,
+            pingpong=self.pingpong,
+            token_back_by_dispatch=self.resolved_token_back_mode != "epi_warps",
+            fc2_in_kernel_topk_reduce=self.in_kernel_fc2_reduce,
+            fc1_early_done_publish=folded or self.fc1_early_done_publish,
+            fc1_store_offload=False if folded else self.fc1_store_offload,
+            dedup_dispatch=self.dedup_dispatch,
+            fc2_tail_n8=self.fc2_tail_n8,
+            fc1_ready_mode=self.fc1_ready_mode,
+        )
 
     @property
     def mxfp4_hybrid(self) -> bool:
@@ -274,7 +302,7 @@ class MegaMoEHopperMxfp4Frontend(MegaMoEHopperFp8Frontend):
         )
 
     def effective_tactic(self) -> Dict[str, Any]:
-        """Return the exact 17-field tactic of the current compiled kernel.
+        """Return the exact 19-field tactic of the current compiled kernel.
 
         The kernel may normalize warp-layout knobs while it establishes a
         register-feasible schedule. Cache and benchmark identities therefore
@@ -293,6 +321,7 @@ class MegaMoEHopperMxfp4Frontend(MegaMoEHopperFp8Frontend):
             )
         kernel = mega.kernel
         required = (
+            "mxfp4_optimizations",
             "group_hint",
             "num_sched_stages",
             "dedup_dispatch",
@@ -324,6 +353,8 @@ class MegaMoEHopperMxfp4Frontend(MegaMoEHopperFp8Frontend):
             fc1_store_offload=bool(kernel.fc1_store_offload),
             fc1_early_done_publish=bool(kernel.fc1_early_done_publish),
             fold_producer_warps=bool(kernel.fold_producer_warps),
+            fc2_tail_n8=kernel.mxfp4_optimizations.fc2_tail_n8,
+            fc1_ready_mode=kernel.mxfp4_optimizations.fc1_ready_mode,
         )
         return _validate_complete_mxfp4_tactic(
             tactic,
@@ -355,6 +386,8 @@ class MegaMoEHopperMxfp4Frontend(MegaMoEHopperFp8Frontend):
             "fc1_store_offload": bool(c.fc1_store_offload),
             "fc1_early_done_publish": bool(c.fc1_early_done_publish),
             "fold_producer_warps": bool(c.fold_producer_warps),
+            "fc2_tail_n8": c.fc2_tail_n8,
+            "fc1_ready_mode": c.fc1_ready_mode,
         }
 
     @property
@@ -369,6 +402,7 @@ class MegaMoEHopperMxfp4Frontend(MegaMoEHopperFp8Frontend):
         return (
             "sm90_mxfp4_fp8_megamoe",
             *_MXFP4_COMPILE_IDENTITY,
+            ("optimization_policy", c.optimizations.identity()),
             # Make logical-K versus packed storage-K explicit.  Shape fields
             # later in the inherited key would distinguish these in practice,
             # but naming both protects against future generic packed formats.
@@ -474,6 +508,8 @@ class MegaMoEHopperMxfp4Frontend(MegaMoEHopperFp8Frontend):
             fc1_store_offload=c.fc1_store_offload,
             fc1_early_done_publish=c.fc1_early_done_publish,
             fold_producer_warps=c.fold_producer_warps,
+            mxfp4_fc2_tail_n8=c.fc2_tail_n8,
+            mxfp4_fc1_ready_mode=c.fc1_ready_mode,
         )
 
         local_ws_bytes, shared_ws_bytes = kernel.get_workspace_sizes()
@@ -835,13 +871,16 @@ def resolve_hopper_mxfp4_knobs(
 
     # Prefer the bucket winner when legal; smaller shapes may require the
     # first legal tactic in the stable manifest union instead.
-    return hopper_mxfp4_ordered_candidates(
-        num_max_tokens,
-        execution_mode="fused",
-        hidden=hidden,
-        intermediate=intermediate,
-        routing_profile=routing_profile,
-    )[0]
+    return _validate_complete_mxfp4_tactic(
+        hopper_mxfp4_ordered_candidates(
+            num_max_tokens,
+            execution_mode="fused",
+            hidden=hidden,
+            intermediate=intermediate,
+            routing_profile=routing_profile,
+        )[0],
+        source="MXFP4 legacy heuristic",
+    )
 
 
 # Private compatibility name retained for existing shim-local callers and
@@ -1003,7 +1042,8 @@ def _resolve_hopper_mxfp4_mega_moe_config(
     )
     if resolved:
         # External knob/cache/heuristic dicts were already validated as a
-        # complete 17-field tactic. Manual selection uses an internal geometry
+        # complete 19-field tactic (legacy 17 expands to strategies off).
+        # Manual selection uses an internal geometry
         # mapping assembled above; the concrete config performs value
         # validation without pretending it is a complete external tactic.
         config = dataclasses.replace(config, **resolved)

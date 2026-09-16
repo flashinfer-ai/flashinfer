@@ -53,6 +53,43 @@ SwapABMxfp4SplitFc1StoreOverlapChoices = ("none", "pr357", "pr360")
 SwapABMxfp4SplitFc1StoreOverlap = "none"
 
 
+@cute.jit
+def _mxfp4_div_rn(a: Float32, b: Float32):
+    return Float32(llvm.inline_asm(
+        Float32.mlir_type, [a.ir_value(), b.ir_value()],
+        "div.rn.f32 $0, $1, $2;", "=f,f,f", has_side_effects=True,
+        is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT,
+    ))
+
+
+@cute.jit
+def _mxfp4_safe_scale_pair(amax: Float32, dequant_scale: Float32):
+    """Keep the normal path; protect tiny positive values without losing q."""
+    quant_scale = Float32(1.0) / dequant_scale
+    if (amax > Float32(0.0)) & (amax < Float32(448.0e-30)):
+        denominator = fmax(amax, Float32(1.3165537626040637e-36))
+        quant_scale = _mxfp4_div_rn(Float32(448.0), denominator)
+        dequant_scale = _mxfp4_div_rn(Float32(1.0), quant_scale)
+    return dequant_scale, quant_scale
+
+
+@dsl_user_op
+def _red_or_release_gpu_b64(counter_ptr, value, *, loc=None, ip=None):
+    """Publish a unique K64 bit after complete data and scale stores."""
+    llvm.inline_asm(
+        None,
+        [counter_ptr.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip),
+         value.ir_value(loc=loc, ip=ip)],
+        "red.release.gpu.global.or.b64 [$0], $1;",
+        "l,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
 @dsl_user_op
 def _quantize_sts_fc1_pair_mxfp4_split_sw64(
     smem_stage_base: Int32,
@@ -255,6 +292,7 @@ class SwapABFp8GluEpilogue:
         split_handoff_token_n: Optional[int] = None,
         split_role: str = "fused",
         pingpong: bool = False,
+        enable_mxfp4_safe_quantization: bool = False,
     ) -> None:
         self.fc1_output_dtype = fc1_output_dtype
         self.fc1_output_layout = fc1_output_layout
@@ -275,6 +313,9 @@ class SwapABFp8GluEpilogue:
                 f"got {split_role!r}."
             )
         self._split_role = split_role
+        # Opt in only from Mega fused MXFP4. Standalone and split epilogues
+        # retain legacy quantization unless their caller explicitly enables it.
+        self._enable_mxfp4_safe_quantization = enable_mxfp4_safe_quantization
         self.fp8_output_rcp_limit = cutlass.Float32(fp8_output_rcp_limit)
         self._sf_vec_size = sf_vec_size
         self._epilog_sync_bar_id = epilog_sync_bar_id
@@ -399,6 +440,10 @@ class SwapABFp8GluEpilogue:
         self._fc2_in_kernel_topk_reduce = fc2_in_kernel_topk_reduce
         self._apply_topk_in_fc1 = apply_topk_in_fc1
         self._token_back_by_dispatch = token_back_by_dispatch
+        # Enabled only by the MXFP4 subclass after full layout validation.
+        # FP8, split and unsupported layouts retain the original scalar path.
+        self._mxfp4_peer32 = False
+        self._mxfp4_fc1_ready_k256 = False
         # Early fc1_done publication (non-pp only, gated kernel-side):
         # drain this WG's FC1 bulk stores and release the tile flag right
         # after the tile's store issues, ahead of consume_next / the
@@ -1028,6 +1073,15 @@ class SwapABFp8GluEpilogue:
                         token1_max * self.fp8_output_rcp_limit,
                         scale_epsilon,
                     )
+                    quant_scale0 = Float32(1.0) / scale0
+                    quant_scale1 = Float32(1.0) / scale1
+                    if cutlass.const_expr(self._enable_mxfp4_safe_quantization):
+                        scale0, quant_scale0 = _mxfp4_safe_scale_pair(
+                            token0_max, scale0
+                        )
+                        scale1, quant_scale1 = _mxfp4_safe_scale_pair(
+                            token1_max, scale1
+                        )
                     if token0 < work_tile_info.valid_tokens_in_cta_tile:
                         stg_fc1_block_scale_row(
                             gmem_fc1_output_sf,
@@ -1042,12 +1096,8 @@ class SwapABFp8GluEpilogue:
                             global_token_base + token1,
                             scale1,
                         )
-                    smem_fc1_amax[n_half, 0, token0] = (
-                        Float32(1.0) / scale0
-                    )
-                    smem_fc1_amax[n_half, 0, token1] = (
-                        Float32(1.0) / scale1
-                    )
+                    smem_fc1_amax[n_half, 0, token0] = quant_scale0
+                    smem_fc1_amax[n_half, 0, token1] = quant_scale1
 
     @cute.jit
     def _load_fc1_scale_rcp_chunk_swapab_blockwise(
@@ -1495,6 +1545,23 @@ class SwapABFp8GluEpilogue:
         token0 = cutlass.Int32(token_group * 8) + lane_mod * cutlass.Int32(2)
         token1 = token0 + cutlass.Int32(1)
         pair_layout = cute.make_layout(4)
+        # Cache just this row across the two M64 fragments, not a token tile.
+        peer_row_addr = cutlass.Int64(0)
+        if cutlass.const_expr(
+            token_comm_args is not None and self._mxfp4_peer32
+        ):
+            peer_token = token0 + lane_group % cutlass.Int32(2)
+            if peer_token < valid_tokens:
+                peer_dest = Fc2OutputDest(
+                    tensor=token_comm_args.combine_output,
+                    metadata=cute.recast_tensor(
+                        token_comm_args.token_src_metadata, cutlass.Uint32
+                    ),
+                    peer_rank_ptr_mapper=token_comm_args.peer_rank_ptr_mapper,
+                    reduce_topk_in_kernel=False,
+                )
+                peer_row = peer_dest.resolve_token_row(pool_token_base + peer_token)
+                peer_row_addr = peer_row.iterator.toint()
         for m_sub in cutlass.range_constexpr(2):
             accum_base = m_sub * self._accum_regs_per_m64 + token_group * 4
             r_fp32 = cute.make_rmem_tensor(pair_layout.shape, self.acc_dtype)
@@ -1574,6 +1641,38 @@ class SwapABFp8GluEpilogue:
                             red_add_relaxed_sys_v2_bf16x2(
                                 dest_ptr, packed0, packed1,
                             )
+                elif cutlass.const_expr(self._mxfp4_peer32):
+                    # XOR4 exchanges adjacent hidden coordinates. Each lane
+                    # keeps one token and writes two BF16 values together.
+                    r_u32 = cute.recast_tensor(r_bf16, cutlass.Uint32)
+                    packed = cute.make_rmem_tensor(2, cutlass.Uint32)
+                    odd = lane_group % cutlass.Int32(2)
+                    for hpair in cutlass.range_constexpr(2):
+                        own = r_u32[hpair]
+                        peer = cute.arch.shuffle_sync_bfly(own, offset=4)
+                        bits = (
+                            (own & cutlass.Uint32(0xffff))
+                            | (peer << cutlass.Uint32(16))
+                        )
+                        if odd != cutlass.Int32(0):
+                            bits = (
+                                (peer >> cutlass.Uint32(16))
+                                | (own & cutlass.Uint32(0xffff0000))
+                            )
+                        packed[hpair] = bits
+                    token = token0 + odd
+                    hidden_pair = hidden0 - odd
+                    if token < valid_tokens:
+                        for hpair in cutlass.range_constexpr(2):
+                            hidden = hidden_pair + cutlass.Int32(hpair * 8)
+                            if hidden + cutlass.Int32(1) < valid_hidden:
+                                ptr = cute.make_ptr(
+                                    cutlass.Uint32,
+                                    peer_row_addr + cutlass.Int64(hidden) * cutlass.Int64(2),
+                                    cute.AddressSpace.gmem,
+                                    assumed_align=4,
+                                )
+                                cute.make_tensor(ptr, cute.make_layout(1))[0] = packed[hpair]
                 else:
                     if token0 < valid_tokens:
                         dest_row0 = fc2_output_dest.resolve_token_row(
@@ -2394,21 +2493,39 @@ class SwapABFp8GluEpilogue:
 
             if cutlass.const_expr(self._early_fc1_pub):
                 if cur_was_linear1:
-                    # Drain this WG's FC1 bulk stores and publish the tile
-                    # flag now -- the pre-consume hoist.  The per-WG +1 is
-                    # matched by the kernel's x2 fc2 spin threshold.
-                    cute.arch.cp_async_bulk_commit_group()
-                    cute.arch.cp_async_bulk_wait_group(0, read=True)
-                    cute.arch.fence_acq_rel_gpu()
-                    if local_warp_idx == cutlass.Int32(0):
-                        if cute.arch.lane_idx() == cutlass.Int32(0):
-                            _early_ptr = (
-                                gmem_fc1_done_counter.iterator
-                                + cur_fc1_counter_slot
-                            )
-                            red_add_release_gpu_s32(
-                                _early_ptr, cutlass.Int32(1)
-                            )
+                    if cutlass.const_expr(self._mxfp4_fc1_ready_k256):
+                        # Match the store helper's full-warp election. Its
+                        # issuing lane fully drains BOTH data and scales
+                        # before publishing this post-SwiGLU K64 fragment.
+                        cute.arch.cp_async_bulk_commit_group()
+                        cute.arch.cp_async_bulk_wait_group(0)
+                        cute.arch.fence_acq_rel_gpu()
+                        if local_warp_idx == cutlass.Int32(0):
+                            with cute.arch.elect_one():
+                                output_n_tile = (
+                                    work_tile_info.tile_m_idx
+                                    * cutlass.Int32(self._wgmma_fragment_count)
+                                    + n_half
+                                )
+                                _red_or_release_gpu_b64(
+                                    gmem_fc1_done_counter.iterator
+                                    + cur_fc1_counter_slot,
+                                    Int64(1) << output_n_tile,
+                                )
+                    else:
+                        # Preserve ordinary FP8 / whole-tile code exactly.
+                        cute.arch.cp_async_bulk_commit_group()
+                        cute.arch.cp_async_bulk_wait_group(0, read=True)
+                        cute.arch.fence_acq_rel_gpu()
+                        if local_warp_idx == cutlass.Int32(0):
+                            if cute.arch.lane_idx() == cutlass.Int32(0):
+                                _early_ptr = (
+                                    gmem_fc1_done_counter.iterator
+                                    + cur_fc1_counter_slot
+                                )
+                                red_add_release_gpu_s32(
+                                    _early_ptr, cutlass.Int32(1)
+                                )
 
             if cutlass.const_expr(self._pingpong_order):
                 # Match CUTLASS ping-pong ordering: retire the current FC1
@@ -2475,6 +2592,7 @@ class SwapABFp8GluEpilogue:
             # epilogue neither drains nor accumulates here.
             if cur_was_linear1 and cutlass.const_expr(
                 not self._pingpong_order and not self._fc1_store_offload
+                and not self._mxfp4_fc1_ready_k256
             ):
                 if _iket_active:
                     iket.range_push("swapab_fc1_store_drain")

@@ -35,6 +35,7 @@ from .autotune import (
     hopper_fp8_candidates,
 )
 from .mxfp4_split_autotune import autotune_hopper_mxfp4_split_mega_moe
+from .mxfp4_optimization import hopper_mxfp4_optimization_candidates
 from .knob_cache import (
     knob_cache_path,
     lookup_knobs,

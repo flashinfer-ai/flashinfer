@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import unittest
 from types import SimpleNamespace
 from unittest import mock
 
@@ -18,9 +19,17 @@ from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel.shim.hopper
 from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel.shim.mxfp4_tuner import (
     hopper_mxfp4_default_tactic,
 )
+from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel.shim.mxfp4_optimization import (
+    normalize_mxfp4_optimization_tactic,
+)
 from flashinfer.moe_ep.sm90_routing import (
     SM90_ROUTING_PROFILE_BLOCK_PERMUTATION,
     SM90_ROUTING_PROFILE_PUBLISHED_EXACT_BALANCED,
+)
+
+from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel.src.moe_hopper_fp8.mxfp4_policy import (
+    Mxfp4Optimizations,
+    resolve_mxfp4_optimizations,
 )
 
 
@@ -86,7 +95,9 @@ def _frontend_with_complete_tactic(**overrides):
         intermediate=3072,
         **tactic,
     )
-    return MegaMoEHopperMxfp4Frontend(config), tactic
+    return MegaMoEHopperMxfp4Frontend(config), normalize_mxfp4_optimization_tactic(
+        tactic
+    )
 
 
 def test_sm90_mxfp4_frontend_reports_requested_and_compiled_effective_tactic():
@@ -94,6 +105,7 @@ def test_sm90_mxfp4_frontend_reports_requested_and_compiled_effective_tactic():
     assert frontend.requested_tactic() == requested
 
     kernel = SimpleNamespace(
+        mxfp4_optimizations=frontend.config.optimizations,
         group_hint=requested["group_hint"],
         num_sched_stages=requested["num_sched_stages"],
         dedup_dispatch=requested["dedup_dispatch"],
@@ -128,6 +140,55 @@ def test_sm90_mxfp4_requested_tactic_preserves_auto_schedule_values():
     requested = MegaMoEHopperMxfp4Frontend(config).requested_tactic()
     assert requested["group_hint"] is None
     assert requested["num_sched_stages"] is None
+
+
+def test_sm90_mxfp4_legacy_tactic_resets_strategy_and_compile_identity():
+    legacy = _fused_knobs(
+        mma_tiler_mnk=(256, 64, 256),
+        cluster_shape_mnk=(2, 1, 1),
+        active_dispatch_warps=1,
+        fold_producer_warps=True,
+    )
+    config = MegaMoEHopperMxfp4Config(
+        rank=0,
+        world_size=4,
+        num_tokens_per_rank=2048,
+        num_topk=6,
+        num_total_experts=384,
+        hidden=7168,
+        intermediate=3072,
+        **legacy,
+    )
+    frontend = MegaMoEHopperMxfp4Frontend(config)
+    original_key = frontend._mega_compile_key()
+    enabled = dict(legacy, fc2_tail_n8=True, fc1_ready_mode="k256")
+    module = "flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel.shim.hopper_mxfp4"
+    with (
+        mock.patch(module + ".ensure_not_capturing"),
+        mock.patch.object(frontend, "_release_workspace") as release,
+    ):
+        frontend.apply_knobs(enabled)
+        assert frontend._mega_compile_key() != original_key
+        assert frontend.config.optimizations.fc1_ready_bits == 48
+        assert frontend.requested_tactic()["fc2_tail_n8"] is True
+        frontend.apply_knobs(enabled)
+        assert release.call_count == 1  # Identical identity keeps the workspace.
+        frontend.apply_knobs(legacy)
+        assert release.call_count == 2  # Protocol change releases old workspace.
+    assert frontend._mega_compile_key() == original_key
+    assert frontend.requested_tactic()["fc1_ready_mode"] == "tile"
+    assert frontend.requested_tactic()["fc2_tail_n8"] is False
+    assert frontend.config.optimizations.fc1_ready_bits == 0
+
+
+def test_sm90_mxfp4_unsupported_strategy_rejected_before_workspace_release():
+    frontend, tactic = _frontend_with_complete_tactic()
+    old_config = frontend.config
+    with mock.patch.object(frontend, "_release_workspace") as release:
+        with pytest.raises(ValueError, match="unsupported"):
+            frontend.apply_knobs(dict(tactic, fc1_ready_mode="k256"))
+        release.assert_not_called()
+    assert frontend.config is old_config
 
 
 def test_sm90_mxfp4_effective_tactic_fails_closed_without_current_compile():
@@ -448,3 +509,189 @@ def test_sm90_mxfp4_explicit_knobs_preserve_fixed_numerics():
     config = _config(knobs=_fused_knobs(in_kernel_fc2_reduce=True))
     with pytest.raises(ValueError, match="in-kernel reduce false"):
         _resolve_public_fused_config(config)
+
+
+def _resolve_optimization(**overrides):
+    arguments = dict(
+        fp8_scale_mode="mxfp4_hybrid",
+        mma_tiler_mnk=(256, 64, 256),
+        cluster_shape_mnk=(2, 1, 1),
+        static_expert_shape=(96, 6144, 7168),
+        world_size=4,
+        fc1_early_done_publish=True,
+    )
+    arguments.update(overrides)
+    return resolve_mxfp4_optimizations(**arguments)
+
+
+class TestMxfp4OptimizationPolicy(unittest.TestCase):
+    def test_local_defaults_keep_optional_protocol_off(self):
+        selected = _resolve_optimization()
+        self.assertTrue(selected.peer32)
+        self.assertTrue(selected.offset_bulk)
+        self.assertTrue(selected.skip_zero_counts)
+        self.assertFalse(selected.fc2_tail_n8)
+        self.assertEqual(selected.fc1_ready_mode, "tile")
+
+    def test_other_formats_and_split_keep_legacy_paths(self):
+        for overrides in (
+            {"fp8_scale_mode": "blockwise"},
+            {"fp8_scale_mode": "per_tensor"},
+            {"split_role": "k1", "execution_phase": "fc1"},
+            {"split_role": "k2", "execution_phase": "fc2"},
+        ):
+            with self.subTest(overrides=overrides):
+                self.assertEqual(
+                    _resolve_optimization(**overrides, skip_zero_counts=True),
+                    Mxfp4Optimizations(),
+                )
+
+    def test_other_legal_tiles_fall_back_without_rejecting(self):
+        for m in (128, 256):
+            for n in (8, 16, 32, 64, 128):
+                for k in (128, 256):
+                    selected = _resolve_optimization(mma_tiler_mnk=(m, n, k))
+                    self.assertEqual(selected.offset_bulk, k == 256)
+                    self.assertEqual(selected.peer32, (m, n, k) == (256, 64, 256))
+        # Policy eligibility does not grant frontend legality to a new tactic.
+
+    def test_protocol_is_optional_and_geometry_checked(self):
+        selected = _resolve_optimization(fc1_ready_mode="k256")
+        self.assertEqual(
+            (selected.fc1_ready_segments, selected.fc1_ready_bits), (12, 48)
+        )
+        for overrides in (
+            {"world_size": 8},
+            {"cluster_shape_mnk": (1, 1, 1)},
+            {"static_expert_shape": (96, 8192, 7168)},
+            {"fc1_store_offload": True},
+            {"fc1_early_done_publish": False},
+            {"pingpong": True},
+            {"token_back_by_dispatch": True},
+        ):
+            with self.subTest(overrides=overrides):
+                self.assertEqual(
+                    _resolve_optimization(**overrides).fc1_ready_mode, "tile"
+                )
+                with self.assertRaises(ValueError):
+                    _resolve_optimization(**overrides, fc1_ready_mode="k256")
+
+    def test_optional_tail_is_not_a_frontend_n8_tactic(self):
+        self.assertTrue(_resolve_optimization(fc2_tail_n8=True).fc2_tail_n8)
+        for tile in ((256, 8, 256), (256, 16, 256), (256, 64, 128)):
+            with self.assertRaises(ValueError):
+                _resolve_optimization(mma_tiler_mnk=tile, fc2_tail_n8=True)
+
+    def test_no_hidden_default_flags_on_other_writeback_paths(self):
+        for overrides in (
+            {"token_back_by_dispatch": True},
+            {"fc2_in_kernel_topk_reduce": True},
+        ):
+            self.assertFalse(_resolve_optimization(**overrides).peer32)
+
+    def test_zero_count_has_diagnostic_optout_and_excludes_dedup(self):
+        self.assertTrue(_resolve_optimization(skip_zero_counts=True).skip_zero_counts)
+        self.assertFalse(_resolve_optimization(skip_zero_counts=False).skip_zero_counts)
+        self.assertFalse(
+            _resolve_optimization(
+                skip_zero_counts=True, dedup_dispatch=True
+            ).skip_zero_counts
+        )
+
+    def test_strict_types_and_every_effective_choice_has_identity(self):
+        for name, value in (
+            ("fc2_tail_n8", 1),
+            ("fc1_ready_mode", "auto"),
+            ("local_optimizations", None),
+            ("skip_zero_counts", "0"),
+        ):
+            with self.assertRaises(ValueError):
+                _resolve_optimization(**{name: value})
+        base = _resolve_optimization()
+        for name in ("peer32", "offset_bulk", "skip_zero_counts", "fc2_tail_n8"):
+            changed = dataclasses.replace(base, **{name: not getattr(base, name)})
+            self.assertNotEqual(base.identity(), changed.identity())
+        self.assertNotEqual(
+            base.identity(), _resolve_optimization(fc1_ready_mode="k256").identity()
+        )
+
+    def test_diagnostic_legacy_and_independence_from_total_tokens(self):
+        self.assertEqual(
+            _resolve_optimization(local_optimizations=False, skip_zero_counts=False),
+            Mxfp4Optimizations(),
+        )
+        # There is intentionally no num_tokens argument or per-token source table.
+        import inspect
+
+        self.assertNotIn(
+            "num_tokens",
+            inspect.signature(resolve_mxfp4_optimizations).parameters,
+        )
+
+    def test_cross_h_local_defaults_keep_protocols_off(self):
+        for hidden in (4096, 6144, 7168, 8192):
+            with self.subTest(hidden=hidden):
+                selected = _resolve_optimization(static_expert_shape=(96, 6144, hidden))
+                self.assertTrue(selected.peer32)
+                self.assertTrue(selected.offset_bulk)
+                self.assertTrue(selected.skip_zero_counts)
+                self.assertFalse(selected.fc2_tail_n8)
+                self.assertEqual(selected.fc1_ready_mode, "tile")
+                self.assertEqual(
+                    (selected.fc1_ready_segments, selected.fc1_ready_bits), (1, 0)
+                )
+
+    def test_cross_h_requires_complete_channel_clusters(self):
+        for hidden in (0, -512, 4352, 7167, 7424):
+            self.assertFalse(
+                _resolve_optimization(static_expert_shape=(96, 6144, hidden)).peer32
+            )
+        self.assertFalse(_resolve_optimization(static_expert_shape=None).peer32)
+        self.assertFalse(_resolve_optimization(cluster_shape_mnk=(0, 1, 1)).peer32)
+
+    def test_cross_h_does_not_widen_optional_protocols(self):
+        for hidden in (4096, 6144, 8192):
+            for option in ({"fc2_tail_n8": True}, {"fc1_ready_mode": "k256"}):
+                with (
+                    self.subTest(hidden=hidden, option=option),
+                    self.assertRaises(ValueError),
+                ):
+                    _resolve_optimization(
+                        static_expert_shape=(96, 6144, hidden), **option
+                    )
+        self.assertTrue(_resolve_optimization(fc2_tail_n8=True).fc2_tail_n8)
+        self.assertEqual(
+            _resolve_optimization(fc1_ready_mode="k256").fc1_ready_bits, 48
+        )
+
+    def test_cross_h_keeps_the_same_mma_tile_domain(self):
+        for hidden in (4096, 6144, 7168, 8192):
+            for m in (128, 256):
+                for n in (8, 16, 32, 64, 128):
+                    for k in (128, 256):
+                        selected = _resolve_optimization(
+                            static_expert_shape=(96, 6144, hidden),
+                            mma_tiler_mnk=(m, n, k),
+                        )
+                        self.assertEqual(selected.peer32, (m, n, k) == (256, 64, 256))
+                        self.assertEqual(selected.offset_bulk, k == 256)
+
+    def test_cross_h_keeps_other_formats_and_writeback_guards(self):
+        for hidden in (4096, 6144, 7168, 8192):
+            for overrides in (
+                {"fp8_scale_mode": "blockwise"},
+                {"fp8_scale_mode": "per_tensor"},
+                {"split_role": "k1", "execution_phase": "fc1"},
+                {"split_role": "k2", "execution_phase": "fc2"},
+                {"pingpong": True},
+                {"token_back_by_dispatch": True},
+                {"fc2_in_kernel_topk_reduce": True},
+                {"dedup_dispatch": True},
+                {"local_optimizations": False},
+            ):
+                with self.subTest(hidden=hidden, overrides=overrides):
+                    self.assertFalse(
+                        _resolve_optimization(
+                            static_expert_shape=(96, 6144, hidden), **overrides
+                        ).peer32
+                    )

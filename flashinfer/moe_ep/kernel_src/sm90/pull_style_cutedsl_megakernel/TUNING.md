@@ -148,9 +148,14 @@ staging uses E4M3 plus one FP32 dequant scale per routed row (replicated into
 the four-column symmetric-memory wire). There is no BF16-weight fallback or
 persistent E4M3-weight conversion in this backend.
 
-The fused live union contains 17 deduplicated tactics: the eight current
+The fused geometry union contains 17 deduplicated tactics: the eight current
 block-permutation winners, seven distinct published-exact winners, and two H20
-anchors. Both supported routing profiles time this same union. Split uses the
+anchors. Fused tuning now expands this union with eligible `fc2_tail_n8` and
+`fc1_ready_mode` choices using the same `hopper_mxfp4_optimization_candidates`
+entry for online and offline tuning. Eligibility depends on model, layout,
+and completion protocol, not total token count. For H7168/I3072/E384/EP4 the
+complete union has 23 candidates. Both routing profiles use the same set;
+token capacity only changes its initial ordering. Split uses the
 eight winners for the selected routing profile because every tactic includes a
 132-SM K1/K2 partition; it must not be reused on a device with a different SM
 count. The block-permutation tables were promoted from the reviewed 2026-09-08
@@ -216,6 +221,91 @@ it. The cached `knobs` value is always the complete effective tactic. In
 particular, split stores both K1/K2 tiles, clusters, group hints, stage counts,
 SM counts, counter-bank count, graph variant, and IKET flag, so it cannot
 cross-match a fused or ordinary FP8 entry.
+
+#### Unified fused MXFP4 implementation (`fused_local_v1`)
+
+The following are implementation defaults, not independent autotune axes:
+
+- FC2 paired BF16 peer stores with row-address reuse: enabled for fused,
+  non-pingpong M256N64K256, direct epilogue token-back, without dispatch
+  deduplication or in-kernel reduction. H must be positive and cover complete
+  channel clusters (`H % (256 * cluster_m) == 0`). H7168 is not a special
+  mathematical requirement. GPU qualification covers H4096/6144/7168/8192,
+  CGA2x1x1; other aligned shapes are a layout-based eligibility rule, not a
+  claim of exhaustive GPU testing. Other legal layouts retain scalar stores.
+- Offset auxiliary bulk copy: enabled for non-pingpong fused K256. It copies
+  each contiguous 512-byte offset block with the existing stage-completion
+  protocol. K128 and split keep the previous copy path.
+- Skip zero expert-count contributions: enabled only for fused MXFP4 without
+  dispatch deduplication. The existing grid rendezvous, all-expert completion
+  broadcast and per-launch reset are retained. Ordinary FP8 and split stay off.
+
+Only these two optional strategies expand tuning:
+
+- `fc2_tail_n8: bool = False`: within the original H7168 paired-store domain, use N8
+  math when a specific FC2 task has at most eight valid tokens. Physical N64
+  staging and output layout remain unchanged; this does not legalize tile N8
+  at the public frontend.
+- `fc1_ready_mode: "tile" | "k256" = "tile"`: `k256` additionally requires
+  H7168/I3072/E384/EP4, CGA2x1x1, effective early publication and no store
+  offload. It publishes 48 distinct K64 completion bits after both post-SwiGLU
+  data and scales finish storing. Each FC2 K256 segment acquires four bits.
+  The counter slots become Int64; workspace reset and compile identity change
+  together. Other models are not yet qualified for this protocol.
+
+#### Fused MXFP4 tiny-value quantization
+
+The fused Mega input quantizer and post-SwiGLU quantizer protect small positive
+amax values without changing the arithmetic for normal or zero rows. For
+`0 < amax < 448e-30`, they first form a finite FP32 multiplier
+`q = 448 / max(amax, FP32(448 / FLT_MAX))`, then form `d = RN(1/q)`.
+Payload is quantized using the retained q; it must not recompute q from rounded
+subnormal d, whose reciprocal can overflow. The smallest d produced by this
+rule is `2**-128`. Truly unrepresentable FP8/BF16 results may still become zero.
+
+This is a numerical correction, not an autotune option. Both backend and tuner
+enable the input path only for fused MXFP4. The shared epilogue additionally
+requires Mega token communication, so ordinary FP8, split, and non-Mega kernels
+retain their existing arithmetic. The input path keeps the Torch row reduction
+and fuses only the subsequent quantization into one cached CuTe kernel, using
+the current Torch stream. An eager warmup is required before first graph capture.
+
+Regression coverage lives in `test_sm90_mxfp4_safe_quantization.py` and
+`test_moe_ep_sm90_pull_mxfp4_mega_multirank.py`: ordinary byte equality,
+FP32 nextafter/subnormal boundaries, separate q/d references, zero batches,
+stream/graph replay, and full cross-rank tiny outputs without an absolute-error
+escape. The activation reference uses effective Humming weights, not an original
+unquantized-weight model.
+
+Precision and cross-H writeback were qualified as separate A/B experiments;
+their timing changes must not be added arithmetically. The pull request records
+the benchmark tables and measurement conditions. Requested clocks are not
+proof of sustained clocks.
+
+#### Optional strategy interface
+
+Manual `knobs` dictionaries may retain the complete historical 17 fields,
+which explicitly mean tail off / whole-tile ready, or include **both** new
+fields for the complete 19-field identity. A partial pair is rejected. Applying
+a legacy tactic after an enabled strategy resets both settings and releases
+the old workspace. Explicit unsupported strategies fail before allocation;
+they never silently select a different implementation. For example:
+
+```python
+knobs = dict(complete_legacy_tactic, fc2_tail_n8=True, fc1_ready_mode="k256")
+```
+
+Benchmark equivalents are `--mxfp4-fc2-tail-n8` and
+`--mxfp4-fc1-ready-mode k256`; they are fused-MXFP4-only. Actual effective
+strategy values participate in the runtime tactic SHA. The fused dtype/JIT
+identity and tuning provenance include `fused_local_v1`; old fused winners
+miss deliberately. Split and ordinary FP8 cache identities are unchanged.
+Historical tables above identify earlier measurements, not performance proof
+for this overlay. See the pull request for the same-node unified-source results.
+The policy, candidate expansion, cache identity and layout gates are covered by
+`tests/moe_ep/test_sm90_pull_mxfp4_config.py`,
+`test_sm90_pull_mxfp4_tuner.py`,
+`test_sm90_mxfp4_autotune_wiring.py` and `test_sm90_mxfp4_local_layout.py`.
 
 - `fp8_scale_mode` — `"per_tensor"` (per-expert weight scalar + static
   activation calibration scalars, identical on all EP ranks by contract) or

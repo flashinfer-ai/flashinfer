@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
+import unittest
 
 import pytest
 
@@ -38,6 +40,14 @@ from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel.shim.mxfp4_
     hopper_mxfp4_runtime_candidates,
     hopper_mxfp4_runtime_candidates_for_shape,
     normalize_hopper_mxfp4_routing_profile,
+)
+
+from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel.shim.mxfp4_optimization import (
+    expand_mxfp4_optimization_candidates,
+    hopper_mxfp4_optimization_candidates,
+    mxfp4_optimization_candidate_sha256,
+    normalize_mxfp4_optimization_tactic,
+    resolve_mxfp4_tactic_optimizations,
 )
 
 
@@ -945,3 +955,189 @@ def test_all_profile_aware_apis_reject_noncanonical_profile(
 def test_validator_requires_a_mapping() -> None:
     with pytest.raises(TypeError, match="mapping"):
         validate_hopper_mxfp4_tactic([], execution_mode="fused")  # type: ignore[arg-type]
+
+
+_OPTIMIZATION_SHAPE = dict(
+    hidden=7168, intermediate=3072, num_experts=384, world_size=4
+)
+
+
+def _optimization_anchor(**overrides):
+    tactic = hopper_mxfp4_default_tactic(2048, execution_mode="fused")
+    tactic.update(overrides)
+    return tactic
+
+
+class TestMxfp4OptimizationCandidates(unittest.TestCase):
+    def test_legacy_mapping_is_explicit_and_does_not_mutate(self):
+        legacy = _optimization_anchor()
+        before = copy.deepcopy(legacy)
+        normalized = normalize_mxfp4_optimization_tactic(legacy)
+        self.assertEqual(legacy, before)
+        self.assertEqual(len(normalized), 19)
+        self.assertIs(normalized["fc2_tail_n8"], False)
+        self.assertEqual(normalized["fc1_ready_mode"], "tile")
+        self.assertEqual(normalize_mxfp4_optimization_tactic(normalized), normalized)
+        for field in legacy:
+            partial = dict(legacy)
+            del partial[field]
+            with self.assertRaises(ValueError, msg=field):
+                normalize_mxfp4_optimization_tactic(partial)
+
+    def test_partial_or_invalid_strategy_never_silently_defaults(self):
+        for extra in (
+            {"fc2_tail_n8": True},
+            {"fc1_ready_mode": "k256"},
+            {"fc2_tail_n8": 1, "fc1_ready_mode": "tile"},
+            {"fc2_tail_n8": False, "fc1_ready_mode": "auto"},
+            {"misspelled_strategy": True},
+        ):
+            with self.subTest(extra=extra), self.assertRaises(ValueError):
+                normalize_mxfp4_optimization_tactic(_optimization_anchor(**extra))
+
+    def test_expansion_is_bounded_and_keeps_originals_first(self):
+        original = hopper_mxfp4_runtime_candidates_for_shape(
+            execution_mode="fused",
+            hidden=_OPTIMIZATION_SHAPE["hidden"],
+            intermediate=_OPTIMIZATION_SHAPE["intermediate"],
+        )
+        frozen = copy.deepcopy(original)
+        expanded = expand_mxfp4_optimization_candidates(original, **_OPTIMIZATION_SHAPE)
+        self.assertEqual(original, frozen)
+        self.assertEqual(
+            expanded[: len(original)],
+            [normalize_mxfp4_optimization_tactic(tactic) for tactic in original],
+        )
+        self.assertGreater(len(expanded), len(original))
+        self.assertLessEqual(len(expanded), 4 * len(original))
+        for candidate in expanded:
+            resolve_mxfp4_tactic_optimizations(candidate, **_OPTIMIZATION_SHAPE)
+        self.assertEqual(
+            expanded,
+            expand_mxfp4_optimization_candidates(
+                original + original, **_OPTIMIZATION_SHAPE
+            ),
+        )
+
+    def test_effective_folding_is_used_for_protocol_eligibility(self):
+        requested = _optimization_anchor(
+            fc1_store_offload=True,
+            fc1_early_done_publish=False,
+            fold_producer_warps=True,
+            active_dispatch_warps=1,
+            fc2_tail_n8=False,
+            fc1_ready_mode="k256",
+        )
+        resolved = resolve_mxfp4_tactic_optimizations(requested, **_OPTIMIZATION_SHAPE)
+        self.assertEqual(
+            (resolved.fc1_ready_segments, resolved.fc1_ready_bits), (12, 48)
+        )
+        self.assertTrue(requested["fc1_store_offload"])
+        with self.assertRaises(ValueError):
+            resolve_mxfp4_tactic_optimizations(
+                dict(requested, fold_producer_warps=False), **_OPTIMIZATION_SHAPE
+            )
+
+    def test_unsupported_shapes_keep_base_but_not_protocol_variants(self):
+        for override in (
+            {"world_size": 8},
+            {"intermediate": 4096},
+            {"num_experts": 192},
+        ):
+            shape = dict(_OPTIMIZATION_SHAPE, **override)
+            expanded = expand_mxfp4_optimization_candidates(
+                [_optimization_anchor()], **shape
+            )
+            self.assertTrue(expanded)
+            self.assertTrue(
+                all(tactic["fc1_ready_mode"] == "tile" for tactic in expanded)
+            )
+        for override in ({"hidden": 3072},):
+            expanded = expand_mxfp4_optimization_candidates(
+                [_optimization_anchor()], **dict(_OPTIMIZATION_SHAPE, **override)
+            )
+            self.assertEqual(len(expanded), 1)
+        for override in (
+            {"dedup_dispatch": True},
+            {"token_back_mode": "reuse_dispatch_warps"},
+        ):
+            expanded = expand_mxfp4_optimization_candidates(
+                [_optimization_anchor(**override)], **_OPTIMIZATION_SHAPE
+            )
+            self.assertEqual(len(expanded), 1)
+
+    def test_invalid_model_or_base_is_an_error_not_an_empty_union(self):
+        for override in (
+            {"hidden": True},
+            {"world_size": 0},
+            {"num_experts": 383},
+            {"intermediate": 3000},
+        ):
+            with self.assertRaises(ValueError):
+                expand_mxfp4_optimization_candidates(
+                    [_optimization_anchor()], **dict(_OPTIMIZATION_SHAPE, **override)
+                )
+
+    def test_identity_covers_strategy_set_without_order_or_duplicate_aliases(self):
+        base = [_optimization_anchor()]
+        expanded = expand_mxfp4_optimization_candidates(base, **_OPTIMIZATION_SHAPE)
+        digest = mxfp4_optimization_candidate_sha256
+        self.assertNotEqual(digest(base), digest(expanded))
+        self.assertEqual(digest(expanded), digest(list(reversed(expanded)) + expanded))
+        self.assertEqual(
+            digest(base),
+            digest([normalize_mxfp4_optimization_tactic(base[0])]),
+        )
+        self.assertNotEqual(digest([expanded[0]]), digest([expanded[1]]))
+
+    def test_one_domain_for_all_token_capacities_and_profiles(self):
+        digests = set()
+        for profile in MXFP4_TUNING_ROUTING_PROFILES:
+            for token in (8, 32, 64, 128, 256, 512, 1024, 2048):
+                actual = hopper_mxfp4_optimization_candidates(
+                    token, routing_profile=profile, **_OPTIMIZATION_SHAPE
+                )
+                original = hopper_mxfp4_ordered_candidates(
+                    token,
+                    execution_mode="fused",
+                    routing_profile=profile,
+                    hidden=_OPTIMIZATION_SHAPE["hidden"],
+                    intermediate=_OPTIMIZATION_SHAPE["intermediate"],
+                )
+                self.assertEqual(
+                    actual,
+                    expand_mxfp4_optimization_candidates(
+                        original, **_OPTIMIZATION_SHAPE
+                    ),
+                )
+                self.assertEqual(
+                    actual[0],
+                    normalize_mxfp4_optimization_tactic(original[0]),
+                )
+                digests.add(mxfp4_optimization_candidate_sha256(actual))
+        self.assertEqual(len(digests), 1)
+
+    def test_historical_manifests_and_split_are_unchanged(self):
+        for profile in MXFP4_TUNING_ROUTING_PROFILES:
+            for mode in ("fused", "split"):
+                manifest = hopper_mxfp4_tuning_manifest(
+                    execution_mode=mode, routing_profile=profile
+                )
+                raw = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode()
+                expected = hopper_mxfp4_tuning_provenance(
+                    execution_mode=mode, routing_profile=profile
+                )
+                self.assertEqual(
+                    hashlib.sha256(raw).hexdigest(), expected["runtime_manifest_sha256"]
+                )
+                for token in MXFP4_TUNING_TOKEN_BUCKETS:
+                    tactic = hopper_mxfp4_default_tactic(
+                        token, execution_mode=mode, routing_profile=profile
+                    )
+                    self.assertEqual(
+                        tactic,
+                        validate_hopper_mxfp4_tactic(tactic, execution_mode=mode),
+                    )
+                    if mode == "split":
+                        with self.assertRaises(ValueError):
+                            normalize_mxfp4_optimization_tactic(tactic)

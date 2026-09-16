@@ -268,6 +268,8 @@ MXFP4_FUSED_RUNTIME_TACTIC_FIELDS = (
             "group_hint",
             "num_sched_stages",
             "in_kernel_fc2_reduce",
+            "fc2_tail_n8",
+            "fc1_ready_mode",
         }
     )
     | _FUSED_EXECUTION_TACTIC_FIELDS
@@ -582,6 +584,17 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument("--split-enable-iket", action="store_true")
     p.add_argument(
+        "--mxfp4-fc2-tail-n8",
+        action="store_true",
+        help="fused MXFP4 only: use N8 math for eligible FC2 token tails",
+    )
+    p.add_argument(
+        "--mxfp4-fc1-ready-mode",
+        choices=("tile", "k256"),
+        default="tile",
+        help="fused MXFP4 FC1 completion protocol (supported geometries only)",
+    )
+    p.add_argument(
         "--token-back",
         choices=[
             "heuristic",
@@ -828,6 +841,7 @@ _FUSED_EXECUTION_KNOB_OPTIONS = frozenset(
         "--no-fold-producer-warps",
     }
 )
+_MXFP4_STRATEGY_OPTIONS = frozenset({"--mxfp4-fc2-tail-n8", "--mxfp4-fc1-ready-mode"})
 _SPLIT_TACTIC_OPTIONS = frozenset(
     {
         "--split-k1-mma-tiler",
@@ -1005,6 +1019,12 @@ def _resolve_sweep(
             "ordinary FP8 cannot masquerade as split"
         )
 
+    strategy_options = args._specified_options.intersection(_MXFP4_STRATEGY_OPTIONS)
+    if strategy_options and (
+        args.backend != MXFP4_BACKEND or args.execution_mode != "fused"
+    ):
+        raise ValueError("MXFP4 strategy flags require the fused MXFP4 backend")
+
     if args.backend == MXFP4_BACKEND:
         if args.fp8_knobs_json is not None:
             raise ValueError(f"--fp8-knobs-json requires --backend {FP8_BACKEND}")
@@ -1054,11 +1074,15 @@ def _resolve_sweep(
             )
         cache_mode = args.mxfp4_tactic_source == "cache_or_heuristic"
         if cache_mode:
-            common_tactic_options = {
-                "--load-balance-mode",
-                "--mma-tiler",
-                "--token-back",
-            } | _FUSED_EXECUTION_KNOB_OPTIONS
+            common_tactic_options = (
+                {
+                    "--load-balance-mode",
+                    "--mma-tiler",
+                    "--token-back",
+                }
+                | _FUSED_EXECUTION_KNOB_OPTIONS
+                | _MXFP4_STRATEGY_OPTIONS
+            )
             fused_tactic_options = (
                 _NEUTRAL_FUSED_GEOMETRY_OPTIONS | _LEGACY_MXFP4_FUSED_GEOMETRY_OPTIONS
             )
@@ -1354,6 +1378,8 @@ def _mxfp4_fused_tactic(
         "group_hint": args.group_hint,
         "num_sched_stages": args.num_sched_stages,
         **_fused_execution_knobs_from_args(args),
+        "fc2_tail_n8": args.mxfp4_fc2_tail_n8,
+        "fc1_ready_mode": args.mxfp4_fc1_ready_mode,
     }
     return tactic
 

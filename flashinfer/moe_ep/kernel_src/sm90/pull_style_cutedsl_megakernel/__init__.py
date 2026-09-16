@@ -12,7 +12,8 @@ revision.  The two trees are separate backends and are mutually exclusive per
 process (see ``shim/_paths.py``).
 
 Layering (same rules as the SM100 package — see SKILL.md):
-- ``src/`` is a verbatim kernel-team drop; never edit it.
+- ``src/`` preserves the joint kernel drop plus the versioned fused MXFP4
+  optimization overlay documented in VENDOR_PROVENANCE.md; do not mix drops.
 - ``shim/`` is the only layer that imports the raw ``src/`` packages.
 - moe_ep backends import from this ``__init__`` only.
 
@@ -56,6 +57,7 @@ from .shim import (
     hopper_mxfp4_candidates,
     hopper_mxfp4_candidates_for_shape,
     hopper_mxfp4_default_tactic,
+    hopper_mxfp4_optimization_candidates,
     hopper_mxfp4_ordered_candidates,
     hopper_mxfp4_runtime_candidates,
     hopper_mxfp4_runtime_candidates_for_shape,
@@ -215,6 +217,7 @@ __all__ = [
     "hopper_mxfp4_candidates",
     "hopper_mxfp4_candidates_for_shape",
     "hopper_mxfp4_default_tactic",
+    "hopper_mxfp4_optimization_candidates",
     "hopper_mxfp4_ordered_candidates",
     "hopper_mxfp4_runtime_candidates",
     "hopper_mxfp4_runtime_candidates_for_shape",

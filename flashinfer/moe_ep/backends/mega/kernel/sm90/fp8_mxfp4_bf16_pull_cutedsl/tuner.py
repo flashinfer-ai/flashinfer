@@ -233,6 +233,7 @@ def _create_canonical_inputs(
             symm_buffer.topk_idx,
             symm_buffer.topk_weights,
             quantize_input=True,
+            safe_quantization=execution_mode == "fused",
         )
         y = torch.empty(live_tokens, args.hidden, dtype=torch.bfloat16, device=device)
         return y, transformed_l1, transformed_l2, symm_buffer
@@ -332,6 +333,15 @@ def tune_one(args, rank: int, world_size: int, max_tokens: int) -> dict:
         intermediate=args.intermediate,
         routing_profile=routing_profile,
     )
+    if mode == "fused":
+        candidates = pkg.hopper_mxfp4_optimization_candidates(
+            max_tokens,
+            hidden=args.hidden,
+            intermediate=args.intermediate,
+            num_experts=args.num_experts,
+            world_size=world_size,
+            routing_profile=routing_profile,
+        )
     symm_buffer: Any = None
     try:
         y, l1, l2, symm_buffer = _create_canonical_inputs(

@@ -166,6 +166,10 @@ def test_none_resolvers_use_mode_specific_guards(monkeypatch) -> None:
 
 
 def test_h20_fused_none_cache_miss_uses_h200_derived_heuristic(monkeypatch) -> None:
+    from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel.shim.mxfp4_optimization import (
+        normalize_mxfp4_optimization_tactic,
+    )
+
     _mock_cuda_device(
         monkeypatch,
         name="NVIDIA H20-3e",
@@ -186,10 +190,12 @@ def test_h20_fused_none_cache_miss_uses_h200_derived_heuristic(monkeypatch) -> N
     }
 
     assert hopper_mxfp4._resolve_mxfp4_knobs(None, **kwargs) == (
-        mxfp4_tuner.hopper_mxfp4_default_tactic(
-            1,
-            execution_mode="fused",
-            routing_profile=SM90_ROUTING_PROFILE_PUBLISHED_EXACT_BALANCED,
+        normalize_mxfp4_optimization_tactic(
+            mxfp4_tuner.hopper_mxfp4_default_tactic(
+                1,
+                execution_mode="fused",
+                routing_profile=SM90_ROUTING_PROFILE_PUBLISHED_EXACT_BALANCED,
+            )
         )
     )
     lookup.assert_called_once()
@@ -234,6 +240,10 @@ def test_backend_auto_allocation_requires_certified_device(
 
 
 def test_complete_explicit_tactics_bypass_device_guard(monkeypatch) -> None:
+    from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel.shim.mxfp4_optimization import (
+        normalize_mxfp4_optimization_tactic,
+    )
+
     fused_guard = mock.Mock(side_effect=AssertionError("guard must not run"))
     split_guard = mock.Mock(side_effect=AssertionError("guard must not run"))
     monkeypatch.setattr(
@@ -248,13 +258,10 @@ def test_complete_explicit_tactics_bypass_device_guard(monkeypatch) -> None:
     )
     fused = mxfp4_tuner.hopper_mxfp4_candidates(execution_mode="fused")[0]
     split = mxfp4_tuner.hopper_mxfp4_candidates(execution_mode="split")[0]
-    assert (
-        hopper_mxfp4._resolve_mxfp4_knobs(
-            fused,
-            **_resolver_kwargs(),
-        )
-        == fused
-    )
+    assert hopper_mxfp4._resolve_mxfp4_knobs(
+        fused,
+        **_resolver_kwargs(),
+    ) == normalize_mxfp4_optimization_tactic(fused)
     assert (
         hopper_mxfp4_split._resolve_mxfp4_split_tactic(
             split,

@@ -185,6 +185,39 @@ def _synthetic_rank_audit(rank, *, global_route="0" * 64, full=False):
 
 
 class BenchmarkContracts(TestCase):
+    def test_mxfp4_optional_strategies_have_complete_runtime_identity(self):
+        args = _mxfp4_args("--mxfp4-fc2-tail-n8", "--mxfp4-fc1-ready-mode", "k256")
+        tactic = bench._mxfp4_fused_tactic(args, (256, 64))
+        self.assertTrue(tactic["fc2_tail_n8"])
+        self.assertEqual(tactic["fc1_ready_mode"], "k256")
+        self.assertEqual(set(tactic), bench.MXFP4_FUSED_RUNTIME_TACTIC_FIELDS)
+        enabled = bench._runtime_tactic_envelope("mxfp4_fused", tactic)
+        disabled = bench._runtime_tactic_envelope(
+            "mxfp4_fused", dict(tactic, fc2_tail_n8=False, fc1_ready_mode="tile")
+        )
+        self.assertNotEqual(
+            enabled["runtime_tactic_sha256"], disabled["runtime_tactic_sha256"]
+        )
+        incomplete = dict(tactic)
+        incomplete.pop("fc1_ready_mode")
+        with self.assertRaisesRegex(RuntimeError, "fields differ"):
+            bench._runtime_tactic_envelope("mxfp4_fused", incomplete)
+
+    def test_mxfp4_strategy_flags_rejected_on_fp8_split_and_cache(self):
+        for prefix in (
+            [],
+            ["--backend", bench.MXFP4_BACKEND, "--execution-mode", "split"],
+            [
+                "--backend",
+                bench.MXFP4_BACKEND,
+                "--mxfp4-tactic-source",
+                "cache_or_heuristic",
+            ],
+        ):
+            args = bench._parse_args([*prefix, "--mxfp4-fc2-tail-n8"])
+            with self.assertRaises(ValueError):
+                bench._resolve_sweep(args, 4)
+
     def test_historical_fp8_prefix_and_append_only_fields(self):
         self.assertEqual(bench.CSV_FIELDS, HISTORICAL_FP8_CSV_FIELDS)
         header = bench.CSV_HEADER.split(",")

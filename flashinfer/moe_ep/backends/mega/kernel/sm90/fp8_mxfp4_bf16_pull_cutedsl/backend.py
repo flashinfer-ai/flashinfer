@@ -363,6 +363,7 @@ class Sm90PullMxfp4MegaKernelBackend(MegaKernelBackend):
             workspace.topk_weights,
             quantize_input=quantize_input,
             scales=t.scales,
+            safe_quantization=self._kernel_config.execution_mode == "fused",
         )
 
     def compute(

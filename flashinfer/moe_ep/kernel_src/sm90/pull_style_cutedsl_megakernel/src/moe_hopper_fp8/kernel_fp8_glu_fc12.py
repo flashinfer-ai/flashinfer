@@ -45,7 +45,7 @@ from common.megamoe_constants import (
     SupportedMmaTileM,
     SupportedMmaTileN,
 )
-from moe_nvfp4_swapab.moe_utils import spin_wait
+from moe_nvfp4_swapab.moe_utils import spin_wait, _nanosleep
 
 
 # =============================================================================
@@ -1975,6 +1975,7 @@ class Sm90SwigluFp8Fc12Kernel:
         mcast_mask,
         _iket_active,
         reuse_single_scale_tile: cutlass.Constexpr = False,
+        fc1_ready_counter_ptr=None,
     ):
         gB_nkl = cute.local_tile(
             real_b,
@@ -2007,6 +2008,9 @@ class Sm90SwigluFp8Fc12Kernel:
             (None, token_tile_idx, None, 0)
         ]
 
+        # Cache only within this FC2 task, never across tasks or launches.
+        if cutlass.const_expr(fc1_ready_counter_ptr is not None):
+            ready_mask = cutlass.Int64(0)
         ab_producer.reset()
         peek_ab_empty_status = ab_producer.try_acquire()
         for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
@@ -2018,6 +2022,30 @@ class Sm90SwigluFp8Fc12Kernel:
             peek_ab_empty_status = cutlass.Boolean(1)
             if handle.count + 1 < k_tile_cnt:
                 peek_ab_empty_status = ab_producer.try_acquire()
+            if cutlass.const_expr(fc1_ready_counter_ptr is not None):
+                if _iket_active:
+                    iket.range_push("swapab_fc2_k256_ready_wait")
+                # Four post-SwiGLU K64 publications cover one K256 load.
+                # count is absolute K, unlike the wrapping AB stage index.
+                if (cutlass.Int32(ready_mask) & cutlass.Int32(15)) != cutlass.Int32(15):
+                    ready_shift = handle.count * cutlass.Int32(4)
+                    ready_mask = cute.arch.load(
+                        fc1_ready_counter_ptr, cutlass.Int64,
+                        sem="acquire", scope="gpu",
+                    ) >> ready_shift
+                    while (cutlass.Int32(ready_mask) & cutlass.Int32(15)) != cutlass.Int32(15):
+                        _nanosleep(20)
+                        ready_mask = cute.arch.load(
+                            fc1_ready_counter_ptr, cutlass.Int64,
+                            sem="acquire", scope="gpu",
+                        ) >> ready_shift
+                    # A cache hit is covered by the acquire/proxy ordering
+                    # of that snapshot. Reissue fences only on reload.
+                    cute.arch.fence_proxy("async")
+                    cute.arch.fence_proxy("async.global")
+                if _iket_active:
+                    iket.range_pop()
+                ready_mask = ready_mask >> cutlass.Int32(4)
             if _iket_active:
                 iket.range_push("tma_operand_copy")
             cute.copy(

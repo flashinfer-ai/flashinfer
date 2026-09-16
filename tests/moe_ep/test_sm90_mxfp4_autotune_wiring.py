@@ -22,17 +22,20 @@ from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel.shim import
     mxfp4_tuner,
 )
 from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel.shim.mxfp4_tuner import (
-    MXFP4_FUSED_RUNTIME_CANDIDATE_UNION_SHA256,
     hopper_mxfp4_cache_provenance_sha256,
     hopper_mxfp4_candidates,
     hopper_mxfp4_default_tactic,
-    hopper_mxfp4_ordered_candidates,
     hopper_mxfp4_runtime_candidates,
     hopper_mxfp4_tuning_provenance,
 )
 from flashinfer.moe_ep.sm90_routing import (
     SM90_ROUTING_PROFILE_BLOCK_PERMUTATION,
     SM90_ROUTING_PROFILE_PUBLISHED_EXACT_BALANCED,
+)
+from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel.shim.mxfp4_optimization import (
+    hopper_mxfp4_optimization_candidates,
+    mxfp4_optimization_candidate_sha256,
+    normalize_mxfp4_optimization_tactic,
 )
 
 
@@ -80,7 +83,8 @@ def test_cache_dtype_identities_spell_both_operand_formats():
     split = hopper_mxfp4_split._SPLIT_TUNING_IDENTITY
     assert fused == (
         "sm90_w_mxfp4_e2m1_k32_a_fp8_e4m3_per_token_full_hidden_humming_v1_"
-        "fold_m64_k128_gateup8_packedk2_residual64_swapab_fused_layout_v2"
+        "fold_m64_k128_gateup8_packedk2_residual64_swapab_fused_layout_v2_"
+        "fused_local_v1"
     )
     assert split == (
         "sm90_w_mxfp4_e2m1_k32_a_fp8_e4m3_per_token_full_hidden_humming_v1_"
@@ -332,11 +336,12 @@ def test_fused_full_union_records_only_fused_identity_and_manifest(monkeypatch):
         gate_up_clamp=10.0,
         routing_profile=SM90_ROUTING_PROFILE_PUBLISHED_EXACT_BALANCED,
     )
-    candidates = hopper_mxfp4_ordered_candidates(
+    candidates = hopper_mxfp4_optimization_candidates(
         cfg.num_tokens_per_rank,
-        execution_mode="fused",
         hidden=cfg.hidden,
         intermediate=cfg.intermediate,
+        num_experts=cfg.num_total_experts,
+        world_size=cfg.world_size,
         routing_profile=cfg.routing_profile,
     )
     candidate = candidates[0]
@@ -433,7 +438,7 @@ def test_fused_full_union_records_only_fused_identity_and_manifest(monkeypatch):
         routing_profile=cfg.routing_profile,
     )
     assert provenance["runtime_manifest_sha256"] in kwargs["source"]
-    assert MXFP4_FUSED_RUNTIME_CANDIDATE_UNION_SHA256 in kwargs["source"]
+    assert mxfp4_optimization_candidate_sha256(candidates) in kwargs["source"]
 
 
 def test_fused_supplied_candidates_must_be_frozen_union_subset(monkeypatch):
@@ -472,13 +477,12 @@ def test_fused_supplied_candidates_must_be_frozen_union_subset(monkeypatch):
         return candidates[0]
 
     monkeypatch.setattr(autotune_module, "autotune_knobs", fake_autotune)
-    assert (
-        autotune_module.autotune_hopper_mxfp4_mega_moe(
-            object(), object(), object(), buffer, candidates=supplied
-        )
-        == subset[0]
-    )
-    assert captured["candidates"] == subset
+    assert autotune_module.autotune_hopper_mxfp4_mega_moe(
+        object(), object(), object(), buffer, candidates=supplied
+    ) == normalize_mxfp4_optimization_tactic(subset[0])
+    assert captured["candidates"] == [
+        normalize_mxfp4_optimization_tactic(c) for c in subset
+    ]
     record.assert_not_called()
 
     h20_anchor = next(
@@ -488,13 +492,10 @@ def test_fused_supplied_candidates_must_be_frozen_union_subset(monkeypatch):
         and candidate["mma_tiler_mnk"] == (128, 16, 256)
         and candidate["group_hint"] == 78
     )
-    assert (
-        autotune_module.autotune_hopper_mxfp4_mega_moe(
-            object(), object(), object(), buffer, candidates=[h20_anchor]
-        )
-        == h20_anchor
-    )
-    assert captured["candidates"] == [h20_anchor]
+    assert autotune_module.autotune_hopper_mxfp4_mega_moe(
+        object(), object(), object(), buffer, candidates=[h20_anchor]
+    ) == normalize_mxfp4_optimization_tactic(h20_anchor)
+    assert captured["candidates"] == [normalize_mxfp4_optimization_tactic(h20_anchor)]
     record.assert_not_called()
 
     outside = {**union[0], "group_hint": 999999}

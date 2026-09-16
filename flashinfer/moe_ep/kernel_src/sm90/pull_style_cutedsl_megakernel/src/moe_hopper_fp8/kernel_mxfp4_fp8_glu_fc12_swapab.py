@@ -12,6 +12,8 @@ except ImportError:  # pragma: no cover
     from src.iket_compat import iket
 from cutlass.cute.nvgpu import cpasync, warpgroup
 from cutlass.cute.typing import Float32
+from cutlass.cutlass_dsl import dsl_user_op
+from cutlass._mlir.dialects import llvm
 import cutlass.pipeline as pipeline
 import cutlass.utils.hopper_helpers as sm90_utils
 
@@ -33,6 +35,29 @@ from moe_hopper_fp8.mxfp4_cutedsl import (
     make_packed_a_ldsm_views_k256_half,
 )
 from moe_nvfp4_swapab.fc1_fc2_fuse_sched import BlockPhase
+from moe_hopper_fp8.mxfp4_policy import resolve_mxfp4_optimizations
+
+
+@dsl_user_op
+def _copy_offset_bulk(dst_smem, src_gmem, mbar, num_bytes, *, loc=None, ip=None):
+    """Copy folded offsets without changing their layout or cache policy."""
+    llvm.inline_asm(
+        None,
+        [
+            dst_smem.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip),
+            src_gmem.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip),
+            num_bytes.ir_value(loc=loc, ip=ip),
+            mbar.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip),
+        ],
+        "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes "
+        "[$0], [$1], $2, [$3];",
+        "r,l,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
 
 Mxfp4Fc2ScaleLoadOverlap = 0
 Mxfp4Fc2StreamScalePromotion = 1
@@ -279,6 +304,34 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
                 f"got {self.b_dtype}."
             )
         super()._setup_attributes()
+        self.mxfp4_optimizations = self._resolve_mxfp4_optimizations()
+        self.epilogue._mxfp4_peer32 = self.mxfp4_optimizations.peer32
+        self.epilogue._mxfp4_fc1_ready_k256 = (
+            self.mxfp4_optimizations.fc1_ready_mode == "k256"
+        )
+        if hasattr(self, "token_comm"):
+            self.token_comm._skip_zero_expert_counts = (
+                self.mxfp4_optimizations.skip_zero_counts
+            )
+
+    def _resolve_mxfp4_optimizations(self):
+        return resolve_mxfp4_optimizations(
+            fp8_scale_mode=self.fp8_scale_mode,
+            mma_tiler_mnk=self.mma_tiler_mnk,
+            cluster_shape_mnk=(*self.cluster_shape_mn, 1),
+            static_expert_shape=self.static_expert_shape,
+            world_size=getattr(self, "world_size", 1),
+            split_role=getattr(self, "split_role", "fused"),
+            execution_phase=self.execution_phase,
+            pingpong=self.pingpong,
+            token_back_by_dispatch=self.token_back_by_dispatch,
+            fc2_in_kernel_topk_reduce=self.fc2_in_kernel_topk_reduce,
+            fc1_early_done_publish=self.fc1_early_done_publish,
+            fc1_store_offload=self.fc1_store_offload,
+            dedup_dispatch=getattr(self, "dedup_dispatch", False),
+            fc2_tail_n8=getattr(self, "_mxfp4_fc2_tail_n8", False),
+            fc1_ready_mode=getattr(self, "_mxfp4_fc1_ready_mode", "tile"),
+        )
 
     def _create_tiled_mma(self) -> cute.TiledMma:
         return sm90_utils.make_trivial_tiled_mma(
@@ -414,6 +467,49 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
         scale_handle.commit()
 
     @cute.jit
+    def _copy_weight_scale_bulk_k256(
+        self,
+        weight_sf_gemm: cute.Tensor,
+        smem_weight_sf: cute.Tensor,
+        work_tile_info,
+        scale_handle,
+    ) -> None:
+        """Copy each pair of contiguous K128 offset blocks in one request.
+
+        Validated GMEM is uint8 [E,M64,K128,16,16]. The unchanged SMEM
+        strides (1,16,512,256,stage_bytes) make one K256 pair contiguous
+        in both spaces. Arm all completion bytes before issuing copies,
+        and retain the original 32 producer arrivals.
+        """
+        blocks = self.mma_tiler[0] // MXFP4_FOLD_M
+        bytes_per_block = 2 * MXFP4_FOLD_BLOCK_BYTES
+        with cute.arch.elect_one():
+            cute.arch.mbarrier_expect_tx(
+                scale_handle.barrier, blocks * bytes_per_block
+            )
+        cute.arch.sync_warp()
+        with cute.arch.elect_one():
+            for block in cutlass.range_constexpr(blocks):
+                global_m64 = (
+                    work_tile_info.tile_m_idx * cutlass.Int32(blocks)
+                    + cutlass.Int32(block)
+                )
+                global_k128 = scale_handle.count * cutlass.Int32(2)
+                gmem_iter = weight_sf_gemm.iterator + cute.crd2idx(
+                    (work_tile_info.expert_idx, global_m64, global_k128, 0, 0),
+                    weight_sf_gemm.layout,
+                )
+                smem_iter = smem_weight_sf.iterator + cute.crd2idx(
+                    (0, 0, cutlass.Int32(block), 0, scale_handle.index),
+                    smem_weight_sf.layout,
+                )
+                _copy_offset_bulk(
+                    smem_iter, gmem_iter, scale_handle.barrier,
+                    cutlass.Int32(bytes_per_block),
+                )
+        scale_handle.commit()
+
+    @cute.jit
     def _copy_weight_scale_cpasync_k256(
         self,
         weight_sf_gemm: cute.Tensor,
@@ -424,6 +520,14 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
         tidx,
     ) -> None:
         """Stage two adjacent folded K128 offset blocks for one K256 tile."""
+        if cutlass.const_expr(self.mxfp4_optimizations.offset_bulk):
+            self._copy_weight_scale_bulk_k256(
+                weight_sf_gemm=weight_sf_gemm,
+                smem_weight_sf=smem_weight_sf,
+                work_tile_info=work_tile_info,
+                scale_handle=scale_handle,
+            )
+            return
         del output_scale_block_base
         lane_idx = tidx % cutlass.Int32(32)
         k128_blocks_per_tile = 2
@@ -1306,7 +1410,12 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
         """Promote one K64 sum while retaining only one token-pair scale."""
         lane_mod = (tidx % 32) % 4
         accum_regs_per_m64 = self.wgmma_tile_n // 2
-        token_group_count = self.wgmma_tile_n // 8
+        math_n = self.wgmma_tile_n
+        if cutlass.const_expr(self.mxfp4_optimizations.fc2_tail_n8):
+            # Each M128 fragment has math_n registers per lane. Narrow only
+            # the source; the destination keeps the physical N64 layout.
+            math_n = cute.size(accum_temp)
+        token_group_count = math_n // 8
         for token_group in cutlass.range_constexpr(token_group_count):
             token0 = (
                 cutlass.Int32(token_group * 8)
@@ -1324,21 +1433,22 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
                     m_sub * accum_regs_per_m64
                     + token_group * 4
                 )
+                src_base = m_sub * (math_n // 2) + token_group * 4
                 accumulators[base + 0] = (
                     accumulators[base + 0]
-                    + accum_temp[base + 0] * token0_scale
+                    + accum_temp[src_base + 0] * token0_scale
                 )
                 accumulators[base + 1] = (
                     accumulators[base + 1]
-                    + accum_temp[base + 1] * token1_scale
+                    + accum_temp[src_base + 1] * token1_scale
                 )
                 accumulators[base + 2] = (
                     accumulators[base + 2]
-                    + accum_temp[base + 2] * token0_scale
+                    + accum_temp[src_base + 2] * token0_scale
                 )
                 accumulators[base + 3] = (
                     accumulators[base + 3]
-                    + accum_temp[base + 3] * token1_scale
+                    + accum_temp[src_base + 3] * token1_scale
                 )
 
     @cute.jit
@@ -1483,6 +1593,64 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
                 ab_pipeline.consumer_release(ab_consumer_state)
                 ab_consumer_state.advance()
 
+        return ab_consumer_state
+
+    @cute.jit
+    def _mma_mxfp4_hybrid_fc2_k256_tail_select(
+        self,
+        valid_tokens,
+        local_warp_idx: int,
+        tiled_mma,
+        packed_smem_a: cute.Tensor,
+        tCrB: cute.Tensor,
+        accumulators: cute.Tensor,
+        accum_temp: cute.Tensor,
+        ab_pipeline,
+        weight_sf_pipeline,
+        ab_consumer_state,
+        smem_activation_sf: cute.Tensor,
+        smem_weight_sf: cute.Tensor,
+        k_tile_cnt,
+        n_half,
+        tidx,
+    ):
+        if cutlass.const_expr(self.mxfp4_optimizations.fc2_tail_n8):
+            if valid_tokens <= cutlass.Int32(8):
+                narrow_mma = sm90_utils.make_trivial_tiled_mma(
+                    cutlass.Float8E4M3FN, cutlass.Float8E4M3FN,
+                    self.a_major_mode, self.b_major_mode, self.acc_dtype,
+                    self.atom_layout_mnk, tiler_mn=(64, 8),
+                    a_source=warpgroup.OperandSource.RMEM,
+                )
+                narrow_temp = cute.make_rmem_tensor(
+                    narrow_mma.partition_shape_C((self.wgmma_tile_m, 8)),
+                    self.acc_dtype,
+                )
+                ab_consumer_state = self._mma_mxfp4_hybrid_fc2_k256_half(
+                    local_warp_idx, narrow_mma, packed_smem_a, tCrB,
+                    accumulators, narrow_temp, ab_pipeline,
+                    weight_sf_pipeline, ab_consumer_state,
+                    smem_activation_sf, smem_weight_sf, k_tile_cnt,
+                    n_half, tidx,
+                )
+            else:
+                ab_consumer_state = self._mma_mxfp4_hybrid_fc2_k256_half(
+                    local_warp_idx, tiled_mma, packed_smem_a, tCrB,
+                    accumulators, accum_temp, ab_pipeline,
+                    weight_sf_pipeline, ab_consumer_state,
+                    smem_activation_sf, smem_weight_sf, k_tile_cnt,
+                    n_half, tidx,
+                )
+        else:
+            # Entire runtime selector is compiled out when the strategy is
+            # off, including all other FP8/MXFP4 geometries and split roles.
+            ab_consumer_state = self._mma_mxfp4_hybrid_fc2_k256_half(
+                local_warp_idx, tiled_mma, packed_smem_a, tCrB,
+                accumulators, accum_temp, ab_pipeline,
+                weight_sf_pipeline, ab_consumer_state,
+                smem_activation_sf, smem_weight_sf, k_tile_cnt,
+                n_half, tidx,
+            )
         return ab_consumer_state
 
     @cute.jit
@@ -1966,7 +2134,8 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
                 ):
                     if cutlass.const_expr(self._k256_fc2_half_fragment):
                         ab_consumer_state = (
-                            self._mma_mxfp4_hybrid_fc2_k256_half(
+                            self._mma_mxfp4_hybrid_fc2_k256_tail_select(
+                                valid_tokens=work_tile_info.valid_tokens_in_cta_tile,
                                 local_warp_idx=local_warp_idx,
                                 tiled_mma=tiled_mma,
                                 packed_smem_a=tCrA,

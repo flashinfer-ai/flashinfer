@@ -442,6 +442,18 @@ def test_tune_one_routes_each_mode_to_its_dedicated_wrapper(
         hidden=args.hidden,
         intermediate=args.intermediate,
     )
+    if mode == "fused":
+        expected = pkg.hopper_mxfp4_optimization_candidates(
+            8,
+            hidden=args.hidden,
+            intermediate=args.intermediate,
+            num_experts=args.num_experts,
+            world_size=4,
+            routing_profile=args.routing_profile,
+        )
+        assert all(len(candidate) == 19 for candidate in expected)
+        assert any(candidate["fc1_ready_mode"] == "k256" for candidate in expected)
+        assert any(candidate["fc2_tail_n8"] for candidate in expected)
     assert captured["create"][5:] == (mode, expected[0])
     assert captured["finish"][-2] == expected
     assert captured["finish"][-1] is getattr(pkg, wrapper_name)

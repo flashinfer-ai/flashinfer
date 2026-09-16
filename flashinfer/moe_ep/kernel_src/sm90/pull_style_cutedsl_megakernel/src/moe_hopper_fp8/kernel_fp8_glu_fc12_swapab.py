@@ -483,6 +483,10 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
         so compiling that extra counter load is pure overhead.  Keep it for
         every fused, FP8, and legacy role to preserve their existing codegen.
         """
+        if getattr(self, "fc1_ready_mask", False):
+            # The old scalar threshold cannot interpret a ready bitmap.
+            # The activation producer owns the authoritative acquire.
+            return False
         return not (
             self.fp8_scale_mode == "mxfp4_hybrid"
             and self.phase_mode == "fc2"
@@ -596,6 +600,11 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
             pingpong=self.pingpong,
             split_handoff_token_n=self.split_handoff_token_n,
             split_role=getattr(self, "split_role", "fused"),
+            enable_mxfp4_safe_quantization=(
+                self.enable_token_comm
+                and getattr(self, "split_role", "fused") == "fused"
+                and self.fp8_scale_mode == "mxfp4_hybrid"
+            ),
         )
         self.epilogue = SwapABFp8GluEpilogue(**_epi_common)
 
@@ -1896,8 +1905,16 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
         """Wait for and load one FC2 handoff tile and its K64 scales."""
         if _iket_active:
             iket.range_push(self._iket_fc2_activation_load_range)
+        ready_kwargs = {}
+        if cutlass.const_expr(getattr(self, "fc1_ready_mask", False)):
+            ready_kwargs["fc1_ready_counter_ptr"] = fc1_done_counter.iterator + (
+                work_tile_info.cumulative_token_block_count
+                * cutlass.Int32(self.cluster_shape_mn[1])
+                + work_tile_info.tile_n_idx
+            )
         if cutlass.const_expr(
-            self.phase_mode != "fc2" or self.split_consume_fc1_done
+            not getattr(self, "fc1_ready_mask", False)
+            and (self.phase_mode != "fc2" or self.split_consume_fc1_done)
         ):
             if cutlass.const_expr(self.split_handoff_token_n is not None):
                 counter_slot = (
@@ -1977,6 +1994,7 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
                 tma_cta_layout=tma_cta_layout,
                 mcast_mask=mcast_mask,
                 _iket_active=_iket_active,
+                **ready_kwargs,
             )
         else:
             ab_producer = self._tma_load_b_task_tile(

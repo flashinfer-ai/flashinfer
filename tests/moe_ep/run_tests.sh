@@ -160,6 +160,7 @@ run_unit_sm90_mxfp4() {
   pytest_no_finalize -v "${MOE_EP_PYTEST_FLAGS[@]}" \
     tests/moe_ep/test_sm90_mxfp4_autotune_wiring.py \
     tests/moe_ep/test_sm90_mxfp4_device_guard.py \
+    tests/moe_ep/test_sm90_mxfp4_local_layout.py \
     tests/moe_ep/test_sm90_mxfp4_split_autotune.py \
     tests/moe_ep/test_sm90_mxfp4_split_contract.py \
     tests/moe_ep/test_sm90_mxfp4_split_token_comm_abi.py \
@@ -300,7 +301,8 @@ run_oracle_sm90() {
 run_oracle_sm90_mxfp4() {
   MEGA_NO_DIST=1 "${PY}" -m pytest \
     "${MOE_EP_PYTEST_FLAGS[@]}" \
-    tests/moe_ep/test_sm90_pull_mxfp4_kernel_vs_reference.py -v \
+    tests/moe_ep/test_sm90_pull_mxfp4_kernel_vs_reference.py \
+    tests/moe_ep/test_sm90_mxfp4_safe_quantization.py -v \
     -m arch_hopper
 }
 

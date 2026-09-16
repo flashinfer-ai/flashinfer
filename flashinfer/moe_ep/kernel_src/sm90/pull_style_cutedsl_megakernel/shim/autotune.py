@@ -594,10 +594,10 @@ def autotune_hopper_mxfp4_mega_moe(
 ) -> Dict[str, Any]:
     """Collectively autotune one fused Hopper MXFP4 x FP8 session.
 
-    Only the compact MXFP4 fused runtime candidate union is timed. It is the
-    deduplicated union of both frozen H200 routing domains plus the two formal
-    H20 anchors; the routing-specific heuristic remains only the first
-    candidate ordering hint.
+    Time the compact geometry union plus its eligible optional-strategy
+    variants. Both frozen H200 routing domains and the two formal H20 anchors
+    supply geometry candidates, not measurements of this implementation.
+    The routing-specific heuristic remains only the initial ordering hint.
     Every rank first takes the median of its own synchronized launch times;
     :func:`autotune_knobs` then all-reduces those medians with ``MAX``. Rank
     zero persists the agreed winner under the versioned MXFP4 fused identity.
@@ -612,14 +612,17 @@ def autotune_hopper_mxfp4_mega_moe(
     )
     from .comm import resolve_gate_up_clamp
     from .mxfp4_tuner import (
-        MXFP4_FUSED_RUNTIME_CANDIDATE_UNION_SHA256,
         hopper_mxfp4_cache_provenance_sha256,
-        hopper_mxfp4_ordered_candidates,
         hopper_mxfp4_runtime_candidates,
         hopper_mxfp4_tuning_provenance,
         is_hopper_mxfp4_tactic_shape_compatible,
         require_hopper_mxfp4_fused_tuning_device,
-        validate_hopper_mxfp4_tactic,
+    )
+    from .mxfp4_optimization import (
+        MXFP4_STRATEGY_FIELDS,
+        hopper_mxfp4_optimization_candidates,
+        mxfp4_optimization_candidate_sha256,
+        normalize_mxfp4_optimization_tactic,
     )
 
     def launch() -> None:
@@ -638,26 +641,33 @@ def autotune_hopper_mxfp4_mega_moe(
 
     cfg = symm_buffer._frontend.config
     require_hopper_mxfp4_fused_tuning_device()
-    full_candidates = hopper_mxfp4_ordered_candidates(
+    full_candidates = hopper_mxfp4_optimization_candidates(
         cfg.num_tokens_per_rank,
-        execution_mode="fused",
         hidden=cfg.hidden,
         intermediate=cfg.intermediate,
+        num_experts=cfg.num_total_experts,
+        world_size=cfg.world_size,
         routing_profile=cfg.routing_profile,
     )
     if candidates is None:
         candidates = full_candidates
     else:
         candidates = [
-            validate_hopper_mxfp4_tactic(candidate, execution_mode="fused")
-            for candidate in candidates
+            normalize_mxfp4_optimization_tactic(candidate) for candidate in candidates
         ]
         runtime_candidates = hopper_mxfp4_runtime_candidates(
             execution_mode="fused",
             routing_profile=cfg.routing_profile,
         )
         outside_union = [
-            candidate for candidate in candidates if candidate not in runtime_candidates
+            candidate
+            for candidate in candidates
+            if {
+                key: value
+                for key, value in candidate.items()
+                if key not in MXFP4_STRATEGY_FIELDS
+            }
+            not in runtime_candidates
         ]
         if outside_union:
             raise ValueError(
@@ -684,7 +694,13 @@ def autotune_hopper_mxfp4_mega_moe(
                 "no supplied MXFP4 fused autotune candidate supports "
                 f"hidden={cfg.hidden}, intermediate={cfg.intermediate}"
             )
+        if any(candidate not in full_candidates for candidate in candidates):
+            raise ValueError(
+                "supplied MXFP4 fused strategy is outside the supported "
+                "model/layout/protocol candidate union"
+            )
     persist_winner = candidates == full_candidates
+    strategy_union_sha256 = mxfp4_optimization_candidate_sha256(full_candidates)
 
     def _record(_winner: Dict[str, Any], p50_s: float) -> None:
         # A subset is useful for smoke tests, but it does not justify a cache
@@ -723,7 +739,7 @@ def autotune_hopper_mxfp4_mega_moe(
                 p50_us=p50_s * 1e6,
                 source=(
                     "autotune:sm90_mxfp4_fused:runtime_union:"
-                    f"{MXFP4_FUSED_RUNTIME_CANDIDATE_UNION_SHA256}:"
+                    f"{strategy_union_sha256}:"
                     f"heuristic_manifest:{manifest_sha256}"
                 ),
             )

@@ -532,3 +532,40 @@ def test_sm90_mxfp4_kernel_matches_independent_reference(monkeypatch) -> None:
         assert relative_l2.item() < 0.035
     finally:
         symm_buffer.destroy()
+
+
+@pytest.mark.arch_hopper
+@pytest.mark.parametrize("k", [32, 128, 7168])
+def test_fp8_rs_reference_integer_exact(k):
+    import torch
+
+    _require_hopper()
+    from tests.moe_ep._sm90_fp8_wgmma_reference import rs_k32_mm
+
+    generator = torch.Generator(device="cuda").manual_seed(43)
+    a = torch.randint(-2, 3, (8, k), device="cuda", generator=generator).to(
+        torch.float8_e4m3fn
+    )
+    b = (
+        torch.randint(-2, 3, (64, k), device="cuda", generator=generator)
+        .to(torch.float8_e4m3fn)
+        .T
+    )
+    actual = rs_k32_mm(a, b)
+    expected = a.float() @ b.float()
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+@pytest.mark.arch_hopper
+def test_fp32_fma_reference_single_rounding():
+    import torch
+
+    _require_hopper()
+    from tests.moe_ep._sm90_fp8_wgmma_reference import fma_add
+
+    accum = torch.full((1,), -1.0, device="cuda")
+    a = torch.full((1,), 1.0 + 2.0**-23, device="cuda")
+    b = torch.full((1,), 1.0 - 2.0**-23, device="cuda")
+    expected = torch.full((1,), -(2.0**-46), device="cuda")
+    assert (accum + a * b).item() == 0
+    torch.testing.assert_close(fma_add(accum, a, b), expected, atol=0, rtol=0)

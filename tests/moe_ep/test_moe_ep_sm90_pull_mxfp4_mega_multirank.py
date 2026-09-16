@@ -134,7 +134,9 @@ def _make_raw_weights(rank: int):
     )
 
 
-def _make_tokens_and_routes(rank: int, world_size: int, *, launch: int):
+def _make_tokens_and_routes(
+    rank: int, world_size: int, *, launch: int, routing_pattern: str = "cross_rank"
+):
     import torch
 
     generator = torch.Generator(device="cpu").manual_seed(2909 + 97 * launch + rank)
@@ -153,7 +155,19 @@ def _make_tokens_and_routes(rank: int, world_size: int, *, launch: int):
     slot = torch.arange(world_size, dtype=torch.int64).view(1, -1)
     owner = (rank + slot + launch) % world_size
     local_expert = (token + slot + launch) % LOCAL_EXPERTS
+    if routing_pattern == "sparse_owner":
+        # Keep top-k unique but concentrate all ranks' tokens onto the fewest
+        # possible owners. Rotate those owners on the next launch, so a rank
+        # transitions between empty and active on the SAME workspace.
+        owner = (slot // LOCAL_EXPERTS + launch) % world_size
+        local_expert = (token * 0 + slot) % LOCAL_EXPERTS
+    elif routing_pattern not in ("cross_rank", "zero_source", "all_masked"):
+        raise ValueError(f"unknown routing pattern: {routing_pattern}")
     topk_ids = owner * LOCAL_EXPERTS + local_expert
+    if (routing_pattern == "zero_source" and rank == launch % world_size) or (
+        routing_pattern == "all_masked" and launch == 0
+    ):
+        topk_ids = torch.full_like(topk_ids, -1)
 
     # Exact binary fractions prevent routing-weight representation noise while
     # still making every slot numerically distinct.
@@ -267,27 +281,18 @@ def _quantize_input_per_token(hidden):
 
 
 def _fast_fp8_mm(a, b):
-    """Hopper 1xacc FP8 matmul, padding only the routed-token dimension."""
+    """Independent native K32 sequence, not a differently tiled library GEMM."""
     import torch
+    from tests.moe_ep._sm90_fp8_wgmma_reference import rs_k32_mm
 
     assert a.dtype == b.dtype == torch.float8_e4m3fn
     assert a.ndim == b.ndim == 2 and a.shape[1] == b.shape[0]
     rows = a.shape[0]
-    padded_rows = (rows + 15) // 16 * 16
-    if padded_rows != rows:
-        padded = torch.zeros((padded_rows, a.shape[1]), dtype=a.dtype, device=a.device)
-        padded[:rows].view(torch.uint8).copy_(a.view(torch.uint8))
-        a = padded
-    one = torch.ones((), dtype=torch.float32, device=a.device)
-    result = torch._scaled_mm(
-        a.contiguous(),
-        b,
-        one,
-        one,
-        out_dtype=torch.float32,
-        use_fast_accum=True,
+    if rows == 0:
+        return torch.empty((0, b.shape[1]), device=a.device, dtype=torch.float32)
+    return torch.cat(
+        [rs_k32_mm(a[begin : begin + 64], b) for begin in range(0, rows, 64)], dim=0
     )
-    return result[:rows]
 
 
 def _swiglu_sm90_formula(gate, up):
@@ -297,9 +302,12 @@ def _swiglu_sm90_formula(gate, up):
     return swiglu_sm90_reference(gate, up)
 
 
-def _global_route_reference(hidden, topk_ids, topk_weights, raw_global):
+def _global_route_reference(
+    hidden, topk_ids, topk_weights, raw_global, *, require_all_experts=True
+):
     """Compute all ranks' fused output from raw operands and global routing."""
     import torch
+    from tests.moe_ep._sm90_fp8_wgmma_reference import fma_add
 
     world_size, num_tokens, topk = topk_ids.shape
     assert topk == world_size
@@ -316,7 +324,14 @@ def _global_route_reference(hidden, topk_ids, topk_weights, raw_global):
 
     for global_expert in range(world_size * LOCAL_EXPERTS):
         routed = (topk_ids == global_expert).nonzero(as_tuple=False)
-        assert routed.numel() > 0, f"global expert {global_expert} was not exercised"
+        if require_all_experts:
+            assert routed.numel() > 0, (
+                f"global expert {global_expert} was not exercised"
+            )
+        elif routed.numel() == 0:
+            # Explicit sparse-route test: an unselected expert contributes
+            # nothing. Dense coverage remains mandatory for existing callers.
+            continue
         source_rank, source_token, source_slot = routed.unbind(dim=1)
         target_rank = global_expert // LOCAL_EXPERTS
         local_expert = global_expert % LOCAL_EXPERTS
@@ -340,7 +355,7 @@ def _global_route_reference(hidden, topk_ids, topk_weights, raw_global):
         fc2_scale = (grouped.abs().amax(dim=2, keepdim=True) / E4M3_MAX).clamp_min(
             1.0e-30
         )
-        fc2_input = (grouped / fc2_scale).to(torch.float8_e4m3fn)
+        fc2_input = (grouped * torch.reciprocal(fc2_scale)).to(torch.float8_e4m3fn)
 
         fc2_accum = torch.zeros(
             (routed.shape[0], HIDDEN), dtype=torch.float32, device=hidden.device
@@ -352,7 +367,7 @@ def _global_route_reference(hidden, topk_ids, topk_weights, raw_global):
                 fc2_input[:, group].contiguous(),
                 fc2[target_rank, local_expert, :, begin:end].transpose(0, 1),
             )
-            fc2_accum.add_(partial * fc2_scale[:, group])
+            fc2_accum = fma_add(fc2_accum, partial, fc2_scale[:, group])
         fc2_output = fc2_accum * fc2_common[target_rank, local_expert]
         terms[source_rank, source_token, source_slot] = fc2_output.to(torch.bfloat16)
 
@@ -435,7 +450,15 @@ def _complete_fused_graph_tactic() -> dict:
 
 @pytest.mark.gpu_2
 @pytest.mark.arch_hopper
-def test_moe_ep_sm90_pull_mxfp4_mega_multirank_raw_oracle_and_workspace_reuse():
+@pytest.mark.parametrize(
+    "routing_pattern", ("cross_rank", "sparse_owner", "zero_source", "all_masked")
+)
+def test_moe_ep_sm90_pull_mxfp4_mega_multirank_raw_oracle_and_workspace_reuse(
+    routing_pattern,
+    *,
+    tactic=None,
+    expected_policy=None,
+):
     """Production raw ABI vs independent global math on 1, 2, 4, or 8 ranks."""
     import torch
     import torch.distributed as dist
@@ -467,16 +490,19 @@ def test_moe_ep_sm90_pull_mxfp4_mega_multirank_raw_oracle_and_workspace_reuse():
         device=local_rank,
     )
     ensure_moe_ep_cuda_device(bootstrap)
-    config = Sm90_Fp8_Mxfp4_Bf16_PullCutedsl_MegaMoeConfig(
-        intermediate_size=INTERMEDIATE,
-        top_k=world_size,
-        gate_up_clamp=GATE_UP_CLAMP,
+    geometry = dict(
         swap_ab=True,
         pingpong=False,
         mma_tiler_mnk=(128, 32, 128),
         cluster_shape_mnk=(1, 1, 1),
         load_balance_mode="static",
         token_back_mode="epi_warps",
+    )
+    config = Sm90_Fp8_Mxfp4_Bf16_PullCutedsl_MegaMoeConfig(
+        intermediate_size=INTERMEDIATE,
+        top_k=world_size,
+        gate_up_clamp=GATE_UP_CLAMP,
+        **(geometry if tactic is None else {"knobs": tactic}),
     )
     registry_kernel = create_mega_kernel(config)
     assert registry_kernel.kernel_name() == "sm90_fp8_mxfp4_bf16_pull_cutedsl"
@@ -490,14 +516,32 @@ def test_moe_ep_sm90_pull_mxfp4_mega_multirank_raw_oracle_and_workspace_reuse():
         raw = _make_raw_weights(rank)
         raw_global = _gather_raw_weights(raw)
         launches = [
-            _make_tokens_and_routes(rank, world_size, launch=launch)
+            _make_tokens_and_routes(
+                rank, world_size, launch=launch, routing_pattern=routing_pattern
+            )
             for launch in range(2)
         ]
         hidden_global = [_all_gather_stack(item[0]) for item in launches]
         ids_global = [_all_gather_stack(item[1]) for item in launches]
         weights_global = [_all_gather_stack(item[2]) for item in launches]
-        for ids in ids_global:
-            _assert_cross_rank_coverage(ids, world_size)
+        for launch, ids in enumerate(ids_global):
+            if routing_pattern == "cross_rank":
+                _assert_cross_rank_coverage(ids, world_size)
+            elif routing_pattern == "sparse_owner":
+                active_owners = torch.unique(ids // LOCAL_EXPERTS).numel()
+                assert (
+                    active_owners == (world_size + LOCAL_EXPERTS - 1) // LOCAL_EXPERTS
+                )
+                if world_size > 1:
+                    assert active_owners < world_size
+                assert torch.unique(ids).numel() < world_size * LOCAL_EXPERTS
+            elif routing_pattern == "zero_source":
+                assert (ids[launch % world_size] == -1).all()
+            elif routing_pattern == "all_masked":
+                if launch == 0:
+                    assert (ids == -1).all()
+                else:
+                    _assert_cross_rank_coverage(ids, world_size)
         assert not torch.equal(ids_global[0], ids_global[1])
 
         layer = MoEEpLayer(
@@ -532,6 +576,10 @@ def test_moe_ep_sm90_pull_mxfp4_mega_multirank_raw_oracle_and_workspace_reuse():
         first = layer.forward(tensors(launches[0])).clone()
         workspace = layer._workspace
         assert workspace is not None
+        if expected_policy is not None:
+            policy = workspace._frontend._mega.kernel.mxfp4_optimizations
+            for field, value in expected_policy.items():
+                assert getattr(policy, field) == value, (field, policy)
         second = layer.forward(tensors(launches[1])).clone()
         assert layer._workspace is workspace
         second_repeat = layer.forward(tensors(launches[1])).clone()
@@ -549,6 +597,7 @@ def test_moe_ep_sm90_pull_mxfp4_mega_multirank_raw_oracle_and_workspace_reuse():
                 ids_global[launch],
                 weights_global[launch],
                 raw_global,
+                require_all_experts=routing_pattern == "cross_rank",
             )
             for launch in range(2)
         ]
@@ -558,7 +607,7 @@ def test_moe_ep_sm90_pull_mxfp4_mega_multirank_raw_oracle_and_workspace_reuse():
             _assert_matches_reference(actual, expected, launch=launch)
         # Expert-specific weights and rank-specific activations must prevent a
         # rank-0-only or wrong-owner implementation from passing accidentally.
-        if world_size > 1:
+        if world_size > 1 and routing_pattern != "all_masked":
             assert not torch.equal(expected_global[0][0], expected_global[0][1])
         print(
             f"rank {rank}: production SM90 MXFP4 fused MegaMoE matched the "
@@ -569,6 +618,46 @@ def test_moe_ep_sm90_pull_mxfp4_mega_multirank_raw_oracle_and_workspace_reuse():
         if layer is not None:
             layer.destroy()
         finalize_moe_ep_runtime(runtime)
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_hopper
+@pytest.mark.parametrize(
+    "hidden,tile,dedup,tail,routing_pattern",
+    [
+        (256, (128, 32, 256), False, False, "cross_rank"),
+        (256, (256, 64, 256), True, False, "sparse_owner"),
+        (7168, (256, 64, 256), False, False, "cross_rank"),
+        (7168, (256, 64, 256), False, True, "cross_rank"),
+    ],
+)
+def test_moe_ep_sm90_pull_mxfp4_local_optimizations_independent_oracle(
+    monkeypatch, hidden, tile, dedup, tail, routing_pattern
+):
+    """Small expert/I fixture, independent raw math; never a perf substitute."""
+    import sys
+
+    module = sys.modules[__name__]
+    monkeypatch.setattr(module, "HIDDEN", hidden)
+    monkeypatch.setattr(module, "INTERMEDIATE", 256)
+    tactic = dict(
+        _complete_fused_graph_tactic(),
+        mma_tiler_mnk=tile,
+        dedup_dispatch=dedup,
+        fc2_tail_n8=tail,
+        fc1_ready_mode="tile",
+    )
+    test_moe_ep_sm90_pull_mxfp4_mega_multirank_raw_oracle_and_workspace_reuse(
+        routing_pattern,
+        tactic=tactic,
+        expected_policy=dict(
+            peer32=hidden == 7168,
+            offset_bulk=True,
+            skip_zero_counts=not dedup,
+            fc2_tail_n8=tail,
+            fc1_ready_mode="tile",
+        ),
+    )
 
 
 @pytest.mark.gpu_2
@@ -726,4 +815,127 @@ def test_moe_ep_sm90_pull_mxfp4_fused_outer_graph_replay_matches_oracle():
     print(
         f"rank {rank}: production SM90 MXFP4 fused outer graph completed "
         f"{GRAPH_REPLAYS} stable lockstep replays across {world_size} ranks"
+    )
+
+
+def _tiny_quantize_reference(x, *, fc2=False):
+    """Independent FP64 scale calculation, rounded only at FP32 boundaries."""
+    import torch
+
+    x = x.float()
+    amax = x.abs().amax(-1, keepdim=True)
+    old_scale = (amax / 448).clamp_min(1e-30)
+    tiny = (amax > 0) & (amax < 448e-30)
+    multiplier = (
+        448 / amax.double().clamp_min(448 / torch.finfo(torch.float32).max)
+    ).float()
+    scale = (1 / multiplier.double()).float()
+    normal = x * old_scale.reciprocal() if fc2 else x / old_scale
+    payload = torch.where(tiny, x * multiplier, normal).to(torch.float8_e4m3fn)
+    return payload, torch.where(tiny, scale, old_scale)
+
+
+def _tiny_full_output_reference(hidden, ids, scores, raw, *, require_all_experts=True):
+    import torch
+
+    from tests.moe_ep._sm90_fp8_wgmma_reference import fma_add
+
+    world, tokens, topk = ids.shape
+    w1, common1, w2, common2 = _prepare_global_humming_operands(raw)
+    x, input_scale = _tiny_quantize_reference(hidden)
+    terms = torch.zeros(
+        (world, tokens, topk, HIDDEN), dtype=torch.bfloat16, device=hidden.device
+    )
+    for expert in range(world * LOCAL_EXPERTS):
+        routes = (ids == expert).nonzero(as_tuple=False)
+        if require_all_experts:
+            assert routes.numel() > 0
+        rank, token, slot = routes.unbind(1)
+        owner, local = divmod(expert, LOCAL_EXPERTS)
+        accum = _fast_fp8_mm(x[rank, token], w1[owner, local].T)
+        fc1 = accum * input_scale[rank, token] * common1[owner, local]
+        paired = fc1.reshape(-1, INTERMEDIATE // 8, 2, 8)
+        gate = paired[:, :, 0].clamp(max=GATE_UP_CLAMP)
+        up = paired[:, :, 1].clamp(min=-GATE_UP_CLAMP, max=GATE_UP_CLAMP)
+        activation = _swiglu_sm90_formula(gate, up).reshape(-1, INTERMEDIATE)
+        activation = activation * scores[rank, token, slot, None]
+        activation, scales = _tiny_quantize_reference(
+            activation.reshape(-1, INTERMEDIATE // 64, 64), fc2=True
+        )
+        output = torch.zeros((routes.shape[0], HIDDEN), device=hidden.device)
+        for group in range(INTERMEDIATE // 64):
+            partial = _fast_fp8_mm(
+                activation[:, group].contiguous(),
+                w2[owner, local, :, group * 64 : (group + 1) * 64].T,
+            )
+            output = fma_add(output, partial, scales[:, group])
+        terms[rank, token, slot] = (output * common2[owner, local]).bfloat16()
+    return terms.float().sum(2)
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_hopper
+@pytest.mark.parametrize(
+    "amplitude,fc1_exponent_shift",
+    [(1e-15, 0), (1e-18, 0), (1e-19, 0), (1e-35, 55)],
+)
+def test_fused_mxfp4_tiny_full_output(monkeypatch, amplitude, fc1_exponent_shift):
+    """No absolute tolerance that could accidentally accept all-zero output."""
+    import sys
+
+    import torch
+
+    from flashinfer.moe_ep import PrequantizedMoEWeights
+
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9:
+        pytest.skip("SM90 fused MXFP4 safe quantization requires Hopper")
+    test_module = sys.modules[__name__]
+
+    monkeypatch.setattr(test_module, "HIDDEN", 256)
+    monkeypatch.setattr(test_module, "INTERMEDIATE", 256)
+    original_inputs = _make_tokens_and_routes
+    original_weights = _make_raw_weights
+
+    def inputs(*args, **kwargs):
+        hidden, ids, scores = original_inputs(*args, **kwargs)
+        hidden = (hidden.float() * amplitude).bfloat16()
+        if fc1_exponent_shift:
+            assert hidden.float().abs().max() < 448e-30
+        return hidden, ids, scores
+
+    def weights(*args, **kwargs):
+        raw = original_weights(*args, **kwargs)
+        exponent = raw.w13_scale.int() + fc1_exponent_shift
+        assert (exponent < 255).all()
+        return PrequantizedMoEWeights(
+            w13=raw.w13,
+            w2=raw.w2,
+            w13_scale=exponent.to(raw.w13_scale.dtype),
+            w2_scale=raw.w2_scale,
+        )
+
+    def check(actual, expected, *, launch):
+        assert torch.isfinite(actual).all() and torch.isfinite(expected).all()
+        assert expected.count_nonzero() > 0 and actual.count_nonzero() > 0
+        relative_l2 = (
+            actual.double() - expected.double()
+        ).norm() / expected.double().norm()
+        assert relative_l2 < 0.02, (amplitude, launch, relative_l2.item())
+        print(
+            "MXFP4_TINY_FULL_OUTPUT_PASS",
+            amplitude,
+            launch,
+            relative_l2.item(),
+            flush=True,
+        )
+
+    monkeypatch.setattr(test_module, "_make_tokens_and_routes", inputs)
+    monkeypatch.setattr(test_module, "_make_raw_weights", weights)
+    monkeypatch.setattr(
+        test_module, "_global_route_reference", _tiny_full_output_reference
+    )
+    monkeypatch.setattr(test_module, "_assert_matches_reference", check)
+    tactic = dict(_complete_fused_graph_tactic(), mma_tiler_mnk=(256, 64, 256))
+    test_moe_ep_sm90_pull_mxfp4_mega_multirank_raw_oracle_and_workspace_reuse(
+        "cross_rank", tactic=tactic
     )

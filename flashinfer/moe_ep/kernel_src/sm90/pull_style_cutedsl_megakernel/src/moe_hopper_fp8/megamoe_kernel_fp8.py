@@ -880,7 +880,7 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
             ),
             _RegionSpec(
                 "fc1_done_counter",
-                cutlass.Int32,
+                cutlass.Int64 if getattr(self, "fc1_ready_mask", False) else cutlass.Int32,
                 (fc1_done_slots,),
                 16,
             ),
@@ -2021,7 +2021,29 @@ class Sm90MegaMoESwapABMxfp4Fp8Kernel(
 ):
     """MegaMoE with the packed MXFP4 RS FC12 specialization."""
 
-    pass
+    def __init__(
+        self, *args, mxfp4_fc2_tail_n8=False,
+        mxfp4_fc1_ready_mode="tile", **kwargs,
+    ):
+        from moe_hopper_fp8.mxfp4_policy import validate_mxfp4_optional_optimizations
+
+        validate_mxfp4_optional_optimizations(
+            fc2_tail_n8=mxfp4_fc2_tail_n8,
+            fc1_ready_mode=mxfp4_fc1_ready_mode,
+        )
+        self._mxfp4_fc2_tail_n8 = mxfp4_fc2_tail_n8
+        self._mxfp4_fc1_ready_mode = mxfp4_fc1_ready_mode
+        if mxfp4_fc1_ready_mode == "k256" and (
+            kwargs.get("split_counter_epoch_banks", 1) != 1
+            or kwargs.get("split_handoff_token_n") is not None
+        ):
+            raise ValueError("MXFP4 k256 readiness requires the fused single-bank ABI")
+        # The workspace layout is built by the Mega constructor. No device
+        # storage is allocated here; final effective-policy validation below
+        # still precedes allocation, including for raw-kernel callers.
+        self.fc1_ready_mask = mxfp4_fc1_ready_mode == "k256"
+        super().__init__(*args, **kwargs)
+        self.mxfp4_optimizations = self._resolve_mxfp4_optimizations()
 
 
 class MegaMoEFp8TopkReduceLauncher:
