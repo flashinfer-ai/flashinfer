@@ -100,9 +100,13 @@ struct BalancedSchedDeviceParams {
   BalancedCombineDescriptor* combineDescriptorPtr;
   int32_t* numCombineDescriptorsDevicePtr;
   int32_t* planMetadataDevicePtr;
+  int64_t* predictedCostDevicePtr;
   int32_t const* costModelTablePtr;
+  int32_t const* evaluationCostModelPtr;
   bool selectCostModelOnDevice;
   bool useOptimizedSchedule;
+  bool computePredictedCost;
+  bool useEvaluationCostModel;
   void* workspacePtr;
   size_t workspaceBytes;
   cudaStream_t stream;

@@ -37,6 +37,12 @@ void check_cuda_i32(tvm::ffi::TensorView tensor, char const* name) {
   TVM_FFI_ICHECK_EQ(tensor.dtype(), dl_int32) << name << " must have dtype int32";
 }
 
+void check_cuda_i64(tvm::ffi::TensorView tensor, char const* name) {
+  TVM_FFI_ICHECK_EQ(tensor.device().device_type, kDLCUDA) << name << " must be a CUDA tensor";
+  TVM_FFI_ICHECK(tensor.IsContiguous()) << name << " must be contiguous";
+  TVM_FFI_ICHECK_EQ(tensor.dtype(), dl_int64) << name << " must have dtype int64";
+}
+
 int32_t checked_nonnegative_i32(int64_t value, char const* name) {
   TVM_FFI_ICHECK_GE(value, 0) << name << " must be non-negative";
   TVM_FFI_ICHECK_LE(value, std::numeric_limits<int32_t>::max()) << name << " is too large";
@@ -56,9 +62,11 @@ void BuildPrimsBalancedMLAPlanDevice(
     tvm::ffi::TensorView seq_lens, tvm::ffi::TensorView work_descriptors,
     tvm::ffi::TensorView partition_offsets, tvm::ffi::TensorView combine_descriptors,
     tvm::ffi::TensorView num_combine_descriptors, tvm::ffi::TensorView plan_metadata,
+    tvm::ffi::TensorView predicted_cost, tvm::ffi::TensorView evaluation_cost_model,
     tvm::ffi::TensorView scheduler_workspace, tvm::ffi::TensorView cost_model_table,
     int64_t num_partitions_arg, int64_t k_tile_tokens_arg, int64_t num_insts_kv_arg,
     int64_t max_seq_len_arg, bool select_cost_model_on_device, bool use_optimized_schedule,
+    bool compute_predicted_cost, bool use_evaluation_cost_model,
     int64_t forced_target_piece_tiles) {
   check_cuda_i32(seq_lens, "seq_lens");
   check_cuda_i32(work_descriptors, "work_descriptors");
@@ -66,6 +74,8 @@ void BuildPrimsBalancedMLAPlanDevice(
   check_cuda_i32(combine_descriptors, "combine_descriptors");
   check_cuda_i32(num_combine_descriptors, "num_combine_descriptors");
   check_cuda_i32(plan_metadata, "plan_metadata");
+  check_cuda_i64(predicted_cost, "predicted_cost");
+  check_cuda_i32(evaluation_cost_model, "evaluation_cost_model");
   check_cuda_i32(cost_model_table, "cost_model_table");
   TVM_FFI_ICHECK_EQ(scheduler_workspace.device().device_type, kDLCUDA)
       << "scheduler_workspace must be a CUDA tensor";
@@ -87,6 +97,12 @@ void BuildPrimsBalancedMLAPlanDevice(
   TVM_FFI_ICHECK_EQ(plan_metadata.ndim(), 1) << "plan_metadata must be rank 1";
   TVM_FFI_ICHECK_GE(plan_metadata.size(0), static_cast<int32_t>(BalancedSchedMetadata::kCount))
       << "device plan_metadata must hold five values";
+  TVM_FFI_ICHECK_EQ(predicted_cost.ndim(), 1) << "predicted_cost must be rank 1";
+  TVM_FFI_ICHECK_GE(predicted_cost.size(0), 1) << "predicted_cost must hold one value";
+  TVM_FFI_ICHECK_EQ(evaluation_cost_model.ndim(), 1) << "evaluation_cost_model must be rank 1";
+  TVM_FFI_ICHECK_EQ(evaluation_cost_model.size(0),
+                    flashinfer::prims_ts::kBalancedDeviceCostCoefficientCount)
+      << "evaluation_cost_model must contain six coefficients";
   TVM_FFI_ICHECK_EQ(scheduler_workspace.ndim(), 1) << "scheduler_workspace must be rank 1";
   TVM_FFI_ICHECK_EQ(cost_model_table.ndim(), 2) << "cost_model_table must be rank 2";
   TVM_FFI_ICHECK_EQ(cost_model_table.size(0), flashinfer::prims_ts::kBalancedDeviceCostBucketCount)
@@ -133,6 +149,8 @@ void BuildPrimsBalancedMLAPlanDevice(
   check_same_cuda_device(combine_descriptors, output_device, "combine_descriptors");
   check_same_cuda_device(num_combine_descriptors, output_device, "num_combine_descriptors");
   check_same_cuda_device(plan_metadata, output_device, "plan_metadata");
+  check_same_cuda_device(predicted_cost, output_device, "predicted_cost");
+  check_same_cuda_device(evaluation_cost_model, output_device, "evaluation_cost_model");
   check_same_cuda_device(scheduler_workspace, output_device, "scheduler_workspace");
   check_same_cuda_device(cost_model_table, output_device, "cost_model_table");
 
@@ -151,9 +169,13 @@ void BuildPrimsBalancedMLAPlanDevice(
       reinterpret_cast<BalancedCombineDescriptor*>(combine_descriptors.data_ptr());
   params.numCombineDescriptorsDevicePtr = static_cast<int32_t*>(num_combine_descriptors.data_ptr());
   params.planMetadataDevicePtr = static_cast<int32_t*>(plan_metadata.data_ptr());
+  params.predictedCostDevicePtr = static_cast<int64_t*>(predicted_cost.data_ptr());
   params.costModelTablePtr = static_cast<int32_t const*>(cost_model_table.data_ptr());
+  params.evaluationCostModelPtr = static_cast<int32_t const*>(evaluation_cost_model.data_ptr());
   params.selectCostModelOnDevice = select_cost_model_on_device;
   params.useOptimizedSchedule = use_optimized_schedule;
+  params.computePredictedCost = compute_predicted_cost;
+  params.useEvaluationCostModel = use_evaluation_cost_model;
   params.workspacePtr = scheduler_workspace.data_ptr();
   params.workspaceBytes = static_cast<size_t>(scheduler_workspace.size(0));
   params.stream = get_stream(output_device);
