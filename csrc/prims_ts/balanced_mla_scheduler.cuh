@@ -73,7 +73,7 @@ enum class BalancedSchedStatus : int32_t {
 };
 
 // Seven rows of six int32 coefficients. Rows correspond to the replay-time bucket classification
-// used by _balanced_scheduler.py; an explicit cost model may repeat one row seven times.
+// used by balanced_scheduler/cost_model.py; an explicit cost model may repeat one row seven times.
 static constexpr int32_t kBalancedDeviceCostBucketCount = 7;
 static constexpr int32_t kBalancedDeviceCostCoefficientCount = 6;
 

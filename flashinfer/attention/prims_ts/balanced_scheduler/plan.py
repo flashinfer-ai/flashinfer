@@ -23,14 +23,14 @@ from typing import Literal
 
 import torch
 
-from flashinfer.jit.prims_balanced_mla import gen_prims_balanced_mla_plan_module
-from .kernels.mla_decode.helpers.constants import (
+from ..kernels.mla_decode.helpers.constants import (
     balanced_partial_capacity,
     balanced_reducer_capacity,
     balanced_work_descriptor_capacity,
 )
+from .jit import gen_prims_balanced_mla_plan_module
 
-from ._balanced_scheduler import (
+from .cost_model import (
     B200_BALANCED_COST_MODEL_ID,
     B200_BALANCED_COST_MODELS,
     B200_BF16_2CTA_COST,

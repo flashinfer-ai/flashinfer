@@ -16,8 +16,8 @@
 
 import functools
 
-from . import env as jit_env
-from .core import JitSpec, gen_jit_spec
+from flashinfer.jit import env as jit_env
+from flashinfer.jit.core import JitSpec, gen_jit_spec
 
 
 @functools.cache
@@ -27,8 +27,8 @@ def gen_prims_balanced_mla_plan_module() -> JitSpec:
     return gen_jit_spec(
         "prims_balanced_mla_plan",
         [
-            jit_env.FLASHINFER_CSRC_DIR / "prims_balanced_mla_plan.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "prims_balanced_mla_scheduler_device.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "prims_ts/balanced_mla_plan.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "prims_ts/balanced_mla_scheduler_device.cu",
         ],
     )
 

@@ -121,7 +121,7 @@ def balanced_cost_bucket(
     return "dense_large"
 
 
-# B200 calibration from ``bench_prims_ts_balanced_mla_cost_model.py`` using
+# B200 calibration from ``balanced_scheduler/tune_cost_model.py`` using
 # artifact ``primsts_balanced_cost_model_b200_20260914_schedule_v3.jsonl``.
 # Keep family and dtype names independent of CuTe types so calibration metadata
 # remains importable in CPU-only build and tuning tools.
@@ -211,10 +211,11 @@ def require_balanced_cost_model_calibration(
             f"{device_label}: name={identity[0]!r}, "
             f"compute_capability={identity[1]}, "
             f"multi_processor_count={identity[2]}. Run "
-            "`python benchmarks/bench_prims_ts_balanced_mla_cost_model.py "
-            f"--device {device_argument}` on this device, then add the measured "
-            "cost models and exact hardware identity to "
-            "flashinfer/attention/prims_ts/_balanced_scheduler.py. Balanced "
+            "`python -m flashinfer.attention.prims_ts.balanced_scheduler."
+            f"tune_cost_model --device {device_argument}` on this device, then "
+            "add the measured cost models and exact hardware identity to "
+            "flashinfer/attention/prims_ts/balanced_scheduler/cost_model.py. "
+            "Balanced "
             "execution will not use an uncalibrated fallback."
         ) from error
 

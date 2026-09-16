@@ -47,7 +47,7 @@ from flashinfer.attention.prims_ts import (
     BatchMLADecodePagedTSWrapper,
     batch_mla_decode_with_paged_kv_cache,
 )
-from flashinfer.attention.prims_ts._balanced_scheduler import (
+from flashinfer.attention.prims_ts.balanced_scheduler.cost_model import (
     B200_BALANCED_COST_MODEL_ID,
 )
 from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_2cta.config import (
@@ -2221,7 +2221,7 @@ def test_attention_ts_mla_auto_plan_installs_gate_selection(monkeypatch, use_bal
 def test_attention_ts_mla_balanced_plan_fails_calibration_before_policy_or_allocation(
     monkeypatch,
 ):
-    import flashinfer.attention.prims_ts._balanced_plan as balanced_plan_module
+    import flashinfer.attention.prims_ts.balanced_scheduler.plan as balanced_plan_module
 
     events = []
 

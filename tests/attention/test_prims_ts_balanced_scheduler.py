@@ -9,21 +9,25 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from flashinfer.attention.prims_ts import _balanced_scheduler as scheduler_module
-from flashinfer.attention.prims_ts._balanced_gate import (
+from flashinfer.attention.prims_ts.balanced_scheduler import (
+    cost_model as scheduler_module,
+)
+from flashinfer.attention.prims_ts.balanced_scheduler.gate import (
     BALANCED_MLA_GATE_THRESHOLDS,
     EXPECTED_MAX_SEQ_LEN_ENV,
     EXPECTED_MEAN_SEQ_LEN_ENV,
     should_use_prims_ts_balanced_mla,
 )
-from flashinfer.attention.prims_ts._balanced_plan import BalancedMLADecodePlan
-from flashinfer.attention.prims_ts._balanced_scheduler import (
+from flashinfer.attention.prims_ts.balanced_scheduler.cost_model import (
     B200_BALANCED_COST_MODEL_ID,
     B200_BF16_2CTA_COST,
     BalancedCostModel,
     balanced_cost_bucket,
     require_balanced_cost_model_calibration,
     select_b200_balanced_cost_model,
+)
+from flashinfer.attention.prims_ts.balanced_scheduler.plan import (
+    BalancedMLADecodePlan,
 )
 from flashinfer.attention.prims_ts.kernels.mla_decode.helpers.constants import (
     balanced_partial_capacity,
@@ -307,7 +311,7 @@ def test_balanced_calibration_registry_requires_exact_device_identity():
     ):
         with pytest.raises(
             NotImplementedError,
-            match=r"bench_prims_ts_balanced_mla_cost_model.py.*add the measured",
+            match=r"balanced_scheduler.*tune_cost_model.*add the measured",
         ):
             require_balanced_cost_model_calibration(
                 device_name=identity[0],
@@ -342,11 +346,13 @@ def test_balanced_device_plan_rejects_uncalibrated_device_before_allocation(
 
 def test_only_cuda_scheduler_implementations_remain():
     repo_root = Path(__file__).resolve().parents[2]
-    assert not (repo_root / "csrc/prims_balanced_mla_scheduler.cu").exists()
+    assert not (repo_root / "csrc/prims_ts/balanced_mla_scheduler.cu").exists()
     assert not hasattr(scheduler_module, "build_balanced_schedule")
-    jit_source = (repo_root / "flashinfer/jit/prims_balanced_mla.py").read_text()
-    assert "prims_balanced_mla_scheduler_device.cu" in jit_source
-    assert '"prims_balanced_mla_scheduler.cu"' not in jit_source
+    jit_source = (
+        repo_root / "flashinfer/attention/prims_ts/balanced_scheduler/jit.py"
+    ).read_text()
+    assert "balanced_mla_scheduler_device.cu" in jit_source
+    assert '"balanced_mla_scheduler.cu"' not in jit_source
 
 
 _REQUIRES_CUDA_SCHEDULER = pytest.mark.skipif(
