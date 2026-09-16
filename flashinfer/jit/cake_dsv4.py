@@ -1023,10 +1023,10 @@ _ARCH_REGISTRATIONS = {
                 "compile_flags": ["--use_fast_math", "-Xptxas=-uumn"],
                 "entry": "run",
                 "host_linkage_flags": [],
-                "identity": "24eec2cc90193157fc5bb1e3429e611c698e942eebb82e2fcdc7e572716661df",
+                "identity": "ad50d6804edf8c134f6a83d1e3874b0ebf065a37d2be7acc90ba971b7c3f3746",
                 "sources": [
-                    "cake_dsv4_c7cffab4e45ea4f75620_kernel.cu",
-                    "cake_dsv4_c7cffab4e45ea4f75620_binding.cu",
+                    "cake_dsv4_b3232c545a450a427881_kernel.cu",
+                    "cake_dsv4_b3232c545a450a427881_binding.cu",
                 ],
                 "tma_workspace_bytes": 0,
             },
