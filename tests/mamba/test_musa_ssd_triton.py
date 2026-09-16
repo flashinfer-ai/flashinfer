@@ -113,7 +113,9 @@ def test_no_initial_state_and_strided_metadata(monkeypatch, dstate):
     torch.testing.assert_close(actual, expected, rtol=0.05, atol=0.02)
 
 
-@pytest.mark.parametrize("lengths", [[127, 128, 3841], [4095], [4097]])
+@pytest.mark.parametrize(
+    "lengths", [[4096], [2048, 2048], [127, 128, 3841], [4095], [4097]]
+)
 def test_tail_chunks_match_reference(monkeypatch, lengths):
     """Keep packed tail chunks and final/intermediate state boundaries correct."""
     monkeypatch.setenv("VLLM_MUSA_FLASHINFER_SSD", "1")
