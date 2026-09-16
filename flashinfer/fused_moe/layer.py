@@ -27,7 +27,7 @@ import torch
 
 from ..api_logging import flashinfer_api
 from ..autotuner import AutoTuner
-from ..quantization.nvfp4_quantization_utils import nvfp4_4over6_is_from_env
+from ..quantization.nvfp4_quantization_utils import _UNSET
 from ..utils import get_compute_capability
 from .api import (
     B12xNvfp4Config,
@@ -257,7 +257,7 @@ class MoELayer:
             # NotImplementedError, but the filter loop swallows it, so the
             # reason has to be reconstructed here or the user only sees "no
             # backend available".
-            if not nvfp4_4over6_is_from_env(config.quant.nvfp4_4over6):
+            if config.quant.nvfp4_4over6 is not _UNSET:
                 supporting = ", ".join(
                     r.__name__
                     for r in _BACKEND_RUNNERS.values()
@@ -269,8 +269,7 @@ class MoELayer:
                     f"[{supporting}] (and only on the paths that runner "
                     f"documents); every other backend reads the "
                     f"FLASHINFER_NVFP4_4OVER6* environment variables directly, "
-                    f"so leaving the field at NVFP4Recipe.FROM_ENV restores "
-                    f"them."
+                    f"so leaving the field unset restores them."
                 )
             # The reasons come last: they are the ground truth, while the
             # hints above are generic and can point at a backend the user

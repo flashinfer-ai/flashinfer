@@ -41,8 +41,7 @@ import torch
 from ..api_logging import flashinfer_api
 from ..tllm_enums import ActivationType
 from ..quantization.nvfp4_quantization_utils import (
-    NVFP44Over6Setting,
-    NVFP4Recipe,
+    NVFP44Over6Config,
     make_nvfp4_global_scale,
     resolve_nvfp4_4over6,
 )
@@ -2436,7 +2435,7 @@ def prepare_cute_dsl_weights(
     intermediate_size: int,
     activation=None,
     device: Optional[torch.device] = None,
-    nvfp4_4over6: NVFP44Over6Setting = NVFP4Recipe.STANDARD,
+    nvfp4_4over6: Optional[NVFP44Over6Config] = None,
 ) -> Dict[str, torch.Tensor]:
     """Build the CuteDSL FP4 ``cute_dsl`` weight view.
 
@@ -2455,7 +2454,7 @@ def prepare_cute_dsl_weights(
         Expert geometry.
     device : torch.device, optional
         Target device; defaults to ``w1_bf16.device``.
-    nvfp4_4over6 : NVFP4Recipe, NVFP44Over6Config or None
+    nvfp4_4over6 : NVFP44Over6Config or None
         The 4over6 recipe the *runtime activation* quantizer will be given.
         It selects ``fc2_input_scale`` only -- the weights themselves are
         quantized standard-NVFP4 either way, matching the separation
@@ -2463,7 +2462,7 @@ def prepare_cute_dsl_weights(
         search bakes ``1 / (6 * e4m3_max)`` into its dequantization, so a
         pinned recipe requires exactly that scale and
         ``_moe_core_impl`` raises on anything else.  The default
-        ``NVFP4Recipe.STANDARD`` keeps the historical ``fc2_input_scale =
+        ``None`` keeps the historical ``fc2_input_scale =
         1.0``, which standard NVFP4 tolerates because it divides by the same
         value it multiplied by.
 

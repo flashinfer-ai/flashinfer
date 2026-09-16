@@ -29,7 +29,6 @@ from flashinfer import (
 )
 from flashinfer.quantization.nvfp4_quantization_utils import (
     NVFP44Over6Config,
-    NVFP4Recipe,
     current_nvfp4_4over6_config,
     make_nvfp4_global_scale,
     nvfp4_e4m3_max,
@@ -1050,8 +1049,8 @@ def test_nvfp4_quantize_roundtrip(
 # =============================================================================
 # Explicit 4over6 recipes via the public ``nvfp4_4over6=`` parameter
 # =============================================================================
-# Everything above drives 4over6 through ``set_nvfp4_quant_env``, which is the
-# FROM_ENV path and stays the default forever.  The tests below drive it
+# Everything above drives 4over6 through ``set_nvfp4_quant_env``, i.e. the
+# omitted-argument path that reads the environment.  The tests below drive it
 # through the parameter instead.  The headline acceptance criterion of issue
 # #5141 is that several recipes can be exercised in ONE process without
 # mutating ``os.environ``, so those tests must not call the fixture at all.
@@ -1059,7 +1058,7 @@ def test_nvfp4_quantize_roundtrip(
 # Kept small on purpose: each distinct recipe is a separate CuTe-DSL kernel
 # compilation, and the TE-reference test above already sweeps all eight.
 EXPLICIT_4OVER6_SETTINGS = [
-    NVFP4Recipe.STANDARD,
+    None,
     NVFP44Over6Config(),
     NVFP44Over6Config(err_mode="MSE", e4m3_max=256),
 ]
@@ -1091,7 +1090,7 @@ def _quantize_with_setting(x, setting, sf_layout, backend, per_token_activation)
     clamp appears in both, and a mismatch silently rescales the tensor.
     """
     global_scale = make_nvfp4_global_scale(
-        x, per_token_activation, nvfp4_4over6=setting
+        x, per_token_activation, nvfp4_4over6_config=setting
     )
     return nvfp4_quantize(
         x,
@@ -1271,7 +1270,9 @@ def test_nvfp4_quantize_config_equals_env(
     # Leg 1: recipe pinned on the call, environment explicitly 4over6-off.
     set_nvfp4_quant_env()
     assert current_nvfp4_4over6_config() is None
-    scale_cfg = make_nvfp4_global_scale(x, per_token_activation, nvfp4_4over6=setting)
+    scale_cfg = make_nvfp4_global_scale(
+        x, per_token_activation, nvfp4_4over6_config=setting
+    )
     out_cfg = nvfp4_quantize(
         x,
         scale_cfg,
@@ -1281,11 +1282,11 @@ def test_nvfp4_quantize_config_equals_env(
         nvfp4_4over6=setting,
     )
 
-    # Leg 2: recipe supplied by the environment, parameter left at FROM_ENV.
+    # Leg 2: recipe supplied by the environment, parameter omitted.
     set_nvfp4_quant_env(nvfp4_4over6_config=nvfp4_4over6_config)
     assert current_nvfp4_4over6_config() == setting
     scale_env = make_nvfp4_global_scale(
-        x, per_token_activation, nvfp4_4over6=NVFP4Recipe.FROM_ENV
+        x, per_token_activation, nvfp4_4over6_config=current_nvfp4_4over6_config()
     )
     torch.testing.assert_close(scale_env, scale_cfg, rtol=0, atol=0)
     out_env = nvfp4_quantize(
@@ -1320,8 +1321,8 @@ def test_nvfp4_quantize_setting_overrides_env(
 ) -> None:
     """Documented precedence, in both directions.
 
-    ``FLASHINFER_NVFP4_4OVER6=1`` cannot turn ``NVFP4Recipe.STANDARD`` back
-    on, and an unset environment cannot turn an explicit recipe off.
+    ``FLASHINFER_NVFP4_4OVER6=1`` cannot turn an explicit ``None`` back on,
+    and an unset environment cannot turn an explicit recipe off.
     """
     if not _is_fp4_supported(torch.device(device)):
         pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
@@ -1338,9 +1339,7 @@ def test_nvfp4_quantize_setting_overrides_env(
 
     # Reference points, taken with the environment agreeing with the parameter.
     set_nvfp4_quant_env()
-    standard_ref = _quantize_with_setting(
-        x, NVFP4Recipe.STANDARD, sf_layout, backend, False
-    )
+    standard_ref = _quantize_with_setting(x, None, sf_layout, backend, False)
     set_nvfp4_quant_env(nvfp4_4over6_config=recipe)
     enabled_ref = _quantize_with_setting(x, canonical, sf_layout, backend, False)
     assert not torch.equal(standard_ref[0], enabled_ref[0]), (
@@ -1348,9 +1347,9 @@ def test_nvfp4_quantize_setting_overrides_env(
         "distinguish the two precedence directions"
     )
 
-    # env ON + STANDARD -> standard output.
+    # env ON + explicit None -> standard output.
     set_nvfp4_quant_env(nvfp4_4over6_config=recipe)
-    out = _quantize_with_setting(x, NVFP4Recipe.STANDARD, sf_layout, backend, False)
+    out = _quantize_with_setting(x, None, sf_layout, backend, False)
     torch.testing.assert_close(out[0], standard_ref[0], rtol=0, atol=0)
     torch.testing.assert_close(out[1], standard_ref[1], rtol=0, atol=0)
 
@@ -1360,9 +1359,14 @@ def test_nvfp4_quantize_setting_overrides_env(
     torch.testing.assert_close(out[0], enabled_ref[0], rtol=0, atol=0)
     torch.testing.assert_close(out[1], enabled_ref[1], rtol=0, atol=0)
 
-    # FROM_ENV still follows the environment, unchanged.
+    # An omitted argument still follows the environment, unchanged.
     set_nvfp4_quant_env(nvfp4_4over6_config=recipe)
-    out = _quantize_with_setting(x, NVFP4Recipe.FROM_ENV, sf_layout, backend, False)
+    out = nvfp4_quantize(
+        x,
+        make_nvfp4_global_scale(x, False, nvfp4_4over6_config=canonical),
+        sfLayout=sf_layout,
+        backend=backend,
+    )
     torch.testing.assert_close(out[0], enabled_ref[0], rtol=0, atol=0)
 
 
@@ -1381,7 +1385,7 @@ def test_nvfp4_quantize_per_token_scale_recipe_mismatch_raises(
     them rescales the whole tensor by 448/256 with no error anywhere - the
     original bug.  The error names both scales so the fix is mechanical.
 
-    The identical mismatch under FROM_ENV must still run: that combination has
+    The identical mismatch with the argument omitted must still run: that combination has
     always been reachable (a caller hardcoding ``1/(448*6)`` while
     ``FLASHINFER_NVFP4_4OVER6_E4M3_USE_256=1``), and turning it into an
     exception would be a breaking change in a backwards-compatible PR.
@@ -1400,7 +1404,7 @@ def test_nvfp4_quantize_per_token_scale_recipe_mismatch_raises(
     # Deliberately built from the *other* recipe. A host float keeps the check
     # reachable on the CuTe-DSL path too, which never reads a device tensor.
     scale_448 = float(
-        make_nvfp4_global_scale(x, True, nvfp4_4over6=NVFP44Over6Config()).item()
+        make_nvfp4_global_scale(x, True, nvfp4_4over6_config=NVFP44Over6Config()).item()
     )
     scale_256 = 1.0 / (nvfp4_e4m3_max(recipe_256) * FLOAT4_E2M1_MAX)
 
@@ -1417,7 +1421,7 @@ def test_nvfp4_quantize_per_token_scale_recipe_mismatch_raises(
     assert repr(scale_448) in message, message
     assert repr(scale_256) in message, message
 
-    # Legacy behaviour: the same mismatch under FROM_ENV is not an error.
+    # Legacy behaviour: the same mismatch with the argument omitted is not an error.
     set_nvfp4_quant_env(nvfp4_4over6_config=recipe_256)
     q_out, _, per_token_scale = nvfp4_quantize(
         x,

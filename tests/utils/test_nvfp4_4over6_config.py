@@ -17,17 +17,18 @@ Pure-Python contract tests for the public NVFP4 4over6 setting.
 
 No GPU, no JIT, no kernel launch: this file exercises only
 ``flashinfer.quantization.nvfp4_quantization_utils``, so it runs in every CI
-lane and is the fast feedback loop for the three-state
-``nvfp4_4over6`` parameter introduced by issue #5141.
+lane and is the fast feedback loop for the ``nvfp4_4over6`` parameter
+introduced by issue #5141: type ``Optional[NVFP44Over6Config]``, with the
+*omitted* argument (a private ``_UNSET`` default) as the third case.
 
 What is pinned here:
 
-1. **Precedence.** ``FROM_ENV`` (and its ``None`` alias) reads the environment
-   on every call; ``STANDARD`` turns 4over6 off and ignores the environment;
-   an explicit ``NVFP44Over6Config`` is used verbatim with **no per-field
-   merge** against the environment.
+1. **Precedence.** An omitted argument reads the environment on every call
+   (and warns when the environment turns 4over6 on); ``None`` turns 4over6
+   off and ignores the environment; an explicit ``NVFP44Over6Config`` is used
+   verbatim with **no per-field merge** against the environment.
 2. **Serialization.** ``eval(repr(x)) == x``, and ``pickle`` / ``deepcopy``
-   preserve :class:`NVFP4Recipe` member identity — a framework-level
+   preserve the identity of the unset sentinel — a framework-level
    quantization config has to survive both.
 3. **The wire format.** The exact int64 packings that
    ``csrc/`` decodes; a silent change here miscompiles every 4over6 kernel.
@@ -47,6 +48,7 @@ hand-rolled save/restore blocks, and this file should model that.
 import copy
 import dataclasses
 import pickle
+import warnings
 
 import pytest
 import torch
@@ -56,14 +58,13 @@ from flashinfer.quantization.nvfp4_quantization_utils import (
     FLOAT8_E4M3_MAX,
     NVFP4_4OVER6_CODE_FROM_ENV,
     NVFP4_4OVER6_CODE_STANDARD,
+    _UNSET,
     NVFP44Over6Config,
     NVFP44Over6ErrMode,
-    NVFP4Recipe,
     make_nvfp4_global_scale,
     nvfp4_4over6_cache_key,
     nvfp4_4over6_code,
     nvfp4_4over6_from_code,
-    nvfp4_4over6_is_from_env,
     nvfp4_e4m3_max,
     resolve_nvfp4_4over6,
 )
@@ -137,32 +138,40 @@ ALL_RECIPES = [
 
 
 class TestResolveTruthTable:
-    """{env unset, env=1, env=1+MSE, env=1+256} x {FROM_ENV, None, STANDARD, config}."""
+    """{env unset, env=1, env=1+MSE, env=1+256} x {omitted, None, config}."""
 
     @pytest.mark.parametrize("env_id", sorted(ENV_STATES))
-    @pytest.mark.parametrize(
-        "setting",
-        [NVFP4Recipe.FROM_ENV, None],
-        ids=["from_env", "none_alias"],
-    )
-    def test_from_env_and_none_read_the_environment(self, monkeypatch, env_id, setting):
+    def test_omitted_argument_reads_the_environment(self, monkeypatch, env_id):
         env, expected = ENV_STATES[env_id]
         _apply_env(monkeypatch, env)
-        assert resolve_nvfp4_4over6(setting) == expected
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            assert resolve_nvfp4_4over6() == expected
 
     @pytest.mark.parametrize("env_id", sorted(ENV_STATES))
-    def test_default_argument_is_from_env(self, monkeypatch, env_id):
-        """Calling with no argument must behave exactly like ``FROM_ENV``."""
+    def test_environment_enabling_4over6_is_deprecated(self, monkeypatch, env_id):
+        """The env vars are a compatibility shim: warn only when they act."""
         env, expected = ENV_STATES[env_id]
         _apply_env(monkeypatch, env)
-        assert resolve_nvfp4_4over6() == expected
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            resolve_nvfp4_4over6()
+        deprecations = [w for w in caught if issubclass(w.category, DeprecationWarning)]
+        if expected is None:
+            assert not deprecations
+        else:
+            assert len(deprecations) == 1
+            assert repr(expected) in str(deprecations[0].message)
+            assert "nvfp4_4over6=" in str(deprecations[0].message)
 
     @pytest.mark.parametrize("env_id", sorted(ENV_STATES))
-    def test_standard_ignores_the_environment(self, monkeypatch, env_id):
-        """``FLASHINFER_NVFP4_4OVER6=1`` cannot turn STANDARD back on."""
+    def test_none_ignores_the_environment(self, monkeypatch, env_id):
+        """``FLASHINFER_NVFP4_4OVER6=1`` cannot turn an explicit ``None`` back on."""
         env, _ = ENV_STATES[env_id]
         _apply_env(monkeypatch, env)
-        assert resolve_nvfp4_4over6(NVFP4Recipe.STANDARD) is None
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", DeprecationWarning)
+            assert resolve_nvfp4_4over6(None) is None
 
     @pytest.mark.parametrize("env_id", sorted(ENV_STATES))
     @pytest.mark.parametrize("recipe", ALL_RECIPES, ids=repr)
@@ -203,29 +212,28 @@ class TestResolveTruthTable:
         assert resolve_nvfp4_4over6(NVFP44Over6Config()) == NVFP44Over6Config()
 
     def test_environment_is_read_on_every_call(self, monkeypatch):
-        """FROM_ENV must not latch: the docstring promises a per-call read."""
+        """An omitted argument must not latch: the docstring promises a per-call read."""
         _apply_env(monkeypatch, {})
-        assert resolve_nvfp4_4over6(NVFP4Recipe.FROM_ENV) is None
-        monkeypatch.setenv("FLASHINFER_NVFP4_4OVER6", "1")
-        assert resolve_nvfp4_4over6(NVFP4Recipe.FROM_ENV) == NVFP44Over6Config()
-        monkeypatch.delenv("FLASHINFER_NVFP4_4OVER6")
-        assert resolve_nvfp4_4over6(NVFP4Recipe.FROM_ENV) is None
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            assert resolve_nvfp4_4over6() is None
+            monkeypatch.setenv("FLASHINFER_NVFP4_4OVER6", "1")
+            assert resolve_nvfp4_4over6() == NVFP44Over6Config()
+            monkeypatch.delenv("FLASHINFER_NVFP4_4OVER6")
+            assert resolve_nvfp4_4over6() is None
 
     @pytest.mark.parametrize("value", ["0", "true", "TRUE", "yes", ""])
     def test_only_the_literal_1_enables_4over6(self, monkeypatch, value):
         """Legacy contract: ``env_flag_enabled`` compares against ``"1"``."""
         _apply_env(monkeypatch, {"FLASHINFER_NVFP4_4OVER6": value})
-        assert resolve_nvfp4_4over6(NVFP4Recipe.FROM_ENV) is None
+        assert resolve_nvfp4_4over6() is None
 
-    @pytest.mark.parametrize("setting", [None, NVFP4Recipe.FROM_ENV])
-    def test_is_from_env_true(self, setting):
-        assert nvfp4_4over6_is_from_env(setting)
-
-    @pytest.mark.parametrize(
-        "setting", [NVFP4Recipe.STANDARD, NVFP44Over6Config(), PINNED_RECIPE]
-    )
-    def test_is_from_env_false(self, setting):
-        assert not nvfp4_4over6_is_from_env(setting)
+    def test_unset_sentinel_is_the_default_and_private(self):
+        """The default is a sentinel, not a public type: callers omit the
+        argument rather than spelling it, and its repr names the env vars."""
+        assert resolve_nvfp4_4over6.__defaults__ == (_UNSET,)
+        assert "FLASHINFER_NVFP4_4OVER6" in repr(_UNSET)
+        assert _UNSET is not None and not isinstance(_UNSET, NVFP44Over6Config)
 
     @pytest.mark.parametrize("bogus", ["auto", 3, 0, 1.5, True, ["MAE"], object()])
     def test_bogus_setting_raises_type_error(self, bogus):
@@ -279,7 +287,6 @@ class TestConfigValidation:
 _EVAL_NAMESPACE = {
     "NVFP44Over6Config": NVFP44Over6Config,
     "NVFP44Over6ErrMode": NVFP44Over6ErrMode,
-    "NVFP4Recipe": NVFP4Recipe,
 }
 
 
@@ -309,11 +316,6 @@ class TestReprRoundTrip:
             "err_mode=NVFP44Over6ErrMode.MSE, err_use_fast_math=True)"
         )
 
-    @pytest.mark.parametrize("member", list(NVFP4Recipe), ids=lambda m: m.name)
-    def test_recipe_round_trip(self, member):
-        assert repr(member) == f"NVFP4Recipe.{member.name}"
-        assert _eval_repr(member) is member
-
     @pytest.mark.parametrize("member", list(NVFP44Over6ErrMode), ids=lambda m: m.name)
     def test_err_mode_round_trip(self, member):
         assert repr(member) == f"NVFP44Over6ErrMode.{member.name}"
@@ -321,27 +323,28 @@ class TestReprRoundTrip:
 
 
 class TestPickleAndDeepcopy:
-    """Enum members must stay singletons: ``is`` comparisons are load-bearing.
+    """The unset sentinel must stay a singleton: ``is _UNSET`` is load-bearing.
 
-    ``resolve_nvfp4_4over6`` dispatches with ``is NVFP4Recipe.STANDARD``, so a
-    recipe that came back from ``pickle`` (a torch DataLoader worker, a cached
-    framework config) as a mere equal-but-distinct object would silently
-    resolve as an unknown setting and raise ``TypeError``.
+    ``resolve_nvfp4_4over6`` dispatches with ``is _UNSET``, so a config that
+    came back from ``pickle`` (a torch DataLoader worker, a cached framework
+    config) or ``deepcopy`` with a mere equal-but-distinct sentinel would
+    silently resolve as an unknown setting and raise ``TypeError``.
     """
 
-    @pytest.mark.parametrize("member", list(NVFP4Recipe), ids=lambda m: m.name)
-    def test_pickle_preserves_identity(self, member):
-        assert pickle.loads(pickle.dumps(member)) is member
+    def test_pickle_preserves_identity(self):
+        assert pickle.loads(pickle.dumps(_UNSET)) is _UNSET
 
-    @pytest.mark.parametrize("member", list(NVFP4Recipe), ids=lambda m: m.name)
-    def test_deepcopy_preserves_identity(self, member):
-        assert copy.deepcopy(member) is member
+    def test_deepcopy_preserves_identity(self):
+        assert copy.deepcopy(_UNSET) is _UNSET
+        assert copy.copy(_UNSET) is _UNSET
 
-    @pytest.mark.parametrize("member", list(NVFP4Recipe), ids=lambda m: m.name)
-    def test_round_tripped_member_still_resolves(self, monkeypatch, member):
+    def test_round_tripped_sentinel_still_resolves(self, monkeypatch):
         _apply_env(monkeypatch, {})
-        revived = pickle.loads(pickle.dumps(member))
+        revived = pickle.loads(pickle.dumps(_UNSET))
         assert resolve_nvfp4_4over6(revived) is None
+
+    def test_constructor_returns_the_singleton(self):
+        assert type(_UNSET)() is _UNSET
 
     @pytest.mark.parametrize("member", list(NVFP44Over6ErrMode), ids=lambda m: m.name)
     def test_err_mode_pickle_preserves_identity(self, member):
@@ -352,14 +355,6 @@ class TestPickleAndDeepcopy:
         assert pickle.loads(pickle.dumps(recipe)) == recipe
         assert copy.deepcopy(recipe) == recipe
         assert hash(copy.deepcopy(recipe)) == hash(recipe)
-
-    def test_recipe_value_is_a_json_token(self):
-        """``.value`` is documented as JSON-serializable without an encoder."""
-        import json
-
-        for member in NVFP4Recipe:
-            assert json.loads(json.dumps(member.value)) == member.value
-            assert NVFP4Recipe(member.value) is member
 
 
 # ---------------------------------------------------------------------------
@@ -410,14 +405,12 @@ class TestWireFormat:
     def test_round_trip(self, recipe):
         assert nvfp4_4over6_from_code(nvfp4_4over6_code(recipe)) == recipe
 
-    def test_round_trip_standard(self):
-        assert nvfp4_4over6_from_code(nvfp4_4over6_code(None)) is NVFP4Recipe.STANDARD
+    def test_round_trip_off(self):
+        assert nvfp4_4over6_from_code(nvfp4_4over6_code(None)) is None
 
-    def test_from_env_code_decodes_to_from_env(self):
-        assert nvfp4_4over6_from_code(-1) is NVFP4Recipe.FROM_ENV
-        assert (
-            nvfp4_4over6_from_code(NVFP4_4OVER6_CODE_FROM_ENV) is NVFP4Recipe.FROM_ENV
-        )
+    def test_from_env_code_decodes_to_unset(self):
+        assert nvfp4_4over6_from_code(-1) is _UNSET
+        assert nvfp4_4over6_from_code(NVFP4_4OVER6_CODE_FROM_ENV) is _UNSET
 
     def test_codes_are_unique_across_all_recipes(self):
         codes = {nvfp4_4over6_code(r) for r in ALL_RECIPES}
@@ -428,11 +421,11 @@ class TestWireFormat:
     def test_code_rejects_an_unresolved_setting(self):
         """``nvfp4_4over6_code`` is typed on the *resolved* two-state value.
 
-        Handing it ``NVFP4Recipe.FROM_ENV`` is the bug the type signature
-        exists to prevent; it must not quietly return a valid-looking code.
+        Handing it the unset sentinel is the bug the type signature exists to
+        prevent; it must not quietly return a valid-looking code.
         """
         with pytest.raises(AttributeError):
-            nvfp4_4over6_code(NVFP4Recipe.FROM_ENV)
+            nvfp4_4over6_code(_UNSET)
 
 
 # ---------------------------------------------------------------------------
@@ -550,10 +543,10 @@ def test_resolve_returns_a_plain_config_unchanged():
 class TestScaleHelpers:
     """``nvfp4_e4m3_max`` / ``make_nvfp4_global_scale``.
 
-    These two default to ``NVFP4Recipe.STANDARD`` rather than ``FROM_ENV``:
-    their pre-existing contract is that ``nvfp4_4over6_config=None`` means
-    "no 4over6", and promoting that to an environment read would rescale every
-    existing caller's tensor.
+    These take the **resolved** recipe (``nvfp4_4over6_config=``) and default
+    to ``None``, never reading the environment: their pre-existing contract is
+    that no recipe means the 448 clamp, and promoting that to an environment
+    read would rescale every existing caller's tensor.
     """
 
     def test_default_is_full_e4m3_range(self, monkeypatch):
@@ -566,48 +559,20 @@ class TestScaleHelpers:
     def test_resolved_config_selects_the_clamp(self, e4m3_max):
         cfg = NVFP44Over6Config(e4m3_max=e4m3_max)
         assert nvfp4_e4m3_max(cfg) == float(e4m3_max)
-        assert nvfp4_e4m3_max(nvfp4_4over6=cfg) == float(e4m3_max)
+        assert nvfp4_e4m3_max(nvfp4_4over6_config=cfg) == float(e4m3_max)
 
-    @pytest.mark.parametrize("env_id", sorted(ENV_STATES))
-    def test_three_state_from_env(self, monkeypatch, env_id):
-        env, expected = ENV_STATES[env_id]
-        _apply_env(monkeypatch, env)
-        want = 448.0 if expected is None else float(expected.e4m3_max)
-        assert nvfp4_e4m3_max(nvfp4_4over6=NVFP4Recipe.FROM_ENV) == want
-
-    @pytest.mark.parametrize("env_id", sorted(ENV_STATES))
-    def test_three_state_standard_ignores_environment(self, monkeypatch, env_id):
-        env, _ = ENV_STATES[env_id]
-        _apply_env(monkeypatch, env)
-        assert nvfp4_e4m3_max(nvfp4_4over6=NVFP4Recipe.STANDARD) == 448.0
-
-    @pytest.mark.parametrize(
-        "setting",
-        [NVFP4Recipe.FROM_ENV, None, NVFP44Over6Config(), PINNED_RECIPE],
-        ids=repr,
-    )
-    def test_e4m3_max_rejects_both_spellings(self, setting):
-        with pytest.raises(ValueError, match="not both"):
-            nvfp4_e4m3_max(NVFP44Over6Config(), nvfp4_4over6=setting)
-
-    @pytest.mark.parametrize(
-        "setting",
-        [NVFP4Recipe.FROM_ENV, None, NVFP44Over6Config(), PINNED_RECIPE],
-        ids=repr,
-    )
-    def test_global_scale_rejects_both_spellings(self, setting):
+    def test_no_three_state_spelling_on_scale_helpers(self):
+        """One recipe type everywhere: the helpers take ``nvfp4_4over6_config``
+        only, so there is no second keyword to disagree with it."""
         x = torch.zeros(4, 16, dtype=torch.float32)
-        with pytest.raises(ValueError, match="not both"):
-            make_nvfp4_global_scale(
-                x,
-                True,
-                nvfp4_4over6_config=NVFP44Over6Config(),
-                nvfp4_4over6=setting,
-            )
+        unresolved_keyword = {"nvfp4_4over6": NVFP44Over6Config()}
+        with pytest.raises(TypeError):
+            nvfp4_e4m3_max(**unresolved_keyword)
+        with pytest.raises(TypeError):
+            make_nvfp4_global_scale(x, True, **unresolved_keyword)
 
     @pytest.mark.parametrize("e4m3_max", [448, 256])
-    @pytest.mark.parametrize("spelling", ["legacy", "three_state"])
-    def test_per_token_scale_inverts_e4m3_max_times_six(self, e4m3_max, spelling):
+    def test_per_token_scale_inverts_e4m3_max_times_six(self, e4m3_max):
         """The invariant the kernel relies on: ``e4m3_max * 6 * scale == 1``.
 
         ``1 / (e4m3_max * 6)`` is not exactly representable in fp32 for either
@@ -617,10 +582,7 @@ class TestScaleHelpers:
         """
         cfg = NVFP44Over6Config(e4m3_max=e4m3_max)
         x = torch.zeros(4, 16, dtype=torch.float32)
-        if spelling == "legacy":
-            scale = make_nvfp4_global_scale(x, True, nvfp4_4over6_config=cfg)
-        else:
-            scale = make_nvfp4_global_scale(x, True, nvfp4_4over6=cfg)
+        scale = make_nvfp4_global_scale(x, True, nvfp4_4over6_config=cfg)
 
         assert scale.shape == (1,)
         assert scale.dtype == torch.float32
@@ -632,7 +594,7 @@ class TestScaleHelpers:
         """Legacy default (no recipe) is the 448 scale, unchanged."""
         x = torch.zeros(4, 16, dtype=torch.float32)
         default = make_nvfp4_global_scale(x, True)
-        standard = make_nvfp4_global_scale(x, True, nvfp4_4over6=NVFP4Recipe.STANDARD)
+        standard = make_nvfp4_global_scale(x, True, nvfp4_4over6_config=None)
         assert float(default.item()) == float(standard.item())
         assert float(default.item()) == pytest.approx(
             1.0 / (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX), rel=1e-6
@@ -641,9 +603,9 @@ class TestScaleHelpers:
     def test_per_token_scale_differs_between_clamps(self):
         """Guards the whole point: the two clamps must not collapse."""
         x = torch.zeros(4, 16, dtype=torch.float32)
-        s448 = make_nvfp4_global_scale(x, True, nvfp4_4over6=NVFP44Over6Config())
+        s448 = make_nvfp4_global_scale(x, True, nvfp4_4over6_config=NVFP44Over6Config())
         s256 = make_nvfp4_global_scale(
-            x, True, nvfp4_4over6=NVFP44Over6Config(e4m3_max=256)
+            x, True, nvfp4_4over6_config=NVFP44Over6Config(e4m3_max=256)
         )
         assert float(s448.item()) != float(s256.item())
 
@@ -651,14 +613,16 @@ class TestScaleHelpers:
     def test_per_tensor_amax_scale_uses_the_clamp(self, e4m3_max):
         cfg = NVFP44Over6Config(e4m3_max=e4m3_max)
         x = torch.full((4, 16), 2.0, dtype=torch.float32)
-        scale = make_nvfp4_global_scale(x, False, nvfp4_4over6=cfg)
+        scale = make_nvfp4_global_scale(x, False, nvfp4_4over6_config=cfg)
         expected = e4m3_max * FLOAT4_E2M1_MAX / 2.0
         assert float(scale.item()) == pytest.approx(expected, rel=1e-6)
 
     def test_per_tensor_all_zero_input_saturates(self):
         """Pre-existing edge case; the new parameter must not disturb it."""
         x = torch.zeros(4, 16, dtype=torch.float32)
-        scale = make_nvfp4_global_scale(x, False, nvfp4_4over6=NVFP44Over6Config())
+        scale = make_nvfp4_global_scale(
+            x, False, nvfp4_4over6_config=NVFP44Over6Config()
+        )
         assert float(scale.item()) == torch.finfo(torch.float32).max
 
     @pytest.mark.parametrize("e4m3_max", [448, 256])
@@ -669,6 +633,6 @@ class TestScaleHelpers:
             x,
             False,
             global_scale=0.125,
-            nvfp4_4over6=NVFP44Over6Config(e4m3_max=e4m3_max),
+            nvfp4_4over6_config=NVFP44Over6Config(e4m3_max=e4m3_max),
         )
         assert float(scale.item()) == 0.125

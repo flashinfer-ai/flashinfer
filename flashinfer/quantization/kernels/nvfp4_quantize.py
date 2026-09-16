@@ -32,7 +32,7 @@ Key differences from MXFP4:
 
 import functools
 import os
-from typing import Callable, Tuple, Union, cast
+from typing import Callable, Optional, Tuple, Union, cast
 
 import cutlass
 import cutlass.cute as cute
@@ -57,9 +57,8 @@ from ...cute_dsl.fp4_common import (
 )
 from ...cute_dsl.utils import get_num_sm
 from ..nvfp4_quantization_utils import (
+    _UNSET,
     NVFP44Over6Config,
-    NVFP44Over6Setting,
-    NVFP4Recipe,
     nvfp4_4over6_fp8_input_error,
     resolve_nvfp4_4over6,
     env_flag_enabled as _env_flag_enabled,
@@ -2272,7 +2271,7 @@ def nvfp4_quantize_cute_dsl(
     sf_layout: int = SF_LAYOUT_128x4,
     enable_pdl: bool | None = None,
     # Appended last so existing positional construction keeps working.
-    nvfp4_4over6: NVFP44Over6Setting = NVFP4Recipe.FROM_ENV,
+    nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Quantize input tensor to NVFP4 format using the CuTe-DSL kernel.
 
@@ -2300,13 +2299,12 @@ def nvfp4_quantize_cute_dsl(
     enable_pdl : bool, optional
         Whether to enable Programmatic Dependent Launch.  Auto-detected
         from device capability (SM >= 9.0) when ``None``.
-    nvfp4_4over6 : NVFP4Recipe, NVFP44Over6Config or None
-        NVFP4 "4over6" scale-candidate search.  ``NVFP4Recipe.FROM_ENV``
-        (the default; ``None`` is an alias) derives the recipe from the
-        legacy ``FLASHINFER_NVFP4_4OVER6*`` environment variables;
-        ``NVFP4Recipe.STANDARD`` turns 4over6 off with the environment
-        ignored; an :class:`NVFP44Over6Config` turns it on with exactly
-        that recipe, environment ignored.  Requires fp16/bf16 input.
+    nvfp4_4over6 : NVFP44Over6Config or None
+        NVFP4 "4over6" scale-candidate search.  Omitted (the default): the
+        recipe comes from the legacy ``FLASHINFER_NVFP4_4OVER6*`` environment
+        variables.  ``None``: 4over6 off, environment ignored.  An
+        :class:`NVFP44Over6Config`: on with exactly that recipe, environment
+        ignored.  Requires fp16/bf16 input.
 
     Returns
     -------
@@ -2387,8 +2385,8 @@ def nvfp4_quantize_cute_dsl(
     nvfp4_4over6_config = resolve_nvfp4_4over6(nvfp4_4over6)
     if nvfp4_4over6_config is not None and input.dtype == torch.float8_e4m3fn:
         # ``nvfp4_4over6`` is still the caller's unresolved value here, so the
-        # error can name the source.  FlashInfer's own callers forward FROM_ENV
-        # as FROM_ENV rather than as its resolved recipe to keep that true --
+        # error can name the source.  FlashInfer's own callers forward an
+        # omitted argument as omitted rather than as its resolved recipe --
         # see _forward_nvfp4_4over6 in ../fp4_quantization.py.
         raise nvfp4_4over6_fp8_input_error(nvfp4_4over6, input.dtype)
     is_sm107 = get_compute_capability(input.device) == (10, 7)
@@ -2594,7 +2592,7 @@ def nvfp4_quantize_smooth_cute_dsl(
     global_scale: torch.Tensor,
     enable_pdl: bool | None = None,
     # Appended last so existing positional construction keeps working.
-    nvfp4_4over6: NVFP44Over6Setting = NVFP4Recipe.FROM_ENV,
+    nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Fuse BF16 channel smoothing into the 128x4 NVFP4 quantizer.
 
@@ -2671,7 +2669,7 @@ def silu_and_mul_nvfp4_quantize_cute_dsl(
     sf_layout: int = SF_LAYOUT_128x4,
     enable_pdl: bool | None = None,
     # Appended last so existing positional construction keeps working.
-    nvfp4_4over6: NVFP44Over6Setting = NVFP4Recipe.FROM_ENV,
+    nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Apply SwiGLU and NVFP4 quantization using CuTe-DSL.
 
@@ -2688,13 +2686,12 @@ def silu_and_mul_nvfp4_quantize_cute_dsl(
         Scale layout: 0 for 128x4, 1 for 8x4, or 2 for linear.
     enable_pdl : bool, optional
         Enable Programmatic Dependent Launch. Auto-detected when None.
-    nvfp4_4over6 : NVFP4Recipe, NVFP44Over6Config or None
-        NVFP4 "4over6" scale-candidate search.  ``NVFP4Recipe.FROM_ENV``
-        (the default; ``None`` is an alias) derives the recipe from the
-        legacy ``FLASHINFER_NVFP4_4OVER6*`` environment variables;
-        ``NVFP4Recipe.STANDARD`` turns 4over6 off with the environment
-        ignored; an :class:`NVFP44Over6Config` turns it on with exactly
-        that recipe, environment ignored.  Requires fp16/bf16 input.
+    nvfp4_4over6 : NVFP44Over6Config or None
+        NVFP4 "4over6" scale-candidate search.  Omitted (the default): the
+        recipe comes from the legacy ``FLASHINFER_NVFP4_4OVER6*`` environment
+        variables.  ``None``: 4over6 off, environment ignored.  An
+        :class:`NVFP44Over6Config`: on with exactly that recipe, environment
+        ignored.  Requires fp16/bf16 input.
 
     Returns
     -------
@@ -2853,7 +2850,7 @@ def nvfp4_quantize_per_token_cute_dsl(
     sf_layout: int = SF_LAYOUT_128x4,
     enable_pdl: bool | None = None,
     # Appended last so existing positional construction keeps working.
-    nvfp4_4over6: NVFP44Over6Setting = NVFP4Recipe.FROM_ENV,
+    nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     r"""Per-token NVFP4 activation quantization using the CuTe-DSL kernel.
 
@@ -2886,13 +2883,12 @@ def nvfp4_quantize_per_token_cute_dsl(
         Whether to enable Programmatic Dependent Launch. Auto-detected from
         device capability (SM >= 9.0) when ``None``; pass ``False`` to force it
         off.
-    nvfp4_4over6 : NVFP4Recipe, NVFP44Over6Config or None
-        NVFP4 "4over6" scale-candidate search.  ``NVFP4Recipe.FROM_ENV``
-        (the default; ``None`` is an alias) derives the recipe from the
-        legacy ``FLASHINFER_NVFP4_4OVER6*`` environment variables;
-        ``NVFP4Recipe.STANDARD`` turns 4over6 off with the environment
-        ignored; an :class:`NVFP44Over6Config` turns it on with exactly
-        that recipe, environment ignored.  Requires fp16/bf16 input.
+    nvfp4_4over6 : NVFP44Over6Config or None
+        NVFP4 "4over6" scale-candidate search.  Omitted (the default): the
+        recipe comes from the legacy ``FLASHINFER_NVFP4_4OVER6*`` environment
+        variables.  ``None``: 4over6 off, environment ignored.  An
+        :class:`NVFP44Over6Config`: on with exactly that recipe, environment
+        ignored.  Requires fp16/bf16 input.
 
     Returns
     -------
