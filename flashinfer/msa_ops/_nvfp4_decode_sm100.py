@@ -69,10 +69,6 @@ written down -- :func:`msa_decode_nvfp4_specialized_stats` reports
 ``batch_spans_at_geometry`` by executing that arithmetic, so a change to the
 thresholds moves the reported spans with it.
 
-``FLASHINFER_MSA_DECODE_NVFP4_ROUTE`` overrides the choice for A/B measurement
-and for tests -- ``auto`` (default), ``pingpong``, or ``specialised`` (which
-RAISES rather than falling back, so a test can prove the guard).
-
 THE WIN IS A CAPTURED-GRAPH WIN
 -------------------------------
 
@@ -112,7 +108,6 @@ from __future__ import annotations
 
 import functools
 import json
-import os
 import sys
 from importlib import resources
 from pathlib import Path
@@ -135,11 +130,6 @@ _WORKLOAD_FIELDS = (
     "head_dim",
     "page_size",
 )
-# Route override. Read at call time, never at import, so one process can
-# measure both implementations on the same tensors.
-_ROUTE_ENV = "FLASHINFER_MSA_DECODE_NVFP4_ROUTE"
-_ROUTE_CHOICES = ("auto", "pingpong", "specialised")
-
 _HEAD_DIM = 128
 _PAGE_SIZE = 128
 # The SINGLE-RANK (tensor-parallel size 1) head geometry. It is what the pinned
@@ -661,15 +651,6 @@ def check_specialized(device: torch.device) -> Optional[str]:
 # ---------------------------------------------------------------------------
 # the second implementation, and the predicate that selects it
 # ---------------------------------------------------------------------------
-def _route_choice() -> str:
-    """``auto`` unless overridden. Read at call time, never at import."""
-
-    value = (os.environ.get(_ROUTE_ENV) or "auto").strip().lower()
-    if value not in _ROUTE_CHOICES:
-        raise ValueError(f"{_ROUTE_ENV}={value!r} is not one of {list(_ROUTE_CHOICES)}")
-    return value
-
-
 @functools.cache
 def _specialised_module():
     """Import the CuTe-DSL implementation, or ``None`` if it is unavailable.
@@ -958,11 +939,9 @@ def warm(device: torch.device | str) -> None:
     device = _normalize_cuda_device(device)
     if (device.type, device.index) in _warmed_devices:
         # The route is warm; the optional half may not be, because it is warmed
-        # after the route and may have been skipped by an override that has
-        # since changed. Idempotent and latched, so this is a set lookup once
+        # after the route. Idempotent and latched, so this is a set lookup once
         # it has settled either way.
-        if _route_choice() != "pingpong":
-            _specialised_warm(device)
+        _specialised_warm(device)
         return
     target = _target_for(device)
     if target is None:
@@ -1025,8 +1004,7 @@ def warm(device: torch.device | str) -> None:
     # After the route itself is warm, because this one is optional: if it
     # cannot be warmed the route still works, and `_warmed_devices` must
     # already say so or capture would be refused for the wrong reason.
-    if _route_choice() != "pingpong":
-        _specialised_warm(device)
+    _specialised_warm(device)
 
 
 # ---------------------------------------------------------------------------
@@ -1490,28 +1468,18 @@ def run(
     # ---- internal route selection -----------------------------------------
     # Not a capability decision. Both implementations compute the same
     # function over everything check_surface admitted; this picks the faster
-    # one for the call at hand.
-    choice = _route_choice()
-    if choice == "pingpong":
-        reason = f"{_ROUTE_ENV}=pingpong"
-    else:
-        reason = specialised_route_reason(
-            q=q,
-            k=k,
-            q2k_indices=q2k_indices,
-            seqlen_q=seqlen_q,
-            causal=causal,
-            softmax_scale=softmax_scale,
-            k_global_scale=k_global_scale,
-        )
-    if reason is not None and choice == "specialised":
-        # Forced, and it cannot serve this call. RAISE: the point of this
-        # setting is to make the guard provable, so it must not silently do
-        # the other thing.
-        raise RuntimeError(
-            f"{_ROUTE_ENV}=specialised but the specialised NVFP4 MSA decode "
-            f"implementation cannot serve this call: {reason}"
-        )
+    # one for the call at hand, from the call's shape alone. There is no
+    # override: the choice is a heuristic the route owns, and a consumer that
+    # wants to know what it will pick asks ``msa_decode_nvfp4_specialized_stats``.
+    reason = specialised_route_reason(
+        q=q,
+        k=k,
+        q2k_indices=q2k_indices,
+        seqlen_q=seqlen_q,
+        causal=causal,
+        softmax_scale=softmax_scale,
+        k_global_scale=k_global_scale,
+    )
     if reason is None:
         _dispatch_specialised(
             q=q,
@@ -1570,8 +1538,6 @@ def _specialised_route_stats() -> Dict[str, Any]:
     stats: Dict[str, Any] = {
         "available": module is not None,
         "import_error": _specialised_import_error,
-        "override_env": _ROUTE_ENV,
-        "override_choices": list(_ROUTE_CHOICES),
         "dispatch_count": _specialised_dispatch_count,
         "declines": dict(sorted(_specialised_decline_counts.items())),
         "warmed_devices": sorted(str(entry) for entry in _specialised_warm_devices),
@@ -1582,16 +1548,6 @@ def _specialised_route_stats() -> Dict[str, Any]:
             "this route accepts"
         ),
     }
-    # A misspelled override is a hard error where it changes what runs, and a
-    # REPORTED one here. This function is a consumer's capability probe --
-    # vLLM's `has_flashinfer_msa_nvfp4_kv()` requires it to be callable and
-    # takes its answer -- so a typo in an environment variable must not turn a
-    # capability question into a startup crash.
-    try:
-        stats["override"] = _route_choice()
-    except ValueError as exc:
-        stats["override"] = os.environ.get(_ROUTE_ENV)
-        stats["override_error"] = str(exc)
     if module is None:
         return stats
     # Enumerated from the implementation's own plan(), not tabulated: the

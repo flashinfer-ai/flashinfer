@@ -32,17 +32,20 @@ kernel bodies, chosen inside the route:
 * ``PINNED`` -- the ``geom::pinned`` family of the same translation unit. Rare:
   under the production route it needs the CuTe-DSL body to decline AND the
   pinned envelope to admit, which across this suite happens only at
-  ``causal = 0`` coordinates, plus the route override and the
+  ``causal = 0`` coordinates, plus a forced decline in a test and the
   warm-failure path.
 
 THIS FILE HAS NO AMBIENT ROUTE DEFAULT, AND THAT IS THE POINT
 -------------------------------------------------------------
-A module-level default for the route override would make every sweep in this
-file test whichever kernel that default selects, while reading as though it
-tested the route. So the backend is a PARAMETER, not an ambient default:
+The route has no switch: it picks a body from the call's shape, and nothing
+outside it can change that. A module-level default that forced one body would
+make every sweep in this file test whichever kernel that default selects,
+while reading as though it tested the route. So the backend is a PARAMETER,
+not an ambient default:
 
-* the autouse fixture now CLEARS the override, so the ambient state of every
-  test is the production route;
+* the ambient state of every test is the production route; a test that needs
+  the C++ translation unit forces the CuTe-DSL body to decline through a
+  monkeypatch of one module function, inside ``expect_backend`` only;
 * every device test that dispatches names its body -- ``_call_on(CUTE, ...)``,
   ``_call_on(PINNED, ...)``, ``_call_on(PARAMETRIC, ...)``, or a
   ``@pytest.mark.parametrize("backend", ...)`` that puts the name in the test
@@ -409,12 +412,16 @@ _BACKEND_COUNTER = {
     PARAMETRIC: ("general_dispatch_count",),
 }
 
-# The route override that makes each body REACHABLE. It does not make it
-# SELECTED -- the call's own geometry does that, which is exactly why every
-# call below is checked against the counters afterwards. `auto` is the
-# production route and is what the CuTe-DSL body needs; `pingpong` forces the
-# C++ translation unit, and the pinned predicate then picks the family.
+# What a test does to REACH each body. It does not make the body SELECTED --
+# the call's own geometry does that, which is exactly why every call below is
+# checked against the counters afterwards. `auto` is the production route
+# untouched, which is what the CuTe-DSL body needs; `pingpong` forces the C++
+# translation unit by making the CuTe-DSL body decline the call, and the
+# pinned predicate then picks the family. This is a test seam -- a monkeypatch
+# of one module function -- not a setting the route exposes; the route has no
+# override.
 _BACKEND_ROUTE = {CUTE: "auto", PINNED: "pingpong", PARAMETRIC: "pingpong"}
+_FORCED_DECLINE = "the test forced this call to the C++ translation unit"
 
 
 def _nested(payload, path):
@@ -441,9 +448,10 @@ def expect_backend(backend, monkeypatch, *, route=None, calls=1, device=None):
     counters are read across the block and a mismatch is an error, not a
     detail.
 
-    ``route`` defaults to the override that makes ``backend`` reachable; a test
-    that wants to prove the PRODUCTION route reaches a body passes
-    ``route="auto"`` explicitly and still gets the assertion.
+    ``route`` defaults to what makes ``backend`` reachable (see
+    ``_BACKEND_ROUTE``); a test that wants to prove the PRODUCTION route
+    reaches a body passes ``route="auto"`` explicitly and still gets the
+    assertion.
 
     ``device`` is warmed first when given. ``warm()`` launches BOTH C++
     families for itself and the decode hook calls it on every eager dispatch,
@@ -454,7 +462,11 @@ def expect_backend(backend, monkeypatch, *, route=None, calls=1, device=None):
 
     assert backend in BACKENDS, f"{backend!r} is not one of {list(BACKENDS)}"
     choice = _BACKEND_ROUTE[backend] if route is None else route
-    monkeypatch.setenv(nvfp4._ROUTE_ENV, choice)
+    assert choice in ("auto", "pingpong"), choice
+    if choice == "pingpong":
+        monkeypatch.setattr(
+            nvfp4, "specialised_route_reason", lambda **_kwargs: _FORCED_DECLINE
+        )
     if device is not None:
         nvfp4.warm(device)
     before = _counters()
@@ -468,7 +480,7 @@ def expect_backend(backend, monkeypatch, *, route=None, calls=1, device=None):
             if moved
             else "nothing dispatched at all"
         )
-        + f" ({nvfp4._ROUTE_ENV}={choice!r}). A test that silently runs on a "
+        + f" (route={choice!r}). A test that silently runs on a "
         f"kernel it did not ask for is vacuous however green it looks, so "
         f"this is a failure."
     )
@@ -623,18 +635,6 @@ def impl():
             f"{nvfp4._specialised_import_error}"
         )
     return module
-
-
-@pytest.fixture(autouse=True)
-def _no_ambient_route(monkeypatch):
-    """NO DEFAULT. Every dispatching test says which body it wants.
-
-    This replaces a module-level ``autouse`` pin to ``pingpong``. The ambient
-    state of a test is now the PRODUCTION route, and a test that cares reaches
-    a body through ``_call_on``, which asserts it got the one it asked for.
-    """
-
-    monkeypatch.delenv(nvfp4._ROUTE_ENV, raising=False)
 
 
 def test_allowlist_and_stats_agree_with_the_module_constants():
@@ -1270,7 +1270,7 @@ def test_a_tensor_parallel_rank_takes_the_parametric_family(
 
     It used to be weaker in two ways, both because of the module-level pin:
     the tp 1 arm could only say "cute OR pinned" (the pin made the answer a
-    property of the process), and the whole test ran with the override set.
+    property of the process), and the whole test ran with the C++ body forced.
     """
     inputs = _build_inputs(
         8,
@@ -1871,7 +1871,7 @@ def test_the_deployment_shape_actually_takes_the_pinned_family(monkeypatch):
     """The counter is the instrument that catches a pin that stopped matching.
 
     Inside the C++ translation unit, which is where the pinned family lives --
-    so the override is set deliberately and named. Under the production route
+    so the C++ body is forced deliberately and named. Under the production route
     this shape is served by the CuTe-DSL body instead, which is what
     ``test_a_tensor_parallel_rank_takes_the_parametric_family[tp1]`` asserts;
     the two facts are separate and neither is the other's default.
@@ -2256,15 +2256,6 @@ def test_an_unwarmed_device_routes_away_rather_than_compiling(impl, monkeypatch)
     assert "not warmed" in nvfp4.specialised_route_reason(**kwargs)
 
 
-def test_the_override_is_validated(monkeypatch):
-    monkeypatch.setenv(nvfp4._ROUTE_ENV, "nonsense")
-    with pytest.raises(ValueError, match=nvfp4._ROUTE_ENV):
-        nvfp4._route_choice()
-    for value in ("auto", "pingpong", "specialised", "AUTO", " pingpong "):
-        monkeypatch.setenv(nvfp4._ROUTE_ENV, value)
-        assert nvfp4._route_choice() == value.strip().lower()
-
-
 def test_stats_report_what_the_route_holds_and_refuses(impl):
     stats = nvfp4.msa_decode_nvfp4_specialized_stats()["specialised_route"]
     assert stats["available"] is True
@@ -2355,9 +2346,14 @@ def test_the_two_implementations_agree_with_each_other(batch, cpp, monkeypatch, 
 
 
 @sm100_only
-def test_forcing_the_specialised_route_off_its_surface_raises(monkeypatch, impl):
-    """The guard is provable: forced onto a shape it cannot serve, the route
-    reports it rather than quietly doing the other thing."""
+def test_a_shape_off_the_specialised_surface_is_declined_visibly(monkeypatch, impl):
+    """The heuristic is silent to the caller and legible to the operator.
+
+    Off its geometry the CuTe-DSL body declines, the C++ translation unit serves
+    the call, and the decline is recorded with its reason -- so "which kernel
+    ran and why" is answerable from ``msa_decode_nvfp4_specialized_stats``
+    without any switch to flip.
+    """
 
     # Every BATCH is now inside the surface, so the shape that proves the
     # guard has to leave the GEOMETRY instead: a top-k of 8 is not the
@@ -2366,12 +2362,27 @@ def test_forcing_the_specialised_route_off_its_surface_raises(monkeypatch, impl)
     inputs = _build_inputs(1, [8192], torch.device("cuda"))
     inputs = dict(inputs, q2k_indices=inputs["q2k_indices"][..., :8].contiguous())
     assert impl.plan(total_q=1, **dict(_GEOMETRY, topk=8))["specialised"] is False
-    monkeypatch.setenv(nvfp4._ROUTE_ENV, "specialised")
-    before = _counters()
-    with pytest.raises(RuntimeError, match="cannot serve this call"):
-        _call(inputs)
-    # ...and it really did not serve it on something else instead.
-    assert _counters() == before
+    reason = nvfp4.specialised_route_reason(
+        q=inputs["q"],
+        k=inputs["k"],
+        q2k_indices=inputs["q2k_indices"],
+        seqlen_q=1,
+        causal=True,
+        softmax_scale=inputs["softmax_scale"],
+        k_global_scale=inputs["k_global_scale"],
+    )
+    assert reason is not None and "8" in reason, reason
+    declines_before = dict(
+        nvfp4.msa_decode_nvfp4_specialized_stats()["specialised_route"]["declines"]
+    )
+    # Not forced anywhere: this is the production route landing where the
+    # heuristic sends it, and the counters saying so.
+    _call_on(PARAMETRIC, inputs, monkeypatch, route="auto")
+    declines_after = nvfp4.msa_decode_nvfp4_specialized_stats()["specialised_route"][
+        "declines"
+    ]
+    assert sum(declines_after.values()) == sum(declines_before.values()) + 1
+    assert any(reason == key for key in declines_after), (reason, declines_after)
 
 
 @sm100_only
