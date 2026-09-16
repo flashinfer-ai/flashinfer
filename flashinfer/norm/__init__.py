@@ -24,7 +24,6 @@ This package provides high-performance normalization kernels:
 - Quantized variants with FP8/FP4 output
 """
 
-import contextlib
 import functools
 import os
 import warnings
@@ -32,7 +31,7 @@ from typing import Optional, Tuple, Union
 
 import torch
 
-from ..api_logging import flashinfer_api, warn_experimental_backend_once
+from ..api_logging import flashinfer_api
 from ..trace.templates.norm import (
     fused_add_rmsnorm_quant_trace,
     fused_add_rmsnorm_trace,
@@ -42,7 +41,6 @@ from ..trace.templates.norm import (
     layernorm_quant_trace,
     layernorm_trace,
     rmsnorm_quant_trace,
-    rmsnorm_fp4quant_trace,
     rmsnorm_trace,
 )
 from ..utils import (
@@ -683,129 +681,12 @@ def _layernorm_quant_fake(
 
 # CuTe-DSL fused RMSNorm + FP4 Quantization kernels
 # These require SM100+ (Blackwell) GPUs and nvidia-cutlass-dsl
-with contextlib.suppress(ImportError):
+try:
+    from ..cute_dsl import rmsnorm_fp4quant as rmsnorm_fp4quant
     from ..cute_dsl import add_rmsnorm_fp4quant as add_rmsnorm_fp4quant
-
-
-@flashinfer_api(trace=rmsnorm_fp4quant_trace)
-def rmsnorm_fp4quant(
-    input: torch.Tensor,
-    weight: torch.Tensor,
-    y_fp4: torch.Tensor | None = None,
-    block_scale: torch.Tensor | None = None,
-    global_scale: torch.Tensor | None = None,
-    eps: float = 1e-6,
-    block_size: int = 16,
-    scale_format: str | None = None,
-    is_sf_swizzled_layout: bool = False,
-    enable_pdl: bool | None = None,
-    *,
-    backend: str = "cute-dsl",
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Fuse RMSNorm and FP4 quantization.
-
-    Parameters and outputs follow :func:`flashinfer.cute_dsl.rmsnorm_fp4quant`.
-    ``backend="cute-dsl"`` (default) and ``"auto"`` use the existing CuTe kernel.
-    Explicit ``backend="triton"`` selects an experimental SM120 implementation:
-    contiguous BF16 2D/3D inputs, NVFP4/E4M3, hidden size divisible by 16 in
-    [64, 8192], and either scale layout. Triton is imported only on this path.
-    Preallocated typed FP4/FP8 outputs are supported and must not alias inputs.
-
-    The Triton backend uses FP32 normalization without an intermediate BF16
-    rounding and does not promise bitwise equality with CuTe. Finite inputs
-    with representable FP32 intermediate arithmetic and a finite positive
-    device global scale are required. Global scale is read at execution time:
-    dequantization is ``FP4 * block_scale / global_scale``. Zero blocks use a
-    zero block scale. Padded swizzled scale entries are unspecified.
-
-    For Triton, ``enable_pdl=None`` or ``False`` uses ordinary stream ordering;
-    ``True`` is unsupported. The backend is JIT-only, warns once on explicit
-    selection, and is never selected automatically, including when
-    ``FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1``. See the experimental
-    backend README for a runnable example and the tested dependency versions.
-
-    Parameters
-    ----------
-    input : torch.Tensor
-        CUDA input with shape ``(M, K)`` or ``(B, S, K)``. CuTe accepts FP16
-        or BF16; Triton requires contiguous BF16 and ``64 <= K <= 8192``
-        with ``K`` divisible by 16.
-    weight : torch.Tensor
-        RMSNorm weights of shape ``(K,)``, on the input device with the same
-        dtype. Triton requires contiguous storage.
-    y_fp4 : torch.Tensor, optional
-        Preallocated packed output with dtype ``torch.float4_e2m1fn_x2``
-        and the input shape with its last dimension halved. Allocated when
-        omitted. Triton requires contiguous, nonoverlapping output storage.
-    block_scale : torch.Tensor, optional
-        Preallocated block scales, allocated when omitted. Row-major shape
-        matches the input with its last dimension divided by ``block_size``;
-        swizzled storage is flattened and padded to 128-row by 4-block tiles.
-        E4M3 uses ``torch.float8_e4m3fn``; CuTe UE8M0 uses ``torch.uint8``.
-        Triton requires contiguous, nonoverlapping output storage.
-    global_scale : torch.Tensor, optional
-        Device FP32 tensor of shape ``(1,)``; omitted means one. For Triton,
-        a finite positive value scales the per-block maxima before E4M3
-        rounding and is read at execution time. Reconstruct values with
-        ``FP4 * block_scale / global_scale``.
-    eps : float
-        Positive RMSNorm stability constant, default ``1e-6``.
-    block_size : int
-        Elements per quantization block: 16 for NVFP4 (default), or 32 for
-        CuTe MXFP4. Triton supports only 16.
-    scale_format : str, optional
-        ``"e4m3"`` or ``"ue8m0"``. When omitted, CuTe infers the format from
-        ``block_size``. Triton accepts only ``None`` or ``"e4m3"``.
-    is_sf_swizzled_layout : bool
-        Whether to use padded 128x4 swizzled scale storage instead of
-        row-major storage. Default is ``False``; padding is unspecified.
-    enable_pdl : bool, optional
-        CuTe enables Programmatic Dependent Launch when supported unless
-        explicitly disabled. Triton accepts ``None`` or ``False`` for
-        ordinary stream ordering and rejects ``True``.
-    backend : str
-        ``"cute-dsl"`` (default) or ``"auto"`` selects CuTe. Explicit
-        ``"triton"`` selects the experimental SM120 backend and warns once.
-
-    Returns
-    -------
-    Tuple[torch.Tensor, torch.Tensor]
-        Packed FP4 values and per-block scales, reusing supplied output
-        buffers. See :func:`flashinfer.cute_dsl.rmsnorm_fp4quant` for full
-        details of the CuTe implementation.
-    """
-    if backend == "triton":
-        warn_experimental_backend_once("rmsnorm_fp4quant", backend)
-        from ..experimental.triton_rmsnorm_fp4quant.backend import run
-
-        return run(
-            input,
-            weight,
-            y_fp4,
-            block_scale,
-            global_scale,
-            eps,
-            block_size,
-            scale_format,
-            is_sf_swizzled_layout,
-            enable_pdl,
-        )
-    if backend not in ("auto", "cute-dsl"):
-        raise ValueError(f"Unknown rmsnorm_fp4quant backend: {backend}")
-    from ..cute_dsl import rmsnorm_fp4quant as cute_rmsnorm_fp4quant
-
-    return cute_rmsnorm_fp4quant(
-        input,
-        weight,
-        y_fp4,
-        block_scale,
-        global_scale,
-        eps,
-        block_size,
-        scale_format,
-        is_sf_swizzled_layout,
-        enable_pdl,
-    )
+except ImportError:
+    # nvidia-cutlass-dsl not installed, these functions will not be available
+    pass
 
 
 # ============================================================

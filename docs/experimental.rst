@@ -63,14 +63,3 @@ The full policy — placement rules, admission criteria, ownership and
 lifecycle requirements, and the graduation checklist — lives in
 ``flashinfer/experimental/README.md`` in the repository, with a summary in
 ``CONTRIBUTING.md``.
-
-Triton RMSNorm + NVFP4 (SM120)
-----------------------------
-
-``flashinfer.norm.rmsnorm_fp4quant(..., backend="triton")`` explicitly selects
-an experimental Triton implementation for contiguous BF16 2D/3D inputs with
-hidden size divisible by 16 in [64, 8192]. It supports device global scales,
-preallocated typed outputs, and row-major or 128x4 swizzled scale layouts.
-It does not support PDL and is never automatically selected. The backend's
-``flashinfer/experimental/triton_rmsnorm_fp4quant/README.md`` contains a runnable
-example, numerical contract, limitations, and benchmark commands.

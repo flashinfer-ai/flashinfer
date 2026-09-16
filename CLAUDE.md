@@ -430,11 +430,6 @@ gated: `backend="auto"` skips backends marked `@experimental_backend` unless
 (never registered in `flashinfer/aot.py`) and tested under
 `tests/experimental/`.
 
-`norm.rmsnorm_fp4quant` also accepts explicit `backend="triton"` for the
-SM120 BF16 NVFP4 subset. The implementation and support validation live in
-`experimental/triton_rmsnorm_fp4quant/`; the default and `"auto"` still use CuTe.
-See that backend's README for its scale, output-buffer and PDL contracts.
-
 → **When working under `flashinfer/experimental/`, follow
 [`flashinfer/experimental/CLAUDE.md`](flashinfer/experimental/CLAUDE.md); the
 full policy is [`flashinfer/experimental/README.md`](flashinfer/experimental/README.md).**
