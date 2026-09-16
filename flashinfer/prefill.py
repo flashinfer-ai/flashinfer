@@ -3341,7 +3341,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
             If :attr:`return_lse` is ``True``, a tuple of two tensors:
 
             * The attention output, shape: ``[qo_indptr[-1], num_qo_heads, head_dim]``.
-            * The logsumexp of attention output, shape: ``[qo_indptr[-1], num_qo_heads]``.
+            * The logsumexp of attention output, shape: ``[qo_indptr[-1], num_qo_heads]``
+              (``lse_layout="NH"``, default) or ``[num_qo_heads, qo_indptr[-1]]``
+              (``"HN"``), in the base selected by :attr:`lse_base`.
         """
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q.device)
@@ -4967,7 +4969,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             If :attr:`return_lse` is ``True``, a tuple of two tensors:
 
             * The attention output, shape: ``[qo_indptr[-1], num_qo_heads, head_dim_vo]``.
-            * The logsumexp of attention output, shape: ``[qo_indptr[-1], num_qo_heads]``.
+            * The logsumexp of attention output, shape: ``[qo_indptr[-1], num_qo_heads]``
+              (``lse_layout="NH"``, default) or ``[num_qo_heads, qo_indptr[-1]]``
+              (``"HN"``), in the base selected by :attr:`lse_base`.
         """
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q.device)
