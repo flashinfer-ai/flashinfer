@@ -134,6 +134,15 @@ def _compile(m, n, k, tactic, *, compute_capability=None):
             ),
         )
 
+        register_redistribution = (
+            compute_capability == (12, 1)
+            and (m, n, k) == (256, 9216, 7168)
+            and tactic == ("raw", 64, 32, 2, False, True, 256, True)
+        )
+        if register_redistribution:
+            gemm.load_register_requirement = 24
+            gemm.mma_register_requirement = 240
+
         class Adapter:
             def __init__(self):
                 self.gemm = gemm
@@ -191,6 +200,8 @@ def _compile(m, n, k, tactic, *, compute_capability=None):
             f"m{m}_n{n}_k{k}_"
             f"ab5{int(gemm.extra_mainloop_stage)}_half{int(gemm.half_stage_wait)}_"
         )
+        if register_redistribution:
+            shape_name += "regs24_240_"
         module = raw
     else:
         _, tile_m, tile_n, tile_k = tactic
