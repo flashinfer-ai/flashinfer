@@ -1262,6 +1262,8 @@ def _resolve_decode_launch_spec(
                 max_kv_len=max_kv_len,
                 seq_len_q=seq_len_q,
                 q_dtype_key=q_dtype_key,
+                k_dtype_key=k_dtype_key,
+                v_dtype_key=v_dtype_key,
                 output_dtype_key=output_dtype_key,
                 mask_type=mask_type,
                 use_packed_q=use_packed_q,
@@ -2718,6 +2720,8 @@ def _resolve_q_token_kv_block_sparse_decode_config(
     max_kv_len: int,
     seq_len_q: int,
     q_dtype_key: str,
+    k_dtype_key: str,
+    v_dtype_key: str,
     output_dtype_key: str,
     mask_type: str,
     use_packed_q: bool,
@@ -2739,12 +2743,16 @@ def _resolve_q_token_kv_block_sparse_decode_config(
         num_qo_heads,
         num_kv_heads,
     )
+    # This route has no QK-BF16/PV-FP8 kernel, so Q, K, and V must match.
     q_token_kv_block_sparse_dtype_supported = (
-        q_dtype_key == output_dtype_key
-        and q_dtype_key in ("float16", "bfloat16")
-        or (
-            q_dtype_key == "float8_e4m3fn"
-            and output_dtype_key in ("float16", "bfloat16")
+        q_dtype_key == k_dtype_key == v_dtype_key
+        and (
+            q_dtype_key == output_dtype_key
+            and q_dtype_key in ("float16", "bfloat16")
+            or (
+                q_dtype_key == "float8_e4m3fn"
+                and output_dtype_key in ("float16", "bfloat16")
+            )
         )
     )
     if not (
