@@ -291,9 +291,9 @@ def prepare(
         )
     mid = mlse = lse = None
     if owned:
-        if not caller_mid:
+        if not caller_mid and workspace[0][2] == 0:
             mid = torch.empty(workspace[0][0], dtype=workspace[0][1], device=device)
-        if not caller_mlse:
+        if not caller_mlse and workspace[1][2] == 0:
             mlse = torch.empty(workspace[1][0], dtype=workspace[1][1], device=device)
         if not caller_lse:
             lse = torch.empty(workspace[2][0], dtype=workspace[2][1], device=device)
@@ -314,6 +314,30 @@ def prefix_scratch(prepared, mid, mlse):
         if tensor is not None and tensor.numel() * tensor.element_size() < need:
             raise ValueError(f"scratch capacity is too small: need {need} bytes")
     return mid, mlse
+
+
+def _wrapper_scratch(wrapper, prepared, mid, mlse, device, capturing):
+    buffers = [mid, mlse]
+    pinned = [prepared.mid, prepared.mlse]
+    for i, (shape, dtype, size, alignment) in enumerate(prepared.workspace[:2]):
+        if buffers[i] is not None:
+            continue
+        if pinned[i] is not None:
+            buffers[i] = pinned[i]
+        elif capturing:
+            pinned[i] = buffers[i] = torch.empty(shape, dtype=dtype, device=device)
+        else:
+            arena = wrapper._scratch_arenas[i]
+            capacity = size + math.lcm(alignment, dtype.itemsize) - 1
+            if arena is None or arena.numel() < capacity:
+                arena = torch.empty(capacity, dtype=torch.uint8, device=device)
+                wrapper._scratch_arenas[i] = arena
+            buffers[i], _ = _workspace_tensor_view(
+                arena, byte_offset=0, shape=shape, dtype=dtype, alignment=alignment
+            )
+    if pinned[0] is not prepared.mid or pinned[1] is not prepared.mlse:
+        prepared = replace(prepared, mid=pinned[0], mlse=pinned[1])
+    return prepared, buffers[0], buffers[1]
 
 
 def wrapper_run(
@@ -422,6 +446,10 @@ def wrapper_run(
         )
         wrapper._prepared_calls[key] = current = updated
     mid_out, mid_lse = prefix_scratch(current, mid_out, mid_lse)
+    current, mid_out, mid_lse = _wrapper_scratch(
+        wrapper, current, mid_out, mid_lse, q.device, capturing
+    )
+    wrapper._prepared_calls[key] = current
     result_lse = out_lse[:t, :h] if out_lse is not None else current.lse
     current.execute(
         q,

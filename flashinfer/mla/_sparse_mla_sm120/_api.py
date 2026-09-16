@@ -780,10 +780,14 @@ class _SparseMLAPagedAttentionRunner:
     """Sparse-MLA paged attention implementation runner for SM120.
 
     ``max_num_tokens`` and ``max_num_heads`` are optional validation bounds.
-    Eager calls prepare exact-shape execution plans and required scratch/LSE.
-    Matching hot calls reuse them. Decode scratch may instead be supplied via
-    ``run(mid_out=..., mid_lse=...)`` as contiguous buffers with sufficient
-    plan-defined byte capacity. Warm every captured metadata shape first.
+    Eager calls cache exact-shape execution plans and dedicated final LSE buffers.
+    Uncaptured calls share grow-only mid-output and mid-LSE scratch arenas.
+    The first capture of a warmed shape allocates dedicated scratch before its
+    kernel calls; that shape then retains its pinned buffers across shape changes.
+    Decode scratch may instead be supplied via ``run(mid_out=..., mid_lse=...)``
+    as contiguous buffers with sufficient plan-defined byte capacity. Warm every
+    captured metadata shape first. Calls sharing wrapper-owned scratch must not
+    execute concurrently on different streams.
     Eager tuning may replace a shape's plan and resources when the profile
     changes; recapture graphs after such a change. The wrapper does not own
     graph objects or maintain historical profile resources.
@@ -833,8 +837,8 @@ class _SparseMLAPagedAttentionRunner:
         main topk=128/512 and PBS=64; extra topk>0 with PBS=2/64. It retains
         NVFP4 Q/P quantization and V requantization, BF16 RoPE, and the separately
         calibrated non-monotonic decode/streaming selection. CPB=0 keeps its
-        existing heuristic. DSV4 NVFP4 graphs reuse warmed plans and exact-shape
-        buffers without tuning or allocating during capture; LSE is contiguous.
+        existing heuristic. DSV4 NVFP4 graphs reuse warmed plans without tuning
+        during capture and pin scratch as described above; LSE is contiguous.
     device : Optional[torch.device]
         Allocation target. Defaults to the current CUDA device.
 
@@ -882,6 +886,7 @@ class _SparseMLAPagedAttentionRunner:
             raise ValueError("compute_precision='nvfp4' requires DSV4 NVFP4 storage")
         self._compute_precision = compute_precision
         self._prepared_calls: dict = {}
+        self._scratch_arenas: list[torch.Tensor | None] = [None, None]
         if kv_cache_format not in _KV_CACHE_FORMATS:
             raise ValueError(
                 "kv_cache_format must be either 'fp8' or 'nvfp4', got "

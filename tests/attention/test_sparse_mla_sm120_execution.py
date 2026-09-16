@@ -13,6 +13,75 @@ from tests.attention.sparse_mla_test_utils import (
 )
 
 
+def test_wrapper_eager_scratch_peak_and_graph_pinning(sm12x):
+    from flashinfer.mla import SparseMLASm120Wrapper
+    from tests.attention.sparse_mla_test_utils import quantize_kv_dsv4_1
+
+    torch.manual_seed(5197)
+    cache = quantize_kv_dsv4_1(
+        torch.randn(4, 64, 1, 512, device="cuda", dtype=torch.bfloat16) * 0.1
+    )
+    q = torch.randn(64, 64, 512, device="cuda", dtype=torch.bfloat16) * 0.1
+    indices = torch.randint(256, (64, 512), device="cuda", dtype=torch.int32)
+    output = torch.empty_like(q)
+    wrapper = SparseMLASm120Wrapper(
+        kv_scale_format="ue8m0_g32", compute_precision="fp8"
+    )
+
+    def run(tokens):
+        return wrapper.run(
+            q[:tokens],
+            cache,
+            indices[:tokens],
+            output[:tokens],
+            512**-0.5,
+            return_lse=True,
+        )
+
+    run(1)
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_allocated()
+    saved_lse = run(1)
+    expected_lse = saved_lse.clone()
+    for tokens in (4, 8, 16, 24, 32, 48, 64):
+        run(tokens)
+    torch.cuda.synchronize()
+    entries = tuple(wrapper._prepared_calls.values())
+    max_scratch = sum(max(entry.workspace[i][2] for entry in entries) for i in (0, 1))
+    lse_bytes = sum(entry.workspace[2][2] for entry in entries)
+    assert torch.cuda.memory_allocated() - before <= max_scratch + lse_bytes + (1 << 20)
+    torch.testing.assert_close(saved_lse, expected_lse, atol=0, rtol=0)
+    assert all(entry.mid is None and entry.mlse is None for entry in entries)
+
+    wrapper = SparseMLASm120Wrapper(
+        kv_scale_format="ue8m0_g32", compute_precision="fp8"
+    )
+    states = []
+    for tokens in (4, 8):
+        lse = run(tokens)
+        states.append(
+            (tokens, lse, output[:tokens].clone(), lse.clone(), torch.cuda.CUDAGraph())
+        )
+    for tokens, _, _, _, graph in states:
+        with torch.cuda.graph(graph):
+            run(tokens)
+    pinned = tuple(wrapper._prepared_calls.values())
+    pointers = [(entry.mid.data_ptr(), entry.mlse.data_ptr()) for entry in pinned]
+    assert len(set(pointers)) == 2
+    run(64)
+    run(4)
+    run(64)
+    for tokens, lse, expected, el, graph in states * 2:
+        output.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(output[:tokens], expected, atol=0, rtol=0)
+        torch.testing.assert_close(lse, el, atol=0, rtol=0)
+    assert pointers == [
+        (entry.mid.data_ptr(), entry.mlse.data_ptr()) for entry in pinned
+    ]
+
+
 def test_swapab_preference_allows_pitched_indices_when_decode_selected(sm12x):
     from flashinfer.mla import SparseMLASm120Wrapper
     from flashinfer.mla._sparse_mla_sm120 import _api

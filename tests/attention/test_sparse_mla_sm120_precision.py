@@ -13,15 +13,30 @@ from tests.attention.sparse_mla_test_utils import (
 
 
 @contextmanager
-def _no_capture_allocations(wrapper, device):
-    prepared = tuple(wrapper._prepared_calls.values())
-    resources = tuple((entry, entry.mid, entry.mlse, entry.lse) for entry in prepared)
+def _capture_scratch_pinning(wrapper, device):
+    prepared = dict(wrapper._prepared_calls)
     allocated = torch.cuda.memory_stats(device)["allocation.all.allocated"]
     yield
-    assert torch.cuda.memory_stats(device)["allocation.all.allocated"] == allocated
-    assert tuple(map(id, wrapper._prepared_calls.values())) == tuple(map(id, prepared))
-    for entry, mid, mlse, lse in resources:
-        assert entry.mid is mid and entry.mlse is mlse and entry.lse is lse
+    assert wrapper._prepared_calls.keys() == prepared.keys()
+    pinned = 0
+    for key, before in prepared.items():
+        after = wrapper._prepared_calls[key]
+        assert after.plan is before.plan and after.lse is before.lse
+        for old, new, (_, _, size, _) in zip(
+            (before.mid, before.mlse),
+            (after.mid, after.mlse),
+            after.workspace[:2],
+            strict=True,
+        ):
+            if old is None and new is not None:
+                assert new.numel() * new.element_size() == size
+                pinned += int(size > 0)
+            else:
+                assert new is old
+    assert (
+        torch.cuda.memory_stats(device)["allocation.all.allocated"]
+        == allocated + pinned
+    )
 
 
 def _kernel_only_graph(topology):
@@ -45,9 +60,9 @@ def test_capture_allocation_guard_tracks_allocations_not_live_bytes():
     )
     device = torch.device("cuda")
     unrelated = torch.empty(1 << 20, device=device)
-    with _no_capture_allocations(wrapper, device):
+    with _capture_scratch_pinning(wrapper, device):
         del unrelated
-    with pytest.raises(AssertionError), _no_capture_allocations(wrapper, device):
+    with pytest.raises(AssertionError), _capture_scratch_pinning(wrapper, device):
         temporary = torch.empty(1024, device=device)
         del temporary
 
@@ -229,7 +244,7 @@ def test_fp8_prefill_cross_bucket_graphs(mixed, tmp_path):
         assert torch.equal(pitched_lse, lse)
         graph = torch.cuda.CUDAGraph(keep_graph=True)
         graph.enable_debug_mode()
-        with torch.cuda.graph(graph), _no_capture_allocations(wrapper, nq.device):
+        with torch.cuda.graph(graph), _capture_scratch_pinning(wrapper, nq.device):
             wrapper.run(nq, main, ni, output, 512**-0.5, **kw)
         graph.instantiate()
         dot = tmp_path / f"route-{nt}.dot"
@@ -458,7 +473,7 @@ def test_nvfp4_precision_cross_bucket_graphs(extra_pbs, tmp_path):
             torch.testing.assert_close(lse, rlse, atol=0.02, rtol=0.02)
         graph = torch.cuda.CUDAGraph(keep_graph=True)
         graph.enable_debug_mode()
-        with torch.cuda.graph(graph), _no_capture_allocations(wrapper, q.device):
+        with torch.cuda.graph(graph), _capture_scratch_pinning(wrapper, q.device):
             wrapper.run(q, main, idx, output, 512**-0.5, prefill_impl="auto", **kw)
         graph.instantiate()
         dot = tmp_path / f"dsv4-nvfp4-{nt}.dot"
@@ -610,7 +625,7 @@ def test_bf16_prefill_runtime_shapes(heads, topk, mixed, tmp_path):
         expected = output.clone(), lse.clone()
         graph = torch.cuda.CUDAGraph(keep_graph=True)
         graph.enable_debug_mode()
-        with torch.cuda.graph(graph), _no_capture_allocations(wrapper, query.device):
+        with torch.cuda.graph(graph), _capture_scratch_pinning(wrapper, query.device):
             wrapper.run(query, main, indices, output, 512**-0.5, out_lse=lse, **kw)
         graph.instantiate()
         dot = tmp_path / f"bf16-{nt}.dot"

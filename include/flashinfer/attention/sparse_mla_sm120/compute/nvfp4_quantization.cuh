@@ -45,6 +45,8 @@ __device__ __forceinline__ uint8_t float_to_e4m3_byte(float value) {
 __device__ __forceinline__ float2 e2m1x2_code_to_float2(uint8_t codes) {
   uint32_t fp16x2;
   const uint32_t packed = codes;
+  // uint8_t zeroes the upper bytes, avoiding the CUDA 12.9 ptxas mov.b32 issue with live high
+  // bytes.
   asm volatile(
       "{\n"
       ".reg .b8 fp4_byte;\n"

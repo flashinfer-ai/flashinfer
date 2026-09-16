@@ -4561,24 +4561,20 @@ def test_sparse_mla_sm120_runner_scratch_follows_routing(monkeypatch) -> None:
     call(4)
     small = list(runner._prepared_calls.values())[-1]
     assert small.lse.shape[0] == 4
-    assert small.mid.numel() * small.mid.element_size() == small.workspace[0][2]
+    assert small.mid is None and small.mlse is None
     call(8)
     grown = list(runner._prepared_calls.values())[-1]
-    assert grown.mid is not small.mid and grown.lse.shape[0] == 8
+    assert grown.mid is None and grown.mlse is None and grown.lse.shape[0] == 8
+    arenas = tuple(runner._scratch_arenas)
     call(4)
     call(16)
-    assert len(runner._prepared_calls) == 3
-    assert (
-        small in runner._prepared_calls.values()
-        and grown in runner._prepared_calls.values()
+    assert all(
+        now is old for now, old in zip(runner._scratch_arenas, arenas, strict=True)
     )
 
 
 def test_sparse_mla_sm120_runner_internal_scratch_cuda_graph(monkeypatch) -> None:
-    """CUDA graph capture with runner-internal split-K scratch (dsv4, H=128,
-    topk=1024, T=8): the warmup calls allocate the cached buffers so capture
-    itself performs no scratch allocation, and replay on fresh data matches
-    the eager reference."""
+    """Capture pins runner-owned split-K scratch; replay matches fresh-input reference."""
     from flashinfer.mla import _sparse_mla_sm120 as sm
     from flashinfer.mla._sparse_mla_sm120 import _calibration as cpb_mod
 
@@ -4622,11 +4618,7 @@ def test_sparse_mla_sm120_runner_internal_scratch_cuda_graph(monkeypatch) -> Non
         indices[:, topk // 2 :] = -1
         return q, indices
 
-    # Everything the replay path touches — static buffers, the fresh replay
-    # payload, and its eager reference — is allocated BEFORE capture: the
-    # captured call performs a small internal allocation whose block would
-    # otherwise be recycled into post-capture tensors that g.replay() then
-    # overwrites.
+    # Allocate replay inputs and references before capture; capture pins only scratch.
     q_s, idx_s = fresh_inputs()
     q_new, idx_new = fresh_inputs()
     ref_out, ref_lse = _ref_sparse_attn(q_new, kv_dequant, idx_new, sm_scale, d_v)
@@ -4642,10 +4634,11 @@ def test_sparse_mla_sm120_runner_internal_scratch_cuda_graph(monkeypatch) -> Non
         for _ in range(3):
             run()
     torch.cuda.current_stream().wait_stream(s)
-    assert next(iter(runner._prepared_calls.values())).mid is not None
+    assert next(iter(runner._prepared_calls.values())).mid is None
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
         run()
+    assert next(iter(runner._prepared_calls.values())).mid is not None
 
     q_s.copy_(q_new)
     idx_s.copy_(idx_new)
