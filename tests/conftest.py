@@ -4,6 +4,19 @@ import types
 from pathlib import Path
 from typing import Any, Dict, Set
 
+
+def _configure_cute_dsl_cache_dir():
+    if "CUTE_DSL_CACHE_DIR" not in os.environ:
+        workspace_base = Path(
+            os.environ.get("FLASHINFER_WORKSPACE_BASE", Path.home().as_posix())
+        ).expanduser()
+        os.environ["CUTE_DSL_CACHE_DIR"] = str(
+            workspace_base / ".cache" / "flashinfer" / "cute_dsl"
+        )
+
+
+_configure_cute_dsl_cache_dir()
+
 import pytest
 import torch
 from torch.torch_version import TorchVersion
@@ -159,6 +172,7 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers", "nvep: requires a moe_ep-enabled install (default)"
     )
+    config.addinivalue_line("markers", "gpu: requires at least one CUDA GPU")
     config.addinivalue_line("markers", "gpu_2: requires >=2 GPUs")
     config.addinivalue_line("markers", "gpu_4: requires >=4 GPUs")
     config.addinivalue_line("markers", "gpu_8: requires >=8 GPUs")

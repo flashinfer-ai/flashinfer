@@ -17,14 +17,31 @@ from ._core import *  # noqa: F401,F403
 
 _PRIMS_TS_LAZY_EXPORTS = frozenset(
     {
-        "get_prims_ts_batch_decode_mla_workspace_size",
-        "prims_ts_batch_decode_with_kv_cache_mla",
+        "get_prims_ts_batch_mla_decode_workspace_size",
+        "prims_ts_batch_mla_decode_with_kv_cache",
+    }
+)
+
+_SPARSE_MLA_SM120_LAZY_EXPORTS = frozenset(
+    {
+        "SparseMLASm120CalibrationReport",
+        "SparseMLASm120DecodeConfig",
+        "SparseMLASm120Wrapper",
+        "calibrate_sparse_mla_sm120",
+        "supported_sparse_mla_sm120_configs",
+    }
+)
+
+_SPARSE_MLA_NVFP4_SM120_LAZY_EXPORTS = frozenset(
+    {
+        "nvfp4_quantize_append_sparse_mla_cache",
+        "nvfp4_quantize_pack_sparse_mla_cache",
     }
 )
 
 
 def __getattr__(name: str):
-    """Resolve PrimTS MLA APIs without loading their runtime at import."""
+    """Resolve lazily-exported MLA APIs without loading their runtime at import."""
 
     if name in _PRIMS_TS_LAZY_EXPORTS:
         from ..attention.prims_ts import mla_decode as prims_ts_mla_decode
@@ -32,8 +49,26 @@ def __getattr__(name: str):
         value = getattr(prims_ts_mla_decode, name)
         globals()[name] = value
         return value
+    if name in _SPARSE_MLA_SM120_LAZY_EXPORTS:
+        from . import _sparse_mla_sm120
+
+        value = getattr(_sparse_mla_sm120, name)
+        globals()[name] = value
+        return value
+    if name in _SPARSE_MLA_NVFP4_SM120_LAZY_EXPORTS:
+        from . import _sparse_mla_nvfp4_sm120
+
+        value = getattr(_sparse_mla_nvfp4_sm120, name)
+        globals()[name] = value
+        return value
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def __dir__():
-    return sorted(set(globals()) | _PRIMS_TS_LAZY_EXPORTS)
+    """Include lazily-exported names alongside the module globals."""
+    return sorted(
+        set(globals())
+        | _PRIMS_TS_LAZY_EXPORTS
+        | _SPARSE_MLA_SM120_LAZY_EXPORTS
+        | _SPARSE_MLA_NVFP4_SM120_LAZY_EXPORTS
+    )

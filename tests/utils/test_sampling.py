@@ -38,6 +38,20 @@ def gumbel_distribution(beta):
     return gumbel_noise
 
 
+@pytest.mark.parametrize("shape", [(1, 4096), (5, 129280), (230, 129280)])
+@pytest.mark.parametrize("per_row_temperature", [False, True])
+def test_softmax_low_temperature_normalization(shape, per_row_temperature):
+    logits = torch.full(shape, -20.0, device="cuda:0")
+    logits[:, 123] = 42.0
+    temperature = 0.001
+    if per_row_temperature:
+        temperature = torch.full((shape[0],), temperature, device=logits.device)
+    probs = flashinfer.sampling.softmax(logits, temperature=temperature)
+    expected = torch.zeros_like(logits)
+    expected[:, 123] = 1.0
+    torch.testing.assert_close(probs, expected, atol=1e-6, rtol=0)
+
+
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize(

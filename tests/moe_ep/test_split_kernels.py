@@ -54,11 +54,13 @@ class TestKernelRequiresWeights:
 
         moe = fm.MoEConfig(
             routing=fm.RoutingConfig(num_experts=2, top_k=1),
-            quant=fm.QuantConfig(
-                variant=(
-                    fm.QuantVariant.MXFP4
-                    if variant == "mxfp4"
-                    else fm.QuantVariant.NVFP4
+            quant=(
+                fm.QuantConfig(
+                    weight=fm.QuantFormat.MXFP4, activation=fm.QuantFormat.MXFP8
+                )
+                if variant == "mxfp4"
+                else fm.QuantConfig(
+                    weight=fm.QuantFormat.NVFP4, activation=fm.QuantFormat.NVFP4
                 )
             ),
             experts=fm.ExpertConfig(intermediate_size=128, local_num_experts=2),
@@ -195,7 +197,29 @@ def capturing_stub_fleet():
         _BACKEND_REGISTRY.pop("nccl_ep", None)
 
 
-def test_split_layer_identity_kernel_wires_dispatch_to_combine(capturing_stub_fleet):
+@pytest.fixture
+def isolated_single_rank_gloo(tmp_path):
+    """Keep this singleton test off the port used by concurrent torchrun jobs."""
+    import torch.distributed as dist
+
+    initialized_here = not dist.is_initialized()
+    if initialized_here:
+        dist.init_process_group(
+            backend="gloo",
+            rank=0,
+            world_size=1,
+            init_method=(tmp_path / "gloo-rendezvous").as_uri(),
+        )
+    try:
+        yield
+    finally:
+        if initialized_here:
+            dist.destroy_process_group()
+
+
+def test_split_layer_identity_kernel_wires_dispatch_to_combine(
+    capturing_stub_fleet, isolated_single_rank_gloo
+):
     """MoEEpSplitLayer + IdentityConfig passes dispatch output into combine."""
     import torch
 

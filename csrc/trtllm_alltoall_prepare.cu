@@ -198,6 +198,11 @@ __device__ __forceinline__ void computeCountAndSend(
 __device__ __forceinline__ void recvCount(int* recvIndiceWorkspace, int* recvCounts,
                                           int* sharedCountsBase, MoeCommWorkspace workspace,
                                           int maxTokenCountPerRank, int rankId, int rankCount) {
+  // Tiles larger than a warp require shared scratch on SM75 and earlier.
+  // Initialize the block collectively before any inactive tiles return.
+  __shared__ cg::block_tile_memory<1024> tileMemory;
+  cg::thread_block block = cg::this_thread_block(tileMemory);
+  auto rankTile = cg::tiled_partition<THREADS_PER_PIPELINE>(block);
   int rankOffset = threadIdx.x / THREADS_PER_PIPELINE;
   if (rankOffset >= PIPELINE_PER_CTA) {
     return;
@@ -208,8 +213,6 @@ __device__ __forceinline__ void recvCount(int* recvIndiceWorkspace, int* recvCou
     return;
   }
   int unitId = threadIdx.x % UNIT_PER_PIPELINE;
-  cg::thread_block_tile<THREADS_PER_PIPELINE> rankTile =
-      cg::tiled_partition<THREADS_PER_PIPELINE>(cg::this_thread_block());
   int* localRecvIndice = recvIndiceWorkspace + targetRankId * maxTokenCountPerRank;
   int rankRecvCount;
   if (rankTile.thread_rank() == 0) {
