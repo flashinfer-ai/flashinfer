@@ -1,10 +1,10 @@
 {
   "all_rows_passed": true,
-  "arithmetic_mean_speedup": 2.3077231087953947,
+  "arithmetic_mean_speedup": 2.3498877084438923,
   "candidate": "vibecuda",
   "contract_version": "pr4576-route-matrix-12-seed7-v2",
   "denominator": "cake (PR-4576 SSDCombined backend)",
-  "geometric_mean_speedup": 2.0835428737077595,
+  "geometric_mean_speedup": 2.2160864871084542,
   "matrix": [
     "bf16_b_h8_g8_dvec",
     "fp16_b_h8_g8",
@@ -19,105 +19,105 @@
     "b_h128_g8",
     "v_h128_g8_zero"
   ],
-  "max_speedup": 5.723759791122715,
-  "min_speedup": 1.1249429981195784,
-  "mode": "in-process",
+  "max_speedup": 5.240460342462272,
+  "min_speedup": 1.3338588955943385,
+  "mode": "subprocess-per-row",
   "rows": [
     {
       "cake_cute_parity": {
         "final_states_tolerance_passed": true,
         "out_tolerance_passed": true
       },
-      "cake_ms": 0.049825,
+      "cake_ms": 0.0496645,
       "cute_parity_passed": true,
       "full_write_passed": true,
       "row": "bf16_b_h8_g8_dvec",
-      "speedup": 2.746086860670194,
-      "vibecuda_ms": 0.018144
+      "speedup": 2.5610158566456103,
+      "vibecuda_ms": 0.0193925
     },
     {
       "cake_cute_parity": {
         "final_states_tolerance_passed": true,
         "out_tolerance_passed": true
       },
-      "cake_ms": 0.0479365,
+      "cake_ms": 0.0476815,
       "cute_parity_passed": true,
       "full_write_passed": true,
       "row": "fp16_b_h8_g8",
-      "speedup": 2.7236647727272727,
-      "vibecuda_ms": 0.0176
+      "speedup": 2.504280462184874,
+      "vibecuda_ms": 0.01904
     },
     {
       "cake_cute_parity": {
         "final_states_tolerance_passed": true,
         "out_tolerance_passed": true
       },
-      "cake_ms": 0.07041700000000001,
+      "cake_ms": 0.074369,
       "cute_parity_passed": true,
       "full_write_passed": true,
       "row": "bf16_v_h8_g8_dvec",
-      "speedup": 1.88318513070803,
-      "vibecuda_ms": 0.037392499999999995
+      "speedup": 1.9695180084745763,
+      "vibecuda_ms": 0.03776
     },
     {
       "cake_cute_parity": {
         "final_states_tolerance_passed": true,
         "out_tolerance_passed": true
       },
-      "cake_ms": 0.071649,
+      "cake_ms": 0.0776495,
       "cute_parity_passed": true,
       "full_write_passed": true,
       "row": "fp16_v_i64_h8_g8",
-      "speedup": 1.9335069421019255,
-      "vibecuda_ms": 0.0370565
+      "speedup": 2.0739439911325968,
+      "vibecuda_ms": 0.0374405
     },
     {
       "cake_cute_parity": {
         "final_states_tolerance_passed": true,
         "out_tolerance_passed": true
       },
-      "cake_ms": 0.1041295,
+      "cake_ms": 0.1031375,
       "cute_parity_passed": true,
       "full_write_passed": true,
       "row": "bf16prep_b_h8_g8",
-      "speedup": 5.723759791122715,
-      "vibecuda_ms": 0.0181925
+      "speedup": 5.240460342462272,
+      "vibecuda_ms": 0.019681
     },
     {
       "cake_cute_parity": {
         "final_states_tolerance_passed": true,
         "out_tolerance_passed": true
       },
-      "cake_ms": 0.0328,
+      "cake_ms": 0.031777,
       "cute_parity_passed": true,
       "full_write_passed": true,
       "row": "b_h1_g1",
-      "speedup": 1.96360153256705,
-      "vibecuda_ms": 0.016704
+      "speedup": 1.7811720523527925,
+      "vibecuda_ms": 0.017840500000000002
     },
     {
       "cake_cute_parity": {
         "final_states_tolerance_passed": true,
         "out_tolerance_passed": true
       },
-      "cake_ms": 0.052096,
+      "cake_ms": 0.054144,
       "cute_parity_passed": true,
       "full_write_passed": true,
       "row": "b_h12_g3",
-      "speedup": 2.9174810293170554,
-      "vibecuda_ms": 0.0178565
+      "speedup": 2.773770491803279,
+      "vibecuda_ms": 0.01952
     },
     {
       "cake_cute_parity": {
         "final_states_tolerance_passed": true,
         "out_tolerance_passed": true
       },
-      "cake_ms": 0.047104,
+      "cake_ms": 0.0464805,
       "cute_parity_passed": true,
       "full_write_passed": true,
       "row": "b_h16_g4",
-      "speedup": 2.537931034482759,
-      "vibecuda_ms": 0.01856
+      "speedup": 2.2588569762356028,
+      "vibecuda_ms": 0.020577
     },
     {
       "cake_cute_parity": {
@@ -128,44 +128,44 @@
       "cute_parity_passed": true,
       "full_write_passed": true,
       "row": "b_h128_g1",
-      "speedup": 1.3789813843958953,
-      "vibecuda_ms": 0.058177
+      "speedup": 1.9152034567960181,
+      "vibecuda_ms": 0.0418885
     },
     {
       "cake_cute_parity": {
         "final_states_tolerance_passed": true,
         "out_tolerance_passed": true
       },
-      "cake_ms": 0.082625,
+      "cake_ms": 0.0827055,
       "cute_parity_passed": true,
       "full_write_passed": true,
       "row": "b_h128_g128",
-      "speedup": 1.381862273696534,
-      "vibecuda_ms": 0.0597925
+      "speedup": 1.8878655070875847,
+      "vibecuda_ms": 0.043809
     },
     {
       "cake_cute_parity": {
         "final_states_tolerance_passed": true,
         "out_tolerance_passed": false
       },
-      "cake_ms": 0.080193,
+      "cake_ms": 0.079777,
       "cute_parity_passed": true,
       "full_write_passed": true,
       "row": "b_h128_g8",
-      "speedup": 1.3776735556357265,
-      "vibecuda_ms": 0.058209
+      "speedup": 1.8987064605571622,
+      "vibecuda_ms": 0.0420165
     },
     {
       "cake_cute_parity": {
         "final_states_tolerance_passed": true,
         "out_tolerance_passed": true
       },
-      "cake_ms": 0.109777,
+      "cake_ms": 0.1104015,
       "cute_parity_passed": true,
       "full_write_passed": true,
       "row": "v_h128_g8_zero",
-      "speedup": 1.1249429981195784,
-      "vibecuda_ms": 0.0975845
+      "speedup": 1.3338588955943385,
+      "vibecuda_ms": 0.0827685
     }
   ],
   "rows_completed": 12,

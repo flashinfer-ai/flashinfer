@@ -21,9 +21,9 @@
   },
   "contract_version": "pr4576-route-matrix-12-seed7-v2",
   "execution_error": null,
-  "mode": "in-process",
+  "mode": "subprocess-per-row",
   "report": {
-    "cake_ms": 0.0328,
+    "cake_ms": 0.031777,
     "cake_truth_final_states": {
       "atol": 0.06,
       "bitwise_equal": false,
@@ -59,7 +59,7 @@
       "rtol": 0.01,
       "tolerance_passed": true
     },
-    "flashinfer_ms": 0.0568965,
+    "flashinfer_ms": 0.0567205,
     "full_write": {
       "fully_written": true,
       "out_numel": 16384,
@@ -101,7 +101,7 @@
       "sequence_lengths": null,
       "state_dtype": "bfloat16"
     },
-    "speedup": 1.7346493902439024,
+    "speedup": 1.784954526859049,
     "timing_backend": "cupti",
     "truth_reference": "fp64_sequential_recurrence",
     "vibecuda_final_states": {
@@ -114,7 +114,7 @@
       "rtol": 0.01,
       "tolerance_passed": true
     },
-    "vibecuda_ms": 0.016704,
+    "vibecuda_ms": 0.017840500000000002,
     "vibecuda_out": {
       "atol": 0.01,
       "bitwise_equal": true,
@@ -125,7 +125,7 @@
       "rtol": 0.01,
       "tolerance_passed": true
     },
-    "vibecuda_speedup_vs_cake": 1.96360153256705,
+    "vibecuda_speedup_vs_cake": 1.7811720523527925,
     "vibecuda_truth_final_states": {
       "atol": 0.06,
       "bitwise_equal": false,
@@ -149,5 +149,5 @@
   },
   "row": "b_h1_g1",
   "validation_failures": [],
-  "wall_s": 1.129
+  "wall_s": 8.656
 }
