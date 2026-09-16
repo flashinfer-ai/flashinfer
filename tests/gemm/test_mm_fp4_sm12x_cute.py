@@ -332,7 +332,7 @@ def test_sm121_defaults_preserve_other_devices_and_unmeasured_shapes():
         ((512, 8192, 14336), ("cooperative", 128, 64, 256)),
         ((512, 5120, 16384), ("cooperative", 128, 128, 256)),
         ((1024, 4608, 7168), ("raw", 64, 32, 8, False, True, 256, True)),
-        ((512, 8192, 28672), ("cooperative", 128, 128, 256)),
+        ((512, 8192, 28672), ("cooperative", 256, 128, 128)),
         ((512, 5120, 4096), ("cooperative", 128, 64, 256)),
         ((256, 34816, 5120), ("cooperative", 128, 128, 256)),
         ((256, 5120, 17408), ("cooperative", 128, 128, 256)),
@@ -355,7 +355,9 @@ def test_sm121_defaults_preserve_other_devices_and_unmeasured_shapes():
         )
         if preferred in choices:
             assert policy.valid_tactics(*shape, compute_capability=(12, 1)) == choices
-        if preferred == ("cooperative", 128, 128, 128) and shape[0] == 2000:
+        if (
+            preferred == ("cooperative", 128, 128, 128) and shape[0] == 2000
+        ) or shape == (512, 8192, 28672):
             previous = ("cooperative", 128, 128, 256)
             assert policy.compatible(*shape, previous, compute_capability=(12, 1))
             assert previous not in policy.valid_tactics(
@@ -547,6 +549,14 @@ def test_sm121_defaults_preserve_other_devices_and_unmeasured_shapes():
         (512, 7168, 5056),
         (512, 7168, 5184),
     ]
+    neighbors += [
+        (511, 8192, 28672),
+        (513, 8192, 28672),
+        (512, 8128, 28672),
+        (512, 8256, 28672),
+        (512, 8192, 28608),
+        (512, 8192, 28736),
+    ]
     for shape in neighbors:
         assert policy.default_tactic(
             *shape, compute_capability=(12, 1)
@@ -662,6 +672,8 @@ def test_sm121_measured_default_public_graph_and_cached_choice(m, n, k, monkeypa
             legacy_choices.append(("b12x", 64, 128, 256))
         if preferred == ("cooperative", 128, 128, 128) and m == 2000:
             legacy_choices.append(("cooperative", 128, 128, 256))
+        if (m, n, k) == (512, 8192, 28672):
+            legacy_choices.append(("cooperative", 128, 128, 256))
         if (m, n, k) == (1024, 512, 7168):
             legacy_choices.append(("cooperative", 128, 64, 256))
         for legacy in legacy_choices:
@@ -670,6 +682,18 @@ def test_sm121_measured_default_public_graph_and_cached_choice(m, n, k, monkeypa
                 mm_fp4(*operands, alpha, out=out, backend="cute-dsl"), changed_expected
             )
             assert selected[-1] == legacy
+            if (m, n, k) == (512, 8192, 28672) and legacy == (
+                "cooperative",
+                128,
+                128,
+                256,
+            ):
+                cached_graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(cached_graph):
+                    mm_fp4(*operands, alpha, out=out, backend="cute-dsl")
+                out.fill_(float("nan"))
+                cached_graph.replay()
+                _assert_bits(out, changed_expected)
     finally:
         if previous is sentinel:
             winners.pop(key, None)
