@@ -142,85 +142,6 @@ def get_trtllm_comm_module():
             buffer_0_ptr, buffer_1_ptr, buffer_2_ptr, size, dtype
         )
 
-    @deprecated(
-        "trtllm_create_ipc_workspace_for_all_reduce and trtllm_custom_all_reduce are deprecated and will be removed in the next major bump, use allreduce.py instead."
-    )
-    @register_custom_op(
-        "flashinfer::trtllm_custom_all_reduce",
-        mutates_args=[
-            "inp",
-            "out",
-            "tp_size",
-            "tp_rank",
-            "token_num",
-            "fusion_op_code",
-            "strategy_code",
-            "config_code",
-            "launch_with_pdl",
-            "flag_value",
-            "peer_comm_buffer_ptrs",
-            "peer_barrier_ptrs_in",
-            "peer_barrier_ptrs_out",
-            "bias",
-            "residual",
-            "weight",
-            "weight_pre_residual_norm",
-            "eps",
-            "intermediate_buffer",
-            "lamport_peer_comm_buffer_ptrs_0",
-            "lamport_peer_comm_buffer_ptrs_1",
-            "lamport_peer_comm_buffer_ptrs_2",
-        ],
-    )
-    def trtllm_custom_all_reduce(
-        inp: torch.Tensor,
-        out: torch.Tensor,
-        tp_size: int,
-        tp_rank: int,
-        token_num: int,
-        fusion_op_code: AllReduceFusionOp,
-        strategy_code: AllReduceStrategyType,
-        config_code: AllReduceStrategyConfig,
-        launch_with_pdl: bool,
-        flag_value: int,
-        peer_comm_buffer_ptrs: torch.Tensor,
-        peer_barrier_ptrs_in: torch.Tensor,
-        peer_barrier_ptrs_out: torch.Tensor,
-        bias: Optional[torch.Tensor],
-        residual: Optional[torch.Tensor],
-        weight: Optional[torch.Tensor],
-        weight_pre_residual_norm: Optional[torch.Tensor],
-        eps: Optional[float],
-        intermediate_buffer: Optional[torch.Tensor],
-        lamport_peer_comm_buffer_ptrs_0: Optional[torch.Tensor],
-        lamport_peer_comm_buffer_ptrs_1: Optional[torch.Tensor],
-        lamport_peer_comm_buffer_ptrs_2: Optional[torch.Tensor],
-    ) -> None:
-        module.trtllm_custom_all_reduce(
-            inp,
-            out,
-            tp_size,
-            tp_rank,
-            token_num,
-            fusion_op_code,
-            strategy_code,
-            config_code,
-            launch_with_pdl,
-            flag_value,
-            peer_comm_buffer_ptrs,
-            peer_barrier_ptrs_in,
-            peer_barrier_ptrs_out,
-            bias,
-            residual,
-            weight,
-            weight_pre_residual_norm,
-            eps,
-            intermediate_buffer,
-            lamport_peer_comm_buffer_ptrs_0,
-            lamport_peer_comm_buffer_ptrs_1,
-            lamport_peer_comm_buffer_ptrs_2,
-        )
-
     @register_custom_op(
         "flashinfer::trtllm_allreduce_fusion",
         mutates_args=[
@@ -418,7 +339,6 @@ def get_trtllm_comm_module():
     return SimpleNamespace(
         trtllm_lamport_initialize=trtllm_lamport_initialize,
         trtllm_lamport_initialize_all=trtllm_lamport_initialize_all,
-        trtllm_custom_all_reduce=trtllm_custom_all_reduce,
         trtllm_allreduce_fusion=trtllm_allreduce_fusion,
         trtllm_moe_allreduce_fusion=trtllm_moe_allreduce_fusion,
         trtllm_moe_finalize_allreduce_fusion=trtllm_moe_finalize_allreduce_fusion,
@@ -433,120 +353,20 @@ def get_cake_moe_allreduce_module(device_index: int):
     return load(device_index)
 
 
-# NOTE(Yingyi): The customAllReduce and allReduceFusion require different buffer size
-# since allreduceFusion kernels are an improved implementation
-OneShotMaxToken = 128
-MAX_ALL_REDUCE_BLOCKS = 24
-LamportTokenNumThreshold = 16
-
 _symm_workspace_refs: dict[int, list[object]] = {}
-
-
-@deprecated(
-    "trtllm_create_ipc_workspace_for_all_reduce and trtllm_custom_all_reduce are deprecated and will be removed in the next major bump, use allreduce.py instead."
-)
-def trtllm_create_ipc_workspace_for_all_reduce(
-    rank: int,
-    tp_size: int,
-    max_token_num: int,
-    hidden_dim,
-    group: Optional[ProcessGroup] = None,
-) -> List[List[int]]:
-    """
-    Parameters:
-    - rank: the rank of the current process.
-    - tp_size: the size of the process group.
-    - max_token_num: the maximum number of tokens in a sequence.
-    - hidden_dim: the dimension of the hidden states.
-    - group: the process group to use.
-
-    Note:
-    This function is used to create a workspace for all reduce.
-    The workspace is a list of IPC handles.
-    The workspace should be initialized before calling trtllm_custom_all_reduce.
-    The workspace should be destroyed after calling trtllm_custom_all_reduce.
-    The workspace can be reused for multiple all reduce calls under the same configuration.
-
-    We would init 7 IPC buffers for trtllm_custom_all_reduce.
-    They are sized as follows:
-    [buffer_size, buffer_size, flag_size, flag_size, lamport_buffer_size, lamport_buffer_size, lamport_buffer_size]
-    where:
-    - buffer_size: tp_size * max_token_num * hidden_dim * sizeof(float) * (maxBeamWidth)
-    - flag_size: (MAX_ALL_REDUCE_BLOCKS + 1) * sizeof(uint32_t) * tp_size * 2
-    - lamport_buffer_size: tp_size * LamportTokenNumThreshold * tp_size * hidden_dim * sizeof(half)
-
-    They are for:
-    ipcHandles[0] - peer_comm_buffer_ptrs
-    ipcHandles[2] - peer_barrier_ptrs_in
-    ipcHandles[3] - peer_barrier_ptrs_out
-    ipcHandles[4] - lamport_peer_comm_buffer_ptrs[0:tp_size]
-    ipcHandles[5] - lamport_peer_comm_buffer_ptrs[tp_size:tp_size * 2]
-    ipcHandles[6] - lamport_peer_comm_buffer_ptrs[tp_size * 2:tp_size * 3]
-
-    We use tp_size and world_size here interchangeably (customAllReduce).
-
-    Reference: trtllm, cpp/tests/unit_tests/kernels/allReduce/allReduceKernelTest.cu, Workspace init
-    """
-
-    buffer_size = tp_size * max_token_num * hidden_dim * 4
-    FLAG_SIZE = (MAX_ALL_REDUCE_BLOCKS + 1) * 4
-    flag_size = FLAG_SIZE * tp_size * 2
-    lamport_buffer_size = tp_size * LamportTokenNumThreshold * tp_size * hidden_dim * 2
-
-    device = torch.device(f"cuda:{torch.cuda.current_device()}")
-    group_name = (
-        group.group_name
-        if group is not None
-        else torch.distributed.group.WORLD.group_name
-    )
-    symm_refs: list[torch.Tensor] = []
-    ipc_handles = list()
-
-    for size, dtype in [
-        (buffer_size, torch.float32),
-        (buffer_size, torch.float32),
-        (flag_size, torch.int32),
-        (flag_size, torch.int32),
-        (lamport_buffer_size, torch.float16),
-        (lamport_buffer_size, torch.float16),
-        (lamport_buffer_size, torch.float16),
-    ]:
-        aligned_size = round_up(size, 16)
-        ptrs, tensor, handle = _alloc_symm_buffer_bytes(
-            aligned_size,
-            tp_size,
-            dtype,
-            device,
-            group_name,
-        )
-        symm_refs.append((tensor, handle))
-        ipc_handles.append(ptrs)
-
-    logger.debug(
-        "rank %s allocated ipc_handles: %s",
-        rank,
-        [[hex(handle) for handle in sublist] for sublist in ipc_handles],
-    )
-
-    _symm_workspace_refs[id(ipc_handles)] = symm_refs
-
-    trtllm_lamport_initialize_all(
-        ipc_handles[4][rank],
-        ipc_handles[5][rank],
-        ipc_handles[6][rank],
-        lamport_buffer_size // 2,
-        torch.float16,
-    )
-
-    dist.barrier(group=group)  # must sync after create_workspace
-
-    return ipc_handles
 
 
 def trtllm_destroy_ipc_workspace_for_all_reduce(
     workspace: List[List[int]], group: Optional[ProcessGroup] = None
 ) -> None:
-    """Destroy a workspace created by trtllm_create_ipc_workspace_for_all_reduce.
+    """Release the symmetric-memory references held for an IPC workspace.
+
+    Kept for backwards compatibility with existing callers. The legacy
+    ``trtllm_create_ipc_workspace_for_all_reduce`` it was originally paired with
+    has been removed; use
+    :func:`trtllm_destroy_ipc_workspace_for_all_reduce_fusion` for workspaces
+    created by ``trtllm_create_ipc_workspace_for_all_reduce_fusion``. The two
+    are behaviourally identical.
 
     Releases the symmetric memory references held internally. The workspace
     list should not be used after this call.
@@ -889,90 +709,6 @@ def trtllm_lamport_initialize_all(
 
     get_trtllm_comm_module().trtllm_lamport_initialize_all(
         buffer_0_ptr, buffer_1_ptr, buffer_2_ptr, size, dtype
-    )
-
-
-@deprecated(
-    "trtllm_create_ipc_workspace_for_all_reduce and trtllm_custom_all_reduce are deprecated, use trtllm_create_ipc_workspace_for_all_reduce_fusion and trtllm_allreduce_fusion instead"
-)
-def trtllm_custom_all_reduce(
-    inp: torch.Tensor,
-    out: torch.Tensor,
-    tp_size: int,
-    tp_rank: int,
-    token_num: int,
-    fusion_op_code: AllReduceFusionOp,
-    strategy_code: AllReduceStrategyType,
-    config_code: AllReduceStrategyConfig,
-    launch_with_pdl: bool,
-    flag_value: int,
-    peer_comm_buffer_ptrs: torch.Tensor,
-    peer_barrier_ptrs_in: torch.Tensor,
-    peer_barrier_ptrs_out: torch.Tensor,
-    bias: Optional[torch.Tensor],
-    residual: Optional[torch.Tensor],
-    weight: Optional[torch.Tensor],
-    weight_pre_residual_norm: Optional[torch.Tensor],
-    eps: Optional[float],
-    intermediate_buffer: Optional[torch.Tensor],
-    lamport_peer_comm_buffer_ptrs_0: Optional[torch.Tensor],
-    lamport_peer_comm_buffer_ptrs_1: Optional[torch.Tensor],
-    lamport_peer_comm_buffer_ptrs_2: Optional[torch.Tensor],
-) -> None:
-    """
-    Parameters:
-    - inp: the input tensor. [token_num, hidden_dim]
-    - out: the output tensor. [token_num, hidden_dim]
-    - tp_size: the size of the process group.
-    - tp_rank: the rank of the current process.
-    - token_num: the number of tokens in the sequence.
-    - fusion_op_code: the fusion operation code.
-    - strategy_code: the strategy code.
-    - config_code: the config code.
-    - launch_with_pdl: whether to launch with pdl.
-    - flag_value: monotonic counter, same value on all ranks for a given call.
-      Calls that dispatch to the lamport kernel (see ``is_lamport_supported``
-      in the kernel header) need consecutive flag values across those calls:
-      keep a separate counter for them, or re-run
-      ``trtllm_lamport_initialize_all`` before each one. Sharing one counter
-      with other calls silently corrupts the lamport output.
-    - peer_comm_buffer_ptrs: the peer communication buffer pointers.
-    - peer_barrier_ptrs_in: the peer barrier pointers in.
-    - peer_barrier_ptrs_out: the peer barrier pointers out.
-    - bias: the bias tensor. [hidden_dim]
-    - residual: the residual tensor. [token_num, hidden_dim]
-    - weight: the weight tensor. [hidden_dim]
-    - weight_pre_residual_norm: the weight pre residual norm tensor. [hidden_dim]
-    - eps: the epsilon value.
-    - intermediate_buffer: the intermediate buffer tensor.
-    - lamport_peer_comm_buffer_ptrs_0: the lamport peer communication buffer pointers 0.
-    - lamport_peer_comm_buffer_ptrs_1: the lamport peer communication buffer pointers 1.
-    - lamport_peer_comm_buffer_ptrs_2: the lamport peer communication buffer pointers 2.
-    """
-
-    get_trtllm_comm_module().trtllm_custom_all_reduce(
-        inp,
-        out,
-        tp_size,
-        tp_rank,
-        token_num,
-        fusion_op_code,
-        strategy_code,
-        config_code,
-        launch_with_pdl,
-        flag_value,
-        peer_comm_buffer_ptrs,
-        peer_barrier_ptrs_in,
-        peer_barrier_ptrs_out,
-        bias,
-        residual,
-        weight,
-        weight_pre_residual_norm,
-        eps,
-        intermediate_buffer,
-        lamport_peer_comm_buffer_ptrs_0,
-        lamport_peer_comm_buffer_ptrs_1,
-        lamport_peer_comm_buffer_ptrs_2,
     )
 
 
