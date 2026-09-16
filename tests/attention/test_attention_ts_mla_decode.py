@@ -1027,8 +1027,8 @@ def test_attention_ts_mla_balanced_1cta_causal_mask_respects_descriptor_end(
     assert captured is graph_out
 
     for runtime_seq_len in (129, 257):
-        wrapper.replan((runtime_seq_len,))
         case.seq_lens.fill_(runtime_seq_len)
+        wrapper.schedule(case.seq_lens)
         graph_out.fill_(float("nan"))
         graph.replay()
         torch.cuda.synchronize()
@@ -1179,7 +1179,7 @@ def test_attention_ts_mla_balanced_causal_reducer_uses_equal_split_boundaries():
     assert plan is not None
     # This regression targets the four-tile equal-split geometry, independent of
     # whichever target the device's calibrated cost model currently selects.
-    plan._replan_forced_target((32769,), 4)
+    plan.schedule_device(case.seq_lens, forced_target_piece_tiles=4)
     assert plan.last_target_piece_tiles == 4
     assert plan.last_combine_request_count == 1
     combine = plan.combine_descriptors[0].cpu().tolist()
@@ -1198,7 +1198,7 @@ def test_attention_ts_mla_balanced_causal_reducer_uses_equal_split_boundaries():
         captured = _run_case(wrapper, case, out=graph_out, validate=False)
     assert captured is graph_out
 
-    wrapper.replan((32769,))
+    wrapper.schedule(case.seq_lens)
     kernel_workspace = wrapper._plan_state.workspace_views.kernel_workspace
     assert kernel_workspace is not None
     kernel_workspace.fill_(-1)
@@ -1313,6 +1313,7 @@ def test_attention_ts_mla_balanced_1cta_reducer_uses_logical_output_stride(
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
+        wrapper.schedule(case.seq_lens, validate=False)
         captured = _run_case(wrapper, case, out=output, validate=False)
     assert captured is output
 
@@ -1323,7 +1324,6 @@ def test_attention_ts_mla_balanced_1cta_reducer_uses_logical_output_stride(
         (max(seq_len_q, 127), max(seq_len_q, 65)),
         (max_seq_len, max_seq_len),
     ):
-        wrapper.replan(runtime_seq_lens)
         case.seq_lens.copy_(
             torch.tensor(runtime_seq_lens, dtype=torch.int32, device="cuda")
         )
@@ -1379,7 +1379,7 @@ def test_attention_ts_mla_balanced_1cta_reducer_waits_for_pdl_producer():
 )
 @pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
-def test_attention_ts_mla_balanced_replan_across_graph_replay(
+def test_attention_ts_mla_balanced_schedule_across_graph_replay(
     num_qo_heads: int,
     expected_kernel: str,
     qkv_dtype: torch.dtype,
@@ -1420,10 +1420,10 @@ def test_attention_ts_mla_balanced_replan_across_graph_replay(
     assert captured is graph_out
 
     for runtime_seq_lens in ((127, 65), (16385, 129), (32768, 257)):
-        wrapper.replan(runtime_seq_lens)
         case.seq_lens.copy_(
             torch.tensor(runtime_seq_lens, dtype=torch.int32, device="cuda")
         )
+        wrapper.schedule(case.seq_lens)
         kernel_workspace = wrapper._plan_state.workspace_views.kernel_workspace
         if kernel_workspace is not None:
             # Make an early reducer read deterministic and visibly invalid.
@@ -1500,10 +1500,10 @@ def test_attention_ts_mla_balanced_inactive_slots_across_graph_replay(
         (4096,) + (0,) * (batch_size - 1),
         storage_seq_lens,
     ):
-        wrapper.replan(runtime_seq_lens)
         case.seq_lens.copy_(
             torch.tensor(runtime_seq_lens, dtype=torch.int32, device="cuda")
         )
+        wrapper.schedule(case.seq_lens)
         graph_out.fill_(float("nan"))
         wrapper._plan_state.workspace_views.lse.fill_(float("nan"))
         kernel_workspace = wrapper._plan_state.workspace_views.kernel_workspace
@@ -1552,8 +1552,30 @@ def test_attention_ts_mla_balanced_inactive_slots_across_graph_replay(
 
 @pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
+def test_attention_ts_mla_optimized_device_schedule_is_numerically_correct():
+    """The folded device plan may reorder work but must preserve attention results."""
+
+    case = _make_mla_case(
+        batch_size=8,
+        num_qo_heads=16,
+        max_seq_len=32768,
+        kv_seq_lens=(32768, 16384, 8192, 4096, 2048, 1024, 512, 129),
+        qkv_dtype=torch.bfloat16,
+        device="cuda",
+        seed=33703,
+    )
+    wrapper = _plan_case(case, balanced=True)
+
+    wrapper.schedule(case.seq_lens, scheduler="optimized")
+    output = _run_case(wrapper, case)
+
+    _assert_case_correct(output, case, _policy_dict(wrapper))
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
 def test_attention_ts_mla_balanced_validated_run_requires_current_schedule():
-    """Validated runs reject live lengths that were not installed by replan."""
+    """Validated runs reject live lengths that were not installed by schedule."""
 
     case = _make_mla_case(
         batch_size=2,
@@ -1570,10 +1592,10 @@ def test_attention_ts_mla_balanced_validated_run_requires_current_schedule():
     case.seq_lens.copy_(
         torch.tensor(updated_seq_lens, dtype=torch.int32, device="cuda")
     )
-    with pytest.raises(ValueError, match=r"live seq_lens.*replan"):
+    with pytest.raises(ValueError, match=r"live seq_lens.*schedule"):
         _run_case(wrapper, case)
 
-    wrapper.replan(updated_seq_lens)
+    wrapper.schedule(case.seq_lens)
     output = _run_case(wrapper, case)
     _assert_case_correct(output, case, _policy_dict(wrapper))
 
@@ -2764,6 +2786,9 @@ def test_attention_ts_mla_balanced_q64_fp8_mixed_deep_queue_is_stable(
         assert one_cta._plan_state is not None
         one_plan = one_cta._plan_state.balanced_plan
         assert one_plan is not None
+        # This kernel-state regression specifically needs the deep exact/LPT
+        # queue. Production defaults to the shallower optimized fold.
+        one_plan.schedule_device(case.seq_lens, scheduler="exact")
         partition_offsets = one_plan.partition_offsets.cpu()
         partition_depths = partition_offsets[1:] - partition_offsets[:-1]
         assert one_plan.last_descriptor_count == batch_size

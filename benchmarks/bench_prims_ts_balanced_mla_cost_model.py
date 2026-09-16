@@ -4,8 +4,8 @@
 The benchmark forces a deterministic set of piece-size targets through the
 same replay-stable descriptor ABI used in production, times captured decode
 graphs, fits the six scheduler coefficients independently for each kernel
-family and input dtype, and validates the fitted model through the native
-planner. Results are append-only JSONL and can be resumed safely.
+family and input dtype, and validates the fitted model through the optimized
+CUDA scheduler. Results are append-only JSONL and can be resumed safely.
 
 After a completed measurement run, use ``--resume --refit-generation N`` to
 reuse that exact measurement cohort with a new fitting implementation. The
@@ -44,11 +44,11 @@ import numpy as np
 import torch
 
 from flashinfer.attention.prims_ts import BatchMLADecodePagedTSWrapper
+from flashinfer.attention.prims_ts._balanced_plan import BalancedMLADecodePlan
 from flashinfer.attention.prims_ts._balanced_scheduler import (
     B200_BF16_2CTA_COST,
     BalancedCostModel,
     balanced_cost_bucket,
-    build_balanced_schedule,
 )
 
 
@@ -78,8 +78,8 @@ COST_BUCKETS = (
     "dense_small",
     "dense_large",
 )
-ARTIFACT_SCHEMA_VERSION = 3
-MEASUREMENT_METHOD_VERSION = "native-forced-schedule-graph-v2"
+ARTIFACT_SCHEMA_VERSION = 4
+MEASUREMENT_METHOD_VERSION = "optimized-cuda-forced-schedule-graph-v3"
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _SOURCE_SUFFIXES = frozenset((".cc", ".cu", ".cuh", ".h", ".py"))
 _MEASUREMENT_SOURCE_SYMBOLS = frozenset(
@@ -129,7 +129,6 @@ _FIT_SOURCE_SYMBOLS = frozenset(
         "normalized_cost",
         "observed_schedule_latency",
         "predicted_schedule_latency",
-        "schedule_snapshot_from_reference",
         "select_fit_generation",
         "stage_recorded_schedule",
         "tune_selection_cost_model",
@@ -313,13 +312,13 @@ def _hash_python_symbols(
 
 
 def measurement_source_identity(root: Path = _REPO_ROOT) -> dict[str, Any]:
-    """Fingerprint the benchmark, planner, emitter, and PrimsTS MLA sources."""
+    """Fingerprint the benchmark, CUDA scheduler, and PrimsTS MLA sources."""
 
     roots = (
         root / "flashinfer/attention/prims_ts",
         root / "flashinfer/jit/prims_balanced_mla.py",
         root / "csrc/prims_balanced_mla_plan.cu",
-        root / "csrc/prims_balanced_mla_scheduler.cu",
+        root / "csrc/prims_balanced_mla_scheduler_device.cu",
         root / "csrc/prims_balanced_mla_scheduler.cuh",
     )
     source_files = set()
@@ -809,44 +808,6 @@ def schedule_snapshot(plan) -> dict[str, Any]:
     }
 
 
-def schedule_snapshot_from_reference(schedule) -> dict[str, Any]:
-    """Encode a reference schedule with the native packed descriptor ABI."""
-
-    work_descriptors = []
-    for descriptor in schedule.descriptors:
-        request_idx = descriptor.request_idx
-        split_count = schedule.split_counts[request_idx]
-        split_info = 0
-        if split_count > 1:
-            split_begin = schedule.split_begins[request_idx]
-            split_global = split_begin + descriptor.local_split_idx
-            split_info = (
-                1
-                | ((split_global & 0xFFF) << 1)
-                | ((split_count & 0x7F) << 13)
-                | ((split_begin & 0xFFF) << 20)
-            )
-        work_descriptors.append(
-            [
-                request_idx,
-                descriptor.k_tile_start,
-                descriptor.k_tile_start + descriptor.k_tile_count,
-                split_info,
-            ]
-        )
-    combine_descriptors = [
-        [request_idx, split_count, schedule.split_begins[request_idx], 0]
-        for request_idx, split_count in enumerate(schedule.split_counts)
-        if split_count > 1
-    ]
-    return {
-        "work_descriptors": work_descriptors,
-        "partition_offsets": list(schedule.partition_offsets),
-        "combine_descriptors": combine_descriptors,
-        "num_combine_descriptors": len(combine_descriptors),
-    }
-
-
 def schedule_sha256(snapshot: dict[str, Any]) -> str:
     """Return a stable identity for one exact emitted schedule."""
 
@@ -892,12 +853,17 @@ def schedule_statistics(snapshot: dict[str, Any]) -> dict[str, Any]:
 def stage_forced_target(
     plan, seq_lens: Sequence[int], target: int
 ) -> dict[str, Any] | None:
-    """Stage a forced target through the production native placement/emitter."""
+    """Stage a forced target through the production optimized CUDA scheduler."""
 
     split_counts = forced_target_split_counts(plan, seq_lens, target)
     if split_counts is None:
         return None
-    plan._replan_forced_target(seq_lens, target)
+    device_seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=plan.device)
+    plan.schedule_device(
+        device_seq_lens,
+        scheduler="optimized",
+        forced_target_piece_tiles=target,
+    )
     snapshot = schedule_snapshot(plan)
     return {
         **schedule_statistics(snapshot),
@@ -1103,13 +1069,14 @@ def tune_selection_cost_model(
     cases: Sequence[CalibrationCase],
     latency_fit_cost: BalancedCostModel,
     latency_fit_case_intercepts_us: dict[str, float],
+    device: torch.device,
 ) -> tuple[BalancedCostModel, dict[str, Any]]:
     """Tune directly for measured planner selection regret.
 
     A latency least-squares fit is useful as a seed, but is not by itself a
     safe scheduler objective: fitted split overhead also enters hard target
-    floors.  This deterministic derivative-free search evaluates the exact
-    production scheduler. Exact schedule matches use direct timings; unseen
+    floors. This deterministic derivative-free search evaluates the optimized
+    production CUDA scheduler. Exact schedule matches use direct timings; unseen
     placements use the latency fit evaluated on that candidate's own
     partition features. This deliberately does not treat target size as a
     complete schedule identity.
@@ -1178,6 +1145,22 @@ def tune_selection_cost_model(
         tuple[int, ...],
         tuple[float, dict[str, float], dict[str, int], dict[str, str]],
     ] = {}
+    selector_plans = {
+        case.name: BalancedMLADecodePlan(
+            batch_size=len(case.seq_lens),
+            num_partitions=num_partitions[case.name],
+            device=device,
+            cost=latency_fit_cost,
+            kernel_family=family,
+            dtype_name=dtype_name,
+            max_seq_len=case.max_kv_len,
+        )
+        for case in selected_cases
+    }
+    selector_seq_lens = {
+        case.name: torch.tensor(case.seq_lens, dtype=torch.int32, device=device)
+        for case in selected_cases
+    }
 
     def evaluate(cost: BalancedCostModel):
         key = tuple(asdict(cost).values())
@@ -1187,14 +1170,14 @@ def tune_selection_cost_model(
         targets: dict[str, int] = {}
         schedule_ids: dict[str, str] = {}
         for case in selected_cases:
-            schedule = build_balanced_schedule(
-                case.seq_lens,
-                num_partitions=num_partitions[case.name],
-                k_tile_tokens=128,
-                cost=cost,
+            plan = selector_plans[case.name]
+            plan.cost = cost
+            plan.schedule_device(
+                selector_seq_lens[case.name],
+                scheduler="optimized",
             )
-            targets[case.name] = schedule.target_piece_tiles
-            snapshot = schedule_snapshot_from_reference(schedule)
+            targets[case.name] = plan.last_target_piece_tiles
+            snapshot = schedule_snapshot(plan)
             schedule_id = schedule_sha256(snapshot)
             schedule_ids[case.name] = schedule_id
             latency = observed_schedule_latency(rows_by_case[case.name], schedule_id)
@@ -1552,6 +1535,7 @@ def main() -> None:
                         bucket_cases,
                         latency_fit_cost,
                         intercepts,
+                        device,
                     )
                     fit_record = {
                         "record": "fit",
@@ -1600,29 +1584,11 @@ def main() -> None:
                             f"{runtime_bucket} != {bucket}"
                         )
                     plan.cost = cost
-                    plan.replan(case.seq_lens)
+                    plan.schedule_device(runtime.seq_lens, scheduler="optimized")
                     selected_target = plan.last_target_piece_tiles
                     selected_snapshot = schedule_snapshot(plan)
                     selected_schedule_id = schedule_sha256(selected_snapshot)
                     selected_stats = schedule_statistics(selected_snapshot)
-                    python_schedule = build_balanced_schedule(
-                        case.seq_lens,
-                        num_partitions=plan.num_partitions,
-                        k_tile_tokens=plan.k_tile_tokens,
-                        cost=cost,
-                    )
-                    if selected_target != python_schedule.target_piece_tiles:
-                        raise RuntimeError(
-                            "native/Python planner target mismatch: "
-                            f"{selected_target} != "
-                            f"{python_schedule.target_piece_tiles}"
-                        )
-                    python_snapshot = schedule_snapshot_from_reference(python_schedule)
-                    if selected_snapshot != python_snapshot:
-                        raise RuntimeError(
-                            "native/Python planner placement mismatch: "
-                            f"{family}/{dtype_name}/{case.name}/{selected_target}"
-                        )
                     runtime.graph.replay()
                     torch.cuda.synchronize()
                     max_abs_diff = check_output(runtime)

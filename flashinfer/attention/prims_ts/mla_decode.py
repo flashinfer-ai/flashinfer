@@ -478,7 +478,7 @@ def _validate_mla_run_metadata(
     if state.planned_seq_lens is not None and seq_lens_host != state.planned_seq_lens:
         raise ValueError(
             "balanced MLA live seq_lens must exactly match the installed "
-            "schedule; call replan() with the new CPU lengths before run()"
+            "schedule; call schedule() with the live CUDA lengths before run()"
         )
     runtime_max_kv_len = max(seq_lens_host)
     if runtime_max_kv_len > state.max_kv_len:
@@ -1843,7 +1843,7 @@ class BatchMLADecodePagedTSWrapper:
         """Return immutable policy and balanced cost-model provenance.
 
         The returned mappings are snapshots. For balanced plans, request this
-        property again after :meth:`replan` to observe the newly selected
+        property again after a validated :meth:`schedule` call to observe the selected
         workload bucket and coefficients.
         """
 
@@ -1887,8 +1887,7 @@ class BatchMLADecodePagedTSWrapper:
         Standard planning consumes only compile-time geometry, capacity,
         dtype, and storage-mode inputs. Balanced planning additionally retains
         the normalized K/V lengths and replay-stable schedule descriptors.
-        A successful re-plan atomically replaces the previous immutable state;
-        a failed re-plan leaves that state usable.
+        Initial descriptor placement runs through the optimized CUDA scheduler.
 
         ``packed_query=False`` selects fixed ``[B, SQ, H, 576]`` query storage,
         where ``SQ`` is exactly ``max_seq_len_q``. ``packed_query=True`` selects
@@ -1925,10 +1924,10 @@ class BatchMLADecodePagedTSWrapper:
             is exclusive to one in-flight launch or graph replay.
         balanced : bool, optional
             Use replay-stable compact balanced scheduling.
-        balanced_seq_lens : sequence or CPU torch.Tensor, optional
+        balanced_seq_lens : sequence or torch.Tensor, optional
             Initial K/V lengths used to build a balanced schedule. Required
-            when ``balanced=True``; later schedules may be installed in-place
-            with :meth:`replan` without changing captured tensor addresses.
+            when ``balanced=True``; later CUDA schedules may be installed in-place
+            with :meth:`schedule` without changing captured tensor addresses.
         """
 
         if not isinstance(packed_query, bool):
@@ -2030,6 +2029,7 @@ class BatchMLADecodePagedTSWrapper:
                 dtype_name=_kernel_dtype_name(_dtype_key(q_data_type)),
                 calibration=balanced_calibration,
                 cost_source="calibration-bootstrap",
+                max_seq_len=max_kv_len,
             )
             assert balanced_seq_lens is not None
             normalized_seq_lens = balanced_plan._normalize_seq_lens(balanced_seq_lens)
@@ -2038,11 +2038,16 @@ class BatchMLADecodePagedTSWrapper:
                     "every balanced K/V length must be non-negative and no larger "
                     f"than max_kv_len ({max_kv_len})"
                 )
-            balanced_plan._replan_normalized(normalized_seq_lens)
+            initial_device_seq_lens = torch.tensor(
+                normalized_seq_lens,
+                dtype=torch.int32,
+                device=device,
+            )
+            balanced_plan.schedule_device(initial_device_seq_lens)
             planned_seq_lens = normalized_seq_lens
 
-        # Publish only after validation, compilation, allocation, and binding
-        # succeed, so a failed re-plan leaves the previous plan usable.
+        # Publish only after validation, compilation, allocation, scheduling,
+        # and binding succeed, so a failed plan leaves the previous state usable.
         self._plan_state = _MLADecodePlanState(
             device=device,
             batch_size=batch_size,
@@ -2165,19 +2170,18 @@ class BatchMLADecodePagedTSWrapper:
     ) -> None:
         """Compile a balanced plan and seed its replay-stable schedule.
 
-        Balanced planning is replay-compatible host work, but is not capture
-        safe: it compiles/allocates, builds descriptors, and synchronizes the
-        planning stream. Create one wrapper per static batch bucket and
+        Balanced planning is not capture safe: it compiles/allocates, runs the
+        optimized CUDA scheduler, and synchronizes the planning stream. Create
+        one wrapper per static batch bucket and
         compatible attention geometry outside capture. Query, cache, metadata,
         and output remain run-owned, so compatible sequential layers may reuse
         one wrapper and schedule. The mutable schedule and workspace must not
         be used concurrently; independent streams require separate wrappers or
         explicit ordering.
 
-        Before each replay whose K/V lengths change, call :meth:`replan` once
-        with the new CPU lengths, update the live CUDA ``seq_lens`` and page
-        tables, and order those updates before replay. A captured nonvalidating
-        run requires its live lengths to exactly match the last planned lengths.
+        For production replay, capture :meth:`schedule` once before all
+        compatible sequential MLA layers. It reads the live CUDA ``seq_lens``
+        and rebuilds the descriptors on every replay without a host round trip.
         Retain the wrapper, optional caller workspace, descriptors, metadata,
         and output buffers for the graph lifetime.
 
@@ -2201,7 +2205,7 @@ class BatchMLADecodePagedTSWrapper:
             Select packed rather than fixed query storage.
         q_data_type, kv_data_type, o_data_type : torch.dtype
             Query, K/V, and output dtypes used to compile the plan.
-        seq_lens : sequence or CPU torch.Tensor
+        seq_lens : sequence or torch.Tensor
             Initial non-negative K/V lengths used to build the schedule. Zero
             marks an inactive request slot whose output is deterministically
             filled with zero.
@@ -2230,15 +2234,17 @@ class BatchMLADecodePagedTSWrapper:
                 o_data_type=torch.bfloat16, seq_lens=host_lengths,
                 workspace_buffer=workspace,
             )
+            wrapper.schedule(seq_lens)
             wrapper.run(query, cache, page_table, seq_lens, out=out)
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
+                # Capture this once before all compatible MLA layers.
+                wrapper.schedule(seq_lens, validate=False)
                 wrapper.run(
                     query, cache, page_table, seq_lens,
                     out=out, validate=False,
                 )
 
-            wrapper.replan(next_host_lengths)
             seq_lens.copy_(next_device_lengths)
             page_table.copy_(next_page_table)
             graph.replay()
@@ -2303,7 +2309,7 @@ class BatchMLADecodePagedTSWrapper:
 
         Returns ``True`` when a balanced plan was installed and ``False`` when
         the standard plan was installed. If the result is ``True``, call
-        :meth:`replan` before replays whose live lengths change. Explicit
+        capture :meth:`schedule` before the balanced runs. Explicit
         :meth:`plan` and :meth:`plan_balanced` remain the force-standard and
         force-balanced APIs, respectively.
 
@@ -2365,31 +2371,54 @@ class BatchMLADecodePagedTSWrapper:
         return use_balanced
 
     @flashinfer_api
-    def replan(self, seq_lens: list[int] | tuple[int, ...] | torch.Tensor) -> None:
-        """Refill a balanced plan in-place before replaying captured runs.
+    def schedule(
+        self,
+        seq_lens: torch.Tensor,
+        *,
+        validate: bool = True,
+        scheduler: Literal["exact", "optimized"] = "optimized",
+    ) -> None:
+        """Build a balanced schedule from live device sequence lengths.
 
-        ``seq_lens`` must be CPU-resident. The caller remains responsible for
-        updating the live CUDA ``seq_lens`` tensor used by the attention math;
-        this method updates only the compact scheduling descriptors. Replanning
-        is not capture safe and currently synchronizes the active CUDA stream
-        before returning. Order the live metadata update and subsequent replay
-        after it. A validating run checks that its live lengths exactly match
-        the most recent successful replan. A zero length marks an inactive slot
-        and produces deterministic zero output for all of that slot's Q rows.
+        Capture this call once before all compatible sequential MLA layers.
+        The captured scheduler runs on every replay and publishes descriptors
+        consumed by subsequent :meth:`run` calls on the same stream. It must
+        not be called separately for each layer.
+
+        ``validate=False`` is the synchronization-free CUDA-graph path. Static
+        tensor shape, dtype, and device are still checked, while dynamic value
+        errors are recorded in device metadata. ``validate=True`` synchronizes,
+        reports those errors, and makes validating :meth:`run` calls check that
+        they receive the same lengths. ``scheduler="optimized"`` is the
+        production default; ``scheduler="exact"`` selects the deterministic
+        reference placement.
         """
 
         state = self._plan_state
         if state is None:
-            raise RuntimeError("plan() must be called before replan()")
+            raise RuntimeError("plan() must be called before schedule()")
         if state.balanced_plan is None:
-            raise RuntimeError("replan() requires a balanced plan")
-        normalized = state.balanced_plan._normalize_seq_lens(seq_lens)
-        if any(seq_len > state.max_kv_len for seq_len in normalized):
-            raise ValueError(
-                "every re-planned KV length must be non-negative and no larger "
-                f"than max_kv_len ({state.max_kv_len})"
-            )
-        state.balanced_plan._replan_normalized(normalized)
+            raise RuntimeError("schedule() requires a balanced plan")
+        if not isinstance(validate, bool):
+            raise TypeError("validate must be a bool")
+        if not isinstance(scheduler, str):
+            raise TypeError("scheduler must be a string")
+        if scheduler not in {"exact", "optimized"}:
+            raise ValueError("scheduler must be 'exact' or 'optimized'")
+
+        normalized = None
+        if validate:
+            normalized = state.balanced_plan._normalize_seq_lens(seq_lens.cpu())
+            if any(seq_len > state.max_kv_len for seq_len in normalized):
+                raise ValueError(
+                    "every scheduled KV length must be non-negative and no larger "
+                    f"than max_kv_len ({state.max_kv_len})"
+                )
+        state.balanced_plan.schedule_device(
+            seq_lens,
+            validate=validate,
+            scheduler=scheduler,
+        )
         self._plan_state = replace(state, planned_seq_lens=normalized)
 
     @flashinfer_api(trace=prims_ts_decode_mla_wrapper_trace_dispatch)
