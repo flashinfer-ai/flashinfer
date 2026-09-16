@@ -87,7 +87,7 @@ The ported sources passed 361 Frontend tests, 4 grouped block-scale cases and
 run passed 5 cases and memcheck passed 43 cases with zero errors. Changed-file
 hooks pass; runtime, test and binding hashes were frozen during these runs.
 
-A subsequent fix catches cuDNN's dedicated `cudnnGraphNotSupportedError` when
+FlashInfer now catches cuDNN's dedicated `cudnnGraphNotSupportedError` when
 shared-input FC1 fusion declines, allowing the existing FP32 FC1 plus activation
 fallback to run. On full B200, the exact new regression fails against the old
 method with that exception; the corrected source passes both decline variants,
@@ -103,11 +103,17 @@ including runs with zero reported race hazards. The separately reported PyTorch
 cuBLAS failure. Staged module/plan/forward diagnostics pass; the public test's
 capture-and-live-weight sequence still fails under racecheck. Keep the failure
 visible and continue isolating it. No numerical tolerance was relaxed.
-Further staged diagnostics pass after separately capturing FC1, FC2, or both
-GEMMs and then making eight reference calls. Capturing the complete native-routing
-MoE still fails on the first subsequent reference call. Native routing,
-permutation and finalization capture interactions remain under investigation;
-this localization is not a root-cause finding or a blanket kernel clearance.
+Further staged diagnostics pass after separately capturing FC1, FC2, both
+GEMMs, permutation, or finalization and then making eight reference calls.
+Capturing native sort alone reproduces the failure. A reduced case constructs
+no MoELayer and runs no Frost GEMM: ordinary native-sort capture and eager
+racecheck both pass eight changing-ID/weight iterations, while captured native
+sort under racecheck fails in the first subsequent `cublasSgemm`. Captured sort
+metadata passes its CPU offset/bijection checks before the reference fails.
+Only the independently reproduced `MaxNanFunctor` hazards are excluded from
+these diagnostic racecheck runs. Frost execution is not a necessary condition
+for this reproducer; the native-routing/capture/instrumentation cause remains
+unresolved. The original failing regression is retained.
 
 The old-snapshot finalizer range comparison also remains incomplete. A native
 routing-only reproducer passes unfiltered racecheck but fails when the original
@@ -142,7 +148,13 @@ Recommended continuation order:
    fixes for the native utility JIT architecture whitelist and the dedicated
    `cudnnGraphNotSupportedError` fallback. The fallback fix is now included in
    this draft; the native utility JIT whitelist and public SM120 support remain
-   unchanged. Sanitizer and performance comparisons are pending.
+   unchanged. The same two configurations and T17/T257 cases now also pass
+   unfiltered memcheck and racecheck for both routing paths on a full 188-SM,
+   600-W RTX PRO 6000 Blackwell Server Edition (112 numerical checks and 64
+   stale-output negative controls across four instrumented processes; zero
+   errors/hazards). Broader H2048/I1024 validation is pending, followed by explicit
+   tactic sweeps and full-MoE backend comparisons. These small-case checks do not
+   establish public support or a performance advantage.
 4. Continue kernel and tuning work only when candidates survive correctness,
    changed-input capture, actual routes and complete-MoE confirmation.
 
