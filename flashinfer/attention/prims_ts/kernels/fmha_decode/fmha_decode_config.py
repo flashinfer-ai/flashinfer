@@ -1385,9 +1385,17 @@ class FmhaDecodeConfig:
         """Return the streamed score fragments that share one route origin.
 
         Route origins are staged per K64 atom, so a 128-token KV block spans
-        two origins; the fragment-to-origin mapping follows the atom.
+        two origins; the fragment-to-origin mapping follows the atom. On the
+        Keeps profiles the route atom is the layout atom
+        (``keeps_fragments_per_atom``), which the spatial-half ownership of
+        route atoms relies on.
         """
-        return self.block_sparse_kv_atom_size // self.softmax_score_fragment_regs
+        fragments = self.block_sparse_kv_atom_size // self.softmax_score_fragment_regs
+        if self.use_keeps_mma_ab:
+            assert fragments == self.keeps_fragments_per_atom, (
+                "Keeps block-sparse routes need the layout atom as route atom"
+            )
+        return fragments
 
     @property
     def uses_ws_2x2_datapath(self) -> bool:
@@ -1399,6 +1407,52 @@ class FmhaDecodeConfig:
         return self.tile_size_kv == 256
 
     @property
+    def keeps_spatial_halves(self) -> int:
+        """Return the Keeps lane halves that own distinct KV tokens of one row.
+
+        KV256's 2x2 datapath gives warp-group threads ``[0, 64)`` and
+        ``[64, 128)`` the two spatial KV128 partials of one logical Q row: of
+        a block-sparse route's four K64 atoms, the first half owns atoms 0
+        and 2 and the second half atoms 1 and 3, so per-half state such as
+        staged route scales exists once per half. Every other Keeps profile
+        has one half that owns the whole tile. ``_keeps_spatial_half`` in
+        ``helpers_common`` maps a thread to its half; ``_keeps_route_atom``
+        there and ``keeps_route_atom_owner`` map between a half's atoms and
+        the route's.
+        """
+        return 2 if self.uses_ws_2x2_datapath else 1
+
+    def keeps_route_atom_owner(self, atom: int) -> tuple[int, int]:
+        """Return ``(half, position)`` of a route atom.
+
+        The halves interleave over the route's atoms: half ``h`` owns atoms
+        ``h``, ``h + halves``, ... in order, so atom ``a`` is atom ``a //
+        halves`` of half ``a % halves`` (``_keeps_route_atom`` in
+        ``helpers_common`` is the inverse).
+        """
+        halves = self.keeps_spatial_halves
+        return atom % halves, atom // halves
+
+    @property
+    def keeps_fragments_per_atom(self) -> int:
+        """Return the K32 score fragments of one Keeps layout atom.
+
+        The KV256 datapath interleaves the tile's KV64 atoms over the two
+        spatial halves (``_keeps_route_atom``), and each atom is two streamed
+        K32 fragments: fragment ``f`` of a thread is the low or high half of
+        its half's atom ``f // 2``. A one-half profile has the same mapping,
+        where the interleave is the identity. The block-sparse route atom has
+        the same token span, which ``softmax_fragments_per_route_atom``
+        checks, so route words and dense tiles share one atom arithmetic.
+        """
+        return 2
+
+    @property
+    def keeps_atom_tokens(self) -> int:
+        """Return the K tokens of one Keeps layout atom."""
+        return self.keeps_fragments_per_atom * self.softmax_score_fragment_regs
+
+    @property
     def proxy_summary_geometry(self) -> tuple[int, int]:
         """Return ``(summary count, final summary's token mass)`` of proxy routes.
 
@@ -1408,6 +1462,12 @@ class FmhaDecodeConfig:
         return _block_sparse_proxy_summary_geometry(
             self.static_seq_len_kv, self.kv_block_size
         )
+
+    @property
+    def num_proxy_summaries(self) -> int:
+        """Return the length of the summary sequence proxy routes address."""
+        num_summaries, _ = self.proxy_summary_geometry
+        return num_summaries
 
     @property
     def proxy_log2_block_mass(self) -> float:
@@ -1432,6 +1492,48 @@ class FmhaDecodeConfig:
         """
         num_summaries, tail_mass = self.proxy_summary_geometry
         return num_summaries - 1, math.log2(tail_mass) - math.log2(self.kv_block_size)
+
+    @property
+    def num_proxy_groups(self) -> int:
+        """Return the fixed summary groups that make up the proxy routes.
+
+        The prepare kernel splits the summary sequence into groups of
+        ``tile_size_kv`` consecutive summaries and emits one proxy record per
+        group, up to the group holding the final summary, whether or not the
+        row selects a block in it.
+        """
+        return (self.num_proxy_summaries + self.tile_size_kv - 1) // self.tile_size_kv
+
+    @property
+    def proxy_static_tail_fragment(self) -> tuple[int, int]:
+        """Return ``(spatial half, fragment)`` holding the ragged final summary.
+
+        Proxy routes are fixed summary groups: the record of group ``k``
+        carries the atom origins ``k * tile_size_kv + atom * atom_size``
+        (``-1`` for an atom past the sequence end), so the final summary sits
+        in the last group at the compile-time in-group position
+        ``tail_summary_idx % tile_size_kv``: in a fixed atom, and hence in a
+        fixed streamed K32 fragment of a fixed Keeps spatial half
+        (``keeps_route_atom_owner``). A consumer of a multi-group sequence
+        tells the last group apart by its first atom origin, ``(num_proxy_groups
+        - 1) * tile_size_kv`` plus the half's first atom. Requires the Keeps
+        K64 atom, which spans two fragments. The result is only meaningful
+        when ``proxy_tail_summary`` reports a non-zero shortfall: a sequence
+        that ends on a block boundary has no ragged summary to shift.
+        """
+        atom_size = self.block_sparse_kv_atom_size
+        fragment_regs = self.softmax_score_fragment_regs
+        assert atom_size == 2 * fragment_regs, (
+            "the proxy tail location requires the K64 Keeps atom"
+        )
+        tail_summary_idx, _ = self.proxy_tail_summary
+        in_group_idx = tail_summary_idx % self.tile_size_kv
+        half, position = self.keeps_route_atom_owner(in_group_idx // atom_size)
+        fragment_idx = (
+            position * self.softmax_fragments_per_route_atom
+            + (in_group_idx % atom_size) // fragment_regs
+        )
+        return half, fragment_idx
 
     @property
     def num_packed_p_regs(self) -> int:
@@ -1665,17 +1767,10 @@ class FmhaDecodeConfig:
             )
         if self.use_paged_kv or self.headdim != 128:
             raise ValueError("Sage attention requires contiguous K/V with headdim=128")
-        if self.use_block_sparse:
-            raise ValueError("Sage attention does not support block-sparse routes yet")
         if not self.streams_tmem_p_fragments:
             raise ValueError(
                 "Sage attention requires a two-instance Keeps profile: "
                 "Q64/KV256 or Q128/KV128"
-            )
-        if self.use_persistent_scheduler:
-            raise ValueError(
-                "Sage attention supports the static grid only; the persistent "
-                "scheduler is unsupported"
             )
         self._require_direct_output_grid()
 
@@ -1697,14 +1792,17 @@ class FmhaDecodeConfig:
             return
         self._require_direct_output_grid()
 
-        if not (self.q_dtype == self.k_dtype == self.v_dtype == self.out_dtype):
-            raise ValueError(
-                "block-sparse requires q_dtype == k_dtype == v_dtype == out_dtype"
-            )
-        if self.q_dtype not in (Float16, BFloat16):
-            raise ValueError(
-                "block-sparse supports only matching Float16 or BFloat16 IO"
-            )
+        # Sage attention dequantizes 8-bit Q/K/V into a 16-bit output; its
+        # dtype recipe is validated by ``validate_dtypes``.
+        if not self.use_sage_attention:
+            if not (self.q_dtype == self.k_dtype == self.v_dtype == self.out_dtype):
+                raise ValueError(
+                    "block-sparse requires q_dtype == k_dtype == v_dtype == out_dtype"
+                )
+            if self.q_dtype not in (Float16, BFloat16):
+                raise ValueError(
+                    "block-sparse supports only matching Float16 or BFloat16 IO"
+                )
 
         kv_block_size = _validate_sparse_kv_block_size(self.kv_block_size)
         selected_q_tile = _select_block_sparse_q_tile_size(
@@ -1726,15 +1824,15 @@ class FmhaDecodeConfig:
             and not self.use_parallel_sparse_kv_loads
         ):
             raise ValueError(
-                "block-sparse tile_size_kv=256 requires the Q64 16-bit Keeps "
-                "profile with coarse KV blocks and one load task"
+                "block-sparse tile_size_kv=256 requires the Q64 Keeps profile "
+                "with coarse KV blocks and one load task"
             )
         if self.use_keeps_mma_ab and not self.streams_tmem_p_fragments:
             # The block-sparse Keeps softmax and P passes exist only in their
             # streamed K32-fragment form.
             raise ValueError(
                 "block-sparse KeepsMmaAb requires a streamed TMEM-P profile "
-                "(Q64/KV256 or 16-bit Q128/KV128)"
+                "(Q64/KV256 or Q128/KV128)"
             )
         if self.tile_size_q != selected_q_tile:
             raise ValueError(
@@ -2414,7 +2512,7 @@ class FmhaDecodeConfig:
         # below. Block-sparse structural, masking, and reduction constraints
         # are validated separately, and a dense contiguous launch is direct.
         if self.use_block_sparse:
-            return profile in _CONTIGUOUS_GROUPED_KEEPS_PROFILES
+            return self._uses_contiguous_grouped_keeps_recipe
         if (
             self._uses_contiguous_grouped_keeps_recipe
             and direct

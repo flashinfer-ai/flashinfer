@@ -37,7 +37,7 @@ from flashinfer.utils import ceil_div
 
 SAGE_K_BLOCK_SIZES = (16, 32, 64, 128, 256)
 # The Sage scale slots of the contiguous attention adapter, in ABI order.
-SAGE_ADAPTER_SLOTS = ("q_scale", "k_scale", "v_scale", "v_mean")
+SAGE_ADAPTER_SLOTS = ("q_scale", "k_scale", "k_summary_scale", "v_scale", "v_mean")
 
 _T = TypeVar("_T")
 
@@ -62,14 +62,17 @@ class SageAttentionConfig:
 class SageAttentionParams:
     """Per-block Q/K scales and per-channel V scales of one run.
 
-    ``q_scale`` is fp32 ``[Hq, flat_scale_numel(B, Sq, q_block_size)]`` and
-    ``k_scale`` is fp32 ``[Hkv, flat_scale_numel(B, Skv, k_block_size)]`` in
+    ``q_scale`` is FP32 ``[Hq, flat_scale_numel(B, Sq, q_block_size)]`` and
+    ``k_scale`` is FP32 ``[Hkv, flat_scale_numel(B, Skv, k_block_size)]`` in
     the trtllm-gen flat layout, with the block sizes of the plan's
-    :class:`SageAttentionConfig`. ``v_scale`` and ``v_mean`` are fp32
+    :class:`SageAttentionConfig`. ``v_scale`` and ``v_mean`` are FP32
     ``[Hkv, D]``; ``v_mean`` is present exactly when the plan's
-    :class:`SageAttentionConfig` has ``v_mean=True``. ``k_summary_scale`` carries the flat-layout scales of
-    block-sparse proxy summaries and is not consumed by dense attention. Every
-    scale must be positive and finite; the kernel does not check the values.
+    :class:`SageAttentionConfig` has ``v_mean=True``. ``k_summary_scale`` is FP32
+    ``[Hkv, flat_scale_numel(B, num_kv_blocks, k_block_size)]``: the flat-layout
+    scales of block-sparse proxy K summaries, quantized as one more K sequence
+    of ``num_kv_blocks`` tokens. It is required by proxy plans and rejected
+    otherwise. Every scale must be positive and finite; the kernel does not
+    check the values.
     """
 
     q_scale: torch.Tensor
@@ -106,9 +109,9 @@ def log2_block_size(block_size: int) -> int:
 def sage_adapter_slots(values: Mapping[str, _T | None]) -> tuple[_T | None, ...]:
     """Arrange Sage values named by scale into the adapter slots.
 
-    A slot whose name is absent or ``None`` stays ``None``: a recipe without
-    a V mean leaves the ``v_mean`` slot empty and the adapter binds a null
-    pointer for it.
+    A slot whose name is absent or ``None`` stays ``None``: only a proxy plan
+    binds ``k_summary_scale`` and only a recipe with a V mean binds
+    ``v_mean``; the adapter binds a null pointer for an empty slot.
     """
 
     return tuple(values.get(name) for name in SAGE_ADAPTER_SLOTS)
@@ -159,12 +162,14 @@ def sage_scale_shapes(
     num_qo_heads: int,
     num_kv_heads: int,
     head_dim: int,
+    summary_seq_len: int | None = None,
 ) -> dict[str, tuple[int, int]]:
     """Return the shape of every scale tensor a plan consumes, by field name.
 
     Q/K scales are ``[heads, flat slots]`` in the flat layout of the recipe's
-    block sizes, V scales and means are ``[kv heads, head dim]``; ``v_mean``
-    appears only when the recipe has one.
+    block sizes, V scales and means are ``[kv heads, head dim]``. The K
+    summary scales appear only for a proxy plan, whose ``summary_seq_len`` is
+    its number of KV blocks, and ``v_mean`` only when the recipe has one.
     """
 
     shapes = {
@@ -178,6 +183,11 @@ def sage_scale_shapes(
         ),
         "v_scale": (num_kv_heads, head_dim),
     }
+    if summary_seq_len is not None:
+        shapes["k_summary_scale"] = (
+            num_kv_heads,
+            flat_scale_numel(batch_size, summary_seq_len, config.k_block_size),
+        )
     if config.v_mean:
         shapes["v_mean"] = (num_kv_heads, head_dim)
     return shapes
@@ -194,11 +204,15 @@ def validate_sage_params(
     num_kv_heads: int,
     head_dim: int,
     device: torch.device,
+    summary_seq_len: int | None = None,
 ) -> None:
     """Validate the scale tensors of one run against the planned recipe.
 
     Plan compilation validates the recipe; this validates what a run supplies:
     the tensors and their agreement with ``config.v_mean``.
+    ``summary_seq_len`` is the number of KV blocks of a proxy plan;
+    ``k_summary_scale`` must then cover that summary sequence in the flat
+    layout and must be absent otherwise.
     """
 
     if not isinstance(params, SageAttentionParams):
@@ -208,10 +222,12 @@ def validate_sage_params(
             "v_mean is required by a plan configured with v_mean=True and "
             "rejected otherwise"
         )
-    if params.k_summary_scale is not None:
+    if summary_seq_len is None and params.k_summary_scale is not None:
         raise ValueError(
             "k_summary_scale is consumed only by block-sparse proxy routes"
         )
+    if summary_seq_len is not None and params.k_summary_scale is None:
+        raise ValueError("k_summary_scale is required by block-sparse proxy routes")
     shapes = sage_scale_shapes(
         config,
         batch_size=batch_size,
@@ -220,6 +236,7 @@ def validate_sage_params(
         num_qo_heads=num_qo_heads,
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
+        summary_seq_len=summary_seq_len,
     )
     for name, expected_shape in shapes.items():
         _validate_scale_tensor(

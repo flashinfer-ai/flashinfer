@@ -69,6 +69,7 @@ from .helpers_common import (
     _keeps_col_base,
     _keeps_row_idx,
     _keeps_score_col,
+    _keeps_spatial_half,
     _keeps_tcgen05_ld,
     _keeps_tcgen05_st,
     _logical_head_batch,
@@ -2206,7 +2207,7 @@ class TmemSResource(DecodeGenResourceBase):
     @consumer_work(work_attrs=WorkAttr.AUXILIARY, returns=sage_scale_arr)
     @cute.jit
     def load_sage_scales(self, stage_info: StageInfo) -> cutlass.Array:
-        """Load the tile's ``sfK`` words into the lane's array ahead of the S wait.
+        """Load the dense tile's ``sfK`` words into the lane's array ahead of the S wait.
 
         Each lane owns one Q row and four K32 fragments whose first tokens
         follow the profile's register-to-column mapping; the array holds one
@@ -2230,9 +2231,6 @@ class TmemSResource(DecodeGenResourceBase):
             _tile_is_unmasked,
             _rows_are_active,
         ) = self._resolve_keeps_tile_context(stage_info)
-        kv_head_idx, batch_idx = _logical_head_batch(
-            stage_info, self.h_k_idx, self.b_idx
-        )
         col_base = _keeps_col_base(cfg, lane_idx, num_fragments * fragment_regs)
         fragment_first_tokens: tuple = ()
         for fragment_idx in cutlass.range_constexpr(num_fragments):
@@ -2245,9 +2243,12 @@ class TmemSResource(DecodeGenResourceBase):
                     col_base,
                 ),
             )
+        kv_head_idx, batch_idx = _logical_head_batch(
+            stage_info, self.h_k_idx, self.b_idx
+        )
         return load_lane_k_scales(
             cfg,
-            k_scale_ptr=self.k_scale_ptr,
+            k_scale_addr=self.k_scale_ptr.toint(),
             k_scale_head_stride=self.k_scale_head_stride,
             kv_head_idx=kv_head_idx,
             batch_idx=batch_idx,
@@ -2563,30 +2564,14 @@ class TmemSResource(DecodeGenResourceBase):
             tail_lane: Constexpr[int] = tail_summary_idx % fragment_regs
             tail_fragment_mask = Int32(0)
             proxy_max_shift, tail_shift = self._proxy_score_shifts(route_is_proxy)
-            # The tail summary's location follows the staged atom origins; the
-            # shift itself is one add per copy of the masked pass.
+            if cutlass.const_expr(tail_log2_delta != 0.0 and cfg.use_sage_attention):
+                # Sage scores are quantized: the shift is divided by the row's
+                # ``sfQ`` here and by the tail group's ``sfK`` in the fragment.
+                tail_shift = tail_shift * cute.math.rcp(sage_q_scale, approx=True)
             if cutlass.const_expr(tail_log2_delta != 0.0):
-                for fragment_idx in cutlass.range_constexpr(num_fragments):
-                    atom_offset = Int32(
-                        (fragment_idx % fragments_per_origin) * fragment_regs
-                    )
-                    fragment_origin = origin0 + atom_offset
-                    fragment_valid = valid0
-                    if cutlass.const_expr(fragment_idx >= fragments_per_origin):
-                        fragment_origin = origin1 + atom_offset
-                        fragment_valid = valid1
-                    tail_offset = Int32(tail_summary_idx) - fragment_origin
-                    # Invalid atoms never hold the tail.
-                    if (
-                        route_is_proxy
-                        and fragment_valid != Int32(0)
-                        and tail_offset >= Int32(0)
-                        and tail_offset < Int32(fragment_regs)
-                    ):
-                        tail_fragment_mask = tail_fragment_mask | Int32(
-                            1 << fragment_idx
-                        )
-                tail_fragment_mask = cute.arch.make_warp_uniform(tail_fragment_mask)
+                tail_fragment_mask = self._proxy_tail_fragment_mask(
+                    route_is_proxy, warp_grp_thread_idx, origin0
+                )
                 # The shifted tail score must reach TMEM for the P pass, so
                 # the route takes the store branch; the vote keeps the branch
                 # condition warp-uniform.
@@ -2688,13 +2673,29 @@ class TmemSResource(DecodeGenResourceBase):
                         and cfg.use_block_sparse_proxy_routes
                         and tail_log2_delta != 0.0
                         and score_idx == tail_lane
+                        and fragment_idx == cfg.proxy_static_tail_fragment[1]
                     ):
                         # The final summary's shortfall is a score-unit shift;
-                        # a masked score stays at the sentinel in fp32.
+                        # a masked score stays at the sentinel in fp32. Sage
+                        # scores are quantized, so the shift (divided by
+                        # ``sfQ`` above) is divided by the tail group's
+                        # ``sfK``. The approximate reciprocal is within one
+                        # ulp on a shift far below the score resolution, and
+                        # unlike the correctly rounded one it needs no
+                        # out-of-line slow-path call per fragment.
                         if (
                             (tail_fragment_mask >> Int32(fragment_idx)) & Int32(1)
                         ) != Int32(0):
-                            score = score + tail_shift
+                            lane_shift = tail_shift
+                            if cutlass.const_expr(cfg.use_sage_attention):
+                                groups = cfg.sage_k_groups_per_fragment
+                                tail_group: Constexpr[int] = tail_lane // (
+                                    fragment_regs // groups
+                                )
+                                lane_shift = tail_shift * cute.math.rcp(
+                                    Float32(fragment_scales[tail_group]), approx=True
+                                )
+                            score = score + lane_shift
                     masked_scores[score_idx] = score
                     if cutlass.const_expr(not cfg.use_sage_attention):
                         chain_idx: Constexpr[int] = score_idx % 4
@@ -2739,6 +2740,43 @@ class TmemSResource(DecodeGenResourceBase):
         old_max_arr[0] = old_max
         new_max_arr[0] = new_max
         return old_max_arr, sum_arr, new_max_arr, s_arr
+
+    @cute.jit
+    def _proxy_tail_fragment_mask(
+        self,
+        route_is_proxy: cutlass.Boolean,
+        warp_grp_thread_idx: Int32,
+        origin0: Int32,
+    ) -> Int32:
+        """Return a bit per streamed fragment holding the ragged final summary.
+
+        The summary's half and fragment are compile-time
+        (``FmhaDecodeConfig.proxy_static_tail_fragment``), so the masked pass
+        decides from one mask bit whether a fragment holds it. A thread holds
+        the tail when its route is a proxy route of the last summary group
+        and it sits in the tail's spatial half. With one summary group every
+        proxy route is the last group; with several, the last group is the
+        one whose first atom origin ``origin0`` is the group base plus the
+        half's first atom. Both compares are warp-uniform, as is the result.
+        """
+        cfg = self.cfg
+        tail_half, tail_fragment = cfg.proxy_static_tail_fragment
+        holds_tail = cutlass.Boolean(
+            route_is_proxy
+            and _keeps_spatial_half(cfg, warp_grp_thread_idx) == Int32(tail_half)
+        )
+        if cutlass.const_expr(cfg.num_proxy_groups > 1):
+            # The half's first atom is atom ``tail_half`` of the group.
+            tail_group_origin0 = (
+                cfg.num_proxy_groups - 1
+            ) * cfg.tile_size_kv + tail_half * cfg.block_sparse_kv_atom_size
+            holds_tail = cutlass.Boolean(
+                holds_tail and origin0 == Int32(tail_group_origin0)
+            )
+        tail_fragment_mask = Int32(0)
+        if holds_tail:
+            tail_fragment_mask = Int32(1 << tail_fragment)
+        return cute.arch.make_warp_uniform(tail_fragment_mask)
 
     @cute.jit
     def _group_max(
@@ -2831,6 +2869,47 @@ class TmemSResource(DecodeGenResourceBase):
                 max_chains[fold_chain] = cute.math.max(
                     max_chains[fold_chain], scaled_max, ftz=True
                 )
+
+    @consumer_work(returns=("old_max_arr", "sum_arr", "new_max_arr", "s_arr"))
+    @cute.jit
+    def compute_sage_block_sparse_softmax_loop(
+        self,
+        stage_info: StageInfo,
+        *,
+        old_max_arr: cutlass.Array,
+        sum_arr: cutlass.Array,
+        new_max_arr: cutlass.Array,
+        s_arr: cutlass.Array,
+        sparse_origin0: Int32,
+        sparse_origin1: Int32,
+        sparse_route_flags: Int32,
+        sparse_token_word0: Uint32,
+        sparse_token_word1: Uint32,
+        sparse_token_word2: Uint32,
+        sparse_token_word3: Uint32,
+        sage_q_scale: Float32,
+        sage_scale_arr: cutlass.Array,
+    ) -> tuple[object, object, object, object]:
+        """Consume one routed S payload with per-group Sage scales."""
+
+        assert self.cfg.use_block_sparse and self.cfg.use_sage_attention
+        return self._compute_softmax_loop_keeps_fragments(
+            stage_info,
+            old_max_arr=old_max_arr,
+            sum_arr=sum_arr,
+            new_max_arr=new_max_arr,
+            s_arr=s_arr,
+            use_sparse=True,
+            sparse_origin0=sparse_origin0,
+            sparse_origin1=sparse_origin1,
+            sparse_route_flags=sparse_route_flags,
+            sparse_token_word0=sparse_token_word0,
+            sparse_token_word1=sparse_token_word1,
+            sparse_token_word2=sparse_token_word2,
+            sparse_token_word3=sparse_token_word3,
+            sage_q_scale=sage_q_scale,
+            sage_scale_arr=sage_scale_arr,
+        )
 
     @consumer_work(returns=("old_max_arr", "sum_arr", "new_max_arr", "s_arr"))
     @cute.jit

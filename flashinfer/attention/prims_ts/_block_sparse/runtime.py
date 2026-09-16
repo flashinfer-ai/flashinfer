@@ -476,6 +476,7 @@ def validate_block_sparse_run(
             num_kv_heads=state.num_kv_heads,
             head_dim=state.head_dim,
             device=state.device,
+            summary_seq_len=num_kv_blocks if use_proxy_routes else None,
         )
 
     effective_scale = (

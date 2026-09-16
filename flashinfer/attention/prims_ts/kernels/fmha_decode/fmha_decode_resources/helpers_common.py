@@ -261,6 +261,32 @@ def _keeps_q64_col_base(lane_idx: Int32, half_cols: int) -> Int32:
 
 
 @cute.jit
+def _keeps_spatial_half(
+    cfg: Constexpr[FmhaDecodeConfig], warp_grp_thread_idx: Int32
+) -> Int32:
+    """Return the spatial half a Keeps warp-group thread belongs to.
+
+    KV256 threads ``[0, 64)`` and ``[64, 128)`` own the two spatial KV128
+    partials of one logical Q row (``FmhaDecodeConfig.keeps_spatial_halves``);
+    every other Keeps profile has a single half.
+    """
+    if cutlass.const_expr(cfg.keeps_spatial_halves == 2):
+        return warp_grp_thread_idx >> Int32(6)
+    return Int32(0)
+
+
+@cute.jit
+def _keeps_route_atom(cfg: Constexpr[FmhaDecodeConfig], half: Int32, position) -> Int32:
+    """Return the route atom a Keeps spatial half owns at ``position``.
+
+    The halves interleave over the route's atoms: half ``h`` owns atoms ``h``,
+    ``h + halves``, ... in order, so its ``position``-th atom is ``position *
+    halves + h`` (``FmhaDecodeConfig.keeps_route_atom_owner`` is the inverse).
+    """
+    return position * Int32(cfg.keeps_spatial_halves) + half
+
+
+@cute.jit
 def _keeps_row_idx(cfg: Constexpr[FmhaDecodeConfig], warp_grp_thread_idx: Int32):
     """Map a correction lane to the logical output row it owns."""
     if cutlass.const_expr(cfg.tile_size_kv == 256):
@@ -293,16 +319,18 @@ def _keeps_score_col(
 ) -> Int32:
     """Return the semantic KV column represented by one Keeps score register."""
     if cutlass.const_expr(cfg.tile_size_kv == 256):
-        # A physical thread owns four K32 fragments. The spatial half selects
-        # alternating KV64 blocks; the temporal fragment selects the low/high
-        # K32 sub-block inside that semantic KV64 block.
-        spatial = warp_grp_thread_idx >> Int32(6)
-        fragment = reg_idx // 32
-        semantic_block = Int32(2 * (fragment // 2)) + spatial
+        # A physical thread owns four K32 fragments: ``keeps_fragments_per_atom``
+        # per layout atom of its spatial half (``_keeps_route_atom``), each
+        # fragment one K32 sub-block of that atom.
+        fragment_regs = cfg.softmax_score_fragment_regs
+        fragments_per_atom = cfg.keeps_fragments_per_atom
+        spatial = _keeps_spatial_half(cfg, warp_grp_thread_idx)
+        fragment = reg_idx // fragment_regs
+        semantic_block = _keeps_route_atom(cfg, spatial, fragment // fragments_per_atom)
         return (
-            semantic_block * Int32(64)
-            + Int32((fragment % 2) * 32)
-            + Int32(reg_idx % 32)
+            semantic_block * Int32(cfg.keeps_atom_tokens)
+            + Int32((fragment % fragments_per_atom) * fragment_regs)
+            + Int32(reg_idx % fragment_regs)
         )
     return col_base + Int32(reg_idx)
 

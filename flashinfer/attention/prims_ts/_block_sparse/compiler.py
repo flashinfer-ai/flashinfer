@@ -117,6 +117,7 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
         # The Sage scale slots, in ``SAGE_ADAPTER_SLOTS`` order.
         q_scale: cute.Tensor | None,
         k_scale: cute.Tensor | None,
+        k_summary_scale: cute.Tensor | None,
         v_scale: cute.Tensor | None,
         v_mean: cute.Tensor | None,
         sm_scale: cutlass.Float32,
@@ -135,6 +136,26 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
             Int32(static_seq_len_kv),
             Int32(static_head_dim),
         )
+        # Sage scale tensors are [heads, flat slots]; the head stride is the
+        # flat slot count of one head. A slot the recipe does not use (the V
+        # mean without a mean, the summary K scales without proxy routes) is
+        # ``None`` and stays unbound.
+        sage_kwargs = {}
+        if cutlass.const_expr(static_config.use_sage_attention):
+            sage_kwargs = {
+                "q_scale_iter": q_scale.iterator,
+                "k_scale_iter": k_scale.iterator,
+                "v_scale_iter": v_scale.iterator,
+                "q_scale_head_stride": Int32(q_scale.shape[1]),
+                "k_scale_head_stride": Int32(k_scale.shape[1]),
+            }
+            if cutlass.const_expr(static_config.sage_v_mean):
+                sage_kwargs["v_mean_iter"] = v_mean.iterator
+            if cutlass.const_expr(static_config.use_block_sparse_proxy_routes):
+                sage_kwargs["k_summary_scale_iter"] = k_summary_scale.iterator
+                sage_kwargs["k_summary_scale_head_stride"] = Int32(
+                    k_summary_scale.shape[1]
+                )
         if cutlass.const_expr(static_config.use_block_sparse):
             if cutlass.const_expr(sparse_format == "bsr"):
                 prepare_routes(
@@ -183,24 +204,11 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
                 stream,
                 static_config,
                 static_seq_len_kv,
+                **sage_kwargs,
             )
         else:
             null_i32 = cute.make_ptr(Int32, 0, mem_space=cutlass.AddressSpace.gmem)
             null_f32 = cute.make_ptr(Float32, 0, mem_space=cutlass.AddressSpace.gmem)
-            sage_kwargs = {}
-            if cutlass.const_expr(static_config.use_sage_attention):
-                # Scale tensors are [heads, flat slots]; the head stride is
-                # the flat slot count of one head.
-                sage_kwargs = {
-                    "q_scale_iter": q_scale.iterator,
-                    "k_scale_iter": k_scale.iterator,
-                    "v_scale_iter": v_scale.iterator,
-                    "v_mean_iter": (
-                        v_mean.iterator if static_config.sage_v_mean else null_f32
-                    ),
-                    "q_scale_head_stride": Int32(q_scale.shape[1]),
-                    "k_scale_head_stride": Int32(k_scale.shape[1]),
-                }
             fmha_decode_launch(
                 problem_shape,
                 q.iterator,
@@ -385,11 +393,12 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
                 4,
             )
             route_workspace_fake = fake_compact(Int32, (cute.sym_int(),), 4)
-        sage_fakes: tuple[object | None, ...] = (None, None, None, None)
+        sage_fakes: tuple[object | None, ...] = (None, None, None, None, None)
         if key.sage is not None:
             # The scale shapes of this plan fill the adapter slots the same
-            # way ``sage_launch_args`` binds the run's tensors; a recipe
-            # without a V mean leaves that slot ``None``.
+            # way ``sage_launch_args`` binds the run's tensors: the summary K
+            # scales only for a proxy plan, and no V mean for a recipe
+            # without one.
             shapes = sage_scale_shapes(
                 key.sage,
                 batch_size=key.batch_size,
@@ -398,6 +407,7 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
                 num_qo_heads=key.num_qo_heads,
                 num_kv_heads=key.num_kv_heads,
                 head_dim=key.head_dim,
+                summary_seq_len=num_kv_blocks if use_proxy_routes else None,
             )
             sage_fakes = tuple(
                 None if shape is None else fake_compact(Float32, shape)

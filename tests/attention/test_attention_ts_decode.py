@@ -3671,21 +3671,33 @@ def test_attention_ts_decode_streamed_p_fragments_follow_kv_tile(
     assert not q128_fp8_sparse.defers_softmax_anchor_updates
 
 
-@pytest.mark.parametrize("tile_size_q", (64, 128))
+# Dense Sage grids: both streamed Keeps profiles qualify for the static and the
+# persistent scheduler.
+_DENSE_SAGE_GRIDS = ((64, False), (64, True), (128, False), (128, True))
+
+
+@pytest.mark.parametrize(("tile_size_q", "persistent"), _DENSE_SAGE_GRIDS)
 @pytest.mark.parametrize("o_dtype", (BFloat16, Float16))
 @pytest.mark.parametrize("mask_type", ("dense", "causal"))
 def test_attention_ts_decode_sage_profile_accepts_streamed_e4m3_recipes(
-    tile_size_q: int, o_dtype, mask_type: str
+    tile_size_q: int, o_dtype, mask_type: str, persistent: bool
 ) -> None:
-    """Sage runs the two streamed Keeps profiles with a 16-bit dequantized output."""
+    """Sage runs the two streamed Keeps profiles on their qualified grids.
+
+    The scale addressing resolves the tile through the work tile, so the
+    persistent scheduler shares the static kernel's Sage passes wherever the
+    profile admits it.
+    """
 
     cfg = make_sage_decode_config(
         tile_size_q=tile_size_q,
         tile_size_kv=256 if tile_size_q == 64 else 128,
         o_dtype=o_dtype,
         mask_type=mask_type,
+        sage_args={"use_persistent_scheduler": persistent},
     )
     assert cfg.use_sage_attention
+    assert cfg.use_persistent_scheduler is persistent
     assert cfg.streams_tmem_p_fragments
     assert cfg.use_fp8_qkv
     assert cfg.out_dtype == o_dtype
@@ -3701,11 +3713,6 @@ def test_attention_ts_decode_sage_profile_accepts_streamed_e4m3_recipes(
             id="16-bit-qkv",
         ),
         pytest.param({"qkv_dtype": Int8}, "Unsupported q_dtype", id="int8-qk"),
-        pytest.param(
-            {"sage_args": {"use_persistent_scheduler": True}},
-            "persistent",
-            id="persistent",
-        ),
         pytest.param(
             {
                 "sage_args": {"use_split_kv": True, "splits_kv": 2, "max_splits_kv": 2},
@@ -3749,8 +3756,8 @@ def test_attention_ts_decode_sage_profile_rejects_unsupported_dtypes_and_recipes
 ) -> None:
     """The Sage profile rejects dtypes and recipes outside its contract.
 
-    It takes E4M3 Q, K and V, a 16-bit output, contiguous single-split K/V on
-    the static grid and the documented scale block sizes.
+    It takes E4M3 Q, K and V, a 16-bit output, contiguous single-split K/V
+    and the documented scale block sizes.
     """
 
     with pytest.raises(ValueError, match=match):

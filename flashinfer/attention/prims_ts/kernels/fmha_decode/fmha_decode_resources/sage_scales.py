@@ -19,12 +19,19 @@ load ``sfQ`` of their Q row once per work tile and the raw ``sfK`` of each
 KV tile's scale groups; the epilogue receives the per-channel V scales for one
 output column range.
 
-The contiguous provider indexes the trtllm-gen flat layout through
-``flat_scale_slot`` of :mod:`flashinfer.attention.prims_ts.sage`, the module
-that owns the layout. Tokens beyond the sequence end (masked score columns)
-and Q rows beyond the valid row count are clamped to the last valid slot:
-their scores are masked or discarded, but their scale must stay finite so
-masked columns exponentiate to zero.
+Both providers index the trtllm-gen flat layout through ``flat_scale_slot``
+of :mod:`flashinfer.attention.prims_ts.sage`, the module that owns the layout.
+Tokens beyond the sequence end (masked score columns) and Q rows beyond the
+valid row count are clamped to the last valid slot: their scores are masked or
+discarded, but their scale must stay finite so masked columns exponentiate to
+zero.
+
+The contiguous provider derives each fragment's first token from the tile
+offset. The block-sparse provider derives it from the route's K64 atom
+origins; a proxy route reads ``k_summary_scale`` instead of ``k_scale`` and
+indexes the summary sequence (one summary per KV block) with the same
+arithmetic, which is why the K source is passed as an address, a head stride
+and a sequence length.
 
 During the two softmax passes a tile's ``sfK`` words live in the lane's
 rotating register array (:class:`RegisterSageKScales`), which hands a pass one
@@ -41,7 +48,7 @@ from cutlass.experimental.task_scheduling.resources import StageInfo
 
 from ....sage import flat_scale_slot, log2_block_size
 from ..fmha_decode_config import FmhaDecodeConfig
-from .helpers_common import fmul2
+from .helpers_common import _keeps_route_atom, fmul2
 
 Constexpr = cutlass.Constexpr
 
@@ -86,7 +93,7 @@ def load_q_scale(
 @cute.jit
 def load_k_scale(
     cfg: Constexpr[FmhaDecodeConfig],
-    k_scale_ptr: cute.Pointer,
+    k_scale_addr: Int64,
     k_scale_head_stride: Int32,
     *,
     kv_head_idx: Int32,
@@ -94,7 +101,11 @@ def load_k_scale(
     seq_len_kv: Int32,
     kv_token_idx: Int32,
 ) -> Float32:
-    """Return ``sfK`` for one KV token of one KV head."""
+    """Return ``sfK`` for one token of one KV head from a flat scale array.
+
+    ``k_scale_addr`` is the base address of ``k_scale`` or ``k_summary_scale``
+    and ``seq_len_kv`` the length of the sequence it covers.
+    """
     kv_token_idx = cute.math.min(kv_token_idx, seq_len_kv - Int32(1))
     slot = flat_scale_slot(
         batch_idx,
@@ -102,12 +113,67 @@ def load_k_scale(
         seq_len_kv,
         log2_block_size(cfg.sage_k_block_size),
     )
-    return _load_scale(k_scale_ptr.toint(), kv_head_idx * k_scale_head_stride + slot)
+    return _load_scale(k_scale_addr, kv_head_idx * k_scale_head_stride + slot)
 
 
 def sage_scale_arr_size(cfg: FmhaDecodeConfig) -> int:
-    """Return the dequantization multipliers owned by one softmax lane per tile."""
+    """Return the number of ``sfK`` words one softmax lane holds per tile."""
     return cfg.num_softmax_score_fragments * cfg.sage_k_groups_per_fragment
+
+
+def sage_k_scale_words(cfg: FmhaDecodeConfig) -> int:
+    """Return the number of ``sfK`` words that cover one KV tile for every spatial half.
+
+    Zero without Sage attention, so the block-sparse staging layout can take
+    the count unconditionally. Word ``half * arr_size + f * groups + g`` holds
+    the scale of group ``g`` of fragment ``f`` of the lanes in that half
+    (``sage_scale_arr_size`` words per half); this is the layout of the words
+    a block-sparse route stages, so a softmax thread reads its half's values
+    with contiguous vector loads.
+    """
+    if not cfg.use_sage_attention:
+        return 0
+    return cfg.keeps_spatial_halves * sage_scale_arr_size(cfg)
+
+
+@cute.jit
+def route_scale_word_position(
+    cfg: Constexpr[FmhaDecodeConfig], word_idx: Int32
+) -> tuple[Int32, Int32]:
+    """Return ``(route atom, token offset in the atom)`` of one staged word.
+
+    Inverse of the staged layout: word ``half * arr_size + f * groups + g``
+    covers group ``g`` of fragment ``f`` of the half's lane array, and fragment
+    ``f`` reads the half's atom number ``f // fragments_per_atom``
+    (``_keeps_route_atom``) from token
+    ``(f % fragments_per_atom) * fragment_regs`` onward.
+    """
+    arr_size = sage_scale_arr_size(cfg)
+    groups = cfg.sage_k_groups_per_fragment
+    fragments_per_atom = cfg.softmax_fragments_per_route_atom
+    fragment_regs = cfg.softmax_score_fragment_regs
+    group_tokens = fragment_regs // groups
+    half = word_idx // Int32(arr_size)
+    lane_entry = word_idx % Int32(arr_size)
+    fragment_idx = lane_entry // Int32(groups)
+    group_idx = lane_entry % Int32(groups)
+    atom_idx = _keeps_route_atom(cfg, half, fragment_idx // Int32(fragments_per_atom))
+    token_offset = (fragment_idx % Int32(fragments_per_atom)) * Int32(
+        fragment_regs
+    ) + group_idx * Int32(group_tokens)
+    return atom_idx, token_offset
+
+
+@cute.jit
+def _load_f32_chunks(ptr, count: Constexpr[int]) -> cutlass.Array:
+    """Return ``count`` fp32 values from an aligned SMEM pointer in 16-byte loads."""
+    assert count % 4 == 0
+    values = cutlass.Array(Float32, count, space=cutlass.AddressSpace.rmem)
+    for chunk in cutlass.range_constexpr(0, count, 4):
+        loaded = (ptr + Int32(chunk)).load(count=4, alignment=16)
+        for elem in cutlass.range_constexpr(4):
+            values[chunk + elem] = Float32(loaded[elem])
+    return values
 
 
 @cute.jit
@@ -127,7 +193,7 @@ def scale_pairs_in_place(
 def load_lane_k_scales(
     cfg: Constexpr[FmhaDecodeConfig],
     *,
-    k_scale_ptr: cute.Pointer,
+    k_scale_addr: Int64,
     k_scale_head_stride: Int32,
     kv_head_idx: Int32,
     batch_idx: Int32,
@@ -136,10 +202,12 @@ def load_lane_k_scales(
 ) -> cutlass.Array:
     """Return ``sfK`` for every scale group of the lane's fragments.
 
-    ``fragment_first_tokens[f]`` is the KV token of the first score register of
-    fragment ``f``; group ``g`` of that fragment starts
-    ``g * softmax_score_fragment_regs / sage_k_groups_per_fragment`` tokens
-    later. Entry ``f * groups + g`` of the result is that group's scale.
+    ``fragment_first_tokens[f]`` is the token of the first score register of
+    fragment ``f`` in the sequence covered by the K scale array at
+    ``k_scale_addr`` (K tokens, or summaries for a proxy route); group ``g``
+    of that fragment starts ``g * softmax_score_fragment_regs /
+    sage_k_groups_per_fragment`` tokens later. Entry ``f * groups + g`` of the
+    result is that group's scale.
     """
     groups = cfg.sage_k_groups_per_fragment
     group_tokens = cfg.softmax_score_fragment_regs // groups
@@ -150,7 +218,7 @@ def load_lane_k_scales(
         for group_idx in cutlass.range_constexpr(groups):
             scales[fragment_idx * groups + group_idx] = load_k_scale(
                 cfg,
-                k_scale_ptr,
+                k_scale_addr,
                 k_scale_head_stride,
                 kv_head_idx=kv_head_idx,
                 batch_idx=batch_idx,
@@ -229,8 +297,37 @@ def make_sage_k_scales(cfg: FmhaDecodeConfig) -> SageKScales | None:
     return RegisterSageKScales(cfg)
 
 
+@cute.jit
+def block_sparse_k_scale_source(
+    cfg: Constexpr[FmhaDecodeConfig],
+    *,
+    k_scale_ptr: cute.Pointer,
+    k_scale_head_stride: Int32,
+    k_summary_scale_ptr: cute.Pointer | None,
+    k_summary_scale_head_stride: Int32 | None,
+    seq_len_kv: Int32,
+    route_is_proxy: cutlass.Boolean,
+) -> tuple[Int64, Int32, Int32]:
+    """Return the K scale array of one block-sparse route.
+
+    Exact routes read ``k_scale`` over the KV tokens; proxy routes read
+    ``k_summary_scale`` over the summary sequence, whose length is the number
+    of KV blocks. The result is ``(base address, head stride, sequence
+    length)`` for :func:`load_k_scale`.
+    """
+    scale_addr = k_scale_ptr.toint()
+    head_stride = k_scale_head_stride
+    seq_len = seq_len_kv
+    if cutlass.const_expr(cfg.use_block_sparse_proxy_routes):
+        if route_is_proxy:
+            scale_addr = k_summary_scale_ptr.toint()
+            head_stride = k_summary_scale_head_stride
+            seq_len = Int32(cfg.num_proxy_summaries)
+    return scale_addr, head_stride, seq_len
+
+
 def staged_v_channel_scale_entries(cfg: FmhaDecodeConfig) -> int:
-    """Return the SMEM floats holding one KV head's V scales and means.
+    """Return the number of SMEM floats holding one KV head's V scales and means.
 
     The scales occupy ``[0, headdim)``; with ``sage_v_mean`` the means follow
     at ``[headdim, 2 * headdim)``.
@@ -260,20 +357,14 @@ def stage_v_channel_scales(
     writes cannot overtake it.
     """
     assert cfg.headdim % num_threads == 0
-    head_base = Int64(kv_head_idx) * Int64(cfg.headdim)
+    v_scale_addr = v_scale_ptr.toint()
+    head_base = kv_head_idx * Int32(cfg.headdim)
     for base in cutlass.range_constexpr(0, cfg.headdim, num_threads):
         channel = Int32(base) + thread_idx
-        byte_offset = (head_base + Int64(channel)) * Int64(4)
-        staged[channel] = Float32(
-            cutlass.inttoptr(
-                v_scale_ptr.toint() + byte_offset, mem_space=1, dtype=Float32
-            ).load(count=1, alignment=4)[0]
-        )
+        staged[channel] = _load_scale(v_scale_addr, head_base + channel)
         if cutlass.const_expr(cfg.sage_v_mean):
-            staged[channel + Int32(cfg.headdim)] = Float32(
-                cutlass.inttoptr(
-                    v_mean_ptr.toint() + byte_offset, mem_space=1, dtype=Float32
-                ).load(count=1, alignment=4)[0]
+            staged[channel + Int32(cfg.headdim)] = _load_scale(
+                v_mean_ptr.toint(), head_base + channel
             )
 
 

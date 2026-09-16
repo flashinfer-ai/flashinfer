@@ -2917,11 +2917,13 @@ def _softmax_schedule_body(
         (False, False): tmem_s.compute_softmax_loop,
         (False, True): tmem_s.compute_sage_softmax_loop,
         (True, False): tmem_s.compute_block_sparse_softmax_loop,
+        (True, True): tmem_s.compute_sage_block_sparse_softmax_loop,
     }[(use_sparse, use_sage)]
     compute_p_fragments = {
         (False, False): smem_p.compute_p_fragments,
         (False, True): smem_p.compute_sage_p_fragments,
         (True, False): smem_p.compute_proxy_route_p_fragments,
+        (True, True): smem_p.compute_sage_proxy_route_p_fragments,
     }[(cfg.use_block_sparse_proxy_routes, use_sage)]
 
     with domain_loop(0, domain, 1, unroll=1) as d:
@@ -2940,10 +2942,14 @@ def _softmax_schedule_body(
                 sparse_token_word2,
                 sparse_token_word3,
             ) = sparse_softmax_metadata.load_route()
+            if cutlass.const_expr(cfg.use_sage_attention):
+                # The route's staged ``sfK`` words become the lane's array.
+                sage_scale_arr = sparse_softmax_metadata.load_route_sage_k_scales()
             sparse_softmax_metadata.release()
-        if cutlass.const_expr(cfg.use_sage_attention):
-            # Issue the tile's scale loads ahead of the score wait so their
-            # latency hides behind the QK MMA.
+        if cutlass.const_expr(cfg.use_sage_attention and not use_sparse):
+            # A dense tile's ``sfK`` loads are issued ahead of the score wait
+            # so their latency hides behind the QK MMA; a route's words came
+            # with its metadata above.
             sage_scale_arr = tmem_s.load_sage_scales()
         # ConsWait/ConsWork: load S from TMEM and compute the tile max.
         tmem_s.wait()

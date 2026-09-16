@@ -126,7 +126,7 @@ The public lifecycle matches paged block-sparse attention:
 ```python
 wrapper = QTokenKvBlockSparsePagedTSWrapper()
 wrapper.plan(...)  # geometry, capacity, dtypes, workspace; outside capture
-wrapper.run(...)   # live indexer IDs and request metadata; graph hot path
+wrapper.run(...)  # live indexer IDs and request metadata; graph hot path
 ```
 
 `plan` binds the single caller-owned byte workspace and fixes
@@ -254,7 +254,9 @@ number of structural tokens in the softmax. V summaries must be per-block
 means; the kernel cannot tell a per-block sum apart and would scale the output
 by the block mass. The final partial block averages only its structural tokens.
 Optional `kv_valid_bits` filters exact K/V tokens only and does not change
-proxy summaries or their represented mass.
+proxy summaries or their represented mass. With Sage attention
+the summaries are E4M3 and `SageAttentionParams.k_summary_scale` carries the
+flat-layout scales of the K summaries.
 
 `BlockSparseTSWrapper.plan(..., use_block_sparse=False)` plans dense attention
 over the whole contiguous K/V sequence with the same Q-tile and KV-route

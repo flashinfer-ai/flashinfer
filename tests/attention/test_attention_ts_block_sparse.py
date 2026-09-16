@@ -1502,6 +1502,17 @@ def test_block_sparse_bshd_tma_strides_use_int64_for_large_batches() -> None:
     assert all(type(stride) is cutlass.Int64 for stride in (*q_strides, *kv_strides))
     assert tuple(map(int, q_strides)) == (16, 16, 262_144, 2_147_483_648)
     assert tuple(map(int, kv_strides)) == (262_144, 16, 2_147_483_648)
+    # One 16-byte stride unit holds sixteen 8-bit elements.
+    q_strides_fp8, kv_strides_fp8 = _block_sparse_bshd_tma_strides(
+        q_seq=cutlass.Int32(8192),
+        h_q=cutlass.Int32(16384),
+        h_k=cutlass.Int32(16384),
+        s_k=cutlass.Int32(8192),
+        d=cutlass.Int32(128),
+        element_bytes=1,
+    )
+    assert tuple(map(int, q_strides_fp8)) == (8, 8, 131_072, 1_073_741_824)
+    assert tuple(map(int, kv_strides_fp8)) == (131_072, 8, 1_073_741_824)
 
 
 def test_block_sparse_selects_native_kv256_only_for_qualified_geometry() -> None:
@@ -1730,15 +1741,6 @@ def test_sage_static_profile_requires_one_qk_dtype_and_a_config() -> None:
             prims_ts.SageAttentionConfig(),
             "two-instance Keeps profile",
             id="swaps-fine-kv",
-        ),
-        pytest.param(
-            64,
-            64,
-            256,
-            True,
-            prims_ts.SageAttentionConfig(),
-            "block-sparse",
-            id="block-sparse",
         ),
         pytest.param(
             64,
@@ -2951,10 +2953,10 @@ def test_dense_runtime_binds_the_sage_scales_of_each_run() -> None:
     k_fp8 = torch.empty((1, 512, 1, _HEAD_DIM), dtype=_FP8)
     scales = make_sage_params(**geometry)
     run_args = run(sage_state, q_fp8, k_fp8, scales)
-    expected = (scales.q_scale, scales.k_scale, scales.v_scale, None)
+    expected = (scales.q_scale, scales.k_scale, None, scales.v_scale, None)
     assert all(
         bound is tensor
-        for bound, tensor in zip(run_args.sage_launch_args, expected, strict=True)
+        for bound, tensor in zip(run_args.sage_slots, expected, strict=True)
     )
     with pytest.raises(ValueError, match="required by a Sage plan"):
         run(sage_state, q_fp8, k_fp8, None)
@@ -2970,7 +2972,7 @@ def test_dense_runtime_binds_the_sage_scales_of_each_run() -> None:
     )
     q_fp16 = torch.empty((1, 64, 1, _HEAD_DIM), dtype=torch.float16)
     k_fp16 = torch.empty((1, 512, 1, _HEAD_DIM), dtype=torch.float16)
-    assert run(plain_state, q_fp16, k_fp16, None).sage_launch_args == (None,) * 4
+    assert run(plain_state, q_fp16, k_fp16, None).sage_slots == (None,) * 5
     with pytest.raises(ValueError, match="rejected by a plan without Sage"):
         run(plain_state, q_fp16, k_fp16, scales)
 
@@ -3069,6 +3071,7 @@ def test_contiguous_launch_forwards_the_exact_compiled_adapter_abi() -> None:
             3,
             None,  # q_scale
             None,  # k_scale
+            None,  # k_summary_scale
             None,  # v_scale
             None,  # v_mean
             1.25,
@@ -3118,6 +3121,7 @@ def test_dense_launch_leaves_every_routing_slot_of_the_shared_adapter_empty() ->
             None,
             None,
             0,
+            None,
             None,
             None,
             None,
