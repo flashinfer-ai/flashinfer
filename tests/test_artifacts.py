@@ -543,91 +543,28 @@ def test_download_artifacts_reuses_checksum_verified_cache(monkeypatch, tmp_path
         assert (cubin_dir / name).read_bytes() == payload
 
 
-def test_download_artifacts_uses_env_retry(monkeypatch, tmp_path):
-    """Download calls use retry values configured via env vars."""
-    from flashinfer import artifacts
-
+def _single_artifact(monkeypatch, artifacts, tmp_path, payload=b"downloaded"):
+    """Point download_artifacts at one fake artifact under tmp_path."""
     cubin_dir = tmp_path / "cubins"
     monkeypatch.setattr(artifacts, "FLASHINFER_CUBIN_DIR", cubin_dir)
     monkeypatch.setattr(artifacts, "FLASHINFER_CUBINS_REPOSITORY", "https://example/")
     monkeypatch.setenv("FLASHINFER_CUBIN_DOWNLOAD_THREADS", "1")
-    monkeypatch.setenv("FLASHINFER_CUBIN_MAX_RETRIES", "11")
-
-    payload = b"downloaded"
     monkeypatch.setattr(
         artifacts,
         "get_subdir_file_list",
         lambda: iter([("pin/file.cubin", hashlib.sha256(payload).hexdigest())]),
     )
-
-    kwargs_seen = []
-
-    def fake_download(_source, destination, **kwargs):
-        kwargs_seen.append(kwargs)
-        Path(destination).write_bytes(payload)
-        return True
-
-    monkeypatch.setattr(artifacts, "download_file", fake_download)
-
-    artifacts.download_artifacts()
-
-    assert len(kwargs_seen) == 1
-    assert kwargs_seen[0]["retries"] == 11
-    assert "timeout" not in kwargs_seen[0]
-    assert kwargs_seen[0]["session"] is not None
-
-
-def test_download_artifacts_keeps_default_retry_without_env(monkeypatch, tmp_path):
-    """Retry count is left to download_file defaults when env var is unset."""
-    from flashinfer import artifacts
-
-    cubin_dir = tmp_path / "cubins"
-    monkeypatch.setattr(artifacts, "FLASHINFER_CUBIN_DIR", cubin_dir)
-    monkeypatch.setattr(artifacts, "FLASHINFER_CUBINS_REPOSITORY", "https://example/")
-    monkeypatch.setenv("FLASHINFER_CUBIN_DOWNLOAD_THREADS", "1")
-    monkeypatch.delenv("FLASHINFER_CUBIN_MAX_RETRIES", raising=False)
-
-    payload = b"downloaded"
-    monkeypatch.setattr(
-        artifacts,
-        "get_subdir_file_list",
-        lambda: iter([("pin/file.cubin", hashlib.sha256(payload).hexdigest())]),
-    )
-
-    kwargs_seen = []
-
-    def fake_download(_source, destination, **kwargs):
-        kwargs_seen.append(kwargs)
-        Path(destination).write_bytes(payload)
-        return True
-
-    monkeypatch.setattr(artifacts, "download_file", fake_download)
-
-    artifacts.download_artifacts()
-
-    assert len(kwargs_seen) == 1
-    assert "retries" not in kwargs_seen[0]
-    assert kwargs_seen[0]["session"] is not None
+    return cubin_dir
 
 
 def test_download_artifacts_retries_within_retry_window(monkeypatch, tmp_path):
     """Retry window keeps retrying failed downloads until one succeeds."""
     from flashinfer import artifacts
 
-    cubin_dir = tmp_path / "cubins"
-    monkeypatch.setattr(artifacts, "FLASHINFER_CUBIN_DIR", cubin_dir)
-    monkeypatch.setattr(artifacts, "FLASHINFER_CUBINS_REPOSITORY", "https://example/")
-    monkeypatch.setenv("FLASHINFER_CUBIN_DOWNLOAD_THREADS", "1")
-    monkeypatch.setenv("FLASHINFER_CUBIN_RETRY_WINDOW_SECONDS", "60")
-    monkeypatch.setenv("FLASHINFER_CUBIN_MAX_RETRIES", "1")
-    monkeypatch.setattr(artifacts.time, "sleep", lambda _seconds: None)
-
     payload = b"downloaded"
-    monkeypatch.setattr(
-        artifacts,
-        "get_subdir_file_list",
-        lambda: iter([("pin/file.cubin", hashlib.sha256(payload).hexdigest())]),
-    )
+    cubin_dir = _single_artifact(monkeypatch, artifacts, tmp_path, payload)
+    monkeypatch.setenv("FLASHINFER_CUBIN_RETRY_WINDOW_SECONDS", "60")
+    monkeypatch.setattr(artifacts.time, "sleep", lambda _seconds: None)
 
     attempts = {"count": 0}
 
@@ -636,7 +573,7 @@ def test_download_artifacts_retries_within_retry_window(monkeypatch, tmp_path):
         if attempts["count"] < 3:
             return False
         Path(destination).write_bytes(payload)
-        assert kwargs["retries"] == 1
+        assert kwargs["session"] is not None
         return True
 
     monkeypatch.setattr(artifacts, "download_file", flaky_download)
@@ -647,29 +584,87 @@ def test_download_artifacts_retries_within_retry_window(monkeypatch, tmp_path):
     assert (cubin_dir / "pin/file.cubin").read_bytes() == payload
 
 
+def test_download_artifacts_backs_off_exponentially_between_retries(
+    monkeypatch, tmp_path
+):
+    """Retries back off exponentially and saturate at the cap.
+
+    A long retry window must not become a high-frequency poll of an endpoint we
+    already believe is congested, so pin the cadence rather than just the fact
+    that a retry happens.
+    """
+    from flashinfer import artifacts
+
+    payload = b"downloaded"
+    _single_artifact(monkeypatch, artifacts, tmp_path, payload)
+    monkeypatch.setenv("FLASHINFER_CUBIN_RETRY_WINDOW_SECONDS", "86400")
+
+    sleeps: list[float] = []
+    monkeypatch.setattr(artifacts.time, "sleep", sleeps.append)
+    # Drop the jitter so the exponential schedule is exact; jitter only widens
+    # each delay to uniform[cap, 2*cap].
+    monkeypatch.setattr(artifacts.random, "uniform", lambda _a, _b: 0.0)
+
+    attempts = {"count": 0}
+
+    def flaky_download(_source, destination, **_kwargs):
+        attempts["count"] += 1
+        if attempts["count"] < 8:
+            return False
+        Path(destination).write_bytes(payload)
+        return True
+
+    monkeypatch.setattr(artifacts, "download_file", flaky_download)
+
+    artifacts.download_artifacts()
+
+    assert sleeps == [5.0, 10.0, 20.0, 40.0, 80.0, 150.0, 150.0]
+
+
+def test_download_artifacts_does_not_retry_without_retry_window(monkeypatch, tmp_path):
+    """Without a window, a failed download is reported immediately."""
+    from flashinfer import artifacts
+
+    _single_artifact(monkeypatch, artifacts, tmp_path)
+    monkeypatch.delenv("FLASHINFER_CUBIN_RETRY_WINDOW_SECONDS", raising=False)
+
+    attempts = {"count": 0}
+
+    def failing_download(_source, _destination, **_kwargs):
+        attempts["count"] += 1
+        return False
+
+    monkeypatch.setattr(artifacts, "download_file", failing_download)
+    monkeypatch.setattr(
+        artifacts.time, "sleep", lambda _s: pytest.fail("slept without a retry window")
+    )
+
+    with pytest.raises(RuntimeError, match="Failed to download cubins"):
+        artifacts.download_artifacts()
+
+    assert attempts["count"] == 1
+
+
 def test_download_artifacts_fails_when_retry_window_expires(monkeypatch, tmp_path):
     """Download fails once the retry window deadline is exceeded."""
     from flashinfer import artifacts
 
-    cubin_dir = tmp_path / "cubins"
-    monkeypatch.setattr(artifacts, "FLASHINFER_CUBIN_DIR", cubin_dir)
-    monkeypatch.setattr(artifacts, "FLASHINFER_CUBINS_REPOSITORY", "https://example/")
-    monkeypatch.setenv("FLASHINFER_CUBIN_DOWNLOAD_THREADS", "1")
-    monkeypatch.setenv("FLASHINFER_CUBIN_RETRY_WINDOW_SECONDS", "1")
-    monkeypatch.setenv("FLASHINFER_CUBIN_MAX_RETRIES", "1")
+    _single_artifact(monkeypatch, artifacts, tmp_path)
+    monkeypatch.setenv("FLASHINFER_CUBIN_RETRY_WINDOW_SECONDS", "600")
     monkeypatch.setattr(artifacts.time, "sleep", lambda _seconds: None)
 
-    timeline = iter([0.0, 2.0])
-    monkeypatch.setattr(artifacts.time, "monotonic", lambda: next(timeline))
+    # Advance a fake clock past the window instead of sleeping through it.
+    clock = {"now": 0.0}
 
-    monkeypatch.setattr(
-        artifacts,
-        "get_subdir_file_list",
-        lambda: iter([("pin/file.cubin", hashlib.sha256(b"expected").hexdigest())]),
-    )
+    def fake_monotonic() -> float:
+        now = clock["now"]
+        clock["now"] += 300.0
+        return now
+
+    monkeypatch.setattr(artifacts.time, "monotonic", fake_monotonic)
     monkeypatch.setattr(artifacts, "download_file", lambda *_args, **_kwargs: False)
 
-    with pytest.raises(RuntimeError, match="Failed to download cubins"):
+    with pytest.raises(RuntimeError, match="Failed to download cubins: pin/file.cubin"):
         artifacts.download_artifacts()
 
 
@@ -703,43 +698,23 @@ def test_download_artifacts_negative_retry_window_env_raises(monkeypatch, tmp_pa
         artifacts.download_artifacts()
 
 
-def test_download_artifacts_non_positive_max_retries_env_raises(monkeypatch, tmp_path):
-    """Non-positive retry-count env values are rejected."""
-    from flashinfer import artifacts
-
-    cubin_dir = tmp_path / "cubins"
-    monkeypatch.setattr(artifacts, "FLASHINFER_CUBIN_DIR", cubin_dir)
-    monkeypatch.setenv("FLASHINFER_CUBIN_MAX_RETRIES", "0")
-    monkeypatch.setattr(artifacts, "get_subdir_file_list", lambda: iter([]))
-
-    with pytest.raises(RuntimeError, match="Invalid FLASHINFER_CUBIN_MAX_RETRIES value"):
-        artifacts.download_artifacts()
-
-
 def test_download_artifacts_reports_worker_exception_with_artifact_name(
     monkeypatch, tmp_path
 ):
     """Unexpected worker exceptions are reported as failed artifact names."""
     from flashinfer import artifacts
 
-    cubin_dir = tmp_path / "cubins"
-    monkeypatch.setattr(artifacts, "FLASHINFER_CUBIN_DIR", cubin_dir)
-    monkeypatch.setattr(artifacts, "FLASHINFER_CUBINS_REPOSITORY", "https://example/")
-    monkeypatch.setenv("FLASHINFER_CUBIN_DOWNLOAD_THREADS", "1")
-    monkeypatch.setenv("FLASHINFER_CUBIN_MAX_RETRIES", "1")
+    _single_artifact(monkeypatch, artifacts, tmp_path)
     monkeypatch.delenv("FLASHINFER_CUBIN_RETRY_WINDOW_SECONDS", raising=False)
-    monkeypatch.setattr(
-        artifacts,
-        "get_subdir_file_list",
-        lambda: iter([("pin/file.cubin", hashlib.sha256(b"expected").hexdigest())]),
-    )
 
     def raising_download(_source, _destination, **_kwargs):
         raise RuntimeError("boom")
 
     monkeypatch.setattr(artifacts, "download_file", raising_download)
 
-    with pytest.raises(RuntimeError, match=r"Failed to download cubins: pin/file.cubin"):
+    with pytest.raises(
+        RuntimeError, match=r"Failed to download cubins: pin/file\.cubin \(RuntimeError"
+    ):
         artifacts.download_artifacts()
 
 

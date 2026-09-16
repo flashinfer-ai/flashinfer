@@ -17,6 +17,7 @@ limitations under the License.
 from dataclasses import dataclass
 import logging
 import os
+import random
 import re
 import threading
 import time
@@ -297,27 +298,23 @@ def get_subdir_file_list() -> Generator[tuple[str, str], None, None]:
             yield (full_path, checksums[full_path])
 
 
+# Outer retry-loop backoff bounds. ``download_file`` already spends its own
+# exponentially-backed-off budget per call, so this loop only paces re-entry
+# into it. Equal jitter (uniform[cap, 2*cap]) mirrors the inner loop's shape
+# and decorrelates the download threads -- and the many CI runners -- hitting
+# the same CDN edge. The cap is what keeps a long window (a nightly may allow
+# 24h) from degrading into a sustained poll of an endpoint we already know is
+# congested: in steady state each artifact re-attempts every 2.5-5 minutes, so
+# a 24h window costs ~350 requests per artifact rather than ~86k.
+_RETRY_BACKOFF_BASE_SECONDS = 5.0
+_RETRY_BACKOFF_CAP_SECONDS = 150.0
+
+
 def download_artifacts() -> None:
     from tqdm.contrib.logging import tqdm_logging_redirect
 
     cubin_files = list[tuple[str, str]](get_subdir_file_list())
     num_threads = int(os.environ.get("FLASHINFER_CUBIN_DOWNLOAD_THREADS", "4"))
-    max_retries_env = os.environ.get("FLASHINFER_CUBIN_MAX_RETRIES")
-    if max_retries_env is None:
-        max_retries = None
-    else:
-        try:
-            max_retries = int(max_retries_env)
-        except ValueError as e:
-            raise RuntimeError(
-                "Invalid FLASHINFER_CUBIN_MAX_RETRIES value:"
-                f" {max_retries_env!r}. Expected an integer."
-            ) from e
-        if max_retries < 1:
-            raise RuntimeError(
-                "Invalid FLASHINFER_CUBIN_MAX_RETRIES value:"
-                f" {max_retries_env!r}. Expected an integer >= 1."
-            )
 
     retry_window_env = os.environ.get("FLASHINFER_CUBIN_RETRY_WINDOW_SECONDS", "0")
     try:
@@ -325,7 +322,7 @@ def download_artifacts() -> None:
     except ValueError as e:
         raise RuntimeError(
             "Invalid FLASHINFER_CUBIN_RETRY_WINDOW_SECONDS value:"
-            f" {retry_window_env!r}. Expected an integer."
+            f" {retry_window_env!r}. Expected an integer >= 0."
         ) from e
     if retry_window_seconds < 0:
         raise RuntimeError(
@@ -356,56 +353,61 @@ def download_artifacts() -> None:
         total=len(cubin_files), desc="Downloading cubins"
     ) as pbar:
         pbar.update(len(cached_files))
-        sessions_by_thread: dict[int, requests.Session] = {}
+
+        # requests.Session is not thread-safe, so hand each pool thread its own
+        # rather than sharing one; they are still long-lived enough for HTTP
+        # keep-alive to do its job across a thread's artifacts.
+        thread_state = threading.local()
+        sessions: list[requests.Session] = []
         sessions_lock = threading.Lock()
+
+        # One window for the whole download, started when the first request goes
+        # out. A per-artifact window would multiply the worst case by the number
+        # of artifacts.
+        retry_deadline = time.monotonic() + retry_window_seconds
 
         def update_pbar_cb(_) -> None:
             pbar.update(1)
 
-        def _get_thread_session() -> requests.Session:
-            thread_id = threading.get_ident()
-            with sessions_lock:
-                session = sessions_by_thread.get(thread_id)
-                if session is None:
-                    session = requests.Session()
-                    sessions_by_thread[thread_id] = session
-                return session
+        def thread_session() -> requests.Session:
+            session = getattr(thread_state, "session", None)
+            if session is None:
+                session = requests.Session()
+                thread_state.session = session
+                with sessions_lock:
+                    sessions.append(session)
+            return session
 
-        def _download_within_retry_window(
-            source_path: str,
-            destination_path: str,
-            artifact_name: str,
-            kwargs: dict[str, object],
-            retry_deadline: float | None,
-        ) -> tuple[bool, str | None]:
-            request_kwargs = dict(kwargs)
-            request_kwargs["session"] = _get_thread_session()
-            last_failure_detail = "download_file returned False after exhausting per-attempt retries"
+        def download_within_retry_window(
+            source_path: str, destination_path: str, artifact_name: str
+        ) -> bool:
+            backoff_cap = _RETRY_BACKOFF_BASE_SECONDS
             while True:
-                if download_file(source_path, destination_path, **request_kwargs):
-                    return True, None
-                if retry_deadline is None:
-                    return False, last_failure_detail
+                if download_file(
+                    source_path, destination_path, session=thread_session()
+                ):
+                    return True
                 remaining = retry_deadline - time.monotonic()
                 if remaining <= 0:
-                    logger.error(
-                        "Retry window exhausted for %s after %d seconds. Last failure: %s",
-                        artifact_name,
-                        retry_window_seconds,
-                        last_failure_detail,
-                    )
-                    return (
-                        False,
-                        f"retry window exhausted; last failure: {last_failure_detail}",
-                    )
+                    if retry_window_seconds > 0:
+                        logger.error(
+                            "Retry window (%ds) exhausted for %s",
+                            retry_window_seconds,
+                            artifact_name,
+                        )
+                    return False
+                backoff = min(backoff_cap + random.uniform(0, backoff_cap), remaining)  # noqa: S311
                 logger.warning(
-                    "Download failed for %s; retrying while %0.2f seconds remain in retry window",
+                    "Download failed for %s; retrying in %.1fs"
+                    " (%.0fs left in retry window)",
                     artifact_name,
+                    backoff,
                     remaining,
                 )
-                time.sleep(min(1.0, remaining))
+                time.sleep(backoff)
+                backoff_cap = min(backoff_cap * 2, _RETRY_BACKOFF_CAP_SECONDS)
 
-        failed_artifacts = []
+        failed_artifacts: list[str] = []
         try:
             with ThreadPoolExecutor(num_threads) as pool:
                 future_to_name = {}
@@ -414,49 +416,27 @@ def download_artifacts() -> None:
                     local_path = FLASHINFER_CUBIN_DIR / name
                     # Ensure parent directory exists
                     local_path.parent.mkdir(parents=True, exist_ok=True)
-                    download_kwargs: dict[str, object] = {}
-                    if max_retries is not None:
-                        download_kwargs["retries"] = max_retries
-                    file_retry_deadline = (
-                        time.monotonic() + retry_window_seconds
-                        if retry_window_seconds > 0
-                        else None
-                    )
                     fut = pool.submit(
-                        _download_within_retry_window,
-                        source,
-                        str(local_path),
-                        name,
-                        download_kwargs,
-                        file_retry_deadline,
+                        download_within_retry_window, source, str(local_path), name
                     )
                     fut.add_done_callback(update_pbar_cb)
                     future_to_name[fut] = name
 
                 for fut in as_completed(future_to_name):
                     artifact_name = future_to_name[fut]
-                    failure_detail = artifact_name
                     try:
-                        result = fut.result()
-                        if isinstance(result, tuple):
-                            ok, detail = result
-                        else:
-                            ok, detail = result, None
-                        if detail:
-                            failure_detail = f"{artifact_name} ({detail})"
+                        if not fut.result():
+                            failed_artifacts.append(artifact_name)
                     except Exception as e:
                         logger.exception(
                             "Unexpected exception in cubin download task for %s",
                             artifact_name,
                         )
-                        ok = False
-                        failure_detail = (
+                        failed_artifacts.append(
                             f"{artifact_name} ({type(e).__name__}: {e})"
                         )
-                    if not ok:
-                        failed_artifacts.append(failure_detail)
         finally:
-            for session in sessions_by_thread.values():
+            for session in sessions:
                 session.close()
 
     if failed_artifacts:
