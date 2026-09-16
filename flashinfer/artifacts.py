@@ -299,9 +299,6 @@ def get_subdir_file_list() -> Generator[tuple[str, str], None, None]:
 def download_artifacts() -> None:
     from tqdm.contrib.logging import tqdm_logging_redirect
 
-    # use a shared session to make use of HTTP keep-alive and reuse of
-    # HTTPS connections.
-    session = requests.Session()
     cubin_files = list[tuple[str, str]](get_subdir_file_list())
     num_threads = int(os.environ.get("FLASHINFER_CUBIN_DOWNLOAD_THREADS", "4"))
     max_retries = os.environ.get("FLASHINFER_CUBIN_MAX_RETRIES")
@@ -343,8 +340,11 @@ def download_artifacts() -> None:
             artifact_name: str,
             kwargs: dict[str, object],
         ) -> bool:
+            session = requests.Session()
+            request_kwargs = dict(kwargs)
+            request_kwargs["session"] = session
             while True:
-                if download_file(source_path, destination_path, **kwargs):
+                if download_file(source_path, destination_path, **request_kwargs):
                     return True
                 if retry_deadline is None:
                     return False
@@ -370,7 +370,7 @@ def download_artifacts() -> None:
                 local_path = FLASHINFER_CUBIN_DIR / name
                 # Ensure parent directory exists
                 local_path.parent.mkdir(parents=True, exist_ok=True)
-                download_kwargs = {"session": session}
+                download_kwargs: dict[str, object] = {}
                 if max_retries is not None:
                     download_kwargs["retries"] = int(max_retries)
                 fut = pool.submit(
