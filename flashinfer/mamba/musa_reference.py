@@ -108,7 +108,12 @@ def _index_for(
         return default
     if indices.dim() == 1:
         return int(indices[batch].item())
-    return int(indices[batch, min(token, indices.shape[1] - 1)].item())
+    if token < 0 or token >= indices.shape[1]:
+        raise IndexError(
+            f"state index token {token} is outside the metadata width "
+            f"{indices.shape[1]}"
+        )
+    return int(indices[batch, token].item())
 
 
 def selective_state_update_musa_reference(
@@ -243,9 +248,23 @@ def selective_state_update_musa_reference(
     is_varlen = cu_seqlens is not None and x.dim() == 3 and dt.dim() == 3
     is_mtp = x.dim() == 4
     if is_varlen:
+        if cu_seqlens.dim() != 1 or cu_seqlens.dtype not in (torch.int32, torch.int64):
+            raise ValueError("cu_seqlens must be a 1D int32 or int64 tensor")
+        cu_values = [int(v) for v in cu_seqlens.detach().cpu().tolist()]
+        if not cu_values or cu_values[0] != 0:
+            raise ValueError("cu_seqlens must start at zero")
+        if any(
+            end < start for start, end in zip(cu_values, cu_values[1:], strict=False)
+        ):
+            raise ValueError("cu_seqlens must be monotonically nondecreasing")
+        if cu_values[-1] != x.shape[0]:
+            raise ValueError(
+                "cu_seqlens final value must equal the packed token count "
+                f"{x.shape[0]}, got {cu_values[-1]}"
+            )
         batch = int(cu_seqlens.numel() - 1)
         steps = [
-            (int(cu_seqlens[b].item()), int(cu_seqlens[b + 1].item()))
+            (cu_values[b], cu_values[b + 1])
             for b in range(batch)
         ]
     elif is_mtp:
@@ -254,6 +273,63 @@ def selective_state_update_musa_reference(
     else:
         batch = x.shape[0]
         steps = [(0, 1) for _ in range(batch)]
+
+    is_spec_decoding = num_accepted_tokens is not None
+    if is_spec_decoding:
+        if not is_varlen:
+            raise ValueError("num_accepted_tokens requires packed varlen input")
+        if state_batch_indices is None or state_batch_indices.dim() != 2:
+            raise ValueError(
+                "speculative varlen state_batch_indices must be a 2D tensor"
+            )
+        if num_accepted_tokens.dim() != 1 or num_accepted_tokens.shape[0] != batch:
+            raise ValueError(
+                "num_accepted_tokens must have one entry per packed sequence"
+            )
+        if num_accepted_tokens.dtype not in (torch.int32, torch.int64):
+            raise ValueError("num_accepted_tokens must be int32 or int64")
+        accepted_values = [
+            max(int(v), 0)
+            for v in num_accepted_tokens.detach().cpu().tolist()
+        ]
+        if state_batch_indices.shape[0] < batch:
+            raise ValueError("state_batch_indices has fewer rows than cu_seqlens")
+        max_len = max((end - start for start, end in steps), default=0)
+        required_width = max(max_len, max(accepted_values, default=0))
+        if state_batch_indices.shape[1] < required_width:
+            raise ValueError(
+                "state_batch_indices metadata width is smaller than the packed "
+                f"sequence/accepted-token requirement ({required_width})"
+            )
+        if dst_state_batch_indices is not None:
+            if dst_state_batch_indices.dim() != 2:
+                raise ValueError(
+                    "speculative varlen dst_state_batch_indices must be 2D"
+                )
+            if (
+                dst_state_batch_indices.shape[0] < batch
+                or dst_state_batch_indices.shape[1] < max_len
+            ):
+                raise ValueError(
+                    "dst_state_batch_indices metadata is smaller than the packed "
+                    "sequences"
+                )
+        else:
+            # Upstream Triton uses source slots as destinations by default in
+            # speculative mode; preserve that cache ownership contract.
+            dst_state_batch_indices = state_batch_indices
+    else:
+        accepted_values = []
+        if is_varlen and state_batch_indices is not None:
+            if state_batch_indices.dim() not in (1, 2):
+                raise ValueError("state_batch_indices must be 1D or 2D")
+            if state_batch_indices.shape[0] < batch:
+                raise ValueError("state_batch_indices has fewer rows than cu_seqlens")
+        if is_varlen and dst_state_batch_indices is not None:
+            if dst_state_batch_indices.dim() not in (1, 2):
+                raise ValueError("dst_state_batch_indices must be 1D or 2D")
+            if dst_state_batch_indices.shape[0] < batch:
+                raise ValueError("dst_state_batch_indices has fewer rows than cu_seqlens")
 
     if is_varlen:
         if B.dim() != 3 or C.dim() != 3:
@@ -340,11 +416,13 @@ def selective_state_update_musa_reference(
             out[batch_idx].copy_(y_t.to(out.dtype))
         return running
 
-    is_spec_decoding = num_accepted_tokens is not None
     for b, (start, end) in enumerate(steps):
+        if end <= start:
+            # Empty packed sequences have no initial read or final write.
+            continue
         accepted = (
-            max(int(num_accepted_tokens[b].item()) - 1, 0)
-            if num_accepted_tokens is not None
+            max(accepted_values[b] - 1, 0)
+            if is_spec_decoding
             else 0
         )
         read_slot = _index_for(state_batch_indices, b, accepted, b)
