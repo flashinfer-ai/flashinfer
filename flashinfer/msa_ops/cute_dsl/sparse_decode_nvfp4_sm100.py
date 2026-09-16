@@ -927,7 +927,10 @@ def _msa_partial_kernel(
     # q2k / page_table -> validity scan -> KV, and Q is 4 KiB per CTA against
     # the block-table row's 512 B.  Letting Q enter the queue first put the
     # BIGGEST request ahead of the one the whole prologue waits on.
-    q_row_base = (qi * num_qo_heads + h * grp) * Int32(HEAD_DIM)
+    # Row offsets into q and the output are (qi * num_qo_heads + head) * 128
+    # elements; qi * num_qo_heads * 128 passes 2^31 at qi = 262144 with 64
+    # heads, so the product is formed in 64 bits, not formed in 32 and widened.
+    q_row_base = (Int64(qi) * Int64(num_qo_heads) + Int64(h * grp)) * Int64(HEAD_DIM)
     rQr = cute.make_rmem_tensor((8,), cutlass.Int32)
     for it in cutlass.range_constexpr(2):
         lin = tid + Int32(it * NTHREAD)
@@ -938,8 +941,8 @@ def _msa_partial_kernel(
         w2 = Int32(0)
         w3 = Int32(0)
         if qrow < grp:
-            r0, r1, r2, r3 = ld_global_v4_b32(q_addr + Int64(2) * Int64(
-                q_row_base + qrow * Int32(HEAD_DIM) + dchunk * Int32(8)))
+            r0, r1, r2, r3 = ld_global_v4_b32(q_addr + Int64(2) * (
+                q_row_base + Int64(qrow * Int32(HEAD_DIM) + dchunk * Int32(8))))
             w0 = bf16x2_to_f16x2(r0)
             w1 = bf16x2_to_f16x2(r1)
             w2 = bf16x2_to_f16x2(r2)
@@ -2013,9 +2016,9 @@ def _msa_partial_kernel(
                 if cden > Float32(0.0):
                     cinv = rcp_approx(cden)
                 if row < grp:
-                    ob = out_addr + Int64(2) * Int64(
-                        (qi * num_qo_heads + h * grp + row) * Int32(HEAD_DIM)
-                        + d0)
+                    ob = out_addr + Int64(2) * (
+                        (Int64(qi) * Int64(num_qo_heads) + Int64(h * grp + row))
+                        * Int64(HEAD_DIM) + Int64(d0))
                     st_global_v2_b32(
                         ob, pack_bf16x2(a0 * cinv, a1 * cinv),
                         pack_bf16x2(a2 * cinv, a3 * cinv))
@@ -2027,8 +2030,9 @@ def _msa_partial_kernel(
     # enables the low-register Q-reload specialization.
     elif cutlass.const_expr(static_nsplit == 1):
         if orow < grp:
-            obase = out_addr + Int64(2) * Int64(
-                (qi * num_qo_heads + h * grp + orow) * Int32(HEAD_DIM) + ocol)
+            obase = out_addr + Int64(2) * (
+                (Int64(qi) * Int64(num_qo_heads) + Int64(h * grp + orow))
+                * Int64(HEAD_DIM) + Int64(ocol))
             for v in cutlass.range_constexpr(2):
                 p0 = pack_bf16x2(sOut[(orow, oskew + Int32(8 * v + 0))],
                                  sOut[(orow, oskew + Int32(8 * v + 1))])
@@ -2041,8 +2045,9 @@ def _msa_partial_kernel(
                 st_global_v4_b32(obase + Int64(16 * v), p0, p1, p2, p3)
     elif nsplit == Int32(1):
         if orow < grp:
-            obase = out_addr + Int64(2) * Int64(
-                (qi * num_qo_heads + h * grp + orow) * Int32(HEAD_DIM) + ocol)
+            obase = out_addr + Int64(2) * (
+                (Int64(qi) * Int64(num_qo_heads) + Int64(h * grp + orow))
+                * Int64(HEAD_DIM) + Int64(ocol))
             for v in cutlass.range_constexpr(2):
                 p0 = pack_bf16x2(sOut[(orow, oskew + Int32(8 * v + 0))],
                                  sOut[(orow, oskew + Int32(8 * v + 1))])
@@ -2155,8 +2160,9 @@ def _msa_partial_kernel(
             if cden > Float32(0.0):
                 cinv = rcp_approx(cden)
             if crow < grp:
-                cob = out_addr + Int64(2) * Int64(
-                    (qi * num_qo_heads + h * grp + crow) * Int32(HEAD_DIM) + ccol)
+                cob = out_addr + Int64(2) * (
+                    (Int64(qi) * Int64(num_qo_heads) + Int64(h * grp + crow))
+                    * Int64(HEAD_DIM) + Int64(ccol))
                 for u in cutlass.range_constexpr(2):
                     q0 = pack_bf16x2(rAcc[u * 8 + 0] * cinv, rAcc[u * 8 + 1] * cinv)
                     q1 = pack_bf16x2(rAcc[u * 8 + 2] * cinv, rAcc[u * 8 + 3] * cinv)

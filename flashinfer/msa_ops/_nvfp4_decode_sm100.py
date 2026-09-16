@@ -132,6 +132,11 @@ _TOPK = 16
 # and cross-checked against the binding by a device test, so the two copies
 # cannot drift.
 _MAX_TOPK = 32
+# The parametric family indexes queries on grid.y, whose limit is 65535
+# (general::kMaxTotalQ). The pinned family and the CuTe-DSL body launch 1-D
+# grids, but neither serves a batch anywhere near this, so one bound covers
+# the route and the binding re-checks it.
+_MAX_TOTAL_Q = 65535
 _SCALE_VEC = 16
 _DATA_DIM = _HEAD_DIM // 2
 _SCALE_DIM = _HEAD_DIM // _SCALE_VEC
@@ -453,6 +458,11 @@ def check_surface(
         )
     if total_q < 1 or total_q % int(seqlen_q):
         return _reject(f"q rows ({total_q}) must be batch_size * seqlen_q ({seqlen_q})")
+    if total_q > _MAX_TOTAL_Q:
+        return _reject(
+            f"q rows ({total_q}) exceed {_MAX_TOTAL_Q} -- the parametric family "
+            f"indexes queries on grid.y"
+        )
     batch_size = total_q // int(seqlen_q)
 
     layout = page_layout(num_kv_heads)
@@ -694,11 +704,24 @@ def specialised_route_reason(
     )
     if reason is not None:
         return reason
-    if device_warm and not module.is_warm(q.device):
-        # The call path of that implementation never compiles, by design, so a
-        # cold device is a route-away rather than a raise: the ping-pong kernel
-        # is already warm and already correct here.
-        return f"not warmed on {q.device}"
+    if device_warm:
+        # Consult the route's own record, not the implementation's: its
+        # `is_warm` is true once its variant table is COMPILED, but `_specialised_warm`
+        # also launches every instantiation once, and only a device that came
+        # through both is in `_specialised_warm_devices`. A device whose warm
+        # failed is latched in `_specialised_warm_failed` and never retried on
+        # the call path -- serving it would fail the same way. Either way the
+        # answer is a route-away rather than a raise: the ping-pong kernel is
+        # already warm and already correct here.
+        device = _normalize_cuda_device(q.device)
+        key = (device.type, device.index)
+        if key in _specialised_warm_failed:
+            return (
+                f"warm failed on {device}; msa_decode_nvfp4_specialized_stats() "
+                f"records the failure"
+            )
+        if key not in _specialised_warm_devices:
+            return f"not warmed on {device}"
     return None
 
 
@@ -1669,6 +1692,10 @@ def msa_decode_nvfp4_specialized_stats() -> Dict[str, Any]:
         # The two axes that stopped being compile-time constants, with the
         # bound that is actually enforced rather than the one that was assumed.
         "topk_range": [1, _MAX_TOPK],
+        "total_q_range": [1, _MAX_TOTAL_Q],
+        "total_q_range_reason": (
+            "the parametric family indexes queries on grid.y, whose limit is 65535"
+        ),
         "topk_range_reason": (
             "every selection slot is one lane of warp 0's compaction ballot in "
             "the parametric family (general::kSelectedCapacity); topk 16 also "

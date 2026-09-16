@@ -757,6 +757,30 @@ def test_parametric_options_are_admitted(cpu_inputs, override):
     assert nvfp4.check_surface(**kwargs) == "q must be a CUDA tensor"
 
 
+def test_the_grid_limit_is_a_surface_refusal_not_a_launch_failure(cpu_inputs):
+    """The parametric family indexes queries on grid.y, which holds 65535.
+
+    One more row is refused here, with the limit in the reason, rather than
+    reaching the driver as cudaErrorInvalidConfiguration. The bound is also
+    reported by the stats so a consumer can read it instead of discovering it.
+    The oversized q is ``torch.empty`` and never touched: the guard reads only
+    its shape, so the 64 MiB it nominally spans is never committed.
+    """
+
+    kwargs = _surface_kwargs(cpu_inputs)
+    num_kv_heads = kwargs["k"].shape[1]
+    too_many = nvfp4._MAX_TOTAL_Q + 1
+    kwargs["q"] = torch.empty(
+        (too_many, num_kv_heads, nvfp4._HEAD_DIM), dtype=kwargs["q"].dtype
+    )
+    reason = nvfp4.check_surface(**kwargs)
+    assert (
+        reason is not None and str(nvfp4._MAX_TOTAL_Q) in reason and "grid.y" in reason
+    )
+    stats = nvfp4.msa_decode_nvfp4_specialized_stats()
+    assert stats["total_q_range"] == [1, nvfp4._MAX_TOTAL_Q] == [1, 65535]
+
+
 def test_a_narrower_block_table_is_admitted(cpu_inputs):
     """``max_blocks`` follows max_model_len; it is a runtime argument."""
     kwargs = _surface_kwargs(cpu_inputs)
@@ -2239,11 +2263,8 @@ def test_the_route_asks_the_implementation_rather_than_deciding(impl, monkeypatc
     assert nvfp4.specialised_route_reason(**kwargs) == "the implementation says no"
 
 
-def test_an_unwarmed_device_routes_away_rather_than_compiling(impl, monkeypatch):
-    """Compiling on the call path would break a CUDA-graph capture."""
-
-    inputs = _build_inputs(64, [8192] * 64, torch.device("cpu"))
-    kwargs = dict(
+def _route_reason_kwargs(inputs):
+    return dict(
         q=inputs["q"],
         k=inputs["k"],
         q2k_indices=inputs["q2k_indices"],
@@ -2252,8 +2273,45 @@ def test_an_unwarmed_device_routes_away_rather_than_compiling(impl, monkeypatch)
         softmax_scale=inputs["softmax_scale"],
         k_global_scale=inputs["k_global_scale"],
     )
-    monkeypatch.setattr(impl, "is_warm", lambda _device: False)
-    assert "not warmed" in nvfp4.specialised_route_reason(**kwargs)
+
+
+def test_an_unwarmed_device_routes_away_rather_than_compiling(impl, monkeypatch):
+    """Compiling on the call path would break a CUDA-graph capture."""
+
+    inputs = _build_inputs(64, [8192] * 64, torch.device("cpu"))
+    monkeypatch.setattr(nvfp4, "_specialised_warm_devices", set())
+    monkeypatch.setattr(nvfp4, "_specialised_warm_failed", set())
+    assert "not warmed" in nvfp4.specialised_route_reason(
+        **_route_reason_kwargs(inputs)
+    )
+
+
+def test_a_device_whose_warm_failed_routes_away_rather_than_dispatching(
+    impl, monkeypatch
+):
+    """A compiled variant table is not a working one.
+
+    ``_specialised_warm`` compiles the table and then launches every
+    instantiation once; a launch that raises latches the device as failed and
+    is never retried on the call path. The implementation's own ``is_warm``
+    turns true at the compile step, so consulting it here would send a call to
+    a body that has already failed on this device. The route's record is what
+    decides.
+    """
+
+    inputs = _build_inputs(64, [8192] * 64, torch.device("cpu"))
+    monkeypatch.setattr(nvfp4, "_specialised_warm_devices", set())
+    monkeypatch.setattr(nvfp4, "_specialised_warm_failed", {("cpu", None)})
+    monkeypatch.setattr(impl, "is_warm", lambda _device: True)  # the trap
+    reason = nvfp4.specialised_route_reason(**_route_reason_kwargs(inputs))
+    assert reason is not None and "warm failed" in reason
+
+
+def test_a_device_the_route_warmed_is_served(impl, monkeypatch):
+    inputs = _build_inputs(64, [8192] * 64, torch.device("cpu"))
+    monkeypatch.setattr(nvfp4, "_specialised_warm_devices", {("cpu", None)})
+    monkeypatch.setattr(nvfp4, "_specialised_warm_failed", set())
+    assert nvfp4.specialised_route_reason(**_route_reason_kwargs(inputs)) is None
 
 
 def test_stats_report_what_the_route_holds_and_refuses(impl):

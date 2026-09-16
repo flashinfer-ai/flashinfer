@@ -297,6 +297,11 @@ namespace general {
 constexpr int kHeadDim = 128;
 constexpr int kHeadCapacity = 16;
 constexpr int kTokenTile = 128;
+// The launch indexes queries on grid.y, whose hardware limit is 65535.  The
+// Python surface check refuses larger calls with this reason before they get
+// here; the binding and the launch both re-check so no path can reach the
+// driver with an invalid grid.
+constexpr int kMaxTotalQ = 65535;
 // Every selection slot is one lane of warp 0's `__ballot_sync`, and the two
 // compaction arrays below are sized by it.  A 33rd slot would be owned by a
 // thread outside that ballot and would be dropped silently, so this is the
@@ -1354,6 +1359,7 @@ cudaError_t launch(const void* q, const void* k_data, const void* v_data, const 
   status = cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 85);
   if (status != cudaSuccess) return status;
 
+  if (total_q > kMaxTotalQ) return cudaErrorInvalidConfiguration;
   cudaLaunchConfig_t config{};
   config.gridDim = dim3(num_kv_heads * split, total_q);
   config.blockDim = dim3(kThreads);
@@ -2490,6 +2496,9 @@ void msa_decode_nvfp4_specialized(TensorView q, TensorView k_data, TensorView v_
   const int page_bytes = static_cast<int>(k_data.stride(0));
   const int data_head_stride = static_cast<int>(k_data.stride(1));
   const int scale_head_stride = static_cast<int>(k_scale.stride(1));
+  TVM_FFI_ICHECK(total_q <= geom::general::kMaxTotalQ)
+      << "q rows (" << total_q << ") exceed " << geom::general::kMaxTotalQ
+      << ": the general family indexes queries on grid.y";
   const cudaStream_t stream = get_stream(q.device());
   cudaError_t status;
   if (use_pinned) {
