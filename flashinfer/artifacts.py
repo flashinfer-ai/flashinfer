@@ -403,7 +403,7 @@ def download_artifacts() -> None:
                     artifact_name,
                     remaining,
                 )
-                time.sleep(min(5.0, remaining))
+                time.sleep(min(1.0, remaining))
 
         failed_artifacts = []
         try:
