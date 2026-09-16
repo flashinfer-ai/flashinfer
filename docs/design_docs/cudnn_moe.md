@@ -73,39 +73,52 @@ initialization on every call and graph replay while avoiding the scheduling
 gaps observed around separate four-byte asynchronous memsets on B200. Both
 dense and block-scaled grouped MoE templates use the compiled reset.
 
-The graph engine/knob identity is also the autotune tactic. The initial runner
-tunes the offered FC1 plans while FC2 uses its initial plan unless explicitly pinned. FROST currently proposes one tile;
-this does not constitute a full kernel search. A catalog sweep can build explicit `create_execution_plan(engine_id, knobs)`
-candidates. Replay a selected pair through
-`CudnnMoeConfig(fc1_tactic=(engine_id, sorted_knob_items),
-fc2_tactic=(engine_id, sorted_knob_items), use_native_routing=True)`.
-Each identity is `(int, tuple[tuple[int, int], ...])`, with knob items sorted.
-The adapter builds these exact plans before execution; unsupported identities
-fail during preparation. Tactics depend on the graph geometry and runtime
-versions and must be revalidated when those change. Performance
-comparisons must record actual engine IDs, configuration coverage and full MoE
-scope, and distinguish them from pre-routed component timings.
+Each stage uses a stable `(engine_id, sorted_knob_items)` identity. The BF16
+runner tunes pairs of FC1/FC2 identities using the complete MoE operation.
+`fc1_tactic` and `fc2_tactic` pin exact plans; `fc1_tactics` and `fc2_tactics`
+provide immutable candidate domains. A pin and domain for the same stage are
+mutually exclusive. Empty domains use the frontend's offered plans, which
+currently do not constitute an exhaustive Frost catalog search.
 
-For a declared joint FC1/FC2 search, list one `CudnnMoeConfig` per pair in
-`BackendOptions`. Repeated configs of the same backend type bind independent
-runners and cache identities. This lets FC2 and scheduler choices participate
-in the full-operator comparison, rather than tuning FC1 with a fixed FC2:
+Each distinct stage plan is prepared once, and its workspace covers every
+candidate. The runner retains all captured resources. An unsupported explicit
+plan fails during preparation; a stale pair is rejected before routing or
+GEMM execution. FI's persisted tactic format retains both stage identities.
+Existing direct FC1 tactic replay remains accepted, using FC2's default plan.
+
+`fc1_fusion=None` preserves the preference for supported shared-input fusion
+with an unfused fallback. `True` requires fusion and reports an unsupported
+plan instead of changing routes; `False` prepares concatenated FC1 followed by
+FP32 activation. Fusion changes resource requirements, so select tile domains
+for each route independently. Only supported candidates should be supplied.
+
+To compare routes and all pairs in their declared domains:
 
 ```python
 from dataclasses import replace
-from itertools import product
 from flashinfer.autotuner import autotune
 
-# Each list contains supported (engine_id, sorted_knob_items) records
-# obtained from prepared stage graphs. Validate each plan before timing.
 candidates = tuple(
-    CudnnMoeConfig(use_native_routing=True, fc1_tactic=first, fc2_tactic=second)
-    for first, second in product(fc1_candidates, fc2_candidates)
+    CudnnMoeConfig(
+        use_native_routing=True,
+        fc1_tactics=tuple(first_stage_records),
+        fc2_tactics=tuple(fc2_records),
+        fc1_fusion=fused,
+    )
+    for fused, first_stage_records in (
+        (True, fused_fc1_records),
+        (False, unfused_fc1_records),
+    )
 )
 layer = MoELayer(replace(config, backend=BackendOptions(candidates)))
 with autotune():
     out = layer(act, weights)
 ```
+
+Route, domain order, and exact stage identities participate in the cache key.
+Normal execution reuses the measured winner. This searches the declared domains;
+full catalog coverage requires explicitly supplying all supported records.
+Record actual engines, coverage, and full-MoE scope when reporting performance.
 
 On a frontend with the new Frost MoE scheduler option, the existing public
 `cudnn.knob_type.SCHED_POLICY` field can select dynamic (omitted/0) or static (1)
@@ -116,7 +129,7 @@ in the open-source Frost engine; the `cudnn` adapter name alone does not identif
 the engine that executed. Record actual plans and kernel traces.
 
 This is exhaustive only over the declared Cartesian product. Preparation costs
-and per-runner storage grow with the candidate set, so retain a measured winner
+grow with distinct stage plans and routes, so retain a measured winner
 for normal execution. FI's cross-runner graph selection and a separately reported
 cold-L2 measurement can use different cache conditions; record both scopes.
 

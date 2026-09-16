@@ -880,11 +880,56 @@ class CudnnMoeConfig:
     ``fc1_tactic`` and ``fc2_tactic`` are optional stable engine/knob identities.
     They replay exactly, with plan preparation outside CUDA graph capture.
     ``use_native_routing`` reuses FI's native sorter and permutation kernels.
+    ``fc1_tactics`` and ``fc2_tactics`` declare candidate domains whose Cartesian
+    product participates in ordinary full-MoE autotuning. Empty domains retain
+    the frontend's proposed plans; they do not request an exhaustive sweep.
+    ``fc1_fusion=None`` prefers supported fusion, ``True`` requires it, and
+    ``False`` selects a separate FC1 and activation. Use separate backend
+    candidates to measure both routes, each with its own stage domains.
     """
 
     use_native_routing: bool = False
     fc1_tactic: Optional[tuple] = None
     fc2_tactic: Optional[tuple] = None
+    fc1_tactics: Tuple[tuple, ...] = ()
+    fc2_tactics: Tuple[tuple, ...] = ()
+    fc1_fusion: Optional[bool] = None
+
+    def __post_init__(self):
+        if self.fc1_fusion is not None and type(self.fc1_fusion) is not bool:
+            raise ValueError("fc1_fusion must be None or bool")
+
+        def normalize(record):
+            if not isinstance(record, tuple) or len(record) != 2:
+                raise ValueError(f"Invalid cuDNN engine/knob tactic: {record!r}")
+            engine, knobs = record
+            if type(engine) is not int or engine < 0 or not isinstance(knobs, tuple):
+                raise ValueError(f"Invalid cuDNN engine/knob tactic: {record!r}")
+            if any(
+                not isinstance(pair, tuple)
+                or len(pair) != 2
+                or any(type(value) is not int for value in pair)
+                for pair in knobs
+            ):
+                raise ValueError("cuDNN tactics require integer knob pairs")
+            if len({pair[0] for pair in knobs}) != len(knobs):
+                raise ValueError("cuDNN tactic contains duplicate knob keys")
+            return engine, tuple(sorted(knobs))
+
+        for stage in ("fc1", "fc2"):
+            domain = getattr(self, stage + "_tactics")
+            pinned = getattr(self, stage + "_tactic")
+            if not isinstance(domain, tuple):
+                raise ValueError(f"{stage}_tactics must be an immutable tuple")
+            if domain and pinned is not None:
+                raise ValueError(f"Specify {stage}_tactic or {stage}_tactics, not both")
+            if pinned is not None:
+                object.__setattr__(self, stage + "_tactic", normalize(pinned))
+            object.__setattr__(
+                self,
+                stage + "_tactics",
+                tuple(dict.fromkeys(normalize(record) for record in domain)),
+            )
 
     @classmethod
     def supported(cls, arch: int) -> bool:

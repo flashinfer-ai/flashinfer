@@ -18,7 +18,9 @@ TILES = [
 ]
 
 
-def _exercise(mode, native, tile, dimensions, activation, monkeypatch):
+def _exercise(
+    mode, native, tile, dimensions, activation, monkeypatch, require_fused=False
+):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0):
         pytest.skip("SM120 GPU required")
     pytest.importorskip("cudnn")
@@ -77,14 +79,21 @@ def _exercise(mode, native, tile, dimensions, activation, monkeypatch):
     assert layer.winner_backend == "cudnn"
     runner = layer.runners[0]
     state = runner._resources(runner.pack_inputs(act, weights))
-    assert not state["fused"]
-    assert state["fc1_output"].dtype == torch.float32
+    if require_fused:
+        assert state["fused"], "The shared-A test must exercise the fused FE plan"
+    if state["fused"]:
+        assert "fc1_output" not in state and "activation" not in state
+    else:
+        assert state["fc1_output"].dtype == torch.float32
     for name in ("fc1", "fc2"):
         graph = state[name].graph
         engine, public_knobs = graph.get_engine_and_knobs_at_index(0)
         assert engine == 20400 and public_knobs == knobs
         compiled = graph._compiled_plans[0]._compiled
         assert compiled.config.pipeline == "sm120" and compiled.config.name == tile
+        assert compiled.chain.num_gemms == (
+            2 if name == "fc1" and state["fused"] else 1
+        )
 
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())
@@ -95,7 +104,8 @@ def _exercise(mode, native, tile, dimensions, activation, monkeypatch):
     for variant in ("x", "ids", "scales", "base"):
         set_variant(variant)
         for name in ("routed", "intermediate", "projected", "output", "fc1_output"):
-            state[name].fill_(float("nan"))
+            if name in state:
+                state[name].fill_(float("nan"))
         actual.fill_(float("nan"))
         capture.replay()
         check(actual, references[variant])
@@ -123,4 +133,17 @@ def test_public_sm120_typed_activation_capture(activation, native, monkeypatch):
         (257, 8, 256, 256),
         activation,
         monkeypatch,
+    )
+
+
+@pytest.mark.parametrize("tile", TILES)
+def test_public_sm120_shared_a_capture(tile, monkeypatch):
+    _exercise(
+        RoutingInputMode.PackedPrecomputed,
+        True,
+        tile,
+        (257, 40, 272, 144),
+        SwiGLU(),
+        monkeypatch,
+        require_fused=True,
     )

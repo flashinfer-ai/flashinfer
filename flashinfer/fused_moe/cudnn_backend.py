@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import struct
 from collections import OrderedDict
+from itertools import product
 from typing import Any
 
 import torch
@@ -116,7 +117,16 @@ def _gated_activation(g, up, gate, activation, device, scalar_bindings):
 
 class _Stage:
     def __init__(
-        self, a, weights, offsets, out, *, fused=False, tactic=None, activation=None
+        self,
+        a,
+        weights,
+        offsets,
+        out,
+        *,
+        fused=False,
+        tactic=None,
+        activation=None,
+        tactics=(),
     ):
         import cudnn
 
@@ -181,19 +191,46 @@ class _Stage:
         )
         g.validate()
         g.build_operation_graph()
-        if tactic is None:
-            g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+        if tactic is not None and tactics:
+            raise ValueError("Specify one tactic or a candidate domain for a stage")
+        requested = tactics or ((tactic,) if tactic is not None else ())
+        if requested:
+            for engine, knobs in requested:
+                g.create_execution_plan(
+                    int(engine), {cudnn.knob_type(int(k)): int(v) for k, v in knobs}
+                )
         else:
-            engine, knobs = tactic
-            g.create_execution_plan(
-                int(engine), {cudnn.knob_type(int(k)): int(v) for k, v in knobs}
-            )
+            g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
         g.check_support()
-        g.build_plans(cudnn.build_plan_policy.ALL)
-        self.tactics = tuple(_plan_indices(g))
-        self.workspace = torch.empty(
-            g.get_workspace_size(), device=a.device, dtype=torch.uint8
+        self.tactic_indices = {}
+        for record, index in _plan_indices(g).items():
+            try:
+                g.build_plan_at_index(index)
+            except (NotImplementedError, cudnn.cudnnGraphNotSupportedError) as exc:
+                if requested:
+                    raise
+                _LOG.debug("Skipping declined BF16 candidate %d: %s", index, exc)
+                continue
+            self.tactic_indices[record] = index
+        if not self.tactic_indices:
+            raise NotImplementedError("No prepared cuDNN plan supports this BF16 stage")
+        g.select_plan(next(iter(self.tactic_indices.values())))
+        self.tactics = tuple(self.tactic_indices)
+        workspace_bytes = max(
+            g.get_workspace_size_plan_at_index(index)
+            for index in self.tactic_indices.values()
         )
+        self.workspace = torch.empty(
+            workspace_bytes, device=a.device, dtype=torch.uint8
+        )
+
+    def plan_index(self, tactic):
+        index = _plan_index(self.graph, tactic)
+        if index != -1 and index not in self.tactic_indices.values():
+            raise ValueError(
+                "cuDNN BF16 stage tactic is unavailable; retune this shape"
+            )
+        return index
 
     def run(self, a, weights, offsets, out, tactic=-1):
         import cudnn
@@ -211,7 +248,7 @@ class _Stage:
             for desc, weight in zip(self.weights, weights, strict=True)
         )
         pack.update(self.scalar_bindings)
-        index = _plan_index(self.graph, tactic)
+        index = self.plan_index(tactic)
         if index == -1:
             self.graph.execute(pack, self.workspace, handle=self.handle)
         else:
@@ -287,7 +324,8 @@ class _Activation:
 class CudnnMoeRunner(MoERunner):
     backend_key = "cudnn"
     _backend_config_type: type = CudnnMoeConfig
-    _cache_version = "cudnn-bf16-v5"
+    # Joint stage tactics and explicit fusion routes change cache identities.
+    _cache_version = "cudnn-bf16-v7-joint-routes"
     _activation_dtype = torch.bfloat16
     supported_routing_modes = (
         RoutingInputMode.PackedPrecomputed,
@@ -478,23 +516,29 @@ class CudnnMoeRunner(MoERunner):
         r = self.config.routing.top_k
         # FROST's shared-A FC1 fusion is optional. A graph decline is a route
         # choice; record it and build the ordinary backend-compatible FC1.
-        try:
-            s["fc1"] = _Stage(
-                s["routed"],
-                [up, gate],
-                s["offsets"],
-                s["intermediate"],
-                fused=True,
-                tactic=self.backend_config.fc1_tactic,
-                activation=self.config.activation,
-            )
-            s["fused"] = True
-        except (
-            NotImplementedError,
-            RuntimeError,
-            cudnn.cudnnGraphNotSupportedError,
-        ) as exc:
-            _LOG.info("cuDNN MoE shared-input FC1 fusion declined: %s", exc)
+        s["fused"] = False
+        if self.backend_config.fc1_fusion is not False:
+            try:
+                s["fc1"] = _Stage(
+                    s["routed"],
+                    [up, gate],
+                    s["offsets"],
+                    s["intermediate"],
+                    fused=True,
+                    tactic=self.backend_config.fc1_tactic,
+                    activation=self.config.activation,
+                    tactics=self.backend_config.fc1_tactics,
+                )
+                s["fused"] = True
+            except (
+                NotImplementedError,
+                RuntimeError,
+                cudnn.cudnnGraphNotSupportedError,
+            ) as exc:
+                _LOG.info("cuDNN MoE shared-input FC1 fusion declined: %s", exc)
+                if self.backend_config.fc1_fusion is True:
+                    raise
+        if not s["fused"]:
             s["fc1_output"] = empty((t * r, 2 * i), torch.float32)
             s["fc1"] = _Stage(
                 s["routed"],
@@ -502,6 +546,7 @@ class CudnnMoeRunner(MoERunner):
                 s["offsets"],
                 s["fc1_output"],
                 tactic=self.backend_config.fc1_tactic,
+                tactics=self.backend_config.fc1_tactics,
             )
             s["activation"] = _Activation(
                 s["fc1_output"], s["intermediate"], self.config.activation
@@ -513,11 +558,38 @@ class CudnnMoeRunner(MoERunner):
             s["offsets"],
             s["projected"],
             tactic=self.backend_config.fc2_tactic,
+            tactics=self.backend_config.fc2_tactics,
         )
 
     def get_valid_tactics(self, inputs, profile):
         s = self._resources(inputs)
-        return list(s["fc1"].tactics)
+        return list(product(s["fc1"].tactics, s["fc2"].tactics))
+
+    @staticmethod
+    def _stage_indices(s, tactic):
+        # Preserve direct FC1 replay for callers of the initial runner. New
+        # tuning records contain stable identities for both stages.
+        if type(tactic) is int or (
+            isinstance(tactic, tuple) and len(tactic) == 2 and type(tactic[0]) is int
+        ):
+            return s["fc1"].plan_index(tactic), -1
+        if not isinstance(tactic, tuple) or len(tactic) != 2:
+            raise ValueError(
+                "BF16 MoE tactic must contain FC1 and FC2 engine/knob records"
+            )
+        for record in tactic:
+            if (
+                not isinstance(record, tuple)
+                or len(record) != 2
+                or type(record[0]) is not int
+            ):
+                raise ValueError(
+                    "BF16 MoE joint tactics require stable engine/knob records"
+                )
+        return tuple(
+            s[stage].plan_index(record)
+            for stage, record in zip(("fc1", "fc2"), tactic, strict=True)
+        )
 
     def forward(self, inputs, tactic=-1, do_preparation=False, **kwargs):
         self._require_built()
@@ -525,6 +597,8 @@ class CudnnMoeRunner(MoERunner):
 
         x, ids, scales, up, gate, down, gate_up = inputs[:7]
         s = self._resources(inputs)
+        # Validate the complete record before routing or either GEMM launches.
+        self._stage_indices(s, tactic)
         output = inputs[7]
         if do_preparation:
             return output
@@ -605,12 +679,15 @@ class CudnnMoeRunner(MoERunner):
         return output
 
     def _run_stages(self, s, inputs, tactic):
+        fc1_index, fc2_index = self._stage_indices(s, tactic)
         _, _, _, up, gate, down, gate_up = inputs[:7]
         if s["fused"]:
             s["fc1"].run(
-                s["routed"], [up, gate], s["offsets"], s["intermediate"], tactic
+                s["routed"], [up, gate], s["offsets"], s["intermediate"], fc1_index
             )
         else:
-            s["fc1"].run(s["routed"], [gate_up], s["offsets"], s["fc1_output"], tactic)
+            s["fc1"].run(
+                s["routed"], [gate_up], s["offsets"], s["fc1_output"], fc1_index
+            )
             s["activation"].run(s["fc1_output"], s["intermediate"])
-        s["fc2"].run(s["intermediate"], [down], s["offsets"], s["projected"])
+        s["fc2"].run(s["intermediate"], [down], s["offsets"], s["projected"], fc2_index)
