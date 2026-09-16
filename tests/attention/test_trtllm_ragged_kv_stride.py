@@ -903,6 +903,68 @@ def test_trtllm_ragged_cute_dsl_all_empty_rows_skip_launch(monkeypatch):
 
 
 @pytest.mark.cuda
+def test_trtllm_ragged_cute_dsl_all_empty_rows_capture_records_launch(monkeypatch):
+    """Under CUDA graph capture, the launch must still be recorded even when
+    the plan-time mirrors report an all-inactive batch. Otherwise a later
+    replay with active rows would find no kernel in the graph.
+
+    The DSL varlen kernel is a no-op for kv_len <= 0 rows, so an all-empty
+    launch under capture is safe. This test stubs both the kernel and the
+    capture predicate so it can run on any CUDA device without recording a
+    real graph.
+    """
+    device = torch.device("cuda")
+    _require_trtllm_ragged(device)
+    torch.manual_seed(42)
+
+    batch_size = 3
+    num_heads = 16
+    head_dim = 128
+    q_lens = torch.tensor([4, 2, 3], device=device, dtype=torch.int32)
+    kv_lens = torch.zeros(batch_size, device=device, dtype=torch.int32)
+    q_indptr = _indptr(q_lens)
+    kv_indptr = _indptr(kv_lens)
+    q = torch.randn(
+        int(q_indptr[-1].item()),
+        num_heads,
+        head_dim,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    k = torch.empty((0, num_heads, head_dim), device=device, dtype=torch.bfloat16)
+    v = torch.empty((0, num_heads, head_dim), device=device, dtype=torch.bfloat16)
+    calls = _stub_cute_dsl_kernel(monkeypatch)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+
+    out = torch.full(
+        (q.shape[0], num_heads, head_dim), 7.0, device=device, dtype=torch.bfloat16
+    )
+    lse = torch.full((q.shape[0], num_heads), 3.0, device=device)
+
+    output, lse_out = _run_trtllm_ragged(
+        q,
+        k,
+        v,
+        q_indptr,
+        kv_indptr,
+        kv_lens,
+        max_kv_len=0,
+        out=out,
+        lse=lse,
+        q_lens_cpu=q_lens.cpu(),
+        kv_lens_cpu=kv_lens.cpu(),
+        backend="cute-dsl",
+    )
+
+    assert len(calls) == 1, (
+        "kernel launch must be recorded during capture even when all rows "
+        "are inactive, so replay with active data can still run the kernel"
+    )
+    assert torch.all(output == 0)
+    assert torch.isneginf(lse_out).all()
+
+
+@pytest.mark.cuda
 def test_trtllm_ragged_cute_dsl_empty_kv_rows_match_compacted_call():
     """Real-kernel companion: neutral rows plus parity with a compacted call."""
     device = torch.device("cuda")

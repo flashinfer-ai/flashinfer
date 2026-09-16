@@ -5981,7 +5981,18 @@ def trtllm_ragged_attention_deepseek(
                 out.zero_()
                 if lse is not None:
                     lse.fill_(-float("inf"))
-                should_launch = False
+                # Skip the launch only outside CUDA graph capture. Under
+                # capture, dropping the launch would leave it unrecorded,
+                # so a later replay with active rows would find no kernel
+                # in the graph. The DSL varlen kernel is a no-op for
+                # kv_len <= 0 rows, so recording it on an all-empty batch
+                # is safe and preserves the graph for varying replays.
+                if not (
+                    query.is_cuda
+                    and hasattr(torch.cuda, "is_current_stream_capturing")
+                    and torch.cuda.is_current_stream_capturing()
+                ):
+                    should_launch = False
             else:
                 q_lens_device = cum_seq_lens_q[1:] - cum_seq_lens_q[:-1]
                 kv_lens_device = cum_seq_lens_kv[1:] - cum_seq_lens_kv[:-1]
