@@ -27,12 +27,17 @@ def _sm121_tactic(m, n, k, compute_capability):
         return ("b12x", 64, 64, 256)
     if compute_capability == (12, 1) and (m, n, k) == (512, 8192, 2048):
         return ("raw", 64, 32, 4, False, True, 256, True)
-    if compute_capability == (12, 1) and (m, n, k) == (256, 7168, 4608):
+    if compute_capability == (12, 1) and (m, n, k) in (
+        (256, 7168, 4608),
+        (256, 4608, 7168),
+        (256, 7168, 2304),
+        (256, 1024, 7168),
+    ):
         return ("b12x", 64, 128, 256)
     if compute_capability == (12, 1) and (m, n, k) == (256, 9216, 7168):
         return ("raw", 64, 32, 2, False, True, 256, True)
     if compute_capability == (12, 1) and (m, n, k) == (512, 7168, 5120):
-        return ("raw", 64, 32, 8, False, True)
+        return ("raw", 64, 32, 8, False, True, 256, False)
     if compute_capability == (12, 1) and (m, n, k) == (1024, 896, 1024):
         return ("raw", 32, 64, 13, True, True)
     if compute_capability == (12, 1) and (m, n, k) == (512, 5120, 640):
@@ -101,7 +106,7 @@ def _sm121_tactic(m, n, k, compute_capability):
     if compute_capability == (12, 1) and (m, n, k) == (512, 5120, 16384):
         return ("cooperative", 128, 128, 256)
     if compute_capability == (12, 1) and (m, n, k) == (1024, 4608, 7168):
-        return ("raw", 64, 32, 8, False, True, 256, True)
+        return ("cooperative", 256, 128, 128)
     if compute_capability == (12, 1) and (m, n, k) == (512, 8192, 28672):
         return ("cooperative", 256, 128, 128)
     if compute_capability == (12, 1) and (m, n, k) == (512, 5120, 4096):
@@ -179,6 +184,11 @@ def compatible(m, n, k, tactic, *, compute_capability=None):
             compute_capability == (12, 1)
             and (m, n, k) == (1024, 1024, 7168)
             and tactic == ("b12x", 64, 128, 128)
+        )
+        or (
+            compute_capability == (12, 1)
+            and (m, n, k) == (1024, 4608, 7168)
+            and tactic == ("raw", 64, 32, 8, False, True, 256, True)
         )
         or (
             compute_capability == (12, 1)
