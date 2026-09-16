@@ -37,6 +37,7 @@ def _sm121_tactic(m, n, k, compute_capability):
     if compute_capability == (12, 1) and (m, n, k) in (
         (512, 1792, 5120),
         (512, 5120, 1024),
+        (512, 5120, 1280),
         (512, 5120, 2048),
     ):
         return ("cooperative", 128, 64, 256)
