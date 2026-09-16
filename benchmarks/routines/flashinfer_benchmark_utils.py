@@ -25,6 +25,7 @@ output_column_dict = {
         "causal",
         "q_dtype",
         "kv_dtype",
+        "v_dtype",
         "avg_actual_seq_len",
         "random_actual_seq_len",
         "is_var_seq",

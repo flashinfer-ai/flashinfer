@@ -26,10 +26,11 @@ configuration.  They group related tensors for ergonomics (no more counting
 from __future__ import annotations
 
 import dataclasses
+from collections.abc import Mapping
 import math
 from dataclasses import KW_ONLY, dataclass, field
 from enum import Enum
-from typing import ClassVar, Dict, Literal, Optional, Tuple, Union
+from typing import Any, ClassVar, Dict, Literal, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
@@ -114,6 +115,13 @@ class RoutingConfig:
     n_group: Optional[int] = None
     topk_group: Optional[int] = None
     routed_scaling_factor: Optional[float] = None
+    # Append new fields BELOW this KW_ONLY sentinel. ``_: KW_ONLY`` is a
+    # ``dataclasses`` marker, not a real field -- every field declared after it
+    # becomes keyword-only. That way a field added later can never silently
+    # rebind an existing positional argument at a call site that still looks
+    # correct. The fields above keep their current binding, so adding this
+    # changes nothing for existing callers.
+    _: KW_ONLY
 
     def __repr__(self) -> str:
         parts = [f"num_experts={self.num_experts!r}", f"top_k={self.top_k!r}"]
@@ -338,6 +346,13 @@ class ExpertConfig:
     local_expert_offset: int = 0
     local_num_experts: Optional[int] = None
     num_fused_shared_experts: int = 0
+    # Append new fields BELOW this KW_ONLY sentinel. ``_: KW_ONLY`` is a
+    # ``dataclasses`` marker, not a real field -- every field declared after it
+    # becomes keyword-only. That way a field added later can never silently
+    # rebind an existing positional argument at a call site that still looks
+    # correct. The fields above keep their current binding, so adding this
+    # changes nothing for existing callers.
+    _: KW_ONLY
 
     def __post_init__(self) -> None:
         if self.num_fused_shared_experts < 0:
@@ -446,6 +461,8 @@ _CUTLASS_W4A16_ARCHS = (90,)
 
 _CUTILE_BF16_ARCHS = (89, 90, 120, 121)
 _CUTILE_NVFP4_ARCHS = (120, 121)
+_CUTILE_MXFP4_ARCHS = (120, 121)
+_CUTILE_W4A16_ARCHS = (89, 90, 120, 121)
 _CUTILE_SUPPORTED_ACTIVATIONS = (
     ActivationType.Swiglu,
     ActivationType.SwigluStep,
@@ -970,7 +987,12 @@ class CuTileNvfp4Config:
         source_format: str = "modelopt",
         device=None,
     ):
-        """Build the ``cutile_nvfp4`` view from checkpoint NVFP4 weights."""
+        """Build the ``cutile_nvfp4`` view from checkpoint NVFP4 weights.
+
+        Set ``device`` to the execution GPU when loading CPU checkpoint tensors.
+        Prepared scale layouts are architecture-specific and must be rebuilt
+        when moving between SM89/90 and SM12x.
+        """
         from .prepare import prepare_cutile_nvfp4_weights
 
         return prepare_cutile_nvfp4_weights(
@@ -990,6 +1012,86 @@ class CuTileNvfp4Config:
 
     def __repr__(self) -> str:
         return "CuTileNvfp4Config()"
+
+
+@dataclass(frozen=True)
+class CuTileNvfp4Bf16Config(CuTileNvfp4Config):
+    """cuTile NVFP4-weight x BF16-activation backend.
+
+    Uses the same prepared weight view as :class:`CuTileNvfp4Config`.
+    Expert parallelism and fused shared experts are not supported.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in _CUTILE_W4A16_ARCHS
+
+    def __repr__(self) -> str:
+        return "CuTileNvfp4Bf16Config()"
+
+
+@dataclass(frozen=True)
+class CuTileMxfp4Config:
+    """cuTile MXFP4-weight x MXFP4-activation backend.
+
+    Expert parallelism and fused shared experts are not supported.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in _CUTILE_MXFP4_ARCHS
+
+    @staticmethod
+    def prepare_weights(
+        w1_fp4,
+        w1_block_scale,
+        w2_fp4,
+        w2_block_scale,
+        *,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
+        device=None,
+    ):
+        """Build the shared ``cutile_mxfp4`` weight view.
+
+        Set ``device`` to the execution GPU when loading CPU checkpoint tensors.
+        Prepared scale layouts are architecture-specific and must be rebuilt
+        when moving between SM89/90 and SM12x.
+        """
+        from .prepare import prepare_cutile_mxfp4_weights
+
+        return prepare_cutile_mxfp4_weights(
+            w1_fp4,
+            w1_block_scale,
+            w2_fp4,
+            w2_block_scale,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation_type=(activation or SwiGLU()).type,
+            device=device,
+        )
+
+    def __repr__(self) -> str:
+        return "CuTileMxfp4Config()"
+
+
+@dataclass(frozen=True)
+class CuTileMxfp4Bf16Config(CuTileMxfp4Config):
+    """cuTile MXFP4-weight x BF16-activation backend.
+
+    Uses the same prepared weight view as :class:`CuTileMxfp4Config`.
+    Expert parallelism and fused shared experts are not supported.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in _CUTILE_W4A16_ARCHS
+
+    def __repr__(self) -> str:
+        return "CuTileMxfp4Bf16Config()"
 
 
 @dataclass(frozen=True)
@@ -1503,6 +1605,9 @@ BackendConfigType = Union[
     TrtllmMxInt4Config,
     CutlassBf16Config,
     CuTileBf16Config,
+    CuTileMxfp4Bf16Config,
+    CuTileMxfp4Config,
+    CuTileNvfp4Bf16Config,
     CuTileNvfp4Config,
     CutlassW4A16Config,
     CutlassNvfp4Config,
@@ -1526,6 +1631,9 @@ ALL_BACKEND_CONFIGS = (
     TrtllmMxInt4Config,
     CutlassBf16Config,
     CuTileBf16Config,
+    CuTileMxfp4Bf16Config,
+    CuTileMxfp4Config,
+    CuTileNvfp4Bf16Config,
     CuTileNvfp4Config,
     CutlassW4A16Config,
     CutlassNvfp4Config,
@@ -1592,6 +1700,8 @@ _DEFAULT_BACKEND = BackendOptions(
         CutlassBf16Config(),
         CutlassW4A16Config(),
         CuteDslConfig(),
+        CuTileMxfp4Bf16Config(),
+        CuTileNvfp4Bf16Config(),
     )
 )
 
@@ -1714,6 +1824,29 @@ class MoEConfig:
 # boundary, so a graph-shaped public API would leak one backend's internals.
 # Each pack presents itself to a backend via prepare_for / get_view, keeping
 # backend-specific layout logic out of the dispatch hot-path.
+
+
+def _tensor_summary(value: Any) -> str:
+    """Shape/dtype/device summary of a tensor; ``repr`` for anything else.
+
+    The packs define ``__repr__`` in terms of this rather than inheriting the
+    dataclass default, which would call ``repr()`` on each tensor field and so
+    read device memory. That matters because the packs are the arguments of
+    ``MoELayer.__call__``, which is decorated with ``@flashinfer_api``; see
+    ``_serialize_value`` in ``flashinfer/api_logging.py`` for why tensor-bearing
+    containers must not be stringified, and the Release Gates section of
+    ``docs/design_docs/flashinfer_moe_api.md`` for the decision to fix it here
+    rather than special-case the pack types inside the shared logger.
+
+    Non-tensor values are rendered with ``repr`` rather than assumed to have
+    ``.shape``: a ``__repr__`` that raises turns an unrelated pytest assertion
+    or debugger inspection into a confusing ``AttributeError``.
+    """
+    if value is None:
+        return "None"
+    if not isinstance(value, Tensor):
+        return repr(value)
+    return f"Tensor(shape={tuple(value.shape)}, dtype={value.dtype}, device={value.device})"
 
 
 @dataclass
@@ -1901,6 +2034,25 @@ class MoEActivationPack:
     def num_tokens(self) -> int:
         return self.hidden_states_q.shape[0]
 
+    def __repr__(self) -> str:
+        """Metadata-only repr -- never reads device memory.
+
+        Driven off ``dataclasses.fields`` rather than a hand-written field list
+        so a tensor field added later is summarized automatically instead of
+        silently vanishing from the log. The two required fields are always
+        shown (``hidden_states_scale=None`` is meaningful -- it is how BF16 and
+        TRT-LLM FP8 packs are distinguished); optional fields left at ``None``
+        are omitted to keep the line readable.
+        """
+        required = ("hidden_states_q", "hidden_states_scale")
+        parts = []
+        for f in dataclasses.fields(self):
+            value = getattr(self, f.name)
+            if value is None and f.name not in required:
+                continue
+            parts.append(f"{f.name}={_tensor_summary(value)}")
+        return f"MoEActivationPack({', '.join(parts)})"
+
 
 @dataclass
 class MoEWeightPack:
@@ -1930,3 +2082,19 @@ class MoEWeightPack:
                 f"Available: {list(self.native_views)}"
             )
         return self.native_views[backend_key]
+
+    def __repr__(self) -> str:
+        def _view_summary(view: Any) -> str:
+            # ``prepare_for`` stores whatever it is handed and ``native_views``
+            # is public, so a view is not guaranteed to be a mapping. Fall back
+            # rather than raise: a ``__repr__`` that throws turns an unrelated
+            # debugger inspection or pytest assertion into an AttributeError.
+            if not isinstance(view, Mapping):
+                return _tensor_summary(view)
+            inner = ", ".join(f"{n}: {_tensor_summary(t)}" for n, t in view.items())
+            return "{" + inner + "}"
+
+        views = ", ".join(
+            f"{key!r}: {_view_summary(view)}" for key, view in self.native_views.items()
+        )
+        return f"MoEWeightPack(native_views={{{views}}})"

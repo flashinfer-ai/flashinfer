@@ -1714,7 +1714,8 @@ def get_trtllm_moe_sm100_module():
 def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
     module = gen_trtllm_gen_fused_moe_sm100_module(enable_rubin=enable_rubin)
     moe_op = module.build_and_load()
-    setup_cubin_loader(str(module.get_library_path()))
+    for library_path in module.get_library_paths():
+        setup_cubin_loader(str(library_path))
 
     class DABodyRunner:
         """Compose one ordinary MoERunner with prepared-metadata body execution."""

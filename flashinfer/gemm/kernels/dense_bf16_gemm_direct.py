@@ -22,6 +22,8 @@ from cutlass import const_expr
 from cutlass.cute import experimental as cute_ext
 from cutlass.cute.runtime import from_dlpack
 
+from ...jit.cute_dsl_core import build_and_load_cute_dsl_kernel
+
 
 _VECTOR_WIDTH = 8
 _SUPPORTED_BLOCK_SIZES = (32, 64, 96, 128, 192, 256, 384)
@@ -301,6 +303,7 @@ def _make_compile_repr_tensors(dtype, m: int, n: int, k: int):
 
 @functools.cache
 def _get_compiled_direct_kernel(
+    device_index: int,
     dtype,
     m: int,
     n: int,
@@ -310,16 +313,30 @@ def _get_compiled_direct_kernel(
 ):
     if dtype != _torch.bfloat16:
         raise ValueError(f"direct GEMM supports BF16; got {dtype}")
-    kernel = DirectDenseGemmKernel(
-        element_type=cutlass.BFloat16,
-        num_rows=m,
-        k_extent=k,
-        tactic=tactic,
-        use_pdl=use_pdl,
-    )
-    tensors = _make_compile_repr_tensors(dtype, m, n, k)
-    stream = _cuda.CUstream(_torch.cuda.current_stream().cuda_stream)
-    return cute_ext.compile(kernel, *tensors, stream, options=_COMPILE_OPTIONS)
+
+    def compile_kernel():
+        return cute_ext.compile(
+            DirectDenseGemmKernel(
+                element_type=cutlass.BFloat16,
+                num_rows=m,
+                k_extent=k,
+                tactic=tactic,
+                use_pdl=use_pdl,
+            ),
+            *_make_compile_repr_tensors(dtype, m, n, k),
+            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+            options=_COMPILE_OPTIONS + " --enable-tvm-ffi",
+        )
+
+    with _torch.cuda.device(device_index):
+        return build_and_load_cute_dsl_kernel(
+            "dense_bf16_gemm_direct",
+            f"bf16_m{m}_n{n}_k{k}_block{tactic.block_size}"
+            f"_out{tactic.outputs_per_block}_rows{tactic.rows_per_block}"
+            f"_pdl{int(use_pdl)}",
+            compile_kernel,
+            extra_key_files=(__file__,),
+        )
 
 
 def _validate_runtime_tensors(a, b, out, tactic: DirectTactic):
@@ -351,10 +368,11 @@ def _validate_runtime_tensors(a, b, out, tactic: DirectTactic):
 def run_direct_dense(a, b, out, pdl: bool, tactic: DirectTactic):
     """Run direct ``A[M,K] @ B[K,N]`` with the ``mm_bf16`` layouts."""
     m, n, k = _validate_runtime_tensors(a, b, out, tactic)
-    compiled = _get_compiled_direct_kernel(a.dtype, m, n, k, tactic, pdl)
-    tensors = tuple(_from_dlpack_static(tensor) for tensor in (a, b.T, out))
-    stream = _cuda.CUstream(_torch.cuda.current_stream(a.device).cuda_stream)
-    compiled(*tensors, stream)
+    with _torch.cuda.device(a.device):
+        compiled = _get_compiled_direct_kernel(
+            a.get_device(), a.dtype, m, n, k, tactic, pdl
+        )
+        compiled(a, b.T, out)
     return out
 
 
