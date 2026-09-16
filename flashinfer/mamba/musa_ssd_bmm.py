@@ -170,9 +170,7 @@ def _bmm_chunk_fwd(a, b, chunk_size, cu_chunk_seqlens, causal=False, output_dtyp
     nchunks = len(cu_chunk_seqlens) - 1
     # Allocates output.
     out_dtype = a.dtype if output_dtype is None else output_dtype
-    out = torch.empty(
-        (nchunks, ngroups, chunk_size, chunk_size), device=a.device, dtype=out_dtype
-    )
+    out = a.new_empty((nchunks, ngroups, chunk_size, chunk_size), dtype=out_dtype)
     dot_dtype = (
         tl.bfloat16
         if a.dtype == torch.bfloat16 or b.dtype == torch.bfloat16

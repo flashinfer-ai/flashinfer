@@ -330,12 +330,8 @@ def _chunk_cumsum_fwd(
     if dt_bias is not None:
         assert dt_bias.shape == (nheads,)
     nchunks = cu_chunk_seqlens.shape[0] - 1
-    dt_out = torch.empty(
-        nheads, nchunks, chunk_size, device=dt.device, dtype=torch.float32
-    )
-    dA_cumsum = torch.empty(
-        nheads, nchunks, chunk_size, device=dt.device, dtype=torch.float32
-    )
+    dt_out = dt.new_empty((nheads, nchunks, chunk_size), dtype=torch.float32)
+    dA_cumsum = dt.new_empty((nheads, nchunks, chunk_size), dtype=torch.float32)
     grid_chunk_cs = lambda META: (nchunks, triton.cdiv(nheads, META["BLOCK_SIZE_H"]))
     with device_context(dt.device.index):
         _chunk_cumsum_fwd_kernel[grid_chunk_cs](
@@ -381,9 +377,7 @@ def _chunk_state_fwd(
         assert states.shape == (nchunks, nheads, headdim, dstate)
     else:
         states_dtype = torch.float32 if states_in_fp32 else B.dtype
-        states = torch.empty(
-            (nchunks, nheads, headdim, dstate), device=x.device, dtype=states_dtype
-        )
+        states = x.new_empty((nchunks, nheads, headdim, dstate), dtype=states_dtype)
 
     grid = lambda META: (
         triton.cdiv(headdim, META["BLOCK_SIZE_M"])

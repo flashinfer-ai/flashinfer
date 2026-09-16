@@ -6,8 +6,6 @@
 
 # ruff: noqa: E501
 
-import torch
-
 from .musa_compile import device_context
 from .musa_ssd_helpers import fast_exp
 import triton
@@ -113,7 +111,7 @@ def _state_passing_fwd(
     batch = last_chunk_indices.shape[0]
     assert dA_cumsum.shape == (nheads, nchunks, chunk_size)
     out_dtype = states.dtype if out_dtype is None else out_dtype
-    out = torch.empty((nchunks, nheads, dim), device=states.device, dtype=out_dtype)
+    out = states.new_empty((nchunks, nheads, dim), dtype=out_dtype)
 
     initial_states_strides = (
         (initial_states.stride(0), initial_states.stride(1), initial_states.stride(2))
