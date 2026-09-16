@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 by FlashInfer team
-"""CuTe DSL fused output RMSNorm and sigmoid gate for per-head output projection."""
+"""CuTe DSL fused output RMSNorm and sigmoid gate for per-head output projection.
+
+Token counts are runtime values. Compiled kernels are shared by tensors with
+the same head count, token strides, and launch configuration.
+"""
 
 import functools
 
@@ -66,10 +70,12 @@ if HAS_CUTEDSL:
             cute.make_layout((vector_size,), stride=(1,)),
         )
 
+    @cute.jit
     def _load_rows(
         atom,
         address,
         rows,
+        num_rows,
         lane_offset,
         token_stride,
         num_heads,
@@ -79,26 +85,31 @@ if HAS_CUTEDSL:
         fragments = []
         for row in rows:
             fragment = cute.make_rmem_tensor((vector_size,), cutlass.BFloat16)
-            cute.copy(
-                atom,
-                _row_view(
-                    address,
-                    row,
-                    lane_offset,
-                    token_stride,
-                    num_heads,
-                    vector_size,
-                    vector_bytes,
-                ),
-                fragment,
-            )
+            # Keep every lane in the reduction, without reading padded rows.
+            fragment.fill(0)
+            if row < num_rows:
+                cute.copy(
+                    atom,
+                    _row_view(
+                        address,
+                        row,
+                        lane_offset,
+                        token_stride,
+                        num_heads,
+                        vector_size,
+                        vector_bytes,
+                    ),
+                    fragment,
+                )
             fragments.append(fragment)
         return fragments
 
+    @cute.jit
     def _store_rows(
         atom,
         address,
         rows,
+        num_rows,
         lane_offset,
         token_stride,
         num_heads,
@@ -107,19 +118,20 @@ if HAS_CUTEDSL:
         vector_bytes,
     ):
         for row, fragment in zip(rows, fragments, strict=True):
-            cute.copy(
-                atom,
-                fragment,
-                _row_view(
-                    address,
-                    row,
-                    lane_offset,
-                    token_stride,
-                    num_heads,
-                    vector_size,
-                    vector_bytes,
-                ),
-            )
+            if row < num_rows:
+                cute.copy(
+                    atom,
+                    fragment,
+                    _row_view(
+                        address,
+                        row,
+                        lane_offset,
+                        token_stride,
+                        num_heads,
+                        vector_size,
+                        vector_bytes,
+                    ),
+                )
 
     def _row_sum(fragment, vector_size, log2_lanes):
         values = [fragment[i] for i in range(vector_size)]
@@ -159,14 +171,13 @@ if HAS_CUTEDSL:
         gate_address: cutlass.Int64,
         output_address: cutlass.Int64,
         eps: cutlass.Float32,
-        rows: cutlass.Constexpr,
+        rows: cutlass.Int32,
         num_heads: cutlass.Constexpr,
         x_token_stride: cutlass.Constexpr,
         gate_token_stride: cutlass.Constexpr,
         output_token_stride: cutlass.Constexpr,
         lanes: cutlass.Constexpr,
         threads: cutlass.Constexpr,
-        full_tiles: cutlass.Constexpr,
     ):
         vector_size = cutlass.const_expr(HEAD_DIM // lanes)
         vector_bytes = cutlass.const_expr(vector_size * 2)
@@ -178,8 +189,6 @@ if HAS_CUTEDSL:
         block_idx = cute.arch.block_idx()[0]
         lane_offset = (thread_idx & (lanes - 1)) * vector_bytes
         row = block_idx * rows_per_cta + (thread_idx >> log2_lanes)
-        if cutlass.const_expr(not full_tiles):
-            row = cute.min(row, cutlass.Int32(rows - 1))
         tile_rows = [row]
 
         atom = cute.make_copy_atom(
@@ -191,6 +200,7 @@ if HAS_CUTEDSL:
             atom,
             x_address,
             tile_rows,
+            rows,
             lane_offset,
             x_token_stride,
             num_heads,
@@ -201,6 +211,7 @@ if HAS_CUTEDSL:
             atom,
             gate_address,
             tile_rows,
+            rows,
             lane_offset,
             gate_token_stride,
             num_heads,
@@ -218,6 +229,7 @@ if HAS_CUTEDSL:
             atom,
             output_address,
             tile_rows,
+            rows,
             lane_offset,
             output_token_stride,
             num_heads,
@@ -239,11 +251,12 @@ if HAS_CUTEDSL:
         output_token_stride: cutlass.Constexpr,
         lanes: cutlass.Constexpr,
         warps: cutlass.Constexpr,
-        grid: cutlass.Constexpr,
         cluster: cutlass.Constexpr,
-        full_tiles: cutlass.Constexpr,
     ):
-        rows = cutlass.const_expr(x.shape[0] * x.shape[1])
+        rows = x.shape[0] * num_heads
+        rows_per_cta = cutlass.const_expr(32 * warps // lanes)
+        tiles = cute.ceil_div(rows, rows_per_cta)
+        grid = cute.ceil_div(tiles, cluster) * cluster
         _rmsnorm_sigmoid_gate_kernel(
             x.iterator.toint(),
             gate.iterator.toint(),
@@ -256,7 +269,6 @@ if HAS_CUTEDSL:
             output_token_stride,
             lanes,
             32 * warps,
-            full_tiles,
         ).launch(
             grid=(grid, 1, 1),
             block=(32 * warps, 1, 1),
@@ -275,17 +287,14 @@ def _as_3d(tensor: torch.Tensor) -> torch.Tensor:
 
 @functools.cache
 def _get_compiled(
-    tokens: int,
     num_heads: int,
     x_token_stride: int,
     gate_token_stride: int,
     lanes: int,
     warps: int,
-    grid: int,
     cluster: int,
-    full_tiles: bool,
 ):
-    shape = (tokens, num_heads, HEAD_DIM)
+    shape = (cute.sym_int(), num_heads, HEAD_DIM)
     x = cute.runtime.make_fake_tensor(
         cutlass.BFloat16,
         shape,
@@ -300,8 +309,8 @@ def _get_compiled(
     )
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     kernel_name = (
-        f"t{tokens}_h{num_heads}_xs{x_token_stride}_gs{gate_token_stride}_l{lanes}_"
-        f"w{warps}_g{grid}_c{cluster}_f{int(full_tiles)}"
+        f"h{num_heads}_xs{x_token_stride}_gs{gate_token_stride}_l{lanes}_"
+        f"w{warps}_c{cluster}"
     )
     return build_and_load_cute_dsl_kernel(
         "rmsnorm_sigmoid_gate",
@@ -319,9 +328,7 @@ def _get_compiled(
             x_token_stride,
             lanes,
             warps,
-            grid,
             cluster,
-            full_tiles,
             options="--enable-tvm-ffi",
         ),
         extra_key_files=(__file__,),
@@ -361,19 +368,14 @@ def rmsnorm_sigmoid_gate(
     rows_per_cta = 32 * warps // lanes
     tiles = (rows + rows_per_cta - 1) // rows_per_cta
     cluster = min(cluster, tiles)
-    grid = (tiles + cluster - 1) // cluster * cluster
-    full_tiles = rows % rows_per_cta == 0 and grid == tiles
 
     compiled = _get_compiled(
-        x.shape[0],
         x.shape[1],
         x.stride(0),
         gate.stride(0),
         lanes,
         warps,
-        grid,
         cluster,
-        full_tiles,
     )
     compiled(x, gate, x, eps)
 
