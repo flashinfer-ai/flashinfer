@@ -105,6 +105,23 @@ from .utils import (
 )
 
 
+def _stage_lse(
+    lse: Optional[torch.Tensor], lse_layout: str, return_lse: bool, q: torch.Tensor
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """Kernels write ``[tokens, heads]``. For ``"HN"`` a caller's buffer is the
+    finisher's ``[heads, tokens]`` destination and the kernel gets a fresh NH
+    buffer; returns ``(lse_for_kernel, lse_out)``."""
+    if not return_lse or lse_layout != "HN":
+        return lse, None
+    if lse is not None:
+        check_shape_dtype_device(
+            lse, (q.size(1), q.size(0)), torch.float32, q.device, "lse"
+        )
+        if not lse.is_contiguous():
+            raise ValueError('lse for lse_layout="HN" must be contiguous')
+    return None, lse
+
+
 def _finish_lse(
     lse: torch.Tensor,
     lse_base: str,
@@ -3390,13 +3407,17 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 # cute-dsl route's convention (the kernel's native scratch
                 # is fp16; the copy-out converts).
                 out = torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
-            return self._cute_dsl_wrapper.run_paged(
+            lse, lse_out = _stage_lse(lse, lse_layout, return_lse, q)
+            res = self._cute_dsl_wrapper.run_paged(
                 q,
                 (k_cache, v_cache),
                 out=out,
                 return_lse=return_lse,
                 lse=lse,
             )
+            if isinstance(res, tuple):
+                return res[0], _finish_lse(res[1], lse_base, lse_layout, lse_out)
+            return res
         elif self._backend == "cute-dsl-prims":
             if args:
                 raise NotImplementedError(
@@ -3432,15 +3453,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     device=q.device,
                 )
             assert self._prims_backend is not None
-            lse_out = None
-            if return_lse and lse_layout == "HN":
-                # the kernel writes [tokens, heads]; a caller's [heads, tokens]
-                # buffer is the destination of the final transpose
-                if lse is not None:
-                    check_shape_dtype_device(
-                        lse, (q.size(1), q.size(0)), torch.float32, q.device, "lse"
-                    )
-                lse_out, lse = lse, None
+            lse, lse_out = _stage_lse(lse, lse_layout, return_lse, q)
             res = self._prims_backend.run_paged(
                 q,
                 k_cache,
@@ -3506,17 +3519,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
             rope_scale = 1.0
         if rope_theta is None:
             rope_theta = 1e4
-        lse_out = None
+        lse, lse_out = _stage_lse(lse, lse_layout, return_lse, q)
         if return_lse:
-            if lse_layout == "HN":
-                # kernels write [tokens, heads]; a caller's buffer is the
-                # [heads, tokens] destination of the final transpose
-                if lse is not None:
-                    check_shape_dtype_device(
-                        lse, (q.size(1), q.size(0)), torch.float32, q.device, "lse"
-                    )
-                lse_out = lse
-                lse = None
             if lse is None:
                 lse = torch.empty(
                     (q.size(0), q.size(1)), dtype=torch.float32, device=q.device
@@ -5017,17 +5021,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             rope_scale = 1.0
         if rope_theta is None:
             rope_theta = 1e4
-        lse_out = None
+        lse, lse_out = _stage_lse(lse, lse_layout, return_lse, q)
         if return_lse:
-            if lse_layout == "HN":
-                # kernels write [tokens, heads]; a caller's buffer is the
-                # [heads, tokens] destination of the final transpose
-                if lse is not None:
-                    check_shape_dtype_device(
-                        lse, (q.size(1), q.size(0)), torch.float32, q.device, "lse"
-                    )
-                lse_out = lse
-                lse = None
             if lse is None:
                 lse = torch.empty(
                     (q.size(0), q.size(1)), dtype=torch.float32, device=q.device
@@ -5189,7 +5184,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 bmm2_scale = (v_scale if v_scale is not None else 1.0) / (
                     o_scale if o_scale is not None else 1.0
                 )
-                return trtllm_ragged_attention_deepseek(
+                res = trtllm_ragged_attention_deepseek(
                     query=q,
                     key=k,
                     value=v,
@@ -5213,6 +5208,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     q_seq_lens_cpu=p["q_seq_lens_cpu"],
                     kv_seq_lens_cpu=p["kv_seq_lens_cpu"],
                 )
+                if isinstance(res, tuple):
+                    return res[0], _finish_lse(res[1], lse_base, lse_layout, lse_out)
+                return res
             # Modular CuTe DSL backend does not support scale parameters.
             if any(s is not None for s in (q_scale, k_scale, v_scale, o_scale)):
                 raise NotImplementedError(
@@ -5221,9 +5219,10 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             if return_lse:
                 # Standard-path modular kernel computes LSE natively; the
                 # wrapper raises NotImplementedError for attention variants.
-                return self._cute_dsl_wrapper.run(
+                out, lse = self._cute_dsl_wrapper.run(
                     q, k, v, out=out, return_lse=True, lse=lse
                 )
+                return out, _finish_lse(lse, lse_base, lse_layout, lse_out)
             out = self._cute_dsl_wrapper.run(q, k, v, out=out)
             return out
         elif self._backend == "cutlass":

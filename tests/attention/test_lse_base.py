@@ -26,6 +26,7 @@ import pytest
 import torch
 
 import flashinfer
+from flashinfer.cudnn.prefill import CUDNN_AVAILABLE
 from flashinfer.utils import is_sm90a_supported, is_sm100a_supported, ln2, log2e
 
 DT = torch.bfloat16
@@ -41,7 +42,9 @@ def _ragged_backends():
     if is_sm90a_supported(dev):
         backends.append("fa3")
     if is_sm100a_supported(dev):
-        backends += ["cutlass", "cudnn"]
+        backends += ["cutlass", "cute-dsl"]
+        if CUDNN_AVAILABLE:  # the cubin fallback only speaks base-2
+            backends.append("cudnn")
     return backends
 
 
@@ -51,6 +54,8 @@ def _paged_backends():
     if is_sm90a_supported(dev):
         backends.append("fa3")
     if is_sm100a_supported(dev):
+        backends.append("cute-dsl")
+    if is_sm100a_supported(dev) and CUDNN_AVAILABLE:
         # Pre-existing, independent of lse_base: the paged cuDNN path insists on a
         # padded (num_sequences, max_q_len, h) LSE buffer while the wrapper
         # allocates the [total_tokens, h] one every other backend writes, so
@@ -79,7 +84,7 @@ def _indptr(lens):
 
 def _ref_lse_ln(q, k, qo_indptr, kv_indptr, causal):
     """Natural-log LSE of the softmax scores, fp32, per request; bottom-right causal."""
-    scale = 1.0 / D**0.5
+    scale = 1.0 / q.shape[-1] ** 0.5
     rows = []
     for i in range(qo_indptr.numel() - 1):
         qi = q[qo_indptr[i] : qo_indptr[i + 1]].float()  # [sq, hq, d]
@@ -118,6 +123,11 @@ def _check_hn(run, lse_log2_nh, lse_ln_nh, n_tokens):
             lse_layout="HN",
             lse=torch.empty(n_tokens, H_QO, dtype=torch.float32, device="cuda"),
         )
+    with pytest.raises(ValueError, match="contiguous"):
+        run(
+            lse_layout="HN",
+            lse=torch.empty(n_tokens, H_QO, dtype=torch.float32, device="cuda").t(),
+        )
     with pytest.raises(ValueError, match="lse_layout"):
         run(lse_layout="TH")
 
@@ -125,11 +135,26 @@ def _check_hn(run, lse_log2_nh, lse_ln_nh, n_tokens):
 @pytest.mark.parametrize("backend", _ragged_backends())
 @pytest.mark.parametrize("causal", [True, False])
 def test_ragged_lse_base(backend, causal):
+    _ragged_case(backend, causal, D)
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and is_sm100a_supported(torch.device("cuda"))),
+    reason="cute-dsl ragged prefill targets SM100a",
+)
+@pytest.mark.parametrize("causal", [True, False])
+def test_ragged_lse_base_cute_dsl_modular(causal):
+    # d=64 keeps the cute-dsl route on its modular kernel (d=128 delegates to
+    # the FMHA kernel, covered above); both return paths finish the LSE.
+    _ragged_case("cute-dsl", causal, 64)
+
+
+def _ragged_case(backend, causal, d):
     torch.manual_seed(0)
     dev = torch.device("cuda")
     qo_indptr, kv_indptr = _indptr(Q_LENS), _indptr(KV_LENS)
-    q = torch.randn(int(qo_indptr[-1]), H_QO, D, dtype=DT, device=dev)
-    k = torch.randn(int(kv_indptr[-1]), H_KV, D, dtype=DT, device=dev)
+    q = torch.randn(int(qo_indptr[-1]), H_QO, d, dtype=DT, device=dev)
+    k = torch.randn(int(kv_indptr[-1]), H_KV, d, dtype=DT, device=dev)
     v = torch.randn_like(k)
     ws = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=dev)
     w = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(ws, "NHD", backend=backend)
@@ -138,7 +163,7 @@ def test_ragged_lse_base(backend, causal):
         kv_indptr,
         H_QO,
         H_KV,
-        D,
+        d,
         causal=causal,
         q_data_type=DT,
         kv_data_type=DT,
