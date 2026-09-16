@@ -1,0 +1,77 @@
+"""Independent Nemotron-shaped SSU contracts.
+
+These cases deliberately use H != D and group-coded B/C values.  Existing
+provider-vs-provider tests can miss an axis swap when H and D are both 64.
+"""
+
+import pytest
+import torch
+
+from flashinfer.mamba import selective_state_update
+
+from .utils import TEST_DEVICE
+
+
+@pytest.mark.skipif(TEST_DEVICE != "musa", reason="MUSA contract test")
+def test_stp_group_mapping_and_src_dst_against_fp32_oracle():
+    torch.manual_seed(1901)
+    device = torch.device(TEST_DEVICE)
+    batch, heads, dim, dstate, groups, slots = 2, 4, 7, 16, 2, 8
+    state = torch.randn(
+        slots, heads, dim, dstate, device=device, dtype=torch.bfloat16
+    )
+    original = state.clone()
+    x = torch.randn(batch, heads, dim, device=device, dtype=torch.bfloat16)
+    dt_base = torch.randn(batch, heads, device=device, dtype=torch.float32) * 0.2
+    dt = dt_base[:, :, None].expand(batch, heads, dim)
+    a_base = -torch.rand(heads, device=device, dtype=torch.float32) - 1
+    A = a_base[:, None, None].expand(heads, dim, dstate)
+    B = torch.empty(batch, groups, dstate, device=device, dtype=torch.bfloat16)
+    C = torch.empty_like(B)
+    for group in range(groups):
+        B[:, group].normal_(mean=group + 1.0, std=0.05)
+        C[:, group].normal_(mean=-(group + 1.0), std=0.05)
+    D = torch.randn(heads, dim, device=device, dtype=torch.float32)
+    bias_base = torch.randn(heads, device=device, dtype=torch.float32) - 2
+    dt_bias = bias_base[:, None].expand(heads, dim)
+    z = torch.randn(batch, heads, dim, device=device, dtype=torch.bfloat16)
+    src = torch.tensor([1, 3], device=device, dtype=torch.int32)
+    dst = torch.tensor([5, 6], device=device, dtype=torch.int32)
+    out = torch.empty_like(x)
+
+    actual = selective_state_update(
+        state,
+        x,
+        dt,
+        A,
+        B,
+        C,
+        D=D,
+        z=z,
+        dt_bias=dt_bias,
+        dt_softplus=True,
+        state_batch_indices=src,
+        dst_state_batch_indices=dst,
+        out=out,
+        backend="flashinfer",
+    )
+
+    expected_state = original.float()
+    expected = torch.empty_like(x, dtype=torch.float32)
+    ratio = heads // groups
+    for b in range(batch):
+        for h in range(heads):
+            g = h // ratio
+            delta = torch.nn.functional.softplus(dt_base[b, h] + bias_base[h])
+            running = expected_state[src[b], h] * torch.exp(a_base[h] * delta)
+            running = running + delta * x[b, h].float()[:, None] * B[b, g].float()[None, :]
+            expected_state[dst[b], h] = running
+            y = (C[b, g].float()[None, :] * running).sum(dim=-1)
+            y = y + D[h] * x[b, h].float()
+            expected[b, h] = y * z[b, h].float() * torch.sigmoid(z[b, h].float())
+
+    torch.testing.assert_close(actual.float(), expected, rtol=0.04, atol=0.04)
+    torch.testing.assert_close(
+        state[dst].float(), expected_state[dst], rtol=0.04, atol=0.04
+    )
+    torch.testing.assert_close(state[src], original[src], rtol=0, atol=0)
