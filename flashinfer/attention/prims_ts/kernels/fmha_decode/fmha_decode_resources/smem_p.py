@@ -474,8 +474,22 @@ class SmemPResource(DecodeGenResourceBase):
             exp_scale = self.scale_softmax_log2 * sage_q_scale
             scales_view = self.sage_k_scales.open(stage_info, sage_scale_arr, exp_scale)
 
+        # With ``prefetches_next_p_fragment`` the loop loads the next fragment
+        # behind the scale FFMAs and carries the running sum as a packed pair;
+        # otherwise it loads, waits, scales and exponentiates each fragment in
+        # place with a scalar running sum.
+        prefetches_next = cfg.prefetches_next_p_fragment
+        num_fragments = cfg.num_softmax_score_fragments
+        last_fragment = Int32(num_fragments - 1)
         total_sum = Float32(0.0)
-        for fragment_idx in cutlass.range(cfg.num_softmax_score_fragments, unroll=1):
+        total_sum_pair = (Float32(0.0), Float32(0.0))
+        s_arr = cutlass.Array(Float32, fragment_regs, space=cutlass.AddressSpace.rmem)
+        pending_scores = cutlass.Array(
+            Float32, fragment_regs, space=cutlass.AddressSpace.rmem
+        )
+        if cutlass.const_expr(prefetches_next):
+            self._load_score_fragment(tmem_base, Int32(0), pending_scores)
+        for fragment_idx in cutlass.range(num_fragments, unroll=1):
             fragment = Int32(fragment_idx)
             fragment_multipliers = None
             if cutlass.const_expr(cfg.use_sage_attention):
@@ -483,27 +497,32 @@ class SmemPResource(DecodeGenResourceBase):
                     scales_view, fragment, exp_scale
                 )
                 self.sage_k_scales.advance(scales_view)
-            loaded = _keeps_tcgen05_ld(
-                cfg,
-                prims.make_tmem_ptr(
-                    tmem_base + fragment * Int32(fragment_regs), Float32
-                ),
-                num=fragment_regs,
-                offset=cfg.tile_size_kv // 2,
-            )
+            if cutlass.const_expr(not prefetches_next):
+                self._load_score_fragment(tmem_base, fragment, pending_scores)
             prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
-            s_arr = cutlass.Array(
-                Float32, fragment_regs, space=cutlass.AddressSpace.rmem
-            )
             for score_idx in cutlass.range_constexpr(fragment_regs):
-                s_arr[score_idx] = loaded[score_idx]
+                s_arr[score_idx] = pending_scores[score_idx]
 
             group_multipliers, group_addends = self._fragment_exponent_terms(
                 fragment_multipliers, exponent_addend
             )
-            local_sum = self._exponentiate_fragment_pairs(
-                s_arr, group_addends, group_multipliers
+            if cutlass.const_expr(prefetches_next):
+                self._scale_fragment_pairs(s_arr, group_addends, group_multipliers)
+                # The last iteration reloads its own fragment so the loop body
+                # stays branch-free; the wait after the loop retires it.
+                next_fragment = fragment + Int32(1)
+                if next_fragment > last_fragment:
+                    next_fragment = last_fragment
+                self._load_score_fragment(tmem_base, next_fragment, pending_scores)
+            local_sum_pair = self._exponentiate_fragment_pairs(
+                s_arr, group_addends, group_multipliers, scaled=prefetches_next
             )
+            if cutlass.const_expr(prefetches_next):
+                total_sum_pair = cute.arch.add_packed_f32x2(
+                    total_sum_pair, local_sum_pair
+                )
+            else:
+                local_sum = Float32(local_sum_pair[0] + local_sum_pair[1])
 
             if cutlass.const_expr(cfg.use_fp8_qkv or cfg.v_dtype_bytes == 1):
                 packed_regs = cutlass.Array(
@@ -525,18 +544,88 @@ class SmemPResource(DecodeGenResourceBase):
                     .to(cfg.v_dtype)
                     .bitcast(Int32)
                 )
-            _keeps_tcgen05_st(
-                cfg,
-                prims.make_tmem_ptr(tmem_base + fragment * Int32(fragment_cols), Int32),
-                packed_p,
-                offset=cfg.tmem_p_cols_per_inst,
-            )
-            cute.arch.fence_view_async_tmem_store()
-            prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
-            if publishes_fragment:
-                prims.mbarrier_arrive(self._fragment_ready.data_ptr() + fragment)
-            total_sum += local_sum
+            self._publish_p_fragment(tmem_base, fragment, packed_p, publishes_fragment)
+            if cutlass.const_expr(not prefetches_next):
+                total_sum += local_sum
+        if cutlass.const_expr(prefetches_next):
+            prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
+            total_sum = Float32(total_sum_pair[0] + total_sum_pair[1])
         self.tmem_s_ref.store_p_local_sum(0, total_sum)
+
+    @cute.jit
+    def _publish_p_fragment(
+        self,
+        tmem_base: Int32,
+        fragment: Int32,
+        packed_p,
+        publishes_fragment: cutlass.Boolean,
+    ) -> None:
+        """Store one packed K32 P fragment to TMEM and signal its barrier.
+
+        The store is made visible to the async proxy and ordered before the
+        barrier arrive; one lane per warp (``publishes_fragment``) arrives so
+        the MMA warp can start the fragment's PV k-slice.
+        """
+        cfg = self.cfg
+        _keeps_tcgen05_st(
+            cfg,
+            prims.make_tmem_ptr(
+                tmem_base + fragment * Int32(cfg.fragment_p_packed_cols), Int32
+            ),
+            packed_p,
+            offset=cfg.tmem_p_cols_per_inst,
+        )
+        cute.arch.fence_view_async_tmem_store()
+        prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
+        if publishes_fragment:
+            prims.mbarrier_arrive(self._fragment_ready.data_ptr() + fragment)
+
+    @cute.jit
+    def _load_score_fragment(
+        self, tmem_base: Int32, fragment: Int32, scores: cutlass.Array
+    ) -> None:
+        """Issue the TMEM load of one K32 score fragment into ``scores``.
+
+        The caller waits for the load before reading ``scores``. The copy
+        below runs before that wait: with compile-time indices it is only a
+        register rename, so it must stay constant-indexed and free of
+        optimization barriers, or it would read the load's destination early.
+        """
+        cfg = self.cfg
+        fragment_regs = cfg.softmax_score_fragment_regs
+        loaded = _keeps_tcgen05_ld(
+            cfg,
+            prims.make_tmem_ptr(tmem_base + fragment * Int32(fragment_regs), Float32),
+            num=fragment_regs,
+            offset=cfg.tile_size_kv // 2,
+        )
+        for score_idx in cutlass.range_constexpr(fragment_regs):
+            scores[score_idx] = loaded[score_idx]
+
+    @cute.jit
+    def _scale_fragment_pairs(
+        self,
+        s_arr: cutlass.Array,
+        group_addends: cutlass.Array,
+        group_multipliers: cutlass.Array,
+    ) -> None:
+        """Turn one fragment of scores into log2 exponents in place.
+
+        Each score pair uses the exponent multiplier and addend of its
+        compile-time scale group; without Sage attention there is one group
+        holding the softmax scale.
+        """
+        pairs_per_fragment = self.cfg.softmax_score_fragment_regs // 2
+        pairs_per_group = pairs_per_fragment // self.cfg.sage_k_groups_per_fragment
+        for pair_idx in cutlass.range_constexpr(pairs_per_fragment):
+            value_idx = pair_idx * 2
+            multiplier = Float32(group_multipliers[pair_idx // pairs_per_group])
+            addend = Float32(group_addends[pair_idx // pairs_per_group])
+            s_arr[value_idx], s_arr[value_idx + 1] = cute.arch.fma_packed_f32x2(
+                (Float32(s_arr[value_idx]), Float32(s_arr[value_idx + 1])),
+                (multiplier, multiplier),
+                (addend, addend),
+            )
 
     @cute.jit
     def _fragment_exponent_terms(
@@ -587,30 +676,39 @@ class SmemPResource(DecodeGenResourceBase):
         s_arr: cutlass.Array,
         group_addends: cutlass.Array,
         group_multipliers: cutlass.Array,
-    ) -> Float32:
-        """Turn one fragment of scaled scores into probabilities in place.
+        *,
+        scaled: Constexpr[bool],
+    ) -> tuple[Float32, Float32]:
+        """Turn one fragment of scores into probabilities in place.
 
-        Returns the fragment's probability sum. Eight independent chains keep
-        the denominator update off one long dependency chain, and a configurable
-        subset of pairs runs its exponentials on the FMA pipe. Each score pair
-        uses the exponent multiplier and addend of its compile-time scale
-        group; without Sage attention there is one group holding the softmax
-        scale.
+        ``scaled`` tells whether ``_scale_fragment_pairs`` has already turned
+        the scores into log2 exponents, in which case ``group_addends`` and
+        ``group_multipliers`` are ignored; otherwise each pair is scaled with
+        the multiplier and addend of its compile-time scale group right before
+        its exponential. Returns the fragment's probability sum as a packed
+        pair.
+        Eight independent chains keep the denominator update off one long
+        dependency chain; the first four pairs seed the chains, because an add
+        to zero is a real FADD under IEEE semantics. A configurable subset of
+        pairs runs its exponentials on the FMA pipe.
         """
         pairs_per_fragment = self.cfg.softmax_score_fragment_regs // 2
+        assert pairs_per_fragment >= 4
         pairs_per_group = pairs_per_fragment // self.cfg.sage_k_groups_per_fragment
         sum_chains = cutlass.Array(Float32, 8, space=cutlass.AddressSpace.rmem)
-        for chain_idx in cutlass.range_constexpr(8):
-            sum_chains[chain_idx] = Float32(0.0)
         for pair_idx in cutlass.range_constexpr(pairs_per_fragment):
             value_idx = pair_idx * 2
-            multiplier = Float32(group_multipliers[pair_idx // pairs_per_group])
-            addend = Float32(group_addends[pair_idx // pairs_per_group])
-            p0, p1 = cute.arch.fma_packed_f32x2(
-                (Float32(s_arr[value_idx]), Float32(s_arr[value_idx + 1])),
-                (multiplier, multiplier),
-                (addend, addend),
-            )
+            if cutlass.const_expr(scaled):
+                p0 = Float32(s_arr[value_idx])
+                p1 = Float32(s_arr[value_idx + 1])
+            else:
+                multiplier = Float32(group_multipliers[pair_idx // pairs_per_group])
+                addend = Float32(group_addends[pair_idx // pairs_per_group])
+                p0, p1 = cute.arch.fma_packed_f32x2(
+                    (Float32(s_arr[value_idx]), Float32(s_arr[value_idx + 1])),
+                    (multiplier, multiplier),
+                    (addend, addend),
+                )
             if cutlass.const_expr(
                 _pair_uses_ex2_emulation(pair_idx, pairs_per_fragment)
             ):
@@ -621,12 +719,16 @@ class SmemPResource(DecodeGenResourceBase):
             s_arr[value_idx] = p0
             s_arr[value_idx + 1] = p1
             chain_idx = (pair_idx & 3) * 2
-            sum_chains[chain_idx], sum_chains[chain_idx + 1] = (
-                cute.arch.add_packed_f32x2(
-                    (sum_chains[chain_idx], sum_chains[chain_idx + 1]),
-                    (p0, p1),
+            if cutlass.const_expr(pair_idx < 4):
+                sum_chains[chain_idx] = p0
+                sum_chains[chain_idx + 1] = p1
+            else:
+                sum_chains[chain_idx], sum_chains[chain_idx + 1] = (
+                    cute.arch.add_packed_f32x2(
+                        (sum_chains[chain_idx], sum_chains[chain_idx + 1]),
+                        (p0, p1),
+                    )
                 )
-            )
         sum01 = cute.arch.add_packed_f32x2(
             (sum_chains[0], sum_chains[1]),
             (sum_chains[2], sum_chains[3]),
@@ -635,8 +737,7 @@ class SmemPResource(DecodeGenResourceBase):
             (sum_chains[4], sum_chains[5]),
             (sum_chains[6], sum_chains[7]),
         )
-        total_pair = cute.arch.add_packed_f32x2(sum01, sum23)
-        return Float32(total_pair[0] + total_pair[1])
+        return cute.arch.add_packed_f32x2(sum01, sum23)
 
     @cute.jit
     def _compute_keeps_p(
