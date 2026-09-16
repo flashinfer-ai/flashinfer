@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""JIT module for the host-side balanced PrimsTS MLA planner."""
+"""JIT module for the balanced PrimsTS MLA CUDA scheduler."""
 
 import functools
 
@@ -22,13 +22,13 @@ from .core import JitSpec, gen_jit_spec
 
 @functools.cache
 def gen_prims_balanced_mla_plan_module() -> JitSpec:
-    """Build the native PrimsTS host scheduler used between graph replays."""
+    """Build the graph-capturable exact and optimized CUDA schedulers."""
 
     return gen_jit_spec(
         "prims_balanced_mla_plan",
         [
             jit_env.FLASHINFER_CSRC_DIR / "prims_balanced_mla_plan.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "prims_balanced_mla_scheduler.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "prims_balanced_mla_scheduler_device.cu",
         ],
     )
 

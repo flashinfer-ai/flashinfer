@@ -19,6 +19,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 import functools
 from types import MappingProxyType
+from typing import Literal
 
 import torch
 
@@ -30,14 +31,42 @@ from .kernels.mla_decode.helpers.constants import (
 )
 
 from ._balanced_scheduler import (
+    B200_BALANCED_COST_MODEL_ID,
+    B200_BALANCED_COST_MODELS,
     B200_BF16_2CTA_COST,
     BalancedCostModelCalibration,
     BalancedCostModel,
     require_balanced_cost_model_calibration,
-    select_calibrated_balanced_cost_model,
 )
 
 _INT32_MAX = 2**31 - 1
+_DEVICE_COST_BUCKETS = (
+    "single",
+    "sparse_small",
+    "sparse_uniform_small",
+    "sparse",
+    "dense_small",
+    "dense_large",
+    "legacy",
+)
+_DEVICE_PLAN_STATUS = {
+    1: "sequence length is negative or exceeds the planned maximum",
+    2: "derived target piece size exceeds int32 capacity",
+    3: "work descriptor capacity was exceeded",
+    4: "split partial capacity was exceeded",
+    5: "combine descriptor capacity was exceeded",
+    6: "the packed split-info 4096-piece capacity was exceeded",
+}
+
+
+def balanced_device_scheduler_workspace_size(
+    batch_size: int, num_partitions: int
+) -> int:
+    """Return the graph-stable scratch size used by the device scheduler."""
+
+    if batch_size <= 0 or num_partitions <= 0:
+        raise ValueError("batch_size and num_partitions must be positive")
+    return 80 * (int(batch_size) + int(num_partitions)) + 4096
 
 
 @functools.cache
@@ -96,11 +125,14 @@ class BalancedMLADecodePlan:
         dtype_name: str = "bf16",
         calibration: BalancedCostModelCalibration | None = None,
         cost_source: str = "explicit",
+        max_seq_len: int = _INT32_MAX,
     ) -> None:
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
         if num_partitions <= 0:
             raise ValueError("num_partitions must be positive")
+        if max_seq_len < 0 or max_seq_len > _INT32_MAX:
+            raise ValueError("max_seq_len must be a non-negative int32 value")
         device = torch.device(device)
         if device.type != "cuda":
             raise ValueError("balanced MLA plan buffers must be allocated on CUDA")
@@ -132,6 +164,7 @@ class BalancedMLADecodePlan:
         self.partial_capacity = balanced_partial_capacity(batch_size, num_partitions)
         self.reducer_capacity = balanced_reducer_capacity(batch_size, num_partitions)
         self.k_tile_tokens = k_tile_tokens
+        self.max_seq_len = max_seq_len
         self.device = device
         self.kernel_family = kernel_family
         self.dtype_name = dtype_name
@@ -169,21 +202,93 @@ class BalancedMLADecodePlan:
             dtype=torch.int32,
             device=device,
         )
-        self._host_seq_lens = torch.empty(
-            (batch_size,),
+        self.device_plan_metadata = torch.empty(
+            (5,),
             dtype=torch.int32,
-            pin_memory=True,
+            device=device,
         )
-        self._host_plan_metadata = torch.empty(
-            (3,),
-            dtype=torch.int32,
-            pin_memory=True,
+        self.device_scheduler_workspace = torch.empty(
+            balanced_device_scheduler_workspace_size(batch_size, num_partitions),
+            dtype=torch.uint8,
+            device=device,
         )
-        self._host_seq_lens_np = self._host_seq_lens.numpy()
-        self._host_plan_metadata_np = self._host_plan_metadata.numpy()
+        self._device_cost_models = self._make_device_cost_models()
         self.last_descriptor_count = 0
         self.last_combine_request_count = 0
         self.last_target_piece_tiles = 0
+
+    @staticmethod
+    def _cost_row(cost: BalancedCostModel) -> tuple[int, ...]:
+        row = (
+            cost.cost_per_k_tile,
+            cost.fixed_piece_cost,
+            cost.split_fixed_cost,
+            cost.split_piece_cost,
+            cost.reducer_fixed_cost,
+            cost.reducer_piece_cost,
+        )
+        if any(value < 0 or value > _INT32_MAX for value in row):
+            raise ValueError(
+                "balanced cost-model coefficients must be non-negative int32 values"
+            )
+        return row
+
+    def _make_device_cost_models(self) -> torch.Tensor:
+        if not self._auto_cost:
+            rows = [self._cost_row(self._cost)] * len(_DEVICE_COST_BUCKETS)
+        else:
+            assert self._calibration is not None
+            if self._calibration.model_id != B200_BALANCED_COST_MODEL_ID:
+                raise RuntimeError(
+                    f"balanced cost-model calibration {self._calibration.model_id!r} "
+                    "has no device selector"
+                )
+            family_aliases = {
+                "1cta": "1cta",
+                "2cta": "2cta",
+                "throughput_latency_1cta": "1cta",
+                "throughput_2cta": "2cta",
+            }
+            dtype_aliases = {
+                "bf16": "bf16",
+                "bfloat16": "bf16",
+                "fp8": "fp8",
+                "e4m3": "fp8",
+                "float8_e4m3fn": "fp8",
+            }
+            try:
+                family = family_aliases[self.kernel_family]
+            except KeyError as error:
+                raise ValueError(
+                    f"unsupported balanced kernel family {self.kernel_family!r}"
+                ) from error
+            try:
+                dtype = dtype_aliases[self.dtype_name]
+            except KeyError as error:
+                raise ValueError(
+                    f"unsupported balanced input dtype {self.dtype_name!r}"
+                ) from error
+            rows = []
+            for bucket in _DEVICE_COST_BUCKETS:
+                cost = (
+                    B200_BF16_2CTA_COST
+                    if bucket == "legacy"
+                    else B200_BALANCED_COST_MODELS[(family, dtype, bucket)]
+                )
+                rows.append(self._cost_row(cost))
+        return torch.tensor(rows, dtype=torch.int32, device=self.device)
+
+    def _cost_for_device_bucket(self, bucket: str) -> BalancedCostModel:
+        if bucket == "legacy":
+            return B200_BF16_2CTA_COST
+        # The table was normalized and validated when it was materialized.
+        family = (
+            "1cta"
+            if self.kernel_family in {"1cta", "throughput_latency_1cta"}
+            else "2cta"
+        )
+        dtype = "fp8" if self.dtype_name in {"fp8", "e4m3", "float8_e4m3fn"} else "bf16"
+        return B200_BALANCED_COST_MODELS[(family, dtype, bucket)]
 
     @property
     def cost(self) -> BalancedCostModel:
@@ -199,6 +304,7 @@ class BalancedMLADecodePlan:
         self._cost_model_id = "explicit-unregistered"
         self._cost_source = "explicit"
         self.last_cost_bucket = None
+        self._device_cost_models = self._make_device_cost_models()
 
     @property
     def cost_model_info(self) -> Mapping[str, object]:
@@ -221,11 +327,6 @@ class BalancedMLADecodePlan:
     @staticmethod
     def _normalize_seq_lens(seq_lens: Sequence[int] | torch.Tensor) -> tuple[int, ...]:
         if isinstance(seq_lens, torch.Tensor):
-            if seq_lens.device.type != "cpu":
-                raise ValueError(
-                    "replan() requires CPU sequence lengths; implicit D2H reads "
-                    "would serialize the decode stream"
-                )
             if seq_lens.ndim != 1:
                 raise ValueError("seq_lens must be rank 1")
             normalized = tuple(int(value) for value in seq_lens.tolist())
@@ -235,96 +336,122 @@ class BalancedMLADecodePlan:
             raise ValueError("seq_lens must contain non-negative int32 values")
         return normalized
 
-    def replan(
+    def schedule_device(
         self,
-        seq_lens: Sequence[int] | torch.Tensor,
+        seq_lens: torch.Tensor,
         *,
         stream: torch.cuda.Stream | None = None,
+        validate: bool = True,
+        scheduler: Literal["exact", "optimized"] = "optimized",
+        forced_target_piece_tiles: int = 0,
     ) -> None:
-        """Refill existing device tensors without changing any address."""
+        """Build the schedule from live CUDA lengths without synchronizing.
 
-        normalized = self._normalize_seq_lens(seq_lens)
-        self._replan_normalized(normalized, stream=stream)
+        With ``validate=False`` the call is graph-capturable and all dynamic
+        metadata remains device-resident. ``validate=True`` synchronizes after
+        launch, raises a descriptive scheduling error, and refreshes the host
+        diagnostic properties. ``scheduler="optimized"`` uses the production
+        two-kernel rank-and-fold policy; ``scheduler="exact"`` uses the
+        deterministic four-kernel reference policy.
+        """
 
-    def _replan_normalized(
-        self,
-        normalized: tuple[int, ...],
-        *,
-        stream: torch.cuda.Stream | None = None,
-    ) -> None:
-        """Refill from lengths already normalized by the public wrapper."""
-
-        self._replan_native(normalized, forced_target_piece_tiles=0, stream=stream)
-
-    def _replan_forced_target(
-        self,
-        seq_lens: Sequence[int] | torch.Tensor,
-        target_piece_tiles: int,
-        *,
-        stream: torch.cuda.Stream | None = None,
-    ) -> None:
-        """Stage an offline-calibration schedule through the native emitter."""
-
-        normalized = self._normalize_seq_lens(seq_lens)
-        if target_piece_tiles <= 0 or target_piece_tiles > _INT32_MAX:
-            raise ValueError("target_piece_tiles must be a positive int32 value")
-        self._replan_native(
-            normalized,
-            forced_target_piece_tiles=target_piece_tiles,
-            stream=stream,
+        if not isinstance(seq_lens, torch.Tensor):
+            raise TypeError("seq_lens must be a torch.Tensor")
+        planned_device_index = (
+            self.device.index
+            if self.device.index is not None
+            else torch.cuda.current_device()
         )
-
-    def _replan_native(
-        self,
-        normalized: tuple[int, ...],
-        *,
-        forced_target_piece_tiles: int,
-        stream: torch.cuda.Stream | None,
-    ) -> None:
-        """Refill descriptors through the sole native placement and emitter."""
-
-        if len(normalized) != self.batch_size:
+        runtime_device_index = (
+            seq_lens.device.index
+            if seq_lens.device.index is not None
+            else torch.cuda.current_device()
+        )
+        if (
+            seq_lens.device.type != "cuda"
+            or runtime_device_index != planned_device_index
+        ):
+            raise ValueError(f"seq_lens must be on {self.device}")
+        if seq_lens.dtype != torch.int32:
+            raise ValueError("seq_lens must have dtype int32")
+        if seq_lens.ndim != 1 or seq_lens.numel() != self.batch_size:
             raise ValueError(
-                f"seq_lens must contain {self.batch_size} values, got {len(normalized)}"
+                f"seq_lens must have shape [{self.batch_size}], got {tuple(seq_lens.shape)}"
             )
-        if self._auto_cost:
-            assert self._calibration is not None
-            self.last_cost_bucket, self._cost = select_calibrated_balanced_cost_model(
-                self._calibration,
-                normalized,
-                kernel_family=self.kernel_family,
-                dtype_name=self.dtype_name,
-                num_partitions=self.num_partitions,
-                k_tile_tokens=self.k_tile_tokens,
+        if not seq_lens.is_contiguous():
+            raise ValueError("seq_lens must be contiguous")
+        if not isinstance(validate, bool):
+            raise TypeError("validate must be a bool")
+        if not isinstance(scheduler, str):
+            raise TypeError("scheduler must be a string")
+        if scheduler not in {"exact", "optimized"}:
+            raise ValueError("scheduler must be 'exact' or 'optimized'")
+        if forced_target_piece_tiles < 0 or forced_target_piece_tiles > _INT32_MAX:
+            raise ValueError(
+                "forced_target_piece_tiles must be a non-negative int32 value"
             )
-        self._host_seq_lens_np[:] = normalized
-        stream_context = torch.cuda.stream(stream) if stream is not None else None
+
         planner_args = (
-            self._host_seq_lens,
+            seq_lens,
             self.work_descriptors,
             self.partition_offsets,
             self.combine_descriptors,
             self.num_combine_descriptors,
-            self._host_plan_metadata,
+            self.device_plan_metadata,
+            self.device_scheduler_workspace,
+            self._device_cost_models,
             self.num_partitions,
             self.k_tile_tokens,
-            self.cost.cost_per_k_tile,
-            self.cost.fixed_piece_cost,
-            self.cost.split_fixed_cost,
-            self.cost.split_piece_cost,
-            self.cost.reducer_fixed_cost,
-            self.cost.reducer_piece_cost,
+            self.max_seq_len,
+            self._auto_cost,
+            scheduler == "optimized",
             forced_target_piece_tiles,
         )
+        stream_context = torch.cuda.stream(stream) if stream is not None else None
         with torch.cuda.device(self.device):
             if stream_context is None:
-                _get_native_planner().build_prims_balanced_mla_plan(*planner_args)
+                _get_native_planner().build_prims_balanced_mla_plan_device(
+                    *planner_args
+                )
             else:
                 with stream_context:
-                    _get_native_planner().build_prims_balanced_mla_plan(*planner_args)
-        self.last_descriptor_count = int(self._host_plan_metadata_np[0])
-        self.last_target_piece_tiles = int(self._host_plan_metadata_np[1])
-        self.last_combine_request_count = int(self._host_plan_metadata_np[2])
+                    _get_native_planner().build_prims_balanced_mla_plan_device(
+                        *planner_args
+                    )
+        if validate:
+            self.synchronize_device_metadata(stream=stream)
+
+    def synchronize_device_metadata(
+        self, *, stream: torch.cuda.Stream | None = None
+    ) -> tuple[int, int, int, int, int]:
+        """Synchronize and return device-planner diagnostics for tests/debugging."""
+
+        active_stream = stream or torch.cuda.current_stream(self.device)
+        active_stream.synchronize()
+        metadata_values = [int(value) for value in self.device_plan_metadata.cpu()]
+        metadata = (
+            metadata_values[0],
+            metadata_values[1],
+            metadata_values[2],
+            metadata_values[3],
+            metadata_values[4],
+        )
+        status = metadata[3]
+        if status:
+            detail = _DEVICE_PLAN_STATUS.get(status, f"unknown status {status}")
+            raise RuntimeError(f"balanced device scheduler failed: {detail}")
+        self.last_descriptor_count = metadata[0]
+        self.last_target_piece_tiles = metadata[1]
+        self.last_combine_request_count = metadata[2]
+        if self._auto_cost:
+            bucket_index = metadata[4]
+            if bucket_index < 0 or bucket_index >= len(_DEVICE_COST_BUCKETS):
+                raise RuntimeError(
+                    f"balanced device scheduler returned invalid cost bucket {bucket_index}"
+                )
+            self.last_cost_bucket = _DEVICE_COST_BUCKETS[bucket_index]
+            self._cost = self._cost_for_device_bucket(self.last_cost_bucket)
+        return metadata
 
 
-__all__ = ["BalancedMLADecodePlan"]
+__all__ = ["BalancedMLADecodePlan", "balanced_device_scheduler_workspace_size"]

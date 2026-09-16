@@ -284,8 +284,8 @@ def test_forced_target_stages_current_packed_descriptor_abi():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA plan buffers")
-def test_forced_target_uses_production_lpt_short_placement():
-    """Keep forced calibration placement identical to the native scheduler."""
+def test_forced_target_uses_production_optimized_folded_placement():
+    """Keep forced calibration placement identical to the optimized scheduler."""
 
     num_short_requests = 127
     plan = BalancedMLADecodePlan(
@@ -312,13 +312,13 @@ def test_forced_target_uses_production_lpt_short_placement():
                 if descriptor[0] < num_short_requests
                 else long_partitions
             ).add(partition_idx)
-    assert short_partitions == set(range(74))
-    assert long_partitions == set(range(53, 61))
+    assert short_partitions == set(range(8, 74))
+    assert long_partitions == set(range(8))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA plan buffers")
-def test_selected_target_and_native_forced_target_emit_identical_schedule():
-    """Permit paired-timing reuse only for byte-equivalent native schedules."""
+def test_selected_target_and_forced_target_emit_identical_optimized_schedule():
+    """Permit paired-timing reuse only for byte-equivalent CUDA schedules."""
 
     seq_lens = (512,) * 127 + (131072,)
     plan = BalancedMLADecodePlan(
@@ -327,33 +327,25 @@ def test_selected_target_and_native_forced_target_emit_identical_schedule():
         device=torch.device("cuda"),
         cost=BalancedCostModel(1000, 0),
     )
-    plan.replan(seq_lens)
+    device_seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device="cuda")
+    plan.schedule_device(device_seq_lens, scheduler="optimized")
     selected_target = plan.last_target_piece_tiles
     selected_schedule = benchmark.schedule_signature(plan)
     selected_snapshot = benchmark.schedule_snapshot(plan)
-    reference_snapshot = benchmark.schedule_snapshot_from_reference(
-        benchmark.build_balanced_schedule(
-            seq_lens,
-            num_partitions=plan.num_partitions,
-            k_tile_tokens=plan.k_tile_tokens,
-            cost=plan.cost,
-        )
-    )
 
     stats = benchmark.stage_forced_target(plan, seq_lens, selected_target)
 
     assert stats is not None
     assert benchmark.schedule_signature(plan) == selected_schedule
-    assert stats["schedule_snapshot"] == selected_snapshot == reference_snapshot
+    assert stats["schedule_snapshot"] == selected_snapshot
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA plan buffers")
-def test_same_forced_target_can_emit_different_cost_model_placements():
-    """A target is not a complete measurement or schedule identity."""
+def test_forced_optimized_placement_depends_only_on_target():
+    """The optimized fold is stable when only the cost model changes."""
 
     seq_tiles = (10,) * 72 + (6, 4, 4, 3) + (400,)
     seq_lens = tuple(value * 128 for value in seq_tiles)
-    long_request = len(seq_lens) - 1
     plan = BalancedMLADecodePlan(
         batch_size=len(seq_lens),
         num_partitions=74,
@@ -367,23 +359,8 @@ def test_same_forced_target_can_emit_different_cost_model_placements():
     flat = benchmark.stage_forced_target(plan, seq_lens, target=200)
     assert flat is not None
 
-    def request_partitions(snapshot, request_idx):
-        result = set()
-        descriptors = snapshot["work_descriptors"]
-        offsets = snapshot["partition_offsets"]
-        for partition, (begin, end) in enumerate(
-            zip(offsets, offsets[1:], strict=False)
-        ):
-            if any(row[0] == request_idx for row in descriptors[begin:end]):
-                result.add(partition)
-        return result
-
-    assert bootstrap["schedule_sha256"] != flat["schedule_sha256"]
-    assert request_partitions(bootstrap["schedule_snapshot"], long_request) == {
-        0,
-        1,
-    }
-    assert request_partitions(flat["schedule_snapshot"], long_request) == {72, 73}
+    assert bootstrap["schedule_sha256"] == flat["schedule_sha256"]
+    assert bootstrap["schedule_snapshot"] == flat["schedule_snapshot"]
 
     restored = benchmark.stage_recorded_schedule(
         plan, seq_lens, {**bootstrap, "target_tiles": 200}
