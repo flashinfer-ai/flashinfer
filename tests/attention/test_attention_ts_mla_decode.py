@@ -164,6 +164,29 @@ def test_attention_ts_mla_balanced_decode_family_policy(num_heads, seq_len_q, ex
     assert select_balanced_decode_mla_kernel_policy(num_heads, seq_len_q) == expected
 
 
+def test_attention_ts_mla_balanced_decode_family_cost_model_boundary():
+    assert (
+        select_balanced_decode_mla_kernel_policy(64, 1, batch_size=8, dtype_name="bf16")
+        == "throughput_2cta"
+    )
+    assert (
+        select_balanced_decode_mla_kernel_policy(
+            64, 1, batch_size=16, dtype_name="bf16"
+        )
+        == "throughput_latency_1cta"
+    )
+    assert (
+        select_balanced_decode_mla_kernel_policy(64, 1, batch_size=4, dtype_name="fp8")
+        == "throughput_latency_1cta"
+    )
+    assert (
+        select_balanced_decode_mla_kernel_policy(
+            64, 1, batch_size=128, dtype_name="fp8"
+        )
+        == "throughput_latency_1cta"
+    )
+
+
 @pytest.mark.parametrize(
     "num_heads,seq_len_q,tile_size_q,expected",
     (
@@ -866,7 +889,7 @@ def _run_case(wrapper, case, *, qo_indptr=None, out=None, validate=True):
     "batch_size,num_qo_heads,balanced_kernel,ordinary_kernel",
     (
         (64, 32, "throughput_latency_1cta", "throughput_2cta"),
-        (32, 64, "throughput_2cta", "throughput_latency_1cta"),
+        (8, 64, "throughput_2cta", "throughput_latency_1cta"),
     ),
 )
 @pytest.mark.arch_blackwell
@@ -901,17 +924,20 @@ def test_attention_ts_mla_balanced_decode_family_overrides_only_balanced_policy(
 
 
 @pytest.mark.parametrize(
-    ("num_qo_heads", "expected_kernel"),
+    ("num_qo_heads", "qkv_dtype", "expected_kernel"),
     (
-        pytest.param(16, "throughput_latency_1cta", id="1cta"),
-        pytest.param(64, "throughput_2cta", id="2cta-h64"),
-        pytest.param(128, "throughput_2cta", id="2cta"),
+        pytest.param(16, torch.bfloat16, "throughput_latency_1cta", id="1cta-bf16"),
+        pytest.param(16, torch.float8_e4m3fn, "throughput_latency_1cta", id="1cta-fp8"),
+        pytest.param(64, torch.bfloat16, "throughput_2cta", id="h64-bf16-low-batch"),
+        pytest.param(
+            64,
+            torch.float8_e4m3fn,
+            "throughput_2cta",
+            id="h64-fp8-below-calibrated-range",
+        ),
+        pytest.param(128, torch.bfloat16, "throughput_2cta", id="2cta-bf16"),
+        pytest.param(128, torch.float8_e4m3fn, "throughput_2cta", id="2cta-fp8"),
     ),
-)
-@pytest.mark.parametrize(
-    "qkv_dtype",
-    (torch.bfloat16, torch.float8_e4m3fn),
-    ids=("bf16", "fp8"),
 )
 @pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
@@ -956,6 +982,52 @@ def test_attention_ts_mla_balanced_b64_h32_uses_calibrated_1cta_family():
         qkv_dtype=torch.bfloat16,
         device="cuda",
         seed=33164,
+    )
+    wrapper = _plan_case(case, balanced=True)
+    policy = _policy_dict(wrapper)
+
+    assert policy["kernel"] == "throughput_latency_1cta"
+    output = _run_case(wrapper, case)
+    _assert_case_correct(output, case, policy)
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_mla_balanced_b16_h64_uses_calibrated_1cta_family():
+    """Cover the BF16 side of the measured H64 batch crossover."""
+
+    batch_size = 16
+    case = _make_mla_case(
+        batch_size=batch_size,
+        num_qo_heads=64,
+        max_seq_len=32768,
+        kv_seq_lens=(32768,) + (257,) * (batch_size - 1),
+        qkv_dtype=torch.bfloat16,
+        device="cuda",
+        seed=33116,
+    )
+    wrapper = _plan_case(case, balanced=True)
+    policy = _policy_dict(wrapper)
+
+    assert policy["kernel"] == "throughput_latency_1cta"
+    output = _run_case(wrapper, case)
+    _assert_case_correct(output, case, policy)
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_mla_balanced_b4_h64_fp8_uses_calibrated_1cta_family():
+    """Cover the first production-gated FP8 batch using the H64 1CTA family."""
+
+    batch_size = 4
+    case = _make_mla_case(
+        batch_size=batch_size,
+        num_qo_heads=64,
+        max_seq_len=32768,
+        kv_seq_lens=(32768,) + (257,) * (batch_size - 1),
+        qkv_dtype=torch.float8_e4m3fn,
+        device="cuda",
+        seed=33104,
     )
     wrapper = _plan_case(case, balanced=True)
     policy = _policy_dict(wrapper)

@@ -56,3 +56,22 @@ python -m flashinfer.attention.prims_ts.balanced_scheduler.benchmark_scheduler \
 The RL and production samples are deterministic for a given distribution,
 batch size, and sample index. Use the same sample range when comparing code
 revisions.
+
+## Calibrating the 1CTA/2CTA family boundary
+
+Family comparison is separate from split-target calibration. Construct one
+`BalancedMLADecodePlan` per candidate family with an
+`evaluation_cost=BalancedCostModel(...)` expressed in physical latency
+units, then call `schedule_device(..., estimate_cost=True)`. The CUDA
+scheduler first emits the schedule using its ordinary calibrated workload
+bucket and only then scores that fixed placement with the evaluation model.
+Thus experimental family coefficients cannot perturb either candidate's split
+target or descriptor placement. `last_predicted_cost` contains the
+critical-partition cost plus any modeled combine cost after synchronization.
+
+Always validate a family rule with paired kernel timings on identical sequence
+samples. On B200 H64, a device-score regression was less accurate than the
+directly measured dtype/batch boundary, so production uses BF16 2CTA below B16,
+BF16 1CTA from B16 onward, and FP8 1CTA from B4 onward. The score path remains opt-in
+calibration telemetry and adds no placement atomics or cost evaluation to
+normal graph replay.

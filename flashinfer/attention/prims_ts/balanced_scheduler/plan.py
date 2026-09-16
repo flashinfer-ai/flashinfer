@@ -122,6 +122,7 @@ class BalancedMLADecodePlan:
         k_tile_tokens: int = 128,
         num_insts_kv: int = 1,
         cost: BalancedCostModel | None = None,
+        evaluation_cost: BalancedCostModel | None = None,
         kernel_family: str = "2cta",
         dtype_name: str = "bf16",
         calibration: BalancedCostModelCalibration | None = None,
@@ -189,6 +190,7 @@ class BalancedMLADecodePlan:
             calibration.model_id if calibration is not None else "explicit-unregistered"
         )
         self._cost_source = "calibrated-registry" if cost is None else cost_source
+        self._evaluation_cost = evaluation_cost
         self.last_cost_bucket: str | None = None
 
         # These are the canonical packed scheduler ABI structs, expressed as
@@ -218,15 +220,27 @@ class BalancedMLADecodePlan:
             dtype=torch.int32,
             device=device,
         )
+        self.device_predicted_cost = torch.empty(
+            (1,),
+            dtype=torch.int64,
+            device=device,
+        )
         self.device_scheduler_workspace = torch.empty(
             balanced_device_scheduler_workspace_size(batch_size, num_partitions),
             dtype=torch.uint8,
             device=device,
         )
         self._device_cost_models = self._make_device_cost_models()
+        self._device_evaluation_cost_model = torch.tensor(
+            self._cost_row(evaluation_cost or BalancedCostModel(0, 0)),
+            dtype=torch.int32,
+            device=self.device,
+        )
         self.last_descriptor_count = 0
         self.last_combine_request_count = 0
         self.last_target_piece_tiles = 0
+        self.last_predicted_cost: int | None = None
+        self._predicted_cost_pending = False
 
     @staticmethod
     def _cost_row(cost: BalancedCostModel) -> tuple[int, ...]:
@@ -332,6 +346,8 @@ class BalancedMLADecodePlan:
                 "dtype": self.dtype_name,
                 "bucket": self.last_cost_bucket,
                 "parameters": self._cost,
+                "evaluation_parameters": self._evaluation_cost,
+                "last_predicted_cost": self.last_predicted_cost,
             }
         )
 
@@ -354,6 +370,7 @@ class BalancedMLADecodePlan:
         stream: torch.cuda.Stream | None = None,
         validate: bool = True,
         scheduler: Literal["exact", "optimized"] = "optimized",
+        estimate_cost: bool = False,
         forced_target_piece_tiles: int = 0,
     ) -> None:
         """Build the schedule from live CUDA lengths without synchronizing.
@@ -363,7 +380,10 @@ class BalancedMLADecodePlan:
         launch, raises a descriptive scheduling error, and refreshes the host
         diagnostic properties. ``scheduler="optimized"`` uses the production
         two-kernel rank-and-fold policy; ``scheduler="exact"`` uses the
-        deterministic four-kernel reference policy.
+        deterministic four-kernel reference policy. ``estimate_cost=True``
+        additionally publishes the final emitted placement's modeled
+        makespan. A constructor-supplied ``evaluation_cost`` is used for that
+        estimate without changing target selection or placement.
         """
 
         if not isinstance(seq_lens, torch.Tensor):
@@ -397,6 +417,8 @@ class BalancedMLADecodePlan:
             raise TypeError("scheduler must be a string")
         if scheduler not in {"exact", "optimized"}:
             raise ValueError("scheduler must be 'exact' or 'optimized'")
+        if not isinstance(estimate_cost, bool):
+            raise TypeError("estimate_cost must be a bool")
         if forced_target_piece_tiles < 0 or forced_target_piece_tiles > _INT32_MAX:
             raise ValueError(
                 "forced_target_piece_tiles must be a non-negative int32 value"
@@ -411,6 +433,8 @@ class BalancedMLADecodePlan:
             self.combine_descriptors,
             self.num_combine_descriptors,
             self.device_plan_metadata,
+            self.device_predicted_cost,
+            self._device_evaluation_cost_model,
             self.device_scheduler_workspace,
             self._device_cost_models,
             self.num_partitions,
@@ -419,8 +443,12 @@ class BalancedMLADecodePlan:
             self.max_seq_len,
             self._auto_cost,
             scheduler == "optimized",
+            estimate_cost,
+            self._evaluation_cost is not None,
             forced_target_piece_tiles,
         )
+        self.last_predicted_cost = None
+        self._predicted_cost_pending = estimate_cost
         stream_context = torch.cuda.stream(stream) if stream is not None else None
         with torch.cuda.device(self.device):
             if stream_context is None:
@@ -465,6 +493,9 @@ class BalancedMLADecodePlan:
                 )
             self.last_cost_bucket = _DEVICE_COST_BUCKETS[bucket_index]
             self._cost = self._cost_for_device_bucket(self.last_cost_bucket)
+        if self._predicted_cost_pending:
+            self.last_predicted_cost = int(self.device_predicted_cost.item())
+            self._predicted_cost_pending = False
         return metadata
 
 

@@ -838,6 +838,8 @@ def _resolve_mla_decode_launch_spec(
             balanced_decode_policy = select_balanced_decode_mla_kernel_policy(
                 num_heads,
                 seq_len_q,
+                batch_size=batch_size,
+                dtype_name=qkv_dtype_name,
             )
             if balanced_decode_policy is not None:
                 requested_policy = balanced_decode_policy
