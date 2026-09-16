@@ -63,7 +63,8 @@ def test_native_simple_stp_rejects_materialized_a():
         )
 
 
-def test_native_simple_stp_stochastic_matches_triton():
+@pytest.mark.parametrize("philox_rounds", [5, 10])
+def test_native_simple_stp_stochastic_matches_triton(philox_rounds):
     torch.manual_seed(29)
     state = torch.randn((2, 64, 64, 128), device="musa", dtype=torch.float16)
     x = torch.randn((1, 64, 64), device="musa", dtype=torch.bfloat16)
@@ -78,11 +79,11 @@ def test_native_simple_stp_stochastic_matches_triton():
     native_out, triton_out = torch.empty_like(x), torch.empty_like(x)
     musa_ssu_one_token_native(
         native_state, x, dt, a, b, c, d, slot, slot, None, None, True, -1,
-        native_out, seed, 5,
+        native_out, seed, philox_rounds,
     )
     ssu_one_token_musa_triton(
         triton_state, x, dt, a, b, c, d, slot, dt_softplus=True,
-        out=triton_out, rand_seed=seed, philox_rounds=5,
+        out=triton_out, rand_seed=seed, philox_rounds=philox_rounds,
     )
     torch.testing.assert_close(native_out, triton_out, atol=3e-2, rtol=3e-2)
     torch.testing.assert_close(native_state, triton_state, atol=3e-2, rtol=3e-2)
