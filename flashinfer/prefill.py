@@ -1455,6 +1455,22 @@ def single_prefill_with_kv_cache(
     if rope_theta is None:
         rope_theta = 1e4
     if custom_mask is not None and packed_custom_mask is None:
+        qo_len = q.size(0)
+        kv_len = k.size(0) if kv_layout == "NHD" else k.size(1)
+        # packbits() below flattens the mask without looking at its size, so a mask
+        # smaller than the attention matrix makes the kernel read past the end of the
+        # packed buffer and silently return corrupted results. The flattened spelling
+        # packs to the same bytes, so it stays accepted.
+        if custom_mask.dim() == 2:
+            mask_ok = tuple(custom_mask.shape) == (qo_len, kv_len)
+        else:
+            mask_ok = custom_mask.numel() == qo_len * kv_len
+        if not mask_ok:
+            raise ValueError(
+                f"custom_mask has shape {tuple(custom_mask.shape)}, expected "
+                f"(qo_len, kv_len) = ({qo_len}, {kv_len}) or a flattened tensor "
+                f"of {qo_len * kv_len} elements."
+            )
         # create packed custom mask from custom mask
         packed_custom_mask = packbits(
             custom_mask.contiguous().view(-1), bitorder="little"
