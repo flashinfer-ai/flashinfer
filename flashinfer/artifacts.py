@@ -432,7 +432,9 @@ def download_artifacts() -> None:
                     artifact_name = future_to_name[fut]
                     try:
                         ok = fut.result()
-                    except Exception:
+                    except Exception as e:
+                        if isinstance(e, RuntimeError):
+                            raise
                         logger.exception(
                             "Unexpected exception in cubin download task for %s",
                             artifact_name,
