@@ -159,7 +159,6 @@ def test_varlen_final_states_against_independent_fp32_oracle():
     cu = torch.tensor([0, 1, 4], device=device, dtype=torch.int32)
     src = torch.tensor([[2, -1, -1], [7, 8, 9]], device=device, dtype=torch.int32)
     dst = torch.tensor([[12, -1, -1], [17, 18, 19]], device=device, dtype=torch.int32)
-    accepted = torch.ones((2,), device=device, dtype=torch.int64)
     out = torch.empty(tokens, heads, dim, device=device, dtype=torch.bfloat16)
 
     actual = selective_state_update(
@@ -176,7 +175,7 @@ def test_varlen_final_states_against_independent_fp32_oracle():
         dst_state_batch_indices=dst,
         pad_slot_id=-1,
         out=out,
-        num_accepted_tokens=accepted,
+        num_accepted_tokens=None,
         cu_seqlens=cu,
         cache_steps=max_seqlen,
         algorithm="simple",
