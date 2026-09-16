@@ -1954,6 +1954,9 @@ def _get_compiled_kernel_nvfp4(
         "float8_e4m3fn": cutlass.Float8E4M3FN,
     }
     cutlass_dtype = _dtype_map[dtype_key]
+    # Pairing only changes codegen for FP8 input; drop it otherwise so the
+    # cache key (and the compiled artifact) is shared with the unpaired kernel.
+    pair_fp8_blocks = pair_fp8_blocks and dtype_key == "float8_e4m3fn"
     if smooth_quant and (dtype_key != "bfloat16" or sf_layout == SF_LAYOUT_LINEAR):
         raise ValueError("smooth quantization requires BF16 and a swizzled SF layout")
 
@@ -2451,8 +2454,10 @@ def nvfp4_quantize_cute_dsl(
         disable_fp4_quant_fast_math,
         nvfp4_4over6_config,
         global_scale_is_tensor=global_scale_is_tensor,
-        # SM107 only: FP8 input keeps two strided SF blocks per thread.
-        pair_fp8_blocks=is_sm107,
+        # SM107 only: FP8 input keeps two strided SF blocks per thread. Gated on
+        # the dtype here so FP16/BF16 do not compile a duplicate (identical)
+        # kernel under the "_fp8pair" cache name.
+        pair_fp8_blocks=is_sm107 and input.dtype == torch.float8_e4m3fn,
     )
 
     blocks_per_sm = _BLOCKS_PER_SM
