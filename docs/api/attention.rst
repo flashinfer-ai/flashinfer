@@ -135,13 +135,7 @@ D128 remains the default.
 
 .. autoclass:: BatchDecodeWithPagedKVCacheWrapper
     :members:
-    :exclude-members: begin_forward, end_forward, forward, forward_return_lse
-
-    .. automethod:: __init__
-
-.. autoclass:: BatchDecodeMlaWithPagedKVCacheWrapper
-    :members:
-    :exclude-members: begin_forward, end_forward, forward, forward_return_lse
+    :exclude-members: begin_forward, forward, forward_return_lse
 
     .. automethod:: __init__
 
@@ -194,13 +188,13 @@ Batch Prefill/Append Attention
 
 .. autoclass:: BatchPrefillWithPagedKVCacheWrapper
     :members:
-    :exclude-members: begin_forward, end_forward, forward, forward_return_lse
+    :exclude-members: begin_forward, forward, forward_return_lse
 
     .. automethod:: __init__
 
 .. autoclass:: BatchPrefillWithRaggedKVCacheWrapper
     :members:
-    :exclude-members: begin_forward, end_forward, forward, forward_return_lse
+    :exclude-members: begin_forward, forward, forward_return_lse
 
     .. automethod:: __init__
 
