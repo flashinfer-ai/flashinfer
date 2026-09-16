@@ -295,7 +295,7 @@ def test_sm121_defaults_preserve_other_devices_and_unmeasured_shapes():
         )
         assert not policy.compatible(m, n, k, expected, compute_capability=(12, 0))
     larger = [
-        ((256, 896, 1024), ("b12x", 64, 128, 256)),
+        ((256, 896, 1024), ("cooperative", 128, 64, 256)),
         ((512, 8192, 2048), ("raw", 64, 32, 4, False, True, 256, True)),
         ((256, 9216, 7168), ("raw", 64, 32, 2, False, True, 256, True)),
         ((1024, 896, 1024), ("raw", 32, 64, 13, True, True)),
@@ -723,7 +723,11 @@ def test_sm121_measured_default_public_graph_and_cached_choice(m, n, k, monkeypa
         legacy_choices = [policy.default_tactic(m, n, k)]
         if (m, n, k) == (512, 8192, 2048):
             legacy_choices.append(("raw", 64, 32, 8, False, True))
-        if (m, n, k) in ((512, 5120, 2560), (256, 9216, 7168)):
+        if (m, n, k) in (
+            (512, 5120, 2560),
+            (256, 9216, 7168),
+            (256, 896, 1024),
+        ):
             legacy_choices.append(("b12x", 64, 128, 256))
         if preferred == ("cooperative", 128, 128, 128) and m == 2000:
             legacy_choices.append(("cooperative", 128, 128, 256))
