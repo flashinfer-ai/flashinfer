@@ -384,7 +384,12 @@ def selective_state_update(
             # flattened token tensors, so that metadata is safe to ignore.
             and (
                 cu_seqlens is None
-                or (x.shape[0] == 1 and cu_seqlens.numel() == 2)
+                or (
+                    x.shape[0] == 1
+                    and cu_seqlens.numel() == 2
+                    and int(cu_seqlens[0].item()) == 0
+                    and int(cu_seqlens[1].item()) == 1
+                )
             )
             and state.dtype in (torch.float16, torch.bfloat16, torch.float32)
             and state.dim() == 4

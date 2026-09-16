@@ -194,7 +194,7 @@ at::Tensor musa_ssu_simple(
   TORCH_CHECK(dt.scalar_type() == at::kFloat && A.scalar_type() == at::kFloat, "dt and A must be fp32");
   TORCH_CHECK(A.stride(1) == 0 && A.stride(2) == 0 && dt.stride(2) == 0, "native Simple STP requires tied A/dt");
   TORCH_CHECK(state.device() == x.device() && state.device() == dt.device() && state.device() == A.device() && state.device() == B.device() && state.device() == C.device(), "native inputs must share a MUSA device");
-  TORCH_CHECK(src.numel() >= 1 && dst.numel() >= 1 && (src.scalar_type() == at::kInt || src.scalar_type() == at::kLong) && src.scalar_type() == dst.scalar_type(), "slot indices must be int32/int64");
+  TORCH_CHECK(src.numel() == 1 && dst.numel() == 1 && (src.scalar_type() == at::kInt || src.scalar_type() == at::kLong) && src.scalar_type() == dst.scalar_type(), "slot indices must be one-element int32/int64 tensors");
   TORCH_CHECK((Dv.scalar_type() == x.scalar_type() || Dv.scalar_type() == at::kFloat) && ((Dv.dim() == 1 && Dv.size(0) == 64) || (Dv.dim() == 2 && Dv.size(0) == 64 && Dv.size(1) == 64)), "D must be [64] or [64,64]");
   TORCH_CHECK(Dv.device() == state.device(), "D must be on the MUSA device");
   auto out = out_opt.has_value() ? *out_opt : at::empty_like(x);
@@ -208,7 +208,7 @@ at::Tensor musa_ssu_simple(
                   (dt_bias->dim() == 2 && dt_bias->size(0) == 64 && dt_bias->size(1) == 64),
               "dt_bias must be [64] or [64,64]");
   TORCH_CHECK(!dt_bias.has_value() || dt_bias->dim() == 1 || dt_bias->stride(1) == 0, "dt_bias must be tied over D");
-  TORCH_CHECK(!z.has_value() || z->scalar_type() == x.scalar_type(), "z dtype must match x");
+  TORCH_CHECK(!z.has_value() || (z->scalar_type() == x.scalar_type() && z->sizes() == x.sizes()), "z must match x dtype and shape");
   TORCH_CHECK(!z.has_value() || z->device() == state.device(), "z must be on the MUSA device");
   TORCH_CHECK(src.device() == state.device() && dst.device() == state.device(), "indices must be on the MUSA device");
   TORCH_CHECK(!rand_seed.has_value() || rand_seed->device() == state.device(), "rand_seed must be on the MUSA device");
