@@ -302,12 +302,16 @@ void SparseMlaSm120NVFP4Decode(TensorView q, TensorView kv_cache, TensorView ind
     return;                                                                                        \
   }
   DISPATCH_NVFP4_DECODE(16, 128)
+  DISPATCH_NVFP4_DECODE(16, 256)
   DISPATCH_NVFP4_DECODE(16, 512)
   DISPATCH_NVFP4_DECODE(32, 128)
+  DISPATCH_NVFP4_DECODE(32, 256)
   DISPATCH_NVFP4_DECODE(32, 512)
   DISPATCH_NVFP4_DECODE(64, 128)
+  DISPATCH_NVFP4_DECODE(64, 256)
   DISPATCH_NVFP4_DECODE(64, 512)
   DISPATCH_NVFP4_DECODE(128, 128)
+  DISPATCH_NVFP4_DECODE(128, 256)
   DISPATCH_NVFP4_DECODE(128, 512)
 #undef DISPATCH_NVFP4_DECODE
   TVM_FFI_ICHECK(false) << "unsupported initial NVFP4 decode shape: heads=" << num_heads
