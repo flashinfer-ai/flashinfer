@@ -131,9 +131,12 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: flashinfer-cubin/flashinfer_cubin/cubins
+          # Older artifact sets are safe fallback seeds: the downloader verifies
+          # every file and prunes stale entries before packaging.
           key: flashinfer-cubins-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flashinfer/artifacts.py') }}
           restore-keys: |
             flashinfer-cubins-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flashinfer/artifacts.py') }}-partial-
+            flashinfer-cubins-v1-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Install build dependencies
         run: |
