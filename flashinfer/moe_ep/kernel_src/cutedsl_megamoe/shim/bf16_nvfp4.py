@@ -413,23 +413,29 @@ class MegaMoEBf16Nvfp4Frontend:
         if self.config.in_kernel_fc2_reduce:
             inputs.combine_output.zero_()
         else:
-            inputs.combine_output.masked_fill_(
-                (inputs.topk_idx < 0).unsqueeze(-1), 0
+            inputs.combine_output[:n].masked_fill_(
+                (inputs.topk_idx[:n] < 0).unsqueeze(-1), 0
             )
         mega.compiled(**mega.launch_kwargs)
         if sync and not torch.cuda.is_current_stream_capturing():
             torch.cuda.synchronize()
         return inputs.combine_output[:n]
 
-    def make_launch_thunk(self, inputs: MegaMoEBf16Nvfp4Inputs) -> Callable[[], Any]:
-        self._validate(inputs, inputs.activation.shape[0])
+    def make_launch_thunk(
+        self,
+        inputs: MegaMoEBf16Nvfp4Inputs,
+        *,
+        num_tokens: Optional[int] = None,
+    ) -> Callable[[], Any]:
+        n = inputs.activation.shape[0] if num_tokens is None else num_tokens
+        self._validate(inputs, n)
         mega = self._ensure_compiled(inputs)
         kwargs = self._runtime_kwargs(inputs, mega)
         if self.config.in_kernel_fc2_reduce:
             return lambda: (inputs.combine_output.zero_(), mega.compiled(**kwargs))
         return lambda: (
-            inputs.combine_output.masked_fill_(
-                (inputs.topk_idx < 0).unsqueeze(-1), 0
+            inputs.combine_output[:n].masked_fill_(
+                (inputs.topk_idx[:n] < 0).unsqueeze(-1), 0
             ),
             mega.compiled(**kwargs),
         )
@@ -723,7 +729,10 @@ def bf16_nvfp4_mega_launch_thunk(
     transformed_l1: TransformedWeights,
     transformed_l2: TransformedWeights,
     symm_buffer: MegaMoEBf16Nvfp4SymmBuffer,
+    *,
+    num_tokens: Optional[int] = None,
 ) -> Callable[[], None]:
+    n = symm_buffer.num_max_tokens if num_tokens is None else num_tokens
     launch = symm_buffer._frontend.make_launch_thunk(
         MegaMoEBf16Nvfp4Inputs(
             symm_buffer.x,
@@ -736,15 +745,16 @@ def bf16_nvfp4_mega_launch_thunk(
             symm_buffer.fc1_alpha,
             symm_buffer.fc2_alpha,
             symm_buffer.kernel_combine_output,
-        )
+        ),
+        num_tokens=n,
     )
     if symm_buffer._frontend.config.in_kernel_fc2_reduce:
         return launch
 
     # Form A's host reduce is part of the forward; a thunk without it would
     # under-report the deterministic path against ikr.
-    partials = symm_buffer.combine_output
-    out = symm_buffer.reduced_output[:, 0]
+    partials = symm_buffer.combine_output[:n]
+    out = symm_buffer.reduced_output[:n, 0]
 
     def thunk() -> None:
         launch()

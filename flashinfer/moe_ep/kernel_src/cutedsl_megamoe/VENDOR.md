@@ -36,7 +36,7 @@ replace, what to audit) lives in `SKILL.md`.
 
 ## Pending local diffs vs upstream
 
-- `src/moe_nvfp4_bf16_glu/` is a verbatim package copy from dastokes commit
+- `src/moe_nvfp4_bf16_glu/` is based on the package from dastokes commit
   `d7b3a3d3ab6d29745f9ae321cd07ff81448df1c8` (2026-09-11). Its required
   shared changes were applied to `src/src/sym_buffer.py`,
   `src/moe_bf16_glu/mega_runner.py`, and

@@ -145,6 +145,7 @@ def test_bf16_nvfp4_kernel_matches_mega_reference(
         preprocess_mega_weights,
     )
     from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+        bf16_nvfp4_mega_launch_thunk,
         compute_megamoe_reference_bf16_nvfp4,
         get_symm_buffer_for_bf16_nvfp4_mega_moe,
         bf16_nvfp4_mega_moe,
@@ -234,8 +235,11 @@ def test_bf16_nvfp4_kernel_matches_mega_reference(
 
         # Form-A must clear skipped routes on every launch. Otherwise a route
         # masked after a prior live launch leaks its stale partial into sum().
+        # Padding is intentionally untouched: clearing it can write hundreds
+        # of megabytes for a small live batch in a large-capacity workspace.
         symm_buffer.topk_idx[0, 0] = -1
         symm_buffer.combine_output[0, 0].fill_(123)
+        symm_buffer.combine_output[num_tokens:].fill_(77)
         bf16_nvfp4_mega_moe(
             y_kernel,
             transformed_l1,
@@ -245,6 +249,18 @@ def test_bf16_nvfp4_kernel_matches_mega_reference(
             sync=True,
         )
         assert torch.count_nonzero(symm_buffer.combine_output[0, 0]) == 0
+        assert torch.all(symm_buffer.combine_output[num_tokens:] == 77)
+
+        symm_buffer.combine_output[num_tokens:].fill_(66)
+        launch = bf16_nvfp4_mega_launch_thunk(
+            transformed_l1,
+            transformed_l2,
+            symm_buffer,
+            num_tokens=num_tokens,
+        )
+        launch()
+        torch.cuda.synchronize()
+        assert torch.all(symm_buffer.combine_output[num_tokens:] == 66)
 
         empty = torch.empty(0, hidden, dtype=torch.bfloat16, device="cuda")
         bf16_nvfp4_mega_moe(

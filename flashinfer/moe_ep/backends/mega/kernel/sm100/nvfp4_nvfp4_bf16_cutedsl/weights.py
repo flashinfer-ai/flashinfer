@@ -107,7 +107,13 @@ def preprocess_mega_weights(
     gate_up_clamp: float | None = None,
     activation_clamp: float | None = None,
 ) -> TransformedMegaWeights:
-    """bf16 (or pre-quantized) weights → NVFP4 + swizzled-SF mega layout."""
+    """bf16 (or packed pre-quantized) weights → NVFP4 + swizzled-SF layout.
+
+    Pre-quantized inputs must already use the packed NVFP4 shapes documented
+    by :class:`MoEWeightPack`. Older releases accepted logical, unpacked shapes
+    here, but that path only reinterpreted bytes and produced an invalid kernel
+    layout; those shapes are now rejected explicitly.
+    """
     import torch
 
     # Backend talks only to the cutedsl_megamoe shim (never src/ directly); the

@@ -339,7 +339,7 @@ misses) — both are the right behavior as long as internal drops carry the
   the BF16×MXFP8 candidate grid and applies the NVFP4-specific predicate so
   the sets can diverge without changing the autotuner. Per-size profiles are
   pending a dedicated tuning pass.
-- Backend configs (`Nvfp4/Mxfp8/Bf16/Bf16_Mxfp8 ..._Cutedsl_MegaMoeConfig.knobs`): explicit dict
+- Backend configs (`Nvfp4/Mxfp8/Bf16/Bf16_Mxfp8/Bf16_Nvfp4 ..._Cutedsl_MegaMoeConfig.knobs`): explicit dict
   overrides the heuristic ENTIRELY (pin every knob you care about);
   `"auto"` runs the online autotuner at the first forward.
 - `autotune.py` — collective online tuner: every EP rank compiles+times the
