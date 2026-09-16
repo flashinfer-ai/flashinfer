@@ -425,7 +425,13 @@ def download_artifacts() -> None:
                     fut.add_done_callback(update_pbar_cb)
                     futures.append(fut)
 
-                results = [fut.result() for fut in as_completed(futures)]
+                results = []
+                for fut in as_completed(futures):
+                    try:
+                        results.append(fut.result())
+                    except Exception:
+                        logger.exception("Unexpected exception in cubin download task")
+                        results.append(False)
         finally:
             for session in sessions_by_thread.values():
                 session.close()
