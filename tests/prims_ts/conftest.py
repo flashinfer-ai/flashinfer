@@ -35,16 +35,26 @@ from flashinfer.prims_ts.cutlass_dsl import (
 # ``pytest_report_header`` instead of raising.
 HAS_PRIMS_TS_RUNTIME = ensure_cutlass_dsl_experimental()
 
-# Every module here except this one imports without the wheel; this one reaches
-# the vendored kernels at import time, so it cannot be collected at all and has
-# to be dropped before collection rather than skipped during it.
+# Modules that reach ``cutlass.experimental`` at IMPORT time cannot be marked
+# during collection -- they raise before an item exists -- so they have to be
+# dropped before collection instead.
+#
+# The reach is transitive, not direct: ``batched_gemm_config`` does an unguarded
+# module-level ``from cutlass.experimental import primitives``, so every module
+# importing it inherits the requirement. That is all ten ``test_batched_gemm_*``
+# modules plus the two MoE support modules below.
+#
+# The glob is deliberate: new ``test_batched_gemm_*`` modules are the likely
+# growth, and over-ignoring is harmless here (on a pre-4.7 lane the whole
+# directory is skipped anyway). ``test_prims_ts_directory_still_collects_without_
+# cutlass_experimental`` in tests/test_prims_ts_import_isolation.py enforces that
+# this stays complete.
 if not HAS_PRIMS_TS_RUNTIME:
-    # Hand-maintained and load-bearing: a module that imports the vendored kernels
-    # eagerly cannot be marked during collection, only dropped before it. Adding one
-    # without listing it here silently reintroduces #5213, so
-    # tests/test_prims_ts_import_isolation.py enforces this list under a simulated
-    # CUTLASS DSL 4.6.
-    collect_ignore = ["test_batched_gemm_captured_schedule_tasks.py"]
+    collect_ignore_glob = ["test_batched_gemm_*.py"]
+    collect_ignore = [
+        "test_moe_bf16_support.py",
+        "test_moe_nvfp4_support.py",
+    ]
 
 
 def pytest_collection_modifyitems(config, items):
