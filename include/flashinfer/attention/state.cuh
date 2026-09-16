@@ -54,9 +54,11 @@ struct state_t {
                                         float other_d) {
     float m_prev = m, d_prev = d;
     m = max(m_prev, other_m);
-    // max() drops the NaN from merging two empty states ((-inf) - (-inf)).
-    float f1 = math::ptx_exp2(max(m_prev - m, -math::inf));
-    float f2 = math::ptx_exp2(max(other_m - m, -math::inf));
+    // Use a finite shift for empty states to avoid (-inf) - (-inf), but keep
+    // m == -inf so the empty state remains neutral in subsequent merges.
+    float m_shift = (m == -math::inf) ? 0.f : m;
+    float f1 = math::ptx_exp2(m_prev - m_shift);
+    float f2 = math::ptx_exp2(other_m - m_shift);
     d = d_prev * f1 + other_d * f2;
 #pragma unroll
     for (size_t i = 0; i < vec_size; ++i) {

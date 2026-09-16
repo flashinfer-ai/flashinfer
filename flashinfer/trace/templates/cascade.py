@@ -32,12 +32,13 @@ def _merge_state_reference(v_a, s_a, v_b, s_b):
     v_a = v_a.to(torch.float32)
     v_b = v_b.to(torch.float32)
     s_max = torch.maximum(s_a, s_b)
-    exp_a = torch.exp(s_a - s_max)
-    exp_b = torch.exp(s_b - s_max)
+    s_shift = s_max.masked_fill(torch.isneginf(s_max), 0)
+    exp_a = torch.exp(s_a - s_shift)
+    exp_b = torch.exp(s_b - s_shift)
     exp_sum = exp_a + exp_b
     v_merged = (
         v_a * exp_a.unsqueeze(-1) + v_b * exp_b.unsqueeze(-1)
-    ) / exp_sum.unsqueeze(-1)
+    ) / exp_sum.clamp_min(1).unsqueeze(-1)
     s_merged = (s_max + torch.log(exp_sum)) / math.log(2.0)
     return v_merged.to(v_a.dtype), s_merged.to(torch.float32)
 
@@ -117,12 +118,13 @@ def _merge_state_in_place_reference(v, s, v_other, s_other, mask=None):
     v_a = v.to(torch.float32)
     v_b = v_other.to(torch.float32)
     s_max = torch.maximum(s_a, s_b)
-    exp_a = torch.exp(s_a - s_max)
-    exp_b = torch.exp(s_b - s_max)
+    s_shift = s_max.masked_fill(torch.isneginf(s_max), 0)
+    exp_a = torch.exp(s_a - s_shift)
+    exp_b = torch.exp(s_b - s_shift)
     exp_sum = exp_a + exp_b
     v_merged = (
         v_a * exp_a.unsqueeze(-1) + v_b * exp_b.unsqueeze(-1)
-    ) / exp_sum.unsqueeze(-1)
+    ) / exp_sum.clamp_min(1).unsqueeze(-1)
     s_merged = (s_max + torch.log(exp_sum)) / math.log(2.0)
     if mask is not None:
         m = mask.to(torch.bool)
@@ -213,12 +215,15 @@ def _merge_states_reference(v, s):
     """Merge num_states attention (V, S) states via numerically stable log-sum-exp."""
     # v: [seq_len, num_states, num_heads, head_dim]
     # s: [seq_len, num_states, num_heads]  (log2 scale)
+    if v.shape[1] == 0:
+        return v.sum(dim=1), torch.full_like(s.sum(dim=1), -torch.inf)
     s_nat = s.to(torch.float32) * math.log(2.0)
     v_f32 = v.to(torch.float32)
     s_max, _ = s_nat.max(dim=1, keepdim=True)
-    exp_s = torch.exp(s_nat - s_max)  # [seq_len, num_states, num_heads]
+    s_shift = s_max.masked_fill(torch.isneginf(s_max), 0)
+    exp_s = torch.exp(s_nat - s_shift)  # [seq_len, num_states, num_heads]
     exp_sum = exp_s.sum(dim=1, keepdim=True)
-    weights = exp_s / exp_sum  # [seq_len, num_states, num_heads]
+    weights = exp_s / exp_sum.clamp_min(1)  # [seq_len, num_states, num_heads]
     v_merged = (v_f32 * weights.unsqueeze(-1)).sum(dim=1)
     s_merged = (s_max.squeeze(1) + torch.log(exp_sum.squeeze(1))) / math.log(2.0)
     return v_merged.to(v.dtype), s_merged.to(torch.float32)
