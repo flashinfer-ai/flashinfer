@@ -1,3 +1,4 @@
+import math
 import sys
 import types
 
@@ -420,8 +421,10 @@ def test_trtllm_ragged_default_and_explicit_skip_match_checked_path(
     torch.testing.assert_close(assumed_lse, checked_lse, atol=2e-2, rtol=2e-2)
 
 
+@pytest.mark.parametrize("backend", ["trtllm-gen", "cute-dsl"])
+@pytest.mark.parametrize("skip_value", [None, True, False])
 @pytest.mark.cuda
-def test_trtllm_ragged_cpu_mirrors_override_explicit_skip():
+def test_trtllm_ragged_cpu_mirrors_override_explicit_skip(backend, skip_value):
     device = torch.device("cuda")
     _require_trtllm_ragged(device)
     q, k, v, q_lens, kv_lens, q_indptr, kv_indptr = _empty_kv_case(device)
@@ -435,6 +438,8 @@ def test_trtllm_ragged_cpu_mirrors_override_explicit_skip():
         kv_lens,
         q_lens_cpu=q_lens.cpu(),
         kv_lens_cpu=kv_lens.cpu(),
+        skip_all_rows_active_check=False,
+        backend=backend,
     )
     explicit_skip_output, explicit_skip_lse = _run_trtllm_ragged(
         q,
@@ -445,7 +450,8 @@ def test_trtllm_ragged_cpu_mirrors_override_explicit_skip():
         kv_lens,
         q_lens_cpu=q_lens.cpu(),
         kv_lens_cpu=kv_lens.cpu(),
-        skip_all_rows_active_check=True,
+        skip_all_rows_active_check=skip_value,
+        backend=backend,
     )
 
     torch.testing.assert_close(
@@ -749,8 +755,9 @@ def _stub_cute_dsl_kernel(monkeypatch) -> list:
     return calls
 
 
+@pytest.mark.parametrize("skip_value", [None, True, False])
 @pytest.mark.cuda
-def test_trtllm_ragged_cute_dsl_mirror_validation_shared():
+def test_trtllm_ragged_cute_dsl_mirror_validation_shared(skip_value):
     """CPU-mirror validation must also fire on the cute-dsl backend.
 
     The wrapper's ``backend="cute-dsl"`` route forwards
@@ -774,6 +781,7 @@ def test_trtllm_ragged_cute_dsl_mirror_validation_shared():
             kv_lens,
             q_lens_cpu=q_lens.cpu(),
             backend="cute-dsl",
+            skip_all_rows_active_check=skip_value,
         )
 
     bad_kv_lens = kv_lens.cpu().clone()
@@ -789,6 +797,7 @@ def test_trtllm_ragged_cute_dsl_mirror_validation_shared():
             q_lens_cpu=q_lens.cpu(),
             kv_lens_cpu=bad_kv_lens,
             backend="cute-dsl",
+            skip_all_rows_active_check=skip_value,
         )
 
 
@@ -1143,3 +1152,101 @@ def test_trtllm_ragged_cute_dsl_wrapper_graph_capture_with_empty_rows():
             atol=2e-2,
             rtol=2e-2,
         )
+
+
+@pytest.mark.parametrize(
+    "capture_q_lens,capture_kv_lens,replay_q_lens,replay_kv_lens",
+    [
+        pytest.param([4, 0], [0, 4], [0, 4], [0, 4], id="inactive-to-active"),
+        pytest.param([2, 2, 2], [4, 2, 2], [2, 2, 2], [4, 4, 0], id="active-to-mixed"),
+    ],
+)
+@pytest.mark.cuda
+def test_trtllm_ragged_cute_dsl_wrapper_graph_replan(
+    capture_q_lens, capture_kv_lens, replay_q_lens, replay_kv_lens
+):
+    """Replanning fixed buffers must preserve captured fills and launches."""
+    device = torch.device("cuda")
+    _require_trtllm_ragged(device)
+    pytest.importorskip("flashinfer.attention.cute_dsl.fmha")
+    torch.manual_seed(42)
+
+    num_heads, head_dim = 16, 128
+    q = torch.randn(
+        sum(capture_q_lens), num_heads, head_dim, device=device, dtype=torch.bfloat16
+    )
+    k = torch.randn(
+        sum(capture_kv_lens), num_heads, head_dim, device=device, dtype=torch.bfloat16
+    )
+    v = torch.randn_like(k)
+    out = torch.empty_like(q)
+    lse = torch.empty(q.shape[:2], device=device, dtype=torch.float32)
+    q_indptr = torch.empty(len(capture_q_lens) + 1, device=device, dtype=torch.int32)
+    kv_indptr = torch.empty_like(q_indptr)
+    wrapper = flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper(
+        _workspace(device),
+        backend="cute-dsl",
+        use_cuda_graph=True,
+        qo_indptr_buf=q_indptr,
+        kv_indptr_buf=kv_indptr,
+    )
+
+    def plan(q_lens, kv_lens):
+        wrapper.plan(
+            _indptr(torch.tensor(q_lens, dtype=torch.int32)),
+            _indptr(torch.tensor(kv_lens, dtype=torch.int32)),
+            num_heads,
+            num_heads,
+            head_dim,
+            causal=False,
+            q_data_type=torch.bfloat16,
+            kv_data_type=torch.bfloat16,
+        )
+
+    # Warm the real kernel on active rows before capturing an inactive plan,
+    # whose eager path deliberately skips the launch. Both plans have the same
+    # token totals and maximum lengths, so the captured launch bounds suffice.
+    plan(replay_q_lens, replay_kv_lens)
+    wrapper.run(q, k, v, out=out, lse=lse, return_lse=True, enable_pdl=False)
+    plan(capture_q_lens, capture_kv_lens)
+    wrapper.run(q, k, v, out=out, lse=lse, return_lse=True, enable_pdl=False)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        wrapper.run(q, k, v, out=out, lse=lse, return_lse=True, enable_pdl=False)
+
+    # Check both the changed plan and a return to the original plan. No run()
+    # call after capture may repair the outputs before replay is checked.
+    for q_lens, kv_lens in [
+        (replay_q_lens, replay_kv_lens),
+        (capture_q_lens, capture_kv_lens),
+    ]:
+        plan(q_lens, kv_lens)
+        out.fill_(7.0)
+        lse.fill_(999.0)
+        graph.replay()
+        torch.cuda.synchronize()
+
+        q_start = kv_start = 0
+        for q_len, kv_len in zip(q_lens, kv_lens, strict=True):
+            q_end, kv_end = q_start + q_len, kv_start + kv_len
+            if q_len > 0:
+                if kv_len == 0:
+                    assert torch.all(out[q_start:q_end] == 0)
+                    assert torch.isneginf(lse[q_start:q_end]).all()
+                else:
+                    qr = q[q_start:q_end].float().transpose(0, 1)
+                    kr = k[kv_start:kv_end].float().transpose(0, 1)
+                    vr = v[kv_start:kv_end].float().transpose(0, 1)
+                    scores = (qr @ kr.transpose(-1, -2)) / math.sqrt(head_dim)
+                    expected_out = (scores.softmax(dim=-1) @ vr).transpose(0, 1)
+                    # The CuTe FMHA entrypoint returns base-2 LSE.
+                    expected_lse = scores.logsumexp(dim=-1).T * math.log2(math.e)
+                    torch.testing.assert_close(
+                        out[q_start:q_end].float(), expected_out, atol=2e-2, rtol=2e-2
+                    )
+                    torch.testing.assert_close(
+                        lse[q_start:q_end], expected_lse, atol=2e-2, rtol=2e-2
+                    )
+            q_start, kv_start = q_end, kv_end

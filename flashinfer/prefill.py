@@ -5801,11 +5801,11 @@ def trtllm_ragged_attention_deepseek(
         launch; the ``cute-dsl`` backend uses them to neutralize the rows its
         kernel skips (``q_len > 0, kv_len == 0`` rows are written as
         ``out = 0`` / ``lse = -inf`` instead of being left uninitialized).
-        If omitted on the ``trtllm-gen`` backend, the wrapper derives lengths
-        from the device indptrs and may synchronize to preserve correctness
-        for direct callers; under CUDA graph capture this device-side
-        detection would require an illegal ``.item()`` readback, so both
-        mirrors must be provided or the wrapper refuses to launch. If omitted
+        If omitted on the ``trtllm-gen`` backend with
+        ``skip_all_rows_active_check=False``, the wrapper derives lengths
+        from the device indptrs and may synchronize; this device-side detection
+        is not allowed under CUDA graph capture, so both mirrors are required
+        in that case. The default assumes all rows are active. If omitted
         on the ``cute-dsl`` backend, no empty-row handling is performed and
         rows with ``q_len > 0, kv_len == 0`` yield undefined output.
     kv_seq_lens_cpu : Optional[torch.Tensor]
@@ -5819,8 +5819,8 @@ def trtllm_ragged_attention_deepseek(
         derives row activity from device tensors, which may synchronize outside
         CUDA graph capture and requires CPU mirrors during capture. Only the
         ``trtllm-gen`` backend performs device-side detection when both
-        mirrors are absent; on ``cute-dsl`` the flag only enforces mutual
-        exclusion with CPU mirrors.
+        mirrors are absent; on ``cute-dsl`` empty-row handling requires CPU
+        mirrors regardless of this setting.
 
     Returns
     -------
@@ -5916,12 +5916,7 @@ def trtllm_ragged_attention_deepseek(
     q_lens_cpu = None
     kv_lens_cpu = None
     active_rows_cpu = None
-    if skip_all_rows_active_check:
-        if q_seq_lens_cpu is not None or kv_seq_lens_cpu is not None:
-            raise ValueError(
-                "skip_all_rows_active_check cannot be combined with CPU length mirrors"
-            )
-    elif q_seq_lens_cpu is not None or kv_seq_lens_cpu is not None:
+    if q_seq_lens_cpu is not None or kv_seq_lens_cpu is not None:
         if q_seq_lens_cpu is None or kv_seq_lens_cpu is None:
             raise ValueError(
                 "q_seq_lens_cpu and kv_seq_lens_cpu must be provided together"
