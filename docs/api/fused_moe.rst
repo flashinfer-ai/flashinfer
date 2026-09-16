@@ -61,6 +61,25 @@ are designed to co-exist, and neither supersedes the other.
     .. automethod:: __init__
     .. automethod:: __call__
 
+Explicit cuDNN BF16 backend
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``BackendOptions((CudnnMoeConfig(...),))`` selects the cuDNN BF16 MoE candidate,
+including SM120. Packed and unpacked precomputed routing are supported; native
+sort/permutation helpers are enabled with ``use_native_routing=True``.
+Set ``ExecutionConfig(enable_pdl=False)`` for this backend.
+
+The SM120 Frost path requires a cuDNN Frontend build containing the SM120
+grouped-MoE kernels and their scheduler-ring synchronization fix. Enable Frost
+with ``CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1``. When shared-input FC1 fusion is
+unavailable, the adapter keeps FC1 output in FP32 through the separate gated
+activation and converts its result to BF16 before FC2. Explicit ``fc1_tactic``
+and ``fc2_tactic`` records replay the selected engine and public knobs.
+
+This architecture extension applies to ``CudnnMoeConfig``; FP8 MoE retains its
+own support domain. Validation status and measurements are recorded in
+``FROST_MOE_HANDOFF.md`` at the repository root.
+
 Utility Functions
 -----------------
 

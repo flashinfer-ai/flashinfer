@@ -318,7 +318,7 @@ class CudnnMoeRunner(MoERunner):
         major, minor = torch.cuda.get_device_capability(self.device)
         if not self._backend_config_type.supported(major * 10 + minor):
             raise NotImplementedError(
-                "CudnnMoeRunner currently validates SM100-family hardware"
+                f"CudnnMoeRunner does not support SM{major}{minor}"
             )
         _check_cudnn_version(92100, "BF16 MoE")
         if not self.config.finalize.do_finalize:

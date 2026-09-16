@@ -874,7 +874,8 @@ class TrtllmMxInt4Config:
 class CudnnMoeConfig:
     """cuDNN BF16 grouped MoE with optional FROST shared-input activation fusion.
 
-    Explicit candidate only. SM120 is outside this adapter's validated domain.
+    Explicit candidate only. On SM120, Frost uses a concatenated FC1 followed
+    by FP32 gated activation when shared-input GEMM fusion is unavailable.
 
     ``fc1_tactic`` and ``fc2_tactic`` are optional stable engine/knob identities.
     They replay exactly, with plan preparation outside CUDA graph capture.
@@ -887,7 +888,7 @@ class CudnnMoeConfig:
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        return arch in (100, 103, 107, 110)
+        return arch in (100, 103, 107, 110, 120)
 
     @staticmethod
     def prepare_weights(

@@ -96,7 +96,8 @@ def test_cudnn_registration_and_support():
 
     assert _BACKEND_RUNNERS[CudnnMoeConfig] is CudnnMoeRunner
     assert CudnnMoeConfig.supported(100)
-    assert not CudnnMoeConfig.supported(120)
+    assert CudnnMoeConfig.supported(120)
+    assert not CudnnMoeConfig.supported(121)
 
 
 def test_cudnn_quantization_axes_are_checked_independently():

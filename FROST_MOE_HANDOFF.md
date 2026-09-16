@@ -1,5 +1,23 @@
 # Frost / FlashInfer MoE integration handoff
 
+## SM120 public-path candidate: validation pending
+
+This follow-up enables the explicit BF16 `CudnnMoeConfig` candidate on SM120
+and adds SM12 to the native MoE helper JIT targets. It requires the paired
+Frontend scheduler-ring repair. That repair passed a focused RED/green
+experiment: the original small tile produced racecheck hazards despite passing
+numerics, and the lane-zero-load/broadcast variant passed unfiltered memcheck
+and racecheck. Its expanded product regression is still pending.
+
+The new public-path regression covers two tile geometries, packed/unpacked
+routing, native/non-native routing, live input/ID/scale changes during graph
+replay, and twelve gated-activation parameter sets. It uses actual architecture
+checks and native JIT flags, without process-local overrides. CPU checks passed
+12 tests after two expected baseline failures (SM120 registration and JIT
+filtering). Full target-GPU validation is required before promoting this
+follow-up. No new performance result is claimed here.
+
+
 This draft collects the complete integration for continued development and review.
 Yanqin can adjust the design, choose which changes to keep, and decide whether to
 split it later. The companion repository carries the other half of the same work;
@@ -154,14 +172,14 @@ Recommended continuation order:
    retain the original failing public regression and its artifacts.
 2. Confirm complete-MoE performance on the port with identical tactics and
    strict gates; finish the T1025/T2048/T3072 finalizer-range comparison.
-3. Finish SM120 interface validation before changing public support. A separate
+3. Finish validation of the SM120 public-path candidate above. A separate
    full RTX PRO 6000 Blackwell Server Edition experiment (188 SMs, 600 W) passed
    BF16 numerics, live-input capture and actual Frost routes for two tile
    configurations and both routing implementations. It required process-local
    fixes for the native utility JIT architecture whitelist and the dedicated
    `cudnnGraphNotSupportedError` fallback. The fallback fix is now included in
-   this draft; the native utility JIT whitelist and public SM120 support remain
-   unchanged. The same two configurations and T17/T257 cases now also pass
+   the earlier draft. The candidate above additionally changes the native utility
+   JIT whitelist and public BF16 SM120 support, with GPU validation pending. The same two configurations and T17/T257 cases now also pass
    unfiltered memcheck and racecheck for both routing paths on a full 188-SM,
    600-W RTX PRO 6000 Blackwell Server Edition (112 numerical checks and 64
    stale-output negative controls across four instrumented processes; zero
