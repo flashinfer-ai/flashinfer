@@ -105,7 +105,7 @@ Primary next direction: combine Yanqin's
 [SM100 swap-AB #1090](https://github.com/NVIDIA/cudnn-frontend/pull/1090) with the
 FI integration and independently choose FC1/FC2 orientation. An isolated merged
 prototype resolves both textual conflicts and the compiled scheduler-reset
-handoff. Its CPU render/replay checks pass; target-GPU comparison is pending.
+handoff. Its CPU render/replay checks and the first target-GPU screen pass.
 The first screen covers all four orientations at one fixed geometry, not a
 complete tile sweep. The experimental merge is not included in these commits.
 
@@ -134,21 +134,49 @@ lowering, separate plain/block-scaled SM100 templates, public knob replay and
 coverage belongs to that work, with thanks to Yanqin and Yihua for the parallel
 distillation effort. Our isolated combination adds FI wiring, conflict/reset
 integration and matched measurements. #1090's code is in that experimental
-combination, not this published followup; no combined speedup has yet been
-validated. A later publication of that combination must retain this attribution.
+combination, not this published runtime followup. The bounded B200 result below credits
+that implementation; a later runtime publication must retain this attribution.
 
 For SM120, the design reference is the NVIDIA CuTeDSL MegaMoE kernel team's
 implementation in the `bangyus/cutedsl_megamoe` fork, vendored by FI at
 `d19d30a748f9e402b8a2a33083fdf530231cf647`; see
 `flashinfer/moe_ep/kernel_src/sm120/swapab_cutedsl_megakernel/VENDOR.md` in the
 companion FlashInfer tree for the dirty-snapshot exceptions and original source.
-It has only been inspected: no source has been copied into Frost and no Frost
-BF16 benefit is established. If adopted, record the exact reused idea/code,
-original author provenance and measured contribution rather than presenting it
-as a new invention here.
+A private SM120 BF16 prototype now references its accumulator-coordinate
+reasoning, together with #1090's ragged-N design. No MegaMoE source body was
+copied. Our adaptation adds BF16 operand binding and a direct FI-layout
+epilogue. This prototype is outside the published runtime; component numerical
+and sanitizer checks pass, but no SM120 speedup is established yet.
 
 Kernel Factory assisted separate candidate exploration. Its exported candidate
 and local numerical repair remain experimental and are not promoted by this
 followup. Future gains will distinguish upstream contribution, adaptation,
 integration and configuration search, with workload-specific evidence.
 
+
+## Combined prototype: first B200 result (September 16)
+
+BF16 T64/E128/top8/H2048/I768, synthetic Qwen-shaped inputs, precomputed uniform
+routing, TP1/EP1, PDL off, full 148-SM/1000-W B200. At one fixed 128x64 geometry,
+complete-MoE cold-L2 CUPTI spans are:
+
+| FC1 swap | FC2 swap | Complete MoE, us |
+|---|---|---:|
+| No | No | 276.481 |
+| No | Yes | **226.992** |
+| Yes | No | 286.817 |
+| Yes | Yes | 238.288 |
+
+FC2-only swap lowers complete latency **17.899%** at this geometry. FC2 changes
+117.680 -> 68.160 us; FC1 remains about142.6 us. Credit for the swap lowering
+and templates belongs to Yanqin's #1090; this pathfinding work adds FI stage
+selection, compiled-reset integration and measurement. This is evidence that
+the two efforts combine usefully on this fixture, not a comparison between
+independently tuned best configurations.
+
+All four arms pass20 strict full-output checks and2 skipped-replay negative
+controls before384 raw spans. Inputs/routing change and buffers are poisoned.
+Independent audit1453 verifies exact source hashes, all spans and actual stage
+routes. Sanitizers on the combined head, fresh-process repetition, tile tuning,
+and a tuned competing-backend comparison remain outstanding. This experimental
+merge is not included in this PR's runtime changes; no model-E2E gain is claimed.
