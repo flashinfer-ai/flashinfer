@@ -340,28 +340,28 @@ def download_artifacts() -> None:
             artifact_name: str,
             kwargs: dict[str, object],
         ) -> bool:
-            session = requests.Session()
-            request_kwargs = dict(kwargs)
-            request_kwargs["session"] = session
-            while True:
-                if download_file(source_path, destination_path, **request_kwargs):
-                    return True
-                if retry_deadline is None:
-                    return False
-                remaining = retry_deadline - time.monotonic()
-                if remaining <= 0:
-                    logger.error(
-                        "Retry window exhausted for %s after %d seconds",
+            with requests.Session() as session:
+                request_kwargs = dict(kwargs)
+                request_kwargs["session"] = session
+                while True:
+                    if download_file(source_path, destination_path, **request_kwargs):
+                        return True
+                    if retry_deadline is None:
+                        return False
+                    remaining = retry_deadline - time.monotonic()
+                    if remaining <= 0:
+                        logger.error(
+                            "Retry window exhausted for %s after %d seconds",
+                            artifact_name,
+                            retry_window_seconds,
+                        )
+                        return False
+                    logger.warning(
+                        "Download failed for %s; retrying while %0.2f seconds remain in retry window",
                         artifact_name,
-                        retry_window_seconds,
+                        remaining,
                     )
-                    return False
-                logger.warning(
-                    "Download failed for %s; retrying while %0.2f seconds remain in retry window",
-                    artifact_name,
-                    remaining,
-                )
-                time.sleep(min(5.0, remaining))
+                    time.sleep(min(5.0, remaining))
 
         with ThreadPoolExecutor(num_threads) as pool:
             futures = []
