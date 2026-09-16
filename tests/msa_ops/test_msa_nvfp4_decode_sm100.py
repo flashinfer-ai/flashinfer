@@ -463,15 +463,21 @@ def expect_backend(backend, monkeypatch, *, route=None, calls=1, device=None):
     assert backend in BACKENDS, f"{backend!r} is not one of {list(BACKENDS)}"
     choice = _BACKEND_ROUTE[backend] if route is None else route
     assert choice in ("auto", "pingpong"), choice
-    if choice == "pingpong":
-        monkeypatch.setattr(
-            nvfp4, "specialised_route_reason", lambda **_kwargs: _FORCED_DECLINE
-        )
-    if device is not None:
-        nvfp4.warm(device)
-    before = _counters()
-    yield
-    after = _counters()
+    # The forcing lives exactly as long as the block. A test that reaches the
+    # C++ body and then asks for the CuTe-DSL body in the SAME function (the
+    # cross-implementation agreement test does) must not carry the first
+    # block's decline into the second, so the patch is undone on exit rather
+    # than at test teardown.
+    with monkeypatch.context() as forcing:
+        if choice == "pingpong":
+            forcing.setattr(
+                nvfp4, "specialised_route_reason", lambda **_kwargs: _FORCED_DECLINE
+            )
+        if device is not None:
+            nvfp4.warm(device)
+        before = _counters()
+        yield
+        after = _counters()
     moved = {name for name in BACKENDS if after[name] > before[name]}
     assert moved == {backend}, (
         f"this test asked for the {backend!r} body and "
@@ -496,6 +502,32 @@ def _call_on(backend, inputs, monkeypatch, *, route=None, **kwargs):
     with expect_backend(backend, monkeypatch, route=route, device=inputs["q"].device):
         result = _call(inputs, **kwargs)
     return result
+
+
+class _LeaveBlock(Exception):
+    """Exits an ``expect_backend`` block before it dispatches anything."""
+
+
+def test_the_forcing_seam_ends_with_its_block(monkeypatch):
+    """A test may reach the C++ body and then ask for the CuTe-DSL body.
+
+    The cross-implementation agreement test does exactly that, in one
+    function. The first block forces the CuTe-DSL body to decline; if that
+    forcing outlived its block, the second block would be served by the C++
+    body and fail as "asked for cute, pinned served". So the seam is scoped to
+    the block, not to the test.
+    """
+
+    original = nvfp4.specialised_route_reason
+    forced_inside = None
+    try:
+        with expect_backend(PINNED, monkeypatch):
+            forced_inside = nvfp4.specialised_route_reason is not original
+            raise _LeaveBlock
+    except _LeaveBlock:
+        pass
+    assert forced_inside is True
+    assert nvfp4.specialised_route_reason is original
 
 
 def _page_count(seq_lengths):

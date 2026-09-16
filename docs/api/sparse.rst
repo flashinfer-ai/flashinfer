@@ -72,7 +72,11 @@ Frozen BF16-query/FP8-KV Q1 serving shapes use exact or transformed direct
 kernels, while paged uniform FP8 Q/K/V supports Q1 through Q32 and returns
 BF16 output. Long batch-one BF16 causal prefill uses a selected-block reverse
 producer and deterministic reduction once the query reaches 8192 tokens.
-The NVFP4 paged-KV prefill route on compute capability 10.0/10.3 is bitwise
+The NVFP4 paged-KV prefill route on compute capability 10.0/10.3 requires
+CUDA 13.0 or newer; on an older toolkit it declines with the reason, which
+``msa_prefill_nvfp4_specialized_stats()`` also reports as
+``toolkit_decline_reason``. The decode route has no such floor. The prefill
+route is bitwise
 reproducible run to run up to a 16,384-token context, and is not guaranteed to
 be above it. The per-tile block union is consumed in ascending hash-slot order;
 at or below 128 blocks per request the slot is a permutation of the selected

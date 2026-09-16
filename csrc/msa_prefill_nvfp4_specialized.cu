@@ -467,6 +467,20 @@ __device__ __forceinline__ void tmem_store_x16_b32(int addr, const uint32_t* x) 
       "r"(x[8]), "r"(x[9]), "r"(x[10]), "r"(x[11]), "r"(x[12]), "r"(x[13]), "r"(x[14]), "r"(x[15]));
 }
 
+// This translation unit requires CUDA 13.0 or newer.  ptxas 12.9.41 -- the
+// assembler in CUDA 12.9.0 -- miscompiles it: the B-operand shared-memory
+// descriptor of the kernel's first `tcgen05.mma` is materialised from a
+// register pair holding a stale FP32 dequant result and an uninitialised
+// register, and the kernel faults on its first launch.  13.x assemblers build
+// the identical PTX correctly; no earlier 12.x toolkit has been qualified on
+// this kernel, so the floor is the toolchain line that has.  The Python route
+// declines with the same reason before it gets here (`toolkit_decline_reason`);
+// this is the backstop for builds that do not go through it.
+#if defined(__CUDACC_VER_MAJOR__) && __CUDACC_VER_MAJOR__ < 13
+#error \
+    "msa_prefill_nvfp4_specialized requires CUDA 13.0 or newer: ptxas 12.9.41 (CUDA 12.9.0) miscompiles this kernel and earlier 12.x toolkits are not qualified for it"
+#endif
+
 // `cvt.rn.bf16x2.{e2m1x2,e4m3x2}` require CUDA Toolkit >= 13.2 (the same guard
 // vec_dtypes.cuh already carries for the FP4 case).  Below that they do not
 // assemble, so the conversion goes through FP16 -- which is BIT-EXACT here, not

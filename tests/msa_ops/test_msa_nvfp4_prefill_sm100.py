@@ -136,6 +136,16 @@ def _require_supported_gpu() -> torch.device:
             f"compute capability {capability[0]}.{capability[1]} requires "
             f"CUDA {minimum_cuda} or newer"
         )
+    # The architecture can be right and the toolkit still too old: the prefill
+    # route requires CUDA 13.0 (ptxas 12.9.41 miscompiles the kernel and no
+    # earlier 12.x toolkit is qualified) and refuses to build it below that. A
+    # skip that names the toolkit, never a green run on a kernel that did not
+    # launch.
+    from flashinfer.msa_ops._nvfp4_prefill_sm100 import toolkit_decline_reason
+
+    toolkit = toolkit_decline_reason()
+    if toolkit is not None:
+        pytest.skip(toolkit)
     return device
 
 

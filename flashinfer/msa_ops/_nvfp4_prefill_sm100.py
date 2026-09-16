@@ -587,6 +587,44 @@ def check_surface(
             return _reject(f"{name} must be on the same device as q")
     if _target_for(q.device) is None:
         return _reject("this route requires compute capability 10.0 or 10.3")
+    toolkit = toolkit_decline_reason()
+    if toolkit is not None:
+        return _reject(toolkit)
+    return None
+
+
+# The prefill route requires CUDA 13.0 or newer. ptxas 12.9.41 (CUDA 12.9.0)
+# miscompiles the kernel -- the B-operand shared-memory descriptor of its first
+# tcgen05.mma is materialised from a stale register pair and the kernel faults
+# on its first launch -- and no earlier 12.x toolkit has been qualified on this
+# kernel at all, so the floor is the toolchain line that has, not the one build
+# that is known broken. Decode is unaffected: both of its bodies run on 12.9.
+_MIN_CUDA_VERSION = "13.0"
+
+
+@functools.cache
+def toolkit_decline_reason() -> Optional[str]:
+    """Why the toolkit that would build this kernel must not, or ``None``.
+
+    Read from the nvcc the JIT will use (``torch.version.cuda`` when nvcc is
+    absent), so the answer is about the compiler that produces the kernel,
+    not the runtime that would launch it. The translation unit carries an
+    ``#error`` on the same condition as the backstop for builds that do not
+    go through this route.
+    """
+
+    from ..jit.cpp_ext import get_cuda_version
+
+    try:
+        version = get_cuda_version()
+    except RuntimeError:
+        return None
+    if version.release[:2] < tuple(int(x) for x in _MIN_CUDA_VERSION.split(".")):
+        return (
+            f"the NVFP4 MSA prefill route requires CUDA {_MIN_CUDA_VERSION} or "
+            f"newer, found {version}; ptxas 12.9.41 (CUDA 12.9.0) miscompiles the "
+            f"kernel and earlier 12.x toolkits are not qualified for it"
+        )
     return None
 
 
@@ -1032,6 +1070,9 @@ def msa_prefill_nvfp4_specialized_stats() -> Dict[str, Any]:
         "distinct_kernels_for_allowlist": 1,
         "kernel_instantiations": ["attend"],
         "compile_cache_key": "(compute capability target,)",
+        # Non-None names a toolkit whose assembler miscompiles the kernel; the
+        # route declines every call with this reason and builds nothing.
+        "toolkit_decline_reason": toolkit_decline_reason(),
         "precompiled": True,
         "allowlist_rows": len(allowlist),
         "allowlist_fields": list(_WORKLOAD_FIELDS),
