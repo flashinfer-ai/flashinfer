@@ -5096,6 +5096,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     backend="cute-dsl",
                     q_seq_lens_cpu=p["q_seq_lens_cpu"],
                     kv_seq_lens_cpu=p["kv_seq_lens_cpu"],
+                    skip_all_rows_active_check=False,
                 )
             # Modular CuTe DSL backend does not support scale parameters.
             if any(s is not None for s in (q_scale, k_scale, v_scale, o_scale)):
@@ -5976,33 +5977,47 @@ def trtllm_ragged_attention_deepseek(
         # keeps repeat_interleave from syncing), so this path stays
         # CUDA-graph-capturable.
         should_launch = True
-        if active_rows_cpu is not None and not bool(active_rows_cpu.all().item()):
-            if not bool(active_rows_cpu.any().item()):
+        _is_capturing = (
+            query.is_cuda
+            and hasattr(torch.cuda, "is_current_stream_capturing")
+            and torch.cuda.is_current_stream_capturing()
+        )
+        if active_rows_cpu is not None:
+            if not bool(active_rows_cpu.all().item()):
+                if not bool(active_rows_cpu.any().item()):
+                    out.zero_()
+                    if lse is not None:
+                        lse.fill_(-float("inf"))
+                    # Skip the launch only outside CUDA graph capture.
+                    # Under capture, dropping the launch would leave it
+                    # unrecorded, so a later replay with active rows would
+                    # find no kernel in the graph. The DSL varlen kernel
+                    # is a no-op for kv_len <= 0 rows, so recording it on
+                    # an all-empty batch is safe.
+                    if not _is_capturing:
+                        should_launch = False
+                else:
+                    q_lens_device = cum_seq_lens_q[1:] - cum_seq_lens_q[:-1]
+                    kv_lens_device = cum_seq_lens_kv[1:] - cum_seq_lens_kv[:-1]
+                    row_active = (q_lens_device > 0) & (kv_lens_device > 0)
+                    token_inactive = ~torch.repeat_interleave(
+                        row_active, q_lens_device, output_size=query.shape[0]
+                    )
+                    out.masked_fill_(token_inactive.view(-1, 1, 1), 0)
+                    if lse is not None:
+                        lse.masked_fill_(token_inactive.view(-1, 1), -float("inf"))
+            elif _is_capturing:
+                # All rows are active at capture time, but replay may
+                # change device-side seq_lens so that some rows become
+                # inactive (kv_len == 0). The DSL kernel would skip those
+                # rows without writing their output. Pre-fill neutral
+                # values so that any newly-inactive row in a replay gets
+                # (out = 0, lse = -inf) rather than stale data. The
+                # kernel overwrites active rows, so the fill is harmless
+                # for them.
                 out.zero_()
                 if lse is not None:
                     lse.fill_(-float("inf"))
-                # Skip the launch only outside CUDA graph capture. Under
-                # capture, dropping the launch would leave it unrecorded,
-                # so a later replay with active rows would find no kernel
-                # in the graph. The DSL varlen kernel is a no-op for
-                # kv_len <= 0 rows, so recording it on an all-empty batch
-                # is safe and preserves the graph for varying replays.
-                if not (
-                    query.is_cuda
-                    and hasattr(torch.cuda, "is_current_stream_capturing")
-                    and torch.cuda.is_current_stream_capturing()
-                ):
-                    should_launch = False
-            else:
-                q_lens_device = cum_seq_lens_q[1:] - cum_seq_lens_q[:-1]
-                kv_lens_device = cum_seq_lens_kv[1:] - cum_seq_lens_kv[:-1]
-                row_active = (q_lens_device > 0) & (kv_lens_device > 0)
-                token_inactive = ~torch.repeat_interleave(
-                    row_active, q_lens_device, output_size=query.shape[0]
-                )
-                out.masked_fill_(token_inactive.view(-1, 1, 1), 0)
-                if lse is not None:
-                    lse.masked_fill_(token_inactive.view(-1, 1), -float("inf"))
 
         # bmm1_scale = scale_q * scale_k * sm_scale (already fused by caller)
         # bmm2_scale = scale_v
