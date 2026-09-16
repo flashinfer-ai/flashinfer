@@ -2752,19 +2752,20 @@ def create_transform_kv_task(
 
 
 # ======================================================================
-# MmaTask — warp 12, 1 warp, mma_load_task_num_registers
-# K and V share one ring; each loop consumes a K/V pair per active instance.
-#   HEAD: wait Q, BMM1 for each active K instance
-#   LOOP: QK then PV per instance, or PV then QK when P aliases S in TMEM
-#   TAIL: release Q, then final BMM2 for each active V instance
+# MmaTask — warp 12, 1 warp
+# K and V share a single SmemKv ring; each MMA loop iter consumes 4 stages
+# (K0, V0, K1, V1) of the shared buffer.
+#   HEAD: wait Q, BMM1(K0), BMM1(K1)
+#   LOOP[i]: BMM1(nextK0), BMM2(currV0), BMM1(nextK1), BMM2(currV1)
+#   TAIL: final BMM2(lastV0), final BMM2(lastV1), release Q
 # ======================================================================
 def create_mma_task(
     smem_q: MemoryResource,
     smem_kv: MemoryResource,
     tmem_s0: MemoryResource,
-    tmem_s1: MemoryResource,
+    tmem_s1: MemoryResource | None,
     smem_p0: MemoryResource,
-    smem_p1: MemoryResource,
+    smem_p1: MemoryResource | None,
     tmem_o: MemoryResource,
     work_queue: WorkQueue | None,
     cfg: FmhaDecodeConfig,
@@ -2779,16 +2780,16 @@ def create_mma_task(
         smem_q: MemoryResource,
         smem_kv: MemoryResource,
         tmem_s0: MemoryResource,
+        tmem_s1: MemoryResource | None,
         smem_p0: MemoryResource,
+        smem_p1: MemoryResource | None,
         tmem_o: MemoryResource,
         q_desc: Any,
-        smem_p1_schedule: MemoryResource | None,
-        tmem_s1_schedule: MemoryResource | None,
     ) -> None:
         """Schedule shared-KV QK and PV waves across HEAD/LOOP/TAIL."""
         if cfg.num_insts_kv != 1:
-            assert smem_p1_schedule is not None
-            assert tmem_s1_schedule is not None
+            assert smem_p1 is not None
+            assert tmem_s1 is not None
         # HEAD: consume Q once and launch BMM1 for each active instance.
         _consume_staged_qk_mma(
             smem_kv,
@@ -2802,7 +2803,7 @@ def create_mma_task(
         if cfg.num_insts_kv != 1:
             _consume_staged_qk_mma(
                 smem_kv,
-                tmem_s1_schedule,
+                tmem_s1,
                 q_desc,
                 "k_desc_1",
                 "qk_mma_head",
@@ -2850,7 +2851,7 @@ def create_mma_task(
                 if cfg.uses_two_inst_tmem_p:
                     _consume_staged_pv_mma(
                         smem_kv,
-                        smem_p1_schedule,
+                        smem_p1,
                         tmem_o,
                         "v_desc_1",
                         "vp_mma_loop",
@@ -2860,7 +2861,7 @@ def create_mma_task(
                     )
                 _consume_staged_qk_mma(
                     smem_kv,
-                    tmem_s1_schedule,
+                    tmem_s1,
                     q_desc,
                     "k_desc_1",
                     "qk_mma_loop",
@@ -2870,7 +2871,7 @@ def create_mma_task(
                 if not cfg.uses_two_inst_tmem_p:
                     _consume_staged_pv_mma(
                         smem_kv,
-                        smem_p1_schedule,
+                        smem_p1,
                         tmem_o,
                         "v_desc_1",
                         "vp_mma_loop",
@@ -2899,7 +2900,7 @@ def create_mma_task(
         if cfg.num_insts_kv != 1:
             _consume_staged_pv_mma(
                 smem_kv,
-                smem_p1_schedule,
+                smem_p1,
                 tmem_o,
                 "v_desc_1",
                 "vp_mma_tail",
@@ -2912,52 +2913,36 @@ def create_mma_task(
         smem_q: MemoryResource,
         smem_kv: MemoryResource,
         smem_p0: MemoryResource,
-        smem_p1_schedule: MemoryResource | None,
+        smem_p1: MemoryResource | None,
     ) -> None:
         """Initialize invariant shared-ring descriptor slots."""
         smem_q.init_descriptor_state()
         smem_kv.init_descriptor_state()
         smem_p0.init_descriptor_state()
         if cfg.num_insts_kv != 1:
-            assert smem_p1_schedule is not None
-            smem_p1_schedule.init_descriptor_state()
+            assert smem_p1 is not None
+            smem_p1.init_descriptor_state()
 
-    @schedule
+    @_schedule_with_optional_resources
     def mma_schedule(
         smem_q: MemoryResource,
         smem_kv: MemoryResource,
         tmem_s0: MemoryResource,
+        tmem_s1: MemoryResource | None,
         smem_p0: MemoryResource,
+        smem_p1: MemoryResource | None,
         tmem_o: MemoryResource,
-        *optional_resources: MemoryResource,
+        work_queue: WorkQueue | None,
     ) -> None:
         """Wrap shared-ring MMA work in packed persistent skip handling."""
-        expected_optional = (2 if cfg.num_insts_kv != 1 else 0) + (
-            1 if work_queue is not None else 0
-        )
-        if len(optional_resources) != expected_optional:
-            raise ValueError(
-                f"Expected {expected_optional} optional MMA schedule resources, "
-                f"got {len(optional_resources)}."
-            )
-        optional_idx = 0
-        smem_p1_schedule = None
-        tmem_s1_schedule = None
-        if cfg.num_insts_kv != 1:
-            smem_p1_schedule = optional_resources[optional_idx]
-            tmem_s1_schedule = optional_resources[optional_idx + 1]
-            optional_idx += 2
-        work_queue_schedule = None
-        if work_queue is not None:
-            work_queue_schedule = optional_resources[optional_idx]
         _decode_work_tile_schedule_with_invariant_bridge(
             cfg,
-            work_queue_schedule,
+            work_queue,
             lambda: mma_schedule_prelude(
                 smem_q,
                 smem_kv,
                 smem_p0,
-                smem_p1_schedule,
+                smem_p1,
             ),
             lambda: smem_q.q_desc(),
             lambda: smem_q.wait(),
@@ -2965,20 +2950,24 @@ def create_mma_task(
                 smem_q,
                 smem_kv,
                 tmem_s0,
+                tmem_s1,
                 smem_p0,
+                smem_p1,
                 tmem_o,
                 q_desc,
-                smem_p1_schedule,
-                tmem_s1_schedule,
             ),
         )
 
-    schedule_args = [smem_q, smem_kv, tmem_s0, smem_p0, tmem_o]
-    if cfg.num_insts_kv != 1:
-        schedule_args.extend([smem_p1, tmem_s1])
-    if work_queue is not None:
-        schedule_args.append(work_queue)
-    captured_schedule = mma_schedule(*schedule_args)
+    captured_schedule = mma_schedule(
+        smem_q,
+        smem_kv,
+        tmem_s0,
+        tmem_s1,
+        smem_p0,
+        smem_p1,
+        tmem_o,
+        work_queue,
+    )
     src = [smem_q, smem_kv, smem_p0]
     dst = [tmem_s0, tmem_o]
     if cfg.num_insts_kv != 1:

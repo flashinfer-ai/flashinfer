@@ -108,7 +108,7 @@ def _get_prims_ts_module():
 
 
 def _prims_ts_decode_supports_dtypes(q_dtype, kv_dtype, out_dtype):
-    """Mirror the public PrimTS decode dtype combinations."""
+    """Helper for checking if PrimTS supports the given dtypes."""
     return (
         (
             q_dtype == torch.float16
@@ -425,17 +425,14 @@ def parse_attention_args(line, parser):
         type=str,
         required=False,
         default="bfloat16",
-        help="Data type of the query (for example, bfloat16 or fp8_e4m3).",
+        help="Query data type; supported values depend on the selected backend.",
     )
     parser.add_argument(
         "--kv_dtype",
         type=str,
         required=False,
         default="bfloat16",
-        help=(
-            "Data type of the key and value "
-            "(for example, bfloat16, fp8_e4m3, or nvfp4)."
-        ),
+        help="Key/value data type; supported values depend on the selected backend.",
     )
     parser.add_argument(
         "--v_dtype",

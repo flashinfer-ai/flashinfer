@@ -4019,7 +4019,7 @@ def test_attention_ts_mixed_dtype_contract(q_dtype, kv_dtype, output_dtype):
 def test_attention_ts_rejects_unsupported_fp16_q_fp8_kv():
     from flashinfer.attention.prims_ts import decode as decode_module
 
-    with pytest.raises(NotImplementedError, match="BF16 Q with FP8 K/V"):
+    with pytest.raises(NotImplementedError, match=r"BF16 Q \+ FP8 K/V"):
         decode_module._validate_dtype_pair(
             torch.float16,
             torch.float8_e4m3fn,

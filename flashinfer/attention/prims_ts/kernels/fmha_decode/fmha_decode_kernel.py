@@ -3339,7 +3339,6 @@ def fmha_decode_launch(
         tma_desc_v,
         tma_desc_k_sf,
         tma_desc_v_sf,
-        # Dense/paged profiles never inspect the 64-token descriptor slots.
         tma_desc_k,
         tma_desc_v,
         o_iter,
