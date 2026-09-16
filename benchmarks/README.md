@@ -649,3 +649,16 @@ python benchmarks/flashinfer_benchmark.py \
 - fla: flash-linear-attention Triton kernels (GDN prefill baseline)
 - flashinfer-decomp / flashinfer-fused: pinned SM120 KDA prefill variants
 - cutekda / flash-kda: optional external SM120 KDA prefill baselines
+
+### vLLM FlashInfer Mamba2/SSD small cases
+
+`benchmarks/mamba/bench_vllm_flashinfer_cases.py` is the production-shaped screening harness for StormEye candidates. It keeps the Nemotron decode contract (`B=1,H=64,D=64,N=128,G=8`, FP16 state, BF16 x/B/C, FP32 dt/A), and the SSD prefill contract (`T=128` by default, `chunk=128`, `dt_softplus=True`). It reports MUSA event median/p90, finite-output status, and SSD max absolute error against the MUSA reference.
+
+```bash
+python benchmarks/mamba/bench_vllm_flashinfer_cases.py --case all --seqlen 128
+python benchmarks/mamba/bench_vllm_flashinfer_cases.py --case ssd --seqlen 4096
+python benchmarks/mamba/bench_vllm_flashinfer_cases.py --case ssd-varlen --lengths 127,128,3841
+python benchmarks/mamba/bench_ssd_stages_musa.py --lengths 127,128,3841
+```
+
+The varlen case uses packed `cu_seqlens`, `cu_chunk_seqlens`, `last_chunk_indices`, and `seq_idx` metadata. The stage harness reports the five internal SSD kernels and accepts the same packed length list. Use these harnesses for candidate screening. A candidate still needs the full FlashInfer regression and compiled Nemotron serving A/B before pinning or merging.
