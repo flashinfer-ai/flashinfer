@@ -10,6 +10,9 @@ import torch
 
 from .musa_compile import device_context
 from .musa_ssd_helpers import fast_exp
+
+
+_DT_MAX = 3.4028234663852886e38
 import triton
 import triton.language as tl
 
@@ -320,7 +323,7 @@ def _chunk_cumsum_fwd(
     cu_chunk_seqlens,
     dt_bias=None,
     dt_softplus=False,
-    dt_limit=(0.0, float("inf")),
+    dt_limit=(0.0, _DT_MAX),
 ):
     seqlen, nheads = dt.shape
     assert A.shape == (nheads,)

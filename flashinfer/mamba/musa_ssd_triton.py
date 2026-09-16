@@ -17,6 +17,13 @@ from .musa_ssd_chunk_scan import _chunk_scan_fwd
 from .musa_ssd_chunk_state import _chunk_cumsum_fwd, _chunk_state_fwd
 from .musa_ssd_state_passing import _state_passing_fwd
 
+
+# Triton/Inductor's MUSA code generator emits constexpr values as bare Python
+# names. ``float('inf')`` therefore becomes an undefined ``inf`` in generated
+# modules; this finite FP32 limit is indistinguishable for the supported dt
+# range and keeps the default path graph-compilable.
+_DT_MAX = 3.4028234663852886e38
+
 TRITON_22 = version.parse(triton.__version__) >= version.parse("2.2.0")
 
 
@@ -42,7 +49,7 @@ def _mamba_chunk_scan_combined_fwd(
     cu_chunk_seqlens=None,
     last_chunk_indices=None,
     dt_softplus=False,
-    dt_limit=(0.0, float("inf")),
+    dt_limit=(0.0, _DT_MAX),
     state_dtype=None,
 ):
     # Match the public cache contract and keep initial/current state pointer
@@ -183,7 +190,7 @@ def mamba_chunk_scan_combined_varlen(
     dt_bias=None,
     initial_states=None,
     dt_softplus=False,
-    dt_limit=(0.0, float("inf")),
+    dt_limit=(0.0, _DT_MAX),
     return_intermediate_states=False,
     state_dtype=None,
 ):
