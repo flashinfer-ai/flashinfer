@@ -1487,6 +1487,17 @@ def cute_dsl_fused_moe(
         Optional W4A4 per-token input row scale for GEMM1.
     tactic : Optional[Tuple]
         Tactic tuple, or ``None`` for auto-selection via the runtime tuner.
+    localized_weights : Optional[list]
+        Per-locality-domain W4A4 weight-shard dictionaries. Supplying these
+        enables localized execution; exactly two equal-width shards are required.
+    localized_streams : Optional[list]
+        One long-lived green-context CUDA stream for each locality domain.
+    localized_sm_count : Optional[int]
+        Number of SMs available to each locality-domain stream, used to size
+        the persistent kernel grid.
+    localized_memset_stream : Optional[torch.cuda.Stream]
+        Optional CUDA stream used to overlap fused-finalize output zeroing
+        with FC1.
     localized_allow_nonlocalized : bool
         Include the full-width path in autotuning when localized weights are
         supplied. The caller must retain usable full-width weights.
