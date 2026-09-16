@@ -859,9 +859,10 @@ def _specialised_warm(device: torch.device) -> None:
       CUDA-graph capture -- so one eager launch per compiled instantiation is
       taken here, on the smallest batch that selects it.
 
-    Compilation is minutes of ptxas on a cold cache. It happens once per
-    device, in the eager phase a serving engine runs before it captures, and
-    ``FLASHINFER_MSA_DECODE_NVFP4_ROUTE=pingpong`` skips it entirely.
+    Compilation happens in the eager phase a serving engine runs before it
+    captures, once per device per process -- and the CuTe-DSL body's compiled
+    instantiations are persisted to FlashInfer's on-disk kernel cache, so on
+    a machine that has built them once this is a reload, not a compile.
     Failure is not fatal: the ping-pong kernel serves every shape this route
     accepts, so a failed warm costs speed on some batch sizes and nothing else.
     """

@@ -67,6 +67,8 @@ from cutlass import Int32, Int64, Float32
 from cutlass._mlir.dialects import llvm, nvvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
+from ...jit.cute_dsl_core import build_and_load_cute_dsl_kernel
+
 _ATT = llvm.AsmDialect.AD_ATT
 
 
@@ -2321,26 +2323,65 @@ _WAVE_CTAS = {3: 288}
 _LOG2E = 1.4426950408889634
 
 
-def _compile_variant(lowreg, static_nsplit, scored_geom, cluster_c=0, ntg=2,
+# On-disk cache identity (flashinfer/jit/cute_dsl_core.py, and
+# docs/design_docs/cute_dsl_kernel_cache.md).  One module directory per
+# (op family, compile arch); one exported object file per instantiation, named
+# by EVERY codegen parameter so that two different kernels can never share an
+# artifact.  Kernels are compiled with TVM-FFI enabled: that is what makes the
+# compiled function exportable and reloadable across processes, and the
+# reloaded `tvm_ffi.Function` takes the same positional arguments the fresh
+# compile does -- raw device pointers and scalars, plus the stream.
+_CUTE_DSL_MODULE = "msa_decode_nvfp4_sm100"
+
+
+def _dsl_arch(dev) -> str:
+    """The CuTe DSL's spelling of ``dev``'s compile target, e.g. ``sm_100a``."""
+    major, minor = torch.cuda.get_device_capability(dev)
+    return "sm_%d%da" % (major, minor)
+
+
+def _variant_name(lowreg, static_nsplit, scored_geom, cluster_c, ntg, mbpm, vsb,
+                  qreg, pf, hoist) -> str:
+    return ("lowreg%d_nsplit%d_geom%d_cl%d_ntg%d_mbpm%d_vsb%d_qreg%d_pf%d_hoist%d"
+            % (lowreg, static_nsplit, scored_geom, cluster_c, ntg, mbpm, vsb,
+               qreg, pf, hoist))
+
+
+def _compile_variant(dev, lowreg, static_nsplit, scored_geom, cluster_c=0, ntg=2,
                      mbpm=2, vsb=False, qreg=False, pf=None, hoist=None):
     if pf is None:
         pf = mbpm < 4
     if hoist is None:
         hoist = mbpm < 4
-    return cute.compile(
-        _msa_launch, *([Int64(0)] * 12), *([Int32(0)] * 18),
-        Float32(0.0), Float32(0.0), cuda_driver.CUstream(0),
-        lowreg=lowreg, static_nsplit=static_nsplit,
-        scored_geom=scored_geom, cluster_c=cluster_c, ntg=ntg, vsb=vsb,
-        # The L2 prefetch pays only where the grid, not the register file, is
-        # what limits the warps in flight.  A four-resident-CTA binary already
-        # has 13.8 warps/SM hiding its DRAM, sits exactly on the 128-register
-        # cliff, and streams a working set far larger than L2 -- there the
-        # prefetch's stream-coordinate arithmetic and extra live registers cost
-        # more than the latency it removes (measured b64 44 -> 48 us, b128
-        # 75 -> 84 us).  Two-resident-CTA binaries are grid-limited with 128
-        # spare registers and gain (b32 27 -> 24 us).
-        pf=pf, hoist=hoist, mbpm=mbpm, qreg=qreg,
+    arch = _dsl_arch(dev)
+
+    def compile_fn():
+        return cute.compile[(cute.GPUArch(arch), cute.EnableTVMFFI(True))](
+            _msa_launch, *([Int64(0)] * 12), *([Int32(0)] * 18),
+            Float32(0.0), Float32(0.0), cuda_driver.CUstream(0),
+            lowreg=lowreg, static_nsplit=static_nsplit,
+            scored_geom=scored_geom, cluster_c=cluster_c, ntg=ntg, vsb=vsb,
+            # The L2 prefetch pays only where the grid, not the register file,
+            # is what limits the warps in flight.  A four-resident-CTA binary
+            # already has 13.8 warps/SM hiding its DRAM, sits exactly on the
+            # 128-register cliff, and streams a working set far larger than L2
+            # -- there the prefetch's stream-coordinate arithmetic and extra
+            # live registers cost more than the latency it removes (measured
+            # b64 44 -> 48 us, b128 75 -> 84 us).  Two-resident-CTA binaries
+            # are grid-limited with 128 spare registers and gain (b32 27 -> 24
+            # us).
+            pf=pf, hoist=hoist, mbpm=mbpm, qreg=qreg,
+        )
+
+    # Hit: the exported object is JITLinked from disk in milliseconds.  Miss:
+    # `compile_fn` runs once, under a cross-process lock, and its result is
+    # both exported and returned.
+    return build_and_load_cute_dsl_kernel(
+        _CUTE_DSL_MODULE,
+        _variant_name(lowreg, static_nsplit, scored_geom, cluster_c, ntg, mbpm,
+                      vsb, qreg, pf, hoist),
+        compile_fn,
+        extra_key_files=(__file__,),
     )
 
 
@@ -2350,30 +2391,30 @@ _VARIANTS = (
     # 0 -- fully dynamic "generalized" instantiation.  UNREACHABLE by design:
     # it is the only one that publishes split-K partials through global memory,
     # and that publication is not correctly ordered (see the module docstring).
-    lambda: _compile_variant(False, 0, False),
+    lambda dev: _compile_variant(dev, False, 0, False),
     # 1 -- dynamic geometry, nsplit pinned to 1.  Correct, but untimed, and the
     # route serves every non-specialised geometry with its own kernel instead.
-    lambda: _compile_variant(True, 1, False, 0, 2, 4),
+    lambda dev: _compile_variant(dev, True, 1, False, 0, 2, 4),
     # 2 -- scored nsplit=2 on the 512-CTA tier.  UNREACHABLE: see _WIDE_K.
     # The 512-CTA tier must hold FOUR resident CTAs/SM (444 < 512 spills a
     # whole second wave), so it stays at 128 registers -- but it takes the
     # DIRECT V path anyway: NCU puts that tier at 73% L1/TEX against 23% DRAM
     # and 49% issue, and staging V costs a shared store plus an ldmatrix.trans
     # per token that register fragments do not.
-    lambda: _compile_variant(False, 2, True, 2, 2, 4, True),
+    lambda dev: _compile_variant(dev, False, 2, True, 2, 2, 4, True),
     # 3/4/5 -- scored split, 256-CTA tier, 32-token streaming chunks.
-    lambda: _compile_variant(False, 2, True, 2, WIDE_NTG, 2, qreg=True),
-    lambda: _compile_variant(False, 4, True, 4, WIDE_NTG, 2, qreg=True),
-    lambda: _compile_variant(False, 8, True, 8, WIDE_NTG, 2, qreg=True),
+    lambda dev: _compile_variant(dev, False, 2, True, 2, WIDE_NTG, 2, qreg=True),
+    lambda dev: _compile_variant(dev, False, 4, True, 4, WIDE_NTG, 2, qreg=True),
+    lambda dev: _compile_variant(dev, False, 8, True, 8, WIDE_NTG, 2, qreg=True),
     # 6 -- scored unsplit, narrow-chunk.  UNREACHABLE: the unsplit arm below
     # always selects 7.  Folding the geometry to constants frees the registers
     # the direct-V path needs to stay inside the 128-register / 4-CTA-per-SM
     # budget.
-    lambda: _compile_variant(False, 1, True, 0, 2, 4, True),
+    lambda dev: _compile_variant(dev, False, 1, True, 0, 2, 4, True),
     # 7 -- scored unsplit on the WIDE-CHUNK family: at 256 and 512 tiles the
     # two-resident-CTA binaries stream 32-token chunks, hold the invariant Q
     # A-fragments in registers, and pay no split partial at all.
-    lambda: _compile_variant(False, 1, True, 0, WIDE_NTG, 2, qreg=True),
+    lambda dev: _compile_variant(dev, False, 1, True, 0, WIDE_NTG, 2, qreg=True),
     # 8 -- scored THREE-way split, same 256-CTA / 32-token-streaming family as
     # 3/4/5.  It exists because the split count is ceil(256 / n_base) and
     # therefore takes every value in its range, not only the powers of two:
@@ -2386,7 +2427,7 @@ _VARIANTS = (
     # It serves the part of that range where its grid still fits one wave --
     # n_base 88..96, batch 22..24 -- and `_WAVE_CTAS` hands the rest to the
     # two-way split, which is 1.26x there while this one would be 0.83-0.94x.
-    lambda: _compile_variant(False, 3, True, 3, WIDE_NTG, 2, qreg=True),
+    lambda dev: _compile_variant(dev, False, 3, True, 3, WIDE_NTG, 2, qreg=True),
 )
 
 # The instantiations that are COMPILED, and therefore the only ones a call can
@@ -2435,12 +2476,17 @@ def _get_kernels(dev, _compiling_ok=False):
 
     The CALL path is lookup-only.  `_compiling_ok` is set only by warmup(),
     which the route's `warm` entry point invokes once per device.  A lookup
-    miss on the call path raises rather than
-    dropping a lazy `cute.compile` onto the caller's stream -- which, inside a
-    CUDA-graph capture, would break the capture.  The table is keyed on the
-    DEVICE and built under `_LOCK`: a table (and the per-kernel launch
-    attributes it carries) built against one GPU's context is never reused on
-    the second GPU in the process.
+    miss on the call path raises rather than dropping a build onto the
+    caller's stream -- which, inside a CUDA-graph capture, would break the
+    capture.  The table is keyed on the DEVICE and built under `_LOCK`: a
+    table (and the per-kernel launch attributes it carries) built against one
+    GPU's context is never reused on the second GPU in the process.
+
+    Each entry comes through the CuTe-DSL disk cache (`_compile_variant`), so
+    a warm cache makes this a reload of exported objects rather than a
+    compile, and a cold one compiles each instantiation once per machine
+    rather than once per process.  The build runs with `dev` current so the
+    cache's own arch detection agrees with the compile target.
     """
     got = _KERNELS.get(dev)
     if got is not None:
@@ -2452,11 +2498,12 @@ def _get_kernels(dev, _compiling_ok=False):
     with _LOCK:
         got = _KERNELS.get(dev)
         if got is None:
-            got = tuple(
-                _VARIANTS[idx]() if idx in SPECIALISED_KERNEL_IDS
-                else _NotCompiled(idx)
-                for idx in range(len(_VARIANTS))
-            )
+            with torch.cuda.device(dev):
+                got = tuple(
+                    _VARIANTS[idx](dev) if idx in SPECIALISED_KERNEL_IDS
+                    else _NotCompiled(idx)
+                    for idx in range(len(_VARIANTS))
+                )
             _KERNELS[dev] = got
     return got
 
