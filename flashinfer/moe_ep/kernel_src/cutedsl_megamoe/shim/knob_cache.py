@@ -310,6 +310,8 @@ def resolve_knobs(
     # ``mxfp8_e5m2`` are separate compiles); the profiles are per kernel.
     if dtype.startswith("bf16_mxfp8"):
         heuristic_dtype = "bf16_mxfp8"
+    elif dtype.startswith("bf16_nvfp4"):
+        heuristic_dtype = "bf16_nvfp4"
     elif dtype.startswith("mxfp8"):
         heuristic_dtype = "mxfp8"
     else:

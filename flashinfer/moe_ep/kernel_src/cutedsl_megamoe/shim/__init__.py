@@ -120,6 +120,16 @@ from .bf16_mxfp8 import (
     bf16_mxfp8_mega_launch_thunk,
     bf16_mxfp8_mega_moe,
 )
+from .bf16_nvfp4 import (
+    MegaMoEBf16Nvfp4Config,
+    MegaMoEBf16Nvfp4Frontend,
+    MegaMoEBf16Nvfp4Inputs,
+    MegaMoEBf16Nvfp4SymmBuffer,
+    bf16_nvfp4_mega_launch_thunk,
+    bf16_nvfp4_mega_moe,
+    create_dummy_inputs as create_dummy_bf16_nvfp4_inputs,
+    get_symm_buffer_for_bf16_nvfp4_mega_moe,
+)
 from .bf16 import (
     MegaMoEBf16Config,
     MegaMoEBf16Frontend,
@@ -145,9 +155,11 @@ from .tuner import (
 from .autotune import (
     autotune_bf16_mega_moe,
     autotune_bf16_mxfp8_mega_moe,
+    autotune_bf16_nvfp4_mega_moe,
     autotune_knobs,
     bf16_candidates,
     bf16_mxfp8_candidates,
+    bf16_nvfp4_candidates,
     autotune_mxfp8_mega_moe,
     autotune_nvfp4_mega_moe,
     mxfp8_candidates,
@@ -230,6 +242,15 @@ __all__ = [
     "get_symm_buffer_for_bf16_mxfp8_mega_moe",
     "bf16_mxfp8_mega_launch_thunk",
     "bf16_mxfp8_mega_moe",
+    # mixed NVFP4-weight/BF16-activation
+    "MegaMoEBf16Nvfp4Config",
+    "MegaMoEBf16Nvfp4Frontend",
+    "MegaMoEBf16Nvfp4Inputs",
+    "MegaMoEBf16Nvfp4SymmBuffer",
+    "create_dummy_bf16_nvfp4_inputs",
+    "get_symm_buffer_for_bf16_nvfp4_mega_moe",
+    "bf16_nvfp4_mega_launch_thunk",
+    "bf16_nvfp4_mega_moe",
     # bf16
     "MegaMoEBf16Config",
     "MegaMoEBf16Frontend",
@@ -251,9 +272,11 @@ __all__ = [
     "autotune_knobs",
     "autotune_bf16_mega_moe",
     "autotune_bf16_mxfp8_mega_moe",
+    "autotune_bf16_nvfp4_mega_moe",
     "autotune_mxfp8_mega_moe",
     "autotune_nvfp4_mega_moe",
     "bf16_mxfp8_candidates",
+    "bf16_nvfp4_candidates",
     "mxfp8_candidates",
     "nvfp4_candidates",
 ]

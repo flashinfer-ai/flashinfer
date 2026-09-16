@@ -235,6 +235,13 @@ class _SymBufferHostAdapter:
 
     def __init__(self, arg: SymBufferHost) -> None:
         self._arg = arg
+        rank_idx = int(arg.rank_idx)
+        num_max_ranks = int(arg.num_max_ranks)
+        if not 0 <= rank_idx < num_max_ranks:
+            raise ValueError(
+                f"rank_idx must be in [0, {num_max_ranks}), got "
+                f"{rank_idx}."
+            )
         if len(tuple(arg.offsets)) != int(arg.num_max_ranks):
             raise ValueError(
                 f"len(offsets)={len(tuple(arg.offsets))} must equal "

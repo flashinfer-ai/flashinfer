@@ -281,6 +281,25 @@ def validate_bf16_mxfp8_cutedsl_cuda() -> None:
     )
 
 
+def is_bf16_nvfp4_cutedsl_supported() -> bool:
+    """BF16xNVFP4 CuTeDSL mega kernels require the CUDA 13 toolkit."""
+    from flashinfer.jit.cpp_ext import get_cuda_version
+
+    return get_cuda_version().major >= 13
+
+
+def validate_bf16_nvfp4_cutedsl_cuda() -> None:
+    """Reject BF16xNVFP4 CuTeDSL mega kernels on pre-CUDA-13 toolchains."""
+    from flashinfer.jit.cpp_ext import get_cuda_version
+
+    if is_bf16_nvfp4_cutedsl_supported():
+        return
+    raise MoEEpConfigError(
+        "sm100_bf16_nvfp4_bf16_cutedsl requires CUDA 13+; "
+        f"current CUDA version is {get_cuda_version()}."
+    )
+
+
 def validate_mega_arch() -> None:
     import torch
 

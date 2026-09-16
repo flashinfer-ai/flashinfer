@@ -639,7 +639,12 @@ class MegaMoEBf16Tester(MegaMoETester):
 # =============================================================================
 
 
-def _build_arg_parser() -> argparse.ArgumentParser:
+def _build_arg_parser(
+    *,
+    kind_default: str = "bf16",
+    kind_choices=("bf16",),
+    kind_help: str = "Data element format for activations and weights.",
+) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="MegaMoE BF16 GLU multi-rank fused dispatch+fc12+combine runner",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -647,9 +652,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--kind",
         type=str,
-        default="bf16",
-        choices=["bf16"],
-        help="Data element format for activations and weights.",
+        default=kind_default,
+        choices=kind_choices,
+        help=kind_help,
     )
     parser.add_argument("--num_tokens_per_rank", type=int, default=128)
     parser.add_argument("--num_topk", type=int, default=4)

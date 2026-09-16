@@ -117,6 +117,7 @@ run_unit() {
     --ignore=tests/moe_ep/test_moe_ep_mxfp8_cutedsl_mega_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_bf16_cutedsl_mega_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_bf16_mxfp8_cutedsl_mega_multirank.py \
+    --ignore=tests/moe_ep/test_moe_ep_bf16_nvfp4_cutedsl_mega_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_megamoe_fc12_split_multirank.py \
     --ignore=tests/moe_ep/test_mega_native_topk_reduce_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_bf16_rank_major_cuda_multirank.py \
@@ -126,6 +127,7 @@ run_unit() {
     --ignore=tests/moe_ep/test_moe_ep_sm120_mxfp8_cutedsl_mega_multirank.py \
     --ignore=tests/moe_ep/test_mxfp8_cutedsl_preprocess_vs_reference.py \
     --ignore=tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py \
+    --ignore=tests/moe_ep/test_bf16_nvfp4_cutedsl_kernel_vs_reference.py \
     --ignore=tests/moe_ep/test_deep_gemm_mega_kernel_vs_reference.py \
     --ignore=tests/moe_ep/test_sm90_pull_fp8_kernel_vs_reference.py \
     --ignore=tests/moe_ep/test_split_fused_moe_kernel_vs_reference.py \
@@ -234,6 +236,7 @@ run_oracle() {
     "${MOE_EP_PYTEST_FLAGS[@]}" \
     tests/moe_ep/test_mxfp8_cutedsl_preprocess_vs_reference.py \
     tests/moe_ep/test_bf16_mxfp8_cutedsl_kernel_vs_reference.py \
+    tests/moe_ep/test_bf16_nvfp4_cutedsl_kernel_vs_reference.py \
     tests/moe_ep/test_bf16_cutedsl_kernel_vs_reference.py \
     tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py -v \
     -m arch_blackwell || rc=1
@@ -279,6 +282,7 @@ run_mega() {
     tests/moe_ep/test_moe_ep_bf16_cutedsl_mega_multirank.py \
     tests/moe_ep/test_moe_ep_mxfp8_cutedsl_mega_multirank.py \
     tests/moe_ep/test_moe_ep_bf16_mxfp8_cutedsl_mega_multirank.py \
+    tests/moe_ep/test_moe_ep_bf16_nvfp4_cutedsl_mega_multirank.py \
     tests/moe_ep/test_moe_ep_megamoe_fc12_split_multirank.py \
     tests/moe_ep/test_mega_native_topk_reduce_multirank.py -v \
     -m "gpu_4 and arch_blackwell" || rc=1
@@ -287,6 +291,7 @@ run_mega() {
     "${MOE_EP_PYTEST_FLAGS[@]}" \
     tests/moe_ep/test_mxfp8_cutedsl_preprocess_vs_reference.py \
     tests/moe_ep/test_bf16_mxfp8_cutedsl_kernel_vs_reference.py \
+    tests/moe_ep/test_bf16_nvfp4_cutedsl_kernel_vs_reference.py \
     tests/moe_ep/test_bf16_cutedsl_kernel_vs_reference.py \
     tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py -v \
     -m arch_blackwell || rc=1

@@ -48,6 +48,7 @@ def _single_rank_layer(backend_name: str, hidden: int = 2048, intermediate: int 
         MegaConfig,
         MoEEpMegaLayer,
         MoEWeightPack,
+        Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
         Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
         Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
     )
@@ -78,8 +79,12 @@ def _single_rank_layer(backend_name: str, hidden: int = 2048, intermediate: int 
         mk = Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
             intermediate_size=intermediate, top_k=topk, gate_up_clamp=10.0
         )
-    else:
+    elif backend_name == "mxfp8":
         mk = Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
+            intermediate_size=intermediate, top_k=topk, gate_up_clamp=10.0
+        )
+    else:
+        mk = Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
             intermediate_size=intermediate, top_k=topk, gate_up_clamp=10.0
         )
 
@@ -133,7 +138,7 @@ def _random_batch(problem: dict, *, seed: int, num_tokens: int = 32):
 
 
 @pytest.mark.arch_blackwell
-@pytest.mark.parametrize("backend_name", ["nvfp4", "mxfp8"])
+@pytest.mark.parametrize("backend_name", ["nvfp4", "mxfp8", "bf16_nvfp4"])
 @pytest.mark.parametrize(
     "hidden,intermediate",
     [

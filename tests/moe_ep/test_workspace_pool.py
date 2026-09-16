@@ -257,7 +257,8 @@ def test_two_nvfp4_layers_share_one_symm_buffer(monkeypatch):
 
 @cuda_13_required
 @pytest.mark.arch_blackwell
-def test_two_bf16_mxfp8_layers_share_one_symm_buffer(monkeypatch):
+@pytest.mark.parametrize("weight_kind", ["mxfp8", "nvfp4"])
+def test_two_bf16_mixed_layers_share_one_symm_buffer(monkeypatch, weight_kind):
     """Two same-geometry mixed layers share a workspace through destroy."""
     import torch
 
@@ -278,6 +279,7 @@ def test_two_bf16_mxfp8_layers_share_one_symm_buffer(monkeypatch):
         MoEEpTensors,
         MoEWeightPack,
         Sm100_Bf16_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
+        Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
     )
 
     monkeypatch.setenv("MEGA_NO_DIST", "1")
@@ -301,6 +303,11 @@ def test_two_bf16_mxfp8_layers_share_one_symm_buffer(monkeypatch):
             device="cuda",
             generator=generator,
         )
+        config_type = (
+            Sm100_Bf16_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
+            if weight_kind == "mxfp8"
+            else Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
+        )
         return MoEEpMegaLayer(
             bootstrap=BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False),
             fleet_params=FleetParams(
@@ -310,7 +317,7 @@ def test_two_bf16_mxfp8_layers_share_one_symm_buffer(monkeypatch):
             ),
             weights=MoEWeightPack(w13=w13, w2=w2),
             backend=MegaConfig(
-                megakernel=Sm100_Bf16_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
+                megakernel=config_type(
                     intermediate_size=intermediate,
                     top_k=topk,
                 ),

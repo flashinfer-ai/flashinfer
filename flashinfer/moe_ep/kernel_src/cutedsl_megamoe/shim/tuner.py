@@ -256,6 +256,13 @@ def _bf16_mxfp8_default_knobs(*, enable_in_kernel_fc2_reduce: bool) -> Dict[str,
     return knobs
 
 
+def _bf16_nvfp4_default_knobs(*, enable_in_kernel_fc2_reduce: bool) -> Dict[str, Any]:
+    """Default tuple for the NVFP4-weight/BF16-activation kernel."""
+    return _bf16_mxfp8_default_knobs(
+        enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce
+    )
+
+
 def default_knobs(
     num_tokens: int,
     *,
@@ -283,6 +290,10 @@ def default_knobs(
         return _bf16_mxfp8_default_knobs(
             enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce
         )
+    if dtype == "bf16_nvfp4":
+        return _bf16_nvfp4_default_knobs(
+            enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce
+        )
     if dtype == "mxfp8":
         return _mxfp8_default_knobs(
             num_tokens, enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce
@@ -295,7 +306,7 @@ def default_knobs(
         )
     raise ValueError(
         f"no knob profile for dtype {dtype!r}; expected 'nvfp4', 'mxfp8', "
-        "'bf16', or 'bf16_mxfp8'."
+        "'bf16', 'bf16_mxfp8', or 'bf16_nvfp4'."
     )
 
 
@@ -364,7 +375,29 @@ def is_valid_bf16_mxfp8(knobs: Dict[str, Any]) -> bool:
         Sm100SwapABMxfp8Bf16Fc12Kernel,
     )
 
-    _BF16_MXFP8_IMPLS = Sm100SwapABMxfp8Bf16Fc12Kernel._SupportedImplementationConfigs
+    impl = (
+        knobs.get("mma_tiler_mnk", (256, 128, 128)),
+        knobs.get("transform_buffer", "tmem"),
+        knobs.get("accumulator_overlap", False),
+        knobs.get("transform_k_tile", 128),
+    )
+    return (
+        impl in Sm100SwapABMxfp8Bf16Fc12Kernel._SupportedImplementationConfigs
+        and knobs.get("cluster_shape_mnk", (2, 1, 1)) == (2, 1, 1)
+        and knobs.get("use_2cta_instrs", True)
+        and knobs.get("token_back_mode", "epi_warps")
+        in ("epi_warps", "reuse_dispatch_warps")
+        and knobs.get("clc_bundle_size") is None
+        and is_valid({**knobs, "cluster_shape_mnk": (2, 1, 1)})
+    )
+
+
+def is_valid_bf16_nvfp4(knobs: Dict[str, Any]) -> bool:
+    """Validate tuples accepted by mixed NVFP4/BF16 MegaMoE."""
+
+    from ..src.moe_nvfp4_bf16_glu.kernel_nvfp4_bf16_glu_fc12 import (
+        Sm100SwapABNvfp4Bf16Fc12Kernel,
+    )
 
     impl = (
         knobs.get("mma_tiler_mnk", (256, 128, 128)),
@@ -373,7 +406,7 @@ def is_valid_bf16_mxfp8(knobs: Dict[str, Any]) -> bool:
         knobs.get("transform_k_tile", 128),
     )
     return (
-        impl in _BF16_MXFP8_IMPLS
+        impl in Sm100SwapABNvfp4Bf16Fc12Kernel._SupportedImplementationConfigs
         and knobs.get("cluster_shape_mnk", (2, 1, 1)) == (2, 1, 1)
         and knobs.get("use_2cta_instrs", True)
         and knobs.get("token_back_mode", "epi_warps")
@@ -435,6 +468,13 @@ def is_valid_bf16_for_config(config: Any, knobs: Dict[str, Any]) -> bool:
 def is_valid_bf16_mxfp8_for_config(config: Any, knobs: Dict[str, Any]) -> bool:
     """Validate mixed BF16/MXFP8 knobs against a session's IKR permission."""
     return _ikr_knob_permitted(config, knobs) and is_valid_bf16_mxfp8(
+        _effective_knobs(config, knobs)
+    )
+
+
+def is_valid_bf16_nvfp4_for_config(config: Any, knobs: Dict[str, Any]) -> bool:
+    """Validate mixed BF16/NVFP4 knobs against a session's IKR permission."""
+    return _ikr_knob_permitted(config, knobs) and is_valid_bf16_nvfp4(
         _effective_knobs(config, knobs)
     )
 

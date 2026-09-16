@@ -58,6 +58,7 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
             "bf16",
             "bf16_mxfp8_e4m3",
             "bf16_mxfp8_e5m2",
+            "bf16_nvfp4",
         ),
         default="nvfp4",
     )
@@ -154,6 +155,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
     elif args.dtype.startswith("bf16_mxfp8"):
         from .backends.mega.kernel.sm100.bf16_mxfp8_bf16_cutedsl.tuner import (
+            run_tuning,
+        )
+    elif args.dtype == "bf16_nvfp4":
+        from .backends.mega.kernel.sm100.bf16_nvfp4_bf16_cutedsl.tuner import (
             run_tuning,
         )
     else:

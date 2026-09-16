@@ -8,15 +8,19 @@ replace, what to audit) lives in `SKILL.md`.
 
 - **Repo**: <https://gitlab-master.nvidia.com/bangyus/cutedsl_megamoe>
   (NVIDIA-internal GitLab; see `ACKNOWLEDGEMENT.md` for authors/contacts).
-- **Vendored commit**: not recorded — the current `src/` drop was taken
+- **Vendored commit**: the original full `src/` drop is not recorded — it was taken
   2026-07-13, before this VENDOR.md existed (it landed in flashinfer via
   PR #3980). The next full re-sync MUST pin the upstream SHA here. Until
   then the only pinned points are the two files synced ahead of the drop
   (see pending diffs below, `50117315d`).
 - **Last synced**: 2026-07-13 (full drop); 2026-08-10 partial re-sync of
-  `inputs_process.py` + `host_utils.py` (see pending diffs).
-- **Vendored subset**: the four kernel packages only (`common/`, `src/`,
-  `moe_mxfp8_glu/`, `moe_nvfp4_swapab/`) under `src/` — no repo scaffolding
+  `inputs_process.py` + `host_utils.py`; 2026-09-16 addition of
+  `moe_nvfp4_bf16_glu/` from dastokes commit
+  `d7b3a3d3ab6d29745f9ae321cd07ff81448df1c8` plus its three shared-file
+  prerequisites (see pending diffs).
+- **Vendored subset**: the kernel packages only (`common/`, `src/`,
+  `moe_bf16_glu/`, `moe_mxfp8_glu/`, `moe_nvfp4_bf16_glu/`,
+  `moe_nvfp4_swapab/`) under `src/` — no repo scaffolding
   (`ci/`, `tester/`, `tests/`, `scripts/`, `pyproject.toml`, …).
 
 ## Policy
@@ -30,6 +34,14 @@ replace, what to audit) lives in `SKILL.md`.
   absorbs it.
 
 ## Pending local diffs vs upstream
+
+- `src/moe_nvfp4_bf16_glu/` is a verbatim package copy from dastokes commit
+  `d7b3a3d3ab6d29745f9ae321cd07ff81448df1c8` (2026-09-11). Its required
+  shared changes were applied to `src/src/sym_buffer.py`,
+  `src/moe_bf16_glu/mega_runner.py`, and
+  `src/moe_bf16_glu/mega_reference_bf16.py` while preserving FlashInfer's
+  newer local formatting and compatibility fixes. Reconcile those files when
+  the branch lands in the kernel-team upstream.
 
 - `src/src/inputs_process.py` is synced **ahead** of the recorded drop, to
   upstream commit `50117315dbcd2ffb1e8c1c4dab4be9b42cad24ab`
@@ -74,3 +86,4 @@ replace, what to audit) lives in `SKILL.md`.
 
 - `backends/mega/kernel/sm100/nvfp4_nvfp4_bf16_cutedsl/`
 - `backends/mega/kernel/sm100/mxfp8_mxfp8_bf16_cutedsl/`
+- `backends/mega/kernel/sm100/bf16_nvfp4_bf16_cutedsl/`

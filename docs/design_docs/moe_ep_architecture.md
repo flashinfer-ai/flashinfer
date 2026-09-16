@@ -31,6 +31,7 @@ owns dispatch, expert compute, and combine; output is always BF16
 |---|---|---|---|---|---|
 | `sm100_nvfp4_nvfp4_bf16_cutedsl` (`nvfp4_cutedsl`) | NVFP4 (block-16) | NVFP4 (block-16) | BF16 | SM100 family | `knobs=None` → token-count heuristic; `knobs=dict` → pinned; `knobs="auto"` → collective compile+time sweep at first forward (never in serving); winners cacheable via `FLASHINFER_MOE_EP_KNOB_CACHE` |
 | `sm100_mxfp8_mxfp8_bf16_cutedsl` (`mxfp8_cutedsl`) | MXFP8 (block-32 UE8M0) | MXFP8 (block-32 UE8M0) | BF16 | SM100 family | same `knobs` surface as the NVFP4 backend |
+| `sm100_bf16_nvfp4_bf16_cutedsl` | BF16 | NVFP4 (block-16, E4M3 scales) | BF16 | SM100 family | three supported implementation tuples; heuristic, pinned, and collective auto-tuned knobs |
 | `sm100_fp8_fp4_bf16_deepgemm` (`deep_gemm_mega`) | FP8 (E4M3, block-32 UE8M0) | FP4 (int8-packed, block-32) | BF16 | SM100 family | — (DeepGEMM selects its own JIT configs internally) |
 | `sm90_fp8_fp8_bf16_pull_cutedsl` (`sm90_pull_fp8`) | FP8 (E4M3/E5M2; per-tensor or DeepGEMM-style blockwise scales) | FP8 (same `fp8_scale_mode`) | BF16 | SM90 exactly | explicit geometry knobs on the config (`swap_ab`, `mma_tiler_mnk`); no tuner/knob-cache yet |
 | `sm90_fp8_fp8_bf16_push_cuda` (`sm90_push_fp8`) | FP8 (E4M3) | FP8 (E4M3) | BF16 | SM90 | — (static dimensions/protocol choices only) |
@@ -191,10 +192,10 @@ moe_ep/
   core/comm, core/kernel, core/runtime, core/validation, core/bootstrap_utils.py
   backends/split/comm/{nccl_ep,nixl_ep}
   backends/split/kernel/{identity,fused_moe}
-  backends/mega/kernel/sm100/{bf16_bf16_bf16_cutedsl,nvfp4_nvfp4_bf16_cutedsl,mxfp8_mxfp8_bf16_cutedsl,fp8_fp4_bf16_deepgemm}
+  backends/mega/kernel/sm100/{bf16_bf16_bf16_cutedsl,bf16_nvfp4_bf16_cutedsl,nvfp4_nvfp4_bf16_cutedsl,mxfp8_mxfp8_bf16_cutedsl,fp8_fp4_bf16_deepgemm}
   backends/mega/kernel/sm90/{fp8_fp8_bf16_pull_cutedsl,fp8_fp8_bf16_push_cuda}
   kernel_src/cutedsl_megamoe/  ← Blackwell CuTeDSL kernel src (kernel team) + FI shim
-    src/                       ← VERBATIM kernel team drop (common, moe_bf16_glu, moe_nvfp4_swapab, moe_mxfp8_glu, src)
+    src/                       ← kernel team drop (common, moe_bf16_glu, moe_nvfp4_bf16_glu, moe_nvfp4_swapab, moe_mxfp8_glu, src)
     __init__.py                ← public API consumed by the sm100 cutedsl backends
     shim/                      ← thin adapters over src/ (_paths, comm, bf16, nvfp4, mxfp8, kernel_helpers, correctness, autotune, tuner)
     SKILL.md                   ← how to resync src/ when kernel team drops a new version
@@ -324,6 +325,7 @@ classDiagram
 | Mega kernel | `sm100_fp8_fp4_bf16_deepgemm` | `Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig` — FP8/FP4, sm_100+ |
 | Mega kernel | `sm100_nvfp4_nvfp4_bf16_cutedsl` | `Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig` — NVFP4, sm_100+ |
 | Mega kernel | `sm100_mxfp8_mxfp8_bf16_cutedsl` | `Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig` — MXFP8 (`kind` e4m3/e5m2), sm_100+ |
+| Mega kernel | `sm100_bf16_nvfp4_bf16_cutedsl` | `Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig` — BF16 activations, NVFP4 weights, sm_100+ |
 
 **Mega weights:** with `preprocess_weights=True` (default), canonical bf16 or pre-quantized `MoEWeightPack` is transformed at init. With `preprocess_weights=False`, supply `MegaConfig.transformed_weights` (from `preprocess_*_mega_weights`).
 
@@ -336,7 +338,7 @@ Both paths call `ensure_moe_ep_cuda_device()` at init. With `auto_bootstrap=True
 | Requirement | Used by |
 |-------------|---------|
 | `torch_dist` | split comm, all mega kernels |
-| `nvshmem` | `sm100_nvfp4_nvfp4_bf16_cutedsl`, `sm100_mxfp8_mxfp8_bf16_cutedsl` (skip with `MEGA_NO_DIST=1`) |
+| `nvshmem` | all SM100 CuTeDSL mega kernels, including `sm100_bf16_nvfp4_bf16_cutedsl` (skip with `MEGA_NO_DIST=1`) |
 
 **Host framework bootstrap (e.g. vLLM):** when the host already initialized `torch.distributed` and EP uses a subgroup, pass `BootstrapConfig(process_group=ep_group, world_size=ep_size, rank=ep_rank, auto_bootstrap=False)` and call `bootstrap_moe_ep_runtime(bootstrap, reqs)` once per worker after dist init. Mega kernels resolve comm via `bootstrap_comm_group` / `bootstrap_ep_rank_world` (`MegaKernelBackend.bind_ep_bootstrap`).
 
@@ -485,6 +487,7 @@ unless noted):
 | mega deep_gemm (fp8_fp4) | 2026-07-31 | same run + variant job (multirank oracle) |
 | mega sm100_nvfp4_nvfp4_bf16_cutedsl (default, ikr, nvfp4/mxfp8 combine wires) | 2026-07-31 | 4x GB200 variant job |
 | mega sm100_mxfp8_mxfp8_bf16_cutedsl (default, ikr) | 2026-07-31 | 4x GB200 variant job |
+| mega sm100_bf16_nvfp4_bf16_cutedsl (default, ikr) | 2026-09-16 | 4x B200 layer parity + multi-rank torch oracle; single-rank kernel oracle |
 | mega sm90_fp8_fp8_bf16_pull_cutedsl (per_tensor/blockwise × swap_ab) | 2026-07-30 | Hopper, when landed (commit 7169aca9); not runnable on the SM100 cluster |
 
 ## Forward flow

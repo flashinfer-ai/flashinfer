@@ -9,6 +9,7 @@ kernel_src/cutedsl_megamoe/
 │   ├── src/                ← CuTeDSL core src (bootstrap, dispatch, sym_buffer, …)
 │   ├── moe_mxfp8_glu/      ← MXFP8 kernel implementation
 │   ├── moe_bf16_glu/       ← BF16 kernel implementation
+│   ├── moe_nvfp4_bf16_glu/ ← NVFP4-weight/BF16-activation implementation
 │   └── moe_nvfp4_swapab/   ← NVFP4 kernel implementation
 ├── __init__.py             ← public API for moe_ep; talks ONLY to shim/ (our code)
 ├── shim/                   ← thin adapters over src/ (our code) — ALL adaptation lives here
@@ -61,11 +62,11 @@ constants/helpers are eager; the `mega_runner`/`mega_reference` helpers pull
 
 ## When the kernel team drops a new version of src/
 
-1. **Replace `src/` verbatim** with the drop's five kernel packages — no injected
-   files, no edits (the drop is a full repo; copy only these four dirs):
+1. **Replace `src/` verbatim** with the drop's kernel packages — no injected
+   files, no edits (the drop is a full repo; copy only these dirs):
    ```bash
-   rm -rf flashinfer/moe_ep/kernel_src/cutedsl_megamoe/src/{common,src,moe_bf16_glu,moe_mxfp8_glu,moe_nvfp4_swapab}
-   cp -r <new_drop>/{common,src,moe_bf16_glu,moe_mxfp8_glu,moe_nvfp4_swapab} \
+   rm -rf flashinfer/moe_ep/kernel_src/cutedsl_megamoe/src/{common,src,moe_bf16_glu,moe_mxfp8_glu,moe_nvfp4_bf16_glu,moe_nvfp4_swapab}
+   cp -r <new_drop>/{common,src,moe_bf16_glu,moe_mxfp8_glu,moe_nvfp4_bf16_glu,moe_nvfp4_swapab} \
        flashinfer/moe_ep/kernel_src/cutedsl_megamoe/src/
    ```
    Do NOT copy the drop's repo scaffolding (`ci/`, `tester/`, `tests/`, `scripts/`,
@@ -100,6 +101,7 @@ constants/helpers are eager; the `mega_runner`/`mega_reference` helpers pull
    | `from moe_nvfp4_swapab.epilogue_refactor import SwapABSwigluFp4Epilogue` | `src/moe_nvfp4_swapab/epilogue_refactor.py` |
    | `from moe_mxfp8_glu.megamoe_kernel_mxfp8 import Sm100MegaMoEMxfp8Kernel` | `src/moe_mxfp8_glu/megamoe_kernel_mxfp8.py` |
    | `from moe_bf16_glu.megamoe_kernel_bf16 import Sm100MegaMoEBf16Kernel` (lazy, `shim/bf16.py`) | `src/moe_bf16_glu/megamoe_kernel_bf16.py` |
+   | `from moe_nvfp4_bf16_glu.megamoe_kernel_nvfp4_bf16 import Sm100MegaMoENvfp4Bf16Kernel` (lazy, `shim/bf16_nvfp4.py`) | `src/moe_nvfp4_bf16_glu/megamoe_kernel_nvfp4_bf16.py` |
    | `from src.sym_buffer import SymBufferHost` | `src/src/sym_buffer.py` |
    | `from src.bootstrap import finalize_dist_and_nvshmem` | `src/src/bootstrap.py` |
 
@@ -121,6 +123,8 @@ constants/helpers are eager; the `mega_runner`/`mega_reference` helpers pull
        tests/moe_ep/test_moe_ep_nvfp4_cutedsl_mega_multirank.py \
        tests/moe_ep/test_moe_ep_mxfp8_cutedsl_mega_multirank.py \
        tests/moe_ep/test_mxfp8_cutedsl_preprocess_vs_reference.py \
+       tests/moe_ep/test_moe_ep_bf16_nvfp4_cutedsl_mega_multirank.py \
+       tests/moe_ep/test_bf16_nvfp4_cutedsl_kernel_vs_reference.py \
        -x -v
    ```
 

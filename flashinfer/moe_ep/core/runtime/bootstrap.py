@@ -310,6 +310,13 @@ def bf16_mxfp8_cutedsl_runtime_requirements(
     return cutedsl_runtime_requirements(bootstrap)
 
 
+def bf16_nvfp4_cutedsl_runtime_requirements(
+    bootstrap: BootstrapConfig,
+) -> FrozenSet[str]:
+    """Runtime needs for the CuTeDSL mixed NVFP4/BF16 mega kernel."""
+    return cutedsl_runtime_requirements(bootstrap)
+
+
 def bf16_cutedsl_runtime_requirements(bootstrap: BootstrapConfig) -> FrozenSet[str]:
     """Runtime needs for the CuTeDSL BF16 mega kernel."""
     return cutedsl_runtime_requirements(bootstrap)
@@ -342,6 +349,7 @@ __all__ = [
     "finalize_moe_ep_runtime",
     "bf16_cutedsl_runtime_requirements",
     "bf16_mxfp8_cutedsl_runtime_requirements",
+    "bf16_nvfp4_cutedsl_runtime_requirements",
     "mxfp8_cutedsl_runtime_requirements",
     "nvfp4_cutedsl_runtime_requirements",
     "sm90_pull_fp8_runtime_requirements",

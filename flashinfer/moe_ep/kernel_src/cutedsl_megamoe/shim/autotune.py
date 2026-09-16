@@ -204,6 +204,21 @@ def bf16_mxfp8_candidates(
     return out
 
 
+def bf16_nvfp4_candidates(
+    *, enable_in_kernel_fc2_reduce: bool = False
+) -> List[Dict[str, Any]]:
+    """Candidate space for the mixed NVFP4/BF16 kernel."""
+    from .tuner import is_valid_bf16_nvfp4
+
+    return [
+        knobs
+        for knobs in bf16_mxfp8_candidates(
+            enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce
+        )
+        if is_valid_bf16_nvfp4(knobs)
+    ]
+
+
 def _session_candidates(
     candidates: List[Dict[str, Any]],
     config: Any,
@@ -617,14 +632,83 @@ def autotune_bf16_mxfp8_mega_moe(
     )
 
 
+def autotune_bf16_nvfp4_mega_moe(
+    y: torch.Tensor,
+    transformed_l1: Any,
+    transformed_l2: Any,
+    symm_buffer: Any,
+    *,
+    num_tokens: Optional[int] = None,
+    gate_up_clamp: Optional[float] = None,
+    candidates: Optional[List[Dict[str, Any]]] = None,
+    warmup_iters: int = 3,
+    timed_iters: int = 10,
+) -> Dict[str, Any]:
+    """Autotune the BF16×NVFP4 MegaMoE session on staged inputs."""
+    from .bf16_nvfp4 import bf16_nvfp4_mega_moe
+    from .tuner import is_valid_bf16_nvfp4_for_config
+
+    def launch() -> None:
+        bf16_nvfp4_mega_moe(
+            y,
+            transformed_l1,
+            transformed_l2,
+            symm_buffer,
+            num_tokens=num_tokens,
+            gate_up_clamp=gate_up_clamp,
+            sync=True,
+        )
+
+    cfg = symm_buffer._frontend.config
+    if candidates is None:
+        candidates = bf16_nvfp4_candidates(
+            enable_in_kernel_fc2_reduce=cfg.enable_in_kernel_fc2_reduce
+        )
+    candidates = _session_candidates(
+        candidates,
+        cfg,
+        is_valid_bf16_nvfp4_for_config,
+        what="mixed BF16/NVFP4 MegaMoE",
+    )
+
+    def _record(winner: Dict[str, Any], p50_s: float) -> None:
+        if cfg.rank == 0:
+            from .knob_cache import record_knobs
+
+            record_knobs(
+                winner,
+                dtype=cfg.kind,
+                world_size=cfg.world_size,
+                hidden=cfg.hidden,
+                intermediate=cfg.intermediate,
+                num_experts=cfg.num_total_experts,
+                topk=cfg.num_topk,
+                max_tokens=cfg.num_tokens_per_rank,
+                p50_us=p50_s * 1e6,
+                source="autotune",
+            )
+
+    return autotune_knobs(
+        symm_buffer._frontend,
+        launch,
+        candidates,
+        label="bf16_nvfp4_mega",
+        warmup_iters=warmup_iters,
+        timed_iters=timed_iters,
+        on_winner=_record,
+    )
+
+
 __all__ = [
     "autotune_knobs",
     "autotune_bf16_mega_moe",
     "autotune_bf16_mxfp8_mega_moe",
+    "autotune_bf16_nvfp4_mega_moe",
     "autotune_mxfp8_mega_moe",
     "autotune_nvfp4_mega_moe",
     "bf16_candidates",
     "bf16_mxfp8_candidates",
+    "bf16_nvfp4_candidates",
     "mxfp8_candidates",
     "nvfp4_candidates",
 ]

@@ -40,6 +40,8 @@ def reference_expert_fc12(
     gate_up_clamp: Optional[float],
     topk_weights: Optional[torch.Tensor],
     ref_compute_graph: Literal["transformers", "deepgemm"],
+    fc1_alpha: Optional[torch.Tensor] = None,
+    fc2_alpha: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Single-expert fused fc1+fc2 BF16 reference.
 
@@ -56,6 +58,8 @@ def reference_expert_fc12(
     """
     intermediate_downproj = intermediate // 2
     fc1_fp32 = ref_mm(a=act, b=fc1_weight, n=intermediate, k=hidden)
+    if fc1_alpha is not None:
+        fc1_fp32 *= fc1_alpha
 
     swiglu = swiglu_fold_interleave(
         fc1_fp32,
@@ -69,6 +73,8 @@ def reference_expert_fc12(
     fc1_bf16 = swiglu.to(torch.bfloat16)
 
     fc2_fp32 = ref_mm(a=fc1_bf16, b=fc2_weight, n=hidden, k=intermediate_downproj)
+    if fc2_alpha is not None:
+        fc2_fp32 *= fc2_alpha
     return fc2_fp32, fc1_bf16, fc1_fp32
 
 
@@ -84,6 +90,8 @@ def compute_megamoe_reference(
     apply_topk_in_fc1: bool = False,
     return_fc1_gateup: bool = False,
     gate_up_interleave: int = Fc1GateUpInterleave,
+    fc1_alpha: Optional[torch.Tensor] = None,
+    fc2_alpha: Optional[torch.Tensor] = None,
 ):
     """Return the per-topk combine reference for the multi-rank MegaMoE path.
 
@@ -198,6 +206,16 @@ def compute_megamoe_reference(
             gate_up_clamp=gate_up_clamp,
             topk_weights=gathered_topk_weights,
             ref_compute_graph=expert_graph,
+            fc1_alpha=(
+                None
+                if fc1_alpha is None
+                else fc1_alpha[target_rank, local_expert]
+            ),
+            fc2_alpha=(
+                None
+                if fc2_alpha is None
+                else fc2_alpha[target_rank, local_expert]
+            ),
         )
 
         if return_fc1_gateup:

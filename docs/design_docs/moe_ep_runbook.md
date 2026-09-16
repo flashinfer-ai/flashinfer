@@ -527,7 +527,8 @@ A mega kernel owns fused comm + local MoE. To wire a new one, add a subpackage
 under `flashinfer/moe_ep/backends/mega/kernel/sm<arch>/<act>_<weight>_<out>_<style>/`. Kernel-team drops are
 vendored per architecture under `flashinfer/moe_ep/kernel_src/<arch>/`:
 
-- `kernel_src/cutedsl_megamoe/` — Blackwell (NVFP4 + MXFP8 kernels)
+- `kernel_src/cutedsl_megamoe/` — Blackwell (NVFP4, MXFP8, BF16, and mixed
+  BF16-activation/NVFP4-weight kernels)
 - `kernel_src/sm90/pull_style_cutedsl_megakernel/` — Hopper pull-style FP8
   (a fork of the same kernel repo)
 - `kernel_src/sm90/push_style_megamoe/` — Hopper push-style FP8 (raw CUDA,
@@ -541,8 +542,11 @@ trees duplicate the shared kernel-repo runtime (`common`, `src`, …) at their
 own drop revision and are **process-exclusive** — the top-level kernel module
 names collide, so each tree's `shim/_paths.py` refuses to bootstrap when the
 sibling tree's modules are already imported (a process runs on one
-architecture anyway). Use the existing `sm100_mxfp8_mxfp8_bf16_cutedsl` backend as the
-reference template.
+architecture anyway). Use the existing `sm100_mxfp8_mxfp8_bf16_cutedsl` or
+`sm100_bf16_nvfp4_bf16_cutedsl` backend as the reference template. The latter
+demonstrates shared BF16 staging and NVFP4 weight preprocessing. Its standalone
+FC12 kernel is already vendored, so a split-path wrapper does not require a
+second source import.
 
 ### 1. Kernel + frontend (the "backend config" it links to)
 
