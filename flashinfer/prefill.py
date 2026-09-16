@@ -4428,7 +4428,6 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             if self._cute_dsl_use_fmha:
                 # Wrapper-owned buffers (populated above): stable addresses
                 # for CUDA-graph mode, single normalized copy otherwise.
-                q_lens = self._qo_indptr_buf[1:] - self._qo_indptr_buf[:-1]
                 k_lens = self._kv_indptr_buf[1:] - self._kv_indptr_buf[:-1]
                 # Snapshot host-side seq-lens at plan time so run() can pass
                 # them into trtllm_ragged_attention_deepseek without touching
@@ -4442,8 +4441,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     "q_seq_lens_cpu": q_lens_cpu,
                     "kv_seq_lens_cpu": k_lens_cpu,
                     "batch_size": qo_indptr.shape[0] - 1,
-                    "max_q_len": int(q_lens.max().item()),
-                    "max_kv_len": int(k_lens.max().item()),
+                    "max_q_len": max_qo_len,
+                    "max_kv_len": max_seq_in_batch,
                     "sm_scale": _sm_scale,
                     "causal": causal,
                     "window_left": window_left,

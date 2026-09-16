@@ -99,6 +99,9 @@ def main():
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    for name in ("batch_size", "kv_len", "page_size", "iterations"):
+        if getattr(args, name) <= 0:
+            parser.error(f"--{name.replace('_', '-')} must be strictly positive")
     source_root = Path(__file__).resolve().parents[1]
     if not Path(flashinfer.__file__).resolve().is_relative_to(source_root):
         raise RuntimeError(
