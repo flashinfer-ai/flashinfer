@@ -22,7 +22,7 @@ def _sm121_tactic(m, n, k, compute_capability):
     if compute_capability == (12, 1) and (m, n, k) == (256, 896, 1024):
         return ("cooperative", 128, 64, 256)
     if compute_capability == (12, 1) and (m, n, k) == (1024, 1024, 7168):
-        return ("b12x", 64, 128, 128)
+        return ("cooperative", 256, 128, 128)
     if compute_capability == (12, 1) and (m, n, k) == (64, 896, 5120):
         return ("b12x", 64, 64, 256)
     if compute_capability == (12, 1) and (m, n, k) == (512, 8192, 2048):
@@ -174,6 +174,11 @@ def compatible(m, n, k, tactic, *, compute_capability=None):
             compute_capability == (12, 1)
             and (m, n, k) == (512, 8192, 28672)
             and tactic == ("cooperative", 128, 128, 256)
+        )
+        or (
+            compute_capability == (12, 1)
+            and (m, n, k) == (1024, 1024, 7168)
+            and tactic == ("b12x", 64, 128, 128)
         )
         or (
             compute_capability == (12, 1)

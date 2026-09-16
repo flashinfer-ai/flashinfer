@@ -301,7 +301,7 @@ def test_sm121_defaults_preserve_other_devices_and_unmeasured_shapes():
         ((1024, 896, 1024), ("raw", 32, 64, 13, True, True)),
         ((512, 7168, 5120), ("raw", 64, 32, 8, False, True)),
         ((256, 7168, 4608), ("b12x", 64, 128, 256)),
-        ((1024, 1024, 7168), ("b12x", 64, 128, 128)),
+        ((1024, 1024, 7168), ("cooperative", 256, 128, 128)),
         ((64, 896, 5120), ("b12x", 64, 64, 256)),
         ((64, 512, 7168), ("b12x", 64, 64, 256)),
         ((512, 5120, 640), ("cooperative", 128, 128, 128)),
@@ -366,6 +366,13 @@ def test_sm121_defaults_preserve_other_devices_and_unmeasured_shapes():
             preferred == ("cooperative", 128, 128, 128) and shape[0] == 2000
         ) or shape == (512, 8192, 28672):
             previous = ("cooperative", 128, 128, 256)
+            assert policy.compatible(*shape, previous, compute_capability=(12, 1))
+            assert previous not in policy.valid_tactics(
+                *shape, compute_capability=(12, 1)
+            )
+            assert not policy.compatible(*shape, previous, compute_capability=(12, 0))
+        if shape == (1024, 1024, 7168):
+            previous = ("b12x", 64, 128, 128)
             assert policy.compatible(*shape, previous, compute_capability=(12, 1))
             assert previous not in policy.valid_tactics(
                 *shape, compute_capability=(12, 1)
@@ -745,6 +752,8 @@ def test_sm121_measured_default_public_graph_and_cached_choice(m, n, k, monkeypa
             legacy_choices.append(("cooperative", 128, 128, 256))
         if (m, n, k) == (1024, 512, 7168):
             legacy_choices.append(("cooperative", 128, 64, 256))
+        if (m, n, k) == (1024, 1024, 7168):
+            legacy_choices.append(("b12x", 64, 128, 128))
         for legacy in legacy_choices:
             winners[key] = (legacy, None)
             _assert_bits(
