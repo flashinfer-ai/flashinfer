@@ -1,5 +1,11 @@
 # Cake DeepSeek V4 sparse MLA
 
+Current support covers SM100 and SM103. The complete current 94-case tables, comparisons, runtime and hardware evidence are in the [current SM100](https://github.com/flashinfer-ai/flashinfer/pull/4573#current-sm100-validation) and [current SM103](https://github.com/flashinfer-ai/flashinfer/pull/4573#current-sm103-validation) PR sections.
+
+## Historical SM103 implementation and validation
+
+The original implementation details and acceptance values below remain historical evidence; the [unchanged historical 94-case table](https://github.com/flashinfer-ai/flashinfer/pull/4573#historical-sm103-94-case-performance) remains in the PR body.
+
 Select the Cake backend through the existing public API:
 
 ```python
