@@ -248,6 +248,34 @@ def _assert_device_plan_covers_requests(plan, seq_lens):
         assert reserved == 0
 
 
+def _modeled_emitted_makespan(plan: BalancedMLADecodePlan, cost: BalancedCostModel):
+    descriptors = plan.work_descriptors[: plan.last_descriptor_count].cpu().tolist()
+    offsets = plan.partition_offsets.cpu().tolist()
+    additive_combine = bool(cost.reducer_fixed_cost or cost.reducer_piece_cost)
+    max_pieces = 0
+    loads = []
+    for partition in range(plan.num_partitions):
+        load = 0
+        for _request, start, end, split_info in descriptors[
+            offsets[partition] : offsets[partition + 1]
+        ]:
+            is_split = split_info & 1
+            pieces = (split_info >> 13) & 0x7F if is_split else 1
+            max_pieces = max(max_pieces, pieces)
+            blocks = end - start
+            charged_blocks = (
+                (blocks + plan.num_insts_kv - 1) // plan.num_insts_kv
+            ) * plan.num_insts_kv
+            load += cost.fixed_piece_cost + charged_blocks * cost.cost_per_k_tile
+            if is_split and not additive_combine:
+                load += cost.split_piece_cost + cost.split_fixed_cost // pieces
+        loads.append(load)
+    makespan = max(loads, default=0)
+    if additive_combine and max_pieces >= 2:
+        makespan += cost.reducer_fixed_cost + cost.reducer_piece_cost * max_pieces
+    return makespan
+
+
 @pytest.mark.parametrize(
     "batch_size,num_partitions,expected",
     [
@@ -435,6 +463,37 @@ def test_cuda_scheduler_splits_on_complete_cta_work_units(scheduler):
         [0, 8, 9],
     ]
     _assert_device_plan_covers_requests(plan, [9 * 128])
+
+
+@_REQUIRES_CUDA_SCHEDULER
+@pytest.mark.parametrize("scheduler", ("exact", "optimized"))
+@pytest.mark.parametrize("num_insts_kv", (1, 2))
+@pytest.mark.parametrize(
+    "cost",
+    (
+        BalancedCostModel(1000, 7000, 11000, 13000),
+        BalancedCostModel(1000, 7000, 0, 0, 19000, 1700),
+    ),
+)
+def test_cuda_scheduler_reports_emitted_modeled_makespan(scheduler, num_insts_kv, cost):
+    seq_lens = [131072, 65536, 32768, 8192, 1024, 256, 0]
+    plan = BalancedMLADecodePlan(
+        batch_size=len(seq_lens),
+        num_partitions=8,
+        device=torch.device("cuda"),
+        num_insts_kv=num_insts_kv,
+        cost=BalancedCostModel(1000, 0),
+        evaluation_cost=cost,
+        max_seq_len=max(seq_lens),
+    )
+
+    plan.schedule_device(
+        torch.tensor(seq_lens, dtype=torch.int32, device="cuda"),
+        scheduler=scheduler,
+        estimate_cost=True,
+    )
+
+    assert plan.last_predicted_cost == _modeled_emitted_makespan(plan, cost)
 
 
 @_REQUIRES_CUDA_SCHEDULER

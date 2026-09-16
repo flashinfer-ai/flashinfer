@@ -338,6 +338,7 @@ __global__ void balancedSchedPrepareKernel(BalancedSchedDeviceParams p) {
   __shared__ int32_t warpInvalid[8];
   if (threadIdx.x == 0) {
     *p.numCombineDescriptorsDevicePtr = 0;
+    if (p.computePredictedCost) *p.predictedCostDevicePtr = 0;
     ws.state->activeCount = 0;
     ws.state->totalBlocks = 0;
     ws.state->maxBlocks = 0;
@@ -651,6 +652,7 @@ __global__ void balancedSchedFoldPrepareScoreKernel(BalancedSchedDeviceParams p)
       p.planMetadataDevicePtr[index] = 0;
     if (threadIdx.x == 0) {
       *p.numCombineDescriptorsDevicePtr = 0;
+      if (p.computePredictedCost) *p.predictedCostDevicePtr = 0;
       p.planMetadataDevicePtr[static_cast<int32_t>(BalancedSchedMetadata::kCostBucket)] = -1;
     }
   }
@@ -1145,6 +1147,38 @@ __global__ void balancedSchedFoldEmitKernel(BalancedSchedDeviceParams p) {
     __syncthreads();
   }
 
+  // Family selection evaluates the final emitted placement with a separate physical-cost model.
+  // This must not feed back into target selection or rank/fold placement: the production bucket
+  // models above remain authoritative for constructing each family's schedule.
+  if (p.computePredictedCost) {
+    for (int32_t pid = threadIdx.x; pid < P; pid += blockDim.x) ws.run[pid] = 0;
+    __syncthreads();
+    DeviceCost const evaluationCost =
+        p.useEvaluationCostModel ? loadCost(p.evaluationCostModelPtr, 0) : cm;
+    bool const evaluationUsesAdditiveCombine =
+        evaluationCost.comb0 != 0 || evaluationCost.comb1 != 0;
+    for (int32_t chunkIdx = threadIdx.x; chunkIdx < descriptorCount; chunkIdx += blockDim.x) {
+      DeviceChunk const chunk = ws.chunks[chunkIdx];
+      int64_t const cost = pieceCost(chunk.endBlock - chunk.startBlock,
+                                     !evaluationUsesAdditiveCombine && chunk.isSplit != 0,
+                                     chunk.numPieces, evaluationCost, p.tilesPerWorkUnit);
+      atomicAdd(reinterpret_cast<unsigned long long*>(ws.run + chunk.partitionIdx),
+                static_cast<unsigned long long>(cost));
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      int64_t makespan = 0;
+      int32_t maxPieces = 0;
+      for (int32_t pid = 0; pid < P; ++pid)
+        if (ws.run[pid] > makespan) makespan = ws.run[pid];
+      for (int32_t req = 0; req < N; ++req)
+        if (ws.piecesPerRequest[req] > maxPieces) maxPieces = ws.piecesPerRequest[req];
+      *p.predictedCostDevicePtr =
+          makespan + (evaluationUsesAdditiveCombine ? combineCost(maxPieces, evaluationCost) : 0);
+    }
+    __syncthreads();
+  }
+
   if (P <= blockDim.x) {
     int32_t const count = threadIdx.x < P ? ws.partitionCounts[threadIdx.x] : 0;
     int32_t const offset = blockExclusiveScanI32(count, scanScratch);
@@ -1314,6 +1348,35 @@ __global__ void balancedSchedEmitKernel(BalancedSchedDeviceParams p) {
       }
       __syncwarp();
     }
+  }
+
+  if (p.computePredictedCost) {
+    for (int32_t pid = threadIdx.x; pid < P; pid += warpSize) ws.run[pid] = 0;
+    __syncwarp();
+    DeviceCost const evaluationCost =
+        p.useEvaluationCostModel ? loadCost(p.evaluationCostModelPtr, 0) : cm;
+    bool const evaluationUsesAdditiveCombine =
+        evaluationCost.comb0 != 0 || evaluationCost.comb1 != 0;
+    for (int32_t chunkIdx = threadIdx.x; chunkIdx < chunkWrite; chunkIdx += warpSize) {
+      DeviceChunk const chunk = ws.chunks[chunkIdx];
+      int64_t const cost = pieceCost(chunk.endBlock - chunk.startBlock,
+                                     !evaluationUsesAdditiveCombine && chunk.isSplit != 0,
+                                     chunk.numPieces, evaluationCost, p.tilesPerWorkUnit);
+      atomicAdd(reinterpret_cast<unsigned long long*>(ws.run + chunk.partitionIdx),
+                static_cast<unsigned long long>(cost));
+    }
+    __syncwarp();
+    if (threadIdx.x == 0) {
+      int64_t makespan = 0;
+      int32_t maxPieces = 0;
+      for (int32_t pid = 0; pid < P; ++pid)
+        if (ws.run[pid] > makespan) makespan = ws.run[pid];
+      for (int32_t req = 0; req < N; ++req)
+        if (ws.piecesPerRequest[req] > maxPieces) maxPieces = ws.piecesPerRequest[req];
+      *p.predictedCostDevicePtr =
+          makespan + (evaluationUsesAdditiveCombine ? combineCost(maxPieces, evaluationCost) : 0);
+    }
+    __syncwarp();
   }
 
   if (threadIdx.x == 0) {
