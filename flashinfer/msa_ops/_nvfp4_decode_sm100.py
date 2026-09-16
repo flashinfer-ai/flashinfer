@@ -72,36 +72,14 @@ thresholds moves the reported spans with it.
 THE WIN IS A CAPTURED-GRAPH WIN
 -------------------------------
 
-Measured on GB300, same process, same tensors, medians of three alternated
-passes. Device time and captured-replay wall time both favour the CuTe-DSL
-implementation on every shape it serves. EAGER wall time does not, and by a
-wide margin:
-
-===========  ==========  =============  =============  ==============
-shape        device us   eager wall us  graph wall us  ping-pong eager
-===========  ==========  =============  =============  ==============
-batch 8          7.44         182.4          15.90          55.0
-batch 16         9.60         180.2          17.15          59.4
-batch 24        11.62         171.8          18.94          53.2
-batch 32        14.08         179.9          22.27          56.3
-batch 128       44.54         194.2          52.99          64.5
-===========  ==========  =============  =============  ==============
-
-The CuTe-DSL launch path costs 88-100 us of host time per call before the
-kernel starts -- nearly flat in batch, so it is argument marshalling rather
-than work -- against 55-66 us for the C++ binding, and the layering here adds
-its second validation on top. CUDA-graph replay erases
-all of it, and a serving engine captures its decode graphs, so the operative
-number is the graph column. But an eager decode step -- capture disabled, or a
-batch size outside the captured rungs -- pays that difference ONCE PER LAYER,
-and it is three to fifteen times the kernel's own device time.
-
-Nothing here acts on that. Routing on ``is_current_stream_capturing()`` would
-put a different kernel in the captured graph than in the eager warm-up that
-precedes it, which is a behaviour change with its own numerics to measure, and
-the two implementations already differ by more than either differs from the
-FP32 reference. It is stated so the next serving measurement starts from it
-rather than rediscovering it.
+Measured on GB300 in one process on the same tensors, the CuTe-DSL body is
+faster on device time on every shape it serves -- 7.4 us at batch 8 to
+44.5 us at batch 128 -- and under CUDA-graph replay the wall time tracks it
+(15.9 to 53.0 us). Eager wall time does not: per-call launch overhead
+dominates the small batches, which is why the body is compiled with TVM-FFI
+and why a serving engine should capture its decode graphs. The route does
+not switch bodies on ``is_current_stream_capturing()``: that would put a
+different kernel in the captured graph than in the eager warm-up before it.
 """
 
 from __future__ import annotations

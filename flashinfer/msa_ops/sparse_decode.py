@@ -242,13 +242,13 @@ def msa_sparse_decode_attention(
     return_softmax_lse : bool
         If ``True``, also return per-query log-sum-exp values.
     k_scale, v_scale : torch.Tensor, optional
-        NVFP4 only: e4m3 block scales as uint8 bytes in the swizzled 128x4
-        layout produced by :func:`flashinfer.nvfp4_quantize` (one scale per
-        16 elements, rows padded to a multiple of 128). Scale rows follow the
-        cache layout: ``(token, head)`` order for flat K/V, ``(page, head,
-        token)`` for paged. SM120/SM121-only.
-        On compute capability 10.0/10.3 the paged NVFP4 decode route instead
-        takes the block-scale regions of the packed page as
+        NVFP4 only: e4m3 block scales, one per 16 elements. The layout is
+        per architecture. On SM120/SM121 they are uint8 bytes in the swizzled
+        128x4 layout produced by :func:`flashinfer.nvfp4_quantize` (rows
+        padded to a multiple of 128), with scale rows following the cache
+        layout: ``(token, head)`` order for flat K/V, ``(page, head, token)``
+        for paged. On compute capability 10.0/10.3 the paged NVFP4 decode
+        route takes the block-scale regions of the packed page as
         ``(num_pages, num_kv_heads, page_size, head_dim // 16)`` views, either
         uint8 or float8_e4m3fn: K scales linear, V scales ``(4, 4)``-swizzled
         inside ``(token, scale index)``.

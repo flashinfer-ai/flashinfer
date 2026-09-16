@@ -22,7 +22,7 @@ import math
 import os
 import threading
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, Optional, cast
+from typing import TYPE_CHECKING, Optional, Tuple, cast
 
 import torch
 
@@ -2040,8 +2040,13 @@ def _try_nvfp4_prefill(
     v_global_scale,
     q_offset,
     workspace: Optional[MSASparseAttentionWorkspace],
-) -> Optional[torch.Tensor]:
-    """Serve NVFP4 paged K/V prefill, or return ``None`` to fall through.
+) -> Tuple[Optional[torch.Tensor], Optional[str]]:
+    """Serve NVFP4 paged K/V prefill, or decline with a reason.
+
+    Returns ``(output, None)`` when the route served the call and
+    ``(None, reason)`` when it did not; the caller falls through on the
+    latter and carries ``reason`` into the error it raises if nothing else
+    can serve the call either.
 
     Compute capability 10.0/10.3 has no NVFP4 MSA prefill route otherwise: the
     checks below this call reject packed uint8 K/V and tensor K/V scales
@@ -2555,8 +2560,13 @@ def _try_nvfp4_decode(
     force_fused,
     workspace: Optional[MSASparseAttentionWorkspace],
     out: Optional[torch.Tensor] = None,
-) -> Optional[torch.Tensor]:
-    """Serve NVFP4 paged K/V decode, or return ``None`` to fall through.
+) -> Tuple[Optional[torch.Tensor], Optional[str]]:
+    """Serve NVFP4 paged K/V decode, or decline with a reason.
+
+    Returns ``(output, None)`` when the route served the call and
+    ``(None, reason)`` when it did not; the caller falls through on the
+    latter and carries ``reason`` into the error it raises if nothing else
+    can serve the call either.
 
     Compute capability 10.0/10.3 has no NVFP4 MSA route otherwise: the checks
     below this call reject packed uint8 K/V and tensor K/V scales outright, and
