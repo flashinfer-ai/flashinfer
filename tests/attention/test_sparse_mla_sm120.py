@@ -4474,7 +4474,8 @@ def test_sparse_mla_sm120_profile_cuda_graph(monkeypatch) -> None:
     sm_scale = d_qk**-0.5
 
     dev_key = cpb_mod._device_key(device)
-    monkeypatch.setattr(cpb_mod, "_maybe_load_disk", lambda: None)
+    monkeypatch.setattr(cpb_mod, "refresh_store", lambda: None)
+    monkeypatch.setattr(cpb_mod, "get_ordinary_profile", lambda *args: None)
 
     from flashinfer.mla._sparse_mla_sm120 import _prepared as prepared
 
@@ -4682,7 +4683,8 @@ def test_sparse_mla_sm120_runner_internal_scratch_cuda_graph(monkeypatch) -> Non
 
     # Pin the uncalibrated decode-first policy.
     dev_key = cpb_mod._device_key(device)
-    monkeypatch.setattr(cpb_mod, "_maybe_load_disk", lambda: None)
+    monkeypatch.setattr(cpb_mod, "refresh_store", lambda: None)
+    monkeypatch.setattr(cpb_mod, "get_ordinary_profile", lambda *args: None)
     monkeypatch.delitem(cpb_mod._crossover, dev_key, raising=False)
     monkeypatch.setattr(cpb_mod, "_constants_version", cpb_mod._constants_version + 1)
 

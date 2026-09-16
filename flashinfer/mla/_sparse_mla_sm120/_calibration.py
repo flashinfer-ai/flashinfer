@@ -1374,10 +1374,6 @@ def refresh_store() -> None:
         _materialize_store(state)
 
 
-def _maybe_load_disk() -> None:
-    refresh_store()
-
-
 def get_constants(device: torch.device, family: str) -> Optional[CpbConstants]:
     with _store_lock:
         refresh_store()
@@ -1521,8 +1517,6 @@ def _store_projection(family: str, section: str):
         return {
             "crossover": _crossover,
             "overrides": _cpb_overrides,
-            "failed": _failed,
-            "cross_failed": _crossover_failed,
         }[section]
 
 

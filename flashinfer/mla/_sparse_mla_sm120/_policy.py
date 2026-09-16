@@ -265,6 +265,8 @@ def _lazy_calibrated_profile(request, device) -> Optional[dict]:
         profile = _cpb.get_ordinary_profile(request, device)
         if profile is not None:
             return profile
+        if _cpb.is_calibration_failed(device, request.key):
+            return None
         _calibrating.add(guard_key)
         try:
             result = _cpb._calibrate_ordinary(request, device, False)

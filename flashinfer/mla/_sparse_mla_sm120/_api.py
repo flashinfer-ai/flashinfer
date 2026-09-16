@@ -645,6 +645,8 @@ def _sparse_mla_sm120_paged_attention(
 ) -> None:
     r"""Internal Sparse-MLA paged attention on SM120.
 
+    Empty-KV output/LSE and sink semantics follow :meth:`SparseMLASm120Wrapper.run`.
+
     Routes decode-form calls (``num_tokens <= 64``) to decode or prefill per
     the configuration profile, and larger calls to prefill. Mutates
     ``output`` and ``out_lse`` in place. Shares prepared metadata plans with
@@ -797,8 +799,10 @@ class _SparseMLAPagedAttentionRunner:
     captured metadata shape first. Calls sharing wrapper-owned scratch must not
     execute concurrently on different streams.
     Eager tuning may replace a shape's plan and resources when the profile
-    changes; recapture graphs after such a change. The wrapper does not own
-    graph objects or maintain historical profile resources.
+    changes; recapture graphs after such a change. Calibration-store updates
+    from another process can also change plan workspace on the next eager call
+    and require recapture. The wrapper does not own graph objects or maintain
+    historical profile resources.
 
     Parameters
     ----------
@@ -831,9 +835,11 @@ class _SparseMLAPagedAttentionRunner:
         and DSV4 NVFP4 cache routes. Explicit DSV4.1 FP8 uses decode where eligible
         (T<=64, H=1..128), otherwise the existing FP8 prefill (H=8/16/32/64,
         main topk multiple of 64). Without a matching DSV4.1 profile the
-        decode-first policy uses CPB=1, isolated from legacy calibration. Exact
-        profiles select same-precision phase/CPB by an exact refined entry when
-        tuning measured one, else the next larger token bucket.
+        explicit-precision decode-first policy uses CPB=1, isolated from legacy
+        calibration; DSV4.1 default precision instead uses the C++ CPB heuristic
+        when no profile exists. Exact profiles select same-precision phase/CPB
+        by an exact refined entry when tuning measured one, else the next larger
+        token bucket.
         FP8 prefill indices must be contiguous;
         independent page sizes and pitched cache/LSE buffers are supported.
         Full BF16 uses decode at T<=64 and direct prefill at larger T, retaining
@@ -1065,13 +1071,17 @@ def sparse_mla_sm120_decode_dsv3_2(
 ) -> torch.Tensor:
     """Sparse-MLA paged decode (DSv3.2 / GLM-NSA kernel) on SM120.
 
+    Empty-KV output/LSE and sink semantics follow :meth:`SparseMLASm120Wrapper.run`.
+
     Positive runtime page sizes, aligned page gaps and pitched index rows are
     supported. Contiguous scratch uses head capacity 8 for H=8, otherwise
     ceil(H/16)*16, and allocated (not active) split stride.
 
-    An explicit ``chunks_per_block`` is used directly. Otherwise a matching
-    configuration profile supplies decode CPB, even if its bucket prefers
-    prefill. Missing profiles use analytical constants or the C++ heuristic.
+    Explicit ``chunks_per_block`` values in ``[1, num_chunks]`` are honored;
+    out-of-range values silently select the C++ wave heuristic, affecting only
+    performance. When omitted, a matching configuration profile supplies decode
+    CPB, even if its bucket prefers prefill. Missing profiles use analytical
+    constants or the C++ heuristic.
     This helper remains decode-only. DSv3.2 and GLM-NSA share analytical
     constants, but their measured profiles remain separate.
     """
@@ -1152,8 +1162,12 @@ def sparse_mla_sm120_decode_dsv4(
 ) -> torch.Tensor:
     r"""Sparse-MLA paged decode (DSv4 standalone kernel) on SM120.
 
-    This helper stays decode-only. An explicit ``chunks_per_block`` is used
-    directly; otherwise a matching configuration profile supplies decode CPB,
+    Empty-KV output/LSE and sink semantics follow :meth:`SparseMLASm120Wrapper.run`.
+
+    This helper stays decode-only. Explicit ``chunks_per_block`` values in
+    ``[1, num_chunks]`` are honored; out-of-range values silently select the C++
+    wave heuristic, affecting only performance. When omitted, a matching
+    configuration profile supplies decode CPB,
     even when that bucket selects prefill for ordinary attention. A missing
     profile uses analytical constants when available, then the C++ heuristic.
     Default calls reuse the shared prepared execution boundary.

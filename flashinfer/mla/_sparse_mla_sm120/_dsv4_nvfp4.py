@@ -390,7 +390,10 @@ def _nvfp4_sparse_mla_decode(
     chunks_per_block_override: int = 0,
     stage1_only: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return final output and LSE from DeepSeek-V4 NVFP4 sparse-MLA decode."""
+    """Return final output and LSE from DeepSeek-V4 NVFP4 sparse-MLA decode.
+
+    Empty-KV output/LSE and sink semantics follow :meth:`SparseMLASm120Wrapper.run`.
+    """
     if stage1_only:
         raise ValueError(
             "stage1_only does not produce final output; use the low-level FFI "
@@ -458,7 +461,10 @@ def _nvfp4_sparse_mla_prefill(
     extra_indices: torch.Tensor | None = None,
     extra_topk_length: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run the single-launch streaming DeepSeek-V4 NVFP4 prefill kernel."""
+    """Run the single-launch streaming DeepSeek-V4 NVFP4 prefill kernel.
+
+    Empty-KV output/LSE and sink semantics follow :meth:`SparseMLASm120Wrapper.run`.
+    """
     if q.ndim != 3 or q.shape[-1] != dsv4_nvfp4_format_info()["query_dim"]:
         raise ValueError(
             f"q must be [T, H, {dsv4_nvfp4_format_info()['query_dim']}], got {tuple(q.shape)}"

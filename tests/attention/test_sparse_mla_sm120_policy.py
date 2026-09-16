@@ -671,7 +671,7 @@ def known_crossover(monkeypatch):
     monkeypatch.setattr(plan_mod, "format_info", lambda model: {"page_size": 64})
     table = {}
     monkeypatch.setattr(cpb_mod, "_device_key", lambda device: "0:Fake GPU")
-    monkeypatch.setattr(cpb_mod, "_maybe_load_disk", lambda: None)
+    monkeypatch.setattr(cpb_mod, "refresh_store", lambda: None)
     monkeypatch.setattr(cpb_mod, "get_constants", lambda device, family: None)
     monkeypatch.setattr(
         cpb_mod,
@@ -1422,7 +1422,7 @@ def planner_state(monkeypatch):
     )
     profiles: dict[str, dict] = {}
     monkeypatch.setattr(cpb_mod, "_device_key", lambda _device: "0:Fake SM120")
-    monkeypatch.setattr(cpb_mod, "_maybe_load_disk", lambda: None)
+    monkeypatch.setattr(cpb_mod, "refresh_store", lambda: None)
     monkeypatch.setattr(cpb_mod, "get_profile", lambda key, _device: profiles.get(key))
     monkeypatch.setattr(cpb_mod, "_refine_failed", set())
     monkeypatch.setattr(native_policy, "_maybe_calibrate", lambda **_kwargs: None)

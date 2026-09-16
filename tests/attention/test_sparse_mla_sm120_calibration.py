@@ -2182,6 +2182,72 @@ def test_profile_selection_refines_exact_tokens_in_tuning(
     assert policy.profile_selection(m._replace(tokens=65), store, "fp8").variant == 1
 
 
+@pytest.mark.parametrize("native_route", [False, True])
+def test_lazy_calibration_waiter_observes_failure(store, monkeypatch, native_route):
+    import threading
+    from flashinfer.mla._sparse_mla_sm120 import _policy as policy
+
+    owner = native if native_route else policy
+    barrier = threading.Barrier(2)
+    lock = threading.RLock()
+
+    class QueuedLock:
+        def __enter__(self):
+            barrier.wait(timeout=10)
+            lock.acquire()
+
+        def __exit__(self, *args):
+            lock.release()
+
+    monkeypatch.setattr(owner, "_calibration_lock", QueuedLock())
+    monkeypatch.setattr(owner, "_calibrating", set())
+    monkeypatch.setattr(cpb_mod, "_target_capturing", lambda device: False)
+    monkeypatch.setattr(
+        owner.AutoTuner,
+        "get",
+        lambda: SimpleNamespace(is_tuning_mode=True, _get_skip_ops_stack=lambda: []),
+    )
+    request = cpb_mod._OrdinaryRequest(16, 128, "fp8", family="dsv4_1")
+    key = "native-test" if native_route else request.key
+    calls = []
+
+    def fail(*args, **kwargs):
+        calls.append(key)
+        cpb_mod.mark_calibration_failed(store, key)
+        if native_route:
+            raise cpb_mod.CalibrationError("measurement failed")
+        return {"status": "failed"}
+
+    if native_route:
+        monkeypatch.setattr(native, "calibrate_nvfp4_sparse_mla_sm120", fail)
+
+        def call():
+            native._maybe_calibrate(
+                device=store,
+                key=key,
+                num_heads=16,
+                topk=128,
+                primary_page_size=64,
+                extra_topk=0,
+                extra_page_size=0,
+                has_topk_length=False,
+                has_extra_topk_length=False,
+                has_attn_sink=False,
+            )
+    else:
+        monkeypatch.setattr(cpb_mod, "_calibrate_ordinary", fail)
+
+        def call():
+            policy._lazy_calibrated_profile(request, store)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(call) for _ in range(2)]
+        for future in futures:
+            future.result(timeout=15)
+    assert calls == [key]
+    assert cpb_mod.is_calibration_failed(store, key)
+
+
 def test_profile_selection_lazy_calibration_reentry_guard(
     store, monkeypatch, ordinary_format_facts
 ):

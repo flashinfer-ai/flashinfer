@@ -257,7 +257,9 @@ def _maybe_calibrate(
         scope = _cpb._active_scope
     guard_key = (scope, _cpb._device_key(device), key)
     with _calibration_lock:
-        if _cpb.get_profile(key, device) is not None:
+        if _cpb.get_profile(key, device) is not None or _cpb.is_calibration_failed(
+            device, key
+        ):
             return
         if guard_key in _calibrating:
             return
