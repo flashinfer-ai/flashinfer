@@ -405,7 +405,7 @@ setup_sccache test-prefix "{tmp_path}"
 test "${{SCCACHE_CLIENT_SIDE}}" = 1
 test "${{FLASHINFER_CXX_LAUNCHER}}" = sccache
 test "${{FLASHINFER_NVCC_LAUNCHER}}" = \
-  "timeout --verbose --signal=TERM --kill-after=2m 30m sccache"
+  "timeout --verbose --signal=TERM --kill-after=2m 90m sccache"
 """
 
     subprocess.run(["bash", "-c", script], check=True)
