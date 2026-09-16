@@ -35,12 +35,12 @@ namespace flashinfer::sparse_mla_sm120::nvfp4 {
 
 namespace {
 
-template <int NUM_HEADS, int TOPK, int PAGE_SIZE, bool DUAL_CACHE>
+template <int NUM_HEADS, int PAGE_SIZE, bool DUAL_CACHE>
 void launch_decode(const bf16* q, const uint8_t* cache, const int32_t* indices, bf16* mid_out,
                    float* mid_lse, bf16* output, float* out_lse, const int* topk_length,
                    const float* attn_sink, const uint8_t* extra_cache, const int32_t* extra_indices,
                    const int* extra_topk_length, int extra_topk, int extra_page_size,
-                   size_t extra_page_stride, int num_tokens, int num_splits,
+                   size_t extra_page_stride, int num_tokens, int topk, int num_splits,
                    int chunks_per_block_override, float sm_scale, size_t page_stride,
                    bool stage1_only, cudaStream_t stream) {
   constexpr bool CAN_GROUP_HEADS = NUM_HEADS >= STREAMING_HEADS_PER_CTA;
@@ -91,27 +91,27 @@ void launch_decode(const bf16* q, const uint8_t* cache, const int32_t* indices, 
     if (use_grouped) {
       constexpr size_t DYN_SMEM_BYTES = StreamingNVFP4Smem::SIZE;
       auto grouped_kernel =
-          sparse_mla_streaming_dsv4_nvfp4_kernel<NUM_HEADS, TOPK, PAGE_SIZE, DUAL_CACHE>;
+          sparse_mla_streaming_dsv4_nvfp4_kernel<NUM_HEADS, PAGE_SIZE, DUAL_CACHE>;
       NVFP4_CUDA_CHECK(cudaFuncSetAttribute(
           grouped_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, DYN_SMEM_BYTES));
       grouped_kernel<<<dim3(num_tokens, GROUPED_H_BLOCKS, active_splits),
                        dim3(STREAMING_BLOCK_THREADS), DYN_SMEM_BYTES, stream>>>(
           q, cache, indices, output, out_lse, mid_out, mid_lse, attn_sink, topk_length, extra_cache,
           extra_indices, extra_topk_length, extra_topk, extra_page_size, extra_page_stride,
-          num_tokens, active_splits, chunks_per_block, sm_scale, page_stride, write_direct);
+          num_tokens, topk, active_splits, chunks_per_block, sm_scale, page_stride, write_direct);
     }
   }
   if (!use_grouped) {
     constexpr size_t DYN_SMEM_BYTES = DecodeNVFP4Smem<ModelType::DSV4>::SIZE;
-    auto kernel = sparse_mla_decode_dsv4_nvfp4_kernel<ModelType::DSV4, NUM_HEADS, TOPK, PAGE_SIZE,
-                                                      DUAL_CACHE>;
+    auto kernel =
+        sparse_mla_decode_dsv4_nvfp4_kernel<ModelType::DSV4, NUM_HEADS, PAGE_SIZE, DUAL_CACHE>;
     NVFP4_CUDA_CHECK(
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, DYN_SMEM_BYTES));
     kernel<<<dim3(num_tokens, UNGROUPED_H_BLOCKS, active_splits), dim3(DECODE_BLOCK_THREADS),
              DYN_SMEM_BYTES, stream>>>(
         q, cache, indices, mid_out, mid_lse, output, out_lse, attn_sink, topk_length, extra_cache,
         extra_indices, extra_topk_length, extra_topk, extra_page_size, extra_page_stride,
-        num_tokens, active_splits, chunks_per_block, sm_scale, page_stride, write_direct);
+        num_tokens, topk, active_splits, chunks_per_block, sm_scale, page_stride, write_direct);
   }
   NVFP4_CUDA_CHECK(cudaGetLastError());
 
@@ -275,43 +275,40 @@ void SparseMlaSm120NVFP4Decode(TensorView q, TensorView kv_cache, TensorView ind
 
   ffi::CUDADeviceGuard device_guard(q.device().device_id);
   cudaStream_t stream = get_stream(q.device());
-#define DISPATCH_NVFP4_DECODE(H, K)                                                                \
-  if (num_heads == (H) && topk == (K)) {                                                           \
+
+#define DISPATCH_NVFP4_DECODE(H)                                                                   \
+  if (num_heads == (H)) {                                                                          \
     if (has_extra) {                                                                               \
-      launch_decode<(H), (K), 64, true>(                                                           \
+      launch_decode<(H), 64, true>(                                                                \
           static_cast<const bf16*>(q.data_ptr()),                                                  \
           static_cast<const uint8_t*>(kv_cache.data_ptr()),                                        \
           static_cast<const int32_t*>(indices.data_ptr()), static_cast<bf16*>(mid_out.data_ptr()), \
           static_cast<float*>(mid_lse.data_ptr()), static_cast<bf16*>(output.data_ptr()),          \
           static_cast<float*>(out_lse.data_ptr()), topk_length_ptr, attn_sink_ptr,                 \
           extra_cache_ptr, extra_indices_ptr, extra_topk_length_ptr, extra_topk,                   \
-          extra_layout.page_size, extra_layout.page_stride_bytes, num_tokens,                      \
+          extra_layout.page_size, extra_layout.page_stride_bytes, num_tokens, topk,                \
           static_cast<int>(num_splits), static_cast<int>(chunks_per_block_override),               \
           static_cast<float>(sm_scale), layout.page_stride_bytes, stage1_only, stream);            \
     } else {                                                                                       \
-      launch_decode<(H), (K), 64, false>(                                                          \
+      launch_decode<(H), 64, false>(                                                               \
           static_cast<const bf16*>(q.data_ptr()),                                                  \
           static_cast<const uint8_t*>(kv_cache.data_ptr()),                                        \
           static_cast<const int32_t*>(indices.data_ptr()), static_cast<bf16*>(mid_out.data_ptr()), \
           static_cast<float*>(mid_lse.data_ptr()), static_cast<bf16*>(output.data_ptr()),          \
           static_cast<float*>(out_lse.data_ptr()), topk_length_ptr, attn_sink_ptr, nullptr,        \
-          nullptr, nullptr, 0, 0, 0, num_tokens, static_cast<int>(num_splits),                     \
+          nullptr, nullptr, 0, 0, 0, num_tokens, topk, static_cast<int>(num_splits),               \
           static_cast<int>(chunks_per_block_override), static_cast<float>(sm_scale),               \
           layout.page_stride_bytes, stage1_only, stream);                                          \
     }                                                                                              \
     return;                                                                                        \
   }
-  DISPATCH_NVFP4_DECODE(16, 128)
-  DISPATCH_NVFP4_DECODE(16, 512)
-  DISPATCH_NVFP4_DECODE(32, 128)
-  DISPATCH_NVFP4_DECODE(32, 512)
-  DISPATCH_NVFP4_DECODE(64, 128)
-  DISPATCH_NVFP4_DECODE(64, 512)
-  DISPATCH_NVFP4_DECODE(128, 128)
-  DISPATCH_NVFP4_DECODE(128, 512)
+  DISPATCH_NVFP4_DECODE(16)
+  DISPATCH_NVFP4_DECODE(32)
+  DISPATCH_NVFP4_DECODE(64)
+  DISPATCH_NVFP4_DECODE(128)
 #undef DISPATCH_NVFP4_DECODE
-  TVM_FFI_ICHECK(false) << "unsupported initial NVFP4 decode shape: heads=" << num_heads
-                        << ", topk=" << topk;
+  TVM_FFI_ICHECK(false) << "unsupported NVFP4 decode head count: heads=" << num_heads
+                        << " (supported: 16, 32, 64, 128)";
 }
 
 }  // namespace flashinfer::sparse_mla_sm120::nvfp4
