@@ -28,11 +28,11 @@ from flashinfer.attention.prims_ts import decode, mla_decode
 
 
 _APIS = (
-    (decode, "batch_decode_with_paged_kv_cache", "_batch_decode_with_workspace"),
+    (decode, "batch_decode_with_paged_kv_cache", "BatchDecodePagedTSWrapper"),
     (
         mla_decode,
         "batch_mla_decode_with_paged_kv_cache",
-        "_batch_mla_decode_with_workspace",
+        "BatchMLADecodePagedTSWrapper",
     ),
 )
 _GPU = pytest.mark.skipif(
@@ -41,45 +41,179 @@ _GPU = pytest.mark.skipif(
 )
 
 
-@pytest.mark.parametrize("module,name,helper", _APIS)
-def test_explicit_dispatch_preserves_live_tensors(monkeypatch, module, name, helper):
-    """Trusted routing does not plan, infer lengths, or copy request metadata."""
+@pytest.mark.parametrize("module,name,wrapper_name", _APIS)
+@pytest.mark.parametrize("mode", ["owned", "validated_external", "trusted_external"])
+def test_explicit_dispatch_preserves_live_tensors(
+    monkeypatch, module, name, wrapper_name, mode
+):
+    """Owned and external scratch both reach the same wrapper plan/run path."""
     seen = {}
     sentinel = object()
 
-    def launch(*args, **kwargs):
-        seen.update(args=args, kwargs=kwargs)
-        return sentinel
+    class Wrapper:
+        def __init__(self, **kwargs):
+            pass
 
-    monkeypatch.setattr(module, helper, launch)
+        def plan(self, *args, **kwargs):
+            seen["plan_args"], seen["plan_kwargs"] = args, kwargs
+
+        def run(self, *args, **kwargs):
+            seen["run_args"], seen["run_kwargs"] = args, kwargs
+            return sentinel
+
+    monkeypatch.setattr(module, wrapper_name, Wrapper)
     api = inspect.unwrap(getattr(module, name))
-    query, cache, tables, lengths, workspace, output, offsets = (
-        object() for _ in range(7)
+    query = torch.empty((4, 8, 64 if module is decode else 576))
+    cache = (
+        (torch.empty((2, 1, 32, 64)),) * 2
+        if module is decode
+        else torch.empty((2, 32, 576))
     )
+    tables = torch.zeros((2, 48), dtype=torch.int32)
+    lengths = torch.ones(2, dtype=torch.int32)
+    workspace = torch.empty(4096, dtype=torch.uint8)
+    output = torch.empty((4, 8, 64 if module is decode else 512))
+    offsets = torch.tensor([0, 2, 4], dtype=torch.int32)
+    owned = mode == "owned"
+    validate = mode != "trusted_external"
+    size_calls = []
+
+    def workspace_size(*args, **kwargs):
+        size_calls.append((args, kwargs))
+        return 4096
+
+    monkeypatch.setattr(module, "_validate_qo_indptr", lambda *a, **kw: None)
+    monkeypatch.setattr(module, "_validate_out", lambda *a, **kw: None)
+    if module is decode:
+        monkeypatch.setattr(module, "_validate_q", lambda *a, **kw: None)
+        monkeypatch.setattr(
+            module, "_validate_block_table_metadata", lambda *a: (query.device, 2, 48)
+        )
+        monkeypatch.setattr(
+            module,
+            "_normalize_paged_kv_cache_views",
+            lambda *a, **kw: (*cache, 2, 1, 32, 64),
+        )
+        monkeypatch.setattr(
+            module, "get_prims_ts_batch_decode_workspace_size", workspace_size
+        )
+    else:
+        monkeypatch.setattr(module, "_validate_query", lambda *a, **kw: None)
+        monkeypatch.setattr(
+            module, "_validate_mla_metadata", lambda *a: (query.device, 2, 48)
+        )
+        monkeypatch.setattr(
+            module, "_normalize_mla_kv_cache", lambda *a, **kw: (cache, 2, 32)
+        )
+        monkeypatch.setattr(
+            module, "get_prims_ts_batch_mla_decode_workspace_size", workspace_size
+        )
     assert (
         api(
             query,
             cache,
             tables,
             lengths,
-            workspace_buffer=workspace,
+            workspace_buffer=None if owned else workspace,
             max_kv_len=1536,
             qo_indptr=offsets,
             max_seq_len_q=4,
             out=output,
-            validate=False,
+            validate=validate,
             **({"page_size": 4} if module is decode else {}),
         )
         is sentinel
     )
-    assert seen["args"][:3] == (query, cache, workspace)
-    assert seen["args"][-3:] == (tables, lengths, 1536)
-    assert seen["kwargs"]["qo_indptr"] is offsets
-    assert seen["kwargs"]["out"] is output
-    assert seen["kwargs"]["validate"] is False
-    assert seen["kwargs"]["validate_values"] is False
+    planned_workspace = seen["plan_kwargs"]["workspace_buffer"]
+    if owned:
+        assert len(size_calls) == 1
+        assert planned_workspace.numel() == 4096
+        assert planned_workspace.dtype == torch.int8
+        assert planned_workspace.device == query.device
+        assert planned_workspace is not workspace
+    else:
+        assert not size_calls
+        assert planned_workspace is workspace
+    assert seen["plan_kwargs"]["validate"] is validate
+    assert seen["plan_args"][-1] == 1536
+    assert seen["run_args"][0] is query
+    assert seen["run_args"][1] is cache
+    assert any(arg is tables for arg in seen["run_args"])
+    if module is decode and owned:
+        assert seen["plan_kwargs"]["seq_lens"] == (1, 1)
+        assert seen["run_args"][2] is None
+    else:
+        assert any(arg is lengths for arg in seen["run_args"])
+    assert seen["run_kwargs"]["qo_indptr"] is offsets
+    assert seen["run_kwargs"]["out"] is output
+    assert seen["run_kwargs"]["validate"] is validate
     if module is decode:
-        assert seen["kwargs"]["page_size"] == 4
+        assert seen["plan_args"][-2] == 4
+        assert seen["plan_kwargs"]["initialize_workspace"] is owned
+
+
+@pytest.mark.parametrize("module,_name,wrapper_name", _APIS)
+def test_trusted_plan_only_binds_existing_scratch(
+    monkeypatch, module, _name, wrapper_name
+):
+    """Exercise real planning with mocked compilation, not a mocked wrapper."""
+    workspace = torch.full((4096,), 7, dtype=torch.uint8)
+    before = workspace.clone()
+    if module is decode:
+        spec = SimpleNamespace(
+            config=SimpleNamespace(
+                use_separate_reduction_kernel=False, use_split_kv=False
+            ),
+            policy=(),
+            scratch_shapes=((1, 1, 1, 1, 1), (1,), (1,)),
+        )
+        family = "decode"
+        geometry = (1, 8, 1, 64, 32, 32)
+        compiled = (lambda *a: None, None)
+        options = {"initialize_workspace": False}
+    else:
+        spec = SimpleNamespace(kernel_workspace_bytes=0, policy=(("split_kv", 1),))
+        family = "mla_decode"
+        geometry = (1, 8, 512, 64, 32, 32)
+        compiled = lambda *a: None
+        options = {}
+    monkeypatch.setattr(module, f"_resolve_{family}_launch_spec", lambda *a: spec)
+    monkeypatch.setattr(module, f"_make_{family}_compile_spec", lambda *a, **kw: None)
+    monkeypatch.setattr(module, f"_get_compiled_{family}", lambda *a: compiled)
+    wrapper = getattr(module, wrapper_name)()
+    with monkeypatch.context() as patch:
+        _forbid_host_work(patch)
+        wrapper.plan(
+            "cuda:0",
+            *geometry,
+            max_seq_len_q=1,
+            packed_query=False,
+            q_data_type=torch.bfloat16,
+            kv_data_type=torch.bfloat16,
+            o_data_type=torch.bfloat16,
+            workspace_buffer=workspace,
+            validate=False,
+            **options,
+        )
+    assert wrapper._plan_state.workspace_buffer is workspace
+    torch.testing.assert_close(workspace, before)
+
+
+def test_removed_direct_apis_are_not_exported():
+    from flashinfer.attention import prims_ts
+    import flashinfer.decode as public_decode
+    import flashinfer.mla as public_mla
+
+    for module, legacy_name in (
+        (decode, "prims_ts_batch_decode_with_kv_cache"),
+        (mla_decode, "prims_ts_batch_mla_decode_with_kv_cache"),
+        (prims_ts, "prims_ts_batch_decode_with_kv_cache"),
+        (prims_ts, "prims_ts_batch_mla_decode_with_kv_cache"),
+        (public_decode, "prims_ts_batch_decode_with_kv_cache"),
+        (public_mla, "prims_ts_batch_mla_decode_with_kv_cache"),
+    ):
+        assert not hasattr(module, legacy_name)
+        assert legacy_name not in dir(module)
 
 
 @pytest.mark.parametrize("page_size,storage_page_size", [(4, 16), (4, 32), (16, 16)])
@@ -158,21 +292,29 @@ def test_explicit_cold_compile_rejects_capture(monkeypatch, module, name, _helpe
 
 def _forbid_host_work(monkeypatch):
     def forbidden(*_args, **_kwargs):
-        raise AssertionError("trusted direct launch allocated, read back, or planned")
+        raise AssertionError(
+            "trusted wrapper launch allocated, read back, reset, or validated"
+        )
 
-    for name in ("empty", "empty_like", "zeros", "zeros_like", "full", "full_like"):
+    for name in (
+        "empty",
+        "empty_like",
+        "zeros",
+        "zeros_like",
+        "full",
+        "full_like",
+        "tensor",
+    ):
         monkeypatch.setattr(torch, name, forbidden)
-    for name in ("item", "tolist", "cpu"):
+    for name in ("item", "tolist", "cpu", "zero_"):
         monkeypatch.setattr(torch.Tensor, name, forbidden)
     for module, _, _ in _APIS:
         for name in vars(module):
-            if name.startswith("_validate_"):
+            if name.startswith("_validate_") and name != "_validate_layout":
                 monkeypatch.setattr(module, name, forbidden)
-    monkeypatch.setattr(decode.BatchDecodePagedTSWrapper, "plan", forbidden)
-    monkeypatch.setattr(mla_decode.BatchMLADecodePagedTSWrapper, "plan", forbidden)
 
 
-def _graph_parity(monkeypatch, run, legacy, output, lengths, tables, offsets):
+def _graph_parity(monkeypatch, run, reference, output, lengths, tables, offsets):
     """Replay after changing all live metadata, with the same storage/extent."""
     graph = torch.cuda.CUDAGraph()
     with monkeypatch.context() as patch:
@@ -180,13 +322,13 @@ def _graph_parity(monkeypatch, run, legacy, output, lengths, tables, offsets):
         with torch.cuda.graph(graph):
             assert run() is output
     graph.replay()
-    torch.testing.assert_close(output, legacy(), rtol=0, atol=0)
+    torch.testing.assert_close(output, reference(), rtol=0, atol=0)
     lengths.sub_(1)
     tables[:, 0].copy_(tables[:, 1])
     if offsets is not None and offsets.numel() == 3:
         # Preserve the total extent while redistributing two nonempty requests.
         offsets[1].fill_(2)
-    expected = legacy().clone()
+    expected = reference().clone()
     graph.replay()
     torch.cuda.synchronize()
     torch.testing.assert_close(output, expected, rtol=0, atol=0)
@@ -277,16 +419,36 @@ def test_unified_fmha_parity_and_capture(
             **options,
         )
 
-    def legacy():
-        return decode.prims_ts_batch_decode_with_kv_cache(
+    reference_wrapper = decode.BatchDecodePagedTSWrapper()
+    reference_wrapper.plan(
+        case.q.device,
+        batch,
+        case.q.shape[-2],
+        case.k_cache.shape[1],
+        dim,
+        32,
+        max_k,
+        max_seq_len_q=sq,
+        packed_query=packed,
+        q_data_type=dtype,
+        kv_data_type=dtype,
+        o_data_type=case.output_dtype,
+        mask_type=case.mask_type,
+        window_left=case.window_left,
+        workspace_buffer=old_workspace,
+    )
+
+    def reference():
+        return reference_wrapper.run(
             case.q,
             case.paged_kv_cache,
-            old_workspace,
-            tables,
             lengths,
-            max_k,
+            tables,
+            qo_indptr=offsets,
+            bmm1_scale=case.bmm1_scale,
+            bmm2_scale=case.bmm2_scale,
             out=old_output,
-            **options,
+            validate=False,
         )
 
     result = run(True)
@@ -297,7 +459,7 @@ def test_unified_fmha_parity_and_capture(
     # reference tolerance (max absolute error 0.00041962). Do not relax that
     # tolerance or claim new arithmetic coverage; existing FP8 accuracy tests
     # remain unchanged. Baseline differential replay was also checked separately.
-    torch.testing.assert_close(run(), legacy(), rtol=0, atol=0)
+    torch.testing.assert_close(run(), reference(), rtol=0, atol=0)
     with pytest.raises(ValueError, match="dtype"):
         decode.batch_decode_with_paged_kv_cache(
             case.q,
@@ -313,7 +475,7 @@ def test_unified_fmha_parity_and_capture(
     with pytest.raises(ValueError, match="within"):
         run(True)
     lengths.fill_(max_k)
-    _graph_parity(monkeypatch, run, legacy, output, lengths, tables, offsets)
+    _graph_parity(monkeypatch, run, reference, output, lengths, tables, offsets)
 
 
 @_GPU
@@ -443,7 +605,6 @@ def test_unified_mla_accuracy_and_capture(monkeypatch, batch, dtype, packed, com
         device=case.query.device,
     )
     workspace = torch.empty(size, dtype=torch.uint8, device="cuda")
-    old_workspace = torch.empty_like(workspace)
     shape = (*case.query.shape[:-1], 512)
     output = torch.empty(shape, dtype=torch.bfloat16, device="cuda")
     old_output = torch.empty_like(output)
@@ -467,30 +628,29 @@ def test_unified_mla_accuracy_and_capture(monkeypatch, batch, dtype, packed, com
             **options,
         )
 
-    def legacy():
-        return mla_decode.prims_ts_batch_mla_decode_with_kv_cache(
+    def reference():
+        return wrapper.run(
             case.query,
             case.kv_cache,
-            old_workspace,
-            512,
-            64,
             case.block_tables,
             case.seq_lens,
-            max_k,
+            qo_indptr=offsets,
+            bmm1_scale=case.bmm1_scale,
+            bmm2_scale=case.bmm2_scale,
             out=old_output,
-            **options,
+            validate=False,
         )
 
     helpers._assert_case_correct(
         run(True), case, helpers._policy_dict(wrapper), qo_indptr=offsets
     )
-    torch.testing.assert_close(run(), legacy(), rtol=0, atol=0)
+    torch.testing.assert_close(run(), reference(), rtol=0, atol=0)
     case.block_tables[0, 0].fill_(-1)
     with pytest.raises(ValueError, match="invalid page ID"):
         run(True)
     case.block_tables[0, 0].copy_(case.block_tables[0, 1])
     _graph_parity(
-        monkeypatch, run, legacy, output, case.seq_lens, case.block_tables, offsets
+        monkeypatch, run, reference, output, case.seq_lens, case.block_tables, offsets
     )
 
 

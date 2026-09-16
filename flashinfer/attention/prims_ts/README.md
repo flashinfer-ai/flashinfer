@@ -21,10 +21,10 @@ Import all entries below from `flashinfer.attention.prims_ts`.
 | Kernel | Guide | Public APIs |
 | --- | --- | --- |
 | FMHA context/prefill | [Task-Scheduled FMHA Context](kernels/fmha_context/README.md) | `BatchPrefillTSWrapper`, `batch_prefill`, `BatchPrefillPagedTSWrapper`, `batch_prefill_with_paged_kv_cache` |
-| FMHA decode | [Task-Scheduled FMHA Decode](kernels/fmha_decode/README.md) | `BatchDecodePagedTSWrapper`, `batch_decode_with_paged_kv_cache`, `get_prims_ts_batch_decode_workspace_size`, `prepare_prims_ts_batch_decode_with_kv_cache`, `prims_ts_batch_decode_with_kv_cache` |
+| FMHA decode | [Task-Scheduled FMHA Decode](kernels/fmha_decode/README.md) | `BatchDecodePagedTSWrapper`, `batch_decode_with_paged_kv_cache`, `get_prims_ts_batch_decode_workspace_size`, `prepare_prims_ts_batch_decode_with_kv_cache` |
 | QToken-KvBlock-Sparse-Attention | [Packed-prefill and fixed-decode example](https://github.com/PerkzZheng/prims-ts-examples/blob/main/q_token_kv_block_sparse_attention.py) | `QTokenKvBlockSparsePagedTSWrapper`, `q_token_kv_block_sparse_attention_with_paged_kv_cache`, `get_q_token_kv_block_sparse_workspace_size`, `suggest_q_token_kv_block_sparse_group_size`, `validate_q_token_kv_block_sparse_group_size`, `make_q_token_kv_block_sparse_qo_indptr` |
 | Block-sparse FMHA | — | `BlockSparseTSWrapper`, `block_sparse_attention`; fixed-Q paged KV: `BlockSparsePagedTSWrapper`, `block_sparse_attention_with_paged_kv_cache` |
-| MLA decode | [Task-Scheduled MLA Decode](kernels/mla_decode/README.md) | `BatchMLADecodePagedTSWrapper`, `batch_mla_decode_with_paged_kv_cache`, `get_prims_ts_batch_mla_decode_workspace_size`, `prims_ts_batch_mla_decode_with_kv_cache` |
+| MLA decode | [Task-Scheduled MLA Decode](kernels/mla_decode/README.md) | `BatchMLADecodePagedTSWrapper`, `batch_mla_decode_with_paged_kv_cache`, `get_prims_ts_batch_mla_decode_workspace_size` |
 
 The component guides define supported shapes, layouts, metadata lifetime,
 output/workspace ownership, examples, limitations, and validation commands.
@@ -38,8 +38,11 @@ length-specialized policies. For allocation-free, synchronization-free
 steady-state launches, provide `workspace_buffer`, `max_kv_len`, `out`,
 and `validate=False`. Packed Q additionally requires `max_seq_len_q`
 (FMHA also accepts its non-default `seq_len_q` alias).
-Only static Python/tensor attributes are used to select the existing cached
-kernel; no wrapper is constructed or planned on this path.
+Both APIs size and allocate scratch only when it is omitted, then pass it to
+the same wrapper plan/run path. Trusted calls select the existing cached
+kernel from static Python/tensor attributes without allocating or reading
+metadata values back to the host. FMHA preserves initialized caller scratch
+by planning with `initialize_workspace=False`.
 
 Use the existing `get_prims_ts_batch_*_workspace_size` helpers outside
 capture. FMHA scratch must be zero-initialized and re-zeroed when any workspace
@@ -72,12 +75,14 @@ with torch.cuda.graph(graph):
 graph.replay()
 ```
 
-The `prims_ts_batch_decode_with_kv_cache` and
-`prims_ts_batch_mla_decode_with_kv_cache` names remain compatibility shims
-over the shared launch implementation. Their positional arguments and
-structural-only validation (no metadata readback) remain unchanged. New
-callers can use the canonical names above; reusable plan/run wrappers and
-all existing lazy imports remain available.
+The former `prims_ts_batch_decode_with_kv_cache` and
+`prims_ts_batch_mla_decode_with_kv_cache` functions and their lazy exports have
+been removed. Use the canonical names above, passing scratch as the keyword
+`workspace_buffer` and the static K/V bound as `max_kv_len`. For FMHA, rename
+`query`/`kv_cache`/`seq_lens` to `q`/`paged_kv_cache`/`seq_lens_kv`; for MLA,
+pass `kv_lora_rank` and `qk_rope_head_dim` by keyword. Choose `validate=False`
+after input validation for capture-safe execution without metadata readback.
+Workspace-sizing helpers and reusable plan/run wrappers remain available.
 
 The contiguous and paged context, FMHA decode, and MLA decode wrappers separate
 reusable static state from per-run request state. `plan()` compiles a static
