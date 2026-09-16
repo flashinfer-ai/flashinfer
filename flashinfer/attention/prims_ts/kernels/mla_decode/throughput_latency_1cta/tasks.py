@@ -271,14 +271,15 @@ def create_throughput_latency_softmax_task_impl(
             )
             tmem_softmax_local.commit()
 
-        def init_work_tile_state():
+        def init_register_work_tile_state():
+            """Create the register-resident state used by both variants."""
             return tmem_s.init_softmax_work_tile_state()
 
         with work_tile_schedule_loop(
             work_queue,
             skip_if=work_tile_skip_if,
             non_skippable_prelude=(
-                init_work_tile_state if work_queue is not None else None
+                init_register_work_tile_state if work_queue is not None else None
             ),
         ) as (_, work_tile_state):
             if work_queue is not None:
@@ -289,6 +290,10 @@ def create_throughput_latency_softmax_task_impl(
                     local_sum_arr,
                     s_arr,
                 ) = work_tile_state
+                # The prelude above refreshes all register arrays for both
+                # variants. Keeps-MMA-AB additionally carries its q64 running
+                # max/sum through shared scratch; swaps-MMA-AB has no analogous
+                # scratch state to reset.
                 if cfg.kernel_variant == "keeps_mma_ab":
                     tmem_s.reset_keeps_softmax_work_tile_scratch()
             with domain_loop(0, domain, 1) as d:
