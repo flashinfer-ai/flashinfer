@@ -2502,8 +2502,9 @@ class ThroughputLatencyMlaDecodeTs:
         prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
         cfg = self._make_config()
         _, _, combine_slot = cute.arch.block_idx()
-        # The producer omits zero-KV requests. Keep the compact fixed grid and
-        # stride it over all logical request slots to publish empty outputs.
+        # Zero-KV requests have no producer or combine descriptor, so the
+        # normal main/reduction paths cannot publish their result. Keep the
+        # compact fixed grid and stride it over every logical request slot.
         zero_balanced_inactive_outputs(
             self,
             output,
