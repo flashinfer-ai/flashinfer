@@ -240,15 +240,23 @@ def test_grouped_tactic_replay_autotune_and_offset_changes():
     torch.testing.assert_close(out, reference(), rtol=0.02, atol=0.125)
 
 
-def test_moe_plain_fc1_fallback_preserves_float_accumulation(monkeypatch):
+@pytest.mark.parametrize("decline_kind", ["not_implemented", "graph_not_supported"])
+def test_moe_plain_fc1_fallback_preserves_float_accumulation(decline_kind, monkeypatch):
     _require_b200()
     from flashinfer.fused_moe import cudnn_backend
 
+    import cudnn
+
     original = cudnn_backend._Stage
+    decline = (
+        NotImplementedError
+        if decline_kind == "not_implemented"
+        else cudnn.cudnnGraphNotSupportedError
+    )
 
     def without_fusion(*args, **kwargs):
         if kwargs.get("fused"):
-            raise NotImplementedError("test the fallback graph")
+            raise decline("test the fallback graph")
         return original(*args, **kwargs)
 
     monkeypatch.setattr(cudnn_backend, "_Stage", without_fusion)

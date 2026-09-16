@@ -87,6 +87,14 @@ The ported sources passed 361 Frontend tests, 4 grouped block-scale cases and
 run passed 5 cases and memcheck passed 43 cases with zero errors. Changed-file
 hooks pass; runtime, test and binding hashes were frozen during these runs.
 
+A subsequent fix catches cuDNN's dedicated `cudnnGraphNotSupportedError` when
+shared-input FC1 fusion declines, allowing the existing FP32 FC1 plus activation
+fallback to run. On full B200, the exact new regression fails against the old
+method with that exception; the corrected source passes both decline variants,
+four typed-activation fallback cases and two capability-contract tests (8 tests,
+no skips). Capture replay changes inputs and poisons intermediate/output buffers.
+This is an interface/correctness fix; no speedup is claimed for it.
+
 **Racecheck is unresolved; this is not an all-tests-passing or merge-ready claim.**
 The full selected racecheck suite failed, first in the 8193-token paired expert
 stride case. Focused reruns fail in the independent reference's `cublasSgemm`,
@@ -95,6 +103,11 @@ including runs with zero reported race hazards. The separately reported PyTorch
 cuBLAS failure. Staged module/plan/forward diagnostics pass; the public test's
 capture-and-live-weight sequence still fails under racecheck. Keep the failure
 visible and continue isolating it. No numerical tolerance was relaxed.
+Further staged diagnostics pass after separately capturing FC1, FC2, or both
+GEMMs and then making eight reference calls. Capturing the complete native-routing
+MoE still fails on the first subsequent reference call. Native routing,
+permutation and finalization capture interactions remain under investigation;
+this localization is not a root-cause finding or a blanket kernel clearance.
 
 The old-snapshot finalizer range comparison also remains incomplete. A native
 routing-only reproducer passes unfiltered racecheck but fails when the original
@@ -127,8 +140,9 @@ Recommended continuation order:
    BF16 numerics, live-input capture and actual Frost routes for two tile
    configurations and both routing implementations. It required process-local
    fixes for the native utility JIT architecture whitelist and the dedicated
-   `cudnnGraphNotSupportedError` fallback. Those fixes and SM120 support are not
-   enabled by this draft. Sanitizer and performance comparisons are pending.
+   `cudnnGraphNotSupportedError` fallback. The fallback fix is now included in
+   this draft; the native utility JIT whitelist and public SM120 support remain
+   unchanged. Sanitizer and performance comparisons are pending.
 4. Continue kernel and tuning work only when candidates survive correctness,
    changed-input capture, actual routes and complete-MoE confirmation.
 

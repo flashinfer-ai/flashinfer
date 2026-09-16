@@ -470,6 +470,8 @@ class CudnnMoeRunner(MoERunner):
 
     def _prepare_stages(self, s, inputs, empty):
         """Build BF16 stages; quantized runners specialize this preparation."""
+        import cudnn
+
         x, _, _, up, gate, down, gate_up = inputs[:7]
         t, _ = x.shape
         i = up.shape[1]
@@ -487,7 +489,11 @@ class CudnnMoeRunner(MoERunner):
                 activation=self.config.activation,
             )
             s["fused"] = True
-        except (NotImplementedError, RuntimeError) as exc:
+        except (
+            NotImplementedError,
+            RuntimeError,
+            cudnn.cudnnGraphNotSupportedError,
+        ) as exc:
             _LOG.info("cuDNN MoE shared-input FC1 fusion declined: %s", exc)
             s["fc1_output"] = empty((t * r, 2 * i), torch.float32)
             s["fc1"] = _Stage(
