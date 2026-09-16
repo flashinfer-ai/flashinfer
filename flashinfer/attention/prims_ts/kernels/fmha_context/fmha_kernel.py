@@ -2349,7 +2349,7 @@ def _select_fmha_domain_policy(
     domain_n_kwargs = {"domain": num_kv_tiles}
     domain_n_minus_1_kwargs = {"domain": num_kv_tiles - 1}
     # Handle the partial last K/V tile after the softmax loop. The loop runs
-    # N-1 unmasked iterations and TAIL masks the last tile. The loop then 
+    # N-1 unmasked iterations and TAIL masks the last tile. The loop then
     # compiles the same for all S, so register spills no longer depend on tail size.
     softmax_uses_dense_k_tail = (
         not cfg.is_causal and not cfg.has_varlen and cfg.fixed_dense_k_tail > 0
