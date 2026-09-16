@@ -376,14 +376,10 @@ def download_artifacts() -> None:
             destination_path: str,
             artifact_name: str,
             kwargs: dict[str, object],
+            retry_deadline: float | None,
         ) -> bool:
             request_kwargs = dict(kwargs)
             request_kwargs["session"] = _get_thread_session()
-            retry_deadline = (
-                time.monotonic() + retry_window_seconds
-                if retry_window_seconds > 0
-                else None
-            )
             while True:
                 if download_file(source_path, destination_path, **request_kwargs):
                     return True
@@ -415,12 +411,18 @@ def download_artifacts() -> None:
                     download_kwargs: dict[str, object] = {}
                     if max_retries is not None:
                         download_kwargs["retries"] = max_retries
+                    file_retry_deadline = (
+                        time.monotonic() + retry_window_seconds
+                        if retry_window_seconds > 0
+                        else None
+                    )
                     fut = pool.submit(
                         _download_within_retry_window,
                         source,
                         str(local_path),
                         name,
                         download_kwargs,
+                        file_retry_deadline,
                     )
                     fut.add_done_callback(update_pbar_cb)
                     futures.append(fut)
