@@ -1266,6 +1266,7 @@ def ssd_combined_fwd_varlen(
         and checkpoint_states is None
     ):
         from .musa_ssd_triton import mamba_chunk_scan_combined_varlen
+        from .musa_compile import finite_dt_limit
 
         return mamba_chunk_scan_combined_varlen(
             x,
@@ -1284,7 +1285,7 @@ def ssd_combined_fwd_varlen(
             dt_bias=dt_bias,
             initial_states=initial_states,
             dt_softplus=dt_softplus,
-            dt_limit=dt_limit,
+            dt_limit=finite_dt_limit(dt_limit),
             return_intermediate_states=return_intermediate_states,
             state_dtype=state_dtype,
         )
