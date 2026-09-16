@@ -157,7 +157,8 @@ integration and configuration search, with workload-specific evidence.
 ## Combined prototype: first B200 result (September 16)
 
 BF16 T64/E128/top8/H2048/I768, synthetic Qwen-shaped inputs, precomputed uniform
-routing, TP1/EP1, PDL off, full 148-SM/1000-W B200. At one fixed 128x64 geometry,
+routing, TP1/EP1, FI API `enable_pdl=False` (see qualification below),
+full 148-SM/1000-W B200. At one fixed 128x64 geometry,
 complete-MoE cold-L2 CUPTI spans are:
 
 | FC1 swap | FC2 swap | Complete MoE, us |
@@ -177,6 +178,18 @@ independently tuned best configurations.
 All four arms pass20 strict full-output checks and2 skipped-replay negative
 controls before384 raw spans. Inputs/routing change and buffers are poisoned.
 Independent audit1453 verifies exact source hashes, all spans and actual stage
-routes. Sanitizers on the combined head, fresh-process repetition, tile tuning,
-and a tuned competing-backend comparison remain outstanding. This experimental
+routes. Synchronization validation, fresh-process repetition, tile tuning and a
+tuned competing-backend comparison remain open. This experimental
 merge is not included in this PR's runtime changes; no model-E2E gain is claimed.
+
+## Qualification of experimental observations
+
+The combined prototype's initial timing observations above do not establish a
+production-ready performance gain. Successful synchronization validation and
+confirmation against separately tuned configurations remain required before
+promotion. No SM120 orientation-specific or complete-MoE benefit is claimed.
+
+The PDL label refers to the public FI API flag; Frost's generated launchers
+control their own PDL setting. It should not be read as all kernels disabling
+PDL. These qualifications do not change the previously reported arithmetic
+or the acknowledgements above.
