@@ -425,6 +425,20 @@ def _neg_max_f32() -> Float32:
     return Float32(NEG_FLT_MAX)
 
 
+@cute.jit
+def _masked_weighted_sum(terms: tuple) -> Float32:
+    """Return the sum of ``value * weight`` over ``(uses, value, weight)`` terms.
+
+    The terms are added in order and a term whose ``uses`` is false is skipped.
+    """
+    total = Float32(0.0)
+    for term_idx in cutlass.range_constexpr(len(terms)):
+        uses, value, weight = terms[term_idx]
+        if uses:
+            total += value * weight
+    return total
+
+
 def _softmax_tile_idx(
     cfg: FmhaDecodeConfig, stage_info: StageInfo, inst_id: int
 ) -> Int32:
