@@ -290,11 +290,26 @@ def musa_ssu_one_token_native(*args: Any, **kwargs: Any) -> Any:
 
     is_compiling = getattr(getattr(torch, "compiler", None), "is_compiling", None)
     if callable(is_compiling) and is_compiling():
-        torch.ops.flashinfer_musa.simple_stp(*args, **kwargs)
+        # The public API permits ``out=None``. Materialize that buffer before
+        # entering the dispatcher so the graph has a concrete mutable alias
+        # and the Python API can still return a tensor.
+        call_args = list(args)
+        if "out" in kwargs:
+            output = kwargs["out"]
+            if output is None:
+                output = torch.empty_like(call_args[1])
+                kwargs = dict(kwargs)
+                kwargs["out"] = output
+        elif len(call_args) > 13 and call_args[13] is None:
+            output = torch.empty_like(call_args[1])
+            call_args[13] = output
+        else:
+            output = call_args[13] if len(call_args) > 13 else None
+        torch.ops.flashinfer_musa.simple_stp(*call_args, **kwargs)
         # The dispatcher op mutates the caller-owned output buffer and returns
         # no tensor so Inductor can model the mutation without an aliasing
         # output. Preserve the public Python API by returning that buffer.
-        return kwargs.get("out", args[13] if len(args) > 13 else None)
+        return output
 
     extension = _load_extension()
     return extension.musa_ssu_simple(*args, **kwargs)
