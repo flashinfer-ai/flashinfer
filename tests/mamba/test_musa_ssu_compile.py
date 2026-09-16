@@ -74,6 +74,11 @@ def test_native_ssu_inductor_fullgraph_replay_and_mutation():
     torch.testing.assert_close(first_inputs[0][1], eager_state[1], rtol=0, atol=0)
 
     second_inputs = _native_inputs(2202)
+    # Keep shapes/static guards identical while changing the caller-owned slot
+    # metadata. This catches a graph replay that accidentally captured the
+    # first source/destination indices as constants.
+    second_inputs[9].copy_(torch.tensor([2], device=second_inputs[9].device))
+    second_inputs[10].copy_(torch.tensor([5], device=second_inputs[10].device))
     second_state_before = second_inputs[0].clone()
     second_eager_state = second_state_before.clone()
     second_eager_args = (second_eager_state, *second_inputs[1:])
