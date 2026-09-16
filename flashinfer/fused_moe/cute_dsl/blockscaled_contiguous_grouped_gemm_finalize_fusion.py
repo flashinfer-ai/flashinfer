@@ -46,6 +46,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
+
+from .localized_moe_debug import localized_moe_trace
 import cuda.bindings.driver as cuda
 import torch
 
@@ -254,6 +256,10 @@ def _get_compiled_finalize_kernel(
         sf_dtype,
         out_dtype,
         final_scale_dtype,
+        # max_active_clusters is a cute.compile constexpr sizing the persistent
+        # grid. Under a green context it is scaled to the node-local SM fraction,
+        # so the full-device and per-die variants must not alias.
+        max_active_clusters,
         enable_pdl,
         use_a_per_token_scale,
         use_fused_finalize,
@@ -346,6 +352,13 @@ def _get_compiled_finalize_kernel(
             scaling_vector_size=sf_vec_size,
             max_active_clusters=max_active_clusters,
             stream=stream,
+            # The Rubin wrapper accepts a trailing runtime Int64 c_stride_row for
+            # the locality-domain strided write; the Blackwell wrapper does not, so only pass
+            # it for Rubin. Traced with cutlass.Int64(0) -- the Int64 wrapping is
+            # what makes it a runtime argument; a bare Python 0 would trace as a
+            # constexpr and be baked in, silently ignoring the per-die value at
+            # the call site. The kernel reads 0 as "natural contiguous stride".
+            **({"c_stride_row": cutlass.Int64(0)} if is_rubin else {}),
         )
 
         _finalize_kernel_cache[cache_key] = compiled_gemm
@@ -376,6 +389,12 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
     cluster_shape_mn: Tuple[int, int] = (2, 1),
     raster_along_m: bool = False,
     sm_count: Optional[int] = None,
+    # locality-domain hidden-shard (Rubin only): domain_id >= 0 makes this die write its
+    # hidden-column half into the caller-provided shared full-width `out` at a
+    # column offset, using a full-hidden row stride (c_stride_row). Each die owns
+    # a disjoint set of output columns and contracts the full intermediate, so no
+    # reduction is needed. domain_id < 0 -> normal contiguous output.
+    domain_id: int = -1,
     # Rubin-specific parameters (optional; when set, use SM107 kernel)
     mma_tiler: Optional[Tuple[int, int, int]] = None,
     mma_inst_shape: Optional[Tuple[int, int, int]] = None,
@@ -576,6 +595,25 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
 
     output_rows = seq_len if use_fused_finalize else seq_len * topk
 
+    # locality-domain hidden-shard (Rubin only). `n` here is b.shape[1] == THIS die's slice of
+    # the hidden dimension, while the shared `out` spans the full hidden width, so
+    # the expected-shape check below has to widen by the die count.
+    localized_half_gemm = domain_id >= 0
+    if localized_half_gemm:
+        if not is_rubin:
+            raise ValueError(
+                "locality-domain hidden-shard (domain_id >= 0) is Rubin (SM107) only"
+            )
+        if domain_id >= 2:
+            raise ValueError(f"domain_id must be 0 or 1, got {domain_id}")
+        if out is None:
+            raise ValueError(
+                "locality-domain hidden-shard requires a caller-provided full-width out. Both "
+                "dies write disjoint column halves of one shared buffer, which the "
+                "caller must also have zeroed before the fused atomic finalize."
+            )
+    expected_n = n * 2 if localized_half_gemm else n
+
     # Atomic fused finalize requires zero-initialized output.
     if out is None:
         allocator = torch.zeros if use_fused_finalize else torch.empty
@@ -586,9 +624,9 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
         )
     else:
         expected_out_dtype = cutlass_to_torch_dtype(out_dtype_cutlass)
-        if out.shape != (output_rows, n):
+        if out.shape != (output_rows, expected_n):
             raise ValueError(
-                f"out must have shape ({output_rows}, {n}), got {tuple(out.shape)}"
+                f"out must have shape ({output_rows}, {expected_n}), got {tuple(out.shape)}"
             )
         if out.dtype != expected_out_dtype:
             raise TypeError(
@@ -596,12 +634,42 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
             )
 
     # Get SM count
+    total_sm = get_num_sm(a.device)
     if sm_count is None:
-        sm_count = get_num_sm(a.device)
+        sm_count = total_sm
 
     # Compute max active clusters (cached to avoid expensive HardwareInfo queries)
     max_active_clusters = get_max_active_clusters(
         cluster_shape_mn[0] * cluster_shape_mn[1]
+    )
+    # get_max_active_clusters() is queried on the FULL device. When this launch is
+    # confined to a green-context partition (sm_count < total_sm), the persistent
+    # grid must be scaled to the node-local SM fraction or it oversizes and spills
+    # into an extra wave (the penalty grows with tile count). Mirrors TRT-LLM's
+    # node_local_max_active_clusters: max_active_full * node_sm // total_sm.
+    max_active_clusters_full = max_active_clusters
+    if sm_count < total_sm:
+        max_active_clusters = max(1, max_active_clusters * sm_count // total_sm)
+
+    # locality-domain strided write: stride each row by the FULL hidden width while filling
+    # only this die's half, and start at this die's column. Unlike FC1 the output
+    # is bf16 (not packed fp4), so the offset scales by element_size(). The kernel
+    # reads c_stride_row == 0 as "natural contiguous stride" (non-localized).
+    if localized_half_gemm:
+        c_stride_row_val = cutlass.Int64(n * 2)
+        c_data_ptr = out.data_ptr() + domain_id * n * out.element_size()
+    else:
+        c_stride_row_val = cutlass.Int64(0)
+        c_data_ptr = out.data_ptr()
+
+    localized_moe_trace(
+        f"fc2-domain-{domain_id}",
+        f"FC2 domain_id={domain_id} localized_half_gemm={localized_half_gemm} is_rubin={is_rubin} | "
+        f"b.shape[1]={n} out.shape={tuple(out.shape)} expected_n={expected_n} | "
+        f"sm_count={sm_count}/{total_sm} "
+        f"max_active_clusters={max_active_clusters_full}->{max_active_clusters} | "
+        f"c_stride_row={int(c_stride_row_val)} "
+        f"c_byte_offset={c_data_ptr - out.data_ptr()}",
     )
 
     tile_size = mma_tiler[0] if is_rubin else mma_tiler_mn[0]
@@ -619,8 +687,10 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
     b_sf_ptr = make_ptr(
         sf_dtype_cutlass, b_scale.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
     )
+    # c_data_ptr carries this die's column offset in locality-domain mode (== out.data_ptr()
+    # otherwise).
     c_ptr = make_ptr(
-        out_dtype_cutlass, out.data_ptr(), cute.AddressSpace.gmem, assumed_align=32
+        out_dtype_cutlass, c_data_ptr, cute.AddressSpace.gmem, assumed_align=32
     )
 
     alpha_ptr = make_ptr(cutlass.Float32, alpha.data_ptr(), cute.AddressSpace.gmem)
@@ -722,6 +792,10 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
         seq_len,
         topk,
         stream=stream,
+        # Rubin-only trailing runtime Int64 (0 outside locality-domain mode, which the kernel reads
+        # as "natural contiguous stride"). Must match the set traced at the compile
+        # site above.
+        **({"c_stride_row": c_stride_row_val} if is_rubin else {}),
     )
 
     return out
