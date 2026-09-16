@@ -527,8 +527,20 @@ __device__ __forceinline__ void compute_mla_pv(typename KTraits::SharedStorage* 
       make_smem_desc<KTraits::SWIZZLE_MODE_P, /*leading_byte_offset=*/16,
                      /*stride_byte_offset=*/KTraits::CTA_TILE_KV * 16, typename KTraits::DTypeQ>(
           smem_storage->kv_o_smem[stage_idx].p);
+  // V (= CKV) is the MN-major B operand of the PV WGMMA.
+  //   leading_byte_offset = stride between adjacent core-matrix groups along MN
+  //                       = 8 rows * (one swizzle atom row) = 8 * 128 B = 1024 B
+  //                         for the k128B swizzle. This is a property of the
+  //                         swizzle atom only -- it does NOT depend on
+  //                         CTA_TILE_KV. Writing it as CTA_TILE_KV * 16 happens
+  //                         to give the right answer at CTA_TILE_KV == 64 and
+  //                         silently corrupts PV for any other tile.
+  //   stride_byte_offset  = stride between adjacent core-matrix groups along K
+  //                       = 8 rows * HEAD_DIM_CKV elems * 2 B = HEAD_DIM_CKV * 16.
+  constexpr uint32_t CKV_SWIZZLE_ATOM_BYTES =
+      (KTraits::SWIZZLE_MODE_CKV == SwizzleMode::k128B) ? 8 * 128 : 8 * 64;
   auto desc_ckv = make_smem_desc<KTraits::SWIZZLE_MODE_CKV,
-                                 /*leading_byte_offset=*/KTraits::CTA_TILE_KV * 16,
+                                 /*leading_byte_offset=*/CKV_SWIZZLE_ATOM_BYTES,
                                  /*stride_byte_offset=*/KTraits::HEAD_DIM_CKV * 16, KVDescType>(
       ckv_base + warp_group_idx * 8 * (KTraits::HEAD_DIM_CKV / 2));
   warpgroup_fence_frag<KTraits::NUM_REGS_O_FRAG>(o_frag);
@@ -1282,18 +1294,42 @@ cudaError_t BatchMLAPageAttentionHopper(Params params, uint32_t num_blks_x, uint
   }
   constexpr bool CAUSAL = MASK_MODE == MaskMode::kCausal;
 
-  // get GPU shared memory size
+  // get GPU shared memory size. cudaDevAttrMaxSharedMemoryPerBlockOptin is the
+  // ceiling cudaFuncSetAttribute(cudaFuncAttributeMaxDynamicSharedMemorySize)
+  // will accept; asking for more returns cudaErrorInvalidValue.
   int device;
-  int smem_limit_per_sm;
+  int smem_limit_per_block;
   cudaGetDevice(&device);
-  cudaDeviceGetAttribute(&smem_limit_per_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, device);
+  FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&smem_limit_per_block,
+                                              cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
 
-  // NUM_STAGES=2 for both paths. The FP8 KV path fits within the 228KB/SM
-  // budget by sharing a single (non-per-stage) `o` writeback overlay across
-  // the whole data path, freeing up room for the BF16 dequant staging buffers.
-  constexpr uint32_t NUM_STAGES = 2;
+  // The FP8 KV path fits within the 228KB/SM budget by sharing a single
+  // (non-per-stage) `o` writeback overlay across the whole data path, freeing
+  // up room for the BF16 dequant staging buffers.
   constexpr uint32_t CTA_TILE_Q = 64;
-  constexpr uint32_t CTA_TILE_KV = 64;
+
+  // Opt-in dynamic shared memory ceiling on every SM90 part: 227KB.
+  constexpr size_t SM90_MAX_DYN_SMEM = 227 * 1024;
+
+  // Pick the largest CTA_TILE_KV whose SharedStorage fits under the SM90
+  // opt-in dynamic shared memory limit. At CTA_TILE_KV=64 the per-stage KV tile
+  // is CTA_TILE_KV*(HEAD_DIM_CKV + max(HEAD_DIM_KPE, CTA_TILE_Q))*sizeof(DTypeKV);
+  // for bf16 HEAD_DIM_CKV=512 that is
+  //   HEAD_DIM_KPE=  0 -> 213856 B  (fits)
+  //   HEAD_DIM_KPE= 64 -> 222048 B  (fits)
+  //   HEAD_DIM_KPE=128 -> 246624 B  (OVER the 232448 B limit)
+  // so HEAD_DIM_KPE=128 must step down to CTA_TILE_KV=32 (164704 B). Without
+  // this, cudaFuncSetAttribute below fails with cudaErrorInvalidValue and the
+  // kernel never launches.
+  // NUM_STAGES=3 at CTA_TILE_KV=32 also fits (205696 B) but measured identically
+  // (1.497 vs 1.498 ms at b400/kv8192) -- the kernel is bandwidth bound here --
+  // so keep the smaller, better-tested NUM_STAGES=2.
+  constexpr uint32_t NUM_STAGES = 2;
+  using KTraitsTileKV64 =
+      hopper::HopperKernelTraits<CAUSAL, NUM_STAGES, HEAD_DIM_CKV, HEAD_DIM_KPE, CTA_TILE_Q,
+                                 /*CTA_TILE_KV_=*/64, DTypeQ, DTypeKV, DTypeO, IdType>;
+  constexpr uint32_t CTA_TILE_KV =
+      sizeof(typename KTraitsTileKV64::SharedStorage) <= SM90_MAX_DYN_SMEM ? 64 : 32;
 
   using KTraits =
       hopper::HopperKernelTraits<CAUSAL, NUM_STAGES, HEAD_DIM_CKV, HEAD_DIM_KPE, CTA_TILE_Q,
@@ -1301,6 +1337,19 @@ cudaError_t BatchMLAPageAttentionHopper(Params params, uint32_t num_blks_x, uint
   dim3 nblks(num_blks_x, num_blks_y);
   dim3 nthrs(KTraits::NUM_THREADS);
   size_t smem_size = sizeof(typename KTraits::SharedStorage);
+
+  if (smem_size > static_cast<size_t>(smem_limit_per_block)) {
+    // Nothing in the supported tile table fits; fail loudly instead of
+    // surfacing an opaque "invalid argument" from cudaFuncSetAttribute.
+    std::ostringstream err;
+    err << "BatchMLAPageAttentionHopper: shared memory required (" << smem_size
+        << " B) exceeds the device limit (" << smem_limit_per_block
+        << " B) for HEAD_DIM_CKV=" << HEAD_DIM_CKV << ", HEAD_DIM_KPE=" << HEAD_DIM_KPE
+        << ", CTA_TILE_Q=" << CTA_TILE_Q << ", CTA_TILE_KV=" << CTA_TILE_KV
+        << ", NUM_STAGES=" << NUM_STAGES;
+    FLASHINFER_ERROR(err.str());
+    return cudaErrorNotSupported;
+  }
 
   auto kernel = hopper::BatchMLAPageAttentionHopperKernel<KTraits, Params>;
   void* args[] = {(void*)&params};
