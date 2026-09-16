@@ -144,3 +144,40 @@ These plans accept ``write_lse=True`` for FP32 base2 LSE. Their caller-owned,
 workspace for each live graph binding and use
 ``CakeFmhaRequestOrderedCapture`` to prepare descriptors before replay.
 The graph includes both the producer and reducer launches.
+
+Runtime-length scheduling
+-------------------------
+
+Without an explicit split plan, the BF16-query request-ordered route selects a
+kernel-owned runtime-length scheduler for batches 1 through 256, fixed Q1 or Q6,
+eight query heads and one
+KV head. The exported family targets GB300 SM103a with 152 SMs, head dimension
+256, 64-token pages, BF16 output and FP8 E4M3 KV storage. Optional LSE output
+uses FP32 base-2 values. Other positive fixed-Q lengths retain the existing
+runtime-Q fallback; they do not select this scheduler family.
+
+The family contains 56 general profiles and 16 one-page profiles. These 72
+modules are additional scheduler-family profiles, rather than the total
+generated inventory of the package. A one-page profile is selected when each
+physical K/V page table has one page slot. Selection does not recognize a
+particular vector of sequence lengths. Larger physical tables select the
+general scheduler, which distributes request work from the current device KV
+lengths and performs any required partition reduction within the same kernel
+launch.
+
+Create the plan and allocate its caller-owned workspace before graph capture.
+Use ``CakeFmhaRequestOrderedCapture`` to prepare and finalize the captured
+decode. Keep tensor storage, tensor metadata and batch capacity fixed, and
+update the device sequence-length and request-order contents between replays.
+Request order must be a permutation of the logical request indices. Initial
+host planning metadata requires positive lengths at least Q; validated device
+replays also support empty requests with length zero. Nonempty lengths must
+be at least Q and fit the supplied physical page tables. Empty requests produce
+zero output and negative-infinity LSE.
+
+Both shared ``[batch, pages]`` page tables and separate K/V
+``[batch, 2, pages]`` tables retain their native storage. Query and output
+storage are likewise retained; the route does not gather queries or pages or
+scatter output outside the FMHA kernel. Length changes, request-order changes
+and partition reduction remain inside one captured FMHA launch. Concurrently
+executing captures require separate workspace ownership.

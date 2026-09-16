@@ -3636,6 +3636,10 @@ def trtllm_batch_decode_with_kv_cache(
         provided, it must be zero-initialized at allocation (e.g. via
         ``torch.zeros``); the kernel self-resets the counters at the end of each
         launch, so it does not need to be re-zeroed between calls.
+        The native runtime-length Cake route also accepts this buffer. When
+        omitted on that route, counters occupy the caller workspace and are
+        initialized by its first eager invocation. Warm that exact workspace
+        before capture, or provide zero-initialized explicit counters.
 
     enable_block_sparse_attention : bool = False
         Whether to use block-sparse attention with different sparse KV pages per KV head.
@@ -3709,21 +3713,34 @@ def trtllm_batch_decode_with_kv_cache(
         graph capture. The plan's ``query_dtype`` must match the query.
         FP8 E4M3 queries require an explicit ``query_dtype=torch.float8_e4m3fn``
         plan; output remains BF16. When omitted for BF16 queries, request
-        ordering uses a safe single-split generated route. Page-table rows must be padded to
-        ``4 * ceil(max_seq_len / 256)`` entries. Run one eager invocation with
-        the exact tensors and workspace before graph capture so its TMA
-        descriptors are initialized. With explicit capture preparation, query,
+        ordering uses the runtime-length scheduler for B1..256, Q1/Q6 and
+        8Q/1KV heads. It reads current device lengths and order every replay
+        and requires only ``ceil(max_seq_len / 64)`` native page slots.
+        Its workspace needs at least ``plan.workspace_size_bytes`` bytes;
+        ``max_seq_len`` is the fixed allocated capacity for legal mutations.
+        Before capturing this runtime-length family, warm its module eagerly
+        and construct ``CakeFmhaRequestOrderedCapture`` outside capture. Call
+        ``capture.prepare_workspace(plan, workspace_buffer)`` before recording,
+        pass it while recording and finalize it before replay. When using internal
+        counters, warm the exact workspace eagerly as well; alternatively
+        supply a zero-initialized explicit counter buffer. Every live
+        graph/layer binding must retain its own workspace.
+        Other BF16 geometries use the existing single-split route, whose page
+        rows need ``4 * ceil(max_seq_len / 256)`` entries. With explicit capture preparation, query,
         page-table, length, request-order and device-scale contents may change
         in place between replays while retaining their storage and satisfying
         the selected plan's shape and length contract.
 
     request_order_capture : Optional[CakeFmhaRequestOrderedCapture] = None
-        Explicit preparation object from ``flashinfer.cake_fmha`` for Q tensors
-        produced inside capture. Construct it and allocate each graph/layer's
-        descriptor workspace outside capture. Pass it only while recording,
+        Explicit preparation object from ``flashinfer.cake_fmha``. Required for
+        the runtime-length scheduler during capture; it also supports Q tensors
+        produced inside capture. Construct it and call
+        ``prepare_workspace(plan, workspace_buffer)`` for every binding outside
+        capture. This allocates descriptor storage separate from caller scratch,
+        including when several bindings share the same plan. Pass it only while recording,
         then finalize it after the graph context exits and before first replay.
         Retain it with the graph. Failed capture/finalization requires discarding
-        the graph and its preparation records. Ordinary prewarmed calls omit it.
+        the graph and its preparation records. Ordinary eager calls omit it.
 
     Returns
     -------
@@ -4146,7 +4163,7 @@ def trtllm_batch_decode_with_kv_cache(
             from .cake_fmha import (
                 CakeFmhaRequestOrderedCapture,
                 CakeFmhaRequestOrderedDecodePlan,
-                _fallback_cake_fmha_request_ordered_plan,
+                _default_cake_fmha_request_ordered_plan,
                 _run_cake_fmha_request_ordered_paged_decode,
             )
 
@@ -4180,7 +4197,7 @@ def trtllm_batch_decode_with_kv_cache(
                     raise ValueError(
                         "FP8-Q request ordering requires an explicit query_dtype plan"
                     )
-                request_order_plan = _fallback_cake_fmha_request_ordered_plan(
+                request_order_plan = _default_cake_fmha_request_ordered_plan(
                     batch_size=batch_size,
                     q_len=q_len_per_req,
                     write_lse=lse is not None,

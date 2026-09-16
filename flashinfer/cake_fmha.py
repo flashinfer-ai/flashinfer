@@ -8,8 +8,10 @@ decode entrypoint and does not change ordinary-call behavior.
 from __future__ import annotations
 
 import copy
+import functools
 import json
 import warnings
+import weakref
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -38,6 +40,9 @@ from .jit.cake_fmha_request_ordered import (
     get_cake_fmha_request_ordered_fp8q_manifest,
     get_cake_fmha_request_ordered_fp8q_split_manifest,
     get_cake_fmha_request_ordered_runtime_q_manifest,
+    get_cake_fmha_request_ordered_runtime_lengths_manifest,
+    get_cake_fmha_request_ordered_one_page_manifest,
+    get_cake_fmha_request_ordered_module_spec,
     load_cake_fmha_request_ordered_module,
 )
 from .utils import get_compute_capability
@@ -59,6 +64,247 @@ class CakeFmhaRequestOrderedDecodePlan:
     query_dtype: torch.dtype = torch.bfloat16
     reducer_module_name: str | None = None
     reducer_grid: tuple[int, int, int] | None = None
+    runtime_length_scheduler: bool = False
+    sm_count: int = 152
+    runtime_one_page: bool = False
+
+    @property
+    def workspace_size_bytes(self) -> int:
+        """Caller workspace capacity, including runtime scheduler counters."""
+        if self.runtime_length_scheduler:
+            return _runtime_length_workspace_layout(self)[-1]
+        if (
+            self.query_dtype == torch.float8_e4m3fn
+            and self.reducer_module_name is not None
+        ):
+            return _fp8q_split_workspace_bytes(self)
+        if self.workspace_parts == 1:
+            return 388
+        return 32 * 1024 * 1024 + sum(_request_ordered_partial_workspace_bytes(self))
+
+
+@functools.cache
+def _runtime_length_cake_fmha_request_ordered_plan(
+    *,
+    batch_size: int,
+    q_len: int,
+    write_lse: bool,
+    num_q_heads: int = 8,
+    num_kv_heads: int = 1,
+) -> CakeFmhaRequestOrderedDecodePlan:
+    """Select one immutable profile; device length/order contents are not keys."""
+    if not (
+        1 <= batch_size <= 256
+        and q_len in (1, 6)
+        and (num_q_heads, num_kv_heads) == (8, 1)
+    ):
+        raise ValueError(
+            "runtime-length request ordering requires B1..256, Q1/Q6 and 8Q/1KV heads"
+        )
+    manifest = get_cake_fmha_request_ordered_runtime_lengths_manifest()
+    matches = [
+        binding
+        for binding in manifest["bindings"]
+        if (
+            binding["q_len"] == q_len
+            and binding["write_lse"] is write_lse
+            and binding["device_scales"] is True
+            and binding["request_order_enabled"] is True
+            and binding["batch_size_min"] <= batch_size <= binding["batch_size_max"]
+        )
+    ]
+    if len(matches) != 1:
+        raise ValueError("no exported runtime-length profile for this Q/LSE mode")
+    sm_count = manifest["contract"]["sm_count"]
+    capacity = matches[0]["workspace_parts"]
+    row_groups = q_len * (num_q_heads // 8)
+    request_grid = batch_size * row_groups
+    # The split capacity is independent of the floor-sized launch grid.
+    grid_parts = min(capacity, max(1, sm_count // request_grid))
+    return CakeFmhaRequestOrderedDecodePlan(
+        module_name=matches[0]["module_name"],
+        batch_size=batch_size,
+        q_len=q_len,
+        workspace_parts=capacity,
+        grid=(q_len, num_q_heads // 8, batch_size * grid_parts),
+        total_tiles=batch_size * capacity,
+        write_lse=write_lse,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        runtime_length_scheduler=True,
+        sm_count=sm_count,
+    )
+
+
+@functools.cache
+def _runtime_one_page_cake_fmha_request_ordered_plan(
+    *,
+    batch_size: int,
+    q_len: int,
+    write_lse: bool,
+    num_q_heads: int = 8,
+    num_kv_heads: int = 1,
+) -> CakeFmhaRequestOrderedDecodePlan:
+    """A single-part sibling; select only after validating physical page capacity."""
+    if not (
+        1 <= batch_size <= 256
+        and q_len in (1, 6)
+        and (num_q_heads, num_kv_heads) == (8, 1)
+    ):
+        raise ValueError(
+            "one-page runtime lengths require B1..256, Q1/Q6 and 8Q/1KV heads"
+        )
+    manifest = get_cake_fmha_request_ordered_one_page_manifest()
+    matches = [
+        binding
+        for binding in manifest["bindings"]
+        if (
+            binding["q_len"] == q_len
+            and binding["write_lse"] is write_lse
+            and binding["device_scales"] is True
+            and binding["request_order_enabled"] is True
+        )
+    ]
+    if len(matches) != 1:
+        raise ValueError("no exported one-page profile for this Q/LSE mode")
+    return CakeFmhaRequestOrderedDecodePlan(
+        module_name=matches[0]["module_name"],
+        batch_size=batch_size,
+        q_len=q_len,
+        workspace_parts=16,
+        grid=(q_len, num_q_heads // 8, batch_size),
+        total_tiles=batch_size * 16,
+        write_lse=write_lse,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        runtime_length_scheduler=True,
+        sm_count=manifest["contract"]["sm_count"],
+        runtime_one_page=True,
+    )
+
+
+def _runtime_storage_variants(plan):
+    if plan.runtime_length_scheduler and not plan.runtime_one_page:
+        return (
+            plan,
+            _runtime_one_page_cake_fmha_request_ordered_plan(
+                batch_size=plan.batch_size,
+                q_len=plan.q_len,
+                write_lse=plan.write_lse,
+                num_q_heads=plan.num_q_heads,
+                num_kv_heads=plan.num_kv_heads,
+            ),
+        )
+    return (plan,)
+
+
+def _default_cake_fmha_request_ordered_plan(
+    *,
+    batch_size: int,
+    q_len: int,
+    write_lse: bool,
+    num_q_heads: int = 8,
+    num_kv_heads: int = 1,
+) -> CakeFmhaRequestOrderedDecodePlan:
+    planner = (
+        _runtime_length_cake_fmha_request_ordered_plan
+        if 1 <= batch_size <= 256
+        and q_len in (1, 6)
+        and (num_q_heads, num_kv_heads) == (8, 1)
+        else _fallback_cake_fmha_request_ordered_plan
+    )
+    return planner(
+        batch_size=batch_size,
+        q_len=q_len,
+        write_lse=write_lse,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+    )
+
+
+_RUNTIME_LENGTH_COUNTER_CAPACITY = 256 * 6
+
+
+def _runtime_length_workspace_layout(plan):
+    counter_begin = 512
+    counter_end = counter_begin + 4 * plan.batch_size * plan.q_len * (
+        plan.num_q_heads // 8
+    )
+    # All members of this family reserve the same counter region. Otherwise
+    # a smaller plan's partials can overwrite a larger plan's idle counters.
+    partial_begin = counter_begin + 4 * _RUNTIME_LENGTH_COUNTER_CAPACITY
+    o_bytes, lse_bytes = _request_ordered_partial_workspace_bytes(plan)
+    partial_end = partial_begin + o_bytes
+    return (
+        counter_begin,
+        counter_end,
+        partial_begin,
+        partial_end,
+        partial_end + lse_bytes,
+    )
+
+
+_runtime_length_workspaces: dict[tuple, tuple] = {}
+
+
+def _runtime_length_workspace(plan, workspace, completion_buffer):
+    """Bind private scratch; initialize owned counters once outside capture."""
+    counter_begin, counter_end, partial_begin, partial_end, required = (
+        _runtime_length_workspace_layout(plan)
+    )
+    if workspace.numel() < required:
+        raise ValueError(
+            f"workspace_buffer needs at least {required} bytes for this plan"
+        )
+    counter_bytes = counter_end - counter_begin
+    if completion_buffer is not None:
+        if (
+            completion_buffer.device != workspace.device
+            or completion_buffer.dtype not in (torch.uint8, torch.int32, torch.uint32)
+            or not completion_buffer.is_contiguous()
+            or completion_buffer.data_ptr() % 4
+            or completion_buffer.numel() * completion_buffer.element_size()
+            < counter_bytes
+        ):
+            raise ValueError(
+                "runtime-length counters require a zero-initialized contiguous 32-bit counter per output group"
+            )
+        completion = (
+            completion_buffer.view(torch.uint8)
+            .flatten()[:counter_bytes]
+            .view(torch.uint32)
+        )
+    else:
+        completion = workspace[counter_begin:counter_end].view(torch.uint32)
+        key = (workspace.device, workspace.data_ptr())
+        state = _runtime_length_workspaces.get(key)
+        reserved_counter_bytes = partial_begin - counter_begin
+        if (
+            state is None
+            or state[0]() is not workspace
+            or state[1:] != (workspace.numel(), reserved_counter_bytes)
+        ):
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "warm this runtime-length workspace before capture or supply zero-initialized explicit counters"
+                )
+            # Initialize the whole family capacity once, including counters
+            # that a later, larger geometry may use in this same storage.
+            workspace[counter_begin:partial_begin].zero_()
+
+            def forget(reference):
+                current = _runtime_length_workspaces.get(key)
+                if current is not None and current[0] is reference:
+                    _runtime_length_workspaces.pop(key)
+
+            _runtime_length_workspaces[key] = (
+                weakref.ref(workspace, forget),
+                workspace.numel(),
+                reserved_counter_bytes,
+            )
+    partial_o = workspace[partial_begin:partial_end].view(torch.bfloat16)
+    partial_lse = workspace[partial_end:required].view(torch.float32)
+    return partial_o, partial_lse, completion
 
 
 def _request_ordered_plan_from_route(
@@ -385,6 +631,12 @@ def plan_cake_fmha_request_ordered_paged_decode(
     64, 128, 160, 192, 224 and 256, plus compound split plans for B8/S8
     and B27 or B32/S2. All use BF16 output, shared page tables, native HND
     views, and KV lengths at least six. Low-batch plans optionally write base2 LSE.
+    BF16 Q1/Q6 with 8Q/1KV heads and B1..256 selects the generic runtime-length
+    scheduler. Its module and grid depend only on fixed geometry; both order
+    and legal KV lengths may change during graph replay. Allocate at least
+    ``plan.workspace_size_bytes`` bytes for its caller workspace. Use
+    :class:`CakeFmhaRequestOrderedCapture` when capturing this family: construct
+    it outside capture, record the decode call, then finalize before replay.
     """
 
     lengths = tuple(int(value) for value in kv_lens)
@@ -445,6 +697,23 @@ def plan_cake_fmha_request_ordered_paged_decode(
             )
         return split
 
+    if (
+        1 <= batch_size <= 256
+        and q_len in (1, 6)
+        and (num_q_heads, num_kv_heads) == (8, 1)
+    ):
+        if min(lengths) < q_len:
+            raise ValueError(
+                "runtime-length request ordering requires kv_lens >= q_len"
+            )
+        return _runtime_length_cake_fmha_request_ordered_plan(
+            batch_size=batch_size,
+            q_len=q_len,
+            write_lse=write_lse,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+        )
+
     if q_len not in (1, 6):
         return _fallback_cake_fmha_request_ordered_plan(
             batch_size=batch_size,
@@ -492,6 +761,21 @@ def _is_authenticated_request_ordered_plan(
 ) -> bool:
     """Return whether ``plan`` names an exported mutable-order route."""
 
+    if plan.runtime_length_scheduler:
+        planner = (
+            _runtime_one_page_cake_fmha_request_ordered_plan
+            if plan.runtime_one_page
+            else _runtime_length_cake_fmha_request_ordered_plan
+        )
+        return plan == planner(
+            batch_size=plan.batch_size,
+            q_len=plan.q_len,
+            write_lse=plan.write_lse,
+            num_q_heads=plan.num_q_heads,
+            num_kv_heads=plan.num_kv_heads,
+        )
+    if plan.sm_count != 152:
+        return False
     if plan.query_dtype == torch.float8_e4m3fn:
         return plan == _fp8q_request_ordered_plan(
             batch_size=plan.batch_size,
@@ -541,16 +825,20 @@ def _is_authenticated_request_ordered_plan(
 
 
 class CakeFmhaRequestOrderedCapture:
-    """Explicit descriptor preparation for Q produced inside CUDA Graph capture.
+    """Explicit descriptor preparation for CUDA Graph capture.
 
+    Runtime-length scheduler plans require this object for every capture. It
+    also supports queries produced inside capture for the other exports.
     Construct with the selected plans outside capture, after warming each
-    module's ordinary launch path. Allocate a distinct caller workspace for
-    every live graph/layer binding before capture. Pass this object as
+    module's ordinary launch path. Call :meth:`prepare_workspace` for each
+    plan/caller-workspace binding before capture; it allocates separate TMA
+    descriptor storage owned by this object. Allocate a distinct caller
+    scratch workspace for each concurrently live graph/layer binding. Pass this object as
     ``request_order_capture`` when recording the public decode call, then call
     :meth:`finalize` after the graph context exits and before its first replay.
     Call :meth:`discard` if recording or finalization fails, and discard that
     graph. The object retains descriptor workspaces, not intermediate Q tensors;
-    keep it alive with its graph. Ordinary prewarmed calls are unchanged.
+    keep it alive with its graph. Ordinary eager calls omit this object.
     """
 
     def __init__(self, plans: Sequence[CakeFmhaRequestOrderedDecodePlan]) -> None:
@@ -562,13 +850,19 @@ class CakeFmhaRequestOrderedCapture:
             raise ValueError(
                 "request-order capture preparation requires selected plans"
             )
-        self._plans = frozenset(plans)
+        for plan in plans:
+            if not _is_authenticated_request_ordered_plan(plan):
+                raise ValueError("request-order capture plan is not an exported route")
+        self._plans = frozenset(
+            variant for plan in plans for variant in _runtime_storage_variants(plan)
+        )
         self._tokens: dict[str, tuple[Any, int]] = {}
         self._reducers: dict[str, Any] = {}
         self._workspaces: dict[int, torch.Tensor] = {}
+        self._descriptor_workspaces: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
         self._state = "recording"
         try:
-            for plan in plans:
+            for plan in self._plans:
                 if not _is_authenticated_request_ordered_plan(plan):
                     raise ValueError(
                         "request-order capture plan is not an exported route"
@@ -591,6 +885,45 @@ class CakeFmhaRequestOrderedCapture:
     def finalized(self) -> bool:
         return self._state == "finalized"
 
+    def prepare_workspace(
+        self,
+        plan: CakeFmhaRequestOrderedDecodePlan,
+        workspace_buffer: torch.Tensor,
+    ) -> None:
+        """Allocate private descriptors for one binding, outside graph capture.
+
+        Register every workspace separately, including multiple workspaces
+        using the same plan. The ordinary workspace argument still owns FMHA
+        scratch; reusing that scratch between sequential operators cannot
+        overwrite this capture's finalized descriptors.
+        """
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("prepare_workspace must run outside CUDA Graph capture")
+        if self._state != "recording" or plan not in self._plans:
+            raise ValueError(
+                "request-order capture is not preparing this selected plan"
+            )
+        if (
+            not workspace_buffer.is_cuda
+            or workspace_buffer.dtype != torch.uint8
+            or not workspace_buffer.is_contiguous()
+            or workspace_buffer.data_ptr() % 128
+            or workspace_buffer.numel() < plan.workspace_size_bytes
+        ):
+            raise ValueError(
+                "prepare_workspace requires the plan's contiguous aligned CUDA uint8 scratch"
+            )
+        for variant in _runtime_storage_variants(plan):
+            key = (variant, workspace_buffer.device, workspace_buffer.data_ptr())
+            if key not in self._descriptor_workspaces:
+                spec = get_cake_fmha_request_ordered_module_spec(variant.module_name)
+                descriptors = torch.empty(
+                    spec.tma_workspace_bytes,
+                    dtype=torch.uint8,
+                    device=workspace_buffer.device,
+                )
+                self._descriptor_workspaces[key] = (workspace_buffer, descriptors)
+
     def _record(
         self,
         plan: CakeFmhaRequestOrderedDecodePlan,
@@ -606,6 +939,16 @@ class CakeFmhaRequestOrderedCapture:
             raise RuntimeError(
                 "request_order_capture is only used inside CUDA Graph capture"
             )
+        key = (plan, workspace.device, workspace.data_ptr())
+        prepared = self._descriptor_workspaces.get(key)
+        if prepared is None:
+            raise RuntimeError(
+                "call prepare_workspace(plan, workspace_buffer) outside capture for this binding"
+            )
+        # The exported ABI places descriptor storage immediately before grid
+        # x/y/z. Keep the public scratch/counter arguments unchanged and bind
+        # only TMA descriptors to this object's independently owned storage.
+        arguments = (*arguments[:-4], prepared[1], *arguments[-3:])
         module, token = self._tokens[plan.module_name]
         module.run_tma_capture(token, *arguments)
         if reducer_arguments is not None:
@@ -633,6 +976,7 @@ class CakeFmhaRequestOrderedCapture:
             module.discard_tma_capture(token)
             del self._tokens[name]
         self._workspaces.clear()
+        self._descriptor_workspaces.clear()
         self._state = "discarded"
 
 
@@ -763,9 +1107,9 @@ def _run_cake_fmha_request_ordered_paged_decode(
     if get_compute_capability(query.device) != (10, 3):
         raise RuntimeError("request-ordered Cake FMHA requires compute capability 10.3")
     sm_count = torch.cuda.get_device_properties(query.device).multi_processor_count
-    if sm_count != 152:
+    if sm_count != plan.sm_count:
         raise RuntimeError(
-            f"request-ordered Cake FMHA requires a 152-SM device, got {sm_count}"
+            f"request-ordered Cake FMHA plan requires {plan.sm_count} SMs, got {sm_count}"
         )
     batch_size, q_len = plan.batch_size, plan.q_len
     if query.shape != (batch_size * q_len, plan.num_q_heads, 256):
@@ -827,7 +1171,11 @@ def _run_cake_fmha_request_ordered_paged_decode(
         raise TypeError("request_order must be contiguous CUDA int32 [batch]")
     if block_tables.dtype != torch.int32 or not block_tables.is_contiguous():
         raise TypeError("block_tables must be contiguous CUDA int32")
-    required_pages = 2 * (((max(1, (int(max_seq_len) + 127) // 128) + 1) // 2) * 2)
+    required_pages = (
+        (int(max_seq_len) + 63) // 64
+        if plan.runtime_length_scheduler
+        else 2 * (((max(1, (int(max_seq_len) + 127) // 128) + 1) // 2) * 2)
+    )
     if uses_shared_paged_kv_idx:
         if block_tables.ndim != 2 or block_tables.shape[0] != batch_size:
             raise ValueError("shared block_tables must have shape [batch, pages]")
@@ -889,6 +1237,35 @@ def _run_cake_fmha_request_ordered_paged_decode(
         )
     if not _is_authenticated_request_ordered_plan(plan):
         raise ValueError("request_order_plan does not match an exported route")
+    if plan.runtime_length_scheduler:
+        if plan.runtime_one_page and pages != 1:
+            raise ValueError(
+                "one-page runtime plan requires one physical page per table"
+            )
+        if pages == 1:
+            plan = _runtime_one_page_cake_fmha_request_ordered_plan(
+                batch_size=plan.batch_size,
+                q_len=plan.q_len,
+                write_lse=plan.write_lse,
+                num_q_heads=plan.num_q_heads,
+                num_kv_heads=plan.num_kv_heads,
+            )
+    if (
+        plan.runtime_length_scheduler
+        and capture is None
+        and torch.cuda.is_current_stream_capturing()
+    ):
+        raise RuntimeError(
+            "runtime-length graph capture requires request_order_capture; "
+            "construct CakeFmhaRequestOrderedCapture before capture and "
+            "finalize it before replay"
+        )
+    if not plan.runtime_length_scheduler:
+        # Other families may use this region for partial results. Reinitialize
+        # owned counters on the next eager runtime-length invocation.
+        _runtime_length_workspaces.pop(
+            (workspace_buffer.device, workspace_buffer.data_ptr()), None
+        )
     tma_workspace = workspace_buffer[:384]
     if plan.query_dtype == torch.float8_e4m3fn:
         if not uses_shared_paged_kv_idx:
@@ -941,7 +1318,11 @@ def _run_cake_fmha_request_ordered_paged_decode(
                     reducer_arguments,
                 )
         return
-    if plan.workspace_parts == 1:
+    if plan.runtime_length_scheduler:
+        partial_o, partial_lse, completion = _runtime_length_workspace(
+            plan, workspace_buffer, completion_buffer
+        )
+    elif plan.workspace_parts == 1:
         partial_o = out
         partial_lse = lse_arg
         completion = seq_lens.view(torch.uint32)

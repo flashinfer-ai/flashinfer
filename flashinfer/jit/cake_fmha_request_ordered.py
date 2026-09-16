@@ -33,6 +33,263 @@ _CONTRACT = {
     "softmax_accumulation_dtype": "float32",
 }
 
+_RUNTIME_LENGTHS_STEM = "cake_fmha_request_ordered_paged_decode_runtime_lengths"
+_RUNTIME_LENGTHS_MANIFEST = _RUNTIME_LENGTHS_STEM + "_manifest.json"
+_RUNTIME_LENGTHS_GRID_RULE = "q_len,head_groups,batch*min(workspace_parts,max(1,floor(sm_count/(batch*q_len*head_groups))))"
+_RUNTIME_LENGTHS_CAPACITY_RULE = (
+    "max(16,min(256,next_power_of_2(ceil(sm_count/(batch*q_len*head_groups)))))"
+)
+_ONE_PAGE_STEM = _RUNTIME_LENGTHS_STEM + "_one_page"
+_ONE_PAGE_MANIFEST = _ONE_PAGE_STEM + "_manifest.json"
+
+
+def _one_page_source_root() -> Path:
+    directory = "request_ordered_paged_decode_runtime_lengths_one_page"
+    for root in (
+        jit_env.FLASHINFER_CSRC_DIR / "cake_fmha" / directory,
+        Path(__file__).resolve().parents[2] / "csrc" / "cake_fmha" / directory,
+    ):
+        if (root / _ONE_PAGE_MANIFEST).is_file():
+            return root
+    raise FileNotFoundError(
+        "request-ordered one-page runtime-length sources were not found"
+    )
+
+
+@functools.cache
+def get_cake_fmha_request_ordered_one_page_manifest() -> dict[str, Any]:
+    """Authenticate profiles selected by immutable per-table page capacity."""
+    root = _one_page_source_root()
+    payload = json.loads((root / _ONE_PAGE_MANIFEST).read_text())
+    _require(
+        payload.get("schema") == "flashinfer.cake_fmha_request_ordered_one_page.v1",
+        "one-page schema",
+    )
+    _require(payload.get("target") == "sm_103a", "one-page target")
+    contract = payload.get("contract")
+    _require(isinstance(contract, dict), "one-page contract")
+    sm_count, min_pairs = contract.get("sm_count"), contract.get("min_pairs")
+    _require(type(sm_count) is int and sm_count > 0, "one-page SM count")
+    _require(
+        type(min_pairs) is int and 1 <= min_pairs <= 8388608, "one-page granularity"
+    )
+    _require(
+        contract
+        == {
+            "query_dtype": "bfloat16",
+            "kv_dtype": "float8_e4m3fn",
+            "output_dtype": "bfloat16",
+            "num_q_heads": 8,
+            "num_kv_heads": 1,
+            "head_dim": 256,
+            "page_size": 64,
+            "kv_layout": "HND",
+            "causal": True,
+            "batch_capacity": 256,
+            "sm_count": sm_count,
+            "min_pairs": min_pairs,
+            "workspace_parts": 16,
+            "physical_pages_per_table": 1,
+            "scheduler": "runtime_lengths_one_page",
+            "request_order_semantics": "original_logical_request_index",
+        },
+        "one-page contract fields",
+    )
+    modules, bindings = payload.get("modules"), payload.get("bindings")
+    _require(
+        isinstance(modules, list) and isinstance(bindings, list), "one-page inventory"
+    )
+    _require(
+        payload.get("module_count") == len(modules) == len(bindings) == 16,
+        "one-page profile count",
+    )
+    names = _verify_modules(root, modules)
+    _require(
+        all(name.startswith(_ONE_PAGE_STEM + "_") for name in names),
+        "one-page module prefix",
+    )
+    profiles = set()
+    for binding in bindings:
+        q = binding.get("q_len")
+        modes = tuple(
+            binding.get(key)
+            for key in ("write_lse", "device_scales", "request_order_enabled")
+        )
+        _require(type(q) is int and q in (1, 6), "one-page Q length")
+        _require(all(type(mode) is bool for mode in modes), "one-page mode flags")
+        profile = (q, *modes)
+        _require(profile not in profiles, "duplicate one-page profile")
+        profiles.add(profile)
+        _require(binding.get("module_name") in names, "one-page module binding")
+        smem = binding.get("dynamic_smem_bytes")
+        _require(type(smem) is int and smem > 0, "one-page shared memory")
+        _require(
+            binding
+            == {
+                "module_name": binding["module_name"],
+                "batch_size_min": 1,
+                "batch_size_max": 256,
+                "q_len": q,
+                "num_q_heads": 8,
+                "num_kv_heads": 1,
+                "write_lse": modes[0],
+                "device_scales": modes[1],
+                "request_order_enabled": modes[2],
+                "workspace_parts": 16,
+                "shared_plan_capacity": 256,
+                "min_pairs": min_pairs,
+                "physical_pages_per_table": 1,
+                "grid_rule": "q_len,head_groups,batch",
+                "dynamic_smem_bytes": smem,
+                "total_tiles_rule": "batch*workspace_parts",
+            },
+            "one-page binding fields",
+        )
+    _require(
+        {binding["module_name"] for binding in bindings} == names,
+        "one-page module coverage",
+    )
+    return payload
+
+
+def _runtime_length_split_capacity(batch: int, q_len: int, sm_count: int) -> int:
+    required = (sm_count + batch * q_len - 1) // (batch * q_len)
+    return max(16, min(256, 1 << (required - 1).bit_length()))
+
+
+def _runtime_lengths_source_root() -> Path:
+    directory = "request_ordered_paged_decode_runtime_lengths"
+    candidates = (
+        jit_env.FLASHINFER_CSRC_DIR / "cake_fmha" / directory,
+        Path(__file__).resolve().parents[2] / "csrc" / "cake_fmha" / directory,
+    )
+    for candidate in candidates:
+        if (candidate / _RUNTIME_LENGTHS_MANIFEST).is_file():
+            return candidate
+    raise FileNotFoundError("request-ordered runtime-length sources were not found")
+
+
+@functools.cache
+def get_cake_fmha_request_ordered_runtime_lengths_manifest() -> dict[str, Any]:
+    """Authenticate the family that reads lengths and order during each launch."""
+    root = _runtime_lengths_source_root()
+    payload = json.loads((root / _RUNTIME_LENGTHS_MANIFEST).read_text())
+    _require(isinstance(payload, dict), "runtime-length root")
+    _require(
+        payload.get("schema")
+        == "flashinfer.cake_fmha_request_ordered_runtime_lengths.v2",
+        "runtime-length schema",
+    )
+    _require(payload.get("target") == "sm_103a", "runtime-length target")
+    contract = payload.get("contract")
+    _require(isinstance(contract, dict), "runtime-length contract")
+    sm_count, min_pairs = contract.get("sm_count"), contract.get("min_pairs")
+    _require(type(sm_count) is int and sm_count > 0, "runtime-length SM count")
+    _require(
+        type(min_pairs) is int and 1 <= min_pairs <= 8388608,
+        "runtime-length granularity",
+    )
+    _require(
+        contract
+        == {
+            "query_dtype": "bfloat16",
+            "kv_dtype": "float8_e4m3fn",
+            "output_dtype": "bfloat16",
+            "num_q_heads": 8,
+            "num_kv_heads": 1,
+            "head_dim": 256,
+            "page_size": 64,
+            "kv_layout": "HND",
+            "causal": True,
+            "split_capacities": [16, 32, 64, 128, 256],
+            "split_capacity_rule": _RUNTIME_LENGTHS_CAPACITY_RULE,
+            "batch_capacity": 256,
+            "sm_count": sm_count,
+            "scheduler": "runtime_lengths",
+            "min_pairs": min_pairs,
+            "request_order_semantics": "original_logical_request_index",
+        },
+        "runtime-length contract fields",
+    )
+    modules, bindings = payload.get("modules"), payload.get("bindings")
+    _require(isinstance(modules, list) and bool(modules), "runtime-length modules")
+    _require(isinstance(bindings, list) and bool(bindings), "runtime-length bindings")
+    _require(payload.get("module_count") == len(modules), "runtime-length module count")
+    names = _verify_modules(root, modules)
+    _require(
+        all(name.startswith(_RUNTIME_LENGTHS_STEM + "_") for name in names),
+        "runtime-length module prefix",
+    )
+    seen = set()
+    covered: dict[tuple[Any, ...], set[int]] = {}
+    for index, binding in enumerate(bindings):
+        _require(isinstance(binding, dict), f"runtime-length bindings[{index}]")
+        _require(binding.get("module_name") in names, "runtime-length module binding")
+        q_len = binding.get("q_len")
+        _require(type(q_len) is int and q_len in (1, 6), "runtime-length Q length")
+        modes = tuple(
+            binding.get(key)
+            for key in ("write_lse", "device_scales", "request_order_enabled")
+        )
+        _require(all(type(mode) is bool for mode in modes), "runtime-length mode flags")
+        profile = (q_len, *modes)
+        capacity = binding.get("workspace_parts")
+        _require(
+            type(capacity) is int and capacity in (16, 32, 64, 128, 256),
+            "runtime-length split capacity",
+        )
+        first, last = binding.get("batch_size_min"), binding.get("batch_size_max")
+        _require(
+            type(first) is int and type(last) is int and 1 <= first <= last <= 256,
+            "runtime-length batch interval",
+        )
+        key = (*profile, capacity)
+        _require(key not in seen, "duplicate runtime-length capacity profile")
+        seen.add(key)
+        batches = set(range(first, last + 1))
+        _require(
+            all(
+                _runtime_length_split_capacity(batch, q_len, sm_count) == capacity
+                for batch in batches
+            ),
+            "runtime-length capacity selector mismatch",
+        )
+        previous = covered.setdefault(profile, set())
+        _require(
+            not previous.intersection(batches),
+            "overlapping runtime-length batch intervals",
+        )
+        previous.update(batches)
+        smem = binding.get("dynamic_smem_bytes")
+        _require(type(smem) is int and smem > 0, "runtime-length shared memory")
+        expected = {
+            "module_name": binding["module_name"],
+            "batch_size_min": first,
+            "batch_size_max": last,
+            "q_len": q_len,
+            "num_q_heads": 8,
+            "num_kv_heads": 1,
+            "write_lse": modes[0],
+            "device_scales": modes[1],
+            "request_order_enabled": modes[2],
+            "workspace_parts": capacity,
+            "shared_plan_capacity": 256,
+            "min_pairs": min_pairs,
+            "grid_rule": _RUNTIME_LENGTHS_GRID_RULE,
+            "dynamic_smem_bytes": smem,
+            "total_tiles_rule": "batch*workspace_parts",
+        }
+        _require(binding == expected, "runtime-length binding fields")
+    _require(
+        all(batches == set(range(1, 257)) for batches in covered.values()),
+        "runtime-length profile has a batch coverage gap",
+    )
+    _require(
+        {binding["module_name"] for binding in bindings} == names,
+        "runtime-length module coverage",
+    )
+    return payload
+
 
 _FP8Q_MANIFEST_NAME = "cake_fmha_request_ordered_paged_decode_fp8q_manifest.json"
 _FP8Q_CONTRACT: dict[str, Any] = {
@@ -504,7 +761,13 @@ def get_cake_fmha_request_ordered_module_spec(
         if name.startswith("cake_fmha_request_ordered_paged_decode_32q2_")
         else (8, 1)
     )
-    if name.startswith("cake_fmha_request_ordered_paged_decode_fp8q_split_"):
+    if name.startswith(_ONE_PAGE_STEM + "_"):
+        root = _one_page_source_root()
+        manifest = get_cake_fmha_request_ordered_one_page_manifest()
+    elif name.startswith(_RUNTIME_LENGTHS_STEM + "_"):
+        root = _runtime_lengths_source_root()
+        manifest = get_cake_fmha_request_ordered_runtime_lengths_manifest()
+    elif name.startswith("cake_fmha_request_ordered_paged_decode_fp8q_split_"):
         root = _fp8q_source_root(split=True)
         manifest = get_cake_fmha_request_ordered_fp8q_split_manifest()
     elif name.startswith("cake_fmha_request_ordered_paged_decode_fp8q_"):
@@ -812,5 +1075,6 @@ __all__ = [
     "CakeFmhaRequestOrderedModuleSpec",
     "get_cake_fmha_request_ordered_manifest",
     "get_cake_fmha_request_ordered_module_spec",
+    "get_cake_fmha_request_ordered_runtime_lengths_manifest",
     "load_cake_fmha_request_ordered_module",
 ]

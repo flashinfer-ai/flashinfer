@@ -124,13 +124,14 @@ It is also reachable through
 ``causal_seqlens_kv_global`` argument is the explicit add-on selection key.
 On SM103, the same Cake entrypoint accepts a device ``request_order`` tensor
 for BF16-query, FP8-E4M3 paged decode with head dimension 256.  Precompute an
-optional immutable length-aware schedule with
+optional immutable launch plan with
 :func:`flashinfer.plan_cake_fmha_request_ordered_paged_decode` before graph
-capture.  Page-table rows must be padded to
-``4 * ceil(max_seq_len / 256)`` entries, and the exact tensor/workspace binding
-must be invoked once eagerly to initialize its TMA descriptors before capture.
-After that prewarm, changing only the order tensor contents does not require
-recapture.
+capture. The BF16 Q1/Q6, 8-query-head/1-KV-head route uses a kernel-owned
+runtime-length scheduler for batches 1 through 256, with native page-table
+rows containing ``ceil(max_seq_len / 64)`` slots. Other request-ordered
+geometries retain their route-specific page padding requirements. Follow
+:doc:`cake_fmha` for workspace preparation and capture ownership; device
+lengths and request order remain mutable within the selected plan's contract.
 
 The planner's optional ``num_kv_splits`` selects an exported split schedule;
 omitting it preserves the ordinary schedule selection. For 32 query heads and
@@ -142,9 +143,10 @@ launch layouts, and device lengths and request order remain mutable on replay.
 
 Split plans require a zero-initialized ``multi_ctas_kv_counter_buffer`` with
 at least ``batch * q_len * (num_q_heads // 8)`` int32 elements. Their uint8
-workspace must contain at least
-``32 MiB + batch * q_len * num_q_heads * plan.workspace_parts * (256 * 2 + 4)``
-bytes. When ``plan.write_lse`` is true, also pass a contiguous FP32 ``lse``
+workspace must contain at least ``plan.workspace_size_bytes`` bytes, which
+uses the selected module's scratch layout. In particular, the B1/Q6 route
+with 32 query heads, two KV heads and 76 splits requires 43,671,552 bytes;
+the generic split formula underestimates this route's storage. When ``plan.write_lse`` is true, also pass a contiguous FP32 ``lse``
 tensor with shape ``[batch * q_len, num_q_heads]``. Allocate these buffers
 before capture and retain them with the graph. Query tensors produced inside
 capture use :class:`flashinfer.cake_fmha.CakeFmhaRequestOrderedCapture` and its
