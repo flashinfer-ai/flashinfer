@@ -8,7 +8,7 @@
     "official_base_commit": "ac7bce13ea0ff76392fd17aa696b096e191d0825",
     "official_base_tree": "73b1ce0e86040d051c1500e4a2d2509e7c903e1f",
     "official_base_parent": "43550a80857ea385f081b9cb1d019b137a96539d",
-    "migration_tip_before_manifest": "31c34e35fd24f40be25f25efc409f215f07cc739"
+    "migration_content_tip": "04234997"
   },
   "official_base_submodules": {
     "3rd-party/cutlass": "8078b13ca63742cb0770662eccaf88a87dba4b95",
@@ -94,5 +94,12 @@
     "The migration source has no common ancestor with official upstream.",
     "Its Mamba blobs match the official base, but the whole snapshot differs at 45 paths.",
     "This manifest records source identity; it does not attest the new integration head until runtime tests are rerun."
-  ]
+  ],
+  "source_parity": {
+    "reviewed_source_reference": "b8bb644",
+    "scope": "docs/mamba, flashinfer/mamba, csrc/mamba, tests/mamba, benchmarks/mamba, benchmarks/README.md, flashinfer/utils.py",
+    "differences_after_migration": [
+      "docs/mamba/musa_nemotron_manifest.json"
+    ]
+  }
 }
