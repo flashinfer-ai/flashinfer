@@ -186,12 +186,15 @@ def test_cli_json_cache_restores_in_a_fresh_process(tmp_path: Path) -> None:
     restored = tmp_path / "restored.json"
     # Start from the user environment, then pin only public tuning/cache controls for this process.
     environment = os.environ.copy()
+    python_path = [str(Path.cwd())]
+    if inherited_python_path := environment.get("PYTHONPATH"):
+        python_path.append(inherited_python_path)
     environment.update(
         {
             "FLASHINFER_DA_BASELINE_GUARD": "0",
             "FLASHINFER_WORKSPACE_BASE": str(Path.cwd() / ".cache"),
             "MAX_JOBS": "8",
-            "PYTHONPATH": str(Path.cwd()),
+            "PYTHONPATH": os.pathsep.join(python_path),
         }
     )
     for name in (
