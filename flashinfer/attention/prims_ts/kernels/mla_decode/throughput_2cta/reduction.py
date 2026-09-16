@@ -138,7 +138,13 @@ def zero_balanced_inactive_outputs(
     reducer_capacity: cutlass.Constexpr[int],
     rows_per_cta: cutlass.Constexpr[int],
 ):
-    """Grid-stride empty requests from a compact, graph-stable reducer grid."""
+    """Publish empty requests from a compact, graph-stable reducer grid.
+
+    Zero-KV requests intentionally have neither a producer work descriptor nor
+    a combine descriptor. Consequently no mainloop or ordinary reduction CTA
+    owns their public output. Grid-striding them here replaces output left by a
+    previous replay with zero and replaces private LSE with negative infinity.
+    """
 
     _, _, reducer_slot = cute.arch.block_idx()
     batch_idx = reducer_slot

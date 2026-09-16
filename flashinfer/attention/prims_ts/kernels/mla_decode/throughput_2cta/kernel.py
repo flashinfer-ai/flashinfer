@@ -1918,9 +1918,9 @@ class MlaDecodeTs:
             prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
         if cutlass.const_expr(self.use_balanced_scheduler):
             _, _, combine_slot = cute.arch.block_idx()
-            # The producer omits zero-KV requests. Keep the compact fixed grid
-            # and stride it over all logical request slots to publish zero O
-            # and -inf private LSE without a second launch or another graph.
+            # Zero-KV requests have no producer or combine descriptor, so the
+            # normal main/reduction paths cannot publish their result. Keep the
+            # compact fixed grid and stride it over every logical request slot.
             zero_balanced_inactive_outputs(
                 self,
                 output,

@@ -1482,6 +1482,8 @@ def test_attention_ts_mla_balanced_inactive_slots_across_graph_replay(
     assert policy["kernel"] == expected_kernel
     assert policy["balanced_reducer_capacity"] < batch_size
     assert wrapper._plan_state is not None
+    plan = wrapper._plan_state.balanced_plan
+    assert plan is not None
 
     graph_out = torch.empty(
         (*case.query.shape[:-1], _LATENT_DIM),
@@ -1522,6 +1524,19 @@ def test_attention_ts_mla_balanced_inactive_slots_across_graph_replay(
             for request_idx, seq_len in enumerate(runtime_seq_lens)
             if seq_len > 0
         )
+        descriptor_requests = set(
+            plan.work_descriptors[: plan.last_descriptor_count, 0].cpu().tolist()
+        )
+        combine_requests = set(
+            plan.combine_descriptors[: plan.last_combine_request_count, 0]
+            .cpu()
+            .tolist()
+        )
+        # The scheduler deliberately omits empty rows from both descriptor
+        # streams. Their public zero output and -inf LSE therefore cannot come
+        # from either the mainloop or the ordinary combine path.
+        assert descriptor_requests == set(active)
+        assert combine_requests.issubset(active)
         if inactive:
             torch.testing.assert_close(
                 graph_out[list(inactive)],
