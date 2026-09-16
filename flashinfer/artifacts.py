@@ -312,6 +312,11 @@ def download_artifacts() -> None:
                 "Invalid FLASHINFER_CUBIN_MAX_RETRIES value:"
                 f" {max_retries_env!r}. Expected an integer."
             ) from e
+        if max_retries < 1:
+            raise RuntimeError(
+                "Invalid FLASHINFER_CUBIN_MAX_RETRIES value:"
+                f" {max_retries_env!r}. Expected an integer >= 1."
+            )
 
     retry_window_env = os.environ.get("FLASHINFER_CUBIN_RETRY_WINDOW_SECONDS", "0")
     try:
@@ -321,9 +326,11 @@ def download_artifacts() -> None:
             "Invalid FLASHINFER_CUBIN_RETRY_WINDOW_SECONDS value:"
             f" {retry_window_env!r}. Expected an integer."
         ) from e
-    retry_deadline = (
-        time.monotonic() + retry_window_seconds if retry_window_seconds > 0 else None
-    )
+    if retry_window_seconds < 0:
+        raise RuntimeError(
+            "Invalid FLASHINFER_CUBIN_RETRY_WINDOW_SECONDS value:"
+            f" {retry_window_env!r}. Expected an integer >= 0."
+        )
 
     cached_files: set[str] = set()
     files_to_download: list[tuple[str, str]] = []
@@ -361,6 +368,11 @@ def download_artifacts() -> None:
             with requests.Session() as session:
                 request_kwargs = dict(kwargs)
                 request_kwargs["session"] = session
+                retry_deadline = (
+                    time.monotonic() + retry_window_seconds
+                    if retry_window_seconds > 0
+                    else None
+                )
                 while True:
                     if download_file(source_path, destination_path, **request_kwargs):
                         return True

@@ -688,6 +688,34 @@ def test_download_artifacts_invalid_retry_window_env_raises(monkeypatch, tmp_pat
         artifacts.download_artifacts()
 
 
+def test_download_artifacts_negative_retry_window_env_raises(monkeypatch, tmp_path):
+    """Negative retry-window values are rejected."""
+    from flashinfer import artifacts
+
+    cubin_dir = tmp_path / "cubins"
+    monkeypatch.setattr(artifacts, "FLASHINFER_CUBIN_DIR", cubin_dir)
+    monkeypatch.setenv("FLASHINFER_CUBIN_RETRY_WINDOW_SECONDS", "-1")
+    monkeypatch.setattr(artifacts, "get_subdir_file_list", lambda: iter([]))
+
+    with pytest.raises(
+        RuntimeError, match="Invalid FLASHINFER_CUBIN_RETRY_WINDOW_SECONDS value"
+    ):
+        artifacts.download_artifacts()
+
+
+def test_download_artifacts_non_positive_max_retries_env_raises(monkeypatch, tmp_path):
+    """Non-positive retry-count env values are rejected."""
+    from flashinfer import artifacts
+
+    cubin_dir = tmp_path / "cubins"
+    monkeypatch.setattr(artifacts, "FLASHINFER_CUBIN_DIR", cubin_dir)
+    monkeypatch.setenv("FLASHINFER_CUBIN_MAX_RETRIES", "0")
+    monkeypatch.setattr(artifacts, "get_subdir_file_list", lambda: iter([]))
+
+    with pytest.raises(RuntimeError, match="Invalid FLASHINFER_CUBIN_MAX_RETRIES value"):
+        artifacts.download_artifacts()
+
+
 def test_download_artifacts_rejects_bad_download_after_cache_miss(
     monkeypatch, tmp_path
 ):
