@@ -152,8 +152,8 @@ def _mega_problem(
     max_tokens: int = 64,
     num_experts: int = 8,
     topk: int = 4,
+    hidden: int = 2048,
 ):
-    hidden = 2048
     intermediate = 1024
     gate_up_clamp = 10.0
     fast_math = True
@@ -440,6 +440,7 @@ def _run_mega_layer(
     cluster_shape_mnk=None,
     num_experts: int = 8,
     topk: int = 4,
+    hidden: int = 2048,
 ):
     import torch
     import torch.distributed as dist
@@ -473,6 +474,7 @@ def _run_mega_layer(
         max_tokens=max_tokens,
         num_experts=num_experts,
         topk=topk,
+        hidden=hidden,
     )
     kernel = create_mega_kernel(
         _megakernel_config(
@@ -764,6 +766,42 @@ def test_moe_ep_sm90_pull_fp8_mega_layer_grouped_token_back(
         f"rank {rank}: sm90_fp8_fp8_bf16_pull_cutedsl mega layer "
         f"({fp8_scale_mode}, grouped_token_back, combine={combine_format}, "
         f"dedup={dedup_dispatch}) within tolerance"
+    )
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_hopper
+@pytest.mark.parametrize("combine_format", ["bf16", "32e4m3xe8m0"])
+def test_moe_ep_sm90_pull_fp8_mega_layer_grouped_token_back_small_hidden(
+    combine_format,
+):
+    """Grouped combine with hidden below the wire chunk and several pull warps.
+
+    The grouped reducer stages a fixed 512-element wire chunk per warp
+    (1024 B for bf16, 512 B + hidden/32 scale bytes for the fp8 wire), so at
+    hidden=512 a per-warp SMEM slot of one fp8 dispatch row (512 B) would
+    make adjacent active dispatch warps overwrite each other's chunk while
+    its TMA push is still reading it.  The slot is sized from the wire
+    chunk; this case runs two active pull warps to exercise the boundary.
+    """
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size < 4:
+        pytest.skip("needs >=4 ranks")
+    rank = _run_mega_layer(
+        rank,
+        world_size,
+        quantize_input=True,
+        fp8_scale_mode="per_tensor",
+        grouped_token_back=True,
+        combine_format=combine_format,
+        active_dispatch_warps=2,
+        hidden=512,
+    )
+    print(
+        f"rank {rank}: sm90_fp8_fp8_bf16_pull_cutedsl mega layer "
+        f"(grouped_token_back, combine={combine_format}, hidden=512, "
+        "active_dispatch_warps=2) within tolerance"
     )
 
 

@@ -375,6 +375,10 @@ class TokenInPullTokenBackPush:
     num_dispatch_warps: int = 4
     warp_threads: int = 32
     num_dispatch_threads: int = num_dispatch_warps * warp_threads
+    # Grouped combine wire: each lane carries GroupedLaneElems elements, a
+    # warp stages one GroupedChunkElems-element chunk in SMEM per TMA push.
+    GroupedLaneElems: int = 16
+    GroupedChunkElems: int = 32 * GroupedLaneElems
     dispatch_intra_cta_bar_id: int = 10
     kernel_tail_named_barrier_id: int = 8
     dispatch_to_sched_named_barrier_id: int = 9
@@ -556,6 +560,26 @@ class TokenInPullTokenBackPush:
         # tb_chunk_bytes pieces (last piece carries the remainder), so this is
         # independent of hidden.
         self.tb_chunk_bytes = 2048
+        # Per-warp SMEM slot of the reuse token-back path.  The plain push
+        # moves the fc2 token in chunk_bytes (= hidden_bytes) pieces, so one
+        # dispatch row per warp suffices; the grouped combine instead stages a
+        # fixed GroupedChunkElems-element wire chunk (+ the per-32 scale bytes
+        # of a quantized wire) per warp regardless of hidden, so the slot must
+        # cover both or adjacent warps overlap (hidden_bytes < wire chunk, e.g.
+        # hidden 512 fp8 with a BF16 wire).
+        self.tb_slot_bytes = self.hidden_bytes
+        if self.grouped_token_back:
+            if hidden % self.GroupedChunkElems != 0:
+                raise ValueError(
+                    "grouped_token_back needs hidden % "
+                    f"{self.GroupedChunkElems} == 0, got hidden={hidden}."
+                )
+            grouped_bytes = (
+                self.GroupedChunkElems * int(combine_format.act_dtype.width) // 8
+            )
+            if combine_format.is_quantized:
+                grouped_bytes += hidden // 32
+            self.tb_slot_bytes = max(self.tb_slot_bytes, grouped_bytes)
 
         self.num_total_threads = (
             self.num_dispatch_threads
@@ -613,12 +637,12 @@ class TokenInPullTokenBackPush:
     def pull_buffer_bytes(self) -> int:
         """Bytes of the dispatch pull buffer in ``extra_smem_storage_class``."""
         if self.compact_pull_buffer:
-            # Each active warp needs one token row for dispatch and one
-            # tb_chunk_bytes piece for the reuse token-back path.
+            # Each active warp needs one token row for dispatch, its reuse
+            # token-back slot, and one tb_chunk_bytes piece.
             return self.active_dispatch_warps * max(
-                self.hidden_bytes, self.tb_chunk_bytes
+                self.tb_slot_bytes, self.tb_chunk_bytes
             )
-        return self.num_dispatch_warps * self.hidden_bytes
+        return self.num_dispatch_warps * self.tb_slot_bytes
 
     def extra_smem_storage_class(self) -> type:
         pull_buffer_bytes = self.pull_buffer_bytes()
@@ -1575,8 +1599,8 @@ class TokenInPullTokenBackPush:
         (``apply_topk_in_fc1``), so the group sum is a plain add; the source
         side dequantizes back to fp32 and reduces over contributing ranks.
         """
-        LANE_ELEMS: cutlass.Constexpr[int] = 16
-        CHUNK_ELEMS: cutlass.Constexpr[int] = 32 * LANE_ELEMS
+        LANE_ELEMS: cutlass.Constexpr[int] = self.GroupedLaneElems
+        CHUNK_ELEMS: cutlass.Constexpr[int] = self.GroupedChunkElems
         n_chunks: cutlass.Constexpr[int] = self.hidden // CHUNK_ELEMS
         quantized: cutlass.Constexpr[bool] = self.combine_format.is_quantized
         act_dtype = self.combine_format.act_dtype
@@ -1792,6 +1816,7 @@ class TokenInPullTokenBackPush:
         local_rank,
         num_sms,
         chunk_bytes: cutlass.Constexpr[int],
+        slot_bytes: cutlass.Constexpr[int],
         num_token_back_warps: cutlass.Constexpr[int],
     ):
         _iket_emit = (sm_idx == Int32(0)) and (warp_idx == Int32(0))
@@ -1951,7 +1976,8 @@ class TokenInPullTokenBackPush:
                 src_topk = md.src_topk
                 is_remote_token_back = src_rank != Int32(local_rank)
 
-                smem_ptr_warp = pull_buffer_ptr + warp_idx * Int32(chunk_bytes)
+                # slot_bytes >= chunk_bytes and >= the grouped wire chunk
+                smem_ptr_warp = pull_buffer_ptr + warp_idx * Int32(slot_bytes)
                 mbar_ptr_warp = pull_mbar_ptr + warp_idx
 
                 if _iket_emit:
@@ -2301,6 +2327,7 @@ class TokenInPullTokenBackPush:
                 local_rank=token_comm_args.local_rank,
                 num_sms=token_comm_args.sm_count,
                 chunk_bytes=self.hidden_bytes,
+                slot_bytes=self.tb_slot_bytes,
                 num_token_back_warps=self.active_dispatch_warps,
             )
 
@@ -2381,6 +2408,7 @@ class TokenInPullTokenBackPush:
             local_rank=token_comm_args.local_rank,
             num_sms=token_comm_args.sm_count,
             chunk_bytes=self.tb_chunk_bytes,
+            slot_bytes=self.tb_chunk_bytes,
             num_token_back_warps=self.num_token_back_warps,
         )
 
