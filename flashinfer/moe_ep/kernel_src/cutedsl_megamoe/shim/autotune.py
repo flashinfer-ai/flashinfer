@@ -45,6 +45,8 @@ from .tuner import (
     is_valid_bf16_for_config,
     is_valid_bf16_mxfp8,
     is_valid_bf16_mxfp8_for_config,
+    is_valid_bf16_nvfp4,
+    is_valid_bf16_nvfp4_for_config,
 )
 
 # Shared base of the sweep restriction (values that won every profile so far).
@@ -208,8 +210,8 @@ def bf16_nvfp4_candidates(
     *, enable_in_kernel_fc2_reduce: bool = False
 ) -> List[Dict[str, Any]]:
     """Candidate space for the mixed NVFP4/BF16 kernel."""
-    from .tuner import is_valid_bf16_nvfp4
-
+    # The mixed kernels currently share an implementation tuple set. Keep the
+    # dtype-specific predicate here so future kernel divergence is automatic.
     return [
         knobs
         for knobs in bf16_mxfp8_candidates(
@@ -646,8 +648,6 @@ def autotune_bf16_nvfp4_mega_moe(
 ) -> Dict[str, Any]:
     """Autotune the BF16×NVFP4 MegaMoE session on staged inputs."""
     from .bf16_nvfp4 import bf16_nvfp4_mega_moe
-    from .tuner import is_valid_bf16_nvfp4_for_config
-
     def launch() -> None:
         bf16_nvfp4_mega_moe(
             y,

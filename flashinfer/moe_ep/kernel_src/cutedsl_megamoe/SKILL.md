@@ -4,7 +4,7 @@
 
 ```
 kernel_src/cutedsl_megamoe/
-├── src/                    ← VERBATIM kernel-team drop; NEVER edit or add files here
+├── src/                    ← kernel-team drop; exceptions are tracked in VENDOR.md
 │   ├── common/
 │   ├── src/                ← CuTeDSL core src (bootstrap, dispatch, sym_buffer, …)
 │   ├── moe_mxfp8_glu/      ← MXFP8 kernel implementation
@@ -18,6 +18,8 @@ kernel_src/cutedsl_megamoe/
 │   ├── nvfp4.py            ← NVFP4 frontend + symm-buffer/launch wrappers (self-contained)
 │   ├── mxfp8.py            ← MXFP8 frontend + symm-buffer/launch wrappers (self-contained)
 │   ├── bf16.py             ← BF16 frontend + symm-buffer/launch wrappers (self-contained)
+│   ├── bf16_mxfp8.py       ← BF16 activation + MXFP8 weight frontend
+│   ├── bf16_nvfp4.py       ← BF16 activation + NVFP4 weight frontend
 │   ├── kernel_helpers.py   ← SINGLE re-export point for raw-kernel helpers/constants/
 │   │                          reference the FI backend + tests need (drop-audit point)
 │   ├── tuner.py            ← kernel tuning knobs (tactic enumeration + config apply);
@@ -33,10 +35,10 @@ kernel_src/cutedsl_megamoe/
                                against deep_gemm / the kernel-repo tester)
 ```
 
-Core principle: **`src/` is a verbatim copy of the kernel-team drop — no injected
-files, no edits.** Every adaptation (path bootstrap, symbol re-exports, API
-shims) lives in `shim/`. A new drop is a pure replace of `src/`; the only work
-is updating `shim/` to whatever the new `src/` exposes.
+Core principle: `src/` tracks kernel-team code. Keep it verbatim except for the
+branch-ahead or pending-upstream changes explicitly recorded in `VENDOR.md`.
+Every integration adaptation lives in `shim/`. On a new drop, replace the
+packages, then reapply only recorded diffs that upstream has not absorbed.
 
 Layering: `moe_ep` backends import from the package (`__init__.py`) only →
 `__init__.py` re-exports from `shim/` → `shim/` imports the raw kernel packages
@@ -62,8 +64,9 @@ constants/helpers are eager; the `mega_runner`/`mega_reference` helpers pull
 
 ## When the kernel team drops a new version of src/
 
-1. **Replace `src/` verbatim** with the drop's kernel packages — no injected
-   files, no edits (the drop is a full repo; copy only these dirs):
+1. **Replace `src/` with the drop's kernel packages**, then audit every pending
+   diff in `VENDOR.md`: drop fixes already absorbed upstream and reapply the
+   remaining recorded changes (the drop is a full repo; copy only these dirs):
    ```bash
    rm -rf flashinfer/moe_ep/kernel_src/cutedsl_megamoe/src/{common,src,moe_bf16_glu,moe_mxfp8_glu,moe_nvfp4_bf16_glu,moe_nvfp4_swapab}
    cp -r <new_drop>/{common,src,moe_bf16_glu,moe_mxfp8_glu,moe_nvfp4_bf16_glu,moe_nvfp4_swapab} \
@@ -71,6 +74,9 @@ constants/helpers are eager; the `mega_runner`/`mega_reference` helpers pull
    ```
    Do NOT copy the drop's repo scaffolding (`ci/`, `tester/`, `tests/`, `scripts/`,
    `.git`, `pyproject.toml`, `dispatch_test.py`, `README.md`).
+   Until the dastokes NVFP4×BF16 branch lands in the main kernel-team repo,
+   preserve `moe_nvfp4_bf16_glu/` from its pinned commit in `VENDOR.md` when a
+   mainline drop does not contain that package.
 
 2. **Path bootstrap needs nothing** — it lives in `shim/_paths.py` and points at
    the sibling `src/` dir, so a verbatim drop just works. (Ignore any bootstrap
@@ -80,7 +86,7 @@ constants/helpers are eager; the `mega_runner`/`mega_reference` helpers pull
    surface, and one a symbol-existence grep will NOT catch (the args change, not
    the names). `shim/{nvfp4,mxfp8}.py` `_ensure_mega_compiled` (constructor) and
    `_build_mega_runtime_kwargs` (the `cute.compile` / launch kwargs) must match
-   `Sm100MegaMoE{,Mxfp8}Kernel.__init__` and `.__call__`. The authoritative
+   `Sm100MegaMoE{,Mxfp8,Nvfp4Bf16}Kernel.__init__` and `.__call__`. The authoritative
    templates to mirror are the training integration's drivers:
    `moe_ep_training/megamoe/forward_nvfp4.py` and `forward.py` (kernel construct,
    `output_activation`, workspace pointer vs cute-tensor handling, `combine_format`).

@@ -30,8 +30,10 @@ from moe_nvfp4_swapab.runner_common import (
     Mxfp8ScaleDtype,
     _stack_byte_reinterpretable_tensors,
     ceil_div,
+    from_blocked as nvfp4_scale_from_blocked,
     nvfp4_quantize_per_block_16,
     round_up,
+    swiglu_fold_interleave,
     to_blocked,
 )
 
@@ -59,14 +61,6 @@ _LAZY = {
     "nvfp4_weight_to_bf16": (
         "moe_nvfp4_bf16_glu.mega_reference_nvfp4_bf16",
         "nvfp4_weight_to_bf16",
-    ),
-    "nvfp4_scale_from_blocked": (
-        "moe_nvfp4_bf16_glu.mega_reference_nvfp4_bf16",
-        "_from_blocked",
-    ),
-    "swiglu_fold_interleave": (
-        "moe_bf16_glu.mega_reference_bf16",
-        "swiglu_fold_interleave",
     ),
     "CombineFormat": ("src.token_comm", "CombineFormat"),
     "combine_roundtrip_to_fp32": (
@@ -97,7 +91,9 @@ __all__ = [
     "kind_data_dtype",
     "mxfp8_quantize_per_block_32",
     "nvfp4_quantize_per_block_16",
+    "nvfp4_scale_from_blocked",
     "round_up",
+    "swiglu_fold_interleave",
     "to_blocked",
     "_stack_byte_reinterpretable_tensors",
     # lazy (resolved via PEP 562 __getattr__ above)
@@ -111,6 +107,4 @@ __all__ = [
     "compute_megamoe_reference_bf16_nvfp4",  # noqa: F822
     "nvfp4_weight_from_swizzled_to_bf16",  # noqa: F822
     "nvfp4_weight_to_bf16",  # noqa: F822
-    "nvfp4_scale_from_blocked",  # noqa: F822
-    "swiglu_fold_interleave",  # noqa: F822
 ]

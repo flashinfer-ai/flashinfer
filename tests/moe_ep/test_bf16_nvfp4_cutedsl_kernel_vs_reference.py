@@ -23,13 +23,115 @@ def _require_cuda():
         pytest.skip("PyTorch lacks NVFP4 support required by the mixed reference")
 
 
+def test_bf16_nvfp4_rejects_legacy_logical_prequantized_shapes():
+    import torch
+
+    from flashinfer.moe_ep import MoEWeightPack
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.bf16_nvfp4_bf16_cutedsl.weights import (
+        preprocess_mega_weights,
+    )
+
+    experts, hidden, intermediate = 2, 128, 128
+    weights = MoEWeightPack(
+        w13=torch.zeros(experts, 2 * intermediate, hidden, dtype=torch.uint8),
+        w2=torch.zeros(experts, hidden, intermediate, dtype=torch.uint8),
+        w13_scale=torch.zeros(experts, 2 * intermediate, hidden // 16),
+        w2_scale=torch.zeros(experts, hidden, intermediate // 16),
+    )
+    with pytest.raises(ValueError, match="must have packed shapes"):
+        preprocess_mega_weights(
+            weights,
+            intermediate_size=intermediate,
+            hidden_size=hidden,
+        )
+
+
+@cuda_13_required
+@pytest.mark.arch_blackwell
+def test_bf16_nvfp4_prequantized_uint8_scales_and_stride_validation():
+    _require_cuda()
+
+    import torch
+
+    from flashinfer.moe_ep import MoEWeightPack
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.bf16_nvfp4_bf16_cutedsl.weights import (
+        preprocess_mega_weights,
+        validate_transformed_mega_weights,
+    )
+    from flashinfer.moe_ep.core.validation.common import MoEEpConfigError
+
+    experts, hidden, intermediate = 2, 128, 128
+    weights = MoEWeightPack(
+        w13=torch.randint(
+            0,
+            256,
+            (experts, 2 * intermediate, hidden // 2),
+            dtype=torch.uint8,
+            device="cuda",
+        ),
+        w2=torch.randint(
+            0,
+            256,
+            (experts, hidden, intermediate // 2),
+            dtype=torch.uint8,
+            device="cuda",
+        ),
+        w13_scale=torch.randint(
+            0,
+            128,
+            (experts, 2 * intermediate, hidden // 16),
+            dtype=torch.uint8,
+            device="cuda",
+        ),
+        w2_scale=torch.randint(
+            0,
+            128,
+            (experts, hidden, intermediate // 16),
+            dtype=torch.uint8,
+            device="cuda",
+        ),
+    )
+    transformed = preprocess_mega_weights(
+        weights,
+        intermediate_size=intermediate,
+        hidden_size=hidden,
+    )
+    assert transformed[0][1].dtype == torch.float8_e4m3fn
+    assert transformed[1][1].dtype == torch.float8_e4m3fn
+    validate_transformed_mega_weights(
+        transformed,
+        intermediate_size=intermediate,
+        hidden_size=hidden,
+        world_size=1,
+        num_experts=experts,
+    )
+
+    n_major = (
+        (transformed[0][0].contiguous(), transformed[0][1]),
+        transformed[1],
+    )
+    with pytest.raises(MoEEpConfigError, match="must be K-major"):
+        validate_transformed_mega_weights(
+            n_major,
+            intermediate_size=intermediate,
+            hidden_size=hidden,
+            world_size=1,
+            num_experts=experts,
+        )
+
+
 @cuda_13_required
 @pytest.mark.arch_blackwell
 @pytest.mark.parametrize(
-    ("hidden", "intermediate"),
-    [(1024, 1024)],
+    ("hidden", "intermediate", "num_experts", "topk"),
+    [
+        pytest.param(1024, 1024, 4, 2, id="square-e4"),
+        pytest.param(1056, 1088, 1, 1, id="nonsquare-singleton-e1"),
+    ],
 )
-def test_bf16_nvfp4_kernel_matches_mega_reference(monkeypatch, hidden, intermediate):
+def test_bf16_nvfp4_kernel_matches_mega_reference(
+    monkeypatch, hidden, intermediate, num_experts, topk
+):
     """The public mixed shim launch matches its BF16-domain torch reference."""
     _require_cuda()
 
@@ -49,7 +151,7 @@ def test_bf16_nvfp4_kernel_matches_mega_reference(monkeypatch, hidden, intermedi
     )
 
     monkeypatch.setenv("MEGA_NO_DIST", "1")
-    num_tokens, max_tokens, num_experts, topk = 32, 64, 4, 2
+    num_tokens, max_tokens = 32, 64
     generator = torch.Generator(device="cuda").manual_seed(29)
     hidden_states = torch.randn(
         num_tokens, hidden, dtype=torch.bfloat16, device="cuda", generator=generator
@@ -128,6 +230,30 @@ def test_bf16_nvfp4_kernel_matches_mega_reference(monkeypatch, hidden, intermedi
         )
         torch.testing.assert_close(
             y_kernel.to(torch.float32), y_ref, atol=8.0, rtol=0.05
+        )
+
+        # Form-A must clear skipped routes on every launch. Otherwise a route
+        # masked after a prior live launch leaks its stale partial into sum().
+        symm_buffer.topk_idx[0, 0] = -1
+        symm_buffer.combine_output[0, 0].fill_(123)
+        bf16_nvfp4_mega_moe(
+            y_kernel,
+            transformed_l1,
+            transformed_l2,
+            symm_buffer,
+            num_tokens=num_tokens,
+            sync=True,
+        )
+        assert torch.count_nonzero(symm_buffer.combine_output[0, 0]) == 0
+
+        empty = torch.empty(0, hidden, dtype=torch.bfloat16, device="cuda")
+        bf16_nvfp4_mega_moe(
+            empty,
+            transformed_l1,
+            transformed_l2,
+            symm_buffer,
+            num_tokens=0,
+            sync=True,
         )
     finally:
         symm_buffer.destroy()

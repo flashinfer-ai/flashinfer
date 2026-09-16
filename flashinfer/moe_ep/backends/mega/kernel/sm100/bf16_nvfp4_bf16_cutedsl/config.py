@@ -22,5 +22,5 @@ class Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(Sm100_Bf16_Cutedsl_MegaMoeConf
 
     kernel_name: str = "sm100_bf16_nvfp4_bf16_cutedsl"
     kind: Literal["bf16_nvfp4"] = "bf16_nvfp4"
-    fc1_alpha: "torch.Tensor | None" = None
-    fc2_alpha: "torch.Tensor | None" = None
+    fc1_alpha: "torch.Tensor | int | float | None" = None
+    fc2_alpha: "torch.Tensor | int | float | None" = None

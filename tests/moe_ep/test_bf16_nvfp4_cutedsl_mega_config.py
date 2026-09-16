@@ -300,3 +300,23 @@ def test_mixed_config_inherits_bf16_options():
     assert isinstance(config, Sm100_Bf16_Cutedsl_MegaMoeConfigBase)
     assert config.gate_up_clamp == 1.5
     assert config.enable_in_kernel_fc2_reduce
+
+
+@cuda_13_required
+def test_mixed_alpha_staging_validates_and_restores_config_default():
+    import torch
+
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.bf16_nvfp4_bf16_cutedsl.backend import (
+        _stage_alpha,
+    )
+
+    destination = torch.empty(4, dtype=torch.float32, device="cuda")
+    override = torch.arange(4, dtype=torch.float32, device="cuda")
+    _stage_alpha("fc1_alpha", destination, override, 2.5)
+    assert torch.equal(destination, override)
+
+    _stage_alpha("fc1_alpha", destination, None, 2.5)
+    assert torch.equal(destination, torch.full_like(destination, 2.5))
+
+    with pytest.raises(ValueError, match="shape"):
+        _stage_alpha("fc1_alpha", destination, torch.ones((), device="cuda"), None)

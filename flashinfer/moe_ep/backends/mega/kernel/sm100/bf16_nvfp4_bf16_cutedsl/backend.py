@@ -39,6 +39,28 @@ def _clamp(config: Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig) -> float | None:
     )
 
 
+def _stage_alpha(
+    name: str,
+    destination: torch.Tensor,
+    override: torch.Tensor | None,
+    default: torch.Tensor | int | float | None,
+) -> None:
+    value = default if override is None else override
+    if value is None:
+        destination.fill_(1.0)
+    elif isinstance(value, (int, float)):
+        destination.fill_(float(value))
+    else:
+        if not value.is_cuda:
+            raise ValueError(f"{name} must be a CUDA tensor, got {value.device}.")
+        if value.dtype != torch.float32 or value.shape != destination.shape:
+            raise ValueError(
+                f"{name} must be CUDA float32 with shape {tuple(destination.shape)}, "
+                f"got {value.dtype} {tuple(value.shape)}."
+            )
+        destination.copy_(value)
+
+
 @register_mega_kernel("sm100_bf16_nvfp4_bf16_cutedsl")
 class Bf16Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
     supports_output_view = True
@@ -70,6 +92,14 @@ class Bf16Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         if fleet_params.token_hidden_size % 32:
             raise ValueError(
                 "Mixed BF16 x NVFP4 MegaMoE requires hidden size divisible by 32."
+            )
+        if fleet_params.token_hidden_size < 128:
+            raise ValueError(
+                "Mixed BF16 x NVFP4 MegaMoE requires hidden size at least 128."
+            )
+        if self._kernel_config.intermediate_size < 128:
+            raise ValueError(
+                "Mixed BF16 x NVFP4 MegaMoE requires intermediate size at least 128."
             )
         if self._kernel_config.intermediate_size % 64:
             raise ValueError(
@@ -153,10 +183,12 @@ class Bf16Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             workspace.topk_weights,
         )
         note_staged_tokens(workspace.topk_idx, t.hidden_states.shape[0])
-        if t.fc1_alpha is not None:
-            workspace.fc1_alpha.copy_(t.fc1_alpha)
-        if t.fc2_alpha is not None:
-            workspace.fc2_alpha.copy_(t.fc2_alpha)
+        _stage_alpha(
+            "fc1_alpha", workspace.fc1_alpha, t.fc1_alpha, self._kernel_config.fc1_alpha
+        )
+        _stage_alpha(
+            "fc2_alpha", workspace.fc2_alpha, t.fc2_alpha, self._kernel_config.fc2_alpha
+        )
 
     def compute(
         self,

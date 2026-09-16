@@ -537,6 +537,8 @@ __all__ = [
     "is_valid_bf16_for_config",
     "is_valid_bf16_mxfp8",
     "is_valid_bf16_mxfp8_for_config",
+    "is_valid_bf16_nvfp4",
+    "is_valid_bf16_nvfp4_for_config",
     "iter_candidates",
     "with_knobs",
 ]

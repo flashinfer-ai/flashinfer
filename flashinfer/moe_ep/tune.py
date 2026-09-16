@@ -4,9 +4,9 @@ This module is only the command-line frontend: it parses arguments and
 dispatches to the tuner that lives NEXT TO the backend being tuned
 (``backends/mega/kernel/sm100/nvfp4_nvfp4_bf16_cutedsl/tuner.py`` for
 ``--dtype nvfp4``, ``.../mxfp8_mxfp8_bf16_cutedsl/tuner.py`` for the mxfp8
-kinds, ``.../bf16_bf16_bf16_cutedsl/tuner.py`` for ``bf16`` and
-``.../bf16_mxfp8_bf16_cutedsl/tuner.py`` for the mixed kinds).  Shared sweep
-machinery lives in ``backends/mega/kernel/tuning.py``.
+kinds, ``.../bf16_bf16_bf16_cutedsl/tuner.py`` for ``bf16``, and the
+``bf16_{mxfp8,nvfp4}_bf16_cutedsl/tuner.py`` modules for the mixed kinds).
+Shared sweep machinery lives in ``backends/mega/kernel/tuning.py``.
 
 The sweep runs the collective autotune OUTSIDE any serving engine and
 persists the winners in the knob cache (see

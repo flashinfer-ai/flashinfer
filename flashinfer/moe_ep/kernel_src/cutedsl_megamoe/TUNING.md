@@ -334,6 +334,11 @@ misses) — both are the right behavior as long as internal drops carry the
   dispatch-warp half also timing `epi_flag_batch=(1, 1)` (18 candidates, or
   36 when ikr is permitted; per-size winners above are the measured starting
   point).
+  Mixed BF16×NVFP4 exposes the same three implementation tuples through
+  `is_valid_bf16_nvfp4`; `bf16_nvfp4_candidates()` intentionally starts from
+  the BF16×MXFP8 candidate grid and applies the NVFP4-specific predicate so
+  the sets can diverge without changing the autotuner. Per-size profiles are
+  pending a dedicated tuning pass.
 - Backend configs (`Nvfp4/Mxfp8/Bf16/Bf16_Mxfp8 ..._Cutedsl_MegaMoeConfig.knobs`): explicit dict
   overrides the heuristic ENTIRELY (pin every knob you care about);
   `"auto"` runs the online autotuner at the first forward.

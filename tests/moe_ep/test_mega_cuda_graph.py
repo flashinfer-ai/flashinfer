@@ -155,6 +155,13 @@ def test_mega_layer_graph_capture_replay_matches_eager(
     import torch
 
     _require_blackwell()
+    if backend_name == "bf16_nvfp4":
+        from flashinfer.moe_ep.core.validation.common import (
+            is_bf16_nvfp4_cutedsl_supported,
+        )
+
+        if not is_bf16_nvfp4_cutedsl_supported():
+            pytest.skip("BF16 x NVFP4 CuTeDSL requires CUDA 13+")
 
     monkeypatch.setenv("MEGA_NO_DIST", "1")
     layer, problem = _single_rank_layer(backend_name, hidden, intermediate)

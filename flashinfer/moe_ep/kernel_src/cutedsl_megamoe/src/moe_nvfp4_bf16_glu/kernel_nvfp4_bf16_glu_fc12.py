@@ -921,6 +921,11 @@ class Sm100SwapABNvfp4Bf16Fc12Kernel:
             token_comm_args,
         )
 
+        # Preserve singleton expert modes in TMA descriptors. Static extent 1
+        # is otherwise canonicalized out before the descriptor reaches the ABI.
+        fc1_weight_experts_runtime = fc1_weight.shape[0]
+        fc2_weight_experts_runtime = fc2_weight.shape[0]
+
         # Bind expert/feature dimensions to codegen-time constants when the
         # runner supplies a static expert shape.  Token rows and all strides
         # remain runtime-dynamic.
@@ -988,10 +993,16 @@ class Sm100SwapABNvfp4Bf16Fc12Kernel:
 
         # Swap-AB views.  Weight is A (M,K,L=expert); token data is B
         # (N,K,L=1).  No physical transpose is performed.
+        fc1_weight_tma_experts = experts
+        if cutlass.const_expr(
+            self.static_expert_shape is not None
+            and self.static_expert_shape[0] == 1
+        ):
+            fc1_weight_tma_experts = fc1_weight_experts_runtime
         fc1_weight_gemm = cute.make_tensor(
             fc1_weight.iterator,
             cute.make_layout(
-                (intermediate_gateup, hidden_w1, experts),
+                (intermediate_gateup, hidden_w1, fc1_weight_tma_experts),
                 stride=(
                     fc1_weight.stride[2],
                     fc1_weight.stride[1],
@@ -1013,10 +1024,16 @@ class Sm100SwapABNvfp4Bf16Fc12Kernel:
                 stride=(fc1_output.stride[0], fc1_output.stride[1], 0),
             ),
         )
+        fc2_weight_tma_experts = experts_w2
+        if cutlass.const_expr(
+            self.static_expert_shape is not None
+            and self.static_expert_shape[0] == 1
+        ):
+            fc2_weight_tma_experts = fc2_weight_experts_runtime
         fc2_weight_gemm = cute.make_tensor(
             fc2_weight.iterator,
             cute.make_layout(
-                (hidden_w2, intermediate, experts_w2),
+                (hidden_w2, intermediate, fc2_weight_tma_experts),
                 stride=(
                     fc2_weight.stride[2],
                     fc2_weight.stride[1],

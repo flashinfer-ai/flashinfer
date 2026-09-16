@@ -813,11 +813,18 @@ class Sm100MegaMoENvfp4Bf16Kernel(Sm100SwapABNvfp4Bf16Fc12Kernel):
         stream,
     ) -> None:
         """Launch dispatch, mixed FC12, and direct BF16 combine."""
+        fc1_weight_experts_runtime = fc1_weight.shape[0]
+        fc2_weight_experts_runtime = fc2_weight.shape[0]
+        fc1_weight_experts = self.num_experts_per_rank
+        fc2_weight_experts = self.num_experts_per_rank
+        if cutlass.const_expr(self.num_experts_per_rank == 1):
+            fc1_weight_experts = fc1_weight_experts_runtime
+            fc2_weight_experts = fc2_weight_experts_runtime
         fc1_weight = cute.make_tensor(
             fc1_weight.iterator,
             cute.make_layout(
                 (
-                    self.num_experts_per_rank,
+                    fc1_weight_experts,
                     self.hidden,
                     self.intermediate_gateup,
                 ),
@@ -828,7 +835,7 @@ class Sm100MegaMoENvfp4Bf16Kernel(Sm100SwapABNvfp4Bf16Fc12Kernel):
             fc2_weight.iterator,
             cute.make_layout(
                 (
-                    self.num_experts_per_rank,
+                    fc2_weight_experts,
                     self.intermediate_downproj,
                     self.hidden,
                 ),

@@ -25,8 +25,9 @@ replace, what to audit) lives in `SKILL.md`.
 
 ## Policy
 
-- `src/` is a **verbatim** copy of the upstream drop: no injected files, no
-  local edits. `diff -r src/<pkg> <upstream>/<pkg>` must come back clean.
+- `src/` is normally a verbatim copy of the recorded upstream drop. Files
+  explicitly listed below may be synced from a newer branch or carry a small
+  local fix while that change is being upstreamed.
 - All adaptation lives in `shim/` (ours), re-exported through `__init__.py`;
   FlashInfer backends import the package `__init__` only, never `src/`.
 - Local bug fixes go upstream first, then re-sync. If an emergency local edit
@@ -42,6 +43,11 @@ replace, what to audit) lives in `SKILL.md`.
   `src/moe_bf16_glu/mega_reference_bf16.py` while preserving FlashInfer's
   newer local formatting and compatibility fixes. Reconcile those files when
   the branch lands in the kernel-team upstream.
+- `src/moe_nvfp4_bf16_glu/kernel_nvfp4_bf16_glu_fc12.py` and
+  `megamoe_kernel_nvfp4_bf16.py` additionally carry FlashInfer's
+  singleton-expert TMA-mode preservation fix, matching the pure-NVFP4 fix in
+  PR #4296. Confirm the mixed branch contains it before the next re-sync; if
+  not, retain/reapply this diff after replacing the package.
 
 - `src/src/inputs_process.py` is synced **ahead** of the recorded drop, to
   upstream commit `50117315dbcd2ffb1e8c1c4dab4be9b42cad24ab`

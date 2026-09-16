@@ -139,24 +139,19 @@ def preprocess_mega_weights(
 
     if isinstance(weights, PrequantizedMoEWeights):
         if (
-            weights.w13.shape == packed_w13_shape
-            and weights.w2.shape == packed_w2_shape
-        ):
-            if not _is_packed_nvfp4_weight(weights.w13) or not _is_packed_nvfp4_weight(
-                weights.w2
-            ):
-                raise ValueError(
-                    "packed NVFP4 weights must be torch.uint8 or torch.float4_e2m1fn_x2"
-                )
-        elif (
-            weights.w13.shape != logical_w13_shape
-            or weights.w2.shape != logical_w2_shape
+            weights.w13.shape != packed_w13_shape
+            or weights.w2.shape != packed_w2_shape
         ):
             raise ValueError(
                 "pre-quantized w13/w2 must have packed shapes "
-                f"{packed_w13_shape} / {packed_w2_shape} or legacy logical "
-                f"shapes {logical_w13_shape} / {logical_w2_shape}; got "
+                f"{packed_w13_shape} / {packed_w2_shape}; got "
                 f"{tuple(weights.w13.shape)} / {tuple(weights.w2.shape)}"
+            )
+        if not _is_packed_nvfp4_weight(weights.w13) or not _is_packed_nvfp4_weight(
+            weights.w2
+        ):
+            raise ValueError(
+                "packed NVFP4 weights must be torch.uint8 or torch.float4_e2m1fn_x2"
             )
         expected_w13_scale_shape = (
             num_experts,
@@ -242,6 +237,11 @@ def preprocess_mega_weights(
         num_experts, fc2_flat_sf_size
     )
 
+    # Pre-quantized callers may provide the same E4M3 bytes through a uint8
+    # tensor. Normalize the view to the kernel ABI without modifying data.
+    fc1_weight_sf = fc1_weight_sf.view(torch.float8_e4m3fn)
+    fc2_weight_sf = fc2_weight_sf.view(torch.float8_e4m3fn)
+
     return (fc1_weight, fc1_weight_sf), (fc2_weight, fc2_weight_sf)
 
 
@@ -320,6 +320,15 @@ def validate_transformed_mega_weights(
         scale_dtype=torch.uint8,
         expected_scale_shape=(local_experts, fc2_flat_sf),
     )
+    for label, weight in (
+        ("fc1", transformed[0][0]),
+        ("fc2", transformed[1][0]),
+    ):
+        if weight.stride(1) != 1:
+            raise MoEEpConfigError(
+                f"transformed_weights {label} weight must be K-major "
+                f"(stride(1) == 1), got strides {weight.stride()}"
+            )
 
 
 __all__ = [

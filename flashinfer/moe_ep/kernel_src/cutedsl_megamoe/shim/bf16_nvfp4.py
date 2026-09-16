@@ -62,9 +62,10 @@ class MegaMoEBf16Nvfp4Config:
             )
         if self.num_total_experts % self.world_size:
             raise ValueError("num_total_experts must be divisible by world_size.")
-        if self.hidden <= 0 or self.hidden % 32 or self.intermediate <= 0:
+        if self.hidden < 128 or self.hidden % 32 or self.intermediate < 128:
             raise ValueError(
-                "hidden must be divisible by 32 and intermediate positive."
+                "hidden must be at least 128 and divisible by 32; "
+                "intermediate must be at least 128."
             )
         if self.intermediate % 64:
             raise ValueError("intermediate must be divisible by 64.")
@@ -162,16 +163,26 @@ class MegaMoEBf16Nvfp4Frontend:
 
     @staticmethod
     def _to_cute(
-        tensor: torch.Tensor, *, static_layout: bool = False, assumed_align: int = 16
+        tensor: torch.Tensor,
+        *,
+        static_layout: bool = False,
+        assumed_align: int = 16,
+        dynamic_compact_shape_modes: tuple[int, ...] = (),
     ):
         import cutlass.torch as cutlass_torch
 
         result = cutlass_torch.from_dlpack(tensor, assumed_align=assumed_align)
         if static_layout:
             return result
-        return result.mark_layout_dynamic(
+        result = result.mark_layout_dynamic(
             leading_dim=cutlass_torch.get_leading_dim(tensor)
         )
+        for mode in dynamic_compact_shape_modes:
+            result = result.mark_compact_shape_dynamic(
+                mode=mode,
+                stride_order=tensor.dim_order(),
+            )
+        return result
 
     def _compile_key(self) -> tuple:
         return dataclasses.astuple(self._config)
@@ -221,6 +232,12 @@ class MegaMoEBf16Nvfp4Frontend:
             ):
                 raise ValueError(f"{name} must be CUDA {dtype} with shape {shape}.")
         for name, tensor in (
+            ("fc1_weight", inputs.fc1_weight),
+            ("fc2_weight", inputs.fc2_weight),
+        ):
+            if tensor.stride(1) != 1:
+                raise ValueError(f"{name} must be K-major (stride(1) == 1).")
+        for name, tensor in (
             ("fc1_weight_sf", inputs.fc1_weight_sf),
             ("fc2_weight_sf", inputs.fc2_weight_sf),
         ):
@@ -263,13 +280,20 @@ class MegaMoEBf16Nvfp4Frontend:
         import cuda.bindings.driver as cuda
         from src.sym_buffer import SymBufferHost
 
+        dynamic_weight_modes = (0,) if self.config.num_experts_per_rank == 1 else ()
         return {
             "activation": self._to_cute(inputs.activation),
             "topk_idx": self._to_cute(inputs.topk_idx),
             "topk_weights": self._to_cute(inputs.topk_weights),
-            "fc1_weight": self._to_cute(inputs.fc1_weight),
+            "fc1_weight": self._to_cute(
+                inputs.fc1_weight,
+                dynamic_compact_shape_modes=dynamic_weight_modes,
+            ),
             "fc1_weight_sf": self._to_cute(inputs.fc1_weight_sf),
-            "fc2_weight": self._to_cute(inputs.fc2_weight),
+            "fc2_weight": self._to_cute(
+                inputs.fc2_weight,
+                dynamic_compact_shape_modes=dynamic_weight_modes,
+            ),
             "fc2_weight_sf": self._to_cute(inputs.fc2_weight_sf),
             "fc1_alpha": self._to_cute(inputs.fc1_alpha, assumed_align=4),
             "fc2_alpha": self._to_cute(inputs.fc2_alpha, assumed_align=4),
@@ -308,10 +332,7 @@ class MegaMoEBf16Nvfp4Frontend:
         cluster_size = c.cluster_shape_mnk[0] * c.cluster_shape_mnk[1]
         max_active_clusters = max(
             1,
-            torch.cuda.get_device_properties(
-                torch.cuda.current_device()
-            ).multi_processor_count
-            // cluster_size,
+            cutlass.utils.HardwareInfo().get_max_active_clusters(cluster_size),
         )
         kernel = Sm100MegaMoENvfp4Bf16Kernel(
             mma_tiler_mnk=c.mma_tiler_mnk,
@@ -391,6 +412,10 @@ class MegaMoEBf16Nvfp4Frontend:
             mega.launch_key = key
         if self.config.in_kernel_fc2_reduce:
             inputs.combine_output.zero_()
+        else:
+            inputs.combine_output.masked_fill_(
+                (inputs.topk_idx < 0).unsqueeze(-1), 0
+            )
         mega.compiled(**mega.launch_kwargs)
         if sync and not torch.cuda.is_current_stream_capturing():
             torch.cuda.synchronize()
@@ -402,7 +427,12 @@ class MegaMoEBf16Nvfp4Frontend:
         kwargs = self._runtime_kwargs(inputs, mega)
         if self.config.in_kernel_fc2_reduce:
             return lambda: (inputs.combine_output.zero_(), mega.compiled(**kwargs))
-        return lambda: mega.compiled(**kwargs)
+        return lambda: (
+            inputs.combine_output.masked_fill_(
+                (inputs.topk_idx < 0).unsqueeze(-1), 0
+            ),
+            mega.compiled(**kwargs),
+        )
 
 
 @dataclass
