@@ -81,13 +81,15 @@ if HAS_CUTEDSL:
         num_heads,
         vector_size,
         vector_bytes,
+        full_tiles: cutlass.Constexpr,
     ):
         fragments = []
         for row in rows:
             fragment = cute.make_rmem_tensor((vector_size,), cutlass.BFloat16)
-            # Keep every lane in the reduction, without reading padded rows.
-            fragment.fill(0)
-            if row < num_rows:
+            if cutlass.const_expr(not full_tiles):
+                # Keep every lane in the reduction, without reading padded rows.
+                fragment.fill(0)
+            if full_tiles or row < num_rows:
                 cute.copy(
                     atom,
                     _row_view(
@@ -116,9 +118,10 @@ if HAS_CUTEDSL:
         fragments,
         vector_size,
         vector_bytes,
+        full_tiles: cutlass.Constexpr,
     ):
         for row, fragment in zip(rows, fragments, strict=True):
-            if row < num_rows:
+            if full_tiles or row < num_rows:
                 cute.copy(
                     atom,
                     fragment,
@@ -178,6 +181,7 @@ if HAS_CUTEDSL:
         output_token_stride: cutlass.Constexpr,
         lanes: cutlass.Constexpr,
         threads: cutlass.Constexpr,
+        full_tiles: cutlass.Constexpr,
     ):
         vector_size = cutlass.const_expr(HEAD_DIM // lanes)
         vector_bytes = cutlass.const_expr(vector_size * 2)
@@ -206,6 +210,7 @@ if HAS_CUTEDSL:
             num_heads,
             vector_size,
             vector_bytes,
+            full_tiles,
         )
         gate_fragments = _load_rows(
             atom,
@@ -217,6 +222,7 @@ if HAS_CUTEDSL:
             num_heads,
             vector_size,
             vector_bytes,
+            full_tiles,
         )
         outputs = _epilogue(
             x_fragments,
@@ -236,6 +242,7 @@ if HAS_CUTEDSL:
             outputs,
             vector_size,
             vector_bytes,
+            full_tiles,
         )
 
     @cute.jit
@@ -255,6 +262,8 @@ if HAS_CUTEDSL:
     ):
         rows = x.shape[0] * num_heads
         rows_per_cta = cutlass.const_expr(32 * warps // lanes)
+        # Whole clusters per token guarantee no padded rows for any runtime T.
+        full_tiles = cutlass.const_expr(num_heads % (rows_per_cta * cluster) == 0)
         tiles = cute.ceil_div(rows, rows_per_cta)
         grid = cute.ceil_div(tiles, cluster) * cluster
         _rmsnorm_sigmoid_gate_kernel(
@@ -269,6 +278,7 @@ if HAS_CUTEDSL:
             output_token_stride,
             lanes,
             32 * warps,
+            full_tiles,
         ).launch(
             grid=(grid, 1, 1),
             block=(32 * warps, 1, 1),
