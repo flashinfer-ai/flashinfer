@@ -171,7 +171,7 @@ def _register_torch_op() -> None:
         "simple_stp(Tensor(a!) state, Tensor x, Tensor dt, Tensor A, Tensor B, "
         "Tensor C, Tensor D, Tensor src, Tensor dst, Tensor? dt_bias, Tensor? z, "
         "bool dt_softplus, int pad_slot_id, Tensor(b!)? out, Tensor? rand_seed, "
-        "int philox_rounds) -> Tensor(b)"
+        "int philox_rounds) -> ()"
     )
 
     def impl(
@@ -192,7 +192,7 @@ def _register_torch_op() -> None:
         rand_seed: Any,
         philox_rounds: int,
     ) -> Any:
-        return _load_extension().musa_ssu_simple(
+        _load_extension().musa_ssu_simple(
             state,
             x,
             dt,
@@ -210,6 +210,7 @@ def _register_torch_op() -> None:
             rand_seed,
             philox_rounds,
         )
+        return None
 
     lib.impl("simple_stp", impl, "PrivateUse1")
 
@@ -231,7 +232,7 @@ def _register_torch_op() -> None:
         rand_seed: Any,
         philox_rounds: int,
     ) -> Any:
-        return out if out is not None else torch.empty_like(x)
+        return None
 
     # PrivateUse1 custom ops need a Meta implementation for Dynamo/Inductor.
     register_fake = getattr(lib, "_register_fake", None)
@@ -288,10 +289,15 @@ def musa_ssu_one_token_native(*args: Any, **kwargs: Any) -> Any:
     import torch
 
     is_compiling = getattr(getattr(torch, "compiler", None), "is_compiling", None)
-    if not (callable(is_compiling) and is_compiling()):
-        _load_extension()
+    if callable(is_compiling) and is_compiling():
+        torch.ops.flashinfer_musa.simple_stp(*args, **kwargs)
+        # The dispatcher op mutates the caller-owned output buffer and returns
+        # no tensor so Inductor can model the mutation without an aliasing
+        # output. Preserve the public Python API by returning that buffer.
+        return kwargs.get("out", args[13] if len(args) > 13 else None)
 
-    return torch.ops.flashinfer_musa.simple_stp(*args, **kwargs)
+    extension = _load_extension()
+    return extension.musa_ssu_simple(*args, **kwargs)
 
 
 def preload_musa_simple_stp() -> None:
