@@ -16,7 +16,7 @@ This is the only path allowed to bootstrap an uncalibrated device. It passes
 an internal seed model solely to compile the balanced kernels and collect
 forced-target measurements. Normal balanced APIs reject the device until the
 resulting models and exact hardware identity are checked into
-``_balanced_scheduler.py``.
+``balanced_scheduler/cost_model.py``.
 
 The default timing protocol is 10 warmups followed by the minimum of five
 trials of 200 CUDA-graph replays. Use ``--quick`` only for harness smoke tests;
@@ -44,11 +44,13 @@ import numpy as np
 import torch
 
 from flashinfer.attention.prims_ts import BatchMLADecodePagedTSWrapper
-from flashinfer.attention.prims_ts._balanced_plan import BalancedMLADecodePlan
-from flashinfer.attention.prims_ts._balanced_scheduler import (
+from flashinfer.attention.prims_ts.balanced_scheduler.cost_model import (
     B200_BF16_2CTA_COST,
     BalancedCostModel,
     balanced_cost_bucket,
+)
+from flashinfer.attention.prims_ts.balanced_scheduler.plan import (
+    BalancedMLADecodePlan,
 )
 
 
@@ -80,7 +82,7 @@ COST_BUCKETS = (
 )
 ARTIFACT_SCHEMA_VERSION = 4
 MEASUREMENT_METHOD_VERSION = "optimized-cuda-forced-schedule-graph-v3"
-_REPO_ROOT = Path(__file__).resolve().parents[1]
+_REPO_ROOT = Path(__file__).resolve().parents[4]
 _SOURCE_SUFFIXES = frozenset((".cc", ".cu", ".cuh", ".h", ".py"))
 _MEASUREMENT_SOURCE_SYMBOLS = frozenset(
     {
@@ -316,12 +318,11 @@ def measurement_source_identity(root: Path = _REPO_ROOT) -> dict[str, Any]:
 
     roots = (
         root / "flashinfer/attention/prims_ts",
-        root / "flashinfer/jit/prims_balanced_mla.py",
-        root / "csrc/prims_balanced_mla_plan.cu",
-        root / "csrc/prims_balanced_mla_scheduler_device.cu",
-        root / "csrc/prims_balanced_mla_scheduler.cuh",
+        root / "csrc/prims_ts/balanced_mla_plan.cu",
+        root / "csrc/prims_ts/balanced_mla_scheduler_device.cu",
+        root / "csrc/prims_ts/balanced_mla_scheduler.cuh",
     )
-    source_files = set()
+    source_files: set[Path] = set()
     for source_root in roots:
         if source_root.is_dir():
             source_files.update(
@@ -335,7 +336,9 @@ def measurement_source_identity(root: Path = _REPO_ROOT) -> dict[str, Any]:
             source_files.add(source_root)
         else:
             raise RuntimeError(f"measurement source path is missing: {source_root}")
-    benchmark_path = root / "benchmarks/bench_prims_ts_balanced_mla_cost_model.py"
+    benchmark_path = (
+        root / "flashinfer/attention/prims_ts/balanced_scheduler/tune_cost_model.py"
+    )
     return {
         "sha256": _hash_source_files(root, tuple(source_files)),
         "file_count": len(source_files),
@@ -350,7 +353,9 @@ def measurement_source_identity(root: Path = _REPO_ROOT) -> dict[str, Any]:
 def fit_source_identity(root: Path = _REPO_ROOT) -> dict[str, Any]:
     """Fingerprint fitting policy independently of reusable measurements."""
 
-    benchmark_path = root / "benchmarks/bench_prims_ts_balanced_mla_cost_model.py"
+    benchmark_path = (
+        root / "flashinfer/attention/prims_ts/balanced_scheduler/tune_cost_model.py"
+    )
     return {
         "sha256": _hash_python_symbols(
             benchmark_path,
@@ -532,7 +537,7 @@ def append_record(path: Path, record: dict[str, Any]) -> None:
 
 
 def load_records(path: Path) -> list[dict[str, Any]]:
-    records = []
+    records: list[dict[str, Any]] = []
     if not path.exists():
         return records
     with path.open(encoding="utf-8") as source:
@@ -953,7 +958,7 @@ def fit_latency_cost_model(records: list[dict[str, Any]], family: str, dtype_nam
             partition_features = np.asarray(row["partition_features"], dtype=float)
             producer_costs = partition_features @ coefficients[:4]
             critical = partition_features[int(np.argmax(producer_costs))]
-            reducer = [
+            reducer_features = [
                 1.0 if int(row["max_split_count"]) > 1 else 0.0,
                 float(row["max_split_count"])
                 if int(row["max_split_count"]) > 1
@@ -961,7 +966,7 @@ def fit_latency_cost_model(records: list[dict[str, Any]], family: str, dtype_nam
             ]
             vector = np.zeros(len(case_names) + 6)
             vector[case_index[str(row["case"])]] = 1.0
-            vector[len(case_names) :] = np.concatenate((critical, reducer))
+            vector[len(case_names) :] = np.concatenate((critical, reducer_features))
             matrix.append(vector)
             observed.append(float(row["latency_us"]))
         design = np.asarray(matrix)
@@ -981,14 +986,14 @@ def fit_latency_cost_model(records: list[dict[str, Any]], family: str, dtype_nam
         features = np.asarray(row["partition_features"], dtype=float)
         producer = float(np.max(features @ coefficients[:4]))
         max_split = int(row["max_split_count"])
-        reducer = (
+        reducer_cost = (
             coefficients[4] + coefficients[5] * max_split if max_split > 1 else 0.0
         )
         predictions.append(
-            intercepts[case_index[str(row["case"])]] + producer + reducer
+            intercepts[case_index[str(row["case"])]] + producer + reducer_cost
         )
-    observed = np.asarray([float(row["latency_us"]) for row in rows])
-    rmse = float(np.sqrt(np.mean((np.asarray(predictions) - observed) ** 2)))
+    observed_array = np.asarray([float(row["latency_us"]) for row in rows])
+    rmse = float(np.sqrt(np.mean((np.asarray(predictions) - observed_array) ** 2)))
     # Cost models are integer nanoseconds. Preserve relative fitted scale and
     # keep a positive tile cost so planner break-even divisions stay defined.
     values_ns = [max(int(round(value * 1000.0)), 0) for value in coefficients]

@@ -25,8 +25,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "balanced_mla_scheduler.cuh"
 #include "flashinfer/exception.h"
-#include "prims_balanced_mla_scheduler.cuh"
 
 namespace flashinfer {
 namespace prims_ts {
