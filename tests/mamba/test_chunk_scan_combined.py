@@ -22,6 +22,7 @@ from .triton_reference.ssd_state_passing import _state_passing_fwd
 from .triton_reference.ssd_bmm import _bmm_chunk_fwd
 from .triton_reference.ssd_chunk_scan import _chunk_scan_fwd
 from einops import rearrange
+from .utils import TEST_DEVICE
 
 
 def ssd_combined_fwd(
@@ -146,11 +147,13 @@ def _compute_varlen_metadata(cu_seqlens, chunk_size):
 # Skip all tests if not on Blackwell (SM100/SM103).
 # SM107 (Rubin) is not yet supported by the Mamba SSD kernel.
 def _is_blackwell_ssd_supported():
+    if TEST_DEVICE == "musa":
+        return True
     if not torch.cuda.is_available():
         return False
-    if not is_sm100a_supported(torch.device("cuda")):
+    if not is_sm100a_supported(torch.device(TEST_DEVICE)):
         return False
-    _, minor = get_compute_capability(torch.device("cuda"))
+    _, minor = get_compute_capability(torch.device(TEST_DEVICE))
     return minor <= 3  # SM100 (minor=0) and SM103 (minor=3) only
 
 
@@ -207,30 +210,30 @@ class TestChunkScanCombined:
 
         # x: (batch, seqlen, nheads, headdim)
         x = torch.randn(
-            batch, seqlen, nheads, headdim, dtype=self.INPUT_DTYPE, device="cuda"
+            batch, seqlen, nheads, headdim, dtype=self.INPUT_DTYPE, device=TEST_DEVICE
         )
 
         # dt: (batch, seqlen, nheads)
-        dt = torch.randn(batch, seqlen, nheads, dtype=torch.float32, device="cuda")
+        dt = torch.randn(batch, seqlen, nheads, dtype=torch.float32, device=TEST_DEVICE)
 
         # A: (nheads,) - should be negative for stability
-        A = -torch.rand(nheads, dtype=torch.float32, device="cuda") - 1.0
+        A = -torch.rand(nheads, dtype=torch.float32, device=TEST_DEVICE) - 1.0
 
         # B: (batch, seqlen, ngroups, dstate)
         B = torch.randn(
-            batch, seqlen, ngroups, dstate, dtype=self.INPUT_DTYPE, device="cuda"
+            batch, seqlen, ngroups, dstate, dtype=self.INPUT_DTYPE, device=TEST_DEVICE
         )
 
         # C: (batch, seqlen, ngroups, dstate)
         C = torch.randn(
-            batch, seqlen, ngroups, dstate, dtype=self.INPUT_DTYPE, device="cuda"
+            batch, seqlen, ngroups, dstate, dtype=self.INPUT_DTYPE, device=TEST_DEVICE
         )
 
         # D: (nheads, headdim) or (nheads,)
-        D = torch.randn(nheads, dtype=self.INPUT_DTYPE, device="cuda")
+        D = torch.randn(nheads, dtype=self.INPUT_DTYPE, device=TEST_DEVICE)
 
         # dt_bias: (nheads,)
-        dt_bias = torch.rand(nheads, dtype=torch.float32, device="cuda") - 4.0
+        dt_bias = torch.rand(nheads, dtype=torch.float32, device=TEST_DEVICE) - 4.0
 
         return {
             "x": x,
@@ -372,19 +375,19 @@ class TestChunkScanCombinedDHasHdim(TestChunkScanCombined):
         seqlen = chunk_size * nchunks
 
         x = torch.randn(
-            batch, seqlen, nheads, headdim, dtype=self.INPUT_DTYPE, device="cuda"
+            batch, seqlen, nheads, headdim, dtype=self.INPUT_DTYPE, device=TEST_DEVICE
         )
-        dt = torch.randn(batch, seqlen, nheads, dtype=torch.float32, device="cuda")
-        A = -torch.rand(nheads, dtype=torch.float32, device="cuda") - 1.0
+        dt = torch.randn(batch, seqlen, nheads, dtype=torch.float32, device=TEST_DEVICE)
+        A = -torch.rand(nheads, dtype=torch.float32, device=TEST_DEVICE) - 1.0
         B = torch.randn(
-            batch, seqlen, ngroups, dstate, dtype=self.INPUT_DTYPE, device="cuda"
+            batch, seqlen, ngroups, dstate, dtype=self.INPUT_DTYPE, device=TEST_DEVICE
         )
         C = torch.randn(
-            batch, seqlen, ngroups, dstate, dtype=self.INPUT_DTYPE, device="cuda"
+            batch, seqlen, ngroups, dstate, dtype=self.INPUT_DTYPE, device=TEST_DEVICE
         )
         # 2D D: (nheads, headdim) -> triggers d_has_hdim=True
-        D = torch.randn(nheads, headdim, dtype=self.INPUT_DTYPE, device="cuda")
-        dt_bias = torch.rand(nheads, dtype=torch.float32, device="cuda") - 4.0
+        D = torch.randn(nheads, headdim, dtype=self.INPUT_DTYPE, device=TEST_DEVICE)
+        dt_bias = torch.rand(nheads, dtype=torch.float32, device=TEST_DEVICE) - 4.0
 
         return {
             "x": x,
@@ -471,19 +474,19 @@ class TestChunkScanCombinedDHasHdim1D(TestChunkScanCombined):
         seqlen = chunk_size * nchunks
 
         x = torch.randn(
-            batch, seqlen, nheads, headdim, dtype=self.INPUT_DTYPE, device="cuda"
+            batch, seqlen, nheads, headdim, dtype=self.INPUT_DTYPE, device=TEST_DEVICE
         )
-        dt = torch.randn(batch, seqlen, nheads, dtype=torch.float32, device="cuda")
-        A = -torch.rand(nheads, dtype=torch.float32, device="cuda") - 1.0
+        dt = torch.randn(batch, seqlen, nheads, dtype=torch.float32, device=TEST_DEVICE)
+        A = -torch.rand(nheads, dtype=torch.float32, device=TEST_DEVICE) - 1.0
         B = torch.randn(
-            batch, seqlen, ngroups, dstate, dtype=self.INPUT_DTYPE, device="cuda"
+            batch, seqlen, ngroups, dstate, dtype=self.INPUT_DTYPE, device=TEST_DEVICE
         )
         C = torch.randn(
-            batch, seqlen, ngroups, dstate, dtype=self.INPUT_DTYPE, device="cuda"
+            batch, seqlen, ngroups, dstate, dtype=self.INPUT_DTYPE, device=TEST_DEVICE
         )
         # 1D D: (nheads,) — will be broadcast to (headdim, nheads) by d_has_hdim path
-        D = torch.randn(nheads, dtype=self.INPUT_DTYPE, device="cuda")
-        dt_bias = torch.rand(nheads, dtype=torch.float32, device="cuda") - 4.0
+        D = torch.randn(nheads, dtype=self.INPUT_DTYPE, device=TEST_DEVICE)
+        dt_bias = torch.rand(nheads, dtype=torch.float32, device=TEST_DEVICE) - 4.0
 
         return {
             "x": x,
@@ -580,17 +583,17 @@ class TestChunkScanCombinedNoD(TestChunkScanCombined):
         seqlen = chunk_size * nchunks
 
         x = torch.randn(
-            batch, seqlen, nheads, headdim, dtype=self.INPUT_DTYPE, device="cuda"
+            batch, seqlen, nheads, headdim, dtype=self.INPUT_DTYPE, device=TEST_DEVICE
         )
-        dt = torch.randn(batch, seqlen, nheads, dtype=torch.float32, device="cuda")
-        A = -torch.rand(nheads, dtype=torch.float32, device="cuda") - 1.0
+        dt = torch.randn(batch, seqlen, nheads, dtype=torch.float32, device=TEST_DEVICE)
+        A = -torch.rand(nheads, dtype=torch.float32, device=TEST_DEVICE) - 1.0
         B = torch.randn(
-            batch, seqlen, ngroups, dstate, dtype=self.INPUT_DTYPE, device="cuda"
+            batch, seqlen, ngroups, dstate, dtype=self.INPUT_DTYPE, device=TEST_DEVICE
         )
         C = torch.randn(
-            batch, seqlen, ngroups, dstate, dtype=self.INPUT_DTYPE, device="cuda"
+            batch, seqlen, ngroups, dstate, dtype=self.INPUT_DTYPE, device=TEST_DEVICE
         )
-        dt_bias = torch.rand(nheads, dtype=torch.float32, device="cuda") - 4.0
+        dt_bias = torch.rand(nheads, dtype=torch.float32, device=TEST_DEVICE) - 4.0
 
         return {
             "x": x,
@@ -698,22 +701,22 @@ class TestChunkScanCombinedWithInitialStates(TestChunkScanCombined):
         seqlen = chunk_size * nchunks
 
         x = torch.randn(
-            batch, seqlen, nheads, headdim, dtype=self.INPUT_DTYPE, device="cuda"
+            batch, seqlen, nheads, headdim, dtype=self.INPUT_DTYPE, device=TEST_DEVICE
         )
-        dt = torch.randn(batch, seqlen, nheads, dtype=torch.float32, device="cuda")
-        A = -torch.rand(nheads, dtype=torch.float32, device="cuda") - 1.0
+        dt = torch.randn(batch, seqlen, nheads, dtype=torch.float32, device=TEST_DEVICE)
+        A = -torch.rand(nheads, dtype=torch.float32, device=TEST_DEVICE) - 1.0
         B = torch.randn(
-            batch, seqlen, ngroups, dstate, dtype=self.INPUT_DTYPE, device="cuda"
+            batch, seqlen, ngroups, dstate, dtype=self.INPUT_DTYPE, device=TEST_DEVICE
         )
         C = torch.randn(
-            batch, seqlen, ngroups, dstate, dtype=self.INPUT_DTYPE, device="cuda"
+            batch, seqlen, ngroups, dstate, dtype=self.INPUT_DTYPE, device=TEST_DEVICE
         )
-        D = torch.randn(nheads, dtype=self.INPUT_DTYPE, device="cuda")
-        dt_bias = torch.rand(nheads, dtype=torch.float32, device="cuda") - 4.0
+        D = torch.randn(nheads, dtype=self.INPUT_DTYPE, device=TEST_DEVICE)
+        dt_bias = torch.rand(nheads, dtype=torch.float32, device=TEST_DEVICE) - 4.0
 
         # Initial states: (batch, nheads, headdim, dstate)
         initial_states = torch.randn(
-            batch, nheads, headdim, dstate, dtype=self.INPUT_DTYPE, device="cuda"
+            batch, nheads, headdim, dstate, dtype=self.INPUT_DTYPE, device=TEST_DEVICE
         )
 
         return {
@@ -897,7 +900,7 @@ class TestChunkScanCombinedVarlen:
         cu_seqlens_list = [0]
         for sl in seq_lengths:
             cu_seqlens_list.append(cu_seqlens_list[-1] + sl)
-        cu_seqlens = torch.tensor(cu_seqlens_list, dtype=torch.int32, device="cuda")
+        cu_seqlens = torch.tensor(cu_seqlens_list, dtype=torch.int32, device=TEST_DEVICE)
 
         # Compute varlen metadata
         seq_idx, chunk_indices, chunk_offsets = _compute_varlen_metadata(
@@ -906,22 +909,22 @@ class TestChunkScanCombinedVarlen:
 
         # Packed tensors (batch=1)
         x = torch.randn(
-            1, total_seqlen, nheads, headdim, dtype=torch.bfloat16, device="cuda"
+            1, total_seqlen, nheads, headdim, dtype=torch.bfloat16, device=TEST_DEVICE
         )
-        dt = torch.randn(1, total_seqlen, nheads, dtype=torch.float32, device="cuda")
-        A = -torch.rand(nheads, dtype=torch.float32, device="cuda") - 1.0
+        dt = torch.randn(1, total_seqlen, nheads, dtype=torch.float32, device=TEST_DEVICE)
+        A = -torch.rand(nheads, dtype=torch.float32, device=TEST_DEVICE) - 1.0
         B = torch.randn(
-            1, total_seqlen, ngroups, dstate, dtype=torch.bfloat16, device="cuda"
+            1, total_seqlen, ngroups, dstate, dtype=torch.bfloat16, device=TEST_DEVICE
         )
         C = torch.randn(
-            1, total_seqlen, ngroups, dstate, dtype=torch.bfloat16, device="cuda"
+            1, total_seqlen, ngroups, dstate, dtype=torch.bfloat16, device=TEST_DEVICE
         )
-        D = torch.randn(nheads, dtype=torch.bfloat16, device="cuda")
-        dt_bias = torch.rand(nheads, dtype=torch.float32, device="cuda") - 4.0
+        D = torch.randn(nheads, dtype=torch.bfloat16, device=TEST_DEVICE)
+        dt_bias = torch.rand(nheads, dtype=torch.float32, device=TEST_DEVICE) - 4.0
 
         # Initial states: one per sequence
         initial_states = torch.randn(
-            num_seqs, nheads, headdim, dstate, dtype=torch.bfloat16, device="cuda"
+            num_seqs, nheads, headdim, dstate, dtype=torch.bfloat16, device=TEST_DEVICE
         )
 
         return {
@@ -1209,11 +1212,11 @@ class TestChunkScanCombinedVarlen:
         num_seqs = inputs["num_seqs"]
         tile_state_bytes = mamba.SSDCombined.tile_state_size(num_seqs)
         tile_state = (
-            torch.empty(tile_state_bytes, dtype=torch.uint8, device="cuda")
+            torch.empty(tile_state_bytes, dtype=torch.uint8, device=TEST_DEVICE)
             if tile_state_bytes > 0
             else None
         )
-        seq_chunk_cumsum = torch.zeros(num_seqs + 1, dtype=torch.int32, device="cuda")
+        seq_chunk_cumsum = torch.zeros(num_seqs + 1, dtype=torch.int32, device=TEST_DEVICE)
 
         # Compute with all buffers pre-allocated
         ssd.compute_seq_chunk_cumsum(
@@ -1390,20 +1393,20 @@ class TestChunkScanCombinedWithZ:
         seqlen = chunk_size * nchunks
 
         x = torch.randn(
-            batch, seqlen, nheads, headdim, dtype=self.INPUT_DTYPE, device="cuda"
+            batch, seqlen, nheads, headdim, dtype=self.INPUT_DTYPE, device=TEST_DEVICE
         )
-        dt = torch.randn(batch, seqlen, nheads, dtype=torch.float32, device="cuda")
-        A = -torch.rand(nheads, dtype=torch.float32, device="cuda") - 1.0
+        dt = torch.randn(batch, seqlen, nheads, dtype=torch.float32, device=TEST_DEVICE)
+        A = -torch.rand(nheads, dtype=torch.float32, device=TEST_DEVICE) - 1.0
         B = torch.randn(
-            batch, seqlen, ngroups, dstate, dtype=self.INPUT_DTYPE, device="cuda"
+            batch, seqlen, ngroups, dstate, dtype=self.INPUT_DTYPE, device=TEST_DEVICE
         )
         C = torch.randn(
-            batch, seqlen, ngroups, dstate, dtype=self.INPUT_DTYPE, device="cuda"
+            batch, seqlen, ngroups, dstate, dtype=self.INPUT_DTYPE, device=TEST_DEVICE
         )
-        D = torch.randn(nheads, dtype=self.INPUT_DTYPE, device="cuda")
-        dt_bias = torch.rand(nheads, dtype=torch.float32, device="cuda") - 4.0
+        D = torch.randn(nheads, dtype=self.INPUT_DTYPE, device=TEST_DEVICE)
+        dt_bias = torch.rand(nheads, dtype=torch.float32, device=TEST_DEVICE) - 4.0
         z = torch.randn(
-            batch, seqlen, nheads, headdim, dtype=self.INPUT_DTYPE, device="cuda"
+            batch, seqlen, nheads, headdim, dtype=self.INPUT_DTYPE, device=TEST_DEVICE
         )
 
         return {
@@ -1648,13 +1651,13 @@ def test_preallocated_output():
     ngroups, dstate, chunk_size = 8, 128, 128
     dtype = torch.bfloat16
 
-    x = torch.randn(batch, seqlen, nheads, headdim, dtype=dtype, device="cuda")
-    dt = torch.randn(batch, seqlen, nheads, dtype=torch.float32, device="cuda")
-    A = -torch.rand(nheads, dtype=torch.float32, device="cuda") - 1.0
-    B = torch.randn(batch, seqlen, ngroups, dstate, dtype=dtype, device="cuda")
-    C = torch.randn(batch, seqlen, ngroups, dstate, dtype=dtype, device="cuda")
-    D = torch.randn(nheads, dtype=dtype, device="cuda")
-    dt_bias = torch.rand(nheads, dtype=torch.float32, device="cuda") - 4.0
+    x = torch.randn(batch, seqlen, nheads, headdim, dtype=dtype, device=TEST_DEVICE)
+    dt = torch.randn(batch, seqlen, nheads, dtype=torch.float32, device=TEST_DEVICE)
+    A = -torch.rand(nheads, dtype=torch.float32, device=TEST_DEVICE) - 1.0
+    B = torch.randn(batch, seqlen, ngroups, dstate, dtype=dtype, device=TEST_DEVICE)
+    C = torch.randn(batch, seqlen, ngroups, dstate, dtype=dtype, device=TEST_DEVICE)
+    D = torch.randn(nheads, dtype=dtype, device=TEST_DEVICE)
+    dt_bias = torch.rand(nheads, dtype=torch.float32, device=TEST_DEVICE) - 4.0
 
     # Run without pre-allocated output
     out_ref, _ = ssd_combined_fwd(
@@ -1672,7 +1675,7 @@ def test_preallocated_output():
     # Run with pre-allocated output in kernel's native layout (B, EH, D, C, L)
     nchunks = seqlen // chunk_size
     out = torch.empty(
-        batch, nheads, headdim, nchunks, chunk_size, dtype=dtype, device="cuda"
+        batch, nheads, headdim, nchunks, chunk_size, dtype=dtype, device=TEST_DEVICE
     )
     out_test, _ = ssd_combined_fwd(
         x,
@@ -1702,13 +1705,13 @@ def test_return_final_states_flag():
     ngroups, dstate, chunk_size = 8, 128, 128
     dtype = torch.bfloat16
 
-    x = torch.randn(batch, seqlen, nheads, headdim, dtype=dtype, device="cuda")
-    dt = torch.randn(batch, seqlen, nheads, dtype=torch.float32, device="cuda")
-    A = -torch.rand(nheads, dtype=torch.float32, device="cuda") - 1.0
-    B = torch.randn(batch, seqlen, ngroups, dstate, dtype=dtype, device="cuda")
-    C = torch.randn(batch, seqlen, ngroups, dstate, dtype=dtype, device="cuda")
-    D = torch.randn(nheads, dtype=dtype, device="cuda")
-    dt_bias = torch.rand(nheads, dtype=torch.float32, device="cuda") - 4.0
+    x = torch.randn(batch, seqlen, nheads, headdim, dtype=dtype, device=TEST_DEVICE)
+    dt = torch.randn(batch, seqlen, nheads, dtype=torch.float32, device=TEST_DEVICE)
+    A = -torch.rand(nheads, dtype=torch.float32, device=TEST_DEVICE) - 1.0
+    B = torch.randn(batch, seqlen, ngroups, dstate, dtype=dtype, device=TEST_DEVICE)
+    C = torch.randn(batch, seqlen, ngroups, dstate, dtype=dtype, device=TEST_DEVICE)
+    D = torch.randn(nheads, dtype=dtype, device=TEST_DEVICE)
+    dt_bias = torch.rand(nheads, dtype=torch.float32, device=TEST_DEVICE) - 4.0
 
     # With return_final_states=True (default), should return final_states
     out, final_states = ssd_combined_fwd(
@@ -1768,22 +1771,22 @@ class TestVarlenEndToEnd:
         cu_seqlens = torch.tensor(
             [0] + list(torch.cumsum(torch.tensor(seq_lengths), dim=0).tolist()),
             dtype=torch.int32,
-            device="cuda",
+            device=TEST_DEVICE,
         )
         seq_idx, chunk_indices, chunk_offsets = _compute_varlen_metadata(
             cu_seqlens, chunk_size
         )
 
         dtype = torch.bfloat16
-        x = torch.randn(1, total_seqlen, nheads, headdim, dtype=dtype, device="cuda")
-        dt = torch.randn(1, total_seqlen, nheads, dtype=torch.float32, device="cuda")
-        A = -torch.rand(nheads, dtype=torch.float32, device="cuda") - 1.0
-        B = torch.randn(1, total_seqlen, ngroups, dstate, dtype=dtype, device="cuda")
-        C = torch.randn(1, total_seqlen, ngroups, dstate, dtype=dtype, device="cuda")
-        D = torch.randn(nheads, dtype=dtype, device="cuda")
-        dt_bias = torch.rand(nheads, dtype=torch.float32, device="cuda") - 4.0
+        x = torch.randn(1, total_seqlen, nheads, headdim, dtype=dtype, device=TEST_DEVICE)
+        dt = torch.randn(1, total_seqlen, nheads, dtype=torch.float32, device=TEST_DEVICE)
+        A = -torch.rand(nheads, dtype=torch.float32, device=TEST_DEVICE) - 1.0
+        B = torch.randn(1, total_seqlen, ngroups, dstate, dtype=dtype, device=TEST_DEVICE)
+        C = torch.randn(1, total_seqlen, ngroups, dstate, dtype=dtype, device=TEST_DEVICE)
+        D = torch.randn(nheads, dtype=dtype, device=TEST_DEVICE)
+        dt_bias = torch.rand(nheads, dtype=torch.float32, device=TEST_DEVICE) - 4.0
         initial_states = torch.randn(
-            num_seqs, nheads, headdim, dstate, dtype=dtype, device="cuda"
+            num_seqs, nheads, headdim, dstate, dtype=dtype, device=TEST_DEVICE
         )
 
         return dict(
@@ -1915,17 +1918,17 @@ def test_fp16_state_dtype():
     batch, seqlen, nheads, headdim = 1, 128, 8, 64
     ngroups, dstate, chunk_size = 8, 128, 128
 
-    x = torch.randn(batch, seqlen, nheads, headdim, dtype=torch.bfloat16, device="cuda")
-    dt = torch.randn(batch, seqlen, nheads, dtype=torch.float32, device="cuda")
-    A = -torch.rand(nheads, dtype=torch.float32, device="cuda") - 1.0
-    B = torch.randn(batch, seqlen, ngroups, dstate, dtype=torch.bfloat16, device="cuda")
-    C = torch.randn(batch, seqlen, ngroups, dstate, dtype=torch.bfloat16, device="cuda")
-    D = torch.randn(nheads, dtype=torch.bfloat16, device="cuda")
-    dt_bias = torch.rand(nheads, dtype=torch.float32, device="cuda") - 4.0
+    x = torch.randn(batch, seqlen, nheads, headdim, dtype=torch.bfloat16, device=TEST_DEVICE)
+    dt = torch.randn(batch, seqlen, nheads, dtype=torch.float32, device=TEST_DEVICE)
+    A = -torch.rand(nheads, dtype=torch.float32, device=TEST_DEVICE) - 1.0
+    B = torch.randn(batch, seqlen, ngroups, dstate, dtype=torch.bfloat16, device=TEST_DEVICE)
+    C = torch.randn(batch, seqlen, ngroups, dstate, dtype=torch.bfloat16, device=TEST_DEVICE)
+    D = torch.randn(nheads, dtype=torch.bfloat16, device=TEST_DEVICE)
+    dt_bias = torch.rand(nheads, dtype=torch.float32, device=TEST_DEVICE) - 4.0
 
     # initial_states in fp16 (different from io_dtype=bf16)
     initial_states = torch.randn(
-        batch, nheads, headdim, dstate, dtype=torch.float16, device="cuda"
+        batch, nheads, headdim, dstate, dtype=torch.float16, device=TEST_DEVICE
     )
 
     out_test, final_states_test = ssd_combined_fwd(
@@ -1991,6 +1994,7 @@ def test_fp16_state_dtype():
 
 
 @pytest.mark.xfail(
+    condition=TEST_DEVICE != "musa",
     reason="state_dtype=float32 not yet supported (only float16/bfloat16)",
     strict=True,
 )
@@ -2000,16 +2004,16 @@ def test_fp32_state_dtype():
     batch, seqlen, nheads, headdim = 1, 128, 8, 64
     ngroups, dstate, chunk_size = 8, 128, 128
 
-    x = torch.randn(batch, seqlen, nheads, headdim, dtype=torch.bfloat16, device="cuda")
-    dt = torch.randn(batch, seqlen, nheads, dtype=torch.float32, device="cuda")
-    A = -torch.rand(nheads, dtype=torch.float32, device="cuda") - 1.0
-    B = torch.randn(batch, seqlen, ngroups, dstate, dtype=torch.bfloat16, device="cuda")
-    C = torch.randn(batch, seqlen, ngroups, dstate, dtype=torch.bfloat16, device="cuda")
-    D = torch.randn(nheads, dtype=torch.bfloat16, device="cuda")
-    dt_bias = torch.rand(nheads, dtype=torch.float32, device="cuda") - 4.0
+    x = torch.randn(batch, seqlen, nheads, headdim, dtype=torch.bfloat16, device=TEST_DEVICE)
+    dt = torch.randn(batch, seqlen, nheads, dtype=torch.float32, device=TEST_DEVICE)
+    A = -torch.rand(nheads, dtype=torch.float32, device=TEST_DEVICE) - 1.0
+    B = torch.randn(batch, seqlen, ngroups, dstate, dtype=torch.bfloat16, device=TEST_DEVICE)
+    C = torch.randn(batch, seqlen, ngroups, dstate, dtype=torch.bfloat16, device=TEST_DEVICE)
+    D = torch.randn(nheads, dtype=torch.bfloat16, device=TEST_DEVICE)
+    dt_bias = torch.rand(nheads, dtype=torch.float32, device=TEST_DEVICE) - 4.0
 
     initial_states = torch.randn(
-        batch, nheads, headdim, dstate, dtype=torch.float32, device="cuda"
+        batch, nheads, headdim, dstate, dtype=torch.float32, device=TEST_DEVICE
     )
 
     out_test, final_states_test = ssd_combined_fwd(

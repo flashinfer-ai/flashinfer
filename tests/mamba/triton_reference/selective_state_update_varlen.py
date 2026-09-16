@@ -404,7 +404,7 @@ def selective_state_update_varlen_triton(
         and dt.stride(-1) == 0
         and (dt_bias is None or dt_bias.stride(-1) == 0)
     )
-    with torch.cuda.device(x.device.index):
+    with (torch.musa if x.device.type == "musa" else torch.cuda).device(x.device.index):
         _selective_scan_update_kernel[grid](
             state,
             x,

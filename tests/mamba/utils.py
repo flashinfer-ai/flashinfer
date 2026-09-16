@@ -1,7 +1,10 @@
+import os
 from typing import Any, Dict, Optional
 
 import numpy as np
 import torch
+
+TEST_DEVICE = os.environ.get("FLASHINFER_MAMBA_TEST_DEVICE", "cuda")
 
 
 def clone_preserving_strides(tensor):
@@ -28,7 +31,7 @@ def create_test_inputs(
     cache_steps: Optional[int] = None,
     generate_retrieve_parent_token: bool = False,
     state_cache_batch_stride: Optional[int] = None,
-    device: str = "cuda",
+    device: str = TEST_DEVICE,
     seed: int = 42,
 ) -> Dict[str, Any]:
     """

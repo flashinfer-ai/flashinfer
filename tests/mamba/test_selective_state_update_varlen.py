@@ -17,6 +17,7 @@ import flashinfer
 from .triton_reference.selective_state_update_varlen import (
     selective_state_update_varlen_triton,
 )
+from .utils import TEST_DEVICE
 
 
 PAD_SLOT_ID = -1
@@ -33,7 +34,7 @@ def _make_base_tensors(
     weight_dtype=torch.float32,
     matrixA_dtype=torch.float32,
     state_dtype=torch.bfloat16,
-    device="cuda",
+    device=TEST_DEVICE,
 ):
     """Create base input tensors for total_tokens in varlen (3D) layout."""
     x = torch.randn(total_tokens, nheads, dim, device=device, dtype=input_dtype)
@@ -82,11 +83,11 @@ class TestSelectiveStateUpdateDstIndices:
 
     ATOL = 1e-3
     RTOL = 1e-2
-    NHEADS = 64
-    DIM = 64
-    DSTATE = 128
-    NGROUPS = 8
-    STATE_CACHE_SIZE = 256
+    NHEADS = 8 if TEST_DEVICE == "musa" else 64
+    DIM = 8 if TEST_DEVICE == "musa" else 64
+    DSTATE = 16 if TEST_DEVICE == "musa" else 128
+    NGROUPS = 2 if TEST_DEVICE == "musa" else 8
+    STATE_CACHE_SIZE = 256 if TEST_DEVICE == "musa" else 256
 
     @pytest.mark.parametrize("algorithm", ["simple"])
     @pytest.mark.parametrize("batch", [1, 4, 32, 64])
@@ -102,10 +103,10 @@ class TestSelectiveStateUpdateDstIndices:
             self.STATE_CACHE_SIZE,
         )
         out = torch.empty(
-            batch, self.NHEADS, self.DIM, device="cuda", dtype=torch.bfloat16
+            batch, self.NHEADS, self.DIM, device=TEST_DEVICE, dtype=torch.bfloat16
         )
 
-        perm = torch.randperm(self.STATE_CACHE_SIZE, device="cuda")
+        perm = torch.randperm(self.STATE_CACHE_SIZE, device=TEST_DEVICE)
         src_indices = perm[:batch].to(torch.int32)
         dst_indices = perm[batch : 2 * batch].to(torch.int32)
 
@@ -168,11 +169,11 @@ class TestSelectiveStateUpdateDstIndices2D:
 
     ATOL = 1e-3
     RTOL = 1e-2
-    NHEADS = 64
-    DIM = 64
-    DSTATE = 128
-    NGROUPS = 8
-    STATE_CACHE_SIZE = 256
+    NHEADS = 8 if TEST_DEVICE == "musa" else 64
+    DIM = 8 if TEST_DEVICE == "musa" else 64
+    DSTATE = 16 if TEST_DEVICE == "musa" else 128
+    NGROUPS = 2 if TEST_DEVICE == "musa" else 8
+    STATE_CACHE_SIZE = 256 if TEST_DEVICE == "musa" else 256
 
     @pytest.mark.parametrize("algorithm", ["simple"])
     @pytest.mark.parametrize("batch", [1, 16, 64])
@@ -188,10 +189,10 @@ class TestSelectiveStateUpdateDstIndices2D:
             self.STATE_CACHE_SIZE,
         )
         out = torch.empty(
-            batch, self.NHEADS, self.DIM, device="cuda", dtype=torch.bfloat16
+            batch, self.NHEADS, self.DIM, device=TEST_DEVICE, dtype=torch.bfloat16
         )
 
-        perm = torch.randperm(self.STATE_CACHE_SIZE, device="cuda")
+        perm = torch.randperm(self.STATE_CACHE_SIZE, device=TEST_DEVICE)
         src_indices = perm[:batch].to(torch.int32).unsqueeze(1)
         dst_indices = perm[batch : 2 * batch].to(torch.int32).unsqueeze(1)
 
@@ -249,11 +250,11 @@ class TestSelectiveStateUpdateVarlen:
 
     ATOL = 1e-3
     RTOL = 1e-2
-    NHEADS = 64
-    DIM = 64
-    DSTATE = 128
-    NGROUPS = 8
-    STATE_CACHE_SIZE = 512
+    NHEADS = 8 if TEST_DEVICE == "musa" else 64
+    DIM = 8 if TEST_DEVICE == "musa" else 64
+    DSTATE = 16 if TEST_DEVICE == "musa" else 128
+    NGROUPS = 2 if TEST_DEVICE == "musa" else 8
+    STATE_CACHE_SIZE = 512 if TEST_DEVICE == "musa" else 512
 
     @pytest.mark.parametrize("algorithm", ["simple"])
     @pytest.mark.parametrize(
@@ -282,10 +283,10 @@ class TestSelectiveStateUpdateVarlen:
         )
 
         cu_seqlens = torch.arange(
-            0, total_tokens + 1, max_seqlen, device="cuda", dtype=torch.int32
+            0, total_tokens + 1, max_seqlen, device=TEST_DEVICE, dtype=torch.int32
         )
 
-        perm = torch.randperm(self.STATE_CACHE_SIZE, device="cuda")
+        perm = torch.randperm(self.STATE_CACHE_SIZE, device=TEST_DEVICE)
         src_indices = (
             perm[: n_seqs * max_seqlen].reshape(n_seqs, max_seqlen).to(torch.int32)
         )
@@ -295,9 +296,9 @@ class TestSelectiveStateUpdateVarlen:
             .to(torch.int32)
         )
 
-        num_accepted = torch.ones(n_seqs, device="cuda", dtype=torch.int64)
+        num_accepted = torch.ones(n_seqs, device=TEST_DEVICE, dtype=torch.int64)
         out = torch.empty(
-            total_tokens, self.NHEADS, self.DIM, device="cuda", dtype=torch.bfloat16
+            total_tokens, self.NHEADS, self.DIM, device=TEST_DEVICE, dtype=torch.bfloat16
         )
 
         state_ref = tensors["state"].clone()
@@ -362,9 +363,9 @@ class TestSelectiveStateUpdateVarlen:
         max_seqlen = 6
         torch.manual_seed(42)
 
-        seq_lens = torch.randint(1, max_seqlen + 1, (n_seqs,), device="cuda")
+        seq_lens = torch.randint(1, max_seqlen + 1, (n_seqs,), device=TEST_DEVICE)
         total_tokens = seq_lens.sum().item()
-        cu_seqlens = torch.zeros(n_seqs + 1, device="cuda", dtype=torch.int32)
+        cu_seqlens = torch.zeros(n_seqs + 1, device=TEST_DEVICE, dtype=torch.int32)
         cu_seqlens[1:] = torch.cumsum(seq_lens, dim=0).to(torch.int32)
 
         tensors = _make_base_tensors(
@@ -377,12 +378,12 @@ class TestSelectiveStateUpdateVarlen:
         )
 
         src_indices = torch.full(
-            (n_seqs, max_seqlen), PAD_SLOT_ID, device="cuda", dtype=torch.int32
+            (n_seqs, max_seqlen), PAD_SLOT_ID, device=TEST_DEVICE, dtype=torch.int32
         )
         dst_indices = torch.full(
-            (n_seqs, max_seqlen), PAD_SLOT_ID, device="cuda", dtype=torch.int32
+            (n_seqs, max_seqlen), PAD_SLOT_ID, device=TEST_DEVICE, dtype=torch.int32
         )
-        perm = torch.randperm(self.STATE_CACHE_SIZE, device="cuda").to(torch.int32)
+        perm = torch.randperm(self.STATE_CACHE_SIZE, device=TEST_DEVICE).to(torch.int32)
         slot_offset = 0
         for s in range(n_seqs):
             sl = seq_lens[s].item()
@@ -394,9 +395,9 @@ class TestSelectiveStateUpdateVarlen:
             ]
             slot_offset += sl
 
-        num_accepted = torch.ones(n_seqs, device="cuda", dtype=torch.int64)
+        num_accepted = torch.ones(n_seqs, device=TEST_DEVICE, dtype=torch.int64)
         out = torch.empty(
-            total_tokens, self.NHEADS, self.DIM, device="cuda", dtype=torch.bfloat16
+            total_tokens, self.NHEADS, self.DIM, device=TEST_DEVICE, dtype=torch.bfloat16
         )
 
         state_ref = tensors["state"].clone()
@@ -449,11 +450,11 @@ class TestSelectiveStateUpdateNumAcceptedTokens:
 
     ATOL = 1e-3
     RTOL = 1e-2
-    NHEADS = 64
-    DIM = 64
-    DSTATE = 128
-    NGROUPS = 8
-    STATE_CACHE_SIZE = 512
+    NHEADS = 8 if TEST_DEVICE == "musa" else 64
+    DIM = 8 if TEST_DEVICE == "musa" else 64
+    DSTATE = 16 if TEST_DEVICE == "musa" else 128
+    NGROUPS = 2 if TEST_DEVICE == "musa" else 8
+    STATE_CACHE_SIZE = 512 if TEST_DEVICE == "musa" else 512
 
     @pytest.mark.parametrize("algorithm", ["simple"])
     @pytest.mark.parametrize("n_seqs", [4, 8, 16])
@@ -476,21 +477,21 @@ class TestSelectiveStateUpdateNumAcceptedTokens:
         )
 
         cu_seqlens = torch.arange(
-            0, total_tokens + 1, max_seqlen, device="cuda", dtype=torch.int32
+            0, total_tokens + 1, max_seqlen, device=TEST_DEVICE, dtype=torch.int32
         )
 
         num_accepted = torch.randint(
-            1, max_seqlen + 1, (n_seqs,), device="cuda", dtype=num_accepted_dtype
+            1, max_seqlen + 1, (n_seqs,), device=TEST_DEVICE, dtype=num_accepted_dtype
         )
 
-        perm = torch.randperm(self.STATE_CACHE_SIZE, device="cuda").to(torch.int32)
+        perm = torch.randperm(self.STATE_CACHE_SIZE, device=TEST_DEVICE).to(torch.int32)
         src_indices = perm[: n_seqs * max_seqlen].reshape(n_seqs, max_seqlen)
         dst_indices = perm[n_seqs * max_seqlen : 2 * n_seqs * max_seqlen].reshape(
             n_seqs, max_seqlen
         )
 
         out = torch.empty(
-            total_tokens, self.NHEADS, self.DIM, device="cuda", dtype=torch.bfloat16
+            total_tokens, self.NHEADS, self.DIM, device=TEST_DEVICE, dtype=torch.bfloat16
         )
 
         state_ref = tensors["state"].clone()
