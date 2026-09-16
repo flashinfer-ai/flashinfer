@@ -2023,6 +2023,17 @@ class BatchDecodeWithPagedKVCacheWrapper:
         max_kv_len = int(kv_lens_arr_host.max())
         if self._user_block_tables:
             # Caller-owned table: its width bounds the walk, so key the graph on it.
+            required_pages = -(-max_kv_len // page_size)
+            if (
+                self._block_tables.shape[0] != batch_size
+                or self._block_tables.shape[1] < required_pages
+            ):
+                raise ValueError(
+                    "cudnn decode backend: block_tables "
+                    f"{tuple(self._block_tables.shape)} cannot hold every planned "
+                    f"sequence (need {(batch_size, required_pages)} for "
+                    f"max kv_len={max_kv_len}, page_size={page_size})."
+                )
             self._max_kv_len = self._block_tables.shape[1] * page_size
             return
 

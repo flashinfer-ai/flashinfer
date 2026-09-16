@@ -76,6 +76,10 @@ def _sdpa_decode_key_fn(
         "decode",
         max_sequence_kv,
         tuple(q.shape),
+        # Q strides are baked into the graph descriptor: a query sliced out of
+        # a packed QKV buffer (batch stride > h*d) must not replay a graph built
+        # for a contiguous query.
+        tuple(q.stride()),
         # K/V shapes and strides are baked into the built graph via
         # tensor_like (v_cache also supplies d_vo for the O dims), so both
         # caches key on their full layout, not just k_cache's shape.
@@ -163,10 +167,17 @@ if CUDNN_AVAILABLE:
 
             d_vo = v_cache.shape[3]
 
+            # Use the caller's strides: a query sliced from a packed QKV buffer
+            # has a batch stride larger than h_qo * d_qk. s_qo == 1, so the
+            # sequence stride is immaterial; reuse the batch stride.
+            if q.dim() == 3:
+                q_stride = (q.stride(0), q.stride(1), q.stride(0), q.stride(2))
+            else:
+                q_stride = tuple(q.stride())
             cudnn_q = g.tensor(
                 name="q",
                 dim=(b, h_qo, s_qo, d_qk),
-                stride=(h_qo * d_qk, d_qk, d_qk * h_qo, 1),
+                stride=q_stride,
                 data_type=cudnn_q_data_type,
             )
             if batch_offsets_q is not None:
@@ -401,8 +412,10 @@ def cudnn_batch_decode_with_kv_cache(
 
     Note
     ----
-    Currently only supports causal attention; all tensors must be contiguous and
-    on the same CUDA device.  Query and KV heads may differ
+    Currently only supports causal attention; all tensors must be on the same
+    CUDA device. ``q`` may carry arbitrary batch/head strides (e.g. a slice of a
+    packed QKV projection) as long as ``head_dim`` is innermost and dense;
+    ``out``/``lse`` must be contiguous.  Query and KV heads may differ
     (``num_heads_qo >= num_heads_kv``, multi-query / grouped-query attention).
 
     LSE convention: ``lse[b, h]`` is the **base-2** log-sum-exp of the
@@ -453,6 +466,13 @@ def cudnn_batch_decode_with_kv_cache(
 
     if out is None:
         out = torch.empty(bs, h_qo, d_vo, device=q.device, dtype=q.dtype)
+    elif not out.is_contiguous():
+        # O is bound with contiguous (batch, heads, d_vo) strides.
+        raise ValueError("out must be contiguous")
+    if q.stride(-1) != 1:
+        # The graph honors arbitrary batch/head strides but needs a unit
+        # innermost stride (TMA/vector loads); such inputs are rare, copy them.
+        q = q.contiguous()
 
     if not CUDNN_AVAILABLE:
         for name, t in (("q", q), ("k_cache", k_cache), ("v_cache", v_cache)):
@@ -468,7 +488,7 @@ def cudnn_batch_decode_with_kv_cache(
         run_func = get_cudnn_fmha_gen_module().decode
         run_func(
             max_sequence_kv,
-            q,
+            q.contiguous(),  # the cubin path assumes a dense (b, h, d) query
             k_cache,
             v_cache,
             scale,

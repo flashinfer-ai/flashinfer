@@ -866,3 +866,77 @@ def test_cudnn_wrapper_rejects_sinks_at_run():
     )
     with pytest.raises(NotImplementedError):
         wrapper.run(q, kv_cache, sinks=torch.zeros(32, device=device))
+
+
+@requires_cudnn_graph
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
+@pytest.mark.parametrize("packed_first", [True, False])
+def test_cudnn_wrapper_packed_q_strides(dtype, kv_layout, packed_first):
+    """A query sliced out of a packed QKV projection (batch stride > h*d) must
+    give the same result as its contiguous copy, in either graph-cache
+    population order (packed-Q graph first, or contiguous-Q graph first)."""
+    torch.manual_seed(0)
+    device = "cuda:0"
+    batch_size, s_kv, page_size = 4, 128, 16
+    num_kv_heads, num_qo_heads, head_dim = 4, 32, 128
+    _, kv_cache, indptr, indices, last_page_len = _wrapper_inputs(
+        batch_size,
+        s_kv,
+        page_size,
+        num_kv_heads,
+        num_qo_heads,
+        head_dim,
+        dtype,
+        kv_layout,
+        device,
+    )
+    packed = torch.randn(
+        batch_size,
+        (num_qo_heads + 2 * num_kv_heads) * head_dim,
+        device=device,
+        dtype=dtype,
+    )
+    q_packed = packed[:, : num_qo_heads * head_dim].view(
+        batch_size, num_qo_heads, head_dim
+    )
+    assert not q_packed.is_contiguous()
+    q_contig = q_packed.contiguous()
+
+    workspace = torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device=device)
+    wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        workspace, kv_layout, backend="cudnn"
+    )
+    wrapper.plan(
+        indptr,
+        indices,
+        last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        q_data_type=dtype,
+        kv_data_type=dtype,
+    )
+    order = (q_packed, q_contig) if packed_first else (q_contig, q_packed)
+    results = [wrapper.run(q, kv_cache, return_lse=True) for q in order]
+    (out_a, lse_a), (out_b, lse_b) = results
+    torch.testing.assert_close(out_a, out_b, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(lse_a, lse_b, rtol=1e-4, atol=1e-4)
+
+    out_ref, lse_ref = _run_wrapper(
+        "fa2",
+        q_contig,
+        kv_cache,
+        indptr,
+        indices,
+        last_page_len,
+        page_size,
+        num_kv_heads,
+        num_qo_heads,
+        head_dim,
+        dtype,
+        kv_layout,
+    )
+    torch.testing.assert_close(out_a, out_ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(lse_a, lse_ref, rtol=1e-3, atol=1e-2)
