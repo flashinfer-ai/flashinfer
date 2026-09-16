@@ -8,6 +8,7 @@
 
 import torch
 
+from .musa_compile import device_context
 from .musa_ssd_helpers import fast_exp
 import triton
 import triton.language as tl
@@ -121,7 +122,7 @@ def _state_passing_fwd(
     )
 
     grid = lambda META: (triton.cdiv(dim, META["BLOCK_SIZE"]), batch, nheads)
-    with torch.accelerator.device_index(states.device.index):
+    with device_context(states.device.index):
         _state_passing_fwd_kernel[grid](
             states_ptr=states,
             out_ptr=out,

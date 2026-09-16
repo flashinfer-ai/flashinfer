@@ -8,6 +8,7 @@
 
 import torch
 
+from .musa_compile import device_context
 from .musa_ssd_helpers import fast_exp
 import triton
 import triton.language as tl
@@ -333,7 +334,7 @@ def _chunk_cumsum_fwd(
         nheads, nchunks, chunk_size, device=dt.device, dtype=torch.float32
     )
     grid_chunk_cs = lambda META: (nchunks, triton.cdiv(nheads, META["BLOCK_SIZE_H"]))
-    with torch.accelerator.device_index(dt.device.index):
+    with device_context(dt.device.index):
         _chunk_cumsum_fwd_kernel[grid_chunk_cs](
             dt_ptr=dt,
             A_ptr=A,
@@ -387,7 +388,7 @@ def _chunk_state_fwd(
         nchunks,
         nheads,
     )
-    with torch.accelerator.device_index(x.device.index):
+    with device_context(x.device.index):
         _chunk_state_fwd_kernel[grid](
             x_ptr=x,
             b_ptr=B,
