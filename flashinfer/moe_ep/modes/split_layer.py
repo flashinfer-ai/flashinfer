@@ -158,6 +158,7 @@ class MoEEpSplitLayer(nn.Module):
             fleet_params=self._fleet_params,
             recv_topk_idx=dispatch.recv_topk_idx,
             recv_topk_weights=dispatch.recv_topk_weights,
+            recv_count=dispatch.expert_counts,
         )
         return self._kernel.compute(ctx)
 

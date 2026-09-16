@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import os
 from typing import TYPE_CHECKING, Optional
 
 from .....config import BootstrapConfig, EpAlgorithm, EpLayout, FleetParams
@@ -96,6 +97,26 @@ class FusedMoeSplitKernelBackend(SplitKernelBackend):
             self._compute = MoELayer(compute_cfg)
         return self._compute
 
+    def _recv_count_for_exclusion(self, ctx: SplitKernelContext):
+        """Per-expert REAL token counts, when they can be used to drop EP padding.
+
+        Returning None is always safe: the bridge then marks every padded row as a
+        real token, which is what this path did before - correct, just wasteful.
+
+        EXPERT_MAJOR only. RANK_MAJOR's counts are per-source-rank rather than
+        per-expert, and its rows are not laid out with a fixed per-expert stride, so
+        the same tensor means something different there.
+
+        Set FLASHINFER_MOE_EP_EXCLUDE_PADDING_ROWS=0 to force the old behaviour, i,e ignoring padded rows.
+        """
+        if ctx.recv_count is None:
+            return None
+        if ctx.fleet_params.layout is not EpLayout.EXPERT_MAJOR:
+            return None
+        if os.environ.get("FLASHINFER_MOE_EP_EXCLUDE_PADDING_ROWS", "1") == "0":
+            return None
+        return ctx.recv_count
+
     def compute(self, ctx: SplitKernelContext):
         expert_tensors = ctx.expert_tensors
         quant = self._moe_config.quant
@@ -130,6 +151,8 @@ class FusedMoeSplitKernelBackend(SplitKernelBackend):
                 per_token_activation=per_token_activation,
                 mxfp8_dispatch=self._mxfp8_dispatch,
                 hidden_size=fleet_params.token_hidden_size,
+                recv_count=self._recv_count_for_exclusion(ctx),
+                num_experts=self._moe_config.routing.num_experts,
             )
 
         out_2d = self._ensure_compute(fleet_params)(act_pack, self._transformed_weights)
