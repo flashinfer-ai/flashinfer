@@ -402,3 +402,5 @@ def _log_import_version() -> None:
 
 _log_import_version()
 del _log_import_version
+
+from .kda_prefill import prepare_tf32_kda_prefill as prepare_tf32_kda_prefill
