@@ -320,8 +320,12 @@ def _mm_fp4_precompile_worker(payload):
             compile_fn,
             _hash_source_files(tuple(payload["key_files"])),
         )
+        from filelock import FileLock
+
         if not spec.is_compiled:
-            spec.build()
+            with FileLock(spec.lock_path, thread_local=False):
+                if not spec.is_compiled:
+                    spec.build()
         return (kernel_name, None)
     except Exception as e:  # noqa: BLE001 -- reported to the parent
         return (kernel_name, f"{type(e).__name__}: {e}")
