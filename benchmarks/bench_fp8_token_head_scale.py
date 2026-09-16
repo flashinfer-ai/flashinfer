@@ -291,6 +291,7 @@ def main():
         "--modes",
         type=str,
         nargs="+",
+        choices=_MODES,
         default=_MODES,
         help="subset of modes to benchmark (see --help / docstring)",
     )
