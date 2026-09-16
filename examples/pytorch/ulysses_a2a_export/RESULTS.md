@@ -101,6 +101,14 @@ The 40 shape-measurement stages total **13372.1 s**, including **2317.7 s** for 
 
 The final 25-case campaign took **2912.905 s** from its first successful trial submission to the last GPU step completion. The full validation interval was **99968.022 s** from the first qualifying campaign submission to the final GPU completion, including inter-job gaps and resource waiting. Initial preparation and later publication are outside that interval.
 
+## Publication formatting
+
+The published bridge and Python helpers include the repository formatters' layout changes.
+The two Python `zip` calls state the original default explicitly as `strict=False`.
+C++ tokens and Python syntax trees match the measured version after accounting for
+that explicit default; all 60 generated kernel and binding files remain byte-identical.
+These publication changes do not alter the measured computation.
+
 ## Public reproduction
 
 ```bash

@@ -39,7 +39,7 @@ class PreparedCase:
 
     def run(self):
         """Three scatters and an independent gather, including copy-out."""
-        for source, destination in zip(self.inputs[:3], self.outputs[:3]):
+        for source, destination in zip(self.inputs[:3], self.outputs[:3], strict=False):
             self.communicator.scatter_heads(
                 source, out=destination, workspace=self.workspace
             )
@@ -54,7 +54,9 @@ class PreparedCase:
         rank = self.communicator.rank
         world = self.communicator.world_size
         self.run()
-        for index, (source, actual) in enumerate(zip(self.inputs, self.outputs)):
+        for index, (source, actual) in enumerate(
+            zip(self.inputs, self.outputs, strict=False)
+        ):
             peers = [torch.empty_like(source) for _ in range(world)]
             dist.all_gather(peers, source, group=group)
             if index < 3:
@@ -106,9 +108,7 @@ def prepare(shape, *, backend="nvlink", group=None, inputs=None, outputs=None):
     if inputs is None:
         generator = torch.Generator(device="cuda").manual_seed(1234 + rank)
         inputs = tuple(
-            torch.randn(
-                dimensions, dtype=dtype, device="cuda", generator=generator
-            )
+            torch.randn(dimensions, dtype=dtype, device="cuda", generator=generator)
             for dimensions in (local_shape, local_shape, local_shape, global_shape)
         )
     if outputs is None:

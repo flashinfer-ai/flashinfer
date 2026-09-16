@@ -80,11 +80,10 @@ def generated_ulysses_spec():
         "generated/ulysses/sm_100a/cake_ulysses_a2a_seq_c4412fd74980ec7da889_binding.cu",
         "generated/ulysses/sm_100a/cake_ulysses_a2a_seq_cf34839748bfea20225c_binding.cu",
         "generated/ulysses/sm_100a/cake_ulysses_a2a_seq_eb420dd5e582de094bd2_binding.cu",
-        "generated/ulysses/sm_100a/cake_ulysses_a2a_seq_fa7672e2c0597c2a23d3_binding.cu"
-]
+        "generated/ulysses/sm_100a/cake_ulysses_a2a_seq_fa7672e2c0597c2a23d3_binding.cu",
+    ]
     return gen_jit_spec(
         "ulysses_a2a_" + name,
         [jit_env.FLASHINFER_CSRC_DIR / path for path in sources],
-        extra_cuda_cflags=arch_flags + []
-        + ["-DFLASHINFER_ULYSSES_GENERATED=1"],
+        extra_cuda_cflags=arch_flags + [] + ["-DFLASHINFER_ULYSSES_GENERATED=1"],
     )
