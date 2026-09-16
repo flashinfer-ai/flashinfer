@@ -810,7 +810,10 @@ class Sm90SwigluFp8Fc12Kernel:
             # Swap-AB kernels share the Mega init path but have no FC1
             # store offload (and no offload fields) -- nothing to fit.
             return
-        if self.epilogue_warpgroup_count == 2 and self.epi_reg_cnt == 216:
+        reclaimed_epi_headroom = (
+            self.epilogue_warpgroup_count == 2 and self.epi_reg_cnt == 216
+        )
+        if reclaimed_epi_headroom:
             self.epi_reg_cnt = 200
         base_regs = (
             self.estimated_register_budget() // 32 - self.epi_aux_reg_cnt
@@ -826,6 +829,10 @@ class Sm90SwigluFp8Fc12Kernel:
             self.fc1_store_offload = False
             self.fc1_early_done_publish = True
             self.epi_aux_reg_cnt = 24
+            if reclaimed_epi_headroom:
+                # The in-epilogue TMA-store partition path is back in the
+                # binary; give it the registers it was tuned with.
+                self.epi_reg_cnt = 216
 
     def validate_register_policy(self) -> None:
         """Validate setmaxnreg immediates and CTA-level register budget."""

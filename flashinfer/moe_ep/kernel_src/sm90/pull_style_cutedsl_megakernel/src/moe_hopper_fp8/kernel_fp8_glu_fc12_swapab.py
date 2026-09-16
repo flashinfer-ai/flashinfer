@@ -105,10 +105,9 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
         fc2_in_kernel_topk_reduce: bool = False,
         apply_topk_in_fc1: bool = False,
         token_back_by_dispatch: bool = False,
-        # Accepted for Mega-ctor parity with the non-swap base; the swap-AB
-        # epilogue has no FC1 store-offload / early-publish path (non-pp
-        # swap tiles span both WGs, and ping-pong already publishes in its
-        # retire section before consume_next).
+        # Both paths are non-ping-pong only (ping-pong already publishes in
+        # its retire section before consume_next); the store offload
+        # supersedes early publication where both are requested.
         fc1_store_offload: bool = False,
         fc1_early_done_publish: bool = False,
         epi_flag_batch: Optional[Tuple[int, int]] = (1, 1),

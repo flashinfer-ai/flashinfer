@@ -185,7 +185,11 @@ case "$FP8_CLUSTER_SHAPE" in
 esac
 
 if [ "$SWAP_AB" -eq 1 ]; then
-    FP8_SWAP_AB_M="${FP8_SWAP_AB_M:-256}"
+    if [ "$PINGPONG" -eq 1 ]; then
+        FP8_SWAP_AB_M="${FP8_SWAP_AB_M:-128}"
+    else
+        FP8_SWAP_AB_M="${FP8_SWAP_AB_M:-256}"
+    fi
     case "$FP8_SWAP_AB_M" in
         128|256)
             ;;

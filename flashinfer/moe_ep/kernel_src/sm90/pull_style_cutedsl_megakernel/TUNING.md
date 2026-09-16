@@ -138,8 +138,9 @@ interleaved same-node A/Bs, never on cross-session sweeps.
 
 ### e2e overhead (the production path)
 
-`e2e` minus `compute` is ~140-280 µs at small token counts growing to
-~1.6-2.9 ms at 32768 — dominated by the torch-composed staging quant plus
+`e2e` minus `compute` is ~120 µs (per_tensor) / ~210 µs (blockwise, whose
+staging quant also emits the per-128 activation scales) at small token
+counts, growing to ~2.9 ms at 32768 — dominated by the torch-composed staging quant plus
 the output copy.  The SM100 tree eliminated the analogous cost with a
 fused single-launch quant+repack kernel (`FLASHINFER_MEGA_FUSED_STAGE`);
 the SM90 tree has no counterpart yet — this is the top e2e lever (see
@@ -373,8 +374,10 @@ cc 9.0) over NVLink, SM clock locked at 1830 MHz on all four GPUs
 (`nvidia-smi --query-gpu=clocks.sm,clocks.max.sm` reports 1830 / 1980 MHz;
 every sweep script records it to `clocks.txt` before timing, and no
 row in this document was taken unlocked).  Python 3.12, torch `2.12.0+cu130`,
-`nvshmem4py-cu13`, **`nvidia-cutlass-dsl 4.6.0`** (the drop pins
-`4.5.0dev0`; 4.6.0 compiles and runs this SM90 tree).  Whether the SM100
+`nvshmem4py-cu13`, **`nvidia-cutlass-dsl 4.6.0`** — the measurement
+environment, pinned separately from the repository's supported range
+(`requirements.txt` >= 4.6.2a0, `pyproject.toml` cu13 extra >= 4.7.0a0);
+the drop pins `4.5.0dev0`, and 4.6.0 compiles and runs this SM90 tree.  Whether the SM100
 tree's ">=4.6.1 perf floor" finding applies to the SM90 kernels is
 UNTESTED — worth one A/B run.
 

@@ -134,28 +134,28 @@ def autotune_knobs(
 
     scores: List[float] = []
     for knobs in candidates:
-        # A candidate failure (ctor reject / compile error) is deterministic
-        # across ranks -- same static problem, same knobs -- so scoring it
-        # inf keeps the collective iteration aligned.
+        # Every rank executes exactly one barrier per candidate, outside the
+        # try, so a rank-local failure (ctor reject, compile error, or a
+        # launch/OOM error that only one rank hits) cannot desynchronize the
+        # collective; the MAX all-reduce below propagates its inf score.
+        score = math.inf
         try:
             frontend.apply_knobs(knobs)
-            _barrier()
             for _ in range(warmup_iters):  # first launch compiles
                 launch()
-            _barrier()
             iters: List[float] = []
             for _ in range(timed_iters):  # launch() syncs internally
                 t0 = time.perf_counter()
                 launch()
                 iters.append(time.perf_counter() - t0)
-            scores.append(statistics.median(iters))
+            score = statistics.median(iters)
         except Exception as exc:  # noqa: BLE001 -- score-and-continue by design
             warnings.warn(
                 f"[sm90-autotune] {label}: candidate {knobs} failed: {exc}",
                 RuntimeWarning,
                 stacklevel=2,
             )
-            scores.append(math.inf)
+        scores.append(score)
         _barrier()
 
     t = torch.tensor(scores, dtype=torch.float64, device="cuda")

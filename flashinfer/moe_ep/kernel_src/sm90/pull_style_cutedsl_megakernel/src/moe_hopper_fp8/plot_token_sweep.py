@@ -168,7 +168,7 @@ def _plot_rank(
                     points.append((tokens, tflops))
             if not points:
                 continue
-            x_values, y_values = zip(*points)
+            x_values, y_values = zip(*points, strict=True)
             all_tokens.update(x_values)
             linestyle = "--" if series.schedule == "pingpong" else "-"
             marker = "s" if series.schedule == "pingpong" else "o"
@@ -191,12 +191,13 @@ def _plot_rank(
         ax.set_xlabel("Tokens per rank before top-k")
         ax.set_ylabel("Slowest-rank effective throughput (TFLOPS/rank)")
         ax.grid(True, which="both", linestyle="--", linewidth=0.5, alpha=0.5)
-        ax.legend(ncols=3, fontsize=5.5, columnspacing=0.8, handlelength=2.0)
         if not line_count:
+            # Filtered sweeps (--scale-mode / --operand-order / ...) only
+            # produce a subset of the four panels; skip the empty ones.
             plt.close(fig)
-            raise ValueError(
-                f"No successful rows for {rank_mode} {scale_tag} {order_tag}"
-            )
+            print(f"[SKIP] no successful rows for {rank_mode} {scale_tag} {order_tag}")
+            continue
+        ax.legend(ncols=3, fontsize=5.5, columnspacing=0.8, handlelength=2.0)
         ordered_tokens = sorted(all_tokens)
         ax.set_xticks(ordered_tokens)
         ax.set_xticklabels([str(value) for value in ordered_tokens], rotation=45)
@@ -205,6 +206,8 @@ def _plot_rank(
         plt.close(fig)
         output_paths.append(output_path)
         print(f"[WROTE] {output_path} lines={line_count}")
+    if not output_paths:
+        raise ValueError(f"No successful rows for {rank_mode} in any panel")
     return output_paths
 
 

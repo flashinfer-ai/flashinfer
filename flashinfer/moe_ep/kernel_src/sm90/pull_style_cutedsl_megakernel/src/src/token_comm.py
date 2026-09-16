@@ -569,11 +569,7 @@ class TokenInPullTokenBackPush:
         # hidden 512 fp8 with a BF16 wire).
         self.tb_slot_bytes = self.hidden_bytes
         if self.grouped_token_back:
-            if hidden % self.GroupedChunkElems != 0:
-                raise ValueError(
-                    "grouped_token_back needs hidden % "
-                    f"{self.GroupedChunkElems} == 0, got hidden={hidden}."
-                )
+            # hidden % GroupedChunkElems was validated above.
             grouped_bytes = (
                 self.GroupedChunkElems * int(combine_format.act_dtype.width) // 8
             )

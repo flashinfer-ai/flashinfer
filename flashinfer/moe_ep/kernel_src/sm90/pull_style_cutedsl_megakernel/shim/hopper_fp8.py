@@ -1456,6 +1456,11 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
         # table's / cache's per-bucket pick.
         if token_back_mode is not None or token_back_by_dispatch:
             knob_overrides.pop("token_back_mode", None)
+        # The combine wire (dedup + format) is a collective correctness
+        # setting the caller passes explicitly; a cached sweep entry must not
+        # silently switch it.
+        knob_overrides.pop("grouped_token_back", None)
+        knob_overrides.pop("combine_format", None)
 
     cfg = MegaMoEHopperFp8Config(
         rank=rank,

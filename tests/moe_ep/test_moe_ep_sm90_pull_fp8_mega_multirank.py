@@ -64,8 +64,12 @@ FC2_ACT_SCALE = 8.0 / (0.95 * E4M3_MAX)
 def _require_cuda():
     import torch
 
+    from flashinfer.utils import is_sm90a_supported
+
     if not torch.cuda.is_available():
         pytest.skip("needs CUDA")
+    if not is_sm90a_supported(torch.device("cuda")):
+        pytest.skip("Requires SM90a")
 
 
 def _launcher_ranks() -> tuple[int, int]:
