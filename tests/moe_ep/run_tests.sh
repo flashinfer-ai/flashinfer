@@ -121,6 +121,7 @@ run_unit() {
     --ignore=tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py \
     --ignore=tests/moe_ep/test_deep_gemm_mega_kernel_vs_reference.py \
     --ignore=tests/moe_ep/test_sm90_pull_fp8_kernel_vs_reference.py \
+    --ignore=tests/moe_ep/test_sm90_pull_fp8_tuner.py \
     --ignore=tests/moe_ep/test_split_fused_moe_kernel_vs_reference.py \
     --ignore=tests/moe_ep/test_moe_ep_compute_correctness.py \
     --ignore=tests/moe_ep/test_moe_ep_compute_correctness_nvfp4.py \
@@ -137,7 +138,15 @@ run_unit() {
   # per-file, and in every subset tried (see moe_ep runbook "unit suite"
   # notes; observed since 2026-07-22).
   pytest_no_finalize -v "${MOE_EP_PYTEST_FLAGS[@]}" \
-    "tests/moe_ep/test_workspace_pool.py::test_two_nvfp4_layers_share_one_symm_buffer"
+    "tests/moe_ep/test_workspace_pool.py::test_two_nvfp4_layers_share_one_symm_buffer" \
+    || return 1
+  # The SM90 pull tuner tests import the sm90 pull_style_cutedsl_megakernel
+  # tree, which shares top-level module names (common, src, moe_nvfp4_swapab)
+  # with the SM100 cutedsl_megamoe tree the tests above load; the shim's
+  # bootstrap_paths guard refuses to mix them in one process, so they get
+  # their own interpreter.
+  pytest_no_finalize -v "${MOE_EP_PYTEST_FLAGS[@]}" \
+    tests/moe_ep/test_sm90_pull_fp8_tuner.py
 }
 
 run_multirank() {
