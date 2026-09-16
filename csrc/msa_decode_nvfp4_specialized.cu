@@ -261,10 +261,8 @@ inline int pinned_chunk_for(int split, bool short_cache) {
 //      1        4        3     0.00%  (0 of 3,000, twice, with and without
 //      1        8        7     0.00%   the split-cluster PV ordering)
 //
-// so the rescale is the site and a cluster is its precondition.  WHY a cluster
-// opens the window is not explained: nothing in the rescale is cluster-scoped
-// and the source ordering is the documented idiom, with all four primitives
-// honoured by ptxas 13.1.115.
+// so the rescale is the site and a cluster is its precondition; the predicate
+// below excludes exactly that combination.
 //
 // The shipped table's only clustered multi-chunk rows are the two split-2 ones
 // (kPages 8 against chunk 4, and chunk 2 on a short cache), i.e. total_q 17..32.
