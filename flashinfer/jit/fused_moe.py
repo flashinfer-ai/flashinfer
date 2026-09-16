@@ -21,6 +21,7 @@ from . import env as jit_env
 from ..artifacts import ArtifactPath, CheckSumHash
 from .core import (
     JitSpec,
+    common_nvcc_flags,
     gen_jit_spec,
     current_compilation_context,
     sm90a_nvcc_flags,
@@ -454,6 +455,49 @@ def gen_trtllm_gen_routing_module() -> JitSpec:
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/include",
             jit_env.FLASHINFER_CUBIN_DIR,
         ],
+    )
+
+
+def gen_alphamoe_fused_router_module() -> JitSpec:
+    """Generate the exact-SM100a/SM103a AlphaMoE router JIT spec.
+
+    Do not select this source by CUDA major version: CC 10.7 and other future
+    SM10x targets are not part of the frozen kernel's validated instruction
+    contract.
+    """
+
+    supported_archs = set()
+    if is_cuda_version_at_least("12.8"):
+        supported_archs.add((10, "0a"))
+    if is_cuda_version_at_least("12.9"):
+        supported_archs.add((10, "3a"))
+    selected_archs = sorted(
+        current_compilation_context.TARGET_CUDA_ARCHS & supported_archs
+    )
+    if not selected_archs:
+        raise RuntimeError(
+            "AlphaMoE fused router requires an exact SM100a or SM103a "
+            "compilation target; configured targets are "
+            f"{sorted(current_compilation_context.TARGET_CUDA_ARCHS)}"
+        )
+    nvcc_flags = [
+        f"-gencode=arch=compute_{major}{minor},code=sm_{major}{minor}"
+        for major, minor in selected_archs
+    ]
+    # The frozen Loom artifact was generated and compiled with this option.
+    nvcc_flags.append("--use_fast_math")
+    nvcc_flags += common_nvcc_flags
+    from .alphamoe_nvrtc import get_alphamoe_nvrtc_spec
+
+    closure_key, embedded_flags, cubin_factory = get_alphamoe_nvrtc_spec(
+        jit_env.FLASHINFER_CSRC_DIR / "alphamoe_router", selected_archs
+    )
+    return gen_jit_spec(
+        f"alphamoe_fused_router_nvrtc_{closure_key}",
+        [jit_env.FLASHINFER_CSRC_DIR / "alphamoe_fused_router.cu"],
+        extra_cuda_cflags=[*nvcc_flags, *embedded_flags],
+        extra_include_paths=[jit_env.FLASHINFER_CSRC_DIR],
+        embedded_cubin_factory=cubin_factory,
     )
 
 

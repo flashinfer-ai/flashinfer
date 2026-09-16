@@ -84,8 +84,27 @@ MAX_CLUSTER_DIM_X = 16
 # overhead does not dominate tiny per-split K ranges.
 MIN_LOOP_ITERS_PER_SPLIT = 2
 
-# The maximum number of warp groups per CTA.
-MAX_WARP_GROUPS = 4
+# Grouped sparse attention may add two producer-only groups to the common
+# four-warpgroup decode topology.
+MAX_WARP_GROUPS = 6
+
+# Grouped sparse routes keep one membership byte per selected page in a table
+# separate from the plain Int32 locators. Four bytes share one Int32 word. Q1 does
+# not consume membership; Q2/Q4/Q5 use the packed table for their per-query
+# softmax mask. A byte keeps Q5 aligned with Q64/Hq12 and leaves room for Q6--Q8.
+Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIP_BITS = 8
+Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIP_MASK = (
+    1 << Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIP_BITS
+) - 1
+Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIPS_PER_WORD = (
+    32 // Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIP_BITS
+)
+# Holding a complete locator window removes duplicate K/V metadata traffic,
+# but a graph-safe Q2/Q4 worst-case bound can otherwise reserve 8 KiB or more
+# of SMEM for rows that commonly use only three KV tiles. Beyond this crossover,
+# stage locators one tile at a time while retaining the compact packed
+# membership row separately.
+Q_TOKEN_KV_BLOCK_SPARSE_HELD_LOCATOR_MAX_TILES = 8
 
 # Default used only when the launch helper has no resolved decode config.
 # Config-aware FMHA and block-sparse callers pass their selected KV tile.

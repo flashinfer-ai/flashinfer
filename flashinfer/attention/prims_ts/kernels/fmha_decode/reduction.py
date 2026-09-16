@@ -147,13 +147,15 @@ def _reduce_exact_splits_body(
     g_q_output_rows: Int32,
     cfg: cutlass.Constexpr[FmhaDecodeConfig],
     static_full_split_prefix: cutlass.Constexpr[bool] = False,
+    wait_for_pdl_producer: cutlass.Constexpr[bool] = False,
 ) -> None:
     """Fold every split in one 512-thread CTA over one 8 KiB output slice.
 
     ``g_partial_stats`` stores one log2-LSE scalar for each split and output
     row. ``g_partial_o`` stores the corresponding normalized 16-bit O fragment.
     This body is shared by the serial reference kernel and the compact S2-S4
-    production schedule; PDL ordering remains in the production outer kernel.
+    production schedule. The production caller requests its PDL acquire after
+    this body's local register state is initialized and before partial reads.
     """
 
     thread_idx, _, _ = cute.arch.thread_idx()
@@ -177,15 +179,6 @@ def _reduce_exact_splits_body(
     )
     q_token_offset, seq_len_q = _q_seq_bounds(cfg, g_cu_seqlens_q, b_idx)
     active_splits_kv = Int32(cfg.splits_kv)
-    if cutlass.const_expr(not static_full_split_prefix):
-        active_splits_kv = _reduction_active_splits_kv(
-            cfg,
-            g_seqlens_kv,
-            b_idx,
-            g_q_output_rows,
-            reduce_row_idx,
-            seq_len_q,
-        )
     valid_reduce_row = _q_logical_output_row_is_valid_for_seq(
         cfg,
         g_q_output_rows,
@@ -214,6 +207,22 @@ def _reduce_exact_splits_body(
         output_vals[elem_idx] = Float32(0.0)
 
     global_lse = Float32(-Float32.inf)
+
+    if cutlass.const_expr(wait_for_pdl_producer):
+        prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
+
+    if cutlass.const_expr(not static_full_split_prefix):
+        # Sparse-route seq_lens may originate two PDL stages upstream. Keep this read
+        # behind the attention-producer acquire together with partial O/stats;
+        # ordinary reducers preserve the same instruction ordering harmlessly.
+        active_splits_kv = _reduction_active_splits_kv(
+            cfg,
+            g_seqlens_kv,
+            b_idx,
+            g_q_output_rows,
+            reduce_row_idx,
+            seq_len_q,
+        )
 
     if valid_reduce_row:
         # The workspace retains configured-max strides, but only the runtime
@@ -450,11 +459,6 @@ def decode_gen_parallel_separate_reduction_kernel(
     G16 uses a two-level 4x4 merge, and G2/G4/G8 finalize through rank zero.
     """
 
-    # Pair with the producer's launch-dependents signal before reading any
-    # partial GMEM. The wait is CTA-convergent and stays outside both schedules.
-    if cutlass.const_expr(cfg.use_parallel_separate_reduction_pdl):
-        prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
-
     if cutlass.const_expr(cfg.use_compact_parallel_reduction):
         _reduce_exact_splits_body(
             o_iter,
@@ -466,6 +470,7 @@ def decode_gen_parallel_separate_reduction_kernel(
             g_q_output_rows,
             cfg,
             static_full_split_prefix,
+            cfg.use_parallel_separate_reduction_pdl,
         )
         return
 
@@ -487,15 +492,6 @@ def decode_gen_parallel_separate_reduction_kernel(
     )
     q_token_offset, seq_len_q = _q_seq_bounds(cfg, g_cu_seqlens_q, b_idx)
     active_splits_kv = Int32(cfg.splits_kv)
-    if cutlass.const_expr(not static_full_split_prefix):
-        active_splits_kv = _reduction_active_splits_kv(
-            cfg,
-            g_seqlens_kv,
-            b_idx,
-            g_q_output_rows,
-            reduce_row_idx,
-            seq_len_q,
-        )
     valid_reduce_row = _q_logical_output_row_is_valid_for_seq(
         cfg,
         g_q_output_rows,
@@ -536,6 +532,37 @@ def decode_gen_parallel_separate_reduction_kernel(
         PARALLEL_REDUCTION_LOAD_BATCH * PACKED_OUTPUT_REGS_PER_THREAD,
         space=cutlass.AddressSpace.rmem,
     )
+
+    # Allocate the clustered path's local SMEM before acquiring the producer.
+    # Cluster-size-one profiles compile out every later use of these arrays.
+    smem_lse = cutlass.Array(
+        Float32,
+        SEPARATE_REDUCTION_LSE_VALUES_PER_ROW * PARALLEL_REDUCTION_THREADS_PER_CTA,
+        space=cutlass.AddressSpace.smem,
+        alignment=16,
+    )
+    smem_partial_o = cutlass.Array(
+        Int32,
+        PACKED_OUTPUT_REGS_PER_THREAD * PARALLEL_REDUCTION_THREADS_PER_CTA,
+        space=cutlass.AddressSpace.smem,
+        alignment=16,
+    )
+
+    # Pair with the producer only after local state is ready, but before the
+    # first producer-dependent partial-O or partial-statistics read.
+    if cutlass.const_expr(cfg.use_parallel_separate_reduction_pdl):
+        prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
+
+    if cutlass.const_expr(not static_full_split_prefix):
+        active_splits_kv = _reduction_active_splits_kv(
+            cfg,
+            g_seqlens_kv,
+            b_idx,
+            g_q_output_rows,
+            reduce_row_idx,
+            seq_len_q,
+        )
+
     for split_base_i in cutlass.range_constexpr(
         0, local_splits, PARALLEL_REDUCTION_LOAD_BATCH
     ):
@@ -635,19 +662,6 @@ def decode_gen_parallel_separate_reduction_kernel(
     # profile's selected 16-bit partial type. Corresponding threads in every
     # rank map to the same output row, so row validity is cluster-uniform. A
     # rank with only padded split slots publishes the neutral ``(-inf, 0)``.
-    smem_lse = cutlass.Array(
-        Float32,
-        SEPARATE_REDUCTION_LSE_VALUES_PER_ROW * PARALLEL_REDUCTION_THREADS_PER_CTA,
-        space=cutlass.AddressSpace.smem,
-        alignment=16,
-    )
-    smem_partial_o = cutlass.Array(
-        Int32,
-        PACKED_OUTPUT_REGS_PER_THREAD * PARALLEL_REDUCTION_THREADS_PER_CTA,
-        space=cutlass.AddressSpace.smem,
-        alignment=16,
-    )
-
     stats_smem_offset = thread_idx * Int32(SEPARATE_REDUCTION_LSE_VALUES_PER_ROW)
     partial_o_smem_offset = thread_idx * Int32(PACKED_OUTPUT_REGS_PER_THREAD)
     if valid_reduce_row:

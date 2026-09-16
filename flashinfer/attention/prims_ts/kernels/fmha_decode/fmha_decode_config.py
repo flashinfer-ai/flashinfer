@@ -55,6 +55,8 @@ from .fmha_decode_constants import (
     PARALLEL_REDUCTION_THREADS_PER_CTA,
     PARTIAL_O_ELEMENT_BYTES,
     PARTIAL_STATS_VALUES_PER_ROW,
+    Q_TOKEN_KV_BLOCK_SPARSE_HELD_LOCATOR_MAX_TILES,
+    Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIP_BITS,
     Q_REPETITION_GROUP_HEADS,
     Q_ROW_ALIGNMENT_BYTES,
     REDUCTION_BYTES_PER_SLICE,
@@ -112,6 +114,15 @@ _GROUPED_KEEPS_STATIC_ONLY_PROFILES = {
 # the KV256 tail merge, while the rolled softmax fragment loop needs less.
 KV_TILE_256_SOFTMAX_TASK_REGISTERS = 152
 KV_TILE_256_CORRECTION_TASK_REGISTERS = 152
+
+# Sparse route unions use a Q64/KV128 profile with one D128 head band per stage.
+# The recipe is independent of query group size; route membership and Q
+# tile capacity are validated separately.
+_Q_TOKEN_KV_BLOCK_SPARSE_GROUPED_KEEPS_PROFILES = {
+    (BFloat16, BFloat16, BFloat16, 256, 128, 1, 1),
+    (Float8E4M3FN, Float8E4M3FN, Float16, 256, 128, 1, 1),
+    (Float8E4M3FN, Float8E4M3FN, BFloat16, 256, 128, 1, 1),
+}
 
 _KV_TILE_256_PHYSICAL_DEFAULTS: Mapping[str, ConfigValue] = {
     "tmem_s_cols": 128,
@@ -509,6 +520,15 @@ class FmhaDecodeConfig:
     # Select the packed Q/O ABI. Q and O are laid out as
     # [sum_q_tokens, num_heads_q, head_dim] and indexed by cu_seqlens_q.
     use_variable_seqlens_q: bool = False
+    # Select the private sparse-block route. This explicit discriminator keeps
+    # ordinary storage-subpage callers on the generic paged-KV path. Grouped
+    # sparse routes consume query membership from a separate packed-word table;
+    # Q1 uses the same scattered page route without membership masking.
+    use_q_token_kv_block_sparse_route: bool = False
+    # Allow the attention grid to acquire a programmatic launch dependency.
+    # Callers must opt in only when a producer was launched immediately before
+    # attention on the same stream and will release that dependency.
+    use_pdl: bool = False
     heads_q_per_kv: int = 0
     groups_tokens_heads_q: bool = False
     # K/V tokens per tile along the K-sequence dimension; also the MMA "M"
@@ -553,7 +573,6 @@ class FmhaDecodeConfig:
     # Accumulator type (BMM accumulators and softmax stats), always Float32
     # in the currently supported recipes.
     acc_dtype: type = Float32
-
     # ------------------------------------------------------------------
     # Software pipeline depths
     # ------------------------------------------------------------------
@@ -602,7 +621,8 @@ class FmhaDecodeConfig:
     mma_tile_n_bmm2: int = 8
 
     # ------------------------------------------------------------------
-    # Warp specialization layout (4 warp groups × 4 warps = 16 warps total)
+    # Warp specialization layout (normally 4 warp groups / 16 warps; a static
+    # sparse-attention throughput profile may add two producer-only groups)
     # NOTE: please update `_active_warp_roles` after new roles are added.
     # ------------------------------------------------------------------
     # Softmax0Task: WG0 (warps 0–3) handles even K/V instances (K0/V0).
@@ -641,7 +661,7 @@ class FmhaDecodeConfig:
     # PaddingTask placement is derived after selecting the active task roles.
     # Each active warp group is compacted first, then its unused tail warps are
     # assigned to the corresponding padding task. Persistent layouts retain
-    # all four warp groups even when the last group contains only padding.
+    # all four original warp groups even when the last contains only padding.
     wg0_padding_warp_idx: int = 4
     wg0_padding_num_warps: int = 0
     wg1_padding_warp_idx: int = 8
@@ -650,6 +670,10 @@ class FmhaDecodeConfig:
     wg2_padding_num_warps: int = 0
     wg3_padding_warp_idx: int = 16
     wg3_padding_num_warps: int = 0
+    wg4_padding_warp_idx: int = 20
+    wg4_padding_num_warps: int = 0
+    wg5_padding_warp_idx: int = 24
+    wg5_padding_num_warps: int = 0
 
     # ------------------------------------------------------------------
     # Task-local register allocation
@@ -659,6 +683,67 @@ class FmhaDecodeConfig:
     # A long KV256 graph instead moves a smaller share from Softmax to its
     # heavier correction tail. Mixed Q/KV graphs also reserve registers for
     # TransformKvTask. Short KV256 loops avoid the fixed hand-off cost.
+    @property
+    def effective_storage_tokens_per_page(self) -> int:
+        """Return the physical cache-page extent used by the TensorMap."""
+        return self.storage_tokens_per_page or self.num_tokens_per_page
+
+    @property
+    def has_storage_subpages(self) -> bool:
+        """Whether one physical cache page contains multiple semantic pages."""
+        return self.effective_storage_tokens_per_page != self.num_tokens_per_page
+
+    @property
+    def uses_scattered_page_route(self) -> bool:
+        """Whether native paged loads consume one locator per page fragment."""
+        return self.has_storage_subpages or self.use_q_token_kv_block_sparse_route
+
+    @property
+    def uses_q_token_kv_block_sparse_page_membership(self) -> bool:
+        """Whether grouped sparse attention uses a packed-membership table."""
+        return self.uses_q_token_kv_block_sparse_page_route and self.max_seq_len_q > 1
+
+    @property
+    def grouped_q_rows(self) -> int:
+        """Return logical query/head rows represented by one sparse-route group."""
+        return self.heads_q_per_kv * self.max_seq_len_q
+
+    @property
+    def grouped_q_fits_tile(self) -> bool:
+        """Whether one complete query group fits in the physical Q tile."""
+        return (
+            self.groups_tokens_heads_q
+            and self.grouped_q_rows > 0
+            and self.grouped_q_rows <= self.tile_size_q
+        )
+
+    @property
+    def uses_q_token_kv_block_sparse_page_route(self) -> bool:
+        """Whether this grouped-Q route consumes sparse-block locators."""
+        return (
+            self.use_paged_kv
+            and not self.use_block_sparse
+            and self.uses_scattered_page_route
+            and self.num_tokens_per_page == 4
+            and self.groups_tokens_heads_q
+            and self.use_q_token_kv_block_sparse_route
+            and 0 < self.max_seq_len_q <= Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIP_BITS
+            and self.grouped_q_fits_tile
+        )
+
+    @property
+    def uses_held_encoded_locator_window(self) -> bool:
+        """Whether encoded paging keeps the complete CTA route in SMEM."""
+
+        return (
+            self.use_paged_kv
+            and self.uses_scattered_page_route
+            and self.tile_size_kv == 128
+            and not self.use_sliding_window_causal
+            and self.static_local_kv_tiles
+            <= Q_TOKEN_KV_BLOCK_SPARSE_HELD_LOCATOR_MAX_TILES
+        )
+
     @property
     def uses_task_register_reallocation(self) -> bool:
         return self.use_transform_kv or (
@@ -1002,7 +1087,14 @@ class FmhaDecodeConfig:
             self.q_dtype in (Float16, BFloat16)
             and self.out_dtype in (Float16, BFloat16)
         ) or (
-            self.q_dtype == Float8E4M3FN and self.out_dtype in (Float16, Float8E4M3FN)
+            self.q_dtype == Float8E4M3FN
+            and (
+                self.out_dtype in (Float16, Float8E4M3FN)
+                or (
+                    self.uses_q_token_kv_block_sparse_page_route
+                    and self.out_dtype == BFloat16
+                )
+            )
         )
 
     @property
@@ -1023,9 +1115,8 @@ class FmhaDecodeConfig:
     # ------------------------------------------------------------------
     # Feature flags
     # ------------------------------------------------------------------
-    # Enable persistent scheduling: work tiles are fetched from a CLC response
-    # queue at runtime instead of mapping one tile per CTA in the launch grid.
-    # Mutually exclusive with split-KV mode.
+    # Enable persistent scheduling: one physical worker may consume multiple
+    # logical work tiles. Mutually exclusive with split-KV mode.
     use_persistent_scheduler: bool = False
     # Split-KV: split the K-sequence across several CTAs that produce partial
     # O/stats, with a GMEM reduction epilogue.
@@ -1040,9 +1131,14 @@ class FmhaDecodeConfig:
     # Paged-KV cache layout: K/V live in fixed-size pages and the kernel
     # follows a logical→physical page index table per request.
     use_paged_kv: bool = False
-    # Page size (tokens per page) when use_paged_kv is enabled. Must be one of
-    # 16 / 32 / 64 / 128 and must divide the 128-token KV tile.
+    # Semantic page size (tokens represented by one page-table entry) when
+    # use_paged_kv is enabled. It must divide the 128-token KV tile.
     num_tokens_per_page: int = 32
+    # Physical tokens stored in one cache page. Zero selects the semantic page
+    # size. A larger value enables encoded subpage locators for a native
+    # page-four table:
+    # locator = physical_page * subpages_per_storage_page + subpage.
+    storage_tokens_per_page: int = 0
     # Maximum number of pages per (batch, head_kv) — sizes the page index
     # table stride.
     max_num_pages_per_seq_kv: int = 1
@@ -1363,8 +1459,16 @@ class FmhaDecodeConfig:
         if not self.use_paged_kv:
             raise ValueError("paged-KV staging requires use_paged_kv=True")
         validate_page_size(self.num_tokens_per_page)
+        validate_storage_page_size(
+            self.num_tokens_per_page,
+            self.effective_storage_tokens_per_page,
+        )
 
         if self.use_block_sparse:
+            if self.uses_scattered_page_route:
+                raise ValueError(
+                    "scattered page routes are supported only by dense paged-KV"
+                )
             if self.tile_size_kv not in (128, 256):
                 raise ValueError(
                     "paged block-sparse supports only KV128 or KV256 routes"
@@ -1393,10 +1497,12 @@ class FmhaDecodeConfig:
             raise ValueError(
                 "paged-KV num_tokens_per_page must divide tile_size_kv exactly"
             )
+        if self.uses_scattered_page_route and self.tile_size_kv != 128:
+            raise ValueError("scattered page routes currently require tile_size_kv=128")
         pages_per_tile = self.tile_size_kv // self.num_tokens_per_page
-        if pages_per_tile not in (1, 2, 4, 8, 16):
+        if pages_per_tile not in (1, 2, 4, 8, 16, 32):
             raise ValueError(
-                "paged-KV staging supports 1, 2, 4, 8, or 16 pages per KV tile"
+                "paged-KV staging supports 1, 2, 4, 8, 16, or 32 pages per KV tile"
             )
         if self.page_offsets_num_warps != 1:
             raise ValueError(
@@ -1825,6 +1931,7 @@ class FmhaDecodeConfig:
     @property
     def matches_kv256_task_topology(self) -> bool:
         """Whether task roles match KV256's validated 16-warp layout."""
+
         return all(
             getattr(self, field) == expected
             for field, expected in _KV_TILE_256_TASK_TOPOLOGY_DEFAULTS.items()
@@ -1993,6 +2100,50 @@ class FmhaDecodeConfig:
         # complete Q tile.
         rows_per_slice = self.split_reduction_rows_per_slice
         return max((self.tile_size_q + rows_per_slice - 1) // rows_per_slice, 1)
+
+    @property
+    def uses_direct_kv_launch(self) -> bool:
+        """Whether the attention CTA publishes final output directly."""
+        return not (self.use_split_kv or self.use_separate_reduction_kernel)
+
+    @property
+    def has_valid_split_kv_fanout(self) -> bool:
+        """Whether the configured split fanout is internally consistent."""
+        return (
+            self.use_split_kv
+            and self.splits_kv > 1
+            and self.max_splits_kv >= self.splits_kv
+        )
+
+    def validate_q_token_kv_block_sparse_grouped_keeps_profile(self) -> None:
+        """Validate the grouped-Keeps profiles for token-query sparse routes."""
+        common_profile = (
+            self.use_keeps_mma_ab
+            and self.groups_tokens_heads_q
+            and self.tile_size_q == 64
+            and self.headdim == 256
+            and self.head_dim_per_stage_kv == 128
+            and self.num_insts_kv == 1
+            and self.o_stages == 1
+            and self.uses_q_token_kv_block_sparse_page_route
+            and self.mask_type == CAUSAL
+            and not self.use_cluster_smem_reduction
+            and not self.use_persistent_scheduler
+            and not self.use_attention_sinks
+        )
+        kv128_profile = (
+            self.tile_size_kv == 128
+            and self._grouped_keeps_profile_key
+            in _Q_TOKEN_KV_BLOCK_SPARSE_GROUPED_KEEPS_PROFILES
+            and not self.use_sliding_window_causal
+            and (self.uses_direct_kv_launch or self.has_valid_split_kv_fanout)
+        )
+        if not (common_profile and kv128_profile):
+            raise ValueError(
+                "QToken-KvBlock-Sparse-Attention grouped KeepsMmaAb requires an encoded page-4 Q group "
+                "that fits Q64, the qualified D256/KV128 arithmetic recipe, "
+                "and a supported causal direct or split launch"
+            )
 
     @property
     def supports_grouped_keeps(self) -> bool:
@@ -2499,16 +2650,33 @@ def _append_padding_warp_roles(cfg: FmhaDecodeConfig, roles: list[_WarpRole]) ->
         preferred_wg = role.preferred_warp_idx // 4
         preferred_wg_end = (role.preferred_warp_idx + role.num_warps - 1) // 4
         if preferred_wg != preferred_wg_end:
-            raise ValueError(
-                f"{role.name} spans warp groups {preferred_wg} and {preferred_wg_end}; "
-                "each task role must fit within one warp group"
+            # A producer-only LoadTask may occupy complete consecutive warp
+            # groups. Keeping each group full preserves warpgroup register
+            # reallocation participation and needs no cross-group padding.
+            spans_complete_wgs = (
+                role.name == "load"
+                and role.preferred_warp_idx % 4 == 0
+                and role.num_warps % 4 == 0
             )
-        if preferred_wg < 0 or preferred_wg >= MAX_WARP_GROUPS:
+            if not spans_complete_wgs:
+                raise ValueError(
+                    f"{role.name} spans warp groups {preferred_wg} and "
+                    f"{preferred_wg_end}; only a complete-group load task may "
+                    "span warp groups"
+                )
+        if preferred_wg < 0 or preferred_wg_end >= MAX_WARP_GROUPS:
             raise ValueError(
-                f"{role.name} is assigned to unsupported warp group {preferred_wg}"
+                f"{role.name} is assigned through unsupported warp group "
+                f"{preferred_wg_end}"
             )
-        num_warps_per_wg[preferred_wg] += role.num_warps
-        total_num_wgs = max(total_num_wgs, preferred_wg + 1)
+        role_warps_remaining = role.num_warps
+        role_wg = preferred_wg
+        while role_warps_remaining > 0:
+            warps_in_group = min(role_warps_remaining, 4)
+            num_warps_per_wg[role_wg] += warps_in_group
+            role_warps_remaining -= warps_in_group
+            role_wg += 1
+        total_num_wgs = max(total_num_wgs, preferred_wg_end + 1)
     for wg_idx, num_warps in enumerate(num_warps_per_wg):
         if num_warps > 4:
             raise ValueError(
@@ -2517,7 +2685,10 @@ def _append_padding_warp_roles(cfg: FmhaDecodeConfig, roles: list[_WarpRole]) ->
 
     # When using persistent scheduling, force 4 warp groups
     if cfg.use_persistent_scheduler:
-        total_num_wgs = MAX_WARP_GROUPS
+        # Ordinary persistent decode retains its established four-group
+        # contract. A profile that explicitly places a role in WG4 keeps that
+        # fifth group instead of truncating the task from the CTA.
+        total_num_wgs = max(total_num_wgs, 4)
 
     for wg_idx, active_warps in enumerate(num_warps_per_wg):
         padding_index_field = f"wg{wg_idx}_padding_warp_idx"
@@ -2785,9 +2956,12 @@ def _max_splits_kv_by_work(
     tile_size_kv: int,
     num_insts_kv: int,
     max_splits_kv: int | None = None,
+    min_loop_iters_per_split: int = MIN_LOOP_ITERS_PER_SPLIT,
 ) -> int:
     """Return the fanout cap that retains useful KV work per CTA."""
-    tile_size_per_cta_kv = tile_size_kv * num_insts_kv * MIN_LOOP_ITERS_PER_SPLIT
+    if min_loop_iters_per_split <= 0:
+        raise ValueError("min_loop_iters_per_split must be positive")
+    tile_size_per_cta_kv = tile_size_kv * num_insts_kv * min_loop_iters_per_split
     max_by_seq = max(
         1,
         (seq_len_kv + tile_size_per_cta_kv - 1) // tile_size_per_cta_kv,
@@ -2844,14 +3018,17 @@ def select_splits_kv(
     service_capacity: int | None = None,
     requested_splits_kv: int = -1,
     max_splits_kv: int | None = None,
+    min_loop_iters_per_split: int = MIN_LOOP_ITERS_PER_SPLIT,
 ) -> int:
     """
     Select a Q-grid-aware split-KV fanout.
 
     Every legal TileQ is considered with its actual number of Q CTAs.  The
     automatic fanout fills otherwise idle cluster-size-one service slots while
-    retaining at least ``MIN_LOOP_ITERS_PER_SPLIT`` KV iterations per CTA.
-    Positive caller fanouts remain pinned subject only to the KV-work cap.
+    retaining at least ``min_loop_iters_per_split`` KV iterations per CTA.
+    Positive caller fanouts remain pinned subject only to the KV-work cap. The
+    default preserves the dense-decode policy; specialized bounded-work routes
+    may choose a lower positive iteration floor explicitly.
     """
     if num_q_tiles <= 0:
         raise ValueError("num_q_tiles must be positive")
@@ -2860,6 +3037,7 @@ def select_splits_kv(
         tile_size_kv=tile_size_kv,
         num_insts_kv=num_insts_kv,
         max_splits_kv=max_splits_kv,
+        min_loop_iters_per_split=min_loop_iters_per_split,
     )
     if requested_splits_kv > 0:
         return max(1, min(max_by_seq, requested_splits_kv))
@@ -3490,14 +3668,19 @@ def _apply_layout_config(
     *,
     qkv_layout: str,
     num_tokens_per_page: int,
+    storage_tokens_per_page: int | None,
     seq_len_kv: int,
 ) -> str:
     """Apply contiguous/paged-KV layout fields and return the canonical layout."""
     qkv_layout = normalize_qkv_layout(qkv_layout)
     if qkv_layout == "pagedKv":
         validate_page_size(num_tokens_per_page)
+        if storage_tokens_per_page is None:
+            storage_tokens_per_page = cfg.storage_tokens_per_page or num_tokens_per_page
+        validate_storage_page_size(num_tokens_per_page, storage_tokens_per_page)
         cfg.use_paged_kv = True
         cfg.num_tokens_per_page = num_tokens_per_page
+        cfg.storage_tokens_per_page = storage_tokens_per_page
         cfg.max_num_pages_per_seq_kv = (
             seq_len_kv + num_tokens_per_page - 1
         ) // num_tokens_per_page
@@ -3680,6 +3863,7 @@ def _apply_split_kv_config(
     max_splits_kv: int | None,
     sliding_window_causal: bool,
     attention_window_size: int,
+    min_loop_iters_per_split: int = MIN_LOOP_ITERS_PER_SPLIT,
 ) -> None:
     """Resolve split-KV fanout and config flags for the selected reduction mode."""
     if split_kv_mode == "disabled":
@@ -3700,6 +3884,7 @@ def _apply_split_kv_config(
         num_q_tiles=_num_q_tiles_for_launch(cfg),
         requested_splits_kv=splits_kv,
         max_splits_kv=max_splits_kv,
+        min_loop_iters_per_split=min_loop_iters_per_split,
     )
     if selected_splits_kv <= 1:
         return
@@ -3912,6 +4097,25 @@ def _validate_profile_support(
                 "parallel separate reduction cluster size "
                 f"{cluster_size} is not supported on this device"
             )
+    is_q_token_kv_block_sparse_grouped_keeps = (
+        use_keeps_mma_ab
+        and use_groups_tokens_heads_q
+        and cfg.uses_q_token_kv_block_sparse_page_route
+    )
+    if (
+        cfg.use_pdl
+        and cfg.use_split_kv
+        and (
+            not cfg.use_separate_reduction_kernel
+            or cfg.use_cluster_smem_reduction
+            or cfg.use_persistent_scheduler
+        )
+    ):
+        raise ValueError(
+            "split PDL requires nonpersistent attention with a standalone GMEM reducer"
+        )
+    if is_q_token_kv_block_sparse_grouped_keeps:
+        cfg.validate_q_token_kv_block_sparse_grouped_keeps_profile()
     supports_grouped_keeps = cfg.supports_grouped_keeps
     if cfg.tile_size_kv != 128 and not (
         cfg.tile_size_kv == 256 and supports_grouped_keeps
@@ -3921,7 +4125,7 @@ def _validate_profile_support(
             "KV256 native warp-specialized profile"
         )
     if use_keeps_mma_ab and use_groups_tokens_heads_q:
-        if not supports_grouped_keeps:
+        if not (is_q_token_kv_block_sparse_grouped_keeps or supports_grouped_keeps):
             raise ValueError(
                 "grouped KeepsMmaAb currently supports only validated narrow "
                 "profiles; pass groups_tokens_heads_q=False to use a supported "
@@ -3936,7 +4140,8 @@ def _validate_profile_support(
         # Packed Q supports the broad grouped Swaps matrix plus the narrow
         # grouped Keeps direct profile validated above.
         if use_keeps_mma_ab and not (
-            use_groups_tokens_heads_q and supports_grouped_keeps
+            use_groups_tokens_heads_q
+            and (is_q_token_kv_block_sparse_grouped_keeps or supports_grouped_keeps)
         ):
             raise ValueError(
                 "packed variable-Q KeepsMmaAb requires its supported grouped "
@@ -3952,6 +4157,18 @@ def _validate_profile_support(
             "mixed Q/KV dtypes do not support paged-KV page size 16; "
             "use 32, 64, or 128 tokens per page"
         )
+    if cfg.use_transform_kv and not cfg.store_transformed_kv_in_tmem:
+        # The SMEM transform assigns eight elements per thread per iteration.
+        total_elems = cfg.tile_size_kv * cfg.head_dim_kv_stage
+        elems_per_iteration = cfg.transform_kv_num_warps * 32 * 8
+        if elems_per_iteration <= 0 or total_elems % elems_per_iteration != 0:
+            raise ValueError(
+                "SMEM transform-KV requires tile_size_kv * head_dim_kv_stage "
+                f"({total_elems}) to be divisible by a positive "
+                "transform_kv_num_warps * 32 * 8 "
+                f"({elems_per_iteration}); got "
+                f"transform_kv_num_warps={cfg.transform_kv_num_warps}"
+            )
     if cfg.store_transformed_kv_in_tmem and not (
         cfg.use_nvfp4_kv
         and cfg.use_fp8_q
@@ -4003,9 +4220,19 @@ def _validate_profile_support(
             raise ValueError(
                 "fmha_decode keepsMmaAb requires numHeadsQPerKv == tile_size_q"
             )
-        if cfg.q_dtype == Float8E4M3FN and cfg.out_dtype not in (
-            Float16,
-            Float8E4M3FN,
+        fp8_q_token_kv_block_sparse_bf16_output = (
+            cfg.out_dtype == BFloat16
+            and use_groups_tokens_heads_q
+            and is_q_token_kv_block_sparse_grouped_keeps
+        )
+        if (
+            cfg.q_dtype == Float8E4M3FN
+            and cfg.out_dtype
+            not in (
+                Float16,
+                Float8E4M3FN,
+            )
+            and not fp8_q_token_kv_block_sparse_bf16_output
         ):
             raise ValueError(
                 "fmha_decode keepsMmaAb fp8 qkv path supports fp16 or fp8 output"
@@ -4033,7 +4260,14 @@ def _validate_profile_support(
         )
         separate_reduction_h256_supported = (
             headdim == 256
-            and tile_size_q == 128
+            and (
+                (tile_size_q == 128 and cfg.tile_size_kv == 128)
+                or (
+                    tile_size_q == 64
+                    and cfg.tile_size_kv == 128
+                    and cfg.uses_q_token_kv_block_sparse_page_route
+                )
+            )
             and effective_head_dim_stage == 128
             and effective_num_insts_kv == 1
             and effective_o_stages == 1
@@ -4065,7 +4299,8 @@ def _validate_profile_support(
         ):
             raise ValueError(
                 "separate reduction keepsMmaAb profiles require "
-                "the established D128/Q64-Q128 or D256/Q128 profiles, or a "
+                "the established D128/Q64-Q128, D256/Q128, or "
+                "QToken-KvBlock-Sparse-Attention D256/Q64-KV128 profiles, or a "
                 "fixed FP8/page-32 D64/Q64-Q128 or D256/Q64 profile; valid "
                 "reduction dtypes, Q layout, and static split-KV are required"
             )
@@ -4110,14 +4345,20 @@ def _validate_profile_support(
         use_split_kv
         and cfg.supports_reduction_dtypes
         and (seq_len_q == 1 or cfg.use_variable_seqlens_q or use_groups_tokens_heads_q)
-        and (tile_size_q in (16, 32) or qualified_fp8_q8_separate_reduction_supported)
+        and (
+            tile_size_q in (16, 32)
+            or qualified_fp8_q8_separate_reduction_supported
+            # The sparse D256 publisher and standalone reducer both index
+            # actual logical rows, so a partial TileQ8 is also valid.
+            or (tile_size_q == 8 and cfg.uses_q_token_kv_block_sparse_page_route)
+        )
         and headdim >= 64
     )
     if use_separate_reduction_kernel and not separate_reduction_supported:
         raise ValueError(
             "separate reduction SwapsMmaAb profiles require fixed SQ=1, "
-            "fixed grouped Q, or packed variable Q; tile_size_q in {16,32} "
-            "or a fixed FP8 Q8/HqPerKv8 profile (legacy D128 with FP8 output, "
+            "fixed grouped Q, or packed variable Q; tile_size_q in {16,32}, "
+            "QToken-KvBlock-Sparse-Attention TileQ8, or a fixed FP8 Q8/HqPerKv8 profile (legacy D128 with FP8 output, "
             "plus grouped paged-KV/page-32 D64 with FP8 output or D256 with "
             "FP16 output); valid reduction dtypes and static split-KV are required"
         )
@@ -4149,10 +4390,31 @@ def normalize_qkv_layout(qkv_layout: str) -> str:
 
 def validate_page_size(num_tokens_per_page: int) -> None:
     """Validate a paged-KV page size against supported tile shapes."""
-    if num_tokens_per_page not in (16, 32, 64, 128):
-        raise ValueError("num_tokens_per_page must be one of 16, 32, 64, or 128")
+    if num_tokens_per_page not in (4, 16, 32, 64, 128):
+        raise ValueError("num_tokens_per_page must be one of 4, 16, 32, 64, or 128")
     if 128 % num_tokens_per_page != 0:
         raise ValueError("num_tokens_per_page must divide the 128-token KV tile")
+
+
+def validate_storage_page_size(
+    num_tokens_per_page: int,
+    storage_tokens_per_page: int,
+) -> None:
+    """Validate native page-4 subpage-locator storage geometry."""
+    if isinstance(storage_tokens_per_page, bool) or not isinstance(
+        storage_tokens_per_page, int
+    ):
+        raise TypeError("storage_tokens_per_page must be an integer")
+    if storage_tokens_per_page <= 0:
+        raise ValueError("storage_tokens_per_page must be positive")
+    if storage_tokens_per_page % num_tokens_per_page != 0:
+        raise ValueError(
+            "storage_tokens_per_page must be divisible by num_tokens_per_page"
+        )
+    if storage_tokens_per_page != num_tokens_per_page and num_tokens_per_page != 4:
+        raise ValueError(
+            "encoded subpage locators currently require num_tokens_per_page=4"
+        )
 
 
 def make_decode_config(
@@ -4169,9 +4431,11 @@ def make_decode_config(
     o_dtype: type = Float16,
     qkv_layout: str = "contiguousKv",
     num_tokens_per_page: int = 32,
+    storage_tokens_per_page: int | None = None,
     split_kv_mode: str = "disabled",
     splits_kv: int = -1,
     max_splits_kv: int | None = None,
+    min_loop_iters_per_split: int = MIN_LOOP_ITERS_PER_SPLIT,
     sliding_window_causal: bool = False,
     attention_window_size: int = 0,
     mask_type: str | None = None,
@@ -4277,6 +4541,7 @@ def make_decode_config(
         cfg,
         qkv_layout=qkv_layout,
         num_tokens_per_page=num_tokens_per_page,
+        storage_tokens_per_page=storage_tokens_per_page,
         seq_len_kv=seq_len_kv,
     )
     _apply_dtype_config(
@@ -4362,6 +4627,7 @@ def make_decode_config(
         # below from the final KV256 work granularity.
         cfg.use_persistent_scheduler = False
         selected_grouped_q_recipe = None
+
     _finalize_static_decode_config(cfg, explicit_fields)
     if not cfg.use_variable_seqlens_q:
         validate_causal_decode_lengths(
@@ -4418,6 +4684,7 @@ def make_decode_config(
         max_splits_kv=max_splits_kv,
         sliding_window_causal=sliding_window_causal,
         attention_window_size=attention_window_size,
+        min_loop_iters_per_split=min_loop_iters_per_split,
     )
 
     if auto_split_kv_selected and cfg.use_split_kv:
