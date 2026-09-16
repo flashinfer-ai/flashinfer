@@ -13,6 +13,7 @@ import subprocess
 import sys
 import sysconfig
 import threading
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -153,8 +154,13 @@ def _import_module(module_path: Path) -> Any:
     return module
 
 
-def _register_torch_op(extension: Any) -> None:
-    """Expose the mutating pybind kernel to Dynamo/MUSA graph capture."""
+def _register_torch_op() -> None:
+    """Expose the native kernel with a real fake/mutation schema.
+
+    The extension itself remains lazy. Registering the dispatcher op before
+    graph capture avoids tracing the build lock and pybind call; the
+    implementation resolves the extension only when the graph runs.
+    """
     global _TORCH_LIB
     if _TORCH_LIB is not None:
         return
@@ -164,8 +170,8 @@ def _register_torch_op(extension: Any) -> None:
     lib.define(
         "simple_stp(Tensor(a!) state, Tensor x, Tensor dt, Tensor A, Tensor B, "
         "Tensor C, Tensor D, Tensor src, Tensor dst, Tensor? dt_bias, Tensor? z, "
-        "bool dt_softplus, int pad_slot_id, Tensor? out, Tensor? rand_seed, "
-        "int philox_rounds) -> Tensor"
+        "bool dt_softplus, int pad_slot_id, Tensor(b!)? out, Tensor? rand_seed, "
+        "int philox_rounds) -> Tensor(b)"
     )
 
     def impl(
@@ -186,7 +192,7 @@ def _register_torch_op(extension: Any) -> None:
         rand_seed: Any,
         philox_rounds: int,
     ) -> Any:
-        return extension.musa_ssu_simple(
+        return _load_extension().musa_ssu_simple(
             state,
             x,
             dt,
@@ -206,7 +212,39 @@ def _register_torch_op(extension: Any) -> None:
         )
 
     lib.impl("simple_stp", impl, "PrivateUse1")
+
+    def fake_impl(
+        state: Any,
+        x: Any,
+        dt: Any,
+        A: Any,
+        B: Any,
+        C: Any,
+        D: Any,
+        src: Any,
+        dst: Any,
+        dt_bias: Any,
+        z: Any,
+        dt_softplus: bool,
+        pad_slot_id: int,
+        out: Any,
+        rand_seed: Any,
+        philox_rounds: int,
+    ) -> Any:
+        return out if out is not None else torch.empty_like(x)
+
+    # PrivateUse1 custom ops need a Meta implementation for Dynamo/Inductor.
+    register_fake = getattr(lib, "_register_fake", None)
+    if register_fake is not None:
+        register_fake("simple_stp", fake_impl)
+    else:  # pragma: no cover - compatibility path
+        torch.library.register_fake("flashinfer_musa::simple_stp")(fake_impl)
     _TORCH_LIB = lib
+
+
+def _ensure_torch_op_registered() -> None:
+    if _TORCH_LIB is None:
+        _register_torch_op()
 
 
 def _load_extension() -> Any:
@@ -240,14 +278,18 @@ def _load_extension() -> Any:
                 manifest.write_text(json.dumps({"fingerprint": fingerprint, "module": module_path.name}))
                 manifest.replace(artifact_dir / "manifest.json")
             _EXT = _import_module(module_path)
-            _register_torch_op(_EXT)
+            _ensure_torch_op_registered()
             return _EXT
 
 
 def musa_ssu_one_token_native(*args: Any, **kwargs: Any) -> Any:
     """Invoke the cached native S5000 Simple-STP extension."""
-    _load_extension()
+    _ensure_torch_op_registered()
     import torch
+
+    is_compiling = getattr(getattr(torch, "compiler", None), "is_compiling", None)
+    if not (callable(is_compiling) and is_compiling()):
+        _load_extension()
 
     return torch.ops.flashinfer_musa.simple_stp(*args, **kwargs)
 
@@ -255,6 +297,12 @@ def musa_ssu_one_token_native(*args: Any, **kwargs: Any) -> Any:
 def preload_musa_simple_stp() -> None:
     """Build and import the extension before graph capture starts."""
     _load_extension()
+
+
+with suppress(ImportError, RuntimeError):
+    # Register the schema/fake eagerly, while keeping the compiler extension
+    # build itself lazy. This lets a first graph trace see a dispatcher op.
+    _ensure_torch_op_registered()
 
 
 __all__ = ["musa_ssu_one_token_native", "preload_musa_simple_stp"]
