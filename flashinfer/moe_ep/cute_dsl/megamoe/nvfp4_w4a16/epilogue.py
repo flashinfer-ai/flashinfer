@@ -508,8 +508,10 @@ class W4A16Fc1Epilogue(EpilogueContext):
                 cute.make_tensor(up_ptr, TmemTranspose16x32._tmem_layout(16, 32)),
                 TmemTranspose16x32._rmem_copy_view(up, 16),
             )
-            # Only register work follows; r1_store() waits for these loads
-            # before the transpose overwrites their TMEM.
+            # Only register work precedes r1_store(), which also waits before
+            # overwriting TMEM, so this early wait is redundant for correctness.
+            # Keep it: removing it regressed small-token decode benchmarks.
+            cute.arch.fence_view_async_tmem_load()
             gate.store(gate.load() * weight_alpha)
             up.store(up.load() * weight_alpha)
             # Preserve the prior W4A16 sequence: post-alpha gate upper clamp,
