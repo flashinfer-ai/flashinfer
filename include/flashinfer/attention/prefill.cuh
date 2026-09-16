@@ -2489,8 +2489,8 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
       // buffer -- it shares SharedStorage with the ragged kernel, and USE_KV_REPACK decides both --
       // the buffer is already counted in the NUM_MMA_KV budget, so leaving FP4 on the in-loop path
       // would spend that shared memory for nothing. FP8 keeps the in-loop path it has always taken
-      // here: switching it over is a behavior change this PR does not measure, and single prefill
-      // has no FP8 KV test to catch a regression. The launcher's repack capability
+      // here: switching it over would change behavior nobody has measured, and single prefill has
+      // no FP8 KV test to catch a regression. The launcher's repack capability
       // (KTraits::ENABLE_FP4_REPACK) is already folded into USE_KV_REPACK, so a caller without a
       // repack call site has no staging buffer to spend in the first place.
       constexpr bool kRepackActive = KTraits::USE_KV_REPACK && is_fp4_type_v<DTypeKV>;
