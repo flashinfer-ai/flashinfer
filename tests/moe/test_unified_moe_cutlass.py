@@ -998,32 +998,29 @@ def test_cutlass_quant_runners_reject_out_of_scope_configs(runner_cls, quant, ma
         runner.check_support()
 
 
-def test_cutlass_mxfp8_rejects_linear_scale_layout():
-    runner = CutlassMxfp8Runner.__new__(CutlassMxfp8Runner)
+@pytest.mark.parametrize(
+    "runner_cls, quant",
+    (
+        (CutlassMxfp8Runner, (QuantFormat.MXFP8, QuantFormat.MXFP8)),
+        (CutlassMxfp8Mxfp4Runner, (QuantFormat.MXFP4, QuantFormat.MXFP8)),
+    ),
+)
+@pytest.mark.parametrize("swizzled", (None, False, True))
+def test_cutlass_mxfp8_scale_layout_follows_swizzled_scale_factors(
+    runner_cls, quant, swizzled
+):
+    # None/False: canonical TRTLLM linear [M, H // 32] pack. True: flat
+    # CUTLASS swizzled 1-D input_sf. Both pass check_support.
+    runner = runner_cls.__new__(runner_cls)
     runner.config = _config(
         quant=QuantConfig(
-            weight=QuantFormat.MXFP8,
-            activation=QuantFormat.MXFP8,
-            swizzled_scale_factors=False,
+            weight=quant[0], activation=quant[1], swizzled_scale_factors=swizzled
         )
     )
     runner._device_arch = 100
-    with pytest.raises(NotImplementedError, match="swizzled MXFP8 input_sf"):
-        runner.check_support()
-
-
-def test_cutlass_mxfp8_mxfp4_rejects_linear_scale_layout():
-    runner = CutlassMxfp8Mxfp4Runner.__new__(CutlassMxfp8Mxfp4Runner)
-    runner.config = _config(
-        quant=QuantConfig(
-            weight=QuantFormat.MXFP4,
-            activation=QuantFormat.MXFP8,
-            swizzled_scale_factors=False,
-        )
-    )
-    runner._device_arch = 100
-    with pytest.raises(NotImplementedError, match="swizzled MXFP8 input_sf"):
-        runner.check_support()
+    runner.check_support()
+    assert runner._swizzled_act_sf is (swizzled is True)
+    assert runner._linear_act_sf is (swizzled is not True)
 
 
 def test_cutlass_fp8_block_rejects_cuda_below_12_8(monkeypatch):
@@ -1042,8 +1039,15 @@ def test_cutlass_fp8_block_rejects_cuda_below_12_8(monkeypatch):
         runner.check_support()
 
 
-def test_cutlass_mxfp8_rejects_linear_activation_scales():
+def test_cutlass_mxfp8_swizzled_layer_rejects_linear_activation_scales():
     runner = CutlassMxfp8Runner.__new__(CutlassMxfp8Runner)
+    runner.config = _config(
+        quant=QuantConfig(
+            weight=QuantFormat.MXFP8,
+            activation=QuantFormat.MXFP8,
+            swizzled_scale_factors=True,
+        )
+    )
     hidden = torch.empty(16, 128, dtype=torch.float8_e4m3fn)
     linear_sf = torch.empty(16, 4, dtype=torch.uint8)
     act = MoEActivationPack(
@@ -1053,6 +1057,27 @@ def test_cutlass_mxfp8_rejects_linear_activation_scales():
         torch.ones(16, 2, dtype=torch.float32),
     )
     with pytest.raises(ValueError, match="swizzled"):
+        runner._validate_activation_scale(act)
+
+
+def test_cutlass_mxfp8_linear_layer_rejects_swizzled_activation_scales():
+    runner = CutlassMxfp8Runner.__new__(CutlassMxfp8Runner)
+    runner.config = _config(
+        quant=QuantConfig(weight=QuantFormat.MXFP8, activation=QuantFormat.MXFP8)
+    )
+    hidden = torch.empty(16, 128, dtype=torch.float8_e4m3fn)
+    swizzled_sf = torch.empty(_mxfp8_swizzled_act_sf_numel(16, 128), dtype=torch.uint8)
+    act = MoEActivationPack(
+        hidden,
+        swizzled_sf,
+        torch.zeros(16, 2, dtype=torch.int32),
+        torch.ones(16, 2, dtype=torch.float32),
+    )
+    with pytest.raises(ValueError, match="linear hidden_states_scale"):
+        runner._validate_activation_scale(act)
+    # The canonical [M, H // 32] layout is accepted with either storage dtype.
+    for dtype in (torch.uint8, torch.float8_e4m3fn):
+        act.hidden_states_scale = torch.empty(16, 4, dtype=dtype)
         runner._validate_activation_scale(act)
 
 
@@ -2049,8 +2074,20 @@ def _run_flat_cutlass_independently(
         (x.shape[0], x.shape[1]), dtype=torch.bfloat16, device=x.device
     )
     input_sf = None
+    swizzled_input_sf = True
     if config_cls in (CutlassMxfp8Mxfp4Config, CutlassMxfp8Config):
-        input_sf = act.hidden_states_scale.reshape(-1)
+        # A 2-D [M, H // 32] scale is the canonical linear pack; the flat
+        # swizzled buffer is 1-D.
+        input_sf = act.hidden_states_scale
+        swizzled_input_sf = input_sf.ndim == 1
+    elif config_cls is CutlassNvfp4Config:
+        # Canonical TRTLLM pack: packed uint8 [M, H // 2] with a linear
+        # [M, H // 16] block scale, so the output is twice as wide as x.
+        input_sf = act.hidden_states_scale
+        swizzled_input_sf = False
+        output = torch.empty(
+            (x.shape[0], x.shape[1] * 2), dtype=torch.bfloat16, device=x.device
+        )
     # The flat NVFP4/MXFP4 ABI takes packed weights viewed as int64 -- that is
     # how the binding selects the FP4 kernel, and it rejects raw uint8.
     packed_fp4 = config_cls in (CutlassNvfp4Config, CutlassMxfp8Mxfp4Config)
@@ -2078,7 +2115,7 @@ def _run_flat_cutlass_independently(
         in (CutlassMxfp8Mxfp4Config, CutlassMxfp8Config),
         use_packed_weights=(config_cls is CutlassW4A8Config),
         use_wfp4afp8_humming=(config_cls is CutlassHummingConfig),
-        swizzled_input_sf=True,
+        swizzled_input_sf=swizzled_input_sf,
         # Written out rather than read off the runner: if a runner stops using
         # the fused finalize, this comparison should surface that as a
         # difference instead of silently following it.
@@ -2356,7 +2393,10 @@ def _make_nvfp4_case(num_tokens: int = 16, activation=None):
             tune_max_num_tokens=max(64, num_tokens),
         ),
     )
-    act = MoEActivationPack(x, None, topk_ids, topk_weights)
+    # The same pack TRTLLM / CuTe-DSL / Cake consume: packed uint8 [M, H // 2]
+    # plus a linear E4M3 [M, H // 16] block scale with unit global scale.
+    x_q, x_sf = CutlassNvfp4Config.prepare_activations(x)
+    act = MoEActivationPack(x_q, x_sf, topk_ids, topk_weights)
     view = CutlassNvfp4Config.prepare_weights(
         w1,
         w2,
@@ -2372,7 +2412,7 @@ def _make_nvfp4_case(num_tokens: int = 16, activation=None):
 
 
 def _dequantize_cutlass_nvfp4_matrix(
-    packed: torch.Tensor, scale: torch.Tensor
+    packed: torch.Tensor, scale: torch.Tensor, *, swizzled: bool = True
 ) -> torch.Tensor:
     from flashinfer.fp4_quantization import e2m1_and_ufp8sf_scale_to_float
 
@@ -2380,11 +2420,11 @@ def _dequantize_cutlass_nvfp4_matrix(
     global_scale = torch.ones(1, dtype=torch.float32)
     return e2m1_and_ufp8sf_scale_to_float(
         packed,
-        scale.reshape(-1),
+        scale.view(torch.uint8).reshape(-1),
         global_scale,
         sf_vec_size=16,
         ufp8_type=1,
-        is_sf_swizzled_layout=True,
+        is_sf_swizzled_layout=swizzled,
     ).view(rows, packed_cols * 2)
 
 
@@ -2393,19 +2433,12 @@ def _nvfp4_quantized_reference(
     view: dict[str, torch.Tensor],
     activation=None,
 ):
-    from flashinfer.fp4_quantization import fp4_quantize
-
+    # Dequantize the pack itself (linear scale layout) rather than
+    # re-quantizing: the reference must see exactly what the kernel sees.
     x = act.hidden_states_q
-    global_scale = torch.ones(1, device=x.device, dtype=torch.float32)
-    x_q, x_sf = fp4_quantize(
-        x,
-        global_scale=global_scale,
-        sf_vec_size=16,
-        is_sf_swizzled_layout=True,
-    )
-    x_dq = _dequantize_cutlass_nvfp4_matrix(x_q, x_sf).to(
-        device=x.device, dtype=torch.bfloat16
-    )
+    x_dq = _dequantize_cutlass_nvfp4_matrix(
+        x, act.hidden_states_scale, swizzled=False
+    ).to(device=x.device, dtype=torch.bfloat16)
     w1_q = view["fc1_expert_weights"]
     w2_q = view["fc2_expert_weights"]
     w1_sf = view["fc1_weight_block_scale"]
@@ -2436,6 +2469,12 @@ def test_cutlass_nvfp4_moe_layer_matches_quantized_reference(activation):
     config, act, weights, view = _make_nvfp4_case(activation=activation)
     assert view["fc1_expert_weights"].dtype is torch.uint8
     assert view["fc1_weight_block_scale"].ndim == 3
+    assert act.hidden_states_q.dtype is torch.uint8
+    assert act.hidden_states_scale.dtype is torch.float8_e4m3fn
+    assert tuple(act.hidden_states_scale.shape) == (
+        act.hidden_states_q.shape[0],
+        act.hidden_states_q.shape[1] * 2 // 16,
+    )
     layer = MoELayer(config)
     runner = _pin_fallback_winner(layer, act)
 
@@ -2466,7 +2505,13 @@ def test_cutlass_nvfp4_autotuned_compound_tactic_and_cuda_graph():
     runner = MoELayer(config).runners[0]
     inputs = runner.pack_inputs(act, weights)
     assert inputs[4].dtype is torch.int64
-    assert len(inputs) == 12
+    assert len(inputs) == 13
+    assert inputs[-1] is act.hidden_states_scale
+    # The linear block scale is token-dynamic and must be resized with the
+    # token bucket alongside output/hidden/topk_ids/topk_weights.
+    spec = runner.tuning_config.dynamic_tensor_specs[0]
+    assert spec.input_idx == (0, 1, 2, 3, 12)
+    assert spec.dim_idx == (0, 0, 0, 0, 0)
 
     with autotune(True):
         _, tactic = AutoTuner.get().choose_one(
@@ -2488,9 +2533,10 @@ def test_cutlass_nvfp4_autotuned_compound_tactic_and_cuda_graph():
     with torch.cuda.graph(graph):
         captured = runner.forward(inputs, tactic=tactic)
     captured_workspace = runner._workspace
-    runner._ensure_workspace(64, inputs[1].shape[1])
+    hidden_size = inputs[1].shape[1] * 2
+    runner._ensure_workspace(64, hidden_size)
     assert runner._workspace is not captured_workspace
-    assert runner._workspace_cache[(32, inputs[1].shape[1])] is captured_workspace
+    assert runner._workspace_cache[(32, hidden_size)] is captured_workspace
     captured.fill_(float("nan"))
     graph.replay()
     torch.cuda.synchronize()
@@ -2784,6 +2830,7 @@ def test_cutlass_mxfp8_mxfp4_moe_layer_matches_quantized_reference(activation):
     )
     topk_ids, topk_weights = _make_routing(num_tokens, num_experts, top_k, device)
     x_q, x_sf = CutlassMxfp8Mxfp4Config.prepare_activations(x)
+    assert x_sf.shape == (num_tokens, hidden_size // 32)
     view = CutlassMxfp8Mxfp4Config.prepare_weights(
         w1,
         w2,
@@ -2796,7 +2843,7 @@ def test_cutlass_mxfp8_mxfp4_moe_layer_matches_quantized_reference(activation):
     x_dq = mxfp8_dequantize_host(
         x_q.cpu().view(torch.uint8),
         x_sf.cpu().view(torch.uint8).reshape(-1),
-        True,
+        False,
     ).to(device=device, dtype=torch.bfloat16)
     w1_dq = torch.stack(
         [
@@ -2867,6 +2914,7 @@ def test_cutlass_mxfp8_moe_layer_matches_quantized_reference(activation):
     )
     topk_ids, topk_weights = _make_routing(num_tokens, num_experts, top_k, device)
     x_q, x_sf = CutlassMxfp8Config.prepare_activations(x)
+    assert x_sf.shape == (num_tokens, hidden_size // 32)
     view = CutlassMxfp8Config.prepare_weights(
         w1,
         w2,
@@ -2879,7 +2927,7 @@ def test_cutlass_mxfp8_moe_layer_matches_quantized_reference(activation):
     x_dq = mxfp8_dequantize_host(
         x_q.cpu().view(torch.uint8),
         x_sf.cpu().view(torch.uint8).reshape(-1),
-        True,
+        False,
     ).to(device=device, dtype=torch.bfloat16)
     w1_dq = torch.stack(
         [
@@ -2947,7 +2995,8 @@ def test_cutlass_mxfp8_autotune_regenerates_swizzled_input_sf_across_bucket():
     x = torch.randn(num_tokens, hidden_size, device=device, dtype=torch.bfloat16) / 2
     w1, w2 = _make_bf16_experts(num_experts, hidden_size, intermediate_size, device)
     topk_ids, topk_weights = _make_routing(num_tokens, num_experts, top_k, device)
-    x_q, x_sf = CutlassMxfp8Config.prepare_activations(x)
+    # The swizzled flat layout stays available behind the existing knob.
+    x_q, x_sf = CutlassMxfp8Config.prepare_activations(x, swizzled_scale_factors=True)
     view = CutlassMxfp8Config.prepare_weights(
         w1,
         w2,
@@ -2957,7 +3006,11 @@ def test_cutlass_mxfp8_autotune_regenerates_swizzled_input_sf_across_bucket():
         device=device,
     )
     config = _config(
-        quant=QuantConfig(weight=QuantFormat.MXFP8, activation=QuantFormat.MXFP8),
+        quant=QuantConfig(
+            weight=QuantFormat.MXFP8,
+            activation=QuantFormat.MXFP8,
+            swizzled_scale_factors=True,
+        ),
         experts=ExpertConfig(intermediate_size=intermediate_size),
         backend=BackendOptions((CutlassMxfp8Config(),)),
         execution=ExecutionConfig(enable_pdl=False, tune_max_num_tokens=8192),
@@ -3277,3 +3330,257 @@ def test_fp8_per_tensor_prepare_activations_is_graph_capturable():
     graph.replay()
     torch.cuda.synchronize()
     torch.testing.assert_close(captured.float(), eager.float())
+
+
+def _assert_backends_share_activation_pack(
+    *,
+    quant: QuantConfig,
+    candidates,
+    act: MoEActivationPack,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    activation,
+    cutlass_key: str,
+    cutlass_reference,
+    ref_tol: float,
+    cross_tol: float,
+):
+    """One activation pack must feed every backend in a mixed candidate set.
+
+    Builds a single ``MoELayer`` over ``candidates`` (``(config, backend_key)``
+    pairs), prepares each backend's weight view from the same BF16 experts,
+    runs every runner standalone on ``act``, pins the CUTLASS runner to its
+    dequantized reference and the remaining consumers of the pack to the
+    CUTLASS output (all backends quantize the same weights, so they agree far
+    more tightly than any of them agrees with a BF16-weight reference), then
+    checks the autotuned layer reproduces its winner's standalone output.
+    """
+    device = act.hidden_states_q.device
+    num_experts, hidden_size, intermediate_size = w2.shape
+    top_k = act.topk_ids.shape[1]
+    config = _config(
+        routing=RoutingConfig(num_experts=num_experts, top_k=top_k),
+        quant=quant,
+        experts=ExpertConfig(intermediate_size=intermediate_size),
+        activation=activation,
+        backend=BackendOptions(tuple(cfg for cfg, _ in candidates)),
+    )
+    weights = MoEWeightPack()
+    for cfg, key in candidates:
+        kwargs = dict(
+            num_local_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation=activation,
+            device=device,
+        )
+        if not key.startswith("cutlass_"):
+            kwargs["quant"] = quant
+        weights.prepare_for(key, cfg.prepare_weights(w1, w2, **kwargs))
+
+    layer = MoELayer(config)
+    assert {runner.backend_key for runner in layer.runners} == {
+        key for _, key in candidates
+    }
+    outputs = {}
+    for runner in layer.runners:
+        inputs = runner.pack_inputs(act, weights)
+        out = runner.forward(inputs, tactic=-1, **runner.launch_kwargs_for(inputs))
+        torch.cuda.synchronize()
+        assert torch.isfinite(out).all(), f"{runner.backend_key} produced non-finite"
+        outputs[runner.backend_key] = out.clone().to(torch.bfloat16)
+    expected = cutlass_reference(weights.get_view(cutlass_key))
+    _assert_numerically_close(
+        outputs[cutlass_key], expected, rtol=ref_tol, atol=ref_tol
+    )
+    for key in outputs:
+        if key != cutlass_key:
+            _assert_numerically_close(
+                outputs[key], outputs[cutlass_key], rtol=cross_tol, atol=cross_tol
+            )
+
+    actual = layer(act, weights)
+    assert layer.winner_backend in outputs
+    torch.testing.assert_close(
+        actual.to(torch.bfloat16), outputs[layer.winner_backend], rtol=5e-2, atol=5e-2
+    )
+
+
+@cutlass_nvfp4_required
+def test_cutlass_nvfp4_shares_canonical_pack_with_trtllm_and_cute_dsl():
+    """The NVFP4 pack from ``TrtllmFp4Config.prepare_activations`` feeds
+    TRTLLM, CuTe-DSL, and CUTLASS runners built from one ``MoELayer``."""
+    from flashinfer.fused_moe import CuteDslConfig, TrtllmFp4Config
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    major, minor = get_compute_capability(device)
+    arch = major * 10 + minor
+    if not (TrtllmFp4Config.supported(arch) and CuteDslConfig.supported(arch)):
+        pytest.skip("requires an arch with TRTLLM, CuTe-DSL, and CUTLASS NVFP4")
+
+    torch.manual_seed(46)
+    num_tokens, num_experts, top_k = 32, 8, 2
+    hidden_size, intermediate_size = 256, 512
+    activation = SwiGLU()
+    x = torch.randn(num_tokens, hidden_size, device=device, dtype=torch.bfloat16) / 2
+    w1, w2 = _make_bf16_experts(
+        num_experts, hidden_size, intermediate_size, device, activation
+    )
+    topk_ids, topk_weights = _make_routing(num_tokens, num_experts, top_k, device)
+    x_q, x_sf = TrtllmFp4Config.prepare_activations(x)
+    act = MoEActivationPack(x_q, x_sf, topk_ids, topk_weights)
+    _assert_backends_share_activation_pack(
+        quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
+        candidates=(
+            (TrtllmFp4Config(), "trtllm_fp4_routed"),
+            (CuteDslConfig(), "cute_dsl"),
+            (CutlassNvfp4Config(), "cutlass_nvfp4"),
+        ),
+        act=act,
+        w1=w1,
+        w2=w2,
+        activation=activation,
+        cutlass_key="cutlass_nvfp4",
+        cutlass_reference=lambda view: _nvfp4_quantized_reference(
+            act, view, activation
+        ),
+        # H=256 / I=512 accumulate more NVFP4 requantization noise than the
+        # H=128 single-backend case; the bound only needs to catch a wrong
+        # magnitude.
+        ref_tol=3e-1,
+        cross_tol=2e-1,
+    )
+
+
+def _mxfp8_pack_reference(act: MoEActivationPack, w1_dq, w2_dq, activation):
+    from flashinfer import mxfp8_dequantize_host
+
+    x_dq = mxfp8_dequantize_host(
+        act.hidden_states_q.cpu().view(torch.uint8),
+        act.hidden_states_scale.cpu().view(torch.uint8).reshape(-1),
+        False,
+    ).to(device=act.hidden_states_q.device, dtype=torch.bfloat16)
+    return _reference(
+        MoEActivationPack(x_dq, None, act.topk_ids, act.topk_weights),
+        w1_dq,
+        w2_dq,
+        activation,
+    )
+
+
+@cutlass_mxfp8_required
+def test_cutlass_mxfp8_shares_canonical_pack_with_trtllm():
+    """The MXFP8 pack from ``TrtllmFp8BlockConfig.prepare_activations`` feeds
+    TRTLLM and CUTLASS MXFP8xMXFP8 runners built from one ``MoELayer``."""
+    from flashinfer import mxfp8_dequantize_host
+    from flashinfer.fused_moe import TrtllmFp8BlockConfig
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    major, minor = get_compute_capability(device)
+    if not TrtllmFp8BlockConfig.supported(major * 10 + minor):
+        pytest.skip("requires an arch with TRTLLM and CUTLASS MXFP8")
+
+    torch.manual_seed(52)
+    num_tokens, num_experts, top_k = 32, 8, 2
+    hidden_size, intermediate_size = 256, 512
+    activation = SwiGLU()
+    quant = QuantConfig(weight=QuantFormat.MXFP8, activation=QuantFormat.MXFP8)
+    x = torch.randn(num_tokens, hidden_size, device=device, dtype=torch.bfloat16) / 2
+    w1, w2 = _make_bf16_experts(
+        num_experts, hidden_size, intermediate_size, device, activation
+    )
+    topk_ids, topk_weights = _make_routing(num_tokens, num_experts, top_k, device)
+    x_q, x_sf = TrtllmFp8BlockConfig.prepare_activations(x, quant=quant)
+    act = MoEActivationPack(x_q, x_sf, topk_ids, topk_weights)
+
+    def reference(view):
+        dq = lambda w, sf: torch.stack(
+            [
+                mxfp8_dequantize_host(
+                    w[i].cpu().view(torch.uint8),
+                    sf[i].cpu().view(torch.uint8).reshape(-1),
+                    True,
+                )
+                for i in range(num_experts)
+            ]
+        ).to(device=device, dtype=torch.bfloat16)
+        return _mxfp8_pack_reference(
+            act,
+            dq(view["fc1_expert_weights"], view["fc1_expert_scales"]),
+            dq(view["fc2_expert_weights"], view["fc2_expert_scales"]),
+            activation,
+        )
+
+    _assert_backends_share_activation_pack(
+        quant=quant,
+        candidates=(
+            (TrtllmFp8BlockConfig(), "trtllm_fp8_block"),
+            (CutlassMxfp8Config(), "cutlass_mxfp8"),
+        ),
+        act=act,
+        w1=w1,
+        w2=w2,
+        activation=activation,
+        cutlass_key="cutlass_mxfp8",
+        cutlass_reference=reference,
+        ref_tol=2e-1,
+        cross_tol=2e-1,
+    )
+
+
+@cutlass_mxfp8_mxfp4_required
+def test_cutlass_mxfp8_mxfp4_shares_canonical_pack_with_trtllm_and_cute_dsl():
+    """The MXFP4xMXFP8 pack from ``TrtllmFp4Config.prepare_activations`` feeds
+    TRTLLM, CuTe-DSL, and CUTLASS runners built from one ``MoELayer``."""
+    from flashinfer import mxfp4_dequantize
+    from flashinfer.fused_moe import CuteDslConfig, TrtllmFp4Config
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    major, minor = get_compute_capability(device)
+    arch = major * 10 + minor
+    if not (TrtllmFp4Config.supported(arch) and CuteDslConfig.supported(arch)):
+        pytest.skip("requires an arch with TRTLLM, CuTe-DSL, and CUTLASS MXFP4")
+
+    torch.manual_seed(53)
+    num_tokens, num_experts, top_k = 32, 8, 2
+    hidden_size, intermediate_size = 256, 512
+    activation = SwiGLU()
+    quant = QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8)
+    x = torch.randn(num_tokens, hidden_size, device=device, dtype=torch.bfloat16) / 2
+    w1, w2 = _make_bf16_experts(
+        num_experts, hidden_size, intermediate_size, device, activation
+    )
+    topk_ids, topk_weights = _make_routing(num_tokens, num_experts, top_k, device)
+    x_q, x_sf = TrtllmFp4Config.prepare_activations(x, quant=quant)
+    act = MoEActivationPack(x_q, x_sf, topk_ids, topk_weights)
+
+    def reference(view):
+        dq = lambda w, sf: torch.stack(
+            [
+                mxfp4_dequantize(w[i].cpu(), sf[i].cpu().view(torch.uint8).reshape(-1))
+                for i in range(num_experts)
+            ]
+        ).to(device=device, dtype=torch.bfloat16)
+        return _mxfp8_pack_reference(
+            act,
+            dq(view["fc1_expert_weights"], view["fc1_expert_scales"]),
+            dq(view["fc2_expert_weights"], view["fc2_expert_scales"]),
+            activation,
+        )
+
+    _assert_backends_share_activation_pack(
+        quant=quant,
+        candidates=(
+            (TrtllmFp4Config(), "trtllm_fp4_routed"),
+            (CuteDslConfig(), "cute_dsl"),
+            (CutlassMxfp8Mxfp4Config(), "cutlass_mxfp8_mxfp4"),
+        ),
+        act=act,
+        w1=w1,
+        w2=w2,
+        activation=activation,
+        cutlass_key="cutlass_mxfp8_mxfp4",
+        cutlass_reference=reference,
+        ref_tol=2e-1,
+        cross_tol=2e-1,
+    )

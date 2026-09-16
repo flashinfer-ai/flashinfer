@@ -503,6 +503,8 @@ _CUTLASS_HUMMING_ARCHS = (90,)
 # Default MMA pair shared by the FP4 ``prepare_*`` helpers
 # (TrtllmFp4Config, CakeWarpDecodeConfig, CuteDslConfig).
 _NVFP4_NVFP4 = QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4)
+_MXFP4_MXFP8 = QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8)
+_MXFP8_MXFP8 = QuantConfig(weight=QuantFormat.MXFP8, activation=QuantFormat.MXFP8)
 
 
 @dataclass(frozen=True)
@@ -1141,15 +1143,19 @@ class CutlassNvfp4Config:
     """CUTLASS NVFP4 backend for SM100 / SM110 / SM12x.
 
     Packed precomputed routing with all flat CUTLASS activation semantics and
-    ``do_finalize=True``. Expert
-    parallelism and shared experts are not supported. Both ``hidden_size``
-    and ``intermediate_size`` must be divisible by 16 (the NVFP4 scale-vector
-    size). Activations stay BF16; the kernel quantizes them internally.
+    ``do_finalize=True``. Expert parallelism and shared experts are not
+    supported. Both ``hidden_size`` and ``intermediate_size`` must be
+    divisible by 16 (the NVFP4 scale-vector size).
 
-    This config is not in the default backend search list. TRTLLM NVFP4 uses
-    a quantized activation pack, so the two contracts cannot share one
-    ``MoEActivationPack``. Select it explicitly with
-    ``BackendOptions((CutlassNvfp4Config(),))``.
+    Activations follow the TRTLLM canonical NVFP4 pack (packed E2M1 ``uint8
+    [M, H // 2]`` plus a linear E4M3 block scale ``[M, H // 16]`` with unit
+    global scale), so the same ``MoEActivationPack`` feeds this backend,
+    ``TrtllmFp4Config``, ``CuteDslConfig``, and the Cake NVFP4 backends.
+    ``prepare_activations`` here is the same helper as
+    ``TrtllmFp4Config.prepare_activations``.
+
+    This config is not in the default backend search list. Select it
+    explicitly with ``BackendOptions((CutlassNvfp4Config(),))``.
     """
 
     @classmethod
@@ -1183,6 +1189,18 @@ class CutlassNvfp4Config:
             activation=activation,
             device=device,
         )
+
+    @staticmethod
+    def prepare_activations(hidden_states_bf16):
+        """Quantize BF16 activations into the canonical NVFP4 pack.
+
+        Identical to ``TrtllmFp4Config.prepare_activations`` for NVFP4×NVFP4:
+        packed E2M1 ``uint8 [M, H // 2]`` and a linear E4M3 block scale
+        ``[M, H // 16]`` computed with a unit global scale.
+        """
+        from .prepare import prepare_trtllm_fp4_activations
+
+        return prepare_trtllm_fp4_activations(hidden_states_bf16, quant=_NVFP4_NVFP4)
 
     def __repr__(self) -> str:
         return "CutlassNvfp4Config()"
@@ -1292,10 +1310,14 @@ class CutlassFp8BlockConfig:
 class CutlassMxfp8Mxfp4Config:
     """CUTLASS MXFP8-activation x MXFP4-weight backend for SM100 / SM110 / SM12x.
 
-    Activations are MXFP8 with a swizzled ``input_sf``. Weights are packed
-    MXFP4 viewed as int64 at launch. Packed precomputed routing with all flat
-    CUTLASS activation semantics and ``do_finalize=True``. Both ``hidden_size`` and ``intermediate_size``
-    must be divisible by 128.
+    Activations follow the TRTLLM canonical MXFP8 pack (E4M3 ``[M, H]`` plus a
+    linear E8M0 block scale ``[M, H // 32]``), so one ``MoEActivationPack``
+    feeds this backend, ``TrtllmFp4Config`` and ``CuteDslConfig`` for
+    MXFP4×MXFP8. ``QuantConfig(swizzled_scale_factors=True)`` selects the flat
+    CUTLASS swizzled ``input_sf`` instead. Weights are packed MXFP4 viewed as
+    int64 at launch. Packed precomputed routing with all flat CUTLASS
+    activation semantics and ``do_finalize=True``. Both ``hidden_size`` and
+    ``intermediate_size`` must be divisible by 128.
     """
 
     @classmethod
@@ -1327,11 +1349,22 @@ class CutlassMxfp8Mxfp4Config:
         )
 
     @staticmethod
-    def prepare_activations(hidden_states_bf16):
-        """Quantize BF16 activations to MXFP8 with a swizzled scale buffer."""
-        from .prepare import prepare_cutlass_mxfp8_activations
+    def prepare_activations(hidden_states_bf16, *, swizzled_scale_factors=False):
+        """Quantize BF16 activations to MXFP8.
 
-        return prepare_cutlass_mxfp8_activations(hidden_states_bf16)
+        The default is the canonical linear pack shared with
+        ``TrtllmFp4Config.prepare_activations`` for MXFP4×MXFP8. Pass
+        ``swizzled_scale_factors=True`` to produce the flat CUTLASS swizzled
+        1-D ``input_sf`` for a layer configured with
+        ``QuantConfig(swizzled_scale_factors=True)``.
+        """
+        if swizzled_scale_factors:
+            from .prepare import prepare_cutlass_mxfp8_activations
+
+            return prepare_cutlass_mxfp8_activations(hidden_states_bf16)
+        from .prepare import prepare_trtllm_fp4_activations
+
+        return prepare_trtllm_fp4_activations(hidden_states_bf16, quant=_MXFP4_MXFP8)
 
     def __repr__(self) -> str:
         return "CutlassMxfp8Mxfp4Config()"
@@ -1341,7 +1374,11 @@ class CutlassMxfp8Mxfp4Config:
 class CutlassMxfp8Config:
     """CUTLASS MXFP8-activation x MXFP8-weight backend (SM100 / SM103 / SM107).
 
-    Activations are MXFP8 with a swizzled ``input_sf``. Weights stay E4M3 with
+    Activations follow the TRTLLM canonical MXFP8 pack (E4M3 ``[M, H]`` plus a
+    linear E8M0 block scale ``[M, H // 32]``) shared with
+    ``TrtllmFp8BlockConfig`` for MXFP8×MXFP8;
+    ``QuantConfig(swizzled_scale_factors=True)`` selects the flat CUTLASS
+    swizzled ``input_sf`` instead. Weights stay E4M3 with
     packed int32 scale tiles. ``hidden_size`` and ``intermediate_size`` must be
     divisible by 128 so the gated fc1 scale layout matches the binding.
     Packed precomputed routing with all flat CUTLASS activation semantics and
@@ -1377,11 +1414,24 @@ class CutlassMxfp8Config:
         )
 
     @staticmethod
-    def prepare_activations(hidden_states_bf16):
-        """Quantize BF16 activations to MXFP8 with a swizzled scale buffer."""
-        from .prepare import prepare_cutlass_mxfp8_activations
+    def prepare_activations(hidden_states_bf16, *, swizzled_scale_factors=False):
+        """Quantize BF16 activations to MXFP8.
 
-        return prepare_cutlass_mxfp8_activations(hidden_states_bf16)
+        The default is the canonical linear pack shared with
+        ``TrtllmFp8BlockConfig.prepare_activations`` for MXFP8×MXFP8. Pass
+        ``swizzled_scale_factors=True`` to produce the flat CUTLASS swizzled
+        1-D ``input_sf`` for a layer configured with
+        ``QuantConfig(swizzled_scale_factors=True)``.
+        """
+        if swizzled_scale_factors:
+            from .prepare import prepare_cutlass_mxfp8_activations
+
+            return prepare_cutlass_mxfp8_activations(hidden_states_bf16)
+        from .prepare import prepare_trtllm_fp8_block_activations
+
+        return prepare_trtllm_fp8_block_activations(
+            hidden_states_bf16, quant=_MXFP8_MXFP8
+        )
 
     def __repr__(self) -> str:
         return "CutlassMxfp8Config()"
