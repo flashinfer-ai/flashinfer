@@ -427,6 +427,8 @@ def test_trtllm_ragged_default_and_explicit_skip_match_checked_path(
 def test_trtllm_ragged_cpu_mirrors_override_explicit_skip(backend, skip_value):
     device = torch.device("cuda")
     _require_trtllm_ragged(device)
+    if backend == "cute-dsl":
+        pytest.importorskip("flashinfer.attention.cute_dsl.fmha")
     q, k, v, q_lens, kv_lens, q_indptr, kv_indptr = _empty_kv_case(device)
 
     mirror_output, mirror_lse = _run_trtllm_ragged(
