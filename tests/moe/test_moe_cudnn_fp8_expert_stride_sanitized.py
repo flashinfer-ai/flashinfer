@@ -13,7 +13,7 @@ from flashinfer.fused_moe import (
     MoELayer,
     MoEWeightPack,
     QuantConfig,
-    QuantVariant,
+    QuantFormat,
     RoutingInputMode,
     SwiGLU,
 )
@@ -72,7 +72,9 @@ def test_packed_expert_stride_capture(storage, tokens, hidden, monkeypatch):
     config = replace(
         config,
         activation=activation,
-        quant=QuantConfig(variant=QuantVariant.FP8PerTensor),
+        quant=QuantConfig(
+            weight=QuantFormat.FP8PerTensor, activation=QuantFormat.FP8PerTensor
+        ),
         backend=BackendOptions(
             (
                 CudnnFp8PerTensorConfig(

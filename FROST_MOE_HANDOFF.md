@@ -11,22 +11,23 @@ The measured implementation uses OSS Frost/CuTeDSL engine **20400** for both GEM
 FlashInfer's native kernels provide routing, permutation, and weighted finalization.
 This is not a closed-source cuDNN kernel performance result.
 
-The initial draft deliberately preserves the tested source architecture:
+The integration has been ported to these pinned upstream revisions:
 
-- cuDNN Frontend base: `b2712de2da3832e9ad607867d22b2a1429c89cdc`.
-- FlashInfer base: `df8b5c1745c51f44b1e8a492b11c3f6cb157cfd2`.
-- Primary measurement environment: full B200, 148 SMs, 1000 W;
+- cuDNN Frontend: `6ca9fa2aa37fb483faddafb1b0f3a8bd01b5f261`.
+- FlashInfer: `c11c1090172f578bad37b8bca2b40e4161d72144`.
+- Validation environment: full B200, 148 SMs, 1000 W;
   CuTe DSL 4.7, CUDA 13.2, cuDNN 9.27, PyTorch 2.13.
 
-Upstream has since changed both integration boundaries. Frontend
-[PR #1068](https://github.com/NVIDIA/cudnn-frontend/pull/1068) moves the GEMM
-compiler/codegen into architecture families. FlashInfer
-[PR #4952](https://github.com/flashinfer-ai/flashinfer/pull/4952) and
-[PR #5061](https://github.com/flashinfer-ai/flashinfer/pull/5061) replace
-`QuantVariant` with separate quantization axes and runner capability checks.
-Porting to these interfaces and validating the resulting branch is explicit
-follow-up work. The old-source measurements do not validate that future port.
-The drafts must not be merged by choosing the old files over upstream refactors.
+Frontend retains upstream's architecture-family compiler/codegen facades, with
+SM100 changes in the SM100 tree. SM120 declines the packed layout and static
+scheduler. The near-zero tanh correction applies to both families. FlashInfer
+uses the upstream independent weight/activation/output quantization axes, with
+cross-product capability tests and updated curated fuzzer inputs. Both imports
+and the rebuilt native bindings were verified against these checkouts.
+
+Historical timings below predate this port. Their initial bases were Frontend
+`b2712de2da3832e9ad607867d22b2a1429c89cdc` and FlashInfer
+`df8b5c1745c51f44b1e8a492b11c3f6cb157cfd2`; no ported-head timing is claimed.
 
 ## What is included
 
@@ -81,11 +82,27 @@ used as a performance headline. Strict failures are not timed or hidden.
 
 ## Validation and continuation
 
-The prior source snapshots have numerical, capture, actual-route and sanitizer
-evidence. The current B200 rerun passed the public packed-cluster regression's
-80 cases and its old-source negative control. Formatting of the consolidated
-Python changes preserves their ASTs; changed-file hooks pass. Full repository CI
-and target-GPU execution of the assembled branches remain pending.
+The ported sources passed 361 Frontend tests, 4 grouped block-scale cases and
+211 FlashInfer tests on full B200, with no skips. A subsequent curated fuzzer
+run passed 5 cases and memcheck passed 43 cases with zero errors. Changed-file
+hooks pass; runtime, test and binding hashes were frozen during these runs.
+
+**Racecheck is unresolved; this is not an all-tests-passing or merge-ready claim.**
+The full selected racecheck suite failed, first in the 8193-token paired expert
+stride case. Focused reruns fail in the independent reference's `cublasSgemm`,
+including runs with zero reported race hazards. The separately reported PyTorch
+`MaxNanFunctor` hazards reproduce without Frost, but that does not explain the
+cuBLAS failure. Staged module/plan/forward diagnostics pass; the public test's
+capture-and-live-weight sequence still fails under racecheck. Keep the failure
+visible and continue isolating it. No numerical tolerance was relaxed.
+
+The old-snapshot finalizer range comparison also remains incomplete. A native
+routing-only reproducer passes unfiltered racecheck but fails when the original
+finalizer-only filter is added, before any Frost/finalizer execution. This makes
+filtering a causal condition, not a complete diagnosis. The full comparison has
+not been declared passed or timed through a failing gate.
+
+Full repository CI and performance confirmation of the port remain open.
 
 Install both matching branches and confirm `cudnn.__file__` and
 `flashinfer.__file__` before testing. An existing editable install may still point
@@ -101,15 +118,25 @@ pytest tests/moe/test_unified_moe_cudnn.py tests/moe/test_moe_cudnn_fp8.py tests
 
 Recommended continuation order:
 
-1. Decide the upstream architecture/API port and revalidate both actual imports.
-2. Finish the pending T1025/T2048/T3072 before/after finalizer comparison with
-   identical GEMM tactics and exact-shape sanitizer gates.
-3. Evaluate cheaper configuration search against exhaustive selection. A first
-   T16 coordinate-search run is promising, but no public tuning policy is changed.
-4. Continue kernel work only when a candidate survives strict correctness,
+1. Resolve or precisely isolate the current-port racecheck/reference failure;
+   retain the original failing public regression and its artifacts.
+2. Confirm complete-MoE performance on the port with identical tactics and
+   strict gates; finish the T1025/T2048/T3072 finalizer-range comparison.
+3. Finish SM120 interface validation before changing public support. A separate
+   full RTX PRO 6000 Blackwell Server Edition experiment (188 SMs, 600 W) passed
+   BF16 numerics, live-input capture and actual Frost routes for two tile
+   configurations and both routing implementations. It required process-local
+   fixes for the native utility JIT architecture whitelist and the dedicated
+   `cudnnGraphNotSupportedError` fallback. Those fixes and SM120 support are not
+   enabled by this draft. Sanitizer and performance comparisons are pending.
+4. Continue kernel and tuning work only when candidates survive correctness,
    changed-input capture, actual routes and complete-MoE confirmation.
 
-Private partition, inactive-rank, resource/grid and Kernel Factory experiments
-remain research candidates. Recent smaller-buffer/smaller-tile ablations passed
-correctness but did not establish a stable gain. They are not silently selected
-by the public runner. No performance roof has been established.
+Recent raw FC2 Kernel Factory candidates passed strict local correctness and
+sanitizers but did not establish a useful large-shape performance gain. A
+wide/compact dispatcher regressed at R512/R2048; forcing its compact branch
+measured 134.047/134.160 us at R512 and 173.648/173.640 us at R2048
+(seed/candidate, same full B200, fresh-process cold-L2 CUPTI ABBA). These are
+component experiments, not full MoE. They are not selected by the public runner.
+Private partition, inactive-rank and resource/grid experiments also remain
+research candidates. No performance roof has been established.

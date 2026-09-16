@@ -16,7 +16,7 @@ os.environ["CUDNN_FRONTEND_ENABLE_FROST_ENGINES"] = "1"
 from flashinfer.fused_moe import (
     BackendOptions, CudnnFp8PerTensorConfig, ExecutionConfig, ExpertConfig,
     MoEActivationPack, MoEConfig, MoELayer, MoEWeightPack, QuantConfig,
-    QuantVariant, RoutingConfig, SiTU,
+    QuantFormat, RoutingConfig, SiTU,
 )
 
 activation = SiTU(linear_scale=None, clamp_limit=0.25)
@@ -24,7 +24,7 @@ backend = CudnnFp8PerTensorConfig()
 config = MoEConfig(
     activation=activation,
     routing=RoutingConfig(num_experts=num_experts, top_k=top_k),
-    quant=QuantConfig(variant=QuantVariant.FP8PerTensor),
+    quant=QuantConfig(weight=QuantFormat.FP8PerTensor, activation=QuantFormat.FP8PerTensor),
     experts=ExpertConfig(intermediate_size=intermediate_size),
     backend=BackendOptions((backend,)),
     execution=ExecutionConfig(enable_pdl=False),

@@ -12,7 +12,7 @@ import torch
 from ..gemm.gemm_base import _check_cudnn_plan_build_not_capturing
 from ..grouped_mm.cudnn.core import _plan_index
 from ..tllm_enums import RoutingInputMode
-from .api import CudnnFp8PerTensorConfig, QuantVariant, SwiGLU
+from .api import CudnnFp8PerTensorConfig, QuantFormat, SwiGLU
 from .cudnn_backend import CudnnMoeRunner, _gated_activation
 from .prepare import _fp8_per_tensor_scale, _quantize_fp8_per_expert
 from .runners import _validate_pack_devices, _validate_prerouted_inputs
@@ -292,7 +292,7 @@ class CudnnFp8PerTensorRunner(CudnnMoeRunner):
     _backend_config_type = CudnnFp8PerTensorConfig
     _cache_version = "cudnn-fp8-per-tensor-v4-blocked-weights"
     _activation_dtype = torch.float8_e4m3fn
-    supported_quant_variants = (QuantVariant.FP8PerTensor,)
+    supported_quant_variants = ((QuantFormat.FP8PerTensor, QuantFormat.FP8PerTensor),)
 
     def _weight_layout_key(self, inputs):
         return (

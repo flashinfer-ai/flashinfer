@@ -16,7 +16,7 @@ from flashinfer.fused_moe import (
     MoELayer,
     MoEWeightPack,
     QuantConfig,
-    QuantVariant,
+    QuantFormat,
     SiTU,
     SwiGLU,
     SwiGLUStep,
@@ -78,7 +78,9 @@ def _prepared(activation, wide, tokens=257, default_tactics=False):
     config = replace(
         config,
         activation=activation,
-        quant=QuantConfig(variant=QuantVariant.FP8PerTensor),
+        quant=QuantConfig(
+            weight=QuantFormat.FP8PerTensor, activation=QuantFormat.FP8PerTensor
+        ),
         backend=BackendOptions((backend,)),
     )
     x, scale = CudnnFp8PerTensorConfig.prepare_activations(

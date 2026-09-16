@@ -10,7 +10,8 @@
 #
 # It layers on top of docker/Dockerfile.flashinfer-ep-pytorch (which provides
 # the NGC PyTorch 26.05 base + CUDA 13.2 + torch + IB/HPC-X/GPUDirect stack +
-# FlashInfer built with BUILD_NCCL_EP=1 + the pinned nccl4py/nccl 2.30.7 wheels).
+# FlashInfer built with BUILD_NCCL_EP=1 + the pinned nccl-extensions/nccl4py/nccl
+# 2.30.7 wheels).
 # Build that base first:
 #
 #   docker build -f docker/Dockerfile.flashinfer-ep-pytorch -t flashinfer-ep:pt2605 .

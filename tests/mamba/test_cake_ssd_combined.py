@@ -216,11 +216,12 @@ def test_cake_ssd_combined_route_matrix(
         preprocess_dtype=preprocess_dtype,
         d_has_hdim=d_has_hdim,
     )
-    if varlen and nheads == 128 and ngroups == 8:
+    if nheads == 128 and ngroups == 8:
         # Nemotron-H prefill starts from zero state and uses the unbounded
-        # positive-dt interval. Finite-clamp and nonzero-initial-state feature
-        # rows remain covered independently above; do not invent their
-        # Cartesian product with the model-derived head shape.
+        # positive-dt interval in both batched and variable-length modes.
+        # Finite-clamp and nonzero-initial-state feature rows remain covered
+        # independently above; do not invent their Cartesian product with the
+        # model-derived head shape.
         arguments["initial_states"].zero_()
         arguments["dt_limit"] = (0.0, float("inf"))
     expected = SSDCombined(**constructor, backend="cute").run(*tensors, **arguments)

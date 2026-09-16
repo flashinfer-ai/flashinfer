@@ -190,18 +190,26 @@ __device__ __forceinline__ const uint8_t* prefill_kv_entry_base(
     const uint8_t* __restrict__ kv_global, int idx, size_t stride_kv_block) {
   using KV = KVCacheTraits<MT>;
   using IO = KVIOTraits<MT>;
-  idx = (idx >= 0) ? idx : 0;
   // Addressing mode follows the scale layout, not V_HAS_ROPE: an inline-scale
   // model (DSV3_2 / GLM_NSA / GLM53_NOPE) is a flat token array, a footer-scale
   // model (DSV4 / DOTS3_SWA) is paged with the footer after the block's data.
   // This matches io_bulk_gather_tile. Keying it on V_HAS_ROPE happened to agree
   // for the three DeepSeek-family models and disagrees for DOTS3_SWA, which is
   // footer-scaled with no rope in V.
+  // Masked lanes redirect to the zero row, not slot 0: rope segments read
+  // through this base feed MMAs whose result is only partially masked
+  // downstream, so a poisoned slot-0 payload would leak NaN.
+  const bool valid = idx >= 0;
+  idx = valid ? idx : 0;
+  const uint8_t* base;
   if constexpr (!KV::SCALE_IN_KV_SMEM) {
     const int bi = idx / PAGE_BLOCK_SIZE;
     const int li = idx % PAGE_BLOCK_SIZE;
-    return kv_global + (size_t)bi * stride_kv_block + (size_t)li * IO::IO_STRIDE;
+    base = kv_global + (size_t)bi * stride_kv_block + (size_t)li * IO::IO_STRIDE;
   } else {
-    return kv_global + (size_t)idx * IO::IO_STRIDE;
+    // Flat inline array: the row advance is the runtime stride (payload 528
+    // for GLM53_NOPE; a legacy 656B vLLM pool advances by 656).
+    base = kv_global + (size_t)idx * inline_row_advance(stride_kv_block, PAGE_BLOCK_SIZE);
   }
+  return valid ? base : sparse_mla_zero_row;
 }

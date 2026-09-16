@@ -14,7 +14,7 @@ from flashinfer.fused_moe import (
     MoELayer,
     MoEWeightPack,
     QuantConfig,
-    QuantVariant,
+    QuantFormat,
     RoutingInputMode,
     SwiGLU,
 )
@@ -69,7 +69,12 @@ def test_native_tiled_runner_capture(tokens, hidden, quant, monkeypatch):
             act.hidden_states_q, hidden_states_scale_global=64.0
         )
         act = replace(act, hidden_states_q=x, hidden_states_scale=scale)
-        config = replace(config, quant=QuantConfig(variant=QuantVariant.FP8PerTensor))
+        config = replace(
+            config,
+            quant=QuantConfig(
+                weight=QuantFormat.FP8PerTensor, activation=QuantFormat.FP8PerTensor
+            ),
+        )
 
         def reference():
             return fp8_reference(act, normal, config.activation)

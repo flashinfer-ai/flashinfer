@@ -20,7 +20,7 @@ from flashinfer.fused_moe import (
     MoELayer,
     MoEWeightPack,
     QuantConfig,
-    QuantVariant,
+    QuantFormat,
     RoutingConfig,
     RoutingInputMode,
 )
@@ -49,7 +49,7 @@ def _case(mode, tokens=17, experts=8, hidden=256, inter=256, backend=None):
     act = MoEActivationPack(x, None, ids, scales, routing_input_mode=mode)
     config = MoEConfig(
         routing=RoutingConfig(num_experts=experts, top_k=2),
-        quant=QuantConfig(variant=QuantVariant.BF16),
+        quant=QuantConfig(weight=QuantFormat.BF16, activation=QuantFormat.BF16),
         experts=ExpertConfig(intermediate_size=inter),
         backend=BackendOptions((backend or CudnnMoeConfig(),)),
         execution=ExecutionConfig(enable_pdl=False, tune_max_num_tokens=tokens),
@@ -97,6 +97,21 @@ def test_cudnn_registration_and_support():
     assert _BACKEND_RUNNERS[CudnnMoeConfig] is CudnnMoeRunner
     assert CudnnMoeConfig.supported(100)
     assert not CudnnMoeConfig.supported(120)
+
+
+def test_cudnn_quantization_axes_are_checked_independently():
+    from itertools import product
+
+    from flashinfer.fused_moe.cudnn_fp8_backend import CudnnFp8PerTensorRunner
+
+    for runner, supported in (
+        (CudnnMoeRunner, QuantFormat.BF16),
+        (CudnnFp8PerTensorRunner, QuantFormat.FP8PerTensor),
+    ):
+        for weight, activation, output in product(QuantFormat, repeat=3):
+            config = QuantConfig(weight=weight, activation=activation, output=output)
+            expected = weight == activation == supported and output == QuantFormat.BF16
+            assert runner.supports_quant(config) == expected, (runner, config)
 
 
 def test_packed_unpacked_inputs_keep_explicit_rounding_contract():

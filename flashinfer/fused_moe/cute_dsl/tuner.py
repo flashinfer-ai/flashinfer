@@ -672,6 +672,11 @@ class CuteDslFusedMoERunner(TunableRunner):
             self.swiglu_limit,
             self.situ_beta,
             self.situ_linear_beta,
+            self.num_experts,
+            self.local_expert_offset,
+            self.use_fused_finalize,
+            self.output_dtype,
+            self.enable_pdl,
         )
 
     def get_valid_tactics(  # type: ignore[override]
@@ -762,6 +767,9 @@ class CuteDslFusedMoERunner(TunableRunner):
                 gemm2_mma_tiler, gemm2_mma_inst_shape, gemm2_cluster_shape_mn, _ = (
                     gemm2_tactic
                 )
+
+                if gemm1_cluster_shape_mn[0] > 1 or gemm2_cluster_shape_mn[0] > 1:
+                    return False
 
                 gemm1_ok = Sm107BlockScaledContiguousGatherGroupedGemmSwigluFusionKernel.can_implement(
                     a_dtype=a_dtype,

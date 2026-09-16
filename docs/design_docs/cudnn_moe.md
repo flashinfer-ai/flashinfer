@@ -8,12 +8,12 @@ Prepare the `"cudnn"` weight view once, as for the other unified backends:
 from flashinfer.fused_moe import (
     BackendOptions, CudnnMoeConfig, ExecutionConfig, ExpertConfig,
     MoEActivationPack, MoEConfig, MoELayer, MoEWeightPack,
-    QuantConfig, QuantVariant, RoutingConfig, RoutingInputMode,
+    QuantConfig, QuantFormat, RoutingConfig, RoutingInputMode,
 )
 
 config = MoEConfig(
     routing=RoutingConfig(num_experts=E, top_k=top_k),
-    quant=QuantConfig(variant=QuantVariant.BF16),
+    quant=QuantConfig(weight=QuantFormat.BF16, activation=QuantFormat.BF16),
     experts=ExpertConfig(intermediate_size=I),
     backend=BackendOptions((CudnnMoeConfig(),)),
     execution=ExecutionConfig(enable_pdl=False),

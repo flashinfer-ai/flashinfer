@@ -30,7 +30,7 @@ from .api import (
     MoEActivationPack,
     MoEConfig,
     MoEWeightPack,
-    QuantVariant,
+    QuantFormat,
     SiTU,
     SwiGLU,
     SwiGLUStep,
@@ -293,7 +293,7 @@ class CudnnMoeRunner(MoERunner):
         RoutingInputMode.PackedPrecomputed,
         RoutingInputMode.UnpackedPrecomputed,
     )
-    supported_quant_variants = (QuantVariant.BF16,)
+    supported_quant_variants = ((QuantFormat.BF16, QuantFormat.BF16),)
     supported_activation_classes = (SwiGLU, SiTU, GeGLU, GeGLUTanh, SwiGLUStep)
     supports_expert_parallelism = False
 
