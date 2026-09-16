@@ -175,6 +175,7 @@ from .fmha_resources import (
     TmemSPResource,
     TmemStatsResource,
     TmemStatsDoneResource,
+    TmemPPrefixReadyResource,
 )
 from .fmha_tasks import (
     PackedContextWorkQueue,
@@ -1164,6 +1165,23 @@ def build_context_task_manager(
         pipeline_config=tmem_stats_done_0_pipeline_cfg,
         name="tmem_stats_done_0",
     )
+    # P-prefix barriers: Softmax (producer) arrives after storing the first 64
+    # keys of P, MMA (consumer) starts PV on them. One per query group.
+    tmem_p_prefix_ready: list[TmemPPrefixReadyResource | None] = [None, None]
+    if cfg.pv_half_overlap:
+        tmem_p_prefix_ready = [
+            TmemPPrefixReadyResource(
+                pipeline_config=PipelineConfig.create_async_async_pipeline_cfg(
+                    num_stages=1,
+                    producer_group=softmax_group,
+                    consumer_group=mma_group,
+                    cta_layout_vmnk=cluster_shape_vmnk,
+                ),
+                name=f"tmem_p_prefix_ready_{index}",
+            )
+            for index in range(2)
+        ]
+    tmem_p_prefix_ready_0, tmem_p_prefix_ready_1 = tmem_p_prefix_ready
 
     single_qkv_instance = cfg.single_qkv_instance
     tmem_sp1: TmemSPResource | None = None
@@ -1283,6 +1301,8 @@ def build_context_task_manager(
         tmem_stats_done_0,
         tmem_stats_done_1,
         work_queue,
+        tmem_p_prefix_ready_0=tmem_p_prefix_ready_0,
+        tmem_p_prefix_ready_1=tmem_p_prefix_ready_1,
         **mma_domain_kwargs,
     )
 
@@ -1295,6 +1315,7 @@ def build_context_task_manager(
         tmem_p0,
         s0s1_seq,
         work_queue,
+        tmem_p_prefix_ready=tmem_p_prefix_ready_0,
         **softmax0_domain_kwargs,
     )
     softmax1_task: Task | None = None
@@ -1308,6 +1329,7 @@ def build_context_task_manager(
             None,
             s0s1_seq,
             work_queue,
+            tmem_p_prefix_ready=tmem_p_prefix_ready_1,
             **softmax1_domain_kwargs,
         )
     correction_task = create_correction_task(
@@ -1461,6 +1483,9 @@ def build_context_task_manager(
         )
         if not cfg.stats_via_smem:
             resource_dependency_graph[tmem_stats_done_1] = [tmem_vec1]
+        if cfg.pv_half_overlap:
+            resource_dependency_graph[tmem_p_prefix_ready_0] = scheduler_deps(tmem_sp0)
+            resource_dependency_graph[tmem_p_prefix_ready_1] = scheduler_deps(tmem_sp1)
     if work_queue is not None:
         resource_dependency_graph[work_queue] = [work_queue] if is_clc_dynamic else []
     if smem_page_offsets_kv is not None:
@@ -1503,6 +1528,8 @@ def build_context_task_manager(
         add_smem_resource(tmem_vec1)
     if s0s1_seq is not None:
         add_smem_resource(s0s1_seq)
+    add_smem_resource(tmem_p_prefix_ready_0)
+    add_smem_resource(tmem_p_prefix_ready_1)
     if tmem_stats_done_1 is not None and not cfg.stats_via_smem:
         add_smem_resource(tmem_stats_done_1)
     if work_queue is not None and work_queue.pipeline_config is not None:
@@ -1677,6 +1704,7 @@ def _context_pipeline_stage_counts(
         "tmem_o": cfg.mma_corr_stage,
         "smem_o": cfg.num_qkv_instances,
         "s0s1_seq": 0 if cfg.single_qkv_instance else 1,
+        "tmem_p_prefix_ready": 2 if cfg.pv_half_overlap else 0,
         "tmem_stats_done": 0 if cfg.stats_via_smem else cfg.num_qkv_instances,
         "work_queue": 1 if is_clc_dynamic else 0,
     }
