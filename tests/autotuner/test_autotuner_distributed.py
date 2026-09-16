@@ -2,7 +2,7 @@
 
 Covers the real risks introduced by ``set_autotune_process_group``. Because the
 production ``_profile_single_kernel`` needs CUDA (and NCCL) it cannot run under
-CI, so the coverage is split into two complementary, GPU-free checks:
+CI, so the coverage is split into three complementary, GPU-free checks:
 
 1. **Source-level (AST) guards on the production code** — assert that the real
    ``AutoTuner._profile_single_kernel`` keeps its all-reduce on every path
@@ -14,6 +14,9 @@ CI, so the coverage is split into two complementary, GPU-free checks:
    confirming that one rank failing does not block peers on the collective.
    This validates gloo's behavior for the pattern, not the production call path
    (which #1 guards).
+3. **Runtime (gloo) check of preparation OOM** — two processes call the real
+   ``AutoTuner.choose_one`` control flow and confirm that one rank's preparation
+   OOM produces the same fallback on every rank.
 
 Uses ``gloo`` (CPU) to avoid depending on CUDA or NCCL. No GPU required.
 """
@@ -24,6 +27,9 @@ import os
 import subprocess
 import sys
 import textwrap
+import time
+
+import pytest
 
 from flashinfer.autotuner import AutoTuner
 
@@ -280,39 +286,205 @@ def test_exception_path_does_not_deadlock_the_reduce(tmp_path):
     store_file = str(tmp_path / "gloo_rendezvous")
     world_size = 2
     procs = []
-    for rank in range(world_size):
-        env = dict(os.environ)
-        env.update(
-            RANK=str(rank), WORLD_SIZE=str(world_size), GLOO_STORE_FILE=store_file
-        )
-        procs.append(
-            subprocess.Popen(
-                [sys.executable, "-c", _GLOO_WORKER_SRC],
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
+    deadline = time.monotonic() + 180
+    try:
+        for rank in range(world_size):
+            env = dict(os.environ)
+            env.update(
+                RANK=str(rank), WORLD_SIZE=str(world_size), GLOO_STORE_FILE=store_file
             )
-        )
+            procs.append(
+                subprocess.Popen(
+                    [sys.executable, "-c", _GLOO_WORKER_SRC],
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
+            )
 
-    outputs = {}
-    for rank, p in enumerate(procs):
-        try:
-            out, _ = p.communicate(timeout=180)
-        except subprocess.TimeoutExpired:
-            p.kill()
-            out, _ = p.communicate()
-            raise AssertionError(
-                f"rank {rank} did not finish (possible reduce deadlock):\n{out}"
-            ) from None
-        outputs[rank] = out
-        assert p.returncode == 0, (
-            f"rank {rank} worker failed (exit {p.returncode}):\n{out}"
-        )
+        outputs = {}
+        for rank, p in enumerate(procs):
+            try:
+                out, _ = p.communicate(timeout=max(0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                p.kill()
+                out, _ = p.communicate()
+                raise AssertionError(
+                    f"rank {rank} did not finish (possible reduce deadlock):\n{out}"
+                ) from None
+            outputs[rank] = out
+            assert p.returncode == 0, (
+                f"rank {rank} worker failed (exit {p.returncode}):\n{out}"
+            )
+    finally:
+        for process in procs:
+            if process.poll() is None:
+                process.kill()
+        for process in procs:
+            process.communicate()
 
     # Both ranks reaching "OK reduced=inf" proves the failing rank did not skip
     # the reduce (else the peer would have hung and hit the timeout above).
     for rank in range(world_size):
         assert "OK reduced=inf" in outputs[rank], (
+            f"rank {rank} unexpected output:\n{outputs[rank]}"
+        )
+
+
+_PREPARATION_OOM_WORKER_SRC = r"""
+import datetime, os, sys
+import torch
+import torch.distributed as dist
+
+from flashinfer.autotuner import (
+    AutoTuner,
+    TunableRunner,
+    TuningConfig,
+    autotune,
+    set_autotune_process_group,
+)
+
+rank = int(os.environ["RANK"])
+world_size = int(os.environ["WORLD_SIZE"])
+store_file = os.environ["GLOO_STORE_FILE"]
+failure_phase = os.environ["FAILURE_PHASE"]
+
+
+class PreparationRunner(TunableRunner):
+    def get_valid_tactics(self, inputs, profile):
+        if failure_phase == "nested_empty" and rank == 1:
+            return ()
+        return (0,)
+
+    def forward(self, inputs, tactic=-1, do_preparation=False, **kwargs):
+        if do_preparation and rank == 0 and failure_phase != "nested_input":
+            raise MemoryError("simulated workspace allocation failure")
+        return inputs[0]
+
+
+class NestedRunner(TunableRunner):
+    from flashinfer.fused_moe.runners import _CutlassRunnerBase
+
+    get_valid_tactics = _CutlassRunnerBase.get_valid_tactics
+    _num_top_tactics_per_stage = 2
+    backend_key = "cutlass"
+    _device_arch = 90
+
+    def __init__(self):
+        self._inner = PreparationRunner()
+
+    def _require_built(self):
+        pass
+
+    def _validate_input_count(self, inputs):
+        pass
+
+    def forward(self, inputs, tactic=-1, **kwargs):
+        return inputs[0]
+
+
+def profile(self, *args, **kwargs):
+    elapsed = torch.tensor([1.0], dtype=torch.float64)
+    dist.all_reduce(elapsed, op=dist.ReduceOp.SUM)
+    return elapsed.item() / world_size
+
+
+prepare_inputs = AutoTuner._prepare_input_tensors
+preparation_calls = 0
+
+
+def prepare(self, *args, **kwargs):
+    global preparation_calls
+    preparation_calls += 1
+    if failure_phase == "nested_input" and rank == 0 and preparation_calls == 2:
+        raise MemoryError("simulated nested input allocation failure")
+    return prepare_inputs(self, *args, **kwargs)
+
+
+dist.init_process_group(
+    backend="gloo",
+    init_method="file://" + store_file,
+    rank=rank,
+    world_size=world_size,
+    timeout=datetime.timedelta(seconds=60),
+)
+try:
+    torch.cuda.is_current_stream_capturing = lambda: False
+    torch.cuda.empty_cache = lambda: None
+    AutoTuner._profile_single_kernel = profile
+    AutoTuner._prepare_input_tensors = prepare
+    set_autotune_process_group(dist.group.WORLD)
+
+    with autotune(True):
+        _, tactic = AutoTuner.get().choose_one(
+            "distributed_preparation_oom",
+            [PreparationRunner() if failure_phase == "runner" else NestedRunner()],
+            TuningConfig(),
+            [torch.empty((8, 8)) for _ in range(6)],
+        )
+
+    if tactic != -1:
+        sys.exit("rank %d: tactic=%r" % (rank, tactic))
+    print("rank %d: fallback" % rank)
+finally:
+    set_autotune_process_group(None)
+    dist.destroy_process_group()
+"""
+
+
+@pytest.mark.parametrize(
+    "failure_phase", ("runner", "nested_input", "nested_runner", "nested_empty")
+)
+def test_preparation_memory_error_falls_back_on_every_rank(tmp_path, failure_phase):
+    """A rank-local preparation OOM produces one group-wide fallback."""
+    store_file = str(tmp_path / "preparation_oom_rendezvous")
+    procs = []
+    deadline = time.monotonic() + 180
+    try:
+        for rank in range(2):
+            env = dict(os.environ)
+            env.update(
+                RANK=str(rank),
+                WORLD_SIZE="2",
+                GLOO_STORE_FILE=store_file,
+                FAILURE_PHASE=failure_phase,
+                TORCH_DISTRIBUTED_DEBUG="DETAIL",
+            )
+            procs.append(
+                subprocess.Popen(
+                    [sys.executable, "-c", _PREPARATION_OOM_WORKER_SRC],
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
+            )
+
+        outputs = {}
+        for rank, process in enumerate(procs):
+            try:
+                output, _ = process.communicate(
+                    timeout=max(0, deadline - time.monotonic())
+                )
+            except subprocess.TimeoutExpired:
+                process.kill()
+                output, _ = process.communicate()
+                raise AssertionError(
+                    f"rank {rank} timed out during preparation OOM synchronization:\n{output}"
+                ) from None
+            outputs[rank] = output
+            assert process.returncode == 0, (
+                f"rank {rank} worker failed (exit {process.returncode}):\n{output}"
+            )
+    finally:
+        for process in procs:
+            if process.poll() is None:
+                process.kill()
+        for process in procs:
+            process.communicate()
+
+    for rank in range(2):
+        assert f"rank {rank}: fallback" in outputs[rank], (
             f"rank {rank} unexpected output:\n{outputs[rank]}"
         )

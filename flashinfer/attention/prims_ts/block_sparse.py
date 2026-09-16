@@ -316,7 +316,8 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
             Softmax scale. Defaults to ``1 / sqrt(D)``.
         out : torch.Tensor, optional
             Caller-owned compact output buffer ``[B, Sq, Hq, D]`` with the
-            planned output dtype.
+            planned output dtype. Must not overlap any live input or plan-owned
+            buffer; storage overlap is not checked.
 
         Returns
         -------
@@ -411,6 +412,7 @@ def block_sparse_attention(
         Softmax scale. Defaults to ``1 / sqrt(D)``.
     out : torch.Tensor, optional
         Caller-owned compact output buffer ``[B, Sq, Hq, D]``.
+        Must not overlap any live input; storage overlap is not checked.
 
     Returns
     -------
@@ -666,7 +668,8 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
             Softmax scale. Defaults to ``1 / sqrt(D)``.
         out : torch.Tensor, optional
             Caller-owned compact output buffer ``[B, Sq, Hq, D]`` with the
-            planned output dtype.
+            planned output dtype. Must not overlap any live input or plan-owned
+            buffer; storage overlap is not checked.
 
         Returns
         -------
@@ -758,6 +761,7 @@ def block_sparse_attention_with_paged_kv_cache(
         Softmax scale. Defaults to ``1 / sqrt(D)``.
     out : torch.Tensor, optional
         Caller-owned compact output buffer ``[B, Sq, Hq, D]``.
+        Must not overlap any live input; storage overlap is not checked.
 
     Returns
     -------

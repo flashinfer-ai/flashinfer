@@ -20,7 +20,6 @@ from typing import TYPE_CHECKING, Literal
 
 import torch
 
-from .._tensor_aliasing import _validate_out_does_not_overlap_inputs
 from ..decode import (
     PagedKVCache,
     _normalize_paged_kv_cache,
@@ -267,7 +266,8 @@ def validate_block_sparse_run(
     Contiguous K/V use compact ``[B, Skv, Hkv, D]`` directly. Paged K/V are
     normalized once into zero-copy HND cache views plus launch metadata. An
     explicit output is returned by identity and may not overlap any live launch
-    input. ``sm_scale=None`` is materialized as ``1 / sqrt(D)``.
+    input or plan-owned buffer. Storage overlap is a caller precondition and
+    is not checked. ``sm_scale=None`` is materialized as ``1 / sqrt(D)``.
     """
 
     use_proxy_routes = state.use_proxy_routes
@@ -325,7 +325,6 @@ def validate_block_sparse_run(
         expected_device=state.device,
     )
     paged_kv: _PagedKVLaunchPayload | None = None
-    overlap_inputs: list[tuple[str, torch.Tensor]]
     if isinstance(kv_storage, _ContiguousKVStorage):
         if state.page_size is not None:
             raise TypeError("contiguous K/V storage requires a contiguous plan state")
@@ -345,11 +344,6 @@ def validate_block_sparse_run(
             )
         k = kv_storage.k
         v = kv_storage.v
-        overlap_inputs = [
-            ("q", q),
-            ("k", k),
-            ("v", v),
-        ]
     elif isinstance(kv_storage, _PagedKVStorage):
         page_size = state.page_size
         if page_size is None:
@@ -401,36 +395,13 @@ def validate_block_sparse_run(
             k_page_stride=k_page_stride,
             v_page_stride=v_page_stride,
         )
-        overlap_inputs = [
-            ("q", q),
-            ("k_cache", k),
-            ("v_cache", v),
-            ("paged_kv_indptr", kv_storage.paged_kv_indptr),
-            ("paged_kv_indices", kv_storage.paged_kv_indices),
-            ("seq_lens_kv", kv_storage.seq_lens_kv),
-        ]
     else:
         raise TypeError("kv_storage must be _ContiguousKVStorage or _PagedKVStorage")
 
-    if block_indptr is not None and block_indices is not None:
-        overlap_inputs.extend(
-            (("block_indptr", block_indptr), ("block_indices", block_indices))
-        )
-    if exact_block_bits is not None:
-        overlap_inputs.append(("exact_block_bits", exact_block_bits))
-    if k_summary is not None and v_summary is not None:
-        overlap_inputs.extend((("k_summary", k_summary), ("v_summary", v_summary)))
-    overlap_inputs.extend(
-        (
-            ("kv_valid_bits", effective_kv_valid_bits),
-            ("row_route_offsets", state.row_route_offsets),
-            ("route_workspace", state.route_workspace),
-        )
-    )
-
-    effective_scale = _validate_scale(
-        1.0 / math.sqrt(state.head_dim) if sm_scale is None else sm_scale,
-        "sm_scale",
+    effective_scale = (
+        1.0 / math.sqrt(state.head_dim)
+        if sm_scale is None
+        else _validate_scale(sm_scale, "sm_scale")
     )
     if out is None:
         out = torch.empty(q_shape, device=state.device, dtype=state.output_dtype)
@@ -442,7 +413,6 @@ def validate_block_sparse_run(
             expected_dtype=state.output_dtype,
             expected_device=state.device,
         )
-        _validate_out_does_not_overlap_inputs(out, *overlap_inputs)
     return _BlockSparseRunArgs(
         q=q,
         k=k,
