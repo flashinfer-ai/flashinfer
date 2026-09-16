@@ -275,7 +275,7 @@ def selective_state_update(
     if rand_seed is not None:
         if not isinstance(rand_seed, torch.Tensor):
             raise TypeError(
-                f"rand_seed must be a CUDA int64 tensor, got {type(rand_seed).__name__}"
+                f"rand_seed must be a CUDA/MUSA int64 tensor, got {type(rand_seed).__name__}"
             )
         if rand_seed.numel() != 1:
             raise ValueError(
@@ -283,8 +283,8 @@ def selective_state_update(
             )
         if rand_seed.dtype != torch.int64:
             raise ValueError(f"rand_seed must have dtype int64, got {rand_seed.dtype}")
-        if not rand_seed.is_cuda:
-            raise ValueError("rand_seed must be a CUDA tensor")
+        if rand_seed.device.type not in ("cuda", "musa"):
+            raise ValueError("rand_seed must be a CUDA or MUSA tensor")
         if state_scale is not None:
             raise ValueError("rand_seed and state_scale cannot both be provided")
         if philox_rounds <= 0:
@@ -304,6 +304,161 @@ def selective_state_update(
         output = torch.empty_like(x)
     else:
         output = out
+
+    # MUSA has a separate provider boundary.  Do not send MUSA tensors through
+    # the CUDA JIT module: its launchers include CUDA runtime headers and its
+    # architecture dispatch is NVIDIA-SM specific.  The initial MUSA provider
+    # is deliberately a correctness scaffold; the native MUSA kernel will keep
+    # this exact call boundary when it lands.
+    if state.device.type == "musa":
+        if algorithm not in (
+            "auto",
+            "simple",
+            "vertical",
+            "horizontal",
+            "async_horizontal",
+        ):
+            raise ValueError(f"unknown MUSA SSU algorithm={algorithm!r}")
+        fused_state_batch_indices = state_batch_indices
+        fused_dst_state_batch_indices = dst_state_batch_indices
+        fused_pad_slot_id = -1 if pad_slot_id is None else int(pad_slot_id)
+        state_indices_are_one_token = state_batch_indices is not None and (
+            state_batch_indices.dim() == 1
+            or (state_batch_indices.dim() == 2 and state_batch_indices.shape[1] == 1)
+        )
+        dst_indices_are_one_token = (
+            dst_state_batch_indices is None
+            or dst_state_batch_indices.dim() == 1
+            or (
+                dst_state_batch_indices.dim() == 2
+                and dst_state_batch_indices.shape[1] == 1
+            )
+        )
+        if (
+            x.dim() == 3
+            and state_batch_indices is not None
+            and state_batch_indices.dim() == 2
+            and state_batch_indices.shape[1] == 1
+        ):
+            fused_state_batch_indices = state_batch_indices[:, -1].contiguous()
+        if (
+            x.dim() == 3
+            and dst_state_batch_indices is not None
+            and dst_state_batch_indices.dim() == 2
+            and dst_state_batch_indices.shape[1] == 1
+        ):
+            fused_dst_state_batch_indices = dst_state_batch_indices[:, -1].contiguous()
+        if (
+            (z is None or (z.dim() == 3 and z.shape == x.shape))
+            and (
+                dt_bias is None
+                or (dt_bias.dim() == 1 and dt_bias.shape[0] == x.shape[1])
+                or (dt_bias.dim() == 2 and dt_bias.shape == x.shape[1:3])
+            )
+            and (
+                fused_state_batch_indices is not None
+                and (
+                    fused_dst_state_batch_indices is None
+                    or fused_dst_state_batch_indices.shape
+                    == fused_state_batch_indices.shape
+                )
+            )
+            and intermediate_states_buffer is None
+            and (
+                rand_seed is None
+                or (
+                    state.dtype == torch.float16
+                    and state.shape[-1] in (64, 128, 256)
+                    and rand_seed.dtype == torch.int64
+                    and rand_seed.numel() == 1
+                    and rand_seed.device == state.device
+                    and philox_rounds in (5, 10)
+                    and algorithm in ("auto", "simple")
+                )
+            )
+            and num_accepted_tokens is None
+            and not disable_state_update
+            and cu_seqlens is None
+            and state.dtype in (torch.float16, torch.bfloat16, torch.float32)
+            and state.dim() == 4
+            and x.dim() == 3
+            and state.shape[1:3] == x.shape[1:3]
+            and state_indices_are_one_token
+            and dst_indices_are_one_token
+            and state_batch_indices.numel() == x.shape[0]
+            and (
+                dst_state_batch_indices is None
+                or dst_state_batch_indices.numel() == x.shape[0]
+            )
+            and dt.dim() == 3
+            and A.dim() == 3
+            and B.dim() == 3
+            and C.dim() == 3
+            and dt.shape == x.shape
+            and A.shape[:2] == x.shape[1:3]
+            and B.shape == C.shape
+            and B.shape[0] == x.shape[0]
+            and B.shape[2] == A.shape[2]
+            and D is not None
+            and (
+                (D.dim() == 1 and D.shape[0] == x.shape[1])
+                or (D.dim() == 2 and D.shape == x.shape[1:3])
+            )
+            and fused_state_batch_indices is not None
+            and fused_state_batch_indices.dim() == 1
+            and x.shape[1] % B.shape[1] == 0
+        ):
+            from .musa_ssu_triton import ssu_one_token_musa_triton
+
+            return ssu_one_token_musa_triton(
+                state,
+                x,
+                dt,
+                A,
+                B,
+                C,
+                D,
+                fused_state_batch_indices,
+                dt_bias=dt_bias,
+                z=z,
+                dt_softplus=dt_softplus,
+                pad_slot_id=fused_pad_slot_id,
+                dst_state_batch_indices=fused_dst_state_batch_indices,
+                out=out,
+                rand_seed=rand_seed,
+                philox_rounds=philox_rounds,
+            )
+        # The correctness provider has one recurrence implementation.  The
+        # algorithm value remains accepted so callers can use the upstream
+        # API while native vertical/horizontal kernels are added.
+        from .musa_reference import selective_state_update_musa_reference
+
+        return selective_state_update_musa_reference(
+            state,
+            x,
+            dt,
+            A,
+            B,
+            C,
+            D,
+            z,
+            dt_bias,
+            dt_softplus,
+            state_batch_indices,
+            dst_state_batch_indices,
+            pad_slot_id,
+            output,
+            disable_state_update,
+            intermediate_states_buffer,
+            intermediate_state_indices,
+            state_scale,
+            intermediate_state_scales,
+            rand_seed,
+            philox_rounds,
+            cache_steps,
+            cu_seqlens,
+            num_accepted_tokens,
+        )
 
     # Determine stateIndex dtype from index tensors, default to int32
     stateIndex_dtype = torch.int32

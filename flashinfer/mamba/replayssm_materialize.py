@@ -323,6 +323,31 @@ def replayssm_materialize(
     write the state after token 128.
 
     """
+    if state_ptrs.device.type == "musa":
+        if dependency_inputs is None or dependency_outputs is None:
+            raise ValueError(
+                "MUSA ReplaySSM requires dependency_inputs/dependency_outputs "
+                "to resolve tensor pointer tables"
+            )
+        from .musa_reference import replayssm_materialize_musa_reference
+
+        return replayssm_materialize_musa_reference(
+            dependency_inputs,
+            dependency_outputs,
+            src_slots,
+            dst_slots,
+            ring_start,
+            replay_prefix_len,
+            active_request_indices,
+            heads_per_group=heads_per_group,
+            max_window=max_window,
+            ring_buffer_len=ring_buffer_len,
+            pad_slot_id=pad_slot_id,
+            rand_seed=rand_seed,
+            philox_rounds=philox_rounds,
+            state_scale_ptrs=state_scale_ptrs,
+            state_dtype=state_dtype,
+        )
     if input_dtype != torch.bfloat16:
         raise ValueError(
             "ReplaySSM materialization requires input_dtype=torch.bfloat16: "

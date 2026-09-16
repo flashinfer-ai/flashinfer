@@ -24,7 +24,17 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Un
 
 import torch
 import torch.version
-import pynvml
+try:
+    import pynvml
+    _USING_PYMTML = False
+except ImportError:  # NVIDIA-only optional dependency; MUSA does not ship NVML.
+    try:
+        # pymtml intentionally exposes the pynvml-compatible API for MUSA.
+        import pymtml as pynvml  # type: ignore[no-redef]
+        _USING_PYMTML = True
+    except ImportError:
+        pynvml = None  # type: ignore[assignment]
+        _USING_PYMTML = False
 from torch.torch_version import TorchVersion
 from torch.torch_version import __version__ as torch_version
 import inspect
@@ -287,13 +297,15 @@ def canonicalize_torch_dtype(dtype: Union[torch.dtype, str]) -> torch.dtype:
 
 @functools.cache
 def get_device_properties(device: torch.device):
+    if device.type == "musa":
+        return torch.musa.get_device_properties(device)
     return torch.cuda.get_device_properties(device)
 
 
 @functools.cache
 def get_compute_capability(device: torch.device) -> Tuple[int, int]:
-    if device.type != "cuda":
-        raise ValueError("device must be a cuda device")
+    if device.type not in ("cuda", "musa"):
+        raise ValueError("device must be a cuda or musa device")
     properties = get_device_properties(device)
     return properties.major, properties.minor
 
@@ -334,11 +346,17 @@ def get_gpu_memory_bandwidth(device: torch.device) -> float:
         device = torch.device(device)
 
     # Check if it's a CUDA device
-    if device.type != "cuda":
-        raise ValueError(f"Device must be a CUDA device, got {device}")
+    if device.type not in ("cuda", "musa"):
+        raise ValueError(f"Device must be a CUDA or MUSA device, got {device}")
 
     # Get device index
     device_index = device.index if device.index is not None else 0
+
+    if pynvml is None:
+        raise RuntimeError(
+            "pynvml is required for NVIDIA memory-bandwidth queries; "
+            "the MUSA backend does not provide NVML"
+        )
 
     # Use pynvml to get bandwidth
     pynvml.nvmlInit()
@@ -352,7 +370,13 @@ def get_gpu_memory_bandwidth(device: torch.device) -> float:
 
         return bandwidth
     finally:
-        pynvml.nvmlShutdown()
+        try:
+            pynvml.nvmlShutdown()
+        except Exception:
+            # pymtml currently reports InvalidArgument when its singleton is
+            # already torn down; a successful bandwidth query is still valid.
+            if not _USING_PYMTML:
+                raise
 
 
 @functools.cache
@@ -703,7 +727,13 @@ def is_cvt_rs_supported(device: torch.device = None) -> bool:
     include/flashinfer/mamba/conversion.cuh (SM100_ALL || SM103_ALL).
     """
     if device is None:
-        device = torch.device("cuda")
+        # MUSA test processes keep CUDA unavailable by design.  Selecting the
+        # active accelerator here avoids querying CUDA device 0 during test
+        # collection when the caller omitted an explicit device.
+        if hasattr(torch.version, "musa") and torch.version.musa is not None:
+            device = torch.device("musa")
+        else:
+            device = torch.device("cuda")
     # Match the CUDA guard exactly: only the arches where cvt.rs actually
     # assembles (verified via ptxas).  NOT a `major == 10/11` check — SM110a
     # (major 11) has no `.rs` feature.

@@ -50,6 +50,8 @@ _CTA_PER_SM_CANDIDATES = tuple(range(1, 33))
 
 @functools.cache
 def _sm_count(device: torch.device) -> int:
+    if device.type == "musa":
+        return torch.musa.get_device_properties(device).multi_processor_count
     return torch.cuda.get_device_properties(device).multi_processor_count
 
 
@@ -896,6 +898,103 @@ def checkpointing_ssu(
     out : torch.Tensor
         Output tensor, shape (batch, T, nheads, dim).
     """
+    if algorithm not in ("auto", "monolith", "two-kernel"):
+        raise ValueError(
+            "algorithm must be one of 'auto', 'monolith', 'two-kernel'; "
+            f"got {algorithm!r}"
+        )
+    scratch_provided = cb_scaled is not None
+    if scratch_provided != (cumAdt_vec is not None) or scratch_provided != (
+        cb_old is not None
+    ):
+        raise ValueError(
+            "cb_scaled, cumAdt_vec, and cb_old must be provided together"
+        )
+    if algorithm == "two-kernel" and not scratch_provided:
+        raise ValueError(
+            "algorithm='two-kernel' requires cb_scaled/cumAdt_vec/cb_old"
+        )
+
+    if state.device.type == "musa":
+        from .musa_reference import checkpointing_ssu_musa_reference
+
+        if cu_seqlens is not None:
+            if max_seqlen is None:
+                raise ValueError("MUSA checkpointing_ssu varlen path requires max_seqlen")
+            if cu_seqlens.dim() != 1 or cu_seqlens.numel() < 2:
+                raise ValueError("cu_seqlens must be a one-dimensional boundary vector")
+            if x.dim() != 4 or x.shape[0] != 1:
+                raise ValueError("packed MUSA checkpointing expects x shaped [1,total,H,D]")
+            if int(cu_seqlens[-1].item()) != x.shape[1]:
+                raise ValueError("cu_seqlens must end at the packed token count")
+            num_sequences = cu_seqlens.numel() - 1
+            if ring_start.numel() != num_sequences or prev_num_accepted_tokens.numel() != num_sequences:
+                raise ValueError("packed checkpoint metadata must have one entry per sequence")
+            if state_batch_indices is None:
+                packed_state_indices = torch.arange(
+                    num_sequences, device=state.device, dtype=torch.int32
+                )
+            else:
+                if state_batch_indices.numel() != num_sequences:
+                    raise ValueError("state_batch_indices must match cu_seqlens")
+                packed_state_indices = state_batch_indices
+            for sequence in range(num_sequences):
+                start = int(cu_seqlens[sequence].item())
+                end = int(cu_seqlens[sequence + 1].item())
+                if end < start or end - start > max_seqlen:
+                    raise ValueError("cu_seqlens contains an invalid sequence length")
+                if end == start:
+                    continue
+                from .musa_reference import checkpointing_ssu_musa_reference
+
+                checkpointing_ssu_musa_reference(
+                    state,
+                    x_cache,
+                    B_cache,
+                    dt_cache,
+                    ring_start[sequence : sequence + 1],
+                    prev_num_accepted_tokens[sequence : sequence + 1],
+                    x[:, start:end],
+                    dt[:, start:end],
+                    A,
+                    B[:, start:end],
+                    C[:, start:end],
+                    out[:, start:end],
+                    D=D,
+                    z=None if z is None else z[:, start:end],
+                    dt_bias=dt_bias,
+                    dt_softplus=dt_softplus,
+                    state_batch_indices=packed_state_indices[sequence : sequence + 1],
+                    pad_slot_id=pad_slot_id,
+                    state_scale=state_scale,
+                    rand_seed=rand_seed,
+                    philox_rounds=philox_rounds,
+                )
+            return out
+        return checkpointing_ssu_musa_reference(
+            state,
+            x_cache,
+            B_cache,
+            dt_cache,
+            ring_start,
+            prev_num_accepted_tokens,
+            x,
+            dt,
+            A,
+            B,
+            C,
+            out,
+            D=D,
+            z=z,
+            dt_bias=dt_bias,
+            dt_softplus=dt_softplus,
+            state_batch_indices=state_batch_indices,
+            pad_slot_id=pad_slot_id,
+            state_scale=state_scale,
+            rand_seed=rand_seed,
+            philox_rounds=philox_rounds,
+        )
+
     # Validate quantized state ↔ state_scale combo.
     # int8 and fp8_e4m3fn use a per-(cache, head, dim) decode-scale tensor
     # (QUANT_MAX = 127 and 448 respectively).  Non-quantized dtypes must NOT

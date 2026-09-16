@@ -22,22 +22,39 @@ This module provides the combined forward pass for Mamba2 SSD, combining:
 """
 
 import functools
+import os
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
-import cutlass
-import cutlass.cute as cute
-import cutlass.torch as cutlass_torch
-import cuda.bindings.driver as cuda_drv
 import torch
-from cutlass import Int32
-from cutlass.base_dsl.compiler import GenerateLineInfo  # profiling
+
+try:
+    import cutlass
+    import cutlass.cute as cute
+    import cutlass.torch as cutlass_torch
+    import cuda.bindings.driver as cuda_drv
+    from cutlass import Int32
+    from cutlass.base_dsl.compiler import GenerateLineInfo  # profiling
+    from .ssd_kernel import SSDKernel
+
+    _CUTE_SSD_AVAILABLE = True
+except ImportError:
+    # CuTe/CUDA are optional until the CUDA backend is actually selected.  A
+    # MUSA installation must be able to import this module so it can dispatch
+    # to the MUSA SSD provider without shipping NVIDIA's CuTe packages.
+    cutlass = None
+    cute = None
+    cutlass_torch = None
+    cuda_drv = None
+    Int32 = None
+    GenerateLineInfo = None
+    SSDKernel = None
+    _CUTE_SSD_AVAILABLE = False
 
 from ..api_logging import flashinfer_api
 from ..jit.mamba.seq_chunk_cumsum import gen_seq_chunk_cumsum_module
 from ..trace.templates.mamba import ssd_combined_trace_dispatch
 from ..triton.kernels.ssd_chunk_state import chunk_cumsum_fwd
-from .ssd_kernel import SSDKernel
 
 
 @functools.cache
@@ -289,14 +306,22 @@ class SSDCombined:
     ):
         from ..utils import get_compute_capability
 
-        major, minor = get_compute_capability(torch.device("cuda"))
+        musa_runtime = (
+            hasattr(torch.version, "musa")
+            and torch.version.musa is not None
+            and torch.musa.is_available()
+        )
+        if musa_runtime:
+            major, minor = 3, 1
+        else:
+            major, minor = get_compute_capability(torch.device("cuda"))
         # The SSD CuTe-DSL kernel uses tcgen05 MMA (MmaF16BF16Op), which is only
         # available on datacenter Blackwell (SM100/SM103/SM110). Consumer/workstation
         # Blackwell (SM120/SM121) lacks tcgen05, so reject it here with a clear message
         # instead of a cryptic cute-dsl "expects ... sm_100a ... got sm_120a" OpError.
         # SM107 (Rubin) shares major=10 but is not yet supported by this kernel, so
         # reject it explicitly rather than letting it slip through the major check.
-        if major not in (10, 11) or (major, minor) == (10, 7):
+        if not musa_runtime and (major not in (10, 11) or (major, minor) == (10, 7)):
             raise ValueError(
                 f"SSDCombined requires datacenter Blackwell (SM100/SM103/SM110) "
                 f"for tcgen05 MMA. Got SM{major}{minor}."
@@ -320,6 +345,10 @@ class SSDCombined:
             raise ValueError(
                 f"SSDCombined backend must be 'cute' or 'cake', got {backend!r}"
             )
+        if musa_runtime and backend == "cute":
+            self._seq_cumsum_key = None
+            self._seq_cumsum_buf = None
+            return
         if backend == "cake":
             from .cake_ssd_combined import CakeSSDCombined
 
@@ -458,6 +487,13 @@ class SSDCombined:
         """
         if seq_chunk_cumsum is None:
             seq_chunk_cumsum = self._get_or_alloc_seq_cumsum(num_seqs, seq_idx.device)
+        if seq_idx.device.type == "musa":
+            from .musa_seq_chunk import seq_chunk_cumsum as musa_seq_chunk_cumsum
+
+            return musa_seq_chunk_cumsum(
+                seq_idx, chunk_indices, chunk_offsets, chunk_size, num_seqs,
+                out=seq_chunk_cumsum, tile_state=tile_state,
+            )
         if tile_state is None:
             module = _get_seq_chunk_cumsum_module()
             tile_state_bytes = module.seq_chunk_cumsum_tile_state_size(num_seqs)
@@ -485,6 +521,8 @@ class SSDCombined:
     @staticmethod
     def tile_state_size(num_seqs: int) -> int:
         """Return the tile_state buffer size in bytes for the given num_seqs."""
+        if getattr(torch.version, "musa", None) is not None:
+            return 0
         return _get_seq_chunk_cumsum_module().seq_chunk_cumsum_tile_state_size(num_seqs)
 
     # -- main entry point ------------------------------------------------------
@@ -649,6 +687,71 @@ class SSDCombined:
                 "initial_states must be provided in varlen mode (when seq_idx, "
                 "chunk_indices, and chunk_offsets are given) to determine num_seqs"
             )
+
+        if x.device.type == "musa":
+            if update_seq_chunk_cumsum and chunk_indices is not None and chunk_offsets is not None:
+                if seq_idx is None:
+                    raise ValueError("update_seq_chunk_cumsum requires seq_idx")
+                if seq_chunk_cumsum is None:
+                    raise ValueError("update_seq_chunk_cumsum requires an output tensor")
+                from .musa_seq_chunk import seq_chunk_cumsum as musa_seq_chunk_cumsum
+
+                flat_seq_idx = seq_idx.reshape(1, -1).contiguous()
+                num_seqs = seq_chunk_cumsum.numel() - 1
+                musa_seq_chunk_cumsum(
+                    flat_seq_idx, chunk_indices, chunk_offsets, self.chunk_size,
+                    num_seqs, out=seq_chunk_cumsum,
+                )
+            from .musa_reference import ssd_combined_fwd_musa_reference
+
+            if chunk_indices is not None or chunk_offsets is not None:
+                if seq_idx is None:
+                    raise ValueError("chunk metadata requires seq_idx on MUSA SSD")
+                if chunk_offsets is not None and (
+                    chunk_offsets.ndim != 1
+                    or int(chunk_offsets[-1].item()) > x.shape[1]
+                ):
+                    raise ValueError("chunk_offsets must be bounded by padded sequence length")
+
+            native_out = out
+            token_out = None
+            if out is not None and out.shape != x.shape:
+                token_out = torch.empty_like(x)
+            else:
+                token_out = out
+
+            result = ssd_combined_fwd_musa_reference(
+                x,
+                dt,
+                A,
+                B,
+                C,
+                D=D,
+                z=z,
+                dt_bias=dt_bias,
+                dt_softplus=dt_softplus,
+                dt_limit=dt_limit,
+                initial_states=initial_states,
+                seq_idx=seq_idx,
+                out=token_out,
+                return_final_states=return_final_states,
+                checkpoint_token_indices=checkpoint_token_indices,
+                checkpoint_state_slots=checkpoint_state_slots,
+                checkpoint_states=checkpoint_states,
+            )
+            if native_out is not None and native_out.shape != x.shape:
+                token_out = result[0]
+                native_out.copy_(
+                    token_out.view(
+                        x.shape[0], x.shape[1] // self.chunk_size,
+                        self.chunk_size, x.shape[2], x.shape[3],
+                    ).permute(0, 3, 4, 1, 2)
+                )
+                result = (
+                    native_out.permute(0, 3, 4, 1, 2).reshape_as(x),
+                    result[1],
+                )
+            return result
 
         if self._backend == "cake":
             return self._cake_runner.run(
@@ -962,6 +1065,92 @@ def ssd_combined_fwd(
         when ``return_final_states`` is false.
     """
 
+    # Keep MUSA tensors away from the CUDA CuTe/Cake launcher.  The initial
+    # MUSA path is a reference recurrence with the same public API; it is the
+    # correctness anchor for the native S5000 SSD implementation.
+    if x.device.type == "musa":
+        if update_seq_chunk_cumsum and chunk_indices is not None and chunk_offsets is not None:
+            if seq_idx is None:
+                raise ValueError("update_seq_chunk_cumsum requires seq_idx")
+            if seq_chunk_cumsum is None:
+                raise ValueError("update_seq_chunk_cumsum requires an output tensor")
+            flat_seq_idx = seq_idx.reshape(1, -1).contiguous()
+            num_seqs = seq_chunk_cumsum.numel() - 1
+            if chunk_offsets.numel() and int(chunk_offsets.max().item()) < flat_seq_idx.shape[1]:
+                # Module-level vLLM callers provide flat token offsets.  The
+                # lower-bound Triton kernel uses physical [chunk, token]
+                # coordinates, so map this compact metadata directly here.
+                counts = torch.zeros(num_seqs, device=x.device, dtype=torch.int32)
+                for chunk in range(chunk_offsets.numel()):
+                    position = int(chunk_offsets[chunk].item())
+                    sequence = int(flat_seq_idx[0, position].item())
+                    if sequence < 0 or sequence >= num_seqs:
+                        raise ValueError("chunk metadata sequence id is out of bounds")
+                    counts[sequence] += 1
+                seq_chunk_cumsum[0] = 0
+                seq_chunk_cumsum[1:] = torch.cumsum(counts, dim=0)
+            else:
+                from .musa_seq_chunk import seq_chunk_cumsum as musa_seq_chunk_cumsum
+
+                musa_seq_chunk_cumsum(
+                    flat_seq_idx, chunk_indices, chunk_offsets, 128,
+                    num_seqs, out=seq_chunk_cumsum,
+                )
+        if chunk_indices is not None or chunk_offsets is not None:
+            if seq_idx is None:
+                raise ValueError("chunk metadata requires seq_idx on MUSA SSD")
+            if chunk_offsets is not None and (
+                chunk_offsets.ndim != 1 or int(chunk_offsets[-1].item()) > x.shape[1]
+            ):
+                raise ValueError("chunk_offsets must be bounded by padded sequence length")
+        from .musa_reference import ssd_combined_fwd_musa_reference
+
+        provider_out = out
+        native_out = None
+        if out is not None and tuple(out.shape) != tuple(x.shape):
+            expected_chunks = (x.shape[1] + 127) // 128
+            expected_native = (x.shape[0], x.shape[2], x.shape[3], expected_chunks, 128)
+            if tuple(out.shape) != expected_native or not out.is_contiguous():
+                raise ValueError(
+                    "MUSA SSD out must be token-major x.shape or contiguous "
+                    "native [batch, heads, headdim, nchunks, 128]"
+                )
+            native_out = out
+            provider_out = torch.empty_like(x)
+        result = ssd_combined_fwd_musa_reference(
+            x,
+            dt,
+            A,
+            B,
+            C,
+            D=D,
+            z=z,
+            dt_bias=dt_bias,
+            dt_softplus=dt_softplus,
+            dt_limit=dt_limit,
+            initial_states=initial_states,
+            seq_idx=seq_idx,
+            out=provider_out,
+            return_final_states=return_final_states,
+            checkpoint_token_indices=checkpoint_token_indices,
+            checkpoint_state_slots=checkpoint_state_slots,
+            checkpoint_states=checkpoint_states,
+        )
+        if native_out is not None:
+            token_output, final_states = result
+            native_view = native_out.reshape(
+                x.shape[0], x.shape[2], x.shape[3], expected_chunks, 128
+            )
+            native_view.zero_()
+            padded = torch.zeros(
+                x.shape[0], expected_chunks * 128, x.shape[2], x.shape[3],
+                device=x.device, dtype=token_output.dtype,
+            )
+            padded[:, : x.shape[1]].copy_(token_output)
+            native_view.copy_(padded.reshape(x.shape[0], expected_chunks, 128, x.shape[2], x.shape[3]).permute(0, 3, 4, 1, 2))
+            return token_output, final_states
+        return result
+
     _, _, nheads, headdim = x.shape
     _, _, ngroups, dstate = B.shape
     state_dtype = (
@@ -1016,3 +1205,117 @@ def ssd_combined_fwd(
         out=out,
         return_final_states=return_final_states,
     )
+
+
+def ssd_combined_fwd_varlen(
+    x: torch.Tensor,
+    dt: torch.Tensor,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    chunk_size: int,
+    cu_seqlens: torch.Tensor,
+    cu_chunk_seqlens: torch.Tensor,
+    last_chunk_indices: torch.Tensor,
+    seq_idx: torch.Tensor,
+    out: torch.Tensor,
+    D: Optional[torch.Tensor] = None,
+    z: Optional[torch.Tensor] = None,
+    dt_bias: Optional[torch.Tensor] = None,
+    initial_states: Optional[torch.Tensor] = None,
+    dt_softplus: bool = False,
+    dt_limit: tuple[float, float] = (0.0, float("inf")),
+    return_intermediate_states: bool = False,
+    state_dtype: Optional[torch.dtype] = None,
+    checkpoint_token_indices: Optional[torch.Tensor] = None,
+    checkpoint_state_slots: Optional[torch.Tensor] = None,
+    checkpoint_states: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Packed SSD API matching vLLM's Mamba2 varlen prefill contract.
+
+    The CUDA CuTe runner has a separate varlen contract.  MUSA uses this
+    explicit entry point so vLLM can share its packed metadata without
+    converting sequences back to a padded batch.
+
+    The native MUSA provider specializes the standard Mamba2 parameterization
+    (non-positive A and softplus/non-negative dt) with half-precision x/B/C.
+    Unsupported layouts and checkpoint materialization retain the reference
+    path. Set VLLM_MUSA_FLASHINFER_SSD=0 to select the reference provider.
+    """
+    if x.device.type != "musa":
+        raise NotImplementedError(
+            "ssd_combined_fwd_varlen is currently implemented for the MUSA provider"
+        )
+    if (
+        os.getenv("VLLM_MUSA_FLASHINFER_SSD", "1") == "1"
+        and chunk_size > 0
+        and chunk_size & (chunk_size - 1) == 0
+        and x.ndim == 3
+        and x.dtype in (torch.float16, torch.bfloat16)
+        and B.dtype == C.dtype == x.dtype
+        and dt.ndim == 2
+        and A.ndim == 1
+        and dt_softplus
+        and dt_limit[0] >= 0
+        and cu_seqlens is not None
+        and cu_chunk_seqlens is not None
+        and last_chunk_indices is not None
+        and seq_idx is not None
+        and checkpoint_token_indices is None
+        and checkpoint_state_slots is None
+        and checkpoint_states is None
+    ):
+        from .musa_ssd_triton import mamba_chunk_scan_combined_varlen
+
+        return mamba_chunk_scan_combined_varlen(
+            x,
+            dt,
+            A,
+            B,
+            C,
+            chunk_size,
+            cu_seqlens,
+            cu_chunk_seqlens,
+            last_chunk_indices,
+            seq_idx,
+            out,
+            D=D,
+            z=z,
+            dt_bias=dt_bias,
+            initial_states=initial_states,
+            dt_softplus=dt_softplus,
+            dt_limit=dt_limit,
+            return_intermediate_states=return_intermediate_states,
+            state_dtype=state_dtype,
+        )
+
+    from .musa_reference import ssd_combined_fwd_varlen_musa_reference
+
+    return ssd_combined_fwd_varlen_musa_reference(
+        x,
+        dt,
+        A,
+        B,
+        C,
+        chunk_size,
+        cu_seqlens,
+        cu_chunk_seqlens,
+        last_chunk_indices,
+        seq_idx,
+        out=out,
+        D=D,
+        z=z,
+        dt_bias=dt_bias,
+        dt_softplus=dt_softplus,
+        dt_limit=dt_limit,
+        initial_states=initial_states,
+        return_intermediate_states=return_intermediate_states,
+        state_dtype=state_dtype,
+        checkpoint_token_indices=checkpoint_token_indices,
+        checkpoint_state_slots=checkpoint_state_slots,
+        checkpoint_states=checkpoint_states,
+    )
+
+
+# Compatibility spelling used by vLLM's Mamba2 mixer.
+mamba_chunk_scan_combined_varlen = ssd_combined_fwd_varlen
