@@ -178,7 +178,6 @@ def test_cudnn_prefill_large_page_wrapper():
     )
     batch_size = len(q_lens)
     scale = float(_HEAD_DIM**-0.5)
-    qo_indptr_elems = qo_indptr_tokens * _NUM_QO_HEADS * _HEAD_DIM
 
     num_pages_used = (seq_kv + page_size - 1) // page_size
     zero = torch.zeros(1, dtype=torch.int32, device=device)
@@ -197,7 +196,7 @@ def test_cudnn_prefill_large_page_wrapper():
         workspace_buffer, "NHD", backend="cudnn"
     )
     wrapper.plan(
-        qo_indptr_elems,
+        qo_indptr_tokens,
         kv_indptr,
         kv_indices,
         kv_last_page_len,

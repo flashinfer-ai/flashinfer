@@ -18,9 +18,11 @@ that capability via the cuDNN backend today:
   aligns the diagonal to the END of the KV sequence, and the test additionally
   asserts a top-left-aligned reference would NOT match, so the alignment claim
   is load-bearing.
-- ``return_lse=True``: LSE shape and finiteness on the valid rows
-  (merging-readiness for speculative decode).
+- ``return_lse=True``: LSE shape, finite writes, and numerical agreement with
+  a dense base-2 log-sum-exp reference on every valid query row.
 """
+
+import math
 
 import pytest
 import torch
@@ -94,7 +96,7 @@ def _make_decode_like_inputs(batch_size, page_size, num_qo_heads, num_kv_heads, 
     )
 
 
-def _dense_reference(inp, scale, causal_alignment=None):
+def _dense_reference(inp, scale, causal_alignment=None, return_lse=False):
     """Dense fp32 torch attention over the valid KV prefix of each request.
 
     Gathering only the valid KV tokens applies exactly the padding mask (and
@@ -102,7 +104,8 @@ def _dense_reference(inp, scale, causal_alignment=None):
     ``None`` (bidirectional), ``"bottom_right"`` (diagonal aligned to the end
     of the valid KV sequence, cuDNN's convention on this API), or
     ``"top_left"`` (diagonal at kv position 0, used only to prove the
-    alignments differ). Returns packed output ``(total_q_tokens, h_qo, d)``.
+    alignments differ). Returns packed output ``(total_q_tokens, h_qo, d)``
+    and, when requested, base-2 LSE ``(total_q_tokens, h_qo)``.
     """
     q = inp["q"]
     k_cache, v_cache = inp["k_cache"], inp["v_cache"]
@@ -111,6 +114,7 @@ def _dense_reference(inp, scale, causal_alignment=None):
     num_qo_heads = q.shape[1]
     num_kv_heads = k_cache.shape[1]
     outs = []
+    lses = []
     q_start = 0
     for i, (len_q, len_kv) in enumerate(zip(seq_q, seq_kv, strict=False)):
         q_i = q[q_start : q_start + len_q].float()  # (len_q, h_qo, d)
@@ -139,8 +143,12 @@ def _dense_reference(inp, scale, causal_alignment=None):
             else:
                 raise ValueError(f"unknown causal_alignment: {causal_alignment}")
             scores = scores.masked_fill(~allowed, float("-inf"))
+        if return_lse:
+            lses.append((torch.logsumexp(scores, dim=-1) / math.log(2)).T)
         probs = torch.softmax(scores, dim=-1)
         outs.append(torch.einsum("hqk,khd->qhd", probs, v_i))
+    if return_lse:
+        return torch.cat(outs, dim=0), torch.cat(lses, dim=0)
     return torch.cat(outs, dim=0)
 
 
@@ -218,8 +226,8 @@ def test_cudnn_causal_bottom_right_multi_token_decode():
 
 def test_cudnn_noncausal_multi_token_decode_return_lse():
     """return_lse=True on the non-causal decode-like batch: correct output plus
-    an LSE of the documented shape whose valid rows are finite and written
-    (merging-readiness for speculative decode)."""
+    an LSE of the documented shape whose valid rows are written and agree
+    with a dense base-2 log-sum-exp reference."""
     if not cudnn_prefill.CUDNN_AVAILABLE:
         pytest.skip("cudnn-frontend python package not available")
 
@@ -245,12 +253,24 @@ def test_cudnn_noncausal_multi_token_decode_return_lse():
     )
     output, lse = _run_cudnn(inp, scale, causal=False, return_lse=True, lse=lse_buf)
 
-    output_ref = _dense_reference(inp, scale, causal_alignment=None)
+    output_ref, lse_ref = _dense_reference(
+        inp, scale, causal_alignment=None, return_lse=True
+    )
     torch.testing.assert_close(output.float(), output_ref, atol=1e-2, rtol=1e-2)
 
     assert lse is not None
     assert lse.shape == (batch_size, MAX_Q_LEN, num_qo_heads)
+    q_start = 0
     for i, len_q in enumerate(inp["seq_q"].tolist()):
         assert torch.isfinite(lse[i, :len_q, :]).all(), (
             f"non-finite LSE in valid rows of request {i}"
         )
+        # The public cuDNN API returns base-2 LSE, as required by cascade
+        # merging. Compare only valid rows; padded rows are unspecified.
+        torch.testing.assert_close(
+            lse[i, :len_q, :],
+            lse_ref[q_start : q_start + len_q],
+            atol=1e-2,
+            rtol=1e-2,
+        )
+        q_start += len_q
