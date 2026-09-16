@@ -132,7 +132,7 @@ def test_public_native_accepts_single_token_cu_seqlens():
     assert result.shape == x.shape
 
 
-def test_public_native_rejects_noncanonical_single_token_cu_seqlens(monkeypatch):
+def test_public_native_rejects_noncanonical_single_token_cu_seqlens():
     torch.manual_seed(38)
     state = torch.randn((2, 64, 64, 128), device="musa", dtype=torch.float16)
     x = torch.randn((1, 64, 64), device="musa", dtype=torch.bfloat16)
@@ -143,29 +143,20 @@ def test_public_native_rejects_noncanonical_single_token_cu_seqlens(monkeypatch)
     d = torch.randn((64, 1), device="musa", dtype=torch.float32).expand(64, 64)
     slot = torch.zeros((1,), device="musa", dtype=torch.int32)
     malformed = torch.tensor([10, 11], device="musa", dtype=torch.int32)
-    # The native path must not silently discard noncanonical metadata. The
-    # generic provider remains responsible for deciding whether it can handle
-    # this request; the sentinel proves the native gate is not selected.
-    def native_must_not_run(*args, **kwargs):
-        raise AssertionError("native Simple STP received malformed cu_seqlens")
-
-    monkeypatch.setattr(
-        "flashinfer.mamba.musa_ssu_native.musa_ssu_one_token_native",
-        native_must_not_run,
-    )
-    selective_state_update(
-        state,
-        x,
-        dt,
-        a,
-        b,
-        c,
-        d,
-        dt_softplus=True,
-        state_batch_indices=slot,
-        cu_seqlens=malformed,
-        backend="flashinfer",
-    )
+    with pytest.raises(ValueError, match=r"canonical \[0, 1\]"):
+        selective_state_update(
+            state,
+            x,
+            dt,
+            a,
+            b,
+            c,
+            d,
+            dt_softplus=True,
+            state_batch_indices=slot,
+            cu_seqlens=malformed,
+            backend="flashinfer",
+        )
 
 
 def test_native_direct_rejects_malformed_z_shape():
@@ -181,6 +172,36 @@ def test_native_direct_rejects_malformed_z_shape():
     with pytest.raises(RuntimeError, match="z must match"):
         musa_ssu_one_token_native(
             state, x, dt, a, b, c, d, slot, slot, None, z, True, -1, None, None, 0
+        )
+
+
+def test_native_direct_rejects_multi_element_slot_indices():
+    state = torch.randn((2, 64, 64, 128), device="musa", dtype=torch.float16)
+    x = torch.randn((1, 64, 64), device="musa", dtype=torch.bfloat16)
+    dt = torch.randn((1, 64, 1), device="musa", dtype=torch.float32).expand(1, 64, 64)
+    a = (-torch.rand((64, 1, 1), device="musa", dtype=torch.float32)).expand(64, 64, 128)
+    b = torch.randn((1, 8, 128), device="musa", dtype=torch.bfloat16)
+    c = torch.randn_like(b)
+    d = torch.randn((64,), device="musa", dtype=torch.bfloat16)
+    slots = torch.tensor([0, 1], device="musa", dtype=torch.int32)
+    with pytest.raises(RuntimeError, match="one-element"):
+        musa_ssu_one_token_native(
+            state,
+            x,
+            dt,
+            a,
+            b,
+            c,
+            d,
+            slots,
+            slots,
+            None,
+            None,
+            True,
+            -1,
+            None,
+            None,
+            0,
         )
 
 
