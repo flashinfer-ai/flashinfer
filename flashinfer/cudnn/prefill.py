@@ -8,7 +8,7 @@ import torch
 
 from ..api_logging import flashinfer_api
 from ..trace.templates.attention import cudnn_batch_prefill_trace
-from ..utils import log2e
+from ..utils import check_lse_base, log2e
 from .utils import get_cudnn_fmha_gen_module
 
 try:
@@ -824,6 +824,7 @@ def _batch_prefill_with_kv_cache(
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
     o_data_type: Optional[torch.dtype] = None,
+    lse_base: str = "log2",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # Shape override covers the fully ragged token-indptr path (3-D q/k/v with
     # cu_seq_lens on both sides, 16-bit inputs); paged, per-batch-length and fp8
@@ -960,7 +961,9 @@ def _batch_prefill_with_kv_cache(
         # backend returns base-2 LSE (they fold log2e into the softmax scale, so
         # their kernels emit base-2 directly). Convert here so the cuDNN backend
         # matches that contract. log2(sum exp(x)) = ln(sum exp(x)) * log2(e).
-        lse.mul_(log2e)
+        # A caller that wants natural log gets the stats as written.
+        if lse_base == "log2":
+            lse.mul_(log2e)
         return out, lse
     else:
         return out, None
@@ -995,6 +998,7 @@ def cudnn_batch_prefill_with_kv_cache(
     is_cuda_graph_compatible: bool = False,
     backend: Optional[str] = None,
     o_data_type: Optional[torch.dtype] = None,
+    lse_base: str = "log2",
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     r"""Batched prefill attention with paged KV cache, backed by cuDNN SDPA.
 
@@ -1099,6 +1103,10 @@ def cudnn_batch_prefill_with_kv_cache(
         autodetects based on cuDNN availability.
     o_data_type : Optional[torch.dtype]
         Optional output dtype; defaults to ``q.dtype``.
+    lse_base : str
+        ``"log2"`` (default): return the LSE in base 2 like every other FlashInfer
+        backend. ``"ln"``: return cuDNN's native natural-log stats, skipping the
+        conversion kernel.
 
     Returns
     -------
@@ -1115,6 +1123,7 @@ def cudnn_batch_prefill_with_kv_cache(
     must reside on the same device as ``q``.  ``head_dim_qk`` must be 128 or 192,
     and ``head_dim_vo`` must be 128.
     """
+    check_lse_base(lse_base)
 
     num_tokens = q.shape[0]
 
@@ -1227,6 +1236,7 @@ def cudnn_batch_prefill_with_kv_cache(
             out=out,
             lse=lse,
             o_data_type=o_data_type,
+            lse_base=lse_base,
         )
 
         if batch_offsets_units == "tokens":
@@ -1312,6 +1322,10 @@ def cudnn_batch_prefill_with_kv_cache(
 
         actual_seq_lens_kv_gpu = actual_seq_lens_kv.to(q.device, non_blocking=True)
 
+        if lse_base != "log2":
+            raise NotImplementedError(
+                "the cubin cuDNN prefill path only returns base-2 LSE"
+            )
         run_func = get_cudnn_fmha_gen_module().prefill
         run_func(
             num_sequences,

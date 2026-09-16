@@ -57,6 +57,17 @@ class TensorLayout(Enum):
 
 
 log2e = 1.44269504088896340736
+ln2 = 0.6931471805599453094
+
+# Bases the attention wrappers can return the LSE in. FlashInfer's kernels fold
+# log2(e) into the softmax scale and emit base-2 LSE ("log2"); "ln" is the
+# natural-log form (torch.logsumexp), what merge kernels written with expf take.
+LSE_BASES = ("log2", "ln")
+
+
+def check_lse_base(lse_base: str) -> None:
+    if lse_base not in LSE_BASES:
+        raise ValueError(f"lse_base must be one of {LSE_BASES}, got {lse_base!r}")
 
 
 class GPUArchitectureError(Exception):
