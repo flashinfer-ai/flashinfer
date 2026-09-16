@@ -144,6 +144,9 @@ jobs:
         id: build-cubin-wheel
         env:
           FLASHINFER_DEV_RELEASE_SUFFIX: ${{ needs.setup.outputs.dev_suffix }}
+          FLASHINFER_CUBIN_DOWNLOAD_THREADS: 2
+          FLASHINFER_CUBIN_MAX_RETRIES: 10
+          FLASHINFER_CUBIN_TIMEOUT: 30
         run: |
           echo "Building flashinfer-cubin with dev suffix: ${FLASHINFER_DEV_RELEASE_SUFFIX}"
           echo "Git commit: $(git rev-parse HEAD)"
