@@ -796,6 +796,11 @@ def ssd_combined_fwd_varlen_musa_reference(
                     nheads, headdim, dstate, dtype=torch.float32, device=x.device
                 )
             else:
+                # Keep the recurrent accumulator in fp32 across a sequence.
+                # The Triton path materializes the requested state dtype at
+                # chunk boundaries; rounding every token would accumulate a
+                # different error profile and make final/intermediate states
+                # disagree with the native provider.
                 running = initial[sequence].clone()
             seen_sequences.add(sequence)
         else:
