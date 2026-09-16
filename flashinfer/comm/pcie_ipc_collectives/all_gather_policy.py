@@ -25,6 +25,7 @@ from enum import IntEnum
 from functools import lru_cache
 from typing import Optional
 
+from ...api_logging import flashinfer_api
 from ._constants import AG_RS_MAX_BLOCKS, AG_RS_MAX_THREADS, PACK_BYTES
 
 
@@ -88,6 +89,7 @@ def _is_launchable(
 
 
 @lru_cache(maxsize=None)
+@flashinfer_api
 def get_pcie_ipc_all_gather_launch_config(
     world_size: int,
     shard_numel: int,
@@ -95,7 +97,30 @@ def get_pcie_ipc_all_gather_launch_config(
     element_size: int = 2,
     ordered_4plus4: bool = False,
 ) -> Optional[PcieIpcAllGatherLaunchConfig]:
-    """Return a deterministic launch seed, or ``None`` if unsupported."""
+    """Return a deterministic all-gather launch seed.
+
+    Parameters
+    ----------
+    world_size : int
+        Number of ranks in the collective: 2, 4, or 8.
+    shard_numel : int
+        Number of input elements on each rank. The input must occupy a
+        positive, whole number of 16-byte packs.
+    max_blocks : int, optional
+        Workspace block capacity and launch-grid limit, from 1 to 64.
+    element_size : int, optional
+        Bytes per element: 2 for BF16/FP16 or 4 for FP32. Defaults to 2.
+    ordered_4plus4 : bool, optional
+        Whether topology discovery verified the supported TP8 placement with
+        logical ranks 0-3 and 4-7 forming the two four-GPU islands. This admits
+        the copy-engine variant; otherwise TP8 uses recursive doubling.
+
+    Returns
+    -------
+    Optional[PcieIpcAllGatherLaunchConfig]
+        Conservative launch configuration, or ``None`` for unsupported inputs.
+        This is a seed policy, not a device-specific tuning result.
+    """
     if world_size not in (2, 4, 8):
         return None
     if element_size not in (2, 4):

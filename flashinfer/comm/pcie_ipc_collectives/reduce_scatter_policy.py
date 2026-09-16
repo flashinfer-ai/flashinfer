@@ -24,6 +24,7 @@ from enum import IntEnum
 from functools import lru_cache
 from typing import Optional
 
+from ...api_logging import flashinfer_api
 from ._constants import AG_RS_MAX_BLOCKS, AG_RS_MAX_THREADS, PACK_BYTES
 
 
@@ -87,6 +88,7 @@ def _is_launchable(
 
 
 @lru_cache(maxsize=None)
+@flashinfer_api
 def get_pcie_ipc_reduce_scatter_launch_config(
     world_size: int,
     shard_numel: int,
@@ -94,7 +96,30 @@ def get_pcie_ipc_reduce_scatter_launch_config(
     element_size: int = 2,
     ordered_4plus4: bool = False,
 ) -> Optional[PcieIpcReduceScatterLaunchConfig]:
-    """Return a deterministic launch seed, or ``None`` if unsupported."""
+    """Return a deterministic reduce-scatter launch seed.
+
+    Parameters
+    ----------
+    world_size : int
+        Number of ranks in the collective: 2, 4, or 8.
+    shard_numel : int
+        Number of output elements on each rank, not the full reduction input.
+        The output must occupy a positive, whole number of 16-byte packs.
+    max_blocks : int, optional
+        Workspace block capacity and launch-grid limit, from 1 to 64.
+    element_size : int, optional
+        Bytes per element: 2 for BF16/FP16 or 4 for FP32. Defaults to 2.
+    ordered_4plus4 : bool, optional
+        Whether topology discovery verified the supported TP8 placement with
+        logical ranks 0-3 and 4-7 forming the two four-GPU islands. Required
+        for TP8; not required for TP2 or TP4.
+
+    Returns
+    -------
+    Optional[PcieIpcReduceScatterLaunchConfig]
+        Conservative launch configuration, or ``None`` for unsupported inputs
+        or TP8 placement. This is a seed policy, not a tuning result.
+    """
     if world_size not in (2, 4, 8):
         return None
     if element_size not in (2, 4):
