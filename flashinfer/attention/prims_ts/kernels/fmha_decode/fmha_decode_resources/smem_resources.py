@@ -1977,43 +1977,38 @@ class SmemKvResource(DecodeGenResourceBase):
                 num_chunks = head_dim_stage // chunk_hd
                 tile_chunk_elems = chunk_hd * cfg.tile_size_kv
                 page_chunk_elems = chunk_hd * cfg.num_tokens_per_page
-                if cutlass.const_expr(cached_page_ids is None):
-                    # Resolve the tile on every lane before the elected-lane
-                    # branch. The release compiler rejects a local that is
-                    # materialized only on the elected dynamic path.
-                    grouped_tile_idx = self._maybe_runtime_tile_idx(
-                        stage_info, local_tile_idx
-                    )
-                    page_ids = self.page_offsets_kv.page_ids(grouped_tile_idx)
-                else:
-                    page_ids = cached_page_ids
-                stage_base = self._stage_base(stage_info)
-                # Consume each cached page ID across every head-dimension
-                # chunk before advancing. The predicated helper elects the
-                # issuing lane without a dynamic DSL branch, keeping all local
-                # values type-stable at control-flow joins.
-                for page_frag in cutlass.range_constexpr(page_fragments):
-                    page_id = Int32(page_ids[page_frag])
-                    for chunk_idx in cutlass.range_constexpr(num_chunks):
-                        local_head_dim_offset = chunk_idx * chunk_hd
-                        global_head_dim_offset = (
-                            head_dim_stage_offset + local_head_dim_offset
-                        )
-                        local_tile_offset = chunk_idx * tile_chunk_elems
-                        smem_page_offset = Int32(
-                            local_tile_offset + page_frag * page_chunk_elems
-                        )
-                        _cp_async_bulk_tensor_4d_shared_cta_global_predicated(
-                            stage_base.subview(smem_page_offset),
-                            tma_desc,
-                            (
-                                Int32(global_head_dim_offset),
-                                Int32(0),
-                                logical_h_k_idx,
-                                page_id,
-                            ),
-                            stage_info.barrier,
-                        )
+                if prims.elect_sync():
+                    kv16_stage_base = self._stage_base(stage_info)
+                    if cutlass.const_expr(cached_page_ids is None):
+                        kv16_page_ids = self.page_offsets_kv.page_ids(grouped_tile_idx)
+                    else:
+                        kv16_page_ids = cached_page_ids
+                    # Consume each cached page ID across every head-dimension
+                    # chunk before advancing. The copies are independent, and
+                    # this order bounds coordinate live ranges in the unrolled
+                    # TMA sequence for every supported page size.
+                    for kv16_page_frag in cutlass.range_constexpr(page_fragments):
+                        kv16_page_id = Int32(kv16_page_ids[kv16_page_frag])
+                        for chunk_idx in cutlass.range_constexpr(num_chunks):
+                            local_head_dim_offset = chunk_idx * chunk_hd
+                            global_head_dim_offset = (
+                                head_dim_stage_offset + local_head_dim_offset
+                            )
+                            local_tile_offset = chunk_idx * tile_chunk_elems
+                            kv16_smem_page_offset = Int32(
+                                local_tile_offset + kv16_page_frag * page_chunk_elems
+                            )
+                            prims.cp_async_bulk_tensor_shared_cta_global(
+                                kv16_stage_base.subview(kv16_smem_page_offset),
+                                tma_desc,
+                                (
+                                    Int32(global_head_dim_offset),
+                                    Int32(0),
+                                    logical_h_k_idx,
+                                    kv16_page_id,
+                                ),
+                                stage_info.barrier,
+                            )
         elif cutlass.const_expr(cfg.use_fp8_kv):
             # Dense FP8 path: one tensor TMA loads the whole K or V tile.
             tile_idx = self._maybe_runtime_tile_idx(stage_info, local_tile_idx)
