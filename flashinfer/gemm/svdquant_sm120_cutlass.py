@@ -21,6 +21,7 @@ from ..autotuner import (
     TunableRunner,
     TuningConfig,
 )
+from ..autotuner.initializers import autotuner_initializer_empty
 from ..jit.gemm.svdquant_sm120 import gen_gemm_sm120_module_cutlass_nvfp4_svdquant
 from ..utils import (
     _get_cache_buf,
@@ -599,12 +600,14 @@ _NVFP4_SVDQUANT_GEMM_TUNING_CONFIG_EXACT = TuningConfig(
         ),
     ),
     constraint_specs=_SVDQUANT_CONSTRAINT_SPECS,
+    tensor_initializers=((9, autotuner_initializer_empty),),
 )
 
 
 _SM120_LINEAR_TUNING_CONFIG_COLD = TuningConfig(
     use_cuda_graph=False,
     use_cold_l2_cache=True,
+    tensor_initializers=((13, autotuner_initializer_empty),),
     constraint_specs=(
         ConstraintSpec(
             13,  # workspace size is scratch state, not part of the problem key
