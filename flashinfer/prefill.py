@@ -1975,7 +1975,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
     ...
 
 
-
     Note
     ----
     To accelerate computation, FlashInfer's batch prefill/append attention operators
@@ -3697,10 +3696,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._rope_theta = rope_theta
         return self.run_return_lse(q, paged_kv_cache, k_scale=k_scale, v_scale=v_scale)
 
-    def end_forward(self) -> None:
-        r"""Warning: this function is deprecated and has no effect."""
-        pass
-
 
 def _compute_mask_indptr(
     qo_indptr: torch.Tensor, kv_indptr: torch.Tensor
@@ -5326,10 +5321,6 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._rope_scale = rope_scale
         self._rope_theta = rope_theta
         return self.run_return_lse(q, k, v)
-
-    def end_forward(self) -> None:
-        r"""Warning: this function is deprecated and has no effect."""
-        pass
 
 
 def fmha_varlen_plan(
