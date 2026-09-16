@@ -58,15 +58,15 @@ def check_native_bf16_fp4(
         a.ndim != 2
         or a.dtype != torch.bfloat16
         or a.shape[1] != k
-        or not 1 <= a.shape[0] <= 16
+        or a.shape[0] < 1
         or not a.is_contiguous()
         or a.device != b.device
     ):
-        raise ValueError(
-            "cute-dsl-native requires contiguous BF16 A[M,K], 1 <= M <= 16"
-        )
+        raise ValueError("cute-dsl-native requires contiguous BF16 A[M,K], M >= 1")
     if a.numel() >= 2**31:
         raise ValueError("cute-dsl-native requires A below 2**31 elements")
+    if a.shape[0] * n >= 2**31:
+        raise ValueError("cute-dsl-native requires M*N below 2**31")
     dtype = out_dtype or a.dtype
     if dtype not in (torch.bfloat16, torch.float16):
         raise ValueError("cute-dsl-native requires BF16 or FP16 output")

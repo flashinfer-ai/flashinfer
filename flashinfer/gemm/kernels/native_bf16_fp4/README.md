@@ -28,15 +28,18 @@ alpha = quant_scale.reciprocal().reshape(1)
 y = flashinfer.mm_bf16_fp4(a, b, sf, alpha, backend="cute-dsl-native")
 ```
 
-Initial support: SM120/121, contiguous BF16 activations with 1 through 16
+Support: SM120/121, contiguous BF16 activations with a positive number of
 rows, contiguous uint8 weights `(N,K/2)`, positive N, K divisible by 16,
-and both N*K and M*K below 2**31. The scale buffer contains the padded 128x4 layout;
+and N*K, M*K and M*N below 2**31. The scale buffer contains the padded 128x4 layout;
 weight rows and output columns may have tails. Output is BF16 or FP16.
 Alpha is an optional live GPU float32 scalar with shape `(1,)`.
 
-CuTe DSL kernels consume the same buffers. For 16-byte-aligned inputs and K
-divisible by 64, asynchronous copies stage canonical weights, activations and
-scales in shared memory. Two or three buffers overlap loading with computation.
+CuTe DSL kernels consume the same buffers. Calls with M greater than 16 use
+a general kernel tiled across activation rows, without split-K scratch or
+weight preparation. This extends functional coverage; the specialized
+small-M kernels remain the performance focus. For M at most 16,
+16-byte-aligned inputs and K divisible by 64, asynchronous copies stage canonical
+weights, activations and scales in shared memory. Two or three buffers overlap loading with computation.
 Matrix loads feed BF16 tensor cores, while FP4 decoding and scaling happen in
 registers. Scalar-load MMA and SIMD kernels handle other alignments and K tails.
 All accumulate in FP32. CUDA 13.2 or newer compilers use direct packed conversions;
@@ -78,6 +81,7 @@ Trace export describes the canonical scale layout and BF16 or FP16 output.
 Run correctness tests with:
 
 ```bash
+.venv/bin/python -m pytest tests/gemm/test_mm_bf16_fp4.py -k cute-dsl-native -v
 .venv/bin/python -m pytest tests/gemm/test_native_bf16_fp4.py -v
 ```
 

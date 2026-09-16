@@ -95,7 +95,11 @@ class NativeBf16Fp4MmaKernel:
     def __call__(self, a, b, sf, alpha, out, partial, stream: cuda.CUstream):
         m, n = out.shape
         self.kernel(a, b, sf, alpha, out, partial).launch(
-            grid=(cute.ceil_div(n, 8 * self.warps * self.n_tiles), self.splits, 1),
+            grid=(
+                cute.ceil_div(n, 8 * self.warps * self.n_tiles) * cute.ceil_div(m, 16),
+                self.splits,
+                1,
+            ),
             block=(32 * self.warps, 1, 1),
             stream=stream,
             use_pdl=self.enable_pdl,
@@ -120,8 +124,11 @@ class NativeBf16Fp4MmaKernel:
     ):
         lane = cute.arch.lane_idx()
         warp = cute.arch.warp_idx()
-        bn, split, _ = cute.arch.block_idx()
+        tile, split, _ = cute.arch.block_idx()
+        n_blocks = cute.ceil_div(out.shape[1], 8 * self.warps * self.n_tiles)
+        bn, bm = tile % n_blocks, tile // n_blocks
         group, pair = lane // 4, lane % 4
+        a_row = bm * 16 + group
         n_base = (bn * self.warps + warp) * 8 * self.n_tiles
         m, k = a.shape
         n = out.shape[1]
@@ -161,15 +168,15 @@ class NativeBf16Fp4MmaKernel:
                     if k_base < k:
                         a0, a1, a2, a3 = Uint32(0), Uint32(0), Uint32(0), Uint32(0)
                         ak = k_base + pair * 2
-                        if group < m:
-                            a0 = pack_16bit_to_u32(a[group, ak], a[group, ak + 1])
-                            a2 = pack_16bit_to_u32(a[group, ak + 8], a[group, ak + 9])
-                        if group + 8 < m:
+                        if a_row < m:
+                            a0 = pack_16bit_to_u32(a[a_row, ak], a[a_row, ak + 1])
+                            a2 = pack_16bit_to_u32(a[a_row, ak + 8], a[a_row, ak + 9])
+                        if a_row + 8 < m:
                             a1 = pack_16bit_to_u32(
-                                a[group + 8, ak], a[group + 8, ak + 1]
+                                a[a_row + 8, ak], a[a_row + 8, ak + 1]
                             )
                             a3 = pack_16bit_to_u32(
-                                a[group + 8, ak + 8], a[group + 8, ak + 9]
+                                a[a_row + 8, ak + 8], a[a_row + 8, ak + 9]
                             )
                         for nt in cutlass.range_constexpr(self.n_tiles):
                             word = words0[nt]
@@ -205,7 +212,7 @@ class NativeBf16Fp4MmaKernel:
         for nt in cutlass.range_constexpr(self.n_tiles):
             for row in cutlass.range_constexpr(2):
                 for col in cutlass.range_constexpr(2):
-                    m_idx, out_n = group + row * 8, n_base + nt * 8 + pair * 2 + col
+                    m_idx, out_n = a_row + row * 8, n_base + nt * 8 + pair * 2 + col
                     value = acc[nt, row * 2 + col]
                     if m_idx < m and out_n < n:
                         if cutlass.const_expr(self.splits > 1):

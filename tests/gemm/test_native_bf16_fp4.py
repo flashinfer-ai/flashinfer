@@ -46,9 +46,10 @@ def make_case(m, n, k, seed=42):
         (2, 127, 64),
         (3, 129, 80),
         (4, 193, 192),
-        (7, 256, 512),
         (8, 129, 1024),
-        (16, 384, 1024),
+        (17, 129, 80),
+        (31, 513, 192),
+        (33, 127, 4112),
     ],
 )
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
@@ -117,7 +118,7 @@ def test_all_finite_e4m3_scales_preserve_fp4_values():
 
 
 @pytest.mark.parametrize("enable_pdl", [True, False])
-@pytest.mark.parametrize("m,n,k", [(3, 513, 512), (1, 129, 2048)])
+@pytest.mark.parametrize("m,n,k", [(3, 513, 512), (1, 129, 2048), (33, 129, 80)])
 def test_graph_replay_reads_live_alpha_and_inputs_on_current_stream(
     enable_pdl, m, n, k
 ):
@@ -166,6 +167,8 @@ def test_graph_replay_reads_live_alpha_and_inputs_on_current_stream(
         (2, 256, 1024, -0.5, torch.bfloat16),
         (4, 129, 768, 0.375, torch.bfloat16),
         (2, 256, 1024, 0.375, torch.float16),
+        (17, 129, 80, None, torch.bfloat16),
+        (33, 513, 192, -0.5, torch.float16),
     ],
 )
 def test_autotuned_tactic_matches_reference(m, n, k, alpha_value, out_dtype):

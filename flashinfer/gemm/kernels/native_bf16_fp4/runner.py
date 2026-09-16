@@ -94,7 +94,11 @@ def _compile(m, n, k, dtype, has_alpha, enable_pdl, tactic):
 
 def _can_stage(inputs):
     a, b, sf = inputs[:3]
-    return a.shape[1] % 64 == 0 and all(t.data_ptr() % 16 == 0 for t in (a, b, sf))
+    return (
+        a.shape[0] <= 16
+        and a.shape[1] % 64 == 0
+        and all(t.data_ptr() % 16 == 0 for t in (a, b, sf))
+    )
 
 
 class NativeBf16Fp4Runner(TunableRunner):
@@ -111,6 +115,8 @@ class NativeBf16Fp4Runner(TunableRunner):
     def get_valid_tactics(self, inputs, profile):
         m, k = inputs[0].shape
         n = inputs[1].shape[0]
+        if m > 16:
+            return [("mma", 4 if n >= 512 else 1, w, 1) for w in (4, 8)]
         rows = sorted({1, min(m, 2), min(m, 4)})
         simd_splits = (
             [s for s in (1, 2, 4, 8) if s <= (k + 255) // 256] if m == 1 else [1]
@@ -166,7 +172,9 @@ class NativeBf16Fp4Runner(TunableRunner):
         if not self.validate_tactic(inputs, tactic):
             raise ValueError("Invalid native W4A16 tactic")
         if tactic == -1:
-            if _can_stage(inputs):
+            if m > 16:
+                tactic = ("mma", 4 if n >= 512 else 1, 4, 1)
+            elif _can_stage(inputs):
                 tk = 128 if k % 128 == 0 else 64
                 splits = min(4 if n < 8192 else 1, k // tk)
                 tactic = ("staged", tk, 8 if n < 8192 else 4, splits, 3)

@@ -971,8 +971,8 @@ def _mm_bf16_fp4_native_init(
         raise NotImplementedError("native mm_bf16_fp4 init requires CUDA")
     if torch.cuda.get_device_capability(torch.device(device)) not in ((12, 0), (12, 1)):
         raise NotImplementedError("native mm_bf16_fp4 requires SM120/121")
-    if not 1 <= M <= 16 or block_size != 16:
-        raise NotImplementedError("native mm_bf16_fp4 requires M<=16 and block_size=16")
+    if M < 1 or block_size != 16:
+        raise NotImplementedError("native mm_bf16_fp4 requires M>=1 and block_size=16")
     torch.manual_seed(seed)
     a = torch.randn(M, K, dtype=torch.bfloat16, device=device)
     w = torch.randn(N, K, dtype=torch.bfloat16, device=device)
@@ -998,7 +998,7 @@ def _mm_bf16_fp4_native_trace(scale_ndim):
         name_prefix=f"mm_bf16_fp4_cute_dsl_native_sf{scale_ndim}d",
         description=(
             "BF16 x NVFP4 GEMM with canonical uint8 weights and padded 128x4-swizzled "
-            "E4M3 block scales on SM120/121. No alternate weight preparation; M<=16."
+            "E4M3 block scales on SM120/121. No alternate weight preparation; M>=1."
         ),
         axes={
             "M": Var(),
@@ -1028,7 +1028,7 @@ def _mm_bf16_fp4_native_trace(scale_ndim):
                 dtype_from_scalar="out_dtype",
             )
         },
-        constraints=["K == K_packed * 2", "block_size == 16", "1 <= M <= 16"],
+        constraints=["K == K_packed * 2", "block_size == 16", "M >= 1"],
         tags=["status:verified", "quantization:fp4"],
         reference=_mm_bf16_fp4_native_reference,
         check=_fp4_gemm_check,

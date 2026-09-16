@@ -73,9 +73,12 @@ def test_mm_bf16_fp4_reference_correctness(backend, shape_kwargs):
         torch.cuda.synchronize()
 
 
+@pytest.mark.parametrize("m", [3, 33])
 @pytest.mark.parametrize("scale_shape", [(1024,), (256, 4), (2, 1, 32, 4, 4)])
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
-def test_native_trace_preserves_layout_tails_and_output_dtype(scale_shape, out_dtype):
+def test_native_trace_preserves_layout_tails_and_output_dtype(
+    m, scale_shape, out_dtype
+):
     """Trace export must preserve physical scales instead of describing linear scales."""
     import flashinfer
     from flashinfer.trace.templates.gemm import mm_bf16_fp4_trace_dispatch
@@ -86,7 +89,7 @@ def test_native_trace_preserves_layout_tails_and_output_dtype(scale_shape, out_d
         (12, 1),
     ):
         pytest.skip("native W4A16 requires SM120/121")
-    a, b, sf, weight = make_case(3, 129, 48)
+    a, b, sf, weight = make_case(m, 129, 48)
     sf = sf.reshape(scale_shape)
     alpha = torch.tensor([0.375], device="cuda")
     kwargs = dict(
