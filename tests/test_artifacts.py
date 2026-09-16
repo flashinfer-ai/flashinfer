@@ -577,6 +577,39 @@ def test_download_artifacts_uses_env_retry(monkeypatch, tmp_path):
     assert kwargs_seen[0]["session"] is not None
 
 
+def test_download_artifacts_keeps_default_retry_without_env(monkeypatch, tmp_path):
+    """Retry count is left to download_file defaults when env var is unset."""
+    from flashinfer import artifacts
+
+    cubin_dir = tmp_path / "cubins"
+    monkeypatch.setattr(artifacts, "FLASHINFER_CUBIN_DIR", cubin_dir)
+    monkeypatch.setattr(artifacts, "FLASHINFER_CUBINS_REPOSITORY", "https://example/")
+    monkeypatch.setenv("FLASHINFER_CUBIN_DOWNLOAD_THREADS", "1")
+    monkeypatch.delenv("FLASHINFER_CUBIN_MAX_RETRIES", raising=False)
+
+    payload = b"downloaded"
+    monkeypatch.setattr(
+        artifacts,
+        "get_subdir_file_list",
+        lambda: iter([("pin/file.cubin", hashlib.sha256(payload).hexdigest())]),
+    )
+
+    kwargs_seen = []
+
+    def fake_download(_source, destination, **kwargs):
+        kwargs_seen.append(kwargs)
+        Path(destination).write_bytes(payload)
+        return True
+
+    monkeypatch.setattr(artifacts, "download_file", fake_download)
+
+    artifacts.download_artifacts()
+
+    assert len(kwargs_seen) == 1
+    assert "retries" not in kwargs_seen[0]
+    assert kwargs_seen[0]["session"] is not None
+
+
 def test_download_artifacts_rejects_bad_download_after_cache_miss(
     monkeypatch, tmp_path
 ):

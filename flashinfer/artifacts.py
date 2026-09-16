@@ -304,7 +304,7 @@ def download_artifacts() -> None:
     session = requests.Session()
     cubin_files = list[tuple[str, str]](get_subdir_file_list())
     num_threads = int(os.environ.get("FLASHINFER_CUBIN_DOWNLOAD_THREADS", "4"))
-    max_retries = int(os.environ.get("FLASHINFER_CUBIN_MAX_RETRIES", "10"))
+    max_retries = os.environ.get("FLASHINFER_CUBIN_MAX_RETRIES")
 
     cached_files: set[str] = set()
     files_to_download: list[tuple[str, str]] = []
@@ -340,12 +340,14 @@ def download_artifacts() -> None:
                 local_path = FLASHINFER_CUBIN_DIR / name
                 # Ensure parent directory exists
                 local_path.parent.mkdir(parents=True, exist_ok=True)
+                download_kwargs = {"session": session}
+                if max_retries is not None:
+                    download_kwargs["retries"] = int(max_retries)
                 fut = pool.submit(
                     download_file,
                     source,
                     str(local_path),
-                    retries=max_retries,
-                    session=session,
+                    **download_kwargs,
                 )
                 fut.add_done_callback(update_pbar_cb)
                 futures.append(fut)
