@@ -84,7 +84,6 @@ Core Operations
     :toctree: ../generated
 
     trtllm_allreduce_fusion
-    trtllm_custom_all_reduce
     trtllm_moe_allreduce_fusion
     trtllm_moe_finalize_allreduce_fusion
 
@@ -94,7 +93,6 @@ Workspace Management
 .. autosummary::
     :toctree: ../generated
 
-    trtllm_create_ipc_workspace_for_all_reduce
     trtllm_create_ipc_workspace_for_all_reduce_fusion
     trtllm_destroy_ipc_workspace_for_all_reduce
     trtllm_destroy_ipc_workspace_for_all_reduce_fusion

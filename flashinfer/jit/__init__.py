@@ -25,7 +25,6 @@ from .activation import gen_act_and_mul_module as gen_act_and_mul_module
 from .activation import get_act_and_mul_cu_str as get_act_and_mul_cu_str
 from .attention import gen_cudnn_fmha_module as gen_cudnn_fmha_module
 from .attention import gen_batch_attention_module as gen_batch_attention_module
-from .attention import gen_batch_decode_mla_module as gen_batch_decode_mla_module
 from .attention import gen_batch_decode_module as gen_batch_decode_module
 from .attention import gen_batch_mla_module as gen_batch_mla_module
 from .attention import gen_batch_prefill_module as gen_batch_prefill_module
@@ -47,7 +46,6 @@ from .attention import gen_pod_module as gen_pod_module
 from .attention import gen_single_decode_module as gen_single_decode_module
 from .attention import gen_single_prefill_module as gen_single_prefill_module
 from .attention import get_batch_attention_uri as get_batch_attention_uri
-from .attention import get_batch_decode_mla_uri as get_batch_decode_mla_uri
 from .attention import get_batch_decode_uri as get_batch_decode_uri
 from .attention import get_batch_mla_uri as get_batch_mla_uri
 from .attention import get_batch_prefill_uri as get_batch_prefill_uri
@@ -200,6 +198,9 @@ from .blackwell_bgmv_moe import (
 )
 from .monomoe import gen_monomoe_module as gen_monomoe_module
 from .monomoe import load_monomoe_module as load_monomoe_module
+from .fused_moe import (
+    gen_alphamoe_fused_router_module as gen_alphamoe_fused_router_module,
+)
 
 
 cuda_lib_path = os.environ.get(
