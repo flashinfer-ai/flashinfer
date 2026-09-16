@@ -1,6 +1,12 @@
 {
   "schema_version": 1,
   "created_at": "2026-09-16",
+  "live_ref_snapshot": {
+    "official_main": "711d3bc94e6d2130af8607320eec612899600084",
+    "fork_main": "313aebc27e2bd359fcca428c8597b16b4219b27c",
+    "fork_main_behind_official": 9,
+    "official_main_ahead_of_ac7": 81
+  },
   "integration": {
     "repository": "https://github.com/flashinfer-ai/flashinfer.git",
     "worktree": "/home/xiaodongye/ws/flashinfer-nemotron-musa",
@@ -8,7 +14,7 @@
     "official_base_commit": "ac7bce13ea0ff76392fd17aa696b096e191d0825",
     "official_base_tree": "73b1ce0e86040d051c1500e4a2d2509e7c903e1f",
     "official_base_parent": "43550a80857ea385f081b9cb1d019b137a96539d",
-    "migration_content_tip": "04234997"
+    "migration_content_tip": "c3b6eba6"
   },
   "official_base_submodules": {
     "3rd-party/cutlass": "8078b13ca63742cb0770662eccaf88a87dba4b95",
