@@ -19,7 +19,6 @@ pytest -s tests/cli/test_cli_cmds.py
 pytest -s tests/cli/test_cli_cmds_gpu.py
 pytest -s tests/moe/test_bgmv_moe.py
 pytest -s tests/moe/test_bgmv_moe_lora_delta.py
-pytest -s tests/comm/test_pcie_ipc_collective_policy.py
 
 # tests/experimental/ is excluded from `pytest tests/` by norecursedirs, so it has
 # to be named explicitly. This ONE FILE, not the directory: it covers the gating

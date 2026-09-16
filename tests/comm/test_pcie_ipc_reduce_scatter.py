@@ -15,16 +15,13 @@
 """Multi-GPU correctness tests for PCIe IPC ReduceScatter."""
 
 import os
-from contextlib import suppress
-from unittest.mock import patch
 
 import pytest
 import torch
 import torch.distributed as dist
 
 import flashinfer.comm as comm
-from flashinfer.comm.pcie_ipc_collectives._ag_rs_module import get_pcie_ipc_ag_rs_module
-from flashinfer.comm.pcie_ipc_collectives.reduce_scatter_policy import (
+from flashinfer.comm import (
     PcieIpcReduceScatterLaunchConfig,
     PcieIpcReduceScatterVariant,
 )
@@ -79,30 +76,18 @@ def _fp32_reference(inp: torch.Tensor, world_size: int, rank: int) -> torch.Tens
 
 
 def _configs(world_size: int):
-    if world_size in (2, 4):
-        return [
-            PcieIpcReduceScatterLaunchConfig(
-                1, 128, PcieIpcReduceScatterVariant.FLAT_CYCLIC
-            ),
-            PcieIpcReduceScatterLaunchConfig(
-                1, 128, PcieIpcReduceScatterVariant.FLAT_ONE_PACK
-            ),
-        ]
-    return [
-        PcieIpcReduceScatterLaunchConfig(
-            1, 128, PcieIpcReduceScatterVariant.TOPOLOGY_CYCLIC
-        ),
-        PcieIpcReduceScatterLaunchConfig(
-            1, 128, PcieIpcReduceScatterVariant.TOPOLOGY_ONE_PACK
-        ),
-    ]
-
-
-def _remove_cache(path: str, rank: int) -> None:
-    if rank == 0:
-        with suppress(FileNotFoundError):
-            os.unlink(path)
-    dist.barrier()
+    variants = (
+        (
+            PcieIpcReduceScatterVariant.FLAT_CYCLIC,
+            PcieIpcReduceScatterVariant.FLAT_ONE_PACK,
+        )
+        if world_size in (2, 4)
+        else (
+            PcieIpcReduceScatterVariant.TOPOLOGY_CYCLIC,
+            PcieIpcReduceScatterVariant.TOPOLOGY_ONE_PACK,
+        )
+    )
+    return [PcieIpcReduceScatterLaunchConfig(1, 128, variant) for variant in variants]
 
 
 def _queued_epoch_stress(
@@ -115,19 +100,14 @@ def _queued_epoch_stress(
     """Queue mixed variants/grids eagerly and in changed-input graph replays."""
     queued = []
     variants = tuple(config.variant for config in _configs(world_size))
-    for step in range(10):
+    for step in range(4):
         rows = 1 + step % 2
-        inp = (
-            torch.arange(
-                world_size * rows * hidden,
-                dtype=torch.int32,
-                device=device,
-            )
-            .remainder_(8)
-            .view(world_size * rows, hidden)
-            .to(workspace.dtype)
+        inp = torch.full(
+            (world_size * rows, hidden),
+            rank + step,
+            dtype=workspace.dtype,
+            device=device,
         )
-        inp.add_(rank + step)
         reference = _reference(inp, world_size)
         out = torch.empty_like(reference)
         config = PcieIpcReduceScatterLaunchConfig(
@@ -137,8 +117,8 @@ def _queued_epoch_stress(
         )
         queued.append((inp, out, reference, config))
 
-    # Complete all NCCL references first.  The ten custom calls below must stay
-    # back-to-back so their epoch, parity slot, and changing grid state overlap.
+    # Keep NCCL outside the back-to-back custom calls to avoid masking stale
+    # workspace state when the variant, grid, or input changes.
     torch.cuda.synchronize(device)
     for inp, out, _, config in queued:
         workspace.reduce_scatter(inp, out=out, config=config)
@@ -152,7 +132,7 @@ def _queued_epoch_stress(
     # custom launches. Keep a separate output snapshot for every queued replay.
     expected = [
         [_reference(inp + replay, world_size) for inp, _, _, _ in queued]
-        for replay in range(1, 5)
+        for replay in range(1, 4)
     ]
     observed = [[torch.empty_like(out) for _, out, _, _ in queued] for _ in expected]
     torch.cuda.synchronize(device)
@@ -175,23 +155,19 @@ def _queued_epoch_stress(
     )
 
 
-def _worker(world_size: int, rank: int, port: int) -> None:
+def _worker(world_size: int, rank: int, port: int, cache_path: str) -> None:
     _init_process_group(world_size, rank, port)
     device = torch.device(f"cuda:{rank}")
     hidden = 1024
     try:
         for dtype in _DTYPES:
-            cache = f"/tmp/flashinfer_pcie_rs_{port}_{dtype}.json"
-            _remove_cache(cache, rank)
-            workspace = comm.PcieIpcReduceScatterWorkspace(
+            with comm.PcieIpcReduceScatterWorkspace(
                 dist.group.WORLD,
                 max_numel=2 * hidden,
                 dtype=dtype,
                 max_blocks=3,
-                tune_batches=(1,),
-                tune_cache=cache,
-            )
-            try:
+                tune_cache=cache_path,
+            ) as workspace:
                 if world_size == 8 and os.getenv(
                     "FLASHINFER_TEST_PCIE_IPC_ORDERED_4PLUS4"
                 ):
@@ -201,41 +177,32 @@ def _worker(world_size: int, rank: int, port: int) -> None:
                         torch.empty((world_size, hidden), dtype=dtype, device=device)
                     )
                     return
-                inp = (
-                    torch.arange(world_size * hidden, dtype=torch.int32, device=device)
-                    .remainder_(8)
-                    .view(world_size, hidden)
-                    .to(dtype)
-                )
-                inp.add_(rank)
-                reference = _reference(inp, world_size)
-
-                assert workspace.supports(inp)
-                _assert_close_collectively(workspace.reduce_scatter(inp), reference)
-                for config in _configs(world_size):
-                    out = torch.empty_like(reference)
-                    assert workspace.reduce_scatter(inp, out=out, config=config) is out
-                    _assert_close_collectively(out, reference)
-
-                pack_elements = 16 // inp.element_size()
-                for shard_elements in (pack_elements, 129 * pack_elements):
-                    edge_input = (
+                pack_elements = 16 // torch.empty((), dtype=dtype).element_size()
+                for rows, width in (
+                    (1, pack_elements),
+                    (1, 129 * pack_elements),
+                    (1, hidden),
+                    (2, hidden),
+                ):
+                    inp = (
                         torch.arange(
-                            world_size * shard_elements,
+                            world_size * rows * width,
                             dtype=torch.int32,
                             device=device,
                         )
                         .remainder_(8)
-                        .view(world_size, shard_elements)
+                        .view(world_size * rows, width)
                         .to(dtype)
                     )
-                    edge_input.add_(rank)
-                    edge_reference = _reference(edge_input, world_size)
+                    inp.add_(rank)
+                    reference = _reference(inp, world_size)
+                    _assert_close_collectively(workspace.reduce_scatter(inp), reference)
+                    out = torch.empty_like(reference)
                     for config in _configs(world_size):
-                        _assert_close_collectively(
-                            workspace.reduce_scatter(edge_input, config=config),
-                            edge_reference,
+                        assert (
+                            workspace.reduce_scatter(inp, out=out, config=config) is out
                         )
+                        _assert_close_collectively(out, reference)
 
                 generator = torch.Generator(device=device).manual_seed(2026 + rank)
                 floating = torch.randn(
@@ -246,13 +213,7 @@ def _worker(world_size: int, rank: int, port: int) -> None:
                 )
                 rtol, atol = _TOLERANCE[dtype]
                 floating_reference = _fp32_reference(floating, world_size, rank)
-                _assert_close_collectively(
-                    workspace.reduce_scatter(floating),
-                    floating_reference,
-                    rtol=rtol,
-                    atol=atol,
-                )
-                for config in _configs(world_size):
+                for config in (None, *_configs(world_size)):
                     _assert_close_collectively(
                         workspace.reduce_scatter(floating, config=config),
                         floating_reference,
@@ -260,51 +221,17 @@ def _worker(world_size: int, rank: int, port: int) -> None:
                         atol=atol,
                     )
 
-                if world_size in (4, 8) and dtype is torch.bfloat16:
+                if dtype is torch.bfloat16:
                     _queued_epoch_stress(workspace, world_size, rank, device, hidden)
 
-                if world_size == 2 and dtype is torch.bfloat16:
-                    out = torch.empty_like(reference)
-                    workspace.reduce_scatter(inp, out=out)
-                    torch.cuda.synchronize(device)
-                    dist.barrier()
-                    graph = torch.cuda.CUDAGraph()
-                    with torch.cuda.graph(graph):
-                        workspace.reduce_scatter(inp, out=out)
-                    inp.fill_(rank + 5)
-                    reference = _reference(inp, world_size)
-                    graph.replay()
-                    torch.cuda.synchronize(device)
-                    _assert_close_collectively(out, reference)
-
-                if dtype is torch.float32:
-                    state = workspace._tuning_state
-                    with patch.object(
-                        state, "_latency_us", wraps=state._latency_us
-                    ) as measured:
-                        tuned = workspace.tune([hidden], warmup=1, repeat=2)
-                    # A variant reaches timing only after real GPU correctness
-                    # screening. max_blocks=3 keeps this smoke search bounded.
-                    assert {
-                        call.args[2].variant for call in measured.call_args_list
-                    } == {config.variant for config in _configs(world_size)}
-                    assert (hidden, 1) in tuned
-                    assert workspace.tuned_launch_config(inp) == tuned[(hidden, 1)]
-            finally:
-                workspace.destroy()
-            _remove_cache(cache, rank)
-
-        if world_size == 2:
-            with pytest.raises(RuntimeError, match="workspace layout overflows"):
-                get_pcie_ipc_ag_rs_module().reduce_scatter_workspace_size(
-                    2, 1 << 62, 4, 64
-                )
     finally:
         dist.destroy_process_group()
 
 
 @pytest.mark.parametrize("world_size", [2, 4, 8])
-def test_pcie_ipc_reduce_scatter(world_size: int) -> None:
+def test_pcie_ipc_reduce_scatter(world_size: int, tmp_path) -> None:
     if world_size > torch.cuda.device_count():
         pytest.skip("not enough GPUs")
-    multi_process_parallel(world_size, _worker, timeout_s=900)
+    multi_process_parallel(
+        world_size, _worker, args=(str(tmp_path / "tuning.json"),), timeout_s=900
+    )

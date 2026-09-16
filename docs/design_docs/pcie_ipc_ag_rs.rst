@@ -176,12 +176,9 @@ Validation coverage
 
 The GPU tests explicitly execute each admitted variant for BF16, FP16, and
 FP32, including a partial final pack batch. RS additionally compares every
-variant against an FP32 reference with dtype-appropriate tolerances. The tuner
-smoke tests use a small workspace and at most three blocks, retain every legal
-variant, and verify that each reaches real GPU timing after correctness
-screening.
+variant against an FP32 reference with dtype-appropriate tolerances.
 
-The TP4/TP8 graph tests queue mixed variants, changing grids and shapes, and
+The graph tests queue mixed variants, changing grids and shapes, and
 then replay captured sequences with changed inputs and independent output
 snapshots. On TP8, the live topology gate controls whether CE/topology variants
 are exercised. Set ``FLASHINFER_TEST_PCIE_IPC_ORDERED_4PLUS4=1`` on a designated
