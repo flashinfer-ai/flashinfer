@@ -301,8 +301,26 @@ def download_artifacts() -> None:
 
     cubin_files = list[tuple[str, str]](get_subdir_file_list())
     num_threads = int(os.environ.get("FLASHINFER_CUBIN_DOWNLOAD_THREADS", "4"))
-    max_retries = os.environ.get("FLASHINFER_CUBIN_MAX_RETRIES")
-    retry_window_seconds = int(os.environ.get("FLASHINFER_CUBIN_RETRY_WINDOW_SECONDS", "0"))
+    max_retries_env = os.environ.get("FLASHINFER_CUBIN_MAX_RETRIES")
+    if max_retries_env is None:
+        max_retries = None
+    else:
+        try:
+            max_retries = int(max_retries_env)
+        except ValueError as e:
+            raise RuntimeError(
+                "Invalid FLASHINFER_CUBIN_MAX_RETRIES value:"
+                f" {max_retries_env!r}. Expected an integer."
+            ) from e
+
+    retry_window_env = os.environ.get("FLASHINFER_CUBIN_RETRY_WINDOW_SECONDS", "0")
+    try:
+        retry_window_seconds = int(retry_window_env)
+    except ValueError as e:
+        raise RuntimeError(
+            "Invalid FLASHINFER_CUBIN_RETRY_WINDOW_SECONDS value:"
+            f" {retry_window_env!r}. Expected an integer."
+        ) from e
     retry_deadline = (
         time.monotonic() + retry_window_seconds if retry_window_seconds > 0 else None
     )
@@ -372,7 +390,7 @@ def download_artifacts() -> None:
                 local_path.parent.mkdir(parents=True, exist_ok=True)
                 download_kwargs: dict[str, object] = {}
                 if max_retries is not None:
-                    download_kwargs["retries"] = int(max_retries)
+                    download_kwargs["retries"] = max_retries
                 fut = pool.submit(
                     _download_within_retry_window,
                     source,

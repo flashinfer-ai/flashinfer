@@ -673,6 +673,21 @@ def test_download_artifacts_fails_when_retry_window_expires(monkeypatch, tmp_pat
         artifacts.download_artifacts()
 
 
+def test_download_artifacts_invalid_retry_window_env_raises(monkeypatch, tmp_path):
+    """Invalid retry-window env values fail with a clear config error."""
+    from flashinfer import artifacts
+
+    cubin_dir = tmp_path / "cubins"
+    monkeypatch.setattr(artifacts, "FLASHINFER_CUBIN_DIR", cubin_dir)
+    monkeypatch.setenv("FLASHINFER_CUBIN_RETRY_WINDOW_SECONDS", "abc")
+    monkeypatch.setattr(artifacts, "get_subdir_file_list", lambda: iter([]))
+
+    with pytest.raises(
+        RuntimeError, match="Invalid FLASHINFER_CUBIN_RETRY_WINDOW_SECONDS value"
+    ):
+        artifacts.download_artifacts()
+
+
 def test_download_artifacts_rejects_bad_download_after_cache_miss(
     monkeypatch, tmp_path
 ):
