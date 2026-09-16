@@ -201,16 +201,18 @@ class TmemTranspose16x32:
         for r in range(16):
             self.output[r] = self._src_regs[self._PermR1[r]]
 
-    def r1_store(self) -> None:
+    def r1_store(self, _wait: cutlass.Constexpr[bool] = True) -> None:
         # Scratch rounds reuse the same TMEM. Complete prior loads before
         # overwriting it, and this store before the next round's loads.
-        cute.arch.fence_view_async_tmem_load()
+        if cutlass.const_expr(_wait):
+            cute.arch.fence_view_async_tmem_load()
         cute.copy(
             self._atom_st16x128,
             self._rmem_copy_view(self.output, 16),
             self._tmem_src_full,
         )
-        cute.arch.fence_view_async_tmem_store()
+        if cutlass.const_expr(_wait):
+            cute.arch.fence_view_async_tmem_store()
 
     # -- R2 ------------------------------------------------------------------
 
@@ -221,14 +223,16 @@ class TmemTranspose16x32:
             self._rmem_copy_view(self._src_regs, 16),
         )
 
-    def r2_store(self) -> None:
-        cute.arch.fence_view_async_tmem_load()
+    def r2_store(self, _wait: cutlass.Constexpr[bool] = True) -> None:
+        if cutlass.const_expr(_wait):
+            cute.arch.fence_view_async_tmem_load()
         cute.copy(
             self._atom_st32x32,
             self._rmem_copy_view(self._src_regs, 16),
             self._tmem_dst_full,
         )
-        cute.arch.fence_view_async_tmem_store()
+        if cutlass.const_expr(_wait):
+            cute.arch.fence_view_async_tmem_store()
 
     # -- R3 ------------------------------------------------------------------
 
@@ -250,14 +254,16 @@ class TmemTranspose16x32:
         for r in range(16):
             self.output[r] = self._src_regs[self._PermR3[r]]
 
-    def r3_store(self) -> None:
-        cute.arch.fence_view_async_tmem_load()
+    def r3_store(self, _wait: cutlass.Constexpr[bool] = True) -> None:
+        if cutlass.const_expr(_wait):
+            cute.arch.fence_view_async_tmem_load()
         cute.copy(
             self._atom_st32x32,
             self._rmem_copy_view(self.output, 16),
             self._tmem_dst_full,
         )
-        cute.arch.fence_view_async_tmem_store()
+        if cutlass.const_expr(_wait):
+            cute.arch.fence_view_async_tmem_store()
 
     # -- R4 ------------------------------------------------------------------
 
@@ -279,19 +285,38 @@ class TmemTranspose16x32:
         for r in range(16):
             self.output[r] = self._src_regs[self._PermR4[r]]
 
-    def from_r1_perm_until_last_store(self) -> cute.Tensor:
+    def _transpose_pair(self, other) -> Tuple[cute.Tensor, cute.Tensor]:
+        # FC2 halves use disjoint 32-column scratch regions. Share each
+        # completion wait across both halves before advancing the round.
         self.r1_perm()
-        self.r1_store()
+        other.r1_perm()
+        cute.arch.fence_view_async_tmem_load()
+        self.r1_store(_wait=False)
+        other.r1_store(_wait=False)
+        cute.arch.fence_view_async_tmem_store()
         self.r2_load()
-        self.r2_store()
+        other.r2_load()
+        cute.arch.fence_view_async_tmem_load()
+        self.r2_store(_wait=False)
+        other.r2_store(_wait=False)
+        cute.arch.fence_view_async_tmem_store()
         self.r3_load_top()
         self.r3_load_bot()
+        other.r3_load_top()
+        other.r3_load_bot()
         self.r3_perm()
-        self.r3_store()
+        other.r3_perm()
+        cute.arch.fence_view_async_tmem_load()
+        self.r3_store(_wait=False)
+        other.r3_store(_wait=False)
+        cute.arch.fence_view_async_tmem_store()
         self.r4_load_top()
         self.r4_load_bot()
         self.r4_perm()
-        return self.output
+        other.r4_load_top()
+        other.r4_load_bot()
+        other.r4_perm()
+        return self.output, other.output
 
 
 @dataclasses.dataclass(frozen=True)
@@ -526,14 +551,17 @@ def fc2_stg_post_f2fp_reorder(
     packed_i32 = cute.recast_tensor(packed, cutlass.Float32)  # (32,): 16 i32 per half
 
     # Reuse the 32-bit transpose: each i32 slot carries one packed bf16x2 pair.
-    token_0_32_pre_scatter_back = TmemTranspose16x32(
+    first = TmemTranspose16x32(
         tmem_subtile_view.iterator,
         reg_tensor=cute.composition(packed_i32, (16,)),
-    ).from_r1_perm_until_last_store()
-    token_32_64_pre_scatter_back = TmemTranspose16x32(
+    )
+    second = TmemTranspose16x32(
         tmem_subtile_view.iterator + 32,
         reg_tensor=cute.composition(cute.domain_offset(16, packed_i32), (16,)),
-    ).from_r1_perm_until_last_store()
+    )
+    token_0_32_pre_scatter_back, token_32_64_pre_scatter_back = first._transpose_pair(
+        second
+    )
     cute.autovec_copy(
         token_0_32_pre_scatter_back, cute.zipped_divide(packed_i32, (16,))[None, 0]
     )
