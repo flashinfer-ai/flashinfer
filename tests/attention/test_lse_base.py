@@ -14,11 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-"""``lse_base`` on the prefill wrappers.
+"""``lse_base`` and ``lse_layout`` on the prefill wrappers.
 
-The default (``"log2"``) must stay bit-identical to what the wrappers returned
-before the option existed; ``"ln"`` must equal ``torch.logsumexp`` of the
-scaled scores on every backend, and equal the base-2 result times ``ln 2``.
+The defaults (``"log2"``, ``"NH"``) must stay bit-identical to what the wrappers
+returned before the options existed; ``"ln"`` must equal ``torch.logsumexp`` of
+the scaled scores on every backend and equal the base-2 result times ``ln 2``;
+``"HN"`` must be the contiguous transpose of ``"NH"`` in either base.
 """
 
 import pytest
@@ -101,6 +102,26 @@ def _check(lse_default, lse_log2, lse_ln, ref_ln):
     torch.testing.assert_close(lse_ln, lse_log2 * ln2, atol=1e-5, rtol=1e-6)
 
 
+def _check_hn(run, lse_log2_nh, lse_ln_nh, n_tokens):
+    """``"HN"`` in both bases: contiguous ``[heads, tokens]``, equal to the NH transpose."""
+    for base, nh in (("log2", lse_log2_nh), ("ln", lse_ln_nh)):
+        _, hn = run(lse_base=base, lse_layout="HN")
+        assert hn.shape == (H_QO, n_tokens) and hn.is_contiguous()
+        torch.testing.assert_close(hn, nh.t(), atol=0, rtol=0)
+    # caller-provided [heads, tokens] buffer, and a wrong-shape one
+    buf = torch.empty(H_QO, n_tokens, dtype=torch.float32, device="cuda")
+    _, hn = run(lse_base="ln", lse_layout="HN", lse=buf)
+    assert hn is buf
+    torch.testing.assert_close(buf, lse_ln_nh.t(), atol=0, rtol=0)
+    with pytest.raises(ValueError):
+        run(
+            lse_layout="HN",
+            lse=torch.empty(n_tokens, H_QO, dtype=torch.float32, device="cuda"),
+        )
+    with pytest.raises(ValueError, match="lse_layout"):
+        run(lse_layout="TH")
+
+
 @pytest.mark.parametrize("backend", _ragged_backends())
 @pytest.mark.parametrize("causal", [True, False])
 def test_ragged_lse_base(backend, causal):
@@ -140,6 +161,10 @@ def test_ragged_lse_base(backend, causal):
 
     with pytest.raises(ValueError, match="lse_base"):
         w.run(q, k, v, return_lse=True, lse_base="e")
+
+    _check_hn(
+        lambda **kw: w.run(q, k, v, return_lse=True, **kw), lse_log2, lse_ln, q.shape[0]
+    )
 
 
 def _paged_kv(k, v, kv_indptr, lens):
@@ -223,3 +248,10 @@ def test_paged_lse_base(backend, causal):
 
     with pytest.raises(ValueError, match="lse_base"):
         w.run(q, (k_cache, v_cache), return_lse=True, lse_base="e")
+
+    _check_hn(
+        lambda **kw: w.run(q, (k_cache, v_cache), return_lse=True, **kw),
+        lse_log2,
+        lse_ln,
+        q.shape[0],
+    )

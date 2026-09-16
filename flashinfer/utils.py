@@ -70,6 +70,16 @@ def check_lse_base(lse_base: str) -> None:
         raise ValueError(f"lse_base must be one of {LSE_BASES}, got {lse_base!r}")
 
 
+# Layouts the LSE can be returned in: "NH" = [total_tokens, num_qo_heads] (default,
+# what the kernels write), "HN" = [num_qo_heads, total_tokens], contiguous.
+LSE_LAYOUTS = ("NH", "HN")
+
+
+def check_lse_layout(lse_layout: str) -> None:
+    if lse_layout not in LSE_LAYOUTS:
+        raise ValueError(f"lse_layout must be one of {LSE_LAYOUTS}, got {lse_layout!r}")
+
+
 class GPUArchitectureError(Exception):
     """Custom exception for GPU architecture-related errors."""
 

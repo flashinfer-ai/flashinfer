@@ -84,6 +84,7 @@ from .utils import (
     canonicalize_torch_dtype,
     ceil_div,
     check_lse_base,
+    check_lse_layout,
     check_shape_dtype_device,
     determine_attention_backend,
     device_support_pdl,
@@ -104,11 +105,30 @@ from .utils import (
 )
 
 
-def _lse_to_base(lse: torch.Tensor, lse_base: str) -> torch.Tensor:
-    """Kernels emit base-2 LSE; rescale in place for callers that asked for ``"ln"``."""
+def _finish_lse(
+    lse: torch.Tensor,
+    lse_base: str,
+    lse_layout: str,
+    lse_out: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Kernels write base-2 LSE as ``[tokens, heads]``; deliver the requested base and layout.
+
+    ``lse_out`` is the caller's buffer in the requested layout, if any. ``"NH"`` is
+    finished in place; ``"HN"`` is one fused transpose(+rescale) into a contiguous
+    ``[heads, tokens]`` tensor.
+    """
+    if lse_layout == "NH":
+        if lse_base == "ln":
+            lse.mul_(ln2)
+        return lse
+    src = lse.t()
+    if lse_out is None:
+        lse_out = torch.empty(src.shape, dtype=lse.dtype, device=lse.device)
     if lse_base == "ln":
-        lse.mul_(ln2)
-    return lse
+        torch.mul(src, ln2, out=lse_out)
+    else:
+        lse_out.copy_(src)
+    return lse_out
 
 
 def _split_scale_param(scale):
@@ -3143,6 +3163,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         lse: Optional[torch.Tensor] = None,
         return_lse: Literal[False] = False,
         lse_base: str = "log2",
+        lse_layout: str = "NH",
         enable_pdl: Optional[bool] = None,
         window_left: Optional[int] = None,
         sinks: Optional[torch.Tensor] = None,
@@ -3166,6 +3187,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         lse: Optional[torch.Tensor] = None,
         return_lse: Literal[True] = True,
         lse_base: str = "log2",
+        lse_layout: str = "NH",
         enable_pdl: Optional[bool] = None,
         window_left: Optional[int] = None,
         sinks: Optional[torch.Tensor] = None,
@@ -3190,6 +3212,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         lse: Optional[torch.Tensor] = None,
         return_lse: bool = False,
         lse_base: str = "log2",
+        lse_layout: str = "NH",
         enable_pdl: Optional[bool] = None,
         window_left: Optional[int] = None,
         sinks: Optional[torch.Tensor] = None,
@@ -3240,6 +3263,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
             or ``"ln"`` (natural log, the ``torch.logsumexp`` convention that merge
             kernels written with ``expf`` consume). ``"ln"`` lets the cuDNN backend hand
             out its native stats without a conversion kernel; the other backends rescale.
+        lse_layout : str
+            Layout of the returned ``lse``: ``"NH"`` (default) is
+            ``[qo_indptr[-1], num_qo_heads]``, ``"HN"`` is the contiguous transpose
+            ``[num_qo_heads, qo_indptr[-1]]`` (one fused transpose + rescale kernel).
+            A caller-provided :attr:`lse` must have the requested layout.
         enable_pdl : bool
             Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
             Only effective on backends and devices that support PDL.
@@ -3302,6 +3330,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             enable_pdl = device_support_pdl(q.device)
         k_cache, v_cache = _unpack_paged_kv_cache(paged_kv_cache, self._kv_layout)
         check_lse_base(lse_base)
+        check_lse_layout(lse_layout)
         _check_cached_qkv_data_type(
             q, k_cache, self._cached_q_data_type, self._cached_kv_data_type
         )
@@ -3403,6 +3432,15 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     device=q.device,
                 )
             assert self._prims_backend is not None
+            lse_out = None
+            if return_lse and lse_layout == "HN":
+                # the kernel writes [tokens, heads]; a caller's [heads, tokens]
+                # buffer is the destination of the final transpose
+                if lse is not None:
+                    check_shape_dtype_device(
+                        lse, (q.size(1), q.size(0)), torch.float32, q.device, "lse"
+                    )
+                lse_out, lse = lse, None
             res = self._prims_backend.run_paged(
                 q,
                 k_cache,
@@ -3416,7 +3454,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 v_scale=v_scale,
             )
             if isinstance(res, tuple):
-                _lse_to_base(res[1], lse_base)
+                return res[0], _finish_lse(res[1], lse_base, lse_layout, lse_out)
             return res
 
         check_trtllm_gen_sm107_only_feature(
@@ -3468,7 +3506,17 @@ class BatchPrefillWithPagedKVCacheWrapper:
             rope_scale = 1.0
         if rope_theta is None:
             rope_theta = 1e4
+        lse_out = None
         if return_lse:
+            if lse_layout == "HN":
+                # kernels write [tokens, heads]; a caller's buffer is the
+                # [heads, tokens] destination of the final transpose
+                if lse is not None:
+                    check_shape_dtype_device(
+                        lse, (q.size(1), q.size(0)), torch.float32, q.device, "lse"
+                    )
+                lse_out = lse
+                lse = None
             if lse is None:
                 lse = torch.empty(
                     (q.size(0), q.size(1)), dtype=torch.float32, device=q.device
@@ -3695,8 +3743,14 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 else:
                     out *= v_scale
 
-        if return_lse and self._backend != "cudnn":
-            _lse_to_base(lse, lse_base)
+        if return_lse:
+            # cuDNN already produced the requested base
+            lse = _finish_lse(
+                lse,
+                "log2" if self._backend == "cudnn" else lse_base,
+                lse_layout,
+                lse_out,
+            )
         return (out, lse) if return_lse else out
 
     run_return_lse = functools.partialmethod(run, return_lse=True)
@@ -4809,6 +4863,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         lse: Optional[torch.Tensor] = None,
         return_lse: Literal[False] = False,
         lse_base: str = "log2",
+        lse_layout: str = "NH",
         enable_pdl: Optional[bool] = None,
         kv_cache_sf: Optional[
             Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
@@ -4826,6 +4881,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         lse: Optional[torch.Tensor] = None,
         return_lse: Literal[True] = True,
         lse_base: str = "log2",
+        lse_layout: str = "NH",
         enable_pdl: Optional[bool] = None,
         kv_cache_sf: Optional[
             Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
@@ -4847,6 +4903,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         lse: Optional[torch.Tensor] = None,
         return_lse: bool = False,
         lse_base: str = "log2",
+        lse_layout: str = "NH",
         enable_pdl: Optional[bool] = None,
         kv_cache_sf: Optional[
             Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
@@ -4885,6 +4942,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             or ``"ln"`` (natural log, the ``torch.logsumexp`` convention that merge
             kernels written with ``expf`` consume). ``"ln"`` lets the cuDNN backend hand
             out its native stats without a conversion kernel; the other backends rescale.
+        lse_layout : str
+            Layout of the returned ``lse``: ``"NH"`` (default) is
+            ``[qo_indptr[-1], num_qo_heads]``, ``"HN"`` is the contiguous transpose
+            ``[num_qo_heads, qo_indptr[-1]]`` (one fused transpose + rescale kernel).
+            A caller-provided :attr:`lse` must have the requested layout.
         enable_pdl : bool
             Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
             Only effective on backends and devices that support PDL.
@@ -4906,6 +4968,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q.device)
         check_lse_base(lse_base)
+        check_lse_layout(lse_layout)
         _check_cached_qkv_data_type(
             q, k, self._cached_q_data_type, self._cached_kv_data_type
         )
@@ -4954,7 +5017,17 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             rope_scale = 1.0
         if rope_theta is None:
             rope_theta = 1e4
+        lse_out = None
         if return_lse:
+            if lse_layout == "HN":
+                # kernels write [tokens, heads]; a caller's buffer is the
+                # [heads, tokens] destination of the final transpose
+                if lse is not None:
+                    check_shape_dtype_device(
+                        lse, (q.size(1), q.size(0)), torch.float32, q.device, "lse"
+                    )
+                lse_out = lse
+                lse = None
             if lse is None:
                 lse = torch.empty(
                     (q.size(0), q.size(1)), dtype=torch.float32, device=q.device
@@ -5029,7 +5102,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 k_scale=k_scale,
                 v_scale=v_scale,
             )
-            return (out, _lse_to_base(lse, lse_base)) if return_lse else out
+            return (
+                (out, _finish_lse(lse, lse_base, lse_layout, lse_out))
+                if return_lse
+                else out
+            )
         elif self._backend == "fmha_v2":
             if return_lse:
                 raise NotImplementedError(
@@ -5173,7 +5250,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 out=out,
                 lse=lse,
             )
-            return (out, _lse_to_base(lse, lse_base)) if return_lse else out
+            return (
+                (out, _finish_lse(lse, lse_base, lse_layout, lse_out))
+                if return_lse
+                else out
+            )
         elif self._backend == "cudnn":
             # cuDNN's ragged prefill graph has no kv_layout input and reads
             # k.shape[1] as the kv head count, i.e. it assumes NHD. Reject HND
@@ -5237,8 +5318,12 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 o_data_type=out_dtype,
             )
 
-            # lse already in the requested base (cudnn_batch_prefill_with_kv_cache)
-            return (out, lse) if return_lse else out
+            # base already handled inside cudnn_batch_prefill_with_kv_cache
+            return (
+                (out, _finish_lse(lse, "log2", lse_layout, lse_out))
+                if return_lse
+                else out
+            )
         elif self._backend == "cutile":
             if any(s is not None for s in (q_scale, k_scale, v_scale, o_scale)):
                 raise NotImplementedError(
@@ -5272,7 +5357,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 out_lse=lse if return_lse else None,
             )
             return (
-                (out_ragged, _lse_to_base(lse_ragged, lse_base))
+                (out_ragged, _finish_lse(lse_ragged, lse_base, lse_layout, lse_out))
                 if return_lse
                 else out_ragged
             )
@@ -5354,7 +5439,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         if apply_kv_scales and v_scale is not None and not is_float_one:
             out *= v_scale
 
-        return (out, _lse_to_base(lse, lse_base)) if return_lse else out
+        return (
+            (out, _finish_lse(lse, lse_base, lse_layout, lse_out))
+            if return_lse
+            else out
+        )
 
     run_return_lse = functools.partialmethod(run, return_lse=True)
 
