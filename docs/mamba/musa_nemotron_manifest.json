@@ -1,0 +1,98 @@
+{
+  "schema_version": 1,
+  "created_at": "2026-09-16",
+  "integration": {
+    "repository": "https://github.com/flashinfer-ai/flashinfer.git",
+    "worktree": "/home/xiaodongye/ws/flashinfer-nemotron-musa",
+    "branch": "codex/nemotron-musa-backend",
+    "official_base_commit": "ac7bce13ea0ff76392fd17aa696b096e191d0825",
+    "official_base_tree": "73b1ce0e86040d051c1500e4a2d2509e7c903e1f",
+    "official_base_parent": "43550a80857ea385f081b9cb1d019b137a96539d",
+    "migration_tip_before_manifest": "31c34e35fd24f40be25f25efc409f215f07cc739"
+  },
+  "official_base_submodules": {
+    "3rd-party/cutlass": "8078b13ca63742cb0770662eccaf88a87dba4b95",
+    "3rd-party/cutlass4": "c11f0da9a7dd70c5b801cd32fe507f8474e15991",
+    "3rd-party/dlpack": "5c210da409e7f1e51a5a6d66568d3f491920191d",
+    "3rd-party/googletest": "f8d7d77c06936315286eb55f8de22cd23c188571",
+    "3rd-party/spdlog": "7c02e204c92545f869e2f04edaab1f19fe8b19fd"
+  },
+  "consumer": {
+    "repository": "https://github.com/MooreThreads/vllm-musa.git",
+    "merged_nemotron_pr": 234,
+    "merged_nemotron_commit": "9a90ece5837599d5bf68c6ba3b1891f86c579f71",
+    "pinned_vllm_commit": "2cf0a6915ce544dc493a0990f2ea38d81601128a",
+    "pinned_flashinfer_commit": "bc29697ba20b7e6bdb728ded98f04788e16ee021",
+    "provider_stack_pr": 233,
+    "historical_closed_pr": 228,
+    "independent_ssd_pr": 238
+  },
+  "validation_stack": {
+    "image": "sh-harbor.mthreads.com/mcctest/vllm:v0.28.0-ph1-5.2.0-torch2.11.0.post1-20260911",
+    "image_digest": "sha256:444f07ae7b52f9a2b4bacc8ec912e86739e4bc6dc004751b7394a6e983d7a9a4",
+    "hardware": "MTT S5000",
+    "torch": "2.11.0.post1+musa5.2.0",
+    "torch_musa": "2.11.0.post1+musa5.2.0",
+    "triton": "3.2.0",
+    "triton_upgrade_owner": "separate effort"
+  },
+  "migration_source": {
+    "repository": "https://github.com/yeahdongcn/flashinfer.git",
+    "snapshot_root_commit": "d42c030fdff30e31b51dfa3b7bc73f41ffd7209b",
+    "snapshot_root_tree": "667359de2a062568ef47551024eadb7c65676049",
+    "local_review_source_commit": "887d0a1d489fbf72445cb5246bb0a95adf291420",
+    "published_simple_stp_commit": "c38726dd514664a40ef3b3f4580a7a7b378a983d",
+    "generic_provider_source_commit": "2cd3560b",
+    "accepted_native_source_commit": "b8bb644"
+  },
+  "migration_commits": [
+    {
+      "commit": "a5660e22",
+      "scope": "generic MUSA SSU and SSD providers"
+    },
+    {
+      "commit": "698ad921",
+      "scope": "generic provider contract tests"
+    },
+    {
+      "commit": "c240cc52",
+      "scope": "S5000 native 128-thread Simple STP, loader, and custom op"
+    },
+    {
+      "commit": "0b75b0cb",
+      "scope": "native Simple STP contract tests"
+    },
+    {
+      "commit": "31c34e35",
+      "scope": "Nemotron-shaped MUSA benchmarks"
+    }
+  ],
+  "branch_inventory": {
+    "accepted_migration_input": [
+      "musa/mamba-ssd provider state through 2cd3560b",
+      "musa/simple-stp-s5000 native state through b8bb644"
+    ],
+    "superseded_experiments": [
+      "musa/ssu-tiled",
+      "musa/ssu-tiled-stack",
+      "musa/ssu-numwarps-d16",
+      "musa/ssu-d16-candidate",
+      "musa/ssd-scan-plus",
+      "musa/ssd-scan-musa-config"
+    ],
+    "rejected": [
+      "codex/stormeye-512-experiment: slower than the retained 128-thread kernel on local S5000",
+      "deprecated axis-swapped SSU and SSD dashboard problems"
+    ],
+    "pending_runtime_review": [
+      "887d0a1 SSD autotune-key specialization",
+      "corrected output-only SSD MUSA-C candidates",
+      "causal-conv candidates owned by the adjacent vLLM/MATE slice"
+    ]
+  },
+  "provenance_limits": [
+    "The migration source has no common ancestor with official upstream.",
+    "Its Mamba blobs match the official base, but the whole snapshot differs at 45 paths.",
+    "This manifest records source identity; it does not attest the new integration head until runtime tests are rerun."
+  ]
+}
