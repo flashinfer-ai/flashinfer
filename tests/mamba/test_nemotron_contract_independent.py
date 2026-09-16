@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from flashinfer.mamba import selective_state_update
+from flashinfer.mamba.musa_ssu_native import musa_ssu_one_token_native
 
 from .utils import TEST_DEVICE
 
@@ -75,3 +76,61 @@ def test_stp_group_mapping_and_src_dst_against_fp32_oracle():
         state[dst].float(), expected_state[dst], rtol=0.04, atol=0.04
     )
     torch.testing.assert_close(state[src], original[src], rtol=0, atol=0)
+
+
+@pytest.mark.skipif(TEST_DEVICE != "musa", reason="MUSA contract test")
+@pytest.mark.skipif(
+    __import__("os").environ.get("FLASHINFER_MUSA_SIMPLE_STP_NATIVE") != "1",
+    reason="native extension is opt-in",
+)
+def test_native_nemotron_recurrence_against_independent_fp32_oracle():
+    torch.manual_seed(1902)
+    device = torch.device(TEST_DEVICE)
+    heads, dim, dstate, groups, slots = 64, 64, 128, 8, 8
+    state = torch.randn(slots, heads, dim, dstate, device=device, dtype=torch.float16)
+    original = state.clone()
+    x = torch.randn(1, heads, dim, device=device, dtype=torch.bfloat16)
+    dt_head = torch.randn(heads, device=device, dtype=torch.float32) * 0.1
+    dt = dt_head[None, :, None].expand(1, heads, dim)
+    a_head = -torch.rand(heads, device=device, dtype=torch.float32) - 1
+    A = a_head[:, None, None].expand(heads, dim, dstate)
+    B = torch.empty(1, groups, dstate, device=device, dtype=torch.bfloat16)
+    C = torch.empty_like(B)
+    for group in range(groups):
+        B[:, group].fill_(group + 1)
+        C[:, group].fill_(group + 2)
+    D = torch.randn(heads, device=device, dtype=torch.bfloat16)
+    src = torch.tensor([1], device=device, dtype=torch.int32)
+    dst = torch.tensor([6], device=device, dtype=torch.int32)
+    out = torch.empty_like(x)
+    musa_ssu_one_token_native(
+        state,
+        x,
+        dt,
+        A,
+        B,
+        C,
+        D,
+        src,
+        dst,
+        None,
+        None,
+        False,
+        -1,
+        out,
+        None,
+        0,
+    )
+
+    expected_state = original.float()
+    expected = torch.empty((1, heads, dim), device=device, dtype=torch.float32)
+    for h in range(heads):
+        group = h // (heads // groups)
+        running = original[1, h].float() * torch.exp(a_head[h] * dt_head[h])
+        running = running + dt_head[h] * x[0, h].float()[:, None] * B[0, group].float()[None, :]
+        expected_state[6, h] = running
+        expected[0, h] = (C[0, group].float()[None, :] * running).sum(-1) + D[h].float() * x[0, h].float()
+
+    torch.testing.assert_close(out.float(), expected, rtol=0.04, atol=0.04)
+    torch.testing.assert_close(state[6].float(), expected_state[6], rtol=0.04, atol=0.04)
+    torch.testing.assert_close(state[1], original[1], rtol=0, atol=0)
