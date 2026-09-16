@@ -1217,7 +1217,7 @@ def test_attention_ts_mla_balanced_causal_reducer_uses_equal_split_boundaries():
 def test_attention_ts_mla_balanced_1cta_m64_uses_persistent_work_queue(
     qkv_dtype: torch.dtype,
 ):
-    """Keep descriptor persistence enabled for balanced keeps-MMA-AB."""
+    """Exercise persistent keeps-MMA-AB and its per-work-tile scratch reset."""
 
     case = _make_mla_case(
         batch_size=1,
@@ -1234,6 +1234,7 @@ def test_attention_ts_mla_balanced_1cta_m64_uses_persistent_work_queue(
     assert policy["kernel"] == "throughput_latency_1cta"
     assert policy["balanced_scheduler"] is True
     assert policy["tile_size_q"] == 64
+    assert policy["num_insts_kv"] == 1
     assert policy["use_persistent_scheduler"] is True
     assert policy["use_clc_dynamic_persistent_scheduler"] is False
     assert int(policy["split_kv"]) > 1
@@ -1383,7 +1384,7 @@ def test_attention_ts_mla_balanced_schedule_across_graph_replay(
     expected_kernel: str,
     qkv_dtype: torch.dtype,
 ):
-    """Refill balanced descriptors without changing captured addresses."""
+    """Refill descriptors; the 1CTA case covers swaps register-state reset."""
 
     case = _make_mla_case(
         batch_size=2,
@@ -1397,6 +1398,9 @@ def test_attention_ts_mla_balanced_schedule_across_graph_replay(
     wrapper = _plan_case(case, balanced=True)
     policy = _policy_dict(wrapper)
     assert policy["kernel"] == expected_kernel
+    if expected_kernel == "throughput_latency_1cta":
+        assert int(policy["tile_size_q"]) < 64
+        assert int(policy["num_insts_kv"]) == 2
     assert wrapper._plan_state is not None
     plan = wrapper._plan_state.balanced_plan
     assert plan is not None

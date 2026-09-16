@@ -271,7 +271,13 @@ class TmemSResource(MlaResource):
     @consumer_work(work_attrs=WorkAttr.AUXILIARY)
     @cute.jit
     def reset_keeps_softmax_work_tile_scratch(self, stage_info: StageInfo) -> None:
-        """Reset the shared q64 online-softmax state for one work tile."""
+        """Reset the keeps-only shared q64 state for one persistent work tile.
+
+        Both variants recreate their register arrays through
+        ``init_softmax_work_tile_state``. Swaps-MMA-AB does not carry online
+        softmax max/sum in this shared scratch and therefore needs no matching
+        operation.
+        """
         del stage_info
         if cutlass.const_expr(self.cfg.kernel_variant == "keeps_mma_ab"):
             state_ptr = self._softmax_scratch.data_ptr(cute.arch.thread_idx()[0])
