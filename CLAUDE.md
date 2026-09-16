@@ -461,7 +461,9 @@ enable_tvm_ffi=True)`. Artifacts live in `cached_ops/` next to the nvcc modules,
 directory per op family — `cached_ops/<module>_<arch>_cute_dsl/` (e.g.
 `nvfp4_quantize_sm100a_cute_dsl/`) holding one `meta.json` plus one `.o` per
 specialization. The arch comes from the DSL's compile target (`CUTE_DSL_ARCH` or the
-current device) since the artifacts are single-arch, unlike nvcc fatbins.
+current device) since the artifacts are single-arch, unlike nvcc fatbins; an op
+family that compiles for a fixed target passes `arch=` so the artifact is labelled
+for the target it was built with.
 Invalidation is module-granular: a changed nvidia-cutlass-dsl version or
 kernel-source SHA256 wipes and lazily rebuilds the module. Reference usage:
 `flashinfer/quantization/kernels/nvfp4_quantize.py`. Disable with
@@ -673,6 +675,12 @@ users should normally leave the batch-size policy at its defaults.
 | `FLASHINFER_PACKED_KDA_HPC` | `1` | Override heads combined per CTA for eligible staged whole-head tiles. |
 | `FLASHINFER_PACKED_KDA_L2POL` | `0` | Override the experimental L2 cache-policy selector. |
 | `FLASHINFER_PACKED_KDA_MINBLOCKS` | `0` | Override the generated kernel's minimum-blocks-per-SM launch-bound hint. |
+
+##### Experimental SM120 KDA Prefill Overlap
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `FLASHINFER_KDA_PIPE` | unset (off) | Read once at import by `flashinfer/kda_kernels/sm120_prefill/decomp.py`. `dual` overlaps the decomposed variant's prepare and recurrence kernels on two streams for shapes its predicate admits; `serial` keeps the flag handshake on one stream for measurement. The overlap relies on the producer kernel staying resident, so leave it unset in production. |
 
 ## Development Workflow
 

@@ -299,6 +299,39 @@ def recurrent_kda(
     # the SM100-family CuTe DSL path, whose eligibility check rejects SM120.
     sm120_rejection: Optional[str] = None
     if backend in ("auto", "cute-dsl") and checkpoint_state_indices is None:
+        # A call the backend has already planned for these exact tensors runs
+        # from its memo; the structural eligibility walk below is what that
+        # plan was admitted by, so a hit does not repeat it.
+        warm = _kda_prefill._sm120_kda_prefill_warm_call(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            use_gate_in_kernel=use_gate_in_kernel,
+            lower_bound=lower_bound,
+            cu_seqlens=cu_seqlens,
+            ssm_state_indices=ssm_state_indices,
+            num_spec_tokens=num_spec_tokens,
+            num_accepted_tokens=num_accepted_tokens,
+            output=output,
+            initial_state_source=initial_state_source,
+            initial_state_indices=initial_state_indices,
+            beta_is_logit=beta_is_logit,
+            seq_order=seq_order,
+            prefill_workspace=prefill_workspace,
+            state_checkpoints=state_checkpoints,
+            checkpoint_cu_starts=checkpoint_cu_starts,
+            checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+        )
+        if warm is not None:
+            return warm
         sm120_prefill_kwargs = dict(
             q=q,
             k=k,
@@ -351,11 +384,10 @@ def recurrent_kda(
             and q.is_cuda
             and get_compute_capability(q.device) == (12, 0)
         ):
-            # Recorded, not raised: a decode or any other call this backend does
-            # not take must keep falling through exactly as before.  It is used
-            # only where the CC 10.0/10.3 block already refuses an explicit
-            # request, which on this architecture can only answer with the
-            # contract when the reason is known right here.
+            # Recorded, not raised: a call this backend does not take must keep
+            # falling through to the other backends.  The reason only enriches
+            # the error the block below raises when an explicit ``cute-dsl``
+            # request is refused on a CC 12.0 device.
             sm120_rejection = _kda_prefill._sm120_kda_prefill_rejection_reason(
                 **sm120_prefill_kwargs
             )
