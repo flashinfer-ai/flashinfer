@@ -466,7 +466,8 @@ def _run_ncu_profiles(args, token_counts):
     ncu = shutil.which("ncu")
     if ncu is None:
         raise RuntimeError("--mode profile_ncu requires Nsight Compute (ncu)")
-    if any(variant.use_megamoe for variant in _selected_variants(args, "ep")):
+    profile_cases = tuple(_profile_cases(args, token_counts))
+    if any(mode == "ep" and variant.use_megamoe for _, mode, variant in profile_cases):
         help_text = subprocess.run(
             [ncu, "--help"], check=True, capture_output=True, text=True
         ).stdout
@@ -488,7 +489,7 @@ def _run_ncu_profiles(args, token_counts):
     source_root = script.parents[1]
     lineinfo_cache = output_dir / "cute_dsl_lineinfo_cache"
     lineinfo_cache.mkdir(exist_ok=True)
-    for num_tokens, mode, variant in _profile_cases(args, token_counts):
+    for num_tokens, mode, variant in profile_cases:
         profile_label = f"{mode}::{variant.name}"
         output = output_dir / f"{mode}_{variant.name}_t{num_tokens}"
         log_file = output.with_suffix(".ncu.log")
@@ -2088,9 +2089,11 @@ def main():
         tokens = DISTRIBUTED_TOKEN_COUNTS
     if (
         args.mode == "profile_ncu"
-        and "w4a16_megamoe" in variant_names
         and args.ncu_megamoe_replay == "application"
-        and any(value < args.num_gpus for value in tokens)
+        and any(
+            mode == "ep" and variant.use_megamoe and value < args.num_gpus
+            for value, mode, variant in _profile_cases(args, tokens)
+        )
     ):
         parser.error("MegaMoE NCU application replay requires nonempty source ranks")
 

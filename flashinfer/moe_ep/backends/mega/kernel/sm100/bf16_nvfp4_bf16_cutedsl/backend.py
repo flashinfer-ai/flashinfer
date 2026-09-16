@@ -157,10 +157,13 @@ class W4A16CutedslMegaKernelBackend(MegaKernelBackend):
         if t.topk_weights.dtype != torch.float32:
             raise MoEEpConfigError("W4A16 MegaMoE topk_weights must be FP32")
         if (
-            t.topk_ids.device != t.hidden_states.device
+            not t.hidden_states.is_cuda
+            or t.topk_ids.device != t.hidden_states.device
             or t.topk_weights.device != t.hidden_states.device
         ):
-            raise MoEEpConfigError("W4A16 activations and routing must share a device")
+            raise MoEEpConfigError(
+                "W4A16 activations and routing must share a CUDA device"
+            )
         validate_mega_forward_inputs(
             t.hidden_states,
             t.topk_ids,

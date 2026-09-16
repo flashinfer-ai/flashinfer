@@ -429,11 +429,10 @@ def test_mega_layer_forward_skips_quantize_when_config_disabled():
         ("w4a16", "hidden_states", "float16", "expects bf16"),
         ("w4a16", "topk_ids", "float32", "int32 or int64"),
         ("w4a16", "topk_weights", "bfloat16", "must be FP32"),
+        ("w4a16", "hidden_states", "bfloat16", "share a CUDA device"),
     ),
 )
-def test_mega_layer_forward_rejects_invalid_input_dtype(
-    backend_name, field, dtype, error
-):
+def test_mega_layer_forward_rejects_invalid_input(backend_name, field, dtype, error):
     import torch
 
     if not hasattr(torch, dtype):
