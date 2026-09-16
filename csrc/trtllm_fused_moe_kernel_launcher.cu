@@ -16,7 +16,6 @@
 #include <flashinfer/exception.h>
 
 #include <algorithm>
-#include <cmath>
 #include <cstring>
 #include <iomanip>
 #include <iostream>
@@ -949,12 +948,14 @@ void cast_fp32_to_bf16(void* output, void const* input, int64_t num_elements, cu
 }  // namespace
 
 // Validate routing_replay_out tensor properties.
-// NOTE: dim0 is only bounded from below. The routing kernels write one replay row per
-// token unconditionally (DeepSeek launches numBlocks == num_tokens and writes row
-// blockIdx.x; the custom and llama4 kernels write row tokenIdx), so a buffer with fewer
-// rows than tokens is written past its end. Oversized buffers stay legal: with CUDA
-// graphs the buffer is pre-allocated at maximum batch size and reused across steps with
-// varying num_tokens.
+// dim0 is only bounded from below: the routing kernels write one replay row
+// per token unconditionally (DeepSeek launches numBlocks == num_tokens and
+// writes row blockIdx.x; the custom and llama4 kernels write row tokenIdx),
+// so a buffer with fewer rows than tokens is written past its end. Oversized
+// buffers stay legal: with CUDA graphs the buffer is pre-allocated at
+// maximum batch size and reused across steps with varying num_tokens.
+// dim1 is the routed top_k even when fused shared experts are enabled; those
+// extra slots are not written.
 static void validate_routing_replay_out(TensorView const& replay, TensorView const& hidden_states,
                                         int64_t top_k) {
   TVM_FFI_ICHECK(replay.device().device_type == kDLCUDA)
@@ -1030,51 +1031,37 @@ inline void validateFp8BlockScaleGemm1ActivationParams(
          "ActivationType::Swiglu.";
 }
 
-// Utility function to compute the next power of two
-inline int32_t nextPowerOfTwo(float value) {
-  int32_t n = static_cast<int32_t>(std::ceil(value));
-  if (n <= 1) return 1;
-
-  // If n is already a power of 2, return it
-  if ((n & (n - 1)) == 0) return n;
-
-  // Find the next power of 2
-  n--;
-  n |= n >> 1;
-  n |= n >> 2;
-  n |= n >> 4;
-  n |= n >> 8;
-  n |= n >> 16;
-  n++;
-
-  return n;
-}
-
 std::set<int32_t> computeSelectedTileN(std::vector<int32_t> const& supported_tile_nums,
                                        int64_t const num_tokens, int64_t const top_k,
                                        int64_t const num_local_experts) {
   TVM_FFI_ICHECK(!supported_tile_nums.empty()) << "supported_tile_nums must not be empty.";
-  float const avg_tokens_per_expert = static_cast<float>(num_tokens * top_k) / num_local_experts;
+  TVM_FFI_ICHECK(num_tokens >= 0) << "num_tokens must be non-negative.";
+  TVM_FFI_ICHECK(top_k > 0) << "top_k must be positive.";
+  TVM_FFI_ICHECK(num_local_experts > 0) << "num_local_experts must be positive.";
+  TVM_FFI_ICHECK(std::is_sorted(supported_tile_nums.begin(), supported_tile_nums.end()))
+      << "supported_tile_nums must be sorted.";
+  TVM_FFI_ICHECK(supported_tile_nums.front() > 0)
+      << "supported_tile_nums must contain only positive values.";
+  double const avg_tokens_per_expert =
+      static_cast<double>(num_tokens) * static_cast<double>(top_k) / num_local_experts;
   // NOTE: This differs from Python AutoTuner bucketing:
   // - AutoTuner maps raw num_tokens with last_positive_power_of_2 (round-down).
-  // - Here we map derived avg_tokens_per_expert and use nextPowerOfTwo (round-up).
-  // Because they round different quantities in different directions, cache bucket and runtime
-  // tile candidates can diverge; launcher-side tactic resolution handles that mismatch.
-  // assume supported_tile_nums is sorted
-  int32_t tile_tokens_dim = std::clamp(nextPowerOfTwo(avg_tokens_per_expert),
-                                       supported_tile_nums.front(), supported_tile_nums.back());
-  auto it = std::find(supported_tile_nums.begin(), supported_tile_nums.end(), tile_tokens_dim);
-  FLASHINFER_CHECK(
-      it != supported_tile_nums.end(), "computeSelectedTileN expected exact tile ", tile_tokens_dim,
-      " in supported_tile_nums (size=", supported_tile_nums.size(),
-      "). Please keep supported_tile_nums as a dense power-of-2 ladder for this launcher.");
+  // - Here we map derived avg_tokens_per_expert to the first supported tile that covers it.
+  // Because they bucket different quantities, cache bucket and runtime tile candidates can
+  // diverge; launcher-side tactic resolution handles that mismatch.
+  auto it = std::lower_bound(
+      supported_tile_nums.begin(), supported_tile_nums.end(), avg_tokens_per_expert,
+      [](int32_t tile, double average) { return static_cast<double>(tile) < average; });
+  if (it == supported_tile_nums.end()) {
+    it = std::prev(supported_tile_nums.end());
+  }
 
   // Candidate tile set centered on the heuristic tile.
   // This function returns nearby candidates (not a single final tile):
   //   center, +1, +2, and -1 neighbors when available.
   // Final tile choice is made later (autotuner-provided tile if valid, otherwise fallback policy).
   std::set<int32_t> selected_tile_nums;
-  selected_tile_nums.insert(tile_tokens_dim);
+  selected_tile_nums.insert(*it);
   if (std::next(it) != supported_tile_nums.end()) {
     selected_tile_nums.insert(*std::next(it));
     if (std::next(std::next(it)) != supported_tile_nums.end()) {
@@ -5656,9 +5643,6 @@ Array<Tensor> trtllm_fp8_block_scale_moe(
   }
 
   if (routing_replay_out.has_value()) {
-    // Replay records at stride top_k + nfse, mismatching the [num_tokens, top_k] layout.
-    TVM_FFI_ICHECK(num_fused_shared_experts.value_or(0) == 0)
-        << "routing_replay_out is not supported with num_fused_shared_experts > 0";
     validate_routing_replay_out(routing_replay_out.value(), hidden_states, top_k);
   }
 
@@ -5834,9 +5818,6 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
   }
 
   if (routing_replay_out.has_value()) {
-    // Replay records at stride top_k + nfse, mismatching the [num_tokens, top_k] layout.
-    TVM_FFI_ICHECK(nFusedShared == 0)
-        << "routing_replay_out is not supported with num_fused_shared_experts > 0";
     validate_routing_replay_out(routing_replay_out.value(), hidden_states, top_k);
   }
 

@@ -23,7 +23,7 @@ files: ^(?!(?:flashinfer/moe_ep/kernel_src/blackwell_bf16_rank_major/src/|csrc/c
 # excluded from all hooks so formatting/lint churn doesn't block syncs or alter
 # the source-distributed kernel payload.
 # The shim/ layers next to them are ours and stay checked.
-# The Cake concat-MLA, MoE finalize, MXFP8 MegaMoE, selective-state, Mamba,
+# The Cake concat-MLA, MoE finalize, MXFP8 MegaMoE, selective-state, MoE all-reduce, Mamba,
 # warp-decode, and KDA CUDA/host trees, including generated-dispatch sources,
 # are byte-faithful exports. Their SHA-256 digests are checked by JIT manifests
 # and must not be rewritten.
@@ -31,7 +31,7 @@ files: ^(?!(?:flashinfer/moe_ep/kernel_src/blackwell_bf16_rank_major/src/|csrc/c
 # code is byte-faithful to the artifact its kernel-level numbers were measured
 # on, and that correspondence is a disassembly-level claim -- reformatting it
 # would make the claim unverifiable for no benefit.
-exclude: ^(?:flashinfer/msa_ops/cute_dsl/sparse_decode_nvfp4_sm100\.py|csrc/(?:cake_minimax_h3_mxfp8_pre_attention/|kda/flashkda_generated_.*|blackwell_msa/|concat_mla/|cake_all_gather_matmul/|cake_moe_finalize_allreduce_fusion/|cake_nvfp4_svdquant_gemm/|cake_selective_state_update/(?:cuda|host)/|cake_mamba_ssd_combined/generated/|fused_moe/warp_decode/generated/|kda/cake_flashkda_blackwell_evolution_.*\.cu)|flashinfer/(?:experimental/(?:cake_mxfp8_megamoe_ep16|sm110_gqa_decode)/csrc/|moe_ep/kernel_src/(?:cutedsl_megamoe|sm90/pull_style_cutedsl_megakernel|sm120/swapab_cutedsl_megakernel)/src/))
+exclude: ^(?:flashinfer/msa_ops/cute_dsl/sparse_decode_nvfp4_sm100\.py|csrc/(?:cake_minimax_h3_mxfp8_pre_attention/|kda/flashkda_generated_.*|blackwell_msa/|concat_mla/|cake_all_gather_matmul/|cake_moe_finalize_allreduce_fusion/|cake_nvfp4_svdquant_gemm/|cake_selective_state_update/(?:cuda|host)/|cake_mamba_ssd_combined/generated/|cake_trtllm_moe_allreduce_fusion/|fused_moe/warp_decode/generated/|kda/cake_flashkda_blackwell_evolution_.*\.cu)|flashinfer/(?:experimental/(?:cake_mxfp8_megamoe_ep16|sm110_gqa_decode)/csrc/|moe_ep/kernel_src/(?:cutedsl_megamoe|sm90/pull_style_cutedsl_megakernel|sm120/swapab_cutedsl_megakernel)/src/))
 
 repos:
   # Standard hooks
@@ -64,7 +64,7 @@ repos:
         # Source-export directories are checksum-attested generated artifacts;
         # formatting them would break their static source-registry identities.
         exclude: |
-          (?x)^(3rdparty/.*|flashinfer/jit/aot_config.py|csrc/concat_mla/.*|csrc/cake_vsa/.*|csrc/cake_grouped_mxfp8_quantize/.*|csrc/dcp/.*|csrc/generated/.*)$
+          (?x)^(3rdparty/.*|csrc/cake_bf16_bmm/.*|flashinfer/jit/aot_config.py|csrc/concat_mla/.*|csrc/cake_vsa/.*|csrc/cake_grouped_mxfp8_quantize/.*|csrc/dcp/.*|csrc/generated/.*)$
 
   -   repo: https://github.com/pre-commit/mirrors-mypy
       rev: 'v1.17.1'  # Use the sha / tag you want to point at

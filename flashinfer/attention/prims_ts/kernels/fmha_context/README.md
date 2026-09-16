@@ -60,7 +60,8 @@ alignment, value, aliasing, and lifetime obligation in the runtime contract.
 | GPU | Blackwell SM100/SM103 and Rubin SM107; see validation scope below |
 | Head dimensions | Equal QK/V: 128 or 256; separate contiguous MLA: QK=192, V=128 |
 | Head mapping | MHA/GQA; `Hq` must be divisible by `Hkv` |
-| Q/K/V dtype | Matching `torch.float16`, `torch.bfloat16`, or `torch.float8_e4m3fn` |
+| Q/K dtype | Matching `torch.float16`, `torch.bfloat16`, or `torch.float8_e4m3fn` |
+| V dtype | Equal to Q/K, or `torch.float8_e4m3fn` with `torch.bfloat16` Q/K (`v_dtype`; defaults to `k_dtype`) |
 | Output dtype | `torch.float16`, `torch.bfloat16`, or `torch.float8_e4m3fn` |
 | Contiguous storage | Fixed BSHD or packed THD with uniform or ragged request lengths |
 | Paged storage | Packed Q plus separate compact HND K/V page pools |
@@ -91,8 +92,8 @@ device. Cumulative offsets, sequence lengths, and variable-window metadata must
 be compact CUDA `torch.int32` tensors on that device and at least 4-byte
 aligned. `block_tables` instead permits the row-strided layout documented
 below. A caller-provided `out` must not overlap Q, K, V, any runtime metadata,
-or active plan-owned scale/scratch storage. The launch conservatively rejects
-overlapping storage spans. The API returns O only; rowwise LSE and other
+or active plan-owned scale/scratch storage. This is an unchecked caller
+precondition in both validation modes. The API returns O only; rowwise LSE and other
 softmax state remain internal to the kernel.
 
 ## Tensor and metadata layouts
@@ -187,7 +188,7 @@ tightest valid length flags for its temporary plan and conservatively keeps the
 V-tail clear.
 
 With the default `validate=True`, `run()` checks tensor structure, shapes,
-dtypes, devices, scales, output, aliasing, page-table strides, sequence
+dtypes, devices, scales, output, page-table strides, sequence
 lengths, and active page IDs. Those metadata checks read device values back to
 the host and may synchronize. Caller-provided variable-window CTA starts are
 also checked against the exact minimum of the corresponding per-token starts.
@@ -279,7 +280,7 @@ wrapper.plan(
     num_kv_heads=Hkv,
     head_dim=D,
     q_dtype=q.dtype,
-    kv_dtype=k.dtype,
+    k_dtype=k.dtype,
     mask_type="causal",
 )
 out = wrapper.run(q, k, v)
@@ -303,7 +304,7 @@ wrapper.plan(
     head_dim=192,
     head_dim_vo=128,
     q_dtype=q.dtype,
-    kv_dtype=k.dtype,
+    k_dtype=k.dtype,
     mask_type="causal",
     out_dtype=torch.bfloat16,
 )
@@ -347,7 +348,7 @@ wrapper.plan(
     num_kv_heads=Hkv,
     head_dim=D,
     q_dtype=q.dtype,
-    kv_dtype=k_cache.dtype,
+    k_dtype=k_cache.dtype,
     out_dtype=q.dtype,
     page_size=page_size,
     mask_type="causal",
@@ -362,6 +363,11 @@ out = wrapper.run(
 )
 assert out.shape == q.shape
 ```
+
+For a `torch.bfloat16` Q/K with a `torch.float8_e4m3fn` V, pass
+`v_dtype=v.dtype` (or `v_dtype=v_cache.dtype` for paged) to `plan()` and
+supply `output_scale=v_descale`; `sm_scale` is unchanged because Q and K stay
+BF16. Both wrappers accept this combination for head dimensions 128 and 256.
 
 For CUDA graph capture, call `plan()` and perform one default-validating
 `run()` first. Capture subsequent calls with `validate=False`, keep every
@@ -384,7 +390,9 @@ runtime tensors alive until every graph using that plan is destroyed.
   value to enable it.
 - Positive windows are restricted to even-ratio GQA because the kernel pairs
   query heads that share a K/V head.
-- Attention sinks, custom masks, and mixed Q/K/V dtypes are not exposed.
+- Attention sinks and custom masks are not exposed. Q and K must share one
+  dtype; the only mixed combination is `torch.bfloat16` Q/K with
+  `torch.float8_e4m3fn` V.
 - Re-plan either wrapper after changing a static capacity, head or dtype
   geometry, mask, window, or default scale; page size and explicit metadata
   promises are also static for paged plans. Request tensors and metadata may
@@ -402,7 +410,8 @@ runtime tensors alive until every graph using that plan is destroyed.
 
 The public suite covers fixed, ragged, and paged layouts; MHA/GQA; both head
 dimensions; `torch.float16`, `torch.bfloat16`, and `torch.float8_e4m3fn`
-inputs; dense, causal, and left-window masks; nonidentity pages; scheduler
+inputs; BF16 Q/K with FP8 V for contiguous and paged storage at both head
+dimensions; dense, causal, and left-window masks; nonidentity pages; scheduler
 safety; CUDA graphs; and reference accuracy. Explicit input-to-output dtype
 conversion coverage spans all nine pairings of FP16, BF16, and FP8 input and
 output state.
