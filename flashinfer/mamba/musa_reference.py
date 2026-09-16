@@ -276,8 +276,8 @@ def selective_state_update_musa_reference(
 
     is_spec_decoding = num_accepted_tokens is not None
     if is_spec_decoding:
-        if not is_varlen:
-            raise ValueError("num_accepted_tokens requires packed varlen input")
+        if not (is_varlen or is_mtp):
+            raise ValueError("num_accepted_tokens requires varlen or MTP input")
         if state_batch_indices is None or state_batch_indices.dim() != 2:
             raise ValueError(
                 "speculative varlen state_batch_indices must be a 2D tensor"
