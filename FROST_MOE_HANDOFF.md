@@ -115,6 +115,19 @@ these diagnostic racecheck runs. Frost execution is not a necessary condition
 for this reproducer; the native-routing/capture/instrumentation cause remains
 unresolved. The original failing regression is retained.
 
+A further minimal reproducer removes native routing as well: a seven-line CUDA
+kernel launched cooperatively on 140 blocks, followed by an unrelated FP32
+matrix multiply, reproduces `CUBLAS_STATUS_INTERNAL_ERROR` after its first CUDA
+Graph replay under unfiltered racecheck. It imports neither FlashInfer nor
+cuDNN. On the same B200, ordinary execution passes; under racecheck the GEMM
+passes before capture, after eager cooperative execution, and after capture
+before replay. The cooperative kernel's output passes an exact CPU check even
+on the failing replay. Environment: driver 610.57.04, CUDA 13.2 compiler and
+sanitizer, PyTorch 2.13.0+cu130. The instrumented process exits nonzero despite
+zero reported race hazards. This establishes a standalone cooperative-capture /
+SGEMM instrumentation interaction; it does not prove the toolchain's internal
+root cause or turn the original full-MoE failure into a pass.
+
 The old-snapshot finalizer range comparison also remains incomplete. A native
 routing-only reproducer passes unfiltered racecheck but fails when the original
 finalizer-only filter is added, before any Frost/finalizer execution. This makes
@@ -152,9 +165,13 @@ Recommended continuation order:
    unfiltered memcheck and racecheck for both routing paths on a full 188-SM,
    600-W RTX PRO 6000 Blackwell Server Edition (112 numerical checks and 64
    stale-output negative controls across four instrumented processes; zero
-   errors/hazards). Broader H2048/I1024 validation is pending, followed by explicit
-   tactic sweeps and full-MoE backend comparisons. These small-case checks do not
-   establish public support or a performance advantage.
+   errors/hazards). Broader normal validation now passes H2048/I1024/top2 at
+   T64/E8 uniform, T257/E16 skewed, T1025/E32 uniform, and T4096/E32 skewed:
+   112 numerical checks, 64 stale-output negative controls, and 16 captured
+   routes, each containing two Frost SM120 GEMMs. This uses the actual published
+   fallback fix. Large-shape sanitizer coverage, full tactic sweeps and confirmed
+   full-MoE backend comparisons remain open. These checks do not establish
+   public support or a performance advantage.
 4. Continue kernel and tuning work only when candidates survive correctness,
    changed-input capture, actual routes and complete-MoE confirmation.
 
