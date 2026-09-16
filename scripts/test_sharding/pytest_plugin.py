@@ -44,6 +44,10 @@ def pytest_configure(config: pytest.Config) -> None:
         "markers",
         "solo: run every node from this source without overlapping another local unit",
     )
+    config.addinivalue_line(
+        "markers",
+        "long_running: dispatch every unit from this source before normal work",
+    )
     config._flashinfer_sharding = {  # type: ignore[attr-defined]
         "session_start": time.time(),
         "collection_complete": None,
@@ -72,6 +76,11 @@ def pytest_collection_modifyitems(
         for item in items
         if item.get_closest_marker("solo") is not None
     }
+    long_running_sources = {
+        Path(str(item.path)).resolve()
+        for item in items
+        if item.get_closest_marker("long_running") is not None
+    }
     collected = []
     for order, item in enumerate(items):
         node = CollectedNode.from_nodeid(item.nodeid, order, _marker_name(item))
@@ -88,6 +97,7 @@ def pytest_collection_modifyitems(
                 order=node.order,
                 shard_group=node.shard_group,
                 solo=item_path in solo_sources,
+                long_running=item_path in long_running_sources,
             )
         )
     collection_path = config.getoption("--flashinfer-collection-json")
@@ -180,7 +190,24 @@ def pytest_runtest_logreport(report: pytest.TestReport) -> None:
     record[report.when] = float(report.duration)
     record[f"{report.when}_outcome"] = report.outcome
     if report.failed:
-        record["longrepr"] = str(report.longrepr)
+        diagnostic = str(report.longrepr)
+        prior_diagnostic = str(record.get("longrepr", ""))
+        record["longrepr"] = (
+            f"{prior_diagnostic}\n\n[{report.when} failure]\n{diagnostic}"
+            if prior_diagnostic
+            else diagnostic
+        )
+        encoded = diagnostic.encode("utf-8")
+        truncated = len(encoded) > 32 * 1024
+        if truncated:
+            diagnostic = encoded[: 32 * 1024].decode("utf-8", errors="replace")
+        _emit_progress(
+            "failure",
+            nodeid=report.nodeid,
+            phase=report.when,
+            diagnostic=diagnostic,
+            diagnostic_truncated=truncated,
+        )
 
 
 _REPORTS: dict[str, dict[str, Any]] = {}

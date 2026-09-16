@@ -908,6 +908,10 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint4, uint64_t> cvt_wa
     }
     fp2Vals[i].x *= outputScale;
     fp2Vals[i].y *= outputScale;
+    // Saturate to +/-E4M3 max (448) so inf / overflow map to the max finite
+    // value instead of NaN. This matches torch's saturating float8_e4m3fn cast.
+    fp2Vals[i].x = fmaxf(fminf(fp2Vals[i].x, 448.0f), -448.0f);
+    fp2Vals[i].y = fmaxf(fminf(fp2Vals[i].y, 448.0f), -448.0f);
   }
 
   // Convert to e4m3 values. Overload selected by `fp2Vals` array length:

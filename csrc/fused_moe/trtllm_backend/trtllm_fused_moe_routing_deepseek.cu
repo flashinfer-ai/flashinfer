@@ -361,10 +361,11 @@ __global__ void routingMainKernel(KernelParams params) {
         params.mPtrTopKWeights[idxShared] = static_cast<OutputT>(1.0F);
       }
 
-      // Routing replay: record all top-K selected expert IDs per token.
-      // Layout: [num_tokens, topK] -- same indexing as mPtrTopKPacked.
+      // Routing replay is routed-only: [num_tokens, topK] with stride topK.
+      // Packed ids/weights use mTotalExpertsPerToken (= topK + fused shared).
+      auto idxReplay = blockIdx.x * params.mTopK + laneIdx;
       if (params.mPtrRoutingReplayOut != nullptr && laneIdx < params.mTopK) {
-        params.mPtrRoutingReplayOut[idxTopK] = static_cast<int16_t>(expertIdx);
+        params.mPtrRoutingReplayOut[idxReplay] = static_cast<int16_t>(expertIdx);
       }
     }
   }
@@ -422,6 +423,8 @@ __global__ void routingIndicesClusterKernel(KernelParams params) {
   assert(false && "routingIndicesClusterKernel is only supported on SM90+ architectures");
 }
 #endif
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
 
 static void launchClusterKernel(Data& data, int numThreadsHist, void* stream) {
   LAUNCH_ROUTING_DEEPSEEK(data,
@@ -620,8 +623,9 @@ void run(Data& data, void* stream) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+}  // namespace routingDeepSeek
+
 #undef LAUNCH_DEEPSEEK_WITH_TOPK
 #undef LAUNCH_ROUTING_DEEPSEEK
 
-}  // namespace routingDeepSeek
 }  // namespace moe::dev::routing

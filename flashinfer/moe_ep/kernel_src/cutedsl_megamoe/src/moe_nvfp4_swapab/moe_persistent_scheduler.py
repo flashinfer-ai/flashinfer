@@ -1418,8 +1418,9 @@ class _ClcDynamicState:
     WGrad linearization):
         These store the **cluster origin** coordinates from the CLC response,
         i.e., the grid position of the first CTA of the canceled cluster.
-        This matches the CLC hardware behavior: UGETNEXTWORKID returns
-        "the first CTA of the CGA" coordinates (see ISA spec).
+        This matches the documented PTX clusterlaunchcontrol semantics:
+        the try_cancel response reports the first CTA of the canceled
+        cluster.
 
         Grid layouts produced by MoEDynamicSchedulerParams.get_grid_shape:
             Layout A (grid_z_lin <= 65535):  (cm,              cn, grid_z_lin)

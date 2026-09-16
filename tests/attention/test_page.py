@@ -1,3 +1,4 @@
+import os
 import subprocess
 import sys
 import textwrap
@@ -43,6 +44,22 @@ def _skip_if_fp8_e4m3_scale_unsupported():
     major, minor = get_compute_capability(torch.device("cuda:0"))
     if major < 8:
         pytest.skip(f"SM{major}{minor} does not support FP8 E4M3 scale tensors")
+
+
+def _is_compute_sanitizer_active() -> bool:
+    """Detect whether the process runs under compute-sanitizer.
+
+    The tool injects itself through environment variables that child processes
+    inherit, so this also holds inside a subprocess a test spawns. CUDA 13.x
+    uses the NV_SANITIZER_INJECTION_* set; older toolkits use
+    CUDA_INJECTION64_PATH, which Nsight tools set too, hence the value check.
+    """
+    if any(name.startswith("NV_SANITIZER_INJECTION_") for name in os.environ):
+        return True
+    return any(
+        "sanitizer" in os.environ.get(name, "").lower()
+        for name in ("CUDA_INJECTION64_PATH", "NVTX_INJECTION64_PATH")
+    )
 
 
 def _make_small_nvfp4_append_inputs(device="cuda:0"):
@@ -589,6 +606,11 @@ def test_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_cuda_graph_captu
     torch.cuda.synchronize()
 
 
+@pytest.mark.skipif(
+    _is_compute_sanitizer_active(),
+    reason="the replay below makes the kernel execute its `trap;` guard on purpose, "
+    "which compute-sanitizer reports as errors and slows past this test's timeout",
+)
 def test_nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_cuda_graph_bad_scale():
     _skip_if_fp8_e4m3_scale_unsupported()
 

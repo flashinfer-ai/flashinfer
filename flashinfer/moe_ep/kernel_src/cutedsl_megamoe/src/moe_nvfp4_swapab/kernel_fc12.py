@@ -37,6 +37,7 @@ from common.megamoe_constants import (
     SupportedMmaTileM,
     SupportedMmaTileN,
 )
+from common.host_utils import get_cutedsl_target_arch
 from .moe_utils import spin_wait
 from . import dynamic_mainloop
 from src.token_comm import CombineFormat
@@ -129,7 +130,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
 
         self.sf_vec_size = sf_vec_size
         self.scenario = scenario
-        self.arch = "sm_100"
+        self.arch = get_cutedsl_target_arch()
 
         self.fc2_output_dtype = fc2_output_dtype
         self.non_ubulk_fc2_store = non_ubulk_fc2_store
@@ -183,7 +184,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
         self.epi_reg_cnt = 256
         self.task_reg_cnt = 72
 
-        self.smem_capacity = utils.get_smem_capacity_in_bytes(self.arch)
+        self.smem_capacity = utils.get_smem_capacity_in_bytes()
         self.num_tmem_alloc_cols = cute.arch.get_max_tmem_alloc_cols(self.arch)
 
     def name(self) -> str:
@@ -772,6 +773,12 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
     ) -> None:
         """Launch the fused fc1+fc2 swap-AB SwiGLU NVFP4 kernel."""
 
+        # Keep the real runtime extent for singleton-expert TMA descriptors.
+        # A static extent of one is canonicalized out of the TMA basis before
+        # the descriptor is derefined to the kernel ABI.
+        fc1_weight_experts_runtime = fc1_weight.shape[0]
+        fc2_weight_experts_runtime = fc2_weight.shape[0]
+
         # Bind data-tensor shapes to codegen-time expert dims when requested.
         # Strides, token rows, and SF tensors stay runtime-dynamic because they
         # encode host padding/swizzle choices.
@@ -836,13 +843,21 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
         # A_gemm (fc1 weights): (experts, hidden, intermediate_gateup)
         # -> (M=intermediate_gateup, K=hidden, L=experts).
         experts, hidden_b, intermediate_gateup = fc1_weight.shape
+        # Static shape refinement above rewrites the expert mode to a Python
+        # int. Re-inject its runtime extent for E=1 so TMA keeps the L basis.
+        fc1_weight_tma_experts = experts
+        if cutlass.const_expr(
+            self.static_expert_shape is not None
+            and self.static_expert_shape[0] == 1
+        ):
+            fc1_weight_tma_experts = fc1_weight_experts_runtime
         fc1_weight_gemm = cute.make_tensor(
             fc1_weight.iterator,
             cute.make_layout(
                 (
                     cutlass.Int32(intermediate_gateup),
                     cutlass.Int32(hidden_b),
-                    cutlass.Int32(experts),
+                    cutlass.Int32(fc1_weight_tma_experts),
                 ),
                 stride=(
                     fc1_weight.stride[2],
@@ -921,13 +936,19 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
         # A_gemm (fc2 weights): (experts, intermediate_downproj, hidden)
         # -> (M=hidden, K=intermediate_downproj, L=experts).
         experts2, intermediate_downproj_b2, hidden_b2 = fc2_weight.shape
+        fc2_weight_tma_experts = experts2
+        if cutlass.const_expr(
+            self.static_expert_shape is not None
+            and self.static_expert_shape[0] == 1
+        ):
+            fc2_weight_tma_experts = fc2_weight_experts_runtime
         fc2_weight_gemm = cute.make_tensor(
             fc2_weight.iterator,
             cute.make_layout(
                 (
                     cutlass.Int32(hidden_b2),
                     cutlass.Int32(intermediate_downproj_b2),
-                    cutlass.Int32(experts2),
+                    cutlass.Int32(fc2_weight_tma_experts),
                 ),
                 stride=(
                     fc2_weight.stride[2],
@@ -1496,6 +1517,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
             allocator_warp_id=self.epilogue_warp_id[0],
             is_two_cta=use_2cta_instrs,
             two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr.ptr,
+            arch=self.arch,
         )
 
         # Sched

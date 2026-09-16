@@ -74,6 +74,13 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.base_dsl.arch import Arch
 from cutlass.cutlass_dsl import BaseDSL
 
+# ``Arch.sm_107*`` only exists in CuTe DSL >= 4.8; requirements.txt allows 4.7,
+# where a bare attribute access raises AttributeError as soon as this branch is
+# evaluated (SM100 short-circuits before it, SM103 does not).  Fall back to the
+# sm_103 bounds so an older DSL keeps exactly its pre-Rubin behaviour.
+_ARCH_SM107 = getattr(Arch, "sm_107", Arch.sm_103f)
+_ARCH_SM107F = getattr(Arch, "sm_107f", Arch.sm_103f)
+
 
 from .mla_helpers import (
     ceil_div,
@@ -1592,7 +1599,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
                         mAccO,
                         mAccLSE,
                         blk_coord,
-                        self.get_valid_q_rows(blk_coord[1]),
+                        q_begin,
+                        valid_q_rows,
                         tidx,
                     )
                 tile_sched.advance_to_next_work()
@@ -1608,6 +1616,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         mAccO: Optional[cute.Tensor],
         mAccLSE: Optional[cute.Tensor],
         blk_coord: cute.Coord,
+        q_begin: cutlass.Int32,
         valid_q_rows: cutlass.Int32,
         tidx: cutlass.Int32,
     ):
@@ -1625,7 +1634,15 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
             q_row = cta_row_base + cta_row
             if cute.elem_less(q_row, valid_q_rows):
                 if cutlass.const_expr(mAccO is None):
-                    mO[q_row, d_idx, blk_coord[1], blk_coord[2]] = self.o_dtype(0.0)
+                    if cutlass.const_expr(self.is_var_q):
+                        compact_q_row = (
+                            q_begin * self.num_heads
+                            + blk_coord[1] * self.mma_qk_tiler[0]
+                            + q_row
+                        )
+                        mO[compact_q_row, d_idx, 0] = self.o_dtype(0.0)
+                    else:
+                        mO[q_row, d_idx, blk_coord[1], blk_coord[2]] = self.o_dtype(0.0)
                 else:
                     mAccO[
                         q_row,
@@ -1639,7 +1656,15 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
             q_row = cta_row_base + local_tidx
             if cute.elem_less(q_row, valid_q_rows):
                 if cutlass.const_expr(mAccLSE is None):
-                    mLSE[q_row, blk_coord[1], blk_coord[2]] = -self.lse_dtype.inf
+                    if cutlass.const_expr(self.is_var_q):
+                        compact_q_row = (
+                            q_begin * self.num_heads
+                            + blk_coord[1] * self.mma_qk_tiler[0]
+                            + q_row
+                        )
+                        mLSE[compact_q_row, 0, 0] = -self.lse_dtype.inf
+                    else:
+                        mLSE[q_row, blk_coord[1], blk_coord[2]] = -self.lse_dtype.inf
                 else:
                     mAccLSE[
                         q_row, blk_coord[3], blk_coord[1], blk_coord[2]
@@ -1854,9 +1879,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         max_splits = ceil_div(K, mma_qk_tiler_mn[1])
         blocks_per_batch = max(1, max_active_blocks // B // (S * 2))
         split_heur = min(max_splits, blocks_per_batch)
-        # {$nv-internal-release begin}
-        # TODO: figure out the error of make_tile with dynamic int_tuple
-        # {$nv-internal-release end}
         k_waves = ceil_div(max_splits, split_heur)
         split_wave_aware = ceil_div(max_splits, k_waves)
         max_split_kv = 32
@@ -1903,9 +1925,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
             split_kv = block_split_kvs[blk_coord[2]]
 
         k_tile_total = cute.ceil_div(K, self.mma_qk_tiler[1])
-        # {$nv-internal-release begin}
-        # TODO: figure out the error of make_tile with dynamic int_tuple
-        # {$nv-internal-release end}
         k_tile_per_cta = cute.ceil_div(k_tile_total, split_kv)
         k_index = blk_coord[3] * k_tile_per_cta
         k_tile_count = max(0, min(k_tile_total, k_index + k_tile_per_cta) - k_index)
@@ -2196,9 +2215,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         k_index += 1
         k_tile_count -= 1
         while k_tile_count > 0:
-            # {$nv-internal-release begin}
-            # TODO: figure out how to support SingleNamespace/struct in ast
-            # {$nv-internal-release end}
             load_q_producer_state, load_kv_producer_state, load_pt_consumer_state = (
                 self.load_tma_qk_one_k_tile(
                     common_params,
@@ -3143,7 +3159,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
             # reduction for row_max
             row_max_new = tTR_rAcc.load().reduce(cute.ReductionOp.MAX, row_max_new, 0)
 
-        elif cutlass.const_expr(arch >= Arch.sm_103 and arch <= Arch.sm_103f):
+        elif cutlass.const_expr(arch >= Arch.sm_103 and arch <= _ARCH_SM107F):
             tmem_load_red_atom = cute.make_copy_atom(
                 tcgen05.copy.LdRed32x32bOp(
                     tcgen05.copy.Repetition(64), redOp=tcgen05.TmemLoadRedOp.MAX
@@ -3259,9 +3275,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
                 ),
             ),
         )
-        # {$nv-internal-release begin}
-        # TODO: figure out if we could use A tmem for pv.
-        # {$nv-internal-release end}
         # change to PISL
         sP_wo_swizzle_iter = cute.recast_ptr(sP.iterator, swizzle_=None)
         swizzle_bits = (
@@ -3372,9 +3385,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
             tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), self.acc_dtype
         )
         tmem_load_tiled_copy = tcgen05.make_tmem_copy(tmem_load_atom, tAcc)
-        # {$nv-internal-release begin}
-        # TODO: supports size() on tiled copy.
-        # {$nv-internal-release end}
         tmem_load_thr_copy = tmem_load_tiled_copy.get_slice(
             common_params.tidx % (self.num_compute_warps * self.threads_per_warp)
         )

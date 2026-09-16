@@ -16,6 +16,10 @@ from scripts.test_sharding.models import CollectedNode, Plan, PlanningOptions
 from scripts.test_sharding.planner import build_plan, capacity_metrics, validate_plan
 
 
+def _planning(**values: int) -> PlanningOptions:
+    return PlanningOptions(default_source_overhead_seconds=0, **values)
+
+
 def _node(
     nodeid: str,
     order: int,
@@ -44,11 +48,10 @@ def test_plan_is_reproducible_and_covers_each_node_once(tmp_path: Path) -> None:
             for node, seconds in zip(nodes, [4.0, 3.0, 2.0, 1.0], strict=True)
         ]
     )
-    options = PlanningOptions(
-        profile="b100-cu13",
+    options = _planning(
         checkpoint_seconds=5,
         target_unit_seconds=7,
-        unknown_case_seconds=5,
+        default_case_seconds=5,
         shard_count=2,
     )
 
@@ -68,6 +71,17 @@ def test_plan_is_reproducible_and_covers_each_node_once(tmp_path: Path) -> None:
     ) == json.dumps(second.to_dict(), sort_keys=True, separators=(",", ":"))
 
 
+def test_runtime_defaults_are_one_second_per_case_and_thirty_per_source() -> None:
+    node = _node("tests/test_sample.py::test_case", 0)
+
+    plan = build_plan([node], EstimateBook(), PlanningOptions())
+
+    batch = plan.units[0].batches[0]
+    assert batch.overhead_ms == 30_000
+    assert batch.estimated_ms == 31_000
+    assert plan.fallback_counts == {"default-case": 1}
+
+
 def test_shard_group_is_atomic_even_when_it_exceeds_checkpoint() -> None:
     nodes = [
         _node("tests/test_grouped.py::test_grouped[0]", 0, shard_group="compile"),
@@ -80,11 +94,10 @@ def test_shard_group_is_atomic_even_when_it_exceeds_checkpoint() -> None:
     plan = build_plan(
         nodes,
         estimates,
-        PlanningOptions(
-            profile="profile",
+        _planning(
             checkpoint_seconds=5,
             target_unit_seconds=10,
-            unknown_case_seconds=5,
+            default_case_seconds=5,
             shard_count=1,
         ),
     )
@@ -114,8 +127,7 @@ def test_solo_source_is_one_batch_and_one_logical_unit() -> None:
         EstimateBook(
             [DurationEstimate("profile", node.nodeid, 4.0, 1) for node in nodes]
         ),
-        PlanningOptions(
-            profile="profile",
+        _planning(
             checkpoint_seconds=5,
             target_unit_seconds=20,
             shard_count=1,
@@ -151,8 +163,7 @@ def test_capacity_metrics_account_for_solo_exclusivity() -> None:
                 DurationEstimate("profile", nodes[2].nodeid, 8.0, 1),
             ]
         ),
-        PlanningOptions(
-            profile="profile",
+        _planning(
             checkpoint_seconds=5,
             target_unit_seconds=5,
             shard_count=1,
@@ -367,21 +378,18 @@ def test_plan_records_each_fallback_source_and_worker_aware_capacity() -> None:
     plan = build_plan(
         nodes,
         book,
-        PlanningOptions(
-            profile="profile",
+        _planning(
             checkpoint_seconds=5,
             target_unit_seconds=5,
-            unknown_case_seconds=2,
+            default_case_seconds=2,
             shard_count=1,
         ),
     )
 
-    assert plan.fallback_sources == {
-        "tests/test_x.py::test_new": "suite-mean-current-profile"
-    }
+    assert plan.fallback_sources == {"tests/test_x.py::test_new": "default-case"}
     one_worker = capacity_metrics(plan, {0: 1}, deadline_seconds=5)
     two_workers = capacity_metrics(plan, {0: 2}, deadline_seconds=5)
-    assert one_worker["total_estimated_load_ms"] == 8000
+    assert one_worker["total_estimated_load_ms"] == 6000
     assert two_workers["estimated_makespan_ms"] < one_worker["estimated_makespan_ms"]
     assert one_worker["required_workers_by_shard"] == {"0": 2}
 
@@ -405,8 +413,7 @@ def test_high_overhead_source_expands_checkpoint_to_avoid_process_churn() -> Non
                 )
             ],
         ),
-        PlanningOptions(
-            profile="profile",
+        _planning(
             checkpoint_seconds=20,
             target_unit_seconds=1000,
             shard_count=1,
@@ -427,8 +434,7 @@ def test_source_process_count_is_capped_when_overhead_is_unknown() -> None:
         EstimateBook(
             [DurationEstimate("profile", node.nodeid, 1.0, 1) for node in nodes]
         ),
-        PlanningOptions(
-            profile="profile",
+        _planning(
             checkpoint_seconds=1,
             target_unit_seconds=100,
             shard_count=1,
@@ -459,8 +465,7 @@ def test_source_affinity_avoids_split_without_material_makespan_gain() -> None:
     plan = build_plan(
         nodes,
         EstimateBook(estimates),
-        PlanningOptions(
-            profile="profile",
+        _planning(
             checkpoint_seconds=1,
             target_unit_seconds=4,
             shard_count=2,
@@ -497,8 +502,7 @@ def test_source_affinity_keeps_balanced_sources_on_one_external_shard() -> None:
     plan = build_plan(
         nodes,
         estimates,
-        PlanningOptions(
-            profile="profile",
+        _planning(
             checkpoint_seconds=5,
             target_unit_seconds=6,
             shard_count=2,
@@ -534,8 +538,7 @@ def test_source_affinity_splits_source_that_exceeds_one_shard_share() -> None:
                 for node in nodes
             ]
         ),
-        PlanningOptions(
-            profile="profile",
+        _planning(
             checkpoint_seconds=5,
             target_unit_seconds=6,
             shard_count=2,
@@ -583,11 +586,10 @@ def test_plan_serialization_stores_each_nodeid_once() -> None:
     plan = build_plan(
         nodes,
         book,
-        PlanningOptions(
-            profile="profile",
+        _planning(
             checkpoint_seconds=5,
             target_unit_seconds=5,
-            unknown_case_seconds=2,
+            default_case_seconds=2,
             shard_count=1,
         ),
     )
@@ -596,7 +598,7 @@ def test_plan_serialization_stores_each_nodeid_once() -> None:
     encoded = json.dumps(serialized, sort_keys=True, separators=(",", ":"))
 
     assert Plan.from_dict(serialized) == plan
-    assert serialized["schema_version"] == 3
+    assert serialized["schema_version"] == 4
     assert serialized["nodeids"] == [node.nodeid for node in nodes]
     assert "nodes" not in serialized
     assert "batch_ids" not in encoded
@@ -608,7 +610,7 @@ def test_plan_reader_accepts_schema_one_manifests() -> None:
     plan = build_plan(
         nodes,
         EstimateBook([DurationEstimate("profile", nodes[0].nodeid, 1.0, 1)]),
-        PlanningOptions(profile="profile"),
+        _planning(),
     )
     legacy = {
         "schema_version": 1,

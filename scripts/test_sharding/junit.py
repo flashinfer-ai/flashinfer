@@ -19,6 +19,7 @@ class TestCaseResult:
     outcome: str
     seconds: float
     synthetic: bool
+    diagnostic: str
 
 
 @dataclass(frozen=True)
@@ -93,6 +94,7 @@ def validate_batch_xml(path: Path, expected_nodeids: Sequence[str]) -> BatchVali
                     outcome=testcase_outcome(testcase),
                     seconds=seconds,
                     synthetic=properties.get("synthetic") == "true",
+                    diagnostic=_testcase_diagnostic(testcase),
                 )
             )
     expected = set(expected_nodeids)
@@ -108,6 +110,19 @@ def validate_batch_xml(path: Path, expected_nodeids: Sequence[str]) -> BatchVali
     if duplicates:
         diagnostics.append("duplicate nodes: " + ", ".join(duplicates[:5]))
     return BatchValidation(not diagnostics, tuple(cases), tuple(diagnostics))
+
+
+def _testcase_diagnostic(testcase: ET.Element) -> str:
+    result = testcase.find("./failure")
+    if result is None:
+        result = testcase.find("./error")
+    if result is None:
+        return ""
+    message = result.attrib.get("message", "").strip()
+    detail = (result.text or "").strip()
+    if message and detail and message not in detail:
+        return f"{message}\n{detail}"
+    return detail or message
 
 
 def finalized_batch_outcomes(

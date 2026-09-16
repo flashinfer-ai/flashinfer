@@ -55,6 +55,7 @@ How to add a new template
    Key rules:
    - ``Var()``   → axis value is NOT baked into the generated name or JSON value.
    - ``Const()`` → axis value IS extracted from a tensor and written to JSON.
+   - ``Const(value=1)`` → axis has that fixed value without a tensor source.
    - Axis values are extracted **automatically** from the first ``Tensor`` input
      whose ``dim_names`` list contains that axis name.
    - For tuple parameters (e.g. ``paged_kv_cache=(k, v)``), set

@@ -20,7 +20,7 @@ import torch
 import cutlass
 
 from common.megamoe_constants import Nvfp4BlockSize, Nvfp4E2M1RcpLimit
-from common.host_utils import mxfp8_quantize_per_block_32
+from common.host_utils import get_cutedsl_target_arch, mxfp8_quantize_per_block_32
 from moe_nvfp4_swapab.runner_common import (
     nvfp4_quantize_per_block_16,
     swiglu_fold_interleave,
@@ -94,7 +94,7 @@ def reference_expert_fc12(
     gate_up_clamp: Optional[float],
     topk_weights: Optional[torch.Tensor],
     ref_compute_graph: Literal["transformers", "deepgemm"],
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Single-expert fused fc1+fc2 reference shared by the single-rank tester
     and the multi-rank MegaMoE reference.
 
@@ -103,8 +103,8 @@ def reference_expert_fc12(
     K-major ``b`` and raw SF formats are identical for the per-expert single-rank
     and gathered multi-rank tensors.  Returns the fc2 fp32 output (``deepgemm``:
     topk pre-multiplied into SwiGLU; ``transformers``: left unweighted for the
-    caller to apply), plus the fc1 NVFP4 hand-off ``(fc1_q, fc1_sf)`` used by the
-    fc1-phase ablation.
+    caller to apply), the fc1 NVFP4 hand-off ``(fc1_q, fc1_sf)`` used by the
+    fc1-phase ablation, and the raw fc1 fp32 pre-SwiGLU activations.
     """
     intermediate_downproj = intermediate // 2
     fc1_fp32 = ref_scaled_mm(
@@ -407,6 +407,7 @@ def compute_megamoe_reference(
 
 
 import cuda.bindings.driver as cuda
+import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 import cutlass.torch as cutlass_torch
@@ -461,8 +462,10 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             num_threads=self.threads_per_warp
             * len((self.mma_warp_id, *self.epilog_warp_id)),
         )
-        self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
-        self.num_tmem_alloc_cols = cute.arch.get_max_tmem_alloc_cols("sm_100")
+        # Resolve SMEM from the active cuTeDSL target (e.g. SM100 vs SM107).
+        self.arch = get_cutedsl_target_arch()
+        self.smem_capacity = utils.get_smem_capacity_in_bytes()
+        self.num_tmem_alloc_cols = cute.arch.get_max_tmem_alloc_cols(self.arch)
 
     def _setup_attributes(self):
         """Set up configurations that are dependent on GEMM inputs
@@ -1064,6 +1067,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             allocator_warp_id=self.epilog_warp_id[0],
             is_two_cta=use_2cta_instrs,
             two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar.ptr,
+            arch=self.arch,
         )
 
         # Cluster arrive after barrier init

@@ -18,6 +18,7 @@ from .models import (
     Batch,
     CollectedNode,
     Plan,
+    RUNTIME_TIMING_PROFILE,
     Unit,
     base_function_for_nodeid,
     source_file_for_nodeid,
@@ -127,7 +128,12 @@ def _read_suites(path: Path, diagnostics: list[str]) -> list[ET.Element]:
 
 
 def _overhead_for_batch(
-    run_dir: Path, run_id: str, plan: Plan, unit: Unit, batch: Batch
+    run_dir: Path,
+    run_id: str,
+    plan: Plan,
+    unit: Unit,
+    batch: Batch,
+    profile: str,
 ) -> ObservedOverhead | None:
     xml_path = batch_xml_path(run_dir, unit, batch)
     telemetry_path = xml_path.with_name(f"{batch.id}.telemetry.json")
@@ -143,7 +149,7 @@ def _overhead_for_batch(
     startup = max(0.0, collection - launch) + max(0.0, process_exit - report)
     warmup = max(0.0, first_case - collection)
     return ObservedOverhead(
-        profile=plan.options.profile,
+        profile=profile,
         source_file=batch.source_file,
         process_startup_seconds=startup,
         source_warmup_seconds=warmup,
@@ -163,7 +169,7 @@ def _scan_run(
     seen: set[tuple[str, str, str]] = set()
     node_metadata = {node.nodeid: node for node in plan.nodes}
     context = _RunScanContext(
-        profile=plan.options.profile,
+        profile=RUNTIME_TIMING_PROFILE,
         node_metadata=node_metadata,
         run_id=run_id,
         seen=seen,
@@ -177,7 +183,13 @@ def _scan_run(
             ):
                 continue
             suites = _read_suites(raw, diagnostics)
+            batch_profile = RUNTIME_TIMING_PROFILE
             for suite in suites:
+                batch_profile = (
+                    element_properties(suite).get("timing_profile")
+                    or RUNTIME_TIMING_PROFILE
+                )
+                context.profile = batch_profile
                 observations.extend(
                     _parse_batch_suite(
                         suite,
@@ -185,7 +197,9 @@ def _scan_run(
                         context,
                     )
                 )
-            overhead = _overhead_for_batch(run_dir, run_id, plan, unit, batch)
+            overhead = _overhead_for_batch(
+                run_dir, run_id, plan, unit, batch, batch_profile
+            )
             if overhead is not None:
                 overheads.append(overhead)
     adjusted, warmup_excess = adjust_first_case_warmup(observations)
