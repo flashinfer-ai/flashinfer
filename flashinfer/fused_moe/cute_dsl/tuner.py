@@ -728,7 +728,7 @@ class CuteDslFusedMoERunner(TunableRunner):
         )
 
     def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
-        extras = (
+        extras: tuple[Any, ...] = (
             self.quant_mode,
             int(self.activation_type),
             self.swiglu_alpha,
