@@ -17,6 +17,10 @@ def check_shape(m, n, k):
 
 
 def _sm121_tactic(m, n, k, compute_capability):
+    if compute_capability == (12, 1) and (m, n, k) == (512, 5120, 640):
+        return ("cooperative", 128, 128, 128)
+    if compute_capability == (12, 1) and (m, n, k) == (512, 5120, 2560):
+        return ("cooperative", 128, 64, 256)
     if compute_capability == (12, 1) and (m, n, k) in (
         (256, 7168, 256),
         (256, 7168, 512),
@@ -143,6 +147,7 @@ def compatible(m, n, k, tactic, *, compute_capability=None):
         or tactic in legacy_choices
         or (
             tactic == ("cooperative", 128, 128, 256)
+            and m == 2000
             and _sm121_tactic(m, n, k, compute_capability)
             == ("cooperative", 128, 128, 128)
         )
