@@ -346,7 +346,6 @@ def _build_decode_gen_schedule(
     active_splits_kv: Int32 | None = None,
     static_full_split_prefix: bool = False,
     tile_sched_params: utils.ClcDynamicPersistentTileSchedulerParams | None = None,
-    clc_response_ptr: cute.Pointer | None = None,
     use_variable_seqlens_kv: bool = False,
     use_native_paged_kv: bool = False,
     use_static_native_seqlens_kv: bool = False,
@@ -570,10 +569,10 @@ def _build_decode_gen_schedule(
     # stats or TMEM-P alias S: their overwrite-credit cadence is tied to each
     # instruction. Dense Swaps uses the shared FIFO, including staged H256.
     # Sparse KV128 keeps instruction-local rings in either MMA orientation;
-    # sparse KV256 reuses its only feasible three-stage shared data ring while
-    # retaining instruction-local route metadata. The load warp issues V(route
-    # R) before replacing that metadata with route R+1, so its lifetime remains
-    # independent of the K/V data-ring depth.
+    # sparse KV256 reuses the shared data ring at its element-width-derived
+    # depth while retaining instruction-local route metadata. The load warp
+    # issues V(route R) before replacing that metadata with route R+1, so its
+    # lifetime remains independent of the K/V data-ring depth.
     # With cfg.keeps_stats_via_smem the stats-alias justification no longer
     # applies, but the shared FIFO still causes a material Q128 regression, so
     # the instruction-local FIFO gate remains part of that kernel policy.
@@ -852,13 +851,11 @@ def _build_decode_gen_schedule(
             ),
             cta_layout_vmnk=cta_layout,
         )
+        # The scheduler config needs the CLC response slots' address, which
+        # exists once the unified SMEM layout is computed below; the queue is
+        # created without a config and bound there.
         work_queue_kwargs = {
-            "tile_scheduler_config": (
-                TileSchedulerConfig.create_clc_dynamic_persistent_tile_scheduler_params(
-                    tile_scheduler_params=tile_sched_params,
-                    response_ptr=clc_response_ptr,
-                )
-            ),
+            "tile_scheduler_config": None,
             "pipeline_config": wq_pipeline_config,
             "name": "work_queue",
         }
@@ -1405,15 +1402,29 @@ def _build_decode_gen_schedule(
     if not use_one_inst_qkv:
         smem_resources.append(tmem_corr1)
 
-    def allocate_smem() -> SmemAllocator:
+    def allocate_smem() -> tuple[SmemAllocator, SmemAllocation | None]:
         allocator = SmemAllocator()
+        clc_response_alloc = None
         for resource in smem_resources:
             allocator.add_resource(resource)
+            if resource is work_queue and tile_sched_params is not None:
+                # A separately allocated response buffer costs every worker
+                # role one uniform value that ptxas demotes to local memory
+                # across the persistent loop; a compile-time offset from the
+                # unified base every role already holds removes that reload.
+                clc_response_alloc = allocator.add(
+                    SmemAllocation(
+                        "clc_response",
+                        dtype=cutlass.Int128,
+                        count=_PERSISTENT_SCHEDULE_TOKEN_STAGES,
+                        alignment=16,
+                    )
+                )
         allocator.add_tmem_ptr(
             SmemAllocation("fmha_tmem_ptr_i32", dtype=cutlass.Int32, alignment=4)
         )
         allocator.compute_layout()
-        return allocator
+        return allocator, clc_response_alloc
 
     def smem_bytes(allocator: SmemAllocator) -> int:
         # Include barriers and conservatively round data to tensor alignment.
@@ -1421,7 +1432,7 @@ def _build_decode_gen_schedule(
             allocator.total_smem_bytes + cfg.stensor_align - 1
         ) // cfg.stensor_align * cfg.stensor_align + allocator.barrier_smem_bytes
 
-    smem_allocator = allocate_smem()
+    smem_allocator, clc_response_alloc = allocate_smem()
     if cfg.uses_q_token_kv_block_sparse_page_membership:
         budget = TOTAL_SMEM_BUDGET_KIB * BYTES_PER_KIB
         if smem_bytes(smem_allocator) > budget:
@@ -1432,9 +1443,25 @@ def _build_decode_gen_schedule(
             assert smem_page_offsets is not None
             smem_page_offsets.cache_memberships_in_smem = False
             smem_page_offsets._init_placeholder_state()
-            smem_allocator = allocate_smem()
+            smem_allocator, clc_response_alloc = allocate_smem()
         if smem_bytes(smem_allocator) > budget:
             raise ValueError("QToken sparse attention resources exceed the SMEM budget")
+    if clc_response_alloc is not None:
+        # The slots are a compile-time offset from the unified base address that
+        # every role already holds; this is the one place the scheduler config
+        # is built, before the task manager creates the work queue.
+        smem_allocator.allocate()
+        work_queue.tile_scheduler_config = (
+            TileSchedulerConfig.create_clc_dynamic_persistent_tile_scheduler_params(
+                tile_scheduler_params=tile_sched_params,
+                response_ptr=cute.make_ptr(
+                    cutlass.Int128,
+                    smem_allocator.get(clc_response_alloc).data_ptr(),
+                    mem_space=cutlass.AddressSpace.smem,
+                    assumed_align=16,
+                ),
+            )
+        )
 
     # ------------------------------------------------------------------
     # Domain computation
@@ -2339,7 +2366,6 @@ def _run_decode_gen_active(
         if cutlass.const_expr(use_runtime_seqlens_kv)
         else Int32(cfg.static_seq_len_kv)
     )
-    use_clc_dynamic_scheduler = cfg.use_persistent_scheduler
     tma_desc_k_summary_ptr = None
     tma_desc_v_summary_ptr = None
     tma_desc_k_summary_atom_ptr = None
@@ -2378,12 +2404,6 @@ def _run_decode_gen_active(
                 prims.prefetch_tensormap(tma_desc_k_summary_atom_ptr)
                 prims.prefetch_tensormap(tma_desc_v_summary_atom_ptr)
     init_warp += 1
-
-    clc_response_ptr = None
-    if cutlass.const_expr(use_clc_dynamic_scheduler):
-        clc_response_ptr = cute.arch.alloc_smem(
-            cutlass.Int128, _PERSISTENT_SCHEDULE_TOKEN_STAGES
-        )
 
     q_output_rows = g_h_r
     if cutlass.const_expr(cfg.max_seq_len_q > 1):
@@ -2463,7 +2483,6 @@ def _run_decode_gen_active(
         active_splits_kv=(None if defer_runtime_split_pruning else active_splits_kv),
         static_full_split_prefix=static_full_split_prefix,
         tile_sched_params=tile_sched_params,
-        clc_response_ptr=clc_response_ptr,
         use_variable_seqlens_kv=use_variable_seqlens_kv,
         use_native_paged_kv=use_native_paged_kv,
         use_static_native_seqlens_kv=use_static_native_seqlens_kv,
