@@ -18,6 +18,7 @@ from dataclasses import dataclass
 import logging
 import os
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Generator
@@ -355,9 +356,20 @@ def download_artifacts() -> None:
         total=len(cubin_files), desc="Downloading cubins"
     ) as pbar:
         pbar.update(len(cached_files))
+        sessions_by_thread: dict[int, requests.Session] = {}
+        sessions_lock = threading.Lock()
 
         def update_pbar_cb(_) -> None:
             pbar.update(1)
+
+        def _get_thread_session() -> requests.Session:
+            thread_id = threading.get_ident()
+            with sessions_lock:
+                session = sessions_by_thread.get(thread_id)
+                if session is None:
+                    session = requests.Session()
+                    sessions_by_thread[thread_id] = session
+                return session
 
         def _download_within_retry_window(
             source_path: str,
@@ -365,55 +377,58 @@ def download_artifacts() -> None:
             artifact_name: str,
             kwargs: dict[str, object],
         ) -> bool:
-            with requests.Session() as session:
-                request_kwargs = dict(kwargs)
-                request_kwargs["session"] = session
-                retry_deadline = (
-                    time.monotonic() + retry_window_seconds
-                    if retry_window_seconds > 0
-                    else None
-                )
-                while True:
-                    if download_file(source_path, destination_path, **request_kwargs):
-                        return True
-                    if retry_deadline is None:
-                        return False
-                    remaining = retry_deadline - time.monotonic()
-                    if remaining <= 0:
-                        logger.error(
-                            "Retry window exhausted for %s after %d seconds",
-                            artifact_name,
-                            retry_window_seconds,
-                        )
-                        return False
-                    logger.warning(
-                        "Download failed for %s; retrying while %0.2f seconds remain in retry window",
+            request_kwargs = dict(kwargs)
+            request_kwargs["session"] = _get_thread_session()
+            retry_deadline = (
+                time.monotonic() + retry_window_seconds
+                if retry_window_seconds > 0
+                else None
+            )
+            while True:
+                if download_file(source_path, destination_path, **request_kwargs):
+                    return True
+                if retry_deadline is None:
+                    return False
+                remaining = retry_deadline - time.monotonic()
+                if remaining <= 0:
+                    logger.error(
+                        "Retry window exhausted for %s after %d seconds",
                         artifact_name,
-                        remaining,
+                        retry_window_seconds,
                     )
-                    time.sleep(min(5.0, remaining))
-
-        with ThreadPoolExecutor(num_threads) as pool:
-            futures = []
-            for name, _ in files_to_download:
-                source = safe_urljoin(FLASHINFER_CUBINS_REPOSITORY, name)
-                local_path = FLASHINFER_CUBIN_DIR / name
-                # Ensure parent directory exists
-                local_path.parent.mkdir(parents=True, exist_ok=True)
-                download_kwargs: dict[str, object] = {}
-                if max_retries is not None:
-                    download_kwargs["retries"] = max_retries
-                fut = pool.submit(
-                    _download_within_retry_window,
-                    source,
-                    str(local_path),
-                    name,
-                    download_kwargs,
+                    return False
+                logger.warning(
+                    "Download failed for %s; retrying while %0.2f seconds remain in retry window",
+                    artifact_name,
+                    remaining,
                 )
-                fut.add_done_callback(update_pbar_cb)
-                futures.append(fut)
+                time.sleep(min(5.0, remaining))
 
-            results = [fut.result() for fut in as_completed(futures)]
+        try:
+            with ThreadPoolExecutor(num_threads) as pool:
+                futures = []
+                for name, _ in files_to_download:
+                    source = safe_urljoin(FLASHINFER_CUBINS_REPOSITORY, name)
+                    local_path = FLASHINFER_CUBIN_DIR / name
+                    # Ensure parent directory exists
+                    local_path.parent.mkdir(parents=True, exist_ok=True)
+                    download_kwargs: dict[str, object] = {}
+                    if max_retries is not None:
+                        download_kwargs["retries"] = max_retries
+                    fut = pool.submit(
+                        _download_within_retry_window,
+                        source,
+                        str(local_path),
+                        name,
+                        download_kwargs,
+                    )
+                    fut.add_done_callback(update_pbar_cb)
+                    futures.append(fut)
+
+                results = [fut.result() for fut in as_completed(futures)]
+        finally:
+            for session in sessions_by_thread.values():
+                session.close()
 
     all_success = all(results)
     if not all_success:
