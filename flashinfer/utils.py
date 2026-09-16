@@ -38,6 +38,39 @@ from .jit.spdlog import gen_spdlog_module
 logger = logging.getLogger(__name__)
 
 
+def _copy_to_cpu(*tensors: torch.Tensor) -> List[torch.Tensor]:
+    """Copy planning metadata to the host, waiting once per CUDA source device.
+
+    CPU inputs are returned unchanged. CUDA copies use the source device's
+    current stream, so callers must establish any cross-stream dependencies.
+    The returned tensors are ready for host access.
+    """
+    host_tensors = []
+    streams = {}
+    for tensor in tensors:
+        device = tensor.device
+        if device.type == "cuda":
+            if device not in streams:
+                streams[device] = torch.cuda.current_stream(device)
+            # Nonblocking CUDA-to-CPU to() allocates through PyTorch's caching
+            # pinned allocator, which also tracks asynchronous copy lifetimes.
+            # Keep per-call ownership: a reusable buffer could be overwritten
+            # while an earlier plan's H2D copy still reads it.
+            host = tensor.to(
+                "cpu",
+                non_blocking=True,
+                memory_format=torch.contiguous_format,
+            )
+        elif device.type == "cpu":
+            host = tensor
+        else:
+            host = tensor.to("cpu")
+        host_tensors.append(host)
+    for stream in streams.values():
+        stream.synchronize()
+    return host_tensors
+
+
 class PosEncodingMode(Enum):
     NONE = 0
     ROPE_LLAMA = 1
