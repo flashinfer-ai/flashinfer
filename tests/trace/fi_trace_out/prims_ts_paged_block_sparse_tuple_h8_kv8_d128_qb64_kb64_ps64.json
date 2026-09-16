@@ -1,11 +1,13 @@
 {
   "name": "prims_ts_paged_block_sparse_tuple_h8_kv8_d128_qb64_kb64_ps64",
-  "description": "One-shot PrimTS block-sparse MHA/GQA/MQA attention over compact BSHD Q, the tuple HND paged KV cache form, request page tables, and per-KV-head BSR metadata.",
+  "description": "One-shot PrimTS block-sparse MHA/GQA/MQA attention over compact fixed-length BSHD Q, the tuple HND paged KV cache form, and live request page tables, K/V lengths, and per-KV-head BSR metadata.",
   "op_type": "block_sparse",
   "tags": [
     "fi_api:flashinfer.attention.prims_ts.block_sparse.block_sparse_attention_with_paged_kv_cache",
     "backend:prims-ts",
     "sparse:block",
+    "sparse-format:bsr",
+    "routes:exact",
     "status:experimental",
     "kv-cache:paged"
   ],
@@ -18,9 +20,9 @@
       "type": "var",
       "description": "Fixed query length per request."
     },
-    "seq_len_kv": {
+    "max_seq_len_kv": {
       "type": "var",
-      "description": "Static maximum logical K/V length."
+      "description": "Static maximum logical K/V length planned for every request."
     },
     "num_qo_heads": {
       "type": "const",
@@ -34,14 +36,6 @@
       "type": "const",
       "value": 128
     },
-    "num_q_block_offsets": {
-      "type": "var",
-      "description": "Number of BSR row offsets per batch and KV head."
-    },
-    "num_block_indices": {
-      "type": "var",
-      "description": "Number of selected KV blocks."
-    },
     "num_kv_valid_words": {
       "type": "var",
       "description": "Number of optional token-validity words per batch."
@@ -54,6 +48,14 @@
       "type": "const",
       "value": 64
     },
+    "num_q_block_offsets": {
+      "type": "var",
+      "description": "Number of BSR row offsets per batch and KV head."
+    },
+    "num_block_indices": {
+      "type": "var",
+      "description": "Capacity of the runtime KV-block ID tensor."
+    },
     "num_pages": {
       "type": "var",
       "description": "Total number of allocated physical KV pages."
@@ -62,13 +64,9 @@
       "type": "const",
       "value": 64
     },
-    "num_page_offsets": {
+    "max_pages_per_seq": {
       "type": "var",
-      "description": "Length of the request-to-page indptr array."
-    },
-    "num_page_indices": {
-      "type": "var",
-      "description": "Number of runtime physical page IDs."
+      "description": "Fixed page-table column capacity."
     }
   },
   "constraints": [
@@ -78,12 +76,13 @@
     "q_block_size > 0",
     "(q_block_size * (num_qo_heads // num_kv_heads)) % 8 == 0",
     "kv_block_size in (8, 16, 32) or (kv_block_size > 0 and kv_block_size % 64 == 0)",
+    "kv_valid_bits is None or num_kv_valid_words == (max_seq_len_kv + 31) // 32",
     "num_q_block_offsets == (seq_len_q + q_block_size - 1) // q_block_size + 1",
-    "kv_valid_bits is None or num_kv_valid_words == (seq_len_kv + 31) // 32",
     "mask_type is None or mask_type in ('dense', 'causal')",
-    "num_page_offsets == batch_size + 1",
-    "num_page_indices == paged_kv_indptr[-1].item()",
-    "seq_lens_kv is None or max(seq_lens_kv) <= seq_len_kv",
+    "max_pages_per_seq * page_size >= max_seq_len_kv",
+    "max_seq_len_kv >= (seq_len_q if mask_type == 'causal' else 1)",
+    "min(seq_lens_kv) >= (seq_len_q if mask_type == 'causal' else 1)",
+    "max(seq_lens_kv) <= max_seq_len_kv",
     "page_size in (16, 32, 64, 128)",
     "page_size >= (kv_block_size if kv_block_size < 64 else 64)",
     "page_size % (kv_block_size if kv_block_size < 64 else 64) == 0"
@@ -97,49 +96,6 @@
         "head_dim"
       ],
       "dtype": "float16"
-    },
-    "block_indptr": {
-      "shape": [
-        "batch_size",
-        "num_kv_heads",
-        "num_q_block_offsets"
-      ],
-      "dtype": "int32",
-      "description": "Absolute offsets into block_indices, consumed by the one-shot call."
-    },
-    "block_indices": {
-      "shape": [
-        "num_block_indices"
-      ],
-      "dtype": "int32",
-      "description": "Selected KV block IDs, consumed by the one-shot call."
-    },
-    "kv_valid_bits": {
-      "shape": [
-        "batch_size",
-        "num_kv_valid_words"
-      ],
-      "dtype": "uint32",
-      "optional": true,
-      "description": "Batch-only token validity bits: token t uses bit t % 32 of word t // 32 (LSB-first); one means valid. Padding bits beyond Skv are ignored; consumed by the one-shot call."
-    },
-    "q_block_size": {
-      "shape": null,
-      "dtype": "int32"
-    },
-    "kv_block_size": {
-      "shape": null,
-      "dtype": "int32"
-    },
-    "mask_type": {
-      "shape": null,
-      "dtype": "string",
-      "optional": true
-    },
-    "sm_scale": {
-      "shape": null,
-      "dtype": "float32",
-      "optional": true
     },
     "k_cache": {
       "shape": [
@@ -161,32 +117,68 @@
       "dtype": "float16",
       "description": "V pages in the separate HND paged-cache form."
     },
-    "paged_kv_indptr": {
+    "block_tables": {
       "shape": [
-        "num_page_offsets"
+        "batch_size",
+        "max_pages_per_seq"
       ],
       "dtype": "int32",
-      "description": "Request offsets into paged_kv_indices."
+      "description": "Physical page IDs in a fixed 2D table; rows may use a padded non-overlapping stride and entries beyond the live length are ignored."
     },
-    "paged_kv_indices": {
-      "shape": [
-        "num_page_indices"
-      ],
-      "dtype": "int32",
-      "description": "Runtime physical page IDs."
-    },
-    "seq_len_kv": {
+    "max_seq_len_kv": {
       "shape": null,
       "dtype": "int32",
-      "description": "Static maximum logical K/V length."
+      "description": "Static maximum logical K/V length used for planning."
     },
     "seq_lens_kv": {
       "shape": [
         "batch_size"
       ],
       "dtype": "int32",
+      "description": "Live per-request logical K/V lengths read for this call."
+    },
+    "block_indptr": {
+      "shape": [
+        "batch_size",
+        "num_kv_heads",
+        "num_q_block_offsets"
+      ],
+      "dtype": "int32",
+      "description": "Absolute offsets into block_indices for this call."
+    },
+    "block_indices": {
+      "shape": [
+        "num_block_indices"
+      ],
+      "dtype": "int32",
+      "description": "Runtime KV-block ID capacity; only entries referenced by block_indptr are live."
+    },
+    "kv_valid_bits": {
+      "shape": [
+        "batch_size",
+        "num_kv_valid_words"
+      ],
+      "dtype": "uint32",
       "optional": true,
-      "description": "Optional per-request logical K/V lengths."
+      "description": "Batch-only token validity bits: token t uses bit t % 32 of word t // 32 (LSB-first); one means valid. Padding bits beyond the K/V length are ignored; the mask applies only to exact routes."
+    },
+    "q_block_size": {
+      "shape": null,
+      "dtype": "int32"
+    },
+    "kv_block_size": {
+      "shape": null,
+      "dtype": "int32"
+    },
+    "mask_type": {
+      "shape": null,
+      "dtype": "string",
+      "optional": true
+    },
+    "sm_scale": {
+      "shape": null,
+      "dtype": "float32",
+      "optional": true
     }
   },
   "outputs": {

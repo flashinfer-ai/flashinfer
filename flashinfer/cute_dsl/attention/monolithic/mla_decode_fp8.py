@@ -72,6 +72,13 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cute.arch import Arch
 from cutlass.cutlass_dsl import BaseDSL
 
+# ``Arch.sm_107*`` only exists in CuTe DSL >= 4.8; requirements.txt allows 4.7,
+# where a bare attribute access raises AttributeError as soon as this branch is
+# evaluated (SM100 short-circuits before it, SM103 does not).  Fall back to the
+# sm_103 bounds so an older DSL keeps exactly its pre-Rubin behaviour.
+_ARCH_SM107 = getattr(Arch, "sm_107", Arch.sm_103f)
+_ARCH_SM107F = getattr(Arch, "sm_107f", Arch.sm_103f)
+
 
 from .mla_helpers import (
     ceil_div,
@@ -1845,7 +1852,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         mAccO,
                         mAccLSE,
                         blk_coord,
-                        self.get_valid_q_rows(blk_coord[1]),
+                        q_begin,
+                        valid_q_rows,
                         tidx,
                     )
                 tile_sched.advance_to_next_work()
@@ -1860,6 +1868,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         mAccO: Optional[cute.Tensor],
         mAccLSE: Optional[cute.Tensor],
         blk_coord: cute.Coord,
+        q_begin: cutlass.Int32,
         valid_q_rows: cutlass.Int32,
         tidx: cutlass.Int32,
     ):
@@ -1877,7 +1886,15 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             q_row = cta_row_base + cta_row
             if cute.elem_less(q_row, valid_q_rows):
                 if cutlass.const_expr(mAccO is None):
-                    mO[q_row, d_idx, blk_coord[1], blk_coord[2]] = self.o_dtype(0.0)
+                    if cutlass.const_expr(self.is_var_q):
+                        compact_q_row = (
+                            q_begin * self.num_heads
+                            + blk_coord[1] * self.mma_qk_tiler[0]
+                            + q_row
+                        )
+                        mO[compact_q_row, d_idx, 0] = self.o_dtype(0.0)
+                    else:
+                        mO[q_row, d_idx, blk_coord[1], blk_coord[2]] = self.o_dtype(0.0)
                 else:
                     mAccO[
                         q_row,
@@ -1891,7 +1908,15 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             q_row = cta_row_base + local_tidx
             if cute.elem_less(q_row, valid_q_rows):
                 if cutlass.const_expr(mAccLSE is None):
-                    mLSE[q_row, blk_coord[1], blk_coord[2]] = -self.lse_dtype.inf
+                    if cutlass.const_expr(self.is_var_q):
+                        compact_q_row = (
+                            q_begin * self.num_heads
+                            + blk_coord[1] * self.mma_qk_tiler[0]
+                            + q_row
+                        )
+                        mLSE[compact_q_row, 0, 0] = -self.lse_dtype.inf
+                    else:
+                        mLSE[q_row, blk_coord[1], blk_coord[2]] = -self.lse_dtype.inf
                 else:
                     mAccLSE[
                         q_row, blk_coord[3], blk_coord[1], blk_coord[2]
@@ -3563,6 +3588,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             (arch >= Arch.sm_101 and arch <= Arch.sm_101f)
             or (arch >= Arch.sm_103 and arch <= Arch.sm_103f)
             or (arch >= Arch.sm_110 and arch <= Arch.sm_110f)
+            or (arch >= _ARCH_SM107 and arch <= _ARCH_SM107F)
         ):
             tmem_load_red_atom = cute.make_copy_atom(
                 tcgen05.copy.LdRed32x32bOp(
@@ -4102,7 +4128,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             self.cp_world * first_local_key
             + common_params.cp_rank
             - common_params.causal_seq_len
-            + self.seq_len_q
+            + common_params.q_len
         )
         return cute.elem_less(first_local_key, common_params.K) and not cute.elem_less(
             flat_q_row, mask_threshold

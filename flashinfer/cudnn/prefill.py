@@ -6,6 +6,7 @@ import torch
 
 from ..api_logging import flashinfer_api
 from ..trace.templates.attention import cudnn_batch_prefill_trace
+from ..utils import log2e
 from .utils import get_cudnn_fmha_gen_module
 
 try:
@@ -162,6 +163,7 @@ def _sdpa_prefill_key_fn(
         graph_b,
         q.dim(),
         q.dtype,
+        q.dtype if o_data_type is None else o_data_type,
         k_cache.dim(),
         max_token_seq_q,
         max_sequence_kv,
@@ -174,6 +176,12 @@ def _sdpa_prefill_key_fn(
         bottom_right_causal_mask,
         page_size,
         cu_seq_lens_q is not None,
+        # The graph tensors carry the callers' strides (a packed T3HD q/k/v has a
+        # token stride of 3*h*d, not h*d), so two same-shape calls with different
+        # strides need different graphs.
+        tuple(q.stride()),
+        tuple(k_cache.stride()),
+        tuple(v_cache.stride()),
         # attn_scale is baked into the built graph as a compile-time constant
         # (see _build_prefill_graph); omitting it here silently replays a
         # stale-scale graph for any same-shape call with a different scale.
@@ -287,6 +295,7 @@ if CUDNN_AVAILABLE:
             else:
                 raise ValueError(f"Invalid query tensor shape: {q.shape}")
 
+            q_token_stride = s_stride
             cudnn_q = g.tensor(
                 name="q",
                 dim=(graph_b, h_qo, graph_s_qo, d_qk),
@@ -353,8 +362,9 @@ if CUDNN_AVAILABLE:
                 cudnn_q.set_ragged_offset(ragged_q)
                 if use_cu_seq_lens:
                     # Offsets are token-unit indptrs; the engine scales them
-                    # back to elements.
-                    cudnn_q.set_ragged_offset_multiplier(h_qo * d_qk)
+                    # back to elements with the tensor's own token stride, so a
+                    # non-contiguous q (T3HD: 3*h*d per token) addresses correctly.
+                    cudnn_q.set_ragged_offset_multiplier(q_token_stride)
 
             if v_cache.dim() == 3:
                 assert block_tables is None, (
@@ -383,7 +393,7 @@ if CUDNN_AVAILABLE:
                     ragged_k.set_uid(UIDs.RAGGED_K_UID.value)
                     cudnn_k_cache.set_ragged_offset(ragged_k)
                     if use_cu_seq_lens:
-                        cudnn_k_cache.set_ragged_offset_multiplier(h_kv * d_qk)
+                        cudnn_k_cache.set_ragged_offset_multiplier(s_stride)
 
                 assert v_cache.dim() == 3, (
                     "v_cache must have 3 dimensions since k_cache has 3 dimensions"
@@ -401,7 +411,7 @@ if CUDNN_AVAILABLE:
                     ragged_v.set_uid(UIDs.RAGGED_V_UID.value)
                     cudnn_v_cache.set_ragged_offset(ragged_v)
                     if use_cu_seq_lens:
-                        cudnn_v_cache.set_ragged_offset_multiplier(h_kv * d_vo)
+                        cudnn_v_cache.set_ragged_offset_multiplier(s_stride)
 
             elif k_cache.dim() == 4:
                 cudnn_k_cache = g.tensor(
@@ -715,6 +725,11 @@ def _batch_prefill_with_kv_cache(
     graph.execute(var_map, workspace=workspace_buffer, handle=handle)
 
     if return_lse:
+        # cuDNN emits softmax stats as natural-log LSE; every other FlashInfer
+        # backend returns base-2 LSE (they fold log2e into the softmax scale, so
+        # their kernels emit base-2 directly). Convert here so the cuDNN backend
+        # matches that contract. log2(sum exp(x)) = ln(sum exp(x)) * log2(e).
+        lse.mul_(log2e)
         return out, lse
     else:
         return out, None
@@ -917,10 +932,21 @@ def cudnn_batch_prefill_with_kv_cache(
                 dtype=torch.float32,
             )
 
-    if lse is not None and lse.shape != (num_sequences, max_token_per_sequence, h_qo):
-        raise ValueError(
-            "lse must have shape (num_sequences, max_token_per_sequence, h_qo)"
-        )
+    if lse is not None:
+        padded = (num_sequences, max_token_per_sequence, h_qo)
+        # With a stats ragged offset cuDNN writes each request at its token
+        # offset, so a packed [num_tokens, h_qo] buffer (the wrapper contract)
+        # is a valid target too.
+        packed_ok = batch_offsets_stats is not None and lse.shape == (num_tokens, h_qo)
+        if lse.shape != padded and not packed_ok:
+            raise ValueError(
+                "lse must have shape (num_sequences, max_token_per_sequence, h_qo)"
+                + (
+                    " or, with batch_offsets_stats, (num_tokens, h_qo)"
+                    if batch_offsets_stats is not None
+                    else ""
+                )
+            )
 
     if o_data_type is None:
         o_data_type = q.dtype

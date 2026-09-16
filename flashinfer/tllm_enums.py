@@ -103,6 +103,11 @@ DEFAULT_SWIGLU_ALPHA = 1.0
 DEFAULT_SWIGLU_BETA = 0.0
 DEFAULT_SWIGLU_LIMIT = torch.finfo(torch.float32).max
 
+# SiTU-GLU tanh scales. Must match the SituAdaptor defaults in
+# csrc/fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh.
+DEFAULT_SITU_BETA = 4.0
+DEFAULT_SITU_LINEAR_BETA = 25.0
+
 
 def normalize_activation_type(
     activation_type: Union[int, ActivationType],
@@ -260,3 +265,7 @@ class Fp8QuantizationType(IntEnum):
     DeepSeekFp8 = 1
     # MxFp8 x MxFp8
     MxFp8 = 2
+    # Per-tensor FP8
+    PerTensorFp8 = 3
+    # Per-channel FP8
+    PerChannelFp8 = 4

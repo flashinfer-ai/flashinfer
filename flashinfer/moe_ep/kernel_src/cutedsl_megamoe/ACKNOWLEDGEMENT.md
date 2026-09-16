@@ -1,8 +1,8 @@
 # Acknowledgement
 
 The CuTeDSL MegaMoE kernels vendored under `src/` — the fused
-dispatch + FC1 + SwiGLU + FC2 + combine persistent kernels for NVFP4 and
-MXFP8 expert-parallel MoE on Blackwell, together with their token-comm
+dispatch + FC1 + SwiGLU + FC2 + combine persistent kernels for BF16, NVFP4,
+and MXFP8 expert-parallel MoE on Blackwell, together with their token-comm
 primitives, epilogues, tester, and reference implementations — are the
 work of the NVIDIA CuTeDSL MegaMoE kernel team:
 

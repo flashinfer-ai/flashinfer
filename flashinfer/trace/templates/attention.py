@@ -1,4 +1,4 @@
-# Copyright (c) 2025 by FlashInfer team.
+# Copyright (c) 2025-2026 by FlashInfer team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -24,10 +24,10 @@ the backend column indicates which kernel the API wraps.
 | ``single_decode``               | single request    | contiguous                | none                    | decode  | any (no plan)   |
 | ``single_prefill``              | single request    | contiguous                | none                    | prefill | any (no plan)   |
 | ``gqa_paged_decode``            | batched, ragged   | paged tuple (k, v)        | kv_indptr + kv_indices  | decode  | FA2/FA3/cuDNN   |
-| ``prims_ts_batch_decode``       | batched, ragged   | paged HND tuple/combined  | kv_indptr + optional qo | decode  | PrimTS SM100/SM103 |
+| ``prims_ts_batch_decode``       | batched, ragged   | paged HND tuple/combined  | block tables + seq/qo   | decode  | PrimTS SM100/SM103 |
 | ``gqa_paged_prefill``           | batched, ragged   | paged tuple (k, v)        | +qo_indptr              | prefill | FA2/FA3/cuDNN   |
 | ``gqa_ragged``                  | batched, ragged   | contiguous                | qo_indptr + kv_indptr   | prefill | FA2/FA3         |
-| ``prims_ts_block_sparse``       | batched, fixed    | contiguous BSHD           | per-KV-head BSR + bits  | both    | PrimTS SM100a   |
+| ``prims_ts_block_sparse``       | batched, fixed    | contiguous BSHD           | BSR/bitmask + summaries | both    | PrimTS SM100a   |
 | ``prims_ts_paged_block_sparse`` | batched, fixed    | paged HND tuple/combined  | page table + BSR + bits | both    | PrimTS SM100a   |
 | ``mla_paged_decode``            | batched, ragged   | paged MLA (ckv + kpe)     | kv_indptr + kv_indices  | decode  | DeepSeek MLA    |
 | ``prims_ts_decode_mla``         | batched, ragged Q | paged MLA (ckv + kpe)     | block tables + qo/seq   | decode  | PrimTS SM100/SM103 |
@@ -40,6 +40,7 @@ the backend column indicates which kernel the API wraps.
 +---------------------------------+-------------------+---------------------------+-------------------------+---------+-----------------+
 """
 
+from functools import lru_cache
 import math
 
 import torch
@@ -245,11 +246,191 @@ gqa_paged_decode_trace = TraceTemplate(
 )
 
 
-# PrimTS block-sparse schema. Only the one-shot API can fully express its BSR
-# metadata and block geometry in a trace definition.
+class _BatchDecodePlanTraceTemplate(TraceTemplate):
+    """Trace batch-decode planning metadata, including compatibility kwargs."""
+
+    def build_fi_trace_fn(self, fi_api):
+        build_definition = super().build_fi_trace_fn(fi_api)
+
+        def fi_trace(save_dir=None, name=None, **kwargs):
+            kwargs = dict(kwargs)
+            nested_kwargs = kwargs.pop("kwargs", None)
+            if isinstance(nested_kwargs, dict):
+                kwargs.update(nested_kwargs)
+            return build_definition(save_dir=save_dir, name=name, **kwargs)
+
+        return fi_trace
 
 
-def _make_prims_ts_block_sparse_trace() -> TraceTemplate:
+gqa_paged_decode_plan_trace = _BatchDecodePlanTraceTemplate(
+    op_type="gqa_paged_plan",
+    name_prefix="gqa_paged_decode_plan",
+    description=(
+        "Batch-decode planning metadata for a paged KV cache, including "
+        "query length and explicit causal-mode request."
+    ),
+    axes={
+        "batch_size": Var(description="Number of requests."),
+        "num_qo_heads": Const(abbrev="h"),
+        "num_kv_heads": Const(abbrev="kv"),
+        "head_dim": Const(abbrev="d"),
+        "page_size": Const(abbrev="ps"),
+        "len_indptr": Var(description="Length of indptr array."),
+        "num_kv_indices": Var(description="Total number of KV page indices."),
+        "max_num_blocks_per_seq": Var(
+            description="Maximum number of block-table entries per request."
+        ),
+    },
+    inputs={
+        "indptr": Tensor(["len_indptr"], dtype="int32"),
+        "indices": Tensor(["num_kv_indices"], dtype="int32"),
+        "last_page_len": Tensor(["batch_size"], dtype="int32"),
+        "num_qo_heads": Scalar("int32"),
+        "num_kv_heads": Scalar("int32"),
+        "head_dim": Scalar("int32"),
+        "page_size": Scalar("int32"),
+        "q_len_per_req": Scalar(
+            "int32",
+            optional=True,
+            description="Uniform query tokens per request.",
+        ),
+        "is_causal": Scalar(
+            "bool",
+            optional=True,
+            description="Whether the planned attention mask is causal.",
+        ),
+        "pos_encoding_mode": Scalar("string", optional=True),
+        "window_left": Scalar("int32", optional=True),
+        "window_right": Scalar("int32", optional=True),
+        "logits_soft_cap": Scalar("float32", optional=True),
+        "q_data_type": Scalar("dtype", optional=True),
+        "kv_data_type": Scalar("dtype", optional=True),
+        "o_data_type": Scalar("dtype", optional=True),
+        "data_type": Scalar("dtype", optional=True),
+        "sm_scale": Scalar("float32", optional=True),
+        "rope_scale": Scalar("float32", optional=True),
+        "rope_theta": Scalar("float32", optional=True),
+        "non_blocking": Scalar("bool", optional=True),
+        "fixed_split_size": Scalar("int32", optional=True),
+        "disable_split_kv": Scalar("bool", optional=True),
+        "seq_lens": Tensor(["batch_size"], dtype="int32", optional=True),
+        "block_tables": Tensor(
+            ["batch_size", "max_num_blocks_per_seq"],
+            dtype="int32",
+            optional=True,
+        ),
+    },
+    outputs={},
+    constraints=[
+        "len_indptr == batch_size + 1",
+        "num_qo_heads % num_kv_heads == 0",
+    ],
+    tags=["stage:decode", "phase:plan", "status:experimental"],
+)
+
+
+# PrimTS block-sparse schemas. One-shot APIs receive the block geometry and
+# mask type as call arguments; the reusable wrappers keep them in plan() and
+# expose them as optional trace context. Route metadata is shared by every
+# template of one sparse format and source mode.
+
+_BLOCK_SPARSE_ROUTE_MODES = tuple(
+    (sparse_format, use_proxy_routes)
+    for sparse_format in ("bsr", "bitmask")
+    for use_proxy_routes in (False, True)
+)
+
+
+def _block_sparse_route_schema(
+    sparse_format: str, use_proxy_routes: bool, *, kv_len_axis: str
+):
+    """Return the axes, inputs, constraints, and name suffix of one route mode."""
+
+    if sparse_format == "bsr":
+        axes: dict[str, Var | Const] = {
+            "num_q_block_offsets": Var(
+                description="Number of BSR row offsets per batch and KV head."
+            ),
+            "num_block_indices": Var(
+                description="Capacity of the runtime KV-block ID tensor."
+            ),
+        }
+        inputs: dict[str, Tensor | Scalar] = {
+            "block_indptr": Tensor(
+                ["batch_size", "num_kv_heads", "num_q_block_offsets"],
+                dtype="int32",
+                description="Absolute offsets into block_indices for this call.",
+            ),
+            "block_indices": Tensor(
+                ["num_block_indices"],
+                dtype="int32",
+                description=(
+                    "Runtime KV-block ID capacity; only entries referenced by "
+                    "block_indptr are live."
+                ),
+            ),
+        }
+        constraints = [
+            "num_q_block_offsets == (seq_len_q + q_block_size - 1) // q_block_size + 1"
+        ]
+    elif sparse_format == "bitmask":
+        axes = {
+            "num_q_blocks": Var(description="Number of semantic query-block rows."),
+            "num_exact_block_words": Var(
+                description="Packed exact-block words in each sparse row."
+            ),
+        }
+        inputs = {
+            "exact_block_bits": Tensor(
+                ["batch_size", "num_kv_heads", "num_q_blocks", "num_exact_block_words"],
+                dtype="uint32",
+                description=(
+                    "LSB-first packed exact-block selections for every query-block row."
+                ),
+            ),
+        }
+        constraints = [
+            "num_q_blocks == (seq_len_q + q_block_size - 1) // q_block_size",
+            "num_exact_block_words == "
+            f"((({kv_len_axis} + kv_block_size - 1) // kv_block_size) + 31) // 32",
+        ]
+    else:
+        raise ValueError(f"unsupported sparse format {sparse_format!r}")
+    if use_proxy_routes:
+        axes["num_kv_blocks"] = Var(
+            description="Number of semantic K/V blocks represented by summaries."
+        )
+        inputs["k_summary"] = Tensor(
+            ["batch_size", "num_kv_blocks", "num_kv_heads", "head_dim"],
+            description="Per-block mean K vectors for proxy routes.",
+        )
+        inputs["v_summary"] = Tensor(
+            ["batch_size", "num_kv_blocks", "num_kv_heads", "head_dim"],
+            description="Per-block summed V vectors for proxy routes.",
+        )
+        constraints.extend(
+            [
+                f"num_kv_blocks == ({kv_len_axis} + kv_block_size - 1) // kv_block_size",
+                "mask_type is None or mask_type == 'dense'",
+            ]
+        )
+    else:
+        constraints.append("mask_type is None or mask_type in ('dense', 'causal')")
+    suffix = ""
+    if sparse_format != "bsr" or use_proxy_routes:
+        suffix = f"_{sparse_format}_proxy" if use_proxy_routes else f"_{sparse_format}"
+    return axes, inputs, constraints, suffix
+
+
+def _make_prims_ts_block_sparse_trace(
+    *, sparse_format: str, use_proxy_routes: bool, wrapper: bool
+) -> TraceTemplate:
+    route_axes, route_inputs, route_constraints, suffix = _block_sparse_route_schema(
+        sparse_format, use_proxy_routes, kv_len_axis="seq_len_kv"
+    )
+    route_name = "BSR" if sparse_format == "bsr" else "bitmask"
+    if use_proxy_routes:
+        route_name += " proxy"
     axes: dict[str, Var | Const] = {
         "batch_size": Var(description="Number of requests."),
         "seq_len_q": Var(description="Fixed query length per request."),
@@ -257,32 +438,21 @@ def _make_prims_ts_block_sparse_trace() -> TraceTemplate:
         "num_qo_heads": Const(abbrev="h"),
         "num_kv_heads": Const(abbrev="kv"),
         "head_dim": Const(abbrev="d"),
-        "num_q_block_offsets": Var(
-            description="Number of BSR row offsets per batch and KV head."
-        ),
-        "num_block_indices": Var(description="Number of selected KV blocks."),
         "num_kv_valid_words": Var(
             description="Number of optional token-validity words per batch."
         ),
-        "q_block_size": Const(abbrev="qb"),
-        "kv_block_size": Const(abbrev="kb"),
     }
+    if not wrapper:
+        # run() does not receive the plan-owned block geometry, so wrapper traces
+        # keep it as optional scalars instead of unresolved Const axes.
+        axes["q_block_size"] = Const(abbrev="qb")
+        axes["kv_block_size"] = Const(abbrev="kb")
+    axes.update(route_axes)
     inputs: dict[str, Tensor | Scalar] = {
         "q": Tensor(["batch_size", "seq_len_q", "num_qo_heads", "head_dim"]),
         "k": Tensor(["batch_size", "seq_len_kv", "num_kv_heads", "head_dim"]),
         "v": Tensor(["batch_size", "seq_len_kv", "num_kv_heads", "head_dim"]),
-        "block_indptr": Tensor(
-            ["batch_size", "num_kv_heads", "num_q_block_offsets"],
-            dtype="int32",
-            description=(
-                "Absolute offsets into block_indices, consumed by the one-shot call."
-            ),
-        ),
-        "block_indices": Tensor(
-            ["num_block_indices"],
-            dtype="int32",
-            description="Selected KV block IDs, consumed by the one-shot call.",
-        ),
+        **route_inputs,
         "kv_valid_bits": Tensor(
             ["batch_size", "num_kv_valid_words"],
             dtype="uint32",
@@ -290,21 +460,50 @@ def _make_prims_ts_block_sparse_trace() -> TraceTemplate:
             description=(
                 "Batch-only token validity bits: token t uses bit t % 32 of "
                 "word t // 32 (LSB-first); one means valid. Padding bits "
-                "beyond Skv are ignored; consumed by the one-shot call."
+                "beyond the K/V length are ignored; the mask applies only to "
+                "exact routes."
             ),
         ),
-        "q_block_size": Scalar("int32"),
-        "kv_block_size": Scalar("int32"),
+        "q_block_size": Scalar("int32", optional=wrapper),
+        "kv_block_size": Scalar("int32", optional=wrapper),
         "mask_type": Scalar("string", optional=True),
         "sm_scale": Scalar("float32", optional=True),
     }
+    if wrapper:
+        inputs["validate"] = Scalar(
+            "bool",
+            optional=True,
+            description="Whether to validate per-run tensor structure.",
+        )
+    constraints = [
+        "num_qo_heads % num_kv_heads == 0",
+        "num_qo_heads // num_kv_heads in (1, 2, 4, 8, 16, 32)",
+        "head_dim == 128",
+        "q_block_size > 0",
+        "(q_block_size * (num_qo_heads // num_kv_heads)) % 8 == 0",
+        (
+            "kv_block_size in (8, 16, 32) or "
+            "(kv_block_size > 0 and kv_block_size % 64 == 0)"
+        ),
+        "kv_valid_bits is None or num_kv_valid_words == (seq_len_kv + 31) // 32",
+        *route_constraints,
+    ]
+    if wrapper:
+        description = (
+            "Reusable PrimTS block-sparse MHA/GQA/MQA attention over compact "
+            f"BSHD Q/K/V and live per-KV-head {route_name} metadata. Block "
+            "geometry and mask type are retained by plan() and represented "
+            "as optional trace context."
+        )
+    else:
+        description = (
+            "One-shot PrimTS block-sparse MHA/GQA/MQA attention over compact "
+            f"BSHD Q/K/V and per-KV-head {route_name} metadata."
+        )
     return TraceTemplate(
         op_type="block_sparse",
-        name_prefix="prims_ts_block_sparse",
-        description=(
-            "One-shot PrimTS block-sparse MHA/GQA/MQA attention over compact "
-            "BSHD Q/K/V and per-KV-head BSR metadata."
-        ),
+        name_prefix=f"prims_ts_block_sparse{'_wrapper' if wrapper else ''}{suffix}",
+        description=description,
         axes=axes,
         inputs=inputs,
         outputs={
@@ -314,137 +513,210 @@ def _make_prims_ts_block_sparse_trace() -> TraceTemplate:
                 param="out",
             )
         },
-        constraints=[
-            "num_qo_heads % num_kv_heads == 0",
-            "num_qo_heads // num_kv_heads in (1, 2, 4, 8, 16, 32)",
-            "head_dim == 128",
-            "q_block_size > 0",
-            "(q_block_size * (num_qo_heads // num_kv_heads)) % 8 == 0",
-            (
-                "kv_block_size in (8, 16, 32) or "
-                "(kv_block_size > 0 and kv_block_size % 64 == 0)"
-            ),
-            "num_q_block_offsets == (seq_len_q + q_block_size - 1) // q_block_size + 1",
-            "kv_valid_bits is None or num_kv_valid_words == (seq_len_kv + 31) // 32",
-            "mask_type is None or mask_type in ('dense', 'causal')",
-        ],
+        constraints=constraints,
         tags=[
             "backend:prims-ts",
             "sparse:block",
+            f"sparse-format:{sparse_format}",
+            "routes:proxy" if use_proxy_routes else "routes:exact",
             "status:experimental",
         ],
     )
 
 
-prims_ts_block_sparse_trace = _make_prims_ts_block_sparse_trace()
-
-
-def _make_prims_ts_paged_block_sparse_trace(*, combined: bool) -> TraceTemplate:
-    """Extend the one-shot block-sparse schema with paged-KV inputs."""
-
-    contiguous = _make_prims_ts_block_sparse_trace()
-    cache_form = "combined" if combined else "tuple"
-    axes = dict(contiguous.axes)
-    axes["seq_len_kv"] = Var(description="Static maximum logical K/V length.")
-    axes.update(
-        {
-            "num_pages": Var(
-                description="Total number of allocated physical KV pages."
-            ),
-            "page_size": Const(abbrev="ps"),
-            "num_page_offsets": Var(
-                description="Length of the request-to-page indptr array."
-            ),
-            "num_page_indices": Var(description="Number of runtime physical page IDs."),
-        }
+_PRIMS_TS_BLOCK_SPARSE_TRACES = {
+    (sparse_format, use_proxy_routes): _make_prims_ts_block_sparse_trace(
+        sparse_format=sparse_format,
+        use_proxy_routes=use_proxy_routes,
+        wrapper=False,
     )
+    for sparse_format, use_proxy_routes in _BLOCK_SPARSE_ROUTE_MODES
+}
+prims_ts_block_sparse_trace = _PRIMS_TS_BLOCK_SPARSE_TRACES[("bsr", False)]
+
+
+def prims_ts_block_sparse_trace_dispatch(**kwargs):
+    """Select a contiguous one-shot schema from its explicit route mode."""
+
+    sparse_format = kwargs.get("sparse_format", "bsr")
+    use_proxy_routes = kwargs.get("use_proxy_routes", False)
+    return _PRIMS_TS_BLOCK_SPARSE_TRACES[(sparse_format, use_proxy_routes)]
+
+
+prims_ts_block_sparse_trace_dispatch.templates = list(  # type: ignore[attr-defined]
+    _PRIMS_TS_BLOCK_SPARSE_TRACES.values()
+)
+
+
+def _make_prims_ts_paged_block_sparse_trace(
+    *, combined: bool, wrapper: bool
+) -> TraceTemplate:
+    route_axes, route_inputs, route_constraints, _ = _block_sparse_route_schema(
+        "bsr", False, kv_len_axis="max_seq_len_kv"
+    )
+    cache_form = "combined" if combined else "tuple"
+    axes: dict[str, Var | Const] = {
+        "batch_size": Var(description="Number of requests."),
+        "seq_len_q": Var(description="Fixed query length per request."),
+        "max_seq_len_kv": Var(
+            description="Static maximum logical K/V length planned for every request."
+        ),
+        "num_qo_heads": Const(abbrev="h"),
+        "num_kv_heads": Const(abbrev="kv"),
+        "head_dim": Const(abbrev="d"),
+        "num_kv_valid_words": Var(
+            description="Number of optional token-validity words per batch."
+        ),
+    }
+    if not wrapper:
+        axes["q_block_size"] = Const(abbrev="qb")
+        axes["kv_block_size"] = Const(abbrev="kb")
+    axes.update(route_axes)
+    axes["num_pages"] = Var(description="Total number of allocated physical KV pages.")
+    axes["page_size"] = Const(abbrev="ps")
     if combined:
         axes["kv_planes"] = Const(
             abbrev="", description="K/V plane count; required to be 2."
         )
+    axes["max_pages_per_seq"] = Var(description="Fixed page-table column capacity.")
 
-    inputs = dict(contiguous.inputs)
-    del inputs["k"], inputs["v"]
+    inputs: dict[str, Tensor | Scalar] = {
+        "q": Tensor(["batch_size", "seq_len_q", "num_qo_heads", "head_dim"]),
+    }
     if combined:
         inputs["paged_kv_cache"] = Tensor(
-            [
-                "num_pages",
-                "kv_planes",
-                "num_kv_heads",
-                "page_size",
-                "head_dim",
-            ],
+            ["num_pages", "kv_planes", "num_kv_heads", "page_size", "head_dim"],
             description="Combined K/V pages in HND layout.",
         )
     else:
-        inputs.update(
-            {
-                "k_cache": Tensor(
-                    ["num_pages", "num_kv_heads", "page_size", "head_dim"],
-                    param="paged_kv_cache",
-                    tuple_idx=0,
-                    description="K pages in the separate HND paged-cache form.",
-                ),
-                "v_cache": Tensor(
-                    ["num_pages", "num_kv_heads", "page_size", "head_dim"],
-                    param="paged_kv_cache",
-                    tuple_idx=1,
-                    description="V pages in the separate HND paged-cache form.",
-                ),
-            }
+        inputs["k_cache"] = Tensor(
+            ["num_pages", "num_kv_heads", "page_size", "head_dim"],
+            param="paged_kv_cache",
+            tuple_idx=0,
+            description="K pages in the separate HND paged-cache form.",
         )
+        inputs["v_cache"] = Tensor(
+            ["num_pages", "num_kv_heads", "page_size", "head_dim"],
+            param="paged_kv_cache",
+            tuple_idx=1,
+            description="V pages in the separate HND paged-cache form.",
+        )
+    inputs["block_tables"] = Tensor(
+        ["batch_size", "max_pages_per_seq"],
+        dtype="int32",
+        description=(
+            "Physical page IDs in a fixed 2D table; rows may use a padded "
+            "non-overlapping stride and entries beyond the live length are ignored."
+        ),
+    )
     inputs.update(
         {
-            "paged_kv_indptr": Tensor(
-                ["num_page_offsets"],
-                dtype="int32",
-                description="Request offsets into paged_kv_indices.",
-            ),
-            "paged_kv_indices": Tensor(
-                ["num_page_indices"],
-                dtype="int32",
-                description="Runtime physical page IDs.",
-            ),
-            "seq_len_kv": Scalar(
+            "max_seq_len_kv": Scalar(
                 "int32",
-                description="Static maximum logical K/V length.",
+                optional=wrapper,
+                description="Static maximum logical K/V length used for planning.",
             ),
             "seq_lens_kv": Tensor(
                 ["batch_size"],
                 dtype="int32",
-                optional=True,
-                description="Optional per-request logical K/V lengths.",
+                description="Live per-request logical K/V lengths read for this call.",
             ),
+            **route_inputs,
+            "kv_valid_bits": Tensor(
+                ["batch_size", "num_kv_valid_words"],
+                dtype="uint32",
+                optional=True,
+                description=(
+                    "Batch-only token validity bits: token t uses bit t % 32 of "
+                    "word t // 32 (LSB-first); one means valid. Padding bits "
+                    "beyond the K/V length are ignored; the mask applies only to "
+                    "exact routes."
+                ),
+            ),
+            "q_block_size": Scalar("int32", optional=wrapper),
+            "kv_block_size": Scalar("int32", optional=wrapper),
+            "mask_type": Scalar("string", optional=True),
+            "sm_scale": Scalar("float32", optional=True),
         }
     )
+    if wrapper:
+        inputs["validate"] = Scalar(
+            "bool",
+            optional=True,
+            description="Whether to validate per-run tensor structure.",
+        )
 
-    return TraceTemplate(
-        op_type=contiguous.op_type,
-        name_prefix=f"prims_ts_paged_block_sparse_{cache_form}",
-        description=(
-            "One-shot PrimTS block-sparse MHA/GQA/MQA attention over compact "
-            f"BSHD Q, the {cache_form} HND paged KV cache form, request page "
-            "tables, and per-KV-head BSR metadata."
+    constraints = [
+        "num_qo_heads % num_kv_heads == 0",
+        "num_qo_heads // num_kv_heads in (1, 2, 4, 8, 16, 32)",
+        "head_dim == 128",
+        "q_block_size > 0",
+        "(q_block_size * (num_qo_heads // num_kv_heads)) % 8 == 0",
+        (
+            "kv_block_size in (8, 16, 32) or "
+            "(kv_block_size > 0 and kv_block_size % 64 == 0)"
         ),
-        axes=axes,
-        inputs=inputs,
-        outputs=dict(contiguous.outputs),
-        constraints=[
-            *contiguous.constraints,
-            "num_page_offsets == batch_size + 1",
-            "num_page_indices == paged_kv_indptr[-1].item()",
-            "seq_lens_kv is None or max(seq_lens_kv) <= seq_len_kv",
+        "kv_valid_bits is None or num_kv_valid_words == (max_seq_len_kv + 31) // 32",
+        *route_constraints,
+    ]
+    constraints.append("max_pages_per_seq * page_size >= max_seq_len_kv")
+    constraints.extend(
+        [
+            "max_seq_len_kv >= (seq_len_q if mask_type == 'causal' else 1)",
+            "min(seq_lens_kv) >= (seq_len_q if mask_type == 'causal' else 1)",
+            "max(seq_lens_kv) <= max_seq_len_kv",
             "page_size in (16, 32, 64, 128)",
             "page_size >= (kv_block_size if kv_block_size < 64 else 64)",
             "page_size % (kv_block_size if kv_block_size < 64 else 64) == 0",
-            *(["kv_planes == 2"] if combined else []),
+        ]
+    )
+    if combined:
+        constraints.append("kv_planes == 2")
+
+    if wrapper:
+        description = (
+            "Reusable PrimTS block-sparse MHA/GQA/MQA attention over compact "
+            f"fixed-length BSHD Q, the {cache_form} HND paged KV cache form, "
+            "and live page tables, K/V lengths, and per-KV-head BSR metadata. "
+            "Static K/V capacity, block geometry, and mask type are retained "
+            "by plan() and represented as optional trace context."
+        )
+    else:
+        description = (
+            "One-shot PrimTS block-sparse MHA/GQA/MQA attention over compact "
+            f"fixed-length BSHD Q, the {cache_form} HND paged KV cache form, "
+            "and live request page tables, K/V lengths, and per-KV-head BSR "
+            "metadata."
+        )
+    return TraceTemplate(
+        op_type="block_sparse",
+        name_prefix=(
+            f"prims_ts_paged_block_sparse{'_wrapper' if wrapper else ''}_{cache_form}"
+        ),
+        description=description,
+        axes=axes,
+        inputs=inputs,
+        outputs={
+            "output": Tensor(
+                ["batch_size", "seq_len_q", "num_qo_heads", "head_dim"],
+                dtype_from="q",
+                param="out",
+            )
+        },
+        constraints=constraints,
+        tags=[
+            "backend:prims-ts",
+            "sparse:block",
+            "sparse-format:bsr",
+            "routes:exact",
+            "status:experimental",
+            "kv-cache:paged",
         ],
-        tags=[*contiguous.tags, "kv-cache:paged"],
     )
 
 
 _PRIMS_TS_PAGED_BLOCK_SPARSE_TRACES = {
-    combined: _make_prims_ts_paged_block_sparse_trace(combined=combined)
+    combined: _make_prims_ts_paged_block_sparse_trace(combined=combined, wrapper=False)
     for combined in (False, True)
 }
 
@@ -458,6 +730,69 @@ def prims_ts_paged_block_sparse_trace_dispatch(**kwargs):
 
 prims_ts_paged_block_sparse_trace_dispatch.templates = list(  # type: ignore[attr-defined]
     _PRIMS_TS_PAGED_BLOCK_SPARSE_TRACES.values()
+)
+
+
+_PRIMS_TS_BLOCK_SPARSE_WRAPPER_TRACES = {
+    (sparse_format, use_proxy_routes): _make_prims_ts_block_sparse_trace(
+        sparse_format=sparse_format,
+        use_proxy_routes=use_proxy_routes,
+        wrapper=True,
+    )
+    for sparse_format, use_proxy_routes in _BLOCK_SPARSE_ROUTE_MODES
+}
+
+
+def _require_prims_ts_block_sparse_wrapper_state(
+    kwargs: dict[str, object], wrapper_name: str
+) -> object:
+    """Require bound-method tracing after the reusable wrapper is planned."""
+
+    wrapper = kwargs.get("self")
+    if wrapper is None:
+        raise ValueError(
+            f"Tracing {wrapper_name}.run requires the live wrapper's plan state. "
+            "Use flashinfer.fi_trace(wrapper.run, ...) instead of "
+            "wrapper.run.fi_trace(...)."
+        )
+    state = getattr(wrapper, "_plan_state", None)
+    if state is None:
+        raise RuntimeError("plan() must be called before run()")
+    return state
+
+
+def prims_ts_block_sparse_wrapper_trace_dispatch(**kwargs):
+    """Trace a planned contiguous block-sparse wrapper run."""
+
+    state = _require_prims_ts_block_sparse_wrapper_state(kwargs, "BlockSparseTSWrapper")
+    route_mode = (
+        state.sparse_format,  # type: ignore[attr-defined]
+        state.use_proxy_routes,  # type: ignore[attr-defined]
+    )
+    return _PRIMS_TS_BLOCK_SPARSE_WRAPPER_TRACES[route_mode]
+
+
+prims_ts_block_sparse_wrapper_trace_dispatch.templates = list(  # type: ignore[attr-defined]
+    _PRIMS_TS_BLOCK_SPARSE_WRAPPER_TRACES.values()
+)
+
+
+_PRIMS_TS_PAGED_BLOCK_SPARSE_WRAPPER_TRACES = {
+    combined: _make_prims_ts_paged_block_sparse_trace(combined=combined, wrapper=True)
+    for combined in (False, True)
+}
+
+
+def prims_ts_paged_block_sparse_wrapper_trace_dispatch(**kwargs):
+    """Trace a planned paged block-sparse wrapper for either cache form."""
+
+    _require_prims_ts_block_sparse_wrapper_state(kwargs, "BlockSparsePagedTSWrapper")
+    combined = isinstance(kwargs.get("paged_kv_cache"), torch.Tensor)
+    return _PRIMS_TS_PAGED_BLOCK_SPARSE_WRAPPER_TRACES[combined]
+
+
+prims_ts_paged_block_sparse_wrapper_trace_dispatch.templates = list(  # type: ignore[attr-defined]
+    _PRIMS_TS_PAGED_BLOCK_SPARSE_WRAPPER_TRACES.values()
 )
 
 
@@ -502,7 +837,17 @@ def _fmha_q_schema(q_mode: str):
     )
 
 
-def _add_fmha_cache_schema(inputs, axes, *, cache_param: str, combined: bool):
+def _add_fmha_cache_schema(
+    inputs, axes, *, cache_param: str, combined: bool, encoded_page_size: bool = False
+):
+    storage_axis = "storage_page_size" if encoded_page_size else "page_size"
+    if encoded_page_size:
+        axes["storage_page_size"] = axes["page_size"]
+        axes["page_size"] = Const(
+            abbrev="sps",
+            value=4,
+            description="Semantic size addressed by encoded subpage locators.",
+        )
     if combined:
         axes["kv_planes"] = Const(
             abbrev="", description="K/V plane count; required to be 2."
@@ -512,24 +857,68 @@ def _add_fmha_cache_schema(inputs, axes, *, cache_param: str, combined: bool):
                 "num_pages",
                 "kv_planes",
                 "num_kv_heads",
-                "page_size",
+                storage_axis,
                 "head_dim",
             ]
         )
         return
     inputs["k_cache"] = Tensor(
-        ["num_pages", "num_kv_heads", "page_size", "head_dim"],
+        ["num_pages", "num_kv_heads", storage_axis, "head_dim"],
         param=cache_param,
         tuple_idx=0,
     )
     inputs["v_cache"] = Tensor(
-        ["num_pages", "num_kv_heads", "page_size", "head_dim"],
+        ["num_pages", "num_kv_heads", storage_axis, "head_dim"],
         param=cache_param,
         tuple_idx=1,
     )
 
 
-def _fmha_trace_variant(kwargs, *, query_param: str, cache_param: str):
+def _fmha_cache_storage_page_size(cache) -> int | None:
+    """Return the physical token extent of an HND paged-KV cache."""
+
+    if isinstance(cache, torch.Tensor):
+        return int(cache.shape[-2]) if cache.ndim >= 2 else None
+    if isinstance(cache, (tuple, list)) and cache:
+        first_cache = cache[0]
+        if isinstance(first_cache, torch.Tensor) and first_cache.ndim >= 2:
+            return int(first_cache.shape[-2])
+    return None
+
+
+def _fmha_uses_encoded_page_size(kwargs, *, cache_param: str) -> bool:
+    """Whether an explicit semantic page size differs from cache storage."""
+
+    semantic_page_size = kwargs.get("page_size")
+    if semantic_page_size is None:
+        return False
+    if isinstance(semantic_page_size, bool) or not isinstance(semantic_page_size, int):
+        raise TypeError("page_size must be an integer when tracing PrimTS decode")
+    storage_page_size = _fmha_cache_storage_page_size(kwargs.get(cache_param))
+    if storage_page_size is None:
+        raise ValueError(
+            "Tracing an explicit PrimTS page_size requires a paged KV cache "
+            "whose physical storage extent can be inspected."
+        )
+    if semantic_page_size == storage_page_size:
+        return False
+    if semantic_page_size != 4:
+        raise ValueError(
+            "A PrimTS page_size that differs from the physical cache extent "
+            "must be 4 (encoded subpage locators)."
+        )
+    if (
+        storage_page_size <= semantic_page_size
+        or storage_page_size % semantic_page_size
+    ):
+        raise ValueError(
+            "Encoded PrimTS cache storage must be larger than and divisible "
+            "by the semantic page size."
+        )
+    return True
+
+
+def _fmha_trace_variant(kwargs, *, query_param: str, cache_param: str, plan_state=None):
     query = kwargs.get(query_param)
     if kwargs.get("qo_indptr") is not None:
         q_mode = _Q_PACKED
@@ -540,15 +929,17 @@ def _fmha_trace_variant(kwargs, *, query_param: str, cache_param: str):
 
     out = kwargs.get("out")
     requested_out_dtype = kwargs.get("out_dtype")
+    if plan_state is None:
+        plan_state = getattr(kwargs.get("self"), "_plan_state", None)
     if isinstance(out, torch.Tensor):
         output_dtype = out.dtype
     elif isinstance(requested_out_dtype, torch.dtype):
         output_dtype = requested_out_dtype
-    elif isinstance(getattr(kwargs.get("self"), "_output_dtype", None), torch.dtype):
+    elif isinstance(getattr(plan_state, "output_dtype", None), torch.dtype):
         # Reusable wrappers retain the planned output dtype.  In particular,
         # an FP8-input plan may allocate FP16 output even though run() has no
         # out_dtype argument and the caller omits an explicit out buffer.
-        output_dtype = kwargs["self"]._output_dtype
+        output_dtype = plan_state.output_dtype
     elif isinstance(query, torch.Tensor):
         output_dtype = query.dtype
     else:
@@ -561,8 +952,11 @@ def _fmha_trace_variant(kwargs, *, query_param: str, cache_param: str):
     return isinstance(kwargs.get(cache_param), torch.Tensor), fp16_output, q_mode
 
 
-def _make_attention_ts_decode_trace(*, combined: bool, fp16_output: bool, q_mode: str):
+def _make_attention_ts_decode_trace(
+    *, combined: bool, fp16_output: bool, q_mode: str, encoded_page_size: bool = False
+):
     cache_form = "combined" if combined else "tuple"
+    page_suffix = "_encoded_page4" if encoded_page_size else ""
     output_suffix = "_fp16_output" if fp16_output else ""
     q_axes, q_shape, output_shape, q_suffix = _fmha_q_schema(q_mode)
     axes: dict[str, Var | Const] = {
@@ -572,19 +966,23 @@ def _make_attention_ts_decode_trace(*, combined: bool, fp16_output: bool, q_mode
         "head_dim": Const(abbrev="d"),
         "num_pages": Var(description="Physical KV-cache page capacity."),
         "page_size": Const(abbrev="ps"),
-        "len_indptr": Var(description="Length of the native CSR indptr."),
-        "num_kv_indices": Var(description="Number of referenced page IDs."),
+        "max_pages_per_seq": Var(
+            description="Physical page-table capacity per request."
+        ),
         "len_qo_indptr": Var(description="Length of cumulative Q offsets."),
     }
     inputs: dict[str, Tensor | Scalar] = {"q": Tensor(q_shape)}
     _add_fmha_cache_schema(
-        inputs, axes, cache_param="paged_kv_cache", combined=combined
+        inputs,
+        axes,
+        cache_param="paged_kv_cache",
+        combined=combined,
+        encoded_page_size=encoded_page_size,
     )
     inputs.update(
         {
-            "paged_kv_indptr": Tensor(["len_indptr"], dtype="int32"),
-            "paged_kv_indices": Tensor(["num_kv_indices"], dtype="int32"),
-            "paged_kv_last_page_len": Tensor(["batch_size"], dtype="int32"),
+            "block_tables": Tensor(["batch_size", "max_pages_per_seq"], dtype="int32"),
+            "seq_lens_kv": Tensor(["batch_size"], dtype="int32"),
             "qo_indptr": Tensor(
                 ["len_qo_indptr"], dtype="int32", optional=q_mode != _Q_PACKED
             ),
@@ -598,12 +996,24 @@ def _make_attention_ts_decode_trace(*, combined: bool, fp16_output: bool, q_mode
             "out_dtype": Scalar("dtype", optional=True),
         }
     )
+    if encoded_page_size:
+        inputs["semantic_page_size"] = Scalar(
+            "int32",
+            param="page_size",
+            description="Semantic page size, fixed to four for encoded locators.",
+        )
     constraints = [
         "head_dim in (64, 128, 256)",
-        "page_size in (16, 32, 64, 128)",
-        "len_indptr == batch_size + 1",
+        "page_size in (4, 16, 32, 64, 128)",
+        *(
+            ["storage_page_size > page_size", "storage_page_size % page_size == 0"]
+            if encoded_page_size
+            else []
+        ),
+        "max_pages_per_seq * page_size >= max(seq_lens_kv)",
+        "min(seq_lens_kv) >= 1",
         "num_qo_heads % num_kv_heads == 0",
-        "1 <= num_qo_heads // num_kv_heads <= 32",
+        "1 <= num_qo_heads // num_kv_heads <= 128",
         "window_left == -1 or mask_type == 'causal'",
         "kv_layout == 'HND'",
     ]
@@ -623,10 +1033,10 @@ def _make_attention_ts_decode_trace(*, combined: bool, fp16_output: bool, q_mode
         constraints.append("seq_len_q == 1")
     return TraceTemplate(
         op_type="gqa_paged",
-        name_prefix=f"attention_ts_decode_{cache_form}{output_suffix}{q_suffix}",
+        name_prefix=f"attention_ts_decode_{cache_form}{page_suffix}{output_suffix}{q_suffix}",
         description=(
-            "One-shot PrimTS GQA decode over FlashInfer native CSR paged KV "
-            f"metadata using the {cache_form} HND cache form. Fixed multi-Q "
+            "One-shot PrimTS GQA decode over a fixed row-strided page table "
+            f"using the {cache_form} HND cache form. Fixed multi-Q "
             "uses [B,SQ,Hq,D]; packed Q uses [total_q,Hq,D] with cumulative "
             "qo_indptr offsets."
         ),
@@ -646,19 +1056,26 @@ def _make_attention_ts_decode_trace(*, combined: bool, fp16_output: bool, q_mode
 
 
 _ATTENTION_TS_DECODE_TRACES = {
-    (combined, fp16_output, q_mode): _make_attention_ts_decode_trace(
-        combined=combined, fp16_output=fp16_output, q_mode=q_mode
+    (combined, fp16_output, q_mode, encoded_page_size): _make_attention_ts_decode_trace(
+        combined=combined,
+        fp16_output=fp16_output,
+        q_mode=q_mode,
+        encoded_page_size=encoded_page_size,
     )
     for combined in (False, True)
     for fp16_output in (False, True)
     for q_mode in (_Q_FIXED_ONE, _Q_FIXED_MULTI, _Q_PACKED)
+    for encoded_page_size in (False, True)
 }
 
 
 def attention_ts_decode_trace_dispatch(**kwargs):
     """Select one-shot FMHA storage, cache, and output-dtype schema."""
 
-    key = _fmha_trace_variant(kwargs, query_param="q", cache_param="paged_kv_cache")
+    key = (
+        *_fmha_trace_variant(kwargs, query_param="q", cache_param="paged_kv_cache"),
+        _fmha_uses_encoded_page_size(kwargs, cache_param="paged_kv_cache"),
+    )
     return _ATTENTION_TS_DECODE_TRACES[key]
 
 
@@ -667,8 +1084,11 @@ attention_ts_decode_trace_dispatch.templates = list(  # type: ignore[attr-define
 )
 
 
-def _make_prims_ts_decode_trace(*, combined: bool, fp16_output: bool, q_mode: str):
+def _make_prims_ts_decode_trace(
+    *, combined: bool, fp16_output: bool, q_mode: str, encoded_page_size: bool = False
+):
     cache_form = "combined" if combined else "tuple"
+    page_suffix = "_encoded_page4" if encoded_page_size else ""
     output_suffix = "_fp16_output" if fp16_output else ""
     q_axes, query_shape, output_shape, q_suffix = _fmha_q_schema(q_mode)
     axes: dict[str, Var | Const] = {
@@ -679,8 +1099,9 @@ def _make_prims_ts_decode_trace(*, combined: bool, fp16_output: bool, q_mode: st
         "num_pages": Var(description="Physical KV-cache page capacity."),
         "page_size": Const(abbrev="ps"),
         "workspace_size": Var(description="Caller workspace size in bytes."),
-        "len_indptr": Var(description="Length of the native CSR indptr."),
-        "num_kv_indices": Var(description="Number of referenced page IDs."),
+        "max_pages_per_seq": Var(
+            description="Physical page-table capacity per request."
+        ),
         "len_qo_indptr": Var(description="Length of cumulative Q offsets."),
         "max_seq_len": Const(
             abbrev="s", description="Exact compiled maximum KV sequence length."
@@ -691,7 +1112,13 @@ def _make_prims_ts_decode_trace(*, combined: bool, fp16_output: bool, q_mode: st
             abbrev="sq", description="Static packed-Q JIT/workspace bound."
         )
     inputs: dict[str, Tensor | Scalar] = {"query": Tensor(query_shape)}
-    _add_fmha_cache_schema(inputs, axes, cache_param="kv_cache", combined=combined)
+    _add_fmha_cache_schema(
+        inputs,
+        axes,
+        cache_param="kv_cache",
+        combined=combined,
+        encoded_page_size=encoded_page_size,
+    )
     inputs.update(
         {
             "workspace_buffer": Tensor(
@@ -699,8 +1126,7 @@ def _make_prims_ts_decode_trace(*, combined: bool, fp16_output: bool, q_mode: st
                 dtype="uint8",
                 description="Exclusive caller-owned int8/uint8 scratch buffer.",
             ),
-            "paged_kv_indptr": Tensor(["len_indptr"], dtype="int32"),
-            "paged_kv_indices": Tensor(["num_kv_indices"], dtype="int32"),
+            "block_tables": Tensor(["batch_size", "max_pages_per_seq"], dtype="int32"),
             "seq_lens": Tensor(["batch_size"], dtype="int32"),
             "max_seq_len": Scalar("int32"),
             "seq_len_q": Scalar("int32", optional=True),
@@ -716,12 +1142,25 @@ def _make_prims_ts_decode_trace(*, combined: bool, fp16_output: bool, q_mode: st
             "kv_layout": Scalar("string", optional=True),
         }
     )
+    if encoded_page_size:
+        inputs["semantic_page_size"] = Scalar(
+            "int32",
+            param="page_size",
+            description="Semantic page size, fixed to four for encoded locators.",
+        )
     constraints = [
         "head_dim in (64, 128, 256)",
-        "page_size in (16, 32, 64, 128)",
-        "len_indptr == batch_size + 1",
+        "page_size in (4, 16, 32, 64, 128)",
+        *(
+            ["storage_page_size > page_size", "storage_page_size % page_size == 0"]
+            if encoded_page_size
+            else []
+        ),
+        "max_pages_per_seq * page_size >= max(seq_lens)",
+        "min(seq_lens) >= 1",
+        "max(seq_lens) <= max_seq_len",
         "num_qo_heads % num_kv_heads == 0",
-        "1 <= num_qo_heads // num_kv_heads <= 32",
+        "1 <= num_qo_heads // num_kv_heads <= 128",
         "kv_layout == 'HND'",
         "window_left == -1 or mask_type == 'causal'",
     ]
@@ -741,9 +1180,9 @@ def _make_prims_ts_decode_trace(*, combined: bool, fp16_output: bool, q_mode: st
         constraints.append("seq_len_q == 1")
     return TraceTemplate(
         op_type="gqa_paged",
-        name_prefix=f"prims_ts_batch_decode_{cache_form}{output_suffix}{q_suffix}",
+        name_prefix=f"prims_ts_batch_decode_{cache_form}{page_suffix}{output_suffix}{q_suffix}",
         description=(
-            "Standalone PrimTS GQA decode over FlashInfer native CSR page "
+            "Standalone PrimTS GQA decode over a fixed row-strided page "
             f"metadata using the {cache_form} HND cache form and caller-owned "
             "workspace. Fixed multi-Q uses [B,SQ,Hq,D]; packed Q uses "
             "[total_q,Hq,D] with cumulative qo_indptr offsets."
@@ -764,19 +1203,26 @@ def _make_prims_ts_decode_trace(*, combined: bool, fp16_output: bool, q_mode: st
 
 
 _PRIMS_TS_DECODE_TRACES = {
-    (combined, fp16_output, q_mode): _make_prims_ts_decode_trace(
-        combined=combined, fp16_output=fp16_output, q_mode=q_mode
+    (combined, fp16_output, q_mode, encoded_page_size): _make_prims_ts_decode_trace(
+        combined=combined,
+        fp16_output=fp16_output,
+        q_mode=q_mode,
+        encoded_page_size=encoded_page_size,
     )
     for combined in (False, True)
     for fp16_output in (False, True)
     for q_mode in (_Q_FIXED_ONE, _Q_FIXED_MULTI, _Q_PACKED)
+    for encoded_page_size in (False, True)
 }
 
 
 def prims_ts_decode_trace_dispatch(**kwargs):
     """Select standalone FMHA storage, cache, and output-dtype schema."""
 
-    key = _fmha_trace_variant(kwargs, query_param="query", cache_param="kv_cache")
+    key = (
+        *_fmha_trace_variant(kwargs, query_param="query", cache_param="kv_cache"),
+        _fmha_uses_encoded_page_size(kwargs, cache_param="kv_cache"),
+    )
     return _PRIMS_TS_DECODE_TRACES[key]
 
 
@@ -786,52 +1232,137 @@ prims_ts_decode_trace_dispatch.templates = list(  # type: ignore[attr-defined]
 
 
 def _make_prims_ts_decode_wrapper_trace(
-    *, combined: bool, fp16_output: bool, q_mode: str
+    *,
+    combined: bool,
+    fp16_output: bool,
+    q_mode: str,
+    mask_type: str,
+    window_left: int,
+    max_seq_len_q: int,
+    max_kv_len: int,
+    kv_prefix_mode: str,
+    kv_lengths_mode: str,
+    plan_owns_seq_lens: bool,
+    encoded_page_size: bool = False,
 ):
-    """Describe ``BatchDecodePagedTSWrapper.run`` and its plan-owned metadata."""
+    """Describe one plan-bound ``BatchDecodePagedTSWrapper.run`` call."""
 
     cache_form = "combined" if combined else "tuple"
+    page_suffix = "_encoded_page4" if encoded_page_size else ""
     output_suffix = "_fp16_output" if fp16_output else ""
     q_axes, q_shape, output_shape, q_suffix = _fmha_q_schema(q_mode)
     axes: dict[str, Var | Const] = {
         **q_axes,
+        "max_seq_len_q": Const(
+            abbrev="maxq",
+            value=max_seq_len_q,
+            description="Query-length capacity frozen by plan().",
+        ),
+        "max_kv_len": Const(
+            abbrev="maxk",
+            value=max_kv_len,
+            description="K/V-length capacity frozen by plan().",
+        ),
+        "causal": Const(
+            abbrev="",
+            value=int(mask_type == "causal"),
+            description="One for a causal plan and zero for a dense plan.",
+        ),
+        "window_left": Const(
+            abbrev="wl",
+            value=window_left,
+            description="Sliding-window extent frozen by plan().",
+        ),
+        "planned_full_kv_prefix": Const(
+            abbrev="pf",
+            value=int(kv_prefix_mode == "planned_full"),
+            description="Whether plan() compiled the full-prefix specialization.",
+        ),
+        "planned_uniform_max_kv_lengths": Const(
+            abbrev="um",
+            value=int(kv_lengths_mode == "planned_uniform_max"),
+            description="Whether plan() compiled uniform maximum K/V lengths.",
+        ),
+        "plan_owns_seq_lens": Const(
+            abbrev="",
+            value=int(plan_owns_seq_lens),
+            description=(
+                "One when plan() owns the K/V length vector and zero when "
+                "run() supplies it."
+            ),
+        ),
         "num_qo_heads": Const(abbrev="h"),
         "num_kv_heads": Const(abbrev="kv"),
         "head_dim": Const(abbrev="d"),
         "num_pages": Var(description="Physical KV-cache page capacity."),
         "page_size": Const(abbrev="ps"),
-        "len_qo_indptr": Var(description="Length of plan-owned cumulative Q offsets."),
+        "max_pages_per_seq": Var(
+            description="Physical page-table capacity per request."
+        ),
+        "len_qo_indptr": Var(description="Length of cumulative Q offsets."),
     }
     inputs: dict[str, Tensor | Scalar] = {"q": Tensor(q_shape)}
     _add_fmha_cache_schema(
-        inputs, axes, cache_param="paged_kv_cache", combined=combined
+        inputs,
+        axes,
+        cache_param="paged_kv_cache",
+        combined=combined,
+        encoded_page_size=encoded_page_size,
     )
     inputs.update(
         {
-            # Wrapper metadata is supplied to plan(), not run(). It remains in
-            # the trace as optional context, matching the existing paged GQA
-            # wrapper templates elsewhere in this file.
+            "block_tables": Tensor(
+                ["batch_size", "max_pages_per_seq"],
+                dtype="int32",
+                description=(
+                    "Required fixed row-strided physical page table supplied to run()."
+                ),
+            ),
+            "seq_lens": Tensor(
+                ["batch_size"],
+                dtype="int32",
+                optional=plan_owns_seq_lens,
+                description=(
+                    "Plan-owned per-request K/V lengths; this is optional trace "
+                    "context and run() must receive seq_lens=None."
+                    if plan_owns_seq_lens
+                    else "Required per-request K/V lengths supplied to run()."
+                ),
+            ),
             "qo_indptr": Tensor(
                 ["len_qo_indptr"],
                 dtype="int32",
-                optional=True,
-                description="Cumulative Q offsets retained by plan().",
+                optional=q_mode != _Q_PACKED,
+                description="Cumulative Q offsets required by a packed-Q run.",
             ),
-            "max_seq_len_q": Scalar("int32", optional=True),
-            "mask_type": Scalar("string", optional=True),
-            "window_left": Scalar("int32", optional=True),
             "bmm1_scale": Scalar("float32", optional=True),
             "bmm2_scale": Scalar("float32", optional=True),
+            "validate": Scalar(
+                "bool",
+                optional=True,
+                description="Whether to validate per-run tensors and metadata values.",
+            ),
         }
     )
     constraints = [
         "head_dim in (64, 128, 256)",
-        "page_size in (16, 32, 64, 128)",
-        "num_qo_heads % num_kv_heads == 0",
-        "1 <= num_qo_heads // num_kv_heads <= 32",
-        "window_left == -1 or mask_type == 'causal'",
+        "page_size in (4, 16, 32, 64, 128)",
         *(
-            ["len_qo_indptr == batch_size + 1", "total_q == qo_indptr[-1].item()"]
+            ["storage_page_size > page_size", "storage_page_size % page_size == 0"]
+            if encoded_page_size
+            else []
+        ),
+        "num_qo_heads % num_kv_heads == 0",
+        "1 <= num_qo_heads // num_kv_heads <= 128",
+        "max_pages_per_seq * page_size >= max(seq_lens)",
+        "min(seq_lens) >= 1",
+        "max(seq_lens) <= max_kv_len",
+        *(
+            [
+                "len_qo_indptr == batch_size + 1",
+                "total_q == qo_indptr[-1].item()",
+                "max(qo_indptr[1:] - qo_indptr[:-1]) <= max_seq_len_q",
+            ]
             if q_mode == _Q_PACKED
             else []
         ),
@@ -842,11 +1373,21 @@ def _make_prims_ts_decode_wrapper_trace(
         constraints.append("seq_len_q >= 2")
     return TraceTemplate(
         op_type="gqa_paged",
-        name_prefix=f"prims_ts_decode_wrapper_{cache_form}{output_suffix}{q_suffix}",
+        name_prefix=(
+            f"prims_ts_decode_wrapper_{cache_form}{page_suffix}{output_suffix}{q_suffix}_{mask_type}"
+            f"{'_plan_seq_lens' if plan_owns_seq_lens else ''}"
+        ),
         description=(
-            "Reusable PrimTS GQA decode wrapper. Native CSR metadata, Q offsets, "
-            "mask, window, and static bounds are retained by plan(); run() receives "
-            "only Q, the HND cache, scales, and an optional output buffer."
+            "Reusable PrimTS GQA decode wrapper. The plan fixes mask, window, "
+            "static bounds, and exact batch size. "
+            + (
+                "The plan also owns the K/V length vector, so run() must omit "
+                "seq_lens. Every run supplies a fixed row-strided page table; "
+                "packed-Q runs also supply Q offsets."
+                if plan_owns_seq_lens
+                else "Every run supplies a fixed row-strided page table and K/V "
+                "lengths; packed-Q runs also supply Q offsets."
+            )
         ),
         axes=axes,
         inputs=inputs,
@@ -859,22 +1400,97 @@ def _make_prims_ts_decode_wrapper_trace(
             )
         },
         constraints=constraints,
-        tags=["stage:decode", "backend:prims-ts", "status:experimental"],
+        tags=[
+            "stage:decode",
+            "backend:prims-ts",
+            "status:experimental",
+            f"mask:{mask_type}",
+            f"kv-prefix-mode:{kv_prefix_mode}",
+            f"kv-lengths-mode:{kv_lengths_mode}",
+            f"seq-lens-source:{'plan' if plan_owns_seq_lens else 'run'}",
+        ],
     )
 
 
-_PRIMS_TS_DECODE_WRAPPER_TRACES = {
-    (combined, fp16_output, q_mode): _make_prims_ts_decode_wrapper_trace(
-        combined=combined, fp16_output=fp16_output, q_mode=q_mode
+# Finite examples support trace discovery and schema-consistency tests. Bound
+# dispatch below synthesizes the exact template from the wrapper's plan state.
+_PRIMS_TS_DECODE_WRAPPER_TRACE_EXAMPLES = {
+    (
+        combined,
+        fp16_output,
+        q_mode,
+        plan_owns_seq_lens,
+        encoded_page_size,
+    ): _make_prims_ts_decode_wrapper_trace(
+        combined=combined,
+        fp16_output=fp16_output,
+        q_mode=q_mode,
+        mask_type="dense",
+        window_left=-1,
+        max_seq_len_q=2 if q_mode == _Q_FIXED_MULTI else 1,
+        max_kv_len=1,
+        kv_prefix_mode="dynamic",
+        kv_lengths_mode="dynamic",
+        plan_owns_seq_lens=plan_owns_seq_lens,
+        encoded_page_size=encoded_page_size,
     )
     for combined in (False, True)
     for fp16_output in (False, True)
     for q_mode in (_Q_FIXED_ONE, _Q_FIXED_MULTI, _Q_PACKED)
+    for encoded_page_size in (False, True)
+    for plan_owns_seq_lens in (False, True)
 }
 
 
+# Keep one stable object per plan identity: the decorator's downstream fi-trace
+# cache is keyed by template id and retains its builder for the process lifetime.
+@lru_cache(maxsize=None)
+def _get_prims_ts_decode_wrapper_trace(
+    *,
+    combined: bool,
+    fp16_output: bool,
+    q_mode: str,
+    mask_type: str,
+    window_left: int,
+    max_seq_len_q: int,
+    max_kv_len: int,
+    kv_prefix_mode: str,
+    kv_lengths_mode: str,
+    plan_owns_seq_lens: bool,
+    encoded_page_size: bool = False,
+) -> TraceTemplate:
+    """Return one stable trace template for a frozen FMHA plan identity."""
+
+    return _make_prims_ts_decode_wrapper_trace(
+        combined=combined,
+        fp16_output=fp16_output,
+        q_mode=q_mode,
+        mask_type=mask_type,
+        window_left=window_left,
+        max_seq_len_q=max_seq_len_q,
+        max_kv_len=max_kv_len,
+        kv_prefix_mode=kv_prefix_mode,
+        kv_lengths_mode=kv_lengths_mode,
+        plan_owns_seq_lens=plan_owns_seq_lens,
+        encoded_page_size=encoded_page_size,
+    )
+
+
+def _require_bound_trace_tensors(
+    kwargs: dict[str, object], *, wrapper_name: str, names: tuple[str, ...]
+) -> None:
+    """Reject incomplete bound traces before they emit unknown input dtypes."""
+
+    missing = [name for name in names if not isinstance(kwargs.get(name), torch.Tensor)]
+    if missing:
+        raise ValueError(
+            f"Tracing {wrapper_name}.run requires per-run tensor argument(s): "
+            f"{', '.join(missing)}"
+        )
+
+
 def prims_ts_decode_wrapper_trace_dispatch(**kwargs):
-    """Select the wrapper schema, using plan state to disambiguate rank-3 Q."""
+    """Synthesize the exact wrapper schema from its bound plan state."""
 
     wrapper = kwargs.get("self")
     if wrapper is None:
@@ -883,18 +1499,67 @@ def prims_ts_decode_wrapper_trace_dispatch(**kwargs):
             "plan state. Use flashinfer.fi_trace(wrapper.run, ...) instead of "
             "wrapper.run.fi_trace(...)."
         )
-    if not bool(getattr(wrapper, "_planned", False)):
+    state = getattr(wrapper, "_plan_state", None)
+    if state is None:
         raise RuntimeError("plan() must be called before run()")
-    combined, fp16_output, q_mode = _fmha_trace_variant(
-        kwargs, query_param="q", cache_param="paged_kv_cache"
+    plan_owns_seq_lens = getattr(state, "planned_seq_lens_device", None) is not None
+    run_seq_lens = kwargs.get("seq_lens")
+    if plan_owns_seq_lens:
+        if run_seq_lens is not None:
+            raise ValueError(
+                "Tracing BatchDecodePagedTSWrapper.run with plan-owned "
+                "sequence lengths requires seq_lens=None"
+            )
+    elif not isinstance(run_seq_lens, torch.Tensor):
+        raise ValueError(
+            "Tracing BatchDecodePagedTSWrapper.run without plan-owned "
+            "sequence lengths requires a per-run seq_lens tensor"
+        )
+    required_metadata = (
+        "block_tables",
+        *(("qo_indptr",) if bool(state.use_packed_q) else ()),
     )
-    if bool(getattr(wrapper, "_use_packed_q", False)):
+    _require_bound_trace_tensors(
+        kwargs,
+        wrapper_name="BatchDecodePagedTSWrapper",
+        names=required_metadata,
+    )
+    combined, fp16_output, q_mode = _fmha_trace_variant(
+        kwargs,
+        query_param="q",
+        cache_param="paged_kv_cache",
+        plan_state=state,
+    )
+    if bool(state.use_packed_q):
         q_mode = _Q_PACKED
-    return _PRIMS_TS_DECODE_WRAPPER_TRACES[(combined, fp16_output, q_mode)]
+    elif int(state.seq_len_q) > 1:
+        q_mode = _Q_FIXED_MULTI
+    else:
+        q_mode = _Q_FIXED_ONE
+    storage_page_size = state.storage_page_size or state.page_size
+    runtime_page_size = _fmha_cache_storage_page_size(kwargs.get("paged_kv_cache"))
+    if runtime_page_size != storage_page_size:
+        raise ValueError(
+            "Runtime cache storage page size does not match the wrapper plan"
+        )
+    encoded_page_size = state.page_size != storage_page_size
+    return _get_prims_ts_decode_wrapper_trace(
+        combined=combined,
+        fp16_output=fp16_output,
+        q_mode=q_mode,
+        mask_type=str(state.mask_type),
+        window_left=int(state.window_left),
+        max_seq_len_q=int(state.seq_len_q),
+        max_kv_len=int(state.max_kv_len),
+        kv_prefix_mode=str(state.kv_prefix_mode),
+        kv_lengths_mode=str(state.kv_lengths_mode),
+        plan_owns_seq_lens=plan_owns_seq_lens,
+        encoded_page_size=encoded_page_size,
+    )
 
 
 prims_ts_decode_wrapper_trace_dispatch.templates = list(  # type: ignore[attr-defined]
-    _PRIMS_TS_DECODE_WRAPPER_TRACES.values()
+    _PRIMS_TS_DECODE_WRAPPER_TRACE_EXAMPLES.values()
 )
 
 
@@ -1118,21 +1783,51 @@ prims_ts_decode_mla_one_shot_trace_dispatch.templates = list(  # type: ignore[at
 )
 
 
-def _make_prims_ts_decode_mla_wrapper_trace(*, rank4_cache: bool, packed_query: bool):
+def _make_prims_ts_decode_mla_wrapper_trace(
+    *,
+    rank4_cache: bool,
+    packed_query: bool,
+    mask_type: str,
+    max_seq_len_q: int,
+    max_kv_len: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+):
     cache_suffix = "_rank4" if rank4_cache else ""
     q_suffix = "_packed_q" if packed_query else ""
     axes: dict[str, Var | Const] = {
-        "batch_size": Var(description="Number of plan-owned MLA requests."),
+        "batch_size": Var(description="Exact number of planned MLA requests."),
+        "max_seq_len_q": Const(
+            abbrev="maxq",
+            value=max_seq_len_q,
+            description="Query-length capacity frozen by plan().",
+        ),
+        "max_kv_len": Const(
+            abbrev="maxk",
+            value=max_kv_len,
+            description="K/V-length capacity frozen by plan().",
+        ),
+        "causal": Const(
+            abbrev="",
+            value=int(mask_type == "causal"),
+            description="One for a causal plan and zero for a dense plan.",
+        ),
         "num_heads": Const(abbrev="h"),
         "head_dim_qk": Const(abbrev="d_qk"),
-        # ``run()`` receives no scalar from which a literal value could be
-        # extracted.  The wrapper plan fixes this dimension to 512, and the
-        # constraint below records that contract; keep the axis variable so a
-        # direct trace never emits an unresolved Const.
-        "kv_lora_rank": Var(description="Fixed MLA output dimension (512)."),
+        "kv_lora_rank": Const(
+            abbrev="ckv",
+            value=kv_lora_rank,
+            description="Latent K/V rank frozen by plan().",
+        ),
+        "qk_rope_head_dim": Const(
+            abbrev="kpe",
+            value=qk_rope_head_dim,
+            description="RoPE head dimension frozen by plan().",
+        ),
         "num_pages": Var(description="Physical MLA cache page capacity."),
         "page_size": Const(abbrev="ps"),
-        "len_qo_indptr": Var(description="Length of plan-owned cumulative Q offsets."),
+        "max_pages_per_seq": Var(description="Per-run block-table column capacity."),
+        "len_qo_indptr": Var(description="Length of cumulative Q offsets."),
     }
     if packed_query:
         axes["total_q"] = Var(description="Total packed query-token count.")
@@ -1153,53 +1848,118 @@ def _make_prims_ts_decode_mla_wrapper_trace(*, rank4_cache: bool, packed_query: 
         cache_dims = ["num_pages", "page_size", "head_dim_qk"]
     return TraceTemplate(
         op_type="mla_paged",
-        name_prefix=f"prims_ts_decode_mla_wrapper{cache_suffix}{q_suffix}",
+        name_prefix=(
+            f"prims_ts_decode_mla_wrapper{cache_suffix}{q_suffix}_{mask_type}"
+        ),
         description=(
-            "Reusable PrimTS MLA decode wrapper. Page tables, sequence lengths, "
-            "Q offsets, masks, and static bounds are retained by plan(); run() "
-            "receives only query, KV cache, scales, and an optional output buffer."
+            "Reusable PrimTS MLA decode wrapper. The plan fixes masks, static "
+            "bounds, and exact batch size. Every run supplies page tables and "
+            "sequence lengths; packed-Q runs also supply Q offsets."
         ),
         axes=axes,
         inputs={
             "query": Tensor(query_dims),
             "kv_cache": Tensor(cache_dims),
+            "block_tables": Tensor(
+                ["batch_size", "max_pages_per_seq"],
+                dtype="int32",
+                description="Required physical page table supplied to run().",
+            ),
+            "seq_lens": Tensor(
+                ["batch_size"],
+                dtype="int32",
+                description="Required per-request KV lengths supplied to run().",
+            ),
             "qo_indptr": Tensor(
                 ["len_qo_indptr"],
                 dtype="int32",
-                optional=True,
-                description="Cumulative Q offsets retained by plan().",
+                optional=not packed_query,
+                description="Cumulative Q offsets required by a packed-Q run.",
             ),
-            "max_seq_len_q": Scalar("int32", optional=True),
-            "mask_type": Scalar("string", optional=True),
             "bmm1_scale": Scalar("float32", optional=True),
             "bmm2_scale": Scalar("float32", optional=True),
+            "validate": Scalar(
+                "bool",
+                optional=True,
+                description="Whether to validate per-run tensors and metadata values.",
+            ),
         },
         outputs={"output": Tensor(output_dims, dtype="bfloat16", param="out")},
         constraints=[
             "head_dim_qk == 576",
             "kv_lora_rank == 512",
             "page_size in (16, 32, 64, 128)",
+            "block_tables.shape[0] == batch_size",
+            "max_pages_per_seq * page_size >= max_kv_len",
+            "min(seq_lens) >= 1",
+            "max(seq_lens) <= max_kv_len",
             *(["kv_pad_dim == 1"] if rank4_cache else []),
             *(
-                ["len_qo_indptr == batch_size + 1", "total_q == qo_indptr[-1].item()"]
+                [
+                    "len_qo_indptr == batch_size + 1",
+                    "total_q == qo_indptr[-1].item()",
+                    "max(qo_indptr[1:] - qo_indptr[:-1]) <= max_seq_len_q",
+                ]
                 if packed_query
                 else ["seq_len_q >= 1"]
             ),
         ],
-        tags=["stage:decode", "backend:prims-ts", "status:experimental", "mla"],
+        tags=[
+            "stage:decode",
+            "backend:prims-ts",
+            "status:experimental",
+            "mla",
+            f"mask:{mask_type}",
+        ],
     )
 
 
-_PRIMS_TS_DECODE_MLA_WRAPPER_TRACES = {
+# Finite examples support trace discovery and schema-consistency tests. Bound
+# dispatch below synthesizes the exact template from the wrapper's plan state.
+_PRIMS_TS_DECODE_MLA_WRAPPER_TRACE_EXAMPLES = {
     (rank4_cache, packed_query): _make_prims_ts_decode_mla_wrapper_trace(
-        rank4_cache=rank4_cache, packed_query=packed_query
+        rank4_cache=rank4_cache,
+        packed_query=packed_query,
+        mask_type="causal",
+        max_seq_len_q=1,
+        max_kv_len=1,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
     )
     for rank4_cache in (False, True)
     for packed_query in (False, True)
 }
 
 
+# See _get_prims_ts_decode_wrapper_trace: eviction would only create duplicate
+# downstream builders when a previously seen plan identity is traced again.
+@lru_cache(maxsize=None)
+def _get_prims_ts_decode_mla_wrapper_trace(
+    *,
+    rank4_cache: bool,
+    packed_query: bool,
+    mask_type: str,
+    max_seq_len_q: int,
+    max_kv_len: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+) -> TraceTemplate:
+    """Return one stable trace template for a frozen MLA plan identity."""
+
+    return _make_prims_ts_decode_mla_wrapper_trace(
+        rank4_cache=rank4_cache,
+        packed_query=packed_query,
+        mask_type=mask_type,
+        max_seq_len_q=max_seq_len_q,
+        max_kv_len=max_kv_len,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+    )
+
+
 def prims_ts_decode_mla_wrapper_trace_dispatch(**kwargs):
+    """Synthesize the exact MLA wrapper schema from its bound plan state."""
+
     wrapper = kwargs.get("self")
     if wrapper is None:
         raise ValueError(
@@ -1207,19 +1967,34 @@ def prims_ts_decode_mla_wrapper_trace_dispatch(**kwargs):
             "plan state. Use flashinfer.fi_trace(wrapper.run, ...) instead of "
             "wrapper.run.fi_trace(...)."
         )
-    if not bool(getattr(wrapper, "_planned", False)):
+    state = getattr(wrapper, "_plan_state", None)
+    if state is None:
         raise RuntimeError("plan() must be called before run()")
-    packed_query = bool(wrapper._packed_query)
-    kv_cache = kwargs.get("kv_cache")
-    key = (
-        isinstance(kv_cache, torch.Tensor) and kv_cache.ndim == 4,
-        packed_query,
+    packed_query = bool(state.packed_query)
+    required_metadata = (
+        "block_tables",
+        "seq_lens",
+        *(("qo_indptr",) if packed_query else ()),
     )
-    return _PRIMS_TS_DECODE_MLA_WRAPPER_TRACES[key]
+    _require_bound_trace_tensors(
+        kwargs,
+        wrapper_name="BatchMLADecodePagedTSWrapper",
+        names=required_metadata,
+    )
+    kv_cache = kwargs.get("kv_cache")
+    return _get_prims_ts_decode_mla_wrapper_trace(
+        rank4_cache=isinstance(kv_cache, torch.Tensor) and kv_cache.ndim == 4,
+        packed_query=packed_query,
+        mask_type=str(state.mask_type),
+        max_seq_len_q=int(state.max_seq_len_q),
+        max_kv_len=int(state.max_kv_len),
+        kv_lora_rank=int(state.kv_lora_rank),
+        qk_rope_head_dim=int(state.qk_rope_head_dim),
+    )
 
 
 prims_ts_decode_mla_wrapper_trace_dispatch.templates = list(  # type: ignore[attr-defined]
-    _PRIMS_TS_DECODE_MLA_WRAPPER_TRACES.values()
+    _PRIMS_TS_DECODE_MLA_WRAPPER_TRACE_EXAMPLES.values()
 )
 
 # ── GQA paged prefill ────────────────────────────────────────────────────────
@@ -1731,7 +2506,49 @@ def _mla_paged_decode_init(
     }
 
 
-mla_paged_decode_trace = TraceTemplate(
+class _MLAPagedDecodeTraceTemplate(TraceTemplate):
+    """Normalize planned MLA structural inputs into the stable split schema."""
+
+    def build_fi_trace_fn(self, fi_api):
+        base_fi_trace = super().build_fi_trace_fn(fi_api)
+
+        def fi_trace(save_dir=None, name=None, **kwargs):
+            from flashinfer.mla._batch_mla._contracts import (
+                _resolve_structural_mla_input,
+            )
+
+            contract = getattr(kwargs.get("self"), "_input_contract", None)
+            head_dim_ckv = kwargs.get("head_dim_ckv")
+            head_dim_kpe = kwargs.get("head_dim_kpe")
+            if head_dim_ckv is None and contract is not None:
+                head_dim_ckv = contract.head_dim_ckv
+            if head_dim_kpe is None and contract is not None:
+                head_dim_kpe = contract.head_dim_kpe
+            widths = (
+                None
+                if head_dim_ckv is None or head_dim_kpe is None
+                else (int(head_dim_ckv), int(head_dim_kpe))
+            )
+            query = kwargs.get("query")
+            if query is not None:
+                q_nope, q_pe = _resolve_structural_mla_input(
+                    query, desired="split", widths=widths, name="query"
+                )
+                kwargs["q_nope"] = q_nope
+                kwargs["q_pe"] = q_pe
+            kv_cache = kwargs.get("kv_cache")
+            if kv_cache is not None:
+                ckv_cache, kpe_cache = _resolve_structural_mla_input(
+                    kv_cache, desired="split", widths=widths, name="KV cache"
+                )
+                kwargs["ckv_cache"] = ckv_cache
+                kwargs["kpe_cache"] = kpe_cache
+            return base_fi_trace(save_dir=save_dir, name=name, **kwargs)
+
+        return fi_trace
+
+
+mla_paged_decode_trace = _MLAPagedDecodeTraceTemplate(
     op_type="mla_paged",
     name_prefix="mla_paged_decode",
     description=(
@@ -2828,6 +3645,12 @@ trtllm_batch_decode_trace = TraceTemplate(
             dtype="int32",
             description="Actual KV sequence length per batch entry.",
         ),
+        "request_order": Tensor(
+            ["batch_size"],
+            dtype="int32",
+            optional=True,
+            description="Graph-stable launch-slot to logical-request mapping.",
+        ),
         "max_seq_len": Scalar(
             "int32", description="Maximum K/V sequence length in the batch."
         ),
@@ -2849,6 +3672,144 @@ trtllm_batch_decode_trace = TraceTemplate(
 # Add max_pages_per_seq axis used above
 trtllm_batch_decode_trace.axes["max_pages_per_seq"] = Var(
     description="Maximum number of pages per sequence (block_tables width)."
+)
+
+
+_TRTLLM_DCP_INPUTS = {
+    **trtllm_batch_decode_trace.inputs,
+    "bmm2_scale": Scalar(
+        "float32",
+        optional=True,
+        description="FP8 V/output scale; must be 1.0 for BF16 KV.",
+    ),
+    "causal_seqlens_kv_global": Tensor(
+        ["batch_size"],
+        dtype="int32",
+        description=(
+            "Committed global-prefix length before speculative row zero for "
+            "each request."
+        ),
+    ),
+    "cp_world": Scalar("int32", description="Decode-context-parallel world size."),
+    "cp_rank": Scalar("int32", description="Round-robin DCP rank."),
+    "q_len_per_req": Scalar(
+        "int32", description="Uniform speculative query length per request."
+    ),
+}
+
+
+trtllm_batch_decode_dcp_spec_trace = TraceTemplate(
+    op_type="trtllm_paged_dcp_spec",
+    name_prefix="trtllm_batch_decode_dcp_spec",
+    description=(
+        "SM100/SM103 BF16-Q paged GQA decode with round-robin DCP ownership "
+        "and a row-dependent global causal bound for speculative queries. "
+        "KV is either BF16/page16 or FP8 e4m3/page64. "
+        "This form describes a combined K/V cache tensor. The operation "
+        "writes caller-owned BF16 output and FP32 base-2 LSE buffers."
+    ),
+    axes=dict(trtllm_batch_decode_trace.axes),
+    inputs=_TRTLLM_DCP_INPUTS,
+    outputs={
+        "output": Tensor(["num_tokens", "num_heads", "head_dim"], dtype_from="query"),
+        "lse": Tensor(["num_tokens", "num_heads"], dtype="float32"),
+    },
+    constraints=[
+        "q_len_per_req in [1, 2, 3, 4, 5, 6, 8]",
+        "cp_world in [1, 2, 4, 8]",
+        "0 <= cp_rank < cp_world",
+        "head_dim == 128",
+        "page_size in [16, 64]",
+        "q_len_per_req != 3 or page_size == 64",
+    ],
+    tags=["status:verified", "stage:decode", "backend:dcp-spec"],
+)
+
+
+trtllm_batch_decode_dcp_spec_split_kv_trace = TraceTemplate(
+    op_type="trtllm_paged_dcp_spec",
+    name_prefix="trtllm_batch_decode_dcp_spec_split_kv",
+    description=(
+        "SM100/SM103 BF16-Q paged GQA decode with round-robin DCP ownership "
+        "and a row-dependent global causal bound for speculative queries. "
+        "KV is either BF16/page16 or FP8 e4m3/page64. "
+        "This form describes the public (K, V) cache tuple. The operation "
+        "writes caller-owned BF16 output and FP32 base-2 LSE buffers."
+    ),
+    axes={
+        "num_tokens": Var(description="Total query tokens across the batch."),
+        "num_heads": Const(abbrev="h"),
+        "num_kv_heads": Const(abbrev="kv"),
+        "head_dim": Const(abbrev="d"),
+        "page_size": Const(abbrev="ps"),
+        "num_pages": Var(),
+        "batch_size": Var(),
+        "max_pages_per_seq": Var(
+            description="Maximum number of pages per sequence (block_tables width)."
+        ),
+    },
+    inputs={
+        "query": Tensor(["num_tokens", "num_heads", "head_dim"]),
+        "k_cache": Tensor(
+            ["num_pages", "num_kv_heads", "page_size", "head_dim"],
+            param="kv_cache",
+            tuple_idx=0,
+            description="Compact rank-local paged key cache in HND layout.",
+        ),
+        "v_cache": Tensor(
+            ["num_pages", "num_kv_heads", "page_size", "head_dim"],
+            param="kv_cache",
+            tuple_idx=1,
+            description="Compact rank-local paged value cache in HND layout.",
+        ),
+        "block_tables": Tensor(
+            ["batch_size", "max_pages_per_seq"],
+            dtype="int32",
+            description="Rank-local compact page table.",
+        ),
+        "seq_lens": Tensor(
+            ["batch_size"],
+            dtype="int32",
+            description="Stored rank-local KV lengths.",
+        ),
+        "max_seq_len": Scalar(
+            "int32", description="Maximum stored rank-local KV length."
+        ),
+        "bmm1_scale": Scalar(
+            "float32", optional=True, description="Scale applied after Q @ K^T."
+        ),
+        "bmm2_scale": Scalar(
+            "float32",
+            optional=True,
+            description="FP8 V/output scale; must be 1.0 for BF16 KV.",
+        ),
+        "causal_seqlens_kv_global": Tensor(
+            ["batch_size"],
+            dtype="int32",
+            description=(
+                "Committed global-prefix length before speculative row zero "
+                "for each request."
+            ),
+        ),
+        "cp_world": Scalar("int32", description="Decode-context-parallel world size."),
+        "cp_rank": Scalar("int32", description="Round-robin DCP rank."),
+        "q_len_per_req": Scalar(
+            "int32", description="Uniform speculative query length per request."
+        ),
+    },
+    outputs={
+        "output": Tensor(["num_tokens", "num_heads", "head_dim"], dtype_from="query"),
+        "lse": Tensor(["num_tokens", "num_heads"], dtype="float32"),
+    },
+    constraints=[
+        "q_len_per_req in [1, 2, 3, 4, 5, 6, 8]",
+        "cp_world in [1, 2, 4, 8]",
+        "0 <= cp_rank < cp_world",
+        "head_dim == 128",
+        "page_size in [16, 64]",
+        "q_len_per_req != 3 or page_size == 64",
+    ],
+    tags=["status:verified", "stage:decode", "backend:dcp-spec"],
 )
 
 
@@ -3026,12 +3987,16 @@ trtllm_batch_decode_block_sparse_trace = TraceTemplate(
 
 
 def trtllm_batch_decode_trace_dispatch(save_dir=None, name=None, **kwargs):
-    """Select the dense or block-sparse decode template at call time.
+    """Select the dense, block-sparse, or DCP decode template at call time.
 
     Pass as ``trace=trtllm_batch_decode_trace_dispatch`` to ``@flashinfer_api``
-    so block-sparse calls (per-KV-head ``block_tables``/``seq_lens`` shapes)
-    are dumped with the matching schema instead of corrupting the dense one.
+    so calls are dumped with the schema matching their cache and causal
+    metadata instead of corrupting the conventional dense definition.
     """
+    if kwargs.get("causal_seqlens_kv_global") is not None:
+        if isinstance(kwargs.get("kv_cache"), (tuple, list)):
+            return trtllm_batch_decode_dcp_spec_split_kv_trace
+        return trtllm_batch_decode_dcp_spec_trace
     if kwargs.get("enable_block_sparse_attention"):
         return trtllm_batch_decode_block_sparse_trace
     return trtllm_batch_decode_trace
@@ -3042,6 +4007,8 @@ def trtllm_batch_decode_trace_dispatch(save_dir=None, name=None, **kwargs):
 trtllm_batch_decode_trace_dispatch.templates = [  # type: ignore[attr-defined]
     trtllm_batch_decode_trace,
     trtllm_batch_decode_block_sparse_trace,
+    trtllm_batch_decode_dcp_spec_trace,
+    trtllm_batch_decode_dcp_spec_split_kv_trace,
 ]
 
 trtllm_batch_context_trace = TraceTemplate(
@@ -4493,6 +5460,56 @@ def _block_sparse_attention_run_init(
             kv_len, num_kv_heads, head_dim, dtype=torch.float16, device=device
         ),
     }
+
+
+cake_vsa_plan_trace = TraceTemplate(
+    op_type="block_sparse_plan",
+    name_prefix="cake_vsa_plan",
+    description=(
+        "Plan the sparse metadata and fixed execution route consumed by the "
+        "Cake VSA source-level backend."
+    ),
+    axes={
+        "qo_len": Var(description="Query sequence length."),
+        "kv_len": Var(description="Key/value sequence length."),
+        "q_block_size": Const(abbrev="r"),
+        "kv_block_size": Const(abbrev="c"),
+        "num_qo_heads": Const(abbrev="h"),
+        "num_kv_heads": Const(abbrev="kv"),
+        "head_dim": Const(abbrev="d"),
+    },
+    inputs={
+        "indptr": Tensor(["indptr_len"], dtype="int32", optional=True),
+        "indices": Tensor(["nnz"], dtype="int32", optional=True),
+        "block_mask": Tensor(["num_qo_heads", "qo_blocks", "kv_blocks"], optional=True),
+        "kv_block_lens": Tensor(["kv_blocks"], dtype="int32", optional=True),
+        "q2k_indices": Tensor(
+            ["num_qo_heads", "qo_blocks", "topk"],
+            dtype="int32",
+            optional=True,
+        ),
+        "q2k_num": Tensor(["num_qo_heads", "qo_blocks"], dtype="int32", optional=True),
+        "qo_len": Scalar("int32", param="M"),
+        "kv_len": Scalar("int32", param="N"),
+        "q_block_size": Scalar("int32", param="R"),
+        "kv_block_size": Scalar("int32", param="C"),
+        "num_qo_heads": Scalar("int32"),
+        "num_kv_heads": Scalar("int32"),
+        "head_dim": Scalar("int32"),
+        "q_data_type": Scalar("dtype"),
+        "sm_scale": Scalar("float32", optional=True),
+        "device": Scalar("device"),
+    },
+    outputs={},
+    constraints=[
+        "qo_len % q_block_size == 0",
+        "kv_len % kv_block_size == 0",
+        "q_block_size == kv_block_size",
+        "q_block_size in (64, 128)",
+        "num_qo_heads % num_kv_heads == 0",
+    ],
+    tags=["status:verified", "sparse:block", "phase:plan"],
+)
 
 
 block_sparse_attention_run_trace = TraceTemplate(

@@ -279,11 +279,12 @@ def test_trtllm_ragged_dit_qk_bf16_v_fp8(
 )
 @pytest.mark.parametrize("causal", [False])
 @pytest.mark.parametrize("batch_size", [1, 2])
-@pytest.mark.parametrize("s_qo,s_kv", [(256, 256), (512, 2048)])
+@pytest.mark.parametrize("s_qo,s_kv", [(256, 256), (1560, 1560), (512, 2048)])
 @pytest.mark.parametrize("num_heads", [1, 8])
 @pytest.mark.parametrize("head_dim", [128])
 @pytest.mark.parametrize("sage_blk_q", [1])
 @pytest.mark.parametrize("sage_blk_k", [4, 16])
+@pytest.mark.parametrize("smooth_k", [False, True])
 def test_trtllm_ragged_dit_sage_qdq(
     causal: bool,
     batch_size: int,
@@ -293,6 +294,7 @@ def test_trtllm_ragged_dit_sage_qdq(
     head_dim: int,
     sage_blk_q: int,
     sage_blk_k: int,
+    smooth_k: bool,
 ):
     torch.manual_seed(42)
     device = GPU_DEVICE
@@ -306,28 +308,40 @@ def test_trtllm_ragged_dit_sage_qdq(
     k = torch.randn(total_kv, num_heads, head_dim, device=device, dtype=torch.bfloat16)
     v = torch.randn(total_kv, num_heads, head_dim, device=device, dtype=torch.bfloat16)
 
-    q_int8, k_int8, v_fp8, q_sfs, k_sfs, v_sfs = (
-        flashinfer.trtllm_sage_attention_quantize(
-            q,
-            k,
-            v,
-            q_block_size=sage_blk_q,
-            k_block_size=sage_blk_k,
-            qk_quant_dtype=torch.int8,
-        )
+    qo_indptr = torch.cat(
+        [torch.zeros(1, dtype=torch.int32, device=device), q_lens.cumsum(0).int()]
     )
+    kv_indptr = torch.cat(
+        [torch.zeros(1, dtype=torch.int32, device=device), kv_lens.cumsum(0).int()]
+    )
+
+    quantized = flashinfer.trtllm_sage_attention_quantize(
+        q,
+        k,
+        v,
+        q_block_size=sage_blk_q,
+        k_block_size=sage_blk_k,
+        qk_quant_dtype=torch.int8,
+        cum_seq_lens_q=qo_indptr,
+        cum_seq_lens_kv=kv_indptr,
+        smooth_k=smooth_k,
+    )
+    q_int8, k_int8, v_fp8, q_sfs, k_sfs, v_sfs = quantized[:6]
+    if smooth_k:
+        k_mean = quantized[6]
+        assert k_mean.shape == (num_heads, head_dim)
+        assert k_mean.dtype == torch.float32
+        assert torch.isfinite(k_mean).all()
 
     assert q_sfs.shape == (
         num_heads,
-        (total_q + sage_blk_q - 1) // sage_blk_q,
+        (total_q + sage_blk_q - 1) // sage_blk_q + batch_size - 1,
     )
     assert k_sfs.shape == (
         num_heads,
-        (total_kv + sage_blk_k - 1) // sage_blk_k,
+        (total_kv + sage_blk_k - 1) // sage_blk_k + batch_size - 1,
     )
     assert v_sfs.shape == (num_heads, head_dim)
-    assert torch.isfinite(q_sfs).all()
-    assert torch.isfinite(k_sfs).all()
     assert torch.isfinite(v_sfs).all()
 
     sage_blk_v = 1
@@ -340,13 +354,6 @@ def test_trtllm_ragged_dit_sage_qdq(
     bmm1_scale = 1.0 / math.sqrt(head_dim)
     # All dequantization scales are supplied through SageAttention scale tensors.
     bmm2_scale = 1.0
-
-    qo_indptr = torch.cat(
-        [torch.zeros(1, dtype=torch.int32, device=device), q_lens.cumsum(0).int()]
-    )
-    kv_indptr = torch.cat(
-        [torch.zeros(1, dtype=torch.int32, device=device), kv_lens.cumsum(0).int()]
-    )
 
     workspace = _get_workspace()
 
@@ -390,3 +397,56 @@ def test_trtllm_ragged_dit_sage_qdq(
         atol=0.1,
         rtol=0.1,
     )
+
+
+@pytest.mark.skipif(
+    (CC_MAJOR, CC_MINOR) != (10, 0),
+    reason="SageAttention quantization tests require SM100.",
+)
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
+def test_trtllm_sage_quant_qkv_error(head_dim: int):
+    torch.manual_seed(42)
+    num_tokens, num_heads = 260, 2
+    q_block_size = 1
+    k_block_size = 16
+
+    q = torch.randn(
+        num_tokens,
+        num_heads,
+        head_dim,
+        device=GPU_DEVICE,
+        dtype=torch.bfloat16,
+    )
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+
+    q_block_indices = torch.arange(num_tokens, device=GPU_DEVICE) // q_block_size
+    block_indices = torch.arange(num_tokens, device=GPU_DEVICE) // k_block_size
+    max_error_tolerance = {"q": 0.04, "k": 0.04, "v": 0.17}
+    for smooth_k in (False, True):
+        quantized = flashinfer.trtllm_sage_attention_quantize(
+            q,
+            k,
+            v,
+            q_block_size=q_block_size,
+            k_block_size=k_block_size,
+            qk_quant_dtype=torch.int8,
+            smooth_k=smooth_k,
+        )
+        q_quant, k_quant, v_quant, q_sfs, k_sfs, v_sfs = quantized[:6]
+        k_mean = quantized[6] if smooth_k else None
+
+        q_dequant = q_quant.float() * q_sfs[:, q_block_indices].T.unsqueeze(-1)
+        k_dequant = k_quant.float() * k_sfs[:, block_indices].T.unsqueeze(-1)
+        if k_mean is not None:
+            k_dequant += k_mean.unsqueeze(0)
+        v_dequant = v_quant.float() * v_sfs.unsqueeze(0)
+
+        for name, dequant, reference in (
+            ("q", q_dequant, q),
+            ("k", k_dequant, k),
+            ("v", v_dequant, v),
+        ):
+            abs_error = (dequant - reference.float()).abs()
+            assert torch.isfinite(abs_error).all()
+            assert abs_error.max().item() < max_error_tolerance[name]

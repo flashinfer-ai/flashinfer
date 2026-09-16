@@ -80,12 +80,13 @@ int round_multiple(int x, int m) { return (x + m - 1) / m * m; }
 
 void set_params_fprop(Flash_fwd_params& params, TensorView q, TensorView k, TensorView v,
                       TensorView q_scale, TensorView k_scale, TensorView v_scale,
-                      TensorView qk_correction, TensorView out, TensorView lse, float sm_scale,
-                      bool causal, bool per_block_mean) {
+                      TensorView qk_correction, TensorView out, ffi::Optional<TensorView> maybe_lse,
+                      float sm_scale, bool causal, bool per_block_mean, int64_t unpadded_k_len) {
   params = {};
 
   const int batch = static_cast<int>(q.size(0));
-  const int num_heads = static_cast<int>(q.size(1));
+  const int num_qo_heads = static_cast<int>(q.size(1));
+  const int num_kv_heads = static_cast<int>(k.size(1));
   const int seq_len_q = static_cast<int>(q.size(2));
   const int seq_len_k = static_cast<int>(k.size(2));
   const int head_dim = static_cast<int>(q.size(3) * 2);
@@ -131,20 +132,21 @@ void set_params_fprop(Flash_fwd_params& params, TensorView q, TensorView k, Tens
   params.cu_seqlens_k = nullptr;
   params.seqused_k = nullptr;
   params.p_ptr = nullptr;
-  params.softmax_lse_ptr = lse.data_ptr();
+  params.softmax_lse_ptr =
+      maybe_lse.has_value() ? static_cast<float*>(maybe_lse.value().data_ptr()) : nullptr;
 
   params.b = batch;
-  params.h = num_heads;
-  params.h_k = num_heads;
-  params.h_h_k_ratio = 1;
+  params.h = num_qo_heads;
+  params.h_k = num_kv_heads;
+  params.h_h_k_ratio = num_qo_heads / num_kv_heads;
   params.seqlen_q = seq_len_q;
   params.seqlen_k = seq_len_k;
-  params.unpadded_seqlen_k = seq_len_k;
+  params.unpadded_seqlen_k = static_cast<int>(unpadded_k_len);
   params.seqlen_q_rounded = round_multiple(seq_len_q, 128);
   params.seqlen_k_rounded = round_multiple(seq_len_k, 128);
   params.d = head_dim;
   params.d_rounded = head_dim;
-  params.head_divmod = cutlass::FastDivmod(num_heads);
+  params.head_divmod = cutlass::FastDivmod(num_qo_heads);
 
   params.scale_softmax = sm_scale;
   params.scale_softmax_log2 = sm_scale * 1.4426950408889634f;
@@ -168,25 +170,31 @@ void set_params_fprop(Flash_fwd_params& params, TensorView q, TensorView k, Tens
   params.tile_count_semaphore = nullptr;
 }
 
-template <bool IsBF16>
+template <bool ReturnLSE, bool IsBF16>
 void run_mha_fwd_dispatch_dtype(Flash_fwd_params& params, cudaStream_t stream) {
   using OType = std::conditional_t<IsBF16, cutlass::bfloat16_t, cutlass::half_t>;
   if (params.d == 64) {
-    ::nvfp4_attention::run_mha_fwd_<cutlass::nv_float4_t<cutlass::float_e2m1_t>, 64, OType>(params,
-                                                                                            stream);
+    ::nvfp4_attention::run_mha_fwd_<cutlass::nv_float4_t<cutlass::float_e2m1_t>, 64, OType,
+                                    ReturnLSE>(params, stream);
   } else if (params.d == 128) {
-    ::nvfp4_attention::run_mha_fwd_<cutlass::nv_float4_t<cutlass::float_e2m1_t>, 128, OType>(
-        params, stream);
+    ::nvfp4_attention::run_mha_fwd_<cutlass::nv_float4_t<cutlass::float_e2m1_t>, 128, OType,
+                                    ReturnLSE>(params, stream);
   } else {
     TVM_FFI_ICHECK(false) << "Unsupported head dimension " << params.d;
   }
 }
 
 void run_mha_fwd(Flash_fwd_params& params, cudaStream_t stream) {
-  if (params.is_bf16) {
-    run_mha_fwd_dispatch_dtype<true>(params, stream);
+  if (params.softmax_lse_ptr != nullptr) {
+    if (params.is_bf16) {
+      run_mha_fwd_dispatch_dtype<true, true>(params, stream);
+    } else {
+      run_mha_fwd_dispatch_dtype<true, false>(params, stream);
+    }
+  } else if (params.is_bf16) {
+    run_mha_fwd_dispatch_dtype<false, true>(params, stream);
   } else {
-    run_mha_fwd_dispatch_dtype<false>(params, stream);
+    run_mha_fwd_dispatch_dtype<false, false>(params, stream);
   }
 }
 
@@ -194,7 +202,8 @@ void run_mha_fwd(Flash_fwd_params& params, cudaStream_t stream) {
 
 void fwd(TensorView q_fp4, TensorView k_fp4, TensorView v_fp4_t, TensorView q_scale,
          TensorView k_scale, TensorView v_scale_t, TensorView qk_correction, TensorView out,
-         TensorView lse, double sm_scale, bool causal, bool per_block_mean) {
+         ffi::Optional<TensorView> maybe_lse, double sm_scale, bool causal, bool per_block_mean,
+         int64_t unpadded_k_len) {
   CHECK_INPUT(q_fp4);
   CHECK_INPUT(k_fp4);
   CHECK_INPUT(v_fp4_t);
@@ -203,7 +212,9 @@ void fwd(TensorView q_fp4, TensorView k_fp4, TensorView v_fp4_t, TensorView q_sc
   CHECK_INPUT(v_scale_t);
   CHECK_INPUT(qk_correction);
   CHECK_INPUT(out);
-  CHECK_INPUT(lse);
+  if (maybe_lse.has_value()) {
+    CHECK_INPUT(maybe_lse.value());
+  }
 
   CHECK_DIM(4, q_fp4);
   CHECK_DIM(4, k_fp4);
@@ -213,7 +224,9 @@ void fwd(TensorView q_fp4, TensorView k_fp4, TensorView v_fp4_t, TensorView q_sc
   CHECK_DIM(4, v_scale_t);
   CHECK_DIM(4, qk_correction);
   CHECK_DIM(4, out);
-  CHECK_DIM(3, lse);
+  if (maybe_lse.has_value()) {
+    CHECK_DIM(3, maybe_lse.value());
+  }
 
   TVM_FFI_ICHECK_EQ(q_fp4.dtype(), dl_uint8) << "q_fp4 must be uint8 packed FP4";
   TVM_FFI_ICHECK_EQ(k_fp4.dtype(), dl_uint8) << "k_fp4 must be uint8 packed FP4";
@@ -222,7 +235,9 @@ void fwd(TensorView q_fp4, TensorView k_fp4, TensorView v_fp4_t, TensorView q_sc
   TVM_FFI_ICHECK_EQ(k_scale.dtype(), dl_float8_e4m3fn) << "k_scale must be float8_e4m3fn";
   TVM_FFI_ICHECK_EQ(v_scale_t.dtype(), dl_float8_e4m3fn) << "v_scale_t must be float8_e4m3fn";
   TVM_FFI_ICHECK_EQ(qk_correction.dtype(), dl_float32) << "qk_correction must be float32";
-  TVM_FFI_ICHECK_EQ(lse.dtype(), dl_float32) << "lse must be float32";
+  if (maybe_lse.has_value()) {
+    TVM_FFI_ICHECK_EQ(maybe_lse.value().dtype(), dl_float32) << "lse must be float32";
+  }
   TVM_FFI_ICHECK(out.dtype() == dl_bfloat16 || out.dtype() == dl_float16)
       << "out must be bfloat16 or float16";
 
@@ -235,51 +250,63 @@ void fwd(TensorView q_fp4, TensorView k_fp4, TensorView v_fp4_t, TensorView q_sc
       << "NVFP4 attention SM120 kernel requires compute capability 12.0 or 12.1";
 
   const int64_t batch = q_fp4.size(0);
-  const int64_t num_heads = q_fp4.size(1);
-  const int64_t seq_len = q_fp4.size(2);
+  const int64_t num_qo_heads = q_fp4.size(1);
+  const int64_t num_kv_heads = k_fp4.size(1);
+  const int64_t seq_len_q = q_fp4.size(2);
+  const int64_t seq_len_k = k_fp4.size(2);
   const int64_t head_dim = q_fp4.size(3) * 2;
 
   TVM_FFI_ICHECK(head_dim == 64 || head_dim == 128) << "head_dim must be 64 or 128";
-  TVM_FFI_ICHECK_EQ(seq_len % 128, 0) << "seq_len must be a multiple of 128";
+  TVM_FFI_ICHECK_EQ(seq_len_q % 128, 0) << "Q sequence length must be a multiple of 128";
+  TVM_FFI_ICHECK_EQ(seq_len_k % 128, 0) << "K/V sequence length must be a multiple of 128";
+  TVM_FFI_ICHECK_GT(unpadded_k_len, 0) << "unpadded_k_len must be positive";
+  TVM_FFI_ICHECK_LE(unpadded_k_len, seq_len_k)
+      << "unpadded_k_len must not exceed the physical K/V sequence length";
+  TVM_FFI_ICHECK_GT(num_qo_heads, 0) << "num_qo_heads must be positive";
+  TVM_FFI_ICHECK_GT(num_kv_heads, 0) << "num_kv_heads must be positive";
+  TVM_FFI_ICHECK_GE(num_qo_heads, num_kv_heads)
+      << "num_qo_heads must be greater than or equal to num_kv_heads";
+  TVM_FFI_ICHECK_EQ(num_qo_heads % num_kv_heads, 0)
+      << "num_qo_heads must be divisible by num_kv_heads";
 
   TVM_FFI_ICHECK_EQ(k_fp4.size(0), batch);
-  TVM_FFI_ICHECK_EQ(k_fp4.size(1), num_heads);
-  TVM_FFI_ICHECK_EQ(k_fp4.size(2), seq_len);
   TVM_FFI_ICHECK_EQ(k_fp4.size(3), q_fp4.size(3));
 
   TVM_FFI_ICHECK_EQ(v_fp4_t.size(0), batch);
-  TVM_FFI_ICHECK_EQ(v_fp4_t.size(1), num_heads);
+  TVM_FFI_ICHECK_EQ(v_fp4_t.size(1), num_kv_heads);
   TVM_FFI_ICHECK_EQ(v_fp4_t.size(2), head_dim);
-  TVM_FFI_ICHECK_EQ(v_fp4_t.size(3), seq_len / 2);
+  TVM_FFI_ICHECK_EQ(v_fp4_t.size(3), seq_len_k / 2);
 
   TVM_FFI_ICHECK_EQ(q_scale.size(0), batch);
-  TVM_FFI_ICHECK_EQ(q_scale.size(1), num_heads);
-  TVM_FFI_ICHECK_EQ(q_scale.size(2), seq_len);
+  TVM_FFI_ICHECK_EQ(q_scale.size(1), num_qo_heads);
+  TVM_FFI_ICHECK_EQ(q_scale.size(2), seq_len_q);
   TVM_FFI_ICHECK_EQ(q_scale.size(3), head_dim / 16);
   TVM_FFI_ICHECK_EQ(k_scale.size(0), batch);
-  TVM_FFI_ICHECK_EQ(k_scale.size(1), num_heads);
-  TVM_FFI_ICHECK_EQ(k_scale.size(2), seq_len);
+  TVM_FFI_ICHECK_EQ(k_scale.size(1), num_kv_heads);
+  TVM_FFI_ICHECK_EQ(k_scale.size(2), seq_len_k);
   TVM_FFI_ICHECK_EQ(k_scale.size(3), head_dim / 16);
   TVM_FFI_ICHECK_EQ(v_scale_t.size(0), batch);
-  TVM_FFI_ICHECK_EQ(v_scale_t.size(1), num_heads);
+  TVM_FFI_ICHECK_EQ(v_scale_t.size(1), num_kv_heads);
   TVM_FFI_ICHECK_EQ(v_scale_t.size(2), head_dim);
-  TVM_FFI_ICHECK_EQ(v_scale_t.size(3), seq_len / 16);
+  TVM_FFI_ICHECK_EQ(v_scale_t.size(3), seq_len_k / 16);
 
   // Compact correction: one row per 128-token Q block. The kernel's TMA
   // layout addresses the tensor this way and broadcasts each row across
   // the rows of the corresponding Q tile.
   TVM_FFI_ICHECK_EQ(qk_correction.size(0), batch);
-  TVM_FFI_ICHECK_EQ(qk_correction.size(1), num_heads);
-  TVM_FFI_ICHECK_EQ(qk_correction.size(2), per_block_mean ? seq_len / 128 : 1);
-  TVM_FFI_ICHECK_EQ(qk_correction.size(3), seq_len);
+  TVM_FFI_ICHECK_EQ(qk_correction.size(1), num_qo_heads);
+  TVM_FFI_ICHECK_EQ(qk_correction.size(2), per_block_mean ? seq_len_q / 128 : 1);
+  TVM_FFI_ICHECK_EQ(qk_correction.size(3), seq_len_k);
 
   TVM_FFI_ICHECK_EQ(out.size(0), batch);
-  TVM_FFI_ICHECK_EQ(out.size(1), num_heads);
-  TVM_FFI_ICHECK_EQ(out.size(2), seq_len);
+  TVM_FFI_ICHECK_EQ(out.size(1), num_qo_heads);
+  TVM_FFI_ICHECK_EQ(out.size(2), seq_len_q);
   TVM_FFI_ICHECK_EQ(out.size(3), head_dim);
-  TVM_FFI_ICHECK_EQ(lse.size(0), batch);
-  TVM_FFI_ICHECK_EQ(lse.size(1), num_heads);
-  TVM_FFI_ICHECK_EQ(lse.size(2), seq_len);
+  if (maybe_lse.has_value()) {
+    TVM_FFI_ICHECK_EQ(maybe_lse.value().size(0), batch);
+    TVM_FFI_ICHECK_EQ(maybe_lse.value().size(1), num_qo_heads);
+    TVM_FFI_ICHECK_EQ(maybe_lse.value().size(2), seq_len_q);
+  }
 
   check_same_device(q_fp4, k_fp4, "k_fp4");
   check_same_device(q_fp4, v_fp4_t, "v_fp4_t");
@@ -288,33 +315,37 @@ void fwd(TensorView q_fp4, TensorView k_fp4, TensorView v_fp4_t, TensorView q_sc
   check_same_device(q_fp4, v_scale_t, "v_scale_t");
   check_same_device(q_fp4, qk_correction, "qk_correction");
   check_same_device(q_fp4, out, "out");
-  check_same_device(q_fp4, lse, "lse");
+  if (maybe_lse.has_value()) {
+    check_same_device(q_fp4, maybe_lse.value(), "lse");
+  }
 
   cudaStream_t stream = get_stream(q_fp4.device());
 
-  if (seq_len == 0) {
+  if (seq_len_q == 0) {
     status = cudaMemsetAsync(out.data_ptr(), 0, numel(out) * get_element_size(out), stream);
     TVM_FFI_ICHECK(status == cudaSuccess)
         << "cudaMemsetAsync(out) failed: " << cudaGetErrorString(status);
-    status = cudaMemsetAsync(lse.data_ptr(), 0, numel(lse) * get_element_size(lse), stream);
-    TVM_FFI_ICHECK(status == cudaSuccess)
-        << "cudaMemsetAsync(lse) failed: " << cudaGetErrorString(status);
+    if (maybe_lse.has_value()) {
+      auto lse = maybe_lse.value();
+      status = cudaMemsetAsync(lse.data_ptr(), 0, numel(lse) * get_element_size(lse), stream);
+      TVM_FFI_ICHECK(status == cudaSuccess)
+          << "cudaMemsetAsync(lse) failed: " << cudaGetErrorString(status);
+    }
     return;
   }
 
-  // lse is allocated uninitialized by the caller (torch.empty). The fwd kernel
-  // writes `out` for every query row but does not guarantee writing every
-  // (batch, head, seq) entry of lse, so reading it back can surface whatever
-  // garbage the allocator handed out (observed as flaky NaNs in lse under a
-  // dirty allocator, depending on test/run ordering). Zero it first, mirroring
-  // the seq_len==0 branch above, so unwritten entries are a defined 0.
-  status = cudaMemsetAsync(lse.data_ptr(), 0, numel(lse) * get_element_size(lse), stream);
-  TVM_FFI_ICHECK(status == cudaSuccess)
-      << "cudaMemsetAsync(lse) failed: " << cudaGetErrorString(status);
+  if (maybe_lse.has_value()) {
+    // LSE may be allocated uninitialized by the caller. Zero it first so any
+    // entries not written by the kernel have a defined value.
+    auto lse = maybe_lse.value();
+    status = cudaMemsetAsync(lse.data_ptr(), 0, numel(lse) * get_element_size(lse), stream);
+    TVM_FFI_ICHECK(status == cudaSuccess)
+        << "cudaMemsetAsync(lse) failed: " << cudaGetErrorString(status);
+  }
 
   Flash_fwd_params params;
   set_params_fprop(params, q_fp4, k_fp4, v_fp4_t, q_scale, k_scale, v_scale_t, qk_correction, out,
-                   lse, static_cast<float>(sm_scale), causal, per_block_mean);
+                   maybe_lse, static_cast<float>(sm_scale), causal, per_block_mean, unpadded_k_len);
   run_mha_fwd(params, stream);
 }
 

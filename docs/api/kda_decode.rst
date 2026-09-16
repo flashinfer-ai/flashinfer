@@ -12,7 +12,7 @@ sequence (``T>=2``).
 
 Pass ``backend="cake"`` to select the exported Cake backend. On SM100-family
 SM100a (B200/GB200) and SM103a (B300/GB300) devices, its D128 ``T=1..6``
-family with in-kernel QK normalization exports 23 frozen CUDA bodies:
+family with in-kernel QK normalization exports 25 frozen CUDA bodies:
 
 * ``T=3`` with raw gates, ``use_gate_in_kernel=True``, a negative
   ``lower_bound``, float32 ``A_log`` and ``dt_bias``, ``H=HV=16``, and
@@ -24,6 +24,13 @@ family with in-kernel QK normalization exports 23 frozen CUDA bodies:
   splits 16 and 8. ``T=1`` keeps the standard decode API and is normalized
   to the packed frozen ABI with zero-copy views and cached identity metadata;
   explicit ``T=1`` ``cu_seqlens`` metadata is outside the Cake contract.
+* two Kimi-Linear ``T=1`` equal-head direct-state schedules for
+  ``lower_bound=None``. They accept any positive runtime head count, including
+  production per-rank ``H=HV=32/16/8/4`` for TP1/2/4/8, and evaluate
+  ``-exp(A_log) * softplus(g + dt_bias)`` and beta sigmoid in-kernel. Q, K,
+  and V may be zero-copy views into one padded packed-projection row; raw G
+  and beta may have independent positive token-row strides. The single frozen
+  kernel therefore consumes SGLang's production views without staging copies.
 
 Let ``W=N*HV`` be the active sequence/value-head work and ``S`` the device SM
 count. SM100a retains the B200-measured policy: direct split 16 for T1 when
@@ -42,7 +49,7 @@ split-1 island at ``3S/4<W<=S``. T6 selects split 8 through ``W<=3S/8``, split
 2 through ``W<=S/2``, and split 1 above it. T3 uses its sole exact lower-bound
 split-4 specialization on both architectures.
 
-With CUDA 12.9 or newer, JIT and AOT compile all 23 checked-in bodies once for
+With CUDA 12.9 or newer, JIT and AOT compile all 25 checked-in bodies once for
 the ``sm_100f`` family target. The family module URI and cubin artifact can run
 on both CC 10.0 and CC 10.3; build workspaces may still materialize separate
 cache directories for their local architecture context. Runtime split
@@ -53,7 +60,7 @@ cubins measured no aggregate change on B200 (``1.0000x`` exact/family) and
 cubins while every other GB300 route uses ``sm_100f``.
 
 CUDA 12.8 cannot compile ``sm_100f``. On B200 it therefore retains exact
-``sm_100a`` modules for all 23 bodies. SM103a requires CUDA 12.9 or newer.
+``sm_100a`` modules for all 25 bodies. SM103a requires CUDA 12.9 or newer.
 Every binding validates its family or exact-device contract before launch, and
 the frozen generated body bytes are identical across all physical targets.
 
@@ -61,7 +68,8 @@ Once ``backend="cake"`` is selected, every supported call launches exactly one
 exported Cake kernel. An unsupported architecture, shape, gate mode, layout,
 aliasing pattern, or optional feature raises an error; it never falls back to
 CuTe-DSL. The default ``backend="cute-dsl"`` preserves the existing FlashInfer
-implementation.
+implementation. ``backend="auto"`` selects Cake only for the equal-head D128
+T1 unbounded-softplus contract and preserves CuTe-DSL for other decode modes.
 
 Serving-native packed Kimi K3 decode
 ------------------------------------
@@ -88,6 +96,28 @@ eight-row value tile for ``B < 32`` and the sixteen-row value tile for
 CUDA 12.9 or newer uses one ``sm_100f`` module on CC 10.0 and CC 10.3.
 Unsupported devices or contracts raise an error without falling back to
 another KDA implementation.
+
+Frozen / speculative-verify mode
+--------------------------------
+
+``recurrent_kda(disable_state_update=True)`` computes the KDA outputs for up
+to 16 tokens per sequence from a read-only committed-state pool and never
+writes state back — the speculative-decode verify path, mirroring GDN's
+``gated_delta_rule_mtp(disable_state_update=True)``. Optional slot-indexed
+``correction_cache`` (float32 per-token delta-rule corrections,
+``[num_slots, HV, T_max, V]``) and ``kg_cache`` (raw key | raw gate,
+``[num_slots, HV, T_max, 2K]``) out-params feed a downstream commit/recovery
+kernel, paralleling GDN's slot-indexed ``intermediate_states_buffer``. The
+mode accepts the batched ``[B, T, ...]`` form and the packed ``cu_seqlens``
+form with ragged per-sequence lengths and null slots.
+
+Two implementations are dispatched internally by problem size: a WY-parallel
+tensor-core kernel that replaces the serial recurrence with T x T GEMMs, a
+log-depth triangular inverse, and TMA-loaded state GEMMs (per-K-channel decay
+folded into ``k * exp(±cumsum g)`` / ``q * exp(cumsum g)`` operand tiles),
+and a grouped register recurrence (no per-token state-checkpoint writes) for
+small ``B * HV * T``. Requires SM90+ for the WY path and ``K = V = 128``;
+``backend="cake"`` raises in this mode.
 
 .. currentmodule:: flashinfer.kda_decode
 

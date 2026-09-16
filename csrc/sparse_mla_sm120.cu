@@ -45,14 +45,15 @@ using tvm::ffi::Optional;
 namespace flashinfer::sparse_mla_sm120 {
 
 // Forward declaration (defined in sparse_mla_sm120_prefill.cu).
-bool sparse_mla_prefill_dispatch(ModelType mt, int num_heads, int topk, int page_block_size,
-                                 int topk_extra, int extra_page_block_size, const bf16* Q,
-                                 const uint8_t* KV_cache, const int32_t* indices,
+bool sparse_mla_prefill_dispatch(ModelType mt, PrefillVariant variant, int num_heads, int topk,
+                                 int page_block_size, int topk_extra, int extra_page_block_size,
+                                 const bf16* Q, const uint8_t* KV_cache, const int32_t* indices,
                                  const uint8_t* extra_KV_cache, const int32_t* extra_indices,
                                  bf16* output, float* out_lse, float sm_scale, int num_tokens,
                                  size_t stride_kv_block, size_t extra_stride_kv_block,
-                                 const float* attn_sink, const int* topk_length,
-                                 const int* extra_topk_length, cudaStream_t stream);
+                                 size_t stride_out_lse, const float* attn_sink,
+                                 const int* topk_length, const int* extra_topk_length,
+                                 cudaStream_t stream);
 
 namespace {
 
@@ -68,61 +69,107 @@ inline ModelType resolve_model_type(int d_qk, int64_t model_type) {
   if (d_qk == 512) {
     const auto mt = static_cast<ModelType>(
         model_type == kAuto ? static_cast<int64_t>(ModelType::DSV4) : model_type);
-    TVM_FFI_ICHECK(mt == ModelType::DSV4)
-        << "d_qk=512 supports only model_type auto or DSV4; got " << model_type;
+    TVM_FFI_ICHECK(mt == ModelType::DSV4 || mt == ModelType::GLM53_NOPE)
+        << "d_qk=512 supports model_type auto, DSV4, or GLM53_NOPE; got " << model_type;
+    return mt;
+  }
+  if (d_qk == 1088) {
+    const auto mt = static_cast<ModelType>(
+        model_type == kAuto ? static_cast<int64_t>(ModelType::DOTS3_SWA) : model_type);
+    TVM_FFI_ICHECK(mt == ModelType::DOTS3_SWA)
+        << "d_qk=1088 supports only model_type auto or DOTS3_SWA; got " << model_type;
     return mt;
   }
   TVM_FFI_ICHECK(false) << "Unsupported d_qk=" << d_qk
-                        << "; expected 576 (DSV3_2/GLM_NSA) or 512 (DSV4)";
+                        << "; expected 576 (DSV3_2/GLM_NSA), 512 (DSV4/GLM53_NOPE) or 1088 "
+                           "(DOTS3_SWA)";
   return ModelType::DSV4;
 }
 
-inline int bytes_per_token(ModelType mt) {
-  switch (mt) {
-    case ModelType::DSV3_2:
-    case ModelType::GLM_NSA:
-      return 656;
-    case ModelType::DSV4:
-      return 584;
-  }
-  TVM_FFI_ICHECK(false) << "Unsupported sparse MLA model type";
-  return 0;
-}
+// Output width. Every DeepSeek-family model absorbs V into the 512-wide
+// latent; DOTS3_SWA's is 1024 (its 1024-wide latent, rope excluded).
+inline int d_v_for(ModelType mt) { return mt == ModelType::DOTS3_SWA ? 1024 : 512; }
 
 struct PagedKVLayout {
   int page_block_size;
   size_t stride_kv_block;
+  // Per-token advance in bytes. Equals bytes_per_token for a packed cache, but
+  // may be larger when the caller pads rows (e.g. a legacy 656B vLLM pool
+  // serving a 528B GLM53_NOPE payload). The payload always sits at the row
+  // start, so only the advance changes.
+  size_t stride_kv_row;
 };
 
-inline PagedKVLayout parse_paged_kv_layout(const TensorView& kv, int bpt, const char* name) {
+// inline_scale: the model stores scales inside the row (DSV3_2 / GLM_NSA /
+// GLM53_NOPE). Inline rows may be padded (advance >= width >= bpt); footer
+// models address scale data relative to packed rows and must stay exact.
+inline PagedKVLayout parse_paged_kv_layout(const TensorView& kv, int bpt, bool inline_scale,
+                                           const char* name) {
   const size_t elem_bytes = static_cast<size_t>(kv.dtype().bits / 8);
+  TVM_FFI_ICHECK_EQ(kv.stride(-1), 1) << name << " last dim must be contiguous";
+  // Bulk gathers require aligned addresses, including sliced cache origins
+  // and the first row of each block.
+  TVM_FFI_ICHECK_EQ(reinterpret_cast<uintptr_t>(kv.data_ptr()) % 16, 0)
+      << name << " data pointer must be 16B-aligned (cp.async.bulk requirement)";
+  const size_t block_stride = static_cast<size_t>(kv.stride(0)) * elem_bytes;
+  TVM_FFI_ICHECK_EQ(block_stride % 16, 0)
+      << name << " block stride must be 16B-aligned (cp.async.bulk requirement)";
   if (kv.ndim() == 2) {
     const size_t block_bytes = static_cast<size_t>(kv.size(1)) * elem_bytes;
     TVM_FFI_ICHECK_EQ(block_bytes % static_cast<size_t>(bpt), 0)
         << name << " 2D block width " << block_bytes
         << " is not divisible by bytes_per_token=" << bpt;
-    return {static_cast<int>(block_bytes / static_cast<size_t>(bpt)), block_bytes};
+    // A flat 2D block carries no row padding to infer, so the row advance is
+    // exactly bytes_per_token.
+    TVM_FFI_ICHECK_GE(block_stride, block_bytes)
+        << name << " block stride is smaller than the packed block width";
+    return {static_cast<int>(block_bytes / static_cast<size_t>(bpt)), block_stride,
+            static_cast<size_t>(bpt)};
   }
+  auto row_advance = [&](int64_t token_axis) {
+    const size_t bytes = static_cast<size_t>(kv.size(-1)) * elem_bytes;
+    if (inline_scale) {
+      TVM_FFI_ICHECK_GE(bytes, static_cast<size_t>(bpt))
+          << name << " row width " << bytes << " is smaller than bytes_per_token=" << bpt;
+    } else {
+      TVM_FFI_ICHECK_EQ(bytes, static_cast<size_t>(bpt))
+          << name << " row width " << bytes << " must equal bytes_per_token=" << bpt
+          << " (footer-scale rows must stay packed)";
+    }
+    // The per-token advance is the token axis's real stride: a caller slicing
+    // the last dim of a wider buffer (padded rows) changes the size but not
+    // the stride, and the kernel must step by the stride.
+    const size_t advance = static_cast<size_t>(kv.stride(token_axis)) * elem_bytes;
+    TVM_FFI_ICHECK_GE(advance, bytes)
+        << name << " token-axis stride " << advance << " is smaller than the row width " << bytes;
+    if (inline_scale) {
+      TVM_FFI_ICHECK_EQ(advance % 16, 0) << name << " token-axis stride " << advance
+                                         << " is not 16B-aligned (cp.async.bulk requirement)";
+    } else {
+      TVM_FFI_ICHECK_EQ(advance, static_cast<size_t>(bpt))
+          << name << " footer-scale rows must stay packed (token-axis stride == " << bpt << ")";
+    }
+    return advance;
+  };
   if (kv.ndim() == 3) {
-    TVM_FFI_ICHECK_EQ(kv.size(-1), bpt)
-        << name << " 3D form must be [num_pages, page_block_size, " << bpt << "]";
-    return {static_cast<int>(kv.size(1)), static_cast<size_t>(kv.stride(0)) * elem_bytes};
+    return {static_cast<int>(kv.size(1)), static_cast<size_t>(kv.stride(0)) * elem_bytes,
+            row_advance(1)};
   }
   TVM_FFI_ICHECK_EQ(kv.ndim(), 4) << name << " must be 2D [num_pages, page_bytes], 3D "
                                   << "[num_pages, page_block_size, bytes_per_token], HND "
                                   << "[num_pages, 1, page_block_size, bytes_per_token], or NHD "
                                   << "[num_pages, page_block_size, 1, bytes_per_token]";
-  TVM_FFI_ICHECK_EQ(kv.size(-1), bpt)
-      << name << " last dim must be bytes_per_token=" << bpt << ", got " << kv.size(-1);
   if (kv.size(1) == 1) {
-    return {static_cast<int>(kv.size(2)), static_cast<size_t>(kv.stride(0)) * elem_bytes};
+    return {static_cast<int>(kv.size(2)), static_cast<size_t>(kv.stride(0)) * elem_bytes,
+            row_advance(2)};
   }
   if (kv.size(2) == 1) {
-    return {static_cast<int>(kv.size(1)), static_cast<size_t>(kv.stride(0)) * elem_bytes};
+    return {static_cast<int>(kv.size(1)), static_cast<size_t>(kv.stride(0)) * elem_bytes,
+            row_advance(1)};
   }
   TVM_FFI_ICHECK(false) << name << " 4D form must have singleton KV-head axis at dim 1 "
                         << "(HND) or dim 2 (NHD)";
-  return {0, 0};
+  return {0, 0, 0};
 }
 
 inline int check_dense_indices_2d_or_s_q_3d(const TensorView& idx, const char* name,
@@ -147,8 +194,10 @@ void SparseMlaSm120PagedAttention(
     TensorView kv_cache,  // packed paged FP8; HND/NHD/3D/2D forms accepted
     TensorView indices,   // [num_tokens, topk] or [num_tokens, 1, topk] int32 (-1 = skip)
     TensorView output,    // [num_tokens, num_heads, d_v] bf16 — in-place
-    TensorView out_lse,   // [num_tokens, num_heads] f32 — in-place
-    double sm_scale, int64_t model_type,
+    // [num_tokens, num_heads] f32 — in-place; row-strided views (a column
+    // slice of a wider buffer) are supported, the head dim stays contiguous.
+    TensorView out_lse, double sm_scale, int64_t model_type,
+    int64_t variant,                         // PrefillVariant; planner-selected
     Optional<TensorView> topk_length,        // [num_tokens] int32, optional
     Optional<TensorView> attn_sink,          // [num_heads] f32, optional
     Optional<TensorView> extra_kv_cache,     // optional dual cache
@@ -157,13 +206,18 @@ void SparseMlaSm120PagedAttention(
 {
   // ── Input validation ───────────────────────────────────────────────
   CHECK_INPUT_AND_TYPE(q, dl_bfloat16);
-  // kv_cache: CUDA + last-dim contiguous only; padded block stride is OK.
+  // kv_cache: CUDA + last-dim contiguous only. Padded block strides are OK
+  // for footer-scale models (DSV4 / DOTS3_SWA); inline-scale models are
+  // checked below.
   CHECK_CUDA(kv_cache);
   CHECK_LAST_DIM_CONTIGUOUS(kv_cache);
   CHECK_INPUT_TYPE(kv_cache, dl_uint8);
   CHECK_INPUT_AND_TYPE(indices, dl_int32);
   CHECK_INPUT_AND_TYPE(output, dl_bfloat16);
-  CHECK_INPUT_AND_TYPE(out_lse, dl_float32);
+  // out_lse may be a row-strided column slice of a wider buffer; checked
+  // against its real strides below instead of requiring full contiguity.
+  CHECK_CUDA(out_lse);
+  CHECK_INPUT_TYPE(out_lse, dl_float32);
 
   CHECK_DIM(3, q);
 
@@ -172,20 +226,52 @@ void SparseMlaSm120PagedAttention(
   const int d_qk = static_cast<int>(q.size(2));
   const int topk = check_dense_indices_2d_or_s_q_3d(indices, "indices", num_tokens);
   const ModelType mt = resolve_model_type(d_qk, model_type);
-  const PagedKVLayout kv_layout = parse_paged_kv_layout(kv_cache, bytes_per_token(mt), "kv_cache");
+  const bool inline_scale =
+      (mt == ModelType::DSV3_2 || mt == ModelType::GLM_NSA || mt == ModelType::GLM53_NOPE);
+  const PagedKVLayout kv_layout =
+      parse_paged_kv_layout(kv_cache, bytes_per_token(mt), inline_scale, "kv_cache");
   const int page_block_size = kv_layout.page_block_size;
+  // Inline-scale models (DSV3_2 / GLM_NSA / GLM53_NOPE) are addressed by the
+  // prefill kernels as a flat token array with a runtime row advance
+  // (prefill_kv_entry_base), so rows may be padded but blocks must stay
+  // contiguous; only footer-scale models honor a padded stride_kv_block.
+  if (inline_scale) {
+    TVM_FFI_ICHECK_EQ(kv_layout.stride_kv_block,
+                      static_cast<size_t>(page_block_size) * kv_layout.stride_kv_row)
+        << "prefill for inline-scale KV caches (DSv3.2/GLM) requires contiguous blocks "
+           "(stride_kv_block == page_block_size * row stride); the row stride itself may "
+           "exceed bytes_per_token for padded-row pools";
+  }
 
   TVM_FFI_ICHECK_GT(num_heads, 0);
   TVM_FFI_ICHECK_LE(num_heads, 128);
   TVM_FFI_ICHECK_GT(topk, 0);
+  // The prefill kernels stage whole index tiles through the math warps, so
+  // the indices row width must be a multiple of 64. (The gather itself is
+  // masked at topk_len granularity; this requirement is about the allocation
+  // width, not the runtime length.)
+  TVM_FFI_ICHECK_EQ(topk % 64, 0)
+      << "sparse-MLA SM120 prefill requires topk % 64 == 0 (BI=64: index tiles "
+         "are issued whole, the tail tile is not masked); got topk="
+      << topk;
+  // DOTS3_SWA's candidate list is the 513-wide sliding window; the buffer
+  // must fit it (the kernel clamps the scan to the window, not the row).
+  TVM_FFI_ICHECK(mt != ModelType::DOTS3_SWA || topk >= 513)
+      << "sparse-MLA SM120 DOTS3_SWA prefill requires topk >= 513 (the "
+         "513-wide sliding window must fit the indices buffer); got topk="
+      << topk;
   TVM_FFI_ICHECK_GT(page_block_size, 0);
-  TVM_FFI_ICHECK_EQ(output.ndim(), 3) << "output must be [num_tokens, num_heads, 512]";
+  const int d_v = d_v_for(mt);
+  TVM_FFI_ICHECK_EQ(output.ndim(), 3) << "output must be [num_tokens, num_heads, d_v]";
   TVM_FFI_ICHECK_EQ(output.size(0), num_tokens);
   TVM_FFI_ICHECK_EQ(output.size(1), num_heads);
-  TVM_FFI_ICHECK_EQ(output.size(2), 512) << "SM120 sparse-MLA requires d_v == 512";
+  TVM_FFI_ICHECK_EQ(output.size(2), d_v)
+      << "SM120 sparse-MLA requires d_v == " << d_v << " for this model type";
   TVM_FFI_ICHECK_EQ(out_lse.ndim(), 2) << "out_lse must be [num_tokens, num_heads]";
   TVM_FFI_ICHECK_EQ(out_lse.size(0), num_tokens);
   TVM_FFI_ICHECK_EQ(out_lse.size(1), num_heads);
+  TVM_FFI_ICHECK_EQ(out_lse.stride(-1), 1) << "out_lse last dimension must be contiguous";
+  const size_t stride_out_lse = static_cast<size_t>(out_lse.stride(0));
 
   if (topk_length.has_value()) {
     const auto& tl = topk_length.value();
@@ -224,7 +310,7 @@ void SparseMlaSm120PagedAttention(
     CHECK_INPUT_TYPE(ekv, dl_uint8);
     CHECK_INPUT_AND_TYPE(eidx, dl_int32);
     const PagedKVLayout extra_layout =
-        parse_paged_kv_layout(ekv, bytes_per_token(mt), "extra_kv_cache");
+        parse_paged_kv_layout(ekv, bytes_per_token(mt), inline_scale, "extra_kv_cache");
     extra_page_block_size = extra_layout.page_block_size;
     extra_stride_kv_block = extra_layout.stride_kv_block;
     extra_topk = check_dense_indices_2d_or_s_q_3d(eidx, "extra_indices", num_tokens);
@@ -256,25 +342,43 @@ void SparseMlaSm120PagedAttention(
   const auto LSE_ptr = static_cast<float*>(out_lse.data_ptr());
 
   // Decode (num_tokens <= 64) is dispatched by Python directly through the
-  // standalone decode-dsv3_2 / decode-dsv4 entry points. The orchestrator
-  // only handles prefill.
-  TVM_FFI_ICHECK_GT(num_tokens, 64)
-      << "Decode (num_tokens <= 64) must go through sparse_mla_sm120_decode_dsv3_2 "
-         "or sparse_mla_sm120_decode_dsv4; got num_tokens="
-      << num_tokens;
+  // standalone decode-dsv3_2 / decode-dsv4 entry points. The prefill kernels
+  // launch one CTA group per query token and guard s_i >= num_tokens, so any
+  // num_tokens >= 1 is valid here.
+  TVM_FFI_ICHECK_GE(num_tokens, 1)
+      << "prefill requires num_tokens >= 1; got num_tokens=" << num_tokens;
+
+  TVM_FFI_ICHECK(variant >= static_cast<int64_t>(PrefillVariant::SG) &&
+                 variant <= static_cast<int64_t>(PrefillVariant::SWAPAB))
+      << "variant must be a PrefillVariant (1=SG, 2=MG, 3=MG_DUAL, 4=SWAPAB); got " << variant;
 
   const bool ok = sparse_mla_prefill_dispatch(
-      mt, num_heads, topk, page_block_size, extra_topk, extra_page_block_size, Q_ptr, KV_ptr,
-      idx_ptr, extra_kv_ptr, extra_idx_ptr, O_ptr, LSE_ptr, static_cast<float>(sm_scale),
-      num_tokens, kv_layout.stride_kv_block, extra_stride_kv_block, attn_sink_ptr, tl_ptr, etl_ptr,
-      stream);
+      mt, static_cast<PrefillVariant>(variant), num_heads, topk, page_block_size, extra_topk,
+      extra_page_block_size, Q_ptr, KV_ptr, idx_ptr, extra_kv_ptr, extra_idx_ptr, O_ptr, LSE_ptr,
+      static_cast<float>(sm_scale), num_tokens, kv_layout.stride_kv_block, extra_stride_kv_block,
+      stride_out_lse, attn_sink_ptr, tl_ptr, etl_ptr, stream);
+  const char* mt_name = "DSV4";
+  switch (mt) {
+    case ModelType::DSV3_2:
+      mt_name = "DSV3_2";
+      break;
+    case ModelType::GLM_NSA:
+      mt_name = "GLM_NSA";
+      break;
+    case ModelType::GLM53_NOPE:
+      mt_name = "GLM53_NOPE";
+      break;
+    case ModelType::DOTS3_SWA:
+      mt_name = "DOTS3_SWA";
+      break;
+    case ModelType::DSV4:
+      break;
+  }
   TVM_FFI_ICHECK(ok) << "Unsupported sparse-MLA prefill configuration: "
-                     << "model="
-                     << (mt == ModelType::DSV3_2 ? "DSV3_2"
-                                                 : (mt == ModelType::GLM_NSA ? "GLM_NSA" : "DSV4"))
-                     << " num_heads=" << num_heads << " topk=" << topk
+                     << "model=" << mt_name << " num_heads=" << num_heads << " topk=" << topk
                      << " page_block_size=" << page_block_size << " topk_extra=" << extra_topk
-                     << " extra_page_block_size=" << extra_page_block_size;
+                     << " extra_page_block_size=" << extra_page_block_size
+                     << " variant=" << variant;
 }
 
 }  // namespace flashinfer::sparse_mla_sm120

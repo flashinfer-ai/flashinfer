@@ -95,10 +95,13 @@ def _build_decode_pipeline(B, ctx):
     return run
 
 
-def test_msa_decode_pipeline_cuda_graph():
+# ctx=4096 (32 blocks) runs the count-rank top-k, ctx=16384 (128 blocks) the
+# chunked one, whose candidate scratch must allocate cleanly under capture.
+@pytest.mark.parametrize("ctx", [4096, 16384])
+def test_msa_decode_pipeline_cuda_graph(ctx):
     """Graph replay of the captured pipeline must be bit-identical to eager."""
     _skip()
-    run = _build_decode_pipeline(B=64, ctx=4096)
+    run = _build_decode_pipeline(B=64, ctx=ctx)
 
     for _ in range(3):  # JIT compile / warm caches before capture
         eager = run()

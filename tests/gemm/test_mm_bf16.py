@@ -28,10 +28,18 @@ _SMOKE_CASES = [
     (1, 2048, 1024, torch.bfloat16, True, True, "tgv", False),
     (64, 1024, 2048, torch.bfloat16, False, True, "tgv", True),
     (16, 2048, 2048, torch.bfloat16, False, False, "cublaslt", True),
+    (16, 2048, 2048, torch.bfloat16, True, False, "cublaslt", True),
     (8, 4096, 3072, torch.float16, False, False, "cublaslt", False),
     (1, 1024, 3072, torch.bfloat16, True, False, "tinygemm", False),
     (32, 1024, 1024, torch.bfloat16, False, False, "cutile", False),
     (25, 2048, 1024, torch.bfloat16, False, False, "cute-dsl", False),
+    # Warp Split-K: tuned low-M with bias and PDL; M > 16 (32-token tile, tail rows)
+    # on the default tactic; K above its tile bound (served by the other runners).
+    (8, 768, 7168, torch.bfloat16, True, True, "cute-dsl", True),
+    (17, 2304, 1536, torch.bfloat16, False, False, "cute-dsl", False),
+    (8, 768, 8320, torch.bfloat16, False, False, "cute-dsl", False),
+    (33, 256, 512, torch.bfloat16, True, True, "cute-dsl", False),
+    (64, 256, 512, torch.bfloat16, True, True, "cute-dsl", False),
     (64, 4096, 2048, torch.bfloat16, False, False, "auto", True),
     (1, 2048, 3072, torch.float16, False, False, "auto", False),
 ]
@@ -80,8 +88,6 @@ def test_mm_bf16(
 
         if not is_cute_dsl_available():
             pytest.skip("nvidia-cutlass-dsl is not available.")
-        if m > 32:
-            pytest.skip("CuTeDSL low-M backend requires M <= 32.")
         if res_dtype != torch.bfloat16:
             pytest.skip("CuTeDSL low-M backend requires BF16 output.")
 
@@ -92,10 +98,8 @@ def test_mm_bf16(
         pytest.skip(
             "mm_bf16 with CUTLASS backend does not support bias or pdl arguments."
         )
-    if backend == "cublaslt" and (enable_bias or pdl):
-        pytest.skip(
-            "mm_bf16 with cuBLASLt backend does not support bias or pdl arguments."
-        )
+    if backend == "cublaslt" and pdl:
+        pytest.skip("mm_bf16 with cuBLASLt backend does not support pdl arguments.")
     if backend == "cutile" and (enable_bias or pdl):
         pytest.skip(
             "mm_bf16 with cuTile backend does not support bias or pdl arguments."
@@ -133,6 +137,11 @@ def test_mm_bf16(
 
     cos_sim = F.cosine_similarity(reference.reshape(-1), out.reshape(-1), dim=0)
     assert cos_sim > 0.99
+    if backend == "cute-dsl":
+        fp32_reference = F.linear(
+            input.float(), mat2.float(), bias.float() if bias is not None else None
+        ).to(res_dtype)
+        torch.testing.assert_close(out, fp32_reference, rtol=2e-2, atol=5e-2)
 
 
 def test_mm_bf16_cutile_rejects_bias_and_pdl():

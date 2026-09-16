@@ -47,12 +47,40 @@ FMHA Decode
 
     batch_decode_with_paged_kv_cache
     get_prims_ts_batch_decode_workspace_size
+    prepare_prims_ts_batch_decode_with_kv_cache
     prims_ts_batch_decode_with_kv_cache
+
+.. autoclass:: PrimsTSBatchDecodePlan
+    :members:
 
 .. autoclass:: BatchDecodePagedTSWrapper
     :members:
 
     .. automethod:: __init__
+
+QToken-KvBlock-Sparse-Attention
+--------------------------------
+
+QToken-KvBlock-Sparse-Attention consumes per-query
+``indexer_block_ids[total_q, block_topk]`` and a dense physical
+``block_table``. Packed prefill uses ``[total_q, Hq, D]`` with
+``qo_indptr``; fixed MTP decode uses ``[B, Nq, G, Hq, D]``.
+``kv_block_size`` is the semantic sparse K/V atom and currently supports
+only four tokens. The wrapper plans capacity outside CUDA Graph capture and
+runs live route metadata on the hot path.
+
+.. autosummary::
+    :toctree: ../generated
+
+    QTokenKvBlockSparsePagedTSWrapper
+    get_q_token_kv_block_sparse_workspace_size
+    q_token_kv_block_sparse_attention_with_paged_kv_cache
+    validate_q_token_kv_block_sparse_group_size
+    suggest_q_token_kv_block_sparse_group_size
+    make_q_token_kv_block_sparse_qo_indptr
+
+.. autoclass:: QTokenKvBlockSparsePagedTSWrapper
+    :members:
 
 Block-Sparse FMHA
 -----------------
@@ -79,9 +107,9 @@ MLA Decode
 .. autosummary::
     :toctree: ../generated
 
-    batch_decode_mla_with_paged_kv_cache
-    get_prims_ts_batch_decode_mla_workspace_size
-    prims_ts_batch_decode_with_kv_cache_mla
+    batch_mla_decode_with_paged_kv_cache
+    get_prims_ts_batch_mla_decode_workspace_size
+    prims_ts_batch_mla_decode_with_kv_cache
 
 .. autoclass:: BatchMLADecodePagedTSWrapper
     :members:
@@ -113,15 +141,40 @@ Batch Decoding
     trtllm_batch_decode_with_kv_cache
     xqa_batch_decode_with_kv_cache
 
+DCP Speculative Decode Workspace
+--------------------------------
+
+The native Cake FMHA DCP speculative route of
+:func:`flashinfer.decode.trtllm_batch_decode_with_kv_cache` uses caller-owned
+scratch buffers so a prewarmed invocation can be captured in a CUDA Graph.
+It is also reachable through
+:func:`flashinfer.cake_fmha.cake_batch_decode_with_kv_cache`; the non-null
+``causal_seqlens_kv_global`` argument is the explicit add-on selection key.
+On SM103, the same Cake entrypoint accepts a device ``request_order`` tensor
+for BF16-query, FP8-E4M3 paged decode with head dimension 256.  Precompute an
+optional immutable length-aware schedule with
+:func:`flashinfer.plan_cake_fmha_request_ordered_paged_decode` before graph
+capture.  Page-table rows must be padded to
+``4 * ceil(max_seq_len / 256)`` entries, and the exact tensor/workspace binding
+must be invoked once eagerly to initialize its TMA descriptors before capture.
+After that prewarm, changing only the order tensor contents does not require
+recapture.
+
+.. currentmodule:: flashinfer
+
+.. autosummary::
+    :toctree: ../generated
+
+    get_dcp_spec_workspace_size_bytes
+    get_dcp_spec_counter_bytes
+    plan_cake_fmha_request_ordered_paged_decode
+    CakeFmhaRequestOrderedDecodePlan
+
+.. currentmodule:: flashinfer.decode
+
 .. autoclass:: BatchDecodeWithPagedKVCacheWrapper
     :members:
-    :exclude-members: begin_forward, end_forward, forward, forward_return_lse
-
-    .. automethod:: __init__
-
-.. autoclass:: BatchDecodeMlaWithPagedKVCacheWrapper
-    :members:
-    :exclude-members: begin_forward, end_forward, forward, forward_return_lse
+    :exclude-members: begin_forward, forward, forward_return_lse
 
     .. automethod:: __init__
 
@@ -174,13 +227,13 @@ Batch Prefill/Append Attention
 
 .. autoclass:: BatchPrefillWithPagedKVCacheWrapper
     :members:
-    :exclude-members: begin_forward, end_forward, forward, forward_return_lse
+    :exclude-members: begin_forward, forward, forward_return_lse
 
     .. automethod:: __init__
 
 .. autoclass:: BatchPrefillWithRaggedKVCacheWrapper
     :members:
-    :exclude-members: begin_forward, end_forward, forward, forward_return_lse
+    :exclude-members: begin_forward, forward, forward_return_lse
 
     .. automethod:: __init__
 
@@ -234,10 +287,16 @@ PageAttention for MLA
     :toctree: ../generated
 
     trtllm_batch_decode_with_kv_cache_mla
+    trtllm_prefill_with_kv_cache_mla
     trtllm_batch_decode_sparse_mla_dsv4
+    nvfp4_quantize_pack_sparse_mla_cache
+    nvfp4_quantize_append_sparse_mla_cache
     convert_compressed_page_aligned_sparse_indices_to_hca_metadata
     DSV4HCAMetadata
     xqa_batch_decode_with_kv_cache_mla
+    supported_sparse_mla_sm120_configs
+    SparseMLASm120DecodeConfig
+    SparseMLASm120Wrapper
 
 .. note::
 

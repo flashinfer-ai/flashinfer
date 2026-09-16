@@ -15,17 +15,15 @@ limitations under the License.
 """
 
 import functools
-from pathlib import Path
 from typing import Literal, NamedTuple, Optional
 
 from . import env as jit_env
-from .core import (
-    JitSpec,
-    gen_jit_spec,
-    logger,
-    sm100a_nvcc_flags,
-    sm100f_nvcc_flags,
+from ._kda_jit_common import (
+    gen_kda_jit_spec,
+    get_kda_csrc_dir as _get_csrc_dir,
+    get_flashinfer_include_dir as _get_include_dir,
 )
+from .core import JitSpec, logger
 from .utils import write_if_different
 
 CakeKDAPackedT1Variant = Literal[
@@ -59,10 +57,10 @@ CAKE_KDA_PACKED_T1_VARIANTS: tuple[CakeKDAPackedT1Variant, ...] = (
     "cpasync_tile128_ilp2",
 )
 
-_CAKE_KDA_PACKED_T1_NVCC_FLAGS = {
-    "sm100a": sm100a_nvcc_flags,
-    "sm100f": sm100f_nvcc_flags,
-}
+_CAKE_KDA_PACKED_T1_TARGETS: tuple[CakeKDAPackedT1Target, ...] = (
+    "sm100a",
+    "sm100f",
+)
 _CAKE_KDA_PACKED_T1_TARGET_KIND = {"sm100a": 1000, "sm100f": 100}
 
 
@@ -219,38 +217,13 @@ def select_cake_kda_packed_t1_variant(
     return None
 
 
-def _get_csrc_dir() -> Path:
-    installed = jit_env.FLASHINFER_CSRC_DIR / "kda"
-    if installed.exists():
-        return installed
-    checkout = Path(__file__).resolve().parents[2] / "csrc" / "kda"
-    if checkout.exists():
-        return checkout
-    raise FileNotFoundError(
-        "frozen Cake KDA packed T=1 sources were not found. Checked:\n"
-        f"  - {installed}\n  - {checkout}"
-    )
-
-
-def _get_include_dir() -> Path:
-    if jit_env.FLASHINFER_INCLUDE_DIR.exists():
-        return jit_env.FLASHINFER_INCLUDE_DIR
-    checkout = Path(__file__).resolve().parents[2] / "include"
-    if checkout.exists():
-        return checkout
-    raise FileNotFoundError(
-        "FlashInfer headers were not found. Checked:\n"
-        f"  - {jit_env.FLASHINFER_INCLUDE_DIR}\n  - {checkout}"
-    )
-
-
 def get_cake_kda_packed_t1_uri(
     variant: CakeKDAPackedT1Variant,
     target: CakeKDAPackedT1Target,
 ) -> str:
     if variant not in CAKE_KDA_PACKED_T1_VARIANTS:
         raise ValueError(f"unsupported Cake KDA packed T=1 variant: {variant}")
-    if target not in _CAKE_KDA_PACKED_T1_NVCC_FLAGS:
+    if target not in _CAKE_KDA_PACKED_T1_TARGETS:
         raise ValueError(f"unsupported Cake KDA packed T=1 target: {target}")
     return f"cake_kda_packed_t1_{variant}_{target}"
 
@@ -280,7 +253,7 @@ def gen_cake_kda_packed_t1_module(
 ) -> JitSpec:
     if variant not in CAKE_KDA_PACKED_T1_VARIANTS:
         raise ValueError(f"unsupported Cake KDA packed T=1 variant: {variant}")
-    if target not in _CAKE_KDA_PACKED_T1_NVCC_FLAGS:
+    if target not in _CAKE_KDA_PACKED_T1_TARGETS:
         raise ValueError(f"unsupported Cake KDA packed T=1 target: {target}")
 
     csrc_dir = _get_csrc_dir()
@@ -297,18 +270,17 @@ def gen_cake_kda_packed_t1_module(
     uri = get_cake_kda_packed_t1_uri(variant, target)
     binding = jit_env.FLASHINFER_GEN_SRC_DIR / uri / "cake_kda_packed_t1_binding.cu"
     write_if_different(binding, _get_binding_cu(metadata))
-    spec = gen_jit_spec(
+    spec = gen_kda_jit_spec(
         name=uri,
         sources=[binding],
-        extra_cuda_cflags=[
-            *_CAKE_KDA_PACKED_T1_NVCC_FLAGS[target],
-            (
-                "-DFLASHINFER_CAKE_KDA_PACKED_T1_TARGET_KIND="
-                f"{_CAKE_KDA_PACKED_T1_TARGET_KIND[target]}"
-            ),
-            *metadata.extra_cuda_flags,
-        ],
-        extra_include_paths=[csrc_dir, csrc_dir.parent, _get_include_dir()],
+        target=target,
+        target_define=(
+            "-DFLASHINFER_CAKE_KDA_PACKED_T1_TARGET_KIND="
+            f"{_CAKE_KDA_PACKED_T1_TARGET_KIND[target]}"
+        ),
+        csrc_dir=csrc_dir,
+        include_dir=_get_include_dir(),
+        extra_cuda_cflags=metadata.extra_cuda_flags,
     )
     logger.info(
         "Generated Cake KDA packed T=1 %s %s JIT spec: %s", variant, target, spec.name

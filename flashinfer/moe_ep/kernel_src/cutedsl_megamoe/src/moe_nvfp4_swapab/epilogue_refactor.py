@@ -41,6 +41,7 @@ from .moe_persistent_scheduler import (
 )
 from common.megamoe_constants import (
     Nvfp4BlockSize,
+    Mxfp8BlockSize,
     Nvfp4E2M1RcpLimit,
     Fp8E4M3RcpLimit,
     Fp8E5M2RcpLimit,

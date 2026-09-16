@@ -15,17 +15,17 @@
  */
 #include "batch_mla_config.inc"
 #include "tvm/ffi/container/array.h"
+#include "tvm/ffi/container/tuple.h"
 #include "tvm_ffi_utils.h"
 
 using tvm::ffi::Array;
 using tvm::ffi::Optional;
+using tvm::ffi::Tuple;
 
-Array<int64_t> BatchMLAPagedAttentionPlan(TensorView float_workspace_buffer,
-                                          TensorView int_workspace_buffer,
-                                          TensorView page_locked_int_workspace_buffer,
-                                          TensorView qo_indptr, TensorView kv_indptr,
-                                          TensorView kv_len, int64_t num_heads, int64_t head_dim_o,
-                                          bool causal);
+Tuple<Array<int64_t>, int64_t> BatchMLAPagedAttentionPlan(
+    TensorView float_workspace_buffer, TensorView int_workspace_buffer,
+    TensorView page_locked_int_workspace_buffer, TensorView qo_indptr, TensorView kv_indptr,
+    TensorView kv_len, int64_t num_heads, int64_t head_dim_o, bool causal);
 
 void BatchMLAPagedAttentionRun(TensorView float_workspace_buffer, TensorView int_workspace_buffer,
                                Array<int64_t> plan_info_vec, TensorView q_nope, TensorView q_pe,
