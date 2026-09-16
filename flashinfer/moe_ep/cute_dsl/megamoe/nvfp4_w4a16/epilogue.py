@@ -508,9 +508,8 @@ class W4A16Fc1Epilogue(EpilogueContext):
                 cute.make_tensor(up_ptr, TmemTranspose16x32._tmem_layout(16, 32)),
                 TmemTranspose16x32._rmem_copy_view(up, 16),
             )
-            # Complete this warp's loads before its in-place transpose
-            # overwrites the same32-feature band.
-            cute.arch.fence_view_async_tmem_load()
+            # Only register work follows; r1_store() waits for these loads
+            # before the transpose overwrites their TMEM.
             gate.store(gate.load() * weight_alpha)
             up.store(up.load() * weight_alpha)
             # Preserve the prior W4A16 sequence: post-alpha gate upper clamp,
