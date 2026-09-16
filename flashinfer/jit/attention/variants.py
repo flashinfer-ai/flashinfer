@@ -204,7 +204,10 @@ struct CausalBidirectionalRangesAttention : AttentionVariantBase {
     const uint32_t q_local = qo_idx < qo_len ? qo_idx : qo_len - 1;
     const int32_t q_abs = int32_t(kv_len - qo_len + q_local);
     const int32_t kv = int32_t(kv_idx);
-    bool causal = (kv <= q_abs) && (sw_left <= 0 || (q_abs - kv) < sw_left);
+    // Same contract as DefaultAttention's window_left: a key is kept when
+    // q_abs - kv <= sw_left, so N keeps N + 1 keys and 0 keeps the diagonal
+    // alone. Only a negative value disables the window.
+    bool causal = (kv <= q_abs) && (sw_left < 0 || (q_abs - kv) <= sw_left);
     const int32_t row = q_base + int32_t(q_local);
     const int32_t start = params.bidirectional_ranges[row * 2];
     const int32_t end = params.bidirectional_ranges[row * 2 + 1];

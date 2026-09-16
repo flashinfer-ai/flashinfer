@@ -413,6 +413,33 @@ class BatchAttentionWithAttentionSinkWrapper(BatchPrefillWithPagedKVCacheWrapper
         )
 
 
+# The parent's ``run`` carries ``@flashinfer_api(trace=gqa_paged_prefill_trace)``.
+# That template describes a plain causal prefill -- no ranges, no windows -- and
+# is tagged ``status:verified``; its definition name is built from the head
+# counts, head dimension and page size alone, so it cannot tell this wrapper's
+# mask from an ordinary causal one.
+#
+# Two things follow from calling it through ``super().run``. Under
+# ``FLASHINFER_TRACE_DUMP=1`` the decorator dumps that causal trace for a call
+# it does not describe, and ``trace_apply.enable_apply`` replaces the parent's
+# class attribute, which ``super()`` reaches through the MRO, so a solution
+# registered from an ordinary causal prefill at the same axes would be
+# substituted for this kernel.
+#
+# Binding the undecorated implementation here keeps both away from this
+# wrapper without touching the parent, the template, or the apply machinery.
+# It is resolved at import time, which is before any caller can enable Trace
+# Apply, so the attribute it reads is still the original. A trace identity of
+# this wrapper's own is a separate piece of work: it needs a template that
+# describes the ranges and a reference to earn a ``status``, and neither
+# belongs in a fix whose job is to stop the wrong one being used.
+_PARENT_RUN_IMPL = getattr(
+    BatchPrefillWithPagedKVCacheWrapper.run,
+    "__wrapped__",
+    BatchPrefillWithPagedKVCacheWrapper.run,
+)
+
+
 class BatchPrefillWithCausalBidirectionalRangesWrapper(
     BatchPrefillWithPagedKVCacheWrapper
 ):
@@ -519,6 +546,24 @@ class BatchPrefillWithCausalBidirectionalRangesWrapper(
             jit_kwargs=self._spec["jit_kwargs"],
             variant_owns_mask=True,
         )
+
+    @staticmethod
+    def _reject_max_sequence_kv(max_sequence_kv: Optional[int]) -> None:
+        """Refuse a knob the parent cannot honour.
+
+        ``BatchPrefillWithPagedKVCacheWrapper.plan`` takes an early branch when
+        this is given and never binds the host-side kv indptr or length arrays
+        it goes on to read, so the call dies with an ``UnboundLocalError`` from
+        inside the parent. That is the parent's to fix; until it is, refusing
+        the argument here names it instead of failing somewhere that does not.
+        """
+        if max_sequence_kv is not None:
+            raise NotImplementedError(
+                "max_sequence_kv is not supported by this wrapper: the parent's "
+                "plan() does not bind the arrays it needs when this is set, so "
+                "it would fail inside the parent rather than here. Leave it "
+                "unset and let the KV lengths be derived from the indptr."
+            )
 
     def _check_specialization(
         self,
@@ -670,6 +715,7 @@ class BatchPrefillWithCausalBidirectionalRangesWrapper(
         parent (``seq_lens``, ``block_tables``, ``rope_scale``, ...) are absent
         here: this wrapper is fa2 only and applies no positional encoding.
         """
+        self._reject_max_sequence_kv(max_sequence_kv)
         q_data_type, kv_data_type, o_data_type, head_dim_vo = (
             self._check_specialization(
                 head_dim_qk,
@@ -749,6 +795,7 @@ class BatchPrefillWithCausalBidirectionalRangesWrapper(
         Validates exactly what :meth:`plan` validates, so a caller cannot size a
         workspace for a configuration that :meth:`plan` would then reject.
         """
+        self._reject_max_sequence_kv(max_sequence_kv)
         q_data_type, kv_data_type, o_data_type, head_dim_vo = (
             self._check_specialization(
                 head_dim_qk,
@@ -870,9 +917,12 @@ class BatchPrefillWithCausalBidirectionalRangesWrapper(
             non-contiguous tensor is rejected rather than copied, so the kernel
             argument stays a stable pointer under CUDA graph capture.
         causal_window_left : int
-            Sliding window on the causal part. A key is kept when
-            ``q_abs - kv < causal_window_left``. ``-1`` (or ``0``) disables the
-            window, leaving the causal part unbounded.
+            Sliding window on the causal part, with the same meaning as
+            ``window_left`` everywhere else in FlashInfer: a key is kept when
+            ``q_abs - kv <= causal_window_left``, so ``N`` keeps ``N + 1`` keys
+            and ``0`` keeps the diagonal alone. A negative value disables the
+            window and leaves the causal part unbounded. Pass the value you
+            would pass to any other prefill wrapper; no conversion is needed.
         range_window_left : int
             Sliding window on the bidirectional part. ``-1`` (or ``0``) leaves
             the spans unclamped, which is what a span normally wants; set it to
@@ -951,19 +1001,22 @@ class BatchPrefillWithCausalBidirectionalRangesWrapper(
                 f"q has dtype {q.dtype}, but this wrapper was built for "
                 f"{self._spec['dtype_q']}."
             )
+        self._check_runtime_shapes(q, paged_kv_cache)
 
         # The kernel indexes the rows flat; the 2-D shape is the public
         # contract, and this view keeps the caller's pointer.
         ranges_flat = bidirectional_ranges.view(-1)
-        # Window semantics are "keep when distance < N", so a disabled window is
-        # 0 rather than -1.
-        causal_n = float(max(causal_window_left, 0))
+        # causal_window_left carries the library's window_left contract, so a
+        # negative value disables it and has to survive as one. range_window_left
+        # is this wrapper's own clamp, whose documented off value is 0.
+        causal_n = float(causal_window_left)
         range_n = float(max(range_window_left, 0))
         # The parent's overloads key on a literal ``return_lse``, so branch
         # here rather than forwarding the bool: that is what makes each call
         # resolve to one of them and keeps the return type exact.
         if return_lse:
-            return super().run(
+            return _PARENT_RUN_IMPL(
+                self,
                 q,
                 paged_kv_cache,
                 ranges_flat,
@@ -978,7 +1031,8 @@ class BatchPrefillWithCausalBidirectionalRangesWrapper(
                 enable_pdl=enable_pdl,
                 kv_cache_sf=kv_cache_sf,
             )
-        return super().run(
+        return _PARENT_RUN_IMPL(
+            self,
             q,
             paged_kv_cache,
             ranges_flat,
@@ -990,6 +1044,137 @@ class BatchPrefillWithCausalBidirectionalRangesWrapper(
             out=out,
             lse=lse,
             return_lse=False,
+            enable_pdl=enable_pdl,
+            kv_cache_sf=kv_cache_sf,
+        )
+
+    def _check_runtime_shapes(
+        self,
+        q: torch.Tensor,
+        paged_kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+    ) -> None:
+        """Close the specialization contract before the kernel is dispatched.
+
+        ``HEAD_DIM_QK`` and ``HEAD_DIM_VO`` are compile-time constants of the
+        module this wrapper built, and the head counts were fixed by
+        :meth:`plan`. Nothing downstream compares either against the tensors
+        actually handed over, so a mismatch reads past the end of a row rather
+        than raising.
+        """
+        num_qo_heads = getattr(self, "_num_qo_heads", None)
+        num_kv_heads = getattr(self, "_num_kv_heads", None)
+        if num_qo_heads is None or num_kv_heads is None:
+            raise ValueError("plan() must be called before run().")
+
+        if q.dim() != 3:
+            raise ValueError(
+                "q must have shape [total_q, num_qo_heads, head_dim_qk], got "
+                f"{tuple(q.shape)}"
+            )
+        if q.size(1) != num_qo_heads:
+            raise ValueError(
+                f"q has {q.size(1)} query heads, but plan() was given {num_qo_heads}."
+            )
+        if q.size(2) != self._spec["head_dim_qk"]:
+            raise ValueError(
+                f"q has head_dim_qk {q.size(2)}, but this wrapper was built for "
+                f"{self._spec['head_dim_qk']}."
+            )
+
+        k_cache, v_cache = _unpack_paged_kv_cache(paged_kv_cache, self._kv_layout)
+        head_axis = 2 if self._kv_layout == "NHD" else 1
+        # A packed NVFP4 cache stores two values per byte, so its last axis is
+        # half the head dimension the module was compiled for.
+        divisor = 2 if self._spec["packed_fp4_kv"] else 1
+        for name, cache, head_dim in (
+            ("k", k_cache, self._spec["head_dim_qk"]),
+            ("v", v_cache, self._spec["head_dim_vo"]),
+        ):
+            if cache.size(head_axis) != num_kv_heads:
+                raise ValueError(
+                    f"{name} cache has {cache.size(head_axis)} kv heads, but "
+                    f"plan() was given {num_kv_heads}."
+                )
+            expected = head_dim // divisor
+            if cache.size(-1) != expected:
+                raise ValueError(
+                    f"{name} cache has width {cache.size(-1)}, but this wrapper "
+                    f"was built for head_dim {head_dim}"
+                    + (" packed two values per byte" if divisor == 2 else "")
+                    + f", which is {expected}."
+                )
+
+    # Bound to this class's ``run``, not the parent's. ``functools.partialmethod``
+    # captures the function object it is given, so inheriting the parent's
+    # binding would send every ``run_return_lse`` call into the parent body and
+    # skip every check the override exists to make.
+    run_return_lse = functools.partialmethod(run, return_lse=True)
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        paged_kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+        bidirectional_ranges: torch.Tensor,
+        causal_window_left: int = -1,
+        range_window_left: int = -1,
+        q_scale: Optional[float] = None,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
+        enable_pdl: Optional[bool] = None,
+        kv_cache_sf: Optional[
+            Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        ] = None,
+    ) -> torch.Tensor:
+        r"""Warning: deprecated, use :meth:`run` instead.
+
+        The parent's ``forward`` sets plan state from keyword arguments this
+        wrapper refuses and has no parameter for the ranges, so it is replaced
+        rather than inherited: reaching it would assign ``_causal``,
+        ``_window_left``, ``_logits_soft_cap`` and ``_sm_scale`` and only then
+        fail inside ``prepare_jit_additional_args``.
+        """
+        return self.run(
+            q,
+            paged_kv_cache,
+            bidirectional_ranges,
+            causal_window_left=causal_window_left,
+            range_window_left=range_window_left,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            enable_pdl=enable_pdl,
+            kv_cache_sf=kv_cache_sf,
+        )
+
+    def forward_return_lse(
+        self,
+        q: torch.Tensor,
+        paged_kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+        bidirectional_ranges: torch.Tensor,
+        causal_window_left: int = -1,
+        range_window_left: int = -1,
+        q_scale: Optional[float] = None,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
+        enable_pdl: Optional[bool] = None,
+        kv_cache_sf: Optional[
+            Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        ] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        r"""Warning: deprecated, use :meth:`run_return_lse` instead.
+
+        Replaced for the same reason as :meth:`forward`.
+        """
+        return self.run(
+            q,
+            paged_kv_cache,
+            bidirectional_ranges,
+            causal_window_left=causal_window_left,
+            range_window_left=range_window_left,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            return_lse=True,
             enable_pdl=enable_pdl,
             kv_cache_sf=kv_cache_sf,
         )

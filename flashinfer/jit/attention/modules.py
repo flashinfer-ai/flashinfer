@@ -1173,6 +1173,26 @@ def get_batch_prefill_bidirectional_ranges_spec(
     """
     from flashinfer.jit.attention.variants import bidirectional_ranges_decl
 
+    # fa2 has no fp8 tensor-core path and no fp8 output path. The public
+    # generators assert on both before rendering; this variant reaches
+    # gen_customize_batch_prefill_module directly, so the same refusals belong
+    # here, where the wrapper and the public generator both pass through.
+    # Reaching nvcc instead would fail on static_assert(sizeof(DTypeQ) == 2)
+    # with nothing naming the argument that caused it.
+    _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
+    if dtype_q in _FP8_DTYPES:
+        raise ValueError(
+            "fp8 tensor core is not supported in fa2 backend: "
+            f"dtype_q={dtype_q} cannot be used with this variant."
+        )
+    if dtype_o in _FP8_DTYPES:
+        raise ValueError(
+            "FP8 output is not supported in fa2/fa3 backends yet: "
+            f"dtype_o={dtype_o} cannot be used with this variant."
+        )
+    # dtype_kv is deliberately not restricted here: a KV-only quantization,
+    # packed NVFP4 included, does not turn on the fp8 tensor-core template.
+
     uri = (
         f"batch_prefill_with_bidirectional_ranges_"
         f"dtype_q_{filename_safe_dtype_map[dtype_q]}_"
@@ -1183,9 +1203,11 @@ def get_batch_prefill_bidirectional_ranges_spec(
         f"head_dim_vo_{head_dim_vo}"
     )
 
+    packed_fp4_kv = dtype_map_kv[dtype_kv] == "__nv_fp4x2_e2m1"
+
     tensor_names: List[str] = ["bidirectional_ranges"]
     tensor_dtypes: List[str] = ["int32_t"]
-    if dtype_map_kv[dtype_kv] == "__nv_fp4x2_e2m1":
+    if packed_fp4_kv:
         # The generator emits the scale-factor stride setters that the packed
         # fp4 KV load path reads only for these exact names.
         tensor_names += ["maybe_k_cache_sf", "maybe_v_cache_sf"]
@@ -1200,6 +1222,9 @@ def get_batch_prefill_bidirectional_ranges_spec(
         "dtype_idx": dtype_idx,
         "head_dim_qk": head_dim_qk,
         "head_dim_vo": head_dim_vo,
+        # Two values per byte, so a packed cache's last axis is half as wide as
+        # the head dimension the module was compiled for.
+        "packed_fp4_kv": packed_fp4_kv,
         "tensor_names": tensor_names,
         "tensor_dtypes": tensor_dtypes,
         "scalar_names": ["causal_window_left", "range_window_left", "sm_scale"],
