@@ -64,6 +64,14 @@ def _fake_cubin_pkg(path):
     return m
 
 
+def _create_aot_module(root, module_name):
+    module_dir = root / module_name
+    module_dir.mkdir(parents=True)
+    module_path = module_dir / f"{module_name}.so"
+    module_path.touch()
+    return module_path
+
+
 # -- priority tests (regression for #2976) ----------------------------------
 
 
@@ -101,3 +109,61 @@ def test_default_when_nothing_set(monkeypatch):
     monkeypatch.delenv("FLASHINFER_CUBIN_DIR", raising=False)
     monkeypatch.setattr(_env, "has_flashinfer_cubin", lambda: False)
     assert _env._get_cubin_dir() == _env.FLASHINFER_CACHE_DIR / "cubins"
+
+
+def test_aot_artifacts_select_each_heterogeneous_target(monkeypatch, tmp_path):
+    fallback_root = tmp_path / "package-aot"
+    sm103_root = tmp_path / "sm103a"
+    sm120_root = tmp_path / "sm120f"
+    sm103_path = _create_aot_module(sm103_root, "attention_module")
+    sm120_path = _create_aot_module(sm120_root, "attention_module")
+    providers = (
+        _env.AOTProvider(
+            provider_id="sm103a",
+            distribution="flashinfer-jit-cache-sm103a",
+            version="0.6.16+cu130",
+            jit_cache_dir=sm103_root,
+            cuda_architectures=frozenset({"sm103a"}),
+            modules=frozenset({"attention_module"}),
+        ),
+        _env.AOTProvider(
+            provider_id="sm120f",
+            distribution="flashinfer-jit-cache-sm120f",
+            version="0.6.16+cu130",
+            jit_cache_dir=sm120_root,
+            cuda_architectures=frozenset({"sm120f"}),
+            modules=frozenset({"attention_module"}),
+        ),
+    )
+    monkeypatch.setattr(_env, "FLASHINFER_AOT_DIR", fallback_root)
+    monkeypatch.setattr(_env, "FLASHINFER_AOT_PROVIDERS", providers)
+    monkeypatch.setattr(
+        _env,
+        "_target_cuda_architectures",
+        lambda: frozenset({"sm103a", "sm120f"}),
+    )
+
+    artifacts = _env.get_aot_artifacts("attention_module")
+
+    assert [(artifact.provider_id, artifact.path) for artifact in artifacts] == [
+        ("sm103a", sm103_path),
+        ("sm120f", sm120_path),
+    ]
+
+
+def test_cuda_architectures_for_call_collects_nested_tensor_devices(monkeypatch):
+    torch_stub = types.ModuleType("torch")
+    torch_stub.cuda = types.SimpleNamespace(current_device=lambda: 0)
+    monkeypatch.setitem(sys.modules, "torch", torch_stub)
+    monkeypatch.setattr(
+        _env,
+        "_cuda_architecture_for_device",
+        lambda device_index: {0: "sm103a", 1: "sm120f"}[device_index],
+    )
+
+    tensor0 = types.SimpleNamespace(device=types.SimpleNamespace(type="cuda", index=0))
+    tensor1 = types.SimpleNamespace(device=types.SimpleNamespace(type="cuda", index=1))
+
+    assert _env._cuda_architectures_for_call(
+        (tensor0,), {"nested": [tensor1]}
+    ) == frozenset({"sm103a", "sm120f"})
