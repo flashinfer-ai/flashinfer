@@ -8,8 +8,8 @@ implementation and input generator as the CAKE SM100 tests:
   3. the general per-token / packed-pair HMMA fallback (any group, flat or
      paged, fp8 K/V included).
 
-The backend intentionally rejects LSE outputs, K/V scale arguments, ragged
-prefill ``cu_seqlens_q``, and non-default softmax scales with loud errors.
+The backend intentionally rejects LSE outputs, K/V scale arguments, and
+non-default softmax scales with loud errors. Ragged prefill is supported eagerly.
 Caller-owned workspaces are exercised through warm/capture/replay below.
 """
 
@@ -228,8 +228,7 @@ def test_vibecuda_msa_public_api_correctness(case: dict[str, Any]) -> None:
     expected = reference_attention(inputs)[0]
     assert actual.shape == inputs["q"].shape
     assert actual.dtype == inputs["q"].dtype
-    tolerance = 0.1 if inputs["kv_dtype"] == FP8 else 0.01
-    torch.testing.assert_close(actual, expected, atol=tolerance, rtol=tolerance)
+    torch.testing.assert_close(actual, expected, atol=0.01, rtol=0.01)
 
 
 def test_vibecuda_route_mirrors() -> None:
@@ -300,17 +299,9 @@ def test_vibecuda_rejects_unsupported_options() -> None:
             *positional, causal=True, softmax_scale=0.5, backend="vibecuda"
         )
     ragged = _sample_prefill_args(device, [256, 128])
-    with pytest.raises(NotImplementedError, match="uniform per-batch"):
-        msa_sparse_attention(
-            ragged["q"],
-            ragged["k"],
-            ragged["v"],
-            ragged["q2k_indices"],
-            ragged["cu_seqlens_q"],
-            ragged["cu_seqlens_k"],
-            causal=True,
-            backend="vibecuda",
-        )
+    actual = _run_vibecuda(ragged)
+    expected = reference_attention(ragged)[0]
+    torch.testing.assert_close(actual, expected, atol=0.01, rtol=0.01)
 
 
 def test_vibecuda_accepts_only_right_aligned_explicit_q_offsets() -> None:
