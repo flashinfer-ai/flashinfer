@@ -305,6 +305,10 @@ def download_artifacts() -> None:
     cubin_files = list[tuple[str, str]](get_subdir_file_list())
     num_threads = int(os.environ.get("FLASHINFER_CUBIN_DOWNLOAD_THREADS", "4"))
     max_retries = os.environ.get("FLASHINFER_CUBIN_MAX_RETRIES")
+    retry_window_seconds = int(os.environ.get("FLASHINFER_CUBIN_RETRY_WINDOW_SECONDS", "0"))
+    retry_deadline = (
+        time.monotonic() + retry_window_seconds if retry_window_seconds > 0 else None
+    )
 
     cached_files: set[str] = set()
     files_to_download: list[tuple[str, str]] = []
@@ -333,6 +337,32 @@ def download_artifacts() -> None:
         def update_pbar_cb(_) -> None:
             pbar.update(1)
 
+        def _download_within_retry_window(
+            source_path: str,
+            destination_path: str,
+            artifact_name: str,
+            kwargs: dict[str, object],
+        ) -> bool:
+            while True:
+                if download_file(source_path, destination_path, **kwargs):
+                    return True
+                if retry_deadline is None:
+                    return False
+                remaining = retry_deadline - time.monotonic()
+                if remaining <= 0:
+                    logger.error(
+                        "Retry window exhausted for %s after %d seconds",
+                        artifact_name,
+                        retry_window_seconds,
+                    )
+                    return False
+                logger.warning(
+                    "Download failed for %s; retrying while %0.2f seconds remain in retry window",
+                    artifact_name,
+                    remaining,
+                )
+                time.sleep(min(5.0, remaining))
+
         with ThreadPoolExecutor(num_threads) as pool:
             futures = []
             for name, _ in files_to_download:
@@ -344,10 +374,11 @@ def download_artifacts() -> None:
                 if max_retries is not None:
                     download_kwargs["retries"] = int(max_retries)
                 fut = pool.submit(
-                    download_file,
+                    _download_within_retry_window,
                     source,
                     str(local_path),
-                    **download_kwargs,
+                    name,
+                    download_kwargs,
                 )
                 fut.add_done_callback(update_pbar_cb)
                 futures.append(fut)

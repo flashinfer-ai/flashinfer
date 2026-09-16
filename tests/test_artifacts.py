@@ -610,6 +610,69 @@ def test_download_artifacts_keeps_default_retry_without_env(monkeypatch, tmp_pat
     assert kwargs_seen[0]["session"] is not None
 
 
+def test_download_artifacts_retries_within_retry_window(monkeypatch, tmp_path):
+    """Retry window keeps retrying failed downloads until one succeeds."""
+    from flashinfer import artifacts
+
+    cubin_dir = tmp_path / "cubins"
+    monkeypatch.setattr(artifacts, "FLASHINFER_CUBIN_DIR", cubin_dir)
+    monkeypatch.setattr(artifacts, "FLASHINFER_CUBINS_REPOSITORY", "https://example/")
+    monkeypatch.setenv("FLASHINFER_CUBIN_DOWNLOAD_THREADS", "1")
+    monkeypatch.setenv("FLASHINFER_CUBIN_RETRY_WINDOW_SECONDS", "60")
+    monkeypatch.setenv("FLASHINFER_CUBIN_MAX_RETRIES", "1")
+    monkeypatch.setattr(artifacts.time, "sleep", lambda _seconds: None)
+
+    payload = b"downloaded"
+    monkeypatch.setattr(
+        artifacts,
+        "get_subdir_file_list",
+        lambda: iter([("pin/file.cubin", hashlib.sha256(payload).hexdigest())]),
+    )
+
+    attempts = {"count": 0}
+
+    def flaky_download(_source, destination, **kwargs):
+        attempts["count"] += 1
+        if attempts["count"] < 3:
+            return False
+        Path(destination).write_bytes(payload)
+        assert kwargs["retries"] == 1
+        return True
+
+    monkeypatch.setattr(artifacts, "download_file", flaky_download)
+
+    artifacts.download_artifacts()
+
+    assert attempts["count"] == 3
+    assert (cubin_dir / "pin/file.cubin").read_bytes() == payload
+
+
+def test_download_artifacts_fails_when_retry_window_expires(monkeypatch, tmp_path):
+    """Download fails once the retry window deadline is exceeded."""
+    from flashinfer import artifacts
+
+    cubin_dir = tmp_path / "cubins"
+    monkeypatch.setattr(artifacts, "FLASHINFER_CUBIN_DIR", cubin_dir)
+    monkeypatch.setattr(artifacts, "FLASHINFER_CUBINS_REPOSITORY", "https://example/")
+    monkeypatch.setenv("FLASHINFER_CUBIN_DOWNLOAD_THREADS", "1")
+    monkeypatch.setenv("FLASHINFER_CUBIN_RETRY_WINDOW_SECONDS", "1")
+    monkeypatch.setenv("FLASHINFER_CUBIN_MAX_RETRIES", "1")
+    monkeypatch.setattr(artifacts.time, "sleep", lambda _seconds: None)
+
+    timeline = iter([0.0, 2.0])
+    monkeypatch.setattr(artifacts.time, "monotonic", lambda: next(timeline))
+
+    monkeypatch.setattr(
+        artifacts,
+        "get_subdir_file_list",
+        lambda: iter([("pin/file.cubin", hashlib.sha256(b"expected").hexdigest())]),
+    )
+    monkeypatch.setattr(artifacts, "download_file", lambda *_args, **_kwargs: False)
+
+    with pytest.raises(RuntimeError, match="Failed to download cubins"):
+        artifacts.download_artifacts()
+
+
 def test_download_artifacts_rejects_bad_download_after_cache_miss(
     monkeypatch, tmp_path
 ):
