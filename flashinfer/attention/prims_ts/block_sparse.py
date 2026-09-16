@@ -225,14 +225,15 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         ordered on one stream or externally synchronized. Unordered concurrent
         runs require distinct wrappers.
 
-        ``sage_config`` enables Sage attention on a dense plan whose block sizes select
-        a Keeps profile (Q64/KV256 or Q128/KV128): Q and K are
+        ``sage_config`` enables Sage attention in both modes when the block sizes
+        select a Keeps profile (Q64/KV256 or Q128/KV128): Q and K are
         ``torch.float8_e4m3fn`` dequantized with one scale per token block, V
         is ``torch.float8_e4m3fn`` with one scale per channel, and the output
         is ``torch.bfloat16`` (the default) or ``torch.float16``.
         :class:`SageAttentionConfig` fixes the scale block sizes and whether a
         V mean is added back; every :meth:`run` supplies the scale tensors as
-        :class:`SageAttentionParams`.
+        :class:`SageAttentionParams`, including ``k_summary_scale`` for the
+        quantized K summaries of a proxy plan.
         """
 
         if use_block_sparse:
@@ -348,7 +349,10 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         ``[B, num_kv_blocks, Hkv, D]``. Both are block means over the block's
         structural tokens (the final partial block averages only the tokens it
         covers); a proxy block stands for that many identical tokens, so its
-        probability carries the block's token mass.
+        probability carries the block's token mass. With Sage attention the
+        summaries are E4M3: K summaries are dequantized with
+        ``k_summary_scale`` and V summaries share ``v_scale`` (built from
+        ``V - v_mean`` when a mean is used).
 
         Every row must fit the planned semantic-block capacity. Reusable runs
         trust routing values. CuTe DSL assertions can diagnose violations when
