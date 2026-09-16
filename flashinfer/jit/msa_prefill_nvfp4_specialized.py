@@ -22,13 +22,10 @@ from .core import JitSpec, gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 
 MSAPrefillNVFP4Target = Literal["sm100a", "sm103a"]
 
-# The toolkit floor for building this module. ptxas 12.9.41 (CUDA 12.9.0)
-# miscompiles the kernel -- the shared-memory descriptor of its first
-# tcgen05.mma is materialised from a stale register pair and it faults on its
-# first launch -- and no earlier 12.x toolkit has been qualified on it. The
-# module is JIT-only (it is not part of the AOT build): the route declines
-# below this version and the translation unit carries an ``#error`` on the
-# same condition.
+# ptxas 12.9.41 (CUDA 12.9.0) miscompiles this kernel's first tcgen05.mma
+# descriptor, and no earlier 12.x toolkit has been qualified on it. The route
+# declines below this version; the translation unit #errors on the same
+# condition.
 MIN_CUDA_VERSION = "13.0"
 
 _NVCC_FLAGS = {

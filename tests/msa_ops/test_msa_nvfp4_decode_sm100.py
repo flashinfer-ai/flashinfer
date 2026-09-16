@@ -695,15 +695,14 @@ def test_allowlist_and_stats_agree_with_the_module_constants():
         "q2k_indices_outer_strides",
     }
     assert stats["topk_range"] == [1, nvfp4._MAX_TOPK]
-    # One translation unit, thirty precompiled instantiations across the two
-    # families, and a compile cache keyed only by the architecture target: no
-    # call shape can trigger a build, which is what makes CUDA graph capture
-    # safe by construction.
+    # Thirty instantiations built together, cache keyed only by the
+    # architecture target: once the module is built, no call shape can trigger
+    # a build, which is what makes CUDA graph capture safe.
     assert stats["distinct_kernels_for_allowlist"] == 30
     assert len(stats["kernel_instantiations"]) == 30
     assert sum(n.startswith("pinned_") for n in stats["kernel_instantiations"]) == 6
     assert stats["compile_cache_key"] == "(compute capability target,)"
-    assert stats["precompiled"] is True
+    assert stats["precompiled"] is False
     assert stats["supported_compute_capability"] == [(10, 0), (10, 3)]
 
 

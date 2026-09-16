@@ -1676,7 +1676,7 @@ def msa_decode_nvfp4_specialized_stats() -> Dict[str, Any]:
             "parametric family, never refused"
         ),
         "compile_cache_key": "(compute capability target,)",
-        "precompiled": True,
+        "precompiled": False,
         "allowlist_rows": len(allowlist),
         "allowlist_fields": list(_WORKLOAD_FIELDS),
         "allowlist": [list(row) for row in allowlist],

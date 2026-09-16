@@ -599,14 +599,8 @@ def check_surface(
 def toolkit_decline_reason() -> Optional[str]:
     """Why the toolkit that would build this kernel must not, or ``None``.
 
-    The floor is ``MIN_CUDA_VERSION`` of the JIT spec module, where the
-    reason is stated.
-    Read from the nvcc the JIT will use (``torch.version.cuda`` when nvcc is
-    absent), so the answer is about the compiler that produces the kernel,
-    not the runtime that would launch it. The translation unit carries an
-    ``#error`` on the same condition as the backstop for builds that do not
-    go through either path. Decode is unaffected: both of its bodies run on
-    12.9.
+    Reads the nvcc the JIT will use; the floor and its reason are
+    ``MIN_CUDA_VERSION`` in the JIT spec module.
     """
 
     from ..jit.cpp_ext import get_cuda_version
@@ -1066,12 +1060,7 @@ def msa_prefill_nvfp4_specialized_stats() -> Dict[str, Any]:
         "distinct_kernels_for_allowlist": 1,
         "kernel_instantiations": ["attend"],
         "compile_cache_key": "(compute capability target,)",
-        # Non-None names a toolkit whose assembler miscompiles the kernel; the
-        # route declines every call with this reason and builds nothing.
         "toolkit_decline_reason": toolkit_decline_reason(),
-        # JIT-built at runtime -- on the first eager call, or ahead of CUDA
-        # graph capture by msa_prefill_nvfp4_specialized_warmup(). Not part of
-        # the AOT build.
         "precompiled": False,
         "allowlist_rows": len(allowlist),
         "allowlist_fields": list(_WORKLOAD_FIELDS),
