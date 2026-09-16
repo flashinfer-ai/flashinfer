@@ -301,6 +301,23 @@ def selective_state_update(
             "intermediate_states_buffer and dst_state_batch_indices are mutually exclusive"
         )
 
+    # A one-token decode may carry the v1 query-start metadata [0, 1].  The
+    # native Simple STP kernel consumes already-flattened tensors and must not
+    # silently ignore a different pair (which would turn a malformed offset
+    # into an out-of-bounds reference fallback).  Multi-token varlen metadata
+    # is handled by the varlen provider below.
+    if (
+        cu_seqlens is not None
+        and x.dim() == 3
+        and x.shape[0] == 1
+        and cu_seqlens.numel() == 2
+        and [int(v) for v in cu_seqlens.detach().cpu().tolist()] != [0, 1]
+    ):
+        raise ValueError(
+            "single-token cu_seqlens must be the canonical [0, 1] pair; "
+            "use a valid multi-token varlen request for other offsets"
+        )
+
     if out is None:
         output = torch.empty_like(x)
     else:
