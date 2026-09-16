@@ -36,13 +36,15 @@
  *       last chunk of each seq also writes final_states (inline accumulation
  *       when there is no K1-produced chunk_state, i.e. single-chunk seqs).
  *
- * The varlen layout is served by a SINGLE K3 launch: each CTA decodes its
- * chunk geometry directly from seq_idx (warp-ballot boundary scan + lane-0
- * arithmetic resolve; the scratch table aliases the prevb smem tile so the
- * VLEN instantiation keeps 2 CTAs/SM), and chunks past the first of their
- * sequence run a "chain phase" that recomputes previous chunks' states
- * inline with K1's exact arithmetic (bitwise-identical prevb), folding the
- * fp32 initial-state chain in registers.
+ * The varlen layout is served by a K4 + K3 pair (serving route): K4 computes
+ * every multi-part sequence's per-part state contribution exactly once with
+ * the same tcgen05 UMMA ladder the old inline "chain phase" used, writing
+ * fp32 chunk_state/da_last rows; K3's GS branch folds those rows from global
+ * memory, so the O(parts^2)-per-sequence chain recompute becomes O(parts)
+ * precomputed rows read once per fold step (bitwise-identical prevb). K3
+ * decodes chunk geometry directly from seq_idx/metadata (scratch table
+ * aliases the prevb smem tile so the VLEN instantiation keeps 2 CTAs/SM).
+ * The frozen SERVING=false ladder retains the old inline chain phase.
  *
  * K3L (lean row-split) covers the tiny uniform single-chunk family
  * (cps == 1 and B*heads*(SPLIT+1) <= 2*SMs): the chunk's 128 token rows are
@@ -559,11 +561,12 @@ template <typename DTP, bool SV>
 __device__ __forceinline__ void prep_chunk(const DTP* __restrict__ dt, const float* __restrict__ a,
                                            const DTP* __restrict__ dtb, int t0, int len, int h,
                                            int heads, int do_softplus, int unbounded, float dt_lo,
-                                           float dt_hi, float* dacs, float* dtp_s, float* dw4) {
+                                           float dt_hi, float* dacs, float* dtp_s, float* dw4,
+                                           int dts) {
   const int tid = threadIdx.x;
   float dtraw = 0.f, dav = 0.f;
   if (tid < len) {
-    const float dtr = VT<DTP>::to(dt[(long)(t0 + tid) * heads + h]);
+    const float dtr = VT<DTP>::to(dt[(long)(t0 + tid) * dts + h]);
     if (do_softplus) {
       dtraw = softplus_v<SV>(dtr + VT<DTP>::to(dtb[h]));
     } else {
@@ -675,10 +678,10 @@ __device__ __forceinline__ void store8_state<fp16>(fp16* dst, const float (&v)[8
 // stage [tok, group, n] matrix (bf16) into smem; row stride in words given.
 // each thread moves one uint4 (8 bf16) per iteration.
 __device__ __forceinline__ void stage_bc(const bf16* __restrict__ mat, uint* dst, int row_words,
-                                         int t0, int len, int g, int groups) {
+                                         int t0, int len, int g, int groups, int bcs) {
   for (int e = threadIdx.x; e < CS * ND / 8; e += 256) {
     const int t = e >> 4, n8 = (e & 15) * 8;
-    const uint4 v = (t < len) ? *reinterpret_cast<const uint4*>(mat + (long)(t0 + t) * groups * ND +
+    const uint4 v = (t < len) ? *reinterpret_cast<const uint4*>(mat + (long)(t0 + t) * bcs +
                                                                 (long)g * ND + n8)
                               : make_uint4(0u, 0u, 0u, 0u);
     uint* d = dst + t * row_words + (n8 >> 1);
@@ -692,13 +695,13 @@ __device__ __forceinline__ void stage_bc(const bf16* __restrict__ mat, uint* dst
 // cp.async staging of a [tok, group, n] bf16 matrix into a swizzled smem tile.
 // All 256 threads participate; rows beyond len are zero-filled.
 __device__ __forceinline__ void stage_bc_sw(const bf16* __restrict__ mat, bf16* dst, int t0,
-                                            int len, int g, int groups) {
-  const bf16* srcm = mat + (long)t0 * groups * ND + (long)g * ND;
+                                            int len, int g, int groups, int bcs) {
+  const bf16* srcm = mat + (long)t0 * bcs + (long)g * ND;
   for (int e = threadIdx.x; e < CS * ND / 8; e += 256) {
     const int t = e >> 4, c8 = e & 15;
     const uint32_t daddr = sw_u32(dst, t, c8);
     if (t < len) {
-      cp_async16(daddr, srcm + (long)t * groups * ND + c8 * 8);
+      cp_async16(daddr, srcm + (long)t * bcs + c8 * 8);
     } else {
       *reinterpret_cast<uint4*>(sw_ptr(dst, t, c8)) = make_uint4(0u, 0u, 0u, 0u);
     }
@@ -730,7 +733,7 @@ __global__ void __launch_bounds__(256)
   const int tid = threadIdx.x;
 
   prep_chunk<DTP, SV>(dt, a, dtb, t0, len, h, heads, do_softplus, unbounded, dt_lo, dt_hi, dacs,
-                      dtp_s, scratch4);
+                      dtp_s, scratch4, heads);
   const float dl = dacs[len - 1];
   const int g = h / (heads / groups);
 
@@ -750,7 +753,7 @@ __global__ void __launch_bounds__(256)
       qq.y = *reinterpret_cast<const uint*>(&q1);
       *reinterpret_cast<uint2*>(xs_w + t * 136 + p4) = qq;
     }
-    stage_bc(bmat, reinterpret_cast<uint*>(bs), 68, t0, len, g, groups);
+    stage_bc(bmat, reinterpret_cast<uint*>(bs), 68, t0, len, g, groups, groups * ND);
   } else {
     // Oracle INTER1 ladder: the raw bf16 x tile is kept unscaled; the
     // delta/exp fold lands on the B side — scaled B = bf16(exp(dl - dacs[t]) *
@@ -818,15 +821,185 @@ __global__ void __launch_bounds__(256)
   if (tid == 0) da_last[c * heads + h] = dl;
 }
 
+// ------------------------- K4: varlen chunk_state pre-pass -------------------------
+// grid: (nchunk_bound, heads)  block: 256
+// Serving-ladder replacement for K3's inline chain phase: each CTA computes
+// ONE varlen part's inter-chunk state contribution with exactly the chain
+// phase's per-j arithmetic (same physical-chunk-anchored prep, same scaled-B
+// fold, same tcgen05 UMMA + TMEM drain), writing the fp32 result into the
+// shared chunk_state layout K1 uses ([chunk][head][PD][ND] row-major) plus the
+// part's end-to-start dacs difference into da_last. K3's varlen GS branch then
+// folds these per-part states from global memory, turning the chain phase's
+// O(parts^2)-per-sequence recompute into O(parts) precomputed rows read once
+// per fold step. Parts of single-part sequences are skipped: nothing folds
+// them and single-part final states are accumulated inline by K3.
+template <typename DTP, bool SV>
+__global__ void __launch_bounds__(256)
+    ssd_k4_kernel(const DTP* __restrict__ dt, const float* __restrict__ a,
+                  const DTP* __restrict__ dtb, const bf16* __restrict__ x,
+                  const bf16* __restrict__ bmat, float* __restrict__ chunk_state,
+                  float* __restrict__ da_last, const void* __restrict__ seq_idx,
+                  const int* __restrict__ meta_ci, const int* __restrict__ meta_co, int nmeta,
+                  int si_is64, int Tseq, int L, int heads, int groups, int do_softplus,
+                  int unbounded, float dt_lo, float dt_hi, long xs, long bcs, int dts) {
+  const int c = blockIdx.x;
+  const int h = blockIdx.y;
+  const int tid = threadIdx.x;
+  extern __shared__ float sm[];
+  float* dacs = sm;
+  float* dtp_s = sm + CS;
+  bf16* xs_w = reinterpret_cast<bf16*>(sm + 2 * CS);  // [CS][ND] swizzled, x tile
+  bf16* sBt = xs_w + CS * ND;                         // [CS][ND] swizzled, scaled-B^T
+  // xs_w's dead upper half parks the TMEM controls, prep scratch, and the
+  // non-metadata decode table; x staging only touches the first 16KB.
+  uint32_t* const tmem_base_sh = reinterpret_cast<uint32_t*>(reinterpret_cast<char*>(xs_w) + 16384);
+  uint64_t* const umma_mbar = reinterpret_cast<uint64_t*>(reinterpret_cast<char*>(xs_w) + 16392);
+  int* starts = reinterpret_cast<int*>(reinterpret_cast<char*>(xs_w) + 16416);
+  ChunkGeo* geo = reinterpret_cast<ChunkGeo*>(starts + (MAXS + 1));
+  float* scratch4 = reinterpret_cast<float*>(geo + 1);
+
+  // Part geometry: same rules as K3 (metadata decode, else the seq_idx
+  // tiling), but only b0/off/pend/lenp and the sequence part count are needed.
+  int b0, off, pend, lenp;
+  int ncp = 0;
+  if (nmeta > 0) {
+    if (tid == 0) {
+      const int t0c = meta_ci[c] * CS + meta_co[c];
+      const int t0n = (c + 1 < nmeta) ? meta_ci[c + 1] * CS + meta_co[c + 1] : Tseq;
+      const int sv = (int)load_si(seq_idx, si_is64, t0c);
+      int c0m = c;
+      while (c0m > 0 &&
+             (int)load_si(seq_idx, si_is64, meta_ci[c0m - 1] * CS + meta_co[c0m - 1]) == sv)
+        c0m--;
+      int ncm = 0;
+      for (int j = c0m;
+           j < nmeta && (int)load_si(seq_idx, si_is64, meta_ci[j] * CS + meta_co[j]) == sv;
+           j++)
+        ncm++;
+      geo->t0 = t0c;
+      geo->len = t0n - t0c;
+      geo->nc = ncm;
+    }
+    __syncthreads();
+    if (c >= nmeta) return;
+    b0 = meta_ci[c] * CS;
+    off = meta_co[c];
+    pend = off + geo->len;
+    lenp = min(CS, Tseq - b0);
+    ncp = geo->nc;
+  } else {
+    decode_chunk_geo(seq_idx, si_is64, Tseq, c, starts, geo);
+    __syncthreads();
+    if (c >= geo->nchunk) return;
+    b0 = geo->t0;
+    off = 0;
+    pend = geo->len;
+    lenp = geo->len;
+    ncp = geo->nc;
+  }
+  if (ncp <= 1) return;  // nothing folds a single-part sequence's state
+
+  if (tid == 0) tc_mbar_init(umma_mbar, 1);
+  if ((tid >> 5) == 0) {
+    tc_alloc(tmem_base_sh, 64);  // the [0,64) cs accumulator columns only
+    tc_relinq();
+  }
+
+  prep_chunk<DTP, SV>(dt, a, dtb, b0, lenp, h, heads, do_softplus, unbounded, dt_lo, dt_hi, dacs,
+                      dtp_s, scratch4, dts);
+  const float dl = dacs[pend - 1];
+  const float bd = (off > 0) ? dacs[off - 1] : 0.f;
+  const int g = h / (heads / groups);
+  if (tid == 0) da_last[c * heads + h] = dl - bd;
+
+  // raw bf16 x into xs_w ([t][p], the MN-major B operand), physical rows,
+  // masked to the part range [off, pend) — identical to the chain phase.
+  if (tid < CS) {
+    const int t = tid;
+    const bf16* xrow = x + (long)(b0 + t) * xs + (long)h * PD;
+#pragma unroll
+    for (int p4 = 0; p4 < PD / 4; p4++) {
+      uint2 xu = make_uint2(0u, 0u);
+      if (t >= off && t < pend) xu = *reinterpret_cast<const uint2*>(xrow + p4 * 4);
+      *reinterpret_cast<uint2*>(sw_ptr(xs_w, t, p4 >> 1) + ((p4 & 1) << 3)) = xu;
+    }
+  }
+  // transposed scaled B: sBt[n][t] = bf16(exp(dl - dacs[t]) * dtp[t] * b[t,n])
+  for (int e = tid; e < CS * ND / 4; e += 256) {
+    const int t = e >> 5, n4 = (e & 31) * 4;
+    const bool inj = (t >= off && t < pend);
+    uint2 bu = make_uint2(0u, 0u);
+    if (inj)
+      bu = *reinterpret_cast<const uint2*>(bmat + (long)(b0 + t) * bcs +
+                                           (long)g * ND + n4);
+    const float w0 = inj ? fold_scaled_b(dl, dacs[t], dtp_s[t], cvt_bf2(bu.x).x) : 0.f;
+    const float w1 = inj ? fold_scaled_b(dl, dacs[t], dtp_s[t], cvt_bf2(bu.x).y) : 0.f;
+    const float w2 = inj ? fold_scaled_b(dl, dacs[t], dtp_s[t], cvt_bf2(bu.y).x) : 0.f;
+    const float w3 = inj ? fold_scaled_b(dl, dacs[t], dtp_s[t], cvt_bf2(bu.y).y) : 0.f;
+    const __nv_bfloat16 q0 = __float2bfloat16(w0);
+    const __nv_bfloat16 q1 = __float2bfloat16(w1);
+    const __nv_bfloat16 q2 = __float2bfloat16(w2);
+    const __nv_bfloat16 q3 = __float2bfloat16(w3);
+    *reinterpret_cast<__nv_bfloat16*>(sw_ptr(sBt, n4 + 0, t >> 3) + ((t & 7) << 1)) = q0;
+    *reinterpret_cast<__nv_bfloat16*>(sw_ptr(sBt, n4 + 1, t >> 3) + ((t & 7) << 1)) = q1;
+    *reinterpret_cast<__nv_bfloat16*>(sw_ptr(sBt, n4 + 2, t >> 3) + ((t & 7) << 1)) = q2;
+    *reinterpret_cast<__nv_bfloat16*>(sw_ptr(sBt, n4 + 3, t >> 3) + ((t & 7) << 1)) = q3;
+  }
+  // Same cross-proxy discipline as K3's chain phase: every producer thread
+  // fences its generic fills before the publishing barrier.
+  fence_async_view();
+  __syncthreads();
+
+  const uint32_t tmb = *tmem_base_sh;
+  const int w = tid >> 5, lane = tid & 31;
+  if (w == 0) {
+    tc_fence_after();
+    if (tc_elect_one()) {
+      const uint64_t dA = TC_DESC_KMAJ(sBt);
+      const uint64_t dB = TC_DESC_MNMAJ(xs_w);
+      const uint32_t idesc = TC_IDESC(128, 64, 0, 1);
+#pragma unroll
+      for (int kt = 0; kt < 8; kt++) {
+        const uint64_t offA = 2u * (kt & 3) + 1024u * (kt >> 2);
+        umma_ss(tmb, dA + offA, dB + 128u * (uint32_t)kt, idesc, kt > 0 ? 1u : 0u);
+      }
+      tc_commit(umma_mbar);
+    }
+  }
+  tc_mbar_wait(umma_mbar, 0);
+  tc_fence_after();
+  // Drain the [dstate x headdim] fp32 accumulator in the chain phase's exact
+  // (Lw, pc0, n_row, 4x8) layout and store it row-major [PD][ND] into
+  // chunk_state, the layout K3's GS fold reads.
+  float* out = chunk_state + ((long)c * heads + h) * (PD * ND);
+  const int Lw = (w & 3) << 5;
+  const int n_row = Lw + lane;
+  const int pc0 = (w >> 2) << 5;
+#pragma unroll
+  for (int i = 0; i < 4; i++) {
+    float dr[8];
+    tc_ld_x8(tmb + ((uint32_t)Lw << 16) + 32u * (w >> 2) + 8u * i, dr);
+    tc_wait_ld();
+#pragma unroll
+    for (int jj = 0; jj < 8; jj++) {
+      const int p_ = pc0 + 8 * i + jj;
+      out[p_ * ND + n_row] = dr[jj];
+    }
+  }
+  tc_fence_before();
+  __syncthreads();
+  if (w == 0) tc_dealloc(tmb, 64);
+}
+
 // swizzled plain-store staging of a [tok, group, n] bf16 matrix (no cp.async).
 // All 256 threads participate; rows beyond len are zero-filled.
 __device__ __forceinline__ void stage_bc_sw_store(const bf16* __restrict__ mat, bf16* dst, int t0,
-                                                  int len, int g, int groups) {
-  const bf16* srcm = mat + (long)t0 * groups * ND + (long)g * ND;
+                                                  int len, int g, int groups, int bcs) {
+  const bf16* srcm = mat + (long)t0 * bcs + (long)g * ND;
   for (int e = threadIdx.x; e < CS * ND / 8; e += 256) {
     const int t = e >> 4, c8 = e & 15;
     const uint4 v = (t < len)
-                        ? *reinterpret_cast<const uint4*>(srcm + (long)t * groups * ND + c8 * 8)
+                        ? *reinterpret_cast<const uint4*>(srcm + (long)t * bcs + c8 * 8)
                         : make_uint4(0u, 0u, 0u, 0u);
     *reinterpret_cast<uint4*>(sw_ptr(dst, t, c8)) = v;
   }
@@ -836,13 +1009,14 @@ __device__ __forceinline__ void stage_bc_sw_store(const bf16* __restrict__ mat, 
 // swizzled smem tile; rows past len (within the range) are zero-filled, rows
 // outside the range are left untouched (never read by the consumer mma).
 __device__ __forceinline__ void stage_bc_sw_lim(const bf16* __restrict__ mat, bf16* dst, int t0,
-                                                int len, int g, int groups, int rlo, int rhi) {
-  const bf16* srcm = mat + (long)t0 * groups * ND + (long)g * ND;
+                                                int len, int g, int groups, int rlo, int rhi,
+                                                  int bcs) {
+  const bf16* srcm = mat + (long)t0 * bcs + (long)g * ND;
   for (int e0 = threadIdx.x; e0 < (rhi - rlo) * (ND / 8); e0 += 256) {
     const int t = rlo + (e0 >> 4), c8 = e0 & 15;
     const uint32_t daddr = sw_u32(dst, t, c8);
     if (t < len) {
-      cp_async16(daddr, srcm + (long)t * groups * ND + c8 * 8);
+      cp_async16(daddr, srcm + (long)t * bcs + c8 * 8);
     } else {
       *reinterpret_cast<uint4*>(sw_ptr(dst, t, c8)) = make_uint4(0u, 0u, 0u, 0u);
     }
@@ -851,16 +1025,19 @@ __device__ __forceinline__ void stage_bc_sw_lim(const bf16* __restrict__ mat, bf
 
 // ------------------------- K3: unified output kernel -------------------------
 // grid: (nchunk_bound, heads)  block: 256
-// GS=true (uniform multi-chunk only): inter-chunk states come from K1's
-//   global chunk_state/da_last.
-// GS=false: single-chunk fast path (uniform), or the varlen path, where the
-//   inter-chunk previous state is built inline by the chain phase below and
-//   final_states are always accumulated inline.
+// GS=true: inter-chunk states come from precomputed global chunk_state/da_last
+//   rows — K1 for the uniform multi-chunk layout, K4 for the varlen serving
+//   route (fold order and per-element fp32 ladder match the frozen inline
+//   chain phase bitwise).
+// GS=false: single-chunk fast path (uniform), or the frozen non-serving
+//   varlen path, where the inter-chunk previous state is built inline by the
+//   chain phase below and final_states are always accumulated inline.
 //
-// Dynamic smem layout (116224B total):
+// Dynamic smem layout (115712B total):
 //   float dacs[CS] | float dtp_s[CS]
 //   | xs_w fp16 [128][128] swizzled (dtp*x; rewritten anchored bf16 for the
-//   |      inline final-states mma after the intra phase)
+//   |      inline final-states mma after the intra phase; dead upper half
+//   |      parks the TMEM controls at +16384 and scratch4 at +16416)
 //   | bs   bf16 [128][128] swizzled (reused as ySm float [128][64] after M~)
 //   | csm  bf16 [128][128] swizzled
 //   | prevb bf16 [64][128] swizzled (previous state)
@@ -877,7 +1054,8 @@ __global__ void __launch_bounds__(256)
                   const int* __restrict__ meta_co, int nmeta, ST* __restrict__ ck_states,
                   const int* __restrict__ ck_tokens, const int* __restrict__ ck_slots, int si_is64,
                   int Tseq, int cps, int L, int heads, int groups, int has_z, int do_softplus,
-                  int unbounded, float dt_lo, float dt_hi, int y_chunk_major) {
+                  int unbounded, float dt_lo, float dt_hi, int y_chunk_major, long xs, long bcs,
+                  int dts, long zs) {
   const int c = blockIdx.x;
   const int h = blockIdx.y;
   const int tid = threadIdx.x;
@@ -890,7 +1068,12 @@ __global__ void __launch_bounds__(256)
   bf16* prevb = csm + CS * ND;                        // [64][128] swizzled
   float* ySm = reinterpret_cast<float*>(bs);          // alias after M~ phase
 
-  float* scratch4 = reinterpret_cast<float*>(prevb + PD * ND);
+  // prep_chunk's SV scan scratch uses only 4 floats (per-warp lane-31
+  // partials) inside syncthreads windows that close before xs_w is staged.
+  // Alias it into xs_w's permanently dead upper half, just past the parked
+  // TMEM controls at +16384..+16407, so the dynamic smem request can drop to
+  // the true 115712B footprint and two CTAs become resident per SM again.
+  float* scratch4 = reinterpret_cast<float*>(reinterpret_cast<char*>(xs_w) + 16416);
 
   int t0, len, s, c0, nchunk_seq, slen = 0;
   if (VLEN) {
@@ -950,10 +1133,10 @@ __global__ void __launch_bounds__(256)
     off = meta_co[c];
     pend = off + len;
     prep_chunk<DTP, SV>(dt, a, dtb, t0 - off, min(CS, Tseq - (t0 - off)), h, heads, do_softplus,
-                        unbounded, dt_lo, dt_hi, dacs, dtp_s, scratch4);
+                        unbounded, dt_lo, dt_hi, dacs, dtp_s, scratch4, dts);
   } else {
     prep_chunk<DTP, SV>(dt, a, dtb, t0, len, h, heads, do_softplus, unbounded, dt_lo, dt_hi, dacs,
-                        dtp_s, scratch4);
+                        dtp_s, scratch4, dts);
   }
   const float dl = dacs[pend - 1];
   const float bd = (off > 0) ? dacs[off - 1] : 0.f;
@@ -992,7 +1175,10 @@ __global__ void __launch_bounds__(256)
   // this replaces — while dropping both the K1 launch and the global
   // chunk_state round trip. xs_w/bs serve as scratch tiles; neither holds
   // this chunk's data yet, so no smem budget is added.
-  if (VLEN && c > c0) {
+  // VLEN+GS (the dispatched serving route) disables the inline chain: prevb
+  // comes from K4's precomputed global chunk_state rows via the GS fold below,
+  // so no serial per-chunk recompute phase runs at all.
+  if (VLEN && !GS && c > c0) {
     // per-j dt-scan scratch, also aliased into prevb's unused tile
     float* dacs_j = reinterpret_cast<float*>(reinterpret_cast<int*>(prevb) + (MAXS + 1) + 8);
     float* dtp_j = dacs_j + CS;
@@ -1032,7 +1218,7 @@ __global__ void __launch_bounds__(256)
           lenp = lenj;
         }
         prep_chunk<DTP, SV>(dt, a, dtb, b0j, lenp, h, heads, do_softplus, unbounded, dt_lo, dt_hi,
-                            dacs_j, dtp_j, scratch4);
+                            dacs_j, dtp_j, scratch4, dts);
         const float dlj = dacs_j[pendj - 1];
         // oracle: last_column -= dA_cs[chunk_offset - 1], then exp (ssd_kernel
         // _warp_pre_inter) — the boundary subtraction is part of the ladder.
@@ -1041,7 +1227,7 @@ __global__ void __launch_bounds__(256)
         // raw bf16 x into xs_w ([t][p], the MN-major B operand), physical rows
         if (tid < CS) {
           const int t = tid;
-          const bf16* xrow = x + (long)(b0j + t) * heads * PD + (long)h * PD;
+          const bf16* xrow = x + (long)(b0j + t) * xs + (long)h * PD;
 #pragma unroll
           for (int p4 = 0; p4 < PD / 4; p4++) {
             uint2 xu = make_uint2(0u, 0u);
@@ -1058,7 +1244,7 @@ __global__ void __launch_bounds__(256)
           const bool inj = (t >= offj && t < pendj);
           uint2 bu = make_uint2(0u, 0u);
           if (inj)
-            bu = *reinterpret_cast<const uint2*>(bmat + (long)(b0j + t) * groups * ND +
+            bu = *reinterpret_cast<const uint2*>(bmat + (long)(b0j + t) * bcs +
                                                  (long)g * ND + n4);
           const float w0 = inj ? fold_scaled_b(dlj, dacs_j[t], dtp_j[t], cvt_bf2(bu.x).x) : 0.f;
           const float w1 = inj ? fold_scaled_b(dlj, dacs_j[t], dtp_j[t], cvt_bf2(bu.x).y) : 0.f;
@@ -1161,7 +1347,7 @@ __global__ void __launch_bounds__(256)
           lenp = lenj;
         }
         prep_chunk<DTP, SV>(dt, a, dtb, b0j, lenp, h, heads, do_softplus, unbounded, dt_lo, dt_hi,
-                            dacs_j, dtp_j, scratch4);
+                            dacs_j, dtp_j, scratch4, dts);
         const float dlj = dacs_j[pendj - 1];
         const float bdj = (offj > 0) ? dacs_j[offj - 1] : 0.f;
         const float decj = exp_v<SV>(dlj - bdj);
@@ -1171,7 +1357,7 @@ __global__ void __launch_bounds__(256)
           if (tid < CS) {
             const int t = tid;
             const float wa = (t >= offj && t < pendj) ? dtp_j[t] * expn(dlj - dacs_j[t]) : 0.f;
-            const bf16* xrow = x + (long)(b0j + t) * heads * PD + (long)h * PD;
+            const bf16* xrow = x + (long)(b0j + t) * xs + (long)h * PD;
 #pragma unroll
             for (int p4 = 0; p4 < PD / 4; p4++) {
               uint2 xu = make_uint2(0u, 0u);
@@ -1186,7 +1372,7 @@ __global__ void __launch_bounds__(256)
               *reinterpret_cast<uint2*>(sw_ptr(xs_w, t, p4 >> 1) + ((p4 & 1) << 3)) = qq;
             }
           }
-          stage_bc_sw_store(bmat, bs, b0j, lenp, g, groups);
+          stage_bc_sw_store(bmat, bs, b0j, lenp, g, groups, bcs);
         }
         __syncthreads();
         float acc[8][4];
@@ -1252,8 +1438,8 @@ __global__ void __launch_bounds__(256)
   umma_ph = 0;
 
   // ---- async stage b/c; zero-fill rows beyond len ----
-  stage_bc_sw(bmat, bs, t0, len, g, groups);
-  stage_bc_sw(cmat, csm, t0, len, g, groups);
+  stage_bc_sw(bmat, bs, t0, len, g, groups, bcs);
+  stage_bc_sw(cmat, csm, t0, len, g, groups, bcs);
   cp_async_commit();
 
   // ---- x fold (threads 0..127); prev-state build (threads 128..255) only for
@@ -1266,7 +1452,7 @@ __global__ void __launch_bounds__(256)
       // the -80 clamp overestimate on unbounded-dt chunks).
       const int t = tid;
       const float w = (t < len) ? dtp_s[off + t] : 0.f;
-      const bf16* xrow = x + (long)(t0 + t) * heads * PD + (long)h * PD;
+      const bf16* xrow = x + (long)(t0 + t) * xs + (long)h * PD;
 #pragma unroll
       for (int p4 = 0; p4 < PD / 4; p4++) {
         uint2 xu = make_uint2(0u, 0u);
@@ -1285,7 +1471,7 @@ __global__ void __launch_bounds__(256)
       // delta is folded into the M~ fragments together with the per-pair decay
       // (all bf16).
       const int t = tid;
-      const bf16* xrow = x + (long)(t0 + t) * heads * PD + (long)h * PD;
+      const bf16* xrow = x + (long)(t0 + t) * xs + (long)h * PD;
 #pragma unroll
       for (int p4 = 0; p4 < PD / 4; p4++) {
         uint2 xu = make_uint2(0u, 0u);
@@ -1293,8 +1479,9 @@ __global__ void __launch_bounds__(256)
         *reinterpret_cast<uint2*>(sw_ptr(xs_w, t, p4 >> 1) + ((p4 & 1) << 3)) = xu;
       }
     }
-  } else if (!(VLEN && c > c0)) {
-    // prev state build: v = initial (+ GS chain over K1 chunk_state)
+  } else if (GS || !(VLEN && c > c0)) {
+    // prev state build: v = initial (+ GS chain over chunk_state; for the
+    // varlen serving route those rows are K4's precomputed per-part states)
     for (int e8 = tid - CS; e8 < PD * ND / 8; e8 += 256 - CS) {
       const int e = e8 * 8;
       float v[8];
@@ -1412,7 +1599,7 @@ __global__ void __launch_bounds__(256)
   // That inline mma runs AFTER the intra phase below (xs_w is rewritten from the
   // unanchored fp16 tile into the anchored bf16 tile it needs; bs must remain raw
   // until then).
-  if (GS && nchunk_seq > 1 && c == c0 + nchunk_seq - 1) {
+  if (GS && !VLEN && nchunk_seq > 1 && c == c0 + nchunk_seq - 1) {
     const float* csc = chunk_state + ((long)c * heads + h) * (PD * ND);
     for (int e8 = tid; e8 < PD * ND / 8; e8 += 256) {
       const int e = e8 * 8;
@@ -1602,7 +1789,7 @@ __global__ void __launch_bounds__(256)
   __syncthreads();  // intra reads of xs_w/bs done everywhere
 
   // ---- inline final_states for last chunks without a K1 chunk_state ----
-  if (!(GS && nchunk_seq > 1) && c == c0 + nchunk_seq - 1) {
+  if ((VLEN || !(GS && nchunk_seq > 1)) && c == c0 + nchunk_seq - 1) {
     if constexpr (!SV) {
       // xs_w currently holds the unanchored fp16 tile; rewrite it in place as
       // the anchored bf16 tile the original accumulation expects, then reuse
@@ -1610,7 +1797,7 @@ __global__ void __launch_bounds__(256)
       if (tid < CS) {
         const int t = tid;
         const float wa = (t < len) ? dtp_s[off + t] * expn(dl - dacs[off + t]) : 0.f;
-        const bf16* xrow = x + (long)(t0 + t) * heads * PD + (long)h * PD;
+        const bf16* xrow = x + (long)(t0 + t) * xs + (long)h * PD;
 #pragma unroll
         for (int p4 = 0; p4 < PD / 4; p4++) {
           uint2 xu = make_uint2(0u, 0u);
@@ -1634,7 +1821,7 @@ __global__ void __launch_bounds__(256)
         const int t = e >> 5, n4 = (e & 31) * 4;
         uint2 bu = make_uint2(0u, 0u);
         if (t < len)
-          bu = *reinterpret_cast<const uint2*>(bmat + (long)(t0 + t) * groups * ND + (long)g * ND +
+          bu = *reinterpret_cast<const uint2*>(bmat + (long)(t0 + t) * bcs + (long)g * ND +
                                                n4);
         const float w0 =
             (t < len) ? fold_scaled_b(dl, dacs[off + t], dtp_s[off + t], cvt_bf2(bu.x).x) : 0.f;
@@ -1654,7 +1841,7 @@ __global__ void __launch_bounds__(256)
     }
   }
   __syncthreads();
-  if (!(GS && nchunk_seq > 1) && c == c0 + nchunk_seq - 1) {
+  if ((VLEN || !(GS && nchunk_seq > 1)) && c == c0 + nchunk_seq - 1) {
     // chunk_state inline accumulation via tensor cores:
     // acc[p][n] = sum_t xs_w_anchored[t,p] * b[t,n]
     const int mw = (w & 3) * 16;
@@ -1803,7 +1990,11 @@ __global__ void __launch_bounds__(256)
     for (int i = 0; i < 8; i++) {
       const int t = t0y + i;
       if (t >= len) break;
-      const long tok = (long)(t0 + t) * heads * PD + hbase;
+      // x and z carry their own (possibly gap-strided) token strides; the
+      // packed token-major y buffer is wrapper-allocated natural-contiguous.
+      const long tok = (long)(t0 + t) * xs + hbase;
+      const long tok_z = (long)(t0 + t) * zs + hbase;
+      const long tok_n = (long)(t0 + t) * (heads * PD) + hbase;
       const uint2 xu = *reinterpret_cast<const uint2*>(x + tok);
       float xv[4] = {cvt_bf2(xu.x).x, cvt_bf2(xu.x).y, cvt_bf2(xu.y).x, cvt_bf2(xu.y).y};
       float dv[4] = {0.f, 0.f, 0.f, 0.f};
@@ -1834,7 +2025,7 @@ __global__ void __launch_bounds__(256)
       }
       float zv[4] = {0.f, 0.f, 0.f, 0.f};
       if (has_z) {
-        const uint2 zu = *reinterpret_cast<const uint2*>(zz + tok);
+        const uint2 zu = *reinterpret_cast<const uint2*>(zz + tok_z);
         zv[0] = cvt_bf2(zu.x).x;
         zv[1] = cvt_bf2(zu.x).y;
         zv[2] = cvt_bf2(zu.y).x;
@@ -1854,7 +2045,7 @@ __global__ void __launch_bounds__(256)
         uint2 ov;
         ov.x = *reinterpret_cast<const uint*>(&o0);
         ov.y = *reinterpret_cast<const uint*>(&o1);
-        *reinterpret_cast<uint2*>(y + tok) = ov;
+        *reinterpret_cast<uint2*>(y + tok_n) = ov;
       } else {
         // public SSDCombined caller buffer: chunk-major (B, H, PD, L/CS, CS),
         // i.e. address ((b*H + h)*PD + p)*L + t_local with b = s (batched) and
@@ -1922,7 +2113,10 @@ __global__ void __launch_bounds__(256)
   bf16* prevb = csm + CS * ND;                        // [64][128] swizzled
   float* ySm = reinterpret_cast<float*>(bs);          // alias after M~ phase
 
-  float* scratch4 = reinterpret_cast<float*>(prevb + PD * ND);
+  // Same scratch4 relocation as K3: 4 floats inside xs_w's dead upper half
+  // (K3L parks no TMEM controls, so +16416 is clear there too), keeping the
+  // dynamic smem request at the true 115712B footprint.
+  float* scratch4 = reinterpret_cast<float*>(reinterpret_cast<char*>(xs_w) + 16416);
 
   const int t0 = s * L;
   const int len = min(CS, L);  // cps == 1 -> whole sequence is this chunk
@@ -1947,8 +2141,8 @@ __global__ void __launch_bounds__(256)
   //      state (threads CS..255) — independent
   //   3) prep_chunk's shuffle scan runs while everything above is in flight
   //   4) folds decode from registers (no global waits on the compute path)
-  stage_bc_sw_lim(bmat, bs, t0, len, g, groups, 0, re_stage);
-  if (!is_fs) stage_bc_sw_lim(cmat, csm, t0, len, g, groups, rb, re_stage);
+  stage_bc_sw_lim(bmat, bs, t0, len, g, groups, 0, re_stage, groups * ND);
+  if (!is_fs) stage_bc_sw_lim(cmat, csm, t0, len, g, groups, rb, re_stage, groups * ND);
   cp_async_commit();
 
   uint2 xr[PD / 4];
@@ -1973,7 +2167,7 @@ __global__ void __launch_bounds__(256)
   }
 
   prep_chunk<DTP, SV>(dt, a, dtb, t0, len, h, heads, do_softplus, unbounded, dt_lo, dt_hi, dacs,
-                      dtp_s, scratch4);
+                      dtp_s, scratch4, heads);
   const float dl = dacs[len - 1];
   const float dec_c = exp_v<SV>(dl);
 
@@ -2380,6 +2574,10 @@ struct VibeCudaSsdArgs {
   float dt_hi;
   int varlen;
   int y_chunk_major;
+  long x_tok_stride;   // x token stride (elements; heads*PD when contiguous)
+  long bc_tok_stride;  // B/C token stride (elements; groups*ND when contiguous)
+  int dt_tok_stride;   // dt token stride (elements; heads when contiguous)
+  long z_tok_stride;   // z token stride (elements; heads*PD when contiguous)
   int sm_count;  // device SM count (lean-dispatch metadata)
   cudaStream_t stream;
 };
@@ -2387,10 +2585,11 @@ struct VibeCudaSsdArgs {
 template <typename DTP, typename ST>
 inline void vibecuda_launch_dt_st(const VibeCudaSsdArgs& p, cudaError_t* err) {
   const int cps = (p.L + CS - 1) / CS;
-  // chunk_state pre-pass only for the uniform multi-chunk layout; the varlen
-  // path builds inter-chunk states inside K3 (chain phase) instead.
+  // chunk_state workspace: K1's uniform multi-chunk pre-pass, or K4's varlen
+  // part states (serving route) folded by K3's GS branch from global memory.
   const bool need_gs = !p.varlen && cps > 1;
-  const long cs_floats = need_gs ? (long)p.nchunk_bound * p.heads * (PD * ND) : 0;
+  const bool need_cs_ws = need_gs || p.varlen;
+  const long cs_floats = need_cs_ws ? (long)p.nchunk_bound * p.heads * (PD * ND) : 0;
   float* chunk_state = p.workspace;
   float* da_last = chunk_state + cs_floats;
 
@@ -2423,8 +2622,28 @@ inline void vibecuda_launch_dt_st(const VibeCudaSsdArgs& p, cudaError_t* err) {
     return cudaGetLastError();
   };
 
+  // --- K4 (varlen chunk-state pre-pass, serving route) ---
+  // Same chain-phase arithmetic as the old inline chain, but each part's
+  // contribution is computed exactly once and read back through the GS fold.
+  const int k4_smem = 2 * CS * 4 + 2 * CS * ND * 2;
+  auto launch_k4 = [&]() -> cudaError_t {
+    auto kern = ssd_k4_kernel<DTP, true>;
+    vibecuda_set_big_smem(reinterpret_cast<const void*>(kern), k4_smem);
+    kern<<<grid, 256, k4_smem, p.stream>>>(
+        reinterpret_cast<const DTP*>(p.dt), p.a, dtb, reinterpret_cast<const bf16*>(p.x),
+        reinterpret_cast<const bf16*>(p.b), chunk_state, da_last, sqi_ptr, p.meta_ci, p.meta_co,
+        p.nmeta, si_is64, p.Tseq, p.L, p.heads, p.groups, p.do_softplus, p.unbounded, p.dt_lo,
+        p.dt_hi, p.x_tok_stride, p.bc_tok_stride, p.dt_tok_stride);
+    return cudaGetLastError();
+  };
+
   // --- K3 ---
-  const int k3_smem = 2 * CS * 4 + 3 * CS * ND * 2 + PD * ND * 2 + 16 + 4 * 4 + CS * 4;
+  // True footprint: dacs/dtp (2*CS*4) + xs_w/bs/csm (3*CS*ND*2) + prevb
+  // (PD*ND*2); scratch4 is aliased into xs_w's dead upper half. 115712B x 2
+  // CTAs + the 1KiB/CTA runtime reservation = the full 228KB/SM budget, so K3
+  // and K3L run two resident CTAs per SM (the TMEM design point: 256 cols x 2
+  // CTAs = all 512 TMEM columns).
+  const int k3_smem = 2 * CS * 4 + 3 * CS * ND * 2 + PD * ND * 2;
 
   auto launch_k3 = [&](auto vlen_c, auto gs_c, auto sv_c) -> cudaError_t {
     constexpr bool VL = decltype(vlen_c)::value;
@@ -2442,7 +2661,7 @@ inline void vibecuda_launch_dt_st(const VibeCudaSsdArgs& p, cudaError_t* err) {
         reinterpret_cast<bf16*>(p.y), reinterpret_cast<ST*>(p.final_states), sqi_ptr, p.meta_ci,
         p.meta_co, p.nmeta, reinterpret_cast<ST*>(p.ck_states), p.ck_tokens, p.ck_slots, si_is64,
         p.Tseq, cps, p.L, p.heads, p.groups, p.has_z, p.do_softplus, p.unbounded, p.dt_lo, p.dt_hi,
-        p.y_chunk_major);
+        p.y_chunk_major, p.x_tok_stride, p.bc_tok_stride, p.dt_tok_stride, p.z_tok_stride);
     return cudaGetLastError();
   };
 
@@ -2487,13 +2706,25 @@ inline void vibecuda_launch_dt_st(const VibeCudaSsdArgs& p, cudaError_t* err) {
   // K3L above covers the lean serving-free family; checkpoints/metadata force
   // the K3 path below.
   if (serving) {
-    if (need_gs) {
-      *err = launch_k1(std::true_type{});
+    // Varlen route selection from host-known shape metadata only (bitwise
+    // ladder identical either way): with nchunk_bound >= 2 * nseq the mean
+    // fold depth per part is at least one, so the serial inline chain's
+    // quadratic recompute costs more than K4's extra launch + pre-pass.
+    // Shallow mixes (nearly all single-part sequences) keep the chain.
+    const bool use_k4 = p.varlen && (p.nchunk_bound >= 2 * p.nseq);
+    if (p.varlen && use_k4) {
+      // Two-pass varlen: K4 precomputes every multi-part sequence's per-part
+      // state contribution (chain-phase arithmetic, once per part instead of
+      // once per (part, successor) pair), then K3's GS branch folds the
+      // precomputed rows from global chunk_state.
+      *err = launch_k4();
       if (*err != cudaSuccess) return;
-    }
-    if (p.varlen) {
+      *err = launch_k3(std::true_type{}, std::true_type{}, std::true_type{});
+    } else if (p.varlen) {
       *err = launch_k3(std::true_type{}, std::false_type{}, std::true_type{});
     } else if (need_gs) {
+      *err = launch_k1(std::true_type{});
+      if (*err != cudaSuccess) return;
       *err = launch_k3(std::false_type{}, std::true_type{}, std::true_type{});
     } else {
       *err = launch_k3(std::false_type{}, std::false_type{}, std::true_type{});

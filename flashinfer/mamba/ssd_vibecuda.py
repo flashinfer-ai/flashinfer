@@ -22,10 +22,13 @@ cuBLAS and no CuTe-DSL).  At most two kernel launches per call:
 
 * ``ssd_k1_kernel`` — chunk-state builder, only for the uniform (non-varlen)
   multi-chunk layout;
+* ``ssd_k4_kernel`` — varlen chunk-state builder: every multi-part sequence's
+  per-part state contribution, once per part (the serving route's replacement
+  for K3's old quadratic inline chain phase);
 * ``ssd_k3_kernel`` — fused output kernel: masked-decay intra-chunk matmuls,
-  inter-chunk state contribution (inline chain for varlen, global chunk-state
-  chain for the uniform multi-chunk layout), D-skip, optional SiLU z gate,
-  per-token output store, and inline final-state accumulation;
+  inter-chunk state contribution (global chunk-state fold over K4/K1 rows for
+  multi-part sequences, inline initial-only otherwise), D-skip, optional SiLU
+  z gate, per-token output store, and inline final-state accumulation;
 * ``ssd_k3l_kernel`` — lean row-split variant of the fused kernel, selected
   by shape metadata for the tiny uniform single-chunk family.
 
@@ -137,6 +140,34 @@ class VibeCUDASSDCombined:
         if t is not None and not t.is_contiguous():
             return t.contiguous()
         return t
+
+    @staticmethod
+    def _dense_inner_view(
+        t: Optional[torch.Tensor],
+    ) -> Tuple[Optional[torch.Tensor], Optional[int]]:
+        """(tensor, token_stride) pair for gap-strided serving views.
+
+        The kernels consume an explicit token stride when the inner
+        (head, dim) blocks are natural-dense and the batch stride matches the
+        token grid; anything else (channels-last, gathers, uneven batches,
+        per-tensor stride mismatches) falls back to a contiguous copy so every
+        kernel-supported layout keeps exact reference semantics.
+        """
+        if t is None:
+            return None, None
+        nd = t.dim()
+        natural = []
+        acc = 1
+        for size in reversed(t.shape):
+            natural.append(acc)
+            acc *= size
+        natural.reverse()
+        if all(t.stride(i) == natural[i] for i in range(2, nd)) and (
+            t.shape[0] == 1 or t.stride(0) == t.stride(1) * t.shape[1]
+        ):
+            return t, int(t.stride(1))
+        c = t.contiguous()
+        return c, int(c.stride(1))
 
     def _zero_dt_bias(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         key = (device.index, dtype)
@@ -408,16 +439,46 @@ class VibeCUDASSDCombined:
         if z is not None and (z.shape != x.shape or z.dtype != torch.bfloat16):
             raise ValueError("z must have the same shape and dtype as x")
 
-        x_c = self._contiguous(x)
-        dt_c = self._contiguous(dt)
-        B_c = self._contiguous(B)
-        C_c = self._contiguous(C)
+        x_c, x_tok_stride = self._dense_inner_view(x)
+        B_c, b_tok_stride = self._dense_inner_view(B)
+        C_c, c_tok_stride = self._dense_inner_view(C)
+        if b_tok_stride != c_tok_stride:
+            B_c = B.contiguous()
+            C_c = C.contiguous()
+            b_tok_stride = c_tok_stride = int(B_c.stride(1))
+        dt_c, dt_tok_stride = self._dense_inner_view(dt)
+        if not has_varlen:
+            # K1/K3L (uniform layouts only) bake the natural token strides
+            # into their address math; keep uniform calls natural-contiguous.
+            natural_x = self.nheads * _HEADDIM
+            natural_bc = self.ngroups * _DSTATE
+            if (
+                x_tok_stride != natural_x
+                or b_tok_stride != natural_bc
+                or dt_tok_stride != self.nheads
+            ):
+                x_c = x.contiguous()
+                B_c = B.contiguous()
+                C_c = C.contiguous()
+                dt_c = dt.contiguous()
+                x_tok_stride = natural_x
+                b_tok_stride = natural_bc
+                dt_tok_stride = self.nheads
         dt_bias_c = (
             self._contiguous(dt_bias)
             if dt_bias is not None
             else self._zero_dt_bias(x.device, dt_c.dtype)
         )
-        z_c = self._contiguous(z) if z is not None else None
+        # z keeps its own native token stride (same dense-inner contract as x);
+        # the kernels read it with an independent stride, so no copy is needed
+        # for gap-strided serving views.
+        if z is not None:
+            z_c, z_tok_stride = self._dense_inner_view(z)
+            if not has_varlen and z_tok_stride != natural_x:
+                z_c = z.contiguous()
+                z_tok_stride = natural_x
+        else:
+            z_c, z_tok_stride = None, 0
         initial_c = self._contiguous(initial_states)
         seq_idx_c = self._contiguous(seq_idx) if has_varlen else None
 
@@ -437,12 +498,12 @@ class VibeCUDASSDCombined:
         else:
             unbounded = 0
 
-        # fp32 scratch for the uniform multi-chunk chunk-state pre-pass
-        # (chunk_state then da_last, padded to at least 64 floats so the tensor
-        # always has valid storage).
-        need_gs = (not has_varlen) and nchunks > 1
-        cs_floats = nchunk_bound * nheads * _HEADDIM * _DSTATE if need_gs else 0
-        dal_floats = nchunk_bound * nheads if need_gs else 0
+        # fp32 scratch for the chunk-state pre-pass (K1 uniform multi-chunk, or
+        # K4 for the varlen serving route; chunk_state then da_last, padded to
+        # at least 64 floats so the tensor always has valid storage).
+        need_cs_ws = has_varlen or ((not has_varlen) and nchunks > 1)
+        cs_floats = nchunk_bound * nheads * _HEADDIM * _DSTATE if need_cs_ws else 0
+        dal_floats = nchunk_bound * nheads if need_cs_ws else 0
         workspace = torch.empty(
             cs_floats + dal_floats + 64, dtype=torch.float32, device=x.device
         )
@@ -503,6 +564,10 @@ class VibeCUDASSDCombined:
             d_mode,
             1 if has_varlen else 0,
             y_chunk_major,
+            x_tok_stride,
+            b_tok_stride,
+            dt_tok_stride,
+            z_tok_stride,
         )
 
         if (

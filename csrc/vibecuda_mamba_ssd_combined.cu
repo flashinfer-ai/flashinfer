@@ -51,13 +51,18 @@ void vibecuda_ssd_combined_fwd(TensorView x, TensorView dt, Optional<TensorView>
                                Optional<TensorView> checkpoint_slots, TensorView workspace,
                                TensorView out, TensorView final_states, int64_t nchunk_bound,
                                int64_t do_softplus, double dt_lo, double dt_hi, int64_t unbounded,
-                               int64_t d_mode, int64_t varlen, int64_t y_chunk_major) {
-  CHECK_INPUT(x);
+                               int64_t d_mode, int64_t varlen, int64_t y_chunk_major,
+                               int64_t x_tok_stride, int64_t bc_tok_stride,
+                               int64_t dt_tok_stride, int64_t z_tok_stride) {
+  // x/dt/b/c may be gap-strided serving views (SGLang split pools); the
+  // dense-inner layout contract is checked explicitly below instead of a
+  // blanket contiguity requirement.
+  CHECK_CUDA(x);
   ffi::CUDADeviceGuard device_guard(x.device().device_id);
-  CHECK_INPUT(dt);
+  CHECK_CUDA(dt);
   CHECK_INPUT(a);
-  CHECK_INPUT(b);
-  CHECK_INPUT(c);
+  CHECK_CUDA(b);
+  CHECK_CUDA(c);
   CHECK_INPUT(workspace);
   CHECK_INPUT(out);
   CHECK_INPUT(final_states);
@@ -92,6 +97,20 @@ void vibecuda_ssd_combined_fwd(TensorView x, TensorView dt, Optional<TensorView>
   TVM_FFI_ICHECK_GT(nchunk_bound, 0) << "nchunk_bound must be positive";
   TVM_FFI_ICHECK_LE(nchunk_bound, 384) << "nchunk_bound exceeds the kernel metadata table";
   TVM_FFI_ICHECK_EQ(x.size(3), PD) << "x headdim must be 64";
+  // Gap-strided serving views (SGLang split pools): token strides may exceed
+  // the contiguous values, but the inner (head, dim) blocks must be dense so
+  // the kernels can vectorize them natively.
+  TVM_FFI_ICHECK_EQ(x.stride(3), 1) << "x channel stride must be 1";
+  TVM_FFI_ICHECK_EQ(x.stride(2), PD) << "x head stride must be dense";
+  TVM_FFI_ICHECK_EQ(b.stride(3), 1) << "b channel stride must be 1";
+  TVM_FFI_ICHECK_EQ(b.stride(2), ND) << "b group stride must be dense";
+  TVM_FFI_ICHECK_EQ(c.stride(3), 1) << "c channel stride must be 1";
+  TVM_FFI_ICHECK_EQ(c.stride(2), ND) << "c group stride must be dense";
+  TVM_FFI_ICHECK_EQ(dt.stride(2), 1) << "dt head stride must be 1";
+  TVM_FFI_ICHECK_EQ(x.stride(1), x_tok_stride) << "x token stride mismatch";
+  TVM_FFI_ICHECK_EQ(b.stride(1), bc_tok_stride) << "b token stride mismatch";
+  TVM_FFI_ICHECK_EQ(c.stride(1), bc_tok_stride) << "c token stride mismatch";
+  TVM_FFI_ICHECK_EQ(dt.stride(1), dt_tok_stride) << "dt token stride mismatch";
   TVM_FFI_ICHECK_EQ(dt.size(0), Bsz) << "dt batch mismatch";
   TVM_FFI_ICHECK_EQ(dt.size(1), L) << "dt seqlen mismatch";
   TVM_FFI_ICHECK_EQ(dt.size(2), H) << "dt nheads mismatch";
@@ -136,10 +155,14 @@ void vibecuda_ssd_combined_fwd(TensorView x, TensorView dt, Optional<TensorView>
   const void* z_ptr = nullptr;
   int has_z = 0;
   if (z.has_value()) {
-    CHECK_INPUT(z.value());
+    CHECK_CUDA(z.value());
     CHECK_DEVICE(z.value(), x);
     TVM_FFI_ICHECK_EQ(z.value().dtype(), dl_bfloat16) << "z must be bfloat16";
     CHECK_SHAPE(z.value(), x);
+    // z carries its own native token stride (same dense-inner contract as x).
+    TVM_FFI_ICHECK_EQ(z.value().stride(3), 1) << "z channel stride must be 1";
+    TVM_FFI_ICHECK_EQ(z.value().stride(2), PD) << "z head stride must be dense";
+    TVM_FFI_ICHECK_EQ(z.value().stride(1), z_tok_stride) << "z token stride mismatch";
     has_z = 1;
     z_ptr = z.value().data_ptr();
   }
@@ -321,6 +344,10 @@ void vibecuda_ssd_combined_fwd(TensorView x, TensorView dt, Optional<TensorView>
   args.dt_hi = static_cast<float>(dt_hi);
   args.varlen = static_cast<int>(varlen);
   args.y_chunk_major = static_cast<int>(y_chunk_major);
+  args.x_tok_stride = static_cast<long>(x_tok_stride);
+  args.bc_tok_stride = static_cast<long>(bc_tok_stride);
+  args.dt_tok_stride = static_cast<int>(dt_tok_stride);
+  args.z_tok_stride = static_cast<long>(z_tok_stride);
   args.sm_count = _vibecuda_sm_count();
   args.stream = get_stream(x.device());
 
