@@ -65,7 +65,6 @@ from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_latency_1cta.co
 )
 from flashinfer.mla import (
     get_prims_ts_batch_mla_decode_workspace_size,
-    prims_ts_batch_mla_decode_with_kv_cache,
 )
 import flashinfer.attention.prims_ts.mla_decode as mla_decode_module
 
@@ -815,15 +814,15 @@ def _run_standalone(
         if out is None
         else out
     )
-    result = prims_ts_batch_mla_decode_with_kv_cache(
+    result = batch_mla_decode_with_paged_kv_cache(
         case.query,
         case.kv_cache,
-        workspace,
-        _LATENT_DIM,
-        _ROPE_DIM,
         case.block_tables,
         case.seq_lens,
-        case.max_seq_len,
+        workspace_buffer=workspace,
+        max_kv_len=case.max_seq_len,
+        kv_lora_rank=_LATENT_DIM,
+        qk_rope_head_dim=_ROPE_DIM,
         qo_indptr=qo_indptr,
         max_seq_len_q=resolved_max_seq_len_q,
         out=output,
@@ -1141,7 +1140,6 @@ def test_attention_ts_mla_public_surfaces_hide_internal_tuning_policy():
         BatchMLADecodePagedTSWrapper.run,
         batch_mla_decode_with_paged_kv_cache,
         get_prims_ts_batch_mla_decode_workspace_size,
-        prims_ts_batch_mla_decode_with_kv_cache,
     )
     violations = []
     for surface in surfaces:
@@ -1195,6 +1193,7 @@ def test_attention_ts_mla_wrapper_uses_compile_oriented_contract():
         "o_data_type",
         "mask_type",
         "workspace_buffer",
+        "validate",
     )
     for name in (
         "device",
@@ -1860,8 +1859,8 @@ def test_attention_ts_mla_rejects_per_request_causal_q_longer_than_kv(
 
 @pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
-def test_attention_ts_mla_packed_query_requires_standalone_static_bound():
-    """The standalone ABI cannot derive a packed-Q JIT bound on its hot path."""
+def test_attention_ts_mla_packed_query_requires_trusted_static_bound():
+    """The trusted caller-workspace path requires an explicit packed-Q bound."""
 
     case = _make_mla_case(
         batch_size=2,
@@ -1874,17 +1873,18 @@ def test_attention_ts_mla_packed_query_requires_standalone_static_bound():
     )
     case, qo_indptr = _pack_mla_case(case, (1, 1))
     workspace = torch.empty(1, dtype=torch.uint8, device="cuda")
-    with pytest.raises(ValueError, match="max_seq_len_q is required"):
-        prims_ts_batch_mla_decode_with_kv_cache(
+    with pytest.raises(ValueError, match="requires max_seq_len_q"):
+        batch_mla_decode_with_paged_kv_cache(
             case.query,
             case.kv_cache,
-            workspace,
-            _LATENT_DIM,
-            _ROPE_DIM,
             case.block_tables,
             case.seq_lens,
-            case.max_seq_len,
+            workspace_buffer=workspace,
+            max_kv_len=case.max_seq_len,
+            kv_lora_rank=_LATENT_DIM,
+            qk_rope_head_dim=_ROPE_DIM,
             qo_indptr=qo_indptr,
+            validate=False,
         )
 
 

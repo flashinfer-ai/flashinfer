@@ -84,7 +84,6 @@ from flashinfer.decode import (
     get_prims_ts_batch_decode_workspace_size,
     make_q_token_kv_block_sparse_qo_indptr as make_prims_ts_q_token_kv_block_sparse_qo_indptr,
     prepare_prims_ts_batch_decode_with_kv_cache,
-    prims_ts_batch_decode_with_kv_cache,
     suggest_q_token_kv_block_sparse_group_size as suggest_prims_ts_q_token_kv_block_sparse_group_size,
     validate_q_token_kv_block_sparse_group_size as validate_prims_ts_q_token_kv_block_sparse_group_size,
 )
@@ -1483,6 +1482,7 @@ def _run_standalone(
     block_table: Optional[torch.Tensor] = None,
     page_size: Optional[int] = None,
     storage_page_size: Optional[int] = None,
+    validate: bool = True,
 ):
     """Run the caller-workspace public entry point for wrapper parity."""
 
@@ -1514,13 +1514,13 @@ def _run_standalone(
     output = torch.empty_like(case.q, dtype=case.output_dtype) if out is None else out
     if block_table is None:
         block_table = case.block_tables
-    result = prims_ts_batch_decode_with_kv_cache(
+    result = batch_decode_with_paged_kv_cache(
         case.q,
         case.paged_kv_cache,
-        workspace,
         block_table,
         seq_lens,
-        max_kv_len,
+        workspace_buffer=workspace,
+        max_kv_len=max_kv_len,
         seq_len_q=seq_len_q,
         qo_indptr=qo_indptr,
         max_seq_len_q=max_seq_len_q,
@@ -1532,6 +1532,7 @@ def _run_standalone(
         window_left=case.window_left,
         kv_layout="HND",
         page_size=page_size,
+        validate=validate,
     )
     assert result is output
     return output
@@ -2211,13 +2212,13 @@ def test_attention_ts_decode_launch_and_plan_reject_unsafe_int32_kv_bound() -> N
     with pytest.raises(
         NotImplementedError, match=r"padded FMHA decode K/V coordinates"
     ):
-        prims_ts_batch_decode_with_kv_cache(
+        batch_decode_with_paged_kv_cache(
             q,
             kv_cache,
-            torch.empty(1, dtype=torch.uint8, device=device),
             block_tables,
             seq_lens,
-            unsafe_max,
+            workspace_buffer=torch.empty(1, dtype=torch.uint8, device=device),
+            max_kv_len=unsafe_max,
         )
 
     with pytest.raises(
@@ -2270,7 +2271,6 @@ _DECODE_PUBLIC_SURFACES = (
     BatchDecodePagedTSWrapper.run,
     batch_decode_with_paged_kv_cache,
     get_prims_ts_batch_decode_workspace_size,
-    prims_ts_batch_decode_with_kv_cache,
 )
 
 
@@ -2322,6 +2322,8 @@ def test_attention_ts_decode_wrapper_has_compile_oriented_contract() -> None:
         "workspace_buffer",
         "storage_page_size",
         "split_kv",
+        "validate",
+        "initialize_workspace",
     )
     run_parameters = inspect.signature(BatchDecodePagedTSWrapper.run).parameters
     assert tuple(run_parameters) == (
@@ -2912,13 +2914,13 @@ def test_attention_ts_decode_page4_encoded_subpages_all_tp_geometries(
         case.paged_kv_indices,
         min_num_pages=(2051 + 3) // 4,
     )
-    result = prims_ts_batch_decode_with_kv_cache(
+    result = batch_decode_with_paged_kv_cache(
         case.q,
         packed_cache,
-        workspace,
         block_table,
         seq_lens,
-        2051,
+        workspace_buffer=workspace,
+        max_kv_len=2051,
         bmm1_scale=case.bmm1_scale,
         bmm2_scale=case.bmm2_scale,
         out=output,
@@ -3380,16 +3382,18 @@ def test_attention_ts_decode_page4_inert_block_table_row_is_zero() -> None:
         min_num_pages=(max_seq_len + semantic_page_size - 1) // semantic_page_size,
     )
 
-    prims_ts_batch_decode_with_kv_cache(
+    batch_decode_with_paged_kv_cache(
         q,
         (k_cache, v_cache),
-        workspace,
         block_table,
         seq_lens,
-        max_seq_len,
+        workspace_buffer=workspace,
+        max_kv_len=max_seq_len,
         out=output,
         mask_type="causal",
         page_size=semantic_page_size,
+        # The kernel's inert padding locator is outside the validated page-ID contract.
+        validate=False,
     )
 
     expected_active = v_cache[0, :, 0].repeat_interleave(
@@ -5944,6 +5948,7 @@ def test_attention_ts_decode_standalone_graph_reloads_all_live_metadata():
             out=graph_out,
             workspace_buffer=workspace,
             block_table=block_table,
+            validate=False,
         )
     assert captured is graph_out
     graph_out.fill_(float("nan"))

@@ -64,10 +64,9 @@ Import these entry points from `flashinfer.attention.prims_ts`:
 | API | Use |
 | --- | --- |
 | `BatchDecodePagedTSWrapper` | Reusable static `plan()` with plan- or run-owned K/V lengths. |
-| `batch_decode_with_paged_kv_cache` | One-shot convenience interface. |
+| `batch_decode_with_paged_kv_cache` | One-shot interface with optional caller scratch, explicit bounds, and trusted capture-safe execution. |
 | `get_prims_ts_batch_decode_workspace_size` | Size caller-owned scratch for the standalone launch. |
 | `prepare_prims_ts_batch_decode_with_kv_cache` | Validate and compile a standalone launch once for a lightweight graph-safe `run()`. |
-| `prims_ts_batch_decode_with_kv_cache` | Standalone launch with caller-owned scratch and explicit `seq_lens`. |
 
 Trace a planned stateful wrapper with `flashinfer.fi_trace(wrapper.run, ...)`.
 The unbound `wrapper.run.fi_trace(...)` form is rejected because it cannot
@@ -227,7 +226,7 @@ import torch
 from flashinfer.attention.prims_ts import (
     BatchDecodePagedTSWrapper,
     get_prims_ts_batch_decode_workspace_size,
-    prims_ts_batch_decode_with_kv_cache,
+    batch_decode_with_paged_kv_cache,
 )
 
 device = "cuda"
@@ -285,13 +284,13 @@ workspace_bytes = get_prims_ts_batch_decode_workspace_size(
     device=q.device,
 )
 workspace = torch.zeros(workspace_bytes, device=device, dtype=torch.int8)
-standalone_out = prims_ts_batch_decode_with_kv_cache(
+standalone_out = batch_decode_with_paged_kv_cache(
     q,
     kv,
-    workspace,
     block_tables,
     seq_lens,
-    max_seq_len,
+    workspace_buffer=workspace,
+    max_kv_len=max_seq_len,
     mask_type="causal",
 )
 assert standalone_out.shape == q.shape
