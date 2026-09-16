@@ -630,11 +630,11 @@ def bsa_attn_sm120_blk64_sage_fwd(
         Required for ``backend="cake"``. For ``backend="cute_dsl"``,
         allocated internally when not provided.
     tma_descriptor_workspace : torch.Tensor, optional
-        Caller-owned contiguous CUDA uint8 workspace, aligned to 128 bytes.
-        Required for ``backend="cake"``; an empty tensor is sufficient
-        since tensor-map descriptors are passed by value in the kernel
-        launch, so workspace contents, lifetime, and reuse across streams
-        do not affect attention. Ignored for ``backend="cute_dsl"``.
+        Accepted for compatibility and unused. An empty tensor is sufficient;
+        this operation neither reads nor writes its storage. Tensor-map
+        descriptors are passed by value in the kernel launch, so workspace
+        contents, lifetime, and reuse across streams do not affect attention.
+        Required for ``backend="cake"``; ignored for ``backend="cute_dsl"``.
     uniform_block_count : bool
         Whether every query block uses ``block_sparse_num`` selected blocks.
         Only honoured by ``backend="cake"``, where it is a caller-provided

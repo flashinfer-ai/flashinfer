@@ -123,12 +123,14 @@ class BlockSparseAttnForwardSageSm120Blk64(BatchedStaticSchedulerMixin):
         # blocks/SM (65536 regs/SM -> floor(65536/(230*128))=2;
         # 100KB smem/SM -> floor(100KB/41KB)=2). kv_stage=2 compiles fine
         # (doubling K/V to 56KB/block is still far under the ~100KB/block
-        # opt-in max), but it is not a net win: it drops the *smem* block
-        # limit to floor(100KB/56KB)=1 while leaving the register-derived
-        # limit at 2 (tSrK/tOrV stay single fragments regardless of depth),
-        # so smem becomes the new, tighter bottleneck -- occupancy would
-        # regress from 2 blocks/SM to 1. So kv_stage=1 isn't "the only
-        # value that fits"; it's the higher-occupancy choice.
+        # opt-in max), but it drops the *smem* block limit to
+        # floor(100KB/56KB)=1 while leaving the register-derived limit at 2
+        # (tSrK/tOrV stay single fragments regardless of depth), so smem
+        # becomes the new, tighter bottleneck -- occupancy would regress
+        # from 2 blocks/SM to 1. Whether the deeper pipeline's extra latency
+        # hiding offsets that occupancy loss is unmeasured (would need a
+        # runtime comparison); kv_stage=1 is kept as the higher-occupancy
+        # choice, not because it is proven the faster one.
         # V's smem index is therefore always 0 (== K_consumer_state.index when
         # kv_stage == 1), which is why it is hardcoded rather than tracked via
         # V_consumer_state.index.
