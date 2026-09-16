@@ -138,7 +138,7 @@ class MlaConfig:
     num_ctas_for_all_heads: int = 1
     num_ctas_per_head_dim: int = 1
     head_dim_per_cta_v: int = 512
-    use_balanced_scheduler: int = 0
+    use_balanced_scheduler: bool = False
     balanced_descriptor_capacity: int = 0
     balanced_partial_capacity: int = 0
     head_dim_per_stage_kv: int = 128
@@ -1668,7 +1668,7 @@ def make_throughput_latency_mla_config(
             selected_profile.use_clc_dynamic_persistent_scheduler
         ),
         persistent_wave_sm_count=persistent_wave_sm_count,
-        use_balanced_scheduler=int_flag(use_balanced_scheduler),
+        use_balanced_scheduler=use_balanced_scheduler,
         balanced_descriptor_capacity=balanced_descriptor_capacity,
         balanced_partial_capacity=balanced_partial_capacity,
     )

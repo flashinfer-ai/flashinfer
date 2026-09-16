@@ -2696,6 +2696,8 @@ def test_attention_ts_mla_balanced_keeps_fp8_serializes_q_work_tiles():
 
     assert direct.q_stages == 2
     assert balanced.q_stages == 1
+    assert direct.use_balanced_scheduler is False
+    assert balanced.use_balanced_scheduler is True
     # Preserve the long-descriptor K/V pipeline; Q is the per-work-tile fence.
     assert balanced.kv_stages == direct.kv_stages == 8
 

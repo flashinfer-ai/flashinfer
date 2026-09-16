@@ -550,7 +550,7 @@ class TmemSResource(MlaResource):
                         local_row_idx,
                         self.cu_seqlens_q,
                     )
-                    if cutlass.const_expr(cfg.use_balanced_scheduler == 1):
+                    if cutlass.const_expr(cfg.use_balanced_scheduler):
                         row_seq_len_kv = cute.math.min(seq_len_kv, row_seq_len_kv)
                 for reg_idx in cutlass.range_constexpr(num_s_regs_per_thread(cfg)):
                     token_idx = tile_offset_k + local_col_base + Int32(reg_idx)
@@ -591,7 +591,7 @@ class TmemSResource(MlaResource):
                             row_in_tile_1,
                             self.cu_seqlens_q,
                         )
-                        if cutlass.const_expr(cfg.use_balanced_scheduler == 1):
+                        if cutlass.const_expr(cfg.use_balanced_scheduler):
                             seq_len_kv_0 = cute.math.min(seq_len_kv, seq_len_kv_0)
                             seq_len_kv_1 = cute.math.min(seq_len_kv, seq_len_kv_1)
                     s_base = repeat_idx * 4

@@ -114,7 +114,7 @@ class MlaDecodeTask(Task):
         if self.cfg is None:
             return self.domain
 
-        if cutlass.const_expr(self.cfg.use_balanced_scheduler == 1):
+        if cutlass.const_expr(self.cfg.use_balanced_scheduler):
             packed_batch_head_idx = Int32(tile_coord[2])
             descriptor_capacity = Int32(self.cfg.balanced_descriptor_capacity)
             descriptor_idx = packed_batch_head_idx % descriptor_capacity
