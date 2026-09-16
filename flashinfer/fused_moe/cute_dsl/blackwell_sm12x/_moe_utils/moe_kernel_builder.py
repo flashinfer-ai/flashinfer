@@ -71,8 +71,10 @@ class MmaConfig:
         return self.op.shape_mnk[2] if self.plain_fp8 else self.op.sf_vec_size
 
     def make_tiled_mma(self, tile):
-        if self.plain_fp8 or self.swap_ab:
+        if self.plain_fp8:
             perm = (tile[0], tile[1], self.sf_vec)
+        elif self.swap_ab:
+            perm = (tile[0], tile[1], self.op.shape_mnk[2])
         else:
             perm = sm120_utils.get_permutation_mnk(tile, self.sf_vec, self.use_mxf8f6f4)
         return cute.make_tiled_mma(
