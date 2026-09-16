@@ -738,8 +738,8 @@ void invokeSiluAndMulNVFP4Quantization(void* output, void* output_scale, void* i
     block.x = (block.x + 1) / 2;
   }
 
-  // TODO(kaixih@nvidia): Should relax this to allow any grid size.
-  // shuw@nvidia.com: only deal with mask case
+  // TODO: Should relax this to allow any grid size.
+  // Only deal with the mask case.
   TLLM_CHECK_WITH_INFO(mask != nullptr, "mask must be non-null for expert NVFP4 path");
   TLLM_CHECK_WITH_INFO(n_experts > 0, "n_experts must be > 0");
   grid.x = (grid.x + n_experts - 1) / n_experts * n_experts;

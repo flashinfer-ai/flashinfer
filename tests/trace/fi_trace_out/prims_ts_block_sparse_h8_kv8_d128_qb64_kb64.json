@@ -6,6 +6,8 @@
     "fi_api:flashinfer.attention.prims_ts.block_sparse.block_sparse_attention",
     "backend:prims-ts",
     "sparse:block",
+    "sparse-format:bsr",
+    "routes:exact",
     "status:experimental"
   ],
   "axes": {
@@ -33,14 +35,6 @@
       "type": "const",
       "value": 128
     },
-    "num_q_block_offsets": {
-      "type": "var",
-      "description": "Number of BSR row offsets per batch and KV head."
-    },
-    "num_block_indices": {
-      "type": "var",
-      "description": "Capacity of the runtime KV-block ID tensor."
-    },
     "num_kv_valid_words": {
       "type": "var",
       "description": "Number of optional token-validity words per batch."
@@ -52,6 +46,14 @@
     "kv_block_size": {
       "type": "const",
       "value": 64
+    },
+    "num_q_block_offsets": {
+      "type": "var",
+      "description": "Number of BSR row offsets per batch and KV head."
+    },
+    "num_block_indices": {
+      "type": "var",
+      "description": "Capacity of the runtime KV-block ID tensor."
     }
   },
   "constraints": [
@@ -61,8 +63,8 @@
     "q_block_size > 0",
     "(q_block_size * (num_qo_heads // num_kv_heads)) % 8 == 0",
     "kv_block_size in (8, 16, 32) or (kv_block_size > 0 and kv_block_size % 64 == 0)",
-    "num_q_block_offsets == (seq_len_q + q_block_size - 1) // q_block_size + 1",
     "kv_valid_bits is None or num_kv_valid_words == (seq_len_kv + 31) // 32",
+    "num_q_block_offsets == (seq_len_q + q_block_size - 1) // q_block_size + 1",
     "mask_type is None or mask_type in ('dense', 'causal')"
   ],
   "inputs": {
@@ -100,7 +102,7 @@
         "num_q_block_offsets"
       ],
       "dtype": "int32",
-      "description": "Absolute offsets into block_indices, consumed by the one-shot call."
+      "description": "Absolute offsets into block_indices for this call."
     },
     "block_indices": {
       "shape": [
@@ -116,7 +118,7 @@
       ],
       "dtype": "uint32",
       "optional": true,
-      "description": "Batch-only token validity bits: token t uses bit t % 32 of word t // 32 (LSB-first); one means valid. Padding bits beyond Skv are ignored; consumed by the one-shot call."
+      "description": "Batch-only token validity bits: token t uses bit t % 32 of word t // 32 (LSB-first); one means valid. Padding bits beyond the K/V length are ignored; the mask applies only to exact routes."
     },
     "q_block_size": {
       "shape": null,

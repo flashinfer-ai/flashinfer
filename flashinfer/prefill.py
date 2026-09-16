@@ -1801,6 +1801,7 @@ def _blackwell_ragged_auto_upgrade(
     cutlass_work_items: int,
     cuda_graph_enabled: bool,
     cutlass_indptr_is_int32: bool = False,
+    single_token_gqa: bool = False,
 ) -> Optional[str]:
     r"""Pick the Blackwell backend ``auto`` should upgrade FA2 to for ragged prefill.
 
@@ -1854,6 +1855,11 @@ def _blackwell_ragged_auto_upgrade(
                 # graph, where it raises instead -- so in that case cuDNN
                 # cannot serve the call and must not be selected.
                 and cudnn_indptr_is_int32
+                # cuDNN's s_q == 1 kernel packs the q heads of a kv group and
+                # writes the LSE only for the first of them (cuDNN 9.26/9.27,
+                # NVBug 6783545); the output is right, the LSE is not, and run()
+                # does not know yet whether the caller wants it.
+                and not single_token_gqa
             ):
                 return backend
         elif backend == "cutlass":
@@ -1973,7 +1979,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
     ...     o_custom = prefill_wrapper.run(q, kv_cache)
     ...     assert torch.allclose(o_custom, outputs[i], rtol=1e-3, atol=1e-3)
     ...
-
 
 
     Note
@@ -3697,10 +3702,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._rope_theta = rope_theta
         return self.run_return_lse(q, paged_kv_cache, k_scale=k_scale, v_scale=v_scale)
 
-    def end_forward(self) -> None:
-        r"""Warning: this function is deprecated and has no effect."""
-        pass
-
 
 def _compute_mask_indptr(
     qo_indptr: torch.Tensor, kv_indptr: torch.Tensor
@@ -4596,6 +4597,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                             self._qo_indptr_buf.dtype == torch.int32
                             and self._kv_indptr_buf.dtype == torch.int32
                         ),
+                        single_token_gqa=(
+                            max_qo_len == 1 and num_qo_heads != num_kv_heads
+                        ),
                     )
                     if upgraded is not None:
                         self._backend = upgraded
@@ -5149,6 +5153,17 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     "cuDNN ragged prefill backend does not consume them; plan() "
                     "again (auto routes past cuDNN when sinks are set) or use fa2"
                 )
+            if (
+                return_lse
+                and self._max_token_per_sequence == 1
+                and q.shape[1] != k.shape[1]
+            ):
+                raise NotImplementedError(
+                    "cuDNN's single-token (max q_len == 1) GQA kernel writes the "
+                    "LSE only for the first head of each kv group (cuDNN 9.26/9.27 "
+                    "bug, NVBug 6783545); use backend='auto', which routes these steps "
+                    "to another backend, or return_lse=False"
+                )
             # The caller's token-unit indptrs go straight to cuDNN (mask +
             # ragged offsets, scaled in-engine); no per-call conversion kernels.
             # actual_seq_lens_q/kv are optional: the direct path derives them
@@ -5326,10 +5341,6 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._rope_scale = rope_scale
         self._rope_theta = rope_theta
         return self.run_return_lse(q, k, v)
-
-    def end_forward(self) -> None:
-        r"""Warning: this function is deprecated and has no effect."""
-        pass
 
 
 def fmha_varlen_plan(

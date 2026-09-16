@@ -98,10 +98,10 @@ constexpr BlockReduceAlgorithm REDUCE_ALGO = BLOCK_REDUCE_WARP_REDUCTIONS;
 
 // On SM107 (Rubin), ptxas can allocate >64 regs/thread for these 1024-thread
 // sampling kernels, which exceeds the 65536-register SM budget and fails with
-// "too many resources requested for launch" (internal MR !611 / feat_sm107).
+// "too many resources requested for launch".
 // Gate __launch_bounds__ to native sm_107* compiles only so other arches keep
-// unconstrained register allocation (avoids the B300/H100 spill regression in
-// NVBug 6517769). When SM107 is mapped to sm_100f at JIT time, this gate is
+// unconstrained register allocation (avoids a B300/H100 register-spill
+// regression). When SM107 is mapped to sm_100f at JIT time, this gate is
 // inactive; that path inherits sm_100 register counts which already fit.
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1070)
 #define FLASHINFER_SAMPLING_LAUNCH_BOUNDS(block_threads) __launch_bounds__(block_threads)
