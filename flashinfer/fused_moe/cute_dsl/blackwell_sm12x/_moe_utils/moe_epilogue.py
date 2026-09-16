@@ -19,8 +19,8 @@ import enum
 from typing import Optional
 
 import cutlass
-import cutlass.utils
 import cutlass.cute as cute
+import cutlass.utils
 import cutlass.utils.hopper_helpers as sm90_utils
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op

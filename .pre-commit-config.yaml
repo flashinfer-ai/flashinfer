@@ -86,7 +86,7 @@ repos:
         alias: sm12x-import-order
         name: ruff check (SM12x import order)
         args: [--select, I]
-        files: ^flashinfer/fused_moe/cute_dsl/blackwell_sm12x/.*\.py$
+        files: ^flashinfer/fused_moe/cute_dsl/blackwell_sm12x/(?:_moe_utils/(?:moe_epilogue|moe_kernel_builder|moe_scheduler|sm12x_blockscaled_layout)|kernel_moe_(?:fp8|mxfp8_mxfp4)_(?:gemm|fc1_act|fc1_act_q1|fc2_finalize)|moe_(?:fp8|mxfp8_mxfp4)_(?:gemm|fc1_act|fc1_act_q1|fc2_finalize))\.py$
       # Run the formatter.
       - id: ruff-format
         types_or: [ python, pyi ]

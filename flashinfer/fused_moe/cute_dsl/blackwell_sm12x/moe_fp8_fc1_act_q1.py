@@ -21,11 +21,11 @@ import torch
 from cutlass.base_dsl.common import DSLUserCodeError
 
 from ....tllm_enums import ActivationType
-from ._moe_utils.sm12x_blockscaled_layout import SF_M_ALIGN
 from ....utils import ceil_div
-from ._moe_utils.sm12x_blockscaled_layout import compute_padded_offset
+from ._moe_utils.heuristic import select_fc1_act_tile
 from ._moe_utils.moe_epilogue import EPI_CONFIGS, EpiMethod
 from ._moe_utils.moe_kernel_builder import Sm12xGemmConfig, dsl_targets_sm12x
+from ._moe_utils.sm12x_blockscaled_layout import SF_M_ALIGN, compute_padded_offset
 from .kernel_moe_fp8_fc1_act_q1 import (
     GRAN_K,
     QUANT_EPIS,
@@ -34,7 +34,6 @@ from .kernel_moe_fp8_fc1_act_q1 import (
     make_args,
     make_cfg,
 )
-from ._moe_utils.heuristic import select_fc1_act_tile
 
 BK = GRAN_K
 EPIS = QUANT_EPIS

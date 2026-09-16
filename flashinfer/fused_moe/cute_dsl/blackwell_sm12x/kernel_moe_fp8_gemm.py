@@ -13,28 +13,26 @@
 # limitations under the License.
 """Self-written CuteDSL fp8 block-scaled (1x128x128) token-packed grouped MoE GEMM for SM120a."""
 
-import torch
-
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.cute.nvgpu.warp.mma as warp_mma
 import cutlass.utils as utils
+import torch
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.runtime import from_dlpack
 
+from ....utils import ceil_div
+from ._moe_utils import moe_epilogue, moe_scheduler
 from ._moe_utils.moe_epilogue import EPI_CONFIGS, EpiMethod
-from ._moe_utils.moe_kernel_builder import Sm12xGemmConfig, MmaConfig, LoadABConfig
+from ._moe_utils.moe_kernel_builder import LoadABConfig, MmaConfig, Sm12xGemmConfig
 from ._moe_utils.sm12x_blockscaled_layout import (
+    TMA_ALIGN_BYTES,
     Sm120SfConfigFp8,
+    compute_padded_offset,
     copy_scale_s2r,
     rescale,
 )
-from ._moe_utils.sm12x_blockscaled_layout import TMA_ALIGN_BYTES
-from ....utils import ceil_div
-from ._moe_utils.sm12x_blockscaled_layout import compute_padded_offset
-from ._moe_utils import moe_scheduler, moe_epilogue
-
 
 GRAN_M, GRAN_N, GRAN_K = 1, 128, 128
 

@@ -19,14 +19,13 @@ import os
 import cutlass
 import cutlass.cute as cute
 import torch
-
-from ....autotuner import AutoTuner, TunableRunner, TuningConfig, autotune
 from cutlass.base_dsl.common import DSLUserCodeError
 
+from ....autotuner import AutoTuner, TunableRunner, TuningConfig, autotune
 from ....utils import ceil_div
 from ._moe_utils.moe_epilogue import EPI_CONFIGS, EpiMethod
-from ._moe_utils.sm12x_blockscaled_layout import Sm120SfConfigMxfp8Mxfp4
 from ._moe_utils.moe_kernel_builder import Sm12xGemmConfig, dsl_targets_sm12x
+from ._moe_utils.sm12x_blockscaled_layout import Sm120SfConfigMxfp8Mxfp4
 from .kernel_moe_mxfp8_mxfp4_fc2_finalize import (
     GRANK_A,
     GRANK_B,

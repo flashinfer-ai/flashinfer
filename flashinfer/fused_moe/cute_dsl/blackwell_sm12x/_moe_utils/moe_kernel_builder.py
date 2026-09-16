@@ -14,9 +14,9 @@
 """SM120 block-scaled GEMM builder for the warp-specialized kernel family: composable per-phase configs + top builder."""
 
 import cutlass
-import cutlass.utils
 import cutlass.cute as cute
 import cutlass.cute.nvgpu.warp.mma as warp_mma
+import cutlass.utils
 import cutlass.utils.blackwell_helpers as sm120_utils
 import cutlass.utils.hopper_helpers as sm90_utils
 from cutlass.cute.nvgpu import cpasync

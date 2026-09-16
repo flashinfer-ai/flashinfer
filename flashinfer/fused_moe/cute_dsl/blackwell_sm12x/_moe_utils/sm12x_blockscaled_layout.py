@@ -16,7 +16,8 @@
 import cutlass
 import cutlass.cute as cute
 
-from .....utils import round_up as align, ceil_div
+from .....utils import ceil_div
+from .....utils import round_up as align
 
 TMA_ALIGN_BYTES = 16
 SF_ELEM_BYTES = 4

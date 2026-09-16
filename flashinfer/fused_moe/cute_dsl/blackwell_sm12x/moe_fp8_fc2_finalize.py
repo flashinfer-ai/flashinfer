@@ -21,6 +21,7 @@ import torch
 from cutlass.base_dsl.common import DSLUserCodeError
 
 from ....utils import ceil_div
+from ._moe_utils.heuristic import select_plain_bm_64_or_128
 from ._moe_utils.moe_epilogue import EPI_CONFIGS, EpiMethod
 from ._moe_utils.moe_kernel_builder import Sm12xGemmConfig, dsl_targets_sm12x
 from .kernel_moe_fp8_fc2_finalize import (
@@ -31,7 +32,6 @@ from .kernel_moe_fp8_fc2_finalize import (
     make_args,
     make_cfg,
 )
-from ._moe_utils.heuristic import select_plain_bm_64_or_128
 
 TILES = ((128, GRAN_N), (64, GRAN_N), (32, GRAN_N))
 BK = GRAN_K
