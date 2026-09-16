@@ -337,7 +337,9 @@ def _validate_devcontainer(
             )
 
 
-def validate_cuda_config(config: Any, repo_root: Path) -> None:
+def validate_cuda_config(
+    config: Any, repo_root: Path, *, validate_devcontainers: bool = True
+) -> None:
     """Validate matrix syntax, safe values, and cross-file consistency."""
     config = _mapping(config, "CUDA configuration")
     runtime_entries = _entries(config, "runtime")
@@ -352,7 +354,8 @@ def validate_cuda_config(config: Any, repo_root: Path) -> None:
         _string(entry, "image", context, IMAGE_PATTERN)
         _string(entry, "cudnn_version", context, CUDNN_PATTERN)
         runtime_by_label[label] = entry
-        _validate_devcontainer(repo_root, entry, context)
+        if validate_devcontainers:
+            _validate_devcontainer(repo_root, entry, context)
 
     jit_by_label: dict[str, dict[str, Any]] = {}
     for index, entry in enumerate(jit_entries):

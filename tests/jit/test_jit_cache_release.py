@@ -60,7 +60,11 @@ def release_verifier_module():
 def test_provider_release_matrices_are_explicit(cuda_config_module):
     config = json.loads((REPO_ROOT / "ci" / "cuda-versions.json").read_text())
 
-    cuda_config_module.validate_cuda_config(config, REPO_ROOT)
+    # GitLab runs this test from a Docker context that intentionally excludes
+    # .devcontainer/. Full-checkout CI validates those files through the CLI.
+    cuda_config_module.validate_cuda_config(
+        config, REPO_ROOT, validate_devcontainers=False
+    )
     provider_matrix = cuda_config_module.build_jit_cache_provider_matrix(config)
     shim_matrix = cuda_config_module.build_jit_cache_shim_matrix(config)
 
@@ -86,7 +90,18 @@ def test_provider_release_matrix_rejects_duplicate_architectures(
     with pytest.raises(
         cuda_config_module.ConfigError, match="contains duplicate architectures"
     ):
-        cuda_config_module.validate_cuda_config(invalid_config, REPO_ROOT)
+        cuda_config_module.validate_cuda_config(
+            invalid_config, REPO_ROOT, validate_devcontainers=False
+        )
+
+
+def test_cuda_config_validation_checks_devcontainers_by_default(
+    cuda_config_module, tmp_path
+):
+    config = json.loads((REPO_ROOT / "ci" / "cuda-versions.json").read_text())
+
+    with pytest.raises(cuda_config_module.ConfigError, match="missing development"):
+        cuda_config_module.validate_cuda_config(config, tmp_path)
 
 
 def test_release_verifier_rejects_duplicate_wheel_distributions(
