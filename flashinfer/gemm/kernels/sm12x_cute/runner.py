@@ -134,10 +134,15 @@ def _compile(m, n, k, tactic, *, compute_capability=None):
             ),
         )
 
-        register_redistribution = (
-            compute_capability == (12, 1)
-            and (m, n, k) == (256, 9216, 7168)
-            and tactic == ("raw", 64, 32, 2, False, True, 256, True)
+        register_redistribution = compute_capability == (12, 1) and (
+            (
+                (m, n, k) == (256, 9216, 7168)
+                and tactic == ("raw", 64, 32, 2, False, True, 256, True)
+            )
+            or (
+                (m, n, k) == (512, 8192, 2048)
+                and tactic == ("raw", 64, 32, 4, False, True, 256, True)
+            )
         )
         if register_redistribution:
             gemm.load_register_requirement = 24
