@@ -1518,28 +1518,34 @@ def single_prefill_with_kv_cache(
     # paged path only.
     is_fp8_token_head_sf = is_float8(k) and kv_cache_sf is not None
     if is_fp8_token_head_sf:
-        assert v.dtype == k.dtype, "k and v must have the same dtype"
-        assert q.dtype in (torch.float16, torch.bfloat16), (
-            f"FP8 token-head scale requires an fp16/bf16 query, got {q.dtype}"
-        )
-        if get_compute_capability(q.device)[0] < 8:
-            assert q.dtype == torch.float16, (
-                "bf16 query is not supported with FP8 token-head scale on this "
-                "architecture (only fp16 is supported on SM75)"
+        if v.dtype != k.dtype:
+            raise ValueError("k and v must have the same dtype")
+        if q.dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError(
+                f"FP8 token-head scale requires an fp16/bf16 query, got {q.dtype}"
             )
-        assert q.shape[-1] % 16 == 0, (
-            "FP8 token-head scale requires the query head_dim to be a multiple of 16, "
-            f"got {q.shape[-1]}"
-        )
+        if get_compute_capability(q.device)[0] < 8:
+            if q.dtype != torch.float16:
+                raise ValueError(
+                    "bf16 query is not supported with FP8 token-head scale on this "
+                    "architecture (only fp16 is supported on SM75)"
+                )
+        if q.shape[-1] % 16 != 0:
+            raise ValueError(
+                "FP8 token-head scale requires the query head_dim to be a multiple of 16, "
+                f"got {q.shape[-1]}"
+            )
         # Standard KV layout: K head_dim == Q head_dim, V head_dim a multiple of 16.
-        assert k.shape[-1] == q.shape[-1], (
-            "FP8 token-head scale expects the K head_dim to equal the query head_dim "
-            f"(got K head_dim {k.shape[-1]}, query head_dim {q.shape[-1]})"
-        )
-        assert v.shape[-1] % 16 == 0, (
-            "FP8 token-head scale expects the V head_dim to be a multiple of 16 "
-            f"(got V head_dim {v.shape[-1]})"
-        )
+        if k.shape[-1] != q.shape[-1]:
+            raise ValueError(
+                "FP8 token-head scale expects the K head_dim to equal the query head_dim "
+                f"(got K head_dim {k.shape[-1]}, query head_dim {q.shape[-1]})"
+            )
+        if v.shape[-1] % 16 != 0:
+            raise ValueError(
+                "FP8 token-head scale expects the V head_dim to be a multiple of 16 "
+                f"(got V head_dim {v.shape[-1]})"
+            )
         # The scale mirrors the KV layout minus head_dim: NHD [kv_len, num_kv_heads] /
         # HND [num_kv_heads, kv_len]. Its strides must mirror the KV strides divided by
         # head_dim (the kernel derives the scale strides from the KV strides, the same
@@ -1552,27 +1558,29 @@ def single_prefill_with_kv_cache(
             (kv_len, num_kv_heads) if kv_layout == "NHD" else (num_kv_heads, kv_len)
         )
         for name, kv, sf in (("k_sf", k, k_sf_arg), ("v_sf", v, v_sf_arg)):
-            assert sf is not None, (
-                f"FP8 token-head scale requires {name} to be provided"
-            )
-            assert sf.dtype == torch.float32, (
-                f"FP8 token-head scale requires {name} to be float32, got {sf.dtype}"
-            )
-            assert sf.shape == expected_sf_shape, (
-                f"FP8 token-head scale expects {name} shape {expected_sf_shape} "
-                f"for kv_layout={kv_layout!r}, got {tuple(sf.shape)}"
-            )
+            if sf is None:
+                raise ValueError(f"FP8 token-head scale requires {name} to be provided")
+            if sf.dtype != torch.float32:
+                raise ValueError(
+                    f"FP8 token-head scale requires {name} to be float32, got {sf.dtype}"
+                )
+            if sf.shape != expected_sf_shape:
+                raise ValueError(
+                    f"FP8 token-head scale expects {name} shape {expected_sf_shape} "
+                    f"for kv_layout={kv_layout!r}, got {tuple(sf.shape)}"
+                )
             head_dim = kv.shape[-1]
             for i in range(sf.ndim):
-                assert (
+                if not (
                     kv.stride(i) % head_dim == 0
                     and sf.stride(i) == kv.stride(i) // head_dim
-                ), (
-                    f"FP8 token-head scale: {name} layout must mirror the KV layout "
-                    f"(scale stride = KV stride / head_dim, as the NVFP4 path requires); "
-                    f"got {name} stride {sf.stride(i)} at dim {i}, expected "
-                    f"{kv.stride(i) // head_dim} from KV stride {kv.stride(i)}"
-                )
+                ):
+                    raise ValueError(
+                        f"FP8 token-head scale: {name} layout must mirror the KV layout "
+                        f"(scale stride = KV stride / head_dim, as the NVFP4 path "
+                        f"requires); got {name} stride {sf.stride(i)} at dim {i}, "
+                        f"expected {kv.stride(i) // head_dim} from KV stride {kv.stride(i)}"
+                    )
         # The token-head-scale path is only implemented in the FA2 kernels.
         if backend == "auto":
             backend = "fa2"
@@ -2334,6 +2342,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._custom_mask_buf = custom_mask_buf
         self._mask_indptr_buf = mask_indptr_buf
         self._max_total_num_rows: Optional[int] = None
+        # `auto` is re-resolved on every plan() (its answer depends on plan
+        # arguments such as window_left); _backend holds the resolved value.
+        self._requested_backend = backend
         self._backend = backend
         self._plan_info = None
         self._cached_module = None
@@ -2854,36 +2865,43 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._head_dim_vo = head_dim_vo
 
         if use_token_head_sf:
-            assert kv_data_type in (torch.float8_e4m3fn, torch.float8_e5m2), (
-                "use_token_head_sf requires an fp8 (e4m3/e5m2) KV cache, got "
-                f"{kv_data_type}"
-            )
-            assert q_data_type in (torch.float16, torch.bfloat16), (
-                f"use_token_head_sf requires an fp16/bf16 query, got {q_data_type}"
-            )
-            if get_compute_capability(self.device)[0] < 8:
-                assert q_data_type == torch.float16, (
-                    "bf16 query is not supported with use_token_head_sf on this "
-                    "device (SM75 only supports fp16)"
+            if kv_data_type not in (torch.float8_e4m3fn, torch.float8_e5m2):
+                raise ValueError(
+                    "use_token_head_sf requires an fp8 (e4m3/e5m2) KV cache, got "
+                    f"{kv_data_type}"
                 )
+            if q_data_type not in (torch.float16, torch.bfloat16):
+                raise ValueError(
+                    f"use_token_head_sf requires an fp16/bf16 query, got {q_data_type}"
+                )
+            if get_compute_capability(self.device)[0] < 8:
+                if q_data_type != torch.float16:
+                    raise ValueError(
+                        "bf16 query is not supported with use_token_head_sf on this "
+                        "device (SM75 only supports fp16)"
+                    )
             # Standard KV layout: the cache last dim is head_dim (no inline slot).
             # head_dim_qk/head_dim_vo must be multiples of 16 and may differ (asymmetric
             # QK/VO plans).
-            assert head_dim_qk % 16 == 0, (
-                "use_token_head_sf requires head_dim_qk to be a multiple of 16, "
-                f"got {head_dim_qk}"
-            )
-            assert head_dim_vo % 16 == 0, (
-                "use_token_head_sf requires head_dim_vo to be a multiple of 16, "
-                f"got {head_dim_vo}"
-            )
-            # The token-head-scale path is only implemented for the fa2 backend.
-            if self._backend == "auto":
+            if head_dim_qk % 16 != 0:
+                raise ValueError(
+                    "use_token_head_sf requires head_dim_qk to be a multiple of 16, "
+                    f"got {head_dim_qk}"
+                )
+            if head_dim_vo % 16 != 0:
+                raise ValueError(
+                    "use_token_head_sf requires head_dim_vo to be a multiple of 16, "
+                    f"got {head_dim_vo}"
+                )
+            # The token-head-scale path is only implemented for the fa2 backend. Key off
+            # the originally requested backend, not self._backend (which a prior "auto"
+            # plan may have resolved to a non-fa2 backend).
+            if self._requested_backend == "auto":
                 self._backend = "fa2"
-            elif self._backend != "fa2":
+            elif self._requested_backend != "fa2":
                 raise ValueError(
                     "use_token_head_sf is only supported with backend='fa2', "
-                    f"got backend={self._backend!r}"
+                    f"got backend={self._requested_backend!r}"
                 )
         self._use_token_head_sf = use_token_head_sf
         if (
@@ -4691,36 +4709,43 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._head_dim_vo = head_dim_vo
 
         if use_token_head_sf:
-            assert kv_data_type in (torch.float8_e4m3fn, torch.float8_e5m2), (
-                "use_token_head_sf requires an fp8 (e4m3/e5m2) KV cache, got "
-                f"{kv_data_type}"
-            )
-            assert q_data_type in (torch.float16, torch.bfloat16), (
-                f"use_token_head_sf requires an fp16/bf16 query, got {q_data_type}"
-            )
-            if get_compute_capability(self.device)[0] < 8:
-                assert q_data_type == torch.float16, (
-                    "bf16 query is not supported with use_token_head_sf on this "
-                    "device (SM75 only supports fp16)"
+            if kv_data_type not in (torch.float8_e4m3fn, torch.float8_e5m2):
+                raise ValueError(
+                    "use_token_head_sf requires an fp8 (e4m3/e5m2) KV cache, got "
+                    f"{kv_data_type}"
                 )
+            if q_data_type not in (torch.float16, torch.bfloat16):
+                raise ValueError(
+                    f"use_token_head_sf requires an fp16/bf16 query, got {q_data_type}"
+                )
+            if get_compute_capability(self.device)[0] < 8:
+                if q_data_type != torch.float16:
+                    raise ValueError(
+                        "bf16 query is not supported with use_token_head_sf on this "
+                        "device (SM75 only supports fp16)"
+                    )
             # Standard KV layout: the cache last dim is head_dim (no inline slot).
             # head_dim_qk/head_dim_vo must be multiples of 16 and may differ (asymmetric
             # QK/VO plans).
-            assert head_dim_qk % 16 == 0, (
-                "use_token_head_sf requires head_dim_qk to be a multiple of 16, "
-                f"got {head_dim_qk}"
-            )
-            assert head_dim_vo % 16 == 0, (
-                "use_token_head_sf requires head_dim_vo to be a multiple of 16, "
-                f"got {head_dim_vo}"
-            )
-            # The token-head-scale path is only implemented for the fa2 backend.
-            if self._backend == "auto":
+            if head_dim_qk % 16 != 0:
+                raise ValueError(
+                    "use_token_head_sf requires head_dim_qk to be a multiple of 16, "
+                    f"got {head_dim_qk}"
+                )
+            if head_dim_vo % 16 != 0:
+                raise ValueError(
+                    "use_token_head_sf requires head_dim_vo to be a multiple of 16, "
+                    f"got {head_dim_vo}"
+                )
+            # The token-head-scale path is only implemented for the fa2 backend. Key off
+            # the originally requested backend, not self._backend (which a prior "auto"
+            # plan may have resolved to a non-fa2 backend).
+            if self._requested_backend == "auto":
                 self._backend = "fa2"
-            elif self._backend != "fa2":
+            elif self._requested_backend != "fa2":
                 raise ValueError(
                     "use_token_head_sf is only supported with backend='fa2', "
-                    f"got backend={self._backend!r}"
+                    f"got backend={self._requested_backend!r}"
                 )
         self._use_token_head_sf = use_token_head_sf
         if (

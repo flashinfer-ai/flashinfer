@@ -220,7 +220,10 @@ def _paged_kv(
 @pytest.mark.parametrize("q_dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("gqa", [False, True])
 @pytest.mark.parametrize("causal", [False, True])
-def test_single_prefill_token_head_scale(head_dim, dtype, q_dtype, gqa, causal):
+@pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
+def test_single_prefill_token_head_scale(
+    head_dim, dtype, q_dtype, gqa, causal, kv_layout
+):
     _skip_bf16_on_sm75(q_dtype)
     torch.manual_seed(42)
     dev = "cuda:0"
@@ -230,19 +233,41 @@ def test_single_prefill_token_head_scale(head_dim, dtype, q_dtype, gqa, causal):
 
     q = torch.randn(qo_len, num_qo_heads, head_dim, dtype=q_dtype).to(dev)
     # K/V reference in q_dtype: the 16-bit FA2 kernel requires DTypeQ == DTypeKV.
-    k_ref = 0.05 * torch.randn(kv_len, num_kv_heads, head_dim, dtype=q_dtype).to(dev)
-    v_ref = 0.05 * torch.randn(kv_len, num_kv_heads, head_dim, dtype=q_dtype).to(dev)
+    # NHD: [kv_len, num_kv_heads, head_dim]; HND: [num_kv_heads, kv_len, head_dim].
+    # quantize_token_head is layout-agnostic (it reduces over the last dim), so the
+    # scale shape follows the KV layout: NHD [kv_len, num_kv_heads] / HND
+    # [num_kv_heads, kv_len].
+    if kv_layout == "NHD":
+        k_ref = 0.05 * torch.randn(kv_len, num_kv_heads, head_dim, dtype=q_dtype).to(
+            dev
+        )
+        v_ref = 0.05 * torch.randn(kv_len, num_kv_heads, head_dim, dtype=q_dtype).to(
+            dev
+        )
+    else:  # HND
+        k_ref = 0.05 * torch.randn(num_kv_heads, kv_len, head_dim, dtype=q_dtype).to(
+            dev
+        )
+        v_ref = 0.05 * torch.randn(num_kv_heads, kv_len, head_dim, dtype=q_dtype).to(
+            dev
+        )
     k_fp8, k_sf, k_deq = quantize_token_head(k_ref, dtype, head_dim)
     v_fp8, v_sf, v_deq = quantize_token_head(v_ref, dtype, head_dim)
 
     o_orig = flashinfer.single_prefill_with_kv_cache(
-        q, k_ref, v_ref, causal=causal, backend="fa2"
+        q, k_ref, v_ref, causal=causal, backend="fa2", kv_layout=kv_layout
     )
     o_ref = flashinfer.single_prefill_with_kv_cache(
-        q, k_deq, v_deq, causal=causal, backend="fa2"
+        q, k_deq, v_deq, causal=causal, backend="fa2", kv_layout=kv_layout
     )
     o_fp8 = flashinfer.single_prefill_with_kv_cache(
-        q, k_fp8, v_fp8, causal=causal, backend="fa2", kv_cache_sf=(k_sf, v_sf)
+        q,
+        k_fp8,
+        v_fp8,
+        causal=causal,
+        backend="fa2",
+        kv_layout=kv_layout,
+        kv_cache_sf=(k_sf, v_sf),
     )
 
     assert o_fp8.shape == (qo_len, num_qo_heads, head_dim), o_fp8.shape
@@ -257,7 +282,10 @@ def test_single_prefill_token_head_scale(head_dim, dtype, q_dtype, gqa, causal):
 @pytest.mark.parametrize("q_dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("gqa", [False, True])
 @pytest.mark.parametrize("causal", [False, True])
-def test_batch_prefill_ragged_token_head_scale(head_dim, dtype, q_dtype, gqa, causal):
+@pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
+def test_batch_prefill_ragged_token_head_scale(
+    head_dim, dtype, q_dtype, gqa, causal, kv_layout
+):
     _skip_bf16_on_sm75(q_dtype)
     torch.manual_seed(42)
     dev = "cuda:0"
@@ -271,13 +299,31 @@ def test_batch_prefill_ragged_token_head_scale(head_dim, dtype, q_dtype, gqa, ca
     total_kv = kv_indptr[-1].item()
 
     q = torch.randn(total_qo, num_qo_heads, head_dim, dtype=q_dtype).to(dev)
-    k_ref = 0.05 * torch.randn(total_kv, num_kv_heads, head_dim, dtype=q_dtype).to(dev)
-    v_ref = 0.05 * torch.randn(total_kv, num_kv_heads, head_dim, dtype=q_dtype).to(dev)
+    # NHD: [total_kv, num_kv_heads, head_dim]; HND: [num_kv_heads, total_kv, head_dim].
+    # quantize_token_head is layout-agnostic (reduces over the last dim), so the scale
+    # shape follows the KV layout: NHD [total_kv, num_kv_heads] / HND
+    # [num_kv_heads, total_kv].
+    if kv_layout == "NHD":
+        k_ref = 0.05 * torch.randn(total_kv, num_kv_heads, head_dim, dtype=q_dtype).to(
+            dev
+        )
+        v_ref = 0.05 * torch.randn(total_kv, num_kv_heads, head_dim, dtype=q_dtype).to(
+            dev
+        )
+    else:  # HND
+        k_ref = 0.05 * torch.randn(num_kv_heads, total_kv, head_dim, dtype=q_dtype).to(
+            dev
+        )
+        v_ref = 0.05 * torch.randn(num_kv_heads, total_kv, head_dim, dtype=q_dtype).to(
+            dev
+        )
     k_fp8, k_sf, k_deq = quantize_token_head(k_ref, dtype, head_dim)
     v_fp8, v_sf, v_deq = quantize_token_head(v_ref, dtype, head_dim)
 
     ws = torch.empty(_WS, dtype=torch.uint8, device=dev)
-    ref = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(ws, backend="fa2")
+    ref = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        ws, kv_layout=kv_layout, backend="fa2"
+    )
     ref.plan(
         qo_indptr,
         kv_indptr,
@@ -291,7 +337,9 @@ def test_batch_prefill_ragged_token_head_scale(head_dim, dtype, q_dtype, gqa, ca
     o_orig = ref.run(q, k_ref, v_ref)
     o_ref = ref.run(q, k_deq, v_deq)
 
-    fi = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(ws, backend="fa2")
+    fi = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        ws, kv_layout=kv_layout, backend="fa2"
+    )
     fi.plan(
         qo_indptr,
         kv_indptr,
@@ -398,7 +446,96 @@ def test_batch_prefill_paged_token_head_scale(
 
 
 # ---------------------------------------------------------------------------
-# 4. batch decode (paged)
+# 4. batch prefill (paged) -- VO-split path (HEAD_DIM_VO >= 512)
+#
+# Exercises vosplit_compute_pv, which (unlike compute_sfm_v) reads the P
+# fragment from p_smem and must apply the per-(token, head) V scale to it
+# before the PV MMA. HEAD_DIM_VO = 512 -> NUM_MMA_D_VO = 32 (> 16 and divisible
+# by NUM_WARPS_KV), so the kernel takes the VO-split path. The paged cache is a
+# single tensor, so head_dim_qk == head_dim_vo == 512.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+@pytest.mark.parametrize("q_dtype", [torch.float16, torch.bfloat16])
+def test_batch_prefill_paged_token_head_scale_vosplit(kv_layout, dtype, q_dtype):
+    _skip_bf16_on_sm75(q_dtype)
+    torch.manual_seed(42)
+    dev = "cuda:0"
+    head_dim = 512
+    batch_size, qo_len, kv_len = 1, 16, 32
+    num_qo_heads = num_kv_heads = 4
+    page_size = 16
+
+    qo_indptr = torch.arange(0, batch_size + 1, dtype=torch.int32).to(dev) * qo_len
+    total_qo = qo_indptr[-1].item()
+
+    (
+        paged_kv_indptr,
+        paged_kv_indices,
+        paged_kv_last_page_len,
+        paged_kv_cache,
+        k_deq_cache,
+        k_orig_cache,
+        kv_sf,
+    ) = _paged_kv(
+        batch_size,
+        kv_len,
+        page_size,
+        num_kv_heads,
+        head_dim,
+        q_dtype,
+        dtype,
+        dev,
+        kv_layout,
+    )
+
+    q = torch.randn(total_qo, num_qo_heads, head_dim, dtype=q_dtype).to(dev)
+
+    ws = torch.empty(_WS, dtype=torch.uint8, device=dev)
+    ref = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        ws, kv_layout=kv_layout, backend="fa2"
+    )
+    ref.plan(
+        qo_indptr,
+        paged_kv_indptr,
+        paged_kv_indices,
+        paged_kv_last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        causal=False,
+        q_data_type=q_dtype,
+        kv_data_type=q_dtype,
+    )
+    o_orig = ref.run(q, k_orig_cache)
+    o_ref = ref.run(q, k_deq_cache)
+
+    fi = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        ws, kv_layout=kv_layout, backend="fa2"
+    )
+    fi.plan(
+        qo_indptr,
+        paged_kv_indptr,
+        paged_kv_indices,
+        paged_kv_last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        causal=False,
+        q_data_type=q_dtype,
+        kv_data_type=dtype,
+        use_token_head_sf=True,
+    )
+    o_fp8 = fi.run(q, paged_kv_cache, kv_cache_sf=kv_sf)
+
+    assert o_fp8.shape == (total_qo, num_qo_heads, head_dim), o_fp8.shape
+    _check(o_fp8, o_ref, o_orig, "batch_prefill_paged_vosplit")
+
+
+# ---------------------------------------------------------------------------
+# 5. batch decode (paged)
 #
 # plan(use_token_head_sf=True) forces the tensor-core (fa2 paged-prefill)
 # path, the same path exercised by test_batch_prefill_paged_token_head_scale.
