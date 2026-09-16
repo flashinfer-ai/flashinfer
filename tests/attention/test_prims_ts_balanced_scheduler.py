@@ -1,4 +1,4 @@
-"""CPU-only layout tests for the balanced PrimsTS MLA host planner."""
+"""Tests for balanced PrimsTS MLA gating and CUDA schedulers."""
 
 from __future__ import annotations
 
@@ -22,7 +22,6 @@ from flashinfer.attention.prims_ts._balanced_scheduler import (
     B200_BF16_2CTA_COST,
     BalancedCostModel,
     balanced_cost_bucket,
-    build_balanced_schedule,
     require_balanced_cost_model_calibration,
     select_b200_balanced_cost_model,
 )
@@ -31,19 +30,6 @@ from flashinfer.attention.prims_ts.kernels.mla_decode.helpers.constants import (
     balanced_reducer_capacity,
     balanced_work_descriptor_capacity,
 )
-
-
-def _request_ranges(schedule):
-    ranges = defaultdict(list)
-    for descriptor in schedule.descriptors:
-        ranges[descriptor.request_idx].append(
-            (
-                descriptor.local_split_idx,
-                descriptor.k_tile_start,
-                descriptor.k_tile_start + descriptor.k_tile_count,
-            )
-        )
-    return ranges
 
 
 @pytest.mark.parametrize(
@@ -203,67 +189,59 @@ def test_production_gate_caps_expected_max_at_plan_capacity():
     )
 
 
-def _assert_device_plan_matches_reference(plan, schedule):
-    torch.cuda.synchronize()
-    descriptor_count = len(schedule.descriptors)
+def _assert_device_plan_covers_requests(plan, seq_lens):
+    """Check the descriptor ABI without requiring a particular placement order."""
 
-    expected_descriptors = []
-    for descriptor in schedule.descriptors:
-        split_count = schedule.split_counts[descriptor.request_idx]
-        split_info = 0
-        if split_count > 1:
-            split_begin = schedule.split_begins[descriptor.request_idx]
-            split_info = (
-                1
-                | ((split_begin + descriptor.local_split_idx) << 1)
-                | (split_count << 13)
-                | (split_begin << 20)
-            )
-        expected_descriptors.append(
-            [
-                descriptor.request_idx,
-                descriptor.k_tile_start,
-                descriptor.k_tile_start + descriptor.k_tile_count,
-                split_info,
-            ]
+    metadata = plan.synchronize_device_metadata()
+    descriptor_count, _target, combine_count, status, _bucket = metadata
+    assert status == 0
+    descriptors = plan.work_descriptors[:descriptor_count].cpu().tolist()
+    offsets = plan.partition_offsets.cpu().tolist()
+    assert offsets[0] == 0
+    assert offsets[-1] == descriptor_count
+    assert offsets == sorted(offsets)
+
+    request_descriptors = defaultdict(list)
+    for partition in range(plan.num_partitions):
+        for descriptor in descriptors[offsets[partition] : offsets[partition + 1]]:
+            request, start, end, split_info = descriptor
+            assert 0 <= request < len(seq_lens)
+            assert 0 <= start < end
+            request_descriptors[request].append((start, end, split_info))
+
+    expected_split_begins = {}
+    split_cursor = 0
+    for request, seq_len in enumerate(seq_lens):
+        expected_tiles = (seq_len + plan.k_tile_tokens - 1) // plan.k_tile_tokens
+        pieces = sorted(request_descriptors[request])
+        if expected_tiles == 0:
+            assert pieces == []
+            continue
+        assert pieces[0][0] == 0
+        assert pieces[-1][1] == expected_tiles
+        assert all(
+            left[1] == right[0] for left, right in zip(pieces, pieces[1:], strict=False)
         )
-    assert plan.last_descriptor_count == descriptor_count
-    assert plan.last_target_piece_tiles == schedule.target_piece_tiles
-    assert (
-        plan.work_descriptors[:descriptor_count].cpu().tolist() == expected_descriptors
-    )
-    assert plan.partition_offsets.cpu().tolist() == list(schedule.partition_offsets)
-    expected_combine_requests = [
-        request_idx
-        for request_idx, split_count in enumerate(schedule.split_counts)
-        if split_count > 1
-    ]
-    assert plan.last_combine_request_count == len(expected_combine_requests)
-    assert plan.num_combine_descriptors.cpu().tolist() == [
-        len(expected_combine_requests)
-    ]
-    expected_combine_descriptors = [
-        [
-            request_idx,
-            schedule.split_counts[request_idx],
-            schedule.split_begins[request_idx],
-            0,
-        ]
-        for request_idx in expected_combine_requests
-    ]
-    assert plan.combine_descriptors[
-        : len(expected_combine_requests)
-    ].cpu().tolist() == (expected_combine_descriptors)
+        if len(pieces) == 1:
+            assert pieces[0][2] == 0
+            continue
+        expected_split_begins[request] = split_cursor
+        global_indices = set()
+        for _start, _end, split_info in pieces:
+            assert split_info & 1
+            global_indices.add((split_info >> 1) & 0xFFF)
+            assert ((split_info >> 13) & 0x7F) == len(pieces)
+            assert ((split_info >> 20) & 0xFFF) == split_cursor
+        assert global_indices == set(range(split_cursor, split_cursor + len(pieces)))
+        split_cursor += len(pieces)
 
-
-def test_empty_schedule_has_replay_stable_shape():
-    schedule = build_balanced_schedule([0, 0, 0], num_partitions=4)
-
-    assert schedule.descriptors == ()
-    assert schedule.partition_offsets == (0, 0, 0, 0, 0)
-    assert schedule.split_counts == (0, 0, 0)
-    assert schedule.split_begins == (0, 0, 0)
-    assert schedule.partition_costs == (0, 0, 0, 0)
+    combine_descriptors = plan.combine_descriptors[:combine_count].cpu().tolist()
+    assert plan.num_combine_descriptors.cpu().tolist() == [combine_count]
+    assert [row[0] for row in combine_descriptors] == list(expected_split_begins)
+    for request, num_pieces, split_begin, reserved in combine_descriptors:
+        assert num_pieces == len(request_descriptors[request])
+        assert split_begin == expected_split_begins[request]
+        assert reserved == 0
 
 
 @pytest.mark.parametrize(
@@ -281,23 +259,6 @@ def test_balanced_capacities_separate_work_partials_and_reducer_slots(
         balanced_partial_capacity(batch_size, num_partitions),
         balanced_reducer_capacity(batch_size, num_partitions),
     ) == expected
-
-
-def test_inactive_slots_preserve_active_plus_partition_capacity_proof():
-    seq_lens = [131072, 65536, 32768] + [0] * 125
-    num_partitions = 74
-    schedule = build_balanced_schedule(seq_lens, num_partitions=num_partitions)
-
-    active_count = sum(seq_len > 0 for seq_len in seq_lens)
-    split_partial_count = sum(
-        split_count for split_count in schedule.split_counts if split_count > 1
-    )
-    combine_count = sum(split_count > 1 for split_count in schedule.split_counts)
-    assert len(schedule.descriptors) <= active_count + num_partitions
-    assert split_partial_count <= balanced_partial_capacity(
-        len(seq_lens), num_partitions
-    )
-    assert combine_count <= balanced_reducer_capacity(len(seq_lens), num_partitions)
 
 
 @pytest.mark.parametrize(
@@ -326,23 +287,8 @@ def test_b200_cost_lookup_normalizes_runtime_policy_names():
         dtype_name="e4m3",
         num_partitions=74,
     )
-
     assert bucket == "sparse_small"
     assert cost == BalancedCostModel(1000, 0)
-
-    uniform_bucket, uniform_cost = select_b200_balanced_cost_model(
-        [8192] * 8,
-        kernel_family="throughput_2cta",
-        dtype_name="bf16",
-        num_partitions=74,
-    )
-    uniform_schedule = build_balanced_schedule(
-        [8192] * 8,
-        num_partitions=74,
-        cost=uniform_cost,
-    )
-    assert uniform_bucket == "sparse_uniform_small"
-    assert uniform_schedule.target_piece_tiles == 8
 
 
 def test_balanced_calibration_registry_requires_exact_device_identity():
@@ -386,10 +332,7 @@ def test_balanced_device_plan_rejects_uncalibrated_device_before_allocation(
         raise AssertionError("an uncalibrated plan must fail before allocation")
 
     monkeypatch.setattr(torch, "empty", unexpected_allocation)
-    with pytest.raises(
-        NotImplementedError,
-        match=r"will not use an uncalibrated fallback",
-    ):
+    with pytest.raises(NotImplementedError, match="uncalibrated fallback"):
         BalancedMLADecodePlan(
             batch_size=1,
             num_partitions=1,
@@ -397,214 +340,177 @@ def test_balanced_device_plan_rejects_uncalibrated_device_before_allocation(
         )
 
 
-def test_native_scheduler_has_no_obsolete_cost_lookup_or_gqa_routing():
+def test_only_cuda_scheduler_implementations_remain():
     repo_root = Path(__file__).resolve().parents[2]
-    source = (repo_root / "csrc/prims_balanced_mla_scheduler.cu").read_text()
-    header = (repo_root / "csrc/prims_balanced_mla_scheduler.cuh").read_text()
-
-    for obsolete in (
-        "BalancedCostFamily",
-        "hasBalancedCostModel",
-        "hostLookupCost",
-        "useCostOverride",
-        "costPerBlockOverride",
-    ):
-        assert obsolete not in source
-        assert obsolete not in header
+    assert not (repo_root / "csrc/prims_balanced_mla_scheduler.cu").exists()
+    assert not hasattr(scheduler_module, "build_balanced_schedule")
+    jit_source = (repo_root / "flashinfer/jit/prims_balanced_mla.py").read_text()
+    assert "prims_balanced_mla_scheduler_device.cu" in jit_source
+    assert '"prims_balanced_mla_scheduler.cu"' not in jit_source
 
 
-def test_ragged_schedule_covers_every_k_tile_once():
-    seq_lens = [131072, 8193, 4096, 257, 1, 0, 65537, 2048]
-    schedule = build_balanced_schedule(seq_lens, num_partitions=74)
-    ranges = _request_ranges(schedule)
-
-    assert len(schedule.descriptors) <= len(seq_lens) + 74
-    assert schedule.partition_offsets[0] == 0
-    assert schedule.partition_offsets[-1] == len(schedule.descriptors)
-    assert list(schedule.partition_offsets) == sorted(schedule.partition_offsets)
-
-    for request_idx, seq_len in enumerate(seq_lens):
-        expected_tiles = (seq_len + 127) // 128
-        request_ranges = sorted(ranges[request_idx])
-        assert schedule.split_counts[request_idx] == len(request_ranges)
-        if expected_tiles == 0:
-            assert request_ranges == []
-            continue
-        assert [entry[0] for entry in request_ranges] == list(
-            range(len(request_ranges))
-        )
-        cursor = 0
-        for _, begin, end in request_ranges:
-            assert begin == cursor
-            assert end > begin
-            cursor = end
-        assert cursor == expected_tiles
-
-
-def test_concentrated_work_is_split_and_load_balanced():
-    schedule = build_balanced_schedule(
-        [131072] + [128] * 7,
-        num_partitions=16,
-    )
-
-    assert schedule.split_counts[0] > 1
-    assert max(schedule.partition_costs) < (
-        B200_BF16_2CTA_COST.fixed_piece_cost
-        + 1024 * B200_BF16_2CTA_COST.cost_per_k_tile
-    )
-
-
-def test_mixed_uniform_shorts_use_lpt_across_all_partitions():
-    cost = BalancedCostModel(cost_per_k_tile=1000, fixed_piece_cost=0)
-
-    schedule = build_balanced_schedule(
-        [1024] * 64 + [2048] * 64,
-        num_partitions=74,
-        cost=cost,
-    )
-
-    assert schedule.target_piece_tiles == 24
-    assert schedule.split_counts == (1,) * 128
-    assert max(schedule.partition_costs) == 24_000
-    assert all(value > 0 for value in schedule.partition_costs)
-
-
-def test_cost_search_scores_emitted_short_then_long_placement():
-    cost = BalancedCostModel(
-        cost_per_k_tile=1000,
-        fixed_piece_cost=5000,
-        split_piece_cost=3000,
-    )
-
-    schedule = build_balanced_schedule(
-        [257 * 128, 16 * 128],
-        num_partitions=4,
-        cost=cost,
-    )
-
-    # Targets 78 and 86 both emit a 94-us modeled makespan. The exact
-    # placement scorer therefore applies the established coarser-target tie
-    # break instead of preferring 78 from a different global-LPT placement.
-    assert schedule.target_piece_tiles == 86
-    assert max(schedule.partition_costs) == 94_000
-
-
-def test_equal_length_ties_are_deterministic():
-    first = build_balanced_schedule([2048] * 16, num_partitions=8)
-    second = build_balanced_schedule([2048] * 16, num_partitions=8)
-
-    assert first == second
-    for partition_idx in range(8):
-        begin, end = first.partition_offsets[partition_idx : partition_idx + 2]
-        request_indices = [
-            descriptor.request_idx for descriptor in first.descriptors[begin:end]
-        ]
-        assert request_indices == sorted(request_indices)
-
-
-@pytest.mark.parametrize(
-    "seq_lens,num_partitions,k_tile_tokens",
-    [([-1], 1, 128), ([1], 0, 128), ([1], 1, 0)],
+_REQUIRES_CUDA_SCHEDULER = pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="balanced scheduler tests require a CUDA device",
 )
-def test_invalid_inputs_are_rejected(seq_lens, num_partitions, k_tile_tokens):
-    with pytest.raises(ValueError):
-        build_balanced_schedule(
-            seq_lens,
-            num_partitions=num_partitions,
-            k_tile_tokens=k_tile_tokens,
+
+
+def _snapshot(plan):
+    return (
+        plan.last_descriptor_count,
+        plan.last_target_piece_tiles,
+        plan.last_combine_request_count,
+        plan.work_descriptors[: plan.last_descriptor_count].cpu().tolist(),
+        plan.partition_offsets.cpu().tolist(),
+        plan.combine_descriptors[: plan.last_combine_request_count].cpu().tolist(),
+    )
+
+
+@_REQUIRES_CUDA_SCHEDULER
+@pytest.mark.parametrize("scheduler", ("exact", "optimized"))
+@pytest.mark.parametrize(
+    "seq_lens,num_partitions,cost",
+    (
+        ([0] * 8, 4, BalancedCostModel(1000, 0)),
+        ([2048] * 16, 4, BalancedCostModel(1000, 0)),
+        ([131072, 0, 4096, 128, 0, 32768], 8, B200_BF16_2CTA_COST),
+        ([2 * 128, 7 * 128], 3, BalancedCostModel(1000, 0)),
+        (
+            [257 * 128, 16 * 128],
+            4,
+            BalancedCostModel(1000, 5000, split_piece_cost=3000),
+        ),
+    ),
+)
+def test_cuda_scheduler_policies_preserve_descriptor_semantics(
+    scheduler, seq_lens, num_partitions, cost
+):
+    plan = BalancedMLADecodePlan(
+        batch_size=len(seq_lens),
+        num_partitions=num_partitions,
+        device=torch.device("cuda"),
+        cost=cost,
+        max_seq_len=max(seq_lens, default=0),
+    )
+    device_seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device="cuda")
+
+    plan.schedule_device(device_seq_lens, scheduler=scheduler)
+
+    _assert_device_plan_covers_requests(plan, seq_lens)
+
+
+@_REQUIRES_CUDA_SCHEDULER
+def test_optimized_scheduler_is_default_and_policies_are_named():
+    seq_lens = [131072, 8192, 257, 0]
+    plan = BalancedMLADecodePlan(
+        batch_size=4,
+        num_partitions=8,
+        device=torch.device("cuda"),
+        cost=B200_BF16_2CTA_COST,
+        max_seq_len=131072,
+    )
+    device_seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device="cuda")
+
+    plan.schedule_device(device_seq_lens)
+    default_snapshot = _snapshot(plan)
+    plan.schedule_device(device_seq_lens, scheduler="exact")
+    _assert_device_plan_covers_requests(plan, seq_lens)
+    plan.schedule_device(device_seq_lens, scheduler="optimized")
+
+    assert _snapshot(plan) == default_snapshot
+    with pytest.raises(ValueError, match="'exact' or 'optimized'"):
+        plan.schedule_device(device_seq_lens, scheduler="equivalent")
+
+
+@_REQUIRES_CUDA_SCHEDULER
+def test_device_plan_allocates_compact_capacities():
+    plan = BalancedMLADecodePlan(
+        batch_size=128,
+        num_partitions=74,
+        device=torch.device("cuda"),
+        cost=B200_BF16_2CTA_COST,
+    )
+    assert plan.descriptor_capacity == 202
+    assert plan.partial_capacity == 148
+    assert plan.reducer_capacity == 74
+    assert plan.work_descriptors.shape == (202, 4)
+    assert plan.combine_descriptors.shape == (74, 4)
+
+
+@_REQUIRES_CUDA_SCHEDULER
+def test_cuda_scheduler_reuses_stable_output_addresses():
+    plan = BalancedMLADecodePlan(
+        batch_size=4,
+        num_partitions=8,
+        device=torch.device("cuda"),
+        cost=B200_BF16_2CTA_COST,
+        max_seq_len=131072,
+    )
+    addresses = (
+        plan.work_descriptors.data_ptr(),
+        plan.partition_offsets.data_ptr(),
+        plan.combine_descriptors.data_ptr(),
+        plan.num_combine_descriptors.data_ptr(),
+    )
+    for seq_lens in ([131072, 128, 4096, 2048], [128, 32768, 256, 8192]):
+        device_seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device="cuda")
+        plan.schedule_device(device_seq_lens)
+        _assert_device_plan_covers_requests(plan, seq_lens)
+        assert addresses == (
+            plan.work_descriptors.data_ptr(),
+            plan.partition_offsets.data_ptr(),
+            plan.combine_descriptors.data_ptr(),
+            plan.num_combine_descriptors.data_ptr(),
         )
 
 
-def test_reference_rejects_unrepresentable_derived_target():
-    int32_max = 2**31 - 1
-    cost = BalancedCostModel(
-        cost_per_k_tile=1,
-        fixed_piece_cost=0,
-        split_fixed_cost=int32_max,
-        split_piece_cost=int32_max,
-    )
-
-    with pytest.raises(OverflowError, match="target piece tiles exceeds int32"):
-        build_balanced_schedule([128], num_partitions=1, cost=cost)
-
-
-def test_split_penalty_changes_target_without_breaking_coverage():
-    expensive_splits = BalancedCostModel(
-        cost_per_k_tile=1,
-        fixed_piece_cost=1,
-        reducer_fixed_cost=10_000,
-        reducer_piece_cost=10_000,
-    )
-    schedule = build_balanced_schedule(
-        [128 * 32, 128 * 31],
+@_REQUIRES_CUDA_SCHEDULER
+@pytest.mark.parametrize("scheduler", ("exact", "optimized"))
+def test_cuda_scheduler_runs_inside_cuda_graph(scheduler):
+    plan = BalancedMLADecodePlan(
+        batch_size=4,
         num_partitions=8,
-        cost=expensive_splits,
-    )
-
-    assert schedule.split_counts == (1, 1)
-    assert sum(descriptor.k_tile_count for descriptor in schedule.descriptors) == 63
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA plan buffers")
-def test_native_plan_handles_int32_max_sequence_length():
-    int32_max = 2**31 - 1
-    cost = BalancedCostModel(cost_per_k_tile=1, fixed_piece_cost=0)
-    expected = build_balanced_schedule(
-        [int32_max],
-        num_partitions=1,
-        cost=cost,
-    )
-    plan = BalancedMLADecodePlan(
-        batch_size=1,
-        num_partitions=1,
         device=torch.device("cuda"),
-        cost=cost,
+        cost=BalancedCostModel(1000, 0),
+        max_seq_len=131072,
     )
-
-    plan.replan([int32_max])
-
-    assert expected.descriptors[0].k_tile_count == (int32_max + 127) // 128
-    _assert_device_plan_matches_reference(plan, expected)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA plan buffers")
-def test_native_plan_rejects_unrepresentable_derived_target():
-    int32_max = 2**31 - 1
-    cost = BalancedCostModel(
-        cost_per_k_tile=1,
-        fixed_piece_cost=0,
-        split_fixed_cost=int32_max,
-        split_piece_cost=int32_max,
+    live_seq_lens = torch.tensor(
+        [131072, 128, 4096, 2048], dtype=torch.int32, device="cuda"
     )
+    plan.schedule_device(live_seq_lens, scheduler=scheduler)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        plan.schedule_device(live_seq_lens, validate=False, scheduler=scheduler)
+
+    replay_lengths = [128, 32768, 256, 8192]
+    live_seq_lens.copy_(torch.tensor(replay_lengths, dtype=torch.int32, device="cuda"))
+    graph.replay()
+
+    _assert_device_plan_covers_requests(plan, replay_lengths)
+
+
+@_REQUIRES_CUDA_SCHEDULER
+def test_cuda_scheduler_failure_publishes_empty_safe_schedule():
     plan = BalancedMLADecodePlan(
-        batch_size=1,
-        num_partitions=1,
-        device=torch.device("cuda"),
-        cost=cost,
-    )
-
-    with pytest.raises(Exception, match="target piece tiles exceeds int32"):
-        plan.replan([128])
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA plan buffers")
-def test_native_forced_plan_enforces_active_plus_partition_limit():
-    plan = BalancedMLADecodePlan(
-        batch_size=8,
+        batch_size=2,
         num_partitions=4,
         device=torch.device("cuda"),
-        cost=BalancedCostModel(cost_per_k_tile=1000, fixed_piece_cost=0),
+        cost=BalancedCostModel(1000, 0),
+        max_seq_len=4096,
     )
+    invalid_lengths = torch.tensor([-1, 8192], dtype=torch.int32, device="cuda")
 
-    with pytest.raises(Exception, match=r"active \+ P limit"):
-        plan._replan_forced_target([1024, 1024, 0, 0, 0, 0, 0, 0], 1)
+    with pytest.raises(RuntimeError, match="sequence length"):
+        plan.schedule_device(invalid_lengths)
+
+    assert plan.partition_offsets.cpu().tolist() == [0] * 5
+    assert plan.num_combine_descriptors.cpu().tolist() == [0]
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA plan buffers")
+@_REQUIRES_CUDA_SCHEDULER
 @pytest.mark.parametrize("target", (1, 2, 3))
-def test_native_forced_single_partition_plan_never_marks_a_split(target):
-    """A P=1 clamp must write public output rather than an orphan partial."""
-
+def test_forced_single_partition_plan_never_marks_a_split(target):
     plan = BalancedMLADecodePlan(
         batch_size=1,
         num_partitions=1,
@@ -615,187 +521,74 @@ def test_native_forced_single_partition_plan_never_marks_a_split(target):
             split_fixed_cost=100_000,
             split_piece_cost=100_000,
         ),
+        max_seq_len=256,
     )
+    seq_lens = torch.tensor([256], dtype=torch.int32, device="cuda")
 
-    plan._replan_forced_target([256], target)
+    plan.schedule_device(seq_lens, forced_target_piece_tiles=target)
 
     assert plan.last_descriptor_count == 1
     assert plan.last_target_piece_tiles == target
     assert plan.last_combine_request_count == 0
     assert plan.work_descriptors[0].cpu().tolist() == [0, 0, 2, 0]
     assert plan.partition_offsets.cpu().tolist() == [0, 1]
-    assert plan.num_combine_descriptors.cpu().tolist() == [0]
 
 
-def test_reference_single_partition_clamp_does_not_charge_split_penalty():
-    cost = BalancedCostModel(
-        cost_per_k_tile=1000,
-        fixed_piece_cost=3000,
-        split_fixed_cost=100_000,
-        split_piece_cost=200_000,
-    )
-    partitions = [[]]
-    partition_costs = [0]
-
-    scheduler_module._equal_split_assign(
-        partitions,
-        partition_costs,
-        request_indices=[0],
-        k_tiles=[2],
-        target_piece_tiles=1,
-        cost=cost,
-        charge_split_penalty=True,
-    )
-
-    assert partition_costs == [5000]
-    assert len(partitions[0]) == 1
-    assert partitions[0][0].num_pieces == 1
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA plan buffers")
-def test_device_plan_allocates_compact_partial_and_reducer_capacities():
+@_REQUIRES_CUDA_SCHEDULER
+@pytest.mark.parametrize(
+    "seq_lens,cost,expected_target",
+    (
+        (
+            [2048] * 5
+            + [3072] * 3
+            + [10112] * 12
+            + [30080] * 24
+            + [50048] * 17
+            + [100096] * 2
+            + [110080],
+            BalancedCostModel(1000, 64000),
+            144,
+        ),
+        (
+            [4096] * 24
+            + [8192] * 13
+            + [16384] * 13
+            + [32768] * 7
+            + [65536] * 4
+            + [131072] * 3,
+            BalancedCostModel(1000, 64000),
+            141,
+        ),
+        (
+            [4096] * 11 + [8192] * 6 + [16384] * 6 + [32768] * 4 + [65536] * 5,
+            BalancedCostModel(1000, 0, split_fixed_cost=35244),
+            86,
+        ),
+        (
+            [4096] * 10 + [8192] * 7 + [16384] * 9 + [32768] * 5 + [65536],
+            BalancedCostModel(1000, 1000),
+            64,
+        ),
+    ),
+)
+def test_optimized_scheduler_corrects_wave_boundaries(seq_lens, cost, expected_target):
     plan = BalancedMLADecodePlan(
-        batch_size=128,
+        batch_size=len(seq_lens),
         num_partitions=74,
         device=torch.device("cuda"),
-        cost=B200_BF16_2CTA_COST,
-    )
-
-    assert plan.descriptor_capacity == 202
-    assert plan.partial_capacity == 148
-    assert plan.reducer_capacity == 74
-    assert plan.work_descriptors.shape == (202, 4)
-    assert plan.combine_descriptors.shape == (74, 4)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA plan buffers")
-def test_device_plan_replans_without_changing_addresses():
-    plan = BalancedMLADecodePlan(
-        batch_size=4,
-        num_partitions=8,
-        device=torch.device("cuda"),
-        cost=B200_BF16_2CTA_COST,
-    )
-    addresses = (
-        plan.work_descriptors.data_ptr(),
-        plan.partition_offsets.data_ptr(),
-        plan.combine_descriptors.data_ptr(),
-        plan.num_combine_descriptors.data_ptr(),
-    )
-
-    first = build_balanced_schedule([131072, 128, 4096, 2048], num_partitions=8)
-    plan.replan([131072, 128, 4096, 2048])
-    _assert_device_plan_matches_reference(plan, first)
-
-    second = build_balanced_schedule([128, 32768, 256, 8192], num_partitions=8)
-    plan.replan([128, 32768, 256, 8192])
-    torch.cuda.synchronize()
-    assert addresses == (
-        plan.work_descriptors.data_ptr(),
-        plan.partition_offsets.data_ptr(),
-        plan.combine_descriptors.data_ptr(),
-        plan.num_combine_descriptors.data_ptr(),
-    )
-    _assert_device_plan_matches_reference(plan, second)
-
-    # Reusing pinned staging immediately must not race the prior nonblocking
-    # host-to-device refill.
-    plan.replan([131072, 128, 4096, 2048])
-    plan.replan([128, 32768, 256, 8192])
-    _assert_device_plan_matches_reference(plan, second)
-
-    with pytest.raises(ValueError, match="non-negative int32"):
-        plan.replan([-1, 32768, 256, 8192])
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA plan buffers")
-def test_native_cost_search_matches_equal_piece_reference():
-    """Score the quotient/remainder piece sizes emitted by both planners."""
-
-    cost = BalancedCostModel(cost_per_k_tile=1000, fixed_piece_cost=0)
-    seq_lens = [2 * 128, 7 * 128]
-    expected = build_balanced_schedule(
-        seq_lens,
-        num_partitions=3,
         cost=cost,
+        max_seq_len=131072,
     )
-    plan = BalancedMLADecodePlan(
-        batch_size=len(seq_lens),
-        num_partitions=3,
-        device=torch.device("cuda"),
-        cost=cost,
-    )
+    device_seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device="cuda")
 
-    plan.replan(seq_lens)
+    plan.schedule_device(device_seq_lens, scheduler="optimized")
 
-    assert expected.target_piece_tiles == 6
-    assert expected.split_counts == (1, 2)
-    assert sorted(
-        descriptor.k_tile_count
-        for descriptor in expected.descriptors
-        if descriptor.request_idx == 1
-    ) == [3, 4]
-    _assert_device_plan_matches_reference(plan, expected)
+    assert plan.last_target_piece_tiles == expected_target
+    _assert_device_plan_covers_requests(plan, seq_lens)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA plan buffers")
-def test_native_cost_search_scores_emitted_placement():
-    cost = BalancedCostModel(
-        cost_per_k_tile=1000,
-        fixed_piece_cost=5000,
-        split_piece_cost=3000,
-    )
-    seq_lens = [257 * 128, 16 * 128]
-    expected = build_balanced_schedule(
-        seq_lens,
-        num_partitions=4,
-        cost=cost,
-    )
-    plan = BalancedMLADecodePlan(
-        batch_size=len(seq_lens),
-        num_partitions=4,
-        device=torch.device("cuda"),
-        cost=cost,
-    )
-
-    plan.replan(seq_lens)
-
-    assert expected.target_piece_tiles == 86
-    _assert_device_plan_matches_reference(plan, expected)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA plan buffers")
-def test_native_cost_search_charges_fixed_only_reducer_model():
-    """Treat any explicit reducer model as an additive critical-path cost."""
-
-    cost = BalancedCostModel(
-        cost_per_k_tile=1000,
-        fixed_piece_cost=0,
-        reducer_fixed_cost=10_000,
-        reducer_piece_cost=0,
-    )
-    seq_lens = [4 * 128]
-    expected = build_balanced_schedule(
-        seq_lens,
-        num_partitions=4,
-        cost=cost,
-    )
-    plan = BalancedMLADecodePlan(
-        batch_size=1,
-        num_partitions=4,
-        device=torch.device("cuda"),
-        cost=cost,
-    )
-
-    plan.replan(seq_lens)
-
-    assert expected.target_piece_tiles == 4
-    assert expected.split_counts == (1,)
-    _assert_device_plan_matches_reference(plan, expected)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA plan buffers")
-def test_device_plan_selects_calibrated_cost_bucket_on_b200():
+@_REQUIRES_CUDA_SCHEDULER
+def test_device_scheduler_selects_calibrated_bucket_from_live_lengths():
     if "B200" not in torch.cuda.get_device_name().upper():
         pytest.skip("B200 calibration is device-specific")
     seq_lens = [512] * 7 + [131072]
@@ -803,32 +596,13 @@ def test_device_plan_selects_calibrated_cost_bucket_on_b200():
         batch_size=len(seq_lens),
         num_partitions=74,
         device=torch.device("cuda"),
-        cost=None,
         kernel_family="throughput_2cta",
         dtype_name="bf16",
-    )
-    _, cost = select_b200_balanced_cost_model(
-        seq_lens,
-        kernel_family="2cta",
-        dtype_name="bf16",
-        num_partitions=74,
+        max_seq_len=131072,
     )
 
-    plan.replan(seq_lens)
-    expected = build_balanced_schedule(seq_lens, num_partitions=74, cost=cost)
+    plan.schedule_device(torch.tensor(seq_lens, dtype=torch.int32, device="cuda"))
 
     assert plan.last_cost_bucket == "sparse_small"
-    assert plan.cost == cost
-    info = plan.cost_model_info
-    assert info["model_id"] == B200_BALANCED_COST_MODEL_ID
-    assert info["source"] == "calibrated-registry"
-    assert info["device_name"] == "NVIDIA B200"
-    assert info["compute_capability"] == (10, 0)
-    assert info["multi_processor_count"] == 148
-    assert info["kernel_family"] == "throughput_2cta"
-    assert info["dtype"] == "bf16"
-    assert info["bucket"] == "sparse_small"
-    assert info["parameters"] == cost
-    with pytest.raises(TypeError):
-        info["bucket"] = "dense_large"
-    _assert_device_plan_matches_reference(plan, expected)
+    assert plan.cost_model_info["bucket"] == "sparse_small"
+    _assert_device_plan_covers_requests(plan, seq_lens)

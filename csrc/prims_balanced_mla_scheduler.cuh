@@ -18,6 +18,7 @@
 
 #include <cuda_runtime_api.h>
 
+#include <cstddef>
 #include <cstdint>
 
 namespace flashinfer {
@@ -50,33 +51,66 @@ struct alignas(16) BalancedCombineDescriptor {
 };
 static_assert(sizeof(BalancedCombineDescriptor) == 16);
 
-struct BalancedSchedParams {
+// Device scheduler metadata layout. Callers get asynchronous status and the selected calibrated
+// cost-model bucket in addition to descriptor counts and the selected target.
+enum class BalancedSchedMetadata : int32_t {
+  kDescriptorCount = 0,
+  kTargetPieceTiles = 1,
+  kCombineDescriptorCount = 2,
+  kStatus = 3,
+  kCostBucket = 4,
+  kCount = 5,
+};
+
+enum class BalancedSchedStatus : int32_t {
+  kSuccess = 0,
+  kInvalidSequenceLength = 1,
+  kTargetOverflow = 2,
+  kWorkDescriptorOverflow = 3,
+  kPartialOverflow = 4,
+  kCombineDescriptorOverflow = 5,
+  kSplitInfoOverflow = 6,
+};
+
+// Seven rows of six int32 coefficients. Rows correspond to the replay-time bucket classification
+// used by _balanced_scheduler.py; an explicit cost model may repeat one row seven times.
+static constexpr int32_t kBalancedDeviceCostBucketCount = 7;
+static constexpr int32_t kBalancedDeviceCostCoefficientCount = 6;
+
+// Fixed upper bound used by the Python plan for graph-stable device scratch. The implementation
+// deliberately exposes a simple formula rather than its internal layout so that the layout may be
+// changed without changing the public scheduler ABI.
+inline size_t getBalancedSchedDeviceWorkspaceSize(int32_t batchSize, int32_t numSmParts) {
+  return 80ULL * (static_cast<size_t>(batchSize) + static_cast<size_t>(numSmParts)) + 4096ULL;
+}
+
+struct BalancedSchedDeviceParams {
   int32_t batchSize;
   int32_t blockSizeN;
   int32_t numSmParts;
+  int32_t maxSeqLen;
   int32_t const* seqLensKvPtr;
-  bool seqLensOnHost = false;
-  int32_t workDescriptorCapacity = 0;
-  int32_t combineDescriptorCapacity = 0;
+  int32_t workDescriptorCapacity;
+  int32_t combineDescriptorCapacity;
   BalancedWorkDescriptor* workDescriptorPtr;
   int32_t* workDescriptorOffsetsPtr;
   BalancedCombineDescriptor* combineDescriptorPtr;
   int32_t* numCombineDescriptorsDevicePtr;
+  int32_t* planMetadataDevicePtr;
+  int32_t const* costModelTablePtr;
+  bool selectCostModelOnDevice;
+  bool useOptimizedSchedule;
+  void* workspacePtr;
+  size_t workspaceBytes;
   cudaStream_t stream;
-  int32_t costPerBlock = 0;
-  int32_t fixedPieceCost = 0;
-  int32_t splitFixedCost = 0;
-  int32_t splitPieceCost = 0;
-  int32_t combineFixedCost = 0;
-  int32_t combinePieceCost = 0;
-  // Positive only for offline calibration. Production planning leaves this
-  // zero and selects the target from the cost model.
   int32_t forcedTargetPieceTiles = 0;
-  int32_t* planMetadataHostPtr = nullptr;
 };
 
-void runBalancedSchedHost(BalancedSchedParams const& params, int32_t* numCombineDescDev,
-                          int32_t maxTotalSplits);
+// Launch a fixed, graph-capturable scheduling pipeline that reads live device sequence lengths and
+// publishes the compact descriptor ABI. The exact policy uses prepare/order/score/emit kernels;
+// the optimized policy uses a lower-overhead semantics-preserving placement. The pipeline never
+// synchronizes its stream.
+void runBalancedSchedDevice(BalancedSchedDeviceParams const& params);
 
 }  // namespace prims_ts
 }  // namespace flashinfer
