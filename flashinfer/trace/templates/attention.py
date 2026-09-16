@@ -913,9 +913,25 @@ def _fmha_q_schema(q_mode: str):
     )
 
 
+class _FmhaDecodeTraceTemplatePatch(TraceTemplate):
+    """Preserve unpacked decode names while distinguishing packed NVFP4."""
+
+    def definition_name(self, axis_values: dict[str, int]) -> str:
+        name = super().definition_name(axis_values)
+        head_dim = axis_values.get("head_dim")
+        storage_head_dim = axis_values.get("kv_storage_head_dim")
+        if (
+            head_dim is not None
+            and storage_head_dim is not None
+            and storage_head_dim * 2 == head_dim
+        ):
+            return f"{name}_nvfp4"
+        return name
+
+
 def _add_fmha_cache_schema(inputs, axes, *, cache_param: str, combined: bool):
     axes["kv_storage_head_dim"] = Const(
-        abbrev="kd", description="Stored K/V width; D/2 for packed NVFP4."
+        abbrev="", description="Stored K/V width; D/2 for packed NVFP4."
     )
     axes["kv_scale_groups"] = Var(
         description="NVFP4 scale groups; one per 16 logical values."
@@ -1033,7 +1049,7 @@ def _make_attention_ts_decode_trace(*, combined: bool, fp16_output: bool, q_mode
         "head_dim in (64, 128, 256)",
         "page_size in (16, 32, 64, 128)",
         "kv_storage_head_dim in (head_dim, head_dim // 2)",
-        "kv_scale_groups * 16 == head_dim when kv_scale_factors is present",
+        "k_sf_cache is None or kv_scale_groups * 16 == head_dim",
         "max_pages_per_seq * page_size >= max(seq_lens_kv)",
         "min(seq_lens_kv) >= 1",
         "num_qo_heads % num_kv_heads == 0",
@@ -1055,7 +1071,7 @@ def _make_attention_ts_decode_trace(*, combined: bool, fp16_output: bool, q_mode
         constraints.append("seq_len_q >= 2")
     else:
         constraints.append("seq_len_q == 1")
-    return TraceTemplate(
+    return _FmhaDecodeTraceTemplatePatch(
         op_type="gqa_paged",
         name_prefix=f"attention_ts_decode_{cache_form}{output_suffix}{q_suffix}",
         description=(
@@ -1110,12 +1126,6 @@ def _make_prims_ts_decode_trace(*, combined: bool, fp16_output: bool, q_mode: st
         "num_qo_heads": Const(abbrev="h"),
         "num_kv_heads": Const(abbrev="kv"),
         "head_dim": Const(abbrev="d"),
-        "kv_storage_head_dim": Const(
-            abbrev="kd", description="Stored K/V width; D/2 for packed NVFP4."
-        ),
-        "kv_scale_groups": Var(
-            description="NVFP4 scale groups; one per 16 logical values."
-        ),
         "num_pages": Var(description="Physical KV-cache page capacity."),
         "page_size": Const(abbrev="ps"),
         "workspace_size": Var(description="Caller workspace size in bytes."),
@@ -1172,7 +1182,7 @@ def _make_prims_ts_decode_trace(*, combined: bool, fp16_output: bool, q_mode: st
         "head_dim in (64, 128, 256)",
         "page_size in (16, 32, 64, 128)",
         "kv_storage_head_dim in (head_dim, head_dim // 2)",
-        "kv_scale_groups * 16 == head_dim when kv_scale_factors is present",
+        "k_sf_cache is None or kv_scale_groups * 16 == head_dim",
         "max_pages_per_seq * page_size >= max(seq_lens)",
         "min(seq_lens) >= 1",
         "max(seq_lens) <= max_seq_len",
@@ -1195,7 +1205,7 @@ def _make_prims_ts_decode_trace(*, combined: bool, fp16_output: bool, q_mode: st
         constraints.append("seq_len_q >= 2")
     else:
         constraints.append("seq_len_q == 1")
-    return TraceTemplate(
+    return _FmhaDecodeTraceTemplatePatch(
         op_type="gqa_paged",
         name_prefix=f"prims_ts_batch_decode_{cache_form}{output_suffix}{q_suffix}",
         description=(
@@ -1364,7 +1374,7 @@ def _make_prims_ts_decode_wrapper_trace(
         "head_dim in (64, 128, 256)",
         "page_size in (16, 32, 64, 128)",
         "kv_storage_head_dim in (head_dim, head_dim // 2)",
-        "kv_scale_groups * 16 == head_dim when kv_scale_factors is present",
+        "k_sf_cache is None or kv_scale_groups * 16 == head_dim",
         "num_qo_heads % num_kv_heads == 0",
         "1 <= num_qo_heads // num_kv_heads <= 128",
         "max_pages_per_seq * page_size >= max(seq_lens)",
@@ -1384,7 +1394,7 @@ def _make_prims_ts_decode_wrapper_trace(
         constraints.append("kv_planes == 2")
     if q_mode == _Q_FIXED_MULTI:
         constraints.append("seq_len_q >= 2")
-    return TraceTemplate(
+    return _FmhaDecodeTraceTemplatePatch(
         op_type="gqa_paged",
         name_prefix=(
             f"prims_ts_decode_wrapper_{cache_form}{output_suffix}{q_suffix}_{mask_type}"
