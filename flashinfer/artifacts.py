@@ -430,16 +430,20 @@ def download_artifacts() -> None:
 
                 for fut in as_completed(future_to_name):
                     artifact_name = future_to_name[fut]
+                    failure_detail = artifact_name
                     try:
                         ok = fut.result()
-                    except Exception:
+                    except Exception as e:
                         logger.exception(
                             "Unexpected exception in cubin download task for %s",
                             artifact_name,
                         )
                         ok = False
+                        failure_detail = (
+                            f"{artifact_name} ({type(e).__name__}: {e})"
+                        )
                     if not ok:
-                        failed_artifacts.append(artifact_name)
+                        failed_artifacts.append(failure_detail)
         finally:
             for session in sessions_by_thread.values():
                 session.close()
