@@ -42,7 +42,10 @@ HAS_PRIMS_TS_RUNTIME = ensure_cutlass_dsl_experimental()
 # The reach is transitive, not direct: ``batched_gemm_config`` does an unguarded
 # module-level ``from cutlass.experimental import primitives``, so every module
 # importing it inherits the requirement. That is all ten ``test_batched_gemm_*``
-# modules plus the two MoE support modules below.
+# modules plus the three MoE modules below. Follow the chain all the way down --
+# ``test_moe_compile_cache`` is three hops from anything named after a GEMM
+# (``batched_gemm_run`` -> ``batched_gemm_quant`` -> ``batched_gemm_config``),
+# and stopping at the first hop is what left it off this list originally.
 #
 # The glob is deliberate: new ``test_batched_gemm_*`` modules are the likely
 # growth, and over-ignoring is harmless here (on a pre-4.7 lane the whole
@@ -53,6 +56,7 @@ if not HAS_PRIMS_TS_RUNTIME:
     collect_ignore_glob = ["test_batched_gemm_*.py"]
     collect_ignore = [
         "test_moe_bf16_support.py",
+        "test_moe_compile_cache.py",
         "test_moe_nvfp4_support.py",
     ]
 
