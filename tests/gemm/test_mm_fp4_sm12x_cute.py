@@ -337,7 +337,7 @@ def test_sm121_defaults_preserve_other_devices_and_unmeasured_shapes():
         ((1024, 7168, 4608), ("raw", 64, 32, 8, False, True, 256, True)),
         ((512, 8192, 8192), ("cooperative", 128, 64, 256)),
         ((512, 8192, 7168), ("cooperative", 128, 64, 256)),
-        ((1024, 9216, 7168), ("raw", 64, 32, 8, False, True, 256, True)),
+        ((1024, 9216, 7168), ("cooperative", 256, 128, 128)),
         ((512, 10240, 8192), ("cooperative", 128, 128, 256)),
         ((512, 8192, 14336), ("cooperative", 128, 64, 256)),
         ((512, 5120, 16384), ("cooperative", 128, 128, 256)),
@@ -381,7 +381,7 @@ def test_sm121_defaults_preserve_other_devices_and_unmeasured_shapes():
                 *shape, compute_capability=(12, 1)
             )
             assert not policy.compatible(*shape, previous, compute_capability=(12, 0))
-        if shape == (1024, 4608, 7168):
+        if shape in ((1024, 4608, 7168), (1024, 9216, 7168)):
             previous = ("raw", 64, 32, 8, False, True, 256, True)
             assert policy.compatible(*shape, previous, compute_capability=(12, 1))
             assert previous not in policy.valid_tactics(
@@ -396,6 +396,14 @@ def test_sm121_defaults_preserve_other_devices_and_unmeasured_shapes():
         (m, n, k)
         for m in [17, 31, 33, 63, 65, 127, 129, 257, 513, 1025, 2047, 2049]
         for n, k in [(34816, 5120), (5120, 17408)]
+    ]
+    neighbors += [
+        (1023, 9216, 7168),
+        (1025, 9216, 7168),
+        (1024, 9088, 7168),
+        (1024, 9344, 7168),
+        (1024, 9216, 6912),
+        (1024, 9216, 7424),
     ]
     neighbors += [
         (1023, 4608, 7168),
@@ -775,7 +783,7 @@ def test_sm121_measured_default_public_graph_and_cached_choice(m, n, k, monkeypa
             legacy_choices.append(("cooperative", 128, 64, 256))
         if (m, n, k) == (1024, 1024, 7168):
             legacy_choices.append(("b12x", 64, 128, 128))
-        if (m, n, k) == (1024, 4608, 7168):
+        if (m, n, k) in ((1024, 4608, 7168), (1024, 9216, 7168)):
             legacy_choices.append(("raw", 64, 32, 8, False, True, 256, True))
         for legacy in legacy_choices:
             winners[key] = (legacy, None)

@@ -98,7 +98,7 @@ def _sm121_tactic(m, n, k, compute_capability):
     ):
         return ("cooperative", 128, 64, 256)
     if compute_capability == (12, 1) and (m, n, k) == (1024, 9216, 7168):
-        return ("raw", 64, 32, 8, False, True, 256, True)
+        return ("cooperative", 256, 128, 128)
     if compute_capability == (12, 1) and (m, n, k) == (512, 10240, 8192):
         return ("cooperative", 128, 128, 256)
     if compute_capability == (12, 1) and (m, n, k) == (512, 8192, 14336):
@@ -187,7 +187,7 @@ def compatible(m, n, k, tactic, *, compute_capability=None):
         )
         or (
             compute_capability == (12, 1)
-            and (m, n, k) == (1024, 4608, 7168)
+            and (m, n, k) in ((1024, 4608, 7168), (1024, 9216, 7168))
             and tactic == ("raw", 64, 32, 8, False, True, 256, True)
         )
         or (
