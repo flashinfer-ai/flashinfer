@@ -49,6 +49,7 @@ from tests.test_helpers.cudnn_linear_attention import (
     assert_rel_close,
     assert_state_orientation,
     packed_offsets,
+    reference_kernel_or_skip,
     rel_err,
     requires_cudnn_linear_attention,
     serial_delta_rule,
@@ -193,7 +194,8 @@ def test_cudnn_backend_matches_default(
     num_sab_heads = max(num_q_heads, num_v_heads)
     state = inputs["initial_state"]
 
-    ref_out, ref_state = chunk_gated_delta_rule(
+    ref_out, ref_state = reference_kernel_or_skip(
+        chunk_gated_delta_rule,
         inputs["q"],
         inputs["k"],
         inputs["v"],
