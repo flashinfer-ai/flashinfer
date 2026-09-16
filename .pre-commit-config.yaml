@@ -83,7 +83,7 @@ repos:
           files: ^flashinfer/
           # Geometry names in generated Frost templates are injected before JIT.
           # b12x (#5767) is excluded pending a typing pass over the migrated tree.
-          exclude: ^(flashinfer/experimental/b12x/|flashinfer/fused_moe/backends/cudnn_frost/artifacts/[^/]+/sources/|flashinfer-cubin/|flashinfer/prims_ts/|flashinfer/attention/prims_ts/kernels/|3rdparty/|build/|flashinfer/cute_dsl/attention/fmha/(fmha\.py|fmha_blockscaled\.py|helpers/)|flashinfer/gemm/kernels/dense_blockscaled_gemm_sm107\.py|flashinfer/fused_moe/cute_dsl/rubin/(blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion\.py|blockscaled_contiguous_grouped_gemm_finalize_fusion\.py)|flashinfer/topk_varlen/kernels/filtered_topk_(util|decode)\.py|flashinfer/topk_varlen/kernels/(gvr2_topk_decode\.py|gvr2_topk_host\.py)|flashinfer/fused_moe/cute_dsl/blackwell_sm12x/(?:kernel_moe|moe)_(?:fp8|mxfp8_mxfp4)_(?:gemm|fc1_act|fc1_act_q1|fc2_finalize)\.py)
+          exclude: ^(flashinfer/experimental/b12x/|flashinfer/fused_moe/backends/cudnn_frost/artifacts/[^/]+/sources/|flashinfer-cubin/|flashinfer/prims_ts/|flashinfer/attention/prims_ts/kernels/|3rdparty/|build/|flashinfer/cute_dsl/attention/fmha/(fmha\.py|fmha_blockscaled\.py|helpers/)|flashinfer/gemm/kernels/dense_blockscaled_gemm_sm107\.py|flashinfer/fused_moe/cute_dsl/rubin/(blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion\.py|blockscaled_contiguous_grouped_gemm_finalize_fusion\.py)|flashinfer/topk_varlen/kernels/filtered_topk_(util|decode)\.py|flashinfer/topk_varlen/kernels/(gvr2_topk_decode\.py|gvr2_topk_host\.py)|flashinfer/fused_moe/cute_dsl/blackwell_sm12x/(?:kernel_moe|moe)_(?:fp8|mxfp8_mxfp4|fp4)_(?:gemm|fc1_act|fc1_act_q1|fc2_finalize)\.py)
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
     # Ruff version.
@@ -95,7 +95,7 @@ repos:
         alias: sm12x-import-order
         name: ruff check (SM12x import order)
         args: [--select, I]
-        files: ^flashinfer/fused_moe/cute_dsl/blackwell_sm12x/(?:_moe_utils/(?:moe_epilogue|moe_kernel_builder|moe_scheduler|sm12x_blockscaled_layout)|kernel_moe_(?:fp8|mxfp8_mxfp4)_(?:gemm|fc1_act|fc1_act_q1|fc2_finalize)|moe_(?:fp8|mxfp8_mxfp4)_(?:gemm|fc1_act|fc1_act_q1|fc2_finalize))\.py$
+        files: ^flashinfer/fused_moe/cute_dsl/blackwell_sm12x/(?:_moe_utils/(?:moe_epilogue|moe_kernel_builder|moe_scheduler|sm12x_blockscaled_layout)|kernel_moe_(?:fp8|mxfp8_mxfp4|fp4)_(?:gemm|fc1_act|fc1_act_q1|fc2_finalize)|moe_(?:fp8|mxfp8_mxfp4|fp4)_(?:gemm|fc1_act|fc1_act_q1|fc2_finalize))\.py$
       # Run the formatter.
       - id: ruff-format
         types_or: [ python, pyi ]

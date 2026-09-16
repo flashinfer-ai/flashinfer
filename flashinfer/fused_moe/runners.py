@@ -8123,6 +8123,328 @@ class SM12xMxfp8Mxfp4Runner(MoERunner):
 
 
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# SM12x NVFP4 runner - fixed tactic, internal op composition
+# ---------------------------------------------------------------------------
+
+
+def _sm12x_nvfp4_activation_kwargs(activation: ActivationConfig) -> dict[str, Any]:
+    if isinstance(activation, SwiGLU):
+        default = SwiGLU()
+        if (
+            activation.alpha != default.alpha
+            or activation.beta != default.beta
+            or activation.limit != default.limit
+        ):
+            raise NotImplementedError(
+                "SM12x NVFP4 supports only default SwiGLU parameters."
+            )
+        return {"activation": ActivationType.Swiglu}
+    if isinstance(activation, SiTU):
+        if activation.linear_scale is None or activation.clamp_limit is not None:
+            raise NotImplementedError(
+                "SM12x NVFP4 requires a finite SiTU linear scale and no clamp limit."
+            )
+        return {
+            "activation": ActivationType.Situ,
+            "situ_beta": activation.gate_scale,
+            "situ_linear_beta": activation.linear_scale,
+        }
+    raise NotImplementedError(
+        f"SM12x NVFP4 does not support {type(activation).__name__}."
+    )
+
+
+def _validate_sm12x_nvfp4_weight_view(
+    view: dict[str, torch.Tensor], x: torch.Tensor, config: MoEConfig
+) -> None:
+    experts = config.routing.num_experts
+    hidden = x.shape[1]
+    intermediate = config.experts.intermediate_size
+    expected = {
+        "w1_weight": (experts, 2 * intermediate, hidden // 2),
+        "w1_weight_sf": (experts * 2 * intermediate, hidden // 16),
+        "w2_weight": (experts, hidden, intermediate // 2),
+        "w2_weight_sf": (experts * hidden, intermediate // 16),
+        "w1_up_scale": (experts,),
+        "w1_gate_scale": (experts,),
+        "w2_alpha": (1,),
+        "q0_global_scale": (1,),
+        "q1_global_scale": (1,),
+    }
+    for key, shape in expected.items():
+        tensor = view[key]
+        if tensor.device != x.device:
+            raise ValueError(f"{key} must be on {x.device}, got {tensor.device}.")
+        dtype = torch.float32 if "scale" in key or key == "w2_alpha" else torch.uint8
+        if key in ("w1_weight_sf", "w2_weight_sf"):
+            dtype = torch.uint8
+        if tensor.dtype is not dtype:
+            raise TypeError(f"{key} must be {dtype}, got {tensor.dtype}.")
+        if tuple(tensor.shape) != shape:
+            raise ValueError(f"{key} shape {tuple(tensor.shape)} != expected {shape}.")
+        if not tensor.is_contiguous():
+            raise ValueError(f"{key} must be contiguous.")
+
+
+class SM12xNvfp4Runner(MoERunner):
+    """Unified adapter for the SM12x NVFP4 internal op chain."""
+
+    backend_key = "sm12x_nvfp4"
+    supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
+    supported_quant_variants = ((QuantFormat.NVFP4, QuantFormat.NVFP4),)
+    supported_activation_classes = (SwiGLU, SiTU)
+    supports_expert_parallelism = False
+    required_weight_keys = (
+        "w1_weight",
+        "w1_weight_sf",
+        "w1_up_scale",
+        "w1_gate_scale",
+        "w2_weight",
+        "w2_weight_sf",
+        "w2_alpha",
+        "q0_global_scale",
+        "q1_global_scale",
+    )
+
+    def __init__(self, config: MoEConfig, device: torch.device):
+        super().__init__()
+        self.config = config
+        self.device = torch.device(device)
+        if self.device.type == "cuda" and self.device.index is None:
+            self.device = torch.device("cuda", torch.cuda.current_device())
+        self.tuning_config = TuningConfig()
+        self._topk_validation_receipt: (
+            tuple[torch.Tensor, int, int | None, int] | None
+        ) = None
+
+    def _check_activation_parameters(self) -> None:
+        _sm12x_nvfp4_activation_kwargs(self.config.activation)
+
+    def _check_support(self) -> None:
+        super()._check_support()
+        from ..cute_dsl import is_cute_dsl_available
+        from ..jit.cpp_ext import get_cuda_version
+        from ..utils import get_compute_capability
+
+        if get_cuda_version().major < 13:
+            raise ValueError("SM12x NVFP4 requires CUDA 13 or later.")
+        if not is_cute_dsl_available():
+            raise RuntimeError("SM12x NVFP4 requires the CuTe DSL package.")
+        if get_compute_capability(self.device) not in ((12, 0), (12, 1)):
+            raise RuntimeError("SM12x NVFP4 requires SM120 or SM121.")
+        if not self.config.finalize.do_finalize:
+            raise NotImplementedError("SM12x NVFP4 requires do_finalize=True.")
+        if not self.config.finalize.use_fused_finalize:
+            raise NotImplementedError("SM12x NVFP4 requires use_fused_finalize=True.")
+        if self.config.quant.per_token_scale:
+            raise NotImplementedError(
+                "SM12x NVFP4 quantizes BF16 activations internally."
+            )
+        if self.config.execution.enable_pdl is not False:
+            raise NotImplementedError("SM12x NVFP4 does not support PDL yet.")
+
+    @staticmethod
+    def _topk_version(topk_ids: torch.Tensor) -> int | None:
+        try:
+            return int(topk_ids._version)
+        except RuntimeError:
+            return None
+
+    def _validate_expert_id_range(
+        self, topk_ids: torch.Tensor, num_experts: int
+    ) -> None:
+        version = self._topk_version(topk_ids)
+        receipt = self._topk_validation_receipt
+        if (
+            receipt is not None
+            and receipt[0] is topk_ids
+            and receipt[1] == topk_ids.data_ptr()
+            and receipt[2] == version
+            and receipt[3] == num_experts
+        ):
+            return
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "SM12x NVFP4 topk_ids must be range-validated before CUDA Graph "
+                "capture; warm up this exact tensor version first."
+            )
+        in_range = torch.logical_and(topk_ids >= 0, topk_ids < num_experts).all()
+        if not bool(in_range.item()):
+            raise ValueError(
+                "SM12xNvfp4Runner requires every topk_ids value to satisfy "
+                f"0 <= id < {num_experts}."
+            )
+        self._topk_validation_receipt = (
+            topk_ids,
+            topk_ids.data_ptr(),
+            version,
+            num_experts,
+        )
+
+    def _build(self) -> None:
+        from .cute_dsl.blackwell_sm12x.moe_fp4_fc1_act_q1 import (
+            cute_dsl_sm12x_fc1_act_q1_nvfp4,
+            out_sf_shape,
+        )
+        from .cute_dsl.blackwell_sm12x.moe_fp4_fc2_finalize import (
+            cute_dsl_sm12x_fc2_finalize_nvfp4,
+        )
+        from .cute_dsl.blackwell_sm12x.moe_fp4_q0_route_triton import (
+            Nvfp4Q0RouteWorkspace,
+            make_nvfp4_q0_route_workspace,
+            nvfp4_q0_route_triton,
+        )
+
+        self._fc1 = cute_dsl_sm12x_fc1_act_q1_nvfp4
+        self._fc2 = cute_dsl_sm12x_fc2_finalize_nvfp4
+        self._out_sf_shape = out_sf_shape
+        self._workspace_cls = Nvfp4Q0RouteWorkspace
+        self._make_workspace = make_nvfp4_q0_route_workspace
+        self._route = nvfp4_q0_route_triton
+
+    def get_valid_tactics(self, inputs: List[torch.Tensor], profile: Any) -> List[Any]:
+        self._require_built()
+        return [-1]
+
+    def pack_inputs(
+        self, act: MoEActivationPack, weights: MoEWeightPack
+    ) -> List[torch.Tensor]:
+        self._require_built()
+        if act.hidden_states_q.dtype is not torch.bfloat16:
+            raise TypeError("SM12x NVFP4 requires BF16 hidden states.")
+        if act.hidden_states_scale is not None or act.per_token_scale is not None:
+            raise ValueError("SM12x NVFP4 requires activation scales to be None.")
+        _validate_prerouted_inputs(
+            act,
+            act.hidden_states_q.shape[0],
+            self.config.routing.top_k,
+            type(self).__name__,
+        )
+        if act.topk_weights.dtype is not torch.float32:
+            raise TypeError("SM12x NVFP4 requires FP32 top-k weights.")
+        self._validate_expert_id_range(act.topk_ids, self.config.routing.num_experts)
+        view = weights.get_view(self.backend_key)
+        missing = [key for key in self.required_weight_keys if key not in view]
+        if missing:
+            raise KeyError(
+                f"{self.backend_key} prepared weights are missing {missing}."
+            )
+        _validate_sm12x_nvfp4_weight_view(view, act.hidden_states_q, self.config)
+        x = act.hidden_states_q
+        num_experts = self.config.routing.num_experts
+        workspace = self._make_workspace(x, act.topk_ids, num_experts)
+        total_pairs = x.shape[0] * act.topk_ids.shape[1]
+        intermediate = self.config.experts.intermediate_size
+        q1 = torch.empty(
+            total_pairs, intermediate // 2, dtype=torch.uint8, device=x.device
+        )
+        sf1 = torch.zeros(
+            self._out_sf_shape(total_pairs, intermediate, num_experts),
+            dtype=torch.uint8,
+            device=x.device,
+        )
+        output = torch.zeros(
+            x.shape[0], x.shape[1], dtype=torch.bfloat16, device=x.device
+        )
+        return [
+            x,
+            act.topk_ids,
+            act.topk_weights,
+            view["w1_weight"],
+            view["w1_weight_sf"],
+            view["w1_up_scale"],
+            view["w1_gate_scale"],
+            view["w2_weight"],
+            view["w2_weight_sf"],
+            view["w2_alpha"],
+            view["q0_global_scale"],
+            view["q1_global_scale"],
+            q1,
+            sf1,
+            output,
+            workspace.counts,
+            workspace.offsets,
+            workspace.expert_cursor,
+            workspace.token_map,
+            workspace.token_weights,
+            workspace.dst_rows,
+            workspace.scale_dst_rows,
+            workspace.q_out,
+            workspace.scale_out,
+        ]
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: Any = -1,
+        do_preparation: bool = False,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        self._require_built()
+        if tactic != -1:
+            raise ValueError("SM12x NVFP4 supports only tactic -1.")
+        (
+            x,
+            ids,
+            topk_weights,
+            w1,
+            w1_sf,
+            up_scale,
+            gate_scale,
+            w2,
+            w2_sf,
+            w2_alpha,
+            q0_global_scale,
+            q1_global_scale,
+            q1,
+            sf1,
+            output,
+        ) = inputs[:15]
+        workspace = self._workspace_cls(*inputs[15:])
+        act_kwargs = _sm12x_nvfp4_activation_kwargs(self.config.activation)
+        output.zero_()
+        offsets, token_map, route_weights, a_q, a_scale = self._route(
+            x,
+            ids,
+            topk_weights,
+            self.config.routing.num_experts,
+            q0_global_scale,
+            workspace=workspace,
+            enable_pdl=False,
+        )
+        self._fc1(
+            a_q,
+            a_scale,
+            w1,
+            w1_sf,
+            offsets,
+            up_scale,
+            gate_scale,
+            q1_global_scale,
+            tune=False,
+            out_q=q1,
+            out_sf=sf1,
+            **act_kwargs,
+        )
+        self._fc2(
+            q1,
+            sf1,
+            w2,
+            w2_sf,
+            offsets,
+            token_map,
+            route_weights,
+            w2_alpha,
+            x.shape[0],
+            tune=False,
+            enable_pdl=False,
+            out=output,
+        )
+        return output
+
+
 # SM12x NVFP4 x BF16 runner - shared cuTile NVFP4 weight view, fixed tactic
 # ---------------------------------------------------------------------------
 

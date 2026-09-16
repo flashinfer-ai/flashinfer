@@ -11,10 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""SM120 per-variant scale-factor configs (fp8 float-scale, mxfp8 x mxfp4 UE8M0), each self-contained."""
+"""SM120 per-variant scale-factor configs for FP8, MXFP8 x MXFP4, and NVFP4."""
 
 import cutlass
 import cutlass.cute as cute
+import cutlass.utils.blockscaled_layout as blockscaled_utils
 
 from .....utils import ceil_div
 from .....utils import round_up as align
@@ -27,6 +28,202 @@ UE8M0_PACK_NUM = 4
 
 def compute_padded_offset(offset, expert_idx, alignment):
     return (offset + expert_idx * (alignment - 1)) // alignment * alignment
+
+
+@cute.jit
+def _make_nvfp4_smem_layout_sfa(tiledmma, tile, sf_vec, stages):
+    block_m, block_sf = 128, 4
+    block_elems = block_m * block_sf
+    mma_sf = tiledmma.shape_mnk[2] // sf_vec
+    sfa_tile_m = max(block_m, ceil_div(tile[0], block_m) * block_m)
+    shape_m = ((32, 4), sfa_tile_m // block_m)
+    stride_m = ((16, 4), block_elems)
+    shape_k = ((sf_vec, mma_sf), block_sf // mma_sf, tile[2] // sf_vec // block_sf)
+    stride_k = ((0, 1), mma_sf, sfa_tile_m // block_m * block_elems)
+    layout = cute.make_layout((shape_m, shape_k), stride=(stride_m, stride_k))
+    return cute.append(
+        layout, cute.make_layout(stages, stride=cute.cosize(cute.filter_zeros(layout)))
+    )
+
+
+@cute.jit
+def _make_nvfp4_smem_layout_sfb(tiledmma, tile, sf_vec, stages):
+    block_n, block_sf = 128, 4
+    block_elems = block_n * block_sf
+    mma_sf = tiledmma.shape_mnk[2] // sf_vec
+    sfb_tile_n = max(block_n, ceil_div(tile[1], block_n) * block_n)
+    shape_n = ((32, 4), sfb_tile_n // block_n)
+    stride_n = ((16, 4), block_elems)
+    shape_k = ((sf_vec, mma_sf), block_sf // mma_sf, tile[2] // sf_vec // block_sf)
+    stride_k = ((0, 1), mma_sf, sfb_tile_n // block_n * block_elems)
+    layout = cute.make_layout((shape_n, shape_k), stride=(stride_n, stride_k))
+    return cute.append(
+        layout, cute.make_layout(stages, stride=cute.cosize(cute.filter_zeros(layout)))
+    )
+
+
+class Sm120SfConfigNvfp4:
+    SF_VEC = 16
+
+    def __init__(self, sf_dtype=cutlass.Float8E4M3FN):
+        self.sf_dtype = sf_dtype
+        self.use_ue8m0 = False
+        self.sf_load_warp = 1
+
+    def ab_stages_contract(self, ab_stage):
+        return ab_stage > 0
+
+    def k_tiles_per_pack_a(self, tile_k):
+        assert tile_k % self.SF_VEC == 0
+        return 1
+
+    def k_tiles_per_pack_b(self, tile_k):
+        assert tile_k % self.SF_VEC == 0
+        return 1
+
+    def sfa_stages(self, ab_stage, tile_k):
+        self.k_tiles_per_pack_a(tile_k)
+        return ab_stage
+
+    def sfb_stages(self, ab_stage, tile_k):
+        self.k_tiles_per_pack_b(tile_k)
+        return ab_stage
+
+    def smem_bytes(self, tile, ab_stage):
+        bm, bn, bk = tile
+        return (max(128, bm) + max(128, bn)) * ceil_div(bk, self.SF_VEC) * ab_stage
+
+    def gate_smem_bytes(self, tile, ab_stage, swap_ab):
+        bm, bn, bk = tile
+        mn = bm if swap_ab else bn
+        return max(128, mn) * ceil_div(bk, self.SF_VEC) * ab_stage
+
+    def sfa_tile_m(self, tile_m):
+        return max(128, ceil_div(tile_m, 128) * 128)
+
+    def sfa_tiles_per_block(self, tile_m):
+        return self.sfa_tile_m(tile_m) // tile_m
+
+    def sfb_tile_n(self, tile_n):
+        return max(128, ceil_div(tile_n, 128) * 128)
+
+    def sfb_tiles_per_block(self, tile_n):
+        return self.sfb_tile_n(tile_n) // tile_n
+
+    def deduce_sfa_layout(self, mn, K, L):
+        return blockscaled_utils.tile_atom_to_shape_SF((mn, K, L), self.SF_VEC)
+
+    def deduce_sfb_layout(self, mn, K, L):
+        return blockscaled_utils.tile_atom_to_shape_SF((mn, K, L), self.SF_VEC)
+
+    def make_smem_layout_sfa(self, tiledmma, tile, ab_stage):
+        return _make_nvfp4_smem_layout_sfa(tiledmma, tile, self.SF_VEC, ab_stage)
+
+    def make_smem_layout_sfb(self, tiledmma, tile, ab_stage):
+        return _make_nvfp4_smem_layout_sfb(tiledmma, tile, self.SF_VEC, ab_stage)
+
+    def thrfrg_SFA(self, sf_layout, tiled_mma):
+        atom_shape_mnk = tiled_mma.shape_mnk
+        perm = tiled_mma.permutation_mnk
+        thr_vmnk = tiled_mma.thr_layout_vmnk
+        atom_sf_layout = cute.make_layout(((2, 2, 8), 64), stride=((8, 0, 1), 16))
+        t_tensor = cute.logical_divide(sf_layout, (perm[0], perm[2]))
+        a_tensor = cute.zipped_divide(
+            t_tensor,
+            (cute.make_layout(atom_shape_mnk[0]), cute.make_layout(atom_shape_mnk[2])),
+        )
+        tv_tensor = cute.composition(a_tensor, (atom_sf_layout, None))
+        return cute.zipped_divide(
+            tv_tensor,
+            (
+                None,
+                (
+                    cute.make_layout(cute.size(thr_vmnk[1])),
+                    cute.make_layout(cute.size(thr_vmnk[3])),
+                ),
+            ),
+        )
+
+    def thrfrg_SFB(self, sf_layout, tiled_mma):
+        atom_shape_mnk = tiled_mma.shape_mnk
+        perm = tiled_mma.permutation_mnk
+        thr_vmnk = tiled_mma.thr_layout_vmnk
+        atom_sf_layout = cute.make_layout(((4, 8), 64), stride=((0, 1), 8))
+        t_tensor = cute.logical_divide(sf_layout, (perm[1], perm[2]))
+        a_tensor = cute.zipped_divide(
+            t_tensor,
+            (cute.make_layout(atom_shape_mnk[1]), cute.make_layout(atom_shape_mnk[2])),
+        )
+        tv_tensor = cute.composition(a_tensor, (atom_sf_layout, None))
+        return cute.zipped_divide(
+            tv_tensor,
+            (
+                None,
+                (
+                    cute.make_layout(cute.size(thr_vmnk[2])),
+                    cute.make_layout(cute.size(thr_vmnk[3])),
+                ),
+            ),
+        )
+
+    @staticmethod
+    def _thr_partition(thr_tensor, thr_coord):
+        rest = (None, tuple([None] * cute.rank(thr_tensor.layout, mode=[1, 1])))
+        return thr_tensor[thr_coord, rest]
+
+    def partition_fragment_SFA(self, sf_tensor, thr_mma, tidx):
+        thr_tensor = cute.make_tensor(
+            sf_tensor.iterator, self.thrfrg_SFA(sf_tensor.layout, thr_mma)
+        )
+        thr_vmnk = thr_mma.thr_layout_vmnk.get_flat_coord(tidx)
+        thr_vmk = (thr_vmnk[0], (thr_vmnk[1], thr_vmnk[3]))
+        return cute.make_fragment_like(self._thr_partition(thr_tensor, thr_vmk))
+
+    def partition_fragment_SFB(self, sf_tensor, thr_mma, tidx):
+        thr_tensor = cute.make_tensor(
+            sf_tensor.iterator, self.thrfrg_SFB(sf_tensor.layout, thr_mma)
+        )
+        thr_vmnk = thr_mma.thr_layout_vmnk.get_flat_coord(tidx)
+        thr_vnk = (thr_vmnk[0], (thr_vmnk[2], thr_vmnk[3]))
+        return cute.make_fragment_like(self._thr_partition(thr_tensor, thr_vnk))
+
+    def get_layoutSFA_TV(self, tiledmma):
+        perm = tiledmma.permutation_mnk
+        thr_vmnk = tiledmma.thr_layout_vmnk
+        ref = cute.make_layout((cute.size(perm[0]), cute.size(perm[2])))
+        atile = (
+            None,
+            (
+                cute.make_layout(
+                    shape=(cute.size(thr_vmnk[1]), cute.size(thr_vmnk[2])),
+                    stride=(1, 0),
+                ),
+                None,
+            ),
+        )
+        tv = cute.composition(self.thrfrg_SFA(ref, tiledmma), (atile, None))
+        return cute.composition(tv, (cute.right_inverse(thr_vmnk), None))
+
+    def get_layoutSFB_TV(self, tiledmma):
+        perm = tiledmma.permutation_mnk
+        thr_vmnk = tiledmma.thr_layout_vmnk
+        ref = cute.make_layout((cute.size(perm[1]), cute.size(perm[2])))
+        atile = (
+            None,
+            (
+                cute.make_layout(
+                    shape=(cute.size(thr_vmnk[1]), cute.size(thr_vmnk[2])),
+                    stride=(0, 1),
+                ),
+                None,
+            ),
+        )
+        tv = cute.composition(self.thrfrg_SFB(ref, tiledmma), (atile, None))
+        return cute.composition(tv, (cute.right_inverse(thr_vmnk), None))
+
+    def make_s2r_sf(self, tv_layout, tiler):
+        atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), self.sf_dtype)
+        return cute.make_tiled_copy(atom, tv_layout, tiler)
 
 
 class Sm120SfConfigMxfp8Mxfp4:
