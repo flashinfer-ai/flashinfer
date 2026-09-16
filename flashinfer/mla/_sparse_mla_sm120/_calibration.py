@@ -47,9 +47,12 @@ family, and non-zero values poisoned the latency-regime picks).
 Ordinary execution consumes configuration-keyed profiles with eight independent
 token buckets (:func:`_calibrate_ordinary`). Tuning-mode selection of an off-grid
 token count measures that count once (:func:`refine_ordinary`); exact entries
-precede nearest-up bucket interpolation. These profiles are the only measured
-phase/CPB source. The sampler and eligibility check share :func:`profile_layout`.
-Legal layouts outside that sample use analytical estimates or the C++ heuristic.
+precede nearest-up bucket interpolation, and a failed refinement of a
+``(key, tokens)`` point is suppressed in-process instead of being retimed on
+every tuning call (a successful explicit refinement clears the mark). These
+profiles are the only measured phase/CPB source. The sampler and eligibility
+check share :func:`profile_layout`. Legal layouts outside that sample use
+analytical estimates or the C++ heuristic.
 Legacy crossover and exact-override helpers remain available for explicit
 experiments, but execution neither reads nor starts them. NVFP4 keeps its
 independently owned profiles.
@@ -1345,7 +1348,14 @@ def _materialize_store(state: dict) -> None:
 
 
 def refresh_store() -> None:
-    """One stat per eager refresh; parse only changed complete snapshots."""
+    """One stat per eager refresh; parse only changed complete snapshots.
+
+    In-process failure marks (``state["failed"]``/``state["cross_failed"]``)
+    are deliberately not cleared by disk changes: a failed measurement stays
+    suppressed for the process lifetime until a successful publish of the same
+    (device, key) clears it. Another process landing fresh calibration data
+    must not reopen measurement this process already found failing.
+    """
     with _store_lock:
         path, state = _activate_store()
         try:
@@ -1361,8 +1371,6 @@ def refresh_store() -> None:
         except (AttributeError, TypeError, ValueError, KeyError):
             devices = {}
         state["disk"], state["token"] = devices, token
-        state["failed"].clear()
-        state["cross_failed"].clear()
         _materialize_store(state)
 
 
@@ -1417,7 +1425,12 @@ def publish_calibration(
     ``profiles`` replaces complete profiles. Refinement supplies
     ``profile_buckets`` to insert only newly measured buckets into an existing
     profile; its complete profile is used only if no profile remains on disk.
-    The same incremental intent is retained when replaying a failed write."""
+    The same incremental intent is retained when replaying a failed write.
+
+    A disk document with a matching schema and timing protocol but unparsable
+    device entries is rebuilt from this process's pending units instead of
+    raising into lazy warmup: readers already treat such content as absent, so
+    the republished document drops only entries no consumer could use."""
     with _store_lock:
         refresh_store()
         path, state = _activate_store()
@@ -1447,10 +1460,32 @@ def publish_calibration(
             with FileLock(str(path) + ".lock"):
                 payload = _read_payload_for_merge(path)
                 devices = payload.setdefault("devices", {})
-                for pending in state["overlay"]:
-                    _replay_unit(devices, pending)
-                _replay_unit(devices, unit)
-                _parse_payload_devices(devices)
+                try:
+                    for pending in state["overlay"]:
+                        _replay_unit(devices, pending)
+                    _replay_unit(devices, unit)
+                    _parse_payload_devices(devices)
+                except (AttributeError, TypeError, ValueError, KeyError) as error:
+                    # Same-schema but unparsable disk content: republish onto a
+                    # fresh document holding this process's pending units (the
+                    # units were validated above, so this pass cannot fail on
+                    # content). Corrupt content must never escape to warmup.
+                    logger.warning(
+                        "SM120 calibration cache %s holds unparsable entries "
+                        "(%s); republishing without them",
+                        path,
+                        error,
+                    )
+                    payload = {
+                        "schema_version": _SCHEMA_VERSION,
+                        "timing_protocol": _TIMING_PROTOCOL,
+                        "devices": {},
+                    }
+                    devices = payload["devices"]
+                    for pending in state["overlay"]:
+                        _replay_unit(devices, pending)
+                    _replay_unit(devices, unit)
+                    _parse_payload_devices(devices)
                 with tempfile.NamedTemporaryFile(
                     mode="w", dir=path.parent, delete=False
                 ) as handle:
@@ -1492,15 +1527,55 @@ def _store_projection(family: str, section: str):
 
 
 def mark_calibration_failed(device: torch.device, family: str) -> None:
-    """Suppress further calibration attempts for (device, family) in-process."""
-    failed = _store_projection(family, "failed")
-    failed.add((_device_key(device), family))
+    """Suppress further calibration attempts for (device, family) in-process.
+
+    The mark lives for the rest of the process: disk cache reloads (another
+    process publishing fresh data) do not clear it. Only a successful
+    calibration publish of the same (device, family) clears it."""
+    with _store_lock:
+        refresh_store()
+        _failed.add((_device_key(device), family))
 
 
 def is_calibration_failed(device: torch.device, family: str) -> bool:
-    """True iff calibration already failed for (device, family) in-process."""
-    failed = _store_projection(family, "failed")
-    return (_device_key(device), family) in failed
+    """True iff calibration already failed for (device, family) in-process.
+
+    Process-lifetime mark; see :func:`mark_calibration_failed`."""
+    with _store_lock:
+        refresh_store()
+        return (_device_key(device), family) in _failed
+
+
+def _clear_calibration_failed(device: torch.device, family: str) -> None:
+    """Clear the in-process failure mark after a successful calibration."""
+    with _store_lock:
+        refresh_store()
+        _failed.discard((_device_key(device), family))
+
+
+# Process-lifetime refinement suppression: (device, profile key, token count)
+# points whose exact-T measurement failed. Like the calibration failure marks,
+# entries are not cleared by disk changes; a successful refinement of the same
+# point clears them. Tuning-time call sites check this before measuring.
+_refine_failed: set[tuple[str, str, int]] = set()
+
+
+def mark_refine_failed(device: torch.device, key: str, tokens: int) -> None:
+    """Suppress further refinement of (device, key, tokens) in-process."""
+    with _store_lock:
+        _refine_failed.add((_device_key(device), key, int(tokens)))
+
+
+def is_refine_failed(device: torch.device, key: str, tokens: int) -> bool:
+    """True iff refinement of (device, key, tokens) already failed in-process."""
+    with _store_lock:
+        return (_device_key(device), key, int(tokens)) in _refine_failed
+
+
+def clear_refine_failed(device: torch.device, key: str, tokens: int) -> None:
+    """Clear the refinement suppression after a successful measurement."""
+    with _store_lock:
+        _refine_failed.discard((_device_key(device), key, int(tokens)))
 
 
 def save_crossover(device: torch.device, table: dict[str, int]) -> bool:
@@ -1572,15 +1647,19 @@ def crossover_grid_complete(device: torch.device, family: str) -> bool:
 
 
 def mark_crossover_failed(device: torch.device, family: str) -> None:
-    """Suppress further crossover calibration for (device, family) in-process."""
-    failed = _store_projection(family, "cross_failed")
-    failed.add((_device_key(device), family))
+    """Suppress further crossover calibration for (device, family) in-process.
+
+    Same process-lifetime semantics as :func:`mark_calibration_failed`."""
+    with _store_lock:
+        refresh_store()
+        _crossover_failed.add((_device_key(device), family))
 
 
 def is_crossover_failed(device: torch.device, family: str) -> bool:
     """True iff crossover calibration already failed for (device, family)."""
-    failed = _store_projection(family, "cross_failed")
-    return (_device_key(device), family) in failed
+    with _store_lock:
+        refresh_store()
+        return (_device_key(device), family) in _crossover_failed
 
 
 def get_cpb_override(
@@ -2061,7 +2140,9 @@ def refine_ordinary(
 
     Returns the refined bucket entry, or ``None`` when refinement does not
     apply (outside the profiled range, no stored profile, or the exact entry
-    already measured).
+    already measured). A successful call clears the in-process failure
+    suppression a failed tuning-time attempt left for this (key, tokens)
+    point.
     """
     if not 1 <= tokens <= _PROFILE_T[-1]:
         return None
@@ -2083,6 +2164,9 @@ def refine_ordinary(
             profiles={request.key: profile},
             profile_buckets={request.key: {str(tokens): entry}},
         )
+    # A successful measurement clears the in-process failure suppression for
+    # this (key, tokens) point.
+    clear_refine_failed(device, request.key, tokens)
     return {**entry, "persisted": persisted}
 
 
@@ -2114,8 +2198,7 @@ def _calibrate_ordinary(
     persisted = publish_calibration(
         device, request.family, profiles={request.key: profile}
     )
-    failed = _store_projection(request.family, "failed")
-    failed.discard((_device_key(device), request.key))
+    _clear_calibration_failed(device, request.key)
     return {**profile, "status": "measured", "persisted": persisted}
 
 

@@ -108,6 +108,8 @@ def resolve_execution(
             has_topk_length=m.has_lengths,
             has_extra_topk_length=m.has_extra_lengths,
             has_attn_sink=m.has_sink,
+            page_stride_bytes=m.page_stride_bytes,
+            extra_page_stride_bytes=m.extra_page_stride_bytes,
         )
         if nvfp4_selected is None:
             raise ValueError("no NVFP4 attention route serves this metadata")
@@ -585,6 +587,8 @@ def caller_run(
         # The executor ABI requires tensors even when prefill has no scratch.
         # These aliases are never accessed by a zero-workspace plan.
         mid, mlse = output, output.view(torch.float32)
+    # inspect accepts a capacity LSE view but execute requires the exact
+    # [T, H] shape; slice caller buffers like the wrapper does.
     current.execute(
         q,
         cache,
@@ -598,7 +602,7 @@ def caller_run(
         extra_lengths,
         mid,
         mlse,
-        lse,
+        lse[: q.shape[0], : q.shape[1]],
     )
 
 
@@ -654,7 +658,9 @@ def functional_run(
             for shape, dtype, _, _ in requirements
         ]
     mid, mlse = views[:2]
-    result = lse if lse is not None else views[2]
+    # inspect accepts a capacity LSE view but execute requires the exact
+    # [T, H] shape; slice caller buffers like the wrapper does.
+    result = lse[: q.shape[0], : q.shape[1]] if lse is not None else views[2]
     current.execute(
         q,
         cache,

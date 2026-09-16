@@ -44,10 +44,12 @@ Explicit DSV4.1 FP8/BF16 without a matching profile uses decode CPB=1.
 Ordinary FP8 prefill requires whole 64-wide index tiles and family-specific
 heads; DOTS3_SWA additionally requires topk >= 513. Full-BF16 DSV4.1 prefill
 supports runtime H=1..128 and positive ragged topk. DSV4 NVFP4
-has a separate compiled envelope. The public config query describes decode
-capabilities and loads a compiled host module on its first use; import alone
-neither compiles nor initializes CUDA. Eligibility and workspace facts come
-from C++, not Python support tables.
+has a separately keyed envelope. The public config query and the dispatch
+envelope membership probes are pure-Python coarse pre-filters over
+family-level static tables: they neither compile nor initialize CUDA (usable
+on GPU-less hosts and under FLASHINFER_DISABLE_JIT), and the C++ dispatcher
+remains authoritative for member shapes. Execution-time eligibility and
+workspace facts come from C++, not Python support tables.
 """
 
 from __future__ import annotations
@@ -101,6 +103,7 @@ from ._policy import (
     _decode_chunk_width,
     _decode_scratch_heads,
     _MODEL_TYPE_TO_FAMILY,
+    _STATIC_DECODE_ENVELOPE,
     _D_V,
     KernelVariant,  # noqa: F401 (compatibility export)
     _normalize_prefill_impl,
@@ -129,6 +132,8 @@ class SparseMLASm120DecodeConfig:
     decode-form shapes in its own envelope; NVFP4 currently uses the same
     exact head/top-k envelope for both kernels. Crossover calibration may
     route an eligible shape to prefill. This config describes decode only.
+    Values come from static Python tables (a coarse pre-filter for init-time
+    probes); the C++ dispatcher is authoritative.
 
     Attributes
     ----------
@@ -252,7 +257,12 @@ def supported_sparse_mla_sm120_configs(
 
     Lets callers validate a serving configuration at initialization time
     instead of discovering an uninstantiated ``(num_heads, topk)`` pair on the
-    first decode-form request.
+    first decode-form request. The answer comes from family-level static
+    Python tables — a coarse pre-filter that never compiles a kernel or
+    initializes CUDA, so it works on GPU-less hosts and under
+    ``FLASHINFER_DISABLE_JIT``. The C++ dispatcher remains authoritative: a
+    shape inside an envelope can still be rejected at dispatch time by
+    metadata rules (layout, precision, dual-cache pairing).
 
     Parameters
     ----------
@@ -284,9 +294,9 @@ def supported_sparse_mla_sm120_configs(
             f"kv_cache_format must be either 'fp8' or 'nvfp4', got {kv_cache_format!r}"
         )
     if kv_cache_format == "nvfp4":
-        from ._execution import dsv4_nvfp4_format_info
+        from ._dsv4_nvfp4_policy import _STATIC_FORMAT
 
-        facts = dsv4_nvfp4_format_info()
+        facts = _STATIC_FORMAT
         return {
             "dsv4": SparseMLASm120DecodeConfig(
                 d_qk=facts["query_dim"],
@@ -303,8 +313,6 @@ def supported_sparse_mla_sm120_configs(
             )
         }
 
-    from ._execution import format_info, main_page_sizes
-
     probes = (
         _DECODE_DSV3_2_TOPKS,
         _DECODE_DSV4_TOPKS,
@@ -315,17 +323,17 @@ def supported_sparse_mla_sm120_configs(
     )
     result = {}
     for model, family in _MODEL_TYPE_TO_FAMILY.items():
-        info = format_info(model)
+        envelope = _STATIC_DECODE_ENVELOPE[model]
         result[family] = SparseMLASm120DecodeConfig(
-            d_qk=info["query_dim"],
-            page_block_size=info["page_size"],
+            d_qk=envelope.d_qk,
+            page_block_size=envelope.page_block_size,
             max_num_tokens=_DECODE_MAX_TOKENS,
             topks=probes[model],
-            min_topk=info["min_topk"],
-            max_num_heads=info["max_heads"],
-            bytes_per_token=info["bytes_per_token"],
-            page_block_sizes=frozenset(main_page_sizes(model)),
-            page_block_size_is_runtime=bool(info["runtime_page"]),
+            min_topk=envelope.min_topk,
+            max_num_heads=envelope.max_num_heads,
+            bytes_per_token=envelope.bytes_per_token,
+            page_block_sizes=envelope.page_block_sizes,
+            page_block_size_is_runtime=envelope.page_block_size_is_runtime,
         )
     result["glm_nsa"] = result["dsv3_2"]
     return result
@@ -571,7 +579,7 @@ def get_sparse_mla_sm120_module():
         extra_topk_length: Optional[torch.Tensor],
         mid_out: Optional[torch.Tensor],
         mid_lse: Optional[torch.Tensor],
-        extra_fp4: bool,
+        extra_fp4: bool = False,
     ) -> None:
         num_tokens = q.shape[0]
         _require_d_v(d_v, model_type)
@@ -837,7 +845,10 @@ class _SparseMLAPagedAttentionRunner:
         main topk=128/512 and PBS=64; extra topk>0 with PBS=2/64. It retains
         NVFP4 Q/P quantization and V requantization, BF16 RoPE, and the separately
         calibrated non-monotonic decode/streaming selection. CPB=0 keeps its
-        existing heuristic. DSV4 NVFP4 graphs reuse warmed plans without tuning
+        existing heuristic. NVFP4 profiles apply only to the canonical packed
+        page layout (page pitch == page_size * 384 bytes); calls with padded
+        page strides keep the decode-first fallback. DSV4 NVFP4 graphs reuse
+        warmed plans without tuning
         during capture and pin scratch as described above; LSE is contiguous.
     device : Optional[torch.device]
         Allocation target. Defaults to the current CUDA device.

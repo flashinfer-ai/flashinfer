@@ -41,6 +41,7 @@ from __future__ import annotations
 import enum
 import functools
 import logging
+import threading
 from dataclasses import dataclass
 from typing import Iterator, Optional, TypeVar
 
@@ -94,32 +95,87 @@ def _decode_chunk_width(model_type: int) -> int:
 # Default page size for calibration probes, not the eligibility boundary.
 _PAGE_BLOCK_SIZE = 64
 
+_DECODE_MAX_HEADS = 128
+
+
+@dataclass(frozen=True)
+class _StaticFamilyEnvelope:
+    """Coarse static decode envelope of one ordinary kernel family.
+
+    Pure Python by construction: init-time capability probes (vLLM imports the
+    ``_DECODE_*_DISPATCH`` objects and ``supported_sparse_mla_sm120_configs``)
+    must work on hosts without a GPU and under ``FLASHINFER_DISABLE_JIT``, so
+    membership never resolves through the compiled module. The C++ dispatcher
+    stays authoritative — a member shape can still be rejected at dispatch
+    (layout, precision, dual-cache rules); this table is a coarse pre-filter,
+    not a mirror of the compiled instantiation set, so no static-vs-compiled
+    parity test pins it. ``page_block_sizes``/``page_block_size_is_runtime``
+    describe the main-cache page envelope: every ordinary family currently
+    accepts independent positive page sizes.
+    """
+
+    d_qk: int
+    bytes_per_token: int
+    min_topk: int = 1
+    max_num_heads: int = _DECODE_MAX_HEADS
+    page_block_size: int = 64  # default/probe page size
+    page_block_sizes: frozenset[int] = frozenset()
+    page_block_size_is_runtime: bool = True
+    dedicated_heads: frozenset[int] = frozenset({8, 16, 32, 64, 128})
+
+
+_STATIC_DECODE_ENVELOPE = {
+    _MODEL_TYPE_DSV3_2: _StaticFamilyEnvelope(d_qk=576, bytes_per_token=656),
+    _MODEL_TYPE_DSV4: _StaticFamilyEnvelope(d_qk=512, bytes_per_token=584),
+    _MODEL_TYPE_GLM_NSA: _StaticFamilyEnvelope(d_qk=576, bytes_per_token=656),
+    _MODEL_TYPE_GLM53_NOPE: _StaticFamilyEnvelope(
+        d_qk=512, bytes_per_token=528, dedicated_heads=frozenset({8, 16, 32, 64})
+    ),
+    _MODEL_TYPE_DOTS3_SWA: _StaticFamilyEnvelope(
+        d_qk=1088,
+        bytes_per_token=1160,
+        min_topk=513,
+        dedicated_heads=frozenset({8, 16, 32, 64}),
+    ),
+    _MODEL_TYPE_DSV4_1: _StaticFamilyEnvelope(d_qk=512, bytes_per_token=528),
+}
+
 
 class _DecodeDispatchEnvelope:
-    """Compiled decode capabilities for downstream compatibility probes.
+    """Coarse ``(num_heads, topk)`` decode membership for one kernel family.
 
-    Membership covers runtime heads/topk. Iteration yields each dedicated head
-    specialization paired with the minimum legal runtime topk, not every legal
-    pair: ordinary decode has no topk specializations.
+    topk is a runtime kernel argument, so the envelope is a predicate, not a
+    pair set: ``(h, k) in envelope`` iff ``1 <= h <= max_num_heads`` and
+    ``k >= min_topk`` in the family's static probe table (a pre-filter; the
+    C++ dispatcher remains authoritative for member shapes). Iteration yields
+    each dedicated head specialization paired with the minimum legal runtime
+    topk, not every legal pair: ordinary decode has no topk specializations.
     """
+
+    __slots__ = ("model",)
 
     def __init__(self, model: int) -> None:
         self.model = model
 
     def __iter__(self) -> Iterator[tuple[int, int]]:
-        from ._execution import query
-
-        topk = format_info(self.model)["min_topk"]
-        return ((head, topk) for head in query("decode_head_counts", self.model))
+        envelope = _STATIC_DECODE_ENVELOPE[self.model]
+        topk = envelope.min_topk
+        return ((head, topk) for head in sorted(envelope.dedicated_heads))
 
     def __contains__(self, pair: object) -> bool:
         if not isinstance(pair, tuple) or len(pair) != 2:
             return False
         h, k = pair
+        if not isinstance(h, int) or not isinstance(k, int):
+            return False
+        envelope = _STATIC_DECODE_ENVELOPE[self.model]
+        return 1 <= h <= envelope.max_num_heads and k >= envelope.min_topk
+
+    def __repr__(self) -> str:
+        envelope = _STATIC_DECODE_ENVELOPE[self.model]
         return (
-            isinstance(h, int)
-            and isinstance(k, int)
-            and 0 in _candidates(self.model, h, k, _PAGE_BLOCK_SIZE, False)
+            f"_DecodeDispatchEnvelope(num_heads<={envelope.max_num_heads}, "
+            f"topk>={envelope.min_topk})"
         )
 
 
@@ -185,6 +241,37 @@ class PlannedCall:
 
 canonical_profile_layout = _cpb.canonical_profile_layout
 
+# Lazy tuning-time calibration guard, symmetric with the NVFP4 policy's
+# ``_calibration_lock``/``_calibrating``: a re-entrant or concurrent
+# profile_selection for the same key must not start a second measurement.
+_calibration_lock = threading.RLock()
+_calibrating: set[tuple[str | None, str, str]] = set()
+
+
+def _lazy_calibrated_profile(request, device) -> Optional[dict]:
+    """Calibrate one ordinary request at tuning time, guarded against re-entry.
+
+    Returns the profile dict, or ``None`` when measurement failed, is already
+    in flight on this thread or another, or a concurrent caller produced the
+    profile first.
+    """
+    with _cpb._store_lock:
+        _cpb.refresh_store()
+        scope = _cpb._active_scope
+    guard_key = (scope, _cpb._device_key(device), request.key)
+    with _calibration_lock:
+        if guard_key in _calibrating:
+            return None
+        profile = _cpb.get_ordinary_profile(request, device)
+        if profile is not None:
+            return profile
+        _calibrating.add(guard_key)
+        try:
+            result = _cpb._calibrate_ordinary(request, device, False)
+        finally:
+            _calibrating.discard(guard_key)
+    return None if result["status"] == "failed" else result
+
 
 def profile_selection(metadata, device, precision: str) -> Optional[PlannedCall]:
     if not canonical_profile_layout(metadata):
@@ -213,8 +300,7 @@ def profile_selection(metadata, device, precision: str) -> Optional[PlannedCall]
         and not _cpb._target_capturing(device)
         and not _cpb.is_calibration_failed(device, request.key)
     ):
-        result = _cpb._calibrate_ordinary(request, device, False)
-        profile = result if result["status"] != "failed" else None
+        profile = _lazy_calibrated_profile(request, device)
     if profile is None:
         return None
     if (
@@ -222,15 +308,18 @@ def profile_selection(metadata, device, precision: str) -> Optional[PlannedCall]
         and m.tokens <= _DECODE_MAX_TOKENS
         and str(m.tokens) not in profile["buckets"]
         and not _cpb._target_capturing(device)
+        and not _cpb.is_refine_failed(device, request.key, m.tokens)
     ):
         # Tuning mode: measure this exact token count once so the selection
-        # stops interpolating from the canonical grid.
+        # stops interpolating from the canonical grid. A failed measurement is
+        # suppressed in-process instead of being retimed on every call.
         try:
             refined = _cpb.refine_ordinary(request, device, m.tokens)
         except (CalibrationError, RuntimeError) as error:
             logger.debug(
                 "%s refine skipped at tokens=%d: %s", request.family, m.tokens, error
             )
+            _cpb.mark_refine_failed(device, request.key, m.tokens)
             refined = None
         if refined is not None:
             profile = _cpb.get_ordinary_profile(request, device)

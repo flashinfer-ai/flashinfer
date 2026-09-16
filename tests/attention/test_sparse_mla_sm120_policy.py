@@ -212,6 +212,78 @@ def test_downstream_decode_dispatch_iteration(sm120_module) -> None:
     assert (48, 384) not in pairs
 
 
+def test_capability_probes_stay_jit_free(monkeypatch) -> None:
+    """The config query and dispatch-envelope probes are pure-Python coarse
+    pre-filters: no compiled module and no CUDA, so they work on GPU-less
+    hosts and under FLASHINFER_DISABLE_JIT. The C++ dispatcher remains
+    authoritative for member shapes."""
+    block_module_loading(monkeypatch)
+    configs = supported_sparse_mla_sm120_configs()
+    assert set(configs) == {
+        "dsv4",
+        "dsv3_2",
+        "glm_nsa",
+        "glm53_nope",
+        "dots3_swa",
+        "dsv4_1",
+    }
+    assert configs["dsv4"].supports_decode(num_heads=64, topk=256)
+    assert configs["dsv4_1"].bytes_per_token == 528
+    nvfp4 = supported_sparse_mla_sm120_configs(kv_cache_format="nvfp4")
+    assert nvfp4["dsv4"].bytes_per_token == 384
+    assert nvfp4["dsv4"].supported_num_heads() == (16, 32, 64, 128)
+    assert (48, 384) in _DECODE_DSV4_DISPATCH
+    assert (256, 384) not in _DECODE_DSV4_DISPATCH
+    assert (64, 512) not in _DECODE_DOTS3_SWA_DISPATCH
+    assert tuple(h for h, _ in _DECODE_DSV4_DISPATCH) == (8, 16, 32, 64, 128)
+    assert tuple(h for h, _ in _DECODE_GLM53_NOPE_DISPATCH) == (8, 16, 32, 64)
+    assert (
+        repr(_DECODE_DSV4_DISPATCH)
+        == "_DecodeDispatchEnvelope(num_heads<=128, topk>=1)"
+    )
+    assert (
+        repr(_DECODE_DOTS3_SWA_DISPATCH)
+        == "_DecodeDispatchEnvelope(num_heads<=128, topk>=513)"
+    )
+
+
+def test_downstream_capability_probes_without_cuda_or_jit() -> None:
+    """Init-time probes in a fresh process with JIT and CUDA both blocked."""
+    import subprocess
+    import sys
+
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import torch
+from unittest.mock import patch
+from flashinfer.jit.core import JitSpec
+
+initialized = torch.cuda.is_initialized()
+with (
+    patch.object(JitSpec, "build_and_load", side_effect=AssertionError("early JIT")),
+    patch.object(torch.cuda, "_lazy_init", side_effect=AssertionError("early CUDA")),
+):
+    from flashinfer.mla import supported_sparse_mla_sm120_configs
+    from flashinfer.mla._sparse_mla_sm120 import _DECODE_DSV4_DISPATCH
+
+    configs = supported_sparse_mla_sm120_configs()
+    assert configs["dsv4"].supports_decode(num_heads=64, topk=256)
+    assert configs["dsv4_1"].page_block_size_is_runtime
+    nvfp4 = supported_sparse_mla_sm120_configs(kv_cache_format="nvfp4")
+    assert nvfp4["dsv4"].bytes_per_token == 384
+    assert (64, 512) in _DECODE_DSV4_DISPATCH
+    assert (256, 512) not in _DECODE_DSV4_DISPATCH
+    assert repr(_DECODE_DSV4_DISPATCH).startswith("_DecodeDispatchEnvelope(")
+assert torch.cuda.is_initialized() == initialized
+""",
+        ],
+        check=True,
+    )
+
+
 def test_supported_configs_families(sm120_module, ordinary_format_facts) -> None:
     """The query API mirrors the decode dispatch envelopes exactly."""
     from flashinfer.mla._sparse_mla_sm120._execution import format_info
@@ -308,6 +380,19 @@ def test_supported_configs_nvfp4_envelope(sm120_module) -> None:
 
     with pytest.raises(ValueError, match="kv_cache_format"):
         supported_sparse_mla_sm120_configs(kv_cache_format="int4")
+
+
+def test_paged_attention_custom_op_extra_fp4_default(sm120_module) -> None:
+    """The paged-attention custom op declares extra_fp4 with a default so the
+    torch.library schema stays compatible with pre-extra_fp4 callers."""
+    import inspect
+
+    from flashinfer.mla._sparse_mla_sm120 import get_sparse_mla_sm120_module
+
+    parameter = inspect.signature(
+        get_sparse_mla_sm120_module().paged_attention
+    ).parameters["extra_fp4"]
+    assert parameter.default is False
 
 
 def test_nvfp4_exact_head_scratch_view() -> None:
@@ -1339,6 +1424,7 @@ def planner_state(monkeypatch):
     monkeypatch.setattr(cpb_mod, "_device_key", lambda _device: "0:Fake SM120")
     monkeypatch.setattr(cpb_mod, "_maybe_load_disk", lambda: None)
     monkeypatch.setattr(cpb_mod, "get_profile", lambda key, _device: profiles.get(key))
+    monkeypatch.setattr(cpb_mod, "_refine_failed", set())
     monkeypatch.setattr(native_policy, "_maybe_calibrate", lambda **_kwargs: None)
     monkeypatch.setattr(native_policy, "_plan_memo", {})
     return profiles
@@ -1516,3 +1602,74 @@ def test_nvfp4_plan_refines_exact_tokens_in_tuning(planner_state, monkeypatch) -
     # Above the decode envelope no refinement is attempted.
     assert _plan(8192).variant is native_policy.NVFP4KernelVariant.PREFILL_STREAMING
     assert refined == [12]
+
+
+def test_nvfp4_plan_suppresses_failed_refine(planner_state, monkeypatch) -> None:
+    """A failed exact-T refinement is suppressed in-process for (key, tokens)
+    instead of being retimed on every tuning-mode call."""
+    from types import SimpleNamespace
+
+    planner_state[_profile_key()] = _profile({})
+    native_policy._plan_memo.clear()
+    monkeypatch.setattr(
+        native_policy.AutoTuner,
+        "get",
+        lambda: SimpleNamespace(is_tuning_mode=True, _get_skip_ops_stack=lambda: []),
+    )
+    attempts = []
+
+    def failing_refine(device, *, tokens, **fields):
+        attempts.append(tokens)
+        raise native_policy.CalibrationError("refine failed")
+
+    monkeypatch.setattr(native_policy, "refine_nvfp4", failing_refine)
+    for _ in range(2):
+        planned = _plan(5)
+        assert planned is not None
+        assert planned.variant is native_policy.NVFP4KernelVariant.DECODE_SPLITK
+        assert planned.cpb == 1  # the nearest-up bucket still serves
+    assert attempts == [5]
+
+
+def test_nvfp4_canonical_profile_layout_predicate() -> None:
+    """Packed page pitches are canonical; padded (legal) pitches are not.
+    Unspecified strides default to canonical for metadata-less callers."""
+    canonical = native_policy._canonical_profile_layout
+    packed = 64 * 384
+    assert canonical(64, packed, 0, 0, None)
+    assert canonical(64, None, 0, 0, None)
+    assert not canonical(64, packed + 128, 0, 0, None)
+    assert canonical(64, packed, 512, 2, 2 * 384)
+    assert canonical(64, packed, 512, 2, None)
+    assert not canonical(64, packed, 512, 2, 3 * 384)
+
+
+def test_nvfp4_noncanonical_layout_skips_profile(planner_state, monkeypatch) -> None:
+    """Padded page strides consume no measured profile and start no lazy
+    calibration; the same shape with packed strides uses both."""
+    from types import SimpleNamespace
+
+    planner_state[_profile_key()] = _profile({}, {16: 3})
+    native_policy._plan_memo.clear()
+    planned = _plan(16, page_stride_bytes=64 * 384 + 128)
+    assert planned is not None
+    assert planned.variant is native_policy.NVFP4KernelVariant.DECODE_SPLITK
+    assert planned.cpb == 0  # the measured bucket is not consumed
+    planned = _plan(16, page_stride_bytes=64 * 384)
+    assert planned is not None and planned.cpb == 3
+
+    calls = []
+    monkeypatch.setattr(
+        native_policy, "_maybe_calibrate", lambda **kwargs: calls.append(kwargs)
+    )
+    monkeypatch.setattr(
+        native_policy.AutoTuner,
+        "get",
+        lambda: SimpleNamespace(is_tuning_mode=True, _get_skip_ops_stack=lambda: []),
+    )
+    # No stored profile for this key (has_topk_length=False): padded strides
+    # must not start measurement; canonical strides do.
+    padded = _plan(4, has_topk_length=False, page_stride_bytes=64 * 384 + 128)
+    assert padded is not None and not calls
+    _plan(4, has_topk_length=False)
+    assert len(calls) == 1

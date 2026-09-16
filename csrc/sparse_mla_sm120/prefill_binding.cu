@@ -63,6 +63,12 @@ void SparseMlaSm120PagedAttention(TensorView q, TensorView kv_cache, TensorView 
                     cudaSuccess);
   const auto plan = execution::resolve_attention(metadata, execution::NumericRoute::QkBF16PvFP8, 1,
                                                  {sm_count, size_t(max_shared)});
+  // Implicit contract: only pointers and sm_scale are populated here. Every
+  // route this binding can resolve takes its geometry (tokens, heads, topk,
+  // page sizes, strides) from plan.metadata via dispatch_prefill's
+  // PrefillColdParams — the QkBF16PvFP8 request above never selects the
+  // FullBF16 prefill kernel, which is the sole consumer of
+  // AttentionParams::num_tokens/num_heads.
   execution::AttentionParams params{};
   params.q = static_cast<const __nv_bfloat16*>(q.data_ptr());
   params.kv = static_cast<const uint8_t*>(kv_cache.data_ptr());

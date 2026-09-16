@@ -155,10 +155,9 @@ def store(monkeypatch, tmp_path):
         "_cpb_overrides",
         "_failed",
         "_crossover_failed",
+        "_refine_failed",
     ):
-        monkeypatch.setattr(
-            cpb_mod, name, set() if name in ("_failed", "_crossover_failed") else {}
-        )
+        monkeypatch.setattr(cpb_mod, name, set() if name.endswith("failed") else {})
     return torch.device("cpu:0")
 
 
@@ -1671,6 +1670,79 @@ def test_missing_or_corrupt_cache_falls_back(clean_cpb_state, tmp_path) -> None:
     assert _resolve_cpb(device, "dsv4", 1, 16, 1024, 0) == -1
 
 
+def _write_unparsable_same_schema_cache(store) -> None:
+    """A document with a matching schema/protocol but corrupt device entries:
+    readers treat it as absent; publish must not escape it as a non-OSError."""
+    path = cpb_mod.default_cache_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": cpb_mod._SCHEMA_VERSION,
+                "timing_protocol": cpb_mod._TIMING_PROTOCOL,
+                "devices": {
+                    cpb_mod._device_key(store): {"dsv3_2": {"inv_bw": "corrupt"}}
+                },
+            }
+        )
+    )
+
+
+def test_publish_rebuilds_unparsable_same_schema_devices(store) -> None:
+    _write_unparsable_same_schema_cache(store)
+    assert cpb_mod.publish_calibration(store, "dsv4", constants=_C)
+    assert cpb_mod.get_constants(store, "dsv4") == _C
+    # The corrupt entry is dropped: readers could never use it.
+    devices = json.loads(cpb_mod.default_cache_path().read_text())["devices"]
+    assert "dsv3_2" not in devices[cpb_mod._device_key(store)]
+    assert devices[cpb_mod._device_key(store)]["dsv4"] == cpb_mod.asdict(_C)
+
+
+def test_warmup_publish_tolerates_unparsable_disk(store, monkeypatch) -> None:
+    """The lazy warmup path (``_calibrate_ordinary``) must not see a
+    non-OSError escape from publish when the cache file is corrupt."""
+    _write_unparsable_same_schema_cache(store)
+    monkeypatch.setattr(
+        cpb_mod,
+        "_measure_ordinary",
+        lambda request, device: {
+            "request": request.effective,
+            "buckets": {str(t): {"variant": 0, "cpb": 1} for t in cpb_mod._PROFILE_T},
+        },
+    )
+    result = cpb_mod._calibrate_ordinary(
+        cpb_mod._OrdinaryRequest(16, 128, family="dsv4"), store, False
+    )
+    assert result["status"] == "measured" and result["persisted"]
+    # The rebuilt document carries the measured profile.
+    request = cpb_mod._OrdinaryRequest(16, 128, family="dsv4")
+    assert cpb_mod.get_ordinary_profile(request, store) is not None
+
+
+def test_failure_marks_persist_across_disk_changes(store) -> None:
+    """In-process failure marks survive disk cache reloads; only a successful
+    publish of the same (device, key) clears them."""
+    cpb_mod.mark_calibration_failed(store, "dsv4")
+    cpb_mod.mark_crossover_failed(store, "dsv4")
+    path = cpb_mod.default_cache_path()
+    # An external writer lands a fresh valid document: the token changes.
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": cpb_mod._SCHEMA_VERSION,
+                "timing_protocol": cpb_mod._TIMING_PROTOCOL,
+                "devices": {cpb_mod._device_key(store): {"dsv3_2": cpb_mod.asdict(_C)}},
+            }
+        )
+    )
+    assert cpb_mod.get_constants(store, "dsv3_2") == _C  # the refresh happened
+    assert cpb_mod.is_calibration_failed(store, "dsv4")
+    assert cpb_mod.is_crossover_failed(store, "dsv4")
+    assert cpb_mod.save_constants(store, "dsv4", _C)
+    assert not cpb_mod.is_calibration_failed(store, "dsv4")
+    assert not cpb_mod.is_crossover_failed(store, "dsv4")
+
+
 def test_stale_schema_read_once_until_changed(isolated_cpb):
     from pathlib import Path
     from unittest.mock import patch
@@ -2110,6 +2182,129 @@ def test_profile_selection_refines_exact_tokens_in_tuning(
     assert policy.profile_selection(m._replace(tokens=65), store, "fp8").variant == 1
 
 
+def test_profile_selection_lazy_calibration_reentry_guard(
+    store, monkeypatch, ordinary_format_facts
+):
+    """A re-entrant profile_selection during lazy calibration takes the
+    no-calibration fallback instead of nesting a second measurement for the
+    same key (guard symmetric with the NVFP4 policy)."""
+    from types import SimpleNamespace
+    from flashinfer.mla._sparse_mla_sm120 import _policy as policy
+    from flashinfer.mla._sparse_mla_sm120._execution import AttentionMetadata
+
+    monkeypatch.setattr(
+        policy.AutoTuner,
+        "get",
+        lambda: SimpleNamespace(is_tuning_mode=True, _get_skip_ops_stack=lambda: []),
+    )
+    monkeypatch.setattr(policy._cpb, "_target_capturing", lambda device: False)
+    m = AttentionMetadata(
+        5,
+        5,
+        16,
+        128,
+        0,
+        64,
+        0,
+        64 * 528,
+        0,
+        528,
+        128,
+        0,
+        16,
+        False,
+        False,
+        False,
+        False,
+        0,
+    )
+    calls = []
+
+    def reentrant(request, device, force):
+        calls.append(request.key)
+        # Re-entrant selection for the same in-flight key must not measure.
+        assert policy.profile_selection(m, store, "fp8") is None
+        return {"status": "failed", "error": "boom", "persisted": False}
+
+    monkeypatch.setattr(policy._cpb, "_calibrate_ordinary", reentrant)
+    assert policy.profile_selection(m, store, "fp8") is None
+    assert len(calls) == 1
+    # The guard releases after the attempt: a later call retries.
+    assert policy.profile_selection(m, store, "fp8") is None
+    assert len(calls) == 2
+
+
+def test_profile_selection_suppresses_failed_refine(
+    store, monkeypatch, ordinary_format_facts
+):
+    """A failed exact-token refinement is not retimed on every tuning call; a
+    successful explicit refinement clears the suppression."""
+    from types import SimpleNamespace
+    from flashinfer.mla._sparse_mla_sm120 import _policy as policy
+    from flashinfer.mla._sparse_mla_sm120._execution import AttentionMetadata
+
+    request = cpb_mod._OrdinaryRequest(16, 128)
+    profile = {
+        "request": request.effective,
+        "buckets": {
+            str(t): {"variant": 0, "cpb": 1, "decode_s": 1e-5, "prefill_s": 1e-5}
+            for t in cpb_mod._PROFILE_T
+        },
+    }
+    cpb_mod.publish_calibration(store, "dsv4_1", profiles={request.key: profile})
+    monkeypatch.setattr(
+        policy.AutoTuner,
+        "get",
+        lambda: SimpleNamespace(is_tuning_mode=True, _get_skip_ops_stack=lambda: []),
+    )
+    monkeypatch.setattr(policy._cpb, "_target_capturing", lambda device: False)
+    monkeypatch.setattr(cpb_mod, "_ordinary_measure_context", lambda *args: object())
+    attempts = []
+
+    def failing(req, ctx, tokens):
+        attempts.append(tokens)
+        raise cpb_mod.CalibrationError("refine failed")
+
+    monkeypatch.setattr(cpb_mod, "_measure_ordinary_bucket", failing)
+    m = AttentionMetadata(
+        5,
+        5,
+        16,
+        128,
+        0,
+        64,
+        0,
+        64 * 528,
+        0,
+        528,
+        128,
+        0,
+        16,
+        False,
+        False,
+        False,
+        False,
+        0,
+    )
+    for _ in range(2):
+        selected = policy.profile_selection(m, store, "fp8")
+        assert selected is not None and selected.cpb == 1  # nearest-up bucket
+    assert attempts == [5]  # the second call is suppressed in-process
+    # A successful explicit refinement clears the suppression mark.
+    monkeypatch.setattr(
+        cpb_mod,
+        "_measure_ordinary_bucket",
+        lambda req, ctx, tokens: {
+            "variant": 0,
+            "cpb": 2,
+            "decode_s": 2e-5,
+            "prefill_s": 1e-5,
+        },
+    )
+    assert cpb_mod.refine_ordinary(request, store, 5)["cpb"] == 2
+    assert not cpb_mod.is_refine_failed(store, request.key, 5)
+
+
 @pytest.fixture(params=["dsv4_1", "dsv4_nvfp4"])
 def refined_profile(request, store, monkeypatch, ordinary_format_facts):
     family = request.param
@@ -2308,6 +2503,7 @@ def test_profile_pool_initialization_releases_before_retry(
     monkeypatch.setattr(cpb_mod, "format_info", lambda *args: facts)
     monkeypatch.setattr(native, "dsv4_nvfp4_format_info", lambda: facts)
     monkeypatch.setattr(cpb_mod, "_check_pool_capacity", lambda *args: None)
+    monkeypatch.setattr(cpb_mod, "_device_l2", lambda device: 0)
     monkeypatch.setattr(cpb_mod, "_POOL_BYTES_MIN", 1024)
     monkeypatch.setattr(native, "_POOL_BYTES_TARGET", 4096)
     monkeypatch.setattr(native, "_POOL_BYTES_MIN", 1024)
@@ -2474,6 +2670,49 @@ def test_pool_allocation_limits_and_non_oom_propagation(
                 call()
             assert caught.value.error_code == 700
             assert len(allocations) == 4 and empty.call_count == 2
+
+
+def test_nvfp4_dual_pool_floors_track_device_l2(store, monkeypatch):
+    """GB202-class L2 (96 MiB): the dual-cache segment floor must clear 2xL2
+    plus page rounding instead of misfiring the capacity guard at the static
+    128 MiB floor."""
+    l2 = 96 << 20
+    monkeypatch.setattr(cpb_mod, "_device_l2", lambda device: l2)
+    monkeypatch.setattr(
+        native, "dsv4_nvfp4_format_info", lambda: {"bytes_per_token": 384}
+    )
+    requested = []
+
+    def fake_pool(page_size, pool_bytes, device):
+        requested.append((page_size, pool_bytes))
+        page_bytes = page_size * 384
+        # The real capacity guard runs on the rounded-down allocation.
+        cpb_mod._check_pool_capacity(device, pool_bytes // page_bytes * page_bytes)
+        return None, pool_bytes // 384
+
+    monkeypatch.setattr(native, "_allocate_cache_pool", fake_pool)
+    native._allocate_calibration_pools(store, 64, 2048, 64, 2)
+    (primary_page, primary_bytes), (extra_page, extra_bytes) = requested
+    assert (primary_page, extra_page) == (64, 2)
+    assert primary_bytes >= max(native._MIN_POOL_PER_SEGMENT, 2 * l2 + 64 * 384)
+    assert extra_bytes >= max(native._MIN_POOL_PER_SEGMENT, 2 * l2 + 2 * 384)
+
+
+def test_nvfp4_dual_pool_oom_message_names_l2_floor(
+    store, monkeypatch, accelerator_error
+):
+    """The OOM fallback error names the real constraint (2x L2 per segment),
+    not just the aggregate 512 MiB floor."""
+    monkeypatch.setattr(cpb_mod, "_device_l2", lambda device: 96 << 20)
+    monkeypatch.setattr(
+        native, "dsv4_nvfp4_format_info", lambda: {"bytes_per_token": 384}
+    )
+    monkeypatch.setattr(
+        native, "_allocate_cache_pool", Mock(side_effect=accelerator_error())
+    )
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    with pytest.raises(cpb_mod.CalibrationError, match="twice the device L2"):
+        native._allocate_calibration_pools(store, 64, 128, 128, 64)
 
 
 def test_eviction_non_oom_propagates(fake_cuda, monkeypatch, accelerator_error):

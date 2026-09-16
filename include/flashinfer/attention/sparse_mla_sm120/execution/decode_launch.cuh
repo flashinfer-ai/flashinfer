@@ -12,7 +12,7 @@
 
 namespace flashinfer::sparse_mla_sm120::execution {
 
-template <ModelType MT, int NUM_HEADS, int PAGE_BLOCK_SIZE>
+template <ModelType MT, int NUM_HEADS>
 cudaError_t launch_decode(const AttentionParams& p, const ExecutionPlan& plan,
                           cudaStream_t stream) {
   using KV = KVCacheTraits<MT>;
@@ -20,11 +20,10 @@ cudaError_t launch_decode(const AttentionParams& p, const ExecutionPlan& plan,
   const int q_heads = (NUM_HEADS == 0) ? p.num_heads : NUM_HEADS;
   const int smem_bytes = plan.shared_bytes;
   const int block_threads = plan.block_threads;
-  auto kernel = sparse_mla_decode_dsv4_kernel<MT, NUM_HEADS, PAGE_BLOCK_SIZE>;
+  auto kernel = sparse_mla_decode_dsv4_kernel<MT, NUM_HEADS>;
   if constexpr (MT == ModelType::DSV4_1) {
     if (plan.implementation == Implementation::MixedCache) {
-      kernel = sparse_mla_decode_dsv4_kernel<MT, NUM_HEADS, PAGE_BLOCK_SIZE,
-                                             Dsv41MixedCacheDecodeSchedule>;
+      kernel = sparse_mla_decode_dsv4_kernel<MT, NUM_HEADS, Dsv41MixedCacheDecodeSchedule>;
       cudaError_t result = validate_mixed_smem(kernel, smem_bytes);
       if (result != cudaSuccess) return result;
     }

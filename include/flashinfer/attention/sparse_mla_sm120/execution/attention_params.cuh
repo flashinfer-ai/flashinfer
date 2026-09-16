@@ -91,7 +91,6 @@ struct AttentionParams {
   size_t out_lse_stride_elems;
   int page_size;
   bool extra_fp4;
-  bool use_full_bf16 = false;
 };
 
 }  // namespace flashinfer::sparse_mla_sm120::execution

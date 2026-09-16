@@ -301,6 +301,89 @@ def test_sparse_mla_sm120_decode_dsv4_padded_row_rejected() -> None:
         )
 
 
+def test_sparse_mla_sm120_decode_dsv4_padded_out_lse() -> None:
+    """A capacity LSE buffer larger than [num_tokens, num_heads] works through
+    the functional entry points: inspect accepts capacity views while execute
+    requires the exact [T, H] shape, so the prepared layer slices the buffer
+    (wrapper behavior) instead of failing the execute-side check."""
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    d_qk, d_v = 512, 512
+    page_block_size, num_blocks, topk = 64, 64, 640
+    num_tokens, num_heads = 8, 64
+    s_kv = num_blocks * page_block_size
+
+    kv_bf16 = (
+        torch.randn(
+            num_blocks, page_block_size, 1, d_qk, device=device, dtype=torch.bfloat16
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    kv_packed = quantize_kv_dsv4(kv_bf16)
+    kv_dequant = dequantize_kv_dsv4(kv_packed)
+    q = (
+        torch.randn(num_tokens, num_heads, d_qk, device=device, dtype=torch.bfloat16)
+        / 10.0
+    ).clamp(-1, 1)
+    indices = torch.randint(
+        0, s_kv, (num_tokens, topk), device=device, dtype=torch.int32
+    )
+    indices[:, topk // 2 :] = -1
+    sm_scale = d_qk**-0.5
+    ref_out, ref_lse = _ref_sparse_attn(q, kv_dequant, indices, sm_scale, d_v)
+
+    mid_out, mid_lse = _make_decode_scratch(num_tokens, num_heads, topk, d_v, device)
+    padded_lse = torch.full(
+        (num_tokens + 3, 128), float("nan"), dtype=torch.float32, device=device
+    )
+    output = torch.zeros(
+        (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=device
+    )
+    sparse_mla_sm120_paged_attention(
+        q,
+        kv_packed,
+        indices,
+        output,
+        padded_lse,
+        sm_scale,
+        d_v=d_v,
+        mid_out=mid_out,
+        mid_lse=mid_lse,
+    )
+    torch.testing.assert_close(output, ref_out, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(
+        padded_lse[:num_tokens, :num_heads], ref_lse, atol=5e-2, rtol=5e-2
+    )
+    # The padding rows and columns are never written.
+    assert torch.isnan(padded_lse[num_tokens:]).all()
+    assert torch.isnan(padded_lse[:, num_heads:]).all()
+
+    # The caller-workspace functional entry point slices the same way.
+    from flashinfer.mla._sparse_mla_sm120._prepared import functional_run
+
+    workspace = torch.empty(8 << 20, dtype=torch.uint8, device=device)
+    padded_lse2 = torch.full(
+        (num_tokens + 2, 128), float("nan"), dtype=torch.float32, device=device
+    )
+    output2 = torch.zeros_like(output)
+    result = functional_run(
+        q,
+        kv_packed,
+        indices,
+        output2,
+        workspace,
+        sm_scale,
+        lse=padded_lse2,
+    )
+    assert result is not None and result.shape == (num_tokens, num_heads)
+    torch.testing.assert_close(output2, ref_out, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(
+        padded_lse2[:num_tokens, :num_heads], ref_lse, atol=5e-2, rtol=5e-2
+    )
+    assert torch.isnan(padded_lse2[num_tokens:]).all()
+    assert torch.isnan(padded_lse2[:, num_heads:]).all()
+
+
 def test_sparse_mla_sm120_decode_dsv4_indices_rows_checked() -> None:
     """The decode binding rejects an indices tensor whose leading dimension
     does not match num_tokens (mirrors the prefill-side guard)."""

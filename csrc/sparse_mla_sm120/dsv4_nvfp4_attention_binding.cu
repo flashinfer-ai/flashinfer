@@ -180,6 +180,9 @@ void attention(TensorView q, TensorView kv_cache, TensorView indices, Optional<T
   TVM_FFI_ICHECK_EQ(cudaDeviceGetAttribute(&max_shared, cudaDevAttrMaxSharedMemoryPerBlockOptin,
                                            q.device().device_id),
                     cudaSuccess);
+  // cpb narrows to resolve_dsv4_nvfp4's int parameter; reject values that
+  // would wrap instead of silently selecting a different chunking.
+  TVM_FFI_ICHECK(cpb >= 0 && cpb <= INT_MAX) << "NVFP4 cpb is out of int range: " << cpb;
   auto plan = execution::resolve_dsv4_nvfp4(
       tokens, heads, topk, p.extra_topk, layout.page_size, p.extra_page_size, p.page_stride_bytes,
       p.extra_page_stride_bytes, cpb, sm_count, max_shared, prefill, stage1_only);

@@ -483,10 +483,14 @@ __global__ void __launch_bounds__(DECODE_MERGE2_THREADS, 2)
   if (token_idx >= num_tokens || head_block >= H_BLOCKS) return;
   const int h_start = head_block * HPB;
   constexpr int VALID_HPB = NUM_HEADS < HPB ? NUM_HEADS : HPB;
+  // All current instantiations have NUM_HEADS % HPB == 0, so this folds to
+  // VALID_HPB; a future unaligned NUM_HEADS must clamp the tail head block
+  // instead of reading/writing past the head rows (merge.cuh guards per head).
+  const int valid_hpb = NUM_HEADS % HPB == 0 ? VALID_HPB : min(VALID_HPB, NUM_HEADS - h_start);
   __shared__ float weight0[HPB];
   __shared__ float weight1[HPB];
 
-  if (threadIdx.x < VALID_HPB) {
+  if (threadIdx.x < valid_hpb) {
     const int local_head = threadIdx.x;
     const int h = h_start + local_head;
     const float* lse_ptr = mid_lse + ((size_t)token_idx * NUM_HEADS + h) * 2;
@@ -514,7 +518,7 @@ __global__ void __launch_bounds__(DECODE_MERGE2_THREADS, 2)
   }
   __syncthreads();
 
-  for (int vec = threadIdx.x; vec < VALID_HPB * VECS_PER_HEAD; vec += DECODE_MERGE2_THREADS) {
+  for (int vec = threadIdx.x; vec < valid_hpb * VECS_PER_HEAD; vec += DECODE_MERGE2_THREADS) {
     const int local_head = vec / VECS_PER_HEAD;
     const int dim = (vec % VECS_PER_HEAD) * 8;
     const bf16* partial =

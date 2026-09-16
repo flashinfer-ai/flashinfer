@@ -353,12 +353,20 @@ __device__ __forceinline__ void prefill_mg_impl(
       float scores_log2[MG_N_HG][4];
       float vsc_cache[CT::N_V_CHUNKS][2];
       const int e0 = qk_nb + tid * 2;
-      bool valid0 = ib[e0] >= 0, valid1 = ib[e0 + 1] >= 0;
+      bool valid0, valid1;
       if constexpr (!ASSUME_FULL_TILES) {
         const int section_tile = (DUAL_CACHE && !is_main) ? ti - main_ni : ti;
         const int section_len = (DUAL_CACHE && !is_main) ? topk_len_extra : topk_len;
-        valid0 = valid0 && section_tile * BI + e0 < section_len;
-        valid1 = valid1 && section_tile * BI + e0 + 1 < section_len;
+        // Guard the loads, not only the values: the extra section's declared
+        // row width may not be tile-aligned (extra_topk % BI != 0), so an
+        // unconditional read of the last tile would step past the row end.
+        // Short-circuiting adds no extra loads versus the IO-side load_idx
+        // pattern, which applies the same position check before its __ldg.
+        valid0 = section_tile * BI + e0 < section_len && ib[e0] >= 0;
+        valid1 = section_tile * BI + e0 + 1 < section_len && ib[e0 + 1] >= 0;
+      } else {
+        valid0 = ib[e0] >= 0;
+        valid1 = ib[e0 + 1] >= 0;
       }
 
       // BF16 MG: both head groups consume the same KV B operand. Fuse them so

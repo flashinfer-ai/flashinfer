@@ -33,7 +33,7 @@ import json
 import logging
 import threading
 from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, TypedDict
 
 import torch
 
@@ -49,6 +49,35 @@ logger = logging.getLogger(__name__)
 # exact cache configuration.
 _FAMILY = "dsv4_nvfp4"
 _AUTOTUNE_OP = "sparse_mla_sm120_nvfp4"
+
+
+class _StaticFormat(TypedDict):
+    query_dim: int
+    value_dim: int
+    bytes_per_token: int
+    chunk_width: int
+    page_size: int
+    heads: tuple[int, ...]
+    topks: tuple[int, ...]
+    extra_page_sizes: tuple[int, ...]
+
+
+# Coarse static capability envelope, pure Python (the ordinary families keep
+# theirs in ``_policy``). Init-time probes such as
+# ``supported_sparse_mla_sm120_configs(kv_cache_format="nvfp4")`` must work
+# without a GPU or JIT compilation. The C++ dispatcher stays authoritative for
+# member shapes; this is a pre-filter, not a mirror of the compiled instances,
+# so no static-vs-compiled parity test pins it.
+_STATIC_FORMAT: _StaticFormat = {
+    "query_dim": 512,
+    "value_dim": 512,
+    "bytes_per_token": 384,
+    "chunk_width": 64,
+    "page_size": 64,
+    "heads": (16, 32, 64, 128),
+    "topks": (128, 512),
+    "extra_page_sizes": (2, 64),
+}
 
 
 @functools.cache
@@ -76,6 +105,10 @@ _CROSSOVER_MARGIN = _cpb._CROSSOVER_MARGIN
 
 # The calibration timing protocol queues calls and rotates index sets, keeping
 # launch latency overlap and cache residency close to steady-state serving.
+# OOM halves the aggregate toward _POOL_BYTES_MIN (the same floor semantics as
+# the ordinary pools); each dual-cache segment additionally floors at twice
+# the device L2 plus one page so the capacity guard cannot misfire on
+# large-L2 parts (e.g. 96 MiB on GB202).
 _POOL_BYTES_TARGET = 2 << 30
 _POOL_BYTES_MIN = 512 << 20
 _MIN_POOL_PER_SEGMENT = 128 << 20
@@ -163,6 +196,34 @@ def _eligible(
     return common and num_tokens <= _DECODE_MAX_TOKENS, common
 
 
+def _canonical_profile_layout(
+    primary_page_size: int,
+    page_stride_bytes: Optional[int],
+    extra_topk: int,
+    extra_page_size: int,
+    extra_page_stride_bytes: Optional[int],
+) -> bool:
+    """True iff the cache layout matches the canonical calibration sample.
+
+    Profiles are measured on packed pages (pitch == page_size * 384, which is
+    inherently 16B-aligned; indices and LSE are dense by resolve contract).
+    Other legal layouts — a padded page pitch — skip profile lookup, lazy
+    calibration and exact-T refinement, mirroring the ordinary policy's
+    ``canonical_profile_layout`` gate. ``None`` strides (direct planner
+    callers without tensor metadata) are treated as canonical; the
+    wrapper/resolve boundary passes the real strides from inspected metadata.
+    """
+    bytes_per_token = _STATIC_FORMAT["bytes_per_token"]
+    if (
+        page_stride_bytes is not None
+        and page_stride_bytes != primary_page_size * bytes_per_token
+    ):
+        return False
+    if extra_topk and extra_page_stride_bytes is not None:
+        return extra_page_stride_bytes == extra_page_size * bytes_per_token
+    return True
+
+
 def _autotune_skipped() -> bool:
     tuner = AutoTuner.get()
     skip_stack = tuner._get_skip_ops_stack()
@@ -242,8 +303,18 @@ def plan_nvfp4_sparse_mla_sm120(
     has_topk_length: bool = False,
     has_extra_topk_length: bool = False,
     has_attn_sink: bool = False,
+    page_stride_bytes: Optional[int] = None,
+    extra_page_stride_bytes: Optional[int] = None,
 ) -> Optional[NVFP4PlannedCall]:
-    """Select independently calibrated NVFP4 prefill/decode execution."""
+    """Select independently calibrated NVFP4 prefill/decode execution.
+
+    The measured profiles apply only to the canonical packed page layout
+    (``page stride == page_size * 384``, inherently 16B-aligned); the
+    wrapper/resolve boundary passes the real page strides, and other legal
+    layouts keep the decode-first fallback without profile lookup, lazy
+    calibration, or refinement. ``None`` strides mean the caller has no
+    layout metadata and are treated as canonical.
+    """
     device = torch.device(device)
     if has_extra_topk_length and extra_topk == 0:
         raise ValueError("has_extra_topk_length requires extra_topk > 0")
@@ -258,6 +329,13 @@ def plan_nvfp4_sparse_mla_sm120(
     if not decode_ok and not prefill_ok:
         return None
 
+    canonical = _canonical_profile_layout(
+        primary_page_size,
+        page_stride_bytes,
+        extra_topk,
+        extra_page_size,
+        extra_page_stride_bytes,
+    )
     key = _request_key(
         num_heads=num_heads,
         topk=topk,
@@ -269,9 +347,9 @@ def plan_nvfp4_sparse_mla_sm120(
         has_attn_sink=has_attn_sink,
     )
     with _cpb._store_lock:
-        profile = _cpb.get_profile(key, device)
+        profile = _cpb.get_profile(key, device) if canonical else None
         scope_epoch = _cpb._constants_version
-    if decode_ok and profile is None:
+    if canonical and decode_ok and profile is None:
         _maybe_calibrate(
             device=device,
             key=key,
@@ -289,15 +367,18 @@ def plan_nvfp4_sparse_mla_sm120(
             scope_epoch = _cpb._constants_version
 
     if (
-        profile is not None
+        canonical
+        and profile is not None
         and decode_ok
         and str(num_tokens) not in profile["buckets"]
         and AutoTuner.get().is_tuning_mode
         and not _autotune_skipped()
         and not _cpb._target_capturing(device)
+        and not _cpb.is_refine_failed(device, key, num_tokens)
     ):
         # Tuning mode: measure this exact token count once so the selection
-        # stops interpolating from the canonical grid.
+        # stops interpolating from the canonical grid. A failed measurement is
+        # suppressed in-process instead of being retimed on every call.
         try:
             refined = refine_nvfp4(
                 device,
@@ -313,6 +394,7 @@ def plan_nvfp4_sparse_mla_sm120(
             )
         except (CalibrationError, RuntimeError) as error:
             logger.debug("NVFP4 refine skipped at tokens=%d: %s", num_tokens, error)
+            _cpb.mark_refine_failed(device, key, num_tokens)
             refined = None
         if refined is not None:
             with _cpb._store_lock:
@@ -395,6 +477,18 @@ def _allocate_cache_pool(
     return cache, num_pages * page_size
 
 
+def _segment_floor_bytes(device: torch.device, page_bytes: int) -> int:
+    """Per-segment pool floor for dual-cache calibration.
+
+    Cold-L2 sampling needs each cache segment to exceed twice the device L2
+    capacity even after page-count rounding (the guard
+    ``_check_pool_capacity`` enforces on the allocated bytes); one page of
+    headroom absorbs the rounding-down. The static 128 MiB floor covers
+    smaller-L2 parts.
+    """
+    return max(_MIN_POOL_PER_SEGMENT, 2 * _cpb._device_l2(device) + page_bytes)
+
+
 def _allocate_calibration_pools(
     device: torch.device,
     primary_page_size: int,
@@ -402,14 +496,24 @@ def _allocate_calibration_pools(
     extra_topk: int,
     extra_page_size: int,
 ) -> tuple[torch.Tensor, int, Optional[torch.Tensor], int]:
+    facts = dsv4_nvfp4_format_info()
+    if extra_topk:
+        primary_floor = _segment_floor_bytes(
+            device, primary_page_size * facts["bytes_per_token"]
+        )
+        extra_floor = _segment_floor_bytes(
+            device, extra_page_size * facts["bytes_per_token"]
+        )
+        min_total = max(_POOL_BYTES_MIN, primary_floor + extra_floor)
+    else:
+        primary_floor = extra_floor = 0
+        min_total = _POOL_BYTES_MIN
     total_bytes = _POOL_BYTES_TARGET
     while True:
         total_topk = topk + extra_topk
         if extra_topk:
-            primary_bytes = max(_MIN_POOL_PER_SEGMENT, total_bytes * topk // total_topk)
-            extra_bytes = max(
-                _MIN_POOL_PER_SEGMENT, total_bytes * extra_topk // total_topk
-            )
+            primary_bytes = max(primary_floor, total_bytes * topk // total_topk)
+            extra_bytes = max(extra_floor, total_bytes * extra_topk // total_topk)
         else:
             primary_bytes, extra_bytes = total_bytes, 0
         primary_cache = None
@@ -429,10 +533,19 @@ def _allocate_calibration_pools(
             if not _cpb._is_cuda_oom(error):
                 raise
             del primary_cache, extra_cache
-            if total_bytes <= _POOL_BYTES_MIN:
+            if total_bytes <= min_total:
+                if extra_topk:
+                    l2_mib = _cpb._device_l2(device) >> 20
+                    raise CalibrationError(
+                        "cannot allocate NVFP4 sparse-MLA calibration KV pools: "
+                        f"out of memory above the {min_total >> 20} MiB aggregate "
+                        "floor (each dual-cache segment must exceed twice the "
+                        f"device L2 capacity, {l2_mib} MiB here, after page "
+                        "rounding)"
+                    ) from None
                 raise CalibrationError(
-                    "cannot allocate a >=512 MiB aggregate NVFP4 KV pool for "
-                    "sparse-MLA calibration"
+                    "cannot allocate an NVFP4 sparse-MLA calibration KV pool: "
+                    f"out of memory above the {min_total >> 20} MiB floor"
                 ) from None
             total_bytes //= 2
         torch.cuda.empty_cache()
@@ -724,6 +837,11 @@ def calibrate_nvfp4_sparse_mla_sm120(
     Old schema or timing-protocol caches are not reused. Explicit calls retry
     missing or failed configurations; ``force=True`` re-measures present ones,
     retaining old profiles if measurement raises.
+
+    Profiles are measured on the canonical packed page layout (page pitch
+    ``page_size * 384`` bytes, inherently 16B-aligned, with dense indices and
+    LSE) and apply only to it: calls with padded page strides keep the
+    decode-first fallback instead of consuming or extending the profile.
     """
     device = torch.device(device)
     if torch.cuda.is_current_stream_capturing():
@@ -765,6 +883,8 @@ def calibrate_nvfp4_sparse_mla_sm120(
             t: buckets[str(t)]["variant"] == NVFP4KernelVariant.DECODE_SPLITK.value
             for t in _CROSSOVER_PROBED_T
         }
+        with _cpb._store_lock:
+            overlay_pending = _cpb._activate_store()[1]["overlay"]
         return NVFP4CalibrationReport(
             key,
             num_heads,
@@ -781,7 +901,7 @@ def calibrate_nvfp4_sparse_mla_sm120(
             {t: buckets[str(t)]["cpb"] for t in _CROSSOVER_PROBED_T},
             {t: buckets[str(t)]["decode_s"] * 1e6 for t in _CROSSOVER_PROBED_T},
             {t: buckets[str(t)]["prefill_s"] * 1e6 for t in _CROSSOVER_PROBED_T},
-            not _cpb._activate_store()[1]["overlay"],
+            not overlay_pending,
         )
 
     ctx = _nvfp4_measure_context(
@@ -814,8 +934,7 @@ def calibrate_nvfp4_sparse_mla_sm120(
         "buckets": buckets,
     }
     persisted = _cpb.publish_calibration(device, _FAMILY, profiles={key: profile})
-    failed = _cpb._store_projection(_FAMILY, "failed")
-    failed.discard((_cpb._device_key(device), key))
+    _cpb._clear_calibration_failed(device, key)
     phase_by_t = {
         token_bucket: "decode" if use_decode else "prefill"
         for token_bucket, use_decode in decode_by_t.items()
@@ -863,7 +982,9 @@ def refine_nvfp4(
 
     Returns the refined bucket entry, or ``None`` when refinement does not
     apply (outside the decode envelope, no stored profile, or the exact entry
-    already measured).
+    already measured). A successful call clears the in-process failure
+    suppression a failed tuning-time attempt left for this (key, tokens)
+    point.
     """
     if not 1 <= tokens <= _DECODE_MAX_TOKENS:
         return None
@@ -905,6 +1026,9 @@ def refine_nvfp4(
             profiles={key: profile},
             profile_buckets={key: {str(tokens): entry}},
         )
+    # A successful measurement clears the in-process failure suppression for
+    # this (key, tokens) point.
+    _cpb.clear_refine_failed(device, key, tokens)
     return {**entry, "persisted": persisted}
 
 

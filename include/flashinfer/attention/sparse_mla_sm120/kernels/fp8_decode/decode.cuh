@@ -46,8 +46,7 @@ namespace flashinfer::sparse_mla_sm120 {
 // The ordinary schedule omits minBlocksPerSM: it is smem-bound at 1 block/SM,
 // and an unconstrained register budget avoids the spill forced by that hint.
 // The mixed schedule supplies its own launch bound.
-template <ModelType MT, int NUM_HEADS, int PAGE_BLOCK_SIZE,
-          typename GatherSchedule = Fp8DecodeGatherSchedule>
+template <ModelType MT, int NUM_HEADS, typename GatherSchedule = Fp8DecodeGatherSchedule>
 __global__ void __launch_bounds__(
     (DecodeTileCfg<MT, GatherSchedule::RAW_PIPELINE>::template block_threads<GatherSchedule>()),
     GatherSchedule::MIN_BLOCKS)

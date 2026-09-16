@@ -32,7 +32,6 @@ void SparseMlaSm120PagedAttention(TensorView q, TensorView kv_cache, TensorView 
 // Thin TVM-FFI wrapper for the decode-dsv4 standalone path. The caller passes
 // already-sized scratch tensors mid_out + mid_lse plus the output and lse.
 // DSV4 accepts independent positive page sizes with aligned page strides.
-template <bool BF16 = false>
 void SparseMlaSm120DecodeDsv4(TensorView q, TensorView kv_cache, TensorView indices,
                               TensorView mid_out, TensorView mid_lse, TensorView output,
                               TensorView out_lse, int64_t num_splits, double sm_scale,
@@ -202,9 +201,21 @@ void SparseMlaSm120DecodeDsv4(TensorView q, TensorView kv_cache, TensorView indi
                                               attn_sink.has_value(),
                                               extra_fp4,
                                               0};
-  const auto plan = execution::resolve_attention(
-      metadata, BF16 ? execution::NumericRoute::FullBF16 : execution::NumericRoute::FP8,
-      chunks_per_block_override, {sm_count, size_t(max_shared)});
+  // The override narrows to resolve_attention's int requested_cpb; reject
+  // values that would wrap instead of silently selecting a different chunking.
+  TVM_FFI_ICHECK(chunks_per_block_override >= INT_MIN && chunks_per_block_override <= INT_MAX)
+      << "decode-dsv4 chunks_per_block_override is out of int range: " << chunks_per_block_override;
+  const auto plan =
+      execution::resolve_attention(metadata, execution::NumericRoute::FP8,
+                                   chunks_per_block_override, {sm_count, size_t(max_shared)});
+  // num_splits sets both the launch grid's split count and the scratch split
+  // stride; fewer splits than the resolved plan needs would silently drop the
+  // tail chunks (the merge reads only allocated splits). Mirrors the NVFP4
+  // binding's explicit num_splits check.
+  TVM_FFI_ICHECK_GE(num_splits, plan.active_splits)
+      << "decode-dsv4 num_splits=" << num_splits
+      << " does not cover the resolved chunking (active_splits=" << plan.active_splits
+      << ", chunk_capacity=" << plan.chunk_capacity << ", cpb=" << plan.cpb << ")";
   const execution::AttentionParams params{num_heads,
                                           topk,
                                           static_cast<const bf16*>(q.data_ptr()),
@@ -231,8 +242,7 @@ void SparseMlaSm120DecodeDsv4(TensorView q, TensorView kv_cache, TensorView indi
                                           stride_extra_indices_token,
                                           stride_out_lse,
                                           page_block_size,
-                                          extra_fp4,
-                                          BF16};
+                                          extra_fp4};
   const auto status = dispatch_decode(params, plan, stream);
   TVM_FFI_ICHECK_EQ(status, cudaSuccess) << "decode-dsv4: " << cudaGetErrorString(status);
 }
@@ -314,9 +324,22 @@ void SparseMlaSm120DecodeDsv3_2(TensorView q, TensorView kv_cache, TensorView in
                                               attn_sink.has_value(),
                                               false,
                                               0};
+  // The override narrows to resolve_attention's int requested_cpb; reject
+  // values that would wrap instead of silently selecting a different chunking.
+  TVM_FFI_ICHECK(chunks_per_block_override >= INT_MIN && chunks_per_block_override <= INT_MAX)
+      << "decode-dsv3_2 chunks_per_block_override is out of int range: "
+      << chunks_per_block_override;
   const auto resolved =
       execution::resolve_attention(metadata, execution::NumericRoute::FP8,
                                    chunks_per_block_override, {sm_count, size_t(max_shared)});
+  // num_splits sets both the launch grid's split count and the scratch split
+  // stride; fewer splits than the resolved plan needs would silently drop the
+  // tail chunks (the merge reads only allocated splits). Mirrors the NVFP4
+  // binding's explicit num_splits check.
+  TVM_FFI_ICHECK_GE(num_splits, resolved.active_splits)
+      << "decode-dsv3_2 num_splits=" << num_splits
+      << " does not cover the resolved chunking (active_splits=" << resolved.active_splits
+      << ", chunk_capacity=" << resolved.chunk_capacity << ", cpb=" << resolved.cpb << ")";
   execution::AttentionParams params{};
   params.num_heads = num_heads;
   params.topk = topk;
@@ -394,7 +417,6 @@ void ExecuteAttentionPlan(ffi::Module descriptor, TensorView q, TensorView cache
   p.indices_stride_elems = m.indices_stride;
   p.out_lse_stride_elems = m.lse_stride;
   p.extra_fp4 = m.extra_fp4;
-  p.use_full_bf16 = plan.numeric == execution::NumericRoute::FullBF16;
   p.topk_length =
       lengths.has_value() ? static_cast<const int*>(lengths.value().data_ptr()) : nullptr;
   p.attn_sink = sink.has_value() ? static_cast<const float*>(sink.value().data_ptr()) : nullptr;
@@ -457,8 +479,6 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(execute_attention,
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(sparse_mla_sm120_paged_attention,
                               flashinfer::sparse_mla_sm120::SparseMlaSm120PagedAttention);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(sparse_mla_sm120_decode_dsv4,
-                              flashinfer::sparse_mla_sm120::SparseMlaSm120DecodeDsv4<false>);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(sparse_mla_sm120_decode_dsv41_bf16,
-                              flashinfer::sparse_mla_sm120::SparseMlaSm120DecodeDsv4<true>);
+                              flashinfer::sparse_mla_sm120::SparseMlaSm120DecodeDsv4);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(sparse_mla_sm120_decode_dsv3_2,
                               flashinfer::sparse_mla_sm120::SparseMlaSm120DecodeDsv3_2);
