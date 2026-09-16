@@ -53,6 +53,7 @@ from tests.attention.prims_ts_test_utils import (
     HEAD_DIM as _HEAD_DIM,
     Patterns as _Patterns,
     REQUIRES_PRIMTS_GPU as _REQUIRES_PRIMTS_GPU,
+    assert_decode_smem_within_capacity,
     block_mean,
     make_block_sparse_compile_key,
     make_bsr,
@@ -1791,6 +1792,83 @@ def test_block_sparse_compile_key_builds_int8_sage_config() -> None:
         block_sparse_config._make_block_sparse_config(replace(key, v_dtype_key="int8"))
 
 
+@pytest.mark.parametrize(
+    ("dtype_key", "v_dtype_key", "sage", "use_block_sparse", "use_proxy_routes"),
+    (
+        pytest.param("bfloat16", "bfloat16", False, True, False, id="bf16-sparse"),
+        pytest.param("bfloat16", "bfloat16", False, False, False, id="bf16-dense"),
+        pytest.param(
+            "float8_e4m3fn", "float8_e4m3fn", True, True, False, id="fp8-sparse-exact"
+        ),
+        pytest.param(
+            "float8_e4m3fn", "float8_e4m3fn", True, True, True, id="fp8-sparse-proxy"
+        ),
+        pytest.param(
+            "float8_e4m3fn", "float8_e4m3fn", True, False, False, id="fp8-dense"
+        ),
+        pytest.param("int8", "float8_e4m3fn", True, True, False, id="int8-sparse"),
+    ),
+)
+@pytest.mark.parametrize("persistent", (False, True), ids=("static", "persistent"))
+def test_kv256_ring_depth_follows_element_width_and_fits_smem(
+    dtype_key: str,
+    v_dtype_key: str,
+    sage: bool,
+    use_block_sparse: bool,
+    use_proxy_routes: bool,
+    persistent: bool,
+) -> None:
+    """Byte-wide Sage KV256 profiles stage a deeper K/V ring within SM100 SMEM.
+
+    16-bit routes keep three stages; every 8-bit recipe (E4M3 or INT8 Q/K with
+    E4M3 V) gets the deeper ring together with its Sage buffers and metadata.
+    """
+
+    from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_constants import (
+        KV_TILE_256_BYTE_WIDE_SHARED_FIFO_STAGES,
+        KV_TILE_256_SHARED_FIFO_STAGES,
+    )
+    from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_kernel import (
+        _build_decode_gen_schedule,
+    )
+
+    key = make_block_sparse_compile_key(
+        seq_len_kv=4096,
+        num_qo_heads=8,
+        num_kv_heads=8,
+        dtype_key=dtype_key,
+        use_persistent_scheduler=persistent,
+        sparse_format="bitmask",
+        use_proxy_routes=use_proxy_routes,
+        use_block_sparse=use_block_sparse,
+        out_dtype_key="bfloat16" if sage else dtype_key,
+        v_dtype_key=v_dtype_key,
+        sage=prims_ts.SageAttentionConfig() if sage else None,
+    )
+    cfg = block_sparse_config._make_block_sparse_config(key)
+    assert cfg.tile_size_kv == 256
+    assert cfg.use_8bit_qkv is sage
+    expected_kv_stages = (
+        KV_TILE_256_BYTE_WIDE_SHARED_FIFO_STAGES
+        if sage
+        else KV_TILE_256_SHARED_FIFO_STAGES
+    )
+    assert cfg.kv_stages == expected_kv_stages
+
+    cfg.total_kv_tiles = 16
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        _tasks, dependency_graph, _labels, smem_allocator, _tmem, _eager = (
+            _build_decode_gen_schedule(cfg, total_kv_tiles=16, num_heads_kv=8)
+        )
+    smem_kv = next(
+        resource for resource in dependency_graph if resource.name == "smemKv"
+    )
+    assert smem_kv.pipeline_config.num_stages == expected_kv_stages
+    assert smem_kv._alloc.size_bytes == expected_kv_stages * cfg.smem_kv_tile_bytes
+    assert_decode_smem_within_capacity(cfg, smem_allocator)
+
+
 def test_sage_static_profile_requires_one_qk_dtype_and_a_config() -> None:
     """The compile key names one Q/K dtype; the recipe is a SageAttentionConfig."""
 
@@ -3526,6 +3604,83 @@ def test_block_sparse_clc_requires_about_two_sm_waves(
         False,
         True,
     )
+
+
+_DENSE_CLC_TEST_SM_COUNT = 4
+
+
+@pytest.mark.parametrize(
+    ("dtype_key", "q_block_size", "kv_block_size", "extra_ctas", "expected"),
+    (
+        # One CTA past the wave threshold of the synthetic device is enough
+        # work for CLC; a grid that fills the threshold exactly has no launch
+        # work for it to eliminate.
+        pytest.param("float8_e4m3fn", 64, 64, 1, True, id="fp8-kv256-past-threshold"),
+        pytest.param("int8", 64, 64, 1, True, id="int8-kv256-past-threshold"),
+        pytest.param("float8_e4m3fn", 64, 64, 0, False, id="fp8-kv256-at-threshold"),
+        pytest.param("bfloat16", 64, 64, 1, True, id="bf16-kv256-past-threshold"),
+        pytest.param(
+            "float8_e4m3fn", 16, 64, 1, True, id="fp8-q128-kv128-past-threshold"
+        ),
+    ),
+)
+def test_dense_contiguous_plans_take_clc_beyond_one_wave(
+    monkeypatch: pytest.MonkeyPatch,
+    dtype_key: str,
+    q_block_size: int,
+    kv_block_size: int,
+    extra_ctas: int,
+    expected: bool,
+) -> None:
+    """Dense plans of every profile go persistent once the grid exceeds one wave."""
+
+    from flashinfer.attention.prims_ts.kernels.fmha_decode import fmha_decode_config
+
+    config_module = importlib.import_module(
+        "flashinfer.attention.prims_ts._block_sparse.config"
+    )
+    # The launch heuristic asks for CLC once the grid exceeds one resident wave.
+    num_heads = _DENSE_CLC_TEST_SM_COUNT + extra_ctas
+
+    class _FourSmHardware:
+        def get_device_multiprocessor_count(self) -> int:
+            return _DENSE_CLC_TEST_SM_COUNT
+
+    monkeypatch.setattr(fmha_decode_config.utils, "HardwareInfo", _FourSmHardware)
+    monkeypatch.setattr(
+        config_module, "_make_block_sparse_config", _stub_block_sparse_config
+    )
+    monkeypatch.setattr(torch.cuda, "device", lambda _index: nullcontext())
+    q_tile_size = block_sparse_config._select_block_sparse_q_tile_size(
+        q_block_size=q_block_size, heads_q_per_kv=1, kv_block_size=kv_block_size
+    )
+    kv_route_size = block_sparse_config._select_block_sparse_kv_route_size(
+        q_tile_size=q_tile_size, kv_block_size=kv_block_size
+    )
+    block_sparse_config._resolve_block_sparse_launch_spec.cache_clear()
+    try:
+        policy = dict(
+            block_sparse_config._resolve_block_sparse_launch_spec(
+                device_index=0,
+                batch_size=1,
+                seq_len_q=q_tile_size,
+                seq_len_kv=4096,
+                num_qo_heads=num_heads,
+                num_kv_heads=num_heads,
+                head_dim=_HEAD_DIM,
+                q_block_size=q_block_size,
+                kv_block_size=kv_block_size,
+                kv_route_size=kv_route_size,
+                dtype_key=dtype_key,
+                mask_type="dense",
+                use_kv_valid_bits=False,
+                max_row_route_capacity=0,
+                use_block_sparse=False,
+            ).policy
+        )
+    finally:
+        block_sparse_config._resolve_block_sparse_launch_spec.cache_clear()
+    assert policy["use_persistent_scheduler"] is expected
 
 
 def test_gqa_launch_spec_uses_q_token_cta_geometry(

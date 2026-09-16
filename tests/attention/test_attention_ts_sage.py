@@ -689,27 +689,20 @@ _DENSE_SAGE_CASES = (
         out_dtype=torch.bfloat16,
         qk_dtype=torch.int8,
     ),
-    # Thirty-two batches exceed one resident wave on both profiles, so the
-    # launch heuristic takes the persistent scheduler.
-    _DenseSageCase(
-        name="kv256_k16_q1_bf16_persistent",
-        **{**_KV256_MHA, "batch_size": 32},
-        sage_q_block_size=1,
-        sage_k_block_size=16,
-        with_mean=False,
-        out_dtype=torch.bfloat16,
-        scheduler="persistent",
-    ),
-    _DenseSageCase(
-        name="q128_int8_k16_q1_bf16_mean_persistent",
-        **{**_Q128_GQA, "batch_size": 32},
-        sage_q_block_size=1,
-        sage_k_block_size=16,
-        with_mean=True,
-        out_dtype=torch.bfloat16,
-        qk_dtype=torch.int8,
-        scheduler="persistent",
-    ),
+)
+# The dense persistent loop resolves every tile through the work tile; cover
+# one E4M3 case, one causal case with the V mean, one INT8 case, and the
+# Q128/KV128 profile on it.
+_PERSISTENT_DENSE_SAGE_CASE_NAMES = (
+    "kv256_k16_q1_bf16",
+    "kv256_k16_q1_fp16_mean_causal",
+    "kv256_int8_k16_q1_bf16",
+    "q128_int8_k16_q1_bf16_mean",
+)
+_DENSE_SAGE_CASES += tuple(
+    replace(case, name=f"{case.name}_persistent", scheduler="persistent")
+    for case in _DENSE_SAGE_CASES
+    if case.name in _PERSISTENT_DENSE_SAGE_CASE_NAMES
 )
 
 
@@ -969,6 +962,38 @@ def test_dense_sage_matches_dequantized_reference(case: _DenseSageCase) -> None:
     else:
         rtol, atol = 2e-3, 2e-3
     torch.testing.assert_close(actual.float(), expected, rtol=rtol, atol=atol)
+
+
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize(
+    "case",
+    _cases_named(_DENSE_SAGE_CASES, "kv256_k16_q1_bf16", "kv256_int8_k16_q1_bf16"),
+    ids=lambda case: case.name,
+)
+@torch.no_grad()
+def test_dense_sage_persistent_scheduler_matches_static_grid_bitwise(
+    case: _DenseSageCase,
+) -> None:
+    """The work-tile loop only reorders tiles, so both schedulers publish the same bits."""
+
+    torch.manual_seed(20260908)
+    device = torch.device("cuda", 0)
+    q, k, v, params = _random_sage_inputs(case, device)
+    sm_scale = _HEAD_DIM**-0.5
+    static, persistent = (
+        _run_dense_sage(
+            replace(case, scheduler=scheduler),
+            q,
+            k,
+            v,
+            params,
+            device,
+            sm_scale=sm_scale,
+        )
+        for scheduler in ("static", "persistent")
+    )
+    assert torch.equal(static, persistent)
 
 
 @_REQUIRES_PRIMTS_GPU

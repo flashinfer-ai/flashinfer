@@ -73,6 +73,7 @@ from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_config import
 from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_constants import (
     BYTES_PER_KIB,
     FP8_P_QUANT_SCALE,
+    KV_TILE_256_BYTE_WIDE_SHARED_FIFO_STAGES,
     KV_TILE_256_SHARED_FIFO_STAGES,
     Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIP_BITS,
     Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIPS_PER_WORD,
@@ -2632,12 +2633,18 @@ def _make_contiguous_keeps_config(*, dtype, tile_size_q: int, headdim: int = 128
 def _make_contiguous_kv256_config(
     *,
     dtype=BFloat16,
+    o_dtype=None,
     persistent: bool | None = None,
     config_args: dict[str, object] | None = None,
     split_kv_mode: str = "disabled",
     splits_kv: int = 1,
+    qkv_layout: str = "contiguousKv",
+    num_tokens_per_page: int = 32,
 ):
-    """Build the qualified Q64/KV256 profile for schedule-level tests."""
+    """Build the qualified Q64/KV256 profile for schedule-level tests.
+
+    The output dtype follows ``dtype`` unless ``o_dtype`` names another one.
+    """
 
     args = {
         "use_keeps_mma_ab": True,
@@ -2659,9 +2666,9 @@ def _make_contiguous_kv256_config(
         num_heads_kv=32,
         q_dtype=dtype,
         k_dtype=dtype,
-        v_dtype=dtype,
-        o_dtype=dtype,
-        qkv_layout="contiguousKv",
+        o_dtype=dtype if o_dtype is None else o_dtype,
+        qkv_layout=qkv_layout,
+        num_tokens_per_page=num_tokens_per_page,
         split_kv_mode=split_kv_mode,
         splits_kv=splits_kv,
         mask_type="dense",
@@ -3575,19 +3582,23 @@ def test_attention_ts_decode_kv256_uses_fragment_ready_p_policy() -> None:
     assert_decode_smem_within_capacity(cfg, smem_allocator)
 
 
-def test_attention_ts_decode_kv256_fp8_ring_stages_fit_smem_budget() -> None:
-    """FP8 KV256 stages one byte per element and keeps the 16-bit ring depth."""
+def test_attention_ts_decode_kv256_fp8_tiles_size_the_ring_and_alias_p() -> None:
+    """FP8 KV256 stages one byte per element; the ring holds whole tiles and P aliases S.
+
+    ``test_attention_ts_decode_kv256_ring_depth_follows_element_width`` pins the
+    stage count and the SMEM capacity; this test pins the byte accounting and
+    the TMEM layout behind it.
+    """
 
     cfg = _make_contiguous_kv256_config(dtype=Float8E4M3FN)
     assert cfg.use_8bit_qkv
     assert cfg.smem_kv_tile_bytes == cfg.tile_size_kv * cfg.headdim
-    assert cfg.kv_stages == KV_TILE_256_SHARED_FIFO_STAGES
     pipeline_smem_bytes = (
         cfg.q_stages * cfg.smem_q_tile_bytes + cfg.kv_stages * cfg.smem_kv_tile_bytes
     )
     assert pipeline_smem_bytes <= TOTAL_SMEM_BUDGET_KIB * BYTES_PER_KIB
 
-    resources, smem_allocator, _tmem_allocator = _build_decode_resources(cfg)
+    resources, _smem_allocator, _tmem_allocator = _build_decode_resources(cfg)
     assert resources["smemKv"]._alloc.size_bytes == (
         cfg.kv_stages * cfg.smem_kv_tile_bytes
     )
@@ -3596,7 +3607,71 @@ def test_attention_ts_decode_kv256_fp8_ring_stages_fit_smem_budget() -> None:
     assert resources["smemP0"]._tmem_alloc.num_columns == cfg.fragment_p_packed_cols * (
         cfg.num_softmax_score_fragments
     )
-    assert_decode_smem_within_capacity(cfg, smem_allocator)
+
+
+@pytest.mark.parametrize(
+    ("dtype", "qkv_layout", "expected_kv_stages"),
+    (
+        pytest.param(
+            BFloat16, "contiguousKv", KV_TILE_256_SHARED_FIFO_STAGES, id="bf16"
+        ),
+        pytest.param(
+            Float16, "contiguousKv", KV_TILE_256_SHARED_FIFO_STAGES, id="fp16"
+        ),
+        pytest.param(
+            BFloat16, "pagedKv", KV_TILE_256_SHARED_FIFO_STAGES, id="bf16-paged"
+        ),
+        pytest.param(
+            Float8E4M3FN,
+            "contiguousKv",
+            KV_TILE_256_BYTE_WIDE_SHARED_FIFO_STAGES,
+            id="fp8",
+        ),
+        pytest.param(
+            Float8E4M3FN,
+            "pagedKv",
+            KV_TILE_256_BYTE_WIDE_SHARED_FIFO_STAGES,
+            id="fp8-paged",
+        ),
+    ),
+)
+@pytest.mark.parametrize("persistent", (False, True), ids=("static", "persistent"))
+def test_attention_ts_decode_kv256_ring_depth_follows_element_width(
+    dtype,
+    qkv_layout: str,
+    expected_kv_stages: int,
+    persistent: bool,
+) -> None:
+    """Byte-wide K/V tiles fund a deeper shared ring; 16-bit tiles keep three."""
+
+    cfg = _make_contiguous_kv256_config(
+        dtype=dtype,
+        o_dtype=Float16 if dtype == Float8E4M3FN else dtype,
+        persistent=persistent,
+        qkv_layout=qkv_layout,
+        num_tokens_per_page=128 if qkv_layout == "pagedKv" else 32,
+    )
+    assert cfg.kv_stages == expected_kv_stages
+    assert cfg.use_8bit_qkv == (
+        expected_kv_stages == KV_TILE_256_BYTE_WIDE_SHARED_FIFO_STAGES
+    )
+    if not persistent:
+        resources, smem_allocator, _tmem_allocator = _build_decode_resources(cfg)
+        assert resources["smemKv"].pipeline_config.num_stages == expected_kv_stages
+        assert_decode_smem_within_capacity(cfg, smem_allocator)
+
+
+def test_attention_ts_decode_kv256_fp8_explicit_ring_depth_is_honored() -> None:
+    """An explicit kv_stages overrides the byte-wide default in both directions."""
+
+    for kv_stages in (KV_TILE_256_SHARED_FIFO_STAGES, 6):
+        cfg = _make_contiguous_kv256_config(
+            dtype=Float8E4M3FN, config_args={"kv_stages": kv_stages}
+        )
+        assert cfg.kv_stages == kv_stages
+        resources, smem_allocator, _tmem_allocator = _build_decode_resources(cfg)
+        assert resources["smemKv"].pipeline_config.num_stages == kv_stages
+        assert_decode_smem_within_capacity(cfg, smem_allocator)
 
 
 def test_attention_ts_decode_kv256_fp8_rejects_attention_sinks() -> None:

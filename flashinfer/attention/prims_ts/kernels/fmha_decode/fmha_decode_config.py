@@ -45,6 +45,7 @@ from .fmha_decode_constants import (
     FP8_P_PACKED_REGS_PER_Q_REPEAT,
     FP16_OUTPUT_ELEMENTS_PER_REG_GROUP,
     FP16_P_PACKED_REGS_PER_Q_REPEAT,
+    KV_TILE_256_BYTE_WIDE_SHARED_FIFO_STAGES,
     KV_TILE_256_REGISTER_REALLOCATION_MIN_TILES,
     KV_TILE_256_SHARED_FIFO_STAGES,
     MAX_CLUSTER_DIM_X,
@@ -185,7 +186,6 @@ _KV_TILE_256_PHYSICAL_DEFAULTS: Mapping[str, ConfigValue] = {
     "mma_tile_m_bmm2": 64,
     "mma_tile_n_bmm2": 256,
     "q_stages": 1,
-    "kv_stages": KV_TILE_256_SHARED_FIFO_STAGES,
     "head_dim_per_stage_kv": 0,
     "num_insts_kv": 2,
     "o_stages": 2,
@@ -210,8 +210,6 @@ _KV_TILE_256_TASK_TOPOLOGY_DEFAULTS: Mapping[str, int] = {
     "scheduler_warp_idx": 13,
     "scheduler_num_warps": 1,
 }
-
-_KV_TILE_256_TUNABLE_FIELDS = frozenset(("kv_stages",))
 
 
 def _dtype_bytes(dtype: type) -> int:
@@ -2851,6 +2849,17 @@ def _finalize_static_decode_config(
             # effective configuration is supported by the kernel.
             for field_name, value in _KV_TILE_256_PHYSICAL_DEFAULTS.items():
                 _set_if_implicit(cfg, field_name, value, explicit_fields)
+            # The shared K/V ring depth follows the element width; it is the
+            # only KV256 field that stays tunable, and the static SMEM
+            # validator decides whether an override fits.
+            _set_if_implicit(
+                cfg,
+                "kv_stages",
+                KV_TILE_256_BYTE_WIDE_SHARED_FIFO_STAGES
+                if cfg.use_8bit_qkv
+                else KV_TILE_256_SHARED_FIFO_STAGES,
+                explicit_fields,
+            )
             for field_name, value in _KV_TILE_256_TASK_TOPOLOGY_DEFAULTS.items():
                 _set_if_implicit(cfg, field_name, value, explicit_fields)
         else:
@@ -2912,10 +2921,9 @@ def _validate_kv256_static_config(cfg: FmhaDecodeConfig) -> None:
 
     for field_name, expected in _KV_TILE_256_PHYSICAL_DEFAULTS.items():
         actual = _require_python_int(field_name)
-        if field_name in _KV_TILE_256_TUNABLE_FIELDS:
-            continue
         if actual != expected:
             raise ValueError(f"KV256 requires {field_name}={expected}, got {actual}")
+    _require_python_int("kv_stages")
     for field_name, expected in _KV_TILE_256_TASK_TOPOLOGY_DEFAULTS.items():
         actual = _require_python_int(field_name)
         if actual != expected:
