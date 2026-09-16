@@ -575,12 +575,12 @@ def test_auto_declines_cudnn_on_non_int32_indptr_under_cuda_graph():
 
 
 @requires_cutlass_arch
-def test_auto_declines_cutlass_under_cuda_graph(monkeypatch):
+def test_auto_declines_cutlass_on_replan_under_cuda_graph(monkeypatch):
     """`fmha_varlen_plan` reallocates its work buffers per plan() call.
 
-    A captured graph would keep pointing at the previous allocation, so CUTLASS
-    is not graph-safe; `auto` must route elsewhere rather than hand back a
-    backend that replays a stale plan.
+    The first plan is safe -- nothing has been captured yet -- so `auto` may
+    still pick CUTLASS there; it is the *re*-plan that would strand a captured
+    graph on the previous allocation, and only that is declined.
     """
     monkeypatch.setenv("FLASHINFER_RAGGED_AUTO_BACKEND_ORDER", "cutlass")
     dev = torch.device("cuda")
@@ -597,23 +597,22 @@ def test_auto_declines_cutlass_under_cuda_graph(monkeypatch):
         kv_indptr_buf=kv_indptr.clone(),
         backend="auto",
     )
-    wrapper.plan(
-        qo_indptr,
-        kv_indptr,
-        32,
-        32,
-        128,
-        head_dim_vo=128,
-        causal=True,
-        q_data_type=DTYPE,
-        kv_data_type=DTYPE,
+    plan_kwargs = dict(
+        head_dim_vo=128, causal=True, q_data_type=DTYPE, kv_data_type=DTYPE
     )
-    assert wrapper._backend == "fa2"
+    wrapper.plan(qo_indptr, kv_indptr, 32, 32, 128, **plan_kwargs)
+    assert wrapper._backend == "cutlass", "first plan under capture is safe"
+    wrapper.plan(qo_indptr, kv_indptr, 32, 32, 128, **plan_kwargs)
+    assert wrapper._backend == "fa2", "re-plan must route off cutlass"
 
 
 @requires_cutlass_arch
-def test_explicit_cutlass_refuses_cuda_graph():
-    """An explicit `backend="cutlass"` says so plainly instead of going stale."""
+def test_explicit_cutlass_refuses_replan_under_cuda_graph():
+    """An explicit `backend="cutlass"` says so plainly instead of going stale.
+
+    Plan-once-then-capture is a legal pattern and must keep working; only the
+    re-plan is refused.
+    """
     dev = torch.device("cuda")
     batch, s_q, s_kv = 2, 512, 512
     workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=dev)
@@ -628,18 +627,12 @@ def test_explicit_cutlass_refuses_cuda_graph():
         kv_indptr_buf=kv_indptr.clone(),
         backend="cutlass",
     )
-    with pytest.raises(ValueError, match="not CUDA-graph safe"):
-        wrapper.plan(
-            qo_indptr,
-            kv_indptr,
-            32,
-            32,
-            128,
-            head_dim_vo=128,
-            causal=True,
-            q_data_type=DTYPE,
-            kv_data_type=DTYPE,
-        )
+    plan_kwargs = dict(
+        head_dim_vo=128, causal=True, q_data_type=DTYPE, kv_data_type=DTYPE
+    )
+    wrapper.plan(qo_indptr, kv_indptr, 32, 32, 128, **plan_kwargs)
+    with pytest.raises(ValueError, match="re-planning under CUDA graph"):
+        wrapper.plan(qo_indptr, kv_indptr, 32, 32, 128, **plan_kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -736,7 +729,7 @@ def test_auto_keeps_fp8_off_cudnn():
         has_sinks=False,
         cudnn_indptr_is_int32=True,
         cutlass_work_items=1,
-        cuda_graph_enabled=False,
+        cutlass_replan_under_capture=False,
     )
     assert (
         _blackwell_ragged_auto_upgrade(

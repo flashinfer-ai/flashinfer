@@ -1845,7 +1845,7 @@ def _blackwell_ragged_auto_upgrade(
     has_sinks: bool,
     cudnn_indptr_is_int32: bool,
     cutlass_work_items: int,
-    cuda_graph_enabled: bool,
+    cutlass_replan_under_capture: bool,
     cutlass_indptr_is_int32: bool = False,
     single_token_gqa: bool = False,
 ) -> Optional[str]:
@@ -1935,10 +1935,10 @@ def _blackwell_ragged_auto_upgrade(
                 and (head_dim_qk, head_dim_vo) in _CUTLASS_RAGGED_AUTO_HEAD_DIMS
                 and cutlass_work_items <= _CUTLASS_PLAN_WORK_CAPACITY
                 # `fmha_varlen_plan` allocates fresh work-index buffers on every
-                # call, so a re-plan silently leaves a captured graph pointing at
-                # the previous allocation. Until those buffers are updated in
-                # place, CUTLASS is not graph-safe and `auto` stays away.
-                and not cuda_graph_enabled
+                # call, so a re-plan leaves a captured graph pointing at the
+                # previous allocation. The first plan is safe (nothing has been
+                # captured yet), so only a re-plan under capture is excluded.
+                and not cutlass_replan_under_capture
             ):
                 return backend
     return None
@@ -4064,6 +4064,10 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             device="cpu",
         )
         self._use_cuda_graph = use_cuda_graph
+        # Tracks whether a CUTLASS plan has already been built on this
+        # wrapper: its work-index buffers are reallocated per plan(), so a
+        # re-plan under graph capture is the unsafe case, not the first plan.
+        self._cutlass_graph_planned = False
         if use_cuda_graph:
             if not torch.is_tensor(qo_indptr_buf):
                 raise ValueError(
@@ -4687,7 +4691,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                         cutlass_work_items=_cutlass_plan_work_items(
                             qo_indptr_host, num_qo_heads
                         ),
-                        cuda_graph_enabled=self.is_cuda_graph_enabled,
+                        cutlass_replan_under_capture=(
+                            self.is_cuda_graph_enabled and self._cutlass_graph_planned
+                        ),
                         cutlass_indptr_is_int32=(
                             self._qo_indptr_buf.dtype == torch.int32
                             and self._kv_indptr_buf.dtype == torch.int32
@@ -4764,17 +4770,22 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             self._cudnn_stats_offsets = self._qo_indptr_buf
 
         if self._backend == "cutlass":
-            if self.is_cuda_graph_enabled:
-                # `fmha_varlen_plan` allocates new work-index buffers per call,
-                # so a captured graph keeps pointing at the previous ones. The
-                # fix is to update them in place; until then, refuse rather than
-                # replay against a stale plan. `auto` never lands here -- it
-                # treats graph mode as CUTLASS-ineligible and routes elsewhere.
+            if self.is_cuda_graph_enabled and self._cutlass_graph_planned:
+                # `fmha_varlen_plan` allocates new work-index buffers on every
+                # call, so a graph captured against the first plan keeps
+                # pointing at that allocation. Planning once and then capturing
+                # is therefore fine -- it is the *re*-plan that strands the
+                # captured graph on stale buffers, so only that is refused.
+                # The fix is to update those buffers in place; until then
+                # `auto` declines CUTLASS on re-plan and routes elsewhere.
                 raise ValueError(
-                    "the cutlass backend allocates its plan buffers per plan() "
-                    "call and is not CUDA-graph safe; use backend='auto' to get "
-                    "a graph-safe backend, or an explicit 'cudnn'/'fa2'"
+                    "the cutlass backend allocates fresh plan buffers on every "
+                    "plan() call, so re-planning under CUDA graph capture would "
+                    "leave the captured graph pointing at the previous ones; "
+                    "use backend='auto', or an explicit 'cudnn'/'fa2', if you "
+                    "need to re-plan inside a graph"
                 )
+            self._cutlass_graph_planned = True
             # Device mirrors, not the caller's tensors: in CUDA-graph mode the
             # kernel reads the registered buffers, and a host-side indptr would
             # otherwise be planned against.
