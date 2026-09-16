@@ -17,6 +17,8 @@ def check_shape(m, n, k):
 
 
 def _sm121_tactic(m, n, k, compute_capability):
+    if compute_capability == (12, 1) and (m, n, k) == (1024, 896, 1024):
+        return ("raw", 32, 64, 13, True, True)
     if compute_capability == (12, 1) and (m, n, k) == (512, 5120, 640):
         return ("cooperative", 128, 128, 128)
     if compute_capability == (12, 1) and (m, n, k) == (512, 5120, 2560):
@@ -125,7 +127,7 @@ def valid_tactics(m, n, k, *, compute_capability=None):
         return (_sm121_tactic(m, n, k, compute_capability) or NARROW_TACTICS[1],)
     choices = NARROW_TACTICS + (RAW_TACTICS if m % 128 == 0 else ())
     preferred = _sm121_tactic(m, n, k, compute_capability)
-    if preferred is None:
+    if preferred is None or preferred in choices:
         return choices
     previous_default = default_tactic(m, n, k)
     return tuple(
