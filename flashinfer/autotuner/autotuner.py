@@ -2940,7 +2940,8 @@ class AutoTuner:
         inputs: list[Any],
         tactic: Any,
         tuning_config: TuningConfig,
-        input_tensor_batches: list[_ProfileInvocation],
+        input_tensor_batches: list[_ProfileInvocation] | None = None,
+        **kwargs: Any,
     ) -> float:
         """Profile a single kernel implementation for performance measurement.
 
@@ -2950,6 +2951,7 @@ class AutoTuner:
             tactic (int): Tactic ID to use for this profiling run
             tuning_config (TuningConfig): Tuning configuration
             input_tensor_batches: Previously provisioned complete invocation schedule.
+                When omitted, this method provisions one from ``inputs`` and ``kwargs``.
 
         Returns:
             Execution time in milliseconds. Cold-L2 profiling returns the
@@ -2978,6 +2980,15 @@ class AutoTuner:
                 "(nested capture is forbidden).  Tune before capture, not "
                 "inside it -- close the autotune_v2/autotune context before "
                 "the framework captures the model."
+            )
+
+        if input_tensor_batches is None:
+            tuning_config, input_tensor_batches = (
+                self._prepare_input_tensors_with_batches(
+                    inputs,
+                    tuning_config,
+                    kwargs=kwargs,
+                )
             )
 
         # MeasurementPolicy(timer="cupti") routes to per-iteration GPU-span
@@ -3481,8 +3492,17 @@ class AutoTuner:
             )
 
             if callable(spec.gen_tuning_buckets):
-                opt_shapes = spec.gen_tuning_buckets(
-                    _get_opt(base_profile.shapes[spec.input_idx[0]][spec.dim_idx[0]])
+                concrete_extent = _get_opt(
+                    base_profile.shapes[spec.input_idx[0]][spec.dim_idx[0]]
+                )
+                opt_shapes = tuple(spec.gen_tuning_buckets(concrete_extent))
+                # A generated catalog may retain the concrete upper bound as its tail even
+                # when inference maps that extent to a wider bucket. Profile the bucket itself;
+                # all other generated coordinates already denote explicit profile points.
+                mapped_extent = spec.map_to_tuning_buckets(concrete_extent)
+                opt_shapes = tuple(
+                    mapped_extent if value == concrete_extent else value
+                    for value in opt_shapes
                 )
             else:
                 opt_shapes = spec.gen_tuning_buckets
@@ -3622,7 +3642,7 @@ class AutoTuner:
         tuning_config: TuningConfig,
         extras: tuple[Any, ...] = (),
     ) -> ProfilingCacheKey:
-        """Build a cache key from generated profile shapes without remapping buckets."""
+        """Build a cache key from generated profile shapes."""
         return cls._get_cache_key_from_nearest_profile(
             custom_op,
             runner,
@@ -3637,7 +3657,7 @@ class AutoTuner:
         optimization_profile: tuple[tuple[int, ...], ...],
         tuning_config: TuningConfig,
     ) -> tuple[tuple[int, ...], ...]:
-        """Mask constraint-derived dimensions while preserving mapped dynamic buckets."""
+        """Mask constraint-derived dimensions while preserving profile coordinates."""
         canonical = [list(shape) for shape in optimization_profile]
         for constraint_spec in tuning_config.constraint_specs:
             canonical[constraint_spec.input_idx][constraint_spec.dim_idx] = -1
