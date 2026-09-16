@@ -466,9 +466,31 @@ def cudnn_batch_decode_with_kv_cache(
 
     if out is None:
         out = torch.empty(bs, h_qo, d_vo, device=q.device, dtype=q.dtype)
-    elif not out.is_contiguous():
+    elif (
+        out.shape != (bs, h_qo, d_vo)
+        or out.device != q.device
+        or not out.is_contiguous()
+    ):
         # O is bound with contiguous (batch, heads, d_vo) strides.
-        raise ValueError("out must be contiguous")
+        raise ValueError(
+            f"out must be a contiguous tensor of shape ({bs}, {h_qo}, {d_vo}) on "
+            f"{q.device}, got shape {tuple(out.shape)} on {out.device}"
+        )
+    # Every tensor bound to the graph (and the workspace) must live where q
+    # does; the graph executes on q's device with raw pointers.
+    for name, tensor in (
+        ("k_cache", k_cache),
+        ("v_cache", v_cache),
+        ("workspace_buffer", workspace_buffer),
+        ("lse", lse),
+        ("block_tables", block_tables),
+        ("actual_seq_lens_kv", actual_seq_lens_kv if CUDNN_AVAILABLE else None),
+    ):
+        if tensor is not None and tensor.device != q.device:
+            raise ValueError(
+                f"{name} must be on the same device as q ({q.device}), "
+                f"got {tensor.device}"
+            )
     if q.stride(-1) != 1:
         # The graph honors arbitrary batch/head strides but needs a unit
         # innermost stride (TMA/vector loads); such inputs are rare, copy them.
