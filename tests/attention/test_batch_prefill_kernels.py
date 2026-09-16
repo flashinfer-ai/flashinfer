@@ -2666,9 +2666,7 @@ def test_paged_prefill_split_kv_preserves_fp32_partials():
     )
     wrapper.plan(
         qo_indptr=torch.tensor([0, 1], device="cuda", dtype=torch.int32),
-        paged_kv_indptr=torch.tensor(
-            [0, num_pages], device="cuda", dtype=torch.int32
-        ),
+        paged_kv_indptr=torch.tensor([0, num_pages], device="cuda", dtype=torch.int32),
         paged_kv_indices=torch.arange(num_pages, device="cuda", dtype=torch.int32),
         paged_kv_last_page_len=torch.tensor(
             [page_size], device="cuda", dtype=torch.int32
@@ -2697,17 +2695,13 @@ def test_paged_prefill_split_kv_preserves_fp32_partials():
             torch.softmax(scores, dim=-1) @ v[:, head_idx // group_size]
         )
 
-    whole_workspace = torch.empty(
-        512 * 1024 * 1024, dtype=torch.uint8, device="cuda"
-    )
+    whole_workspace = torch.empty(512 * 1024 * 1024, dtype=torch.uint8, device="cuda")
     whole_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
         whole_workspace, kv_layout="NHD", backend="fa2"
     )
     whole_wrapper.plan(
         qo_indptr=torch.tensor([0, 1], device="cuda", dtype=torch.int32),
-        paged_kv_indptr=torch.tensor(
-            [0, num_pages], device="cuda", dtype=torch.int32
-        ),
+        paged_kv_indptr=torch.tensor([0, num_pages], device="cuda", dtype=torch.int32),
         paged_kv_indices=torch.arange(num_pages, device="cuda", dtype=torch.int32),
         paged_kv_last_page_len=torch.tensor(
             [page_size], device="cuda", dtype=torch.int32

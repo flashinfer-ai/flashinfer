@@ -27,15 +27,13 @@ template <bool SAME_KV_STRIDES, uint32_t CTA_TILE_Q, uint32_t HEAD_DIM_QK, uint3
           PosEncodingMode POS_ENCODING_MODE, bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE,
           typename AttentionVariant, typename Params>
 cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, float* tmp_v, float* tmp_s,
-                                                   bool enable_pdl,
-                                                   cudaStream_t stream);
+                                                   bool enable_pdl, cudaStream_t stream);
 
 template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
           PosEncodingMode POS_ENCODING_MODE, bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE,
           typename AttentionVariant, typename Params>
 cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, float* tmp_v, float* tmp_s,
-                                                    bool enable_pdl,
-                                                    cudaStream_t stream);
+                                                    bool enable_pdl, cudaStream_t stream);
 
 }  // namespace flashinfer
 
