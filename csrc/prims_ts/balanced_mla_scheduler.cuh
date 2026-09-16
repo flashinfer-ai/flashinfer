@@ -87,6 +87,9 @@ inline size_t getBalancedSchedDeviceWorkspaceSize(int32_t batchSize, int32_t num
 struct BalancedSchedDeviceParams {
   int32_t batchSize;
   int32_t blockSizeN;
+  // One producer CTA advances this many base KV tiles per mainloop step. Descriptor coordinates
+  // remain expressed in base KV tiles; only schedule partitioning uses this larger work unit.
+  int32_t tilesPerWorkUnit;
   int32_t numSmParts;
   int32_t maxSeqLen;
   int32_t const* seqLensKvPtr;

@@ -57,8 +57,8 @@ void BuildPrimsBalancedMLAPlanDevice(
     tvm::ffi::TensorView partition_offsets, tvm::ffi::TensorView combine_descriptors,
     tvm::ffi::TensorView num_combine_descriptors, tvm::ffi::TensorView plan_metadata,
     tvm::ffi::TensorView scheduler_workspace, tvm::ffi::TensorView cost_model_table,
-    int64_t num_partitions_arg, int64_t k_tile_tokens_arg, int64_t max_seq_len_arg,
-    bool select_cost_model_on_device, bool use_optimized_schedule,
+    int64_t num_partitions_arg, int64_t k_tile_tokens_arg, int64_t num_insts_kv_arg,
+    int64_t max_seq_len_arg, bool select_cost_model_on_device, bool use_optimized_schedule,
     int64_t forced_target_piece_tiles) {
   check_cuda_i32(seq_lens, "seq_lens");
   check_cuda_i32(work_descriptors, "work_descriptors");
@@ -99,8 +99,16 @@ void BuildPrimsBalancedMLAPlanDevice(
   TVM_FFI_ICHECK_LE(num_partitions_arg, std::numeric_limits<int32_t>::max());
   TVM_FFI_ICHECK_GT(k_tile_tokens_arg, 0) << "k_tile_tokens must be positive";
   TVM_FFI_ICHECK_LE(k_tile_tokens_arg, std::numeric_limits<int32_t>::max());
+  TVM_FFI_ICHECK_GT(num_insts_kv_arg, 0) << "num_insts_kv must be positive";
+  TVM_FFI_ICHECK_LE(num_insts_kv_arg, std::numeric_limits<int32_t>::max());
   TVM_FFI_ICHECK_GE(max_seq_len_arg, 0) << "max_seq_len must be non-negative";
   TVM_FFI_ICHECK_LE(max_seq_len_arg, std::numeric_limits<int32_t>::max());
+  int64_t const max_base_tiles = (max_seq_len_arg + k_tile_tokens_arg - 1) / k_tile_tokens_arg;
+  TVM_FFI_ICHECK_LE(max_base_tiles + num_insts_kv_arg - 1, std::numeric_limits<int32_t>::max())
+      << "the maximum aligned KV work-unit extent exceeds int32 capacity";
+  TVM_FFI_ICHECK_LE(forced_target_piece_tiles + num_insts_kv_arg - 1,
+                    std::numeric_limits<int32_t>::max())
+      << "the aligned forced target exceeds int32 capacity";
   TVM_FFI_ICHECK_LE(seq_lens.size(0), std::numeric_limits<int32_t>::max() - num_partitions_arg)
       << "batch_size plus num_partitions exceeds int32 capacity";
 
@@ -131,6 +139,7 @@ void BuildPrimsBalancedMLAPlanDevice(
   BalancedSchedDeviceParams params{};
   params.batchSize = batch_size;
   params.blockSizeN = static_cast<int32_t>(k_tile_tokens_arg);
+  params.tilesPerWorkUnit = static_cast<int32_t>(num_insts_kv_arg);
   params.numSmParts = num_partitions;
   params.maxSeqLen = static_cast<int32_t>(max_seq_len_arg);
   params.seqLensKvPtr = static_cast<int32_t const*>(seq_lens.data_ptr());

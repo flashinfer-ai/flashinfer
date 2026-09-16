@@ -81,7 +81,7 @@ COST_BUCKETS = (
     "dense_large",
 )
 ARTIFACT_SCHEMA_VERSION = 4
-MEASUREMENT_METHOD_VERSION = "optimized-cuda-forced-schedule-graph-v3"
+MEASUREMENT_METHOD_VERSION = "optimized-cuda-forced-work-unit-schedule-graph-v4"
 _REPO_ROOT = Path(__file__).resolve().parents[4]
 _SOURCE_SUFFIXES = frozenset((".cc", ".cu", ".cuh", ".h", ".py"))
 _MEASUREMENT_SOURCE_SYMBOLS = frozenset(
@@ -770,8 +770,15 @@ def forced_target_split_counts(plan, seq_lens: Sequence[int], target: int):
     if target <= 0:
         raise ValueError("target must be positive")
     k_tiles = [ceil_div(int(value), plan.k_tile_tokens) for value in seq_lens]
+    target_work_units = ceil_div(target, plan.num_insts_kv)
     split_counts = [
-        min(ceil_div(value, target), 127, plan.num_partitions) if value else 0
+        min(
+            ceil_div(ceil_div(value, plan.num_insts_kv), target_work_units),
+            127,
+            plan.num_partitions,
+        )
+        if value
+        else 0
         for value in k_tiles
     ]
     if sum(split_counts) > plan.descriptor_capacity:
@@ -905,15 +912,21 @@ def stage_recorded_schedule(
     return stats
 
 
-def target_candidates(seq_lens: Sequence[int], quick: bool) -> tuple[int, ...]:
+def target_candidates(
+    seq_lens: Sequence[int], quick: bool, tiles_per_work_unit: int = 1
+) -> tuple[int, ...]:
     max_tiles = max(ceil_div(int(value), 128) for value in seq_lens)
     piece_counts = (
         (1, 4, 16, 64, 127)
         if quick
         else (1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 127)
     )
-    targets = {max(ceil_div(max_tiles, pieces), 1) for pieces in piece_counts}
-    targets.add(max_tiles)
+    targets = {
+        ceil_div(max(ceil_div(max_tiles, pieces), 1), tiles_per_work_unit)
+        * tiles_per_work_unit
+        for pieces in piece_counts
+    }
+    targets.add(ceil_div(max_tiles, tiles_per_work_unit) * tiles_per_work_unit)
     return tuple(sorted(targets))
 
 
@@ -1157,6 +1170,7 @@ def tune_selection_cost_model(
             device=device,
             cost=latency_fit_cost,
             kernel_family=family,
+            num_insts_kv=2 if family == "1cta" else 1,
             dtype_name=dtype_name,
             max_seq_len=case.max_kv_len,
         )
@@ -1307,7 +1321,11 @@ def collect_measurements(
     for family in families:
         for dtype_name in dtype_names:
             for case in cases:
-                candidates = target_candidates(case.seq_lens, quick)
+                candidates = target_candidates(
+                    case.seq_lens,
+                    quick,
+                    tiles_per_work_unit=2 if family == "1cta" else 1,
+                )
                 missing = [
                     target
                     for target in candidates
