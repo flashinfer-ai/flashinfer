@@ -2268,6 +2268,8 @@ class AutoTuner:
             for _step, p in enumerate(profiles):
                 tensors = None
                 prepared_input_batches = None
+                preparation_inputs = None
+                preparation_kwargs = None
                 try:
                     # Check the cache before synthesizing profile inputs.
                     # `_prepare_input_tensors` launches a GPU kernel per
@@ -2328,11 +2330,15 @@ class AutoTuner:
                             input_preparation_oom = True
                             tensors = None
                             prepared_input_batches = None
+                            preparation_inputs = None
+                            preparation_kwargs = None
                             retained_kwarg_clones.clear()
 
                         if _sync_oom_across_tune_group(input_preparation_oom):
                             tensors = None
                             prepared_input_batches = None
+                            preparation_inputs = None
+                            preparation_kwargs = None
                             retained_kwarg_clones.clear()
                             torch.cuda.empty_cache()
                             logger.warning(
@@ -2342,6 +2348,8 @@ class AutoTuner:
 
                         assert tensors is not None
                         assert prepared_input_batches is not None
+                        assert preparation_inputs is not None
+                        assert preparation_kwargs is not None
                         if pbar is None:
                             pbar = tqdm.tqdm(
                                 total=len(profiles),
@@ -2365,10 +2373,16 @@ class AutoTuner:
                                 runner_preparation_oom = True
                                 tensors = None
                                 prepared_input_batches = None
+                                preparation_inputs = None
+                                preparation_kwargs = None
+                                retained_kwarg_clones.clear()
 
                             if _sync_oom_across_tune_group(runner_preparation_oom):
                                 tensors = None
                                 prepared_input_batches = None
+                                preparation_inputs = None
+                                preparation_kwargs = None
+                                retained_kwarg_clones.clear()
                                 torch.cuda.empty_cache()
                                 logger.warning(
                                     "[Autotuner]: OOM detected, falling back to default tactic"
@@ -2421,6 +2435,8 @@ class AutoTuner:
                                 ) -> float:
                                     """Lazily materialize and time one complete runner tactic."""
                                     nonlocal runner_handles_precompile, skipped_count
+                                    nonlocal tensors, prepared_input_batches
+                                    nonlocal preparation_inputs, preparation_kwargs
                                     _ = decisive
                                     public_tactic = candidate.public_identity()
                                     if isinstance(public_tactic, list):
@@ -2448,24 +2464,44 @@ class AutoTuner:
                                         # PrimsTS compiles only coordinate points the search visits.
                                         # A generic preparation-only runner still receives its legacy
                                         # one-time fallback preparation before the first measurement.
-                                        if runner_handles_precompile is not False:
-                                            handled = r.precompile_tactics(
-                                                preparation_inputs,
-                                                [public_tactic],
-                                                p,
-                                                **preparation_kwargs,
+                                        factorized_preparation_oom = False
+                                        try:
+                                            if runner_handles_precompile is not False:
+                                                handled = r.precompile_tactics(
+                                                    preparation_inputs,
+                                                    [public_tactic],
+                                                    p,
+                                                    **preparation_kwargs,
+                                                )
+                                                if runner_handles_precompile is None:
+                                                    runner_handles_precompile = handled
+                                                    if not handled and (
+                                                        "do_preparation"
+                                                        in runner_arg_names
+                                                    ):
+                                                        r(
+                                                            preparation_inputs,
+                                                            tactic=-1,
+                                                            do_preparation=True,
+                                                            **preparation_kwargs,
+                                                        )
+                                        except (
+                                            torch.cuda.OutOfMemoryError,
+                                            MemoryError,
+                                        ):
+                                            factorized_preparation_oom = True
+                                        if _sync_oom_across_tune_group(
+                                            factorized_preparation_oom
+                                        ):
+                                            factorized_preparation_oom = True
+                                            tensors = None
+                                            prepared_input_batches = None
+                                            preparation_inputs = None
+                                            preparation_kwargs = None
+                                            retained_kwarg_clones.clear()
+                                            raise MemoryError(
+                                                "OOM during factorized tactic preparation"
                                             )
-                                            if runner_handles_precompile is None:
-                                                runner_handles_precompile = handled
-                                                if not handled and (
-                                                    "do_preparation" in runner_arg_names
-                                                ):
-                                                    r(
-                                                        preparation_inputs,
-                                                        tactic=-1,
-                                                        do_preparation=True,
-                                                        **preparation_kwargs,
-                                                    )
                                         time_measured = self._profile_single_kernel(
                                             r,
                                             tensors,
@@ -2473,7 +2509,12 @@ class AutoTuner:
                                             effective_tuning_config,
                                             input_tensor_batches=prepared_input_batches,
                                         )
-                                    except torch.cuda.OutOfMemoryError:
+                                    except (
+                                        torch.cuda.OutOfMemoryError,
+                                        MemoryError,
+                                    ):
+                                        if factorized_preparation_oom:
+                                            raise
                                         if _tune_process_group is None:
                                             raise
                                         with contextlib.suppress(Exception):
@@ -2544,10 +2585,16 @@ class AutoTuner:
                                 runner_preparation_oom = True
                                 tensors = None
                                 prepared_input_batches = None
+                                preparation_inputs = None
+                                preparation_kwargs = None
+                                retained_kwarg_clones.clear()
 
                             if _sync_oom_across_tune_group(runner_preparation_oom):
                                 tensors = None
                                 prepared_input_batches = None
+                                preparation_inputs = None
+                                preparation_kwargs = None
+                                retained_kwarg_clones.clear()
                                 torch.cuda.empty_cache()
                                 logger.warning(
                                     "[Autotuner]: OOM detected, falling back to default tactic"
@@ -2773,6 +2820,8 @@ class AutoTuner:
 
             tensors = None
             input_tensor_batches = None
+            preparation_inputs = None
+            preparation_kwargs = None
             input_preparation_oom = False
             try:
                 tensors = self._prepare_input_tensors(profile, inputs)
@@ -2794,16 +2843,22 @@ class AutoTuner:
                 input_preparation_oom = True
                 tensors = None
                 input_tensor_batches = None
+                preparation_inputs = None
+                preparation_kwargs = None
 
             # Ranking can run inside another runner's get_valid_tactics().
             # Every rank must leave preparation before nested timing reduces.
             if _sync_oom_across_tune_group(input_preparation_oom):
                 tensors = None
                 input_tensor_batches = None
+                preparation_inputs = None
+                preparation_kwargs = None
                 raise MemoryError("OOM during tactic-ranking input preparation")
 
             assert tensors is not None
             assert input_tensor_batches is not None
+            assert preparation_inputs is not None
+            assert preparation_kwargs is not None
             runner_preparation_oom = False
             try:
                 valid_tactics = runner.get_valid_tactics(tensors, profile)
@@ -2821,10 +2876,14 @@ class AutoTuner:
                 runner_preparation_oom = True
                 tensors = None
                 input_tensor_batches = None
+                preparation_inputs = None
+                preparation_kwargs = None
 
             if _sync_oom_across_tune_group(runner_preparation_oom):
                 tensors = None
                 input_tensor_batches = None
+                preparation_inputs = None
+                preparation_kwargs = None
                 raise MemoryError("OOM during tactic-ranking runner preparation")
 
             if not valid_tactics:

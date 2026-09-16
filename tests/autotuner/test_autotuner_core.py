@@ -538,10 +538,10 @@ def test_choose_one_releases_inputs_before_oom_sync_and_cache_cleanup(
         synthetic_ref = weakref.ref(synthetic_input)
         return [synthetic_input]
 
-    def prepare_batches(_self, tensors, *_args):
+    def prepare_batches(_self, tensors, tuning_config, **_kwargs):
         if failure_phase == "input_batches":
             raise MemoryError("CUDA out of memory")
-        return [list(tensors)]
+        return tuning_config, [(list(tensors), {"repeated": tensors[0]})]
 
     def empty_cache():
         gc.collect()
@@ -1038,6 +1038,29 @@ def test_factorized_search_fails_only_when_all_coordinates_fail(monkeypatch):
         pytest.raises(RuntimeError, match="no finite tactics"),
     ):
         tuner.choose_one("factorized_all_failed", [runner], TuningConfig(), inputs)
+
+
+def test_factorized_search_preparation_oom_uses_default_tactic(monkeypatch):
+    class PreparationOomRunner(FactorizedDummyRunner):
+        def precompile_tactics(self, inputs, tactics, profile, **kwargs):
+            raise MemoryError("workspace allocation failed")
+
+    tuner = reset_autotuner()
+    runner = PreparationOomRunner((8,), num_tactics_per_tile=4)
+    inputs = [torch.empty((3, 4), dtype=torch.float32)]
+    profile = MagicMock(return_value=1.0)
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", profile)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(torch.cuda, "empty_cache", MagicMock())
+
+    with autotune(tune_mode=True):
+        chosen_runner, tactic = tuner.choose_one(
+            "factorized_preparation_oom", [runner], TuningConfig(), inputs
+        )
+
+    assert chosen_runner is runner
+    assert tactic == -1
+    profile.assert_not_called()
 
 
 def test_factorized_search_recovers_when_one_pinned_slice_fails(monkeypatch):
