@@ -134,3 +134,72 @@ def test_native_nemotron_recurrence_against_independent_fp32_oracle():
     torch.testing.assert_close(out.float(), expected, rtol=0.04, atol=0.04)
     torch.testing.assert_close(state[6].float(), expected_state[6], rtol=0.04, atol=0.04)
     torch.testing.assert_close(state[1], original[1], rtol=0, atol=0)
+
+
+@pytest.mark.skipif(TEST_DEVICE != "musa", reason="MUSA contract test")
+def test_varlen_final_states_against_independent_fp32_oracle():
+    """Check packed sequence boundaries and every destination state, not only output."""
+    torch.manual_seed(1903)
+    device = torch.device(TEST_DEVICE)
+    lengths = [1, 3]
+    max_seqlen = 3
+    tokens, heads, dim, dstate, groups, slots = 4, 4, 7, 16, 2, 32
+    state = torch.randn(slots, heads, dim, dstate, device=device, dtype=torch.bfloat16)
+    original = state.clone()
+    x = torch.randn(tokens, heads, dim, device=device, dtype=torch.bfloat16)
+    dt_base = torch.randn(tokens, heads, device=device, dtype=torch.float32) * 0.1
+    dt = dt_base[:, :, None].expand(tokens, heads, dim)
+    a_base = -torch.rand(heads, device=device, dtype=torch.float32) - 1
+    A = a_base[:, None, None].expand(heads, dim, dstate)
+    B = torch.randn(tokens, groups, dstate, device=device, dtype=torch.bfloat16)
+    C = torch.randn_like(B)
+    D = torch.randn(heads, dim, device=device, dtype=torch.float32)
+    bias_base = torch.randn(heads, device=device, dtype=torch.float32) - 2
+    dt_bias = bias_base[:, None].expand(heads, dim)
+    cu = torch.tensor([0, 1, 4], device=device, dtype=torch.int32)
+    src = torch.tensor([[2, -1, -1], [7, 8, 9]], device=device, dtype=torch.int32)
+    dst = torch.tensor([[12, -1, -1], [17, 18, 19]], device=device, dtype=torch.int32)
+    accepted = torch.ones((2,), device=device, dtype=torch.int64)
+    out = torch.empty(tokens, heads, dim, device=device, dtype=torch.bfloat16)
+
+    actual = selective_state_update(
+        state,
+        x,
+        dt,
+        A,
+        B,
+        C,
+        D=D,
+        dt_bias=dt_bias,
+        dt_softplus=True,
+        state_batch_indices=src,
+        dst_state_batch_indices=dst,
+        pad_slot_id=-1,
+        out=out,
+        num_accepted_tokens=accepted,
+        cu_seqlens=cu,
+        cache_steps=max_seqlen,
+        algorithm="simple",
+        backend="flashinfer",
+    )
+
+    expected_state = original.float()
+    expected = torch.empty(tokens, heads, dim, device=device, dtype=torch.float32)
+    ratio = heads // groups
+    flat = 0
+    for seq, length in enumerate(lengths):
+        for t in range(length):
+            for h in range(heads):
+                group = h // ratio
+                delta = torch.nn.functional.softplus(dt_base[flat, h] + bias_base[h])
+                running = expected_state[src[seq, t], h] * torch.exp(a_base[h] * delta)
+                running = running + delta * x[flat, h].float()[:, None] * B[flat, group].float()[None, :]
+                expected_state[dst[seq, t], h] = running
+                expected[flat, h] = (C[flat, group].float()[None, :] * running).sum(-1) + D[h] * x[flat, h].float()
+            flat += 1
+
+    torch.testing.assert_close(actual.float(), expected, rtol=0.05, atol=0.05)
+    for slot in [12, 17, 18, 19]:
+        torch.testing.assert_close(state[slot].float(), expected_state[slot], rtol=0.05, atol=0.05)
+    for slot in [2, 7, 8, 9]:
+        torch.testing.assert_close(state[slot], original[slot], rtol=0, atol=0)
