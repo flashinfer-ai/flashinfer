@@ -536,30 +536,10 @@ class SwapABFp8GluEpilogue:
         tidx,
         c_scale: Float32,
     ) -> None:
-        """generate_c: store this thread's raw FC1 gate/up accumulators as BF16
-        with one 16-byte store per token group.
+        """Store pre-clamp, pre-SwiGLU, unweighted FC1 output as BF16.
 
-        Same contract as the non-swap kernel (pre-SwiGLU, pre-clamp,
-        pre-routing-weight, dequantized; ``fc1_c[pool_row, intermediate_gateup]``
-        in the kernel's gate/up-interleaved order) with the swap-AB register
-        layout: the CTA tile has intermediate along M and tokens along N.
-        Warpgroup ``n_half`` owns accumulator rows ``[n_half * 128, +128)``
-        of the CTA tile; per token group a thread holds eight values
-        ``E[g][c]`` (``g`` = its lane group, class ``c = 4*m_sub + 2*t +
-        kind``, ``t`` the token parity, ``kind`` 0 = gate / 1 = up) at
-        ``C[token0 + t, c_col_base + m_sub*64 + local_warp_idx*16 + kind*8 +
-        g]``.  For a fixed class the eight lane groups therefore cover eight
-        consecutive columns (16 bytes, 16-byte aligned).  An 8x8 transpose
-        across the lane groups -- two 32-bit butterfly levels on lane-id bits
-        4 and 3 (``lane_group`` bits 2 and 1) plus one 16-bit half-word
-        exchange on bit 2 (``lane_group`` bit 0) -- leaves lane group ``g``
-        with the eight values of class ``g`` in column order, stored with one
-        ``st.global.v4`` (1 STG.128 per token group instead of 8 scalar
-        stores).  Only valid tokens are written and ``intermediate_gateup %
-        64 == 0`` keeps every chunk inside the tensor, so the row/column
-        predicate is exact; the expert offset comes straight from
-        ``cumulative_data_physical_row`` (no scheduler-extension slice).
-        ``c_scale``: per-tensor dequant scale, 1.0 for blockwise.
+        Preserve the kernel's gate/up-interleaved column order.
+        c_scale is the per-tensor dequantization factor, or 1.0 for blockwise.
         """
         thread_in_warp = tidx % WarpThreadCount
         lane_group = thread_in_warp // 4
@@ -572,51 +552,60 @@ class SwapABFp8GluEpilogue:
             work_tile_info.tile_m_idx * cutlass.Int32(self._wgmma_fragment_count)
             + cutlass.Int32(n_half)
         ) * cutlass.Int32(128)
-        b2_set = (lane_group & cutlass.Int32(4)) != cutlass.Int32(0)
-        b1_set = (lane_group & cutlass.Int32(2)) != cutlass.Int32(0)
-        b0_set = (lane_group & cutlass.Int32(1)) != cutlass.Int32(0)
-        b2 = (lane_group >> cutlass.Int32(2)) & cutlass.Int32(1)
-        b1 = (lane_group >> cutlass.Int32(1)) & cutlass.Int32(1)
-        b0 = lane_group & cutlass.Int32(1)
-        # class g = 4*b2 + 2*b1 + b0 -> token0 + b1, column block
-        # c_col_base + b2*64 + local_warp_idx*16 + b0*8.
+        lane_group_bit2_set = (lane_group & cutlass.Int32(4)) != cutlass.Int32(0)
+        lane_group_bit1_set = (lane_group & cutlass.Int32(2)) != cutlass.Int32(0)
+        lane_group_bit0_set = (lane_group & cutlass.Int32(1)) != cutlass.Int32(0)
+        lane_group_bit2 = (lane_group >> cutlass.Int32(2)) & cutlass.Int32(1)
+        lane_group_bit1 = (lane_group >> cutlass.Int32(1)) & cutlass.Int32(1)
+        lane_group_bit0 = lane_group & cutlass.Int32(1)
+        # Lane-group bits select the M64 fragment, token row, and gate/up block.
         col = (
             c_col_base
-            + b2 * cutlass.Int32(64)
+            + lane_group_bit2 * cutlass.Int32(64)
             + cutlass.Int32(local_warp_idx * 16)
-            + b0 * cutlass.Int32(8)
+            + lane_group_bit0 * cutlass.Int32(8)
         )
         # prmt.b32 selectors (nibble i picks source byte i of {b, a}):
         # 0x5410 = (a.lo, b.lo), 0x7632 = (a.hi, b.hi), 0x7610 = (a.lo, b.hi),
         # 0x3254 = (b.lo, a.hi), 0x3276 = (b.hi, a.hi).
-        sel_send = cutlass.Uint32(0x5410) if b0_set else cutlass.Uint32(0x7632)
-        sel_a = cutlass.Uint32(0x3254) if b0_set else cutlass.Uint32(0x5410)
-        sel_b = cutlass.Uint32(0x3276) if b0_set else cutlass.Uint32(0x7610)
+        sel_send = (
+            cutlass.Uint32(0x5410) if lane_group_bit0_set else cutlass.Uint32(0x7632)
+        )
+        sel_a = (
+            cutlass.Uint32(0x3254) if lane_group_bit0_set else cutlass.Uint32(0x5410)
+        )
+        sel_b = (
+            cutlass.Uint32(0x3276) if lane_group_bit0_set else cutlass.Uint32(0x7610)
+        )
         for token_group in cutlass.range_constexpr(self._token_group_count):
             token0 = cutlass.Int32(token_group * 8) + lane_mod * cutlass.Int32(2)
             # W[k] = gate_k | up_k << 16 for k = m_sub*2 + t (acc regs: src+0/1
             # gate token0/1, src+2/3 up token0/1), i.e. classes (2k, 2k+1)
             # share one word.
-            src0 = token_group * 4
-            src1 = self._accum_regs_per_m64 + token_group * 4
+            first_fragment_accum_base = token_group * 4
+            second_fragment_accum_base = self._accum_regs_per_m64 + token_group * 4
             w0 = pack_f32x2_to_bf16x2(
-                accumulators[src0 + 0] * c_scale, accumulators[src0 + 2] * c_scale,
+                accumulators[first_fragment_accum_base + 0] * c_scale,
+                accumulators[first_fragment_accum_base + 2] * c_scale,
             )
             w1 = pack_f32x2_to_bf16x2(
-                accumulators[src0 + 1] * c_scale, accumulators[src0 + 3] * c_scale,
+                accumulators[first_fragment_accum_base + 1] * c_scale,
+                accumulators[first_fragment_accum_base + 3] * c_scale,
             )
             w2 = pack_f32x2_to_bf16x2(
-                accumulators[src1 + 0] * c_scale, accumulators[src1 + 2] * c_scale,
+                accumulators[second_fragment_accum_base + 0] * c_scale,
+                accumulators[second_fragment_accum_base + 2] * c_scale,
             )
             w3 = pack_f32x2_to_bf16x2(
-                accumulators[src1 + 1] * c_scale, accumulators[src1 + 3] * c_scale,
+                accumulators[second_fragment_accum_base + 1] * c_scale,
+                accumulators[second_fragment_accum_base + 3] * c_scale,
             )
             # 32-bit levels: lane_group bit 2 <-> lane bit 4 (xor 16), bit 1
             # <-> lane bit 3 (xor 8).  Afterwards the lane holds, for classes
-            # (4*b2 + 2*b1, +1) packed low/high, the words of the four lane
-            # groups sharing its bit 0, in ascending lane-group order.
+            # adjacent gate/up classes packed low/high, the words of the four
+            # lane groups sharing bit 0, in ascending lane-group order.
             y0, y1, y2, y3 = bfly_transpose4_u32(
-                w0, w1, w2, w3, b2_set, b1_set, 16, 8,
+                w0, w1, w2, w3, lane_group_bit2_set, lane_group_bit1_set, 16, 8,
             )
             # 16-bit level on lane_group bit 0 (xor 4): even lane groups keep
             # the gate (low) halves and receive the odd groups' gate halves;
@@ -632,7 +621,7 @@ class SwapABFp8GluEpilogue:
             o1 = cutlass.Uint32(cute.arch.prmt(y1, p0, sel_b))
             o2 = cutlass.Uint32(cute.arch.prmt(y2, p1, sel_a))
             o3 = cutlass.Uint32(cute.arch.prmt(y3, p1, sel_b))
-            token = token0 + b1
+            token = token0 + lane_group_bit1
             if token < valid_tokens and col < valid_gateup_n:
                 stg_128b_bf16x8(g_c, o0, o1, o2, o3, row_base + token, col)
 
@@ -2011,6 +2000,9 @@ class SwapABFp8GluEpilogue:
                     )
                 else:
                     if cutlass.const_expr(self._token_back_by_dispatch):
+                        # All four warps must finish STG before the leader
+                        # publishes this task's FC2 completion counter.
+                        task_tile_boundary_bar.arrive_and_wait()
                         cute.arch.fence_acq_rel_gpu()
                         fc2_flag_addr = (
                             token_comm_args.fc2_done_counter.iterator

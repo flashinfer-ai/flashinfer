@@ -503,36 +503,10 @@ class Fp8GluEpilogue:
         tidx,
         c_scale: Float32,
     ) -> None:
-        """generate_c: store this thread's raw FC1 gate/up accumulators as BF16
-        with 16-byte stores.
+        """Store pre-clamp, pre-SwiGLU, unweighted FC1 output as BF16.
 
-        Same contract as the Blackwell MXFP8 kernel's ``_store_fc1_c_subtile``:
-        the pre-SwiGLU (pre-clamp, pre-routing-weight) FP32 accumulator goes
-        to ``fc1_c[pool_row, intermediate_gateup]`` in the kernel's native
-        gate/up-interleaved column order (interleave = Fp8GateUpInterleave).
-        Hopper register layout: this warpgroup owns acc columns
-        ``[n_half * 128, n_half * 128 + 128)`` of the CTA tile; per 8-wide
-        gate or up column group each thread holds the column pair
-        ``2 * lane_mod`` for rows ``token_row0`` and ``token_row1`` (regs
-        0,1 -> row0; 2,3 -> row1).
-
-        For a fixed row and pair of output groups ``(2*rh, 2*rh+1)`` the four
-        lanes of a quad hold 64 consecutive raw columns (gate/up of group
-        2*rh, gate/up of group 2*rh+1 = four 16-byte chunks), each lane
-        owning 4 bytes of every chunk.  A two-level 32-bit butterfly
-        transpose across ``lane_mod`` (lane-id bits 1 and 0) leaves lane
-        ``q`` with chunk ``q`` in column order, so one ``st.global.v4`` per
-        (row, rh) replaces four 4-byte stores and a quad writes one
-        64-byte-aligned 64-byte run of a single row.  No SMEM staging, so
-        the AB pipeline budget is unchanged.  Only valid token rows are
-        written (the 128-aligned pad rows keep the host's zero fill) and
-        ``intermediate_gateup % 64 == 0`` keeps every chunk inside the
-        tensor, so the row/column predicate is exact.
-
-        ``c_scale`` restores real units: the blockwise mainloop already folds
-        the block scales into the accumulator (pass 1.0), while the per-tensor
-        mainloop accumulates raw fp8 x fp8 products and applies
-        ``fc1_act_weight_dequant_scale`` in the epilogue -- so does this store.
+        Preserve the kernel's gate/up-interleaved column order.
+        c_scale is the per-tensor dequantization factor, or 1.0 for blockwise.
         """
         lane_mod = (tidx % WarpThreadCount) % 4
         q_hi_set = (lane_mod & cutlass.Int32(2)) != cutlass.Int32(0)
@@ -545,38 +519,37 @@ class Fp8GluEpilogue:
             + cutlass.Int32(n_half * 2 * Fc1EpilogueStoreTileN)
         )
         accum_fragment_base = m_sub * self._accum_regs_per_m64
-        for rh in cutlass.range_constexpr(
+        for output_group_pair_idx in cutlass.range_constexpr(
             Fc1SubtilesPerHalf * Fc1GroupsPerSubtile // 2
         ):
-            og0 = 2 * rh
-            # regs: gate(og) at +0..3, up(og) at +4..7; (0,1) row0, (2,3) row1
-            rb0 = accum_fragment_base + og0 * 8
-            rb1 = rb0 + 8
-            # chunk q of this 64-byte run starts at raw column og0*16 + q*8
+            first_output_group = 2 * output_group_pair_idx
+            # Each output group uses 4 gate and 4 up accumulator registers.
+            first_group_accum_base = accum_fragment_base + first_output_group * 8
+            second_group_accum_base = first_group_accum_base + 8
+            # Each lane stores 8 raw columns from this pair of output groups.
             col = (
                 col_wg_base
-                + cutlass.Int32(og0 * 2 * Fp8GateUpInterleave)
+                + cutlass.Int32(first_output_group * 2 * Fp8GateUpInterleave)
                 + lane_mod * cutlass.Int32(Fp8GateUpInterleave)
             )
             for row in cutlass.range_constexpr(2):
-                r = 2 * row
-                # chunk order along the row: gate(og0), up(og0), gate(og0+1),
-                # up(og0+1)
+                row_reg_offset = 2 * row
+                # Pack gate/up pairs for the first group, then the second.
                 w0 = pack_f32x2_to_bf16x2(
-                    accumulators[rb0 + r] * c_scale,
-                    accumulators[rb0 + r + 1] * c_scale,
+                    accumulators[first_group_accum_base + row_reg_offset] * c_scale,
+                    accumulators[first_group_accum_base + row_reg_offset + 1] * c_scale,
                 )
                 w1 = pack_f32x2_to_bf16x2(
-                    accumulators[rb0 + 4 + r] * c_scale,
-                    accumulators[rb0 + 5 + r] * c_scale,
+                    accumulators[first_group_accum_base + 4 + row_reg_offset] * c_scale,
+                    accumulators[first_group_accum_base + 5 + row_reg_offset] * c_scale,
                 )
                 w2 = pack_f32x2_to_bf16x2(
-                    accumulators[rb1 + r] * c_scale,
-                    accumulators[rb1 + r + 1] * c_scale,
+                    accumulators[second_group_accum_base + row_reg_offset] * c_scale,
+                    accumulators[second_group_accum_base + row_reg_offset + 1] * c_scale,
                 )
                 w3 = pack_f32x2_to_bf16x2(
-                    accumulators[rb1 + 4 + r] * c_scale,
-                    accumulators[rb1 + 5 + r] * c_scale,
+                    accumulators[second_group_accum_base + 4 + row_reg_offset] * c_scale,
+                    accumulators[second_group_accum_base + 5 + row_reg_offset] * c_scale,
                 )
                 o0, o1, o2, o3 = bfly_transpose4_u32(
                     w0, w1, w2, w3, q_hi_set, q_lo_set, 2, 1,
@@ -2206,8 +2179,15 @@ class Fp8GluEpilogue:
                 else:
                     if cutlass.const_expr(self._use_fc2_tma_store):
                         if local_warp_idx == cutlass.Int32(0):
-                            fc2_store_pipeline.producer_tail()
+                            if cutlass.const_expr(self._token_back_by_dispatch):
+                                # Ready publication requires GMEM writes, not
+                                # just the SMEM reads waited on by producer_tail.
+                                cute.arch.cp_async_bulk_wait_group(0)
+                            else:
+                                fc2_store_pipeline.producer_tail()
                     if cutlass.const_expr(self._token_back_by_dispatch):
+                        # Join this WG's issuing warp before publishing ready.
+                        task_tile_boundary_bar.arrive_and_wait()
                         cute.arch.fence_acq_rel_gpu()
                         fc2_flag_addr = (
                             token_comm_args.fc2_done_counter.iterator
@@ -2318,7 +2298,12 @@ class Fp8GluEpilogue:
                         drain_fc2_store = cutlass.Boolean(1)
                     if drain_fc2_store:
                         if local_warp_idx == cutlass.Int32(0):
-                            fc2_store_pipeline.producer_tail()
+                            if cutlass.const_expr(self._token_back_by_dispatch):
+                                # The task barrier below joins all store issuers
+                                # before the leader publishes FC2 completion.
+                                cute.arch.cp_async_bulk_wait_group(0)
+                            else:
+                                fc2_store_pipeline.producer_tail()
 
             if _iket_active:
                 iket.range_push("nswap_task_boundary_barrier")

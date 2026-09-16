@@ -756,8 +756,12 @@ class MegaMoEFp8Tester(MegaMoETester):
         ):
             if self._kernel is None or self.shared_workspace is None:
                 raise RuntimeError("combine workspace is unavailable for validation.")
-            combine_spec = self._kernel._shared_region_by_name["combine_quant"]
-            combine_offset = self._kernel._shared_offsets["combine_quant"]
+            combine_spec = self._kernel._shared_region_by_name[
+                "unreduced_expert_output"
+            ]
+            combine_offset = self._kernel._shared_offsets[
+                "unreduced_expert_output"
+            ]
             combine_bytes = combine_spec.nbytes
             actual_full = (
                 self.shared_workspace.narrow(0, combine_offset, combine_bytes)

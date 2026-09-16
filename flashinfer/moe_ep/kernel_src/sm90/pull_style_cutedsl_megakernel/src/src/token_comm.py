@@ -414,7 +414,7 @@ class TokenInPullTokenBackPush:
         dedup_dispatch: bool = False,
         max_tokens_per_rank: int = 0,
         grouped_token_back: bool = False,
-        active_dispatch_warps: int = 1,
+        active_dispatch_warps: int = 4,
         compact_pull_buffer: bool = False,
     ) -> None:
         self.world_size = world_size
@@ -1792,7 +1792,7 @@ class TokenInPullTokenBackPush:
         local_rank,
         num_sms,
         chunk_bytes: cutlass.Constexpr[int],
-        num_walker_warps: cutlass.Constexpr[int],
+        num_token_back_warps: cutlass.Constexpr[int],
     ):
         _iket_emit = (sm_idx == Int32(0)) and (warp_idx == Int32(0))
         avg_token_back_window = Int32(2500)
@@ -1821,7 +1821,7 @@ class TokenInPullTokenBackPush:
         num_experts_per_lane: cutlass.Constexpr[int] = (
             self.num_experts_per_rank + 31
         ) // 32
-        num_global_warps: cutlass.Constexpr[int] = num_sms * num_walker_warps
+        num_global_warps: cutlass.Constexpr[int] = num_sms * num_token_back_warps
 
         if cutlass.const_expr(self.grouped_token_back):
             # A group's rows can belong to experts owned by OTHER dispatch
@@ -1874,7 +1874,7 @@ class TokenInPullTokenBackPush:
                 schedule_mode, atomic_batch, num_global_warps,
             )
         else:
-            token_idx = sm_idx * Int32(num_walker_warps) + warp_idx
+            token_idx = sm_idx * Int32(num_token_back_warps) + warp_idx
             batch_remaining = Int32(0)
 
         current_expert_idx = Int32(-1)
@@ -2301,7 +2301,7 @@ class TokenInPullTokenBackPush:
                 local_rank=token_comm_args.local_rank,
                 num_sms=token_comm_args.sm_count,
                 chunk_bytes=self.hidden_bytes,
-                num_walker_warps=self.active_dispatch_warps,
+                num_token_back_warps=self.active_dispatch_warps,
             )
 
             if iket_active:
@@ -2381,7 +2381,7 @@ class TokenInPullTokenBackPush:
             local_rank=token_comm_args.local_rank,
             num_sms=token_comm_args.sm_count,
             chunk_bytes=self.tb_chunk_bytes,
-            num_walker_warps=self.num_token_back_warps,
+            num_token_back_warps=self.num_token_back_warps,
         )
 
         if iket_active:

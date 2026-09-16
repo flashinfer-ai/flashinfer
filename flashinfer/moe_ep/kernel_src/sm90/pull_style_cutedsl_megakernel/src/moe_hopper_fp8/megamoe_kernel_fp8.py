@@ -32,7 +32,7 @@ Following the NVFP4 mega kernel, the combine surface is two orthogonal knobs:
 ``fc2_in_kernel_topk_reduce`` -- where the topk axis collapses:
 
   * False (**separate reduce**): writes land in the internal
-    ``combine_quant[src_token, src_topk, :]`` shared-symmetric staging, then
+    ``unreduced_expert_output[src_token, src_topk, :]`` shared-symmetric staging, then
     the shared ``TopkReduce`` kernel collapses topk into the public output.
   * True (**in-kernel reduce**): writes accumulate directly into a
     ``(max_tokens_per_rank, 1, hidden)`` view of the public output --
@@ -329,24 +329,24 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
         # For token_back_by_dispatch, the dispatch warp pushes fc2 results
         # from the local pool workspace back to each source rank's internal
         # combine target.
-        # Count every FC2 CTA publish in one token cluster tile. Channel tiles
-        # are rounded to complete channel clusters, and every CTA along the
+        # Count every FC2 CTA publish in one token cluster tile. Hidden tiles
+        # are rounded to complete hidden clusters, and every CTA along the
         # token-cluster axis independently publishes its output rows.
         if token_back_by_dispatch:
             if is_swap_ab:
-                channel_tile = self.mma_tiler_mnk[0]
-                channel_cluster = cluster_shape_mnk[0]
+                hidden_tile = self.mma_tiler_mnk[0]
+                hidden_cluster = cluster_shape_mnk[0]
                 token_cluster = cluster_shape_mnk[1]
             else:
-                channel_tile = self.mma_tiler_mnk[1]
-                channel_cluster = cluster_shape_mnk[1]
+                hidden_tile = self.mma_tiler_mnk[1]
+                hidden_cluster = cluster_shape_mnk[1]
                 token_cluster = cluster_shape_mnk[0]
             fc2_publishes = (
                 (
-                    self.hidden + channel_tile * channel_cluster - 1
+                    self.hidden + hidden_tile * hidden_cluster - 1
                 )
-                // (channel_tile * channel_cluster)
-                * channel_cluster
+                // (hidden_tile * hidden_cluster)
+                * hidden_cluster
                 * token_cluster
             )
         else:
@@ -724,14 +724,15 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
         # output_activation (REDG from epi_warps, or bulk reduce push from the
         # dispatch token-back modes) and needs no staging.  Grouped token-back
         # pre-reduces per (src_rank, src_token) on the expert rank, so its
-        # inbox is keyed by contributing RANK instead of topk slot.
+        # inbox is keyed by contributing RANK instead of topk slot. Here
+        # unreduced means the final source-rank reduction is still pending.
         if not self.fc2_in_kernel_topk_reduce:
             combine_slots = (
                 world_size if self.grouped_token_back else num_topk
             )
             specs.append(
                 _RegionSpec(
-                    "combine_quant",
+                    "unreduced_expert_output",
                     self.combine_format.act_dtype,
                     (max_tokens_per_rank, combine_slots, self.hidden),
                     128,
@@ -910,7 +911,7 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
           * Under in-kernel reduce (``fc2_in_kernel_topk_reduce``),
             ``output_activation`` is the cross-rank accumulate target (REDG or
             bulk reduce push) and must also be peer reachable. Under separate
-            reduce, peer writes target the internal ``combine_quant``
+            reduce, peer writes target the internal ``unreduced_expert_output``
             shared-workspace region and ``output_activation`` may be
             rank-local memory.
         """
@@ -995,7 +996,9 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
                 ),
             )
         else:
-            combine_target = self._view_shared(shared_workspace, "combine_quant")
+            combine_target = self._view_shared(
+                shared_workspace, "unreduced_expert_output",
+            )
 
         if cutlass.const_expr(self.token_back_by_dispatch):
             fc2_output_workspace_native = self._view_local(
