@@ -37,6 +37,8 @@ PAGE_SIZE = 16
 
 
 def _ragged_backends():
+    if not torch.cuda.is_available():
+        return []
     dev = torch.device("cuda")
     backends = ["fa2"]
     if is_sm90a_supported(dev):
@@ -49,6 +51,8 @@ def _ragged_backends():
 
 
 def _paged_backends():
+    if not torch.cuda.is_available():
+        return []
     dev = torch.device("cuda")
     backends = ["fa2"]
     if is_sm90a_supported(dev):
