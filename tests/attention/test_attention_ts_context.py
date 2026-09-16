@@ -3893,9 +3893,8 @@ def test_attention_ts_context_fixed_dense_k_tail_excludes_tma_padding():
 
 
 # Fixed dense K tails. The tail size S % 128 selects the partial-tile path in
-# the query-paired softmax schedule. 16 is the Wan2.2 P3 tail, 80 the P1 tail.
-# k_lengths with two or more K/V tiles run at least one unmasked loop
-# iteration before the masked last tile, which k=65 alone never does.
+# the query-paired softmax schedule. Lengths with two or more K/V tiles run
+# unmasked loop iterations before the masked last tile.
 _FIXED_DENSE_K_TAIL_CASES = (
     pytest.param((272,), id="two-tiles-tail16"),
     pytest.param((336,), id="two-tiles-tail80"),
@@ -3921,10 +3920,8 @@ def test_attention_ts_context_fixed_dense_k_tail_accuracy(
     """Random data on the fixed dense tail path against the torch reference.
 
     Unpacked BSHD with equal Q and K lengths is the contiguous no-KV-cache
-    layout that diffusion workloads use. The existing QK-BF16/PV-FP8 test is
-    packed, which takes the varlen bounds path and never sets a fixed tail.
-    An unmasked tail of 16 lowers every output row by 16/128, well outside
-    the tolerance, so a mask fault fails here.
+    layout that diffusion workloads use. The last K/V tile is masked to its
+    valid keys, so the output matches the reference for PV bf16 and PV fp8.
     """
     (k_length,) = k_lengths
     case = _make_context_case(
