@@ -23,7 +23,6 @@ only the canonical ``flashinfer.quantization`` spelling is documented, because
 .. autosummary::
     :toctree: ../generated
 
-    NVFP4Recipe
     NVFP44Over6Config
     NVFP44Over6ErrMode
 
@@ -93,7 +92,7 @@ treat it as a distinct recipe rather than a pure speed knob.
 
     # Same recipe object on both calls - see the warning above.
     global_sf = make_nvfp4_global_scale(
-        x, per_token_activation=False, nvfp4_4over6=recipe
+        x, per_token_activation=False, nvfp4_4over6_config=recipe
     )
     x_q, sf = nvfp4_quantize(x, global_sf, nvfp4_4over6=recipe)
 
@@ -101,7 +100,8 @@ Precedence
 ~~~~~~~~~~
 
 Every NVFP4 entry point that used to read the environment now takes an
-``nvfp4_4over6=`` keyword, typed ``NVFP44Over6Setting``, with three states:
+``nvfp4_4over6=`` keyword typed ``Optional[NVFP44Over6Config]``. There are
+three cases, but only one public type:
 
 .. list-table::
     :header-rows: 1
@@ -109,29 +109,35 @@ Every NVFP4 entry point that used to read the environment now takes an
 
     * - ``nvfp4_4over6=``
       - Meaning
-    * - ``NVFP4Recipe.FROM_ENV`` (default; ``None`` is an alias)
+    * - omitted (the default)
       - Read ``FLASHINFER_NVFP4_4OVER6``; when it is ``"1"``, the other three
         ``FLASHINFER_NVFP4_4OVER6_*`` variables supply the recipe. Read on
-        every call. Byte-for-byte the behaviour that predates this parameter.
-    * - ``NVFP4Recipe.STANDARD``
-      - 4over6 off. ``FLASHINFER_NVFP4_4OVER6=1`` cannot turn it back on.
+        every call. Byte-for-byte the behaviour that predates this parameter,
+        plus a ``DeprecationWarning`` when the environment turns 4over6 on.
+    * - ``None``
+      - 4over6 off. ``FLASHINFER_NVFP4_4OVER6=1`` cannot turn it back on. This
+        is the same meaning ``None`` has always had inside the kernel drivers.
     * - ``NVFP44Over6Config(...)``
       - On with exactly this recipe. The environment is ignored, and there is
         **no** per-field merge: a field left at its dataclass default keeps
         that default rather than picking up the environment's value.
 
 The four ``FLASHINFER_NVFP4_4OVER6*`` variables are documented in the
-repository's ``CLAUDE.md``. They remain supported, but they are legacy: being
-process-wide, they cannot express two models served in one process under
-different recipes.
+repository's ``CLAUDE.md``. They remain supported as a compatibility shim but
+are deprecated: being process-wide, they cannot express two models served in
+one process under different recipes. When the shim is retired the default of
+``nvfp4_4over6=`` becomes ``None`` and no signature changes.
 
 .. note::
 
     :func:`~flashinfer.quantization.make_nvfp4_global_scale` and
-    :func:`~flashinfer.quantization.nvfp4_e4m3_max` default to
-    ``NVFP4Recipe.STANDARD``, not ``FROM_ENV``. Their pre-existing contract is
-    that passing nothing means "no 4over6", and promoting that to an
-    environment read would change the scale returned to every existing caller.
+    :func:`~flashinfer.quantization.nvfp4_e4m3_max` take the **resolved**
+    recipe as ``nvfp4_4over6_config=`` and default to ``None``; they never
+    read the environment. Their pre-existing contract is that passing nothing
+    means "no 4over6", and promoting that to an environment read would change
+    the scale returned to every existing caller. When the quantize call leaves
+    ``nvfp4_4over6`` unset, pass ``resolve_nvfp4_4over6()`` to the scale helper
+    so both sides agree.
 
 Resolution happens in exactly one place,
 :func:`~flashinfer.quantization.resolve_nvfp4_4over6`. Below it, every kernel

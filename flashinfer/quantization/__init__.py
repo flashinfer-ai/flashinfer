@@ -54,8 +54,6 @@ from .fp4_quantization import (
 from .nvfp4_quantization_utils import (
     NVFP44Over6Config,
     NVFP44Over6ErrMode,
-    NVFP44Over6Setting,
-    NVFP4Recipe,
     make_nvfp4_global_scale,
     nvfp4_4over6_code,
     nvfp4_4over6_from_code,
@@ -116,8 +114,6 @@ __all__ = [
     # NVFP4 4over6 recipe
     "NVFP44Over6Config",
     "NVFP44Over6ErrMode",
-    "NVFP44Over6Setting",
-    "NVFP4Recipe",
     "make_nvfp4_global_scale",
     "nvfp4_4over6_code",
     "nvfp4_4over6_from_code",
