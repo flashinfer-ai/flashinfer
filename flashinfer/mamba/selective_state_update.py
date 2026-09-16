@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import functools
+import os
 from typing import Optional
 
 import torch
@@ -378,7 +379,13 @@ def selective_state_update(
             )
             and num_accepted_tokens is None
             and not disable_state_update
-            and cu_seqlens is None
+            # vLLM's decode path supplies a two-entry query_start_loc even
+            # for one token. The Simple-STP kernel consumes the already
+            # flattened token tensors, so that metadata is safe to ignore.
+            and (
+                cu_seqlens is None
+                or (x.shape[0] == 1 and cu_seqlens.numel() == 2)
+            )
             and state.dtype in (torch.float16, torch.bfloat16, torch.float32)
             and state.dim() == 4
             and x.dim() == 3
@@ -408,6 +415,90 @@ def selective_state_update(
             and fused_state_batch_indices.dim() == 1
             and x.shape[1] % B.shape[1] == 0
         ):
+            # S5000's low-parallel Nemotron shape maps to the NVIDIA SM90
+            # Simple STP contract: four D rows per 128-thread CTA. Keep this
+            # shape-gated so every other MUSA shape retains the generic
+            # Triton provider.
+            native_stp_contract = (
+                x.shape[0] == 1
+                and x.shape[1:] == (64, 64)
+                and state.shape[-1] == 128
+                and B.shape[1] == 8
+                and state.dtype == torch.float16
+                and x.dtype == torch.bfloat16
+                and B.dtype == x.dtype
+                and C.dtype == x.dtype
+                and dt.dtype == torch.float32
+                and A.dtype == torch.float32
+                and D.dtype in (torch.float32, x.dtype)
+                and state.is_contiguous()
+                and all(t.device == state.device for t in (x, dt, A, B, C, D))
+                and fused_state_batch_indices.device == state.device
+                and (
+                    fused_dst_state_batch_indices is None
+                    or fused_dst_state_batch_indices.device == state.device
+                )
+                and (z is None or (z.dtype == x.dtype and z.device == state.device))
+                and (out is None or (out.dtype == x.dtype and out.device == state.device))
+                and (
+                    dt_bias is None
+                    or (dt_bias.dtype == torch.float32 and dt_bias.device == state.device)
+                )
+                and A.stride(1) == 0
+                and A.stride(2) == 0
+                and dt.stride(2) == 0
+                and (
+                    dt_bias is None
+                    or dt_bias.dim() == 1
+                    or dt_bias.stride(1) == 0
+                )
+            )
+            if native_stp_contract:
+                if os.environ.get("FLASHINFER_MUSA_SIMPLE_STP_NATIVE") == "1":
+                    from .musa_ssu_native import musa_ssu_one_token_native
+
+                    return musa_ssu_one_token_native(
+                        state,
+                        x,
+                        dt,
+                        A,
+                        B,
+                        C,
+                        D,
+                        fused_state_batch_indices,
+                        fused_dst_state_batch_indices
+                        if fused_dst_state_batch_indices is not None
+                        else fused_state_batch_indices,
+                        dt_bias,
+                        z,
+                        dt_softplus,
+                        fused_pad_slot_id,
+                        out,
+                        rand_seed,
+                        philox_rounds,
+                    )
+
+                from .musa_ssu_simple import ssu_one_token_musa_simple
+
+                return ssu_one_token_musa_simple(
+                    state,
+                    x,
+                    dt,
+                    A,
+                    B,
+                    C,
+                    D,
+                    fused_state_batch_indices,
+                    dt_bias=dt_bias,
+                    z=z,
+                    dt_softplus=dt_softplus,
+                    pad_slot_id=fused_pad_slot_id,
+                    dst_state_batch_indices=fused_dst_state_batch_indices,
+                    out=out,
+                    rand_seed=rand_seed,
+                    philox_rounds=philox_rounds,
+                )
+
             from .musa_ssu_triton import ssu_one_token_musa_triton
 
             return ssu_one_token_musa_triton(
@@ -692,3 +783,11 @@ def _selective_state_update_fake(
 ) -> None:
     """Fake implementation for torch.compile() meta tensor propagation."""
     pass
+
+
+# Build/import the opt-in native extension before vLLM starts graph capture.
+# Generic Triton/CUDA imports never execute this branch.
+if os.environ.get("FLASHINFER_MUSA_SIMPLE_STP_NATIVE") == "1":
+    from .musa_ssu_native import preload_musa_simple_stp
+
+    preload_musa_simple_stp()

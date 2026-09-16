@@ -1,11 +1,8 @@
-"""Fused MUSA Triton selective state update kernel.
+"""S5000 Simple-STP MUSA selective state update provider.
 
-The decode kernel tiles the head dimension inside each program.  A program
-therefore updates ``BLOCK_D`` dimensions while reducing the state dimension,
-which amortizes launch and address-calculation overhead for the small
-Nemotron decode shapes.  The private block-size hook is deliberately kept out
-of the public API so that hardware-specific tuning can be done without
-changing callers.
+This provider mirrors NVIDIA SM90 Simple STP: four warps, four D rows,
+and one CTA per four-row tile. It is shape-gated for Nemotron on S5000 and
+keeps the generic MUSA Triton provider as fallback.
 """
 
 from __future__ import annotations
@@ -25,6 +22,8 @@ from .musa_ssd_helpers import fast_exp
 # Triton limit for the production N=128 path. Larger values remain available
 # through the private sweep hook for kernels that fit their shape.
 _SSU_BLOCK_D = 4
+_SIMPLE_STP_BLOCK_D = 4
+_SIMPLE_STP_BLOCK_N = 128
 
 
 def _ssu_block_d(dim: int) -> int:
@@ -40,7 +39,7 @@ def _ssu_block_d(dim: int) -> int:
 
 
 @triton.jit
-def _ssu_one_token_kernel(
+def _ssu_simple_stp_kernel(
     state_ptr,
     x_ptr,
     dt_ptr,
@@ -227,7 +226,7 @@ def _ssu_one_token_kernel(
     )
 
 
-def ssu_one_token_musa_triton(
+def ssu_one_token_musa_simple(
     state: torch.Tensor,
     x: torch.Tensor,
     dt: torch.Tensor,
@@ -245,8 +244,17 @@ def ssu_one_token_musa_triton(
     rand_seed: torch.Tensor | None = None,
     philox_rounds: int = 10,
 ) -> torch.Tensor:
-    """Run the fused MUSA decode kernel for the supported contract."""
+    """Run the S5000 Simple-STP contract for Nemotron decode."""
     batch, heads, dim = x.shape
+    if not (
+        batch == 1
+        and heads == 64
+        and dim == 64
+        and state.shape[-1] == _SIMPLE_STP_BLOCK_N
+        and A.shape[-1] == _SIMPLE_STP_BLOCK_N
+        and B.shape[1] == 8
+    ):
+        raise ValueError("S5000 Simple STP requires B=1,H=64,D=64,N=128,G=8")
     groups = B.shape[1]
     dstate = A.shape[-1]
     if rand_seed is not None:
@@ -262,8 +270,10 @@ def ssu_one_token_musa_triton(
             raise ValueError("rand_seed must be one int64 value on the state device")
         if philox_rounds not in (5, 10):
             raise ValueError("stochastic fused SSU supports Philox 5 or 10 rounds")
-    block_n = triton.next_power_of_2(dstate)
-    block_d = _ssu_block_d(dim)
+    # Fixed CUDA Simple-STP tile: four D rows per four-warp CTA and one
+    # packed 128-element state row per lane group.
+    block_n = _SIMPLE_STP_BLOCK_N
+    block_d = _SIMPLE_STP_BLOCK_D
     if dst_state_batch_indices is None:
         dst_state_batch_indices = state_batch_indices
     if dst_state_batch_indices.shape != state_batch_indices.shape:
@@ -283,7 +293,7 @@ def ssu_one_token_musa_triton(
     if D.dim() not in (1, 2) or (dt_bias is not None and dt_bias.dim() not in (1, 2)):
         raise ValueError("MUSA fused SSU D and dt_bias must be rank 1 or 2")
     tiles_per_head = (dim + block_d - 1) // block_d
-    _ssu_one_token_kernel[(batch * heads * tiles_per_head,)](
+    _ssu_simple_stp_kernel[(batch * heads * tiles_per_head,)](
         state,
         x,
         dt,
@@ -297,6 +307,8 @@ def ssu_one_token_musa_triton(
         dst_state_batch_indices,
         out,
         rand_seed if rand_seed is not None else x,
+        num_warps=4,
+        num_stages=1,
         state_slot_stride=state.stride(0),
         state_h_stride=state.stride(1),
         state_d_stride=state.stride(2),
@@ -358,4 +370,4 @@ def ssu_one_token_musa_triton(
     return out
 
 
-__all__ = ["ssu_one_token_musa_triton"]
+__all__ = ["ssu_one_token_musa_simple"]
