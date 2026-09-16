@@ -449,7 +449,7 @@ def _tgv_gemm_requirement(
     return True
 
 
-@supported_compute_capability([100, 103])
+@supported_compute_capability([100, 103, 107])
 def _cute_dsl_mm_bf16_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
