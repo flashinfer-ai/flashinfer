@@ -970,7 +970,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         )
         _check_kv_layout(kv_layout)
 
-        if backend == "cute-dsl" and jit_args is not None:
+        if backend in ("cute-dsl", "cudnn") and jit_args is not None:
             raise NotImplementedError(
                 f"{backend} backend does not support jit_args customization"
             )
@@ -1258,7 +1258,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     "would attend to an empty KV range."
                 )
 
-        if backend in ("cute-dsl", "trtllm-gen"):
+        if backend in ("cute-dsl", "trtllm-gen", "cudnn"):
             raise NotImplementedError(
                 f"workspace_size is not available for decode backend {backend!r}"
             )
@@ -2518,6 +2518,11 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 raise NotImplementedError(
                     "cudnn decode backend requires q_len_per_req == 1 "
                     f"(got q.shape[0]={q.shape[0]}, batch_size={actual_batch_size})."
+                )
+            if v_cache.dtype != self._cached_kv_data_type:
+                raise ValueError(
+                    f"The dtype of v {v_cache.dtype} does not match the kv_data_type "
+                    f"{self._cached_kv_data_type} specified in plan function."
                 )
             # The cuDNN graph is built from strides, so an NHD cache is presented
             # as a transposed [pages, heads, page_size, head_dim] view (no copy).

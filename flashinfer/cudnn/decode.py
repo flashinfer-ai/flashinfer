@@ -51,6 +51,12 @@ class UIDs(Enum):
     STATS_UID = 1001  # Stats tensor
 
 
+def _tensor_layout_key(t: Optional[torch.Tensor]):
+    if t is None:
+        return None
+    return (tuple(t.shape), tuple(t.stride()), t.dtype)
+
+
 def _sdpa_decode_key_fn(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -95,12 +101,14 @@ def _sdpa_decode_key_fn(
         # same-batch table with a different pages-per-seq width must not share
         # a graph (the replay would walk rows with the stale row stride).
         tuple(block_tables.shape) if block_tables is not None else None,
+        tuple(block_tables.stride()) if block_tables is not None else None,
         block_tables.dtype if block_tables is not None else None,
         # The seq-len tensors are bound via tensor_like, which bakes their
-        # dtypes (an int64 buffer bound to a graph built for int32 would be
-        # silently read as int32).
-        actual_seq_lens_q.dtype if actual_seq_lens_q is not None else None,
-        actual_seq_lens_kv.dtype if actual_seq_lens_kv is not None else None,
+        # dtypes, dims and strides (an int64 buffer bound to a graph built for
+        # int32 would be silently read as int32; a (bs,) buffer and a
+        # (bs, 1, 1, 1) buffer need different descriptors).
+        _tensor_layout_key(actual_seq_lens_q),
+        _tensor_layout_key(actual_seq_lens_kv),
         return_lse,
     )
 
@@ -435,6 +443,7 @@ def cudnn_batch_decode_with_kv_cache(
             lse.shape != (bs, h_qo)
             or lse.dtype != torch.float32
             or not lse.is_contiguous()
+            or lse.device != q.device
         ):
             raise ValueError(
                 "lse must be a contiguous float32 tensor of shape "
@@ -446,13 +455,14 @@ def cudnn_batch_decode_with_kv_cache(
         out = torch.empty(bs, h_qo, d_vo, device=q.device, dtype=q.dtype)
 
     if not CUDNN_AVAILABLE:
-        if q.dtype != torch.bfloat16:
-            # The fallback cubins are compiled for bf16 only; passing fp16
-            # buffers through would silently reinterpret them as bf16.
-            raise NotImplementedError(
-                f"q.dtype={q.dtype} requires the cuDNN graph backend; the "
-                "fallback cubin decode path only supports torch.bfloat16"
-            )
+        for name, t in (("q", q), ("k_cache", k_cache), ("v_cache", v_cache)):
+            if t.dtype != torch.bfloat16:
+                # The fallback cubins are compiled for bf16 only; passing fp16
+                # buffers through would silently reinterpret them as bf16.
+                raise NotImplementedError(
+                    f"{name}.dtype={t.dtype} requires the cuDNN graph backend; the "
+                    "fallback cubin decode path only supports torch.bfloat16"
+                )
         actual_seq_lens_kv_gpu = actual_seq_lens_kv.to(q.device, non_blocking=True)
 
         run_func = get_cudnn_fmha_gen_module().decode

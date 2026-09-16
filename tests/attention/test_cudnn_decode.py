@@ -416,7 +416,7 @@ def test_cudnn_decode_unsupported_dtype_raises():
     actual_seq_lens_kv = torch.full(
         (batch_size, 1, 1, 1), s_kv, dtype=torch.int32, device=device
     )
-    with pytest.raises(ValueError, match="only supports torch.float16"):
+    with pytest.raises(ValueError, match=r"only supports torch\.float16"):
         _run_cudnn_decode(
             q,
             k_cache,

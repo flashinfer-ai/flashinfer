@@ -779,6 +779,12 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 f"[INFO] {cudnn_backend} decode requires one fp16/bf16 dtype for q, kv and out. Skipping."
             )
             remove_cudnn = True
+        elif q_dtype == torch.float16 and not CUDNN_AVAILABLE:
+            print(
+                f"[INFO] {cudnn_backend} fp16 decode requires the cudnn-frontend python package "
+                "(the fallback cubin path is bf16-only). Skipping."
+            )
+            remove_cudnn = True
         if remove_cudnn:
             backends.remove(cudnn_backend)
 
