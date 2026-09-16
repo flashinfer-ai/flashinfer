@@ -4718,11 +4718,11 @@ class TmemCorrResource(DecodeGenResourceBase):
                             ),
                             offset=keeps_o_ldst_offset,
                         )
-                        prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
-            if skip_correction:
-                # Preserve the correction task's TMEM ordering when this warp
-                # issues no correction transaction.
-                prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
+            # The chunks occupy disjoint TMEM columns, so their stores need no
+            # ordering among themselves: one wait retires them all before this
+            # O stage goes to the next PV wave, and keeps the correction task's
+            # TMEM ordering when this warp issued no correction transaction.
+            prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
             return
 
         if cutlass.const_expr(cfg.tile_size_q == 16):
