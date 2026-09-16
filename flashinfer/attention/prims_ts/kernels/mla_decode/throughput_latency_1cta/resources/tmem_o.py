@@ -143,7 +143,7 @@ class TmemOResource(MlaResource):
     @cute.jit
     def _tail_has_prior_o(self, stage_info: StageInfo):
         """Return whether tail PV should accumulate into existing O state."""
-        if cutlass.const_expr(self.cfg.use_balanced_scheduler == 1):
+        if cutlass.const_expr(self.cfg.use_balanced_scheduler):
             # Balanced descriptors have independent, runtime K spans.  The
             # configured split geometry is only a workspace capacity and
             # cannot describe whether this descriptor executed a loop body.

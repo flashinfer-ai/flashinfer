@@ -432,7 +432,7 @@ class TmemCorrResource(MlaResource):
                         smem_src.load(count=4, alignment=16),
                     )
                 elif valid_output_row:
-                    if cutlass.const_expr(cfg.use_balanced_scheduler == 1):
+                    if cutlass.const_expr(cfg.use_balanced_scheduler):
                         write_partial = Int32(
                             task_cache[_TASK_CACHE_PARTIAL_IDX]
                         ) >= Int32(0)
@@ -566,7 +566,7 @@ class TmemCorrResource(MlaResource):
                     self._store_partial_lse_to_cluster_smem(
                         local_row_idx, cta_idx_kv, lse_val
                     )
-                elif cutlass.const_expr(self.cfg.use_balanced_scheduler == 1):
+                elif cutlass.const_expr(self.cfg.use_balanced_scheduler):
                     if valid_output_row and cta_idx_head_dim_v == Int32(0):
                         if Int32(task_cache[_TASK_CACHE_PARTIAL_IDX]) >= Int32(0):
                             elem_offset = (
@@ -1508,7 +1508,7 @@ class TmemCorrResource(MlaResource):
                 + Int32(chunk_idx)
             )
             if global_head_idx < Int32(cfg.num_heads_q) and valid_output_row:
-                if cutlass.const_expr(cfg.use_balanced_scheduler == 1):
+                if cutlass.const_expr(cfg.use_balanced_scheduler):
                     write_partial = Int32(task_cache[_TASK_CACHE_PARTIAL_IDX]) >= Int32(
                         0
                     )

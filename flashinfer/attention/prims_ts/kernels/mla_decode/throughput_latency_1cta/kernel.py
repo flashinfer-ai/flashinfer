@@ -491,7 +491,7 @@ def _make_static_work_queue(
             tile_scheduler_params=tile_sched_params,
         )
     )
-    if cfg.use_balanced_scheduler == 1:
+    if cfg.use_balanced_scheduler:
         return ThroughputLatencyMlaBalancedWorkQueue(
             tile_scheduler_config=tile_scheduler_config,
             cfg=cfg,
@@ -1906,7 +1906,7 @@ class ThroughputLatencyMlaDecodeTs:
             )
         workspace_split_kv = split_kv
         if cutlass.const_expr(cfg.use_multi_ctas_kv == 1):
-            if cutlass.const_expr(cfg.use_balanced_scheduler == 1):
+            if cutlass.const_expr(cfg.use_balanced_scheduler):
                 workspace_split_kv = cutlass.Int32(self.balanced_partial_capacity)
             else:
                 workspace_split_kv = cutlass.Int32(cfg.num_ctas_per_seq_kv)
@@ -2041,7 +2041,7 @@ class ThroughputLatencyMlaDecodeTs:
             cutlass.Int32(cfg.seq_len_q),
             (
                 cutlass.Int32(1)
-                if cutlass.const_expr(cfg.use_balanced_scheduler == 1)
+                if cutlass.const_expr(cfg.use_balanced_scheduler)
                 else batch_size
             ),
             workspace_split_kv,
@@ -2079,7 +2079,7 @@ class ThroughputLatencyMlaDecodeTs:
                 tile_sched_params,
                 self.max_active_clusters,
             )
-            if cutlass.const_expr(cfg.use_balanced_scheduler == 1):
+            if cutlass.const_expr(cfg.use_balanced_scheduler):
                 grid = (
                     1,
                     1,
@@ -2126,7 +2126,7 @@ class ThroughputLatencyMlaDecodeTs:
             use_pdl=acc_o is not None,
         )
         if cutlass.const_expr(acc_o is not None):
-            if cutlass.const_expr(cfg.use_balanced_scheduler == 1):
+            if cutlass.const_expr(cfg.use_balanced_scheduler):
                 self.balanced_gmem_reduction_kernel(
                     o,
                     lse,
@@ -2313,9 +2313,7 @@ class ThroughputLatencyMlaDecodeTs:
             batch_idx = None
             cta_idx_head_dim_v = None
             cta_idx_kv = (
-                None
-                if cutlass.const_expr(cfg.use_balanced_scheduler == 1)
-                else Int32(0)
+                None if cutlass.const_expr(cfg.use_balanced_scheduler) else Int32(0)
             )
             head_idx = None
         use_clc_dynamic = cutlass.const_expr(

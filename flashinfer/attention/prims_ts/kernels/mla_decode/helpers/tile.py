@@ -364,7 +364,7 @@ def runtime_seq_len_kv_from_task_cache(
             logical_q_idx,
             logical_seq_len_q,
         )
-    if cutlass.const_expr(cfg.use_balanced_scheduler == 1):
+    if cutlass.const_expr(cfg.use_balanced_scheduler):
         descriptor_end_k = (
             Int32(task_cache[_TASK_CACHE_K_TILE_START])
             + Int32(task_cache[_TASK_CACHE_DESCRIPTOR_TILE_COUNT])
@@ -382,7 +382,7 @@ def global_kv_tile_idx(
     task_cache=None,
 ):
     """Map a local KV tile id to the global KV tile id for split-KV mode."""
-    if cutlass.const_expr(cfg.use_balanced_scheduler == 1):
+    if cutlass.const_expr(cfg.use_balanced_scheduler):
         return Int32(task_cache[_TASK_CACHE_K_TILE_START]) + local_tile_idx
     if cutlass.const_expr(cfg.use_multi_ctas_kv != 1):
         return local_tile_idx
@@ -410,7 +410,7 @@ def batch_idx_for_stage_cfg(attr, cfg: MlaConfig, stage_info: StageInfo):
         _cta_idx_q, _cta_idx_head_dim, batch_head_idx = stage_info.work_tile.tile_idx
         del _cta_idx_q, _cta_idx_head_dim
         batch_head_idx = Int32(batch_head_idx)
-        if cutlass.const_expr(cfg.use_balanced_scheduler == 1):
+        if cutlass.const_expr(cfg.use_balanced_scheduler):
             batch_head_idx = batch_head_idx // Int32(cfg.balanced_descriptor_capacity)
         return batch_head_idx // Int32(cfg.num_ctas_for_all_heads)
     return Int32(attr)
@@ -423,7 +423,7 @@ def head_idx_for_stage(attr, cfg: MlaConfig, stage_info: StageInfo):
         _cta_idx_q, _cta_idx_head_dim, batch_head_idx = stage_info.work_tile.tile_idx
         del _cta_idx_q, _cta_idx_head_dim
         batch_head_idx = Int32(batch_head_idx)
-        if cutlass.const_expr(cfg.use_balanced_scheduler == 1):
+        if cutlass.const_expr(cfg.use_balanced_scheduler):
             batch_head_idx = batch_head_idx // Int32(cfg.balanced_descriptor_capacity)
         head_tile_idx = batch_head_idx % Int32(cfg.num_ctas_for_all_heads)
         return head_tile_idx * Int32(cfg.tile_size_q)
@@ -446,7 +446,7 @@ def cta_idx_head_dim_v_for_stage(attr, stage_info: StageInfo):
 def cta_idx_kv_for_stage(attr, stage_info: StageInfo, task_cache=None, cfg=None):
     """Return the KV CTA index, defaulting to zero for non-split KV."""
     if cutlass.const_expr(
-        task_cache is not None and cfg is not None and cfg.use_balanced_scheduler == 1
+        task_cache is not None and cfg is not None and cfg.use_balanced_scheduler
     ):
         return Int32(task_cache[_TASK_CACHE_PARTIAL_IDX])
     if cutlass.const_expr(attr is None):
