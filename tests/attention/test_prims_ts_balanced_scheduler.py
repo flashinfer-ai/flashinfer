@@ -406,6 +406,38 @@ def test_cuda_scheduler_policies_preserve_descriptor_semantics(
 
 
 @_REQUIRES_CUDA_SCHEDULER
+@pytest.mark.parametrize("scheduler", ("exact", "optimized"))
+def test_cuda_scheduler_splits_on_complete_cta_work_units(scheduler):
+    plan = BalancedMLADecodePlan(
+        batch_size=1,
+        num_partitions=4,
+        device=torch.device("cuda"),
+        k_tile_tokens=128,
+        num_insts_kv=2,
+        cost=BalancedCostModel(1000, 0),
+        max_seq_len=9 * 128,
+    )
+    seq_lens = torch.tensor([9 * 128], dtype=torch.int32, device="cuda")
+
+    plan.schedule_device(
+        seq_lens,
+        scheduler=scheduler,
+        forced_target_piece_tiles=3,
+    )
+
+    assert plan.last_target_piece_tiles == 4
+    descriptors = sorted(
+        plan.work_descriptors[: plan.last_descriptor_count].cpu().tolist()
+    )
+    assert [descriptor[:3] for descriptor in descriptors] == [
+        [0, 0, 4],
+        [0, 4, 8],
+        [0, 8, 9],
+    ]
+    _assert_device_plan_covers_requests(plan, [9 * 128])
+
+
+@_REQUIRES_CUDA_SCHEDULER
 def test_optimized_scheduler_is_default_and_policies_are_named():
     seq_lens = [131072, 8192, 257, 0]
     plan = BalancedMLADecodePlan(

@@ -2020,6 +2020,7 @@ class BatchMLADecodePagedTSWrapper:
                 num_partitions=int(resolved_policy["balanced_num_partitions"]),
                 device=device,
                 k_tile_tokens=int(resolved_policy["tile_size_kv"]),
+                num_insts_kv=int(resolved_policy["num_insts_kv"]),
                 cost=balanced_bootstrap_cost,
                 kernel_family=(
                     "1cta"

@@ -344,16 +344,20 @@ def run_reduction_kernel(
     row_k_tile_total = (row_k + kv_tile_size - 1) // kv_tile_size
     if cutlass.const_expr(kernel.use_balanced_scheduler):
         # Balanced descriptors use quotient/remainder equal splits over the
-        # full request. Reconstruct that exact prefix: deriving a uniform span
-        # from the row-visible or tile-visible causal domain can omit the last
-        # partially intersecting descriptor.
+        # full request's CTA work units. Reconstruct that exact prefix:
+        # deriving a uniform span from the row-visible or tile-visible causal
+        # domain can omit the last partially intersecting descriptor.
         request_k_tile_total = (
             cache_seqs[batch_idx] + kv_tile_size - 1
         ) // kv_tile_size
+        tiles_per_work_unit = Int32(1)
+        if cutlass.const_expr(hasattr(cfg, "num_insts_kv")):
+            tiles_per_work_unit = Int32(cfg.num_insts_kv)
         local_split_kv = runtime_equal_split_row_prefix_active_split_count(
             row_k_tile_total,
             request_k_tile_total,
             split_kv_cap,
+            tiles_per_work_unit,
         )
     else:
         # Ordinary kernels use configured-span partitioning over the producer

@@ -142,9 +142,34 @@ __device__ __forceinline__ int32_t ceilDivI32(int32_t value, int32_t divisor) {
   return static_cast<int32_t>((static_cast<int64_t>(value) + divisor - 1) / divisor);
 }
 
+__device__ __forceinline__ int32_t workUnitCount(int32_t blocks, int32_t tilesPerWorkUnit) {
+  return ceilDivI32(blocks, tilesPerWorkUnit);
+}
+
+__device__ __forceinline__ int64_t alignedTargetI64(int64_t target, int32_t tilesPerWorkUnit) {
+  return ((target + tilesPerWorkUnit - 1) / tilesPerWorkUnit) * tilesPerWorkUnit;
+}
+
+__device__ __forceinline__ int32_t requestPieceCount(int32_t blocks, int32_t target,
+                                                     int32_t tilesPerWorkUnit, int32_t P) {
+  int32_t const units = workUnitCount(blocks, tilesPerWorkUnit);
+  int32_t const targetUnits = workUnitCount(target, tilesPerWorkUnit);
+  int32_t pieces = ceilDivI32(units, targetUnits);
+  if (pieces > kMaxNumPieces) pieces = kMaxNumPieces;
+  if (pieces > P) pieces = P;
+  return pieces;
+}
+
+__device__ __forceinline__ int32_t alignedTarget(int32_t target, int32_t tilesPerWorkUnit) {
+  return static_cast<int32_t>(alignedTargetI64(target, tilesPerWorkUnit));
+}
+
 __device__ __forceinline__ int64_t pieceCost(int32_t blocks, bool split, int32_t numPieces,
-                                             DeviceCost const& cm) {
-  int64_t cost = static_cast<int64_t>(cm.cR) + static_cast<int64_t>(blocks) * cm.cB;
+                                             DeviceCost const& cm, int32_t tilesPerWorkUnit) {
+  // A CTA pays for a complete instruction group even when the request tail contains fewer base
+  // tiles. The calibrated coefficients remain expressed per base tile.
+  int32_t const chargedBlocks = alignedTarget(blocks, tilesPerWorkUnit);
+  int64_t cost = static_cast<int64_t>(cm.cR) + static_cast<int64_t>(chargedBlocks) * cm.cB;
   if (split) cost += static_cast<int64_t>(cm.gamma1) + cm.gamma0 / (numPieces > 0 ? numPieces : 1);
   return cost;
 }
@@ -199,12 +224,14 @@ __device__ int32_t leastLoadedPartitionWarp(int64_t const* run, int32_t P, int32
 
 __device__ void assignShortsForCandidateWarp(int64_t* run, int32_t const* lptOrder,
                                              int32_t activeCount, int32_t const* blocks,
-                                             DeviceCost const& cm, int32_t P, int32_t target) {
+                                             DeviceCost const& cm, int32_t P, int32_t target,
+                                             int32_t tilesPerWorkUnit) {
   for (int32_t orderIdx = 0; orderIdx < activeCount; ++orderIdx) {
     int32_t const req = lptOrder[orderIdx];
     if (blocks[req] > target) continue;
     int32_t const pid = leastLoadedPartitionWarp(run, P, nullptr, 0);
-    if (threadIdx.x % warpSize == 0) run[pid] += pieceCost(blocks[req], false, 0, cm);
+    if (threadIdx.x % warpSize == 0)
+      run[pid] += pieceCost(blocks[req], false, 0, cm, tilesPerWorkUnit);
     __syncwarp();
   }
 }
@@ -212,14 +239,13 @@ __device__ void assignShortsForCandidateWarp(int64_t* run, int32_t const* lptOrd
 __device__ void assignLongsForCandidateWarp(int64_t* run, int32_t const* longOrder,
                                             int32_t activeCount, int32_t const* blocks,
                                             DeviceCost const& cm, int32_t P, int32_t target,
-                                            bool chargeSplitPenalty, int32_t* selected) {
+                                            bool chargeSplitPenalty, int32_t* selected,
+                                            int32_t tilesPerWorkUnit) {
   for (int32_t orderIdx = 0; orderIdx < activeCount; ++orderIdx) {
     int32_t const req = longOrder[orderIdx];
     int32_t const blockCount = blocks[req];
     if (blockCount <= target) continue;
-    int32_t pieces = ceilDivI32(blockCount, target);
-    if (pieces > 127) pieces = 127;
-    if (pieces > P) pieces = P;
+    int32_t const pieces = requestPieceCount(blockCount, target, tilesPerWorkUnit, P);
     for (int32_t j = 0; j < pieces; ++j) {
       int32_t const pid = leastLoadedPartitionWarp(run, P, selected, j);
       if (threadIdx.x % warpSize == 0) selected[j] = pid;
@@ -227,12 +253,14 @@ __device__ void assignLongsForCandidateWarp(int64_t* run, int32_t const* longOrd
     }
     if (threadIdx.x % warpSize == 0) sortSelected(selected, pieces);
     __syncwarp();
-    int32_t const base = blockCount / pieces;
-    int32_t const remainder = blockCount - base * pieces;
+    int32_t const unitCount = workUnitCount(blockCount, tilesPerWorkUnit);
+    int32_t const base = unitCount / pieces;
+    int32_t const remainder = unitCount - base * pieces;
     for (int32_t j = threadIdx.x % warpSize; j < pieces; j += warpSize) {
       int32_t const pid = selected[j];
-      int32_t const pieceBlocks = base + (j < remainder ? 1 : 0);
-      run[pid] += pieceCost(pieceBlocks, chargeSplitPenalty && pieces > 1, pieces, cm);
+      int32_t const pieceBlocks = (base + (j < remainder ? 1 : 0)) * tilesPerWorkUnit;
+      run[pid] +=
+          pieceCost(pieceBlocks, chargeSplitPenalty && pieces > 1, pieces, cm, tilesPerWorkUnit);
     }
     __syncwarp();
   }
@@ -440,7 +468,11 @@ __global__ void balancedSchedPrepareKernel(BalancedSchedDeviceParams p) {
   if (yMinimum > baseTarget64) baseTarget64 = yMinimum;
   if (yCap > baseTarget64) baseTarget64 = yCap;
   if (baseTarget64 < 1) baseTarget64 = 1;
-  if (baseTarget64 > INT_MAX) {
+  baseTarget64 = alignedTargetI64(baseTarget64, p.tilesPerWorkUnit);
+  int64_t const forcedTarget64 =
+      p.forcedTargetPieceTiles > 0 ? alignedTargetI64(p.forcedTargetPieceTiles, p.tilesPerWorkUnit)
+                                   : 0;
+  if (baseTarget64 > INT_MAX || forcedTarget64 > INT_MAX) {
     ws.state->failed = 1;
     failPlan(p, BalancedSchedStatus::kTargetOverflow, p.selectCostModelOnDevice ? bucket : -1);
     return;
@@ -450,7 +482,7 @@ __global__ void balancedSchedPrepareKernel(BalancedSchedDeviceParams p) {
   bool const usesForcedTarget = p.forcedTargetPieceTiles > 0;
   bool const usesCostSearch = !usesForcedTarget && activeCount <= 2 * P;
   bool const useAdditiveCombine = cm.comb0 != 0 || cm.comb1 != 0;
-  ws.state->target = usesForcedTarget ? p.forcedTargetPieceTiles : baseTarget;
+  ws.state->target = usesForcedTarget ? static_cast<int32_t>(forcedTarget64) : baseTarget;
   ws.state->usesCostSearch = usesCostSearch;
   ws.state->useAdditiveCombine = useAdditiveCombine;
 
@@ -465,6 +497,7 @@ __global__ void balancedSchedPrepareKernel(BalancedSchedDeviceParams p) {
       if (floorTarget > candidate) candidate = floorTarget;
       if (yCap > candidate) candidate = static_cast<int32_t>(yCap);
       if (candidate < 1) candidate = 1;
+      candidate = alignedTarget(candidate, p.tilesPerWorkUnit);
       ws.candidates[candidateCount++] = candidate;
     }
     ws.state->candidateCount = candidateCount;
@@ -484,12 +517,12 @@ __global__ void balancedSchedSortOrdersKernel(BalancedSchedDeviceParams p) {
   DeviceCost const cm = loadCost(p.costModelTablePtr, ws.state->bucket);
   for (int32_t index = threadIdx.x; index < activeCount; index += blockDim.x) {
     int32_t const req = ws.lptOrder[index];
-    int64_t const reqCost = pieceCost(ws.blocks[req], false, 0, cm);
+    int64_t const reqCost = pieceCost(ws.blocks[req], false, 0, cm, p.tilesPerWorkUnit);
     int32_t lptRank = 0;
     int32_t longRank = 0;
     for (int32_t otherIndex = 0; otherIndex < activeCount; ++otherIndex) {
       int32_t const otherReq = ws.lptOrder[otherIndex];
-      int64_t const otherCost = pieceCost(ws.blocks[otherReq], false, 0, cm);
+      int64_t const otherCost = pieceCost(ws.blocks[otherReq], false, 0, cm, p.tilesPerWorkUnit);
       if (otherCost > reqCost || (otherCost == reqCost && otherReq < req)) ++lptRank;
       if (ws.blocks[otherReq] > ws.blocks[req] ||
           (ws.blocks[otherReq] == ws.blocks[req] && otherReq < req))
@@ -536,9 +569,8 @@ __global__ void balancedSchedScoreKernel(BalancedSchedDeviceParams p) {
     int32_t const blockCount = ws.blocks[req];
     int32_t requestPieces = 0;
     if (blockCount > 0) {
-      requestPieces = blockCount > target ? ceilDivI32(blockCount, target) : 1;
-      if (requestPieces > 127) requestPieces = 127;
-      if (requestPieces > P) requestPieces = P;
+      requestPieces =
+          blockCount > target ? requestPieceCount(blockCount, target, p.tilesPerWorkUnit, P) : 1;
     }
     descriptorCount += requestPieces;
     if (requestPieces > maxPieces) maxPieces = requestPieces;
@@ -550,9 +582,10 @@ __global__ void balancedSchedScoreKernel(BalancedSchedDeviceParams p) {
     sharedRun[pid] = 0;
   }
   __syncwarp();
-  assignShortsForCandidateWarp(sharedRun, ws.lptOrder, activeCount, ws.blocks, cm, P, target);
+  assignShortsForCandidateWarp(sharedRun, ws.lptOrder, activeCount, ws.blocks, cm, P, target,
+                               p.tilesPerWorkUnit);
   assignLongsForCandidateWarp(sharedRun, ws.longOrder, activeCount, ws.blocks, cm, P, target,
-                              !useAdditiveCombine, selected);
+                              !useAdditiveCombine, selected, p.tilesPerWorkUnit);
   if (threadIdx.x == 0) {
     int64_t makespan = 0;
     for (int32_t pid = 0; pid < P; ++pid)
@@ -695,7 +728,12 @@ __global__ void balancedSchedFoldPrepareScoreKernel(BalancedSchedDeviceParams p)
     if (yMinimum > baseTarget) baseTarget = yMinimum;
     if (yCap > baseTarget) baseTarget = yCap;
     if (baseTarget < 1) baseTarget = 1;
-    if (baseTarget > INT_MAX) {
+    baseTarget = alignedTargetI64(baseTarget, p.tilesPerWorkUnit);
+    int64_t const forcedTarget =
+        p.forcedTargetPieceTiles > 0
+            ? alignedTargetI64(p.forcedTargetPieceTiles, p.tilesPerWorkUnit)
+            : 0;
+    if (baseTarget > INT_MAX || forcedTarget > INT_MAX) {
       failureStatus = static_cast<int32_t>(BalancedSchedStatus::kTargetOverflow);
       baseTarget = 1;
     }
@@ -704,7 +742,8 @@ __global__ void balancedSchedFoldPrepareScoreKernel(BalancedSchedDeviceParams p)
     useAdditiveCombine = aggregateCost.comb0 != 0 || aggregateCost.comb1 != 0;
     candidateCount = usesCostSearch ? 1 + (P < 127 ? P : 127) : 0;
     if (candidateIdx == 0) {
-      target = usesForcedTarget ? p.forcedTargetPieceTiles : static_cast<int32_t>(baseTarget);
+      target =
+          usesForcedTarget ? static_cast<int32_t>(forcedTarget) : static_cast<int32_t>(baseTarget);
     } else {
       int32_t const floorTarget = static_cast<int64_t>(candidateIdx) * activeCount <= P
                                       ? 1
@@ -713,7 +752,7 @@ __global__ void balancedSchedFoldPrepareScoreKernel(BalancedSchedDeviceParams p)
       if (floorTarget > candidate) candidate = floorTarget;
       if (yCap > candidate) candidate = static_cast<int32_t>(yCap);
       if (candidate < 1) candidate = 1;
-      target = candidate;
+      target = alignedTarget(candidate, p.tilesPerWorkUnit);
     }
     bool const spreadUniform = static_cast<int64_t>(maxBlocks) - minBlocks <= yBreak;
     bool const enoughRequests = 2LL * activeCount >= P;
@@ -750,19 +789,19 @@ __global__ void balancedSchedFoldPrepareScoreKernel(BalancedSchedDeviceParams p)
   for (int32_t req = threadIdx.x; req < N; req += blockDim.x) {
     int32_t const blockCount = sharedBlocks[req];
     if (blockCount <= 0) continue;
-    int32_t requestPieces = blockCount > target ? ceilDivI32(blockCount, target) : 1;
-    if (requestPieces > 127) requestPieces = 127;
-    if (requestPieces > P) requestPieces = P;
+    int32_t const requestPieces =
+        blockCount > target ? requestPieceCount(blockCount, target, p.tilesPerWorkUnit, P) : 1;
     int32_t const chunkBase = atomicAdd(&totalChunks, requestPieces);
     atomicMax(&maxPieces, requestPieces);
-    int32_t const base = blockCount / requestPieces;
-    int32_t const remainder = blockCount - base * requestPieces;
+    int32_t const unitCount = workUnitCount(blockCount, p.tilesPerWorkUnit);
+    int32_t const base = unitCount / requestPieces;
+    int32_t const remainder = unitCount - base * requestPieces;
     for (int32_t j = 0; j < requestPieces; ++j) {
       int32_t const chunkIdx = chunkBase + j;
       if (chunkIdx >= capacity) continue;
-      int32_t const pieceBlocks = base + (j < remainder ? 1 : 0);
-      chunkCosts[chunkIdx] =
-          pieceCost(pieceBlocks, !useAdditiveCombine && requestPieces > 1, requestPieces, cm);
+      int32_t const pieceBlocks = (base + (j < remainder ? 1 : 0)) * p.tilesPerWorkUnit;
+      chunkCosts[chunkIdx] = pieceCost(pieceBlocks, !useAdditiveCombine && requestPieces > 1,
+                                       requestPieces, cm, p.tilesPerWorkUnit);
     }
   }
   __syncthreads();
@@ -952,9 +991,7 @@ __global__ void balancedSchedFoldEmitKernel(BalancedSchedDeviceParams p) {
     if (blockCount > 0) {
       requestPieces = 1;
       if (!noSplitFastPath && blockCount > target) {
-        requestPieces = ceilDivI32(blockCount, target);
-        if (requestPieces > 127) requestPieces = 127;
-        if (requestPieces > P) requestPieces = P;
+        requestPieces = requestPieceCount(blockCount, target, p.tilesPerWorkUnit, P);
       }
     }
     ws.piecesPerRequest[req] = requestPieces;
@@ -1032,17 +1069,22 @@ __global__ void balancedSchedFoldEmitKernel(BalancedSchedDeviceParams p) {
     int32_t const requestPieces = ws.piecesPerRequest[req];
     if (requestPieces == 0) continue;
     int32_t const blockCount = ws.blocks[req];
-    int32_t const base = blockCount / requestPieces;
-    int32_t const remainder = blockCount - base * requestPieces;
+    int32_t const unitCount = workUnitCount(blockCount, p.tilesPerWorkUnit);
+    int32_t const base = unitCount / requestPieces;
+    int32_t const remainder = unitCount - base * requestPieces;
     int32_t const chunkBase = ws.chunkBegin[req];
     for (int32_t j = 0; j < requestPieces; ++j) {
-      int32_t const pieceBlocks = base + (j < remainder ? 1 : 0);
-      int32_t const blockOffset = j * base + (j < remainder ? j : remainder);
+      int32_t const pieceUnits = base + (j < remainder ? 1 : 0);
+      int32_t const unitOffset = j * base + (j < remainder ? j : remainder);
+      int32_t const startBlock = unitOffset * p.tilesPerWorkUnit;
+      int32_t const unboundedEndBlock = (unitOffset + pieceUnits) * p.tilesPerWorkUnit;
+      int32_t const endBlock = unboundedEndBlock < blockCount ? unboundedEndBlock : blockCount;
       int32_t const chunkIdx = chunkBase + j;
-      ws.chunks[chunkIdx] = {req, blockOffset, blockOffset + pieceBlocks, requestPieces,
-                             j,   -1,          requestPieces > 1 ? 1 : 0};
+      ws.chunks[chunkIdx] = {
+          req, startBlock, endBlock, requestPieces, j, -1, requestPieces > 1 ? 1 : 0};
       ws.chunkCosts[chunkIdx] =
-          pieceCost(pieceBlocks, !useAdditiveCombine && requestPieces > 1, requestPieces, cm);
+          pieceCost(pieceUnits * p.tilesPerWorkUnit, !useAdditiveCombine && requestPieces > 1,
+                    requestPieces, cm, p.tilesPerWorkUnit);
     }
     if (requestPieces >= 2) {
       p.combineDescriptorPtr[ws.lptOrder[req]] = {req, requestPieces, ws.splitBegin[req], 0};
@@ -1175,9 +1217,7 @@ __global__ void balancedSchedEmitKernel(BalancedSchedDeviceParams p) {
       if (ws.blocks[req] > 0) {
         requestPieces = 1;
         if (!noSplitFastPath && ws.blocks[req] > target) {
-          requestPieces = ceilDivI32(ws.blocks[req], target);
-          if (requestPieces > 127) requestPieces = 127;
-          if (requestPieces > P) requestPieces = P;
+          requestPieces = requestPieceCount(ws.blocks[req], target, p.tilesPerWorkUnit, P);
         }
       }
       descriptorDemand += requestPieces;
@@ -1226,7 +1266,7 @@ __global__ void balancedSchedEmitKernel(BalancedSchedDeviceParams p) {
     if (!noSplitFastPath && ws.blocks[req] > target) continue;
     int32_t const pid = leastLoadedPartitionWarp(ws.run, P, nullptr, 0);
     if (threadIdx.x == 0) {
-      ws.run[pid] += pieceCost(ws.blocks[req], false, 0, cm);
+      ws.run[pid] += pieceCost(ws.blocks[req], false, 0, cm, p.tilesPerWorkUnit);
       ws.chunkBegin[req] = chunkWrite;
       ws.chunkCount[req] = 1;
       ws.piecesPerRequest[req] = 1;
@@ -1240,9 +1280,7 @@ __global__ void balancedSchedEmitKernel(BalancedSchedDeviceParams p) {
       int32_t const req = ws.longOrder[orderIdx];
       int32_t const blockCount = ws.blocks[req];
       if (blockCount <= target) continue;
-      int32_t requestPieces = ceilDivI32(blockCount, target);
-      if (requestPieces > 127) requestPieces = 127;
-      if (requestPieces > P) requestPieces = P;
+      int32_t const requestPieces = requestPieceCount(blockCount, target, p.tilesPerWorkUnit, P);
       for (int32_t j = 0; j < requestPieces; ++j) {
         int32_t const pid = leastLoadedPartitionWarp(ws.run, P, ws.selected, j);
         if (threadIdx.x == 0) ws.selected[j] = pid;
@@ -1257,16 +1295,21 @@ __global__ void balancedSchedEmitKernel(BalancedSchedDeviceParams p) {
         ws.piecesPerRequest[req] = requestPieces;
       }
       __syncwarp();
-      int32_t const base = blockCount / requestPieces;
-      int32_t const remainder = blockCount - base * requestPieces;
+      int32_t const unitCount = workUnitCount(blockCount, p.tilesPerWorkUnit);
+      int32_t const base = unitCount / requestPieces;
+      int32_t const remainder = unitCount - base * requestPieces;
       for (int32_t j = threadIdx.x; j < requestPieces; j += warpSize) {
         int32_t const pid = ws.selected[j];
-        int32_t const pieceBlocks = base + (j < remainder ? 1 : 0);
-        int32_t const blockOffset = j * base + (j < remainder ? j : remainder);
+        int32_t const pieceUnits = base + (j < remainder ? 1 : 0);
+        int32_t const unitOffset = j * base + (j < remainder ? j : remainder);
+        int32_t const startBlock = unitOffset * p.tilesPerWorkUnit;
+        int32_t const unboundedEndBlock = (unitOffset + pieceUnits) * p.tilesPerWorkUnit;
+        int32_t const endBlock = unboundedEndBlock < blockCount ? unboundedEndBlock : blockCount;
         ws.run[pid] +=
-            pieceCost(pieceBlocks, !useAdditiveCombine && requestPieces > 1, requestPieces, cm);
-        ws.chunks[chunkBase + j] = {req, blockOffset, blockOffset + pieceBlocks, requestPieces,
-                                    j,   pid,         requestPieces > 1 ? 1 : 0};
+            pieceCost(pieceUnits * p.tilesPerWorkUnit, !useAdditiveCombine && requestPieces > 1,
+                      requestPieces, cm, p.tilesPerWorkUnit);
+        ws.chunks[chunkBase + j] = {
+            req, startBlock, endBlock, requestPieces, j, pid, requestPieces > 1 ? 1 : 0};
         ++ws.partitionCounts[pid];
       }
       __syncwarp();

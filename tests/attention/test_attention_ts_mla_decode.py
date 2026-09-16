@@ -223,6 +223,25 @@ def test_attention_ts_mla_equal_split_causal_prefix_boundaries(
     )
 
 
+@pytest.mark.parametrize(
+    "row_tiles,expected_pieces",
+    ((0, 0), (1, 1), (4, 1), (5, 2), (252, 63), (253, 64), (256, 64), (257, 65)),
+)
+def test_attention_ts_mla_equal_split_causal_prefix_uses_cta_work_units(
+    row_tiles: int,
+    expected_pieces: int,
+):
+    assert (
+        equal_split_row_prefix_active_split_count(
+            row_tiles,
+            257,
+            65,
+            tiles_per_work_unit=2,
+        )
+        == expected_pieces
+    )
+
+
 @dataclass(frozen=True)
 class _MLACase:
     query: torch.Tensor
@@ -1005,6 +1024,7 @@ def test_attention_ts_mla_balanced_1cta_causal_mask_respects_descriptor_end(
     assert policy["tile_size_q"] == expected_tile_size_q
     plan = wrapper._plan_state.balanced_plan
     assert plan is not None
+    assert plan.num_insts_kv == int(policy["num_insts_kv"])
     descriptors = plan.work_descriptors[: plan.last_descriptor_count].cpu()
     assert torch.any(descriptors[:, 2] - descriptors[:, 1] == 1)
 
