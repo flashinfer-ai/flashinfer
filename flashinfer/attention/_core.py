@@ -1110,7 +1110,7 @@ class BatchPrefillWithCausalBidirectionalRangesWrapper(
     # skip every check the override exists to make.
     run_return_lse = functools.partialmethod(run, return_lse=True)
 
-    def forward(
+    def forward(  # type: ignore[override]
         self,
         q: torch.Tensor,
         paged_kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
@@ -1146,7 +1146,7 @@ class BatchPrefillWithCausalBidirectionalRangesWrapper(
             kv_cache_sf=kv_cache_sf,
         )
 
-    def forward_return_lse(
+    def forward_return_lse(  # type: ignore[override]
         self,
         q: torch.Tensor,
         paged_kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
