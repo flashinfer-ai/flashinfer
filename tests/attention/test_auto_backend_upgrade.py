@@ -784,3 +784,113 @@ def test_cudnn_ragged_handles_packed_t3hd_views():
     assert resolved == "cudnn"
     _assert_close_to_fa2(out, lse, out_fa2, lse_fa2, "cudnn on packed T3HD views")
     _assert_close_to_fa2(out_c, lse_c, out_fa2, lse_fa2, "cudnn on contiguous copies")
+
+
+def _single_token_rows(h_qo, h_kv, d, batch=8, seed=99):
+    """Every request contributes one query token (a chunked-prefill remainder
+    step) against a longer kv range: qo_indptr = arange, kv_indptr ragged."""
+    dev = torch.device("cuda")
+    g = torch.Generator().manual_seed(seed)
+    kv_lens = torch.randint(1, 1024, (batch,), generator=g)
+    kv_indptr = torch.zeros(batch + 1, dtype=torch.int32)
+    kv_indptr[1:] = torch.cumsum(kv_lens, 0)
+    qo_indptr = torch.arange(batch + 1, dtype=torch.int32)
+    torch.manual_seed(seed)
+    q = torch.randn(batch, h_qo, d, dtype=DTYPE, device=dev)
+    k = torch.randn(int(kv_indptr[-1]), h_kv, d, dtype=DTYPE, device=dev)
+    v = torch.randn(int(kv_indptr[-1]), h_kv, d, dtype=DTYPE, device=dev)
+    return q, k, v, qo_indptr.to(dev), kv_indptr.to(dev)
+
+
+def _plan_single_token(backend, qo_indptr, kv_indptr, h_qo, h_kv, d):
+    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+    wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        workspace, "NHD", backend=backend
+    )
+    wrapper.plan(
+        qo_indptr,
+        kv_indptr,
+        h_qo,
+        h_kv,
+        d,
+        head_dim_vo=d,
+        causal=False,
+        q_data_type=DTYPE,
+        kv_data_type=DTYPE,
+    )
+    return wrapper
+
+
+@requires_cudnn_upgrade
+def test_auto_declines_single_token_gqa_rows():
+    """cuDNN's s_q == 1 kernel packs a kv group's q heads and writes the LSE only
+    for the first of them (cuDNN 9.26/9.27), so `auto` keeps single-token GQA
+    steps off cuDNN; the results, LSE included, match fa2. MHA single-token rows
+    are unaffected and may still take cuDNN."""
+    h_qo, h_kv, d = 32, 8, 128
+    q, k, v, qo_indptr, kv_indptr = _single_token_rows(h_qo, h_kv, d)
+    w = _plan_single_token("auto", qo_indptr, kv_indptr, h_qo, h_kv, d)
+    assert w._backend != "cudnn"
+    out, lse = w.run(q, k, v, return_lse=True)
+    wf = _plan_single_token("fa2", qo_indptr, kv_indptr, h_qo, h_kv, d)
+    out_fa2, lse_fa2 = wf.run(q, k, v, return_lse=True)
+    _assert_close_to_fa2(out, lse, out_fa2, lse_fa2, "auto on single-token GQA rows")
+    # MHA: the kernel is correct, cuDNN stays eligible
+    q, k, v, qo_indptr, kv_indptr = _single_token_rows(h_qo, h_qo, d)
+    w = _plan_single_token("auto", qo_indptr, kv_indptr, h_qo, h_qo, d)
+    assert w._backend == "cudnn"
+    out, lse = w.run(q, k, v, return_lse=True)
+    wf = _plan_single_token("fa2", qo_indptr, kv_indptr, h_qo, h_qo, d)
+    out_fa2, lse_fa2 = wf.run(q, k, v, return_lse=True)
+    _assert_close_to_fa2(out, lse, out_fa2, lse_fa2, "cudnn on single-token MHA rows")
+
+
+@requires_cudnn_upgrade
+def test_explicit_cudnn_refuses_single_token_gqa_lse():
+    h_qo, h_kv, d = 32, 8, 128
+    q, k, v, qo_indptr, kv_indptr = _single_token_rows(h_qo, h_kv, d)
+    w = _plan_single_token("cudnn", qo_indptr, kv_indptr, h_qo, h_kv, d)
+    with pytest.raises(NotImplementedError, match="single-token"):
+        w.run(q, k, v, return_lse=True)
+    # the output itself is correct, so the no-LSE call is allowed
+    out = w.run(q, k, v)
+    wf = _plan_single_token("fa2", qo_indptr, kv_indptr, h_qo, h_kv, d)
+    out_fa2 = wf.run(q, k, v)
+    torch.testing.assert_close(out.float(), out_fa2.float(), atol=2e-2, rtol=2e-2)
+
+
+@requires_cudnn_upgrade
+@pytest.mark.xfail(
+    strict=True,
+    raises=AssertionError,  # a build/execute failure is not the known LSE bug
+    reason="cuDNN s_q==1 GQA kernel writes the ragged Stats only for the first head "
+    "of each kv group (cuDNN 9.26/9.27, reported); drop the guards above when this passes",
+)
+def test_cudnn_single_token_gqa_lse_is_correct():
+    from flashinfer.cudnn import cudnn_batch_prefill_with_kv_cache
+
+    h_qo, h_kv, d = 32, 8, 128
+    q, k, v, qo_indptr, kv_indptr = _single_token_rows(h_qo, h_kv, d)
+    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+    _, lse = cudnn_batch_prefill_with_kv_cache(
+        q,
+        k,
+        v,
+        float(1.0 / d**0.5),
+        workspace,
+        max_token_per_sequence=1,
+        max_sequence_kv=int((kv_indptr[1:] - kv_indptr[:-1]).max()),
+        causal=False,
+        return_lse=True,
+        batch_offsets_q=qo_indptr,
+        batch_offsets_o=qo_indptr,
+        batch_offsets_k=kv_indptr,
+        batch_offsets_v=kv_indptr,
+        batch_offsets_stats=qo_indptr,
+        batch_offsets_units="tokens",
+        lse=torch.empty(q.shape[0], h_qo, dtype=torch.float32, device="cuda"),
+    )
+    wf = _plan_single_token("fa2", qo_indptr, kv_indptr, h_qo, h_kv, d)
+    _, lse_fa2 = wf.run(q, k, v, return_lse=True)
+    assert torch.isfinite(lse).all()
+    torch.testing.assert_close(lse, lse_fa2, atol=1e-2, rtol=1e-2)
