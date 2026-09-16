@@ -400,6 +400,7 @@ def download_artifacts() -> None:
                 )
                 time.sleep(min(5.0, remaining))
 
+        failed_artifacts = []
         try:
             with ThreadPoolExecutor(num_threads) as pool:
                 future_to_name = {}
@@ -427,7 +428,6 @@ def download_artifacts() -> None:
                     fut.add_done_callback(update_pbar_cb)
                     future_to_name[fut] = name
 
-                failed_artifacts = []
                 for fut in as_completed(future_to_name):
                     artifact_name = future_to_name[fut]
                     try:

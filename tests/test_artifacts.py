@@ -716,6 +716,33 @@ def test_download_artifacts_non_positive_max_retries_env_raises(monkeypatch, tmp
         artifacts.download_artifacts()
 
 
+def test_download_artifacts_reports_worker_exception_with_artifact_name(
+    monkeypatch, tmp_path
+):
+    """Unexpected worker exceptions are reported as failed artifact names."""
+    from flashinfer import artifacts
+
+    cubin_dir = tmp_path / "cubins"
+    monkeypatch.setattr(artifacts, "FLASHINFER_CUBIN_DIR", cubin_dir)
+    monkeypatch.setattr(artifacts, "FLASHINFER_CUBINS_REPOSITORY", "https://example/")
+    monkeypatch.setenv("FLASHINFER_CUBIN_DOWNLOAD_THREADS", "1")
+    monkeypatch.setenv("FLASHINFER_CUBIN_MAX_RETRIES", "1")
+    monkeypatch.delenv("FLASHINFER_CUBIN_RETRY_WINDOW_SECONDS", raising=False)
+    monkeypatch.setattr(
+        artifacts,
+        "get_subdir_file_list",
+        lambda: iter([("pin/file.cubin", hashlib.sha256(b"expected").hexdigest())]),
+    )
+
+    def raising_download(_source, _destination, **_kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(artifacts, "download_file", raising_download)
+
+    with pytest.raises(RuntimeError, match=r"Failed to download cubins: pin/file.cubin"):
+        artifacts.download_artifacts()
+
+
 def test_download_artifacts_rejects_bad_download_after_cache_miss(
     monkeypatch, tmp_path
 ):
