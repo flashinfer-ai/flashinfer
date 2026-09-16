@@ -402,7 +402,7 @@ def download_artifacts() -> None:
 
         try:
             with ThreadPoolExecutor(num_threads) as pool:
-                futures = []
+                future_to_name = {}
                 for name, _ in files_to_download:
                     source = safe_urljoin(FLASHINFER_CUBINS_REPOSITORY, name)
                     local_path = FLASHINFER_CUBIN_DIR / name
@@ -425,22 +425,30 @@ def download_artifacts() -> None:
                         file_retry_deadline,
                     )
                     fut.add_done_callback(update_pbar_cb)
-                    futures.append(fut)
+                    future_to_name[fut] = name
 
-                results = []
-                for fut in as_completed(futures):
+                failed_artifacts = []
+                for fut in as_completed(future_to_name):
+                    artifact_name = future_to_name[fut]
                     try:
-                        results.append(fut.result())
+                        ok = fut.result()
                     except Exception:
-                        logger.exception("Unexpected exception in cubin download task")
-                        results.append(False)
+                        logger.exception(
+                            "Unexpected exception in cubin download task for %s",
+                            artifact_name,
+                        )
+                        ok = False
+                    if not ok:
+                        failed_artifacts.append(artifact_name)
         finally:
             for session in sessions_by_thread.values():
                 session.close()
 
-    all_success = all(results)
-    if not all_success:
-        raise RuntimeError("Failed to download cubins")
+    if failed_artifacts:
+        failed_preview = ", ".join(failed_artifacts[:5])
+        remainder = len(failed_artifacts) - 5
+        extra = f" (+{remainder} more)" if remainder > 0 else ""
+        raise RuntimeError(f"Failed to download cubins: {failed_preview}{extra}")
 
     # Cached artifacts were verified before they were skipped. Verify each file
     # fetched in this invocation before allowing it into the wheel.
