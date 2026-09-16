@@ -821,16 +821,24 @@ def _plan_single_token(backend, qo_indptr, kv_indptr, h_qo, h_kv, d):
     return wrapper
 
 
+def _single_token_rows_with_empty(h_qo, h_kv, d, batch=8, seed=99):
+    """Like _single_token_rows, but the third request has no query tokens."""
+    q, k, v, qo_indptr, kv_indptr = _single_token_rows(h_qo, h_kv, d, batch, seed)
+    qo_indptr = qo_indptr.clone()
+    qo_indptr[3:] -= 1  # request 2 contributes zero tokens
+    return q[: batch - 1], k, v, qo_indptr, kv_indptr
+
+
 @requires_cudnn_upgrade
-def test_auto_declines_single_token_gqa_rows():
-    """cuDNN's s_q == 1 kernel packs a kv group's q heads and writes the LSE only
-    for the first of them (cuDNN 9.26/9.27), so `auto` keeps single-token GQA
-    steps off cuDNN; the results, LSE included, match fa2. MHA single-token rows
-    are unaffected and may still take cuDNN."""
+def test_auto_takes_cudnn_for_single_token_gqa_rows():
+    """cuDNN < 9.28 mis-stores a ragged Stats tensor for s_q == 1 GQA (NVBug
+    6783545), but the low level serves the packed LSE through the padded
+    (b, 1, h) form when every request has exactly one token, so `auto` keeps
+    cuDNN for these rows and the LSE matches fa2. MHA rows likewise."""
     h_qo, h_kv, d = 32, 8, 128
     q, k, v, qo_indptr, kv_indptr = _single_token_rows(h_qo, h_kv, d)
     w = _plan_single_token("auto", qo_indptr, kv_indptr, h_qo, h_kv, d)
-    assert w._backend != "cudnn"
+    assert w._backend == "cudnn"
     out, lse = w.run(q, k, v, return_lse=True)
     wf = _plan_single_token("fa2", qo_indptr, kv_indptr, h_qo, h_kv, d)
     out_fa2, lse_fa2 = wf.run(q, k, v, return_lse=True)
@@ -846,15 +854,28 @@ def test_auto_declines_single_token_gqa_rows():
 
 
 @requires_cudnn_upgrade
-def test_explicit_cudnn_refuses_single_token_gqa_lse():
+def test_single_token_gqa_with_empty_rows_stays_off_cudnn_lse():
+    """The one single-token GQA shape the low level cannot serve on cuDNN < 9.28
+    is a batch mixing zero-length and one-token requests (the padded (b, 1, h)
+    form is no longer the packed layout). `auto` keeps those steps off cuDNN,
+    and explicit cudnn refuses the LSE while still serving the output."""
+    from flashinfer.cudnn.prefill import _cudnn_single_token_gqa_ragged_stats_broken
+
+    if not _cudnn_single_token_gqa_ragged_stats_broken():
+        pytest.skip("cuDNN >= 9.28 stores the ragged Stats correctly")
     h_qo, h_kv, d = 32, 8, 128
-    q, k, v, qo_indptr, kv_indptr = _single_token_rows(h_qo, h_kv, d)
+    q, k, v, qo_indptr, kv_indptr = _single_token_rows_with_empty(h_qo, h_kv, d)
+    w = _plan_single_token("auto", qo_indptr, kv_indptr, h_qo, h_kv, d)
+    assert w._backend != "cudnn"
+    out, lse = w.run(q, k, v, return_lse=True)
+    wf = _plan_single_token("fa2", qo_indptr, kv_indptr, h_qo, h_kv, d)
+    out_fa2, lse_fa2 = wf.run(q, k, v, return_lse=True)
+    _assert_close_to_fa2(out, lse, out_fa2, lse_fa2, "auto on single-token GQA + empty")
     w = _plan_single_token("cudnn", qo_indptr, kv_indptr, h_qo, h_kv, d)
-    with pytest.raises(NotImplementedError, match="single-token"):
+    with pytest.raises(NotImplementedError, match="zero-length"):
         w.run(q, k, v, return_lse=True)
     # the output itself is correct, so the no-LSE call is allowed
     out = w.run(q, k, v)
-    wf = _plan_single_token("fa2", qo_indptr, kv_indptr, h_qo, h_kv, d)
     out_fa2 = wf.run(q, k, v)
     torch.testing.assert_close(out.float(), out_fa2.float(), atol=2e-2, rtol=2e-2)
 
@@ -866,7 +887,7 @@ def test_cudnn_single_token_gqa_lse_is_correct():
     kernel (NVBug 6783545), so cudnn_batch_prefill_with_kv_cache binds the
     packed buffer as the padded (b, 1, h) Stats form instead (the two are
     byte-identical when every request has one token); 9.28+ stores the ragged
-    form correctly. The wrapper guards above remain as belt and braces."""
+    form correctly."""
     from flashinfer.cudnn import cudnn_batch_prefill_with_kv_cache
 
     h_qo, h_kv, d = 32, 8, 128

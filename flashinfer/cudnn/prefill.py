@@ -1252,6 +1252,13 @@ def cudnn_batch_prefill_with_kv_cache(
     if out is None:
         out_shape = (num_tokens, h_qo, d_vo)
         out = torch.empty(out_shape, device=q.device, dtype=o_data_type)
+    else:
+        # The graph declares O with contiguous (tokens, h_qo, d_vo) strides and
+        # binds this buffer to it directly.
+        if not out.is_contiguous():
+            raise ValueError("out must be contiguous")
+        if out.device != q.device:
+            raise ValueError(f"out must be on {q.device}, got {out.device}")
 
     if batch_offsets_units == "tokens":
         # Convenience feature to allow user to set just batch_offsets_{q,k} if desired.
