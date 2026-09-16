@@ -150,8 +150,8 @@ def main() -> None:
         "speedup_pct,mae,max_abs,cosine_mean,lse_max_abs"
     )
     for topk in args.topk:
-        if topk not in (128, 512):
-            raise ValueError("the initial NVFP4 prefill kernel supports topk 128/512")
+        if topk < 1:
+            raise ValueError("topk must be >= 1")
         indices = torch.randint(
             0,
             args.num_pages * _PAGE_SIZE,

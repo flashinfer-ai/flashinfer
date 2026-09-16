@@ -243,8 +243,8 @@ def main() -> None:
         "nvfp4_full_us,nvfp4_stage1_us,nvfp4_merge_us,speedup_pct"
     )
     for topk in args.topk:
-        if topk not in (128, 512):
-            raise ValueError("the initial NVFP4 decode prototype supports topk 128/512")
+        if topk < 1:
+            raise ValueError("topk must be >= 1")
         num_splits = (topk + 63) // 64 + (args.extra_topk + 63) // 64
         indices = torch.randint(
             0,
