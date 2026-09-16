@@ -9,14 +9,14 @@ loop and shared helpers come from ``backends/mega/kernel/tuning.py``.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal, cast
 
 from ...tuning import finish_sweep, run_tuning as _run_tuning, schedule_candidates
 
 
-def _kind(args) -> str:
+def _kind(args) -> Literal["fp8_e4m3", "fp8_e5m2"]:
     # CLI dtype "sm90_fp8_e4m3" -> shim kind "fp8_e4m3".
-    return args.dtype.removeprefix("sm90_")
+    return cast(Literal["fp8_e4m3", "fp8_e5m2"], args.dtype.removeprefix("sm90_"))
 
 
 def tune_one(args, rank: int, world_size: int, max_tokens: int) -> dict:

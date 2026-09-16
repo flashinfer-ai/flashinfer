@@ -992,7 +992,8 @@ def main() -> int:
                 f"{args.operand_order}_{args.scale_mode}.csv",
             )
         os.makedirs(os.path.dirname(os.path.abspath(csv_path)), exist_ok=True)
-        csv_file = open(csv_path, "w")
+        # Closed in the ``finally`` below (the handle outlives this block).
+        csv_file = open(csv_path, "w")  # noqa: SIM115
         print(f"# output_csv: {csv_path}", flush=True)
     try:
         for scale_mode in scale_modes:

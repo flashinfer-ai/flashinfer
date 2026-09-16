@@ -48,9 +48,7 @@ CORRECTNESS_KNOBS: Dict[str, Tuple[Any, ...]] = {
 
 _NONSWAP_TILES = ((64, 128, 128), (64, 256, 128))
 # Keep in sync with hopper_fp8._SWAPAB_TILE_N_CHOICES (N=8 admitted 2026-09-10).
-_SWAPAB_TILES = tuple(
-    (m, n, 128) for m in (128, 256) for n in (8, 16, 32, 64, 128)
-)
+_SWAPAB_TILES = tuple((m, n, 128) for m in (128, 256) for n in (8, 16, 32, 64, 128))
 _CLUSTER_SHAPES = ((1, 1, 1), (2, 1, 1), (1, 2, 1), (2, 2, 1))
 
 PERF_KNOBS: Dict[str, Tuple[Any, ...]] = {

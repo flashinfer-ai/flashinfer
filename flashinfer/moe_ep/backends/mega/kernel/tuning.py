@@ -135,7 +135,9 @@ def run_tuning(
     import torch
 
     if pkg is None:
-        from ....kernel_src import cutedsl_megamoe as pkg
+        from ....kernel_src import cutedsl_megamoe as _default_pkg
+
+        pkg = _default_pkg
 
     rank, world_size = pkg.init_dist()
     try:

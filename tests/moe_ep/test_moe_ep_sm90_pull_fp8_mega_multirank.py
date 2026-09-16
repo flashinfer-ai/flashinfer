@@ -366,7 +366,10 @@ def _assert_grouped_close(y, ref, *, combine_format: str):
     else:
         assert snr_db > 20.0, f"quantized combine SNR {snr_db:.1f} dB"
         torch.testing.assert_close(
-            y.float(), ref.float(), rtol=0.25, atol=0.08,
+            y.float(),
+            ref.float(),
+            rtol=0.25,
+            atol=0.08,
         )
     print(f"grouped combine ({combine_format}) SNR vs exact ref: {snr_db:.1f} dB")
 
@@ -1169,7 +1172,9 @@ def _check_generate_c_output(fc1_c, ref_map, idx_g, rank, num_local_experts):
         ref_c = ref.to(rows.device).float().flatten().sort().values
         torch.testing.assert_close(kernel_c, ref_c, atol=1e-2, rtol=1e-2)
         pad = fc1_c[offsets[e] + v : offsets[e + 1]]
-        assert pad.numel() == 0 or pad.abs().max().item() == 0.0, f"expert {e}: non-zero pad rows"
+        assert pad.numel() == 0 or pad.abs().max().item() == 0.0, (
+            f"expert {e}: non-zero pad rows"
+        )
         checked += 1
     assert checked > 0, "no local expert received tokens"
     return checked

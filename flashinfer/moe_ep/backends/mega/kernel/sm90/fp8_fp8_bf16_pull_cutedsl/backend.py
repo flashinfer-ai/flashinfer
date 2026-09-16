@@ -56,8 +56,7 @@ class Sm90PullFp8MegaKernelBackend(MegaKernelBackend):
         if config.knobs is not None:
             if not (isinstance(config.knobs, dict) or config.knobs == "auto"):
                 raise ValueError(
-                    "knobs must be None, a knob dict, or 'auto'; "
-                    f"got {config.knobs!r}"
+                    f"knobs must be None, a knob dict, or 'auto'; got {config.knobs!r}"
                 )
             if any(
                 v is not None
