@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import replace
@@ -1085,7 +1086,7 @@ def test_timer_uses_target_device_and_restores_current(fake_cuda):
 
 
 @requires_sm12x
-def test_cold_timer_gpu_graph_topology(monkeypatch):
+def test_cold_timer_gpu_graph_topology(monkeypatch, tmp_path):
     graph_type = torch.cuda.CUDAGraph
 
     def make_graph():
@@ -1106,23 +1107,41 @@ def test_cold_timer_gpu_graph_topology(monkeypatch):
         timer.eviction.numel() * timer.eviction.element_size()
         == 4 * cpb_mod._device_l2(target)
     )
-    nodes = timer.graph.get_graph_data()["nodes"]
+    # debug_dump (cudaGraphDebugDotPrint) works without the tools-id support
+    # that get_graph_data requires.
+    dot = tmp_path / "timer.dot"
+    timer.graph.debug_dump(str(dot))
+    text = dot.read_text()
+    nodes = {
+        name: attributes
+        for name, attributes in re.findall(
+            r'"(graph_\d+_node_\d+)"\[(.*?)\];', text, re.DOTALL
+        )
+    }
     assert len(nodes) == 8
-    by_id = {node["index"]: node for node in nodes}
-    roots = [node for node in nodes if not node["dependencies"]]
+    outgoing = {name: [] for name in nodes}
+    incoming = {name: [] for name in nodes}
+    for source, target_node in re.findall(
+        r'"(graph_\d+_node_\d+)" -> "(graph_\d+_node_\d+)"', text
+    ):
+        outgoing[source].append(target_node)
+        incoming[target_node].append(source)
+    roots = [name for name in nodes if not incoming[name]]
     assert len(roots) == 1
     node = roots[0]
     for i in range(8):
+        attributes = nodes[node]
         if i % 4 in (1, 3):
-            assert node["node_type"] == "event_record"
+            assert "EVENT_RECORD" in attributes
         else:
-            assert node["node_type"] == "kernel"
-            assert ("add" if i % 4 == 0 else "Mul") in node["kernel_name"]
+            match = re.search(r"\| \{ID \| [^|]+\| (.*?)\\<\\<\\<", attributes)
+            assert match, attributes
+            assert ("add" if i % 4 == 0 else "Mul") in match.group(1)
         if i < 7:
-            assert len(node["dependents"]) == 1
-            node = by_id[node["dependents"][0]]
+            assert len(outgoing[node]) == 1
+            node = outgoing[node][0]
         else:
-            assert not node["dependents"]
+            assert not outgoing[node]
 
 
 def test_timer_requires_device_sm_count(fake_cuda, monkeypatch):

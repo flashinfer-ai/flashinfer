@@ -176,6 +176,9 @@ def test_caller_entry_matches_dsv41_profile(monkeypatch, sm12x):
         "get_ordinary_profile",
         lambda *args: {"buckets": {"4": {"variant": 1, "cpb": 2}}},
     )
+    from flashinfer.mla._sparse_mla_sm120 import _prepared
+
+    _prepared._functional_plans.clear()
     q = torch.randn(4, 16, 512, device="cuda", dtype=torch.bfloat16) * 0.1
     cache = quantize_kv_dsv4_1(
         torch.randn(4, 64, 1, 512, device="cuda", dtype=torch.bfloat16) * 0.1
@@ -200,17 +203,18 @@ def test_caller_entry_matches_dsv41_profile(monkeypatch, sm12x):
         )
 
     call()
-    graph = torch.cuda.CUDAGraph(keep_graph=True)
-    graph.enable_debug_mode()
+    graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         call()
     graph.replay()
     torch.cuda.synchronize()
     assert torch.equal(out, expected) and torch.equal(lse, el)
-    assert any(
-        "prefill_kernel" in n.get("kernel_name", "")
-        for n in graph.get_graph_data()["nodes"]
-    )
+    prefill_plans = [
+        p
+        for p in _prepared._functional_plans.values()
+        if p.plan.inspect()["variant"] == 1
+    ]
+    assert prefill_plans
     mid = torch.empty(4, 16, 2, 512, device="cuda", dtype=torch.bfloat16)
     mlse = torch.empty(4, 16, 2, device="cuda")
     _api.sparse_mla_sm120_decode_dsv4(
@@ -224,7 +228,6 @@ def test_caller_entry_matches_dsv41_profile(monkeypatch, sm12x):
         512**-0.5,
         model_type=5,
     )
-    from flashinfer.mla._sparse_mla_sm120 import _prepared
 
     plans = [
         p
@@ -1503,11 +1506,13 @@ def test_dsv4_metadata_overrides_prefill_crossover(api, pitched, monkeypatch, sm
         SparseMLASm120Wrapper,
         trtllm_batch_decode_sparse_mla_dsv4,
     )
-    from flashinfer.mla._sparse_mla_sm120 import _calibration, _api
+    from flashinfer.mla._sparse_mla_sm120 import _calibration, _api, _prepared
     from tests.attention.sparse_mla_test_utils import (
         dequantize_kv_dsv4,
         _ref_sparse_attn,
     )
+
+    _prepared._functional_plans.clear()
 
     monkeypatch.setattr(
         _calibration,
@@ -1612,21 +1617,19 @@ def test_dsv4_metadata_overrides_prefill_crossover(api, pitched, monkeypatch, sm
         if api != "functional":
             torch.testing.assert_close(lse, el, atol=0.02, rtol=0.02)
         saved = out.clone()
-        graph = torch.cuda.CUDAGraph(keep_graph=True)
-        graph.enable_debug_mode()
+        graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             call()
         graph.replay()
         torch.cuda.synchronize()
         assert torch.equal(out, saved)
-        kernels = [
-            n["kernel_name"]
-            for n in graph.get_graph_data()["nodes"]
-            if n["node_type"] == "kernel"
-        ]
-        assert any(
-            ("decode_dsv4_kernel" if strided else "prefill") in name for name in kernels
+        plans = (
+            list(wrapper._prepared_calls.values())
+            if api == "wrapper"
+            else list(_prepared._functional_plans.values())
         )
+        variants = {p.plan.inspect()["variant"] for p in plans}
+        assert (0 if strided else 3) in variants
 
 
 @pytest.mark.parametrize("tokens,page", [(2, 3), (128, 65)])
