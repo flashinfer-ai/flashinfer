@@ -39,6 +39,11 @@ HAS_PRIMS_TS_RUNTIME = ensure_cutlass_dsl_experimental()
 # the vendored kernels at import time, so it cannot be collected at all and has
 # to be dropped before collection rather than skipped during it.
 if not HAS_PRIMS_TS_RUNTIME:
+    # Hand-maintained and load-bearing: a module that imports the vendored kernels
+    # eagerly cannot be marked during collection, only dropped before it. Adding one
+    # without listing it here silently reintroduces #5213, so
+    # tests/test_prims_ts_import_isolation.py enforces this list under a simulated
+    # CUTLASS DSL 4.6.
     collect_ignore = ["test_batched_gemm_captured_schedule_tasks.py"]
 
 
@@ -64,7 +69,9 @@ def pytest_collection_modifyitems(config, items):
         )
     )
     for item in items:
-        if Path(str(item.path)).parent == here:
+        # `in ... parents` rather than `== parent`: a future subdirectory of
+        # tests/prims_ts/ would otherwise escape the skip marker.
+        if here in Path(str(item.path)).parents:
             item.add_marker(skip_prims_ts)
 
 
