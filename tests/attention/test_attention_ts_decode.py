@@ -7031,9 +7031,7 @@ def test_block_sparse_pattern_heads_graph(storage, fmt, shared):
                 cache_v[physical] = v[
                     request, logical * page : (logical + 1) * page
                 ].transpose(0, 1)
-        page_indptr = torch.arange(batch + 1, device="cuda", dtype=torch.int32) * (
-            sk // page
-        )
+        page_table = pages.view(batch, sk // page)
         lens = torch.full((batch,), sk, device="cuda", dtype=torch.int32)
         w = BlockSparsePagedTSWrapper()
         w.plan(batch, sq, sk, hq, hkv, dim, qb, block, page, **static)
@@ -7042,8 +7040,7 @@ def test_block_sparse_pattern_heads_graph(storage, fmt, shared):
             return w.run(
                 q,
                 (cache_k, cache_v),
-                page_indptr,
-                pages,
+                page_table,
                 lens,
                 indptr,
                 indices,
@@ -7053,14 +7050,13 @@ def test_block_sparse_pattern_heads_graph(storage, fmt, shared):
         eager = block_sparse_attention_with_paged_kv_cache(
             q,
             (cache_k, cache_v),
-            page_indptr,
-            pages,
+            page_table,
+            lens,
             indptr,
             indices,
             qb,
             block,
             max_seq_len_kv=sk,
-            seq_lens_kv=lens,
             mask_type=mask,
             share_pattern_across_kv_heads=shared,
         )
