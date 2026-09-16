@@ -13,16 +13,17 @@
 # limitations under the License.
 """fp8 fc1_gate_up + SiLU + fp8 quantization in one kernel: the activation never reaches gmem."""
 
-import torch
-
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.cute.nvgpu.warp.mma as warp_mma
 import cutlass.utils as utils
+import torch
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.runtime import from_dlpack
 
+from ....utils import ceil_div
+from ._moe_utils import moe_activation, moe_epilogue, moe_scheduler
 from ._moe_utils.moe_epilogue import (
     EPI_CONFIGS,
     EpiMethod,
@@ -32,17 +33,15 @@ from ._moe_utils.moe_epilogue import (
     store_wg_q1_after_s2r,
     store_wg_q1_before_r2s,
 )
-from ._moe_utils.moe_kernel_builder import Sm12xGatedGemmConfig, MmaConfig, LoadABConfig
+from ._moe_utils.moe_kernel_builder import LoadABConfig, MmaConfig, Sm12xGatedGemmConfig
 from ._moe_utils.sm12x_blockscaled_layout import (
+    SF_M_ALIGN,
+    TMA_ALIGN_BYTES,
     Sm120SfConfigFp8,
+    compute_padded_offset,
     copy_scale_s2r,
     rescale,
 )
-from ._moe_utils.sm12x_blockscaled_layout import SF_M_ALIGN, TMA_ALIGN_BYTES
-from ....utils import ceil_div
-from ._moe_utils.sm12x_blockscaled_layout import compute_padded_offset
-from ._moe_utils import moe_activation, moe_scheduler, moe_epilogue
-
 
 GRAN_M, GRAN_N, GRAN_K = 1, 128, 128
 

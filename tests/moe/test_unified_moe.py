@@ -874,7 +874,7 @@ class TestTypedActivationConfig:
 
         config = MoEConfig(
             routing=RoutingConfig(num_experts=2, top_k=1),
-            quant=QuantConfig(variant=QuantVariant.MXFP4),
+            quant=QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
             experts=ExpertConfig(intermediate_size=128, local_num_experts=2),
         )
         x = torch.empty(3, 128, dtype=torch.bfloat16)

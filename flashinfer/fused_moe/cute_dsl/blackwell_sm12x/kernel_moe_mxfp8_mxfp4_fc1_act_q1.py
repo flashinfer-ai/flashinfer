@@ -13,16 +13,23 @@
 # limitations under the License.
 """mx fc1_gate_up + SiLU + mxfp8 quantization in one kernel: the activation never reaches gmem."""
 
-import torch
-
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
-import cutlass.utils
 import cutlass.cute.nvgpu.warp.mma as warp_mma
+import cutlass.utils
+import torch
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.runtime import from_dlpack
 
+from ....tllm_enums import (
+    DEFAULT_SITU_BETA as SITU_BETA,
+)
+from ....tllm_enums import (
+    DEFAULT_SITU_LINEAR_BETA as SITU_LINEAR_BETA,
+)
+from ....utils import ceil_div
+from ._moe_utils import moe_activation, moe_epilogue, moe_scheduler
 from ._moe_utils.moe_epilogue import (
     EPI_CONFIGS,
     EpiMethod,
@@ -32,16 +39,12 @@ from ._moe_utils.moe_epilogue import (
     store_wg_q1_after_s2r,
     store_wg_q1_before_r2s,
 )
-from ._moe_utils.moe_kernel_builder import Sm12xGatedGemmConfig, MmaConfig, LoadABConfig
-from ._moe_utils.sm12x_blockscaled_layout import Sm120SfConfigMxfp8Mxfp4
-from ....tllm_enums import (
-    DEFAULT_SITU_BETA as SITU_BETA,
-    DEFAULT_SITU_LINEAR_BETA as SITU_LINEAR_BETA,
+from ._moe_utils.moe_kernel_builder import LoadABConfig, MmaConfig, Sm12xGatedGemmConfig
+from ._moe_utils.sm12x_blockscaled_layout import (
+    SF_M_ALIGN,
+    UE8M0_PACK_NUM,
+    Sm120SfConfigMxfp8Mxfp4,
 )
-from ._moe_utils.sm12x_blockscaled_layout import SF_M_ALIGN, UE8M0_PACK_NUM
-from ....utils import ceil_div
-from ._moe_utils import moe_activation, moe_scheduler, moe_epilogue
-
 
 GRANK_A, GRANK_B = 128, 32
 

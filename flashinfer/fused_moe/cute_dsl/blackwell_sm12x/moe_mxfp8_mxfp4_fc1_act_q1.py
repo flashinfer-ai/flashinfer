@@ -20,21 +20,28 @@ import os
 import cutlass
 import cutlass.cute as cute
 import torch
-
-from ....autotuner import AutoTuner, TunableRunner, TuningConfig, autotune
 from cutlass.base_dsl.common import DSLUserCodeError
 
+from ....autotuner import AutoTuner, TunableRunner, TuningConfig, autotune
 from ....tllm_enums import (
     DEFAULT_SITU_BETA as SITU_BETA,
+)
+from ....tllm_enums import (
     DEFAULT_SITU_LINEAR_BETA as SITU_LINEAR_BETA,
+)
+from ....tllm_enums import (
     ActivationType,
 )
-from ._moe_utils.sm12x_blockscaled_layout import SF_M_ALIGN, UE8M0_PACK_NUM
 from ....utils import ceil_div
-from ._moe_utils.sm12x_blockscaled_layout import compute_padded_offset
+from ._moe_utils.heuristic import select_fc1_act_tile
 from ._moe_utils.moe_epilogue import EPI_CONFIGS, EpiMethod
-from ._moe_utils.sm12x_blockscaled_layout import Sm120SfConfigMxfp8Mxfp4
 from ._moe_utils.moe_kernel_builder import Sm12xGemmConfig, dsl_targets_sm12x
+from ._moe_utils.sm12x_blockscaled_layout import (
+    SF_M_ALIGN,
+    UE8M0_PACK_NUM,
+    Sm120SfConfigMxfp8Mxfp4,
+    compute_padded_offset,
+)
 from .kernel_moe_mxfp8_mxfp4_fc1_act_q1 import (
     GRANK_A,
     GRANK_B,
@@ -44,7 +51,6 @@ from .kernel_moe_mxfp8_mxfp4_fc1_act_q1 import (
     make_args,
     make_cfg,
 )
-from ._moe_utils.heuristic import select_fc1_act_tile
 
 BK = GRANK_B * Sm120SfConfigMxfp8Mxfp4.PACK_NSF
 EPIS = QUANT_EPIS

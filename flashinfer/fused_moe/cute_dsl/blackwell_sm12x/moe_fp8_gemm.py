@@ -19,11 +19,11 @@ import os
 import cutlass
 import cutlass.cute as cute
 import torch
-
-from ....autotuner import AutoTuner, TunableRunner, TuningConfig, autotune
 from cutlass.base_dsl.common import DSLUserCodeError
 
+from ....autotuner import AutoTuner, TunableRunner, TuningConfig, autotune
 from ....utils import ceil_div
+from ._moe_utils.heuristic import select_plain_bm_64_or_128
 from ._moe_utils.moe_epilogue import EPI_CONFIGS, EpiMethod
 from ._moe_utils.moe_kernel_builder import Sm12xGemmConfig
 from .kernel_moe_fp8_gemm import (
@@ -34,7 +34,6 @@ from .kernel_moe_fp8_gemm import (
     make_args,
     make_cfg,
 )
-from ._moe_utils.heuristic import select_plain_bm_64_or_128
 
 FALLBACK_TILE = (128, 128, 128)
 

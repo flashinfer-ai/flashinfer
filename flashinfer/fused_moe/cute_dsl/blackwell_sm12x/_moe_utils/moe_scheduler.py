@@ -16,14 +16,14 @@
 import enum
 
 import cutlass
+import cutlass.cute as cute
 from cutlass.cutlass_dsl import (
-    Int32,
     Boolean,
+    Int32,
+    dsl_user_op,
     extract_mlir_values,
     new_from_mlir_values,
-    dsl_user_op,
 )
-import cutlass.cute as cute
 
 from .....utils import ceil_div
 
