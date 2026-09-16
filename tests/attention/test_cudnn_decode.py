@@ -62,8 +62,9 @@ def _build_paged_kv(batch_size, s_kv, page_size, num_kv_heads, head_dim, dtype, 
 def _decode_ref(q, k_cache, v_cache, block_tables, actual_seq_lens_kv, scale):
     """fp32 torch decode reference; returns ``(out, lse)``.
 
-    ``lse`` is the natural-log log-sum-exp of the scaled scores over the valid
-    KV positions (``scale`` folded in), shape ``(batch_size, num_heads_qo)``.
+    ``lse`` is the base-2 log-sum-exp of the scaled scores over the valid
+    KV positions (``scale`` folded in), shape ``(batch_size, num_heads_qo)`` —
+    FlashInfer's LSE contract.
     """
     batch_size, num_heads_qo, head_dim = q.shape
     num_kv_heads = k_cache.shape[1]
@@ -92,7 +93,7 @@ def _decode_ref(q, k_cache, v_cache, block_tables, actual_seq_lens_kv, scale):
             .repeat_interleave(gqa_ratio, dim=0)
         )
         scores = torch.einsum("hd,hld->hl", q[b].float(), k_b) * scale
-        lse[b] = torch.logsumexp(scores, dim=-1)
+        lse[b] = torch.logsumexp(scores, dim=-1) * math.log2(math.e)
         out[b] = torch.einsum("hl,hld->hd", torch.softmax(scores, dim=-1), v_b)
     return out, lse
 
@@ -322,7 +323,7 @@ def test_cudnn_decode_dtypes(dtype):
 @requires_cudnn_graph
 def test_cudnn_decode_return_lse():
     """return_lse=True returns (out, lse); out matches the return_lse=False
-    output, and lse matches natural-log logsumexp of the scaled scores."""
+    output, and lse matches the base-2 logsumexp of the scaled scores."""
     torch.manual_seed(1)
     device = "cuda:0"
     batch_size, s_kv, page_size = 8, 512, 16
@@ -533,3 +534,335 @@ def test_cudnn_decode_fp16_requires_cudnn(monkeypatch):
             actual_seq_lens_kv,
             float(1.0 / (head_dim**0.5)),
         )
+
+
+# --- BatchDecodeWithPagedKVCacheWrapper(backend="cudnn") -----------------------
+
+
+def _wrapper_inputs(
+    batch_size,
+    s_kv,
+    page_size,
+    num_kv_heads,
+    num_qo_heads,
+    head_dim,
+    dtype,
+    kv_layout,
+    device,
+):
+    """CSR paged-KV plan inputs + a 5-D paged cache in ``kv_layout`` + query."""
+    num_pages_per_seq = (s_kv + page_size - 1) // page_size
+    total_num_pages = batch_size * num_pages_per_seq
+    kv_lens = torch.randint(
+        max(1, s_kv // 2), s_kv + 1, (batch_size,), dtype=torch.int32
+    )
+    kv_lens[0] = s_kv
+    pages_per_seq = (kv_lens + page_size - 1) // page_size
+    indptr = torch.zeros(batch_size + 1, dtype=torch.int32)
+    indptr[1:] = torch.cumsum(pages_per_seq, 0)
+    indices = torch.randperm(total_num_pages, dtype=torch.int32)[: int(indptr[-1])]
+    last_page_len = kv_lens - (pages_per_seq - 1) * page_size
+    if kv_layout == "HND":
+        shape = (total_num_pages, 2, num_kv_heads, page_size, head_dim)
+    else:
+        shape = (total_num_pages, 2, page_size, num_kv_heads, head_dim)
+    kv_cache = torch.randn(shape, dtype=dtype, device=device)
+    q = torch.randn(batch_size, num_qo_heads, head_dim, dtype=dtype, device=device)
+    return q, kv_cache, indptr.to(device), indices.to(device), last_page_len.to(device)
+
+
+def _run_wrapper(
+    backend,
+    q,
+    kv_cache,
+    indptr,
+    indices,
+    last_page_len,
+    page_size,
+    num_kv_heads,
+    num_qo_heads,
+    head_dim,
+    dtype,
+    kv_layout,
+    **plan_kwargs,
+):
+    workspace = torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device=q.device)
+    wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        workspace, kv_layout, use_tensor_cores=(backend != "cudnn"), backend=backend
+    )
+    wrapper.plan(
+        indptr,
+        indices,
+        last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        q_data_type=dtype,
+        kv_data_type=dtype,
+        **plan_kwargs,
+    )
+    return wrapper.run(q, kv_cache, return_lse=True)
+
+
+@requires_cudnn_graph
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
+@pytest.mark.parametrize("page_size", [16, 64])
+@pytest.mark.parametrize("num_qo_heads,num_kv_heads", [(32, 8), (64, 4)])
+def test_cudnn_wrapper_matches_fa2(
+    dtype, kv_layout, page_size, num_qo_heads, num_kv_heads
+):
+    """backend='cudnn' on the paged-decode wrapper matches the fa2 tensor-core
+    backend (output and base-2 LSE) for the same CSR plan inputs."""
+    torch.manual_seed(0)
+    device = "cuda:0"
+    batch_size, s_kv, head_dim = 8, 2048, 128
+    q, kv_cache, indptr, indices, last_page_len = _wrapper_inputs(
+        batch_size,
+        s_kv,
+        page_size,
+        num_kv_heads,
+        num_qo_heads,
+        head_dim,
+        dtype,
+        kv_layout,
+        device,
+    )
+    args = (
+        q,
+        kv_cache,
+        indptr,
+        indices,
+        last_page_len,
+        page_size,
+        num_kv_heads,
+        num_qo_heads,
+        head_dim,
+        dtype,
+        kv_layout,
+    )
+    out_ref, lse_ref = _run_wrapper("fa2", *args)
+    out, lse = _run_wrapper("cudnn", *args)
+    assert out.dtype == dtype and out.shape == out_ref.shape
+    torch.testing.assert_close(out, out_ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(lse, lse_ref, rtol=1e-3, atol=1e-2)
+
+
+@requires_cudnn_graph
+def test_cudnn_wrapper_replan_reuses_block_table_and_bucketed_max():
+    """Consecutive plans with growing KV lengths inside one 1024-token bucket
+    keep the same block-table buffer (and thus the same built cuDNN graph)."""
+    torch.manual_seed(0)
+    device = "cuda:0"
+    dtype, kv_layout, page_size = torch.bfloat16, "HND", 16
+    num_kv_heads, num_qo_heads, head_dim = 4, 32, 128
+    workspace = torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device=device)
+    wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        workspace, kv_layout, backend="cudnn"
+    )
+    tables = []
+    for s_kv in (1500, 1600, 2048):
+        q, kv_cache, indptr, indices, last_page_len = _wrapper_inputs(
+            4,
+            s_kv,
+            page_size,
+            num_kv_heads,
+            num_qo_heads,
+            head_dim,
+            dtype,
+            kv_layout,
+            device,
+        )
+        wrapper.plan(
+            indptr,
+            indices,
+            last_page_len,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            q_data_type=dtype,
+            kv_data_type=dtype,
+        )
+        assert wrapper._max_kv_len == 2048
+        tables.append(wrapper._block_tables.data_ptr())
+        out = wrapper.run(q, kv_cache)
+        ref = _run_wrapper(
+            "fa2",
+            q,
+            kv_cache,
+            indptr,
+            indices,
+            last_page_len,
+            page_size,
+            num_kv_heads,
+            num_qo_heads,
+            head_dim,
+            dtype,
+            kv_layout,
+        )[0]
+        torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-2)
+    assert len(set(tables)) == 1
+
+
+@requires_cudnn_graph
+def test_cudnn_wrapper_cuda_graph_with_user_block_tables():
+    """CUDA-graph mode: capture once with a caller-owned block table, re-plan
+    with new page indices / lengths, replay, and match fa2."""
+    torch.manual_seed(0)
+    device = "cuda:0"
+    dtype, kv_layout, page_size = torch.bfloat16, "HND", 16
+    batch_size, s_kv = 4, 1024
+    num_kv_heads, num_qo_heads, head_dim = 4, 32, 128
+    max_pages = s_kv // page_size
+    workspace = torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device=device)
+    indptr_buf = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
+    indices_buf = torch.zeros(batch_size * max_pages, dtype=torch.int32, device=device)
+    last_buf = torch.zeros(batch_size, dtype=torch.int32, device=device)
+    block_tables = torch.zeros(batch_size, max_pages, dtype=torch.int32, device=device)
+    wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        workspace,
+        kv_layout,
+        use_cuda_graph=True,
+        backend="cudnn",
+        paged_kv_indptr_buffer=indptr_buf,
+        paged_kv_indices_buffer=indices_buf,
+        paged_kv_last_page_len_buffer=last_buf,
+    )
+
+    def fill_block_tables(indptr, indices):
+        block_tables.zero_()
+        for i in range(batch_size):
+            b, e = int(indptr[i]), int(indptr[i + 1])
+            block_tables[i, : e - b] = indices[b:e]
+
+    q, kv_cache, indptr, indices, last_page_len = _wrapper_inputs(
+        batch_size,
+        s_kv,
+        page_size,
+        num_kv_heads,
+        num_qo_heads,
+        head_dim,
+        dtype,
+        kv_layout,
+        device,
+    )
+    fill_block_tables(indptr, indices)
+    wrapper.plan(
+        indptr,
+        indices,
+        last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        q_data_type=dtype,
+        kv_data_type=dtype,
+        block_tables=block_tables,
+    )
+    out = torch.empty_like(q)
+    wrapper.run(q, kv_cache, out=out)  # warm-up builds the cuDNN graph outside capture
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        wrapper.run(q, kv_cache, out=out)
+
+    for _ in range(2):
+        q2, kv2, indptr, indices, last_page_len = _wrapper_inputs(
+            batch_size,
+            s_kv,
+            page_size,
+            num_kv_heads,
+            num_qo_heads,
+            head_dim,
+            dtype,
+            kv_layout,
+            device,
+        )
+        q.copy_(q2)
+        kv_cache.copy_(kv2)
+        fill_block_tables(indptr, indices)
+        wrapper.plan(
+            indptr,
+            indices,
+            last_page_len,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            q_data_type=dtype,
+            kv_data_type=dtype,
+            block_tables=block_tables,
+        )
+        g.replay()
+        torch.cuda.synchronize()
+        ref = _run_wrapper(
+            "fa2",
+            q,
+            kv_cache,
+            indptr,
+            indices,
+            last_page_len,
+            page_size,
+            num_kv_heads,
+            num_qo_heads,
+            head_dim,
+            dtype,
+            kv_layout,
+        )[0]
+        torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-2)
+
+
+@requires_cudnn_graph
+@pytest.mark.parametrize(
+    "plan_kwargs",
+    [
+        dict(q_len_per_req=2),
+        dict(logits_soft_cap=30.0),
+        dict(window_left=128),
+        dict(pos_encoding_mode="ROPE_LLAMA"),
+        dict(kv_data_type=torch.float8_e4m3fn),
+    ],
+)
+def test_cudnn_wrapper_rejects_unsupported(plan_kwargs):
+    device = "cuda:0"
+    dtype, page_size = torch.bfloat16, 16
+    q, kv_cache, indptr, indices, last_page_len = _wrapper_inputs(
+        4, 512, page_size, 4, 32, 128, dtype, "HND", device
+    )
+    workspace = torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device=device)
+    wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        workspace, "HND", backend="cudnn"
+    )
+    kwargs = dict(q_data_type=dtype, kv_data_type=dtype)
+    kwargs.update(plan_kwargs)
+    # q_len_per_req > 1 is caught by the wrapper's generic tensor-core check
+    # (ValueError) before the cudnn-specific NotImplementedError.
+    with pytest.raises((NotImplementedError, ValueError)):
+        wrapper.plan(indptr, indices, last_page_len, 32, 4, 128, page_size, **kwargs)
+
+
+@requires_cudnn_graph
+def test_cudnn_wrapper_rejects_sinks_at_run():
+    device = "cuda:0"
+    dtype, page_size = torch.bfloat16, 16
+    q, kv_cache, indptr, indices, last_page_len = _wrapper_inputs(
+        4, 512, page_size, 4, 32, 128, dtype, "HND", device
+    )
+    workspace = torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device=device)
+    wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        workspace, "HND", backend="cudnn"
+    )
+    wrapper.plan(
+        indptr,
+        indices,
+        last_page_len,
+        32,
+        4,
+        128,
+        page_size,
+        q_data_type=dtype,
+        kv_data_type=dtype,
+    )
+    with pytest.raises(NotImplementedError):
+        wrapper.run(q, kv_cache, sinks=torch.zeros(32, device=device))

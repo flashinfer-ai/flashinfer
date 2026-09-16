@@ -5,6 +5,7 @@ import torch
 
 from ..api_logging import flashinfer_api
 from ..trace.templates.attention import cudnn_batch_decode_trace
+from ..utils import log2e
 from .utils import get_cudnn_fmha_gen_module
 
 try:
@@ -305,6 +306,11 @@ def _batch_decode_with_kv_cache(
 
     graph.execute(var_map, workspace=workspace_buffer, handle=handle_)
 
+    if return_lse:
+        # cuDNN emits natural-log softmax stats; FlashInfer's LSE contract is
+        # base-2 (the cascade-merge kernels consume it), as in the prefill path.
+        lse.mul_(log2e)
+
     return out
 
 
@@ -391,11 +397,13 @@ def cudnn_batch_decode_with_kv_cache(
     on the same CUDA device.  Query and KV heads may differ
     (``num_heads_qo >= num_heads_kv``, multi-query / grouped-query attention).
 
-    LSE convention: ``lse[b, h]`` is the natural-log log-sum-exp of the
+    LSE convention: ``lse[b, h]`` is the **base-2** log-sum-exp of the
     pre-softmax attention row with ``scale`` folded in, i.e.
-    ``log(sum_j(exp(scale * q[b, h] . k[b, h // (num_heads_qo // num_heads_kv), j])))``
-    summed over the valid KV positions ``j < actual_seq_lens_kv[b]`` (matching
-    ``torch.logsumexp`` on the masked, scaled scores).
+    ``log2(sum_j(exp(scale * q[b, h] . k[b, h // (num_heads_qo // num_heads_kv), j])))``
+    summed over the valid KV positions ``j < actual_seq_lens_kv[b]`` — the same
+    contract as every other FlashInfer backend (``torch.logsumexp(...) * log2(e)``),
+    so it can be fed to the cascade-merge kernels. cuDNN emits natural-log stats;
+    they are folded to base-2 here.
     """
 
     bs = q.shape[0]
