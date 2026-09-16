@@ -82,6 +82,8 @@ class MSASparseAttentionWorkspace:
         self._warmed_launches: set[tuple] = set()
         self._bound_stream_ptr: Optional[int] = None
         self._captured = False
+        self._vibecuda_uniform_q_lengths: dict[tuple, int] = {}
+        self._vibecuda_right_aligned_offsets: set[tuple] = set()
 
 
 _topk_warmed_devices: set[tuple[int, str]] = set()

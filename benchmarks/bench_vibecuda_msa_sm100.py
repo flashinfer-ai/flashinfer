@@ -98,15 +98,11 @@ CORRECTNESS_TOLERANCES = cake_bench.CORRECTNESS_TOLERANCES
 def _reference_tolerance(shape: MSAShape) -> dict[str, float]:
     """Declared precision contract for the independent FP32 reference.
 
-    The authoritative benchmark compares against its independent FP32
-    reference at the Q-dtype tolerance (its FP16 rows are FP16/FP16).  Rows
-    whose K/V storage is FP8 E4M3 carry the FP8 quantization error through
-    any implementation, so those rows use the FP8 entry, matching the
-    kv-dtype tolerance the authoritative benchmark applies to FP8 rows.
+    Match the authoritative benchmark's candidate-versus-reference rule:
+    tolerance follows the Q/output dtype.  K/V quantization is already part
+    of the input contract and does not relax implementation error.
     """
 
-    if shape.kv_dtype == "float8_e4m3fn":
-        return CORRECTNESS_TOLERANCES["float8_e4m3fn"]
     return CORRECTNESS_TOLERANCES[shape.q_dtype]
 
 
@@ -670,8 +666,8 @@ def _run_parent(args: argparse.Namespace) -> None:
             "correctness_reference": (
                 "independent torch FP32 masked-attention reference from "
                 "benchmarks/bench_cake_msa_sm100.py, applied independently to "
-                "the baseline and the candidate at the declared per-dtype "
-                "tolerances (FP8-KV rows use the FP8 entry)"
+                "the baseline and the candidate at the declared Q/output-dtype "
+                "tolerances"
             ),
             "zero_row_full_write_contract": ZERO_ROW_FULL_WRITE_CONTRACT,
             "fallback_policy": "reject",

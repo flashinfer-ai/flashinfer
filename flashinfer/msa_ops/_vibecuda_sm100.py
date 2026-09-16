@@ -222,7 +222,7 @@ def _resolve_uniform_seqlen_q(
 
     workspace_key = (tuple(cu_q.shape), tuple(cu_q.stride()), cu_q.dtype)
     if workspace is not None and torch.cuda.is_current_stream_capturing():
-        state = getattr(workspace, "_vibecuda_uniform_q_lengths", {})
+        state = workspace._vibecuda_uniform_q_lengths
         if workspace_key not in state:
             raise RuntimeError(
                 "VibeCUDA MSA prefill workspace was not warmed for this "
@@ -251,11 +251,7 @@ def _resolve_uniform_seqlen_q(
             return cached[2]
     seqlen_q = resolve()
     if workspace is not None:
-        state = getattr(workspace, "_vibecuda_uniform_q_lengths", None)
-        if state is None:
-            state = {}
-            workspace._vibecuda_uniform_q_lengths = state
-        state[workspace_key] = seqlen_q
+        workspace._vibecuda_uniform_q_lengths[workspace_key] = seqlen_q
     with _uniform_q_len_cache_lock:
         if len(_uniform_q_len_cache) >= 64:
             dead_keys = [
@@ -288,7 +284,7 @@ def _validate_right_aligned_q_offset(
         tuple(cu_k.stride()),
     )
     if workspace is not None and torch.cuda.is_current_stream_capturing():
-        if key not in getattr(workspace, "_vibecuda_right_aligned_offsets", set()):
+        if key not in workspace._vibecuda_right_aligned_offsets:
             raise RuntimeError(
                 "VibeCUDA MSA prefill workspace was not warmed with explicit "
                 "right-aligned q_offset values before CUDA graph capture"
@@ -308,11 +304,7 @@ def _validate_right_aligned_q_offset(
             "equals kv_len - q_len for every request (right-aligned queries)"
         )
     if workspace is not None:
-        state = getattr(workspace, "_vibecuda_right_aligned_offsets", None)
-        if state is None:
-            state = set()
-            workspace._vibecuda_right_aligned_offsets = state
-        state.add(key)
+        workspace._vibecuda_right_aligned_offsets.add(key)
 
 
 def _validate_inputs(
@@ -448,6 +440,7 @@ def _run(
     seqlen_q: int,
     causal: bool,
     workspace: Optional[MSASparseAttentionWorkspace],
+    output: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     device = q.device
     total_q, num_q_heads, num_kv_heads, group_size, kv_fp8 = _validate_inputs(
@@ -483,13 +476,25 @@ def _run(
                 stream_ptr=stream_ptr,
                 capturing=capturing,
             )
-        out = _workspace_buffer(
-            workspace,
-            "vibecuda_out",
-            tuple(q.shape),
-            dtype=q.dtype,
-            device=device,
-        )
+        if output is None:
+            out = _workspace_buffer(
+                workspace,
+                "vibecuda_out",
+                tuple(q.shape),
+                dtype=q.dtype,
+                device=device,
+            )
+        else:
+            if (
+                output.shape != q.shape
+                or output.dtype != q.dtype
+                or output.device != q.device
+                or not output.is_contiguous()
+            ):
+                raise ValueError(
+                    "output must be contiguous and match q's shape/dtype/device"
+                )
+            out = output
         k_arg = k.view(torch.uint8) if kv_fp8 else k
         v_arg = v.view(torch.uint8) if kv_fp8 else v
         if workspace is None:
@@ -638,7 +643,56 @@ def vibecuda_msa_sparse_attention(
     _validate_right_aligned_q_offset(
         q_offset, cu_q=cu_q, cu_k=cu_k, workspace=workspace
     )
-    seqlen_q = _resolve_uniform_seqlen_q(cu_q, batch_size, workspace)
+    try:
+        seqlen_q = _resolve_uniform_seqlen_q(cu_q, batch_size, workspace)
+    except NotImplementedError:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "ragged VibeCUDA MSA prefill must be warmed and executed eagerly"
+            ) from None
+        q_bounds = cu_q.cpu().tolist()
+        k_bounds = cu_k.cpu().tolist()
+        out = _workspace_buffer(
+            workspace,
+            "vibecuda_ragged_out",
+            tuple(q.shape),
+            dtype=q.dtype,
+            device=q.device,
+        )
+        for batch_idx in range(batch_size):
+            q_begin, q_end = q_bounds[batch_idx : batch_idx + 2]
+            if q_begin == q_end:
+                continue
+            k_begin, k_end = k_bounds[batch_idx : batch_idx + 2]
+            q_len = q_end - q_begin
+            k_len = k_end - k_begin
+            one_cu_q = _uniform_cu_q(1, q_len, q.device)
+            one_cu_k = _uniform_cu_q(1, k_len, q.device)
+            if page_table is None:
+                one_k = k[k_begin:k_end]
+                one_v = v[k_begin:k_end]
+                one_page_table = None
+                one_seqused_k = None
+            else:
+                one_k = k
+                one_v = v
+                one_page_table = page_table[batch_idx : batch_idx + 1]
+                one_seqused_k = seqused_k[batch_idx : batch_idx + 1]
+            _run(
+                q=q[q_begin:q_end],
+                k=one_k,
+                v=one_v,
+                q2k_indices=q2k_indices[:, q_begin:q_end].contiguous(),
+                cu_q=one_cu_q,
+                cu_k=one_cu_k,
+                page_table=one_page_table,
+                seqused_k=one_seqused_k,
+                seqlen_q=q_len,
+                causal=causal,
+                workspace=workspace,
+                output=out[q_begin:q_end],
+            )
+        return out
     return _run(
         q=q,
         k=k,
