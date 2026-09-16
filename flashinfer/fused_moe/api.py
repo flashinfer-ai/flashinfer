@@ -50,11 +50,9 @@ from ..tllm_enums import (
 # alone: ``QuantConfig.__repr__`` can emit either, and the ``eval(repr(cfg))``
 # round-trip this module guarantees is evaluated in *this* module's namespace.
 from ..quantization.nvfp4_quantization_utils import (
+    _UNSET,
     NVFP44Over6Config,  # noqa: F401
     NVFP44Over6ErrMode,  # noqa: F401
-    NVFP44Over6Setting,
-    NVFP4Recipe,
-    nvfp4_4over6_is_from_env,
     resolve_nvfp4_4over6,
 )
 
@@ -176,7 +174,7 @@ class QuantConfig:
     per_token_scale : bool or None
         Whether activations carry a per-token scale (vs per-tensor / block).
         ``None`` → backend default.
-    nvfp4_4over6 : NVFP4Recipe, NVFP44Over6Config or None
+    nvfp4_4over6 : NVFP44Over6Config or None
         NVFP4 "4over6" scale-selection recipe for the **activation**
         quantization the kernels perform at runtime.  Weight quantization is a
         separate concern — it happens ahead of the call, in the caller's own
@@ -184,24 +182,24 @@ class QuantConfig:
         parametrizes ``use_4over6`` and ``weights_use_4over6`` independently for
         exactly that reason.
 
-        Three states:
+        Three cases, spelled by one ``Optional`` type plus the default:
 
-        ``NVFP4Recipe.FROM_ENV``
-            The default, and what ``None`` means.  Read
-            ``FLASHINFER_NVFP4_4OVER6``; when ``"1"``, the other three
+        Unset (the default)
+            Read ``FLASHINFER_NVFP4_4OVER6``; when ``"1"``, the other three
             ``FLASHINFER_NVFP4_4OVER6_*`` variables supply the recipe.  Read on
-            every call.  Byte-for-byte the old behaviour.
-        ``NVFP4Recipe.STANDARD``
+            every call.  Byte-for-byte the old behaviour; the environment
+            variables are a deprecated compatibility shim.
+        ``None``
             4over6 off.  ``FLASHINFER_NVFP4_4OVER6=1`` cannot turn it back on.
         ``NVFP44Over6Config(...)``
             On with exactly this recipe; the environment is ignored and there
             is **no** per-field merge with it.
 
         This is the config knob ``SfLayout`` (above) was denied, and it earns
-        the exception on the same test: every inhabitant of the type —
-        :class:`NVFP4Recipe`, :class:`NVFP44Over6Config` including its
-        :class:`NVFP44Over6ErrMode` field, and ``None`` — has an eval-safe
-        ``__repr__``, so the ``eval(repr(cfg))`` round-trip still holds.
+        the exception on the same test: :class:`NVFP44Over6Config` (including
+        its :class:`NVFP44Over6ErrMode` field) has an eval-safe ``__repr__``,
+        so the ``eval(repr(cfg))`` round-trip still holds; an unset field is
+        simply not emitted.
 
         A backend that has not threaded the setting into its quantizer rejects
         an explicit value rather than silently dropping it; see
@@ -218,15 +216,15 @@ class QuantConfig:
     Raises
     ------
     ValueError
-        If ``nvfp4_4over6`` is set to anything other than
-        ``NVFP4Recipe.FROM_ENV`` (or its ``None`` alias) when ``activation``
-        is not ``QuantFormat.NVFP4``.  ``NVFP4Recipe.STANDARD`` counts as an
-        explicit value and is rejected too: on a non-NVFP4 activation it is
-        not a no-op to be ignored but a statement about a quantization that is
-        not happening, and accepting it would make the field look meaningful
-        where it is not.
+        If ``nvfp4_4over6`` is set (to ``None`` or a config) when
+        ``activation`` is not ``QuantFormat.NVFP4``.  An explicit ``None``
+        is rejected too: on a non-NVFP4 activation it is not a no-op to be
+        ignored but a statement about a quantization that is not happening,
+        and accepting it would make the field look meaningful where it is
+        not.
     TypeError
-        If ``nvfp4_4over6`` is not one of the three states (raised by
+        If ``nvfp4_4over6`` is neither ``None`` nor an
+        :class:`NVFP44Over6Config` (raised by
         :func:`~flashinfer.resolve_nvfp4_4over6`, which ``__post_init__``
         calls purely to type-check the value where it is written).
     """
@@ -238,7 +236,7 @@ class QuantConfig:
     _: KW_ONLY
     swizzled_scale_factors: Optional[bool] = None
     per_token_scale: Optional[bool] = None
-    nvfp4_4over6: NVFP44Over6Setting = NVFP4Recipe.FROM_ENV
+    nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET
 
     def __post_init__(self) -> None:
         for name in ("weight", "activation", "output"):
@@ -248,7 +246,7 @@ class QuantConfig:
                     f"QuantConfig.{name} must be a QuantFormat, got {value!r}. "
                     "Pass QuantFormat.FP16 rather than torch.float16."
                 )
-        if nvfp4_4over6_is_from_env(self.nvfp4_4over6):
+        if self.nvfp4_4over6 is _UNSET:
             return
         # Resolve once purely to type-check the setting: a config object that
         # cannot be resolved should fail where it is written, not at launch.
@@ -280,10 +278,9 @@ class QuantConfig:
             parts.append(f"swizzled_scale_factors={self.swizzled_scale_factors!r}")
         if self.per_token_scale is not None:
             parts.append(f"per_token_scale={self.per_token_scale!r}")
-        # Compared against the literal default rather than
-        # nvfp4_4over6_is_from_env(): ``None`` is only an *alias* for FROM_ENV,
-        # it is not equal to it, so eliding it would break the round-trip.
-        if self.nvfp4_4over6 is not NVFP4Recipe.FROM_ENV:
+        # An unset field is not emitted; an explicit ``None`` is, because it
+        # means "4over6 off" and eliding it would break the round-trip.
+        if self.nvfp4_4over6 is not _UNSET:
             parts.append(f"nvfp4_4over6={self.nvfp4_4over6!r}")
         return f"QuantConfig({', '.join(parts)})"
 
@@ -1253,7 +1250,7 @@ class CutlassNvfp4Config:
         intermediate_size: int,
         activation: Optional[ActivationConfig] = None,
         device=None,
-        nvfp4_4over6: NVFP44Over6Setting = NVFP4Recipe.STANDARD,
+        nvfp4_4over6: Optional[NVFP44Over6Config] = None,
     ):
         """Quantize canonical BF16 weights into CUTLASS-swizzled NVFP4.
 
@@ -1575,7 +1572,7 @@ class CuteDslConfig:
         intermediate_size: int,
         activation: Optional[ActivationConfig] = None,
         device=None,
-        nvfp4_4over6: NVFP44Over6Setting = NVFP4Recipe.STANDARD,
+        nvfp4_4over6: Optional[NVFP44Over6Config] = None,
     ):
         """Build the ``cute_dsl`` weight view from canonical BF16 weights.
 

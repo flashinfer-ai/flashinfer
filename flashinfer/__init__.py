@@ -111,7 +111,6 @@ from .quantization.fp4_quantization import (
 from .quantization.nvfp4_quantization_utils import (
     NVFP44Over6Config,
     NVFP44Over6ErrMode,
-    NVFP4Recipe,
     make_nvfp4_global_scale,
     resolve_nvfp4_4over6,
 )

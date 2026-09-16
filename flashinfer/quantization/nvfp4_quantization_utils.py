@@ -17,9 +17,10 @@ Shared NVFP4 quantization helpers.
 """
 
 from dataclasses import dataclass, fields
-from enum import Enum, IntEnum
+from enum import IntEnum
 import os
-from typing import Union
+from typing import Any, Optional, Union
+import warnings
 
 import torch
 
@@ -42,33 +43,46 @@ class NVFP44Over6ErrMode(IntEnum):
         return f"{type(self).__name__}.{self.name}"
 
 
-class NVFP4Recipe(Enum):
-    """The two NVFP4 scale-selection states that are not a 4over6 recipe.
+class _UnsetType:
+    """Type of :data:`_UNSET`, the "argument omitted" default of ``nvfp4_4over6``.
 
-    A 4over6 setting has *three* states and ``None`` cannot spell all of
-    them: internally ``None`` has always meant "4over6 disabled", while a
-    public parameter's default must mean "derive from the environment" to
-    stay backwards compatible.  These two members name the states that are
-    not an :class:`NVFP44Over6Config`:
+    The public type of every ``nvfp4_4over6=`` parameter is
+    ``Optional[NVFP44Over6Config]``: ``None`` means 4over6 off and a config
+    means on with exactly that recipe.  Omitting the argument is the third
+    case -- read the legacy ``FLASHINFER_NVFP4_4OVER6*`` environment
+    variables -- and it is spelled by the *default value* rather than by a
+    third public type, so that retiring the environment shim later only flips
+    the default to ``None`` and changes no signature.
 
-    ``FROM_ENV``
-        Read ``FLASHINFER_NVFP4_4OVER6`` and friends at call time.  This is
-        the default everywhere and is byte-for-byte the behaviour that
-        predates the ``nvfp4_4over6=`` parameter.
-    ``STANDARD``
-        Plain NVFP4.  The environment is not consulted at all.
-
-    An ``Enum`` rather than a bespoke sentinel: singleton identity,
-    ``pickle``, ``copy.deepcopy``, hashing and static narrowing come for
-    free, and ``.value`` is a JSON token so a framework-level quantization
-    config round-trips through ``json.dumps`` without a custom encoder.
+    The sentinel is a singleton: ``pickle`` and ``copy`` return the same
+    object, so ``is _UNSET`` stays a valid test on a round-tripped config.
     """
 
-    FROM_ENV = "from_env"
-    STANDARD = "standard"
+    _instance: Optional["_UnsetType"] = None
+
+    def __new__(cls) -> "_UnsetType":
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
 
     def __repr__(self) -> str:
-        return f"{type(self).__name__}.{self.name}"
+        return "<nvfp4_4over6 unset: read FLASHINFER_NVFP4_4OVER6*>"
+
+    def __reduce__(self) -> str:
+        return "_UNSET"
+
+    def __copy__(self) -> "_UnsetType":
+        return self
+
+    def __deepcopy__(self, memo: dict) -> "_UnsetType":
+        return self
+
+
+#: Default of every public ``nvfp4_4over6=`` parameter: "not passed".  Typed
+#: ``Any`` so the parameters keep the honest annotation
+#: ``Optional[NVFP44Over6Config]``.  Never pass it explicitly; omit the
+#: argument instead.
+_UNSET: Any = _UnsetType()
 
 
 @dataclass(frozen=True)
@@ -126,14 +140,6 @@ class NVFP44Over6Config:
         return f"{type(self).__name__}({', '.join(parts)})"
 
 
-#: Public three-state 4over6 setting.  ``NVFP4Recipe.FROM_ENV`` (``None`` is an
-#: alias) derives the recipe from the environment, ``NVFP4Recipe.STANDARD``
-#: turns 4over6 off, and an :class:`NVFP44Over6Config` turns it on with exactly
-#: that recipe.  Below :func:`resolve_nvfp4_4over6` everything keeps the
-#: two-state ``NVFP44Over6Config | None`` convention where ``None`` means off.
-NVFP44Over6Setting = Union[NVFP4Recipe, NVFP44Over6Config, None]
-
-
 #: Wire codes for the packed recipe crossing the torch-custom-op / TVM-FFI
 #: boundary.  Mirrored in csrc/nv_internal/tensorrt_llm/kernels/nvfp4Recipe.h.
 NVFP4_4OVER6_CODE_FROM_ENV = -1
@@ -155,9 +161,9 @@ def env_flag_enabled(name: str) -> bool:
 def current_nvfp4_4over6_config() -> NVFP44Over6Config | None:
     """Build the 4over6 recipe from the ``FLASHINFER_NVFP4_4OVER6*`` env vars.
 
-    This is the implementation of :attr:`NVFP4Recipe.FROM_ENV`.  Prefer
+    This is what an omitted ``nvfp4_4over6=`` argument resolves to.  Prefer
     :func:`resolve_nvfp4_4over6`, which routes here only when the caller did
-    not pin a recipe.
+    not pass a recipe.
     """
     if not env_flag_enabled("FLASHINFER_NVFP4_4OVER6"):
         return None
@@ -171,13 +177,8 @@ def current_nvfp4_4over6_config() -> NVFP44Over6Config | None:
     )
 
 
-def nvfp4_4over6_is_from_env(setting: NVFP44Over6Setting) -> bool:
-    """Whether ``setting`` defers to the environment (``FROM_ENV`` or ``None``)."""
-    return setting is None or setting is NVFP4Recipe.FROM_ENV
-
-
 def nvfp4_4over6_fp8_input_error(
-    setting: NVFP44Over6Setting, input_dtype: torch.dtype
+    setting: Optional[NVFP44Over6Config], input_dtype: torch.dtype
 ) -> ValueError:
     """Build the error for a recipe an FP8-input quantizer cannot honor.
 
@@ -195,9 +196,7 @@ def nvfp4_4over6_fp8_input_error(
     dead end.
     """
     source = (
-        "FLASHINFER_NVFP4_4OVER6"
-        if nvfp4_4over6_is_from_env(setting)
-        else "the nvfp4_4over6= argument"
+        "FLASHINFER_NVFP4_4OVER6" if setting is _UNSET else "the nvfp4_4over6= argument"
     )
     return ValueError(
         f"NVFP4 4over6 (requested via {source}) requires fp16 or bf16 input, "
@@ -206,9 +205,9 @@ def nvfp4_4over6_fp8_input_error(
 
 
 def resolve_nvfp4_4over6(
-    setting: NVFP44Over6Setting = NVFP4Recipe.FROM_ENV,
+    setting: Optional[NVFP44Over6Config] = _UNSET,
 ) -> NVFP44Over6Config | None:
-    """Collapse the public three-state setting to the internal two-state one.
+    """Resolve a public ``nvfp4_4over6=`` argument to the recipe the kernels use.
 
     This is the *only* place the ``FLASHINFER_NVFP4_4OVER6*`` environment
     variables are consulted on the Python side, so precedence is decided
@@ -216,10 +215,12 @@ def resolve_nvfp4_4over6(
 
     Parameters
     ----------
-    setting : NVFP4Recipe, NVFP44Over6Config or None
-        ``NVFP4Recipe.FROM_ENV`` (or ``None``) reads the environment;
-        ``NVFP4Recipe.STANDARD`` returns ``None`` without reading it; an
-        :class:`NVFP44Over6Config` is returned as-is.
+    setting : NVFP44Over6Config or None
+        Omitted (the default): read the environment; when it enables 4over6
+        a ``DeprecationWarning`` points at the argument, because the
+        environment variables are a compatibility shim.  ``None``: 4over6
+        off, environment ignored.  An :class:`NVFP44Over6Config`: on with
+        exactly that recipe, environment ignored (no per-field merge).
 
     Returns
     -------
@@ -227,9 +228,17 @@ def resolve_nvfp4_4over6(
         The resolved recipe, where ``None`` means 4over6 is off.  This is the
         value every kernel driver below the public boundary expects.
     """
-    if nvfp4_4over6_is_from_env(setting):
-        return current_nvfp4_4over6_config()
-    if setting is NVFP4Recipe.STANDARD:
+    if setting is _UNSET:
+        config = current_nvfp4_4over6_config()
+        if config is not None:
+            warnings.warn(
+                "The FLASHINFER_NVFP4_4OVER6* environment variables are "
+                f"deprecated; pass nvfp4_4over6={config!r} explicitly instead.",
+                DeprecationWarning,
+                stacklevel=3,
+            )
+        return config
+    if setting is None:
         return None
     if isinstance(setting, NVFP44Over6Config):
         if type(setting) is not NVFP44Over6Config:
@@ -244,8 +253,8 @@ def resolve_nvfp4_4over6(
             )
         return setting
     raise TypeError(
-        "nvfp4_4over6 must be NVFP4Recipe.FROM_ENV, NVFP4Recipe.STANDARD, an "
-        f"NVFP44Over6Config, or None; got {type(setting).__name__}."
+        "nvfp4_4over6 must be an NVFP44Over6Config or None (or omitted); got "
+        f"{type(setting).__name__}."
     )
 
 
@@ -284,8 +293,11 @@ def nvfp4_4over6_code(config: NVFP44Over6Config | None) -> int:
     )
 
 
-def nvfp4_4over6_from_code(code: int) -> NVFP44Over6Setting:
+def nvfp4_4over6_from_code(code: int) -> Optional[NVFP44Over6Config]:
     """Inverse of :func:`nvfp4_4over6_code`, for logs, repro tooling and tests.
+
+    ``-1`` (:data:`NVFP4_4OVER6_CODE_FROM_ENV`) decodes to the "argument
+    omitted" sentinel, whose ``repr`` names the environment variables.
 
     Mirrors ``resolveNVFP4Recipe`` in
     csrc/nv_internal/tensorrt_llm/kernels/nvfp4Recipe.h *including its
@@ -305,14 +317,14 @@ def nvfp4_4over6_from_code(code: int) -> NVFP44Over6Setting:
         if code != NVFP4_4OVER6_CODE_FROM_ENV:
             raise ValueError(
                 f"Unsupported NVFP4 4over6 code {code}: the only negative code "
-                f"is {NVFP4_4OVER6_CODE_FROM_ENV} (FROM_ENV)."
+                f"is {NVFP4_4OVER6_CODE_FROM_ENV} (read the environment)."
             )
-        return NVFP4Recipe.FROM_ENV
+        return _UNSET
     if code >> NVFP4_4OVER6_KNOWN_BITS:
         raise ValueError(f"Unsupported NVFP4 4over6 code {code}: unknown bits set.")
     if not code & 1:
-        # STANDARD: 4over6 off.  Covers NVFP4_4OVER6_CODE_STANDARD.
-        return NVFP4Recipe.STANDARD
+        # 4over6 off.  Covers NVFP4_4OVER6_CODE_STANDARD.
+        return None
     # Validated rather than handed to NVFP44Over6ErrMode(), so the two spare
     # encodings report the same "expected 0=MAE or 1=MSE" as the C++ decoder
     # instead of a bare enum-lookup failure.
@@ -329,45 +341,16 @@ def nvfp4_4over6_from_code(code: int) -> NVFP44Over6Setting:
     )
 
 
-def _resolve_for_scale(
-    nvfp4_4over6_config: NVFP44Over6Config | None,
-    nvfp4_4over6: NVFP44Over6Setting,
-) -> NVFP44Over6Config | None:
-    """Reconcile the legacy resolved parameter with the three-state one.
+def nvfp4_e4m3_max(nvfp4_4over6_config: NVFP44Over6Config | None = None) -> float:
+    """E4M3 block-scale clamp implied by a **resolved** recipe.
 
-    ``nvfp4_4over6`` defaults to ``NVFP4Recipe.STANDARD`` rather than
-    ``FROM_ENV`` on the scale helpers: their pre-existing contract is that
-    ``nvfp4_4over6_config=None`` means "no 4over6", and silently promoting
-    that to an environment read would change the scale of every existing
-    caller.
+    ``None`` (the default) is standard NVFP4.  Unlike the quantizers, omitting
+    the recipe here does *not* read the environment: the pre-existing contract
+    of the scale helpers is that no recipe means the 448 clamp, and every
+    caller passes the recipe it resolved for the matching quantize call.
     """
-    if nvfp4_4over6 is NVFP4Recipe.STANDARD:
-        return nvfp4_4over6_config
     if nvfp4_4over6_config is not None:
-        raise ValueError(
-            "pass either nvfp4_4over6_config (resolved) or nvfp4_4over6 "
-            "(three-state), not both."
-        )
-    return resolve_nvfp4_4over6(nvfp4_4over6)
-
-
-def nvfp4_e4m3_max(
-    nvfp4_4over6_config: NVFP44Over6Config | None = None,
-    *,
-    nvfp4_4over6: NVFP44Over6Setting = NVFP4Recipe.STANDARD,
-) -> float:
-    """E4M3 block-scale clamp implied by a recipe.
-
-    Parameters
-    ----------
-    nvfp4_4over6_config : NVFP44Over6Config or None
-        Legacy **resolved** recipe; ``None`` means 4over6 is off.
-    nvfp4_4over6 : NVFP4Recipe, NVFP44Over6Config or None
-        Three-state public spelling.  Pass exactly one of the two.
-    """
-    config = _resolve_for_scale(nvfp4_4over6_config, nvfp4_4over6)
-    if config is not None:
-        return float(config.e4m3_max)
+        return float(nvfp4_4over6_config.e4m3_max)
     return FLOAT8_E4M3_MAX
 
 
@@ -376,15 +359,15 @@ def make_nvfp4_global_scale(
     per_token_activation: bool,
     global_scale: float | None = None,
     nvfp4_4over6_config: NVFP44Over6Config | None = None,
-    *,
-    nvfp4_4over6: NVFP44Over6Setting = NVFP4Recipe.STANDARD,
 ) -> torch.Tensor:
-    """Build the NVFP4 global scale implied by a 4over6 recipe.
+    """Build the NVFP4 global scale implied by a **resolved** 4over6 recipe.
 
-    The recipe used here **must** match the one passed to the quantizer: the
+    The recipe used here **must** match the one the quantizer runs with: the
     E4M3 clamp appears both in this scale and in the kernel's candidate
     search, and a mismatch silently rescales the whole tensor.  Pass the same
-    ``nvfp4_4over6=`` value to both.
+    ``NVFP44Over6Config`` (or ``None``) here as ``nvfp4_4over6=`` on the
+    quantize call; when the quantize call leaves ``nvfp4_4over6`` unset, pass
+    ``resolve_nvfp4_4over6()`` here.
 
     Parameters
     ----------
@@ -396,12 +379,10 @@ def make_nvfp4_global_scale(
     global_scale : float, optional
         Explicit per-tensor scale, bypassing the amax reduction.
     nvfp4_4over6_config : NVFP44Over6Config or None
-        Legacy **resolved** recipe; ``None`` means 4over6 is off.
-    nvfp4_4over6 : NVFP4Recipe, NVFP44Over6Config or None
-        Three-state public spelling.  Pass exactly one of the two.
+        Resolved recipe; ``None`` (the default) means 4over6 is off.  Like
+        :func:`nvfp4_e4m3_max`, omitting it does not read the environment.
     """
-    config = _resolve_for_scale(nvfp4_4over6_config, nvfp4_4over6)
-    e4m3_max = nvfp4_e4m3_max(config)
+    e4m3_max = nvfp4_e4m3_max(nvfp4_4over6_config)
     if per_token_activation:
         scale = 1.0 / (e4m3_max * FLOAT4_E2M1_MAX)
     elif global_scale is not None:
@@ -447,8 +428,6 @@ __all__ = [
     "NVFP4_4OVER6_KNOWN_BITS",
     "NVFP44Over6Config",
     "NVFP44Over6ErrMode",
-    "NVFP44Over6Setting",
-    "NVFP4Recipe",
     "current_nvfp4_4over6_config",
     "env_flag_enabled",
     "make_nvfp4_global_scale",
@@ -456,7 +435,6 @@ __all__ = [
     "nvfp4_4over6_code",
     "nvfp4_4over6_fp8_input_error",
     "nvfp4_4over6_from_code",
-    "nvfp4_4over6_is_from_env",
     "nvfp4_4over6_mode_label",
     "nvfp4_e4m3_max",
     "resolve_nvfp4_4over6",

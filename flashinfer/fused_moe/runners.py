@@ -42,9 +42,9 @@ from ..autotuner import (
     TuningConfig,
 )
 from ..quantization.nvfp4_quantization_utils import (
+    _UNSET,
     NVFP44Over6Config,
     nvfp4_4over6_cache_key,
-    nvfp4_4over6_is_from_env,
     resolve_nvfp4_4over6,
 )
 from ..utils import next_positive_power_of_2, round_up
@@ -589,18 +589,18 @@ class MoERunner(TunableRunner):
     def _assert_nvfp4_4over6_supported(self) -> None:
         """Reject an explicit 4over6 recipe on a backend that has not opted in.
 
-        Silence is the contract only for ``NVFP4Recipe.FROM_ENV``.  A pinned
+        Silence is the contract only for an unset field.  A pinned
         recipe that the backend would quietly ignore is the exact failure mode
         the field exists to eliminate, so it must be loud.
         """
         setting = self.config.quant.nvfp4_4over6
-        if nvfp4_4over6_is_from_env(setting) or self.supports_nvfp4_4over6:
+        if setting is _UNSET or self.supports_nvfp4_4over6:
             return
         raise NotImplementedError(
             f"{type(self).__name__} cannot honor an explicit "
             f"QuantConfig.nvfp4_4over6={setting!r}: its activation quantizer "
             "reads the FLASHINFER_NVFP4_4OVER6* environment variables "
-            "directly. Leave the field at NVFP4Recipe.FROM_ENV to use them, or "
+            "directly. Leave the field unset to use them, or "
             "select a backend that implements it."
         )
 
@@ -647,7 +647,7 @@ class MoERunner(TunableRunner):
         recipe.
 
         A ``str`` and not the enum: ``ProfilingCacheKey.file_key`` stringifies
-        the extras and drops ``runner_hash``, so ``NVFP4Recipe.FROM_ENV`` would
+        the extras and drops ``runner_hash``, so an unset field would
         render identically in two processes running with opposite
         ``FLASHINFER_NVFP4_4OVER6`` settings — the collision this key exists to
         break.  Resolving turns it into ``"off"`` / ``"4over6_448_MAE_0"`` /
@@ -4115,7 +4115,7 @@ class CuteDslRunner(MoERunner):
         ):
             # Without per-token activation scales the GEMM2 input is produced
             # by GEMM1's NVFP4 epilogue, which has no 4over6 variant. Only a
-            # pinned recipe is rejected: NVFP4Recipe.STANDARD is exactly what
+            # pinned recipe is rejected: ``None`` (4over6 off) is exactly what
             # that path already does, since it never reads the environment.
             raise NotImplementedError(
                 f"{type(self).__name__} honors a pinned QuantConfig.nvfp4_4over6 "
@@ -4190,7 +4190,7 @@ class CuteDslRunner(MoERunner):
         # _cute_dsl_fused_moe_nvfp4_impl.
         self._forward_kwargs = (
             {}
-            if nvfp4_4over6_is_from_env(self.config.quant.nvfp4_4over6)
+            if self.config.quant.nvfp4_4over6 is _UNSET
             else {"nvfp4_4over6": self.config.quant.nvfp4_4over6}
         )
         # tuning_config is an instance attribute on the inner runner (its

@@ -78,11 +78,9 @@ from ...quantization.kernels.nvfp4_quantize import (
     nvfp4_quantize_per_token_cute_dsl,
 )
 from ...quantization.nvfp4_quantization_utils import (
+    _UNSET,
     FLOAT4_E2M1_MAX,
     NVFP44Over6Config,
-    NVFP44Over6Setting,
-    NVFP4Recipe,
-    nvfp4_4over6_is_from_env,
     nvfp4_e4m3_max,
     resolve_nvfp4_4over6,
 )
@@ -299,7 +297,7 @@ def _moe_core_impl(
     swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
     situ_beta: Optional[float] = None,
     situ_linear_beta: Optional[float] = None,
-    nvfp4_4over6: NVFP44Over6Setting = NVFP4Recipe.FROM_ENV,
+    nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
 ) -> torch.Tensor:
     """Core MoE implementation shared by functional and wrapper APIs.
 
@@ -356,10 +354,10 @@ def _moe_core_impl(
         situ_beta: When set with ActivationType.Swiglu, use the SiTU gate.
         situ_linear_beta: Optional SiTU tanh clamp for the up branch.
         nvfp4_4over6: NVFP4 4over6 recipe for the GEMM2-input quantization.
-            NVFP4Recipe.FROM_ENV (the default) reads FLASHINFER_NVFP4_4OVER6
-            and friends on every call, NVFP4Recipe.STANDARD turns 4over6 off
-            regardless of the environment, and an NVFP44Over6Config pins that
-            exact recipe with no per-field merge. Only consulted when
+            Omitted (the default) reads FLASHINFER_NVFP4_4OVER6 and friends
+            on every call, None turns 4over6 off regardless of the
+            environment, and an NVFP44Over6Config pins that exact recipe
+            with no per-field merge. Only consulted when
             per_token_scale is given: without it the GEMM2 input comes out of
             GEMM1's NVFP4 epilogue, which has no 4over6 variant. Pinning a
             recipe also pins fc2_input_scale to 1 / (6 * e4m3_max) -- what
@@ -414,11 +412,11 @@ def _moe_core_impl(
     # fc2_input_scale came from the same recipe.  Resolved here instead of
     # forwarded, because below the resolve boundary ``None`` means "4over6
     # off" while the quantizer's ``nvfp4_4over6=`` parameter reads it as "from
-    # the environment".  FROM_ENV (the default) is left unresolved and
+    # the environment".  An omitted argument (the default) is left unresolved and
     # unchecked on purpose: it must stay byte-for-byte the pre-existing
     # behaviour, and the default path then reads neither the environment here
     # nor the scale off the device at all.
-    if use_per_token_activation and not nvfp4_4over6_is_from_env(nvfp4_4over6):
+    if use_per_token_activation and nvfp4_4over6 is not _UNSET:
         _check_gemm2_input_scale(fc2_input_scale, resolve_nvfp4_4over6(nvfp4_4over6))
 
     if moe_output is None:
@@ -1172,7 +1170,7 @@ def _cute_dsl_fused_moe_impl(
     swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
     situ_beta: Optional[float] = None,
     situ_linear_beta: Optional[float] = None,
-    nvfp4_4over6: NVFP44Over6Setting = NVFP4Recipe.FROM_ENV,
+    nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
 ) -> torch.Tensor:
     """Internal implementation called by auto-tuner for functional API."""
     return _moe_core_impl(
