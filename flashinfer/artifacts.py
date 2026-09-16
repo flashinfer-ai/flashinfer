@@ -305,7 +305,6 @@ def download_artifacts() -> None:
     cubin_files = list[tuple[str, str]](get_subdir_file_list())
     num_threads = int(os.environ.get("FLASHINFER_CUBIN_DOWNLOAD_THREADS", "4"))
     max_retries = int(os.environ.get("FLASHINFER_CUBIN_MAX_RETRIES", "10"))
-    download_timeout = int(os.environ.get("FLASHINFER_CUBIN_TIMEOUT", "30"))
 
     cached_files: set[str] = set()
     files_to_download: list[tuple[str, str]] = []
@@ -346,7 +345,6 @@ def download_artifacts() -> None:
                     source,
                     str(local_path),
                     retries=max_retries,
-                    timeout=download_timeout,
                     session=session,
                 )
                 fut.add_done_callback(update_pbar_cb)

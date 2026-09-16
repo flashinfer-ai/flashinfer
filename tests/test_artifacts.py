@@ -543,8 +543,8 @@ def test_download_artifacts_reuses_checksum_verified_cache(monkeypatch, tmp_path
         assert (cubin_dir / name).read_bytes() == payload
 
 
-def test_download_artifacts_uses_env_retry_and_timeout(monkeypatch, tmp_path):
-    """Download calls use retry and timeout values configured via env vars."""
+def test_download_artifacts_uses_env_retry(monkeypatch, tmp_path):
+    """Download calls use retry values configured via env vars."""
     from flashinfer import artifacts
 
     cubin_dir = tmp_path / "cubins"
@@ -552,7 +552,6 @@ def test_download_artifacts_uses_env_retry_and_timeout(monkeypatch, tmp_path):
     monkeypatch.setattr(artifacts, "FLASHINFER_CUBINS_REPOSITORY", "https://example/")
     monkeypatch.setenv("FLASHINFER_CUBIN_DOWNLOAD_THREADS", "1")
     monkeypatch.setenv("FLASHINFER_CUBIN_MAX_RETRIES", "11")
-    monkeypatch.setenv("FLASHINFER_CUBIN_TIMEOUT", "29")
 
     payload = b"downloaded"
     monkeypatch.setattr(
@@ -574,7 +573,7 @@ def test_download_artifacts_uses_env_retry_and_timeout(monkeypatch, tmp_path):
 
     assert len(kwargs_seen) == 1
     assert kwargs_seen[0]["retries"] == 11
-    assert kwargs_seen[0]["timeout"] == 29
+    assert "timeout" not in kwargs_seen[0]
     assert kwargs_seen[0]["session"] is not None
 
 
