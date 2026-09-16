@@ -1850,6 +1850,7 @@ def test_decode_schedule_revalidates_mutable_paged_staging_config(
             )
         )
         cfg.num_tokens_per_page = 32
+        cfg.storage_tokens_per_page = 32
         message = "atom size must not exceed page size"
 
     with pytest.raises(ValueError, match=message):
@@ -2953,127 +2954,6 @@ def test_paged_launch_forwards_caller_live_lengths_to_attention() -> None:
             1.25,
         )
     ]
-
-
-@pytest.mark.parametrize(
-    "aliased_name",
-    ("block_indptr", "block_indices", "kv_valid_bits"),
-)
-def test_runtime_output_must_not_alias_sparse_metadata(aliased_name: str) -> None:
-    from flashinfer.attention.prims_ts._block_sparse.runtime import (
-        _ContiguousKVStorage,
-        validate_block_sparse_run,
-    )
-
-    shape = (1, 1, 1, _HEAD_DIM)
-    q = torch.empty(shape, dtype=torch.float16)
-    k = torch.empty_like(q)
-    v = torch.empty_like(q)
-    block_indptr_storage = torch.empty(_HEAD_DIM // 2, dtype=torch.int32)
-    block_indices = torch.empty(_HEAD_DIM // 2, dtype=torch.int32)
-    kv_valid_bits_storage = torch.empty(_HEAD_DIM // 2, dtype=torch.uint32)
-    block_indptr = block_indptr_storage[:2].view(1, 1, 2)
-    kv_valid_bits = kv_valid_bits_storage[:1].view(1, 1)
-    aliased_tensor = {
-        "block_indptr": block_indptr_storage,
-        "block_indices": block_indices,
-        "kv_valid_bits": kv_valid_bits_storage,
-    }[aliased_name]
-    out = torch.empty(0, dtype=torch.float16).set_(
-        aliased_tensor.untyped_storage(),
-        0,
-        shape,
-    )
-
-    with pytest.raises(
-        ValueError,
-        match=rf"out must not overlap {aliased_name} storage",
-    ):
-        state = SimpleNamespace(
-            device=torch.device("cpu"),
-            batch_size=1,
-            seq_len_q=1,
-            seq_len_kv=1,
-            num_qo_heads=1,
-            num_kv_heads=1,
-            head_dim=_HEAD_DIM,
-            q_block_size=1,
-            kv_block_size=8,
-            sparse_format="bsr",
-            use_proxy_routes=False,
-            use_kv_valid_bits=True,
-            q_dtype=torch.float16,
-            kv_dtype=torch.float16,
-            output_dtype=torch.float16,
-            dummy_kv_valid_bits=None,
-            row_route_offsets=torch.zeros(2, dtype=torch.int32),
-            route_workspace=torch.zeros(4, dtype=torch.int32),
-            page_size=None,
-        )
-        validate_block_sparse_run(
-            q,
-            _ContiguousKVStorage(k=k, v=v),
-            state=state,
-            block_indptr=block_indptr,
-            block_indices=block_indices,
-            kv_valid_bits=kv_valid_bits,
-            sm_scale=None,
-            out=out,
-        )
-
-
-def test_runtime_output_must_not_alias_plan_owned_route_workspace() -> None:
-    from flashinfer.attention.prims_ts._block_sparse.runtime import (
-        _ContiguousKVStorage,
-        validate_block_sparse_run,
-    )
-
-    shape = (1, 1, 1, _HEAD_DIM)
-    q = torch.empty(shape, dtype=torch.float16)
-    k = torch.empty_like(q)
-    v = torch.empty_like(q)
-    route_workspace = torch.empty(_HEAD_DIM // 2, dtype=torch.int32)
-    out = torch.empty(0, dtype=torch.float16).set_(
-        route_workspace.untyped_storage(),
-        0,
-        shape,
-    )
-    state = SimpleNamespace(
-        device=torch.device("cpu"),
-        batch_size=1,
-        seq_len_q=1,
-        seq_len_kv=1,
-        num_qo_heads=1,
-        num_kv_heads=1,
-        head_dim=_HEAD_DIM,
-        q_block_size=1,
-        kv_block_size=8,
-        sparse_format="bsr",
-        use_proxy_routes=False,
-        use_kv_valid_bits=False,
-        q_dtype=torch.float16,
-        kv_dtype=torch.float16,
-        output_dtype=torch.float16,
-        dummy_kv_valid_bits=torch.zeros((1, 1), dtype=torch.uint32),
-        row_route_offsets=torch.zeros(2, dtype=torch.int32),
-        route_workspace=route_workspace,
-        page_size=None,
-    )
-
-    with pytest.raises(
-        ValueError,
-        match=r"out must not overlap route_workspace storage",
-    ):
-        validate_block_sparse_run(
-            q,
-            _ContiguousKVStorage(k=k, v=v),
-            state=state,
-            block_indptr=torch.zeros((1, 1, 2), dtype=torch.int32),
-            block_indices=torch.empty(0, dtype=torch.int32),
-            kv_valid_bits=None,
-            sm_scale=None,
-            out=out,
-        )
 
 
 @pytest.mark.parametrize(

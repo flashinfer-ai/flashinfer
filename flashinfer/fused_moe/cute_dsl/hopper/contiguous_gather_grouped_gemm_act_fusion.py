@@ -75,6 +75,71 @@ class Sm90ContiguousGatherGroupedGemmActFusionKernel:
     must be masked downstream.
     """
 
+    @staticmethod
+    def is_valid_tile_and_cluster_shape(
+        tile_shape_mn: tuple[int, int],
+        cluster_shape_mn: tuple[int, int],
+    ) -> bool:
+        """Tile and cluster constraints of the kernel itself: M in {64, 128},
+        N a multiple of 64 (up/gate pairs of 32-column epilogue subtiles) up
+        to 256 (N > 128 runs on two consumer warpgroups at M = 128 and on one
+        at M = 64), cluster (1, 1) or (2, 1)."""
+        tile_m, tile_n = tile_shape_mn
+        return (
+            tile_m in (64, 128)
+            and tile_n % 64 == 0
+            and 64 <= tile_n <= 256
+            and cluster_shape_mn in ((1, 1), (2, 1))
+        )
+
+    @classmethod
+    def can_implement(
+        cls,
+        a_dtype: type[cutlass.Numeric],
+        b_dtype: type[cutlass.Numeric],
+        c_dtype: type[cutlass.Numeric],
+        tile_shape_mn: tuple[int, int],
+        cluster_shape_mn: tuple[int, int],
+        m: int,
+        n: int,
+        k: int,
+        l: int,  # noqa: E741
+        swizzle_size: int = 1,
+    ) -> bool:
+        """Whether the kernel can run this problem with these options.
+
+        :param a_dtype: activation dtype, bf16 or fp16, equal to ``b_dtype``
+        :param b_dtype: weight dtype
+        :param c_dtype: intermediate (output) dtype, bf16 or fp16
+        :param tile_shape_mn: CTA tile (M, N); M is ``moe_sort``'s tile size
+        :param cluster_shape_mn: (1, 1) or (2, 1)
+        :param m: permuted rows, a multiple of the M tile (``moe_sort`` pads
+            every expert to whole tiles); (2, 1) also needs an even M-tile
+            count so that every CTA pair is complete
+        :param n: ``2I``, a multiple of the N tile (the epilogue writes full
+            N tiles)
+        :param k: hidden size, a multiple of the 64-element K tile (the
+            gather loader moves whole K tiles)
+        :param l: local experts, at least 1
+        :param swizzle_size: persistent-walk swizzle, a positive int
+        """
+        if (
+            a_dtype.width != 16
+            or a_dtype != b_dtype
+            or c_dtype not in (cutlass.BFloat16, cutlass.Float16)
+        ):
+            return False
+        if not cls.is_valid_tile_and_cluster_shape(tile_shape_mn, cluster_shape_mn):
+            return False
+        if not isinstance(swizzle_size, int) or swizzle_size < 1:
+            return False
+        tile_m, tile_n = tile_shape_mn
+        if m % tile_m != 0 or n % tile_n != 0 or k % 64 != 0 or l < 1:
+            return False
+        if cluster_shape_mn == (2, 1) and (m // tile_m) % 2 != 0:
+            return False
+        return True
+
     def __init__(
         self,
         acc_dtype: type[cutlass.Numeric],
@@ -98,8 +163,11 @@ class Sm90ContiguousGatherGroupedGemmActFusionKernel:
         written to its own padded C tile) — required because the cluster
         empty-barrier arrivals are static. A is per-CTA cp.async (never
         multicast)."""
-        if cluster_shape_mn not in ((1, 1), (2, 1)):
-            raise ValueError("cluster_shape_mn must be (1, 1) or (2, 1)")
+        if not self.is_valid_tile_and_cluster_shape(tile_shape_mn, cluster_shape_mn):
+            raise ValueError(
+                f"unsupported tile_shape_mn={tile_shape_mn}, "
+                f"cluster_shape_mn={cluster_shape_mn}"
+            )
         self.acc_dtype = acc_dtype
         self.topk = topk
         self.cluster_shape_mn = cluster_shape_mn
@@ -153,14 +221,6 @@ class Sm90ContiguousGatherGroupedGemmActFusionKernel:
         )
 
     def _setup_attributes(self):
-        if self.tile_shape_mnk[0] not in [64, 128]:
-            raise ValueError("CTA tile shape M must be 64/128")
-        if self.tile_shape_mnk[1] % 64 != 0 or not 64 <= self.tile_shape_mnk[1] <= 256:
-            raise ValueError(
-                "CTA tile shape N must be a multiple of 64 (up/gate pairs of "
-                "32-col epilogue subtiles), <= 256"
-            )
-
         self.tiled_mma = sm90_utils.make_trivial_tiled_mma(
             self.a_dtype,
             self.b_dtype,

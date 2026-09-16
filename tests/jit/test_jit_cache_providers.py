@@ -9,6 +9,7 @@ from types import ModuleType, SimpleNamespace
 import pytest
 
 from flashinfer.jit import env as jit_env
+from flashinfer.jit import core as jit_core
 
 
 class _FakeEntryPoint:
@@ -283,6 +284,67 @@ def test_jit_cache_version_rejects_unbounded_prefix(monkeypatch):
         jit_env._check_jit_cache_version("flashinfer-jit-cache", "0.6.10+cu130")
 
 
+def test_jit_cache_provider_version_requires_exact_cuda_release(monkeypatch):
+    monkeypatch.delenv("FLASHINFER_DISABLE_VERSION_CHECK", raising=False)
+    monkeypatch.setattr(jit_env, "flashinfer_version", "0.6.18")
+
+    jit_env._check_jit_cache_provider_version(
+        "flashinfer-jit-cache-sm90a", "0.6.18+cu130", "0.6.18+cu130"
+    )
+    with pytest.raises(RuntimeError, match="does not match flashinfer-jit-cache"):
+        jit_env._check_jit_cache_provider_version(
+            "flashinfer-jit-cache-sm90a", "0.6.18+cu134", "0.6.18+cu130"
+        )
+
+
+def test_aot_provider_discovery_skips_incompatible_provider(
+    monkeypatch, caplog, tmp_path
+):
+    monkeypatch.delenv("FLASHINFER_DISABLE_VERSION_CHECK", raising=False)
+    monkeypatch.setattr(jit_env, "flashinfer_version", "0.6.18")
+    monkeypatch.setattr(jit_env, "has_flashinfer_jit_cache", lambda: True)
+    stale_provider = SimpleNamespace(
+        provider_id="sm90a",
+        distribution="flashinfer-jit-cache-sm90a",
+        version="0.6.17+cu130",
+        jit_cache_dir=tmp_path,
+        cuda_architectures=frozenset({"sm90a"}),
+        modules=frozenset({"attention_module"}),
+    )
+    shim = SimpleNamespace(
+        __version__="0.6.18+cu130",
+        get_jit_cache_providers=lambda: (stale_provider,),
+    )
+    monkeypatch.setitem(sys.modules, "flashinfer_jit_cache", shim)
+
+    assert jit_env._get_aot_providers() == ()
+    assert "Ignoring incompatible flashinfer jit-cache provider" in caplog.text
+
+
+def test_aot_provider_discovery_skips_different_cuda_release(
+    monkeypatch, caplog, tmp_path
+):
+    monkeypatch.delenv("FLASHINFER_DISABLE_VERSION_CHECK", raising=False)
+    monkeypatch.setattr(jit_env, "flashinfer_version", "0.6.18")
+    monkeypatch.setattr(jit_env, "has_flashinfer_jit_cache", lambda: True)
+    wrong_cuda_provider = SimpleNamespace(
+        provider_id="sm90a",
+        distribution="flashinfer-jit-cache-sm90a",
+        version="0.6.18+cu134",
+        jit_cache_dir=tmp_path,
+        cuda_architectures=frozenset({"sm90a"}),
+        modules=frozenset({"attention_module"}),
+    )
+    shim = SimpleNamespace(
+        __version__="0.6.18+cu130",
+        get_jit_cache_providers=lambda: (wrong_cuda_provider,),
+    )
+    monkeypatch.setitem(sys.modules, "flashinfer_jit_cache", shim)
+
+    assert jit_env._get_aot_providers() == ()
+    assert "does not match flashinfer-jit-cache version" in caplog.text
+
+
 def test_jit_cache_build_setup_preserves_indexes_and_cleans_constraint(tmp_path):
     common_script = (
         Path(__file__).resolve().parents[2] / "scripts" / "jit_cache_build_common.sh"
@@ -319,8 +381,46 @@ test "${{PIP_BUILD_CONSTRAINT}}" = /tmp/original-build-constraint
     assert trap_marker.is_file()
 
 
-def test_native_provider_cuda_inspection_reports_no_ptx(
-    monkeypatch, tmp_path, provider_validation_module
+@pytest.mark.parametrize(
+    ("binary_target", "device_architecture", "expected"),
+    [
+        ("sm80", "sm86", True),
+        ("sm80", "sm89", True),
+        ("sm86", "sm80", False),
+        ("sm100", "sm107a", True),
+        ("sm100a", "sm103a", False),
+        ("sm100f", "sm103a", True),
+        ("sm100f", "sm107a", True),
+        ("sm103f", "sm107a", True),
+        ("sm107f", "sm107a", True),
+        ("sm107f", "sm103a", False),
+        ("sm120f", "sm121a", True),
+        ("sm121a", "sm120f", False),
+    ],
+)
+def test_cuda_binary_target_compatibility(
+    provider_validation_module, binary_target, device_architecture, expected
+):
+    assert (
+        provider_validation_module.cuda_binary_target_is_compatible(
+            binary_target, device_architecture
+        )
+        is expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("provider", "binary_target"),
+    [
+        ("sm120f", "sm120f"),
+        ("sm100a", "sm100"),
+        ("sm103a", "sm100"),
+        ("sm107a", "sm100"),
+        ("sm120f", "sm120"),
+    ],
+)
+def test_native_provider_cuda_inspection_accepts_compatible_sass(
+    monkeypatch, tmp_path, provider_validation_module, provider, binary_target
 ):
     wheel_path = tmp_path / "provider.whl"
     archive_path = "provider/jit_cache/test_module/test_module.so"
@@ -328,7 +428,7 @@ def test_native_provider_cuda_inspection_reports_no_ptx(
         archive.writestr(archive_path, b"test")
     wheel = provider_validation_module.Wheel(
         path=wheel_path,
-        distribution="flashinfer-jit-cache-sm120f",
+        distribution=f"flashinfer-jit-cache-{provider}",
         version="0.6.16+cu130",
         requirements=(),
         contents=(archive_path,),
@@ -340,7 +440,7 @@ def test_native_provider_cuda_inspection_reports_no_ptx(
     def mock_run(cmd, **_kwargs):
         if cmd[1] == "--list-elf":
             return subprocess.CompletedProcess(
-                cmd, 0, stdout="ELF file 1: test.sm120f.cubin\n", stderr=""
+                cmd, 0, stdout=f"ELF file 1: test.{binary_target}.cubin\n", stderr=""
             )
         assert cmd[1] == "--list-ptx"
         return subprocess.CompletedProcess(
@@ -355,13 +455,55 @@ def test_native_provider_cuda_inspection_reports_no_ptx(
     architectures, ptx_modules = provider_validation_module.inspect_cuda_architectures(
         wheel,
         {"test_module": archive_path},
-        "sm120f",
+        provider,
         cuobjdump,
         strict=True,
     )
 
-    assert architectures == {"test_module": ["sm120f"]}
+    assert architectures == {"test_module": [binary_target]}
     assert ptx_modules == []
+
+
+def test_native_provider_cuda_inspection_rejects_incompatible_sass(
+    monkeypatch, tmp_path, provider_validation_module
+):
+    wheel_path = tmp_path / "provider.whl"
+    archive_path = "provider/jit_cache/test_module/test_module.so"
+    with zipfile.ZipFile(wheel_path, "w") as archive:
+        archive.writestr(archive_path, b"test")
+    wheel = provider_validation_module.Wheel(
+        path=wheel_path,
+        distribution="flashinfer-jit-cache-sm103a",
+        version="0.6.16+cu130",
+        requirements=(),
+        contents=(archive_path,),
+        metadata_path="provider.dist-info/METADATA",
+    )
+    cuobjdump = tmp_path / "cuobjdump"
+    cuobjdump.touch()
+
+    def mock_run(cmd, **_kwargs):
+        if cmd[1] == "--list-elf":
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout="ELF file 1: test.sm100a.cubin\n", stderr=""
+            )
+        return subprocess.CompletedProcess(
+            cmd,
+            0,
+            stdout="",
+            stderr="cuobjdump info: No PTX file found to extract\n",
+        )
+
+    monkeypatch.setattr(provider_validation_module.subprocess, "run", mock_run)
+
+    with pytest.raises(ValueError, match="CUDA targets incompatible"):
+        provider_validation_module.inspect_cuda_architectures(
+            wheel,
+            {"test_module": archive_path},
+            "sm103a",
+            cuobjdump,
+            strict=True,
+        )
 
 
 def test_native_provider_cuda_inspection_rejects_ptx(
@@ -405,7 +547,7 @@ def test_native_provider_cuda_inspection_rejects_ptx(
 
 
 def test_get_aot_path_selects_provider_for_target_arch(monkeypatch, tmp_path):
-    legacy_root = tmp_path / "legacy"
+    fallback_root = tmp_path / "package-aot"
     sm80_root = tmp_path / "sm80"
     sm90_root = tmp_path / "sm90a"
     expected = _create_aot_module(sm90_root, "attention_module")
@@ -429,7 +571,7 @@ def test_get_aot_path_selects_provider_for_target_arch(monkeypatch, tmp_path):
             modules=frozenset({"attention_module"}),
         ),
     )
-    monkeypatch.setattr(jit_env, "FLASHINFER_AOT_DIR", legacy_root)
+    monkeypatch.setattr(jit_env, "FLASHINFER_AOT_DIR", fallback_root)
     monkeypatch.setattr(jit_env, "FLASHINFER_AOT_PROVIDERS", providers)
     monkeypatch.setattr(
         jit_env, "_target_cuda_architectures", lambda: frozenset({"sm90a"})
@@ -438,21 +580,56 @@ def test_get_aot_path_selects_provider_for_target_arch(monkeypatch, tmp_path):
     assert jit_env.get_aot_path("attention_module") == expected
 
 
+def test_get_aot_path_uses_best_compatible_provider(monkeypatch, tmp_path):
+    fallback_root = tmp_path / "package-aot"
+    sm80_root = tmp_path / "sm80"
+    sm89_root = tmp_path / "sm89"
+    expected = _create_aot_module(sm89_root, "attention_module")
+    _create_aot_module(sm80_root, "attention_module")
+    providers = (
+        jit_env.AOTProvider(
+            provider_id="sm80",
+            distribution="flashinfer-jit-cache-sm80",
+            version="0.6.16+cu130",
+            jit_cache_dir=sm80_root,
+            cuda_architectures=frozenset({"sm80"}),
+            modules=frozenset({"attention_module"}),
+        ),
+        jit_env.AOTProvider(
+            provider_id="sm89",
+            distribution="flashinfer-jit-cache-sm89",
+            version="0.6.16+cu130",
+            jit_cache_dir=sm89_root,
+            cuda_architectures=frozenset({"sm89"}),
+            modules=frozenset({"attention_module"}),
+        ),
+    )
+    monkeypatch.setattr(jit_env, "FLASHINFER_AOT_DIR", fallback_root)
+    monkeypatch.setattr(jit_env, "FLASHINFER_AOT_PROVIDERS", providers)
+    monkeypatch.setattr(
+        jit_env, "_target_cuda_architectures", lambda: frozenset({"sm89"})
+    )
+
+    assert jit_env.get_aot_path("attention_module") == expected
+
+
 @pytest.mark.parametrize(
-    ("provider_architecture", "target_architecture"),
+    ("provider_architecture", "target_architecture", "compatible"),
     [
-        ("sm100a", "sm103a"),
-        ("sm120f", "sm121a"),
-        ("sm80", "sm86"),
+        ("sm80", "sm86", True),
+        ("sm100f", "sm107a", True),
+        ("sm120f", "sm121a", True),
+        ("sm100a", "sm103a", False),
     ],
 )
-def test_get_aot_path_does_not_infer_provider_compatibility(
+def test_get_aot_path_applies_cuda_provider_compatibility(
     monkeypatch,
     tmp_path,
     provider_architecture,
     target_architecture,
+    compatible,
 ):
-    legacy_root = tmp_path / "legacy"
+    fallback_root = tmp_path / "package-aot"
     provider_root = tmp_path / provider_architecture
     _create_aot_module(provider_root, "attention_module")
     provider = jit_env.AOTProvider(
@@ -463,7 +640,7 @@ def test_get_aot_path_does_not_infer_provider_compatibility(
         cuda_architectures=frozenset({provider_architecture}),
         modules=frozenset({"attention_module"}),
     )
-    monkeypatch.setattr(jit_env, "FLASHINFER_AOT_DIR", legacy_root)
+    monkeypatch.setattr(jit_env, "FLASHINFER_AOT_DIR", fallback_root)
     monkeypatch.setattr(jit_env, "FLASHINFER_AOT_PROVIDERS", (provider,))
     monkeypatch.setattr(
         jit_env,
@@ -471,38 +648,122 @@ def test_get_aot_path_does_not_infer_provider_compatibility(
         lambda: frozenset({target_architecture}),
     )
 
+    expected_root = provider_root if compatible else fallback_root
     assert jit_env.get_aot_path("attention_module") == (
-        legacy_root / "attention_module" / "attention_module.so"
+        expected_root / "attention_module" / "attention_module.so"
     )
 
 
-def test_get_aot_path_requires_provider_to_cover_all_targets(monkeypatch, tmp_path):
-    legacy_root = tmp_path / "legacy"
-    provider_root = tmp_path / "sm90a"
+def test_get_aot_path_allows_provider_for_subset_of_targets(monkeypatch, tmp_path):
+    fallback_root = tmp_path / "package-aot"
+    provider_root = tmp_path / "sm103a"
     _create_aot_module(provider_root, "attention_module")
     provider = jit_env.AOTProvider(
-        provider_id="sm90a",
-        distribution="flashinfer-jit-cache-sm90a",
+        provider_id="sm103a",
+        distribution="flashinfer-jit-cache-sm103a",
         version="0.6.16+cu130",
         jit_cache_dir=provider_root,
-        cuda_architectures=frozenset({"sm90a"}),
+        cuda_architectures=frozenset({"sm103a"}),
         modules=frozenset({"attention_module"}),
     )
-    monkeypatch.setattr(jit_env, "FLASHINFER_AOT_DIR", legacy_root)
+    monkeypatch.setattr(jit_env, "FLASHINFER_AOT_DIR", fallback_root)
     monkeypatch.setattr(jit_env, "FLASHINFER_AOT_PROVIDERS", (provider,))
     monkeypatch.setattr(
         jit_env,
         "_target_cuda_architectures",
-        lambda: frozenset({"sm80", "sm90a"}),
+        lambda: frozenset({"sm103a", "sm120f"}),
     )
 
     assert jit_env.get_aot_path("attention_module") == (
-        legacy_root / "attention_module" / "attention_module.so"
+        provider_root / "attention_module" / "attention_module.so"
     )
 
 
+def test_jit_spec_dispatches_heterogeneous_aot_modules(monkeypatch, tmp_path):
+    sm103_path = tmp_path / "sm103a.so"
+    sm120_path = tmp_path / "sm120f.so"
+    artifacts = (
+        jit_env.AOTArtifact("sm103a", sm103_path, frozenset({"sm103a"})),
+        jit_env.AOTArtifact("sm120f", sm120_path, frozenset({"sm120f"})),
+    )
+    modules = {
+        sm103_path: SimpleNamespace(run=lambda: "sm103a"),
+        sm120_path: SimpleNamespace(run=lambda: "sm120f"),
+    }
+    jit_module = SimpleNamespace(run=lambda: "jit")
+    spec = jit_core.JitSpecNvcc(
+        name="attention_module",
+        sources=[],
+        extra_cflags=None,
+        extra_cuda_cflags=None,
+        extra_ldflags=None,
+        extra_include_dirs=None,
+    )
+    monkeypatch.setattr(jit_env, "get_aot_artifacts", lambda _name: artifacts)
+    monkeypatch.setattr(
+        jit_env,
+        "_target_cuda_architectures",
+        lambda: frozenset({"sm103a", "sm120f"}),
+    )
+    monkeypatch.setattr(spec, "load", lambda path=None: modules[path])
+    monkeypatch.setattr(spec, "_build_and_load_jit_fallback", lambda: jit_module)
+    call_targets = {"value": frozenset({"sm103a"})}
+    monkeypatch.setattr(
+        jit_env,
+        "_cuda_architectures_for_call",
+        lambda _args, _kwargs: call_targets["value"],
+    )
+
+    assert spec.get_library_paths() == (sm103_path, sm120_path)
+
+    module = spec.try_load()
+    assert isinstance(module, jit_core._HeterogeneousAOTModule)
+    assert module.run() == "sm103a"
+
+    call_targets["value"] = frozenset({"sm120f"})
+    assert module.run() == "sm120f"
+
+    call_targets["value"] = frozenset({"sm103a", "sm120f"})
+    assert module.run() == "jit"
+
+
+def test_jit_spec_uses_partial_aot_provider_on_matching_device(monkeypatch, tmp_path):
+    sm103_path = tmp_path / "sm103a.so"
+    artifacts = (jit_env.AOTArtifact("sm103a", sm103_path, frozenset({"sm103a"})),)
+    sm103_module = SimpleNamespace(run=lambda: "sm103a")
+    spec = jit_core.JitSpecNvcc(
+        name="sm103_attention_module",
+        sources=[],
+        extra_cflags=None,
+        extra_cuda_cflags=None,
+        extra_ldflags=None,
+        extra_include_dirs=None,
+    )
+    monkeypatch.setattr(jit_env, "get_aot_artifacts", lambda _name: artifacts)
+    monkeypatch.setattr(
+        jit_env,
+        "_target_cuda_architectures",
+        lambda: frozenset({"sm103a", "sm120f"}),
+    )
+    monkeypatch.setattr(spec, "load", lambda path=None: sm103_module)
+    monkeypatch.setattr(
+        spec,
+        "_build_and_load_jit_fallback",
+        lambda: pytest.fail("matching partial provider should not trigger JIT"),
+    )
+    monkeypatch.setattr(
+        jit_env,
+        "_cuda_architectures_for_call",
+        lambda _args, _kwargs: frozenset({"sm103a"}),
+    )
+
+    module = spec.try_load()
+    assert isinstance(module, jit_core._HeterogeneousAOTModule)
+    assert module.run() == "sm103a"
+
+
 def test_get_aot_path_does_not_guess_when_target_is_unknown(monkeypatch, tmp_path):
-    legacy_root = tmp_path / "legacy"
+    fallback_root = tmp_path / "package-aot"
     provider_root = tmp_path / "sm80"
     _create_aot_module(provider_root, "attention_module")
     provider = jit_env.AOTProvider(
@@ -513,19 +774,19 @@ def test_get_aot_path_does_not_guess_when_target_is_unknown(monkeypatch, tmp_pat
         cuda_architectures=frozenset({"sm80"}),
         modules=frozenset({"attention_module"}),
     )
-    monkeypatch.setattr(jit_env, "FLASHINFER_AOT_DIR", legacy_root)
+    monkeypatch.setattr(jit_env, "FLASHINFER_AOT_DIR", fallback_root)
     monkeypatch.setattr(jit_env, "FLASHINFER_AOT_PROVIDERS", (provider,))
     monkeypatch.setattr(jit_env, "_target_cuda_architectures", lambda: frozenset())
 
     assert jit_env.get_aot_path("attention_module") == (
-        legacy_root / "attention_module" / "attention_module.so"
+        fallback_root / "attention_module" / "attention_module.so"
     )
 
 
-def test_get_aot_path_prefers_legacy_monolithic_wheel(monkeypatch, tmp_path):
-    legacy_root = tmp_path / "legacy"
+def test_get_aot_path_prefers_bundled_package_module(monkeypatch, tmp_path):
+    fallback_root = tmp_path / "package-aot"
     provider_root = tmp_path / "sm80"
-    expected = _create_aot_module(legacy_root, "attention_module")
+    expected = _create_aot_module(fallback_root, "attention_module")
     _create_aot_module(provider_root, "attention_module")
     provider = jit_env.AOTProvider(
         provider_id="sm80",
@@ -535,7 +796,7 @@ def test_get_aot_path_prefers_legacy_monolithic_wheel(monkeypatch, tmp_path):
         cuda_architectures=frozenset({"sm80"}),
         modules=frozenset({"attention_module"}),
     )
-    monkeypatch.setattr(jit_env, "FLASHINFER_AOT_DIR", legacy_root)
+    monkeypatch.setattr(jit_env, "FLASHINFER_AOT_DIR", fallback_root)
     monkeypatch.setattr(jit_env, "FLASHINFER_AOT_PROVIDERS", (provider,))
     monkeypatch.setattr(
         jit_env, "_target_cuda_architectures", lambda: frozenset({"sm80"})

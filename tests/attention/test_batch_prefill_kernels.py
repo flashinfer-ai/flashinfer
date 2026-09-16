@@ -20,6 +20,7 @@ import numpy
 import pytest
 import torch
 from tests.test_helpers.jit_utils import gen_prefill_attention_modules
+from tests.test_helpers.paged_kv import make_padded_paged_kv_view
 
 import flashinfer
 from tests.test_helpers.test_helpers import assert_close_chunked, ref_single_prefill
@@ -336,6 +337,173 @@ def test_batch_prefill_with_paged_kv_cache(
         o_i = o[q_indptr_cpu[i] : q_indptr_cpu[i + 1]]
         _accumulate_mismatch_count(mismatch_counts, o_i, o_ref_i, rtol=1e-3, atol=1e-3)
     _assert_no_ref_mismatch(mismatch_counts)
+
+
+@pytest.mark.parametrize("kv_layout,head_dim", [("NHD", 64), ("HND", 128)])
+def test_batch_prefill_lazy_stride_router_plan_reuse(kv_layout, head_dim):
+    """Reuse one equal-primary plan across equal/unequal/equal paged runs."""
+    torch.manual_seed(42)
+    batch_size, qo_len, kv_len, page_size = 2, 17, 97, 16
+    num_qo_heads, num_kv_heads = 8, 2
+    pages_per_request = (kv_len + page_size - 1) // page_size
+    total_pages = batch_size * pages_per_request
+
+    q = torch.randn(
+        batch_size * qo_len,
+        num_qo_heads,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    if kv_layout == "NHD":
+        cache_shape = (total_pages, page_size, num_kv_heads, head_dim)
+        to_dense = lambda cache: cache.reshape(-1, num_kv_heads, head_dim)
+    else:
+        cache_shape = (total_pages, num_kv_heads, page_size, head_dim)
+        to_dense = lambda cache: cache.permute(0, 2, 1, 3).reshape(
+            -1, num_kv_heads, head_dim
+        )
+
+    k = torch.randn(cache_shape, device="cuda", dtype=torch.bfloat16) / 4
+    v_equal = torch.randn(cache_shape, device="cuda", dtype=torch.bfloat16) / 4
+    v_unequal = make_padded_paged_kv_view(v_equal, kv_layout)
+    assert k.shape == v_equal.shape == v_unequal.shape
+    assert k.stride() == v_equal.stride()
+    assert k.stride() != v_unequal.stride()
+
+    qo_indptr = (
+        torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * qo_len
+    )
+    kv_indptr = (
+        torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32)
+        * pages_per_request
+    )
+    kv_indices = torch.arange(total_pages, device="cuda", dtype=torch.int32)
+    last_page_len = torch.full(
+        (batch_size,),
+        (kv_len - 1) % page_size + 1,
+        device="cuda",
+        dtype=torch.int32,
+    )
+
+    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        torch.empty(128 * 1024 * 1024, device="cuda", dtype=torch.uint8),
+        kv_layout,
+        backend="fa2",
+    )
+    wrapper.plan(
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        causal=True,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+        fixed_split_size=2,
+    )
+    plan_info = tuple(wrapper._plan_info)
+    outputs = [
+        wrapper.run(q, cache) for cache in ((k, v_equal), (k, v_unequal), (k, v_equal))
+    ]
+    assert tuple(wrapper._plan_info) == plan_info
+
+    expected_batches = []
+    for batch_idx in range(batch_size):
+        q_i = q[batch_idx * qo_len : (batch_idx + 1) * qo_len]
+        page_slice = slice(
+            batch_idx * pages_per_request,
+            (batch_idx + 1) * pages_per_request,
+        )
+        expected_i, _ = ref_single_prefill(
+            q_i,
+            to_dense(k[page_slice])[:kv_len],
+            to_dense(v_equal[page_slice])[:kv_len],
+            causal=True,
+        )
+        expected_batches.append(expected_i)
+    expected = torch.cat(expected_batches)
+    for output in outputs:
+        torch.testing.assert_close(output, expected, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(outputs[0], outputs[1], rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(outputs[0], outputs[2], rtol=1e-2, atol=1e-2)
+
+
+def test_batch_prefill_lazy_stride_router_nvfp4():
+    """Route on data strides while preserving independent NVFP4 scale strides."""
+    torch.manual_seed(42)
+    batch_size, qo_len, kv_len, page_size = 1, 17, 33, 16
+    num_qo_heads, num_kv_heads, head_dim = 4, 2, 128
+    pages_per_request = (kv_len + page_size - 1) // page_size
+    total_pages = batch_size * pages_per_request
+
+    q = torch.randn(
+        batch_size * qo_len,
+        num_qo_heads,
+        head_dim,
+        device="cuda",
+        dtype=torch.float16,
+    )
+    packed_shape = (total_pages, page_size, num_kv_heads, head_dim // 2)
+    k_packed, k_sf, k_scale = create_nvfp4_kv(packed_shape, "cuda")
+    v_packed, v_sf, v_scale = create_nvfp4_kv(packed_shape, "cuda")
+    v_packed_unequal = make_padded_paged_kv_view(v_packed, "NHD")
+    k_sf_unequal = make_padded_paged_kv_view(k_sf, "NHD", padding_heads=1)
+    v_sf_unequal = make_padded_paged_kv_view(v_sf, "NHD", padding_heads=3)
+    assert k_packed.stride() == v_packed.stride()
+    assert k_packed.stride() != v_packed_unequal.stride()
+    assert k_sf_unequal.stride() != v_sf_unequal.stride()
+
+    qo_indptr = torch.tensor([0, qo_len], device="cuda", dtype=torch.int32)
+    kv_indptr = torch.tensor([0, pages_per_request], device="cuda", dtype=torch.int32)
+    kv_indices = torch.arange(total_pages, device="cuda", dtype=torch.int32)
+    last_page_len = torch.tensor(
+        [(kv_len - 1) % page_size + 1], device="cuda", dtype=torch.int32
+    )
+    custom_mask = torch.tril(
+        torch.ones(qo_len, kv_len, device="cuda", dtype=torch.bool),
+        diagonal=kv_len - qo_len,
+    ).flatten()
+    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        torch.empty(128 * 1024 * 1024, device="cuda", dtype=torch.uint8),
+        "NHD",
+        backend="fa2",
+    )
+    wrapper.plan(
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        custom_mask=custom_mask,
+        q_data_type=torch.float16,
+        kv_data_type=torch.uint8,
+    )
+    plan_info = tuple(wrapper._plan_info)
+    equal_output = wrapper.run(
+        q,
+        (k_packed, v_packed),
+        kv_cache_sf=(k_sf_unequal, v_sf_unequal),
+        k_scale=k_scale.item(),
+        v_scale=v_scale.item(),
+    )
+
+    wrapper.prewarm_paged_kv_stride_variant("independent")
+    unequal_output = wrapper.run(
+        q,
+        (k_packed, v_packed_unequal),
+        kv_cache_sf=(k_sf_unequal, v_sf_unequal),
+        k_scale=k_scale.item(),
+        v_scale=v_scale.item(),
+    )
+    assert tuple(wrapper._plan_info) == plan_info
+    torch.testing.assert_close(unequal_output, equal_output, rtol=1e-3, atol=1e-3)
 
 
 @pytest.mark.parametrize("causal", [False, True])

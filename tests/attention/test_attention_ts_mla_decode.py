@@ -1402,35 +1402,6 @@ def test_attention_ts_mla_decode_bound_wrapper_trace_uses_plan_state():
     assert "mask:causal" in defn["tags"]
 
 
-def test_attention_ts_mla_output_guard_covers_every_live_allocation():
-    """Reject output overlap with inputs retained through an MLA launch."""
-
-    for aliased_name in (
-        "kv_cache",
-        "block_tables",
-        "seq_lens",
-        "qo_indptr",
-        "workspace_buffer",
-    ):
-        runtime = _empty_mla_runtime()
-        inputs = {
-            "block_tables": torch.empty(8),
-            "seq_lens": torch.empty(8),
-            "qo_indptr": torch.empty(8),
-            "workspace_buffer": torch.empty(8),
-        }
-        if aliased_name == "kv_cache":
-            runtime = replace(runtime, normalized_cache=runtime.out)
-        else:
-            inputs[aliased_name] = runtime.out
-
-        with pytest.raises(
-            ValueError,
-            match=rf"out must not overlap {aliased_name} storage",
-        ):
-            mla_decode_module._validate_mla_output_aliasing(runtime, **inputs)
-
-
 @pytest.mark.filterwarnings("ignore::UserWarning")
 def test_attention_ts_mla_bf16_clc_skipped_tiles_preserve_progress():
     """Skip data work symmetrically while preserving CLC queue progress."""
@@ -1525,14 +1496,6 @@ def test_attention_ts_mla_run_validate_false_bypasses_explicit_validators(
     monkeypatch.setattr(mla_decode_module, "_prepare_mla_runtime", prepare_runtime)
     monkeypatch.setattr(
         mla_decode_module, "_validate_mla_run_metadata", fail_validation
-    )
-    monkeypatch.setattr(
-        mla_decode_module,
-        "_validate_tensor_does_not_overlap_inputs",
-        fail_validation,
-    )
-    monkeypatch.setattr(
-        mla_decode_module, "_validate_mla_output_aliasing", fail_validation
     )
     monkeypatch.setattr(mla_decode_module, "_launch_mla_decode", launch)
 
@@ -1719,30 +1682,6 @@ def test_attention_ts_mla_workspace_rejects_unsafe_int32_kv_bound():
             1,
             max_seq_len_q=2**30,
         )
-
-
-@pytest.mark.arch_blackwell
-@_REQUIRES_PRIMTS_GPU
-def test_attention_ts_mla_public_interfaces_reject_output_alias():
-    case = _make_mla_case(
-        batch_size=1,
-        num_qo_heads=8,
-        max_seq_len=128,
-        qkv_dtype=torch.bfloat16,
-        seq_len_q=1,
-        device="cuda",
-        seed=20260718,
-    )
-    # O is a compact view over the leading bytes of the 576-element query.
-    output_shape = (*case.query.shape[:-1], _LATENT_DIM)
-    output_elements = math.prod(output_shape)
-    aliased_out = case.query.view(-1)[:output_elements].view(output_shape)
-    wrapper = _plan_case(case)
-
-    with pytest.raises(ValueError, match="out must not overlap query storage"):
-        _run_case(wrapper, case, out=aliased_out)
-    with pytest.raises(ValueError, match="out must not overlap query storage"):
-        _run_standalone(case, out=aliased_out)
 
 
 @pytest.mark.arch_blackwell

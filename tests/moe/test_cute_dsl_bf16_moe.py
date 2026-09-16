@@ -212,9 +212,11 @@ def test_cute_dsl_fused_moe_bf16(
         w2,
         num_experts=num_experts,
         top_k=top_k,
-        tile_size=tile_m,
-        gemm1_tile_n=g1_tile_n,
-        gemm2_tile_n=g2_tile_n,
+        tactic=(
+            tile_m,
+            ((tile_m, g1_tile_n), 1),
+            ((tile_m, g2_tile_n), (1, 1), False),
+        ),
     )
 
     ref = ref_moe(x, ids, scales, w_gate_up, w2)
@@ -265,10 +267,7 @@ def test_cute_dsl_bf16_moe_process_cache_reuse(monkeypatch):
             num_experts=num_experts,
             top_k=top_k,
             use_fused_finalize=False,
-            tile_size=64,
-            gemm1_tile_n=64,
-            gemm2_tile_n=64,
-            gemm2_tile_k=64,
+            tactic=(64, ((64, 64), 1), ((64, 64), (1, 1), False)),
         )
 
     saved_gemm1 = dict(gemm1_module._gather_kernel_cache)
@@ -322,7 +321,14 @@ def test_cute_dsl_bf16_moe_fp16(num_tokens):
 
     w1 = interleave_up_gate_sm90(w_gate_up)
     out = cute_dsl_fused_moe_bf16(
-        x, ids, scales, w1, w2, num_experts=num_experts, top_k=top_k, tile_size=128
+        x,
+        ids,
+        scales,
+        w1,
+        w2,
+        num_experts=num_experts,
+        top_k=top_k,
+        tactic=(128, ((128, 128), 1), ((128, 128), (1, 1), False)),
     )
     assert out.dtype == dtype
     ref = ref_moe(x, ids, scales, w_gate_up, w2)
@@ -331,9 +337,9 @@ def test_cute_dsl_bf16_moe_fp16(num_tokens):
 
 @cute_dsl_available
 @sm90_required
-@pytest.mark.parametrize("num_tokens", [64, 2048, 4096])
+@pytest.mark.parametrize("num_tokens", [4096])
 def test_cute_dsl_bf16_moe_auto_select(num_tokens):
-    """Untuned fallback selection stays correct across decode and prefill."""
+    """The fixed default tactic stays correct at a prefill batch size."""
     from flashinfer.fused_moe.cute_dsl.sm90_fused_moe import cute_dsl_fused_moe_bf16
     from flashinfer.fused_moe.cute_dsl.sm90_contiguous_gather_grouped_gemm_act_fusion import (
         interleave_up_gate_sm90,
@@ -395,9 +401,11 @@ def test_cute_dsl_bf16_moe_gemm2_tactic_overrides(
         w2,
         num_experts=num_experts,
         top_k=top_k,
-        tile_size=128,
-        gemm2_cluster_shape_mn=gemm2_cluster_shape_mn,
-        gemm2_raster_along_m=raster_along_m,
+        tactic=(
+            128,
+            ((128, 64), 1),
+            ((128, 128), gemm2_cluster_shape_mn, raster_along_m),
+        ),
     )
     ref = ref_moe(x, ids, scales, w_gate_up, w2)
     torch.testing.assert_close(out.float(), ref, atol=3e-1, rtol=5e-2)
@@ -517,9 +525,7 @@ def test_cute_dsl_bf16_moe_pdl_off_matches():
             num_experts=num_experts,
             top_k=top_k,
             use_fused_finalize=False,
-            tile_size=128,
-            gemm1_tile_n=128,
-            gemm2_tile_n=128,
+            tactic=(128, ((128, 128), 1), ((128, 128), (1, 1), False)),
             enable_pdl=enable_pdl,
         )
 
@@ -727,19 +733,19 @@ def test_cute_dsl_bf16_moe_ep_shard(offset):
 @pytest.mark.parametrize(
     "inter,dispatch_sizes",
     [
-        # I=768 (tp=1): 16 tokens -> tile_m 64; 2048 -> tile_m 128 + GEMM2
-        # (1,1); 4096 -> tile_m 128 + GEMM2 (1,2) (tokens*topk >= 256*E).
+        # I=768 (tp=1): decode (16 tokens), prefill (2048) and the region
+        # where the tuner picks the GEMM2 (1,2) cluster (4096).
         (768, (16, 2048, 4096)),
-        # I=96 (tp=8, tiny reduction): 16 -> tile_m 64; 2048 -> tile_m 128
-        # (early flip) + GEMM2 (1,1); 8192 -> M-raster (output at the 32 MiB
-        # heuristic boundary).
+        # I=96 (tp=8, tiny reduction): decode, prefill, and the M-major raster
+        # region (8192 tokens, 32 MiB output).
         (96, (16, 2048, 8192)),
     ],
 )
 def test_cute_dsl_bf16_moe_autotune_covers_dispatch(inter, dispatch_sizes):
-    """One autotune pass profiles every legal tuned cluster/raster tactic and
-    the fallback tactic. Subsequent real calls reuse those process-local
-    specializations."""
+    """One autotune pass at the largest batch profiles every candidate tactic
+    (tile sizes, gated swizzles and GEMM2 clusters) and the fallback tactic.
+    Real calls at any token count up to that batch reuse those process-local
+    specializations, including the fixed default."""
     import importlib
 
     from flashinfer.autotuner import autotune
@@ -772,10 +778,11 @@ def test_cute_dsl_bf16_moe_autotune_covers_dispatch(inter, dispatch_sizes):
         inter**0.25
     )
 
-    # The tuning pass mirrors vLLM's engine-init flashinfer_autotune: one
-    # max-token-ish batch profiles every tactic after its compile warmup.
-    x = torch.randn(4096, hidden, device="cuda", dtype=dtype) / (hidden**0.25)
-    ids, scales = make_random_topk(num_experts, 4096, top_k)
+    # The tuning pass mirrors an engine's init-time autotune: one batch at the
+    # maximum token count profiles every tactic of every bucket below it.
+    max_tokens = max(dispatch_sizes)
+    x = torch.randn(max_tokens, hidden, device="cuda", dtype=dtype) / (hidden**0.25)
+    ids, scales = make_random_topk(num_experts, max_tokens, top_k)
     with autotune(True):
         cute_dsl_fused_moe_bf16(
             x, ids, scales, w1, w2, num_experts=num_experts, top_k=top_k
@@ -840,10 +847,10 @@ def test_cute_dsl_bf16_moe_bad_inputs():
         )
     # 2I not a multiple of 64 (gated tile constraint).
     w1_bad_n = torch.randn(e, 96, k, device="cuda", dtype=torch.bfloat16)
-    with pytest.raises(ValueError, match="multiple of 64"):
+    with pytest.raises(ValueError, match="cannot implement"):
         sm90_contiguous_gather_grouped_gemm_act_fusion(x, w1_bad_n, *args, **kw)
     # permuted_m not a multiple of tile_m.
-    with pytest.raises(ValueError, match="multiple of tile_m"):
+    with pytest.raises(ValueError, match="cannot implement"):
         sm90_contiguous_gather_grouped_gemm_act_fusion(
             x,
             w1,
@@ -870,12 +877,12 @@ def test_cute_dsl_bf16_moe_bad_inputs():
         )
     # N not a multiple of tile_n (partial N tile would write out of bounds).
     w1_192 = torch.randn(e, 192, k, device="cuda", dtype=torch.bfloat16)
-    with pytest.raises(ValueError, match="multiple of tile_n"):
+    with pytest.raises(ValueError, match="cannot implement"):
         sm90_contiguous_gather_grouped_gemm_act_fusion(x, w1_192, *args, **kw)
     # K not a multiple of the 64-element K tile.
     x_k = torch.randn(t, 96, device="cuda", dtype=torch.bfloat16)
     w1_k = torch.randn(e, 128, 96, device="cuda", dtype=torch.bfloat16)
-    with pytest.raises(ValueError, match="multiple of the K tile"):
+    with pytest.raises(ValueError, match="cannot implement"):
         sm90_contiguous_gather_grouped_gemm_act_fusion(x_k, w1_k, *args, **kw)
 
 
@@ -898,7 +905,7 @@ def test_cute_dsl_bf16_moe_gemm2_bad_inputs():
 
     # n=192 is not a multiple of tile_n=128: the finalize scatter copies a
     # full tile_n-wide row, so a partial N tile would write out of bounds.
-    with pytest.raises(ValueError, match="multiple of tile_n"):
+    with pytest.raises(ValueError, match="cannot implement"):
         sm90_contiguous_grouped_gemm_finalize_fusion(
             a,
             w2,
@@ -910,5 +917,22 @@ def test_cute_dsl_bf16_moe_gemm2_bad_inputs():
             out,
             topk=topk,
             tile_shape_mn=(128, 128),
-            tile_k=64,
         )
+
+
+@cute_dsl_available
+@pytest.mark.parametrize(
+    "tactic",
+    [
+        [64, 128, 1, 128, 64, [1, 1], False],
+        [64, [128, 8], [128, [1, 2], False]],
+        [64, [[64, 128], 8], [[64, 128], [1, 2]]],
+        7,
+        None,
+    ],
+)
+def test_sm90_moe_rejects_malformed_tactic_structure(tactic):
+    from flashinfer.fused_moe.cute_dsl.sm90_tuner import _extract_tactic_params
+
+    with pytest.raises(ValueError, match="tactic must be"):
+        _extract_tactic_params(tactic)

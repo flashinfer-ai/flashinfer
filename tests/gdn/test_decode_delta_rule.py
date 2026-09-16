@@ -1277,10 +1277,21 @@ def test_verify_kernel_mtp_reuses_compile_across_cache_modes(monkeypatch, batch_
     original_compile = cute.compile
     compile_count = 0
 
-    def counted_compile(*args, **kwargs):
-        nonlocal compile_count
-        compile_count += 1
-        return original_compile(*args, **kwargs)
+    class CountedCompile:
+        """Stand-in for ``cute.compile``, which is used in its subscripted form."""
+
+        def __init__(self, compile_fn):
+            self._compile_fn = compile_fn
+
+        def __getitem__(self, options):
+            return CountedCompile(original_compile[options])
+
+        def __call__(self, *args, **kwargs):
+            nonlocal compile_count
+            compile_count += 1
+            return self._compile_fn(*args, **kwargs)
+
+    counted_compile = CountedCompile(original_compile)
 
     # Pin the disk cache off: a populated cache would satisfy the reuse
     # property with zero compiles, breaking the count-based assertion.

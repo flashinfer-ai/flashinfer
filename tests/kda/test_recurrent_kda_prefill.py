@@ -42,6 +42,14 @@ kda_prefill_api = importlib.import_module("flashinfer.kda_prefill")
 kda_prefill_cute_api = importlib.import_module("flashinfer.kda_prefill_cute")
 cake_kda_jit_api = importlib.import_module("flashinfer.jit.cake_kda")
 
+# cutlass.experimental only exists in nvidia-cutlass-dsl>=4.7.0 (issue #4911).
+_xfail_without_cute_dsl_experimental = pytest.mark.xfail(
+    not kda_prefill_cute_api._is_cute_dsl_kda_runtime_available(),
+    reason="cute-dsl KDA prefill requires nvidia-cutlass-dsl>=4.7.0 (cutlass.experimental)",
+    raises=ImportError,
+    strict=True,
+)
+
 
 @pytest.fixture(autouse=True)
 def _legacy_module_stubs_select_the_legacy_fallback(monkeypatch):
@@ -812,6 +820,7 @@ def test_cute_dsl_prefill_adapter_forwards_packed_sequence_order(
     assert kwargs["generate_planned_metadata"] is False
 
 
+@_xfail_without_cute_dsl_experimental
 def test_cute_dsl_device_sequence_order_buffer_is_stream_cached(monkeypatch):
     kernel_module = importlib.import_module("flashinfer.kda_kernels.kda_chunked_bt16")
     monkeypatch.setattr(kernel_module, "_DEVICE_SEQUENCE_ORDER_CACHE", {})
@@ -827,6 +836,7 @@ def test_cute_dsl_device_sequence_order_buffer_is_stream_cached(monkeypatch):
     assert other_stream.data_ptr() != first.data_ptr()
 
 
+@_xfail_without_cute_dsl_experimental
 def test_cute_dsl_unplanned_packed_engine_rejects_graph_capture(monkeypatch):
     kernel_module = importlib.import_module("flashinfer.kda_kernels.kda_chunked_bt16")
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
@@ -872,6 +882,7 @@ def test_cute_dsl_unplanned_packed_engine_rejects_graph_capture(monkeypatch):
         )
 
 
+@_xfail_without_cute_dsl_experimental
 def test_cute_dsl_engine_workspace_query_does_not_read_device_offsets(monkeypatch):
     kernel_module = importlib.import_module("flashinfer.kda_kernels.kda_chunked_bt16")
     monkeypatch.setattr(kernel_module, "_device_sm_count", lambda device: 148)
@@ -933,6 +944,7 @@ def test_cute_dsl_prefill_accepts_padded_gate_and_beta_token_extents(
     )
 
 
+@_xfail_without_cute_dsl_experimental
 def test_cute_dsl_padded_gate_and_beta_match_compact_inputs(flash_kda_device):
     inputs = _make_inputs(
         seq_lens=[26, 42],
@@ -970,6 +982,7 @@ def test_cute_dsl_padded_gate_and_beta_match_compact_inputs(flash_kda_device):
     torch.testing.assert_close(padded_final_state, compact_final_state, atol=0, rtol=0)
 
 
+@_xfail_without_cute_dsl_experimental
 def test_cute_dsl_fp32_indexed_state_checkpoints_match_prefix_runs(
     flash_kda_device,
 ):
@@ -1040,6 +1053,7 @@ def test_cute_dsl_fp32_indexed_state_checkpoints_match_prefix_runs(
     )
 
 
+@_xfail_without_cute_dsl_experimental
 def test_cute_dsl_checkpoint_state_indices_write_pool_and_aligned_final_boundary(
     flash_kda_device,
 ):
@@ -1141,6 +1155,7 @@ def test_cute_dsl_checkpoint_state_indices_write_pool_and_aligned_final_boundary
     )
 
 
+@_xfail_without_cute_dsl_experimental
 def test_cute_dsl_checkpoint_state_indices_engine_route_matches_packed_states(
     flash_kda_device,
 ):
@@ -1206,6 +1221,7 @@ def test_cute_dsl_checkpoint_state_indices_engine_route_matches_packed_states(
     )
 
 
+@_xfail_without_cute_dsl_experimental
 def test_cute_dsl_rejects_mixed_state_and_checkpoint_dtypes(flash_kda_device):
     inputs = _make_inputs(
         seq_lens=[65],
@@ -5349,6 +5365,7 @@ def test_frozen_bt16_policy_routes_padded_compact_state_to_direct(
     torch.testing.assert_close(state_storage[:, slot_numel:], padding_seed)
 
 
+@_xfail_without_cute_dsl_experimental
 def test_frozen_bt16_combined_h12_fixed512_matches_cute(flash_kda_device):
     inputs = _make_inputs(
         seq_lens=[512],
@@ -5825,6 +5842,7 @@ def test_frozen_prefill_h12_strided_beta_indexed_state_and_checkpoints_match_ref
         ((33, 65), 12, True, True),
     ],
 )
+@_xfail_without_cute_dsl_experimental
 def test_cute_dsl_checkpoints_match_cake(
     flash_kda_device,
     seq_lens,
@@ -5935,6 +5953,7 @@ def test_dsl_version_guard_is_scoped_to_the_sm100_family(cuda_device, monkeypatc
     ("seq_lens", "num_heads", "packed"),
     [((17,), 96, False), ((17, 33), 12, True)],
 )
+@_xfail_without_cute_dsl_experimental
 def test_cute_dsl_padded_indexed_state_matches_cake(
     flash_kda_device, seq_lens, num_heads, packed
 ):
@@ -6125,6 +6144,7 @@ def test_frozen_unbounded_softplus_h32_prefix_resume_matches_uninterrupted(
 
 
 @pytest.mark.parametrize("num_sequences", [171, 256])
+@_xfail_without_cute_dsl_experimental
 def test_cute_dsl_packed_tensor_map_stride_above_int32_matches_cake(
     flash_kda_device,
     num_sequences,

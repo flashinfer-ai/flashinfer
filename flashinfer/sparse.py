@@ -1633,10 +1633,6 @@ class BlockSparseAttentionWrapper:
 
         return (out, lse) if return_lse else out
 
-    def end_forward(self) -> None:
-        r"""Warning: This method is deprecated and has no effect."""
-        pass
-
 
 class VariableBlockSparseAttentionWrapper:
     r"""Wrapper class for attention computation with a block-sparse matrix as attention mask.

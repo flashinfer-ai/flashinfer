@@ -2477,8 +2477,17 @@ def flashinfer_api(func: Callable = None, *, trace=None) -> Callable:
             if args and hasattr(args[0], "__class__"):
                 try:
                     class_name = args[0].__class__.__name__
+                    # Stateful entry points whose class name does not contain
+                    # "Wrapper" must be listed explicitly, or the log line
+                    # degrades to a bare method name. "MoELayer" needs this more
+                    # than most: its entry point is ``__call__``, so without the
+                    # prefix every unified-MoE call logs as "__call__" -- both
+                    # unreadable and useless as a FLASHINFER_DUMP_INCLUDE /
+                    # FLASHINFER_DUMP_EXCLUDE pattern, since it would also match
+                    # any other decorated ``__call__``.
                     if "Wrapper" in class_name or class_name in [
-                        "BatchMLAPagedAttentionWrapper"
+                        "BatchMLAPagedAttentionWrapper",
+                        "MoELayer",
                     ]:
                         func_name = f"{class_name}.{func_name}"
                         self_id = id(args[0])

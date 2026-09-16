@@ -251,6 +251,7 @@ def generate_ninja_build_for_op(
     common_cflags = build_common_cflags(cuda_home, extra_include_dirs)
     cflags = build_cflags(common_cflags, extra_cflags)
     cuda_cflags = build_cuda_cflags(common_cflags, extra_cuda_cflags)
+    cuda_arch_flags = [flag for flag in cuda_cflags if flag.startswith("-gencode=")]
 
     ldflags = [
         "-shared",
@@ -287,6 +288,7 @@ def generate_ninja_build_for_op(
         "post_cflags =",
         "cuda_cflags = " + join_multiline(cuda_cflags),
         "cuda_post_cflags =",
+        "cuda_arch_flags = " + join_multiline(cuda_arch_flags),
         "ldflags = " + join_multiline(ldflags),
         "",
         "rule compile",
@@ -316,7 +318,7 @@ def generate_ninja_build_for_op(
         lines.extend(
             [
                 "rule nvcc_link",
-                "  command = $nvcc -shared $in $ldflags -o $out",
+                "  command = $nvcc -shared $cuda_arch_flags $in $ldflags -o $out",
                 "",
             ]
         )

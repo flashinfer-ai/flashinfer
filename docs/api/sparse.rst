@@ -9,14 +9,14 @@ Kernels for block sparse flashattention.
 
 .. autoclass:: BlockSparseAttentionWrapper
     :members:
-    :exclude-members: begin_forward, end_forward, forward, forward_return_lse
+    :exclude-members: begin_forward, forward, forward_return_lse
 
     .. automethod:: __init__
 
 
 .. autoclass:: VariableBlockSparseAttentionWrapper
     :members:
-    :exclude-members: begin_forward, end_forward, forward, forward_return_lse
+    :exclude-members: begin_forward, forward, forward_return_lse
 
     .. image:: https://raw.githubusercontent.com/flashinfer-ai/web-data/main/examples/flashinfer-variable-block-sparse.png
         :width: 600

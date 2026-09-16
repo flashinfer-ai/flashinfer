@@ -39,16 +39,6 @@ def skip_if_head_dim_unsupported(head_dim: int):
         pytest.skip("16-bit FA2 head_dim > 256 is only supported on SM80 or newer")
 
 
-def skip_if_head_dim_dtype_unsupported(head_dim: int, kv_dtype: torch.dtype):
-    skip_if_head_dim_unsupported(head_dim)
-    if (
-        head_dim > 256
-        and kv_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
-        and get_compute_capability(torch.device("cuda:0"))[0] < 10
-    ):
-        pytest.skip("head_dim > 256 with FP8 KV is only validated on SM100 or newer")
-
-
 def skip_if_nvfp4_large_head_decode_unsupported(head_dim: int):
     if head_dim > 256 and get_compute_capability(torch.device("cuda:0"))[0] < 10:
         pytest.skip(
@@ -130,7 +120,7 @@ def _run_batch_decode_with_paged_kv_cache_case(
             pytest.skip("cuTile decode fp8 KV not covered yet.")
         if head_dim > 256:
             pytest.skip("cuTile decode head_dim>256 not covered yet.")
-    skip_if_head_dim_dtype_unsupported(head_dim, kv_dtype)
+    skip_if_head_dim_unsupported(head_dim)
     q = torch.randn(batch_size, num_qo_heads, head_dim, device="cuda:0", dtype=q_dtype)
     num_pages_per_seq = (kv_len + page_size - 1) // page_size
     total_num_pages = num_pages_per_seq * batch_size

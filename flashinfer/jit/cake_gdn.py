@@ -34,7 +34,7 @@ from .cpp_ext import get_cuda_path, get_nvcc_parallelism_flags
 CakeGDNArch = Literal["sm_100a", "sm_103a"]
 
 _EXPORT_SCHEMA = "flashinfer-cake-gdn-decode-standalone-export-v1"
-_MANIFEST_SHA256 = "388df1483226190eb171433c947b2b045f00579af61c2e1f0e48c16513672c93"
+_MANIFEST_SHA256 = "836fa2ab739f31c9c037f2277b079a4593947363408caa350972be88d1d2517a"
 _ARCH_ACTIVE_CLUSTERS: dict[CakeGDNArch, int] = {
     "sm_100a": 148,
     "sm_103a": 160,

@@ -74,9 +74,9 @@ def get_available_cubin_files(
                 logger.info(f"Retrying in {delay} seconds...")
                 time.sleep(delay)
 
-    # TODO: check if we really want to return an empty collection here instead of crashing.
-    logger.error("Max retries reached. Fetch failed.")
-    return tuple()
+    raise RuntimeError(
+        f"Failed to fetch the cubin artifact index {source} after {retries} attempts"
+    )
 
 
 def get_available_header_files(
@@ -120,7 +120,9 @@ def get_available_header_files(
                     logger.info(f"Retrying in {delay} seconds...")
                     time.sleep(delay)
 
-        logger.error(f"Max retries reached for {url}. Fetch failed.")
+        raise RuntimeError(
+            f"Failed to fetch the header artifact index {url} after {retries} attempts"
+        )
 
     fetch_directory(source)
     logger.info(f"result: {result}")
@@ -302,16 +304,37 @@ def download_artifacts() -> None:
     session = requests.Session()
     cubin_files = list[tuple[str, str]](get_subdir_file_list())
     num_threads = int(os.environ.get("FLASHINFER_CUBIN_DOWNLOAD_THREADS", "4"))
+
+    cached_files: set[str] = set()
+    files_to_download: list[tuple[str, str]] = []
+    for name, checksum in cubin_files:
+        local_path = FLASHINFER_CUBIN_DIR / name
+        if local_path.is_file():
+            try:
+                if verify_cubin(str(local_path), checksum):
+                    cached_files.add(name)
+                    continue
+            except OSError as e:
+                logger.warning(f"Failed to read cached artifact {local_path}: {e}")
+        files_to_download.append((name, checksum))
+
+    logger.info(
+        "Using %d checksum-verified cached artifacts; downloading %d artifacts",
+        len(cached_files),
+        len(files_to_download),
+    )
+
     with tqdm_logging_redirect(
         total=len(cubin_files), desc="Downloading cubins"
     ) as pbar:
+        pbar.update(len(cached_files))
 
         def update_pbar_cb(_) -> None:
             pbar.update(1)
 
         with ThreadPoolExecutor(num_threads) as pool:
             futures = []
-            for name, _ in cubin_files:
+            for name, _ in files_to_download:
                 source = safe_urljoin(FLASHINFER_CUBINS_REPOSITORY, name)
                 local_path = FLASHINFER_CUBIN_DIR / name
                 # Ensure parent directory exists
@@ -328,8 +351,9 @@ def download_artifacts() -> None:
     if not all_success:
         raise RuntimeError("Failed to download cubins")
 
-    # Check checksums of all downloaded cubins
-    for name, checksum in cubin_files:
+    # Cached artifacts were verified before they were skipped. Verify each file
+    # fetched in this invocation before allowing it into the wheel.
+    for name, checksum in files_to_download:
         local_path = FLASHINFER_CUBIN_DIR / name
         if not verify_cubin(str(local_path), checksum):
             raise RuntimeError("Failed to download cubins: checksum mismatch")

@@ -14,7 +14,7 @@ import torch
 from ....jit import gen_batch_mla_module
 from ....utils import MaskMode, check_shape_dtype_device, get_compute_capability
 from ._capabilities import MLAPlanCapabilities, plan_capability_rejection_reason
-from .._planning import _MLAPlanArguments
+from .._planning import _MLAPlanArguments, _audit_plan_from_wrapper_arguments
 
 
 class _GeneratedBatchMLAModule(Protocol):
@@ -25,7 +25,7 @@ class _GeneratedBatchMLAModule(Protocol):
     def run(self, *args: object) -> object: ...
 
 
-@functools.cache
+@functools.lru_cache(maxsize=128)
 def get_batch_mla_module(
     backend: str,
     dtype_q: torch.dtype,
@@ -554,6 +554,7 @@ class _BatchMLAPagedAttentionFaBackendBase(_BatchMLAGeneratedFaMechanics):
         raise NotImplementedError
 
     @classmethod
+    @_audit_plan_from_wrapper_arguments
     def plan_from_wrapper(
         cls: type[_FaBackendT], args: _MLAPlanArguments
     ) -> _FaBackendT:
@@ -614,6 +615,10 @@ class _BatchMLAPagedAttentionFaBackendBase(_BatchMLAGeneratedFaMechanics):
         ckv_scale: Optional[float],
         ckv_scale_arr: Optional[torch.Tensor],
         kpe_scale: Optional[float],
+        sinks: Optional[torch.Tensor] = None,
+        skip_softmax_threshold_scale_factor: Optional[float] = None,
+        bmm1_scale: Optional[Union[float, torch.Tensor]] = None,
+        bmm2_scale: Optional[Union[float, torch.Tensor]] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if kv_len is not None:
             raise ValueError("kv_len is only supported with cutlass backend.")
@@ -623,6 +628,15 @@ class _BatchMLAPagedAttentionFaBackendBase(_BatchMLAGeneratedFaMechanics):
             raise ValueError(
                 "o_scale is only supported with the cutlass backend for now."
             )
+        if sinks is not None:
+            raise ValueError("sinks are not supported with an fa2/fa3 backend.")
+        if skip_softmax_threshold_scale_factor is not None:
+            raise ValueError(
+                "skip_softmax_threshold_scale_factor is not supported with an "
+                "fa2/fa3 backend."
+            )
+        if bmm1_scale is not None or bmm2_scale is not None:
+            raise ValueError("BMM scales are not supported with an fa2/fa3 backend.")
         q_nope, q_pe = cast(tuple[torch.Tensor, torch.Tensor], query)
         ckv_cache, kpe_cache = cast(tuple[torch.Tensor, torch.Tensor], kv_cache)
         return self._run_generated_fa(

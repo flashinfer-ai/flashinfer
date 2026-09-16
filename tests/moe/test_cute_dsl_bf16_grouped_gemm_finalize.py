@@ -107,15 +107,17 @@ def _ref_expanded_gemm(intermediate, w2, maps, row_valid, tile_m):
 @cute_dsl_available
 @sm90_required
 @pytest.mark.parametrize(
-    "hidden,inter,tile_shape_mn,tile_k,cluster_shape_mn,raster_along_m",
+    "hidden,inter,tile_shape_mn,cluster_shape_mn,raster_along_m",
     [
         # Qwen3-30B-A3B GEMM2: hidden=2048, I=768/tp
-        (2048, 768, (128, 128), 64, (1, 1), False),  # tp=1
-        (2048, 768, (128, 256), 32, (1, 1), False),  # tp=1, 2-WG tile, k32
-        (2048, 768, (128, 128), 64, (1, 2), False),  # tp=1, N-cluster pair
-        (2048, 768, (128, 128), 64, (1, 1), True),  # tp=1, M-major raster
-        (2048, 192, (64, 128), 32, (1, 1), False),  # tp=4, tile_m=64
-        (2048, 96, (128, 64), 32, (1, 1), False),  # tp=8, I%64!=0 (k32 only)
+        (2048, 768, (128, 128), (1, 1), False),  # tp=1
+        (2048, 768, (128, 256), (1, 1), False),  # tp=1, 2-WG tile
+        (2048, 768, (128, 128), (1, 2), False),  # tp=1, N-cluster pair
+        (2048, 768, (128, 128), (1, 1), True),  # tp=1, M-major raster
+        (2048, 192, (64, 128), (1, 1), False),  # tp=4, tile_m=64
+        (2048, 96, (128, 64), (1, 1), False),  # tp=8, partial last K tile (32 of 64)
+        (2048, 176, (128, 128), (1, 1), False),  # I%32!=0: K tail 48 of 64
+        (2048, 352, (128, 128), (1, 2), False),  # K tail with A multicast
     ],
 )
 @pytest.mark.parametrize("num_tokens", [3, 777])
@@ -124,7 +126,6 @@ def test_cute_dsl_grouped_gemm_finalize_fused(
     hidden,
     inter,
     tile_shape_mn,
-    tile_k,
     cluster_shape_mn,
     raster_along_m,
     num_tokens,
@@ -161,7 +162,6 @@ def test_cute_dsl_grouped_gemm_finalize_fused(
         topk=top_k,
         use_fused_finalize=True,
         tile_shape_mn=tile_shape_mn,
-        tile_k=tile_k,
         cluster_shape_mn=cluster_shape_mn,
         raster_along_m=raster_along_m,
     )
@@ -179,16 +179,16 @@ def test_cute_dsl_grouped_gemm_finalize_fused(
 @cute_dsl_available
 @sm90_required
 @pytest.mark.parametrize(
-    "hidden,inter,tile_shape_mn,tile_k",
+    "hidden,inter,tile_shape_mn",
     [
-        (2048, 768, (128, 128), 64),
-        (2048, 96, (128, 64), 32),
+        (2048, 768, (128, 128)),
+        (2048, 96, (128, 64)),  # partial last K tile
     ],
 )
 @pytest.mark.parametrize("num_tokens", [3, 777])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_cute_dsl_grouped_gemm_finalize_deterministic(
-    hidden, inter, tile_shape_mn, tile_k, num_tokens, dtype
+    hidden, inter, tile_shape_mn, num_tokens, dtype
 ):
     """Deterministic mode: unscaled rows scattered to expanded (token, slot)
     order; every valid route lands exactly once and padding rows never do."""
@@ -222,7 +222,6 @@ def test_cute_dsl_grouped_gemm_finalize_deterministic(
         topk=top_k,
         use_fused_finalize=False,
         tile_shape_mn=tile_shape_mn,
-        tile_k=tile_k,
         cluster_shape_mn=(1, 1),
         raster_along_m=False,
     )
@@ -231,3 +230,25 @@ def test_cute_dsl_grouped_gemm_finalize_deterministic(
     perm_rows = expanded_to_perm.flatten().long()
     ref = ref_rows[perm_rows]
     torch.testing.assert_close(out.float(), ref, atol=2e-1, rtol=3e-2)
+
+
+@cute_dsl_available
+@pytest.mark.parametrize("tile_shape_mn", [(64, 256), (32, 256), (64, 8), (128, 40)])
+def test_cute_dsl_grouped_gemm_finalize_unsupported_tiles(tile_shape_mn):
+    """Reject unsupported MMA shapes and incomplete 32-column epilogue subtiles."""
+    import cutlass
+    from flashinfer.fused_moe.cute_dsl.hopper.contiguous_grouped_gemm_finalize_fusion import (
+        Sm90ContiguousGroupedGemmFinalizeFusionKernel,
+    )
+
+    assert not Sm90ContiguousGroupedGemmFinalizeFusionKernel.can_implement(
+        cutlass.BFloat16,
+        cutlass.BFloat16,
+        cutlass.BFloat16,
+        tile_shape_mn,
+        (1, 1),
+        128,
+        2560,
+        768,
+        8,
+    )
