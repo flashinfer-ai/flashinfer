@@ -26,6 +26,12 @@ not scale with the configured model length or global cache capacity. Plain
 Int32 locators and packed membership words remain separate outputs; membership
 bits are never fused into a locator.
 
+Attention caches a grouped membership row in SMEM only when the complete
+resource layout, including barriers, fits the compilation budget. Larger rows
+stay in the existing immutable metadata buffer; Softmax reads packed words for
+the current KV tile directly from GMEM. This does not change query grouping or
+the caller's split-KV permission.
+
 The combined QToken-KvBlock-Sparse-Attention metadata+attention API uses programmatic dependent launch
 (PDL) for its final metadata-to-attention handoff. QToken-KvBlock-Sparse-Attention metadata producers
 release only after their page indices, membership words, and sequence lengths

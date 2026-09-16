@@ -70,9 +70,11 @@ from ..tensor_map import (
 )
 from .fmha_decode_config import FmhaDecodeConfig
 from .fmha_decode_constants import (
+    BYTES_PER_KIB,
     KV_KIND_K,
     KV_KIND_V,
     KV_TILE_256_REGISTER_REALLOCATION_MIN_TILES,
+    TOTAL_SMEM_BUDGET_KIB,
 )
 from .fmha_decode_resources import (
     SmemBlockSparseKvMetadataResource,
@@ -940,6 +942,8 @@ def _build_decode_gen_schedule(
                 pipeline_config=smem_page_offsets_v_cfg,
                 cfg=cfg,
                 stage_page_ids_per_tile=stage_page_ids_per_tile,
+                # Softmax consumes only the K-side membership view.
+                cache_memberships_in_smem=False,
                 page_idx_kv=page_idx_kv,
                 page_table_stride=page_table_stride,
                 num_heads_kv=num_heads_kv,
@@ -1300,6 +1304,85 @@ def _build_decode_gen_schedule(
     else:
         tmem_corr0.softmax_local1_ref = tmem_softmax_local1
         tmem_corr1.softmax_local1_ref = tmem_softmax_local1
+
+    # ------------------------------------------------------------------
+    # Finalize SMEM and membership mode before tracing tasks.
+    # ------------------------------------------------------------------
+    smem_resources = []
+    if work_queue is not None:
+        smem_resources.append(work_queue)
+    if schedule_token_throttle is not None:
+        smem_resources.append(schedule_token_throttle)
+    if membership_lifetime is not None:
+        smem_resources.append(membership_lifetime)
+    smem_resources.append(smem_q)
+    if smem_page_offsets is not None:
+        smem_resources.append(smem_page_offsets)
+    if smem_page_offsets_v is not None:
+        smem_resources.append(smem_page_offsets_v)
+    if sparse_kv_metadata0 is not None:
+        smem_resources.append(sparse_kv_metadata0)
+        smem_resources.append(sparse_kv_metadata1)
+    if sparse_softmax_metadata0 is not None:
+        smem_resources.append(sparse_softmax_metadata0)
+        smem_resources.append(sparse_softmax_metadata1)
+    if use_one_inst_qkv:
+        smem_resources.append(smem_k0)
+        smem_resources.append(smem_v0)
+    elif use_per_inst_kv_resources:
+        smem_resources.append(smem_k0)
+        smem_resources.append(smem_k1)
+        smem_resources.append(smem_v0)
+        smem_resources.append(smem_v1)
+    else:
+        smem_resources.append(smem_kv)
+    smem_resources.append(smem_p0)
+    if not use_one_inst_qkv:
+        smem_resources.append(smem_p1)
+    smem_resources.append(tmem_s0)
+    if not use_one_inst_qkv:
+        smem_resources.append(tmem_s1)
+    smem_resources.append(tmem_o)
+    smem_resources.append(tmem_softmax_local0)
+    if not use_one_inst_qkv:
+        smem_resources.append(tmem_softmax_local1)
+    smem_resources.append(tmem_softmax_global0)
+    if not use_one_inst_qkv:
+        smem_resources.append(tmem_softmax_global1)
+    smem_resources.append(tmem_corr0)
+    if not use_one_inst_qkv:
+        smem_resources.append(tmem_corr1)
+
+    def allocate_smem() -> SmemAllocator:
+        allocator = SmemAllocator()
+        for resource in smem_resources:
+            allocator.add_resource(resource)
+        allocator.add_tmem_ptr(
+            SmemAllocation("fmha_tmem_ptr_i32", dtype=cutlass.Int32, alignment=4)
+        )
+        allocator.compute_layout()
+        return allocator
+
+    def smem_bytes(allocator: SmemAllocator) -> int:
+        # Include barriers and conservatively round data to tensor alignment.
+        return (
+            allocator.total_smem_bytes + cfg.stensor_align - 1
+        ) // cfg.stensor_align * cfg.stensor_align + allocator.barrier_smem_bytes
+
+    smem_allocator = allocate_smem()
+    if cfg.uses_q_token_kv_block_sparse_page_membership:
+        budget = TOTAL_SMEM_BUDGET_KIB * BYTES_PER_KIB
+        if smem_bytes(smem_allocator) > budget:
+            # A full union can be much larger than a KV tile. Keep small routes
+            # cached, but let Softmax read immutable packed GMEM words on demand
+            # when the complete resource layout cannot hold the membership row.
+            # This also accounts for the fixed K/V rings of one-inst D256.
+            assert smem_page_offsets is not None
+            smem_page_offsets.cache_memberships_in_smem = False
+            smem_page_offsets._init_placeholder_state()
+            smem_allocator = allocate_smem()
+        if smem_bytes(smem_allocator) > budget:
+            raise ValueError("QToken sparse attention resources exceed the SMEM budget")
 
     # ------------------------------------------------------------------
     # Domain computation
@@ -1803,56 +1886,8 @@ def _build_decode_gen_schedule(
         )
 
     # ------------------------------------------------------------------
-    # SMEM / TMEM allocators
+    # TMEM allocator
     # ------------------------------------------------------------------
-    smem_allocator = SmemAllocator()
-    if work_queue is not None:
-        smem_allocator.add_resource(work_queue)
-    if schedule_token_throttle is not None:
-        smem_allocator.add_resource(schedule_token_throttle)
-    if membership_lifetime is not None:
-        smem_allocator.add_resource(membership_lifetime)
-    smem_allocator.add_resource(smem_q)
-    if smem_page_offsets is not None:
-        smem_allocator.add_resource(smem_page_offsets)
-    if smem_page_offsets_v is not None:
-        smem_allocator.add_resource(smem_page_offsets_v)
-    if sparse_kv_metadata0 is not None:
-        smem_allocator.add_resource(sparse_kv_metadata0)
-        smem_allocator.add_resource(sparse_kv_metadata1)
-    if sparse_softmax_metadata0 is not None:
-        smem_allocator.add_resource(sparse_softmax_metadata0)
-        smem_allocator.add_resource(sparse_softmax_metadata1)
-    if use_one_inst_qkv:
-        smem_allocator.add_resource(smem_k0)
-        smem_allocator.add_resource(smem_v0)
-    elif use_per_inst_kv_resources:
-        smem_allocator.add_resource(smem_k0)
-        smem_allocator.add_resource(smem_k1)
-        smem_allocator.add_resource(smem_v0)
-        smem_allocator.add_resource(smem_v1)
-    else:
-        smem_allocator.add_resource(smem_kv)
-    smem_allocator.add_resource(smem_p0)
-    if not use_one_inst_qkv:
-        smem_allocator.add_resource(smem_p1)
-    smem_allocator.add_resource(tmem_s0)
-    if not use_one_inst_qkv:
-        smem_allocator.add_resource(tmem_s1)
-    smem_allocator.add_resource(tmem_o)
-    smem_allocator.add_resource(tmem_softmax_local0)
-    if not use_one_inst_qkv:
-        smem_allocator.add_resource(tmem_softmax_local1)
-    smem_allocator.add_resource(tmem_softmax_global0)
-    if not use_one_inst_qkv:
-        smem_allocator.add_resource(tmem_softmax_global1)
-    smem_allocator.add_resource(tmem_corr0)
-    if not use_one_inst_qkv:
-        smem_allocator.add_resource(tmem_corr1)
-    smem_allocator.add_tmem_ptr(
-        SmemAllocation("fmha_tmem_ptr_i32", dtype=cutlass.Int32, alignment=4)
-    )
-    smem_allocator.compute_layout()
     tmem_allocator = TmemAllocator()
     if cfg.use_keeps_mma_ab:
         if use_one_inst_qkv:

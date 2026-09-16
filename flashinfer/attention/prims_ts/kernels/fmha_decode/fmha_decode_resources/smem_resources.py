@@ -1313,10 +1313,13 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
 
     Other paged-KV schedules stage one tile or an aligned 32-ID window. Native
     page rows have a fixed dense stride and a sequence-length-bounded prefix.
+    Membership rows are cached only when the complete SMEM layout fits; larger
+    rows are read one packed word at a time from immutable GMEM by Softmax.
     """
 
     cfg: Constexpr[FmhaDecodeConfig] = None
     stage_page_ids_per_tile: Constexpr[bool] = False
+    cache_memberships_in_smem: Constexpr[bool] = True
     page_idx_kv: cute.Pointer | DirectSparseMetadataView | None = None
     q_token_kv_block_sparse_page_memberships: cute.Pointer | None = None
     seqlens_kv: cute.Pointer | None = None
@@ -1388,7 +1391,10 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
     def q_token_kv_block_sparse_membership_entries(self) -> int:
         """Return packed membership words retained by grouped-Q routes."""
 
-        if not self.cfg.uses_q_token_kv_block_sparse_page_membership:
+        if (
+            not self.cfg.uses_q_token_kv_block_sparse_page_membership
+            or not self.cache_memberships_in_smem
+        ):
             return 0
         pages_per_tile = self.cfg.tile_size_kv // self.cfg.num_tokens_per_page
         page_entries = self.encoded_locator_window_tiles * pages_per_tile
@@ -1564,6 +1570,68 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
         return Int32(self._smem_page_offsets[offset + page_frag])
 
     @cute.jit
+    def _q_token_kv_block_sparse_membership_word(
+        self, stage_info: StageInfo, membership_idx: Int32
+    ) -> tuple[Uint32, Int32]:
+        """Read a cached word, or fetch only the current tile's word from GMEM.
+
+        Large routes retain metadata in its existing immutable GMEM buffer.
+        Both paths return the index in their word coordinate system, including
+        an unaligned split's byte offset. Never expose poisoned padding bytes.
+        """
+        if cutlass.const_expr(self.cache_memberships_in_smem):
+            self._create_initial_task_locals(stage_info.context)
+            word = Uint32(
+                self._smem_q_token_kv_block_sparse_memberships[
+                    membership_idx
+                    // Int32(Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIPS_PER_WORD)
+                ]
+            )
+        else:
+            assert self.q_token_kv_block_sparse_page_memberships is not None
+            cfg = self.cfg
+            task_cache = _decode_gen_task_cache(stage_info)
+            membership_idx += Int32(task_cache[_TASK_CACHE_KV_RAW_TILE_BASE]) * Int32(
+                cfg.tile_size_kv // cfg.num_tokens_per_page
+            )
+            word_idx = membership_idx // Int32(
+                Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIPS_PER_WORD
+            )
+            first_page = word_idx * Int32(
+                Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIPS_PER_WORD
+            )
+            last_page = Int32(task_cache[_TASK_CACHE_KV_PAGE_IDX_UB])
+            word = Uint32(0)
+            if first_page <= last_page:
+                head, batch = _logical_head_batch(stage_info, self.h_k_idx, self.b_idx)
+                row = cutlass.Int64(batch)
+                if cutlass.const_expr(
+                    cfg.use_persistent_scheduler and not cfg.shares_sparse_pattern
+                ):
+                    row = row * cutlass.Int64(self.num_heads_kv) + cutlass.Int64(head)
+                word = Uint32(
+                    self.q_token_kv_block_sparse_page_memberships[
+                        row
+                        * cutlass.Int64(
+                            self.q_token_kv_block_sparse_page_membership_stride
+                        )
+                        + cutlass.Int64(word_idx)
+                    ]
+                )
+                live_bytes = last_page - first_page + Int32(1)
+                if live_bytes < Int32(
+                    Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIPS_PER_WORD
+                ):
+                    word &= (
+                        Uint32(1)
+                        << (
+                            live_bytes
+                            * Int32(Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIP_BITS)
+                        )
+                    ) - Uint32(1)
+        return word, membership_idx
+
+    @cute.jit
     def q_token_kv_block_sparse_page_membership(
         self,
         stage_info: StageInfo,
@@ -1572,14 +1640,10 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
     ) -> Uint32:
         """Load one grouped-Q membership byte for a score fragment."""
         assert self.cfg.uses_q_token_kv_block_sparse_page_membership
-        self._create_initial_task_locals(stage_info.context)
         pages_per_tile = Int32(self.cfg.tile_size_kv // self.cfg.num_tokens_per_page)
         membership_idx = local_tile_idx * pages_per_tile + page_frag
-        membership_word = Uint32(
-            self._smem_q_token_kv_block_sparse_memberships[
-                membership_idx
-                // Int32(Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIPS_PER_WORD)
-            ]
+        membership_word, membership_idx = self._q_token_kv_block_sparse_membership_word(
+            stage_info, membership_idx
         )
         membership_shift = (
             membership_idx % Int32(Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIPS_PER_WORD)
@@ -1595,14 +1659,13 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
         local_tile_idx: Int32,
         page_frag: Int32,
     ) -> cutlass.Array:
-        """Load four aligned grouped-Q membership bytes from one vector.
+        """Load four aligned grouped-Q membership bytes from one packed word.
 
         The ``tmem_s`` Keeps Softmax path calls this helper four times to
         assemble each lane-local 16-page membership word.
         """
 
         assert self.cfg.uses_q_token_kv_block_sparse_page_membership
-        self._create_initial_task_locals(stage_info.context)
         pages_per_tile = Int32(self.cfg.tile_size_kv // self.cfg.num_tokens_per_page)
         membership_idx = local_tile_idx * pages_per_tile + page_frag
         memberships = cutlass.Array(
@@ -1610,11 +1673,8 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
             4,
             space=cutlass.AddressSpace.rmem,
         )
-        membership_word = Uint32(
-            self._smem_q_token_kv_block_sparse_memberships[
-                membership_idx
-                // Int32(Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIPS_PER_WORD)
-            ]
+        membership_word, _ = self._q_token_kv_block_sparse_membership_word(
+            stage_info, membership_idx
         )
         for elem_idx in cutlass.range_constexpr(4):
             memberships[elem_idx] = (
