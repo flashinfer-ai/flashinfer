@@ -2186,6 +2186,9 @@ def _log_function_outputs(func_name: str, result: Any, level: int) -> None:
 # Read by tests/trace/test_fi_trace_template_consistency.py to auto-discover
 # all registered templates without requiring manual maintenance.
 _TRACE_REGISTRY: List[Tuple[Callable, Any, str]] = []
+# Runtime selectors are stored separately so the stable registry tuple remains
+# concrete-template-only and decorated callables need no private attributes.
+_TRACE_DISPATCHERS: Dict[Callable, Callable] = {}
 
 _TRACE_FI_API_ALIASES = {
     "flashinfer.mla._batch_mla._wrapper.BatchMLAPagedAttentionWrapper.run": (
@@ -2262,6 +2265,7 @@ def _attach_fi_trace(
                     _label = tpl.name_prefix or tpl.op_type
                     _TRACE_REGISTRY.append((original, tpl, _label))
                 _dispatch_fn = trace_template
+                _TRACE_DISPATCHERS[original] = _dispatch_fn
                 _fi_trace_cache: Dict[int, Callable] = {}
 
                 def fi_trace_fn(
@@ -2473,8 +2477,17 @@ def flashinfer_api(func: Callable = None, *, trace=None) -> Callable:
             if args and hasattr(args[0], "__class__"):
                 try:
                     class_name = args[0].__class__.__name__
+                    # Stateful entry points whose class name does not contain
+                    # "Wrapper" must be listed explicitly, or the log line
+                    # degrades to a bare method name. "MoELayer" needs this more
+                    # than most: its entry point is ``__call__``, so without the
+                    # prefix every unified-MoE call logs as "__call__" -- both
+                    # unreadable and useless as a FLASHINFER_DUMP_INCLUDE /
+                    # FLASHINFER_DUMP_EXCLUDE pattern, since it would also match
+                    # any other decorated ``__call__``.
                     if "Wrapper" in class_name or class_name in [
-                        "BatchMLAPagedAttentionWrapper"
+                        "BatchMLAPagedAttentionWrapper",
+                        "MoELayer",
                     ]:
                         func_name = f"{class_name}.{func_name}"
                         self_id = id(args[0])

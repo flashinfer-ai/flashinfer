@@ -377,5 +377,158 @@ class ClassReexportIntegrationTest(unittest.TestCase):
         self.assertEqual(compare_snapshots(base, head), [])
 
 
+class ExperimentalTrackExclusionTest(unittest.TestCase):
+    """The experimental track carries no compatibility guarantees, so it must
+    stay out of the public-API diff (flashinfer/experimental/README.md)."""
+
+    stable = textwrap.dedent(
+        """
+        @flashinfer_api
+        def api(value: int) -> None:
+            pass
+        """
+    )
+    breaking = textwrap.dedent(
+        """
+        @flashinfer_api
+        def api(renamed: int) -> None:
+            pass
+        """
+    )
+
+    def test_breaking_change_inside_experimental_is_ignored(self) -> None:
+        base = {"flashinfer/experimental/feature/backend.py": self.stable}
+        head = {"flashinfer/experimental/feature/backend.py": self.breaking}
+        self.assertEqual(compare_snapshots(base, head), [])
+
+    def test_experimental_module_deletion_is_ignored(self) -> None:
+        # "flashinfer/core.py" is the unchanged anchor: a snapshot cannot be
+        # empty, since git refuses a commit with nothing in it.
+        base = {
+            "flashinfer/core.py": self.stable,
+            "flashinfer/experimental/feature/backend.py": self.stable,
+        }
+        head = {"flashinfer/core.py": self.stable}
+        self.assertEqual(compare_snapshots(base, head), [])
+
+    def test_new_experimental_api_is_ignored(self) -> None:
+        base = {"flashinfer/core.py": self.stable}
+        head = {
+            "flashinfer/core.py": self.stable,
+            "flashinfer/experimental/feature/backend.py": self.stable,
+        }
+        self.assertEqual(compare_snapshots(base, head), [])
+
+    def test_experimental_decorator_in_core_is_ignored(self) -> None:
+        # @flashinfer_experimental_api is not @flashinfer_api: experimental APIs
+        # live in core modules but are not part of the versioned surface.
+        experimental_api = textwrap.dedent(
+            """
+            @flashinfer_experimental_api
+            def api(value: int) -> None:
+                pass
+            """
+        )
+        renamed = textwrap.dedent(
+            """
+            @flashinfer_experimental_api
+            def api(renamed: int) -> None:
+                pass
+            """
+        )
+        self.assertEqual(
+            compare_snapshots(
+                {"flashinfer/core.py": experimental_api},
+                {"flashinfer/core.py": renamed},
+            ),
+            [],
+        )
+
+    def test_move_from_core_into_experimental_is_a_removal(self) -> None:
+        # Demoting a stable API to the experimental track drops it from the
+        # public surface, so both the API and its module must still be reported.
+        findings = compare_snapshots(
+            {"flashinfer/core.py": self.stable},
+            {"flashinfer/experimental/feature/backend.py": self.stable},
+        )
+        self.assertEqual(
+            tuple(finding.check for finding in findings),
+            ("public_api_removed", "public_module_moved"),
+        )
+
+    def test_reexport_from_experimental_is_a_removal(self) -> None:
+        findings = compare_snapshots(
+            {"flashinfer/core.py": self.stable},
+            {
+                "flashinfer/core.py": "from flashinfer.experimental.feature import api\n",
+                "flashinfer/experimental/feature.py": self.stable,
+            },
+        )
+        self.assertEqual(
+            tuple(finding.check for finding in findings), ("public_api_removed",)
+        )
+
+    def test_graduation_out_of_experimental_reports_nothing(self) -> None:
+        self.assertEqual(
+            compare_snapshots(
+                {"flashinfer/experimental/feature/backend.py": self.stable},
+                {"flashinfer/core.py": self.stable},
+            ),
+            [],
+        )
+
+
+class ListApisExperimentalExclusionTest(unittest.TestCase):
+    """scripts/list_apis.sh feeds the release API diff and applies the same rule."""
+
+    script = SCRIPTS_DIR / "list_apis.sh"
+
+    @unittest.skipUnless(shutil.which("rg"), "list_apis.sh requires ripgrep")
+    def test_experimental_track_excluded_unless_requested(self) -> None:
+        sources = {
+            "flashinfer/core.py": textwrap.dedent(
+                """
+                @flashinfer_api
+                def stable_api(value: int) -> None:
+                    pass
+
+
+                @flashinfer_experimental_api
+                def experimental_api(value: int) -> None:
+                    pass
+                """
+            ),
+            "flashinfer/experimental/feature/backend.py": textwrap.dedent(
+                """
+                @flashinfer_api
+                def backend_entry(value: int) -> None:
+                    pass
+                """
+            ),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for relative_path, source in sources.items():
+                path = root / relative_path
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(source, encoding="utf-8")
+
+            def run(*flags: str) -> str:
+                return subprocess.check_output(
+                    ["bash", str(self.script), "-d", "-p", *flags, "flashinfer/"],
+                    cwd=root,
+                    text=True,
+                )
+
+            default = run()
+            self.assertIn("def stable_api(", default)
+            self.assertNotIn("def experimental_api(", default)
+            self.assertNotIn("def backend_entry(", default)
+
+            included = run("-x")
+            for name in ("stable_api", "experimental_api", "backend_entry"):
+                self.assertIn(f"def {name}(", included)
+
+
 if __name__ == "__main__":
     unittest.main()

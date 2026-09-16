@@ -34,8 +34,11 @@
 //   DSV3_2:  d_nope=512, power-of-2 FP32 scale inline, 656B/token
 //   DSV4:    d_nope=448, UE8M0 scale footer, 584B/token
 //   GLM_NSA: d_nope=512, d_rope=64, arbitrary FP32 scale inline, 656B/token
-//   GLM53_NOPE: d_nope=512, d_rope=0, arbitrary FP32 scale inline,
-//               656B/token (the final 128 bytes are reserved cache padding)
+//   GLM53_NOPE: d_nope=512, d_rope=0, arbitrary FP32 scale inline, 528B/token.
+//               The vLLM fp8_ds_mla ABI pads the row to 656B; the kernels take
+//               the gmem row advance as a runtime stride, so a legacy 656B pool
+//               and a compact 528B pool are the same kernel (the payload prefix
+//               is identical). A flat 2D cache must be packed at 528B.
 //   DOTS3_SWA: d_nope=1024, d_rope=64, UE8M0 scale footer, 1160B/token
 //
 // DOTS3_SWA is the sliding-window family: its candidate list is a 513-token
@@ -44,13 +47,15 @@
 // in kv_cache_traits.cuh.
 enum class ModelType { DSV3_2, DSV4, GLM_NSA, GLM53_NOPE, DOTS3_SWA };
 
-// Bytes per packed KV cache token row, per model type.
+// Bytes per packed KV cache token row, per model type. For GLM53_NOPE this is
+// the payload; the gmem row advance is a runtime stride >= this value.
 constexpr int bytes_per_token(ModelType mt) {
   switch (mt) {
     case ModelType::DSV3_2:
     case ModelType::GLM_NSA:
-    case ModelType::GLM53_NOPE:
       return 656;
+    case ModelType::GLM53_NOPE:
+      return 528;
     case ModelType::DSV4:
       return 584;
     case ModelType::DOTS3_SWA:

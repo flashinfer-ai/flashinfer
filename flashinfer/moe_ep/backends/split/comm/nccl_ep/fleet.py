@@ -58,7 +58,7 @@ NCCL_EP_AUTO = 0
 # (``nccl/ep/include/nccl_ep/common.hpp``: ``#define MAX_SUPPORTED_TOKENS_PER_RANK
 # 8192``). We mirror it here to *clamp* the HT dispatch budget (graceful) rather
 # than let a large caller value (e.g. vLLM ``max_num_batched_tokens``) hit the C++
-# assert. LL has no such cap. Kept in sync with the nccl4py wheel.
+# assert. LL has no such cap. Kept in sync with the nccl-extensions wheel.
 _HT_MAX_SUPPORTED_TOKENS_PER_RANK = 8192
 
 
@@ -100,8 +100,10 @@ def _import_nccl_ep():
     except ImportError as e:  # pragma: no cover
         raise MoEEpNotBuiltError(
             "nccl.ep (nccl-ep-v0.1.0) python package unavailable. It ships in "
-            "the nccl4py wheel, a base dependency of flashinfer-python — "
-            "install with `pip install 'nccl4py>=0.3.1'`."
+            "the nccl-extensions wheel, a base dependency of flashinfer-python "
+            "— install with `pip install 'nccl-extensions>=0.1.0'`. NOTE: "
+            "nccl.ep used to ship in nccl4py; it moved out in nccl4py 0.4.1, "
+            "so an environment pinned to nccl4py alone no longer provides it."
         ) from e
 
 
@@ -310,8 +312,8 @@ class NcclEpFleet(FaultToleranceMixin, Fleet):
         if names is not None and "enable_mask" not in names:
             raise MoEEpFaultToleranceUnsupportedError(
                 "nccl.ep.GroupConfig has no `enable_mask` field: the installed "
-                "nccl4py predates EP fault tolerance. Upgrade the nccl4py wheel, "
-                "or drop FleetAlgoKnobFaultTolerance."
+                "nccl-extensions predates EP fault tolerance. Upgrade the "
+                "nccl-extensions wheel, or drop FleetAlgoKnobFaultTolerance."
             )
         ffi = mask_ffi()
         if not ffi.available:

@@ -50,7 +50,7 @@ backend packs them); the kernel backend computes on this rank's expert shard.
 
 | Backend | Config | Transport | Modes | Constraints |
 |---|---|---|---|---|
-| `nccl_ep` | `NcclEpConfig` | NCCL (nccl4py wheel) | LL `EXPERT_MAJOR` / `RANK_MAJOR`, HT `FLAT` | LL device kernel whitelists per-token row widths and caps top-k at 8 — see the runbook's "NCCL-EP low-latency device-kernel limits" |
+| `nccl_ep` | `NcclEpConfig` | NCCL (nccl-extensions wheel) | LL `EXPERT_MAJOR` / `RANK_MAJOR`, HT `FLAT` | LL device kernel whitelists per-token row widths and caps top-k at 8 — see the runbook's "NCCL-EP low-latency device-kernel limits" |
 | `nixl_ep` | `NvepConfig` | NIXL over UCX device API (GPU-initiated RDMA) | LL `EXPERT_MAJOR` only | needs `BUILD_NIXL_EP=1` (UCX v1.21+ device headers) and `BootstrapConfig.tcp_store`; `max_tokens_per_rank ≤ 1024`; hidden ∈ {2048, 2560, 3072, 4096, 5120, 6144, 7168, 8192}; handles top-k > 8 |
 
 #### Kernel backends (post-dispatch inner compute)
@@ -227,6 +227,7 @@ Kernels register via `@register_split_kernel` / `@register_mega_kernel` when `ba
 | `FleetParams` | EP sizing only (no weights); split transport fields (`algorithm`, `layout`, `dtype_bytes`) default and are ignored by mega |
 | `MoEEpTensors` | `hidden_states`, `topk_ids`, `topk_weights`; optional `scales`, `fc1_alpha`, `fc2_alpha`, `fc1_norm_const`, `recv_count`, `num_tokens_per_expert` |
 | `MoEWeightPack` | Canonical `w13` / `w2` (+ optional `w13_scale` / `w2_scale`); required `weights` arg at layer construction; `dummy_moe_weights()` for comm-only split |
+| `MoEEpMegaWorkspace` | Public, layer-bound capacity-profile handle returned by `MoEEpMegaLayer.create_workspace()`; do not construct directly |
 | `SplitConfig` | `comm` + `kernel` slots (default `NcclEpConfig` + `IdentityConfig`) |
 | `MegaConfig` | `megakernel`, `quantize_input`, `preprocess_weights`, optional `transformed_weights` |
 | `FleetAlgoKnobFaultTolerance` | Opt-in rank masking (`enabled`, `timeout_ms`, reconcile budgets) — see **Fault tolerance** |
@@ -238,9 +239,47 @@ Kernels register via `@register_split_kernel` / `@register_mega_kernel` when `ba
 - LL **EXPERT_MAJOR** — `[num_local_experts, cap, hidden]` (`cap = max_tokens_per_rank * world`), each row pre-assigned to one expert; the bridge synthesizes `top_k=1` / `final_scales=1` and **combine owns the real top-k reweight**.
 - LL **RANK_MAJOR** / **HT FLAT** — `[world, max_tokens_per_rank, hidden]` carrying received `topk_idx` / `topk_weights`; the runner uses the real `top_k` with non-local picks masked to weight 0, and combine just sums across ranks.
 
-BF16, W4A4, W4A8, and W4A16 are supported through the unified compute path (`MoEConfig.quant.variant`); quantized activations are prepared in the bridge, and W4A8 optionally packs its MXFP8 payload before dispatch (see **Available backends**).
+BF16, W4A4, W4A8, and W4A16 are supported through the unified compute path (`MoEConfig.quant` weight/activation `QuantFormat` pair); quantized activations are prepared in the bridge, and W4A8 optionally packs its MXFP8 payload before dispatch (see **Available backends**).
 
 **Mega:** pass `MegaConfig(megakernel=...)`. Weights required as the layer's `weights` argument. Workspace allocated on first forward. Output is bf16 `[num_tokens, token_hidden_size]` where `num_tokens = MoEEpTensors.num_tokens` (may be `< max_tokens_per_rank`). `fleet_knobs` are ignored. NIXL-EP split layers require `BootstrapConfig.tcp_store` at init.
+
+For serving several token capacities with one layer and one transformed weight
+set, allocate explicit profiles before capture:
+
+```python
+decode_workspace = layer.create_workspace(max_tokens_per_rank=256)
+prefill_workspace = layer.create_workspace(max_tokens_per_rank=4096)
+
+decode_out = layer.forward(decode_inputs, workspace=decode_workspace)
+prefill_out = layer.forward(prefill_inputs, workspace=prefill_workspace)
+
+# Explicit opt-in when a graph needs a stable borrowed output address.
+decode_view = layer.forward(
+    decode_inputs,
+    workspace=decode_workspace,
+    return_workspace_view=True,
+)
+```
+
+Creation and destruction are collective across EP ranks and must occur in the
+same order. A handle belongs to the layer that created it and accepts any live
+token count up to its capacity. Only one live handle per capacity is allowed on
+a layer. If an explicit handle is created for the
+`FleetParams.max_tokens_per_rank` capacity, it becomes the same logical profile
+selected by `workspace=None`; FlashInfer transfers/reuses the default allocation
+rather than acquiring an aliasing pool reference. `workspace=` selects capacity
+but preserves the existing owned-output default; request
+`return_workspace_view=True` explicitly when a supported backend and CUDA Graph
+need a stable borrowed output address.
+
+Warm each handle with `layer.warmup(..., workspace=handle)` before capturing a
+separate CUDA graph for it. Before `destroy()`, synchronize all uses and retire
+graphs that reference the handle. Physical workspaces are process-pooled across
+compatible layers, so handles are capacity profiles, not concurrency-isolation
+lanes: pooled profiles must execute under stream ordering. Calls without an
+explicit handle preserve the original lazy default-workspace behavior.
+Do not rely on Python garbage collection for cleanup: call `layer.destroy()`
+collectively and explicitly on every EP rank.
 
 ## Architecture
 
@@ -302,7 +341,7 @@ When `auto_bootstrap=False`: dist must be up at layer construction if `process_g
 
 Split comm backends ship native libs under `backends/split/comm/*/_libs/`. Probe with `have_nccl_ep()`, `have_nixl_ep()`, `available_backends()`. Missing libs raise `MoEEpNotBuiltError`.
 
-**Recommended build:** `docker/install/build_flashinfer_ep_pytorch.sh` builds the full NCCL-EP + Mega environment inside the NVIDIA PyTorch base image (`nvcr.io/nvidia/pytorch`): it pins the NCCL-EP runtime wheels (`nvidia-nccl-cu13`, `nccl4py`, `cuda-core`, `cuda-bindings`), installs the mega deps (DeepGEMM, NVSHMEM, CUTLASS DSL), then runs `BUILD_NIXL_EP=0 pip install --no-build-isolation -e .`. The EP backends are ON by default: NCCL-EP needs no build step (`nccl4py>=0.3.1` is a base dependency), and the NIXL-EP meson build runs best-effort unless opted out with `BUILD_NIXL_EP=0` (set `BUILD_NIXL_EP=1` to make missing build deps a hard error; `BUILD_NVEP=0` turns both backends off).
+**Recommended build:** `docker/install/build_flashinfer_ep_pytorch.sh` builds the full NCCL-EP + Mega environment inside the NVIDIA PyTorch base image (`nvcr.io/nvidia/pytorch`): it pins the NCCL-EP runtime wheels (`nvidia-nccl-cu13`, `nccl-extensions`, `nccl4py`, `cuda-core`, `cuda-bindings`), installs the mega deps (DeepGEMM, NVSHMEM, CUTLASS DSL), then runs `BUILD_NIXL_EP=0 pip install --no-build-isolation -e .`. The EP backends are ON by default: NCCL-EP needs no build step (`nccl-extensions>=0.1.0` is a base dependency; `nccl.ep` moved there out of `nccl4py` in nccl4py 0.4.1), and the NIXL-EP meson build runs best-effort unless opted out with `BUILD_NIXL_EP=0` (set `BUILD_NIXL_EP=1` to make missing build deps a hard error; `BUILD_NVEP=0` turns both backends off).
 
 ## Lifetimes
 
@@ -312,7 +351,8 @@ Split comm backends ship native libs under `backends/split/comm/*/_libs/`. Probe
 | Process runtime | layer init (if `auto_bootstrap`) | layer destroy (ref-counted) |
 | Fleet | first split forward | layer destroy |
 | Handle | each split forward | end of forward |
-| Mega workspace | first mega forward | layer destroy |
+| Default mega workspace | first mega forward | layer destroy |
+| Explicit mega workspace | `create_workspace()` | handle or layer destroy |
 
 ## Usage
 

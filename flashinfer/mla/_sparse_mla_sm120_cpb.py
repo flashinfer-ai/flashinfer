@@ -83,10 +83,13 @@ logger = logging.getLogger(__name__)
 _BI = 64  # chunk width in candidates (BLOCK_SIZE_N)
 _HPB = 16  # head tile per block
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 # Only current-schema files load; any other version counts as absent and the
-# families recalibrate on the next tuning-mode pass.
-_BYTES_PER_TOKEN = {"dsv4": 584, "dsv3_2": 656, "glm53_nope": 656, "dots3_swa": 1160}
+# families recalibrate on the next tuning-mode pass. v2: glm53_nope rows went
+# 656B -> 528B — constants and measured overrides can otherwise retain the old
+# 656B footprint, and a stale entry would silently overstate the L2 footprint
+# in the cpb guard.
+_BYTES_PER_TOKEN = {"dsv4": 584, "dsv3_2": 656, "glm53_nope": 528, "dots3_swa": 1160}
 _D_QK = {"dsv4": 512, "dsv3_2": 576, "glm53_nope": 512, "dots3_swa": 1088}
 _D_V = {"dsv4": 512, "dsv3_2": 512, "glm53_nope": 512, "dots3_swa": 1024}
 # Kernel candidate-tile width per family: DOTS3_SWA decodes at BI=32 (its
@@ -344,6 +347,45 @@ def _allocate_kv_pool(family: str, device: torch.device) -> tuple[torch.Tensor, 
     return kv_cache, kv_cache.shape[0] * 64
 
 
+def calibration_batch_count(
+    num_tokens: int,
+    total_topk: int,
+    bytes_per_token: int,
+    device: torch.device,
+    *,
+    max_batch_calls: int = _MAX_BATCH_CALLS,
+) -> int:
+    """Number of rotating index sets needed to evict one call's KV footprint."""
+    l2 = int(getattr(torch.cuda.get_device_properties(device), "L2_cache_size", 0) or 0)
+    footprint = max(1, num_tokens * total_topk * bytes_per_token)
+    if not l2:
+        return _MIN_BATCH_CALLS
+    return min(max_batch_calls, max(_MIN_BATCH_CALLS, l2 // footprint + 2))
+
+
+def time_calibration_calls(
+    call: Callable[..., None],
+    argument_sets: list[tuple[Any, ...]],
+) -> float:
+    """Return steady-state seconds/call using the shared queued timing protocol."""
+    if not argument_sets:
+        raise ValueError("calibration requires at least one argument set")
+    for i in range(_WARMUP_ITERS):
+        call(*argument_sets[i % len(argument_sets)])
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    best = float("inf")
+    for _ in range(_TIMED_BATCHES):
+        start.record()
+        for args in argument_sets:
+            call(*args)
+        end.record()
+        torch.cuda.synchronize()
+        best = min(best, start.elapsed_time(end) / 1e3 / len(argument_sets))
+    return best
+
+
 def _time_call_fresh_indices(
     call: Callable[[torch.Tensor], None],
     num_tokens: int,
@@ -373,33 +415,21 @@ def _time_call_fresh_indices(
     # A set recurs after K-1 intervening calls; require the reuse distance to
     # cover L2 so no gathered page survives between visits. Without a known
     # L2 size, the minimum batch still hides launch latency.
-    l2 = int(getattr(torch.cuda.get_device_properties(device), "L2_cache_size", 0) or 0)
-    footprint = max(1, num_tokens * topk * bytes_per_token)
-    k = (
-        _MIN_BATCH_CALLS
-        if not l2
-        else min(_MAX_BATCH_CALLS, max(_MIN_BATCH_CALLS, l2 // footprint + 2))
+    k = calibration_batch_count(
+        num_tokens,
+        topk,
+        bytes_per_token,
+        device,
     )
     sets = [
-        torch.randint(
-            0, num_slots, (num_tokens, topk), dtype=torch.int32, device=device
+        (
+            torch.randint(
+                0, num_slots, (num_tokens, topk), dtype=torch.int32, device=device
+            ),
         )
         for _ in range(k)
     ]
-    for i in range(_WARMUP_ITERS):
-        call(sets[i % k])
-    torch.cuda.synchronize()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    best = float("inf")
-    for _ in range(_TIMED_BATCHES):
-        start.record()
-        for indices in sets:
-            call(indices)
-        end.record()
-        torch.cuda.synchronize()
-        best = min(best, start.elapsed_time(end) / 1e3 / k)
-    return best
+    return time_calibration_calls(call, sets)
 
 
 def _make_decode_call_builder(
@@ -528,6 +558,10 @@ def calibrate(
     props = torch.cuda.get_device_properties(device)
     sm_count = int(props.multi_processor_count)
     l2_cache_bytes = int(getattr(props, "L2_cache_size", 0) or 0)
+    # On integrated-memory devices (GB10) the L2 is shared with the CPU fabric
+    # and the effective streaming window measures ~half the reported size.
+    if int(getattr(props, "is_integrated", 0) or 0):
+        l2_cache_bytes //= 2
     bi = _CHUNK_WIDTH[family]
     w = bi * _BYTES_PER_TOKEN[family]
     # Families whose decode is instantiated at a single topk have a fixed N,
@@ -955,10 +989,12 @@ def _maybe_load_disk() -> None:
         return
     try:
         payload = json.loads(path.read_text())
-        if (
-            not isinstance(payload, dict)
-            or payload.get("schema_version") != _SCHEMA_VERSION
-        ):
+        if not isinstance(payload, dict):
+            return
+        if payload.get("schema_version") != _SCHEMA_VERSION:
+            # This file version cannot supply entries. Retry only after it
+            # changes, rather than reparsing stale tuning on every lookup.
+            _cache_mtime = mtime
             return
         devices = payload["devices"]
         if not isinstance(devices, dict):
