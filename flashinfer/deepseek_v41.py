@@ -45,7 +45,8 @@ def deepseek_v41_index_scores_fp32(
 
     The optional CuTe workspace is a contiguous 16-byte-aligned uint8 CUDA
     tensor. For B=batch and C=candidate count, allocate at least
-    align16(4*B*C) + align16(8*B*C) + 4*B*ceil(C*8/128)*128 bytes.
+    align16(4*B*C) + align16(B*ceil(C/4)*4) bytes. It stores encoded
+    candidate IDs and packed validity; each scorer gathers its own KV scales.
     Use a separate workspace for concurrently executing calls. Reusing out
     and workspace avoids allocation; warm the call before CUDA Graph capture.
     The workspace and output must not overlap any input or each other.
@@ -69,3 +70,74 @@ def deepseek_v41_index_scores_fp32(
         backend=backend,
         workspace=workspace,
     )
+
+
+@flashinfer_experimental_api
+def prepare_deepseek_v41_candidate_metadata(
+    visible,
+    block_table,
+    candidates,
+    *,
+    page_size,
+    num_physical_pages,
+    max_context_len,
+    out=None,
+):
+    """Publish an owned snapshot of H32 block8 candidate metadata on CUDA.
+
+    visible is int32[B], block_table is int32[B,pages], and candidates is
+    int32[B,C], with 1<=C<=2048. All tensors must be contiguous on the same
+    SM100/SM103 device. page_size is 32, 64 or 128; max_context_len is a
+    positive int32 context covered by the table. Caller guarantees
+    0<=visible<=max_context_len. Invalid candidate or physical page IDs
+    produce masked scores; duplicates and candidate order are preserved.
+
+    The returned opaque metadata owns encoded IDs, validity and visibility.
+    Later changes to these input tensors do not change the snapshot. Publish
+    again when candidates, visibility or page mapping change. Pass an existing
+    metadata object as out to reuse its storage; batch, candidate count, page
+    size, physical page count, context and device must match. Warm preparation
+    and consumption before CUDA Graph capture, then reuse metadata and scores.
+
+    Publication runs on the current stream. Order consumers after publication
+    using stream order or events, including replay of a captured publication.
+    Do not republish a snapshot while any consumer reads it. Once publication
+    completes, different layers or streams may read it with separate outputs.
+    No metadata reuse across layers is assumed by the API.
+    """
+    from .experimental.deepseek_v41.candidate_metadata import prepare_candidate_metadata
+
+    return prepare_candidate_metadata(
+        visible,
+        block_table,
+        candidates,
+        page_size=page_size,
+        num_physical_pages=num_physical_pages,
+        max_context_len=max_context_len,
+        out=out,
+    )
+
+
+@flashinfer_experimental_api
+def deepseek_v41_candidate_scores_fp32(
+    q_data, q_scales, kv_cache, weights, metadata, *, out=None
+):
+    """Score one layer using explicitly prepared block8 candidate metadata.
+
+    metadata must be returned by prepare_deepseek_v41_candidate_metadata.
+    Q, scales, cache, weights, output and finite-value requirements match
+    deepseek_v41_index_scores_fp32 with backend="cute_dsl". The same credited
+    native CuTe scorer and ordered FP32 arithmetic are used; CUTLASS DSL>=4.7
+    is required. Returns BF16[B,C*8] with the same candidate ordering.
+
+    Layer tensors must match the snapshot's batch, page size, physical page
+    count and device. Cache addresses and padded strides may differ between
+    layers; address width is selected from each complete strided cache pool.
+    Output and layer tensors must not overlap metadata storage, and output
+    must not overlap inputs. This function only consumes the snapshot;
+    publish it again explicitly when candidates, mapping or visibility change.
+    Reuse out to avoid output allocation during graph replay.
+    """
+    from .experimental.deepseek_v41.candidate_metadata import candidate_scores_fp32
+
+    return candidate_scores_fp32(q_data, q_scales, kv_cache, weights, metadata, out=out)

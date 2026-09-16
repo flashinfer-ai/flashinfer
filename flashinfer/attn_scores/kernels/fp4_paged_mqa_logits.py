@@ -16,7 +16,8 @@
 # tensorrt_llm/_torch/cute_dsl_kernels/blackwell/paged_mqa_logits/fp4_paged_mqa_logits.py
 # Original copyright: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # H32 candidate gathering extends Dhiraj Reddy's FlashInfer ports (#4365, #4737).
-# The original MMA, scale layouts, epilogue, and scheduler remain shared.
+# Native MMA, scale layouts and the FP32 reduction recipe are reused; H32
+# adds cooperative gathers, fixed-width scheduling and serial math consumption.
 
 """
 CuTe DSL FP4 (MXFP4) paged MQA logits kernel for Blackwell (SM100/SM103) and Rubin (SM107).
@@ -38,9 +39,12 @@ warp partition / barrier choreography with the following deltas (see plan
     KV+SF pipe — UMMA owns it.
 
 Architecture:
-  - 384 threads: 256 math (2 WGs) + 128 specialized (2 TMA + 2 UMMA)
+  - Full H64: 384 threads, 256 math (2 WGs) + 128 specialized (2 TMA + 2 UMMA)
+  - Candidate H32: 256 threads, 128 math (1 WG) + 128 specialized
+    (2 cooperative cp.async/Q-TMA warps + 2 UMMA warps); 3 CTAs per SM
   - 1 TMA per KV block [128, 128] (FP4 packed bytes = 64 / row)
-  - 2 warp groups process 2 KV blocks per iteration (kNumMathWarpGroups=2)
+  - Two accumulator groups process 2 KV tiles per iteration; H32 drains both
+    sequentially with one full math warpgroup and reuses its H32 weight vector
   - Q reloaded via TMA pipeline when q_idx (batch) changes
   - Persistent kernel: CTAs iterate through assigned (q_idx, kv_idx) pairs
   - Weights cached in registers: preloaded once per q_idx change
@@ -73,7 +77,7 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass import BFloat16, Float4E2M1FN, Float8E8M0FNU, Float16, Int32
 from cutlass._mlir import ir
-from cutlass._mlir.dialects import cute_nvgpu, llvm, nvvm, vector
+from cutlass._mlir.dialects import llvm, nvvm, vector
 from cutlass.cute.arch import get_max_tmem_alloc_cols
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cutlass_dsl import BaseDSL, dsl_user_op
@@ -100,20 +104,63 @@ except ImportError:
 
 
 @dsl_user_op
-def descriptor_pointer(atom, bar, *, loc=None, ip=None):
-    # Isolate the CuTe atom-field extraction here. The public primitive
-    # accepts a descriptor pointer and lets each lane issue its own TMA.
-    executable = atom._trait.unpack(tma_bar_ptr=bar, loc=loc, ip=ip)
-    pointer = cute_nvgpu.atom_get_value(
-        ir.Type.parse(
-            "!cute.ptr<!cute_nvgpu.tma_descriptor_tiled, generic, align<64>>"
-        ),
-        executable,
-        ir.Attribute.parse("#cute_nvgpu.atom_copy_field_tmaload<tma_descriptor_ptr>"),
+def candidate_copy_sf16(dst, src, *, cp_size, loc=None, ip=None):
+    # Two lanes copy each block8's 32B scale segment. Prefetch the adjacent
+    # scale sector, retaining normal L2 priority for these small shared lines.
+    prims.inline_ptx(
+        "cp.async.cg.shared.global.L2::64B [{$r0}], [{$r1}], 16, {$r2};",
+        read_only_args=[
+            dst.toint(loc=loc, ip=ip),
+            src.toint(loc=loc, ip=ip),
+            cutlass.Int32(cp_size),
+        ],
         loc=loc,
         ip=ip,
     )
-    return pointer
+
+
+@dsl_user_op
+def candidate_copy_block512(dst, src, *, cp_size, loc=None, ip=None):
+    """Eight cooperating lanes copy one 512B candidate using scoped addresses.
+
+    Sparse copy organization follows DeepGEMM. Keep the shared scorer's
+    Dhiraj Reddy / TensorRT-LLM attribution and its FP32 reduction unchanged.
+    Streaming K uses evict-first; scales and metadata keep normal priority.
+    """
+    prims.inline_ptx(
+        """{
+        .reg .u32 dst, sw;
+        .reg .b64 policy;
+        createpolicy.fractional.L2::evict_first.b64 policy, 1.0;
+        add.u32 dst, {$r0}, 0;
+        shr.u32 sw, dst, 3;
+        and.b32 sw, sw, 48;
+        xor.b32 dst, dst, sw;
+        cp.async.cg.shared.global.L2::cache_hint [dst], [{$r1}+0], 16, {$r2}, policy;
+        add.u32 dst, {$r0}, 128;
+        shr.u32 sw, dst, 3;
+        and.b32 sw, sw, 48;
+        xor.b32 dst, dst, sw;
+        cp.async.cg.shared.global.L2::cache_hint [dst], [{$r1}+128], 16, {$r2}, policy;
+        add.u32 dst, {$r0}, 256;
+        shr.u32 sw, dst, 3;
+        and.b32 sw, sw, 48;
+        xor.b32 dst, dst, sw;
+        cp.async.cg.shared.global.L2::cache_hint [dst], [{$r1}+256], 16, {$r2}, policy;
+        add.u32 dst, {$r0}, 384;
+        shr.u32 sw, dst, 3;
+        and.b32 sw, sw, 48;
+        xor.b32 dst, dst, sw;
+        cp.async.cg.shared.global.L2::cache_hint [dst], [{$r1}+384], 16, {$r2}, policy;
+        }""",
+        read_only_args=[
+            dst.toint(loc=loc, ip=ip),
+            src.toint(loc=loc, ip=ip),
+            cutlass.Int32(cp_size),
+        ],
+        loc=loc,
+        ip=ip,
+    )
 
 
 # CuTe DSL CUDA 13 validates rounding modes as string literals. The string
@@ -451,6 +498,7 @@ class FP4MQALogitsKernel:
         *,
         arch: str,
         candidate_block8: bool = False,
+        candidate_offset32: bool = False,
         weight_dtype=None,
     ):
         # arch is the cute.compile --gpu-arch target (e.g. "sm_107a"), passed
@@ -471,6 +519,8 @@ class FP4MQALogitsKernel:
             candidate_block8 and self.weight_dtype == cutlass.BFloat16
         )
         self.candidate_block8 = candidate_block8
+        assert not candidate_offset32 or candidate_block8
+        self.candidate_offset32 = candidate_offset32
         self.cache_page_size = phys_block_kv
         if candidate_block8:
             phys_block_kv = 8
@@ -517,8 +567,8 @@ class FP4MQALogitsKernel:
         # MMA/TMEM N tile spans one atom; the logical next_n only appears in the
         # output row stride (see _atom_out_row_base).
         self.N = self.next_n_atom * num_heads
-        self.num_sms = num_sms
-        self.num_epi_subtiles = num_epi_subtiles
+        self.num_sms = num_sms * (3 if self.candidate_block8 else 1)
+        self.num_epi_subtiles = 1 if self.candidate_block8 else num_epi_subtiles
         self.epi_dtype = epi_dtype
         # When True, skip the in-kernel SMEM warp_transpose for KV SF; assume
         # the host has pre-arranged GMEM SF into UTCCP chunk layout. Only valid
@@ -575,21 +625,23 @@ class FP4MQALogitsKernel:
             )
         self.num_groups = 2
 
-        self.num_math_threads = 256
+        # H32 reuses one math warpgroup for both accumulator groups. Full H64
+        # retains a separate math warpgroup for each accumulator.
+        self.num_math_threads = 128 if self.candidate_block8 else 256
         self.num_specialized_threads = 128
-        self.threads_per_cta = 384
-        self.num_math_warps = 8
-        self.tma_warp_base = 8
-        self.umma_warp_base = 10
+        self.threads_per_cta = self.num_math_threads + self.num_specialized_threads
+        self.num_math_warps = self.num_math_threads // 32
+        self.tma_warp_base = self.num_math_warps
+        self.umma_warp_base = self.tma_warp_base + 2
 
-        self.num_q_stages = 3
+        self.num_q_stages = 2 if self.candidate_block8 else 3
         # Note, when next_n=1, num_umma_stages could be 2. But test on silicon shows,
         # num_umma_stages=2 don't improve perf much, so we use num_umma_stages=1 now.
         # This parameter could be tuned when needed.
         # self.num_umma_stages = 2 if next_n == 1 else 1
-        self.num_umma_stages = 2 if candidate_block8 else 1
+        self.num_umma_stages = 1
         # KV pipeline depth
-        self.num_kv_stages = 6
+        self.num_kv_stages = 4 if self.candidate_block8 else 6
         # Step 5.11: smem_pad_bytes (FP8 sub-partition opt knob) dropped.
 
         # acc_dtype is locked to fp32 for FP4 MXF4 SS (cannot be exposed).
@@ -839,7 +891,6 @@ class FP4MQALogitsKernel:
         batch_size: cutlass.Int32,
         stream: cuda.CUstream,
         candidate_valid: Optional[cute.Tensor] = None,
-        candidate_sf: Optional[cute.Tensor] = None,
     ):
         if cutlass.const_expr(self.candidate_block8):
             self.candidate_width = block_table.shape[1] * 8
@@ -890,14 +941,6 @@ class FP4MQALogitsKernel:
             kv_fused.iterator + scale_offset_bytes, sf_kv_uint8_layout
         )
         sf_kv = cute.recast_tensor(sf_kv_uint8, cutlass.Int32)
-        if cutlass.const_expr(self.candidate_block8):
-            sf_kv = cute.make_tensor(
-                candidate_sf.iterator,
-                cute.make_layout(
-                    (self.block_kv, cute.size(candidate_sf) // self.block_kv),
-                    stride=(1, self.block_kv),
-                ),
-            )
 
         a_dtype = a.element_type
         b_dtype = b.element_type
@@ -924,12 +967,14 @@ class FP4MQALogitsKernel:
         # ((tile_M, tile_K), rest_M, rest_K, stages) → drop trivial rest_K
         self.a_tma_view_layout = cute.select(self.a_tma_view_layout, mode=[0, 1, 3])
         # ((tile_M, tile_K), rest_M=num_sub_blocks, stages)
-        tma_atom_a, tma_tensor_a = cpasync.make_tiled_tma_atom(
-            tma_load_op,
-            a,
-            self.a_tma_view_layout[0],  # atom SMEM = single-tile (mode 0)
-            (self.phys_block_kv, self.head_dim),
-        )
+        tma_atom_a, tma_tensor_a = None, None
+        if cutlass.const_expr(not self.candidate_block8):
+            tma_atom_a, tma_tensor_a = cpasync.make_tiled_tma_atom(
+                tma_load_op,
+                a,
+                self.a_tma_view_layout[0],  # atom SMEM = single-tile (mode 0)
+                (self.phys_block_kv, self.head_dim),
+            )
 
         # TMA for Q (B) — full K=128, L dim = batch_size (unchanged)
         b_op = sm100_utils.cluster_shape_to_tma_atom_B(
@@ -966,14 +1011,15 @@ class FP4MQALogitsKernel:
         self.sf_kv_smem_layout_staged = cute.make_layout(
             (self.block_kv, self.num_kv_stages)
         )
-        sf_tile = self.block_kv if self.candidate_block8 else self.cache_page_size
-        sf_kv_smem_per_subblock = cute.make_layout((sf_tile,))
-        tma_atom_sf_kv, tma_tensor_sf_kv = cpasync.make_tiled_tma_atom(
-            tma_load_op,
-            sf_kv,
-            sf_kv_smem_per_subblock,
-            (sf_tile,),
-        )
+        tma_atom_sf_kv, tma_tensor_sf_kv = None, None
+        if cutlass.const_expr(not self.candidate_block8):
+            sf_kv_smem_per_subblock = cute.make_layout((self.cache_page_size,))
+            tma_atom_sf_kv, tma_tensor_sf_kv = cpasync.make_tiled_tma_atom(
+                tma_load_op,
+                sf_kv,
+                sf_kv_smem_per_subblock,
+                (self.cache_page_size,),
+            )
 
         # TMA for SF Q — [N, batch_size] int32, tile [N] (1D, like weights).
         # SMEM single stage size = N_padded int32 (UTCCP atom is 128-token
@@ -1034,6 +1080,13 @@ class FP4MQALogitsKernel:
         )
 
         num_ctas = self.num_sms
+        if cutlass.const_expr(self.candidate_block8):
+            # The fixed partition gives no work to CTA IDs >= total segments
+            # when the batch is small. Avoid their pipeline/TMEM setup entirely.
+            segments = (self.candidate_width + self.block_kv * 2 - 1) // (
+                self.block_kv * 2
+            )
+            num_ctas = min(self.num_sms, batch_size * segments)
 
         @cute.struct
         class SharedStorage:
@@ -1050,6 +1103,7 @@ class FP4MQALogitsKernel:
             tiled_mma,
             tma_atom_a,
             tma_tensor_a,
+            kv_fused,
             tma_atom_b,
             tma_tensor_b,
             tma_atom_w,
@@ -1082,7 +1136,8 @@ class FP4MQALogitsKernel:
         ).launch(
             grid=(1, 1, num_ctas),
             block=[self.threads_per_cta, 1, 1],
-            cluster=(*self.cluster_shape_mn, 1),
+            cluster=None if self.candidate_block8 else (*self.cluster_shape_mn, 1),
+            min_blocks_per_mp=3 if self.candidate_block8 else 1,
             stream=stream,
         )
 
@@ -1090,14 +1145,17 @@ class FP4MQALogitsKernel:
     def kernel(
         self,
         tiled_mma: cute.TiledMma,
-        tma_atom_a: cute.CopyAtom,
-        mA_mkl: cute.Tensor,  # KV pool (FP4)
+        tma_atom_a: Optional[cute.CopyAtom],
+        mA_mkl: Optional[cute.Tensor],  # KV pool (FP4)
+        mRawKV: cute.Tensor,  # Raw packed pool for cp.async
         tma_atom_b: cute.CopyAtom,
         mB_nkl: cute.Tensor,  # Q (L dim = batch_size, FP4)
         tma_atom_w: cute.CopyAtom,
         mW_tma: cute.Tensor,  # Weights TMA coord tensor [N, batch_size]
-        tma_atom_sf_kv: cute.CopyAtom,
-        mSF_KV_tma: cute.Tensor,  # SF KV TMA coord tensor [phys_block_kv, num_phys_blocks] int32
+        tma_atom_sf_kv: Optional[cute.CopyAtom],
+        mSF_KV_tma: Optional[
+            cute.Tensor
+        ],  # SF KV TMA coord tensor [phys_block_kv, num_phys_blocks] int32
         tma_atom_sf_q: cute.CopyAtom,
         mSF_Q_tma: cute.Tensor,  # SF Q TMA coord tensor [N, batch_size] int32
         mLogits: cute.Tensor,  # [batch_size * next_n, max_context_len]
@@ -1139,17 +1197,17 @@ class FP4MQALogitsKernel:
 
         # Warp roles
         warpgroup_idx = warp_idx // 4
-        is_math_warp = warp_idx < 8
-        is_tma_warp_0 = warp_idx == 8
-        is_tma_warp_1 = warp_idx == 9
+        is_math_warp = warp_idx < self.num_math_warps
+        is_tma_warp_0 = warp_idx == self.tma_warp_base
+        is_tma_warp_1 = warp_idx == self.tma_warp_base + 1
         is_tma_warp = is_tma_warp_0 | is_tma_warp_1
-        is_umma_warp_0 = warp_idx == 10
-        is_umma_warp_1 = warp_idx == 11
+        is_umma_warp_0 = warp_idx == self.umma_warp_base
+        is_umma_warp_1 = warp_idx == self.umma_warp_base + 1
 
         # Early schedule metadata load: issue global loads ASAP so their
         # ~200-cycle L2 latency overlaps with subsequent prologue setup
         # (SMEM alloc, TMA partition, MMA fragment creation, etc.)
-        NUM_MATH_WG = 2  # kNumMathWarpGroups
+        NUM_KV_GROUPS = 2  # Accumulator groups, independent of math warpgroup count
         NUM_BLOCKS_PER_MMA = self.num_blocks_per_mma
         PHYS_BLOCK_KV = self.phys_block_kv
         sm_idx = bidz
@@ -1184,10 +1242,12 @@ class FP4MQALogitsKernel:
         ) // self.block_kv
 
         if is_tma_warp:
-            cpasync.prefetch_descriptor(tma_atom_a)
+            if cutlass.const_expr(not self.candidate_block8):
+                cpasync.prefetch_descriptor(tma_atom_a)
             cpasync.prefetch_descriptor(tma_atom_b)
             cpasync.prefetch_descriptor(tma_atom_w)
-            cpasync.prefetch_descriptor(tma_atom_sf_kv)
+            if cutlass.const_expr(not self.candidate_block8):
+                cpasync.prefetch_descriptor(tma_atom_sf_kv)
             cpasync.prefetch_descriptor(tma_atom_sf_q)
 
         smem = utils.SmemAllocator()
@@ -1203,10 +1263,12 @@ class FP4MQALogitsKernel:
         # === Pipelines ===
         prod_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
 
-        # Q pipeline: TMA producer → Math consumer (8 math warps)
-        # PipelineTmaAsync: consumer_release uses is_signalling_thread
-        # (lane 0 per warp). 8 math warps × 1 lane-0 = 8 arrives.
-        q_cons_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, 8)
+        # Q pipeline: TMA producer to math consumers. PipelineTmaAsync
+        # consumer_release signals once per warp (lane 0): four arrivals
+        # for H32 candidates, eight for the full H64 path.
+        q_cons_group = pipeline.CooperativeGroup(
+            pipeline.Agent.Thread, self.num_math_warps
+        )
         q_pipeline = pipeline.PipelineTmaAsync.create(
             barrier_storage=storage.q_mbar.data_ptr(),
             num_stages=self.num_q_stages,
@@ -1220,7 +1282,7 @@ class FP4MQALogitsKernel:
         q_prod_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Producer, self.num_q_stages
         )
-        # Both Math WGs share the same pipeline state (advance in lockstep)
+        # Math warps advance the shared Q pipeline state once per query
         q_cons_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Consumer, self.num_q_stages
         )
@@ -1241,13 +1303,15 @@ class FP4MQALogitsKernel:
         # Reuse waits for all 32 scale-transpose writers and one asynchronous
         # TC completion. A thread arrival alone does not wait for MMA reads.
         kv_cons_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, 33)
-        kv_prod_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, 1)
+        kv_prod_group = pipeline.CooperativeGroup(
+            pipeline.Agent.Thread, 33 if self.candidate_block8 else 1
+        )
         kv_pipeline_0 = pipeline.PipelineTmaAsync.create(
             barrier_storage=storage.kv_mbar_0.data_ptr(),
             num_stages=self.num_kv_stages,
             producer_group=kv_prod_group,
             consumer_group=kv_cons_group,
-            tx_count=self.num_kv_sf_tma_bytes,
+            tx_count=0 if self.candidate_block8 else self.num_kv_sf_tma_bytes,
             cta_layout_vmnk=cluster_layout_vmnk,
             tidx=tidx,
             defer_sync=True,
@@ -1257,7 +1321,7 @@ class FP4MQALogitsKernel:
             num_stages=self.num_kv_stages,
             producer_group=kv_prod_group,
             consumer_group=kv_cons_group,
-            tx_count=self.num_kv_sf_tma_bytes,
+            tx_count=0 if self.candidate_block8 else self.num_kv_sf_tma_bytes,
             cta_layout_vmnk=cluster_layout_vmnk,
             tidx=tidx,
             defer_sync=True,
@@ -1280,7 +1344,7 @@ class FP4MQALogitsKernel:
         )
 
         # UMMA pipelines (per-group)
-        math_threads_per_group = self.num_math_threads // 2
+        math_threads_per_group = 128  # A full warpgroup consumes each accumulator
         umma_pipeline_0 = pipeline.PipelineUmmaAsync.create(
             barrier_storage=storage.umma_mbar_0.data_ptr(),
             num_stages=self.num_umma_stages,
@@ -1342,13 +1406,13 @@ class FP4MQALogitsKernel:
             pipeline.PipelineUserType.Consumer, self.num_umma_stages
         )
 
-        # TMEM — only Math warps (8×32=256) + UMMA warps (2×32=64) = 320 threads
+        # TMEM — only the math threads and the two UMMA warps participate
         # TMA warps do NOT participate, so they can start TMA loads earlier.
         # Math warp 0 is the allocator (like fp16_gemm_3's epilogue warp 0),
         # because math warps are the last TMEM consumers (epilogue reads).
         # Warp roles reach different instructions: use the non-aligned
         # named-barrier primitive for retrieval and the SFB rendezvous.
-        tmem_alloc_num_threads = 320  # 10 warps: warp 0-7 (math) + warp 10-11 (umma)
+        tmem_alloc_num_threads = self.num_math_threads + 64  # Math and both MMA warps
         tmem_alloc_barrier = pipeline.NamedBarrier(
             barrier_id=1, num_threads=tmem_alloc_num_threads
         )
@@ -1432,27 +1496,28 @@ class FP4MQALogitsKernel:
         # Use .outer (plain layout); swizzle is captured by sKV_0's iterator.
         # GMEM: local_tile by (phys, head), then group first 2 modes into tile.
         thr_mma = tiled_mma.get_slice(mma_tile_coord_v)
-        sKV_0_for_tma = cute.make_tensor(sKV_0.iterator, a_tma_view_layout.outer)
-        sKV_1_for_tma = cute.make_tensor(sKV_1.iterator, a_tma_view_layout.outer)
-        gA = cute.local_tile(
-            mA_mkl,
-            (self.phys_block_kv, self.head_dim),
-            coord=(None, None, None),
-        )
-        tAsA_0, tAgA_0 = cpasync.tma_partition(
-            tma_atom_a,
-            0,
-            cute.make_layout(1),
-            sKV_0_for_tma,
-            cute.group_modes(gA, 0, 2),
-        )
-        tAsA_1, tAgA_1 = cpasync.tma_partition(
-            tma_atom_a,
-            0,
-            cute.make_layout(1),
-            sKV_1_for_tma,
-            cute.group_modes(gA, 0, 2),
-        )
+        if cutlass.const_expr(not self.candidate_block8):
+            sKV_0_for_tma = cute.make_tensor(sKV_0.iterator, a_tma_view_layout.outer)
+            sKV_1_for_tma = cute.make_tensor(sKV_1.iterator, a_tma_view_layout.outer)
+            gA = cute.local_tile(
+                mA_mkl,
+                (self.phys_block_kv, self.head_dim),
+                coord=(None, None, None),
+            )
+            tAsA_0, tAgA_0 = cpasync.tma_partition(
+                tma_atom_a,
+                0,
+                cute.make_layout(1),
+                sKV_0_for_tma,
+                cute.group_modes(gA, 0, 2),
+            )
+            tAsA_1, tAgA_1 = cpasync.tma_partition(
+                tma_atom_a,
+                0,
+                cute.make_layout(1),
+                sKV_1_for_tma,
+                cute.group_modes(gA, 0, 2),
+            )
 
         # Partition Q (B): shared SMEM, L dim = batch_size
         gB_nkl = cute.local_tile(
@@ -1487,29 +1552,34 @@ class FP4MQALogitsKernel:
         # Layout (phys_block_kv, num_sub, stages) K-major with custom strides.
         # Strides are int32-element units, same numeric stride values as FP8's
         # fp32 case (4-byte element / element-major-1) — so no shape change.
-        sf_tile = self.block_kv if self.candidate_block8 else self.phys_block_kv
-        sf_kv_tma_view_layout = cute.make_layout(
-            (sf_tile, self.block_kv // sf_tile, self.num_kv_stages),
-            stride=(1, sf_tile, self.block_kv),
-        )
-        sSF_KV_0_for_tma = cute.make_tensor(sSF_KV_0.iterator, sf_kv_tma_view_layout)
-        sSF_KV_1_for_tma = cute.make_tensor(sSF_KV_1.iterator, sf_kv_tma_view_layout)
-        # GMEM: local_tile by phys to match atom's tile size
-        gSF_KV = cute.local_tile(mSF_KV_tma, (sf_tile,), coord=(None, None))
-        tSsSF_KV_0, tSgSF_KV_0 = cpasync.tma_partition(
-            tma_atom_sf_kv,
-            0,
-            cute.make_layout(1),
-            sSF_KV_0_for_tma,
-            gSF_KV,
-        )
-        tSsSF_KV_1, tSgSF_KV_1 = cpasync.tma_partition(
-            tma_atom_sf_kv,
-            0,
-            cute.make_layout(1),
-            sSF_KV_1_for_tma,
-            gSF_KV,
-        )
+        if cutlass.const_expr(not self.candidate_block8):
+            sf_tile = self.phys_block_kv
+            sf_kv_tma_view_layout = cute.make_layout(
+                (sf_tile, self.block_kv // sf_tile, self.num_kv_stages),
+                stride=(1, sf_tile, self.block_kv),
+            )
+            sSF_KV_0_for_tma = cute.make_tensor(
+                sSF_KV_0.iterator, sf_kv_tma_view_layout
+            )
+            sSF_KV_1_for_tma = cute.make_tensor(
+                sSF_KV_1.iterator, sf_kv_tma_view_layout
+            )
+            # GMEM: local_tile by phys to match atom's tile size
+            gSF_KV = cute.local_tile(mSF_KV_tma, (sf_tile,), coord=(None, None))
+            tSsSF_KV_0, tSgSF_KV_0 = cpasync.tma_partition(
+                tma_atom_sf_kv,
+                0,
+                cute.make_layout(1),
+                sSF_KV_0_for_tma,
+                gSF_KV,
+            )
+            tSsSF_KV_1, tSgSF_KV_1 = cpasync.tma_partition(
+                tma_atom_sf_kv,
+                0,
+                cute.make_layout(1),
+                sSF_KV_1_for_tma,
+                gSF_KV,
+            )
 
         # Step 5.3: Partition SF Q: standalone TMA, [N, batch_size] → [N] per
         # stage (parallel to weights). Single SMEM ring buffer (sSF_Q has
@@ -1576,14 +1646,19 @@ class FP4MQALogitsKernel:
 
         # ===== WARP-SPECIALIZED EXECUTION =====
 
+        # All four control warps share one setmaxnreg instruction, as required
+        # by the warpgroup-wide PTX aligned contract. Math retains its own
+        # uniform allocation inside the math branch below.
+        if not is_math_warp:
+            cute.arch.warpgroup_reg_dealloc(56 if self.candidate_block8 else 24)
+
         if is_tma_warp_0:
             # TMA warp 0: loads Q (prefetch) + KV for group 0
-            cute.arch.warpgroup_reg_dealloc(64 if self.candidate_block8 else 24)
 
             # Per-role scheduler state (see comment above the branch chain)
-            end_kv_idx = end_kv_half * NUM_MATH_WG
+            end_kv_idx = end_kv_half * NUM_KV_GROUPS
             next_q_idx = start_q
-            next_kv_idx = start_kv_half * NUM_MATH_WG
+            next_kv_idx = start_kv_half * NUM_KV_GROUPS
             next_num_kv = current_num_kv
             q_idx = batch_size  # sentinel: no previous batch
             has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
@@ -1716,10 +1791,10 @@ class FP4MQALogitsKernel:
                             q_prod_state.advance()
 
                 # Candidates: each half warp prefetches16 adjacent block8
-                # IDs. Four coalesced loads cover eight tiles; each issuing
-                # lane shuffles one ID for its TMA. Tail IDs select the first
-                # page beyond the TMA bound, which zero-fills without reading
-                # an uninitialized or contended dummy page. Full scoring
+                # IDs. Four coalesced loads cover eight tiles. Resolve each
+                # lane's page once, then exchange64-bit offsets for the copies.
+                # Tail IDs select the pool-end sentinel and zero-fill through
+                # cp_size=0 without reading a dummy page. Full scoring
                 # retains its32-tile prefetch and per-column table bounds.
                 if cutlass.const_expr(self.candidate_block8):
                     if kv_blk_ptr == 8:
@@ -1729,28 +1804,28 @@ class FP4MQALogitsKernel:
                         ) // 8
                         for i in cutlass.range_constexpr(4):
                             prefetch_kv = (
-                                kv_idx + 0 + (lane_idx // 16 + i * 2) * NUM_MATH_WG
+                                kv_idx + 0 + (lane_idx // 16 + i * 2) * NUM_KV_GROUPS
                             )
                             col = prefetch_kv * NUM_BLOCKS_PER_MMA + lane_idx % 16
                             blk = cutlass.Int32(
-                                mA_mkl.shape[2] * (self.cache_page_size // 8)
+                                mRawKV.shape[0] * (self.cache_page_size // 8)
                             )
                             if col < num_phys_row:
                                 blk = mBlockTable[(self._atom_seq(q_idx), col)]
                             cached_blks[i] = blk
                     word = cached_blks[0]
                     for i in cutlass.range_constexpr(1, 4):
-                        if kv_blk_ptr // 2 == i:
+                        if cutlass.Uint32(kv_blk_ptr) // 2 == i:
                             word = cached_blks[i]
                     encoded = cute.arch.shuffle_sync(
-                        word, lane_idx % 16 + (kv_blk_ptr % 2) * 16
+                        word, lane_idx % 16 + (cutlass.Uint32(kv_blk_ptr) % 2) * 16
                     )
                     kv_blk_ptr = kv_blk_ptr + 1
 
                 else:
                     if kv_blk_ptr == 32:
                         kv_blk_ptr = cutlass.Int32(0)
-                        prefetch_kv = kv_idx + lane_idx * NUM_MATH_WG
+                        prefetch_kv = kv_idx + lane_idx * NUM_KV_GROUPS
                         num_phys_row = (
                             self._atom_ctx_len(q_idx, mContextLens) + PHYS_BLOCK_KV - 1
                         ) // PHYS_BLOCK_KV
@@ -1774,34 +1849,61 @@ class FP4MQALogitsKernel:
                 bar = kv_pipeline_0.producer_get_barrier(kv_prod_state_0)
                 stage = kv_prod_state_0.index
                 if cutlass.const_expr(self.candidate_block8):
-                    # Publish the elected producer arrival/byte budget before
-                    # all16 issuing lanes enqueue their disjoint512B tiles.
                     cute.arch.sync_warp()
-                    desc = descriptor_pointer(tma_atom_a, bar)
-                    if lane_idx < NUM_BLOCKS_PER_MMA:
-                        sub = encoded % (self.cache_page_size // 8)
-                        page = encoded // (self.cache_page_size // 8)
-                        prims.cp_async_bulk_tensor_shared_cta_global(
-                            tAsA_0[(None, lane_idx, stage)].iterator,
-                            desc,
-                            [0, sub * 8, page],
-                            bar,
-                        )
-                    sf_index = (
-                        q_idx
-                        * (
-                            (mBlockTable.shape[1] * 8 + self.block_kv - 1)
-                            // self.block_kv
-                        )
-                        + kv_idx
-                        + 0
+                    lane_page = cutlass.Uint32(encoded) // (self.cache_page_size // 8)
+                    lane_sub = cutlass.Uint32(encoded) % (self.cache_page_size // 8)
+                    lane_bytes = cutlass.Int32(16)
+                    if lane_page >= mRawKV.shape[0]:
+                        lane_page = cutlass.Uint32(0)
+                        lane_bytes = cutlass.Int32(0)
+                    # The adapter bounds the complete pool span before using
+                    # uint32 offsets; pointers and the fallback stay64-bit.
+                    offset_type = (
+                        cutlass.Uint32
+                        if cutlass.const_expr(self.candidate_offset32)
+                        else cutlass.Int64
                     )
-                    cute.copy(
-                        tma_atom_sf_kv,
-                        tSgSF_KV_0[(None, 0, sf_index)],
-                        tSsSF_KV_0[(None, 0, stage)],
-                        tma_bar_ptr=bar,
+                    lane_base = offset_type(lane_page) * offset_type(mRawKV.stride[0])
+                    lane_k_offset = lane_base + offset_type(lane_sub * 512)
+                    lane_sf_offset = lane_base + offset_type(
+                        self.cache_page_size * 64 + lane_sub * 32
                     )
+                    for block_group in cutlass.range_constexpr(4):
+                        copy_block = block_group * 4 + lane_idx // 8
+                        source_base = cutlass.Int64(
+                            cute.arch.shuffle_sync(lane_k_offset, copy_block)
+                        )
+                        copy_bytes = cute.arch.shuffle_sync(lane_bytes, copy_block)
+                        chunk = (lane_idx % 8) * 16
+                        offset = a_tma_view_layout.outer(
+                            ((chunk // 64, (chunk % 64) * 2), copy_block, stage)
+                        )
+                        candidate_copy_block512(
+                            sKV_0.iterator + offset,
+                            mRawKV.iterator + source_base + chunk,
+                            cp_size=copy_bytes,
+                        )
+                    # Two lanes load each block's 32-byte scale segment.
+                    # K and scales share the same asynchronous completion.
+                    sf_block = lane_idx // 2
+                    sf_source = (
+                        cutlass.Int64(cute.arch.shuffle_sync(lane_sf_offset, sf_block))
+                        + (lane_idx % 2) * 16
+                    )
+                    sf_bytes = cute.arch.shuffle_sync(lane_bytes, sf_block)
+                    sf_dest = (
+                        stage * sSF_KV_0.layout.stride[1]
+                        + sf_block * 8
+                        + (lane_idx % 2) * 4
+                    )
+                    candidate_copy_sf16(
+                        sSF_KV_0.iterator + sf_dest,
+                        mRawKV.iterator + sf_source,
+                        cp_size=sf_bytes,
+                    )
+                    # producer_acquire contributed one elected arrival with
+                    # zero expected TMA bytes; all 32 copy lanes arrive async.
+                    prims.cp_async_mbarrier_arrive(bar, noinc=True)
                 else:
                     for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
                         cute.copy(
@@ -1820,7 +1922,7 @@ class FP4MQALogitsKernel:
                 kv_prod_state_0.advance()
 
                 # Advance: inline fetch_next_task
-                next_kv_idx = kv_idx + NUM_MATH_WG
+                next_kv_idx = kv_idx + NUM_KV_GROUPS
                 if next_kv_idx >= num_kv:
                     next_q_idx = q_idx + 1
                     next_kv_idx = 0
@@ -1853,12 +1955,11 @@ class FP4MQALogitsKernel:
 
         elif is_tma_warp_1:
             # TMA warp 1: loads KV + Scale for group 1 only
-            cute.arch.warpgroup_reg_dealloc(64 if self.candidate_block8 else 24)
 
             # Per-role scheduler state (see comment above the branch chain)
-            end_kv_idx = end_kv_half * NUM_MATH_WG
+            end_kv_idx = end_kv_half * NUM_KV_GROUPS
             next_q_idx = start_q
-            next_kv_idx = start_kv_half * NUM_MATH_WG
+            next_kv_idx = start_kv_half * NUM_KV_GROUPS
             next_num_kv = current_num_kv
             q_idx = batch_size  # sentinel: no previous batch
             has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
@@ -1895,28 +1996,28 @@ class FP4MQALogitsKernel:
                         ) // 8
                         for i in cutlass.range_constexpr(4):
                             prefetch_kv = (
-                                kv_idx + 1 + (lane_idx // 16 + i * 2) * NUM_MATH_WG
+                                kv_idx + 1 + (lane_idx // 16 + i * 2) * NUM_KV_GROUPS
                             )
                             col = prefetch_kv * NUM_BLOCKS_PER_MMA + lane_idx % 16
                             blk = cutlass.Int32(
-                                mA_mkl.shape[2] * (self.cache_page_size // 8)
+                                mRawKV.shape[0] * (self.cache_page_size // 8)
                             )
                             if col < num_phys_row:
                                 blk = mBlockTable[(self._atom_seq(q_idx), col)]
                             cached_blks[i] = blk
                     word = cached_blks[0]
                     for i in cutlass.range_constexpr(1, 4):
-                        if kv_blk_ptr // 2 == i:
+                        if cutlass.Uint32(kv_blk_ptr) // 2 == i:
                             word = cached_blks[i]
                     encoded = cute.arch.shuffle_sync(
-                        word, lane_idx % 16 + (kv_blk_ptr % 2) * 16
+                        word, lane_idx % 16 + (cutlass.Uint32(kv_blk_ptr) % 2) * 16
                     )
                     kv_blk_ptr = kv_blk_ptr + 1
 
                 else:
                     if kv_blk_ptr == 32:
                         kv_blk_ptr = cutlass.Int32(0)
-                        prefetch_kv = kv_idx + 1 + lane_idx * NUM_MATH_WG
+                        prefetch_kv = kv_idx + 1 + lane_idx * NUM_KV_GROUPS
                         num_phys_row = (
                             self._atom_ctx_len(q_idx, mContextLens) + PHYS_BLOCK_KV - 1
                         ) // PHYS_BLOCK_KV
@@ -1940,34 +2041,61 @@ class FP4MQALogitsKernel:
                 bar = kv_pipeline_1.producer_get_barrier(kv_prod_state_1)
                 stage = kv_prod_state_1.index
                 if cutlass.const_expr(self.candidate_block8):
-                    # Publish the elected producer arrival/byte budget before
-                    # all16 issuing lanes enqueue their disjoint512B tiles.
                     cute.arch.sync_warp()
-                    desc = descriptor_pointer(tma_atom_a, bar)
-                    if lane_idx < NUM_BLOCKS_PER_MMA:
-                        sub = encoded % (self.cache_page_size // 8)
-                        page = encoded // (self.cache_page_size // 8)
-                        prims.cp_async_bulk_tensor_shared_cta_global(
-                            tAsA_1[(None, lane_idx, stage)].iterator,
-                            desc,
-                            [0, sub * 8, page],
-                            bar,
-                        )
-                    sf_index = (
-                        q_idx
-                        * (
-                            (mBlockTable.shape[1] * 8 + self.block_kv - 1)
-                            // self.block_kv
-                        )
-                        + kv_idx
-                        + 1
+                    lane_page = cutlass.Uint32(encoded) // (self.cache_page_size // 8)
+                    lane_sub = cutlass.Uint32(encoded) % (self.cache_page_size // 8)
+                    lane_bytes = cutlass.Int32(16)
+                    if lane_page >= mRawKV.shape[0]:
+                        lane_page = cutlass.Uint32(0)
+                        lane_bytes = cutlass.Int32(0)
+                    # The adapter bounds the complete pool span before using
+                    # uint32 offsets; pointers and the fallback stay64-bit.
+                    offset_type = (
+                        cutlass.Uint32
+                        if cutlass.const_expr(self.candidate_offset32)
+                        else cutlass.Int64
                     )
-                    cute.copy(
-                        tma_atom_sf_kv,
-                        tSgSF_KV_1[(None, 0, sf_index)],
-                        tSsSF_KV_1[(None, 0, stage)],
-                        tma_bar_ptr=bar,
+                    lane_base = offset_type(lane_page) * offset_type(mRawKV.stride[0])
+                    lane_k_offset = lane_base + offset_type(lane_sub * 512)
+                    lane_sf_offset = lane_base + offset_type(
+                        self.cache_page_size * 64 + lane_sub * 32
                     )
+                    for block_group in cutlass.range_constexpr(4):
+                        copy_block = block_group * 4 + lane_idx // 8
+                        source_base = cutlass.Int64(
+                            cute.arch.shuffle_sync(lane_k_offset, copy_block)
+                        )
+                        copy_bytes = cute.arch.shuffle_sync(lane_bytes, copy_block)
+                        chunk = (lane_idx % 8) * 16
+                        offset = a_tma_view_layout.outer(
+                            ((chunk // 64, (chunk % 64) * 2), copy_block, stage)
+                        )
+                        candidate_copy_block512(
+                            sKV_1.iterator + offset,
+                            mRawKV.iterator + source_base + chunk,
+                            cp_size=copy_bytes,
+                        )
+                    # Two lanes load each block's 32-byte scale segment.
+                    # K and scales share the same asynchronous completion.
+                    sf_block = lane_idx // 2
+                    sf_source = (
+                        cutlass.Int64(cute.arch.shuffle_sync(lane_sf_offset, sf_block))
+                        + (lane_idx % 2) * 16
+                    )
+                    sf_bytes = cute.arch.shuffle_sync(lane_bytes, sf_block)
+                    sf_dest = (
+                        stage * sSF_KV_1.layout.stride[1]
+                        + sf_block * 8
+                        + (lane_idx % 2) * 4
+                    )
+                    candidate_copy_sf16(
+                        sSF_KV_1.iterator + sf_dest,
+                        mRawKV.iterator + sf_source,
+                        cp_size=sf_bytes,
+                    )
+                    # producer_acquire contributed one elected arrival with
+                    # zero expected TMA bytes; all 32 copy lanes arrive async.
+                    prims.cp_async_mbarrier_arrive(bar, noinc=True)
                 else:
                     for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
                         cute.copy(
@@ -1986,7 +2114,7 @@ class FP4MQALogitsKernel:
                 kv_prod_state_1.advance()
 
                 # Advance: inline fetch_next_task
-                next_kv_idx = kv_idx + NUM_MATH_WG
+                next_kv_idx = kv_idx + NUM_KV_GROUPS
                 if next_kv_idx >= num_kv:
                     next_q_idx = q_idx + 1
                     next_kv_idx = 0
@@ -2023,12 +2151,11 @@ class FP4MQALogitsKernel:
             # barriers are NOT visibility-ordered even within the same
             # warp. KV0 barrier arriving does not guarantee Q SMEM
             # writes are visible.
-            cute.arch.warpgroup_reg_dealloc(64 if self.candidate_block8 else 24)
 
             # Per-role scheduler state (see comment above the branch chain)
-            end_kv_idx = end_kv_half * NUM_MATH_WG
+            end_kv_idx = end_kv_half * NUM_KV_GROUPS
             next_q_idx = start_q
-            next_kv_idx = start_kv_half * NUM_MATH_WG
+            next_kv_idx = start_kv_half * NUM_KV_GROUPS
             next_num_kv = current_num_kv
             q_idx = batch_size  # sentinel: no previous batch
             has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
@@ -2218,7 +2345,7 @@ class FP4MQALogitsKernel:
                     _barrier_cta_sync(2, thread_count=64)
 
                     # Advance: inline fetch_next_task
-                    next_kv_idx = kv_idx + NUM_MATH_WG
+                    next_kv_idx = kv_idx + NUM_KV_GROUPS
                     if next_kv_idx >= num_kv:
                         next_q_idx = q_idx + 1
                         next_kv_idx = 0
@@ -2254,12 +2381,11 @@ class FP4MQALogitsKernel:
             # Explicitly waits on Q pipeline — critical because TMA warp 1
             # only loads KV1, not Q. Without this wait, UMMA warp 1 can
             # start GEMM before TMA warp 0 finishes loading Q into SMEM.
-            cute.arch.warpgroup_reg_dealloc(64 if self.candidate_block8 else 24)
 
             # Per-role scheduler state (see comment above the branch chain)
-            end_kv_idx = end_kv_half * NUM_MATH_WG
+            end_kv_idx = end_kv_half * NUM_KV_GROUPS
             next_q_idx = start_q
-            next_kv_idx = start_kv_half * NUM_MATH_WG
+            next_kv_idx = start_kv_half * NUM_KV_GROUPS
             next_num_kv = current_num_kv
             q_idx = batch_size  # sentinel: no previous batch
             has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
@@ -2401,7 +2527,7 @@ class FP4MQALogitsKernel:
                     _barrier_cta_sync(2, thread_count=64)
 
                     # Advance: inline fetch_next_task
-                    next_kv_idx = kv_idx + NUM_MATH_WG
+                    next_kv_idx = kv_idx + NUM_KV_GROUPS
                     if next_kv_idx >= num_kv:
                         next_q_idx = q_idx + 1
                         next_kv_idx = 0
@@ -2433,20 +2559,22 @@ class FP4MQALogitsKernel:
                     has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
 
         elif is_math_warp:
-            cute.arch.warpgroup_reg_alloc(224 if self.candidate_block8 else 240)
+            cute.arch.warpgroup_reg_alloc(104 if self.candidate_block8 else 240)
 
             # Per-role scheduler state (see comment above the branch chain).
             # Derived AFTER warpgroup_reg_alloc(240) so the loop-carried
             # scheduler words live under the 240-register math budget.
-            end_kv_idx = end_kv_half * NUM_MATH_WG
+            end_kv_idx = end_kv_half * NUM_KV_GROUPS
             next_q_idx = start_q
-            next_kv_idx = start_kv_half * NUM_MATH_WG
+            next_kv_idx = start_kv_half * NUM_KV_GROUPS
             next_num_kv = current_num_kv
             q_idx = batch_size  # sentinel: no previous batch
             has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
 
             # TMEM: math warp 0 is the allocator; all math warps wait + retrieve
             tmem.allocate(num_tmem_alloc_cols_total)
+            if cutlass.const_expr(self.candidate_block8):
+                tmem.relinquish_alloc_permit()
             _barrier_cta_sync(1, thread_count=tmem_alloc_num_threads)
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
             tCtAcc_base_0 = cute.make_tensor(tmem_ptr, tCtAcc_fake_staged.layout)
@@ -2457,7 +2585,232 @@ class FP4MQALogitsKernel:
             local_tidx = tidx % 128
             cC = cute.make_identity_tensor(epi_sub_mn)
 
-            if warpgroup_idx == 0:
+            if cutlass.const_expr(self.candidate_block8):
+                tAcc_0_ref = tCtAcc_base_0[None, None, None, 0][(None, None), 0, 0]
+                tAcc_0_ref_epi = cute.flat_divide(tAcc_0_ref, epi_sub_mn)
+                tiled_copy_ref_0 = tcgen05.make_tmem_copy(
+                    copy_atom_t2r, tAcc_0_ref_epi[None, None, 0, 0]
+                )
+                thr_copy_ref_0 = tiled_copy_ref_0.get_slice(local_tidx)
+                tAcc_1_ref = tCtAcc_base_1[None, None, None, 0][(None, None), 0, 0]
+                tAcc_1_ref_epi = cute.flat_divide(tAcc_1_ref, epi_sub_mn)
+                tiled_copy_ref_1 = tcgen05.make_tmem_copy(
+                    copy_atom_t2r, tAcc_1_ref_epi[None, None, 0, 0]
+                )
+                thr_copy_ref_1 = tiled_copy_ref_1.get_slice(local_tidx)
+                tTR_cC = thr_copy_ref_0.partition_D(cC)
+                m_coord = tTR_cC[0][0]
+                tTR_rAcc = cute.make_fragment_like(tTR_cC, self.acc_dtype)
+                # One H32 weight vector is reused for both accumulator groups.
+                w_cache = cute.make_rmem_tensor(32, cutlass.Float32)
+                result_arr = cute.make_rmem_tensor(1, self.output_dtype)
+                q_stage_local = cutlass.Int32(0)
+                MASK_WORDS_PER_LANE = (self.candidate_width + 8191) // 8192
+                row_masks = [cutlass.Int32(0) for _ in range(2 * MASK_WORDS_PER_LANE)]
+                mask_words = cute.make_tensor(
+                    cute.recast_ptr(mCandidateValid.iterator, dtype=cutlass.Int32),
+                    cute.make_layout(
+                        (mCandidateValid.shape[0], mCandidateValid.shape[1] // 4),
+                        stride=(mCandidateValid.shape[1] // 4, 1),
+                    ),
+                )
+                if cutlass.const_expr(self.use_flat_logits_view):
+                    logits_stride0 = cutlass.Int32(mLogits.layout.stride[0])
+                    mLogits_flat = cute.make_tensor(
+                        mLogits.iterator,
+                        cute.make_layout(cute.size(mLogits, mode=[0]) * logits_stride0),
+                    )
+                    out_row_off = cutlass.Int32(0)
+                else:
+                    mLogits_2d = mLogits
+                while has_work:
+                    q_idx_old = q_idx
+                    q_idx = next_q_idx
+                    kv_idx = next_kv_idx
+                    num_kv = next_num_kv
+                    if q_idx != q_idx_old:
+                        if q_idx_old < batch_size:
+                            q_pipeline.consumer_release(q_cons_state)
+                            q_cons_state.advance()
+                        q_pipeline.consumer_wait(q_cons_state)
+                        q_stage_local = q_cons_state.index
+                        if cutlass.const_expr(self.use_flat_logits_view):
+                            out_row_off = (
+                                self._atom_out_row_base(q_idx) * logits_stride0
+                            )
+                        for math_group in cutlass.range_constexpr(2):
+                            for part in cutlass.range_constexpr(MASK_WORDS_PER_LANE):
+                                tile = (local_tidx % 32 + part * 32) * 2 + math_group
+                                column = tile * 4 + local_tidx // 32
+                                bits = cutlass.Int32(0)
+                                if column * 32 < self.candidate_width:
+                                    bits = mask_words[q_idx, column]
+                                row_masks[math_group * MASK_WORDS_PER_LANE + part] = (
+                                    bits
+                                )
+                        for w_j in cutlass.range_constexpr(32):
+                            w_cache[w_j] = sW[w_j, q_stage_local].to(cutlass.Float32)
+                    kv_go = cutlass.Boolean(True)
+                    while kv_go:
+                        # Drain group 0 before group 1, using all 128 legal TMEM row lanes.
+                        kv_pos = kv_idx * block_kv_val + m_coord
+                        mask_tile = cutlass.Uint32(kv_idx) // 2
+                        local_word = row_masks[0]
+                        for part in cutlass.range_constexpr(1, MASK_WORDS_PER_LANE):
+                            if mask_tile // 32 == part:
+                                local_word = row_masks[part]
+                        # All lanes take part in the shuffle, including output tail lanes.
+                        packed_valid = cute.arch.shuffle_sync(
+                            local_word, mask_tile % 32
+                        )
+                        umma_pipeline_0.consumer_wait(umma_cons_state_0)
+                        tCtAcc_c0 = tCtAcc_base_0[
+                            None, None, None, umma_cons_state_0.index
+                        ]
+                        tAcc_c0 = tCtAcc_c0[(None, None), 0, 0]
+                        tAcc_c0_epi = cute.flat_divide(tAcc_c0, epi_sub_mn)
+                        tTR_0 = thr_copy_ref_0.partition_S(tAcc_c0_epi)
+                        cute.copy(
+                            tiled_copy_ref_0, tTR_0[None, None, None, 0, 0], tTR_rAcc
+                        )
+                        cute.arch.fence_view_async_tmem_load()
+                        s0x = cutlass.Float32(0.0)
+                        s0y = cutlass.Float32(0.0)
+                        s1x = cutlass.Float32(0.0)
+                        s1y = cutlass.Float32(0.0)
+                        # Release only after the complete TMEM load and its visibility fence.
+                        umma_pipeline_0.consumer_release(umma_cons_state_0)
+                        umma_cons_state_0.advance()
+                        acc_vec = tTR_rAcc.load()
+                        for h in cutlass.range_constexpr(0, 32, 4):
+                            n0 = h
+                            h_g = h
+                            a0 = cutlass.max(acc_vec[n0], cutlass.Float32(0.0))
+                            a1 = cutlass.max(acc_vec[n0 + 1], cutlass.Float32(0.0))
+                            a2 = cutlass.max(acc_vec[n0 + 2], cutlass.Float32(0.0))
+                            a3 = cutlass.max(acc_vec[n0 + 3], cutlass.Float32(0.0))
+                            r0 = h_g
+                            w0 = w_cache[r0]
+                            w1 = w_cache[r0 + 1]
+                            w2 = w_cache[r0 + 2]
+                            w3 = w_cache[r0 + 3]
+                            (s0x, s0y) = cute.arch.fma_packed_f32x2(
+                                (a0, a1), (w0, w1), (s0x, s0y), rnd=_RND_RN
+                            )
+                            (s1x, s1y) = cute.arch.fma_packed_f32x2(
+                                (a2, a3), (w2, w3), (s1x, s1y), rnd=_RND_RN
+                            )
+                        result_t = s0x + s0y + s1x + s1y
+                        if kv_pos < mLogits.shape[1]:
+                            if packed_valid >> m_coord % 32 & 1 == 0:
+                                result_t = cutlass.Float32(-float("inf"))
+                        result_arr[0] = self.output_dtype(result_t)
+                        out_off_t = cutlass.Int32(0)
+                        out_row = cutlass.Int32(0)
+                        if kv_pos < mLogits.shape[1]:
+                            if cutlass.const_expr(self.use_flat_logits_view):
+                                out_off_t = out_row_off + kv_pos
+                                mLogits_flat[out_off_t] = result_arr[0]
+                            else:
+                                out_row = self._atom_out_row_base(q_idx)
+                                mLogits_2d[out_row, kv_pos] = result_arr[0]
+                        kv_idx_1 = kv_idx + 1
+                        kv_pos = kv_idx_1 * block_kv_val + m_coord
+                        mask_tile = cutlass.Uint32(kv_idx) // 2
+                        local_word = row_masks[MASK_WORDS_PER_LANE]
+                        for part in cutlass.range_constexpr(1, MASK_WORDS_PER_LANE):
+                            if mask_tile // 32 == part:
+                                local_word = row_masks[MASK_WORDS_PER_LANE + part]
+                        # All lanes take part in the shuffle, including output tail lanes.
+                        packed_valid = cute.arch.shuffle_sync(
+                            local_word, mask_tile % 32
+                        )
+                        umma_pipeline_1.consumer_wait(umma_cons_state_1)
+                        tCtAcc_c1 = tCtAcc_base_1[
+                            None, None, None, umma_cons_state_1.index
+                        ]
+                        tAcc_c1 = tCtAcc_c1[(None, None), 0, 0]
+                        tAcc_c1_epi = cute.flat_divide(tAcc_c1, epi_sub_mn)
+                        tTR_1 = thr_copy_ref_1.partition_S(tAcc_c1_epi)
+                        cute.copy(
+                            tiled_copy_ref_1, tTR_1[None, None, None, 0, 0], tTR_rAcc
+                        )
+                        cute.arch.fence_view_async_tmem_load()
+                        s0x = cutlass.Float32(0.0)
+                        s0y = cutlass.Float32(0.0)
+                        s1x = cutlass.Float32(0.0)
+                        s1y = cutlass.Float32(0.0)
+                        umma_pipeline_1.consumer_release(umma_cons_state_1)
+                        umma_cons_state_1.advance()
+                        acc_vec = tTR_rAcc.load()
+                        for h in cutlass.range_constexpr(0, 32, 4):
+                            n0 = h
+                            h_g = h
+                            a0 = cutlass.max(acc_vec[n0], cutlass.Float32(0.0))
+                            a1 = cutlass.max(acc_vec[n0 + 1], cutlass.Float32(0.0))
+                            a2 = cutlass.max(acc_vec[n0 + 2], cutlass.Float32(0.0))
+                            a3 = cutlass.max(acc_vec[n0 + 3], cutlass.Float32(0.0))
+                            r0 = h_g
+                            w0 = w_cache[r0]
+                            w1 = w_cache[r0 + 1]
+                            w2 = w_cache[r0 + 2]
+                            w3 = w_cache[r0 + 3]
+                            (s0x, s0y) = cute.arch.fma_packed_f32x2(
+                                (a0, a1), (w0, w1), (s0x, s0y), rnd=_RND_RN
+                            )
+                            (s1x, s1y) = cute.arch.fma_packed_f32x2(
+                                (a2, a3), (w2, w3), (s1x, s1y), rnd=_RND_RN
+                            )
+                        result_t = s0x + s0y + s1x + s1y
+                        if kv_pos < mLogits.shape[1]:
+                            if packed_valid >> m_coord % 32 & 1 == 0:
+                                result_t = cutlass.Float32(-float("inf"))
+                        result_arr[0] = self.output_dtype(result_t)
+                        out_off_t = cutlass.Int32(0)
+                        out_row = cutlass.Int32(0)
+                        if kv_pos < mLogits.shape[1]:
+                            if cutlass.const_expr(self.use_flat_logits_view):
+                                out_off_t = out_row_off + kv_pos
+                                mLogits_flat[out_off_t] = result_arr[0]
+                            else:
+                                out_row = self._atom_out_row_base(q_idx)
+                                mLogits_2d[out_row, kv_pos] = result_arr[0]
+                        kv_idx = kv_idx + NUM_KV_GROUPS
+                        kv_go = (kv_idx < num_kv) & (
+                            (q_idx != end_q_idx) | (kv_idx != end_kv_idx)
+                        )
+                        if cutlass.const_expr(not self.use_two_level_task_loop):
+                            kv_go = cutlass.Boolean(False)
+                    if kv_idx >= num_kv:
+                        next_q_idx = q_idx + 1
+                        next_kv_idx = 0
+                        if next_q_idx < batch_size:
+                            next_num_kv = (
+                                self._atom_ctx_len(next_q_idx, mContextLens)
+                                + block_kv_val
+                                - 1
+                            ) // block_kv_val
+                        while (
+                            (next_num_kv == 0)
+                            & (next_q_idx < batch_size)
+                            & ((next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx))
+                        ):
+                            next_q_idx = next_q_idx + 1
+                            if next_q_idx < batch_size:
+                                next_num_kv = (
+                                    self._atom_ctx_len(next_q_idx, mContextLens)
+                                    + block_kv_val
+                                    - 1
+                                ) // block_kv_val
+                    else:
+                        next_q_idx = q_idx
+                        next_kv_idx = kv_idx
+                    has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
+                if q_idx < batch_size:
+                    q_pipeline.consumer_release(q_cons_state)
+                    q_cons_state.advance()
+
+            elif warpgroup_idx == 0:
                 # Math WG 0: process group 0
                 # Reference setup (stage 0) for m_coord
                 # flat_divide by sub-tile to get sub-tile partitions
@@ -2569,7 +2922,7 @@ class FP4MQALogitsKernel:
                     #             roll over to (q+1, 0) if next_kv >= num_kv;
                     #             stop when (next_q, next_kv) == (end_q, end_kv).
                     # Truth table for kv_go after processing (q, kv) and advancing
-                    # kv += W (W = NUM_MATH_WG):
+                    # kv += W (W = NUM_KV_GROUPS):
                     #   kv <  num_kv, (q, kv) != end -> True  (more kv in this q)
                     #   kv <  num_kv, (q, kv) == end -> False (global end mid-q)
                     #   kv >= num_kv, any            -> False (q exhausted; outer
@@ -2866,10 +3219,6 @@ class FP4MQALogitsKernel:
                                 result_t = sum_lo + sum_hi
                             else:
                                 result_t = s0x + s0y + s1x + s1y
-                            if cutlass.const_expr(self.candidate_block8):
-                                if kv_pos < mLogits.shape[1]:
-                                    if not mCandidateValid[(q_idx, kv_pos)]:
-                                        result_t = cutlass.Float32(-float("inf"))
                             # Step 5.7: drop * scale_val (FP4 SF baked into acc).
                             if cutlass.const_expr(self.use_batched_store):
                                 result_arr[t] = self.output_dtype(result_t)
@@ -2883,23 +3232,21 @@ class FP4MQALogitsKernel:
                                 )
 
                         if cutlass.const_expr(self.use_batched_store):
-                            # Candidate output padding is caller-owned.
                             out_off_t = cutlass.Int32(0)
                             out_row = cutlass.Int32(0)
-                            if not self.candidate_block8 or kv_pos < mLogits.shape[1]:
-                                # Batched STG: all result_arr[t] → mLogits in one pass.
-                                for t in cutlass.range_constexpr(next_n):
-                                    if cutlass.const_expr(self.use_flat_logits_view):
-                                        out_off_t = (
-                                            out_row_off + t * logits_stride0 + kv_pos
-                                        )
-                                        mLogits_flat[out_off_t] = result_arr[t]
-                                    else:
-                                        out_row = self._atom_out_row_base(q_idx) + t
-                                        mLogits_2d[(out_row, kv_pos)] = result_arr[t]
+                            # Batched STG: all result_arr[t] → mLogits in one pass.
+                            for t in cutlass.range_constexpr(next_n):
+                                if cutlass.const_expr(self.use_flat_logits_view):
+                                    out_off_t = (
+                                        out_row_off + t * logits_stride0 + kv_pos
+                                    )
+                                    mLogits_flat[out_off_t] = result_arr[t]
+                                else:
+                                    out_row = self._atom_out_row_base(q_idx) + t
+                                    mLogits_2d[(out_row, kv_pos)] = result_arr[t]
 
                         # Advance within this q
-                        kv_idx = kv_idx + NUM_MATH_WG
+                        kv_idx = kv_idx + NUM_KV_GROUPS
                         kv_go = (kv_idx < num_kv) & (
                             (q_idx != end_q_idx) | (kv_idx != end_kv_idx)
                         )
@@ -3051,7 +3398,7 @@ class FP4MQALogitsKernel:
                     #             roll over to (q+1, 0) if next_kv >= num_kv;
                     #             stop when (next_q, next_kv) == (end_q, end_kv).
                     # Truth table for kv_go after processing (q, kv) and advancing
-                    # kv += W (W = NUM_MATH_WG):
+                    # kv += W (W = NUM_KV_GROUPS):
                     #   kv <  num_kv, (q, kv) != end -> True  (more kv in this q)
                     #   kv <  num_kv, (q, kv) == end -> False (global end mid-q)
                     #   kv >= num_kv, any            -> False (q exhausted; outer
@@ -3338,10 +3685,6 @@ class FP4MQALogitsKernel:
                                 result_t = sum_lo + sum_hi
                             else:
                                 result_t = s0x + s0y + s1x + s1y
-                            if cutlass.const_expr(self.candidate_block8):
-                                if kv_pos < mLogits.shape[1]:
-                                    if not mCandidateValid[(q_idx, kv_pos)]:
-                                        result_t = cutlass.Float32(-float("inf"))
                             # Step 5.7: drop * scale_val (FP4 SF baked into acc).
                             if cutlass.const_expr(self.use_batched_store):
                                 result_arr[t] = self.output_dtype(result_t)
@@ -3355,23 +3698,21 @@ class FP4MQALogitsKernel:
                                 )
 
                         if cutlass.const_expr(self.use_batched_store):
-                            # Candidate output padding is caller-owned.
                             out_off_t = cutlass.Int32(0)
                             out_row = cutlass.Int32(0)
-                            if not self.candidate_block8 or kv_pos < mLogits.shape[1]:
-                                # Batched STG: all result_arr[t] → mLogits in one pass.
-                                for t in cutlass.range_constexpr(next_n):
-                                    if cutlass.const_expr(self.use_flat_logits_view):
-                                        out_off_t = (
-                                            out_row_off + t * logits_stride0 + kv_pos
-                                        )
-                                        mLogits_flat[out_off_t] = result_arr[t]
-                                    else:
-                                        out_row = self._atom_out_row_base(q_idx) + t
-                                        mLogits_2d[(out_row, kv_pos)] = result_arr[t]
+                            # Batched STG: all result_arr[t] → mLogits in one pass.
+                            for t in cutlass.range_constexpr(next_n):
+                                if cutlass.const_expr(self.use_flat_logits_view):
+                                    out_off_t = (
+                                        out_row_off + t * logits_stride0 + kv_pos
+                                    )
+                                    mLogits_flat[out_off_t] = result_arr[t]
+                                else:
+                                    out_row = self._atom_out_row_base(q_idx) + t
+                                    mLogits_2d[(out_row, kv_pos)] = result_arr[t]
 
                         # Advance within this q
-                        kv_idx = kv_idx + NUM_MATH_WG
+                        kv_idx = kv_idx + NUM_KV_GROUPS
                         kv_go = (kv_idx < num_kv) & (
                             (q_idx != end_q_idx) | (kv_idx != end_kv_idx)
                         )
@@ -3423,11 +3764,9 @@ class FP4MQALogitsKernel:
                     q_pipeline.consumer_release(q_cons_state)
                     q_cons_state.advance()
 
-            # Both math groups must finish their TMEM reads before warp 0
-            # frees the allocation.  Only these 256 threads participate.
+            # All math threads finish their TMEM reads before warp 0 frees
+            # the allocation: 128 H32 candidate threads or 256 full-score threads.
             _barrier_cta_sync(3, thread_count=self.num_math_threads)
-            tmem.relinquish_alloc_permit()
+            if cutlass.const_expr(not self.candidate_block8):
+                tmem.relinquish_alloc_permit()
             tmem.free(tmem_ptr)
-
-        else:
-            cute.arch.warpgroup_reg_dealloc(64 if self.candidate_block8 else 24)

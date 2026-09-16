@@ -100,20 +100,17 @@ def _scores(
     )
 
 
-def index_scores_fp32(
-    q_data,
-    q_scales,
-    kv_cache,
-    weights,
-    visible,
-    block_table,
-    *,
-    max_context_len,
-    candidates=None,
-    out=None,
-    backend="triton",
-    workspace=None,
-):
+def _check_tensor(value, shape, dtype, device, name):
+    if (
+        value.shape != shape
+        or value.dtype != dtype
+        or value.device != device
+        or not value.is_contiguous()
+    ):
+        raise ValueError(f"{name} shape/dtype/device/contiguous declaration mismatch")
+
+
+def _validate_layer_inputs(q_data, q_scales, kv_cache, weights):
     if q_data.device.type != "cuda" or torch.cuda.get_device_capability(
         q_data.device
     ) not in ((10, 0), (10, 3)):
@@ -122,24 +119,9 @@ def index_scores_fp32(
         raise ValueError("Q data requires positive [B,32,64] shape")
     batch = q_data.shape[0]
 
-    def check(value, shape, dtype, name):
-        if (
-            value.shape != shape
-            or value.dtype != dtype
-            or value.device != q_data.device
-            or not value.is_contiguous()
-        ):
-            raise ValueError(
-                f"{name} shape/dtype/device/contiguous declaration mismatch"
-            )
-
-    check(q_data, (batch, 32, 64), torch.uint8, "Q data")
-    check(q_scales, (batch, 32, 4), torch.uint8, "Q scales")
-    check(weights, (batch, 32), torch.bfloat16, "weights")
-    check(visible, (batch,), torch.int32, "visible")
-    if block_table.ndim != 2 or block_table.shape[1] < 1:
-        raise ValueError("positive [B,pages] block table required")
-    check(block_table, (batch, block_table.shape[1]), torch.int32, "block table")
+    _check_tensor(q_data, (batch, 32, 64), torch.uint8, q_data.device, "Q data")
+    _check_tensor(q_scales, (batch, 32, 4), torch.uint8, q_data.device, "Q scales")
+    _check_tensor(weights, (batch, 32), torch.bfloat16, q_data.device, "weights")
     if (
         kv_cache.ndim != 4
         or kv_cache.shape[0] < 1
@@ -156,16 +138,11 @@ def index_scores_fp32(
         or kv_cache.stride(0) % 512
     ):
         raise ValueError("index cache requires padded 512-byte-aligned page strides")
-    if not isinstance(max_context_len, int) or not 1 <= max_context_len <= min(
-        2**31 - 1, block_table.shape[1] * page
-    ):
-        raise ValueError("positive int32 logical context must fit the block table")
-    width = max_context_len
-    if candidates is not None:
-        if candidates.ndim != 2 or not 1 <= candidates.shape[1] <= 2048:
-            raise ValueError("candidate block8 IDs require [B,1..2048]")
-        check(candidates, (batch, candidates.shape[1]), torch.int32, "candidates")
-        width = candidates.shape[1] * 8
+    return batch, page
+
+
+def _scores_output(q_data, q_scales, kv_cache, weights, width, out, other_inputs=()):
+    batch = q_data.shape[0]
     if out is None:
         out = torch.empty_strided(
             (batch, width),
@@ -185,13 +162,64 @@ def index_scores_fp32(
         raise ValueError(
             "scores need contiguous BF16 columns and 1024-byte aligned rows"
         )
-    inputs = (q_data, q_scales, kv_cache, weights, visible, block_table) + (
-        () if candidates is None else (candidates,)
-    )
+    inputs = (q_data, q_scales, kv_cache, weights, *other_inputs)
     if torch.is_grad_enabled() and any(value.requires_grad for value in (*inputs, out)):
         raise ValueError("FP32 index scores are inference-only")
     if any(_overlaps(out, value) for value in inputs):
         raise ValueError("score output must not overlap inputs")
+    return out
+
+
+def index_scores_fp32(
+    q_data,
+    q_scales,
+    kv_cache,
+    weights,
+    visible,
+    block_table,
+    *,
+    max_context_len,
+    candidates=None,
+    out=None,
+    backend="triton",
+    workspace=None,
+):
+    batch, page = _validate_layer_inputs(q_data, q_scales, kv_cache, weights)
+    _check_tensor(visible, (batch,), torch.int32, q_data.device, "visible")
+    if block_table.ndim != 2 or block_table.shape[1] < 1:
+        raise ValueError("positive [B,pages] block table required")
+    _check_tensor(
+        block_table,
+        (batch, block_table.shape[1]),
+        torch.int32,
+        q_data.device,
+        "block table",
+    )
+    if not isinstance(max_context_len, int) or not 1 <= max_context_len <= min(
+        2**31 - 1, block_table.shape[1] * page
+    ):
+        raise ValueError("positive int32 logical context must fit the block table")
+    width = max_context_len
+    if candidates is not None:
+        if candidates.ndim != 2 or not 1 <= candidates.shape[1] <= 2048:
+            raise ValueError("candidate block8 IDs require [B,1..2048]")
+        _check_tensor(
+            candidates,
+            (batch, candidates.shape[1]),
+            torch.int32,
+            q_data.device,
+            "candidates",
+        )
+        width = candidates.shape[1] * 8
+    out = _scores_output(
+        q_data,
+        q_scales,
+        kv_cache,
+        weights,
+        width,
+        out,
+        (visible, block_table) + (() if candidates is None else (candidates,)),
+    )
     if backend not in ("triton", "cute_dsl"):
         raise ValueError("backend must be 'triton' or 'cute_dsl'")
     if backend == "cute_dsl":

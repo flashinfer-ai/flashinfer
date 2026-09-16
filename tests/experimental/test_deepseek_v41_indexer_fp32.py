@@ -69,6 +69,8 @@ def make_cache(x, *, page_size=64, out=None):
         (1, 1, 32, 1),
         (2, 257, 64, 3),
         (64, 8193, 64, 1025),
+        (3, 8195, 128, 1027),
+        (149, 8193, 64, 1025),
     ],
 )
 @pytest.mark.parametrize("backend", ["triton", "cute_dsl"])
@@ -419,6 +421,36 @@ def test_kv_stride_above_32_gib(backend):
     assert torch.isneginf(out[:, 31]).all()
 
 
+@pytest.mark.parametrize(
+    "stride",
+    [2**31 + 512, 2**32 - 128 * 68 - 512, 2**32 - 128 * 68],
+    ids=["unsigned_offset", "below_4gib_span", "at_4gib_span"],
+)
+def test_cute_kv_unsigned_offsets_and_capacity_boundary(stride):
+    # Reach the second page through offsets with bit31 set, on both sides of
+    # the compact-offset dispatch boundary. This catches accidental sign
+    # extension and specialization reuse across incompatible pool spans.
+    inputs, candidates = _constant_case(batch=1, count=4)
+    free, _ = torch.cuda.mem_get_info()
+    if free < stride + 2 * 1024**3:
+        pytest.skip("requires a4GiB strided allocation plus runtime headroom")
+    cache = torch.empty_strided(
+        (2, 128, 1, 68), (stride, 68, 68, 1), device="cuda", dtype=torch.uint8
+    )
+    flat = cache.flatten(1)
+    flat[1, :8192].fill_(0x11)
+    flat[1, 8192:].fill_(127)
+    inputs[2] = cache
+    inputs[-1].fill_(1)
+    out = deepseek_v41_index_scores_fp32(
+        *inputs, max_context_len=32, candidates=candidates, backend="cute_dsl"
+    )
+    torch.testing.assert_close(
+        out[:, :31], torch.full_like(out[:, :31], 32), atol=0, rtol=0
+    )
+    assert torch.isneginf(out[:, 31]).all()
+
+
 def test_cute_rejects_int32_padded_output_extent():
     inputs, candidates = _constant_case(batch=1, count=4)
     # A singleton row can declare this stride with only64 bytes allocated.
@@ -443,3 +475,228 @@ def test_invalid_physical_pages_are_masked(backend, invalid_page):
         *inputs, max_context_len=32, candidates=candidates, backend=backend
     )
     assert torch.isneginf(out).all()
+
+
+@pytest.mark.parametrize("page,count", [(32, 3), (64, 1025), (128, 1027)])
+def test_candidate_metadata_owned_snapshot_graph_and_readers(page, count):
+    from flashinfer.deepseek_v41 import (
+        deepseek_v41_candidate_scores_fp32,
+        prepare_deepseek_v41_candidate_metadata,
+    )
+
+    gate()
+    torch.manual_seed(20260916 + page)
+    batch, context = 3, 8195
+    pages = (context + page - 1) // page
+    qd, qs = quantize(torch.randn(batch * 32, 128, device="cuda"))
+    qd, qs = qd.view(batch, 32, 64), qs.view(batch, 32, 4)
+    cache = make_cache(
+        torch.randn(batch * pages * page, 128, device="cuda"), page_size=page
+    )
+    weights = (torch.randn(batch, 32, device="cuda") / 64).bfloat16()
+    visible = torch.tensor(
+        [0, context // 2 + 1, context], device="cuda", dtype=torch.int32
+    )
+    table = torch.randperm(batch * pages, device="cuda").int().view(batch, pages)
+    candidates = torch.randint(
+        0, (context + 7) // 8, (batch, count), device="cuda", dtype=torch.int32
+    )
+    candidates[-1, -1] = (context - 1) // 8
+    if count > 8:
+        candidates[1, :4] = torch.tensor(
+            [-1, 2**29, 2**31 - 1, -(2**31)], device="cuda", dtype=torch.int32
+        )
+        candidates[2, :3] = torch.tensor([0, 0, 1], device="cuda", dtype=torch.int32)
+        table[1, 0] = -1
+        table[2, 0] = batch * pages
+    config = dict(
+        page_size=page, num_physical_pages=cache.shape[0], max_context_len=context
+    )
+    width, stride = count * 8, ((count * 8 + 511) // 512 + 1) * 512
+    guard = torch.full((batch + 2, stride), 17, device="cuda", dtype=torch.bfloat16)
+    out = guard[1:-1, :width]
+
+    def check_scores(actual):
+        native = deepseek_v41_index_scores_fp32(
+            qd,
+            qs,
+            cache,
+            weights,
+            visible,
+            table,
+            max_context_len=context,
+            candidates=candidates,
+            backend="cute_dsl",
+        )
+        assert torch.equal(actual.view(torch.int16), native.view(torch.int16))
+        token = (
+            candidates.long()[..., None] * 8 + torch.arange(8, device="cuda")
+        ).flatten(1)
+        safe = token.clamp(0, context - 1)
+        physical = table.gather(1, safe // page).long()
+        valid = (token >= 0) & (token < visible[:, None]) & (token < context)
+        valid &= (physical >= 0) & (physical < cache.shape[0])
+        flat = cache.flatten(1)
+        kd = flat[:, : page * 64].reshape(-1, page, 64)
+        ks = flat[:, page * 64 :].reshape(-1, page, 4)
+        keys = dequant(kd, ks)[physical.clamp(0, cache.shape[0] - 1), safe % page]
+        expected = (
+            torch.einsum("bhd,btd->bht", dequant(qd, qs), keys).relu()
+            * weights.double()[..., None]
+        ).sum(1)
+        expected = expected.masked_fill(~valid, 0)
+        assert torch.isneginf(actual[~valid]).all()
+        error = actual.double().masked_fill(~valid, 0) - expected
+        assert error.norm() / expected.norm().clamp_min(1e-20) < 0.0021
+        assert error.abs().max() / expected.abs().max().clamp_min(1e-20) < 0.0042
+        assert (guard[0] == 17).all() and (guard[-1] == 17).all()
+        assert (guard[1:-1, width:] == 17).all()
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        metadata = prepare_deepseek_v41_candidate_metadata(
+            visible, table, candidates, **config
+        )
+
+        def run(destination=out):
+            return deepseek_v41_candidate_scores_fp32(
+                qd, qs, cache, weights, metadata, out=destination
+            )
+
+        run()
+        check_scores(out)
+        old = out.clone()
+        originals = [x.clone() for x in (visible, table, candidates)]
+        consumer = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(consumer, stream=stream):
+            run()
+        # Mutated raw inputs do not modify an already published snapshot.
+        visible.zero_()
+        table.fill_(-1)
+        candidates.fill_(-1)
+        out.fill_(torch.nan)
+        consumer.replay()
+        assert torch.equal(out.view(torch.int16), old.view(torch.int16))
+        assert torch.equal(metadata._visible, originals[0])
+        fresh = deepseek_v41_index_scores_fp32(
+            qd,
+            qs,
+            cache,
+            weights,
+            visible,
+            table,
+            max_context_len=context,
+            candidates=candidates,
+            backend="cute_dsl",
+        )
+        assert not torch.equal(out, fresh), "stale snapshot negative control failed"
+        for value, original in zip(
+            (visible, table, candidates), originals, strict=True
+        ):
+            value.copy_(original)
+
+        combined = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(combined, stream=stream):
+            prepare_deepseek_v41_candidate_metadata(
+                visible, table, candidates, out=metadata, **config
+            )
+            run()
+        for _ in range(3):
+            visible.copy_(visible.roll(1))
+            table.copy_(table.flip(1))
+            candidates.copy_(candidates.roll(1, dims=1))
+            qd.bitwise_xor_(0x88)
+            qs.copy_(qs.roll(1, dims=1))
+            cache.flatten(1)[:, : page * 64].bitwise_xor_(0x11)
+            cache.flatten(1)[:, page * 64 :].copy_(
+                cache.flatten(1)[:, page * 64 :].roll(1, dims=0)
+            )
+            weights.neg_()
+            metadata._storage.fill_(0xA5)
+            out.fill_(torch.nan)
+            combined.replay()
+            check_scores(out)
+            assert torch.equal(metadata._visible, visible)
+        ready = torch.cuda.Event()
+        ready.record()
+        readers = []
+        for _ in range(2):
+            reader = torch.cuda.Stream()
+            reader.wait_event(ready)
+            with torch.cuda.stream(reader):
+                destination = torch.empty_strided(
+                    out.shape, out.stride(), device="cuda", dtype=torch.bfloat16
+                )
+                run(destination)
+            readers.append((reader, destination))
+        for reader, destination in readers:
+            reader.synchronize()
+            check_scores(destination)
+
+        with pytest.raises(ValueError, match="configuration"):
+            prepare_deepseek_v41_candidate_metadata(
+                visible,
+                table,
+                candidates,
+                out=metadata,
+                **(config | {"num_physical_pages": cache.shape[0] + 1}),
+            )
+        with pytest.raises(ValueError, match="overlap"):
+            prepare_deepseek_v41_candidate_metadata(
+                visible, table, metadata._encoded, out=metadata, **config
+            )
+        with pytest.raises(ValueError, match="configuration"):
+            deepseek_v41_candidate_scores_fp32(qd, qs, cache[:-1], weights, metadata)
+        with pytest.raises(ValueError, match="scores need"):
+            run(out[:, :-1])
+        with pytest.raises(ValueError, match="metadata must"):
+            deepseek_v41_candidate_scores_fp32(qd, qs, cache, weights, object())
+        if count > 8:
+            aliases = (
+                metadata._storage[: batch * 32 * 2].view(torch.bfloat16).view(batch, 32)
+            )
+            with pytest.raises(ValueError, match="overlap"):
+                deepseek_v41_candidate_scores_fp32(qd, qs, cache, aliases, metadata)
+        with torch.enable_grad():
+            weights.requires_grad_(True)
+            with pytest.raises(ValueError, match="inference-only"):
+                run()
+            weights.requires_grad_(False)
+    stream.synchronize()
+
+
+@pytest.mark.parametrize("stride", [2**31 + 512, 2**32 - 128 * 68, 40 * 1024**3])
+def test_candidate_metadata_reuse_selects_each_layer_address_width(stride):
+    from flashinfer.deepseek_v41 import (
+        deepseek_v41_candidate_scores_fp32,
+        prepare_deepseek_v41_candidate_metadata,
+    )
+
+    inputs, candidates = _constant_case(batch=1, count=4)
+    free, _ = torch.cuda.mem_get_info()
+    if free < stride + 2 * 1024**3:
+        pytest.skip("requires complete strided allocation plus runtime headroom")
+    qd, qs, _, weights, visible, table = inputs
+    table.fill_(1)
+    metadata = prepare_deepseek_v41_candidate_metadata(
+        visible,
+        table,
+        candidates,
+        page_size=128,
+        num_physical_pages=2,
+        max_context_len=32,
+    )
+    for pitch in (128 * 68, stride, 128 * 68):
+        cache = torch.empty_strided(
+            (2, 128, 1, 68), (pitch, 68, 68, 1), device="cuda", dtype=torch.uint8
+        )
+        flat = cache.flatten(1)
+        flat[1, :8192].fill_(0x11)
+        flat[1, 8192:].fill_(127)
+        out = deepseek_v41_candidate_scores_fp32(qd, qs, cache, weights, metadata)
+        torch.testing.assert_close(
+            out[:, :31], torch.full_like(out[:, :31], 32), atol=0, rtol=0
+        )
+        assert torch.isneginf(out[:, 31]).all()
+        del flat, cache

@@ -9,7 +9,11 @@ and their existing index cache; this example does not quantize or select TopK.
 """
 
 import torch
-from flashinfer.deepseek_v41 import deepseek_v41_index_scores_fp32
+from flashinfer.deepseek_v41 import (
+    deepseek_v41_candidate_scores_fp32,
+    deepseek_v41_index_scores_fp32,
+    prepare_deepseek_v41_candidate_metadata,
+)
 
 batch, page, context, count = 64, 64, 8192, 1024
 pages = context // page
@@ -46,3 +50,23 @@ torch.testing.assert_close(
 )
 assert torch.isneginf(scores[:, -1]).all()
 print("MXFP4 candidate scores:", scores.shape)
+
+# When layers share candidates, mapping and visibility, publish them once.
+# Each consumer supplies its own Q, cache and weights. Publish again when
+# metadata changes, and order publication before readers on other streams.
+metadata = prepare_deepseek_v41_candidate_metadata(
+    visible,
+    table,
+    candidates,
+    page_size=page,
+    num_physical_pages=cache.shape[0],
+    max_context_len=context,
+)
+prepared_scores = deepseek_v41_candidate_scores_fp32(qd, qs, cache, weights, metadata)
+torch.testing.assert_close(prepared_scores, scores, atol=0, rtol=0)
+weights.mul_(2)
+deepseek_v41_candidate_scores_fp32(
+    qd, qs, cache, weights, metadata, out=prepared_scores
+)
+torch.testing.assert_close(prepared_scores, scores * 2, atol=0, rtol=0)
+print("Reused candidate metadata:", prepared_scores.shape)

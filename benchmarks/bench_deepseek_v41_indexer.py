@@ -7,6 +7,8 @@ Run: python benchmarks/bench_deepseek_v41_indexer.py --output results.json
 CUPTI: add --cupti (requires cupti-python>=13). Default timings are complete
 CUDA Graph calls including candidate metadata, masking and scoring. CUPTI
 reports the GPU activity span of the same graph separately; neither is serving E2E.
+The optional cute_prepared benchmark arm times the public snapshot consumer
+after explicit publication, which is excluded from that arm's timing.
 
 DeepSeek V4.1 config dba1be0a40aa45a94ad051997016db3960a90277:
 index_n_heads=32, index_head_dim=128, top2048 block8 candidates. Candidate
@@ -214,6 +216,7 @@ CASES = {
     "b64_64k": (64, 65536, 64, "spread", False),
     "b128_128k": (128, 131072, 64, "spread", False),
     "b256_64k": (256, 65536, 64, "spread", False),
+    "b512_64k": (512, 65536, 64, "spread", False),
     "mixed128_64k": (128, 65536, 64, "clustered", True),
     "page32_b64": (64, 65536, 32, "clustered", True),
     "page128_b64": (64, 65536, 128, "spread", False),
@@ -222,6 +225,32 @@ CASES = {
 
 
 def prepare(f, out, backend):
+    if backend == "cute_prepared":
+        from flashinfer.deepseek_v41 import (
+            deepseek_v41_candidate_scores_fp32,
+            prepare_deepseek_v41_candidate_metadata,
+        )
+
+        config = dict(
+            page_size=f.page,
+            num_physical_pages=f.phys,
+            max_context_len=f.context,
+        )
+        metadata = prepare_deepseek_v41_candidate_metadata(
+            f.lengths, f.table, f.candidates, **config
+        )
+
+        def publish():
+            prepare_deepseek_v41_candidate_metadata(
+                f.lengths, f.table, f.candidates, out=metadata, **config
+            )
+
+        def consume():
+            return deepseek_v41_candidate_scores_fp32(
+                f.qd, f.qs, f.cache, f.weights, metadata, out=out
+            )
+
+        return consume, publish
     if backend == "triton_fixed":
         # Reproduce the previous draft's candidate tile policy using the
         # same native MXFP4 math. This is a benchmark baseline, not an API.
@@ -254,16 +283,13 @@ def prepare(f, out, backend):
             )
             return out
 
-        return run_fixed
+        return run_fixed, None
     # Explicit scratch ownership; no cached tensors shared across calls.
     workspace = None
     if backend == "cute_dsl":
-        align16 = lambda x: (x + 15) // 16 * 16
-        size = (
-            align16(4 * f.batch * f.count)
-            + align16(8 * f.batch * f.count)
-            + 4 * f.batch * tr.cdiv(f.width, 128) * 128
-        )
+        from flashinfer.experimental.deepseek_v41.indexer_cute import workspace_size
+
+        size = sum(workspace_size(f.batch, f.count))
         workspace = torch.empty(size, device="cuda", dtype=torch.uint8)
 
     def run():
@@ -281,7 +307,7 @@ def prepare(f, out, backend):
             workspace=workspace,
         )
 
-    return run
+    return run, None
 
 
 def main():
@@ -309,6 +335,7 @@ def main():
         root / "flashinfer/deepseek_v41.py",
         root / "flashinfer/experimental/deepseek_v41/indexer_fp32.py",
         root / "flashinfer/experimental/deepseek_v41/indexer_cute.py",
+        root / "flashinfer/experimental/deepseek_v41/candidate_metadata.py",
         root / "flashinfer/attn_scores/kernels/fp4_paged_mqa_logits.py",
     ]
     report = {
@@ -319,7 +346,7 @@ def main():
         "torch": torch.__version__,
         "torch_cuda": torch.version.cuda,
         "cutlass": importlib.metadata.version("nvidia-cutlass-dsl"),
-        "scope": "synthetic candidate scorer; complete graph call, allocation/JIT excluded",
+        "scope": "synthetic single-pool candidate scorer; graph call, allocation/JIT excluded; cute_prepared excludes explicit metadata publication",
         "source_sha256": {
             str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
             for p in paths
@@ -346,14 +373,21 @@ def main():
                 arms = {}
                 for backend in args.backends.split(","):
                     out, guard = f.output()
-                    run = prepare(f, out, backend)
+                    run, publish = prepare(f, out, backend)
                     graph, _ = capture(run)
-                    arms[backend] = (run, out, guard, graph)
-                    row["arms"][backend] = {"correctness": []}
+                    arms[backend] = (run, out, guard, graph, publish)
+                    row["arms"][backend] = {
+                        "correctness": [],
+                        "metadata_publication": "excluded; explicit snapshot"
+                        if publish
+                        else "included in scorer call",
+                    }
                 for repeat in range(2):
                     f.mutate(repeat)
                     ref = f.reference()
-                    for backend, (_, out, guard, graph) in arms.items():
+                    for backend, (_, out, guard, graph, publish) in arms.items():
+                        if publish is not None:
+                            publish()
                         out.fill_(float("nan"))
                         graph.replay()
                         row["arms"][backend]["correctness"].append(
