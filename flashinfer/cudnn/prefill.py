@@ -76,6 +76,16 @@ _OVERRIDE_CACHE_BATCH = 4096
 
 
 @functools.cache
+def _cudnn_single_token_gqa_ragged_stats_broken() -> bool:
+    """True if cuDNN's single-token (s_q == 1) decode-class kernel mis-stores a
+    ragged Stats tensor when h_qo != h_kv (NVBug 6783545): it used the sequence
+    stride for the per-head tile rows, so most heads of the packed LSE were
+    never written. Fixed in cuDNN 9.28 (MR !4496). The output is unaffected."""
+    if not CUDNN_AVAILABLE:
+        return False
+    return cudnn.backend_version() < 92800
+
+
 def _cudnn_version_supports_shape_override() -> bool:
     """SDPA shape override needs the unified engine's support (cuDNN 9.22+) and a
     cudnn-frontend whose pygraph takes is_override_shape_enabled (1.29+)."""
@@ -1053,16 +1063,18 @@ def cudnn_batch_prefill_with_kv_cache(
     batch_offsets_q : Optional[torch.Tensor]
         Cumulative per-request start offsets into the packed query tensor,
         shape ``(batch_size + 1,)``, int32, on GPU, in the units given by
-        ``batch_offsets_units`` (element offsets are
-        ``token_offset * num_heads_qo * head_dim_qk``).  Required when
-        ``batch_size > 1`` on the cuDNN graph path; may be omitted only for
-        ``batch_size == 1``.
+        ``batch_offsets_units`` (element offsets count elements of ``q``'s own
+        storage: ``token_offset * q.stride(0)``, which is
+        ``token_offset * num_heads_qo * head_dim_qk`` for a contiguous ``q``).
+        Required when ``batch_size > 1`` on the cuDNN graph path; may be
+        omitted only for ``batch_size == 1``.
     batch_offsets_o : Optional[torch.Tensor]
         Cumulative per-request start offsets into the packed output tensor,
         shape ``(batch_size + 1,)``, int32, on GPU, in the units given by
-        ``batch_offsets_units`` (element offsets are
-        ``token_offset * num_heads_qo * head_dim_vo``).  Required when
-        ``batch_size > 1`` on the cuDNN graph path; with
+        ``batch_offsets_units`` (element offsets count elements of the output's
+        own storage: ``token_offset * out.stride(0)``, i.e.
+        ``token_offset * num_heads_qo * head_dim_vo`` for a contiguous output).
+        Required when ``batch_size > 1`` on the cuDNN graph path; with
         ``batch_offsets_units="tokens"`` it defaults to ``batch_offsets_q``.
     batch_offsets_k : Optional[torch.Tensor]
         Cumulative per-request start offsets into the key tensor, shape
@@ -1209,6 +1221,31 @@ def cudnn_batch_prefill_with_kv_cache(
             f"drop it for the padded form {padded_shape}"
         )
 
+    # NVBug 6783545 (cuDNN < 9.28): the s_q == 1 GQA kernel mis-stores a ragged
+    # Stats tensor. With max_token_per_sequence == 1 the padded (b, 1, h_qo)
+    # Stats block is byte-identical to the packed (tokens, h_qo) buffer whenever
+    # every request has exactly one token, so declare the packed buffer as the
+    # padded form (no ragged Stats offset) and let the fixed-stride store write
+    # it. The caller still gets the packed tensor back.
+    lse_bind_padded = None
+    if (
+        use_cudnn_graph
+        and return_lse
+        and lse_packed
+        and max_token_per_sequence == 1
+        and h_qo != k_cache.shape[1]
+        and _cudnn_single_token_gqa_ragged_stats_broken()
+    ):
+        if num_tokens != num_sequences:
+            raise ValueError(
+                "cuDNN < 9.28 mis-stores a ragged Stats tensor for single-token "
+                "GQA (NVBug 6783545); with zero-length requests in the batch the "
+                f"packed LSE cannot be served, pass a padded lse of shape "
+                f"{padded_shape} instead"
+            )
+        lse_bind_padded = lse.view(num_sequences, 1, h_qo)
+        batch_offsets_stats = None
+
     if o_data_type is None:
         o_data_type = q.dtype
 
@@ -1235,8 +1272,9 @@ def cudnn_batch_prefill_with_kv_cache(
                 "batch_offsets_q and batch_offsets_o are required when batch_size > 1: "
                 "packed q/out cannot be addressed without ragged offsets. Pass "
                 "cumulative element offsets of shape (batch_size + 1,), e.g. "
-                "cumsum([0, *actual_seq_lens_q]) * num_qo_heads * head_dim, or "
-                'token-unit indptrs with batch_offsets_units="tokens".'
+                "cumsum([0, *actual_seq_lens_q]) * q.stride(0) for q (and "
+                "* out.stride(0) for out), or token-unit indptrs with "
+                'batch_offsets_units="tokens".'
             )
         run_kwargs = dict(
             q=q,
@@ -1255,11 +1293,16 @@ def cudnn_batch_prefill_with_kv_cache(
             k_scale=k_scale,
             v_scale=v_scale,
             out=out,
-            lse=lse,
+            lse=lse if lse_bind_padded is None else lse_bind_padded,
             o_data_type=o_data_type,
         )
 
-        if return_lse and lse_packed and batch_offsets_stats is None:
+        if (
+            return_lse
+            and lse_packed
+            and lse_bind_padded is None
+            and batch_offsets_stats is None
+        ):
             # Each request's rows of the packed LSE start where its query
             # tokens start. Token-unit offsets are the q indptr itself (the
             # graph applies the per-tensor multiplier h_qo); element-unit q
@@ -1268,15 +1311,12 @@ def cudnn_batch_prefill_with_kv_cache(
             # token stride and rescaled by h_qo. A single request without
             # offsets starts at row 0 and spans the buffer.
             if batch_offsets_q is None:
-                batch_offsets_stats = torch.tensor(
-                    [
-                        0,
-                        num_tokens
-                        if batch_offsets_units == "tokens"
-                        else num_tokens * h_qo,
-                    ],
-                    dtype=torch.int32,
-                    device=q.device,
+                # Built on the device (no host-to-device copy) so the call is
+                # legal inside CUDA-graph capture.
+                batch_offsets_stats = torch.arange(
+                    2, dtype=torch.int32, device=q.device
+                ) * (
+                    num_tokens if batch_offsets_units == "tokens" else num_tokens * h_qo
                 )
             elif batch_offsets_units == "tokens":
                 batch_offsets_stats = batch_offsets_q
@@ -1349,7 +1389,7 @@ def cudnn_batch_prefill_with_kv_cache(
                 )
                 batch_offsets_stats = apply_multiplier(batch_offsets_stats, h_qo)
 
-        return _batch_prefill_with_kv_cache(
+        result = _batch_prefill_with_kv_cache(
             **run_kwargs,
             batch_offsets_q=batch_offsets_q,
             batch_offsets_o=batch_offsets_o,
@@ -1357,6 +1397,9 @@ def cudnn_batch_prefill_with_kv_cache(
             batch_offsets_v=batch_offsets_v,
             batch_offsets_stats=batch_offsets_stats,
         )
+        if lse_bind_padded is not None:
+            return out, lse  # the padded view shares lse's storage
+        return result
     else:
         if actual_seq_lens_q is None or actual_seq_lens_kv is None:
             raise ValueError(

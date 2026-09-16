@@ -860,13 +860,13 @@ def test_explicit_cudnn_refuses_single_token_gqa_lse():
 
 
 @requires_cudnn_upgrade
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,  # a build/execute failure is not the known LSE bug
-    reason="cuDNN s_q==1 GQA kernel writes the ragged Stats only for the first head "
-    "of each kv group (cuDNN 9.26/9.27, NVBug 6783545); drop the guards above when this passes",
-)
 def test_cudnn_single_token_gqa_lse_is_correct():
+    """The low-level packed LSE is correct for single-token GQA rows on every
+    supported cuDNN: below 9.28 the ragged Stats store is broken for this
+    kernel (NVBug 6783545), so cudnn_batch_prefill_with_kv_cache binds the
+    packed buffer as the padded (b, 1, h) Stats form instead (the two are
+    byte-identical when every request has one token); 9.28+ stores the ragged
+    form correctly. The wrapper guards above remain as belt and braces."""
     from flashinfer.cudnn import cudnn_batch_prefill_with_kv_cache
 
     h_qo, h_kv, d = 32, 8, 128

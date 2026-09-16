@@ -248,6 +248,123 @@ def test_cudnn_prefill_lse_packed_with_noncontiguous_q(units):
     torch.testing.assert_close(lse, lse_ref, atol=1e-2, rtol=1e-2)
 
 
+@pytest.mark.parametrize("paged", [False, True])
+@pytest.mark.parametrize("h_qo,h_kv", [(8, 2), (8, 8)])
+def test_cudnn_prefill_lse_packed_single_token_rows(paged, h_qo, h_kv):
+    """Single-token requests (max_token_per_sequence == 1, the decode /
+    verify shape). cuDNN < 9.28 mis-stores a ragged Stats tensor for GQA here
+    (NVBug 6783545), so the packed LSE is served through the padded (b, 1, h)
+    declaration instead. The buffer is poisoned with NaN so an unwritten head
+    cannot pass by accident."""
+    _skip_unless_cudnn()
+    device = "cuda:0"
+    batch_size, d = 3, 128
+    kv_lens = torch.tensor([16, 31, 65], dtype=torch.int32, device=device)
+    q_lens = torch.ones(batch_size, dtype=torch.int32, device=device)
+    zero = torch.zeros(1, dtype=torch.int32, device=device)
+    qo_indptr = torch.cat([zero, torch.cumsum(q_lens, 0)]).int()
+    kv_indptr = torch.cat([zero, torch.cumsum(kv_lens, 0)]).int()
+    torch.manual_seed(0)
+    q = torch.randn(batch_size, h_qo, d, device=device, dtype=torch.bfloat16)
+    k = torch.randn(int(kv_lens.sum()), h_kv, d, device=device, dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    scale = float(d**-0.5)
+    ws = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
+    lse = torch.full((batch_size, h_qo), float("nan"), device=device)
+    common = dict(
+        max_token_per_sequence=1,
+        max_sequence_kv=int(kv_lens.max()),
+        actual_seq_lens_q=q_lens.view(batch_size, 1, 1, 1),
+        actual_seq_lens_kv=kv_lens.view(batch_size, 1, 1, 1),
+        causal=False,
+        return_lse=True,
+        batch_offsets_q=qo_indptr,
+        batch_offsets_units="tokens",
+        lse=lse,
+    )
+    if paged:
+        page_size = 16
+        pages_per_req = [(int(n) + page_size - 1) // page_size for n in kv_lens]
+        k_cache = torch.zeros(
+            sum(pages_per_req), h_kv, page_size, d, device=device, dtype=k.dtype
+        )
+        v_cache = torch.zeros_like(k_cache)
+        block_tables = torch.zeros(
+            batch_size, max(pages_per_req), dtype=torch.int32, device=device
+        )
+        page = 0
+        for b in range(batch_size):
+            for j in range(pages_per_req[b]):
+                start = int(kv_indptr[b]) + j * page_size
+                n = min(page_size, int(kv_lens[b]) - j * page_size)
+                k_cache[page, :, :n] = k[start : start + n].transpose(0, 1)
+                v_cache[page, :, :n] = v[start : start + n].transpose(0, 1)
+                block_tables[b, j] = page
+                page += 1
+        _, lse_out = cudnn_batch_prefill_with_kv_cache(
+            q, k_cache, v_cache, scale, ws, **common, block_tables=block_tables
+        )
+    else:
+        _, lse_out = cudnn_batch_prefill_with_kv_cache(
+            q, k, v, scale, ws, **common, batch_offsets_k=kv_indptr
+        )
+    assert lse_out.shape == (batch_size, h_qo)
+    assert not lse_out.isnan().any(), "some LSE heads were never written"
+    lse_ref = _reference_lse(q, k, q_lens, kv_lens, qo_indptr, kv_indptr, scale, False)
+    torch.testing.assert_close(lse_out, lse_ref, atol=1e-2, rtol=1e-2)
+
+
+def test_cudnn_prefill_lse_single_request_no_offsets_cuda_graph():
+    """A single request may omit every batch offset; the implicit Stats
+    offsets must then be built without a host-to-device copy so the call can
+    be captured into a CUDA graph."""
+    _skip_unless_cudnn()
+    device = "cuda:0"
+    h_qo, h_kv, d = 8, 2, 128
+    torch.manual_seed(0)
+    q = torch.randn(37, h_qo, d, device=device, dtype=torch.bfloat16)
+    k = torch.randn(64, h_kv, d, device=device, dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    ws = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
+    kwargs = dict(
+        max_token_per_sequence=37,
+        max_sequence_kv=64,
+        actual_seq_lens_q=torch.tensor([37], dtype=torch.int32, device=device).view(
+            1, 1, 1, 1
+        ),
+        actual_seq_lens_kv=torch.tensor([64], dtype=torch.int32, device=device).view(
+            1, 1, 1, 1
+        ),
+        causal=False,
+        return_lse=True,
+        is_cuda_graph_compatible=True,
+    )
+    scale = float(d**-0.5)
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            cudnn_batch_prefill_with_kv_cache(q, k, v, scale, ws, **kwargs)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        out, lse = cudnn_batch_prefill_with_kv_cache(q, k, v, scale, ws, **kwargs)
+    graph.replay()
+    torch.cuda.synchronize()
+    zero = torch.zeros(1, dtype=torch.int32, device=device)
+    lse_ref = _reference_lse(
+        q,
+        k,
+        torch.tensor([37], dtype=torch.int32, device=device),
+        torch.tensor([64], dtype=torch.int32, device=device),
+        torch.cat([zero, torch.tensor([37], dtype=torch.int32, device=device)]),
+        torch.cat([zero, torch.tensor([64], dtype=torch.int32, device=device)]),
+        scale,
+        False,
+    )
+    assert lse.shape == (37, h_qo)
+    torch.testing.assert_close(lse, lse_ref, atol=1e-2, rtol=1e-2)
+
+
 @pytest.mark.parametrize("flaw", ["dtype", "contiguity"])
 def test_cudnn_prefill_lse_rejects_unbindable_buffers(flaw):
     """The packed LSE is bound to cuDNN's Stats as contiguous float32; other
