@@ -377,22 +377,27 @@ def download_artifacts() -> None:
             artifact_name: str,
             kwargs: dict[str, object],
             retry_deadline: float | None,
-        ) -> bool:
+        ) -> tuple[bool, str | None]:
             request_kwargs = dict(kwargs)
             request_kwargs["session"] = _get_thread_session()
+            last_failure_detail = "download_file returned False after exhausting per-attempt retries"
             while True:
                 if download_file(source_path, destination_path, **request_kwargs):
-                    return True
+                    return True, None
                 if retry_deadline is None:
-                    return False
+                    return False, last_failure_detail
                 remaining = retry_deadline - time.monotonic()
                 if remaining <= 0:
                     logger.error(
-                        "Retry window exhausted for %s after %d seconds",
+                        "Retry window exhausted for %s after %d seconds. Last failure: %s",
                         artifact_name,
                         retry_window_seconds,
+                        last_failure_detail,
                     )
-                    return False
+                    return (
+                        False,
+                        f"retry window exhausted; last failure: {last_failure_detail}",
+                    )
                 logger.warning(
                     "Download failed for %s; retrying while %0.2f seconds remain in retry window",
                     artifact_name,
@@ -432,7 +437,13 @@ def download_artifacts() -> None:
                     artifact_name = future_to_name[fut]
                     failure_detail = artifact_name
                     try:
-                        ok = fut.result()
+                        result = fut.result()
+                        if isinstance(result, tuple):
+                            ok, detail = result
+                        else:
+                            ok, detail = result, None
+                        if detail:
+                            failure_detail = f"{artifact_name} ({detail})"
                     except Exception as e:
                         logger.exception(
                             "Unexpected exception in cubin download task for %s",
