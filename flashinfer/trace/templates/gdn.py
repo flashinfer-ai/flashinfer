@@ -514,83 +514,56 @@ def _gdn_mtp_reference(
     a,
     dt_bias,
     b,
-    scale,
+    scale=None,
     intermediate_states_buffer=None,
+    *,
+    cache_replayssm=False,
+    disable_state_update=True,
+    use_qk_l2norm=True,
+    replayssm_rawv=None,
+    replayssm_rawk=None,
+    replayssm_g=None,
+    replayssm_beta=None,
 ):
-    """
-    Gated Delta Net MTP (Multi-Token Prediction) reference implementation.
-
-    State layout: [pool_size, H, V, K] (k-last, K dimension at the end)
-
-    Gate computation:
-    g = exp(-exp(A_log) * softplus(a + dt_bias))
-    beta = sigmoid(b)
-
-    For each token t in sequence:
-        state_new = g_t * state_old + k_t^T @ (beta_t * v_t + (1-beta_t) * k_t @ state_old) - k_t^T @ (k_t @ state_old)
-        output_t = scale * q_t @ state_new
-        state_old = state_new  # Update for next token
-    """
-    B, T, num_q_heads, head_size = q.shape
-    _, _, num_k_heads, _ = k.shape
-    _, _, num_v_heads, _ = v.shape
-    device = q.device
-
-    if scale is None or scale == 0.0:
-        scale = 1.0 / math.sqrt(head_size)
-
-    x = a.float() + dt_bias.float()  # [B, T, HV]
-    g = torch.exp(-torch.exp(A_log.float()) * F.softplus(x))  # [B, T, HV]
-    beta = torch.sigmoid(b.float())  # [B, T, HV]
-
-    q_exp = q.repeat_interleave(num_v_heads // num_q_heads, dim=2)  # [B, T, HV, K]
-    k_exp = k.repeat_interleave(num_v_heads // num_k_heads, dim=2)  # [B, T, HV, K]
-
-    output = torch.zeros(
-        (B, T, num_v_heads, head_size), dtype=torch.bfloat16, device=device
+    """Direct GDN recurrence, including frozen-state raw-window verification."""
+    B, T, H, K = q.shape
+    HV = v.shape[2]
+    scale = K**-0.5 if scale is None else scale
+    raw_q, raw_k, raw_v, raw_a, raw_b = (
+        x.to(torch.bfloat16).double() for x in (q, k, v, a, b)
     )
-    cache_intermediate = intermediate_states_buffer is not None
-    final_state = initial_state.clone().float()
-
-    for b_idx in range(B):
-        state_idx = int(initial_state_indices[b_idx].item())
-        state_HVK = (
-            initial_state[state_idx].clone().float().transpose(-1, -2)
-        )  # [H,V,K] -> [H,K,V]
-
-        for t in range(T):
-            q_HK = q_exp[b_idx, t].float()  # [HV, K]
-            k_HK = k_exp[b_idx, t].float()  # [HV, K]
-            v_HV = v[b_idx, t].float()  # [HV, V]
-            g_H = g[b_idx, t]  # [HV]
-            beta_H = beta[b_idx, t]  # [HV]
-
-            for h_idx in range(num_v_heads):
-                q_h = q_HK[h_idx]
-                k_h = k_HK[h_idx]
-                v_h = v_HV[h_idx]
-                h_state = state_HVK[h_idx]
-                g_val = g_H[h_idx]
-                beta_val = beta_H[h_idx]
-
-                old_state = g_val * h_state
-                old_v = k_h @ old_state
-                new_v = beta_val * v_h + (1 - beta_val) * old_v
-                state_remove = k_h.unsqueeze(1) @ old_v.unsqueeze(0)
-                state_update = k_h.unsqueeze(1) @ new_v.unsqueeze(0)
-                h_state = old_state - state_remove + state_update
-
-                output[b_idx, t, h_idx] = (scale * (q_h @ h_state)).to(torch.bfloat16)
-                state_HVK[h_idx] = h_state
-
-            if cache_intermediate:
-                intermediate_states_buffer[state_idx, t] = state_HVK.transpose(
-                    -1, -2
-                )  # [H,K,V] -> [H,V,K]
-
-        # Commit accumulated state back to the pool slot [H,K,V] -> [H,V,K].
-        final_state[state_idx] = state_HVK.transpose(-1, -2)
-
+    query, key = raw_q, raw_k
+    if use_qk_l2norm:
+        query = query * torch.rsqrt(query.square().sum(-1, keepdim=True) + 1e-6)
+        key = key * torch.rsqrt(key.square().sum(-1, keepdim=True) + 1e-6)
+    query = query.repeat_interleave(HV // H, dim=2) * scale
+    key = key.repeat_interleave(HV // H, dim=2)
+    log_g = -A_log.double().exp() * F.softplus(raw_a + dt_bias.double())
+    beta = raw_b.sigmoid()
+    output = torch.zeros_like(v)
+    final_state = initial_state.clone()
+    for row, slot in enumerate(initial_state_indices.tolist()):
+        if slot < 0:
+            continue
+        if cache_replayssm:
+            replayssm_rawv[slot] = raw_v[row].transpose(0, 1).to(torch.bfloat16)
+            replayssm_rawk[slot] = raw_k[row].transpose(0, 1).to(torch.bfloat16)
+            replayssm_g[slot] = log_g[row].transpose(0, 1).float()
+            replayssm_beta[slot] = beta[row].transpose(0, 1).float()
+        state = initial_state[slot].double()
+        for step in range(T):
+            kt = key[row, step]
+            state *= log_g[row, step, :, None, None].exp()
+            prediction = (state * kt[:, None, :]).sum(-1)
+            delta = (raw_v[row, step] - prediction) * beta[row, step, :, None]
+            state += delta[..., None] * kt[:, None, :]
+            output[row, step] = (
+                (state * query[row, step, :, None, :]).sum(-1).to(output.dtype)
+            )
+            if intermediate_states_buffer is not None:
+                intermediate_states_buffer[row, step] = state.float()
+        if not disable_state_update:
+            final_state[slot] = state.float()
     return output, final_state
 
 
@@ -733,6 +706,25 @@ gdn_mtp_trace = TraceTemplate(
             optional=True,
             description="Optional buffer for caching intermediate states for potential rollback.",
         ),
+        "cache_replayssm": Scalar("bool", optional=True),
+        "disable_state_update": Scalar("bool", optional=True),
+        "use_qk_l2norm": Scalar("bool", optional=True),
+        "replayssm_rawv": Tensor(
+            ["pool_size", "num_v_heads", "seq_len", "head_size"],
+            dtype="bfloat16",
+            optional=True,
+        ),
+        "replayssm_rawk": Tensor(
+            ["pool_size", "num_k_heads", "seq_len", "head_size"],
+            dtype="bfloat16",
+            optional=True,
+        ),
+        "replayssm_g": Tensor(
+            ["pool_size", "num_v_heads", "seq_len"], dtype="float32", optional=True
+        ),
+        "replayssm_beta": Tensor(
+            ["pool_size", "num_v_heads", "seq_len"], dtype="float32", optional=True
+        ),
     },
     outputs={
         "output": Tensor(
@@ -744,6 +736,30 @@ gdn_mtp_trace = TraceTemplate(
             ["pool_size", "num_v_heads", "head_size", "head_size"],
             dtype="float32",
             description="Updated recurrent state pool in k-last layout [pool_size, H, V, K].",
+        ),
+        "replayssm_rawv": Tensor(
+            ["pool_size", "num_v_heads", "seq_len", "head_size"],
+            dtype="bfloat16",
+            param="replayssm_rawv",
+            optional=True,
+        ),
+        "replayssm_rawk": Tensor(
+            ["pool_size", "num_k_heads", "seq_len", "head_size"],
+            dtype="bfloat16",
+            param="replayssm_rawk",
+            optional=True,
+        ),
+        "replayssm_g": Tensor(
+            ["pool_size", "num_v_heads", "seq_len"],
+            dtype="float32",
+            param="replayssm_g",
+            optional=True,
+        ),
+        "replayssm_beta": Tensor(
+            ["pool_size", "num_v_heads", "seq_len"],
+            dtype="float32",
+            param="replayssm_beta",
+            optional=True,
         ),
     },
     constraints=[
@@ -1073,4 +1089,154 @@ gdn_fused_decode_trace = TraceTemplate(
     tags=["stage:decode", "status:verified"],
     reference=_gdn_fused_decode_reference,
     init=_gdn_fused_decode_init,
+)
+
+
+@torch.no_grad()
+def _gdn_replayssm_commit_reference(
+    checkpoint_state,
+    rawv_cache,
+    rawk_cache,
+    g_cache,
+    beta_cache,
+    state_indices,
+    accept_lens,
+    *,
+    track_state_indices=None,
+    track_steps=None,
+    use_qk_l2norm=True,
+    null_block_id=-1,
+    backend="auto",
+):
+    """Direct recurrence over accepted tokens; mutates the checkpoint pool."""
+    hv, h = rawv_cache.shape[2], rawk_cache.shape[2]
+    for row, slot in enumerate(state_indices.tolist()):
+        count = int(accept_lens[row])
+        if slot <= null_block_id or count <= 0:
+            continue
+        state = checkpoint_state[:, slot].double()
+        for step in range(count):
+            key = (
+                rawk_cache[:, slot, :, step].double().repeat_interleave(hv // h, dim=1)
+            )
+            if use_qk_l2norm:
+                key *= torch.rsqrt(key.square().sum(-1, keepdim=True) + 1e-6)
+            state *= g_cache[:, slot, :, step, None, None].double().exp()
+            delta = (
+                rawv_cache[:, slot, :, step].double()
+                - (state * key[..., None, :]).sum(-1)
+            ) * beta_cache[:, slot, :, step, None].double()
+            state += delta[..., None] * key[..., None, :]
+            if track_state_indices is not None and track_steps is not None:
+                track = int(track_state_indices[row])
+                if track > null_block_id and int(track_steps[row]) == step:
+                    checkpoint_state[:, track] = state.float()
+        checkpoint_state[:, slot] = state.float()
+    return checkpoint_state
+
+
+def _gdn_replayssm_commit_init(
+    *,
+    batch_size=4,
+    num_layers=2,
+    pool_size=8,
+    num_k_heads=2,
+    num_v_heads=8,
+    seq_len=8,
+    head_size=128,
+    device="cuda",
+    seed=0,
+):
+    torch.manual_seed(seed)
+    return dict(
+        checkpoint_state=torch.randn(
+            num_layers, pool_size, num_v_heads, head_size, head_size, device=device
+        )
+        * 0.1,
+        rawv_cache=torch.randn(
+            num_layers,
+            pool_size,
+            num_v_heads,
+            seq_len,
+            head_size,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        * 0.1,
+        rawk_cache=torch.randn(
+            num_layers,
+            pool_size,
+            num_k_heads,
+            seq_len,
+            head_size,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        * 0.1,
+        g_cache=-torch.rand(num_layers, pool_size, num_v_heads, seq_len, device=device),
+        beta_cache=torch.rand(
+            num_layers, pool_size, num_v_heads, seq_len, device=device
+        ),
+        state_indices=torch.arange(batch_size, device=device, dtype=torch.int32),
+        accept_lens=torch.full(
+            (batch_size,), seq_len, device=device, dtype=torch.int32
+        ),
+    )
+
+
+gdn_replayssm_commit_trace = TraceTemplate(
+    op_type="gdn",
+    name_prefix="gdn_replayssm_commit",
+    description="Commit the accepted raw-input prefix into all FP32 GDN checkpoints.",
+    axes={
+        "num_layers": Var(),
+        "pool_size": Var(),
+        "batch_size": Var(),
+        "seq_len": Var(),
+        "num_k_heads": Const(abbrev="k"),
+        "num_v_heads": Const(abbrev="v"),
+        "head_size": Const(abbrev="d"),
+    },
+    inputs={
+        "checkpoint_state": Tensor(
+            ["num_layers", "pool_size", "num_v_heads", "head_size", "head_size"],
+            dtype="float32",
+        ),
+        "rawv_cache": Tensor(
+            ["num_layers", "pool_size", "num_v_heads", "seq_len", "head_size"],
+            dtype="bfloat16",
+        ),
+        "rawk_cache": Tensor(
+            ["num_layers", "pool_size", "num_k_heads", "seq_len", "head_size"],
+            dtype="bfloat16",
+        ),
+        "g_cache": Tensor(
+            ["num_layers", "pool_size", "num_v_heads", "seq_len"], dtype="float32"
+        ),
+        "beta_cache": Tensor(
+            ["num_layers", "pool_size", "num_v_heads", "seq_len"], dtype="float32"
+        ),
+        "state_indices": Tensor(["batch_size"], dtype="int32"),
+        "accept_lens": Tensor(["batch_size"], dtype="int32"),
+        "track_state_indices": Tensor(["batch_size"], dtype="int32", optional=True),
+        "track_steps": Tensor(["batch_size"], dtype="int32", optional=True),
+        "use_qk_l2norm": Scalar("bool", optional=True),
+        "null_block_id": Scalar("int32", optional=True),
+        "backend": Scalar("str", optional=True),
+    },
+    outputs={
+        "checkpoint_state": Tensor(
+            ["num_layers", "pool_size", "num_v_heads", "head_size", "head_size"],
+            param="checkpoint_state",
+            dtype="float32",
+        ),
+    },
+    constraints=[
+        "head_size == 128",
+        "num_v_heads % num_k_heads == 0",
+        "batch_size <= pool_size",
+    ],
+    tags=["stage:commit"],
+    reference=_gdn_replayssm_commit_reference,
+    init=_gdn_replayssm_commit_init,
 )

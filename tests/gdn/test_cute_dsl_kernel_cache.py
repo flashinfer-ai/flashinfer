@@ -161,6 +161,7 @@ MTP_BASELINE = {
     "use_smem_v": False,
     "use_packed_fma": True,
     "per_token_pool_scatter": False,
+    "cache_replayssm": False,
 }
 
 PREFILL_BASELINE = {
@@ -372,6 +373,7 @@ def test_pretranspose_name_varies_with_every_argument(param, alternate):
         ("use_smem_v", True),
         ("use_packed_fma", False),
         ("per_token_pool_scatter", True),
+        ("cache_replayssm", True),
     ],
 )
 def test_mtp_name_varies_with_every_argument(param, alternate):

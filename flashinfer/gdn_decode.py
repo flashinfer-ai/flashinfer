@@ -21,10 +21,11 @@ Gated Delta Rule Decode - API Layer
 This file provides the public API for gated delta rule decode operations.
 Kernel implementations are in flashinfer/gdn_kernels/.
 
-Three APIs are provided:
+APIs:
 - gated_delta_rule_decode_pretranspose: V-major state layout [B, HV, V, K], T=1
 - gated_delta_rule_decode: K-major state layout [B, HV, K, V], T=1
 - gated_delta_rule_mtp: Multi-token processing (T > 1) for speculative decoding
+- gated_delta_rule_replayssm_commit: Commit the accepted ReplaySSM prefix
 """
 
 from typing import Literal, Optional, Tuple
@@ -46,6 +47,7 @@ try:
     from .trace.templates.gdn import (
         gated_delta_rule_decode_trace,
         gdn_mtp_trace,
+        gdn_replayssm_commit_trace,
     )
 
     _FLASHINFER_AVAILABLE = True
@@ -53,6 +55,7 @@ except ImportError:
     _FLASHINFER_AVAILABLE = False
     gated_delta_rule_decode_trace = None  # type: ignore[assignment]
     gdn_mtp_trace = None  # type: ignore[assignment]
+    gdn_replayssm_commit_trace = None  # type: ignore[assignment]
 
     # Fallback decorator for standalone usage (accepts trace= kwarg)
     def flashinfer_api(func=None, *, trace=None):  # type: ignore[misc]
@@ -1103,6 +1106,11 @@ def gated_delta_rule_mtp(
     disable_state_update: Optional[bool] = None,
     use_qk_l2norm: bool = True,
     output_state_indices: Optional[torch.Tensor] = None,
+    cache_replayssm: bool = False,
+    replayssm_rawv: Optional[torch.Tensor] = None,
+    replayssm_rawk: Optional[torch.Tensor] = None,
+    replayssm_g: Optional[torch.Tensor] = None,
+    replayssm_beta: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Gated Delta Rule MTP kernel (Multiple Token Processing).
 
@@ -1181,6 +1189,32 @@ def gated_delta_rule_mtp(
         to ``initial_state_indices`` (read and write target the same
         slot).  Negative entries skip the writeback for that batch
         (the read still runs).
+    cache_replayssm : bool
+        SM100/SM103 only, FP32 checkpoint, K=V=128, T>=3.
+        Persist only the fold-every-commit ReplaySSM raw input window instead
+        of full intermediate hidden-state snapshots. Requires frozen-state
+        verify mode (``disable_state_update=True``), no
+        ``intermediate_states_buffer`` or ``ssm_state_indices``, and all four
+        ``replayssm_*`` buffers. Live ``initial_state_indices`` must be unique
+        and in range. Negative indices leave output and cache rows untouched.
+        Windows are indexed by pool slot, overwritten on every verify, and
+        consumed once by :func:`gated_delta_rule_replayssm_commit` before the
+        next verify. FP16 inputs are converted to BF16 before caching, as in
+        the existing MTP kernel. Default: ``False``.
+
+        The tcgen05 TF32 specialization requires T=4/8, B=1..256, a
+        contiguous checkpoint, BF16 output, int32 indices, Q/K normalization,
+        and even HV/H. Other supported SM100 cases use the FP32 MTP fallback.
+        TF32 changes reduction precision; outputs need not be bitwise equal
+        to the fallback.
+    replayssm_rawv : torch.Tensor, optional
+        BF16 raw V window of shape ``[pool_size, HV, T, V]``.
+    replayssm_rawk : torch.Tensor, optional
+        BF16 pre-normalization K window of shape ``[pool_size, H, T, K]``.
+    replayssm_g : torch.Tensor, optional
+        FP32 log-decay window of shape ``[pool_size, HV, T]``.
+    replayssm_beta : torch.Tensor, optional
+        FP32 sigmoid-beta window of shape ``[pool_size, HV, T]``.
 
     Returns
     -------
@@ -1191,7 +1225,7 @@ def gated_delta_rule_mtp(
 
     Notes
     -----
-    - Requires SM90 (Hopper) architecture.
+    - Standard MTP requires SM90 or later; ReplaySSM requires SM100/SM103.
     - Supports ``T > 1`` (multiple token processing).
     - State layout is K-last: ``[pool_size, HV, V, K]``.
     - Optimized for speculative decoding verification scenarios.
@@ -1313,7 +1347,11 @@ def gated_delta_rule_mtp(
         )
     else:
         cache_steps = T
-        intermediate_states = torch.zeros(1, 1, 1, dtype=torch.float32, device=q.device)
+        # This argument is compile-time dead when intermediate-state caching is
+        # disabled.  Reuse an existing tensor so the ReplaySSM tcgen fast path
+        # does not enqueue a tiny cudaMemset before every verify launch; the
+        # generic path replaces it with its shape-compatible cached dummy.
+        intermediate_states = initial_state
 
     # FLA-style per-token pool scatter. When provided, the kernel writes each
     # h_{t+1} directly to initial_state[ssm_state_indices[i, t]] instead of
@@ -1340,6 +1378,83 @@ def gated_delta_rule_mtp(
         )
         assert ssm_state_indices.device == q.device, (
             f"ssm_state_indices device {ssm_state_indices.device} != q device {q.device}"
+        )
+
+    replayssm_buffers = (
+        replayssm_rawv,
+        replayssm_rawk,
+        replayssm_g,
+        replayssm_beta,
+    )
+    if cache_replayssm:
+        from .gdn_kernels.device_target import gdn_device_target
+
+        if gdn_device_target(q.device).major != 10:
+            raise ValueError("ReplaySSM caching currently requires SM100/SM103")
+        assert disable_state_update, (
+            "ReplaySSM verify must leave the checkpoint frozen "
+            "(disable_state_update=True)"
+        )
+        assert intermediate_states_buffer is None, (
+            "ReplaySSM replaces full intermediate-state snapshots"
+        )
+        assert ssm_state_indices is None, (
+            "ReplaySSM and per-token state scatter are mutually exclusive"
+        )
+        assert pool_size > 0, "ReplaySSM requires at least one checkpoint slot"
+        assert k.shape == q.shape and v.shape[:2] == (B, T), (
+            "ReplaySSM Q/K/V shapes must agree"
+        )
+        assert a.shape == b.shape == (B, T, HV), "ReplaySSM a/b must be [B,T,HV]"
+        assert A_log.shape == dt_bias.shape == (HV,), (
+            "ReplaySSM gate parameters must be [HV]"
+        )
+        assert all(
+            t.device == q.device
+            for t in (
+                k,
+                v,
+                a,
+                b,
+                A_log,
+                dt_bias,
+                initial_state,
+                initial_state_indices,
+                output,
+            )
+        ), "ReplaySSM tensors must be on the query device"
+        assert K == V == 128, "ReplaySSM requires K=V=128"
+        assert H > 0 and HV > 0 and HV % H == 0, "ReplaySSM requires HV divisible by H"
+        assert initial_state_indices.shape == (B,), "initial_state_indices must be [B]"
+        assert T >= 3, f"ReplaySSM caching requires T >= 3, got T={T}"
+        assert all(t is not None for t in replayssm_buffers), (
+            "cache_replayssm=True requires replayssm_rawv/rawk/g/beta"
+        )
+        expected_replayssm = (
+            ((pool_size, HV, T, V), torch.bfloat16, "replayssm_rawv"),
+            ((pool_size, H, T, K), torch.bfloat16, "replayssm_rawk"),
+            ((pool_size, HV, T), torch.float32, "replayssm_g"),
+            ((pool_size, HV, T), torch.float32, "replayssm_beta"),
+        )
+        for tensor, (shape, dtype, name) in zip(
+            replayssm_buffers, expected_replayssm, strict=True
+        ):
+            assert tensor is not None
+            assert tensor.shape == shape, (
+                f"{name} must have shape {list(shape)}, got {tuple(tensor.shape)}"
+            )
+            assert tensor.dtype == dtype, (
+                f"{name} must have dtype {dtype}, got {tensor.dtype}"
+            )
+            assert tensor.device == q.device, (
+                f"{name} device {tensor.device} != q device {q.device}"
+            )
+            assert tensor.is_contiguous(), (
+                f"{name} must be a contiguous per-layer ReplaySSM view"
+            )
+    else:
+        assert all(t is None for t in replayssm_buffers), (
+            "replayssm_* buffers require cache_replayssm=True"
         )
 
     # Execute kernel
@@ -1372,6 +1487,11 @@ def gated_delta_rule_mtp(
         ssm_state_indices=ssm_state_indices,
         output_state_indices=output_state_indices,
         use_pool_indexing=pool_use_pool_indexing,
+        cache_replayssm=cache_replayssm,
+        replayssm_rawv=replayssm_rawv,
+        replayssm_rawk=replayssm_rawk,
+        replayssm_g=replayssm_g,
+        replayssm_beta=replayssm_beta,
     )
 
     # No post-kernel scatter step: the contiguity assert above guarantees
@@ -1384,3 +1504,91 @@ def gated_delta_rule_mtp(
         output = output.to(target_dtype)
 
     return output, initial_state
+
+
+@flashinfer_api(trace=gdn_replayssm_commit_trace)
+def gated_delta_rule_replayssm_commit(
+    checkpoint_state: torch.Tensor,
+    rawv_cache: torch.Tensor,
+    rawk_cache: torch.Tensor,
+    g_cache: torch.Tensor,
+    beta_cache: torch.Tensor,
+    state_indices: torch.Tensor,
+    accept_lens: torch.Tensor,
+    *,
+    track_state_indices: Optional[torch.Tensor] = None,
+    track_steps: Optional[torch.Tensor] = None,
+    use_qk_l2norm: bool = True,
+    null_block_id: int = -1,
+    backend: Literal["auto", "simt", "tcgen05"] = "auto",
+) -> None:
+    """Commit an accepted ReplaySSM prefix into all layers' checkpoints.
+
+    Call :func:`gated_delta_rule_mtp` with ``cache_replayssm=True`` for each
+    layer first. Verify leaves checkpoints frozen. After acceptance is known,
+    call this function once, then overwrite the windows during the next verify.
+    The cache is not shifted or cleared; unaccepted tokens are discarded.
+
+    Parameters
+    ----------
+    checkpoint_state : torch.Tensor
+        Contiguous FP32 ``[layers, slots, HV, 128, 128]`` state, K-last.
+        Updated in place. All tensors must be on the same SM100/SM103 device.
+    rawv_cache : torch.Tensor
+        Contiguous BF16 ``[layers, slots, HV, T, 128]`` raw V windows.
+    rawk_cache : torch.Tensor
+        Contiguous BF16 ``[layers, slots, H, T, 128]`` pre-normalization K.
+    g_cache : torch.Tensor
+        Contiguous FP32 ``[layers, slots, HV, T]`` log-decay windows.
+    beta_cache : torch.Tensor
+        Contiguous FP32 ``[layers, slots, HV, T]`` sigmoid-beta windows.
+    state_indices : torch.Tensor
+        Contiguous int32 ``[B]`` pool slots. Live slots must be unique and
+        in range. Slots <= ``null_block_id`` are ignored.
+    accept_lens : torch.Tensor
+        Contiguous int32 ``[B]`` accepted token counts in [0, T]. Zero is a
+        no-op, including for optional track writes.
+    track_state_indices : torch.Tensor, optional
+        Contiguous int32 ``[B]`` destinations for an additional checkpoint.
+        Live track slots must be in range, mutually distinct, and disjoint
+        from every live ``state_indices`` slot. Paired with ``track_steps``.
+    track_steps : torch.Tensor, optional
+        Contiguous int32 ``[B]`` zero-based token indices to save. A step
+        outside the accepted prefix leaves the destination unchanged.
+    use_qk_l2norm : bool
+        Normalize cached K with epsilon 1e-6. Must match verify. Default True.
+    null_block_id : int
+        Largest reserved/invalid slot; must be >= -1. Default -1.
+
+    backend : {"auto", "simt", "tcgen05"}
+        Auto selects TF32 tcgen05 for normalized T=8 without tracking and
+        FP32 SIMT otherwise. Use ``simt`` to retain FP32 contractions.
+        Explicit ``tcgen05`` rejects unsupported configurations.
+
+    Notes
+    -----
+    Index values, accepted lengths and non-aliasing are caller contracts;
+    they are not read back to the host. Warm up before CUDA graph capture.
+    """
+    from .gdn_kernels.gdn_replayssm_spec_fold import (
+        commit_gdn_replayssm_fold_all_layers,
+    )
+
+    if rawk_cache.ndim != 5:
+        raise ValueError("rawk_cache must be [layers, slots, H, T, K]")
+    commit_gdn_replayssm_fold_all_layers(
+        checkpoint_state,
+        rawv_cache,
+        rawk_cache,
+        g_cache,
+        beta_cache,
+        state_indices,
+        accept_lens,
+        rawk_cache.shape[3],
+        rawk_cache.shape[2],
+        track_state_indices=track_state_indices,
+        track_steps=track_steps,
+        use_qk_l2norm_in_kernel=use_qk_l2norm,
+        null_block_id=null_block_id,
+        backend=backend,
+    )
