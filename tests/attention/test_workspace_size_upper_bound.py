@@ -293,6 +293,75 @@ def test_decode_cuda_core_bound_refuses_the_split_settings():
         )
 
 
+def test_prefill_bound_uses_the_custom_jit_module(monkeypatch):
+    """A wrapper built on a custom variant sizes against that variant."""
+
+    def _refuse(*args, **kwargs):
+        raise AssertionError("a standard module was built for a custom variant")
+
+    monkeypatch.setattr(prefill_module, "get_batch_prefill_module", _refuse)
+
+    wrapper = _bare_prefill_wrapper()
+    wrapper._jit_module = _ModuleWithBound()
+    wrapper.workspace_size_upper_bound(
+        max_batch_size=4,
+        max_total_num_rows=64,
+        max_num_pages_per_request=8,
+        num_qo_heads=8,
+        num_kv_heads=2,
+        head_dim_qk=128,
+        page_size=16,
+    )
+
+    assert wrapper._jit_module.args is not None
+
+
+@pytest.mark.parametrize("use_tensor_cores", [True, False], ids=["tc", "cuda-core"])
+def test_decode_bound_uses_the_custom_jit_module(monkeypatch, use_tensor_cores):
+    """plan() and workspace_size() honour _jit_module, so the bound must too.
+
+    Sizing against the standard scheduler while planning against a custom one
+    can under-reserve, and the failure would surface later inside plan().
+    """
+
+    def _refuse(*args, **kwargs):
+        raise AssertionError("a standard module was built for a custom variant")
+
+    monkeypatch.setattr(decode_module, "get_batch_prefill_module", _refuse)
+    monkeypatch.setattr(decode_module, "get_batch_decode_module", _refuse)
+
+    wrapper = _bare_decode_wrapper(use_tensor_cores=use_tensor_cores)
+    wrapper._jit_module = _ModuleWithBound()
+    wrapper.workspace_size_upper_bound(
+        max_batch_size=4,
+        max_num_pages_per_request=8,
+        num_qo_heads=8,
+        num_kv_heads=2,
+        head_dim=128,
+        page_size=16,
+    )
+
+    assert wrapper._jit_module.args is not None
+
+
+@pytest.mark.parametrize("use_tensor_cores", [True, False], ids=["tc", "cuda-core"])
+def test_decode_bound_refuses_a_custom_jit_module_without_an_entry_point(
+    use_tensor_cores,
+):
+    """A custom variant that cannot answer leaves the caller its own sizing."""
+    wrapper = _bare_decode_wrapper(use_tensor_cores=use_tensor_cores)
+    wrapper._jit_module = _ModuleWithoutBound()
+    with pytest.raises(NotImplementedError):
+        wrapper.workspace_size_upper_bound(
+            max_batch_size=4,
+            max_num_pages_per_request=8,
+            num_qo_heads=8,
+            num_kv_heads=2,
+            head_dim=128,
+            page_size=16,
+        )
+
+
 def test_cta_tile_q_candidates_have_a_single_source():
     """The selector and the bound must iterate the same list.
 

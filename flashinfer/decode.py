@@ -1492,28 +1492,31 @@ class BatchDecodeWithPagedKVCacheWrapper:
             # so its bound is the prefill bound for q_len_per_req rows each.
             # Which prefill scheduler it gets depends on the dtypes, so it is
             # resolved the way plan() resolves it rather than assumed.
-            backend = _resolve_decode_tensor_core_backend(
-                backend,
-                self.device,
-                pos_encoding_mode,
-                q_data_type,
-                kv_data_type,
-                head_dim,
-                q_len_per_req,
-            )
-            module = get_batch_prefill_module(
-                backend,
-                q_data_type,
-                kv_data_type,
-                o_data_type,
-                torch.int32,
-                head_dim,
-                head_dim,
-                PosEncodingMode[pos_encoding_mode].value,
-                window_left >= 0,
-                logits_soft_cap > 0,
-                False,
-            )
+            if self._jit_module is not None:
+                module = self._jit_module
+            else:
+                backend = _resolve_decode_tensor_core_backend(
+                    backend,
+                    self.device,
+                    pos_encoding_mode,
+                    q_data_type,
+                    kv_data_type,
+                    head_dim,
+                    q_len_per_req,
+                )
+                module = get_batch_prefill_module(
+                    backend,
+                    q_data_type,
+                    kv_data_type,
+                    o_data_type,
+                    torch.int32,
+                    head_dim,
+                    head_dim,
+                    PosEncodingMode[pos_encoding_mode].value,
+                    window_left >= 0,
+                    logits_soft_cap > 0,
+                    False,
+                )
             bound_fn = getattr(module, "workspace_size_upper_bound", None)
             if bound_fn is None:
                 raise NotImplementedError(
@@ -1541,17 +1544,20 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     "fixed_split_size and disable_split_kv are only accepted "
                     "on the tensor-core decode path"
                 )
-            module = get_batch_decode_module(
-                q_data_type,
-                kv_data_type,
-                o_data_type,
-                torch.int32,
-                head_dim,
-                head_dim,
-                PosEncodingMode[pos_encoding_mode].value,
-                window_left != -1,
-                logits_soft_cap > 0,
-            )
+            if self._jit_module is not None:
+                module = self._jit_module
+            else:
+                module = get_batch_decode_module(
+                    q_data_type,
+                    kv_data_type,
+                    o_data_type,
+                    torch.int32,
+                    head_dim,
+                    head_dim,
+                    PosEncodingMode[pos_encoding_mode].value,
+                    window_left != -1,
+                    logits_soft_cap > 0,
+                )
             bound_fn = getattr(module, "workspace_size_upper_bound", None)
             if bound_fn is None:
                 raise NotImplementedError(
