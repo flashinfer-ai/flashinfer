@@ -2004,10 +2004,6 @@ def create_softmax_task(
                         row_max=row_max,
                         q_offset=q_offset,
                     )
-                elif tmem_sp.uses_fixed_dense_k_tail_mask:
-                    old_row_max, row_max = sp.fixed_dense_k_tail_masked_row_max(
-                        row_max=row_max,
-                    )
                 elif tmem_sp.uses_packed_dense_k_mask:
                     old_row_max, row_max = sp.packed_dense_k_masked_row_max(
                         row_max=row_max,
@@ -2202,6 +2198,56 @@ def create_softmax_task(
                 sp.release()
                 old_row_max = sp.softmax_aux_identity(row_max=row_max)
                 vec.acquire()
+                vec.store_vec(
+                    old_row_max=old_row_max,
+                    row_max=row_max,
+                    row_sum=row_sum,
+                    final_stats=True,
+                )
+                vec.commit()
+            elif tmem_sp.uses_fixed_dense_k_tail_mask:
+                # Dense TAIL: the partial last K/V tile. Same handshake as one
+                # LOOP iteration, with the TMA zero-fill lanes masked to -inf.
+                sp.wait()
+                old_row_max, row_max = sp.fixed_dense_k_tail_masked_row_max(
+                    row_max=row_max,
+                    section=FmhaStage.Tail,
+                )
+                vec.store_vec(
+                    old_row_max=old_row_max,
+                    row_max=row_max,
+                    row_sum=row_sum,
+                )
+                vec.commit()
+                if s0s1_seq is None:
+                    pass
+                elif index == 0:
+                    seq.acquire()
+                else:
+                    seq.wait()
+                p_chunk = sp.exp2_p(
+                    row_max=row_max,
+                    scale_softmax_log2=scale_softmax_log2,
+                )
+                if s0s1_seq is None:
+                    pass
+                elif index == 0:
+                    seq.commit()
+                else:
+                    seq.release()
+                sp.release()
+                row_sum = sp.softmax_aux_reduce(
+                    old_row_max=old_row_max,
+                    row_max=row_max,
+                    row_sum=row_sum,
+                    p_chunk=p_chunk,
+                    scale_softmax_log2=scale_softmax_log2,
+                )
+                vec.acquire()
+                # Cleanup: drain the final SP slot and publish identity stats.
+                sp.wait()
+                sp.release()
+                old_row_max = sp.softmax_aux_identity(row_max=row_max)
                 vec.store_vec(
                     old_row_max=old_row_max,
                     row_max=row_max,
