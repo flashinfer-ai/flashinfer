@@ -360,3 +360,73 @@ pcie_ipc_all_reduce_trace = TraceTemplate(
     reference=_pcie_ipc_all_reduce_reference,
     init=_pcie_ipc_all_reduce_init,
 )
+
+
+def _pcie_ipc_collective_templates(collective, input_rows, output_rows):
+    # The group size belongs to the workspace, not the call signature. Finite
+    # templates preserve it as a Const and remain discoverable by trace tooling.
+    operation = "all-gather" if collective == "all_gather" else "SUM reduce-scatter"
+    return {
+        world_size: TraceTemplate(
+            op_type="comm",
+            name_prefix=f"pcie_ipc_{collective}_tp{world_size}",
+            description=(
+                f"PCIe IPC {operation} with rank-major shards. "
+                "This is a per-rank metadata schema; "
+                "execution requires a collectively initialized workspace."
+            ),
+            axes={
+                "local_rows": Var(description="Rows in one rank's shard."),
+                "total_rows": Var(description="Rows across all rank-major shards."),
+                "hidden_dim": Const(abbrev="h"),
+                "world_size": Const(value=world_size, abbrev=""),
+            },
+            inputs={"inp": Tensor([input_rows, "hidden_dim"])},
+            outputs={
+                "output": Tensor(
+                    [output_rows, "hidden_dim"], param="out", dtype_from="inp"
+                )
+            },
+            constraints=["total_rows == world_size * local_rows"],
+            tags=["stage:comm"],
+            # A local tensor alone cannot define a distributed reference/init.
+        )
+        for world_size in (2, 4, 8)
+    }
+
+
+_pcie_ipc_all_gather_templates = _pcie_ipc_collective_templates(
+    "all_gather", "local_rows", "total_rows"
+)
+_pcie_ipc_reduce_scatter_templates = _pcie_ipc_collective_templates(
+    "reduce_scatter", "total_rows", "local_rows"
+)
+
+
+def _pcie_ipc_collective_trace_dispatch(templates, kwargs):
+    world_size = getattr(kwargs.get("self"), "world_size", None)
+    if world_size not in templates:
+        raise ValueError(
+            "PCIe IPC collective tracing requires a bound workspace with "
+            "world_size 2, 4, or 8; use fi_trace(workspace.all_gather, inp=...) "
+            "or fi_trace(workspace.reduce_scatter, inp=...)."
+        )
+    return templates[world_size]
+
+
+def pcie_ipc_all_gather_trace_dispatch(**kwargs):
+    return _pcie_ipc_collective_trace_dispatch(_pcie_ipc_all_gather_templates, kwargs)
+
+
+def pcie_ipc_reduce_scatter_trace_dispatch(**kwargs):
+    return _pcie_ipc_collective_trace_dispatch(
+        _pcie_ipc_reduce_scatter_templates, kwargs
+    )
+
+
+pcie_ipc_all_gather_trace_dispatch.templates = tuple(  # type: ignore[attr-defined]
+    _pcie_ipc_all_gather_templates.values()
+)
+pcie_ipc_reduce_scatter_trace_dispatch.templates = tuple(  # type: ignore[attr-defined]
+    _pcie_ipc_reduce_scatter_templates.values()
+)

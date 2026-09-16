@@ -478,6 +478,9 @@ def test_aot_registers_each_exact_mnnvl_moe_target(monkeypatch):
     monkeypatch.setattr(jit_comm, "gen_vllm_comm_module", lambda: spec("vllm"))
     monkeypatch.setattr(jit_comm, "gen_pcie_ipc_comm_module", lambda: spec("pcie"))
     monkeypatch.setattr(
+        jit_comm, "gen_pcie_ipc_ag_rs_module", lambda: spec("pcie_ag_rs")
+    )
+    monkeypatch.setattr(
         jit_comm,
         "gen_moe_alltoall_module",
         lambda target: selected.append(target) or spec(f"mnnvl_{target}"),

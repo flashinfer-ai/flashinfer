@@ -21,6 +21,7 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 from ...api_logging import flashinfer_api
+from ...trace.templates.comm import pcie_ipc_reduce_scatter_trace_dispatch
 from ._ag_rs_tuning import (
     PCIE_IPC_TUNE_BATCHES,
     PCIE_IPC_TUNE_REPEAT,
@@ -151,7 +152,7 @@ class PcieIpcReduceScatterWorkspace(_PcieIpcWorkspace):
             repeat=repeat,
         )
 
-    @flashinfer_api
+    @flashinfer_api(trace=pcie_ipc_reduce_scatter_trace_dispatch)
     def reduce_scatter(
         self,
         inp: torch.Tensor,
