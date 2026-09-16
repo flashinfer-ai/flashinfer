@@ -236,7 +236,8 @@ def get_customize_batch_prefill_module(
 def get_trtllm_gen_prefill_module():
     mod = gen_trtllm_gen_fmha_module()
     op = mod.build_and_load()
-    setup_cubin_loader(mod.get_library_path())
+    for library_path in mod.get_library_paths():
+        setup_cubin_loader(library_path)
 
     def _paged_run(
         query: torch.Tensor,
@@ -5174,7 +5175,8 @@ def fmha_varlen(
 def get_trtllm_gen_fmha_module():
     mod = gen_trtllm_gen_fmha_module()
     op = mod.build_and_load()
-    setup_cubin_loader(mod.get_library_path())
+    for library_path in mod.get_library_paths():
+        setup_cubin_loader(library_path)
     return op
 
 
