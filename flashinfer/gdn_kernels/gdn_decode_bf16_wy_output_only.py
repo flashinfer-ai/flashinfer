@@ -2260,6 +2260,8 @@ def gated_delta_rule_mtp(
     # ~1-7% faster across BS=16..256 with bit-identical output. mbp=12 (40 regs) gains no
     # further occupancy (SMEM-capped at 7 CTAs) and is slower — do not raise past 8.
     mbp = max(1, min(_needed + 1, 8))
+    if torch.cuda.get_device_capability(device) == (10, 7):
+        mbp = 1
     # T-aware Phase-2 squaring depth.
     t_disc = 4 if T <= 4 else (8 if T <= 8 else 16)
     # n_valid in the key: native (n_valid<T) vs staged (n_valid=T_KERNEL) compile to
