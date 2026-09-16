@@ -350,6 +350,165 @@ def test_gather_gemm_k_tail(k, num_tokens, tile_m):
     torch.testing.assert_close(output[:num_tokens], expected, rtol=0, atol=0)
 
 
+def test_localized_runner_uses_shard_shapes_and_separate_cache_key():
+    from flashinfer.fused_moe.cute_dsl.tuner import (
+        CuteDslFusedMoERunner,
+    )
+
+    full_w1 = torch.empty((2, 1024, 2048), dtype=torch.uint8)
+    full_w2 = torch.empty((2, 2048, 512), dtype=torch.uint8)
+    shards = [
+        {
+            "w1_weight": torch.empty((2, 512, 2048), dtype=torch.uint8),
+            "w2_weight": torch.empty((2, 1024, 512), dtype=torch.uint8),
+        }
+        for _ in range(2)
+    ]
+    inputs = [None] * 11
+    inputs[4], inputs[8] = full_w1, full_w2
+    kwargs = {
+        "forward_impl": lambda **kwargs: kwargs,
+        "num_experts": 2,
+        "top_k": 1,
+        "num_local_experts": 2,
+        "use_cuda_graph": True,
+        "cuda_graph_max_tokens": 256,
+    }
+    full_runner = CuteDslFusedMoERunner(**kwargs)
+    localized_runner = CuteDslFusedMoERunner(
+        **kwargs,
+        localized_weights=shards,
+        localized_streams=[object(), object()],
+        localized_sm_count=100,
+    )
+
+    tuning_w1, tuning_w2 = full_runner._weights_for_tuning(inputs)
+    assert tuning_w1 is full_w1
+    assert tuning_w2 is full_w2
+    tuning_w1, tuning_w2 = localized_runner._weights_for_tuning(inputs)
+    assert tuning_w1 is shards[0]["w1_weight"]
+    assert tuning_w2 is shards[0]["w2_weight"]
+    assert localized_runner.tuning_config.use_cuda_graph
+    assert localized_runner.tuning_config.cuda_graph_profile_shape_limit == (
+        0,
+        0,
+        256,
+    )
+    assert full_runner.get_cache_key_extras(inputs) != (
+        localized_runner.get_cache_key_extras(inputs)
+    )
+
+
+def test_localized_runner_injects_localized_execution_resources():
+    from flashinfer.fused_moe.cute_dsl.tuner import (
+        DEFAULT_BLACKWELL_MOE_TACTIC,
+        CuteDslFusedMoERunner,
+    )
+
+    captured = {}
+    shards = [
+        {
+            "w1_weight": torch.empty((2, 512, 2048), dtype=torch.uint8),
+            "w2_weight": torch.empty((2, 1024, 512), dtype=torch.uint8),
+        }
+        for _ in range(2)
+    ]
+    streams = [object(), object()]
+    memset_stream = object()
+    runner = CuteDslFusedMoERunner(
+        forward_impl=lambda **kwargs: captured.update(kwargs) or "result",
+        num_experts=2,
+        top_k=1,
+        num_local_experts=2,
+        localized_weights=shards,
+        localized_streams=streams,
+        localized_sm_count=100,
+        localized_memset_stream=memset_stream,
+    )
+    inputs = [object()] * 12
+
+    assert runner(inputs, tactic=DEFAULT_BLACKWELL_MOE_TACTIC) == "result"
+    assert captured["localized_weights"] is shards
+    assert captured["localized_streams"] is streams
+    assert captured["localized_memset_stream"] is memset_stream
+    assert captured["sm_count"] == 100
+
+
+def test_adaptive_localization_executes_autotuner_selected_runner(monkeypatch):
+    import importlib
+
+    fused_moe_module = importlib.import_module(
+        "flashinfer.fused_moe.cute_dsl.fused_moe"
+    )
+
+    created_runners = []
+
+    class FakeRunner:
+        def __init__(self, **kwargs):
+            self.localized_weights = kwargs.get("localized_weights")
+            self.tuning_config = object()
+            self.calls = []
+            created_runners.append(self)
+
+        def __call__(self, inputs, tactic, **kwargs):
+            self.calls.append((inputs, tactic, kwargs))
+            return self
+
+    class FakeTuner:
+        is_tuning_mode = False
+
+        def choose_one(self, op_name, runners, tuning_config, inputs, **kwargs):
+            assert op_name.endswith("::AdaptiveLocalized")
+            assert len(runners) == 2
+            assert runners[0].localized_weights is not None
+            assert runners[1].localized_weights is None
+            assert tuning_config is runners[0].tuning_config
+            return runners[1], "full-path-tactic"
+
+    class FakeAutoTuner:
+        @staticmethod
+        def get():
+            return FakeTuner()
+
+    monkeypatch.setattr(fused_moe_module, "AutoTuner", FakeAutoTuner)
+    monkeypatch.setattr(fused_moe_module, "CuteDslFusedMoERunner", FakeRunner)
+    monkeypatch.setattr(
+        fused_moe_module, "_require_cute_dsl_arch_for", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        fused_moe_module, "localized_moe_trace", lambda *args, **kwargs: None
+    )
+
+    tensor = torch.empty((1, 1), dtype=torch.uint8)
+    selected_runner = fused_moe_module.cute_dsl_fused_moe_nvfp4(
+        x=tensor,
+        x_sf=tensor,
+        token_selected_experts=torch.zeros((1, 1), dtype=torch.int32),
+        token_final_scales=torch.ones((1, 1), dtype=torch.float32),
+        w1_weight=tensor,
+        w1_weight_sf=tensor,
+        w1_alpha=torch.ones(1),
+        fc2_input_scale=torch.ones(1),
+        w2_weight=tensor,
+        w2_weight_sf=tensor,
+        w2_alpha=torch.ones(1),
+        num_experts=1,
+        top_k=1,
+        moe_output=torch.empty((1, 1), dtype=torch.bfloat16),
+        localized_weights=[
+            {"w1_weight": tensor, "w2_weight": tensor},
+            {"w1_weight": tensor, "w2_weight": tensor},
+        ],
+        localized_streams=[object(), object()],
+        localized_sm_count=100,
+        localized_allow_nonlocalized=True,
+    )
+
+    assert selected_runner is created_runners[1]
+    assert created_runners[0].calls == []
+    assert created_runners[1].calls[0][1] == "full-path-tactic"
+
+
 # =============================================================================
 # Test Class: GEMM input validation
 # =============================================================================
