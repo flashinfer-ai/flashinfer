@@ -1143,6 +1143,45 @@ def test_factorized_cache_maps_non_idempotent_profile_once(monkeypatch):
     )
 
 
+@pytest.mark.parametrize("generator", [(4,), lambda _maximum: (4,)])
+def test_profile_bucket_representation_does_not_change_cache_coordinate(
+    monkeypatch, generator
+):
+    """Equivalent explicit and generated profile points share one cache coordinate."""
+    tuner = reset_autotuner()
+    runner = DummyRunner(valid_tactics=(0, 1))
+    inputs = [torch.empty((3, 4), dtype=torch.float32)]
+    config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0,),
+                dim_idx=(0,),
+                gen_tuning_buckets=generator,
+                map_to_tuning_buckets=lambda value: value + 1,
+            ),
+        ),
+    )
+
+    monkeypatch.setattr(
+        AutoTuner,
+        "_profile_single_kernel",
+        lambda _self, _runner, _inputs, tactic, _config, **_kwargs: float(1 - tactic),
+    )
+    with autotune(tune_mode=True):
+        _, tactic = tuner.choose_one("callable_profile_tail", [runner], config, inputs)
+
+    assert tactic == 1
+    is_hit, _, cached_tactic, _ = tuner.search_cache(
+        "callable_profile_tail",
+        [runner],
+        (inputs[0].shape,),
+        config,
+        inputs=inputs,
+    )
+    assert is_hit
+    assert cached_tactic == tactic
+
+
 def test_choose_one_different_infer_tokens_same_bucket_get_same_cached_tactic(
     monkeypatch,
 ):
