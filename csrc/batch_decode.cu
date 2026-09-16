@@ -140,6 +140,16 @@ Array<int64_t> BatchDecodeWithPagedKVCacheWorkspaceSizeUpperBound(
       << "CUDA cores template only supports equal head dim for QK and VO, please use tensor "
          "cores template for different head dim";
 
+  // The bound is asked for before any tensor exists, so these arrive as plain
+  // scheduler limits. A zero head count divides below, a truncated head ratio
+  // would silently pick the wrong GQA group size, and a zero page size divides
+  // inside the work estimator.
+  TVM_FFI_ICHECK_GT(num_qo_heads, 0) << "num_qo_heads must be positive";
+  TVM_FFI_ICHECK_GT(num_kv_heads, 0) << "num_kv_heads must be positive";
+  TVM_FFI_ICHECK_EQ(num_qo_heads % num_kv_heads, 0)
+      << "num_qo_heads must be divisible by num_kv_heads";
+  TVM_FFI_ICHECK_GT(page_size, 0) << "page_size must be positive";
+
   ffi::CUDADeviceGuard device_guard(device_buffer.device().device_id);
   const cudaStream_t stream = get_stream(device_buffer.device());
   size_t float_workspace_size_in_bytes = 0;

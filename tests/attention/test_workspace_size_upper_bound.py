@@ -763,6 +763,79 @@ def test_decode_upper_bound_covers_targeted_nonuniform_shapes(use_tensor_cores):
 
 
 @requires_cuda
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        pytest.param(
+            {"num_kv_heads": 0}, "num_kv_heads must be positive", id="kv-zero"
+        ),
+        pytest.param(
+            {"num_qo_heads": 0}, "num_qo_heads must be positive", id="qo-zero"
+        ),
+        pytest.param(
+            {"num_qo_heads": 6, "num_kv_heads": 4},
+            "divisible",
+            id="indivisible-ratio",
+        ),
+        pytest.param({"page_size": 0}, "page_size must be positive", id="page-zero"),
+    ],
+)
+def test_decode_bound_rejects_degenerate_scheduler_limits(overrides, message):
+    """The bound is asked for before any tensor exists, so it checks its limits.
+
+    A zero head count divides, a truncated ratio such as 6 / 4 would silently
+    pick the wrong GQA group size, and a zero page size divides inside the work
+    estimator.
+    """
+    import flashinfer
+
+    pytest.importorskip("flashinfer")
+    wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        torch.empty(16 * 1024 * 1024, dtype=torch.uint8, device="cuda"),
+        "NHD",
+        use_tensor_cores=False,
+    )
+    limits = dict(
+        max_batch_size=4,
+        max_num_pages_per_request=8,
+        num_qo_heads=_NUM_QO_HEADS,
+        num_kv_heads=_NUM_KV_HEADS,
+        head_dim=_HEAD_DIM,
+        page_size=_PAGE_SIZE,
+    )
+    assert wrapper.workspace_size_upper_bound(**limits)
+
+    with pytest.raises(RuntimeError, match=message):
+        wrapper.workspace_size_upper_bound(**{**limits, **overrides})
+
+
+@requires_cuda
+def test_prefill_bound_rejects_a_zero_kv_head_count():
+    """num_qo_heads % num_kv_heads runs before the ratio check below it."""
+    import flashinfer
+
+    pytest.importorskip("flashinfer")
+    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        torch.empty(16 * 1024 * 1024, dtype=torch.uint8, device="cuda"),
+        "NHD",
+        backend="fa2",
+    )
+    limits = dict(
+        max_batch_size=4,
+        max_total_num_rows=64,
+        max_num_pages_per_request=8,
+        num_qo_heads=_NUM_QO_HEADS,
+        num_kv_heads=_NUM_KV_HEADS,
+        head_dim_qk=_HEAD_DIM,
+        page_size=_PAGE_SIZE,
+    )
+    assert wrapper.workspace_size_upper_bound(**limits)
+
+    with pytest.raises(RuntimeError, match="num_kv_heads must be positive"):
+        wrapper.workspace_size_upper_bound(**{**limits, "num_kv_heads": 0})
+
+
+@requires_cuda
 def test_prefill_plan_succeeds_with_buffers_sized_from_the_bound():
     """A bound is only useful if the plans it was taken for fit in it."""
     pytest.importorskip("flashinfer")

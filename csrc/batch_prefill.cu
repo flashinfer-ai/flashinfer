@@ -113,6 +113,10 @@ Array<int64_t> BatchPrefillWithKVCacheWorkspaceSizeUpperBound(
   size_t float_workspace_size_in_bytes = 0;
   size_t int_workspace_size_in_bytes = 0;
 
+  // The bound is asked for before any tensor exists, so the head counts arrive
+  // as plain scheduler limits. Zero reaches num_qo_heads % num_kv_heads below.
+  TVM_FFI_ICHECK_GT(num_kv_heads, 0) << "num_kv_heads must be positive";
+
   ffi::CUDADeviceGuard device_guard(device_buffer.device().device_id);
   cudaError_t status = PrefillPlanWorkspaceSizeUpperBound<IdType>(
       float_workspace_size_in_bytes, int_workspace_size_in_bytes, max_batch_size,
