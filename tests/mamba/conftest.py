@@ -12,6 +12,12 @@ parallel across cores, and is a near-free no-op when the modules are already
 present in the JIT disk cache.
 """
 
+import contextlib
+import os
+import subprocess
+import sys
+import tempfile
+
 import torch
 
 # Every _CHECKPOINTING_SSU_VARIANT_FIELDS combination requested by
@@ -1066,10 +1072,6 @@ def _triton_compile_check() -> bool:
     on probe infrastructure failures so tests are skipped only on a
     demonstrated compile abort.
     """
-    import os
-    import sys
-    import tempfile
-
     probe_src = (
         "import triton, triton.language as tl, torch\n"
         "@triton.jit\n"
@@ -1099,10 +1101,8 @@ def _triton_compile_check() -> bool:
         return True
     finally:
         if path is not None:
-            try:
+            with contextlib.suppress(OSError):
                 os.unlink(path)
-            except OSError:
-                pass
 
 
 def _module_uses_triton(fspath) -> bool:

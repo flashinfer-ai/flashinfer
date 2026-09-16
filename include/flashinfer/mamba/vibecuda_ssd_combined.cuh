@@ -681,9 +681,9 @@ __device__ __forceinline__ void stage_bc(const bf16* __restrict__ mat, uint* dst
                                          int t0, int len, int g, int groups, int bcs) {
   for (int e = threadIdx.x; e < CS * ND / 8; e += 256) {
     const int t = e >> 4, n8 = (e & 15) * 8;
-    const uint4 v = (t < len) ? *reinterpret_cast<const uint4*>(mat + (long)(t0 + t) * bcs +
-                                                                (long)g * ND + n8)
-                              : make_uint4(0u, 0u, 0u, 0u);
+    const uint4 v =
+        (t < len) ? *reinterpret_cast<const uint4*>(mat + (long)(t0 + t) * bcs + (long)g * ND + n8)
+                  : make_uint4(0u, 0u, 0u, 0u);
     uint* d = dst + t * row_words + (n8 >> 1);
     d[0] = v.x;
     d[1] = v.y;
@@ -873,8 +873,7 @@ __global__ void __launch_bounds__(256)
         c0m--;
       int ncm = 0;
       for (int j = c0m;
-           j < nmeta && (int)load_si(seq_idx, si_is64, meta_ci[j] * CS + meta_co[j]) == sv;
-           j++)
+           j < nmeta && (int)load_si(seq_idx, si_is64, meta_ci[j] * CS + meta_co[j]) == sv; j++)
         ncm++;
       geo->t0 = t0c;
       geo->len = t0n - t0c;
@@ -929,9 +928,7 @@ __global__ void __launch_bounds__(256)
     const int t = e >> 5, n4 = (e & 31) * 4;
     const bool inj = (t >= off && t < pend);
     uint2 bu = make_uint2(0u, 0u);
-    if (inj)
-      bu = *reinterpret_cast<const uint2*>(bmat + (long)(b0 + t) * bcs +
-                                           (long)g * ND + n4);
+    if (inj) bu = *reinterpret_cast<const uint2*>(bmat + (long)(b0 + t) * bcs + (long)g * ND + n4);
     const float w0 = inj ? fold_scaled_b(dl, dacs[t], dtp_s[t], cvt_bf2(bu.x).x) : 0.f;
     const float w1 = inj ? fold_scaled_b(dl, dacs[t], dtp_s[t], cvt_bf2(bu.x).y) : 0.f;
     const float w2 = inj ? fold_scaled_b(dl, dacs[t], dtp_s[t], cvt_bf2(bu.y).x) : 0.f;
@@ -998,9 +995,8 @@ __device__ __forceinline__ void stage_bc_sw_store(const bf16* __restrict__ mat, 
   const bf16* srcm = mat + (long)t0 * bcs + (long)g * ND;
   for (int e = threadIdx.x; e < CS * ND / 8; e += 256) {
     const int t = e >> 4, c8 = e & 15;
-    const uint4 v = (t < len)
-                        ? *reinterpret_cast<const uint4*>(srcm + (long)t * bcs + c8 * 8)
-                        : make_uint4(0u, 0u, 0u, 0u);
+    const uint4 v = (t < len) ? *reinterpret_cast<const uint4*>(srcm + (long)t * bcs + c8 * 8)
+                              : make_uint4(0u, 0u, 0u, 0u);
     *reinterpret_cast<uint4*>(sw_ptr(dst, t, c8)) = v;
   }
 }
@@ -1010,7 +1006,7 @@ __device__ __forceinline__ void stage_bc_sw_store(const bf16* __restrict__ mat, 
 // outside the range are left untouched (never read by the consumer mma).
 __device__ __forceinline__ void stage_bc_sw_lim(const bf16* __restrict__ mat, bf16* dst, int t0,
                                                 int len, int g, int groups, int rlo, int rhi,
-                                                  int bcs) {
+                                                int bcs) {
   const bf16* srcm = mat + (long)t0 * bcs + (long)g * ND;
   for (int e0 = threadIdx.x; e0 < (rhi - rlo) * (ND / 8); e0 += 256) {
     const int t = rlo + (e0 >> 4), c8 = e0 & 15;
@@ -1244,8 +1240,7 @@ __global__ void __launch_bounds__(256)
           const bool inj = (t >= offj && t < pendj);
           uint2 bu = make_uint2(0u, 0u);
           if (inj)
-            bu = *reinterpret_cast<const uint2*>(bmat + (long)(b0j + t) * bcs +
-                                                 (long)g * ND + n4);
+            bu = *reinterpret_cast<const uint2*>(bmat + (long)(b0j + t) * bcs + (long)g * ND + n4);
           const float w0 = inj ? fold_scaled_b(dlj, dacs_j[t], dtp_j[t], cvt_bf2(bu.x).x) : 0.f;
           const float w1 = inj ? fold_scaled_b(dlj, dacs_j[t], dtp_j[t], cvt_bf2(bu.x).y) : 0.f;
           const float w2 = inj ? fold_scaled_b(dlj, dacs_j[t], dtp_j[t], cvt_bf2(bu.y).x) : 0.f;
@@ -1821,8 +1816,7 @@ __global__ void __launch_bounds__(256)
         const int t = e >> 5, n4 = (e & 31) * 4;
         uint2 bu = make_uint2(0u, 0u);
         if (t < len)
-          bu = *reinterpret_cast<const uint2*>(bmat + (long)(t0 + t) * bcs + (long)g * ND +
-                                               n4);
+          bu = *reinterpret_cast<const uint2*>(bmat + (long)(t0 + t) * bcs + (long)g * ND + n4);
         const float w0 =
             (t < len) ? fold_scaled_b(dl, dacs[off + t], dtp_s[off + t], cvt_bf2(bu.x).x) : 0.f;
         const float w1 =
@@ -2578,7 +2572,7 @@ struct VibeCudaSsdArgs {
   long bc_tok_stride;  // B/C token stride (elements; groups*ND when contiguous)
   int dt_tok_stride;   // dt token stride (elements; heads when contiguous)
   long z_tok_stride;   // z token stride (elements; heads*PD when contiguous)
-  int sm_count;  // device SM count (lean-dispatch metadata)
+  int sm_count;        // device SM count (lean-dispatch metadata)
   cudaStream_t stream;
 };
 

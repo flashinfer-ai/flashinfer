@@ -131,8 +131,12 @@ def _case(
 def _assert_parity(actual, expected):
     # Numeric comparison only: backends return (output, final_states) in the
     # configured io/state dtypes, so normalize both sides to fp32.
-    torch.testing.assert_close(actual[0].float(), expected[0].float(), atol=ATOL, rtol=RTOL)
-    torch.testing.assert_close(actual[1].float(), expected[1].float(), atol=ATOL, rtol=RTOL)
+    torch.testing.assert_close(
+        actual[0].float(), expected[0].float(), atol=ATOL, rtol=RTOL
+    )
+    torch.testing.assert_close(
+        actual[1].float(), expected[1].float(), atol=ATOL, rtol=RTOL
+    )
 
 
 def _cute_reference(constructor, tensors, arguments):

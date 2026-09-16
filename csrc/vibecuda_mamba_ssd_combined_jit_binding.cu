@@ -17,18 +17,15 @@
 
 using tvm::ffi::Optional;
 
-void vibecuda_ssd_combined_fwd(TensorView x, TensorView dt, Optional<TensorView> dt_bias,
-                               TensorView a, TensorView b, TensorView c, Optional<TensorView> d,
-                               Optional<TensorView> z, Optional<TensorView> initial,
-                               Optional<TensorView> seq_idx, Optional<TensorView> chunk_indices,
-                               Optional<TensorView> chunk_offsets,
-                               Optional<TensorView> checkpoint_states,
-                               Optional<TensorView> checkpoint_tokens,
-                               Optional<TensorView> checkpoint_slots, TensorView workspace,
-                               TensorView out, TensorView final_states, int64_t nchunk_bound,
-                               int64_t do_softplus, double dt_lo, double dt_hi, int64_t unbounded,
-                               int64_t d_mode, int64_t varlen, int64_t y_chunk_major,
-                               int64_t x_tok_stride, int64_t bc_tok_stride,
-                               int64_t dt_tok_stride, int64_t z_tok_stride);
+void vibecuda_ssd_combined_fwd(
+    TensorView x, TensorView dt, Optional<TensorView> dt_bias, TensorView a, TensorView b,
+    TensorView c, Optional<TensorView> d, Optional<TensorView> z, Optional<TensorView> initial,
+    Optional<TensorView> seq_idx, Optional<TensorView> chunk_indices,
+    Optional<TensorView> chunk_offsets, Optional<TensorView> checkpoint_states,
+    Optional<TensorView> checkpoint_tokens, Optional<TensorView> checkpoint_slots,
+    TensorView workspace, TensorView out, TensorView final_states, int64_t nchunk_bound,
+    int64_t do_softplus, double dt_lo, double dt_hi, int64_t unbounded, int64_t d_mode,
+    int64_t varlen, int64_t y_chunk_major, int64_t x_tok_stride, int64_t bc_tok_stride,
+    int64_t dt_tok_stride, int64_t z_tok_stride);
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(vibecuda_ssd_combined_fwd, vibecuda_ssd_combined_fwd);
