@@ -6947,6 +6947,163 @@ def test_q_token_sparse_geometry_graph(
 @pytest.mark.arch_blackwell
 @_REQUIRES_BLACKWELL_PRIMTS_GPU
 @pytest.mark.parametrize(
+    (
+        "dim",
+        "dtype",
+        "group",
+        "block",
+        "page",
+        "topk",
+        "context",
+        "packed",
+        "split_kv",
+        "shared",
+    ),
+    (
+        (256, torch.bfloat16, 8, 128, 4, 512, 262144, True, False, False),
+        (128, torch.float8_e4m3fn, 8, 128, 4, 512, 524288, False, False, True),
+        (256, torch.bfloat16, 5, 128, 128, 16, 16384, False, True, False),
+        (128, torch.float8_e4m3fn, 4, 128, 64, 16, 16384, True, True, False),
+        (64, torch.float8_e4m3fn, 3, 32, 16, 16, 8192, False, True, False),
+    ),
+)
+def test_q_token_sparse_membership_capacity_and_per_head_reduction(
+    dim,
+    dtype,
+    group,
+    block,
+    page,
+    topk,
+    context,
+    packed,
+    split_kv,
+    shared,
+    batch=2,
+    ratio=12,
+):
+    """Large nonsplit metadata and unequal per-head split domains stay correct."""
+    hkv = 2
+    rows = batch * group - int(packed)
+    q_shape = (
+        (rows, hkv * ratio, dim) if packed else (batch, 1, group, hkv * ratio, dim)
+    )
+    q = torch.zeros(q_shape, dtype=torch.bfloat16, device="cuda").to(dtype)
+    out = torch.empty_like(q, dtype=torch.bfloat16)
+    offsets = torch.arange(batch + 1, device="cuda", dtype=torch.int32) * group
+    offsets[-1] = rows
+    qo_indptr = offsets if packed else None
+    table = torch.arange(context // page, device="cuda", dtype=torch.int32).repeat(
+        batch, 1
+    )
+    k = torch.zeros(
+        context // page, hkv, page, dim, device="cuda", dtype=torch.bfloat16
+    ).to(dtype)
+    heads = torch.arange(hkv, device="cuda")
+    values = ((torch.arange(context, device="cuda") // block // topk) % 4 + 1).view(
+        -1, 1, page, 1
+    ) + 4 * heads.view(1, hkv, 1, 1)
+    v = values.expand(-1, -1, -1, dim).to(dtype).contiguous()
+    requests = torch.arange(batch, device="cuda", dtype=torch.int32).repeat_interleave(
+        group
+    )[:rows]
+    positions = (context - group + torch.arange(group, device="cuda")).repeat(batch)[
+        :rows
+    ]
+    candidates = (context - group - block) // block
+    ids = (
+        (
+            torch.arange(topk, device="cuda")
+            + torch.arange(batch, device="cuda")[:, None, None, None] * (topk // 2)
+            + torch.arange(group, device="cuda")[None, :, None, None]
+            * heads[None, None, :, None]
+            * topk
+        )
+        .remainder(candidates)
+        .reshape(batch * group, hkv, topk)[:rows]
+        .to(torch.int32)
+    )
+    if shared:
+        ids = ids[:, 1].contiguous()
+    workspace = torch.empty(
+        get_q_token_kv_block_sparse_workspace_size(
+            q,
+            k,
+            table,
+            block_topk=topk,
+            max_seq_len_kv=context,
+            qo_indptr=qo_indptr,
+            seq_len_q=group if packed else None,
+            kv_block_size=block,
+            o_data_type=out.dtype,
+            share_pattern_across_kv_heads=shared,
+            split_kv=split_kv,
+        ),
+        device="cuda",
+        dtype=torch.uint8,
+    )
+    wrapper = QTokenKvBlockSparsePagedTSWrapper()
+    wrapper.plan(
+        batch,
+        group,
+        hkv * ratio,
+        hkv,
+        dim,
+        block,
+        page,
+        topk,
+        context,
+        device=q.device,
+        workspace_buffer=workspace,
+        use_packed_q=packed,
+        split_kv=split_kv,
+        share_pattern_across_kv_heads=shared,
+        q_data_type=q.dtype,
+        o_data_type=out.dtype,
+    )
+
+    def run():
+        wrapper.run(
+            q, (k, v), table, ids, requests, positions, qo_indptr=qo_indptr, out=out
+        )
+
+    def check():
+        # Zero Q/K gives uniform attention. Per-head cases give head 0 shared
+        # blocks across Q and head 1 different blocks, producing a longer union.
+        pattern_ids = ids[:, None] if shared else ids
+        chosen = (pattern_ids.long() // topk) % 4 + 1 + 4 * heads[None, :, None]
+        tail = (positions + 1) % block
+        tail_value = (((positions + 1) // block // topk) % 4 + 1)[:, None] + 4 * heads
+        expected = (chosen.float().sum(-1) * block + tail[:, None] * tail_value) / (
+            topk * block + tail[:, None]
+        )
+        actual = out.reshape(rows, hkv, ratio, dim).float()
+        torch.testing.assert_close(
+            actual,
+            expected[..., None, None].expand_as(actual),
+            rtol=0.02,
+            atol=0.02,
+        )
+
+    run()
+    prepared = wrapper._prepared_plan
+    assert (prepared._attention_plan._compiled_reducer is not None) == split_kv
+    if not shared:
+        lengths = prepared._metadata_plan.seq_lens.view(batch, hkv)
+        assert bool(torch.all(lengths[:, 1] > lengths[:, 0]))
+    check()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    ids.add_(topk).remainder_(candidates)
+    positions.sub_(block)
+    out.fill_(torch.nan)
+    graph.replay()
+    check()
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_BLACKWELL_PRIMTS_GPU
+@pytest.mark.parametrize(
     ("storage", "fmt"),
     (("contiguous", "bsr"), ("contiguous", "bitmask"), ("paged", "bsr")),
 )
