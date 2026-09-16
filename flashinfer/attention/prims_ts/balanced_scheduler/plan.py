@@ -120,6 +120,7 @@ class BalancedMLADecodePlan:
         num_partitions: int,
         device: torch.device,
         k_tile_tokens: int = 128,
+        num_insts_kv: int = 1,
         cost: BalancedCostModel | None = None,
         kernel_family: str = "2cta",
         dtype_name: str = "bf16",
@@ -131,8 +132,17 @@ class BalancedMLADecodePlan:
             raise ValueError("batch_size must be positive")
         if num_partitions <= 0:
             raise ValueError("num_partitions must be positive")
+        if k_tile_tokens <= 0 or k_tile_tokens > _INT32_MAX:
+            raise ValueError("k_tile_tokens must be a positive int32 value")
+        if num_insts_kv <= 0 or num_insts_kv > _INT32_MAX:
+            raise ValueError("num_insts_kv must be a positive int32 value")
         if max_seq_len < 0 or max_seq_len > _INT32_MAX:
             raise ValueError("max_seq_len must be a non-negative int32 value")
+        max_base_tiles = (max_seq_len + k_tile_tokens - 1) // k_tile_tokens
+        if max_base_tiles + num_insts_kv - 1 > _INT32_MAX:
+            raise ValueError(
+                "the maximum aligned KV work-unit extent exceeds int32 capacity"
+            )
         device = torch.device(device)
         if device.type != "cuda":
             raise ValueError("balanced MLA plan buffers must be allocated on CUDA")
@@ -164,6 +174,7 @@ class BalancedMLADecodePlan:
         self.partial_capacity = balanced_partial_capacity(batch_size, num_partitions)
         self.reducer_capacity = balanced_reducer_capacity(batch_size, num_partitions)
         self.k_tile_tokens = k_tile_tokens
+        self.num_insts_kv = num_insts_kv
         self.max_seq_len = max_seq_len
         self.device = device
         self.kernel_family = kernel_family
@@ -390,6 +401,8 @@ class BalancedMLADecodePlan:
             raise ValueError(
                 "forced_target_piece_tiles must be a non-negative int32 value"
             )
+        if forced_target_piece_tiles + self.num_insts_kv - 1 > _INT32_MAX:
+            raise ValueError("the aligned forced target exceeds int32 capacity")
 
         planner_args = (
             seq_lens,
@@ -402,6 +415,7 @@ class BalancedMLADecodePlan:
             self._device_cost_models,
             self.num_partitions,
             self.k_tile_tokens,
+            self.num_insts_kv,
             self.max_seq_len,
             self._auto_cost,
             scheduler == "optimized",
