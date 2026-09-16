@@ -1342,7 +1342,8 @@ def single_prefill_with_kv_cache(
         The custom boolean mask tensor, shape: ``[qo_len, kv_len]``.
         The elements in the mask tensor should be either ``True`` or ``False``,
         where ``False`` means the corresponding element in the attention matrix will be
-        masked out.
+        masked out. Its flattened form, a 1D tensor of ``qo_len * kv_len`` elements, is
+        also accepted. Any other shape raises :class:`ValueError`.
 
         When :attr:`custom_mask` is provided, and :attr:`packed_custom_mask` is not, the
         function will pack the custom mask tensor into a 1D packed mask tensor, which introduces
