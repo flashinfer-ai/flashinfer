@@ -17,6 +17,8 @@ def check_shape(m, n, k):
 
 
 def _sm121_tactic(m, n, k, compute_capability):
+    if compute_capability == (12, 1) and (m, n, k) == (256, 7168, 4608):
+        return ("b12x", 64, 128, 256)
     if compute_capability == (12, 1) and (m, n, k) == (256, 9216, 7168):
         return ("raw", 64, 32, 2, False, True, 256, True)
     if compute_capability == (12, 1) and (m, n, k) == (512, 7168, 5120):

@@ -298,6 +298,7 @@ def test_sm121_defaults_preserve_other_devices_and_unmeasured_shapes():
         ((256, 9216, 7168), ("raw", 64, 32, 2, False, True, 256, True)),
         ((1024, 896, 1024), ("raw", 32, 64, 13, True, True)),
         ((512, 7168, 5120), ("raw", 64, 32, 8, False, True)),
+        ((256, 7168, 4608), ("b12x", 64, 128, 256)),
         ((512, 5120, 640), ("cooperative", 128, 128, 128)),
         ((512, 5120, 2560), ("cooperative", 128, 64, 256)),
         ((256, 7168, 256), ("raw", 32, 64, 13, True, True, 256, False)),
@@ -565,6 +566,14 @@ def test_sm121_defaults_preserve_other_devices_and_unmeasured_shapes():
         (512, 8192, 28608),
         (512, 8192, 28736),
     ]
+    neighbors += [
+        (255, 7168, 4608),
+        (257, 7168, 4608),
+        (256, 7104, 4608),
+        (256, 7232, 4608),
+        (256, 7168, 4544),
+        (256, 7168, 4672),
+    ]
     for shape in neighbors:
         assert policy.default_tactic(
             *shape, compute_capability=(12, 1)
@@ -585,6 +594,7 @@ def test_sm121_defaults_preserve_other_devices_and_unmeasured_shapes():
         (256, 9216, 7168),
         (1024, 896, 1024),
         (512, 7168, 5120),
+        (256, 7168, 4608),
         (512, 5120, 640),
         (512, 5120, 2560),
         (256, 7168, 256),
