@@ -121,13 +121,78 @@ FLASHINFER_ONLINE_ACT_QUANT=0 \
 python wan/transformer_wan_flashinfer.py
 ```
 
+### Fused-MoE APIs
+
+`FlashInferFusedMoE` (used by the HunyuanImage-3 example) selects the fused
+Mixture-of-Experts kernel via `FLASHINFER_MOE_BACKEND` / `--moe-backend`,
+mirroring the GEMM convention. Routing (softmax → top-k → renormalize) always
+stays in the model's own gate; every backend consumes the same precomputed
+`topk_ids` / `topk_weights`, so routing decisions are identical across
+backends.
+
+| Backend value | Main API | Quantization | SM support |
+|---------------|----------|--------------|------------|
+| `torch` | eager per-expert loop | none (BF16) | any |
+| `cutlass` | `flashinfer.fused_moe.cutlass_fused_moe` | none (BF16) | SM89/SM90/SM100+ |
+| `cutlass_fp8` | `cutlass_fused_moe` (`quant_scales`, 4-tensor layout) | per-tensor FP8 W8A8 | SM89/SM90/SM100+ |
+| `cutlass_fp8_blockscale` | `cutlass_fused_moe` (`use_deepseek_fp8_block_scale=True`) | DeepSeek-style 128×128 block-scale FP8 W8A8; activation quantized inside the kernel | SM90 only (the only arch with this kernel; CUDA ≥ 12.8) |
+| `cutlass_w4a16` | `cutlass_fused_moe` (`use_w4_group_scaling=True`, SM90 interleaved weights) | MXFP4 weight-only, BF16 activation | SM90 only |
+| `cutlass_nvfp4` | `cutlass_fused_moe` (6-tensor `quant_scales`) | NVFP4 W4A4 (per-expert global scales + 16-elem E4M3 block scales; BF16 activation quantized inside the kernel) | SM100/SM103/SM110/SM120/SM121 |
+| `trtllm` | `flashinfer.fused_moe.trtllm_bf16_routed_moe` (packed `(expert_id << 16) \| bf16(weight)` routing) | none (BF16, shuffled BlockMajorK weights) | SM100/SM103 |
+| `trtllm_fp8_blockscale` | `flashinfer.fused_moe.trtllm_fp8_block_scale_routed_moe` (packed routing, plain MajorK weights) | DeepSeek-style 128×128 block-scale FP8 W8A8, per-token-group-128 activation scales | SM100/SM103 |
+| `trtllm_fp4` | `flashinfer.fused_moe.trtllm_fp4_block_scale_routed_moe` (packed routing) | NVFP4 activations × NVFP4 weights | SM100/SM103 |
+
+Unsupported backends on the current device fall back to `torch` with a
+warning, same as the GEMM backends.
+
+Per-architecture availability of the FlashInfer-accelerated backends
+(everything else falls back to `torch`):
+
+| Arch | Available MoE backends |
+|------|------------------------|
+| SM75/SM80/SM86 | `torch` only (no cutlass fused-MoE JIT module) |
+| SM89 (Ada) | `cutlass`, `cutlass_fp8` |
+| SM90 (Hopper) | `cutlass`, `cutlass_fp8`, `cutlass_fp8_blockscale`, `cutlass_w4a16` |
+| SM100/SM103 (Blackwell) | `cutlass`, `cutlass_fp8`, `cutlass_nvfp4`, `trtllm`, `trtllm_fp8_blockscale`, `trtllm_fp4` |
+| SM110 | `cutlass`, `cutlass_fp8`, `cutlass_nvfp4` |
+| SM120/SM121 | `cutlass`, `cutlass_fp8`, `cutlass_nvfp4` |
+
+**Coverage notes — FlashInfer MoE APIs intentionally *not* wrapped here:**
+
+- `trtllm_fp8_per_tensor_scale_moe`: takes routing logits rather than
+  precomputed top-k ids (no `*_routed_*` variant), so it cannot preserve
+  this wrapper's bit-identical-routing contract; the per-tensor FP8 recipe
+  is available on Blackwell through `cutlass_fp8` instead.
+- `trtllm_mxint4_block_scale_moe` and the MxFP8 variant of
+  `trtllm_fp8_block_scale_moe`: weight formats that assume an
+  offline-quantized checkpoint (MXINT4 / MXFP8); see
+  `tests/moe/test_trtllm_gen_fused_moe.py` for the canonical recipes.
+- `cutlass_fused_moe` W4A8 / `wfp4afp8` ("Humming") modes: SM90 mixed-input
+  paths that likewise assume offline-quantized weights with 8-tensor
+  `quant_scales` layouts (`tests/moe/test_trtllm_cutlass_fused_moe.py`).
+- `cute_dsl_fused_moe_nvfp4` / `CuteDslMoEWrapper` (SM100/SM103) and
+  `b12x_fused_moe` / `B12xMoEWrapper` (SM120/SM121, CUDA 13): CuTe-DSL
+  alternatives to the NVFP4 paths already wrapped above (`cutlass_nvfp4`,
+  `trtllm_fp4`); the `B12x` wrapper additionally has no expert-parallelism
+  support.
+
+> ⚠️ The Blackwell-only backends (`cutlass_nvfp4`, `trtllm`,
+> `trtllm_fp8_blockscale`, `trtllm_fp4`) mirror the canonical recipes in
+> `tests/moe/test_trtllm_cutlass_fused_moe.py` and
+> `tests/moe/test_trtllm_gen_routed_fused_moe.py`; their weight-prep,
+> packing, and fallback paths are covered by the checks runnable on any
+> GPU, but the kernel launches themselves have not been exercised on
+> SM100+ hardware from this example yet.
+
 ### Environment Variables
 
 | Variable | Values | Meaning |
 |----------|--------|---------|
 | `FLASHINFER_GEMM_BACKEND` | `<base>` or `<base>-<kernel>` — base ∈ {`torch`, `bf16`, `fp8`, `fp8_sm90`, `bmm_fp8`, `fp8_groupwise`, `fp8_blockscaled`, `batch_deepgemm_fp8`, `fp4`, `bmm_bf16`, `mxfp8`, `bmm_mxfp8`}; kernel suffix forwarded to the chosen API's `backend` kwarg (e.g. `fp4-cutlass`, `bf16-cutlass`, `mxfp8-cute-dsl`). | Selects the `FlashInferLinear` GEMM implementation. Unsupported backends fall back to `torch` with a warning. |
 | `FLASHINFER_ATTENTION_BACKEND` | `<base>` or `<base>-<kernel>` — base ∈ {`auto`, `single`, `cudnn`, `trtllm`, `torch`}; `-<kernel>` suffix on `single` is forwarded to `single_prefill_with_kv_cache`'s `backend` kwarg (`single-fa3`, `single-fa2`, `single-cudnn`, …). | Selects the FlashInfer attention path. `auto` uses `single_prefill_with_kv_cache` for `batch_size == 1` and `cudnn_batch_prefill_with_kv_cache` for `batch_size > 1`. |
-| `FLASHINFER_ONLINE_ACT_QUANT` | `1/0`, `true/false`, `yes/no`, `on/off` | Controls FP8/FP4-family activation scaling: online scale from the current tensor vs fixed default scale. Backends that ignore this flag: `torch`, `bf16`, `bmm_bf16`, `mxfp8`, `bmm_mxfp8`. |
+| `FLASHINFER_MOE_BACKEND` | `torch`, `cutlass`, `cutlass_fp8`, `cutlass_fp8_blockscale`, `cutlass_w4a16`, `cutlass_nvfp4`, `trtllm`, `trtllm_fp8_blockscale`, `trtllm_fp4` (HunyuanImage-3 also accepts `eager` = keep the upstream per-expert loop) | Selects the `FlashInferFusedMoE` kernel — see the Fused-MoE APIs table above. Unsupported backends fall back to `torch` with a warning. |
+| `FLASHINFER_MOE_IMPL` | `flashinfer`, `eager` | Deprecated alias of `FLASHINFER_MOE_BACKEND` (`flashinfer` → `cutlass`). |
+| `FLASHINFER_ONLINE_ACT_QUANT` | `1/0`, `true/false`, `yes/no`, `on/off` | Controls FP8/FP4-family activation scaling: online scale from the current tensor vs fixed default scale. GEMM backends that ignore this flag: `torch`, `bf16`, `bmm_bf16`, `mxfp8`, `bmm_mxfp8`. MoE backends that consult it: `cutlass_fp8` and `trtllm_fp4` (`cutlass_fp8_blockscale` / `cutlass_nvfp4` quantize activations inside the kernel, `trtllm_fp8_blockscale` always computes per-token-group scales online, `cutlass_w4a16` doesn't quantize activations). |
 | `FLASHINFER_USE_SKIP_SOFTMAX_SPARSE` | `1/0`, `true/false`, `yes/no`, `on/off` | Enables skip-softmax sparse attention when the GPU supports it; this forces the TRT-LLM attention path. |
 | `FLASHINFER_SKIP_SOFTMAX_THRESHOLD` | Float, for example `1.0` | Threshold scale passed to the TRT-LLM sparse attention path. |
 
@@ -164,20 +229,12 @@ modes (mutually exclusive):
   graph. Eliminates per-launch overhead; only helps when the GPU has
   idle time between kernels.
 - `--torch-compile` — wrap each transformer block with `torch.compile`.
-  Fuses the per-layer activation-quant / bias-add / dtype-cast
-  prologue identified as the bottleneck in `wan/BENCHMARK.md`. On
-  B300 + NVFP4 it's the fastest configuration measured at 720p × 5s.
+  Fuses the per-layer activation-quant / bias-add / dtype-cast prologue
+  that dominates the wrapper overhead. On B300 + NVFP4 it's the fastest
+  configuration measured at 720p × 5s.
   Optional sub-flags: `--torch-compile-mode {default,reduce-overhead,
   max-autotune,max-autotune-no-cudagraphs}`, `--torch-compile-fullgraph`,
   `--torch-compile-dynamic`.
-
-### Benchmark Results
-
-See [`wan/BENCHMARK.md`](wan/BENCHMARK.md) for an end-to-end forward-latency
-comparison of every GEMM backend on H100 PCIe, B200, and B300 for both
-Wan2.1-T2V-1.3B and Wan2.2-T2V-A14B, including the `--torch-compile`
-section, CUDA-graph attempt, and online-vs-offline activation-quant
-breakdown.
 
 ### End-to-End Pipeline Evaluation
 
@@ -202,6 +259,30 @@ python wan/pipeline_wan_flashinfer.py \
 | `attention_backend` | `auto` | Attention backend. `auto` uses `single` for `batch_size == 1` and `cudnn` for `batch_size > 1`; explicit values are `single`, `cudnn`, and `trtllm` |
 | `use_skip_softmax_sparse` | `False` | Enables sparse attention through TRT-LLM when supported |
 | `skip_softmax_threshold_scale_factor` | `1.0` | Sparse attention threshold scale |
+
+## HunyuanImage-3.0 Example
+
+The `hunyuan_image3/` directory hosts an end-to-end driver for
+[`tencent/HunyuanImage-3.0-Instruct`](https://huggingface.co/tencent/HunyuanImage-3.0-Instruct),
+inspired by [vllm-omni's `end2end.py`](https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/hunyuan_image3):
+
+| File | Description |
+|------|-------------|
+| `hunyuan_image3/modeling_hunyuan_image3_flashinfer.py` | `replace_backbone_with_flashinfer(model, ...)` swaps RMSNorm, QK-norm, GQA attention, SwiGLU MLP, and MoE in every decoder layer of a HuggingFace-loaded model. |
+| `hunyuan_image3/pipeline_hunyuan_image3_flashinfer.py` | CLI driver for `text2img`, `img2img`, `img2text`, and `text2text` modalities. |
+
+Quick example:
+
+```bash
+python hunyuan_image3/pipeline_hunyuan_image3_flashinfer.py \
+  --modality text2img \
+  --prompts "A cute cat sitting on a windowsill" \
+  --gemm-backend bf16 \
+  --output ./out
+```
+
+See [`hunyuan_image3/README.md`](hunyuan_image3/README.md) for backend flags
+and per-modality details.
 
 ## Notes
 
