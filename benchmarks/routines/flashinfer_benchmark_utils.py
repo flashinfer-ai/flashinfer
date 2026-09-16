@@ -4,6 +4,9 @@ import torch
 from flashinfer.testing.utils import set_seed
 from flashinfer.utils import get_compute_capability
 
+# Ensure deterministic RNG for benchmark correctness checks.
+DEFAULT_SEED = 42
+
 # Output columns for the test results.
 output_column_dict = {
     "perf": [
