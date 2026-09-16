@@ -854,9 +854,9 @@ def _bmm_bias(
 
 
 def _from_dlpack_dynamic(tensor, leading_dim: int, assumed_align: int = 32):
-    return from_dlpack(tensor, assumed_align=assumed_align).mark_layout_dynamic(
-        leading_dim=leading_dim
-    )
+    return from_dlpack(
+        tensor.detach(), assumed_align=assumed_align
+    ).mark_layout_dynamic(leading_dim=leading_dim)
 
 
 def _detect_leading_dim(tensor: _torch.Tensor) -> int:

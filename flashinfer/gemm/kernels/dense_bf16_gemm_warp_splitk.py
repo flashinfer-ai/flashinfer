@@ -776,7 +776,7 @@ class CpAsyncWarpSplitKKernel:
 
 
 def _from_dlpack(tensor: _torch.Tensor, *, dynamic_m: bool = False):
-    tensor = from_dlpack(tensor, assumed_align=32)
+    tensor = from_dlpack(tensor.detach(), assumed_align=32)
     if dynamic_m:
         # Only M varies; the row stride and N/K extents stay static.
         tensor = tensor.mark_compact_shape_dynamic(
