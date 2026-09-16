@@ -14,10 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import atexit
+import json
 import os
+import signal
 import sys
 import tempfile
-import json
 from enum import Enum
 from pathlib import Path
 
@@ -188,6 +190,28 @@ class TestAPILogging:
             assert "inf_count=" in log_contents
         finally:
             Path(log_file).unlink(missing_ok=True)
+
+    def test_restore_unregisters_level_10_process_hooks(self, monkeypatch):
+        """Reload teardown removes callbacks and restores the prior SIGTERM hook."""
+        self.setup_logging(level=10)
+        module = sys.modules["flashinfer.api_logging"]
+        installer = module._install_cuda_graph_dump_autoflush
+        callback = installer._atexit_callback
+        sigterm_handler = installer._sigterm_handler
+        previous_sigterm_handler = installer._previous_sigterm_handler
+        unregistered = []
+        original_unregister = atexit.unregister
+
+        with monkeypatch.context() as context:
+            context.setattr(atexit, "unregister", unregistered.append)
+            module._restore_cuda_graph_hooks()
+
+        original_unregister(callback)
+
+        assert unregistered == [callback]
+        assert signal.getsignal(signal.SIGTERM) is previous_sigterm_handler
+        assert signal.getsignal(signal.SIGTERM) is not sigterm_handler
+        assert not hasattr(installer, "_done")
 
     def test_enum_logging(self):
         """Test that enum values are logged with name and value."""
