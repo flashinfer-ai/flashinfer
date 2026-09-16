@@ -3951,6 +3951,32 @@ __device__ __forceinline__ void vosplit_compute_pv(
       a_frag[mma_q][2] = *(uint32_t*)&p_smem[r0 * CTA_TILE_KV + c0 + 8];
       a_frag[mma_q][3] = *(uint32_t*)&p_smem[(r0 + 8) * CTA_TILE_KV + c0 + 8];
     }
+    if constexpr (KTraits::USE_TOKEN_HEAD_SF) {
+      // Apply the per-(token, head) V scale for mma_kv to the P A-fragment, once per KV tile
+      // (mirrors compute_sfm_v's V path). The scale is per-KV-row (the mma_kv dimension),
+      // independent of the VO column, so it factors out of the local_d loop and is applied here
+      // before the MMA. Thread t's P columns in the mma_kv tile are (t%4)*2+{0,1} and
+      // (t%4)*2+{8,9}, so the 4 scales sit at mma_kv*16 + 2*(t%4) + {0,1,8,9}. P is in [0,1]
+      // after softmax, so P*scale <= scale (no fp16/bf16 overflow); out-of-bounds rows carry
+      // scale 1.0 (produce_kv_token_head_sf), so no NaN pollution.
+      using packed2 = std::conditional_t<std::is_same_v<DTypeQ, half>, half2, __nv_bfloat162>;
+      const float* v_scale = smem_storage->v_scale_smem_ptr() + mma_kv * 16 + 2 * (lane_idx % 4);
+      packed2 scale_lo, scale_hi;
+      if constexpr (std::is_same_v<DTypeQ, half>) {
+        scale_lo = __floats2half2_rn(v_scale[0], v_scale[1]);
+        scale_hi = __floats2half2_rn(v_scale[8], v_scale[9]);
+      } else {
+        scale_lo = __floats2bfloat162_rn(v_scale[0], v_scale[1]);
+        scale_hi = __floats2bfloat162_rn(v_scale[8], v_scale[9]);
+      }
+#pragma unroll
+      for (uint32_t mma_q = 0; mma_q < NUM_MMA_Q; ++mma_q) {
+        *(packed2*)&a_frag[mma_q][0] = __hmul2(*(packed2*)&a_frag[mma_q][0], scale_lo);
+        *(packed2*)&a_frag[mma_q][1] = __hmul2(*(packed2*)&a_frag[mma_q][1], scale_lo);
+        *(packed2*)&a_frag[mma_q][2] = __hmul2(*(packed2*)&a_frag[mma_q][2], scale_hi);
+        *(packed2*)&a_frag[mma_q][3] = __hmul2(*(packed2*)&a_frag[mma_q][3], scale_hi);
+      }
+    }
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) && (__CUDA_ARCH__ < 900)
     constexpr bool USE_SM8X_VEC_V_SCALE = true;
 #else

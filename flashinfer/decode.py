@@ -1463,7 +1463,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 )
         self._backend = backend
         # backend="auto" is re-resolved at every plan(); the tensor-core path
-        # rewrites self._backend to its pick, so remember what was asked for.
+        # rewrites self._backend to its pick, so remember what was asked for. The
+        # token-head-scale check in plan() keys off this value so a prior
+        # auto-resolved plan does not leak into a later token-head plan.
         self._requested_backend = backend
         self._cudnn_auto = False
         self._cudnn_auto_frozen: Optional[bool] = None
@@ -2099,26 +2101,40 @@ class BatchDecodeWithPagedKVCacheWrapper:
         o_data_type = canonicalize_torch_dtype(o_data_type)
 
         if use_token_head_sf:
-            assert kv_data_type in (torch.float8_e4m3fn, torch.float8_e5m2), (
-                f"use_token_head_sf requires fp8 KV dtype, got {kv_data_type}"
-            )
-            assert q_data_type in (torch.float16, torch.bfloat16), (
-                f"use_token_head_sf requires fp16/bf16 Q dtype, got {q_data_type}"
-            )
-            if get_compute_capability(self.device)[0] < 8:
-                assert q_data_type == torch.float16, (
-                    "use_token_head_sf on SM75 only supports fp16 Q dtype"
+            if kv_data_type not in (torch.float8_e4m3fn, torch.float8_e5m2):
+                raise ValueError(
+                    f"use_token_head_sf requires fp8 KV dtype, got {kv_data_type}"
                 )
+            if q_data_type not in (torch.float16, torch.bfloat16):
+                raise ValueError(
+                    f"use_token_head_sf requires fp16/bf16 Q dtype, got {q_data_type}"
+                )
+            if get_compute_capability(self.device)[0] < 8:
+                if q_data_type != torch.float16:
+                    raise ValueError(
+                        "use_token_head_sf on SM75 only supports fp16 Q dtype"
+                    )
             # Decode requires head_dim_qk == head_dim_vo, so K and V share one head_dim;
             # any 16-multiple is supported.
-            assert head_dim % 16 == 0, (
-                f"use_token_head_sf requires head_dim to be a multiple of 16, got {head_dim}"
-            )
-            if self._backend == "auto":
-                self._backend = "fa2"
-            elif self._backend != "fa2":
+            if head_dim % 16 != 0:
                 raise ValueError(
-                    f"use_token_head_sf requires backend='fa2', got {self._backend!r}"
+                    f"use_token_head_sf requires head_dim to be a multiple of 16, got {head_dim}"
+                )
+            # Key off the originally requested backend, not self._backend (which a prior
+            # "auto" plan may have resolved to a non-fa2 backend).
+            if self._requested_backend == "auto":
+                self._backend = "fa2"
+            elif self._requested_backend != "fa2":
+                raise ValueError(
+                    f"use_token_head_sf requires backend='fa2', got {self._requested_backend!r}"
+                )
+            # The custom-JIT-module path (jit_args) is built without the token-head-scale
+            # flag (the decode wrapper takes no jit_kwargs), so its run() would pass None
+            # for the required K/V scale tensors. Reject it rather than silently misroute.
+            if self._jit_module is not None:
+                raise ValueError(
+                    "use_token_head_sf is not supported with a custom JIT module "
+                    "(jit_args); use the standard fa2 tensor-core path instead"
                 )
             # The CUDA-core decode path has no token-head-scale support; route to the
             # tensor-core (fa2 prefill) path, which reuses the prefill kernel and reads
