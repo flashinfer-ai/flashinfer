@@ -76,12 +76,23 @@ def _iv(x, ty, loc, ip):
 
 @dsl_user_op
 def fmax3(a: Float32, b: Float32, c: Float32, *, loc=None, ip=None) -> Float32:
-    """Blackwell three-input FMNMX3 through NVVM's ternary fmax form."""
-    from cutlass import CUDA_VERSION
-    if CUDA_VERSION.major == 12 and CUDA_VERSION.minor == 9:
-        return Float32(nvvm.fmax(
-            T.f32(), _iv(a, Float32, loc, ip), _iv(b, Float32, loc, ip),
-            c=_iv(c, Float32, loc, ip), loc=loc, ip=ip))
+    """Blackwell three-input FMNMX3 through NVVM's ternary fmax form.
+
+    ``nvvm.fmax`` takes two positional operands and the third as ``c=``; that
+    signature is the same across every CuTe DSL release this package accepts
+    (4.6.0 through 4.7.x).  An earlier revision special-cased
+    ``cutlass.CUDA_VERSION == (12, 9)`` and passed the result type as an extra
+    leading positional argument.  That call is invalid for every supported DSL
+    and raised ``TypeError: fmax() takes 2 positional arguments but 3 were
+    given`` during tracing -- but only on a CUDA 12.9 host with a visible GPU,
+    because ``cutlass.CUDA_VERSION`` follows the driver there and reports the
+    DSL's bundled CUDA otherwise.  The failed trace made the CuTe-DSL warm
+    fail, and the route silently fell back to the C++ kernel.
+
+    The DSL API does not vary with the CUDA version, so nothing here should be
+    keyed on it.  If this call ever does need to differ between DSL releases,
+    probe the API, not ``CUDA_VERSION``.
+    """
     return Float32(nvvm.fmax(
         _iv(a, Float32, loc, ip), _iv(b, Float32, loc, ip),
         c=_iv(c, Float32, loc, ip), loc=loc, ip=ip))
