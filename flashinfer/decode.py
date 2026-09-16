@@ -1452,6 +1452,13 @@ class BatchDecodeWithPagedKVCacheWrapper:
             Whether the mask is causal within each request block. Defaults to ``None``,
             which derives it from ``q_len_per_req > 1``. Values that differ from
             that default are not supported by this wrapper.
+        use_token_head_sf : bool
+            Whether the FP8 KV cache uses the per-(token, head) scale layout: a separate
+            ``float32`` scale tensor (passed via ``kv_cache_sf`` in :meth:`run`) dequantizes
+            the KV cache inside the kernel. When enabled, the KV cache is FP8 (``e4m3``/
+            ``e5m2``) with standard layout (last dim ``head_dim``), ``q`` must be ``fp16``
+            (or ``bf16`` on SM80+), and the ``fa2`` tensor-core backend is forced.
+            Defaults to ``False``.
         Note
         ----
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -1527,6 +1534,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         disable_split_kv: bool = False,
         q_len_per_req: int = 1,
         is_causal: Optional[bool] = None,
+        use_token_head_sf: bool = False,
     ) -> None:
         """Shared plan() implementation for the paged-decode wrapper across backends."""
         _check_workspace_buffer_alignment(
@@ -1626,6 +1634,34 @@ class BatchDecodeWithPagedKVCacheWrapper:
         if o_data_type is None:
             o_data_type = q_data_type
         o_data_type = canonicalize_torch_dtype(o_data_type)
+
+        if use_token_head_sf:
+            assert kv_data_type in (torch.float8_e4m3fn, torch.float8_e5m2), (
+                f"use_token_head_sf requires fp8 KV dtype, got {kv_data_type}"
+            )
+            assert q_data_type in (torch.float16, torch.bfloat16), (
+                f"use_token_head_sf requires fp16/bf16 Q dtype, got {q_data_type}"
+            )
+            if get_compute_capability(self.device)[0] < 8:
+                assert q_data_type == torch.float16, (
+                    "use_token_head_sf on SM75 only supports fp16 Q dtype"
+                )
+            # Decode requires head_dim_qk == head_dim_vo, so K and V share one head_dim;
+            # any 16-multiple is supported.
+            assert head_dim % 16 == 0, (
+                f"use_token_head_sf requires head_dim to be a multiple of 16, got {head_dim}"
+            )
+            if self._backend == "auto":
+                self._backend = "fa2"
+            elif self._backend != "fa2":
+                raise ValueError(
+                    f"use_token_head_sf requires backend='fa2', got {self._backend!r}"
+                )
+            # The CUDA-core decode path has no token-head-scale support; route to the
+            # tensor-core (fa2 prefill) path, which reuses the prefill kernel and reads
+            # the scale from the separate tensor.
+            self._use_tensor_cores = True
+        self._use_token_head_sf = use_token_head_sf
 
         if fixed_split_size is not None and not self.use_tensor_cores:
             raise ValueError(
@@ -1889,6 +1925,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     window_left != -1,  # use_sliding_window
                     logits_soft_cap > 0,  # use_logits_soft_cap
                     False,  # use_fp16_qk_reduction
+                    use_token_head_sf,
                 )
 
             args = [
@@ -2271,6 +2308,13 @@ class BatchDecodeWithPagedKVCacheWrapper:
             Both tensors have dtype ``torch.float8_e4m3fn``.
 
             Currently, NVFP4 KV supports `fa2` and `trtllm-gen` backend.
+
+            With ``use_token_head_sf=True`` (plan time), ``kv_cache_sf`` must be a
+            ``(k_sf, v_sf)`` tuple of ``float32`` tensors mirroring the KV layout
+            minus ``head_dim``: ``[num_pages, page_size, num_kv_heads]`` if
+            :attr:`kv_layout` is ``NHD``, and ``[num_pages, num_kv_heads, page_size]``
+            if ``HND``. The tensors may be non-contiguous views (e.g. sliced out of
+            an inline slot layout).
         Returns
         -------
         Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
@@ -2284,21 +2328,70 @@ class BatchDecodeWithPagedKVCacheWrapper:
             enable_pdl = device_support_pdl(q.device)
         k_cache, v_cache = _unpack_paged_kv_cache(paged_kv_cache, self._kv_layout)
 
+        if getattr(self, "_use_token_head_sf", False):
+            # FP8 token-head scale uses the standard KV layout (last dim == head_dim);
+            # the scale is a separate float32 tensor passed via kv_cache_sf.
+            # Decode requires head_dim_qk == head_dim_vo, so both share q's head dim.
+            expected_head_dim = q.shape[-1]
+            if k_cache.shape[-1] != expected_head_dim:
+                raise ValueError(
+                    f"use_token_head_sf requires K cache last dim = head_dim "
+                    f"({expected_head_dim}), got {k_cache.shape[-1]}"
+                )
+            if v_cache.shape[-1] != expected_head_dim:
+                raise ValueError(
+                    f"use_token_head_sf requires V cache last dim = head_dim "
+                    f"({expected_head_dim}), got {v_cache.shape[-1]}"
+                )
+
         if k_cache.dtype == torch.uint8 or v_cache.dtype == torch.uint8:
             if get_compute_capability(q.device) == (10, 7):
                 raise ValueError("KV Cache NVFP4 is not supported on SM107")
             if kv_cache_sf is None:
                 raise ValueError("kv_cache_sf must be provided for NVFP4 KV cache.")
-        key_block_scales, value_block_scales = (
-            _unpack_paged_kv_cache(kv_cache_sf, self._kv_layout)
-            if kv_cache_sf is not None
-            else (None, None)
-        )
+        if getattr(self, "_use_token_head_sf", False):
+            # FP8 per-(token, head) scale: kv_cache_sf is a (k_sf, v_sf) tuple of
+            # float32 tensors mirroring the KV layout minus head_dim (3-D paged).
+            # Pass through as-is — the 4-D/5-D expansion in _unpack_paged_kv_cache
+            # is NVFP4-specific and would misinterpret the page_size dim.
+            if not isinstance(kv_cache_sf, (tuple, list)) or len(kv_cache_sf) != 2:
+                raise ValueError(
+                    "use_token_head_sf requires kv_cache_sf to be a "
+                    "(k_sf, v_sf) tuple of float32 tensors"
+                )
+            key_block_scales, value_block_scales = kv_cache_sf
+        else:
+            key_block_scales, value_block_scales = (
+                _unpack_paged_kv_cache(kv_cache_sf, self._kv_layout)
+                if kv_cache_sf is not None
+                else (None, None)
+            )
 
         if self._kv_layout == "NHD":
             page_size = k_cache.shape[1]
         else:
             page_size = k_cache.shape[2]
+        if getattr(self, "_use_token_head_sf", False):
+            # Scale tensors mirror the KV layout minus head_dim; they may be
+            # non-contiguous views (e.g. sliced out of an inline slot), so only
+            # the logical shape and dtype are checked.
+            num_pages = k_cache.shape[0]
+            if self._kv_layout == "NHD":
+                expected_sf_shape = (num_pages, page_size, self._num_kv_heads)
+            else:
+                expected_sf_shape = (num_pages, self._num_kv_heads, page_size)
+            for name, sf in (("k_sf", key_block_scales), ("v_sf", value_block_scales)):
+                if sf is None:
+                    raise ValueError(
+                        "use_token_head_sf requires both k_sf and v_sf in kv_cache_sf"
+                    )
+                if sf.dtype != torch.float32:
+                    raise ValueError(f"{name} must be float32, got {sf.dtype}")
+                if tuple(sf.shape) != expected_sf_shape:
+                    raise ValueError(
+                        f"{name} must have shape {expected_sf_shape} for "
+                        f"kv_layout={self._kv_layout!r}, got {tuple(sf.shape)}"
+                    )
         _check_cached_qkv_data_type(
             q, k_cache, self._cached_q_data_type, self._cached_kv_data_type
         )
