@@ -31,7 +31,7 @@ from flashinfer.mla._sparse_mla_sm120._dsv4_nvfp4 import (
     _nvfp4_sparse_mla_m16n8k64_candidate_major,
     _nvfp4_sparse_mla_m16n32k64,
 )
-from flashinfer.utils import is_sm120a_supported
+from flashinfer.utils import is_sm12x_supported
 from tests.attention.sparse_mla_test_utils import (
     _D_NOPE,
     _D_ROPE,
@@ -63,8 +63,8 @@ def test_nvfp4_sparse_mla_reuses_fp8_public_api() -> None:
 
 
 def _require_sm120() -> None:
-    if not torch.cuda.is_available() or not is_sm120a_supported(torch.device("cuda")):
-        pytest.skip("NVFP4 sparse MLA requires SM120/SM121")
+    if not torch.cuda.is_available() or not is_sm12x_supported(torch.device("cuda")):
+        pytest.skip("NVFP4 sparse MLA requires SM12x")
 
 
 @pytest.mark.parametrize("page_size", [2, 64])
@@ -1194,7 +1194,7 @@ def test_nvfp4_sparse_mla_decode_zero_topk_length(with_sink: bool) -> None:
 
     assert torch.count_nonzero(output) == 0
     if attn_sink is None:
-        assert torch.all(lse < -1e29)
+        assert torch.isneginf(lse).all()
     else:
         torch.testing.assert_close(lse, attn_sink.unsqueeze(0) * math.log2(math.e))
 
@@ -1227,7 +1227,7 @@ def test_nvfp4_sparse_mla_invalid_nonempty_chunks_have_zero_probability(
         )
         assert torch.count_nonzero(output) == 0
         if attn_sink is None:
-            assert torch.all(lse < -1e29)
+            assert torch.isneginf(lse).all()
         else:
             torch.testing.assert_close(lse, attn_sink.unsqueeze(0) * math.log2(math.e))
 
@@ -1261,3 +1261,57 @@ def test_nvfp4_sparse_mla_skips_fully_invalid_chunk_in_nonempty_row(
         output, lse = attention(q, cache, indices, 512**-0.5)
         torch.testing.assert_close(output, reference, atol=5e-2, rtol=5e-2)
         torch.testing.assert_close(lse, reference_lse, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize(
+    "heads,topk,cpbs,dual",
+    [(16, 128, (2, 1), False), (128, 512, (1,), True)],
+)
+@pytest.mark.parametrize("sink_value", [None, -1000.0, 2.0])
+def test_nvfp4_sparse_mla_empty_store_families(heads, topk, cpbs, dual, sink_value):
+    _require_sm120()
+    torch.manual_seed(4484)
+    q = torch.randn(6, heads, 512, device="cuda", dtype=torch.bfloat16) * 0.1
+    cache = nvfp4_quantize_pack_sparse_mla_cache(
+        torch.randn(2, 64, 512, device="cuda", dtype=torch.bfloat16) * 0.1
+    )
+    idx = torch.randint(128, (6, topk), device="cuda", dtype=torch.int32)
+    idx[1] = -1
+    lengths = torch.full((6,), topk, device="cuda", dtype=torch.int32)
+    lengths[0] = 0
+    sink = (
+        torch.full((heads,), sink_value, device="cuda")
+        if sink_value is not None
+        else None
+    )
+    kwargs = dict(topk_length=lengths, attn_sink=sink)
+    virtual = _dequantize_nvfp4_cache(cache).reshape(-1, 512)
+    masked = idx.masked_fill(
+        torch.arange(topk, device="cuda")[None] >= lengths[:, None], -1
+    )
+    if dual:
+        extra_idx = torch.randint(128, (6, 128), device="cuda", dtype=torch.int32)
+        extra_idx[:3] = -1
+        idx[3] = -1
+        masked[3] = -1
+        kwargs.update(extra_kv_cache=cache, extra_indices=extra_idx)
+        virtual = torch.cat([virtual, virtual])
+        masked = torch.cat(
+            [masked, torch.where(extra_idx < 0, extra_idx, extra_idx + 128)], -1
+        )
+    reference, reference_lse = _reference_sparse_attention(
+        _dequantize_nvfp4_query(q),
+        virtual,
+        masked,
+        512**-0.5,
+        attn_sink=sink,
+    )
+    calls = [
+        (_nvfp4_sparse_mla_decode, dict(chunks_per_block_override=cpb)) for cpb in cpbs
+    ]
+    calls.append((_nvfp4_sparse_mla_prefill, {}))
+    for attention, extra_kwargs in calls:
+        output, lse = attention(q, cache, idx, 512**-0.5, **kwargs, **extra_kwargs)
+        assert torch.count_nonzero(output[:2]) == 0
+        torch.testing.assert_close(output, reference, atol=0.05, rtol=0.05)
+        torch.testing.assert_close(lse, reference_lse, atol=0.02, rtol=0.02)

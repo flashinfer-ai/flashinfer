@@ -84,7 +84,7 @@ __global__ void __launch_bounds__(DECODE_BLOCK_THREADS) sparse_mla_decode_dsv4_n
         if (threadIdx.x < VALID_HPB) {
           const int h = h_start + threadIdx.x;
           out_lse[(size_t)token_idx * NUM_HEADS + h] =
-              attn_sink ? __ldg(attn_sink + h) * LOG2E : -1e30f;
+              attn_sink ? __ldg(attn_sink + h) * LOG2E : -INFINITY;
         }
       } else if (threadIdx.x < VALID_HPB) {
         const int h = h_start + threadIdx.x;
@@ -374,8 +374,8 @@ __global__ void __launch_bounds__(DECODE_BLOCK_THREADS) sparse_mla_decode_dsv4_n
 
   if (write_direct) {
     if (warp_id == 0 && tid == 0) {
-      float lse0 = global_sum[0] > 0.f ? log2f(global_sum[0]) + global_max[0] : -1e30f;
-      float lse1 = global_sum[1] > 0.f ? log2f(global_sum[1]) + global_max[1] : -1e30f;
+      float lse0 = global_sum[0] > 0.f ? log2f(global_sum[0]) + global_max[0] : -INFINITY;
+      float lse1 = global_sum[1] > 0.f ? log2f(global_sum[1]) + global_max[1] : -INFINITY;
       float output_scale0 = 1.f;
       float output_scale1 = 1.f;
       if (attn_sink != nullptr) {
@@ -498,7 +498,9 @@ __global__ void __launch_bounds__(DECODE_MERGE2_THREADS, 2)
                   (lse1 > -1e29f ? exp2f(lse1 - global_max) : 0.f);
     if (attn_sink != nullptr) {
       const float sink_log2 = __ldg(attn_sink + h) * LOG2E;
-      if (sink_log2 > global_max) {
+      if (total == 0.f) {
+        global_max = sink_log2;
+      } else if (sink_log2 > global_max) {
         total *= exp2f(global_max - sink_log2);
         global_max = sink_log2;
       }
@@ -507,7 +509,8 @@ __global__ void __launch_bounds__(DECODE_MERGE2_THREADS, 2)
     const float inv_total = total > 0.f ? 1.f / total : 0.f;
     weight0[local_head] = (lse0 > -1e29f ? exp2f(lse0 - global_max) : 0.f) * inv_total;
     weight1[local_head] = (lse1 > -1e29f ? exp2f(lse1 - global_max) : 0.f) * inv_total;
-    out_lse[(size_t)token_idx * NUM_HEADS + h] = total > 0.f ? log2f(total) + global_max : -1e30f;
+    out_lse[(size_t)token_idx * NUM_HEADS + h] =
+        total > 0.f ? log2f(total) + global_max : -INFINITY;
   }
   __syncthreads();
 
@@ -518,10 +521,8 @@ __global__ void __launch_bounds__(DECODE_MERGE2_THREADS, 2)
         mid_out + ((size_t)token_idx * NUM_HEADS + h_start + local_head) * 2 * D_V + dim;
     const float w0 = weight0[local_head];
     const float w1 = weight1[local_head];
-    // A ragged split can contain no valid indices. Its LSE/weight is the
-    // sentinel/zero pair, and its stage-1 accumulator is intentionally
-    // irrelevant (it may contain NaN after masked MMA lanes). Do not read
-    // that row: IEEE NaN * 0 would otherwise poison the merged output.
+    // An empty non-direct split writes only mid_lse, leaving mid_out unwritten.
+    // Do not read its output row when the merge weight is zero.
     uint4 packed0 = make_uint4(0, 0, 0, 0);
     uint4 packed1 = make_uint4(0, 0, 0, 0);
     if (w0 > 0.f) packed0 = *reinterpret_cast<const uint4*>(partial);

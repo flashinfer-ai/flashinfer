@@ -49,6 +49,11 @@ static __global__ void __launch_bounds__(BLOCK_THREADS, 8)
       local_max = fmaxf(local_max, __shfl_xor_sync(0xffffffff, local_max, s));
     }
     float gmax = (local_max > -1e29f) ? local_max : 0.f;
+    float sink_log2 = 0.f;
+    if (attn_sink != nullptr) {
+      sink_log2 = __ldg(attn_sink + h) * LOG2E;
+      gmax = local_max > -1e29f ? fmaxf(gmax, sink_log2) : sink_log2;
+    }
 
     float local_sum = 0.f;
     for (int sp = tid; sp < num_splits; sp += 32) {
@@ -61,13 +66,10 @@ static __global__ void __launch_bounds__(BLOCK_THREADS, 8)
     }
     if (tid == 0) {
       float total_sum = local_sum;
-      if (attn_sink != nullptr) {
-        float sink_log2 = __ldg(attn_sink + h) * LOG2E;
-        total_sum += exp2f(sink_log2 - gmax);
-      }
+      if (attn_sink != nullptr) total_sum += exp2f(sink_log2 - gmax);
       sm_gmax = gmax;
       sm_inv_gsum = (total_sum > 0.f) ? (1.f / total_sum) : 0.f;
-      sm_glse = (total_sum > 0.f) ? (log2f(total_sum) + gmax) : -1e30f;
+      sm_glse = (total_sum > 0.f) ? (log2f(total_sum) + gmax) : -INFINITY;
     }
   }
   __syncthreads();

@@ -384,14 +384,9 @@ def _ref_sparse_attn(
 
     if attn_sink is not None:
         sink = attn_sink.float()
-        sink_log2 = sink / LN2
         factor = torch.sigmoid(lse_e.float() - sink.unsqueeze(0))
         out_f = out_f * factor.unsqueeze(-1)
-        lse_log2 = torch.where(
-            lse_log2 == float("-inf"),
-            sink_log2.unsqueeze(0).expand_as(lse_log2),
-            lse_log2 + torch.log2(1.0 + torch.exp2(sink_log2.unsqueeze(0) - lse_log2)),
-        )
+        lse_log2 = torch.logaddexp(lse_e, sink.unsqueeze(0)) / LN2
 
     return out_f.to(torch.bfloat16), lse_log2
 

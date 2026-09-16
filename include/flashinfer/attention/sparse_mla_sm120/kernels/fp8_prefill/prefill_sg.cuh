@@ -390,10 +390,12 @@ __device__ __forceinline__ void sparse_mla_prefill_math_pc(
       float lse = softmax_lse(sm.m_smem[h], sm.l_smem[h]);
       if (attn_sink != nullptr) {
         float sink_log2 = __ldg(attn_sink + h_start + h) * LOG2E;
-        if (lse != -1e30f)
-          lse += log2f(1.f + exp2f(sink_log2 - lse));
+        if (sm.l_smem[h] > 0.f)
+          lse = fmaxf(lse, sink_log2) + log2f(1.f + exp2f(-fabsf(sink_log2 - lse)));
         else
           lse = sink_log2;
+      } else if (sm.l_smem[h] == 0.f) {
+        lse = -INFINITY;
       }
       size_t lse_idx = (size_t)s_i * cold.out_lse_stride_elems + h_start + h;
       out_lse[lse_idx] = lse;
@@ -459,12 +461,16 @@ __device__ __forceinline__ void sparse_mla_prefill_math_pc(
     float il0, il1;
     if (attn_sink != nullptr) {
       float s0 = __ldg(attn_sink + h_start + gid) * LOG2E;
-      float denom0 = sm.l_smem[gid] + exp2f(s0 - sm.m_smem[gid]);
-      il0 = (denom0 > 0.f) ? (1.f / denom0) : 0.f;
+      float peak0 = fmaxf(s0, sm.m_smem[gid]);
+      float weight0 = exp2f(sm.m_smem[gid] - peak0);
+      float denom0 = sm.l_smem[gid] * weight0 + exp2f(s0 - peak0);
+      il0 = sm.l_smem[gid] > 0.f ? weight0 / denom0 : 0.f;
       if constexpr (VALID_HPB > 8) {
         float s1 = __ldg(attn_sink + h_start + gid + 8) * LOG2E;
-        float denom1 = sm.l_smem[gid + 8] + exp2f(s1 - sm.m_smem[gid + 8]);
-        il1 = (denom1 > 0.f) ? (1.f / denom1) : 0.f;
+        float peak1 = fmaxf(s1, sm.m_smem[gid + 8]);
+        float weight1 = exp2f(sm.m_smem[gid + 8] - peak1);
+        float denom1 = sm.l_smem[gid + 8] * weight1 + exp2f(s1 - peak1);
+        il1 = sm.l_smem[gid + 8] > 0.f ? weight1 / denom1 : 0.f;
       } else {
         il1 = 0.f;
       }
@@ -729,6 +735,7 @@ __global__ void __launch_bounds__((Fp8PrefillResources<MT, QkMode, GatherSchedul
         sm.w_head_sc_all[i] = 0.f;
 
       float s[4] = {0.f, 0.f, 0.f, 0.f};
+      bool valid0 = false, valid1 = false;
       if (qk_warp) {
         uint8_t* kv_warp_base = kv_smem + qk_nb * KV::KV_SMEM_STRIDE;
 
@@ -781,39 +788,19 @@ __global__ void __launch_bounds__((Fp8PrefillResources<MT, QkMode, GatherSchedul
         // ── QK rope (BF16 MMA, uses prefetched B operands) ──────
         compute_qk_rope<MT>(qk, q_rope_regs, rope_pf);
 
-        // ── Invalid index masking + topk_length overflow ─────
-        {
-          int e0 = qk_nb + tid * 2, e1 = e0 + 1;
-          if (mask0 < 0) {
-            qk[0] = -1e30f;
-            qk[2] = -1e30f;
-          }
-          if (mask1 < 0) {
-            qk[1] = -1e30f;
-            qk[3] = -1e30f;
-          }
-          // HAS_WINDOW makes topk_len a real bound even when the caller passes no
-          // topk_length, so the mask has to run. For the unbounded models this
-          // folds back to the original pointer test (and with topk_length null,
-          // topk_len == topk makes the comparisons dead anyway).
-          if (Cfg::HAS_WINDOW || cold.topk_length != nullptr) {
-            int a0 = ti * Cfg::BI + e0, a1 = ti * Cfg::BI + e1;
-            if (a0 >= topk_len) {
-              qk[0] = -1e30f;
-              qk[2] = -1e30f;
-            }
-            if (a1 >= topk_len) {
-              qk[1] = -1e30f;
-              qk[3] = -1e30f;
-            }
-          }
+        valid0 = mask0 >= 0;
+        valid1 = mask1 >= 0;
+        if (Cfg::HAS_WINDOW || cold.topk_length != nullptr) {
+          const int a0 = ti * Cfg::BI + qk_nb + tid * 2;
+          valid0 = valid0 && a0 < topk_len;
+          valid1 = valid1 && a0 + 1 < topk_len;
         }
 
         // ── Online softmax, warp-local half ──────────────────
-        s[0] = qk[0] * sm_scale_log2e;
-        s[1] = qk[1] * sm_scale_log2e;
-        s[2] = qk[2] * sm_scale_log2e;
-        s[3] = qk[3] * sm_scale_log2e;
+        s[0] = valid0 ? qk[0] * sm_scale_log2e : -1e30f;
+        s[1] = valid1 ? qk[1] * sm_scale_log2e : -1e30f;
+        s[2] = valid0 ? qk[2] * sm_scale_log2e : -1e30f;
+        s[3] = valid1 ? qk[3] * sm_scale_log2e : -1e30f;
 
         float lm0, lm1;
         softmax_warp_max(s, lm0, lm1);
@@ -863,10 +850,10 @@ __global__ void __launch_bounds__((Fp8PrefillResources<MT, QkMode, GatherSchedul
       float w0 = 0.f, w1 = 0.f, w2 = 0.f, w3 = 0.f;
       float vsc_cache[CT::N_V_CHUNKS][2];
       if (qk_warp) {
-        w0 = exp2f(s[0] - nm0);
-        w1 = exp2f(s[1] - nm0);
-        w2 = exp2f(s[2] - nm1);
-        w3 = exp2f(s[3] - nm1);
+        w0 = valid0 ? exp2f(s[0] - nm0) : 0.f;
+        w1 = valid1 ? exp2f(s[1] - nm0) : 0.f;
+        w2 = valid0 ? exp2f(s[2] - nm1) : 0.f;
+        w3 = valid1 ? exp2f(s[3] - nm1) : 0.f;
 
         float ls0, ls1;
         softmax_warp_sum(w0, w1, w2, w3, ls0, ls1);
@@ -1046,21 +1033,20 @@ __global__ void __launch_bounds__((Fp8PrefillResources<MT, QkMode, GatherSchedul
     bar_sync_t<Fp8PrefillSync::MATH, Cfg::MATH_THREADS>();
 
     // ── Write BF16 output and LSE ────────────────────────────────
-    // attn_sink convention (FlashMLA V4): output[h] *= sigmoid(lse_h - sink_h)
-    // is folded directly into the normalizer:
-    //   il = exp(lse) / (exp(lse) + exp(sink)) / exp(lse)
-    //      = 1 / (l + exp(sink - m))   in log2 space
-    // (working in log2 space: sum_l is in exp-domain of m, multiply sink by LOG2E).
-    // Padded heads carry sink=-inf → exp2(-inf)=0 → no-op (collapses to 1/l).
+    // The sink denominator and accumulator use the same max frame.
     float il0, il1;
     if (cold.attn_sink != nullptr) {
       float s0 = __ldg(cold.attn_sink + h_start + gid) * LOG2E;
-      float denom0 = sm.l_smem[gid] + exp2f(s0 - sm.m_smem[gid]);
-      il0 = (denom0 > 0.f) ? (1.f / denom0) : 0.f;
+      float peak0 = fmaxf(s0, sm.m_smem[gid]);
+      float weight0 = exp2f(sm.m_smem[gid] - peak0);
+      float denom0 = sm.l_smem[gid] * weight0 + exp2f(s0 - peak0);
+      il0 = sm.l_smem[gid] > 0.f ? weight0 / denom0 : 0.f;
       if constexpr (VALID_HPB > 8) {
         float s1 = __ldg(cold.attn_sink + h_start + gid + 8) * LOG2E;
-        float denom1 = sm.l_smem[gid + 8] + exp2f(s1 - sm.m_smem[gid + 8]);
-        il1 = (denom1 > 0.f) ? (1.f / denom1) : 0.f;
+        float peak1 = fmaxf(s1, sm.m_smem[gid + 8]);
+        float weight1 = exp2f(sm.m_smem[gid + 8] - peak1);
+        float denom1 = sm.l_smem[gid + 8] * weight1 + exp2f(s1 - peak1);
+        il1 = sm.l_smem[gid + 8] > 0.f ? weight1 / denom1 : 0.f;
       } else {
         il1 = 0.f;
       }
@@ -1124,10 +1110,12 @@ __global__ void __launch_bounds__((Fp8PrefillResources<MT, QkMode, GatherSchedul
       float lse = softmax_lse(sm.m_smem[h], sm.l_smem[h]);
       if (cold.attn_sink != nullptr) {
         float sink_log2 = __ldg(cold.attn_sink + h_start + h) * LOG2E;
-        if (lse != -1e30f)
-          lse += log2f(1.f + exp2f(sink_log2 - lse));
+        if (sm.l_smem[h] > 0.f)
+          lse = fmaxf(lse, sink_log2) + log2f(1.f + exp2f(-fabsf(sink_log2 - lse)));
         else
           lse = sink_log2;
+      } else if (sm.l_smem[h] == 0.f) {
+        lse = -INFINITY;
       }
       size_t lse_idx = (size_t)s_i * cold.out_lse_stride_elems + h_start + h;
       out_lse[lse_idx] = lse;

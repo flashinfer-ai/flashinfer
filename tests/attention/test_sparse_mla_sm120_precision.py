@@ -270,6 +270,90 @@ def test_fp8_prefill_cross_bucket_graphs(mixed, tmp_path):
         planner.plan(65, 16, 128, 5, 61, False, 1, q.device, compute_precision="fp8")
 
 
+@pytest.mark.parametrize(
+    "precision,tokens", [("fp8", 4), ("fp8", 65), ("bf16", 4), ("bf16", 65)]
+)
+@pytest.mark.parametrize("sink_value", [None, -1000.0, 2.0, 1000.0])
+def test_precision_empty_effective_kv(precision, tokens, sink_value):
+    q, main, idx, _, _ = inputs(16, 64, 64, False)
+    q = q[:1].expand(tokens, -1, -1).contiguous()
+    idx = idx[:1].expand(tokens, -1).contiguous()
+    lengths = torch.full((tokens,), 128, device="cuda", dtype=torch.int32)
+    lengths[0] = 0
+    idx[1] = -1
+    sink = None if sink_value is None else torch.full((16,), sink_value, device="cuda")
+    wrapper = SparseMLASm120Wrapper(
+        kv_scale_format="ue8m0_g32", compute_precision=precision
+    )
+    output = torch.full_like(q, float("nan"))
+    lse = torch.full((tokens, 16), float("nan"), device="cuda")
+    wrapper.run(
+        q,
+        main,
+        idx,
+        output,
+        512**-0.5,
+        topk_length=lengths,
+        attn_sink=sink,
+        out_lse=lse,
+    )
+    ref, rlse = _ref_sparse_attn(
+        q,
+        dequantize_kv_dsv4_1(main),
+        idx,
+        512**-0.5,
+        512,
+        topk_length=lengths,
+        attn_sink=sink,
+    )
+    assert torch.count_nonzero(output[:2]) == 0
+    if sink is not None:
+        torch.testing.assert_close(lse[:2], (sink * 1.4426950408889634).expand(2, -1))
+    torch.testing.assert_close(output, ref, atol=0.05, rtol=0.05)
+    torch.testing.assert_close(lse, rlse, atol=0.02, rtol=0.02)
+
+    valid_idx = idx[2].clone()
+    expected_output, expected_lse = output[2].clone(), lse[2].clone()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        wrapper.run(
+            q,
+            main,
+            idx,
+            output,
+            512**-0.5,
+            topk_length=lengths,
+            attn_sink=sink,
+            out_lse=lse,
+        )
+    for empty in (True, False):
+        if empty:
+            idx[2].fill_(-1)
+            lengths[3] = 0
+        else:
+            idx[2].copy_(valid_idx)
+            lengths[3] = 128
+        output.fill_(float("nan"))
+        lse.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        if empty:
+            assert torch.count_nonzero(output[2:4]) == 0
+            if sink is None:
+                assert torch.isneginf(lse[2:4]).all()
+            else:
+                torch.testing.assert_close(
+                    lse[2:4], (sink * 1.4426950408889634).expand(2, -1)
+                )
+        else:
+            torch.testing.assert_close(
+                output[2:4], expected_output.expand(2, -1, -1), atol=0, rtol=0
+            )
+            torch.testing.assert_close(
+                lse[2:4], expected_lse.expand(2, -1), atol=0, rtol=0
+            )
+
+
 def test_precision_independent_graphs():
     q, main, idx, kwargs, _ = inputs()
     states = []
@@ -592,7 +676,7 @@ def test_bf16_prefill_optional_lengths_and_empty_rows():
     output = torch.empty_like(query)
     lse = wrapper.run(query, main, indices, output, 512**-0.5, return_lse=True)
     assert torch.count_nonzero(output[0]) == 0
-    assert torch.all(lse[0] == -1e30)
+    assert torch.isneginf(lse[0]).all()
     old_tf32 = torch.backends.cuda.matmul.allow_tf32
     try:
         torch.backends.cuda.matmul.allow_tf32 = False

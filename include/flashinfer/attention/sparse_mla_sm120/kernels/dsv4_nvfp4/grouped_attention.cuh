@@ -112,7 +112,7 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1)
         const int h = h_start + threadIdx.x;
         if (write_direct) {
           out_lse[(size_t)token_idx * NUM_HEADS + h] =
-              attn_sink ? __ldg(attn_sink + h) * LOG2E : -1e30f;
+              attn_sink ? __ldg(attn_sink + h) * LOG2E : -INFINITY;
         } else {
           mid_lse[((size_t)token_idx * NUM_HEADS + h) * scratch_split_stride + split_idx] = -1e30f;
         }
@@ -465,10 +465,11 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1)
   if (warp_id == 0 && tid == 0) {
 #pragma unroll
     for (int group = 0; group < VALID_HEAD_GROUPS; ++group) {
-      float lse0 =
-          global_sum[group][0] > 0.f ? log2f(global_sum[group][0]) + global_max[group][0] : -1e30f;
-      float lse1 =
-          global_sum[group][1] > 0.f ? log2f(global_sum[group][1]) + global_max[group][1] : -1e30f;
+      const float empty_lse = write_direct ? -INFINITY : -1e30f;
+      float lse0 = global_sum[group][0] > 0.f ? log2f(global_sum[group][0]) + global_max[group][0]
+                                              : empty_lse;
+      float lse1 = global_sum[group][1] > 0.f ? log2f(global_sum[group][1]) + global_max[group][1]
+                                              : empty_lse;
       float output_scale0 = 1.f;
       float output_scale1 = 1.f;
       const int h0 = h_start + group * HPB + gid;

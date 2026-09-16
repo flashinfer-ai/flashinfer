@@ -474,11 +474,12 @@ __global__ void __launch_bounds__(
     }
 
     // Mask invalid cands + sm_scale × LOG2E. Invalid = position past
-    // section_len OR slot id = -1 (indexer-padded; IO already gathered slot 0
-    // into smem with idx clamped — masking to -inf kills it in softmax).
+    // section_len OR slot id = -1 (indexer-padded). Invalid candidates gather
+    // a zero row and receive the finite -1e30 mask.
     const int32_t* section_idx_base =
         is_extra_chunk ? (extra_indices + (size_t)t_idx * extra_indices_stride_elems) : idx_base;
     const int warp_first_cand = warp_id * Cfg::ENTRIES_PER_WARP;
+    bool valid_candidate[Cfg::QK_N_TILES][2];
 #pragma unroll
     for (int nt = 0; nt < Cfg::QK_N_TILES; nt++) {
       const int c0 = warp_first_cand + nt * 8 + tid * 2;
@@ -487,18 +488,12 @@ __global__ void __launch_bounds__(
       const int abs_c1 = c1 + split_cand_start;
       const int idx0 = (abs_c0 < section_len) ? section_idx_base[abs_c0] : -1;
       const int idx1 = (abs_c1 < section_len) ? section_idx_base[abs_c1] : -1;
-      if (abs_c0 >= split_cand_end || idx0 < 0) {
-        qk[nt][0] = -1e30f;
-        qk[nt][2] = -1e30f;
-      }
-      if (abs_c1 >= split_cand_end || idx1 < 0) {
-        qk[nt][1] = -1e30f;
-        qk[nt][3] = -1e30f;
-      }
-      qk[nt][0] *= sm_scale * LOG2E;
-      qk[nt][1] *= sm_scale * LOG2E;
-      qk[nt][2] *= sm_scale * LOG2E;
-      qk[nt][3] *= sm_scale * LOG2E;
+      valid_candidate[nt][0] = abs_c0 < split_cand_end && idx0 >= 0;
+      valid_candidate[nt][1] = abs_c1 < split_cand_end && idx1 >= 0;
+      qk[nt][0] = valid_candidate[nt][0] ? qk[nt][0] * (sm_scale * LOG2E) : -1e30f;
+      qk[nt][1] = valid_candidate[nt][1] ? qk[nt][1] * (sm_scale * LOG2E) : -1e30f;
+      qk[nt][2] = valid_candidate[nt][0] ? qk[nt][2] * (sm_scale * LOG2E) : -1e30f;
+      qk[nt][3] = valid_candidate[nt][1] ? qk[nt][3] * (sm_scale * LOG2E) : -1e30f;
     }
 
     // Per-warp local max/sum.
@@ -517,10 +512,10 @@ __global__ void __launch_bounds__(
     float p[Cfg::QK_N_TILES][4];
 #pragma unroll
     for (int nt = 0; nt < Cfg::QK_N_TILES; nt++) {
-      p[nt][0] = exp2f(qk[nt][0] - local_max[0]);
-      p[nt][1] = exp2f(qk[nt][1] - local_max[0]);
-      p[nt][2] = exp2f(qk[nt][2] - local_max[1]);
-      p[nt][3] = exp2f(qk[nt][3] - local_max[1]);
+      p[nt][0] = valid_candidate[nt][0] ? exp2f(qk[nt][0] - local_max[0]) : 0.f;
+      p[nt][1] = valid_candidate[nt][1] ? exp2f(qk[nt][1] - local_max[0]) : 0.f;
+      p[nt][2] = valid_candidate[nt][0] ? exp2f(qk[nt][2] - local_max[1]) : 0.f;
+      p[nt][3] = valid_candidate[nt][1] ? exp2f(qk[nt][3] - local_max[1]) : 0.f;
       local_sum[0] += p[nt][0] + p[nt][1];
       local_sum[1] += p[nt][2] + p[nt][3];
     }
@@ -574,13 +569,7 @@ __global__ void __launch_bounds__(
     //     global_sum update.
     //   warp_rescale  = exp(local_max[w] - new_gmax) — rescales THIS
     //     warp's p (computed in the warp's own local_max frame) into the
-    //     new global frame. CRITICAL for correctness when a warp covers
-    //     only invalid candidates: the post-mask qk == -1e30 * sm_scale *
-    //     LOG2E ≈ -6.38e28 becomes the warp's local_max[0], and softmax
-    //     gives p ≡ 1 (exp2(qk - local_max) = exp2(0)). Without the
-    //     per-warp factor, these spurious 1s would leak into sm_p_full
-    //     and corrupt the RoPE MMA. The exp(local_max - new_gmax) factor
-    //     drives them to ~0.
+    //     new global frame, independently of the block-wide sum.
     const float block_rescale0 = exp2f(block_local_max0 - new_gmax0);
     const float block_rescale1 = exp2f(block_local_max1 - new_gmax1);
     const float warp_rescale0 = exp2f(local_max[0] - new_gmax0);
@@ -615,8 +604,7 @@ __global__ void __launch_bounds__(
     global_max[0] = new_gmax0;
     global_max[1] = new_gmax1;
 
-    // Stage 2.75: sm_p_full = p * warp_rescale. Each warp uses its OWN
-    // local_max-based rescale to kill all-invalid-warp contributions.
+    // Stage 2.75: rescale each warp's probabilities into the global max frame.
     // w_pre is shared: the XV-nope FP8 quantization below reads it too, so it
     // stays unconditional. Only the bf16 sm_p_full staging is rope-only.
     float w_pre[Cfg::QK_N_TILES][4];

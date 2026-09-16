@@ -311,9 +311,8 @@ __global__ void __launch_bounds__(DSV32_BLOCK_THREADS) sparse_mla_decode_dsv3_2_
     }
 
     // Mask invalid cands + sm_scale × LOG2E. Invalid = absolute cand position
-    // past the per-token topk_length OR slot id = -1 (indexer-padded). The
-    // IO warp gathered slot 0 into smem for the -1 case (idx clamped to 0);
-    // setting qk = -inf kills the contribution in softmax.
+    // past the per-token topk_length OR slot id = -1 (indexer-padded).
+    // Invalid candidates gather a zero row and receive the finite -1e30 mask.
     const int warp_first_cand = warp_id * DSV32_ENTRIES_PER_WARP;
 #pragma unroll
     for (int nt = 0; nt < DSV32_QK_N_TILES; nt++) {
@@ -323,18 +322,12 @@ __global__ void __launch_bounds__(DSV32_BLOCK_THREADS) sparse_mla_decode_dsv3_2_
       const int abs_c1 = c1 + split_cand_start;
       const int idx0 = (abs_c0 < topk_len) ? idx_base[abs_c0] : -1;
       const int idx1 = (abs_c1 < topk_len) ? idx_base[abs_c1] : -1;
-      if (abs_c0 >= split_cand_end || idx0 < 0) {
-        qk[nt][0] = -1e30f;
-        qk[nt][2] = -1e30f;
-      }
-      if (abs_c1 >= split_cand_end || idx1 < 0) {
-        qk[nt][1] = -1e30f;
-        qk[nt][3] = -1e30f;
-      }
-      qk[nt][0] *= sm_scale * LOG2E;
-      qk[nt][1] *= sm_scale * LOG2E;
-      qk[nt][2] *= sm_scale * LOG2E;
-      qk[nt][3] *= sm_scale * LOG2E;
+      const bool valid0 = abs_c0 < split_cand_end && idx0 >= 0;
+      const bool valid1 = abs_c1 < split_cand_end && idx1 >= 0;
+      qk[nt][0] = valid0 ? qk[nt][0] * (sm_scale * LOG2E) : -1e30f;
+      qk[nt][1] = valid1 ? qk[nt][1] * (sm_scale * LOG2E) : -1e30f;
+      qk[nt][2] = valid0 ? qk[nt][2] * (sm_scale * LOG2E) : -1e30f;
+      qk[nt][3] = valid1 ? qk[nt][3] * (sm_scale * LOG2E) : -1e30f;
     }
 
     // Per-warp local max/sum.
@@ -407,8 +400,7 @@ __global__ void __launch_bounds__(DSV32_BLOCK_THREADS) sparse_mla_decode_dsv3_2_
     const float alpha1 = (global_max[1] > -1e29f) ? exp2f(global_max[1] - new_gmax1) : 0.f;
     const float block_rescale0 = exp2f(block_local_max0 - new_gmax0);
     const float block_rescale1 = exp2f(block_local_max1 - new_gmax1);
-    // Per-warp rescale: drives spurious p ≡ 1 from all-invalid warps to ~0
-    // before it contributes to sm_p_full (see decode-dsv4 comment).
+    // Per-warp probabilities and the block sum use different max frames.
     const float warp_rescale0 = exp2f(local_max[0] - new_gmax0);
     const float warp_rescale1 = exp2f(local_max[1] - new_gmax1);
 

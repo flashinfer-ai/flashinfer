@@ -218,6 +218,7 @@ def test_sparse_mla_sm120_decode_dsv3_2_padded_row(
         0, s_kv, (num_tokens_, topk), device=device, dtype=torch.int32
     )
     indices[:, topk // 2 :] = -1
+    indices[0] = -1
     sm_scale = d_qk**-0.5
 
     ref_out, ref_lse = _ref_sparse_attn(q, kv_dequant, indices, sm_scale, d_v)
@@ -3108,15 +3109,7 @@ def test_sparse_mla_sm120_prefill_dots3_swa(
     )
 
     torch.testing.assert_close(output, ref_out, atol=1e-2, rtol=5e-3)
-    if attn_sink is None:
-        # Empty row: kernel emits the -1e30 sentinel, the reference -inf.
-        nonempty = topk_length.bool()
-        torch.testing.assert_close(
-            out_lse[nonempty], ref_lse[nonempty], atol=5e-3, rtol=5e-3
-        )
-        assert (out_lse[1] == -1e30).all()
-    else:
-        torch.testing.assert_close(out_lse, ref_lse, atol=5e-3, rtol=5e-3)
+    torch.testing.assert_close(out_lse, ref_lse, atol=5e-3, rtol=5e-3)
 
 
 @pytest.mark.parametrize("num_heads", [8, 64])
@@ -3897,7 +3890,7 @@ def test_sparse_mla_sm120_prefill_dsv3_2_sg_zero_topk_length() -> None:
     torch.cuda.synchronize()
 
     torch.testing.assert_close(output, torch.zeros_like(output))
-    torch.testing.assert_close(out_lse, torch.full_like(out_lse, -1e30))
+    assert torch.isneginf(out_lse).all()
 
 
 @pytest.mark.parametrize("extra_topk,extra_pbs", [(1024, 2), (1664, 2), (1024, 64)])
@@ -4807,3 +4800,135 @@ def test_sparse_mla_sm120_envelope_consistency(
     else:
         with pytest.raises(RuntimeError, match="sparse-MLA"):
             call()
+
+
+@pytest.mark.parametrize(
+    "model,heads,variant,dual,lengths",
+    [
+        (0, 16, 1, False, True),
+        (4, 8, 1, False, True),
+        (0, 32, 2, False, True),
+        (0, 64, 4, False, True),
+        (1, 32, 3, True, True),
+        (1, 32, 3, True, False),
+    ],
+)
+@pytest.mark.parametrize("sink_value", [None, 2.0, 1000.0])
+def test_sparse_mla_sm120_prefill_empty_effective_kv(
+    model, heads, variant, dual, lengths, sink_value
+):
+    from flashinfer.mla._sparse_mla_sm120 import _get_sparse_mla_sm120_decode_module
+
+    torch.manual_seed(4484)
+    tokens, topk = 6, 576 if model == 4 else 128
+    dim = {0: 576, 1: 512, 4: 1088}[model]
+    value_dim = 1024 if model == 4 else 512
+    quantize = {0: quantize_kv_dsv3_2, 1: quantize_kv_dsv4, 4: quantize_kv_dots3_swa}[
+        model
+    ]
+    dequantize = {
+        0: dequantize_kv_dsv3_2,
+        1: dequantize_kv_dsv4,
+        4: dequantize_kv_dots3_swa,
+    }[model]
+    cache = quantize(
+        torch.randn(2, 64, 1, dim, device="cuda", dtype=torch.bfloat16) * 0.1
+    )
+    q = torch.randn(tokens, heads, dim, device="cuda", dtype=torch.bfloat16) * 0.1
+    indices = torch.randint(128, (tokens, topk), device="cuda", dtype=torch.int32)
+    indices[1] = -1
+    lens = (
+        torch.full((tokens,), topk, device="cuda", dtype=torch.int32)
+        if lengths
+        else None
+    )
+    if lengths:
+        lens[0] = 0
+    else:
+        indices[0] = -1
+    extra = cache.clone() if dual else None
+    extra_indices = (
+        torch.randint(128, (tokens, 128), device="cuda", dtype=torch.int32)
+        if dual
+        else None
+    )
+    extra_lens = (
+        torch.full((tokens,), 128, device="cuda", dtype=torch.int32)
+        if dual and lengths
+        else None
+    )
+    if dual:
+        extra_indices[:3] = -1
+        indices[3] = -1
+    sink = (
+        torch.full((heads,), sink_value, device="cuda")
+        if sink_value is not None
+        else None
+    )
+    if sink_value == 1000.0:
+        sink = torch.linspace(-1000.0, 1000.0, heads, device="cuda")
+    output = torch.full(
+        (tokens, heads, value_dim), float("nan"), device="cuda", dtype=torch.bfloat16
+    )
+    lse = torch.full((tokens, heads), float("nan"), device="cuda")
+    module = _get_sparse_mla_sm120_decode_module()
+    module.sparse_mla_sm120_paged_attention(
+        q,
+        cache,
+        indices,
+        output,
+        lse,
+        dim**-0.5,
+        model,
+        variant,
+        lens,
+        sink,
+        extra,
+        extra_indices,
+        extra_lens,
+        False,
+    )
+    virtual = dequantize(cache).reshape(-1, 1, 1, dim)
+    masked = indices.clone()
+    if lengths:
+        masked.masked_fill_(
+            torch.arange(topk, device="cuda")[None] >= lens[:, None], -1
+        )
+    if dual:
+        virtual = torch.cat([virtual, dequantize(extra).reshape(-1, 1, 1, dim)])
+        masked = torch.cat(
+            [
+                masked,
+                torch.where(extra_indices < 0, extra_indices, extra_indices + 128),
+            ],
+            -1,
+        )
+    ref, rlse = _ref_sparse_attn(
+        q, virtual, masked, dim**-0.5, value_dim, attn_sink=sink
+    )
+    assert torch.count_nonzero(output[:2]) == 0
+    torch.testing.assert_close(output, ref, atol=0.05, rtol=0.05)
+    torch.testing.assert_close(lse, rlse, atol=0.02, rtol=0.02)
+
+
+def test_sparse_mla_sm120_empty_state_cuda_merge():
+    from flashinfer.mla import SparseMLASm120Wrapper
+
+    torch.manual_seed(4484)
+    q = torch.randn(2, 16, 512, device="cuda", dtype=torch.bfloat16) * 0.1
+    cache = quantize_kv_dsv4_1(
+        torch.randn(2, 64, 1, 512, device="cuda", dtype=torch.bfloat16) * 0.1
+    )
+    idx = torch.zeros(2, 128, device="cuda", dtype=torch.int32)
+    idx[0] = -1
+    out = torch.full_like(q, float("nan"))
+    wrapper = SparseMLASm120Wrapper(
+        kv_scale_format="ue8m0_g32", compute_precision="fp8"
+    )
+    lse = wrapper.run(q, cache, idx, out, 512**-0.5, return_lse=True)
+    for other in (0, 1):
+        merged, merged_lse = flashinfer.merge_state(
+            out[:1], lse[:1], out[other : other + 1], lse[other : other + 1]
+        )
+        torch.testing.assert_close(merged, out[other : other + 1], atol=0, rtol=0)
+        torch.testing.assert_close(merged_lse, lse[other : other + 1], atol=0, rtol=0)

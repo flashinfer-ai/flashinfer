@@ -435,13 +435,9 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
     }
 
     // ── Write BF16 output and LSE ────────────────────────────────
-    // attn_sink convention (FlashMLA V4): output[h] *= sigmoid(lse_h - sink_h)
-    // is folded directly into the normalizer:
-    //   il = exp(lse) / (exp(lse) + exp(sink)) / exp(lse)
-    //      = 1 / (l + exp(sink - m))   in log2 space
-    // (working in log2 space: sum_l is in exp-domain of m, multiply sink by LOG2E).
-    // A row whose candidates are all masked keeps m at -1e30f, where every slot
-    // would contribute exp2(0)=1; drop l so it collapses to il=0, lse=-1e30f.
+    // The sink denominator and accumulator use the same max frame.
+    // All-masked rows keep m at -1e30f; drop their spurious exp2(0) mass
+    // so il=0, with lse=-inf when no sink contributes.
     float il[2];
     float lse[2];
 #pragma unroll
@@ -449,15 +445,19 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
       const bool empty = (warp_m[ih] <= -1e29f);
       const float l = warp8_reduce_sum(empty ? 0.f : warp_l[ih]);
       const float m = empty ? -1e30f : warp_m[ih];
-      lse[ih] = softmax_lse(m, l);
+      lse[ih] = l > 0.f ? softmax_lse(m, l) : -INFINITY;
+      il[ih] = l > 0.f ? 1.f / l : 0.f;
       if (cold.attn_sink != nullptr) {
         const float sink_log2 = __ldg(cold.attn_sink + h_base + 2 * tid + ih) * LOG2E;
-        const float denom = l + exp2f(sink_log2 - m);
-        il[ih] = (denom > 0.f) ? (1.f / denom) : 0.f;
-        lse[ih] =
-            (lse[ih] != -1e30f) ? (lse[ih] + log2f(1.f + exp2f(sink_log2 - lse[ih]))) : sink_log2;
-      } else {
-        il[ih] = (l > 0.f) ? (1.f / l) : 0.f;
+        if (l > 0.f) {
+          const float peak = fmaxf(m, sink_log2);
+          const float weight = exp2f(m - peak);
+          const float total = l * weight + exp2f(sink_log2 - peak);
+          il[ih] = weight / total;
+          lse[ih] = log2f(total) + peak;
+        } else {
+          lse[ih] = sink_log2;
+        }
       }
     }
 

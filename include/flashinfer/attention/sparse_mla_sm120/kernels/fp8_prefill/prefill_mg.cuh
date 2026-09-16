@@ -352,6 +352,14 @@ __device__ __forceinline__ void prefill_mg_impl(
       // ── QK + softmax for both groups ────────────────────────
       float scores_log2[MG_N_HG][4];
       float vsc_cache[CT::N_V_CHUNKS][2];
+      const int e0 = qk_nb + tid * 2;
+      bool valid0 = ib[e0] >= 0, valid1 = ib[e0 + 1] >= 0;
+      if constexpr (!ASSUME_FULL_TILES) {
+        const int section_tile = (DUAL_CACHE && !is_main) ? ti - main_ni : ti;
+        const int section_len = (DUAL_CACHE && !is_main) ? topk_len_extra : topk_len;
+        valid0 = valid0 && section_tile * BI + e0 < section_len;
+        valid1 = valid1 && section_tile * BI + e0 + 1 < section_len;
+      }
 
       // BF16 MG: both head groups consume the same KV B operand. Fuse them so
       // FP8->BF16 KV dequantization runs once per K step.
@@ -371,57 +379,9 @@ __device__ __forceinline__ void prefill_mg_impl(
           float* qk = qk_grp[g];
           compute_qk_rope<MT>(qk, q_rope_regs[g], rope_pf);
 
-          {
-            int e0 = qk_nb + tid * 2, e1 = e0 + 1;
-            if (ib[e0] < 0) {
-              qk[0] = -1e30f;
-              qk[2] = -1e30f;
-            }
-            if (ib[e1] < 0) {
-              qk[1] = -1e30f;
-              qk[3] = -1e30f;
-            }
-            if constexpr (DUAL_CACHE && !ASSUME_FULL_TILES) {
-              if (is_main) {
-                if (cold.topk_length != nullptr) {
-                  int a0 = ti * BI + e0, a1 = ti * BI + e1;
-                  if (a0 >= topk_len) {
-                    qk[0] = -1e30f;
-                    qk[2] = -1e30f;
-                  }
-                  if (a1 >= topk_len) {
-                    qk[1] = -1e30f;
-                    qk[3] = -1e30f;
-                  }
-                }
-              } else {
-                int a0 = (ti - main_ni) * BI + e0, a1 = (ti - main_ni) * BI + e1;
-                if (a0 >= topk_len_extra) {
-                  qk[0] = -1e30f;
-                  qk[2] = -1e30f;
-                }
-                if (a1 >= topk_len_extra) {
-                  qk[1] = -1e30f;
-                  qk[3] = -1e30f;
-                }
-              }
-            } else if constexpr (!DUAL_CACHE && !ASSUME_FULL_TILES) {
-              if (cold.topk_length != nullptr) {
-                int a0 = ti * BI + e0, a1 = ti * BI + e1;
-                if (a0 >= topk_len) {
-                  qk[0] = -1e30f;
-                  qk[2] = -1e30f;
-                }
-                if (a1 >= topk_len) {
-                  qk[1] = -1e30f;
-                  qk[3] = -1e30f;
-                }
-              }
-            }
-          }
-
-          float s[4] = {qk[0] * sm_scale_log2e, qk[1] * sm_scale_log2e, qk[2] * sm_scale_log2e,
-                        qk[3] * sm_scale_log2e};
+          float s[4] = {
+              valid0 ? qk[0] * sm_scale_log2e : -1e30f, valid1 ? qk[1] * sm_scale_log2e : -1e30f,
+              valid0 ? qk[2] * sm_scale_log2e : -1e30f, valid1 ? qk[3] * sm_scale_log2e : -1e30f};
 
           float lm0, lm1;
           softmax_warp_max(s, lm0, lm1);
@@ -475,60 +435,9 @@ __device__ __forceinline__ void prefill_mg_impl(
           // QK rope (reuses prefetched B operands)
           compute_qk_rope<MT>(qk, q_rope_regs[g], rope_pf);
 
-          // Invalid index masking + topk_length overflow. Dual splits per phase
-          // (main: absolute ti*BI+e vs topk_len; extra: relative
-          // (ti-main_ni)*BI+e vs topk_len_extra).
-          {
-            int e0 = qk_nb + tid * 2, e1 = e0 + 1;
-            if (ib[e0] < 0) {
-              qk[0] = -1e30f;
-              qk[2] = -1e30f;
-            }
-            if (ib[e1] < 0) {
-              qk[1] = -1e30f;
-              qk[3] = -1e30f;
-            }
-            if constexpr (DUAL_CACHE && !ASSUME_FULL_TILES) {
-              if (is_main) {
-                if (cold.topk_length != nullptr) {
-                  int a0 = ti * BI + e0, a1 = ti * BI + e1;
-                  if (a0 >= topk_len) {
-                    qk[0] = -1e30f;
-                    qk[2] = -1e30f;
-                  }
-                  if (a1 >= topk_len) {
-                    qk[1] = -1e30f;
-                    qk[3] = -1e30f;
-                  }
-                }
-              } else {
-                int a0 = (ti - main_ni) * BI + e0, a1 = (ti - main_ni) * BI + e1;
-                if (a0 >= topk_len_extra) {
-                  qk[0] = -1e30f;
-                  qk[2] = -1e30f;
-                }
-                if (a1 >= topk_len_extra) {
-                  qk[1] = -1e30f;
-                  qk[3] = -1e30f;
-                }
-              }
-            } else if constexpr (!DUAL_CACHE && !ASSUME_FULL_TILES) {
-              if (cold.topk_length != nullptr) {
-                int a0 = ti * BI + e0, a1 = ti * BI + e1;
-                if (a0 >= topk_len) {
-                  qk[0] = -1e30f;
-                  qk[2] = -1e30f;
-                }
-                if (a1 >= topk_len) {
-                  qk[1] = -1e30f;
-                  qk[3] = -1e30f;
-                }
-              }
-            }
-          }
-
-          float s[4] = {qk[0] * sm_scale_log2e, qk[1] * sm_scale_log2e, qk[2] * sm_scale_log2e,
-                        qk[3] * sm_scale_log2e};
+          float s[4] = {
+              valid0 ? qk[0] * sm_scale_log2e : -1e30f, valid1 ? qk[1] * sm_scale_log2e : -1e30f,
+              valid0 ? qk[2] * sm_scale_log2e : -1e30f, valid1 ? qk[3] * sm_scale_log2e : -1e30f};
 
           float lm0, lm1;
           softmax_warp_max(s, lm0, lm1);
@@ -608,8 +517,10 @@ __device__ __forceinline__ void prefill_mg_impl(
           warp_l_partial[g][1] *= alpha1;
         }
 
-        float w0 = exp2f(scores_log2[g][0] - nm0), w1 = exp2f(scores_log2[g][1] - nm0);
-        float w2 = exp2f(scores_log2[g][2] - nm1), w3 = exp2f(scores_log2[g][3] - nm1);
+        float w0 = valid0 ? exp2f(scores_log2[g][0] - nm0) : 0.f;
+        float w1 = valid1 ? exp2f(scores_log2[g][1] - nm0) : 0.f;
+        float w2 = valid0 ? exp2f(scores_log2[g][2] - nm1) : 0.f;
+        float w3 = valid1 ? exp2f(scores_log2[g][3] - nm1) : 0.f;
         p[g][0] = w0;
         p[g][1] = w1;
         p[g][2] = w2;
@@ -836,20 +747,25 @@ __device__ __forceinline__ void prefill_mg_impl(
 
 #pragma unroll
     for (int g = 0; g < MG_N_HG; g++) {
-      // attn_sink folded into the normalizer (FlashMLA V4 convention).
-      // See SG epilogue for full derivation.
+      // The sink denominator and accumulator use the same max frame.
       float il0, il1;
       if (cold.attn_sink != nullptr) {
         int h0 = h_start + g * HPB + gid;
         float s0 = __ldg(cold.attn_sink + h0) * LOG2E;
-        float d0 = sm.l_smem()[g * SMG::ML_GRP_STRIDE + gid] +
-                   exp2f(s0 - sm.m_smem()[g * SMG::ML_GRP_STRIDE + gid]);
-        il0 = (d0 > 0.f) ? (1.f / d0) : 0.f;
+        float m0 = sm.m_smem()[g * SMG::ML_GRP_STRIDE + gid];
+        float l0 = sm.l_smem()[g * SMG::ML_GRP_STRIDE + gid];
+        float weight0 = exp2f(-fabsf(s0 - m0));
+        float numerator0 = s0 > m0 ? weight0 : 1.f;
+        float d0 = s0 > m0 ? l0 * weight0 + 1.f : l0 + weight0;
+        il0 = l0 > 0.f ? numerator0 / d0 : 0.f;
         if constexpr (VALID_HPB > 8) {
           float s1 = __ldg(cold.attn_sink + h0 + 8) * LOG2E;
-          float d1 = sm.l_smem()[g * SMG::ML_GRP_STRIDE + gid + 8] +
-                     exp2f(s1 - sm.m_smem()[g * SMG::ML_GRP_STRIDE + gid + 8]);
-          il1 = (d1 > 0.f) ? (1.f / d1) : 0.f;
+          float m1 = sm.m_smem()[g * SMG::ML_GRP_STRIDE + gid + 8];
+          float l1 = sm.l_smem()[g * SMG::ML_GRP_STRIDE + gid + 8];
+          float weight1 = exp2f(-fabsf(s1 - m1));
+          float numerator1 = s1 > m1 ? weight1 : 1.f;
+          float d1 = s1 > m1 ? l1 * weight1 + 1.f : l1 + weight1;
+          il1 = l1 > 0.f ? numerator1 / d1 : 0.f;
         } else {
           il1 = 0.f;
         }
@@ -910,10 +826,12 @@ __device__ __forceinline__ void prefill_mg_impl(
                                 sm.l_smem()[g * SMG::ML_GRP_STRIDE + h]);
         if (cold.attn_sink != nullptr) {
           float sink_log2 = __ldg(cold.attn_sink + h_start + g * HPB + h) * LOG2E;
-          if (lse != -1e30f)
-            lse += log2f(1.f + exp2f(sink_log2 - lse));
+          if (sm.l_smem()[g * SMG::ML_GRP_STRIDE + h] > 0.f)
+            lse = fmaxf(lse, sink_log2) + log2f(1.f + exp2f(-fabsf(sink_log2 - lse)));
           else
             lse = sink_log2;
+        } else if (sm.l_smem()[g * SMG::ML_GRP_STRIDE + h] == 0.f) {
+          lse = -INFINITY;
         }
         size_t lse_idx = (size_t)s_i * cold.out_lse_stride_elems + (h_start + g * HPB + h);
         out_lse[lse_idx] = lse;

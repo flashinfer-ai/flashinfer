@@ -944,6 +944,13 @@ class _SparseMLAPagedAttentionRunner:
         LSE buffer sized to the actual ``num_tokens``; otherwise returns
         ``None``.
 
+        Final LSE uses base 2. If lengths and indices leave no valid KV in
+        either cache for a query head, its output is zero and its LSE is
+        ``-inf`` when no sink contributes. A finite ``attn_sink`` contributes
+        denominator mass: an empty KV row still has zero output, with LSE
+        ``attn_sink * log2(e)``. This final-output contract does not apply to
+        internal split-K scratch sentinels.
+
         Accepts ``q``/``output`` either as 3-D ``[num_tokens, num_heads, head_dim]``
         or as 4-D ``[num_tokens, 1, num_heads, head_dim]`` (some callers carry
         a singleton s_q dim); the 4-D form is squeezed in place. Calls that

@@ -1739,7 +1739,9 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     To add a compressed segment, pass ``compressed_kv_cache`` as another pool
     in the same format and pass ``extra_sparse_indices`` with
     ``extra_sparse_topk_lens``. The SM120/SM121 path accepts BF16 query tensors
-    and produces BF16 output.
+    and produces BF16 output. Empty effective KV rows produce zero output;
+    the packed backend's final base-2 LSE and finite-sink semantics are
+    documented in :meth:`SparseMLASm120Wrapper.run`.
 
     With ``backend="cute-dsl"`` on SM100/SM103, this calls the DeepSeek V4
     HCA kernel. Its SWA stream consumes arbitrary physical token-row indices,

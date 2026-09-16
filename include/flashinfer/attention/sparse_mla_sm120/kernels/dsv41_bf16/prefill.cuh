@@ -244,7 +244,7 @@ __global__ void __launch_bounds__(Dsv41Bf16Resources::BLOCK_THREADS, 1)
     const int head = hs + gid + h * 8;
     if (head < heads) {
       float norm = sum[h] > 0.f ? 1.f / sum[h] : 0.f;
-      float lse = sum[h] > 0.f ? log2f(sum[h]) + m[h] : -1e30f;
+      float lse = sum[h] > 0.f ? log2f(sum[h]) + m[h] : -INFINITY;
       if (params.attn_sink) {
         const float sink = params.attn_sink[head] * LOG2E;
         if (sum[h] > 0.f) {
