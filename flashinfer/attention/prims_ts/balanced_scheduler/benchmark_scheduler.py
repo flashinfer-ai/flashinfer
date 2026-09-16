@@ -246,7 +246,9 @@ def run_policy_comparison(args, device: torch.device, qkv_dtype: torch.dtype) ->
 
             optimized_scheduler_graph = capture_graph(optimized_schedule)
             optimized_combined_graph = capture_graph(optimized_schedule_and_attention)
-            measurements = {policy: [] for policy in ("exact", "optimized")}
+            measurements: dict[str, list[dict[str, float]]] = {
+                policy: [] for policy in ("exact", "optimized")
+            }
 
             def measure_policy(policy: str):
                 if policy == "exact":

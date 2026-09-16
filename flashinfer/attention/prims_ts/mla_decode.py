@@ -28,7 +28,7 @@ from flashinfer.trace.templates.attention import (
     prims_ts_decode_mla_wrapper_trace_dispatch,
 )
 
-from ._balanced_gate import should_use_prims_ts_balanced_mla
+from .balanced_scheduler.gate import should_use_prims_ts_balanced_mla
 from .decode import (
     _WorkspaceSection,
     _align_up,
@@ -1409,7 +1409,7 @@ def get_prims_ts_batch_mla_decode_workspace_size(
     resolved_device, device_index = _resolve_cuda_device(device)
     _validate_runtime_device(resolved_device)
     if balanced:
-        from ._balanced_plan import require_balanced_mla_calibration
+        from .balanced_scheduler.plan import require_balanced_mla_calibration
 
         require_balanced_mla_calibration(resolved_device)
 
@@ -1734,7 +1734,7 @@ class BatchMLADecodePagedTSWrapper:
 
         balanced_calibration = None
         if balanced and balanced_bootstrap_cost is None:
-            from ._balanced_plan import require_balanced_mla_calibration
+            from .balanced_scheduler.plan import require_balanced_mla_calibration
 
             # Fail before policy compilation or any CUDA allocation. Production
             # balanced execution must never silently inherit another device's
@@ -1789,7 +1789,7 @@ class BatchMLADecodePagedTSWrapper:
         balanced_plan = None
         planned_seq_lens = None
         if balanced:
-            from ._balanced_plan import BalancedMLADecodePlan
+            from .balanced_scheduler.plan import BalancedMLADecodePlan
 
             resolved_policy = dict(policy)
             balanced_plan = BalancedMLADecodePlan(
@@ -1964,8 +1964,8 @@ class BatchMLADecodePagedTSWrapper:
 
         Balanced planning requires a checked-in cost model for the exact GPU
         product, compute capability, and SM count. An uncalibrated device is
-        rejected before compilation or allocation. Run
-        ``benchmarks/bench_prims_ts_balanced_mla_cost_model.py`` on that device
+        rejected before compilation or allocation. Run the balanced scheduler's
+        ``tune_cost_model`` module on that device
         and add its measured models to the calibration registry before use.
 
         Parameters

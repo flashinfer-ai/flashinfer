@@ -21,7 +21,7 @@
 #include <cstdint>
 #include <limits>
 
-#include "prims_balanced_mla_scheduler.cuh"
+#include "balanced_mla_scheduler.cuh"
 #include "tvm_ffi_utils.h"
 
 namespace {
