@@ -138,7 +138,14 @@ def test_native_nemotron_recurrence_against_independent_fp32_oracle():
 
 @pytest.mark.skipif(TEST_DEVICE != "musa", reason="MUSA contract test")
 def test_varlen_final_states_against_independent_fp32_oracle():
-    """Check packed sequence boundaries and every destination state, not only output."""
+    """Check packed sequences and the non-spec final-state write contract.
+
+    With ``num_accepted_tokens=None`` the varlen path reads the first source
+    slot for each sequence, carries the recurrent state across all packed
+    tokens, and writes one final state to the first destination slot.  The
+    per-token source/destination mapping belongs to speculative decoding and
+    is covered separately by the upstream varlen contract tests.
+    """
     torch.manual_seed(1903)
     device = torch.device(TEST_DEVICE)
     lengths = [1, 3]
@@ -187,18 +194,20 @@ def test_varlen_final_states_against_independent_fp32_oracle():
     ratio = heads // groups
     flat = 0
     for seq, length in enumerate(lengths):
+        running_state = expected_state[src[seq, 0]].clone()
         for t in range(length):
             for h in range(heads):
                 group = h // ratio
                 delta = torch.nn.functional.softplus(dt_base[flat, h] + bias_base[h])
-                running = expected_state[src[seq, t], h] * torch.exp(a_base[h] * delta)
+                running = running_state[h] * torch.exp(a_base[h] * delta)
                 running = running + delta * x[flat, h].float()[:, None] * B[flat, group].float()[None, :]
-                expected_state[dst[seq, t], h] = running
+                running_state[h] = running
                 expected[flat, h] = (C[flat, group].float()[None, :] * running).sum(-1) + D[h] * x[flat, h].float()
             flat += 1
+        expected_state[dst[seq, 0]] = running_state
 
     torch.testing.assert_close(actual.float(), expected, rtol=0.05, atol=0.05)
-    for slot in [12, 17, 18, 19]:
+    for slot in [12, 17]:
         torch.testing.assert_close(state[slot].float(), expected_state[slot], rtol=0.05, atol=0.05)
-    for slot in [2, 7, 8, 9]:
+    for slot in [18, 19, 2, 7, 8, 9]:
         torch.testing.assert_close(state[slot], original[slot], rtol=0, atol=0)
