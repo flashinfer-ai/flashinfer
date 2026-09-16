@@ -205,6 +205,8 @@ _E2M1_VALUES = (
 # Peak-memory budget for one chunk of the composable reference gather.
 _REFERENCE_CHUNK_BYTES = 96 << 20
 
+from ..jit.msa_prefill_nvfp4_specialized import MIN_CUDA_VERSION as _MIN_CUDA_VERSION
+
 try:
     from ..jit.msa_prefill_nvfp4_specialized import (
         load_msa_prefill_nvfp4_specialized_module,
@@ -593,24 +595,18 @@ def check_surface(
     return None
 
 
-# The prefill route requires CUDA 13.0 or newer. ptxas 12.9.41 (CUDA 12.9.0)
-# miscompiles the kernel -- the B-operand shared-memory descriptor of its first
-# tcgen05.mma is materialised from a stale register pair and the kernel faults
-# on its first launch -- and no earlier 12.x toolkit has been qualified on this
-# kernel at all, so the floor is the toolchain line that has, not the one build
-# that is known broken. Decode is unaffected: both of its bodies run on 12.9.
-_MIN_CUDA_VERSION = "13.0"
-
-
 @functools.cache
 def toolkit_decline_reason() -> Optional[str]:
     """Why the toolkit that would build this kernel must not, or ``None``.
 
+    The floor is ``MIN_CUDA_VERSION`` of the JIT spec module, where the
+    reason is stated.
     Read from the nvcc the JIT will use (``torch.version.cuda`` when nvcc is
     absent), so the answer is about the compiler that produces the kernel,
     not the runtime that would launch it. The translation unit carries an
     ``#error`` on the same condition as the backstop for builds that do not
-    go through this route.
+    go through either path. Decode is unaffected: both of its bodies run on
+    12.9.
     """
 
     from ..jit.cpp_ext import get_cuda_version
@@ -1073,7 +1069,10 @@ def msa_prefill_nvfp4_specialized_stats() -> Dict[str, Any]:
         # Non-None names a toolkit whose assembler miscompiles the kernel; the
         # route declines every call with this reason and builds nothing.
         "toolkit_decline_reason": toolkit_decline_reason(),
-        "precompiled": True,
+        # JIT-built at runtime -- on the first eager call, or ahead of CUDA
+        # graph capture by msa_prefill_nvfp4_specialized_warmup(). Not part of
+        # the AOT build.
+        "precompiled": False,
         "allowlist_rows": len(allowlist),
         "allowlist_fields": list(_WORKLOAD_FIELDS),
         "allowlist": [list(row) for row in allowlist],

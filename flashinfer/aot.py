@@ -69,9 +69,6 @@ from .jit.blackwell_msa import (
 from .jit.msa_decode_nvfp4_specialized import (
     gen_msa_decode_nvfp4_specialized_module,
 )
-from .jit.msa_prefill_nvfp4_specialized import (
-    gen_msa_prefill_nvfp4_specialized_module,
-)
 from .jit.cake_kda import (
     CAKE_KDA_AFFINE_ROLES,
     CakeKDATarget,
@@ -628,13 +625,10 @@ def gen_all_modules(
             jit_specs.append(
                 gen_msa_decode_nvfp4_specialized_module(blackwell_msa_target)
             )
-            # Specialized NVFP4 paged-KV prefill. Precompiled rather than left
-            # to JIT because it is the only NVFP4 MSA prefill implementation on
-            # these parts, so a first call that has to compile is a first call
-            # that stalls a request.
-            jit_specs.append(
-                gen_msa_prefill_nvfp4_specialized_module(blackwell_msa_target)
-            )
+            # The specialized NVFP4 paged-KV prefill module is deliberately NOT
+            # here: it is JIT-built at runtime, on the first eager call or by
+            # msa_prefill_nvfp4_specialized_warmup(), and requires CUDA 13.0
+            # (flashinfer/jit/msa_prefill_nvfp4_specialized.py, MIN_CUDA_VERSION).
 
     minimax_h3_targets: tuple[tuple[MiniMaxH3Mxfp8Target, bool], ...] = (
         ("sm100a", sm_capabilities.get("sm100a_exact", False)),
