@@ -762,6 +762,8 @@ def bench_trtllm(
         local_expert_offset=local_expert_offset,
         local_num_experts=num_local_experts,
         do_finalize=True,
+        # Profile large-token rows at their own size, beyond the native 8192 cap.
+        tune_max_num_tokens=max(n, 8192),
     )
 
     if precision == "bf16":
