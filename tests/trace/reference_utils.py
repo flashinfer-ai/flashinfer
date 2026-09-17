@@ -23,10 +23,12 @@ def _skip_if_not_sm100():
 
 
 def _skip_if_not_sm100_or_103():
-    """Gate for kernels that run only on Blackwell proper (SM100/SM103)."""
+    """Gate for kernels that run only on the datacenter sm_10x family."""
     major, minor = _cc()
-    if (major, minor) not in ((10, 0), (10, 3)):
-        pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
+    if (major, minor) not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip(
+            "These tests are only guaranteed to work on SM100/SM103/SM107 GPUs."
+        )
 
 
 def _check(template, reference_outputs, actual_outputs, **thresholds) -> None:
