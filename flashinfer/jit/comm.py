@@ -280,6 +280,11 @@ def gen_pcie_ipc_comm_module() -> JitSpec:
 
 
 def gen_ulysses_a2a_module() -> JitSpec:
+    from .cake_ulysses import generated_ulysses_spec
+
+    generated = generated_ulysses_spec()
+    if generated is not None:
+        return generated
     return gen_jit_spec(
         "ulysses_a2a",
         [
