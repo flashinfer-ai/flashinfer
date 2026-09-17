@@ -118,6 +118,14 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="time the comm-only identity path (no compute_config)",
     )
+    p.add_argument(
+        "--cuda-graph",
+        action="store_true",
+        help=(
+            "capture the forward into a CUDA graph and time replays instead of "
+            "eager calls (split layers only; uses create_graph_state)"
+        ),
+    )
     args = p.parse_args()
     if args.reference:
         args.num_experts = _REFERENCE["num_experts"]
@@ -316,28 +324,59 @@ def main() -> int:
     from statistics import median
     from time import perf_counter
 
-    layer.enable_timing = True
-
-    for _ in range(args.warmup):
-        layer.forward(t)
-    torch.cuda.synchronize()
-    dist.barrier()
-
     e2e_us_samples: list[float] = []
     disp_us: list[float] = []
     comp_us: list[float] = []
     comb_us: list[float] = []
-    for _ in range(args.repeat):
+
+    if args.cuda_graph:
+        # Per-stage CUDA events need a device sync to read, which is illegal
+        # inside a capture, so graph mode reports e2e only.
+        layer.enable_timing = False
+        graph_state = layer.create_graph_state(t)
+        for _ in range(args.warmup):
+            layer.forward(t, graph_state=graph_state)
+        torch.cuda.synchronize()
         dist.barrier()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            layer.forward(t, graph_state=graph_state)
         torch.cuda.synchronize()
-        t0 = perf_counter()
-        layer.forward(t)
+        dist.barrier()
+        # Warm the replay path too: the first replay pays one-time costs.
+        for _ in range(args.warmup):
+            graph.replay()
         torch.cuda.synchronize()
-        e2e_us_samples.append((perf_counter() - t0) * 1e6)
-        tm = layer.last_timings_ms
-        disp_us.append(tm.get("dispatch", 0.0) * 1e3)
-        comp_us.append(tm.get("compute", 0.0) * 1e3)
-        comb_us.append(tm.get("combine", 0.0) * 1e3)
+        dist.barrier()
+        for _ in range(args.repeat):
+            dist.barrier()
+            torch.cuda.synchronize()
+            t0 = perf_counter()
+            graph.replay()
+            torch.cuda.synchronize()
+            e2e_us_samples.append((perf_counter() - t0) * 1e6)
+        disp_us.append(0.0)
+        comp_us.append(0.0)
+        comb_us.append(0.0)
+    else:
+        layer.enable_timing = True
+
+        for _ in range(args.warmup):
+            layer.forward(t)
+        torch.cuda.synchronize()
+        dist.barrier()
+
+        for _ in range(args.repeat):
+            dist.barrier()
+            torch.cuda.synchronize()
+            t0 = perf_counter()
+            layer.forward(t)
+            torch.cuda.synchronize()
+            e2e_us_samples.append((perf_counter() - t0) * 1e6)
+            tm = layer.last_timings_ms
+            disp_us.append(tm.get("dispatch", 0.0) * 1e3)
+            comp_us.append(tm.get("compute", 0.0) * 1e3)
+            comb_us.append(tm.get("combine", 0.0) * 1e3)
 
     e2e_us = median(e2e_us_samples)
     d_us, cp_us, cb_us = median(disp_us), median(comp_us), median(comb_us)
@@ -369,8 +408,9 @@ def main() -> int:
         mode = "identity" if args.baseline else args.quant
         layout_name = "ht_flat" if args.algorithm == "ht" else args.layout
         print(
-            "BENCH_CSV,algo,layout,tokens,gpus,backend,quant,dispatch_us,compute_us,combine_us,e2e_us,tok_s,disp_gbps,disp_rdma_gbps,comb_gbps,comb_rdma_gbps\n"
+            "BENCH_CSV,algo,layout,tokens,gpus,backend,quant,mode,dispatch_us,compute_us,combine_us,e2e_us,tok_s,disp_gbps,disp_rdma_gbps,comb_gbps,comb_rdma_gbps\n"
             f"BENCH_CSV,{args.algorithm},{layout_name},{args.tokens},{world_size},{args.backend},{mode},"
+            f"{'graph' if args.cuda_graph else 'eager'},"
             f"{d_us:.1f},{cp_us:.1f},{cb_us:.1f},{e2e_us:.1f},{tok_s:.1f},"
             f"{disp_gbps:.1f},{disp_rdma:.1f},{comb_gbps:.1f},{comb_rdma:.1f}"
         )
