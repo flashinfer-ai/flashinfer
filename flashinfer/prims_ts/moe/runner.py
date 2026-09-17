@@ -157,19 +157,76 @@ def _fp8_per_tensor_scale_dtype(
     return int(dtype_value or 1)
 
 
+def _staged_routing_mode(
+    moe_inputs: MoeRunnerInputs, kwargs: dict[str, Any]
+) -> RoutingInputMode:
+    """Resolve staged-routing mode, preferring the explicit kwarg.
+
+    The C++ launcher infers packed vs unpacked vs logits from tensor rank,
+    not from ``routing_input_mode``. When the caller omitted the kwarg
+    (flat APIs), reconstruct the same rule: 2-D nonempty ids+weights are
+    unpacked, 2-D nonempty ids alone are packed, otherwise logits.
+    """
+    mode = kwargs.get("routing_input_mode")
+    if mode is not None:
+        return RoutingInputMode(int(mode))
+    ids = moe_inputs.topk_ids
+    weights = moe_inputs.expert_weights
+    has_ids = ids is not None and ids.ndim == 2 and ids.size(0) > 0
+    has_weights = weights is not None and weights.ndim == 2 and weights.size(0) > 0
+    if has_ids and has_weights:
+        return RoutingInputMode.UnpackedPrecomputed
+    if has_ids:
+        return RoutingInputMode.PackedPrecomputed
+    return RoutingInputMode.FromLogits
+
+
+def _staged_routing_io(
+    moe_inputs: MoeRunnerInputs, kwargs: dict[str, Any]
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Ids/weights buffers the staged C++ launcher needs for ``mode``.
+
+    A 2-D nonempty ``expert_weights`` tensor selects unpacked expert ids.
+    Packed and FromLogits therefore pass a 1-D empty weights placeholder.
+    """
+    mode = _staged_routing_mode(moe_inputs, kwargs)
+    hidden = moe_inputs.hidden_states
+    empty_ids = hidden.new_empty((0,), dtype=torch.int32)
+    empty_weights = hidden.new_empty((0,), dtype=torch.bfloat16)
+    if mode is RoutingInputMode.FromLogits:
+        return empty_ids, empty_weights
+    if mode is RoutingInputMode.PackedPrecomputed:
+        topk_ids = moe_inputs.topk_ids
+        if topk_ids is None:
+            raise RuntimeError("PackedPrecomputed routing requires topk_ids")
+        return topk_ids, empty_weights
+    topk_ids = moe_inputs.topk_ids
+    expert_weights = moe_inputs.expert_weights
+    if topk_ids is None or expert_weights is None:
+        raise RuntimeError(
+            "UnpackedPrecomputed routing requires topk_ids and expert_weights"
+        )
+    return topk_ids, expert_weights
+
+
 def _select_expert_weights(
     moe_inputs: MoeRunnerInputs,
     routed_expert_weights: torch.Tensor | None,
+    kwargs: dict[str, Any] | None = None,
 ) -> torch.Tensor:
-    has_precomputed_routing = (
-        moe_inputs.routing_logits is None or moe_inputs.routing_logits.numel() == 0
-    )
-    if (
-        has_precomputed_routing
-        and moe_inputs.expert_weights is not None
-        and moe_inputs.expert_weights.numel() > 0
-    ):
-        return moe_inputs.expert_weights
+    """Pick finalize weights. Match C++ ``ndim()==2 && size(0)>0``.
+
+    Autotune may synthesize a 1-D nonempty placeholder from a 1-D empty
+    buffer; that must not be treated as caller-owned unpacked weights.
+    """
+    mode = _staged_routing_mode(moe_inputs, kwargs or {})
+    if mode is RoutingInputMode.UnpackedPrecomputed:
+        weights = moe_inputs.expert_weights
+        if weights is None or weights.ndim != 2 or weights.size(0) <= 0:
+            raise RuntimeError(
+                "UnpackedPrecomputed routing did not provide 2-D expert weights"
+            )
+        return weights
     if routed_expert_weights is None:
         raise RuntimeError("routing did not return expert weights")
     return routed_expert_weights
@@ -642,11 +699,12 @@ class PrimsTsBf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         torch_stream = torch.cuda.current_stream(device=hidden_states.device)
         stream = cuda_drv.CUstream(torch_stream.cuda_stream)
 
+        topk_ids, expert_weights_in = _staged_routing_io(moe_inputs, kwargs)
         routing_out = self.moe_op.trtllm_moe_run_routing(
             moe_inputs.routing_logits,
             kwargs["routing_bias"],
-            moe_inputs.topk_ids,
-            moe_inputs.expert_weights,
+            topk_ids,
+            expert_weights_in,
             hidden_states,
             kwargs["gemm1_weights"],
             kwargs["gemm2_weights"],
@@ -679,7 +737,7 @@ class PrimsTsBf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             gemm1_output,
             gemm2_output,
         ) = _torch_views_of_ffi_tensors(routing_out)
-        expert_weights = _select_expert_weights(moe_inputs, expert_weights)
+        expert_weights = _select_expert_weights(moe_inputs, expert_weights, kwargs)
         routed_token_capacity = _routed_token_capacity(
             self,
             moe_inputs,
@@ -924,11 +982,12 @@ class PrimsTsNvfp4MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
 
         torch_stream = torch.cuda.current_stream(device=hidden_states.device)
         stream = cuda_drv.CUstream(torch_stream.cuda_stream)
+        topk_ids, expert_weights_in = _staged_routing_io(moe_inputs, kwargs)
         routing_out = self.moe_op.trtllm_moe_run_routing_fp4_nvfp4(
             moe_inputs.routing_logits,
             kwargs["routing_bias"],
-            moe_inputs.topk_ids,
-            moe_inputs.expert_weights,
+            topk_ids,
+            expert_weights_in,
             hidden_states,
             moe_inputs.hidden_states_scale,
             kwargs["gemm1_weights"],
@@ -967,7 +1026,7 @@ class PrimsTsNvfp4MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             gemm1_output_scale,
             gemm2_output,
         ) = _torch_views_of_ffi_tensors(routing_out)
-        expert_weights = _select_expert_weights(moe_inputs, expert_weights)
+        expert_weights = _select_expert_weights(moe_inputs, expert_weights, kwargs)
         if (
             moe_inputs.routing_logits is not None
             and moe_inputs.routing_logits.numel() > 0
@@ -1249,11 +1308,12 @@ class PrimsTsMxfp4Mxfp8MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
                     )
                     continue
 
+                topk_ids, expert_weights_in = _staged_routing_io(moe_inputs, kwargs)
                 routing_out = self.moe_op.trtllm_moe_run_routing_fp4_mxfp4_mxfp8(
                     moe_inputs.routing_logits,
                     kwargs["routing_bias"],
-                    moe_inputs.topk_ids,
-                    moe_inputs.expert_weights,
+                    topk_ids,
+                    expert_weights_in,
                     hidden_states,
                     moe_inputs.hidden_states_scale,
                     kwargs["gemm1_weights"],
@@ -1402,11 +1462,12 @@ class PrimsTsMxfp4Mxfp8MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         torch_stream = torch.cuda.current_stream(device=hidden_states.device)
         stream = cuda_drv.CUstream(torch_stream.cuda_stream)
 
+        topk_ids, expert_weights_in = _staged_routing_io(moe_inputs, kwargs)
         routing_out = self.moe_op.trtllm_moe_run_routing_fp4_mxfp4_mxfp8(
             moe_inputs.routing_logits,
             kwargs["routing_bias"],
-            moe_inputs.topk_ids,
-            moe_inputs.expert_weights,
+            topk_ids,
+            expert_weights_in,
             hidden_states,
             moe_inputs.hidden_states_scale,
             kwargs["gemm1_weights"],
@@ -1445,7 +1506,7 @@ class PrimsTsMxfp4Mxfp8MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             gemm1_output_scale,
             gemm2_output,
         ) = _torch_views_of_ffi_tensors(routing_out)
-        expert_weights = _select_expert_weights(moe_inputs, expert_weights)
+        expert_weights = _select_expert_weights(moe_inputs, expert_weights, kwargs)
         routed_token_capacity = _routed_token_capacity(
             self,
             moe_inputs,
@@ -1657,11 +1718,12 @@ class PrimsTsMxfp4Bf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         torch_stream = torch.cuda.current_stream(device=hidden_states.device)
         stream = cuda_drv.CUstream(torch_stream.cuda_stream)
 
+        topk_ids, expert_weights_in = _staged_routing_io(moe_inputs, kwargs)
         routing_out = self.moe_op.trtllm_moe_run_routing_fp4_mxfp4_bf16(
             moe_inputs.routing_logits,
             kwargs["routing_bias"],
-            moe_inputs.topk_ids,
-            moe_inputs.expert_weights,
+            topk_ids,
+            expert_weights_in,
             hidden_states,
             kwargs["gemm1_weights"],
             kwargs["gemm1_weights_scale"],
@@ -1698,7 +1760,7 @@ class PrimsTsMxfp4Bf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             gemm1_output,
             gemm2_output,
         ) = _torch_views_of_ffi_tensors(routing_out)
-        expert_weights = _select_expert_weights(moe_inputs, expert_weights)
+        expert_weights = _select_expert_weights(moe_inputs, expert_weights, kwargs)
         routed_token_capacity = _routed_token_capacity(
             self,
             moe_inputs,
@@ -1971,11 +2033,12 @@ class PrimsTsFp8PerTensorMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         ):
             routing_logits_for_routing = routing_logits_for_routing.to(torch.bfloat16)
 
+        topk_ids, expert_weights_in = _staged_routing_io(moe_inputs, kwargs)
         routing_out = self.moe_op.trtllm_moe_run_routing_fp8_per_tensor(
             routing_logits_for_routing,
             kwargs["routing_bias"],
-            moe_inputs.topk_ids,
-            moe_inputs.expert_weights,
+            topk_ids,
+            expert_weights_in,
             hidden_states,
             kwargs["gemm1_weights"],
             kwargs["output1_scale_scalar"],
@@ -2011,7 +2074,7 @@ class PrimsTsFp8PerTensorMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             gemm1_output,
             gemm2_output,
         ) = _torch_views_of_ffi_tensors(routing_out)
-        expert_weights = _select_expert_weights(moe_inputs, expert_weights)
+        expert_weights = _select_expert_weights(moe_inputs, expert_weights, kwargs)
         routed_token_capacity = _routed_token_capacity(
             self,
             moe_inputs,
@@ -2257,11 +2320,12 @@ class PrimsTsFp8BlockScaleMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
 
         torch_stream = torch.cuda.current_stream(device=hidden_states.device)
         stream = cuda_drv.CUstream(torch_stream.cuda_stream)
+        topk_ids, expert_weights_in = _staged_routing_io(moe_inputs, kwargs)
         routing_out = self.moe_op.trtllm_moe_run_routing_fp8_block_scale(
             moe_inputs.routing_logits,
             kwargs["routing_bias"],
-            moe_inputs.topk_ids,
-            moe_inputs.expert_weights,
+            topk_ids,
+            expert_weights_in,
             hidden_states,
             moe_inputs.hidden_states_scale,
             kwargs["gemm1_weights"],
@@ -2300,7 +2364,7 @@ class PrimsTsFp8BlockScaleMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             activation_output_scale,
             gemm2_output,
         ) = _torch_views_of_ffi_tensors(routing_out)
-        expert_weights = _select_expert_weights(moe_inputs, expert_weights)
+        expert_weights = _select_expert_weights(moe_inputs, expert_weights, kwargs)
         routed_token_capacity = _routed_token_capacity(
             self,
             moe_inputs,
