@@ -1495,17 +1495,23 @@ _NON_CAUSAL_ROWS = [8192, 1024, 129, 4096, 7, 2048]
 
 @sm100_only
 @pytest.mark.parametrize(
-    "backend, route",
-    [pytest.param(b, r, id=b) for b, r in bodies_for(_NON_CAUSAL_ROWS, causal=False)],
+    "rows, backend, route",
+    [
+        pytest.param(rows, b, r, id=f"b{len(rows)}-{b}")
+        for rows in (_NON_CAUSAL_ROWS, _NON_CAUSAL_ROWS * 6)
+        for b, r in bodies_for(rows, causal=False)
+    ],
 )
-def test_a_non_causal_decode_step(backend, route, monkeypatch):
-    """``causal = 0`` is one of the few coordinates that reaches the PINNED
-    family without an override: the CuTe-DSL body declines the geometry and
-    the pinned envelope admits the shape, so the production route lands there.
+def test_a_non_causal_decode_step(rows, backend, route, monkeypatch):
+    """``causal = 0`` is a coordinate the CuTe-DSL body declines, so the
+    production route lands on the C++ translation unit without any forcing:
+    on the general family at six rows, and on the pinned family at thirty-six,
+    where the pinned envelope's unclustered row admits the shape.
     """
-    inputs = _build_inputs(6, _NON_CAUSAL_ROWS, torch.device("cuda"), seed=23)
+    inputs = _build_inputs(len(rows), rows, torch.device("cuda"), seed=23)
     inputs["causal"] = False
-    assert backend == PINNED, backend
+    assert route == "auto" and backend != CUTE, (backend, route)
+    assert backend == (PINNED if len(rows) >= 33 else PARAMETRIC), backend
     _assert_peer(
         _call_on(backend, inputs, monkeypatch, route=route), _reference(inputs)
     )
