@@ -1652,7 +1652,9 @@ def test_generated_tma_workspaces_are_owned_by_prepared_graphs(
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or not is_sm100a_supported(torch.device("cuda")),
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3))
+    or not is_sm100a_supported(torch.device("cuda")),
     reason="requires an exact SM100a or SM103a GPU",
 )
 @pytest.mark.parametrize("metadata_dtype", [torch.int32, torch.int64])
@@ -1737,7 +1739,9 @@ def test_public_cuda_graph_reads_updated_sequence_boundaries(
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or not is_sm100a_supported(torch.device("cuda")),
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3))
+    or not is_sm100a_supported(torch.device("cuda")),
     reason="requires an exact SM100a or SM103a GPU",
 )
 @pytest.mark.parametrize(
@@ -1840,7 +1844,9 @@ def test_frozen_graph_matches_reference_and_preserves_inputs(
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or not is_sm100a_supported(torch.device("cuda")),
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3))
+    or not is_sm100a_supported(torch.device("cuda")),
     reason="requires an exact SM100a or SM103a GPU",
 )
 @pytest.mark.parametrize("metadata_dtype", [torch.int32, torch.int64])
@@ -1998,9 +2004,10 @@ def _allocate_state_pool(
 
 @pytest.mark.skipif(
     not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3))
     or not is_sm100a_supported(torch.device("cuda"))
     or _cuda_major() < 13,
-    reason="requires an SM100a-compatible GPU with CUDA 13",
+    reason="requires an exact SM100a or SM103a GPU with CUDA 13",
 )
 @pytest.mark.parametrize(
     "case",
@@ -2252,9 +2259,10 @@ def test_structurally_supported_public_route_uses_generated_state_and_lifecycle(
 
 @pytest.mark.skipif(
     not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3))
     or not is_sm100a_supported(torch.device("cuda"))
     or _cuda_major() < 13,
-    reason="requires an SM100a-compatible GPU with CUDA 13",
+    reason="requires an exact SM100a or SM103a GPU with CUDA 13",
 )
 @pytest.mark.parametrize(
     ("seq_lens", "cu_dtype"),
@@ -2383,9 +2391,10 @@ def test_public_dispatcher_preserves_zero_length_sequences_and_state_pool(
 
 @pytest.mark.skipif(
     not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3))
     or not is_sm100a_supported(torch.device("cuda"))
     or _cuda_major() < 13,
-    reason="requires an SM100a-compatible GPU with CUDA 13",
+    reason="requires an exact SM100a or SM103a GPU with CUDA 13",
 )
 def test_public_dispatcher_uses_generated_for_indexed_inplace_gqa(
     monkeypatch: pytest.MonkeyPatch,
