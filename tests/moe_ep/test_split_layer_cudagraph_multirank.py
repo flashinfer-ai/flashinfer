@@ -50,11 +50,12 @@ def _init_dist():
     return rank, world
 
 
-def _build_layer(rank, world_size, backend):
+def _build_layer(rank, world_size, backend, algorithm=None):
     import torch
 
     from flashinfer.moe_ep import (
         BootstrapConfig,
+        EpAlgorithm,
         FleetParams,
         MoEEpSplitLayer,
         dummy_moe_weights,
@@ -71,6 +72,7 @@ def _build_layer(rank, world_size, backend):
             max_tokens_per_rank=NUM_TOKENS,
             token_hidden_size=HIDDEN,
             dtype_bytes=2,
+            algorithm=algorithm or EpAlgorithm.LOW_LATENCY,
         ),
         weights=dummy_moe_weights(
             num_local_experts=NUM_EXPERTS // world_size, hidden=HIDDEN
@@ -101,10 +103,20 @@ def _make_tensors(rank, seed):
     return MoEEpTensors(hidden_states=x, topk_ids=ids, topk_weights=w)
 
 
+# nixl_ep is LL-only (MVP), so only nccl_ep carries the HT case. HT reaches
+# capture differently: its recv buffer is sized statically (max_per_rank *
+# world), so no host sync sneaks into the captured region.
 @pytest.mark.nvep
 @pytest.mark.gpu_4
-@pytest.mark.parametrize("backend", ["nccl_ep", "nixl_ep"])
-def test_split_layer_forward_is_capturable(backend):
+@pytest.mark.parametrize(
+    "backend,algo_name",
+    [
+        ("nccl_ep", "low_latency"),
+        ("nccl_ep", "high_throughput"),
+        ("nixl_ep", "low_latency"),
+    ],
+)
+def test_split_layer_forward_is_capturable(backend, algo_name):
     """Capture ``forward(graph_state=...)``, then replay across changed input.
 
     Asserts, in increasing order of what they would catch:
@@ -121,10 +133,16 @@ def test_split_layer_forward_is_capturable(backend):
     import torch
     import torch.distributed as dist
 
+    from flashinfer.moe_ep import EpAlgorithm
+
     rank, world_size = _init_dist()
     assert world_size >= 4, f"needs >=4 ranks, got {world_size}"
 
-    layer = _build_layer(rank, world_size, backend)
+    algorithm = {
+        "low_latency": EpAlgorithm.LOW_LATENCY,
+        "high_throughput": EpAlgorithm.HIGH_THROUGHPUT,
+    }[algo_name]
+    layer = _build_layer(rank, world_size, backend, algorithm)
     t = _make_tensors(rank, 1234)
 
     # All collective work runs first and results are stashed; the assertions
@@ -163,11 +181,21 @@ def test_split_layer_forward_is_capturable(backend):
     dist.barrier()
 
     # --- assertions: no collectives beyond this point ---------------------
+    # Replay must reproduce eager. This is the capture property itself and
+    # holds for both algorithms.
     torch.testing.assert_close(replay_same, eager, atol=5e-2, rtol=5e-2)
-    # LL writes every slot of its recv buffer and the weights sum to 1, so the
-    # identity round trip returns x exactly.
-    torch.testing.assert_close(eager, x_orig, atol=5e-2, rtol=5e-2)
-    torch.testing.assert_close(replay_newx, x_orig * -3.0, atol=5e-2, rtol=5e-2)
+    # A replay that re-ran tracks the rewritten activations; one that did not
+    # would still hold the previous result. True for both algorithms, and the
+    # assertion that actually distinguishes them.
+    assert not torch.allclose(replay_newx, replay_same, atol=5e-2, rtol=5e-2), (
+        "replay did not track activations rewritten between replays"
+    )
+    if algorithm is EpAlgorithm.LOW_LATENCY:
+        # LL writes every slot of its recv buffer and the weights sum to 1, so
+        # the identity round trip returns x exactly, under any routing. HT only
+        # fills the rows it actually received, so it has no such closed form.
+        torch.testing.assert_close(eager, x_orig, atol=5e-2, rtol=5e-2)
+        torch.testing.assert_close(replay_newx, x_orig * -3.0, atol=5e-2, rtol=5e-2)
 
 
 @pytest.mark.nvep
