@@ -55,8 +55,18 @@ from .cascade import (
 from .cascade import merge_state as merge_state
 from .cascade import merge_state_in_place as merge_state_in_place
 from .cascade import merge_states as merge_states
-from .decode import (
-    BatchDecodeMlaWithPagedKVCacheWrapper as BatchDecodeMlaWithPagedKVCacheWrapper,
+from .cake_fmha import (
+    cake_batch_context_with_kv_cache as cake_batch_context_with_kv_cache,
+)
+from .cake_fmha import (
+    cake_batch_decode_with_kv_cache as cake_batch_decode_with_kv_cache,
+)
+from .cake_fmha import cake_fmha_manifest as cake_fmha_manifest
+from .cake_fmha import (
+    CakeFmhaRequestOrderedDecodePlan as CakeFmhaRequestOrderedDecodePlan,
+)
+from .cake_fmha import (
+    plan_cake_fmha_request_ordered_paged_decode as plan_cake_fmha_request_ordered_paged_decode,
 )
 from .decode import (
     BatchDecodeWithPagedKVCacheWrapper as BatchDecodeWithPagedKVCacheWrapper,
@@ -99,7 +109,8 @@ from .quantization.fp8_quantization import (
     mxfp8_grouped_quantize,
     mxfp8_quantize,
 )
-from .attn_scores import padded_context_len as padded_context_len
+from .attn_scores import min_block_table_width as min_block_table_width
+from .attn_scores import padded_seq_len as padded_seq_len
 from .attn_scores import (
     compute_paged_mqa_logits_schedule as compute_paged_mqa_logits_schedule,
 )
@@ -119,6 +130,33 @@ from .fused_moe import (
     trtllm_fp8_per_tensor_scale_routed_moe,
 )
 
+_PRIMS_TS_LAZY_EXPORTS = frozenset(
+    {
+        "prims_ts_bf16_moe",
+        "prims_ts_bf16_routed_moe",
+        "prims_ts_fp4_block_scale_moe",
+        "prims_ts_fp4_block_scale_routed_moe",
+        "prims_ts_fp8_block_scale_moe",
+        "prims_ts_fp8_block_scale_routed_moe",
+        "prims_ts_fp8_per_tensor_scale_moe",
+    }
+)
+
+
+def __getattr__(name: str):
+    if name not in _PRIMS_TS_LAZY_EXPORTS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    from . import fused_moe as _fused_moe
+
+    value = getattr(_fused_moe, name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | _PRIMS_TS_LAZY_EXPORTS)
+
+
 # CuteDSL high-level APIs (conditionally if cute_dsl available)
 with contextlib.suppress(ImportError):
     from .fused_moe import (
@@ -133,6 +171,8 @@ with contextlib.suppress(ImportError):
         CuteDslBf16MoEWrapper as CuteDslBf16MoEWrapper,
     )
     from .gdn_prefill import chunk_gated_delta_rule as chunk_gated_delta_rule
+from .gdn2_prefill import chunk_gated_delta_rule2 as chunk_gated_delta_rule2
+from .gdp_prefill import chunk_gated_delta_product as chunk_gated_delta_product
 
 
 # The fused GDN decode step is surfaced here like the other GDN APIs; the

@@ -22,7 +22,7 @@ from typing import Any, Literal, Optional, cast
 
 import torch
 
-from flashinfer.api_logging import flashinfer_api
+from flashinfer.api_logging import flashinfer_experimental_api
 from flashinfer.trace.templates.attention import (
     prims_ts_decode_mla_one_shot_trace_dispatch,
     prims_ts_decode_mla_trace_dispatch,
@@ -30,10 +30,6 @@ from flashinfer.trace.templates.attention import (
 )
 
 from .balanced_scheduler.gate import should_use_prims_ts_balanced_mla
-from ._tensor_aliasing import (
-    _validate_out_does_not_overlap_inputs,
-    _validate_tensor_does_not_overlap_inputs,
-)
 from .decode import (
     _WorkspaceSection,
     _align_up,
@@ -1520,27 +1516,6 @@ def _prepare_mla_runtime(
     )
 
 
-def _validate_mla_output_aliasing(
-    runtime: _MLARuntime,
-    *,
-    block_tables: torch.Tensor,
-    seq_lens: torch.Tensor,
-    qo_indptr: Optional[torch.Tensor],
-    workspace_buffer: torch.Tensor,
-) -> None:
-    """Keep output disjoint from every live MLA decode allocation."""
-
-    _validate_out_does_not_overlap_inputs(
-        runtime.out,
-        ("query", runtime.query),
-        ("kv_cache", runtime.normalized_cache),
-        ("block_tables", block_tables),
-        ("seq_lens", seq_lens),
-        ("qo_indptr", qo_indptr),
-        ("workspace_buffer", workspace_buffer),
-    )
-
-
 def _launch_mla_decode(
     runtime: _MLARuntime,
     *,
@@ -1612,7 +1587,7 @@ def _launch_mla_decode(
     return runtime.out
 
 
-@flashinfer_api(trace=prims_ts_decode_mla_trace_dispatch)
+@flashinfer_experimental_api(trace=prims_ts_decode_mla_trace_dispatch)
 def prims_ts_batch_mla_decode_with_kv_cache(
     query: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -1651,7 +1626,8 @@ def prims_ts_batch_mla_decode_with_kv_cache(
     KV row ``seq_lens[b] - q_len[b] + i`` for request ``b``.
 
     The workspace is exclusive to one in-flight launch or captured graph and
-    must not overlap query, K/V cache, metadata, or output storage.
+    must not overlap query, K/V cache, metadata, or output storage. Output must
+    also be disjoint from every input; storage overlap is not checked.
     Runtime K/V lengths must remain positive and no larger than ``max_seq_len``;
     this hot path deliberately performs no device-to-host metadata reads. For
     packed launches, callers must ensure that offsets start at zero, are
@@ -1767,7 +1743,6 @@ def prims_ts_batch_mla_decode_with_kv_cache(
         device=query.device,
         required_bytes=layout.total_bytes,
     )
-    caller_provided_out = out is not None
     runtime = _prepare_mla_runtime(
         query,
         normalized_cache,
@@ -1786,24 +1761,6 @@ def prims_ts_batch_mla_decode_with_kv_cache(
         out=out,
         validate=True,
     )
-    _validate_tensor_does_not_overlap_inputs(
-        workspace_buffer,
-        "workspace_buffer",
-        ("query", runtime.query),
-        ("kv_cache", runtime.normalized_cache),
-        ("block_tables", block_tables),
-        ("seq_lens", seq_lens),
-        ("qo_indptr", qo_indptr),
-        ("out", runtime.out),
-    )
-    if caller_provided_out:
-        _validate_mla_output_aliasing(
-            runtime,
-            block_tables=block_tables,
-            seq_lens=seq_lens,
-            qo_indptr=qo_indptr,
-            workspace_buffer=workspace_buffer,
-        )
     compile_spec = _make_mla_decode_compile_spec(
         spec,
         device_index=device_index,
@@ -1835,7 +1792,7 @@ def prims_ts_batch_mla_decode_with_kv_cache(
 class BatchMLADecodePagedTSWrapper:
     """Compile and reuse task-scheduled paged MLA decode launches."""
 
-    @flashinfer_api
+    @flashinfer_experimental_api
     def __init__(self) -> None:
         """Initialize an unplanned task-scheduled paged-MLA wrapper."""
         self._plan_state: Optional[_MLADecodePlanState] = None
@@ -2076,7 +2033,7 @@ class BatchMLADecodePagedTSWrapper:
             planned_seq_lens=planned_seq_lens,
         )
 
-    @flashinfer_api
+    @flashinfer_experimental_api
     def plan(
         self,
         device: int | str | torch.device,
@@ -2151,7 +2108,7 @@ class BatchMLADecodePagedTSWrapper:
             workspace_buffer=workspace_buffer,
         )
 
-    @flashinfer_api
+    @flashinfer_experimental_api
     def plan_balanced(
         self,
         device: int | str | torch.device,
@@ -2272,7 +2229,7 @@ class BatchMLADecodePagedTSWrapper:
             balanced_seq_lens=seq_lens,
         )
 
-    @flashinfer_api
+    @flashinfer_experimental_api
     def plan_auto(
         self,
         device: int | str | torch.device,
@@ -2373,7 +2330,7 @@ class BatchMLADecodePagedTSWrapper:
         )
         return use_balanced
 
-    @flashinfer_api
+    @flashinfer_experimental_api
     def schedule(
         self,
         seq_lens: torch.Tensor,
@@ -2424,7 +2381,7 @@ class BatchMLADecodePagedTSWrapper:
         )
         self._plan_state = replace(state, planned_seq_lens=normalized)
 
-    @flashinfer_api(trace=prims_ts_decode_mla_wrapper_trace_dispatch)
+    @flashinfer_experimental_api(trace=prims_ts_decode_mla_wrapper_trace_dispatch)
     def run(
         self,
         query: torch.Tensor,
@@ -2443,13 +2400,16 @@ class BatchMLADecodePagedTSWrapper:
         ``block_tables`` and ``seq_lens`` are required per-run bindings.
         ``qo_indptr`` is required by a packed-query plan and rejected by a
         fixed-query plan. With validation enabled, tensor structure, metadata
-        values, scales, aliases, and every static capacity are checked before
+        values, scales, and every static capacity are checked before
         launch. These checks synchronize metadata to the host. Set
         ``validate=False`` only after validating representative inputs, and use
         it for ``torch.compile`` or CUDA graph capture. For a balanced plan,
         nonvalidating execution requires live ``seq_lens`` to match the most
         recently planned lengths; that invariant cannot be checked without
         synchronizing.
+
+        In either mode, output and workspace must be disjoint from each other
+        and from all inputs. Storage overlap is not checked.
 
         Parameters
         ----------
@@ -2485,7 +2445,6 @@ class BatchMLADecodePagedTSWrapper:
         if not isinstance(validate, bool):
             raise TypeError("validate must be a bool")
         runtime_qo_indptr = qo_indptr if state.packed_query else None
-        caller_provided_out = out is not None
         runtime = _prepare_mla_runtime(
             query,
             kv_cache,
@@ -2512,24 +2471,6 @@ class BatchMLADecodePagedTSWrapper:
                 seq_lens,
                 qo_indptr,
             )
-            _validate_tensor_does_not_overlap_inputs(
-                state.workspace_buffer,
-                "workspace_buffer",
-                ("query", runtime.query),
-                ("kv_cache", runtime.normalized_cache),
-                ("block_tables", block_tables),
-                ("seq_lens", seq_lens),
-                ("qo_indptr", runtime_qo_indptr),
-                ("out", runtime.out),
-            )
-            if caller_provided_out:
-                _validate_mla_output_aliasing(
-                    runtime,
-                    block_tables=block_tables,
-                    seq_lens=seq_lens,
-                    qo_indptr=runtime_qo_indptr,
-                    workspace_buffer=state.workspace_buffer,
-                )
         return _launch_mla_decode(
             runtime,
             block_tables=block_tables,
@@ -2544,7 +2485,7 @@ class BatchMLADecodePagedTSWrapper:
         )
 
 
-@flashinfer_api(trace=prims_ts_decode_mla_one_shot_trace_dispatch)
+@flashinfer_experimental_api(trace=prims_ts_decode_mla_one_shot_trace_dispatch)
 def batch_mla_decode_with_paged_kv_cache(
     query: torch.Tensor,
     kv_cache: torch.Tensor,

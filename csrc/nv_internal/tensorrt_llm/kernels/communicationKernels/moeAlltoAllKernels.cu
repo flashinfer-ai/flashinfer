@@ -379,19 +379,32 @@ __device__ void vectorized_dispatch(uint8_t const* src_ptr, int bytes_per_token,
                                     int max_tokens_per_rank, int payload_idx,
                                     DispatchKernelPointers const& ptrs,
                                     int const* topk_target_ranks, int const* topk_send_indices) {
-  if (bytes_per_token % 16 == 0) {
+  // Receive planes are packed without vector-width padding. A small preceding
+  // payload can misalign the next plane even when its row size is divisible by
+  // 16. Token offsets are multiples of bytes_per_token, so checking every base
+  // together with the row size preserves wide copies exactly where safe.
+  uintptr_t copy_alignment =
+      reinterpret_cast<uintptr_t>(src_ptr) | static_cast<uintptr_t>(bytes_per_token);
+#pragma unroll
+  for (int k = 0; k < TOP_K; ++k) {
+    if (topk_send_indices[k] >= 0) {
+      copy_alignment |=
+          reinterpret_cast<uintptr_t>(ptrs.recv_buffers[topk_target_ranks[k]][payload_idx]);
+    }
+  }
+  if (copy_alignment % 16 == 0) {
     vectorized_dispatch_impl<16, TOP_K>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank,
                                         payload_idx, ptrs, topk_target_ranks, topk_send_indices,
                                         threadIdx.x, blockDim.x);
-  } else if (bytes_per_token % 8 == 0) {
+  } else if (copy_alignment % 8 == 0) {
     vectorized_dispatch_impl<8, TOP_K>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank,
                                        payload_idx, ptrs, topk_target_ranks, topk_send_indices,
                                        threadIdx.x, blockDim.x);
-  } else if (bytes_per_token % 4 == 0) {
+  } else if (copy_alignment % 4 == 0) {
     vectorized_dispatch_impl<4, TOP_K>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank,
                                        payload_idx, ptrs, topk_target_ranks, topk_send_indices,
                                        threadIdx.x, blockDim.x);
-  } else if (bytes_per_token % 2 == 0) {
+  } else if (copy_alignment % 2 == 0) {
     vectorized_dispatch_impl<2, TOP_K>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank,
                                        payload_idx, ptrs, topk_target_ranks, topk_send_indices,
                                        threadIdx.x, blockDim.x);

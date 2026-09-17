@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import importlib
 import warnings
 
 # Unified MoE API
@@ -46,6 +47,9 @@ from .api import (  # noqa: F401
     CutlassW4A16Config,
     CutlassW4A8Config,
     CuTileBf16Config,
+    CuTileMxfp4Bf16Config,
+    CuTileMxfp4Config,
+    CuTileNvfp4Bf16Config,
     CuTileNvfp4Config,
     ExecutionConfig,
     ExpertConfig,
@@ -55,7 +59,6 @@ from .api import (  # noqa: F401
     MoEWeightPack,
     QuantConfig,
     QuantFormat,
-    QuantVariant,
     RoutingConfig,
     TrtllmBf16Config,
     TrtllmFp4Config,
@@ -83,6 +86,9 @@ from .runners import (  # noqa: F401
     CutlassW4A16Runner,
     CutlassW4A8Runner,
     CuTileBf16Runner,
+    CuTileMxfp4Bf16Runner,
+    CuTileMxfp4Runner,
+    CuTileNvfp4Bf16Runner,
     CuTileNvfp4Runner,
     CuteDslRunner,
     TrtllmBf16RoutedRunner,
@@ -92,7 +98,25 @@ from .runners import (  # noqa: F401
     TrtllmMxInt4RoutedRunner,
 )
 
-# Legacy flat-argument APIs (unchanged, not deprecated)
+# Legacy flat-argument Prims-TS APIs are imported on first use. Keeping them
+# lazy prevents a plain ``import flashinfer`` from importing CUTLASS Task
+# Scheduling and applying its process-wide WorkTileInfo customization.
+_PRIMS_TS_LAZY_EXPORTS = {
+    "prims_ts_bf16_moe": ".backends.prims_ts.bf16_op",
+    "prims_ts_bf16_routed_moe": ".backends.prims_ts.bf16_op",
+    "prims_ts_fp8_block_scale_moe": ".backends.prims_ts.fp8_op",
+    "prims_ts_fp8_block_scale_routed_moe": ".backends.prims_ts.fp8_op",
+    "prims_ts_fp8_per_tensor_scale_moe": ".backends.prims_ts.fp8_op",
+    "prims_ts_fp4_block_scale_moe": ".backends.prims_ts.fp4_op",
+    "prims_ts_fp4_block_scale_routed_moe": ".backends.prims_ts.fp4_op",
+}
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | _PRIMS_TS_LAZY_EXPORTS.keys())
+
+
+# Other legacy flat-argument APIs (unchanged, not deprecated)
 from .core import (
     RoutingInputMode,
     TrtllmMoERoutingMetadata,
@@ -135,8 +159,19 @@ from ..tllm_enums import (
     RoutingMethodType,
 )
 
+from .alphamoe_sm100 import (  # noqa: F401
+    alphamoe_fp8_block_scale_aligned_moe as alphamoe_fp8_block_scale_aligned_moe,
+    alphamoe_interleave_gated_weights as alphamoe_interleave_gated_weights,
+)
+
 from .fused_routing_dsv3 import (  # noqa: F401
     fused_topk_deepseek as fused_topk_deepseek,
+)
+
+from .alphamoe_fused_router import (  # noqa: F401
+    AlphaMoERoutePlan as AlphaMoERoutePlan,
+    allocate_alphamoe_route_plan as allocate_alphamoe_route_plan,
+    alphamoe_fused_router as alphamoe_fused_router,
 )
 
 from .hash_topk import (  # noqa: F401
@@ -189,6 +224,11 @@ except ImportError:
 
 
 def __getattr__(name: str):
+    module_name = _PRIMS_TS_LAZY_EXPORTS.get(name)
+    if module_name is not None:
+        value = getattr(importlib.import_module(module_name, __name__), name)
+        globals()[name] = value
+        return value
     if name == "CuteDslNvfp4Runner":
         warnings.warn(
             "CuteDslNvfp4Runner is deprecated; use CuteDslRunner instead.",
@@ -200,6 +240,8 @@ def __getattr__(name: str):
 
 
 __all__ = [
+    "alphamoe_fp8_block_scale_aligned_moe",
+    "alphamoe_interleave_gated_weights",
     # Typed activation values
     "ActivationConfig",
     "GELU",
@@ -241,6 +283,12 @@ __all__ = [
     "CutlassW4A8Runner",
     "CuTileBf16Config",
     "CuTileBf16Runner",
+    "CuTileMxfp4Bf16Config",
+    "CuTileMxfp4Bf16Runner",
+    "CuTileMxfp4Config",
+    "CuTileMxfp4Runner",
+    "CuTileNvfp4Bf16Config",
+    "CuTileNvfp4Bf16Runner",
     "CuTileNvfp4Config",
     "CuTileNvfp4Runner",
     "ExecutionConfig",
@@ -267,7 +315,6 @@ __all__ = [
     "TrtllmMxInt4RoutedRunner",
     "QuantConfig",
     "QuantFormat",
-    "QuantVariant",
     "RoutingConfig",
     "TrtllmBf16Config",
     "TrtllmFp4Config",
@@ -292,6 +339,13 @@ __all__ = [
     "gen_trtllm_gen_fused_moe_sm100_module",
     "reorder_rows_for_gated_act_gemm",
     "trtllm_bf16_moe",
+    "prims_ts_bf16_moe",
+    "prims_ts_bf16_routed_moe",
+    "prims_ts_fp4_block_scale_moe",
+    "prims_ts_fp4_block_scale_routed_moe",
+    "prims_ts_fp8_block_scale_moe",
+    "prims_ts_fp8_block_scale_routed_moe",
+    "prims_ts_fp8_per_tensor_scale_moe",
     "trtllm_bf16_routed_moe",
     "trtllm_fp4_block_scale_moe",
     "trtllm_fp4_block_scale_routed_moe",
@@ -304,6 +358,9 @@ __all__ = [
     "trtllm_mxint4_block_scale_moe",
     "trtllm_mxint4_block_scale_routed_moe",
     "fused_topk_deepseek",
+    "AlphaMoERoutePlan",
+    "allocate_alphamoe_route_plan",
+    "alphamoe_fused_router",
     "hash_topk",
     "TrtllmGenRoutingResult",
     "trtllm_gen_routing",

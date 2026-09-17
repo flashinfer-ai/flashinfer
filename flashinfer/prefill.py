@@ -17,6 +17,8 @@ limitations under the License.
 import functools
 import logging
 import math
+import os
+import threading
 from types import SimpleNamespace
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union, overload
 
@@ -24,7 +26,9 @@ import torch
 
 from .api_logging import flashinfer_api
 from .cudnn import cudnn_batch_prefill_with_kv_cache
+from .cudnn.prefill import _cudnn_supports_direct_seqlens
 from .jit import (
+    MissingJITCacheError,
     gen_batch_prefill_module,
     gen_customize_batch_prefill_module,
     gen_fmha_cutlass_sm100a_module,
@@ -36,7 +40,16 @@ from .jit import (
     get_single_prefill_uri,
     setup_cubin_loader,
 )
+from .jit.attention.modules import (
+    BatchPrefillModuleSurface,
+    BatchPrefillPagedKVStrideMode,
+    _gen_batch_prefill_independent_paged_module,
+    _gen_batch_prefill_primary_module,
+)
 from .jit.attention.utils import _is_nvfp4_kv_dtype
+from .mla import (
+    trtllm_prefill_with_kv_cache_mla as trtllm_prefill_with_kv_cache_mla,
+)
 from .page import get_seq_lens
 from .quantization import packbits, segment_packbits
 from .trace.templates.attention import (
@@ -70,6 +83,8 @@ from .utils import (
     _unpack_paged_kv_cache,
     canonicalize_torch_dtype,
     ceil_div,
+    check_lse_base,
+    check_lse_layout,
     check_shape_dtype_device,
     determine_attention_backend,
     device_support_pdl,
@@ -80,6 +95,7 @@ from .utils import (
     is_sm12x_supported,
     is_sm100a_supported,
     is_sm110a_supported,
+    ln2,
     log2e,
     prepare_jit_additional_args,
     register_custom_op,
@@ -87,6 +103,49 @@ from .utils import (
     round_up,
     check_trtllm_gen_sm107_only_feature,
 )
+
+
+def _stage_lse(
+    lse: Optional[torch.Tensor], lse_layout: str, return_lse: bool, q: torch.Tensor
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """Kernels write ``[tokens, heads]``. For ``"HN"`` a caller's buffer is the
+    finisher's ``[heads, tokens]`` destination and the kernel gets a fresh NH
+    buffer; returns ``(lse_for_kernel, lse_out)``."""
+    if not return_lse or lse_layout != "HN":
+        return lse, None
+    if lse is not None:
+        check_shape_dtype_device(
+            lse, (q.size(1), q.size(0)), torch.float32, q.device, "lse"
+        )
+        if not lse.is_contiguous():
+            raise ValueError('lse for lse_layout="HN" must be contiguous')
+    return None, lse
+
+
+def _finish_lse(
+    lse: torch.Tensor,
+    lse_base: str,
+    lse_layout: str,
+    lse_out: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Kernels write base-2 LSE as ``[tokens, heads]``; deliver the requested base and layout.
+
+    ``lse_out`` is the caller's buffer in the requested layout, if any. ``"NH"`` is
+    finished in place; ``"HN"`` is one fused transpose(+rescale) into a contiguous
+    ``[heads, tokens]`` tensor.
+    """
+    if lse_layout == "NH":
+        if lse_base == "ln":
+            lse.mul_(ln2)
+        return lse
+    src = lse.t()
+    if lse_out is None:
+        lse_out = torch.empty(src.shape, dtype=lse.dtype, device=lse.device)
+    if lse_base == "ln":
+        torch.mul(src, ln2, out=lse_out)
+    else:
+        lse_out.copy_(src)
+    return lse_out
 
 
 def _split_scale_param(scale):
@@ -196,6 +255,8 @@ def get_customize_batch_prefill_module(
     use_logits_soft_cap: bool = False,
     use_fp16_qk_reduction: bool = False,
     fp8_enabled: bool = False,
+    paged_kv_stride_mode: BatchPrefillPagedKVStrideMode = "runtime",
+    module_surface: BatchPrefillModuleSurface = "full",
 ):
     return gen_customize_batch_prefill_module(
         backend,
@@ -217,6 +278,8 @@ def get_customize_batch_prefill_module(
         use_logits_soft_cap,
         use_fp16_qk_reduction,
         fp8_enabled,
+        paged_kv_stride_mode=paged_kv_stride_mode,
+        module_surface=module_surface,
     ).build_and_load()
 
 
@@ -224,7 +287,8 @@ def get_customize_batch_prefill_module(
 def get_trtllm_gen_prefill_module():
     mod = gen_trtllm_gen_fmha_module()
     op = mod.build_and_load()
-    setup_cubin_loader(mod.get_library_path())
+    for library_path in mod.get_library_paths():
+        setup_cubin_loader(library_path)
 
     def _paged_run(
         query: torch.Tensor,
@@ -455,13 +519,80 @@ def get_single_prefill_module(backend, *args):
     return SimpleNamespace(run=run_single_prefill)
 
 
+class _LazyBatchPrefillIndependentModule:
+    """Load one independent-stride batch-prefill module on first eager use."""
+
+    def __init__(self, spec: Any) -> None:
+        self._spec = spec
+        self._lock = threading.Lock()
+        self._module: Optional[Any] = None
+
+    @property
+    def is_loaded(self) -> bool:
+        """Whether this holder already has an in-process loaded module."""
+        return self._module is not None
+
+    @staticmethod
+    def _check_not_capturing() -> None:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "The lazy independent paged-KV-stride module cannot be compiled "
+                "or loaded during CUDA graph capture. Call "
+                "prewarm_paged_kv_stride_variant('independent') after plan() "
+                "and before capture."
+            )
+
+    def get(self) -> Any:
+        """Return the loaded module, building it once outside graph capture."""
+        module = self._module
+        if module is not None:
+            return module
+
+        self._check_not_capturing()
+        with self._lock:
+            module = self._module
+            if module is not None:
+                return module
+            self._check_not_capturing()
+            try:
+                module = self._spec.build_and_load()
+            except MissingJITCacheError as exc:
+                raise MissingJITCacheError(
+                    "Unequal K/V data strides require FlashInfer's lazy "
+                    "independent paged module, which is not included in the "
+                    "default JIT cache. Use equal-stride K/V tensors, enable "
+                    "local JIT and call "
+                    "prewarm_paged_kv_stride_variant('independent') after "
+                    "plan(), or install a compatible independent-module cache "
+                    "package when one becomes available.",
+                    spec=exc.spec,
+                ) from exc
+            self._module = module
+            return module
+
+    def prewarm(self) -> None:
+        """Eagerly load the independent module for later graph capture."""
+        self.get()
+
+
 @functools.cache
 def get_batch_prefill_module(backend, *args):
+    lazy_independent_module: Optional[_LazyBatchPrefillIndependentModule] = None
     if backend == "trtllm-gen":
         uri = "trtllm_gen_context"
         module = get_trtllm_gen_prefill_module()
         plan_func = module.plan
         workspace_size_func = None
+        ragged_run_func = module.ragged_run
+        paged_run_func = module.paged_run
+    elif backend == "fa2":
+        uri = get_batch_prefill_uri(backend, *args)
+        module = _gen_batch_prefill_primary_module(backend, *args).build_and_load()
+        lazy_independent_module = _LazyBatchPrefillIndependentModule(
+            _gen_batch_prefill_independent_paged_module(backend, *args)
+        )
+        plan_func = module.plan
+        workspace_size_func = getattr(module, "workspace_size", None)
         ragged_run_func = module.ragged_run
         paged_run_func = module.paged_run
     else:
@@ -748,7 +879,12 @@ def get_batch_prefill_module(backend, *args):
             )
         elif backend == "fa2":
             assert not is_float8(q)
-            paged_run_func(
+            if tuple(paged_k_cache.stride()) == tuple(paged_v_cache.stride()):
+                routed_paged_run_func = paged_run_func
+            else:
+                assert lazy_independent_module is not None
+                routed_paged_run_func = lazy_independent_module.get().paged_run
+            routed_paged_run_func(
                 float_workspace_buffer,
                 int_workspace_buffer,
                 plan_info_vec,
@@ -896,11 +1032,23 @@ def get_batch_prefill_module(backend, *args):
     #
     # Note that plan is not part of model logic. It should not be included in
     # Cuda Graph or torch.compile. So, we don't provide a torch library for plan.
+    def prewarm_paged_kv_stride_variant(variant: str = "independent") -> None:
+        """Load the requested lazy paged-KV-stride variant before graph capture."""
+        if variant != "independent":
+            raise ValueError(f"variant must be 'independent', got {variant!r}")
+        if lazy_independent_module is None:
+            raise RuntimeError(
+                "Paged-KV-stride prewarm is available only for standard FA2 "
+                f"batch-prefill modules, got backend={backend!r}."
+            )
+        lazy_independent_module.prewarm()
+
     return SimpleNamespace(
         plan=plan_func,
         workspace_size=workspace_size_func,
         ragged_run=ragged_run,
         paged_run=paged_run,
+        prewarm_paged_kv_stride_variant=prewarm_paged_kv_stride_variant,
     )
 
 
@@ -1579,6 +1727,213 @@ def _build_block_tables_from_paged_kv_indices(
     return block_tables
 
 
+# Ragged-prefill `auto` on Blackwell: tried in this order, first eligible wins.
+#
+# NOTE this is an order over *capability*, not a cost model: the walk returns the
+# first backend whose kernel serves the problem, so a backend listed earlier wins
+# even where a later one is measurably faster. That is why the order is per-shape
+# below rather than a single global tuple.
+#
+# Measured on B200 (bf16, causal, 20 iters after 5 warmup, medians):
+#   d128 square    cuDNN 1.09-1.45x faster than CUTLASS -> cuDNN first
+#   d256 square    CUTLASS declines the shape entirely  -> cuDNN only
+#   d192/128 MHA   CUTLASS 1.09-1.12x faster than cuDNN -> CUTLASS first
+_BLACKWELL_RAGGED_AUTO_PREFERENCE = ("cudnn", "cutlass")
+
+# Per-shape overrides of the default order, keyed on
+# (head_dim_qk, head_dim_vo). Deliberately EMPTY: a head-dim key turned out to
+# be the wrong granularity.
+#
+# The 128-head d192/128 cell looked like a clean CUTLASS win at (b16, s4096) --
+# 14.16 vs 15.62 ms, reproduced over four runs. Sweeping the rest of that cell
+# on B200 showed the winner flips with sequence length and head config, not
+# head dim (medians, 30 iters after 10 warmup):
+#
+#   b4  s1024  128x128   CUTLASS 0.334   cuDNN 0.265   cuDNN  1.26x
+#   b16 s1024  128x128   CUTLASS 1.257   cuDNN 1.030   cuDNN  1.22x
+#   b64 s1024  128x128   CUTLASS 5.764   cuDNN 4.178   cuDNN  1.38x
+#   b8  s2048   32x8     CUTLASS 0.509   cuDNN 0.383   cuDNN  1.33x
+#   b8  s2048   64x8     CUTLASS 0.969   cuDNN 0.716   cuDNN  1.35x
+#   b1  s4096  128x128   CUTLASS 0.738   cuDNN 0.816   CUTLASS 1.11x
+#   b16 s4096  128x128   CUTLASS 14.061  cuDNN 15.818  CUTLASS 1.12x
+#   b4  s16384 128x128   CUTLASS 49.555  cuDNN 68.782  CUTLASS 1.39x
+#
+# cuDNN takes 5 of 8 -- every short-sequence case and every GQA case -- while
+# CUTLASS only leads long-sequence MHA. Pinning the whole head-dim to CUTLASS
+# would trade 1.22-1.38x away on the majority to win 1.11-1.39x on the rest, so
+# the default order stands and this table stays empty until a heuristic keyed on
+# the axes that actually discriminate (sequence length, MHA vs GQA) is measured
+# across architectures. Until then, callers who know their shape can pin the
+# order with the environment variable below.
+_BLACKWELL_RAGGED_AUTO_PREFERENCE_BY_HEAD_DIM: Dict[
+    Tuple[int, int], Tuple[str, ...]
+] = {}
+
+# Escape hatch: a comma-separated order (e.g. "cutlass,cudnn", or "cudnn" to pin
+# one backend) overrides both tables. Intended for benchmarking and regression
+# bisection on hardware whose ranking differs from the B200 numbers above --
+# eligibility is still enforced, so an unusable backend is skipped rather than
+# forced. Mirrors FLASHINFER_TOPK_ALGO's role for the top-k dispatcher.
+_RAGGED_AUTO_ORDER_ENV = "FLASHINFER_RAGGED_AUTO_BACKEND_ORDER"
+
+# (head_dim_qk, head_dim_vo) pairs validated against FA2 on the cuDNN path.
+_CUDNN_RAGGED_AUTO_HEAD_DIMS = frozenset({(128, 128), (192, 128), (256, 256)})
+
+# (head_dim_qk, head_dim_vo) pairs `auto` may route to CUTLASS. `DISPATCH_head_dim`
+# in csrc/fmha_cutlass_sm100.cu accepts exactly (192,128), (128,128) and (64,64);
+# the pairs are listed rather than tested as `head_dim_qk == 192`, which would
+# also admit unsupported shapes such as 192/192. (64,64) is inside the kernel's
+# domain but outside `auto`'s: this PR never measured it, so it stays on FA2
+# until someone does.
+_CUTLASS_RAGGED_AUTO_HEAD_DIMS = frozenset({(128, 128), (192, 128)})
+
+# `fmha_varlen_plan` allocates the CUTLASS work-index buffers at this fixed
+# capacity, and `plan_kernel` writes one entry per (qo_tile, head, batch) work
+# item without a bounds check, so a problem that generates more work items than
+# this overruns them. `auto` therefore treats capacity as an eligibility
+# condition and leaves oversized problems on another backend; an explicit
+# `backend="cutlass"` is unaffected and still hits the underlying limit.
+_CUTLASS_PLAN_WORK_CAPACITY = 131072
+_CUTLASS_PLAN_QO_TILE_SIZE = 256
+
+
+def _cutlass_plan_work_items(qo_indptr_host: torch.Tensor, num_qo_heads: int) -> int:
+    """Work items `fmha_varlen_plan` will emit: one per (qo_tile, head, batch).
+
+    Mirrors the loop nest in ``plan_kernel``. Computed from the host indptr
+    copy `plan()` already materialises, so it costs no extra device sync.
+    """
+    qo_lens = qo_indptr_host[1:] - qo_indptr_host[:-1]
+    tiles_per_request = (qo_lens + (_CUTLASS_PLAN_QO_TILE_SIZE - 1)) // (
+        _CUTLASS_PLAN_QO_TILE_SIZE
+    )
+    return int(tiles_per_request.sum().item()) * num_qo_heads
+
+
+def _blackwell_ragged_auto_order(head_dim_qk: int, head_dim_vo: int) -> Tuple[str, ...]:
+    """Backend preference order for this shape.
+
+    Resolution order: the ``FLASHINFER_RAGGED_AUTO_BACKEND_ORDER`` override, then
+    the per-shape table, then the global default. Read per call rather than
+    cached at import so a test or a sweep can change it without a fresh
+    interpreter.
+    """
+    override = os.environ.get(_RAGGED_AUTO_ORDER_ENV)
+    if override:
+        parsed = tuple(name.strip() for name in override.split(",") if name.strip())
+        if parsed:
+            return parsed
+    return _BLACKWELL_RAGGED_AUTO_PREFERENCE_BY_HEAD_DIM.get(
+        (head_dim_qk, head_dim_vo), _BLACKWELL_RAGGED_AUTO_PREFERENCE
+    )
+
+
+def _blackwell_ragged_auto_upgrade(
+    device: torch.device,
+    kv_layout: str,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    q_data_type: torch.dtype,
+    kv_data_type: torch.dtype,
+    o_data_type: torch.dtype,
+    pos_encoding_mode: int,
+    *,
+    has_custom_mask: bool,
+    window_left: int,
+    logits_soft_cap: float,
+    has_multi_item_scoring: bool,
+    has_sinks: bool,
+    cudnn_indptr_is_int32: bool,
+    cutlass_work_items: int,
+    cuda_graph_enabled: bool,
+    cutlass_indptr_is_int32: bool = False,
+    single_token_gqa: bool = False,
+) -> Optional[str]:
+    r"""Pick the Blackwell backend ``auto`` should upgrade FA2 to for ragged prefill.
+
+    Walks the order from :func:`_blackwell_ragged_auto_order` (per-shape table,
+    or the ``FLASHINFER_RAGGED_AUTO_BACKEND_ORDER`` override) and returns the
+    first backend whose kernel serves the problem exactly, or ``None`` to stay
+    on FA2. The walk tests *capability*, so the order decides the winner
+    wherever both candidates are eligible.
+
+    Both candidates' run paths receive only ``causal`` and the scales, so any
+    request for RoPE, a custom mask, a sliding window, a logits soft cap, the
+    multi-item-scoring pointers or attention sinks stashed on the wrapper
+    (vLLM's ``_sinks``) disqualifies every upgrade: selecting one would
+    silently drop the feature.
+
+    ``cudnn`` is chosen only when the installed cuDNN can consume the caller's
+    token-unit indptrs directly (``batch_offsets_units="tokens"``: they serve as
+    ``cu_seq_len_q/kv`` for the mask and as ragged offsets scaled in-engine).
+    That keeps the caller contract identical to every other backend and puts no
+    conversion kernel on the run path; older cuDNN falls through to ``cutlass``.
+
+    Every condition here is an *eligibility* test, never a deferred error: a
+    backend this function returns must be able to serve the call. Conditions the
+    backend would otherwise raise on later therefore belong in this walk, so
+    ``auto`` routes past them instead of failing (``cudnn_indptr_is_int32`` and
+    ``cutlass_work_items`` both exist for that reason).
+    """
+    if (
+        kv_layout != "NHD"
+        or q_data_type != kv_data_type
+        or pos_encoding_mode != PosEncodingMode.NONE.value
+        or has_custom_mask
+        or window_left >= 0
+        or logits_soft_cap != 0.0
+        or has_multi_item_scoring
+        or has_sinks
+    ):
+        return None
+    for backend in _blackwell_ragged_auto_order(head_dim_qk, head_dim_vo):
+        if backend == "cudnn":
+            if (
+                is_sm100a_supported(device)
+                # fp16 / bf16 only: the cuDNN run branch below takes the caller's
+                # tensors as they are, and the wrapper's fp8 handling (scales,
+                # descale tensors) lives on the paths after it.
+                and q_data_type in (torch.float16, torch.bfloat16)
+                and _cudnn_supports_direct_seqlens(q_data_type)
+                and (head_dim_qk, head_dim_vo) in _CUDNN_RAGGED_AUTO_HEAD_DIMS
+                # cuDNN reads the indptrs as int32. plan() can re-dtype them
+                # eagerly, but not buffers already registered with a captured
+                # graph, where it raises instead -- so in that case cuDNN
+                # cannot serve the call and must not be selected.
+                and cudnn_indptr_is_int32
+                # cuDNN's s_q == 1 kernel packs the q heads of a kv group and
+                # writes the LSE only for the first of them (cuDNN 9.26/9.27,
+                # NVBug 6783545); the output is right, the LSE is not, and run()
+                # does not know yet whether the caller wants it.
+                and not single_token_gqa
+            ):
+                return backend
+        elif backend == "cutlass":
+            if (
+                (is_sm100a_supported(device) or is_sm110a_supported(device))
+                and q_data_type in (torch.float16, torch.bfloat16)
+                # DISPATCH_DTYPE_IN_OUT only handles out == in for fp16/bf16;
+                # any other pairing falls into its FP8 branch, which a bf16 or
+                # fp16 input does not match, and the call dies on a check that
+                # reports unsupported *head dimensions*. Mismatched output
+                # dtype is therefore out of domain, not a slow path.
+                and o_data_type == q_data_type
+                # Both the planner and kernel read these buffers as int32.
+                # Device mirrors preserve the caller's dtype, so leave wider
+                # indices on a compatible backend instead of reinterpreting them.
+                and cutlass_indptr_is_int32
+                and (head_dim_qk, head_dim_vo) in _CUTLASS_RAGGED_AUTO_HEAD_DIMS
+                and cutlass_work_items <= _CUTLASS_PLAN_WORK_CAPACITY
+                # `fmha_varlen_plan` allocates fresh work-index buffers on every
+                # call, so a re-plan silently leaves a captured graph pointing at
+                # the previous allocation. Until those buffers are updated in
+                # place, CUTLASS is not graph-safe and `auto` stays away.
+                and not cuda_graph_enabled
+            ):
+                return backend
+    return None
+
+
 class BatchPrefillWithPagedKVCacheWrapper:
     r"""Wrapper class for prefill/append attention with paged kv-cache for batch of
     requests.
@@ -1670,7 +2025,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
     ...     o_custom = prefill_wrapper.run(q, kv_cache)
     ...     assert torch.allclose(o_custom, outputs[i], rtol=1e-3, atol=1e-3)
     ...
-
 
 
     Note
@@ -2254,8 +2608,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         ----------
         qo_indptr : torch.Tensor
             The indptr of the query/output tensor, shape: ``[batch_size + 1]``.
-            For the ``cudnn`` backend this is interpreted in **element units**
-            (``cumsum(seq_lens_q) * num_qo_heads * head_dim_qk``), not token units.
+            Token units for every backend, including ``cudnn`` (it previously took
+            element-unit offsets; that contract has been normalized).
         paged_kv_indptr : torch.Tensor
             The indptr of the paged kv-cache, shape: ``[batch_size + 1]``.
         paged_kv_indices : torch.Tensor
@@ -2754,6 +3108,38 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._seq_lens_kv = seq_lens
         self._seq_lens_q = seq_lens_q if seq_lens_q is not None else seq_lens
 
+    @flashinfer_api
+    def prewarm_paged_kv_stride_variant(self, variant: str = "independent") -> None:
+        r"""Load a lazy paged-KV-stride variant after :meth:`plan`.
+
+        Call this method before CUDA graph capture when a planned standard FA2
+        wrapper will receive K and V tensors with different data strides.
+
+        Parameters
+        ----------
+        variant : str
+            The paged-KV-stride variant to prewarm. The only supported value is
+            ``"independent"`` (the default), for K and V with different data strides.
+        """
+        if (
+            getattr(self, "_plan_info", None) is None
+            or getattr(self, "_cached_module", None) is None
+        ):
+            raise RuntimeError(
+                "plan() must complete before prewarming a paged-KV-stride variant."
+            )
+        if self._jit_module is not None:
+            raise RuntimeError(
+                "Paged-KV-stride prewarm is not supported for a custom JIT module."
+            )
+        if self._backend != "fa2":
+            raise RuntimeError(
+                "Paged-KV-stride prewarm requires a standard FA2 plan, "
+                f"got backend={self._backend!r}."
+            )
+        assert self._cached_module is not None
+        self._cached_module.prewarm_paged_kv_stride_variant(variant)
+
     begin_forward = plan
 
     def forward(
@@ -2793,6 +3179,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         return_lse: Literal[False] = False,
+        lse_base: str = "log2",
+        lse_layout: str = "NH",
         enable_pdl: Optional[bool] = None,
         window_left: Optional[int] = None,
         sinks: Optional[torch.Tensor] = None,
@@ -2815,6 +3203,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         return_lse: Literal[True] = True,
+        lse_base: str = "log2",
+        lse_layout: str = "NH",
         enable_pdl: Optional[bool] = None,
         window_left: Optional[int] = None,
         sinks: Optional[torch.Tensor] = None,
@@ -2838,6 +3228,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         return_lse: bool = False,
+        lse_base: str = "log2",
+        lse_layout: str = "NH",
         enable_pdl: Optional[bool] = None,
         window_left: Optional[int] = None,
         sinks: Optional[torch.Tensor] = None,
@@ -2882,6 +3274,17 @@ class BatchPrefillWithPagedKVCacheWrapper:
             The log-sum-exp of attention logits, if not provided, will be allocated internally.
         return_lse : bool
             Whether to return the logsumexp of attention output
+        lse_base : str
+            Base of the returned ``lse`` when :attr:`return_lse` is ``True``:
+            ``"log2"`` (default, FlashInfer's convention, ``max + log2(sum(exp2(...)))``)
+            or ``"ln"`` (natural log, the ``torch.logsumexp`` convention that merge
+            kernels written with ``expf`` consume). ``"ln"`` lets the cuDNN backend hand
+            out its native stats without a conversion kernel; the other backends rescale.
+        lse_layout : str
+            Layout of the returned ``lse``: ``"NH"`` (default) is
+            ``[qo_indptr[-1], num_qo_heads]``, ``"HN"`` is the contiguous transpose
+            ``[num_qo_heads, qo_indptr[-1]]`` (one fused transpose + rescale kernel).
+            A caller-provided :attr:`lse` must have the requested layout.
         enable_pdl : bool
             Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
             Only effective on backends and devices that support PDL.
@@ -2938,21 +3341,31 @@ class BatchPrefillWithPagedKVCacheWrapper:
             If :attr:`return_lse` is ``True``, a tuple of two tensors:
 
             * The attention output, shape: ``[qo_indptr[-1], num_qo_heads, head_dim]``.
-            * The logsumexp of attention output, shape: ``[qo_indptr[-1], num_qo_heads]``.
+            * The logsumexp of attention output, shape: ``[qo_indptr[-1], num_qo_heads]``
+              (``lse_layout="NH"``, default) or ``[num_qo_heads, qo_indptr[-1]]``
+              (``"HN"``), in the base selected by :attr:`lse_base`.
         """
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q.device)
         k_cache, v_cache = _unpack_paged_kv_cache(paged_kv_cache, self._kv_layout)
+        check_lse_base(lse_base)
+        check_lse_layout(lse_layout)
         _check_cached_qkv_data_type(
             q, k_cache, self._cached_q_data_type, self._cached_kv_data_type
         )
         # Validate q shape matches qo_indptr (using value cached in plan() to avoid GPU sync)
         if self._backend == "cudnn":
-            if q.numel() != self._qo_indptr_last:
+            if q.size(0) != self._qo_indptr_last:
+                hint = ""
+                if q.numel() == self._qo_indptr_last:
+                    hint = (
+                        " qo_indptr looks like element-unit offsets "
+                        "(total_tokens * num_heads * head_dim); the cudnn backend now "
+                        "takes token-unit qo_indptr, like every other backend."
+                    )
                 raise ValueError(
-                    f"q.numel() ({q.numel()}) does not match qo_indptr[-1] ({self._qo_indptr_last}). "
-                    f"For cudnn paged prefill, qo_indptr uses element offsets "
-                    f"(total_tokens * num_heads * head_dim)."
+                    f"q.shape[0] ({q.size(0)}) does not match qo_indptr[-1] ({self._qo_indptr_last})."
+                    + hint
                 )
         else:
             if q.size(0) != self._qo_indptr_last:
@@ -2996,13 +3409,17 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 # cute-dsl route's convention (the kernel's native scratch
                 # is fp16; the copy-out converts).
                 out = torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
-            return self._cute_dsl_wrapper.run_paged(
+            lse, lse_out = _stage_lse(lse, lse_layout, return_lse, q)
+            res = self._cute_dsl_wrapper.run_paged(
                 q,
                 (k_cache, v_cache),
                 out=out,
                 return_lse=return_lse,
                 lse=lse,
             )
+            if isinstance(res, tuple):
+                return res[0], _finish_lse(res[1], lse_base, lse_layout, lse_out)
+            return res
         elif self._backend == "cute-dsl-prims":
             if args:
                 raise NotImplementedError(
@@ -3038,7 +3455,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     device=q.device,
                 )
             assert self._prims_backend is not None
-            return self._prims_backend.run_paged(
+            lse, lse_out = _stage_lse(lse, lse_layout, return_lse, q)
+            res = self._prims_backend.run_paged(
                 q,
                 k_cache,
                 v_cache,
@@ -3050,6 +3468,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 k_scale=k_scale,
                 v_scale=v_scale,
             )
+            if isinstance(res, tuple):
+                return res[0], _finish_lse(res[1], lse_base, lse_layout, lse_out)
+            return res
 
         check_trtllm_gen_sm107_only_feature(
             use_fp16_softmax, "use_fp16_softmax", q.device
@@ -3100,6 +3521,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             rope_scale = 1.0
         if rope_theta is None:
             rope_theta = 1e4
+        lse, lse_out = _stage_lse(lse, lse_layout, return_lse, q)
         if return_lse:
             if lse is None:
                 lse = torch.empty(
@@ -3168,17 +3590,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
             if self._seq_lens_kv is not None and self._seq_lens_kv.dim() == 1:
                 self._seq_lens_kv = self._seq_lens_kv.reshape(self._batch_size, 1, 1, 1)
 
-            # qo_indptr is element-unit (tokens * num_qo_heads * head_dim_qk). The O
-            # ragged offset is strided by head_dim_vo, so when head_dim_qk !=
-            # head_dim_vo the Q offset cannot be reused for O -- rescale it (only in
-            # that case, so the common head_dim_qk == head_dim_vo path is unchanged).
-            head_dim_qk = q.shape[-1]
-            head_dim_vo = out.shape[-1]
-            if head_dim_qk == head_dim_vo:
-                o_indptr = self._qo_indptr_buf
-            else:
-                o_indptr = self._qo_indptr_buf // head_dim_qk * head_dim_vo
-
+            # qo_indptr is token-unit (like every other backend). The low level
+            # consumes it directly as cu_seq_len_q / the Q and O ragged offsets,
+            # applying the per-tensor (num_heads * head_dim) multipliers itself, so
+            # head_dim_qk != head_dim_vo is handled without any offset rescaling.
             cudnn_batch_prefill_with_kv_cache(
                 q,
                 k_cache,  # Need to be changed
@@ -3192,11 +3607,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 block_tables=self._block_tables,
                 causal=self._causal,
                 return_lse=return_lse,
+                lse_base=lse_base,
                 q_scale=q_scale,
                 k_scale=k_scale,
                 v_scale=v_scale,
                 batch_offsets_q=self._qo_indptr_buf,
-                batch_offsets_o=o_indptr,
+                batch_offsets_units="tokens",
                 out=out,
                 lse=lse,
                 o_data_type=out_dtype,
@@ -3333,6 +3749,14 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 else:
                     out *= v_scale
 
+        if return_lse:
+            # cuDNN already produced the requested base
+            lse = _finish_lse(
+                lse,
+                "log2" if self._backend == "cudnn" else lse_base,
+                lse_layout,
+                lse_out,
+            )
         return (out, lse) if return_lse else out
 
     run_return_lse = functools.partialmethod(run, return_lse=True)
@@ -3362,10 +3786,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._rope_scale = rope_scale
         self._rope_theta = rope_theta
         return self.run_return_lse(q, paged_kv_cache, k_scale=k_scale, v_scale=v_scale)
-
-    def end_forward(self) -> None:
-        r"""Warning: this function is deprecated and has no effect."""
-        pass
 
 
 def _compute_mask_indptr(
@@ -3532,7 +3952,16 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             or ``cute-dsl``/``cute-dsl-prims``/``cutile``.
             Defaults to ``auto``.
             If set to ``auto``, the wrapper will automatically choose the backend based on the
-            device architecture and kernel availability.
+            device architecture and kernel availability: ``fa3`` on Hopper where it applies,
+            ``fmha_v2`` for large-sequence MHA on SM120, and on SM100a ``cudnn`` (when the
+            installed cuDNN can consume token-unit indptrs directly, see
+            :func:`~flashinfer.cudnn.prefill._cudnn_supports_direct_seqlens`) or else
+            ``cutlass`` on SM100a/SM110a, for the head dims those kernels serve, when no
+            sliding window, logits soft cap, custom mask or multi-item-scoring pointer is in
+            play -- neither path accepts those, so ``auto`` stays on ``fa2`` for them.
+            Otherwise ``fa2``.
+            The ``cudnn`` backend takes ``qo_indptr``/``kv_indptr`` in the same **token**
+            units as every other backend, whether selected explicitly or via ``auto``.
             The ``cute-dsl`` backend uses the CuTe DSL attention kernel for Blackwell (SM100+).
             ``cute-dsl-prims`` is an explicit SM120-only packed FP8 prefill backend.
             The ``cutile`` backend uses the pure cuda.tile Python prefill kernel (Blackwell,
@@ -3649,8 +4078,14 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._custom_mask_buf = custom_mask_buf
         self._mask_indptr_buf = mask_indptr_buf
         self._max_total_num_rows: Optional[int] = None
+        # `auto` is re-resolved on every plan() (its answer depends on plan
+        # arguments such as window_left); _backend holds the resolved value.
+        self._requested_backend = backend
         self._backend = backend
         self._cached_module = None
+        # cudnn: stats ragged offset so the LSE lands packed as
+        # [total_tokens, num_qo_heads]; token-unit, so it is qo_indptr itself.
+        self._cudnn_stats_offsets: Optional[torch.Tensor] = None
 
     @property
     def is_cuda_graph_enabled(self) -> bool:
@@ -3722,10 +4157,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         ----------
         qo_indptr : torch.Tensor
             The indptr of the query/output tensor, shape: ``[batch_size + 1]``.
-            For the ``cudnn`` backend the ``qo_indptr`` and ``kv_indptr`` are
-            interpreted in **element units** (``cumsum(seq_lens) * num_heads *
-            head_dim_qk``), not token units. The ``cudnn`` backend also requires
-            ``kv_layout="NHD"``.
+            Token units for every backend, including ``cudnn`` (it previously took
+            element-unit offsets; that contract has been normalized). The ``cudnn``
+            backend also requires ``kv_layout="NHD"``.
         kv_indptr : torch.Tensor
             The indptr of the key/value tensor, shape: ``[batch_size + 1]``.
         num_qo_heads : int
@@ -3814,18 +4248,23 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         disable_split_kv : bool,
             Whether to disable the split-kv for determinism in CUDA Graph, defaults to ``False``.
         seq_lens: Optional[torch.Tensor]
-            A uint32 1D tensor indicating the kv sequence length of each prompt. shape: ``[batch_size]``.
+            Only used by the cudnn backend. A 1D int32 tensor with the kv sequence length
+            of each prompt, shape: ``[batch_size]``. Optional: cuDNN derives it from ``kv_indptr``.
         seq_lens_q: Optional[torch.Tensor]
-            A uint32 1D tensor indicating the q sequence length of each prompt. shape: ``[batch_size]``.
-            If not provided, will be set to the same value as ``seq_lens``.
+            Only used by the cudnn backend. A 1D int32 tensor with the q sequence length
+            of each prompt, shape: ``[batch_size]``. Optional: cuDNN derives it from ``qo_indptr``.
         max_token_per_sequence: Optional[int],
-            Required for cudnn backend. This is the scalar max token length of each sequence.
+            Only used by the cudnn backend. The max q length of any sequence; defaults to
+            ``max(qo_indptr[1:] - qo_indptr[:-1])``.
         max_sequence_kv: Optional[int],
-            Required for cudnn backend. This is the scalar max sequence length of each sequence in kv cache.
+            Only used by the cudnn backend. The max kv length of any sequence; defaults to
+            ``max(kv_indptr[1:] - kv_indptr[:-1])``.
         v_indptr: Optional[torch.Tensor]
-            Required for cudnn backend. This is the indptr of the value tensor.
+            Only used by the cudnn backend. Token-unit indptr of the value tensor;
+            defaults to ``kv_indptr``.
         o_indptr: Optional[torch.Tensor]
-            Required for cudnn backend. This is the indptr of the output tensor.
+            Only used by the cudnn backend. Token-unit indptr of the output tensor;
+            defaults to ``qo_indptr``.
         Note
         ----
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -4144,7 +4583,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         elif self._jit_module is not None:
             self._cached_module = self._jit_module
         else:
-            if self._backend == "auto":
+            if self._requested_backend == "auto":
                 self._backend = determine_attention_backend(
                     self.device,
                     PosEncodingMode[pos_encoding_mode].value,
@@ -4194,6 +4633,62 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 ):
                     self._backend = "fmha_v2"
 
+                # Blackwell: determine_attention_backend only ever answers
+                # fa3/fa2 and FA3 is Hopper-gated, so `auto` lands on FA2 here.
+                # Walk the explicit preference list (cudnn, then cutlass) and
+                # take the first backend whose kernel serves this problem
+                # exactly; none eligible -> stay on FA2. Explicit backends are
+                # never rewritten.
+                elif self._backend == "fa2":
+                    upgraded = _blackwell_ragged_auto_upgrade(
+                        self.device,
+                        self._kv_layout,
+                        head_dim_qk,
+                        head_dim_vo,
+                        q_data_type,
+                        kv_data_type,
+                        o_data_type,
+                        PosEncodingMode[pos_encoding_mode].value,
+                        has_custom_mask=self._custom_mask_buf is not None,
+                        window_left=window_left,
+                        logits_soft_cap=logits_soft_cap,
+                        has_multi_item_scoring=(
+                            prefix_len_ptr is not None
+                            or token_pos_in_items_ptr is not None
+                            or max_item_len_ptr is not None
+                        ),
+                        has_sinks=getattr(self, "_sinks", None) is not None,
+                        # Outside graph mode the cuDNN branch below converts a
+                        # non-int32 indptr in place, so any dtype is fine; under
+                        # capture it raises, and `auto` must route around that
+                        # rather than pick a backend that cannot run.
+                        cudnn_indptr_is_int32=(
+                            not self.is_cuda_graph_enabled
+                            or all(
+                                buf.dtype == torch.int32
+                                for buf in (
+                                    self._qo_indptr_buf,
+                                    self._kv_indptr_buf,
+                                    self._o_indptr_buf,
+                                    self._v_indptr_buf,
+                                )
+                            )
+                        ),
+                        cutlass_work_items=_cutlass_plan_work_items(
+                            qo_indptr_host, num_qo_heads
+                        ),
+                        cuda_graph_enabled=self.is_cuda_graph_enabled,
+                        cutlass_indptr_is_int32=(
+                            self._qo_indptr_buf.dtype == torch.int32
+                            and self._kv_indptr_buf.dtype == torch.int32
+                        ),
+                        single_token_gqa=(
+                            max_qo_len == 1 and num_qo_heads != num_kv_heads
+                        ),
+                    )
+                    if upgraded is not None:
+                        self._backend = upgraded
+
             get_module_args = (
                 q_data_type,
                 kv_data_type,
@@ -4217,9 +4712,12 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 self._fmha_v2_qo_indptr = self._qo_indptr_buf.to(torch.int32)
                 self._fmha_v2_kv_indptr = self._kv_indptr_buf.to(torch.int32)
             elif self._backend == "cutlass":
-                # insert qo_indptr.device to 9th position (0-indexed) of get_module_args
+                # insert the wrapper's device at the 9th position (0-indexed) of
+                # get_module_args. `self.device`, not `qo_indptr.device`: the
+                # caller may pass a host indptr, and the module has to be built
+                # for the device the kernel will run on.
                 new_get_module_args = (
-                    get_module_args[:9] + (qo_indptr.device,) + get_module_args[9:]
+                    get_module_args[:9] + (self.device,) + get_module_args[9:]
                 )
                 self._cached_module = get_fmha_module(*new_get_module_args)
             elif self._backend != "cudnn":
@@ -4227,11 +4725,59 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     self._backend, *get_module_args
                 )
 
-        if self._backend == "cutlass":
-            self._plan_info = fmha_varlen_plan(
-                self._cached_module, qo_indptr, kv_indptr, num_qo_heads, causal
+        if self._backend == "cudnn":
+            # The graph's padded dims default to the indptr diffs computed
+            # above, and cuDNN reads cu_seq_lens as int32. Done once here so
+            # run() launches no conversion kernel.
+            if self._max_token_per_sequence is None:
+                self._max_token_per_sequence = max_qo_len
+            if self._max_sequence_kv is None:
+                self._max_sequence_kv = max_seq_in_batch
+            indptr_bufs = (
+                self._qo_indptr_buf,
+                self._kv_indptr_buf,
+                self._o_indptr_buf,
+                self._v_indptr_buf,
             )
-            self._max_qo_len = torch.max(qo_indptr[1:] - qo_indptr[:-1]).item()
+            if any(buf.dtype != torch.int32 for buf in indptr_bufs):
+                if self.is_cuda_graph_enabled:
+                    raise ValueError(
+                        "the cudnn backend reads qo_indptr/kv_indptr (and o_indptr/"
+                        "v_indptr) as int32; pass int32 indptr buffers in CUDA-graph mode"
+                    )
+                # All four together: o/v default to aliases of q/kv taken above,
+                # so converting only q/kv would hand cuDNN mixed dtypes.
+                self._qo_indptr_buf = self._qo_indptr_buf.to(torch.int32)
+                self._kv_indptr_buf = self._kv_indptr_buf.to(torch.int32)
+                self._o_indptr_buf = self._o_indptr_buf.to(torch.int32)
+                self._v_indptr_buf = self._v_indptr_buf.to(torch.int32)
+            self._cudnn_stats_offsets = self._qo_indptr_buf
+
+        if self._backend == "cutlass":
+            if self.is_cuda_graph_enabled:
+                # `fmha_varlen_plan` allocates new work-index buffers per call,
+                # so a captured graph keeps pointing at the previous ones. The
+                # fix is to update them in place; until then, refuse rather than
+                # replay against a stale plan. `auto` never lands here -- it
+                # treats graph mode as CUTLASS-ineligible and routes elsewhere.
+                raise ValueError(
+                    "the cutlass backend allocates its plan buffers per plan() "
+                    "call and is not CUDA-graph safe; use backend='auto' to get "
+                    "a graph-safe backend, or an explicit 'cudnn'/'fa2'"
+                )
+            # Device mirrors, not the caller's tensors: in CUDA-graph mode the
+            # kernel reads the registered buffers, and a host-side indptr would
+            # otherwise be planned against.
+            self._plan_info = fmha_varlen_plan(
+                self._cached_module,
+                self._qo_indptr_buf,
+                self._kv_indptr_buf,
+                num_qo_heads,
+                causal,
+            )
+            self._max_qo_len = torch.max(
+                self._qo_indptr_buf[1:] - self._qo_indptr_buf[:-1]
+            ).item()
         elif self._backend == "fmha_v2":
             # fmha_v2 handles planning internally — no JIT module plan needed
             pass
@@ -4322,6 +4868,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         return_lse: Literal[False] = False,
+        lse_base: str = "log2",
+        lse_layout: str = "NH",
         enable_pdl: Optional[bool] = None,
         kv_cache_sf: Optional[
             Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
@@ -4338,6 +4886,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         return_lse: Literal[True] = True,
+        lse_base: str = "log2",
+        lse_layout: str = "NH",
         enable_pdl: Optional[bool] = None,
         kv_cache_sf: Optional[
             Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
@@ -4358,6 +4908,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         return_lse: bool = False,
+        lse_base: str = "log2",
+        lse_layout: str = "NH",
         enable_pdl: Optional[bool] = None,
         kv_cache_sf: Optional[
             Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
@@ -4390,6 +4942,17 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             The log-sum-exp of attention logits, if not provided, will be allocated internally.
         return_lse : bool
             Whether to return the logsumexp of attention output
+        lse_base : str
+            Base of the returned ``lse`` when :attr:`return_lse` is ``True``:
+            ``"log2"`` (default, FlashInfer's convention, ``max + log2(sum(exp2(...)))``)
+            or ``"ln"`` (natural log, the ``torch.logsumexp`` convention that merge
+            kernels written with ``expf`` consume). ``"ln"`` lets the cuDNN backend hand
+            out its native stats without a conversion kernel; the other backends rescale.
+        lse_layout : str
+            Layout of the returned ``lse``: ``"NH"`` (default) is
+            ``[qo_indptr[-1], num_qo_heads]``, ``"HN"`` is the contiguous transpose
+            ``[num_qo_heads, qo_indptr[-1]]`` (one fused transpose + rescale kernel).
+            A caller-provided :attr:`lse` must have the requested layout.
         enable_pdl : bool
             Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
             Only effective on backends and devices that support PDL.
@@ -4406,20 +4969,30 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             If :attr:`return_lse` is ``True``, a tuple of two tensors:
 
             * The attention output, shape: ``[qo_indptr[-1], num_qo_heads, head_dim_vo]``.
-            * The logsumexp of attention output, shape: ``[qo_indptr[-1], num_qo_heads]``.
+            * The logsumexp of attention output, shape: ``[qo_indptr[-1], num_qo_heads]``
+              (``lse_layout="NH"``, default) or ``[num_qo_heads, qo_indptr[-1]]``
+              (``"HN"``), in the base selected by :attr:`lse_base`.
         """
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q.device)
+        check_lse_base(lse_base)
+        check_lse_layout(lse_layout)
         _check_cached_qkv_data_type(
             q, k, self._cached_q_data_type, self._cached_kv_data_type
         )
         # Validate q shape matches qo_indptr (using value cached in plan() to avoid GPU sync)
         if self._backend == "cudnn":
-            if q.numel() != self._qo_indptr_last:
+            if q.size(0) != self._qo_indptr_last:
+                hint = ""
+                if q.numel() == self._qo_indptr_last:
+                    hint = (
+                        " qo_indptr looks like element-unit offsets "
+                        "(total_tokens * num_heads * head_dim); the cudnn backend now "
+                        "takes token-unit qo_indptr, like every other backend."
+                    )
                 raise ValueError(
-                    f"q.numel() ({q.numel()}) does not match qo_indptr[-1] ({self._qo_indptr_last}). "
-                    f"For cudnn ragged prefill, qo_indptr uses element offsets "
-                    f"(total_tokens * num_heads * head_dim)."
+                    f"q.shape[0] ({q.size(0)}) does not match qo_indptr[-1] ({self._qo_indptr_last})."
+                    + hint
                 )
         else:
             if q.size(0) != self._qo_indptr_last:
@@ -4452,6 +5025,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             rope_scale = 1.0
         if rope_theta is None:
             rope_theta = 1e4
+        lse, lse_out = _stage_lse(lse, lse_layout, return_lse, q)
         if return_lse:
             if lse is None:
                 lse = torch.empty(
@@ -4527,7 +5101,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 k_scale=k_scale,
                 v_scale=v_scale,
             )
-            return (out, lse) if return_lse else out
+            return (
+                (out, _finish_lse(lse, lse_base, lse_layout, lse_out))
+                if return_lse
+                else out
+            )
         elif self._backend == "fmha_v2":
             if return_lse:
                 raise NotImplementedError(
@@ -4610,7 +5188,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 bmm2_scale = (v_scale if v_scale is not None else 1.0) / (
                     o_scale if o_scale is not None else 1.0
                 )
-                return trtllm_ragged_attention_deepseek(
+                res = trtllm_ragged_attention_deepseek(
                     query=q,
                     key=k,
                     value=v,
@@ -4634,6 +5212,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     q_seq_lens_cpu=p["q_seq_lens_cpu"],
                     kv_seq_lens_cpu=p["kv_seq_lens_cpu"],
                 )
+                if isinstance(res, tuple):
+                    return res[0], _finish_lse(res[1], lse_base, lse_layout, lse_out)
+                return res
             # Modular CuTe DSL backend does not support scale parameters.
             if any(s is not None for s in (q_scale, k_scale, v_scale, o_scale)):
                 raise NotImplementedError(
@@ -4642,12 +5223,19 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             if return_lse:
                 # Standard-path modular kernel computes LSE natively; the
                 # wrapper raises NotImplementedError for attention variants.
-                return self._cute_dsl_wrapper.run(
+                out, lse = self._cute_dsl_wrapper.run(
                     q, k, v, out=out, return_lse=True, lse=lse
                 )
+                return out, _finish_lse(lse, lse_base, lse_layout, lse_out)
             out = self._cute_dsl_wrapper.run(q, k, v, out=out)
             return out
         elif self._backend == "cutlass":
+            if getattr(self, "_sinks", None) is not None:
+                raise NotImplementedError(
+                    "attention sinks were set on the wrapper (_sinks) but the "
+                    "cutlass ragged prefill backend does not consume them; plan() "
+                    "again (auto routes past cutlass when sinks are set) or use fa2"
+                )
             out, lse = fmha_varlen(
                 q,
                 k,
@@ -4665,7 +5253,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 out=out,
                 lse=lse,
             )
-            return (out, lse) if return_lse else out
+            return (
+                (out, _finish_lse(lse, lse_base, lse_layout, lse_out))
+                if return_lse
+                else out
+            )
         elif self._backend == "cudnn":
             # cuDNN's ragged prefill graph has no kv_layout input and reads
             # k.shape[1] as the kv head count, i.e. it assumes NHD. Reject HND
@@ -4674,13 +5266,32 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 raise NotImplementedError(
                     "cuDNN ragged prefill backend requires kv_layout='NHD'"
                 )
-            if self._seq_lens_q.dim() == 1:
-                batch_size = self._seq_lens_q.shape[0]
+            if getattr(self, "_sinks", None) is not None:
+                raise NotImplementedError(
+                    "attention sinks were set on the wrapper (_sinks) but the "
+                    "cuDNN ragged prefill backend does not consume them; plan() "
+                    "again (auto routes past cuDNN when sinks are set) or use fa2"
+                )
+            if (
+                return_lse
+                and self._max_token_per_sequence == 1
+                and q.shape[1] != k.shape[1]
+            ):
+                raise NotImplementedError(
+                    "cuDNN's single-token (max q_len == 1) GQA kernel writes the "
+                    "LSE only for the first head of each kv group (cuDNN 9.26/9.27 "
+                    "bug, NVBug 6783545); use backend='auto', which routes these steps "
+                    "to another backend, or return_lse=False"
+                )
+            # The caller's token-unit indptrs go straight to cuDNN (mask +
+            # ragged offsets, scaled in-engine); no per-call conversion kernels.
+            # actual_seq_lens_q/kv are optional: the direct path derives them
+            # from the indptrs. The stats ragged offset makes cuDNN write the
+            # LSE packed as [total_tokens, num_qo_heads], the wrapper's contract.
             if self._seq_lens_q is not None and self._seq_lens_q.dim() == 1:
-                self._seq_lens_q = self._seq_lens_q.reshape(batch_size, 1, 1, 1)
-
+                self._seq_lens_q = self._seq_lens_q.reshape(-1, 1, 1, 1)
             if self._seq_lens_kv is not None and self._seq_lens_kv.dim() == 1:
-                self._seq_lens_kv = self._seq_lens_kv.reshape(batch_size, 1, 1, 1)
+                self._seq_lens_kv = self._seq_lens_kv.reshape(-1, 1, 1, 1)
 
             cudnn_batch_prefill_with_kv_cache(
                 q,
@@ -4701,12 +5312,21 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 batch_offsets_k=self._kv_indptr_buf,
                 batch_offsets_v=self._v_indptr_buf,
                 batch_offsets_o=self._o_indptr_buf,
+                batch_offsets_stats=(self._cudnn_stats_offsets if return_lse else None),
+                batch_offsets_units="tokens",
                 is_cuda_graph_compatible=self._use_cuda_graph,
+                lse_base=lse_base,
                 out=out,
                 lse=lse,
+                o_data_type=out_dtype,
             )
 
-            return (out, lse) if return_lse else out
+            # base already handled inside cudnn_batch_prefill_with_kv_cache
+            return (
+                (out, _finish_lse(lse, "log2", lse_layout, lse_out))
+                if return_lse
+                else out
+            )
         elif self._backend == "cutile":
             if any(s is not None for s in (q_scale, k_scale, v_scale, o_scale)):
                 raise NotImplementedError(
@@ -4739,7 +5359,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 outputs=out,
                 out_lse=lse if return_lse else None,
             )
-            return (out_ragged, lse_ragged) if return_lse else out_ragged
+            return (
+                (out_ragged, _finish_lse(lse_ragged, lse_base, lse_layout, lse_out))
+                if return_lse
+                else out_ragged
+            )
 
         # Skip FP8->FP16 conversion for FA3 backend with FP8 support
         # The JIT module will handle FP8 natively
@@ -4818,7 +5442,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         if apply_kv_scales and v_scale is not None and not is_float_one:
             out *= v_scale
 
-        return (out, lse) if return_lse else out
+        return (
+            (out, _finish_lse(lse, lse_base, lse_layout, lse_out))
+            if return_lse
+            else out
+        )
 
     run_return_lse = functools.partialmethod(run, return_lse=True)
 
@@ -4846,10 +5474,6 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._rope_scale = rope_scale
         self._rope_theta = rope_theta
         return self.run_return_lse(q, k, v)
-
-    def end_forward(self) -> None:
-        r"""Warning: this function is deprecated and has no effect."""
-        pass
 
 
 def fmha_varlen_plan(
@@ -5046,7 +5670,8 @@ def fmha_varlen(
 def get_trtllm_gen_fmha_module():
     mod = gen_trtllm_gen_fmha_module()
     op = mod.build_and_load()
-    setup_cubin_loader(mod.get_library_path())
+    for library_path in mod.get_library_paths():
+        setup_cubin_loader(library_path)
     return op
 
 
@@ -5235,7 +5860,7 @@ def trtllm_ragged_attention_deepseek(
     kv_seq_lens_cpu: Optional[torch.Tensor] = None,
     use_fp16_softmax: Optional[bool] = None,
     uses_spcompress: Optional[bool] = None,
-    skip_all_rows_active_check: bool = False,
+    skip_all_rows_active_check: bool = True,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """
     Parameters
@@ -5312,23 +5937,21 @@ def trtllm_ragged_attention_deepseek(
         Attention backend to use. "trtllm-gen" (default) or "cute-dsl".
     q_seq_lens_cpu : Optional[torch.Tensor]
         Optional trusted CPU mirror of the per-row query lengths. When provided
-        together with ``kv_seq_lens_cpu``, the Python wrapper can keep the
-        all-active ragged fast path asynchronous while still compacting empty
-        rows (either ``q_len == 0`` or ``kv_len == 0``). If omitted, the
-        wrapper derives lengths from the device indptrs and may synchronize
-        to preserve correctness for direct callers. Under CUDA graph capture,
-        this device-side detection would require an illegal ``.item()``
-        readback, so both mirrors must be provided; without them the wrapper
-        cannot tell whether any row has ``q_len == 0`` or ``kv_len == 0`` and
-        will refuse to launch. Currently only consulted by the ``trtllm-gen``
-        backend.
+        together with ``kv_seq_lens_cpu``, the Python wrapper validates and
+        compacts empty rows (either ``q_len == 0`` or ``kv_len == 0``). Mirrors
+        take precedence over the omitted/default all-rows-active mode. Currently
+        only consulted by the ``trtllm-gen`` backend.
     kv_seq_lens_cpu : Optional[torch.Tensor]
         Optional trusted CPU mirror of the per-row KV lengths. Currently only
         consulted by the ``trtllm-gen`` backend.
     skip_all_rows_active_check : bool
-        Skip empty-row detection when the caller guarantees that every row has
-        positive query and KV lengths. Mutually exclusive with CPU length
-        mirrors. Currently only consulted by the ``trtllm-gen`` backend.
+        Controls empty-row detection. ``True`` (default) assumes every row has
+        positive query and KV lengths and avoids device-to-host synchronization.
+        Paired CPU length mirrors take precedence and request checked/compacting
+        behavior regardless of this setting. ``False`` without CPU mirrors
+        derives row activity from device tensors, which may synchronize outside
+        CUDA graph capture and requires CPU mirrors during capture. Currently
+        only consulted by the ``trtllm-gen`` backend.
 
     Returns
     -------
@@ -5497,13 +6120,7 @@ def trtllm_ragged_attention_deepseek(
         has_inactive_rows = False
         has_active_rows = True
 
-        if skip_all_rows_active_check:
-            if q_seq_lens_cpu is not None or kv_seq_lens_cpu is not None:
-                raise ValueError(
-                    "skip_all_rows_active_check cannot be combined with CPU length "
-                    "mirrors"
-                )
-        elif q_seq_lens_cpu is not None or kv_seq_lens_cpu is not None:
+        if q_seq_lens_cpu is not None or kv_seq_lens_cpu is not None:
             if q_seq_lens_cpu is None or kv_seq_lens_cpu is None:
                 raise ValueError(
                     "q_seq_lens_cpu and kv_seq_lens_cpu must be provided together"
@@ -5532,6 +6149,10 @@ def trtllm_ragged_attention_deepseek(
             if not bool(active_rows_cpu.all().item()):
                 has_inactive_rows = True
                 has_active_rows = bool(active_rows_cpu.any().item())
+        elif skip_all_rows_active_check:
+            # The default assumes all rows have positive Q and KV lengths.
+            # Keep the original tensors and avoid device-to-host row inspection.
+            pass
         else:
             # An active row requires q_len > 0 AND kv_len > 0; detecting
             # either kind of empty row from device indptrs needs an
@@ -5824,6 +6445,7 @@ def trtllm_batch_context_with_kv_cache(
     multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None,
     use_fp16_softmax: Optional[bool] = None,
     uses_spcompress: Optional[bool] = None,
+    backend: str = "trtllm-gen",
 ) -> Union[
     torch.Tensor, FP4Tensor, Tuple[Union[torch.Tensor, FP4Tensor], torch.Tensor]
 ]:
@@ -5949,6 +6571,10 @@ def trtllm_batch_context_with_kv_cache(
         zero-initialized at allocation (e.g. via ``torch.zeros``); the kernel
         self-resets the counters after each launch, so it does not need to be
         re-zeroed between calls.
+    backend : str = "trtllm-gen"
+        The implementation backend, either ``trtllm-gen`` or ``cake``. ``cake``
+        selects the separately versioned Cake FMHA product. The default remains
+        the conventional TRTLLM implementation.
     Returns
     -------
     out: Union[torch.Tensor, FP4Tensor]
@@ -5966,6 +6592,10 @@ def trtllm_batch_context_with_kv_cache(
     )
     if enable_pdl is None:
         enable_pdl = device_support_pdl(query.device)
+    if backend not in ("trtllm-gen", "cake"):
+        raise ValueError(
+            "trtllm_batch_context_with_kv_cache backend must be 'trtllm-gen' or 'cake'"
+        )
     if not causal and window_left >= 0:
         raise NotImplementedError(
             "Sliding-window non-causal attention is not supported for trtllm-gen paged KV cache. "
@@ -6011,7 +6641,8 @@ def trtllm_batch_context_with_kv_cache(
             key_block_scales = key_block_scales.transpose(-3, -2).contiguous()
             value_block_scales = value_block_scales.transpose(-3, -2).contiguous()
 
-    run_func = get_trtllm_gen_fmha_module().trtllm_paged_attention_context
+    if backend != "cake":
+        run_func = get_trtllm_gen_fmha_module().trtllm_paged_attention_context
     sm_count = get_device_sm_count(query.device)
 
     if out_dtype == "nvfp4" or (out_dtype is None and isinstance(out, FP4Tensor)):
@@ -6114,6 +6745,54 @@ def trtllm_batch_context_with_kv_cache(
     else:
         lse_stride_tokens = 0
         lse_stride_heads = 0
+
+    if backend == "cake":
+        from .cake_fmha import (
+            get_cake_fmha_context_module,
+            select_cake_fmha_context_route,
+        )
+
+        cake_route = select_cake_fmha_context_route(
+            query.device,
+            query=query,
+            key_cache=k_cache,
+            value_cache=v_cache,
+            out=out,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            batch_size=batch_size,
+            max_q_len=max_q_len,
+            max_kv_len=max_kv_len,
+            window_left=window_left,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+            sinks=sinks,
+            uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+            cum_seq_lens_q=cum_seq_lens_q,
+            cum_seq_lens_kv=cum_seq_lens_kv,
+            key_block_scales=key_block_scales,
+            value_block_scales=value_block_scales,
+            skip_softmax_threshold_scale_factor=(skip_softmax_threshold_scale_factor),
+            is_causal=causal,
+            lse=lse,
+            kv_layout=kv_layout,
+            workspace_buffer=workspace_buffer,
+        )
+        if skip_softmax_threshold_scale_factor == 1e-30:
+            # The pinned public matrix uses 1e-30 as a numerically inert
+            # skip-softmax probe. Both exact routes and compat_v1 consume the
+            # disabled form at the FFI boundary.
+            skip_softmax_threshold_scale_factor = None
+        # All context adapters consume host scalar scales. Device scalar
+        # values are resolved only after exact route selection, preserving
+        # their public value while converting bmm1 back from log2 form.
+        if isinstance(bmm1_scale, torch.Tensor):
+            bmm1_scale = float(bmm1_scale.item()) / log2e
+        if isinstance(bmm2_scale, torch.Tensor):
+            bmm2_scale = float(bmm2_scale.item())
+        run_func = get_cake_fmha_context_module(
+            query.device, cake_route
+        ).cake_paged_attention_context
 
     run_func(
         out,
