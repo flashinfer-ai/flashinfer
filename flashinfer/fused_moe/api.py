@@ -1255,7 +1255,6 @@ class CutlassNvfp4Config:
         intermediate_size: int,
         activation: Optional[ActivationConfig] = None,
         device=None,
-        nvfp4_4over6: Optional[NVFP44Over6Config] = None,
     ):
         """Quantize canonical BF16 weights into CUTLASS-swizzled NVFP4.
 

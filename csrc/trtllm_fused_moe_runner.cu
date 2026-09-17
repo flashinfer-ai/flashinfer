@@ -747,16 +747,10 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
                          btg::sfLayoutToString(sfLayoutB));
     }
 
-    // One resolution per launch. Previously this site derived the runtime
-    // globalScaleInv from its own pair of env reads while the callee independently
-    // re-read the same env vars to pick the compile-time e4m3Max, so the two could
-    // desync (e.g. if the env changed between the reads) for one knob. Now a single
-    // NVFP4RecipeSpec feeds both, and recipe.globalScaleInv() is by construction the
-    // scale matching recipe.e4m3Max.
-    //
-    // This runner still resolves FROM_ENV: threading a caller-supplied code through
-    // the trtllm_fp4_block_scale_moe FFI is deferred (issue #5141), and
-    // kNVFP44Over6FromEnv is the single literal marking that remaining deferred read.
+    // One NVFP4RecipeSpec per launch feeds both the runtime globalScaleInv and the
+    // compile-time e4m3Max, so they cannot desync.
+    // TODO(aleozlx, #5141): thread a caller-supplied recipe code through the
+    // trtllm_fp4_block_scale_moe FFI; until then this runner resolves from the env.
     auto const recipe =
         tensorrt_llm::kernels::resolveNVFP4Recipe(tensorrt_llm::kernels::kNVFP44Over6FromEnv);
     invokeNvfp4QuantAndPerTokenScale<__nv_bfloat16>(

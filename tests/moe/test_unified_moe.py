@@ -1454,6 +1454,33 @@ class TestMoERunnerSupport:
         with pytest.raises(NotImplementedError, match=r"W4A8.*SM107"):
             runner.check_support()
 
+    def test_cute_dsl_pinned_4over6_requires_per_token_scale(self):
+        """The guard lives in _check_support(), so it fires on every device.
+
+        Without per-token scales GEMM1's NVFP4 epilogue produces the GEMM2
+        input and has no 4over6 variant; a pinned recipe must be refused, not
+        silently dropped.  ``None`` (off) is what that path already does.
+        """
+        runner = CuteDslRunner.__new__(CuteDslRunner)
+        runner.config = self._nvfp4_swiglu(
+            quant=QuantConfig(
+                weight=QuantFormat.NVFP4,
+                activation=QuantFormat.NVFP4,
+                nvfp4_4over6=NVFP44Over6Config(),
+            )
+        )
+        with pytest.raises(NotImplementedError, match="per_token_scale=True"):
+            runner.check_support()
+
+        runner.config = self._nvfp4_swiglu(
+            quant=QuantConfig(
+                weight=QuantFormat.NVFP4,
+                activation=QuantFormat.NVFP4,
+                nvfp4_4over6=None,
+            )
+        )
+        assert runner.check_support() is None
+
     def test_cute_dsl_w4a8_requires_fused_finalize(self):
         runner = CuteDslRunner.__new__(CuteDslRunner)
         runner.config = self._nvfp4_swiglu(

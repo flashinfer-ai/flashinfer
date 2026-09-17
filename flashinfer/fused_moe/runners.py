@@ -641,33 +641,16 @@ class MoERunner(TunableRunner):
 
     @functools.cached_property
     def _nvfp4_4over6_key(self) -> str:
-        """The resolved 4over6 recipe, as a token the tactic cache can key on.
+        """The *resolved* 4over6 recipe as a cache-key token.
 
-        ``"n/a"`` when the activation is not NVFP4, where no kernel reads a
-        recipe.
-
-        A ``str`` and not the enum: ``ProfilingCacheKey.file_key`` stringifies
-        the extras and drops ``runner_hash``, so an unset field would
-        render identically in two processes running with opposite
-        ``FLASHINFER_NVFP4_4OVER6`` settings — the collision this key exists to
-        break.  Resolving turns it into ``"off"`` / ``"4over6_448_MAE_0"`` /
-        ... , which differ.
-
-        Cached because ``__hash__`` runs on every autotuner lookup and must not
-        touch ``os.environ`` in that hot path.  The cost is that flipping the
-        environment *mid-process* does not re-key: pin a recipe on
-        ``QuantConfig.nvfp4_4over6`` if a single process needs both.
+        Resolved, because ``ProfilingCacheKey.file_key`` stringifies the extras:
+        an unset field would key identically in two processes with opposite
+        ``FLASHINFER_NVFP4_4OVER6`` settings. Cached because ``__hash__`` runs
+        on every autotuner lookup; flipping the environment mid-process does
+        not re-key. ``"n/a"`` for non-NVFP4 activations, so the environment
+        does not leak into BF16 / FP8 tactic keys.
         """
         if self.config.quant.activation is not QuantFormat.NVFP4:
-            # Only NVFP4-activation runners quantize with a recipe, and
-            # ``QuantConfig`` rejects an explicit setting on every other
-            # activation format, so resolving here would just stamp the
-            # environment onto BF16 / FP8 / MxInt4 tactic keys: a process
-            # exporting FLASHINFER_NVFP4_4OVER6=1 could then share no on-disk
-            # tactic with one that does not.  The sentinel cannot collide with
-            # a recipe token ("off" / "4over6_<e4m3>_<mode>_<fastmath>"), and
-            # the quant axes are already in the extras tuple, so it stays
-            # keyed apart from a genuine NVFP4 entry.
             return "n/a"
         return nvfp4_4over6_cache_key(
             resolve_nvfp4_4over6(self.config.quant.nvfp4_4over6)
@@ -4152,6 +4135,21 @@ class CuteDslRunner(MoERunner):
 
             if get_compute_capability(self.device) == (10, 7):
                 raise NotImplementedError("CuTe-DSL W4A8 does not support SM107.")
+        if (
+            isinstance(self.config.quant.nvfp4_4over6, NVFP44Over6Config)
+            and not self.config.quant.per_token_scale
+        ):
+            # Without per-token activation scales the GEMM2 input is produced
+            # by GEMM1's NVFP4 epilogue, which has no 4over6 variant. Only a
+            # pinned recipe is rejected: ``None`` (4over6 off) is exactly what
+            # that path already does, since it never reads the environment.
+            raise NotImplementedError(
+                f"{type(self).__name__} honors a pinned QuantConfig.nvfp4_4over6 "
+                "only with per_token_scale=True, the one path where it quantizes "
+                "the GEMM2 input itself (nvfp4_quantize_per_token_cute_dsl). "
+                "Otherwise GEMM1's epilogue emits NVFP4 directly and has no "
+                "4over6 variant."
+            )
         self._assert_rubin_cute_dsl_available()
 
     def _assert_rubin_cute_dsl_available(self) -> None:
@@ -4211,21 +4209,6 @@ class CuteDslRunner(MoERunner):
                 f"{type(self).__name__} requires CuTe DSL >= 4.8 on SM107 "
                 "(Rubin), which provides cutlass.utils.rubin_helpers; the "
                 "installed CuTe DSL does not have it."
-            )
-        if (
-            isinstance(self.config.quant.nvfp4_4over6, NVFP44Over6Config)
-            and not self.config.quant.per_token_scale
-        ):
-            # Without per-token activation scales the GEMM2 input is produced
-            # by GEMM1's NVFP4 epilogue, which has no 4over6 variant. Only a
-            # pinned recipe is rejected: ``None`` (4over6 off) is exactly what
-            # that path already does, since it never reads the environment.
-            raise NotImplementedError(
-                f"{type(self).__name__} honors a pinned QuantConfig.nvfp4_4over6 "
-                "only with per_token_scale=True, the one path where it quantizes "
-                "the GEMM2 input itself (nvfp4_quantize_per_token_cute_dsl). "
-                "Otherwise GEMM1's epilogue emits NVFP4 directly and has no "
-                "4over6 variant."
             )
 
     def __init__(self, config: MoEConfig, device: torch.device):
