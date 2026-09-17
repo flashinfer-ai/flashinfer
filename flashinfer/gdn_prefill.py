@@ -711,8 +711,11 @@ def chunk_gated_delta_rule(
         an explicit value must be a multiple of 64.
     backend : {"auto", "flashinfer", "cake_gdn", "cudnn"}
         ``auto`` uses the same SM90/SM100/SM120 kernels and context-parallel
-        routing as ``flashinfer``. The source-only Cake kernels require an
-        explicit ``cake_gdn`` request, which fails for unsupported inputs.
+        routing as ``flashinfer``. Cake kernels require an explicit ``cake_gdn``
+        request. Use ``backend="cake_gdn", use_cp=True`` for Cake CP on
+        SM100/SM103; ``use_cp=False`` or ``"auto"`` retains Cake non-CP.
+        Explicit Cake requests fail for unsupported inputs without falling
+        back to another backend.
         ``cudnn`` runs cuDNN's fused SM100 linear-attention engine through
         :func:`flashinfer.cudnn.cudnn_chunk_gated_delta_rule`.
     max_seqlen : int, optional
@@ -751,12 +754,12 @@ def chunk_gated_delta_rule(
     """
     if backend not in ("auto", "flashinfer", "cake_gdn", "cudnn"):
         raise ValueError(f"unsupported GDN backend: {backend!r}")
-    if backend == "cake_gdn" and (not _CAKE_GDN_AVAILABLE or _cake_gdn is None):
+    if (
+        backend == "cake_gdn"
+        and use_cp is not True
+        and (not _CAKE_GDN_AVAILABLE or _cake_gdn is None)
+    ):
         raise RuntimeError("the source-only Cake GDN backend is not installed")
-    if backend == "cake_gdn" and use_cp is True:
-        raise _cake_gdn.CakeGDNUnsupportedError(
-            "forced context-parallel prefill is outside the GDN non-CP non-CP backend"
-        )
     if use_cp not in ("auto", True, False):
         raise ValueError(f'use_cp must be "auto", True, or False, got {use_cp!r}')
     if checkpoint_every_n_tokens < 0:
@@ -917,11 +920,12 @@ def chunk_gated_delta_rule(
         _device_name,
         device_capability=_device_capability,
     )
-    will_use_cp = backend != "cake_gdn" and (
-        use_cp is True or (use_cp == "auto" and cp_heuristic_matches)
+    will_use_cp = use_cp is True or (
+        backend != "cake_gdn" and use_cp == "auto" and cp_heuristic_matches
     )
     use_gdn_cp_backend = bool(
-        will_use_cp
+        backend == "cake_gdn"
+        and will_use_cp
         and _device_capability in ((10, 0), (10, 3))
         and _use_gdn_cp_sm100(
             initial_state=initial_state,
@@ -933,6 +937,11 @@ def chunk_gated_delta_rule(
         )
         and _is_gdn_cp_sm100_supported_shape(q, k, v)
     )
+    if backend == "cake_gdn" and will_use_cp and not use_gdn_cp_backend:
+        raise ValueError(
+            "Cake GDN CP requires SM100/SM103 and supported head, state and "
+            "checkpoint configurations"
+        )
     if state_indices is not None:
         if not is_integer_dtype(state_indices.dtype):
             raise ValueError(

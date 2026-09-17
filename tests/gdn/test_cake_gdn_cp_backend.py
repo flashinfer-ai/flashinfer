@@ -1137,26 +1137,33 @@ def test_generated_shape_qualification_is_structural() -> None:
     )
 
 
+@pytest.mark.parametrize(("capability", "sm_count"), [((10, 0), 148), ((10, 3), 152)])
+@pytest.mark.parametrize("backend", ["auto", "flashinfer"])
 @pytest.mark.parametrize(
     ("use_cp", "heuristic_matches", "expected_route"),
     [
-        ("auto", True, "gdn_cp"),
+        ("auto", True, "cute_cp"),
         ("auto", False, "non_cp"),
-        (True, False, "gdn_cp"),
+        (True, False, "cute_cp"),
         (False, True, "non_cp"),
     ],
 )
 def test_public_dispatch_preserves_auto_and_explicit_cp_routes(
     monkeypatch: pytest.MonkeyPatch,
+    capability: tuple[int, int],
+    sm_count: int,
+    backend: str,
     use_cp: str | bool,
     heuristic_matches: bool,
     expected_route: str,
 ) -> None:
     calls: list[str] = []
 
-    monkeypatch.setattr(gdn_prefill, "get_device_sm_count", lambda _device: 148)
-    monkeypatch.setattr(gdn_prefill, "get_compute_capability", lambda _device: (10, 0))
-    monkeypatch.setattr(gdn_prefill, "get_device_name", lambda _device: "NVIDIA B200")
+    monkeypatch.setattr(gdn_prefill, "get_device_sm_count", lambda _device: sm_count)
+    monkeypatch.setattr(
+        gdn_prefill, "get_compute_capability", lambda _device: capability
+    )
+    monkeypatch.setattr(gdn_prefill, "get_device_name", lambda _device: "test GPU")
     monkeypatch.setattr(
         gdn_prefill,
         "should_use_cp_host",
@@ -1170,8 +1177,18 @@ def test_public_dispatch_preserves_auto_and_explicit_cp_routes(
     )
     monkeypatch.setattr(
         gdn_prefill,
+        "cp_delta_rule_dsl_sm100",
+        lambda *_args, **_kwargs: calls.append("cute_cp"),
+    )
+    monkeypatch.setattr(
+        gdn_prefill,
         "chunk_gated_delta_rule_sm100",
         lambda *_args, **_kwargs: calls.append("non_cp"),
+    )
+    monkeypatch.setattr(
+        gdn_prefill,
+        "_run_cake_gdn_prefill",
+        lambda **_kwargs: calls.append("cake_non_cp"),
     )
 
     q, k, v, cu_seqlens = _qualified_public_dispatch_inputs()
@@ -1181,17 +1198,68 @@ def test_public_dispatch_preserves_auto_and_explicit_cp_routes(
         v,
         cu_seqlens=cu_seqlens,
         use_cp=use_cp,
+        backend=backend,
     )
 
     assert output.shape == (2048, 8, 128)
     assert calls == [expected_route]
 
 
-@pytest.mark.parametrize("capability", [(10, 0), (12, 0)])
+@pytest.mark.parametrize(("capability", "sm_count"), [((10, 0), 148), ((10, 3), 152)])
+@pytest.mark.parametrize(
+    ("use_cp", "expected_route"),
+    [(True, "gdn_cp"), (False, "cake_non_cp"), ("auto", "cake_non_cp")],
+)
+def test_explicit_cake_backend_uses_cp_only_when_requested(
+    monkeypatch: pytest.MonkeyPatch,
+    capability: tuple[int, int],
+    sm_count: int,
+    use_cp: str | bool,
+    expected_route: str,
+) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr(gdn_prefill, "get_device_sm_count", lambda _device: sm_count)
+    monkeypatch.setattr(
+        gdn_prefill, "get_compute_capability", lambda _device: capability
+    )
+    monkeypatch.setattr(gdn_prefill, "get_device_name", lambda _device: "test GPU")
+    monkeypatch.setattr(gdn_prefill.torch.version, "cuda", "13.0")
+    monkeypatch.setattr(
+        gdn_prefill, "should_use_cp_host", lambda *_args, **_kwargs: True
+    )
+    monkeypatch.setattr(
+        gdn_prefill,
+        "_chunk_gated_delta_rule_gdn_cp_sm100",
+        lambda *_args, **_kwargs: calls.append("gdn_cp"),
+    )
+    monkeypatch.setattr(
+        gdn_prefill,
+        "cp_delta_rule_dsl_sm100",
+        lambda *_args, **_kwargs: calls.append("cute_cp"),
+    )
+
+    def cake_non_cp(**kwargs):
+        calls.append("cake_non_cp")
+        return kwargs["output"]
+
+    monkeypatch.setattr(gdn_prefill, "_run_cake_gdn_prefill", cake_non_cp)
+    q, k, v, cu_seqlens = _qualified_public_dispatch_inputs()
+    output = gdn_prefill.chunk_gated_delta_rule(
+        q, k, v, cu_seqlens=cu_seqlens, use_cp=use_cp, backend="cake_gdn"
+    )
+    assert output.shape == (2048, 8, 128)
+    assert calls == [expected_route]
+
+
+@pytest.mark.parametrize(
+    ("capability", "backend"),
+    [((10, 0), "cake_gdn"), ((10, 0), "flashinfer"), ((12, 0), "flashinfer")],
+)
 @pytest.mark.parametrize(("max_seqlen", "expected"), [(None, 5), (11, 11)])
 def test_public_dispatch_forwards_max_seqlen_or_balanced_fallback(
     monkeypatch: pytest.MonkeyPatch,
     capability: tuple[int, int],
+    backend: str,
     max_seqlen: int | None,
     expected: int,
 ) -> None:
@@ -1210,6 +1278,11 @@ def test_public_dispatch_forwards_max_seqlen_or_balanced_fallback(
     )
     monkeypatch.setattr(
         gdn_prefill,
+        "cp_delta_rule_dsl_sm100",
+        lambda *_args, **kwargs: observed.append(kwargs["max_seqlen"]),
+    )
+    monkeypatch.setattr(
+        gdn_prefill,
         "cp_delta_rule_dsl_sm120",
         lambda *_args, **kwargs: observed.append(kwargs["max_seqlen"]),
     )
@@ -1222,6 +1295,7 @@ def test_public_dispatch_forwards_max_seqlen_or_balanced_fallback(
         q,
         cu_seqlens=cu_seqlens,
         use_cp=True,
+        backend=backend,
         max_seqlen=max_seqlen,
     )
 
@@ -1252,6 +1326,7 @@ def test_public_dispatch_allows_gdn_cp_before_cuda_13(
         v,
         cu_seqlens=cu_seqlens,
         use_cp=True,
+        backend="cake_gdn",
     )
 
     assert output.shape == (2048, 8, 128)
@@ -1283,15 +1358,18 @@ def test_public_dispatch_rejects_gdn_cp_before_cuda_12_8(
             v,
             cu_seqlens=cu_seqlens,
             use_cp=True,
+            backend="cake_gdn",
         )
 
     assert calls == []
 
 
+@pytest.mark.parametrize("backend", ["auto", "flashinfer"])
 @pytest.mark.parametrize("cuda_version", ["12.8", "12.9"])
 def test_public_dispatch_keeps_cuda_13_gate_for_sm100_dsl(
     monkeypatch: pytest.MonkeyPatch,
     cuda_version: str,
+    backend: str,
 ) -> None:
     calls: list[str] = []
 
@@ -1305,33 +1383,38 @@ def test_public_dispatch_keeps_cuda_13_gate_for_sm100_dsl(
         lambda *_args, **_kwargs: calls.append("cute_cp"),
     )
 
-    q = torch.zeros((2, 1, 128), dtype=torch.float16)
-    initial_state = torch.empty((1, 1, 128, 128), dtype=torch.float8_e4m3fn)
+    q, k, v, cu_seqlens = _qualified_public_dispatch_inputs()
     with pytest.raises(ValueError, match="SM100 DSL kernel requires CUDA 13"):
         gdn_prefill.chunk_gated_delta_rule(
             q,
-            q,
-            q,
-            initial_state=initial_state,
-            cu_seqlens=torch.tensor([0, 2], dtype=torch.int32),
+            k,
+            v,
+            cu_seqlens=cu_seqlens,
             use_cp=True,
+            backend=backend,
         )
 
     assert calls == []
 
 
 @pytest.mark.parametrize(
-    ("extension", "expected_route"),
+    ("backend", "extension", "expected_route"),
     [
-        ("checkpoint", "cute_cp"),
-        ("fp8_state", "cute_cp"),
-        ("cp_chunk_len", "gdn_cp"),
+        (backend, extension, "cute_cp")
+        for backend in ("auto", "flashinfer")
+        for extension in ("checkpoint", "fp8_state", "cp_chunk_len")
+    ]
+    + [
+        ("cake_gdn", "checkpoint", None),
+        ("cake_gdn", "fp8_state", None),
+        ("cake_gdn", "cp_chunk_len", "gdn_cp"),
     ],
 )
 def test_public_dispatch_routes_sm100_cp_extensions_by_backend_support(
     monkeypatch: pytest.MonkeyPatch,
+    backend: str,
     extension: str,
-    expected_route: str,
+    expected_route: str | None,
 ) -> None:
     calls: list[str] = []
 
@@ -1366,12 +1449,28 @@ def test_public_dispatch_routes_sm100_cp_extensions_by_backend_support(
     else:
         kwargs["_cp_chunk_len"] = 64
 
+    # Host checkpoint metadata and FP8 state are outside the Cake CP domain.
+    if expected_route is None:
+        with pytest.raises(ValueError, match="Cake GDN CP requires"):
+            gdn_prefill.chunk_gated_delta_rule(
+                q,
+                q,
+                q,
+                cu_seqlens=torch.tensor([0, total], dtype=torch.int32),
+                use_cp=True,
+                backend=backend,
+                **kwargs,
+            )
+        assert calls == []
+        return
+
     output = gdn_prefill.chunk_gated_delta_rule(
         q,
         q,
         q,
         cu_seqlens=torch.tensor([0, total], dtype=torch.int32),
         use_cp=True,
+        backend=backend,
         **kwargs,
     )
 
@@ -1396,7 +1495,41 @@ def test_public_dispatch_fails_closed_when_gdn_cp_is_unavailable(
             v,
             cu_seqlens=cu_seqlens,
             use_cp=True,
+            backend="cake_gdn",
         )
+
+
+@pytest.mark.parametrize("unsupported", ["architecture", "head_layout"])
+def test_explicit_cake_cp_rejects_unsupported_domain_without_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    unsupported: str,
+) -> None:
+    calls: list[str] = []
+    capability = (10, 7) if unsupported == "architecture" else (10, 3)
+    monkeypatch.setattr(gdn_prefill, "get_device_sm_count", lambda _device: 152)
+    monkeypatch.setattr(
+        gdn_prefill, "get_compute_capability", lambda _device: capability
+    )
+    monkeypatch.setattr(gdn_prefill, "get_device_name", lambda _device: "test GPU")
+    monkeypatch.setattr(gdn_prefill.torch.version, "cuda", "13.0")
+    for name in (
+        "_chunk_gated_delta_rule_gdn_cp_sm100",
+        "cp_delta_rule_dsl_sm100",
+        "_run_cake_gdn_prefill",
+    ):
+        monkeypatch.setattr(
+            gdn_prefill,
+            name,
+            lambda *_args, route=name, **_kwargs: calls.append(route),
+        )
+    q, k, v, cu_seqlens = _qualified_public_dispatch_inputs()
+    if unsupported == "head_layout":
+        k = torch.zeros((2048, 1, 128), dtype=torch.float16)
+    with pytest.raises(ValueError, match="Cake GDN CP requires"):
+        gdn_prefill.chunk_gated_delta_rule(
+            q, k, v, cu_seqlens=cu_seqlens, use_cp=True, backend="cake_gdn"
+        )
+    assert calls == []
 
 
 def test_public_dispatch_routes_other_blackwell_capabilities_to_dsl(
@@ -2003,6 +2136,7 @@ def test_structurally_supported_public_route_uses_generated_state_and_lifecycle(
         output_state=candidate_state,
         state_indices=state_indices,
         use_cp=True,
+        backend="cake_gdn",
         max_seqlen=max(seq_lens),
     )
     if output_state_dtype is None:
@@ -2144,6 +2278,7 @@ def test_public_dispatcher_preserves_zero_length_sequences_and_state_pool(
         output=output,
         output_state=output_state,
         use_cp=True,
+        backend="cake_gdn",
         state_indices=state_indices,
         max_seqlen=max(seq_lens, default=0),
     )
@@ -2173,7 +2308,7 @@ def test_public_dispatcher_preserves_zero_length_sequences_and_state_pool(
 def test_public_dispatcher_uses_generated_for_indexed_inplace_gqa(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Exercise generated public use_cp=True indexed in-place state."""
+    """Exercise explicit Cake CP indexed in-place state."""
 
     torch.manual_seed(504078)
     seq_lens = (64, 129)
@@ -2271,6 +2406,7 @@ def test_public_dispatcher_uses_generated_for_indexed_inplace_gqa(
         output=output,
         output_state=candidate_state,
         use_cp=True,
+        backend="cake_gdn",
         state_indices=state_indices,
         max_seqlen=max(seq_lens),
     )
