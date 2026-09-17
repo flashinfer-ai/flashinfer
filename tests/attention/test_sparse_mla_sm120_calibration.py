@@ -2718,6 +2718,9 @@ def test_pool_allocation_limits_and_non_oom_propagation(
     monkeypatch.setattr(native, "_POOL_BYTES_MIN", 1024)
     monkeypatch.setattr(cpb_mod, "_check_pool_capacity", lambda *args: None)
     monkeypatch.setattr(cpb_mod, "format_info", lambda *args: {"bytes_per_token": 8})
+    monkeypatch.setattr(
+        native, "dsv4_nvfp4_format_info", lambda: {"bytes_per_token": 384}
+    )
     request = cpb_mod._OrdinaryRequest(16, 128)
     device = torch.device("cpu")
     for name, target, call in [
