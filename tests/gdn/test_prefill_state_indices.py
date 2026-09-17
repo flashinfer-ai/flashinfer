@@ -342,9 +342,7 @@ def test_prefill_state_indices_preserves_inner_strides(backend, use_cp, H):
         inner_stride=2,
     )
     if backend == "cake_gdn" and use_cp is not True:
-        with pytest.raises(
-            CakeGDNUnsupportedError, match=r"contiguous \[H,V,K\] rows"
-        ):
+        with pytest.raises(CakeGDNUnsupportedError, match=r"contiguous \[H,V,K\] rows"):
             _run(
                 q,
                 k,
