@@ -11,6 +11,7 @@ import torch
 
 from flashinfer.attention.prims_ts.balanced_scheduler import (
     cost_model as scheduler_module,
+    tune_cost_model as cost_model_tuner,
 )
 from flashinfer.attention.prims_ts.balanced_scheduler.gate import (
     BALANCED_MLA_GATE_THRESHOLDS,
@@ -34,6 +35,68 @@ from flashinfer.attention.prims_ts.kernels.mla_decode.helpers.constants import (
     balanced_reducer_capacity,
     balanced_work_descriptor_capacity,
 )
+
+
+def _make_tuner_identity_tree(tmp_path: Path) -> tuple[Path, Path]:
+    """Create the minimum source tree required by measurement fingerprinting."""
+
+    root = tmp_path / "repo"
+    tuner_path = (
+        root / "flashinfer/attention/prims_ts/balanced_scheduler/tune_cost_model.py"
+    )
+    tuner_path.parent.mkdir(parents=True)
+    tuner_path.write_text(
+        Path(cost_model_tuner.__file__).read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    (root / "flashinfer/attention/prims_ts/runtime.py").write_text(
+        "MEASUREMENT_RUNTIME_VERSION = 1\n",
+        encoding="utf-8",
+    )
+    csrc_root = root / "csrc/prims_ts"
+    csrc_root.mkdir(parents=True)
+    for name in (
+        "balanced_mla_plan.cu",
+        "balanced_mla_scheduler_device.cu",
+        "balanced_mla_scheduler.cuh",
+    ):
+        (csrc_root / name).write_text(f"// {name}\n", encoding="utf-8")
+    return root, tuner_path
+
+
+def test_measurement_fingerprint_ignores_fit_only_tuner_edits(tmp_path):
+    root, tuner_path = _make_tuner_identity_tree(tmp_path)
+    measurement_before = cost_model_tuner.measurement_source_identity(root)
+    fit_before = cost_model_tuner.fit_source_identity(root)
+
+    source = tuner_path.read_text(encoding="utf-8")
+    edited = source.replace(
+        'FIT_METHOD = "tail_aware_selection_regret_v8_schedule_identity"',
+        'FIT_METHOD = "test_fit_only_change"',
+        1,
+    )
+    assert edited != source
+    tuner_path.write_text(edited, encoding="utf-8")
+
+    assert cost_model_tuner.measurement_source_identity(root) == measurement_before
+    assert cost_model_tuner.fit_source_identity(root) != fit_before
+
+
+def test_measurement_fingerprint_tracks_measurement_tuner_edits(tmp_path):
+    root, tuner_path = _make_tuner_identity_tree(tmp_path)
+    before = cost_model_tuner.measurement_source_identity(root)
+
+    source = tuner_path.read_text(encoding="utf-8")
+    edited = source.replace("PAGE_SIZE = 32", "PAGE_SIZE = 64", 1)
+    assert edited != source
+    tuner_path.write_text(edited, encoding="utf-8")
+    after = cost_model_tuner.measurement_source_identity(root)
+
+    # The tuner is absent from the whole-file digest, but its selected
+    # measurement definitions retain their independent fingerprint.
+    assert after["sha256"] == before["sha256"]
+    assert after["file_count"] == before["file_count"]
+    assert after["measurement_harness_sha256"] != before["measurement_harness_sha256"]
 
 
 @pytest.mark.parametrize(

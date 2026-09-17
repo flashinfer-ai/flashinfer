@@ -316,6 +316,9 @@ def _hash_python_symbols(
 def measurement_source_identity(root: Path = _REPO_ROOT) -> dict[str, Any]:
     """Fingerprint the benchmark, CUDA scheduler, and PrimsTS MLA sources."""
 
+    benchmark_path = (
+        root / "flashinfer/attention/prims_ts/balanced_scheduler/tune_cost_model.py"
+    )
     roots = (
         root / "flashinfer/attention/prims_ts",
         root / "csrc/prims_ts/balanced_mla_plan.cu",
@@ -336,9 +339,14 @@ def measurement_source_identity(root: Path = _REPO_ROOT) -> dict[str, Any]:
             source_files.add(source_root)
         else:
             raise RuntimeError(f"measurement source path is missing: {source_root}")
-    benchmark_path = (
-        root / "flashinfer/attention/prims_ts/balanced_scheduler/tune_cost_model.py"
-    )
+    # The tuner deliberately contains both immutable measurement code and
+    # replaceable fitting policy. Hashing the complete file here would make a
+    # fit-only edit invalidate the measurement cohort before
+    # --refit-generation can reuse it. The selected measurement definitions
+    # remain covered independently by measurement_harness_sha256 below.
+    source_files = {
+        path for path in source_files if path.resolve() != benchmark_path.resolve()
+    }
     return {
         "sha256": _hash_source_files(root, tuple(source_files)),
         "file_count": len(source_files),
