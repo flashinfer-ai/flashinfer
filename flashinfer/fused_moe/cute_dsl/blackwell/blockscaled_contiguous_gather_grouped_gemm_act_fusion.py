@@ -66,6 +66,8 @@ from .utils import (
     is_power_of_2,
     situ_f32,
     tanh_f32,
+    tcgen05_fence_after_thread_sync,
+    tcgen05_fence_before_thread_sync,
 )
 
 """
@@ -2402,6 +2404,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 #
                 if is_leader_cta:
                     acc_pipeline.producer_acquire(acc_producer_state)
+                    tcgen05_fence_after_thread_sync()
                 #
                 # Mma mainloop
                 #
@@ -2750,6 +2753,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 # Wait for accumulator buffer full
                 #
                 acc_pipeline.consumer_wait(acc_consumer_state)
+                tcgen05_fence_after_thread_sync()
 
                 tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
                 bSG_gC = cute.group_modes(bSG_gC, 1, cute.rank(bSG_gC))
@@ -2793,6 +2797,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                         if real_subtile_idx == self.iter_acc_early_release_in_epilogue:
                             # Fence for TMEM load
                             cute.arch.fence_view_async_tmem_load()
+                            tcgen05_fence_before_thread_sync()
                             acc_pipeline.consumer_release(acc_consumer_state)
                             acc_consumer_state.advance()
 
@@ -3295,6 +3300,10 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 # Async arrive accumulator buffer empty
                 #
                 if cutlass.const_expr(not self.overlapping_accum):
+                    # Finish every TMEM read before the producer can reuse
+                    # this accumulator; output stores alone are not a handoff.
+                    cute.arch.fence_view_async_tmem_load()
+                    tcgen05_fence_before_thread_sync()
                     acc_pipeline.consumer_release(acc_consumer_state)
                     acc_consumer_state.advance()
 

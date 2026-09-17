@@ -47,6 +47,8 @@ from .utils import (
     griddepcontrol_launch_dependents,
     griddepcontrol_wait,
     is_power_of_2,
+    tcgen05_fence_after_thread_sync,
+    tcgen05_fence_before_thread_sync,
 )
 
 """
@@ -1833,6 +1835,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                 #
                 if is_leader_cta:
                     acc_pipeline.producer_acquire(acc_producer_state)
+                    tcgen05_fence_after_thread_sync()
                 #
                 # Reset the ACCUMULATE field for each tile
                 #
@@ -2112,6 +2115,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                 # Wait for accumulator buffer full
                 #
                 acc_pipeline.consumer_wait(acc_consumer_state)
+                tcgen05_fence_after_thread_sync()
 
                 tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
                 #
@@ -2139,6 +2143,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                         if subtile_idx == self.iter_acc_early_release_in_epilogue:
                             # Fence for TMEM load
                             cute.arch.fence_view_async_tmem_load()
+                            tcgen05_fence_before_thread_sync()
                             acc_pipeline.consumer_release(acc_consumer_state)
                             acc_consumer_state.advance()
 
@@ -2167,6 +2172,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                 #
                 if cutlass.const_expr(not self.overlapping_accum):
                     cute.arch.fence_view_async_tmem_load()
+                    tcgen05_fence_before_thread_sync()
                     acc_pipeline.consumer_release(acc_consumer_state)
                     acc_consumer_state.advance()
 

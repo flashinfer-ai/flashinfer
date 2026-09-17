@@ -83,6 +83,23 @@ from ..common.kernel_utils import (  # noqa: F401
 # ============================================================================
 
 
+@dsl_user_op
+def tcgen05_fence_before_thread_sync(*, loc=None, ip=None) -> None:
+    """Order completed asynchronous tensor-memory accesses before handoff."""
+    nvvm.tcgen05_fence(kind=nvvm.Tcgen05FenceKind.BEFORE_THREAD_SYNC, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def tcgen05_fence_after_thread_sync(*, loc=None, ip=None) -> None:
+    """Order asynchronous tensor-memory operations after a completed wait.
+
+    An accumulator mbarrier wait needs this ordering before a tcgen05 load.
+    The load-completion wait emitted by fence_view_async_tmem_load serves a
+    separate purpose and does not replace this fence.
+    """
+    nvvm.tcgen05_fence(kind=nvvm.Tcgen05FenceKind.AFTER_THREAD_SYNC, loc=loc, ip=ip)
+
+
 @dataclass(frozen=True)
 class UnalignedNamedBarrier:
     """Counted CTA barrier for participating warps at different instruction sites.
