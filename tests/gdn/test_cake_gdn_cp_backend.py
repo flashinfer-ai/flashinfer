@@ -29,7 +29,7 @@ from flashinfer.gdn_kernels.blackwell import cake_gdn_cp_backend as gdn_cp
 from flashinfer.jit import cake_gdn_cp_backend as gdn_cp_jit
 from flashinfer.utils import is_sm100a_supported
 
-from .reference_delta_rule import delta_rule
+from .reference_delta_rule import blockwise_delta_rule, delta_rule
 
 
 def _source_root() -> Path:
@@ -1655,6 +1655,91 @@ def test_generated_tma_workspaces_are_owned_by_prepared_graphs(
     not torch.cuda.is_available() or not is_sm100a_supported(torch.device("cuda")),
     reason="requires an exact SM100a or SM103a GPU",
 )
+@pytest.mark.parametrize("metadata_dtype", [torch.int32, torch.int64])
+def test_public_cuda_graph_reads_updated_sequence_boundaries(
+    metadata_dtype: torch.dtype,
+) -> None:
+    """Replay the public route with new device metadata and no host readback."""
+
+    torch.manual_seed(4539)
+    q = torch.randn((256, 1, 128), dtype=torch.float16, device="cuda")
+    k = torch.nn.functional.normalize(
+        torch.randn((256, 1, 128), device="cuda"), dim=-1
+    ).to(torch.float16)
+    v = torch.randn_like(q)
+    alpha = 1.0 - torch.rand((256, 1), device="cuda") / 256
+    beta = torch.rand((256, 1), device="cuda").sigmoid()
+    output = torch.empty_like(q)
+    output_state = torch.empty((2, 1, 128, 128), device="cuda")
+    boundaries = [
+        torch.tensor(values, dtype=metadata_dtype, device="cuda")
+        for values in ([0, 128, 256], [0, 64, 256])
+    ]
+    cu_seqlens = boundaries[0].clone()
+    references = []
+    for seq_lens in ([128, 128], [64, 192]):
+        expected_output, expected_state = delta_rule(
+            q.float(),
+            k.float(),
+            v.float(),
+            seq_lens,
+            alpha=alpha,
+            beta=beta,
+            scale_factor=0.125,
+            state_dtype=torch.float32,
+        )
+        references.append(
+            (expected_output.to(q.dtype), expected_state.transpose(-1, -2))
+        )
+
+    def invoke() -> None:
+        gdn_prefill.chunk_gated_delta_rule(
+            q,
+            k,
+            v,
+            g=alpha,
+            beta=beta,
+            scale=0.125,
+            output_final_state=True,
+            cu_seqlens=cu_seqlens,
+            output=output,
+            output_state=output_state,
+            use_cp=True,
+            backend="cake_gdn",
+            max_seqlen=192,
+        )
+
+    gdn_cp._reset_gdn_cp_prefill_cache()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    try:
+        with torch.cuda.stream(stream):
+            invoke()
+        stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            invoke()
+
+        for index in (0, 1, 0):
+            with torch.cuda.stream(stream):
+                cu_seqlens.copy_(boundaries[index])
+                output.fill_(float("nan"))
+                output_state.fill_(float("nan"))
+                graph.replay()
+            stream.synchronize()
+            expected_output, expected_state = references[index]
+            torch.testing.assert_close(output, expected_output, atol=1e-2, rtol=1e-2)
+            torch.testing.assert_close(
+                output_state, expected_state, atol=1e-2, rtol=1e-2
+            )
+    finally:
+        gdn_cp._reset_gdn_cp_prefill_cache()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not is_sm100a_supported(torch.device("cuda")),
+    reason="requires an exact SM100a or SM103a GPU",
+)
 @pytest.mark.parametrize(
     ("total", "hq", "hv"),
     [
@@ -1664,15 +1749,11 @@ def test_generated_tma_workspaces_are_owned_by_prepared_graphs(
         (65536, 32, 32),
     ],
 )
-def test_frozen_graph_matches_pr4078_and_preserves_inputs(
+def test_frozen_graph_matches_reference_and_preserves_inputs(
     total: int,
     hq: int,
     hv: int,
 ) -> None:
-    from flashinfer.gdn_kernels.blackwell.gdn_cp_prefill import (
-        cp_delta_rule_dsl_sm100,
-    )
-
     torch.manual_seed(4078 + hq * 100 + hv)
     device = torch.device("cuda")
     seq_lens = (total,)
@@ -1693,21 +1774,47 @@ def test_frozen_graph_matches_pr4078_and_preserves_inputs(
         tensor.clone() for tensor in (q, k, v, alpha, beta, cu_seqlens, initial_state)
     )
 
-    expected_output = torch.empty((total, hv, dim), dtype=torch.float16, device=device)
-    expected_state = torch.empty_like(initial_state)
-    cp_delta_rule_dsl_sm100(
-        expected_output,
-        expected_state,
-        q,
-        k,
-        v,
-        alpha,
-        beta,
-        cu_seqlens,
-        1.0 / dim**0.5,
-        initial_state=initial_state,
-        max_seqlen=total,
-    )
+    if _cuda_major() >= 13:
+        from flashinfer.gdn_kernels.blackwell.gdn_cp_prefill import (
+            cp_delta_rule_dsl_sm100,
+        )
+
+        expected_output = torch.empty_like(v)
+        expected_state = torch.empty_like(initial_state)
+        cp_delta_rule_dsl_sm100(
+            expected_output,
+            expected_state,
+            q,
+            k,
+            v,
+            alpha,
+            beta,
+            cu_seqlens,
+            1.0 / dim**0.5,
+            initial_state=initial_state,
+            max_seqlen=total,
+        )
+    else:
+        # The native SM100 CP DSL requires CUDA 13; Cake also supports CUDA 12.8+.
+        allow_tf32 = torch.backends.cuda.matmul.allow_tf32
+        try:
+            torch.backends.cuda.matmul.allow_tf32 = False
+            expected_output, expected_state = blockwise_delta_rule(
+                q.float(),
+                k.float(),
+                v.float(),
+                list(seq_lens),
+                alpha=alpha,
+                beta=beta,
+                block_size=64,
+                scale_factor=1.0 / dim**0.5,
+                state_dtype=torch.float32,
+                initial_state=initial_state.transpose(-1, -2).contiguous(),
+            )
+        finally:
+            torch.backends.cuda.matmul.allow_tf32 = allow_tf32
+        expected_output = expected_output.to(q.dtype)
+        expected_state = expected_state.transpose(-1, -2)
     prepared = gdn_cp.prepare_gdn_cp_prefill(
         q,
         k,
@@ -1722,6 +1829,8 @@ def test_frozen_graph_matches_pr4078_and_preserves_inputs(
     output, final_state = prepared.replay()
     torch.cuda.synchronize()
 
+    for tensor in (output, expected_output, final_state, expected_state):
+        assert torch.isfinite(tensor).all()
     torch.testing.assert_close(output, expected_output, atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(final_state, expected_state, atol=1e-2, rtol=1e-2)
     for observed, before in zip(
