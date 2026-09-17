@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from math import prod
 from typing import Optional
 
+import cuda.bindings.driver as cuda
 import torch
 
 from ...tllm_enums import ActivationType
@@ -106,6 +107,7 @@ class Mxfp4MoEPlan:
     """
 
     def __init__(self, *, kwargs, workspace, topk_ids, topk_weights, route_ids, route_weights):
+        # Keep every bound tensor alive alongside the raw launch pointers.
         self._kwargs = kwargs
         self.workspace = workspace
         self.output = kwargs["moe_output"]
@@ -120,6 +122,25 @@ class Mxfp4MoEPlan:
             else None
         )
 
+    def _prepare_routing(self):
+        if self._topk_weights is None:
+            torch.bitwise_right_shift(self._topk_ids, 16, out=self._route_ids)
+            self._route_weights.copy_(self._packed_weight_view)
+        elif self._route_weights is not self._topk_weights:
+            self._route_weights.copy_(self._topk_weights)
+
+    def _prepare(self):
+        # The existing path validates and warms the exact pointers/callables
+        # retained below. No stream is retained: run resolves the caller's.
+        launches = {}
+        with torch.cuda.device(self.device):
+            self._prepare_routing()
+            _moe_core_impl(**self._kwargs, _prepared_launches=launches)
+        self._sort, self._sort_args = launches["sort"]
+        self._gather, self._gather_args, self._gather_kwargs = launches["gather"]
+        self._memset, self._memset_args = launches["memset"]
+        self._finalize, self._finalize_args = launches["finalize"]
+
     def run(self) -> torch.Tensor:
         """Enqueue on the caller's current stream and return the bound output.
 
@@ -127,12 +148,14 @@ class Mxfp4MoEPlan:
         This method performs no tuning, allocation, or host synchronization.
         """
         with torch.cuda.device(self.device):
-            if self._topk_weights is None:
-                torch.bitwise_right_shift(self._topk_ids, 16, out=self._route_ids)
-                self._route_weights.copy_(self._packed_weight_view)
-            elif self._route_weights is not self._topk_weights:
-                self._route_weights.copy_(self._topk_weights)
-            return _moe_core_impl(**self._kwargs)
+            stream_ptr = torch.cuda.current_stream().cuda_stream
+            stream = cuda.CUstream(stream_ptr)
+            self._prepare_routing()
+            self._sort(*self._sort_args, stream_ptr)
+            self._gather(*self._gather_args, stream=stream, **self._gather_kwargs)
+            self._memset(*self._memset_args, stream_ptr)
+            self._finalize(*self._finalize_args, stream=stream)
+        return self.output
 
 
 class CuteDslMxfp4MoEWrapper:
@@ -362,5 +385,5 @@ class CuteDslMxfp4MoEWrapper:
                 topk_weights=topk_weights, route_ids=route_ids,
                 route_weights=route_weights,
             )
-            plan.run()
+            plan._prepare()
             return plan

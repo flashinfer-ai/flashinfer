@@ -479,6 +479,7 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
     situ_beta: Optional[Union[float, torch.Tensor]] = None,
     situ_linear_beta: Optional[Union[float, torch.Tensor]] = None,
     gated: bool = True,
+    _prepared_launches: Optional[Dict[str, Any]] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Blockscaled contiguous gather grouped GEMM with fused FC1 activation.
 
@@ -929,7 +930,7 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
     # (a_ptr, b_ptr, a_sf_ptr, b_sf_ptr, c_ptr, c_sf_ptr, alpha_ptr,
     #  tile_idx_ptr, mn_limit_ptr, token_id_ptr, num_tiles_ptr, global_sf_ptr,
     #  [a_per_token_scale_ptr], orig_m, m, n, k, l, stream)
-    compiled_gemm(
+    launch_args = (
         a_ptr,
         b_ptr,
         a_sf_ptr,
@@ -948,18 +949,20 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         n,
         k,
         num_experts,
-        stream=stream,
-        **(
-            {
-                "situ_beta_ptr": runtime_situ_beta_ptr,
-                "situ_linear_beta_ptr": runtime_situ_linear_beta_ptr,
-                "situ_beta_stride": situ_beta_stride,
-                "situ_linear_beta_stride": situ_linear_beta_stride,
-            }
-            if not is_rubin
-            else {}
-        ),
     )
+    launch_kwargs = (
+        {
+            "situ_beta_ptr": runtime_situ_beta_ptr,
+            "situ_linear_beta_ptr": runtime_situ_linear_beta_ptr,
+            "situ_beta_stride": situ_beta_stride,
+            "situ_linear_beta_stride": situ_linear_beta_stride,
+        }
+        if not is_rubin
+        else {}
+    )
+    if _prepared_launches is not None:
+        _prepared_launches["gather"] = (compiled_gemm, launch_args, launch_kwargs)
+    compiled_gemm(*launch_args, stream=stream, **launch_kwargs)
 
     return out, out_scale if generate_sfc else None
 

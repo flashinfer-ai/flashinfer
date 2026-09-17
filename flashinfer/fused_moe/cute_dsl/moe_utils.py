@@ -18,7 +18,7 @@ import ctypes
 import functools
 import math
 from enum import IntEnum
-from typing import Dict, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
 
@@ -424,7 +424,11 @@ def moe_output_memset(
     )
 
 
-def moe_output_memset_inplace(output: torch.Tensor) -> None:
+def moe_output_memset_inplace(
+    output: torch.Tensor,
+    *,
+    _prepared_launches: Optional[Dict[str, Any]] = None,
+) -> None:
     """
     Zero the active MoE output slice via ``cudaMemsetAsync`` on the current
     CUDA stream.
@@ -481,7 +485,10 @@ def moe_output_memset_inplace(output: torch.Tensor) -> None:
     func_name = f"flashinfer_moe_output_memset_inplace_{dtype_suffix}"
     func = module[func_name]
 
-    func(output.data_ptr(), num_tokens, hidden_size, _get_cuda_stream_ptr())
+    launch_args = (output.data_ptr(), num_tokens, hidden_size)
+    if _prepared_launches is not None:
+        _prepared_launches["memset"] = (func, launch_args)
+    func(*launch_args, _get_cuda_stream_ptr())
 
 
 # ============================ moe_sort ============================
@@ -585,6 +592,8 @@ def moe_sort(
     out_total_num_padded_tokens: Optional[torch.Tensor] = None,
     out_num_non_exiting_tiles: Optional[torch.Tensor] = None,
     out_expert_counts: Optional[torch.Tensor] = None,
+    *,
+    _prepared_launches: Optional[Dict[str, Any]] = None,
 ) -> Tuple[
     torch.Tensor,  # tile_idx_to_expert_idx
     torch.Tensor,  # tile_idx_to_mn_limit
@@ -779,7 +788,7 @@ def moe_sort(
     # Get PyTorch's current stream for CUDA graph compatibility
     cuda_stream_ptr = _get_cuda_stream_ptr()
 
-    func(
+    launch_args = (
         # Inputs
         token_selected_experts.data_ptr(),
         token_final_scales.data_ptr(),
@@ -799,9 +808,10 @@ def moe_sort(
         num_non_exiting_tiles.data_ptr(),
         # Optional buffer
         expert_counts_ptr,
-        # CUDA stream for CUDA graph compatibility
-        cuda_stream_ptr,
     )
+    if _prepared_launches is not None:
+        _prepared_launches["sort"] = (func, launch_args)
+    func(*launch_args, cuda_stream_ptr)
 
     # Return total_num_padded_tokens as tensor for CUDA graph compatibility
     # (avoiding .item() which causes CPU-GPU sync)
