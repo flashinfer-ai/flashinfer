@@ -924,9 +924,17 @@ class BatchPrefillWithCausalBidirectionalRangesWrapper(
             window and leaves the causal part unbounded. Pass the value you
             would pass to any other prefill wrapper; no conversion is needed.
         range_window_left : int
-            Sliding window on the bidirectional part. ``-1`` (or ``0``) leaves
-            the spans unclamped, which is what a span normally wants; set it to
-            bound how far back a span may reach.
+            Sliding window on the bidirectional part, as a count of keys rather
+            than as a left bound: a key inside a span is kept when
+            ``q_abs - kv < range_window_left``, so ``N`` keeps the ``N`` nearest
+            backward distances, ``0..N-1``. ``0`` and any negative value leave
+            the spans unclamped, which is what a span normally wants. Only the
+            backward edge is clamped; a span's forward side is untouched.
+
+            This is deliberately not ``causal_window_left``'s contract. That one
+            carries FlashInfer's ``window_left``, where ``N`` keeps ``0..N`` and
+            ``0`` keeps the diagonal alone. The same number therefore means one
+            fewer key here, and ``0`` means the opposite of what it means there.
         q_scale, k_scale : Optional[float]
             Scalar calibration scales folded into ``sm_scale``. Per-head scale
             tensors are rejected: this variant declares a single ``double``
@@ -1109,6 +1117,18 @@ class BatchPrefillWithCausalBidirectionalRangesWrapper(
     # binding would send every ``run_return_lse`` call into the parent body and
     # skip every check the override exists to make.
     run_return_lse = functools.partialmethod(run, return_lse=True)
+
+    # The parent's class body has a second alias of the same shape,
+    # ``begin_forward = plan``, which captures the parent's ``plan`` function.
+    # Inheriting it would let a caller plan without ``_check_specialization``,
+    # without the ``max_sequence_kv`` refusal, and without any of the option
+    # refusals: the parent's ``q_data_type`` default is ``"float16"``, so a
+    # wrapper built for bf16 would cache the wrong dtype, and ``window_left``
+    # would reach a scheduler that truncates its per-request KV in pages while
+    # the variant pins ``window_left = kv_len``, which on the split path leaves
+    # the tail of the KV unvisited and the partial writes striding past what
+    # the host reserved. Bind it to this class's ``plan`` instead.
+    begin_forward = plan
 
     def forward(  # type: ignore[override]
         self,

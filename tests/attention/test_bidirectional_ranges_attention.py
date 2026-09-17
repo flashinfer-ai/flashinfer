@@ -1450,3 +1450,186 @@ def test_kv_only_fp8_is_not_refused(fp8):
     assert spec["backend"] == "fa2"
     assert spec["dtype_kv"] == fp8
     assert spec["packed_fp4_kv"] is False
+
+
+def test_begin_forward_goes_through_this_wrappers_plan():
+    """The parent's ``begin_forward = plan`` alias must not be inherited.
+
+    It captures the parent's ``plan`` function, so a caller reaching it would
+    plan without ``_check_specialization``, without the ``max_sequence_kv``
+    refusal, and with the parent's ``q_data_type`` default of ``"float16"``
+    rather than the dtype this wrapper was built for.
+    """
+    _skip_unless_fa2_jit()
+    from flashinfer.attention import _core
+    from flashinfer.prefill import BatchPrefillWithPagedKVCacheWrapper
+
+    cls = _core.BatchPrefillWithCausalBidirectionalRangesWrapper
+    assert cls.__dict__["begin_forward"] is cls.__dict__["plan"]
+    assert (
+        cls.__dict__["begin_forward"]
+        is not BatchPrefillWithPagedKVCacheWrapper.__dict__["plan"]
+    )
+
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    qo_len = kv_len = 32
+    num_qo_heads, num_kv_heads = 8, 2
+
+    k = torch.randn(kv_len, num_kv_heads, HEAD_DIM, device=device, dtype=dtype)
+    v = torch.randn(kv_len, num_kv_heads, HEAD_DIM, device=device, dtype=dtype)
+    _, kv_indptr, kv_indices, last_page_len = _build_paged(
+        k, v, [kv_len], device, dtype
+    )
+    qo_indptr = torch.tensor([0, qo_len], dtype=torch.int32, device=device)
+
+    workspace = torch.empty(32 * 1024 * 1024, dtype=torch.uint8, device=device)
+    wrapper = flashinfer.BatchPrefillWithCausalBidirectionalRangesWrapper(
+        workspace,
+        kv_layout="NHD",
+        q_data_type=dtype,
+        kv_data_type=dtype,
+        head_dim_qk=HEAD_DIM,
+        head_dim_vo=HEAD_DIM,
+    )
+    args = (
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        HEAD_DIM,
+        PAGE_SIZE,
+    )
+    kwargs = dict(q_data_type=dtype, kv_data_type=dtype)
+
+    # Every refusal the override owns has to fire through this entry point too.
+    with pytest.raises(NotImplementedError, match="max_sequence_kv"):
+        wrapper.begin_forward(*args, max_sequence_kv=512, **kwargs)
+    with pytest.raises(ValueError, match="window_left"):
+        wrapper.begin_forward(*args, window_left=8, **kwargs)
+    with pytest.raises(ValueError, match="causal"):
+        wrapper.begin_forward(*args, causal=True, **kwargs)
+    with pytest.raises(ValueError, match="head_dim_qk"):
+        wrapper.begin_forward(
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            last_page_len,
+            num_qo_heads,
+            num_kv_heads,
+            64,
+            PAGE_SIZE,
+            **kwargs,
+        )
+
+    # And a valid plan through it leaves the wrapper usable, with the dtype it
+    # was built for rather than the parent's float16 default.
+    wrapper.begin_forward(*args)
+    assert wrapper._cached_q_data_type == dtype
+
+    q = torch.randn(qo_len, num_qo_heads, HEAD_DIM, device=device, dtype=dtype)
+    ranges = torch.full((qo_len, 2), -1, dtype=torch.int32, device=device)
+    out = wrapper.run(q, _build_paged(k, v, [kv_len], device, dtype)[0], ranges)
+    assert out.shape == q.shape
+
+
+@pytest.mark.parametrize(("q_target", "window"), [(30, 1), (30, 4), (30, 9), (20, 6)])
+def test_range_window_left_excludes_the_key_at_the_window(q_target, window):
+    """``N`` keeps distances ``0..N-1``: the key at distance ``N`` is out.
+
+    One key carries a spike and the rest are zero, so whether the edge is
+    exclusive or inclusive is the difference between reading 0 and reading a
+    nonzero weight. A mean over the kept set would not do: moving the edge by
+    one key shifts it by 0.5, which is inside bf16 noise at these magnitudes.
+
+    The span is closed at the query itself so the forward side adds nothing,
+    and the causal window is 0 so it contributes only the diagonal.
+    """
+    _skip_unless_fa2_jit()
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    kv_len = qo_len = 48
+    spike = q_target - window  # excluded at N, included at N + 1
+
+    q = torch.zeros(qo_len, 1, HEAD_DIM, device=device, dtype=dtype)
+    k = torch.zeros(kv_len, 1, HEAD_DIM, device=device, dtype=dtype)
+    v = torch.zeros(kv_len, 1, HEAD_DIM, device=device, dtype=dtype)
+    v[spike, 0, 0] = 1.0
+
+    kv_cache, kv_indptr, kv_indices, last_page_len = _build_paged(
+        k, v, [kv_len], device, dtype
+    )
+    qo_indptr = torch.tensor([0, qo_len], dtype=torch.int32, device=device)
+    ranges = torch.full((qo_len, 2), -1, dtype=torch.int32, device=device)
+    for row in range(qo_len):
+        ranges[row, 0] = 0
+        ranges[row, 1] = row
+
+    workspace = torch.empty(32 * 1024 * 1024, dtype=torch.uint8, device=device)
+    wrapper = flashinfer.BatchPrefillWithCausalBidirectionalRangesWrapper(
+        workspace,
+        kv_layout="NHD",
+        q_data_type=dtype,
+        kv_data_type=dtype,
+        head_dim_qk=HEAD_DIM,
+        head_dim_vo=HEAD_DIM,
+    )
+    wrapper.plan(
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        last_page_len,
+        1,
+        1,
+        HEAD_DIM,
+        PAGE_SIZE,
+        q_data_type=dtype,
+        kv_data_type=dtype,
+    )
+
+    at_n = (
+        wrapper.run(
+            q, kv_cache, ranges, causal_window_left=0, range_window_left=window
+        )[q_target, 0, 0]
+        .float()
+        .item()
+    )
+    at_n_plus_1 = (
+        wrapper.run(
+            q, kv_cache, ranges, causal_window_left=0, range_window_left=window + 1
+        )[q_target, 0, 0]
+        .float()
+        .item()
+    )
+
+    assert at_n == pytest.approx(0.0, abs=1e-3), (
+        f"range_window_left={window} kept the key at distance {window}"
+    )
+    assert at_n_plus_1 == pytest.approx(1.0 / (window + 1), rel=5e-2), (
+        f"range_window_left={window + 1} did not keep the key at distance "
+        f"{window}, or kept a different number of keys"
+    )
+
+
+def test_range_window_left_off_values_leave_spans_unclamped():
+    """``0`` and negatives both mean unclamped, unlike ``causal_window_left``.
+
+    The causal window is narrowed first. It is unbounded by default, and the
+    mask is a union, so every key the range clamp would drop on the backward
+    side is one the causal term keeps anyway; the clamp is only observable once
+    causal stops covering it.
+    """
+    _skip_unless_fa2_jit()
+    qo_lens, kv_lens = [48], [48]
+    spans = [[(i, (4, 40)) for i in range(4, 41)]]
+    common = dict(causal_window_left=0, seed=7)
+    base, _, _ = _run_case(qo_lens, kv_lens, spans, range_window_left=-1, **common)
+    zero, _, _ = _run_case(qo_lens, kv_lens, spans, range_window_left=0, **common)
+    torch.testing.assert_close(base.float(), zero.float(), atol=2e-2, rtol=2e-2)
+
+    clamped, _, _ = _run_case(qo_lens, kv_lens, spans, range_window_left=8, **common)
+    assert not torch.allclose(base.float(), clamped.float(), atol=1e-2, rtol=1e-2), (
+        "a positive clamp did not change the answer for this shape"
+    )
