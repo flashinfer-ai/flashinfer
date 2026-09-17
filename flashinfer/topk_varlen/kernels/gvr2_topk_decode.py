@@ -6045,6 +6045,16 @@ def _val__regclus(frags, s: int):
     return frags[s // 4][s % 4]
 
 
+@cute.jit
+def _store_regclus_index(out_row, column, index, stage_addr, page_size: cutlass.Constexpr):
+    if cutlass.const_expr(page_size == 0):
+        out_row[column] = index
+    else:
+        # All cluster ranks contribute logical winners to rank 0's epilogue.
+        address = _mapa_shared_cluster_addr(stage_addr + column * cutlass.Int32(4), cutlass.Int32(0))
+        _st_shared_cluster_i32(address, index)
+
+
 class GvrRegClusKernel:
     """gvr_reg_clus<BLK, VPT, CS>."""
 
@@ -6057,8 +6067,10 @@ class GvrRegClusKernel:
         varlen: bool = False,
         next_n: int = 1,
         cr_shift: int = 0,
+        page_size: int = 0,
     ):
         assert blk == BLKC, "all instantiations BLK=BLKC=1024"
+        self.page_size = page_size
         assert vpt in (1, 2, 4) and cs in (2, 4, 8)
         self.blk = blk
         self.vpt = vpt
@@ -6085,6 +6097,7 @@ class GvrRegClusKernel:
         kv_lens: cute.Tensor,
         out: cute.Tensor,
         n: cutlass.Int32,
+        mapping=None,
     ):
         BLK = cutlass.const_expr(self.blk)
         VPT = cutlass.const_expr(self.vpt)
@@ -6131,7 +6144,7 @@ class GvrRegClusKernel:
                         ov = cutlass.Int32(-1)
                         if tid < nv:
                             ov = tid
-                        out[row, tid] = ov
+                        _store_mapped_index(out[row, None], tid, ov, mapping, row, self.page_size)
 
         # ------------------------------------------------------------------
         # Predeclarations (DSL AST rule: every scalar (re)assigned under a
@@ -6374,7 +6387,7 @@ class GvrRegClusKernel:
                             (base4 + tid + cutlass.Int32((s // 4) * self.blk)) << cutlass.Int32(2)
                         ) + cutlass.Int32(s % 4)
                         if p < lim1:
-                            out_row[p] = idx
+                            _store_regclus_index(out_row, p, idx, sbase + cutlass.Int32(SMEM_BYTES), self.page_size)
                         else:
                             if whole == cutlass.Int32(0):
                                 # crossing overflow -> striped DSMEM slabs; TWO
@@ -6395,7 +6408,7 @@ class GvrRegClusKernel:
                     bn = _umin_u32__regclus(f2u_rz(qv), cutlass.Uint32(NB__regclus - 1))
                     p = atomic_add_cta(s_mrg.iterator + cutlass.Int32(bn), cutlass.Int32(1))
                     if p < lim1:
-                        out_row[p] = tix
+                        _store_regclus_index(out_row, p, tix, sbase + cutlass.Int32(SMEM_BYTES), self.page_size)
                     else:
                         if whole == cutlass.Int32(0):
                             q2i = p - above
@@ -6436,7 +6449,7 @@ class GvrRegClusKernel:
                                     rnk = rnk + tinc
                                     j = j + cutlass.Int32(1)
                                 if rnk < need:
-                                    out_row[above + rnk] = s_ci[i]
+                                    _store_regclus_index(out_row, above + rnk, s_ci[i], sbase + cutlass.Int32(SMEM_BYTES), self.page_size)
                                 i = i + cutlass.Int32(BLK)
                         else:
                             # (2) key-space narrowing over striped DSMEM slabs:
@@ -6587,10 +6600,10 @@ class GvrRegClusKernel:
                                 p2e = b2 + popc(n2 & lml)
                                 if q1f == cutlass.Int32(1):
                                     if p1e < aboveC:
-                                        out_row[above + p1e] = idv
+                                        _store_regclus_index(out_row, above + p1e, idv, sbase + cutlass.Int32(SMEM_BYTES), self.page_size)
                                 if q2f == cutlass.Int32(1):
                                     if p2e < needC:
-                                        out_row[above + aboveC + p2e] = idv
+                                        _store_regclus_index(out_row, above + aboveC + p2e, idv, sbase + cutlass.Int32(SMEM_BYTES), self.page_size)
                                 it = it + cutlass.Int32(1)
                     else:
                         # (3) degen safety net: crossing bin larger than the
@@ -6701,15 +6714,25 @@ class GvrRegClusKernel:
                             p2e = b2 + popc(n2 & lml)
                             if q1f == cutlass.Int32(1):
                                 if p1e < nA:
-                                    out_row[p1e] = i
+                                    _store_regclus_index(out_row, p1e, i, sbase + cutlass.Int32(SMEM_BYTES), self.page_size)
                             if q2f == cutlass.Int32(1):
                                 if p2e < nT:
-                                    out_row[nA + p2e] = i
+                                    _store_regclus_index(out_row, nA + p2e, i, sbase + cutlass.Int32(SMEM_BYTES), self.page_size)
                             it = it + cutlass.Int32(1)
 
             # ---- P10: FINAL cluster rendezvous — ALL ranks reach it;
             # keeps peers resident until rank 0 has read their ck/ci.
+            # Also publishes every rank's staged winner stores. Rank 0 then
+            # reads only its own shared memory, so peers can safely exit.
             _cluster_sync_aligned()
+            if cutlass.const_expr(self.page_size > 0):
+                if rank == cutlass.Int32(0):
+                    staged = cute.make_tensor(
+                        cute.make_ptr(cutlass.Int32, sbase + cutlass.Int32(SMEM_BYTES), cute.AddressSpace.smem, assumed_align=16),
+                        cute.make_layout((pre_idx.shape[1],)),
+                    )
+                    if tid < cutlass.Int32(pre_idx.shape[1]):
+                        _store_mapped_index(out[row, None], tid, staged[tid], mapping, row, self.page_size)
 
     # ------------------------------------------------------------------
     @cute.jit
@@ -6737,19 +6760,33 @@ class GvrRegClusKernel:
 # ---------------------------------------------------------------------------
 # host wrapper: compile cache + route()-driven entry
 # ---------------------------------------------------------------------------
+class GvrRegClusPagedKernel(GvrRegClusKernel):
+    @cute.jit
+    def __call__(self, logits: cute.Tensor, pre_idx: cute.Tensor, kv_lens: cute.Tensor,
+                 out: cute.Tensor, n: cutlass.Int32, mapping, stream):
+        self.kern(logits, pre_idx, kv_lens, out, n, mapping).launch(
+            grid=(self.cs, out.shape[0], 1), block=(self.blk, 1, 1),
+            cluster=(self.cs, 1, 1), stream=stream,
+            smem=SMEM_BYTES + pre_idx.shape[1] * 4,
+            min_blocks_per_mp=1, use_pdl=self.pdl,
+        )
+
+
 _COMPILE_CACHE__regclus: dict = {}
 
 
-def get_compiled__regclus(tpl, dump_dir=None, pdl=False, varlen=False, next_n=1, cr_shift=0):
+def get_compiled__regclus(tpl, dump_dir=None, pdl=False, varlen=False, next_n=1, cr_shift=0, mapping_spec=None):
     """Compile (or fetch) the variant for constexpr tuple (BLK, VPT, CS)."""
-    key = (tuple(tpl), bool(pdl), bool(varlen), int(next_n), int(cr_shift), C._compile_arch_token())
+    key = (tuple(tpl), bool(pdl), bool(varlen), int(next_n), int(cr_shift), C._compile_arch_token(), mapping_spec)
     compiled = _COMPILE_CACHE__regclus.get(key)
     if compiled is None:
         from cutlass.cute import runtime as _crt
 
         blk, vpt, cs = tpl
-        kernel = GvrRegClusKernel(
-            blk, vpt, cs, pdl=pdl, varlen=varlen, next_n=next_n, cr_shift=cr_shift
+        kernel_cls = GvrRegClusKernel if mapping_spec is None else GvrRegClusPagedKernel
+        kernel = kernel_cls(
+            blk, vpt, cs, pdl=pdl, varlen=varlen, next_n=next_n, cr_shift=cr_shift,
+            page_size=0 if mapping_spec is None else mapping_spec[0],
         )
         nb_, nc_ = cute.sym_int(), cute.sym_int()
         nb2_, nc2_ = cute.sym_int(), cute.sym_int()
@@ -6768,6 +6805,16 @@ def get_compiled__regclus(tpl, dump_dir=None, pdl=False, varlen=False, next_n=1,
             cutlass.Int32, (v0_,), stride_order=(0,), assumed_align=4
         )
         fake_stream = _crt.make_fake_stream(use_tvm_ffi_env_stream=True)
+        mapping_args = ()
+        if mapping_spec is not None:
+            _, has_row_map, has_page_starts, has_raw = mapping_spec
+            pages_fake = _crt.make_fake_tensor(
+                cutlass.Int32, (cute.sym_int(), cute.sym_int()),
+                stride=(cute.sym_int64(), 1), assumed_align=4,
+            )
+            mapping_args = ((pages_fake, kv_fake if has_row_map else None,
+                             kv_fake if has_page_starts else None,
+                             out_fake if has_raw else None),)
         opts = _base_compile_opts()
         if dump_dir:
             opts += f" --keep-ptx --keep-cubin --dump-dir {dump_dir}"
@@ -6780,6 +6827,7 @@ def get_compiled__regclus(tpl, dump_dir=None, pdl=False, varlen=False, next_n=1,
                 kv_fake,
                 out_fake,
                 cutlass.Int32(0),
+                *mapping_args,
                 stream=fake_stream,
                 options=opts,
             )
@@ -6792,6 +6840,8 @@ def get_compiled__regclus(tpl, dump_dir=None, pdl=False, varlen=False, next_n=1,
                 "regclus_" + "_".join(str(x) for x in tuple(tpl))
                 + f"_pdl{int(bool(pdl))}_vl{int(bool(varlen))}_nn{int(next_n)}_cs{int(cr_shift)}"
             )
+            if mapping_spec is not None:
+                name += "_paged_" + "_".join(str(int(x)) for x in mapping_spec)
             compiled = C._persist(name, _compile_fn)
         _COMPILE_CACHE__regclus[key] = compiled
     return compiled

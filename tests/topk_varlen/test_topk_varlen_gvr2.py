@@ -87,6 +87,9 @@ _FMIN = -3.4028234663852886e38  # torch.finfo(torch.float32).min
         (8192, 512),
         (8448, 512),
         (16384, 512),
+        (16640, 512),
+        (32768, 512),
+        (65536, 1024),
         (4096, 1024),
         (8192, 2048),
     ],
@@ -174,8 +177,9 @@ def test_gvr2_fused_page_transform(width, k, page_size, save_raw):
 
 
 @requires_gvr2
-def test_gvr2_fused_page_transform_graph():
-    rows, width, k, page_size = 8, 8448, 512, 64
+@pytest.mark.parametrize("width", [8448, 16640])
+def test_gvr2_fused_page_transform_graph(width):
+    rows, k, page_size = 8, 512, 64
     scores = torch.randn((rows, width), device="cuda")
     # Fewer pages than the score allocation is legal if valid lengths fit.
     pages = torch.randperm(rows * 128, device="cuda").int().view(rows, 128)
@@ -226,10 +230,11 @@ def test_gvr2_fused_page_transform_graph():
 
 
 @requires_gvr2
-def test_gvr2_fused_page_transform_padding_pages():
-    scores = torch.randn((3, 512), device="cuda")
+@pytest.mark.parametrize("width", [512, 16640])
+def test_gvr2_fused_page_transform_padding_pages(width):
+    scores = torch.randn((3, width), device="cuda")
     pages = torch.tensor([[7, 8], [9, 10], [11, 12]], device="cuda", dtype=torch.int32)
-    lengths = torch.tensor([512, 512, 512], device="cuda", dtype=torch.int32)
+    lengths = torch.tensor([width, width, width], device="cuda", dtype=torch.int32)
     starts = torch.tensor([0, -1, 2], device="cuda", dtype=torch.int32)
     raw = torch.empty((3, 512), device="cuda", dtype=torch.int32)
     out = flashinfer.top_k_page_table_transform(
@@ -242,9 +247,16 @@ def test_gvr2_fused_page_transform_padding_pages():
         out_raw_indices=raw,
         backend="gvr_2",
     )
-    logical = torch.arange(512, device="cuda")
-    torch.testing.assert_close(raw.long(), logical.expand(3, -1))
+    if width == 512:
+        torch.testing.assert_close(
+            raw.long(), torch.arange(512, device="cuda").expand(3, -1)
+        )
     for row in range(3):
+        logical = raw[row].long()
+        torch.testing.assert_close(
+            scores[row, logical].sort().values,
+            scores[row].topk(512).values.sort().values,
+        )
         page_col = logical // 64 + starts[row]
         valid = (page_col >= 0) & (page_col < pages.shape[1])
         expected = torch.full((512,), -1, device="cuda", dtype=torch.int32)
@@ -281,7 +293,10 @@ def test_gvr2_fused_page_transform_rejections():
 
 
 @requires_gvr2
-@pytest.mark.parametrize("width,rows", [(4096, 2), (8192, 256), (16384, 32)])
+@pytest.mark.parametrize(
+    "width,rows",
+    [(4096, 2), (8192, 256), (16384, 32), (16640, 32), (16640, 64), (32768, 8)],
+)
 @pytest.mark.parametrize(
     "pattern", ["constant", "quantized4", "huge_flood_lt_k", "posinf"]
 )

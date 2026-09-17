@@ -1150,6 +1150,7 @@ def top_k_page_table_transform(
     backend : str, optional
         ``"auto"`` preserves the existing radix/clusters/CUB dispatch.
         ``"gvr_2"`` explicitly selects hint-free fused GVR register kernels
+        (single-CTA or clustered)
         on supported GPUs, for FP32 scores and k=512/1024/2048. Requires
         full score rows and no deterministic or index tie-break guarantee.
         Unsupported GVR kernel families raise ``NotImplementedError``.

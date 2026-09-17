@@ -38,7 +38,7 @@ the existing ``page_size``, ``row_to_batch``, ``page_table_row_starts``,
 output is allocated when ``out_raw_indices`` is omitted. Short rows emit
 their logical positions in order and pad the remaining output with ``-1``.
 
-This initial backend supports the GVR register and register-image routes,
+This backend supports the GVR register, register-image and clustered-register routes,
 FP32 full-row scores, and K of 512, 1024 or 2048 on supported GVR GPUs.
 Other kernel families raise ``NotImplementedError``; score windows,
 deterministic ordering and explicit tie breaking are not supported.

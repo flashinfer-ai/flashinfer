@@ -1611,17 +1611,21 @@ def run_page_table_transform(
             raise ValueError("logits view storage too small to widen to its row stride")
         lg = logits.as_strided((rows, pitch), (pitch, 1), logits.storage_offset())
     plan = route(rows, max(width, k + 1), pitch, k, sms=_sm_count())
-    if plan["kernel"] not in ("reg", "regimg"):
+    if plan["kernel"] not in ("reg", "regimg", "reg_clus"):
         raise NotImplementedError("gvr_2 fused page transform currently supports the register families only")
     mapping_spec = (page_size, row_to_batch is not None, page_table_row_starts is not None, out_raw_indices is not None)
     dev = _device()
-    compiled = _gate_first_call(dev.get_compiled__reg(
+    compiler = dev.get_compiled__regclus if plan["kernel"] == "reg_clus" else dev.get_compiled__reg
+    compiled = _gate_first_call(compiler(
         tuple(plan["tpl"]), varlen=True, mapping_spec=mapping_spec,
     ))
     anchor = _hint_free_pre_idx(rows, k, logits.device)
-    compiled(lg, anchor, lengths, out, width, plan["rt"]["CMP"], plan["rt"]["QC"],
-             dev.STATIC_BYTES + plan["smem"],
-             (page_table, row_to_batch, page_table_row_starts, out_raw_indices))
+    mapping = (page_table, row_to_batch, page_table_row_starts, out_raw_indices)
+    if plan["kernel"] == "reg_clus":
+        compiled(lg, anchor, lengths, out, width, mapping)
+    else:
+        compiled(lg, anchor, lengths, out, width, plan["rt"]["CMP"], plan["rt"]["QC"],
+                 dev.STATIC_BYTES + plan["smem"], mapping)
     return out
 
 
