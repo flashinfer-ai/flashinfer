@@ -209,6 +209,17 @@ constexpr bool use_kv_repack(bool enable_fp4_repack) {
          (!is_fp4_type_v<DTypeKV> || (HEAD_DIM_QK <= 256 && enable_fp4_repack));
 }
 
+// NVFP4 repacking uses the 128-byte KV producer and native 16-bit MMA loads,
+// both of which support a single MMA KV tile with four Q warps. Keep the
+// legacy one-byte alignment constraint for FP8 and the non-repacked FP4 path.
+// Share this minimum between trait validation and the launchers' smem budgets.
+template <typename DTypeKV, uint32_t NUM_WARPS_Q>
+constexpr uint32_t get_min_num_mma_kv(bool use_repack) {
+  return (sizeof(DTypeKV) == 1 && !(is_fp4_type_v<DTypeKV> && use_repack) && NUM_WARPS_Q > 2)
+             ? NUM_WARPS_Q / 2
+             : 1;
+}
+
 template <typename DTypeQ, typename DTypeKV, uint32_t CTA_TILE_Q, uint32_t CTA_TILE_KV,
           uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, bool ENABLE_FP4_REPACK,
           bool = use_kv_repack<DTypeKV, CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO>(ENABLE_FP4_REPACK)>
@@ -421,7 +432,7 @@ struct KernelTraits {
             (NUM_MMA_Q * (8 * (USE_VO_SPLIT ? NUM_MMA_D_VO_PER_WARP : NUM_MMA_D_VO_TILE) +
                           2 * sizeof(DTypeQKAccum) * NUM_MMA_KV) >=
              256) ||
-            (sizeof(DTypeKV) == 1 && NUM_MMA_KV * 2 % NUM_WARPS_Q != 0) ||
+            (NUM_MMA_KV % get_min_num_mma_kv<DTypeKV, NUM_WARPS_Q>(USE_KV_REPACK) != 0) ||
             (sizeof(DTypeKV) == 1 && !is_fp4_type_v<DTypeKV> &&
              POS_ENCODING_MODE == PosEncodingMode::kRoPELlama));
   }
@@ -893,8 +904,7 @@ __device__ __forceinline__ void page_produce_kv_sf(
           }
         }
         // NUM_SF_ITERS is rounded up, so the last iter has lanes with
-        // flat_byte >= SF_TOTAL_BYTES. Unlike the predicated cp_async store below,
-        // this write is unconditional, so guard it on the buffer bound (not in_bounds,
+        // flat_byte >= SF_TOTAL_BYTES. Guard this write on the buffer bound (not in_bounds,
         // which would also skip the intended zero-fill of in-buffer padding rows).
         if (flat_byte < SF_TOTAL_BYTES) {
           *reinterpret_cast<uint32_t*>(sf_smem + flat_byte) = packed;
@@ -907,9 +917,14 @@ __device__ __forceinline__ void page_produce_kv_sf(
         // update_mdo_states, so they never reach the accumulator.
         constexpr auto fill_mode = produce_v ? cp_async::SharedMemFillMode::kFillZero
                                              : cp_async::SharedMemFillMode::kNoFill;
+        // A false source predicate still zero-fills V. Predicate the destination
+        // separately so unused lanes skip the copy without a divergent branch.
+        // Keep predicated-off pointers in bounds before conversion to a shared address.
+        const uint32_t dst_byte = flat_byte < SF_TOTAL_BYTES ? flat_byte : 0;
         cp_async::pred_load_32b<fill_mode>(
-            reinterpret_cast<uint32_t*>(sf_smem + flat_byte),
-            reinterpret_cast<const uint32_t*>(sf_ptr + sf_gmem_offset), in_bounds);
+            reinterpret_cast<uint32_t*>(sf_smem + dst_byte),
+            reinterpret_cast<const uint32_t*>(sf_ptr + sf_gmem_offset), in_bounds,
+            flat_byte < SF_TOTAL_BYTES);
       }
     }
   }
@@ -979,9 +994,11 @@ __device__ __forceinline__ void produce_kv_sf(SmemStorage* smem_storage, uint8_t
       // Same rationale as page_produce_kv_sf: zero-fill V SF to prevent 0*NaN=NaN in compute_sfm_v.
       constexpr auto fill_mode =
           produce_v ? cp_async::SharedMemFillMode::kFillZero : cp_async::SharedMemFillMode::kNoFill;
-      cp_async::pred_load_32b<fill_mode>(reinterpret_cast<uint32_t*>(sf_smem + flat_byte),
+      // Predicate the destination separately from the source (see page_produce_kv_sf).
+      const uint32_t dst_byte = flat_byte < SF_TOTAL_BYTES ? flat_byte : 0;
+      cp_async::pred_load_32b<fill_mode>(reinterpret_cast<uint32_t*>(sf_smem + dst_byte),
                                          reinterpret_cast<const uint32_t*>(sf_ptr + sf_gmem_offset),
-                                         in_bounds);
+                                         in_bounds, flat_byte < SF_TOTAL_BYTES);
     }
   }
 }
@@ -2860,12 +2877,9 @@ cudaError_t SinglePrefillWithKVCacheDispatchedImpl(Params params, typename Param
         kSinglePrefillVOSplitDispatch ? (NUM_WARPS_KV * CTA_TILE_Q * 8u + 2048u) : 0u;
     constexpr uint32_t kFixedSmem = CTA_TILE_Q * HEAD_DIM_QK * sizeof(DTypeQ) +
                                     kSinglePrefillVOSplitFixedSmem + kSharedRopeFreqSmem;
-    // Smallest NUM_MMA_KV satisfying the FP8 alignment constraint
-    // (sizeof(DTypeKV)==1 requires NUM_MMA_KV*2 % NUM_WARPS_Q == 0); size the
-    // occupancy budget against the minimum *valid* tile so the staging buffer
-    // can't shrink NUM_MMA_KV onto an invalid value on tight-smem parts (SM120).
-    constexpr uint32_t kMinValidMmaKV =
-        (sizeof(DTypeKV) == 1 && NUM_WARPS_Q > 2) ? (NUM_WARPS_Q / 2) : 1;
+    // Budget two CTAs only when the smallest valid KV tile fits. Repacked
+    // NVFP4 permits NUM_MMA_KV=1, which enables two CTAs at head_dim=256 on SM89.
+    constexpr uint32_t kMinValidMmaKV = get_min_num_mma_kv<DTypeKV, NUM_WARPS_Q>(kUseRepack);
     const int num_ctas_per_sm =
         max_smem_per_sm >= 2 * (kFixedSmem + kMinValidMmaKV * kKVSmemPerMmaKV) ? 2 : 1;
     const int max_smem_per_threadblock =
@@ -4518,13 +4532,9 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatchedImpl(Params params,
                                                : 0u;
   constexpr uint32_t kFixedSmem =
       CTA_TILE_Q * HEAD_DIM_QK * sizeof(DTypeQ) + kVOSplitFixedSmem + kSharedRopeFreqSmem;
-  // Smallest NUM_MMA_KV satisfying the FP8 alignment constraint
-  // (sizeof(DTypeKV)==1 requires NUM_MMA_KV*2 % NUM_WARPS_Q == 0). When the
-  // staging buffer shrinks the tile on tight-smem parts (e.g. SM120), we must
-  // not land on an invalid NUM_MMA_KV, so size the occupancy budget against the
-  // minimum *valid* tile rather than NUM_MMA_KV=1.
-  constexpr uint32_t kMinValidMmaKV =
-      (sizeof(DTypeKV) == 1 && NUM_WARPS_Q > 2) ? (NUM_WARPS_Q / 2) : 1;
+  // Budget two CTAs only when the smallest valid KV tile fits. Repacked
+  // NVFP4 permits NUM_MMA_KV=1, which enables two CTAs at head_dim=256 on SM89.
+  constexpr uint32_t kMinValidMmaKV = get_min_num_mma_kv<DTypeKV, NUM_WARPS_Q>(kUseRepack);
   const int num_ctas_per_sm =
       max_smem_per_sm >= 2 * (kFixedSmem + kMinValidMmaKV * kKVSmemPerMmaKV) ? 2 : 1;
   // The occupancy budget (max_smem_per_sm / num_ctas_per_sm) can exceed the
@@ -4736,13 +4746,9 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatchedImpl(Params params,
                                                : 0u;
   constexpr uint32_t kFixedSmem =
       CTA_TILE_Q * HEAD_DIM_QK * sizeof(DTypeQ) + kVOSplitFixedSmem + kSharedRopeFreqSmem;
-  // Smallest NUM_MMA_KV satisfying the FP8 alignment constraint
-  // (sizeof(DTypeKV)==1 requires NUM_MMA_KV*2 % NUM_WARPS_Q == 0). When the
-  // staging buffer shrinks the tile on tight-smem parts (e.g. SM120), we must
-  // not land on an invalid NUM_MMA_KV, so size the occupancy budget against the
-  // minimum *valid* tile rather than NUM_MMA_KV=1.
-  constexpr uint32_t kMinValidMmaKV =
-      (sizeof(DTypeKV) == 1 && NUM_WARPS_Q > 2) ? (NUM_WARPS_Q / 2) : 1;
+  // Budget two CTAs only when the smallest valid KV tile fits. Repacked
+  // NVFP4 permits NUM_MMA_KV=1, which enables two CTAs at head_dim=256 on SM89.
+  constexpr uint32_t kMinValidMmaKV = get_min_num_mma_kv<DTypeKV, NUM_WARPS_Q>(kUseRepack);
   const int num_ctas_per_sm =
       max_smem_per_sm >= 2 * (kFixedSmem + kMinValidMmaKV * kKVSmemPerMmaKV) ? 2 : 1;
   const int max_smem_per_threadblock =
