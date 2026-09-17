@@ -399,17 +399,13 @@ def msa_sparse_decode_attention(
             raise NotImplementedError(
                 "SM90 msa_sparse_decode_attention requires the paged KV layout"
             )
-        if (
-            k_scale is not None
-            or v_scale is not None
-            or k_global_scale is not None
-            or v_global_scale is not None
-        ):
-            # Silently dropping a scale would return plausible, wrong numbers.
-            raise NotImplementedError("SM90 msa_sparse_decode_attention has no dequant path")
-        if softmax_scale is not None and softmax_scale != head_dim**-0.5:
+        if k_scale is not None or v_scale is not None or k_global_scale is not None:
+            # Per-tensor k/v scale tensors have no SM90 path; a silently dropped
+            # scale would return plausible, wrong numbers. softmax_scale and
+            # v_global_scale ARE handled -- folded into q and the output below.
             raise NotImplementedError(
-                "SM90 msa_sparse_decode_attention uses the default softmax scale"
+                "SM90 msa_sparse_decode_attention handles softmax_scale and "
+                "v_global_scale, but not per-tensor k_scale/v_scale/k_global_scale"
             )
         from ._sm90_dispatch import sparse_decode_sm90
 
@@ -417,7 +413,8 @@ def msa_sparse_decode_attention(
             (total_q, num_qo_heads, head_dim), dtype=compute_dtype, device=q.device
         )
         return sparse_decode_sm90(
-            q, k, v, q2k_indices, page_table, seqused_k, out
+            q, k, v, q2k_indices, page_table, seqused_k, out,
+            softmax_scale=softmax_scale, v_global_scale=v_global_scale,
         )
     topk = q2k_indices.shape[2]
     if topk <= 0:

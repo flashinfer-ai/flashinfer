@@ -234,22 +234,21 @@ def msa_sparse_attention(
             raise NotImplementedError("SM90 msa_sparse_attention does not return an LSE")
         if page_table is None or seqused_k is None:
             raise NotImplementedError("SM90 msa_sparse_attention requires the paged KV layout")
-        if softmax_scale != head_dim**-0.5:
-            raise NotImplementedError("SM90 msa_sparse_attention uses the default softmax scale")
-        if (
-            k_scale is not None
-            or v_scale is not None
-            or k_global_scale is not None
-            or v_global_scale is not None
-        ):
-            # Silently dropping a scale would return plausible, wrong numbers.
-            raise NotImplementedError("SM90 msa_sparse_attention has no dequant path")
+        if k_scale is not None or v_scale is not None or k_global_scale is not None:
+            # softmax_scale and v_global_scale ARE handled (folded into q and the
+            # output); per-tensor scale tensors have no SM90 path and dropping one
+            # silently would return plausible, wrong numbers.
+            raise NotImplementedError(
+                "SM90 msa_sparse_attention handles softmax_scale and v_global_scale, "
+                "but not per-tensor k_scale/v_scale/k_global_scale"
+            )
         from ._sm90_dispatch import sparse_prefill_sm90
 
         out = torch.zeros((total_q, num_qo_heads, head_dim), dtype=q.dtype, device=q.device)
         return sparse_prefill_sm90(
             q, k, v, q2k_indices, cu_seqlens_q, page_table, seqused_k, out,
             q_offset=q_offset if isinstance(q_offset, torch.Tensor) else None,
+            softmax_scale=softmax_scale, v_global_scale=v_global_scale,
         )
 
     kv_fp8 = k.dtype == torch.float8_e4m3fn

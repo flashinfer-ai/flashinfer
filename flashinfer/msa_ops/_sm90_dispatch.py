@@ -23,6 +23,25 @@ def _prefix_lens(cu_seqlens_q: torch.Tensor, seqused_k: torch.Tensor) -> torch.T
     return (seqused_k.to(torch.int32) - qlen).contiguous()
 
 
+def _fold_scales(q, out_scale, softmax_scale, head_dim):
+    """Fold vLLM's softmax/dequant scales into tensors the SM90 kernels accept.
+
+    The sparse kernels hardcode 1/sqrt(D) and take no scale argument, so an
+    fp8 KV cache -- where vLLM folds k_scale into softmax_scale and passes
+    v_scale as v_global_scale -- cannot be served by passing them through.
+    Pre-scaling q by softmax_scale*sqrt(D) makes the kernel's fixed 1/sqrt(D)
+    reproduce the requested scale exactly; the v scale is applied to the output
+    by the caller. Returns q unchanged when the requested scale already is the
+    kernel's own, so the common bf16 path costs nothing.
+    """
+    if softmax_scale is None:
+        return q
+    default = head_dim ** -0.5
+    if abs(softmax_scale - default) <= 1e-9 * max(1.0, abs(default)):
+        return q
+    return q * (softmax_scale / default)
+
+
 def proxy_score_sm90(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -147,11 +166,15 @@ def sparse_decode_sm90(
     page_table: torch.Tensor,
     seqused_k: torch.Tensor,
     out: torch.Tensor,
+    *,
+    softmax_scale: Optional[float] = None,
+    v_global_scale: Optional[float] = None,
 ) -> torch.Tensor:
     """MSA sparse decode attention on Hopper. Writes ``out``."""
     from .cute_dsl.sparse_decode_sm90 import run as _decode
 
     kv = _as_packed_kv(k, v)
+    q = _fold_scales(q, v_global_scale, softmax_scale, q.shape[-1])
     _decode(
         q,
         kv,
@@ -160,6 +183,8 @@ def sparse_decode_sm90(
         seqused_k.to(torch.int32).contiguous(),
         out,
     )
+    if v_global_scale is not None and v_global_scale != 1.0:
+        out.mul_(v_global_scale)
     return out
 
 
@@ -174,11 +199,14 @@ def sparse_prefill_sm90(
     out: torch.Tensor,
     *,
     q_offset: Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float] = None,
+    v_global_scale: Optional[float] = None,
 ) -> torch.Tensor:
     """MSA sparse prefill attention on Hopper. Writes ``out``."""
     from .cute_dsl.sparse_prefill_sm90 import run as _prefill
 
     kv = _as_packed_kv(k, v)
+    q = _fold_scales(q, v_global_scale, softmax_scale, q.shape[-1])
     cu = cu_seqlens_q.to(torch.int32).contiguous()
     sk = seqused_k.to(torch.int32).contiguous()
     pfx = q_offset.to(torch.int32).contiguous() if q_offset is not None else _prefix_lens(cu, sk)
@@ -192,4 +220,6 @@ def sparse_prefill_sm90(
         pfx,
         out,
     )
+    if v_global_scale is not None and v_global_scale != 1.0:
+        out.mul_(v_global_scale)
     return out
