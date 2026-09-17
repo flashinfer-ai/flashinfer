@@ -663,6 +663,84 @@ The raw megakernel config must be wrapped in `MegaConfig` — `MoEEpLayer` route
 `MegaConfig` → `MoEEpMegaLayer` → `create_mega_kernel(cfg)`, which looks up
 `cfg.kernel_name` in `_MEGA_KERNEL_REGISTRY`.
 
+## CUDA graphs (split layer)
+
+`MoEEpSplitLayer.forward()` on its own is **not** capturable, by construction:
+it creates a `Handle` per call and destroys it in a `finally`, so a graph --
+which records the device pointers it sees at capture time -- would replay
+against freed memory. That failure is silent at capture and only surfaces at
+replay, as an illegal memory access, so `forward()` now refuses capture
+outright and points at the API below.
+
+Capture with `create_graph_state()`, which holds one long-lived handle across
+forwards (the allocating half outside the capture, `Handle.update()` recorded
+inside it):
+
+```python
+state = layer.create_graph_state(t)          # outside any capture, ALL ranks
+layer.forward(t, graph_state=state)          # warmup, still eager
+torch.cuda.synchronize()
+
+g = torch.cuda.CUDAGraph()
+with torch.cuda.graph(g):
+    y = layer.forward(t, graph_state=state)
+
+t.hidden_states.copy_(new_x)                 # in place -- same buffers
+t.topk_ids.copy_(new_ids)
+g.replay()                                   # y now holds this step's result
+```
+
+Rules, in rough order of how easily they are violated:
+
+- **Update the registered tensors in place, never rebind them.** `t`'s
+  tensors become the graph's bound buffers (`topk_weights` is bound into the
+  handle at creation; `out` is the address combine writes). `forward()`
+  re-checks all three addresses each call and raises, because a caller that
+  quietly passed a fresh tensor would otherwise get a graph still serving the
+  old one.
+- **The warmup forward is not optional.** It compiles/autotunes the inner
+  kernel and establishes the transport's steady state; neither can happen
+  during capture.
+- **One shape per state and per graph.** `top_k` and the token count are baked
+  into the handle *and* into the graph. A different batch size needs its own
+  state and its own graph — the usual multi-size-graph pattern.
+- **`enable_timing` is off-limits under capture.** It synchronizes the device
+  to read its CUDA events, which capture forbids. Time `g.replay()` instead
+  (`benchmarks/bench_moe_ep.py --cuda-graph` does exactly this).
+- **All EP ranks must run the same sequence of eager calls and replays.**
+  Ordinary collective discipline, but nixl_ep makes it sharper: its Buffer
+  toggles a *host-side* double-buffer index (`buffer_idx ^= 1`) on every
+  dispatch and combine. Replays run no host code, so every replay reuses the
+  slot that was current at capture. That stays consistent only while the ranks
+  agree on the call sequence.
+- **Retire the graphs before `state.destroy()`.** They hold pointers into the
+  handle's buffers.
+
+Backend notes:
+
+- **nccl_ep** implements the real split: `ncclEpInitHandle` (via
+  `create_handle`) stays outside the capture and `ncclEpUpdateHandle` is
+  recorded inside, mirroring `contrib/nccl_ep/ep_test.cu --use_cuda_graph`.
+  Covered for LL *and* HT.
+- **nixl_ep** has no handle-init step at all — LL dispatch recomputes routing
+  in-kernel from `topk_idx`, and the recv buffers live in the Buffer's
+  persistent RDMA arena. Its `update()` therefore exists to guarantee the
+  *binding* (the int64→int32 ids cast lands in a handle-owned buffer, so the
+  captured address keeps receiving new routing). Under capture the handle also
+  drops its recv hook (`return_recv_hook=False`): the hook is a **host**
+  callback, so a captured one runs once at capture and never on replay,
+  leaving replays reading data that had not landed. The kernel's own arrival
+  wait records faithfully instead.
+
+Tests: `tests/moe_ep/test_split_layer_cudagraph_multirank.py` (layer API, both
+backends) and `tests/moe_ep/test_moe_ep_cudagraph_multirank.py` (the same
+property one layer down, driving `Fleet`/`Handle` directly).
+
+```bash
+torchrun --nproc_per_node=4 -m pytest \
+    tests/moe_ep/test_split_layer_cudagraph_multirank.py -v -m "nvep and gpu_4"
+```
+
 ## Fault tolerance
 
 Enable with `FleetAlgoKnobFaultTolerance()` in `fleet_knobs`. Check support
