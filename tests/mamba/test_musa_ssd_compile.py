@@ -100,3 +100,36 @@ def test_packed_ssd_inductor_fullgraph():
 
     explanation = torch._dynamo.explain(_step)(*_inputs(2303))
     assert explanation.graph_break_count == 0
+
+
+@pytest.mark.skipif(
+    not hasattr(torch.version, "musa") or torch.version.musa is None,
+    reason="MUSA graph test",
+)
+def test_packed_ssd_musa_graph_updates_existing_buffers():
+    compiled = torch.compile(_step, backend="inductor", fullgraph=True, dynamic=False)
+    static = _inputs(2310)
+    compiled(*static)
+    torch.musa.synchronize()
+
+    capture_stream = torch.musa.Stream()
+    capture_stream.wait_stream(torch.musa.current_stream())
+    graph = torch.musa.MUSAGraph()
+    with torch.musa.graph(graph, stream=capture_stream):
+        captured_final_state = compiled(*static)
+    torch.musa.current_stream().wait_stream(capture_stream)
+
+    updated = _inputs(2311)
+    expected_final_state = _step(*updated).clone()
+    expected_output = updated[-2].clone()
+    for index in (*range(8), 13):
+        static[index].copy_(updated[index])
+    static[-2].fill_(float("nan"))
+
+    graph.replay()
+    torch.musa.synchronize()
+    torch.testing.assert_close(
+        captured_final_state, expected_final_state, rtol=0.05, atol=0.05
+    )
+    torch.testing.assert_close(static[-2], expected_output, rtol=0.05, atol=0.05)
+    torch.testing.assert_close(static[-1], updated[-1], rtol=0, atol=0)
