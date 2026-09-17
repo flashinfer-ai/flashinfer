@@ -281,6 +281,21 @@ def _sdpa_prefill_key_fn(
         # (see _build_prefill_graph); omitting it here silently replays a
         # stale-scale graph for any same-shape call with a different scale.
         scale,
+        # The graph is built from the tensors' strides and dtypes too: an HND
+        # graph replayed on NHD-strided (permuted) K/V, or a bf16-KV graph on
+        # fp8 KV, silently reads the wrong elements. Found by the PagedAttention
+        # fuzzer when an HND and an NHD problem shared every other key field.
+        tuple(q.stride()),
+        tuple(k_cache.stride()),
+        tuple(v_cache.stride()),
+        k_cache.dtype,
+        v_cache.dtype,
+        o_data_type,
+        batch_offsets_q is not None,
+        batch_offsets_o is not None,
+        batch_offsets_k is not None,
+        batch_offsets_v is not None,
+        batch_offsets_stats is not None,
     )
     return key
 
@@ -824,6 +839,7 @@ def _batch_prefill_with_kv_cache(
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
     o_data_type: Optional[torch.dtype] = None,
+    lse_base: str = "2",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # Shape override covers the fully ragged token-indptr path (3-D q/k/v with
     # cu_seq_lens on both sides, 16-bit inputs); paged, per-batch-length and fp8
@@ -956,11 +972,13 @@ def _batch_prefill_with_kv_cache(
     graph.execute(var_map, workspace=workspace_buffer, handle=handle, **execute_kwargs)
 
     if return_lse:
-        # cuDNN emits softmax stats as natural-log LSE; every other FlashInfer
-        # backend returns base-2 LSE (they fold log2e into the softmax scale, so
-        # their kernels emit base-2 directly). Convert here so the cuDNN backend
-        # matches that contract. log2(sum exp(x)) = ln(sum exp(x)) * log2(e).
-        lse.mul_(log2e)
+        if lse_base == "2":
+            # cuDNN emits softmax stats as natural-log LSE; every other FlashInfer
+            # backend returns base-2 LSE (they fold log2e into the softmax scale, so
+            # their kernels emit base-2 directly). Convert here so the cuDNN backend
+            # matches that contract. log2(sum exp(x)) = ln(sum exp(x)) * log2(e).
+            # lse_base="e" returns the native stats untouched (no kernel launch).
+            lse.mul_(log2e)
         return out, lse
     else:
         return out, None
@@ -995,6 +1013,7 @@ def cudnn_batch_prefill_with_kv_cache(
     is_cuda_graph_compatible: bool = False,
     backend: Optional[str] = None,
     o_data_type: Optional[torch.dtype] = None,
+    lse_base: str = "2",
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     r"""Batched prefill attention with paged KV cache, backed by cuDNN SDPA.
 
@@ -1099,6 +1118,10 @@ def cudnn_batch_prefill_with_kv_cache(
         autodetects based on cuDNN availability.
     o_data_type : Optional[torch.dtype]
         Optional output dtype; defaults to ``q.dtype``.
+    lse_base : str
+        Base of the returned ``lse``: ``"2"`` (default, the FlashInfer contract)
+        or ``"e"`` (natural log, cuDNN's native stats — skips the conversion
+        kernel; the cubin backend converts instead).
 
     Returns
     -------
@@ -1181,6 +1204,8 @@ def cudnn_batch_prefill_with_kv_cache(
 
     if o_data_type is None:
         o_data_type = q.dtype
+    if lse_base not in ("2", "e"):
+        raise ValueError(f"lse_base must be '2' or 'e', got {lse_base!r}")
 
     if out is None:
         out_shape = (num_tokens, h_qo, d_vo)
@@ -1227,6 +1252,7 @@ def cudnn_batch_prefill_with_kv_cache(
             out=out,
             lse=lse,
             o_data_type=o_data_type,
+            lse_base=lse_base,
         )
 
         if batch_offsets_units == "tokens":
@@ -1337,5 +1363,7 @@ def cudnn_batch_prefill_with_kv_cache(
             None,
             is_cuda_graph_compatible,
         )
+        if return_lse and lse_base == "e":
+            lse.mul_(1.0 / log2e)  # the cubin path emits base-2 natively
 
     return out, lse
