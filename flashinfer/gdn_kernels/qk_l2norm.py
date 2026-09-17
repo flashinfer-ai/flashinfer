@@ -23,6 +23,7 @@ import cutlass.cute as cute
 from cutlass import Float32, Int64
 from ..jit.cute_dsl_core import build_and_load_cute_dsl_kernel
 from .cute_dsl_cache_naming import make_kernel_name
+from .device_target import gdn_compile_options, gdn_device_target, target_arch
 
 
 @cute.jit
@@ -81,7 +82,8 @@ def _launch(
 
 
 @functools.cache
-def _compiled(dtype: torch.dtype, d: int, capability: tuple[int, int]):
+def _compiled(dtype: torch.dtype, d: int, target_key: tuple[int, str]):
+    device = torch.device("cuda", target_key[0])
     dt = {
         torch.bfloat16: cutlass.BFloat16,
         torch.float16: cutlass.Float16,
@@ -98,9 +100,9 @@ def _compiled(dtype: torch.dtype, d: int, capability: tuple[int, int]):
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     return build_and_load_cute_dsl_kernel(
         "gdn_qk_l2norm",
-        make_kernel_name("qk_l2norm", dtype, d, capability),
-        lambda: cute.compile(
-            _launch, q, k, oq, ok, d, stream, options="--enable-tvm-ffi"
+        make_kernel_name("qk_l2norm", dtype, d, target_arch(target_key)),
+        lambda: cute.compile[gdn_compile_options(device, cute.EnableTVMFFI(True))](
+            _launch, q, k, oq, ok, d, stream
         ),
         extra_key_files=(__file__,),
     )
@@ -119,7 +121,7 @@ def normalize_qk(q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.
     oq = torch.empty_like(q)
     ok = torch.empty_like(k)
     with torch.cuda.device(q.device):
-        _compiled(q.dtype, d, torch.cuda.get_device_capability(q.device))(
+        _compiled(q.dtype, d, gdn_device_target(q.device).compile_key)(
             q.reshape(-1, d), k.reshape(-1, d), oq.reshape(-1, d), ok.reshape(-1, d)
         )
     return oq, ok
