@@ -33,7 +33,11 @@ from dataclasses import dataclass
 import torch
 import tvm_ffi
 
-from ...jit.cake_gdn_cp_backend import GDNCPArch, load_gdn_cp_kernel
+from ...jit.cake_gdn_cp_backend import (
+    GDNCPArch,
+    load_gdn_cp_kernel,
+    prepare_gdn_cp_kernel,
+)
 
 _BLOCK = 64
 _HEAD_DIM = 128
@@ -97,6 +101,17 @@ def _choose_chunk_len(
         return max(_BLOCK, _round_up(balanced, _BLOCK))
 
     target_chunks = max(1, num_sms // num_heads)
+    return _choose_long_chunk_len(
+        total_tokens=total_tokens,
+        num_seqs=num_seqs,
+        max_seqlen=max_seqlen,
+        target_chunks=target_chunks,
+    )
+
+
+def _choose_long_chunk_len(
+    *, total_tokens: int, num_seqs: int, max_seqlen: int, target_chunks: int
+) -> int:
     remaining_tokens = max(0, total_tokens - max_seqlen)
     remaining_seqs = max(0, num_seqs - 1)
 
@@ -115,6 +130,27 @@ def _choose_chunk_len(
         else:
             lo = mid + 1
     return lo * _CHUNK_GRANULARITY
+
+
+def _default_physical_chunk_len(
+    *,
+    source_chunk_len: int,
+    total_tokens: int,
+    num_seqs: int,
+    max_seqlen: int,
+    num_heads: int,
+    num_sms: int,
+) -> int:
+    # The admitted SM100/SM103 devices use the HBM short-workload threshold.
+    approx_ctas = _ceil_div(total_tokens, _CHUNK_GRANULARITY) * num_heads
+    if approx_ctas * 2 < num_sms:
+        return source_chunk_len
+    return _choose_long_chunk_len(
+        total_tokens=total_tokens,
+        num_seqs=num_seqs,
+        max_seqlen=max_seqlen,
+        target_chunks=max(1, _ceil_div(num_sms, num_heads)),
+    )
 
 
 def _choose_fixup_kind(num_parallel_states: int, num_sms: int) -> str:
@@ -370,11 +406,23 @@ def _build_plan(
         split_bf16_two_block_factor = (
             q.dtype == torch.bfloat16 and source_cp_chunk_len == 2 * _BLOCK
         )
-        cp_chunk_len = checkpoint_every_n_tokens or (
-            4096
-            if gb300_long_hv64_override
-            else (_BLOCK if split_bf16_two_block_factor else source_cp_chunk_len)
-        )
+        if checkpoint_every_n_tokens:
+            cp_chunk_len = checkpoint_every_n_tokens
+        elif gb300_long_hv64_override:
+            cp_chunk_len = 4096
+        elif split_bf16_two_block_factor:
+            cp_chunk_len = _BLOCK
+        elif total_tokens:
+            cp_chunk_len = _default_physical_chunk_len(
+                source_chunk_len=source_cp_chunk_len,
+                total_tokens=total_tokens,
+                num_seqs=num_seqs,
+                max_seqlen=max_seqlen,
+                num_heads=num_sab_heads,
+                num_sms=num_sms,
+            )
+        else:
+            cp_chunk_len = source_cp_chunk_len
     if cp_chunk_len <= 0 or cp_chunk_len % _BLOCK:
         raise ValueError("cp_chunk_len must be a positive multiple of 64")
     if checkpoint_every_n_tokens and checkpoint_every_n_tokens != cp_chunk_len:
@@ -662,8 +710,12 @@ class GDNCPPrefill:
             else None
         )
         self._t = load_gdn_cp_kernel(plan.t_kernel, plan.arch)
-        self._mn = load_gdn_cp_kernel(plan.mn_kernel, plan.arch)
-        self._fixup = load_gdn_cp_kernel(plan.fixup_kernel, plan.arch)
+        self._mn, self._mn_workspaces = prepare_gdn_cp_kernel(
+            plan.mn_kernel, plan.arch, device=q.device
+        )
+        self._fixup, self._fixup_workspaces = prepare_gdn_cp_kernel(
+            plan.fixup_kernel, plan.arch, device=q.device
+        )
         self._prefill = load_gdn_cp_kernel(plan.prefill_kernel, plan.arch)
         self._gather = None
         self._gather_source = None
@@ -778,6 +830,8 @@ class GDNCPPrefill:
             self.fixed_state,
             self.initial_state_workspace,
             self.tensormap_workspace,
+            *self._mn_workspaces,
+            *self._fixup_workspaces,
             self._gather_source,
             self._scatter_output,
         )

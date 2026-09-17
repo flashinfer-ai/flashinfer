@@ -31,6 +31,12 @@ from tvm_ffi import cpp
 from . import env as jit_env
 from .cpp_ext import get_cuda_path, get_nvcc_parallelism_flags
 
+from .cake_gdn_cp_generated import (
+    load_generated_gdn_cp_kernel,
+    prepare_generated_gdn_cp_kernel,
+)
+
+
 GDNCPArch = Literal["sm_100a", "sm_103a"]
 
 _EXPORT_SCHEMA = "flashinfer-pr4078-sm100-cp-prefill-standalone-export-v3"
@@ -170,6 +176,9 @@ def load_gdn_cp_kernel(name: str, arch: GDNCPArch):
 
     if arch not in ("sm_100a", "sm_103a"):
         raise ValueError(f"unsupported GDN CP-prefill architecture: {arch!r}")
+    generated = load_generated_gdn_cp_kernel(name, arch)
+    if generated is not None:
+        return generated
     record = _kernel_record(name)
     cuda = _cuda_record(record, arch)
     host = record["host_binding"]
@@ -207,4 +216,13 @@ def load_gdn_cp_kernel(name: str, arch: GDNCPArch):
     return module[host["entry"]]
 
 
-__all__ = ["GDNCPArch", "load_gdn_cp_kernel"]
+def prepare_gdn_cp_kernel(name: str, arch: GDNCPArch, *, device):
+    """Prepare per-owner launch storage while sharing only compiled code."""
+
+    generated = prepare_generated_gdn_cp_kernel(name, arch, device=device)
+    if generated is not None:
+        return generated
+    return load_gdn_cp_kernel(name, arch), ()
+
+
+__all__ = ["GDNCPArch", "load_gdn_cp_kernel", "prepare_gdn_cp_kernel"]

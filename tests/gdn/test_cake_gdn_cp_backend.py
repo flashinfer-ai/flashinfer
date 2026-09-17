@@ -77,7 +77,13 @@ def test_generated_source_inventory_and_hashes() -> None:
     }
     assert manifest["frozen_performance_shape_count"] == 120
     assert len(manifest["frozen_performance_shapes"]) == 120
-    assert len(tuple(path for path in root.rglob("*") if path.is_file())) == 72
+    legacy_inventory = {"README.md", "manifest.json"}
+    legacy_inventory.update(header["path"] for header in manifest["cuda_headers"])
+    for kernel in manifest["kernels"]:
+        legacy_inventory.add(kernel["host_binding"]["path"])
+        legacy_inventory.update(output["path"] for output in kernel["outputs"])
+    assert len(legacy_inventory) == 72
+    assert all((root / path).is_file() for path in legacy_inventory)
     implementation_paths = [record["path"] for record in manifest["cuda_headers"]]
     for kernel in manifest["kernels"]:
         implementation_paths.append(kernel["host_binding"]["path"])
@@ -1473,6 +1479,54 @@ def test_public_dispatch_rejects_impossible_max_seqlen_without_cuda_reads(
             use_cp=False,
             max_seqlen=max_seqlen,
         )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3),
+    reason="requires the generated SM103a route",
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("num_seqs", [1, 8])
+def test_generated_tma_workspaces_are_owned_by_prepared_graphs(
+    dtype: torch.dtype, num_seqs: int
+) -> None:
+    # Sixteen parallel states exercise UTCMMA64; 128 exercise UTCMMA128.
+    # Preparing a second graph must not replace the first graph's descriptors.
+    total, hq, hv, dim = num_seqs * 512, 2, 16, 128
+    prepared_graphs = []
+    expected = []
+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+    for seed, stream in enumerate(streams, start=4539):
+        with torch.cuda.stream(stream):
+            torch.manual_seed(seed)
+            q = torch.randn((total, hq, dim), dtype=dtype, device="cuda")
+            k = torch.nn.functional.normalize(
+                torch.randn((total, hq, dim), device="cuda"), dim=-1
+            ).to(dtype)
+            v = torch.randn((total, hv, dim), dtype=dtype, device="cuda")
+            alpha = 1.0 - torch.rand((total, hv), device="cuda") / total
+            beta = torch.rand((total, hv), device="cuda").sigmoid()
+            cu_seqlens = torch.arange(
+                0, total + 1, 512, dtype=torch.int64, device="cuda"
+            )
+            state = torch.randn((num_seqs, hv, dim, dim), device="cuda")
+            prepared = gdn_cp.prepare_gdn_cp_prefill(
+                q, k, v, alpha, beta, cu_seqlens, state, max_seqlen=512
+            )
+            prepared_graphs.append(prepared)
+            expected.append((prepared.output.clone(), prepared.final_state.clone()))
+
+    torch.cuda.synchronize()
+    allocated = torch.cuda.memory_allocated()
+    for _ in range(3):
+        for prepared, stream in zip(prepared_graphs, streams, strict=True):
+            with torch.cuda.stream(stream):
+                prepared.replay()
+    torch.cuda.synchronize()
+    assert torch.cuda.memory_allocated() == allocated
+    for prepared, (output, state) in zip(prepared_graphs, expected, strict=True):
+        _assert_oracle_close(prepared.output, output)
+        _assert_oracle_close(prepared.final_state, state)
 
 
 @pytest.mark.skipif(
