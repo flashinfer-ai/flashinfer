@@ -332,9 +332,10 @@ class CuteDslMxfp4MoEWrapper:
 
         Routing may be separate int32 IDs and BF16/FP32 weights, or packed
         int32 (expert ID in high 16 bits, BF16 weight in low 16 bits) when
-        ``topk_weights=None``. IDs are global. Output and workspace must be
-        distinct from all inputs; workspace is a contiguous uint8 tensor
-        whose address is aligned to 256 bytes.
+        ``topk_weights=None``. IDs are global, must be in ``[0, num_experts)``,
+        and must be distinct within each token. Output and workspace must be
+        distinct from all inputs; workspace is a contiguous uint8 tensor whose
+        address is aligned to 256 bytes.
         """
         if x.device.type != "cuda":
             raise ValueError("plan requires CUDA tensors")

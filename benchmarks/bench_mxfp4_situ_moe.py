@@ -154,9 +154,9 @@ def _compiled_counts():
                 "flashinfer.fused_moe.cute_dsl.moe_utils", "_get_moe_utils_module"
             ),
             "moe_sort": {
-                "provider": "shared_moe_utils_nvcc_module; flashinfer_moe_sort",
+                "provider": "T<=16 with PDL disabled: fused CuTe route_preprocess; otherwise: shared_moe_utils_nvcc_module flashinfer_moe_sort",
                 "compiled_kernel_count": None,
-                "reason": "NVCC routing dispatch is inside the shared native module; no Python kernel inventory is exposed",
+                "reason": "Fused decode variant counted above; native fallback dispatch has no Python kernel inventory",
             },
             "output_clear": {
                 "provider": "T<=16: fused CuTe route_preprocess; T>16: cudaMemsetAsync via shared_moe_utils_nvcc_module",

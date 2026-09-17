@@ -357,6 +357,80 @@ def test_decode_pdl_graph_matches_standard(tokens):
     torch.testing.assert_close(output, expected, atol=1e-2, rtol=1e-2)
 
 
+def test_decode_tile256_graph_matches_default_fp64(record_property):
+    _require_blackwell()
+    from flashinfer.fused_moe.cute_dsl.mxfp4 import CuteDslMxfp4MoEWrapper
+
+    case = make_case(tokens=16, distribution="hot")
+    prepared = prepare_cute_weights(case)
+    baseline, baseline_output, _ = prepare_candidate(case, prepared_weights=prepared)
+    # Both GEMMs use the supported 2-CTA M=256 layout. Sorting must produce
+    # matching 256-row offsets, even though no expert has more than 16 rows.
+    tactic = (256, ((256, 128), (2, 1), False), ((256, 128), (2, 1), False))
+    wrapper = CuteDslMxfp4MoEWrapper(
+        case.num_experts,
+        case.topk_ids.shape[1],
+        case.hidden_size,
+        case.intermediate_size,
+        num_local_experts=case.local_num_experts,
+        local_expert_offset=case.local_expert_offset,
+        enable_pdl=False,
+        offline_tactics={16: tactic},
+    )
+    workspace = torch.empty(
+        wrapper.get_workspace_size(16), device=case.x.device, dtype=torch.uint8
+    )
+    output = torch.empty_like(case.x, dtype=torch.bfloat16)
+    plan = wrapper.plan(
+        case.x,
+        case.x_scale,
+        case.topk_ids,
+        case.topk_weights,
+        *prepared,
+        beta=case.beta,
+        linear_beta=case.linear_beta,
+        workspace=workspace,
+        output=output,
+    )
+    compiled_before = _compiled_counts()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        plan.run()
+    torch.cuda.current_stream().wait_stream(stream)
+
+    reports = {}
+    previous_output = None
+    for phase in ("initial", "changed_inputs"):
+        if phase == "changed_inputs":
+            case.x.copy_((-case.x.float()).to(case.x.dtype))
+            case.topk_ids.copy_((case.topk_ids + 3) % case.num_experts)
+            case.topk_weights.copy_(case.topk_weights.flip(1))
+        # No eager candidate call after mutation: replay must read the new
+        # activations and rebuild routes at the existing workspace addresses.
+        for _ in range(3):
+            graph.replay()
+        baseline.run()
+        ref = reference_moe(case, modes=("ideal_fp64",))["ideal_fp64"]
+        report = paired_accuracy(output, baseline_output, ref)
+        reports[phase] = report
+        assert report["candidate"]["finite"] and report["baseline"]["finite"]
+        floor = torch.linalg.vector_norm(ref.to(torch.bfloat16).double() - ref)
+        candidate_error = torch.linalg.vector_norm(output.double() - ref)
+        baseline_error = torch.linalg.vector_norm(baseline_output.double() - ref)
+        # Keep the suite's paired FP64 non-regression criterion; the default
+        # validated tactic is the same-input numerical anchor for this case.
+        assert candidate_error <= baseline_error + floor, report
+        if previous_output is not None:
+            assert not torch.equal(output, previous_output), (
+                "captured inputs were ignored"
+            )
+        previous_output = output.clone()
+    assert _compiled_counts() == compiled_before
+    record_property("numerical_report", json.dumps(reports))
+
+
 @pytest.mark.parametrize("linear_beta", [None, 7.0])
 def test_fp64_oracle_sparse_exact_case(linear_beta):
     # One active input, one active gate/up pair, and one output channel.
