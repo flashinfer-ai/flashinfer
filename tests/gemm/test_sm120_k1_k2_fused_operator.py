@@ -105,10 +105,7 @@ def _assert_admission_tracks_the_ladder(m: int, k: int, rank: int = 32) -> None:
     agree in both directions.
     """
     admitted = svdquant_sm120_cutlass._sm120_fused_linear_supported(m, k, rank)
-    launchable = bool(_sm120_routes.sm120_producer_variants(m, k))
-    if rank != 32:
-        assert not admitted, f"({m}, {k}) admitted at rank {rank}"
-        return
+    launchable = bool(_sm120_routes.sm120_producer_variants(m, k, rank))
     assert admitted == launchable, (
         f"({m}, {k}) admitted={admitted} but launchable={launchable}"
     )

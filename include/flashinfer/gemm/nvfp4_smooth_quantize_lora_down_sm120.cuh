@@ -272,13 +272,16 @@ inline cudaError_t launch_m537_mixed_kernel(void const* x, void const* pre_quant
 }
 
 template <int BlockThreads, int DownTileCols, int RowsPerQuantBlock, bool PackedL2T = false,
-          bool SignalLaunch = false>
+          bool SignalLaunch = false, int Rank = 32>
 __global__
 __launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_small_m_dyn_sm120_kernel(
     quant::Type const* __restrict__ x, quant::Type const* __restrict__ pre_quant_scale,
     float const* __restrict__ global_scale, std::uint64_t* __restrict__ xq,
     std::uint8_t* __restrict__ sf, quant::Type const* __restrict__ l2t_smoothed,
     quant::Type* __restrict__ down, int M, int K) {
+  constexpr int kRank = Rank;
+  static_assert(Rank == 32 || Rank == 64);
+  static_assert(!PackedL2T || Rank == 32);
   static_assert(!SignalLaunch || PackedL2T, "launch signaling requires packed L2T");
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1200)
   if constexpr (SignalLaunch) {
@@ -441,11 +444,12 @@ __launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_small_m_dyn
 // everything derived from it are arguments, so one instantiation per tiling
 // serves every shape whose K divides the warp split.
 template <int BlockThreads, int DownTileCols, int RowsPerQuantBlock, bool PackedL2T = false,
-          bool SignalLaunch = false>
+          bool SignalLaunch = false, int Rank = 32>
 inline cudaError_t launch_small_m_dyn_kernel(void const* x, void const* pre_quant_scale,
                                              float const* global_scale, void* xq, void* sf,
                                              void const* l2t_smoothed, void* down, int m, int k,
                                              cudaStream_t stream) {
+  constexpr int kRank = Rank;
   constexpr int kDownWarps = BlockThreads / 32;
   constexpr int kNFragments = DownTileCols / kMmaN;
   constexpr int kDownNTiles = kRank / DownTileCols;
@@ -463,7 +467,7 @@ inline cudaError_t launch_small_m_dyn_kernel(void const* x, void const* pre_quan
     int const grid_blocks = quant_blocks + ((m + 15) / 16) * kDownNTiles;
     // Keep the primary's ordinary stream dependency, including the preceding GEMM.
     nvfp4_smooth_quantize_lora_down_small_m_dyn_sm120_kernel<
-        BlockThreads, DownTileCols, RowsPerQuantBlock, PackedL2T, SignalLaunch>
+        BlockThreads, DownTileCols, RowsPerQuantBlock, PackedL2T, SignalLaunch, Rank>
         <<<grid_blocks, BlockThreads, 0, stream>>>(
             static_cast<quant::Type const*>(x), static_cast<quant::Type const*>(pre_quant_scale),
             global_scale, static_cast<std::uint64_t*>(xq), static_cast<std::uint8_t*>(sf),
@@ -478,9 +482,6 @@ namespace smooth_quantize_lora_down_large_m_sm120_detail {
 
 namespace base = smooth_quantize_lora_down_sm120_detail;
 namespace quant = smooth_quantize_detail;
-
-constexpr int kRank = 32;
-constexpr int kDownWarps = kRank / 8;
 
 __device__ __forceinline__ std::uint64_t make_l2_evict_first_policy() {
   std::uint64_t policy;
@@ -517,11 +518,12 @@ __device__ __forceinline__ void wait_x_tile_async() {
 enum class DynAddress { kRecompute, kAccumulate };
 
 template <int BlockThreads, bool LongK, int KernelTileM, int KernelTileK = 128,
-          DynAddress Policy = DynAddress::kRecompute>
+          DynAddress Policy = DynAddress::kRecompute, int Rank = 32>
 __device__ __forceinline__ void copy_x_tile_async_dyn(quant::Type const* __restrict__ x,
                                                       quant::Type* __restrict__ x_tile,
                                                       int row_base, int tile_k, int thread,
                                                       std::uint64_t l2_policy, int M, int K) {
+  constexpr int kDownWarps = Rank / 8;
   constexpr int kKernelTileM = KernelTileM;
   constexpr bool kUseStreamingX = LongK;
   constexpr int kKernelQuantThreads = BlockThreads - kDownWarps * 32;
@@ -589,10 +591,11 @@ __device__ __forceinline__ void copy_x_tile_async_dyn(quant::Type const* __restr
   }
 }
 
-template <bool LongK, int KernelTileK = 128>
+template <bool LongK, int KernelTileK = 128, int Rank = 32>
 __device__ __forceinline__ void copy_pre_quant_scale_tile_async_dyn(
     quant::Type const* __restrict__ pre_quant_scale, quant::Type* __restrict__ scale_tile,
     int tile_k, int thread) {
+  constexpr int kDownWarps = Rank / 8;
   constexpr int kTileK = KernelTileK;
   constexpr int kLoadItems = kTileK / 8;
   int const load_thread = LongK ? thread - kDownWarps * 32 : thread;
@@ -608,13 +611,16 @@ __device__ __forceinline__ void copy_pre_quant_scale_tile_async_dyn(
 }
 
 template <int BlockThreads, bool LongK, int KernelTileM, int KernelTileK = 128,
-          DynAddress Policy = DynAddress::kRecompute>
+          DynAddress Policy = DynAddress::kRecompute, int Rank = 32>
 __global__
 __launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_large_m_dyn_sm120_kernel(
     quant::Type const* __restrict__ x, quant::Type const* __restrict__ pre_quant_scale,
     float const* __restrict__ global_scale, std::uint64_t* __restrict__ xq,
     std::uint8_t* __restrict__ sf, quant::Type const* __restrict__ l2t_smoothed,
     quant::Type* __restrict__ down, int M, int K) {
+  constexpr int kRank = Rank;
+  constexpr int kDownWarps = Rank / 8;
+  static_assert(Rank == 32 || Rank == 64);
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1200)
   constexpr int kKernelTileM = KernelTileM;
   constexpr bool kUseStreamingX = LongK;
@@ -674,10 +680,10 @@ __launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_large_m_dyn
   float d18 = 0.0f;
   float d19 = 0.0f;
 
-  copy_x_tile_async_dyn<BlockThreads, LongK, KernelTileM, KernelTileK, Policy>(
+  copy_x_tile_async_dyn<BlockThreads, LongK, KernelTileM, KernelTileK, Policy, Rank>(
       x, x_tiles[0], row_base, 0, thread, l2_evict_first_policy, M, K);
-  copy_pre_quant_scale_tile_async_dyn<LongK, KernelTileK>(pre_quant_scale, scale_tiles[0], 0,
-                                                          thread);
+  copy_pre_quant_scale_tile_async_dyn<LongK, KernelTileK, Rank>(pre_quant_scale, scale_tiles[0], 0,
+                                                                thread);
   commit_x_tile_async();
   wait_x_tile_async();
   __syncthreads();
@@ -688,9 +694,9 @@ __launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_large_m_dyn
     int const next_tile_k = tile_k + kTileK;
     int const next_buffer = tile_buffer ^ 1;
     if (next_tile_k < K) {
-      copy_x_tile_async_dyn<BlockThreads, LongK, KernelTileM, KernelTileK, Policy>(
+      copy_x_tile_async_dyn<BlockThreads, LongK, KernelTileM, KernelTileK, Policy, Rank>(
           x, x_tiles[next_buffer], row_base, next_tile_k, thread, l2_evict_first_policy, M, K);
-      copy_pre_quant_scale_tile_async_dyn<LongK, KernelTileK>(
+      copy_pre_quant_scale_tile_async_dyn<LongK, KernelTileK, Rank>(
           pre_quant_scale, scale_tiles[next_buffer], next_tile_k, thread);
       commit_x_tile_async();
     }
@@ -877,11 +883,13 @@ __launch_bounds__(BlockThreads) void nvfp4_smooth_quantize_lora_down_large_m_dyn
 // Runtime-M/K launch. The geometry stays a template parameter -- shared memory
 // and every unroll constant come from it -- while M and K become arguments, so
 // one instantiation serves every shape whose K divides the tile.
-template <int BlockThreads, bool LongK, int TileM, int TileK, DynAddress Policy>
+template <int BlockThreads, bool LongK, int TileM, int TileK, DynAddress Policy, int Rank = 32>
 inline cudaError_t launch_large_m_dyn_kernel(void const* x, void const* pre_quant_scale,
                                              float const* global_scale, void* xq, void* sf,
                                              void const* l2t_smoothed, void* down, int m, int k,
                                              cudaStream_t stream) {
+  constexpr int kRank = Rank;
+  constexpr int kDownWarps = Rank / 8;
   // KernelLaunchGeometry passes TileM straight through; the kernel's default
   // template argument (K >= 8192 ? 80 : kTileM) is never what the launcher uses.
   constexpr int kKernelTileM = TileM;
@@ -908,7 +916,7 @@ inline cudaError_t launch_large_m_dyn_kernel(void const* x, void const* pre_quan
       if (grid_blocks * BlockThreads < l2_lines) return cudaErrorInvalidValue;
     }
     nvfp4_smooth_quantize_lora_down_large_m_dyn_sm120_kernel<BlockThreads, LongK, kKernelTileM,
-                                                             TileK, Policy>
+                                                             TileK, Policy, Rank>
         <<<grid_blocks, BlockThreads, 0, stream>>>(
             static_cast<quant::Type const*>(x), static_cast<quant::Type const*>(pre_quant_scale),
             global_scale, static_cast<std::uint64_t*>(xq), static_cast<std::uint8_t*>(sf),
@@ -947,6 +955,17 @@ inline cudaError_t launch_large_m_dyn_kernel(void const* x, void const* pre_quan
   X(1024, 8, 16)                   \
   X(1024, 16, 16)
 
+// Rank 64 reserves eight warps for LoRA-down; the remaining warps quantize.
+#define FI_SVDQ_RANK64_LARGE_M_GEOMETRIES(X) \
+  X(320, 16, 128)                            \
+  X(320, 32, 128)                            \
+  X(352, 48, 128)                            \
+  X(384, 32, 256)                            \
+  X(384, 64, 128)                            \
+  X(384, 80, 128)                            \
+  X(512, 32, 256)
+
+template <int Rank = 32>
 inline cudaError_t nvfp4_smooth_quantize_lora_down_dyn_sm120(
     void const* x, void const* pre_quant_scale, float const* global_scale, void* xq, void* sf,
     void const* l2t_smoothed, void* down, int m, int k, int block_threads, int tile_m, int tile_k,
@@ -959,19 +978,26 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_dyn_sm120(
   if (block_threads == (BT) && tile_m == (TM) && tile_k == (TK)) {                                 \
     if (long_k) {                                                                                  \
       return accumulate                                                                            \
-                 ? large_m::launch_large_m_dyn_kernel<BT, true, TM, TK, DynAddress::kAccumulate>(  \
-                       x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k, stream) \
-                 : large_m::launch_large_m_dyn_kernel<BT, true, TM, TK, DynAddress::kRecompute>(   \
-                       x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k,         \
-                       stream);                                                                    \
+                 ? large_m::launch_large_m_dyn_kernel<BT, true, TM, TK, DynAddress::kAccumulate,   \
+                                                      Rank>(x, pre_quant_scale, global_scale, xq,  \
+                                                            sf, l2t_smoothed, down, m, k, stream)  \
+                 : large_m::launch_large_m_dyn_kernel<BT, true, TM, TK, DynAddress::kRecompute,    \
+                                                      Rank>(x, pre_quant_scale, global_scale, xq,  \
+                                                            sf, l2t_smoothed, down, m, k, stream); \
     }                                                                                              \
     return accumulate                                                                              \
-               ? large_m::launch_large_m_dyn_kernel<BT, false, TM, TK, DynAddress::kAccumulate>(   \
-                     x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k, stream)   \
-               : large_m::launch_large_m_dyn_kernel<BT, false, TM, TK, DynAddress::kRecompute>(    \
-                     x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k, stream);  \
+               ? large_m::launch_large_m_dyn_kernel<BT, false, TM, TK, DynAddress::kAccumulate,    \
+                                                    Rank>(x, pre_quant_scale, global_scale, xq,    \
+                                                          sf, l2t_smoothed, down, m, k, stream)    \
+               : large_m::launch_large_m_dyn_kernel<BT, false, TM, TK, DynAddress::kRecompute,     \
+                                                    Rank>(x, pre_quant_scale, global_scale, xq,    \
+                                                          sf, l2t_smoothed, down, m, k, stream);   \
   }
-  FI_SVDQ_LARGE_M_GEOMETRIES(FI_SVDQ_DYN_CASE)
+  if constexpr (Rank == 64) {
+    FI_SVDQ_RANK64_LARGE_M_GEOMETRIES(FI_SVDQ_DYN_CASE)
+  } else {
+    FI_SVDQ_LARGE_M_GEOMETRIES(FI_SVDQ_DYN_CASE)
+  }
 #undef FI_SVDQ_DYN_CASE
   return cudaErrorInvalidValue;
 }
@@ -985,6 +1011,7 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_dyn_sm120(
 //   family 2 fixed-M537 with packed L2T (a, b, c = block threads, down warps, rows/quant block)
 //   family 4 packed small-M (same tiling fields as family 1)
 // Family 3 uses the separate cuBLASLt prefix entry.
+template <int Rank = 32>
 inline cudaError_t nvfp4_smooth_quantize_lora_down_family_sm120(
     void const* x, void const* pre_quant_scale, float const* global_scale, void* xq, void* sf,
     void const* l2t_smoothed, void* down, int m, int k, int family, int a, int b, int c,
@@ -992,6 +1019,9 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_family_sm120(
   namespace large_m = smooth_quantize_lora_down_large_m_sm120_detail;
   namespace small_m = smooth_quantize_lora_down_small_m_sm120_detail;
   using large_m::DynAddress;
+  if constexpr (Rank == 64) {
+    if (family != 0 && family != 1) return cudaErrorInvalidValue;
+  }
   if (family == 2) {
     // One M, parameterised on K: the role split bakes M in, so this family
     // enumerates for the M it was written for and nothing else.
@@ -1027,18 +1057,19 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_family_sm120(
   if (family == 1) {
 #define FI_SVDQ_SMALL_CASE(BT, DTC, RPQB)                                            \
   if (a == (BT) && b == (DTC) && c == (RPQB)) {                                      \
-    return small_m::launch_small_m_dyn_kernel<BT, DTC, RPQB>(                        \
+    return small_m::launch_small_m_dyn_kernel<BT, DTC, RPQB, false, false, Rank>(    \
         x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k, stream); \
   }
     FI_SVDQ_SMALL_M_TILINGS(FI_SVDQ_SMALL_CASE)
 #undef FI_SVDQ_SMALL_CASE
     return cudaErrorInvalidValue;
   }
-  return nvfp4_smooth_quantize_lora_down_dyn_sm120(x, pre_quant_scale, global_scale, xq, sf,
-                                                   l2t_smoothed, down, m, k, a, b, c, stream,
-                                                   address_policy);
+  return nvfp4_smooth_quantize_lora_down_dyn_sm120<Rank>(x, pre_quant_scale, global_scale, xq, sf,
+                                                         l2t_smoothed, down, m, k, a, b, c, stream,
+                                                         address_policy);
 }
 
+template <int Rank = 32>
 inline cudaError_t nvfp4_smooth_quantize_lora_down_sm120(
     void const* x, void const* pre_quant_scale, float const* global_scale, void* xq, void* sf,
     void const* l2t_smoothed, void* down, int m, int k, cudaStream_t stream,
@@ -1065,14 +1096,18 @@ inline cudaError_t nvfp4_smooth_quantize_lora_down_sm120(
   (void)geometry_variant;
 #define FI_SVDQ_TRY(FAMILY, A, B, C)                                                            \
   {                                                                                             \
-    cudaError_t const status = nvfp4_smooth_quantize_lora_down_family_sm120(                    \
+    cudaError_t const status = nvfp4_smooth_quantize_lora_down_family_sm120<Rank>(              \
         x, pre_quant_scale, global_scale, xq, sf, l2t_smoothed, down, m, k, FAMILY, A, B, C, 0, \
         stream);                                                                                \
     if (status != cudaErrorInvalidValue) return status;                                         \
   }
 #define FI_SVDQ_TRY_LARGE(BT, TM, TK) FI_SVDQ_TRY(0, BT, TM, TK)
 #define FI_SVDQ_TRY_SMALL(BT, DTC, RPQB) FI_SVDQ_TRY(1, BT, DTC, RPQB)
-  FI_SVDQ_LARGE_M_GEOMETRIES(FI_SVDQ_TRY_LARGE)
+  if constexpr (Rank == 64) {
+    FI_SVDQ_RANK64_LARGE_M_GEOMETRIES(FI_SVDQ_TRY_LARGE)
+  } else {
+    FI_SVDQ_LARGE_M_GEOMETRIES(FI_SVDQ_TRY_LARGE)
+  }
   FI_SVDQ_SMALL_M_TILINGS(FI_SVDQ_TRY_SMALL)
 #undef FI_SVDQ_TRY_SMALL
 #undef FI_SVDQ_TRY_LARGE

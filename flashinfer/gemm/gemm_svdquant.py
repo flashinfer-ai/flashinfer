@@ -1133,8 +1133,8 @@ def svdquant_linear(
     backend: Literal["cutlass", "cute-dsl", "cute-dsl-unfused", "cutlass-sm120", "auto"]
         Backend forwarded to smooth quantization and SVDQuant GEMM. Defaults to
         architecture-based automatic selection.
-        ``"cutlass-sm120"`` supports ranks 32 and 64: rank 32 can use fused
-        preprocessing, while rank 64 uses separate quantization and LoRA-down.
+        ``"cutlass-sm120"`` supports ranks 32 and 64, with fused or separate
+        quantization and LoRA-down selected by complete-linear autotuning.
 
     Returns
     -------
@@ -1144,8 +1144,8 @@ def svdquant_linear(
     if backend == "cutlass-sm120":
         from .svdquant_sm120_cutlass import svdquant_linear as _sm120_cutlass_linear
 
-        # Rank 32 can fuse smooth quantization and LoRA-down; rank 64 uses the
-        # composed prefix. Both paths tune the complete linear operation.
+        # Both ranks can fuse smooth quantization and LoRA-down and tune the
+        # preprocessing route together with the GEMM.
         return _sm120_cutlass_linear(
             x,
             weight_fp4,

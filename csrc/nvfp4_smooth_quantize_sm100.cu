@@ -44,6 +44,12 @@ int32_t getMultiProcessorCount(int32_t device_index) {
 }
 
 #if defined(FLASHINFER_ENABLE_SVDQ_SM120_K1_K2_FUSION)
+#if defined(SVDQ_SM120_LORA_RANK) && SVDQ_SM120_LORA_RANK == 64
+constexpr int kSm120PrefixRank = 64;
+#else
+constexpr int kSm120PrefixRank = 32;
+#endif
+
 __global__ __launch_bounds__(128) void pack_svdquant_l2t_sm120_kernel(
     std::uint16_t const* __restrict__ source, std::uint64_t* __restrict__ packed) {
   // [tile, a2, b4, c2, d2, e2, f8] -> [tile, d2, e2, f8, b4, a2, c2].
@@ -154,18 +160,20 @@ void check_sm120_prefix_inputs(TensorView x, TensorView pqs, TensorView global_s
   int const k = static_cast<int>(x.size(1));
   TVM_FFI_ICHECK_EQ(pqs.numel(), k) << "pqs must have k elements";
   TVM_FFI_ICHECK_GE(global_scale.numel(), 1) << "global_scale must contain at least one element";
-  TVM_FFI_ICHECK_EQ(l2t_smoothed.ndim(), 2) << "l2t_smoothed must be [k, 32]";
-  TVM_FFI_ICHECK_EQ(l2t_smoothed.size(0), k) << "l2t_smoothed must be [k, 32]";
-  TVM_FFI_ICHECK_EQ(l2t_smoothed.size(1), 32) << "l2t_smoothed must be [k, 32]";
+  TVM_FFI_ICHECK_EQ(l2t_smoothed.ndim(), 2) << "l2t_smoothed must be [k, rank]";
+  TVM_FFI_ICHECK_EQ(l2t_smoothed.size(0), k) << "l2t_smoothed must be [k, rank]";
+  TVM_FFI_ICHECK_EQ(l2t_smoothed.size(1), kSm120PrefixRank)
+      << "l2t_smoothed must be [k, " << kSm120PrefixRank << "]";
   TVM_FFI_ICHECK_EQ(xq.ndim(), 2) << "xq must be [m, k/2]";
   TVM_FFI_ICHECK_EQ(xq.size(0), m) << "xq must be [m, k/2]";
   TVM_FFI_ICHECK_EQ(xq.size(1), k / 2) << "xq must be [m, k/2]";
   int64_t const sfSize = static_cast<int64_t>((m + 127) / 128 * 128) * (k / 16);
   TVM_FFI_ICHECK_GE(sf.numel(), sfSize)
       << "sf is smaller than the required swizzled scale layout (" << sfSize << " bytes)";
-  TVM_FFI_ICHECK_EQ(down.ndim(), 2) << "down must be [m, 32]";
-  TVM_FFI_ICHECK_EQ(down.size(0), m) << "down must be [m, 32]";
-  TVM_FFI_ICHECK_EQ(down.size(1), 32) << "down must be [m, 32]";
+  TVM_FFI_ICHECK_EQ(down.ndim(), 2) << "down must be [m, rank]";
+  TVM_FFI_ICHECK_EQ(down.size(0), m) << "down must be [m, rank]";
+  TVM_FFI_ICHECK_EQ(down.size(1), kSm120PrefixRank)
+      << "down rank must match the compiled rank " << kSm120PrefixRank;
 }
 
 void nvfp4_quantize_smooth_lora_down_sm120_impl(TensorView x, TensorView pqs,
@@ -177,10 +185,11 @@ void nvfp4_quantize_smooth_lora_down_sm120_impl(TensorView x, TensorView pqs,
   int const m = static_cast<int>(x.size(0));
   int const k = static_cast<int>(x.size(1));
   auto stream = get_stream(x.device());
-  cudaError_t const status = flashinfer::gemm::nvfp4_smooth_quantize_lora_down_sm120(
-      x.data_ptr(), pqs.data_ptr(), static_cast<float const*>(global_scale.data_ptr()),
-      xq.data_ptr(), sf.data_ptr(), l2t_smoothed.data_ptr(), down.data_ptr(), m, k, stream,
-      signal_m537_quant_ready, geometry_variant);
+  cudaError_t const status =
+      flashinfer::gemm::nvfp4_smooth_quantize_lora_down_sm120<kSm120PrefixRank>(
+          x.data_ptr(), pqs.data_ptr(), static_cast<float const*>(global_scale.data_ptr()),
+          xq.data_ptr(), sf.data_ptr(), l2t_smoothed.data_ptr(), down.data_ptr(), m, k, stream,
+          signal_m537_quant_ready, geometry_variant);
   TVM_FFI_ICHECK_EQ(status, cudaSuccess)
       << "failed to launch SM120 fused smooth-quantize + LoRA-down kernel: "
       << cudaGetErrorString(status);
@@ -214,10 +223,11 @@ void nvfp4_quantize_smooth_lora_down_dyn_sm120_impl(TensorView x, TensorView pqs
   int const m = static_cast<int>(x.size(0));
   int const k = static_cast<int>(x.size(1));
   cudaStream_t stream = get_stream(x.device());
-  cudaError_t status = flashinfer::gemm::nvfp4_smooth_quantize_lora_down_family_sm120(
-      x.data_ptr(), pqs.data_ptr(), static_cast<float const*>(global_scale.data_ptr()),
-      xq.data_ptr(), sf.data_ptr(), l2t_smoothed.data_ptr(), down.data_ptr(), m, k, family, tiling0,
-      tiling1, tiling2, address_policy, stream, signal_launch);
+  cudaError_t status =
+      flashinfer::gemm::nvfp4_smooth_quantize_lora_down_family_sm120<kSm120PrefixRank>(
+          x.data_ptr(), pqs.data_ptr(), static_cast<float const*>(global_scale.data_ptr()),
+          xq.data_ptr(), sf.data_ptr(), l2t_smoothed.data_ptr(), down.data_ptr(), m, k, family,
+          tiling0, tiling1, tiling2, address_policy, stream, signal_launch);
   TVM_FFI_ICHECK_EQ(status, cudaSuccess)
       << "nvfp4_quantize_smooth_lora_down_dyn_sm120 failed: " << cudaGetErrorString(status);
 }

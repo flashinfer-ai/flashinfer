@@ -25,6 +25,7 @@ SM120_TACTIC_ABI_VERSION: Final = 3
 # Preserve cached winners wherever the linear candidate set is unchanged.
 SM120_LINEAR_ROUTE_ABI_VERSION: Final = 5
 SM120_PACKED_SMALL_M_ROUTE_ABI_VERSION: Final = 10
+SM120_RANK64_FUSED_ROUTE_ABI_VERSION: Final = 11
 
 # Historical route versions remain the fallback for shapes without the new
 # packed small-M family. Candidate admission below determines the v10 scope.
@@ -77,6 +78,8 @@ SM120_LINEAR_ROUTE_V9_MKR: Final = _route_keys_for_version(9)
 
 def sm120_linear_route_abi_version(m: int, k: int, rank: int) -> int:
     """Return the persistent route namespace for one exact linear shape."""
+    if rank == 64:
+        return SM120_RANK64_FUSED_ROUTE_ABI_VERSION
     if rank == 32 and any(
         family == SM120_FAMILY_SMALL_M_PACKED
         for family, _, _ in sm120_producer_variants(m, k)
@@ -106,22 +109,31 @@ SM120_PRODUCER_GEOMETRY_LADDER: Final[tuple[tuple[int, int, int], ...]] = (
     (384, 32, 256),
 )
 
+# Eight LoRA-down warps leave the remaining threads to quantize each tile.
+SM120_RANK64_PRODUCER_GEOMETRY_LADDER: Final[tuple[tuple[int, int, int], ...]] = (
+    (320, 16, 128),
+    (320, 32, 128),
+    (352, 48, 128),
+    (384, 32, 256),
+    (384, 64, 128),
+    (384, 80, 128),
+    (512, 32, 256),
+)
+
 # How the runtime row offset is formed. Both are built; which one is faster is a
 # property of the geometry -- accumulating wins on some and loses on others --
 # so the tuner picks, on the device it is running
 # on.
 SM120_ADDRESS_POLICIES: Final[tuple[int, ...]] = (0, 1)  # 0 recompute, 1 accumulate
 
-_GEOMETRY_RANK: Final = 32
 _GEOMETRY_SF_VEC: Final = 16
 _GEOMETRY_ELEM_BYTES: Final = 2
-_GEOMETRY_DOWN_WARPS: Final = 4
 _GEOMETRY_SHARED_LIMIT: Final = 48 * 1024
 _GEOMETRY_MMA_N: Final = 8
 
 
 def sm120_producer_geometry_is_valid(
-    m: int, k: int, block_threads: int, tile_m: int, tile_k: int
+    m: int, k: int, block_threads: int, tile_m: int, tile_k: int, rank: int = 32
 ) -> bool:
     """Python counterpart of the runtime large-M launcher guards.
 
@@ -136,7 +148,7 @@ def sm120_producer_geometry_is_valid(
         return False
     if not (0 < tile_m <= 80 and tile_m % 16 == 0):
         return False
-    quant_threads = block_threads - _GEOMETRY_DOWN_WARPS * 32
+    quant_threads = block_threads - (rank // _GEOMETRY_MMA_N) * 32
     if block_threads % 32 or quant_threads <= 0:
         return False
     sf_cols_per_tile = tile_k // _GEOMETRY_SF_VEC
@@ -146,7 +158,7 @@ def sm120_producer_geometry_is_valid(
     padded_m = (m + 127) // 128 * 128
     grid_blocks = (padded_m + tile_m - 1) // tile_m
     if long_k:
-        prefetch_lines = k * _GEOMETRY_RANK * _GEOMETRY_ELEM_BYTES // 128
+        prefetch_lines = k * rank * _GEOMETRY_ELEM_BYTES // 128
         if grid_blocks * block_threads < prefetch_lines:
             return False
     shared_bytes = (
@@ -202,7 +214,12 @@ def sm120_m537_is_valid(m: int, k: int) -> bool:
 
 
 def sm120_small_m_tiling_is_valid(
-    m: int, k: int, block_threads: int, down_tile_cols: int, rows_per_quant_block: int
+    m: int,
+    k: int,
+    block_threads: int,
+    down_tile_cols: int,
+    rows_per_quant_block: int,
+    rank: int = 32,
 ) -> bool:
     """Python counterpart of the runtime small-M launcher guards."""
     if m <= 0 or rows_per_quant_block <= 0 or block_threads % 32:
@@ -216,8 +233,8 @@ def sm120_small_m_tiling_is_valid(
         return False
     if down_tile_cols % _GEOMETRY_MMA_N or down_tile_cols // _GEOMETRY_MMA_N <= 0:
         return False
-    down_n_tiles = _GEOMETRY_RANK // down_tile_cols
-    if down_n_tiles * down_tile_cols != _GEOMETRY_RANK:
+    down_n_tiles = rank // down_tile_cols
+    if down_n_tiles * down_tile_cols != rank:
         return False
     padded_m = (m + 127) // 128 * 128
     quant_blocks = (m + rows_per_quant_block - 1) // rows_per_quant_block
@@ -226,7 +243,7 @@ def sm120_small_m_tiling_is_valid(
 
 @functools.cache
 def sm120_producer_variants(
-    m: int, k: int
+    m: int, k: int, rank: int = 32
 ) -> tuple[tuple[int, tuple[int, int, int], int], ...]:
     """Every (family, tiling, address policy) this exact shape can run.
 
@@ -235,17 +252,26 @@ def sm120_producer_variants(
     ranks the candidates itself. The address policy is a large-M axis only; the
     small-M kernel forms its addresses differently and takes 0.
     """
+    if rank not in (32, 64):
+        return ()
+    geometries = (
+        SM120_RANK64_PRODUCER_GEOMETRY_LADDER
+        if rank == 64
+        else SM120_PRODUCER_GEOMETRY_LADDER
+    )
     large = tuple(
         (SM120_FAMILY_LARGE_M, geometry, policy)
-        for geometry in SM120_PRODUCER_GEOMETRY_LADDER
-        if sm120_producer_geometry_is_valid(m, k, *geometry)
+        for geometry in geometries
+        if sm120_producer_geometry_is_valid(m, k, *geometry, rank)
         for policy in SM120_ADDRESS_POLICIES
     )
     small = tuple(
         (SM120_FAMILY_SMALL_M, tiling, 0)
         for tiling in SM120_SMALL_M_TILING_LADDER
-        if sm120_small_m_tiling_is_valid(m, k, *tiling)
+        if sm120_small_m_tiling_is_valid(m, k, *tiling, rank)
     )
+    if rank == 64:
+        return large + small
     m537 = (
         ((SM120_FAMILY_M537, SM120_M537_TILING, 0),)
         if sm120_m537_is_valid(m, k)
@@ -263,18 +289,18 @@ def sm120_producer_variants(
     return native + cublaslt + packed_small
 
 
-def sm120_variant_packs_l2t(m: int, k: int, variant: int) -> bool:
+def sm120_variant_packs_l2t(m: int, k: int, variant: int, rank: int = 32) -> bool:
     """Whether the producer this variant selects wants the packed L2T layout.
 
     Read from the chosen family rather than from the shape: once the tuner picks
     the producer, the shape no longer determines which layout is correct.
     """
-    family, _, _ = sm120_decode_producer_variant(m, k, variant)
+    family, _, _ = sm120_decode_producer_variant(m, k, variant, rank)
     return family in SM120_FAMILY_PACKS_L2T
 
 
-def sm120_producer_variant_count(m: int, k: int) -> int:
-    return len(sm120_producer_variants(m, k))
+def sm120_producer_variant_count(m: int, k: int, rank: int = 32) -> int:
+    return len(sm120_producer_variants(m, k, rank))
 
 
 SM120_PRODUCER_SHIFT: Final = 8
@@ -298,14 +324,14 @@ def sm120_unpack_tactic(tactic: int) -> tuple[int, int]:
 
 
 def sm120_decode_producer_variant(
-    m: int, k: int, variant: int
+    m: int, k: int, variant: int, rank: int = 32
 ) -> tuple[int, tuple[int, int, int], int]:
     """Resolve a variant index to the geometry and policy the launcher needs.
 
     Out of range falls back to the first admissible pair rather than failing: a
     persisted tactic must still run something correct after the ladder moves.
     """
-    variants = sm120_producer_variants(m, k)
+    variants = sm120_producer_variants(m, k, rank)
     if not 0 <= variant < len(variants):
         return variants[0]
     return variants[variant]

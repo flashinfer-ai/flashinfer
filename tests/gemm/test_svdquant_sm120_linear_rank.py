@@ -30,12 +30,16 @@ def test_linear_runners_load_the_requested_rank(
         svdquant_sm120_cutlass, "get_nvfp4_svdquant_sm120_module", get_module
     )
 
-    svdquant_sm120_cutlass._sm120_linear_runners(
+    runners = svdquant_sm120_cutlass._sm120_linear_runners(
         False, torch.device("cuda:0"), 129, 256, 256, rank
     )
 
     assert requested_ranks
     assert set(requested_ranks) == {rank}
+    expected_fallback = (
+        "Sm120CutlassLinearRunner" if rank == 64 else "Sm120FusedLinearRunner"
+    )
+    assert type(runners[0]).__name__ == expected_fallback
 
 
 @pytest.mark.parametrize("rank", [0, 48, 96, 128])
