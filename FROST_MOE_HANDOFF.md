@@ -50,14 +50,20 @@ weight updates are covered. Overlapping PDL stage durations must not be summed.
 
 The standalone paired graph engine separately passed180 raw outputs and54
 negative controls under normal/memcheck/racecheck, including16-byte-aligned
-pitched storage and six geometries. The collected public pytest port currently
-passes3 metadata and5 GPU cases on B200. Its `one_token` case passes the first
-eager comparison but fails the first CUDA Graph capture with error901
-(`cudaErrorStreamCaptureInvalidated`); public-port sanitizers were not reached.
-The cause remains open. This gate is distinct from the passing standalone
-capsule; neither result is used to erase the other. The earlier public-port
-run failed before kernel execution because its DSL version check omitted a
-required argument; that test-only call is repaired and the failure preserved.
+pitched storage and six geometries. The actual collected public pytest port
+now also passes all9 cases (3 metadata plus6 GPU) in each of normal execution,
+memcheck and racecheck on B200:27 test executions, independently audited180 raw
+outputs and54 changed-reference controls, with no skips or tolerance changes.
+
+The earlier public-port failures are retained. Its first run called the DSL
+version helper without a required argument; that test-only call was repaired.
+A subsequent run hit `cudaErrorStreamCaptureInvalidated` (901) after correct
+eager output. GC callbacks located collection inside MagicMock construction
+during capture; original/force-GC diagnostic processes were1/0/0/0 exits.
+The test now constructs simple allocation/JIT guards before capture and resets
+retained graphs after use. Runtime kernels, default GC behavior, input mutations,
+route assertions and numerical thresholds are unchanged. All three public-port
+validation modes then passed. This fixes the test harness, not a kernel speedup.
 The explicit-parent CPU regression is confirmed RED against the preceding FE
 source (`no lowering for node type SLICE`).
 
@@ -65,8 +71,7 @@ Timing above used frozen pair1820/fi_pair1825. This publication additionally
 carries the planning-only compatibility retry and SM120 source reconciliation,
 validated separately; the final assembled head has not been retimed.
 
-Pending before readiness: resolve the public-port capture failure and run its
-sanitizers, finish the SM120 parent-binding gate, and refresh the strong
+Pending before readiness: finish the SM120 parent-binding gate and refresh the strong
 TRT comparator. An initial SM120 integration run failed before kernel execution
 because its source copy lacked the already validated static scheduler; the
 combined source restores it without relaxing the gate. Full repository CI is
