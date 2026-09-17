@@ -26,6 +26,7 @@ import torch
 from ...tllm_enums import ActivationType
 from .fused_moe import _moe_core_impl, validate_w4a8_inputs
 from .moe_utils import get_max_num_tiles
+from .mxfp4_routing import _plan_route_preprocess
 from .tuner import DEFAULT_BLACKWELL_MOE_TACTIC, canonicalize_w4a8_tactic
 
 
@@ -70,7 +71,11 @@ def mxfp4_moe_capability(
         reason = "require 1 <= top_k <= num_experts <= 1024"
     elif top_k > 32:
         reason = "top_k must not exceed 32"
-    elif local <= 0 or local_expert_offset < 0 or local_expert_offset + local > num_experts:
+    elif (
+        local <= 0
+        or local_expert_offset < 0
+        or local_expert_offset + local > num_experts
+    ):
         reason = "local experts must form a nonempty contiguous global expert interval"
     return Mxfp4MoECapability(not reason, reason, not reason)
 
@@ -90,7 +95,10 @@ def _align(size: int) -> int:
 
 def _byte_interval(tensor):
     first = tensor.data_ptr()
-    span = 1 + sum((dim - 1) * stride for dim, stride in zip(tensor.shape, tensor.stride()))
+    span = 1 + sum(
+        (dim - 1) * stride
+        for dim, stride in zip(tensor.shape, tensor.stride(), strict=True)
+    )
     return first, first + span * tensor.element_size()
 
 
@@ -106,7 +114,9 @@ class Mxfp4MoEPlan:
     The output is this rank's contribution when expert parallelism is used.
     """
 
-    def __init__(self, *, kwargs, workspace, topk_ids, topk_weights, route_ids, route_weights):
+    def __init__(
+        self, *, kwargs, workspace, topk_ids, topk_weights, route_ids, route_weights
+    ):
         # Keep every bound tensor alive alongside the raw launch pointers.
         self._kwargs = kwargs
         self.workspace = workspace
@@ -115,11 +125,10 @@ class Mxfp4MoEPlan:
         self._topk_weights = topk_weights
         self._route_ids = route_ids
         self._route_weights = route_weights
+        self._route_preprocess = None
         self.device = self.output.device
         self._packed_weight_view = (
-            topk_ids.view(torch.bfloat16)[:, ::2]
-            if topk_weights is None
-            else None
+            topk_ids.view(torch.bfloat16)[:, ::2] if topk_weights is None else None
         )
 
     def _prepare_routing(self):
@@ -140,6 +149,17 @@ class Mxfp4MoEPlan:
         self._gather, self._gather_args, self._gather_kwargs = launches["gather"]
         self._memset, self._memset_args = launches["memset"]
         self._finalize, self._finalize_args = launches["finalize"]
+        if self.output.shape[0] <= 16:
+            self._route_preprocess = _plan_route_preprocess(
+                self._topk_ids,
+                self._topk_weights,
+                route_ids=self._route_ids,
+                route_weights=self._route_weights,
+                output=self.output,
+            )
+            # Preprocessing warmup clears output. Finish the complete MoE so
+            # plan retains its existing valid-output postcondition.
+            self.run()
 
     def run(self) -> torch.Tensor:
         """Enqueue on the caller's current stream and return the bound output.
@@ -150,10 +170,14 @@ class Mxfp4MoEPlan:
         with torch.cuda.device(self.device):
             stream_ptr = torch.cuda.current_stream().cuda_stream
             stream = cuda.CUstream(stream_ptr)
-            self._prepare_routing()
+            if self._route_preprocess is None:
+                self._prepare_routing()
+            else:
+                self._route_preprocess.run(stream)
             self._sort(*self._sort_args, stream_ptr)
             self._gather(*self._gather_args, stream=stream, **self._gather_kwargs)
-            self._memset(*self._memset_args, stream_ptr)
+            if self._route_preprocess is None:
+                self._memset(*self._memset_args, stream_ptr)
             self._finalize(*self._finalize_args, stream=stream)
         return self.output
 
@@ -162,7 +186,7 @@ class CuteDslMxfp4MoEWrapper:
     """MXFP4 runner with offline tactics and explicit caller-owned workspace.
 
     The wrapper is metadata only. ``get_workspace_size(T)`` may be called
-    before any CUDA allocation. ``plan`` compiles and performs one warmup
+    before any CUDA allocation. ``plan`` compiles and performs warmup
     execution using valid caller inputs; it must run outside CUDA Graph
     capture. Its returned plan is used both for prefill and decode.
 
@@ -190,7 +214,9 @@ class CuteDslMxfp4MoEWrapper:
         self.top_k = top_k
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
-        self.num_local_experts = num_experts if num_local_experts is None else num_local_experts
+        self.num_local_experts = (
+            num_experts if num_local_experts is None else num_local_experts
+        )
         self.local_expert_offset = local_expert_offset
         self.activation_type = ActivationType(activation_type)
         self.quantization = quantization
@@ -232,12 +258,22 @@ class CuteDslMxfp4MoEWrapper:
         specs = [
             ("out_tile_idx_to_expert_idx", (tiles,), torch.int32, 4),
             ("out_tile_idx_to_mn_limit", (tiles,), torch.int32, 4),
-            ("out_expanded_idx_to_permuted_idx", (num_tokens, self.top_k), torch.int32, 4),
+            (
+                "out_expanded_idx_to_permuted_idx",
+                (num_tokens, self.top_k),
+                torch.int32,
+                4,
+            ),
             ("out_permuted_idx_to_expanded_idx", (rows,), torch.int32, 4),
             ("out_total_num_padded_tokens", (1,), torch.int32, 4),
             ("out_num_non_exiting_tiles", (1,), torch.int32, 4),
             ("gemm1_out", (rows, self.intermediate_size), torch.float8_e4m3fn, 1),
-            ("gemm1_out_scale", (32, 4, rows // 128, 4, self.intermediate_size // 128, 1), torch.uint8, 1),
+            (
+                "gemm1_out_scale",
+                (32, 4, rows // 128, 4, self.intermediate_size // 128, 1),
+                torch.uint8,
+                1,
+            ),
             ("route_ids", (num_tokens, self.top_k), torch.int32, 4),
             ("route_weights", (num_tokens, self.top_k), torch.float32, 4),
             ("w1_alpha", (self.num_local_experts,), torch.float32, 4),
@@ -293,7 +329,9 @@ class CuteDslMxfp4MoEWrapper:
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError("plan must be called before CUDA Graph capture")
             major, minor = torch.cuda.get_device_capability(x.device)
-            capability = mxfp4_moe_capability(gpu_arch=major * 10 + minor, **self._metadata())
+            capability = mxfp4_moe_capability(
+                gpu_arch=major * 10 + minor, **self._metadata()
+            )
             if not capability.supported:
                 raise ValueError(capability.reason)
             num_tokens = x.shape[0]
@@ -301,42 +339,88 @@ class CuteDslMxfp4MoEWrapper:
                 "x": (x, (num_tokens, self.hidden_size), torch.float8_e4m3fn),
                 "x_sf": (x_sf, (num_tokens, self.hidden_size // 32), torch.uint8),
                 "topk_ids": (topk_ids, (num_tokens, self.top_k), torch.int32),
-                "w1": (w1, (self.num_local_experts, 2 * self.intermediate_size, self.hidden_size // 2), torch.uint8),
-                "w2": (w2, (self.num_local_experts, self.hidden_size, self.intermediate_size // 2), torch.uint8),
+                "w1": (
+                    w1,
+                    (
+                        self.num_local_experts,
+                        2 * self.intermediate_size,
+                        self.hidden_size // 2,
+                    ),
+                    torch.uint8,
+                ),
+                "w2": (
+                    w2,
+                    (
+                        self.num_local_experts,
+                        self.hidden_size,
+                        self.intermediate_size // 2,
+                    ),
+                    torch.uint8,
+                ),
                 "output": (output, (num_tokens, self.hidden_size), torch.bfloat16),
             }
             for name, (tensor, shape, dtype) in expected.items():
-                if tensor.device != x.device or tensor.dtype != dtype or tuple(tensor.shape) != shape or not tensor.is_contiguous():
-                    raise ValueError(f"{name} must be contiguous {dtype} {shape} on {x.device}")
+                if (
+                    tensor.device != x.device
+                    or tensor.dtype != dtype
+                    or tuple(tensor.shape) != shape
+                    or not tensor.is_contiguous()
+                ):
+                    raise ValueError(
+                        f"{name} must be contiguous {dtype} {shape} on {x.device}"
+                    )
             if topk_weights is not None and (
                 topk_weights.device != x.device
                 or topk_weights.dtype not in (torch.bfloat16, torch.float32)
                 or tuple(topk_weights.shape) != (num_tokens, self.top_k)
                 or not topk_weights.is_contiguous()
             ):
-                raise ValueError("topk_weights must be contiguous CUDA BF16/FP32 [T,top_k]")
+                raise ValueError(
+                    "topk_weights must be contiguous CUDA BF16/FP32 [T,top_k]"
+                )
             if self.activation_type == ActivationType.Situ and beta is None:
                 raise ValueError("SiTU requires runtime beta")
-            if self.activation_type != ActivationType.Situ and (beta is not None or linear_beta is not None):
+            if self.activation_type != ActivationType.Situ and (
+                beta is not None or linear_beta is not None
+            ):
                 raise ValueError("SiTU parameters require ActivationType.Situ")
             for name, tensor in (("beta", beta), ("linear_beta", linear_beta)):
                 if tensor is not None and (
-                    tensor.device != x.device or tensor.dtype != torch.float32
-                    or tensor.ndim != 1 or tensor.numel() not in (1, self.num_local_experts)
+                    tensor.device != x.device
+                    or tensor.dtype != torch.float32
+                    or tensor.ndim != 1
+                    or tensor.numel() not in (1, self.num_local_experts)
                     or not tensor.is_contiguous()
                 ):
-                    raise ValueError(f"{name} must be CUDA FP32 [1] or [num_local_experts]")
+                    raise ValueError(
+                        f"{name} must be CUDA FP32 [1] or [num_local_experts]"
+                    )
             fields, size = self._workspace_fields(num_tokens)
-            if workspace.device != x.device or workspace.dtype != torch.uint8 or workspace.ndim != 1 or not workspace.is_contiguous() or workspace.numel() < size or workspace.data_ptr() % 256:
-                raise ValueError(f"workspace requires at least {size} aligned CUDA uint8 bytes")
+            if (
+                workspace.device != x.device
+                or workspace.dtype != torch.uint8
+                or workspace.ndim != 1
+                or not workspace.is_contiguous()
+                or workspace.numel() < size
+                or workspace.data_ptr() % 256
+            ):
+                raise ValueError(
+                    f"workspace requires at least {size} aligned CUDA uint8 bytes"
+                )
             workspace_interval = (workspace.data_ptr(), workspace.data_ptr() + size)
             output_interval = _byte_interval(output)
             if _overlap(workspace_interval, output_interval):
                 raise ValueError("output must not overlap workspace")
             for name, tensor in (
-                ("x", x), ("x_sf", x_sf), ("topk_ids", topk_ids),
-                ("topk_weights", topk_weights), ("w1", w1), ("w1_sf", w1_sf),
-                ("w2", w2), ("w2_sf", w2_sf), ("beta", beta),
+                ("x", x),
+                ("x_sf", x_sf),
+                ("topk_ids", topk_ids),
+                ("topk_weights", topk_weights),
+                ("w1", w1),
+                ("w1_sf", w1_sf),
+                ("w2", w2),
+                ("w2_sf", w2_sf),
+                ("beta", beta),
                 ("linear_beta", linear_beta),
             ):
                 if tensor is not None and (
@@ -345,7 +429,9 @@ class CuteDslMxfp4MoEWrapper:
                 ):
                     raise ValueError(f"output/workspace must not overlap {name}")
             buffers = {
-                f.name: workspace.narrow(0, f.offset, f.nbytes).view(f.dtype).view(f.shape)
+                f.name: workspace.narrow(0, f.offset, f.nbytes)
+                .view(f.dtype)
+                .view(f.shape)
                 for f in fields
             }
             buffers["w1_alpha"].fill_(1.0)
@@ -361,28 +447,48 @@ class CuteDslMxfp4MoEWrapper:
             tile, gemm1, gemm2 = self._tactic(num_tokens)
             route_ids = buffers["route_ids"] if topk_weights is None else topk_ids
             kwargs = dict(
-                x=x, x_sf=x_sf,
+                x=x,
+                x_sf=x_sf,
                 token_selected_experts=route_ids,
                 token_final_scales=route_weights,
-                w1_weight=w1, w1_weight_sf=w1_sf, w1_alpha=buffers["w1_alpha"],
+                w1_weight=w1,
+                w1_weight_sf=w1_sf,
+                w1_alpha=buffers["w1_alpha"],
                 fc2_input_scale=None,
-                w2_weight=w2, w2_weight_sf=w2_sf, w2_alpha=buffers["w2_alpha"],
-                num_experts=self.num_experts, top_k=self.top_k,
+                w2_weight=w2,
+                w2_weight_sf=w2_sf,
+                w2_alpha=buffers["w2_alpha"],
+                num_experts=self.num_experts,
+                top_k=self.top_k,
                 num_local_experts=self.num_local_experts,
                 local_expert_offset=self.local_expert_offset,
-                tile_size=tile, gemm1_mma_tiler_mn=gemm1[0],
-                gemm1_cluster_shape_mn=gemm1[1], gemm2_mma_tiler_mn=gemm2[0],
+                tile_size=tile,
+                gemm1_mma_tiler_mn=gemm1[0],
+                gemm1_cluster_shape_mn=gemm1[1],
+                gemm2_mma_tiler_mn=gemm2[0],
                 gemm2_cluster_shape_mn=gemm2[1],
-                moe_sort_buffers={name: value for name, value in buffers.items() if name.startswith("out_")},
-                gemm1_out=buffers["gemm1_out"], gemm1_out_scale=buffers["gemm1_out_scale"],
-                moe_output=output, output_dtype=torch.bfloat16,
-                use_async_memset=False, use_fused_finalize=True,
-                enable_pdl=self.enable_pdl, activation_type=self.activation_type.value,
-                situ_beta=beta, situ_linear_beta=linear_beta,
+                moe_sort_buffers={
+                    name: value
+                    for name, value in buffers.items()
+                    if name.startswith("out_")
+                },
+                gemm1_out=buffers["gemm1_out"],
+                gemm1_out_scale=buffers["gemm1_out_scale"],
+                moe_output=output,
+                output_dtype=torch.bfloat16,
+                use_async_memset=False,
+                use_fused_finalize=True,
+                enable_pdl=self.enable_pdl,
+                activation_type=self.activation_type.value,
+                situ_beta=beta,
+                situ_linear_beta=linear_beta,
             )
             plan = Mxfp4MoEPlan(
-                kwargs=kwargs, workspace=workspace, topk_ids=topk_ids,
-                topk_weights=topk_weights, route_ids=route_ids,
+                kwargs=kwargs,
+                workspace=workspace,
+                topk_ids=topk_ids,
+                topk_weights=topk_weights,
+                route_ids=route_ids,
                 route_weights=route_weights,
             )
             plan._prepare()

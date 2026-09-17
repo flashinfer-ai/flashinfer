@@ -473,9 +473,7 @@ def _moe_core_impl(
                 memset_event.record()
             memset_event.wait()
         else:
-            moe_output_memset_inplace(
-                moe_output, _prepared_launches=_prepared_launches
-            )
+            moe_output_memset_inplace(moe_output, _prepared_launches=_prepared_launches)
         gemm2_output = moe_output
     else:
         gemm2_output = torch.empty(

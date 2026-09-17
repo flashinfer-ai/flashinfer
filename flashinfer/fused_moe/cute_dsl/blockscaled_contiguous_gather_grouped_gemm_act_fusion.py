@@ -299,7 +299,9 @@ def _get_compiled_gather_kernel(
     is_rubin = mma_tiler is not None and mma_inst_shape is not None
     runtime_situ = isinstance(situ_beta, torch.Tensor)
     if is_rubin and runtime_situ:
-        raise NotImplementedError("Runtime SiTU parameters require the Blackwell kernel")
+        raise NotImplementedError(
+            "Runtime SiTU parameters require the Blackwell kernel"
+        )
 
     cache_key = (
         "sm107" if is_rubin else "sm100",

@@ -2464,7 +2464,9 @@ def prepare_cute_dsl_mxfp4_weights(
     if experts <= 0 or min(hidden, intermediate) <= 0:
         raise ValueError("expert count and matrix dimensions must be positive")
     if hidden % 128 or intermediate % 128:
-        raise ValueError("MXFP4 hidden and intermediate dimensions must be multiples of 128")
+        raise ValueError(
+            "MXFP4 hidden and intermediate dimensions must be multiples of 128"
+        )
     expected = (
         ("w1", w1, (experts, 2 * intermediate, hidden // 2)),
         ("w1_scale", w1_scale, (experts, 2 * intermediate, hidden // 32)),
@@ -2472,7 +2474,9 @@ def prepare_cute_dsl_mxfp4_weights(
     )
     for name, tensor, shape in expected:
         if tuple(tensor.shape) != shape:
-            raise ValueError(f"{name} must have shape {shape}, got {tuple(tensor.shape)}")
+            raise ValueError(
+                f"{name} must have shape {shape}, got {tuple(tensor.shape)}"
+            )
 
     def to_mma_layout(scale: torch.Tensor) -> torch.Tensor:
         # Linear [E, M, K/32] -> physical [E, M/128, K/128, 32, 4, 4].
@@ -2487,9 +2491,7 @@ def prepare_cute_dsl_mxfp4_weights(
         return physical.permute(3, 4, 1, 5, 2, 0)
 
     w1_prepared = _interleave_linear_and_gate(w1, group_size=64, dim=1)
-    w1_scale_interleaved = _interleave_linear_and_gate(
-        w1_scale, group_size=64, dim=1
-    )
+    w1_scale_interleaved = _interleave_linear_and_gate(w1_scale, group_size=64, dim=1)
     return (
         w1_prepared,
         to_mma_layout(w1_scale_interleaved),
