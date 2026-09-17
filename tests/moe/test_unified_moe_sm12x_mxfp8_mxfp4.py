@@ -30,9 +30,23 @@ from tests.moe.test_cute_dsl_sm12x_mxfp8_mxfp4 import (
     pack_mxfp4_moe_sfb,
 )
 
-pytestmark = pytest.mark.skipif(
-    not is_cute_dsl_available(), reason="cute_dsl not available"
-)
+
+def _cuda_13_or_newer() -> bool:
+    try:
+        from flashinfer.jit.cpp_ext import get_cuda_version
+
+        return get_cuda_version().major >= 13
+    except Exception:
+        return False
+
+
+pytestmark = [
+    pytest.mark.skipif(not is_cute_dsl_available(), reason="cute_dsl not available"),
+    pytest.mark.skipif(
+        not _cuda_13_or_newer(),
+        reason="SM12x MXFP8 x MXFP4 requires CUDA 13 or later",
+    ),
+]
 
 
 def _dequant_weight(q, sf):
