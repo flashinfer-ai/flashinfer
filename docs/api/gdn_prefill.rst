@@ -30,9 +30,6 @@ gate/scale, int32/int64 cu-seqlens and state indices, mixed or all-empty
 varlen batches, Q/K L2 normalization, checkpoints, output, and arbitrary
 positive non-overlapping packed/indexed/in-place state strides.
 The runtime manifest records only the source inventory and loading metadata.
-The historical 120-shape performance map and export provenance are preserved
-in ``tests/gdn/data/cake_gdn_cp_export_manifest.json``; they do not restrict
-the supported inputs.
 
 On SM100a/SM103a, the ``gdn_cp`` route uses checked-in CUDA sources and is
 supported with CUDA 12.8, CUDA 12.9, and CUDA 13 for FP16/BF16 inputs plus

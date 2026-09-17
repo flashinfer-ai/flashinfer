@@ -52,39 +52,7 @@ def _assert_oracle_close(actual: torch.Tensor, expected: torch.Tensor) -> None:
 def test_generated_source_inventory_and_hashes() -> None:
     root = _source_root()
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
-    historical_manifest = json.loads(
-        (Path(__file__).parent / "data" / "cake_gdn_cp_export_manifest.json").read_text(
-            encoding="utf-8"
-        )
-    )
     assert manifest["schema"] == "flashinfer.gdn_cp.runtime_manifest.v1"
-    assert historical_manifest["schema"] == (
-        "flashinfer-pr4078-sm100-cp-prefill-standalone-export-v3"
-    )
-    assert historical_manifest["baseline_revision"] == (
-        "6cb2e70995d92edbc443b1bfc317ecacac907640"
-    )
-    assert historical_manifest["support_contract"]["external_fallbacks_allowed"] == 0
-    assert historical_manifest["support_contract"]["focus_contract"] == {
-        "row_count": 150,
-        "canonical_stream_sha256": "d4f3fad233af91b8afac35271d6848df8f0f090b08f17807b9e2830139dd37ab",
-    }
-    assert historical_manifest["support_contract"]["full_regression_contract"] == {
-        "row_count": 822,
-        "canonical_stream_sha256": "0dff83c89b9a17f67e0a2db9bb9c20ed77506fa3b38cc55d7772864021553592",
-    }
-    assert historical_manifest["support_contract"]["checkpoint"] == {
-        "cu_starts_dtypes": ["int32", "int64"],
-        "interval": (
-            "zero disables checkpoints; otherwise a positive multiple of 64 "
-            "that becomes the CP chunk length"
-        ),
-        "ordering": "sequence-major complete CP chunk boundaries",
-        "shape": "[sum(seq_len // interval), H, 128, 128]",
-        "state_dtype": "float32",
-    }
-    assert historical_manifest["frozen_performance_shape_count"] == 120
-    assert len(historical_manifest["frozen_performance_shapes"]) == 120
     legacy_inventory = {"README.md", "manifest.json"}
     legacy_inventory.update(header["path"] for header in manifest["cuda_headers"])
     for kernel in manifest["kernels"]:
@@ -99,15 +67,6 @@ def test_generated_source_inventory_and_hashes() -> None:
     assert len(implementation_paths) == 70
     assert all(
         Path(path).name.startswith("cake_gdn_cp_") for path in implementation_paths
-    )
-    assert historical_manifest["launch_order"] == [
-        "t_precompute",
-        "mn_precompute",
-        "state_fixup",
-        "cp_prefill",
-    ]
-    assert historical_manifest["launch_policy"]["tensor_map_abi"].startswith(
-        "grid_constant"
     )
     assert len(manifest["cuda_headers"]) == 1
     assert manifest["cuda_headers"][0]["path"] == "cuda/cake_gdn_cp_common.cuh"
@@ -150,26 +109,14 @@ def test_generated_source_inventory_and_hashes() -> None:
         "cp_prefill_generic_bf16",
     ]
     assert len(manifest["kernels"]) == 33
-    historical_kernels = {
-        record["name"]: record for record in historical_manifest["kernels"]
-    }
     for record in manifest["kernels"]:
         host = record["host_binding"]
         host_path = root / host["path"]
         assert hashlib.sha256(host_path.read_bytes()).hexdigest() == host["sha256"]
-        assert historical_kernels[record["name"]]["host_binding"]["arg_plan"][-3:] == [
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ]
         for output in record["outputs"]:
             source = root / output["path"]
             assert hashlib.sha256(source.read_bytes()).hexdigest() == output["sha256"]
     common_header = root / manifest["cuda_headers"][0]["path"]
-    assert (
-        common_header.stat().st_size
-        == historical_manifest["cuda_headers"][0]["size_bytes"]
-    )
     assert (
         hashlib.sha256(common_header.read_bytes()).hexdigest()
         == (manifest["cuda_headers"][0]["sha256"])
@@ -388,57 +335,83 @@ def test_bf16_two_block_factor_keeps_source_and_physical_chunks_distinct(
     assert plan.cp_chunk_len == 64
 
 
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])
+@pytest.mark.parametrize(
+    ("hq", "hk", "hv"),
+    [
+        (2, 2, 8),
+        (4, 4, 16),
+        (8, 8, 32),
+        (16, 16, 16),
+        (16, 16, 32),
+        (16, 16, 48),
+        (16, 16, 64),
+        (32, 32, 32),
+    ],
+)
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        (65536,),
+        (32768,),
+        (16384,),
+        (8192,),
+        (4096,),
+        (2048,),
+        (6144, 2048),
+        (4096, 4096),
+        (2048, 6144),
+        (1024, 7168),
+        (2048,) * 4,
+        (1024,) * 8,
+        (8192,) * 8,
+        (8192,) * 16,
+        (8192,) * 32,
+    ],
+)
 def test_all_contract_plans_use_payload_independent_bounds(
     monkeypatch: pytest.MonkeyPatch,
+    arch: str,
+    hq: int,
+    hk: int,
+    hv: int,
+    seq_lens: tuple[int, ...],
 ) -> None:
+    monkeypatch.setattr(gdn_cp, "_arch_for", lambda _device: arch)
     monkeypatch.setattr(
         gdn_cp.torch.cuda,
         "get_device_properties",
         lambda _device: SimpleNamespace(multi_processor_count=148),
     )
-    historical_manifest = json.loads(
-        (Path(__file__).parent / "data" / "cake_gdn_cp_export_manifest.json").read_text(
-            encoding="utf-8"
-        )
+    total = sum(seq_lens)
+    q = SimpleNamespace(
+        shape=(total, hq, 128), device=SimpleNamespace(), dtype=torch.float16
     )
-    assert len(historical_manifest["frozen_performance_shapes"]) == 120
-    for shape in historical_manifest["frozen_performance_shapes"]:
-        total = sum(shape["seq_lens"])
-        q = SimpleNamespace(
-            shape=(total, shape["Hq"], shape["D"]),
-            device=SimpleNamespace(),
-            dtype=torch.float16,
-        )
-        k = SimpleNamespace(shape=(total, shape["Hk"], shape["D"]))
-        v = SimpleNamespace(shape=(total, shape["Hv"], shape["D"]))
-        for arch in shape["dispatch"]:
-            monkeypatch.setattr(gdn_cp, "_arch_for", lambda _device, value=arch: value)
-            seq_lens = tuple(shape["seq_lens"])
-            max_seqlen = max(seq_lens, default=0)
-            plan = gdn_cp._build_plan(
-                q,
-                k,
-                v,
-                num_seqs=len(seq_lens),
-                max_seqlen=max_seqlen,
-            )
-            assert plan.max_seqlen == max_seqlen
-            assert plan.total_t_blocks == gdn_cp._workspace_num_chunks(
-                total, len(seq_lens), 64
-            )
-            assert plan.total_cp_chunks == gdn_cp._workspace_num_chunks(
-                total, len(seq_lens), plan.cp_chunk_len
-            )
-            assert plan.t_grid == (
-                plan.num_sab_heads * gdn_cp._ceil_div(max_seqlen, 64),
-                len(seq_lens),
-                1,
-            )
-            assert plan.cp_grid == (
-                plan.num_sab_heads * gdn_cp._ceil_div(max_seqlen, plan.cp_chunk_len),
-                len(seq_lens),
-                1,
-            )
+    k = SimpleNamespace(shape=(total, hk, 128))
+    v = SimpleNamespace(shape=(total, hv, 128))
+    max_seqlen = max(seq_lens, default=0)
+    plan = gdn_cp._build_plan(
+        q,
+        k,
+        v,
+        num_seqs=len(seq_lens),
+        max_seqlen=max_seqlen,
+    )
+    assert plan.max_seqlen == max_seqlen
+    assert plan.total_t_blocks == gdn_cp._workspace_num_chunks(total, len(seq_lens), 64)
+    assert plan.total_cp_chunks == gdn_cp._workspace_num_chunks(
+        total, len(seq_lens), plan.cp_chunk_len
+    )
+    assert plan.t_grid == (
+        plan.num_sab_heads * gdn_cp._ceil_div(max_seqlen, 64),
+        len(seq_lens),
+        1,
+    )
+    assert plan.cp_grid == (
+        plan.num_sab_heads * gdn_cp._ceil_div(max_seqlen, plan.cp_chunk_len),
+        len(seq_lens),
+        1,
+    )
 
 
 def test_gdn_cp_prepared_launcher_is_not_a_new_public_api() -> None:
