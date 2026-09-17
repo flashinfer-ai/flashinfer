@@ -1651,11 +1651,13 @@ def testCuteDslBf16Moe(args):
     ``cute_dsl_fused_moe_bf16``).
 
     This test:
-    1. Creates bf16/fp16 weights ([gate; up] w13 repacked to the kernel's
-       32-column up/gate interleave) and pre-routed top-k ids/scales
+    1. Creates bf16/fp16 weights (gated activations: [gate; up] w13 repacked
+       to the kernel's 32-column up/gate interleave; ReLU2: a single [E, I, H]
+       projection) and pre-routed top-k ids/scales
     2. Runs MoE via CuteDslBf16MoEWrapper (or cute_dsl_fused_moe_bf16 when
-       ``--use_functional_api`` is set). SwiGLU only. ``--autotune`` runs the
-       AutoTuner pass, compiling each candidate specialization as it is profiled.
+       ``--use_functional_api`` is set). ``--activation_type`` selects Swiglu
+       (default), GegluTanh or Relu2. ``--autotune`` runs the AutoTuner pass,
+       compiling each candidate specialization as it is profiled.
     3. Measures performance metrics (TFLOPS, TB/sec)
 
     Pass per-rank ``--hidden_size`` / ``--intermediate_size`` for TP shapes
@@ -1702,11 +1704,16 @@ def testCuteDslBf16Moe(args):
         return res
 
     activation_type = args.activation_type
-    if activation_type != ActivationType.Swiglu:
+    if activation_type not in (
+        ActivationType.Swiglu,
+        ActivationType.GegluTanh,
+        ActivationType.Relu2,
+    ):
         raise ValueError(
-            f"cute_dsl_fused_moe_bf16 only supports Swiglu activation, "
-            f"got {activation_type.name}."
+            "cute_dsl_fused_moe_bf16 supports Swiglu, GegluTanh and Relu2 "
+            f"activations, got {activation_type.name}."
         )
+    is_gated = is_gated_activation(activation_type)
 
     if args.verbose >= 1:
         print(
@@ -1717,19 +1724,19 @@ def testCuteDslBf16Moe(args):
 
     torch.manual_seed(args.random_seed)
     x = torch.randn(num_tokens, hidden_size, dtype=input_dtype, device=device) / 10
-    # [gate; up]-concatenated w13 (vLLM layout), repacked to the kernel's
-    # 32-column up/gate interleave.
-    w_gate_up = (
+    # Gated: [gate; up]-concatenated w13 (vLLM layout), repacked to the kernel's
+    # 32-column up/gate interleave. Non-gated (Relu2): one [E, I, H] projection.
+    w1_model = (
         torch.randn(
             local_num_experts,
-            2 * intermediate_size,
+            (2 if is_gated else 1) * intermediate_size,
             hidden_size,
             dtype=input_dtype,
             device=device,
         )
         / 10
     )
-    w1 = interleave_up_gate_sm90(w_gate_up)
+    w1 = interleave_up_gate_sm90(w1_model) if is_gated else w1_model
     w2 = (
         torch.randn(
             local_num_experts,
@@ -1750,7 +1757,10 @@ def testCuteDslBf16Moe(args):
 
     if args.verbose >= 2:
         print(f"[VVERBOSE] x.shape = {x.shape}")
-        print(f"[VVERBOSE] w1.shape = {w1.shape} (interleaved)")
+        print(
+            f"[VVERBOSE] w1.shape = {w1.shape} "
+            f"({'interleaved' if is_gated else 'non-gated'})"
+        )
         print(f"[VVERBOSE] w2.shape = {w2.shape}")
 
     moe_output = torch.empty(num_tokens, hidden_size, dtype=input_dtype, device=device)
@@ -1770,6 +1780,7 @@ def testCuteDslBf16Moe(args):
             local_expert_offset=local_expert_offset,
             moe_output=moe_output,
             enable_pdl=args.enable_pdl,
+            **_activation_kwarg(cute_dsl_fused_moe_bf16, activation_type),
         )
     else:
         moe = CuteDslBf16MoEWrapper(
@@ -1780,6 +1791,7 @@ def testCuteDslBf16Moe(args):
             num_local_experts=local_num_experts,
             local_expert_offset=local_expert_offset,
             enable_pdl=args.enable_pdl,
+            **_activation_kwarg(CuteDslBf16MoEWrapper.__init__, activation_type),
         )
 
         def runner(x, ids, scales, w1, w2):
@@ -1798,7 +1810,7 @@ def testCuteDslBf16Moe(args):
 
     if args.refcheck:
         out = run_cute_dsl_bf16_moe(*input_args).float()
-        gate, up = w_gate_up[:, :intermediate_size], w_gate_up[:, intermediate_size:]
+        w1_ref = w1_model.float()
         ref = torch.zeros(num_tokens, hidden_size, device=device)
         for slot in range(top_k):
             e_global = token_selected_experts[:, slot].long()
@@ -1806,9 +1818,18 @@ def testCuteDslBf16Moe(args):
             local = e_global - local_expert_offset
             mask = (local >= 0) & (local < local_num_experts)
             e = local.clamp(0, local_num_experts - 1)
-            g = torch.einsum("th,tih->ti", x.float(), gate.float()[e])
-            u = torch.einsum("th,tih->ti", x.float(), up.float()[e])
-            act = torch.nn.functional.silu(g) * u
+            # Model layout: gated w1 rows are [gate; up], non-gated rows are h.
+            h = torch.einsum("th,tih->ti", x.float(), w1_ref[e])
+            if activation_type == ActivationType.Swiglu:
+                g, u = h[:, :intermediate_size], h[:, intermediate_size:]
+                act = torch.nn.functional.silu(g) * u
+            elif activation_type == ActivationType.GegluTanh:
+                g, u = h[:, :intermediate_size], h[:, intermediate_size:]
+                act = torch.nn.functional.gelu(g, approximate="tanh") * u
+            elif activation_type == ActivationType.Relu2:
+                act = torch.relu(h) ** 2
+            else:
+                raise ValueError(f"unsupported activation_type {activation_type}")
             contrib = torch.einsum("ti,thi->th", act, w2.float()[e])
             ref += torch.where(mask.unsqueeze(1), scale * contrib, 0.0)
         max_err = (out - ref).abs().max().item()
@@ -1858,7 +1879,7 @@ def testCuteDslBf16Moe(args):
         num_experts,
         top_k,
         median_time,
-        is_gated=True,
+        is_gated=is_gated,
     )
     tb_per_sec = calculate_moe_kernel_bandwidth(
         num_tokens,
@@ -1874,7 +1895,7 @@ def testCuteDslBf16Moe(args):
         routing_logits_dtype=None,
         active_experts=num_active_experts,
         verbose=args.verbose,
-        is_gated=True,
+        is_gated=is_gated,
     )
 
     print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)

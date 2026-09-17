@@ -4,25 +4,33 @@
 # Kernel structure adapted from NVIDIA CUTLASS CuTe-DSL example
 # examples/python/CuTeDSL/hopper/dense_gemm_persistent.py (BSD-3-Clause).
 
-"""SM90 gather grouped GEMM with fused gated activation (MoE GEMM1).
+"""SM90 gather grouped GEMM with fused activation (MoE GEMM1).
 
-Computes, for each valid permuted row ``r`` belonging to expert ``e``:
+Computes, for each valid permuted row ``r`` belonging to expert ``e``, either
+the gated form (``ActivationType.Swiglu`` incl. its OAI/SiTU variants,
+``ActivationType.GegluTanh``)
 
     C[r, j] = act(gate_j) * up_j    where
     [up_j, gate_j] = A[token(r)] @ B[e].T   (columns interleaved, see below)
+
+or the non-gated form (``ActivationType.Relu2``)
+
+    C[r, j] = relu(h_j)^2           where h = A[token(r)] @ B[e].T
 
 - **Gather fusion**: A rows are fetched directly from the *unpermuted* token
   activations using ``permuted_idx_to_expanded_idx`` (``token_id_mapping``) —
   the MoE permute is never materialized. The gather is done with cp.async
   (LDGSTS) by the producer warpgroup; rows beyond an expert's real count
   (``tile_idx_to_mn_limit``) are predicated off.
-- **Activation fusion**: the epilogue applies SiLU-gating in f32 registers and
-  stores ``N/2`` output columns.
-- **Weight interleave**: B's N dimension holds up/gate interleaved at
-  **32-column granularity**: ``[up 0:32 | gate 0:32 | up 32:64 | ...]``.
-  This matches the epilogue subtile width, so an even accumulator subtile is
-  always "up" and the following odd subtile is its "gate". Consequently
-  ``tile_n % 64 == 0`` is required for gated activations.
+- **Activation fusion**: the epilogue applies the activation in f32 registers
+  and stores ``N/2`` output columns for gated activations, ``N`` otherwise.
+- **Weight interleave** (gated activations): B's N dimension holds up/gate
+  interleaved at **32-column granularity**: ``[up 0:32 | gate 0:32 | up 32:64
+  | ...]``. This matches the epilogue subtile width, so an even accumulator
+  subtile is always "up" and the following odd subtile is its "gate".
+  ``tile_n % 64 == 0`` keeps every up/gate pair inside one CTA tile; the
+  non-gated form keeps the same tile grid (N tiles of 64..256) and reads B as
+  a plain ``[I, K]`` projection per expert.
 
 Pipeline structure:
 
@@ -45,6 +53,7 @@ Gather geometry (bf16, CTA K-tile 64 = 128 B per row):
 """
 
 import math
+from typing import Optional
 
 import cuda.bindings.driver as cuda
 
@@ -56,23 +65,54 @@ import cutlass.utils.hopper_helpers as sm90_utils
 from cutlass.cute.nvgpu import cpasync
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
+from flashinfer.tllm_enums import (
+    DEFAULT_SWIGLU_ALPHA,
+    DEFAULT_SWIGLU_BETA,
+    DEFAULT_SWIGLU_LIMIT,
+    ActivationType,
+)
+
 from . import utils as hopper_utils
-from ..common.kernel_utils import silu_f32
+from ..common.kernel_utils import (
+    f32_reciprocal,
+    fmin,
+    gelu_tanh_f32,
+    silu_f32,
+    situ_f32,
+    tanh_f32,
+)
+from ..moe_utils import (
+    normalize_cute_dsl_moe_activation_type,
+    validate_cute_dsl_moe_situ_config,
+)
 
 
 class Sm90ContiguousGatherGroupedGemmActFusionKernel:
-    """Persistent warp-specialized MoE GEMM1: gather + grouped GEMM + SwiGLU.
+    """Persistent warp-specialized MoE GEMM1: gather + grouped GEMM + activation.
 
     :param acc_dtype: Accumulator dtype (Float32 for bf16 inputs).
-    :param tile_shape_mn: CTA tile (M, N) over the **accumulator** (N counts
-        interleaved up+gate columns; the C output has N/2 columns).
-        M in {64, 128}; N % 64 == 0, N <= 256.
+    :param tile_shape_mn: CTA tile (M, N) over the **accumulator** (for gated
+        activations N counts interleaved up+gate columns and the C output has
+        N/2 columns; non-gated C has N columns). M in {64, 128}; N % 64 == 0,
+        N <= 256.
     :param topk: MoE top-k (token id = ``token_id_mapping[row] // topk``).
     :param raster_along_m: Persistent walk order.
+    :param activation_type: ``ActivationType.Swiglu`` (gated SwiGLU; the
+        OAI variant via ``swiglu_alpha``/``swiglu_beta``/``swiglu_limit``,
+        SiTU via ``situ_beta``), ``ActivationType.GegluTanh`` (gated
+        tanh-approximate GeGLU) or ``ActivationType.Relu2`` (non-gated).
+    :param swiglu_alpha: SwiGLU sigmoid multiplier.
+    :param swiglu_beta: SwiGLU up-projection bias.
+    :param swiglu_limit: SwiGLU clamp limit (gate clamped from above, up to
+        ``[-limit, limit]``).
+    :param situ_beta: With ``Swiglu``, selects the SiTU gate
+        ``beta * tanh(gate / beta) * sigmoid(gate)``.
+    :param situ_linear_beta: Optional SiTU tanh clamp of the up branch.
 
-    Output C is ``[permuted_m, N_total/2]`` where ``N_total`` is B's row count
-    per expert. Rows in padding tiles or beyond ``mn_limit`` hold garbage and
-    must be masked downstream.
+    Output C is ``[permuted_m, N_total // out_n_factor]`` where ``N_total`` is
+    B's row count per expert and ``out_n_factor`` is 2 for gated activations
+    and 1 otherwise. Rows in padding tiles or beyond ``mn_limit`` hold garbage
+    and must be masked downstream.
     """
 
     @staticmethod
@@ -81,9 +121,10 @@ class Sm90ContiguousGatherGroupedGemmActFusionKernel:
         cluster_shape_mn: tuple[int, int],
     ) -> bool:
         """Tile and cluster constraints of the kernel itself: M in {64, 128},
-        N a multiple of 64 (up/gate pairs of 32-column epilogue subtiles) up
-        to 256 (N > 128 runs on two consumer warpgroups at M = 128 and on one
-        at M = 64), cluster (1, 1) or (2, 1)."""
+        N a multiple of 64 (up/gate pairs of 32-column epilogue subtiles for
+        gated activations; the non-gated form keeps the same grid) up to 256
+        (N > 128 runs on two consumer warpgroups at M = 128 and on one at
+        M = 64), cluster (1, 1) or (2, 1)."""
         tile_m, tile_n = tile_shape_mn
         return (
             tile_m in (64, 128)
@@ -116,8 +157,9 @@ class Sm90ContiguousGatherGroupedGemmActFusionKernel:
         :param m: permuted rows, a multiple of the M tile (``moe_sort`` pads
             every expert to whole tiles); (2, 1) also needs an even M-tile
             count so that every CTA pair is complete
-        :param n: ``2I``, a multiple of the N tile (the epilogue writes full
-            N tiles)
+        :param n: B rows per expert (``2I`` for gated activations, ``I``
+            for ``Relu2``), a multiple of the N tile (the epilogue writes
+            full N tiles)
         :param k: hidden size, a multiple of the 64-element K tile (the
             gather loader moves whole K tiles)
         :param l: local experts, at least 1
@@ -149,6 +191,12 @@ class Sm90ContiguousGatherGroupedGemmActFusionKernel:
         swizzle_size: int = 1,
         raster_along_m: bool = False,
         enable_pdl: bool = True,
+        activation_type: int = ActivationType.Swiglu.value,
+        swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
+        swiglu_beta: float = DEFAULT_SWIGLU_BETA,
+        swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
+        situ_beta: Optional[float] = None,
+        situ_linear_beta: Optional[float] = None,
     ):
         """``cluster_shape_mn``: (1, 1) or (2, 1). (2, 1) pairs two adjacent
         M-tile CTAs and TMA-multicasts B when both tiles belong to the SAME
@@ -168,6 +216,16 @@ class Sm90ContiguousGatherGroupedGemmActFusionKernel:
                 f"unsupported tile_shape_mn={tile_shape_mn}, "
                 f"cluster_shape_mn={cluster_shape_mn}"
             )
+        activation, gated = normalize_cute_dsl_moe_activation_type(activation_type)
+        validate_cute_dsl_moe_situ_config(activation, situ_beta, situ_linear_beta)
+        self.activation_type = int(activation)
+        self.gated = gated
+        self.out_n_factor = 2 if gated else 1
+        self.swiglu_alpha = float(swiglu_alpha)
+        self.swiglu_beta = float(swiglu_beta)
+        self.swiglu_limit = float(swiglu_limit)
+        self.situ_beta = situ_beta
+        self.situ_linear_beta = situ_linear_beta
         self.acc_dtype = acc_dtype
         self.topk = topk
         self.cluster_shape_mn = cluster_shape_mn
@@ -242,10 +300,10 @@ class Sm90ContiguousGatherGroupedGemmActFusionKernel:
 
         self.cta_layout_mnk = cute.make_layout((*self.cluster_shape_mn, 1))
 
-        # C tile: half the accumulator columns (gated activation).
+        # C tile: half the accumulator columns for gated activations.
         self.cta_tile_shape_c = (
             self.tile_shape_mnk[0],
-            self.tile_shape_mnk[1] // 2,
+            self.tile_shape_mnk[1] // self.out_n_factor,
         )
 
         is_cooperative = self.atom_layout_mnk == (2, 1, 1)
@@ -753,7 +811,7 @@ class Sm90ContiguousGatherGroupedGemmActFusionKernel:
                 b_pipeline.producer_tail(b_producer_state)
 
         # ------------------------------------------------------------------
-        # MMA warpgroups: WGMMA mainloop + gated SwiGLU epilogue.
+        # MMA warpgroups: WGMMA mainloop + fused-activation epilogue.
         # ------------------------------------------------------------------
         if not is_dma_warp_group:
             cute.arch.setmaxregister_increase(self.mma_register_requirement)
@@ -822,10 +880,11 @@ class Sm90ContiguousGatherGroupedGemmActFusionKernel:
             )
 
             # Epi-subtile grid over the accumulator: (m_subs, n_subs) with
-            # n_subs = tile_n/32; C subtiles pair (2*nc, 2*nc+1) -> nc.
+            # n_subs = tile_n/32; gated C subtiles pair (2*nc, 2*nc+1) -> nc,
+            # non-gated map 1:1.
             m_subs = self.tile_shape_mnk[0] // self.epi_tile[0]
             n_subs = self.tile_shape_mnk[1] // self.epi_tile[1]
-            n_subs_c = n_subs // 2
+            n_subs_c = n_subs // self.out_n_factor
 
             while work_tile.is_valid_tile:
                 tile_coord_mnl = work_tile.tile_idx
@@ -901,7 +960,8 @@ class Sm90ContiguousGatherGroupedGemmActFusionKernel:
                         a_release_state.advance()
                         b_release_state.advance()
 
-                    # EPILOGUE: silu(gate) * up over 32-col subtile pairs.
+                    # EPILOGUE: fused activation over 32-col subtiles (pairs
+                    # for gated activations).
                     tCgC_for_tma_partition = cute.zipped_divide(
                         gC_mnl_slice, self.epi_tile
                     )
@@ -921,14 +981,84 @@ class Sm90ContiguousGatherGroupedGemmActFusionKernel:
                             # Flat n-fast subtile chunking of the retiled
                             # accumulator: subtile s occupies elements
                             # [s*size_tRS_rD, (s+1)*size_tRS_rD) with
-                            # s = m_sub * n_subs + n_sub. Even n_sub = up,
-                            # odd n_sub = gate (32-col interleave).
-                            up_base = (m_sub * n_subs + 2 * nc) * size_tRS_rD
-                            gate_base = up_base + size_tRS_rD
-                            for v in cutlass.range_constexpr(size_tRS_rD):
-                                g = tRS_rAcc[gate_base + v]
-                                u = tRS_rAcc[up_base + v]
-                                tRS_rD[v] = silu_f32(g, fastmath=True) * u
+                            # s = m_sub * n_subs + n_sub. Gated: even n_sub =
+                            # up, odd n_sub = gate (32-col interleave).
+                            base = (
+                                m_sub * n_subs + self.out_n_factor * nc
+                            ) * size_tRS_rD
+                            gate_base = base + size_tRS_rD
+                            if cutlass.const_expr(
+                                self.activation_type == ActivationType.Relu2.value
+                            ):
+                                for v in cutlass.range_constexpr(size_tRS_rD):
+                                    h = cute.arch.fmax(
+                                        tRS_rAcc[base + v], cutlass.Float32(0.0)
+                                    )
+                                    tRS_rD[v] = h * h
+                            elif cutlass.const_expr(
+                                self.activation_type == ActivationType.Swiglu.value
+                                and self.situ_beta is not None
+                            ):
+                                for v in cutlass.range_constexpr(size_tRS_rD):
+                                    g = tRS_rAcc[gate_base + v]
+                                    u = tRS_rAcc[base + v]
+                                    if cutlass.const_expr(
+                                        self.situ_linear_beta is not None
+                                    ):
+                                        u = cutlass.Float32(
+                                            self.situ_linear_beta
+                                        ) * tanh_f32(
+                                            u
+                                            * cutlass.Float32(
+                                                f32_reciprocal(self.situ_linear_beta)
+                                            ),
+                                            fastmath=True,
+                                        )
+                                    tRS_rD[v] = u * situ_f32(
+                                        g, self.situ_beta, fastmath=True
+                                    )
+                            elif cutlass.const_expr(
+                                self.activation_type == ActivationType.GegluTanh.value
+                            ):
+                                for v in cutlass.range_constexpr(size_tRS_rD):
+                                    g = tRS_rAcc[gate_base + v]
+                                    u = tRS_rAcc[base + v]
+                                    tRS_rD[v] = u * gelu_tanh_f32(g, fastmath=True)
+                            elif cutlass.const_expr(
+                                self.activation_type == ActivationType.Swiglu.value
+                                and self.swiglu_alpha == DEFAULT_SWIGLU_ALPHA
+                                and self.swiglu_beta == DEFAULT_SWIGLU_BETA
+                                and self.swiglu_limit == DEFAULT_SWIGLU_LIMIT
+                            ):
+                                for v in cutlass.range_constexpr(size_tRS_rD):
+                                    g = tRS_rAcc[gate_base + v]
+                                    u = tRS_rAcc[base + v]
+                                    tRS_rD[v] = silu_f32(g, fastmath=True) * u
+                            elif cutlass.const_expr(
+                                self.activation_type == ActivationType.Swiglu.value
+                            ):
+                                swiglu_alpha = cutlass.Float32(self.swiglu_alpha)
+                                swiglu_beta = cutlass.Float32(self.swiglu_beta)
+                                swiglu_limit = cutlass.Float32(self.swiglu_limit)
+                                LOG2_E = cutlass.Float32(1.4426950408889634)
+                                for v in cutlass.range_constexpr(size_tRS_rD):
+                                    g = fmin(
+                                        tRS_rAcc[gate_base + v], swiglu_limit, nan=True
+                                    )
+                                    u = -fmin(
+                                        -fmin(
+                                            tRS_rAcc[base + v], swiglu_limit, nan=True
+                                        ),
+                                        swiglu_limit,
+                                        nan=True,
+                                    )
+                                    sigmoid_gate = cute.arch.rcp_approx(
+                                        1.0
+                                        + cute.math.exp2(
+                                            -(swiglu_alpha * LOG2_E * g), fastmath=True
+                                        )
+                                    )
+                                    tRS_rD[v] = g * sigmoid_gate * (u + swiglu_beta)
 
                             acc_vec = tRS_rD.load()
                             tRS_rD_out.store(acc_vec.to(self.c_dtype))
@@ -991,8 +1121,9 @@ class Sm90ContiguousGatherGroupedGemmActFusionKernel:
 
         :param orig_m: Unpermuted token count (rows of A).
         :param m: Padded permuted row count (``max_num_tiles * tile_m``).
-        :param n: Interleaved up+gate weight rows per expert (2I per rank);
-            C gets ``n // 2`` columns.
+        :param n: Weight rows per expert: interleaved up+gate (2I per rank)
+            for gated activations, I for ``Relu2``; C gets
+            ``n // out_n_factor`` columns.
         """
         num_tiles = m // self.tile_shape_mnk[0]
         a = cute.make_tensor(
@@ -1002,7 +1133,10 @@ class Sm90ContiguousGatherGroupedGemmActFusionKernel:
             b_ptr, layout=cute.make_ordered_layout((n, k, l), order=(1, 0, 2))
         )
         c = cute.make_tensor(
-            c_ptr, layout=cute.make_ordered_layout((m, n // 2, 1), order=(1, 0, 2))
+            c_ptr,
+            layout=cute.make_ordered_layout(
+                (m, n // self.out_n_factor, 1), order=(1, 0, 2)
+            ),
         )
         tile_idx_to_expert_idx = cute.make_tensor(
             tile_idx_to_expert_idx_ptr, layout=cute.make_layout((num_tiles,))

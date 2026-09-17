@@ -191,3 +191,146 @@ def test_cute_dsl_bf16_gather_grouped_gemm_swizzled_walk(swizzle_size):
         rows < tile_idx_to_mn_limit.long()[rows // 128]
     )
     assert torch.equal(baseline[row_valid], swizzled[row_valid])
+
+
+def _activation_cases():
+    from flashinfer.fused_moe import GeGLUTanh, ReLU2, SiTU, SwiGLU
+
+    return [
+        pytest.param(SwiGLU(alpha=1.702, beta=1.0, limit=7.0), id="swiglu_oai"),
+        pytest.param(SiTU(gate_scale=4.0, linear_scale=None), id="situ"),
+        pytest.param(SiTU(gate_scale=4.0, linear_scale=25.0), id="situ_linear"),
+        pytest.param(GeGLUTanh(), id="geglu_tanh"),
+        pytest.param(ReLU2(), id="relu2"),
+    ]
+
+
+@cute_dsl_available
+@sm90_required
+@pytest.mark.parametrize("activation", _activation_cases())
+@pytest.mark.parametrize(
+    "inter,tile_shape_mn",
+    [
+        (768, (128, 128)),
+        (192, (128, 192)),  # 2-WG tile at M=128; N == 2I (gated) or I (relu2)
+        (768, (64, 256)),
+    ],
+)
+def test_cute_dsl_bf16_gather_grouped_gemm_activations(
+    activation, inter, tile_shape_mn
+):
+    """Every fused activation matches the shared float32 reference on the
+    valid rows.
+
+    Gated activations read the 32-column up/gate interleave and write I
+    columns; ReLU2 reads a plain [E, I, K] projection (no interleave).
+    """
+    from tests.moe.utils import compute_reference_activation
+    from flashinfer.fused_moe.runners import _cute_dsl_activation_kwargs
+    from flashinfer.fused_moe.cute_dsl.moe_utils import moe_sort
+    from flashinfer.fused_moe.cute_dsl.sm90_contiguous_gather_grouped_gemm_act_fusion import (
+        interleave_up_gate_sm90,
+        sm90_contiguous_gather_grouped_gemm_act_fusion,
+    )
+
+    torch.manual_seed(3)
+    num_experts, top_k, k, num_tokens = 32, 4, 1024, 333
+    dtype = torch.bfloat16
+    tile_m = tile_shape_mn[0]
+    gated = activation.is_gated
+    act = _cute_dsl_activation_kwargs(activation)
+    if not gated and tile_shape_mn[1] > inter:
+        pytest.skip("N tile wider than the non-gated projection")
+
+    ids = make_random_topk_ids(num_experts, num_tokens, top_k)
+    scales = torch.rand(num_tokens, top_k, device="cuda", dtype=torch.float32)
+    (
+        tile_idx_to_expert_idx,
+        tile_idx_to_mn_limit,
+        expanded_idx_to_permuted_idx,
+        permuted_idx_to_expanded_idx,
+        _total_padded,
+        num_non_exiting_tiles,
+    ) = moe_sort(
+        ids, scales, num_experts=num_experts, top_k=top_k, tile_tokens_dim=tile_m
+    )
+    permuted_m = tile_idx_to_expert_idx.numel() * tile_m
+
+    x = torch.randn(num_tokens, k, device="cuda", dtype=dtype) / (k**0.25)
+    if gated:
+        w_gate_up = torch.randn(num_experts, 2 * inter, k, device="cuda", dtype=dtype)
+        w_gate_up = w_gate_up / (k**0.25)
+        w1 = interleave_up_gate_sm90(w_gate_up)
+    else:
+        w1 = torch.randn(num_experts, inter, k, device="cuda", dtype=dtype) / (k**0.25)
+
+    out = torch.full((permuted_m, inter), float("nan"), device="cuda", dtype=dtype)
+    out = sm90_contiguous_gather_grouped_gemm_act_fusion(
+        x,
+        w1,
+        tile_idx_to_expert_idx,
+        tile_idx_to_mn_limit,
+        permuted_idx_to_expanded_idx,
+        num_non_exiting_tiles,
+        out=out,
+        topk=top_k,
+        permuted_m=permuted_m,
+        tile_shape_mn=tile_shape_mn,
+        **act,
+    )
+    assert out.shape == (permuted_m, inter)
+
+    n_tiles = int(num_non_exiting_tiles.item())
+    rows = torch.arange(permuted_m, device="cuda")
+    row_tile = rows // tile_m
+    row_valid = (row_tile < n_tiles) & (rows < tile_idx_to_mn_limit.long()[row_tile])
+    expert_of_tile = tile_idx_to_expert_idx.long()
+    token_of_expanded = torch.arange(num_tokens, device="cuda").repeat_interleave(top_k)
+    token_of_row = torch.zeros(permuted_m, dtype=torch.long, device="cuda")
+    token_of_row[expanded_idx_to_permuted_idx.flatten().long()] = token_of_expanded
+
+    ref = torch.zeros(permuted_m, inter, device="cuda", dtype=torch.float32)
+    for e in torch.unique(expert_of_tile[:n_tiles]).tolist():
+        rows_e = rows[row_valid & (expert_of_tile[row_tile] == e)]
+        if not rows_e.numel():
+            continue
+        xe = x[token_of_row[rows_e]].float()
+        if gated:
+            # The shared reference takes [up | gate]; the model pack is [gate; up].
+            gate = xe @ w_gate_up[e, :inter].float().T
+            up = xe @ w_gate_up[e, inter:].float().T
+            values = torch.cat((up, gate), dim=-1)
+        else:
+            values = xe @ w1[e].float().T
+        ref[rows_e] = compute_reference_activation(values, activation, inter).float()
+
+    torch.testing.assert_close(
+        out[row_valid].float(), ref[row_valid], atol=2e-1, rtol=3e-2
+    )
+
+
+@cute_dsl_available
+def test_cute_dsl_bf16_gather_grouped_gemm_rejects_bad_activation_config():
+    """Unsupported activation types and inconsistent SiTU parameters are
+    rejected when the kernel is configured, before any compilation."""
+    import cutlass
+
+    from flashinfer.fused_moe.cute_dsl.hopper.contiguous_gather_grouped_gemm_act_fusion import (
+        Sm90ContiguousGatherGroupedGemmActFusionKernel,
+    )
+    from flashinfer.tllm_enums import ActivationType
+
+    def make(**kwargs):
+        return Sm90ContiguousGatherGroupedGemmActFusionKernel(
+            cutlass.Float32, (128, 64), topk=2, **kwargs
+        )
+
+    for bad in (ActivationType.Geglu, ActivationType.Silu, ActivationType.SwigluStep):
+        with pytest.raises(ValueError, match="Unsupported activation_type"):
+            make(activation_type=bad.value)
+    with pytest.raises(ValueError, match="requires situ_beta"):
+        make(situ_linear_beta=25.0)
+    with pytest.raises(ValueError, match="require ActivationType.Swiglu"):
+        make(activation_type=ActivationType.GegluTanh.value, situ_beta=4.0)
+    assert make(activation_type=ActivationType.Relu2.value).out_n_factor == 1
+    assert make(activation_type=ActivationType.GegluTanh.value).out_n_factor == 2
