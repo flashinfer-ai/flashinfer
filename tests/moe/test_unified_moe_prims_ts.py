@@ -180,12 +180,18 @@ class TestPrimsTsUnifiedValidation:
         runner.device = torch.device("cpu")
         return runner
 
-    def test_missing_dsl_is_skipped(self, monkeypatch):
+    @pytest.fixture(autouse=True)
+    def _prims_ts_cpu_support_env(self, monkeypatch):
         monkeypatch.setattr(
-            "flashinfer.prims_ts.utils.is_prims_ts_available", lambda: False
+            "flashinfer.prims_ts.utils.is_prims_ts_available", lambda: True
         )
         monkeypatch.setattr(
             "flashinfer.utils.get_compute_capability", lambda _: (10, 0)
+        )
+
+    def test_missing_dsl_is_skipped(self, monkeypatch):
+        monkeypatch.setattr(
+            "flashinfer.prims_ts.utils.is_prims_ts_available", lambda: False
         )
         runner = self._runner(_config())
         with pytest.raises(RuntimeError, match="nvidia-cutlass-dsl"):
@@ -193,33 +199,18 @@ class TestPrimsTsUnifiedValidation:
 
     def test_unsupported_arch_rejected(self, monkeypatch):
         monkeypatch.setattr(
-            "flashinfer.prims_ts.utils.is_prims_ts_available", lambda: True
-        )
-        monkeypatch.setattr(
             "flashinfer.utils.get_compute_capability", lambda _: (10, 7)
         )
         runner = self._runner(_config())
         with pytest.raises(NotImplementedError, match="SM100/SM103"):
             runner.check_support()
 
-    def test_intermediate_size_alignment(self, monkeypatch):
-        monkeypatch.setattr(
-            "flashinfer.prims_ts.utils.is_prims_ts_available", lambda: True
-        )
-        monkeypatch.setattr(
-            "flashinfer.utils.get_compute_capability", lambda _: (10, 0)
-        )
+    def test_intermediate_size_alignment(self):
         runner = self._runner(_config(experts=ExpertConfig(intermediate_size=64)))
         with pytest.raises(NotImplementedError, match="intermediate_size"):
             runner.check_support()
 
-    def test_bf16_rejects_sigmoid_routing(self, monkeypatch):
-        monkeypatch.setattr(
-            "flashinfer.prims_ts.utils.is_prims_ts_available", lambda: True
-        )
-        monkeypatch.setattr(
-            "flashinfer.utils.get_compute_capability", lambda _: (10, 0)
-        )
+    def test_bf16_rejects_sigmoid_routing(self):
         runner = self._runner(
             _config(
                 variant=_BF16,
@@ -233,7 +224,16 @@ class TestPrimsTsUnifiedValidation:
         with pytest.raises(NotImplementedError, match="Sigmoid"):
             runner.check_support()
 
-    def test_staged_routing_placeholders_match_flat_api(self):
+    def test_geglu_does_not_forward_prepare_alpha(self):
+        alpha = torch.ones(32, dtype=torch.float32)
+        view = {"gemm1_alpha": alpha, "gemm1_beta": None, "gemm1_clamp_limit": None}
+        geglu = self._runner(_config(activation=GeGLU()))._gemm1_oa_launch_kwargs(view)
+        assert geglu["gemm1_alpha"] is None
+        assert geglu["gemm1_beta"] is None
+        swiglu = self._runner(_config())._gemm1_oa_launch_kwargs(view)
+        assert swiglu["gemm1_alpha"] is alpha
+
+    def test_staged_routing_placeholders_match_bf16_runner(self):
         runner = self._runner(_config(execution=ExecutionConfig(enable_pdl=False)))
         hidden = torch.zeros(4, 8, dtype=torch.bfloat16)
         packed_act = MoEActivationPack(
@@ -242,13 +242,11 @@ class TestPrimsTsUnifiedValidation:
             torch.arange(8, dtype=torch.int32).reshape(4, 2),
             torch.ones(4, 2, dtype=torch.float32),
         )
-        _, _, _, packed_ids, packed_weights = runner._pack_routing(
-            packed_act, num_tokens=4, hidden_like=hidden
-        )
+        _, _, packed_ids, packed_weights = runner._pack_routing(packed_act)
         assert packed_ids.shape == (4, 2)
         assert packed_ids.dtype == torch.int32
-        assert packed_weights.numel() == 0
-        assert packed_weights.ndim == 1
+        assert packed_weights.shape == (4, 2)
+        assert packed_weights.dtype == torch.bfloat16
 
         logits_act = MoEActivationPack(
             hidden,
@@ -256,11 +254,9 @@ class TestPrimsTsUnifiedValidation:
             routing_input_mode=RoutingInputMode.FromLogits,
             routing_logits=torch.zeros(4, 32, dtype=torch.float32),
         )
-        _, _, _, logits_ids, logits_weights = runner._pack_routing(
-            logits_act, num_tokens=4, hidden_like=hidden
-        )
-        assert logits_ids.numel() == 0
-        assert logits_weights.numel() == 0
+        _, _, logits_ids, logits_weights = runner._pack_routing(logits_act)
+        assert logits_ids.shape == (4, 2)
+        assert logits_weights.shape == (4, 2)
 
         unpacked_act = MoEActivationPack(
             hidden,
@@ -269,19 +265,12 @@ class TestPrimsTsUnifiedValidation:
             torch.ones(4, 2, dtype=torch.bfloat16),
             routing_input_mode=RoutingInputMode.UnpackedPrecomputed,
         )
-        _, _, _, unpacked_ids, unpacked_weights = runner._pack_routing(
-            unpacked_act, num_tokens=4, hidden_like=hidden
-        )
+        _, _, unpacked_ids, unpacked_weights = runner._pack_routing(unpacked_act)
         assert unpacked_ids.shape == (4, 2)
         assert unpacked_weights.shape == (4, 2)
+        assert unpacked_weights is unpacked_act.topk_weights
 
-    def test_situ_unclamped_linear_rejected(self, monkeypatch):
-        monkeypatch.setattr(
-            "flashinfer.prims_ts.utils.is_prims_ts_available", lambda: True
-        )
-        monkeypatch.setattr(
-            "flashinfer.utils.get_compute_capability", lambda _: (10, 0)
-        )
+    def test_situ_unclamped_linear_rejected(self):
         runner = self._runner(_config(activation=SiTU(linear_scale=None)))
         with pytest.raises(NotImplementedError, match="linear_scale=None"):
             runner.check_support()
@@ -295,9 +284,6 @@ class TestPrimsTsUnifiedValidation:
         )
         monkeypatch.setattr(
             "flashinfer.fused_moe.layer.get_compute_capability", lambda _: (10, 0)
-        )
-        monkeypatch.setattr(
-            "flashinfer.utils.get_compute_capability", lambda _: (10, 0)
         )
         with pytest.raises(RuntimeError, match="none of the configured backends"):
             MoELayer(_config())
@@ -320,6 +306,22 @@ class TestPrimsTsUnifiedGpu:
         packed = runner.pack_inputs(act, weights)
         direct_out = runner.forward(packed, tactic=-1)
         _nvfp4_check(direct_out, reference, "prims_ts nvfp4 direct")
+
+    def test_nvfp4_geglu_matches_trtllm_without_oa_placeholder(self):
+        # Cute-DSL's FP4 reference does not implement GeGLU. TRT-LLM does, and
+        # prepare_weights still inserts gemm1_alpha=ones; the adapter must drop
+        # that placeholder or the first Prims-TS forward fails support.
+        act, weights, config, _tensors = _make_packs_and_config(
+            16, max_tokens=16, activation=GeGLU(), **SMALL
+        )
+        _attach_prims_ts_view(weights, "trtllm_fp4_routed")
+        prims_out = MoELayer(
+            dataclasses.replace(config, backend=BackendOptions((PrimsTsConfig(),)))
+        )(act, weights)
+        trtllm_out = MoELayer(
+            dataclasses.replace(config, backend=BackendOptions((TrtllmFp4Config(),)))
+        )(act, weights)
+        _nvfp4_check(prims_out, trtllm_out.float(), "prims_ts nvfp4 geglu vs trtllm")
 
     def test_bf16_layer_and_direct_runner_match_reference(self):
         act, weights, config, tensors = _make_bf16_packs_and_config(

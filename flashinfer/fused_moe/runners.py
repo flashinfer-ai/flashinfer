@@ -56,6 +56,7 @@ from .api import (
     _CUTILE_MXFP4_ARCHS,
     _CUTILE_NVFP4_ARCHS,
     _CUTILE_W4A16_ARCHS,
+    _PRIMS_TS_ARCHS,
     # Typed activation values
     ActivationConfig,
     GELU,
@@ -4334,6 +4335,140 @@ class _TrtllmRunnerBase(MoERunner):
             return inputs[0]
         return result
 
+    def _validate_fp4_tensors(
+        self,
+        act: MoEActivationPack,
+        view: dict,
+        hidden_size: int,
+    ) -> torch.Tensor | None:
+        num_tokens = act.hidden_states_q.shape[0]
+        if self._pair == (QuantFormat.NVFP4, QuantFormat.NVFP4):
+            if act.hidden_states_q.dtype != torch.uint8:
+                raise TypeError(
+                    "NVFP4 hidden_states_q must be packed uint8, got "
+                    f"{act.hidden_states_q.dtype}."
+                )
+            scale = act.hidden_states_scale
+            expected_scale = (num_tokens, hidden_size // 16)
+            if (
+                scale is None
+                or scale.dtype not in (torch.uint8, torch.float8_e4m3fn)
+                or tuple(scale.shape) != expected_scale
+            ):
+                got = None if scale is None else (scale.dtype, tuple(scale.shape))
+                raise ValueError(
+                    "NVFP4 hidden_states_scale must have shape "
+                    f"{expected_scale} and uint8/float8_e4m3fn storage, got {got}."
+                )
+            if scale.dtype == torch.uint8:
+                scale = scale.view(torch.float8_e4m3fn)
+            scale_dtype = torch.float8_e4m3fn
+            sf_vec_size = 16
+        elif self._pair == (QuantFormat.MXFP4, QuantFormat.MXFP8):
+            if act.hidden_states_q.dtype != torch.float8_e4m3fn:
+                raise TypeError(
+                    "MXFP4×MXFP8 hidden_states_q must be float8_e4m3fn, got "
+                    f"{act.hidden_states_q.dtype}."
+                )
+            scale = act.hidden_states_scale
+            expected_scale = (num_tokens, hidden_size // 32)
+            if (
+                scale is None
+                or scale.dtype != torch.float8_e4m3fn
+                or tuple(scale.shape) != expected_scale
+            ):
+                got = None if scale is None else (scale.dtype, tuple(scale.shape))
+                raise ValueError(
+                    "MXFP4×MXFP8 hidden_states_scale must carry UE8M0 bytes in "
+                    f"a float8_e4m3fn tensor with shape {expected_scale}, got {got}."
+                )
+            scale_dtype = torch.float8_e4m3fn
+            sf_vec_size = 32
+        else:
+            if act.hidden_states_q.dtype != torch.bfloat16:
+                raise TypeError(
+                    "TRTLLM W4A16 hidden_states_q must be bfloat16, got "
+                    f"{act.hidden_states_q.dtype}."
+                )
+            if act.hidden_states_scale is not None:
+                raise ValueError("TRTLLM W4A16 does not consume hidden_states_scale.")
+            scale = None
+            scale_dtype = torch.float8_e4m3fn
+            sf_vec_size = 32
+
+        expected_weights = {
+            "gemm1_weights": (
+                self._num_weight_rows,
+                self._intermediate_size * (2 if self.config.activation.is_gated else 1),
+                hidden_size // 2,
+            ),
+            "gemm2_weights": (
+                self._num_weight_rows,
+                hidden_size,
+                self._intermediate_size // 2,
+            ),
+        }
+        for name, expected in expected_weights.items():
+            tensor = view[name]
+            if tensor.dtype != torch.uint8 or tuple(tensor.shape) != expected:
+                raise ValueError(
+                    f"{name} must be packed uint8 with shape {expected}, got "
+                    f"{tensor.dtype} {tuple(tensor.shape)}."
+                )
+
+        for name, expected in (
+            (
+                "gemm1_weights_scale",
+                (
+                    self._num_weight_rows,
+                    self._intermediate_size
+                    * (2 if self.config.activation.is_gated else 1),
+                    hidden_size // sf_vec_size,
+                ),
+            ),
+            (
+                "gemm2_weights_scale",
+                (
+                    self._num_weight_rows,
+                    hidden_size,
+                    self._intermediate_size // sf_vec_size,
+                ),
+            ),
+        ):
+            tensor = view[name]
+            if tensor.dtype != scale_dtype or tuple(tensor.shape) != expected:
+                raise ValueError(
+                    f"{name} must be {scale_dtype} with shape {expected}, got "
+                    f"{tensor.dtype} {tuple(tensor.shape)}."
+                )
+
+        for name in (
+            "gemm1_alpha",
+            "gemm1_beta",
+            "gemm1_clamp_limit",
+            "output1_scale_scalar",
+            "output1_scale_gate_scalar",
+            "output2_scale_scalar",
+        ):
+            tensor = view.get(name)
+            if tensor is None:
+                continue
+            if tensor.device != act.hidden_states_q.device:
+                raise ValueError(
+                    f"{name} is on {tensor.device}, expected "
+                    f"{act.hidden_states_q.device}."
+                )
+            if tensor.dtype != torch.float32:
+                raise TypeError(f"{name} must be float32, got {tensor.dtype}.")
+            if tuple(tensor.shape) != (self._num_weight_rows,):
+                raise ValueError(
+                    f"{name} must have shape ({self._num_weight_rows},), got "
+                    f"{tuple(tensor.shape)}."
+                )
+            if not tensor.is_contiguous():
+                raise ValueError(f"{name} must be contiguous.")
+        return scale
+
 
 class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
     """FP4 adapter over the canonical trtllm-gen ``MoERunner``.
@@ -4528,140 +4663,6 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
         return self._forward_inner(
             inputs, tactic, do_preparation, kwargs.pop("launch_state", None)
         )
-
-    def _validate_fp4_tensors(
-        self,
-        act: MoEActivationPack,
-        view: dict,
-        hidden_size: int,
-    ) -> torch.Tensor | None:
-        num_tokens = act.hidden_states_q.shape[0]
-        if self._pair == (QuantFormat.NVFP4, QuantFormat.NVFP4):
-            if act.hidden_states_q.dtype != torch.uint8:
-                raise TypeError(
-                    "NVFP4 hidden_states_q must be packed uint8, got "
-                    f"{act.hidden_states_q.dtype}."
-                )
-            scale = act.hidden_states_scale
-            expected_scale = (num_tokens, hidden_size // 16)
-            if (
-                scale is None
-                or scale.dtype not in (torch.uint8, torch.float8_e4m3fn)
-                or tuple(scale.shape) != expected_scale
-            ):
-                got = None if scale is None else (scale.dtype, tuple(scale.shape))
-                raise ValueError(
-                    "NVFP4 hidden_states_scale must have shape "
-                    f"{expected_scale} and uint8/float8_e4m3fn storage, got {got}."
-                )
-            if scale.dtype == torch.uint8:
-                scale = scale.view(torch.float8_e4m3fn)
-            scale_dtype = torch.float8_e4m3fn
-            sf_vec_size = 16
-        elif self._pair == (QuantFormat.MXFP4, QuantFormat.MXFP8):
-            if act.hidden_states_q.dtype != torch.float8_e4m3fn:
-                raise TypeError(
-                    "MXFP4×MXFP8 hidden_states_q must be float8_e4m3fn, got "
-                    f"{act.hidden_states_q.dtype}."
-                )
-            scale = act.hidden_states_scale
-            expected_scale = (num_tokens, hidden_size // 32)
-            if (
-                scale is None
-                or scale.dtype != torch.float8_e4m3fn
-                or tuple(scale.shape) != expected_scale
-            ):
-                got = None if scale is None else (scale.dtype, tuple(scale.shape))
-                raise ValueError(
-                    "MXFP4×MXFP8 hidden_states_scale must carry UE8M0 bytes in "
-                    f"a float8_e4m3fn tensor with shape {expected_scale}, got {got}."
-                )
-            scale_dtype = torch.float8_e4m3fn
-            sf_vec_size = 32
-        else:
-            if act.hidden_states_q.dtype != torch.bfloat16:
-                raise TypeError(
-                    "TRTLLM W4A16 hidden_states_q must be bfloat16, got "
-                    f"{act.hidden_states_q.dtype}."
-                )
-            if act.hidden_states_scale is not None:
-                raise ValueError("TRTLLM W4A16 does not consume hidden_states_scale.")
-            scale = None
-            scale_dtype = torch.float8_e4m3fn
-            sf_vec_size = 32
-
-        expected_weights = {
-            "gemm1_weights": (
-                self._num_weight_rows,
-                self._intermediate_size * (2 if self.config.activation.is_gated else 1),
-                hidden_size // 2,
-            ),
-            "gemm2_weights": (
-                self._num_weight_rows,
-                hidden_size,
-                self._intermediate_size // 2,
-            ),
-        }
-        for name, expected in expected_weights.items():
-            tensor = view[name]
-            if tensor.dtype != torch.uint8 or tuple(tensor.shape) != expected:
-                raise ValueError(
-                    f"{name} must be packed uint8 with shape {expected}, got "
-                    f"{tensor.dtype} {tuple(tensor.shape)}."
-                )
-
-        for name, expected in (
-            (
-                "gemm1_weights_scale",
-                (
-                    self._num_weight_rows,
-                    self._intermediate_size
-                    * (2 if self.config.activation.is_gated else 1),
-                    hidden_size // sf_vec_size,
-                ),
-            ),
-            (
-                "gemm2_weights_scale",
-                (
-                    self._num_weight_rows,
-                    hidden_size,
-                    self._intermediate_size // sf_vec_size,
-                ),
-            ),
-        ):
-            tensor = view[name]
-            if tensor.dtype != scale_dtype or tuple(tensor.shape) != expected:
-                raise ValueError(
-                    f"{name} must be {scale_dtype} with shape {expected}, got "
-                    f"{tensor.dtype} {tuple(tensor.shape)}."
-                )
-
-        for name in (
-            "gemm1_alpha",
-            "gemm1_beta",
-            "gemm1_clamp_limit",
-            "output1_scale_scalar",
-            "output1_scale_gate_scalar",
-            "output2_scale_scalar",
-        ):
-            tensor = view.get(name)
-            if tensor is None:
-                continue
-            if tensor.device != act.hidden_states_q.device:
-                raise ValueError(
-                    f"{name} is on {tensor.device}, expected "
-                    f"{act.hidden_states_q.device}."
-                )
-            if tensor.dtype != torch.float32:
-                raise TypeError(f"{name} must be float32, got {tensor.dtype}.")
-            if tuple(tensor.shape) != (self._num_weight_rows,):
-                raise ValueError(
-                    f"{name} must have shape ({self._num_weight_rows},), got "
-                    f"{tuple(tensor.shape)}."
-                )
-            if not tensor.is_contiguous():
-                raise ValueError(f"{name} must be contiguous.")
-        return scale
 
     def pack_inputs(
         self, act: MoEActivationPack, weights: MoEWeightPack
@@ -5819,7 +5820,8 @@ class PrimsTsRunner(_TrtllmRunnerBase):
                 "cutlass.experimental.primitives and task_scheduling."
             )
         compute_capability = get_compute_capability(self.device)
-        if compute_capability not in ((10, 0), (10, 3)):
+        arch = compute_capability[0] * 10 + compute_capability[1]
+        if arch not in _PRIMS_TS_ARCHS:
             raise NotImplementedError(
                 f"{type(self).__name__} is enabled only on SM100/SM103, "
                 f"got SM{compute_capability[0]}{compute_capability[1]}."
@@ -5866,8 +5868,7 @@ class PrimsTsRunner(_TrtllmRunnerBase):
         execution = config.execution
         self._pair = config.quant.pair
         self._num_local_experts = experts.local_num_experts or routing.num_experts
-        self._num_fused_shared_experts = experts.num_fused_shared_experts
-        self._num_weight_rows = self._num_local_experts + self._num_fused_shared_experts
+        self._num_weight_rows = self._num_local_experts
         self._local_expert_offset = experts.local_expert_offset
         self._intermediate_size = experts.intermediate_size
         self._activation_type = int(config.activation.type)
@@ -5879,6 +5880,7 @@ class PrimsTsRunner(_TrtllmRunnerBase):
             enable_pdl = device_support_pdl(device)
         self._enable_pdl = enable_pdl
         self._inner: Any = None
+        self._last_launch_state: _TrtllmLaunchState | None = None
 
     def _weight_layout(self) -> int:
         from flashinfer.tllm_enums import WeightLayout
@@ -5922,7 +5924,22 @@ class PrimsTsRunner(_TrtllmRunnerBase):
         self, inputs: List[torch.Tensor], profile: Any
     ) -> List[Any]:
         self._require_built()
+        self._sync_inner_static_extras(inputs)
         return self._inner.get_valid_tactics(inputs, profile)
+
+    def _sync_inner_static_extras(
+        self,
+        inputs: List[torch.Tensor],
+        launch_state: _TrtllmLaunchState | None = None,
+    ) -> None:
+        # Autotune synthesizes a plain tensor list, so fall back to the
+        # launch state from the most recent pack_inputs.
+        if launch_state is None:
+            launch_state = getattr(inputs, "launch_state", None)
+        if not isinstance(launch_state, _TrtllmLaunchState):
+            launch_state = self._last_launch_state
+        if isinstance(launch_state, _TrtllmLaunchState) and self._inner is not None:
+            self._inner.set_cache_key_static_extras(**launch_state.static_kwargs)
 
     def forward(
         self,
@@ -5932,145 +5949,59 @@ class PrimsTsRunner(_TrtllmRunnerBase):
         **kwargs: Any,
     ) -> torch.Tensor | List[torch.Tensor]:
         self._require_built()
-        return self._forward_inner(
-            inputs, tactic, do_preparation, kwargs.pop("launch_state", None)
-        )
+        launch_state = kwargs.pop("launch_state", None)
+        self._sync_inner_static_extras(inputs, launch_state)
+        return self._forward_inner(inputs, tactic, do_preparation, launch_state)
 
-    def _validate_nvfp4_tensors(
-        self,
-        act: MoEActivationPack,
-        view: dict,
-        hidden_size: int,
-    ) -> torch.Tensor:
-        num_tokens = act.hidden_states_q.shape[0]
-        if act.hidden_states_q.dtype != torch.uint8:
-            raise TypeError(
-                "NVFP4 hidden_states_q must be packed uint8, got "
-                f"{act.hidden_states_q.dtype}."
-            )
-        scale = act.hidden_states_scale
-        expected_scale = (num_tokens, hidden_size // 16)
-        if (
-            scale is None
-            or scale.dtype not in (torch.uint8, torch.float8_e4m3fn)
-            or tuple(scale.shape) != expected_scale
-        ):
-            got = None if scale is None else (scale.dtype, tuple(scale.shape))
-            raise ValueError(
-                "NVFP4 hidden_states_scale must have shape "
-                f"{expected_scale} and uint8/float8_e4m3fn storage, got {got}."
-            )
-        if scale.dtype == torch.uint8:
-            scale = scale.view(torch.float8_e4m3fn)
-
-        expected_weights = {
-            "gemm1_weights": (
-                self._num_weight_rows,
-                self._intermediate_size * (2 if self.config.activation.is_gated else 1),
-                hidden_size // 2,
-            ),
-            "gemm2_weights": (
-                self._num_weight_rows,
-                hidden_size,
-                self._intermediate_size // 2,
-            ),
+    def _gemm1_oa_launch_kwargs(self, view: dict) -> dict[str, Any]:
+        # Prims-TS OA (alpha/beta/clamp) is SwiGLU/SiTU only. TRT-LLM FP4
+        # prepare inserts gemm1_alpha=ones for every gated activation,
+        # including GeGLU; forwarding that placeholder fails support.
+        if isinstance(self.config.activation, (SwiGLU, SiTU)):
+            return {
+                "gemm1_alpha": view.get("gemm1_alpha"),
+                "gemm1_beta": view.get("gemm1_beta"),
+                "gemm1_clamp_limit": view.get("gemm1_clamp_limit"),
+            }
+        return {
+            "gemm1_alpha": None,
+            "gemm1_beta": None,
+            "gemm1_clamp_limit": None,
         }
-        for name, expected in expected_weights.items():
-            tensor = view[name]
-            if tensor.dtype != torch.uint8 or tuple(tensor.shape) != expected:
-                raise ValueError(
-                    f"{name} must be packed uint8 with shape {expected}, got "
-                    f"{tensor.dtype} {tuple(tensor.shape)}."
-                )
-        for name, expected in (
-            (
-                "gemm1_weights_scale",
-                (
-                    self._num_weight_rows,
-                    self._intermediate_size
-                    * (2 if self.config.activation.is_gated else 1),
-                    hidden_size // 16,
-                ),
-            ),
-            (
-                "gemm2_weights_scale",
-                (
-                    self._num_weight_rows,
-                    hidden_size,
-                    self._intermediate_size // 16,
-                ),
-            ),
-        ):
-            tensor = view[name]
-            if tensor.dtype != torch.float8_e4m3fn or tuple(tensor.shape) != expected:
-                raise ValueError(
-                    f"{name} must be float8_e4m3fn with shape {expected}, got "
-                    f"{tensor.dtype} {tuple(tensor.shape)}."
-                )
-        for name in (
-            "gemm1_alpha",
-            "gemm1_beta",
-            "gemm1_clamp_limit",
-            "output1_scale_scalar",
-            "output1_scale_gate_scalar",
-            "output2_scale_scalar",
-        ):
-            tensor = view.get(name)
-            if tensor is None:
-                continue
-            if tensor.device != act.hidden_states_q.device:
-                raise ValueError(
-                    f"{name} is on {tensor.device}, expected "
-                    f"{act.hidden_states_q.device}."
-                )
-            if tensor.dtype != torch.float32:
-                raise TypeError(f"{name} must be float32, got {tensor.dtype}.")
-            if tuple(tensor.shape) != (self._num_weight_rows,):
-                raise ValueError(
-                    f"{name} must have shape ({self._num_weight_rows},), got "
-                    f"{tuple(tensor.shape)}."
-                )
-            if not tensor.is_contiguous():
-                raise ValueError(f"{name} must be contiguous.")
-        return scale
 
     def _pack_routing(
-        self,
-        act: MoEActivationPack,
-        *,
-        num_tokens: int,
-        hidden_like: torch.Tensor,
-    ) -> tuple[Any, Any, Any, torch.Tensor, torch.Tensor]:
+        self, act: MoEActivationPack
+    ) -> tuple[Any, Any, torch.Tensor, torch.Tensor]:
+        """Allocate the same 2-D routing buffers as ``TrtllmBf16RoutedRunner``.
+
+        Inner ``_staged_routing_io`` rewrites Packed/FromLogits placeholders
+        to the 1-D empties the staged C++ launcher infers mode from.
+        """
         from .core import RoutingInputMode
 
         routing = self.config.routing
-        routing_input_mode = act.routing_input_mode
-        # Staged routing (``trtllm_moe_run_routing*``) infers packed vs
-        # unpacked vs logits from tensor rank/size, not from
-        # ``routing_input_mode``. A 2-D nonempty ``expert_weights`` makes the
-        # kernel treat packed ``(id << 16 | scale)`` ints as unpacked expert
-        # ids, which are all out of range → every token is dropped and the
-        # output is zeros. Match the flat ``prims_ts_*`` APIs: 1-D empty
-        # placeholders except for true UnpackedPrecomputed.
-        if routing_input_mode == RoutingInputMode.FromLogits:
+        num_tokens = act.hidden_states_q.shape[0]
+        hidden = act.hidden_states_q
+        mode = act.routing_input_mode
+        if mode == RoutingInputMode.FromLogits:
             _validate_logits_inputs(
                 act, num_tokens, routing.num_experts, type(self).__name__
             )
-            routing_logits = act.routing_logits
-            routing_bias = act.routing_bias
-            topk_ids = hidden_like.new_empty((0,), dtype=torch.int32)
-            expert_weights = hidden_like.new_empty((0,), dtype=torch.bfloat16)
-        elif routing_input_mode == RoutingInputMode.PackedPrecomputed:
+            topk_ids = hidden.new_empty((num_tokens, routing.top_k), dtype=torch.int32)
+            expert_weights = hidden.new_empty(
+                (num_tokens, routing.top_k), dtype=torch.bfloat16
+            )
+            return act.routing_logits, act.routing_bias, topk_ids, expert_weights
+        if mode == RoutingInputMode.PackedPrecomputed:
             _validate_prerouted_inputs(
                 act, num_tokens, routing.top_k, type(self).__name__
             )
-            routing_logits = None
-            routing_bias = None
             topk_ids = _pack_prerouted_topk_ids(act)
             expert_weights = act.topk_weights.new_empty(
-                0, dtype=torch.bfloat16, device=act.topk_weights.device
+                (num_tokens, routing.top_k), dtype=torch.bfloat16
             )
-        elif routing_input_mode == RoutingInputMode.UnpackedPrecomputed:
+            return None, None, topk_ids, expert_weights
+        if mode == RoutingInputMode.UnpackedPrecomputed:
             _validate_prerouted_inputs(
                 act,
                 num_tokens,
@@ -6079,29 +6010,22 @@ class PrimsTsRunner(_TrtllmRunnerBase):
                 allowed_weights_dtypes=(torch.bfloat16, torch.float32),
                 require_contiguous=True,
             )
-            routing_logits = None
-            routing_bias = None
-            topk_ids = act.topk_ids
-            expert_weights = act.topk_weights
-        else:
-            raise NotImplementedError(
-                f"{type(self).__name__} does not support "
-                f"routing_input_mode={routing_input_mode!r} "
-                "(only FromLogits, PackedPrecomputed, and "
-                "UnpackedPrecomputed are wired)."
-            )
-        return (
-            routing_input_mode,
-            routing_logits,
-            routing_bias,
-            topk_ids,
-            expert_weights,
+            return None, None, act.topk_ids, act.topk_weights
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support "
+            f"routing_input_mode={mode!r} "
+            "(only FromLogits, PackedPrecomputed, and "
+            "UnpackedPrecomputed are wired)."
         )
 
     def pack_inputs(
         self, act: MoEActivationPack, weights: MoEWeightPack
     ) -> List[torch.Tensor]:
         self._require_built()
+        from flashinfer.prims_ts.moe.support import (
+            is_prims_ts_bf16_supported,
+            is_prims_ts_nvfp4_supported,
+        )
         from .core import MoeRunnerInputs
 
         v = weights.get_view(self.backend_key)
@@ -6118,13 +6042,12 @@ class PrimsTsRunner(_TrtllmRunnerBase):
         )
 
         if is_nvfp4:
-            hidden_states_scale = self._validate_nvfp4_tensors(act, v, hidden_size)
+            hidden_states_scale = self._validate_fp4_tensors(act, v, hidden_size)
             if self._per_token and act.per_token_scale is None:
                 raise RuntimeError(
                     "Per-token NVFP4 scale is configured but no activation scale is given."
                 )
             per_token_scale = act.per_token_scale
-            hidden_like = act.hidden_states_q
         else:
             _validate_optional_gemm1_activation_params(
                 v,
@@ -6139,15 +6062,8 @@ class PrimsTsRunner(_TrtllmRunnerBase):
                 )
             hidden_states_scale = None
             per_token_scale = None
-            hidden_like = act.hidden_states_q
 
-        (
-            routing_input_mode,
-            routing_logits,
-            routing_bias,
-            topk_ids,
-            expert_weights,
-        ) = self._pack_routing(act, num_tokens=num_tokens, hidden_like=hidden_like)
+        routing_logits, routing_bias, topk_ids, expert_weights = self._pack_routing(act)
 
         output = act.hidden_states_q.new_empty(
             (
@@ -6168,17 +6084,15 @@ class PrimsTsRunner(_TrtllmRunnerBase):
         )
 
         static_kwargs = dict(
-            routing_input_mode=routing_input_mode,
+            routing_input_mode=act.routing_input_mode,
             routing_bias=routing_bias,
             gemm1_weights=v["gemm1_weights"],
             gemm2_weights=v["gemm2_weights"],
             gemm1_bias=v.get("gemm1_bias"),
             gemm2_bias=v.get("gemm2_bias"),
-            gemm1_alpha=v.get("gemm1_alpha"),
-            gemm1_beta=v.get("gemm1_beta"),
-            gemm1_clamp_limit=v.get("gemm1_clamp_limit"),
+            **self._gemm1_oa_launch_kwargs(v),
             num_experts=routing.num_experts,
-            num_fused_shared_experts=self._num_fused_shared_experts,
+            num_fused_shared_experts=0,
             n_group=routing.n_group,
             topk_group=routing.topk_group,
             local_expert_offset=self._local_expert_offset,
@@ -6195,28 +6109,38 @@ class PrimsTsRunner(_TrtllmRunnerBase):
         )
         if is_nvfp4:
             static_kwargs.update(
-                gemm1_weights_scale=v["gemm1_weights_scale"],
-                gemm2_weights_scale=v["gemm2_weights_scale"],
-                output1_scale_scalar=v["output1_scale_scalar"],
-                output1_scale_gate_scalar=v["output1_scale_gate_scalar"],
-                output2_scale_scalar=v["output2_scale_scalar"],
+                gemm1_weights_scale=v.get("gemm1_weights_scale"),
+                gemm2_weights_scale=v.get("gemm2_weights_scale"),
+                output1_scale_scalar=v.get("output1_scale_scalar"),
+                output1_scale_gate_scalar=v.get("output1_scale_gate_scalar"),
+                output2_scale_scalar=v.get("output2_scale_scalar"),
             )
 
         self._ensure_inner(hidden_size)
-        self._inner.set_cache_key_static_extras(**static_kwargs)
-        # Prims-TS ``make_moe_tuning_config`` forwards extras into TuningConfig;
-        # it does not accept TRTLLM-only kwargs such as scale-factor layout.
-        tuning_config = self._inner._make_tuning_config(
-            moe_inputs,
+        support_fn = (
+            is_prims_ts_nvfp4_supported if is_nvfp4 else is_prims_ts_bf16_supported
+        )
+        ok, reason = support_fn(self._inner, moe_inputs, [-1, -1], **static_kwargs)
+        if not ok:
+            raise RuntimeError(f"Config not supported by Prims-TS kernel ({reason})")
+
+        tuning_kwargs: dict[str, Any] = dict(
             tune_max_num_tokens=self._tune_max_num_tokens,
-            routing_input_mode=routing_input_mode,
+            routing_input_mode=act.routing_input_mode,
             use_cuda_graph=True,
             use_cold_l2_cache=True,
         )
+        if is_nvfp4:
+            from ..tllm_enums import SfLayout
+
+            tuning_kwargs["act_sf_layout"] = SfLayout.layout_linear
+        tuning_config = self._inner._make_tuning_config(moe_inputs, **tuning_kwargs)
+        launch_state = _TrtllmLaunchState(static_kwargs)
+        self._last_launch_state = launch_state
         return _TrtllmPackedInputs(
             moe_inputs.to_list(),
             tuning_config=tuning_config,
-            launch_state=_TrtllmLaunchState(static_kwargs),
+            launch_state=launch_state,
         )
 
 
