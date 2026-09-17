@@ -2354,9 +2354,25 @@ class FP4MQALogitsKernel:
                         # Preload first NUM_W_IN_REG weights per slot
                         for t_i in cutlass.range_constexpr(next_n):
                             for w_j in cutlass.range_constexpr(NUM_W_IN_REG):
-                                w_cache[t_i * NUM_W_IN_REG + w_j] = sW[
-                                    (t_i * num_heads + w_j, q_stage_local)
-                                ]
+                                if cutlass.const_expr(
+                                    self.epi_dtype == cutlass.Float32
+                                ):
+                                    # fp32 epilogue: the weight carries the /2 of the
+                                    # relu(x) = (x + |x|) / 2 rewrite below. Exact:
+                                    # (x + |x|) is 2x or 0 and w * 0.5 is a power-of-two
+                                    # scaling, so fma(2x, w/2, s) == fma(x, w, s) bit for
+                                    # bit. Folding it here (once per q stage) instead of
+                                    # multiplying every output measured 5-12% faster than
+                                    # the baseline on B200 where the per-output multiply
+                                    # was 4-9% slower (it sits on the per-output
+                                    # reduce -> convert -> store dependency chain).
+                                    w_cache[t_i * NUM_W_IN_REG + w_j] = (
+                                        sW[(t_i * num_heads + w_j, q_stage_local)] * 0.5
+                                    )
+                                else:
+                                    w_cache[t_i * NUM_W_IN_REG + w_j] = sW[
+                                        (t_i * num_heads + w_j, q_stage_local)
+                                    ]
 
                     # ---- inner: hot kv loop within this q ----
                     # Two-level restructure: the two cold blocks (q-change
@@ -2513,17 +2529,28 @@ class FP4MQALogitsKernel:
                                             ps0 = fma_bf16x2(pa01, pw01, ps0)
                                             ps1 = fma_bf16x2(pa23, pw23, ps1)
                                     else:
-                                        a0 = cutlass.max(
-                                            acc_vec[n0], cutlass.Float32(0.0)
+                                        # relu(x) = (x + |x|) / 2: two packed
+                                        # FADD2 with a free |.| operand modifier
+                                        # replace four FMNMX (no packed f32x2 max
+                                        # exists). Exact for finite x, and the
+                                        # accumulator is a finite dot product of
+                                        # fp4 operands; the /2 lives in the fp32
+                                        # weights (halved at the q-stage preload; the
+                                        # FP4 SF is baked into the accumulator, so
+                                        # there is no scale multiply to fold it into).
+                                        # Ported from DKG MR !27837.
+                                        a0, a1 = cute.arch.add_packed_f32x2(
+                                            (acc_vec[n0], acc_vec[n0 + 1]),
+                                            (abs(acc_vec[n0]), abs(acc_vec[n0 + 1])),
+                                            rnd=_RND_RN,
                                         )
-                                        a1 = cutlass.max(
-                                            acc_vec[n0 + 1], cutlass.Float32(0.0)
-                                        )
-                                        a2 = cutlass.max(
-                                            acc_vec[n0 + 2], cutlass.Float32(0.0)
-                                        )
-                                        a3 = cutlass.max(
-                                            acc_vec[n0 + 3], cutlass.Float32(0.0)
+                                        a2, a3 = cute.arch.add_packed_f32x2(
+                                            (acc_vec[n0 + 2], acc_vec[n0 + 3]),
+                                            (
+                                                abs(acc_vec[n0 + 2]),
+                                                abs(acc_vec[n0 + 3]),
+                                            ),
+                                            rnd=_RND_RN,
                                         )
                                         r0 = t * NUM_W_IN_REG + h_g
                                         w0 = w_cache[r0]
@@ -2626,6 +2653,13 @@ class FP4MQALogitsKernel:
                                             ps0 = fma_bf16x2(pa01, pw01, ps0)
                                             ps1 = fma_bf16x2(pa23, pw23, ps1)
                                     else:
+                                        # smem-path heads (beyond the register weight
+                                        # budget; fp32 next_n >= 3 only) keep the scalar
+                                        # relu on the UNSCALED smem weights: the /2 of the
+                                        # register path lives in w_cache, and halving
+                                        # these weights per read cost four FMULs per head
+                                        # group (Rubin fp4 next_n=4: +19% vs +5% for the
+                                        # per-output multiply and 0% for this form).
                                         a0 = cutlass.max(
                                             acc_vec[n0], cutlass.Float32(0.0)
                                         )
@@ -2828,9 +2862,25 @@ class FP4MQALogitsKernel:
                         # Preload first NUM_W_IN_REG weights per slot
                         for t_i in cutlass.range_constexpr(next_n):
                             for w_j in cutlass.range_constexpr(NUM_W_IN_REG):
-                                w_cache[t_i * NUM_W_IN_REG + w_j] = sW[
-                                    (t_i * num_heads + w_j, q_stage_local)
-                                ]
+                                if cutlass.const_expr(
+                                    self.epi_dtype == cutlass.Float32
+                                ):
+                                    # fp32 epilogue: the weight carries the /2 of the
+                                    # relu(x) = (x + |x|) / 2 rewrite below. Exact:
+                                    # (x + |x|) is 2x or 0 and w * 0.5 is a power-of-two
+                                    # scaling, so fma(2x, w/2, s) == fma(x, w, s) bit for
+                                    # bit. Folding it here (once per q stage) instead of
+                                    # multiplying every output measured 5-12% faster than
+                                    # the baseline on B200 where the per-output multiply
+                                    # was 4-9% slower (it sits on the per-output
+                                    # reduce -> convert -> store dependency chain).
+                                    w_cache[t_i * NUM_W_IN_REG + w_j] = (
+                                        sW[(t_i * num_heads + w_j, q_stage_local)] * 0.5
+                                    )
+                                else:
+                                    w_cache[t_i * NUM_W_IN_REG + w_j] = sW[
+                                        (t_i * num_heads + w_j, q_stage_local)
+                                    ]
 
                     # ---- inner: hot kv loop within this q ----
                     # Two-level restructure: the two cold blocks (q-change
@@ -2977,17 +3027,28 @@ class FP4MQALogitsKernel:
                                             ps0 = fma_bf16x2(pa01, pw01, ps0)
                                             ps1 = fma_bf16x2(pa23, pw23, ps1)
                                     else:
-                                        a0 = cutlass.max(
-                                            acc_vec[n0], cutlass.Float32(0.0)
+                                        # relu(x) = (x + |x|) / 2: two packed
+                                        # FADD2 with a free |.| operand modifier
+                                        # replace four FMNMX (no packed f32x2 max
+                                        # exists). Exact for finite x, and the
+                                        # accumulator is a finite dot product of
+                                        # fp4 operands; the /2 lives in the fp32
+                                        # weights (halved at the q-stage preload; the
+                                        # FP4 SF is baked into the accumulator, so
+                                        # there is no scale multiply to fold it into).
+                                        # Ported from DKG MR !27837.
+                                        a0, a1 = cute.arch.add_packed_f32x2(
+                                            (acc_vec[n0], acc_vec[n0 + 1]),
+                                            (abs(acc_vec[n0]), abs(acc_vec[n0 + 1])),
+                                            rnd=_RND_RN,
                                         )
-                                        a1 = cutlass.max(
-                                            acc_vec[n0 + 1], cutlass.Float32(0.0)
-                                        )
-                                        a2 = cutlass.max(
-                                            acc_vec[n0 + 2], cutlass.Float32(0.0)
-                                        )
-                                        a3 = cutlass.max(
-                                            acc_vec[n0 + 3], cutlass.Float32(0.0)
+                                        a2, a3 = cute.arch.add_packed_f32x2(
+                                            (acc_vec[n0 + 2], acc_vec[n0 + 3]),
+                                            (
+                                                abs(acc_vec[n0 + 2]),
+                                                abs(acc_vec[n0 + 3]),
+                                            ),
+                                            rnd=_RND_RN,
                                         )
                                         r0 = t * NUM_W_IN_REG + h_g
                                         w0 = w_cache[r0]
@@ -3090,6 +3151,13 @@ class FP4MQALogitsKernel:
                                             ps0 = fma_bf16x2(pa01, pw01, ps0)
                                             ps1 = fma_bf16x2(pa23, pw23, ps1)
                                     else:
+                                        # smem-path heads (beyond the register weight
+                                        # budget; fp32 next_n >= 3 only) keep the scalar
+                                        # relu on the UNSCALED smem weights: the /2 of the
+                                        # register path lives in w_cache, and halving
+                                        # these weights per read cost four FMULs per head
+                                        # group (Rubin fp4 next_n=4: +19% vs +5% for the
+                                        # per-output multiply and 0% for this form).
                                         a0 = cutlass.max(
                                             acc_vec[n0], cutlass.Float32(0.0)
                                         )
@@ -3208,7 +3276,11 @@ class FP4MQALogitsKernel:
 
             # TMEM dealloc: math warps are allocator + last consumer
             tmem.relinquish_alloc_permit()
-            tmem.free(tmem_ptr)
+            # Pass the static column count: dealloc must be marked exclusive for
+            # the >512-column (Rubin next_n=4) allocation, which the allocator
+            # only does when num_columns is a Python int rather than its own
+            # bookkeeping counter (DKG d9adb3cfa77).
+            tmem.free(tmem_ptr, num_tmem_alloc_cols_total)
 
         else:
             cute.arch.warpgroup_reg_dealloc(24)

@@ -1834,17 +1834,26 @@ class FP8MQALogitsKernel:
                                         ps0 = fma_f16x2(pa01, pw01, ps0)
                                         ps1 = fma_f16x2(pa23, pw23, ps1)
                                     else:
-                                        a0 = cutlass.max(
-                                            acc_vec[n0], cutlass.Float32(0.0)
+                                        # relu(x) = (x + |x|) / 2: two packed
+                                        # FADD2 with a free |.| operand modifier
+                                        # replace four FMNMX (no packed f32x2 max
+                                        # exists). Exact for finite x, and the
+                                        # accumulator is a finite dot product of
+                                        # fp8 operands; the /2 folds into the
+                                        # scale multiply at the store. Ported
+                                        # from DKG MR !27837.
+                                        a0, a1 = cute.arch.add_packed_f32x2(
+                                            (acc_vec[n0], acc_vec[n0 + 1]),
+                                            (abs(acc_vec[n0]), abs(acc_vec[n0 + 1])),
+                                            rnd=_RND_RN,
                                         )
-                                        a1 = cutlass.max(
-                                            acc_vec[n0 + 1], cutlass.Float32(0.0)
-                                        )
-                                        a2 = cutlass.max(
-                                            acc_vec[n0 + 2], cutlass.Float32(0.0)
-                                        )
-                                        a3 = cutlass.max(
-                                            acc_vec[n0 + 3], cutlass.Float32(0.0)
+                                        a2, a3 = cute.arch.add_packed_f32x2(
+                                            (acc_vec[n0 + 2], acc_vec[n0 + 3]),
+                                            (
+                                                abs(acc_vec[n0 + 2]),
+                                                abs(acc_vec[n0 + 3]),
+                                            ),
+                                            rnd=_RND_RN,
                                         )
                                         r0 = t * NUM_W_IN_REG + h_g
                                         w0 = w_cache[r0]
@@ -1894,17 +1903,26 @@ class FP8MQALogitsKernel:
                                         ps0 = fma_f16x2(pa01, pw01, ps0)
                                         ps1 = fma_f16x2(pa23, pw23, ps1)
                                     else:
-                                        a0 = cutlass.max(
-                                            acc_vec[n0], cutlass.Float32(0.0)
+                                        # relu(x) = (x + |x|) / 2: two packed
+                                        # FADD2 with a free |.| operand modifier
+                                        # replace four FMNMX (no packed f32x2 max
+                                        # exists). Exact for finite x, and the
+                                        # accumulator is a finite dot product of
+                                        # fp8 operands; the /2 folds into the
+                                        # scale multiply at the store. Ported
+                                        # from DKG MR !27837.
+                                        a0, a1 = cute.arch.add_packed_f32x2(
+                                            (acc_vec[n0], acc_vec[n0 + 1]),
+                                            (abs(acc_vec[n0]), abs(acc_vec[n0 + 1])),
+                                            rnd=_RND_RN,
                                         )
-                                        a1 = cutlass.max(
-                                            acc_vec[n0 + 1], cutlass.Float32(0.0)
-                                        )
-                                        a2 = cutlass.max(
-                                            acc_vec[n0 + 2], cutlass.Float32(0.0)
-                                        )
-                                        a3 = cutlass.max(
-                                            acc_vec[n0 + 3], cutlass.Float32(0.0)
+                                        a2, a3 = cute.arch.add_packed_f32x2(
+                                            (acc_vec[n0 + 2], acc_vec[n0 + 3]),
+                                            (
+                                                abs(acc_vec[n0 + 2]),
+                                                abs(acc_vec[n0 + 3]),
+                                            ),
+                                            rnd=_RND_RN,
                                         )
                                         w0 = sW[(t * num_heads + h_g, q_stage_local)]
                                         w1 = sW[
@@ -1938,7 +1956,9 @@ class FP8MQALogitsKernel:
                                     )
                                 else:
                                     mLogits_flat[out_off_t] = self.output_dtype(
-                                        result_t * scale_val
+                                        # * 0.5 is the divisor of the
+                                        # relu(x) = (x + |x|) / 2 rewrite above
+                                        result_t * (scale_val * 0.5)
                                     )
                             else:
                                 out_row = q_idx * next_n + t
@@ -1950,7 +1970,9 @@ class FP8MQALogitsKernel:
                                     )
                                 else:
                                     mLogits_2d[(out_row, kv_pos)] = self.output_dtype(
-                                        result_t * scale_val
+                                        # * 0.5 is the divisor of the
+                                        # relu(x) = (x + |x|) / 2 rewrite above
+                                        result_t * (scale_val * 0.5)
                                     )
                         # Advance within this q
                         kv_idx = kv_idx + NUM_MATH_WG
@@ -2248,17 +2270,26 @@ class FP8MQALogitsKernel:
                                         ps0 = fma_f16x2(pa01, pw01, ps0)
                                         ps1 = fma_f16x2(pa23, pw23, ps1)
                                     else:
-                                        a0 = cutlass.max(
-                                            acc_vec[n0], cutlass.Float32(0.0)
+                                        # relu(x) = (x + |x|) / 2: two packed
+                                        # FADD2 with a free |.| operand modifier
+                                        # replace four FMNMX (no packed f32x2 max
+                                        # exists). Exact for finite x, and the
+                                        # accumulator is a finite dot product of
+                                        # fp8 operands; the /2 folds into the
+                                        # scale multiply at the store. Ported
+                                        # from DKG MR !27837.
+                                        a0, a1 = cute.arch.add_packed_f32x2(
+                                            (acc_vec[n0], acc_vec[n0 + 1]),
+                                            (abs(acc_vec[n0]), abs(acc_vec[n0 + 1])),
+                                            rnd=_RND_RN,
                                         )
-                                        a1 = cutlass.max(
-                                            acc_vec[n0 + 1], cutlass.Float32(0.0)
-                                        )
-                                        a2 = cutlass.max(
-                                            acc_vec[n0 + 2], cutlass.Float32(0.0)
-                                        )
-                                        a3 = cutlass.max(
-                                            acc_vec[n0 + 3], cutlass.Float32(0.0)
+                                        a2, a3 = cute.arch.add_packed_f32x2(
+                                            (acc_vec[n0 + 2], acc_vec[n0 + 3]),
+                                            (
+                                                abs(acc_vec[n0 + 2]),
+                                                abs(acc_vec[n0 + 3]),
+                                            ),
+                                            rnd=_RND_RN,
                                         )
                                         r0 = t * NUM_W_IN_REG + h_g
                                         w0 = w_cache[r0]
@@ -2308,17 +2339,26 @@ class FP8MQALogitsKernel:
                                         ps0 = fma_f16x2(pa01, pw01, ps0)
                                         ps1 = fma_f16x2(pa23, pw23, ps1)
                                     else:
-                                        a0 = cutlass.max(
-                                            acc_vec[n0], cutlass.Float32(0.0)
+                                        # relu(x) = (x + |x|) / 2: two packed
+                                        # FADD2 with a free |.| operand modifier
+                                        # replace four FMNMX (no packed f32x2 max
+                                        # exists). Exact for finite x, and the
+                                        # accumulator is a finite dot product of
+                                        # fp8 operands; the /2 folds into the
+                                        # scale multiply at the store. Ported
+                                        # from DKG MR !27837.
+                                        a0, a1 = cute.arch.add_packed_f32x2(
+                                            (acc_vec[n0], acc_vec[n0 + 1]),
+                                            (abs(acc_vec[n0]), abs(acc_vec[n0 + 1])),
+                                            rnd=_RND_RN,
                                         )
-                                        a1 = cutlass.max(
-                                            acc_vec[n0 + 1], cutlass.Float32(0.0)
-                                        )
-                                        a2 = cutlass.max(
-                                            acc_vec[n0 + 2], cutlass.Float32(0.0)
-                                        )
-                                        a3 = cutlass.max(
-                                            acc_vec[n0 + 3], cutlass.Float32(0.0)
+                                        a2, a3 = cute.arch.add_packed_f32x2(
+                                            (acc_vec[n0 + 2], acc_vec[n0 + 3]),
+                                            (
+                                                abs(acc_vec[n0 + 2]),
+                                                abs(acc_vec[n0 + 3]),
+                                            ),
+                                            rnd=_RND_RN,
                                         )
                                         w0 = sW[(t * num_heads + h_g, q_stage_local)]
                                         w1 = sW[
@@ -2352,7 +2392,9 @@ class FP8MQALogitsKernel:
                                     )
                                 else:
                                     mLogits_flat[out_off_t] = self.output_dtype(
-                                        result_t * scale_val
+                                        # * 0.5 is the divisor of the
+                                        # relu(x) = (x + |x|) / 2 rewrite above
+                                        result_t * (scale_val * 0.5)
                                     )
                             else:
                                 out_row = q_idx * next_n + t
@@ -2364,7 +2406,9 @@ class FP8MQALogitsKernel:
                                     )
                                 else:
                                     mLogits_2d[(out_row, kv_pos)] = self.output_dtype(
-                                        result_t * scale_val
+                                        # * 0.5 is the divisor of the
+                                        # relu(x) = (x + |x|) / 2 rewrite above
+                                        result_t * (scale_val * 0.5)
                                     )
                         # Advance within this q
                         kv_idx = kv_idx + NUM_MATH_WG
@@ -2417,7 +2461,8 @@ class FP8MQALogitsKernel:
 
             # TMEM dealloc: math warps are allocator + last consumer
             tmem.relinquish_alloc_permit()
-            tmem.free(tmem_ptr)
+            # Static column count, mirroring the fp4 kernel (DKG d9adb3cfa77).
+            tmem.free(tmem_ptr, num_tmem_alloc_cols_total)
 
         else:
             cute.arch.warpgroup_reg_dealloc(24)
