@@ -47,6 +47,9 @@ from .api import (  # noqa: F401
     CutlassW4A16Config,
     CutlassW4A8Config,
     CuTileBf16Config,
+    CuTileMxfp4Bf16Config,
+    CuTileMxfp4Config,
+    CuTileNvfp4Bf16Config,
     CuTileNvfp4Config,
     ExecutionConfig,
     ExpertConfig,
@@ -83,6 +86,9 @@ from .runners import (  # noqa: F401
     CutlassW4A16Runner,
     CutlassW4A8Runner,
     CuTileBf16Runner,
+    CuTileMxfp4Bf16Runner,
+    CuTileMxfp4Runner,
+    CuTileNvfp4Bf16Runner,
     CuTileNvfp4Runner,
     CuteDslRunner,
     TrtllmBf16RoutedRunner,
@@ -153,8 +159,19 @@ from ..tllm_enums import (
     RoutingMethodType,
 )
 
+from .alphamoe_sm100 import (  # noqa: F401
+    alphamoe_fp8_block_scale_aligned_moe as alphamoe_fp8_block_scale_aligned_moe,
+    alphamoe_interleave_gated_weights as alphamoe_interleave_gated_weights,
+)
+
 from .fused_routing_dsv3 import (  # noqa: F401
     fused_topk_deepseek as fused_topk_deepseek,
+)
+
+from .alphamoe_fused_router import (  # noqa: F401
+    AlphaMoERoutePlan as AlphaMoERoutePlan,
+    allocate_alphamoe_route_plan as allocate_alphamoe_route_plan,
+    alphamoe_fused_router as alphamoe_fused_router,
 )
 
 from .hash_topk import (  # noqa: F401
@@ -223,6 +240,8 @@ def __getattr__(name: str):
 
 
 __all__ = [
+    "alphamoe_fp8_block_scale_aligned_moe",
+    "alphamoe_interleave_gated_weights",
     # Typed activation values
     "ActivationConfig",
     "GELU",
@@ -264,6 +283,12 @@ __all__ = [
     "CutlassW4A8Runner",
     "CuTileBf16Config",
     "CuTileBf16Runner",
+    "CuTileMxfp4Bf16Config",
+    "CuTileMxfp4Bf16Runner",
+    "CuTileMxfp4Config",
+    "CuTileMxfp4Runner",
+    "CuTileNvfp4Bf16Config",
+    "CuTileNvfp4Bf16Runner",
     "CuTileNvfp4Config",
     "CuTileNvfp4Runner",
     "ExecutionConfig",
@@ -333,6 +358,9 @@ __all__ = [
     "trtllm_mxint4_block_scale_moe",
     "trtllm_mxint4_block_scale_routed_moe",
     "fused_topk_deepseek",
+    "AlphaMoERoutePlan",
+    "allocate_alphamoe_route_plan",
+    "alphamoe_fused_router",
     "hash_topk",
     "TrtllmGenRoutingResult",
     "trtllm_gen_routing",

@@ -69,9 +69,6 @@ from .cake_fmha import (
     plan_cake_fmha_request_ordered_paged_decode as plan_cake_fmha_request_ordered_paged_decode,
 )
 from .decode import (
-    BatchDecodeMlaWithPagedKVCacheWrapper as BatchDecodeMlaWithPagedKVCacheWrapper,
-)
-from .decode import (
     BatchDecodeWithPagedKVCacheWrapper as BatchDecodeWithPagedKVCacheWrapper,
 )
 from .decode import (
@@ -112,7 +109,8 @@ from .quantization.fp8_quantization import (
     mxfp8_grouped_quantize,
     mxfp8_quantize,
 )
-from .attn_scores import padded_context_len as padded_context_len
+from .attn_scores import min_block_table_width as min_block_table_width
+from .attn_scores import padded_seq_len as padded_seq_len
 from .attn_scores import (
     compute_paged_mqa_logits_schedule as compute_paged_mqa_logits_schedule,
 )

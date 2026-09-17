@@ -127,6 +127,16 @@ _SMOKE_CONST_OVERRIDES: Dict[str, int] = {
 }
 
 
+# Coupled dimensions that cannot use the generic tiny smoke values.
+_SMOKE_TEMPLATE_OVERRIDES: Dict[str, Dict[str, int]] = {
+    "group_gemm_fp8_nt_groupwise_contiguous": {
+        "N": 128,
+        "K_div_128": 1,
+        "N_div_128": 1,
+    },
+}
+
+
 def _canonical_var_kwargs(template: TraceTemplate) -> Dict[str, int]:
     out: Dict[str, int] = {}
     for axis_name, marker in template.axes.items():
@@ -151,12 +161,37 @@ def _smoke_init_kwargs(template: TraceTemplate) -> Dict[str, int]:
             continue  # already populated by _canonical_var_kwargs
         if axis_name in accepted and axis_name in _SMOKE_CONST_OVERRIDES:
             out[axis_name] = _SMOKE_CONST_OVERRIDES[axis_name]
+    out.update(
+        {
+            name: value
+            for name, value in _SMOKE_TEMPLATE_OVERRIDES.get(
+                template.name_prefix, {}
+            ).items()
+            if name in accepted
+        }
+    )
     return out
 
 
 # ---------------------------------------------------------------------------
 # Tests.
 # ---------------------------------------------------------------------------
+
+
+def test_grouped_fp8_contiguous_smoke_uses_init_defaults():
+    """The CPU smoke bundle must execute without supplying constant group count."""
+    from flashinfer.trace.templates.gemm import (
+        group_gemm_fp8_nt_groupwise_contiguous_trace as template,
+    )
+
+    kwargs = _smoke_init_kwargs(template)
+    assert "num_groups" not in kwargs
+    # Do not catch errors as skips: this initializer supports CPU execution.
+    result = template.init(device="cpu", **kwargs)
+    assert result["a"].shape == (kwargs["M"], 128)
+    assert result["b"].shape == (2, 128, 128)
+    assert result["a_scale"].shape == (kwargs["M"], kwargs["K_div_128"])
+    assert result["b_scale"].shape == (2, kwargs["N_div_128"], kwargs["K_div_128"])
 
 
 @pytest.mark.parametrize("func,template,label", _INIT_PAIRS, ids=_INIT_IDS)
