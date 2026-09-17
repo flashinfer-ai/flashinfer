@@ -1,4 +1,5 @@
 import argparse
+import csv
 import sys
 
 # Only import utilities at module level - routine modules are imported lazily
@@ -89,7 +90,8 @@ def run_test(args):
 
     # Write results to output file if specified
     if args.output_path is not None:
-        with open(args.output_path, "a") as fout:
+        with open(args.output_path, "a", newline="") as fout:
+            writer = csv.writer(fout)
             for cur_res in res:
                 for key in full_output_columns:
                     # Backfill every output column the routine didn't set: from
@@ -99,10 +101,7 @@ def run_test(args):
                     if key not in cur_res or cur_res[key] == "":
                         cur_res[key] = getattr(args, key, "")
 
-                output_line = ",".join(
-                    [str(cur_res[col]) for col in full_output_columns]
-                )
-                fout.write(output_line + "\n")
+                writer.writerow([str(cur_res[col]) for col in full_output_columns])
             fout.flush()
     return
 
@@ -354,8 +353,8 @@ if __name__ == "__main__":
 
     # Setup output file if specified
     if testlist_args.output_path is not None:
-        with open(testlist_args.output_path, "w") as fout:
-            fout.write(",".join(full_output_columns) + "\n")
+        with open(testlist_args.output_path, "w", newline="") as fout:
+            csv.writer(fout).writerow(full_output_columns)
 
     # Process tests either from testlist file or command line arguments
     if testlist_args.testlist is not None:

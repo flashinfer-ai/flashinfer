@@ -25,11 +25,13 @@ from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
 import torch
 
+from ..api_logging import flashinfer_api
 from ..autotuner import AutoTuner
 from ..utils import get_compute_capability
 from .api import (
     B12xNvfp4Config,
     B12xW4A16Config,
+    CakeWarpDecodeConfig,
     CutlassBf16Config,
     CutlassFp8BlockConfig,
     CutlassFp8PerTensorConfig,
@@ -40,6 +42,9 @@ from .api import (
     CutlassW4A16Config,
     CutlassW4A8Config,
     CuTileBf16Config,
+    CuTileMxfp4Bf16Config,
+    CuTileMxfp4Config,
+    CuTileNvfp4Bf16Config,
     CuTileNvfp4Config,
     CuteDslConfig,
     MoEActivationPack,
@@ -54,6 +59,7 @@ from .api import (
 from .runners import (
     B12xNvfp4Runner,
     B12xW4A16Runner,
+    CakeWarpDecodeRunner,
     CutlassBf16Runner,
     CutlassFp8BlockRunner,
     CutlassFp8PerTensorRunner,
@@ -64,6 +70,9 @@ from .runners import (
     CutlassW4A16Runner,
     CutlassW4A8Runner,
     CuTileBf16Runner,
+    CuTileMxfp4Bf16Runner,
+    CuTileMxfp4Runner,
+    CuTileNvfp4Bf16Runner,
     CuTileNvfp4Runner,
     CuteDslRunner,
     TrtllmBf16RoutedRunner,
@@ -79,6 +88,7 @@ from .utils import map_to_hybrid_bucket
 # backend_key / tuning_config / pack_inputs as attributes or class members;
 # typing the list with this Union gives mypy the visibility it needs.
 _RunnerT = Union[
+    CakeWarpDecodeRunner,
     CutlassBf16Runner,
     CutlassFp8BlockRunner,
     CutlassFp8PerTensorRunner,
@@ -89,6 +99,9 @@ _RunnerT = Union[
     CutlassW4A16Runner,
     CutlassW4A8Runner,
     CuTileBf16Runner,
+    CuTileMxfp4Bf16Runner,
+    CuTileMxfp4Runner,
+    CuTileNvfp4Bf16Runner,
     CuTileNvfp4Runner,
     CuteDslRunner,
     TrtllmFp4RoutedRunner,
@@ -102,6 +115,7 @@ _RunnerT = Union[
 
 # Map backend-config class -> runner class
 _BACKEND_RUNNERS: Dict[type, Type[_RunnerT]] = {
+    CakeWarpDecodeConfig: CakeWarpDecodeRunner,
     CutlassBf16Config: CutlassBf16Runner,
     CutlassFp8BlockConfig: CutlassFp8BlockRunner,
     CutlassFp8PerTensorConfig: CutlassFp8PerTensorRunner,
@@ -112,6 +126,9 @@ _BACKEND_RUNNERS: Dict[type, Type[_RunnerT]] = {
     CutlassW4A16Config: CutlassW4A16Runner,
     CutlassW4A8Config: CutlassW4A8Runner,
     CuTileBf16Config: CuTileBf16Runner,
+    CuTileMxfp4Bf16Config: CuTileMxfp4Bf16Runner,
+    CuTileMxfp4Config: CuTileMxfp4Runner,
+    CuTileNvfp4Bf16Config: CuTileNvfp4Bf16Runner,
     CuTileNvfp4Config: CuTileNvfp4Runner,
     CuteDslConfig: CuteDslRunner,
     TrtllmFp4Config: TrtllmFp4RoutedRunner,
@@ -139,7 +156,29 @@ class MoELayer:
     >>> out = layer(act_pack, weight_pack)
     """
 
+    @flashinfer_api
     def __init__(self, config: MoEConfig, device: Optional[torch.device] = None):
+        """Build the layer and the set of backend runners it will autotune over.
+
+        Every backend in ``config.backend`` whose hardware preconditions the
+        target device satisfies gets a runner; the rest are skipped here rather
+        than at call time, so an unsupported backend costs nothing per call.
+
+        Parameters
+        ----------
+        config : MoEConfig
+            Routing, quantization, expert geometry, activation, backend
+            candidates and execution parameters. Cross-field constraints are
+            validated by ``MoEConfig`` itself.
+        device : torch.device or None
+            Device whose compute capability selects the usable backends.
+            ``None`` → the current CUDA device.
+
+        Raises
+        ------
+        RuntimeError
+            If no configured backend is usable on this device's architecture.
+        """
         self.config = config
         self.device = device or torch.device("cuda", torch.cuda.current_device())
         self.tuner = AutoTuner.get()
@@ -155,7 +194,7 @@ class MoELayer:
             runner_cls = _BACKEND_RUNNERS.get(type(backend_cfg))
             if runner_cls is None:
                 continue  # MVP scope — skip non-MVP backends silently
-            if config.quant.variant not in runner_cls.supported_quant_variants:
+            if not runner_cls.supports_quant(config.quant):
                 continue
             try:
                 # Construction is inside the guard because a runner may reject an
@@ -204,6 +243,11 @@ class MoELayer:
                     f"implemented only by [{supporting}], which must also be "
                     f"configured and supported on this arch."
                 )
+            hint += (
+                f" Note quant weight={config.quant.weight.name}, "
+                f"activation={config.quant.activation.name}, "
+                f"output={config.quant.output.name}."
+            )
             raise RuntimeError(
                 f"MoELayer: none of the configured backends "
                 f"{[type(c).__name__ for c in config.backend]} are usable on "
@@ -221,11 +265,41 @@ class MoELayer:
         # Backend key selected on the most recent call (introspection hook).
         self._last_winner_backend: Optional[str] = None
 
+    @flashinfer_api
     def __call__(
         self,
         act_pack: MoEActivationPack,
         weight_pack: MoEWeightPack,
     ) -> Union[torch.Tensor, List[torch.Tensor]]:
+        """Run the MoE layer, selecting and caching the fastest usable backend.
+
+        Only runners that support this pack's ``routing_input_mode`` compete —
+        not every backend has an in-kernel router — and the winner is cached
+        per ``(token-count bucket, mode)`` so repeated calls skip reselection.
+
+        Parameters
+        ----------
+        act_pack : MoEActivationPack
+            Backend-native activations plus routing inputs for this call.
+        weight_pack : MoEWeightPack
+            Expert weights, prepared for the selected backend's native layout.
+
+        Returns
+        -------
+        torch.Tensor or list of torch.Tensor
+            The layer output. With ``config.finalize.do_finalize=False`` the
+            unreduced TRTLLM intermediates are returned instead, as
+            ``[gemm2_output, expert_weights, expanded_idx_to_permuted_idx]``,
+            leaving the combine to the caller.
+
+        Raises
+        ------
+        ValueError
+            If ``act_pack.num_tokens`` exceeds the
+            ``execution.tune_max_num_tokens`` ceiling the layer was built with.
+        NotImplementedError
+            If no usable backend supports this pack's ``routing_input_mode``.
+        """
         ceiling = self.config.execution.tune_max_num_tokens
         if act_pack.num_tokens > ceiling:
             raise ValueError(

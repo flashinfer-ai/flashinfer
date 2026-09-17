@@ -127,6 +127,49 @@ def float_as_uint32(float_val):
     return llvm.bitcast(cutlass.Uint32.mlir_type, float_val.ir_value())
 
 
+def float_as_int32(float_val):
+    """Interpret FP32 value as int32 bit pattern (cuTe DSL bit-cast)."""
+    return cutlass.Int32(llvm.bitcast(cutlass.Int32.mlir_type, float_val.ir_value()))
+
+
+def f32_order_key(float_val):
+    """Order-preserving fp32 -> int32 key (unsigned-monotonic bit pattern).
+
+    ``s ^ ((s >> 31) | 0x80000000)``: positive floats map to
+    ``bits | 0x80000000``, negative floats to ``~bits`` — the standard radix
+    transform whose UNSIGNED order equals fp32 order (NaN-free inputs). The
+    returned Int32 must only be consumed digit-wise (``(k >> s) & 0xFF``) or
+    via equality / prefix-equality; for a full ordered compare, flip the top
+    bit first (``k ^ 0x80000000`` is signed-monotonic).
+    """
+    s = float_as_int32(float_val)
+    return s ^ ((s >> cutlass.Int32(31)) | cutlass.Int32(-2147483648))
+
+
+def f32_order_key_signed(float_val):
+    """Signed-monotonic Int32 key (fp32 order == signed Int32 order), so the
+    Phase-3 repair can bisect with provable collapse in <= 32 steps."""
+    return f32_order_key(float_val) ^ cutlass.Int32(-2147483648)
+
+
+def order_key_signed_to_f32(m):
+    """Branchless inverse of :func:`f32_order_key_signed` (non-NaN keys)."""
+    k = m ^ cutlass.Int32(-2147483648)
+    top = k >> cutlass.Int32(31)  # -1 if top bit set, else 0
+    mask = cutlass.Int32(-2147483648) | (~top & cutlass.Int32(2147483647))
+    s = k ^ mask
+    return cutlass.Float32(llvm.bitcast(cutlass.Float32.mlir_type, s.ir_value()))
+
+
+def order_key_mid_f32(v_lo, v_hi):
+    """Ordered-key midpoint; returns (mid_float, is_adjacent) where adjacency
+    means no float strictly between v_lo and v_hi exists."""
+    m_lo = f32_order_key_signed(v_lo)
+    m_hi = f32_order_key_signed(v_hi)
+    m_mid = (m_lo & m_hi) + ((m_lo ^ m_hi) >> cutlass.Int32(1))
+    return order_key_signed_to_f32(m_mid), m_mid == m_lo
+
+
 def _fmin_f32_inline(a, b):
     """Single PTX ``min.f32`` → one SASS FMNMX.
 
@@ -551,7 +594,7 @@ class GvrTopKKernel:
         smem_wsum_f32,  # cute.Tensor [NUM_WARPS] float32
         smem_wcnt_i32,  # cute.Tensor [NUM_WARPS] int32
         s_thr,  # cute.Tensor [3] float32: [threshold, val_lo, val_hi]
-        s_iscalars,  # cute.Tensor [6] int32: [cand_count, done, cnt_lo, cnt_hi, out_count, local_cand_count]
+        s_iscalars,  # cute.Tensor [8] int32: [cand_count, done, cnt_lo, cnt_hi, out_count, local_cand_count, plateau_flag, fill_ticket]
         tidx,
         warp_id,
         lane,
@@ -719,7 +762,7 @@ class GvrTopKKernel:
         threshold,  # cutlass.Float32 scalar
         smem_ptcnt,  # cute.Tensor [BLOCK_SIZE] int32 (P3 cache)
         smem_wcnt,  # cute.Tensor [NUM_WARPS] int32 (block reduce scratch)
-        s_iscalars,  # cute.Tensor [6] int32 (writes [0] = cand_count)
+        s_iscalars,  # cute.Tensor [8] int32 (writes [0] = cand_count)
         s_cluster_partial,  # cute.Tensor [1] int32 (per-CTA partial scratch for DSMEM)
         tidx,
         warp_id,
@@ -976,7 +1019,7 @@ class GvrTopKKernel:
         smem_ptcnt,
         smem_wcnt,
         s_thr,  # [threshold, val_lo, val_hi]
-        s_iscalars,  # [cand_count, done, cnt_lo, cnt_hi, out_count]
+        s_iscalars,  # [cand_count, done, cnt_lo, cnt_hi, out_count, ...]
         s_cluster_partial,  # [3] int32 cluster scratch (parity slots + counter)
         tidx,
         warp_id,
@@ -988,7 +1031,10 @@ class GvrTopKKernel:
 
         Each iter calls block_count_ge at the candidate threshold and
         updates the bracket (val_lo, val_hi, cnt_lo, cnt_hi). Sets
-        s_iscalars[1] (done) = 1 on convergence, 2 on bracket exhaustion.
+        s_iscalars[1] (done) = 1 on convergence, 2 on bracket exhaustion
+        (Phase 3's two-sided repair then re-derives the threshold), or 3 on
+        an adjacent-float tie plateau wider than kC (threshold = the
+        sure-winner side; Phase 4's plateau fill completes the row).
         """
         kK = cutlass.const_expr(self.top_k)
         kCC = cutlass.const_expr(self.kC)
@@ -1058,8 +1104,18 @@ class GvrTopKKernel:
                 if nv == vlo_r or nv == vhi_r:
                     nv = (vlo_r + vhi_r) * cutlass.Float32(0.5)
                     if nv == vlo_r or nv == vhi_r:
-                        thr_r = vlo_r
-                        done_r = cutlass.Int32(2)
+                        # ADJACENT-FLOAT bracket, same terminal as the
+                        # leader path: a low side over the candidate
+                        # buffer plus a high side under K means the
+                        # boundary sits inside a bitwise-equal plateau
+                        # wider than kC. Keep the sure-winner threshold
+                        # and let Phase 4's plateau fill finish the row.
+                        if clo_r > cutlass.Int32(kCC) and chi_r < cutlass.Int32(kK):
+                            thr_r = vhi_r
+                            done_r = cutlass.Int32(3)
+                        else:
+                            thr_r = vlo_r
+                            done_r = cutlass.Int32(2)
                 if done_r == cutlass.Int32(0):
                     thr_r = nv
                     par_r = par_r ^ cutlass.Int32(1)
@@ -1089,6 +1145,75 @@ class GvrTopKKernel:
                         vhi_r = thr_r
                         chi_r = cnt_r
                 it = it + cutlass.Int32(1)
+            # ---- Budget-exhausted plateau collapse (mirrors the leader
+            # path): the refine budget can run out while the bracket is
+            # still wide because a tie plateau wider than kC admits no
+            # threshold. On exactly that signature, bisect to adjacent
+            # floats so the plateau terminal is exact. Every thread
+            # replays this from identical registers, so the branch stays
+            # warp-uniform and block_count_ge keeps its barrier cadence.
+            if (
+                done_r == cutlass.Int32(0)
+                and clo_r > cutlass.Int32(kCC)
+                and chi_r >= cutlass.Int32(0)
+                and chi_r < cutlass.Int32(kK)
+            ):
+                itc = cutlass.Int32(0)
+                while itc < cutlass.Int32(64) and done_r == cutlass.Int32(0):
+                    mid_c = (vlo_r + vhi_r) * cutlass.Float32(0.5)
+                    if mid_c == vlo_r or mid_c == vhi_r:
+                        thr_r = vhi_r
+                        done_r = cutlass.Int32(3)
+                    else:
+                        thr_r = mid_c
+                        par_r = par_r ^ cutlass.Int32(1)
+                        cnt_r = self.block_count_ge(
+                            input_row,
+                            slice_start,
+                            slice_end,
+                            thr_r,
+                            smem_ptcnt,
+                            smem_wcnt,
+                            s_iscalars,
+                            s_cluster_partial,
+                            tidx,
+                            warp_id,
+                            lane,
+                            cutlass.Boolean(False),  # do_cluster_sync (cs==1)
+                            smem_input=smem_input,
+                            redundant=True,
+                            wcnt_off=par_r * cutlass.Int32(nwp2),
+                        )
+                        if cnt_r >= cutlass.Int32(kK) and cnt_r <= cutlass.Int32(kCC):
+                            done_r = cutlass.Int32(1)
+                        elif cnt_r > cutlass.Int32(kCC):
+                            vlo_r = thr_r
+                            clo_r = cnt_r
+                        else:
+                            vhi_r = thr_r
+                            chi_r = cnt_r
+                    itc = itc + cutlass.Int32(1)
+                if done_r == cutlass.Int32(3):
+                    # recount at the terminal threshold so Phase 3 sees
+                    # per-thread counts for the sure-winner set.
+                    par_r = par_r ^ cutlass.Int32(1)
+                    cnt_r = self.block_count_ge(
+                        input_row,
+                        slice_start,
+                        slice_end,
+                        thr_r,
+                        smem_ptcnt,
+                        smem_wcnt,
+                        s_iscalars,
+                        s_cluster_partial,
+                        tidx,
+                        warp_id,
+                        lane,
+                        cutlass.Boolean(False),  # do_cluster_sync (cs==1)
+                        smem_input=smem_input,
+                        redundant=True,
+                        wcnt_off=par_r * cutlass.Int32(nwp2),
+                    )
             if done_r == cutlass.Int32(0):
                 if clo_r <= cutlass.Int32(kCC * 2):
                     thr_r = vlo_r
@@ -1174,11 +1299,22 @@ class GvrTopKKernel:
                     nv = vhi - rng * cutlass.Float32(0.05)
 
                 if nv == vlo or nv == vhi:
-                    # Bracket exhausted — try midpoint, else give up.
+                    # Bracket exhausted — try midpoint, else terminal.
                     nv = (vlo + vhi) * cutlass.Float32(0.5)
                     if nv == vlo or nv == vhi:
-                        s_thr[0] = vlo
-                        s_iscalars[1] = cutlass.Int32(2)  # done = 2 (give up)
+                        # ADJACENT-FLOAT bracket: every value in
+                        # [vlo, vhi) is bitwise-equal to vlo. Low side
+                        # overflowing the candidate buffer AND high side
+                        # undershooting K means the boundary sits inside
+                        # a bitwise-equal plateau wider than kC — record
+                        # the plateau terminal (done = 3) and keep the
+                        # sure-winner threshold vhi.
+                        if clo > cutlass.Int32(kCC) and chi < cutlass.Int32(kK):
+                            s_thr[0] = vhi
+                            s_iscalars[1] = cutlass.Int32(3)  # done = 3 (plateau)
+                        else:
+                            s_thr[0] = vlo
+                            s_iscalars[1] = cutlass.Int32(2)  # done = 2 (give up)
                     else:
                         s_thr[0] = nv
                 else:
@@ -1217,6 +1353,84 @@ class GvrTopKKernel:
                         s_iscalars[3] = c_new
                 cute.arch.barrier()
             it = it + cutlass.Int32(1)
+
+        # ---- Budget-exhausted plateau collapse ----
+        # The refine budget can run out while the bracket is still wide: the
+        # secant step keeps making progress (the bracket shrinks every
+        # iteration) but a tie plateau wider than kC admits no threshold, so
+        # the count never lands in [kK, kCC]. In exactly that signature -
+        # count(>= v_lo) > kCC AND count(>= v_hi) < kK, both counts current -
+        # collapse the bracket by pure bisection until the ends are ADJACENT
+        # floats; every value in [v_lo, v_hi) is then bitwise-equal, so the
+        # plateau terminal (done = 3) is exact and Phase 4 completes the row
+        # from that tie class. A count landing in [kK, kCC] mid-collapse
+        # converges normally. Anything else keeps the legacy give-up below.
+        if (
+            s_iscalars[1] == cutlass.Int32(0)
+            and s_iscalars[2] > cutlass.Int32(kCC)
+            and s_iscalars[3] >= cutlass.Int32(0)
+            and s_iscalars[3] < cutlass.Int32(kK)
+        ):
+            itc = cutlass.Int32(0)
+            while itc < cutlass.Int32(64) and s_iscalars[1] == cutlass.Int32(0):
+                if tidx == 0:
+                    vlo_c = s_thr[1]
+                    vhi_c = s_thr[2]
+                    mid_c = (vlo_c + vhi_c) * cutlass.Float32(0.5)
+                    if mid_c == vlo_c or mid_c == vhi_c:
+                        s_thr[0] = vhi_c
+                        s_iscalars[1] = cutlass.Int32(3)  # plateau terminal
+                    else:
+                        s_thr[0] = mid_c
+                cute.arch.barrier()
+                if s_iscalars[1] == cutlass.Int32(0):
+                    self.block_count_ge(
+                        input_row,
+                        slice_start,
+                        slice_end,
+                        s_thr[0],
+                        smem_ptcnt,
+                        smem_wcnt,
+                        s_iscalars,
+                        s_cluster_partial,
+                        tidx,
+                        warp_id,
+                        lane,
+                        smem_input=smem_input,
+                        do_cluster_sync=do_cluster_sync,
+                    )
+                    if tidx == 0:
+                        c_c = s_iscalars[0]
+                        t_c = s_thr[0]
+                        if c_c >= cutlass.Int32(kK) and c_c <= cutlass.Int32(kCC):
+                            s_iscalars[1] = cutlass.Int32(1)
+                        elif c_c > cutlass.Int32(kCC):
+                            s_thr[1] = t_c
+                            s_iscalars[2] = c_c
+                        else:
+                            s_thr[2] = t_c
+                            s_iscalars[3] = c_c
+                    cute.arch.barrier()
+                itc = itc + cutlass.Int32(1)
+            if s_iscalars[1] == cutlass.Int32(3):
+                # recount at the terminal threshold so Phase 3's cached
+                # per-thread counts describe the sure-winner set.
+                self.block_count_ge(
+                    input_row,
+                    slice_start,
+                    slice_end,
+                    s_thr[0],
+                    smem_ptcnt,
+                    smem_wcnt,
+                    s_iscalars,
+                    s_cluster_partial,
+                    tidx,
+                    warp_id,
+                    lane,
+                    smem_input=smem_input,
+                    do_cluster_sync=do_cluster_sync,
+                )
+                cute.arch.barrier()
 
         # ---- Post-loop fallback: if still not done, force threshold ----
         if tidx == 0:
@@ -1289,29 +1503,74 @@ class GvrTopKKernel:
                 smem_input=smem_input,
                 do_cluster_sync=do_cluster_sync,
             )
+            # Two-sided repair: the old retry only guarded overflow, so an
+            # undershooting threshold shipped a -1-padded, silently wrong
+            # top-K. Anchor the untested bracket end at a float extreme, then
+            # bisect on the signed order-key image (provable collapse). The
+            # lower anchor is the true minimum key, -inf, not -FLT_MAX: a row
+            # with fewer than K values >= -FLT_MAX (all -inf, or a short
+            # finite head over a -inf tail) has count(>= -FLT_MAX) < K, which
+            # broke the "val_lo admits >= kK" invariant below and left its
+            # slots unwritten. -inf is an ordinary (non-NaN) key for the
+            # signed order-key mapping, so the bisection is unchanged.
             if tidx == 0:
-                if s_iscalars[0] > cutlass.Int32(kCC):
-                    s_thr[1] = s_thr[0]  # val_lo = threshold
+                c0 = s_iscalars[0]
+                if c0 > cutlass.Int32(kCC):
+                    s_thr[1] = s_thr[0]
+                    s_thr[2] = cutlass.Float32(self.FLT_MAX)
+                elif c0 < cutlass.Int32(kK):
+                    s_thr[2] = s_thr[0]
+                    s_thr[1] = cutlass.Float32(float("-inf"))
             cute.arch.barrier()
 
-            # 10-iter retry-shrink. Runtime while with `cand_count > kCC` in the
-            # loop condition.
             rs = cutlass.Int32(0)
-            while rs < cutlass.Int32(10) and s_iscalars[0] > cutlass.Int32(kCC):
+            collapsed = cutlass.Int32(0)
+            while (
+                rs < cutlass.Int32(48)
+                and (s_iscalars[0] > cutlass.Int32(kCC) or s_iscalars[0] < cutlass.Int32(kK))
+                and collapsed == cutlass.Int32(0)
+            ):
+                mid_f, adj = order_key_mid_f32(s_thr[1], s_thr[2])
+                if adj:
+                    collapsed = cutlass.Int32(1)
+                if collapsed == cutlass.Int32(0):
+                    if tidx == 0:
+                        s_thr[0] = mid_f
+                    cute.arch.barrier()
+                    self.block_count_ge(
+                        input_row,
+                        slice_start,
+                        slice_end,
+                        s_thr[0],
+                        smem_ptcnt,
+                        smem_wcnt,
+                        s_iscalars,
+                        s_cluster_partial,
+                        tidx,
+                        warp_id,
+                        lane,
+                        smem_input=smem_input,
+                        do_cluster_sync=do_cluster_sync,
+                    )
+                    if tidx == 0:
+                        c_rs = s_iscalars[0]
+                        if c_rs > cutlass.Int32(kCC):
+                            s_thr[1] = s_thr[0]
+                        elif c_rs < cutlass.Int32(kK):
+                            s_thr[2] = s_thr[0]
+                    cute.arch.barrier()
+                rs = rs + cutlass.Int32(1)
+
+            # Undershoot at collapse: val_lo admits >= kK by construction.
+            if s_iscalars[0] < cutlass.Int32(kK):
                 if tidx == 0:
-                    lo = s_thr[1]
-                    hi = s_thr[2]
-                    mid = (lo + hi) * cutlass.Float32(0.5)
-                    if mid == lo:
-                        mid = hi
-                    s_thr[0] = mid
+                    s_thr[0] = s_thr[1]
                 cute.arch.barrier()
-                new_thr = s_thr[0]
                 self.block_count_ge(
                     input_row,
                     slice_start,
                     slice_end,
-                    new_thr,
+                    s_thr[0],
                     smem_ptcnt,
                     smem_wcnt,
                     s_iscalars,
@@ -1322,14 +1581,33 @@ class GvrTopKKernel:
                     smem_input=smem_input,
                     do_cluster_sync=do_cluster_sync,
                 )
+            cute.arch.barrier()
+
+            # Collapsed tie plateau (> kCC at an adjacent bracket): hand the
+            # row to the existing done=3 machinery; Phase 4 fills from the
+            # tie class in [val_lo, val_hi).
+            mid_chk, adj_chk = order_key_mid_f32(s_thr[1], s_thr[2])
+            if s_iscalars[0] > cutlass.Int32(kCC) and adj_chk:
                 if tidx == 0:
-                    c_rs = s_iscalars[0]
-                    if c_rs > cutlass.Int32(kCC):
-                        s_thr[1] = s_thr[0]
-                    elif c_rs < cutlass.Int32(kK):
-                        s_thr[2] = s_thr[0]
+                    s_thr[0] = s_thr[2]
+                    s_iscalars[1] = cutlass.Int32(3)  # plateau terminal
                 cute.arch.barrier()
-                rs = rs + cutlass.Int32(1)
+                self.block_count_ge(
+                    input_row,
+                    slice_start,
+                    slice_end,
+                    s_thr[0],
+                    smem_ptcnt,
+                    smem_wcnt,
+                    s_iscalars,
+                    s_cluster_partial,
+                    tidx,
+                    warp_id,
+                    lane,
+                    smem_input=smem_input,
+                    do_cluster_sync=do_cluster_sync,
+                )
+                cute.arch.barrier()
 
         # ---- Warp prefix sum over smem_ptcnt ----
         # my_total_qual = per-thread count cached by last block_count_ge.
@@ -2391,12 +2669,13 @@ class GvrTopKKernel:
                     )
                 output_indices_row[i10] = self._smem_ld(cutlass.Int32, vals_base, i10)
                 i10 = i10 + cutlass.Int32(num_threads)
-            i11 = cand_count + tidx
-            while i11 < cutlass.Int32(kK):
-                if cutlass.const_expr(self.return_output_values):
-                    output_values_row[i11] = self.dtype(self.NEG_FLT_MAX)
-                output_indices_row[i11] = cutlass.Int32(-1)
-                i11 = i11 + cutlass.Int32(num_threads)
+            if s_iscalars[6] == cutlass.Int32(0):  # plateau fill completes done=3
+                i11 = cand_count + tidx
+                while i11 < cutlass.Int32(kK):
+                    if cutlass.const_expr(self.return_output_values):
+                        output_values_row[i11] = self.dtype(self.NEG_FLT_MAX)
+                    output_indices_row[i11] = cutlass.Int32(-1)
+                    i11 = i11 + cutlass.Int32(num_threads)
 
     # ------------------------------------------------------------------
     # Main kernel — one CTA per row
@@ -2525,6 +2804,14 @@ class GvrTopKKernel:
             N = actual_kv_len
         else:
             N = actual_kv_len // cutlass.Int32(self.compress_ratio)
+        # Clamp to the physical row width. seq_lens is the dynamic side (read on
+        # device, grows every decode step) and the logits width is the static
+        # side (fixed at allocation / graph capture); a row whose length has
+        # outgrown the width holds only its first `width` scores, so rank those
+        # instead of reading past the row (and the tensor).
+        n_cols = input_data.shape[1]
+        if N > n_cols:
+            N = n_cols
 
         # Slice per-row views.
         input_row = input_data[row_idx, None]
@@ -2614,9 +2901,12 @@ class GvrTopKKernel:
         #   [4] out_count
         #   [5] local cand_count  (per-CTA snapshot before cluster all-reduce;
         #                          consumed by the kernel-level cluster handoff)
+        #   [6] plateau flag  (done==3 captured BEFORE Phase 4, which reuses
+        #                      the scalar slots as snap scratch)
+        #   [7] plateau fill ticket counter (post-P4 tie-class completion)
         s_iscalars = smem.allocate_tensor(
             element_type=cutlass.Int32,
-            layout=cute.make_ordered_layout((6,), order=(0,)),
+            layout=cute.make_ordered_layout((8,), order=(0,)),
             byte_alignment=16,
         )
         # Per-CTA DSMEM scratch for the cluster all-reduce of cand_count:
@@ -2863,109 +3153,202 @@ class GvrTopKKernel:
             lane,
         )
 
-        # Degenerate threshold init: val_hi <= -self.FLT_MAX or val_lo >= val_hi.
-        # When preIdx values produce an unusable bracket (e.g. all -inf or
-        # identical), skip Phase 2-4 and emit identity output instead.
+        # Degenerate hint (all gathered values identical or out of range):
+        # reset to a synthetic bracket and fall through instead of emitting
+        # row[0:K]; the Phase-3 repair guarantees the answer, so the hint only
+        # affects speed. cnt_hi is seeded with top_k (not 0) so Phase 2's
+        # budget-collapse guard (`cnt_hi < kK`) cannot fire on this
+        # UNMEASURED bracket — a smaller seed would let the collapse mint a
+        # plateau terminal from a count that was never measured.
         v_lo = s_thr[1]
         v_hi = s_thr[2]
         if v_hi <= cutlass.Float32(self.NEG_FLT_MAX) or v_lo >= v_hi:
-            if cutlass.const_expr(cluster_size == 1):
-                if tidx == 0:
-                    top_k = cutlass.const_expr(self.top_k)
-                    # Emit identity output (first min(top_k, N) indices)
-                    emit_count = cutlass.Int32(top_k) if cutlass.Int32(top_k) < N else N
-                    je = cutlass.Int32(0)
-                    while je < emit_count:
-                        output_indices_row[je] = je
-                        if cutlass.const_expr(self.return_output_values):
-                            output_values_row[je] = input_row[je]
-                        je = je + cutlass.Int32(1)
-            else:
-                # cs>1: all cluster CTAs enter _run_phases; only leader writes.
-                if is_leader & (tidx == cutlass.Int32(0)):
-                    top_k = cutlass.const_expr(self.top_k)
-                    # Emit identity output (first min(top_k, N) indices)
-                    emit_count = cutlass.Int32(top_k) if cutlass.Int32(top_k) < N else N
-                    je = cutlass.Int32(0)
-                    while je < emit_count:
-                        output_indices_row[je] = je
-                        if cutlass.const_expr(self.return_output_values):
-                            output_values_row[je] = input_row[je]
-                        je = je + cutlass.Int32(1)
-        else:
-            # Stage this CTA's slice into SMEM once before Phase 2's
-            # 6-10 secant iters re-scan it. Phase 1 (preIdx) uses
-            # scatter-loads OUTSIDE this slice, so it stays on GMEM.
-            if cutlass.const_expr(self.enable_smem_cache):
-                self.load_slice_to_smem(
-                    input_row,
-                    slice_start,
-                    slice_end,
-                    smem_input,
-                    tidx,
-                )
-
-            # ---- Phase 2: secant threshold search ----
-            self.phase2_secant_search(
+            if tidx == 0:
+                s_thr[0] = cutlass.Float32(0.0)
+                s_thr[1] = cutlass.Float32(-1.0)
+                s_thr[2] = cutlass.Float32(1.0)
+                s_iscalars[2] = N  # cnt_lo
+                s_iscalars[3] = cutlass.Int32(self.top_k)  # cnt_hi
+            cute.arch.barrier()
+        # Stage this CTA's slice into SMEM once before Phase 2's
+        # 6-10 secant iters re-scan it. Phase 1 (preIdx) uses
+        # scatter-loads OUTSIDE this slice, so it stays on GMEM.
+        if cutlass.const_expr(self.enable_smem_cache):
+            self.load_slice_to_smem(
                 input_row,
-                N,
                 slice_start,
                 slice_end,
-                smem_ptcnt,
-                smem_wcnt,
-                s_thr,
-                s_iscalars,
-                s_cluster_partial,
+                smem_input,
                 tidx,
-                warp_id,
-                lane,
-                do_cluster_sync=do_cluster_sync,
-                smem_input=smem_input,
             )
 
-            # Cluster handoff #1 (end of Phase 2). Skipped when
-            # do_cluster_sync is False (cs=1 or short-row degrade).
-            if cutlass.const_expr(cluster_size > 1):
-                if do_cluster_sync:
-                    cute.arch.cluster_arrive_relaxed()
-                    cute.arch.cluster_wait()
+        # ---- Phase 2: secant threshold search ----
+        self.phase2_secant_search(
+            input_row,
+            N,
+            slice_start,
+            slice_end,
+            smem_ptcnt,
+            smem_wcnt,
+            s_thr,
+            s_iscalars,
+            s_cluster_partial,
+            tidx,
+            warp_id,
+            lane,
+            do_cluster_sync=do_cluster_sync,
+            smem_input=smem_input,
+        )
 
-            # ---- Phase 3: cluster-parallel candidate collect ----
-            self.phase3_collect_candidates(
-                input_row,
-                N,
-                slice_start,
-                slice_end,
+        # Cluster handoff #1 (end of Phase 2). Skipped when
+        # do_cluster_sync is False (cs=1 or short-row degrade).
+        if cutlass.const_expr(cluster_size > 1):
+            if do_cluster_sync:
+                cute.arch.cluster_arrive_relaxed()
+                cute.arch.cluster_wait()
+
+        # ---- Phase 3: cluster-parallel candidate collect ----
+        self.phase3_collect_candidates(
+            input_row,
+            N,
+            slice_start,
+            slice_end,
+            smem_keys,
+            smem_vals,
+            smem_ptcnt,
+            smem_wcnt,
+            s_thr,
+            s_iscalars,
+            s_cluster_partial,
+            tidx,
+            warp_id,
+            lane,
+            do_cluster_sync=do_cluster_sync,
+            smem_input=smem_input,
+        )
+
+        # Cluster handoff #2: leader's DSMEM gather of peer
+        # smem_keys/smem_vals. Skipped at do_cluster_sync=False.
+        if cutlass.const_expr(cluster_size > 1):
+            if do_cluster_sync:
+                cute.arch.cluster_arrive()
+                cute.arch.cluster_wait()
+
+        # Phase 4 runs on the leader only. const_expr (compile-
+        # time eliminated) split from runtime so cs=1 gets a flat
+        # code path with no leader/sync checks.
+        # Pre-init cand_count_p4 so CuTe DSL sees a stable Int32 type
+        # across the runtime ``if is_leader:`` branch in cs>1 mode
+        # (DSL forbids first-assigning a variable inside a dynamic if).
+        cand_count_p4 = cutlass.Int32(0)
+        if cutlass.const_expr(cluster_size == 1):
+            # cs=1: the single CTA per row IS the leader.
+            # Capture the P2/P3 terminal BEFORE Phase 4 (P4 snap state may
+            # overwrite scalar slots; the flag must survive to the fill).
+            if tidx == cutlass.Int32(0):
+                s_iscalars[6] = cutlass.Int32(0)
+                if s_iscalars[1] == cutlass.Int32(3):
+                    s_iscalars[6] = cutlass.Int32(1)
+            cute.arch.barrier()
+            cand_count_p4 = min(s_iscalars[0], cutlass.Int32(self.kC))
+            self.phase4_histogram_snap(
                 smem_keys,
                 smem_vals,
-                smem_ptcnt,
+                smem_hist,
                 smem_wcnt,
                 s_thr,
                 s_iscalars,
-                s_cluster_partial,
+                output_values_row,
+                output_indices_row,
+                cand_count_p4,
                 tidx,
                 warp_id,
                 lane,
-                do_cluster_sync=do_cluster_sync,
-                smem_input=smem_input,
             )
-
-            # Cluster handoff #2: leader's DSMEM gather of peer
-            # smem_keys/smem_vals. Skipped at do_cluster_sync=False.
-            if cutlass.const_expr(cluster_size > 1):
+            # ---- plateau fill (done == 3): complete the row from the
+            # bitwise-equal plateau class. The terminal is only set on an
+            # ADJACENT-FLOAT bracket, so every value in [s_thr[1], s_thr[0])
+            # is bitwise-equal; Phase 4 has already emitted the
+            # cnt(>= s_thr[0]) sure winners, and ANY (K - count)-subset of
+            # the tie class is a valid tie-aware completion. Ticket counter
+            # lives in the DEDICATED s_iscalars[7].
+            if s_iscalars[6] == cutlass.Int32(1):
+                pv_lo = s_thr[1]
+                pv_hi = s_thr[0]
+                if tidx == cutlass.Int32(0):
+                    # cand_count_p4 was captured BEFORE Phase 4; s_iscalars[0]
+                    # is snap scratch by now (same hazard as the flag).
+                    s_iscalars[7] = cand_count_p4
+                cute.arch.barrier()
+                ifp = tidx
+                while ifp < N:
+                    vfp = cutlass.Float32(0.0)
+                    if cutlass.const_expr(self.dtype == cutlass.Float32):
+                        vfp = input_row[ifp]
+                    else:
+                        vfp = cutlass.Float32(input_row[ifp])
+                    if vfp >= pv_lo and vfp < pv_hi:
+                        pfill = atomicAdd(
+                            s_iscalars.iterator + cutlass.Int32(7), cutlass.Int32(1)
+                        )
+                        if pfill < cutlass.Int32(self.top_k):
+                            if cutlass.const_expr(self.return_output_values):
+                                output_values_row[pfill] = self.dtype(vfp)
+                            output_indices_row[pfill] = ifp
+                    ifp = ifp + cutlass.Int32(self.num_threads)
+                cute.arch.barrier()
+        else:
+            # cs>1: only the leader (CTA 0 in cluster) runs Phase 4.
+            if is_leader:
                 if do_cluster_sync:
-                    cute.arch.cluster_arrive()
-                    cute.arch.cluster_wait()
+                    # DSMEM-gather peer candidates into the leader's
+                    # smem_keys/smem_vals. Layout: leader's chunk goes
+                    # to [0 .. leader_local_cnt); each peer r's chunk
+                    # appends the next peer_r_local_cnt entries.
+                    local_cnt_self = s_iscalars[5]
+                    local_iscalars_ptr = s_iscalars.iterator + cutlass.Int32(5)
+                    smem_keys_iter = smem_keys.iterator
+                    smem_vals_iter = smem_vals.iterator
+                    base_offset = local_cnt_self
+                    for peer in cutlass.range_constexpr(1, cluster_size):
+                        peer_iscalars_addr = mapa_shared_cluster(
+                            local_iscalars_ptr, cutlass.Int32(peer)
+                        )
+                        peer_cnt = ld_shared_cluster_i32(peer_iscalars_addr)
+                        # Cap to kC (defense-in-depth vs. the
+                        # done==2 bracket-exhaustion path).
+                        peer_cnt = min(peer_cnt, cutlass.Int32(self.kC))
+                        i_gather = tidx
+                        while i_gather < peer_cnt:
+                            peer_key_addr = mapa_shared_cluster(
+                                smem_keys_iter + i_gather, cutlass.Int32(peer)
+                            )
+                            peer_val_addr = mapa_shared_cluster(
+                                smem_vals_iter + i_gather, cutlass.Int32(peer)
+                            )
+                            k_val = ld_shared_cluster_f32(peer_key_addr)
+                            v_val = ld_shared_cluster_i32(peer_val_addr)
+                            dst = base_offset + i_gather
+                            if dst < cutlass.Int32(self.kC):
+                                smem_keys[dst] = k_val
+                                smem_vals[dst] = v_val
+                            i_gather = i_gather + cutlass.Int32(num_threads)
+                        base_offset = base_offset + peer_cnt
+                    # Reset s_iscalars[0] to cluster-wide cand_count.
+                    if tidx == cutlass.Int32(0):
+                        s_iscalars[0] = base_offset
+                    cute.arch.barrier()
+                # else: short-row degrade — leader (CTA 0) already
+                # holds the full row's candidates in its own
+                # smem_keys/smem_vals (no peers to gather from).
 
-            # Phase 4 runs on the leader only. const_expr (compile-
-            # time eliminated) split from runtime so cs=1 gets a flat
-            # code path with no leader/sync checks.
-            # Pre-init cand_count_p4 so CuTe DSL sees a stable Int32 type
-            # across the runtime ``if is_leader:`` branch in cs>1 mode
-            # (DSL forbids first-assigning a variable inside a dynamic if).
-            cand_count_p4 = cutlass.Int32(0)
-            if cutlass.const_expr(cluster_size == 1):
-                # cs=1: the single CTA per row IS the leader.
+                # ---- Phase 4: histogram snap + writeback ----
+                # Capture the P2/P3 terminal BEFORE Phase 4 (see cs=1 path).
+                if tidx == cutlass.Int32(0):
+                    s_iscalars[6] = cutlass.Int32(0)
+                    if s_iscalars[1] == cutlass.Int32(3):
+                        s_iscalars[6] = cutlass.Int32(1)
+                cute.arch.barrier()
                 cand_count_p4 = min(s_iscalars[0], cutlass.Int32(self.kC))
                 self.phase4_histogram_snap(
                     smem_keys,
@@ -2981,67 +3364,33 @@ class GvrTopKKernel:
                     warp_id,
                     lane,
                 )
-            else:
-                # cs>1: only the leader (CTA 0 in cluster) runs Phase 4.
-                if is_leader:
-                    if do_cluster_sync:
-                        # DSMEM-gather peer candidates into the leader's
-                        # smem_keys/smem_vals. Layout: leader's chunk goes
-                        # to [0 .. leader_local_cnt); each peer r's chunk
-                        # appends the next peer_r_local_cnt entries.
-                        local_cnt_self = s_iscalars[5]
-                        local_iscalars_ptr = s_iscalars.iterator + cutlass.Int32(5)
-                        smem_keys_iter = smem_keys.iterator
-                        smem_vals_iter = smem_vals.iterator
-                        base_offset = local_cnt_self
-                        for peer in cutlass.range_constexpr(1, cluster_size):
-                            peer_iscalars_addr = mapa_shared_cluster(
-                                local_iscalars_ptr, cutlass.Int32(peer)
+                # ---- plateau fill (done == 3): see the cs=1 path. The
+                # leader scans the FULL row [0, N) from GMEM (correct for
+                # both slice modes; the plateau class is row-global).
+                if s_iscalars[6] == cutlass.Int32(1):
+                    pv_lo = s_thr[1]
+                    pv_hi = s_thr[0]
+                    if tidx == cutlass.Int32(0):
+                        s_iscalars[7] = cand_count_p4
+                    cute.arch.barrier()
+                    ifp = tidx
+                    while ifp < N:
+                        vfp = cutlass.Float32(0.0)
+                        if cutlass.const_expr(self.dtype == cutlass.Float32):
+                            vfp = input_row[ifp]
+                        else:
+                            vfp = cutlass.Float32(input_row[ifp])
+                        if vfp >= pv_lo and vfp < pv_hi:
+                            pfill = atomicAdd(
+                                s_iscalars.iterator + cutlass.Int32(7),
+                                cutlass.Int32(1),
                             )
-                            peer_cnt = ld_shared_cluster_i32(peer_iscalars_addr)
-                            # Cap to kC (defense-in-depth vs. the
-                            # done==2 bracket-exhaustion path).
-                            peer_cnt = min(peer_cnt, cutlass.Int32(self.kC))
-                            i_gather = tidx
-                            while i_gather < peer_cnt:
-                                peer_key_addr = mapa_shared_cluster(
-                                    smem_keys_iter + i_gather, cutlass.Int32(peer)
-                                )
-                                peer_val_addr = mapa_shared_cluster(
-                                    smem_vals_iter + i_gather, cutlass.Int32(peer)
-                                )
-                                k_val = ld_shared_cluster_f32(peer_key_addr)
-                                v_val = ld_shared_cluster_i32(peer_val_addr)
-                                dst = base_offset + i_gather
-                                if dst < cutlass.Int32(self.kC):
-                                    smem_keys[dst] = k_val
-                                    smem_vals[dst] = v_val
-                                i_gather = i_gather + cutlass.Int32(num_threads)
-                            base_offset = base_offset + peer_cnt
-                        # Reset s_iscalars[0] to cluster-wide cand_count.
-                        if tidx == cutlass.Int32(0):
-                            s_iscalars[0] = base_offset
-                        cute.arch.barrier()
-                    # else: short-row degrade — leader (CTA 0) already
-                    # holds the full row's candidates in its own
-                    # smem_keys/smem_vals (no peers to gather from).
-
-                    # ---- Phase 4: histogram snap + writeback ----
-                    cand_count_p4 = min(s_iscalars[0], cutlass.Int32(self.kC))
-                    self.phase4_histogram_snap(
-                        smem_keys,
-                        smem_vals,
-                        smem_hist,
-                        smem_wcnt,
-                        s_thr,
-                        s_iscalars,
-                        output_values_row,
-                        output_indices_row,
-                        cand_count_p4,
-                        tidx,
-                        warp_id,
-                        lane,
-                    )
+                            if pfill < cutlass.Int32(self.top_k):
+                                if cutlass.const_expr(self.return_output_values):
+                                    output_values_row[pfill] = self.dtype(vfp)
+                                output_indices_row[pfill] = ifp
+                        ifp = ifp + cutlass.Int32(self.num_threads)
+                    cute.arch.barrier()
 
         # Final cluster barrier: keep peer CTAs (and their SMEM) alive
         # until the leader's gather + Phase 4 finish. Skipped at

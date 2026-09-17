@@ -168,7 +168,12 @@ def _fmha_v2_specs(items):
     # test item (~2.4k items would grind for many minutes).
     fmha_keys = set()  # (layout, dtype, o_dtype-or-None)
     sink_keys = set()  # (dtype, use_swa, head_dim)
-    need_sm120_module = False
+    test_names = {it.name.split("[")[0] for it in items}
+    need_sm120_module = sm12x and any(
+        name == "test_fmha_v2_prefill_deepseek"
+        or name.startswith("test_fmha_v2_prefill_sm120")
+        for name in test_names
+    )
     for it in items:
         cs = getattr(it, "callspec", None)
         if cs is None:
@@ -176,7 +181,6 @@ def _fmha_v2_specs(items):
         p = cs.params
         fn = it.name.split("[")[0]
         if fn == "test_fmha_v2_prefill_deepseek":
-            need_sm120_module = sm12x
             continue
         if fn == "test_trtllm_fmha_v2_prefill_sm120_large_head_dim" and not sm12x:
             continue  # test skips on non-SM12x

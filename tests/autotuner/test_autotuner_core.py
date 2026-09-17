@@ -1,5 +1,7 @@
+import gc
 import random
 import tracemalloc
+import weakref
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -8,7 +10,11 @@ import torch
 import flashinfer.fused_moe.core as core_mod
 from flashinfer import autotune
 from flashinfer.autotuner.initializers import autotuner_initializer_randn
-from flashinfer.fused_moe.core import MoeRunnerInputs, _moe_topk_ids_init
+from flashinfer.fused_moe.shared.inputs import MoeRunnerInputs
+from flashinfer.fused_moe.shared.tuning import (
+    make_moe_tuning_config,
+    moe_topk_ids_init,
+)
 from flashinfer.fused_moe.utils import (
     get_hybrid_num_tokens_buckets,
     make_hybrid_bucket_mapper,
@@ -17,10 +23,6 @@ from flashinfer.mla._core import (
     CuteDslMlaDecodeRunner,
     _build_mla_decode_tuning_config,
     _mla_decode_tuning_config,
-)
-from flashinfer.mla._sparse_mla_sm120 import (
-    _decode_dsv3_2_tuning_config,
-    _decode_dsv4_tuning_config,
 )
 from flashinfer.tllm_enums import (
     DtypeTrtllmGen,
@@ -36,6 +38,7 @@ from flashinfer.autotuner import (
     make_bucket_mapper,
     round_to_nearest_bucket,
 )
+from flashinfer.fused_moe.shared.tuning import make_repeating_tensor_initializer
 
 from flashinfer.utils import last_positive_power_of_2
 
@@ -69,6 +72,54 @@ class DummyRunner(TunableRunner):
 
     def forward(self, inputs, tactic: int = -1, do_preparation: bool = False, **kwargs):
         return inputs[0]
+
+
+def test_repeating_tensor_initializer_preserves_runtime_values():
+    source = torch.tensor([[10, 11, 12], [20, 21, 22]], dtype=torch.int32)
+    initializer = make_repeating_tensor_initializer(source)
+
+    actual = initializer((5, 3), torch.int32, torch.device("cpu"))
+
+    assert torch.equal(
+        actual,
+        torch.tensor(
+            [
+                [10, 11, 12],
+                [20, 21, 22],
+                [10, 11, 12],
+                [20, 21, 22],
+                [10, 11, 12],
+            ],
+            dtype=torch.int32,
+        ),
+    )
+    actual[0, 0] = -1
+    assert source[0, 0] == 10
+
+
+def test_repeating_tensor_initializer_rejects_mismatched_width():
+    initializer = make_repeating_tensor_initializer(torch.ones(2, 3))
+    with pytest.raises(ValueError, match="Cannot initialize shape"):
+        initializer((4, 2), torch.float32, torch.device("cpu"))
+
+
+def test_repeating_tensor_initializer_resamples_expanded_route_profiles():
+    expert_ids = torch.tensor([[7, 19, 63, 101]], dtype=torch.int32)
+    weight_bits = torch.ones((1, 4), dtype=torch.bfloat16).view(torch.int16)
+    source = (expert_ids << 16) | weight_bits.to(torch.int32)
+    initializer = make_repeating_tensor_initializer(
+        source, num_experts=128, packed=True
+    )
+
+    assert torch.equal(initializer((1, 4), torch.int32, torch.device("cpu")), source)
+    first = initializer((512, 4), torch.int32, torch.device("cpu"))
+    second = initializer((512, 4), torch.int32, torch.device("cpu"))
+    expanded_ids = first >> 16
+
+    assert torch.equal(first, second)
+    assert torch.unique(expanded_ids).numel() == 128
+    assert torch.all((expanded_ids >= 0) & (expanded_ids < 128))
+    assert torch.all(torch.sort(expanded_ids, dim=1).values.diff(dim=1) != 0)
 
 
 def test_find_nearest_profile_passthrough_without_specs():
@@ -415,6 +466,205 @@ def test_choose_one_tuning_selects_best_tactic_and_populates_cache(monkeypatch):
     assert len(tuner.profiling_cache) >= 1
     assert tuner.stats.tuned_op_total_configs["dummy_tune"] >= 1
     assert tuner.stats.tuned_op_successful_configs["dummy_tune"] >= 1
+
+
+@pytest.mark.parametrize("phase", ("forward", "precompile"))
+def test_choose_one_recovers_from_memory_error_during_preparation(monkeypatch, phase):
+    class PreparationMemoryErrorRunner(DummyRunner):
+        def precompile_tactics(self, inputs, tactics, profile, **kwargs):
+            if phase == "precompile":
+                raise MemoryError("CUDA out of memory")
+            return False
+
+        def forward(
+            self, inputs, tactic: int = -1, do_preparation: bool = False, **kwargs
+        ):
+            if do_preparation:
+                raise MemoryError("CUDA out of memory")
+            return inputs[0]
+
+    tuner = reset_autotuner()
+    runner = PreparationMemoryErrorRunner(valid_tactics=(0,))
+    inputs = [torch.empty((16, 32), dtype=torch.float32)]
+    profile = MagicMock(return_value=1.0)
+    empty_cache = MagicMock()
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", profile)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(torch.cuda, "empty_cache", empty_cache)
+
+    with autotune(tune_mode=True):
+        chosen_runner, tactic = tuner.choose_one(
+            "preparation_memory_error", [runner], TuningConfig(), inputs
+        )
+
+    assert chosen_runner is runner
+    assert tactic == -1
+    profile.assert_not_called()
+    empty_cache.assert_called_once_with()
+
+
+@pytest.mark.parametrize("failure_phase", ("input_batches", "runner"))
+def test_choose_one_releases_inputs_before_oom_sync_and_cache_cleanup(
+    monkeypatch, failure_phase
+):
+    """OOM inputs die before flag allocation and CUDA cache cleanup."""
+
+    class SyntheticInput:
+        pass
+
+    class PreparationRunner(DummyRunner):
+        def forward(
+            self, inputs, tactic: int = -1, do_preparation: bool = False, **kwargs
+        ):
+            if failure_phase == "runner" and do_preparation:
+                raise MemoryError("CUDA out of memory")
+            return inputs[0]
+
+    tuner = reset_autotuner()
+    runner = PreparationRunner(valid_tactics=(0,))
+    inputs = [torch.empty((16, 32), dtype=torch.float32)]
+    synthetic_ref = None
+
+    def prepare_input_tensors(_self, *_args):
+        nonlocal synthetic_ref
+        synthetic_input = SyntheticInput()
+        synthetic_ref = weakref.ref(synthetic_input)
+        return [synthetic_input]
+
+    def prepare_batches(_self, tensors, *_args):
+        if failure_phase == "input_batches":
+            raise MemoryError("CUDA out of memory")
+        return [list(tensors)]
+
+    def empty_cache():
+        gc.collect()
+        assert synthetic_ref is not None
+        assert synthetic_ref() is None
+
+    def sync_oom(local_oom):
+        gc.collect()
+        if local_oom:
+            assert synthetic_ref is not None
+            assert synthetic_ref() is None
+        return local_oom
+
+    monkeypatch.setattr(AutoTuner, "_prepare_input_tensors", prepare_input_tensors)
+    monkeypatch.setattr(
+        AutoTuner, "_prepare_input_tensors_with_batches", prepare_batches
+    )
+    monkeypatch.setattr(
+        AutoTuner, "_profile_single_kernel", lambda *_args, **_kwargs: 1.0
+    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(torch.cuda, "empty_cache", empty_cache)
+    monkeypatch.setattr(
+        "flashinfer.autotuner.autotuner._sync_oom_across_tune_group", sync_oom
+    )
+
+    with autotune(tune_mode=True):
+        chosen_runner, tactic = tuner.choose_one(
+            "input_memory_error", [runner], TuningConfig(), inputs
+        )
+
+    assert chosen_runner is runner
+    assert tactic == -1
+
+
+def test_choose_one_recovers_from_memory_error_during_profiling(monkeypatch):
+    tuner = reset_autotuner()
+    runner = DummyRunner(valid_tactics=(0,))
+    inputs = [torch.empty((16, 32), dtype=torch.float32)]
+    empty_cache = MagicMock()
+    monkeypatch.setattr(
+        AutoTuner,
+        "_profile_single_kernel",
+        MagicMock(side_effect=MemoryError("CUDA out of memory")),
+    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(torch.cuda, "empty_cache", empty_cache)
+
+    with autotune(tune_mode=True):
+        chosen_runner, tactic = tuner.choose_one(
+            "profiling_memory_error", [runner], TuningConfig(), inputs
+        )
+
+    assert chosen_runner is runner
+    assert tactic == -1
+    empty_cache.assert_called_once_with()
+
+
+@pytest.mark.parametrize("failure_phase", ("input_hook", "runner"))
+@pytest.mark.parametrize("error_type", (MemoryError, torch.cuda.OutOfMemoryError))
+@pytest.mark.parametrize("distributed", (False, True))
+def test_rank_tactics_preparation_oom_error_and_input_lifetime(
+    monkeypatch, failure_phase, error_type, distributed
+):
+    class SyntheticInput:
+        pass
+
+    local_errors = []
+
+    def fail_preparation():
+        error = error_type("workspace allocation failed")
+        if not distributed:
+            local_errors.append(error)
+        raise error
+
+    class PreparationRunner(DummyRunner):
+        def forward(self, inputs, tactic=-1, do_preparation=False, **kwargs):
+            if failure_phase == "runner" and do_preparation:
+                fail_preparation()
+            return inputs[0]
+
+    tuner = reset_autotuner()
+    synthetic_ref = None
+
+    def prepare_inputs(*_args):
+        nonlocal synthetic_ref
+        value = SyntheticInput()
+        synthetic_ref = weakref.ref(value)
+        return [value]
+
+    def input_hook(tensors):
+        if failure_phase == "input_hook":
+            fail_preparation()
+        return tensors
+
+    def sync_oom(local_oom):
+        if local_oom:
+            gc.collect()
+            assert synthetic_ref() is None
+        return local_oom
+
+    monkeypatch.setattr(AutoTuner, "_prepare_input_tensors", prepare_inputs)
+    monkeypatch.setattr(
+        "flashinfer.autotuner.autotuner._tune_process_group",
+        object() if distributed else None,
+    )
+    sync = MagicMock(side_effect=sync_oom)
+    monkeypatch.setattr(
+        "flashinfer.autotuner.autotuner._sync_oom_across_tune_group", sync
+    )
+    profile = MagicMock()
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", profile)
+
+    with (
+        autotune(True),
+        pytest.raises(MemoryError if distributed else error_type) as exc,
+    ):
+        tuner.rank_tactics(
+            "ranking_preparation_oom",
+            [PreparationRunner(valid_tactics=(0,))],
+            TuningConfig(inputs_pre_hook=input_hook),
+            [torch.empty((8, 8))],
+            k=2,
+        )
+
+    if distributed:
+        sync.assert_any_call(True)
+    else:
+        assert exc.value is local_errors[0]
+    profile.assert_not_called()
 
 
 def test_rank_tactics_returns_top_k_and_caches_winner(monkeypatch):
@@ -901,12 +1151,238 @@ def test_tuning_overrides_preserve_tensor_initializers():
             ),
         ),
         tensor_initializers=((0, initializer),),
+        profiling_repeat=100,
     )
 
     with autotune(tune_mode=False, tuning_buckets=(100, 200)):
         overridden = tuner._apply_tuning_overrides(config)
 
     assert overridden.tensor_initializers == config.tensor_initializers
+    assert overridden.profiling_repeat == 100
+
+
+def test_tuning_config_profiling_repeat_override(monkeypatch):
+    tuner = reset_autotuner()
+    monkeypatch.setattr(tuner, "repeat", 10)
+    monkeypatch.setattr(tuner, "_get_l2_cache_size_in_bytes", lambda: 1024)
+
+    default_config = TuningConfig(use_cold_l2_cache=True)
+    override_config = TuningConfig(use_cold_l2_cache=True, profiling_repeat=3)
+    inputs = [torch.ones(1)]
+
+    assert tuner._get_profiling_repeat(default_config) == 10
+    assert tuner._get_profiling_repeat(override_config) == 3
+    assert len(tuner._prepare_input_tensors_with_batches(inputs, override_config)) == 4
+
+    default_key = tuner._get_cache_key("op", DummyRunner(), ((1,),), default_config)
+    override_key = tuner._get_cache_key("op", DummyRunner(), ((1,),), override_config)
+    # Repeat controls measurement precision, not tactic compatibility.
+    assert default_key.file_key == override_key.file_key
+
+    with pytest.raises(ValueError, match="profiling_repeat must be positive"):
+        tuner._get_profiling_repeat(TuningConfig(profiling_repeat=0))
+
+
+def test_tuning_config_profiling_repeat_controls_measurement(monkeypatch):
+    if not torch.cuda.is_available():
+        pytest.skip("profiling requires CUDA")
+
+    class CountingRunner(DummyRunner):
+        def __init__(self):
+            super().__init__(valid_tactics=(0,))
+            self.calls = 0
+
+        def forward(self, inputs, tactic=0, **kwargs):
+            del tactic, kwargs
+            self.calls += 1
+            inputs[0].add_(1)
+            return inputs[0]
+
+    tuner = reset_autotuner()
+    monkeypatch.setattr(tuner, "warmup", 0)
+    monkeypatch.setattr(tuner, "stream_delay_micro_secs", 0)
+    runner = CountingRunner()
+    config = TuningConfig(profiling_repeat=3)
+
+    tuner._profile_single_kernel(runner, [torch.zeros(1, device="cuda")], 0, config)
+
+    assert runner.calls == 3
+
+
+def test_tuning_config_profiling_repeat_reuses_bounded_cuda_arena(monkeypatch):
+    if not torch.cuda.is_available():
+        pytest.skip("profile arena requires CUDA")
+
+    tuner = reset_autotuner()
+    monkeypatch.setattr(tuner, "_get_l2_cache_size_in_bytes", lambda: 768)
+    inputs = [torch.zeros(256, dtype=torch.float32, device="cuda")]
+    config = TuningConfig(
+        use_cold_l2_cache=True,
+        profiling_repeat=100,
+        profile_arena_input_indices=(0,),
+    )
+
+    batches = tuner._prepare_input_tensors_with_batches(inputs, config)
+
+    # One lane carries 1024 bytes and the cold-L2 target is 1792 bytes, so two
+    # lanes per A/B arena suffice. All 100 timed replays remain scheduled and
+    # traverse A0, B0, A1, B1 instead of skipping half the lanes when the lane
+    # count is even.
+    assert len(batches) == 100
+    data_ptrs = [batch[0].data_ptr() for batch in batches]
+    assert data_ptrs[:4] == data_ptrs[4:8]
+    assert len(set(data_ptrs)) == 4
+
+    storages = {
+        batch[0].untyped_storage().data_ptr(): batch[0].untyped_storage().nbytes()
+        for batch in batches
+    }
+    assert len(storages) == 2
+    assert sum(storages.values()) == 2 * 2 * 1024
+    assert sum(storages.values()) < 2 * 100 * 1024
+
+
+def test_autotune_context_overrides_cuda_graph_profile_replays(monkeypatch):
+    tuner = reset_autotuner()
+    runner = DummyRunner(valid_tactics=(0,))
+    inputs = [torch.empty((128, 32), dtype=torch.float32)]
+    config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0,),
+                dim_idx=(0,),
+                gen_tuning_buckets=(128,),
+                map_to_tuning_buckets=last_positive_power_of_2,
+            ),
+        ),
+        use_cuda_graph=True,
+        cuda_graph_profile_replays=1,
+    )
+    seen_replays = []
+
+    def fake_profile(self, runner_obj, prof_inputs, tactic, tuning_config, **kwargs):
+        seen_replays.append(tuning_config.cuda_graph_profile_replays)
+        return 1.0
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+
+    with autotune(tune_mode=True, cuda_graph_profile_replays=20):
+        tuner.choose_one("profile_replays_test", [runner], config, inputs)
+
+    assert seen_replays == [20]
+
+
+def test_cuda_graph_profile_replay_change_reprofiles(monkeypatch):
+    tuner = reset_autotuner()
+    runner = DummyRunner(valid_tactics=(0,))
+    inputs = [torch.empty((128, 32), dtype=torch.float32)]
+    config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0,),
+                dim_idx=(0,),
+                gen_tuning_buckets=(128,),
+                map_to_tuning_buckets=last_positive_power_of_2,
+            ),
+        ),
+        use_cuda_graph=True,
+    )
+    seen_replays = []
+
+    def fake_profile(self, runner_obj, prof_inputs, tactic, tuning_config, **kwargs):
+        seen_replays.append(tuning_config.cuda_graph_profile_replays)
+        return 1.0
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+
+    with autotune(tune_mode=True, cuda_graph_profile_replays=1):
+        tuner.choose_one("profile_policy_test", [runner], config, inputs)
+    with autotune(tune_mode=True, cuda_graph_profile_replays=20):
+        tuner.choose_one("profile_policy_test", [runner], config, inputs)
+    with autotune(tune_mode=True, cuda_graph_profile_replays=20):
+        tuner.choose_one("profile_policy_test", [runner], config, inputs)
+
+    # Runtime lookup must keep using the tactic selected by the last tuning pass.
+    tuner.choose_one("profile_policy_test", [runner], config, inputs)
+
+    assert seen_replays == [1, 20]
+
+
+def test_cold_l2_policy_reprofiles_legacy_hot_cache(monkeypatch):
+    tuner = reset_autotuner()
+    runner = DummyRunner(valid_tactics=(0,))
+    inputs = [torch.empty((128, 32), dtype=torch.float32)]
+    hot_config = TuningConfig(use_cuda_graph=True, use_cold_l2_cache=False)
+    cold_config = TuningConfig(use_cuda_graph=True, use_cold_l2_cache=True)
+    seen_policies = []
+
+    def fake_profile(self, runner_obj, prof_inputs, tactic, tuning_config, **kwargs):
+        seen_policies.append(self._profiling_policy(tuning_config))
+        return 1.0
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+
+    with autotune(tune_mode=True):
+        tuner.choose_one("l2_policy_test", [runner], hot_config, inputs)
+    tuner._profiling_cache_policies.clear()
+    with autotune(tune_mode=True):
+        tuner.choose_one("l2_policy_test", [runner], cold_config, inputs)
+    with autotune(tune_mode=True):
+        tuner.choose_one("l2_policy_test", [runner], cold_config, inputs)
+
+    assert seen_policies == [
+        ("cuda_graph_profile_replays", 1, "l2_cache_policy", "hot"),
+        ("cuda_graph_profile_replays", 1, "l2_cache_policy", "cold"),
+    ]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_cold_l2_profile_uses_full_flush_buffer(monkeypatch):
+    class AddRunner(DummyRunner):
+        def forward(
+            self, inputs, tactic: int = -1, do_preparation: bool = False, **kwargs
+        ):
+            torch.add(inputs[0], 1, out=inputs[1])
+            return inputs[1]
+
+    tuner = AutoTuner(warmup=1, repeat=2)
+    runner = AddRunner(valid_tactics=(0,))
+    inputs = [
+        torch.ones(1024, device="cuda"),
+        torch.empty(1024, device="cuda"),
+    ]
+    config = TuningConfig(
+        use_cuda_graph=True,
+        use_cold_l2_cache=True,
+        cuda_graph_profile_replays=2,
+    )
+    allocations = []
+    original_empty = torch.empty
+
+    def tracked_empty(*args, **kwargs):
+        result = original_empty(*args, **kwargs)
+        if kwargs.get("dtype") == torch.int8:
+            allocations.append((result.numel(), result.device))
+        return result
+
+    monkeypatch.setattr(tuner, "_get_l2_cache_size_in_bytes", lambda device_id: 4096)
+    monkeypatch.setattr(torch, "empty", tracked_empty)
+    monkeypatch.setattr(
+        "flashinfer.autotuner.autotuner.delay_kernel", lambda delay_us: None
+    )
+
+    latency = tuner._profile_single_kernel(runner, inputs, 0, config)
+
+    assert latency >= 0
+    assert allocations == [(8192, inputs[0].device)]
+
+
+def test_autotune_context_rejects_invalid_cuda_graph_profile_replays():
+    with (
+        pytest.raises(ValueError, match="must be at least one"),
+        autotune(tune_mode=True, cuda_graph_profile_replays=0),
+    ):
+        pass
 
 
 def test_autotune_context_round_up(monkeypatch):
@@ -990,13 +1466,21 @@ def test_autotune_context_restores_overrides():
 
     assert tuner._override_tuning_buckets is None
     assert tuner._override_round_up is False
+    assert tuner._override_cuda_graph_profile_replays is None
 
-    with autotune(tune_mode=False, tuning_buckets=(100, 200), round_up=True):
+    with autotune(
+        tune_mode=False,
+        tuning_buckets=(100, 200),
+        round_up=True,
+        cuda_graph_profile_replays=20,
+    ):
         assert tuner._override_tuning_buckets == (100, 200)
         assert tuner._override_round_up is True
+        assert tuner._override_cuda_graph_profile_replays == 20
 
     assert tuner._override_tuning_buckets is None
     assert tuner._override_round_up is False
+    assert tuner._override_cuda_graph_profile_replays is None
 
 
 def test_choose_one_with_custom_buckets_selects_best_tactic(monkeypatch):
@@ -1084,7 +1568,9 @@ def test_value_aware_choose_one_stages_one_sample_fairly(monkeypatch):
     tuner = reset_autotuner()
     runner = ValueAwareCudaRunner()
     monkeypatch.setattr(tuner, "repeat", 4)
-    monkeypatch.setattr(tuner, "_get_l2_cache_size_in_bytes", lambda: 1024)
+    monkeypatch.setattr(
+        tuner, "_get_l2_cache_size_in_bytes", lambda device_id=None: 1024
+    )
     num_tokens = 128
     top_k = 4
     num_experts = 32
@@ -1161,9 +1647,13 @@ def test_value_aware_choose_one_stages_one_sample_fairly(monkeypatch):
         for input_index in (0, 1, 2, 3):
             assert batch[input_index].data_ptr() != inputs[input_index].data_ptr()
     for input_index in (0, 1, 2, 3):
-        assert (
-            len({batch[input_index].data_ptr() for batch in schedule}) == tuner.repeat
-        )
+        pointers = [batch[input_index].data_ptr() for batch in schedule]
+        num_physical_buffers = len(set(pointers))
+        assert 2 <= num_physical_buffers <= tuner.repeat
+        assert num_physical_buffers % 2 == 0
+        assert pointers == [
+            pointers[index % num_physical_buffers] for index in range(tuner.repeat)
+        ]
     assert torch.count_nonzero(inputs[1]).item() == 0
     assert torch.count_nonzero(inputs[2]).item() == 0
     sorted_ids = schedule[0][1].sort(dim=1).values
@@ -1180,7 +1670,9 @@ def test_value_aware_profiles_expert_distributions_in_one_transaction(monkeypatc
     monkeypatch.setattr(tuner, "repeat", 4)
     monkeypatch.setattr(tuner, "warmup", 0)
     monkeypatch.setattr(tuner, "stream_delay_micro_secs", 0)
-    monkeypatch.setattr(tuner, "_get_l2_cache_size_in_bytes", lambda: 1024)
+    monkeypatch.setattr(
+        tuner, "_get_l2_cache_size_in_bytes", lambda device_id=None: 1024
+    )
     operation_key = "value_aware_moe_distribution"
     num_tokens = 1024
     top_k = 4
@@ -1352,7 +1844,7 @@ def test_prepare_input_tensors_with_batches_preserves_non_tensor(
 ):
     """Cold-L2 batches clone tensors while preserving scalar and optional inputs."""
     tuner = reset_autotuner()
-    monkeypatch.setattr(tuner, "_get_l2_cache_size_in_bytes", lambda: 4)
+    monkeypatch.setattr(tuner, "_get_l2_cache_size_in_bytes", lambda device_id=None: 4)
     inputs = [torch.ones(1), non_tensor]
 
     batches = tuner._prepare_input_tensors_with_batches(
@@ -1772,19 +2264,19 @@ def test_find_nearest_profile_cache_dedups_moe_config_with_initializers():
     must collapse to a single cache entry.
     """
     # The factory must return the identical object for the same expert count.
-    assert _moe_topk_ids_init(128) is _moe_topk_ids_init(128)
+    assert moe_topk_ids_init(128) is moe_topk_ids_init(128)
 
     AutoTuner._find_nearest_profile_cached.cache_clear()
     shapes = ((1024, 4096), (1024, 8))
 
     AutoTuner._find_nearest_profile(
-        shapes, _build_moe_style_tuning_config(_moe_topk_ids_init(128))
+        shapes, _build_moe_style_tuning_config(moe_topk_ids_init(128))
     )
     cache_before = AutoTuner._find_nearest_profile_cached.cache_info().currsize
 
     N = 1_000
     for _ in range(N):
-        config = _build_moe_style_tuning_config(_moe_topk_ids_init(128))
+        config = _build_moe_style_tuning_config(moe_topk_ids_init(128))
         AutoTuner._find_nearest_profile(shapes, config)
 
     cache_growth = (
@@ -1806,9 +2298,7 @@ def test_find_nearest_profile_cache_dedups_moe_config_with_initializers():
     ],
 )
 def test_make_tuning_config_reuses_topk_ids_initializer(routing_input_mode, packed):
-    """_make_tuning_config must return configs whose topk_ids initializer is the
-    same object across calls and matches the launcher's routing representation.
-    """
+    """Tuning configs reuse live routes without repeating small histograms."""
     fn = core_mod._get_trtllm_moe_sm100_module_impl
     fn.cache_clear()
     try:
@@ -1822,9 +2312,10 @@ def test_make_tuning_config_reuses_topk_ids_initializer(routing_input_mode, pack
             ),
             patch.object(core_mod, "setup_cubin_loader"),
         ):
-            MoERunner = fn(enable_rubin=False).MoERunner
+            trtllm_module = fn(enable_rubin=False)
 
-        runner = MoERunner(
+        runner = trtllm_module.MoERunner(
+            trtllm_module.moe_op,
             top_k=8,
             num_local_experts=128,
             dtype_act=DtypeTrtllmGen.Bfloat16,
@@ -1834,10 +2325,20 @@ def test_make_tuning_config_reuses_topk_ids_initializer(routing_input_mode, pack
             intermediate_size=14336,
             num_experts=128,
         )
+        expert_ids = torch.arange(64, dtype=torch.int32).reshape(8, 8) % 128
+        if packed:
+            bf16_one_bits = (
+                torch.tensor(1.0, dtype=torch.bfloat16).view(torch.int16).item()
+                & 0xFFFF
+            )
+            topk_ids = (expert_ids << 16) | bf16_one_bits
+        else:
+            topk_ids = expert_ids
+
         moe_inputs = MoeRunnerInputs(
             output=torch.empty((8, 4096)),
             routing_logits=None,
-            topk_ids=torch.zeros((8, 8), dtype=torch.int32),
+            topk_ids=topk_ids,
             expert_weights=None,
             hidden_states=torch.empty((8, 4096)),
             hidden_states_scale=None,
@@ -1858,20 +2359,19 @@ def test_make_tuning_config_reuses_topk_ids_initializer(routing_input_mode, pack
 
         assert init_a is init_b, (
             "_make_tuning_config returned a different topk_ids initializer object "
-            "on each call. It must reuse _moe_topk_ids_init(num_experts) so an "
+            "on each call. It must reuse moe_topk_ids_init(num_experts) so an "
             "equivalent config reuses one initializer object instead of allocating "
             "a fresh closure on every call."
         )
-        assert init_a is _moe_topk_ids_init(128, packed=packed)
+        generated = init_a((16, 8), torch.int32, torch.device("cpu"))
+        generated_ids = generated >> 16 if packed else generated
+        assert torch.unique(generated_ids).numel() > torch.unique(expert_ids).numel()
 
         initialized = init_a((8, 8), torch.int32, torch.device("cpu"))
+        assert torch.equal(initialized, moe_inputs.topk_ids)
         if packed:
             # Packed routing stores the expert ID in the high 16 bits and a
             # deterministic BF16 routing weight of 1.0 in the low 16 bits.
-            bf16_one_bits = (
-                torch.tensor(1.0, dtype=torch.bfloat16).view(torch.int16).item()
-                & 0xFFFF
-            )
             assert torch.all((initialized >> 16) < 128)
             assert torch.all((initialized & 0xFFFF) == bf16_one_bits)
         else:
@@ -1879,6 +2379,52 @@ def test_make_tuning_config_reuses_topk_ids_initializer(routing_input_mode, pack
             assert torch.all((initialized >= 0) & (initialized < 128))
     finally:
         fn.cache_clear()
+
+
+def test_moe_empty_routing_placeholders_preserve_file_cache_key():
+    """Logits-routed placeholders remain bucketed in persisted tactic keys."""
+    num_tokens, hidden_size, num_experts = 17, 64, 8
+    moe_inputs = MoeRunnerInputs(
+        output=torch.empty((num_tokens, hidden_size)),
+        routing_logits=torch.empty((num_tokens, num_experts)),
+        topk_ids=torch.empty((0,), dtype=torch.int32),
+        expert_weights=torch.empty((0,), dtype=torch.bfloat16),
+        hidden_states=torch.empty((num_tokens, hidden_size)),
+        hidden_states_scale=None,
+        gemm1_lora_delta=None,
+        per_token_scale=None,
+    )
+    tuning_config = make_moe_tuning_config(
+        moe_inputs,
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        fp8_quantization_type=Fp8QuantizationType.NoneFp8,
+        init_packed_topk_ids=moe_topk_ids_init(num_experts),
+    )
+    input_shapes = AutoTuner.get()._get_input_sizes(moe_inputs.to_list())
+
+    cache_key = AutoTuner._get_cache_key(
+        "test::routed_moe",
+        DummyRunner(),
+        input_shapes,
+        tuning_config,
+    )
+    legacy_profile = (
+        (32, hidden_size),
+        (32, num_experts),
+        (32,),
+        (32,),
+        (32, hidden_size),
+        (0,),
+        (0,),
+        (0,),
+    )
+
+    assert tuning_config.dynamic_tensor_specs[0].input_idx == (0, 1, 2, 3, 4)
+    assert cache_key.nearest_profile == legacy_profile
+    assert cache_key.file_key == str(
+        ("test::routed_moe", "DummyRunner", legacy_profile, ())
+    )
 
 
 def test_find_nearest_profile_cache_ignores_fresh_closure_initializer(monkeypatch):
@@ -2002,19 +2548,6 @@ def test_mla_decode_tuning_config_is_memoized(
             )
     finally:
         _mla_decode_tuning_config.cache_clear()
-
-
-def test_sparse_mla_tuning_config_initializer_indices():
-    """Sparse MLA configs retain each initializer's original input index."""
-
-    assert set(dict(_decode_dsv4_tuning_config().tensor_initializers)) == {
-        0,
-        1,
-        6,
-        8,
-        9,
-    }
-    assert set(dict(_decode_dsv3_2_tuning_config().tensor_initializers)) == {0, 1, 6}
 
 
 def test_find_nearest_profile_cache_dedups_mla_decode_config():

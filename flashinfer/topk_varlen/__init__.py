@@ -17,5 +17,8 @@
 The CuTe-DSL kernel source (GVR and radix Top-K for Blackwell sm_100+) lives in
 ``flashinfer.topk_varlen.kernels``.  The public ``top_k_varlen`` API is defined in
 ``flashinfer.topk_varlen.topk_varlen`` and re-exported from the top-level
-``flashinfer`` namespace.
+``flashinfer`` namespace. ``release_gvr2_resources`` frees the ``gvr_2``
+backend's per-device caches (default workspace slabs, hint-free anchor tables).
 """
+
+from .topk_varlen import release_gvr2_resources as release_gvr2_resources

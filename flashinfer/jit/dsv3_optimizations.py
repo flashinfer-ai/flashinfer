@@ -1,5 +1,34 @@
+from pathlib import Path
+
 from .core import JitSpec, gen_jit_spec
 from . import env as jit_env
+
+
+def _get_concat_mla_csrc_dir() -> Path:
+    installed = jit_env.FLASHINFER_CSRC_DIR
+    if (installed / "concat_mla.cu").is_file():
+        return installed
+    checkout = Path(__file__).resolve().parents[2] / "csrc"
+    if (checkout / "concat_mla.cu").is_file():
+        return checkout
+    raise FileNotFoundError(
+        "FlashInfer concat MLA sources were not found. Checked:\n"
+        f"  - {installed}\n"
+        f"  - {checkout}"
+    )
+
+
+def _get_concat_mla_include_dir() -> Path:
+    if jit_env.FLASHINFER_INCLUDE_DIR.exists():
+        return jit_env.FLASHINFER_INCLUDE_DIR
+    checkout = Path(__file__).resolve().parents[2] / "include"
+    if checkout.exists():
+        return checkout
+    raise FileNotFoundError(
+        "FlashInfer headers were not found. Checked:\n"
+        f"  - {jit_env.FLASHINFER_INCLUDE_DIR}\n"
+        f"  - {checkout}"
+    )
 
 
 def gen_concat_mla_module() -> JitSpec:
@@ -7,11 +36,13 @@ def gen_concat_mla_module() -> JitSpec:
 
     This kernel efficiently concatenates CKV and KPE tensors for MLA prefill attention
     """
+    csrc_dir = _get_concat_mla_csrc_dir()
     return gen_jit_spec(
         "concat_mla",
         [
-            jit_env.FLASHINFER_CSRC_DIR / "concat_mla.cu",
+            csrc_dir / "concat_mla.cu",
         ],
+        extra_include_paths=[csrc_dir, _get_concat_mla_include_dir()],
     )
 
 
