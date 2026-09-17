@@ -442,10 +442,12 @@ class QKRMSNormKernel:
         dtype: cutlass.Numeric,
         head_dim: int,
         weight_bias: float = 0.0,
+        sm_version: int | None = None,
     ):
         self.dtype = dtype
         self.head_dim = head_dim
         self.weight_bias = weight_bias
+        self.sm_version = sm_version if sm_version is not None else get_sm_version()
 
         elem_bytes = dtype.width // 8
         max_vec_size = COPY_BITS // 8 // elem_bytes
@@ -454,7 +456,7 @@ class QKRMSNormKernel:
         self.vec_size = min(h_align, max_vec_size)
         self.copy_bits = self.vec_size * dtype.width
 
-        self.threads_per_row = self._compute_threads_per_row(head_dim, get_sm_version())
+        self.threads_per_row = self._compute_threads_per_row(head_dim, self.sm_version)
         self.num_threads = RMSNormKernel._compute_num_threads(head_dim)
         self.rows_per_block = self.num_threads // self.threads_per_row
         self.warps_per_row = max(self.threads_per_row // 32, 1)
@@ -1199,11 +1201,15 @@ def _get_compiled_rmsnorm_kernel(
 
 @functools.cache
 def _get_compiled_qk_rmsnorm_kernel(
-    dtype_str: str, head_dim: int, weight_bias: float, enable_pdl: bool
+    dtype_str: str,
+    head_dim: int,
+    weight_bias: float,
+    enable_pdl: bool,
+    sm_version: int,
 ):
     """Get a compiled QKRMSNorm kernel for 3D tensors with arbitrary stride."""
     dtype = get_cutlass_dtype(dtype_str)
-    kernel_obj = QKRMSNormKernel(dtype, head_dim, weight_bias)
+    kernel_obj = QKRMSNormKernel(dtype, head_dim, weight_bias, sm_version=sm_version)
 
     # 64-bit B and N so the flattened row index B*N is not truncated.
     sym_b = cute.sym_int(64)
@@ -1381,7 +1387,7 @@ def qk_rmsnorm_cute(
 
     dtype_str = _torch_dtype_to_str(input.dtype)
     kernel = _get_compiled_qk_rmsnorm_kernel(
-        dtype_str, head_dim, weight_bias, enable_pdl
+        dtype_str, head_dim, weight_bias, enable_pdl, get_sm_version(input.device)
     )
 
     kernel(input, weight, output, batch_size, num_heads, eps)
