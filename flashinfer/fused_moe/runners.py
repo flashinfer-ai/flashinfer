@@ -4306,6 +4306,9 @@ class _TrtllmRunnerBase(MoERunner):
 
     _module: Any
     _inner: Any
+    _pair: tuple[QuantFormat, QuantFormat]
+    _num_weight_rows: int
+    _intermediate_size: int
 
     def _build(self) -> None:
         from .core import get_trtllm_moe_sm100_module
