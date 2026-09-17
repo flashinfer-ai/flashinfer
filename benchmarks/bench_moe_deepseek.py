@@ -866,7 +866,7 @@ def bench_trtllm(
                 )
             else:
                 hidden_states, hidden_states_scale = fp4_quantize(
-                    hidden_states, hidden_global_scale, sv, False, True
+                    hidden_states, hidden_global_scale, sv, False, False
                 )
                 per_token_scale = None
             hidden_states = hidden_states.view(torch.uint8).reshape(
@@ -927,6 +927,7 @@ def bench_trtllm(
         sc = torch.ones(num_local_experts, device=dev, dtype=torch.float32)
         moe_kwargs.update(
             gemm1_weights=w1f,
+            hidden_states_scale_layout=SfLayout.layout_linear,
             gemm1_weights_scale=w1s,
             gemm1_bias=None,
             gemm1_alpha=None,
