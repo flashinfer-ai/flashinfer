@@ -17,14 +17,19 @@ Regression coverage for normalization through the public prefill API.
 """
 
 import re
+import sys
+from types import ModuleType
 from unittest.mock import Mock
 
 import pytest
 import torch
 
+# GDN's varlen helpers also import CuTe DSL during module initialization.
+pytest.importorskip("cutlass.cute")
+
 import flashinfer.gdn_prefill as gdn_prefill
 from flashinfer import chunk_gated_delta_rule
-from flashinfer.gdn_kernels.qk_l2norm import normalize_qk
+from flashinfer.cute_dsl.availability import is_cute_dsl_arch_supported
 from flashinfer.utils import get_compute_capability
 
 
@@ -32,11 +37,13 @@ def _supported_device():
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
     device = torch.device("cuda")
-    major, _ = get_compute_capability(device)
+    major, minor = get_compute_capability(device)
     if major not in (9, 10, 12):
         pytest.skip("GDN prefill requires SM90, SM100, or SM12x")
     if major == 10 and int(torch.version.cuda.split(".")[0]) < 13:
         pytest.skip("SM100 GDN prefill requires CUDA 13+")
+    if not is_cute_dsl_arch_supported(major, minor):
+        pytest.skip("CuTe DSL does not support this GPU")
     return device
 
 
@@ -69,7 +76,11 @@ def test_prefill_normalization_preserves_backend_rejection(
         monkeypatch.setattr(gdn_prefill, "cp_delta_rule_dsl_sm90", None)
 
     normalize = Mock(side_effect=AssertionError("normalization must not run"))
-    monkeypatch.setattr("flashinfer.gdn_kernels.qk_l2norm.normalize_qk", normalize)
+    normalization_module = ModuleType("flashinfer.gdn_kernels.qk_l2norm")
+    normalization_module.normalize_qk = normalize
+    monkeypatch.setitem(
+        sys.modules, normalization_module.__name__, normalization_module
+    )
     q = torch.zeros(8, 1, 128, dtype=torch.float16)
     kwargs = dict(
         q=q,
@@ -90,6 +101,8 @@ def test_prefill_normalization_preserves_backend_rejection(
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_qk_normalization_reference_and_graph(dtype):
     device = _supported_device()
+    from flashinfer.gdn_kernels.qk_l2norm import normalize_qk
+
     torch.manual_seed(2026)
     q = torch.randn(37, 32, 128, device=device, dtype=dtype) * 3
     k = torch.randn(37, 16, 128, device=device, dtype=dtype) * 4
