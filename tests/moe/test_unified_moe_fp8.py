@@ -174,9 +174,7 @@ def _block_fp8_reference(
                         else gemm1_alpha[local_expert].float()
                     )
                     beta = (
-                        1.0
-                        if gemm1_beta is None
-                        else gemm1_beta[local_expert].float()
+                        1.0 if gemm1_beta is None else gemm1_beta[local_expert].float()
                     )
                     act = (
                         beta

@@ -191,11 +191,7 @@ def test_mxfp8_moe_trace_reference_applies_swiglu_oa_params():
     expected_clamp_only = x2 * torch.sigmoid(x2) * x1
     expected_oa = x2 * torch.sigmoid(1.702 * x2) * (x1 + 1.0)
     expected_situ = (
-        25.0
-        * torch.tanh(x1 / 25.0)
-        * 4.0
-        * torch.tanh(x2 / 4.0)
-        * torch.sigmoid(x2)
+        25.0 * torch.tanh(x1 / 25.0) * 4.0 * torch.tanh(x2 / 4.0) * torch.sigmoid(x2)
     )
 
     torch.testing.assert_close(default_out, noop_out, atol=1e-2, rtol=1e-2)

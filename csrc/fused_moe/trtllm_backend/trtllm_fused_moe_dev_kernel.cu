@@ -372,8 +372,7 @@ __global__ void activationDeepSeekKernel(KernelParams params) {
           // Padding lanes keep permutedIdx == -1 and contribute a zeroed x1/x2, so skip the
           // per-expert lookup for them instead of indexing ctaIdxXyToBatchIdx out of range.
           int const permutedIdx = permutedIdxArr[tokenInCtaIdx];
-          float out =
-              permutedIdx == -1 ? 0.0f : gatedActivation(params, permutedIdx, x1, x2);
+          float out = permutedIdx == -1 ? 0.0f : gatedActivation(params, permutedIdx, x1, x2);
           outArr[tokenInCtaIdx] = out;
           absOutArr[tokenInCtaIdx] = fabsf(out);
         }

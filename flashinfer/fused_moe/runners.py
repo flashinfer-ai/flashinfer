@@ -4911,7 +4911,10 @@ class TrtllmFp8BlockRunner(_TrtllmRunnerBase):
     }
 
     def _check_activation_parameters(self) -> None:
-        if isinstance(self.config.activation, SiTU) and self.config.activation.linear_scale is None:
+        if (
+            isinstance(self.config.activation, SiTU)
+            and self.config.activation.linear_scale is None
+        ):
             raise NotImplementedError(
                 f"{type(self).__name__} cannot represent SiTU(linear_scale=None)."
             )
