@@ -44,6 +44,10 @@ from flashinfer.gdn_decode import (
     gated_delta_rule_mtp,
 )
 from flashinfer.utils import get_compute_capability
+from tests.test_helpers.parametrize import (
+    parametrize_product,
+    pairwise_product_cases,
+)
 
 # Import BF16 state kernels (T=1 and MTP)
 try:
@@ -2658,15 +2662,25 @@ def test_gdn_decode_bf16_state_recovery_per_request_k(
 # Verifies bit-equivalence (within BF16 noise) against the two-call reference.
 
 
-@pytest.mark.parametrize("recovery_steps", [1, 2, "T-1"])
-@pytest.mark.parametrize("T", [4, 8])
-@pytest.mark.parametrize("batch_size", [2, 8, 32])
-@pytest.mark.parametrize(
-    "num_q_heads, num_k_heads, num_v_heads",
-    [(16, 16, 64)],
+@parametrize_product(
+    (
+        "recovery_steps",
+        "T",
+        "batch_size",
+        "num_q_heads,num_k_heads,num_v_heads",
+        "head_size",
+        "dtype",
+    ),
+    (
+        [1, 2, "T-1"],
+        [4, 8],
+        [2, 8, 32],
+        [(16, 16, 64)],
+        [128],
+        ["bfloat16"],
+    ),
+    regular=pairwise_product_cases,
 )
-@pytest.mark.parametrize("head_size", [128])
-@pytest.mark.parametrize("dtype", ["bfloat16"])
 def test_gdn_decode_bf16_state_fused_recovery_decode(
     dtype: str,
     head_size: int,
@@ -4084,8 +4098,11 @@ def test_gdn_decode_bf16_state_fla_scatter_random_slots(
         assert diff == 0, f"unused slot {s} clobbered: {diff}"
 
 
-@pytest.mark.parametrize("max_T", [2, 4, 8])
-@pytest.mark.parametrize("batch_size", [1, 4, 16, 64, 128])
+@parametrize_product(
+    "max_T,batch_size",
+    ([2, 4, 8], [1, 4, 16, 64, 128]),
+    regular=pairwise_product_cases,
+)
 def test_gdn_decode_fp32_state_fla_scatter_vs_dense(
     batch_size: int,
     max_T: int,

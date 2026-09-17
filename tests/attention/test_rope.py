@@ -17,6 +17,10 @@ limitations under the License.
 import pytest
 import torch
 from tests.test_helpers.rope_reference import *
+from tests.test_helpers.parametrize import (
+    parametrize_product,
+    pairwise_product_cases,
+)
 
 import flashinfer
 
@@ -514,34 +518,46 @@ def test_generalized_rope_quantize(
     )
 
 
-@pytest.mark.parametrize(
-    "attention_type,num_qo_heads,num_kv_heads,rope_dim,no_rope_dim",
-    [
-        # MLA: Multiple Q heads, single shared K/V head
-        ("mla", 128, 1, 64, 512),
-        ("mla", 64, 1, 128, 256),
-        ("mla", 128, 1, 64, 128),  # Explicit DeepSeek R1 MLA config case
-        ("mla", 32, 1, 32, 96),
-        # GQA: Multiple Q heads, fewer K/V heads (grouped)
-        ("gqa", 32, 8, 64, 64),
-        ("gqa", 64, 16, 128, 128),
-        ("gqa", 24, 6, 32, 96),
-        ("gqa", 32, 8, 128, 0),  # Llama3 8B standard config
-        ("gqa", 64, 8, 128, 0),  # Llama3 70B standard config
-        ("gqa", 64, 8, 64, 0),  # (plausible) GPT-OSS config
-        # MHA: Equal Q and K/V heads
-        ("mha", 32, 32, 64, 64),
-        ("mha", 16, 16, 128, 128),
-        ("mha", 8, 8, 32, 96),
-    ],
+@parametrize_product(
+    (
+        "attention_type,num_qo_heads,num_kv_heads,rope_dim,no_rope_dim",
+        "num_tokens",
+        "input_dtype",
+        "quant_dtype",
+        "enable_pdl",
+        "kv_layout",
+        "page_size",
+        "rope_idtype",
+    ),
+    (
+        [
+            # MLA: Multiple Q heads, single shared K/V head
+            ("mla", 128, 1, 64, 512),
+            ("mla", 64, 1, 128, 256),
+            ("mla", 128, 1, 64, 128),
+            ("mla", 32, 1, 32, 96),
+            # GQA: Multiple Q heads, fewer K/V heads (grouped)
+            ("gqa", 32, 8, 64, 64),
+            ("gqa", 64, 16, 128, 128),
+            ("gqa", 24, 6, 32, 96),
+            ("gqa", 32, 8, 128, 0),
+            ("gqa", 64, 8, 128, 0),
+            ("gqa", 64, 8, 64, 0),
+            # MHA: Equal Q and K/V heads
+            ("mha", 32, 32, 64, 64),
+            ("mha", 16, 16, 128, 128),
+            ("mha", 8, 8, 32, 96),
+        ],
+        [1, 19, 128, 199, 899, 2047],
+        [torch.float16, torch.bfloat16],
+        [torch.float8_e4m3fn, torch.float8_e5m2],
+        [True, False],
+        ["NHD", "HND"],
+        [16, 32],
+        [torch.int32, torch.int64],
+    ),
+    regular=pairwise_product_cases,
 )
-@pytest.mark.parametrize("num_tokens", [1, 19, 128, 199, 899, 2047])
-@pytest.mark.parametrize("input_dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("quant_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
-@pytest.mark.parametrize("enable_pdl", [True, False])
-@pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
-@pytest.mark.parametrize("page_size", [16, 32])
-@pytest.mark.parametrize("rope_idtype", [torch.int32, torch.int64])
 def test_generalized_rope_quantize_append_kv_cache(
     attention_type,
     num_qo_heads,

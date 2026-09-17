@@ -24,6 +24,10 @@ from tests.test_helpers.jit_utils import (
     gen_prefill_attention_modules,
 )
 from tests.test_helpers.utils_fp4 import create_nvfp4_kv, nvfp4_to_float
+from tests.test_helpers.parametrize import (
+    parametrize_product,
+    pairwise_product_cases,
+)
 from flashinfer.utils import get_compute_capability, has_flashinfer_jit_cache
 
 
@@ -248,16 +252,22 @@ def test_batch_attention_with_noncontiguous_q():
     get_compute_capability(torch.device(device="cuda"))[0] == 12,
     reason="Expected failure for SM120/121 for now since the tile size/number of stages is too large.",
 )
-@pytest.mark.parametrize("seq_len_pairs", _build_seq_len_configs())
-@pytest.mark.parametrize("page_block_size", [1, 8, 16])
-@pytest.mark.parametrize("num_kv_heads", [1, 4])
-@pytest.mark.parametrize("gqa_group_size", [1, 4, 7, 8])
-@pytest.mark.parametrize("head_dim", [64, 128, 256])
-@pytest.mark.parametrize("v_scale", [2.0, None])
-@pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("layout", ["HND", "NHD"])
-@pytest.mark.parametrize("test_dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("logits_soft_cap", [0.0, 50.0])
+@parametrize_product(
+    "seq_len_pairs,page_block_size,num_kv_heads,gqa_group_size,head_dim,v_scale,causal,layout,test_dtype,logits_soft_cap",
+    (
+        _build_seq_len_configs(),
+        [1, 8, 16],
+        [1, 4],
+        [1, 4, 7, 8],
+        [64, 128, 256],
+        [2.0, None],
+        [False, True],
+        ["HND", "NHD"],
+        [torch.bfloat16, torch.float16],
+        [0.0, 50.0],
+    ),
+    regular=pairwise_product_cases,
+)
 def test_batch_attention_correctness(
     seq_len_pairs,
     page_block_size,
