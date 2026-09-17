@@ -50,7 +50,8 @@ moves it into `include/flashinfer/moe_route_permute.cuh` with a namespace-qualif
 launcher. Python AST and normalized CUDA-body equivalence were checked. This
 final layout additionally passes all 26 new routing and 36 existing finalizer
 cases in normal/memcheck/racecheck on each GPU, including 12 captured route
-checks per architecture. Timing of the final file layout was not repeated.
+checks per architecture. The eight-case timing table predates that relocation;
+the fixed-geometry experiment below additionally measures the published layout.
 
 Reproduce the targeted module checks from the repository root:
 
@@ -80,6 +81,52 @@ not a new kernel optimization, and it is not included in the routing-gain table.
 Best-to-best swap-AB tests have not beaten ordinary Frost configurations;
 the fixed-geometry swap observation retained below is historical. Current
 counter work and grid-size experiments do not yet establish a hardware roof.
+
+### Fixed fast geometry: separating integration gains from tuning
+
+On RTX5090, T1 packed with the same fixture above, hold both GEMMs fixed:
+FC1 M16/N64/K128, warps 1x4, static scheduling; FC2 M32/N128/K128,
+warps 1x8, dynamic scheduling. The published `de982b1` runtime gives:
+
+| Routing / finalization | Full MoE, us | Reduction from baseline |
+|---|---:|---:|
+| Existing router / existing finalizer |62.700|0%|
+| Fused router / existing finalizer |60.752|3.11%|
+| Existing router / native finalizer |61.620|1.72%|
+| Fused router / native finalizer |59.644|4.87%|
+
+All four arms have identical generated FC1/FC2 source hashes and pass normal,
+unfiltered memcheck and racecheck, followed by eight fresh mirrored timing
+processes: 136 output checks, 60 skipped-replay negative controls and 768 raw
+full-MoE spans. Thus the combined 4.87% reduction excludes configuration-search
+credit. It includes adoption of NVIDIA TensorRT-LLM's finalizer and our routing
+fusion, not solely new GEMM code.
+
+A separate selected-backend comparison measures **Frost 59.762 us versus
+CUTLASS 61.466 us**, or **2.77% lower latency**, for this same T1 packed shape
+on a 600 W RTX5090. The search attempted all 8x8 offered stage combinations;
+two FC1 tactics exceed shared-memory capacity, and all 6x8 supported joint
+pairs were measured. The selected pair then passed independent normal,
+unfiltered memcheck/racecheck and four fresh ABBA processes (148 output checks,
+21 negative controls, 768 spans). Actual native symbols and library hashes
+match the selected search result. Unused tactic enumeration is outside this
+selected replay gate; its earlier sanitizer CUDA API errors remain failures.
+This comparison uses the integration before file relocation. CUTLASS's two
+GEMMs remain slightly faster; routing and finalization give Frost the full-MoE
+advantage. This is a small fixture-specific benefit, not model-level evidence.
+
+### Weight preparation and timing boundary
+
+The B200 TRT-LLM BF16 comparator uses the public `prepare_weights` path:
+FC1 gate/up row interleaving plus an MMA row shuffle (`epilogue_tile_m=128`),
+FC2 MMA row shuffle, then `BlockMajorK` conversion of both matrices using
+128-byte K blocks. These are byte-preserving permutations; weights remain BF16.
+Both backends prepare weights before timing. Frost BF16 currently splits and
+copies gate/up and concatenates gate/up for its fused FC1 route; it does not use
+the TRT-LLM MMA shuffle or BlockMajorK layout. Its prepared pack currently
+duplicates FC1 storage. Preparation latency, peak memory and dynamic weight
+replacement have not been benchmarked, so this evidence supports steady-state
+inference only. SM120's comparator is CUTLASS, not this TRT-LLM path.
 
 NVIDIA TensorRT-LLM retains credit for the native finalizer and fallback router;
 FlashInfer provides the contracts, JIT and permutation infrastructure. The new
