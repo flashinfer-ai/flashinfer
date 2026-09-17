@@ -1981,10 +1981,10 @@ if __name__ == "__main__":
     # Quick smoke: one config per entry (head_dim 128, e4m3, fp16, MHA) plus a
     # couple of cheap negative checks.
     test_single_prefill_token_head_scale(
-        128, torch.float8_e4m3fn, torch.float16, False, False
+        128, torch.float8_e4m3fn, torch.float16, False, False, "HND"
     )
     test_batch_prefill_ragged_token_head_scale(
-        128, torch.float8_e4m3fn, torch.float16, False, False
+        128, torch.float8_e4m3fn, torch.float16, False, False, "HND"
     )
     test_batch_prefill_paged_token_head_scale(
         128, torch.float8_e4m3fn, torch.float16, False, False, "HND"
