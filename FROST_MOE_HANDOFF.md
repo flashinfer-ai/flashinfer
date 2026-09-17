@@ -1,3 +1,54 @@
+## Paired FC1 row-range extension and current SM120 evidence — 2026-09-17
+
+Engine20401 now accepts1..513 routed rows, retaining the same generic compact
+persistent kernel, public knob vocabulary and FP32 SwiGLU/BF16-output semantics.
+This is an admission extension with wider validation, not a new MMA kernel or
+a sweep-based optimization. It enables explicit paired FC1 for T8 and T64 at
+top8. Engine20402 remains limited to1..8 routed rows. Ordinary20400 remains
+available; enumerate/tune the full eligible configuration set before choosing.
+
+On one1000W B200, BF16 E128/top8/H2048/I768, full synthetic FI MoE:
+
+| Tokens / routing | Ordinary FC1 | Paired FC1 | Latency reduction |
+|---|---:|---:|---:|
+| T8 / unpacked |122.884500 us|116.789750 us|4.960%|
+| T8 / packed |123.106000 us|116.486000 us|5.377%|
+| T64 / unpacked |212.322750 us|206.230500 us|2.869%|
+| T64 / packed |212.286375 us|206.279125 us|2.830%|
+
+Both arms use ordinary static128x128 FC2. Ordinary FC1 uses the previously
+audited dynamic64x64 configuration; this is not a fresh best-configuration
+sweep or a current TRT/CUTLASS comparison. Paired FC1 also removes the separate
+FC1 counter reset. PDL intervals overlap: stage medians must not be summed.
+Weight preparation is outside replay. Four fresh ABBA processes per case,
+normal/memcheck/racecheck, retained parents and live input/routing/scale/weight
+changes pass independent audit1962 (592 raw outputs,240 negative controls,
+1536 cold-L2 spans). Public graph audit1958 passes45 zero-skip test executions,
+390 raw outputs,117 changed-reference controls and78 paired routes, covering
+R9/17/64/512/513, pitched weights, skewed groups and persistent multiwave work.
+The three runtime/test files match validated archive
+`74acba5290f6f58056f7163b99f77ddbb81110c267bdd00d514cf4dd143ad87a`.
+
+Current SM120 BF16 T1/E128/top8/H2048/I768 packed comparison, on600W RTX PRO6000
+Blackwell Server, measures Frost84.904125us versus CUTLASS87.9780625us (-3.494%).
+All64 CUTLASS FC1/FC2 tactic pairs were searched; winner(4,11) passes sanitizers
+and four fresh ABBA processes (audit1965). This is current workload-specific
+evidence, not a new SM120 code optimization or a transfer of RTX5090 timings.
+Frost's routing/finalization explains the advantage; its GEMMs are slightly
+slower. Same-fixture NCU audit1979 observes FC1 DRAM throughput83.77% of peak
+versus CUTLASS84.76%, FC2 70.58% versus75.59%, with near-identical DRAM bytes.
+These counters guide bandwidth/integration work; they do not establish a roof.
+
+The small-R scheduler specialization and FC2+finalize fusion remain separate
+experiments. Packed scheduler metadata reduced fullFI latency by only0.17-0.25%
+despite a component gain; it is not promoted. These results do not change the
+published T1 B200 comparison of29.484375us Frost versus28.620375us TRT-LLM.
+No model-E2E or full-repository-CI success is claimed. Historical sections below
+retain their original source scope; this section supersedes their pending status.
+
+Credit: NVIDIA Frost/FlashInfer/TRT-LLM, Yanqin Zhai PR1090 and Yanqin/Yihua's
+parallel work, KF624/2f5c, CUTLASS113 and canonical rank5/early-PDL contributions.
+
 ## Current paired Frost versus tuned TRT-LLM — 2026-09-17
 
 The published compact-resource FC1/FC2 implementation now measures **29.484375 us**
