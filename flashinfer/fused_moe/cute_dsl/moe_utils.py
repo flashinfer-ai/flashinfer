@@ -263,6 +263,7 @@ def moe_unpermute(
     input_is_expanded: bool = False,
     round_scales_to_bf16: bool = False,
     use_wide_tiling: bool = False,
+    use_native_finalize: bool = False,
 ) -> None:
     """
     Unpermute and scale outputs after expert computation.
@@ -297,6 +298,13 @@ def moe_unpermute(
             Input and output data pointers must be 16-byte aligned.
             Other callers retain the existing kernel by default.
 
+        use_native_finalize: Reuse NVIDIA TensorRT-LLM's BF16 finalizer on
+            SM100/SM120, with FP32 scales and Int32 permutation indices.
+            Requires contiguous, 16-byte aligned tensors, PDL off and permuted
+            input. Top-k must be 1..64. The vector route requires hidden size
+            divisible by 8. Packed weight rounding is fused when requested.
+            This option is mutually exclusive with use_wide_tiling.
+
     Note:
         Output is the weighted sum of expert contributions:
         output[i] = sum(topk_scales[i, k] * expert_output[i, k] for k in range(top_k))
@@ -315,6 +323,67 @@ def moe_unpermute(
         scale_suffix = "bf16"
     else:
         raise ValueError(f"Unsupported scale dtype: {topk_scales.dtype}")
+
+    if use_native_finalize:
+        if (
+            enable_pdl
+            or input_is_expanded
+            or use_wide_tiling
+            or permuted_input.dtype != torch.bfloat16
+            or output.dtype != torch.bfloat16
+            or topk_scales.dtype != torch.float32
+            or expanded_idx_to_permuted_idx.dtype != torch.int32
+        ):
+            raise ValueError(
+                "Native finalize requires BF16 data, FP32 scales, Int32 indices, "
+                "permuted input and PDL off; wide tiling is mutually exclusive"
+            )
+        tensors = (permuted_input, output, expanded_idx_to_permuted_idx, topk_scales)
+        if not all(
+            t.is_cuda and t.is_contiguous() and t.device == output.device
+            for t in tensors
+        ):
+            raise ValueError(
+                "Native finalize requires contiguous tensors on one CUDA device"
+            )
+        if torch.cuda.get_device_capability(output.device)[0] not in (10, 12):
+            raise ValueError("Native finalize requires SM100 or SM120 family")
+        if (
+            permuted_input.ndim != 2
+            or output.shape != (num_tokens, hidden_size)
+            or num_tokens <= 0
+            or not 0 < hidden_size < 2**27
+            or not 1 <= top_k <= 64
+            or expanded_idx_to_permuted_idx.numel() != num_tokens * top_k
+            or topk_scales.numel() != num_tokens * top_k
+        ):
+            raise ValueError(
+                "Native finalize received inconsistent shapes or unsupported dimensions"
+            )
+        if any(t.numel() >= 2**31 for t in tensors):
+            raise ValueError("Native finalize uses Int32 scalar indexing")
+        if any(t.data_ptr() % 16 for t in tensors):
+            raise ValueError("Native finalize requires 16-byte aligned storage")
+        # Match the native scalar/vector boundary. BF16 vector loads need eight
+        # elements per 16-byte transaction; scalar tails remain supported.
+        vector = ((hidden_size + 255) // 256) * min(8192, num_tokens) >= 1184
+        if vector and hidden_size % 8:
+            raise ValueError(
+                "Native vector finalize requires hidden size divisible by eight"
+            )
+        with torch.cuda.device(output.device):
+            module["flashinfer_moe_unpermute_bf16_float_scale_native"](
+                permuted_input.data_ptr(),
+                output.data_ptr(),
+                expanded_idx_to_permuted_idx.data_ptr(),
+                topk_scales.data_ptr(),
+                num_tokens,
+                hidden_size,
+                top_k,
+                round_scales_to_bf16,
+                _get_cuda_stream_ptr(),
+            )
+        return
 
     if use_wide_tiling:
         if (

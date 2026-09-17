@@ -92,6 +92,10 @@ def gen_moe_utils_module() -> JitSpec:
         "moe_utils",
         [
             jit_env.FLASHINFER_CSRC_DIR / "moe_utils_binding.cu",
+            # Reuse the existing NVIDIA TRT-LLM finalizer without loading the
+            # complete TRT MoE/GEMM module. Rounded weights fuse in this kernel.
+            jit_env.FLASHINFER_CSRC_DIR
+            / "fused_moe/trtllm_backend/trtllm_fused_moe_dev_kernel.cu",
             jit_env.FLASHINFER_CSRC_DIR
             / "nv_internal/tensorrt_llm/kernels/cuteDslKernels/moeUtils.cu",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/envUtils.cpp",

@@ -193,3 +193,44 @@ The PDL label refers to the public FI API flag; Frost's generated launchers
 control their own PDL setting. It should not be read as all kernels disabling
 PDL. These qualifications do not change the previously reported arithmetic
 or the acknowledgements above.
+
+### Native finalizer reuse and attribution
+
+The BF16 finalizer implementation comes from NVIDIA TensorRT-LLM, as preserved
+in FlashInfer's existing
+[`trtllm_fused_moe_dev_kernel.cu`](https://github.com/flashinfer-ai/flashinfer/blob/d75167cfc927c11aac42954fb6cb0ce7e304f7ee/csrc/fused_moe/trtllm_backend/trtllm_fused_moe_dev_kernel.cu),
+including its original
+copyright and license. This follow-up reuses that implementation through the
+existing `moe_utils` JIT module. FlashInfer's staged finalize binding provides
+the integration reference.
+
+Our additions are the checked helper interface, Frost adapter wiring and fused
+FP32-to-BF16 routing-weight rounding required by `PackedPrecomputed`. The rounding
+is performed inside the existing scalar/vector kernels and retains live weights
+on every CUDA Graph replay. Kernel authorship remains with NVIDIA TensorRT-LLM;
+our contribution is the integration and this numeric-contract adaptation.
+
+Yanqin Zhai's PR1090 implementation and Yanqin/Yihua's collaboration retain the
+separate attribution above. Each performance claim should name the tested GPU,
+fixture, baseline and scope; component timing and complete MoE timing are separate.
+
+The new helper option is append-only and defaults off. The Frost adapter selects
+it for BF16 H2048/top-k8 with 1..64 tokens; it preserves the existing wide-finalizer
+selection elsewhere. The reused native kernel remains responsible for scalar or
+vector dispatch. Unsupported metadata is rejected before its launch.
+
+The proposed combined `moe_utils` module passed the targeted native-finalizer and
+existing scale-rounding tests on B200 and RTX5090, including CUDA Graph replay,
+memcheck and racecheck. SM90 target compilation also passed; this is not Hopper
+execution coverage. Reproduce the targeted checks from the FI repository root:
+
+```bash
+pytest -q tests/moe/test_moe_native_finalize.py tests/moe/test_moe_unpermute_round_scales.py
+compute-sanitizer --tool memcheck --target-processes all --error-exitcode 86 python -m pytest -q tests/moe/test_moe_native_finalize.py tests/moe/test_moe_unpermute_round_scales.py
+compute-sanitizer --tool racecheck --target-processes all --error-exitcode 86 python -m pytest -q tests/moe/test_moe_native_finalize.py tests/moe/test_moe_unpermute_round_scales.py
+```
+
+Complete-MoE performance confirmation of this combined module is still running.
+Earlier standalone-finalizer experiments motivated the change; their timings
+must not be described as timings of this assembled source. This remains a draft
+for asynchronous review; no new competing-backend or model-level win is claimed.

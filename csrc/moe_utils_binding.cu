@@ -24,6 +24,7 @@
 #include <cuda_fp4.h>
 #endif
 
+#include "flashinfer/trtllm/fused_moe/DevKernel.h"
 #include "flashinfer/trtllm/fused_moe/RoutingKernel.h"
 #include "tensorrt_llm/kernels/cuteDslKernels/moeUtils.h"
 #include "tvm_ffi_utils.h"
@@ -195,6 +196,36 @@ void moe_unpermute_bf16_float_scale_tiled(int64_t input_ptr, int64_t output_ptr,
                                    top_k, expanded, round_scales, stream);
 }
 
+// Reuse NVIDIA TensorRT-LLM's native finalizer. The BF16 path does not read
+// totalNumPaddedTokens; that field is used only by the DeepSeek FP8 finalizer.
+void moe_unpermute_bf16_float_scale_native(int64_t input_ptr, int64_t output_ptr,
+                                           int64_t inverse_ptr, int64_t scales_ptr,
+                                           int32_t num_tokens, int32_t hidden_size, int32_t top_k,
+                                           bool round_scales_to_bf16, int64_t cuda_stream_ptr) {
+  namespace tg = batchedGemm::trtllm::gen;
+  moe::dev::finalize::Data data;
+  data.mDtypeElt = tg::Dtype::Bfloat16;
+  data.mDtypeExpW = tg::Dtype::Fp32;
+  data.mUsePdl = false;
+  data.mUseDeepSeekFp8 = false;
+  data.inPtr = reinterpret_cast<void*>(input_ptr);
+  data.outPtr = reinterpret_cast<void*>(output_ptr);
+  data.expertWeightsPtr = reinterpret_cast<void*>(scales_ptr);
+  data.expandedIdxToPermutedIdx = reinterpret_cast<int32_t*>(inverse_ptr);
+  data.totalNumPaddedTokens = nullptr;
+  data.numTokens = num_tokens;
+  data.numExperts = 0;  // Not read by the BF16 finalizer.
+  data.topK = top_k;
+  data.hiddenDim = hidden_size;
+  data.hiddenDimPadded = hidden_size;
+  cudaStream_t stream =
+      cuda_stream_ptr != 0 ? reinterpret_cast<cudaStream_t>(cuda_stream_ptr) : get_current_stream();
+  if (round_scales_to_bf16)
+    moe::dev::finalize::run_rounded(data, stream);
+  else
+    moe::dev::finalize::run(data, stream);
+}
+
 void moe_unpermute_bf16_bf16_scale(int64_t permuted_input_ptr, int64_t output_ptr,
                                    int64_t expanded_idx_to_permuted_idx_ptr,
                                    int64_t topk_scales_ptr, int32_t num_tokens, int32_t hidden_size,
@@ -343,6 +374,8 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(flashinfer_moe_unpermute_bf16_float_scale_rounded,
                               moe_unpermute_bf16_float_scale_rounded);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(flashinfer_moe_unpermute_bf16_float_scale_tiled,
                               moe_unpermute_bf16_float_scale_tiled);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(flashinfer_moe_unpermute_bf16_float_scale_native,
+                              moe_unpermute_bf16_float_scale_native);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(flashinfer_moe_unpermute_bf16_bf16_scale,
                               moe_unpermute_bf16_bf16_scale);
 #endif

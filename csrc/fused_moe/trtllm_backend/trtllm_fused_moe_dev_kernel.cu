@@ -674,7 +674,7 @@ namespace tg = batchedGemm::trtllm::gen;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <typename KernelParams>
+template <typename KernelParams, bool RoundWeightsToBf16 = false>
 __global__ void finalizeKernel(KernelParams params) {
   using Type = typename KernelParams::Type;
   using TypeExpW = typename KernelParams::TypeExpW;
@@ -703,7 +703,11 @@ __global__ void finalizeKernel(KernelParams params) {
         }
 
         if (params.expertWeightsPtr != nullptr) {
-          TypeExpW const scale = params.expertWeightsPtr[expandedIdx];
+          float scale = float{params.expertWeightsPtr[expandedIdx]};
+          // FI PackedPrecomputed contract: preserve BF16 rounding of live FP32 weights.
+          if constexpr (RoundWeightsToBf16) {
+            scale = __bfloat162float(__float2bfloat16_rn(scale));
+          }
           data +=
               float{scale} * float{params.inPtr[permutedIdx * params.hiddenDimPadded + hiddenIdx]};
         } else {
@@ -838,7 +842,7 @@ struct FinalizeTraits<4, TypeExpW_> {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <typename KernelParams>
+template <typename KernelParams, bool RoundWeightsToBf16 = false>
 __global__ void finalizeKernelVecLoad(KernelParams params) {
   using Type = typename KernelParams::Type;
   using TypeExpW = typename KernelParams::TypeExpW;
@@ -929,6 +933,10 @@ __global__ void finalizeKernelVecLoad(KernelParams params) {
           continue;
         }
         auto scale = useScale ? scaleFloatArr[ki] : 1.0f;
+        // Adaptation of NVIDIA TRT-LLM's finalizer, matching FI packed semantics.
+        if constexpr (RoundWeightsToBf16) {
+          scale = __bfloat162float(__float2bfloat16_rn(scale));
+        }
         ComputeElem expertResult = arrayConvert<InputElem, ComputeElem>(inputElemArr[ki]);
         threadOutput = threadOutput + scale * expertResult;
       }
@@ -1038,6 +1046,46 @@ void run(Data const& data, void* stream) {
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Adaptation of the NVIDIA TRT-LLM kernels and scheduling, with
+// FP32-to-BF16 weight rounding fused before accumulation. No conversion launch.
+// PDL-off and BF16 data / FP32 weights are checked by the Python boundary.
+template <int Unroll>
+void launchRounded(Data const& data, void* stream) {
+  using Params = KernelParams<cutlass::bfloat16_t, float, Unroll, false>;
+  auto params = Params::setKernelParams(data);
+  int const blocksX = (data.hiddenDim + 255) / 256;
+  int const blocksY = std::min(8192, data.numTokens);
+  bool const vector = blocksX * blocksY >= 1184;
+  cudaLaunchConfig_t config{};
+  config.gridDim = vector ? dim3(data.numTokens) : dim3(blocksX, blocksY);
+  config.blockDim = 256;
+  config.stream = static_cast<cudaStream_t>(stream);
+  cudaLaunchAttribute attributes[2] = {};
+  attributes[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attributes[0].val.programmaticStreamSerializationAllowed = 0;
+  attributes[1].id = cudaLaunchAttributeCooperative;
+  attributes[1].val.cooperative = 0;
+  config.attrs = attributes;
+  config.numAttrs = 2;
+  if (vector) {
+    CHECK_CUDA_ERROR(cudaLaunchKernelEx(&config, finalizeKernelVecLoad<Params, true>, params));
+  } else {
+    CHECK_CUDA_ERROR(cudaLaunchKernelEx(&config, finalizeKernel<Params, true>, params));
+  }
+}
+
+void run_rounded(Data const& data, void* stream) {
+  FLASHINFER_CHECK(data.mDtypeElt == tg::Dtype::Bfloat16 && data.mDtypeExpW == tg::Dtype::Fp32 &&
+                       !data.mUsePdl && !data.mUseDeepSeekFp8 && data.topK > 0 && data.topK <= 64,
+                   "Rounded finalizer requires BF16 data, FP32 weights, top-k 1..64 and PDL off");
+  if (data.topK % 4 == 0)
+    launchRounded<4>(data, stream);
+  else if (data.topK % 2 == 0)
+    launchRounded<2>(data, stream);
+  else
+    launchRounded<1>(data, stream);
+}
 
 }  // namespace finalize
 

@@ -665,6 +665,11 @@ class CudnnMoeRunner(MoERunner):
             r,
             enable_pdl=False,
             round_scales_to_bf16=inputs[8],
+            # Reuse the NVIDIA TRT-LLM finalizer for the measured small-token
+            # H2048/top8 region; preserve the routing mode's scale precision.
+            use_native_finalize=(
+                0 < x.shape[0] <= 64 and output.shape[1] == 2048 and r == 8
+            ),
             use_wide_tiling=(
                 (
                     0 < x.shape[0] <= 1024

@@ -444,6 +444,9 @@ struct KernelParams {
 
 void run(Data const& data, void* stream);
 
+// Preserve PackedPrecomputed BF16 weight rounding without a conversion kernel.
+void run_rounded(Data const& data, void* stream);
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 }  // namespace finalize
