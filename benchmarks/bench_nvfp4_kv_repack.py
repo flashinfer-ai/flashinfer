@@ -272,6 +272,9 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     source = Path(flashinfer.__file__).resolve().parents[1]
+    args.output = args.output.resolve()
+    if args.output.is_relative_to(source):
+        parser.error("--output must be outside the source checkout")
     result = {
         "git_commit": source_commit(source),
         "source": str(source),
