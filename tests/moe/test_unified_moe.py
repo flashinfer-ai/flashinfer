@@ -2823,7 +2823,7 @@ def _bf16_check(out, ref, label):
 
 @sm100_required
 def test_bf16_gate_up_row_order_is_up_then_gate():
-    """Every BF16 backend reads canonical gated ``w1`` rows as ``[up, gate]``.
+    """TRT-LLM and CUTLASS BF16 read canonical gated ``w1`` rows as ``[up, gate]``.
 
     Random weights let a backend and a reference that share the same swapped
     reading agree; scaling the halves apart makes ``[gate, up]`` fail loudly.
