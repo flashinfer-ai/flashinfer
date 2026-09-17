@@ -156,6 +156,15 @@ class Mxfp4MoEPlan:
                 route_ids=self._route_ids,
                 route_weights=self._route_weights,
                 output=self.output,
+                moe_sort_buffers=(
+                    None
+                    if self._kwargs["enable_pdl"]
+                    else self._kwargs["moe_sort_buffers"]
+                ),
+                num_experts=self._kwargs["num_experts"],
+                num_local_experts=self._kwargs["num_local_experts"],
+                local_expert_offset=self._kwargs["local_expert_offset"],
+                tile_size=self._kwargs["tile_size"],
             )
             # Preprocessing warmup clears output. Finish the complete MoE so
             # plan retains its existing valid-output postcondition.
@@ -174,7 +183,11 @@ class Mxfp4MoEPlan:
                 self._prepare_routing()
             else:
                 self._route_preprocess.run(stream)
-            self._sort(*self._sort_args, stream_ptr)
+            if (
+                self._route_preprocess is None
+                or not self._route_preprocess.sorts_tokens
+            ):
+                self._sort(*self._sort_args, stream_ptr)
             self._gather(*self._gather_args, stream=stream, **self._gather_kwargs)
             if self._route_preprocess is None:
                 self._memset(*self._memset_args, stream_ptr)

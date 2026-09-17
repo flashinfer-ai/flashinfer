@@ -12,19 +12,33 @@
 """Fused MXFP4 MoE decode preprocessing; minimum architecture SM100 (B300: SM103).
 
 For T=1..16, unpack global expert IDs, convert BF16 router weights to FP32,
-and clear the combined BF16 output in one launch. Planning compiles and binds
-caller-owned buffers outside capture; execution uses the supplied CUDA stream.
+optionally sort assignments into compact expert tiles, and clear the combined
+BF16 output in one launch. Planning compiles and binds caller-owned buffers
+outside capture; execution uses the supplied CUDA stream.
 """
 
 import cutlass
 import cutlass.cute as cute
+import cutlass.utils as utils
+from cutlass._mlir.dialects import llvm
+from cutlass.cutlass_dsl import T, dsl_user_op
 import cuda.bindings.driver as cuda
 import torch
 
 from ...cute_dsl.utils import make_ptr
+from .moe_utils import get_max_num_tiles
 
 
 _route_preprocess_kernel_cache = {}
+
+_SORT_BUFFER_NAMES = (
+    "out_tile_idx_to_expert_idx",
+    "out_tile_idx_to_mn_limit",
+    "out_expanded_idx_to_permuted_idx",
+    "out_permuted_idx_to_expanded_idx",
+    "out_total_num_padded_tokens",
+    "out_num_non_exiting_tiles",
+)
 
 
 class _RoutePreprocess:
@@ -110,11 +124,239 @@ class _RoutePreprocess:
             output_words[word] = cutlass.Uint32(0)
 
 
+@dsl_user_op
+def _routing_shared_add(
+    address: cutlass.Int32, value: cutlass.Int32, *, loc=None, ip=None
+):
+    # Same narrow primitive used by FlashInfer's existing shared histograms.
+    # The address is already in the 32-bit shared-memory address space.
+    return cutlass.Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                cutlass.Int32(address).ir_value(loc=loc, ip=ip),
+                cutlass.Int32(value).ir_value(loc=loc, ip=ip),
+            ],
+            "atom.shared.add.s32 $0, [$1], $2;",
+            "=r,r,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@cute.jit
+def _routing_warp_inclusive(value: cutlass.Int32, lane: cutlass.Int32):
+    for step in cutlass.range_constexpr(5):
+        offset = 1 << step
+        other = cute.arch.shuffle_sync_up(value, offset=offset, mask_and_clamp=0)
+        if lane >= offset:
+            value += other
+    return value
+
+
+class _FusedRoutePreprocess:
+    def __init__(self, mode, threads):
+        self.packed = mode == "packed"
+        self.convert_weights = mode != "separate_fp32"
+        self.threads = threads
+        self.warps = threads // 32
+
+    @cute.jit
+    def __call__(
+        self,
+        ids_src_ptr: cute.Pointer,
+        weights_src_ptr: cute.Pointer,
+        ids_dst_ptr: cute.Pointer,
+        weights_dst_ptr: cute.Pointer,
+        output_ptr: cute.Pointer,
+        tile_expert_ptr: cute.Pointer,
+        tile_limit_ptr: cute.Pointer,
+        expanded_ptr: cute.Pointer,
+        permuted_ptr: cute.Pointer,
+        padded_total_ptr: cute.Pointer,
+        active_total_ptr: cute.Pointer,
+        tokens: cutlass.Int32,
+        top_k: cutlass.Int32,
+        hidden: cutlass.Int32,
+        num_experts: cutlass.Int32,
+        local_experts: cutlass.Int32,
+        local_offset: cutlass.Int32,
+        tile_size: cutlass.Int32,
+        tile_capacity: cutlass.Int32,
+        ids_row_stride: cutlass.Int32,
+        ids_col_stride: cutlass.Int32,
+        weights_row_stride: cutlass.Int32,
+        weights_col_stride: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        ids_src = cute.make_tensor(
+            ids_src_ptr,
+            cute.make_layout((tokens, top_k), stride=(ids_row_stride, ids_col_stride)),
+        )
+        weights_src = cute.make_tensor(
+            weights_src_ptr,
+            cute.make_layout(
+                (tokens, top_k), stride=(weights_row_stride, weights_col_stride)
+            ),
+        )
+        ids_dst = cute.make_tensor(ids_dst_ptr, cute.make_layout((tokens * top_k,)))
+        weights_dst = cute.make_tensor(
+            weights_dst_ptr, cute.make_layout((tokens * top_k,))
+        )
+        output = cute.make_tensor(
+            output_ptr, cute.make_layout((tokens * (hidden // 2),))
+        )
+        tile_expert = cute.make_tensor(
+            tile_expert_ptr, cute.make_layout((tile_capacity,))
+        )
+        tile_limit = cute.make_tensor(
+            tile_limit_ptr, cute.make_layout((tile_capacity,))
+        )
+        expanded = cute.make_tensor(expanded_ptr, cute.make_layout((tokens * top_k,)))
+        permuted = cute.make_tensor(
+            permuted_ptr, cute.make_layout((tile_capacity * tile_size,))
+        )
+        padded_total = cute.make_tensor(padded_total_ptr, cute.make_layout((1,)))
+        active_total = cute.make_tensor(active_total_ptr, cute.make_layout((1,)))
+        self.kernel(
+            ids_src,
+            weights_src,
+            ids_dst,
+            weights_dst,
+            output,
+            tile_expert,
+            tile_limit,
+            expanded,
+            permuted,
+            padded_total,
+            active_total,
+            num_experts,
+            local_experts,
+            local_offset,
+            tile_size,
+        ).launch(
+            grid=(cute.ceil_div(cute.size(output), self.threads), 1, 1),
+            block=(self.threads, 1, 1),
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        ids_src: cute.Tensor,
+        weights_src: cute.Tensor,
+        ids_dst: cute.Tensor,
+        weights_dst: cute.Tensor,
+        output: cute.Tensor,
+        tile_expert: cute.Tensor,
+        tile_limit: cute.Tensor,
+        expanded: cute.Tensor,
+        permuted: cute.Tensor,
+        padded_total: cute.Tensor,
+        active_total: cute.Tensor,
+        num_experts: cutlass.Int32,
+        local_experts: cutlass.Int32,
+        local_offset: cutlass.Int32,
+        tile_size: cutlass.Int32,
+    ):
+        tid, _, _ = cute.arch.thread_idx()
+        block, _, _ = cute.arch.block_idx()
+        lane = tid % 32
+        warp = tid // 32
+        smem = utils.SmemAllocator()
+        counts = smem.allocate_tensor(cutlass.Int32, cute.make_layout((self.threads,)))
+        bases = smem.allocate_tensor(cutlass.Int32, cute.make_layout((self.threads,)))
+        warp_sums = smem.allocate_tensor(cutlass.Int32, cute.make_layout((self.warps,)))
+
+        # The branch is uniform across the entire CTA. Each barrier below has
+        # all threads of CTA0 participating; no named or cluster barriers.
+        if block == 0:
+            counts[tid] = cutlass.Int32(0)
+            cute.arch.sync_threads()
+            local = cutlass.Int32(-1)
+            rank = cutlass.Int32(-1)
+            if tid < cute.size(expanded):
+                token = tid // ids_src.shape[1]
+                slot = tid % ids_src.shape[1]
+                expert = ids_src[(token, slot)]
+                if cutlass.const_expr(self.packed):
+                    expert = expert >> 16
+                    ids_dst[tid] = expert
+                if cutlass.const_expr(self.convert_weights):
+                    weights_dst[tid] = weights_src[(token, slot)].to(cutlass.Float32)
+                local = expert - local_offset
+                expanded[tid] = cutlass.Int32(-1)
+                if (
+                    (expert >= 0)
+                    & (expert < num_experts)
+                    & (local >= 0)
+                    & (local < local_experts)
+                ):
+                    address = (counts.iterator + local).toint().to(cutlass.Int32)
+                    rank = _routing_shared_add(address, cutlass.Int32(1))
+            cute.arch.sync_threads()
+
+            count = counts[tid]
+            ntiles = (count + tile_size - 1) // tile_size
+            within_warp = _routing_warp_inclusive(ntiles, lane)
+            if lane == 31:
+                warp_sums[warp] = within_warp
+            cute.arch.sync_threads()
+            if warp == 0:
+                subtotal = cutlass.Int32(0)
+                if lane < self.warps:
+                    subtotal = warp_sums[lane]
+                subtotal = _routing_warp_inclusive(subtotal, lane)
+                if lane < self.warps:
+                    warp_sums[lane] = subtotal
+            cute.arch.sync_threads()
+            preceding_warps = cutlass.Int32(0)
+            if warp > 0:
+                preceding_warps = warp_sums[warp - 1]
+            tile_base = preceding_warps + within_warp - ntiles
+            row_base = tile_base * tile_size
+            bases[tid] = row_base
+            if tid < local_experts:
+                for j in cutlass.range(ntiles):
+                    tile = tile_base + j
+                    limit = (tile + 1) * tile_size
+                    if limit > row_base + count:
+                        limit = row_base + count
+                    tile_expert[tile] = tid
+                    tile_limit[tile] = limit
+            if tid == self.threads - 1:
+                active = preceding_warps + within_warp
+                active_total[0] = active
+                padded_total[0] = active * tile_size
+            cute.arch.sync_threads()
+            if rank >= 0:
+                row = bases[local] + rank
+                expanded[tid] = row
+                permuted[row] = tid
+
+        # Each word is covered once, independently of the assignment count.
+        word = block * self.threads + tid
+        if word < cute.size(output):
+            output[word] = cutlass.Uint32(0)
+
+
 class _RoutePreprocessPlan:
     """Fixed-address launcher. One plan per concurrent mutable buffer set."""
 
     def __init__(
-        self, compiled, arguments, owners, route_ids, route_weights, output, mode
+        self,
+        compiled,
+        arguments,
+        owners,
+        route_ids,
+        route_weights,
+        output,
+        mode,
+        sorts_tokens=False,
     ):
         self._compiled = compiled
         self._arguments = arguments
@@ -124,6 +366,7 @@ class _RoutePreprocessPlan:
         self.output = output
         self.device = output.device
         self.mode = mode
+        self.sorts_tokens = sorts_tokens
 
     def run(self, stream):
         """Enqueue one kernel; no buffer allocation, JIT or host synchronization."""
@@ -163,6 +406,11 @@ def _plan_route_preprocess(
     route_weights=None,
     output,
     threads=256,
+    moe_sort_buffers=None,
+    num_experts=None,
+    num_local_experts=None,
+    local_expert_offset=0,
+    tile_size=128,
 ):
     """Compile, bind and enqueue one warmup, outside CUDA Graph capture.
 
@@ -170,15 +418,22 @@ def _plan_route_preprocess(
     Packed input requires caller-owned contiguous int32 ``route_ids`` and FP32
     ``route_weights`` outputs. Separate BF16 weights require ``route_weights``;
     separate IDs are bound directly. Separate FP32 weights are bound directly,
-    and the only GPU work is output clearing. Do not pass different destination
-    buffers for either direct-bind input. All tensors must be on one device.
+    and require no conversion. Do not pass different destination buffers for
+    either direct-bind input. All tensors must be on one device.
+
+    With ``moe_sort_buffers``, CTA0 additionally builds a local expert histogram
+    and writes the six existing ``moe_sort`` outputs. Empty experts have no
+    tiles; padding inside nonempty expert tiles is unchanged. Expert IDs must
+    be unique within each token, as in standard top-k routing. This mode is
+    used only when PDL is disabled; later GEMMs wait for the complete kernel.
 
     Inputs may have independent nonnegative 2-D strides. Output and conversion
     buffers are contiguous. This kernel supports tokens from 1..16, top-k from
     1..32, and a positive even hidden size. No input data are read on
     the host. Tensor contents must be valid when planning because warmup runs.
     Shapes/strides are dynamic kernel arguments; beta values and tactic choices
-    do not enter compilation. Cache entries are per mode, threads and device.
+    do not enter compilation. Cache entries are per input/sort mode, thread
+    count and device. Sorting uses 256..1024 threads, selected during planning.
     """
     if (
         not isinstance(output, torch.Tensor)
@@ -211,6 +466,33 @@ def _plan_route_preprocess(
     _check_tensor("topk_ids", topk_ids, shape, torch.int32, device)
     writable = [("output", output)]
     inputs = [("topk_ids", topk_ids)]
+    sorts_tokens = moe_sort_buffers is not None
+    if sorts_tokens:
+        if not (
+            isinstance(num_experts, int)
+            and isinstance(num_local_experts, int)
+            and top_k <= num_experts <= 1024
+            and num_local_experts > 0
+            and local_expert_offset >= 0
+            and local_expert_offset + num_local_experts <= num_experts
+            and tile_size > 0
+        ):
+            raise ValueError("invalid fused decode sorting geometry")
+        tile_capacity = get_max_num_tiles(tokens, top_k, num_local_experts, tile_size)
+        shapes = (
+            (tile_capacity,),
+            (tile_capacity,),
+            shape,
+            (tile_capacity * tile_size,),
+            (1,),
+            (1,),
+        )
+        for name, expected in zip(_SORT_BUFFER_NAMES, shapes, strict=True):
+            tensor = moe_sort_buffers[name]
+            _check_tensor(name, tensor, expected, torch.int32, device, contiguous=True)
+            writable.append((name, tensor))
+        required = max(256, tokens * top_k, num_local_experts)
+        threads = 1 << (required - 1).bit_length()
 
     if topk_weights is None:
         mode = "packed"
@@ -280,7 +562,7 @@ def _plan_route_preprocess(
         arch = torch.cuda.get_device_capability(device)
         if arch not in ((10, 0), (10, 3)):
             raise RuntimeError("route preprocessing requires SM100/SM103")
-        arguments = (
+        pointers = (
             make_ptr(
                 cutlass.Int32,
                 topk_ids.data_ptr(),
@@ -311,28 +593,60 @@ def _plan_route_preprocess(
                 cute.AddressSpace.gmem,
                 assumed_align=4,
             ),
-            tokens,
-            top_k,
-            hidden_size,
-            *topk_ids.stride(),
-            *weight_strides,
         )
-        cache_key = (mode, threads, device.index, arch)
+        if sorts_tokens:
+            pointers += tuple(
+                make_ptr(
+                    cutlass.Int32,
+                    moe_sort_buffers[name].data_ptr(),
+                    cute.AddressSpace.gmem,
+                    assumed_align=4,
+                )
+                for name in _SORT_BUFFER_NAMES
+            )
+            arguments = pointers + (
+                tokens,
+                top_k,
+                hidden_size,
+                num_experts,
+                num_local_experts,
+                local_expert_offset,
+                tile_size,
+                tile_capacity,
+                *topk_ids.stride(),
+                *weight_strides,
+            )
+        else:
+            arguments = pointers + (
+                tokens,
+                top_k,
+                hidden_size,
+                *topk_ids.stride(),
+                *weight_strides,
+            )
+        cache_key = (mode, threads, device.index, arch, sorts_tokens)
         compiled = _route_preprocess_kernel_cache.get(cache_key)
         stream = cuda.CUstream(torch.cuda.current_stream(device).cuda_stream)
         if compiled is None:
-            compiled = cute.compile(
-                _RoutePreprocess(mode, threads), *arguments, stream=stream
-            )
+            kernel = _FusedRoutePreprocess if sorts_tokens else _RoutePreprocess
+            compiled = cute.compile(kernel(mode, threads), *arguments, stream=stream)
             _route_preprocess_kernel_cache[cache_key] = compiled
         bound = _RoutePreprocessPlan(
             compiled,
             arguments,
-            (topk_ids, topk_weights, route_ids, route_weights, output),
+            (
+                topk_ids,
+                topk_weights,
+                route_ids,
+                route_weights,
+                output,
+                moe_sort_buffers,
+            ),
             route_ids,
             route_weights,
             output,
             mode,
+            sorts_tokens,
         )
         bound.run(stream)
         return bound

@@ -57,11 +57,12 @@ def _compiled_counts():
                 "blockscaled_contiguous_grouped_gemm_finalize_fusion",
                 "_finalize_kernel_cache",
             ),
+            ("mxfp4_routing", "_route_preprocess_kernel_cache"),
         )
     )
 
 
-def prepare_candidate(case, packed=False, prepared_weights=None):
+def prepare_candidate(case, packed=False, prepared_weights=None, enable_pdl=False):
     from flashinfer.fused_moe.cute_dsl.mxfp4 import CuteDslMxfp4MoEWrapper
 
     wrapper = CuteDslMxfp4MoEWrapper(
@@ -71,7 +72,7 @@ def prepare_candidate(case, packed=False, prepared_weights=None):
         case.intermediate_size,
         num_local_experts=case.local_num_experts,
         local_expert_offset=case.local_expert_offset,
-        enable_pdl=False,
+        enable_pdl=enable_pdl,
     )
     weights = (
         prepare_cute_weights(case) if prepared_weights is None else prepared_weights
@@ -165,6 +166,195 @@ def test_routing_global_ids(distribution):
         assert (ids == 336).sum() == 128
     if distribution == "empty":
         assert ids[local].unique().numel() <= 1
+
+
+def _assert_decode_route_semantics(buffers, ids, local_experts, offset, tile):
+    """Check the public mapping contract independently of assignment ordering."""
+    ids = ids.cpu().flatten().tolist()
+    groups = [
+        [q for q, expert in enumerate(ids) if expert == offset + local]
+        for local in range(local_experts)
+    ]
+    arrays = {
+        name: tensor.cpu().flatten().tolist()
+        for name, tensor in buffers.items()
+        if name != "out_expert_counts"
+    }
+    tile_experts, tile_limits = [], []
+    base = 0
+    valid_rows = set()
+    expanded = arrays["out_expanded_idx_to_permuted_idx"]
+    permuted = arrays["out_permuted_idx_to_expanded_idx"]
+    for local, assignments in enumerate(groups):
+        count = len(assignments)
+        num_tiles = (count + tile - 1) // tile
+        tile_experts.extend([local] * num_tiles)
+        tile_limits.extend(
+            min(base + (j + 1) * tile, base + count) for j in range(num_tiles)
+        )
+        assert sorted(permuted[base : base + count]) == assignments
+        for q in assignments:
+            row = expanded[q]
+            assert base <= row < base + count
+            assert permuted[row] == q
+            assert row not in valid_rows
+            valid_rows.add(row)
+        base += num_tiles * tile
+    active = len(tile_experts)
+    assert arrays["out_tile_idx_to_expert_idx"][:active] == tile_experts
+    assert arrays["out_tile_idx_to_mn_limit"][:active] == tile_limits
+    assert arrays["out_num_non_exiting_tiles"] == [active]
+    assert arrays["out_total_num_padded_tokens"] == [base]
+    for q, expert in enumerate(ids):
+        if not offset <= expert < offset + local_experts:
+            assert expanded[q] == -1
+
+
+_DECODE_ROUTE_CASES = [
+    (
+        tokens,
+        112,
+        336,
+        16,
+        ("balanced", "hot", "all_remote", "random")[(tokens - 1) % 4],
+    )
+    for tokens in range(1, 17)
+] + [
+    (1, 112, 336, 16, "hot"),
+    (1, 112, 336, 16, "all_remote"),
+    (16, 112, 336, 16, "balanced"),
+    (16, 112, 336, 16, "hot"),
+    (16, 112, 336, 16, "all_remote"),
+    (16, 896, 0, 16, "hot"),
+    (16, 4, 336, 32, "hot"),
+    (16, 4, 336, 32, "all_remote"),
+]
+
+
+@pytest.mark.parametrize(
+    "tokens,local_experts,offset,top_k,distribution", _DECODE_ROUTE_CASES
+)
+@pytest.mark.parametrize("mode", ["packed", "bf16", "fp32"])
+def test_decode_fused_routing_semantics_and_graph(
+    tokens, local_experts, offset, top_k, distribution, mode
+):
+    # Full routing geometry, without allocating any expert weight bank.
+    _require_blackwell()
+    import cuda.bindings.driver as cuda
+    from flashinfer.fused_moe.cute_dsl.moe_utils import (
+        allocate_moe_sort_buffers,
+        moe_sort,
+    )
+    from flashinfer.fused_moe.cute_dsl.mxfp4_routing import _plan_route_preprocess
+
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        ids, weights = make_routing(
+            tokens,
+            896,
+            top_k,
+            local_experts,
+            offset,
+            "balanced" if distribution == "random" else distribution,
+        )
+        if distribution == "random":
+            generator = torch.Generator().manual_seed(123 + tokens)
+            ids.copy_(
+                torch.stack(
+                    [
+                        torch.randperm(896, generator=generator)[:top_k]
+                        for _ in range(tokens)
+                    ]
+                ).to(device=ids.device, dtype=torch.int32)
+            )
+        if mode == "fp32":
+            weights = weights.float() + 0.0003
+        source_ids = pack_topk(ids, weights) if mode == "packed" else ids.clone()
+        source_weights = None if mode == "packed" else weights.clone()
+        route_ids = torch.empty_like(ids) if mode == "packed" else source_ids
+        route_weights = (
+            source_weights
+            if mode == "fp32"
+            else torch.empty_like(weights, dtype=torch.float32)
+        )
+        buffers = allocate_moe_sort_buffers(tokens, 896, top_k, local_experts)
+        native_buffers = allocate_moe_sort_buffers(tokens, 896, top_k, local_experts)
+        output = torch.full((tokens, 7168), 7, dtype=torch.bfloat16, device="cuda")
+        plan = _plan_route_preprocess(
+            source_ids,
+            source_weights,
+            output=output,
+            route_ids=route_ids,
+            route_weights=route_weights,
+            moe_sort_buffers=buffers,
+            num_experts=896,
+            num_local_experts=local_experts,
+            local_expert_offset=offset,
+        )
+
+        def check(current_ids, current_weights):
+            moe_sort(
+                current_ids,
+                current_weights.float(),
+                896,
+                top_k,
+                num_local_experts=local_experts,
+                local_expert_offset=offset,
+                **native_buffers,
+            )
+            for mappings in (buffers, native_buffers):
+                _assert_decode_route_semantics(
+                    mappings, current_ids, local_experts, offset, 128
+                )
+            torch.testing.assert_close(route_ids, current_ids, atol=0, rtol=0)
+            torch.testing.assert_close(
+                route_weights, current_weights.float(), atol=0, rtol=0
+            )
+            assert output.count_nonzero() == 0
+
+        check(ids, weights)
+        compiled_before = _compiled_counts()
+        stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            plan.run(cuda.CUstream(stream.cuda_stream))
+        changed_ids = (ids + 1) % 896
+        changed_weights = weights.flip(1).contiguous()
+        if mode == "packed":
+            source_ids.copy_(pack_topk(changed_ids, changed_weights))
+        else:
+            source_ids.copy_(changed_ids)
+            source_weights.copy_(changed_weights)
+        # A poisoned output and changed input contents must be consumed by the
+        # existing capture, without an intervening eager forward or replan.
+        for _ in range(3):
+            output.fill_(7)
+            graph.replay()
+        check(changed_ids, changed_weights)
+        assert _compiled_counts() == compiled_before
+
+
+@pytest.mark.parametrize("tokens", [1, 16])
+def test_decode_pdl_graph_matches_standard(tokens):
+    _require_blackwell()
+    case = make_case(tokens=tokens, distribution="hot")
+    prepared = prepare_cute_weights(case)
+    ordinary, expected, _ = prepare_candidate(
+        case, packed=True, prepared_weights=prepared
+    )
+    pdl, output, _ = prepare_candidate(
+        case, packed=True, prepared_weights=prepared, enable_pdl=True
+    )
+    ordinary.run()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        pdl.run()
+    torch.cuda.current_stream().wait_stream(stream)
+    for _ in range(3):
+        graph.replay()
+    torch.testing.assert_close(output, expected, atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.parametrize("linear_beta", [None, 7.0])
