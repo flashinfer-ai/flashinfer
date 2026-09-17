@@ -67,7 +67,7 @@ def _check_mm_bf16_fp4_problem_size(
     return True
 
 
-@supported_compute_capability([100, 103, 110, 120, 121])
+@supported_compute_capability([100, 103, 107, 110, 120, 121])
 def _cudnn_bf16_fp4_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -101,7 +101,7 @@ def _cudnn_bf16_fp4_requirement(
     return True
 
 
-@supported_compute_capability([100, 103, 110, 120, 121])
+@supported_compute_capability([100, 103, 107, 110, 120, 121])
 def _cute_dsl_bf16_fp4_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
