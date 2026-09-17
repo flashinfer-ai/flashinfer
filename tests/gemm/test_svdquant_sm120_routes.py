@@ -54,7 +54,7 @@ def test_route_manifest_containers_are_immutable() -> None:
         (0, 3072, 32, 5),
         (64, 1536, 32, 5),
         (64, 3072, 16, 5),
-        (64, 3072, 64, 5),
+        (64, 3072, 64, 11),
     ],
 )
 def test_route_abi_version_matches_manifest(
