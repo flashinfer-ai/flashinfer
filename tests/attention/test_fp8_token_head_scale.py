@@ -459,6 +459,8 @@ def test_batch_prefill_paged_token_head_scale(
 @pytest.mark.parametrize("q_dtype", [torch.float16, torch.bfloat16])
 def test_batch_prefill_paged_token_head_scale_vosplit(kv_layout, dtype, q_dtype):
     _skip_bf16_on_sm75(q_dtype)
+    if _cc_major() < 8:
+        pytest.skip("FP8 FA2 head_dim > 256 is only supported on SM80 or newer")
     torch.manual_seed(42)
     dev = "cuda:0"
     head_dim = 512
