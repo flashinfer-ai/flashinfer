@@ -1475,6 +1475,18 @@ class _CutlassRunnerBase(MoERunner):
                 f"SM{self._device_arch}; supported architectures are "
                 f"{self._supported_archs}."
             )
+        if (
+            self.config.quant.swizzled_scale_factors is True
+            and self._act_sf_vec_size is not None
+            and not self._use_mxfp8_act_scaling
+        ):
+            # Only the MXFP8 runners have a swizzled input_sf path; silently
+            # reading a swizzled pack as linear would corrupt the scales.
+            raise NotImplementedError(
+                f"{type(self).__name__} consumes only the linear activation "
+                "block-scale layout; swizzled_scale_factors=True is supported "
+                "by the CUTLASS MXFP8 runners only."
+            )
         if self._use_deepseek_fp8_block_scale:
             from ..jit.cpp_ext import is_cuda_version_at_least
 
@@ -1640,7 +1652,8 @@ class _CutlassRunnerBase(MoERunner):
 
     @property
     def _swizzled_act_sf(self) -> bool:
-        """MXFP8 opted into the flat CUTLASS 128x4-swizzled 1-D ``input_sf``."""
+        """Activation block scale factor (flat ``input_sf``) is the CUTLASS
+        128x4-swizzled 1-D buffer: MXFP8 with ``swizzled_scale_factors=True``."""
         return (
             self._use_mxfp8_act_scaling
             and self.config.quant.swizzled_scale_factors is True
@@ -1648,7 +1661,9 @@ class _CutlassRunnerBase(MoERunner):
 
     @property
     def _linear_act_sf(self) -> bool:
-        """Activation pack carries a TRTLLM-layout ``[M, H // vec]`` block scale."""
+        """Activation block scale factor (flat ``input_sf``) is the canonical
+        row-major ``[M, H // vec]`` tensor: NVFP4 (E4M3, vec 16) always, MXFP8
+        (E8M0, vec 32) unless swizzled. False for pairs without a block scale."""
         return self._act_sf_vec_size is not None and not self._swizzled_act_sf
 
     def _prepare_tuning_inputs(self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
@@ -1678,9 +1693,7 @@ class _CutlassRunnerBase(MoERunner):
                 device=hidden_states.device,
             )
         elif self._linear_act_sf:
-            # The autotuner resizes the linear block-scale tensor with the
-            # token bucket but leaves it uninitialized; time the kernel on
-            # unit scales rather than NaN/Inf garbage.
+            # Autotune buffers hold random bytes; time on unit scales, not NaN.
             inputs[-1].view(torch.uint8).fill_(self._act_sf_unit_byte)
         return inputs
 
@@ -1899,8 +1912,12 @@ class _CutlassRunnerBase(MoERunner):
             scale = act.hidden_states_scale
             num_tokens, hidden_size = act.hidden_states_q.shape
             expected = _mxfp8_swizzled_act_sf_numel(num_tokens, hidden_size)
+            # ndim == 1 distinguishes the flat swizzled buffer from the
+            # canonical 2-D [M, H // 32] pack, whose numel coincides whenever
+            # M % 128 == 0 and (H // 32) % 4 == 0.
             if (
                 scale is None
+                or scale.ndim != 1
                 or scale.dtype is not torch.uint8
                 or scale.numel() != expected
                 or not scale.is_contiguous()
@@ -1912,8 +1929,9 @@ class _CutlassRunnerBase(MoERunner):
                 )
                 raise ValueError(
                     f"{type(self).__name__} with swizzled_scale_factors=True "
-                    f"requires a contiguous uint8 swizzled input_sf with {expected} "
-                    f"elements for M={num_tokens}, H={hidden_size}; got {got}."
+                    f"requires a contiguous 1-D uint8 swizzled input_sf with "
+                    f"{expected} elements for M={num_tokens}, H={hidden_size}; "
+                    f"got {got}."
                 )
             return
         if act.hidden_states_scale is not None:
@@ -2187,10 +2205,16 @@ class CutlassNvfp4Runner(_CutlassRunnerBase):
         ) = (view[key] for key in self._required_weight_keys)
         num_experts = self.config.routing.num_experts
         intermediate_size = self.config.experts.intermediate_size
-        if hidden_size % 16 != 0 or intermediate_size % 16 != 0:
+        # The expand kernel reads the linear input_sf with a row stride of
+        # padded_hidden_size / 16, padded to MinKDimAlignmentNVFP4 (64), while
+        # the canonical pack is a compact [M, H / 16]; any H that is not a
+        # multiple of 64 would be read with the wrong stride (and past the
+        # end). GEMM2's input is quantized in-kernel, so I only needs 16.
+        if hidden_size % 64 != 0 or intermediate_size % 16 != 0:
             raise ValueError(
-                "Cutlass NVFP4 requires hidden_size and intermediate_size "
-                f"divisible by 16, got H={hidden_size}, I={intermediate_size}."
+                "Cutlass NVFP4 requires hidden_size divisible by 64 and "
+                f"intermediate_size divisible by 16, got H={hidden_size}, "
+                f"I={intermediate_size}."
             )
         gemm1_rows = intermediate_size * (2 if self.config.activation.is_gated else 1)
         expected_w1 = (num_experts, gemm1_rows, hidden_size // 2)

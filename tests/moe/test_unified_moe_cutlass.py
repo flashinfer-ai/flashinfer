@@ -998,6 +998,30 @@ def test_cutlass_quant_runners_reject_out_of_scope_configs(runner_cls, quant, ma
         runner.check_support()
 
 
+def test_cutlass_nvfp4_rejects_swizzled_scale_factors():
+    # NVFP4 has no swizzled input_sf path; an explicit True must not be read
+    # as the linear layout it would otherwise silently fall into.
+    runner = CutlassNvfp4Runner.__new__(CutlassNvfp4Runner)
+    runner.config = _config(
+        quant=QuantConfig(
+            weight=QuantFormat.NVFP4,
+            activation=QuantFormat.NVFP4,
+            swizzled_scale_factors=True,
+        )
+    )
+    runner._device_arch = 100
+    with pytest.raises(NotImplementedError, match="linear activation"):
+        runner.check_support()
+    runner.config = _config(
+        quant=QuantConfig(
+            weight=QuantFormat.NVFP4,
+            activation=QuantFormat.NVFP4,
+            swizzled_scale_factors=False,
+        )
+    )
+    runner.check_support()
+
+
 @pytest.mark.parametrize(
     "runner_cls, quant",
     (
@@ -1058,6 +1082,32 @@ def test_cutlass_mxfp8_swizzled_layer_rejects_linear_activation_scales():
     )
     with pytest.raises(ValueError, match="swizzled"):
         runner._validate_activation_scale(act)
+    # M % 128 == 0 and (H // 32) % 4 == 0: the canonical 2-D pack has exactly
+    # the swizzled numel, so only the rank tells them apart.
+    act.hidden_states_q = torch.empty(128, 128, dtype=torch.float8_e4m3fn)
+    act.topk_ids = torch.zeros(128, 2, dtype=torch.int32)
+    act.topk_weights = torch.ones(128, 2, dtype=torch.float32)
+    act.hidden_states_scale = torch.empty(128, 4, dtype=torch.uint8)
+    assert act.hidden_states_scale.numel() == _mxfp8_swizzled_act_sf_numel(128, 128)
+    with pytest.raises(ValueError, match="1-D"):
+        runner._validate_activation_scale(act)
+    act.hidden_states_scale = act.hidden_states_scale.reshape(-1)
+    runner._validate_activation_scale(act)
+
+
+def test_cutlass_nvfp4_pack_rejects_hidden_size_not_multiple_of_64():
+    # The kernel reads the linear input_sf with a padded (64-aligned) row
+    # stride, so a compact [M, H // 16] pack is only correct for H % 64 == 0.
+    runner = CutlassNvfp4Runner.__new__(CutlassNvfp4Runner)
+    runner.config = _config(
+        quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
+        routing=RoutingConfig(num_experts=2, top_k=2),
+        experts=ExpertConfig(intermediate_size=64),
+    )
+    runner.device = torch.device("cpu")
+    view = {key: torch.empty(1) for key in runner._required_weight_keys}
+    with pytest.raises(ValueError, match="divisible by 64"):
+        runner._pack_weight_inputs(view, hidden_size=80)
 
 
 def test_cutlass_mxfp8_linear_layer_rejects_swizzled_activation_scales():

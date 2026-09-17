@@ -42,7 +42,6 @@ config = MoEConfig(
     ),
     quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
     experts=ExpertConfig(intermediate_size=2048, local_num_experts=32),
-    # NVFP4 activation packs are backend-native; choose one candidate set.
     backends=[TrtllmFp4Config(extra_backend_params...)],
 )
 # --- Find possible backends ---
@@ -122,11 +121,9 @@ Individual backend configs provided in an ordered list. The autotuner or heurist
 ```
 # Single backend
 backends = [TrtllmFp4Config()]
-# Multiple candidates are valid only when they consume the same activation
-# pack contract. NVFP4 TRT-LLM and CUTLASS require different packs, so select
-# either singleton candidate set explicitly.
-backends = [TrtllmFp4Config()]
-# or: backends = [CutlassNvfp4Config()]
+# Multiple candidates share one MoEActivationPack: for each MMA pair every
+# backend consumes the TRT-LLM canonical pack (see MoEActivationPack).
+backends = [TrtllmFp4Config(), CuteDslConfig(), CutlassNvfp4Config()]
 # | is associative, returns BackendOptions
 ```
 
@@ -1084,6 +1081,29 @@ crosses the Python API.
 `output` defaults to BF16 and every current runner declares
 `supported_output_formats == (BF16,)`, so the activation matrix is keyed by the
 `weight×activation` pair only.
+
+### CUTLASS runners consume the TRT-LLM canonical activation pack (2026-09)
+
+Weight views are per-backend (keyed by `backend_key`), but a call carries one
+`MoEActivationPack`, so every candidate for an MMA pair must agree on its
+encoding. The unified CUTLASS NVFP4 runner originally took BF16 and quantized
+in-kernel, and CUTLASS MXFP8 required the flat 128x4-swizzled `input_sf`; each
+made `(TrtllmXxxConfig(), CutlassXxxConfig())` fail at `pack_inputs`. The flat
+`cutlass_fused_moe` already accepts pre-quantized NVFP4 and linear scales, so
+the runners now consume the canonical packs with no kernel change:
+
+- NVFP4×NVFP4: packed `uint8 [M, H/2]` + linear E4M3 `[M, H/16]`, unit global
+  scale (`CutlassNvfp4Config.prepare_activations` ==
+  `TrtllmFp4Config.prepare_activations`).
+- MXFP8 (both pairs): linear `[M, H/32]` by default; the previously
+  declared-but-rejected `QuantConfig(swizzled_scale_factors=True)` selects the
+  flat swizzled buffer. `Cutlass*Config.prepare_activations(...,
+  swizzled_scale_factors=True)` produces it.
+
+CUTLASS per-tensor FP8 still takes a dynamic scalar dequant scale on the pack
+(TRT-LLM keeps its static multipliers in the weight view); aligning it is a
+separate change. b12x / cuTile NVFP4 still take BF16 activations and quantize in-kernel; they
+are not in the same candidate sets as the pre-quantized NVFP4 backends.
 
 ### Explicit Non-Goals For This MVP
 
