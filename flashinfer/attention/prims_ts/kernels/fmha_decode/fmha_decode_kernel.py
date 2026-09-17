@@ -512,7 +512,18 @@ def _build_decode_gen_schedule(
     # ring, each shared by both K/V instances.
     use_shared_inst_kv_rings = cfg.k_dtype != cfg.v_dtype and cfg.tile_size_kv != 256
     one_inst_tmem_stages = 2 if use_one_inst_qkv else 1
-    one_inst_kv_stages = cfg.num_head_dim_stages_kv if use_one_inst_qkv else 1
+    # Keep complete head-dimension rounds in each balanced K/V ring. FP8's
+    # smaller stage tiles can prefetch farther without increasing the budget.
+    one_inst_kv_stages = (
+        max(
+            cfg.num_head_dim_stages_kv,
+            cfg.kv_stages
+            // (2 * cfg.num_head_dim_stages_kv)
+            * cfg.num_head_dim_stages_kv,
+        )
+        if use_one_inst_qkv
+        else 1
+    )
     use_distributed_split_kv_stages = not use_one_inst_qkv
     if cfg.tile_size_q == 128 and use_distributed_split_kv_stages:
         # Q128's four instruction-local K0/K1/V0/V1 rings need equal depth.
