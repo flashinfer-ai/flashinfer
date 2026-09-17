@@ -173,6 +173,7 @@ def _radix_cutlass_top_k_varlen_check(
     load_balance=True,
     workspace=None,
     row_starts=None,
+    max_seq_len=None,
 ):  # extra kwargs mirror the public signature; unused by the check
     """Radix masked-fallback: runs on all supported SM tiers, on contiguous
     logits (the CUDA launcher checks contiguity; gating here lets ``auto``
@@ -231,6 +232,7 @@ def _gvr_top_k_varlen_check(
     load_balance=True,
     workspace=None,
     row_starts=None,
+    max_seq_len=None,
 ):
     """Return True only when GVR can run on this exact configuration.
 
@@ -279,6 +281,7 @@ def _gvr2_top_k_varlen_check(
     load_balance=True,
     workspace=None,
     row_starts=None,
+    max_seq_len=None,
 ):
     """Return True only when the self-sampling GVR V2 port can run this config.
 
@@ -339,6 +342,7 @@ def _top_k_varlen_heuristic(
     load_balance: bool = True,
     workspace=None,
     row_starts=None,
+    max_seq_len=None,
 ):
     """Shape/dtype-aware ranking so auto tracks the measured per-config winner.
 
@@ -1095,10 +1099,14 @@ def _run_gvr2(
     out_values: Optional[torch.Tensor],
     workspace: Optional[dict] = None,
     row_starts: Optional[torch.Tensor] = None,
+    max_seq_len: Optional[int] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Self-sampling GVR V2: one launch for the whole batch via the per-row
     in-kernel varlen engine (TRT-LLM ``run_varlen`` port). ``row_starts``
-    selects the windowed (prefill) engines (TRT-LLM #18702 port).
+    selects the windowed (prefill) engines (TRT-LLM #18702 port);
+    ``max_seq_len`` (windowed only) is the caller's bound on the window
+    lengths, which lets the host pick a register-resident engine for the
+    launch; without it the streaming engine serves every row.
 
     ``max_seq_len`` is derived from the logits row width (in uncompressed
     token space, hence ``* compress_ratio``), which is capture-stable — the
@@ -1121,7 +1129,18 @@ def _run_gvr2(
         next_n=next_n,
         compress_ratio=compress_ratio,
         values=out_values if return_output_values else None,
-        max_seq_len=logits.shape[1] * compress_ratio,
+        # windowed: None = unhinted (streaming engine), else the caller's
+        # window-length bound (clamped to the width); decode: the logits
+        # width in uncompressed token space
+        max_seq_len=(
+            (
+                min(int(max_seq_len), logits.shape[1])
+                if max_seq_len is not None
+                else None
+            )
+            if row_starts is not None
+            else logits.shape[1] * compress_ratio
+        ),
         workspace=workspace.get("gvr2_workspace") if workspace else None,
         top_k=top_k,
         row_starts=row_starts,
@@ -1267,6 +1286,7 @@ def _radix_top_k_varlen_check(
     load_balance=True,
     workspace=None,
     row_starts=None,
+    max_seq_len=None,
 ):
     """CuTe DSL multi-CTA radix: Blackwell-plus only, no pre_idx required.
     Overlapping row layouts (stride(0) < shape[1]) fail the kernel's stride
@@ -1409,6 +1429,7 @@ def _radix_filter_top_k_varlen_check(
     load_balance=True,
     workspace=None,
     row_starts=None,
+    max_seq_len=None,
 ):
     """Return True only when the vendored DKG kernel covers this configuration.
 
@@ -1540,6 +1561,7 @@ def top_k_varlen(
     load_balance: bool = True,
     workspace: Optional[dict] = None,
     row_starts: Optional[torch.Tensor] = None,
+    max_seq_len: Optional[int] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     r"""Top-K selection over batched decode-step logits.
 
@@ -1599,8 +1621,20 @@ def top_k_varlen(
         == 1`` and no ``pre_idx``. Served by ``gvr_2`` (dedicated windowed
         engines, TRT-LLM #18702 port); the other backends are not eligible.
         CUDA graphs: warm up with one eager windowed call of the same
-        (row-count tier, top_k, envelope bucket) or ``warmup_prefill``.
+        (row count, top_k, ``max_seq_len``, logits width) or ``warmup_prefill``.
         Default ``None`` (every window starts at column 0).
+    max_seq_len : int, optional
+        Windowed mode only: an upper bound on every row's window length
+        (``seq_lens.max()``, e.g. the longest prompt of the prefill batch,
+        which the framework knows on the host). With it the launch runs on
+        the register-resident gvr_2 engine whose capacity covers the bound
+        (windows up to 8K tokens, 1.3-2x faster than the streaming engine on
+        B200/B300, part-dependent on Rubin); without it the lengths are
+        device data and every row takes the streaming engine. The bound is a
+        contract: a row whose window is longer than it is reported as all
+        ``-1`` on the register engine (never a truncated ranking); a bound
+        larger than the logits width is clamped. Ignored when ``row_starts``
+        is ``None``.
     top_k : int
         Number of top elements per row.  GVR backend supports
         ``{512, 1024, 2048}``; radix backend has no restriction.
@@ -1892,6 +1926,14 @@ def top_k_varlen(
             raise ValueError(
                 "row_starts (windowed mode) is hint-free: pass pre_idx=None"
             )
+        if max_seq_len is not None and (
+            isinstance(max_seq_len, bool)
+            or not isinstance(max_seq_len, int)
+            or max_seq_len < 1
+        ):
+            raise ValueError(
+                f"max_seq_len must be a positive int (window-length bound), got {max_seq_len!r}"
+            )
 
     # A malformed hint is discarded, loudly: the call runs hint-free (the
     # checkers above already treated it as absent, so `auto` never selected a
@@ -2031,6 +2073,7 @@ def top_k_varlen(
             out_values,
             workspace=workspace,
             row_starts=row_starts,
+            max_seq_len=max_seq_len,
         )
     elif row_starts is not None:
         # reachable under skip_check=True only (the checkers refuse it)
