@@ -311,6 +311,20 @@ def test_prepare_cutlass_fp8_per_tensor_weights_rejects_invalid_source_contract(
         CutlassFp8PerTensorConfig.prepare_weights(
             w1,
             w2,
+            hidden_states_scale_global=1.0,
+            intermediate_scale_global=1.0,
+            num_local_experts=2,
+            hidden_size=32,
+            intermediate_size=32,
+        )
+    w1 = torch.zeros(2, 64, 32, dtype=torch.bfloat16)
+    w2 = torch.zeros(2, 32, 32, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="hidden_states_scale_global"):
+        CutlassFp8PerTensorConfig.prepare_weights(
+            w1,
+            w2,
+            hidden_states_scale_global=0.0,
+            intermediate_scale_global=1.0,
             num_local_experts=2,
             hidden_size=32,
             intermediate_size=32,
@@ -591,6 +605,11 @@ def test_all_cutlass_preparers_reject_opposite_activation_geometry(
     wrong_rows = intermediate if activation.is_gated else 2 * intermediate
     w1 = torch.empty(experts, wrong_rows, hidden, dtype=torch.bfloat16)
     w2 = torch.empty(experts, hidden, intermediate, dtype=torch.bfloat16)
+    extra = (
+        dict(hidden_states_scale_global=1.0, intermediate_scale_global=1.0)
+        if config_cls is CutlassFp8PerTensorConfig
+        else {}
+    )
 
     with pytest.raises(ValueError, match="weight shapes"):
         config_cls.prepare_weights(
@@ -601,6 +620,7 @@ def test_all_cutlass_preparers_reject_opposite_activation_geometry(
             intermediate_size=intermediate,
             activation=activation,
             device="cpu",
+            **extra,
         )
 
 
@@ -1035,20 +1055,24 @@ def test_cutlass_mxfp8_rejects_linear_activation_scales():
         runner._validate_activation_scale(act)
 
 
-def test_cutlass_fp8_per_tensor_rejects_nonscalar_activation_scale():
+def test_cutlass_fp8_per_tensor_rejects_activation_scale():
+    # The static per-tensor scale lives in the weight view (TRTLLM pack); a
+    # per-call hidden_states_scale would silently be ignored.
     runner = CutlassFp8PerTensorRunner.__new__(CutlassFp8PerTensorRunner)
     hidden = torch.empty(1, 128, dtype=torch.float8_e4m3fn)
     act = MoEActivationPack(
         hidden,
-        torch.ones(1, dtype=torch.float32),
+        torch.ones((), dtype=torch.float32),
         torch.zeros(1, 2, dtype=torch.int32),
         torch.ones(1, 2, dtype=torch.float32),
     )
-    with pytest.raises(ValueError, match="0-dim float32"):
+    with pytest.raises(ValueError, match="do not use hidden_states_scale"):
         runner._validate_activation_scale(act)
+    act.hidden_states_scale = None
+    runner._validate_activation_scale(act)
 
 
-def test_cutlass_fp8_per_tensor_pack_keeps_scalar_scale_static():
+def test_cutlass_fp8_per_tensor_pack_reads_static_scales_from_view():
     runner = CutlassFp8PerTensorRunner.__new__(CutlassFp8PerTensorRunner)
     runner.config = _config(
         quant=QuantConfig(
@@ -1059,23 +1083,43 @@ def test_cutlass_fp8_per_tensor_pack_keeps_scalar_scale_static():
     runner._inner = object()
     runner._built = True
     runner._ensure_workspace = lambda *_args, **_kwargs: None
-    runner._pack_weight_inputs = lambda _view, _hidden_size: [
-        torch.empty(1) for _ in runner._required_weight_keys
-    ]
     act = MoEActivationPack(
         torch.empty(1, 128, dtype=torch.float8_e4m3fn),
-        torch.ones((), dtype=torch.float32),
+        None,
         torch.zeros(1, 2, dtype=torch.int32),
         torch.full((1, 2), 0.5, dtype=torch.float32),
     )
+    view = {
+        "fc1_expert_weights": torch.empty(4, 512, 128, dtype=torch.float8_e4m3fn),
+        "fc2_expert_weights": torch.empty(4, 128, 256, dtype=torch.float8_e4m3fn),
+        "fc1_dequant": torch.full((4,), 0.5),
+        "fc2_dequant": torch.full((4,), 0.25),
+        "hidden_states_scale_global": torch.tensor(4.0),
+        "intermediate_scale_global": torch.tensor(8.0),
+    }
     weights = MoEWeightPack()
-    weights.prepare_for(
-        runner.backend_key,
-        {key: torch.empty(1) for key in runner._required_weight_keys},
-    )
-    runner.pack_inputs(act, weights)
+    weights.prepare_for(runner.backend_key, view)
+    inputs = runner.pack_inputs(act, weights)
+    assert len(inputs) == runner._expected_num_inputs == 10
+    # The static view scales are folded into the flat ABI once per view, so
+    # forward launches no arithmetic and repeated packing reuses the tensors.
+    assert inputs[7] is view["intermediate_scale_global"]
+    again = runner.pack_inputs(act, weights)
+    assert all(a is b for a, b in zip(inputs[6:10], again[6:10], strict=True))
+    # Static scales are not token-dynamic.
     spec = runner.tuning_config.dynamic_tensor_specs[0]
     assert spec.input_idx == (0, 1, 2, 3)
+    # Flat ABI: [fc1_dequant * a1_dequant, fc2_act_quant, fc2_dequant /
+    # fc2_act_quant, a1_dequant] with a1_dequant = 1 / hidden_states_scale_global.
+    fc1, fc2_quant, fc2, a1 = runner._quant_scales(inputs)
+    torch.testing.assert_close(fc1, torch.full((4,), 0.125))
+    assert fc2_quant is view["intermediate_scale_global"]
+    torch.testing.assert_close(fc2, torch.full((4,), 0.03125))
+    torch.testing.assert_close(a1, torch.tensor(0.25))
+
+    view["intermediate_scale_global"] = torch.tensor(8.0, dtype=torch.float64)
+    with pytest.raises(TypeError, match="intermediate_scale_global"):
+        runner.pack_inputs(act, weights)
 
 
 def test_cutlass_mxfp8_mxfp4_pack_rejects_unaligned_hidden_size():
@@ -1709,7 +1753,10 @@ def _reference(
     w1: torch.Tensor,
     w2: torch.Tensor,
     activation=None,
+    *,
+    intermediate_hook=None,
 ):
+    """``intermediate_hook`` models a backend's GEMM2-input requantization."""
     activation = activation or SwiGLU()
     x = act.hidden_states_q.float()
     result = torch.zeros_like(x)
@@ -1757,6 +1804,8 @@ def _reference(
                     raise AssertionError(
                         f"unsupported CUTLASS activation {activation!r}"
                     )
+            if intermediate_hook is not None:
+                intermediate = intermediate_hook(intermediate)
             expert_out = intermediate @ w2[expert].float().T
             result[token] += act.topk_weights[token, slot] * expert_out
     return result.to(torch.bfloat16)
@@ -1855,12 +1904,13 @@ def _independent_quant_scales(backend_key, view, act):
             v["fc2_dequant_scale"],
         ]
     if backend_key == "cutlass_fp8_per_tensor":
-        act_scale = act.hidden_states_scale
+        act_dequant = 1.0 / v["hidden_states_scale_global"]
+        inter_quant = v["intermediate_scale_global"]
         return [
-            (v["fc1_dequant"] * act_scale).float(),
-            torch.ones((), device=act_scale.device, dtype=torch.float32),
-            v["fc2_dequant"].float(),
-            act_scale,
+            v["fc1_dequant"] * act_dequant,
+            inter_quant,
+            v["fc2_dequant"] / inter_quant,
+            act_dequant,
         ]
     if backend_key == "cutlass_fp8_block":
         return [v["fc1_block_scale"], v["fc2_block_scale"]]
@@ -1950,9 +2000,9 @@ _EXPECTED_SCALE_ORDER = {
 def test_scale_orders_match_flat_abi(backend_key):
     """CPU-only, so the SM90 backends are covered on any arch.
 
-    cutlass_fp8_per_tensor is absent: it folds the activation scale into the
-    gemm1 dequant and inserts a literal, so there is no key-to-slot mapping to
-    pin. Sentinels are int32 so the .view(torch.int32) calls stay no-ops.
+    cutlass_fp8_per_tensor is absent: its four slots are arithmetic
+    combinations of view scales rather than a key-to-slot mapping; the
+    runner-boundary test pins that arithmetic instead. Sentinels are int32 so the .view(torch.int32) calls stay no-ops.
     """
     expected = _EXPECTED_SCALE_ORDER[backend_key]
     keys = sorted(set(expected))
@@ -2552,6 +2602,31 @@ def _autotune_and_graph(runner, act, weights, expected, *, rtol, atol, cache_nam
     _assert_numerically_close(captured, expected, rtol=rtol, atol=atol)
 
 
+def _fp8_per_tensor_static_scales(x: torch.Tensor):
+    """Calibration multipliers a framework would carry: amax-derived for the
+    activations, a fixed value for the GEMM1 output (the fuzz does the same
+    with 64.0; 32.0 here keeps the non-gated activations' larger GEMM1
+    outputs representable)."""
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    amax = x.float().abs().amax()
+    hidden_states_scale_global = torch.where(
+        amax > 0, fp8_max / amax, torch.ones_like(amax)
+    )
+    intermediate_scale_global = torch.tensor(32.0, device=x.device)
+    return hidden_states_scale_global, intermediate_scale_global
+
+
+def _fp8_requant_hook(intermediate_scale_global: torch.Tensor):
+    """Model the kernel's static E4M3 requantization of GEMM1 output."""
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+
+    def hook(intermediate: torch.Tensor) -> torch.Tensor:
+        q = (intermediate * intermediate_scale_global).clamp(-fp8_max, fp8_max)
+        return q.to(torch.float8_e4m3fn).float() / intermediate_scale_global
+
+    return hook
+
+
 @cutlass_fp8_required
 @pytest.mark.parametrize("activation", _CUTLASS_ACTIVATIONS)
 def test_cutlass_fp8_per_tensor_moe_layer_matches_quantized_reference(activation):
@@ -2564,19 +2639,25 @@ def test_cutlass_fp8_per_tensor_moe_layer_matches_quantized_reference(activation
         num_experts, hidden_size, intermediate_size, device, activation
     )
     topk_ids, topk_weights = _make_routing(num_tokens, num_experts, top_k, device)
-    x_q, x_scale = CutlassFp8PerTensorConfig.prepare_activations(x)
+    # Static calibration multipliers, as a framework would supply them.
+    hs_scale, inter_scale = _fp8_per_tensor_static_scales(x)
+    x_q, x_scale = CutlassFp8PerTensorConfig.prepare_activations(
+        x, hidden_states_scale_global=hs_scale
+    )
     assert x_q.dtype is torch.float8_e4m3fn
-    assert x_scale.dtype is torch.float32 and x_scale.ndim == 0
+    assert x_scale is None
     view = CutlassFp8PerTensorConfig.prepare_weights(
         w1,
         w2,
+        hidden_states_scale_global=hs_scale,
+        intermediate_scale_global=inter_scale,
         num_local_experts=num_experts,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
         activation=activation,
         device=device,
     )
-    x_dq = x_q.float() * x_scale
+    x_dq = x_q.float() / view["hidden_states_scale_global"]
     w1_dq = view["fc1_expert_weights"].float() * view["fc1_dequant"][:, None, None]
     w2_dq = view["fc2_expert_weights"].float() * view["fc2_dequant"][:, None, None]
     config = _config(
@@ -2592,10 +2673,10 @@ def test_cutlass_fp8_per_tensor_moe_layer_matches_quantized_reference(activation
     weights = MoEWeightPack()
     weights.prepare_for("cutlass_fp8_per_tensor", view)
     layer = MoELayer(config)
-    # Keep the public ``prepare_activations`` contract coupled to the actual
-    # runner boundary, rather than only checking the numerical launch below.
+    # Keep the public weight-view contract coupled to the actual runner
+    # boundary, rather than only checking the numerical launch below.
     packed_inputs = layer.runners[0].pack_inputs(act, weights)
-    assert packed_inputs[-1] is x_scale
+    assert packed_inputs[7] is view["intermediate_scale_global"]
     _pin_fallback_winner(layer, act)
     actual = layer(act, weights)
     flat = _run_flat_cutlass_independently(
@@ -2606,6 +2687,7 @@ def test_cutlass_fp8_per_tensor_moe_layer_matches_quantized_reference(activation
         w1_dq.to(torch.bfloat16),
         w2_dq.to(torch.bfloat16),
         activation,
+        intermediate_hook=_fp8_requant_hook(view["intermediate_scale_global"]),
     )
     assert layer.winner_backend == "cutlass_fp8_per_tensor"
     torch.testing.assert_close(actual, flat, rtol=0, atol=0)
@@ -3058,4 +3140,106 @@ def test_cutlass_humming_moe_layer_matches_quantized_reference(activation):
         rtol=2e-1,
         atol=2e-1,
         cache_name="test_moe_cutlass_humming",
+    )
+
+
+@cutlass_fp8_required
+def test_cutlass_fp8_per_tensor_shares_canonical_pack_with_trtllm():
+    """The per-tensor FP8 pack from ``TrtllmFp8PerTensorConfig
+    .prepare_activations`` (no pack scale) feeds TRTLLM and CUTLASS runners
+    built from one ``MoELayer`` whose views carry the same static scales."""
+    from flashinfer.fused_moe import TrtllmFp8PerTensorConfig
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    major, minor = get_compute_capability(device)
+    if not TrtllmFp8PerTensorConfig.supported(major * 10 + minor):
+        pytest.skip("requires an arch with TRTLLM and CUTLASS per-tensor FP8")
+
+    torch.manual_seed(54)
+    num_tokens, num_experts, top_k = 32, 8, 2
+    hidden_size, intermediate_size = 256, 512
+    activation = SwiGLU()
+    quant = QuantConfig(
+        weight=QuantFormat.FP8PerTensor, activation=QuantFormat.FP8PerTensor
+    )
+    x = torch.randn(num_tokens, hidden_size, device=device, dtype=torch.bfloat16) / 2
+    w1, w2 = _make_bf16_experts(
+        num_experts, hidden_size, intermediate_size, device, activation
+    )
+    topk_ids, topk_weights = _make_routing(num_tokens, num_experts, top_k, device)
+    hs_scale, inter_scale = _fp8_per_tensor_static_scales(x)
+    scales = dict(
+        hidden_states_scale_global=hs_scale, intermediate_scale_global=inter_scale
+    )
+    x_q, x_scale = TrtllmFp8PerTensorConfig.prepare_activations(
+        x, hidden_states_scale_global=hs_scale
+    )
+    assert x_scale is None
+    act = MoEActivationPack(x_q, None, topk_ids, topk_weights)
+
+    def reference(view):
+        x_dq = x_q.float() / view["hidden_states_scale_global"]
+        w1_dq = view["fc1_expert_weights"].float() * view["fc1_dequant"][:, None, None]
+        w2_dq = view["fc2_expert_weights"].float() * view["fc2_dequant"][:, None, None]
+        return _reference(
+            MoEActivationPack(x_dq.to(torch.bfloat16), None, topk_ids, topk_weights),
+            w1_dq.to(torch.bfloat16),
+            w2_dq.to(torch.bfloat16),
+            activation,
+            intermediate_hook=_fp8_requant_hook(view["intermediate_scale_global"]),
+        )
+
+    candidates = (
+        (TrtllmFp8PerTensorConfig(), "trtllm_fp8_per_tensor"),
+        (CutlassFp8PerTensorConfig(), "cutlass_fp8_per_tensor"),
+    )
+    config = _config(
+        routing=RoutingConfig(num_experts=num_experts, top_k=top_k),
+        quant=quant,
+        experts=ExpertConfig(intermediate_size=intermediate_size),
+        activation=activation,
+        backend=BackendOptions(tuple(cfg for cfg, _ in candidates)),
+    )
+    weights = MoEWeightPack()
+    for cfg, key in candidates:
+        weights.prepare_for(
+            key,
+            cfg.prepare_weights(
+                w1,
+                w2,
+                num_local_experts=num_experts,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                activation=activation,
+                device=device,
+                **scales,
+            ),
+        )
+
+    layer = MoELayer(config)
+    assert {r.backend_key for r in layer.runners} == {key for _, key in candidates}
+    outputs = {}
+    for runner in layer.runners:
+        inputs = runner.pack_inputs(act, weights)
+        out = runner.forward(inputs, tactic=-1, **runner.launch_kwargs_for(inputs))
+        torch.cuda.synchronize()
+        assert torch.isfinite(out).all(), f"{runner.backend_key} produced non-finite"
+        outputs[runner.backend_key] = out.clone().to(torch.bfloat16)
+    # Both backends quantize the same weights with the same static scales, so
+    # they agree tightly; pin CUTLASS to its dequantized reference and TRT-LLM
+    # to CUTLASS.
+    expected = reference(weights.get_view("cutlass_fp8_per_tensor"))
+    _assert_numerically_close(
+        outputs["cutlass_fp8_per_tensor"], expected, rtol=1e-1, atol=1e-1
+    )
+    _assert_numerically_close(
+        outputs["trtllm_fp8_per_tensor"],
+        outputs["cutlass_fp8_per_tensor"],
+        rtol=1e-1,
+        atol=1e-1,
+    )
+    actual = layer(act, weights)
+    assert layer.winner_backend in outputs
+    torch.testing.assert_close(
+        actual.to(torch.bfloat16), outputs[layer.winner_backend], rtol=5e-2, atol=5e-2
     )

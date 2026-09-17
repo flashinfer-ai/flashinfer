@@ -1081,6 +1081,20 @@ crosses the Python API.
 `supported_output_formats == (BF16,)`, so the activation matrix is keyed by the
 `weight×activation` pair only.
 
+### CUTLASS FP8 per-tensor takes the TRT-LLM static-scale activation pack (2026-09)
+
+`(TrtllmFp8PerTensorConfig(), CutlassFp8PerTensorConfig())` could not share
+one `MoEActivationPack`: TRT-LLM quantizes activations with a static
+calibration multiplier kept in its weight view and carries no pack scale,
+while the CUTLASS runner expected a dynamic 0-dim dequant scale on the pack.
+vLLM / SGLang feed static scales to the flat CUTLASS FP8 path, so CUTLASS now
+speaks the static contract: `hidden_states_scale_global` /
+`intermediate_scale_global` are `prepare_weights` inputs stored in the view,
+the pack carries no scale, and
+`CutlassFp8PerTensorConfig.prepare_activations(x, hidden_states_scale_global=...)`
+delegates to the TRT-LLM helper. GEMM2 input is requantized with the
+calibrated intermediate scale (previously an implicit 1.0).
+
 ### Explicit Non-Goals For This MVP
 
 | Status | Task | Notes |

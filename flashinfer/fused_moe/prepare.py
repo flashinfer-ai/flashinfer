@@ -1970,29 +1970,12 @@ def _require_canonical_cutlass_bf16_weights(
     return w1_bf16.to(device).contiguous(), w2_bf16.to(device).contiguous(), device
 
 
-def prepare_cutlass_fp8_per_tensor_activations(
-    hidden_states_bf16: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Quantize ``[M, H]`` BF16 activations to E4M3 plus a scalar dequant scale."""
-    if hidden_states_bf16.dtype != torch.bfloat16 or hidden_states_bf16.dim() != 2:
-        raise ValueError(
-            "prepare_cutlass_fp8_per_tensor_activations expects a 2D BF16 tensor, "
-            f"got shape={tuple(hidden_states_bf16.shape)}, "
-            f"dtype={hidden_states_bf16.dtype}."
-        )
-    fp8_max = torch.finfo(torch.float8_e4m3fn).max
-    amax = hidden_states_bf16.float().abs().amax()
-    dequant = torch.where(
-        amax > 0, amax / fp8_max, torch.ones_like(amax, dtype=torch.float32)
-    ).to(torch.float32)
-    quantized = (hidden_states_bf16.float() / dequant).clamp(-fp8_max, fp8_max)
-    return quantized.to(torch.float8_e4m3fn), dequant.reshape(())
-
-
 def prepare_cutlass_fp8_per_tensor_weights(
     w1_bf16: torch.Tensor,
     w2_bf16: torch.Tensor,
     *,
+    hidden_states_scale_global: Union[float, torch.Tensor],
+    intermediate_scale_global: Union[float, torch.Tensor],
     num_local_experts: int,
     hidden_size: int,
     intermediate_size: int,
@@ -2004,6 +1987,12 @@ def prepare_cutlass_fp8_per_tensor_weights(
     Each expert uses one E4M3 multiplier. The returned ``fc1_dequant`` /
     ``fc2_dequant`` tensors are the CUTLASS dequant scales (``amax / fp8_max``),
     not TRTLLM's inverted calibration multipliers.
+
+    ``hidden_states_scale_global`` and ``intermediate_scale_global`` are the
+    same static calibration *multipliers* the TRTLLM per-tensor view carries
+    (``q = x * scale``); activations are quantized with the former by
+    ``prepare_trtllm_fp8_per_tensor_activations`` and carry no pack scale, and
+    GEMM1 output is requantized with the latter before GEMM2.
     """
     w1_bf16, w2_bf16, device = _require_canonical_cutlass_bf16_weights(
         w1_bf16,
@@ -2022,6 +2011,16 @@ def prepare_cutlass_fp8_per_tensor_weights(
         "fc2_expert_weights": w2_q,
         "fc1_dequant": (1.0 / w1_mult).contiguous(),
         "fc2_dequant": (1.0 / w2_mult).contiguous(),
+        "hidden_states_scale_global": _fp8_per_tensor_scale(
+            hidden_states_scale_global,
+            name="hidden_states_scale_global",
+            device=device,
+        ),
+        "intermediate_scale_global": _fp8_per_tensor_scale(
+            intermediate_scale_global,
+            name="intermediate_scale_global",
+            device=device,
+        ),
     }
 
 

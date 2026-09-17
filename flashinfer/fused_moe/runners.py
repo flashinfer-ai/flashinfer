@@ -1793,10 +1793,11 @@ class _CutlassRunnerBase(MoERunner):
         self._activation_params = self._resolve_activation_params(view)
 
         # Token-dynamic dims are only the packed prerouted buffers (output,
-        # hidden, topk_ids, topk_weights). Per-tensor FP8 dequant is 0-dim;
-        # MXFP8 input_sf is a swizzled 1-D buffer resized by ConstraintSpec.
-        # Sniffing shape[0] == num_tokens treated a (1,) scale at M=1 as
-        # token-dynamic and let autotune replace it with a bucket-sized tensor.
+        # hidden, topk_ids, topk_weights). Per-tensor FP8 scales are static
+        # 0-dim entries of the weight view; MXFP8 input_sf is a swizzled 1-D
+        # buffer resized by ConstraintSpec. Sniffing shape[0] == num_tokens
+        # treated a (1,) scale at M=1 as token-dynamic and let autotune replace
+        # it with a bucket-sized tensor.
         input_idxs: tuple[int, ...] = (0, 1, 2, 3)
         dim_idxs: tuple[int, ...] = (0, 0, 0, 0)
 
@@ -1864,14 +1865,6 @@ class _CutlassRunnerBase(MoERunner):
                     f"H={hidden_size}; got {got}."
                 )
             return
-        if self._x_dtype is torch.float8_e4m3fn:
-            scale = act.hidden_states_scale
-            if scale is None or scale.dim() != 0 or scale.dtype is not torch.float32:
-                raise ValueError(
-                    f"{type(self).__name__} requires a 0-dim float32 "
-                    "hidden_states_scale dequant factor."
-                )
-            return
         if act.hidden_states_scale is not None:
             raise ValueError(
                 f"{type(self).__name__} activations do not use hidden_states_scale."
@@ -1880,7 +1873,7 @@ class _CutlassRunnerBase(MoERunner):
     def _pack_activation_scale_inputs(
         self, act: MoEActivationPack
     ) -> List[torch.Tensor]:
-        if self._use_mxfp8_act_scaling or self._x_dtype is torch.float8_e4m3fn:
+        if self._use_mxfp8_act_scaling:
             assert act.hidden_states_scale is not None
             scale = act.hidden_states_scale
             if self._use_mxfp8_act_scaling:
@@ -2212,7 +2205,15 @@ class CutlassNvfp4Runner(_CutlassRunnerBase):
 
 
 class CutlassFp8PerTensorRunner(_CutlassRunnerBase):
-    """Unified adapter for CUTLASS per-tensor FP8 fused MoE."""
+    """Unified adapter for CUTLASS per-tensor FP8 fused MoE.
+
+    Activations use the TRTLLM canonical per-tensor FP8 pack: E4M3
+    ``[M, H]`` quantized with the static calibration multiplier
+    ``hidden_states_scale_global`` and no ``hidden_states_scale``. Both static
+    multipliers (``hidden_states_scale_global``, ``intermediate_scale_global``)
+    live in the weight view, exactly as in the ``trtllm_fp8_per_tensor`` view,
+    and are folded into the flat CUTLASS ``quant_scales`` at launch.
+    """
 
     backend_key = "cutlass_fp8_per_tensor"
     supported_quant_variants = ((QuantFormat.FP8PerTensor, QuantFormat.FP8PerTensor),)
@@ -2225,13 +2226,15 @@ class CutlassFp8PerTensorRunner(_CutlassRunnerBase):
         "fc2_expert_weights",
         "fc1_dequant",
         "fc2_dequant",
+        "hidden_states_scale_global",
+        "intermediate_scale_global",
     )
-    _expected_num_inputs = 9
+    _expected_num_inputs = 10
 
     def _pack_weight_inputs(
         self, view: dict[str, torch.Tensor], hidden_size: int
     ) -> List[torch.Tensor]:
-        w1, w2, w1_dequant, w2_dequant = (
+        w1, w2, w1_dequant, w2_dequant, act_scale, inter_scale = (
             view[key] for key in self._required_weight_keys
         )
         num_experts = self.config.routing.num_experts
@@ -2261,18 +2264,54 @@ class CutlassFp8PerTensorRunner(_CutlassRunnerBase):
                 f"{tuple(w1_dequant.shape)}/{tuple(w2_dequant.shape)} != "
                 f"expected {expected_scale}."
             )
-        self._validate_weight_storage((w1, w2, w1_dequant, w2_dequant))
-        return [w1, w2, w1_dequant, w2_dequant]
+        for name, scale in (
+            ("hidden_states_scale_global", act_scale),
+            ("intermediate_scale_global", inter_scale),
+        ):
+            _require_cutlass_tensor(scale, name=name, dtype=torch.float32, shape=())
+        self._validate_weight_storage(
+            (w1, w2, w1_dequant, w2_dequant, act_scale, inter_scale)
+        )
+        return [
+            w1,
+            w2,
+            *self._fp8_abi_scales(w1_dequant, w2_dequant, act_scale, inter_scale),
+        ]
+
+    def _fp8_abi_scales(
+        self,
+        w1_dequant: torch.Tensor,
+        w2_dequant: torch.Tensor,
+        act_scale: torch.Tensor,
+        inter_scale: torch.Tensor,
+    ) -> List[torch.Tensor]:
+        """Fold the static view scales into the flat ``quant_scales`` ABI once.
+
+        Flat ABI: ``[fc1_dequant, fc2_act_quant, fc2_dequant, fc1_act_dequant]``.
+        The view stores quant *multipliers* (``q = x * scale``), so the
+        activation dequant is their reciprocal. ``MoELayer`` packs on every
+        call, so the folded tensors are cached per view (by storage pointer);
+        recomputing them per forward would add three launches per step and
+        move pointers out from under a captured CUDA graph.
+        """
+        key = tuple(
+            t.data_ptr() for t in (w1_dequant, w2_dequant, act_scale, inter_scale)
+        )
+        cached = getattr(self, "_fp8_abi_cache", None)
+        if cached is None or cached[0] != key:
+            act_dequant = act_scale.reciprocal()
+            scales = [
+                (w1_dequant * act_dequant).contiguous(),
+                inter_scale,
+                (w2_dequant / inter_scale).contiguous(),
+                act_dequant,
+            ]
+            cached = (key, scales)
+            self._fp8_abi_cache = cached
+        return list(cached[1])
 
     def _quant_scales(self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
-        act_scale = inputs[8]
-        gemm2_act_quant = torch.ones((), device=act_scale.device, dtype=torch.float32)
-        return [
-            (inputs[6] * act_scale).float(),
-            gemm2_act_quant,
-            inputs[7].float(),
-            act_scale,
-        ]
+        return list(inputs[6:10])
 
 
 class CutlassFp8BlockRunner(_CutlassRunnerBase):
