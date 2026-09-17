@@ -1,3 +1,25 @@
+## Comparator PDL scope clarification — 2026-09-17
+
+The latest B200 TRT-LLM comparison (audit1913, Frost29.484375us versus
+TRT28.620375us) uses `ExecutionConfig(enable_pdl=False)` for TRT. Its earlier
+352-pair search varied native tactics with that flag fixed. Frost's SM100
+kernels internally enable PDL despite the adapter configuration flag, so
+these numbers do not establish the gap to the fastest PDL-enabled TRT path.
+
+Likewise, the RTX PRO6000 Blackwell Server comparison (audit1965,
+Frost84.904125us versus CUTLASS87.9780625us) searched all64 native tactic pairs
+with CUTLASS PDL disabled. Its3.494% advantage is scoped to that configuration,
+not an exhaustive optimum across launch settings. Both native runners forward
+the flag to their implementation; neither setting can be assumed neutral.
+
+These measurements and correctness checks remain evidence for their recorded
+settings. The fixed-source Frost ablations, including the9.66–9.82% compact
+resource gain and larger-row admission results, keep their stated scope.
+Claims of a strongest competing backend require searching PDL off and on,
+then revalidating and retiming the selected route. That broader comparison
+is pending; no new performance numbers or runtime changes are published here.
+This clarification supersedes unqualified "strongest" wording below.
+
 ## Paired FC1 row-range extension and current SM120 evidence — 2026-09-17
 
 Engine20401 now accepts1..513 routed rows, retaining the same generic compact
