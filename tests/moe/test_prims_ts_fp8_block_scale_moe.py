@@ -32,6 +32,7 @@ from flashinfer.fused_moe import (
     prims_ts_fp8_block_scale_moe,
     prims_ts_fp8_block_scale_routed_moe,
 )
+from flashinfer.fused_moe.core import get_trtllm_moe_sm100_module
 from flashinfer.prims_ts.utils import is_prims_ts_available
 from flashinfer.tllm_enums import ActivationType, Fp8QuantizationType
 from flashinfer.utils import device_support_pdl, get_compute_capability
@@ -45,6 +46,58 @@ def cache_permute_indices():
 def _skip_prims_ts_on_sm107() -> None:
     if get_compute_capability(torch.device("cuda")) == (10, 7):
         pytest.skip("Prims-TS MoE kernels support SM100 and SM103, not SM107")
+
+
+@pytest.mark.parametrize(
+    ("argument_index", "dtype", "error_match"),
+    [
+        pytest.param(
+            6,
+            torch.int32,
+            "cta_idx_xy_to_batch_idx must be a CUDA tensor",
+            id="tile-map",
+        ),
+        pytest.param(7, torch.float32, "gemm1_alpha must be a CUDA tensor", id="alpha"),
+        pytest.param(8, torch.float32, "gemm1_beta must be a CUDA tensor", id="beta"),
+        pytest.param(
+            9,
+            torch.float32,
+            "gemm1_clamp_limit must be a CUDA tensor",
+            id="clamp-limit",
+        ),
+    ],
+)
+def test_deepseek_fp8_activation_rejects_cpu_auxiliary_tensors(
+    argument_index,
+    dtype,
+    error_match,
+):
+    """The native staged-activation ABI must reject host pointers before launch."""
+    device = torch.device("cuda")
+    arguments = [
+        torch.empty((1, 2), dtype=torch.uint8, device=device),
+        torch.empty(1, dtype=torch.float32, device=device),
+        torch.empty((1, 1), dtype=torch.uint8, device=device),
+        torch.empty(1, dtype=torch.float32, device=device),
+        torch.zeros(1, dtype=torch.int32, device=device),
+        torch.ones(1, dtype=torch.int32, device=device),
+        torch.zeros(1, dtype=torch.int32, device=device),
+        None,
+        None,
+        None,
+        1,  # num_tokens
+        1,  # top_k
+        1,  # intermediate_size
+        1,  # local_num_experts
+        1,  # tile_tokens_dim
+        ActivationType.Situ.value,
+        False,  # enable_pdl
+    ]
+    arguments[argument_index] = torch.zeros(1, dtype=dtype, device="cpu")
+
+    moe_op = get_trtllm_moe_sm100_module().moe_op
+    with pytest.raises(RuntimeError, match=error_match):
+        moe_op.trtllm_moe_run_deepseek_fp8_activation(*arguments)
 
 
 @pytest.mark.parametrize(
