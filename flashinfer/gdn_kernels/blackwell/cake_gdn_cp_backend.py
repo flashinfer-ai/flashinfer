@@ -174,9 +174,7 @@ def _default_physical_chunk_len(
                 granularity = 2 * _BLOCK
             # Strongly uneven grids retain the measured 512-token policy.
         elif (
-            num_seqs == 2
-            and num_heads == 64
-            and total_tokens != num_seqs * max_seqlen
+            num_seqs == 2 and num_heads == 64 and total_tokens != num_seqs * max_seqlen
         ):
             if 4 * max_seqlen > 3 * total_tokens:
                 # The half-total partition improves the rectangular grid's
