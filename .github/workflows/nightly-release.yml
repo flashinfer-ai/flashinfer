@@ -386,6 +386,8 @@ jobs:
           RELEASE_SUFFIX: ${{ needs.setup.outputs.dev_suffix }}
           RELEASE_TAG: ${{ needs.setup.outputs.release_tag }}
           RELEASE_VERSION: ${{ needs.setup.outputs.version }}
+          SOURCE_COMMIT_URL: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
+          SOURCE_SHA: ${{ github.sha }}
         run: |
           # Delete existing release and tag if they exist
           if gh release view "${RELEASE_TAG}" --repo "${NIGHTLY_RELEASE_REPOSITORY}" &>/dev/null; then
@@ -397,10 +399,16 @@ jobs:
           fi
 
           # Create new release without assets first
+          printf -v RELEASE_NOTES \
+            'Automated nightly build for version %s (dev%s)\n\nSource commit: [%s](%s)' \
+            "${RELEASE_VERSION}" \
+            "${RELEASE_SUFFIX}" \
+            "${SOURCE_SHA}" \
+            "${SOURCE_COMMIT_URL}"
           gh release create "${RELEASE_TAG}" \
             --repo "${NIGHTLY_RELEASE_REPOSITORY}" \
             --title "Nightly Release v${RELEASE_VERSION}-${RELEASE_SUFFIX}" \
-            --notes "Automated nightly build for version ${RELEASE_VERSION} (dev${RELEASE_SUFFIX})" \
+            --notes "${RELEASE_NOTES}" \
             --prerelease
 
       - name: Download flashinfer-python artifact
