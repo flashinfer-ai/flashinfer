@@ -992,8 +992,8 @@ _DEPLOYMENT = dict(
     topk=TOPK,
     max_blocks=MAX_BLOCKS,
     seqlen_q=1,
-    total_q=16,
-    num_pages=2048,
+    total_q=64,
+    num_pages=8192,
 )
 
 
@@ -1026,57 +1026,45 @@ def test_each_axis_of_the_pin_is_load_bearing(axis, value):
     )
 
 
-def test_a_batch_of_32_over_a_toy_page_pool_is_outside_the_pinned_envelope():
-    """The eval-shaped small-pool case, which serving never produces.
-
-    Batch 32 is now outside the envelope for a SECOND and stronger reason --
-    it takes the clustered multi-chunk instantiation, which is not
-    deterministic (see test_the_pin_never_admits_a_clustered_multichunk_shape)
-    -- so the small-pool rule is asserted at a batch the new rule does not
-    already cover.
-    """
-    assert nvfp4.pinned_path_reason(**dict(_DEPLOYMENT, total_q=32, num_pages=64))
+def test_the_pinned_envelope_is_exactly_the_unclustered_row():
+    """Batch 32 is the last clustered batch, 33 the first unclustered one."""
+    for num_pages in (64, 4096):
+        reason = nvfp4.pinned_path_reason(
+            **dict(_DEPLOYMENT, total_q=32, num_pages=num_pages)
+        )
+        assert reason is not None and "cluster" in reason, reason
     assert (
-        nvfp4.pinned_path_reason(**dict(_DEPLOYMENT, total_q=16, num_pages=2048))
+        nvfp4.pinned_path_reason(**dict(_DEPLOYMENT, total_q=33, num_pages=33 * 128))
         is None
     )
+    assert nvfp4.pinned_path_reason(**_DEPLOYMENT) is None
 
 
-def test_the_pin_never_admits_a_clustered_multichunk_shape():
-    """The correctness rule the pinned family now carries, over every batch.
+def test_the_pin_never_admits_a_clustered_shape():
+    """The correctness rule the pinned family carries, over every batch.
 
-    `geom::pinned`'s chunk loop runs `kPages / kChunk` times with
-    `kPages = topk / split`, and the `c != 0` iterations read-modify-write the
-    running FP32 numerator in Tensor Memory. Inside a cluster that store is
-    observed only partially: GB300, batch 32 / seq 8192, 3,000 trials per
-    cell, twice --
-
-        cluster 2, two chunks    3.37% / 3.40%      the same code, no rescale
-        cluster 2, four chunks  19.67% / 18.73%     0.07% / 0.00%
-        cluster 4, two chunks    7.87%
-        NO cluster, four chunks  0.00%   (0 of 3,000, twice)
-        NO cluster, eight chunks 0.00%   (0 of 3,000, twice)
-
-    -- so no shape may take a clustered instantiation that runs more than one
-    chunk. This walks every batch the dispatch can reach, in both page-pool
-    regimes, against the module's own copy of the launcher's arithmetic.
+    A clustered pinned instantiation is not deterministic run to run. GB300,
+    seq 8192, 3,000 trials per cell, twice: the split-2 rows, whose chunk loop
+    read-modify-writes the FP32 numerator in Tensor Memory between MMAs,
+    mismatch in 3.4-19.7% of trials; the clustered single-chunk rows, split 4
+    and split 8, in 0.05% and 0.20% with no identified site; the unclustered
+    split-1 row and the general family in 0 of 3,000 eager and 0 of 1,000
+    CUDA-graph replays. So only split 1 is admitted. This walks every batch
+    the dispatch can reach, in both page-pool regimes, against the module's
+    own copy of the launcher's arithmetic.
     """
-    admitted_clustered_multichunk = []
-    rejected = []
+    admitted, rejected = set(), set()
     for total_q in range(1, 513):
         for num_pages in (64 * total_q, 8 * total_q):
             coordinate = dict(_DEPLOYMENT, total_q=total_q, num_pages=num_pages)
             reason = nvfp4.pinned_path_reason(**coordinate)
-            multichunk = nvfp4.pinned_is_clustered_multichunk(total_q, num_pages)
-            if reason is None and multichunk:
-                admitted_clustered_multichunk.append((total_q, num_pages))
-            if multichunk:
-                rejected.append(total_q)
-    assert not admitted_clustered_multichunk, admitted_clustered_multichunk
-    # ...and the rule bites exactly where the defect was measured: the split-2
-    # band, total_q 17..32, and nowhere else. A rule that rejected everything
-    # would also satisfy the assertion above.
-    assert sorted(set(rejected)) == list(range(17, 33))
+            split = nvfp4._pinned_split_for(total_q, num_pages)
+            assert (reason is None) == (split == 1), (total_q, num_pages, split, reason)
+            (admitted if reason is None else rejected).add(total_q)
+    # ...and the rule bites exactly where the clusters are, and nowhere else.
+    # A rule that rejected everything would also satisfy the assertion above.
+    assert sorted(rejected) == list(range(1, 33))
+    assert sorted(admitted) == list(range(33, 513))
 
 
 def test_missing_the_pin_is_a_speed_statement_not_a_refusal(cpu_inputs):
@@ -1095,7 +1083,7 @@ def test_missing_the_pin_is_a_speed_statement_not_a_refusal(cpu_inputs):
     assert nvfp4.pinned_path_reason(**dict(_DEPLOYMENT, max_blocks=MAX_BLOCKS + 1))
 
 
-def test_the_dispatch_hands_its_decision_to_the_binding(cpu_inputs):
+def test_the_dispatch_hands_its_decision_to_the_binding():
     """The binding cross-checks it, so it must actually be sent."""
     sent = []
 
@@ -1104,7 +1092,9 @@ def test_the_dispatch_hands_its_decision_to_the_binding(cpu_inputs):
         def msa_decode_nvfp4_specialized(*args):
             sent.append(args[-1])
 
-    inputs = dict(cpu_inputs)
+    # A batch the pinned family serves -- its unclustered split-1 row -- so the
+    # decision sent is 1 first and 0 after the table is widened.
+    inputs = dict(_build_inputs(64, [1024] * 64, torch.device("cpu")))
     inputs["out"] = torch.empty_like(inputs["q"])
     inputs.pop("k_global_scale_tensor", None)
     call = dict(
@@ -1124,7 +1114,7 @@ def test_the_dispatch_hands_its_decision_to_the_binding(cpu_inputs):
         v_global_scale=inputs["v_global_scale"],
     )
     nvfp4._dispatch(_StubModule, **call)
-    assert sent == [1], "the deployment shape must take the pinned family"
+    assert sent == [1], "the unclustered pinned row must take the pinned family"
 
     wider = torch.zeros(call["page_table"].shape[0], MAX_BLOCKS + 1, dtype=torch.int32)
     wider[:, :MAX_BLOCKS] = call["page_table"]
@@ -1822,9 +1812,9 @@ def test_capture_before_any_warm_is_rejected_and_warm_alone_clears_it(monkeypatc
     device = torch.device("cuda", torch.cuda.current_device())
     inputs = _build_inputs(4, [8192] * 4, device, seed=21)
     # Build the module so the failure is about warming and not about the JIT.
-    # Pinned, explicitly: this test then RESETS the warm latch, so it must not
+    # Named explicitly: this test then RESETS the warm latch, so it must not
     # be the test that leaves the route's warm state a variable.
-    _call_on(PINNED, inputs, monkeypatch)
+    _call_on(PARAMETRIC, inputs, monkeypatch)
     torch.cuda.synchronize()
 
     warmed = set(nvfp4._warmed_devices)
@@ -1882,7 +1872,7 @@ def test_the_two_instantiation_families_agree_on_the_same_call(monkeypatch):
     call from the pinned family to the parametric one, so the two families are
     compared on inputs that are otherwise byte-identical.
     """
-    inputs = _build_inputs(8, [4096] * 8, torch.device("cuda"), seed=11)
+    inputs = _build_inputs(64, [4096] * 64, torch.device("cuda"), seed=11)
     assert nvfp4.selects_pinned_path(
         **nvfp4._pinned_kwargs_for(
             inputs["q"],
@@ -1922,17 +1912,21 @@ def test_the_two_instantiation_families_agree_on_the_same_call(monkeypatch):
 
 
 @sm100_only
-def test_the_deployment_shape_actually_takes_the_pinned_family(monkeypatch):
+def test_the_pinned_family_is_reached_only_at_its_unclustered_row(monkeypatch):
     """The counter is the instrument that catches a pin that stopped matching.
 
     Inside the C++ translation unit, which is where the pinned family lives --
-    so the C++ body is forced deliberately and named. Under the production route
-    this shape is served by the CuTe-DSL body instead, which is what
-    ``test_a_tensor_parallel_rank_takes_the_parametric_family[tp1]`` asserts;
-    the two facts are separate and neither is the other's default.
+    so the C++ body is forced deliberately and named. Batch 16 selects a
+    clustered pinned instantiation, which is not deterministic, so the general
+    family serves it; batch 64 selects the unclustered one and is pinned.
+    Under the production route both shapes are served by the CuTe-DSL body
+    instead, which ``test_a_tensor_parallel_rank_takes_the_parametric_family``
+    asserts; the two facts are separate and neither is the other's default.
     """
-    inputs = _build_inputs(16, [8192] * 16, torch.device("cuda"), seed=12)
-    _call_on(PINNED, inputs, monkeypatch, route="pingpong")
+    clustered = _build_inputs(16, [8192] * 16, torch.device("cuda"), seed=12)
+    _call_on(PARAMETRIC, clustered, monkeypatch, route="pingpong")
+    unclustered = _build_inputs(64, [8192] * 64, torch.device("cuda"), seed=12)
+    _call_on(PINNED, unclustered, monkeypatch, route="pingpong")
 
 
 @sm100_only
@@ -2063,7 +2057,7 @@ def test_a_malformed_out_raises_rather_than_being_copied_into(
     inputs = _build_inputs(4, [2048] * 4, torch.device("cuda"), seed=33)
     # Warm, so the failure is about `out` and not about the JIT. Named, because
     # even a warm-up call has to be a call to a body somebody chose.
-    _call_on(PINNED, inputs, monkeypatch)
+    _call_on(PARAMETRIC, inputs, monkeypatch)
     with pytest.raises((ValueError, TypeError), match=fragment):
         _call(inputs, out=mangle(torch.empty_like(inputs["q"])))
 
@@ -2071,7 +2065,7 @@ def test_a_malformed_out_raises_rather_than_being_copied_into(
 @sm100_only
 def test_a_non_contiguous_out_raises(monkeypatch):
     inputs = _build_inputs(4, [2048] * 4, torch.device("cuda"), seed=34)
-    _call_on(PINNED, inputs, monkeypatch)
+    _call_on(PARAMETRIC, inputs, monkeypatch)
     wide = torch.empty(
         (4, NUM_QO_HEADS, 2 * HEAD_DIM), dtype=torch.bfloat16, device="cuda"
     )
@@ -2086,10 +2080,9 @@ _BOTH_FAMILY_ROWS = [
     # (batch, lengths, seqlen_q, the family the shape selects inside the C++ TU)
     (32, [8192] * 32, 1, PARAMETRIC),
     (8, [4096] * 8, 2, PARAMETRIC),
-    # The pinned row, which the two above stopped covering when the clustered
-    # multi-chunk guard moved batch 17..32 onto the parametric family: without
-    # it the test named "across both families" ran on one family twice.
-    (16, [8192] * 16, 1, PINNED),
+    # The pinned row: the family is reached only at its unclustered split-1
+    # instantiation, batch 33 and above.
+    (64, [8192] * 64, 1, PINNED),
 ]
 
 
@@ -2567,7 +2560,7 @@ def test_the_specialised_implementation_over_its_own_shape_sweep(
     exactly the case where a partial final block, an empty request and a
     block-id past the staged block-table prefix never occur. The pin is gone
     and the rows stay: they are now swept on the C++ translation unit too,
-    where 22..31 is the band the clustered multi-chunk guard moved.
+    where every batch up to 32 is the band the clustered-pinned guard moves.
     """
 
     inputs = _build_inputs(batch, seq_lengths, torch.device("cuda"), seed=batch + 7)

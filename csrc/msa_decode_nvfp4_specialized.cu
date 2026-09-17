@@ -233,63 +233,28 @@ inline int pinned_split_for(int total_q, int num_pages) {
   return split;
 }
 
-inline int pinned_chunk_for(int split, bool short_cache) {
-  if (split == 8) return 2;
-  if (split == 2 && short_cache) return 2;
-  return 4;
-}
-
-// A CLUSTERED PINNED INSTANTIATION WHOSE CHUNK LOOP RUNS MORE THAN ONCE IS NOT
-// DETERMINISTIC ON THIS TARGET.
+// A CLUSTERED PINNED INSTANTIATION IS NOT DETERMINISTIC ON THIS TARGET, so
+// only the unclustered split-1 row is ever selected.
 //
-// `kPages = kTopK / split` selected pages per rank against a `chunk`-page
-// window, so `kPages > chunk` is what makes the loop run more than once -- and
-// what makes it execute the `c != 0` block, which READ-MODIFY-WRITES the
-// running FP32 numerator in Tensor Memory (`tcgen05.ld` -> scale by alpha ->
-// `tcgen05.st`) before the next PV `tcgen05.mma` accumulates into the same
-// columns.  Inside a cluster that store is observed only partially: whole
-// 16-lane groups of the 128 TMEM lanes keep their un-rescaled value, so 16, 32
-// ... 128 consecutive head dims of one (token, kv-head) tile come out short by
-// the factor alpha, across all sixteen heads and both cluster ranks.
+// Measured on GB300, seq 8192, 3,000 trials per cell, twice.  The split-2 rows,
+// whose chunk loop runs more than once, mismatch run to run in 3.4-19.7% of
+// trials: their `c != 0` block read-modify-writes the running FP32 numerator in
+// Tensor Memory before the next PV `tcgen05.mma` accumulates into the same
+// columns, and inside a cluster that store is observed only partially.  The
+// clustered single-chunk rows -- split 4 and split 8, batch 1..16 -- carry a
+// smaller residual with no identified site: 0.05% and 0.20%.  The unclustered
+// split-1 row and the general family read 0 of 3,000 eager and 0 of 1,000
+// CUDA-graph replays.
 //
-// Measured on GB300, batch 32 / seq 8192, 3,000 trials per cell, twice:
-//
-//   cluster  chunks  rescales  rate          the same code without the rescale
-//      2        2        1     3.37 / 3.40%  0.07% / 0.00%
-//      2        4        3    19.67 / 18.73% --
-//      4        2        1     7.87%         --
-//      1        4        3     0.00%  (0 of 3,000, twice, with and without
-//      1        8        7     0.00%   the split-cluster PV ordering)
-//
-// so the rescale is the site and a cluster is its precondition; the predicate
-// below excludes exactly that combination.
-//
-// The shipped table's only clustered multi-chunk rows are the two split-2 ones
-// (kPages 8 against chunk 4, and chunk 2 on a short cache), i.e. total_q 17..32.
-// They go to the general family, which reads 0 of 3,000 eager and 0 of 1,000
-// CUDA-graph replays at batches 17..32 for +0.0 to +1.9 us per call.  Both
-// split-2 kernels stay COMPILED and are simply never selected, so the
-// allowlist's kernel count is unchanged and no call shape can trigger a build.
-//
-// The single-chunk clustered rows still carry a residual of 0.05% (split 4) and
-// 0.20% (split 8) against split 1's < 0.031%; this predicate does not address
-// that and does not claim to.
-inline bool pinned_is_clustered_multichunk(int total_q, int num_pages) {
-  const int split = pinned_split_for(total_q, num_pages);
-  if (split == 1) return false;
-  return (kTopK / split) > pinned_chunk_for(split, num_pages < 32 * total_q);
-}
-
+// So `pinned_split_for(...) == 1` -- batch 33 and above at the pinned geometry
+// -- is the whole envelope; the general family serves every smaller batch,
+// deterministically.  The clustered instantiations stay COMPILED and are simply
+// never selected, so the allowlist's kernel count is unchanged and no call shape
+// can trigger a build.
 inline bool selects_pinned_path(const PinnedEnvelope& e) {
-  // A batch of 32 whose page pool is smaller than 32 rows per request is an
-  // out-of-deployment shape (the serving pool is ~2.3M pages); the pinned
-  // family's short-cache instantiation is not tuned for it, so it is routed to
-  // the general one rather than guessed at.
-  const bool short_batch32 = e.total_q == 32 && e.num_pages < 32 * e.total_q;
   return e.num_q_heads == kNumQHeads && e.num_kv_heads == kNumKVHeads && e.head_dim == kHeadDim &&
          e.page_size == kPageSize && e.topk == kTopK && e.max_blocks == kMaxBlocks &&
-         e.seqlen_q == 1 && !short_batch32 &&
-         !pinned_is_clustered_multichunk(e.total_q, e.num_pages);
+         e.seqlen_q == 1 && pinned_split_for(e.total_q, e.num_pages) == 1;
 }
 
 namespace general {

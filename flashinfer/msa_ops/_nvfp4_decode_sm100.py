@@ -1201,22 +1201,15 @@ def pinned_path_reason(
         return f"block-table width {max_blocks} != {_PINNED_MAX_BLOCKS}"
     if seqlen_q != 1:
         return f"seqlen_q {seqlen_q} != 1"
-    # A batch of 32 over a page pool smaller than 32 rows per request is not a
-    # serving shape (a serving pool is millions of pages); the pinned family's
-    # short-cache instantiation is not tuned for it, so it is routed to the
-    # general family rather than guessed at.
-    if total_q == 32 and num_pages < 32 * total_q:
-        return f"batch 32 over a {num_pages}-page pool is outside the pinned envelope"
-    # A CLUSTERED PINNED INSTANTIATION WHOSE CHUNK LOOP RUNS MORE THAN ONCE IS
-    # NOT DETERMINISTIC ON THIS TARGET -- see pinned_is_clustered_multichunk.
-    # In the shipped table that is exactly the two split-2 rows, total_q 17..32.
-    if pinned_is_clustered_multichunk(total_q, num_pages):
-        split = _pinned_split_for(total_q, num_pages)
-        chunks = (_TOPK // split) // _pinned_chunk_for(split, num_pages < 32 * total_q)
+    # A clustered pinned instantiation is not deterministic run to run on this
+    # target (see selects_pinned_path in the C++ copy for the measurements), so
+    # only the unclustered split-1 row is selected: batch 33 and above.
+    split = _pinned_split_for(total_q, num_pages)
+    if split != 1:
         return (
             f"total_q {total_q} takes the pinned family's split-{split} "
-            f"instantiation, whose chunk loop runs {chunks} times inside a "
-            f"cluster; its TMEM rescale is not deterministic there"
+            f"instantiation, a {split}-CTA cluster, which is not deterministic "
+            f"run to run; the general family serves it"
         )
     return None
 
@@ -1229,44 +1222,6 @@ def _pinned_split_for(total_q: int, num_pages: int) -> int:
     if total_q == 8 and not (num_pages < 32 * total_q):
         split = 4
     return split
-
-
-def _pinned_chunk_for(split: int, short_cache: bool) -> int:
-    """The chunk width ``geom::pinned::launch`` would choose for that split."""
-
-    if split == 8:
-        return 2
-    if split == 2 and short_cache:
-        return 2
-    return 4
-
-
-def pinned_is_clustered_multichunk(total_q: int, num_pages: int) -> bool:
-    """Would the pinned family run its TMEM rescale inside a cluster here?
-
-    ``kPages = topk // split`` selected pages per rank against a ``chunk``-page
-    window, so ``kPages > chunk`` is what makes the chunk loop run more than
-    once and execute the ``c != 0`` block, which read-modify-writes the running
-    FP32 numerator in Tensor Memory before the next PV MMA accumulates into the
-    same columns. Inside a cluster that store is observed only partially --
-    whole 16-lane groups of the 128 TMEM lanes keep their un-rescaled value --
-    and one (token, kv-head) tile comes out short by the factor alpha over 16,
-    32 ... 128 consecutive head dims, across all sixteen heads and both cluster
-    ranks.
-
-    GB300, batch 32 / seq 8192, 3,000 trials per cell, reproduced twice:
-    cluster 2 with two chunks 3.37%/3.40%, with four chunks 19.67%/18.73%;
-    cluster 4 with two chunks 7.87%; the SAME code with the rescale removed
-    0.07%/0.00%; and the same three or seven rescales with NO cluster 0 of
-    3,000, twice. Why a cluster opens the window is not explained. See
-    csrc/msa_decode_nvfp4_specialized.cu for the C++ copy, which is what
-    dispatches; the binding hard-errors if the two disagree.
-    """
-
-    split = _pinned_split_for(total_q, num_pages)
-    if split == 1:
-        return False
-    return (_TOPK // split) > _pinned_chunk_for(split, num_pages < 32 * total_q)
 
 
 def selects_pinned_path(**kwargs: int) -> bool:
