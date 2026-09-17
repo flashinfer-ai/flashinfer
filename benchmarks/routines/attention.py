@@ -762,22 +762,31 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
         if remove_fa2_tc:
             backends.remove("fa2_tc")
 
-    if "cudnn" in backends:
+    for cudnn_backend in ("cudnn", "cudnn-native"):
+        if cudnn_backend not in backends:
+            continue
         remove_cudnn = False
         if speculative_decode:
-            print("[INFO] cuDNN backend does not support speculative decode. Skipping.")
+            print(
+                f"[INFO] {cudnn_backend} backend does not support speculative decode. Skipping."
+            )
             remove_cudnn = True
-        if o_data_type != torch.bfloat16:
-            print("[INFO] cuDNN decode requires BF16 output. Skipping.")
+        if not (q_dtype == kv_dtype == o_data_type) or q_dtype not in (
+            torch.bfloat16,
+            torch.float16,
+        ):
+            print(
+                f"[INFO] {cudnn_backend} decode requires one fp16/bf16 dtype for q, kv and out. Skipping."
+            )
             remove_cudnn = True
-        if q_dtype in [torch.float8_e4m3fn, torch.float8_e5m2] or kv_dtype in [
-            torch.float8_e4m3fn,
-            torch.float8_e5m2,
-        ]:
-            print("[INFO] cuDNN backend does not support FP8. Skipping.")
+        elif q_dtype == torch.float16 and not CUDNN_AVAILABLE:
+            print(
+                f"[INFO] {cudnn_backend} fp16 decode requires the cudnn-frontend python package "
+                "(the fallback cubin path is bf16-only). Skipping."
+            )
             remove_cudnn = True
         if remove_cudnn:
-            backends.remove("cudnn")
+            backends.remove(cudnn_backend)
 
     if "auto" in backends:
         remove_auto = False
@@ -1011,7 +1020,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
     backend_wrappers = {}
     resolved_backends = {}
     for backend in backends:
-        if backend in ["fa2", "fa2_tc", "auto", "trtllm-gen"]:
+        if backend in ["fa2", "fa2_tc", "auto", "trtllm-gen", "cudnn"]:
             plan_kv_indptr = (
                 kv_indptr.clone().detach() if backend == "trtllm-gen" else kv_indptr
             )
@@ -1022,7 +1031,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 workspace_buffer,
                 "HND",
                 use_cuda_graph=is_cuda_graph_compatible,
-                use_tensor_cores=(backend != "fa2"),
+                use_tensor_cores=(backend not in ("fa2", "cudnn")),
                 paged_kv_indptr_buffer=plan_kv_indptr,
                 paged_kv_indices_buffer=kv_indices,
                 paged_kv_last_page_len_buffer=kv_last_page_len,
@@ -1134,7 +1143,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
         speculative_mask,
         out,
     ):
-        if backend in ["fa2", "fa2_tc", "auto", "trtllm-gen"]:
+        if backend in ["fa2", "fa2_tc", "auto", "trtllm-gen", "cudnn"]:
             wrapper_kv = kv_cache_nvfp4 if is_nvfp4_kv else kv_cache
             return backend_wrappers[backend].run(
                 q,
@@ -1146,7 +1155,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 enable_pdl=args.enable_pdl,
                 out=out,
             )
-        elif backend == "cudnn":
+        elif backend == "cudnn-native":
             return flashinfer.decode.cudnn_batch_decode_with_kv_cache(
                 q,
                 k_cache,
@@ -1211,8 +1220,8 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
         workspace_buffer.zero_()
         runtime_kv_cache = prims_ts_kv_cache if cur_backend == "prims-ts" else kv_cache
         runtime_out = backend_outputs[cur_backend]
-        runtime_k_cache = k_cache if cur_backend == "cudnn" else None
-        runtime_v_cache = v_cache if cur_backend == "cudnn" else None
+        runtime_k_cache = k_cache if cur_backend == "cudnn-native" else None
+        runtime_v_cache = v_cache if cur_backend == "cudnn-native" else None
         runtime_workspace = None if cur_backend == "prims-ts" else workspace_buffer
         if run_refcheck:
             outputs[cur_backend] = (
