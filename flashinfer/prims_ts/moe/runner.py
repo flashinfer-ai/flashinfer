@@ -2321,6 +2321,13 @@ class PrimsTsFp8BlockScaleMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             activation_output = gemm1_output
             activation_output_scale = gemm1_output_scale
 
+        gemm1_oa_io_kwargs = _gemm1_oa_io_kwargs(kwargs)
+        if self.fp8_quantization_type == Fp8QuantizationType.DeepSeekFp8:
+            # DeepSeek FP8 keeps FC1 activation outside the Prims-TS GEMM. Its
+            # per-expert activation parameters are consumed by the staged
+            # activation kernel below, not by the FC1 epilogue.
+            gemm1_oa_io_kwargs = dict.fromkeys(gemm1_oa_io_kwargs)
+
         common_io_kwargs = dict(
             fp8_quantization_type=int(self.fp8_quantization_type),
             hidden_states=hidden_states,
@@ -2331,7 +2338,7 @@ class PrimsTsFp8BlockScaleMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             gemm2_weights_scale=kwargs["gemm2_weights_scale"],
             gemm1_bias=kwargs.get("gemm1_bias"),
             gemm2_bias=kwargs.get("gemm2_bias"),
-            **_gemm1_oa_io_kwargs(kwargs),
+            **gemm1_oa_io_kwargs,
             gemm1_output=gemm1_output,
             gemm1_output_scale=gemm1_output_scale,
             activation_output=activation_output,
@@ -2366,9 +2373,15 @@ class PrimsTsFp8BlockScaleMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
                 activation_output_scale,
                 expanded_idx_to_permuted_idx,
                 total_num_padded_tokens,
+                tile_idx,
+                kwargs.get("gemm1_alpha"),
+                kwargs.get("gemm1_beta"),
+                kwargs.get("gemm1_clamp_limit"),
                 num_tokens,
                 self.top_k,
                 self.intermediate_size,
+                self.num_local_experts,
+                fc1_cfg.tile_n,
                 int(self.activation_type),
                 kwargs["enable_pdl"],
             )

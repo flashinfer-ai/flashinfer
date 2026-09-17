@@ -3053,13 +3053,14 @@ void trtllm_moe_run_finalize(TensorView gemm2_output, TensorView output, TensorV
                           num_experts, top_k, hidden_size, enable_pdl, use_routing_scales_on_input);
 }
 
-void trtllm_moe_run_deepseek_fp8_activation(TensorView gemm1_output, TensorView gemm1_output_scale,
-                                            TensorView activation_output,
-                                            TensorView activation_output_scale,
-                                            TensorView expanded_idx_to_permuted_idx,
-                                            TensorView total_num_padded_tokens, int64_t num_tokens,
-                                            int64_t top_k, int64_t intermediate_size,
-                                            int64_t activation_type, bool enable_pdl) {
+void trtllm_moe_run_deepseek_fp8_activation(
+    TensorView gemm1_output, TensorView gemm1_output_scale, TensorView activation_output,
+    TensorView activation_output_scale, TensorView expanded_idx_to_permuted_idx,
+    TensorView total_num_padded_tokens, TensorView cta_idx_xy_to_batch_idx,
+    Optional<TensorView> gemm1_alpha, Optional<TensorView> gemm1_beta,
+    Optional<TensorView> gemm1_clamp_limit, int64_t num_tokens, int64_t top_k,
+    int64_t intermediate_size, int64_t local_num_experts, int64_t tile_tokens_dim,
+    int64_t activation_type, bool enable_pdl) {
   TVM_FFI_ICHECK_EQ(gemm1_output.dtype(), dl_uint8)
       << "DeepSeek FP8 activation: gemm1_output must be uint8 FP8 storage.";
   TVM_FFI_ICHECK_EQ(gemm1_output_scale.dtype(), dl_float32)
@@ -3072,12 +3073,45 @@ void trtllm_moe_run_deepseek_fp8_activation(TensorView gemm1_output, TensorView 
       << "DeepSeek FP8 activation: expanded_idx_to_permuted_idx must be int32.";
   TVM_FFI_ICHECK_EQ(total_num_padded_tokens.dtype(), dl_int32)
       << "DeepSeek FP8 activation: total_num_padded_tokens must be int32.";
+  TVM_FFI_ICHECK_EQ(cta_idx_xy_to_batch_idx.dtype(), dl_int32)
+      << "DeepSeek FP8 activation: cta_idx_xy_to_batch_idx must be int32.";
+  TVM_FFI_ICHECK_EQ(cta_idx_xy_to_batch_idx.ndim(), 1)
+      << "DeepSeek FP8 activation: cta_idx_xy_to_batch_idx must be 1D.";
+  TVM_FFI_ICHECK(cta_idx_xy_to_batch_idx.IsContiguous())
+      << "DeepSeek FP8 activation: cta_idx_xy_to_batch_idx must be contiguous.";
+  TVM_FFI_ICHECK_EQ(cta_idx_xy_to_batch_idx.device().device_id,
+                    activation_output.device().device_id)
+      << "DeepSeek FP8 activation: cta_idx_xy_to_batch_idx must be on the output device.";
+  TVM_FFI_ICHECK(tile_tokens_dim > 0)
+      << "DeepSeek FP8 activation: tile_tokens_dim must be positive.";
+  TVM_FFI_ICHECK(local_num_experts > 0)
+      << "DeepSeek FP8 activation: local_num_experts must be positive.";
 
   auto const activation = validateAndCastActivationType(activation_type);
+  TVM_FFI_ICHECK(activation == ActivationType::Swiglu || activation == ActivationType::Situ)
+      << "DeepSeek FP8 activation only supports Swiglu and Situ, got " << activation_type << ".";
+  auto check_optional_param = [&](Optional<TensorView> const& tensor, char const* name) {
+    if (!tensor.has_value()) {
+      return;
+    }
+    auto const& value = tensor.value();
+    TVM_FFI_ICHECK_EQ(value.dtype(), dl_float32) << name << " must be float32.";
+    TVM_FFI_ICHECK_EQ(value.ndim(), 1) << name << " must be 1D.";
+    TVM_FFI_ICHECK(value.size(0) >= local_num_experts)
+        << name << " must have at least local_num_experts elements.";
+    TVM_FFI_ICHECK(value.IsContiguous()) << name << " must be contiguous.";
+    TVM_FFI_ICHECK_EQ(value.device().device_id, activation_output.device().device_id)
+        << name << " must be on the output device.";
+  };
+  check_optional_param(gemm1_alpha, "gemm1_alpha");
+  check_optional_param(gemm1_beta, "gemm1_beta");
+  check_optional_param(gemm1_clamp_limit, "gemm1_clamp_limit");
+
   moe::dev::activation::Data activationData;
   activationData.mDtypeElt = btg::Dtype::E4m3;
   activationData.mUsePdl = enable_pdl;
   activationData.mUseDeepSeekFp8 = true;
+  activationData.mUseSitu = activation == ActivationType::Situ;
   activationData.inPtr = const_cast<void*>(gemm1_output.data_ptr());
   activationData.outPtr = activation_output.data_ptr();
   activationData.inDqSfsPtr = static_cast<float*>(const_cast<void*>(gemm1_output_scale.data_ptr()));
@@ -3090,6 +3124,16 @@ void trtllm_moe_run_deepseek_fp8_activation(TensorView gemm1_output, TensorView 
       static_cast<int32_t*>(const_cast<void*>(expanded_idx_to_permuted_idx.data_ptr()));
   activationData.totalNumPaddedTokens =
       static_cast<int32_t*>(const_cast<void*>(total_num_padded_tokens.data_ptr()));
+  activationData.gatedActAlphaPtr =
+      gemm1_alpha.has_value() ? static_cast<float*>(gemm1_alpha.value().data_ptr()) : nullptr;
+  activationData.gatedActBetaPtr =
+      gemm1_beta.has_value() ? static_cast<float*>(gemm1_beta.value().data_ptr()) : nullptr;
+  activationData.gatedActClampLimitPtr =
+      gemm1_clamp_limit.has_value() ? static_cast<float*>(gemm1_clamp_limit.value().data_ptr())
+                                    : nullptr;
+  activationData.ctaIdxXyToBatchIdx =
+      static_cast<int32_t*>(const_cast<void*>(cta_idx_xy_to_batch_idx.data_ptr()));
+  activationData.tileTokensDim = static_cast<int32_t>(tile_tokens_dim);
 
   cudaStream_t stream = get_stream(activation_output.device());
   moe::dev::activation::run(activationData, stream);

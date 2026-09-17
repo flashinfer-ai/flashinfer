@@ -747,8 +747,11 @@ def is_prims_ts_fp8_block_scale_supported(
     activation_type = kwargs.get("activation_type", runner.activation_type)
     if not any(_enum_eq(activation_type, act) for act in _SUPPORTED_ACTIVATIONS):
         return False, "activation must be Identity, Swiglu, Geglu, Silu, Relu2, or Situ"
-    if is_deepseek and not _enum_eq(activation_type, ActivationType.Swiglu):
-        return False, "DeepSeek FP8 Prims-TS integration currently exposes Swiglu only"
+    if is_deepseek and not any(
+        _enum_eq(activation_type, act)
+        for act in (ActivationType.Swiglu, ActivationType.Situ)
+    ):
+        return False, "DeepSeek FP8 Prims-TS supports Swiglu and Situ only"
     if not _is_supported_weight_layout(
         kwargs.get("weight_layout", runner.weight_layout)
     ):
@@ -761,8 +764,6 @@ def is_prims_ts_fp8_block_scale_supported(
         runner, "use_per_token_scaling", False
     ):
         return False, "per-token scaling is not supported"
-    if is_deepseek and _has_gemm1_oa_params(kwargs):
-        return False, "DeepSeek FP8 Prims-TS OA params are not supported"
     ok, reason = _validate_gemm1_oa_params(runner, moe_inputs, activation_type, kwargs)
     if not ok:
         return False, reason

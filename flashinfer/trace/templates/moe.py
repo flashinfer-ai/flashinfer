@@ -2818,7 +2818,7 @@ def _trtllm_fp8_block_scale_routed_moe_reference(
 ):
     """Reference for TRT-LLM FP8 block-scale routed MoE (precomputed topk_ids).
 
-    Reuses ``_fp8_moe_run_experts`` for the dequant + SwiGLU path, and builds
+    Reuses ``_fp8_moe_run_experts`` for dequantization and gated activation, and builds
     a uniform per-token weight tensor (real routing scales are not available
     from topk_ids alone).
     """

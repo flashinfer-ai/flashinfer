@@ -105,6 +105,63 @@ def test_prims_ts_fp8_block_scale_moe_smoke(
     )
 
 
+@pytest.mark.parametrize(
+    "quant_mode",
+    [
+        pytest.param(QuantMode.FP8_BLOCK_SCALE_MXFP8, id="MxFp8"),
+        pytest.param(QuantMode.FP8_BLOCK_SCALE_DEEPSEEK, id="DeepSeekFp8"),
+    ],
+)
+def test_prims_ts_fp8_block_scale_situ_matches_reference(
+    quant_mode,
+    cache_permute_indices,
+):
+    """Kimi K3 SiTU parameters match the dequantized reference."""
+    _skip_prims_ts_on_sm107()
+    num_tokens = 128 if quant_mode == QuantMode.FP8_BLOCK_SCALE_DEEPSEEK else 32
+    hidden_size = 512
+    intermediate_size = 512
+    num_experts = 64
+    top_k = 8
+    device = torch.device("cuda")
+
+    run_moe_test(
+        num_tokens=num_tokens,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        moe_impl=FP8BlockScaleMoe(fp8_quantization_type=quant_mode),
+        routing_config={
+            "num_experts": num_experts,
+            "top_k": top_k,
+            "padding": 8,
+            "n_groups": None,
+            "top_k_groups": None,
+            "routed_scaling": None,
+            "has_routing_bias": False,
+            "routing_method_type": RoutingMethodType.Renormalize,
+            "compatible_moe_impls": [FP8BlockScaleMoe],
+            "compatible_intermediate_size": [intermediate_size],
+            "compatible_activation_types": [ActivationType.Situ],
+            "enable_autotune": False,
+        },
+        weight_processing={
+            "use_shuffled_weight": True,
+            "layout": WeightLayout.MajorK,
+            "compatible_moe_impls": [FP8BlockScaleMoe],
+            "compatible_gemm_backends": [MoeGemmBackend.PRIMS_TS],
+        },
+        activation_type=ActivationType.Situ,
+        cache_permute_indices=cache_permute_indices,
+        routing_logits_dtype=torch.bfloat16,
+        gemm1_alpha=torch.full((num_experts,), 4.0, device=device, dtype=torch.float32),
+        gemm1_beta=torch.full((num_experts,), 25.0, device=device, dtype=torch.float32),
+        gemm1_clamp_limit=torch.full(
+            (num_experts,), 6.0, device=device, dtype=torch.float32
+        ),
+        moe_gemm_backend=MoeGemmBackend.PRIMS_TS,
+    )
+
+
 def test_prims_ts_deepseek_fp8_block_scale_tile16_smoke(
     cache_permute_indices,
 ):
