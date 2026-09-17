@@ -2487,7 +2487,7 @@ def create_mma_task_one_inst_qkv(
     work_queue: WorkQueue | None,
     cfg: FmhaDecodeConfig,
     *,
-    tmem_stats_done: MemoryResource,
+    tmem_stats_done: MemoryResource | None,
     domain: int | cutlass.Int32,
     warp_idx: int | None = None,
     num_warps: int | None = None,
@@ -2503,7 +2503,7 @@ def create_mma_task_one_inst_qkv(
         tmem_s: MemoryResource,
         smem_p: MemoryResource,
         tmem_o: MemoryResource,
-        tmem_stats_done: MemoryResource,
+        tmem_stats_done: MemoryResource | None,
         q_desc: Any,
     ) -> None:
         """Schedule single-instance QK and PV waves across HEAD/LOOP/TAIL."""
@@ -2511,7 +2511,8 @@ def create_mma_task_one_inst_qkv(
         def qk_mma(q_desc, qk_mma_label: str, section: FmhaStage) -> None:
             """Issue one scheduled single-instance QK wave."""
             _ = section
-            tmem_stats_done.acquire()
+            if tmem_stats_done is not None:
+                tmem_stats_done.acquire()
             tmem_s.acquire()
             for head_dim_stage_idx in range(cfg.num_head_dim_stages_kv):
                 smem_k.wait()
@@ -2529,7 +2530,8 @@ def create_mma_task_one_inst_qkv(
                     )
                 smem_k.release()
             tmem_s.commit()
-            tmem_stats_done.commit()
+            if tmem_stats_done is not None:
+                tmem_stats_done.commit()
 
         def pv_mma(vp_mma_label: str, section: FmhaStage) -> None:
             """Issue one scheduled single-instance PV wave."""
@@ -2575,15 +2577,14 @@ def create_mma_task_one_inst_qkv(
         smem_v.init_descriptor_state()
         smem_p.init_descriptor_state()
 
-    @schedule
-    def mma_schedule(
+    def mma_schedule_context(
         smem_q: MemoryResource,
         smem_k: MemoryResource,
         smem_v: MemoryResource,
         tmem_s: MemoryResource,
         smem_p: MemoryResource,
         tmem_o: MemoryResource,
-        tmem_stats_done: MemoryResource,
+        tmem_stats_done: MemoryResource | None = None,
         work_queue: WorkQueue | None = None,
     ) -> None:
         """Wrap one-inst MMA work in packed persistent skip handling."""
@@ -2605,34 +2606,50 @@ def create_mma_task_one_inst_qkv(
             ),
         )
 
-    schedule_result = (
-        mma_schedule(
-            smem_q,
-            smem_k,
-            smem_v,
-            tmem_s,
-            smem_p,
-            tmem_o,
-            tmem_stats_done,
+    @schedule
+    def mma_schedule_without_credit(
+        smem_q: MemoryResource,
+        smem_k: MemoryResource,
+        smem_v: MemoryResource,
+        tmem_s: MemoryResource,
+        smem_p: MemoryResource,
+        tmem_o: MemoryResource,
+        work_queue: WorkQueue | None = None,
+    ) -> None:
+        mma_schedule_context(
+            smem_q, smem_k, smem_v, tmem_s, smem_p, tmem_o, None, work_queue
         )
-        if work_queue is None
-        else mma_schedule(
-            smem_q,
-            smem_k,
-            smem_v,
-            tmem_s,
-            smem_p,
-            tmem_o,
-            tmem_stats_done,
-            work_queue,
+
+    @schedule
+    def mma_schedule_with_credit(
+        smem_q: MemoryResource,
+        smem_k: MemoryResource,
+        smem_v: MemoryResource,
+        tmem_s: MemoryResource,
+        smem_p: MemoryResource,
+        tmem_o: MemoryResource,
+        tmem_stats_done: MemoryResource,
+        work_queue: WorkQueue | None = None,
+    ) -> None:
+        mma_schedule_context(
+            smem_q, smem_k, smem_v, tmem_s, smem_p, tmem_o, tmem_stats_done, work_queue
         )
-    )
+
+    schedule_args = [smem_q, smem_k, smem_v, tmem_s, smem_p, tmem_o]
+    schedule_fn = mma_schedule_without_credit
+    if tmem_stats_done is not None:
+        schedule_args.append(tmem_stats_done)
+        schedule_fn = mma_schedule_with_credit
+    if work_queue is not None:
+        schedule_args.append(work_queue)
+    schedule_result = schedule_fn(*schedule_args)
     src = [smem_q, smem_k, smem_v, smem_p]
     if work_queue is not None:
         src.append(work_queue)
     return task_class(
         src_resources=src,
-        dst_resources=[tmem_s, tmem_o, tmem_stats_done],
+        dst_resources=[tmem_s, tmem_o]
+        + ([tmem_stats_done] if tmem_stats_done is not None else []),
         cfg=cfg,
         warp_idx=cfg.mma_warp_idx if warp_idx is None else warp_idx,
         num_warps=cfg.mma_num_warps if num_warps is None else num_warps,
@@ -3737,7 +3754,7 @@ def create_correction_task_one_inst_qkv(
     work_queue: WorkQueue | None,
     cfg: FmhaDecodeConfig,
     *,
-    tmem_stats_done: MemoryResource,
+    tmem_stats_done: MemoryResource | None,
     domain: int | cutlass.Int32,
     task_class: type[DecodeGenTask] = DecodeGenTask,
     **kw: TaskKwarg,
@@ -3748,7 +3765,7 @@ def create_correction_task_one_inst_qkv(
         tmem_softmax_local: MemoryResource,
         tmem_o: MemoryResource,
         tmem_corr: MemoryResource,
-        tmem_stats_done: MemoryResource,
+        tmem_stats_done: MemoryResource | None,
     ) -> None:
         """Schedule one-inst O correction and final output normalization."""
 
@@ -3791,7 +3808,7 @@ def create_correction_task_one_inst_qkv(
                 inst_new_max_arr=inst_new_max_arr,
                 inst_sum_arr=inst_sum_arr,
             )
-            if release_stats_done:
+            if release_stats_done and tmem_stats_done is not None:
                 # Return one S-overwrite credit for this QK-derived payload.
                 tmem_stats_done.wait()
                 tmem_stats_done.release()
@@ -3906,12 +3923,11 @@ def create_correction_task_one_inst_qkv(
         # ConsRelease: the final O stage is no longer needed.
         tmem_o.release()
 
-    @schedule
-    def correction_schedule(
+    def correction_schedule_context(
         tmem_softmax_local: MemoryResource,
         tmem_o: MemoryResource,
         tmem_corr: MemoryResource,
-        tmem_stats_done: MemoryResource,
+        tmem_stats_done: MemoryResource | None = None,
         work_queue: WorkQueue | None = None,
     ) -> None:
         """Wrap one-inst correction in packed persistent skip handling."""
@@ -3926,23 +3942,40 @@ def create_correction_task_one_inst_qkv(
             ),
         )
 
-    schedule_result = (
-        correction_schedule(
-            tmem_softmax_local,
-            tmem_o,
-            tmem_corr,
-            tmem_stats_done,
+    @schedule
+    def correction_schedule_without_credit(
+        tmem_softmax_local: MemoryResource,
+        tmem_o: MemoryResource,
+        tmem_corr: MemoryResource,
+        work_queue: WorkQueue | None = None,
+    ) -> None:
+        correction_schedule_context(
+            tmem_softmax_local, tmem_o, tmem_corr, None, work_queue
         )
-        if work_queue is None
-        else correction_schedule(
-            tmem_softmax_local,
-            tmem_o,
-            tmem_corr,
-            tmem_stats_done,
-            work_queue,
+
+    @schedule
+    def correction_schedule_with_credit(
+        tmem_softmax_local: MemoryResource,
+        tmem_o: MemoryResource,
+        tmem_corr: MemoryResource,
+        tmem_stats_done: MemoryResource,
+        work_queue: WorkQueue | None = None,
+    ) -> None:
+        correction_schedule_context(
+            tmem_softmax_local, tmem_o, tmem_corr, tmem_stats_done, work_queue
         )
-    )
-    src = [tmem_softmax_local, tmem_o, tmem_stats_done]
+
+    schedule_args = [tmem_softmax_local, tmem_o, tmem_corr]
+    schedule_fn = correction_schedule_without_credit
+    if tmem_stats_done is not None:
+        schedule_args.append(tmem_stats_done)
+        schedule_fn = correction_schedule_with_credit
+    if work_queue is not None:
+        schedule_args.append(work_queue)
+    schedule_result = schedule_fn(*schedule_args)
+    src = [tmem_softmax_local, tmem_o]
+    if tmem_stats_done is not None:
+        src.append(tmem_stats_done)
     if work_queue is not None:
         src.append(work_queue)
     return task_class(

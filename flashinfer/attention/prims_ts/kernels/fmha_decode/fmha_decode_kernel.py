@@ -816,15 +816,14 @@ def _build_decode_gen_schedule(
         advance_on_wait=True,
     )
 
-    # Two-instance Keeps keeps stats outside S and orders each same-instance PV
-    # before the next QK, so it needs no stats-done credit.
-    # The staged one-instance path needs an overwrite-credit gate across its
-    # double-buffered S/P overlay: correction returns the stage credit before
-    # MMA can reissue QK into those columns.
+    # The single MMA issuer orders PV before QK reuses the same S/P slot.
+    # PTX's same-warp mma(A-read) -> mma(D-write) pipeline protects that alias.
+    # Separate SMEM stats have their own softmax-local handoff, just as in
+    # two-instance Keeps; correction need not additionally gate S reuse.
     stats_done0_cfg = None
     stats_done1_cfg = None
     resource_dependency_graph: dict[MemoryResource, list[MemoryResource]]
-    if use_one_inst_qkv:
+    if use_one_inst_qkv and (not cfg.keeps_stats_via_smem or cfg.mma_num_warps != 1):
         stats_done0_cfg = PipelineConfig.create_async_async_pipeline_cfg(
             num_stages=one_inst_tmem_stages,
             producer_group=mma_grp,
