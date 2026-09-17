@@ -128,10 +128,20 @@ cuTile Fused MoE
 
     CuTileBf16Config
     CuTileBf16Runner
+    CuTileFp8PerTensorBf16Config
+    CuTileFp8PerTensorBf16Runner
+    CuTileFp8PerTensorConfig
+    CuTileFp8PerTensorRunner
     CuTileMxfp4Bf16Config
     CuTileMxfp4Bf16Runner
     CuTileMxfp4Config
     CuTileMxfp4Runner
+    CuTileMxfp4Mxfp8Config
+    CuTileMxfp4Mxfp8Runner
+    CuTileMxfp8Bf16Config
+    CuTileMxfp8Bf16Runner
+    CuTileMxfp8Config
+    CuTileMxfp8Runner
     CuTileNvfp4Bf16Config
     CuTileNvfp4Bf16Runner
     CuTileNvfp4Config

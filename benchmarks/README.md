@@ -111,7 +111,11 @@ A test case is generally invoked as `python3 flashinfer_benchmark.py --routine <
 
 The unified MoE comparison runs the selected backends from the same routing, activation,
 and weight inputs. Supported cuTile quantization modes are `bf16`, `nvfp4`,
-`nvfp4_w4a16`, `mxfp4`, and `mxfp4_w4a16`. This example uses the
+`nvfp4_w4a16`, `mxfp4`, `mxfp4_w4a16`, `fp8`, `fp8_w8a16`, `mxfp8`,
+`mxfp8_w8a16`, and `mxfp4_w4a8`. `fp8` uses per-tensor E4M3 scaling;
+`mxfp8` uses E8M0 block scales. The W8A16 modes retain BF16 activations;
+`mxfp4_w4a8` uses MXFP4 weights with MXFP8 activations. A8 modes include
+BF16-to-FP8 quantization before both GEMMs in the timed region. This example uses the
 Nemotron-3.5-Lightning MoE shape:
 
 ```bash
@@ -122,6 +126,15 @@ CUDA graph timing is enabled by default and captures one MoE invocation per
 graph replay with cold-L2 benchmarking enabled; pass `--no_cuda_graph` for eager
 timing. Without `--autotune`, results are named `cutlass` and `cutile`; autotuned
 results use `cutlass_autotune` and `cutile_autotune`.
+CUTLASS comparisons also support `fp8` (per-tensor W8A8) and `mxfp4_w4a8`
+on supported architectures. These CUTLASS runners take prequantized activations,
+so the benchmark includes their public `prepare_activations` conversion in the
+main BF16-input latency. The additional CSV columns `prequantized_median_time`
+and `prequantized_std_time` (milliseconds) report the runner-only timing without
+that input conversion. Per-tensor CUTLASS uses its fixed GEMM2 activation scale,
+whereas cuTile dynamically scales GEMM2 input; equal precision pairs do not imply
+identical quantization policies. CUTLASS `mxfp4_w4a8` requires hidden and
+intermediate sizes divisible by 128; unsupported shapes are skipped.
 On SM120/SM121, `--backends b12x cutile` also compares NVFP4 W4A4 (`nvfp4`)
 and W4A16 (`nvfp4_w4a16`). The b12x runner exposes a single heuristic tactic;
 `--autotune` does not expand its search space. MXFP4 is not supported by b12x.

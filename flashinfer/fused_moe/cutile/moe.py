@@ -133,6 +133,17 @@ def _permute_workspace_shape(
     return epow2, max_ncp, max_num_slabs
 
 
+def _max_permuted_rows(
+    num_assignments: int, num_experts: int, block_size: int
+) -> int:
+    """Upper-bound expert-padded rows without charging empty experts.
+
+    Every nonempty expert adds at most ``block_size - 1`` padding rows, and
+    there can be no more nonempty experts than routing assignments.
+    """
+    return num_assignments + min(num_assignments, num_experts) * (block_size - 1)
+
+
 def allocate_workspace(
     *,
     num_tokens: int,
@@ -158,10 +169,15 @@ def allocate_workspace(
     if allocate_gemm1_output and gemm1_output_rows < num_assignments:
         raise ValueError("gemm1_output_rows must cover every routed assignment.")
     max_em = max(
-        num_assignments + num_experts * (block_size - 1) for block_size in block_sizes
+        _max_permuted_rows(num_assignments, num_experts, block_size)
+        for block_size in block_sizes
     )
     max_blocks = max(
-        (num_assignments + num_experts * (block_size - 1) + block_size - 1)
+        (
+            _max_permuted_rows(num_assignments, num_experts, block_size)
+            + block_size
+            - 1
+        )
         // block_size
         for block_size in block_sizes
     )
@@ -742,7 +758,7 @@ def _permute(
     workspace: Workspace,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     num_assignments = topk_ids.numel()
-    em = num_assignments + num_experts * (block_size - 1)
+    em = _max_permuted_rows(num_assignments, num_experts, block_size)
     num_blocks = (em + block_size - 1) // block_size
     sorted_slots = workspace.sorted_slots[:em]
     block_expert = workspace.block_expert[:num_blocks]

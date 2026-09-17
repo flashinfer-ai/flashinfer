@@ -427,6 +427,40 @@ def test_cutile_workspace_covers_all_permute_shapes_in_bucket(
 
 @cutile_bf16_required
 @pytest.mark.parametrize(
+    ("num_assignments", "num_experts", "block_size", "expected_rows"),
+    (
+        (8, 256, 32, 256),
+        (256, 256, 32, 8192),
+        (257, 256, 32, 8193),
+    ),
+)
+def test_cutile_permute_workspace_does_not_pad_empty_experts(
+    num_assignments, num_experts, block_size, expected_rows
+):
+    from flashinfer.fused_moe.cutile import moe
+
+    assert (
+        moe._max_permuted_rows(num_assignments, num_experts, block_size)
+        == expected_rows
+    )
+    workspace = moe.allocate_workspace(
+        num_tokens=num_assignments,
+        hidden_size=64,
+        intermediate_size=64,
+        num_experts=num_experts,
+        top_k=1,
+        is_gated=True,
+        block_sizes=(block_size,),
+        device=torch.device("cuda"),
+    )
+    assert workspace.sorted_slots.numel() == expected_rows
+    assert workspace.block_expert.numel() == (
+        expected_rows + block_size - 1
+    ) // block_size
+
+
+@cutile_bf16_required
+@pytest.mark.parametrize(
     (
         "activation",
         "num_tokens",
