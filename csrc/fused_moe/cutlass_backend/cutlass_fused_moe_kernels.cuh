@@ -136,7 +136,7 @@ struct AbsMaxOp<__nv_bfloat16> {
   __device__ static float to_float(Accum value) { return __bfloat162float(value); }
 };
 
-// DEFERRED (issue #5141): unlike the TRT-LLM quantization kernels, this CUTLASS-backend
+// TODO(aleozlx, #5141): unlike the TRT-LLM quantization kernels, this CUTLASS-backend
 // dispatcher still reads FLASHINFER_NVFP4_4OVER6* directly instead of taking a
 // caller-supplied NVFP4RecipeSpec. Threading the recipe down to here is a follow-up.
 template <typename Fn>

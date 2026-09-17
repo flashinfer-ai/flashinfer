@@ -54,28 +54,16 @@ class _UnsetType:
     third public type, so that retiring the environment shim later only flips
     the default to ``None`` and changes no signature.
 
-    The sentinel is a singleton: ``pickle`` and ``copy`` return the same
-    object, so ``is _UNSET`` stays a valid test on a round-tripped config.
+    ``__reduce__`` returning the module attribute name keeps ``pickle`` and
+    ``copy`` returning this same object, so ``is _UNSET`` stays valid on a
+    round-tripped config.
     """
-
-    _instance: Optional["_UnsetType"] = None
-
-    def __new__(cls) -> "_UnsetType":
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-        return cls._instance
 
     def __repr__(self) -> str:
         return "<nvfp4_4over6 unset: read FLASHINFER_NVFP4_4OVER6*>"
 
     def __reduce__(self) -> str:
         return "_UNSET"
-
-    def __copy__(self) -> "_UnsetType":
-        return self
-
-    def __deepcopy__(self, memo: dict) -> "_UnsetType":
-        return self
 
 
 #: Default of every public ``nvfp4_4over6=`` parameter: "not passed".  Typed
@@ -177,9 +165,7 @@ def current_nvfp4_4over6_config() -> NVFP44Over6Config | None:
     )
 
 
-def nvfp4_4over6_fp8_input_error(
-    setting: Optional[NVFP44Over6Config], input_dtype: torch.dtype
-) -> ValueError:
+def nvfp4_4over6_fp8_input_error(input_dtype: torch.dtype) -> ValueError:
     """Build the error for a recipe an FP8-input quantizer cannot honor.
 
     Every FP8->FP4 path hardcodes the standard recipe -- the ``FP8_TO_FP4``
@@ -189,17 +175,10 @@ def nvfp4_4over6_fp8_input_error(
     pairing the caller's global scale with a 448 clamp it was not built for.
     Shared, so the CUDA and CuTe-DSL backends of one public API refuse in the
     same words.
-
-    Takes the **unresolved** ``setting``: below :func:`resolve_nvfp4_4over6` an
-    environment-derived recipe is indistinguishable from an explicitly passed
-    one, and sending a caller to look at an argument they never passed is a
-    dead end.
     """
-    source = (
-        "FLASHINFER_NVFP4_4OVER6" if setting is _UNSET else "the nvfp4_4over6= argument"
-    )
     return ValueError(
-        f"NVFP4 4over6 (requested via {source}) requires fp16 or bf16 input, "
+        "NVFP4 4over6 (from the nvfp4_4over6= argument or the "
+        "FLASHINFER_NVFP4_4OVER6* environment) requires fp16 or bf16 input, "
         f"got {input_dtype}."
     )
 
@@ -217,8 +196,8 @@ def resolve_nvfp4_4over6(
     ----------
     setting : NVFP44Over6Config or None
         Omitted (the default): read the environment; when it enables 4over6
-        a ``DeprecationWarning`` points at the argument, because the
-        environment variables are a compatibility shim.  ``None``: 4over6
+        a ``FutureWarning`` points at the argument, because the environment
+        variables are a compatibility shim.  ``None``: 4over6
         off, environment ignored.  An :class:`NVFP44Over6Config`: on with
         exactly that recipe, environment ignored (no per-field merge).
 
@@ -231,10 +210,13 @@ def resolve_nvfp4_4over6(
     if setting is _UNSET:
         config = current_nvfp4_4over6_config()
         if config is not None:
+            # FutureWarning, not DeprecationWarning: the default filters hide
+            # DeprecationWarning unless it is attributed to __main__, and this
+            # one has to reach the framework maintainers who set the variable.
             warnings.warn(
                 "The FLASHINFER_NVFP4_4OVER6* environment variables are "
                 f"deprecated; pass nvfp4_4over6={config!r} explicitly instead.",
-                DeprecationWarning,
+                FutureWarning,
                 stacklevel=3,
             )
         return config
@@ -341,6 +323,17 @@ def nvfp4_4over6_from_code(code: int) -> Optional[NVFP44Over6Config]:
     )
 
 
+#: Relative tolerance for checking that a per-token global scale was built from
+#: the same recipe as the quantizer: loose enough for a float32 round trip of
+#: ``1 / (448 * 6)``, far tighter than the 448 / 256 ratio it exists to catch.
+NVFP4_PER_TOKEN_SCALE_RTOL = 1e-3
+
+
+def nvfp4_per_token_scale_inv(nvfp4_4over6_config: NVFP44Over6Config | None) -> float:
+    """The per-token inverse global scale a recipe implies: ``1 / (e4m3_max * 6)``."""
+    return 1.0 / (nvfp4_e4m3_max(nvfp4_4over6_config) * FLOAT4_E2M1_MAX)
+
+
 def nvfp4_e4m3_max(nvfp4_4over6_config: NVFP44Over6Config | None = None) -> float:
     """E4M3 block-scale clamp implied by a **resolved** recipe.
 
@@ -384,7 +377,7 @@ def make_nvfp4_global_scale(
     """
     e4m3_max = nvfp4_e4m3_max(nvfp4_4over6_config)
     if per_token_activation:
-        scale = 1.0 / (e4m3_max * FLOAT4_E2M1_MAX)
+        scale = nvfp4_per_token_scale_inv(nvfp4_4over6_config)
     elif global_scale is not None:
         scale = global_scale
     else:
@@ -426,6 +419,7 @@ __all__ = [
     "NVFP4_4OVER6_CODE_FROM_ENV",
     "NVFP4_4OVER6_CODE_STANDARD",
     "NVFP4_4OVER6_KNOWN_BITS",
+    "NVFP4_PER_TOKEN_SCALE_RTOL",
     "NVFP44Over6Config",
     "NVFP44Over6ErrMode",
     "current_nvfp4_4over6_config",
@@ -437,5 +431,6 @@ __all__ = [
     "nvfp4_4over6_from_code",
     "nvfp4_4over6_mode_label",
     "nvfp4_e4m3_max",
+    "nvfp4_per_token_scale_inv",
     "resolve_nvfp4_4over6",
 ]
