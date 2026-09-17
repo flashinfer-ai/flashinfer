@@ -611,6 +611,68 @@ def test_optimized_scheduler_rejects_more_than_fold_thread_partitions():
     _assert_device_plan_covers_requests(plan, seq_lens)
 
 
+def _fold_dynamic_shared_bytes(batch_size: int, num_partitions: int) -> int:
+    block_bytes = (batch_size * 4 + 7) & ~7
+    return block_bytes + (batch_size + 2 * num_partitions) * 8
+
+
+@_REQUIRES_CUDA_SCHEDULER
+def test_optimized_scheduler_opts_in_to_large_dynamic_shared_memory():
+    properties = torch.cuda.get_device_properties(torch.cuda.current_device())
+    default_bytes = properties.shared_memory_per_block
+    opt_in_bytes = properties.shared_memory_per_block_optin
+    if opt_in_bytes <= default_bytes + 8192:
+        pytest.skip("CUDA device has no useful dynamic shared-memory opt-in range")
+
+    num_partitions = 4
+    batch_size = 1
+    while (
+        _fold_dynamic_shared_bytes(batch_size, num_partitions) <= default_bytes + 4096
+    ):
+        batch_size += 1
+    seq_lens = torch.zeros(batch_size, dtype=torch.int32, device="cuda")
+    seq_lens[0] = 128
+    plan = BalancedMLADecodePlan(
+        batch_size=batch_size,
+        num_partitions=num_partitions,
+        device=torch.device("cuda"),
+        cost=BalancedCostModel(1000, 0),
+        max_seq_len=128,
+    )
+
+    plan.schedule_device(seq_lens, scheduler="optimized")
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        plan.schedule_device(seq_lens, validate=False, scheduler="optimized")
+    graph.replay()
+
+    assert plan.partition_offsets[-1].item() == 1
+
+
+@_REQUIRES_CUDA_SCHEDULER
+def test_optimized_scheduler_rejects_unsupported_dynamic_shared_memory():
+    properties = torch.cuda.get_device_properties(torch.cuda.current_device())
+    opt_in_bytes = properties.shared_memory_per_block_optin
+    num_partitions = 4
+    batch_size = 1
+    while _fold_dynamic_shared_bytes(batch_size, num_partitions) <= opt_in_bytes:
+        batch_size += 1
+    seq_lens = torch.zeros(batch_size, dtype=torch.int32, device="cuda")
+    seq_lens[0] = 128
+    plan = BalancedMLADecodePlan(
+        batch_size=batch_size,
+        num_partitions=num_partitions,
+        device=torch.device("cuda"),
+        cost=BalancedCostModel(1000, 0),
+        max_seq_len=128,
+    )
+
+    with pytest.raises(
+        RuntimeError, match=r"permits at most\s+\d+\s+total opt-in bytes"
+    ):
+        plan.schedule_device(seq_lens, scheduler="optimized")
+
+
 @_REQUIRES_CUDA_SCHEDULER
 def test_device_plan_allocates_compact_capacities():
     plan = BalancedMLADecodePlan(
