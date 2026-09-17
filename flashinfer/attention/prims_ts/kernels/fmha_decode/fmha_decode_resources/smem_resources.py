@@ -249,12 +249,12 @@ def _issue_sparse_page_copies(
     head_dim_stage: Constexpr[int],
     head_dim_stage_offset: Constexpr[int],
 ):
-    """Partition (D64 chunk, physical fragment) copies across loader lanes.
+    """Partition (head-dim chunk, physical fragment) copies across loader lanes.
 
     The cache writer zero-fills page padding: full-fragment tail loads rely
     on this because score masking alone does not sanitize NaN/Inf in V.
     """
-    chunk_hd = min(head_dim_stage, 64)
+    chunk_hd = head_dim_stage if cfg.use_fp8_qkv else min(head_dim_stage, 64)
     chunks = head_dim_stage // chunk_hd
     fragments = cfg.tile_size_kv // cfg.num_tokens_per_page
     copies = fragments * chunks
@@ -1128,6 +1128,20 @@ class SmemKvTileResource(DecodeGenResourceBase):
             tile_idx = self._maybe_runtime_tile_idx(stage_info, local_tile_idx)
             inst_dtype_bytes = _kv_dtype_bytes_for_kind(self.cfg, self.kv_kind)
             if cutlass.const_expr(cfg.use_fp8_qkv or inst_dtype_bytes == 1):
+                if cutlass.const_expr(cfg.use_fp8_qkv and cfg.uses_scattered_page_route):
+                    _issue_sparse_page_copies(
+                        cfg,
+                        self.page_offsets_kv,
+                        self._stage_base(stage_info),
+                        tma_desc,
+                        stage_info.barrier,
+                        tile_idx,
+                        local_tile_idx,
+                        logical_h_k_idx,
+                        head_dim_stage,
+                        head_dim_stage_offset,
+                    )
+                    return
                 if prims.elect_sync() and _load_task_warp_rank(cfg) < Int32(
                     min(page_fragments, cfg.load_num_warps)
                 ):
@@ -1138,7 +1152,6 @@ class SmemKvTileResource(DecodeGenResourceBase):
                     # elected lane replay the full loop over-completes the TMA
                     # transaction barrier when load_num_warps > 1.
                     stage_base = self._stage_base(stage_info)
-                    page_ids = self.page_offsets_kv.page_ids(tile_idx, local_tile_idx)
                     active_load_warps = min(page_fragments, cfg.load_num_warps)
                     transactions_per_warp = page_fragments // active_load_warps
                     first_page_frag = _load_task_warp_rank(cfg) * Int32(
@@ -1148,8 +1161,14 @@ class SmemKvTileResource(DecodeGenResourceBase):
                         transactions_per_warp
                     ):
                         page_frag = first_page_frag + Int32(warp_transaction)
+                        # A runtime warp rank cannot index a register vector
+                        # without materializing it in local memory. Read only
+                        # this issuer's locator from the retained SMEM window.
+                        locator = self.page_offsets_kv.page_id(
+                            tile_idx, local_tile_idx, page_frag
+                        )
                         token_offset, physical_page = _decode_native_page_locator(
-                            cfg, Int32(page_ids[page_frag])
+                            cfg, locator
                         )
                         smem_page_offset = Int32(
                             page_frag * cfg.num_tokens_per_page * head_dim_stage
@@ -1701,37 +1720,21 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
         )
 
     @cute.jit
-    def q_token_kv_block_sparse_page_memberships4(
+    def q_token_kv_block_sparse_page_membership_word4(
         self,
         stage_info: StageInfo,
         local_tile_idx: Int32,
         page_frag: Int32,
-    ) -> cutlass.Array:
-        """Load four aligned grouped-Q membership bytes from one packed word.
-
-        The ``tmem_s`` Keeps Softmax path calls this helper four times to
-        assemble each lane-local 16-page membership word.
-        """
+    ) -> Uint32:
+        """Load the packed word for four aligned grouped-Q page memberships."""
 
         assert self.cfg.uses_q_token_kv_block_sparse_page_membership
         pages_per_tile = Int32(self.cfg.tile_size_kv // self.cfg.num_tokens_per_page)
         membership_idx = local_tile_idx * pages_per_tile + page_frag
-        memberships = cutlass.Array(
-            Uint32,
-            4,
-            space=cutlass.AddressSpace.rmem,
-        )
         membership_word, _ = self._q_token_kv_block_sparse_membership_word(
             stage_info, membership_idx
         )
-        for elem_idx in cutlass.range_constexpr(4):
-            memberships[elem_idx] = (
-                membership_word
-                >> Int32(Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIP_BITS * elem_idx)
-            ) & Uint32(
-                Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIP_MASK,
-            )
-        return memberships
+        return membership_word
 
     @consumer_work(returns=cached_page_ids)
     @cute.jit

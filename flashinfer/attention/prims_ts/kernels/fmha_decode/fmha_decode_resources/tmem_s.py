@@ -950,19 +950,21 @@ class TmemSResource(DecodeGenResourceBase):
         pages_per_lane = cfg.num_s_regs_per_thread // page_span
         for page_vector_idx in cutlass.range_constexpr(pages_per_lane // 4):
             memberships = (
-                self.page_offsets_ref.q_token_kv_block_sparse_page_memberships4(
+                self.page_offsets_ref.q_token_kv_block_sparse_page_membership_word4(
                     stage_info,
                     local_tile_idx,
                     col_base // Int32(cfg.num_tokens_per_page)
                     + Int32(page_vector_idx * 4),
                 )
             )
-            for vector_elem_idx in cutlass.range_constexpr(4):
-                local_page_idx = page_vector_idx * 4 + vector_elem_idx
-                page_is_member = Uint32(
-                    (memberships[vector_elem_idx] & membership_bit) != Uint32(0)
-                )
-                keep_word = keep_word | (page_is_member << Uint32(local_page_idx))
+            # Select one bit from each byte, then compact the four bits with
+            # a carry-free multiply. Padded Q rows cannot wrap into the byte.
+            byte_bits = (memberships >> (q_token_idx & Int32(7))) & Uint32(0x01010101)
+            packed_bits = (byte_bits * Uint32(0x01020408)) >> Uint32(24)
+            packed_bits = cutlass.select_(
+                Uint32(q_token_idx) < Uint32(8), packed_bits, Uint32(0)
+            )
+            keep_word = keep_word | (packed_bits << Uint32(page_vector_idx * 4))
         if cutlass.const_expr(pages_per_lane < 4):
             for local_page_idx in cutlass.range_constexpr(pages_per_lane):
                 membership = (

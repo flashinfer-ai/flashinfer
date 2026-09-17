@@ -7191,34 +7191,42 @@ def test_attention_ts_decode_page_cache_sliding_product(
 @pytest.mark.arch_blackwell
 @_REQUIRES_BLACKWELL_PRIMTS_GPU
 @pytest.mark.parametrize(
-    ("group", "dim", "ratio", "block", "page", "packed", "shared", "batch"),
+    ("group", "dim", "ratio", "block", "page", "packed", "shared", "batch", "dtype"),
     (
-        (1, 64, 3, 4, 16, False, False, 256),
-        (3, 128, 4, 8, 16, True, False, 2),
-        (5, 128, 6, 16, 128, False, True, 2),
-        (4, 256, 12, 32, 16, True, False, 256),
-        (8, 64, 3, 64, 128, False, True, 2),
-        (8, 128, 12, 128, 20, True, False, 256),
+        (1, 64, 3, 4, 16, False, False, 256, torch.bfloat16),
+        (3, 128, 4, 8, 16, True, False, 2, torch.bfloat16),
+        (5, 128, 6, 16, 128, False, True, 2, torch.bfloat16),
+        (4, 256, 12, 32, 16, True, False, 256, torch.bfloat16),
+        (8, 64, 3, 64, 128, False, True, 2, torch.bfloat16),
+        (8, 128, 12, 128, 20, True, False, 256, torch.bfloat16),
+        # FP8 page fragments with padded Q rows and non-power-of-two storage.
+        (8, 256, 12, 4, 20, True, False, 256, torch.float8_e4m3fn),
     ),
 )
 def test_q_token_sparse_geometry_graph(
-    group, dim, ratio, block, page, packed, shared, batch
+    group, dim, ratio, block, page, packed, shared, batch, dtype
 ):
     """Check sparse geometry and persistent reuse against an independent mask."""
     torch.manual_seed(71845)
     context, topk, hkv = 1024, 3, 2
-    q = torch.randn(batch, group, hkv * ratio, dim, device="cuda", dtype=torch.bfloat16)
+    q = torch.randn(
+        batch, group, hkv * ratio, dim, device="cuda", dtype=torch.bfloat16
+    ).to(dtype)
     rows = batch * group - int(packed)
     query = q.reshape(-1, hkv * ratio, dim)[:rows] if packed else q[:, None]
-    out = torch.empty_like(query)
+    out = torch.empty_like(query, dtype=torch.bfloat16)
     offsets = torch.arange(batch + 1, device="cuda", dtype=torch.int32) * group
     offsets[-1] = rows
     width = (context + page - 1) // page
     table = torch.randperm(batch * width, device="cuda", dtype=torch.int32).view(
         batch, width
     )
-    k = torch.randn(batch * width, hkv, page, dim, device="cuda", dtype=q.dtype)
-    v = torch.randn_like(k)
+    k = torch.randn(
+        batch * width, hkv, page, dim, device="cuda", dtype=torch.bfloat16
+    ).to(dtype)
+    v = torch.randn(
+        batch * width, hkv, page, dim, device="cuda", dtype=torch.bfloat16
+    ).to(dtype)
     if context % page:
         k[table[:, -1].long(), :, context % page :] = 0
         v[table[:, -1].long(), :, context % page :] = 0
@@ -7249,6 +7257,7 @@ def test_q_token_sparse_geometry_graph(
             qo_indptr=qo_indptr,
             seq_len_q=group if packed else None,
             kv_block_size=block,
+            o_data_type=out.dtype,
             split_kv=False,
             share_pattern_across_kv_heads=shared,
         ),
@@ -7272,6 +7281,7 @@ def test_q_token_sparse_geometry_graph(
         split_kv=False,
         share_pattern_across_kv_heads=shared,
         q_data_type=q.dtype,
+        o_data_type=out.dtype,
     )
 
     def run():
@@ -7304,7 +7314,20 @@ def test_q_token_sparse_geometry_graph(
             * dim**-0.5
         )
         scores.masked_fill_(~visible[..., None, :], -torch.inf)
-        expected = torch.einsum("bghrk,bkhd->bghrd", scores.softmax(-1), values)
+        if dtype == _FP8:
+            # This union fits one KV tile. Match the FP8 P operand and FP32
+            # denominator, as in _fp8_decode_reference, without relaxing error
+            # tolerances for the page/membership geometry being tested.
+            assert group * (topk + 1) * block <= _FP8_KV_TILE_SIZE
+            probabilities = (
+                scores - scores.amax(-1, keepdim=True)
+            ).exp() * _FP8_PROBABILITY_SCALE
+            weights = probabilities.to(_FP8).float() / probabilities.sum(
+                -1, keepdim=True
+            )
+        else:
+            weights = scores.softmax(-1)
+        expected = torch.einsum("bghrk,bkhd->bghrd", weights, values)
         torch.testing.assert_close(
             out.reshape(rows, hkv * ratio, dim).float(),
             expected.reshape(batch * group, hkv * ratio, dim)[:rows],
