@@ -1147,6 +1147,9 @@ class FmhaDecodeConfig:
     # page-four table:
     # locator = physical_page * subpages_per_storage_page + subpage.
     storage_tokens_per_page: int = 0
+    # Prepared single-head compact caches can view all storage pages as rows
+    # of one TensorMap, while retaining the same encoded fragment indices.
+    use_flat_native_kv_tma: bool = False
     # Maximum number of pages per (batch, head_kv) — sizes the page index
     # table stride.
     max_num_pages_per_seq_kv: int = 1

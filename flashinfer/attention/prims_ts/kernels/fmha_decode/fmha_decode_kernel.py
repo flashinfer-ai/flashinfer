@@ -3045,12 +3045,22 @@ def fmha_decode_launch(
     if cutlass.const_expr(cfg.use_paged_kv):
         if cutlass.const_expr(use_native_paged_kv):
             storage_tokens_per_page = Int32(cfg.effective_storage_tokens_per_page)
-            kv_shape = (
-                d,
-                storage_tokens_per_page,
-                h_k,
-                num_physical_kv_pages,
-            )
+            if cutlass.const_expr(cfg.use_flat_native_kv_tma):
+                # Planning checked single-head compact K/V and signed-32-bit
+                # row coordinates. Only the descriptor changes, not the cache.
+                flat_tokens = num_physical_kv_pages * Int64(storage_tokens_per_page)
+                kv_shape = (d, flat_tokens, Int32(1), Int32(1))
+                k_head_stride = k_token_stride * flat_tokens
+                k_page_stride = k_head_stride
+                v_head_stride = v_token_stride * flat_tokens
+                v_page_stride = v_head_stride
+            else:
+                kv_shape = (
+                    d,
+                    storage_tokens_per_page,
+                    h_k,
+                    num_physical_kv_pages,
+                )
             k_layout = cute.make_layout(
                 kv_shape,
                 stride=(

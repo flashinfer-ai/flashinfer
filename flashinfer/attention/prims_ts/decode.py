@@ -1390,12 +1390,15 @@ def _make_decode_compile_spec(
     kv_prefix_mode: Literal["dynamic", "planned_full"],
     kv_lengths_mode: Literal["dynamic", "planned_uniform_max"],
     direct_q1_spec: Optional[_DirectQ1CompileSpec] = None,
+    flat_native_kv_tma: bool = False,
 ) -> _DecodeCompileSpec:
     """Freeze the resolved topology while leaving batch in runtime tensors."""
 
+    config_items = dict(launch_spec.config.compile_signature())
+    config_items["use_flat_native_kv_tma"] = flat_native_kv_tma
     return _DecodeCompileSpec(
         device_index=device_index,
-        config_items=launch_spec.config.compile_signature(),
+        config_items=tuple(config_items.items()),
         num_qo_heads=num_qo_heads,
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
@@ -3394,6 +3397,16 @@ def _prepare_prims_ts_batch_decode_plan(
         kv_prefix_mode="dynamic",
         kv_lengths_mode="dynamic",
         direct_q1_spec=direct_q1_spec,
+        flat_native_kv_tma=(
+            use_q_token_kv_block_sparse_route
+            and spec.config.uses_staged_one_inst_tmem_p
+            and spec.config.use_fp8_qkv
+            and spec.config.has_storage_subpages
+            and num_kv_heads == 1
+            and k_cache.is_contiguous()
+            and normalized_cache.v_cache.is_contiguous()
+            and int(k_cache.shape[0]) * storage_page_size < (1 << 31)
+        ),
     )
     compiled_main, compiled_reducer = _get_compiled_decode(compile_spec)
     workspace = _bind_decode_workspace(workspace_buffer, layout)

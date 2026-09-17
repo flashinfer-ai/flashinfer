@@ -3605,6 +3605,122 @@ def test_grouped_q_token_kv_block_sparse_physical_sparse_pages_match_torch_refer
     )
 
 
+@_REQUIRES_PRIMS_TS_ATTENTION
+def test_fp8_grouped_cache_stride_rebinding_graph() -> None:
+    """Compact and padded page strides must not share incompatible TensorMaps."""
+    torch.manual_seed(82173)
+    group, heads, dim, page, context, topk = 8, 12, 256, 20, 1280, 16
+    rows, pages = 20, context // page
+    query = torch.randn(rows, heads, dim, device="cuda", dtype=torch.bfloat16).to(
+        torch.float8_e4m3fn
+    )
+    cache = tuple(
+        torch.randn(2 * pages, 1, page, dim, device="cuda", dtype=torch.bfloat16).to(
+            query.dtype
+        )
+        for _ in range(2)
+    )
+    padded = tuple(
+        torch.zeros(
+            2 * pages, 1, page + 4, dim, device="cuda", dtype=torch.bfloat16
+        ).to(query.dtype)[:, :, :page]
+        for _ in range(2)
+    )
+    for target, source in zip(padded, cache, strict=True):
+        target.copy_(source)
+        assert not target.is_contiguous()
+    table = torch.randperm(2 * pages, device="cuda", dtype=torch.int32).view(2, pages)
+    requests = torch.tensor([0] * 9 + [1] * 11, device="cuda", dtype=torch.int32)
+    positions = torch.cat(
+        [torch.arange(context - count, context, device="cuda") for count in (9, 11)]
+    )
+    candidates = 256
+    blocks = (
+        torch.rand(rows, candidates, device="cuda")
+        .argsort(-1)[:, :topk]
+        .to(torch.int32)
+        .contiguous()
+    )
+    qo_indptr = make_prims_ts_q_token_kv_block_sparse_qo_indptr(
+        torch.tensor([0, 9, rows], dtype=torch.int32),
+        rows,
+        group_size=group,
+        device=query.device,
+    )
+    output = torch.empty_like(query, dtype=torch.bfloat16)
+    workspace = torch.empty(
+        get_prims_ts_q_token_kv_block_sparse_workspace_size(
+            query,
+            cache[0],
+            table,
+            block_topk=topk,
+            max_seq_len_kv=context,
+            out_dtype=output.dtype,
+            qo_indptr=qo_indptr,
+            max_seq_len_q=group,
+            split_kv=False,
+        ),
+        device="cuda",
+        dtype=torch.uint8,
+    )
+    wrapper = QTokenKvBlockSparsePagedTSWrapper()
+    wrapper.plan(
+        qo_indptr.numel() - 1,
+        group,
+        heads,
+        1,
+        dim,
+        4,
+        page,
+        topk,
+        context,
+        device=query.device,
+        workspace_buffer=workspace,
+        use_packed_q=True,
+        split_kv=False,
+        q_data_type=query.dtype,
+        o_data_type=output.dtype,
+    )
+    tokens = torch.arange(context, device="cuda")
+    physical = table[requests.long()[:, None], tokens[None, :] // page].long()
+    keys = cache[0][physical, 0, tokens[None, :] % page].float()
+    values = cache[1][physical, 0, tokens[None, :] % page].float()
+
+    def check():
+        visible = (tokens[None, :, None] // 4 == blocks[:, None, :]).any(-1)
+        visible |= tokens[None, :] // 4 == (positions[:, None] + 1) // 4
+        visible &= tokens[None, :] <= positions[:, None]
+        scores = torch.einsum("qhd,qtd->qht", query.float(), keys) * dim**-0.5
+        scores.masked_fill_(~visible[:, None, :], -torch.inf)
+        expected = torch.einsum("qht,qtd->qhd", scores.softmax(-1), values)
+        torch.testing.assert_close(output.float(), expected, rtol=0.05, atol=0.05)
+
+    for bound_cache in (cache, padded, cache):
+
+        def run(cache_view=bound_cache):
+            wrapper.run(
+                query,
+                cache_view,
+                table,
+                blocks,
+                requests,
+                positions,
+                qo_indptr=qo_indptr,
+                out=output,
+            )
+
+        run()
+        check()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run()
+        blocks.add_(1).remainder_(candidates)
+        positions.sub_(4)
+        output.fill_(torch.nan)
+        graph.replay()
+        check()
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_packed_q_token_kv_block_sparse_metadata_handles_partial_request_groups() -> (
     None

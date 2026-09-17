@@ -157,6 +157,10 @@ def _decode_native_page_locator(
     page_locator: Int32,
 ) -> tuple[Int32, Int32]:
     """Return ``(token_offset, physical_page)`` for one native table entry."""
+    if cutlass.const_expr(cfg.use_flat_native_kv_tma):
+        # The bound cache has one head and compact storage. Encoded fragments
+        # already count its physical rows; -1 remains an OOB zero-fill copy.
+        return page_locator * Int32(cfg.num_tokens_per_page), Int32(0)
     token_offset = Int32(0)
     physical_page = page_locator
     if cutlass.const_expr(cfg.has_storage_subpages):
