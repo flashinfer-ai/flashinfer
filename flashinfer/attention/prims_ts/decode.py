@@ -716,10 +716,10 @@ def _device_index(device: torch.device) -> int:
     return int(torch.cuda.current_device())
 
 
-def _validate_runtime_device(device: torch.device) -> int:
+def _validate_runtime_device(device: torch.device) -> None:
     if device.type != "cuda":
         raise ValueError("attention-ts decode tensors must be CUDA tensors")
-    device_index = _device_index(device)
+    device_index = device.index
     with torch.cuda.device(device_index):
         capability = torch.cuda.get_device_capability(device_index)
     if capability not in _SUPPORTED_COMPUTE_CAPABILITIES:
@@ -734,12 +734,13 @@ def _validate_runtime_device(device: torch.device) -> int:
         from ...cute_dsl.utils import require_cute_dsl_arch
 
         require_cute_dsl_arch(device_index)
-    return device_index
 
 
 def _resolve_cuda_device(
     device: Optional[Union[int, str, torch.device]],
 ) -> tuple[torch.device, int]:
+    """Normalize a device specifier without checking CUDA support."""
+
     if device is None:
         resolved = torch.device("cuda", torch.cuda.current_device())
     elif isinstance(device, int) and not isinstance(device, bool):
@@ -751,8 +752,11 @@ def _resolve_cuda_device(
             raise TypeError("device must identify one CUDA device") from error
         if resolved.type == "cuda" and resolved.index is None:
             resolved = torch.device("cuda", torch.cuda.current_device())
-    device_index = _validate_runtime_device(resolved)
-    return torch.device("cuda", device_index), device_index
+    # Preserve non-CUDA device types for the caller's explicit validation.
+    device_index = (
+        _device_index(resolved) if resolved.type == "cuda" else (resolved.index or 0)
+    )
+    return torch.device(resolved.type, device_index), device_index
 
 
 def _validate_q(
@@ -1157,9 +1161,6 @@ def _resolve_decode_launch_spec(
         page_size if storage_page_size is None else storage_page_size,
     )
 
-    if torch.cuda.is_initialized() and torch.cuda.is_current_stream_capturing():
-        raise RuntimeError("warm up this decode topology before CUDA graph capture")
-
     import cutlass
 
     from .kernels.fmha_decode.fmha_decode_config import (
@@ -1399,9 +1400,6 @@ def _get_compiled_decode(
     compile_spec: _DecodeCompileSpec,
 ):
     """Compile and cache one batch-dynamic TS decode topology."""
-
-    if torch.cuda.is_initialized() and torch.cuda.is_current_stream_capturing():
-        raise RuntimeError("warm up this decode topology before CUDA graph capture")
 
     device_index = compile_spec.device_index
     num_qo_heads = compile_spec.num_qo_heads
@@ -2447,7 +2445,8 @@ def _resolve_decode_workspace_layout(
 ) -> _DecodeWorkspaceLayout:
     """Resolve the byte layout for one already-validated semantic key."""
 
-    _, device_index = _resolve_cuda_device(device)
+    resolved_device, device_index = _resolve_cuda_device(device)
+    _validate_runtime_device(resolved_device)
     spec = _resolve_decode_launch_spec(
         device_index,
         batch_size,
@@ -3256,7 +3255,8 @@ def _prepare_prims_ts_batch_decode_plan(
         output_dtype,
         allow_fp8_bf16_output=use_q_token_kv_block_sparse_route,
     )
-    device_index = _validate_runtime_device(query.device)
+    resolved_device, device_index = _resolve_cuda_device(query.device)
+    _validate_runtime_device(resolved_device)
 
     policy_args = (
         device_index,
@@ -3685,18 +3685,14 @@ class BatchDecodePagedTSWrapper:
                             f"{request_idx} has Q={seq_len_q} and K/V={kv_len}"
                         )
 
-            device, device_index = _resolve_cuda_device(device)
         else:
-            device = (
-                torch.device("cuda", device)
-                if isinstance(device, int)
-                else torch.device(device)
-            )
-            device_index = _device_index(device)
-            device = torch.device("cuda", device_index)
             specialization_seq_lens = _normalize_plan_seq_lens(
                 seq_lens, batch_size=batch_size, max_kv_len=max_kv_len
             )
+
+        device, device_index = _resolve_cuda_device(device)
+        if validate:
+            _validate_runtime_device(device)
 
         policy_args = (
             device_index,

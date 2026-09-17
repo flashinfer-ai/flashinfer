@@ -75,15 +75,6 @@ with torch.cuda.graph(graph):
 graph.replay()
 ```
 
-The former `prims_ts_batch_decode_with_kv_cache` and
-`prims_ts_batch_mla_decode_with_kv_cache` functions and their lazy exports have
-been removed. Use the canonical names above, passing scratch as the keyword
-`workspace_buffer` and the static K/V bound as `max_kv_len`. For FMHA, rename
-`query`/`kv_cache`/`seq_lens` to `q`/`paged_kv_cache`/`seq_lens_kv`; for MLA,
-pass `kv_lora_rank` and `qk_rope_head_dim` by keyword. Choose `validate=False`
-after input validation for capture-safe execution without metadata readback.
-Workspace-sizing helpers and reusable plan/run wrappers remain available.
-
 The contiguous and paged context, FMHA decode, and MLA decode wrappers separate
 reusable static state from per-run request state. `plan()` compiles a static
 capacity, shape, dtype, and storage-mode specialization without retaining

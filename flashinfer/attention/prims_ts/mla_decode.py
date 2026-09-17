@@ -32,12 +32,12 @@ from .decode import (
     _align_up,
     _append_workspace_section,
     _dtype_key,
-    _device_index,
     _resolve_cuda_device,
     _validate_16byte_alignment,
     _validate_mask,
     _validate_page_size,
     _validate_positive_int,
+    _validate_runtime_device,
     _validate_scale,
     _validate_workspace_buffer,
     _workspace_section_view,
@@ -730,9 +730,6 @@ def _resolve_mla_decode_launch_spec(
 
     max_kv_len = _validate_mla_max_kv_len(max_kv_len, "max_kv_len")
 
-    if torch.cuda.is_initialized() and torch.cuda.is_current_stream_capturing():
-        raise RuntimeError("warm up this decode topology before CUDA graph capture")
-
     import cutlass
     import cutlass.utils as cutlass_utils
     from cuda.bindings import driver as cuda_drv
@@ -1052,9 +1049,6 @@ def _get_compiled_mla_decode(
 ):
     """Compile and cache one batch-dynamic TS MLA topology."""
 
-    if torch.cuda.is_initialized() and torch.cuda.is_current_stream_capturing():
-        raise RuntimeError("warm up this decode topology before CUDA graph capture")
-
     import cutlass
     import cutlass.cute as cute
 
@@ -1248,7 +1242,8 @@ def get_prims_ts_batch_mla_decode_workspace_size(
     if kv_dtype is None:
         kv_dtype = q_dtype
     _validate_mla_dtype_pair(q_dtype, kv_dtype, out_dtype)
-    _, device_index = _resolve_cuda_device(device)
+    resolved_device, device_index = _resolve_cuda_device(device)
+    _validate_runtime_device(resolved_device)
 
     spec = _resolve_mla_decode_launch_spec(
         device_index,
@@ -1505,15 +1500,10 @@ class BatchMLADecodePagedTSWrapper:
                 max_seq_len_q=max_seq_len_q,
             )
             _validate_mla_dtype_pair(q_data_type, kv_data_type, o_data_type)
-            device, device_index = _resolve_cuda_device(device)
-        else:
-            device = (
-                torch.device("cuda", device)
-                if isinstance(device, int)
-                else torch.device(device)
-            )
-            device_index = _device_index(device)
-            device = torch.device("cuda", device_index)
+
+        device, device_index = _resolve_cuda_device(device)
+        if validate:
+            _validate_runtime_device(device)
 
         required_page_columns = _ceil_div(max_kv_len, page_size)
 
