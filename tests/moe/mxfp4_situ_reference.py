@@ -205,6 +205,22 @@ def reference_moe(case: MXFP4SiTUCase, modes=("ideal_fp64", "mxfp8_fp32")):
     return outputs
 
 
+
+def absolute_error_quantiles(absolute):
+    """Exact linear p50/p95/p99, including arrays above torch.quantile's limit."""
+    flat = absolute.flatten()
+    probabilities = torch.tensor([.5, .95, .99], device=flat.device, dtype=torch.float64)
+    if flat.numel() <= 2**24:
+        return torch.quantile(flat, probabilities)
+    # torch.quantile rejects >2**24 elements. Sorting itself has no such
+    # restriction; compute its double-precision ranks and linear interpolation
+    # explicitly. This runs only in diagnostics, never in the kernel path.
+    ordered = flat.sort().values
+    ranks = probabilities * (flat.numel() - 1)
+    lower, upper = ranks.floor().long(), ranks.ceil().long()
+    return torch.lerp(ordered[lower], ordered[upper], ranks - lower)
+
+
 def error_metrics(actual, reference):
     """Diagnostics, with no customer-unapproved numerical pass threshold."""
     actual, reference = actual.double(), reference.double()
@@ -221,7 +237,7 @@ def error_metrics(actual, reference):
         cosine = (actual.flatten() @ reference.flatten()) / (ref_norm * actual_norm)
     else:
         cosine = torch.ones_like(ref_norm) if error_norm == 0 else torch.zeros_like(ref_norm)
-    quantiles = torch.quantile(absolute.flatten(), torch.tensor([.5, .95, .99], device=absolute.device, dtype=torch.float64))
+    quantiles = absolute_error_quantiles(absolute)
     passing = absolute <= (.1 + .15 * reference.abs())
     token_error = torch.linalg.vector_norm(error, dim=-1)
     token_norm = torch.linalg.vector_norm(reference, dim=-1)
