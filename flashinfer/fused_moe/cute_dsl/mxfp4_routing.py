@@ -640,14 +640,20 @@ def _plan_route_preprocess(
             _single_tile_per_expert and sorts_tokens and tile_size >= tokens
         )
         cache_key = (
-            mode, threads, device.index, arch, sorts_tokens, single_tile_per_expert
+            mode,
+            threads,
+            device.index,
+            arch,
+            sorts_tokens,
+            single_tile_per_expert,
         )
         compiled = _route_preprocess_kernel_cache.get(cache_key)
         stream = cuda.CUstream(torch.cuda.current_stream(device).cuda_stream)
         if compiled is None:
             kernel = (
                 _FusedRoutePreprocess(mode, threads, single_tile_per_expert)
-                if sorts_tokens else _RoutePreprocess(mode, threads)
+                if sorts_tokens
+                else _RoutePreprocess(mode, threads)
             )
             compiled = cute.compile(kernel, *arguments, stream=stream)
             _route_preprocess_kernel_cache[cache_key] = compiled

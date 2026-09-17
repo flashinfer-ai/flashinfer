@@ -2987,8 +2987,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                                             acc_vec_up_alpha = (
                                                 linear_beta
                                                 * native_tanh_f32(
-                                                    acc_vec_up_alpha
-                                                    * inv_linear_beta,
+                                                    acc_vec_up_alpha * inv_linear_beta,
                                                 )
                                             )
                                         else:

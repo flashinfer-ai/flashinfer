@@ -1062,3 +1062,163 @@ def test_all_local_kimi_paired_fp64_and_graph(
     candidate_error = torch.linalg.vector_norm(output.double() - ref)
     baseline_error = torch.linalg.vector_norm(baseline_output.double() - ref)
     assert candidate_error <= baseline_error + floor, report
+
+
+@pytest.mark.parametrize("order", [(17, 16, 17), (16, 17, 16)])
+def test_decode_plan_cache_transition_graph(order, record_property):
+    _require_blackwell()
+    finalize = importlib.import_module(
+        "flashinfer.fused_moe.cute_dsl."
+        "blockscaled_contiguous_grouped_gemm_finalize_fusion"
+    )
+    routing = importlib.import_module("flashinfer.fused_moe.cute_dsl.mxfp4_routing")
+    # Test both first-compilation orders. Keep every plan alive within an order.
+    finalize._finalize_kernel_cache.clear()
+    routing._route_preprocess_kernel_cache.clear()
+    stream = torch.cuda.Stream()
+    reports = []
+    with torch.no_grad(), torch.cuda.stream(stream):
+        base = make_case(
+            tokens=17,
+            hidden=512,
+            intermediate=128,
+            num_experts=8,
+            local_num_experts=4,
+            local_expert_offset=2,
+            top_k=2,
+            seed=1917,
+            distribution="hot",
+        )
+        cute_weights = prepare_cute_weights(base)
+        trt_weights = prepare_trt_weights(base)
+        plans = []
+        for tokens in order:
+            ids, weights = make_routing(tokens, 8, 2, 4, 2, "hot", seed=1917)
+            case = replace(
+                base,
+                x=base.x[:tokens].clone(),
+                x_scale=base.x_scale[:tokens].clone(),
+                topk_ids=ids,
+                topk_weights=weights,
+                beta=torch.linspace(2.5, 7.0, 4, device="cuda"),
+                linear_beta=torch.linspace(3.0, 25.0, 4, device="cuda"),
+            )
+            plan, output, workspace = prepare_candidate(
+                case, packed=True, prepared_weights=cute_weights
+            )
+            stream.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                plan.run()
+            plans.append((case, plan, output, workspace, graph))
+        for index, (case, plan, output, _workspace, graph) in enumerate(plans):
+            for distribution in ("hot", "all_remote", "balanced"):
+                ids, weights = make_routing(
+                    case.x.shape[0], 8, 2, 4, 2, distribution, seed=7401
+                )
+                case.topk_ids.copy_(ids)
+                case.topk_weights.copy_(weights)
+                case.x.copy_((-case.x.float()).to(case.x.dtype))
+                case.beta.copy_(case.beta.flip(0) * 0.75 + 0.25)
+                case.linear_beta.copy_(case.linear_beta.flip(0) * 0.5 + 0.5)
+                plan._topk_ids.copy_(pack_topk(ids, weights))
+                plan._kwargs["gemm1_out"].view(torch.uint8).fill_(0x7F)
+                plan._kwargs["gemm1_out_scale"].view(torch.uint8).fill_(0xFF)
+                output.fill_(float("nan"))
+                graph.replay()
+                baseline, baseline_output = make_trt_baseline(case, trt_weights)
+                baseline()
+                stream.synchronize()
+                references = reference_moe(case)
+                metrics = {
+                    name: paired_accuracy(output, baseline_output, reference)
+                    for name, reference in references.items()
+                }
+                for report in metrics.values():
+                    assert report["candidate"]["finite"]
+                    assert report["baseline"]["finite"]
+                ideal = references["ideal_fp64"]
+                floor = torch.linalg.vector_norm(
+                    ideal.to(torch.bfloat16).double() - ideal
+                )
+                error = torch.linalg.vector_norm(output.double() - ideal)
+                baseline_error = torch.linalg.vector_norm(
+                    baseline_output.double() - ideal
+                )
+                assert error <= baseline_error + floor
+                reports.append(
+                    {
+                        "plan_index": index,
+                        "tokens": case.x.shape[0],
+                        "distribution": distribution,
+                        "metrics": metrics,
+                    }
+                )
+        stream.synchronize()
+    record_property("numerical_report", json.dumps(reports))
+
+
+def test_decode_routing_opt_in_fallback_graph():
+    _require_blackwell()
+    import cuda.bindings.driver as cuda
+    from flashinfer.fused_moe.cute_dsl.moe_utils import allocate_moe_sort_buffers
+    from flashinfer.fused_moe.cute_dsl import mxfp4_routing as routing
+
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        for order in ((128, 8), (8, 128)):
+            routing._route_preprocess_kernel_cache.clear()
+            ids, weights = make_routing(16, 8, 2, 4, 2, "hot", seed=1917)
+            source_ids = pack_topk(ids, weights)
+            plans = []
+            for tile, opt_in in [(tile, True) for tile in order] + [(8, False)]:
+                buffers = allocate_moe_sort_buffers(16, 8, 2, 4, tile)
+                output = torch.full((16, 512), 7, device="cuda", dtype=torch.bfloat16)
+                route_ids = torch.empty_like(ids)
+                route_weights = torch.empty_like(weights, dtype=torch.float32)
+                plan = routing._plan_route_preprocess(
+                    source_ids,
+                    None,
+                    output=output,
+                    route_ids=route_ids,
+                    route_weights=route_weights,
+                    moe_sort_buffers=buffers,
+                    num_experts=8,
+                    num_local_experts=4,
+                    local_expert_offset=2,
+                    tile_size=tile,
+                    _single_tile_per_expert=opt_in,
+                )
+                stream.synchronize()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, stream=stream):
+                    plan.run(cuda.CUstream(stream.cuda_stream))
+                plans.append(
+                    (tile, buffers, output, route_ids, route_weights, plan, graph)
+                )
+            for distribution in ("hot", "all_remote", "balanced"):
+                ids, weights = make_routing(16, 8, 2, 4, 2, distribution, seed=7401)
+                source_ids.copy_(pack_topk(ids, weights))
+                for (
+                    tile,
+                    buffers,
+                    output,
+                    route_ids,
+                    route_weights,
+                    _plan,
+                    graph,
+                ) in plans:
+                    for tensor in buffers.values():
+                        tensor.fill_(-97)
+                    output.fill_(7)
+                    route_ids.fill_(-97)
+                    route_weights.fill_(float("nan"))
+                    graph.replay()
+                    stream.synchronize()
+                    _assert_decode_route_semantics(buffers, ids, 4, 2, tile)
+                    torch.testing.assert_close(route_ids, ids, atol=0, rtol=0)
+                    torch.testing.assert_close(
+                        route_weights, weights.float(), atol=0, rtol=0
+                    )
+                    assert output.count_nonzero() == 0
+        stream.synchronize()

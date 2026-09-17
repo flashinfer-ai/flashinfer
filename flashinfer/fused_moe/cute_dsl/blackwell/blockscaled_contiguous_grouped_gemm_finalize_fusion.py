@@ -1360,15 +1360,21 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                 sA.iterator,
                 cute.make_layout(
                     (16, self.mma_tiler[2], 1, self.num_ab_stage),
-                    stride=(self.mma_tiler[2], 1, 16 * self.mma_tiler[2],
-                            128 * self.mma_tiler[2]),
+                    stride=(
+                        self.mma_tiler[2],
+                        1,
+                        16 * self.mma_tiler[2],
+                        128 * self.mma_tiler[2],
+                    ),
                 ),
             )
             narrow_gA = cute.local_tile(
                 mA_mkl, (16, self.mma_tiler[2], 1), (None, None, None)
             )
             tAsA, tAgA = cpasync.tma_partition(
-                tma_atom_a, 0, cute.make_layout(1),
+                tma_atom_a,
+                0,
+                cute.make_layout(1),
                 cute.group_modes(narrow_sA, 0, 3),
                 cute.group_modes(narrow_gA, 0, 3),
             )

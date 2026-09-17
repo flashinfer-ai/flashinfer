@@ -155,11 +155,7 @@ def native_situ_f32(
         inv_beta = cutlass.Float32(f32_reciprocal(beta))
     else:
         inv_beta = cutlass.Float32(1.0) / beta_f32
-    return (
-        beta_f32
-        * native_tanh_f32(x * inv_beta)
-        * sigmoid_f32(x, fastmath=fastmath)
-    )
+    return beta_f32 * native_tanh_f32(x * inv_beta) * sigmoid_f32(x, fastmath=fastmath)
 
 
 @dsl_user_op
