@@ -192,7 +192,12 @@ def _register_torch_op() -> None:
         rand_seed: Any,
         philox_rounds: int,
     ) -> Any:
-        _load_extension().musa_ssu_simple(
+        method = (
+            "musa_ssu_simple_legacy"
+            if os.environ.get("FLASHINFER_MUSA_SIMPLE_STP_DISABLE_FAST") == "1"
+            else "musa_ssu_simple"
+        )
+        getattr(_load_extension(), method)(
             state,
             x,
             dt,
@@ -312,7 +317,12 @@ def musa_ssu_one_token_native(*args: Any, **kwargs: Any) -> Any:
         return output
 
     extension = _load_extension()
-    return extension.musa_ssu_simple(*args, **kwargs)
+    method = (
+        "musa_ssu_simple_legacy"
+        if os.environ.get("FLASHINFER_MUSA_SIMPLE_STP_DISABLE_FAST") == "1"
+        else "musa_ssu_simple"
+    )
+    return getattr(extension, method)(*args, **kwargs)
 
 
 def preload_musa_simple_stp() -> None:

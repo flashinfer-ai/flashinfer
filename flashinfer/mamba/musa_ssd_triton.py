@@ -116,6 +116,12 @@ def _mamba_chunk_scan_combined_fwd(
         dt_bias=dt_bias,
         dt_softplus=dt_softplus,
         dt_limit=dt_limit,
+        regular_full_chunks=(
+            cu_seqlens is not None
+            and cu_seqlens.numel() == 2
+            and seqlen % chunk_size == 0
+            and chunk_size == 128
+        ),
     )
 
     # 2. Compute the state for each intra-chunk

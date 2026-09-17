@@ -29,6 +29,9 @@ constexpr int kPhiloxKeyB = 0xBB67AE85u;
 constexpr uint32_t kPhiloxMulA = 0xD2511F53u;
 constexpr uint32_t kPhiloxMulB = 0xCD9E8D57u;
 
+struct __align__(16) Half8 { __half x[8]; };
+struct __align__(16) BF168 { __mt_bfloat16 x[8]; };
+
 template <typename T> __device__ __forceinline__ float as_float(T v) {
   return static_cast<float>(v);
 }
@@ -92,6 +95,12 @@ __device__ __forceinline__ uint16_t stochastic_f16(float x, uint32_t rnd) {
 __device__ __forceinline__ float warp_sum(float x) {
 #pragma unroll
   for (int d = 16; d; d >>= 1) x += __shfl_down_sync(0xffffffffu, x, d);
+  return x;
+}
+
+__device__ __forceinline__ float half_warp_sum(float x) {
+#pragma unroll
+  for (int d = 8; d; d >>= 1) x += __shfl_down_sync(0xffffffffu, x, d);
   return x;
 }
 
@@ -168,18 +177,133 @@ __global__ void simple_stp_kernel(
   }
 }
 
+// Dashboard submission #77543 showed that the production Nemotron shape is
+// dominated by state-cache traffic. The generic kernel above launches one
+// CTA for four rows and reloads B/C for every CTA. This shape-specialized
+// path launches one CTA for sixteen rows: each half warp streams two rows,
+// while B/C stay in registers and are reused for both rows. The state-cache
+// contract (separate source/destination slots, pad sentinel and Philox
+// stochastic rounding) stays identical to the generic implementation.
+template <typename DType, typename IndexT, int ROUNDS, bool STOCHASTIC>
+__global__ __launch_bounds__(kThreads) void simple_stp_tied_fast_kernel(
+    __half* __restrict__ state, const __mt_bfloat16* __restrict__ x,
+    const float* __restrict__ dt, const float* __restrict__ A,
+    const __mt_bfloat16* __restrict__ B,
+    const __mt_bfloat16* __restrict__ C,
+    const DType* __restrict__ Dv, const float* __restrict__ bias,
+    const IndexT* __restrict__ src_slots,
+    const IndexT* __restrict__ dst_slots,
+    __mt_bfloat16* __restrict__ out, const int64_t* __restrict__ seed,
+    int64_t pad, int slots, bool has_bias, bool softplus_flag) {
+  constexpr int kHalfWarp = 16;
+  constexpr int kHalfWarps = kThreads / kHalfWarp;
+  constexpr int kRowsPerHalfWarp = 2;
+  constexpr int kRowsPerBlock = kHalfWarps * kRowsPerHalfWarp;
+  constexpr int kBlocksPerHead = 64 / kRowsPerBlock;
+  constexpr int64_t kSlotStride = 64LL * 64 * kN;
+
+  const int block = blockIdx.x;
+  const int head = block / kBlocksPerHead;
+  const int row_base = (block % kBlocksPerHead) * kRowsPerBlock;
+  const int tid = threadIdx.x;
+  const int half_warp = tid >> 4;
+  const int lane = tid & 15;
+  const int n0 = lane << 3;
+  const int d0 = row_base + half_warp;
+  const int d1 = d0 + kHalfWarps;
+
+  const int group_base = (head / 8) * kN + n0;
+  const BF168 bp = *reinterpret_cast<const BF168*>(B + group_base);
+  const BF168 cp = *reinterpret_cast<const BF168*>(C + group_base);
+  float bf[8], cf[8];
+#pragma unroll
+  for (int q = 0; q < 8; ++q) {
+    bf[q] = as_float(bp.x[q]);
+    cf[q] = as_float(cp.x[q]);
+  }
+
+  float dtv = dt[head] + (has_bias ? bias[head] : 0.f);
+  if (softplus_flag) dtv = softplus(dtv);
+  const float decay = fast_exp(A[head] * dtv);
+  const float residual = as_float(Dv[head]);
+
+  const IndexT src_i = src_slots[0];
+  const IndexT dst_i = dst_slots[0];
+  const bool src_ok = src_i >= 0 && src_i < slots && src_i != pad;
+  const bool dst_ok = dst_i >= 0 && dst_i < slots && dst_i != pad;
+  const int64_t state_offset = static_cast<int64_t>(head) * 64 * kN +
+                               static_cast<int64_t>(d0) * kN + n0;
+  const __half* src0 = state + static_cast<int64_t>(src_i) * kSlotStride +
+                       state_offset;
+  __half* dst0 = state + static_cast<int64_t>(dst_i) * kSlotStride +
+                 state_offset;
+
+  Half8 old0{}, old1{};
+  if (src_ok) {
+    old0 = *reinterpret_cast<const Half8*>(src0);
+    old1 = *reinterpret_cast<const Half8*>(src0 + kHalfWarps * kN);
+  }
+
+  const float x0 = as_float(x[head * 64 + d0]);
+  const float x1 = as_float(x[head * 64 + d1]);
+  const float drive0 = dtv * x0;
+  const float drive1 = dtv * x1;
+  Half8 next0{}, next1{};
+  float acc0 = 0.f, acc1 = 0.f;
+  uint4 rnd0a{}, rnd0b{}, rnd1a{}, rnd1b{};
+  if constexpr (STOCHASTIC) {
+    const int64_t logical0 = (static_cast<int64_t>(head) * 64 + d0) * kN + n0;
+    const int64_t logical1 = (static_cast<int64_t>(head) * 64 + d1) * kN + n0;
+    rnd0a = philox4x32<ROUNDS>(*seed, logical0);
+    rnd0b = philox4x32<ROUNDS>(*seed, logical0 + 4);
+    rnd1a = philox4x32<ROUNDS>(*seed, logical1);
+    rnd1b = philox4x32<ROUNDS>(*seed, logical1 + 4);
+  }
+#pragma unroll
+  for (int q = 0; q < 8; ++q) {
+    const float u0 = as_float(old0.x[q]) * decay + drive0 * bf[q];
+    const float u1 = as_float(old1.x[q]) * decay + drive1 * bf[q];
+    if constexpr (STOCHASTIC) {
+      const uint4 r0 = q < 4 ? rnd0a : rnd0b;
+      const uint4 r1 = q < 4 ? rnd1a : rnd1b;
+      const int k = q & 3;
+      const uint32_t v0 = k == 0 ? r0.x : k == 1 ? r0.y : k == 2 ? r0.z : r0.w;
+      const uint32_t v1 = k == 0 ? r1.x : k == 1 ? r1.y : k == 2 ? r1.z : r1.w;
+      next0.x[q] = __ushort_as_half(stochastic_f16(u0, v0));
+      next1.x[q] = __ushort_as_half(stochastic_f16(u1, v1));
+    } else {
+      next0.x[q] = __float2half(u0);
+      next1.x[q] = __float2half(u1);
+    }
+    acc0 += cf[q] * u0;
+    acc1 += cf[q] * u1;
+  }
+
+  if (dst_ok) {
+    *reinterpret_cast<Half8*>(dst0) = next0;
+    *reinterpret_cast<Half8*>(dst0 + kHalfWarps * kN) = next1;
+  }
+  acc0 = half_warp_sum(acc0);
+  acc1 = half_warp_sum(acc1);
+  if (lane == 0) {
+    out[head * 64 + d0] = from_float<__mt_bfloat16>(acc0 + residual * x0);
+    out[head * 64 + d1] = from_float<__mt_bfloat16>(acc1 + residual * x1);
+  }
+}
+
 #define LAUNCH(IN, DT, IDX, R, HB, BM, HZ, SP, DV, TH, SR) \
   simple_stp_kernel<IN, DT, IDX, R> \
     <<<1024, kThreads, 0, stream>>>(reinterpret_cast<__half*>(state.data_ptr()), reinterpret_cast<const IN*>(x.data_ptr()), reinterpret_cast<const float*>(dt.data_ptr()), reinterpret_cast<const float*>(A.data_ptr()), reinterpret_cast<const IN*>(B.data_ptr()), reinterpret_cast<const IN*>(C.data_ptr()), reinterpret_cast<const DT*>(Dv.data_ptr()), bias_ptr, reinterpret_cast<const IN*>(z_tensor.data_ptr()), reinterpret_cast<const IDX*>(src.data_ptr()), reinterpret_cast<const IDX*>(dst.data_ptr()), reinterpret_cast<IN*>(out.data_ptr()), seed_ptr, ss,sh,sd,sn,xb,xh,xd,dtb,dth,dtd,ah,ad,an,bb,bg,bn,cb,cg,cn,dh,dd,bh,bd,ob,oh,od,zb,zh,zd,pad_slot_id,state.size(0),HB,BM,HZ,SP,DV,TH,SR)
 
 }  // namespace
 
-at::Tensor musa_ssu_simple(
+at::Tensor musa_ssu_simple_impl(
     at::Tensor state, at::Tensor x, at::Tensor dt, at::Tensor A,
     at::Tensor B, at::Tensor C, at::Tensor Dv, at::Tensor src, at::Tensor dst,
     c10::optional<at::Tensor> dt_bias, c10::optional<at::Tensor> z,
     bool dt_softplus, int64_t pad_slot_id, c10::optional<at::Tensor> out_opt,
-    c10::optional<at::Tensor> rand_seed, int64_t philox_rounds) {
+    c10::optional<at::Tensor> rand_seed, int64_t philox_rounds,
+    bool enable_fast) {
   TORCH_CHECK(state.device().is_privateuseone(), "state must be MUSA");
   TORCH_CHECK(state.dim() == 4 && state.size(1) == 64 && state.size(2) == 64 && state.size(3) == 128,
               "native Simple STP requires state [slots,64,64,128]");
@@ -223,6 +347,75 @@ at::Tensor musa_ssu_simple(
   const auto z_tensor = z.has_value() ? *z : x;
   const int64_t* seed_ptr = rand_seed.has_value() ? rand_seed->data_ptr<int64_t>() : nullptr;
   TORCH_CHECK(x.scalar_type() == at::kBFloat16, "native Simple STP currently requires BF16 x/output");
+
+  // The dashboard SOTA layout is safe only when every tensor uses the
+  // contiguous/tied Nemotron view. Keep the general strided kernel as the
+  // fallback; this is also the switch used by the A/B microbenchmark.
+  const bool fast_layout =
+      enable_fast && !z.has_value() && x.is_contiguous() && B.is_contiguous() &&
+      C.is_contiguous() && out.is_contiguous() && dt.stride(0) == 64 &&
+      dt.stride(1) == 1 && dt.stride(2) == 0 && A.stride(0) == 1 &&
+      A.stride(1) == 0 && A.stride(2) == 0 &&
+      ((Dv.dim() == 1 && Dv.stride(0) == 1) ||
+       (Dv.dim() == 2 && Dv.stride(0) == 1 && Dv.stride(1) == 0)) &&
+      (!dt_bias.has_value() ||
+       (dt_bias->dim() == 1 && dt_bias->stride(0) == 1) ||
+       (dt_bias->dim() == 2 && dt_bias->stride(0) == 1 &&
+        dt_bias->stride(1) == 0));
+  if (fast_layout) {
+#define FAST_LAUNCH(DT, IDX, R, SR)                                             \
+  simple_stp_tied_fast_kernel<DT, IDX, R, SR>                                   \
+      <<<256, kThreads, 0, stream>>>(                                           \
+          reinterpret_cast<__half*>(state.data_ptr()),                         \
+          reinterpret_cast<const __mt_bfloat16*>(x.data_ptr()),                 \
+          reinterpret_cast<const float*>(dt.data_ptr()),                       \
+          reinterpret_cast<const float*>(A.data_ptr()),                        \
+          reinterpret_cast<const __mt_bfloat16*>(B.data_ptr()),                \
+          reinterpret_cast<const __mt_bfloat16*>(C.data_ptr()),                \
+          reinterpret_cast<const DT*>(Dv.data_ptr()), bias_ptr,                 \
+          reinterpret_cast<const IDX*>(src.data_ptr()),                         \
+          reinterpret_cast<const IDX*>(dst.data_ptr()),                         \
+          reinterpret_cast<__mt_bfloat16*>(out.data_ptr()), seed_ptr,           \
+          pad_slot_id, static_cast<int>(state.size(0)), dt_bias.has_value(),     \
+          dt_softplus)
+    if (Dv.scalar_type() == at::kFloat) {
+      if (src.scalar_type() == at::kInt) {
+        if (rand_seed.has_value()) {
+          if (philox_rounds == 5) FAST_LAUNCH(float, int, 5, true);
+          else FAST_LAUNCH(float, int, 10, true);
+        } else {
+          FAST_LAUNCH(float, int, 10, false);
+        }
+      } else {
+        if (rand_seed.has_value()) {
+          if (philox_rounds == 5) FAST_LAUNCH(float, int64_t, 5, true);
+          else FAST_LAUNCH(float, int64_t, 10, true);
+        } else {
+          FAST_LAUNCH(float, int64_t, 10, false);
+        }
+      }
+    } else {
+      if (src.scalar_type() == at::kInt) {
+        if (rand_seed.has_value()) {
+          if (philox_rounds == 5) FAST_LAUNCH(__mt_bfloat16, int, 5, true);
+          else FAST_LAUNCH(__mt_bfloat16, int, 10, true);
+        } else {
+          FAST_LAUNCH(__mt_bfloat16, int, 10, false);
+        }
+      } else {
+        if (rand_seed.has_value()) {
+          if (philox_rounds == 5) FAST_LAUNCH(__mt_bfloat16, int64_t, 5, true);
+          else FAST_LAUNCH(__mt_bfloat16, int64_t, 10, true);
+        } else {
+          FAST_LAUNCH(__mt_bfloat16, int64_t, 10, false);
+        }
+      }
+    }
+#undef FAST_LAUNCH
+    TORCH_CHECK(musaGetLastError() == musaSuccess,
+                "native Simple STP fast launch failed");
+    return out;
+  }
 #define LAUNCH_ROUND(IDX, R, SR) do { \
   if (Dv.scalar_type() == at::kFloat) \
     LAUNCH(__mt_bfloat16, float, IDX, R, dt_bias.has_value(), dt_bias.has_value() && dt_bias->dim()==2, z.has_value(), dt_softplus, Dv.dim()==1, A.stride(1)==0 && A.stride(2)==0, SR); \
@@ -241,4 +434,30 @@ at::Tensor musa_ssu_simple(
   return out;
 }
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("musa_ssu_simple", &musa_ssu_simple, "Native MUSA Simple STP"); }
+at::Tensor musa_ssu_simple(
+    at::Tensor state, at::Tensor x, at::Tensor dt, at::Tensor A,
+    at::Tensor B, at::Tensor C, at::Tensor Dv, at::Tensor src, at::Tensor dst,
+    c10::optional<at::Tensor> dt_bias, c10::optional<at::Tensor> z,
+    bool dt_softplus, int64_t pad_slot_id, c10::optional<at::Tensor> out_opt,
+    c10::optional<at::Tensor> rand_seed, int64_t philox_rounds) {
+  return musa_ssu_simple_impl(state, x, dt, A, B, C, Dv, src, dst, dt_bias, z,
+                              dt_softplus, pad_slot_id, out_opt, rand_seed,
+                              philox_rounds, true);
+}
+
+at::Tensor musa_ssu_simple_legacy(
+    at::Tensor state, at::Tensor x, at::Tensor dt, at::Tensor A,
+    at::Tensor B, at::Tensor C, at::Tensor Dv, at::Tensor src, at::Tensor dst,
+    c10::optional<at::Tensor> dt_bias, c10::optional<at::Tensor> z,
+    bool dt_softplus, int64_t pad_slot_id, c10::optional<at::Tensor> out_opt,
+    c10::optional<at::Tensor> rand_seed, int64_t philox_rounds) {
+  return musa_ssu_simple_impl(state, x, dt, A, B, C, Dv, src, dst, dt_bias, z,
+                              dt_softplus, pad_slot_id, out_opt, rand_seed,
+                              philox_rounds, false);
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("musa_ssu_simple", &musa_ssu_simple, "Native MUSA Simple STP");
+  m.def("musa_ssu_simple_legacy", &musa_ssu_simple_legacy,
+        "Legacy native MUSA Simple STP");
+}

@@ -6,6 +6,8 @@
 
 # ruff: noqa: E501
 
+import os
+
 import torch
 
 from .musa_compile import device_context
@@ -324,12 +326,35 @@ def _chunk_cumsum_fwd(
     dt_bias=None,
     dt_softplus=False,
     dt_limit=(0.0, _DT_MAX),
+    regular_full_chunks=False,
 ):
     seqlen, nheads = dt.shape
     assert A.shape == (nheads,)
     if dt_bias is not None:
         assert dt_bias.shape == (nheads,)
     nchunks = cu_chunk_seqlens.shape[0] - 1
+
+    # The native dashboard kernel is intentionally restricted to the common
+    # single-sequence, full-chunk Nemotron prefill shape. Varlen tails and
+    # arbitrary chunk boundaries continue through the reference Triton path.
+    if (
+        regular_full_chunks
+        and os.environ.get("FLASHINFER_MUSA_SSD_CUMSUM_DISABLE_FAST") != "1"
+        and chunk_size == 128
+        and nheads == 64
+        and dt_bias is not None
+        and dt.dtype == torch.float32
+        and A.dtype == torch.float32
+        and dt_bias.dtype == torch.float32
+        and dt.is_contiguous()
+        and A.is_contiguous()
+        and dt_bias.is_contiguous()
+        and seqlen == nchunks * 128
+    ):
+        from .musa_ssd_cumsum_native import musa_ssd_chunk_cumsum_native
+
+        return musa_ssd_chunk_cumsum_native(dt, A, dt_bias)
+
     dt_out = dt.new_empty((nheads, nchunks, chunk_size), dtype=torch.float32)
     dA_cumsum = dt.new_empty((nheads, nchunks, chunk_size), dtype=torch.float32)
     grid_chunk_cs = lambda META: (nchunks, triton.cdiv(nheads, META["BLOCK_SIZE_H"]))
