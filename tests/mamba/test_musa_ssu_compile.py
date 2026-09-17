@@ -87,10 +87,10 @@ def test_native_ssu_inductor_fullgraph_replay_and_mutation():
     torch.musa.synchronize()
     torch.testing.assert_close(second_out, second_eager_out, rtol=0.05, atol=0.05)
     torch.testing.assert_close(
-        second_inputs[0][6], second_eager_state[6], rtol=0.05, atol=0.05
+        second_inputs[0][5], second_eager_state[5], rtol=0.05, atol=0.05
     )
     torch.testing.assert_close(second_inputs[-1], second_out, rtol=0, atol=0)
-    torch.testing.assert_close(second_inputs[0][1], second_state_before[1], rtol=0, atol=0)
+    torch.testing.assert_close(second_inputs[0][2], second_state_before[2], rtol=0, atol=0)
 
     explanation = torch._dynamo.explain(_step)(*(_native_inputs(2203)))
     assert explanation.graph_break_count == 0
@@ -99,3 +99,48 @@ def test_native_ssu_inductor_fullgraph_replay_and_mutation():
         for graph in explanation.graphs
         for node in graph.graph.nodes
     )
+
+
+@pytest.mark.skipif(TEST_DEVICE != "musa", reason="MUSA graph test")
+@pytest.mark.skipif(
+    os.environ.get("FLASHINFER_MUSA_SIMPLE_STP_NATIVE") != "1",
+    reason="native extension is opt-in",
+)
+def test_native_ssu_musa_graph_updates_existing_buffers():
+    from flashinfer.mamba.musa_ssu_native import preload_musa_simple_stp
+
+    preload_musa_simple_stp()
+    compiled = torch.compile(_step, backend="inductor", fullgraph=True, dynamic=False)
+    static = _native_inputs(2210)
+    compiled(*static)
+    torch.musa.synchronize()
+
+    capture_stream = torch.musa.Stream()
+    capture_stream.wait_stream(torch.musa.current_stream())
+    graph = torch.musa.MUSAGraph()
+    with torch.musa.graph(graph, stream=capture_stream):
+        captured_output = compiled(*static)
+    torch.musa.current_stream().wait_stream(capture_stream)
+
+    updated = _native_inputs(2211)
+    updated[9].fill_(2)
+    updated[10].fill_(5)
+    expected_state = updated[0].clone()
+    expected_output = _step(expected_state, *updated[1:]).clone()
+    # Preserve each static tensor's address and tied stride layout. Copying
+    # directly to an expanded view would write overlapping storage.
+    for index in (0, 1, 4, 5, 8, 9, 10):
+        static[index].copy_(updated[index])
+    static[2][..., 0].copy_(updated[2][..., 0])
+    static[3][:, 0, 0].copy_(updated[3][:, 0, 0])
+    for index in (6, 7):
+        static[index][:, 0].copy_(updated[index][:, 0])
+    static[-1].fill_(float("nan"))
+
+    graph.replay()
+    torch.musa.synchronize()
+    torch.testing.assert_close(captured_output, expected_output, rtol=0.05, atol=0.05)
+    torch.testing.assert_close(static[-1], expected_output, rtol=0.05, atol=0.05)
+    torch.testing.assert_close(static[0][5], expected_state[5], rtol=0.05, atol=0.05)
+    torch.testing.assert_close(static[0][2], updated[0][2], rtol=0, atol=0)
+    torch.testing.assert_close(static[0][6], updated[0][6], rtol=0, atol=0)
