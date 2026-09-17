@@ -3358,6 +3358,128 @@ class TestTrtllmFp4UnpackedContract:
         torch.testing.assert_close(captured, eager)
 
 
+@pytest.fixture(scope="module", params=[1, 256], ids=["m1", "m256"])
+def per_token_moe_pdl_setup(request):
+    device = torch.device("cuda", torch.cuda.current_device())
+    hidden_size, intermediate_size, num_experts, top_k = 4096, 2048, 32, 4
+    tensors = create_moe_tensors(
+        num_tokens=request.param,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        num_local_experts=num_experts,
+        top_k=top_k,
+        gated=True,
+        use_per_token_activation=True,
+        use_nontrivial_alphas=False,
+    )
+    config = MoEConfig(
+        routing=RoutingConfig(num_experts=num_experts, top_k=top_k),
+        quant=QuantConfig(
+            weight=QuantFormat.NVFP4,
+            activation=QuantFormat.NVFP4,
+            per_token_scale=True,
+        ),
+        experts=ExpertConfig(
+            intermediate_size=intermediate_size, local_num_experts=num_experts
+        ),
+        activation=SwiGLU(),
+    )
+    act = MoEActivationPack(
+        hidden_states_q=tensors["x"],
+        hidden_states_scale=tensors["x_sf"].squeeze(-1),
+        topk_ids=tensors["token_selected_experts"],
+        topk_weights=tensors["token_final_scales"].to(torch.bfloat16),
+        per_token_scale=tensors["x_per_token_scale"],
+        routing_input_mode=RoutingInputMode.UnpackedPrecomputed,
+    )
+    prepared_weights = TrtllmFp4Config.prepare_weights(
+        tensors["w1_weight_bf16"],
+        tensors["w2_weight_bf16"],
+        num_local_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        activation=config.activation,
+        device=device,
+    )
+    runners, inputs = {}, {}
+    for pdl in (False, True):
+        runners[pdl] = _build_direct_runner(
+            TrtllmFp4RoutedRunner,
+            dataclasses.replace(config, execution=ExecutionConfig(enable_pdl=pdl)),
+            device,
+        )
+        weights = MoEWeightPack()
+        weights.prepare_for(runners[pdl].backend_key, prepared_weights)
+        inputs[pdl] = runners[pdl].pack_inputs(act, weights)
+        assert runners[pdl]._inner.use_per_token_scaling
+
+    # Fix the same FC1/FC2 tactic for both arms, bypassing autotune.
+    tactics = runners[False].get_valid_tactics(inputs[False], None)
+    assert tactics, "No per-token NVFP4 MoE tactic available"
+    tactic = tactics[0]
+    assert tactic in runners[True].get_valid_tactics(inputs[True], None)
+
+    def run(enable_pdl):
+        return runners[enable_pdl].forward(inputs[enable_pdl], tactic=tactic)
+
+    # Warm up JIT, workspaces and auxiliary streams before any graph capture.
+    warmup_stream = torch.cuda.Stream()
+    warmup_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup_stream):
+        for _ in range(3):
+            run(False)
+            run(True)
+    torch.cuda.current_stream().wait_stream(warmup_stream)
+    torch.cuda.synchronize()
+    return run, act.hidden_states_q, act.hidden_states_q.clone()
+
+
+@pytest.fixture
+def per_token_moe_pdl_case(per_token_moe_pdl_setup):
+    run, static_input, initial_input = per_token_moe_pdl_setup
+    static_input.copy_(initial_input)
+    yield run, static_input
+    torch.cuda.synchronize()
+
+
+@sm100_required
+class TestPerTokenMoePdl:
+    def test_pdl_matches_no_pdl(self, per_token_moe_pdl_case):
+        """Smoke-test PDL equivalence; this does not prove absence of races."""
+        run, static_input = per_token_moe_pdl_case
+        for _ in range(3):
+            # Fresh, valid packed FP4 values; retain the same scale tensors.
+            static_input.copy_(torch.randint_like(static_input, high=256))
+            actual = run(True).clone()
+            expected = run(False).clone()
+            assert torch.isfinite(expected).all()
+            assert torch.equal(expected, run(False)), "Non-PDL baseline changed"
+            assert torch.equal(actual, expected), "PDL changed the MoE result"
+
+    @pytest.mark.parametrize("enable_pdl", [False, True])
+    def test_cuda_graph_fresh_inputs(self, per_token_moe_pdl_case, enable_pdl):
+        """Captured PDL launches must consume fresh inputs and overwrite the output."""
+        run, static_input = per_token_moe_pdl_case
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = run(enable_pdl)
+        previous = run(False).clone()
+        for _ in range(3):
+            static_input.copy_(torch.randint_like(static_input, high=256))
+            captured.fill_(float("nan"))
+            graph.replay()
+            actual = captured.clone()
+            # Compute reference after replay so it cannot seed stale intermediates.
+            expected = run(False).clone()
+            assert torch.isfinite(actual).all()
+            assert not torch.equal(expected, previous), "Input change had no effect"
+            assert torch.equal(actual, expected), (
+                "Graph replay used stale or incorrect data"
+            )
+            previous = expected
+
+
 @sm100_required
 class TestTrtllmEPOffset:
     """EP-shard forward regression (gh #3547): an offset>0 run over the same
