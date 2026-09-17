@@ -1,10 +1,5 @@
 # SM110 GQA decode results
 
-The later prepared sustained-decode study is recorded separately in
-[PARTIAL_RESIDENCY.md](PARTIAL_RESIDENCY.md). It uses controlled partial KV
-footprints, paired original/XQA baselines and matched observed clocks.
-The CUDA 13.5 measurements below remain unchanged and are not pooled with it.
-
 ## Primary comparison: paired kernel timing against XQA
 
 Fresh measurements on 2026-09-09 compare the exported kernels at commit

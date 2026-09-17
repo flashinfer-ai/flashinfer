@@ -73,7 +73,5 @@ B1/capacity4096. Other shapes use original long. Explicit `num_splits=1`
 selects original long above capacity64; the specialized long routes also
 support explicit `num_splits=10`. Unsupported splits are rejected.
 
-See [PARTIAL_RESIDENCY.md](PARTIAL_RESIDENCY.md) for the frozen paired study,
-per-condition results and measurement limits. Run
-`examples/experimental/sm110_gqa_decode_prepared.py --graph` for a prepared
+Run `examples/experimental/sm110_gqa_decode_prepared.py --graph` for a prepared
 Graph example. Existing `sm110_gqa_decode` behavior is unchanged.
