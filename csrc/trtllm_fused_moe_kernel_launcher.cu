@@ -3079,6 +3079,8 @@ void trtllm_moe_run_deepseek_fp8_activation(
       << "DeepSeek FP8 activation: cta_idx_xy_to_batch_idx must be 1D.";
   TVM_FFI_ICHECK(cta_idx_xy_to_batch_idx.IsContiguous())
       << "DeepSeek FP8 activation: cta_idx_xy_to_batch_idx must be contiguous.";
+  TVM_FFI_ICHECK_EQ(cta_idx_xy_to_batch_idx.device().device_type, kDLCUDA)
+      << "DeepSeek FP8 activation: cta_idx_xy_to_batch_idx must be a CUDA tensor.";
   TVM_FFI_ICHECK_EQ(cta_idx_xy_to_batch_idx.device().device_id,
                     activation_output.device().device_id)
       << "DeepSeek FP8 activation: cta_idx_xy_to_batch_idx must be on the output device.";
@@ -3100,6 +3102,7 @@ void trtllm_moe_run_deepseek_fp8_activation(
     TVM_FFI_ICHECK(value.size(0) >= local_num_experts)
         << name << " must have at least local_num_experts elements.";
     TVM_FFI_ICHECK(value.IsContiguous()) << name << " must be contiguous.";
+    TVM_FFI_ICHECK_EQ(value.device().device_type, kDLCUDA) << name << " must be a CUDA tensor.";
     TVM_FFI_ICHECK_EQ(value.device().device_id, activation_output.device().device_id)
         << name << " must be on the output device.";
   };
