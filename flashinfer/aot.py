@@ -44,6 +44,7 @@ from .jit.attention import (
     gen_trtllm_gen_fmha_module,
     gen_trtllm_fmha_v2_sm120_module,
 )
+from .jit.attention.modules import _gen_batch_prefill_primary_module
 from .jit.attention.utils import _is_nvfp4_kv_dtype
 from .jit.cascade import gen_cascade_module
 from .jit.cake_fmha import gen_cake_fmha_compat_module
@@ -95,9 +96,12 @@ from .jit.cake_kda_packed_t1 import (
     CAKE_KDA_PACKED_T1_VARIANTS,
     gen_cake_kda_packed_t1_module,
 )
+from .jit.cake_megamoe_topk_reduce import gen_cake_megamoe_topk_reduce_module
 from .jit.nvfp4_attention_sm120 import gen_nvfp4_attention_sm120_module
 from .jit.fp8_quantization import gen_mxfp8_quantization_sm100_module
 from .jit.fused_moe import (
+    gen_alphamoe_fused_router_module,
+    gen_alphamoe_sm100_module,
     gen_cutlass_fused_moe_sm90_module,
     gen_cutlass_fused_moe_sm100_module,
     gen_cutlass_fused_moe_sm103_module,
@@ -135,7 +139,9 @@ from .jit.gemm import (
     gen_tgv_gemm_sm10x_module,
     gen_trtllm_gen_gemm_module,
     gen_trtllm_low_latency_gemm_module,
+    gen_blackwell_bf16_bmm_module,
 )
+from .jit.gemm.cake_blackwell_bf16_bmm import BlackwellBf16BmmTarget
 from .jit.mamba import (
     gen_selective_state_update_module,
     gen_selective_state_update_sm90_module,
@@ -186,7 +192,7 @@ def gen_fa2(
     if dtype_qo.itemsize == 1:
         return  # fp8 tensor cores not supported in fa2
 
-    yield gen_batch_prefill_module(
+    yield _gen_batch_prefill_primary_module(
         backend="fa2",
         dtype_q=dtype_qo,
         dtype_kv=dtype_kv,
@@ -263,9 +269,9 @@ def gen_attention(
     head_dim_ckv = 512
     head_dim_kpe = 64
 
-    # For 16-bit KV, head_dim > 256 FA2 modules use the Ampere+ large-head path.
-    # NVFP4 KV large-head is validated for FA2 batch prefill on SM8+; other
-    # one-byte large-head modules stay SM100+-only until validated separately.
+    # For 16-bit and FP8 KV, head_dim > 256 FA2 modules use the Ampere+
+    # large-head path. NVFP4 KV large-head is validated for FA2 batch prefill
+    # on SM8+, while NVFP4 decode remains SM100+-only.
     from .jit.core import current_compilation_context
 
     has_sm8_or_newer = any(
@@ -274,7 +280,6 @@ def gen_attention(
     has_sm10_or_newer = any(
         major >= 10 for major, _ in current_compilation_context.TARGET_CUDA_ARCHS
     )
-
     # FA2 MHA / MQA / GQA
     for (
         (head_dim_qk, head_dim_vo),
@@ -291,12 +296,8 @@ def gen_attention(
     ):
         large_head = head_dim_qk > 256 or head_dim_vo > 256
         nvfp4_large_head = large_head and _is_nvfp4_kv_dtype(dtype_kv)
-        if large_head:
-            if dtype_kv.itemsize == 1 and not nvfp4_large_head:
-                if not has_sm10_or_newer:
-                    continue
-            elif not has_sm8_or_newer:
-                continue
+        if large_head and not has_sm8_or_newer:
+            continue
         yield from gen_fa2(
             dtype_qo=dtype_qo,
             dtype_kv=dtype_kv,
@@ -508,6 +509,15 @@ def gen_xqa(
             )
 
 
+def _gen_blackwell_bf16_bmm_aot_specs(sm_capabilities: dict) -> List[JitSpec]:
+    targets: List[BlackwellBf16BmmTarget] = []
+    if sm_capabilities.get("sm100a_exact", False):
+        targets.append("sm100a")
+    if sm_capabilities.get("sm103a_exact", False):
+        targets.append("sm103a")
+    return [gen_blackwell_bf16_bmm_module(target) for target in targets]
+
+
 def gen_all_modules(
     f16_dtype_: List[torch.dtype],
     f8_dtype_: List[torch.dtype],
@@ -560,6 +570,9 @@ def gen_all_modules(
     )
     has_flash_kda_packed_t1_sm100f = sm_capabilities.get(
         "flash_kda_packed_t1_sm100f", False
+    )
+    has_cake_megamoe_topk_reduce_sm100a = sm_capabilities.get(
+        "cake_megamoe_topk_reduce_sm100a", False
     )
     has_sm100f = sm_capabilities.get("sm100f", False)
     has_sm103 = sm_capabilities.get("sm103", False)
@@ -731,6 +744,8 @@ def gen_all_modules(
             jit_specs.append(gen_cake_fused_moe_warp_decode_module("sm100a"))
         # DSv4 hash-based MoE routing (SM-portable)
         jit_specs.append(gen_hash_topk_module())
+        if has_cake_megamoe_topk_reduce_sm100a:
+            jit_specs.append(gen_cake_megamoe_topk_reduce_module())
         if has_sm90:
             jit_specs.append(gen_gemm_sm90_module())
             # fp8 blockscale GEMM (SM90)
@@ -768,8 +783,13 @@ def gen_all_modules(
             )
             jit_specs.append(gen_tgv_gemm_sm10x_module(torch.float16, use_sm_100f=True))
             jit_specs.append(gen_moe_utils_module())
+        if has_sm100a_exact or has_sm103a_exact:
+            jit_specs.append(gen_alphamoe_fused_router_module())
         if has_sm100 or has_sm103:
             jit_specs.append(gen_mm_bf16_cublaslt_module())
+        jit_specs.extend(_gen_blackwell_bf16_bmm_aot_specs(sm_capabilities))
+        if has_sm100a_exact or has_sm103a_exact:
+            jit_specs.append(gen_alphamoe_sm100_module())
         if has_sm103:
             jit_specs.append(gen_fp4_quantization_sm103_module())
             jit_specs.append(gen_cutlass_fused_moe_sm103_module())
@@ -1140,7 +1160,7 @@ def parse_head_dim(head_dim: str) -> Tuple[int, int]:
 def get_default_config():
     """Get default AOT configuration"""
     return {
-        # Note: head_dim=512 (FA2 prefill/decode, SM100+) excluded to reduce
+        # Note: head_dim=512 (FA2 prefill/decode, SM80+) excluded to reduce
         # space in the jit-cache wheel.
         "fa2_head_dim": [(64, 64), (128, 128), (256, 256)],
         "fa3_head_dim": [(192, 128), (128, 128), (64, 64), (256, 256)],
@@ -1249,6 +1269,10 @@ def detect_sm_capabilities():
         "flash_kda_packed_t1_sm100f": (
             bool(flash_kda_family_arches & compilation_context.TARGET_CUDA_ARCHS)
             and cuda_version >= Version("12.9")
+        ),
+        "cake_megamoe_topk_reduce_sm100a": (
+            (10, "0a") in compilation_context.TARGET_CUDA_ARCHS
+            and cuda_version >= Version("12.8")
         ),
         "sm103": has_sm("compute_103", "12.9"),
         "sm103a_exact": (10, "3a") in compilation_context.TARGET_CUDA_ARCHS

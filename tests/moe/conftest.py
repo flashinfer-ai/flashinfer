@@ -28,6 +28,18 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 
+def pytest_make_parametrize_id(config, val, argname):
+    """Give QuantConfig / ActivationConfig parametrize values stable node ids.
+
+    Without this, pytest labels them ``quant0`` / ``activation0``. Keep an
+    explicit ``ids=`` only when a value is a hook-unknown object or tuple, or
+    when several numeric columns need axis labels.
+    """
+    from tests.moe.utils import parametrize_id
+
+    return parametrize_id(val)
+
+
 @pytest.fixture(autouse=True)
 def _disable_prims_ts_exhaustive_checker_in_moe_integration_tests(monkeypatch):
     monkeypatch.setenv("FLASHINFER_PRIMS_TS_DEBUG_CHECKS", "0")

@@ -168,15 +168,15 @@ def _validate_input_contract(
 def _check_runtime_support(device: torch.device) -> None:
     if device.type != "cuda":
         raise ValueError("MiniMax-H3 BF16 pre-attention requires CUDA tensors")
-    if get_compute_capability(device) != (10, 3):
+    if get_compute_capability(device) not in {(10, 0), (10, 3)}:
         raise RuntimeError(
-            "MiniMax-H3 BF16 pre-attention requires compute capability 10.3"
+            "MiniMax-H3 BF16 pre-attention requires compute capability 10.0 or 10.3"
         )
     if not is_cuda_version_at_least("12.9"):
         raise RuntimeError("MiniMax-H3 BF16 pre-attention requires CUDA 12.9 or newer")
 
 
-@supported_compute_capability([103])
+@supported_compute_capability([100, 103])
 @flashinfer_api(trace=minimax_h3_bf16_pre_attention_trace)
 def minimax_h3_bf16_pre_attention(
     x: torch.Tensor,
@@ -243,8 +243,9 @@ def minimax_h3_bf16_pre_attention(
     MiniMax-H3 checkpoint semantics without a synchronizing host reduction.
 
     This is a direct kernel entry point for all supported destination counts.
-    The measured performance promotion range is ``P in {2, 4, 8}``; callers
-    that dispatch by ``P`` should retain their segmented fallback for ``P=1``.
+    On SM103a, the measured performance promotion range is ``P in {2, 4, 8}``.
+    Callers that dispatch by ``P`` should retain their segmented fallback for
+    ``P=1``.
     """
     _validate_input_contract(
         x,

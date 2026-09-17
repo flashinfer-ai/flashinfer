@@ -529,7 +529,7 @@ def chunk_gated_delta_rule(
     use_cp: Literal["auto"] | bool = "auto",
     state_indices: Optional[torch.Tensor] = None,
     _cp_chunk_len: Optional[int] = None,
-    backend: Literal["auto", "flashinfer", "cake_gdn"] = "auto",
+    backend: Literal["auto", "flashinfer", "cake_gdn", "cudnn"] = "auto",
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Chunked Gated Delta Rule (GDN) attention for prefill.
 
@@ -637,10 +637,12 @@ def chunk_gated_delta_rule(
         Internal context-parallel chunk-length override used for testing and
         tuning. ``None`` lets the CP backend select the length automatically;
         an explicit value must be a multiple of 64.
-
-    backend : {"auto", "flashinfer", "cake_gdn"}
-        ``auto`` selects GDN non-CP only for an exact frozen non-CP manifest row;
-        explicit ``cake_gdn`` requests fail closed.
+    backend : {"auto", "flashinfer", "cake_gdn", "cudnn"}
+        ``auto`` uses the same SM90/SM100/SM120 kernels and context-parallel
+        routing as ``flashinfer``. The source-only Cake kernels require an
+        explicit ``cake_gdn`` request, which fails for unsupported inputs.
+        ``cudnn`` runs cuDNN's fused SM100 linear-attention engine through
+        :func:`flashinfer.cudnn.cudnn_chunk_gated_delta_rule`.
 
     Returns
     -------
@@ -663,7 +665,7 @@ def chunk_gated_delta_rule(
       ``nvidia-cutlass-dsl[cu13]>=4.4.2`` (``pip install
       flashinfer-python[cu13]``).
     """
-    if backend not in ("auto", "flashinfer", "cake_gdn"):
+    if backend not in ("auto", "flashinfer", "cake_gdn", "cudnn"):
         raise ValueError(f"unsupported GDN backend: {backend!r}")
     if backend == "cake_gdn" and (not _CAKE_GDN_AVAILABLE or _cake_gdn is None):
         raise RuntimeError("the source-only Cake GDN backend is not installed")
@@ -710,6 +712,38 @@ def chunk_gated_delta_rule(
     head_size = q.size(2)
     num_o_heads = max(num_q_heads, num_v_heads)
     num_sab_heads = num_o_heads
+
+    if backend == "cudnn":
+        from .cudnn import cudnn_chunk_gated_delta_rule
+
+        unsupported = [
+            name
+            for name, requested in (
+                ("use_cp", use_cp is True or _cp_chunk_len is not None),
+                ("checkpoint_every_n_tokens", checkpoint_every_n_tokens > 0),
+                ("state_indices", state_indices is not None),
+            )
+            if requested
+        ]
+        if unsupported:
+            raise NotImplementedError(
+                'chunk_gated_delta_rule(backend="cudnn") does not support '
+                + ", ".join(unsupported)
+            )
+        return cudnn_chunk_gated_delta_rule(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            cu_seqlens=cu_seqlens,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            output=output,
+            output_state=output_state,
+        )
 
     if checkpoint_every_n_tokens > 0:
         assert state_checkpoints is not None and checkpoint_cu_starts is not None
@@ -899,33 +933,28 @@ def chunk_gated_delta_rule(
             if output_final_state:
                 return output, output_state
             return output
-    if backend != "flashinfer":
-        if not _CAKE_GDN_AVAILABLE or _cake_gdn is None:
-            if backend == "cake_gdn":
-                raise RuntimeError("the source-only Cake GDN backend is not installed")
-        else:
-            try:
-                return _run_cake_gdn_prefill(
-                    q=q,
-                    k=k,
-                    v=v,
-                    g=g,
-                    beta=beta,
-                    scale=_scale,
-                    initial_state=initial_state,
-                    output_final_state=output_final_state,
-                    cu_seqlens=cu_seqlens,
-                    use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-                    output=output,
-                    output_state=output_state,
-                    state_checkpoints=state_checkpoints,
-                    checkpoint_cu_starts=checkpoint_cu_starts,
-                    checkpoint_every_n_tokens=checkpoint_every_n_tokens,
-                    state_indices=state_indices,
-                )
-            except _cake_gdn.CakeGDNUnsupportedError:
-                if backend == "cake_gdn":
-                    raise
+    # Compiled Cake specializations cover more shapes than have been qualified
+    # against the existing prefill kernels. Keep them opt-in until automatic
+    # dispatch has a performance-qualified domain.
+    if backend == "cake_gdn":
+        return _run_cake_gdn_prefill(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            scale=_scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            cu_seqlens=cu_seqlens,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            output=output,
+            output_state=output_state,
+            state_checkpoints=state_checkpoints,
+            checkpoint_cu_starts=checkpoint_cu_starts,
+            checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+            state_indices=state_indices,
+        )
 
     if _arch_major == 10:
         if _cuda_major < 13:
