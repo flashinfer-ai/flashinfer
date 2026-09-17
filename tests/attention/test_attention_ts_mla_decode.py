@@ -3259,6 +3259,30 @@ def test_attention_ts_mla_int32_kv_coordinate_bound():
             num_qo_heads=2,
             max_q_len=2**30,
         )
+    with pytest.raises(
+        NotImplementedError,
+        match=r"total_q \* num_qo_heads must fit",
+    ):
+        mla_decode_module._validate_mla_query_head_extent(
+            batch_size=1,
+            num_qo_heads=2,
+            max_q_len=1,
+            total_q=2**30,
+        )
+
+    maximal_policy = (
+        ("tile_size_kv", 128),
+        ("num_insts_kv", 2),
+        ("split_kv", 128),
+    )
+    mla_decode_module._validate_mla_policy_coordinate_span(maximal_policy)
+    mla_decode_module._validate_mla_policy_coordinate_span(
+        (*maximal_policy[:-1], ("split_kv", 152)), max_kv_len=32768
+    )
+    with pytest.raises(NotImplementedError, match="padded K/V extent"):
+        mla_decode_module._validate_mla_policy_coordinate_span(
+            (*maximal_policy[:-1], ("split_kv", 152)), max_kv_len=2**31 - 32768
+        )
 
 
 def test_attention_ts_mla_balanced_1cta_packed_coordinate_bound():
@@ -3299,30 +3323,6 @@ def test_attention_ts_mla_public_balanced_plan_rejects_packed_coordinate_overflo
             max_seq_len_q=1,
             balanced=True,
             device="cuda",
-        )
-    with pytest.raises(
-        NotImplementedError,
-        match=r"total_q \* num_qo_heads must fit",
-    ):
-        mla_decode_module._validate_mla_query_head_extent(
-            batch_size=1,
-            num_qo_heads=2,
-            max_q_len=1,
-            total_q=2**30,
-        )
-
-    maximal_policy = (
-        ("tile_size_kv", 128),
-        ("num_insts_kv", 2),
-        ("split_kv", 128),
-    )
-    mla_decode_module._validate_mla_policy_coordinate_span(maximal_policy)
-    mla_decode_module._validate_mla_policy_coordinate_span(
-        (*maximal_policy[:-1], ("split_kv", 152)), max_kv_len=32768
-    )
-    with pytest.raises(NotImplementedError, match="padded K/V extent"):
-        mla_decode_module._validate_mla_policy_coordinate_span(
-            (*maximal_policy[:-1], ("split_kv", 152)), max_kv_len=2**31 - 32768
         )
 
 
