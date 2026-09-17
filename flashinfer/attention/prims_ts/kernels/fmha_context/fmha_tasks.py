@@ -2166,7 +2166,7 @@ def create_softmax_task(
                 )
                 vec.commit()
             elif tmem_sp.cfg.is_causal:
-                # Causal softmax1 TAIL handles masked rows and cleanup.
+                # Causal tail: mask the last tile, then publish the final stats.
                 sp.wait()
                 old_row_max, row_max = sp.masked_row_max(
                     row_max=row_max,
@@ -2206,8 +2206,7 @@ def create_softmax_task(
                 )
                 vec.commit()
             elif tmem_sp.uses_fixed_dense_k_tail_mask:
-                # Dense TAIL: the partial last K/V tile. Same handshake as one
-                # LOOP iteration, with the TMA zero-fill lanes masked to -inf.
+                # Dense tail: one more loop step with the zero-filled lanes masked out.
                 sp.wait()
                 old_row_max, row_max = sp.fixed_dense_k_tail_masked_row_max(
                     row_max=row_max,
@@ -2256,8 +2255,7 @@ def create_softmax_task(
                 )
                 vec.commit()
             else:
-                # Non-causal TAIL commits the reserved stats slot and lets MMA
-                # complete its cleanup path.
+                # Non-causal tail: no more tiles, just publish the final stats.
                 sp.wait()
                 sp.release()
                 old_row_max = sp.softmax_aux_identity(row_max=row_max)
@@ -2502,8 +2500,7 @@ def create_correction_task(
                     )
                     v0.release()
                     to.release()
-                # TAIL: consume remaining stats, release tmem-stats-done gates, and
-                # stage corrected O0/O1 into SMEM for the epilogue task.
+                # Tail: read the final stats, then write corrected O0/O1 to smem.
                 v1.release()
                 v0.wait()
                 _, _, vec_row_sum, vec_scale = v0.read_vec(
