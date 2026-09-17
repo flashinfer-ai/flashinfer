@@ -21,9 +21,12 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <climits>
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
+#include <unordered_map>
 
 #include "balanced_mla_scheduler.cuh"
 #include "flashinfer/exception.h"
@@ -1434,6 +1437,82 @@ __global__ void balancedSchedEmitKernel(BalancedSchedDeviceParams p) {
   }
 }
 
+size_t getFoldDynamicSharedMemorySize(BalancedSchedDeviceParams const& params) {
+  size_t bytes = static_cast<size_t>(params.batchSize) * sizeof(int32_t);
+  bytes = (bytes + alignof(int64_t) - 1) & ~(alignof(int64_t) - 1);
+  bytes += (static_cast<size_t>(params.batchSize) + static_cast<size_t>(params.numSmParts)) *
+           sizeof(int64_t);
+  bytes += static_cast<size_t>(params.numSmParts) * sizeof(int64_t);
+  return bytes;
+}
+
+struct FoldSharedMemoryConfiguration {
+  size_t staticBytes;
+  size_t optInTotalBytes;
+  size_t configuredDynamicBytes;
+};
+
+void ensureFoldDynamicSharedMemoryCapacity(size_t dynamicBytes) {
+  int device = -1;
+  cudaError_t status = cudaGetDevice(&device);
+  FLASHINFER_CHECK(status == cudaSuccess,
+                   "failed to query the CUDA device for the balanced optimized scheduler: ",
+                   cudaGetErrorString(status));
+
+  // cudaFuncSetAttribute changes process-wide function state for the current device. Serialize
+  // updates and only increase the allowance so concurrently created plans cannot invalidate an
+  // already captured larger launch. CUDA graph replay does not execute this host-side path.
+  static std::mutex configurationMutex;
+  static std::unordered_map<int, FoldSharedMemoryConfiguration> configurations;
+  std::lock_guard<std::mutex> lock(configurationMutex);
+  auto configuration = configurations.find(device);
+  if (configuration == configurations.end()) {
+    cudaFuncAttributes attributes{};
+    status = cudaFuncGetAttributes(&attributes, balancedSchedFoldPrepareScoreKernel);
+    FLASHINFER_CHECK(status == cudaSuccess,
+                     "failed to query balanced optimized scheduler kernel attributes: ",
+                     cudaGetErrorString(status));
+    int optInTotalBytes = 0;
+    status =
+        cudaDeviceGetAttribute(&optInTotalBytes, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+    FLASHINFER_CHECK(status == cudaSuccess,
+                     "failed to query balanced optimized scheduler shared-memory capacity: ",
+                     cudaGetErrorString(status));
+    FLASHINFER_CHECK(
+        optInTotalBytes >= 0 && static_cast<size_t>(optInTotalBytes) >= attributes.sharedSizeBytes,
+        "balanced optimized scheduler kernel static shared memory exceeds CUDA device ", device,
+        " capacity");
+    size_t const optInDynamicBytes =
+        static_cast<size_t>(optInTotalBytes) - attributes.sharedSizeBytes;
+    configuration =
+        configurations
+            .emplace(device,
+                     FoldSharedMemoryConfiguration{
+                         attributes.sharedSizeBytes, static_cast<size_t>(optInTotalBytes),
+                         std::min(static_cast<size_t>(attributes.maxDynamicSharedSizeBytes),
+                                  optInDynamicBytes)})
+            .first;
+  }
+
+  FoldSharedMemoryConfiguration& config = configuration->second;
+  FLASHINFER_CHECK(dynamicBytes <= config.optInTotalBytes - config.staticBytes,
+                   "balanced optimized scheduler requires ", dynamicBytes, " dynamic + ",
+                   config.staticBytes, " static shared-memory bytes, but CUDA device ", device,
+                   " permits at most ", config.optInTotalBytes,
+                   " total opt-in bytes; reduce batch_size or use scheduler='exact'");
+  FLASHINFER_CHECK(dynamicBytes <= static_cast<size_t>(INT_MAX),
+                   "balanced optimized scheduler dynamic shared-memory request exceeds int32");
+  if (dynamicBytes > config.configuredDynamicBytes) {
+    status = cudaFuncSetAttribute(balancedSchedFoldPrepareScoreKernel,
+                                  cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                  static_cast<int>(dynamicBytes));
+    FLASHINFER_CHECK(status == cudaSuccess, "failed to opt in to ", dynamicBytes,
+                     " dynamic shared-memory bytes for the balanced optimized scheduler: ",
+                     cudaGetErrorString(status));
+    config.configuredDynamicBytes = dynamicBytes;
+  }
+}
+
 }  // namespace
 
 void runBalancedSchedDevice(BalancedSchedDeviceParams const& params) {
@@ -1444,10 +1523,8 @@ void runBalancedSchedDevice(BalancedSchedDeviceParams const& params) {
     FLASHINFER_CHECK(params.numSmParts <= kFoldThreads,
                      "Balanced device optimized scheduler supports at most ", kFoldThreads,
                      " partitions, got ", params.numSmParts);
-    size_t const sharedBytes =
-        static_cast<size_t>(params.batchSize) * sizeof(int32_t) + sizeof(int64_t) +
-        static_cast<size_t>(params.batchSize + params.numSmParts) * sizeof(int64_t) +
-        static_cast<size_t>(params.numSmParts) * sizeof(int64_t);
+    size_t const sharedBytes = getFoldDynamicSharedMemorySize(params);
+    ensureFoldDynamicSharedMemoryCapacity(sharedBytes);
     balancedSchedFoldPrepareScoreKernel<<<kMaxCandidates, kFoldThreads, sharedBytes,
                                           params.stream>>>(params);
     cudaError_t status = cudaGetLastError();
