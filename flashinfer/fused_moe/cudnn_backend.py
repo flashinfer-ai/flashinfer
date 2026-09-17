@@ -115,6 +115,52 @@ def _gated_activation(g, up, gate, activation, device, scalar_bindings):
     raise NotImplementedError(f"cuDNN MoE does not support {activation!r}")
 
 
+def _has_canonical_fc1_parent(weights, parent):
+    """Check explicit [up, gate] views against a [gate, up] parent using metadata.
+
+    Equal strides alone do not declare an alias. Verify both live pointers so
+    independent weight packs with identical geometry cannot share this graph
+    topology. A second allocation with the same parent relationship can reuse it.
+    """
+    if parent is None or len(weights) != 2:
+        return False
+    if parent.ndim != 3 or parent.dtype != torch.bfloat16 or not parent.is_contiguous():
+        return False
+    e, twice_i, h = parent.shape
+    if min(e, twice_i, h) <= 0 or twice_i % 2:
+        return False
+    i = twice_i // 2
+    for weight, row in zip(weights, (i, 0), strict=True):
+        if (
+            weight.device != parent.device
+            or weight.dtype != parent.dtype
+            or tuple(weight.shape) != (e, i, h)
+            or tuple(weight.stride()) != tuple(parent.stride())
+            or weight.data_ptr()
+            != parent.data_ptr() + row * parent.stride(1) * parent.element_size()
+        ):
+            return False
+    return True
+
+
+class _ParentGraphUnsupported(NotImplementedError):
+    """The declared weight-parent graph declined before kernel compilation."""
+
+
+def _prepare_fused_fc1(*args, weights_parent=None, **kwargs):
+    try:
+        return _Stage(*args, weights_parent=weights_parent, **kwargs)
+    except _ParentGraphUnsupported as exc:
+        # Older Frontend engines can fuse separate up/gate inputs without
+        # recognizing their parent SLICE declarations. Reuse the same native
+        # views and explicit tactics, with no repack and no execution fallback.
+        _LOG.info(
+            "cuDNN MoE parent weight graph declined; retrying shared-input graph: %s",
+            exc,
+        )
+        return _Stage(*args, weights_parent=None, **kwargs)
+
+
 class _Stage:
     def __init__(
         self,
@@ -127,6 +173,7 @@ class _Stage:
         tactic=None,
         activation=None,
         tactics=(),
+        weights_parent=None,
     ):
         import cudnn
 
@@ -151,15 +198,37 @@ class _Stage:
             data_type=cudnn.data_type.INT32,
         )
         self.weights = []
-        gemms = []
-        for i, weight in enumerate(weights):
-            view = weight.transpose(1, 2)
-            desc = g.tensor(
-                name=f"weight_{i}",
+        self.weights_parent = None
+        if weights_parent is not None:
+            if not fused or not _has_canonical_fc1_parent(weights, weights_parent):
+                raise ValueError(
+                    "Fused FC1 weights must be explicit views of their gate/up parent"
+                )
+            view = weights_parent.transpose(1, 2)
+            self.weights_parent = g.tensor(
+                name="gate_up_parent",
                 dim=list(view.shape),
                 stride=list(view.stride()),
                 data_type=cudnn.data_type.BFLOAT16,
             )
+        gemms = []
+        for i, weight in enumerate(weights):
+            view = weight.transpose(1, 2)
+            if self.weights_parent is None:
+                desc = g.tensor(
+                    name=f"weight_{i}",
+                    dim=list(view.shape),
+                    stride=list(view.stride()),
+                    data_type=cudnn.data_type.BFLOAT16,
+                )
+            else:
+                # FC1's operand order is [up, gate]; its parent is [gate, up].
+                start = weight.shape[1] if i == 0 else 0
+                desc = g.slice(
+                    self.weights_parent,
+                    [slice(None), slice(None), slice(start, start + weight.shape[1])],
+                    name=f"weight_{i}",
+                ).set_stride(list(view.stride()))
             self.weights.append(desc)
             gemms.append(
                 g.moe_grouped_matmul(
@@ -189,19 +258,24 @@ class _Stage:
             if out.dtype == torch.float32
             else cudnn.data_type.BFLOAT16
         )
-        g.validate()
-        g.build_operation_graph()
         if tactic is not None and tactics:
             raise ValueError("Specify one tactic or a candidate domain for a stage")
-        requested = tactics or ((tactic,) if tactic is not None else ())
-        if requested:
-            for engine, knobs in requested:
-                g.create_execution_plan(
-                    int(engine), {cudnn.knob_type(int(k)): int(v) for k, v in knobs}
-                )
-        else:
-            g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
-        g.check_support()
+        try:
+            g.validate()
+            g.build_operation_graph()
+            requested = tactics or ((tactic,) if tactic is not None else ())
+            if requested:
+                for engine, knobs in requested:
+                    g.create_execution_plan(
+                        int(engine), {cudnn.knob_type(int(k)): int(v) for k, v in knobs}
+                    )
+            else:
+                g.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+            g.check_support()
+        except (NotImplementedError, cudnn.cudnnGraphNotSupportedError) as exc:
+            if self.weights_parent is None:
+                raise
+            raise _ParentGraphUnsupported(str(exc)) from exc
         self.tactic_indices = {}
         for record, index in _plan_indices(g).items():
             try:
@@ -232,7 +306,7 @@ class _Stage:
             )
         return index
 
-    def run(self, a, weights, offsets, out, tactic=-1):
+    def run(self, a, weights, offsets, out, tactic=-1, *, weights_parent=None):
         import cudnn
 
         cudnn.set_stream(
@@ -243,10 +317,19 @@ class _Stage:
             self.offsets: offsets[:-1].view(-1, 1, 1),
             self.out: out.unsqueeze(0),
         }
-        pack.update(
-            (desc, weight.transpose(1, 2))
-            for desc, weight in zip(self.weights, weights, strict=True)
-        )
+        if self.weights_parent is None:
+            if weights_parent is not None:
+                raise ValueError("This FC1 plan does not declare a parent weight")
+            pack.update(
+                (desc, weight.transpose(1, 2))
+                for desc, weight in zip(self.weights, weights, strict=True)
+            )
+        else:
+            if not _has_canonical_fc1_parent(weights, weights_parent):
+                raise ValueError(
+                    "FC1 execution must preserve its declared parent relationship"
+                )
+            pack[self.weights_parent] = weights_parent.transpose(1, 2)
         pack.update(self.scalar_bindings)
         index = self.plan_index(tactic)
         if index == -1:
@@ -470,9 +553,10 @@ class CudnnMoeRunner(MoERunner):
     def _weight_layout_key(self, inputs):
         # Compiled plans include expert strides. Separate legacy contiguous
         # packs from shared FC1 views in both resource and autotuning caches.
-        return tuple(
+        layout = tuple(
             (tuple(tensor.shape), tuple(tensor.stride())) for tensor in inputs[3:7]
         )
+        return layout, _has_canonical_fc1_parent(inputs[3:5], inputs[6])
 
     def _resources(self, inputs):
         x, ids, scales, up, gate, down, gate_up = inputs[:7]
@@ -535,7 +619,7 @@ class CudnnMoeRunner(MoERunner):
         s["fused"] = False
         if self.backend_config.fc1_fusion is not False:
             try:
-                s["fc1"] = _Stage(
+                s["fc1"] = _prepare_fused_fc1(
                     s["routed"],
                     [up, gate],
                     s["offsets"],
@@ -544,6 +628,11 @@ class CudnnMoeRunner(MoERunner):
                     tactic=self.backend_config.fc1_tactic,
                     activation=self.config.activation,
                     tactics=self.backend_config.fc1_tactics,
+                    weights_parent=(
+                        gate_up
+                        if _has_canonical_fc1_parent([up, gate], gate_up)
+                        else None
+                    ),
                 )
                 s["fused"] = True
             except (
@@ -725,7 +814,12 @@ class CudnnMoeRunner(MoERunner):
         _, _, _, up, gate, down, gate_up = inputs[:7]
         if s["fused"]:
             s["fc1"].run(
-                s["routed"], [up, gate], s["offsets"], s["intermediate"], fc1_index
+                s["routed"],
+                [up, gate],
+                s["offsets"],
+                s["intermediate"],
+                fc1_index,
+                weights_parent=gate_up if s["fc1"].weights_parent is not None else None,
             )
         else:
             s["fc1"].run(

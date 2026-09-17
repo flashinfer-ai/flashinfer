@@ -1,5 +1,80 @@
 # Frost / FlashInfer MoE pathfinding handoff
 
+## September 17: real paired MoE graph engine and FI parent binding
+
+This followup carries the small-token path into the real graph API. Engine
+20401 (`frost_moe_swiglu_pair`) recognizes two BF16 grouped projections and
+FP32 SwiGLU over explicit slices of one canonical gate/up weight parent.
+Engine20400 remains available. The specialization is limited to SM100,
+1..8 routed rows, and positive N/K divisible by64; unsupported graphs and
+knobs decline. Compilation occurs while building the plan. Execute binds the
+current parent and caller workspace/stream without repacking, allocating,
+synchronizing or compiling.
+
+FI now declares the parent relationship only after checking the actual view
+pointers, dtype, device, dimensions and strides. Its cache key distinguishes
+true shared storage from independent tensors with identical strides. A
+planning-only parent-graph decline retries the existing separate-input fused
+FC1 graph, preserving weight views and explicit tactics. This retry does not
+catch compiler or runtime errors. Actual old/new FE compatibility passed on
+B200 under normal execution, memcheck and racecheck: 144 raw output checks,
+72 poisoned-output negative controls, 72 independently changed-reference pairs
+and 72 captured routes. The new FE binds the shared parent; the old FE declines
+that graph and preserves the existing fused separate-input path.
+
+The FE changes include Yanqin Zhai's merged
+[PR #1090](https://github.com/NVIDIA/cudnn-frontend/pull/1090) and its regression
+coverage, with the prior SM120 scheduler/shared-A path retained. The new paired
+kernel derives from Kernel Factory optimizer624 plus the validated early-PDL
+change, using NVIDIA CUTLASS example113 layout concepts and canonical rank5
+pairing guidance. TRT-LLM's gated-row interleave motivated layout exploration;
+no TRT-LLM kernel body is copied. The larger-token KF candidate and subsequent
+ballot-prefix experiment are not included in this engine.
+
+On a full B2001000W, BF16 T1/E128/top8/H2048/I768 with precomputed routing,
+cold-L2 CUDA-Graph/CUPTI full MoE timing measured:
+
+| Routing | Tuned ordinary Frost | Early-PDL prototype | Real FI graph engine20401 |
+|---|---:|---:|---:|
+| Unpacked |33.915625us|33.127875us|33.123625us|
+| Packed |33.991375us|33.147250us|33.159500us|
+
+The real integration is2.34–2.45% lower latency than ordinary Frost and within
+0.04% of the prototype. These numbers are not an additional gain over the
+previously reported KF/PDL improvement. No fresh TRT/CUTLASS or model comparison
+is claimed. All arms use the same FI/FE source; preprocessing is outside replay.
+The full-MoE audit passes414 raw BF16 comparisons,150 changed-input negative
+controls and1152 timing spans, after normal/memcheck/racecheck for both routing
+modes. Two retained captures, independent legacy weights, and live X/IDs/scales/
+weight updates are covered. Overlapping PDL stage durations must not be summed.
+
+The standalone paired graph engine separately passed180 raw outputs and54
+negative controls under normal/memcheck/racecheck, including16-byte-aligned
+pitched storage and six geometries. The collected public pytest port currently
+passes3 metadata and5 GPU cases on B200. Its `one_token` case passes the first
+eager comparison but fails the first CUDA Graph capture with error901
+(`cudaErrorStreamCaptureInvalidated`); public-port sanitizers were not reached.
+The cause remains open. This gate is distinct from the passing standalone
+capsule; neither result is used to erase the other. The earlier public-port
+run failed before kernel execution because its DSL version check omitted a
+required argument; that test-only call is repaired and the failure preserved.
+The explicit-parent CPU regression is confirmed RED against the preceding FE
+source (`no lowering for node type SLICE`).
+
+Timing above used frozen pair1820/fi_pair1825. This publication additionally
+carries the planning-only compatibility retry and SM120 source reconciliation,
+validated separately; the final assembled head has not been retimed.
+
+Pending before readiness: resolve the public-port capture failure and run its
+sanitizers, finish the SM120 parent-binding gate, and refresh the strong
+TRT comparator. An initial SM120 integration run failed before kernel execution
+because its source copy lacked the already validated static scheduler; the
+combined source restores it without relaxing the gate. Full repository CI is
+not claimed. These remain consolidated pathfinding drafts for Yanqin/Yihua to
+distill; new validation and improvements will be stacked on these branches.
+
+---
+
 Updated September 17, 2026. Companion drafts:
 [cuDNN Frontend #1080](https://github.com/NVIDIA/cudnn-frontend/pull/1080) and
 [FlashInfer #5250](https://github.com/flashinfer-ai/flashinfer/pull/5250).
