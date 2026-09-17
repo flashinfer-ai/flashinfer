@@ -3998,7 +3998,7 @@ def create_padding_task(
         warp_idx=warp_idx,
         num_warps=num_warps,
         schedule=captured_schedule,
-        num_registers=cfg.mma_load_task_num_registers,
+        num_registers=cfg.padding_task_num_registers(warp_idx, num_warps),
         name="PaddingTask",
         **kw,
     )

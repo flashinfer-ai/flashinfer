@@ -2178,31 +2178,53 @@ def test_attention_ts_decode_register_reallocation_follows_task_graph(
         assert all(value is not None and value % 8 == 0 for value in budgets)
 
 
-@pytest.mark.parametrize("load_warps", (4, 8))
+@pytest.mark.parametrize("load_warps", (1, 4, 8))
+@pytest.mark.parametrize("num_insts_kv", (1, 2))
 def test_attention_ts_decode_register_reallocation_fits_initial_cta_pool(
     load_warps: int,
+    num_insts_kv: int,
 ) -> None:
-    """Extra producers must not request unassigned registers outside the CTA pool."""
+    """Padding may donate registers without starving active or mixed groups."""
+    from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_config import (
+        _active_warp_roles,
+    )
+
     config = FmhaDecodeConfig(
         use_keeps_mma_ab=True,
         tile_size_q=128,
         tile_size_kv=128,
         headdim=256,
         head_dim_per_stage_kv=128,
-        num_insts_kv=1,
+        num_insts_kv=num_insts_kv,
         o_stages=1,
         load_warp_idx=16,
         load_num_warps=load_warps,
     )
     threads = config.threads_per_cta
-    softmax_warps = config.softmax0_num_warps
-    correction_warps = config.correction_num_warps
-    producer_warps = threads // 32 - softmax_warps - correction_warps
-    requested = 32 * (
-        softmax_warps * config.softmax_task_num_registers
-        + correction_warps * config.correction_task_num_registers
-        + producer_warps * config.mma_load_task_num_registers
-    )
+    requested = 0
+    warpgroup_budgets: dict[int, set[int]] = {}
+    for role in _active_warp_roles(config):
+        if role.is_padding:
+            budget = config.padding_task_num_registers(
+                role.preferred_warp_idx, role.num_warps
+            )
+            if role.num_warps == 4:
+                assert budget < config.mma_load_task_num_registers
+            else:
+                assert budget == config.mma_load_task_num_registers
+        elif role.name.startswith("softmax"):
+            budget = config.softmax_task_num_registers
+        elif role.name == "correction":
+            budget = config.correction_task_num_registers
+        else:
+            budget = config.mma_load_task_num_registers
+        assert budget is not None and 24 <= budget <= 256 and budget % 8 == 0
+        requested += 32 * role.num_warps * budget
+        for warp in range(
+            role.preferred_warp_idx, role.preferred_warp_idx + role.num_warps
+        ):
+            warpgroup_budgets.setdefault(warp // 4, set()).add(budget)
+    assert all(len(budgets) == 1 for budgets in warpgroup_budgets.values())
     initial_per_thread = 65536 // (threads * 8) * 8
     assert requested <= threads * initial_per_thread
 
@@ -7316,13 +7338,16 @@ def test_q_token_sparse_geometry_graph(
         "packed",
         "split_kv",
         "shared",
+        "batch",
     ),
     (
-        (256, torch.bfloat16, 8, 128, 4, 512, 262144, True, False, False),
-        (128, torch.float8_e4m3fn, 8, 128, 4, 512, 524288, False, False, True),
-        (256, torch.bfloat16, 5, 128, 128, 16, 16384, False, True, False),
-        (128, torch.float8_e4m3fn, 4, 128, 64, 16, 16384, True, True, False),
-        (64, torch.float8_e4m3fn, 3, 32, 16, 16, 8192, False, True, False),
+        (256, torch.bfloat16, 8, 128, 4, 512, 262144, True, False, False, 2),
+        (128, torch.float8_e4m3fn, 8, 128, 4, 512, 524288, False, False, True, 2),
+        (256, torch.bfloat16, 5, 128, 128, 16, 16384, False, True, False, 2),
+        (128, torch.float8_e4m3fn, 4, 128, 64, 16, 16384, True, True, False, 2),
+        (64, torch.float8_e4m3fn, 3, 32, 16, 16, 8192, False, True, False, 2),
+        # Full-row FP8 with enough independent work to reuse persistent CTAs.
+        (256, torch.float8_e4m3fn, 8, 128, 128, 16, 8192, True, False, True, 256),
     ),
 )
 def test_q_token_sparse_membership_capacity_and_per_head_reduction(
@@ -7336,7 +7361,7 @@ def test_q_token_sparse_membership_capacity_and_per_head_reduction(
     packed,
     split_kv,
     shared,
-    batch=2,
+    batch,
     ratio=12,
 ):
     """Large nonsplit metadata and unequal per-head split domains stay correct."""

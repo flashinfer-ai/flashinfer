@@ -787,9 +787,11 @@ class FmhaDecodeConfig:
     def softmax_task_num_registers(self) -> int | None:
         if not self.uses_task_register_reallocation:
             return None
-        preferred = (
-            KV_TILE_256_SOFTMAX_TASK_REGISTERS if self.tile_size_kv == 256 else 184
-        )
+        # Complete Q128 rows keep 128 scores live through masking and P
+        # conversion. Give them headroom without taking registers from TMA.
+        preferred = 232 if self.softmax_score_fragment_regs == 128 else 184
+        if self.tile_size_kv == 256:
+            preferred = KV_TILE_256_SOFTMAX_TASK_REGISTERS
         # setmaxnreg redistributes the CTA's initial register pool, not the
         # whole SM register file. Complete 8-register/thread quanta leave
         # unused SM registers when a CTA has more than 16 warps.
@@ -807,6 +809,14 @@ class FmhaDecodeConfig:
             - self.correction_num_warps * correction_regs
             - other_warps * producer_regs
         )
+        # Only whole padding warpgroups may donate independently. Padding
+        # beside active tasks must execute the same setmaxnreg as its peers.
+        for wg_idx in range(MAX_WARP_GROUPS):
+            padding_warps = getattr(self, f"wg{wg_idx}_padding_num_warps")
+            if padding_warps == 4:
+                padding_regs = self.padding_task_num_registers(wg_idx * 4, 4)
+                assert padding_regs is not None
+                available += padding_warps * (producer_regs - padding_regs)
         return min(preferred, available // (softmax_warps * 8) * 8)
 
     @property
@@ -818,6 +828,21 @@ class FmhaDecodeConfig:
     @property
     def mma_load_task_num_registers(self) -> int | None:
         return 56 if self.uses_task_register_reallocation else None
+
+    def padding_task_num_registers(self, warp_idx: int, num_warps: int) -> int | None:
+        """Release unused registers only from complete padding warpgroups."""
+        if not self.uses_task_register_reallocation:
+            return None
+        if (
+            self.tile_size_kv != 256
+            and self.softmax_score_fragment_regs == 128
+            and warp_idx % 4 == 0
+            and num_warps == 4
+        ):
+            # setmaxnreg's minimum legal grant; no attention work runs here.
+            # Smaller score fragments keep their existing allocation.
+            return 24
+        return self.mma_load_task_num_registers
 
     # ------------------------------------------------------------------
     # SMEM allocation alignment
