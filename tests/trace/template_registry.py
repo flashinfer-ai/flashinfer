@@ -1,4 +1,4 @@
-# Copyright (c) 2025 by FlashInfer team.
+# Copyright (c) 2025-2026 by FlashInfer team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -36,9 +36,6 @@ TraceRegistryEntry = tuple[Callable[..., Any], Any, str]
 _TRACE_REGISTRATION_MODULES = (
     "flashinfer.activation",
     "flashinfer.attention._core",
-    "flashinfer.attention.prims_ts.block_sparse",
-    "flashinfer.attention.prims_ts.decode",
-    "flashinfer.attention.prims_ts.mla_decode",
     "flashinfer.attn_scores.attn_scores",
     "flashinfer.cake_vsa",
     "flashinfer.cascade",
@@ -58,6 +55,7 @@ _TRACE_REGISTRATION_MODULES = (
     "flashinfer.fused_moe.backends.prims_ts.bf16_op",
     "flashinfer.fused_moe.backends.prims_ts.fp4_op",
     "flashinfer.fused_moe.backends.prims_ts.fp8_op",
+    "flashinfer.fused_moe.alphamoe_fused_router",
     "flashinfer.fused_moe.core",
     "flashinfer.fused_moe.cute_dsl.b12x_moe",
     "flashinfer.fused_moe.cute_dsl.fused_moe",

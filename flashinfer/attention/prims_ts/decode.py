@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING, Literal, Optional, Union
 
 import torch
 
-from flashinfer.api_logging import flashinfer_api
+from flashinfer.api_logging import flashinfer_experimental_api
 from flashinfer.trace.templates.attention import (
     attention_ts_decode_trace_dispatch,
     prims_ts_decode_trace_dispatch,
@@ -2756,7 +2756,7 @@ def _prims_ts_q_token_kv_block_sparse_group_launch_profile(
     return tile_size_q, num_insts_kv
 
 
-@flashinfer_api
+@flashinfer_experimental_api
 def suggest_q_token_kv_block_sparse_group_size(
     batch_size: int,
     seq_len_q: int,
@@ -2925,7 +2925,7 @@ def _validate_prims_ts_q_token_kv_block_sparse_group_layout(
     return group_size
 
 
-@flashinfer_api
+@flashinfer_experimental_api
 def validate_q_token_kv_block_sparse_group_size(
     query_start_loc_cpu: Optional[torch.Tensor],
     num_query_tokens: int,
@@ -2980,7 +2980,7 @@ def validate_q_token_kv_block_sparse_group_size(
     )
 
 
-@flashinfer_api
+@flashinfer_experimental_api
 def make_q_token_kv_block_sparse_qo_indptr(
     query_start_loc_cpu: torch.Tensor,
     num_query_tokens: int,
@@ -3295,7 +3295,7 @@ def _prepare_prims_ts_batch_decode_plan(
     return plan, out
 
 
-@flashinfer_api
+@flashinfer_experimental_api
 def prepare_prims_ts_batch_decode_with_kv_cache(
     query: torch.Tensor,
     kv_cache: PagedKVCache,
@@ -3389,7 +3389,7 @@ def prepare_prims_ts_batch_decode_with_kv_cache(
     return plan
 
 
-@flashinfer_api(trace=prims_ts_decode_trace_dispatch)
+@flashinfer_experimental_api(trace=prims_ts_decode_trace_dispatch)
 def prims_ts_batch_decode_with_kv_cache(
     query: torch.Tensor,
     kv_cache: PagedKVCache,
@@ -3555,7 +3555,7 @@ class BatchDecodePagedTSWrapper:
     graph replays require separate wrappers and workspace buffers.
     """
 
-    @flashinfer_api
+    @flashinfer_experimental_api
     def __init__(self, kv_layout: Literal["HND"] = "HND") -> None:
         """Initialize an unplanned wrapper with one static K/V layout.
 
@@ -3581,7 +3581,7 @@ class BatchDecodePagedTSWrapper:
 
         return self._require_plan_state().policy
 
-    @flashinfer_api
+    @flashinfer_experimental_api
     def plan(
         self,
         device: Union[int, str, torch.device],
@@ -3856,7 +3856,7 @@ class BatchDecodePagedTSWrapper:
         # previous complete plan revision usable.
         self._plan_state = candidate
 
-    @flashinfer_api(trace=prims_ts_decode_wrapper_trace_dispatch)
+    @flashinfer_experimental_api(trace=prims_ts_decode_wrapper_trace_dispatch)
     def run(
         self,
         q: torch.Tensor,
@@ -4023,7 +4023,7 @@ class BatchDecodePagedTSWrapper:
         )
 
 
-@flashinfer_api(trace=attention_ts_decode_trace_dispatch)
+@flashinfer_experimental_api(trace=attention_ts_decode_trace_dispatch)
 def batch_decode_with_paged_kv_cache(
     q: torch.Tensor,
     paged_kv_cache: PagedKVCache,

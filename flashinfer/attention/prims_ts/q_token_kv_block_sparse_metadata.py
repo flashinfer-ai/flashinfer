@@ -39,7 +39,7 @@ from dataclasses import dataclass
 from typing import Any, Literal, Optional
 
 import torch
-from flashinfer.api_logging import flashinfer_api
+from flashinfer.api_logging import flashinfer_experimental_api
 
 from ...utils import device_support_pdl
 
@@ -574,7 +574,7 @@ class QTokenKvBlockSparsePagedTSWrapper:
             raise RuntimeError("plan() must be called before run()")
         return config
 
-    @flashinfer_api
+    @flashinfer_experimental_api
     def run(
         self,
         q: torch.Tensor,
@@ -994,7 +994,7 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
     )
 
 
-@flashinfer_api
+@flashinfer_experimental_api
 def get_q_token_kv_block_sparse_workspace_size(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -1661,7 +1661,7 @@ def _prepare_q_token_kv_block_sparse_attention(
     )
 
 
-@flashinfer_api
+@flashinfer_experimental_api
 def q_token_kv_block_sparse_attention_with_paged_kv_cache(
     q: torch.Tensor,
     paged_kv_cache: tuple[torch.Tensor, torch.Tensor],
