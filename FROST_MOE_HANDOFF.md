@@ -11,7 +11,83 @@ permutation and weighted finalization. It does not benchmark closed-source
 cuDNN GEMM kernels. Frost needs explicit per-workload tuning; no heuristic
 quality claim is made.
 
-## Latest source changes
+## September 16 routing followup and current comparison
+
+The new private helper fuses stable expert ranking, input permutation and all
+expert offsets into one CUDA kernel. The Frost adapter selects it only for
+BF16 E128/top-k8/H2048 with T1..64. It checks tensor metadata and storage aliases
+without reading device IDs on the host; IDs must already name valid local
+experts. Other shapes retain the existing native sort/permutation path. The
+helper writes only the three operands Frost consumes and does not replace the
+generic `moe_sort` metadata interface.
+
+With the native finalizer already enabled, the actual integrated module gives
+these incremental full-MoE results. Both arms use the same source and fixed
+ordinary GEMMs; the control disables only the new routing helper.
+
+| GPU / tokens / routing | Sort + permutation, us | Fused routing, us | Reduction |
+|---|---:|---:|---:|
+| B200 / 1 / unpacked |36.776|33.720|8.31%|
+| B200 / 1 / packed |36.760|33.680|8.38%|
+| B200 / 64 / unpacked |218.448|215.460|1.37%|
+| B200 / 64 / packed |218.452|215.444|1.38%|
+| RTX5090 / 1 / unpacked |133.951|131.679|1.70%|
+| RTX5090 / 1 / packed |133.899|131.616|1.71%|
+| RTX5090 / 64 / unpacked |796.565|793.613|0.37%|
+| RTX5090 / 64 / packed |796.749|793.613|0.39%|
+
+Fixture: synthetic BF16 E128/top-k8/H2048/I768/SwiGLU, uniform precomputed
+routing, TP1/EP1, full B200 (148 SMs, 1000 W) or RTX5090 (170 SMs, 600 W).
+Each architecture passes both-arm normal/memcheck/racecheck and four fresh ABBA
+processes per case: 272 output checks, 120 skipped-replay negative controls and
+1536 raw cold-L2 CUDA Graph/CUPTI spans. Inputs, IDs and scales change; outputs,
+intermediates and exposed workspaces are poisoned. Preparation/JIT, logits/top-k,
+expert communication and model execution are excluded. The public FI API uses
+`enable_pdl=False`; Frost generated launchers retain their own PDL behavior.
+
+The performance candidate placed the same CUDA body in `csrc`; publication
+moves it into `include/flashinfer/moe_route_permute.cuh` with a namespace-qualified
+launcher. Python AST and normalized CUDA-body equivalence were checked. This
+final layout additionally passes all 26 new routing and 36 existing finalizer
+cases in normal/memcheck/racecheck on each GPU, including 12 captured route
+checks per architecture. Timing of the final file layout was not repeated.
+
+Reproduce the targeted module checks from the repository root:
+
+```bash
+pytest -q tests/moe/test_moe_route_permute_small.py tests/moe/test_moe_native_finalize.py tests/moe/test_moe_unpermute_round_scales.py
+compute-sanitizer --tool memcheck --target-processes all --error-exitcode 86 python -m pytest -q tests/moe/test_moe_route_permute_small.py tests/moe/test_moe_native_finalize.py tests/moe/test_moe_unpermute_round_scales.py
+compute-sanitizer --tool racecheck --target-processes all --error-exitcode 86 python -m pytest -q tests/moe/test_moe_route_permute_small.py tests/moe/test_moe_native_finalize.py tests/moe/test_moe_unpermute_round_scales.py
+```
+
+The earlier native-finalizer change now also has complete RTX5090 confirmation:
+T1 unpacked/packed 134.144/134.167 -> 133.224/133.167 us (0.69/0.75% reduction),
+T64 797.267/797.084 -> 795.247/795.325 us (0.25/0.22%). These are independent
+incremental comparisons; do not add their percentages to the routing table.
+
+The stronger B200 baseline still wins. After selecting TRT-LLM from 352 joint
+tactics, a separate same-card comparison measures Frost/TRT-LLM at 33.816/29.120
+us for T1 and 215.600/197.120 us for T64: Frost is 16.13%/9.38% slower. Actual
+native BMM symbols and cubin hashes match the search winners. Both arms pass
+normal/memcheck/racecheck and fresh ABBA timing. Weight-layout preparation is
+outside racecheck; normal reference creators prove bit-exact CPU/GPU prepared
+weights, and every child verifies those hashes. This comparator uses the prior
+validated standalone fused router; it is not a timing of the publication layout.
+
+Separately, selecting an existing SM120 M16x64 static FC1 configuration gives
+59.71/59.74 us at T1 unpacked/packed after independent gates. This is tuning,
+not a new kernel optimization, and it is not included in the routing-gain table.
+Best-to-best swap-AB tests have not beaten ordinary Frost configurations;
+the fixed-geometry swap observation retained below is historical. Current
+counter work and grid-size experiments do not yet establish a hardware roof.
+
+NVIDIA TensorRT-LLM retains credit for the native finalizer and fallback router;
+FlashInfer provides the contracts, JIT and permutation infrastructure. The new
+stable-rank routing kernel and its bounded integration are our additions.
+Yanqin/Yihua, the MegaMoE design reference and KF retain their separate
+acknowledgements below. No KF gain is promoted into this runtime.
+
+## Earlier source changes
 
 The September 16 followup carries the runtime/test source from frozen Frontend
 `ea4b86dd9823ed5849d3d6f2994f26906b2f0d8f` and FlashInfer
@@ -46,9 +122,7 @@ captured replay and actual Frost routing.
 | RTX PRO 6000 Blackwell Server Edition, 188 SMs, 600 W | 8 shared-A FE cases, 42 FI public cases, 30 single-GEMM scheduler cases in normal execution; all 8 shared-A cases under unfiltered memcheck and racecheck; 2 mandatory-fusion public cases under each sanitizer. |
 | RTX 5090, 600 W | 44 public cases in normal execution (42 existing plus 2 joint-tactic cases); 2 joint-tactic cases under unfiltered memcheck. |
 
-Audit receipts: `analysis1055/result.json` and `analysis1188/result.json` under
-the local experiment root
-`/home/scratch.yanxu_libs/cudnn_frontend/.fi-cudnn-work/20260914`.
+Historical audit receipts are retained by the pathfinding owner for handoff.
 
 The formerly failing SM120 BF16 `256x256x64/warps2x4` FC1 case is repaired by
 the included lifetime fence. On full RTX PRO 6000, T4096/E32/top2/H2048/I1024
@@ -99,9 +173,9 @@ padless FC1. The comparisons used different physical cards. Both include
 additional experimental resource hooks that are **not in these product
 commits**; do not attribute their timings to this PR head or compound the raw
 latencies. FC1 accounts for roughly 67% and FC2 32% of the first candidate span.
-Actual memory/tensor counters are being collected; a hardware roof is not proven.
+Later counters are recorded in the current investigation; a hardware roof is not proven.
 
-Primary next direction: combine Yanqin's
+Historical combination experiment: combine Yanqin's
 [SM100 swap-AB #1090](https://github.com/NVIDIA/cudnn-frontend/pull/1090) with the
 FI integration and independently choose FC1/FC2 orientation. An isolated merged
 prototype resolves both textual conflicts and the compiled scheduler-reset
@@ -253,6 +327,6 @@ The public FI API uses `enable_pdl=False`; generated Frost launchers retain thei
 own PDL behavior.
 
 These are gains over existing Frost finalization. They are not new comparisons
-against another MoE backend or a model-E2E claim. SM120 complete-MoE confirmation
-remains running; its API/capture and component sanitizer checks above are separate.
+against another MoE backend or a model-E2E claim. SM120 complete-MoE confirmation is now complete; see the current update above.
+Its API/capture and component sanitizer checks remain separate evidence.
 This remains a draft for asynchronous review and further measured follow-ups.

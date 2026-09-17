@@ -604,45 +604,66 @@ class CudnnMoeRunner(MoERunner):
             return output
         r = self.config.routing.top_k
         if self.backend_config.use_native_routing:
-            from .cute_dsl.moe_utils import _get_moe_utils_module, moe_permute
+            from .cute_dsl.moe_utils import (
+                _get_moe_utils_module,
+                _try_moe_route_permute_small,
+                moe_permute,
+            )
 
             b = s["native_sort"]
             t, e = x.shape[0], up.shape[0]
-            # One row per tile means exactly T*top_k tiles, with no padding or
-            # unwritten tail. The native precomputed-ID path fills every slot.
-            # Calling the native binding also lets us own the large-token
-            # expert-count scratch; the general wrapper allocates it per call.
-            _get_moe_utils_module()["flashinfer_moe_sort_with_offsets"](
-                ids.data_ptr(),
-                scales.data_ptr(),
-                t,
-                e,
-                r,
-                0,
-                e,
-                1,
-                False,
-                b["out_tile_idx_to_expert_idx"].data_ptr(),
-                b["out_tile_idx_to_mn_limit"].data_ptr(),
-                b["out_expanded_idx_to_permuted_idx"].data_ptr(),
-                b["out_permuted_idx_to_expanded_idx"].data_ptr(),
-                b["out_total_num_padded_tokens"].data_ptr(),
-                b["out_num_non_exiting_tiles"].data_ptr(),
-                s["expert_counts"].data_ptr() if t > 1024 else 0,
-                torch.cuda.current_stream(self.device).cuda_stream,
-                s["offsets"].data_ptr(),
+            # The bounded Frost path consumes only these three operands.
+            # Generic native routing retains ownership of its other metadata.
+            compact = (
+                0 < t <= 64
+                and e == 128
+                and r == 8
+                and x.shape[1] == 2048
+                and _try_moe_route_permute_small(
+                    x,
+                    ids,
+                    s["routed"],
+                    b["out_expanded_idx_to_permuted_idx"],
+                    s["offsets"],
+                    e,
+                )
             )
-            moe_permute(
-                x,
-                s["routed"],
-                b["out_tile_idx_to_mn_limit"],
-                b["out_permuted_idx_to_expanded_idx"],
-                b["out_num_non_exiting_tiles"],
-                t * r,
-                r,
-                1,
-                enable_pdl=False,
-            )
+            if not compact:
+                # One row per tile means exactly T*top_k tiles, with no padding or
+                # unwritten tail. The native precomputed-ID path fills every slot.
+                # Calling the native binding also lets us own the large-token
+                # expert-count scratch; the general wrapper allocates it per call.
+                _get_moe_utils_module()["flashinfer_moe_sort_with_offsets"](
+                    ids.data_ptr(),
+                    scales.data_ptr(),
+                    t,
+                    e,
+                    r,
+                    0,
+                    e,
+                    1,
+                    False,
+                    b["out_tile_idx_to_expert_idx"].data_ptr(),
+                    b["out_tile_idx_to_mn_limit"].data_ptr(),
+                    b["out_expanded_idx_to_permuted_idx"].data_ptr(),
+                    b["out_permuted_idx_to_expanded_idx"].data_ptr(),
+                    b["out_total_num_padded_tokens"].data_ptr(),
+                    b["out_num_non_exiting_tiles"].data_ptr(),
+                    s["expert_counts"].data_ptr() if t > 1024 else 0,
+                    torch.cuda.current_stream(self.device).cuda_stream,
+                    s["offsets"].data_ptr(),
+                )
+                moe_permute(
+                    x,
+                    s["routed"],
+                    b["out_tile_idx_to_mn_limit"],
+                    b["out_permuted_idx_to_expanded_idx"],
+                    b["out_num_non_exiting_tiles"],
+                    t * r,
+                    r,
+                    1,
+                    enable_pdl=False,
+                )
             inverse = b["out_expanded_idx_to_permuted_idx"]
         else:
             # Fixed output extents: no device-to-host reads or dynamic allocations.

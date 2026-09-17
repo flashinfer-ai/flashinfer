@@ -178,6 +178,78 @@ def _get_dtype_suffix(dtype: torch.dtype) -> str:
         raise ValueError(f"Unsupported dtype: {dtype}")
 
 
+def _try_moe_route_permute_small(
+    input: torch.Tensor,
+    expert_ids: torch.Tensor,
+    routed: torch.Tensor,
+    inverse: torch.Tensor,
+    offsets: torch.Tensor,
+    num_experts: int,
+) -> bool:
+    """Fill Frost's three routing operands, or decline without a launch.
+
+    IDs must name valid local experts in [0, num_experts); like native routing,
+    this internal helper does not synchronize to validate device-side values.
+    It writes a stable expert ordering with no padding and all E+1 offsets,
+    including empty groups. It does not produce generic ``moe_sort`` metadata.
+    Input copy and rank construction share one kernel. The implementation uses
+    FlashInfer's existing offset/inverse conventions; it does not copy the
+    NVIDIA TensorRT-LLM router, which remains the general fallback.
+    """
+    tensors = (input, expert_ids, routed, inverse, offsets)
+    if not all(
+        t.is_cuda and t.is_contiguous() and t.device == input.device for t in tensors
+    ):
+        return False
+    if (
+        input.ndim != 2
+        or expert_ids.ndim != 2
+        or input.dtype != torch.bfloat16
+        or routed.dtype != torch.bfloat16
+        or any(t.dtype != torch.int32 for t in (expert_ids, inverse, offsets))
+    ):
+        return False
+    tokens, hidden = input.shape
+    top_k = expert_ids.shape[1]
+    if (
+        not 0 < tokens * top_k <= 512
+        or not 0 < hidden <= 16384
+        or hidden % 8
+        or not 0 < num_experts <= 4096
+        or expert_ids.shape[0] != tokens
+        or routed.shape != (tokens * top_k, hidden)
+        or inverse.numel() != tokens * top_k
+        or offsets.shape != (num_experts + 1,)
+        or input.data_ptr() % 16
+        or routed.data_ptr() % 16
+    ):
+        return False
+    # Parallel copies and offset writes require distinct contiguous storage.
+    ranges = [
+        (t.data_ptr(), t.data_ptr() + t.numel() * t.element_size()) for t in tensors
+    ]
+    for i in range(2, len(ranges)):
+        for j in range(i):
+            if max(ranges[i][0], ranges[j][0]) < min(ranges[i][1], ranges[j][1]):
+                return False
+    if torch.cuda.get_device_capability(input.device)[0] not in (10, 12):
+        return False
+    with torch.cuda.device(input.device):
+        _get_moe_utils_module()["flashinfer_moe_route_permute_small"](
+            input.data_ptr(),
+            expert_ids.data_ptr(),
+            routed.data_ptr(),
+            inverse.data_ptr(),
+            offsets.data_ptr(),
+            tokens,
+            top_k,
+            hidden,
+            num_experts,
+            _get_cuda_stream_ptr(),
+        )
+    return True
+
+
 def moe_permute(
     input: torch.Tensor,
     permuted_output: torch.Tensor,
