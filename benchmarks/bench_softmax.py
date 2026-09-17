@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import warnings
 
 import numpy as np
 import torch
@@ -294,9 +295,11 @@ def _paired_rows(backend):
             logits if temperature is None else logits / temperature, dim=-1
         )
         passed = bool(torch.allclose(result, reference, atol=1e-5))
-        elapsed = bench_gpu_time(
-            call, dry_run_time_ms=100, repeat_time_ms=1000, enable_cupti=True
-        )
+        with warnings.catch_warnings():
+            warnings.filterwarnings("error", message=".*Falling back to CUDA events.*")
+            elapsed = bench_gpu_time(
+                call, dry_run_time_ms=100, repeat_time_ms=1000, enable_cupti=True
+            )
         rows.append(
             {
                 "shape": [batch, vocab, temperature, enable_pdl],
@@ -315,7 +318,12 @@ def _compare_cake(baseline_root, baseline_python):
     if not (baseline_root / "flashinfer" / "__init__.py").is_file():
         raise ValueError("--baseline-root must be a FlashInfer checkout")
     env = os.environ.copy()
-    env["PYTHONPATH"] = str(baseline_root)
+    dependency_paths = [
+        path
+        for path in env.get("PYTHONPATH", "").split(os.pathsep)
+        if path and Path(path).resolve() not in {candidate_root, baseline_root}
+    ]
+    env["PYTHONPATH"] = os.pathsep.join([str(baseline_root), *dependency_paths])
     env["EXPECTED_BASELINE_ROOT"] = str(baseline_root)
     child = subprocess.run(
         [str(baseline_python), str(Path(__file__).resolve()), "--paired-child"],
