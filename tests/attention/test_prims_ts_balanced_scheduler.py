@@ -742,6 +742,77 @@ def test_cuda_scheduler_runs_inside_cuda_graph(scheduler):
 
 
 @_REQUIRES_CUDA_SCHEDULER
+def test_cost_update_preserves_captured_table_and_changes_replay_schedule():
+    seq_lens = (
+        [2048] * 5
+        + [3072] * 3
+        + [10112] * 12
+        + [30080] * 24
+        + [50048] * 17
+        + [100096] * 2
+        + [110080]
+    )
+    old_cost = BalancedCostModel(1000, 0)
+    new_cost = BalancedCostModel(1000, 1_000_000)
+    plan = BalancedMLADecodePlan(
+        batch_size=len(seq_lens),
+        num_partitions=74,
+        device=torch.device("cuda"),
+        cost=old_cost,
+        max_seq_len=max(seq_lens),
+    )
+    device_seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device="cuda")
+    table_address = plan._device_cost_models.data_ptr()
+
+    plan.schedule_device(device_seq_lens, scheduler="optimized")
+    old_target = plan.last_target_piece_tiles
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        plan.schedule_device(device_seq_lens, validate=False, scheduler="optimized")
+
+    plan.cost = new_cost
+    assert plan._device_cost_models.data_ptr() == table_address
+    assert plan.cost_model_info["parameters"] == new_cost
+    graph.replay()
+    plan.synchronize_device_metadata()
+    replay_snapshot = _snapshot(plan)
+
+    expected = BalancedMLADecodePlan(
+        batch_size=len(seq_lens),
+        num_partitions=74,
+        device=torch.device("cuda"),
+        cost=new_cost,
+        max_seq_len=max(seq_lens),
+    )
+    expected.schedule_device(device_seq_lens, scheduler="optimized")
+
+    assert plan.last_target_piece_tiles != old_target
+    assert replay_snapshot == _snapshot(expected)
+
+
+@_REQUIRES_CUDA_SCHEDULER
+def test_invalid_cost_update_preserves_existing_model():
+    old_cost = BalancedCostModel(1000, 2000)
+    plan = BalancedMLADecodePlan(
+        batch_size=1,
+        num_partitions=1,
+        device=torch.device("cuda"),
+        cost=old_cost,
+        max_seq_len=128,
+    )
+    table_address = plan._device_cost_models.data_ptr()
+    table_contents = plan._device_cost_models.clone()
+
+    with pytest.raises(ValueError, match="non-negative int32"):
+        plan.cost = BalancedCostModel(-1, 0)
+
+    assert plan.cost == old_cost
+    assert plan.cost_model_info["parameters"] == old_cost
+    assert plan._device_cost_models.data_ptr() == table_address
+    assert torch.equal(plan._device_cost_models, table_contents)
+
+
+@_REQUIRES_CUDA_SCHEDULER
 def test_cuda_scheduler_failure_publishes_empty_safe_schedule():
     plan = BalancedMLADecodePlan(
         batch_size=2,

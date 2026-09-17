@@ -321,15 +321,27 @@ class BalancedMLADecodePlan:
 
     @cost.setter
     def cost(self, value: BalancedCostModel) -> None:
-        """Install an explicit model, disabling automatic bucket selection."""
+        """Install an explicit model without invalidating captured table addresses.
 
+        The table update is ordered on the current stream for this plan's device.
+        Callers replaying a graph on another stream must establish the usual CUDA
+        stream dependency before replay.
+        """
+
+        row = self._cost_row(value)
+        with torch.cuda.device(self.device):
+            replacement = torch.tensor(
+                [row] * len(_DEVICE_COST_BUCKETS),
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self._device_cost_models.copy_(replacement)
         self._cost = value
         self._auto_cost = False
         self._calibration = None
         self._cost_model_id = "explicit-unregistered"
         self._cost_source = "explicit"
         self.last_cost_bucket = None
-        self._device_cost_models = self._make_device_cost_models()
 
     @property
     def cost_model_info(self) -> Mapping[str, object]:
