@@ -16,9 +16,13 @@ limitations under the License.
 Regression coverage for normalization through the public prefill API.
 """
 
+import re
+from unittest.mock import Mock
+
 import pytest
 import torch
 
+import flashinfer.gdn_prefill as gdn_prefill
 from flashinfer import chunk_gated_delta_rule
 from flashinfer.gdn_kernels.qk_l2norm import normalize_qk
 from flashinfer.utils import get_compute_capability
@@ -39,6 +43,48 @@ def _supported_device():
 def _normalize_reference(x):
     x = x.double()
     return x * torch.rsqrt(x.square().sum(dim=-1, keepdim=True) + 1e-6)
+
+
+@pytest.mark.parametrize("use_cp", [False, True])
+@pytest.mark.parametrize(
+    "capability,cuda_version,dsl_available",
+    [
+        pytest.param((8, 0), "13.0", True, id="unsupported-gdn-arch"),
+        pytest.param((10, 0), "12.8", True, id="unsupported-cuda-version"),
+        pytest.param((9, 0), "13.0", False, id="unavailable-cute-dsl"),
+    ],
+)
+def test_prefill_normalization_preserves_backend_rejection(
+    monkeypatch, use_cp, capability, cuda_version, dsl_available
+):
+    monkeypatch.setattr(gdn_prefill, "get_compute_capability", lambda _: capability)
+    monkeypatch.setattr(gdn_prefill, "get_device_sm_count", lambda _: 132)
+    monkeypatch.setattr(gdn_prefill, "get_device_name", lambda _: "test GPU")
+    monkeypatch.setattr(torch.version, "cuda", cuda_version)
+    monkeypatch.setattr(
+        gdn_prefill, "is_cute_dsl_arch_supported", lambda *_: dsl_available
+    )
+    if not dsl_available:
+        monkeypatch.setattr(gdn_prefill, "chunk_gated_delta_rule_sm90", None)
+        monkeypatch.setattr(gdn_prefill, "cp_delta_rule_dsl_sm90", None)
+
+    normalize = Mock(side_effect=AssertionError("normalization must not run"))
+    monkeypatch.setattr("flashinfer.gdn_kernels.qk_l2norm.normalize_qk", normalize)
+    q = torch.zeros(8, 1, 128, dtype=torch.float16)
+    kwargs = dict(
+        q=q,
+        k=q,
+        v=q,
+        cu_seqlens=torch.tensor([0, 8], dtype=torch.int64),
+        use_cp=use_cp,
+        backend="flashinfer",
+    )
+    error_type = ValueError if use_cp else NotImplementedError
+    with pytest.raises(error_type) as expected:
+        chunk_gated_delta_rule(**kwargs)
+    with pytest.raises(error_type, match=re.escape(str(expected.value))):
+        chunk_gated_delta_rule(**kwargs, use_qk_l2norm_in_kernel=True)
+    normalize.assert_not_called()
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
