@@ -454,7 +454,7 @@ def prepare(
         counters.zero_()
         q_view, out_view = q.view(batch, q_heads, 128), out.view(batch, q_heads, 128)
 
-        def execute() -> None:
+        def execute_decode() -> None:
             run(
                 q_view,
                 kv,
@@ -476,7 +476,7 @@ def prepare(
             if partitions > 1 and merge is not None:
                 merge(partial, statistics, out_view, partitions, batch * q_heads, 1, 1)
 
-        return PreparedAttention(out, route, tuple(workspace), execute)
+        return PreparedAttention(out, route, tuple(workspace), execute_decode)
     if workspace is not None:
         raise ValueError("the D512 tree route does not require external workspace")
     if partition_tokens is not None:
@@ -492,7 +492,7 @@ def prepare(
     )
     run = _tree_op(route)
 
-    def execute() -> None:
+    def execute_tree() -> None:
         run(
             q,
             kv,
@@ -510,7 +510,7 @@ def prepare(
             *grid,
         )
 
-    return PreparedAttention(out, route, (), execute)
+    return PreparedAttention(out, route, (), execute_tree)
 
 
 def attention(
