@@ -120,6 +120,8 @@ def normalize_qk(q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.
     k = k.contiguous()
     oq = torch.empty_like(q)
     ok = torch.empty_like(k)
+    if q.numel() == 0 and k.numel() == 0:
+        return oq, ok
     with torch.cuda.device(q.device):
         _compiled(q.dtype, d, gdn_device_target(q.device).compile_key)(
             q.reshape(-1, d), k.reshape(-1, d), oq.reshape(-1, d), ok.reshape(-1, d)

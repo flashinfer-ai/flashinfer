@@ -123,6 +123,47 @@ def test_qk_normalization_reference_and_graph(dtype):
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("q_rows,k_rows", [(0, 0), (0, 7), (7, 0)])
+def test_qk_normalization_empty_inputs(dtype, q_rows, k_rows):
+    device = _supported_device()
+    from flashinfer.gdn_kernels.qk_l2norm import normalize_qk
+
+    torch.manual_seed(2026)
+    q = torch.randn(q_rows, 32, 128, device=device, dtype=dtype)
+    k = torch.randn(k_rows, 16, 128, device=device, dtype=dtype)
+    outputs = normalize_qk(q, k)
+    for actual, source in zip(outputs, (q, k), strict=True):
+        torch.testing.assert_close(
+            actual, _normalize_reference(source).to(dtype), rtol=1e-3, atol=1e-3
+        )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_prefill_normalization_all_empty(dtype):
+    device = _supported_device()
+    q = torch.empty(0, 16, 128, device=device, dtype=dtype)
+    k = torch.empty(0, 16, 128, device=device, dtype=dtype)
+    v = torch.empty(0, 32, 128, device=device, dtype=dtype)
+    gate = torch.empty(0, 32, device=device, dtype=torch.float32)
+    output_state = torch.full((2, 32, 128, 128), 123.0, device=device)
+    output, state = chunk_gated_delta_rule(
+        q=q,
+        k=k,
+        v=v,
+        g=gate,
+        beta=gate,
+        cu_seqlens=torch.zeros(3, device=device, dtype=torch.int64),
+        output_final_state=True,
+        output_state=output_state,
+        use_qk_l2norm_in_kernel=True,
+        use_cp=False,
+        backend="flashinfer",
+    )
+    torch.testing.assert_close(output, torch.empty_like(v))
+    torch.testing.assert_close(state, torch.full_like(output_state, 123.0))
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("use_cp", [False, True])
 @pytest.mark.parametrize("heads", [(16, 16, 32), (32, 16, 16)])
 @pytest.mark.parametrize("use_qk_l2norm", [False, True])
