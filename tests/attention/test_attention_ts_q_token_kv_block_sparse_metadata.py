@@ -1488,6 +1488,22 @@ def test_q_token_kv_block_sparse_sort_union_cuda_graph_reloads_and_invalidates()
     expected = _reference(blocks, table, requests, positions, storage_page_size, 5)
     _assert_metadata_matches(outputs, expected)
 
+    valid_positions = positions.clone()
+    # Both endpoints and interior lanes must reject out-of-range Int64 values
+    # before any subtraction or expected-position arithmetic can overflow.
+    for row, value in (
+        (0, torch.iinfo(torch.int64).min),
+        (4, torch.iinfo(torch.int64).max),
+        (2, torch.iinfo(torch.int64).max),
+    ):
+        positions.copy_(valid_positions)
+        positions[row] = value
+        graph.replay()
+        torch.cuda.synchronize()
+        assert outputs[2][0].item() == 1
+        assert outputs[0][0, 0].item() == -1
+    positions.copy_(valid_positions)
+
     positions[2].add_(1)
     graph.replay()
     torch.cuda.synchronize()

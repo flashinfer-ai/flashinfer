@@ -37,11 +37,10 @@ template <int GroupSize>
 struct QTokenKvBlockSparseTouchedMetadataKernelTraits {
   static_assert(GroupSize >= 3 && GroupSize <= 8);
   static constexpr int kMaxCandidates = GroupSize * (kQTokenKvBlockSparseMaxBlockTopK + 1);
-  // Increase per-thread storage only when four keys would exceed the CUDA
-  // 1024-thread CTA limit. Round the resulting CTA up to a complete warp.
-  static constexpr int kItemsPerThread = kMaxCandidates <= 1024 * 4 ? 4 : 8;
-  static constexpr int kBlockThreads =
-      ((kMaxCandidates + 32 * kItemsPerThread - 1) / (32 * kItemsPerThread)) * 32;
+  // Bound collective width and keep more keys local to each thread. This
+  // reduces cross-warp work for large unions without a batch-specific recipe.
+  static constexpr int kBlockThreads = 256;
+  static constexpr int kItemsPerThread = (kMaxCandidates + kBlockThreads - 1) / kBlockThreads;
 };
 
 // Keep enough independent warps to fill a Blackwell wave when decode exposes
@@ -156,7 +155,9 @@ template <typename PositionType, int GroupSize, bool PackedQuery>
 __device__ __forceinline__ void InitRoute(
     const QTokenKvBlockSparseTouchedMetadataParams<PositionType>& params,
     QTokenKvBlockSparseRouteState* route) {
-  if (threadIdx.x != 0) {
+  // One lane validates each query, avoiding serial dependent global loads
+  // on lane zero while preserving the complete route contract.
+  if (threadIdx.x >= 32) {
     return;
   }
 
@@ -175,37 +176,36 @@ __device__ __forceinline__ void InitRoute(
     valid = row_end <= params.rows;
   }
 
-  int32_t request = -1;
-  int64_t first_position = -1;
-  int64_t last_position = -1;
-  if (valid) {
-    request = params.token_to_request[first_row];
-    first_position = static_cast<int64_t>(params.query_positions[first_row]);
-    last_position = static_cast<int64_t>(params.query_positions[row_end - 1]);
-    // Bound both endpoints before subtracting. Besides expressing the route
-    // contract directly, this avoids signed overflow for malformed Int64
-    // positions supplied to the synchronization-free device validator.
-    valid = request >= 0 && request < params.num_requests && first_position >= 0 &&
-            first_position < params.max_seq_len_kv && last_position >= first_position &&
-            last_position < params.max_seq_len_kv &&
-            last_position - first_position == (row_end - first_row) - 1;
-
-#pragma unroll
-    for (int query = 1; query < GroupSize && valid; ++query) {
-      if (query < row_end - first_row) {
-        valid = params.token_to_request[first_row + query] == request &&
-                static_cast<int64_t>(params.query_positions[first_row + query]) ==
-                    first_position + query;
-      }
-    }
+  const int32_t query_count = valid ? row_end - first_row : 0;
+  const int32_t lane = threadIdx.x;
+  int32_t lane_request = -1;
+  int64_t lane_position = -1;
+  if (lane < query_count) {
+    lane_request = params.token_to_request[first_row + lane];
+    lane_position = static_cast<int64_t>(params.query_positions[first_row + lane]);
   }
+  const int32_t request = __shfl_sync(0xffffffffu, lane_request, 0);
+  const int64_t first_position = __shfl_sync(0xffffffffu, static_cast<long long>(lane_position), 0);
+  const int64_t last_position = __shfl_sync(0xffffffffu, static_cast<long long>(lane_position),
+                                            query_count > 0 ? query_count - 1 : 0);
+  // Validate endpoints before subtracting or forming expected positions, so
+  // malformed Int64 positions cannot cause signed overflow.
+  valid = valid && request >= 0 && request < params.num_requests && first_position >= 0 &&
+          first_position < params.max_seq_len_kv && last_position >= first_position &&
+          last_position < params.max_seq_len_kv &&
+          last_position - first_position == query_count - 1;
+  const bool lane_valid = !valid || lane >= query_count ||
+                          (lane_request == request && lane_position == first_position + lane);
+  valid = valid && __all_sync(0xffffffffu, lane_valid);
 
-  route->valid = valid;
-  route->request = request;
-  route->first_row = first_row;
-  route->query_count = valid ? row_end - first_row : 0;
-  route->first_position = first_position;
-  route->last_position = last_position;
+  if (lane == 0) {
+    route->valid = valid;
+    route->request = request;
+    route->first_row = first_row;
+    route->query_count = valid ? query_count : 0;
+    route->first_position = first_position;
+    route->last_position = last_position;
+  }
 }
 
 template <typename PositionType>
@@ -329,6 +329,34 @@ __device__ __forceinline__ int BuildTouchedUnion(
   constexpr int kSortCapacity = kBlockThreads * kItemsPerThread;
 
   uint32_t encoded_keys[kItemsPerThread];
+  // Gather every independent candidate before validating its value. This
+  // preserves the causal read bounds while exposing memory-level parallelism
+  // across each thread's items instead of consuming one load at a time.
+#pragma unroll
+  for (int item = 0; item < kItemsPerThread; ++item) {
+    const uint32_t candidate_rank = item * kBlockThreads + threadIdx.x;
+    uint32_t query;
+    uint32_t query_item;
+    params.candidates_per_query.divmod(candidate_rank, query, query_item);
+    int32_t selected_block = -1;
+    if (shared.route.valid && query < static_cast<uint32_t>(shared.route.query_count) &&
+        candidate_rank < static_cast<uint32_t>(GroupSize * (params.block_topk + 1))) {
+      const int64_t visible_tokens = shared.route.first_position + query + 1;
+      const int64_t complete_block_count = visible_tokens >> params.sparse_block_shift;
+      const int32_t selected_count = static_cast<int32_t>(
+          complete_block_count < params.block_topk ? complete_block_count : params.block_topk);
+      if (query_item < static_cast<uint32_t>(selected_count)) {
+        const int32_t row = shared.route.first_row + query;
+        selected_block =
+            params.block_indices[static_cast<int64_t>(row) * params.block_indices_row_stride +
+                                 static_cast<int64_t>(blockIdx.x % params.pattern_heads) *
+                                     params.block_indices_head_stride +
+                                 static_cast<int64_t>(query_item) *
+                                     params.block_indices_column_stride];
+      }
+    }
+    encoded_keys[item] = static_cast<uint32_t>(selected_block);
+  }
 #pragma unroll
   for (int item = 0; item < kItemsPerThread; ++item) {
     const uint32_t candidate_rank = item * kBlockThreads + threadIdx.x;
@@ -344,13 +372,7 @@ __device__ __forceinline__ int BuildTouchedUnion(
       const int32_t selected_count = static_cast<int32_t>(
           complete_block_count < params.block_topk ? complete_block_count : params.block_topk);
       if (query_item < static_cast<uint32_t>(selected_count)) {
-        const int32_t row = shared.route.first_row + query;
-        const int32_t selected_block =
-            params.block_indices[static_cast<int64_t>(row) * params.block_indices_row_stride +
-                                 static_cast<int64_t>(blockIdx.x % params.pattern_heads) *
-                                     params.block_indices_head_stride +
-                                 static_cast<int64_t>(query_item) *
-                                     params.block_indices_column_stride];
+        const int32_t selected_block = static_cast<int32_t>(encoded_keys[item]);
         // Selected IDs may only name complete causal blocks. The partial
         // causal tail is synthesized separately and must remain the final
         // logical block for attention's tail-only mask.
