@@ -2352,7 +2352,10 @@ def _select_fmha_domain_policy(
     # N-1 unmasked iterations and TAIL masks the last tile. The loop then
     # compiles the same for all S, so register spills no longer depend on tail size.
     softmax_uses_dense_k_tail = (
-        not cfg.is_causal and not cfg.has_varlen and cfg.fixed_dense_k_tail > 0
+        not cfg.single_qkv_instance
+        and not cfg.is_causal
+        and not cfg.has_varlen
+        and cfg.fixed_dense_k_tail > 0
     )
     softmax_domain_kwargs = (
         domain_n_minus_1_kwargs if softmax_uses_dense_k_tail else domain_n_kwargs
