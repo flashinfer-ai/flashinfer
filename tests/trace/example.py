@@ -23,6 +23,10 @@ Results:
 - ulysses_lowp_k_grouped_amax_h8_d128_p8.json
 - ulysses_lowp_quant_qkv_pack_h8_d128_p8.json
 - ulysses_lowp_unpack_for_sage_h1_d128_p8.json
+- ulysses_scatter_qkv_sage2_sm90_h8_d64_p8_u513.json
+- ulysses_scatter_qkv_sage2_sm90_h8_d128_p8_u513.json
+- ulysses_scatter_qkv_sage2_sm89_sm120_h8_d64_p8_u513.json
+- ulysses_scatter_qkv_sage2_sm89_sm120_h8_d128_p8_u513.json
 - We would get these example json files under fi_trace_out directory:
 bmm_mxfp8_N128_K128.json
 cute_dsl_fused_moe_bf16_h2048_e128_topk8.json
@@ -2665,7 +2669,7 @@ with contextlib.suppress(Exception):
 
 # Ulysses trace schemas can be generated on CPU, independently of kernel support.
 def dump_ulysses_lowp_traces(save_dir):
-    from flashinfer.comm import ulysses_lowp as lowp
+    from flashinfer.comm import _ulysses_lowp as lowp
 
     for head_dim in (64, 128):
         q = torch.empty(1, 65, 8, head_dim, dtype=torch.bfloat16)
@@ -2716,3 +2720,25 @@ def dump_ulysses_lowp_traces(save_dir):
 
 
 dump_ulysses_lowp_traces(SAVE_DIR)
+
+
+def dump_ulysses_qkv_traces(save_dir):
+    from types import SimpleNamespace
+
+    from flashinfer.comm import UlyssesCommunicator
+
+    # Schema generation only. Real execution obtains this metadata from
+    # comm.prepare_qkv(), called collectively by all ranks before inference.
+    # Do not create a communicator or launch collectives in this example.
+    for layout in ("sage2_sm90", "sage2_sm89_sm120"):
+        metadata = SimpleNamespace(layout=layout, world_size=8, used_sequence=513)
+        for head_dim in (64, 128):
+            q = torch.empty(1, 65, 8, head_dim, dtype=torch.bfloat16)
+            definition = UlyssesCommunicator.scatter_qkv.fi_trace(
+                q=q, k=q, v=q, workspace=metadata
+            )
+            path = save_dir / f"{definition['name']}.json"
+            path.write_text(json.dumps(definition, indent=2) + "\n")
+
+
+dump_ulysses_qkv_traces(SAVE_DIR)

@@ -27,7 +27,7 @@ import json
 import numpy as np
 import torch
 
-import flashinfer.comm.ulysses_lowp as lowp
+import flashinfer.comm._ulysses_lowp as lowp
 from flashinfer.testing.utils import bench_gpu_time
 
 _DTYPES = {"bfloat16": torch.bfloat16, "float16": torch.float16}

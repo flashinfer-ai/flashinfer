@@ -3,7 +3,7 @@
   "description": "Split-path quantize+pack of one Ulysses shard with externally finalized per-group Q/K amax (stats protocol 2: groups may straddle ranks and were max-merged / derived across the group). Byte contract validated in tests/comm/test_ulysses_lowp.py.",
   "op_type": "comm",
   "tags": [
-    "fi_api:flashinfer.comm.ulysses_lowp.quant_qkv_pack",
+    "fi_api:flashinfer.comm._ulysses_lowp.quant_qkv_pack",
     "stage:comm",
     "quantization:float8_e4m3fn"
   ],

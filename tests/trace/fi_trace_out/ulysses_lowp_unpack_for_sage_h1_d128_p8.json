@@ -3,7 +3,7 @@
   "description": "Receiver side of the low-precision Ulysses A2A: rebuild this rank's heads over the full logical sequence from the received per-source chunks -- INT8 Q/K [B,S,h,D], FP8 V in SageAttention's 16-token permuted [B,D,h,padded_S] layout, and the fp32 Q/K group scales at the consumer's width. Pure byte movement; validated bit-for-bit in tests/comm/test_ulysses_lowp.py.",
   "op_type": "comm",
   "tags": [
-    "fi_api:flashinfer.comm.ulysses_lowp.unpack_for_sage",
+    "fi_api:flashinfer.comm._ulysses_lowp.unpack_for_sage",
     "stage:comm"
   ],
   "axes": {

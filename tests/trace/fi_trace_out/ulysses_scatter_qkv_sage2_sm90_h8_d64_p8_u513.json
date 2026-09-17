@@ -1,0 +1,182 @@
+{
+  "name": "ulysses_scatter_qkv_sage2_sm90_h8_d64_p8_u513",
+  "description": "Distributed SageAttention2 QKV preparation: local statistics, one FP32 NCCL AllGather, rank-ordered statistics finalization, quantize/pack, one uint8 NCCL AllToAll, and unpack. Requires an existing communicator and prepare_qkv workspace on every rank, in the same collective order. This schema describes a distributed operation; it has no single-GPU reference or automatic process-group/workspace initializer. Returned UlyssesQKV fields are listed in tuple order; when out is supplied, its six tensors are filled and the same result record is returned. Input rows outside the global used_sequence prefix must already be zero.",
+  "op_type": "comm",
+  "tags": [
+    "fi_api:flashinfer.comm.ulysses.UlyssesCommunicator.scatter_qkv",
+    "stage:comm",
+    "distributed:multi-rank",
+    "transport:nccl",
+    "quantization:sage2",
+    "layout:sage2_sm90"
+  ],
+  "axes": {
+    "batch": {
+      "type": "var"
+    },
+    "local_sequence": {
+      "type": "var"
+    },
+    "logical_sequence": {
+      "type": "var"
+    },
+    "padded_sequence": {
+      "type": "var"
+    },
+    "local_heads": {
+      "type": "var"
+    },
+    "q_scale_width": {
+      "type": "var"
+    },
+    "k_scale_width": {
+      "type": "var"
+    },
+    "num_heads": {
+      "type": "const",
+      "value": 8
+    },
+    "head_dim": {
+      "type": "const",
+      "value": 64
+    },
+    "world_size": {
+      "type": "const",
+      "value": 8
+    },
+    "used_sequence": {
+      "type": "const",
+      "value": 513
+    }
+  },
+  "constraints": [
+    "batch > 0",
+    "local_sequence > 0",
+    "num_heads > 0",
+    "head_dim in [64, 128]",
+    "world_size in [2, 4, 8]",
+    "num_heads % world_size == 0",
+    "local_heads == num_heads // world_size",
+    "logical_sequence == world_size * local_sequence",
+    "0 < used_sequence <= logical_sequence",
+    "padded_sequence == (logical_sequence + 127) // 128 * 128",
+    "q_scale_width == (used_sequence + 63) // 64 * 4",
+    "k_scale_width == (used_sequence + 127) // 128"
+  ],
+  "inputs": {
+    "q": {
+      "shape": [
+        "batch",
+        "local_sequence",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "k": {
+      "shape": [
+        "batch",
+        "local_sequence",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "v": {
+      "shape": [
+        "batch",
+        "local_sequence",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "world_size": {
+      "shape": null,
+      "dtype": "int32",
+      "optional": true,
+      "description": "Prepared workspace metadata, not a scatter_qkv argument."
+    },
+    "used_sequence": {
+      "shape": null,
+      "dtype": "int32",
+      "optional": true,
+      "description": "Prepared global live prefix, not a scatter_qkv argument."
+    }
+  },
+  "outputs": {
+    "q": {
+      "shape": [
+        "batch",
+        "logical_sequence",
+        "local_heads",
+        "head_dim"
+      ],
+      "dtype": "int8"
+    },
+    "k": {
+      "shape": [
+        "batch",
+        "logical_sequence",
+        "local_heads",
+        "head_dim"
+      ],
+      "dtype": "int8"
+    },
+    "v": {
+      "shape": [
+        "batch",
+        "head_dim",
+        "local_heads",
+        "padded_sequence"
+      ],
+      "dtype": "float8_e4m3fn",
+      "description": "SageAttention2 packed V layout: sage2_sm90."
+    },
+    "q_scale": {
+      "shape": [
+        "batch",
+        "local_heads",
+        "q_scale_width"
+      ],
+      "dtype": "float32"
+    },
+    "k_scale": {
+      "shape": [
+        "batch",
+        "local_heads",
+        "k_scale_width"
+      ],
+      "dtype": "float32"
+    },
+    "v_scale": {
+      "shape": [
+        "batch",
+        "local_heads",
+        "head_dim"
+      ],
+      "dtype": "float32"
+    },
+    "layout": {
+      "shape": null,
+      "dtype": "string",
+      "description": "Always 'sage2_sm90'."
+    },
+    "logical_sequence": {
+      "shape": null,
+      "dtype": "int32",
+      "description": "world_size * local_sequence."
+    },
+    "used_sequence": {
+      "shape": null,
+      "dtype": "int32",
+      "description": "Prepared global live prefix."
+    },
+    "input_dtype": {
+      "shape": null,
+      "dtype": "dtype",
+      "description": "Original Q/K/V dtype."
+    }
+  },
+  "check": "def standard_check(\n    reference_outputs: Any,\n    actual_outputs: Any,\n    *,\n    rtol: Optional[float] = None,\n    atol: Optional[float] = None,\n    max_mismatch_pct: float = 0.0,\n    min_cos_sim: Optional[float] = 1.0 - 1e-3,\n) -> bool:\n    \"\"\"Default trace correctness check used when a template does not override it.\"\"\"\n    from flashinfer.trace import default_check\n\n    return default_check(\n        reference_outputs,\n        actual_outputs,\n        rtol=rtol,\n        atol=atol,\n        max_mismatch_pct=max_mismatch_pct,\n        min_cos_sim=min_cos_sim,\n    )\n"
+}

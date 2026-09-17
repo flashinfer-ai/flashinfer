@@ -7,10 +7,9 @@ SM89/SM120 use Q32/K64; SM90 uses Q16/K128. All shards use one
 boundary-statistics AllGather, separate grouped-amax and quantization,
 and the general receiver. Attention is supplied by an external Sage backend.
 
-NOTE: this submodule is addressed as ``flashinfer.comm.ulysses_lowp``. Never
-re-export a function named exactly ``ulysses_lowp`` from ``flashinfer.comm``:
-it would shadow this submodule on the package and break attribute-based
-module access (see the ulysses_a2a merge note in ``ulysses.py``).
+Internal implementation of the prepared UlyssesCommunicator QKV API.
+Primitive entry points remain here for numerical tests, trace definitions,
+and kernel benchmarks; they are not exported from ``flashinfer.comm``.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -512,7 +511,7 @@ def capability(
     (Q_GROUP, K_GROUP, HEAD_DIM) match that layout's Python-side values.
 
     ``layout_class`` names the class to instantiate -- resolve it with
-    ``getattr(flashinfer.comm.ulysses_lowp, cap["layout_class"])`` -- and is
+    ``getattr(flashinfer.comm._ulysses_lowp, cap["layout_class"])`` -- and is
     None exactly when ``supported`` is False.  Only the device's own module is
     probed, so this never builds a translation unit the device cannot launch.
 
@@ -719,22 +718,35 @@ def k_sum_v_amax(
         raise TypeError("k and v must have the same dtype")
     if k.device != v.device:
         raise ValueError("k and v must be on the same CUDA device")
+    if out is not None and (not isinstance(out, tuple) or len(out) != 2):
+        raise TypeError("out must be a (k_sum, v_amax) tensor tuple")
+    return _k_sum_v_amax_impl(
+        k, v, out, _resolve_pdl(enable_pdl, k), get_ulysses_lowp_module()
+    )
+
+
+def _k_sum_v_amax_impl(k, v, out, enable_pdl, module, *, zero_init=False):
+    """Shared launch body; callers validate inputs and resolve the module."""
+    batch, local_sequence, num_heads, head_dim = k.shape
+    # Preserve the existing Hopper zero-initialization work as well as its
+    # fixed reduction partition; this change only consolidates validation.
+    allocate = torch.zeros if zero_init else torch.empty
     if out is None:
-        k_sum = torch.empty(
+        k_sum = allocate(
             (batch, num_heads, head_dim), dtype=torch.float32, device=k.device
         )
-        v_amax = torch.empty_like(k_sum)
+        v_amax = torch.zeros_like(k_sum) if zero_init else torch.empty_like(k_sum)
     else:
-        if not isinstance(out, tuple) or len(out) != 2:
-            raise TypeError("out must be a (k_sum, v_amax) tensor tuple")
         k_sum, v_amax = out
     num_chunks = (local_sequence + KSUM_CHUNK_TOKENS - 1) // KSUM_CHUNK_TOKENS
-    k_partial = torch.empty(
+    k_partial = allocate(
         (batch, num_heads, num_chunks, head_dim), dtype=torch.float32, device=k.device
     )
-    v_partial = torch.empty_like(k_partial)
-    get_ulysses_lowp_module().ulysses_lowp_k_sum_v_amax(
-        k, v, k_sum, v_amax, k_partial, v_partial, _resolve_pdl(enable_pdl, k)
+    v_partial = (
+        torch.zeros_like(k_partial) if zero_init else torch.empty_like(k_partial)
+    )
+    module.ulysses_lowp_k_sum_v_amax(
+        k, v, k_sum, v_amax, k_partial, v_partial, enable_pdl
     )
     return k_sum, v_amax
 
@@ -772,14 +784,24 @@ def q_grouped_amax(
     batch, local_sequence, num_heads, _ = _validate_nhd_input("q", q)
     world_size = _world_size(world_size)
     rank = _rank(rank, world_size)
+    return _q_grouped_amax_impl(
+        q,
+        rank,
+        world_size,
+        Q_GROUP,
+        _resolve_pdl(enable_pdl, q),
+        get_ulysses_lowp_module(),
+    )
+
+
+def _q_grouped_amax_impl(q, rank, world_size, group, enable_pdl, module):
+    batch, local_sequence, num_heads, _ = q.shape
     amax = torch.zeros(
-        (batch, num_heads, slots(local_sequence, Q_GROUP)),
+        (batch, num_heads, slots(local_sequence, group)),
         dtype=torch.float32,
         device=q.device,
     )
-    get_ulysses_lowp_module().ulysses_lowp_q_grouped_amax(
-        q, amax, rank, world_size, _resolve_pdl(enable_pdl, q)
-    )
+    module.ulysses_lowp_q_grouped_amax(q, amax, rank, world_size, enable_pdl)
     return amax
 
 
@@ -852,16 +874,32 @@ def k_grouped_amax(
     _validate_live_length("used_sequence", used_sequence, global_sequence)
     if used_sequence is not None and not 0 < int(used_sequence) <= global_sequence:
         raise ValueError("used_sequence must lie in (0, local_sequence * world_size]")
+    return _k_grouped_amax_impl(
+        k,
+        k_mean_global,
+        rank,
+        world_size,
+        used_sequence,
+        K_GROUP,
+        _resolve_pdl(enable_pdl, k),
+        get_ulysses_lowp_module(),
+    )
+
+
+def _k_grouped_amax_impl(
+    k, k_mean_global, rank, world_size, used_sequence, group, enable_pdl, module
+):
+    batch, local_sequence, num_heads, _ = k.shape
     amax = torch.zeros(
-        (batch, num_heads, slots(local_sequence, K_GROUP)),
+        (batch, num_heads, slots(local_sequence, group)),
         dtype=torch.float32,
         device=k.device,
     )
-    get_ulysses_lowp_module().ulysses_lowp_k_grouped_amax(
-        k, k_mean_global, amax, rank, world_size, _resolve_pdl(enable_pdl, k)
+    module.ulysses_lowp_k_grouped_amax(
+        k, k_mean_global, amax, rank, world_size, enable_pdl
     )
     return _repair_k_tail_amax(
-        amax, k, k_mean_global, rank, world_size, used_sequence, K_GROUP
+        amax, k, k_mean_global, rank, world_size, used_sequence, group
     )
 
 
@@ -990,6 +1028,10 @@ def boundary_descriptors(
 
     world_size = _world_size(world_size)
     rank = _rank(rank, world_size)
+    return _boundary_descriptors_impl(grouped_amax, rank, local_sequence, group)
+
+
+def _boundary_descriptors_impl(grouped_amax, rank, local_sequence, group):
     touched_count = touched(rank, local_sequence, group)
     first = grouped_amax[..., 0:1]
     last = grouped_amax[..., touched_count - 1 : touched_count]
@@ -1036,6 +1078,14 @@ def merge_boundary_amax(
         or gathered_descriptors.shape[-1] != 2
     ):
         raise ValueError("gathered_descriptors must have shape [P, B, H, 2]")
+    return _merge_boundary_amax_impl(
+        grouped_amax, gathered_descriptors, rank, local_sequence, group, world_size
+    )
+
+
+def _merge_boundary_amax_impl(
+    grouped_amax, gathered_descriptors, rank, local_sequence, group, world_size
+):
     my_first = group_first(rank, local_sequence, group)
     touched_count = touched(rank, local_sequence, group)
     for boundary_group in {my_first, my_first + touched_count - 1}:
@@ -1634,20 +1684,25 @@ def unpack_for_sage(
         ("k_scale", k_scale, (batch_size, local_heads, k_scale_width), torch.float32),
     ):
         _validate_tensor_spec(name, tensor, shape, dtype, recv_u8.device)
-    fn = get_ulysses_lowp_module().ulysses_lowp_unpack_for_sage_unaligned
-    fn(
+    return _unpack_for_sage_impl(
         recv_u8,
-        q_logical,
-        k_logical,
-        v_packed,
-        q_scale,
-        k_scale,
+        (q_logical, k_logical, v_packed, q_scale, k_scale),
         local_sequence,
         world_size,
         int(scale_sequence),
         _resolve_pdl(enable_pdl, recv_u8),
+        get_ulysses_lowp_module(),
     )
-    return q_logical, k_logical, v_packed, q_scale, k_scale
+
+
+def _unpack_for_sage_impl(
+    recv_u8, out, local_sequence, world_size, scale_sequence, enable_pdl, module
+):
+    """Emit the selected consumer layout into validated output storage."""
+    module.ulysses_lowp_unpack_for_sage_unaligned(
+        recv_u8, *out, local_sequence, world_size, scale_sequence, enable_pdl
+    )
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1868,15 +1923,39 @@ def local_stats(
         raise ValueError("q, k, and v must have identical shape and dtype")
     world_size = _world_size(world_size)
     rank = _rank(rank, world_size)
-    protocol = stats_protocol_for(local_sequence, world_size)
     global_sequence = local_sequence * world_size
     _validate_live_length("used_sequence", used_sequence, global_sequence)
     if used_sequence is not None and not 0 < int(used_sequence) <= global_sequence:
         raise ValueError("used_sequence must lie in (0, local_sequence * world_size]")
 
-    k_sum, v_amax = k_sum_v_amax(k, v, enable_pdl=enable_pdl)
+    return _local_stats_impl(
+        q,
+        k,
+        v,
+        rank,
+        world_size,
+        used_sequence,
+        Q_GROUP,
+        K_GROUP,
+        _resolve_pdl(enable_pdl, k),
+        get_ulysses_lowp_module(),
+    )
+
+
+def _local_stats_impl(
+    q, k, v, rank, world_size, used_sequence, q_group, k_group, enable_pdl, module
+):
+    """Execute local statistics after public or communicator validation.
+
+    The module and groups are resolved before entry; no architecture probe,
+    compilation or public primitive wrapper is needed inside this body.
+    """
+    batch, local_sequence, num_heads, head_dim = q.shape
+    k_sum, v_amax = _k_sum_v_amax_impl(
+        k, v, None, enable_pdl, module, zero_init=q_group == Q_GROUP_SM90
+    )
     ctx = StatsContext(
-        stats_protocol=protocol,
+        stats_protocol=BOUNDARY_MERGE,
         rank=rank,
         world_size=world_size,
         used_sequence=int(used_sequence) if used_sequence is not None else None,
@@ -1886,19 +1965,13 @@ def local_stats(
         head_dim=head_dim,
         input_dtype=q.dtype,
         stats_numel=k_sum.numel(),
+        q_group=q_group,
+        k_group=k_group,
     )
 
-    q_amax = q_grouped_amax(q, rank=rank, world_size=world_size, enable_pdl=enable_pdl)
-    q_desc = boundary_descriptors(
-        q_amax,
-        rank=rank,
-        local_sequence=local_sequence,
-        group=Q_GROUP,
-        world_size=world_size,
-    )
-    k_minmax = k_boundary_minmax(
-        k, rank=rank, world_size=world_size, used_sequence=used_sequence
-    )
+    q_amax = _q_grouped_amax_impl(q, rank, world_size, q_group, enable_pdl, module)
+    q_desc = _boundary_descriptors_impl(q_amax, rank, local_sequence, q_group)
+    k_minmax = _k_boundary_minmax_impl(k, rank, world_size, used_sequence, k_group)
     ctx.q_amax = q_amax
     ctx.q_desc_shape = tuple(q_desc.shape)
     ctx.k_minmax_shape = tuple(k_minmax.shape)
@@ -1964,6 +2037,24 @@ def finalize_stats(
             f"{ctx.world_size} x {per_rank}"
         )
 
+    return _finalize_stats_impl(
+        gathered, ctx, k, _resolve_pdl(enable_pdl, k), get_ulysses_lowp_module()
+    )
+
+
+def _finalize_stats_impl(gathered, ctx, k, enable_pdl, module):
+    """Rank-major reductions and boundary repair for a validated context."""
+    batch, local_sequence, num_heads, head_dim = (
+        ctx.batch_size,
+        ctx.local_sequence,
+        ctx.num_heads,
+        ctx.head_dim,
+    )
+    per_rank = (
+        ctx.stats_numel * 2
+        + math.prod(ctx.q_desc_shape)
+        + math.prod(ctx.k_minmax_shape)
+    )
     world_size = ctx.world_size
     used = ctx.used_sequence
     denominator = used if used is not None else local_sequence * world_size
@@ -1980,33 +2071,36 @@ def finalize_stats(
     ).contiguous()
 
     n_desc = int(math.prod(ctx.q_desc_shape))
-    merge_boundary_amax(
+    _merge_boundary_amax_impl(
         ctx.q_amax,
         g[:, 2 * n_stat : 2 * n_stat + n_desc]
         .reshape(world_size, *ctx.q_desc_shape)
         .contiguous(),
-        rank=ctx.rank,
-        local_sequence=local_sequence,
-        group=Q_GROUP,
-        world_size=world_size,
+        ctx.rank,
+        local_sequence,
+        ctx.q_group,
+        world_size,
     )
-    k_amax = k_grouped_amax(
+    k_amax = _k_grouped_amax_impl(
         k,
         k_mean_global,
-        rank=ctx.rank,
-        world_size=world_size,
-        used_sequence=used,
-        enable_pdl=enable_pdl,
+        ctx.rank,
+        world_size,
+        used,
+        ctx.k_group,
+        enable_pdl,
+        module,
     )
-    derive_k_boundary_amax(
+    _derive_k_boundary_amax_impl(
         k_amax,
         g[:, 2 * n_stat + n_desc :]
         .reshape(world_size, *ctx.k_minmax_shape)
         .contiguous(),
         k_mean_global,
-        rank=ctx.rank,
-        local_sequence=local_sequence,
-        world_size=world_size,
+        ctx.rank,
+        local_sequence,
+        world_size,
+        ctx.k_group,
     )
     return V2GStats(
         stats_protocol=BOUNDARY_MERGE,
@@ -2017,6 +2111,8 @@ def finalize_stats(
         v_scale_global=v_scale_global,
         q_amax_final=ctx.q_amax,
         k_amax_final=k_amax,
+        q_group=ctx.q_group,
+        k_group=ctx.k_group,
     )
 
 
@@ -2053,19 +2149,52 @@ def quant_and_pack(
         raise TypeError("stats must be the V2GStats returned by finalize_stats")
     _validate_qkv(q, k, v)
     _validate_final_stats(stats, q, Q_GROUP, K_GROUP)
-    return quant_qkv_pack(
+    _require_sm89_or_sm120(q)
+    batch, local_sequence, num_heads, head_dim = q.shape
+    spec = payload_spec(
+        batch_size=batch,
+        local_sequence=local_sequence,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        world_size=stats.world_size,
+    )
+    if out is None:
+        out = torch.empty(
+            (stats.world_size, spec["chunk_bytes"]), dtype=torch.uint8, device=q.device
+        )
+    _validate_tensor_spec(
+        "out", out, (stats.world_size, spec["chunk_bytes"]), torch.uint8, q.device
+    )
+    return _quant_and_pack_impl(
         q,
         k,
         v,
+        stats,
+        out,
+        int(spec["q_scale_offset"]),
+        _resolve_pdl(enable_pdl, q),
+        get_ulysses_lowp_module(),
+    )
+
+
+def _quant_and_pack_impl(q, k, v, stats, out, q_scale_offset, enable_pdl, module):
+    """Pack validated operands, including every call's scale/tail clearing."""
+    out[:, q_scale_offset:].zero_()
+    module.ulysses_lowp_quant_q_int8_pack(
+        q, stats.q_amax_final, out, stats.rank, stats.world_size, enable_pdl
+    )
+    module.ulysses_lowp_quant_kv_int8_fp8_pack(
+        k,
+        v,
         stats.k_mean_global,
-        stats.q_amax_final,
         stats.k_amax_final,
         stats.v_scale_global,
-        rank=stats.rank,
-        world_size=stats.world_size,
-        out=out,
-        enable_pdl=enable_pdl,
+        out,
+        stats.rank,
+        stats.world_size,
+        enable_pdl,
     )
+    return out
 
 
 class UlyssesLowpSageLayout:
@@ -2402,42 +2531,18 @@ class UlyssesLowpSageLayoutSM90(UlyssesLowpSageLayout):
             raise ValueError(
                 "used_sequence must lie in (0, local_sequence * world_size]"
             )
-        protocol = stats_protocol_for(local_sequence, world_size)
-        _pdl = _resolve_pdl(enable_pdl, k)
-        mod = get_ulysses_lowp_sm90_module()
-        k_sum, v_amax = self._k_sum_v_amax(k, v, _pdl, mod)
-
-        ctx = StatsContext(
-            stats_protocol=protocol,
-            rank=rank,
-            world_size=world_size,
-            used_sequence=int(used_sequence) if used_sequence is not None else None,
-            batch_size=batch,
-            local_sequence=local_sequence,
-            num_heads=num_heads,
-            head_dim=head_dim,
-            input_dtype=q.dtype,
-            stats_numel=k_sum.numel(),
-            q_group=self.Q_GROUP,
-            k_group=self.K_GROUP,
+        return _local_stats_impl(
+            q,
+            k,
+            v,
+            rank,
+            world_size,
+            used_sequence,
+            self.Q_GROUP,
+            self.K_GROUP,
+            _resolve_pdl(enable_pdl, k),
+            get_ulysses_lowp_sm90_module(),
         )
-
-        q_amax = self._q_grouped_amax(q, rank, world_size, _pdl, mod)
-        q_desc = boundary_descriptors(
-            q_amax,
-            rank=rank,
-            local_sequence=local_sequence,
-            group=self.Q_GROUP,
-            world_size=world_size,
-        )
-        k_minmax = self._k_boundary_minmax(k, rank, world_size, used_sequence)
-        ctx.q_amax = q_amax
-        ctx.q_desc_shape = tuple(q_desc.shape)
-        ctx.k_minmax_shape = tuple(k_minmax.shape)
-        send = torch.cat(
-            [k_sum.flatten(), v_amax.flatten(), q_desc.flatten(), k_minmax.flatten()]
-        ).contiguous()
-        return send, ctx
 
     def finalize_stats(
         self,
@@ -2451,64 +2556,12 @@ class UlyssesLowpSageLayoutSM90(UlyssesLowpSageLayout):
         _validate_stats_context(gathered, ctx, k, self.Q_GROUP, self.K_GROUP)
         self._check_head_dim(k)
         batch, local_sequence, num_heads, head_dim = _validate_nhd_shape("k", k)
-        world_size = ctx.world_size
-        _pdl = _resolve_pdl(enable_pdl, k)
-        mod = get_ulysses_lowp_sm90_module()
-
-        per_rank = ctx.stats_numel * 2
-        if ctx.stats_protocol == BOUNDARY_MERGE:
-            per_rank += int(math.prod(ctx.q_desc_shape)) + int(
-                math.prod(ctx.k_minmax_shape)
-            )
-        used = ctx.used_sequence
-        denominator = used if used is not None else local_sequence * world_size
-        stat_shape = (batch, num_heads, head_dim)
-        g = gathered.reshape(world_size, per_rank)
-        n_stat = ctx.stats_numel
-        k_mean_global = (
-            (g[:, :n_stat].sum(dim=0).view(stat_shape) / denominator)
-            .to(ctx.input_dtype)
-            .contiguous()
-        )
-        v_scale_global = (
-            g[:, n_stat : 2 * n_stat].amax(dim=0).view(stat_shape) / V_SCALE_MAX
-        ).contiguous()
-        n_desc = int(math.prod(ctx.q_desc_shape))
-        merge_boundary_amax(
-            ctx.q_amax,
-            g[:, 2 * n_stat : 2 * n_stat + n_desc]
-            .reshape(world_size, *ctx.q_desc_shape)
-            .contiguous(),
-            rank=ctx.rank,
-            local_sequence=local_sequence,
-            group=self.Q_GROUP,
-            world_size=world_size,
-        )
-        k_amax = self._k_grouped_amax(
-            k, k_mean_global, ctx.rank, world_size, used, _pdl, mod
-        )
-        # derive_k_boundary_amax uses K_GROUP for group_first/touched — pass SM90 K_GROUP
-        self._derive_k_boundary_amax(
-            k_amax,
-            g[:, 2 * n_stat + n_desc :]
-            .reshape(world_size, *ctx.k_minmax_shape)
-            .contiguous(),
-            k_mean_global,
-            ctx.rank,
-            local_sequence,
-            world_size,
-        )
-        return V2GStats(
-            stats_protocol=BOUNDARY_MERGE,
-            rank=ctx.rank,
-            world_size=world_size,
-            used_sequence=used,
-            k_mean_global=k_mean_global,
-            v_scale_global=v_scale_global,
-            q_amax_final=ctx.q_amax,
-            k_amax_final=k_amax,
-            q_group=self.Q_GROUP,
-            k_group=self.K_GROUP,
+        return _finalize_stats_impl(
+            gathered,
+            ctx,
+            k,
+            _resolve_pdl(enable_pdl, k),
+            get_ulysses_lowp_sm90_module(),
         )
 
     # ── pack / unpack ─────────────────────────────────────────────────────────
@@ -2535,7 +2588,6 @@ class UlyssesLowpSageLayoutSM90(UlyssesLowpSageLayout):
         _validate_nhd_shape("v", v)
         _validate_final_stats(stats, q, self.Q_GROUP, self.K_GROUP)
         world_size = stats.world_size
-        rank = stats.rank
         _pdl = _resolve_pdl(enable_pdl, q)
         mod = get_ulysses_lowp_sm90_module()
 
@@ -2554,23 +2606,9 @@ class UlyssesLowpSageLayoutSM90(UlyssesLowpSageLayout):
         _validate_tensor_spec(
             "out", out, (world_size, spec["chunk_bytes"]), torch.uint8, q.device
         )
-        out[:, int(spec["q_scale_offset"]) :].zero_()
-
-        mod.ulysses_lowp_quant_q_int8_pack(
-            q, stats.q_amax_final, out, rank, world_size, _pdl
+        return _quant_and_pack_impl(
+            q, k, v, stats, out, int(spec["q_scale_offset"]), _pdl, mod
         )
-        mod.ulysses_lowp_quant_kv_int8_fp8_pack(
-            k,
-            v,
-            stats.k_mean_global,
-            stats.k_amax_final,
-            stats.v_scale_global,
-            out,
-            rank,
-            world_size,
-            _pdl,
-        )
-        return out
 
     def unpack_for_sage(
         self,
@@ -2687,21 +2725,15 @@ class UlyssesLowpSageLayoutSM90(UlyssesLowpSageLayout):
             ),
         ):
             _validate_tensor_spec(name, tensor, shape, dtype, recv_u8.device)
-        mod = get_ulysses_lowp_sm90_module()
-        fn = mod.ulysses_lowp_unpack_for_sage_unaligned
-        fn(
+        return _unpack_for_sage_impl(
             recv_u8,
-            q_logical,
-            k_logical,
-            v_packed,
-            q_scale,
-            k_scale,
+            (q_logical, k_logical, v_packed, q_scale, k_scale),
             local_sequence,
             world_size,
             int(scale_sequence),
             _resolve_pdl(enable_pdl, recv_u8),
+            get_ulysses_lowp_sm90_module(),
         )
-        return q_logical, k_logical, v_packed, q_scale, k_scale
 
     def verify_duplicate_scale_slots(
         self,
@@ -2737,31 +2769,11 @@ class UlyssesLowpSageLayoutSM90(UlyssesLowpSageLayout):
 
     @staticmethod
     def _k_sum_v_amax(k, v, enable_pdl, mod):
-        batch, local_sequence, num_heads, head_dim = k.shape
-        chunks = (local_sequence + KSUM_CHUNK_TOKENS - 1) // KSUM_CHUNK_TOKENS
-        k_sum = torch.zeros(
-            (batch, num_heads, head_dim), dtype=torch.float32, device=k.device
-        )
-        v_amax = torch.zeros_like(k_sum)
-        k_partial = torch.zeros(
-            (batch, num_heads, chunks, head_dim), dtype=torch.float32, device=k.device
-        )
-        v_partial = torch.zeros_like(k_partial)
-        mod.ulysses_lowp_k_sum_v_amax(
-            k, v, k_sum, v_amax, k_partial, v_partial, enable_pdl
-        )
-        return k_sum, v_amax
+        return _k_sum_v_amax_impl(k, v, None, enable_pdl, mod, zero_init=True)
 
     @staticmethod
     def _q_grouped_amax(q, rank, world_size, enable_pdl, mod):
-        batch, local_sequence, num_heads, _ = q.shape
-        amax = torch.zeros(
-            (batch, num_heads, slots(local_sequence, Q_GROUP_SM90)),
-            dtype=torch.float32,
-            device=q.device,
-        )
-        mod.ulysses_lowp_q_grouped_amax(q, amax, rank, world_size, enable_pdl)
-        return amax
+        return _q_grouped_amax_impl(q, rank, world_size, Q_GROUP_SM90, enable_pdl, mod)
 
     @staticmethod
     def _k_boundary_minmax(k, rank, world_size, used_sequence):
@@ -2774,16 +2786,15 @@ class UlyssesLowpSageLayoutSM90(UlyssesLowpSageLayout):
         batch, local_sequence, num_heads, head_dim = k.shape
         global_sequence = local_sequence * world_size
         _validate_live_length("used_sequence", used_sequence, global_sequence)
-        amax = torch.zeros(
-            (batch, num_heads, slots(local_sequence, K_GROUP_SM90)),
-            dtype=torch.float32,
-            device=k.device,
-        )
-        mod.ulysses_lowp_k_grouped_amax(
-            k, k_mean_global, amax, rank, world_size, enable_pdl
-        )
-        return _repair_k_tail_amax(
-            amax, k, k_mean_global, rank, world_size, used_sequence, K_GROUP_SM90
+        return _k_grouped_amax_impl(
+            k,
+            k_mean_global,
+            rank,
+            world_size,
+            used_sequence,
+            K_GROUP_SM90,
+            enable_pdl,
+            mod,
         )
 
     def _derive_k_boundary_amax(

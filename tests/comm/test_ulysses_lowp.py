@@ -16,7 +16,7 @@ Four layers:
 import pytest
 import torch
 
-import flashinfer.comm.ulysses_lowp as lowp
+import flashinfer.comm._ulysses_lowp as lowp
 
 requires_sm120 = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability(0) != (12, 0),

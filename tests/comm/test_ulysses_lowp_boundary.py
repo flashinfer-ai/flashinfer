@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-import flashinfer.comm.ulysses_lowp as lowp
+import flashinfer.comm._ulysses_lowp as lowp
 
 LAYOUTS = [lowp.UlyssesLowpSageLayout, lowp.UlyssesLowpSageLayoutSM90]
 LENGTHS = [1, 15, 16, 17, 63, 64, 65, 127, 128, 129, 160, 192, 256]

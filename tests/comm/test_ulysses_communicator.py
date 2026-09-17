@@ -482,7 +482,8 @@ def _worker_main(rank, world_size, port, body_name, arg, allow_skip, q):
     non-NVLink machines); fake-topology and fault-injection tests must FAIL
     on it — a regressed resolver rejecting a fake full mesh is a bug, not a
     hardware limitation. Runtime init/JIT/IPC failures always FAIL."""
-    body = globals()[body_name]
+    # Other Ulysses tests reuse the runner with a top-level, spawn-safe callable.
+    body = body_name if callable(body_name) else globals()[body_name]
     outcome = None
     try:
         group = _init_pg(

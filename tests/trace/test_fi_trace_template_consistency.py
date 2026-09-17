@@ -301,6 +301,17 @@ def _make_sample_kwargs(template: TraceTemplate, axis_size: int = 4) -> Dict[str
     for p, parts in tuple_parts.items():
         kwargs[p] = tuple(parts)
 
+    if template.name_prefix and template.name_prefix.startswith("ulysses_scatter_qkv_"):
+        # The real workspace is collectively prepared. Schema-only tests read
+        # its metadata without allocating GPU storage or initializing a group.
+        q = torch.empty(1, 65, 8, 64, dtype=torch.bfloat16)
+        kwargs.update(
+            q=q,
+            k=q,
+            v=q,
+            workspace=SimpleNamespace(world_size=8, used_sequence=513),
+        )
+
     return kwargs
 
 

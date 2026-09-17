@@ -381,6 +381,58 @@ Preallocated outputs and NCCL staging can be reused across serialized calls::
 
     .. automethod:: __init__
 
+Prepared Low-Precision QKV Exchange
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The public Lowp interface is :class:`UlyssesCommunicator` together with
+:class:`UlyssesQKVWorkspace` and :class:`UlyssesQKV`. Statistics, quantization
+and payload primitives are private implementation details. See the
+:download:`design document <../design_docs/ulysses_lowp.md>` for the numerical
+contract and kernel-level validation.
+
+``prepare_qkv`` is a collective preparation method; all ranks call it in the
+same order before attention. It allocates a dedicated mixed-dtype workspace
+from the local QKV shape. Ordinary ``create_workspace`` remains rank-local.
+``scatter_qkv`` currently supports the SageAttention2 encoding only::
+
+    with UlyssesCommunicator(group, max_elems=q.numel(), dtype=q.dtype,
+                             device=q.device, backend="auto") as comm:
+        workspace = comm.prepare_qkv(q.shape, used_sequence=used)
+        encoded = comm.scatter_qkv(q, k, v, workspace=workspace)
+        # A framework adapter calls Sage with encoded.q/k/v and the scales.
+        # It returns [B, P*L, H/P, D], in encoded.input_dtype, with a zero tail.
+        output = comm.gather_heads(sage_adapter(encoded))
+        # After the previous attention has consumed the buffers:
+        encoded = comm.scatter_qkv(q_next, k_next, v_next,
+                                   workspace=workspace, out=encoded)
+
+The result contains INT8 Q/K, FP8 E4M3 V, three FP32 scales, the Sage layout,
+logical and used sequence lengths, and the original input dtype. It accepts
+FP16/BF16 inputs on homogeneous SM90 or SM120 groups, D=64/128, and P=2/4/8.
+The last input dimension is dense and each row must be 16-byte aligned;
+projection views need not be fully contiguous. The input padding after the
+used global prefix must already be zero.
+
+Statistics and byte payload exchange always use NCCL on the communicator's
+group. ``comm.backend`` continues to describe the ordinary scatter/gather
+backend, which can remain NVLink; ``workspace.transport`` reports the QKV
+transport. Preparation checks NCCL capability even for an NVLink communicator.
+``max_elems`` bounds each logical Q/K/V operand; the combined byte payload and
+statistics are sized independently, so it is not a total memory budget.
+
+``out=None`` returns independent storage. ``out=`` requires matching tensor
+geometry and metadata, including the exact used length and original dtype.
+Output fields must not overlap one another, inputs or workspace scratch.
+A workspace belongs to its creating communicator and cannot be used after
+that communicator closes. Calls are serialized on the current CUDA stream.
+Prepared QKV workspaces and ordinary staging workspaces are not interchangeable.
+
+.. autoclass:: UlyssesQKV
+    :members:
+
+.. autoclass:: UlyssesQKVWorkspace
+    :members:
+
 Head-Chunk Layout and Transport Primitives
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -458,84 +510,6 @@ verified all-pairs NVLink P2P and owns the IPC workspace lifecycle.
     init_ulysses_a2a
     dispose_ulysses_a2a
     ulysses_a2a
-
-Low-Precision Ulysses Payloads
-------------------------------------
-
-.. currentmodule:: flashinfer.comm
-
-These primitives quantize BF16/FP16 Q/K/V before a caller-owned all-to-all.
-Q/K use INT8 and V uses FP8 E4M3 internally. The caller owns the statistics
-AllGather, payload all-to-all, attention backend and output communication.
-Use ``UlyssesLowpSageLayoutSM90`` on Hopper and ``UlyssesLowpSageLayout`` on
-SM89/SM120. Both accept head dimensions 64 and 128. See the
-:download:`design document <../design_docs/ulysses_lowp.md>` for the global-grid
-contract and the complete execution sequence.
-
-.. autosummary::
-    :toctree: ../generated
-
-    UlyssesLowpSageLayout
-    UlyssesLowpSageLayoutSM90
-    StatsContext
-    V2GStats
-    ulysses_lowp_capability
-    ulysses_lowp_payload_spec
-    ulysses_lowp_k_sum_v_amax
-    ulysses_lowp_q_grouped_amax
-    ulysses_lowp_k_grouped_amax
-    ulysses_lowp_boundary_descriptors
-    ulysses_lowp_merge_boundary_amax
-    ulysses_lowp_k_boundary_minmax
-    ulysses_lowp_derive_k_boundary_amax
-    ulysses_lowp_zero_scale_and_padding
-    ulysses_lowp_quant_q_into_payload
-    ulysses_lowp_quant_kv_into_payload
-    ulysses_lowp_quant_qkv_pack
-    ulysses_lowp_unpack_for_sage
-    ulysses_lowp_local_stats
-    ulysses_lowp_finalize_stats
-    ulysses_lowp_quant_and_pack
-    ulysses_lowp_verify_duplicate_scale_slots
-    ulysses_lowp_quant_v_fp8_with_scale
-
-Geometry helpers also remain available through the ``ulysses_lowp_`` prefix:
-``stats_protocol_for`` selects the boundary protocol, ``required_alignment``
-returns the global padding multiple, ``aligned_length`` rounds up the live
-sequence, and ``scale_widths`` computes consumer Q/K scale counts. On Hopper,
-use the corresponding SM90 layout methods so these calculations use its grid.
-
-Module-level primitives
-~~~~~~~~~~~~~~~~~~~~~~~
-
-Module-level tensor operations use the SM89/SM120 grid. On Hopper, call the
-corresponding SM90 layout methods. Inputs are CUDA BF16/FP16 tensors with a
-dense last dimension and 16-byte-aligned rows; outputs are contiguous.
-
-.. currentmodule:: flashinfer.comm.ulysses_lowp
-
-.. autosummary::
-    :toctree: ../generated
-
-    capability
-    payload_spec
-    k_sum_v_amax
-    q_grouped_amax
-    k_grouped_amax
-    boundary_descriptors
-    merge_boundary_amax
-    k_boundary_minmax
-    derive_k_boundary_amax
-    zero_scale_and_padding
-    quant_q_into_payload
-    quant_kv_into_payload
-    quant_qkv_pack
-    unpack_for_sage
-    local_stats
-    finalize_stats
-    quant_and_pack
-    verify_duplicate_scale_slots
-    quant_v_fp8_with_scale
 
 MNNVL (Multi-Node NVLink)
 -------------------------

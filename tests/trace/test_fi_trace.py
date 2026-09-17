@@ -1455,7 +1455,7 @@ def test_ulysses_lowp_trace_json_init_is_self_contained(head_dim, op):
     tensor = inputs["q" if op == "q_grouped_amax" else "k"]
     assert tensor.shape == (1, 65, 8, head_dim)
     assert tensor.dtype == torch.bfloat16
-    from flashinfer.comm import ulysses_lowp as lowp
+    from flashinfer.comm import _ulysses_lowp as lowp
 
     regenerated = getattr(lowp, op).fi_trace(**inputs)
     assert regenerated["init"] == definition["init"]
@@ -1463,7 +1463,7 @@ def test_ulysses_lowp_trace_json_init_is_self_contained(head_dim, op):
 
 @pytest.mark.parametrize("head_dim", [64, 128])
 def test_ulysses_lowp_trace_head_dim(head_dim):
-    from flashinfer.comm import ulysses_lowp as lowp
+    from flashinfer.comm import _ulysses_lowp as lowp
 
     q = torch.empty(1, 65, 8, head_dim, dtype=torch.bfloat16)
     mean = torch.empty(1, 8, head_dim, dtype=q.dtype)
@@ -1502,6 +1502,8 @@ def test_ulysses_lowp_trace_head_dim(head_dim):
     )
     for fn, kwargs in calls:
         definition = fn.fi_trace(**kwargs)
-        _check_defn(definition, "comm", fn.__name__)
+        _check_defn(definition, "comm", f"flashinfer.comm._ulysses_lowp.{fn.__name__}")
         assert definition["axes"]["head_dim"]["value"] == head_dim
         assert f"_d{head_dim}" in definition["name"]
+        path = Path(__file__).parent / "fi_trace_out" / f"{definition['name']}.json"
+        assert json.loads(path.read_text()) == definition

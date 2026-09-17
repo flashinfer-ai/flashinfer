@@ -364,7 +364,7 @@ pcie_ipc_all_reduce_trace = TraceTemplate(
 )
 
 
-# ── Low-precision Ulysses A2A (flashinfer.comm.ulysses_lowp) ─────────────────
+# ── Low-precision Ulysses A2A (flashinfer.comm._ulysses_lowp) ────────────────
 #
 # Quantization primitives around the sequence->head all-to-all of Ulysses
 # attention: INT8 Q/K on SageAttention2's global 32/64-token grids, FP8 V per
@@ -415,7 +415,7 @@ def _ulysses_lowp_k_sum_v_amax_init(
     device: str = "cuda",
     seed: int = 0,
 ):
-    """Build inputs for ``flashinfer.comm.ulysses_lowp.k_sum_v_amax`` (one
+    """Build inputs for ``flashinfer.comm._ulysses_lowp.k_sum_v_amax`` (one
     MiniMax-H3 Ulysses shard at P=8)."""
     torch.manual_seed(seed)
     k = torch.randn(
@@ -752,4 +752,146 @@ ulysses_lowp_unpack_for_sage_trace = TraceTemplate(
         # chunk_bytes = round_up(3*B*L*local_heads*D + 4*B*local_heads*(slots(L,32)+slots(L,64)), 128)
     ],
     tags=["stage:comm"],
+)
+
+
+class _UlyssesQKVTraceTemplate(TraceTemplate):
+    """Read prepared QKV metadata without preparing or running collectives."""
+
+    def build_fi_trace_fn(self, fi_api):
+        build_definition = super().build_fi_trace_fn(fi_api)
+
+        def fi_trace(save_dir=None, name=None, **kwargs):
+            kwargs = dict(kwargs)
+            workspace = kwargs.get("workspace")
+            if workspace is None:
+                raise ValueError(
+                    "scatter_qkv tracing requires prepared workspace metadata"
+                )
+            kwargs["world_size"] = workspace.world_size
+            kwargs["used_sequence"] = workspace.used_sequence
+            return build_definition(save_dir=save_dir, name=name, **kwargs)
+
+        return fi_trace
+
+
+def _make_ulysses_scatter_qkv_trace(layout):
+    sm90 = layout == "sage2_sm90"
+    q_tile, k_group, v_alignment = (64, 128, 128) if sm90 else (128, 64, 64)
+    return _UlyssesQKVTraceTemplate(
+        op_type="comm",
+        name_prefix=f"ulysses_scatter_qkv_{layout}",
+        description=(
+            "Distributed SageAttention2 QKV preparation: local statistics, one "
+            "FP32 NCCL AllGather, rank-ordered statistics finalization, quantize/pack, "
+            "one uint8 NCCL AllToAll, and unpack. Requires an existing communicator "
+            "and prepare_qkv workspace on every rank, in the same collective order. "
+            "This schema describes a distributed operation; it has no single-GPU "
+            "reference or automatic process-group/workspace initializer. Returned "
+            "UlyssesQKV fields are listed in tuple order; when out is supplied, its "
+            "six tensors are filled and the same result record is returned. Input "
+            "rows outside the global used_sequence prefix must already be zero."
+        ),
+        axes={
+            "batch": Var(),
+            "local_sequence": Var(),
+            "logical_sequence": Var(),
+            "padded_sequence": Var(),
+            "local_heads": Var(),
+            "q_scale_width": Var(),
+            "k_scale_width": Var(),
+            "num_heads": Const(abbrev="h"),
+            "head_dim": Const(abbrev="d"),
+            "world_size": Const(abbrev="p"),
+            # Identical tensor shapes can carry different valid prefixes.
+            "used_sequence": Const(abbrev="u"),
+        },
+        inputs={
+            "q": Tensor(["batch", "local_sequence", "num_heads", "head_dim"]),
+            "k": Tensor(["batch", "local_sequence", "num_heads", "head_dim"]),
+            "v": Tensor(["batch", "local_sequence", "num_heads", "head_dim"]),
+            "world_size": Scalar(
+                "int32",
+                optional=True,
+                description="Prepared workspace metadata, not a scatter_qkv argument.",
+            ),
+            "used_sequence": Scalar(
+                "int32",
+                optional=True,
+                description="Prepared global live prefix, not a scatter_qkv argument.",
+            ),
+        },
+        outputs={
+            "q": Tensor(
+                ["batch", "logical_sequence", "local_heads", "head_dim"],
+                dtype="int8",
+            ),
+            "k": Tensor(
+                ["batch", "logical_sequence", "local_heads", "head_dim"],
+                dtype="int8",
+            ),
+            "v": Tensor(
+                ["batch", "head_dim", "local_heads", "padded_sequence"],
+                dtype="float8_e4m3fn",
+                description=f"SageAttention2 packed V layout: {layout}.",
+            ),
+            "q_scale": Tensor(
+                ["batch", "local_heads", "q_scale_width"], dtype="float32"
+            ),
+            "k_scale": Tensor(
+                ["batch", "local_heads", "k_scale_width"], dtype="float32"
+            ),
+            "v_scale": Tensor(["batch", "local_heads", "head_dim"], dtype="float32"),
+            "layout": Scalar("string", description=f"Always {layout!r}."),
+            "logical_sequence": Scalar(
+                "int32", description="world_size * local_sequence."
+            ),
+            "used_sequence": Scalar(
+                "int32", description="Prepared global live prefix."
+            ),
+            "input_dtype": Scalar("dtype", description="Original Q/K/V dtype."),
+        },
+        constraints=[
+            "batch > 0",
+            "local_sequence > 0",
+            "num_heads > 0",
+            "head_dim in [64, 128]",
+            "world_size in [2, 4, 8]",
+            "num_heads % world_size == 0",
+            "local_heads == num_heads // world_size",
+            "logical_sequence == world_size * local_sequence",
+            "0 < used_sequence <= logical_sequence",
+            f"padded_sequence == (logical_sequence + {v_alignment - 1}) // {v_alignment} * {v_alignment}",
+            f"q_scale_width == (used_sequence + {q_tile - 1}) // {q_tile} * 4",
+            f"k_scale_width == (used_sequence + {k_group - 1}) // {k_group}",
+        ],
+        tags=[
+            "stage:comm",
+            "distributed:multi-rank",
+            "transport:nccl",
+            "quantization:sage2",
+            f"layout:{layout}",
+        ],
+    )
+
+
+ulysses_scatter_qkv_sm90_trace = _make_ulysses_scatter_qkv_trace("sage2_sm90")
+ulysses_scatter_qkv_sm120_trace = _make_ulysses_scatter_qkv_trace("sage2_sm89_sm120")
+
+
+def ulysses_scatter_qkv_trace_dispatch(save_dir=None, name=None, **kwargs):
+    """Select by prepared layout; never inspect a GPU or create a process group."""
+    workspace = kwargs.get("workspace")
+    if workspace is None:
+        raise ValueError("scatter_qkv tracing requires prepared workspace metadata")
+    if workspace.layout == "sage2_sm90":
+        return ulysses_scatter_qkv_sm90_trace
+    if workspace.layout == "sage2_sm89_sm120":
+        return ulysses_scatter_qkv_sm120_trace
+    raise ValueError(f"Unsupported Ulysses QKV trace layout: {workspace.layout!r}")
+
+
+ulysses_scatter_qkv_trace_dispatch.templates = (  # type: ignore[attr-defined]
+    ulysses_scatter_qkv_sm90_trace,
+    ulysses_scatter_qkv_sm120_trace,
 )

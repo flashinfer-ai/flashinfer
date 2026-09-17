@@ -3,7 +3,7 @@
   "description": "Per-32-token-group |Q| amax on the GLOBAL sequence grid for this rank's shard (SageAttention2 per-warp Q scale); slot s is global group group_first(rank)+s.",
   "op_type": "comm",
   "tags": [
-    "fi_api:flashinfer.comm.ulysses_lowp.q_grouped_amax",
+    "fi_api:flashinfer.comm._ulysses_lowp.q_grouped_amax",
     "status:verified",
     "stage:comm"
   ],

@@ -3,7 +3,7 @@
   "description": "Per-64-token-group |K - k_mean| amax on the GLOBAL sequence grid for this rank's shard (SageAttention2 smooth-K per-block scale). ``used_sequence`` repairs the one group that mixes live and zero-padded rows.",
   "op_type": "comm",
   "tags": [
-    "fi_api:flashinfer.comm.ulysses_lowp.k_grouped_amax",
+    "fi_api:flashinfer.comm._ulysses_lowp.k_grouped_amax",
     "status:verified",
     "stage:comm"
   ],

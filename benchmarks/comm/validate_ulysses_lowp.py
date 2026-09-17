@@ -1,6 +1,8 @@
 """User-run collective and Sage acceptance gate on either SM90 or SM120.
 
 torchrun --standalone --nproc-per-node=4 benchmarks/comm/validate_ulysses_lowp.py --output result.json
+Add --compare-communicator to check the prepared QKV API byte-for-byte against
+the original collective chain and run Sage acceptance on its returned tensors.
 Requires this source checkout's tests and pytest; does not modify Sage/SGLang.
 """
 
@@ -16,7 +18,7 @@ import torch
 import torch.distributed as dist
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-import flashinfer.comm.ulysses_lowp as lowp
+import flashinfer.comm._ulysses_lowp as lowp
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tests" / "comm"))
 from test_ulysses_lowp_boundary import check_receiver, inputs  # noqa: E402
@@ -50,6 +52,47 @@ def mean_metrics(value, reference):
     )
 
 
+def compare_communicator(shard, used, reference, payload, recv):
+    from flashinfer.comm import UlyssesCommunicator
+
+    with UlyssesCommunicator(
+        dist.group.WORLD,
+        max_elems=shard[0].numel(),
+        dtype=shard[0].dtype,
+        backend="nccl",
+        device=shard[0].device,
+    ) as comm:
+        workspace = comm.prepare_qkv(shard[0].shape, used_sequence=used)
+        result = comm.scatter_qkv(*shard, workspace=workspace)
+        names = ("q", "k", "v", "q_scale", "k_scale", "v_scale")
+        checks = {}
+        for name, actual, expected in zip(names, result[:6], reference, strict=True):
+            checks[name] = (
+                actual.shape == expected.shape
+                and actual.dtype == expected.dtype
+                and actual.is_contiguous()
+                and torch.equal(
+                    actual.view(torch.uint8), expected.contiguous().view(torch.uint8)
+                )
+            )
+        checks["send_payload"] = torch.equal(workspace._send_buffer, payload)
+        checks["received_payload"] = torch.equal(workspace._recv_buffer, recv)
+        assert all(checks.values()), f"communicator byte mismatch: {checks}"
+        assert result.used_sequence == used
+        assert result.logical_sequence == shard[0].shape[1] * dist.get_world_size()
+        assert result.input_dtype == shard[0].dtype
+        report = dict(
+            byte_checks=checks,
+            layout=result.layout,
+            used_sequence=result.used_sequence,
+            logical_sequence=result.logical_sequence,
+            transport=workspace.transport,
+            backend=comm.backend,
+        )
+    # Consuming these outputs after close also exercises their independent storage.
+    return result, report
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--head-dim", type=int, choices=(64, 128), default=128)
@@ -59,10 +102,11 @@ def main():
     parser.add_argument("--batch", type=int, default=1)
     parser.add_argument("--dtype", choices=["bfloat16", "float16"], default="bfloat16")
     parser.add_argument("--zero-v", action="store_true")
+    parser.add_argument("--compare-communicator", action="store_true")
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
     repo = Path(__file__).resolve().parents[2]
-    if Path(lowp.__file__).resolve() != repo / "flashinfer/comm/ulysses_lowp.py":
+    if Path(lowp.__file__).resolve() != repo / "flashinfer/comm/_ulysses_lowp.py":
         raise RuntimeError(f"FlashInfer import is not this checkout: {lowp.__file__}")
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     dist.init_process_group("nccl", timeout=timedelta(minutes=5))
@@ -124,6 +168,13 @@ def main():
             ),
         )
         heads = slice(rank * (args.heads // world), (rank + 1) * (args.heads // world))
+        vs = stats.v_scale_global[:, heads].contiguous()
+        communicator_report = None
+        if args.compare_communicator:
+            encoded, communicator_report = compare_communicator(
+                shard, used, (qi, ki, vp, qs, ks, vs), payload, recv
+            )
+            qi, ki, vp, qs, ks, vs = encoded[:6]
         q0, k0, v0 = (x[:, :used, heads].contiguous() for x in (q, k, v))
         with sdpa_kernel(SDPBackend.MATH):
             ref = torch.nn.functional.scaled_dot_product_attention(
@@ -148,7 +199,6 @@ def main():
             extension_file = _qattn_sm89.__file__
             stock = core.sageattn_qk_int8_pv_fp8_cuda
             accum = "fp32+fp16"
-        vs = stats.v_scale_global[:, heads].contiguous()
         sentinel = torch.full(
             (args.batch, total + 1, args.heads // world, args.head_dim),
             17,
@@ -223,6 +273,7 @@ def main():
             payload_bytes=payload.numel(),
             payload_dtype=str(payload.dtype),
             protocol=ctx.stats_protocol,
+            communicator=communicator_report,
         )
         rows = [None] * world
         dist.all_gather_object(rows, row)

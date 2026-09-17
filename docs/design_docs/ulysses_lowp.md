@@ -1,11 +1,73 @@
 # Low-precision Ulysses on the global quantization grid
 
 This implementation provides INT8 Q/K and FP8 E4M3 V payload operations.
-Attention and collectives belong to the caller. All legal shards use
-BOUNDARY_MERGE, including shards whose length is divisible by 128.
+The prepared communicator API owns the statistics and payload collectives;
+attention belongs to the caller. The underlying primitives are private implementation details used by
+independent numerical tests, trace definitions and kernel benchmarks.
+All legal shards use BOUNDARY_MERGE, including shards whose length is divisible by 128.
 Fused amax/pack and aligned-only receiver implementations are deferred.
 
-## Layout and capability
+## Prepared communicator API
+
+Use the existing `UlyssesCommunicator` with two additional methods:
+
+```python
+with UlyssesCommunicator(group, max_elems=q.numel(), dtype=q.dtype,
+                         device=q.device, backend="auto") as comm:
+    workspace = comm.prepare_qkv(q.shape, used_sequence=U)
+    encoded = comm.scatter_qkv(q, k, v, workspace=workspace)
+    # The framework calls the appropriate Sage2 kernel with encoded fields.
+    # Its full [B,P*L,H/P,D] output uses encoded.input_dtype and a zero tail.
+    local_output = comm.gather_heads(sage_adapter(encoded))
+```
+
+`prepare_qkv` is collective, with three joint phases: configuration validation,
+layout/JIT admission, and allocation. Recoverable preparation failures publish
+no workspace and leave the existing communicator usable. Missing rank calls,
+invalid hot-path inputs and unrecoverable CUDA/process-group failures cannot
+be recovered this way. Ordinary `create_workspace` remains local.
+
+The dedicated `UlyssesQKVWorkspace` fixes owner, shape, P, dtype, layout and U.
+It reuses the statistics receive buffer and mixed-dtype payload storage;
+existing local statistics may still allocate temporaries. Capacity is derived
+internally from the selected layout. Each logical Q/K/V must fit `max_elems`,
+but that floating operand capacity does not limit the joint payload bytes or
+represent the total workspace memory.
+
+`UlyssesQKV` is a named tuple with six tensor fields (`q`, `k`, `v`, `q_scale`,
+`k_scale`, `v_scale`) and `layout`, `logical_sequence`, `used_sequence`,
+`input_dtype`. `out=None` owns independent result storage; subsequent calls can
+reuse it with `out=encoded`. All output metadata must match exactly, even when
+different U values have identical scale widths. V scale is copied into a
+contiguous result so its lifetime does not depend on statistical scratch.
+
+The prepared path accepts FP16/BF16, D64/D128, and P2/4/8 on homogeneous SM90
+or SM120 groups. It preserves the primitive stride and input-padding contract.
+Statistics AllGather and packed uint8 AllToAll use NCCL on the existing group;
+`workspace.transport` exposes that choice. `comm.backend` still selects
+ordinary scatter/gather, including NVLink output communication. No additional
+backend configuration, public byte transport or constructor argument is added.
+All operations are serialized on the current stream. There is no ordinary
+floating `scatter_qkv` mode, automatic workspace cache or Sage package dependency.
+
+Validation is owned by the public entry point. The prepared communicator checks
+the actual Q/K/V, workspace buffers and reused outputs on every call, including
+storage overlap; tensor identity alone is insufficient because `resize_` and
+`set_` can change an existing tensor's metadata or storage. Its execution uses
+private stage implementations shared with the standalone primitives, avoiding
+repeated public-wrapper validation. The internal standalone entry points retain their
+own checks for independent tests and benchmarks. Private stages are not an unchecked public API and must only receive
+validated inputs and internally produced statistics. Fixed payload geometry,
+loaded kernel modules and PDL selection belong to preparation.
+
+The numerical implementation lives in the private `_ulysses_lowp.py` module.
+Frameworks use `UlyssesCommunicator`; layout classes, statistics records and
+primitive functions are not re-exported by `flashinfer.comm`. Tests and
+benchmarks import the internal module explicitly. Trace definitions use its
+private Python path, while custom-op/JIT names and CUDA entry points retain
+their original names. The former `flashinfer.comm.ulysses_lowp` module is removed.
+
+## Internal layout and capability
 
 | Device | Layout | Q group | K group | V storage alignment |
 |---|---|---:|---:|---:|
@@ -46,8 +108,11 @@ in one implementation. Python K boundary min/max, centered boundary merging
 and live-tail repair also share helpers parameterized by the K group.
 Consumers should use `layout.scale_widths(U)` instead of copying its formula.
 
+The following developer example shows the internal primitive sequence used for
+independent validation; applications should use the communicator example above.
+
 ```python
-import flashinfer.comm.ulysses_lowp as lowp
+import flashinfer.comm._ulysses_lowp as lowp
 
 cap = lowp.capability("cuda")
 if not cap["supported"]:
@@ -150,6 +215,9 @@ supported; outputs must have exact shape, dtype, device and contiguous storage.
 - Existing primitive tests: tests/comm/test_ulysses_lowp.py.
 - Independent boundary and per-layout tests: tests/comm/test_ulysses_lowp_boundary.py.
 - Benchmark: benchmarks/comm/bench_ulysses_lowp.py; rank-local timing excludes network.
+- Prepared API benchmark: benchmarks/comm/bench_ulysses_qkv.py under torchrun;
+  compares reusable standalone and communicator buffers with real collectives.
+  Reports synchronized wall time and CUDA event spans, including CPU launch gaps.
 - Distributed acceptance: benchmarks/comm/validate_ulysses_lowp.py under torchrun.
 
 CPU structural tests do not certify CUDA behavior. Run GPU acceptance on

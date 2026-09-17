@@ -20,10 +20,12 @@ limitations under the License.
 
 import contextlib
 import ctypes
+import dataclasses
 import functools
+import math
 import re
 from types import SimpleNamespace
-from typing import Any, List, Optional, Tuple, Union
+from typing import Any, List, NamedTuple, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -31,6 +33,7 @@ from torch.distributed import ProcessGroup
 
 from ..api_logging import flashinfer_api
 from ..jit.comm import gen_ulysses_a2a_module
+from ..trace.templates.comm import ulysses_scatter_qkv_trace_dispatch
 from ..utils import register_custom_op
 from .ulysses_topology import (
     SUPPORTED_WORLD_SIZES,
@@ -60,6 +63,21 @@ def _storage_ranges_overlap(left: torch.Tensor, right: torch.Tensor) -> bool:
         return tensor.data_ptr() + (max_element_offset + 1) * tensor.element_size()
 
     return left.data_ptr() < storage_end(right) and right.data_ptr() < storage_end(left)
+
+
+def _qkv_byte_range(tensor: torch.Tensor) -> Tuple[int, int]:
+    """Byte extent of a validated tensor on the QKV communicator's device."""
+    numel = tensor.numel()
+    if numel == 0:
+        return (0, 0)
+    start = tensor.data_ptr()
+    if tensor.is_contiguous():
+        return start, start + numel * tensor.element_size()
+    max_element_offset = sum(
+        (size - 1) * stride
+        for size, stride in zip(tensor.shape, tensor.stride(), strict=True)
+    )
+    return start, start + (max_element_offset + 1) * tensor.element_size()
 
 
 class UlyssesWorkspace:
@@ -137,6 +155,143 @@ class UlyssesWorkspace:
         return self._recv_buffer
 
 
+class UlyssesQKV(NamedTuple):
+    """Pre-quantized SageAttention2 operands returned by ``scatter_qkv``.
+
+    ``q`` and ``k`` are contiguous INT8 ``[B, S, H/P, D]`` tensors. ``v``
+    is FP8 E4M3 ``[B, D, H/P, S_pad]`` in the consumer's permuted layout.
+    Q/K scales are FP32 ``[B, H/P, width]``; V scales are FP32
+    ``[B, H/P, D]``. Scale widths use ``used_sequence``, whereas Q/K/V
+    storage covers ``logical_sequence``. ``layout`` identifies the Sage
+    consumer: ``"sage2_sm90"`` or ``"sage2_sm89_sm120"``.
+
+    The record is immutable, but its six tensors may be overwritten by an
+    explicit ``out=`` call. Attention and its softmax scale remain the
+    caller's responsibility; ``input_dtype`` is the floating output dtype.
+    """
+
+    q: torch.Tensor
+    k: torch.Tensor
+    v: torch.Tensor
+    q_scale: torch.Tensor
+    k_scale: torch.Tensor
+    v_scale: torch.Tensor
+    layout: str
+    logical_sequence: int
+    used_sequence: int
+    input_dtype: torch.dtype
+
+
+@dataclasses.dataclass(frozen=True, init=False, repr=False, eq=False)
+class UlyssesQKVWorkspace:
+    """Prepared Lowp geometry and reusable communication storage.
+
+    Created collectively by :meth:`UlyssesCommunicator.prepare_qkv`; direct
+    construction is not supported. Metadata is read-only. The workspace is
+    bound to its owner communicator and cannot be used after that owner is
+    closed, on another communicator, or concurrently across streams.
+
+    ``qkv_shape``, ``world_size``, ``dtype``, ``device``, ``used_sequence``,
+    ``quantization`` and ``layout`` describe the prepared operation.
+    ``transport`` is always ``"nccl"``, independently of the ordinary
+    scatter/gather backend. Storage follows PyTorch tensor lifetimes and
+    owns neither an extra process group nor a separate close protocol.
+    """
+
+    qkv_shape: Tuple[int, int, int, int]
+    world_size: int
+    dtype: torch.dtype
+    device: torch.device
+    used_sequence: int
+    quantization: str
+    layout: str
+    transport: str
+    _owner: "UlyssesCommunicator"
+    _layout_impl: Any
+    _module: Any
+    _enable_pdl: bool
+    _q_scale_offset: int
+    _wire_shape: Tuple[int, int]
+    _stats_numel: int
+    _output_specs: Tuple[Tuple[Tuple[int, ...], torch.dtype], ...]
+    _send_buffer: torch.Tensor
+    _recv_buffer: torch.Tensor
+    _stats_gather: torch.Tensor
+
+    def __init__(self):
+        raise TypeError("use UlyssesCommunicator.prepare_qkv() to create a workspace")
+
+    @property
+    def logical_sequence(self) -> int:
+        """Full sequence length, including any zero-padded suffix."""
+        return self.qkv_shape[1] * self.world_size
+
+    @classmethod
+    def _allocate(cls, owner, qkv_shape, used_sequence, layout, layout_impl):
+        from . import _ulysses_lowp as lowp
+
+        batch, local_sequence, heads, head_dim = qkv_shape
+        world = owner.world_size
+        local_heads = heads // world
+        spec = layout_impl.payload_spec(
+            batch_size=batch,
+            local_sequence=local_sequence,
+            num_heads=heads,
+            world_size=world,
+        )
+        q_width, k_width = layout_impl.scale_widths(used_sequence)
+        wire_shape = (world, int(spec["chunk_bytes"]))
+        sequence = world * local_sequence
+        # K sum + V amax + two Q descriptors + two raw-K min/max slices.
+        stats_numel = batch * heads * (6 * head_dim + 2)
+        q_shape = (batch, sequence, local_heads, head_dim)
+        output_specs = (
+            (q_shape, torch.int8),
+            (q_shape, torch.int8),
+            (
+                (batch, head_dim, local_heads, int(spec["padded_sequence"])),
+                torch.float8_e4m3fn,
+            ),
+            ((batch, local_heads, q_width), torch.float32),
+            ((batch, local_heads, k_width), torch.float32),
+            ((batch, local_heads, head_dim), torch.float32),
+        )
+        workspace = object.__new__(cls)
+        values = dict(
+            qkv_shape=qkv_shape,
+            world_size=world,
+            dtype=owner.dtype,
+            device=owner.device,
+            used_sequence=used_sequence,
+            quantization="sage2",
+            layout=layout,
+            transport="nccl",
+            _owner=owner,
+            _layout_impl=layout_impl,
+            _q_scale_offset=int(spec["q_scale_offset"]),
+            _wire_shape=wire_shape,
+            _stats_numel=stats_numel,
+            _output_specs=output_specs,
+        )
+        with torch.cuda.device(owner.device):
+            values["_module"] = (
+                lowp.get_ulysses_lowp_sm90_module()
+                if layout == "sage2_sm90"
+                else lowp.get_ulysses_lowp_module()
+            )
+            values["_enable_pdl"] = bool(lowp.device_support_pdl(owner.device))
+            values["_send_buffer"] = torch.empty(
+                wire_shape, dtype=torch.uint8, device=owner.device
+            )
+            values["_recv_buffer"] = torch.empty_like(values["_send_buffer"])
+            values["_stats_gather"] = torch.empty(
+                world * stats_numel, dtype=torch.float32, device=owner.device
+            )
+        for name, value in values.items():
+            object.__setattr__(workspace, name, value)
+        return workspace
+
+
 class UlyssesCommunicator:
     r"""Ulysses context-parallelism all-to-all communicator.
 
@@ -154,7 +309,12 @@ class UlyssesCommunicator:
     ``S_global = S_local * world_size``. Both backends produce bit-identical
     results.
 
-    Backend selection happens in the constructor, strictly before any IPC
+    :meth:`prepare_qkv` and :meth:`scatter_qkv` additionally provide Sage2
+    INT8/FP8 QKV preparation and exchange. Those operations use NCCL on the
+    same group, independently of the ordinary layout-transform backend.
+
+    Backend selection for ordinary scatter/gather happens in the constructor,
+    strictly before any IPC
     allocation or JIT compilation (see
     :func:`~flashinfer.comm.resolve_ulysses_backend`):
 
@@ -207,11 +367,13 @@ class UlyssesCommunicator:
     group : torch.distributed.ProcessGroup, optional
         Process group of the Ulysses ranks. Defaults to ``dist.group.WORLD``.
     max_elems : int
-        Capacity: the largest element count of any single all-to-all operand
+        Capacity: the largest element count of an ordinary all-to-all operand
         (input and output have equal ``numel``, so this is ``B*S_local*H*D``
         for the largest call). Must be at most ``2**31 - 1`` (the kernel's
         int32 index range). Sizes the NVLink staging buffer once at
-        construction.
+        construction. For quantized QKV, each floating input must fit this
+        element count; ``prepare_qkv`` allocates its combined payload and
+        statistics separately. This is not a total memory or wire-byte budget.
     dtype : torch.dtype
         Element type of all operands (float16 / bfloat16 / float32); enforced
         on every call.
@@ -789,6 +951,388 @@ class UlyssesCommunicator:
         return UlyssesWorkspace(
             max_elems=max_elems, dtype=self.dtype, device=self.device
         )
+
+    @flashinfer_api
+    def prepare_qkv(
+        self,
+        qkv_shape: Sequence[int],
+        *,
+        quantization: str = "sage2",
+        used_sequence: Optional[int] = None,
+    ) -> UlyssesQKVWorkspace:
+        r"""Collectively prepare Sage2 QKV communication and reusable storage.
+
+        Every rank must call this method in the same order, outside CUDA
+        graph capture. Shape/configuration, layout/JIT availability, and
+        allocation outcomes are agreed in three separate stages. A
+        recoverable preparation failure releases only this call's storage;
+        it does not close the communicator or invalidate existing workspaces.
+        Missing participants and CUDA/process-group failures are not recoverable
+        through this protocol.
+
+        This method does not change ``backend``. Quantized QKV always uses
+        the group's CUDA NCCL backend, even when ordinary scatter/gather
+        uses NVLink. Supports homogeneous SM90 or SM120 groups of 2/4/8 ranks.
+
+        Parameters
+        ----------
+        qkv_shape : Sequence[int]
+            Common local ``[B, L, H, D]`` shape, with positive dimensions,
+            ``D`` equal to 64 or 128, and ``H`` divisible by the group size.
+            Each Q/K/V contains at most ``max_elems`` floating elements.
+            Combined byte payload and statistics are allocated separately.
+        quantization : str, default = "sage2"
+            QKV encoding policy. Only ``"sage2"`` is supported: grouped INT8
+            Q/K and channel-scaled FP8 E4M3 V, using the device's Sage2 layout.
+            The communicator dtype must be FP16 or BF16.
+        used_sequence : int, optional
+            Global live prefix length ``U`` in ``(0, world_size * L]``.
+            ``None`` uses the whole sequence. Callers must zero input rows
+            outside this prefix; this method does not initialize inputs.
+
+        Returns
+        -------
+        UlyssesQKVWorkspace
+            Owner-bound, read-only geometry with reusable send/receive and
+            statistics-gather buffers. Shape or live-length changes require
+            another collective preparation call.
+        """
+        # Validate inside the outcome envelope: a bad argument on one rank
+        # must not skip a collective that every other rank is entering.
+        outcome: Tuple[Any, ...]
+        try:
+            self._require_open("prepare_qkv")
+            if type(qkv_shape) not in (tuple, list, torch.Size):
+                raise TypeError(
+                    "qkv_shape must be a tuple/list/torch.Size of four ints"
+                )
+            shape = tuple(qkv_shape)
+            if len(shape) != 4 or any(type(n) is not int or n <= 0 for n in shape):
+                raise ValueError("qkv_shape must contain four positive integers")
+            batch, local_sequence, heads, head_dim = shape
+            if type(quantization) is not str or quantization != "sage2":
+                raise ValueError("quantization must be 'sage2'")
+            if self.dtype not in (torch.float16, torch.bfloat16):
+                raise ValueError(
+                    "Sage2 QKV requires a float16 or bfloat16 communicator"
+                )
+            if self.world_size not in (2, 4, 8):
+                raise ValueError("Sage2 QKV requires world_size in {2, 4, 8}")
+            if head_dim not in (64, 128) or heads % self.world_size:
+                raise ValueError(
+                    "Sage2 QKV requires D in {64, 128} and H % world_size == 0"
+                )
+            if math.prod(shape) > self.max_elems:
+                raise ValueError(
+                    "each Q/K/V must fit the communicator max_elems capacity"
+                )
+            used = (
+                self.world_size * local_sequence
+                if used_sequence is None
+                else used_sequence
+            )
+            if (
+                type(used) is not int
+                or not 0 < used <= self.world_size * local_sequence
+            ):
+                raise ValueError(
+                    "used_sequence must be an integer in (0, world_size * L]"
+                )
+            supported, observed = self._group_supports_cuda_alltoall()
+            if not supported:
+                raise ValueError(
+                    f"Sage2 QKV requires a CUDA NCCL process group, got {observed}"
+                )
+            outcome = (
+                "ok",
+                (
+                    shape,
+                    quantization,
+                    used,
+                    str(self.dtype),
+                    self.world_size,
+                    self.max_elems,
+                ),
+            )
+        except Exception as e:  # noqa: BLE001 — all ranks must vote before raising
+            outcome = (
+                "err",
+                f"rank {self.rank} QKV configuration: {type(e).__name__}: {e}",
+            )
+        outcomes = self._gather(outcome)
+        err = self._first_error(outcomes)
+        if err is not None:
+            raise ValueError(f"prepare_qkv failed: {err}")
+        if any(item != outcomes[0] for item in outcomes[1:]):
+            raise ValueError(
+                f"inconsistent prepare_qkv configuration across ranks: {outcomes}"
+            )
+
+        try:
+            from . import _ulysses_lowp as lowp
+
+            with torch.cuda.device(self.device):
+                cap = lowp.capability(self.device)
+                if (
+                    cap["device_capability"] not in ((9, 0), (12, 0))
+                    or not cap["supported"]
+                ):
+                    raise RuntimeError(
+                        f"Sage2 QKV kernels unavailable on SM90/SM120: {cap}"
+                    )
+                if head_dim not in cap["supported_head_dims"]:
+                    raise RuntimeError(
+                        f"Sage2 QKV module does not support D={head_dim}"
+                    )
+                layout_impl = getattr(lowp, cap["layout_class"])(head_dim=head_dim)
+            layout = (
+                "sage2_sm90"
+                if cap["device_capability"] == (9, 0)
+                else "sage2_sm89_sm120"
+            )
+            outcome = (
+                "ok",
+                (
+                    cap["device_capability"],
+                    layout,
+                    layout_impl.Q_GROUP,
+                    layout_impl.K_GROUP,
+                ),
+            )
+        except Exception as e:  # noqa: BLE001 — JIT failure is a group outcome
+            outcome = (
+                "err",
+                f"rank {self.rank} QKV layout/JIT: {type(e).__name__}: {e}",
+            )
+        outcomes = self._gather(outcome)
+        err = self._first_error(outcomes)
+        if err is not None:
+            raise RuntimeError(f"prepare_qkv failed: {err}")
+        if any(item != outcomes[0] for item in outcomes[1:]):
+            raise ValueError(
+                f"inconsistent QKV hardware/layout across ranks: {outcomes}"
+            )
+
+        workspace = None
+        try:
+            workspace = UlyssesQKVWorkspace._allocate(
+                self, shape, used, layout, layout_impl
+            )
+            outcome = ("ok",)
+        except Exception as e:  # noqa: BLE001 — release only this attempted allocation
+            outcome = (
+                "err",
+                f"rank {self.rank} QKV allocation: {type(e).__name__}: {e}",
+            )
+        err = self._first_error(self._gather(outcome))
+        if err is not None:
+            workspace = None
+            raise RuntimeError(f"prepare_qkv failed: {err}")
+        return workspace
+
+    @flashinfer_api(trace=ulysses_scatter_qkv_trace_dispatch)
+    def scatter_qkv(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        workspace: UlyssesQKVWorkspace,
+        out: Optional[UlyssesQKV] = None,
+    ) -> UlyssesQKV:
+        r"""Quantize and exchange QKV for the prepared SageAttention2 layout.
+
+        Runs one FP32 statistics AllGather and one jointly packed uint8
+        AllToAll on ``group``, using NCCL independently of ``backend``.
+        Execution uses the current CUDA stream; all ranks must issue the
+        same sequence of calls with valid inputs. There is no per-call
+        metadata collective, implicit preparation, or precision fallback.
+        Local statistics still allocate temporary tensors.
+
+        Parameters
+        ----------
+        q, k, v : torch.Tensor
+            FP16/BF16 CUDA tensors matching the prepared ``[B,L,H,D]`` shape,
+            dtype and device. D must be contiguous; the base pointer and
+            each outer stride must preserve 16-byte row alignment. Projection
+            views satisfying those constraints do not require copies. Input
+            rows outside the prepared global live prefix must already be zero.
+        workspace : UlyssesQKVWorkspace
+            Workspace returned by this communicator's ``prepare_qkv``.
+            Must not be shared by concurrent operations or another communicator.
+        out : UlyssesQKV, optional
+            Reuse these six output tensors. Shapes, dtypes, device, layout,
+            logical/live lengths and input dtype must match the preparation.
+            Outputs must be contiguous and cannot overlap each other, the
+            inputs, or workspace storage. ``None`` allocates independent
+            final storage that remains valid after later workspace reuse.
+
+        Returns
+        -------
+        UlyssesQKV
+            Pre-quantized Q/K/V and three FP32 scales, with consumer metadata.
+            Returns ``out`` itself when supplied. Attention uses the live
+            prefix; the caller restores a full-length floating output before
+            invoking ``gather_heads``.
+        """
+        from . import _ulysses_lowp as lowp
+
+        self._require_open("scatter_qkv")
+        if (
+            not isinstance(workspace, UlyssesQKVWorkspace)
+            or workspace._owner is not self
+        ):
+            raise ValueError(
+                "scatter_qkv workspace must be prepared by this communicator"
+            )
+        lowp._validate_qkv(q, k, v)
+        if (
+            tuple(q.shape) != workspace.qkv_shape
+            or q.dtype != workspace.dtype
+            or q.device != workspace.device
+        ):
+            raise ValueError(
+                "Q/K/V shape, dtype and device must match the prepared workspace"
+            )
+        # Re-read each tensor's extent once per call, then compare integers.
+        # Repeated pairwise metadata queries are costly on this hot path;
+        # a cross-call cache would miss resized or rebound tensor storage.
+        checked_ranges = [_qkv_byte_range(x) for x in (q, k, v)]
+        staging = (
+            (workspace._send_buffer, workspace._wire_shape, torch.uint8),
+            (workspace._recv_buffer, workspace._wire_shape, torch.uint8),
+            (
+                workspace._stats_gather,
+                (workspace.world_size * workspace._stats_numel,),
+                torch.float32,
+            ),
+        )
+        for buffer, shape, dtype in staging:
+            lowp._validate_tensor_spec(
+                "QKV workspace buffer", buffer, shape, dtype, self.device
+            )
+            start, end = _qkv_byte_range(buffer)
+            if any(
+                start < other_end and other_start < end
+                for other_start, other_end in checked_ranges
+            ):
+                raise ValueError(
+                    "QKV workspace buffers must not overlap inputs or one another"
+                )
+            checked_ranges.append((start, end))
+        result = self._prepare_qkv_out(workspace, out, checked_ranges, lowp)
+        layout = workspace._layout_impl
+        _batch, local_sequence, heads, _head_dim = workspace.qkv_shape
+        local_heads = heads // self.world_size
+        with torch.cuda.device(self.device):
+            with torch.cuda.nvtx.range("lowp_local_stats"):
+                send, ctx = lowp._local_stats_impl(
+                    q,
+                    k,
+                    v,
+                    self.rank,
+                    self.world_size,
+                    workspace.used_sequence,
+                    layout.Q_GROUP,
+                    layout.K_GROUP,
+                    workspace._enable_pdl,
+                    workspace._module,
+                )
+            with torch.cuda.nvtx.range("lowp_stats_allgather"):
+                dist.all_gather_into_tensor(
+                    workspace._stats_gather, send, group=self.group
+                )
+            with torch.cuda.nvtx.range("lowp_finalize_stats"):
+                stats = lowp._finalize_stats_impl(
+                    workspace._stats_gather,
+                    ctx,
+                    k,
+                    workspace._enable_pdl,
+                    workspace._module,
+                )
+            with torch.cuda.nvtx.range("lowp_quant_pack"):
+                lowp._quant_and_pack_impl(
+                    q,
+                    k,
+                    v,
+                    stats,
+                    workspace._send_buffer,
+                    workspace._q_scale_offset,
+                    workspace._enable_pdl,
+                    workspace._module,
+                )
+            with torch.cuda.nvtx.range("lowp_input_a2a"):
+                self._exchange_qkv_payload(
+                    workspace._send_buffer, workspace._recv_buffer
+                )
+            with torch.cuda.nvtx.range("lowp_unpack"):
+                lowp._unpack_for_sage_impl(
+                    workspace._recv_buffer,
+                    result[:5],
+                    local_sequence,
+                    self.world_size,
+                    workspace.used_sequence,
+                    workspace._enable_pdl,
+                    workspace._module,
+                )
+            with torch.cuda.nvtx.range("lowp_v_scale"):
+                head_start = self.rank * local_heads
+                result.v_scale.copy_(
+                    stats.v_scale_global[:, head_start : head_start + local_heads]
+                )
+        return result
+
+    def _exchange_qkv_payload(self, send: torch.Tensor, recv: torch.Tensor) -> None:
+        # These buffers were sized for the combined payload by prepare_qkv;
+        # ordinary floating-operand/NVLink capacity checks do not apply.
+        dist.all_to_all_single(recv, send, group=self.group)
+
+    def _prepare_qkv_out(self, workspace, out, checked_ranges, lowp) -> UlyssesQKV:
+        metadata = (
+            workspace.layout,
+            workspace.logical_sequence,
+            workspace.used_sequence,
+            workspace.dtype,
+        )
+        if out is None:
+            tensors = tuple(
+                torch.empty(shape, dtype=dtype, device=self.device)
+                for shape, dtype in workspace._output_specs
+            )
+            return UlyssesQKV(
+                tensors[0],
+                tensors[1],
+                tensors[2],
+                tensors[3],
+                tensors[4],
+                tensors[5],
+                workspace.layout,
+                workspace.logical_sequence,
+                workspace.used_sequence,
+                workspace.dtype,
+            )
+        if not isinstance(out, UlyssesQKV):
+            raise TypeError("out must be a UlyssesQKV result")
+        if out[6:] != metadata:
+            raise ValueError(
+                "out layout, logical_sequence, used_sequence and input_dtype must match"
+            )
+        for index, (tensor, (shape, dtype)) in enumerate(
+            zip(out[:6], workspace._output_specs, strict=True)
+        ):
+            lowp._validate_tensor_spec(
+                f"out.{UlyssesQKV._fields[index]}", tensor, shape, dtype, self.device
+            )
+            start, end = _qkv_byte_range(tensor)
+            if any(
+                start < other_end and other_start < end
+                for other_start, other_end in checked_ranges
+            ):
+                raise ValueError(
+                    "out tensors must not overlap inputs, workspace storage or each other"
+                )
+            checked_ranges.append((start, end))
+        return out
 
     # ---- collectives -----------------------------------------------------------
 
