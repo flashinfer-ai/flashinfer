@@ -1,5 +1,70 @@
 # Frost / FlashInfer MoE pathfinding handoff
 
+## September 17 followup: formal paired FC2 projection engine
+
+Small-row BF16 grouped down projections can now explicitly select engine20402
+(`frost_moe_fc2_pair`). It computes both output-channel halves in the paired
+MMA kernel and stores both directly. The supported graph is one untransformed
+grouped projection with BF16 input/output, FP32 accumulation,1..8 routed rows,
+output width divisible by128 and K divisible by64 on SM100. Canonical expert
+weights may have nonoverlapping16-byte-aligned pitches. Unsupported transforms,
+epilogues, dynamic graph dimensions and knob combinations decline at planning.
+Ordinary engine20400 and paired SwiGLU engine20401 retain their meanings.
+
+FI selects the new engine through the existing `fc2_tactic` interface. Execute
+uses current input/weight/offset pointers and caller workspace/stream; it does
+not repack, allocate, synchronize or compile. This followup needs no FI runtime
+override or API change. The engine is an explicit candidate, not a heuristic
+ranking claim.
+
+The public FE suite passes31 collected tests under each of normal execution,
+memcheck and racecheck on B200, zero skips:93 executions,360 independently
+audited raw outputs,108 changed-reference pairs and36 actual FC2 routes. This
+includes the retained FC1/metadata regressions, pitched storage, two captures,
+live weights/tokens/offsets and allocation/compile/synchronization guards.
+
+Actual full FI on B2001000W, BF16 T1/E128/top8/H2048/I768, now measures:
+
+| Precomputed routing | Paired FC1 + ordinary FC2 | Paired FC1 + engine20402 | Latency reduction |
+|---|---:|---:|---:|
+| Unpacked | 32.888000 us | 32.192000 us | 2.116% |
+| Packed | 32.884125 us | 32.208000 us | 2.056% |
+
+These are same-source, same-card cold-L2 CUDA-Graph/CUPTI full-MoE spans from
+fresh ABBA processes. Both routes pass normal/memcheck/racecheck, with296 raw
+output checks,120 independently changed-reference controls and768 spans.
+Two retained parent captures, live X/IDs/scales/FC1 and FC2 weights, and
+independent legacy weights are covered. PDL intervals overlap; stage durations
+must not be added. This is a synthetic model-shaped operator result, not model
+E2E or a new competitor victory. It supersedes the earlier private FC2 override
+as evidence for the real public graph path.
+
+Evidence: local `artifacts/analysis1883/public.json` and
+`artifacts/analysis1887/fc2.json` under `.fi-cudnn-work/20260914`.
+The tested formal-engine archive SHA256 is
+`814dee6cdeaea97e01f468e5fbf1979e892335bc66cbb5fba6efd806ac5e2047`.
+
+The preceding published-source TRT comparison is now independently audited:
+Frost/TRT T1=33.276/28.424125us and T64=214.043625/197.01975us,
+or17.07%/8.64% Frost latency overhead. TRT kernels match the prior352-joint-
+tactic winners by BMM symbols/cubin hashes. Both preparations are outside
+timing; TRT BF16 includes gate/up row interleave, MMA row shuffle and BlockMajorK.
+These measurements precede engine20402 and must not be combined with the table
+above to infer a new TRT gap. Current parent-binding integration also passes
+on RTX PRO6000 Blackwell Server600W:72 raw checks,36 poisoned-output controls,
+36 changed-reference pairs and36 routes under all three modes. That is SM120
+compatibility evidence; the earlier RTX5090 performance result remains separate.
+
+The FC2 implementation retains credit to NVIDIA Frost, Kernel Factory624,
+Yanqin Zhai's PR1090, NVIDIA CUTLASS example113, and canonical rank5 pairing/
+early-PDL work. TRT layout motivated exploration; no TRT kernel body is copied.
+New KF compact-resource and single-pass scheduler experiments remain outside
+this publication until complete-FI validation. Full repository CI and a
+performance roof are not claimed. Yanqin/Yihua can continue distilling these
+same consolidated drafts.
+
+---
+
 ## September 17: real paired MoE graph engine and FI parent binding
 
 This followup carries the small-token path into the real graph API. Engine
@@ -71,8 +136,8 @@ Timing above used frozen pair1820/fi_pair1825. This publication additionally
 carries the planning-only compatibility retry and SM120 source reconciliation,
 validated separately; the final assembled head has not been retimed.
 
-Pending before readiness: finish the SM120 parent-binding gate and refresh the strong
-TRT comparator. An initial SM120 integration run failed before kernel execution
+The earlier pending SM120 parent-binding gate and published-source TRT refresh
+are completed in the followup above. An initial SM120 integration run failed before kernel execution
 because its source copy lacked the already validated static scheduler; the
 combined source restores it without relaxing the gate. Full repository CI is
 not claimed. These remain consolidated pathfinding drafts for Yanqin/Yihua to
