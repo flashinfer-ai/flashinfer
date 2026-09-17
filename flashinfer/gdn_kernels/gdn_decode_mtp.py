@@ -288,22 +288,13 @@ def _mtp_precompute_replayssm_step(
         for i in cutlass.range_constexpr(vec_size):
             sum_q += r_q[i] * r_q[i]
             sum_k += r_k[i] * r_k[i]
-        if cutlass.const_expr(vec_size == 8):
-            for offset in [8, 4, 2, 1]:
-                sum_q += cute.arch.shuffle_sync_bfly(
-                    sum_q, offset=offset, mask=-1, mask_and_clamp=0x100F
-                )
-                sum_k += cute.arch.shuffle_sync_bfly(
-                    sum_k, offset=offset, mask=-1, mask_and_clamp=0x100F
-                )
-        else:
-            for offset in [16, 8, 4, 2, 1]:
-                sum_q += cute.arch.shuffle_sync_bfly(
-                    sum_q, offset=offset, mask=-1, mask_and_clamp=31
-                )
-                sum_k += cute.arch.shuffle_sync_bfly(
-                    sum_k, offset=offset, mask=-1, mask_and_clamp=31
-                )
+        for offset in [16, 8, 4, 2, 1]:
+            sum_q += cute.arch.shuffle_sync_bfly(
+                sum_q, offset=offset, mask=-1, mask_and_clamp=31
+            )
+            sum_k += cute.arch.shuffle_sync_bfly(
+                sum_k, offset=offset, mask=-1, mask_and_clamp=31
+            )
         inv_norm_q_scaled = cute.rsqrt(sum_q + 1e-6, fastmath=True) * scale
         inv_norm_k = cute.rsqrt(sum_k + 1e-6, fastmath=True)
         for i in cutlass.range_constexpr(vec_size):

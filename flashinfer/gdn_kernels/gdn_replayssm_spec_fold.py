@@ -45,7 +45,7 @@ _L2_EPS = 1.0e-6
 
 
 def _aligned_tensor(tensor: cute.Tensor, alignment: int) -> cute.Tensor:
-    """Attach alignment implied by the compact state/cache layouts."""
+    """Attach alignment guaranteed by base validation and compact strides."""
     pointer = tensor.iterator
     return cute.make_tensor(
         cute.make_ptr(
@@ -464,6 +464,21 @@ def commit_gdn_replayssm_fold_all_layers(
     else:
         track_indices = ssm_state_indices
         track_steps = accept_lens
+
+    # Compact strides preserve alignment only when the base is aligned too.
+    for name, tensor in (
+        ("checkpoint_state", checkpoint_state),
+        ("rawv_cache", rawv_cache),
+        ("rawk_cache", rawk_cache),
+        ("g_cache", g_cache),
+        ("beta_cache", beta_cache),
+        ("ssm_state_indices", ssm_state_indices),
+        ("accept_lens", accept_lens),
+        ("track_state_indices", track_indices),
+        ("track_steps", track_steps),
+    ):
+        if tensor.data_ptr() % 16:
+            raise ValueError(f"{name} must have a 16-byte aligned base address")
 
     supports_tcgen = max_cache_len == 8 and use_qk_l2norm_in_kernel and not has_track
     if backend == "tcgen05" and not supports_tcgen:

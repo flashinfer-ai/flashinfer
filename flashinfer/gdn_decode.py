@@ -1200,7 +1200,8 @@ def gated_delta_rule_mtp(
         Windows are indexed by pool slot, overwritten on every verify, and
         consumed once by :func:`gated_delta_rule_replayssm_commit` before the
         next verify. FP16 inputs are converted to BF16 before caching, as in
-        the existing MTP kernel. Default: ``False``.
+        the existing MTP kernel. All tensor base addresses must be 16-byte
+        aligned for vectorized loads and TMA. Default: ``False``.
 
         The tcgen05 TF32 specialization requires T=4/8, B=1..256, a
         contiguous checkpoint, BF16 output, int32 indices, Q/K normalization,
@@ -1452,6 +1453,26 @@ def gated_delta_rule_mtp(
             assert tensor.is_contiguous(), (
                 f"{name} must be a contiguous per-layer ReplaySSM view"
             )
+        # Contiguous views may still start at an unaligned storage offset.
+        for name, tensor in (
+            ("q", q),
+            ("k", k),
+            ("v", v),
+            ("a", a),
+            ("b", b),
+            ("A_log", A_log),
+            ("dt_bias", dt_bias),
+            ("initial_state", initial_state),
+            ("initial_state_indices", initial_state_indices),
+            ("output_state_indices", output_state_indices),
+            ("output", output),
+            ("replayssm_rawv", replayssm_rawv),
+            ("replayssm_rawk", replayssm_rawk),
+            ("replayssm_g", replayssm_g),
+            ("replayssm_beta", replayssm_beta),
+        ):
+            if tensor is not None and tensor.data_ptr() % 16:
+                raise ValueError(f"{name} must have a 16-byte aligned base address")
     else:
         assert all(t is None for t in replayssm_buffers), (
             "replayssm_* buffers require cache_replayssm=True"
@@ -1568,7 +1589,9 @@ def gated_delta_rule_replayssm_commit(
     Notes
     -----
     Index values, accepted lengths and non-aliasing are caller contracts;
-    they are not read back to the host. Warm up before CUDA graph capture.
+    they are not read back to the host. All tensor base addresses must be
+    16-byte aligned for vectorized loads and TMA. Contiguous storage-offset
+    views must also satisfy this alignment. Warm up before CUDA graph capture.
     """
     from .gdn_kernels.gdn_replayssm_spec_fold import (
         commit_gdn_replayssm_fold_all_layers,

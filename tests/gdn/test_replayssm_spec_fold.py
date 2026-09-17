@@ -99,6 +99,15 @@ def _reference(args):
     return torch.stack(outputs, 1), torch.stack(states, 1), log_g, beta
 
 
+def _offset_copy(tensor, offset):
+    storage = torch.empty(
+        tensor.numel() + offset, dtype=tensor.dtype, device=tensor.device
+    )
+    view = storage[offset:].view_as(tensor)
+    view.copy_(tensor)
+    return view
+
+
 @pytest.mark.parametrize(
     "batch,steps,heads,hv,variant",
     [
@@ -252,8 +261,12 @@ def test_replayssm_verify_commit_cycles(steps, normalize, track, tcgen):
         for name, value in cache.items()
     }
     track_ids = torch.arange(slots, slots + batch, device="cuda", dtype=torch.int32)
-    track_steps = torch.arange(batch, device="cuda", dtype=torch.int32) % steps
+    track_steps = (accepts - 1).clamp_min(0)
     track_ids[1] = -1
+    # Exercise an out-of-prefix request, an intermediate accepted step, and
+    # the last accepted step; zero-accept and null rows also remain untouched.
+    track_steps[2] = accepts[2]
+    track_steps[3] = 1
     for _ in range(2):
         before = checkpoint.clone()
         expected_state = checkpoint.clone()
@@ -310,6 +323,98 @@ def test_replayssm_verify_commit_cycles(steps, normalize, track, tcgen):
             atol=1e-4 if tcgen else 2e-6,
             rtol=1e-3 if tcgen else 1e-5,
         )
+
+
+@pytest.mark.parametrize("accept", [1, 6, 8])
+@pytest.mark.parametrize("backend", ["auto", "simt", "tcgen05"])
+def test_replayssm_single_request_commit(accept, backend):
+    args, cache = _inputs(batch=1, steps=8)
+    # Nonzero storage offsets are valid when the resulting pointers are aligned.
+    args["initial_state"] = _offset_copy(args["initial_state"], 4)
+    cache["replayssm_rawk"] = _offset_copy(cache["replayssm_rawk"], 8)
+    expected_output, expected_states, _, _ = _reference(args)
+    expected_checkpoint = args["initial_state"].clone()
+    slot = args["initial_state_indices"].item()
+    expected_checkpoint[slot] = expected_states[0, accept - 1].float()
+    before = args["initial_state"].clone()
+    output, _ = gated_delta_rule_mtp(**args, cache_replayssm=True, **cache)
+    torch.testing.assert_close(output.double(), expected_output, atol=1e-4, rtol=1e-2)
+    torch.testing.assert_close(args["initial_state"], before, atol=0, rtol=0)
+    for window in cache.values():
+        window[slot, :, accept:] = float("nan")
+    gated_delta_rule_replayssm_commit(
+        args["initial_state"].unsqueeze(0),
+        cache["replayssm_rawv"].unsqueeze(0),
+        cache["replayssm_rawk"].unsqueeze(0),
+        cache["replayssm_g"].unsqueeze(0),
+        cache["replayssm_beta"].unsqueeze(0),
+        args["initial_state_indices"],
+        torch.tensor([accept], device="cuda", dtype=torch.int32),
+        backend=backend,
+    )
+    torch.testing.assert_close(
+        args["initial_state"],
+        expected_checkpoint,
+        atol=2e-6 if backend == "simt" else 1e-4,
+        rtol=1e-5 if backend == "simt" else 1e-3,
+    )
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "initial_state",
+        "initial_state_indices",
+        "output_state_indices",
+        "q",
+        "k",
+        "v",
+        "a",
+        "b",
+        "A_log",
+        "dt_bias",
+        "output",
+        "replayssm_rawv",
+        "replayssm_rawk",
+        "replayssm_g",
+        "replayssm_beta",
+    ],
+)
+def test_replayssm_verify_rejects_unaligned_storage(name):
+    args, cache = _inputs()
+    args["output"] = torch.empty_like(args["v"])
+    args["output_state_indices"] = args["initial_state_indices"].clone()
+    tensors = args if name in args else cache
+    tensors[name] = _offset_copy(tensors[name], 1)
+    with pytest.raises(ValueError, match="aligned"):
+        gated_delta_rule_mtp(**args, cache_replayssm=True, **cache)
+
+
+@pytest.mark.parametrize("backend", ["auto", "simt", "tcgen05"])
+@pytest.mark.parametrize(
+    "name",
+    [
+        "checkpoint_state",
+        "rawv_cache",
+        "rawk_cache",
+        "g_cache",
+        "beta_cache",
+        "state_indices",
+        "accept_lens",
+        "track_state_indices",
+        "track_steps",
+    ],
+)
+def test_replayssm_commit_rejects_unaligned_storage(name, backend):
+    from flashinfer.trace.templates.gdn import gdn_replayssm_commit_trace
+
+    args = gdn_replayssm_commit_trace.init()
+    if name in ("track_state_indices", "track_steps"):
+        args["track_state_indices"] = torch.full_like(args["state_indices"], -1)
+        args["track_steps"] = torch.zeros_like(args["accept_lens"])
+    args[name] = _offset_copy(args[name], 1)
+    with pytest.raises(ValueError, match="aligned"):
+        gated_delta_rule_replayssm_commit(**args, backend=backend)
 
 
 @pytest.mark.parametrize(
