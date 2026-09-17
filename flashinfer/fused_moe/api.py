@@ -962,11 +962,15 @@ class CudnnMoeConfig:
             )
         device = device or w1_bf16.device
         up, gate = w1_bf16.to(device).split(i, dim=1)
+        # Fused and unfused FC1 share one allocation. Each expert matrix is
+        # contiguous; the split views retain the combined tensor's expert pitch.
+        gate_up = torch.cat((gate, up), dim=1).contiguous()
+        gate, up = gate_up.split(i, dim=1)
         return {
-            "up": up.contiguous(),
-            "gate": gate.contiguous(),
+            "up": up,
+            "gate": gate,
             "down": w2_bf16.to(device).contiguous(),
-            "gate_up": torch.cat((gate, up), dim=1).contiguous(),
+            "gate_up": gate_up,
         }
 
 

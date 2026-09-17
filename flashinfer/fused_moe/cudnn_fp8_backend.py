@@ -302,9 +302,6 @@ class CudnnFp8PerTensorRunner(CudnnMoeRunner):
             ),
         )
 
-    def get_cache_key_extras(self, inputs):
-        return (*super().get_cache_key_extras(inputs), self._weight_layout_key(inputs))
-
     def _check_support(self):
         super()._check_support()
         if not self.backend_config.use_native_routing:

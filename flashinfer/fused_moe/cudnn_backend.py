@@ -325,7 +325,7 @@ class CudnnMoeRunner(MoERunner):
     backend_key = "cudnn"
     _backend_config_type: type = CudnnMoeConfig
     # Joint stage tactics and explicit fusion routes change cache identities.
-    _cache_version = "cudnn-bf16-v7-joint-routes"
+    _cache_version = "cudnn-bf16-v8-shared-weight-views"
     _activation_dtype = torch.bfloat16
     supported_routing_modes = (
         RoutingInputMode.PackedPrecomputed,
@@ -393,7 +393,12 @@ class CudnnMoeRunner(MoERunner):
         )
 
     def get_cache_key_extras(self, inputs):
-        return (*self._cache_key_extras(), str(inputs[2].dtype), inputs[8])
+        return (
+            *self._cache_key_extras(),
+            str(inputs[2].dtype),
+            inputs[8],
+            self._weight_layout_key(inputs),
+        )
 
     def pack_inputs(self, act: MoEActivationPack, weights: MoEWeightPack):
         self._require_built()
@@ -431,17 +436,26 @@ class CudnnMoeRunner(MoERunner):
             x.shape[1],
         )
         tensors = [v[name] for name in ("up", "gate", "down", "gate_up")]
-        for t, shape in zip(
-            tensors, ((e, i, h), (e, i, h), (e, h, i), (e, 2 * i, h)), strict=True
+        for name, t, shape in zip(
+            ("up", "gate", "down", "gate_up"),
+            tensors,
+            ((e, i, h), (e, i, h), (e, h, i), (e, 2 * i, h)),
+            strict=True,
         ):
+            split_view = name in ("up", "gate") and tuple(t.stride()) == (
+                2 * i * h,
+                h,
+                1,
+            )
             if (
                 t.device != self.device
                 or t.dtype != torch.bfloat16
                 or tuple(t.shape) != shape
-                or not t.is_contiguous()
+                or not (t.is_contiguous() or split_view)
             ):
                 raise ValueError(
-                    f"Invalid cuDNN MoE weight layout; expected contiguous BF16 {shape} on {self.device}"
+                    f"Invalid cuDNN MoE weight layout for {name}; expected BF16 {shape} "
+                    f"on {self.device}, contiguous or a canonical gate/up split view"
                 )
         # Packed mode's public contract narrows routing weights to BF16. The
         # cuDNN adapter does not encode IDs into their high bits, but preserves
@@ -454,9 +468,11 @@ class CudnnMoeRunner(MoERunner):
         return [*inputs, self._resources(inputs)["output"], round_scales]
 
     def _weight_layout_key(self, inputs):
-        # BF16 currently accepts only contiguous weights. Quantized runners
-        # can specialize this without adding work to the BF16 hot path.
-        return ()
+        # Compiled plans include expert strides. Separate legacy contiguous
+        # packs from shared FC1 views in both resource and autotuning caches.
+        return tuple(
+            (tuple(tensor.shape), tuple(tensor.stride())) for tensor in inputs[3:7]
+        )
 
     def _resources(self, inputs):
         x, ids, scales, up, gate, down, gate_up = inputs[:7]

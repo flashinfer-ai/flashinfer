@@ -1,6 +1,6 @@
 # Frost / FlashInfer MoE pathfinding handoff
 
-Updated September 16, 2026. Companion drafts:
+Updated September 17, 2026. Companion drafts:
 [cuDNN Frontend #1080](https://github.com/NVIDIA/cudnn-frontend/pull/1080) and
 [FlashInfer #5250](https://github.com/flashinfer-ai/flashinfer/pull/5250).
 Yanqin and Yihua can distill these drafts asynchronously. Validated followups
@@ -12,6 +12,86 @@ cuDNN GEMM kernels. Frost needs explicit per-workload tuning; no heuristic
 quality claim is made.
 
 ## September 16 routing followup and current comparison
+
+### Shared BF16 FC1 storage
+
+The BF16 preparation now stores FC1 once. The returned up and gate tensors are
+views into gate_up: each expert matrix remains contiguous, and the expert stride
+includes both projections. Updating a prepared up/gate view also updates the
+corresponding region used by the unfused route. Canonical FC1 input weights are
+copied during preparation; the contiguous down tensor can alias the caller's
+FC2 weights. Existing independently contiguous weight packs remain accepted.
+
+Resource and autotuning keys include weight shapes and strides, separating old
+contiguous packs from shared views. The BF16 cache version advances to 8; FP8's
+existing serialized cache-key structure is preserved. No execution-time packing
+or conversion is introduced.
+
+For BF16 E128/H2048/I768, retained prepared weight storage is **1.125 GiB instead
+of 1.875 GiB**, saving **0.75 GiB (40%)**. This removes duplicated FC1 storage
+from our adapter; it does not establish a memory advantage over other backends.
+Canonical input weights, allocator reservations and peak preparation memory are
+excluded; preparation costs are separately measured below.
+
+Both B200 and RTX5090 pass nine shared-weight tests in each of normal
+execution, unfiltered memcheck and racecheck (27 test executions and 36 captured
+routes per architecture). Coverage includes both FC1 routes, both routing
+formats, interleaved legacy/shared packs and live input/routing/weight changes.
+The complete-MoE regression passes both-arm normal/memcheck/racecheck and fresh
+ABBA on each architecture: 272 output checks, 120 negative controls and 1536
+raw spans each, with identical generated GEMM source across arms.
+
+| GPU / tokens / routing | Legacy us | Shared us | Latency change |
+|---|---:|---:|---:|
+| B200 / 1 / unpacked |33.524|33.728|+0.61%|
+| B200 / 1 / packed |33.572|33.752|+0.54%|
+| B200 / 64 / unpacked |215.177|214.068|-0.51%|
+| B200 / 64 / packed |215.721|214.340|-0.64%|
+| RTX5090 / 1 / unpacked |59.496|58.976|-0.87%|
+| RTX5090 / 1 / packed |59.556|59.024|-0.89%|
+| RTX5090 / 64 / unpacked |790.957|789.269|-0.21%|
+| RTX5090 / 64 / packed |790.692|789.220|-0.19%|
+
+The main benefit is the 40% reduction in our retained prepared-weight storage.
+B200 T1 is slightly slower; this is not a universal speedup or a claim of
+unchanged latency. Fixture and timing boundaries are the same as below.
+Local independent evidence: audit1704/1677 (unit), audit1710/1685 (full MoE).
+
+Reproduce the new contracts with:
+
+```bash
+pytest -q tests/moe/test_moe_cudnn_bf16_weight_views.py
+```
+
+### Weight preparation, separate from inference
+
+The TRT-LLM BF16 comparator uses its required gate/up interleaving, MMA row
+shuffle and 128-byte K-block BlockMajorK layout. The uint8 view is a byte-level
+layout operation; weights remain BF16. Both backends prepare before timing.
+The historical competitor measurement used Frost's legacy dense preparation;
+the shared and private blocked candidates have not yet been freshly paired
+against TRT-LLM.
+
+On a 1000 W B200, resident canonical BF16 E128/H2048/I768 weights occupy
+1.125 GiB. Actual helpers, 12 mirrored warm calls each, give:
+
+| Helper | Completion wall ms | Prepared GiB | Additional GiB | Incremental peak GiB |
+|---|---:|---:|---:|---:|
+| Frost legacy |2.620|1.875|1.500|1.500|
+| Frost shared |1.749|1.125|0.750|0.750|
+| Frost blocked (private) |3.288|1.125|1.125|1.875|
+| TRT-LLM BlockMajorK |4.637|1.125|1.125|2.250|
+| CUTLASS dense alias |0.040|1.125|0|0|
+
+Audit1713 verifies 65 samples, including five first calls reported separately,
+and bit-exact layout checks. Peak is PyTorch allocated memory, not reserved.
+Prepared storage includes aliases; additional storage excludes canonical
+weights. This measures current helpers, excluding loading, H2D and inference.
+Credit NVIDIA TensorRT-LLM's preparation algorithm and FlashInfer's helpers.
+The private blocked candidate extends Frost's prior blocked-weight path and
+is not part of this shared-storage delivery.
+
+### Routing fusion
 
 The new private helper fuses stable expert ranking, input permutation and all
 expert offsets into one CUDA kernel. The Frost adapter selects it only for
@@ -121,11 +201,11 @@ The B200 TRT-LLM BF16 comparator uses the public `prepare_weights` path:
 FC1 gate/up row interleaving plus an MMA row shuffle (`epilogue_tile_m=128`),
 FC2 MMA row shuffle, then `BlockMajorK` conversion of both matrices using
 128-byte K blocks. These are byte-preserving permutations; weights remain BF16.
-Both backends prepare weights before timing. Frost BF16 currently splits and
-copies gate/up and concatenates gate/up for its fused FC1 route; it does not use
-the TRT-LLM MMA shuffle or BlockMajorK layout. Its prepared pack currently
-duplicates FC1 storage. Preparation latency, peak memory and dynamic weight
-replacement have not been benchmarked, so this evidence supports steady-state
+Both backends prepare weights before timing. The historical Frost BF16 comparator
+splits/copies gate/up and concatenates gate/up, duplicating FC1 storage; the
+shared-view followup above removes that duplication. Neither version uses the
+TRT-LLM MMA shuffle or BlockMajorK layout. Dynamic weight
+replacement has not been benchmarked, so this evidence supports steady-state
 inference only. SM120's comparator is CUTLASS, not this TRT-LLM path.
 
 NVIDIA TensorRT-LLM retains credit for the native finalizer and fallback router;
