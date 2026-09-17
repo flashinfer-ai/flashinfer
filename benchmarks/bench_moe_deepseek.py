@@ -950,6 +950,9 @@ def bench_trtllm(
     routing_weights = None
     is_routed = routing_input_mode == "routed"
     if is_routed:
+        if precision == "mxfp8":
+            # The FP8 Renormalize path consumes precomputed, ungrouped routes.
+            moe_kwargs.update(n_group=None, topk_group=None)
         # Share this row's cached routes across precisions, including after
         # autotuning advances the RNG. Release the cache with the input row.
         factory = inputs.get("_trtllm_routing_factory")
