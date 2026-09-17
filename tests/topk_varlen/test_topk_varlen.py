@@ -1317,7 +1317,7 @@ def test_backend_heuristic_priority():
         "radix",
         "radix_cutlass",
     ]
-    # hint-free fp32 (gvr_2 runs on its synthetic anchor): gvr_2 still first
+    # hint-free fp32 (gvr_2 runs its hint-free engines): gvr_2 still first
     # everywhere except the one measured loss — K >= 2048, N <= 4096, single
     # row — where radix_filter leads and gvr_2 follows; a real hint restores
     # gvr_2 to the front there.
@@ -1337,6 +1337,12 @@ def test_backend_heuristic_priority():
     assert order_k(all5, 1, 4096, 1024, False)[0] == "gvr_2"
     assert order_k(all5, 2, 4096, 2048, False)[0] == "gvr_2"
     assert order_k(all5, 1, 4096, 2048, False)[:2] == ["radix_filter", "gvr_2"]
+    # N <= top_k: every row is the identity answer; radix_filter emits it
+    # cheaper than gvr_2's short-path launch, with or without a hint
+    assert order_k(all5, 16, 2048, 2048, False)[:2] == ["radix_filter", "gvr_2"]
+    assert order_k(all5, 16, 2048, 2048, True)[:2] == ["radix_filter", "gvr_2"]
+    assert order_k(all5, 4, 1000, 1024, True)[:2] == ["radix_filter", "gvr_2"]
+    assert order_k(all5, 4, 1025, 1024, True)[0] == "gvr_2"
     assert order_k(all4, 1, 4096, 2048, False)[0] == "gvr_2"  # no radix_filter
     # (a meta pre_idx fails the CUDA-device check and counts as absent; a hint
     # on the logits device is exercised by the GPU tests)
@@ -1449,7 +1455,7 @@ def test_malformed_hint_is_discarded_with_warning(kind):
     """A malformed ``pre_idx`` (wrong shape, dtype, device, layout or
     alignment) is dropped with a RuntimeWarning and the call runs hint-free
     and exact, under ``auto``, under an explicit hint-free backend, and under
-    ``gvr_2`` (which runs on its synthetic anchor). ``gvr`` cannot run
+    ``gvr_2`` (which runs its hint-free engines). ``gvr`` cannot run
     without a hint and refuses the call up front instead of failing inside
     the kernel."""
     from flashinfer.utils import BackendSupportedError
@@ -1480,10 +1486,12 @@ def test_malformed_hint_is_discarded_with_warning(kind):
     assert bool(((indices >= 0) & (indices < n)).all()), "index out of range"
     assert torch.equal(torch.sort(logits.gather(1, indices.long()), dim=1).values, ref)
     # gvr_2: the hint is dropped with the warning and the call runs exact on
-    # the host's synthetic anchor (checked and skip_check paths alike)
+    # the hint-free engines (checked and skip_check paths alike)
     if flashinfer.top_k_varlen.is_backend_supported("gvr_2", cc):
         for skip in (False, True):
-            with pytest.warns(RuntimeWarning, match="synthetic sampling anchor"):
+            with pytest.warns(
+                RuntimeWarning, match="falls back to its hint-free engines"
+            ):
                 indices, _ = flashinfer.top_k_varlen(
                     logits,
                     seq_lens,
