@@ -80,7 +80,12 @@ def _parse_args() -> argparse.Namespace:
         default="ll",
         help="EP algorithm: ll = Low-Latency, ht = High-Throughput",
     )
-    p.add_argument("--quant", choices=["nvfp4", "bf16"], default="bf16")
+    p.add_argument(
+        "--quant",
+        choices=["nvfp4", "bf16", "w4a16"],
+        default="bf16",
+        help="w4a16 = NVFP4 weights x BF16 activations (weight-only quant)",
+    )
     p.add_argument(
         "--layout",
         choices=["expert_major", "rank_major"],
@@ -185,6 +190,17 @@ def _build_compute(args, *, local_num_experts, local_expert_offset, max_tokens, 
             quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
             experts=experts,
             backend=BackendOptions(candidates=(CuteDslConfig(), TrtllmFp4Config())),
+            execution=execution,
+        )
+    elif args.quant == "w4a16":
+        # Weight-only quantization: 4-bit weights, BF16 activations. On SM100
+        # CuteDslRunner is the only runner that serves this pair -- the CUTLASS
+        # W4A16 path is Hopper-only and the CuTile one omits 100.
+        cfg = MoEConfig(
+            routing=routing,
+            quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.BF16),
+            experts=experts,
+            backend=BackendOptions(candidates=(CuteDslConfig(),)),
             execution=execution,
         )
     else:
