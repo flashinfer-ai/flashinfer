@@ -2924,6 +2924,35 @@ def test_attention_ts_mla_partial_tail_rejects_cluster_reduction():
         )
 
 
+def test_attention_ts_mla_balanced_rejects_cluster_reduction():
+    """Balanced descriptors require the standalone GMEM reduction path."""
+
+    config_kwargs = {
+        "batch_size": 1,
+        "num_heads_q": 8,
+        "seq_len_q": 1,
+        "seq_len_kv": 4096,
+        "tile_size_q": 8,
+        "explicit_split_kv": 2,
+        "max_active_clusters": 148,
+        "reduction_mode": "cluster",
+    }
+    ordinary = make_throughput_latency_mla_config(**config_kwargs)
+    assert ordinary.kernel_variant == "swaps_mma_ab"
+    assert ordinary.use_cluster_reduction == 1
+
+    with pytest.raises(
+        ValueError,
+        match="balanced 1CTA MLA does not support cluster reduction",
+    ):
+        make_throughput_latency_mla_config(
+            **config_kwargs,
+            use_balanced_scheduler=True,
+            balanced_descriptor_capacity=2,
+            balanced_partial_capacity=2,
+        )
+
+
 def test_attention_ts_mla_int32_kv_coordinate_bound():
     """The public K/V bound reserves the largest padded split-KV span."""
 
