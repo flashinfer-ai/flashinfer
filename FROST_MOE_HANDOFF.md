@@ -1,3 +1,42 @@
+## Compact resources in paired SM100 kernels
+
+Both small-row graph engines now allocate 32 TMEM columns instead of 512, use
+one accumulator stage instead of two, and omit dynamic register redistribution.
+The persistent scheduler, 256-thread CTA, MMA geometry and public contracts
+are unchanged. This implementation change originated in Kernel Factory
+candidate 2f5c073d; its FC1 transfer was separately measured and validated.
+The later bounded single-pass scheduler is not included: its FC1 transfer
+regressed, and the small FC2 component gain still needs full-FI confirmation.
+
+Fixed-tactic, full synthetic FI BF16 MoE on B200 at 1000 W, T1/E128/top8/H2048/I768:
+
+| Routing | Paired baseline | FC1 resources only | FC2 resources only | Both | Both latency reduction |
+|---|---:|---:|---:|---:|---:|
+| Unpacked | 32.956125 us | 31.176125 us | 31.408125 us | 29.772000 us | 9.662% |
+| Packed | 32.924000 us | 31.180375 us | 31.328000 us | 29.692000 us | 9.817% |
+
+The baseline already includes paired graph engines 20401 and 20402. These
+are same-card four-arm comparisons, not gains from selecting a different
+existing tactic. Both routing modes pass normal/memcheck/racecheck; eight
+fresh mirrored timing processes per mode yield 1536 cold-L2 raw spans.
+Independent audit 1899 reconstructs 592 output comparisons and 240 changed
+references, including retained parents, live tokens/IDs/scales/FC1 and FC2
+weights, and legacy independent-weight execution. Overlapping PDL stage
+durations are not summed. Weight preparation is outside both arms' timing.
+
+Public graph tests now include 256-tile and 1024-tile persistent workloads for
+both stages. Audit 1919 passes 35 cases in each of normal/memcheck/racecheck:
+105 zero-skip executions, 480 raw output checks, 144 changed-reference controls
+and 96 paired-kernel routes. Execute remains allocation/JIT/sync-free and
+uses the caller's stream. Source archive:
+`fe88c8b14abbaa254ac6de82b0257f5991b31d2c30259cbcdb56939ccbfe1cfd`.
+
+NCU confirms essentially unchanged DRAM/L2 traffic and 210944 B dynamic shared
+memory, with increased achieved bandwidth and a small active-warp change.
+It does not establish a large occupancy gain or a performance roof. A fresh
+strongest-TRT comparison for this version is still required; the resource
+table alone is not a competitor or model-E2E win. SM120 kernels are unchanged.
+
 # Frost / FlashInfer MoE pathfinding handoff
 
 ## September 17 followup: formal paired FC2 projection engine
