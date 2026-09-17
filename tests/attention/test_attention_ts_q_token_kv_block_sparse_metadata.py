@@ -768,10 +768,10 @@ def _make_case(group_size: int, block_topk: int, storage_page_size: int = 16):
 
 
 @pytest.mark.arch_blackwell
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@_REQUIRES_PRIMS_TS_ATTENTION
 @pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float8_e4m3fn))
 def test_q1_page_prefix_and_causal_tail_graph(dtype):
-    """Replay growing prefixes across two producer warps and a strided row boundary."""
+    """Replay Q1 attention across two producer warps and a strided row boundary."""
     torch.manual_seed(7193)
     rows, topk, page_size, context, dim = 2, 65, 16, 272, 256
     query = (torch.randn(rows, 1, 1, 12, dim, device="cuda") * 0.25).to(dtype)
