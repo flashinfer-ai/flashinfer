@@ -589,7 +589,7 @@ kernel_cake_fmha_request_ordered_paged_decode_runtime_lengths_568b14ff813ca28889
         int runtime_max_len = 0;
         #pragma unroll 1
         for (int runtime_lane_base = 0; runtime_lane_base < batch_size; runtime_lane_base += 32) {
-            int runtime_slot = (unsigned int)runtime_lane_base + lane;
+            int runtime_slot = runtime_lane_base + threadIdx.x % 32;
             if (runtime_slot < batch_size) {
                 int runtime_request = runtime_slot;
                 int runtime_length = seq_lens_kv[runtime_request];
@@ -779,7 +779,7 @@ kernel_cake_fmha_request_ordered_paged_decode_runtime_lengths_568b14ff813ca28889
             int my_tmem_s = taddr;
             int my_tmem_stats = taddr + 16 + (unsigned int)(tmem_row_base_v << 16);
             const int warp_in_wg = warp;
-            const int wg_tid = (unsigned int)(warp_in_wg * 32) + lane;
+            const int wg_tid = warp_in_wg * 32 + threadIdx.x % 32;
             int col_pair = wg_tid % 4;
             int col_pair_base = col_pair * 2;
             unsigned int work_stage_s = 0;
@@ -900,7 +900,7 @@ kernel_cake_fmha_request_ordered_paged_decode_runtime_lengths_568b14ff813ca28889
                         sv[c + 4] = sv_hi[c];
                     }
                     int my_block = split_start_pair * 2 + n;
-                    int ldtm_row_base = (unsigned int)(warp_in_wg * 32) + lane / 4;
+                    int ldtm_row_base = warp_in_wg * 32 + threadIdx.x % 32 / 4;
                     int kv_pos0 = my_block * BLOCK_N + ldtm_row_base;
                     int kv_pos1 = kv_pos0 + 8;
                     int kv_pos2 = kv_pos0 + 16;
@@ -955,7 +955,7 @@ kernel_cake_fmha_request_ordered_paged_decode_runtime_lengths_568b14ff813ca28889
                         float _max_17 = max_noftz(row_max_pair[c_2], pair_max[c_2]);
                         new_max_pair[c_2] = _max_17;
                     }
-                    if (lane < 8) {
+                    if (threadIdx.x % 32 < 8) {
                         uint32_t _amf_u_1 = __float_as_uint(new_max_pair[0]);
                         uint32_t _amf_mask_1 = -int32_t(_amf_u_1 >> 31) | 0x80000000u;
                         unsigned int _amf_enc_1 = _amf_u_1 ^ _amf_mask_1;
@@ -1121,14 +1121,14 @@ kernel_cake_fmha_request_ordered_paged_decode_runtime_lengths_568b14ff813ca28889
             const int tmem_row_base_v_1 = warp % 4 * 32;
             const int corr_row = tmem_row_base_v_1 << 16;
             const int warp_in_wg_c = warp % 4;
-            const int corr_tid = (unsigned int)(warp_in_wg_c * 32) + lane;
+            const int corr_tid = warp_in_wg_c * 32 + threadIdx.x % 32;
             const int col_pair_c = corr_tid % 4;
             const int col_pair_base_c = col_pair_c * 2;
             unsigned int work_stage_c = 0;
             int corr_cons_stage = 0;
             int corr_cons_phase = 0;
             int p_stage_c = 0;
-            int d_idx = warp % 4 * 32 + lane;
+            int d_idx = warp % 4 * 32 + (unsigned int)(threadIdx.x % 32);
             int group_ratio_rt = num_q_heads / (num_kv_heads * Q_GROUPS_PER_KV);
             float bmm1_scale_log2_c = softmax_scale_log2;
             float bmm2_scale_c = output_scale;
@@ -1273,7 +1273,7 @@ kernel_cake_fmha_request_ordered_paged_decode_runtime_lengths_568b14ff813ca28889
                     float _shfl_xor_7 = __shfl_xor_sync(0xFFFFFFFF, reduced_sum_pair[c_8], 4);
                     reduced_sum_pair[c_8] = reduced_sum_pair[c_8] + _shfl_xor_7;
                 }
-                if (lane < 4) {
+                if (threadIdx.x % 32 < 4) {
                     const int warp_sum_base_c = warp_in_wg_c * 8 + col_pair_base_c;
                     smem_corr[warp_sum_base_c] = reduced_sum_pair[0];
                     smem_corr[warp_sum_base_c + 1] = reduced_sum_pair[1];
@@ -1290,7 +1290,7 @@ kernel_cake_fmha_request_ordered_paged_decode_runtime_lengths_568b14ff813ca28889
                     int stats_head_c = col_pair_base_c;
                     float stats_sum_c = total_sum_pair[0];
                     float stats_max_c = _tmem_load_3[2];
-                    if (lane >= 4) {
+                    if (threadIdx.x % 32 >= 4) {
                         stats_head_c = col_pair_base_c + 1;
                         stats_sum_c = total_sum_pair[1];
                         stats_max_c = _tmem_load_3[3];
@@ -1419,7 +1419,7 @@ kernel_cake_fmha_request_ordered_paged_decode_runtime_lengths_568b14ff813ca28889
                         }
                         float _max_18 = max_noftz(lse0_seg, lse1_seg);
                         float lane_max_seg = _max_18;
-                        int subgroup_lane_base_seg = lane / 8 * 8;
+                        int subgroup_lane_base_seg = threadIdx.x % 32 / 8 * 8;
                         float merged_max_seg = -CAKE_INF;
                         #pragma unroll
                         for (int source_lane_seg = 0; source_lane_seg < 8; source_lane_seg++) {
@@ -1582,7 +1582,7 @@ kernel_cake_fmha_request_ordered_paged_decode_runtime_lengths_568b14ff813ca28889
                         }
                         float _max_20 = max_noftz(lse0, lse1);
                         float lane_max = _max_20;
-                        int subgroup_lane_base = lane / 8 * 8;
+                        int subgroup_lane_base = threadIdx.x % 32 / 8 * 8;
                         float merged_max = -CAKE_INF;
                         #pragma unroll
                         for (int source_lane = 0; source_lane < 8; source_lane++) {
