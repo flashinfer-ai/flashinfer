@@ -1441,6 +1441,9 @@ void runBalancedSchedDevice(BalancedSchedDeviceParams const& params) {
                        getBalancedSchedDeviceWorkspaceSize(params.batchSize, params.numSmParts),
                    "Balanced device scheduler workspace is too small");
   if (params.useOptimizedSchedule) {
+    FLASHINFER_CHECK(params.numSmParts <= kFoldThreads,
+                     "Balanced device optimized scheduler supports at most ", kFoldThreads,
+                     " partitions, got ", params.numSmParts);
     size_t const sharedBytes =
         static_cast<size_t>(params.batchSize) * sizeof(int32_t) + sizeof(int64_t) +
         static_cast<size_t>(params.batchSize + params.numSmParts) * sizeof(int64_t) +
