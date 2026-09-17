@@ -3384,6 +3384,30 @@ def _no_carveout():
             base._generate_kernel_attrs = orig_gen
 
 
+@cute.jit
+def _store_mapped_index(out_row, column, index, mapping, row, page_size: cutlass.Constexpr):
+    """Terminal store only: keep selection/workspace indices logical."""
+    if cutlass.const_expr(page_size == 0):
+        out_row[column] = index
+    else:
+        pages, row_to_batch, page_starts, raw = mapping
+        if cutlass.const_expr(raw is not None):
+            raw[row, column] = index
+        physical = cutlass.Int32(-1)
+        if index >= cutlass.Int32(0):
+            batch = row
+            if cutlass.const_expr(row_to_batch is not None):
+                batch = row_to_batch[row]
+            page_column = index // cutlass.Int32(page_size)
+            if cutlass.const_expr(page_starts is not None):
+                page_column = page_column + page_starts[row]
+            # Score arenas may be wider than the logical page table. Keep
+            # the raw selection, but never dereference a padding page slot.
+            if page_column >= cutlass.Int32(0) and page_column < pages.shape[1]:
+                physical = pages[batch, page_column] * cutlass.Int32(page_size) + index % cutlass.Int32(page_size)
+        out_row[column] = physical
+
+
 class GvrTopkRegKernel:
     """gvr_topk_reg<BLK, VPT, MINB, KPT, CUR, DEG, IMGF, NBH>."""
 
@@ -3401,6 +3425,7 @@ class GvrTopkRegKernel:
         varlen: bool = False,
         next_n: int = 1,
         cr_shift: int = 0,
+        page_size: int = 0,
     ):
         assert blk in (256, 512, 1024) and vpt in (1, 2, 4)
         assert nbh in (256, 512, 1024, 2048)
@@ -3414,6 +3439,7 @@ class GvrTopkRegKernel:
         self.img = bool(img)
         self.nbh = nbh
         self.pdl = bool(pdl)
+        self.page_size = page_size
         # per-row varlen mode (production heuristicTopKDecode contract, same
         # semantics as GvrMainKernel/GvrRegClusKernel): n is re-derived PER
         # ROW in-kernel from a device kv_lens tensor; the scalar n launch arg
@@ -3442,6 +3468,7 @@ class GvrTopkRegKernel:
         cmp_: cutlass.Int32,
         qc: cutlass.Int32,
         smem_bytes: cutlass.Int32,
+        mapping=None,
     ):
         BLK = cutlass.const_expr(self.blk)
         VPT = cutlass.const_expr(self.vpt)
@@ -3494,7 +3521,7 @@ class GvrTopkRegKernel:
                     ov = cutlass.Int32(-1)
                     if i < nv:
                         ov = i
-                    out[row, i] = ov
+                    _store_mapped_index(out[row, None], i, ov, mapping, row, self.page_size)
                     i = i + cutlass.Int32(BLK)
 
         # ------------------------------------------------------------------
@@ -4020,10 +4047,10 @@ class GvrTopkRegKernel:
                     p2e = b2 + popc(n2 & lml)
                     if q1e == cutlass.Int32(1):
                         if p1e < nA:
-                            out_row[p1e] = ixv
+                            _store_mapped_index(out_row, p1e, ixv, mapping, row, self.page_size)
                     if q2e == cutlass.Int32(1):
                         if p2e < nT:
-                            out_row[nA + p2e] = ixv
+                            _store_mapped_index(out_row, nA + p2e, ixv, mapping, row, self.page_size)
                 # tail element
                 u64 = cutlass.Int64(-1)
                 if tid < ntail:
@@ -4049,10 +4076,10 @@ class GvrTopkRegKernel:
                 p2e = b2 + popc(n2 & lml)
                 if q1e == cutlass.Int32(1):
                     if p1e < nA:
-                        out_row[p1e] = tix
+                        _store_mapped_index(out_row, p1e, tix, mapping, row, self.page_size)
                 if q2e == cutlass.Int32(1):
                     if p2e < nT:
-                        out_row[nA + p2e] = tix
+                        _store_mapped_index(out_row, nA + p2e, tix, mapping, row, self.page_size)
                 # (CUDA returns here — everything below is the else-arm)
             else:
                 # ---- emit
@@ -4076,7 +4103,7 @@ class GvrTopkRegKernel:
                                 s_hist.iterator + cutlass.Int32(bn), cutlass.Int32(1)
                             )
                             if p < lim1:
-                                out_row[p] = idx
+                                _store_mapped_index(out_row, p, idx, mapping, row, self.page_size)
                             else:
                                 if whole == cutlass.Int32(0):
                                     q2i = p - above
@@ -4093,7 +4120,7 @@ class GvrTopkRegKernel:
                         bn = _umin_u32(f2u_rz(qt2), cutlass.Uint32(self.nbh - 1))
                         p = atomic_add_cta(s_hist.iterator + cutlass.Int32(bn), cutlass.Int32(1))
                         if p < lim1:
-                            out_row[p] = tix
+                            _store_mapped_index(out_row, p, tix, mapping, row, self.page_size)
                         else:
                             if whole == cutlass.Int32(0):
                                 q2i = p - above
@@ -4156,12 +4183,12 @@ class GvrTopkRegKernel:
                             << cutlass.Int32(2)
                         ) + (sdyn & cutlass.Int32(3))
                         if p1 < lim1:
-                            out_row[p1] = idx
+                            _store_mapped_index(out_row, p1, idx, mapping, row, self.page_size)
                         p1 = p1 + cutlass.Int32(1)
                         wm = wm & (wm - cutlass.Int32(1))
                     if t1 == cutlass.Int32(1):
                         if p1 < lim1:
-                            out_row[p1] = tix
+                            _store_mapped_index(out_row, p1, tix, mapping, row, self.page_size)
                         p1 = p1 + cutlass.Int32(1)
                     if m2 != cutlass.Int32(0):  # static-unrolled
                         for s in cutlass.range_constexpr(S):
@@ -4212,7 +4239,7 @@ class GvrTopkRegKernel:
                                 r = r + tinc
                                 j = j + cutlass.Int32(1)
                             if r < need:
-                                out_row[above + r] = ci[i]
+                                _store_mapped_index(out_row, above + r, ci[i], mapping, row, self.page_size)
                             i = i + cutlass.Int32(BLK)
                     else:
                         # ---- fallback: exact key-space narrowing
@@ -4328,10 +4355,10 @@ class GvrTopkRegKernel:
                             p2e = b2 + popc(n2 & lml)
                             if q1f == cutlass.Int32(1):
                                 if p1e < aboveC:
-                                    out_row[above + p1e] = idv
+                                    _store_mapped_index(out_row, above + p1e, idv, mapping, row, self.page_size)
                             if q2f == cutlass.Int32(1):
                                 if p2e < needC:
-                                    out_row[above + aboveC + p2e] = idv
+                                    _store_mapped_index(out_row, above + aboveC + p2e, idv, mapping, row, self.page_size)
                             it = it + cutlass.Int32(1)
 
     # ------------------------------------------------------------------
@@ -4365,16 +4392,33 @@ class GvrTopkRegKernel:
 _COMPILE_CACHE__reg: dict = {}
 
 
-def get_compiled__reg(tpl, dump_dir=None, pdl=False, varlen=False, next_n=1, cr_shift=0):
+class GvrTopkRegPagedKernel(GvrTopkRegKernel):
+    """Same selection engine, with page translation at its terminal stores."""
+
+    @cute.jit
+    def __call__(
+        self, logits: cute.Tensor, pre_idx: cute.Tensor, kv_lens: cute.Tensor,
+        out: cute.Tensor, n: cutlass.Int32, cmp_: cutlass.Int32,
+        qc: cutlass.Int32, smem_bytes: cutlass.Int32, mapping, stream,
+    ):
+        self.kern(logits, pre_idx, kv_lens, out, n, cmp_, qc, smem_bytes, mapping).launch(
+            grid=(logits.shape[0], 1, 1), block=(self.blk, 1, 1),
+            stream=stream, smem=smem_bytes, min_blocks_per_mp=self.minb,
+            use_pdl=self.pdl,
+        )
+
+
+def get_compiled__reg(tpl, dump_dir=None, pdl=False, varlen=False, next_n=1, cr_shift=0, mapping_spec=None):
     """Compile (or fetch) the variant for constexpr tuple
     (BLK, VPT, MINB, KPT, CUR, DEG, IMG, NBH)."""
-    key = (tuple(tpl), bool(pdl), bool(varlen), int(next_n), int(cr_shift), C._compile_arch_token())
+    key = (tuple(tpl), bool(pdl), bool(varlen), int(next_n), int(cr_shift), C._compile_arch_token(), mapping_spec)
     compiled = _COMPILE_CACHE__reg.get(key)
     if compiled is None:
         from cutlass.cute import runtime as _crt
 
         blk, vpt, minb, kpt, cur, deg, img, nbh = tpl
-        kernel = GvrTopkRegKernel(
+        kernel_cls = GvrTopkRegKernel if mapping_spec is None else GvrTopkRegPagedKernel
+        kernel = kernel_cls(
             blk,
             vpt,
             minb,
@@ -4387,6 +4431,7 @@ def get_compiled__reg(tpl, dump_dir=None, pdl=False, varlen=False, next_n=1, cr_
             varlen=varlen,
             next_n=next_n,
             cr_shift=cr_shift,
+            page_size=0 if mapping_spec is None else mapping_spec[0],
         )
         nb_, nc_ = cute.sym_int(), cute.sym_int()
         nb2_, nc2_ = cute.sym_int(), cute.sym_int()
@@ -4405,6 +4450,19 @@ def get_compiled__reg(tpl, dump_dir=None, pdl=False, varlen=False, next_n=1, cr_
             cutlass.Int32, (v0_,), stride_order=(0,), assumed_align=4
         )
         fake_stream = _crt.make_fake_stream(use_tvm_ffi_env_stream=True)
+        mapping_args = ()
+        if mapping_spec is not None:
+            _, has_row_map, has_page_starts, has_raw = mapping_spec
+            pages_fake = _crt.make_fake_tensor(
+                cutlass.Int32, (cute.sym_int(), cute.sym_int()),
+                stride=(cute.sym_int64(), 1), assumed_align=4,
+            )
+            mapping_args = ((
+                pages_fake,
+                kv_fake if has_row_map else None,
+                kv_fake if has_page_starts else None,
+                out_fake if has_raw else None,
+            ),)
         opts = _base_compile_opts()
         if dump_dir:
             opts += f" --keep-ptx --keep-cubin --dump-dir {dump_dir}"
@@ -4421,6 +4479,7 @@ def get_compiled__reg(tpl, dump_dir=None, pdl=False, varlen=False, next_n=1, cr_
                     cutlass.Int32(0),
                     cutlass.Int32(0),
                     cutlass.Int32(0),
+                    *mapping_args,
                     stream=fake_stream,
                     options=opts,
                 )
@@ -4433,6 +4492,8 @@ def get_compiled__reg(tpl, dump_dir=None, pdl=False, varlen=False, next_n=1, cr_
                 "reg_" + "_".join(str(x) for x in tuple(tpl))
                 + f"_pdl{int(bool(pdl))}_vl{int(bool(varlen))}_nn{int(next_n)}_cs{int(cr_shift)}"
             )
+            if mapping_spec is not None:
+                name += "_paged_" + "_".join(str(int(x)) for x in mapping_spec)
             compiled = C._persist(name, _compile_fn)
         _COMPILE_CACHE__reg[key] = compiled
     return compiled
