@@ -69,6 +69,9 @@ PCIE_IPC_CUSTOM_OP = "flashinfer::pcie_ipc_all_reduce"
 # driver versions but nothing about this op, and a dev checkout does not move
 # the FlashInfer version.
 PCIE_IPC_TUNE_VERSION = 3
+# Only workspaces that admit stream publication search the additional tactic.
+# Preserve their existing namespace without invalidating original-path caches.
+_PCIE_IPC_MEMOP_TUNE_VERSION = 4
 
 # Not all powers of two: the extra entries are block counts the search selected
 # on real hardware, and it cannot converge on a configuration its own grid
@@ -120,6 +123,7 @@ def candidate_tactics(
     numel: Optional[int] = None,
     elem_size: int = 2,
     profile: Optional[str] = None,
+    memop_supported: bool = False,
 ) -> Tuple[Tuple[int, int, int], ...]:
     """Every launch configuration worth profiling for this shape, as tactics.
 
@@ -132,17 +136,26 @@ def candidate_tactics(
     worth measuring here", and returns the unscreened grid.
     """
     return _candidate_tactics_cached(
-        world_size, max_blocks, blocks, threads, numel, elem_size, profile
+        world_size,
+        max_blocks,
+        blocks,
+        threads,
+        numel,
+        elem_size,
+        profile,
+        memop_supported,
     )
 
 
 @lru_cache(maxsize=None)
 def _candidate_tactics_cached(
-    world_size, max_blocks, blocks, threads, numel, elem_size, profile
+    world_size, max_blocks, blocks, threads, numel, elem_size, profile, memop_supported
 ):
     screen = numel is not None and numel * elem_size >= PREFILL_SCREEN_BYTES
     out = []
     for variant in IpcVariant:
+        if variant == IpcVariant.COPY_ENGINE_RING_MEMOP and not memop_supported:
+            continue
         # The island schedule's 4+4 grouping describes one topology, and on
         # fabrics it does not describe it measured worse than the flat ring and
         # the SM path it competes with, so leaving it reachable is worse than
@@ -156,6 +169,8 @@ def _candidate_tactics_cached(
         ):
             continue
         for b in blocks:
+            if variant == IpcVariant.COPY_ENGINE_RING_MEMOP and b != 1:
+                continue
             for t in threads:
                 if screen and t < PREFILL_MIN_THREADS:
                     continue
@@ -192,8 +207,29 @@ def tactic_to_config(tactic: Sequence[int]) -> IpcLaunchConfig:
         raise ValueError(f"tactic {tactic!r} names no variant: {exc}") from exc
 
 
+def _cache_key_head(
+    world_size: int,
+    profile: str,
+    max_blocks: int,
+    max_numel: int,
+    memop_supported: bool,
+) -> Tuple:
+    head = (
+        _PCIE_IPC_MEMOP_TUNE_VERSION if memop_supported else PCIE_IPC_TUNE_VERSION,
+        int(world_size),
+        str(profile),
+        int(max_blocks),
+        int(max_numel),
+    )
+    return head + (True,) if memop_supported else head
+
+
 def cache_covers_workspace(
-    world_size: int, profile: str, max_blocks: int, max_numel: int
+    world_size: int,
+    profile: str,
+    max_blocks: int,
+    max_numel: int,
+    memop_supported: bool = False,
 ) -> bool:
     """Whether the loaded cache holds any entry written for this workspace.
 
@@ -215,13 +251,7 @@ def cache_covers_workspace(
     prefix = f"('{PCIE_IPC_CUSTOM_OP}'"
     # cache_key_extras up to the dtype, with the closing paren traded for the
     # separator that must follow it.
-    head = (
-        PCIE_IPC_TUNE_VERSION,
-        int(world_size),
-        str(profile),
-        int(max_blocks),
-        int(max_numel),
-    )
+    head = _cache_key_head(world_size, profile, max_blocks, max_numel, memop_supported)
     needle = repr(head)[:-1] + ", "
     return any(
         key.startswith(prefix) and needle in key
@@ -325,6 +355,7 @@ def cache_key_extras(
     max_blocks: int,
     max_numel: int,
     dtype: torch.dtype,
+    memop_supported: bool = False,
 ) -> Tuple:
     """Everything the autotuner's own cache key leaves out.
 
@@ -339,14 +370,9 @@ def cache_key_extras(
     autotuner requires: the tuple must come out the same for the caller's real
     tensors and for the ones it synthesizes.
     """
-    return (
-        PCIE_IPC_TUNE_VERSION,
-        int(world_size),
-        str(profile),
-        int(max_blocks),
-        int(max_numel),
-        str(dtype),
-    )
+    return _cache_key_head(
+        world_size, profile, max_blocks, max_numel, memop_supported
+    ) + (str(dtype),)
 
 
 def pack_config(config: IpcLaunchConfig) -> int:
@@ -526,18 +552,25 @@ class PcieIpcAllReduceRunner(TunableRunner):
         return hash(
             (
                 type(self).__name__,
-                PCIE_IPC_TUNE_VERSION,
-                ws.world_size,
-                ws.profile,
-                ws.max_blocks,
-                ws.max_numel,
+                *_cache_key_head(
+                    ws.world_size,
+                    ws.profile,
+                    ws.max_blocks,
+                    ws.max_numel,
+                    ws.memop_supported,
+                ),
             )
         )
 
     def get_cache_key_extras(self, inputs) -> Tuple:
         ws = self._ws
         return cache_key_extras(
-            ws.world_size, ws.profile, ws.max_blocks, ws.max_numel, inputs[0].dtype
+            ws.world_size,
+            ws.profile,
+            ws.max_blocks,
+            ws.max_numel,
+            inputs[0].dtype,
+            ws.memop_supported,
         )
 
     def _output_for(self, inp: torch.Tensor) -> torch.Tensor:
@@ -606,6 +639,7 @@ class PcieIpcAllReduceRunner(TunableRunner):
             numel=inp.numel(),
             elem_size=inp.element_size(),
             profile=ws.profile,
+            memop_supported=ws.memop_supported,
         )
         configs = [table_config] + [tactic_to_config(t) for t in tactics]
 

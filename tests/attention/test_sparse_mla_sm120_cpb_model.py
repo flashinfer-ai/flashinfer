@@ -288,6 +288,79 @@ def test_missing_or_corrupt_cache_falls_back(clean_cpb_state, tmp_path) -> None:
     assert _resolve_cpb(device, "dsv4", 1, 16, 1024, 0) == -1
 
 
+def test_stale_schema_is_read_once_until_file_changes(
+    clean_cpb_state, monkeypatch
+) -> None:
+    """Repeated misses skip stale JSON, but a replaced tuning file is picked up."""
+    from unittest.mock import patch
+    import os
+
+    device = torch.device("cpu")
+    path = cpb_mod.default_cache_path()
+    path.write_text('{"schema_version": 1, "devices": {}}')
+    old_mtime = path.stat().st_mtime
+    read_text = type(path).read_text
+    with patch.object(
+        type(path), "read_text", autospec=True, side_effect=read_text
+    ) as read:
+        for _ in range(3):
+            assert cpb_mod.get_constants(device, "glm53_nope") is None
+            assert cpb_mod.get_cpb_override(device, "glm53_nope", 32, 512, 4) is None
+            assert cpb_mod.get_decode_max_tokens(device, "glm53_nope", 32, 512) is None
+        assert read.call_count == 1
+        path.write_text(
+            cpb_mod.json.dumps(
+                {
+                    "schema_version": cpb_mod._SCHEMA_VERSION,
+                    "devices": {
+                        cpb_mod._device_key(device): {"dsv4": cpb_mod.asdict(_C)}
+                    },
+                }
+            )
+        )
+        os.utime(path, (old_mtime + 1, old_mtime + 1))
+        assert cpb_mod.get_constants(device, "dsv4") == _C
+        assert read.call_count == 2
+
+
+def test_legacy_glm_layout_calibration_is_invalidated(clean_cpb_state) -> None:
+    """A payload-layout change invalidates constants and measured tuning picks."""
+    from flashinfer.mla._sparse_mla_sm120 import _resolve_cpb
+
+    device = torch.device("cpu")
+    legacy = CpbConstants(**{**_C.__dict__, "bytes_per_chunk": 64 * 656})
+    cpb_mod.default_cache_path().write_text(
+        cpb_mod.json.dumps(
+            {
+                "schema_version": 1,
+                "devices": {
+                    cpb_mod._device_key(device): {
+                        "glm53_nope": cpb_mod.asdict(legacy),
+                        cpb_mod._CPB_OVERRIDES_KEY: {"glm53_nope|32|512|4": 7},
+                        cpb_mod._DECODE_MAX_TOKENS_KEY: {"glm53_nope|32|512": 16},
+                    }
+                },
+            }
+        )
+    )
+    assert cpb_mod.get_constants(device, "glm53_nope") is None
+    assert cpb_mod.get_cpb_override(device, "glm53_nope", 32, 512, 4) is None
+    assert cpb_mod.get_decode_max_tokens(device, "glm53_nope", 32, 512) is None
+    assert _resolve_cpb(device, "glm53_nope", 4, 32, 512, 0) == -1
+
+    current = CpbConstants(**{**_C.__dict__, "bytes_per_chunk": 64 * 528})
+    cpb_mod.save_constants(device, "glm53_nope", current)
+    cpb_mod._constants.clear()
+    cpb_mod._cache_mtime = -1.0
+    assert cpb_mod.get_constants(device, "glm53_nope") == current
+    payload = cpb_mod.json.loads(cpb_mod.default_cache_path().read_text())
+    assert payload["schema_version"] == cpb_mod._SCHEMA_VERSION
+    assert (
+        cpb_mod._CPB_OVERRIDES_KEY
+        not in payload["devices"][cpb_mod._device_key(device)]
+    )
+
+
 def _skip_if_low_vram(needed_gib: int) -> None:
     """Skip when the GPU cannot fit the multi-GiB KV pool (mirrors the
     torch.cuda.mem_get_info precedent in test_mla_decode_kernel.py)."""

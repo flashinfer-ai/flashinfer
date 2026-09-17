@@ -719,6 +719,68 @@ def test_nvfp4_sparse_mla_decode_matches_dequantized_reference(
     torch.testing.assert_close(prefill_lse, reference_lse, atol=2e-2, rtol=2e-2)
 
 
+def test_nvfp4_sparse_mla_masked_rows_ignore_poisoned_slot_zero() -> None:
+    """Masked (-1) candidates gather the shared zero row, never cache slot 0:
+    the slot is poisoned with 0xFF (the BF16 rope tail decodes as NaN) and
+    must not leak into valid outputs through 0 * NaN in the value MMA."""
+    _require_sm120()
+    torch.manual_seed(0)
+    num_tokens, num_heads, topk = 2, 128, 512
+    num_pages, page_size = 16, 64
+    kv_bf16 = (
+        torch.randn(
+            num_pages,
+            page_size,
+            1,
+            _D_NOPE + _D_ROPE,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    q = (
+        torch.randn(
+            num_tokens,
+            num_heads,
+            _D_NOPE + _D_ROPE,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    # Slot 0 is never a valid candidate, so the reference is unaffected by
+    # the poisoning below.
+    indices = torch.randint(
+        1,
+        num_pages * page_size,
+        (num_tokens, topk),
+        dtype=torch.int32,
+        device="cuda",
+    )
+    indices[:, topk // 2 :] = -1
+    sm_scale = (_D_NOPE + _D_ROPE) ** -0.5
+
+    cache = nvfp4_quantize_pack_sparse_mla_cache(kv_bf16.squeeze(2))
+    q_dequant = _dequantize_nvfp4_query(q)
+    kv_dequant = _dequantize_nvfp4_cache(cache)
+    reference, reference_lse = _reference_sparse_attention(
+        q_dequant, kv_dequant, indices, sm_scale
+    )
+
+    # Poison slot 0 (page 0, token 0): its 352B data row (packed NoPE + BF16
+    # rope tail) and its 32B scale row.
+    page0 = cache[0].view(-1)
+    page0[:_DATA_BYTES_PER_TOKEN].fill_(0xFF)
+    scale_base = page_size * _DATA_BYTES_PER_TOKEN
+    page0[scale_base : scale_base + _SCALE_BYTES_PER_TOKEN].fill_(0xFF)
+
+    for attention in (_nvfp4_sparse_mla_decode, _nvfp4_sparse_mla_prefill):
+        output, lse = attention(q, cache, indices, sm_scale)
+        assert torch.isfinite(output.float()).all()
+        torch.testing.assert_close(output, reference, atol=5e-2, rtol=5e-2)
+        torch.testing.assert_close(lse, reference_lse, atol=2e-2, rtol=2e-2)
+
+
 @pytest.mark.parametrize("num_tokens", [2, 65])
 def test_nvfp4_sparse_mla_shared_wrapper_matches_reference(num_tokens: int) -> None:
     """The existing SM120 wrapper routes NVFP4 through its independent planner."""

@@ -18,11 +18,11 @@ from __future__ import annotations
 
 import functools
 import math
-from typing import Any, Callable
+from typing import Any, Callable, Sequence, Tuple
 
 import torch
 
-from ...autotuner import DynamicTensorSpec, TuningConfig
+from ...autotuner import ConstraintSpec, DynamicTensorSpec, TuningConfig
 from ...autotuner.initializers import (
     autotuner_initializer_empty,
     autotuner_initializer_ones,
@@ -30,13 +30,14 @@ from ...autotuner.initializers import (
     autotuner_initializer_randn,
     autotuner_initializer_zeros,
 )
-from ...tllm_enums import Fp8QuantizationType
+from ...tllm_enums import Fp8QuantizationType, SfLayout
 from ..utils import (
     get_hybrid_num_tokens_buckets,
     make_hybrid_bucket_mapper,
     make_random_topk_ids,
 )
 from .inputs import MoeRunnerInputs
+from .validation import SUPPORTED_MOE_ACT_SF_LAYOUT
 
 
 @functools.cache
@@ -114,6 +115,31 @@ def make_repeating_tensor_initializer(
     return _initializer
 
 
+@functools.cache
+def _make_flat_act_sf_numel_inferrer(
+    hidden_states_idx: int, sf_per_token: int
+) -> Callable[[Sequence[Sequence[int]]], int]:
+    """ConstraintSpec callback for a flat (1-D) activation scale buffer.
+
+    A flat scale holds ``num_tokens * sf_per_token`` elements, so its single
+    dim is not ``num_tokens``.  The autotuner writes a bucket's raw token
+    count verbatim into a dynamic dim (see ``_generate_optimization_profiles``),
+    which would under-allocate the buffer by a factor of ``sf_per_token`` and
+    make the kernel read out of bounds while profiling.  A ConstraintSpec
+    instead derives the extent from the profiled ``hidden_states`` dim 0, the
+    same approach ``runners.py`` uses for the swizzled MXFP8 activation scale.
+
+    Cached so equal arguments yield the same callable: ConstraintSpec is hashed
+    into AutoTuner._find_nearest_profile's lru_cache key, and a fresh closure
+    per inference call would cause unbounded cache growth.
+    """
+
+    def infer_shape(shapes: Sequence[Sequence[int]]) -> int:
+        return shapes[hidden_states_idx][0] * sf_per_token
+
+    return infer_shape
+
+
 def make_moe_tuning_config(
     moe_inputs: MoeRunnerInputs,
     *,
@@ -122,9 +148,16 @@ def make_moe_tuning_config(
     fp8_quantization_type: Fp8QuantizationType,
     init_packed_topk_ids: Callable | None,
     tune_max_num_tokens: int = 8192,
+    act_sf_layout: SfLayout = SUPPORTED_MOE_ACT_SF_LAYOUT,
     **kwargs: Any,
 ) -> TuningConfig:
-    """Build a TuningConfig for a MoE runner instance."""
+    """Build a TuningConfig for a MoE runner instance.
+
+    ``act_sf_layout`` is the *already resolved* layout of a block-scale
+    ``hidden_states_scale``; resolve it in the caller with
+    :func:`~flashinfer.fused_moe.shared.validation.resolve_moe_act_sf_layout`
+    so its DeprecationWarning is attributed to the user's call site.
+    """
 
     spec = {
         "output": autotuner_initializer_empty,
@@ -148,12 +181,96 @@ def make_moe_tuning_config(
     sorted_inputs = sorted(
         (MoeRunnerInputs.idx(name), name, init) for name, init in spec.items()
     )
-    input_idx = tuple(i for i, _, _ in sorted_inputs)
 
     num_tokens = moe_inputs.hidden_states.shape[0]
 
+    # A flat (1-D) activation scale — the linear layout produced by
+    # mxfp8_quantize(..., is_sf_swizzled_layout=False), and what
+    # TensorRT-LLM passes through — packs num_tokens * sf_per_token
+    # elements into a single dimension, so no dim of it equals
+    # num_tokens.  Resizing it as a dynamic dim would shrink it to the
+    # raw bucket count; drive it with a ConstraintSpec that scales by
+    # sf_per_token instead.  The C++ launcher accepts any rank here (it
+    # derives the SF vector size from numel alone).
+    constraint_specs: Tuple[ConstraintSpec, ...] = ()
+    scale = moe_inputs.hidden_states_scale
+    flat_scale = (
+        scale is not None
+        and fp8_quantization_type != Fp8QuantizationType.DeepSeekFp8
+        and scale.dim() == 1
+    )
+    if flat_scale:
+        # Hoisted: this runs on every op call (_make_tuning_config is not
+        # memoized), so avoid repeating the numel() FFI hop three times.
+        _sf_numel = scale.numel()
+        if num_tokens <= 0 or _sf_numel % num_tokens != 0:
+            # Not an assert: these validate caller input, and `python -O`
+            # strips asserts -- which would let a malformed flat scale
+            # through and let the floor division below derive an
+            # undersized profiling extent.
+            raise ValueError(
+                f"flat hidden_states_scale numel {_sf_numel} is not a "
+                f"multiple of num_tokens={num_tokens}"
+            )
+        # Validate the buffer against the DECLARED layout.
+        # ``act_sf_layout`` is linear here — the caller either said so or
+        # the deprecated implicit path inferred it, and
+        # resolve_moe_act_sf_layout() rejects every other value up
+        # front — so the expected extent is exact: a linear scale holds
+        # num_tokens * hidden_size // sf_vec_size elements, and the C++
+        # launcher recovers sf_vec_size as
+        # num_tokens * hidden_size / numel, accepting only 16 (NvFp4) or
+        # 32 (Mx*).  A buffer that implies anything else is malformed
+        # for the declared layout and fails here with a clear message
+        # instead of deriving a bogus profiling stride.
+        #
+        # This validates against the declaration; it is not a layout
+        # *detector*, and it does not need to be.  As measured in #3455,
+        # a 128x4-swizzled buffer has exactly the linear numel whenever
+        # num_tokens % 128 == 0, so it would slip past any numel-based
+        # test — which is precisely why the layout is declared rather
+        # than guessed.  A caller that declares swizzled never reaches
+        # this code (NotImplementedError in the resolver); one that stays
+        # on the deprecated implicit path gets the DeprecationWarning
+        # telling it to declare.  Either way sf_per_token is only used to
+        # SIZE a profiling buffer, never to interpret data, so an
+        # indistinguishable swizzled buffer sizes correctly and a
+        # distinguishable one (row/column padded, hence strictly larger)
+        # either trips this check or over-sizes the buffer, which is
+        # safe.
+        _sf_per_token = _sf_numel // num_tokens
+        if not (
+            _sf_per_token > 0
+            and hidden_size % _sf_per_token == 0
+            and hidden_size // _sf_per_token in (16, 32)
+        ):
+            raise ValueError(
+                f"flat hidden_states_scale numel {_sf_numel} implies "
+                f"{_sf_per_token} scales/token for hidden_size="
+                f"{hidden_size}, i.e. an SF vector size of "
+                f"{hidden_size / _sf_per_token if _sf_per_token else 'inf'}; "
+                "which is not a supported SF vector size (16 for NvFp4, 32 "
+                f"for Mx*). {act_sf_layout!r} expects "
+                "num_tokens * hidden_size // sf_vec_size elements, e.g. from "
+                "mxfp8_quantize(..., is_sf_swizzled_layout=False)."
+            )
+        constraint_specs = (
+            ConstraintSpec(
+                MoeRunnerInputs.idx("hidden_states_scale"),
+                0,
+                _make_flat_act_sf_numel_inferrer(
+                    MoeRunnerInputs.idx("hidden_states"),
+                    _sf_per_token,
+                ),
+            ),
+        )
+
     def _dynamic_dim(name: str) -> int:
         if name == "hidden_states_scale":
+            # DeepSeekFp8 uses [hidden_size//128, num_tokens]; all others
+            # (MxFp8, fp4, …) use [num_tokens, ...] when 2-D.  The flat
+            # 1-D layout never reaches here — it is filtered out above
+            # and handled by a ConstraintSpec.
             t = moe_inputs.hidden_states_scale
             if fp8_quantization_type == Fp8QuantizationType.DeepSeekFp8:
                 assert t.shape == (hidden_size // 128, num_tokens), (
@@ -162,25 +279,36 @@ def make_moe_tuning_config(
                     f"(hidden_size//128={hidden_size // 128}, num_tokens={num_tokens})"
                 )
                 return 1
-            assert t.shape[0] == num_tokens, (
+            assert t.dim() >= 1 and t.shape[0] == num_tokens, (
                 f"hidden_states_scale shape {tuple(t.shape)} does not match "
-                f"expected layout (num_tokens={num_tokens}, ...)"
+                f"expected layout (num_tokens={num_tokens}, ...) or flat "
+                f"(num_tokens * sf_per_token,)"
             )
             return 0
         return MoeRunnerInputs._DYNAMIC_DIM[name]
 
-    dim_idx = tuple(_dynamic_dim(name) for _, name, _ in sorted_inputs)
+    # The constrained flat scale is excluded from the dynamic spec but keeps
+    # its initializer: a ConstraintSpec also marks the dim dynamic, so the
+    # profiler still synthesizes the tensor at the derived size.
+    dynamic_inputs = tuple(
+        (idx, name)
+        for idx, name, _ in sorted_inputs
+        if not (flat_scale and name == "hidden_states_scale")
+    )
+    dynamic_input_idx = tuple(idx for idx, _ in dynamic_inputs)
+    dim_idx = tuple(_dynamic_dim(name) for _, name in dynamic_inputs)
     tensor_initializers = tuple((idx, init) for idx, _, init in sorted_inputs)
 
     return TuningConfig(
         dynamic_tensor_specs=(
             DynamicTensorSpec(
-                input_idx,
+                dynamic_input_idx,
                 dim_idx,
                 get_hybrid_num_tokens_buckets(tune_max_num_tokens, 1),
                 make_hybrid_bucket_mapper(tune_max_num_tokens),
             ),
         ),
+        constraint_specs=constraint_specs,
         tensor_initializers=tensor_initializers,
         **kwargs,
     )

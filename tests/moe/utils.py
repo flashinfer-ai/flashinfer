@@ -29,6 +29,7 @@ from flashinfer.fused_moe import (
     GeGLU,
     GeGLUTanh,
     Identity,
+    QuantConfig,
     ReLU,
     ReLU2,
     SiLU,
@@ -49,6 +50,21 @@ from flashinfer.tllm_enums import (
     RoutingMethodType,
 )
 from flashinfer.utils import get_compute_capability
+
+
+def quant_id(quant: QuantConfig) -> str:
+    """Pytest id for a QuantConfig MMA pair, e.g. ``NVFP4xNVFP4`` or ``NVFP4xBF16``."""
+    weight, activation = quant.pair
+    return f"{weight.name}x{activation.name}"
+
+
+def parametrize_id(val: object) -> str | None:
+    """Id for ``pytest_make_parametrize_id``; ``None`` leaves pytest's default."""
+    if isinstance(val, QuantConfig):
+        return quant_id(val)
+    if isinstance(val, ActivationConfig):
+        return type(val).__name__
+    return None
 
 
 def assert_trtllm_packed_call_contract(runner, inputs) -> None:

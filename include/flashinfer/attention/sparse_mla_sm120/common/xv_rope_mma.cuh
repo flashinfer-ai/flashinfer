@@ -51,8 +51,9 @@
 template <ModelType MT, int PAGE_BLOCK_SIZE>
 __device__ __forceinline__ void xv_rope_mma(float acc_rope[4], float w0, float w1, float w2,
                                             float w3, const int32_t* __restrict__ tile_indices,
-                                            const uint8_t* __restrict__ KV_cache, int mwarp,
-                                            int lane, size_t stride_kv_block, bf16* weight_smem) {
+                                            int valid_len, const uint8_t* __restrict__ KV_cache,
+                                            int mwarp, int lane, size_t stride_kv_block,
+                                            bf16* weight_smem) {
   if constexpr (!KVCacheTraits<MT>::V_HAS_ROPE) return;
 
   using KV = KVCacheTraits<MT>;
@@ -80,14 +81,15 @@ __device__ __forceinline__ void xv_rope_mma(float acc_rope[4], float w0, float w
     uint32_t a0, a1, a2, a3;
     ldmatrix_load_A_bf16(a0, a1, a2, a3, weight_smem + k_base, BI, lane);
 
-    // B operand: 4 scalar loads from global (L2 cached). Invalid entries
-    // (idx < 0) return v=0 directly rather than reading slot 0 — if slot 0
-    // holds non-finite KV (unwritten BF16 NaN/inf from prior workload),
-    // 0 * NaN = NaN would propagate through the MMA. The QK side masks
-    // invalid entries to -1e30 so weights round to 0, but that's not safe
-    // against non-finite V.
+    // B operand: 4 scalar loads from global (L2 cached). Invalid entries —
+    // idx < 0, or entry_offset at/past the tile's runtime length (stale
+    // caller padding) — return v=0 directly rather than reading slot 0: if
+    // slot 0 holds non-finite KV (unwritten BF16 NaN/inf from prior
+    // workload), 0 * NaN = NaN would propagate through the MMA. The QK side
+    // masks invalid entries to -1e30 so weights round to 0, but that's not
+    // safe against non-finite V.
     auto load_rope_v = [&](int entry_offset) -> uint16_t {
-      int idx = tile_indices[entry_offset];
+      int idx = mask_idx_past_len(tile_indices[entry_offset], entry_offset, valid_len);
       if (idx < 0) return 0;
       const uint8_t* base;
       if constexpr (KV::SCALE_IN_KV_SMEM) {
@@ -125,8 +127,8 @@ __device__ __forceinline__ void xv_rope_mma(float acc_rope[4], float w0, float w
 template <ModelType MT, int PAGE_BLOCK_SIZE, int N_HG>
 __device__ __forceinline__ void xv_rope_mma_mg(float acc_rope[N_HG][4], const float w_grp[N_HG][4],
                                                const int32_t* __restrict__ tile_indices,
-                                               const uint8_t* __restrict__ KV_cache, int mwarp,
-                                               int lane, size_t stride_kv_block,
+                                               int valid_len, const uint8_t* __restrict__ KV_cache,
+                                               int mwarp, int lane, size_t stride_kv_block,
                                                bf16* weight_smem) {
   if constexpr (!KVCacheTraits<MT>::V_HAS_ROPE) return;
 
@@ -156,7 +158,7 @@ __device__ __forceinline__ void xv_rope_mma_mg(float acc_rope[N_HG][4], const fl
     int k_base = ks * 16;
 
     auto load_rope_v = [&](int entry_offset) -> uint16_t {
-      int idx = tile_indices[entry_offset];
+      int idx = mask_idx_past_len(tile_indices[entry_offset], entry_offset, valid_len);
       if (idx < 0) return 0;
       const uint8_t* base;
       if constexpr (KV::SCALE_IN_KV_SMEM) {
