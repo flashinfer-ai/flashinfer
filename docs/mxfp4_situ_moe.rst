@@ -58,6 +58,12 @@ from FP32 to group-32 MXFP8 before GEMM2. Router weights are applied after the
 expert computation. Output includes only experts in this rank's interval;
 cross-rank reduction is external.
 
+Mixed MXFP8/MXFP4 SiTU uses native approximate FP32 tanh for the gate and
+optional up clamp. Runtime beta, sigmoid evaluation and intermediate
+quantization remain explicit. Values near a quantization boundary can change
+an intermediate byte; the numerical report includes that effect. W4A4/W4A16
+SiTU and unrelated GELU/tanh helpers retain their existing arithmetic.
+
 Native layouts
 --------------
 
@@ -92,6 +98,15 @@ token and lie in ``[0, num_experts)``, as in standard top-k routing.
 PDL-enabled decode retains separate
 native sorting. Prefill conversion, sorting and clearing are unchanged.
 
+On B300, SiTU T1..16 additionally uses a ballot/popcount routing prefix and
+a 16-row A transfer in GEMM2 when PDL is disabled, routing tile size is 128,
+and both GEMMs use M128/N128, cluster1, non-raster tactics. Unique IDs bound
+each expert to at most T valid rows. The transfer retains full shared stage
+strides, scale-factor transfers, MMA shape and valid-row output predicates.
+Routing and finalize caches include their specialization modes. SM100, T17+,
+other activations, PDL and other tactics retain the existing routing/finalize
+paths; native SiTU arithmetic still applies to other supported W4A8 shapes.
+
 Workspace and kernel selection
 ------------------------------
 
@@ -115,236 +130,401 @@ At H=7168, I=3072 and 112 local experts, one prepared weight bank occupies
 3,930,587,136 bytes. With top-k=16 and the conservative tactic, workspace is
 6,499,072 bytes at T=1, 45,885,440 bytes at T=16, and 253,748,224 bytes at
 T=4096. These totals exclude caller activations/output and temporary load-time
-preparation storage. Paired evaluation holds one bank per backend; serving
-with the CuTe runner needs only its own bank.
+preparation storage. Evaluation retains CuTe- and TRT-prepared banks, with
+the CuTe revisions sharing prepared tensors; serving with the CuTe runner
+needs only its own bank.
+
+Under the default M128/N128 tactic, GEMM1 allocates 228,352 shared bytes
+per CTA, six operand stages, two accumulator stages and 512 TMEM columns.
+GEMM2 allocates 207,872 shared bytes, five operand stages, two accumulator
+stages and 512 TMEM columns. The narrow A transfer reduces transferred
+bytes, not these allocated capacities. Workspace layout and size match the
+previous implementation. Other tactics have separate resource requirements.
+
+.. list-table:: Measured workspace and separate output sizes
+   :header-rows: 1
+
+   * - T
+     - Workspace bytes
+     - BF16 output bytes
+   * - 1
+     - 6,499,072
+     - 14,336
+   * - 16
+     - 45,885,440
+     - 229,376
+   * - 128
+     - 51,591,168
+     - 1,835,008
+   * - 512
+     - 71,154,176
+     - 7,340,032
+   * - 2048
+     - 149,412,864
+     - 29,360,128
+   * - 4096
+     - 253,748,224
+     - 58,720,256
 
 Evaluation status
 -----------------
 
-The selected candidate is ``fence-r008``, committed as
-``a24cbc26d49b8cc3a34f2bb3eb6dca691b604a01``. The repair adds typed
-``tcgen05.fence::after_thread_sync`` after producer acquisition and consumer
-waits, and completes TMEM loads with ``tcgen05.wait::ld`` before
-``tcgen05.fence::before_thread_sync`` and consumer release. This extends the
-earlier unaligned counted-barrier repair in both gather and finalize.
-Routing, warp roles, barrier counts and the three-launch decode design are
-unchanged from r007.
-
-R008 passed 168 SiTU/routing tests with two opt-in skips (58.67 seconds),
-the separate tile256/two-CTA changed-input graph and FP64 test (6.41 seconds),
-two all-local-896 tests (5.73 seconds), and eight existing W4A8/W4A4 SwiGLU,
-two-CTA and partial-tile tests (12.63 seconds). The full 84-row paired
-benchmark passed every numerical check; 76 rows passed clock qualification,
-including all 66 required rows. The benchmark took 160.20 seconds within
-the 349.84-second managed validation job.
-
 Validation uses NVIDIA B300 (SM103), CUDA 13.1, PyTorch 2.10.0a0 and CuTe DSL
 4.8.0.dev0. Full geometry is H=7168, I=3072, E=896, top-k=16, 112 local
-experts and offset 336. Numerical tests cover T=1,16,128,512,2048 with
-balanced, empty-expert and hot routing. Graph tests replay every T=1..16
-100 times; concurrent decode/prefill tests include independent compute and
-copy traffic. Per-expert runtime SiTU parameters and their graph mutation
-are covered with and without the up-branch tanh.
+experts and offset 336. All inputs are synthetic; matching real-checkpoint
+evaluation has not been performed.
 
-Follow-up PTX inspection found both fence forms, TMEM loads and load waits
-in gather/finalize entries for the default and tile256 configurations.
-This is an instruction-presence check with source windows, not proof of
-control-flow dominance. R008 synccheck was skipped after its hard
-20-second timeout, with no actual errors printed; it is not a pass and
-will not be retried automatically. R008 racecheck passed with zero hazards
-in 6.81 seconds. All six new full-geometry forward API audit cases passed:
-T1 packed, T16 packed/separate BF16, T128 packed, and T1025 packed/separate
-BF16. The three decode cases each contain five forwards with exactly three
-kernels, all on the calibrated caller stream, with clean compilation and
-forbidden-API checks. The follow-up validation job took 194.52 seconds.
-Earlier r007 traces remain historical evidence.
+The current implementation passed 96 numerical cases, 14 dispatch/cache
+boundary cases and 188 established regression tests. Three additional public
+regressions pass for both T16/T17 compilation orders and routing opt-in/fallback. These include 72 full-dimension
+configurations: 69 shape/routing combinations plus three parameter cases.
+Full dimensions cover every integer T1..17 and T128/256/512/1024/2048/4096
+with balanced, empty-expert and hot routing. Tests cover poisoned workspace,
+mutable graphs for every integer T1..16, optional/scalar/per-expert SiTU
+parameters, T16/T17 cache order, PDL and alternate tactics. Independent
+concurrent streams complete 480 plan replays across 30 cases. The 344 stage
+observations include repeated eager/graph executions, not independent inputs.
 
-Tests in ``tests/moe/test_cute_dsl_mxfp4_situ.py`` also exercise native-format
-decoding, lossless preparation, packed/separate routing, streams and
-preallocated execution. Enable full geometry with:
+Three CUDA API trace audits cover T1 packed, T16 separate BF16 routing and
+T17 packed, with five forwards each. All 55 correlated kernel activities
+execute on the calibrated caller stream. Audited forward ranges contain no
+allocation/free, host synchronization, device-to-host transfer, synchronous
+copy, module loading or compilation. Preparation and the final stream drain
+are outside those ranges. The audit job took 153.894 seconds of physical
+turnaround; its three workload drivers took 46.369, 11.159 and 10.436 seconds.
+
+The default decode forward has three launches. The traced packed T17 eager
+path has five; measured required prefill has five eager kernel activities
+and six Graph activities, including the graph-lowered output clear. These
+are measured per-forward counts, not a total of compiled variants. The
+compiled inventory depends on routing mode, tactic and specialization scope;
+no fixed total is asserted here. In the focused public cache-transition and
+routing tests, the resident inventory is one gather, two finalize and two
+routing callables (five total). This is the inventory for those exercised
+small-geometry plans, not every possible configuration.
+
+Targeted Ruff lint and formatting pass for the changed Python files. The
+formatted runtime has the same AST as the measured implementation. The three
+new public regressions took 11.583 seconds of driver execution (9.079 seconds
+in pytest); the packaging job, including queue/setup and histogram rendering,
+took 260.092 seconds.
+
+Earlier baseline racecheck passed with zero hazards; its synccheck was
+skipped after a hard 20-second timeout. Those results remain source-specific:
+ordinary numerical/API checks do not establish a new sanitizer pass.
+
+Numerical semantics and limits
+------------------------------
+
+Both FP64 references use the same stored quantized operands. The ideal
+reference evaluates FP64 GEMMs, SiTU and routing-weight accumulation without
+intermediate quantization. The explicit reference rounds the FP64 activation
+to FP32, applies the unchanged group-32 MXFP8 quantizer, then evaluates GEMM2
+and routing in FP64. Reports include relative L2, cosine, absolute-error
+percentiles/max, worst-token error and finite checks. All full-dimension
+outputs are finite.
+
+The following are independent worst values across the required full-size
+qualification observations; columns need not identify the same case. Previous/current each have 216
+observations; TRT has 210 because its adapter omits absent-linear-beta cases.
+The initial and remaining numerical batches use fixture banks generated at
+T128 and T4096, respectively, with seed 123. Empty outputs are included.
+
+.. list-table:: Full-dimension numerical extrema
+   :header-rows: 1
+
+   * - Reference / implementation
+     - Max relative L2
+     - Min cosine
+     - Max p95 abs
+     - Max p99 abs
+     - Max abs
+   * - Ideal FP64 / Previous
+     - 0.02742379
+     - 0.99962416
+     - 0.00377511
+     - 0.00717171
+     - 0.02299803
+   * - Ideal FP64 / Current
+     - 0.02742379
+     - 0.99962416
+     - 0.00377577
+     - 0.00717597
+     - 0.02299803
+   * - Ideal FP64 / TRT
+     - 0.02748178
+     - 0.99962251
+     - 0.00373778
+     - 0.00706444
+     - 0.02154345
+   * - Explicit MXFP8 / Previous
+     - 0.00459769
+     - 0.99998943
+     - 0.00055471
+     - 0.00138613
+     - 0.01067550
+   * - Explicit MXFP8 / Current
+     - 0.00462994
+     - 0.99998928
+     - 0.00055403
+     - 0.00139324
+     - 0.01143374
+   * - Explicit MXFP8 / TRT
+     - 0.00270023
+     - 0.99999635
+     - 0.00034163
+     - 0.00065426
+     - 0.00331082
+
+Accuracy remains a tradeoff. At T16 balanced, explicit-reference relative L2
+increases from 0.00242913 to 0.00276122. The largest full-size ideal-reference
+increase over the previous implementation is 0.00001034. At T512, a graph
+replay changed from empty-expert to hot routing has current/TRT explicit
+relative L2 of 0.00462994/0.00241501. At T4096 hot routing, worst-token
+explicit relative L2 rises from 0.00804290 to 0.01578682. The ideal-reference
+aggregate alone does not resolve these differences.
+
+The combined implementation matches its native-arithmetic-only control's
+valid intermediate FP8/UE8M0 bytes in all 344 stage comparisons. This does
+not imply bitwise output identity: BF16 contribution rounding and atomic
+accumulation remain part of finalization. A separate T4 diagnostic on that
+control, using a different T2048-generated fixture bank, reproduced one FP8
+value changing from 1.125 to 1.0 with its scale unchanged. FP64 GEMM2/routing
+of each actual intermediate, followed by BF16 rounding, exactly reproduced
+both outputs. That result accounts for the downstream difference in that
+fixture; it did not observe pre-quantization FP32 registers and is not a
+fresh combined-implementation T4 result.
+
+The four-backend evolution comparison requires current ideal-FP64 error no
+greater than the previous CuTe implementation's error plus the reference's
+BF16 representation floor. The public tests retain their existing gate:
+current ideal-FP64 error no greater than TRT's error plus that floor. Neither
+gate requires explicit-reference nonregression. The historical
+``atol=0.1, rtol=0.15``, greater-than-95% precedent remains diagnostic.
+Final customer numerical acceptance is unresolved.
+
+Comparative performance
+-----------------------
+
+All 66 required rows are clock-qualified: T1/2/4/8/16 and
+T128/256/512/1024/2048/4096, three routing distributions, eager and Graph.
+Every row compares identical operands across the previous implementation,
+a native-arithmetic-only control, the current implementation and TRT-LLM Gen
+on the same B300. Inputs use seed 123, beta 4, linear_beta 25 and packed BF16
+routing. Measurements use cold-L2 CUPTI, alternating backend order, five
+warmups and 20 samples, with SM clock at least 97% of reported maximum.
+No CUDA-event fallback qualifies. Raw samples and latency/routing histograms
+are retained with the measurements.
+
+The 15 Graph-decode rows use a T16-generated fixture bank; the other 51 rows
+use a T4096-generated bank. Each comparison is paired within its row; these
+batches must not be treated as identical cross-shape inputs. The two timing
+jobs took 144.523 and 204.539 seconds of managed physical turnaround,
+respectively, with drivers of 21.855801 and 78.972480 seconds: 349.062 seconds
+physical turnaround and 100.828281 seconds of driver execution in total.
+
+Balanced medians below are microseconds. Kernel sum covers the complete
+runner. Eager synchronized end-to-end time includes host submission; Graph
+end-to-end is reported separately. Each current/TRT pair is a same-row
+comparison. Graph and eager measurements are not interchangeable.
+
+.. list-table:: Balanced routing; all rows clock-qualified
+   :header-rows: 1
+
+   * - T
+     - Previous Graph kernel sum
+     - Current / TRT Graph kernel sum
+     - Current / TRT Graph E2E
+     - Current / TRT eager E2E
+   * - 1
+     - 37.393
+     - 36.816 / 32.657
+     - 53.849 / 51.614
+     - 137.186 / 243.987
+   * - 2
+     - 58.273
+     - 57.409 / 50.144
+     - 75.145 / 68.553
+     - 150.860 / 259.638
+   * - 4
+     - 87.392
+     - 85.936 / 73.088
+     - 102.648 / 91.736
+     - 179.223 / 284.914
+   * - 8
+     - 145.584
+     - 143.121 / 122.273
+     - 160.927 / 141.992
+     - 237.589 / 327.286
+   * - 16
+     - 250.659
+     - 245.874 / 201.969
+     - 264.240 / 221.799
+     - 341.718 / 406.781
+   * - 128
+     - 801.992
+     - 803.414 / 729.464
+     - 827.418 / 750.339
+     - 895.606 / 933.914
+   * - 256
+     - 808.903
+     - 806.888 / 763.912
+     - 831.788 / 786.077
+     - 897.922 / 937.087
+   * - 512
+     - 816.057
+     - 814.664 / 695.671
+     - 838.587 / 717.417
+     - 908.673 / 891.537
+   * - 1024
+     - 825.948
+     - 822.823 / 1362.717
+     - 847.228 / 1387.690
+     - 920.750 / 962.227
+   * - 2048
+     - 840.056
+     - 837.656 / 1294.413
+     - 863.487 / 1317.369
+     - 929.683 / 2059.941
+   * - 4096
+     - 876.969
+     - 875.354 / 1236.013
+     - 902.584 / 1260.200
+     - 969.024 / 1245.815
+
+Geometric-mean ratios below are baseline latency divided by current latency;
+values above one favor the current implementation. Decode means T1..16 and
+prefill means T128..4096, each with all three routing distributions.
+
+.. list-table:: Paired performance ratios
+   :header-rows: 1
+
+   * - Scope
+     - Rows
+     - Previous/current kernel
+     - TRT/current kernel
+     - TRT/current synchronized E2E
+   * - Graph decode
+     - 15
+     - 1.03914
+     - 0.94422
+     - 0.98184
+   * - Graph prefill
+     - 18
+     - 1.00690
+     - 1.24791
+     - 1.20115
+   * - Eager decode
+     - 15
+     - 1.04018
+     - 0.94463
+     - 1.72478
+   * - Eager prefill
+     - 18
+     - 1.00886
+     - 1.20491
+     - 1.37271
+   * - All required
+     - 66
+     - 1.02220
+     - 1.08899
+     - 1.29188
+
+The current implementation improves aggregate kernel time over the previous
+implementation, but does not achieve performance neutrality against TRT.
+Balanced Graph T1 and T16 kernel time remains 12.7% and 21.7% higher than
+TRT; Graph end-to-end remains 4.3% and 19.1% higher. Larger-prefill gains do
+not remove these decode gaps. Kernel medians improve in 64 of 66 rows versus
+the previous implementation; the two regressions are Graph T128 balanced
+(0.177%) and Graph T1024 hot (0.053%). Thirty-five rows remain slower than
+TRT in kernel sum. Eager host-side gains do not establish Graph GPU parity.
+The aspirational 5--10% improvement is not claimed across the required matrix.
+
+Optional T8192/16384/32768 evaluation completed all 18 eager/Graph rows.
+The nine shape/routing configurations passed numerical preflight; every row
+passed the same ideal-FP64 development gate before and after timing, with
+finite outputs and matching routing counts. This separate batch compares
+previous/current CuTe and TRT, using a T32768-generated fixture bank with
+seed 123. It took 196.536 seconds of physical turnaround and 75.207 seconds
+of driver execution.
+
+Only nine rows passed the unchanged clock gate. Their latencies are below;
+no excluded-row timing contributes to this table or the required-row results.
+Six qualified rows have no local expert assignments, so their large TRT
+ratios do not establish balanced or hot-routing performance.
+
+.. list-table:: Clock-qualified optional medians in microseconds
+   :header-rows: 1
+
+   * - Mode / T / routing
+     - Previous kernel
+     - Current / TRT kernel
+     - Current / TRT synchronized E2E
+   * - Graph / 8192 / balanced
+     - 1527.808
+     - 1505.904 / 1163.259
+     - 1532.277 / 1186.323
+   * - Eager / 8192 / empty
+     - 57.649
+     - 56.562 / 189.443
+     - 147.623 / 365.889
+   * - Graph / 8192 / empty
+     - 76.961
+     - 75.394 / 189.218
+     - 95.415 / 208.944
+   * - Eager / 8192 / hot
+     - 1757.058
+     - 1774.339 / 1481.568
+     - 1883.796 / 1672.830
+   * - Graph / 8192 / hot
+     - 1797.634
+     - 1792.532 / 1479.728
+     - 1820.207 / 1504.332
+   * - Eager / 16384 / empty
+     - 49.632
+     - 48.463 / 291.123
+     - 179.597 / 521.492
+   * - Graph / 16384 / empty
+     - 86.450
+     - 86.289 / 290.932
+     - 108.278 / 312.087
+   * - Eager / 32768 / empty
+     - 71.857
+     - 70.433 / 564.647
+     - 232.969 / 758.157
+   * - Graph / 32768 / empty
+     - 144.546
+     - 142.514 / 564.839
+     - 165.413 / 587.811
+
+The nine clock-excluded rows are eager T8192 balanced, plus eager and Graph
+balanced/hot at T16384 and T32768. They retain numerical evidence but provide
+no qualified timing comparison. Among qualified rows, current CuTe is slower
+than TRT for T8192 balanced/hot; eager T8192 hot also regresses relative to
+the previous CuTe implementation. Older optional measurements are not reused.
+
+Reproduction
+------------
+
+Tests also cover native E2M1/UE8M0 decoding, lossless preparation, packed and
+separate routing, runtime parameters and preallocated execution:
 
 .. code-block:: bash
 
    FLASHINFER_KIMI_K3_FULL=1 pytest -q tests/moe/test_cute_dsl_mxfp4_situ.py
    FLASHINFER_KIMI_K3_ALL_LOCAL=1 pytest -q tests/moe/test_cute_dsl_mxfp4_situ.py -k all_local
 
-Numerical reports compare both implementations to the same FP64 oracle for
-the supplied quantized operands, plus an oracle that explicitly models
-intermediate MXFP8 quantization. They include relative L2, cosine,
-absolute-error statistics and the historical ``atol=0.1, rtol=0.15`` passing
-fraction. The development gate is candidate relative L2 no greater than
-TRT-LLM Gen error plus the FP64 reference's BF16 representation-error floor.
-This gate is provisional; the historical tolerance is diagnostic and is not
-an agreed acceptance threshold. Across r008's 84 rows, candidate relative
-L2 is 0.02485--0.02693 and TRT-LLM Gen is 0.02493--0.02666.
-
-A separate synthetic study with seed 123 and a fixture bank generated at
-T=2048 found a larger difference against the explicit intermediate-MXFP8
-reference. At T128 with hot routing, selected-implementation relative L2
-was 0.00435, versus 0.00239 for TRT-LLM Gen. Targeted stage checks attribute
-most of the additional error to BF16 contribution rounding and atomic
-accumulation. FP32 accumulation and separate FP32 reduction prototypes
-improved hot-routing accuracy but increased full-runner latency, so they
-are not included in this implementation. Final numerical acceptance and
-this accuracy/performance tradeoff remain unresolved.
-
-All 84 timing rows were measured again on r008 in one full matrix. The 66
-required rows cover T=1,2,4,8,16,128,256,512,1024,2048,4096, three routing
-distributions and eager/graph modes; every required row is clock-qualified.
-The table below uses balanced routing and microseconds; each latency pair
-is CuTe / TRT-LLM Gen. Kernel sum includes all kernel activities from the
-runner; eager end-to-end includes host submission and synchronization.
-Ratios are TRT-LLM Gen latency / CuTe latency, so values above one favor CuTe.
-
-.. list-table:: R008 balanced routing; all rows clock-qualified
-   :header-rows: 1
-
-   * - T
-     - Local assignments / empty experts
-     - Graph kernel sum: CuTe / TRT
-     - Eager end-to-end: CuTe / TRT
-   * - 1
-     - 2 / 110
-     - 37.504 / 31.808
-     - 139.834 / 242.025
-   * - 2
-     - 4 / 108
-     - 58.528 / 49.473
-     - 154.250 / 249.234
-   * - 4
-     - 8 / 104
-     - 87.649 / 73.728
-     - 181.496 / 278.828
-   * - 8
-     - 16 / 96
-     - 146.113 / 122.017
-     - 237.816 / 320.244
-   * - 16
-     - 32 / 80
-     - 251.523 / 201.954
-     - 348.050 / 429.341
-   * - 128
-     - 256 / 0
-     - 804.585 / 729.414
-     - 907.161 / 939.663
-   * - 256
-     - 512 / 0
-     - 808.489 / 754.984
-     - 915.898 / 962.013
-   * - 512
-     - 1024 / 0
-     - 816.455 / 697.095
-     - 925.853 / 899.189
-   * - 1024
-     - 2048 / 0
-     - 827.240 / 952.809
-     - 947.461 / 1063.156
-   * - 2048
-     - 4096 / 0
-     - 842.343 / 1308.396
-     - 948.743 / 1204.265
-   * - 4096
-     - 8192 / 0
-     - 882.246 / 1232.011
-     - 995.418 / 1294.463
-
-Across T=1,2,4,8,16 and the three routing distributions, eager synchronized
-end-to-end ratios are 1.234--2.296x, while graph kernel ratios are
-0.803--1.047x. Balanced decode remains slower than TRT. Empty/hot T=8/16
-graph cases reach 1.015--1.047x. Prefill is mixed: balanced/hot graph kernel
-ratios are 0.934/0.985x at T=256 and 0.854/0.886x at T=512; balanced
-T=512 eager end-to-end is below parity at 0.971x. Graph kernel ratios span
-1.152--1.325x at T=1024, 1.526--1.805x at T=2048 and 1.392--2.025x at
-T=4096. Eager host-side gains do not establish graph decode GPU-time parity.
-
-Inputs are synthetic, with seed 123, beta 4, linear_beta 25 and packed BF16
-routing. Measurements use 10 warmups, 15 samples, CUPTI activity tracing
-and cold L2. Every row supplies identical operands to both backends, and
-complete assignment histograms are retained. This full-matrix fixture bank
-was generated with maximum T=32768 and differs from earlier revision
-batches; cross-revision differences do not isolate the fence change alone.
-
-The optional T=8192/16384/32768 matrix contributes 18 numerical passes and
-ten clock-qualified rows. Qualification is specific to each mode: T=8192
-hot and T=16384 balanced qualify only in eager mode. At T=16384 hot and
-T=32768 balanced/hot, neither mode qualifies. The eight unqualified rows
-retain raw measurements but are excluded from performance conclusions.
-
-.. list-table:: Optional r008 prefill; only clock-qualified ratios shown
-   :header-rows: 1
-
-   * - T
-     - Routing
-     - Graph kernel ratio
-     - Eager end-to-end ratio
-   * - 8192
-     - balanced
-     - 0.766x
-     - 0.833x
-   * - 8192
-     - empty
-     - 2.475x
-     - 2.303x
-   * - 8192
-     - hot
-     - unqualified
-     - 0.886x
-   * - 16384
-     - balanced
-     - unqualified
-     - 0.983x
-   * - 16384
-     - empty
-     - 3.376x
-     - 2.652x
-   * - 16384
-     - hot
-     - unqualified
-     - unqualified
-   * - 32768
-     - balanced
-     - unqualified
-     - unqualified
-   * - 32768
-     - empty
-     - 3.920x
-     - 3.045x
-   * - 32768
-     - hot
-     - unqualified
-     - unqualified
-
-
-The standalone ``benchmarks/bench_mxfp4_situ_moe.py`` reports kernel sum,
-complete-runner GPU activity span, host enqueue time and synchronized
-end-to-end latency, with raw samples and paired ratios. GPU span includes
-correlated memory operations and gaps. Kernel sum adds ``CONCURRENT_KERNEL``
-durations: separate ``MEMCPY``/``MEMSET`` records are excluded, while a
-graph-lowered memset reported as a kernel is included. Host metrics use
-CUPTI timestamps with tracing enabled. The helper's historical r005 smoke
-covered six full-geometry rows and 12 backend measurements with three
-samples per metric and zero dropped records, using cupti-python 13.4.0;
-that validation job took 136.41 seconds.
+The standalone benchmark reports kernel sum, GPU activity span, host enqueue
+and synchronized end-to-end latency, raw samples and paired ratios. GPU span
+includes correlated memory operations and gaps. Kernel sum adds kernel
+activity durations, excluding separate memcpy/memset records but including
+a graph-lowered memset reported as a kernel. Host metrics use CUPTI timestamps.
+The command below runs the public two-backend comparison; the reported
+four-backend measurements additionally retain previous/control implementations.
 
 .. code-block:: bash
 
    python benchmarks/bench_mxfp4_situ_moe.py --full --accuracy \
      --tokens 1,2,4,8,16,128,256,512,1024,2048,4096 --distributions balanced,empty,hot \
-     --modes eager,graph --routing packed --warmup 10 --repeats 15 \
+     --modes eager,graph --routing packed --warmup 5 --repeats 20 \
      --run-id review --output mxfp4-situ-review.json
-
-The fixed r008 packed-routing matrix has three distinct CuTe compiled
-variants: fused routing/preprocessing, gather and finalize. Every decode
-timing sample contains three kernel activities. The previously inspected
-shared native module has 1,290 unique SM103 entrypoints; that artifact is
-unchanged. Default decode bypasses native sorting. Required prefill selects
-512-thread cluster sorting at T=128 and 1024-thread cluster sorting at
-T=256..4096. Artifact contents, selected variants and per-forward launch
-counts are different quantities; CUDA runtime and PyTorch kernels are
-outside the native-module inventory.
-
-R005 and r007 timing/trace results are historical. The rejected r006
-arithmetic change is absent; its six boundary tests are retained. The
-separate skinny-N GEMM prototype has no selected-implementation performance
-claim. No real checkpoint distribution is represented by these fixtures.
-Balanced decode and some prefill cases still trail TRT-LLM Gen. Performance work and final review checks remain before final acceptance.
