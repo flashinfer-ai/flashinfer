@@ -25,10 +25,14 @@ output_column_dict = {
         "causal",
         "q_dtype",
         "kv_dtype",
+        "v_dtype",
         "avg_actual_seq_len",
         "random_actual_seq_len",
         "is_var_seq",
         "cute_dsl_impl",
+        "timing_metric",
+        "row_activity_mode",
+        "calls_per_sample",
     ],
     "dsv4_sparse_mla": [
         "swa_topk",
@@ -408,16 +412,18 @@ routine_cc_to_supported_backends = {
     # ATTENTION
     "BatchDecodeWithPagedKVCacheWrapper": {
         # NOTE: trtllm-native calls trtllm_batch_decode_with_kv_cache
+        # NOTE: cudnn-native calls cudnn_batch_decode_with_kv_cache
         "7.5": ["fa2", "auto"],
-        "8.0": ["fa2", "fa2_tc", "auto", "cudnn"],
-        "8.6": ["fa2", "fa2_tc", "auto", "cudnn"],
-        "8.9": ["fa2", "fa2_tc", "auto", "cudnn"],
-        "9.0": ["fa2", "fa2_tc", "auto", "cudnn", "trtllm-native"],
+        "8.0": ["fa2", "fa2_tc", "auto", "cudnn", "cudnn-native"],
+        "8.6": ["fa2", "fa2_tc", "auto", "cudnn", "cudnn-native"],
+        "8.9": ["fa2", "fa2_tc", "auto", "cudnn", "cudnn-native"],
+        "9.0": ["fa2", "fa2_tc", "auto", "cudnn", "cudnn-native", "trtllm-native"],
         "10.0": [
             "fa2",
             "fa2_tc",
             "auto",
             "cudnn",
+            "cudnn-native",
             "trtllm-gen",
             "trtllm-native",
             "prims-ts",
@@ -427,13 +433,22 @@ routine_cc_to_supported_backends = {
             "fa2_tc",
             "auto",
             "cudnn",
+            "cudnn-native",
             "trtllm-gen",
             "trtllm-native",
             "prims-ts",
         ],
-        "10.7": ["fa2", "fa2_tc", "auto", "cudnn", "trtllm-gen", "trtllm-native"],
-        "12.0": ["fa2", "fa2_tc", "auto", "cudnn", "trtllm-native"],
-        "12.1": ["fa2", "fa2_tc", "auto", "cudnn", "trtllm-native"],
+        "10.7": [
+            "fa2",
+            "fa2_tc",
+            "auto",
+            "cudnn",
+            "cudnn-native",
+            "trtllm-gen",
+            "trtllm-native",
+        ],
+        "12.0": ["fa2", "fa2_tc", "auto", "cudnn", "cudnn-native", "trtllm-native"],
+        "12.1": ["fa2", "fa2_tc", "auto", "cudnn", "cudnn-native", "trtllm-native"],
     },
     "BatchPrefillWithPagedKVCacheWrapper": {
         # NOTE: trtllm-native calls trtllm_batch_context_with_kv_cache

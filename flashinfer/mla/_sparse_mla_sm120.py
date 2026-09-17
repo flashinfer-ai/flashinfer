@@ -95,6 +95,7 @@ from ._sparse_mla_sm120_plan import (
     _BPT_DSV3_2,
     _BPT_DSV4,
     _BPT_DOTS3_SWA,
+    _BPT_GLM53_NOPE,
     _DECODE_DSV3_2_DISPATCH,  # noqa: F401  (vLLM probe surface)
     _DECODE_DSV4_DISPATCH,  # noqa: F401  (vLLM probe surface)
     _DECODE_MAX_HEADS,
@@ -176,7 +177,9 @@ class SparseMLASm120DecodeConfig:
         Packed cache format described by this entry (``"fp8"`` or
         ``"nvfp4"``).
     bytes_per_token : int
-        Logical packed-cache bytes per token.
+        Logical packed-cache bytes per token. For inline-scale models this is
+        the payload minimum: callers may allocate wider padded rows since the
+        kernels take the gmem row advance as a runtime stride.
     head_counts : Optional[frozenset[int]]
         Exact instantiated head counts when the kernel has no runtime-head
         fallback. ``None`` means every count in ``[1, max_num_heads]``.
@@ -335,7 +338,9 @@ def supported_sparse_mla_sm120_configs(
             topks=frozenset({_DECODE_GLM53_NOPE_TOPK}),
             min_topk=1,
             max_num_heads=_DECODE_MAX_HEADS,
-            bytes_per_token=_BPT_DSV3_2,
+            # 528B payload; the gmem row advance is a runtime stride, so a
+            # legacy 656B vLLM pool keeps working unchanged.
+            bytes_per_token=_BPT_GLM53_NOPE,
         ),
         "dots3_swa": SparseMLASm120DecodeConfig(
             d_qk=1088,
@@ -503,13 +508,34 @@ def _resolve_model_type(d_qk: int, kv_scale_format: str) -> int:
 
 
 def _bytes_per_token_for_model_type(model_type: int) -> int:
-    if model_type in (_MODEL_TYPE_DSV3_2, _MODEL_TYPE_GLM_NSA, _MODEL_TYPE_GLM53_NOPE):
+    if model_type in (_MODEL_TYPE_DSV3_2, _MODEL_TYPE_GLM_NSA):
         return _BPT_DSV3_2
+    if model_type == _MODEL_TYPE_GLM53_NOPE:
+        return _BPT_GLM53_NOPE
     if model_type == _MODEL_TYPE_DSV4:
         return _BPT_DSV4
     if model_type == _MODEL_TYPE_DOTS3_SWA:
         return _BPT_DOTS3_SWA
     raise ValueError(f"Unsupported SM120 sparse-MLA model_type={model_type}")
+
+
+def _inline_cache_block_contiguous(kv_cache: torch.Tensor) -> bool:
+    """Block-contiguity predicate for inline-scale (DSv3.2/GLM) caches.
+
+    Inline-scale kernels address the cache as a flat token array with a
+    runtime row stride, so padded *rows* (a wider last dim or a sliced view)
+    are fine, but pages must pack rows back-to-back. The FFI binding
+    re-checks the same invariant; this only produces an earlier, clearer
+    error at the wrapper layer.
+    """
+    if kv_cache.is_contiguous():
+        return True
+    if kv_cache.ndim == 2 or kv_cache.stride(-1) != 1:
+        return False
+    token_axis = 2 if kv_cache.ndim == 4 and kv_cache.shape[1] == 1 else 1
+    return kv_cache.stride(0) == kv_cache.shape[token_axis] * kv_cache.stride(
+        token_axis
+    )
 
 
 def _packed_kv_page_block_size(
@@ -644,29 +670,22 @@ def get_sparse_mla_sm120_module():
         kv_pbs = _packed_kv_page_block_size(
             kv_cache, model_type=model_type, name="kv_cache"
         )
-        if (
-            model_type
-            in (
-                _MODEL_TYPE_DSV3_2,
-                _MODEL_TYPE_GLM_NSA,
-                _MODEL_TYPE_GLM53_NOPE,
-            )
-            and not kv_cache.is_contiguous()
-        ):
+        if model_type in (
+            _MODEL_TYPE_DSV3_2,
+            _MODEL_TYPE_GLM_NSA,
+            _MODEL_TYPE_GLM53_NOPE,
+        ) and not _inline_cache_block_contiguous(kv_cache):
             # Inline-scale prefill kernels address the cache as a flat token
-            # array, so a padded block stride would be silently misread — and
-            # crossover can route any decode-form call there, so the
-            # restriction cannot wait for a prefill-routed call to fire.
-            # Contiguous padded-row caches (wider last dim) stay allowed:
-            # decode-v32 honors their row stride, and a prefill-routed call
-            # rejects them loudly at the binding.
+            # array with a runtime row stride — and crossover can route any
+            # decode-form call there, so the restriction cannot wait for a
+            # prefill-routed call to fire. Padded rows are honored everywhere;
+            # only inter-block gaps are rejected.
             raise ValueError(
-                "inline-scale (DSv3.2/GLM) KV caches must be contiguous "
-                "through this entry: prefill-routed calls address the cache "
-                "as a flat token array, and the calibrated crossover can "
-                "route decode-form calls to prefill. Padded block strides are "
-                "supported only by the standalone decode entry "
-                "(sparse_mla_sm120_decode_dsv3_2)"
+                "inline-scale (DSv3.2/GLM) KV caches must pack rows "
+                "contiguously within each block through this entry (padded "
+                "rows are fine): prefill-routed calls address the cache as a "
+                "flat token array, and the calibrated crossover can route "
+                "decode-form calls to prefill"
             )
         extra_topk = int(extra_indices.size(-1)) if extra_indices is not None else 0
         planned = plan(
@@ -804,19 +823,24 @@ def _sparse_mla_sm120_paged_attention(
         ``[num_blocks, page_block_size, 1, bytes]``. The SM120 binding derives
         page size and block stride from the tensor metadata without
         materializing a layout conversion. Padded block strides are honored
-        only for footer-scale models (DSv4 / DOTS3_SWA); inline-scale
-        (DSv3.2 / GLM) caches must be contiguous through this entry, since
-        crossover can route any decode-form call to the flat-addressing
-        prefill kernels. Contiguous caches with padded rows (a wider last
-        dim) are served by the decode-v32 kernel and rejected loudly if a
-        call routes to prefill.
+        only for footer-scale models (DSv4 / DOTS3_SWA). Inline-scale
+        (DSv3.2 / GLM) caches take the row advance as a runtime stride, so
+        padded rows (a wider last dim, e.g. a legacy 656B pool serving the
+        528B GLM53_NOPE payload) work in both decode and prefill as long as
+        blocks pack rows contiguously. Cache origins and block strides must
+        be 16-byte aligned; inline-scale row strides must also be aligned.
+        Footer-scale rows must remain packed. Flat 2D GLM53_NOPE caches use
+        528 bytes per token; expose the token axis in a 3D/4D view to use
+        an existing 656-byte pool without repacking.
     indices : torch.Tensor
         Paged slot IDs per query token, shape ``[num_tokens, topk]`` or
         ``[num_tokens, 1, topk]``, dtype int32. ``-1`` marks invalid /
-        out-of-window slots (kernel skips). Prefill-routed calls require
-        ``topk % 64 == 0`` (whole 64-wide index tiles; the tail tile is not
-        masked) and, for DOTS3_SWA, ``topk >= 513`` so the sliding window
-        fits the buffer.
+        out-of-window slots; masked slots gather a dedicated zero row, so
+        arbitrary cache contents (including NaNs) cannot contaminate valid
+        outputs, and slots past ``topk_length`` are never gathered regardless
+        of the padding contents. Prefill-routed calls require
+        ``topk % 64 == 0`` (whole 64-wide index tiles) and, for DOTS3_SWA,
+        ``topk >= 513`` so the sliding window fits the buffer.
     output : torch.Tensor
         In-place output, shape ``[num_tokens, num_heads, d_v]``, dtype bf16.
     out_lse : torch.Tensor

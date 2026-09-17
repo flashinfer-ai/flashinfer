@@ -109,6 +109,10 @@ def _run(
         state_indices=state_indices,
         use_cp=use_cp,
         max_seqlen=total,
+        # This file checks the existing implementation's indexed and packed
+        # paths for bitwise identity.  Cake is covered separately against the
+        # independent sequential recurrence.
+        backend="flashinfer",
     )
     return output, final
 

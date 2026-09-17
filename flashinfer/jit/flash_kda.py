@@ -751,6 +751,7 @@ def gen_flash_kda_generated_module(variant_id: str) -> JitSpec:
             *embedded_flags,
             *(
                 [
+                    "-std=c++20",
                     "-DFLASHKDA_GENERATED_DIRECT_SOURCE_ABI=1",
                     "-UPy_LIMITED_API",
                 ]

@@ -3,7 +3,7 @@
 ``fake_nccl_ep`` injects a recording stand-in for the whole ``nccl`` package
 tree (``nccl.ep``, ``nccl.core``, ``nccl.ep.interop.torch``) into
 ``sys.modules`` so fleet/handle marshaling and the host-path caching layer can
-be exercised without a GPU, RDMA fabric, or the nccl4py wheel.
+be exercised without a GPU, RDMA fabric, or the nccl-extensions wheel.
 """
 
 from __future__ import annotations
