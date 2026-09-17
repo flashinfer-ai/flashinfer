@@ -54,7 +54,7 @@
   },
   "constraints": [
     "head_dim in (64, 128, 256)",
-    "page_size in (4, 16, 32, 64, 128)",
+    "page_size in (4, 8, 16, 32, 64, 128)",
     "storage_page_size > page_size",
     "storage_page_size % page_size == 0",
     "max_pages_per_seq * page_size >= max(seq_lens_kv)",
@@ -161,7 +161,7 @@
     "semantic_page_size": {
       "shape": null,
       "dtype": "int32",
-      "description": "Semantic page size, fixed to four for encoded locators."
+      "description": "Semantic fragment size addressed by encoded locators."
     }
   },
   "outputs": {

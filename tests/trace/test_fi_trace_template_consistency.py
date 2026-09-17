@@ -972,8 +972,24 @@ def test_attention_ts_sq4_trace_dispatch_covers_all_public_decode_apis():
     assert "window_left" not in fmha_definitions[2]["inputs"]
 
 
-def test_attention_ts_encoded_page4_trace_separates_semantic_and_storage_pages():
-    """Encoded locators retain semantic page four over larger cache pages."""
+@pytest.mark.parametrize(
+    "semantic_page_size,storage_page_size,combined",
+    (
+        (4, 32, False),
+        (8, 24, False),
+        (8, 24, True),
+        (16, 64, False),
+        (32, 128, True),
+        (64, 128, False),
+        (128, 256, True),
+        (8, 8, False),
+        (32, 32, True),
+    ),
+)
+def test_attention_ts_trace_semantic_and_storage_pages(
+    semantic_page_size, storage_page_size, combined
+):
+    """Each FMHA surface retains native or encoded page geometry in its trace."""
     from flashinfer.attention.prims_ts.decode import (
         BatchDecodePagedTSWrapper,
         batch_decode_with_paged_kv_cache,
@@ -985,8 +1001,8 @@ def test_attention_ts_encoded_page4_trace_separates_semantic_and_storage_pages()
         prims_ts_decode_trace_dispatch,
     )
 
-    batch_size, seq_len_q, max_seq_len = 2, 4, 64
-    semantic_page_size, storage_page_size = 4, 32
+    batch_size, seq_len_q, max_seq_len = 2, 4, 2 * storage_page_size
+    encoded = semantic_page_size != storage_page_size
     num_qo_heads, num_kv_heads, head_dim = 8, 2, 64
     num_physical_pages = batch_size * max_seq_len // storage_page_size
     max_num_semantic_pages = max_seq_len // semantic_page_size
@@ -999,6 +1015,7 @@ def test_attention_ts_encoded_page4_trace_separates_semantic_and_storage_pages()
         dtype=torch.bfloat16,
     )
     v_cache = torch.empty_like(k_cache)
+    cache = torch.stack((k_cache, v_cache), dim=1) if combined else (k_cache, v_cache)
     block_table = torch.arange(
         batch_size * max_num_semantic_pages, dtype=torch.int32
     ).reshape(batch_size, max_num_semantic_pages)
@@ -1007,7 +1024,7 @@ def test_attention_ts_encoded_page4_trace_separates_semantic_and_storage_pages()
 
     one_shot_kwargs = {
         "q": q,
-        "paged_kv_cache": (k_cache, v_cache),
+        "paged_kv_cache": cache,
         "block_tables": block_table,
         "seq_lens_kv": seq_lens,
         "seq_len_q": seq_len_q,
@@ -1015,7 +1032,7 @@ def test_attention_ts_encoded_page4_trace_separates_semantic_and_storage_pages()
     }
     standalone_kwargs = {
         "query": q,
-        "kv_cache": (k_cache, v_cache),
+        "kv_cache": cache,
         "workspace_buffer": workspace,
         "block_tables": block_table,
         "seq_lens": seq_lens,
@@ -1029,36 +1046,38 @@ def test_attention_ts_encoded_page4_trace_separates_semantic_and_storage_pages()
         prims_ts_decode_trace_dispatch(**standalone_kwargs),
     )
     for template in direct_templates:
-        assert "_encoded_page4" in template.name_prefix
-        assert template.axes["page_size"].value == semantic_page_size
-        assert template.inputs["semantic_page_size"].param == "page_size"
-        assert template.inputs["semantic_page_size"].optional is False
+        assert ("_encoded_page" in template.name_prefix) == encoded
+        if encoded:
+            assert f"_encoded_page{semantic_page_size}" in template.name_prefix
+            assert template.axes["page_size"].value == semantic_page_size
+            assert template.inputs["semantic_page_size"].param == "page_size"
+            assert template.inputs["semantic_page_size"].optional is False
+        else:
+            assert "storage_page_size" not in template.axes
+            assert "semantic_page_size" not in template.inputs
 
     definitions = (
         batch_decode_with_paged_kv_cache.fi_trace(**one_shot_kwargs),
         prims_ts_batch_decode_with_kv_cache.fi_trace(**standalone_kwargs),
     )
     for definition in definitions:
-        assert "_encoded_page4" in definition["name"]
-        assert definition["axes"]["storage_page_size"]["value"] == 32
-        assert definition["axes"]["page_size"]["value"] == 4
-        assert "optional" not in definition["inputs"]["semantic_page_size"]
-        assert "storage_page_size > page_size" in definition["constraints"]
-        assert "storage_page_size % page_size == 0" in definition["constraints"]
-        for cache_name in ("k_cache", "v_cache"):
-            assert definition["inputs"][cache_name]["shape"] == [
-                "num_pages",
-                "num_kv_heads",
-                "storage_page_size",
-                "head_dim",
-            ]
-
-    default_template = attention_ts_decode_trace_dispatch(
-        **{**one_shot_kwargs, "page_size": storage_page_size}
-    )
-    assert "_encoded_page4" not in default_template.name_prefix
-    assert "storage_page_size" not in default_template.axes
-    assert "semantic_page_size" not in default_template.inputs
+        assert ("_encoded_page" in definition["name"]) == encoded
+        assert definition["axes"]["page_size"]["value"] == semantic_page_size
+        if encoded:
+            assert definition["axes"]["storage_page_size"]["value"] == storage_page_size
+            assert "optional" not in definition["inputs"]["semantic_page_size"]
+            assert "storage_page_size > page_size" in definition["constraints"]
+            assert "storage_page_size % page_size == 0" in definition["constraints"]
+        shape = [
+            "num_pages",
+            *(["kv_planes"] if combined else []),
+            "num_kv_heads",
+            "storage_page_size" if encoded else "page_size",
+            "head_dim",
+        ]
+        for name, spec in definition["inputs"].items():
+            if "cache" in name:
+                assert spec["shape"] == shape
 
     wrapper = BatchDecodePagedTSWrapper()
     wrapper._plan_state = SimpleNamespace(
@@ -1076,23 +1095,36 @@ def test_attention_ts_encoded_page4_trace_separates_semantic_and_storage_pages()
     )
     wrapper_kwargs = dict(
         q=q,
-        paged_kv_cache=(k_cache, v_cache),
+        paged_kv_cache=cache,
         seq_lens=seq_lens,
         block_tables=block_table,
     )
     wrapper_definition = fi_trace(wrapper.run, **wrapper_kwargs)
-    assert "_encoded_page4" in wrapper_definition["name"]
-    assert wrapper_definition["axes"]["storage_page_size"]["value"] == 32
-    assert wrapper_definition["axes"]["page_size"]["value"] == 4
+    assert ("_encoded_page" in wrapper_definition["name"]) == encoded
+    if encoded:
+        assert (
+            wrapper_definition["axes"]["storage_page_size"]["value"]
+            == storage_page_size
+        )
+    assert wrapper_definition["axes"]["page_size"]["value"] == semantic_page_size
     assert "semantic_page_size" not in wrapper_definition["inputs"]
 
-    wrapper._plan_state.storage_page_size = 16
+    for definition in (*definitions, wrapper_definition):
+        page_constraint = next(
+            c for c in definition["constraints"] if c.startswith("page_size in ")
+        )
+        assert eval(page_constraint, {}, {"page_size": semantic_page_size})
+
+    wrapper._plan_state.storage_page_size += semantic_page_size
     with pytest.raises(ValueError, match="does not match the wrapper plan"):
         fi_trace(wrapper.run, **wrapper_kwargs)
 
 
-@pytest.mark.parametrize("storage_page_size", (2, 6))
-def test_attention_ts_encoded_page4_trace_rejects_incompatible_storage(
+@pytest.mark.parametrize(
+    "semantic_page_size,storage_page_size", ((4, 2), (4, 6), (8, 4), (8, 20))
+)
+def test_attention_ts_encoded_pages_trace_rejects_incompatible_storage(
+    semantic_page_size,
     storage_page_size,
 ):
     """Trace selection must reject invalid extents before dumping a definition."""
@@ -1113,7 +1145,7 @@ def test_attention_ts_encoded_page4_trace_rejects_incompatible_storage(
             paged_kv_cache=(k, v),
             block_tables=block_tables,
             seq_lens_kv=seq_lens,
-            page_size=4,
+            page_size=semantic_page_size,
         )
     with pytest.raises(ValueError, match="larger than and divisible"):
         prims_ts_batch_decode_with_kv_cache.fi_trace(
@@ -1122,8 +1154,8 @@ def test_attention_ts_encoded_page4_trace_rejects_incompatible_storage(
             workspace_buffer=torch.empty(4096, dtype=torch.uint8),
             block_tables=block_tables,
             seq_lens=seq_lens,
-            max_seq_len=4,
-            page_size=4,
+            max_seq_len=semantic_page_size,
+            page_size=semantic_page_size,
         )
 
 

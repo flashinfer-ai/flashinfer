@@ -7263,6 +7263,7 @@ def test_block_sparse_pattern_heads_graph(storage, fmt, shared):
 def test_dense_encoded_eight_token_fragments(dtype):
     """The common paged loader also accepts eight-token encoded fragments."""
     from flashinfer.attention.prims_ts.decode import BatchDecodePagedTSWrapper
+    from flashinfer.fi_trace import fi_trace
 
     torch.manual_seed(4173)
     batch, sq, hkv, ratio, dim, storage, fragment, context = (
@@ -7310,6 +7311,17 @@ def test_dense_encoded_eight_token_fragments(dtype):
         wrapper.run(q, (k, v), lengths, table, out=out, validate=False)
 
     run()
+    definition = fi_trace(
+        wrapper.run,
+        q=q,
+        paged_kv_cache=(k, v),
+        seq_lens=lengths,
+        block_tables=table,
+        out=out,
+        validate=False,
+    )
+    assert definition["axes"]["page_size"]["value"] == fragment
+    assert definition["axes"]["storage_page_size"]["value"] == storage
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         run()
