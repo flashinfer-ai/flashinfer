@@ -1190,7 +1190,7 @@ def test_single_prefill_rejects_kv_dtype_mismatch():
         .to(torch.float8_e5m2)
     )
     k_sf, _ = _neg_sf(c["kv_len"], dev)
-    with pytest.raises(AssertionError, match="same dtype"):
+    with pytest.raises(ValueError, match="same dtype"):
         flashinfer.single_prefill_with_kv_cache(
             q, k, v, backend="fa2", kv_cache_sf=(k_sf, None)
         )
@@ -1211,7 +1211,7 @@ def test_single_prefill_rejects_missing_v_sf():
         .to(torch.float8_e4m3fn)
     )
     k_sf, _ = _neg_sf(c["kv_len"], dev)
-    with pytest.raises(AssertionError, match="v_sf"):
+    with pytest.raises(ValueError, match="v_sf"):
         flashinfer.single_prefill_with_kv_cache(
             q, k, v, backend="fa2", kv_cache_sf=(k_sf, None)
         )
@@ -1233,7 +1233,7 @@ def test_single_prefill_rejects_non_float32_sf():
     )
     k_sf, _ = _neg_sf(c["kv_len"], dev)
     v_sf, _ = _neg_sf(c["kv_len"], dev)
-    with pytest.raises(AssertionError, match="float32"):
+    with pytest.raises(ValueError, match="float32"):
         flashinfer.single_prefill_with_kv_cache(
             q, k, v, backend="fa2", kv_cache_sf=(k_sf, v_sf.to(torch.float16))
         )
@@ -1256,7 +1256,7 @@ def test_single_prefill_rejects_bad_sf_shape():
     # Transposed (heads, kv_len) instead of (kv_len, heads) for NHD.
     k_sf = torch.ones(c["heads"], c["kv_len"], dtype=torch.float32, device=dev)
     v_sf, _ = _neg_sf(c["kv_len"], dev)
-    with pytest.raises(AssertionError, match="shape"):
+    with pytest.raises(ValueError, match="shape"):
         flashinfer.single_prefill_with_kv_cache(
             q, k, v, backend="fa2", kv_cache_sf=(k_sf, v_sf)
         )
@@ -1279,7 +1279,7 @@ def test_single_prefill_rejects_non_mirror_sf():
     _, v_sf_view = extract_views(v_slot, torch.float8_e4m3fn, c["head_dim"])
     k = k_ref.to(torch.float8_e4m3fn)
     v = v_ref.to(torch.float8_e4m3fn)
-    with pytest.raises(AssertionError, match="mirror"):
+    with pytest.raises(ValueError, match="mirror"):
         flashinfer.single_prefill_with_kv_cache(
             q, k, v, backend="fa2", kv_cache_sf=(k_sf_view, v_sf_view)
         )
@@ -1314,7 +1314,7 @@ def test_ragged_prefill_plan_rejects_non_fp8_kv():
     kv_indptr = torch.arange(0, c["batch"] + 1, dtype=torch.int32).to(dev) * c["kv_len"]
     ws = torch.empty(_WS, dtype=torch.uint8, device=dev)
     fi = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(ws, backend="fa2")
-    with pytest.raises(AssertionError, match="fp8"):
+    with pytest.raises(ValueError, match="fp8"):
         fi.plan(
             qo_indptr,
             kv_indptr,
@@ -1524,7 +1524,7 @@ def test_paged_prefill_plan_rejects_non_fp8_kv():
     fi = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
         ws, kv_layout="HND", backend="fa2"
     )
-    with pytest.raises(AssertionError, match="fp8"):
+    with pytest.raises(ValueError, match="fp8"):
         fi.plan(
             qo_indptr,
             paged_kv_indptr,
