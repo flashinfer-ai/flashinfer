@@ -5127,6 +5127,9 @@ class _TrtllmRunnerBase(MoERunner):
 
     _module: Any
     _inner: Any
+    _pair: tuple[QuantFormat, QuantFormat]
+    _num_weight_rows: int
+    _intermediate_size: int
 
     def _check_support(self) -> None:
         super()._check_support()
