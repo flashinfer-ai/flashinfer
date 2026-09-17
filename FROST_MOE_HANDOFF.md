@@ -1,3 +1,29 @@
+## Current paired Frost versus tuned TRT-LLM — 2026-09-17
+
+The published compact-resource FC1/FC2 implementation now measures **29.484375 us**
+against TRT-LLM **28.620375 us**, or **3.019% higher latency**, on the same 1000 W
+B200. This is complete synthetic BF16 MoE, T1/E128/top8/H2048/I768, unpacked
+routing. It is not yet a competitor win and does not update the T64 or SM120 result.
+
+Independent audit 1913 reconstructs 68 raw output checks, 30 changed-reference
+controls and 384 cold-L2 timing spans. Both paths pass normal, memcheck and
+racecheck before four fresh ABBA processes. Actual Frost engines are 20401/20402;
+TRT-LLM tactic (8,129) and its BMM symbols/cubin hashes match the prior 352-joint-tactic
+search. This is a fresh replay of that winner, not a new exhaustive search.
+
+Weight preparation is outside inference timing for both paths. TRT BF16 uses
+FC1 gate/up interleave, MMA row shuffles and 128-byte K-block BlockMajorK copies;
+dtype stays BF16. CPU-prepared bytes match the GPU helper exactly. Preparation
+is measured separately in audit 1713. PDL stage intervals overlap; their medians
+must not be summed to reconstruct full latency.
+
+Evidence: `.fi-cudnn-work/20260914/artifacts/analysis1913/sm100.json`,
+capsule `native1911`, raw output `native1912`, allocation 4366434,
+GPU UUID `197a4e8d-b2bd-906c-faa7-c44f5d99c67b`. Tested runtime corresponds to
+FE `7a38cf20d1df401a793a2f899ba2c37d09349172` and FI `fa75f6970e95cef61f9c75fe914cc587daeb9275`.
+Credit: NVIDIA Frost/FlashInfer/TensorRT-LLM, KF 624 and candidate 2f5c,
+Yanqin Zhai PR #1090, CUTLASS 113 and canonical rank5/early-PDL guidance.
+
 ## Compact resources in paired SM100 kernels
 
 Both small-row graph engines now allocate 32 TMEM columns instead of 512, use
