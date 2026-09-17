@@ -60,13 +60,13 @@ from ..utils import (
 from ..tllm_enums import SfLayout
 from .nvfp4_quantization_utils import (
     _UNSET,
-    FLOAT4_E2M1_MAX,
     NVFP4_4OVER6_CODE_FROM_ENV,
     NVFP44Over6Config,
     nvfp4_4over6_code,
     nvfp4_4over6_fp8_input_error,
+    NVFP4_PER_TOKEN_SCALE_RTOL,
+    nvfp4_per_token_scale_inv,
     nvfp4_4over6_from_code,
-    nvfp4_e4m3_max,
     resolve_nvfp4_4over6,
 )
 
@@ -88,36 +88,6 @@ NVFP4_QUANT_ENV_VARS = (
 _FP8_TO_FP4_INPUT_DTYPES = (torch.float8_e4m3fn,)
 
 
-def _forward_nvfp4_4over6(
-    nvfp4_4over6: Optional[NVFP44Over6Config],
-) -> Optional[NVFP44Over6Config]:
-    """Value to hand a callee that resolves the setting for itself.
-
-    An omitted argument is forwarded as omitted (``_UNSET``), never as the
-    recipe it resolves to: re-widening an environment-derived recipe into an
-    explicit one erases where it came from, which is what the guards here and
-    the callees' error messages key off, and it would also silence the
-    deprecation warning the callee's resolve emits.  (``MoERunner
-    ._forward_kwargs`` in flashinfer/fused_moe/runners.py forwards explicit
-    values only, for the same reason.)
-
-    The recipe that reaches a kernel still comes from exactly one environment
-    read: on a path that forwards, this frame's own resolution feeds at most
-    an explicit-recipe guard, and those never consult the environment.
-    """
-    if nvfp4_4over6 is _UNSET:
-        return _UNSET
-    # Explicit: resolving cannot touch the environment, and canonicalizes a
-    # subclass once here rather than once per callee.
-    return resolve_nvfp4_4over6(nvfp4_4over6)
-
-
-#: Relative tolerance for pairing the per-token global scale with the recipe.
-#: Loose enough that a float32 round-trip of ``1 / (448 * 6)`` passes, far
-#: tighter than the 448/256 ratio (1.75) the check exists to catch.
-_GLOBAL_SF_RTOL = 1e-3
-
-
 def _check_per_token_global_scale(
     scale_inv: float, nvfp4_4over6_config: Optional[NVFP44Over6Config]
 ) -> None:
@@ -128,14 +98,14 @@ def _check_per_token_global_scale(
     silently rescales the whole tensor instead of failing.  Takes an already
     materialized ``float`` so it can never add a device synchronization.
     """
-    expected = 1.0 / (nvfp4_e4m3_max(nvfp4_4over6_config) * FLOAT4_E2M1_MAX)
-    if abs(scale_inv - expected) > _GLOBAL_SF_RTOL * expected:
+    expected = nvfp4_per_token_scale_inv(nvfp4_4over6_config)
+    if abs(scale_inv - expected) > NVFP4_PER_TOKEN_SCALE_RTOL * expected:
         raise ValueError(
             f"a_global_sf={scale_inv!r} does not match the requested NVFP4 "
             f"4over6 recipe {nvfp4_4over6_config!r}, which implies "
             f"a_global_sf={expected!r}.  Build the scale from the same recipe: "
             "flashinfer.make_nvfp4_global_scale(a, per_token_activation=True, "
-            "nvfp4_4over6=<the same value>)."
+            "nvfp4_4over6_config=<the same value>)."
         )
 
 
@@ -1014,10 +984,9 @@ def silu_and_mul_nvfp4_quantize(
     Tuple[torch.Tensor, torch.Tensor]
         Packed FP4 values of shape ``[M, K/2]`` and their scale factors.
     """
-    # Not resolved here: the kernel below resolves, and forwarding the
-    # three-state value keeps this frame from reading the environment at all
-    # (see _forward_nvfp4_4over6).  An explicit value is still validated, by
-    # the resolve inside that helper.
+    # Resolve once at the public boundary; the kernel driver receives the
+    # resolved recipe (``None`` = off) and does not read the environment again.
+    nvfp4_4over6_config = resolve_nvfp4_4over6(nvfp4_4over6)
     if sf_vec_size != 16:
         raise NotImplementedError(
             "sf_vec_size can only be 16 for silu_and_mul_nvfp4_quantize"
@@ -1061,7 +1030,7 @@ def silu_and_mul_nvfp4_quantize(
         global_scale,
         sf_layout=sf_layout,
         enable_pdl=enable_pdl,
-        nvfp4_4over6=_forward_nvfp4_4over6(nvfp4_4over6),
+        nvfp4_4over6=nvfp4_4over6_config,
     )
 
 
@@ -1159,7 +1128,7 @@ def fp4_quantize(
 
     - Omitted (the default): read ``FLASHINFER_NVFP4_4OVER6``; when ``"1"``,
       the other three vars supply the recipe.  Read on every call.
-      Byte-for-byte the old behaviour; a ``DeprecationWarning`` is emitted
+      Byte-for-byte the old behaviour; a ``FutureWarning`` is emitted
       when the environment turns 4over6 on.
     - ``None``: 4over6 off.  ``FLASHINFER_NVFP4_4OVER6=1`` cannot turn it
       back on.
@@ -1173,29 +1142,34 @@ def fp4_quantize(
     Build the global scale from the SAME recipe -- use
     ``flashinfer.make_nvfp4_global_scale(..., nvfp4_4over6_config=<same value>)``.
     """
-    nvfp4_4over6_config = resolve_nvfp4_4over6(nvfp4_4over6)
     if sf_vec_size != 16 and sf_vec_size != 32:
         raise NotImplementedError("sf_vec_size can only be 16 or 32")
 
-    # Two kernel paths below have no 4over6 candidate search and would drop an
-    # explicitly requested recipe without a trace -- leaving a global scale
-    # built for e4m3_max=256 paired with a kernel that clamps at 448.  MXFP4
-    # has no candidate search at all; the FP8->FP4 kernels hardcode the
-    # off-recipe (see nvfp4_4over6_fp8_input_error).  Only an explicit per-call
-    # recipe raises: a process-wide environment variable is not a per-call
-    # request, it has always been ignored on both paths, and the omitted-argument
-    # path must stay byte-for-byte compatible.  The CuTe-DSL backend keeps
-    # raising for FP8 with the argument omitted too, as it always has -- that check stays with the
-    # kernel that cannot honor the recipe.
-    if nvfp4_4over6_config is not None and nvfp4_4over6 is not _UNSET:
-        if sf_vec_size != 16 or sf_use_ue8m0:
+    # 4over6 is an NVFP4 recipe. MXFP4 has no candidate search, so it never
+    # reads the environment (and never warns); an explicit recipe there is a
+    # mistake. The FP8->FP4 kernels hardcode the off-recipe, so an explicit
+    # recipe is rejected for FP8 input too; an environment-derived one keeps
+    # its historical silent-ignore on the CUDA backend (the CuTe-DSL kernel
+    # rejects it, as it always has). Resolve exactly once here; the backends
+    # below receive the resolved recipe (``None`` = off).
+    is_mxfp4 = sf_vec_size != 16 or sf_use_ue8m0
+    explicit = nvfp4_4over6 is not _UNSET
+    if is_mxfp4:
+        if explicit and nvfp4_4over6 is not None:
             raise ValueError(
                 "nvfp4_4over6 applies to NVFP4 only (sf_vec_size=16, "
                 f"sf_use_ue8m0=False); got sf_vec_size={sf_vec_size}, "
                 f"sf_use_ue8m0={sf_use_ue8m0}."
             )
-        if input.dtype in _FP8_TO_FP4_INPUT_DTYPES:
-            raise nvfp4_4over6_fp8_input_error(nvfp4_4over6, input.dtype)
+        nvfp4_4over6_config = None
+    else:
+        nvfp4_4over6_config = resolve_nvfp4_4over6(nvfp4_4over6)
+        if (
+            explicit
+            and nvfp4_4over6_config is not None
+            and input.dtype in _FP8_TO_FP4_INPUT_DTYPES
+        ):
+            raise nvfp4_4over6_fp8_input_error(input.dtype)
 
     # The quantize kernel reads global_scale as float32 on input's device. Normalize
     # so a bf16/fp16 or off-device scale isn't misread byte-wise / cross-device-read
@@ -1212,7 +1186,7 @@ def fp4_quantize(
             is_sf_swizzled_layout,
             is_sf_8x4_layout,
             enable_pdl,
-            _forward_nvfp4_4over6(nvfp4_4over6),
+            nvfp4_4over6_config,
         )
     elif backend != "cuda":
         raise ValueError(f"Unknown backend: {backend}. Must be 'cuda' or 'cute-dsl'.")
@@ -1333,11 +1307,8 @@ def _fp4_quantize_cute_dsl(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """CuTe-DSL dispatch for fp4_quantize. Maps parameters to the appropriate kernel.
 
-    ``nvfp4_4over6`` is the caller's **unresolved** setting: the NVFP4 kernel
-    resolves it, and keeping an omitted argument unresolved down to there is
-    what lets it name the source when it has to refuse (see
-    :func:`_forward_nvfp4_4over6`).  The MXFP4 kernel below takes no recipe;
-    :func:`fp4_quantize` has already rejected an explicit one for it.
+    ``nvfp4_4over6`` is the **resolved** recipe (``None`` = off) from
+    :func:`fp4_quantize`; the MXFP4 kernel takes no recipe.
     """
     from ..cute_dsl import is_cute_dsl_available
 
@@ -1653,7 +1624,7 @@ def nvfp4_quantize(
 
     - Omitted (the default): read ``FLASHINFER_NVFP4_4OVER6``; when ``"1"``,
       the other three vars supply the recipe.  Read on every call.
-      Byte-for-byte the old behaviour; a ``DeprecationWarning`` is emitted
+      Byte-for-byte the old behaviour; a ``FutureWarning`` is emitted
       when the environment turns 4over6 on.
     - ``None``: 4over6 off.  ``FLASHINFER_NVFP4_4OVER6=1`` cannot turn it
       back on.
@@ -1747,7 +1718,7 @@ def nvfp4_quantize(
                 ),
                 sf_layout=_sf_layout_map[sf_layout],
                 enable_pdl=enable_pdl,
-                nvfp4_4over6=_forward_nvfp4_4over6(nvfp4_4over6),
+                nvfp4_4over6=nvfp4_4over6_config,
             )
         else:
             raise ValueError(
@@ -1777,7 +1748,7 @@ def nvfp4_quantize(
             is_sf_swizzled_layout=is_sf_swizzled_layout,
             is_sf_8x4_layout=is_sf_8x4_layout,
             enable_pdl=enable_pdl,
-            nvfp4_4over6=_forward_nvfp4_4over6(nvfp4_4over6),
+            nvfp4_4over6=nvfp4_4over6_config,
         )
     elif backend == "cute-dsl":
         from ..cute_dsl import is_cute_dsl_available
@@ -1814,7 +1785,7 @@ def nvfp4_quantize(
             a_global_sf,
             sf_layout=sf_layout_int,
             enable_pdl=enable_pdl,
-            nvfp4_4over6=_forward_nvfp4_4over6(nvfp4_4over6),
+            nvfp4_4over6=nvfp4_4over6_config,
         )
     else:
         raise ValueError(f"Unknown backend: {backend}. Must be 'cuda' or 'cute-dsl'.")
@@ -2037,7 +2008,7 @@ def nvfp4_batched_quantize(
         and nvfp4_4over6 is not _UNSET
         and a.dtype in _FP8_TO_FP4_INPUT_DTYPES
     ):
-        raise nvfp4_4over6_fp8_input_error(nvfp4_4over6, a.dtype)
+        raise nvfp4_4over6_fp8_input_error(a.dtype)
     major, minor = get_compute_capability(a.device)
     device_arch = f"{major * 10 + minor}"
     a_fp4, a_sf = get_fp4_quantization_module(device_arch).fp4_batched_quantize_sm100(

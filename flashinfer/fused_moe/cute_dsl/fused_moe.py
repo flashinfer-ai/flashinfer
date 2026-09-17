@@ -78,8 +78,9 @@ from ...quantization.kernels.nvfp4_quantize import (
     nvfp4_quantize_per_token_cute_dsl,
 )
 from ...quantization.nvfp4_quantization_utils import (
+    nvfp4_per_token_scale_inv,
+    NVFP4_PER_TOKEN_SCALE_RTOL,
     _UNSET,
-    FLOAT4_E2M1_MAX,
     NVFP44Over6Config,
     nvfp4_e4m3_max,
     resolve_nvfp4_4over6,
@@ -136,10 +137,10 @@ def _canonicalize_quant_mode(quant_mode: str) -> str:
     return quant_mode
 
 
-# Same tolerance as ``_check_per_token_global_scale`` in
-# flashinfer/quantization/fp4_quantization.py, kept as its own constant rather
-# than imported so neither guard depends on the other module's privates.
-_GEMM2_INPUT_SCALE_RTOL = 1e-3
+#: ``(data_ptr, device index, e4m3_max)`` of GEMM2-input scales already checked
+#: against their recipe. The scale is a weight-pack constant, so checking it
+#: once per tensor avoids a device->host sync on every forward.
+_validated_gemm2_input_scales: set[tuple[int, int, float]] = set()
 
 
 def _check_gemm2_input_scale(
@@ -148,47 +149,41 @@ def _check_gemm2_input_scale(
 ) -> None:
     """Verify ``fc2_input_scale`` was built from the pinned 4over6 recipe.
 
-    The 4over6 candidate search dequantizes its sf4 / sf6 candidates as
-    ``value * sf * row_amax / (6 * e4m3_max)``, i.e. it substitutes that
-    constant for ``1 / global_scale`` instead of reading the scale the caller
-    passed.  Standard NVFP4 divides by whatever it multiplied by and so
-    tolerates an arbitrary global scale, but here the substitution is only an
-    identity when ``fc2_input_scale == 1 / (6 * e4m3_max)``; with any other
-    value the two candidates are ranked against dequantized magnitudes that
-    are off by ``6 * e4m3_max * fc2_input_scale`` and the selection stops
-    tracking the requested error metric.  Raising beats overriding the scale:
-    it is caller-supplied data from their weight pack, and quietly replacing
-    it would surprise anyone who set it deliberately.
-
-    Takes a **resolved** recipe; ``None`` (standard NVFP4) returns
-    immediately, so the non-4over6 path is untouched.
+    The 4over6 candidate search bakes ``1 / (6 * e4m3_max)`` into the
+    dequantization it ranks its candidates with, so any other GEMM2-input
+    scale ranks them on the wrong magnitudes. Raising beats overriding a
+    caller-supplied pack constant. ``None`` (standard NVFP4) returns
+    immediately; a CUDA tensor is read once and remembered by storage pointer.
     """
     if nvfp4_4over6_config is None:
         return
+    e4m3_max = nvfp4_e4m3_max(nvfp4_4over6_config)
+    key = None
     if isinstance(fc2_input_scale, torch.Tensor):
-        if fc2_input_scale.is_cuda and _is_current_stream_capturing():
-            # Reading a device tensor mid-capture is illegal, and the warmup
-            # iterations CUDA graphs require have already run this check on
-            # the same scale.
-            return
+        if fc2_input_scale.is_cuda:
+            key = (fc2_input_scale.data_ptr(), fc2_input_scale.device.index, e4m3_max)
+            if key in _validated_gemm2_input_scales:
+                return
+            if _is_current_stream_capturing():
+                # Reading a device tensor mid-capture is illegal; the warmup
+                # iterations CUDA graphs require have already checked it.
+                return
         value = float(fc2_input_scale.reshape(-1)[0])
     else:
         value = float(fc2_input_scale)
-    expected = 1.0 / (nvfp4_e4m3_max(nvfp4_4over6_config) * FLOAT4_E2M1_MAX)
-    if abs(value - expected) > _GEMM2_INPUT_SCALE_RTOL * expected:
+    expected = nvfp4_per_token_scale_inv(nvfp4_4over6_config)
+    if abs(value - expected) > NVFP4_PER_TOKEN_SCALE_RTOL * expected:
         raise ValueError(
             f"fc2_input_scale={value!r} does not match the requested NVFP4 "
             f"4over6 recipe {nvfp4_4over6_config!r}, which implies "
-            f"fc2_input_scale={expected!r}.  The 4over6 candidate search "
-            "bakes 1 / (6 * e4m3_max) into its dequantization, so any other "
-            "GEMM2-input scale ranks the sf4 / sf6 candidates on the wrong "
-            "magnitudes.  Build the pack with "
-            "prepare_cute_dsl_nvfp4_weights(..., nvfp4_4over6=<the same "
-            "value>) -- also reachable as CuteDslConfig.prepare_weights -- "
-            "or the scale with "
+            f"fc2_input_scale={expected!r}. Build the pack with "
+            "prepare_cute_dsl_weights(..., nvfp4_4over6=<the same value>) "
+            "(CuteDslConfig.prepare_weights) or the scale with "
             "flashinfer.make_nvfp4_global_scale(x, per_token_activation=True, "
-            "nvfp4_4over6=<the same value>)."
+            "nvfp4_4over6_config=<the same value>)."
         )
+    if key is not None:
+        _validated_gemm2_input_scales.add(key)
 
 
 def _get_cuda_graph_resources() -> Dict[str, Any]:
@@ -407,15 +402,10 @@ def _moe_core_impl(
     hidden_size = w2_weight.size(1)
     use_per_token_activation = per_token_scale is not None
 
-    # A pinned recipe is either honored or refused, never silently bought for
-    # nothing: the GEMM2-input quantizer only measures what it claims to when
-    # fc2_input_scale came from the same recipe.  Resolved here instead of
-    # forwarded, because below the resolve boundary ``None`` means "4over6
-    # off" while the quantizer's ``nvfp4_4over6=`` parameter reads it as "from
-    # the environment".  An omitted argument (the default) is left unresolved and
-    # unchecked on purpose: it must stay byte-for-byte the pre-existing
-    # behaviour, and the default path then reads neither the environment here
-    # nor the scale off the device at all.
+    # A pinned recipe is either honored or refused: the GEMM2-input quantizer
+    # only measures what it claims to when fc2_input_scale came from the same
+    # recipe. An omitted argument keeps the pre-existing behaviour and reads
+    # neither the environment nor the scale here.
     if use_per_token_activation and nvfp4_4over6 is not _UNSET:
         _check_gemm2_input_scale(fc2_input_scale, resolve_nvfp4_4over6(nvfp4_4over6))
 

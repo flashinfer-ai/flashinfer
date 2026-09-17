@@ -113,7 +113,7 @@ three cases, but only one public type:
       - Read ``FLASHINFER_NVFP4_4OVER6``; when it is ``"1"``, the other three
         ``FLASHINFER_NVFP4_4OVER6_*`` variables supply the recipe. Read on
         every call. Byte-for-byte the behaviour that predates this parameter,
-        plus a ``DeprecationWarning`` when the environment turns 4over6 on.
+        plus a ``FutureWarning`` when the environment turns 4over6 on.
     * - ``None``
       - 4over6 off. ``FLASHINFER_NVFP4_4OVER6=1`` cannot turn it back on. This
         is the same meaning ``None`` has always had inside the kernel drivers.

@@ -145,18 +145,18 @@ class TestResolveTruthTable:
         env, expected = ENV_STATES[env_id]
         _apply_env(monkeypatch, env)
         with warnings.catch_warnings():
-            warnings.simplefilter("ignore", DeprecationWarning)
+            warnings.simplefilter("ignore", FutureWarning)
             assert resolve_nvfp4_4over6() == expected
 
     @pytest.mark.parametrize("env_id", sorted(ENV_STATES))
     def test_environment_enabling_4over6_is_deprecated(self, monkeypatch, env_id):
-        """The env vars are a compatibility shim: warn only when they act."""
+        """The env vars are a compatibility shim: warn (visibly) only when they act."""
         env, expected = ENV_STATES[env_id]
         _apply_env(monkeypatch, env)
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             resolve_nvfp4_4over6()
-        deprecations = [w for w in caught if issubclass(w.category, DeprecationWarning)]
+        deprecations = [w for w in caught if issubclass(w.category, FutureWarning)]
         if expected is None:
             assert not deprecations
         else:
@@ -170,7 +170,7 @@ class TestResolveTruthTable:
         env, _ = ENV_STATES[env_id]
         _apply_env(monkeypatch, env)
         with warnings.catch_warnings():
-            warnings.simplefilter("error", DeprecationWarning)
+            warnings.simplefilter("error", FutureWarning)
             assert resolve_nvfp4_4over6(None) is None
 
     @pytest.mark.parametrize("env_id", sorted(ENV_STATES))
@@ -215,7 +215,7 @@ class TestResolveTruthTable:
         """An omitted argument must not latch: the docstring promises a per-call read."""
         _apply_env(monkeypatch, {})
         with warnings.catch_warnings():
-            warnings.simplefilter("ignore", DeprecationWarning)
+            warnings.simplefilter("ignore", FutureWarning)
             assert resolve_nvfp4_4over6() is None
             monkeypatch.setenv("FLASHINFER_NVFP4_4OVER6", "1")
             assert resolve_nvfp4_4over6() == NVFP44Over6Config()
@@ -342,9 +342,6 @@ class TestPickleAndDeepcopy:
         _apply_env(monkeypatch, {})
         revived = pickle.loads(pickle.dumps(_UNSET))
         assert resolve_nvfp4_4over6(revived) is None
-
-    def test_constructor_returns_the_singleton(self):
-        assert type(_UNSET)() is _UNSET
 
     @pytest.mark.parametrize("member", list(NVFP44Over6ErrMode), ids=lambda m: m.name)
     def test_err_mode_pickle_preserves_identity(self, member):

@@ -174,7 +174,7 @@ NVFP4 "4over6" is a two-candidate block-scale search inside the quantizer: along
 
 | `nvfp4_4over6=` | Meaning |
 | --- | --- |
-| unset (the default) | Read `FLASHINFER_NVFP4_4OVER6`; when it is `"1"`, the other three variables supply the recipe. Read on every call. Byte-for-byte the behaviour that predates this field, plus a `DeprecationWarning` when the environment turns 4over6 on. |
+| unset (the default) | Read `FLASHINFER_NVFP4_4OVER6`; when it is `"1"`, the other three variables supply the recipe. Read on every call. Byte-for-byte the behaviour that predates this field, plus a `FutureWarning` when the environment turns 4over6 on. |
 | `None` | 4over6 off. `FLASHINFER_NVFP4_4OVER6=1` cannot turn it back on. |
 | `NVFP44Over6Config(...)` | On with exactly this recipe. The environment is ignored, with **no** per-field merge: a field left at its dataclass default keeps that default rather than picking up the environment's value. |
 

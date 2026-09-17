@@ -57,6 +57,7 @@ from ...cute_dsl.fp4_common import (
 )
 from ...cute_dsl.utils import get_num_sm
 from ..nvfp4_quantization_utils import (
+    nvfp4_4over6_cache_key,
     _UNSET,
     NVFP44Over6Config,
     nvfp4_4over6_fp8_input_error,
@@ -1650,9 +1651,8 @@ def _nvfp4_kernel_name(
     if disable_fp4_quant_fast_math:
         name += "_nofastmath"
     if nvfp4_4over6_config is not None:
-        cfg = nvfp4_4over6_config
-        err_mode = getattr(cfg.err_mode, "name", cfg.err_mode)
-        name += f"_4over6_{cfg.e4m3_max}_{err_mode}_{int(cfg.err_use_fast_math)}"
+        # The same token keys the MoE autotuner cache, so the two cannot drift.
+        name += f"_{nvfp4_4over6_cache_key(nvfp4_4over6_config)}"
     return name
 
 
@@ -2384,11 +2384,9 @@ def nvfp4_quantize_cute_dsl(
     )
     nvfp4_4over6_config = resolve_nvfp4_4over6(nvfp4_4over6)
     if nvfp4_4over6_config is not None and input.dtype == torch.float8_e4m3fn:
-        # ``nvfp4_4over6`` is still the caller's unresolved value here, so the
-        # error can name the source.  FlashInfer's own callers forward an
-        # omitted argument as omitted rather than as its resolved recipe --
-        # see _forward_nvfp4_4over6 in ../fp4_quantization.py.
-        raise nvfp4_4over6_fp8_input_error(nvfp4_4over6, input.dtype)
+        raise nvfp4_4over6_fp8_input_error(input.dtype)
+    # The TMA kernel has no recipe parameter, so it is only eligible for
+    # standard NVFP4.
     is_sm107 = get_compute_capability(input.device) == (10, 7)
     use_tma = (
         _should_use_tma(
@@ -2402,16 +2400,6 @@ def nvfp4_quantize_cute_dsl(
     )
 
     if use_tma:
-        if nvfp4_4over6_config is not None:
-            # Unreachable while the `use_tma` gate above tests the config, but
-            # _get_compiled_kernel_nvfp4_tma has no recipe parameter, so a future
-            # edit to that gate would silently emit standard-NVFP4 numerics.
-            # A raise, not an assert: python -O (PYTHONOPTIMIZE, common in
-            # serving containers) strips asserts and would restore the silence.
-            raise AssertionError(
-                "the TMA NVFP4 kernel cannot express a 4over6 recipe; "
-                f"refusing to silently ignore {nvfp4_4over6_config!r}"
-            )
         tma_row_tile = _TMA_ROW_TILE
         if sf_layout == SF_LAYOUT_LINEAR:
             padded_m = _round_up(m, tma_row_tile)
