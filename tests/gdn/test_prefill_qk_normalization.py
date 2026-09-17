@@ -32,6 +32,8 @@ from flashinfer import chunk_gated_delta_rule
 from flashinfer.cute_dsl.availability import is_cute_dsl_arch_supported
 from flashinfer.utils import get_compute_capability
 
+from .reference_delta_rule import blockwise_delta_rule
+
 
 def _supported_device():
     if not torch.cuda.is_available():
@@ -123,12 +125,14 @@ def test_qk_normalization_reference_and_graph(dtype):
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("use_cp", [False, True])
 @pytest.mark.parametrize("heads", [(16, 16, 32), (32, 16, 16)])
-def test_prefill_normalization_flag(dtype, use_cp, heads):
+@pytest.mark.parametrize("use_qk_l2norm", [False, True])
+def test_prefill_normalization_flag(dtype, use_cp, heads, use_qk_l2norm):
     device = _supported_device()
     torch.manual_seed(2026)
     hq, hk, hv = heads
     q = torch.randn(104, hq, 128, device=device, dtype=dtype) * 3
-    k = torch.randn(104, hk, 128, device=device, dtype=dtype) * 4
+    # Keep the recurrence stable when normalization is disabled.
+    k = torch.randn(104, hk, 128, device=device, dtype=dtype) * 0.05
     v = torch.randn(104, hv, 128, device=device, dtype=dtype)
     h = max(hq, hv)
     kwargs = dict(
@@ -141,25 +145,54 @@ def test_prefill_normalization_flag(dtype, use_cp, heads):
         use_cp=use_cp,
         backend="flashinfer",
     )
-    expected = chunk_gated_delta_rule(
-        q=_normalize_reference(q).to(dtype),
-        k=_normalize_reference(k).to(dtype),
-        use_qk_l2norm_in_kernel=False,
-        **kwargs,
+    ref_q, ref_k = (
+        (_normalize_reference(q).to(dtype), _normalize_reference(k).to(dtype))
+        if use_qk_l2norm
+        else (q, k)
     )
-    actual = chunk_gated_delta_rule(q=q, k=k, use_qk_l2norm_in_kernel=True, **kwargs)
-    for result, reference in zip(actual, expected, strict=True):
+    ref_output, ref_state = blockwise_delta_rule(
+        ref_q.float(),
+        ref_k.float(),
+        v.float(),
+        [37, 67],
+        scale_factor=128**-0.5,
+        alpha=kwargs["g"],
+        beta=kwargs["beta"],
+        initial_state=kwargs["initial_state"].transpose(-1, -2),
+        state_dtype=torch.float32,
+    )
+    actual = chunk_gated_delta_rule(
+        q=q, k=k, use_qk_l2norm_in_kernel=use_qk_l2norm, **kwargs
+    )
+    for result in actual:
         assert torch.isfinite(result).all()
-        relative_error = (
-            result.float() - reference.float()
-        ).norm() / reference.float().norm()
-        assert relative_error < 1e-3
+    torch.testing.assert_close(
+        actual[0],
+        ref_output.to(dtype),
+        atol=1e-2 if dtype == torch.bfloat16 else 2e-3,
+        rtol=1e-2 if dtype == torch.bfloat16 else 1e-3,
+    )
+    torch.testing.assert_close(
+        actual[1].transpose(-1, -2),
+        ref_state,
+        atol=5e-3 if dtype == torch.bfloat16 else 1e-3,
+        rtol=1e-3 if dtype == torch.bfloat16 else 1e-4,
+    )
+    if use_qk_l2norm:
+        expected = chunk_gated_delta_rule(
+            q=ref_q, k=ref_k, use_qk_l2norm_in_kernel=False, **kwargs
+        )
+        for result, reference in zip(actual, expected, strict=True):
+            relative_error = (
+                result.float() - reference.float()
+            ).norm() / reference.float().norm()
+            assert relative_error < 1e-3
 
     if dtype == torch.bfloat16 and not use_cp and heads == (16, 16, 32):
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             graph_outputs = chunk_gated_delta_rule(
-                q=q, k=k, use_qk_l2norm_in_kernel=True, **kwargs
+                q=q, k=k, use_qk_l2norm_in_kernel=use_qk_l2norm, **kwargs
             )
         graph.replay()
         for result, reference in zip(graph_outputs, actual, strict=True):
