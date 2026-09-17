@@ -429,6 +429,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         situ_linear_beta: Optional[float] = None,
         gated: bool = True,
         use_a_per_token_scale: bool = False,
+        runtime_situ: bool = False,
+        runtime_situ_linear_beta: bool = False,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel with
         gather operation and FC1 activation fusion.
@@ -580,7 +582,13 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             raise ValueError(
                 f"gated={gated} is inconsistent with activation_type {activation_type!r}"
             )
-        validate_cute_dsl_moe_situ_config(activation_type, situ_beta, situ_linear_beta)
+        if runtime_situ:
+            if activation_type not in (ActivationType.Situ, ActivationType.Swiglu):
+                raise ValueError("Runtime SiTU requires ActivationType.Situ or Swiglu")
+        else:
+            validate_cute_dsl_moe_situ_config(
+                activation_type, situ_beta, situ_linear_beta
+            )
         self.vectorized_f32 = vectorized_f32
         self.activation_type = int(activation_type)
         self.swiglu_alpha = swiglu_alpha
@@ -588,6 +596,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         self.swiglu_limit = swiglu_limit
         self.situ_beta = situ_beta
         self.situ_linear_beta = situ_linear_beta
+        self.runtime_situ = runtime_situ
+        self.runtime_situ_linear_beta = runtime_situ_linear_beta
 
     def _setup_attributes(self):
         """Set up configurations that are dependent on GEMM inputs
@@ -813,6 +823,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
+        situ_beta_tensor: Optional[cute.Tensor] = None,
+        situ_linear_beta_tensor: Optional[cute.Tensor] = None,
     ):
         """Execute the contiguous grouped GEMM with gather operation and SwiGLU fusion.
 
@@ -1173,6 +1185,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             num_non_exiting_tiles,
             alpha,
             a_per_token_scale,
+            situ_beta_tensor,
+            situ_linear_beta_tensor,
             self.cluster_layout_vmnk,
             self.cluster_layout_sfb_vmnk,
             self.a_smem_layout_staged,
@@ -1260,6 +1274,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         num_non_exiting_tiles: cute.Tensor,
         alpha: cute.Tensor,
         a_per_token_scale: Optional[cute.Tensor],
+        situ_beta_tensor: Optional[cute.Tensor],
+        situ_linear_beta_tensor: Optional[cute.Tensor],
         cluster_layout_vmnk: cute.Layout,
         cluster_layout_sfb_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
@@ -2666,6 +2682,13 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
 
                 expert_idx = mma_tile_coord_mnl[2]
                 alpha_val = alpha[expert_idx]
+                if cutlass.const_expr(self.runtime_situ):
+                    runtime_beta = situ_beta_tensor[expert_idx]
+                    if cutlass.const_expr(self.runtime_situ_linear_beta):
+                        runtime_linear_beta = situ_linear_beta_tensor[expert_idx]
+                        runtime_inv_linear_beta = (
+                            cutlass.Float32(1.0) / runtime_linear_beta
+                        )
                 if cutlass.const_expr(self.use_a_per_token_scale):
                     tile_m_start = tile_info[0] * self.cta_tile_shape_mnk[0]
                     permuted_row = tile_m_start + epi_tidx
@@ -2815,14 +2838,24 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                         swiglu_beta = cutlass.Float32(self.swiglu_beta)
                         swiglu_limit = cutlass.Float32(self.swiglu_limit)
                         LOG2_E = cutlass.Float32(1.4426950408889634)
-                        if cutlass.const_expr(self.situ_beta is not None):
-                            # Keep the Python float so situ_f32 can fold 1/beta.
-                            situ_beta = self.situ_beta
-                            if cutlass.const_expr(self.situ_linear_beta is not None):
-                                linear_beta = cutlass.Float32(self.situ_linear_beta)
-                                inv_linear_beta = cutlass.Float32(
-                                    f32_reciprocal(self.situ_linear_beta)
-                                )
+                        if cutlass.const_expr(
+                            self.runtime_situ or self.situ_beta is not None
+                        ):
+                            if cutlass.const_expr(self.runtime_situ):
+                                situ_beta = runtime_beta
+                                if cutlass.const_expr(self.runtime_situ_linear_beta):
+                                    linear_beta = runtime_linear_beta
+                                    inv_linear_beta = runtime_inv_linear_beta
+                            else:
+                                # Preserve folding for the existing scalar API.
+                                situ_beta = self.situ_beta
+                                if cutlass.const_expr(
+                                    self.situ_linear_beta is not None
+                                ):
+                                    linear_beta = cutlass.Float32(self.situ_linear_beta)
+                                    inv_linear_beta = cutlass.Float32(
+                                        f32_reciprocal(self.situ_linear_beta)
+                                    )
                             if cutlass.const_expr(self.vectorized_f32):
                                 for i in cutlass.range_constexpr(
                                     0, cute.size(tTR_rAcc_up), 2
@@ -2854,7 +2887,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                                         ),
                                     )
                                     if cutlass.const_expr(
-                                        self.situ_linear_beta is not None
+                                        self.runtime_situ_linear_beta
+                                        or self.situ_linear_beta is not None
                                     ):
                                         acc_vec_up_alpha = (
                                             linear_beta
@@ -2890,7 +2924,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                                         fastmath=True,
                                     )
                                     if cutlass.const_expr(
-                                        self.situ_linear_beta is not None
+                                        self.runtime_situ_linear_beta
+                                        or self.situ_linear_beta is not None
                                     ):
                                         acc_vec_up_alpha = linear_beta * tanh_f32(
                                             acc_vec_up_alpha * inv_linear_beta,
@@ -4023,6 +4058,10 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
+        situ_beta_ptr: Optional[cute.Pointer] = None,
+        situ_linear_beta_ptr: Optional[cute.Pointer] = None,
+        situ_beta_stride: cutlass.Int32 = 0,
+        situ_linear_beta_stride: cutlass.Int32 = 0,
     ):
         scale_k = k // scaling_vector_size
         interm_size = n // self.out_n_factor
@@ -4065,6 +4104,22 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             else None
         )
         alpha = cute.make_tensor(alpha_ptr, layout=cute.make_layout((l,)))
+        situ_beta_tensor = (
+            cute.make_tensor(
+                situ_beta_ptr,
+                layout=cute.make_layout((l,), stride=(situ_beta_stride,)),
+            )
+            if cutlass.const_expr(situ_beta_ptr is not None)
+            else None
+        )
+        situ_linear_beta_tensor = (
+            cute.make_tensor(
+                situ_linear_beta_ptr,
+                layout=cute.make_layout((l,), stride=(situ_linear_beta_stride,)),
+            )
+            if cutlass.const_expr(situ_linear_beta_ptr is not None)
+            else None
+        )
         a_per_token_scale = (
             cute.make_tensor(a_per_token_scale_ptr, layout=cute.make_layout((orig_m,)))
             if cutlass.const_expr(a_per_token_scale_ptr is not None)
@@ -4106,6 +4161,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             max_active_clusters=max_active_clusters,
             stream=stream,
             epilogue_op=epilogue_op,
+            situ_beta_tensor=situ_beta_tensor,
+            situ_linear_beta_tensor=situ_linear_beta_tensor,
         )
 
 

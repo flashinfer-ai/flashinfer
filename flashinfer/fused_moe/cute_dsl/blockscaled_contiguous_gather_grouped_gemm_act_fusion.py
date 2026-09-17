@@ -266,10 +266,14 @@ def _get_compiled_gather_kernel(
     swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
     swiglu_beta: float = DEFAULT_SWIGLU_BETA,
     swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
-    situ_beta: Optional[float] = None,
-    situ_linear_beta: Optional[float] = None,
+    situ_beta: Optional[Union[float, torch.Tensor]] = None,
+    situ_linear_beta: Optional[Union[float, torch.Tensor]] = None,
     gated: bool = True,
     use_a_per_token_scale: bool = False,
+    runtime_situ_beta_ptr=None,
+    runtime_situ_linear_beta_ptr=None,
+    situ_beta_stride: int = 0,
+    situ_linear_beta_stride: int = 0,
 ):
     """Get or compile the gather grouped GEMM with FC1 activation fusion.
 
@@ -293,6 +297,9 @@ def _get_compiled_gather_kernel(
     )
 
     is_rubin = mma_tiler is not None and mma_inst_shape is not None
+    runtime_situ = isinstance(situ_beta, torch.Tensor)
+    if is_rubin and runtime_situ:
+        raise NotImplementedError("Runtime SiTU parameters require the Blackwell kernel")
 
     cache_key = (
         "sm107" if is_rubin else "sm100",
@@ -314,8 +321,10 @@ def _get_compiled_gather_kernel(
         swiglu_alpha,
         swiglu_beta,
         swiglu_limit,
-        situ_beta,
-        situ_linear_beta,
+        "runtime" if runtime_situ else situ_beta,
+        ("runtime" if situ_linear_beta is not None else None)
+        if runtime_situ
+        else situ_linear_beta,
         gated,
         use_a_per_token_scale,
     )
@@ -371,10 +380,12 @@ def _get_compiled_gather_kernel(
                 swiglu_alpha=swiglu_alpha,
                 swiglu_beta=swiglu_beta,
                 swiglu_limit=swiglu_limit,
-                situ_beta=situ_beta,
-                situ_linear_beta=situ_linear_beta,
+                situ_beta=None if runtime_situ else situ_beta,
+                situ_linear_beta=None if runtime_situ else situ_linear_beta,
                 gated=gated,
                 use_a_per_token_scale=use_a_per_token_scale,
+                runtime_situ=runtime_situ,
+                runtime_situ_linear_beta=runtime_situ and situ_linear_beta is not None,
             )
         wrapper_fn = gemm.wrapper
 
@@ -413,6 +424,16 @@ def _get_compiled_gather_kernel(
             scaling_vector_size=sf_vec_size,
             max_active_clusters=max_active_clusters,
             stream=stream,
+            **(
+                {
+                    "situ_beta_ptr": runtime_situ_beta_ptr,
+                    "situ_linear_beta_ptr": runtime_situ_linear_beta_ptr,
+                    "situ_beta_stride": situ_beta_stride,
+                    "situ_linear_beta_stride": situ_linear_beta_stride,
+                }
+                if not is_rubin
+                else {}
+            ),
         )
 
         _gather_kernel_cache[cache_key] = compiled_gemm
@@ -455,8 +476,8 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
     swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
     swiglu_beta: float = DEFAULT_SWIGLU_BETA,
     swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
-    situ_beta: Optional[float] = None,
-    situ_linear_beta: Optional[float] = None,
+    situ_beta: Optional[Union[float, torch.Tensor]] = None,
+    situ_linear_beta: Optional[Union[float, torch.Tensor]] = None,
     gated: bool = True,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Blockscaled contiguous gather grouped GEMM with fused FC1 activation.
@@ -520,9 +541,16 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         swiglu_alpha: SwiGLU sigmoid multiplier.
         swiglu_beta: SwiGLU up-projection bias.
         swiglu_limit: SwiGLU clamp limit.
-        situ_beta: When set with ActivationType.Swiglu, use the SiTU gate
-            ``beta * tanh(gate / beta) * sigmoid(gate)``.
-        situ_linear_beta: Optional SiTU tanh clamp for the up branch.
+        situ_beta: SiTU gate parameter for ``ActivationType.Situ`` (or the
+            legacy SwiGLU variant): ``beta * tanh(gate / beta) * sigmoid(gate)``.
+            A contiguous CUDA float32 tensor containing one value or one per
+            local expert supplies runtime parameters without specialization on
+            their values. Values must be positive and finite. Python floats
+            retain the existing scalar specialization behavior.
+        situ_linear_beta: Optional SiTU tanh clamp for the up branch. When
+            situ_beta is a tensor this must also be a CUDA float32 tensor
+            containing one value or one per local expert, or None to leave
+            the up branch unchanged.
         gated: Whether to run the gated SwiGLU path. If False, run non-gated
             ReLU2.
 
@@ -791,6 +819,31 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         norm_const_ptr = None
 
     alpha_ptr = make_ptr(cutlass.Float32, alpha.data_ptr(), cute.AddressSpace.gmem)
+    runtime_situ_beta_ptr = None
+    runtime_situ_linear_beta_ptr = None
+    situ_beta_stride = 0
+    situ_linear_beta_stride = 0
+    if isinstance(situ_beta, torch.Tensor):
+        for name, value in (
+            ("situ_beta", situ_beta),
+            ("situ_linear_beta", situ_linear_beta),
+        ):
+            if value is not None and (
+                value.device != a.device or value.numel() not in (1, num_experts)
+            ):
+                raise ValueError(
+                    f"{name} must be on the input device and contain one or "
+                    "num_local_experts values"
+                )
+        runtime_situ_beta_ptr = make_ptr(
+            cutlass.Float32, situ_beta.data_ptr(), cute.AddressSpace.gmem
+        )
+        situ_beta_stride = int(situ_beta.numel() != 1)
+        if situ_linear_beta is not None:
+            runtime_situ_linear_beta_ptr = make_ptr(
+                cutlass.Float32, situ_linear_beta.data_ptr(), cute.AddressSpace.gmem
+            )
+            situ_linear_beta_stride = int(situ_linear_beta.numel() != 1)
     if use_a_per_token_scale:
         a_per_token_scale_ptr = make_ptr(
             cutlass.Float32,
@@ -862,6 +915,10 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         situ_linear_beta=situ_linear_beta,
         gated=gated,
         use_a_per_token_scale=use_a_per_token_scale,
+        runtime_situ_beta_ptr=runtime_situ_beta_ptr,
+        runtime_situ_linear_beta_ptr=runtime_situ_linear_beta_ptr,
+        situ_beta_stride=situ_beta_stride,
+        situ_linear_beta_stride=situ_linear_beta_stride,
     )
 
     # Execute kernel with runtime parameters.
@@ -892,6 +949,16 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         k,
         num_experts,
         stream=stream,
+        **(
+            {
+                "situ_beta_ptr": runtime_situ_beta_ptr,
+                "situ_linear_beta_ptr": runtime_situ_linear_beta_ptr,
+                "situ_beta_stride": situ_beta_stride,
+                "situ_linear_beta_stride": situ_linear_beta_stride,
+            }
+            if not is_rubin
+            else {}
+        ),
     )
 
     return out, out_scale if generate_sfc else None

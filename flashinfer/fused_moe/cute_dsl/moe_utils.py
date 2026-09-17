@@ -53,6 +53,7 @@ def _is_finite_fp32(value: float, *, positive: bool = False) -> bool:
 
 SUPPORTED_CUTE_DSL_MOE_ACTIVATION_TYPES = (
     ActivationType.Swiglu,
+    ActivationType.Situ,
     ActivationType.GegluTanh,
     ActivationType.Relu2,
 )
@@ -86,24 +87,41 @@ def validate_cute_dsl_moe_swiglu_config(
 
 def validate_cute_dsl_moe_situ_config(
     activation_type: ActivationType,
-    situ_beta: Optional[float],
-    situ_linear_beta: Optional[float],
+    situ_beta: Optional[Union[float, torch.Tensor]],
+    situ_linear_beta: Optional[Union[float, torch.Tensor]],
 ) -> None:
     """Validate the optional SiTU variant of the SwiGLU epilogue."""
     if situ_beta is None:
+        if activation_type == ActivationType.Situ:
+            raise ValueError("ActivationType.Situ requires situ_beta")
         if situ_linear_beta is not None:
             raise ValueError("situ_linear_beta requires situ_beta")
         return
-    if activation_type != ActivationType.Swiglu:
-        raise ValueError("SiTU parameters require ActivationType.Swiglu")
-    if not _is_finite_fp32(situ_beta, positive=True):
-        raise ValueError("situ_beta must be positive and finite in fp32")
-    if situ_linear_beta is not None and not _is_finite_fp32(
-        situ_linear_beta, positive=True
+    if activation_type not in (ActivationType.Swiglu, ActivationType.Situ):
+        raise ValueError("SiTU parameters require ActivationType.Situ or Swiglu")
+    runtime = isinstance(situ_beta, torch.Tensor)
+    for name, value in (
+        ("situ_beta", situ_beta),
+        ("situ_linear_beta", situ_linear_beta),
     ):
-        raise ValueError(
-            "situ_linear_beta must be positive and finite in fp32 when set"
-        )
+        if value is None:
+            continue
+        if isinstance(value, torch.Tensor):
+            if not runtime:
+                raise TypeError("Tensor situ_linear_beta requires tensor situ_beta")
+            if value.dtype != torch.float32 or value.device.type != "cuda":
+                raise TypeError(f"{name} must be a CUDA float32 tensor")
+            if not value.is_contiguous() or value.numel() == 0:
+                raise ValueError(f"{name} must be nonempty and contiguous")
+            # Runtime values are caller-owned device data. Reading them here
+            # would synchronize the host and break CUDA Graph capture.
+        else:
+            if runtime:
+                raise TypeError(
+                    "Tensor situ_beta requires tensor situ_linear_beta or None"
+                )
+            if not _is_finite_fp32(value, positive=True):
+                raise ValueError(f"{name} must be positive and finite in fp32")
 
 
 def get_max_num_tiles(
@@ -500,6 +518,7 @@ def allocate_moe_sort_buffers(
             - out_permuted_idx_to_expanded_idx
             - out_total_num_padded_tokens
             - out_num_non_exiting_tiles
+            - out_expert_counts (scratch used for num_tokens > 1024)
 
     Example:
         >>> # Pre-allocate before CUDA graph capture
@@ -543,6 +562,9 @@ def allocate_moe_sort_buffers(
         "out_num_non_exiting_tiles": torch.empty(
             (1,), dtype=torch.int32, device=device
         ),
+        "out_expert_counts": torch.empty(
+            (2 * num_experts,), dtype=torch.int32, device=device
+        ),
     }
 
 
@@ -562,6 +584,7 @@ def moe_sort(
     out_permuted_idx_to_expanded_idx: Optional[torch.Tensor] = None,
     out_total_num_padded_tokens: Optional[torch.Tensor] = None,
     out_num_non_exiting_tiles: Optional[torch.Tensor] = None,
+    out_expert_counts: Optional[torch.Tensor] = None,
 ) -> Tuple[
     torch.Tensor,  # tile_idx_to_expert_idx
     torch.Tensor,  # tile_idx_to_mn_limit
@@ -730,9 +753,21 @@ def moe_sort(
     # launchInitExpertCounts before reading, so no Python-side init is needed
     # (matching trt-llm's torch::empty allocation pattern).
     if num_tokens > 1024:
-        expert_counts = torch.empty(
-            (2 * num_experts,), dtype=torch.int32, device=device
-        )
+        expert_counts = out_expert_counts
+        if expert_counts is None:
+            expert_counts = torch.empty(
+                (2 * num_experts,), dtype=torch.int32, device=device
+            )
+        elif (
+            expert_counts.dtype != torch.int32
+            or expert_counts.device != device
+            or not expert_counts.is_contiguous()
+            or expert_counts.numel() < 2 * num_experts
+        ):
+            raise ValueError(
+                "out_expert_counts must be contiguous int32 on the routing device "
+                "with at least 2 * num_experts elements"
+            )
         expert_counts_ptr = expert_counts.data_ptr()
     else:
         expert_counts_ptr = 0  # Will be set to nullptr in kernel

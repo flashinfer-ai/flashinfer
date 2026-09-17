@@ -50,7 +50,7 @@ Example (Wrapper API with CUDA Graph):
     >>> g.replay()
 """
 
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, Union
 
 import warnings
 import weakref
@@ -233,8 +233,8 @@ def _moe_core_impl(
     swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
     swiglu_beta: float = DEFAULT_SWIGLU_BETA,
     swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
-    situ_beta: Optional[float] = None,
-    situ_linear_beta: Optional[float] = None,
+    situ_beta: Optional[Union[float, torch.Tensor]] = None,
+    situ_linear_beta: Optional[Union[float, torch.Tensor]] = None,
 ) -> torch.Tensor:
     """Core MoE implementation shared by functional and wrapper APIs.
 
@@ -313,8 +313,6 @@ def _moe_core_impl(
         raise ValueError("quant_mode='w4a8' supports only torch.bfloat16 output")
     if is_mxfp8 and not use_fused_finalize:
         raise ValueError("quant_mode='w4a8' requires use_fused_finalize=True")
-    if is_mxfp8 and (situ_beta is not None or situ_linear_beta is not None):
-        raise ValueError("SiTU is not supported when quant_mode='w4a8'")
     validate_cute_dsl_moe_situ_config(activation, situ_beta, situ_linear_beta)
     if is_mxfp8:
         validate_w4a8_inputs(

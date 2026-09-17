@@ -2420,6 +2420,84 @@ def _interleave_linear_and_gate(
     return x
 
 
+def prepare_cute_dsl_mxfp4_weights(
+    w1: torch.Tensor,
+    w1_scale: torch.Tensor,
+    w2: torch.Tensor,
+    w2_scale: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Prepare native packed MXFP4 weights for CuTe-DSL W4A8 without requantizing.
+
+    The canonical inputs are contiguous uint8 tensors on the same device:
+
+    * ``w1``: ``[E, 2 * I, H // 2]``, with the up rows followed by gate rows.
+    * ``w1_scale``: ``[E, 2 * I, H // 32]`` linear UE8M0 scale bytes.
+    * ``w2``: ``[E, H, I // 2]`` packed E2M1 down-projection weights.
+    * ``w2_scale``: ``[E, H, I // 32]`` linear UE8M0 scale bytes.
+
+    ``H`` and ``I`` must be positive multiples of 128. Each byte stores two
+    E2M1 values in their original nibble order; one scale covers 32 values.
+    Scale bytes encode UE8M0 directly, so unity is byte 127, not an E4M3 one.
+
+    Returns ``(w1_prepared, w1_sf_mma, w2, w2_sf_mma)``. W1 rows and their
+    scales are interleaved in 64-row up/gate groups. Scale outputs use the
+    strided six-dimensional MMA layout expected by the W4A8 kernels. All
+    payload and scale bytes are preserved exactly; W2 storage is reused.
+
+    This load-time operation allocates the prepared W1 and scale storage.
+    It does not cache or retain the source tensors: callers may release the
+    original W1 and linear scales after preparation. Run before graph capture.
+    """
+    for name, tensor in (
+        ("w1", w1),
+        ("w1_scale", w1_scale),
+        ("w2", w2),
+        ("w2_scale", w2_scale),
+    ):
+        if tensor.dtype != torch.uint8 or tensor.ndim != 3:
+            raise ValueError(f"{name} must be a three-dimensional uint8 tensor")
+        if tensor.device != w1.device or not tensor.is_contiguous():
+            raise ValueError(f"{name} must be contiguous and on the W1 device")
+
+    experts, hidden, packed_intermediate = w2.shape
+    intermediate = packed_intermediate * 2
+    if experts <= 0 or min(hidden, intermediate) <= 0:
+        raise ValueError("expert count and matrix dimensions must be positive")
+    if hidden % 128 or intermediate % 128:
+        raise ValueError("MXFP4 hidden and intermediate dimensions must be multiples of 128")
+    expected = (
+        ("w1", w1, (experts, 2 * intermediate, hidden // 2)),
+        ("w1_scale", w1_scale, (experts, 2 * intermediate, hidden // 32)),
+        ("w2_scale", w2_scale, (experts, hidden, intermediate // 32)),
+    )
+    for name, tensor, shape in expected:
+        if tuple(tensor.shape) != shape:
+            raise ValueError(f"{name} must have shape {shape}, got {tuple(tensor.shape)}")
+
+    def to_mma_layout(scale: torch.Tensor) -> torch.Tensor:
+        # Linear [E, M, K/32] -> physical [E, M/128, K/128, 32, 4, 4].
+        # Within a 128-row tile, the row index is inner_m * 32 + outer_m.
+        groups, rows, blocks = scale.shape
+        physical = (
+            scale.view(groups, rows // 128, 4, 32, blocks // 4, 4)
+            .permute(0, 1, 4, 3, 2, 5)
+            .contiguous()
+        )
+        # Logical MMA axes: [outer_m, inner_m, M/128, inner_k, K/128, E].
+        return physical.permute(3, 4, 1, 5, 2, 0)
+
+    w1_prepared = _interleave_linear_and_gate(w1, group_size=64, dim=1)
+    w1_scale_interleaved = _interleave_linear_and_gate(
+        w1_scale, group_size=64, dim=1
+    )
+    return (
+        w1_prepared,
+        to_mma_layout(w1_scale_interleaved),
+        w2,
+        to_mma_layout(w2_scale),
+    )
+
+
 def prepare_cute_dsl_weights(
     w1_bf16: torch.Tensor,
     w2_bf16: torch.Tensor,
