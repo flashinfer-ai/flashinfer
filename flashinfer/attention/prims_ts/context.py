@@ -140,6 +140,7 @@ class _ContextPlanGeometry:
     causal_single_kv_tile: bool
     packed_dense_k_mask: bool
     head_dim_vo: int | None = None
+    enable_softmax_stats: bool = False
 
 
 @dataclass(frozen=True)
@@ -231,6 +232,7 @@ class _ContextCompileSpec:
     packed_dense_k_mask: bool
     scheduler: _ContextScheduler
     head_dim_vo: int | None = None
+    enable_softmax_stats: bool = False
 
 
 @dataclass(frozen=True)
@@ -769,8 +771,9 @@ def _read_indptr(
     name: str,
     *,
     expected_total: int,
+    allow_empty: bool = False,
 ) -> tuple[tuple[int, ...], tuple[int, ...]]:
-    """Read cumulative offsets and validate strictly positive row lengths."""
+    """Read cumulative offsets and validate nonempty (or explicitly empty) rows."""
 
     values = tuple(int(value) for value in indptr.tolist())
     if values[0] != 0:
@@ -781,8 +784,9 @@ def _read_indptr(
             f"expected {expected_total}, got {values[-1]}"
         )
     lengths = tuple(curr - prev for prev, curr in itertools.pairwise(values))
-    if any(length <= 0 for length in lengths):
-        raise ValueError(f"{name} offsets must be strictly increasing")
+    if any(length < (0 if allow_empty else 1) for length in lengths):
+        ordering = "nondecreasing" if allow_empty else "strictly increasing"
+        raise ValueError(f"{name} offsets must be {ordering}")
     return values, lengths
 
 
@@ -1258,10 +1262,13 @@ def _resolve_context_plan_geometry(
     mask_type: str,
     window_left: int,
     output_dtype: torch.dtype,
+    enable_softmax_stats: bool = False,
 ) -> _ContextPlanGeometry:
     """Validate explicit static bounds for a reusable contiguous plan."""
 
     _validate_context_dtype_pair(qk_dtype, qk_dtype, pv_dtype, output_dtype)
+    if not isinstance(enable_softmax_stats, bool):
+        raise TypeError("enable_softmax_stats must be a bool")
     _validate_mask(mask_type)
     window_left = _validate_window_left(window_left, mask_type)
     if not isinstance(packed, bool):
@@ -1336,6 +1343,7 @@ def _resolve_context_plan_geometry(
             and max_kv_len <= _CONTEXT_KV_TILE_N
         ),
         packed_dense_k_mask=packed and mask_type == "dense",
+        enable_softmax_stats=enable_softmax_stats,
     )
 
 
@@ -1654,6 +1662,7 @@ def _context_compile_spec(geometry: _ContextPlanGeometry) -> _ContextCompileSpec
         head_dim_vo=geometry.head_dim_vo,
         qk_dtype_key=_dtype_key(geometry.qk_dtype),
         pv_dtype_key=_dtype_key(geometry.pv_dtype),
+        enable_softmax_stats=geometry.enable_softmax_stats,
         output_dtype_key=_dtype_key(geometry.output_dtype),
         mask_type=geometry.mask_type,
         window_left=geometry.window_left,
@@ -1780,6 +1789,7 @@ def _get_compiled_context(
         variable_window_token_starts: cute.Tensor,
         variable_window_token_ends: cute.Tensor,
         variable_window_cta_starts: cute.Tensor,
+        softmax_stats: cute.Tensor | None,
         stream: cuda_drv.CUstream,
         static_max_active_clusters: cutlass.Constexpr[int],
         static_packed: cutlass.Constexpr[bool],
@@ -1805,6 +1815,7 @@ def _get_compiled_context(
                 variable_window_token_starts=variable_window_token_starts,
                 variable_window_token_ends=variable_window_token_ends,
                 variable_window_cta_starts=variable_window_cta_starts,
+                softmax_stats=softmax_stats,
             )
         else:
             fmha(
@@ -1819,6 +1830,7 @@ def _get_compiled_context(
                 variable_window_token_starts=variable_window_token_starts,
                 variable_window_token_ends=variable_window_token_ends,
                 variable_window_cta_starts=variable_window_cta_starts,
+                softmax_stats=softmax_stats,
             )
 
     def fake_compact(dtype, shape, assumed_align):
@@ -1853,6 +1865,11 @@ def _get_compiled_context(
     k_fake = fake_compact(input_qk_dtype, kv_shape, 16)
     v_fake = fake_compact(input_pv_dtype, (*kv_shape[:-1], head_dim_vo), 16)
     out_fake = fake_compact(output_dtype, out_shape, 16)
+    softmax_stats_fake = (
+        fake_compact(cutlass.Float32, (*out_shape[:-1], 2), 4)
+        if compile_spec.enable_softmax_stats
+        else None
+    )
     scale_fake = fake_compact(cutlass.Float32, (1,), 4)
     output_scale_fake = fake_compact(cutlass.Float32, (1,), 4)
     qo_indptr_fake = fake_compact(cutlass.Int32, qo_indptr_shape, 4)
@@ -1891,6 +1908,7 @@ def _get_compiled_context(
             variable_window_starts_fake,
             variable_window_ends_fake,
             variable_window_cta_starts_fake,
+            softmax_stats_fake,
             stream_fake,
             max_active_clusters,
             packed,
@@ -2136,7 +2154,12 @@ def _validate_runtime_inputs(
                 f"{total_q} for batch_size={geometry.batch_size} and "
                 f"max_seq_len_q={geometry.max_seq_len_q}"
             )
-        if total_k < geometry.batch_size or total_k > (
+        min_total_k = (
+            1
+            if geometry.enable_softmax_stats and geometry.mask_type == "dense"
+            else geometry.batch_size
+        )
+        if total_k < min_total_k or total_k > (
             geometry.batch_size * geometry.max_seq_len_k
         ):
             raise ValueError(
@@ -2162,6 +2185,11 @@ def _validate_runtime_inputs(
                 indptr,
                 name,
                 expected_total=expected_total,
+                allow_empty=(
+                    name == "kv_indptr"
+                    and geometry.enable_softmax_stats
+                    and geometry.mask_type == "dense"
+                ),
             )
             request_lengths[name] = lengths
             capacity = (
@@ -2457,6 +2485,7 @@ class BatchPrefillTSWrapper:
         v_dtype: Optional[torch.dtype] = None,
         out_dtype: Optional[torch.dtype] = None,
         packed: bool = False,
+        enable_softmax_stats: bool = False,
         mask_type: Literal["dense", "causal", "variable_window"] = "dense",
         window_left: int = -1,
         sm_scale: Optional[float] = None,
@@ -2464,8 +2493,9 @@ class BatchPrefillTSWrapper:
     ) -> None:
         """Compile one reusable specialization from explicit static geometry.
 
-        Packed plans conservatively support any positive per-request Q and K/V
-        lengths bounded by ``max_seq_len_q`` and ``max_kv_len``. Fixed plans
+        Packed plans support positive per-request Q and K/V lengths bounded by
+        ``max_seq_len_q`` and ``max_kv_len`` (empty dense K/V chunks are also
+        supported when statistics are enabled; see below). Fixed plans
         use those bounds as their exact tensor extents. ``batch_size`` is exact.
         Calling ``plan`` again replaces all plan-owned tensors and invalidates
         CUDA graphs captured from the previous plan. Complete every launch and
@@ -2503,6 +2533,13 @@ class BatchPrefillTSWrapper:
             Output dtype; defaults to ``q_dtype``.
         packed : bool
             Whether run tensors use packed ``[total_tokens, H, D]`` storage.
+        enable_softmax_stats : bool
+            Compile an additional output for merging independently computed
+            attention chunks. When enabled, every run must supply a float32
+            ``softmax_stats`` tensor with shape ``[*q.shape[:-1], 2]``.
+            Packed dense plans also permit empty K/V rows for absent chunks,
+            provided the packed K/V tensors contain at least one token.
+            Empty rows produce zero output and statistics ``(-inf, 0)``.
         mask_type : {"dense", "causal", "variable_window"}
             Attention mask mode. ``variable_window`` is supported only for
             fixed-shape inputs.
@@ -2536,6 +2573,7 @@ class BatchPrefillTSWrapper:
             mask_type=mask_type,
             window_left=window_left,
             output_dtype=resolved_out_dtype,
+            enable_softmax_stats=enable_softmax_stats,
         )
         if sm_scale is None:
             sm_scale = 1.0 / math.sqrt(geometry.head_dim)
@@ -2601,6 +2639,7 @@ class BatchPrefillTSWrapper:
         variable_window_token_ends: Optional[torch.Tensor] = None,
         variable_window_cta_starts: Optional[torch.Tensor] = None,
         out: Optional[torch.Tensor] = None,
+        softmax_stats: Optional[torch.Tensor] = None,
         scale_softmax_log2: Optional[torch.Tensor] = None,
         output_scale: Optional[torch.Tensor] = None,
         validate: bool = True,
@@ -2625,6 +2664,16 @@ class BatchPrefillTSWrapper:
             wrapper derives these values from ``variable_window_token_starts``.
         out : torch.Tensor, optional
             Caller-owned output tensor. A new tensor is allocated when omitted.
+        softmax_stats : torch.Tensor, optional
+            Caller-owned compact float32 tensor shaped ``[*q.shape[:-1], 2]``.
+            Required exactly when ``enable_softmax_stats=True`` was planned.
+            Each pair is ``(m, s)``, where ``m`` is the maximum scaled logit
+            in natural-log units and ``s = sum(exp(logit - m))``. Together
+            with the normalized output, these values allow stable merging of
+            attention over disjoint K/V chunks. They are independent of
+            ``output_scale``; merged outputs must use a common output scale.
+            Must not overlap ``out``, any live input, or a plan-owned buffer;
+            storage overlap is a caller precondition and is not checked.
         scale_softmax_log2 : torch.Tensor, optional
             Per-run one-element float32 softmax scale in base-2 form. Defaults
             to the scale retained by the plan.
@@ -2643,6 +2692,20 @@ class BatchPrefillTSWrapper:
         if not isinstance(validate, bool):
             raise TypeError("validate must be a bool")
         geometry = state.geometry
+        if geometry.enable_softmax_stats != (softmax_stats is not None):
+            raise ValueError(
+                "softmax_stats must be supplied exactly when "
+                "enable_softmax_stats=True was planned"
+            )
+        if validate and softmax_stats is not None:
+            if softmax_stats.dtype != torch.float32:
+                raise ValueError("softmax_stats must have dtype float32")
+            if softmax_stats.device != q.device:
+                raise ValueError("softmax_stats must be on the same device as q")
+            if tuple(softmax_stats.shape) != (*q.shape[:-1], 2):
+                raise ValueError("softmax_stats must have shape [*q.shape[:-1], 2]")
+            _validate_compact(softmax_stats, "softmax_stats", "[*q.shape[:-1], 2]")
+            _validate_alignment(softmax_stats, "softmax_stats", 4)
         if geometry.packed:
             if qo_indptr is None or kv_indptr is None:
                 raise ValueError(
@@ -2755,6 +2818,7 @@ class BatchPrefillTSWrapper:
             runtime_window_starts,
             runtime_window_ends,
             runtime_window_cta_starts,
+            softmax_stats,
         )
         return out
 

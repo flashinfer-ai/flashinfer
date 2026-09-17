@@ -4104,6 +4104,9 @@ class TmemStatsResource(MemoryResource):
     tmem_vec_offset: Constexpr[int] = field(init=False, default=None)
     scale_softmax_log2: cute.Tensor | None = field(init=False, default=None)
     output_scale: cute.Tensor | None = field(init=False, default=None)
+    softmax_stats: cute.Tensor | None = field(init=False, default=None)
+    cum_seqlen_q: cute.Tensor | None = field(init=False, default=None)
+    q_half: Constexpr[int] = 0
     tmem_addr_cached: TmemAddr | None = field(init=False, default=None)
     # Precomputed per-warp TMEM vec address (once, before persistent loop).
     tmem_vec_addr_cached: TmemAddr | None = field(init=False, default=None)
@@ -4123,6 +4126,9 @@ class TmemStatsResource(MemoryResource):
         tmem_vec_offset: int,
         scale_softmax_log2: cute.Tensor | None = None,
         output_scale: cute.Tensor | None = None,
+        softmax_stats: cute.Tensor | None = None,
+        cum_seqlen_q: cute.Tensor | None = None,
+        q_half: int = 0,
         **kwargs: Any,
     ) -> None:
         """Bind the correction-stat TMEM vector offset and allocation."""
@@ -4131,6 +4137,9 @@ class TmemStatsResource(MemoryResource):
         self.tmem_vec_offset = tmem_vec_offset
         self.scale_softmax_log2 = scale_softmax_log2
         self.output_scale = output_scale
+        self.softmax_stats = softmax_stats
+        self.cum_seqlen_q = cum_seqlen_q
+        self.q_half = q_half
         self._alloc = TmemAllocation(f"tmem_vec_{tmem_vec_offset}", cfg.tmem_stats_cols)
         self._smem_alloc = None
         if cfg.stats_via_smem:
@@ -4327,6 +4336,40 @@ class TmemStatsResource(MemoryResource):
           scale = exp2(scale_log2 * (old_max - new_max))
         and to forward row_sum to SmemO for the final normalization.
         """
+        if cutlass.const_expr(final_stats and self.softmax_stats is not None):
+            seq_coord, head_coord, batch_coord = _resolve_work_tile_coords(
+                self.cfg, stage_info.work_tile.tile_idx
+            )
+            row_in_tile = (
+                cute.arch.warp_idx() % 4
+            ) * cute.arch.WARP_SIZE + cute.arch.lane_idx()
+            row = (
+                seq_coord * self.cfg.q_tile_m * self.cfg.work_tile_q_seq_tiles
+                + self.q_half * self.cfg.peer_q_seq_tile_stride * self.cfg.q_tile_m
+                + row_in_tile
+            )
+            head = (
+                head_coord * self.cfg.work_tile_q_heads
+                + self.q_half * self.cfg.peer_q_head_stride
+            )
+            # Softmax uses exp2(raw_score * scale_log2). The chunk merger
+            # expects maxima in natural-log units, not raw QK scores or LSE.
+            maximum = row_max * self.scale_softmax_log2[0] * Float32(0.6931471805599453)
+            # FP8 PV stores exp(logit - maximum) scaled by 448. Export the
+            # unscaled denominator; keep the internal correction stats intact.
+            denominator = row_sum / Float32(self.cfg.pv_p_scale)
+            if row_sum == Float32(0.0):
+                maximum = -Float32.inf
+            if cutlass.const_expr(self.cfg.has_varlen):
+                start = Int32(self.cum_seqlen_q[batch_coord])
+                end = Int32(self.cum_seqlen_q[batch_coord + Int32(1)])
+                if start + row < end:
+                    self.softmax_stats[start + row, head, 0] = maximum
+                    self.softmax_stats[start + row, head, 1] = denominator
+            else:
+                if row < self.softmax_stats.shape[1]:
+                    self.softmax_stats[batch_coord, row, head, 0] = maximum
+                    self.softmax_stats[batch_coord, row, head, 1] = denominator
         if cutlass.const_expr(self.cfg.stats_via_smem):
             stat0 = old_row_max
             if cutlass.const_expr(final_stats):
@@ -5041,6 +5084,12 @@ class SmemOResource(MemoryResource):
         # in TmemStats.consumer_work.
         correction_scale = vec_scale
         scale = output_scale * correction_scale / vec_row_sum
+        if cutlass.const_expr(self.tmem_vec_resource is not None):
+            if cutlass.const_expr(self.tmem_vec_resource.softmax_stats is not None):
+                # Absent chunks have zero accumulated O. Avoid 0 * inf so
+                # their outputs can be merged using the exported (m, s).
+                if vec_row_sum == Float32(0.0):
+                    scale = Float32(0.0)
 
         num_correction_warps = 4
         tidx, _, _ = cute.arch.thread_idx()
