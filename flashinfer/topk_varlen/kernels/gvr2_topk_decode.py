@@ -3619,13 +3619,25 @@ class GvrTopkRegKernel:
         if short == cutlass.Int32(0):
             npad = cutlass.Int32(logits.shape[1])  # noqa: F841
             k = cutlass.Int32(pre_idx.shape[1])
-            out_row = out[row, None]
             x_addr = logits[row, None].iterator.toint()  # Int64 gmem byte base
             p_addr = pre_idx[prow, None].iterator.toint()  # request-level under varlen
 
             # ---- shared-memory window (map in module docstring) ----
             sptr = cute.arch.get_dyn_smem(cutlass.Int32, alignment=16)
             sbase = sptr.toint()  # Int32 shared addr
+            if cutlass.const_expr(self.page_size > 0):
+                # Keep dependent page gathers out of the atomic-serialized
+                # selection scatters. Append K logical indices to the normal
+                # workspace, then map them in a coalesced terminal epilogue.
+                out_row = cute.make_tensor(
+                    cute.make_ptr(
+                        cutlass.Int32, sbase + smem_bytes,
+                        cute.AddressSpace.smem, assumed_align=16,
+                    ),
+                    cute.make_layout((k,)),
+                )
+            else:
+                out_row = out[row, None]
 
             s_res = _smem_view(cutlass.Int32, sbase, 0, 6)
             s_cnt = _smem_view(cutlass.Int32, sbase, 6, 2)  # [0]=s_o1 [1]=s_oc
@@ -4047,10 +4059,10 @@ class GvrTopkRegKernel:
                     p2e = b2 + popc(n2 & lml)
                     if q1e == cutlass.Int32(1):
                         if p1e < nA:
-                            _store_mapped_index(out_row, p1e, ixv, mapping, row, self.page_size)
+                            out_row[p1e] = ixv
                     if q2e == cutlass.Int32(1):
                         if p2e < nT:
-                            _store_mapped_index(out_row, nA + p2e, ixv, mapping, row, self.page_size)
+                            out_row[nA + p2e] = ixv
                 # tail element
                 u64 = cutlass.Int64(-1)
                 if tid < ntail:
@@ -4076,10 +4088,10 @@ class GvrTopkRegKernel:
                 p2e = b2 + popc(n2 & lml)
                 if q1e == cutlass.Int32(1):
                     if p1e < nA:
-                        _store_mapped_index(out_row, p1e, tix, mapping, row, self.page_size)
+                        out_row[p1e] = tix
                 if q2e == cutlass.Int32(1):
                     if p2e < nT:
-                        _store_mapped_index(out_row, nA + p2e, tix, mapping, row, self.page_size)
+                        out_row[nA + p2e] = tix
                 # (CUDA returns here — everything below is the else-arm)
             else:
                 # ---- emit
@@ -4103,7 +4115,7 @@ class GvrTopkRegKernel:
                                 s_hist.iterator + cutlass.Int32(bn), cutlass.Int32(1)
                             )
                             if p < lim1:
-                                _store_mapped_index(out_row, p, idx, mapping, row, self.page_size)
+                                out_row[p] = idx
                             else:
                                 if whole == cutlass.Int32(0):
                                     q2i = p - above
@@ -4120,7 +4132,7 @@ class GvrTopkRegKernel:
                         bn = _umin_u32(f2u_rz(qt2), cutlass.Uint32(self.nbh - 1))
                         p = atomic_add_cta(s_hist.iterator + cutlass.Int32(bn), cutlass.Int32(1))
                         if p < lim1:
-                            _store_mapped_index(out_row, p, tix, mapping, row, self.page_size)
+                            out_row[p] = tix
                         else:
                             if whole == cutlass.Int32(0):
                                 q2i = p - above
@@ -4183,12 +4195,12 @@ class GvrTopkRegKernel:
                             << cutlass.Int32(2)
                         ) + (sdyn & cutlass.Int32(3))
                         if p1 < lim1:
-                            _store_mapped_index(out_row, p1, idx, mapping, row, self.page_size)
+                            out_row[p1] = idx
                         p1 = p1 + cutlass.Int32(1)
                         wm = wm & (wm - cutlass.Int32(1))
                     if t1 == cutlass.Int32(1):
                         if p1 < lim1:
-                            _store_mapped_index(out_row, p1, tix, mapping, row, self.page_size)
+                            out_row[p1] = tix
                         p1 = p1 + cutlass.Int32(1)
                     if m2 != cutlass.Int32(0):  # static-unrolled
                         for s in cutlass.range_constexpr(S):
@@ -4239,7 +4251,7 @@ class GvrTopkRegKernel:
                                 r = r + tinc
                                 j = j + cutlass.Int32(1)
                             if r < need:
-                                _store_mapped_index(out_row, above + r, ci[i], mapping, row, self.page_size)
+                                out_row[above + r] = ci[i]
                             i = i + cutlass.Int32(BLK)
                     else:
                         # ---- fallback: exact key-space narrowing
@@ -4355,11 +4367,18 @@ class GvrTopkRegKernel:
                             p2e = b2 + popc(n2 & lml)
                             if q1f == cutlass.Int32(1):
                                 if p1e < aboveC:
-                                    _store_mapped_index(out_row, above + p1e, idv, mapping, row, self.page_size)
+                                    out_row[above + p1e] = idv
                             if q2f == cutlass.Int32(1):
                                 if p2e < needC:
-                                    _store_mapped_index(out_row, above + aboveC + p2e, idv, mapping, row, self.page_size)
+                                    out_row[above + aboveC + p2e] = idv
                             it = it + cutlass.Int32(1)
+
+            if cutlass.const_expr(self.page_size > 0):
+                cute.arch.barrier()
+                i = tid
+                while i < k:
+                    _store_mapped_index(out[row, None], i, out_row[i], mapping, row, self.page_size)
+                    i = i + cutlass.Int32(BLK)
 
     # ------------------------------------------------------------------
     @cute.jit
@@ -4393,7 +4412,7 @@ _COMPILE_CACHE__reg: dict = {}
 
 
 class GvrTopkRegPagedKernel(GvrTopkRegKernel):
-    """Same selection engine, with page translation at its terminal stores."""
+    """Same selection engine, with a shared-index mapping epilogue."""
 
     @cute.jit
     def __call__(
@@ -4403,7 +4422,8 @@ class GvrTopkRegPagedKernel(GvrTopkRegKernel):
     ):
         self.kern(logits, pre_idx, kv_lens, out, n, cmp_, qc, smem_bytes, mapping).launch(
             grid=(logits.shape[0], 1, 1), block=(self.blk, 1, 1),
-            stream=stream, smem=smem_bytes, min_blocks_per_mp=self.minb,
+            stream=stream, smem=smem_bytes + pre_idx.shape[1] * 4,
+            min_blocks_per_mp=self.minb,
             use_pdl=self.pdl,
         )
 
