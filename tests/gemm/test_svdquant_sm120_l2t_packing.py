@@ -77,10 +77,11 @@ def test_sm120_pack_preserves_arbitrary_bits(k: int, source_offset: int) -> None
 
 @pytest.mark.parametrize("k", (3072, 5120, 5376, 7168))
 @pytest.mark.parametrize("graph_calls", (1, 32))
-def test_sm120_pack_inference_graph_observes_same_address_updates(
-    k: int, graph_calls: int
+@pytest.mark.parametrize("inference_mode", (False, True))
+def test_sm120_pack_graph_observes_same_address_updates(
+    k: int, graph_calls: int, inference_mode: bool
 ) -> None:
-    with torch.inference_mode():
+    with torch.inference_mode(inference_mode):
         source = _source(k)
         output, storage = _guarded_output(k)
         for _ in range(3):
@@ -93,7 +94,7 @@ def test_sm120_pack_inference_graph_observes_same_address_updates(
                 _pack(source, output)
                 cached_output = backend._cached_sm120_m537_l2t(source)
         addresses = source.data_ptr(), output.data_ptr(), cached_output.data_ptr()
-        assert source.is_inference()
+        assert source.is_inference() == inference_mode
         for mask in (0x1234, -1, 0x4321):
             source.view(torch.int16).bitwise_xor_(mask)
             output.view(torch.int16).fill_(0)
@@ -108,6 +109,24 @@ def test_sm120_pack_inference_graph_observes_same_address_updates(
                 output.data_ptr(),
                 cached_output.data_ptr(),
             )
+
+
+def test_sm120_pack_capture_does_not_publish_unexecuted_eager_cache() -> None:
+    source = _source(3072)
+    backend._pack_sm120_m537_l2t(source)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = backend._cached_sm120_m537_l2t(source)
+
+    captured.view(torch.int16).zero_()
+    eager = backend._cached_sm120_m537_l2t(source)
+    assert torch.equal(_reference_bits(source), eager.view(torch.int16))
+
+    source.view(torch.int16).bitwise_xor_(0x1234)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(_reference_bits(source), captured.view(torch.int16))
 
 
 InvalidInput = Literal[

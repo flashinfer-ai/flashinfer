@@ -144,9 +144,12 @@ def _cached_sm120_m537_l2t(
     l2t_smoothed: torch.Tensor,
 ) -> torch.Tensor:
     """Cache a shared L2T pack and invalidate it on mutation."""
-    # Inference tensors have no version counter, so their mutations cannot
-    # invalidate a cached pack. Repack them on each call.
-    if l2t_smoothed.is_inference():
+    # Capture the pack so graph replay observes weight updates without Python
+    # cache lookups. Keep graph-owned buffers out of the eager cache as well.
+    # Inference tensors have no version counter and must also be repacked.
+    if l2t_smoothed.is_inference() or (
+        l2t_smoothed.is_cuda and torch.cuda.is_current_stream_capturing()
+    ):
         return _pack_sm120_m537_l2t(l2t_smoothed)
 
     source_id = id(l2t_smoothed)
@@ -457,8 +460,10 @@ def _sm120_fused_linear_runner(enable_pdl: bool, device: torch.device):
     return Sm120FusedLinearRunner()
 
 
-def _sm120_cutlass_linear_runner(enable_pdl: bool, device: torch.device):
-    module = get_nvfp4_svdquant_sm120_module()
+def _sm120_cutlass_linear_runner(
+    enable_pdl: bool, device: torch.device, rank: int
+) -> TunableRunner:
+    module = get_nvfp4_svdquant_sm120_module(rank)
 
     class Sm120CutlassLinearRunner(TunableRunner):
         def get_valid_tactics(
@@ -538,7 +543,7 @@ def _sm120_linear_runners(
     runners = []
     if _sm120_fused_linear_supported(m, k, rank):
         runners.append(_sm120_fused_linear_runner(enable_pdl, device))
-    runners.append(_sm120_cutlass_linear_runner(enable_pdl, device))
+    runners.append(_sm120_cutlass_linear_runner(enable_pdl, device, rank))
     return runners
 
 
@@ -858,6 +863,7 @@ def svdquant_linear(
     is a route the tuner selects over -- one fused launch where the composed
     path spends two -- and the tactic it picks names the prefix and the GEMM
     together, so the pair is chosen on measured cost rather than independently.
+    Rank 64 uses separate smooth quantization and LoRA-down with a rank-64 GEMM.
     """
     if enable_pdl is None:
         enable_pdl = device_support_pdl(x.device)
@@ -865,10 +871,10 @@ def svdquant_linear(
     m, k = x.shape if x.ndim == 2 else (-1, -1)
     n = weight_fp4.shape[0] if weight_fp4.ndim == 2 else -1
     rank = l2t_smoothed.shape[1] if l2t_smoothed.ndim == 2 else -1
-    if rank != SVDQUANT_LORA_RANK_GRANULARITY:
+    if rank not in (32, 64):
         raise ValueError(
-            f"the SM120 CUTLASS SVDQuant backend supports LoRA rank "
-            f"{SVDQUANT_LORA_RANK_GRANULARITY} only, got {rank}"
+            "the SM120 CUTLASS SVDQuant linear backend supports LoRA ranks "
+            f"32 and 64, got {rank}"
         )
 
     xq = torch.empty((m, k // 2), dtype=torch.uint8, device=x.device)
