@@ -18,15 +18,18 @@ DESCRIPTION = """Reproduce FlashInfer #4775 with signed FP4 data and a dequantiz
 
 Run one KV dtype per process. Select the source checkout with PYTHONPATH and
 give each checkout its own FLASHINFER_WORKSPACE_BASE. Timings exclude plan,
-quantization, compilation, and reference checking.
+quantization, compilation, and reference checking. The selected checkout must
+be clean, including untracked files. Keep benchmark outputs outside that checkout.
 """
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
 import statistics
 import subprocess
+import tempfile
 
 import torch
 import flashinfer
@@ -54,6 +57,39 @@ DTYPES = {
     "fp8": torch.float8_e4m3fn,
     "nvfp4": torch.uint8,
 }
+
+
+def positive_int(value):
+    """Parse a strictly positive integer for benchmark dimensions and sampling."""
+    value = int(value)
+    if value <= 0:
+        raise argparse.ArgumentTypeError("value must be greater than zero")
+    return value
+
+
+def source_commit(source):
+    """Require a clean imported checkout before attributing results to its HEAD."""
+    status = subprocess.check_output(
+        ["git", "-C", str(source), "status", "--porcelain", "--untracked-files=all"],
+        text=True,
+    )
+    if status:
+        raise RuntimeError(
+            f"Benchmark requires a clean source checkout: {source}\n{status}"
+        )
+    return subprocess.check_output(
+        ["git", "-C", str(source), "rev-parse", "HEAD"], text=True
+    ).strip()
+
+
+def write_results(output, result):
+    """Preserve completed results if writing the next JSON snapshot fails."""
+    with tempfile.TemporaryDirectory(
+        prefix=f".{output.name}.", dir=output.parent
+    ) as tmp:
+        temporary = Path(tmp) / output.name
+        temporary.write_text(json.dumps(result, indent=2) + "\n")
+        temporary.replace(output)
 
 
 def make_kv(shape, dtype):
@@ -221,26 +257,25 @@ def main():
     parser.add_argument("--kv-dtype", choices=DTYPES, default="nvfp4")
     parser.add_argument("--q-dtype", choices=["fp16", "bf16"], default="fp16")
     parser.add_argument("--cases", nargs="+", choices=CASES, default=list(CASES)[:5])
-    parser.add_argument("--q-heads", type=int, default=32)
-    parser.add_argument("--kv-heads", type=int, default=8)
-    parser.add_argument("--page-size", type=int, default=16)
+    parser.add_argument("--q-heads", type=positive_int, default=32)
+    parser.add_argument("--kv-heads", type=positive_int, default=8)
+    parser.add_argument("--page-size", type=positive_int, default=16)
     parser.add_argument("--layout", choices=["NHD", "HND"], default="NHD")
     parser.add_argument("--mode", choices=["paged", "ragged"], default="paged")
     parser.add_argument("--causal", action="store_true")
     parser.add_argument(
         "--pos-encoding-mode", choices=["NONE", "ROPE_LLAMA"], default="NONE"
     )
-    parser.add_argument("--rounds", type=int, default=3)
-    parser.add_argument("--repeats", type=int, default=30)
+    parser.add_argument("--rounds", type=positive_int, default=3)
+    parser.add_argument("--repeats", type=positive_int, default=30)
     parser.add_argument("--check-only", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     source = Path(flashinfer.__file__).resolve().parents[1]
     result = {
-        "git_commit": subprocess.check_output(
-            ["git", "-C", str(source), "rev-parse", "HEAD"], text=True
-        ).strip(),
+        "git_commit": source_commit(source),
         "source": str(source),
+        "benchmark_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "torch": torch.__version__,
         "cuda": torch.version.cuda,
         "gpu": torch.cuda.get_device_name(),
@@ -256,7 +291,7 @@ def main():
     for name in args.cases:
         row = run_case(name, args)
         result["results"].append(row)
-        args.output.write_text(json.dumps(result, indent=2) + "\n")
+        write_results(args.output, result)
         print(json.dumps(row), flush=True)
 
 

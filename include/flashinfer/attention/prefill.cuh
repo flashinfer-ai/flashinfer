@@ -919,8 +919,10 @@ __device__ __forceinline__ void page_produce_kv_sf(
                                              : cp_async::SharedMemFillMode::kNoFill;
         // A false source predicate still zero-fills V. Predicate the destination
         // separately so unused lanes skip the copy without a divergent branch.
+        // Keep predicated-off pointers in bounds before conversion to a shared address.
+        const uint32_t dst_byte = flat_byte < SF_TOTAL_BYTES ? flat_byte : 0;
         cp_async::pred_load_32b<fill_mode>(
-            reinterpret_cast<uint32_t*>(sf_smem + flat_byte),
+            reinterpret_cast<uint32_t*>(sf_smem + dst_byte),
             reinterpret_cast<const uint32_t*>(sf_ptr + sf_gmem_offset), in_bounds,
             flat_byte < SF_TOTAL_BYTES);
       }
@@ -993,7 +995,8 @@ __device__ __forceinline__ void produce_kv_sf(SmemStorage* smem_storage, uint8_t
       constexpr auto fill_mode =
           produce_v ? cp_async::SharedMemFillMode::kFillZero : cp_async::SharedMemFillMode::kNoFill;
       // Predicate the destination separately from the source (see page_produce_kv_sf).
-      cp_async::pred_load_32b<fill_mode>(reinterpret_cast<uint32_t*>(sf_smem + flat_byte),
+      const uint32_t dst_byte = flat_byte < SF_TOTAL_BYTES ? flat_byte : 0;
+      cp_async::pred_load_32b<fill_mode>(reinterpret_cast<uint32_t*>(sf_smem + dst_byte),
                                          reinterpret_cast<const uint32_t*>(sf_ptr + sf_gmem_offset),
                                          in_bounds, flat_byte < SF_TOTAL_BYTES);
     }
