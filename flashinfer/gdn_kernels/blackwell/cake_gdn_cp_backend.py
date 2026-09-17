@@ -110,46 +110,86 @@ def _choose_chunk_len(
 
 
 def _choose_long_chunk_len(
-    *, total_tokens: int, num_seqs: int, max_seqlen: int, target_chunks: int
+    *,
+    max_seqlen: int,
+    total_tokens: int,
+    num_seqs: int,
+    target_chunks: int,
+    chunk_len_granularity: int = _CHUNK_GRANULARITY,
 ) -> int:
+    """Resolve the shared long-path chunk search for an explicit CTA target."""
+
     remaining_tokens = max(0, total_tokens - max_seqlen)
     remaining_seqs = max(0, num_seqs - 1)
 
     def bounded_chunks(chunk_len: int) -> int:
+        # This is the same safe upper bound used by the pinned source.
         longest = _ceil_div(max_seqlen, chunk_len)
         compact_bound = min(remaining_seqs, remaining_tokens)
         compact_bound += (remaining_tokens - compact_bound) // chunk_len
         return longest + compact_bound
 
     lo = 1
-    hi = max(1, _ceil_div(max_seqlen, _CHUNK_GRANULARITY))
+    hi = max(1, _ceil_div(max_seqlen, chunk_len_granularity))
     while lo < hi:
         mid = (lo + hi) // 2
-        if bounded_chunks(mid * _CHUNK_GRANULARITY) <= target_chunks:
+        if bounded_chunks(mid * chunk_len_granularity) <= target_chunks:
             hi = mid
         else:
             lo = mid + 1
-    return lo * _CHUNK_GRANULARITY
+    return lo * chunk_len_granularity
 
 
 def _default_physical_chunk_len(
     *,
     source_chunk_len: int,
+    max_seqlen: int,
     total_tokens: int,
     num_seqs: int,
-    max_seqlen: int,
     num_heads: int,
     num_sms: int,
 ) -> int:
-    # The admitted SM100/SM103 devices use the HBM short-workload threshold.
+    """Choose measured physical waves while preserving source-final boundaries."""
+
     approx_ctas = _ceil_div(total_tokens, _CHUNK_GRANULARITY) * num_heads
     if approx_ctas * 2 < num_sms:
         return source_chunk_len
+    target_chunks = max(1, _ceil_div(num_sms, num_heads))
+    granularity = _CHUNK_GRANULARITY
+    if num_sms == 152:
+        # A barely populated extra wave serializes these one-CTA-per-SM
+        # recurrent stages. Use complete wave budgets and two-block alignment.
+        if num_seqs == 1 and num_heads in (16, 32, 48, 64):
+            waves = 1
+            if max_seqlen >= 32768 and num_heads in (32, 64):
+                waves = num_heads // 16
+            target_chunks = max(1, waves * num_sms // num_heads)
+            granularity = 2 * _BLOCK
+        elif num_seqs == 2 and num_heads == 48:
+            if total_tokens == num_seqs * max_seqlen:
+                target_chunks = max(1, 2 * num_sms // num_heads)
+                granularity = 2 * _BLOCK
+            elif 4 * max_seqlen <= 3 * total_tokens:
+                target_chunks = max(1, num_sms // num_heads)
+                granularity = 2 * _BLOCK
+            # Strongly uneven grids retain the measured 512-token policy.
+        elif (
+            num_seqs == 2
+            and num_heads == 64
+            and total_tokens != num_seqs * max_seqlen
+        ):
+            if 4 * max_seqlen > 3 * total_tokens:
+                # The half-total partition improves the rectangular grid's
+                # long/short CTA balance; it is not a sequence-alignment claim.
+                return _round_up(_ceil_div(total_tokens, 2), 2 * _BLOCK)
+            target_chunks = max(1, 2 * num_sms // num_heads)
+            granularity = 2 * _BLOCK
     return _choose_long_chunk_len(
+        max_seqlen=max_seqlen,
         total_tokens=total_tokens,
         num_seqs=num_seqs,
-        max_seqlen=max_seqlen,
-        target_chunks=max(1, _ceil_div(num_sms, num_heads)),
+        target_chunks=target_chunks,
+        chunk_len_granularity=granularity,
     )
 
 
@@ -434,9 +474,15 @@ def _build_plan(
     if (
         q.dtype == torch.float16
         and arch == "sm_103a"
-        and num_seqs == 1
-        and total_tokens == 65536
-        and (hq, hk, hv) == (16, 16, 48)
+        and hk == 16
+        and (
+            (num_seqs == 1 and total_tokens == 65536 and num_sab_heads == 48)
+            or (
+                num_seqs == 2
+                and total_tokens != num_seqs * max_seqlen
+                and num_sab_heads in (48, 64)
+            )
+        )
     ):
         t_kernel = "t_precompute_gb300_hv48_min6"
     # Without reading prefix-sum payloads, the full-block path is provably safe
