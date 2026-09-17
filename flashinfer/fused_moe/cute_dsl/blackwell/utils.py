@@ -51,7 +51,10 @@ f32 activation functions, fmin) and adds Blackwell-specific functions:
 blk_reduce_bf16, blk_reduce_fp32, blk_reduce_fp16.
 """
 
-from cutlass._mlir.dialects import llvm
+from dataclasses import dataclass
+
+import cutlass
+from cutlass._mlir.dialects import llvm, nvvm
 from cutlass.cutlass_dsl import dsl_user_op
 
 # Re-export all shared utilities so existing imports continue to work
@@ -78,6 +81,30 @@ from ..common.kernel_utils import (  # noqa: F401
 # ============================================================================
 # Blackwell-specific functions
 # ============================================================================
+
+
+@dataclass(frozen=True)
+class UnalignedNamedBarrier:
+    """Counted CTA barrier for participating warps at different instruction sites.
+
+    The aligned PTX form requires every thread in the CTA to execute the same
+    instruction. Warp-specialized kernels need the unaligned form when only
+    selected warps participate or producer and consumer warps meet at distinct
+    sites. Barrier ids and participant counts retain their usual semantics.
+    """
+
+    barrier_id: int
+    num_threads: int
+
+    @dsl_user_op
+    def arrive_and_wait(self, *, loc=None, ip=None) -> None:
+        nvvm.barrier_cta_sync(
+            barrier_id=cutlass.Int32(self.barrier_id).ir_value(loc=loc, ip=ip),
+            thread_count=cutlass.Int32(self.num_threads).ir_value(loc=loc, ip=ip),
+            aligned=False,
+            loc=loc,
+            ip=ip,
+        )
 
 
 @dsl_user_op

@@ -57,6 +57,7 @@ from ..moe_utils import (
 )
 from .custom_pipeline import PipelineCpAsyncUmma
 from .utils import (
+    UnalignedNamedBarrier,
     f32_reciprocal,
     fmin,
     gelu_tanh_f32,
@@ -558,15 +559,15 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             barrier_id=1,
             num_threads=self.threads_per_cta,
         )
-        self.epilog_sync_barrier = pipeline.NamedBarrier(
+        self.epilog_sync_barrier = UnalignedNamedBarrier(
             barrier_id=2,
             num_threads=32 * len(self.epilog_warp_id),
         )
-        self.tmem_alloc_barrier = pipeline.NamedBarrier(
+        self.tmem_alloc_barrier = UnalignedNamedBarrier(
             barrier_id=3,
             num_threads=32 * len((self.mma_warp_id, *self.epilog_warp_id)),
         )
-        self.sched_sync_barrier = pipeline.NamedBarrier(
+        self.sched_sync_barrier = UnalignedNamedBarrier(
             barrier_id=4,
             num_threads=self.threads_per_warp,
         )
@@ -2229,7 +2230,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             #
             # Bar sync for retrieve tensor memory ptr from shared mem
             #
-            tmem.wait_for_alloc()
+            # TmemAllocator reconstructs its barrier as an aligned NamedBarrier
+            # across DSL regions. Preserve our explicit unaligned barrier here.
+            self.tmem_alloc_barrier.arrive_and_wait()
 
             #
             # Retrieving tensor memory ptr and make accumulator tensor
@@ -2555,7 +2558,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             #
             # Bar sync for retrieve tensor memory ptr from shared memory
             #
-            tmem.wait_for_alloc()
+            self.tmem_alloc_barrier.arrive_and_wait()
 
             #
             # Retrieving tensor memory ptr and make accumulator tensor
