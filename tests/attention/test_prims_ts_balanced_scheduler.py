@@ -583,6 +583,35 @@ def test_optimized_scheduler_is_default_and_policies_are_named():
 
 
 @_REQUIRES_CUDA_SCHEDULER
+def test_optimized_scheduler_rejects_more_than_fold_thread_partitions():
+    seq_lens = [128]
+    accepted_plan = BalancedMLADecodePlan(
+        batch_size=1,
+        num_partitions=256,
+        device=torch.device("cuda"),
+        cost=BalancedCostModel(1000, 0),
+        max_seq_len=128,
+    )
+    plan = BalancedMLADecodePlan(
+        batch_size=1,
+        num_partitions=257,
+        device=torch.device("cuda"),
+        cost=BalancedCostModel(1000, 0),
+        max_seq_len=128,
+    )
+    device_seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device="cuda")
+
+    accepted_plan.schedule_device(device_seq_lens, scheduler="optimized")
+    _assert_device_plan_covers_requests(accepted_plan, seq_lens)
+
+    with pytest.raises(RuntimeError, match=r"supports at most\s+256\s+partitions"):
+        plan.schedule_device(device_seq_lens, scheduler="optimized")
+
+    plan.schedule_device(device_seq_lens, scheduler="exact")
+    _assert_device_plan_covers_requests(plan, seq_lens)
+
+
+@_REQUIRES_CUDA_SCHEDULER
 def test_device_plan_allocates_compact_capacities():
     plan = BalancedMLADecodePlan(
         batch_size=128,
