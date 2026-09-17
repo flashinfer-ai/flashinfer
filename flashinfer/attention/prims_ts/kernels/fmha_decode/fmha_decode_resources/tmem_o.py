@@ -474,7 +474,7 @@ class TmemOResource(DecodeGenResourceBase):
                         # Advance V and P to the next MMA-K slice inside the
                         # staged head-dim tile.
                         v_desc = v_desc + Int32(
-                            (cfg.head_dim_kv_stage * 2)
+                            (min(cfg.head_dim_kv_stage, 128) * 2)
                             if (cfg.use_fp8_qkv or cfg.v_dtype_bytes == 1)
                             else 128
                         )

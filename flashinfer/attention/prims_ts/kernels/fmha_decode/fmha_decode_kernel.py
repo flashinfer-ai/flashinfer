@@ -386,7 +386,7 @@ def _build_decode_gen_schedule(
     if cfg.use_keeps_mma_ab and cfg.num_insts_kv == 1 and not cfg.uses_tmem_p:
         raise ValueError(
             "one-instance KeepsMmaAb is enabled only for the staged headDim=256 "
-            "profile with head_dim_per_stage_kv=128 and o_stages=1"
+            "profile with D128 bands (or D256 for sparse FP8) and o_stages=1"
         )
     if use_native_paged_kv and not cfg.use_paged_kv:
         raise ValueError("native paged-KV ABI requires cfg.use_paged_kv=True")

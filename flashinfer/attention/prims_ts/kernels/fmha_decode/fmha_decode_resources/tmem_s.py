@@ -709,6 +709,12 @@ class TmemSResource(DecodeGenResourceBase):
                 if cutlass.const_expr(cfg.use_fp8_qkv or cfg.k_dtype_bytes == 1):
                     k_desc_offset = ki * Int32(2)
                     q_desc_offset = ki * Int32(2)
+                    if cutlass.const_expr(cfg.head_dim_kv_stage > 128):
+                        # A full FP8 head stage consists of two SW128 planes,
+                        # not a row-major D256 tile. Cross planes at K128.
+                        chunk_idx = (ki * Int32(_mma_k_step_qk(cfg))) // Int32(128)
+                        k_desc_offset += chunk_idx * Int32(8 * cfg.tile_size_kv - 8)
+                        q_desc_offset += chunk_idx * Int32(8 * cfg.tile_size_q - 8)
                 else:
                     chunk_idx = (ki * Int32(_mma_k_step_qk(cfg))) // Int32(64)
                     k_desc_offset = ki * Int32(2) + chunk_idx * Int32(1016)

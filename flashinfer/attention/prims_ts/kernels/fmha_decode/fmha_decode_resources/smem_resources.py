@@ -258,7 +258,7 @@ def _issue_sparse_page_copies(
     The cache writer zero-fills page padding: full-fragment tail loads rely
     on this because score masking alone does not sanitize NaN/Inf in V.
     """
-    chunk_hd = head_dim_stage if cfg.use_fp8_qkv else min(head_dim_stage, 64)
+    chunk_hd = min(head_dim_stage, 128 if cfg.use_fp8_qkv else 64)
     chunks = head_dim_stage // chunk_hd
     fragments = cfg.tile_size_kv // cfg.num_tokens_per_page
     copies = fragments * chunks
@@ -367,7 +367,7 @@ class SmemQResource(DecodeGenResourceBase):
             leading_byte_offset = q_leading_bytes
             stride_byte_offset = Int32(1024)
             if cutlass.const_expr(self.cfg.use_fp8_qkv):
-                q_head_dim_stage = self.cfg.head_dim_kv_stage
+                q_head_dim_stage = min(self.cfg.head_dim_kv_stage, 128)
                 q_tile_bytes = Int32(
                     self.cfg.tile_size_q * q_head_dim_stage * self.cfg.q_dtype_bytes
                 )
@@ -515,7 +515,7 @@ class SmemQResource(DecodeGenResourceBase):
         stage_base = self._smem_base_q.subview(stage_info.stage_idx * stage_elems)
         if cutlass.const_expr(cfg.use_fp8_qkv):
             if _is_load_task_warp_leader(cfg):
-                if cutlass.const_expr(cfg.num_head_dim_stages_kv == 1):
+                if cutlass.const_expr(cfg.headdim <= 128):
                     # FP8 with one head-dim stage is one tensor copy into the
                     # complete staged Q tile.
                     prims.cp_async_bulk_tensor_shared_cta_global(
@@ -532,9 +532,9 @@ class SmemQResource(DecodeGenResourceBase):
                 else:
                     # H256 FP8 stages Q by head-dim slices so each QK head-dim
                     # stage sees a contiguous SMEM tile.
-                    q_chunk_dim = cfg.head_dim_kv_stage
+                    q_chunk_dim = 128
                     for q_chunk_idx in cutlass.range_constexpr(
-                        cfg.num_head_dim_stages_kv
+                        cfg.headdim // q_chunk_dim
                     ):
                         head_dim_offset = q_chunk_idx * q_chunk_dim
                         smem_offset = head_dim_offset * cfg.tile_size_q
@@ -722,9 +722,6 @@ class SmemKvTileResource(DecodeGenResourceBase):
                 ),
                 addrspace=3,
             )
-            kv_tile_bytes = Int32(
-                self.cfg.tile_size_kv * self.cfg.head_dim_kv_stage * inst_dtype_bytes
-            )
             leading_byte_offset = Int32(
                 self.cfg.tile_size_kv
                 * min(self.cfg.head_dim_kv_stage, 64)
@@ -732,15 +729,19 @@ class SmemKvTileResource(DecodeGenResourceBase):
             )
             stride_byte_offset = Int32(1024)
             if cutlass.const_expr(self.cfg.use_fp8_qkv or inst_dtype_bytes == 1):
-                leading_byte_offset = kv_tile_bytes
+                leading_byte_offset = Int32(
+                    self.cfg.tile_size_kv * min(self.cfg.head_dim_kv_stage, 128)
+                )
                 stride_byte_offset = Int32(
                     _major_k_stride_bytes(inst_dtype_bytes, self.cfg.head_dim_kv_stage)
                 )
             if cutlass.const_expr(
                 self.kv_kind == KV_KIND_V
                 and (
-                    self.cfg.use_fp8_qkv
-                    or inst_dtype_bytes == 1
+                    (
+                        (self.cfg.use_fp8_qkv or inst_dtype_bytes == 1)
+                        and self.cfg.head_dim_kv_stage <= 128
+                    )
                     or self.cfg.headdim == 64
                 )
             ):

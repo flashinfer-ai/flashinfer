@@ -129,7 +129,8 @@ KV_TILE_256_SOFTMAX_TASK_REGISTERS = 152
 KV_TILE_256_CORRECTION_TASK_REGISTERS = 152
 
 # Sparse route unions reuse the dense Keeps staging: D64/D128 use two
-# unstaged K/V instances; D256 uses one instance with D128 head bands.
+# unstaged K/V instances; D256 uses one instance with D128 bands or a full
+# D256 FP8 stage assembled from 128-byte swizzled chunks.
 _Q_TOKEN_KV_BLOCK_SPARSE_GROUPED_KEEPS_PROFILES = {
     (
         dtype,
@@ -149,6 +150,10 @@ _Q_TOKEN_KV_BLOCK_SPARSE_GROUPED_KEEPS_PROFILES = {
         (Float8E4M3FN, BFloat16),
     )
 }
+_Q_TOKEN_KV_BLOCK_SPARSE_GROUPED_KEEPS_PROFILES.update(
+    (Float8E4M3FN, Float8E4M3FN, Float8E4M3FN, output, 256, 256, 1, 1)
+    for output in (Float16, BFloat16)
+)
 
 _KV_TILE_256_PHYSICAL_DEFAULTS: Mapping[str, ConfigValue] = {
     "tmem_s_cols": 128,
@@ -1877,7 +1882,14 @@ class FmhaDecodeConfig:
         return (
             self.use_keeps_mma_ab
             and self.headdim == 256
-            and self.head_dim_per_stage_kv == 128
+            and (
+                self.head_dim_per_stage_kv == 128
+                or (
+                    self.head_dim_per_stage_kv == 256
+                    and self.use_fp8_qkv
+                    and self.uses_scattered_page_route
+                )
+            )
             and self.num_insts_kv == 1
             and self.o_stages == 1
         )
@@ -4068,22 +4080,27 @@ def _validate_profile_support(
         effective_head_dim_stage = cfg.head_dim_per_stage_kv
         effective_num_insts_kv = cfg.num_insts_kv
         effective_o_stages = cfg.o_stages
+        supported_head_stage = effective_head_dim_stage == 128 or (
+            effective_head_dim_stage == 256
+            and cfg.use_fp8_qkv
+            and cfg.uses_q_token_kv_block_sparse_page_route
+        )
         if effective_num_insts_kv == 1 and (
-            headdim != 256 or effective_head_dim_stage != 128 or effective_o_stages != 1
+            headdim != 256 or not supported_head_stage or effective_o_stages != 1
         ):
             raise ValueError(
                 "one-instance KeepsMmaAb is enabled only for the staged "
-                "headDim=256 profile with head_dim_per_stage_kv=128 and "
+                "headDim=256 profile with D128 bands (or D256 for sparse FP8) and "
                 "o_stages=1"
             )
         if headdim == 256 and (
-            effective_head_dim_stage != 128
+            not supported_head_stage
             or effective_num_insts_kv != 1
             or effective_o_stages != 1
         ):
             raise ValueError(
                 "fmha_decode keepsMmaAb headDim=256 requires "
-                "head_dim_per_stage_kv=128, num_insts_kv=1, and o_stages=1"
+                "D128 bands (or D256 for sparse FP8), num_insts_kv=1, and o_stages=1"
             )
         if headdim != 256 and effective_head_dim_stage != 0:
             raise ValueError(
@@ -4145,7 +4162,7 @@ def _validate_profile_support(
                     and cfg.uses_q_token_kv_block_sparse_page_route
                 )
             )
-            and effective_head_dim_stage == 128
+            and supported_head_stage
             and effective_num_insts_kv == 1
             and effective_o_stages == 1
         )
