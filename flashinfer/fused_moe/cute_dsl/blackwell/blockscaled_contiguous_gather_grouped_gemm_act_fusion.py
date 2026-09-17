@@ -64,6 +64,8 @@ from .utils import (
     griddepcontrol_launch_dependents,
     griddepcontrol_wait,
     is_power_of_2,
+    native_situ_f32,
+    native_tanh_f32,
     situ_f32,
     tanh_f32,
     tcgen05_fence_after_thread_sync,
@@ -2882,34 +2884,69 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                                             cutlass.Float32(alpha_val),
                                         ),
                                     )
-                                    situ_gate_pair = (
-                                        situ_f32(
-                                            acc_vec_gate_alpha[0],
-                                            situ_beta,
-                                            fastmath=True,
-                                        ),
-                                        situ_f32(
-                                            acc_vec_gate_alpha[1],
-                                            situ_beta,
-                                            fastmath=True,
-                                        ),
-                                    )
+                                    # The validated mixed MXFP8/MXFP4 path uses native tanh.
+                                    if cutlass.const_expr(
+                                        self.unpack_tma and self.is_mxfp8_output
+                                    ):
+                                        situ_gate_pair = (
+                                            native_situ_f32(
+                                                acc_vec_gate_alpha[0],
+                                                situ_beta,
+                                                fastmath=True,
+                                            ),
+                                            native_situ_f32(
+                                                acc_vec_gate_alpha[1],
+                                                situ_beta,
+                                                fastmath=True,
+                                            ),
+                                        )
+                                    else:
+                                        situ_gate_pair = (
+                                            situ_f32(
+                                                acc_vec_gate_alpha[0],
+                                                situ_beta,
+                                                fastmath=True,
+                                            ),
+                                            situ_f32(
+                                                acc_vec_gate_alpha[1],
+                                                situ_beta,
+                                                fastmath=True,
+                                            ),
+                                        )
                                     if cutlass.const_expr(
                                         self.runtime_situ_linear_beta
                                         or self.situ_linear_beta is not None
                                     ):
-                                        acc_vec_up_alpha = (
-                                            linear_beta
-                                            * tanh_f32(
-                                                acc_vec_up_alpha[0] * inv_linear_beta,
-                                                fastmath=True,
-                                            ),
-                                            linear_beta
-                                            * tanh_f32(
-                                                acc_vec_up_alpha[1] * inv_linear_beta,
-                                                fastmath=True,
-                                            ),
-                                        )
+                                        if cutlass.const_expr(
+                                            self.unpack_tma and self.is_mxfp8_output
+                                        ):
+                                            acc_vec_up_alpha = (
+                                                linear_beta
+                                                * native_tanh_f32(
+                                                    acc_vec_up_alpha[0]
+                                                    * inv_linear_beta,
+                                                ),
+                                                linear_beta
+                                                * native_tanh_f32(
+                                                    acc_vec_up_alpha[1]
+                                                    * inv_linear_beta,
+                                                ),
+                                            )
+                                        else:
+                                            acc_vec_up_alpha = (
+                                                linear_beta
+                                                * tanh_f32(
+                                                    acc_vec_up_alpha[0]
+                                                    * inv_linear_beta,
+                                                    fastmath=True,
+                                                ),
+                                                linear_beta
+                                                * tanh_f32(
+                                                    acc_vec_up_alpha[1]
+                                                    * inv_linear_beta,
+                                                    fastmath=True,
+                                                ),
+                                            )
                                     (
                                         tCompute[i],
                                         tCompute[i + 1],
@@ -2926,19 +2963,39 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                                     acc_vec_gate_alpha = acc_vec_gate[
                                         i
                                     ] * cutlass.Float32(alpha_val)
-                                    situ_gate_value = situ_f32(
-                                        acc_vec_gate_alpha,
-                                        situ_beta,
-                                        fastmath=True,
-                                    )
+                                    if cutlass.const_expr(
+                                        self.unpack_tma and self.is_mxfp8_output
+                                    ):
+                                        situ_gate_value = native_situ_f32(
+                                            acc_vec_gate_alpha,
+                                            situ_beta,
+                                            fastmath=True,
+                                        )
+                                    else:
+                                        situ_gate_value = situ_f32(
+                                            acc_vec_gate_alpha,
+                                            situ_beta,
+                                            fastmath=True,
+                                        )
                                     if cutlass.const_expr(
                                         self.runtime_situ_linear_beta
                                         or self.situ_linear_beta is not None
                                     ):
-                                        acc_vec_up_alpha = linear_beta * tanh_f32(
-                                            acc_vec_up_alpha * inv_linear_beta,
-                                            fastmath=True,
-                                        )
+                                        if cutlass.const_expr(
+                                            self.unpack_tma and self.is_mxfp8_output
+                                        ):
+                                            acc_vec_up_alpha = (
+                                                linear_beta
+                                                * native_tanh_f32(
+                                                    acc_vec_up_alpha
+                                                    * inv_linear_beta,
+                                                )
+                                            )
+                                        else:
+                                            acc_vec_up_alpha = linear_beta * tanh_f32(
+                                                acc_vec_up_alpha * inv_linear_beta,
+                                                fastmath=True,
+                                            )
                                     tCompute[i] = acc_vec_up_alpha * situ_gate_value
                         elif cutlass.const_expr(
                             self.activation_type == ActivationType.GegluTanh.value

@@ -159,7 +159,8 @@ def _routing_warp_inclusive(value: cutlass.Int32, lane: cutlass.Int32):
 
 
 class _FusedRoutePreprocess:
-    def __init__(self, mode, threads):
+    def __init__(self, mode, threads, single_tile_per_expert=False):
+        self.single_tile_per_expert = single_tile_per_expert
         self.packed = mode == "packed"
         self.convert_weights = mode != "separate_fp32"
         self.threads = threads
@@ -301,8 +302,16 @@ class _FusedRoutePreprocess:
             cute.arch.sync_threads()
 
             count = counts[tid]
-            ntiles = (count + tile_size - 1) // tile_size
-            within_warp = _routing_warp_inclusive(ntiles, lane)
+            if cutlass.const_expr(self.single_tile_per_expert):
+                # Unique IDs give at most T rows per expert, and planning
+                # requires tile_size >= T. Every expert has zero or one tile.
+                ntiles = (count > 0).to(cutlass.Int32)
+                active_mask = cute.arch.vote_ballot_sync(count > 0)
+                inclusive_mask = cutlass.Uint32(0xFFFFFFFF) >> (31 - lane)
+                within_warp = cute.arch.popc(active_mask & inclusive_mask)
+            else:
+                ntiles = (count + tile_size - 1) // tile_size
+                within_warp = _routing_warp_inclusive(ntiles, lane)
             if lane == 31:
                 warp_sums[warp] = within_warp
             cute.arch.sync_threads()
@@ -411,6 +420,7 @@ def _plan_route_preprocess(
     num_local_experts=None,
     local_expert_offset=0,
     tile_size=128,
+    _single_tile_per_expert=False,
 ):
     """Compile, bind and enqueue one warmup, outside CUDA Graph capture.
 
@@ -433,7 +443,9 @@ def _plan_route_preprocess(
     the host. Tensor contents must be valid when planning because warmup runs.
     Shapes/strides are dynamic kernel arguments; beta values and tactic choices
     do not enter compilation. Cache entries are per input/sort mode, thread
-    count and device. Sorting uses 256..1024 threads, selected during planning.
+    count, device and single-tile prefix mode. Sorting uses 256..1024 threads,
+    selected during planning. The private single-tile option relies on the
+    unique-ID contract and falls back when tile_size < tokens.
     """
     if (
         not isinstance(output, torch.Tensor)
@@ -624,12 +636,20 @@ def _plan_route_preprocess(
                 *topk_ids.stride(),
                 *weight_strides,
             )
-        cache_key = (mode, threads, device.index, arch, sorts_tokens)
+        single_tile_per_expert = (
+            _single_tile_per_expert and sorts_tokens and tile_size >= tokens
+        )
+        cache_key = (
+            mode, threads, device.index, arch, sorts_tokens, single_tile_per_expert
+        )
         compiled = _route_preprocess_kernel_cache.get(cache_key)
         stream = cuda.CUstream(torch.cuda.current_stream(device).cuda_stream)
         if compiled is None:
-            kernel = _FusedRoutePreprocess if sorts_tokens else _RoutePreprocess
-            compiled = cute.compile(kernel(mode, threads), *arguments, stream=stream)
+            kernel = (
+                _FusedRoutePreprocess(mode, threads, single_tile_per_expert)
+                if sorts_tokens else _RoutePreprocess(mode, threads)
+            )
+            compiled = cute.compile(kernel, *arguments, stream=stream)
             _route_preprocess_kernel_cache[cache_key] = compiled
         bound = _RoutePreprocessPlan(
             compiled,

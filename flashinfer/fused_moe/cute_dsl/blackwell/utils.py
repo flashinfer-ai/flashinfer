@@ -52,10 +52,11 @@ blk_reduce_bf16, blk_reduce_fp32, blk_reduce_fp16.
 """
 
 from dataclasses import dataclass
+from typing import Union
 
 import cutlass
 from cutlass._mlir.dialects import llvm, nvvm
-from cutlass.cutlass_dsl import dsl_user_op
+from cutlass.cutlass_dsl import T, dsl_user_op
 
 # Re-export all shared utilities so existing imports continue to work
 from ..common.kernel_utils import (  # noqa: F401
@@ -122,6 +123,43 @@ class UnalignedNamedBarrier:
             loc=loc,
             ip=ip,
         )
+
+
+@dsl_user_op
+def native_tanh_f32(a, *, loc=None, ip=None):
+    """Native FP32 tanh for the SiTU path; requires SM75 or newer."""
+    return cutlass.Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [cutlass.Float32(a).ir_value(loc=loc, ip=ip)],
+            "tanh.approx.f32 $0, $1;",
+            "=f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+def native_situ_f32(
+    a: Union[float, cutlass.Float32],
+    beta: Union[float, cutlass.Float32],
+    fastmath: bool = False,
+) -> Union[float, cutlass.Float32]:
+    """Compute SiTU with native tanh and the existing sigmoid primitive."""
+    x = cutlass.Float32(a)
+    beta_f32 = cutlass.Float32(beta)
+    if isinstance(beta, (float, int)):
+        inv_beta = cutlass.Float32(f32_reciprocal(beta))
+    else:
+        inv_beta = cutlass.Float32(1.0) / beta_f32
+    return (
+        beta_f32
+        * native_tanh_f32(x * inv_beta)
+        * sigmoid_f32(x, fastmath=fastmath)
+    )
 
 
 @dsl_user_op

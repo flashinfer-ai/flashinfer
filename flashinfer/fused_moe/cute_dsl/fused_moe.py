@@ -236,6 +236,7 @@ def _moe_core_impl(
     situ_beta: Optional[Union[float, torch.Tensor]] = None,
     situ_linear_beta: Optional[Union[float, torch.Tensor]] = None,
     _prepared_launches: Optional[Dict[str, Any]] = None,
+    _enable_decode_specialization: bool = False,
 ) -> torch.Tensor:
     """Core MoE implementation shared by functional and wrapper APIs.
 
@@ -508,6 +509,7 @@ def _moe_core_impl(
         enable_pdl=enable_pdl,
         use_fused_finalize=use_fused_finalize,
         _prepared_launches=_prepared_launches,
+        _enable_narrow_a=_enable_decode_specialization,
     )
 
     # Step 4: Deterministic routing-weight reduction

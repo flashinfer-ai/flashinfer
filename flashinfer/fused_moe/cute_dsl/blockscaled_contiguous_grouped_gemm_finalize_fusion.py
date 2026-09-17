@@ -222,6 +222,7 @@ def _get_compiled_finalize_kernel(
     enable_pdl: bool = True,
     use_a_per_token_scale: bool = False,
     use_fused_finalize: bool = True,
+    enable_narrow_a: bool = False,
 ):
     """Get or compile the grouped GEMM with finalize fusion kernel.
 
@@ -257,6 +258,7 @@ def _get_compiled_finalize_kernel(
         enable_pdl,
         use_a_per_token_scale,
         use_fused_finalize,
+        enable_narrow_a,
     )
 
     if cache_key not in _finalize_kernel_cache:
@@ -307,6 +309,7 @@ def _get_compiled_finalize_kernel(
                 enable_pdl=enable_pdl,
                 use_a_per_token_scale=use_a_per_token_scale,
                 use_fused_finalize=use_fused_finalize,
+                enable_narrow_a=enable_narrow_a,
             )
             wrapper_fn = gemm_bw.wrapper
 
@@ -382,6 +385,7 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
     enable_pdl: bool = True,
     use_fused_finalize: bool = True,
     _prepared_launches: Optional[Dict[str, Any]] = None,
+    _enable_narrow_a: bool = False,
 ) -> torch.Tensor:
     """Blockscaled contiguous grouped GEMM for MoE GEMM2 workloads.
 
@@ -694,6 +698,7 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
         enable_pdl=enable_pdl,
         use_fused_finalize=use_fused_finalize,
         use_a_per_token_scale=use_a_per_token_scale,
+        enable_narrow_a=_enable_narrow_a,
     )
 
     # Execute kernel with runtime parameters.

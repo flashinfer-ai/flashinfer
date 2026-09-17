@@ -165,6 +165,9 @@ class Mxfp4MoEPlan:
                 num_local_experts=self._kwargs["num_local_experts"],
                 local_expert_offset=self._kwargs["local_expert_offset"],
                 tile_size=self._kwargs["tile_size"],
+                _single_tile_per_expert=self._kwargs.get(
+                    "_enable_decode_specialization", False
+                ),
             )
             # Preprocessing warmup clears output. Finish the complete MoE so
             # plan retains its existing valid-output postcondition.
@@ -459,6 +462,18 @@ class CuteDslMxfp4MoEWrapper:
             if w1_sf.device != x.device or w2_sf.device != x.device:
                 raise ValueError("weight scales must be on the input device")
             tile, gemm1, gemm2 = self._tactic(num_tokens)
+            # The public routing contract requires distinct IDs per token,
+            # so an expert has at most T rows. Restrict this specialization
+            # to the qualified B300 SiTU decode tactic.
+            decode_specialization = (
+                (major, minor) == (10, 3)
+                and 1 <= num_tokens <= 16
+                and self.activation_type == ActivationType.Situ
+                and not self.enable_pdl
+                and tile == 128
+                and gemm1 == ((128, 128), (1, 1), False)
+                and gemm2 == ((128, 128), (1, 1), False)
+            )
             route_ids = buffers["route_ids"] if topk_weights is None else topk_ids
             kwargs = dict(
                 x=x,
@@ -496,6 +511,7 @@ class CuteDslMxfp4MoEWrapper:
                 activation_type=self.activation_type.value,
                 situ_beta=beta,
                 situ_linear_beta=linear_beta,
+                _enable_decode_specialization=decode_specialization,
             )
             plan = Mxfp4MoEPlan(
                 kwargs=kwargs,
