@@ -172,10 +172,13 @@ def _radix_cutlass_top_k_varlen_check(
     backend="auto",
     load_balance=True,
     workspace=None,
+    row_starts=None,
 ):  # extra kwargs mirror the public signature; unused by the check
     """Radix masked-fallback: runs on all supported SM tiers, on contiguous
     logits (the CUDA launcher checks contiguity; gating here lets ``auto``
     pick a backend that handles strided views instead)."""
+    if row_starts is not None:
+        return False  # windowed (prefill) mode is served by gvr_2 only
     return logits.is_contiguous()
 
 
@@ -227,12 +230,15 @@ def _gvr_top_k_varlen_check(
     backend="auto",
     load_balance=True,
     workspace=None,
+    row_starts=None,
 ):
     """Return True only when GVR can run on this exact configuration.
 
     Used by backend="auto" routing: returning False here causes the heuristic to
     fall back to radix or radix_cutlass rather than reaching GVR and crashing.
     """
+    if row_starts is not None:
+        return False  # windowed (prefill) mode is served by gvr_2 only
     if not (
         _cute_dsl_ready(logits.device)
         and pre_idx is not None
@@ -272,6 +278,7 @@ def _gvr2_top_k_varlen_check(
     backend="auto",
     load_balance=True,
     workspace=None,
+    row_starts=None,
 ):
     """Return True only when the self-sampling GVR V2 port can run this config.
 
@@ -283,6 +290,12 @@ def _gvr2_top_k_varlen_check(
     sample, TRT-LLM #18410) when it is absent — or malformed, in which case the
     API body discards it with a RuntimeWarning first.
     """
+    if row_starts is not None and (
+        pre_idx is not None or next_n != 1 or compress_ratio != 1
+    ):
+        return (
+            False  # windowed mode: hint-free, one row per request, no compression shift
+        )
     if not _cute_dsl_ready(logits.device):
         return False
     # fp32 only: the upstream self-sampling kernels declare bf16/fp16 a
@@ -325,6 +338,7 @@ def _top_k_varlen_heuristic(
     backend: str = "auto",
     load_balance: bool = True,
     workspace=None,
+    row_starts=None,
 ):
     """Shape/dtype-aware ranking so auto tracks the measured per-config winner.
 
@@ -1080,9 +1094,11 @@ def _run_gvr2(
     out_indices: torch.Tensor,
     out_values: Optional[torch.Tensor],
     workspace: Optional[dict] = None,
+    row_starts: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Self-sampling GVR V2: one launch for the whole batch via the per-row
-    in-kernel varlen engine (TRT-LLM ``run_varlen`` port).
+    in-kernel varlen engine (TRT-LLM ``run_varlen`` port). ``row_starts``
+    selects the windowed (prefill) engines (TRT-LLM #18702 port).
 
     ``max_seq_len`` is derived from the logits row width (in uncompressed
     token space, hence ``* compress_ratio``), which is capture-stable — the
@@ -1108,6 +1124,7 @@ def _run_gvr2(
         max_seq_len=logits.shape[1] * compress_ratio,
         workspace=workspace.get("gvr2_workspace") if workspace else None,
         top_k=top_k,
+        row_starts=row_starts,
     )
     return out_indices, (out_values if return_output_values else None)
 
@@ -1249,10 +1266,13 @@ def _radix_top_k_varlen_check(
     backend="auto",
     load_balance=True,
     workspace=None,
+    row_starts=None,
 ):
     """CuTe DSL multi-CTA radix: Blackwell-plus only, no pre_idx required.
     Overlapping row layouts (stride(0) < shape[1]) fail the kernel's stride
     contract, so they are gated here and ``auto`` falls through."""
+    if row_starts is not None:
+        return False  # windowed (prefill) mode is served by gvr_2 only
     if logits.dim() == 2 and logits.shape[0] > 1 and logits.stride(0) < logits.shape[1]:
         return False
     return _cute_dsl_ready(logits.device)
@@ -1388,6 +1408,7 @@ def _radix_filter_top_k_varlen_check(
     backend="auto",
     load_balance=True,
     workspace=None,
+    row_starts=None,
 ):
     """Return True only when the vendored DKG kernel covers this configuration.
 
@@ -1400,6 +1421,8 @@ def _radix_filter_top_k_varlen_check(
     input, so a hinted caller can use (or be routed by ``auto`` to) any
     hint-free backend.
     """
+    if row_starts is not None:
+        return False  # windowed (prefill) mode is served by gvr_2 only
     if not _cute_dsl_ready(logits.device):
         return False
     if not _radix_filter_kernel_dsl_ok():
@@ -1516,6 +1539,7 @@ def top_k_varlen(
     ] = "auto",
     load_balance: bool = True,
     workspace: Optional[dict] = None,
+    row_starts: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     r"""Top-K selection over batched decode-step logits.
 
@@ -1560,7 +1584,23 @@ def top_k_varlen(
         A row whose length exceeds the logits width (the dynamic length has
         outgrown the static buffer, e.g. under CUDA-graph replay) is clamped
         to the width by every backend: only the scores present in the buffer
-        are ranked.
+        are ranked. With
+        ``row_starts`` it is the WINDOW LENGTH of each row (see below).
+    row_starts : torch.Tensor, optional
+        Windowed (prefill) mode. 1-D ``int32`` CUDA tensor of shape
+        ``(num_rows,)``: row ``r``'s candidates are
+        ``logits[r, row_starts[r] : row_starts[r] + seq_lens[r]]`` and the
+        returned indices are LOCAL to that window (``column - row_starts[r]``),
+        ``-1`` padded, identity for windows shorter than ``top_k``. This is the
+        DSA prefill-indexer layout: every request's keys packed along the
+        column axis, one query row per prompt token with a causal window into
+        its own request's slice; columns outside a row's window are never read
+        (they may be unwritten). Requires ``next_n == 1``, ``compress_ratio
+        == 1`` and no ``pre_idx``. Served by ``gvr_2`` (dedicated windowed
+        engines, TRT-LLM #18702 port); the other backends are not eligible.
+        CUDA graphs: warm up with one eager windowed call of the same
+        (row-count tier, top_k, envelope bucket) or ``warmup_prefill``.
+        Default ``None`` (every window starts at column 0).
     top_k : int
         Number of top elements per row.  GVR backend supports
         ``{512, 1024, 2048}``; radix backend has no restriction.
@@ -1823,6 +1863,35 @@ def top_k_varlen(
             f"with one seq_lens entry per row."
         )
     num_rows = logits.shape[0]
+    if row_starts is not None:
+        # windowed / prefill mode: validated here (every backend's checker
+        # already refused it except gvr_2's; the API body still runs under
+        # skip_check=True and a bad tensor is a device-side OOB read)
+        if not (
+            isinstance(row_starts, torch.Tensor)
+            and row_starts.is_cuda
+            and row_starts.device == logits.device
+            and row_starts.dim() == 1
+            and row_starts.dtype == torch.int32
+            and row_starts.is_contiguous()
+        ):
+            raise ValueError(
+                f"row_starts must be a contiguous 1-D int32 CUDA tensor on {logits.device}"
+            )
+        if row_starts.shape[0] != num_rows:
+            raise ValueError(
+                f"row_starts has {row_starts.shape[0]} entries, expected one per "
+                f"logits row ({num_rows})"
+            )
+        if next_n != 1 or compress_ratio != 1:
+            raise ValueError(
+                "row_starts (windowed mode) requires next_n == 1 and "
+                f"compress_ratio == 1, got {next_n} / {compress_ratio}"
+            )
+        if pre_idx is not None:
+            raise ValueError(
+                "row_starts (windowed mode) is hint-free: pass pre_idx=None"
+            )
 
     # A malformed hint is discarded, loudly: the call runs hint-free (the
     # checkers above already treated it as absent, so `auto` never selected a
@@ -1961,6 +2030,13 @@ def top_k_varlen(
             out_indices,
             out_values,
             workspace=workspace,
+            row_starts=row_starts,
+        )
+    elif row_starts is not None:
+        # reachable under skip_check=True only (the checkers refuse it)
+        raise BackendSupportedError(
+            f"backend={backend!r} does not support row_starts (windowed mode); "
+            "use backend='gvr_2' or 'auto'"
         )
     elif backend == "radix_cutlass":
         out_i, out_v = _run_radix_cutlass(
