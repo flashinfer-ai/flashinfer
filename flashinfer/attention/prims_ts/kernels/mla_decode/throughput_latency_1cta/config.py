@@ -1531,6 +1531,8 @@ def make_throughput_latency_mla_config(
             raise ValueError(
                 "balanced_partial_capacity must be positive for balanced scheduling"
             )
+        if reduction_mode == "cluster":
+            raise ValueError("balanced 1CTA MLA does not support cluster reduction")
         if o_dtype != "bf16":
             raise ValueError("balanced 1CTA MLA requires BF16 output storage")
 
