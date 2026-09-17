@@ -265,8 +265,13 @@ def _check_warmed_launch(
     signature: tuple,
     *,
     capturing: bool,
+    allow_unwarmed_capture: bool = False,
 ) -> None:
-    if capturing and (workspace is None or signature not in workspace._warmed_launches):
+    if (
+        capturing
+        and not allow_unwarmed_capture
+        and (workspace is None or signature not in workspace._warmed_launches)
+    ):
         raise RuntimeError(
             "MSA CUDA graph capture requires an explicit "
             "MSASparseAttentionWorkspace warmed by an eager call with the "
@@ -400,6 +405,9 @@ def _validate_attention_tensors(
     k: torch.Tensor,
     v: torch.Tensor,
     q2k_indices: torch.Tensor,
+    *,
+    allow_packed_hnd_kv: bool = False,
+    allow_strided_q2k: bool = False,
 ) -> tuple[int, int, int, int]:
     if not isinstance(q, torch.Tensor) or not q.is_cuda:
         raise ValueError("q must be a CUDA tensor")
@@ -422,13 +430,16 @@ def _validate_attention_tensors(
     if k.shape != v.shape or k.dtype != v.dtype:
         raise ValueError("k/v must have the same shape and dtype")
     if not k.is_contiguous() or not v.is_contiguous():
-        if k.ndim == 4:
+        if allow_packed_hnd_kv and _is_packed_hnd_kv(k, v):
+            pass
+        elif k.ndim == 4:
             raise ValueError(
-                "MSA on compute capability 10.0/10.3 does not directly support "
-                "K/V views split from a packed paged cache; pass separate "
-                "contiguous K and V tensors (implicit copies are not performed)"
+                "MSA on compute capability 10.0/10.3 does not support this "
+                "strided paged K/V layout; pass separate contiguous K and V "
+                "tensors or exact HND views split from a compact packed cache"
             )
-        raise ValueError("k/v must be contiguous")
+        else:
+            raise ValueError("k/v must be contiguous")
     fp8_kv = k.dtype == torch.float8_e4m3fn
     if fp8_kv:
         if q.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
@@ -452,11 +463,23 @@ def _validate_attention_tensors(
         or q2k_indices.dtype != torch.int32
         or q2k_indices.ndim != 3
         or tuple(q2k_indices.shape[:2]) != (num_kv_heads, total_q)
-        or not q2k_indices.is_contiguous()
+        or (
+            not q2k_indices.is_contiguous()
+            and (
+                not allow_strided_q2k
+                or q2k_indices.stride()
+                != (
+                    _ATTENTION_TOPK,
+                    num_kv_heads * _ATTENTION_TOPK,
+                    1,
+                )
+            )
+        )
     ):
         raise ValueError(
-            "q2k_indices must be contiguous CUDA int32 with shape "
-            "(num_kv_heads, total_q, topk)"
+            "q2k_indices must be CUDA int32 with shape "
+            "(num_kv_heads, total_q, topk) and either be compact head-major "
+            "or an exact compact token-major transpose"
         )
     topk = int(q2k_indices.shape[2])
     if topk not in _SUPPORTED_ATTENTION_TOPK:
@@ -464,6 +487,33 @@ def _validate_attention_tensors(
             "Blackwell MSA sparse attention requires topk in {4, 8, 16, 32}"
         )
     return total_q, num_q_heads, num_kv_heads, group_size
+
+
+def _is_packed_hnd_kv(k: torch.Tensor, v: torch.Tensor) -> bool:
+    """Return whether K/V are exact views of a compact packed HND cache."""
+
+    if (
+        k.ndim != 4
+        or v.ndim != 4
+        or k.shape != v.shape
+        or k.dtype != v.dtype
+        or k.device != v.device
+        or k.shape[2:] != (_BLOCK_SIZE, _HEAD_DIM)
+        or k.stride() != v.stride()
+    ):
+        return False
+    num_kv_heads = int(k.shape[1])
+    packed_width = 2 * _HEAD_DIM
+    expected_strides = (
+        num_kv_heads * _BLOCK_SIZE * packed_width,
+        _BLOCK_SIZE * packed_width,
+        packed_width,
+        1,
+    )
+    return (
+        k.stride() == expected_strides
+        and v.data_ptr() - k.data_ptr() == _HEAD_DIM * k.element_size()
+    )
 
 
 def _prepare_layout(
@@ -1676,6 +1726,7 @@ def _run_fp8_direct_module(
     stream_ptr: int,
     workspace: Optional[MSASparseAttentionWorkspace],
     capturing: bool,
+    allow_unwarmed_capture: bool = False,
 ) -> None:
     variants = {
         "q1_exact": f"decode_q1_bf16_query_fp8_kv_exact_{'paged' if paged else 'flat'}",
@@ -1730,7 +1781,12 @@ def _run_fp8_direct_module(
     signature = _launch_signature(
         variant=variant, target=target, tensors=tensors, scalars=scalars, grid=grid
     )
-    _check_warmed_launch(workspace, signature, capturing=capturing)
+    _check_warmed_launch(
+        workspace,
+        signature,
+        capturing=capturing,
+        allow_unwarmed_capture=allow_unwarmed_capture,
+    )
     _get_module(variant, target).run(*tensors, *scalars, *grid, stream_ptr)
     _record_successful_launch(workspace, signature, capturing=capturing)
 
@@ -2341,6 +2397,8 @@ def blackwell_msa_sparse_decode_attention(
     partial_dtype: Optional[torch.dtype] = None,
     force_fused: Optional[bool] = None,
     workspace: Optional[MSASparseAttentionWorkspace] = None,
+    out: Optional[torch.Tensor] = None,
+    lse_out: Optional[torch.Tensor] = None,
 ):
     """Run sparse decode on compute capability 10.0 or 10.3."""
 
@@ -2355,8 +2413,23 @@ def blackwell_msa_sparse_decode_attention(
         v_global_scale=v_global_scale,
         allow_uniform_fp8=True,
     )
+    uniform_fp8_paged_layouts_allowed = (
+        page_table is not None
+        and force_fused is True
+        and causal
+        and q_offset is None
+        and 1 <= seqlen_q <= 32
+        and q.dtype == k.dtype == v.dtype == torch.float8_e4m3fn
+        and q2k_indices.ndim == 3
+        and q2k_indices.shape[2] == _ATTENTION_TOPK
+    )
     total_q, num_q_heads, num_kv_heads, _ = _validate_attention_tensors(
-        q, k, v, q2k_indices
+        q,
+        k,
+        v,
+        q2k_indices,
+        allow_packed_hnd_kv=uniform_fp8_paged_layouts_allowed,
+        allow_strided_q2k=uniform_fp8_paged_layouts_allowed,
     )
     if seqlen_q <= 0 or total_q % seqlen_q:
         raise ValueError("q rows must equal batch_size * positive seqlen_q")
@@ -2364,7 +2437,10 @@ def blackwell_msa_sparse_decode_attention(
         raise ValueError("force_fused must be True, False, or None")
     batch_size = total_q // seqlen_q
     capturing = torch.cuda.is_current_stream_capturing()
-    if capturing and workspace is None:
+    externally_buffered_direct = (
+        uniform_fp8_paged_layouts_allowed and out is not None and lse_out is not None
+    )
+    if capturing and workspace is None and not externally_buffered_direct:
         raise RuntimeError(
             "CUDA graph capture of MSA on compute capability 10.0/10.3 "
             "requires an explicit MSASparseAttentionWorkspace warmed with the "
@@ -2447,20 +2523,52 @@ def blackwell_msa_sparse_decode_attention(
             raise ValueError(
                 "non-TopK16 Blackwell MSA attention is restricted to exact routes"
             )
-        out = _workspace_buffer(
-            workspace,
-            "decode_out",
-            tuple(q.shape),
-            dtype=(torch.bfloat16 if q.dtype == torch.float8_e4m3fn else q.dtype),
-            device=q.device,
-        )
-        lse = _workspace_buffer(
-            workspace,
-            "decode_lse",
-            (total_q, num_q_heads),
-            dtype=torch.float32,
-            device=q.device,
-        )
+        out_dtype = torch.bfloat16 if q.dtype == torch.float8_e4m3fn else q.dtype
+        if out is None:
+            out = _workspace_buffer(
+                workspace,
+                "decode_out",
+                tuple(q.shape),
+                dtype=out_dtype,
+                device=q.device,
+            )
+        elif not isinstance(out, torch.Tensor):
+            raise TypeError("out must be a torch.Tensor")
+        elif (
+            tuple(out.shape) != tuple(q.shape)
+            or out.dtype != out_dtype
+            or out.device != q.device
+            or not out.is_contiguous()
+        ):
+            raise ValueError(
+                f"out must be contiguous {out_dtype} with shape "
+                f"{tuple(q.shape)} on {q.device}"
+            )
+        if lse_out is not None:
+            if not return_softmax_lse:
+                raise ValueError("lse_out requires return_softmax_lse=True")
+            if not isinstance(lse_out, torch.Tensor):
+                raise TypeError("lse_out must be a torch.Tensor")
+            expected_lse_shape = (total_q, num_q_heads)
+            if (
+                tuple(lse_out.shape) != expected_lse_shape
+                or lse_out.dtype != torch.float32
+                or lse_out.device != q.device
+                or not lse_out.is_contiguous()
+            ):
+                raise ValueError(
+                    "lse_out must be contiguous torch.float32 with shape "
+                    f"{expected_lse_shape} on {q.device}"
+                )
+            lse = lse_out
+        else:
+            lse = _workspace_buffer(
+                workspace,
+                "decode_lse",
+                (total_q, num_q_heads),
+                dtype=torch.float32,
+                device=q.device,
+            )
         if non16_variant is not None:
             _run_decode_module(
                 variant=non16_variant,
@@ -2601,6 +2709,7 @@ def blackwell_msa_sparse_decode_attention(
                 stream_ptr=stream_ptr,
                 workspace=workspace,
                 capturing=capturing,
+                allow_unwarmed_capture=externally_buffered_direct,
             )
             return (out, lse) if return_softmax_lse else out
         variant = _decode_variant(

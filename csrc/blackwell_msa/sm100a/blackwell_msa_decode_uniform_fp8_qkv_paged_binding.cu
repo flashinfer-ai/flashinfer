@@ -64,6 +64,49 @@ inline void CheckContiguous(const TensorView& t, const char* name) {
   TVM_FFI_CHECK(t.IsContiguous(), ValueError) << name << " must be contiguous";
 }
 
+inline void CheckStridedTopK(const TensorView& t, const char* name) {
+  TVM_FFI_CHECK(t.ndim() == 3, ValueError) << name << " must have rank 3";
+  TVM_FFI_CHECK(t.stride(2) == 1, ValueError)
+      << name << " top-k entries must be contiguous";
+  TVM_FFI_CHECK(t.stride(0) > 0 && t.stride(1) > 0, ValueError)
+      << name << " head and query strides must be positive";
+}
+
+inline bool IsPackedHndKvPair(const TensorView& k, const TensorView& v) {
+  if (k.ndim() != 4 || v.ndim() != 4) {
+    return false;
+  }
+  for (int axis = 0; axis < 4; ++axis) {
+    if (k.size(axis) != v.size(axis) || k.stride(axis) != v.stride(axis)) {
+      return false;
+    }
+  }
+  const int64_t num_kv_heads = k.size(1);
+  const int64_t block_size = k.size(2);
+  const int64_t head_dim = k.size(3);
+  const int64_t packed_width = 2 * head_dim;
+  const int64_t element_bits =
+      static_cast<int64_t>(k.dtype().bits) * static_cast<int64_t>(k.dtype().lanes);
+  if (element_bits % CHAR_BIT != 0) {
+    return false;
+  }
+  const int64_t element_size_bytes = element_bits / CHAR_BIT;
+  const uintptr_t k_ptr = reinterpret_cast<uintptr_t>(k.data_ptr());
+  const uintptr_t v_ptr = reinterpret_cast<uintptr_t>(v.data_ptr());
+  return block_size == 128 && head_dim == 128 && k.stride(3) == 1 &&
+         k.stride(2) == packed_width && k.stride(1) == block_size * packed_width &&
+         k.stride(0) == num_kv_heads * block_size * packed_width && v_ptr >= k_ptr &&
+         v_ptr - k_ptr == head_dim * element_size_bytes;
+}
+
+inline void CheckContiguousOrPackedHndKvPair(const TensorView& k, const TensorView& v) {
+  // Separate contiguous K/V tensors do not share the backing-storage relationship required by
+  // IsPackedHndKvPair, so keep the two supported layouts as distinct alternatives.
+  TVM_FFI_CHECK(
+      (k.IsContiguous() && v.IsContiguous()) || IsPackedHndKvPair(k, v), ValueError)
+      << "K/V must be contiguous or exact views split from a compact packed HND cache";
+}
+
 inline void CheckDtype(const TensorView& t, const char* name, int code, int bits, int lanes) {
   DLDataType d = t.dtype();
   TVM_FFI_CHECK((int)d.code == code && (int)d.bits == bits && (int)d.lanes == lanes, TypeError)
@@ -182,14 +225,19 @@ inline CUtensorMap EncodeTma_K(const TensorView& t) {
   TVM_FFI_CHECK(d1 > 0 && d2 > 0, ValueError)
       << "TMA source 'K' trailing dims must be positive";
   int64_t outer2 = t.numel() / (d1 * d2);
+  CheckDenseLeadingFold(t, 2, "K");
+  int64_t s2 = t.stride(t.ndim() - 2);
+  int64_t s3 = t.stride(t.ndim() - 3);
+  TVM_FFI_CHECK(s2 > 0 && s3 > 0, ValueError)
+      << "TMA source 'K' physical strides must be positive";
   uint64_t global_dim[3] = {(uint64_t)(128), (uint64_t)(d2), (uint64_t)(outer2)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0, ValueError)
       << "TMA descriptor for 'K' resolved a non-positive global dim";
   TVM_FFI_CHECK(128u <= global_dim[0] && 128u <= global_dim[1] && 1u <= global_dim[2], ValueError)
       << "TMA box (128, 128, 1) exceeds resolved global dims for 'K'";
   uint64_t global_strides[2] = {
-      (uint64_t)((d1 * 8) / 8),
-      (uint64_t)(((d2 * d1) * 8) / 8),
+      (uint64_t)((s2 * 8) / 8),
+      (uint64_t)((s3 * 8) / 8),
   };
   uint32_t box_dim[3] = {128u, 128u, 1u};
   uint32_t elem_strides[3] = {1u, 1u, 1u};
@@ -215,14 +263,19 @@ inline CUtensorMap EncodeTma_V(const TensorView& t) {
   TVM_FFI_CHECK(d1 > 0 && d2 > 0, ValueError)
       << "TMA source 'V' trailing dims must be positive";
   int64_t outer2 = t.numel() / (d1 * d2);
+  CheckDenseLeadingFold(t, 2, "V");
+  int64_t s2 = t.stride(t.ndim() - 2);
+  int64_t s3 = t.stride(t.ndim() - 3);
+  TVM_FFI_CHECK(s2 > 0 && s3 > 0, ValueError)
+      << "TMA source 'V' physical strides must be positive";
   uint64_t global_dim[3] = {(uint64_t)(128), (uint64_t)(d2), (uint64_t)(outer2)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0, ValueError)
       << "TMA descriptor for 'V' resolved a non-positive global dim";
   TVM_FFI_CHECK(128u <= global_dim[0] && 128u <= global_dim[1] && 1u <= global_dim[2], ValueError)
       << "TMA box (128, 128, 1) exceeds resolved global dims for 'V'";
   uint64_t global_strides[2] = {
-      (uint64_t)((d1 * 8) / 8),
-      (uint64_t)(((d2 * d1) * 8) / 8),
+      (uint64_t)((s2 * 8) / 8),
+      (uint64_t)((s3 * 8) / 8),
   };
   uint32_t box_dim[3] = {128u, 128u, 1u};
   uint32_t elem_strides[3] = {1u, 1u, 1u};
@@ -245,10 +298,9 @@ void Run(TensorView arg_Q, TensorView arg_K, TensorView arg_V, TensorView arg_O,
   CheckDtype(arg_Q, "Q", 1, 8, 1);
   CheckCudaTensor(arg_K, "K");
   CheckDtype(arg_K, "K", 1, 8, 1);
-  CheckContiguous(arg_K, "K");
   CheckCudaTensor(arg_V, "V");
   CheckDtype(arg_V, "V", 1, 8, 1);
-  CheckContiguous(arg_V, "V");
+  CheckContiguousOrPackedHndKvPair(arg_K, arg_V);
   CheckCudaTensor(arg_O, "O");
   CheckDtype(arg_O, "O", 4, 16, 1);
   CheckContiguous(arg_O, "O");
@@ -263,7 +315,7 @@ void Run(TensorView arg_Q, TensorView arg_K, TensorView arg_V, TensorView arg_O,
   CheckContiguous(arg_kv_indptr, "kv_indptr");
   CheckCudaTensor(arg_task_kind, "task_kind");
   CheckDtype(arg_task_kind, "task_kind", 0, 32, 1);
-  CheckContiguous(arg_task_kind, "task_kind");
+  CheckStridedTopK(arg_task_kind, "task_kind");
   CheckCudaTensor(arg_task_request, "task_request");
   CheckDtype(arg_task_request, "task_request", 0, 32, 1);
   CheckContiguous(arg_task_request, "task_request");
@@ -330,6 +382,19 @@ void Run(TensorView arg_Q, TensorView arg_K, TensorView arg_V, TensorView arg_O,
       << "num_q_heads must be divisible by num_kv_heads";
   TVM_FFI_CHECK(arg_num_kv_heads >= 1, ValueError)
       << "num_kv_heads must be >= " << 1      << ", got " << arg_num_kv_heads;
+  constexpr int64_t kAttentionTopK = 16;
+  TVM_FFI_CHECK(arg_task_kind.size(0) == arg_num_kv_heads &&
+                    arg_task_kind.size(1) == arg_total_q &&
+                    arg_task_kind.size(2) == kAttentionTopK,
+                ValueError)
+      << "task_kind must have shape (num_kv_heads, total_q, " << kAttentionTopK << ")";
+  const bool task_kind_head_major = arg_task_kind.IsContiguous();
+  const bool task_kind_token_major =
+      arg_task_kind.stride(0) == kAttentionTopK &&
+      arg_task_kind.stride(1) == arg_num_kv_heads * kAttentionTopK &&
+      arg_task_kind.stride(2) == 1;
+  TVM_FFI_CHECK(task_kind_head_major || task_kind_token_major, ValueError)
+      << "task_kind must be compact head-major or an exact compact token-major transpose";
 
 
   CUtensorMap p_Q = EncodeTma_Q(arg_Q);
@@ -354,12 +419,16 @@ void Run(TensorView arg_Q, TensorView arg_K, TensorView arg_V, TensorView arg_O,
   dim3 grid((uint32_t)grid_x, (uint32_t)grid_y, (uint32_t)grid_z);
   dim3 block(384u, 1u, 1u);
 
+  const void* kernel = task_kind_token_major && !task_kind_head_major
+                           ? reinterpret_cast<const void*>(
+                                 kernel_blackwell_batch_attention_msa_decode_uniform_fp8_natural_sm100_v1<true>)
+                           : reinterpret_cast<const void*>(
+                                 kernel_blackwell_batch_attention_msa_decode_uniform_fp8_natural_sm100_v1<false>);
   cudaError_t status = cudaFuncSetAttribute(
-      kernel_blackwell_batch_attention_msa_decode_uniform_fp8_natural_sm100_v1, cudaFuncAttributeMaxDynamicSharedMemorySize, 156672);
+      kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 156672);
   TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
       << "cudaFuncSetAttribute(kernel_blackwell_batch_attention_msa_decode_uniform_fp8_natural_sm100_v1) failed: " << cudaGetErrorString(status);
-  status = cudaLaunchKernel(reinterpret_cast<const void*>(kernel_blackwell_batch_attention_msa_decode_uniform_fp8_natural_sm100_v1), grid, block, kargs,
-                            156672u, stream);
+  status = cudaLaunchKernel(kernel, grid, block, kargs, 156672u, stream);
   TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
       << "kernel_blackwell_batch_attention_msa_decode_uniform_fp8_natural_sm100_v1 launch failed: " << cudaGetErrorString(status);
 }
