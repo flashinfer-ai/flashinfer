@@ -249,9 +249,9 @@ fused_kda_decode_trace = TraceTemplate(
 )
 
 
-fused_kda_decode_packed_trace = TraceTemplate(
+packed_fused_kda_decode_trace = TraceTemplate(
     op_type="kda",
-    name_prefix="fused_kda_decode_packed",
+    name_prefix="packed_fused_kda_decode",
     description=(
         "Packed ragged T>=1 Kimi width-four causal convolution, recurrent KDA, "
         "and gated RMSNorm with one recurrent checkpoint per token."
@@ -286,6 +286,7 @@ fused_kda_decode_packed_trace = TraceTemplate(
         "state_indices": Tensor(["num_sequences", "num_tokens"]),
         "query_start_loc": Tensor(["num_sequence_offsets"]),
         "num_accepted_tokens": Tensor(["num_sequences"]),
+        "t1_state_indices": Tensor(["num_rows"], optional=True),
         "state": Tensor(["num_slots", "num_heads", "head_dim", "head_dim"]),
         "output_gate": Tensor(["num_rows", "num_heads", "head_dim"]),
         "norm_weight": Tensor(["head_dim"]),

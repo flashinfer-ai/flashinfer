@@ -26,7 +26,7 @@ gdn_prefill_qk4_v8_d128.json
 recurrent_kda_q8_v16_d128.json
 packed_kda_decode_h12_d128.json
 fused_kda_decode_h12_d128.json
-fused_kda_decode_packed_t3_h12_d128.json
+packed_fused_kda_decode_t3_h12_d128.json
 gemm_bf16_N256_K7168.json
 gemm_bf16_N4096_K4096.json
 gemm_fp4_N2048_K7168_block_size16.json
@@ -1005,7 +1005,7 @@ fkp_query_start = torch.arange(0, fkp_rows + 1, fkp_T, dtype=torch.int32, device
 fkp_accepted = torch.ones(fkp_N, dtype=torch.int32, device=device)
 fkp_state = torch.zeros(fkp_slots, fk_H, fk_D, fk_D, dtype=torch.float32, device=device)
 fkp_output_gate = torch.randn(fkp_rows, fk_H, fk_D, dtype=torch.bfloat16, device=device)
-flashinfer.kda_decode.fused_kda_decode_packed(
+flashinfer.kda_decode.packed_fused_kda_decode(
     fkp_x,
     fk_weight,
     fkp_conv_state,
@@ -1014,11 +1014,11 @@ flashinfer.kda_decode.fused_kda_decode_packed(
     fk_A_log,
     fk_dt_bias,
     fkp_indices,
-    fkp_query_start,
-    fkp_accepted,
     fkp_state,
     fkp_output_gate,
     fk_norm_weight,
+    query_start_loc=fkp_query_start,
+    num_accepted_tokens=fkp_accepted,
 )
 
 # ── mono_moe / monomoe (Qwen3.5-35B block-FP8 MonoMoe kernel, SM90a) ────────────

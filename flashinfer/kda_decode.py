@@ -29,7 +29,7 @@ import torch
 
 from .api_logging import flashinfer_api
 from .trace.templates.kda import (
-    fused_kda_decode_packed_trace,
+    packed_fused_kda_decode_trace,
     fused_kda_decode_trace,
     packed_kda_decode_trace,
     recurrent_kda_trace,
@@ -49,12 +49,12 @@ from .kda_kernels import run_packed_kda_decode as _run_packed_kda_decode
 
 try:
     from .kda_kernels.fused_kda_decode_multitoken import (
-        run_fused_kda_decode_multitoken as _run_fused_kda_decode_packed,
+        run_fused_kda_decode_multitoken as _run_packed_fused_kda_decode,
     )
 
     _FUSED_KDA_DECODE_PACKED_AVAILABLE = True
 except (ImportError, RuntimeError):
-    _run_fused_kda_decode_packed = None
+    _run_packed_fused_kda_decode = None
     _FUSED_KDA_DECODE_PACKED_AVAILABLE = False
 from .kda_kernels import run_recurrent_kda as _run_recurrent_kda
 
@@ -487,8 +487,33 @@ def fused_kda_decode(
     )
 
 
-@flashinfer_api(trace=fused_kda_decode_packed_trace)
-def fused_kda_decode_packed(
+def _validate_packed_t1_remap_inputs(x, query_start_loc, state_indices):
+    """Validate remap metadata structure without reading device values."""
+    if query_start_loc.dtype != torch.int32:
+        raise TypeError(
+            f"query_start_loc must have dtype torch.int32, got {query_start_loc.dtype}"
+        )
+    if state_indices.dtype != torch.int32:
+        raise TypeError(
+            f"state_indices must have dtype torch.int32, got {state_indices.dtype}"
+        )
+    if state_indices.ndim != 2 or state_indices.shape[1] != 1:
+        raise ValueError("state_indices must have shape [N, 1]")
+    if (
+        query_start_loc.ndim != 1
+        or query_start_loc.shape[0] != state_indices.shape[0] + 1
+    ):
+        raise ValueError("query_start_loc must have shape [state_indices.shape[0] + 1]")
+    if not query_start_loc.is_contiguous():
+        raise ValueError("query_start_loc must be contiguous")
+    if not state_indices.is_contiguous():
+        raise ValueError("state_indices must be contiguous")
+    if query_start_loc.device != x.device or state_indices.device != x.device:
+        raise ValueError("T=1 remap metadata must be on the same device as x")
+
+
+@flashinfer_api(trace=packed_fused_kda_decode_trace)
+def packed_fused_kda_decode(
     x: torch.Tensor,
     weight: torch.Tensor,
     conv_state: torch.Tensor,
@@ -497,14 +522,16 @@ def fused_kda_decode_packed(
     A_log: torch.Tensor,
     dt_bias: torch.Tensor,
     state_indices: torch.Tensor,
-    query_start_loc: torch.Tensor,
-    num_accepted_tokens: torch.Tensor,
     state: torch.Tensor,
     output_gate: torch.Tensor,
     norm_weight: torch.Tensor,
     lower_bound: Optional[float] = -5.0,
     norm_eps: float = 1e-5,
     output: Optional[torch.Tensor] = None,
+    *,
+    query_start_loc: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+    t1_state_indices: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     r"""Run packed T>=1 fused KDA with per-token cache checkpoints.
 
@@ -515,20 +542,32 @@ def fused_kda_decode_packed(
     recurrent checkpoint to ``state_indices[n, t]``. The convolution cache is
     one rolling window of length ``T + 2`` in ``state_indices[n, 0]``.
 
-    T=1 dispatches to :func:`fused_kda_decode`, including its bfloat16-state and
-    softplus-gate support. T>1 uses the experimental SM10x packed backend,
-    which currently requires FP32 recurrent state and a finite negative
-    ``lower_bound``. Both paths require head dimension 128, convolution width
-    four, and 12, 24, 32, 48, or 96 heads. Other tensors follow
-    :func:`fused_kda_decode`, with the packed row count supplied by ``x``.
+    This facade is CuTe-only: T=1 uses the CuTe DSL implementation underlying
+    ``fused_kda_decode`` (without Cake or backend selection), including
+    bfloat16-state and softplus-gate support. The optional
+    ``t1_state_indices`` optimization is strictly T=1-only; passing it for
+    T>1 fails closed. T>1 uses the SM10x CuTe DSL packed backend, which
+    requires FP32
+    recurrent state and a finite negative ``lower_bound``. Both paths require
+    head dimension 128, convolution width four, and 12, 24, 32, 48, or 96
+    heads. Other tensors follow :func:`fused_kda_decode`, with the packed row
+    count supplied by ``x``.
 
     ``query_start_loc`` must be contiguous int32 of shape ``[N+1]``, start at
     zero, and contain nondecreasing offsets within ``x`` with active lengths no
     larger than T.
     ``num_accepted_tokens`` must be contiguous int32 of shape ``[N]`` with
-    values in ``[1, T]``. Active recurrent destinations must be positive cache
+    values in ``[1, T]``. For T=1, ``t1_state_indices`` may optionally provide
+    the already-resolved contiguous per-row cache slots with shape
+    ``[num_rows]``. When supplied, it is used by the direct fused T=1
+    specialization and ``query_start_loc`` is retained only as structural
+    metadata; its values are not read by the host or kernel. This is intended
+    for CUDA-Graph-stable caller-owned buffers updated in-place.
+    Active recurrent destinations must be positive cache
     slots and must not alias destinations from another active sequence;
-    non-positive or zero-length rows are padding and do not mutate either cache.
+    non-positive or zero-length rows are null rows and do not mutate either
+    cache. In T=1, packed rows beyond ``query_start_loc[-1]`` are trailing
+    unused capacity: they receive zero output and do not mutate either cache.
     These value constraints are caller-owned so CUDA Graph replay never performs
     a device-to-host validation sync.
 
@@ -560,6 +599,11 @@ def fused_kda_decode_packed(
             Contiguous int32 packed-row offsets with shape ``[N + 1]``.
         num_accepted_tokens:
             Contiguous int32 accepted-token counts with shape ``[N]``.
+        t1_state_indices:
+            Optional contiguous int32 per-packed-row cache slots with shape
+            ``[num_rows]``. T=1 only; null and trailing rows must be zero or
+            non-positive. The tensor is never allocated or populated by this
+            function.
         state:
             Paged recurrent state with shape ``[num_slots, H, 128, 128]``.
             T=1 accepts float32 or bfloat16; T>1 requires float32.
@@ -580,20 +624,27 @@ def fused_kda_decode_packed(
     Returns:
         The packed bfloat16 output with shape ``[1, num_rows, H, 128]``.
     """
-    if state_indices.ndim == 2 and state_indices.shape[1] == 1:
+    if state_indices.ndim < 2:
+        raise ValueError("state_indices must have shape [N, T]")
+    if t1_state_indices is not None:
+        if state_indices.ndim != 2 or state_indices.shape[1] != 1:
+            raise ValueError(
+                "t1_state_indices is only supported for T=1; T>1 uses the "
+                "multitoken kernel unchanged"
+            )
+        if (
+            t1_state_indices.ndim != 1
+            or t1_state_indices.shape != (x.shape[0],)
+            or t1_state_indices.dtype != torch.int32
+            or not t1_state_indices.is_contiguous()
+            or t1_state_indices.device != x.device
+        ):
+            raise ValueError(
+                "t1_state_indices must be contiguous int32 [num_rows] on x.device"
+            )
         if _run_fused_kda_decode is None:
             raise NotImplementedError("fused KDA decode backend is unavailable")
-        legacy_state_indices = state_indices[:, 0]
-        if x.shape[0] != legacy_state_indices.shape[0]:
-            packed_rows = torch.arange(
-                x.shape[0], dtype=query_start_loc.dtype, device=x.device
-            )
-            sequence_indices = torch.searchsorted(
-                query_start_loc[1:], packed_rows, right=True
-            )
-            legacy_state_indices = legacy_state_indices.index_select(
-                0, sequence_indices
-            )
+        _validate_packed_t1_remap_inputs(x, query_start_loc, state_indices)
         return _run_fused_kda_decode(
             x=x,
             weight=weight,
@@ -602,7 +653,7 @@ def fused_kda_decode_packed(
             raw_beta=raw_beta,
             A_log=A_log,
             dt_bias=dt_bias,
-            state_indices=legacy_state_indices,
+            state_indices=t1_state_indices,
             state=state,
             output_gate=output_gate,
             norm_weight=norm_weight,
@@ -610,9 +661,34 @@ def fused_kda_decode_packed(
             norm_eps=norm_eps,
             output=output,
         )
-    if _run_fused_kda_decode_packed is None:
+    if state_indices.ndim == 2 and state_indices.shape[1] == 1:
+        if _run_fused_kda_decode is None:
+            raise NotImplementedError("fused KDA decode backend is unavailable")
+        _validate_packed_t1_remap_inputs(x, query_start_loc, state_indices)
+        return _run_fused_kda_decode(
+            x=x,
+            weight=weight,
+            conv_state=conv_state,
+            raw_gate=raw_gate,
+            raw_beta=raw_beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            # T=1 does not need a remap buffer.  The direct ABI argument is
+            # unused by the packed constexpr specialization; pass the first
+            # packed destination as the compatible [N] view.
+            state_indices=state_indices[:, 0],
+            query_start_loc=query_start_loc,
+            packed_state_indices=state_indices,
+            state=state,
+            output_gate=output_gate,
+            norm_weight=norm_weight,
+            lower_bound=lower_bound,
+            norm_eps=norm_eps,
+            output=output,
+        )
+    if _run_packed_fused_kda_decode is None:
         raise NotImplementedError("packed fused KDA decode backend is unavailable")
-    return _run_fused_kda_decode_packed(
+    return _run_packed_fused_kda_decode(
         x=x,
         weight=weight,
         conv_state=conv_state,

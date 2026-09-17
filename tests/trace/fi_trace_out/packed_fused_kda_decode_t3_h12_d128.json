@@ -1,9 +1,9 @@
 {
-  "name": "fused_kda_decode_packed_t3_h12_d128",
+  "name": "packed_fused_kda_decode_t3_h12_d128",
   "description": "Packed ragged T>=1 Kimi width-four causal convolution, recurrent KDA, and gated RMSNorm with one recurrent checkpoint per token.",
   "op_type": "kda",
   "tags": [
-    "fi_api:flashinfer.kda_decode.fused_kda_decode_packed",
+    "fi_api:flashinfer.kda_decode.packed_fused_kda_decode",
     "stage:decode",
     "status:experimental"
   ],
