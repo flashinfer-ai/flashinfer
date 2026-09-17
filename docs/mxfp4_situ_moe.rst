@@ -178,6 +178,16 @@ This gate is provisional; the historical tolerance is diagnostic and is not
 an agreed acceptance threshold. Across r008's 84 rows, candidate relative
 L2 is 0.02485--0.02693 and TRT-LLM Gen is 0.02493--0.02666.
 
+A separate synthetic study with seed 123 and a fixture bank generated at
+T=2048 found a larger difference against the explicit intermediate-MXFP8
+reference. At T128 with hot routing, selected-implementation relative L2
+was 0.00435, versus 0.00239 for TRT-LLM Gen. Targeted stage checks attribute
+most of the additional error to BF16 contribution rounding and atomic
+accumulation. FP32 accumulation and separate FP32 reduction prototypes
+improved hot-routing accuracy but increased full-runner latency, so they
+are not included in this implementation. Final numerical acceptance and
+this accuracy/performance tradeoff remain unresolved.
+
 All 84 timing rows were measured again on r008 in one full matrix. The 66
 required rows cover T=1,2,4,8,16,128,256,512,1024,2048,4096, three routing
 distributions and eager/graph modes; every required row is clock-qualified.
