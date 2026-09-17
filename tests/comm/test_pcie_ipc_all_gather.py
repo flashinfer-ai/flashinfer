@@ -156,6 +156,7 @@ def _worker(world_size: int, rank: int, port: int, cache_path: str) -> None:
                 max_numel=2 * hidden,
                 dtype=dtype,
                 max_blocks=3,
+                tune_batches=(1,),
                 tune_cache=cache_path,
             ) as workspace:
                 if world_size == 8 and os.getenv(
@@ -180,6 +181,26 @@ def _worker(world_size: int, rank: int, port: int, cache_path: str) -> None:
 
                 if dtype is torch.bfloat16:
                     _queued_epoch_stress(workspace, world_size, rank, device, hidden)
+                    # Tune one small shape; the winner is machine-dependent.
+                    inp = torch.full((1, hidden), rank, dtype=dtype, device=device)
+                    reference = _reference(inp, world_size)
+                    tuned = workspace.tune([hidden], warmup=1, repeat=2)[(hidden, 1)]
+                    assert workspace.tuned_launch_config(inp) == tuned
+                    _assert_close_collectively(workspace.all_gather(inp), reference)
+
+            if dtype is torch.bfloat16:
+                # Reconstruct after destruction to exercise the saved-cache path.
+                assert os.path.isfile(cache_path)
+                with comm.PcieIpcAllGatherWorkspace(
+                    dist.group.WORLD,
+                    max_numel=2 * hidden,
+                    dtype=dtype,
+                    max_blocks=3,
+                    tune_batches=(1,),
+                    tune_cache=cache_path,
+                ) as reloaded:
+                    assert reloaded.tuned_launch_config(inp) == tuned
+                    _assert_close_collectively(reloaded.all_gather(inp), reference)
     finally:
         dist.destroy_process_group()
 

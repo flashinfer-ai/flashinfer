@@ -178,6 +178,10 @@ The GPU tests explicitly execute each admitted variant for BF16, FP16, and
 FP32, including a partial final pack batch. RS additionally compares every
 variant against an FP32 reference with dtype-appropriate tolerances.
 
+Each core test also tunes one small BF16 shape, checks the default call against
+the reference, and repeats the check with a fresh workspace using the saved
+cache. This is a functional smoke test, not a performance assertion.
+
 The graph tests queue mixed variants, changing grids and shapes, and
 then replay captured sequences with changed inputs and independent output
 snapshots. On TP8, the live topology gate controls whether CE/topology variants
