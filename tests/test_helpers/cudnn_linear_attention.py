@@ -73,6 +73,20 @@ requires_cudnn_linear_attention = pytest.mark.skipif(
 )
 
 
+def reference_kernel_or_skip(fn, *args, **kwargs):
+    """Run a FlashInfer kernel used as an oracle, skipping if it cannot serve.
+
+    The gate above covers the cuDNN engines, not the in-tree kernels the
+    cross-kernel tests compare against: FlashInfer's own SM100 GDN prefill
+    needs CUDA 13+, so the CUDA 12.x lanes reach a working cuDNN backend with
+    no in-tree oracle for it.
+    """
+    try:
+        return fn(*args, **kwargs)
+    except (ImportError, NotImplementedError) as exc:
+        pytest.skip(f"reference kernel unavailable: {exc}")
+
+
 def rel_err(actual: torch.Tensor, expected: torch.Tensor) -> float:
     """Frobenius relative error.
 

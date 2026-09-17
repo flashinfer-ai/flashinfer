@@ -4,9 +4,11 @@ flashinfer.cudnn
 ================
 
 cuDNN-backed attention kernels. These wrappers call into NVIDIA's cuDNN runtime
-for batch prefill and batch decode, and are typically used as an alternative
-backend for ``BatchPrefillWithPagedKVCacheWrapper`` /
-``BatchDecodeWithPagedKVCacheWrapper`` when cuDNN is available on the host GPU.
+for batch prefill and batch decode, and are reachable as ``backend="cudnn"`` on
+``BatchPrefillWithPagedKVCacheWrapper`` / ``BatchDecodeWithPagedKVCacheWrapper``
+(or directly) when cuDNN is available on the host GPU. For decode the wrapper
+backend covers fp16/bf16 GQA with ``return_lse`` and CUDA graphs; it does not
+support ``q_len_per_req > 1``, RoPE, soft-cap, sliding window, sinks or fp8/NVFP4 KV.
 
 .. currentmodule:: flashinfer.cudnn
 

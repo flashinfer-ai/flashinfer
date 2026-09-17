@@ -101,7 +101,7 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
             kv_valid_bits,
             None,
             None,
-            None,
+            Int64(0),
             Int64(0),
             row_route_offsets,
             route_workspace,
@@ -214,7 +214,7 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
             kv_valid_bits,
             None,
             None,
-            None,
+            Int64(0),
             Int64(0),
             row_route_offsets,
             route_workspace,
@@ -306,13 +306,13 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
         block_indptr: cute.Tensor,
         block_indices: cute.Tensor,
         kv_valid_bits: cute.Tensor,
-        paged_kv_indptr: cute.Tensor,
-        paged_kv_indices: cute.Tensor,
+        block_tables: cute.Tensor,
         seq_lens_kv: cute.Tensor,
         row_route_offsets: cute.Tensor,
         route_workspace: cute.Tensor,
         max_blocks_per_row: cutlass.Int32,
         num_physical_kv_pages: cutlass.Int64,
+        block_table_row_stride: cutlass.Int64,
         k_page_stride: cutlass.Int64,
         v_page_stride: cutlass.Int64,
         sm_scale: cutlass.Float32,
@@ -329,9 +329,9 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
             block_indices,
             kv_valid_bits,
             seq_lens_kv,
-            paged_kv_indptr,
-            paged_kv_indices,
+            block_tables,
             num_physical_kv_pages,
+            block_table_row_stride,
             row_route_offsets,
             route_workspace,
             max_blocks_per_row,
@@ -505,7 +505,8 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
         page_size = key.page_size
         assert page_size is not None
         physical_pages = cute.sym_int()
-        logical_pages = cute.sym_int()
+        runtime_page_columns = cute.sym_int()
+        runtime_page_row_stride = cute.sym_int64(divisibility=1)
         k_outer_stride = cute.sym_int64(divisibility=1)
         v_outer_stride = cute.sym_int64(divisibility=1)
         kv_shape = (
@@ -536,12 +537,12 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
             ),
             assumed_align=16,
         )
-        paged_kv_indptr_fake = fake_compact(
+        block_tables_fake = cute.runtime.make_fake_tensor(
             Int32,
-            (key.batch_size + 1,),
-            4,
+            (key.batch_size, runtime_page_columns),
+            stride=(runtime_page_row_stride, 1),
+            assumed_align=4,
         )
-        paged_kv_indices_fake = fake_compact(Int32, (logical_pages,), 4)
         seq_lens_kv_fake = fake_compact(Int32, (key.batch_size,), 4)
         tensor_adapter = paged_tensor_adapter
         dynamic_args = (
@@ -552,12 +553,12 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
             indptr_fake,
             indices_fake,
             valid_bits_fake,
-            paged_kv_indptr_fake,
-            paged_kv_indices_fake,
+            block_tables_fake,
             seq_lens_kv_fake,
             row_route_offsets_fake,
             route_workspace_fake,
             Int32(0),
+            Int64(1),
             Int64(1),
             Int64(1),
             Int64(1),

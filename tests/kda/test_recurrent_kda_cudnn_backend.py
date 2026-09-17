@@ -52,6 +52,7 @@ from tests.test_helpers.cudnn_linear_attention import (
     assert_state_orientation,
     kda_safe_gate,
     packed_offsets,
+    reference_kernel_or_skip,
     rel_err,
     requires_cudnn_linear_attention,
     serial_delta_rule,
@@ -207,15 +208,13 @@ def test_cudnn_backend_matches_default(
     state = inputs["initial_state"]
     kwargs = _gate_kwargs(inputs, output_final_state=True)
     args = (inputs["q"], inputs["k"], inputs["v"], inputs["g"], inputs["beta"])
-    try:
-        ref_out, ref_state = recurrent_kda(
-            *args,
-            initial_state=None if state is None else state.clone(),
-            backend=reference_backend,
-            **kwargs,
-        )
-    except (ImportError, NotImplementedError) as exc:
-        pytest.skip(f"reference backend {reference_backend} unavailable: {exc}")
+    ref_out, ref_state = reference_kernel_or_skip(
+        recurrent_kda,
+        *args,
+        initial_state=None if state is None else state.clone(),
+        backend=reference_backend,
+        **kwargs,
+    )
     out, final_state = _run(
         inputs, initial_state=None if state is None else state.clone(), **kwargs
     )
