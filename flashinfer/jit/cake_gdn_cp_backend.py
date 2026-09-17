@@ -39,17 +39,8 @@ from .cake_gdn_cp_generated import (
 
 GDNCPArch = Literal["sm_100a", "sm_103a"]
 
-_EXPORT_SCHEMA = "flashinfer-pr4078-sm100-cp-prefill-standalone-export-v3"
-_MANIFEST_SHA256 = "44e3f41cc5728514f2cab03a5b543f01029bcd199c3923901f5b2a8d14ef458e"
-_BASELINE_REVISION = "6cb2e70995d92edbc443b1bfc317ecacac907640"
-_FOCUS_CONTRACT = (
-    150,
-    "d4f3fad233af91b8afac35271d6848df8f0f090b08f17807b9e2830139dd37ab",
-)
-_FULL_CONTRACT = (
-    822,
-    "0dff83c89b9a17f67e0a2db9bb9c20ed77506fa3b38cc55d7772864021553592",
-)
+_EXPORT_SCHEMA = "flashinfer.gdn_cp.runtime_manifest.v1"
+_MANIFEST_SHA256 = "ff97f4e62fbd50c157486c79e92f92fb0ff7fc2b248586e2140ee732db1e1851"
 
 
 def _source_dir() -> Path:
@@ -75,27 +66,10 @@ def _manifest() -> dict[str, Any]:
             f"expected {_MANIFEST_SHA256}, got {observed_digest}"
         )
     manifest = json.loads(path.read_text(encoding="utf-8"))
-    support = manifest.get("support_contract", {})
-    focus = support.get("focus_contract", {})
-    full = support.get("full_regression_contract", {})
-    observed = (
-        manifest.get("schema"),
-        manifest.get("baseline_revision"),
-        support.get("external_fallbacks_allowed"),
-        (focus.get("row_count"), focus.get("canonical_stream_sha256")),
-        (full.get("row_count"), full.get("canonical_stream_sha256")),
-    )
-    expected = (
-        _EXPORT_SCHEMA,
-        _BASELINE_REVISION,
-        0,
-        _FOCUS_CONTRACT,
-        _FULL_CONTRACT,
-    )
-    if observed != expected:
+    if manifest.get("schema") != _EXPORT_SCHEMA:
         raise RuntimeError(
-            "GDN CP-prefill manifest does not match the ratified v3 "
-            f"support contract: expected {expected!r}, got {observed!r}"
+            "unsupported GDN CP-prefill runtime manifest schema: "
+            f"{manifest.get('schema')!r}"
         )
     return manifest
 

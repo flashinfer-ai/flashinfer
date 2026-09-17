@@ -1,3 +1,18 @@
 # Blackwell GDN CP-prefill CUDA source
 
-This source export contains the complete typed CUDA schedules and their generated TVM FFI host launchers for the four-stage context-parallel GDN prefill launcher. The manifest records the frozen 120-shape performance map, kernel ABI, graph replay policy, launch order, architecture coverage, and content hashes. `manifest.json` is build provenance for the internal JIT loader: it pins the generated source inventory and the PR4078 oracle revision, and is not a public runtime API or a shape allowlist. Shared CUDA device utilities live in `cuda/cake_gdn_cp_common.cuh`. Every TMA-backed stage passes `CUtensorMap` through the `__grid_constant__` ABI, so no process-lifetime descriptor arena is retained. The host launchers encode tensor maps and expose the low-level kernel ABI; workspace allocation, runtime dispatch, and graph replay remain consumer responsibilities. The FlashInfer integration supplies those responsibilities through an internal prepared launcher selected by the existing public `flashinfer.gdn_prefill.chunk_gated_delta_rule` dispatcher. The support contract binds the full legal public ABI, including FP32 CP-boundary checkpoints, and the 150-row focus and 822-row regression streams; the 120 listed shapes are frozen performance evidence, not an input allowlist.
+This source export contains CUDA kernels and their TVM FFI host launchers for
+context-parallel GDN prefill. `manifest.json` contains only the metadata needed
+by the JIT loader: the manifest schema, shared-header paths and hashes, and each
+kernel's architecture-specific CUDA source and host binding paths, hashes,
+module identifier and entry point.
+
+Shared device utilities live in `cuda/cake_gdn_cp_common.cuh`. The host launchers
+encode tensor maps and expose the low-level kernel ABI. The prepared launcher
+in `flashinfer.gdn_kernels.blackwell.cake_gdn_cp_backend` handles workspace
+allocation, dispatch and graph replay through the public
+`flashinfer.gdn_prefill.chunk_gated_delta_rule` API.
+
+The original export snapshot, including historical support contracts, schedule
+metadata and the frozen 120-shape performance map, lives in
+[`tests/gdn/data/cake_gdn_cp_export_manifest.json`](../../../tests/gdn/data/cake_gdn_cp_export_manifest.json).
+It is a historical test fixture, not runtime configuration or an input allowlist.

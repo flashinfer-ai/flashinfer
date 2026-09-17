@@ -52,20 +52,28 @@ def _assert_oracle_close(actual: torch.Tensor, expected: torch.Tensor) -> None:
 def test_generated_source_inventory_and_hashes() -> None:
     root = _source_root()
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["schema"] == (
+    historical_manifest = json.loads(
+        (Path(__file__).parent / "data" / "cake_gdn_cp_export_manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert manifest["schema"] == "flashinfer.gdn_cp.runtime_manifest.v1"
+    assert historical_manifest["schema"] == (
         "flashinfer-pr4078-sm100-cp-prefill-standalone-export-v3"
     )
-    assert manifest["baseline_revision"] == ("6cb2e70995d92edbc443b1bfc317ecacac907640")
-    assert manifest["support_contract"]["external_fallbacks_allowed"] == 0
-    assert manifest["support_contract"]["focus_contract"] == {
+    assert historical_manifest["baseline_revision"] == (
+        "6cb2e70995d92edbc443b1bfc317ecacac907640"
+    )
+    assert historical_manifest["support_contract"]["external_fallbacks_allowed"] == 0
+    assert historical_manifest["support_contract"]["focus_contract"] == {
         "row_count": 150,
         "canonical_stream_sha256": "d4f3fad233af91b8afac35271d6848df8f0f090b08f17807b9e2830139dd37ab",
     }
-    assert manifest["support_contract"]["full_regression_contract"] == {
+    assert historical_manifest["support_contract"]["full_regression_contract"] == {
         "row_count": 822,
         "canonical_stream_sha256": "0dff83c89b9a17f67e0a2db9bb9c20ed77506fa3b38cc55d7772864021553592",
     }
-    assert manifest["support_contract"]["checkpoint"] == {
+    assert historical_manifest["support_contract"]["checkpoint"] == {
         "cu_starts_dtypes": ["int32", "int64"],
         "interval": (
             "zero disables checkpoints; otherwise a positive multiple of 64 "
@@ -75,8 +83,8 @@ def test_generated_source_inventory_and_hashes() -> None:
         "shape": "[sum(seq_len // interval), H, 128, 128]",
         "state_dtype": "float32",
     }
-    assert manifest["frozen_performance_shape_count"] == 120
-    assert len(manifest["frozen_performance_shapes"]) == 120
+    assert historical_manifest["frozen_performance_shape_count"] == 120
+    assert len(historical_manifest["frozen_performance_shapes"]) == 120
     legacy_inventory = {"README.md", "manifest.json"}
     legacy_inventory.update(header["path"] for header in manifest["cuda_headers"])
     for kernel in manifest["kernels"]:
@@ -92,13 +100,15 @@ def test_generated_source_inventory_and_hashes() -> None:
     assert all(
         Path(path).name.startswith("cake_gdn_cp_") for path in implementation_paths
     )
-    assert manifest["launch_order"] == [
+    assert historical_manifest["launch_order"] == [
         "t_precompute",
         "mn_precompute",
         "state_fixup",
         "cp_prefill",
     ]
-    assert manifest["launch_policy"]["tensor_map_abi"].startswith("grid_constant")
+    assert historical_manifest["launch_policy"]["tensor_map_abi"].startswith(
+        "grid_constant"
+    )
     assert len(manifest["cuda_headers"]) == 1
     assert manifest["cuda_headers"][0]["path"] == "cuda/cake_gdn_cp_common.cuh"
     assert manifest["cuda_headers"][0]["sha256"] == (
@@ -140,11 +150,14 @@ def test_generated_source_inventory_and_hashes() -> None:
         "cp_prefill_generic_bf16",
     ]
     assert len(manifest["kernels"]) == 33
+    historical_kernels = {
+        record["name"]: record for record in historical_manifest["kernels"]
+    }
     for record in manifest["kernels"]:
         host = record["host_binding"]
         host_path = root / host["path"]
         assert hashlib.sha256(host_path.read_bytes()).hexdigest() == host["sha256"]
-        assert host["arg_plan"][-3:] == [
+        assert historical_kernels[record["name"]]["host_binding"]["arg_plan"][-3:] == [
             ["grid", "grid_x"],
             ["grid", "grid_y"],
             ["grid", "grid_z"],
@@ -153,7 +166,10 @@ def test_generated_source_inventory_and_hashes() -> None:
             source = root / output["path"]
             assert hashlib.sha256(source.read_bytes()).hexdigest() == output["sha256"]
     common_header = root / manifest["cuda_headers"][0]["path"]
-    assert common_header.stat().st_size == manifest["cuda_headers"][0]["size_bytes"]
+    assert (
+        common_header.stat().st_size
+        == historical_manifest["cuda_headers"][0]["size_bytes"]
+    )
     assert (
         hashlib.sha256(common_header.read_bytes()).hexdigest()
         == (manifest["cuda_headers"][0]["sha256"])
@@ -162,9 +178,7 @@ def test_generated_source_inventory_and_hashes() -> None:
 
 def test_jit_loader_accepts_checked_in_manifest() -> None:
     gdn_cp_jit._manifest.cache_clear()
-    assert gdn_cp_jit._manifest()["schema"] == (
-        "flashinfer-pr4078-sm100-cp-prefill-standalone-export-v3"
-    )
+    assert gdn_cp_jit._manifest()["schema"] == "flashinfer.gdn_cp.runtime_manifest.v1"
 
 
 @pytest.mark.parametrize(
@@ -382,11 +396,13 @@ def test_all_contract_plans_use_payload_independent_bounds(
         "get_device_properties",
         lambda _device: SimpleNamespace(multi_processor_count=148),
     )
-    manifest = json.loads(
-        (_source_root() / "manifest.json").read_text(encoding="utf-8")
+    historical_manifest = json.loads(
+        (Path(__file__).parent / "data" / "cake_gdn_cp_export_manifest.json").read_text(
+            encoding="utf-8"
+        )
     )
-    assert len(manifest["frozen_performance_shapes"]) == 120
-    for shape in manifest["frozen_performance_shapes"]:
+    assert len(historical_manifest["frozen_performance_shapes"]) == 120
+    for shape in historical_manifest["frozen_performance_shapes"]:
         total = sum(shape["seq_lens"])
         q = SimpleNamespace(
             shape=(total, shape["Hq"], shape["D"]),
