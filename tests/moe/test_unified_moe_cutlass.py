@@ -1103,7 +1103,6 @@ def test_cutlass_fp8_per_tensor_pack_reads_static_scales_from_view():
     assert len(inputs) == runner._expected_num_inputs == 10
     # The static view scales are folded into the flat ABI once per view, so
     # forward launches no arithmetic and repeated packing reuses the tensors.
-    assert inputs[7] is view["intermediate_scale_global"]
     again = runner.pack_inputs(act, weights)
     assert all(a is b for a, b in zip(inputs[6:10], again[6:10], strict=True))
     # Static scales are not token-dynamic.
@@ -1113,13 +1112,59 @@ def test_cutlass_fp8_per_tensor_pack_reads_static_scales_from_view():
     # fc2_act_quant, a1_dequant] with a1_dequant = 1 / hidden_states_scale_global.
     fc1, fc2_quant, fc2, a1 = runner._quant_scales(inputs)
     torch.testing.assert_close(fc1, torch.full((4,), 0.125))
-    assert fc2_quant is view["intermediate_scale_global"]
+    torch.testing.assert_close(fc2_quant, torch.tensor(8.0))
     torch.testing.assert_close(fc2, torch.full((4,), 0.03125))
     torch.testing.assert_close(a1, torch.tensor(0.25))
 
     view["intermediate_scale_global"] = torch.tensor(8.0, dtype=torch.float64)
     with pytest.raises(TypeError, match="intermediate_scale_global"):
         runner.pack_inputs(act, weights)
+
+
+def test_cutlass_fp8_per_tensor_folded_scales_ignore_in_place_writes():
+    """Registered scales are immutable once packed; re-calibration is a new tensor.
+
+    The fold cache is keyed by storage pointer, so an in-place ``copy_`` is not
+    observed -- and must not be observed by *some* ABI slots only. All four
+    keep the old calibration until the view holds a new tensor.
+    """
+    runner = CutlassFp8PerTensorRunner.__new__(CutlassFp8PerTensorRunner)
+    runner.config = _config(
+        quant=QuantConfig(
+            weight=QuantFormat.FP8PerTensor, activation=QuantFormat.FP8PerTensor
+        )
+    )
+    runner.device = torch.device("cpu")
+    runner._inner = object()
+    runner._built = True
+    runner._ensure_workspace = lambda *_args, **_kwargs: None
+    act = MoEActivationPack(
+        torch.empty(1, 128, dtype=torch.float8_e4m3fn),
+        None,
+        torch.zeros(1, 2, dtype=torch.int32),
+        torch.full((1, 2), 0.5, dtype=torch.float32),
+    )
+    view = {
+        "fc1_expert_weights": torch.empty(4, 512, 128, dtype=torch.float8_e4m3fn),
+        "fc2_expert_weights": torch.empty(4, 128, 256, dtype=torch.float8_e4m3fn),
+        "fc1_dequant": torch.full((4,), 0.5),
+        "fc2_dequant": torch.full((4,), 0.25),
+        "hidden_states_scale_global": torch.tensor(4.0),
+        "intermediate_scale_global": torch.tensor(8.0),
+    }
+    weights = MoEWeightPack()
+    weights.prepare_for(runner.backend_key, view)
+    before = [t.clone() for t in runner._quant_scales(runner.pack_inputs(act, weights))]
+
+    view["intermediate_scale_global"].copy_(torch.tensor(16.0))
+    stale = runner._quant_scales(runner.pack_inputs(act, weights))
+    for old, now in zip(before, stale, strict=True):
+        torch.testing.assert_close(now, old)
+
+    view["intermediate_scale_global"] = torch.tensor(16.0)
+    fresh = runner._quant_scales(runner.pack_inputs(act, weights))
+    torch.testing.assert_close(fresh[1], torch.tensor(16.0))
+    torch.testing.assert_close(fresh[2], torch.full((4,), 0.25 / 16.0))
 
 
 def test_cutlass_mxfp8_mxfp4_pack_rejects_unaligned_hidden_size():
@@ -2676,7 +2721,7 @@ def test_cutlass_fp8_per_tensor_moe_layer_matches_quantized_reference(activation
     # Keep the public weight-view contract coupled to the actual runner
     # boundary, rather than only checking the numerical launch below.
     packed_inputs = layer.runners[0].pack_inputs(act, weights)
-    assert packed_inputs[7] is view["intermediate_scale_global"]
+    torch.testing.assert_close(packed_inputs[7], view["intermediate_scale_global"])
     _pin_fallback_winner(layer, act)
     actual = layer(act, weights)
     flat = _run_flat_cutlass_independently(

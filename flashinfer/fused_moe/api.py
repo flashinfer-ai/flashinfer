@@ -1223,7 +1223,9 @@ class CutlassFp8PerTensorConfig:
 
         ``hidden_states_scale_global`` / ``intermediate_scale_global`` are the
         same static calibration multipliers ``TrtllmFp8PerTensorConfig``
-        takes; they are stored in the view and folded into the launch.
+        takes; they are stored in the view and folded into the launch. The
+        runner folds them once per view: treat the registered scales as
+        immutable and re-prepare (new tensors) instead of writing in place.
         """
         from .prepare import prepare_cutlass_fp8_per_tensor_weights
 

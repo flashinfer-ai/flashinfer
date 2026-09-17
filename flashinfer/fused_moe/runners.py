@@ -2290,9 +2290,18 @@ class CutlassFp8PerTensorRunner(_CutlassRunnerBase):
         Flat ABI: ``[fc1_dequant, fc2_act_quant, fc2_dequant, fc1_act_dequant]``.
         The view stores quant *multipliers* (``q = x * scale``), so the
         activation dequant is their reciprocal. ``MoELayer`` packs on every
-        call, so the folded tensors are cached per view (by storage pointer);
-        recomputing them per forward would add three launches per step and
-        move pointers out from under a captured CUDA graph.
+        call, so the folded tensors are cached per view, keyed by the storage
+        pointers of the four source tensors; recomputing them per forward
+        would add three launches per step and move pointers out from under a
+        captured CUDA graph.
+
+        Contract: the registered scales are immutable once packed. An in-place
+        write (``view["intermediate_scale_global"].copy_(...)``) keeps the
+        pointer and is therefore not observed -- all four folded tensors keep
+        the old calibration, consistently. Re-calibrating means registering
+        new tensors (new storage) and calling ``pack_inputs`` again. Static
+        per-tensor scales come from the checkpoint, so this is the normal
+        framework flow.
         """
         key = tuple(
             t.data_ptr() for t in (w1_dequant, w2_dequant, act_scale, inter_scale)
@@ -2302,7 +2311,9 @@ class CutlassFp8PerTensorRunner(_CutlassRunnerBase):
             act_dequant = act_scale.reciprocal()
             scales = [
                 (w1_dequant * act_dequant).contiguous(),
-                inter_scale,
+                # Cloned, not aliased: an in-place update of the view must not
+                # change one ABI slot while the folded ones keep the old value.
+                inter_scale.clone(),
                 (w2_dequant / inter_scale).contiguous(),
                 act_dequant,
             ]
