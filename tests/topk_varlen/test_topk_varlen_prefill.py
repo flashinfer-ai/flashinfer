@@ -155,12 +155,14 @@ def test_prefill_causal_ramp_single_request(top_k):
 
 
 @requires_gvr2
+@pytest.mark.parametrize("hinted", [False, True], ids=["unhinted", "hinted"])
 @pytest.mark.parametrize("lead", [1, 2, 3], ids=lambda x: f"lead{x}")
 @pytest.mark.parametrize("top_k", [512, 2048], ids=lambda k: f"k{k}")
-def test_prefill_packed_misaligned_ks(top_k, lead):
+def test_prefill_packed_misaligned_ks(top_k, lead, hinted):
     """Two packed requests; the second starts at ks % 4 == lead with +inf
     poison at [ks-lead, ks): a leaked lead lane would become top-1 and a missed
-    frame correction a negative index."""
+    frame correction a negative index. Unhinted = streaming slab engine;
+    hinted = the register rung picked for the ``max_seq_len`` bound."""
     a = 300
     ks1 = ((a + 3) // 4) * 4 + lead
     n1 = 4096 + 17
@@ -169,7 +171,7 @@ def test_prefill_packed_misaligned_ks(top_k, lead):
     ks = [0] * a + [ks1] * n1
     lens = list(range(1, a + 1)) + list(range(1, n1 + 1))
     lg, rs, le = _make_case(rows, ncols, ks, lens, seed=top_k * 100 + lead)
-    out = _run(lg, rs, le, top_k)
+    out = _run(lg, rs, le, top_k, **({"max_seq_len": n1} if hinted else {}))
     assert int(out.min()) >= -1, (
         "negative index leaked (missed -lead correction / guard)"
     )
@@ -199,9 +201,10 @@ def test_prefill_ties_degenerate(top_k, dist):
 
 
 @requires_gvr2
+@pytest.mark.parametrize("hinted", [False, True], ids=["unhinted", "hinted"])
 @pytest.mark.parametrize("lead", [1, 2, 3], ids=lambda x: f"lead{x}")
 @pytest.mark.parametrize("top_k", [512, 1024], ids=lambda k: f"k{k}")
-def test_prefill_neginf_masks_in_window(top_k, lead):
+def test_prefill_neginf_masks_in_window(top_k, lead, hinted):
     """Fewer than K finite values in the window (the rest -inf, as SGLang's
     init/local-token masks): the K-th boundary lies in the -inf tie class,
     crossed with a misaligned lead; no negative index may leak."""
@@ -222,7 +225,7 @@ def test_prefill_neginf_masks_in_window(top_k, lead):
     lg = full[:, :ncols]
     rs = torch.tensor([ks1] * rows, dtype=torch.int32, device=_DEV)
     le = torch.tensor([nv] * rows, dtype=torch.int32, device=_DEV)
-    out = _run(lg, rs, le, top_k)
+    out = _run(lg, rs, le, top_k, **({"max_seq_len": nv} if hinted else {}))
     assert int(out.min()) >= -1, "negative index leaked in a -inf tie class"
     _check_windowed(lg, out, rs, le, top_k)
 
@@ -347,10 +350,8 @@ def test_prefill_unwarmed_capture_raises_loudly():
     rs = torch.zeros((rows,), dtype=torch.int32, device=_DEV)
     le = torch.full((rows,), n, dtype=torch.int32, device=_DEV)
     out = torch.empty((rows, top_k), dtype=torch.int32, device=_DEV)
-    key = _host._prefill_cache_key(
-        _host._prefill_tier(rows, n, top_k), top_k, _host._prefill_bucket(n)
-    )
-    _host._PREFILL_CACHE.pop(key, None)
+    # drop every windowed launcher (slab tiers and register rungs alike)
+    _host._PREFILL_CACHE.clear()
     s = torch.cuda.Stream()
     with torch.cuda.stream(s):
         _host.default_workspace(lg)  # the slab exists; only the launcher is missing
@@ -391,6 +392,204 @@ def test_prefill_engine_key_distinct_from_decode():
     assert a is not b
     with pytest.raises(RuntimeError, match="varlen tuple"):
         dev.get_compiled(tpl[:7], hint_free=True, prefill=True)
+
+
+def _reg_keys():
+    return [k for k in _host._PREFILL_CACHE if k[0] == "reg"]
+
+
+@requires_gvr2
+@pytest.mark.parametrize(
+    "bound", [2045, 2048, 2049, 4096, 4097, 8192], ids=lambda b: f"L{b}"
+)
+@pytest.mark.parametrize("top_k", [512, 2048], ids=lambda k: f"k{k}")
+def test_prefill_register_rung_hinted(top_k, bound):
+    """With ``max_seq_len`` the launch runs on the register rung the per-part
+    table picks for that bound (or the slab where the table says so): exact on
+    every lead with +inf poison, and the register launcher really is what ran."""
+    R = 3
+    L = bound
+    rows = R * L
+    ks = [(r * L) for r in range(R) for _ in range(L)]
+    lens = [i + 1 for _ in range(R) for i in range(L)]
+    lg, rs, le = _make_case(rows, R * L, ks, lens, seed=bound + top_k)
+    plan = _host._prefill_reg_route(rows, top_k, L)
+    before = set(_reg_keys())
+    out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    flashinfer.top_k_varlen(
+        lg, le, top_k, row_starts=rs, out_indices=out, backend="gvr_2", max_seq_len=L
+    )
+    torch.cuda.synchronize()
+    # the bound + 3 lead lanes must fit the rung: no row may be skipped
+    assert not bool((out == -7).any()), "a row was left unwritten by the hinted launch"
+    _check_windowed(lg, out, rs, le, top_k)
+    if plan is not None:
+        new = set(_reg_keys()) - before
+        assert new or before, (
+            "register rung expected but no register launcher was compiled"
+        )
+        assert plan["tpl"][0] == 512 and plan["tpl"][0] * plan["tpl"][1] * 4 >= L
+
+
+@requires_gvr2
+@pytest.mark.parametrize("top_k", [512, 2048], ids=lambda k: f"k{k}")
+def test_prefill_bound_violation_reports_minus_one(top_k):
+    """``max_seq_len`` is a contract: on a register rung, a row whose scan
+    extent (window + lead lanes) exceeds the rung's capacity + 3-lane tail
+    comes out as all -1 — never a truncated ranking — while every conforming
+    row, including those exactly at that limit, stays exact at every lead."""
+    bound = 4096
+    plan = _host._prefill_reg_route(40, top_k, bound)
+    if plan is None:
+        pytest.skip("slab for this bound on this part: no capacity to violate")
+    cap = (
+        plan["tpl"][0] * plan["tpl"][1] * 4 + 3
+    )  # register batch + the 3-lane scalar tail
+    lens_pat = [
+        cap - 6,
+        cap - 4,
+        cap - 3,
+        cap - 2,
+        cap - 1,
+        cap,
+        cap + 1,
+        cap + 5,
+        top_k,
+        300,
+    ]
+    ks_list, len_list = [], []
+    for lead in range(4):
+        for ln in lens_pat:
+            ks_list.append(1024 + lead)
+            len_list.append(ln)
+    rows = len(ks_list)
+    ncols = 1024 + 4 + max(len_list)
+    lg, rs, le = _make_case(rows, ncols, ks_list, len_list, seed=top_k)
+    out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    flashinfer.top_k_varlen(
+        lg,
+        le,
+        top_k,
+        row_starts=rs,
+        out_indices=out,
+        backend="gvr_2",
+        max_seq_len=bound,
+    )
+    torch.cuda.synchronize()
+    assert not bool((out == -7).any()), "a row was left unwritten"
+    fits = [(ln + (ks & 3)) <= cap for ks, ln in zip(ks_list, len_list, strict=True)]
+    for r in range(rows):
+        if fits[r]:
+            continue
+        assert bool((out[r] == -1).all()), f"row {r}: violating row must be all -1"
+    keep = [r for r in range(rows) if fits[r]]
+    idx = torch.tensor(keep, device=_DEV)
+    _check_windowed(lg[idx], out[idx].contiguous(), rs[idx], le[idx], top_k)
+
+
+def test_prefill_route_table_pure():
+    """The per-part rung table (pure host logic) — pins the measured choices."""
+    mp = pytest.MonkeyPatch()
+    try:
+        mp.setattr(_host, "_arch_token", lambda: "sm100")
+        mp.setattr(_host, "_sm_count", lambda: 148)
+        r = _host._prefill_reg_route
+        assert r(8192, 512, 2045)["tpl"][:3] == (512, 1, 4)
+        assert r(8192, 512, 2048)["tpl"][:3] == (512, 1, 4)  # lead lanes ride the tail
+        assert r(8192, 512, 2049)["tpl"][:3] == (512, 2, 4)
+        assert r(8192, 1024, 2048)["tpl"][:3] == (512, 1, 4)
+        assert r(8192, 2048, 2048) is None  # bound <= k: every row identity, slab
+        assert r(8192, 2048, 4096)["tpl"][:3] == (512, 2, 4)
+        assert r(8192, 512, 4096)["tpl"][:3] == (512, 2, 4)
+        assert r(8192, 512, 4097) is None  # K <= 1024 above 4K: slab
+        assert r(8192, 512, 8192) is None
+        assert r(8192, 2048, 8192)["tpl"][:3] == (512, 4, 2)
+        assert r(8192, 2048, 8193) is None
+        assert r(8192, 512, 400) is None  # bound <= k: identity rows, slab
+        mp.setattr(_host, "_arch_token", lambda: "sm107")
+        mp.setattr(_host, "_sm_count", lambda: 208)
+        assert r(8192, 512, 2048)["tpl"][:3] == (512, 1, 4)
+        assert r(32768, 512, 2048) is None  # short windows, high rows: slab
+        assert r(8192, 1024, 2048)["tpl"][:3] == (512, 1, 4)
+        assert r(8192, 512, 2100)["tpl"][:3] == (512, 2, 2)  # VPT=2 class, small launch
+        assert r(32768, 512, 2100) is None  # mostly-empty VPT=2 at high rows: slab
+        assert r(8192, 2048, 2100) is None
+        assert r(32768, 2048, 4096)["tpl"][:3] == (512, 2, 2)  # full 4K windows: rung
+        assert r(8192, 512, 4096)["tpl"][:3] == (512, 2, 2)
+        assert r(8192, 2048, 8192)["tpl"][:3] == (512, 4, 2)
+        assert r(8192, 512, 8192) is None
+    finally:
+        mp.undo()
+
+
+@requires_gvr2
+def test_prefill_hinted_cuda_graph_replay():
+    """warmup_prefill compiles the register rungs too; a hinted capture replays
+    exactly with changed windows."""
+    top_k, L, R = 512, 2045, 4
+    rows = R * L
+    _host.warmup_prefill(top_k, R * L)
+    # finite everywhere (the second replay grows windows past the first ones)
+    stride = (R * L + 256 + 255) // 256 * 256
+    full = torch.randn((rows, stride), dtype=torch.float32, device=_DEV)
+    lg = full[:, : R * L]
+    rs = torch.tensor(
+        [(r * L) for r in range(R) for _ in range(L)], dtype=torch.int32, device=_DEV
+    )
+    le = torch.tensor(
+        [i + 1 for _ in range(R) for i in range(L)], dtype=torch.int32, device=_DEV
+    )
+    out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    s = torch.cuda.Stream()
+    with torch.cuda.stream(s):
+        flashinfer.top_k_varlen(
+            lg,
+            le,
+            top_k,
+            row_starts=rs,
+            out_indices=out,
+            backend="gvr_2",
+            max_seq_len=L,
+        )
+    torch.cuda.synchronize()
+    assert _host.prefill_ready(rows, top_k, L, width=R * L)
+    g = torch.cuda.CUDAGraph()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s), torch.cuda.graph(g, stream=s):
+        flashinfer.top_k_varlen(
+            lg,
+            le,
+            top_k,
+            row_starts=rs,
+            out_indices=out,
+            backend="gvr_2",
+            max_seq_len=L,
+        )
+    torch.cuda.current_stream().wait_stream(s)
+    g.replay()
+    torch.cuda.synchronize()
+    _check_windowed(lg, out, rs, le, top_k)
+    le.copy_(
+        torch.tensor(
+            [max(1, (i * 7) % L) for _ in range(R) for i in range(L)], dtype=torch.int32
+        )
+    )
+    g.replay()
+    torch.cuda.synchronize()
+    _check_windowed(lg, out, rs, le, top_k)
+
+
+def test_prefill_max_seq_len_validation():
+    n, rows, k = 4096, 8, 512
+    lg = torch.randn((rows, n), dtype=torch.float32, device=_DEV)
+    le = torch.full((rows,), n, dtype=torch.int32, device=_DEV)
+    rs = torch.zeros((rows,), dtype=torch.int32, device=_DEV)
+    if flashinfer.top_k_varlen.is_backend_supported("gvr_2", _cc()):
+        for bad in (0, -1, "8", 2.5, True):
+            with pytest.raises(ValueError, match="max_seq_len"):
+                flashinfer.top_k_varlen(lg, le, k, row_starts=rs, max_seq_len=bad)
+    # ignored without row_starts (decode mode), any backend
+    flashinfer.top_k_varlen(lg, le, k, max_seq_len=5)
 
 
 def test_prefill_api_validation_and_admission():

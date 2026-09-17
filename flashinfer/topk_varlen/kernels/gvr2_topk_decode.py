@@ -3624,6 +3624,7 @@ class GvrTopkRegKernel:
         next_n: int = 1,
         cr_shift: int = 0,
         hint_free: bool = False,
+        prefill: bool = False,
     ):
         assert blk in (256, 512, 1024) and vpt in (1, 2, 4)
         assert nbh in (256, 512, 1024, 2048)
@@ -3664,6 +3665,16 @@ class GvrTopkRegKernel:
         # measured 4-5% slower than the gather at n = 16K
         self.hf_fold = self.hint_free and (not deg) and vpt == 1
         self.brl = (minb * blk <= 1024) or (vpt == 1)
+        # windowed (prefill) mode: row r ranks logits[r, ks:ks+len) with ks from
+        # the pre_idx slot (1-D row_starts) and len from kv_lens; the row is read
+        # from the float4-rounded base col0 = ks & ~3 and the lead = ks & 3 low
+        # lanes (thread 0, s < lead) are excluded from bracket, histogram, escape
+        # and emit by a lane mask; emitted indices are local to ks. Hint-free
+        # varlen only (FlashInfer; the TRT-LLM #18702 port covers gvr_main).
+        self.prefill = bool(prefill)
+        if self.prefill:
+            assert self.varlen and self.hint_free and self.next_n == 1 and self.cr_shift == 0
+            assert not (self.use_img or self.use_bm)
 
     # ------------------------------------------------------------------
     @cute.kernel
@@ -3706,23 +3717,62 @@ class GvrTopkRegKernel:
         # a zero-work pass would reach the degenerate emitter and poison out.
         short = cutlass.Int32(0)
         prow = row
+        # prefill window frame (0 in every non-prefill compile): lead = ks & 3
+        # masked low lanes, col0 = ks - lead float4-aligned read base.
+        lead = cutlass.Int32(0)
+        col0 = cutlass.Int32(0)
         if cutlass.const_expr(self.varlen):
-            kq = cutlass.Int32(pre_idx.shape[1])
-            req = row // cutlass.Int32(self.next_n)
-            rr = row % cutlass.Int32(self.next_n)
-            prow = req
-            kvl = kv_lens[req]
-            nv = (kvl - cutlass.Int32(self.next_n) + rr + cutlass.Int32(1)) >> cutlass.Int32(
-                self.cr_shift
-            )
-            if nv < cutlass.Int32(0):
-                nv = cutlass.Int32(0)
-            if nv > n:
-                nv = n
+            if cutlass.const_expr(self.prefill):
+                kq = cutlass.Int32(out.shape[1])
+                # pre_idx slot = 1-D row_starts; kv_lens slot = window LENGTH
+                # (same ABI as the gvr_main window engine). Clamps: memory safety.
+                ks = pre_idx[row]
+                nv0 = kv_lens[row]
+                if ks < cutlass.Int32(0):
+                    ks = cutlass.Int32(0)
+                if nv0 < cutlass.Int32(0):
+                    nv0 = cutlass.Int32(0)
+                ke = ks + nv0
+                if ke > n:
+                    ke = n
+                if ks > ke:
+                    ks = ke
+                nv = ke - ks
+                lead = ks & cutlass.Int32(3)
+                col0 = ks - lead
+                npad0 = cutlass.Int32(logits.shape[1])
+                if col0 > npad0 - cutlass.Int32(4):
+                    col0 = npad0 - cutlass.Int32(4)
+            else:
+                kq = cutlass.Int32(pre_idx.shape[1])
+                req = row // cutlass.Int32(self.next_n)
+                rr = row % cutlass.Int32(self.next_n)
+                prow = req
+                kvl = kv_lens[req]
+                nv = (kvl - cutlass.Int32(self.next_n) + rr + cutlass.Int32(1)) >> cutlass.Int32(
+                    self.cr_shift
+                )
+                if nv < cutlass.Int32(0):
+                    nv = cutlass.Int32(0)
+                if nv > n:
+                    nv = n
             if nv <= kq:
                 short = cutlass.Int32(1)
             if short == cutlass.Int32(0):
-                n = nv
+                # scan extent from the float4-rounded base: lead pad + window
+                n = nv + lead
+            if cutlass.const_expr(self.prefill):
+                # the host admits this rung only when the caller's max_seq_len
+                # bound <= BLK*VPT*4: the register batch holds that many
+                # elements and the scalar tail lane (ntail < 4) the <= 3 lead
+                # lanes on top. A row whose extent exceeds cap + 3 violates the
+                # bound and cannot be ranked here -- report it as all -1
+                # (short=2: skip the body, emit no identity) rather than
+                # ranking a truncated window
+                if short == cutlass.Int32(0):
+                    if n > cutlass.Int32(self.blk * self.vpt * 4 + 3):
+                        short = cutlass.Int32(2)
+                        nv = cutlass.Int32(0)
             if short != cutlass.Int32(0):
                 i = tid
                 while i < kq:
@@ -3742,6 +3792,8 @@ class GvrTopkRegKernel:
         j = cutlass.Int32(0)
         r = cutlass.Int32(0)
         tinc = cutlass.Int32(0)
+        okl = cutlass.Int32(1)
+        lmask = cutlass.Int32(0xF)
         nA = cutlass.Int32(0)
         nT = cutlass.Int32(0)
         n1 = cutlass.Int32(0)
@@ -3826,10 +3878,22 @@ class GvrTopkRegKernel:
 
         if short == cutlass.Int32(0):
             npad = cutlass.Int32(logits.shape[1])  # noqa: F841
-            k = cutlass.Int32(pre_idx.shape[1])
+            if cutlass.const_expr(self.prefill):
+                k = cutlass.Int32(out.shape[1])
+                # 1-D row_starts slot: pointer formed (dead), never dereferenced
+                p_addr = pre_idx.iterator.toint()
+            else:
+                k = cutlass.Int32(pre_idx.shape[1])
+                p_addr = pre_idx[prow, None].iterator.toint()  # request-level under varlen
             out_row = out[row, None]
-            x_addr = logits[row, None].iterator.toint()  # Int64 gmem byte base
-            p_addr = pre_idx[prow, None].iterator.toint()  # request-level under varlen
+            # prefill: base shifted to the float4-rounded window start
+            x_addr = logits[row, None].iterator.toint() + cutlass.Int64(col0) * cutlass.Int64(4)
+            # lane mask over float4 0 (the only float4 holding lead lanes): bit s
+            # set iff lane s of thread 0 is in-window; every other thread all set.
+            lmask = cutlass.Int32(0xF)
+            if cutlass.const_expr(self.prefill):
+                if tid == cutlass.Int32(0):
+                    lmask = (cutlass.Int32(0xF) << lead) & cutlass.Int32(0xF)
 
             # ---- shared-memory window (map in module docstring) ----
             sptr = cute.arch.get_dyn_smem(cutlass.Int32, alignment=16)
@@ -3879,7 +3943,7 @@ class GvrTopkRegKernel:
                     j = tid + cutlass.Int32(t * self.blk)
                     if j < k:
                         if cutlass.const_expr(self.hint_free):
-                            pv = j  # identity hint: positions 0..k-1, no load
+                            pv = j + lead  # identity hint: window positions 0..k-1
                         else:
                             pv = ld_g_i32(p_addr, j)
                     pvs.append(pv)
@@ -3984,10 +4048,11 @@ class GvrTopkRegKernel:
                     pos = (
                         (tid + cutlass.Int32((s // 4) * self.blk)) << cutlass.Int32(2)
                     ) + cutlass.Int32(s % 4)
-                    if pos < k:
-                        v = _val(frags, s)
-                        lmn = fmin_f32(lmn, v)
-                        lmx = fmax_f32(lmx, v)
+                    if pos >= lead:
+                        if pos < k + lead:
+                            v = _val(frags, s)
+                            lmn = fmin_f32(lmn, v)
+                            lmx = fmax_f32(lmx, v)
                 lmin = fkey(lmn)
                 lmax = fkey(lmx)
             elif cutlass.const_expr(self.deg):
@@ -3995,9 +4060,13 @@ class GvrTopkRegKernel:
                 lmx = cutlass.Float32(_NEG_INF__reg)
                 for s in cutlass.range_constexpr(S):
                     v = _val(frags, s)
-                    if v > cutlass.Float32(_NEG_INF__reg):
-                        lmn = fmin_f32(lmn, v)
-                        lmx = fmax_f32(lmx, v)
+                    okl = cutlass.Int32(1)
+                    if cutlass.const_expr(self.prefill and s < 4):
+                        okl = (lmask >> cutlass.Int32(s)) & cutlass.Int32(1)
+                    if okl != cutlass.Int32(0):
+                        if v > cutlass.Float32(_NEG_INF__reg):
+                            lmn = fmin_f32(lmn, v)
+                            lmx = fmax_f32(lmx, v)
                 if tid < ntail:
                     lmn = fmin_f32(lmn, tval)
                     lmx = fmax_f32(lmx, tval)
@@ -4085,7 +4154,11 @@ class GvrTopkRegKernel:
                 for s in cutlass.range_constexpr(S):
                     q = _fmaf__reg(_val(frags, s), SC, CQ)
                     bn = _umin_u32(f2u_rz(q), cutlass.Uint32(self.nbh - 1))
-                    _red_shared_add1__reg(hb + (cutlass.Int32(bn) << cutlass.Int32(2)))
+                    okl = cutlass.Int32(1)
+                    if cutlass.const_expr(self.prefill and s < 4):
+                        okl = (lmask >> cutlass.Int32(s)) & cutlass.Int32(1)
+                    if okl != cutlass.Int32(0):
+                        _red_shared_add1__reg(hb + (cutlass.Int32(bn) << cutlass.Int32(2)))
                 qt = _fmaf__reg(tval, SC, CQ)  # unconditional
                 bnt = _umin_u32(f2u_rz(qt), cutlass.Uint32(self.nbh - 1))
                 _red_shared_add1__reg(hb + (cutlass.Int32(bnt) << cutlass.Int32(2)))
@@ -4096,8 +4169,14 @@ class GvrTopkRegKernel:
                 hb = _smem_addr_reg__reg(sbase + cutlass.Int32(STATIC_WORDS * 4))
                 for s in cutlass.range_constexpr(S):
                     q = _submul_asm(_val(frags, s), Tv, SC)  # anti-CSE classify
-                    if q >= cutlass.Float32(0.0):
-                        _red_shared_add1__reg(hb + (f2s_rz(fmin_f32(q, QCAPf)) << cutlass.Int32(2)))
+                    okl = cutlass.Int32(1)
+                    if cutlass.const_expr(self.prefill and s < 4):
+                        okl = (lmask >> cutlass.Int32(s)) & cutlass.Int32(1)
+                    if okl != cutlass.Int32(0):
+                        if q >= cutlass.Float32(0.0):
+                            _red_shared_add1__reg(
+                                hb + (f2s_rz(fmin_f32(q, QCAPf)) << cutlass.Int32(2))
+                            )
                 qt = _submul_asm(tval, Tv, SC)
                 if qt >= cutlass.Float32(0.0):
                     _red_shared_add1__reg(hb + (f2s_rz(fmin_f32(qt, QCAPf)) << cutlass.Int32(2)))
@@ -4177,7 +4256,7 @@ class GvrTopkRegKernel:
                 rlo = cutlass.Uint32(0)
                 rhi = cutlass.Uint32(0xFFFFFFFF)
                 needC = k
-                mm = n  # in-range count, carried from the previous level
+                mm = n - lead  # in-range count (window only), carried per level
                 lev = cutlass.Int32(0)
                 state = cutlass.Int32(0)  # 1 -> ethr = rlo, 2 -> ethr = rlo - 1
                 while state == cutlass.Int32(0):
@@ -4203,18 +4282,22 @@ class GvrTopkRegKernel:
                             ix = (
                                 (tid + cutlass.Int32((s // 4) * self.blk)) << cutlass.Int32(2)
                             ) + cutlass.Int32(s % 4)
+                            okl = cutlass.Int32(1)
+                            if cutlass.const_expr(self.prefill and s < 4):
+                                okl = (lmask >> cutlass.Int32(s)) & cutlass.Int32(1)
                             if ix < nvec:
-                                uev = fkey(_val(frags, s))
-                                if uev >= rlo:
-                                    if uev <= rhi:
-                                        bne = _umin_u32(
-                                            (uev - rlo) >> cutlass.Uint32(sh2),
-                                            cutlass.Uint32(self.nbh - 1),
-                                        )
-                                        atomic_add_cta(
-                                            s_hist.iterator + cutlass.Int32(bne),
-                                            cutlass.Int32(1),
-                                        )
+                                if okl != cutlass.Int32(0):
+                                    uev = fkey(_val(frags, s))
+                                    if uev >= rlo:
+                                        if uev <= rhi:
+                                            bne = _umin_u32(
+                                                (uev - rlo) >> cutlass.Uint32(sh2),
+                                                cutlass.Uint32(self.nbh - 1),
+                                            )
+                                            atomic_add_cta(
+                                                s_hist.iterator + cutlass.Int32(bne),
+                                                cutlass.Int32(1),
+                                            )
                         if tid < ntail:
                             uev = fkey(tval)
                             if uev >= rlo:
@@ -4254,8 +4337,12 @@ class GvrTopkRegKernel:
                         (tid + cutlass.Int32((s // 4) * self.blk)) << cutlass.Int32(2)
                     ) + cutlass.Int32(s % 4)
                     u64 = cutlass.Int64(-1)
+                    okl = cutlass.Int32(1)
+                    if cutlass.const_expr(self.prefill and s < 4):
+                        okl = (lmask >> cutlass.Int32(s)) & cutlass.Int32(1)
                     if ixv < nvec:
-                        u64 = cutlass.Int64(fkey(_val(frags, s)))
+                        if okl != cutlass.Int32(0):
+                            u64 = cutlass.Int64(fkey(_val(frags, s)))
                     q1e = cutlass.Int32(0)
                     q2e = cutlass.Int32(0)
                     if u64 > ethr:
@@ -4277,10 +4364,10 @@ class GvrTopkRegKernel:
                     p2e = b2 + popc(n2 & lml)
                     if q1e == cutlass.Int32(1):
                         if p1e < nA:
-                            out_row[p1e] = ixv
+                            out_row[p1e] = ixv - lead
                     if q2e == cutlass.Int32(1):
                         if p2e < nT:
-                            out_row[nA + p2e] = ixv
+                            out_row[nA + p2e] = ixv - lead
                 # tail element
                 u64 = cutlass.Int64(-1)
                 if tid < ntail:
@@ -4306,10 +4393,10 @@ class GvrTopkRegKernel:
                 p2e = b2 + popc(n2 & lml)
                 if q1e == cutlass.Int32(1):
                     if p1e < nA:
-                        out_row[p1e] = tix
+                        out_row[p1e] = tix - lead
                 if q2e == cutlass.Int32(1):
                     if p2e < nT:
-                        out_row[nA + p2e] = tix
+                        out_row[nA + p2e] = tix - lead
                 # (CUDA returns here — everything below is the else-arm)
             else:
                 # ---- emit
@@ -4327,19 +4414,23 @@ class GvrTopkRegKernel:
                             (tid + cutlass.Int32((s // 4) * self.blk)) << cutlass.Int32(2)
                         ) + cutlass.Int32(s % 4)
                         p = cutlass.Int32(0)
-                        if q >= LOQ:
-                            bn = _umin_u32(f2u_rz(q), cutlass.Uint32(self.nbh - 1))
-                            p = atomic_add_cta(
-                                s_hist.iterator + cutlass.Int32(bn), cutlass.Int32(1)
-                            )
-                            if p < lim1:
-                                out_row[p] = idx
-                            else:
-                                if whole == cutlass.Int32(0):
-                                    q2i = p - above
-                                    if q2i < cmp_:  # escape-made-safe guard
-                                        ck[q2i] = fkey(_val(frags, s))
-                                        ci[q2i] = idx
+                        okl = cutlass.Int32(1)
+                        if cutlass.const_expr(self.prefill and s < 4):
+                            okl = (lmask >> cutlass.Int32(s)) & cutlass.Int32(1)
+                        if okl != cutlass.Int32(0):
+                            if q >= LOQ:
+                                bn = _umin_u32(f2u_rz(q), cutlass.Uint32(self.nbh - 1))
+                                p = atomic_add_cta(
+                                    s_hist.iterator + cutlass.Int32(bn), cutlass.Int32(1)
+                                )
+                                if p < lim1:
+                                    out_row[p] = idx - lead
+                                else:
+                                    if whole == cutlass.Int32(0):
+                                        q2i = p - above
+                                        if q2i < cmp_:  # escape-made-safe guard
+                                            ck[q2i] = fkey(_val(frags, s))
+                                            ci[q2i] = idx - lead
                     # tail
                     if cutlass.const_expr(self.brl):
                         qt2 = _fmaf__reg(tval, SC, CQ)
@@ -4350,13 +4441,13 @@ class GvrTopkRegKernel:
                         bn = _umin_u32(f2u_rz(qt2), cutlass.Uint32(self.nbh - 1))
                         p = atomic_add_cta(s_hist.iterator + cutlass.Int32(bn), cutlass.Int32(1))
                         if p < lim1:
-                            out_row[p] = tix
+                            out_row[p] = tix - lead
                         else:
                             if whole == cutlass.Int32(0):
                                 q2i = p - above
                                 if q2i < cmp_:
                                     ck[q2i] = fkey(tval)
-                                    ci[q2i] = tix
+                                    ci[q2i] = tix - lead
                 else:
                     # two-mask ballot emit
                     HIf = cutlass.Float32(_POS_INF)
@@ -4374,11 +4465,15 @@ class GvrTopkRegKernel:
                             q = _fmaf__reg(_val(frags, s), SC, CQ)
                         else:
                             q = _fmaf__reg(_val(frags, s) - Tv, SC, OFFf)
-                        if q >= HIf:
-                            m1 = m1 | cutlass.Int32(1 << s)
-                        else:
-                            if q >= LOf:
-                                m2 = m2 | cutlass.Int32(1 << s)
+                        okl = cutlass.Int32(1)
+                        if cutlass.const_expr(self.prefill and s < 4):
+                            okl = (lmask >> cutlass.Int32(s)) & cutlass.Int32(1)
+                        if okl != cutlass.Int32(0):
+                            if q >= HIf:
+                                m1 = m1 | cutlass.Int32(1 << s)
+                            else:
+                                if q >= LOf:
+                                    m2 = m2 | cutlass.Int32(1 << s)
                     if cutlass.const_expr(self.brl):
                         qt3 = _fmaf__reg(tval, SC, CQ)
                     else:
@@ -4413,12 +4508,12 @@ class GvrTopkRegKernel:
                             << cutlass.Int32(2)
                         ) + (sdyn & cutlass.Int32(3))
                         if p1 < lim1:
-                            out_row[p1] = idx
+                            out_row[p1] = idx - lead
                         p1 = p1 + cutlass.Int32(1)
                         wm = wm & (wm - cutlass.Int32(1))
                     if t1 == cutlass.Int32(1):
                         if p1 < lim1:
-                            out_row[p1] = tix
+                            out_row[p1] = tix - lead
                         p1 = p1 + cutlass.Int32(1)
                     if m2 != cutlass.Int32(0):  # static-unrolled
                         for s in cutlass.range_constexpr(S):
@@ -4428,12 +4523,12 @@ class GvrTopkRegKernel:
                                 ) + cutlass.Int32(s % 4)
                                 if p2 < cmp_:
                                     ck[p2] = fkey(_val(frags, s))
-                                    ci[p2] = idx
+                                    ci[p2] = idx - lead
                                 p2 = p2 + cutlass.Int32(1)
                     if t2 == cutlass.Int32(1):
                         if p2 < cmp_:
                             ck[p2] = fkey(tval)
-                            ci[p2] = tix
+                            ci[p2] = tix - lead
                         p2 = p2 + cutlass.Int32(1)
 
                 # ---- refine (skipped when whole — CUDA returned inside emit)
@@ -4623,7 +4718,14 @@ _COMPILE_CACHE__reg: dict = {}
 
 
 def get_compiled__reg(
-    tpl, dump_dir=None, pdl=False, varlen=False, next_n=1, cr_shift=0, hint_free=False
+    tpl,
+    dump_dir=None,
+    pdl=False,
+    varlen=False,
+    next_n=1,
+    cr_shift=0,
+    hint_free=False,
+    prefill=False,
 ):
     """Compile (or fetch) the variant for constexpr tuple
     (BLK, VPT, MINB, KPT, CUR, DEG, IMG, NBH).
@@ -4632,7 +4734,10 @@ def get_compiled__reg(
     kernel never reads the hint (no prefetch, no gather arm), so the hinted and
     hint-free launchers share one compiled object instead of two byte-identical
     ones."""
-    if bool(tpl[5]):  # DEG
+    if prefill:
+        if not (varlen and hint_free and int(next_n) == 1 and int(cr_shift) == 0):
+            raise RuntimeError("reg prefill requires varlen, hint_free, next_n == 1, cr_shift == 0")
+    elif bool(tpl[5]):  # DEG (hinted / hint-free share one object; prefill keys its own)
         hint_free = False
     key = (
         tuple(tpl),
@@ -4641,6 +4746,7 @@ def get_compiled__reg(
         int(next_n),
         int(cr_shift),
         bool(hint_free),
+        bool(prefill),
         C._compile_arch_token(),
     )
     compiled = _COMPILE_CACHE__reg.get(key)
@@ -4662,6 +4768,7 @@ def get_compiled__reg(
             next_n=next_n,
             cr_shift=cr_shift,
             hint_free=hint_free,
+            prefill=prefill,
         )
         nb_, nc_ = cute.sym_int(), cute.sym_int()
         nb2_, nc2_ = cute.sym_int(), cute.sym_int()
@@ -4669,9 +4776,15 @@ def get_compiled__reg(
         lg_fake = _crt.make_fake_compact_tensor(
             cutlass.Float32, (nb_, nc_), stride_order=(1, 0), assumed_align=16
         )
-        pi_fake = _crt.make_fake_compact_tensor(
-            cutlass.Int32, (nb2_, nc2_), stride_order=(1, 0), assumed_align=16
-        )
+        if prefill:
+            # 1-D row_starts in the pre_idx slot (4B aligned: it is sliced per slab)
+            pi_fake = _crt.make_fake_compact_tensor(
+                cutlass.Int32, (nb2_,), stride_order=(0,), assumed_align=4
+            )
+        else:
+            pi_fake = _crt.make_fake_compact_tensor(
+                cutlass.Int32, (nb2_, nc2_), stride_order=(1, 0), assumed_align=16
+            )
         out_fake = _crt.make_fake_compact_tensor(
             cutlass.Int32, (nb3_, nc3_), stride_order=(1, 0), assumed_align=16
         )
@@ -4708,6 +4821,7 @@ def get_compiled__reg(
                 "reg_" + "_".join(str(x) for x in tuple(tpl))
                 + f"_pdl{int(bool(pdl))}_vl{int(bool(varlen))}_nn{int(next_n)}_cs{int(cr_shift)}"
                 + ("_hf" if hint_free else "")
+                + ("_pf" if prefill else "")
             )
             compiled = C._persist(name, _compile_fn)
         _COMPILE_CACHE__reg[key] = compiled

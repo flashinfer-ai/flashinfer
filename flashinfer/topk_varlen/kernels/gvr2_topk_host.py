@@ -1013,17 +1013,174 @@ def _prefill_bucket(n_env: int) -> int:
     return min(1 << max(int(n_env) - 1, 1).bit_length(), 32768)
 
 
-def _prefill_cache_key(tier: int, k: int, n_bucket: int):
-    # tiers 1/2 fix U, so the bucket does not change their engine — collapse it
-    # to one key so warmup covers them with a single launch
-    return (tier, k, n_bucket if tier == 0 else 0, _arch_token(), _sm_count())
+# ---- family routing for windowed rows ---------------------------------------
+# The window engines exist for two families: the register-resident `reg`
+# kernels (BLK=512, VPT in {1,2,4}: the row is read once into registers) and
+# the streaming `main` slab. The register rungs need the whole scan extent
+# (max window length + up to 3 lead lanes) to fit their capacity, so they are
+# only reachable when the caller's ``max_seq_len`` bounds the windows; without
+# it every launch takes the slab. A row that violates the bound on a register
+# rung is reported as all -1 (never a truncated ranking). Table and numbers:
+# _prefill_reg_route.
+_PREFILL_REG_MAX_N4 = 2048  # register capacity ceiling: 512 threads x VPT 4 float4
+
+
+def _reg_plan(blk: int, vpt: int, minb: int, n: int, k: int, b: int) -> dict:
+    """Register-family plan for the non-``wide`` band (b > sms): mirror of
+    route()'s register-band constants (CMP / QC / CURE / DEGE / NBSEL) for an
+    explicit (BLK, VPT, MINB) rung — the windowed router picks rungs the decode
+    router does not (occupancy variants), so it cannot go through route()."""
+    sms = _sm_count()
+    wide = b <= sms
+    cmp_ = n if n < 2560 else 2560
+    qc = 1024 if b > sms else QUADC
+    cure = not (n < 2 * k and b > sms)
+    dege = (n <= 3 * k) or (n <= 4 * k + 64)
+    if dege and cmp_ < n:
+        cmp_ = n
+    n4 = n >> 2
+    nbsel = (2 * NB) if (n4 > 512 and not (n4 <= 2048 and not wide)) else NB
+    if dege:
+        tpl = (blk, vpt, minb, 1, cure, True, False, nbsel)
+    else:
+        kpt = 1 if k <= blk else (2 if k <= 2 * blk else 4)
+        tpl = (blk, vpt, minb, kpt, cure, False, False, nbsel)
+    return {
+        "kernel": "reg",
+        "tpl": tpl,
+        "rt": {"n": n, "npad": n, "k": k, "CMP": cmp_, "IMGOFF": nbsel, "QC": qc},
+        "smem": (nbsel + 2 * cmp_) * 4,
+    }
+
+
+def _prefill_reg_route(rows: int, k: int, n_hint: int) -> dict | None:
+    """Register rung (BLK=512, VPT, MINB) for windowed rows whose scan extent
+    ``n_hint + 3`` (lead lanes) fits its capacity, or None for the slab.
+
+    Per-part table from the causal-staircase sweep (rows 2K-32K, K in {512,
+    2048}, window bounds filling each class; logs prefill_reg_sweep, same node
+    vs sglang topk_v2, 3 interleaved reps, min; B200 and B300 agree within
+    3%, Rubin differs):
+      * L <= 2048: B200/B300 VPT=1/MINB=4 (K <= 1024) or VPT=2/MINB=4 (K =
+        2048), 1.6-2.0x the slab at every row count. Rubin: VPT=1/MINB=4 only
+        while the launch is small (K <= 1024: <= 16K rows; K = 2048: <= 4K
+        rows) — above that Rubin's slab is as fast or faster (up to 1.4x).
+      * L <= 4096: B200/B300 VPT=2/MINB=4 (the decode rung), 1.6-1.7x the
+        slab. Rubin: VPT=2/MINB=2 — the MINB=4 rung is register-starved there
+        (1.4-2x slower than the slab) while MINB=2 is 1.4x faster; bounds
+        <= 2560 (one empty float4 per thread) keep the small-launch gate of
+        the class below (6-40% behind the slab at 8K-32K rows otherwise).
+      * L <= 8192: K = 2048 -> VPT=4/MINB=2 (5-8% ahead of the slab on every
+        part); K <= 1024 -> slab (the register rungs lose 10-25%).
+      * above: slab (streaming main).
+    Occupancy variants of the same rung (MINB 1/2/4, BLK 1024) were measured
+    and lose everywhere else."""
+    # Capacity: the register batch holds BLK*VPT float4 = cap elements and the
+    # kernel's scalar tail lane covers up to 3 more (ntail = n - 4*n4 < 4), so a
+    # rung ranks scan extents nv + lead <= cap + 3 exactly, i.e. any window
+    # bound <= cap (the <= 3 lead lanes ride in the tail). Classes are keyed on
+    # the bound itself so 2048 / 4096 / 8192-token prompts keep their rung.
+    n_hint = int(n_hint)
+    if n_hint > _PREFILL_REG_MAX_N4 * 4 or n_hint <= k:
+        return None
+    rows = int(rows)
+    rubin = "107" in _arch_token()
+    # Rubin's slab is the faster engine for short windows at high row counts
+    # (K <= 1024: above 16K rows; K = 2048: above 4K rows). That gate covers
+    # the VPT=1 class and the low half of the VPT=2 class (a 2049-2560 bound
+    # lands on VPT=2 with one empty float4 per thread: measured 6-40% behind
+    # the slab at 8K-32K rows on Rubin, ahead of it below).
+    rubin_short_gate = rubin and ((k <= 1024 and rows > 16384) or (k > 1024 and rows > 4096))
+    if n_hint <= 2048:
+        if rubin:
+            if rubin_short_gate:
+                return None
+            rung = (512, 1, 4)
+        else:
+            rung = (512, 2, 4) if k == 2048 else (512, 1, 4)
+    elif n_hint <= 4096:
+        if rubin:
+            if rubin_short_gate and n_hint <= 2560:
+                return None
+            rung = (512, 2, 2)
+        else:
+            rung = (512, 2, 4)
+    else:
+        if k != 2048:
+            return None
+        rung = (512, 4, 2)
+    blk, vpt, minb = rung
+    assert blk * vpt * 4 >= n_hint
+    return _reg_plan(blk, vpt, minb, blk * vpt * 4, k, rows)
+
+
+_PREFILL_CLASS_BOUNDS = (2048, 4096, 8192)  # register capacity classes (VPT 1 / 2 / 4)
+# Unhinted windowed calls (no max_seq_len) run the slab for every row. A
+# per-row split across two launches (register rung + slab, each skipping the
+# other's rows) was measured and rejected: the slab launch that only skips
+# still schedules one CTA per row at its 1-2 CTA/SM smem occupancy (~35 us per
+# 32K rows on B200), and without the bound the register launch must take the
+# largest class, which is the wrong kernel for short windows (VPT=4 on 2K
+# windows: slower than the slab itself at K = 2048). The bound is host
+# knowledge in every serving framework, so the API asks for it.
+
+
+def _prefill_cache_key(fam: str, tier_or_tpl, k: int, n_bucket: int):
+    # main: tiers 1/2 fix U, so the bucket does not change their engine —
+    # collapse it to one key so warmup covers them with a single launch.
+    # reg: the compile tuple + envelope constants identify the launcher.
+    if fam == "main":
+        tier = tier_or_tpl
+        return ("main", tier, k, n_bucket if tier == 0 else 0, _arch_token(), _sm_count())
+    return ("reg", tier_or_tpl, k, _arch_token(), _sm_count())
+
+
+def _prefill_reg_launcher(plan: dict, k: int) -> tuple:
+    """Windowed register-family launcher for a route() plan (hint-free varlen
+    compile with the prefill flag). ABI: ``fn(logits, row_starts, kv_lens=window
+    lengths, out, n_clamp, CMP, QC, smem)``."""
+    rt = plan["rt"]
+    tpl = tuple(plan["tpl"])
+    key = _prefill_cache_key("reg", (tpl, rt["CMP"], rt["QC"], plan["smem"]), k, 0)
+    hit = _PREFILL_CACHE.get(key)
+    if hit is not None:
+        return hit
+    dev = _device()
+    fn = _gate_first_call(
+        dev.get_compiled__reg(
+            tpl, varlen=True, next_n=1, cr_shift=0, hint_free=True, prefill=True
+        )
+    )
+    lc = ("reg", fn, (rt["CMP"], rt["QC"], dev.STATIC_BYTES + plan["smem"]))
+    _PREFILL_CACHE[key] = lc
+    return lc
+
+
+def _prefill_get(rows: int, k: int, n_hint: int, n_bucket: int, compile_ok: bool) -> tuple:
+    """Launcher for one row slab: register rung when the window bound admits
+    it, else the slab tier. ``compile_ok=False`` (capture) returns None on a
+    cache miss instead of compiling."""
+    plan = _prefill_reg_route(rows, k, n_hint)
+    if plan is not None:
+        key = _prefill_cache_key(
+            "reg", (tuple(plan["tpl"]), plan["rt"]["CMP"], plan["rt"]["QC"], plan["smem"]), k, 0
+        )
+        lc = _PREFILL_CACHE.get(key)
+        if lc is None and compile_ok:
+            lc = _prefill_reg_launcher(plan, k)
+        return lc
+    tier = _prefill_tier(rows, n_hint, k)
+    lc = _PREFILL_CACHE.get(_prefill_cache_key("main", tier, k, n_bucket))
+    if lc is None and compile_ok:
+        lc = _prefill_launcher(tier, k, n_bucket)
+    return lc
 
 
 def _prefill_launcher(tier: int, k: int, n_bucket: int) -> tuple:
-    """Windowed plan + compiled launcher: ``_varlen_launcher``'s main branch
+    """Windowed slab plan + compiled launcher: ``_varlen_launcher``'s main branch
     with r_const=1, split=False, hint_free=True and the prefill compile flag.
     SCAP_/CMP_ are envelope upper bounds; the `n` slot is filled per call."""
-    key = _prefill_cache_key(tier, k, n_bucket)
+    key = _prefill_cache_key("main", tier, k, n_bucket)
     hit = _PREFILL_CACHE.get(key)
     if hit is not None:
         return hit
@@ -1054,7 +1211,7 @@ def _prefill_launcher(tier: int, k: int, n_bucket: int) -> tuple:
     return lc
 
 
-def _launch_prefill(lg, row_starts, kv_lens, idx, ws, k, n_clamp, n_hint, npad) -> None:
+def _launch_prefill(lg, row_starts, kv_lens, idx, ws, k, n_clamp, n_hint, npad, hinted) -> None:
     """Launch the windowed engine over ``lg`` in row slabs. ABI (main varlen):
     ``fn(logits, pre_idx_slot=row_starts, out, ws, n, npad, k, SCAP_, CMP_, R,
     dead x5, kv_lens_slot=window lengths, tuning tail)``; the prefill compile
@@ -1065,17 +1222,31 @@ def _launch_prefill(lg, row_starts, kv_lens, idx, ws, k, n_clamp, n_hint, npad) 
     num_rows = lg.shape[0]
     n_hint = min(max(int(n_hint), 1), int(n_clamp))
     n_bucket = _prefill_bucket(n_hint)
+    capture = _is_capturing()
     for r0 in range(0, num_rows, _PREFILL_ROW_SLAB):
         r1 = min(r0 + _PREFILL_ROW_SLAB, num_rows)
-        tier = _prefill_tier(r1 - r0, n_hint, k)
-        lc = _PREFILL_CACHE.get(_prefill_cache_key(tier, k, n_bucket))
+        rows = r1 - r0
+        if hinted:
+            # the caller's window-length bound picks ONE engine for the slab:
+            # a register rung whose capacity covers bound + 3 lead lanes, else
+            # the streaming main tier
+            lc = _prefill_get(rows, k, n_hint, n_bucket, compile_ok=not capture)
+        else:
+            # unhinted: window lengths are device data -> streaming main for
+            # every row (see the note at _PREFILL_CLASS_BOUNDS)
+            tier = _prefill_tier(rows, n_hint, k)
+            lc = _PREFILL_CACHE.get(_prefill_cache_key("main", tier, k, n_bucket))
+            if lc is None and not capture:
+                lc = _prefill_launcher(tier, k, n_bucket)
         if lc is None:
-            if _is_capturing():
-                raise RuntimeError(
-                    "prefill launcher not compiled for this shape — warm up "
-                    "(warmup_prefill or one eager windowed call) before CUDA graph capture"
-                )
-            lc = _prefill_launcher(tier, k, n_bucket)
+            raise RuntimeError(
+                "prefill launcher not compiled for this shape — warm up "
+                "(warmup_prefill or one eager windowed call) before CUDA graph capture"
+            )
+        if lc[0] == "reg":
+            # register rung ABI: (logits, row_starts, window lengths, out, n_clamp, CMP, QC, smem)
+            lc[1](lg[r0:r1], row_starts[r0:r1], kv_lens[r0:r1], idx[r0:r1], n_clamp, *lc[2])
+            continue
         _, fn, (scap, cmp_), tail = lc
         pre = (n_clamp, npad, k, scap, cmp_, 1, 0, 0, 0, 0, 0)
         fn(lg[r0:r1], row_starts[r0:r1], idx[r0:r1], ws, *pre, kv_lens[r0:r1], *tail)
@@ -1109,47 +1280,71 @@ def warmup_prefill(
         b <<= 1
     if not buckets:
         buckets = [hi]
-    keys = {}  # cache_key -> (tier, bucket) representative for the launch
+    # (rows, max window hint) representatives: every bucket at both edges (the
+    # slab tier and the register rung both depend on the hint inside a bucket:
+    # tier-0 -> tier-1 promotion, VPT 1/2/4 capacity steps at 2045/4093/8189)
+    reps = {}
     for rows in num_rows_list:
         for bk in buckets:
-            # the tier depends on the hint inside the bucket (tier-0 -> tier-1
-            # promotion), so evaluate it at both edges of every bucket
-            for n_h in (max(bk // 2 + 1, k + 1), bk):
-                tier = _prefill_tier(int(rows), n_h, k)
-                keys.setdefault(_prefill_cache_key(tier, k, bk), (tier, bk))
+            hints = {max(bk // 2 + 1, k + 1), bk}
+            for cap in (2048, 4096, 8192):  # register capacity classes (bound <= cap)
+                if bk // 2 < cap <= bk:
+                    hints.add(cap)
+                    hints.add(min(cap + 1, bk))
+            for n_h in sorted(hints):
+                plan = _prefill_reg_route(int(rows), k, n_h)
+                if plan is not None:
+                    key = _prefill_cache_key(
+                        "reg",
+                        (tuple(plan["tpl"]), plan["rt"]["CMP"], plan["rt"]["QC"], plan["smem"]),
+                        k,
+                        0,
+                    )
+                else:
+                    key = _prefill_cache_key("main", _prefill_tier(int(rows), n_h, k), k, bk)
+                reps.setdefault(key, (int(rows), n_h))
     done_key = (dev, k, max_cols, tuple(sorted(int(r) for r in num_rows_list)), row_stride)
     with _PREFILL_WARMUP_LOCK:
         if done_key in _PREFILL_WARMUP_DONE:
             return
-    for tier, bk in keys.values():
-        rows = _PREFILL_TIER_ROWS[tier]
-        stride = row_stride if row_stride is not None else ((bk + 256 + 255) // 256 * 256)
-        if stride < bk or stride % 4:
-            stride = (max(stride, bk) + 256 + 255) // 256 * 256
+    for rows, n_h in reps.values():
+        rows = _PREFILL_TIER_ROWS[_prefill_tier(rows, n_h, k)] if rows > 297 else rows
+        n_w = (n_h + 3) // 4 * 4  # launch width: a 1-row view keys npad on shape[1]
+        stride = row_stride if row_stride is not None else ((n_w + 256 + 255) // 256 * 256)
+        if stride < n_w or stride % 4:
+            stride = (max(stride, n_w) + 256 + 255) // 256 * 256
         logits = torch.zeros((rows, stride), dtype=torch.float32, device=dev)
         ks = torch.zeros((rows,), dtype=_I32, device=dev)
-        lens = torch.full((rows,), bk, dtype=_I32, device=dev)
+        lens = torch.full((rows,), n_h, dtype=_I32, device=dev)
         out = torch.empty((rows, k), dtype=_I32, device=dev)
-        run_varlen(logits[:, :bk], None, lens, out, top_k=k, row_starts=ks, max_seq_len=bk)
+        # max_seq_len = the exact hint the serving call will use (key parity)
+        run_varlen(logits[:, :n_w], None, lens, out, top_k=k, row_starts=ks, max_seq_len=n_h)
         del logits, ks, lens, out
     torch.cuda.synchronize()
     with _PREFILL_WARMUP_LOCK:
         _PREFILL_WARMUP_DONE.add(done_key)
 
 
-def prefill_ready(num_rows: int, k: int, n_env: int) -> bool:
+def prefill_ready(num_rows: int, k: int, n_env: int, width: int | None = None) -> bool:
     """True iff a windowed ``run_varlen`` call with this geometry would launch
-    without compiling (the same (tier, k, envelope bucket) keys it looks up),
-    so a caller can route around the engine under CUDA graph capture.
-    ``n_env`` is the hint the call will use: its ``max_seq_len`` if given,
-    else the logits width."""
+    without compiling (the same launcher keys it looks up), so a caller can
+    route around the engine under CUDA graph capture. Unhinted call: pass the
+    logits width as ``n_env`` and leave ``width`` None. Hinted call: ``n_env``
+    is the ``max_seq_len`` bound and ``width`` the logits width."""
     if num_rows == 0:
         return True
-    n_env = max(int(n_env), 1)
+    hinted = width is not None
+    width = int(n_env) if width is None else int(width)
+    n_env = min(max(int(n_env), 1), width)
     n_bucket = _prefill_bucket(n_env)
     for r0 in range(0, num_rows, _PREFILL_ROW_SLAB):
-        tier = _prefill_tier(min(r0 + _PREFILL_ROW_SLAB, num_rows) - r0, n_env, k)
-        if _prefill_cache_key(tier, k, n_bucket) not in _PREFILL_CACHE:
+        rows = min(r0 + _PREFILL_ROW_SLAB, num_rows) - r0
+        if hinted:
+            if _prefill_get(rows, k, n_env, n_bucket, compile_ok=False) is None:
+                return False
+            continue
+        tier = _prefill_tier(rows, n_env, k)  # unhinted: slab only
+        if _prefill_cache_key("main", tier, k, n_bucket) not in _PREFILL_CACHE:
             return False
     return True
 
@@ -1934,7 +2129,11 @@ def run_varlen(
                     f"got {tuple(values.shape)}"
                 )
         cshift = 0 if cr == 1 else 2
-        if max_seq_len is not None:
+        if windowed and max_seq_len is None:
+            # unhinted windowed call: the envelope is the logits width (no
+            # host read of device data); the rows are routed per row below
+            n_env = npad
+        elif max_seq_len is not None:
             n_env = int(max_seq_len) >> cshift
         else:
             if _is_capturing():
@@ -1965,7 +2164,16 @@ def run_varlen(
             # max_seq_len, if given, is the max window length used only to
             # pick the plan tier / envelope bucket
             _launch_prefill(
-                lg, row_starts, kv_lens, idx, ws, k, min(logits.shape[1], npad), n_env, npad
+                lg,
+                row_starts,
+                kv_lens,
+                idx,
+                ws,
+                k,
+                min(logits.shape[1], npad),
+                n_env,
+                npad,
+                hinted=max_seq_len is not None,
             )
             if vals is not None:
                 # window-local indices -> absolute columns for the gather
