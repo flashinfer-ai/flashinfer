@@ -1383,6 +1383,7 @@ def _batched_gemm_kernel_bf16_body(
     sfa_gmem_tensor: cute.Tensor,  # SF GMEM for LDGSTS SF (dummy when not LDGSTS)
     sfb_gmem_tensor: cute.Tensor,  # SF GMEM for LDGSTS SF (dummy when not LDGSTS)
     problem_m: cutlass.Int32,
+    c_row_stride: cutlass.Int32,
     problem_n: cutlass.Int32,
     problem_k: cutlass.Int32,
     num_tokens: cutlass.Int32,
@@ -1781,6 +1782,7 @@ def _batched_gemm_kernel_bf16_body(
         mn_limit_view=mn_limit_view,
         total_num_padded_tokens_tensor=total_num_padded_tokens_tensor,
         problem_m=problem_m,
+        c_row_stride=c_row_stride,
         problem_n=problem_n,
         name="GmemC",
     )
@@ -2406,6 +2408,7 @@ def batched_gemm_kernel_bf16(
     sfa_gmem_tensor: cute.Tensor,
     sfb_gmem_tensor: cute.Tensor,
     problem_m: cutlass.Int32,
+    c_row_stride: cutlass.Int32,
     problem_n: cutlass.Int32,
     problem_k: cutlass.Int32,
     num_tokens: cutlass.Int32,
@@ -2455,6 +2458,7 @@ def batched_gemm_kernel_bf16(
                 sfa_gmem_tensor,
                 sfb_gmem_tensor,
                 problem_m,
+                c_row_stride,
                 problem_n,
                 problem_k,
                 num_tokens,
@@ -2489,6 +2493,7 @@ def batched_gemm_kernel_bf16(
             sfa_gmem_tensor,
             sfb_gmem_tensor,
             problem_m,
+            c_row_stride,
             problem_n,
             problem_k,
             num_tokens,
@@ -2528,6 +2533,7 @@ def gemm(
     gemm1_clamp_limit_raw_ptr,
     problem_size: tuple,
     early_exit_max_token_ctas: cutlass.Int32,
+    c_row_stride: cutlass.Int32,
     cfg: cutlass.Constexpr[BatchedGemmConfig],
     stream,
 ):
@@ -3016,9 +3022,9 @@ def gemm(
                     ),
                     stride=(
                         1,
-                        cute.assume(output_m_for_c, 32),
-                        TMA_XLARGE_N - output_m_for_c,
-                        cute.assume(output_m_for_c, 32),
+                        cute.assume(c_row_stride, 32),
+                        TMA_XLARGE_N - c_row_stride,
+                        cute.assume(c_row_stride, 32),
                     ),
                 )
             else:
@@ -3031,15 +3037,16 @@ def gemm(
                     ),
                     stride=(
                         1,
-                        cute.assume(output_m_for_c, 32),
-                        TMA_XLARGE_N - output_m_for_c,
-                        cute.assume(output_m_for_c, 32),
+                        cute.assume(c_row_stride, 32),
+                        TMA_XLARGE_N - c_row_stride,
+                        cute.assume(c_row_stride, 32),
                     ),
                 )
         else:
+            # Extent is this launch's width; stride is the shared buffer pitch.
             c_layout = cute.make_layout(
                 (cute.assume(output_m_for_c, 32), cute.assume(n, 16)),
-                stride=(1, cute.assume(output_m_for_c, 32)),
+                stride=(1, cute.assume(c_row_stride, 32)),
             )
     else:
         # Non-swapAB: C is (M, N) row-major.
@@ -3311,6 +3318,7 @@ def gemm(
         sfa_gmem_tensor,
         sfb_gmem_tensor,
         m,
+        c_row_stride,
         n,
         k,
         num_tokens,

@@ -2047,6 +2047,7 @@ def build_fp8_per_tensor_launch_io(
     route_map: torch.Tensor,
     num_non_exiting_ctas: torch.Tensor,
     total_num_padded_tokens: torch.Tensor,
+    c_row_stride: int | None = None,
     routed_token_capacity: int | None = None,
     activation_type: int,
     num_experts: int,
@@ -2116,6 +2117,10 @@ def build_fp8_per_tensor_launch_io(
         ("num_non_exiting_ctas", num_non_exiting_ctas),
         ("total_num_padded_tokens", total_num_padded_tokens),
     ):
+        # A strided output is a column slice, non-contiguous by construction;
+        # its layout is checked against the declared stride below instead.
+        if c_row_stride and name in ("gemm1_output", "gemm2_output"):
+            continue
         if not tensor.is_contiguous():
             raise ValueError(f"{name} must be contiguous")
     if hidden_states.dtype != torch.float8_e4m3fn:
@@ -2184,6 +2189,38 @@ def build_fp8_per_tensor_launch_io(
         num_experts,
     )
     logical_output_m = m_val // 2 if cfg.has_gated_epilogue else m_val
+    # Row pitch of C; a caller sharing one buffer passes that buffer's width.
+    c_row_stride_val = int(c_row_stride) if c_row_stride else logical_output_m
+    if c_row_stride_val < logical_output_m:
+        raise ValueError(
+            f"{fc} c_row_stride={c_row_stride_val} is narrower than this "
+            f"launch's output width {logical_output_m}"
+        )
+    if c_row_stride_val % 32:
+        raise ValueError(
+            f"{fc} c_row_stride={c_row_stride_val} must be a multiple of 32 "
+            "(the C layout applies cute.assume(stride, 32))"
+        )
+    if c_row_stride and output_buf.dim() == 2:
+        if output_buf.stride(1) != 1 or output_buf.stride(0) != c_row_stride_val:
+            raise ValueError(
+                f"{fc} output layout {tuple(output_buf.stride())} does not match "
+                f"c_row_stride={c_row_stride_val}; expected row stride "
+                f"{c_row_stride_val} with unit column stride"
+            )
+    # A strided output is a column slice, so its own numel covers only its
+    # columns; the bound that matters is from its base to the end of storage.
+    _width = int(output_buf.shape[1]) if output_buf.dim() == 2 else logical_output_m
+    _need = (n_val - 1) * c_row_stride_val + _width
+    _avail = (
+        output_buf.untyped_storage().nbytes() // output_buf.element_size()
+        - output_buf.storage_offset()
+    )
+    if _avail < _need:
+        raise ValueError(
+            f"{fc} output buffer too small for row stride {c_row_stride_val}: "
+            f"need {_need} elements from its base, got {_avail}"
+        )
     data_dtype = cutlass.Float8E4M3FN
     dummy_ptr = output_buf.data_ptr()
     bias_torch = _select_bias(
@@ -2352,6 +2389,7 @@ def build_fp8_per_tensor_launch_io(
         "sfa_dp": sfa_dp,
         "sfb_dp": sfb_dp,
         "c0_dp": c0_dp,
+        "c_row_stride": c_row_stride_val,
         "sf_c_dp": sf_c_dp,
         "tile_idx_dp": tile_idx_dp,
         "route_map_dp": route_map_dp,
