@@ -2145,16 +2145,32 @@ __device__ __forceinline__ void compute_sfm_v(
         scale_lo = __floats2bfloat162_rn(v_scale[0], v_scale[1]);
         scale_hi = __floats2bfloat162_rn(v_scale[8], v_scale[9]);
       }
+      // The MMA below reads s_frag_f16 (the downcast copy) for a float QK accumulator,
+      // but the raw s_frag (a half) for the fp16 QK-reduction accumulator. s_frag_f16 is
+      // only initialized in the float case, so scale whichever buffer the MMA actually
+      // reads; scaling s_frag_f16 in the half case would touch an uninitialized buffer
+      // and drop the scale.
 #pragma unroll
       for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
-        *(packed2_*)&s_frag_f16[mma_q][mma_kv][0] =
-            __hmul2(*(packed2_*)&s_frag_f16[mma_q][mma_kv][0], scale_lo);
-        *(packed2_*)&s_frag_f16[mma_q][mma_kv][2] =
-            __hmul2(*(packed2_*)&s_frag_f16[mma_q][mma_kv][2], scale_lo);
-        *(packed2_*)&s_frag_f16[mma_q][mma_kv][4] =
-            __hmul2(*(packed2_*)&s_frag_f16[mma_q][mma_kv][4], scale_hi);
-        *(packed2_*)&s_frag_f16[mma_q][mma_kv][6] =
-            __hmul2(*(packed2_*)&s_frag_f16[mma_q][mma_kv][6], scale_hi);
+        if constexpr (std::is_same_v<typename KTraits::DTypeQKAccum, float>) {
+          *(packed2_*)&s_frag_f16[mma_q][mma_kv][0] =
+              __hmul2(*(packed2_*)&s_frag_f16[mma_q][mma_kv][0], scale_lo);
+          *(packed2_*)&s_frag_f16[mma_q][mma_kv][2] =
+              __hmul2(*(packed2_*)&s_frag_f16[mma_q][mma_kv][2], scale_lo);
+          *(packed2_*)&s_frag_f16[mma_q][mma_kv][4] =
+              __hmul2(*(packed2_*)&s_frag_f16[mma_q][mma_kv][4], scale_hi);
+          *(packed2_*)&s_frag_f16[mma_q][mma_kv][6] =
+              __hmul2(*(packed2_*)&s_frag_f16[mma_q][mma_kv][6], scale_hi);
+        } else {
+          *(packed2_*)&s_frag[mma_q][mma_kv][0] =
+              __hmul2(*(packed2_*)&s_frag[mma_q][mma_kv][0], scale_lo);
+          *(packed2_*)&s_frag[mma_q][mma_kv][2] =
+              __hmul2(*(packed2_*)&s_frag[mma_q][mma_kv][2], scale_lo);
+          *(packed2_*)&s_frag[mma_q][mma_kv][4] =
+              __hmul2(*(packed2_*)&s_frag[mma_q][mma_kv][4], scale_hi);
+          *(packed2_*)&s_frag[mma_q][mma_kv][6] =
+              __hmul2(*(packed2_*)&s_frag[mma_q][mma_kv][6], scale_hi);
+        }
       }
     }
 #pragma unroll
