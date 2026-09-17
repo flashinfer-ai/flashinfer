@@ -23,6 +23,7 @@ except ImportError:  # pragma: no cover - exercised without nvidia-cutlass-dsl
 
 
 HEAD_DIM = 64
+_COMPUTE_CAPABILITIES = ((10, 0), (10, 3))
 LOG2E = 1.4426950408889634
 INV_HEAD_DIM = 1.0 / HEAD_DIM
 
@@ -368,8 +369,8 @@ def rmsnorm_sigmoid_gate(
         raise ValueError("head rows must be contiguous")
     if x.data_ptr() % 16 or gate.data_ptr() % 16:
         raise ValueError("x and gate must be 16-byte aligned")
-    if torch.cuda.get_device_capability(x.device) != (10, 3):
-        raise ValueError("rmsnorm_sigmoid_gate requires an SM103 GPU")
+    if torch.cuda.get_device_capability(x.device) not in _COMPUTE_CAPABILITIES:
+        raise ValueError("rmsnorm_sigmoid_gate requires an SM100 or SM103 GPU")
     if x.numel() == 0:
         return
 
@@ -395,7 +396,7 @@ def supports_rmsnorm_sigmoid_gate(
     head_dim: int,
     device: torch.device | str | None = None,
 ) -> bool:
-    """Whether the SM103 fused kernel supports this dtype and head size."""
+    """Whether the SM100/SM103 fused kernel supports this dtype and head size."""
     if not HAS_CUTEDSL or dtype != torch.bfloat16 or head_dim != HEAD_DIM:
         return False
     if device is None:
@@ -407,5 +408,5 @@ def supports_rmsnorm_sigmoid_gate(
     return (
         resolved_device.type == "cuda"
         and torch.cuda.is_available()
-        and torch.cuda.get_device_capability(resolved_device) == (10, 3)
+        and torch.cuda.get_device_capability(resolved_device) in _COMPUTE_CAPABILITIES
     )

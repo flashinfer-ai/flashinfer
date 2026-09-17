@@ -551,7 +551,7 @@ def rmsnorm_sigmoid_gate(
 
     The last dimension is normalized independently, multiplied by
     ``sigmoid(gate)``, and written back to ``input``. The optimized kernel
-    supports contiguous BF16 head rows of width 64 on SM103 GPUs.
+    supports contiguous BF16 head rows of width 64 on SM100 and SM103 GPUs.
     """
     if input.ndim not in (2, 3) or gate.shape != input.shape:
         raise ValueError("input and gate must have matching 2-D or 3-D shapes")
