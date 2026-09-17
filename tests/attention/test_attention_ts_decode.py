@@ -4112,8 +4112,10 @@ def test_attention_ts_decode_run_validates_control_and_q_mode(
         wrapper.run(*args, qo_indptr=object())
 
 
+@pytest.mark.parametrize("validate", (True, False))
 def test_attention_ts_decode_failed_replan_preserves_published_state(
     monkeypatch: pytest.MonkeyPatch,
+    validate: bool,
 ) -> None:
     """A failed compile cannot tear down the previous complete revision."""
 
@@ -4131,10 +4133,21 @@ def test_attention_ts_decode_failed_replan_preserves_published_state(
     )()
     wrapper._plan_state = previous_state
     fake_spec = type("_DecodeLaunchSpec", (), {"config": object()})()
+    device_calls = []
+
+    def resolve_device(device):
+        device_calls.append("resolve")
+        return torch.device("cuda:0"), 0
+
     monkeypatch.setattr(
         decode_module,
         "_resolve_cuda_device",
-        lambda _device: (torch.device("cuda:0"), 0),
+        resolve_device,
+    )
+    monkeypatch.setattr(
+        decode_module,
+        "_validate_runtime_device",
+        lambda _device: device_calls.append("validate"),
     )
     monkeypatch.setattr(
         decode_module,
@@ -4153,7 +4166,8 @@ def test_attention_ts_decode_failed_replan_preserves_published_state(
     )
 
     with pytest.raises(RuntimeError, match="synthetic compile failure"):
-        wrapper.plan(torch.device("cuda:0"), 1, 8, 1, 64, 16, 128)
+        wrapper.plan(torch.device("cuda:0"), 1, 8, 1, 64, 16, 128, validate=validate)
+    assert device_calls == (["resolve", "validate"] if validate else ["resolve"])
     assert wrapper._plan_state is previous_state
     assert wrapper._plan_state.planned_seq_lens_device is previous_seq_lens
 
@@ -4630,7 +4644,46 @@ def test_attention_ts_decode_rejects_per_request_causal_q_longer_than_kv(
         )
 
 
-def test_attention_ts_decode_shared_arch_guard_rejects_unsupported_gpu(monkeypatch):
+@pytest.mark.parametrize(
+    "device,expected",
+    [
+        (None, "cuda:3"),
+        (2, "cuda:2"),
+        ("cuda", "cuda:3"),
+        ("cuda:1", "cuda:1"),
+        (torch.device("cuda:0"), "cuda:0"),
+        ("cpu", "cpu:0"),
+    ],
+)
+def test_attention_ts_decode_device_resolution_does_not_validate(
+    monkeypatch, device, expected
+):
+    from flashinfer.attention.prims_ts import decode as decode_module
+
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 3)
+
+    def unexpected_validation(*_args, **_kwargs):
+        pytest.fail("device resolution must not check runtime CUDA support")
+
+    monkeypatch.setattr(
+        decode_module, "_validate_runtime_device", unexpected_validation
+    )
+    monkeypatch.setattr(torch.cuda, "get_device_capability", unexpected_validation)
+    resolved, device_index = decode_module._resolve_cuda_device(device)
+    assert resolved == torch.device(expected)
+    assert device_index == resolved.index
+
+
+@pytest.mark.parametrize(
+    "device,error,message",
+    [
+        ("cuda:0", NotImplementedError, r"requires an SM100a/B200.*GPU.*\(9, 0\)"),
+        ("cpu", ValueError, "must be CUDA tensors"),
+    ],
+)
+def test_attention_ts_decode_shared_arch_guard_rejects_unsupported_gpu(
+    monkeypatch, device, error, message
+):
     """Both public decode workspace APIs enforce the shared architecture guard."""
 
     from contextlib import nullcontext
@@ -4649,7 +4702,7 @@ def test_attention_ts_decode_shared_arch_guard_rejects_unsupported_gpu(monkeypat
             head_dim=128,
             page_size=32,
             max_seq_len=128,
-            device="cuda:0",
+            device=device,
         ),
         lambda: get_prims_ts_batch_mla_decode_workspace_size(
             batch_size=1,
@@ -4658,14 +4711,11 @@ def test_attention_ts_decode_shared_arch_guard_rejects_unsupported_gpu(monkeypat
             qk_rope_head_dim=64,
             page_size=32,
             max_seq_len=128,
-            device="cuda:0",
+            device=device,
         ),
     )
     for query in workspace_queries:
-        with pytest.raises(
-            NotImplementedError,
-            match=r"requires an SM100a/B200.*GPU.*\(9, 0\)",
-        ):
+        with pytest.raises(error, match=message):
             query()
 
 

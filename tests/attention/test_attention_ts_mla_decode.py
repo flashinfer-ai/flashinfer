@@ -1237,12 +1237,18 @@ def test_attention_ts_mla_wrapper_uses_compile_oriented_contract():
     assert run_parameters["validate"].default is True
 
 
+@pytest.mark.parametrize("validate", (True, False))
 def test_attention_ts_mla_plan_publishes_frozen_state_after_workspace_binding(
     monkeypatch,
+    validate,
 ):
     """Keep plan publication atomic and compilation after workspace checks."""
 
     events = []
+    device_calls = []
+    expected_events = (
+        ["spec"] + (["validate_workspace"] if validate else []) + ["bind_workspace"]
+    )
     policy = (("source", "auto"), ("split_kv", 1))
     spec = mla_decode_module._MLADecodeLaunchSpec(
         kernel=object(),
@@ -1254,6 +1260,7 @@ def test_attention_ts_mla_plan_publishes_frozen_state_after_workspace_binding(
 
     def resolve_device(device):
         assert device == "cuda:0"
+        device_calls.append("resolve")
         return torch.device("cpu"), 0
 
     def resolve_spec(*args):
@@ -1270,11 +1277,16 @@ def test_attention_ts_mla_plan_publishes_frozen_state_after_workspace_binding(
         return original_bind(workspace_buffer, layout)
 
     def compile_plan(*args):
-        assert events == ["spec", "validate_workspace", "bind_workspace"]
+        assert events == expected_events
         events.append("compile")
         return lambda *launch_args: None
 
     monkeypatch.setattr(mla_decode_module, "_resolve_cuda_device", resolve_device)
+    monkeypatch.setattr(
+        mla_decode_module,
+        "_validate_runtime_device",
+        lambda _device: device_calls.append("validate"),
+    )
     monkeypatch.setattr(
         mla_decode_module, "_resolve_mla_decode_launch_spec", resolve_spec
     )
@@ -1305,9 +1317,11 @@ def test_attention_ts_mla_plan_publishes_frozen_state_after_workspace_binding(
         kv_data_type=torch.bfloat16,
         o_data_type=torch.bfloat16,
         workspace_buffer=workspace,
+        validate=validate,
     )
 
-    assert events == ["spec", "validate_workspace", "bind_workspace", "compile"]
+    assert events == [*expected_events, "compile"]
+    assert device_calls == (["resolve", "validate"] if validate else ["resolve"])
     assert tuple(vars(wrapper)) == ("_plan_state",)
     state = wrapper._plan_state
     assert state is not None
@@ -1334,6 +1348,7 @@ def test_attention_ts_mla_plan_publishes_frozen_state_after_workspace_binding(
             q_data_type=torch.bfloat16,
             kv_data_type=torch.bfloat16,
             o_data_type=torch.bfloat16,
+            validate=validate,
             workspace_buffer=workspace,
         )
     assert wrapper._plan_state is state
