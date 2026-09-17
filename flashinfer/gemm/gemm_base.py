@@ -842,7 +842,7 @@ def _cutlass_bmm_bf16_requirement(
     return True
 
 
-@supported_compute_capability([80, 86, 87, 89, 90, 100, 103, 110, 120, 121])
+@supported_compute_capability([80, 86, 87, 89, 90, 100, 103, 107, 110, 120, 121])
 def _cudnn_bmm_bf16_requirement(
     A: torch.Tensor,
     B: torch.Tensor,
