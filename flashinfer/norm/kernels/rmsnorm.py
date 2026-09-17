@@ -419,6 +419,11 @@ class RMSNormKernel:
 # =============================================================================
 
 
+# Architectures where the norm kernels are bound by bytes in flight per SM;
+# the tiling adjustments below apply only to these.
+_LATENCY_BOUND_SMS = (100, 103, 107)
+
+
 class QKRMSNormKernel:
     """
     QK RMSNorm Kernel using CuTe-DSL for 3D tensors [batch, heads, head_dim].
@@ -437,12 +442,10 @@ class QKRMSNormKernel:
         dtype: cutlass.Numeric,
         head_dim: int,
         weight_bias: float = 0.0,
-        sm_version: int | None = None,
     ):
         self.dtype = dtype
         self.head_dim = head_dim
         self.weight_bias = weight_bias
-        self.sm_version = sm_version if sm_version is not None else get_sm_version()
 
         elem_bytes = dtype.width // 8
         max_vec_size = COPY_BITS // 8 // elem_bytes
@@ -451,7 +454,7 @@ class QKRMSNormKernel:
         self.vec_size = min(h_align, max_vec_size)
         self.copy_bits = self.vec_size * dtype.width
 
-        self.threads_per_row = self._compute_threads_per_row(head_dim, self.sm_version)
+        self.threads_per_row = self._compute_threads_per_row(head_dim, get_sm_version())
         self.num_threads = RMSNormKernel._compute_num_threads(head_dim)
         self.rows_per_block = self.num_threads // self.threads_per_row
         self.warps_per_row = max(self.threads_per_row // 32, 1)
@@ -474,18 +477,12 @@ class QKRMSNormKernel:
     def _compute_threads_per_row(head_dim: int, sm_version: int) -> int:
         """Threads cooperating on one (batch, head) row.
 
-        The shared RMSNorm table gives every thread a single 16-byte vector for
-        head_dim <= 256 (8 threads at 64, 16 at 128, 32 at 256). On SM107 the
-        kernel is then latency-bound: with at most 2048 resident threads per SM
-        that is only 32 KB in flight per SM, and the measured bandwidth at large
-        M is ~5 TB/s against a ~9 TB/s copy. Using fewer threads per row so each
-        thread owns ~32 elements (4 vectors) restores 8.6-8.7 TB/s (1.35x at
-        head_dim 64, 1.7x at 128 and 256) with no loss at small M. Adding threads
-        per CTA instead was measured to be monotonically worse. Other
-        architectures keep the shared table untouched.
+        The shared RMSNorm table leaves each thread with a single 16-byte vector
+        for small head_dim, which is too little in flight per SM on Blackwell and
+        Rubin. There, use fewer threads per row so each thread owns ~32 elements.
         """
         default = RMSNormKernel._compute_threads_per_row(head_dim)
-        if sm_version != 107:
+        if sm_version not in _LATENCY_BOUND_SMS:
             return default
         target = max(head_dim // 32, 1)
         target = 1 << (target.bit_length() - 1)  # power of two for warp shuffles
@@ -738,11 +735,13 @@ class RMSNormQuantKernel:
 
         self.threads_per_row = RMSNormKernel._compute_threads_per_row(self.H_per_cta)
         self.num_threads = RMSNormKernel._compute_num_threads(self.H_per_cta)
-        # 256 threads (2 rows per CTA) for H > 8192 doubles the smem tile and
-        # halves resident CTAs. On SM107 that costs bandwidth: 128 threads
-        # measured 1.18-1.47x faster at H=16384 and 1.03-1.04x at H=12288, with
-        # bit-identical output. Other architectures keep the 256-thread rule.
-        if self.H_per_cta > 8192 and self.num_threads < 256 and self.sm_version != 107:
+        # Two rows per CTA for H > 8192 doubles the smem tile and halves resident
+        # CTAs, which costs bandwidth on Blackwell and Rubin.
+        if (
+            self.H_per_cta > 8192
+            and self.num_threads < 256
+            and self.sm_version not in _LATENCY_BOUND_SMS
+        ):
             self.num_threads = 256
         self.rows_per_block = self.num_threads // self.threads_per_row
         self.warps_per_row = max(self.threads_per_row // 32, 1)
@@ -1200,15 +1199,11 @@ def _get_compiled_rmsnorm_kernel(
 
 @functools.cache
 def _get_compiled_qk_rmsnorm_kernel(
-    dtype_str: str,
-    head_dim: int,
-    weight_bias: float,
-    enable_pdl: bool,
-    sm_version: int,
+    dtype_str: str, head_dim: int, weight_bias: float, enable_pdl: bool
 ):
     """Get a compiled QKRMSNorm kernel for 3D tensors with arbitrary stride."""
     dtype = get_cutlass_dtype(dtype_str)
-    kernel_obj = QKRMSNormKernel(dtype, head_dim, weight_bias, sm_version=sm_version)
+    kernel_obj = QKRMSNormKernel(dtype, head_dim, weight_bias)
 
     # 64-bit B and N so the flattened row index B*N is not truncated.
     sym_b = cute.sym_int(64)
@@ -1386,7 +1381,7 @@ def qk_rmsnorm_cute(
 
     dtype_str = _torch_dtype_to_str(input.dtype)
     kernel = _get_compiled_qk_rmsnorm_kernel(
-        dtype_str, head_dim, weight_bias, enable_pdl, get_sm_version(input.device)
+        dtype_str, head_dim, weight_bias, enable_pdl
     )
 
     kernel(input, weight, output, batch_size, num_heads, eps)
