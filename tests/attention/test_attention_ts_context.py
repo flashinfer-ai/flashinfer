@@ -898,6 +898,7 @@ def test_attention_ts_context_contiguous_wrapper_exposes_compile_oriented_contra
         "v_dtype",
         "out_dtype",
         "packed_query",
+        "enable_softmax_stats",
         "mask_type",
         "window_left",
         "softmax_scale",
@@ -925,6 +926,7 @@ def test_attention_ts_context_contiguous_wrapper_exposes_compile_oriented_contra
         "max_q_len",
         "max_kv_len",
         "out",
+        "softmax_stats",
         "lse",
         "return_lse",
         "attention_sinks",
@@ -935,6 +937,9 @@ def test_attention_ts_context_contiguous_wrapper_exposes_compile_oriented_contra
         "validate",
     )
     assert plan_parameters["head_dim_vo"].default is None
+    assert plan_parameters["enable_softmax_stats"].default is False
+    assert run_parameters["softmax_stats"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert run_parameters["softmax_stats"].default is None
     assert plan_parameters["sage"].default is None
     assert run_parameters["sage"].default is None
     assert run_parameters["qo_indptr"].default is None
@@ -1109,6 +1114,106 @@ def test_attention_ts_context_paged_one_shot_forwards_fixed_table_to_wrapper(
     assert run_kwargs["return_lse"] is False
     assert run_kwargs["attention_sinks"] is None
     assert run_kwargs["out"] is out
+
+
+@pytest.mark.parametrize("enable_softmax_stats", [False, True])
+@pytest.mark.parametrize("lse_mode", ["none", "base2"])
+def test_attention_ts_context_stats_reuses_dynamic_requests(
+    monkeypatch, enable_softmax_stats, lse_mode
+):
+    compile_calls, launches = [], []
+
+    def fake_compile(spec):
+        compile_calls.append(spec)
+        return lambda *args: launches.append(args), ()
+
+    monkeypatch.setattr(
+        context_module, "_resolve_cuda_device", lambda _: (torch.device("cpu"), 0)
+    )
+    monkeypatch.setattr(
+        context_module, "_resolve_context_scheduler", lambda _: "static_persistent"
+    )
+    monkeypatch.setattr(context_module, "_get_compiled_context", fake_compile)
+    monkeypatch.setattr(
+        context_module, "_two_cta_umma_geometry_eligible", lambda _: False
+    )
+    wrapper = BatchPrefillTSWrapper()
+    wrapper.plan(
+        device="cpu",
+        batch_size=2,
+        max_q_len=8,
+        max_kv_len=10,
+        num_qo_heads=4,
+        num_kv_heads=2,
+        head_dim=128,
+        q_dtype=torch.float16,
+        k_dtype=torch.float16,
+        packed_query=True,
+        enable_softmax_stats=enable_softmax_stats,
+        lse_mode=lse_mode,
+    )
+    for q_lens, k_lens in (((3, 5), (4, 6)), ((6, 1), (0, 9))):
+        q = torch.empty(sum(q_lens), 4, 128, dtype=torch.float16)
+        k = torch.empty(sum(k_lens), 2, 128, dtype=torch.float16)
+        v = torch.empty_like(k)
+        qo = torch.tensor(_cumulative(q_lens), dtype=torch.int32)
+        ko = torch.tensor(_cumulative(k_lens), dtype=torch.int32)
+        out = torch.empty_like(q)
+        stats = torch.empty(*q.shape[:-1], 2) if enable_softmax_stats else None
+        lse = torch.empty(*q.shape[:-1]) if lse_mode != "none" else None
+        with pytest.raises(ValueError, match="softmax_stats must be supplied exactly"):
+            wrapper.run(
+                q,
+                k,
+                v,
+                qo,
+                ko,
+                out=out,
+                softmax_stats=None if enable_softmax_stats else torch.empty(1),
+                validate=False,
+            )
+        returned = wrapper.run(
+            q,
+            k,
+            v,
+            qo,
+            ko,
+            out=out,
+            softmax_stats=stats,
+            lse=lse,
+            return_lse=lse is not None,
+            softmax_scale=0.25,
+            output_scale=0.5,
+            validate=False,
+        )
+        assert (returned[0] if lse is not None else returned) is out
+        assert launches[-1][4] is lse
+        assert launches[-1][8] is qo
+        assert launches[-1][9] is ko
+        assert launches[-1][17] is stats
+        assert launches[-1][6] == pytest.approx(0.25 * math.log2(math.e))
+        assert launches[-1][7] == 0.5
+    assert len(compile_calls) == 1
+    assert compile_calls[0].enable_softmax_stats is enable_softmax_stats
+    assert compile_calls[0].lse_mode == lse_mode
+
+
+@pytest.mark.parametrize("extra", ["vc_config", "sage", "use_attention_sinks"])
+def test_attention_ts_context_stats_rejects_unqualified_recipes(extra):
+    with pytest.raises(NotImplementedError, match="softmax statistics do not support"):
+        BatchPrefillTSWrapper().plan(
+            device="cpu",
+            batch_size=1,
+            max_q_len=8,
+            max_kv_len=8,
+            num_qo_heads=4,
+            num_kv_heads=4,
+            head_dim=128,
+            q_dtype=torch.bfloat16,
+            k_dtype=torch.bfloat16,
+            enable_softmax_stats=True,
+            **{extra: True if extra == "use_attention_sinks" else object()},
+        )
 
 
 def _enable_paged_one_shot_cpu_validation(monkeypatch) -> None:
@@ -1288,7 +1393,9 @@ def test_attention_ts_context_rejects_cta_starts_for_non_variable_mask() -> None
     empty_i32 = torch.empty(1, dtype=torch.int32)
     wrapper = BatchPrefillTSWrapper()
     wrapper._plan_state = context_module._ContextPlanState(
-        geometry=SimpleNamespace(packed_query=False, mask_type="dense", vc=None),
+        geometry=SimpleNamespace(
+            packed_query=False, mask_type="dense", vc=None, enable_softmax_stats=False
+        ),
         scale_softmax_log2=torch.empty(1),
         output_scale=torch.empty(1),
         empty_i32=empty_i32,
@@ -4875,7 +4982,195 @@ def test_attention_ts_context_supplied_out_stream_and_cuda_graph():
     _assert_context_correct(graph_out, second)
 
 
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("head_dim,head_dim_vo", [(128, 128), (192, 128), (256, 256)])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.arch_blackwell
+@_REQUIRES_CONTEXT_GPU
+def test_attention_ts_context_softmax_stats(
+    packed, causal, head_dim, head_dim_vo, dtype
+):
+    """Statistics use the natural-log maximum/denominator chunk-merge contract."""
+    torch.manual_seed(123)
+    q_lens = (65, 257) if packed else (257, 257)
+    k_lens = (129, 513) if packed else (513, 513)
+    heads = 6  # Kimi K3 full attention at TP16.
+    q = torch.randn(sum(q_lens), heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(sum(k_lens), heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(
+        sum(k_lens), heads, head_dim_vo, device="cuda", dtype=torch.bfloat16
+    )
+    q, k, v = (tensor.to(dtype) for tensor in (q, k, v))
+    sm_scale = 0.75 / math.sqrt(head_dim)
+    output_scale = 0.625
+    expected_out, expected_stats = [], []
+    qi = ki = 0
+    for nq, nk in zip(q_lens, k_lens, strict=True):
+        scores = torch.einsum(
+            "qhd,khd->qhk", q[qi : qi + nq].float(), k[ki : ki + nk].float()
+        )
+        scores *= sm_scale
+        if causal:
+            masked = torch.arange(nk, device="cuda")[None, :] > (
+                nk - nq + torch.arange(nq, device="cuda")[:, None]
+            )
+            scores.masked_fill_(masked[:, None, :], -torch.inf)
+        maximum = scores.amax(-1)
+        denominator = (scores - maximum[..., None]).exp().sum(-1)
+        expected_stats.append(torch.stack((maximum, denominator), -1))
+        expected_out.append(
+            torch.einsum("qhk,khd->qhd", scores.softmax(-1), v[ki : ki + nk].float())
+            * output_scale
+        )
+        qi += nq
+        ki += nk
+    expected_out = torch.cat(expected_out)
+    expected_stats = torch.cat(expected_stats)
+    qo = ko = None
+    if packed:
+        qo = torch.tensor(_cumulative(q_lens), device="cuda", dtype=torch.int32)
+        ko = torch.tensor(_cumulative(k_lens), device="cuda", dtype=torch.int32)
+    else:
+        q = q.view(2, q_lens[0], heads, head_dim)
+        k = k.view(2, k_lens[0], heads, head_dim)
+        v = v.view(2, k_lens[0], heads, head_dim_vo)
+    out = torch.empty((*q.shape[:-1], head_dim_vo), device="cuda", dtype=torch.bfloat16)
+    stats = torch.full((*q.shape[:-1], 2), torch.nan, device="cuda")
+    wrapper = BatchPrefillTSWrapper()
+    wrapper.plan(
+        device=q.device,
+        batch_size=2,
+        max_q_len=max(q_lens),
+        max_kv_len=max(k_lens),
+        num_qo_heads=heads,
+        num_kv_heads=heads,
+        head_dim=head_dim,
+        head_dim_vo=head_dim_vo,
+        q_dtype=q.dtype,
+        k_dtype=k.dtype,
+        out_dtype=out.dtype,
+        packed_query=packed,
+        mask_type="causal" if causal else "dense",
+        softmax_scale=sm_scale,
+        output_scale=output_scale,
+        enable_softmax_stats=True,
+    )
+    with pytest.raises(ValueError, match="softmax_stats must be supplied"):
+        wrapper.run(q, k, v, qo, ko, out=out)
+    wrapper.run(q, k, v, qo, ko, out=out, softmax_stats=stats)
+    torch.testing.assert_close(
+        stats.reshape_as(expected_stats), expected_stats, atol=2e-3, rtol=2e-3
+    )
+    torch.testing.assert_close(
+        out.float().reshape_as(expected_out), expected_out, atol=0.01, rtol=0.02
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        wrapper.run(q, k, v, qo, ko, out=out, softmax_stats=stats, validate=False)
+    stats.fill_(torch.nan)
+    graph.replay()
+    torch.testing.assert_close(
+        stats.reshape_as(expected_stats), expected_stats, atol=2e-3, rtol=2e-3
+    )
+
+
+@pytest.mark.parametrize("heads", [6, 96])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.arch_blackwell
+@_REQUIRES_CONTEXT_GPU
+def test_attention_ts_context_mla_chunk_merge(heads, dtype):
+    """Merge a dense cached prefix with a causal suffix, for TP16 and DP heads."""
+    torch.manual_seed(314)
+    q = torch.randn(1, 129, heads, 192, device="cuda").to(dtype)
+    k = torch.randn(1, 385, heads, 192, device="cuda").to(dtype)
+    v = torch.randn(1, 385, heads, 128, device="cuda").to(dtype)
+    pieces = []
+    for start, end, mask in ((0, 128, "dense"), (128, 385, "causal")):
+        wrapper = BatchPrefillTSWrapper()
+        wrapper.plan(
+            device=q.device,
+            batch_size=1,
+            max_q_len=129,
+            max_kv_len=end - start,
+            num_qo_heads=heads,
+            num_kv_heads=heads,
+            head_dim=192,
+            head_dim_vo=128,
+            q_dtype=dtype,
+            k_dtype=dtype,
+            out_dtype=torch.bfloat16,
+            mask_type=mask,
+            enable_softmax_stats=True,
+        )
+        stats = torch.empty((*q.shape[:-1], 2), device="cuda")
+        out = wrapper.run(
+            q,
+            k[0, start:end].unsqueeze(0),
+            v[0, start:end].unsqueeze(0),
+            softmax_stats=stats,
+        )
+        pieces.append((out.float(), stats))
+    (o0, s0), (o1, s1) = pieces
+    maximum = torch.maximum(s0[..., 0], s1[..., 0])
+    w0 = s0[..., 1] * (s0[..., 0] - maximum).exp()
+    w1 = s1[..., 1] * (s1[..., 0] - maximum).exp()
+    merged = (o0 * w0[..., None] + o1 * w1[..., None]) / (w0 + w1)[..., None]
+    scores = torch.einsum("bqhd,bkhd->bqhk", q.float(), k.float()) / math.sqrt(192)
+    mask = torch.arange(385, device="cuda")[None, :] > (
+        256 + torch.arange(129, device="cuda")[:, None]
+    )
+    scores.masked_fill_(mask[None, :, None, :], -torch.inf)
+    expected = torch.einsum("bqhk,bkhd->bqhd", scores.softmax(-1), v.float())
+    # FP8 PV also rounds probabilities, unlike the FP32 reference. Bound both
+    # per-element error and aggregate relative RMS error over all 96 heads.
+    torch.testing.assert_close(
+        merged, expected, atol=0.02 if dtype == torch.float8_e4m3fn else 0.01, rtol=0.02
+    )
+    relative_rms = (merged - expected).square().mean() / expected.square().mean()
+    assert relative_rms.sqrt() < (0.03 if dtype == torch.float8_e4m3fn else 0.01)
+
+
 # Non-absorbed MLA: separate compact Q/K=192, V/O=128.
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.arch_blackwell
+@_REQUIRES_CONTEXT_GPU
+def test_attention_ts_context_empty_mla_chunk(dtype):
+    """A batch member with no cached chunk must not read a neighbor's KV."""
+    torch.manual_seed(123)
+    q = torch.randn(130, 6, 192, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(257, 6, 192, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(257, 6, 128, device="cuda", dtype=torch.bfloat16)
+    q, k, v = (tensor.to(dtype) for tensor in (q, k, v))
+    qo = torch.tensor([0, 65, 130], dtype=torch.int32, device="cuda")
+    ko = torch.tensor([0, 0, 257], dtype=torch.int32, device="cuda")
+    stats = torch.empty(130, 6, 2, device="cuda")
+    wrapper = BatchPrefillTSWrapper()
+    wrapper.plan(
+        device=q.device,
+        batch_size=2,
+        max_q_len=65,
+        max_kv_len=257,
+        num_qo_heads=6,
+        num_kv_heads=6,
+        head_dim=192,
+        head_dim_vo=128,
+        q_dtype=q.dtype,
+        k_dtype=k.dtype,
+        out_dtype=torch.bfloat16,
+        packed_query=True,
+        mask_type="dense",
+        enable_softmax_stats=True,
+    )
+    out = wrapper.run(q, k, v, qo, ko, softmax_stats=stats)
+    torch.testing.assert_close(out[:65], torch.zeros_like(out[:65]), atol=0, rtol=0)
+    assert torch.isneginf(stats[:65, :, 0]).all()
+    assert (stats[:65, :, 1] == 0).all()
+    scores = torch.einsum("qhd,khd->qhk", q[65:].float(), k.float()) / math.sqrt(192)
+    expected = torch.einsum("qhk,khd->qhd", scores.softmax(-1), v.float())
+    torch.testing.assert_close(out[65:].float(), expected, atol=0.01, rtol=0.02)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])

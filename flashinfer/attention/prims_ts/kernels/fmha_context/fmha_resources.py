@@ -6068,6 +6068,7 @@ class TmemStatsResource(MemoryResource):
     scale_softmax_log2: Float32 | None = field(init=False, default=None)
     output_scale: Float32 | cute.Tensor | None = field(init=False, default=None)
     lse_output: cute.Tensor | None = field(init=False, default=None)
+    softmax_stats: cute.Tensor | None = field(init=False, default=None)
     attention_sinks: cute.Tensor | None = field(init=False, default=None)
     cum_seqlen_q: cute.Tensor | None = field(init=False, default=None)
     query_seq_len: Int32 | int = field(init=False, default=0)
@@ -6092,6 +6093,7 @@ class TmemStatsResource(MemoryResource):
         scale_softmax_log2: Float32 | None = None,
         output_scale: Float32 | cute.Tensor | None = None,
         lse_output: cute.Tensor | None = None,
+        softmax_stats: cute.Tensor | None = None,
         attention_sinks: cute.Tensor | None = None,
         cum_seqlen_q: cute.Tensor | None = None,
         query_seq_len: Int32 | int = 0,
@@ -6105,6 +6107,7 @@ class TmemStatsResource(MemoryResource):
         self.scale_softmax_log2 = scale_softmax_log2
         self.output_scale = output_scale
         self.lse_output = lse_output
+        self.softmax_stats = softmax_stats
         self.attention_sinks = attention_sinks
         self.cum_seqlen_q = cum_seqlen_q
         self.query_seq_len = query_seq_len
@@ -6391,7 +6394,11 @@ class TmemStatsResource(MemoryResource):
             vec_old_max = vec_new_max
         if cutlass.const_expr(
             final_stats
-            and (self.lse_output is not None or self.attention_sinks is not None)
+            and (
+                self.lse_output is not None
+                or self.attention_sinks is not None
+                or self.softmax_stats is not None
+            )
         ):
             scale *= self._store_final_lse(
                 stage_info, vec_new_max, vec_row_sum, scale_softmax_log2
@@ -6417,7 +6424,11 @@ class TmemStatsResource(MemoryResource):
         heads = (
             Int32(self.lse_output.shape[-1])
             if self.lse_output is not None
-            else Int32(self.attention_sinks.shape[0])
+            else (
+                Int32(self.attention_sinks.shape[0])
+                if self.attention_sinks is not None
+                else Int32(self.softmax_stats.shape[-2])
+            )
         )
         weight = Float32(1.0)
         start = Int32(0)
@@ -6444,6 +6455,20 @@ class TmemStatsResource(MemoryResource):
                     heads
                 ) + cutlass.Int64(head)
                 (self.lse_output.iterator + offset).store(value)
+            if cutlass.const_expr(self.softmax_stats is not None):
+                maximum = Float32(-Float32.inf)
+                denominator = Float32(0.0)
+                if row_sum > Float32(0.0):
+                    maximum = row_max * scale_softmax_log2 * Float32(0.6931471805599453)
+                    denominator = row_sum / Float32(self.cfg.pv_p_scale)
+                offset = (
+                    cutlass.Int64(flat_query) * cutlass.Int64(heads)
+                    + cutlass.Int64(head)
+                ) * cutlass.Int64(2)
+                (self.softmax_stats.iterator + offset).store(maximum)
+                (self.softmax_stats.iterator + offset + cutlass.Int64(1)).store(
+                    denominator
+                )
         return weight
 
     @consumer_work(returns=(vec_old_max, vec_new_max, vec_row_sum, vec_scale))
@@ -7336,6 +7361,12 @@ class SmemOResource(MemoryResource):
         # in TmemStats.consumer_work.
         correction_scale = vec_scale
         scale = output_scale * correction_scale / vec_row_sum
+        if cutlass.const_expr(self.tmem_vec_resource is not None):
+            if cutlass.const_expr(self.tmem_vec_resource.softmax_stats is not None):
+                # Absent chunks have zero accumulated O. Avoid 0 * inf so
+                # their outputs can be merged using the exported (m, s).
+                if vec_row_sum == Float32(0.0):
+                    scale = Float32(0.0)
 
         num_correction_warps = 4
         tidx, _, _ = cute.arch.thread_idx()
