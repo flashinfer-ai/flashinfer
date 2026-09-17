@@ -420,10 +420,39 @@ def gen_dcp_lse_reduce_module() -> JitSpec:
     extra_ldflags = [f"-L{path}" for path in cuda_library_paths]
     nccl_ldflag = "-lnccl"
 
+    nccl_home_path: pathlib.Path | None = None
     nccl_home = os.environ.get("NCCL_HOME")
     if nccl_home:
         nccl_home_path = pathlib.Path(nccl_home)
-        nccl_lib_dir = nccl_home_path / "lib"
+    else:
+        # PyTorch CUDA wheels install NCCL as a Python package, but
+        # cpp_extension does not add that package's headers or libraries to
+        # extension builds. Discover the wheel location directly so CI and
+        # ordinary pip environments do not need to export NCCL_HOME.
+        try:
+            import nvidia.nccl  # type: ignore[import-not-found]
+
+            nccl_home_path = pathlib.Path(nvidia.nccl.__path__[0])
+        except (ImportError, AttributeError, IndexError):
+            # A system NCCL installation may already be on the compiler and
+            # linker search paths; retain the -lnccl fallback below.
+            pass
+
+    if nccl_home_path is not None:
+        nccl_lib_candidates = [
+            nccl_home_path / "lib",
+            nccl_home_path / "lib64",
+            nccl_home_path,
+        ]
+        nccl_lib_dir = next(
+            (
+                path
+                for path in nccl_lib_candidates
+                if (path / "libnccl.so").exists()
+                or any(path.glob("libnccl.so.*"))
+            ),
+            nccl_home_path / "lib",
+        )
         extra_includes.extend(
             [
                 nccl_home_path / "include",
@@ -431,7 +460,7 @@ def gen_dcp_lse_reduce_module() -> JitSpec:
             ]
         )
         extra_ldflags.insert(0, f"-L{nccl_lib_dir}")
-        # PyTorch's pip wheels include only the versioned NCCL shared object,
+        # PyTorch's pip NCCL wheels include only the versioned shared object,
         # whereas system installations also provide libnccl.so for -lnccl.
         if not (nccl_lib_dir / "libnccl.so").exists():
             versioned_libraries = sorted(nccl_lib_dir.glob("libnccl.so.*"))
