@@ -269,6 +269,52 @@ and other compute capabilities are rejected.
     CakeWarpDecodeConfig
     CakeWarpDecodeRunner
 
+Prims-TS Unified MoE (SM100/SM103)
+----------------------------------
+
+The Prims-TS runner is an explicit unified-MoE backend for SM100 and SM103.
+Select it with ``PrimsTsConfig()``; it is not in the default backend list.
+MVP coverage is NVFP4×NVFP4 and BF16×BF16. Routing and finalize stay on the
+TRT-LLM Gen path; only the GEMM middle stage uses Prims-TS. The backend
+reuses the physical layouts prepared by ``TrtllmFp4Config`` (MajorK) and
+``TrtllmBf16Config`` (BlockMajorK), so one view can be registered for both
+keys::
+
+    backend = PrimsTsConfig()
+    quant = QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4)
+    view = backend.prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        quant=quant,
+        num_local_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        activation=SwiGLU(),
+    )
+
+    weights = MoEWeightPack()
+    weights.prepare_for("prims_ts", view)
+    weights.prepare_for("trtllm_fp4_routed", view)
+
+    x_q, x_scale = backend.prepare_activations(x_bf16, quant=quant)
+    activations = MoEActivationPack(x_q, x_scale, topk_ids, topk_weights)
+    config = MoEConfig(
+        routing=RoutingConfig(num_experts=num_experts, top_k=top_k),
+        quant=quant,
+        experts=ExpertConfig(intermediate_size=intermediate_size),
+        backend=BackendOptions((backend,)),
+    )
+    output = MoELayer(config)(activations, weights)
+
+``intermediate_size`` must be a multiple of 128. Fused shared experts and
+LoRA are out of scope for this MVP.
+
+.. autosummary::
+    :toctree: ../generated
+
+    PrimsTsConfig
+    PrimsTsRunner
+
 Prims-TS Fused MoE
 ------------------
 
