@@ -6,6 +6,8 @@
 
 # ruff: noqa: E501,SIM102
 
+import os
+
 from packaging import version
 
 from .musa_ssd_helpers import fast_exp
@@ -512,6 +514,23 @@ def _chunk_scan_fwd(
     assert dA_cumsum.shape == (nheads, nchunks, chunk_size)
     assert states.shape == (nchunks, nheads, headdim, dstate)
     assert seq_idx.shape == (nchunks,)
+
+    # Keep the dashboard TCE path opt-in until its exact layout is selected by
+    # the higher-level benchmark. The generic Triton implementation remains
+    # the correctness path for all production calls.
+    if (
+        os.environ.get("FLASHINFER_MUSA_SSD_SCAN_TCE_EXPERIMENTAL") == "1"
+        and z is None
+        and initial_states is None
+        and seqlen == 128
+        and nheads == 64
+        and headdim == 64
+        and ngroups == 8
+        and dstate == 128
+    ):
+        from .musa_ssd_scan_native import musa_ssd_chunk_scan_tce_native
+
+        return musa_ssd_chunk_scan_tce_native(states[0], x, dt, dA_cumsum, C, C, D)
 
     grid = lambda META: (
         triton.cdiv(chunk_size, META["BLOCK_SIZE_M"])
