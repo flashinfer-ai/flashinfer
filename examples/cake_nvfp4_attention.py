@@ -29,7 +29,7 @@ def main():
     torch.cuda.synchronize()
     reference = torch.nn.functional.scaled_dot_product_attention(q, k, v)
     torch.testing.assert_close(output, reference, atol=1.0, rtol=0.1)
-    print("Prepared NVFP4 attention output:", tuple(output.shape), output.dtype)
+    print("NVFP4 attention output:", tuple(output.shape), output.dtype)
 
 
 if __name__ == "__main__":

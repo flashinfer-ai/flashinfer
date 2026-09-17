@@ -23,20 +23,20 @@ from flashinfer.prefill import prepare_nvfp4_attention
 @pytest.mark.parametrize(
     "batch,heads,seqlen", [(4, 8, 4096), (1, 8, 32768), (8, 32, 8192)]
 )
-def test_prepared_nvfp4_attention(batch, heads, seqlen):
+def test_nvfp4_attention(batch, heads, seqlen):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
         pytest.skip("SM103 required")
     torch.manual_seed(42)
     q = torch.randn((batch, heads, seqlen, 128), dtype=torch.bfloat16, device="cuda")
     k, v = torch.randn_like(q), torch.randn_like(q)
     out = torch.empty_like(q)
-    prepared = prepare_nvfp4_attention(q, k, v, out, backend="cake")
-    assert prepared() is out
+    attention = prepare_nvfp4_attention(q, k, v, out, backend="cake")
+    assert attention() is out
     expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
     torch.testing.assert_close(out, expected, atol=1.0, rtol=0.1)
     snapshot = out.clone()
     out.zero_()
-    assert prepared() is out
+    assert attention() is out
     torch.testing.assert_close(out, snapshot, atol=0, rtol=0)
 
 

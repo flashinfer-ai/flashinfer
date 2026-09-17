@@ -73,8 +73,12 @@ def _prepack_sf_tiles_split_ksets(scale_u8):
 
 
 @dataclass(frozen=True)
-class PreparedNVFP4Attention:
-    """Prepared packed tensors, host launch metadata and caller-owned output."""
+class NVFP4AttentionRunner:
+    """Run QK, softmax and PV attention on quantized, bound Q/K/V tensors.
+
+    Calling the runner or ``launch()`` writes and returns the caller-owned
+    output. Prepare a new runner when input values or bindings change.
+    """
 
     module_name: str
     main_kwargs: dict
@@ -104,7 +108,7 @@ def bind_attention_payload(module_name, main_kwargs, out):
         for kind, key in record["arg_plan"]
     )
     module = load_cake_nvfp4_attention_module(module_name)
-    return PreparedNVFP4Attention(
+    return NVFP4AttentionRunner(
         module_name, main_kwargs, out, getattr(module, record["ffi_entry"]), arguments
     )
 

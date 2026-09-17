@@ -7511,10 +7511,11 @@ def prepare_nvfp4_attention(q, k, v, out, *, causal=False, backend="cake"):
     """Prepare NVFP4 attention from contiguous BF16 [B,H,S,128] tensors.
 
     The experimental Cake backend requires SM103 and noncausal S divisible
-    by 512. Preparation quantizes Q/K/V to block-scaled E2M1. The returned
-    callable writes the caller-owned BF16 output without CUDA allocation.
-    Invoke preparation again after changing inputs. CUDA Graph ownership
-    remains with the caller.
+    by 512. Preparation quantizes Q/K/V to block-scaled E2M1 and returns an
+    NVFP4AttentionRunner. Calling the runner executes QK, softmax and PV
+    attention and writes the caller-owned BF16 output without CUDA allocation.
+    Prepare a new runner after changing input values or bindings. CUDA Graph
+    ownership remains with the caller.
     """
     if backend != "cake":
         raise ValueError("NVFP4 attention currently supports backend='cake'")
