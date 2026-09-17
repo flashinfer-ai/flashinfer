@@ -187,8 +187,8 @@ def _sm120_fused_linear_supported(m: int, k: int, rank: int) -> bool:
 
     Computed, not looked up. A shape can offer the fused route when a producer
     can launch it -- when its geometry ladder is non-empty -- and the fused
-    producer stages rank 32 only, carrying its own compile-time rank rather
-    than taking one as a build parameter the way the GEMM half does.
+    producer stages the module's compile-time rank. Rank 64 uses the row-major
+    producer families; packed-L2T families remain rank 32 only.
 
     This replaced a 51-entry table whose contents were exactly the (M, K)
     projection of the 71 benchmark shapes, so on everything ever measured the
@@ -202,9 +202,9 @@ def _sm120_fused_linear_supported(m: int, k: int, rank: int) -> bool:
     as a candidate instead of being excluded by a list, and the tuner drops it
     if it loses.
     """
-    if rank != SVDQUANT_LORA_RANK_GRANULARITY:
+    if rank not in (32, 64):
         return False
-    return bool(_sm120_producer_variants(m, k))
+    return bool(_sm120_producer_variants(m, k, rank))
 
 
 def _svdquant_op_name(
@@ -342,7 +342,7 @@ def _sm120_linear_tactics(module, inputs: List[torch.Tensor]) -> List[int]:
     """
     m, n, k, rank = _sm120_linear_inputs_shape(inputs)
     rows = _nvfp4_svdquant_valid_tactics(module, m, n, k, rank, inputs[0].device)
-    variants = range(len(_sm120_producer_variants(m, k)))
+    variants = range(len(_sm120_producer_variants(m, k, rank)))
     return [_sm120_pack_tactic(row, v) for v in variants for row in rows]
 
 
@@ -383,8 +383,10 @@ def _sm120_run_unfused_linear_prefix(
     torch.mm(x, l2t_smoothed, out=down)
 
 
-def _sm120_fused_linear_runner(enable_pdl: bool, device: torch.device):
-    module = get_nvfp4_svdquant_sm120_module()
+def _sm120_fused_linear_runner(
+    enable_pdl: bool, device: torch.device, rank: int = 32
+) -> TunableRunner:
+    module = get_nvfp4_svdquant_sm120_module(rank)
 
     class Sm120FusedLinearRunner(TunableRunner):
         def get_valid_tactics(
@@ -423,13 +425,13 @@ def _sm120_fused_linear_runner(enable_pdl: bool, device: torch.device):
             m_rt, k_rt = x.shape[0], x.shape[1]
             _, producer_variant = _sm120_unpack_tactic(tactic)
             family, tiling, address_policy = _sm120_decode_producer_variant(
-                m_rt, k_rt, producer_variant
+                m_rt, k_rt, producer_variant, rank
             )
             # M537 and packed small-M producers share the packed L2T layout;
             # the remaining producers read the original row-major matrix.
             fused_l2t_smoothed = (
                 _cached_sm120_m537_l2t(l2t_smoothed)
-                if _sm120_variant_packs_l2t(m_rt, k_rt, producer_variant)
+                if _sm120_variant_packs_l2t(m_rt, k_rt, producer_variant, rank)
                 else l2t_smoothed
             )
             module.nvfp4_svdquant_linear_sm120(
@@ -542,8 +544,11 @@ def _sm120_linear_runners(
     """Return every full-linear route valid for one exact SM120 shape."""
     runners = []
     if _sm120_fused_linear_supported(m, k, rank):
-        runners.append(_sm120_fused_linear_runner(enable_pdl, device))
+        runners.append(_sm120_fused_linear_runner(enable_pdl, device, rank))
     runners.append(_sm120_cutlass_linear_runner(enable_pdl, device, rank))
+    # Keep rank 64's existing untuned fallback; autotuning can select fusion.
+    if rank == 64:
+        runners.reverse()
     return runners
 
 
@@ -859,11 +864,11 @@ def svdquant_linear(
     """``backend="cutlass-sm120"`` for :func:`flashinfer.gemm.svdquant_linear`.
 
     The whole chain in one tuned unit, which is what separates this backend from
-    upstream's: the prefix that smooth-quantizes and projects rank-32 LoRA-down
+    upstream's: the prefix that smooth-quantizes and projects LoRA-down
     is a route the tuner selects over -- one fused launch where the composed
     path spends two -- and the tactic it picks names the prefix and the GEMM
     together, so the pair is chosen on measured cost rather than independently.
-    Rank 64 uses separate smooth quantization and LoRA-down with a rank-64 GEMM.
+    Both ranks offer fused and separate preprocessing to the autotuner.
     """
     if enable_pdl is None:
         enable_pdl = device_support_pdl(x.device)
