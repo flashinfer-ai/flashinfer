@@ -17,10 +17,7 @@ DEVICE = "cuda:0"
 
 # The validation lives in the Python entry of the API, but the "valid shape"
 # and "skip validation" paths fall through to the actual attention kernel, which
-# requires a CUDA device. Skip the whole module when no GPU is available.
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="CUDA not available"
-)
+# requires a CUDA device. Each test is skipped when no GPU is available.
 
 
 def _make_qkv(qo_len, kv_len, num_qo_heads, num_kv_heads, head_dim, kv_layout):
@@ -39,6 +36,7 @@ def _make_qkv(qo_len, kv_len, num_qo_heads, num_kv_heads, head_dim, kv_layout):
 # Valid scenarios: a correctly shaped (qo_len, kv_len) mask must pass.
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_custom_mask_valid_shape_passes(kv_layout):
     qo_len, kv_len = 16, 32
     num_qo_heads = num_kv_heads = 4
@@ -66,6 +64,7 @@ def test_custom_mask_valid_shape_passes(kv_layout):
     ids=["row-mismatch", "col-mismatch", "extra-dim", "transposed"],
 )
 @pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_custom_mask_invalid_shape_raises(kv_layout, bad_shape_fn):
     qo_len, kv_len = 16, 32
     num_qo_heads = num_kv_heads = 4
@@ -83,6 +82,7 @@ def test_custom_mask_invalid_shape_raises(kv_layout, bad_shape_fn):
 # ---------------------------------------------------------------------------
 # Boundary scenarios: validation must be skipped entirely.
 # ---------------------------------------------------------------------------
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_custom_mask_none_skips_validation():
     qo_len, kv_len = 16, 32
     num_qo_heads = num_kv_heads = 4
@@ -93,6 +93,7 @@ def test_custom_mask_none_skips_validation():
     assert o.shape == (qo_len, num_qo_heads, head_dim)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_packed_custom_mask_skips_validation():
     qo_len, kv_len = 16, 32
     num_qo_heads = num_kv_heads = 4
