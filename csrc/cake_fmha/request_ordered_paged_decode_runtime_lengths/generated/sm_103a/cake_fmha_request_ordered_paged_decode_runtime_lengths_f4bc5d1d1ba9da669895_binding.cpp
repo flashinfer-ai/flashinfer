@@ -19,7 +19,7 @@
 
 TVM_FFI_EMBED_CUBIN(cake_fmha_request_ordered_paged_decode_runtime_lengths_f4bc5d1d1ba9da669895_sm_103a);
 
-namespace cake_host_shim_48d8e9ed31feedbe {
+namespace cake_host_shim_a94b7071096bdf05 {
 
 using tvm::ffi::Optional;
 using tvm::ffi::TensorView;
@@ -1052,10 +1052,10 @@ void RunTmaCapture(int64_t capture_token, TensorView arg_Qt, TensorView arg_K, T
   TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(kernel.LaunchEx(kargs, config));
 }
 
-}  // namespace cake_host_shim_48d8e9ed31feedbe
+}  // namespace cake_host_shim_a94b7071096bdf05
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_host_shim_48d8e9ed31feedbe::Run);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(begin_tma_capture, cake_host_shim_48d8e9ed31feedbe::BeginTmaCapture);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_tma_capture, cake_host_shim_48d8e9ed31feedbe::RunTmaCapture);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(finalize_tma_capture, cake_host_shim_48d8e9ed31feedbe::FinalizeTmaCapture);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(discard_tma_capture, cake_host_shim_48d8e9ed31feedbe::DiscardTmaCapture);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_host_shim_a94b7071096bdf05::Run);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(begin_tma_capture, cake_host_shim_a94b7071096bdf05::BeginTmaCapture);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_tma_capture, cake_host_shim_a94b7071096bdf05::RunTmaCapture);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(finalize_tma_capture, cake_host_shim_a94b7071096bdf05::FinalizeTmaCapture);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(discard_tma_capture, cake_host_shim_a94b7071096bdf05::DiscardTmaCapture);
