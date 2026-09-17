@@ -319,6 +319,61 @@ def test_situ_sparse_kernel_matches_quantized_oracle(linear_beta):
     torch.testing.assert_close(output.double(), reference, atol=1e-3, rtol=1e-2)
 
 
+@pytest.mark.parametrize("tokens", [127, 128, 129])
+@pytest.mark.parametrize("linear_beta", [None, 25.0])
+def test_situ_partial_m_tile_matches_quantized_oracle(tokens, linear_beta):
+    """Check the last valid row on either side of a 128-row CTA boundary."""
+    _require_blackwell()
+    case = make_case(
+        tokens=tokens,
+        hidden=256,
+        intermediate=128,
+        num_experts=1,
+        local_num_experts=1,
+        local_expert_offset=0,
+        top_k=1,
+        beta=2.5,
+        linear_beta=linear_beta,
+    )
+    # Exactly represented sparse projections isolate the activation and row
+    # mapping from GEMM accumulation error, as in the existing sparse test.
+    case.w1.zero_()
+    case.w2.zero_()
+    case.w1_scale.fill_(127)
+    case.w2_scale.fill_(127)
+    case.w1[:, 0, 0] = 6  # E2M1 up = 4
+    case.w1[:, case.intermediate_size, 0] = 7  # E2M1 gate = 6
+    case.w2[:, 0, 0] = 2  # down projection = 1
+    source = torch.zeros(case.x.shape, device=case.x.device)
+    source[:, 0] = (
+        torch.arange(tokens, device=case.x.device, dtype=torch.float32) % 4 + 1
+    ) * 0.5
+    case.x.copy_(source.to(case.x.dtype))
+    case.x_scale.fill_(127)
+    case.topk_ids.zero_()
+    case.topk_weights.fill_(1.0)
+    plan, output, _ = prepare_candidate(case)
+    plan.run()
+    reference = reference_moe(case, modes=("mxfp8_fp32",))["mxfp8_fp32"]
+    torch.testing.assert_close(output.double(), reference, atol=1e-3, rtol=1e-2)
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        plan.run()
+    torch.cuda.current_stream().wait_stream(stream)
+    # A graph replay must retain the same row predicate while reading new
+    # contents of the bound runtime parameter buffers.
+    case.beta.fill_(5.0)
+    if case.linear_beta is not None:
+        case.linear_beta.fill_(7.0)
+    for _ in range(3):
+        graph.replay()
+    reference = reference_moe(case, modes=("mxfp8_fp32",))["mxfp8_fp32"]
+    torch.testing.assert_close(output.double(), reference, atol=1e-3, rtol=1e-2)
+
+
 @pytest.mark.parametrize("tokens", [16, 1025])
 def test_run_uses_caller_output_without_torch_storage_allocation(tokens):
     _require_blackwell()

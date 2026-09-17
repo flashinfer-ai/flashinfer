@@ -24,7 +24,8 @@ from timing. CUPTI is required; no timing fallback is available.
 Reports GPU activity span, summed kernel durations, host submission time, and
 synchronized end-to-end runner latency, with raw samples and paired ratios.
 GPU span includes correlated memory operations and gaps; kernel sum includes
-only kernels. Host metrics use CUPTI timestamps with tracing enabled. Both
+only CONCURRENT_KERNEL activities, including graph-lowered memset kernels.
+Host metrics use CUPTI timestamps with tracing enabled. Both
 eager and CUDA Graph samples use the same cold-L2 policy; the flush and its
 completion synchronization occur before each sample's start timestamp.
 
@@ -323,7 +324,7 @@ def main():
             "physical_elapsed_seconds": 0.0,
             "timing_scope": {
                 "gpu_span_ms": "first-to-last correlated GPU kernel/memory activity, including gaps",
-                "kernel_sum_ms": "sum of correlated kernel durations, excluding memory operations and gaps",
+                "kernel_sum_ms": "sum of correlated CONCURRENT_KERNEL durations, including graph-lowered memset kernels; excludes MEMCPY/MEMSET activity records and gaps",
                 "host_enqueue_ms": "CUPTI timestamp before runner submission through return",
                 "synchronized_e2e_ms": "CUPTI timestamp before runner submission through device synchronization",
                 "excluded": "preparation, compilation, capture, warmup, L2 flush, pre-sample synchronization, FP64 reference",
