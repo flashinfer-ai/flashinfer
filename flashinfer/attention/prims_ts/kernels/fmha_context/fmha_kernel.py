@@ -2348,9 +2348,9 @@ def _select_fmha_domain_policy(
     # peers traverse the full static K/V domain.
     domain_n_kwargs = {"domain": num_kv_tiles}
     domain_n_minus_1_kwargs = {"domain": num_kv_tiles - 1}
-    # Handle the partial last K/V tile after the softmax loop. The loop runs
-    # N-1 unmasked iterations and TAIL masks the last tile. The loop then
-    # compiles the same for all S, so register spills no longer depend on tail size.
+    # Query-paired softmax handles the partial last K/V tile after its loop:
+    # N-1 unmasked iterations, then a masked tail. The single-QKV schedules
+    # mask the last tile inside the loop instead, so they keep the full N domain.
     softmax_uses_dense_k_tail = (
         not cfg.single_qkv_instance
         and not cfg.is_causal
