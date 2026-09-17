@@ -83,6 +83,8 @@ from .utils import (
     _unpack_paged_kv_cache,
     canonicalize_torch_dtype,
     ceil_div,
+    check_lse_base,
+    check_lse_layout,
     check_shape_dtype_device,
     determine_attention_backend,
     device_support_pdl,
@@ -93,6 +95,7 @@ from .utils import (
     is_sm12x_supported,
     is_sm100a_supported,
     is_sm110a_supported,
+    ln2,
     log2e,
     prepare_jit_additional_args,
     register_custom_op,
@@ -100,6 +103,49 @@ from .utils import (
     round_up,
     check_trtllm_gen_sm107_only_feature,
 )
+
+
+def _stage_lse(
+    lse: Optional[torch.Tensor], lse_layout: str, return_lse: bool, q: torch.Tensor
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """Kernels write ``[tokens, heads]``. For ``"HN"`` a caller's buffer is the
+    finisher's ``[heads, tokens]`` destination and the kernel gets a fresh NH
+    buffer; returns ``(lse_for_kernel, lse_out)``."""
+    if not return_lse or lse_layout != "HN":
+        return lse, None
+    if lse is not None:
+        check_shape_dtype_device(
+            lse, (q.size(1), q.size(0)), torch.float32, q.device, "lse"
+        )
+        if not lse.is_contiguous():
+            raise ValueError('lse for lse_layout="HN" must be contiguous')
+    return None, lse
+
+
+def _finish_lse(
+    lse: torch.Tensor,
+    lse_base: str,
+    lse_layout: str,
+    lse_out: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Kernels write base-2 LSE as ``[tokens, heads]``; deliver the requested base and layout.
+
+    ``lse_out`` is the caller's buffer in the requested layout, if any. ``"NH"`` is
+    finished in place; ``"HN"`` is one fused transpose(+rescale) into a contiguous
+    ``[heads, tokens]`` tensor.
+    """
+    if lse_layout == "NH":
+        if lse_base == "ln":
+            lse.mul_(ln2)
+        return lse
+    src = lse.t()
+    if lse_out is None:
+        lse_out = torch.empty(src.shape, dtype=lse.dtype, device=lse.device)
+    if lse_base == "ln":
+        torch.mul(src, ln2, out=lse_out)
+    else:
+        lse_out.copy_(src)
+    return lse_out
 
 
 def _split_scale_param(scale):
@@ -3133,6 +3179,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         return_lse: Literal[False] = False,
+        lse_base: str = "log2",
+        lse_layout: str = "NH",
         enable_pdl: Optional[bool] = None,
         window_left: Optional[int] = None,
         sinks: Optional[torch.Tensor] = None,
@@ -3155,6 +3203,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         return_lse: Literal[True] = True,
+        lse_base: str = "log2",
+        lse_layout: str = "NH",
         enable_pdl: Optional[bool] = None,
         window_left: Optional[int] = None,
         sinks: Optional[torch.Tensor] = None,
@@ -3178,6 +3228,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         return_lse: bool = False,
+        lse_base: str = "log2",
+        lse_layout: str = "NH",
         enable_pdl: Optional[bool] = None,
         window_left: Optional[int] = None,
         sinks: Optional[torch.Tensor] = None,
@@ -3222,6 +3274,17 @@ class BatchPrefillWithPagedKVCacheWrapper:
             The log-sum-exp of attention logits, if not provided, will be allocated internally.
         return_lse : bool
             Whether to return the logsumexp of attention output
+        lse_base : str
+            Base of the returned ``lse`` when :attr:`return_lse` is ``True``:
+            ``"log2"`` (default, FlashInfer's convention, ``max + log2(sum(exp2(...)))``)
+            or ``"ln"`` (natural log, the ``torch.logsumexp`` convention that merge
+            kernels written with ``expf`` consume). ``"ln"`` lets the cuDNN backend hand
+            out its native stats without a conversion kernel; the other backends rescale.
+        lse_layout : str
+            Layout of the returned ``lse``: ``"NH"`` (default) is
+            ``[qo_indptr[-1], num_qo_heads]``, ``"HN"`` is the contiguous transpose
+            ``[num_qo_heads, qo_indptr[-1]]`` (one fused transpose + rescale kernel).
+            A caller-provided :attr:`lse` must have the requested layout.
         enable_pdl : bool
             Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
             Only effective on backends and devices that support PDL.
@@ -3278,11 +3341,15 @@ class BatchPrefillWithPagedKVCacheWrapper:
             If :attr:`return_lse` is ``True``, a tuple of two tensors:
 
             * The attention output, shape: ``[qo_indptr[-1], num_qo_heads, head_dim]``.
-            * The logsumexp of attention output, shape: ``[qo_indptr[-1], num_qo_heads]``.
+            * The logsumexp of attention output, shape: ``[qo_indptr[-1], num_qo_heads]``
+              (``lse_layout="NH"``, default) or ``[num_qo_heads, qo_indptr[-1]]``
+              (``"HN"``), in the base selected by :attr:`lse_base`.
         """
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q.device)
         k_cache, v_cache = _unpack_paged_kv_cache(paged_kv_cache, self._kv_layout)
+        check_lse_base(lse_base)
+        check_lse_layout(lse_layout)
         _check_cached_qkv_data_type(
             q, k_cache, self._cached_q_data_type, self._cached_kv_data_type
         )
@@ -3342,13 +3409,17 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 # cute-dsl route's convention (the kernel's native scratch
                 # is fp16; the copy-out converts).
                 out = torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
-            return self._cute_dsl_wrapper.run_paged(
+            lse, lse_out = _stage_lse(lse, lse_layout, return_lse, q)
+            res = self._cute_dsl_wrapper.run_paged(
                 q,
                 (k_cache, v_cache),
                 out=out,
                 return_lse=return_lse,
                 lse=lse,
             )
+            if isinstance(res, tuple):
+                return res[0], _finish_lse(res[1], lse_base, lse_layout, lse_out)
+            return res
         elif self._backend == "cute-dsl-prims":
             if args:
                 raise NotImplementedError(
@@ -3384,7 +3455,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     device=q.device,
                 )
             assert self._prims_backend is not None
-            return self._prims_backend.run_paged(
+            lse, lse_out = _stage_lse(lse, lse_layout, return_lse, q)
+            res = self._prims_backend.run_paged(
                 q,
                 k_cache,
                 v_cache,
@@ -3396,6 +3468,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 k_scale=k_scale,
                 v_scale=v_scale,
             )
+            if isinstance(res, tuple):
+                return res[0], _finish_lse(res[1], lse_base, lse_layout, lse_out)
+            return res
 
         check_trtllm_gen_sm107_only_feature(
             use_fp16_softmax, "use_fp16_softmax", q.device
@@ -3446,6 +3521,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             rope_scale = 1.0
         if rope_theta is None:
             rope_theta = 1e4
+        lse, lse_out = _stage_lse(lse, lse_layout, return_lse, q)
         if return_lse:
             if lse is None:
                 lse = torch.empty(
@@ -3531,6 +3607,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 block_tables=self._block_tables,
                 causal=self._causal,
                 return_lse=return_lse,
+                lse_base=lse_base,
                 q_scale=q_scale,
                 k_scale=k_scale,
                 v_scale=v_scale,
@@ -3672,6 +3749,14 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 else:
                     out *= v_scale
 
+        if return_lse:
+            # cuDNN already produced the requested base
+            lse = _finish_lse(
+                lse,
+                "log2" if self._backend == "cudnn" else lse_base,
+                lse_layout,
+                lse_out,
+            )
         return (out, lse) if return_lse else out
 
     run_return_lse = functools.partialmethod(run, return_lse=True)
@@ -4783,6 +4868,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         return_lse: Literal[False] = False,
+        lse_base: str = "log2",
+        lse_layout: str = "NH",
         enable_pdl: Optional[bool] = None,
         kv_cache_sf: Optional[
             Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
@@ -4799,6 +4886,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         return_lse: Literal[True] = True,
+        lse_base: str = "log2",
+        lse_layout: str = "NH",
         enable_pdl: Optional[bool] = None,
         kv_cache_sf: Optional[
             Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
@@ -4819,6 +4908,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         return_lse: bool = False,
+        lse_base: str = "log2",
+        lse_layout: str = "NH",
         enable_pdl: Optional[bool] = None,
         kv_cache_sf: Optional[
             Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
@@ -4851,6 +4942,17 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             The log-sum-exp of attention logits, if not provided, will be allocated internally.
         return_lse : bool
             Whether to return the logsumexp of attention output
+        lse_base : str
+            Base of the returned ``lse`` when :attr:`return_lse` is ``True``:
+            ``"log2"`` (default, FlashInfer's convention, ``max + log2(sum(exp2(...)))``)
+            or ``"ln"`` (natural log, the ``torch.logsumexp`` convention that merge
+            kernels written with ``expf`` consume). ``"ln"`` lets the cuDNN backend hand
+            out its native stats without a conversion kernel; the other backends rescale.
+        lse_layout : str
+            Layout of the returned ``lse``: ``"NH"`` (default) is
+            ``[qo_indptr[-1], num_qo_heads]``, ``"HN"`` is the contiguous transpose
+            ``[num_qo_heads, qo_indptr[-1]]`` (one fused transpose + rescale kernel).
+            A caller-provided :attr:`lse` must have the requested layout.
         enable_pdl : bool
             Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
             Only effective on backends and devices that support PDL.
@@ -4867,10 +4969,14 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             If :attr:`return_lse` is ``True``, a tuple of two tensors:
 
             * The attention output, shape: ``[qo_indptr[-1], num_qo_heads, head_dim_vo]``.
-            * The logsumexp of attention output, shape: ``[qo_indptr[-1], num_qo_heads]``.
+            * The logsumexp of attention output, shape: ``[qo_indptr[-1], num_qo_heads]``
+              (``lse_layout="NH"``, default) or ``[num_qo_heads, qo_indptr[-1]]``
+              (``"HN"``), in the base selected by :attr:`lse_base`.
         """
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q.device)
+        check_lse_base(lse_base)
+        check_lse_layout(lse_layout)
         _check_cached_qkv_data_type(
             q, k, self._cached_q_data_type, self._cached_kv_data_type
         )
@@ -4919,6 +5025,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             rope_scale = 1.0
         if rope_theta is None:
             rope_theta = 1e4
+        lse, lse_out = _stage_lse(lse, lse_layout, return_lse, q)
         if return_lse:
             if lse is None:
                 lse = torch.empty(
@@ -4994,7 +5101,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 k_scale=k_scale,
                 v_scale=v_scale,
             )
-            return (out, lse) if return_lse else out
+            return (
+                (out, _finish_lse(lse, lse_base, lse_layout, lse_out))
+                if return_lse
+                else out
+            )
         elif self._backend == "fmha_v2":
             if return_lse:
                 raise NotImplementedError(
@@ -5077,7 +5188,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 bmm2_scale = (v_scale if v_scale is not None else 1.0) / (
                     o_scale if o_scale is not None else 1.0
                 )
-                return trtllm_ragged_attention_deepseek(
+                res = trtllm_ragged_attention_deepseek(
                     query=q,
                     key=k,
                     value=v,
@@ -5100,7 +5211,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     backend="cute-dsl",
                     q_seq_lens_cpu=p["q_seq_lens_cpu"],
                     kv_seq_lens_cpu=p["kv_seq_lens_cpu"],
+                    skip_all_rows_active_check=False,
                 )
+                if isinstance(res, tuple):
+                    return res[0], _finish_lse(res[1], lse_base, lse_layout, lse_out)
+                return res
             # Modular CuTe DSL backend does not support scale parameters.
             if any(s is not None for s in (q_scale, k_scale, v_scale, o_scale)):
                 raise NotImplementedError(
@@ -5109,9 +5224,10 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             if return_lse:
                 # Standard-path modular kernel computes LSE natively; the
                 # wrapper raises NotImplementedError for attention variants.
-                return self._cute_dsl_wrapper.run(
+                out, lse = self._cute_dsl_wrapper.run(
                     q, k, v, out=out, return_lse=True, lse=lse
                 )
+                return out, _finish_lse(lse, lse_base, lse_layout, lse_out)
             out = self._cute_dsl_wrapper.run(q, k, v, out=out)
             return out
         elif self._backend == "cutlass":
@@ -5138,7 +5254,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 out=out,
                 lse=lse,
             )
-            return (out, lse) if return_lse else out
+            return (
+                (out, _finish_lse(lse, lse_base, lse_layout, lse_out))
+                if return_lse
+                else out
+            )
         elif self._backend == "cudnn":
             # cuDNN's ragged prefill graph has no kv_layout input and reads
             # k.shape[1] as the kv head count, i.e. it assumes NHD. Reject HND
@@ -5196,12 +5316,18 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 batch_offsets_stats=(self._cudnn_stats_offsets if return_lse else None),
                 batch_offsets_units="tokens",
                 is_cuda_graph_compatible=self._use_cuda_graph,
+                lse_base=lse_base,
                 out=out,
                 lse=lse,
                 o_data_type=out_dtype,
             )
 
-            return (out, lse) if return_lse else out
+            # base already handled inside cudnn_batch_prefill_with_kv_cache
+            return (
+                (out, _finish_lse(lse, "log2", lse_layout, lse_out))
+                if return_lse
+                else out
+            )
         elif self._backend == "cutile":
             if any(s is not None for s in (q_scale, k_scale, v_scale, o_scale)):
                 raise NotImplementedError(
@@ -5234,7 +5360,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 outputs=out,
                 out_lse=lse if return_lse else None,
             )
-            return (out_ragged, lse_ragged) if return_lse else out_ragged
+            return (
+                (out_ragged, _finish_lse(lse_ragged, lse_base, lse_layout, lse_out))
+                if return_lse
+                else out_ragged
+            )
 
         # Skip FP8->FP16 conversion for FA3 backend with FP8 support
         # The JIT module will handle FP8 natively
@@ -5313,7 +5443,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         if apply_kv_scales and v_scale is not None and not is_float_one:
             out *= v_scale
 
-        return (out, lse) if return_lse else out
+        return (
+            (out, _finish_lse(lse, lse_base, lse_layout, lse_out))
+            if return_lse
+            else out
+        )
 
     run_return_lse = functools.partialmethod(run, return_lse=True)
 
@@ -5804,21 +5938,33 @@ def trtllm_ragged_attention_deepseek(
         Attention backend to use. "trtllm-gen" (default) or "cute-dsl".
     q_seq_lens_cpu : Optional[torch.Tensor]
         Optional trusted CPU mirror of the per-row query lengths. When provided
-        together with ``kv_seq_lens_cpu``, the Python wrapper validates and
-        compacts empty rows (either ``q_len == 0`` or ``kv_len == 0``). Mirrors
-        take precedence over the omitted/default all-rows-active mode. Currently
-        only consulted by the ``trtllm-gen`` backend.
+        together with ``kv_seq_lens_cpu``, the Python wrapper can detect empty
+        rows (either ``q_len == 0`` or ``kv_len == 0``) without touching the
+        device, which keeps the call CUDA-graph-capturable. The ``trtllm-gen``
+        backend uses the mirrors to compact empty rows away before the kernel
+        launch; the ``cute-dsl`` backend uses them to neutralize the rows its
+        kernel skips (``q_len > 0, kv_len == 0`` rows are written as
+        ``out = 0`` / ``lse = -inf`` instead of being left uninitialized).
+        If omitted on the ``trtllm-gen`` backend with
+        ``skip_all_rows_active_check=False``, the wrapper derives lengths
+        from the device indptrs and may synchronize; this device-side detection
+        is not allowed under CUDA graph capture, so both mirrors are required
+        in that case. The default assumes all rows are active. If omitted
+        on the ``cute-dsl`` backend, no empty-row handling is performed and
+        rows with ``q_len > 0, kv_len == 0`` yield undefined output.
     kv_seq_lens_cpu : Optional[torch.Tensor]
-        Optional trusted CPU mirror of the per-row KV lengths. Currently only
-        consulted by the ``trtllm-gen`` backend.
+        Optional trusted CPU mirror of the per-row KV lengths. See
+        ``q_seq_lens_cpu``.
     skip_all_rows_active_check : bool
         Controls empty-row detection. ``True`` (default) assumes every row has
         positive query and KV lengths and avoids device-to-host synchronization.
         Paired CPU length mirrors take precedence and request checked/compacting
         behavior regardless of this setting. ``False`` without CPU mirrors
         derives row activity from device tensors, which may synchronize outside
-        CUDA graph capture and requires CPU mirrors during capture. Currently
-        only consulted by the ``trtllm-gen`` backend.
+        CUDA graph capture and requires CPU mirrors during capture. Only the
+        ``trtllm-gen`` backend performs device-side detection when both
+        mirrors are absent; on ``cute-dsl`` empty-row handling requires CPU
+        mirrors regardless of this setting.
 
     Returns
     -------
@@ -5885,6 +6031,62 @@ def trtllm_ragged_attention_deepseek(
             dtype=torch.float32,
         )
 
+    # --- CPU seq-len mirror validation (shared by all backends) ---
+    def _validate_cpu_seq_lens(
+        lengths: torch.Tensor,
+        name: str,
+        total_tokens: int,
+        max_len: int,
+    ) -> int:
+        if lengths.device.type != "cpu":
+            raise ValueError(f"{name} must be a CPU tensor")
+        if lengths.dtype not in (torch.int32, torch.int64):
+            raise ValueError(f"{name} must have dtype torch.int32 or torch.int64")
+        if lengths.shape != (batch_size,):
+            raise ValueError(f"{name} must have shape ({batch_size},)")
+        if bool((lengths < 0).any().item()):
+            raise ValueError(f"{name} must contain non-negative lengths")
+
+        actual_total = int(lengths.sum().item())
+        if actual_total != total_tokens:
+            raise ValueError(
+                f"{name} sums to {actual_total}, but expected {total_tokens} "
+                "tokens from the corresponding ragged tensor"
+            )
+        if batch_size > 0 and int(lengths.max().item()) > max_len:
+            raise ValueError(f"{name} contains a length larger than max_len")
+        return actual_total
+
+    q_lens_cpu = None
+    kv_lens_cpu = None
+    active_rows_cpu = None
+    if q_seq_lens_cpu is not None or kv_seq_lens_cpu is not None:
+        if q_seq_lens_cpu is None or kv_seq_lens_cpu is None:
+            raise ValueError(
+                "q_seq_lens_cpu and kv_seq_lens_cpu must be provided together"
+            )
+
+        _validate_cpu_seq_lens(
+            q_seq_lens_cpu,
+            "q_seq_lens_cpu",
+            query.shape[0],
+            max_q_len,
+        )
+        kv_total = _validate_cpu_seq_lens(
+            kv_seq_lens_cpu,
+            "kv_seq_lens_cpu",
+            key.shape[0],
+            max_kv_len,
+        )
+        if kv_total != value.shape[0]:
+            raise ValueError(
+                "kv_seq_lens_cpu must sum to both key and value token counts"
+            )
+
+        q_lens_cpu = q_seq_lens_cpu
+        kv_lens_cpu = kv_seq_lens_cpu
+        active_rows_cpu = (q_lens_cpu > 0) & (kv_lens_cpu > 0)
+
     if backend == "cute-dsl":
         from .attention.cute_dsl.fmha import cute_dsl_fmha_ragged_prefill
 
@@ -5905,30 +6107,82 @@ def trtllm_ragged_attention_deepseek(
         _bmm1 = bmm1_scale
         _bmm2 = bmm2_scale
 
+        # The DSL varlen kernel skips batches whose kv_len == 0 without
+        # writing their output rows, and ``out`` defaults to torch.empty.
+        # When CPU mirrors are provided, neutralize those rows here
+        # (out = 0, lse = -inf) to match the trtllm-gen empty-row
+        # semantics. The decisions below read only the CPU mirrors and the
+        # fill itself uses only device-resident tensors (``output_size``
+        # keeps repeat_interleave from syncing), so this path stays
+        # CUDA-graph-capturable.
+        should_launch = True
+        _is_capturing = (
+            query.is_cuda
+            and hasattr(torch.cuda, "is_current_stream_capturing")
+            and torch.cuda.is_current_stream_capturing()
+        )
+        if active_rows_cpu is not None:
+            if not bool(active_rows_cpu.all().item()):
+                if not bool(active_rows_cpu.any().item()):
+                    out.zero_()
+                    if lse is not None:
+                        lse.fill_(-float("inf"))
+                    # Skip the launch only outside CUDA graph capture.
+                    # Under capture, dropping the launch would leave it
+                    # unrecorded, so a later replay with active rows would
+                    # find no kernel in the graph. The DSL varlen kernel
+                    # is a no-op for kv_len <= 0 rows, so recording it on
+                    # an all-empty batch is safe.
+                    if not _is_capturing:
+                        should_launch = False
+                else:
+                    q_lens_device = cum_seq_lens_q[1:] - cum_seq_lens_q[:-1]
+                    kv_lens_device = cum_seq_lens_kv[1:] - cum_seq_lens_kv[:-1]
+                    row_active = (q_lens_device > 0) & (kv_lens_device > 0)
+                    token_inactive = ~torch.repeat_interleave(
+                        row_active, q_lens_device, output_size=query.shape[0]
+                    )
+                    out.masked_fill_(token_inactive.view(-1, 1, 1), 0)
+                    if lse is not None:
+                        lse.masked_fill_(token_inactive.view(-1, 1), -float("inf"))
+            elif _is_capturing:
+                # All rows are active at capture time, but replay may
+                # change device-side seq_lens so that some rows become
+                # inactive (kv_len == 0). The DSL kernel would skip those
+                # rows without writing their output. Pre-fill neutral
+                # values so that any newly-inactive row in a replay gets
+                # (out = 0, lse = -inf) rather than stale data. The
+                # kernel overwrites active rows, so the fill is harmless
+                # for them.
+                out.zero_()
+                if lse is not None:
+                    lse.fill_(-float("inf"))
+
         # bmm1_scale = scale_q * scale_k * sm_scale (already fused by caller)
         # bmm2_scale = scale_v
         # Pass the fused value as sm_scale with scale_q=scale_k=1.0
-        cute_dsl_fmha_ragged_prefill(
-            q=query,
-            k=key,
-            v=value,
-            o=out,
-            qo_indptr=cum_seq_lens_q,
-            kv_indptr=cum_seq_lens_kv,
-            is_causal=is_causal,
-            sm_scale=_bmm1,
-            window_left=window_left,
-            lse=lse if return_lse else None,
-            attention_sinks=attention_sinks,
-            scale_q=1.0,
-            scale_k=1.0,
-            scale_v=_bmm2,
-            scale_o=1.0,
-            max_qo_len=max_q_len,
-            max_kv_len=max_kv_len,
-            skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
-            enable_pdl=enable_pdl,
-        )
+        if should_launch:
+            cute_dsl_fmha_ragged_prefill(
+                q=query,
+                k=key,
+                v=value,
+                o=out,
+                qo_indptr=cum_seq_lens_q,
+                kv_indptr=cum_seq_lens_kv,
+                is_causal=is_causal,
+                sm_scale=_bmm1,
+                window_left=window_left,
+                lse=lse if return_lse else None,
+                attention_sinks=attention_sinks,
+                scale_q=1.0,
+                scale_k=1.0,
+                scale_v=_bmm2,
+                scale_o=1.0,
+                max_qo_len=max_q_len,
+                max_kv_len=max_kv_len,
+                skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+                enable_pdl=enable_pdl,
+            )
     else:
         # --- trtllm-gen backend ---
         run_func = get_trtllm_gen_fmha_module().trtllm_ragged_attention
@@ -5939,31 +6193,6 @@ def trtllm_ragged_attention_deepseek(
             bmm1_scale = bmm1_scale * log2e
         if isinstance(bmm2_scale, torch.Tensor):
             assert bmm2_scale.dtype == torch.float32
-
-        def _validate_cpu_seq_lens(
-            lengths: torch.Tensor,
-            name: str,
-            total_tokens: int,
-            max_len: int,
-        ) -> int:
-            if lengths.device.type != "cpu":
-                raise ValueError(f"{name} must be a CPU tensor")
-            if lengths.dtype not in (torch.int32, torch.int64):
-                raise ValueError(f"{name} must have dtype torch.int32 or torch.int64")
-            if lengths.shape != (batch_size,):
-                raise ValueError(f"{name} must have shape ({batch_size},)")
-            if bool((lengths < 0).any().item()):
-                raise ValueError(f"{name} must contain non-negative lengths")
-
-            actual_total = int(lengths.sum().item())
-            if actual_total != total_tokens:
-                raise ValueError(
-                    f"{name} sums to {actual_total}, but expected {total_tokens} "
-                    "tokens from the corresponding ragged tensor"
-                )
-            if batch_size > 0 and int(lengths.max().item()) > max_len:
-                raise ValueError(f"{name} contains a length larger than max_len")
-            return actual_total
 
         run_out = out
         run_lse = lse
@@ -5981,38 +6210,11 @@ def trtllm_ragged_attention_deepseek(
 
         q_lens = None
         kv_lens = None
-        q_lens_cpu = None
-        kv_lens_cpu = None
         active_rows = None
         has_inactive_rows = False
         has_active_rows = True
 
-        if q_seq_lens_cpu is not None or kv_seq_lens_cpu is not None:
-            if q_seq_lens_cpu is None or kv_seq_lens_cpu is None:
-                raise ValueError(
-                    "q_seq_lens_cpu and kv_seq_lens_cpu must be provided together"
-                )
-
-            _validate_cpu_seq_lens(
-                q_seq_lens_cpu,
-                "q_seq_lens_cpu",
-                query.shape[0],
-                max_q_len,
-            )
-            kv_total = _validate_cpu_seq_lens(
-                kv_seq_lens_cpu,
-                "kv_seq_lens_cpu",
-                key.shape[0],
-                max_kv_len,
-            )
-            if kv_total != value.shape[0]:
-                raise ValueError(
-                    "kv_seq_lens_cpu must sum to both key and value token counts"
-                )
-
-            q_lens_cpu = q_seq_lens_cpu
-            kv_lens_cpu = kv_seq_lens_cpu
-            active_rows_cpu = (q_lens_cpu > 0) & (kv_lens_cpu > 0)
+        if active_rows_cpu is not None:
             if not bool(active_rows_cpu.all().item()):
                 has_inactive_rows = True
                 has_active_rows = bool(active_rows_cpu.any().item())
@@ -6073,8 +6275,8 @@ def trtllm_ragged_attention_deepseek(
             else:
                 if q_lens_cpu is not None:
                     assert kv_lens_cpu is not None
+                    assert active_rows_cpu is not None
 
-                    active_rows_cpu = (q_lens_cpu > 0) & (kv_lens_cpu > 0)
                     q_active_mask_cpu = torch.repeat_interleave(
                         active_rows_cpu, q_lens_cpu
                     )
