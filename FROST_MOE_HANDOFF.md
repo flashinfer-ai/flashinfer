@@ -230,7 +230,29 @@ compute-sanitizer --tool memcheck --target-processes all --error-exitcode 86 pyt
 compute-sanitizer --tool racecheck --target-processes all --error-exitcode 86 python -m pytest -q tests/moe/test_moe_native_finalize.py tests/moe/test_moe_unpermute_round_scales.py
 ```
 
-Complete-MoE performance confirmation of this combined module is still running.
-Earlier standalone-finalizer experiments motivated the change; their timings
-must not be described as timings of this assembled source. This remains a draft
-for asynchronous review; no new competing-backend or model-level win is claimed.
+Complete-MoE confirmation now passes on B200 for the actual combined FI module.
+The following synthetic BF16 E128/top-k8/H2048/I768/SwiGLU cases use precomputed
+uniform routing on one full 148-SM/1000-W B200. Both arms use the same source and
+fixed ordinary GEMMs; the control explicitly disables the new finalizer. Each
+case passes both-arm normal/memcheck/racecheck and four fresh ABBA processes,
+using cold-L2 CUDA Graph/CUPTI full spans and cached independent references.
+
+| Tokens / routing | Existing finalizer, us | Native finalizer, us | Full-MoE reduction |
+|---|---:|---:|---:|
+| 1 / unpacked |38.423|36.552|4.87%|
+| 1 / packed |38.455|36.536|4.99%|
+| 64 / unpacked |219.981|217.077|1.32%|
+| 64 / packed |220.001|217.054|1.34%|
+
+FC1 uses the 64x64x128 ordinary tile (static at T1, dynamic at T64). FC2 uses
+64x128x128 at T1 and 128x128x128 at T64, both static. The frozen FE integration
+contains #1090 plus the integration/reset/scheduler adaptations; these runs
+select ordinary kernels and establish no swap-AB benefit. They validate the
+published FI module, not every combination of FE revisions or the entire draft.
+The public FI API uses `enable_pdl=False`; generated Frost launchers retain their
+own PDL behavior.
+
+These are gains over existing Frost finalization. They are not new comparisons
+against another MoE backend or a model-E2E claim. SM120 complete-MoE confirmation
+remains running; its API/capture and component sanitizer checks above are separate.
+This remains a draft for asynchronous review and further measured follow-ups.
