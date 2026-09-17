@@ -45,11 +45,15 @@ from tests.test_helpers.utils_fp4 import nvfp4_global_encode_scale_te
 
 from . import utils as moe_utils
 
+# Kept in the same shape as flashinfer.fused_moe.api._CUTLASS_BF16_ARCHS, which
+# is the table the code under test actually consults; (10, 7) was missing here
+# while the library has listed it all along.
 _CUTLASS_MOE_SUPPORTED_ARCHES = {
     (8, 9),
     (9, 0),
     (10, 0),
     (10, 3),
+    (10, 7),
     (11, 0),
     (12, 0),
     (12, 1),
