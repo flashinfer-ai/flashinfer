@@ -2126,9 +2126,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         max_splits = ceil_div(K, mma_qk_tiler_mn[1])
         blocks_per_batch = max(1, max_active_blocks // B // (S * 2))
         split_heur = min(max_splits, blocks_per_batch)
-        # {$nv-internal-release begin}
-        # TODO: figure out the error of make_tile with dynamic int_tuple
-        # {$nv-internal-release end}
         k_waves = ceil_div(max_splits, split_heur)
         split_wave_aware = ceil_div(max_splits, k_waves)
         max_split_kv = 32
@@ -2175,9 +2172,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             split_kv = block_split_kvs[blk_coord[2]]
 
         k_tile_total = cute.ceil_div(K, self.mma_qk_tiler[1])
-        # {$nv-internal-release begin}
-        # TODO: figure out the error of make_tile with dynamic int_tuple
-        # {$nv-internal-release end}
         k_tile_per_cta = cute.ceil_div(k_tile_total, split_kv)
         k_index = blk_coord[3] * k_tile_per_cta
         k_tile_count = max(0, min(k_tile_total, k_index + k_tile_per_cta) - k_index)
@@ -2359,9 +2353,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
 
         k_tile_count_init = k_tile_count
         while k_tile_count > 0:
-            # {$nv-internal-release begin}
-            # TODO: figure out how to support SingleNamespace/struct in ast
-            # {$nv-internal-release end}
             load_q_producer_state, load_k_producer_state = self.load_tma_qk_one_k_tile(
                 common_params,
                 qk_params,
@@ -2430,9 +2421,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         v_params.tVCsVC = tVCsVC
 
         while k_tile_count > 0:
-            # {$nv-internal-release begin}
-            # TODO: figure out how to support SingleNamespace/struct in ast
-            # {$nv-internal-release end}
             load_v_producer_state = self.load_tma_v_one_k_tile(
                 common_params,
                 v_params,
@@ -3755,9 +3743,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 ),
             ),
         )
-        # {$nv-internal-release begin}
-        # TODO: figure out if we could use A tmem for pv.
-        # {$nv-internal-release end}
         # change to PISL
         sP_wo_swizzle_iter = cute.recast_ptr(sP.iterator, swizzle_=None)
         swizzle_bits = (
@@ -3900,9 +3885,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), self.acc_dtype
         )
         tmem_load_tiled_copy = tcgen05.make_tmem_copy(tmem_load_atom, tAcc)
-        # {$nv-internal-release begin}
-        # TODO: supports size() on tiled copy.
-        # {$nv-internal-release end}
         tmem_load_thr_copy = tmem_load_tiled_copy.get_slice(
             common_params.tidx % (self.num_compute_warps * self.threads_per_warp)
         )
