@@ -43,3 +43,30 @@ def test_nvfp4_attention(batch, heads, seqlen):
 def test_nvfp4_rejects_unknown_backend():
     with pytest.raises(ValueError, match="backend"):
         prepare_nvfp4_attention(None, None, None, None, backend="unknown")
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_nvfp4_quantization_saturates_finite_scales(device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    from flashinfer.experimental.nvfp4_attention.cake_backend import _quantize_nvfp4
+
+    largest = torch.finfo(torch.bfloat16).max
+    values = torch.tensor(
+        [0.0, 1.0, 2688.0, 4096.0, -4096.0, largest, -largest],
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    x = values[:, None].expand(-1, 16).contiguous()
+    packed, scale_bytes = _quantize_nvfp4(x)
+    scales = scale_bytes.view(torch.float8_e4m3fn).float()
+    expected_scales = torch.tensor(
+        [2.0**-9, 0.171875, 448.0, 448.0, 448.0, 448.0, 448.0], device=device
+    )[:, None]
+    torch.testing.assert_close(scales, expected_scales, atol=0, rtol=0)
+    expected_packed = torch.tensor(
+        [0x00, 0x77, 0x77, 0x77, 0xFF, 0x77, 0xFF],
+        dtype=torch.uint8,
+        device=device,
+    )[:, None].expand(-1, 8)
+    torch.testing.assert_close(packed, expected_packed, atol=0, rtol=0)

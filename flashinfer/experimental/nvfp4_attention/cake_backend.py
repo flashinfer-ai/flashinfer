@@ -34,7 +34,9 @@ def _quantize_nvfp4(x):
     x_f32 = x.float()
     groups = x_f32.shape[-1] // SF_VEC
     blocks = x_f32.reshape(*x_f32.shape[:-1], groups, SF_VEC)
-    raw_scale = (blocks.abs().amax(dim=-1) / 6.0).clamp_min(2.0**-9)
+    raw_scale = (blocks.abs().amax(dim=-1) / 6.0).clamp(
+        min=2.0**-9, max=torch.finfo(torch.float8_e4m3fn).max
+    )
     scale_fp8 = raw_scale.to(torch.float8_e4m3fn)
     scale = scale_fp8.float()
     normalized = blocks / scale.unsqueeze(-1)
