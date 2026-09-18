@@ -129,7 +129,9 @@ def test_mega_layer_requires_weights():
         )
 
 
-@pytest.mark.parametrize("backend_name", ("w4a4", "w4a16", "split"))
+@pytest.mark.parametrize(
+    "backend_name", ("w4a4", "w4a16", "bf16", "bf16_mxfp8", "split")
+)
 @pytest.mark.parametrize("scale_field", ("w13_global_scale", "w2_global_scale"))
 def test_layer_global_weight_scale_support(backend_name, scale_field):
     import torch
@@ -141,6 +143,8 @@ def test_layer_global_weight_scale_support(backend_name, scale_field):
         MoEEpConfigError,
         MoEEpLayer,
         PrequantizedMoEWeights,
+        Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig,
+        Sm100_Bf16_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
         Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
         Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
     )
@@ -148,6 +152,8 @@ def test_layer_global_weight_scale_support(backend_name, scale_field):
     config_types = {
         "w4a4": Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
         "w4a16": Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+        "bf16": Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig,
+        "bf16_mxfp8": Sm100_Bf16_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
     }
     if backend_name == "split":
         backend = "nccl_ep"

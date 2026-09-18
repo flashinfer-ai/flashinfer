@@ -97,6 +97,7 @@ from .shim import (
     tuner,
     with_knobs,
 )
+from .shim.autotune import _session_candidates
 from .shim.comm import _CompiledMega, _compute_peer_offsets
 from .shim.tuner import is_valid
 
@@ -163,6 +164,7 @@ __all__ = [
     *_KERNEL_PRIMITIVES,
     "_CompiledMega",
     "_compute_peer_offsets",
+    "_session_candidates",
     "bootstrap_dist",
     "free_sym_tensor",
     "resolve_gate_up_clamp",

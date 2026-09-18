@@ -16,11 +16,14 @@ class _CollectiveGraphTimingError(RuntimeError):
     """A private graph timing failure that must stop the collective sweep."""
 
 
-def bf16_nvfp4_candidates() -> List[Dict[str, Any]]:
+def bf16_nvfp4_candidates(
+    *, enable_in_kernel_fc2_reduce: bool = False
+) -> List[Dict[str, Any]]:
     """Four M256 W4A16 tactics with flag batch 4 and scheduler depth 2.
 
     Both geometries use two-CTA instructions and two dequantization warp
     groups. Explicit M128 configurations remain supported by the kernel.
+    Opting into in-kernel reduction adds two dispatch-return tactics.
     """
     return [
         dict(
@@ -32,11 +35,13 @@ def bf16_nvfp4_candidates() -> List[Dict[str, Any]]:
             use_2cta_instrs=True,
             flag_batch=4,
             token_back_mode=token_back,
-            in_kernel_fc2_reduce=False,
+            in_kernel_fc2_reduce=in_kernel,
             num_sched_stages=2,
         )
+        for in_kernel in ((False, True) if enable_in_kernel_fc2_reduce else (False,))
         for tile in ((256, 128, 256), (256, 64, 256))
         for token_back in ("epi_warps", "reuse_dispatch_warps")
+        if not in_kernel or token_back == "reuse_dispatch_warps"
     ]
 
 
@@ -150,12 +155,20 @@ def autotune_bf16_nvfp4_mega_moe(
 
     cfg = symm_buffer._frontend.config
     frontend = symm_buffer._frontend
-    candidates = bf16_nvfp4_candidates() if candidates is None else candidates
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import _session_candidates, tuner
+
+    if candidates is None:
+        candidates = bf16_nvfp4_candidates(
+            enable_in_kernel_fc2_reduce=cfg.enable_in_kernel_fc2_reduce
+        )
+    candidates = _session_candidates(
+        candidates,
+        cfg,
+        tuner.is_valid_bf16_nvfp4_for_config,
+        what="BF16/NVFP4 MegaMoE",
+    )
     warmup_iters = max(1, warmup_iters)
     label = "bf16_nvfp4_mega"
-    if not candidates:
-        raise ValueError("autotune_knobs needs a non-empty candidate list.")
-
     from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import ensure_not_capturing
 
     # The sweep owns host-side compile, allocation, timing and collectives;

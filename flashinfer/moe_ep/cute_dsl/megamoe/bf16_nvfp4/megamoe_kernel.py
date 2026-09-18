@@ -145,13 +145,16 @@ class Sm100W4A16MegaMoEKernel:
             raise ValueError("W4A16 requires forward 2Dx3D scheduler records.")
         if load_balance_mode not in ("static", "atomic_counter"):
             raise ValueError("Unsupported W4A16 load_balance_mode.")
-        if fc2_in_kernel_topk_reduce or in_kernel_fc2_reduce or apply_topk_in_fc1:
-            raise ValueError("W4A16 MegaMoE uses external post-FC2 routing.")
+        if apply_topk_in_fc1:
+            raise ValueError("W4A16 MegaMoE applies routing weights after FC2.")
         if token_back_mode not in ("epi_warps", "reuse_dispatch_warps"):
             raise ValueError(
                 "W4A16 supports epi_warps or reuse_dispatch_warps token return."
             )
         by_dispatch = token_back_mode == "reuse_dispatch_warps"
+        self.in_kernel_fc2_reduce = fc2_in_kernel_topk_reduce or in_kernel_fc2_reduce
+        if self.in_kernel_fc2_reduce and not by_dispatch:
+            raise ValueError("W4A16 in-kernel FC2 reduction requires dispatch return.")
         if token_back_by_dispatch is not None and token_back_by_dispatch != by_dispatch:
             raise ValueError("token_back_by_dispatch must match token_back_mode.")
         if mma_tiler_mnk not in (
@@ -253,7 +256,7 @@ class Sm100W4A16MegaMoEKernel:
             combine_format=combine_format,
             token_back_by_dispatch=by_dispatch,
             fc2_publishes_per_token_cluster_tile=fc2_publishes_per_token_cluster_tile,
-            token_back_reduce_topk=False,
+            token_back_reduce_topk=self.in_kernel_fc2_reduce,
             token_back_standalone=False,
             sf_uint32_per_token=0,
             token_padding_block=token_padding_block,
@@ -291,6 +294,7 @@ class Sm100W4A16MegaMoEKernel:
             f"_return{self.token_back_mode}_epiflag{self.epi_flag_batch}"
             f"_clamp{self.gate_up_clamp}_ep{self.world_size}_topk{self.num_topk}"
             f"_tokens{self.max_tokens_per_rank}_flag{self.flag_batch}"
+            + ("_ikr" if self.in_kernel_fc2_reduce else "")
         )
 
     def _make_mixed(self, fragment_size, output_tensor, raw_stages, activation_stages):
@@ -419,7 +423,7 @@ class Sm100W4A16MegaMoEKernel:
         fc2_alpha: cute.Tensor,
         fc1_c: Optional[cute.Tensor],  # fc1 c output
         # Combine destination (peer write target via the epilogue Fc2OutputDest).
-        combine_output: cute.Tensor,  # (T, num_topk, hidden) BF16
+        combine_output: cute.Tensor,  # (T, 1 if in-kernel reduce else num_topk, H) BF16
         # Opaque workspaces.
         local_workspace: cute.Tensor,  # (local_ws_bytes,) Uint8
         shared_workspace: cute.Tensor,  # (shared_ws_bytes,) Uint8
@@ -439,10 +443,10 @@ class Sm100W4A16MegaMoEKernel:
           * ``topk_idx`` is read on the local rank only.
           * ``fc1_weight`` / ``fc2_weight`` are local-only.
 
-        ``combine_output`` is the MoE-domain ``(max_tokens_per_rank, num_topk,
-        hidden)`` BF16 storage; the epilogue maps each pool row back to the
-        source rank's ``[src_token, src_topk, :]`` slot via ``token_comm_args``
-        (form A; host reduces the topk axis).
+        ``combine_output`` holds BF16 ``(max_tokens_per_rank, num_topk, hidden)``
+        partials for external reduction, or ``(max_tokens_per_rank, 1, hidden)``
+        outputs for dispatch-return in-kernel reduction. Token communication
+        maps each pool row back to its source rank and token.
         """
         cluster_size = self.cluster_shape_mn[0] * self.cluster_shape_mn[1]
         sm_count = max_active_clusters * cluster_size
@@ -705,6 +709,7 @@ class Sm100W4A16MegaMoEKernel:
             mma_tiler_mnk=self.mma_tiler,
             cluster_shape_mn=self.cluster_shape_mn,
             token_back_by_dispatch=self.token_back_by_dispatch,
+            in_kernel_fc2_reduce=self.in_kernel_fc2_reduce,
             epi_flag_batch=self.epi_flag_batch,
             static_expert_shape=self.static_expert_shape,
             gate_up_clamp=self.gate_up_clamp,

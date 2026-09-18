@@ -41,6 +41,7 @@ class MegaMoEBf16Nvfp4Config:
     num_sched_stages: Optional[int] = None
     flag_batch: int = 1
     epi_flag_batch: Tuple[int, int] = (1, 1)
+    enable_in_kernel_fc2_reduce: bool = False
     in_kernel_fc2_reduce: bool = False
     token_back_mode: Literal[
         "epi_warps", "standalone_warps", "reuse_dispatch_warps"
@@ -57,8 +58,16 @@ class MegaMoEBf16Nvfp4Config:
             raise ValueError(
                 f"Unsupported load_balance_mode={self.load_balance_mode!r}."
             )
-        if self.apply_topk_in_fc1 or self.in_kernel_fc2_reduce:
+        if self.apply_topk_in_fc1:
             raise ValueError("W4A16 routing scores are applied after FC2.")
+        if self.in_kernel_fc2_reduce and not self.enable_in_kernel_fc2_reduce:
+            raise ValueError(
+                "in_kernel_fc2_reduce knob selected without enable_in_kernel_fc2_reduce."
+            )
+        if self.in_kernel_fc2_reduce and self.token_back_mode != "reuse_dispatch_warps":
+            raise ValueError(
+                "in_kernel_fc2_reduce requires token_back_mode='reuse_dispatch_warps'."
+            )
         if self.token_back_mode == "standalone_warps":
             raise ValueError("W4A16 standalone token-back is not supported.")
         if self.world_size < 1 or not 0 <= self.rank < self.world_size:
@@ -136,19 +145,21 @@ class MegaMoEBf16Nvfp4Frontend:
 
     def apply_knobs(self, knobs: dict) -> None:
         """Apply a validated swapped-MMA tuning configuration and invalidate its compile."""
-        from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import is_valid, with_knobs
+        from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import tuner, with_knobs
 
-        if not is_valid(
-            {
-                "mma_tiler_mnk": self.config.mma_tiler_mnk,
-                "cluster_shape_mnk": self.config.cluster_shape_mnk,
-                **knobs,
-            }
-        ):
-            raise ValueError(f"unsupported W4A16 MegaMoE knobs: {knobs}.")
-        # Clamp changes belong to set_gate_up_clamp, independently of tuning.
+        if not tuner.is_valid_bf16_nvfp4_for_config(self.config, knobs):
+            raise ValueError(
+                f"unsupported BF16/NVFP4 MegaMoE knobs {knobs}: "
+                f"{tuner.describe_invalid_knobs(self.config, knobs, tuner.is_valid_bf16_nvfp4_for_config)}."
+            )
+        # Clamp and reduction permission belong to the session, not the tuner.
         new_config = with_knobs(
-            self.config, {**knobs, "gate_up_clamp": self.config.gate_up_clamp}
+            self.config,
+            {
+                **knobs,
+                "gate_up_clamp": self.config.gate_up_clamp,
+                "enable_in_kernel_fc2_reduce": self.config.enable_in_kernel_fc2_reduce,
+            },
         )
         if new_config != self._config:
             ensure_not_capturing("apply_knobs (config change)")
@@ -301,6 +312,8 @@ class MegaMoEBf16Nvfp4Frontend:
         if mega.launch_key != key:
             mega.launch_kwargs = self._runtime_kwargs(inputs, mega)
             mega.launch_key = key
+        if self.config.in_kernel_fc2_reduce:
+            inputs.combine_output.zero_()
         mega.compiled(**mega.launch_kwargs)
         if sync:
             torch.cuda.synchronize()
@@ -311,11 +324,19 @@ class MegaMoEBf16Nvfp4Frontend:
         mega = self._ensure_compiled(inputs)
         kwargs = self._runtime_kwargs(inputs, mega)
         compiled = mega.compiled
+        if self.config.in_kernel_fc2_reduce:
 
-        def thunk():
-            compiled(**kwargs)
+            def thunk():
+                inputs.combine_output.zero_()
+                compiled(**kwargs)
 
-        return thunk
+            return thunk
+        else:
+
+            def thunk():
+                compiled(**kwargs)
+
+            return thunk
 
     def _validate(self, inputs: MegaMoEBf16Nvfp4Inputs, num_tokens: int) -> None:
         c = self.config
@@ -376,7 +397,12 @@ class MegaMoEBf16Nvfp4Frontend:
                 raise ValueError("weight global scales must be FP32 per expert.")
             if not all(t.is_cuda and t.is_contiguous() for t in (scale, alpha)):
                 raise ValueError("weight scales must be contiguous CUDA tensors.")
-        if inputs.combine_output.shape != (c.num_tokens_per_rank, c.num_topk, c.hidden):
+        combine_topk = 1 if c.in_kernel_fc2_reduce else c.num_topk
+        if inputs.combine_output.shape != (
+            c.num_tokens_per_rank,
+            combine_topk,
+            c.hidden,
+        ):
             raise ValueError("combine_output has an invalid shape.")
 
     def reduce_topk(self, combined, scores, output):
@@ -434,6 +460,14 @@ class MegaMoEBf16Nvfp4SymmBuffer:
     _sym_roots: list[torch.Tensor] = field(default_factory=list)
     _destroyed: bool = False
 
+    @property
+    def kernel_combine_output(self) -> torch.Tensor:
+        """A compact reduction target, or all top-k partials for external combine."""
+        if self._frontend.config.in_kernel_fc2_reduce:
+            # Both tactics reuse the same symmetric allocation during autotune.
+            return self.combine_output.view(-1, 1, self.hidden)[: self.num_max_tokens]
+        return self.combine_output
+
     def destroy(self) -> None:
         if not self._destroyed:
             self._frontend.release()
@@ -462,7 +496,7 @@ def get_symm_buffer_for_bf16_nvfp4_mega_moe(
     *,
     gate_up_clamp: Optional[float] = None,
     activation_clamp: Optional[float] = None,
-    in_kernel_fc2_reduce: bool = False,
+    enable_in_kernel_fc2_reduce: bool = False,
     token_back_mode: Optional[
         Literal["epi_warps", "standalone_warps", "reuse_dispatch_warps"]
     ] = None,
@@ -471,7 +505,11 @@ def get_symm_buffer_for_bf16_nvfp4_mega_moe(
     clamp = resolve_gate_up_clamp(
         gate_up_clamp=gate_up_clamp, activation_clamp=activation_clamp
     )
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import resolve_knobs, with_knobs
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+        resolve_knobs,
+        tuner,
+        with_knobs,
+    )
 
     # Match the existing Mega cache contract: None is a pure capacity-keyed
     # lookup; an explicit dict (including {}) bypasses cache and defaults.
@@ -485,15 +523,16 @@ def get_symm_buffer_for_bf16_nvfp4_mega_moe(
             topk=num_topk,
             max_tokens=num_max_tokens,
             combine_dtype="bf16",
+            enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
         )
     else:
         resolved_knobs = {}
     optional_config = {
         **resolved_knobs,
         "gate_up_clamp": clamp,
-        "in_kernel_fc2_reduce": in_kernel_fc2_reduce,
         **({"token_back_mode": token_back_mode} if token_back_mode is not None else {}),
         **(knobs or {}),
+        "enable_in_kernel_fc2_reduce": enable_in_kernel_fc2_reduce,
     }
     cfg = MegaMoEBf16Nvfp4Config(
         rank=rank,
@@ -503,7 +542,13 @@ def get_symm_buffer_for_bf16_nvfp4_mega_moe(
         num_total_experts=num_total_experts,
         hidden=hidden,
         intermediate=intermediate,
+        enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
     )
+    if not tuner.is_valid_bf16_nvfp4_for_config(cfg, optional_config):
+        raise ValueError(
+            f"unsupported BF16/NVFP4 MegaMoE knobs {optional_config}: "
+            f"{tuner.describe_invalid_knobs(cfg, optional_config, tuner.is_valid_bf16_nvfp4_for_config)}."
+        )
     cfg = with_knobs(cfg, optional_config)
     x = sym_zeros((num_max_tokens, hidden), torch.bfloat16)
     topk_idx = sym_zeros((num_max_tokens, num_topk), torch.int64)
@@ -550,6 +595,7 @@ def bf16_nvfp4_mega_moe(
         raise ValueError("y must be a contiguous CUDA tensor.")
     if (
         n > 0
+        and not symm_buffer._frontend.config.in_kernel_fc2_reduce
         and symm_buffer._frontend._reduce is None
         and torch.cuda.is_current_stream_capturing()
     ):
@@ -574,11 +620,14 @@ def bf16_nvfp4_mega_moe(
             transformed_l2[0],
             transformed_l2[1],
             transformed_l2[2],
-            symm_buffer.combine_output,
+            symm_buffer.kernel_combine_output,
         ),
         num_tokens=n,
     )
-    symm_buffer._frontend.reduce_topk(result, symm_buffer.topk_weights[:n], y)
+    if symm_buffer._frontend.config.in_kernel_fc2_reduce:
+        y.copy_(result[:, 0])
+    else:
+        symm_buffer._frontend.reduce_topk(result, symm_buffer.topk_weights[:n], y)
     if sync:
         torch.cuda.synchronize()
 
@@ -599,7 +648,7 @@ def bf16_nvfp4_mega_launch_thunk(
             transformed_l2[0],
             transformed_l2[1],
             transformed_l2[2],
-            symm_buffer.combine_output,
+            symm_buffer.kernel_combine_output,
         )
     )
 

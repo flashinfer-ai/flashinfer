@@ -113,7 +113,10 @@ def test_record_upserts_same_key(monkeypatch, tmp_path):
     assert len(data["entries"]) == 1
 
 
-def test_ikr_and_deterministic_winners_are_separate_entries(monkeypatch, tmp_path):
+@pytest.mark.parametrize("dtype", ["nvfp4", "bf16_nvfp4"])
+def test_ikr_and_deterministic_winners_are_separate_entries(
+    monkeypatch, tmp_path, dtype
+):
     """The two objectives are tuned separately, so neither may evict the other."""
     import json
 
@@ -122,48 +125,54 @@ def test_ikr_and_deterministic_winners_are_separate_entries(monkeypatch, tmp_pat
         record_knobs,
     )
 
+    key = {**_KEY, "dtype": dtype}
     path = _cache_env(monkeypatch, tmp_path)
     ikr = {**_KNOBS, "flag_batch": 8, "in_kernel_fc2_reduce": True}
-    record_knobs(_KNOBS, max_tokens=2048, device="testgpu", **_KEY)
-    record_knobs(ikr, max_tokens=2048, device="testgpu", **_KEY)
+    record_knobs(_KNOBS, max_tokens=2048, device="testgpu", **key)
+    record_knobs(ikr, max_tokens=2048, device="testgpu", **key)
     assert len(json.loads(path.read_text())["entries"]) == 2
 
     # A reproducible session must not be served the ikr winner: its other
     # knobs were only ever measured alongside ikr.
-    assert lookup_knobs(max_tokens=2048, device="testgpu", **_KEY) == _KNOBS
+    assert lookup_knobs(max_tokens=2048, device="testgpu", **key) == _KNOBS
     assert (
         lookup_knobs(
             max_tokens=2048,
             device="testgpu",
             enable_in_kernel_fc2_reduce=True,
-            **_KEY,
+            **key,
         )
         == ikr
     )
 
 
-def test_permitted_session_falls_back_to_a_deterministic_entry(monkeypatch, tmp_path):
+@pytest.mark.parametrize("dtype", ["nvfp4", "bf16_nvfp4"])
+def test_permitted_session_falls_back_to_a_deterministic_entry(
+    monkeypatch, tmp_path, dtype
+):
     """The permission is a ceiling, so a non-ikr winner stays usable."""
     from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
         lookup_knobs,
         record_knobs,
     )
 
+    key = {**_KEY, "dtype": dtype}
     _cache_env(monkeypatch, tmp_path)
-    record_knobs(_KNOBS, max_tokens=2048, device="testgpu", **_KEY)
+    record_knobs(_KNOBS, max_tokens=2048, device="testgpu", **key)
     assert (
         lookup_knobs(
             max_tokens=2048,
             device="testgpu",
             enable_in_kernel_fc2_reduce=True,
-            **_KEY,
+            **key,
         )
         == _KNOBS
     )
 
 
+@pytest.mark.parametrize("dtype", ["nvfp4", "bf16_nvfp4"])
 def test_resolve_ignores_an_ikr_entry_for_a_deterministic_session(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, dtype
 ):
     """Falling back to the heuristic beats serving a knob set never measured."""
     from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
@@ -172,18 +181,19 @@ def test_resolve_ignores_an_ikr_entry_for_a_deterministic_session(
         resolve_knobs,
     )
 
+    key = {**_KEY, "dtype": dtype}
     _cache_env(monkeypatch, tmp_path)
     with mock.patch(
         "flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.knob_cache."
         "_current_device_name",
         return_value="testgpu",
     ):
-        record_knobs({**_KNOBS, "in_kernel_fc2_reduce": True}, max_tokens=2048, **_KEY)
-        knobs, source = resolve_knobs(max_tokens=2048, **_KEY)
+        record_knobs({**_KNOBS, "in_kernel_fc2_reduce": True}, max_tokens=2048, **key)
+        knobs, source = resolve_knobs(max_tokens=2048, **key)
         permitted, permitted_source = resolve_knobs(
-            max_tokens=2048, enable_in_kernel_fc2_reduce=True, **_KEY
+            max_tokens=2048, enable_in_kernel_fc2_reduce=True, **key
         )
-    assert (source, knobs) == ("heuristic", default_knobs(2048))
+    assert (source, knobs) == ("heuristic", default_knobs(2048, dtype=dtype))
     assert permitted_source == "cache"
     assert permitted["in_kernel_fc2_reduce"] is True
 

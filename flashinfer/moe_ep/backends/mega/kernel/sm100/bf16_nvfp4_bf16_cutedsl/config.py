@@ -12,12 +12,16 @@ class Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     Routing scores are applied after FC2. Packed weight data, E4M3 block
     scales and optional FP32 global scales are supplied in ``MoEWeightPack``.
     SwiGLU uses the kernel's fixed approximate exp2/reciprocal implementation.
+    In-kernel FC2 reduction is opt-in: its BF16 atomic accumulation is
+    nondeterministic; the default combines BF16 partials in FP32.
     """
 
     intermediate_size: int
     top_k: int
     kernel_name: str = "sm100_bf16_nvfp4_bf16_cutedsl"
     gate_up_clamp: float | None = None
+    # Permit BF16 in-kernel reduction; autotune may still choose external reduction.
+    enable_in_kernel_fc2_reduce: bool = False
     # None looks up a recorded winner or the built-in profile; a dict overrides
     # both. "auto" tunes collectively on the first forward, before capture.
     knobs: dict | Literal["auto"] | None = None

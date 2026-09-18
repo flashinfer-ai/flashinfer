@@ -1229,6 +1229,7 @@ def _run_nvfp4_routing_rounds(
     knobs,
     changing_batches,
     num_tokens=257,
+    in_kernel_fc2_reduce=False,
 ):
     """One public layer reuses its workspace across skew, empty sources and refill."""
     import dataclasses
@@ -1300,7 +1301,8 @@ def _run_nvfp4_routing_rounds(
                 intermediate_size=intermediate,
                 top_k=topk,
                 gate_up_clamp=1.5,
-                knobs=knobs,
+                enable_in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+                knobs={**knobs, "in_kernel_fc2_reduce": in_kernel_fc2_reduce},
             )
         ),
     )
@@ -1357,7 +1359,12 @@ def _run_nvfp4_routing_rounds(
             assert y.dtype == torch.bfloat16 and y.shape == (n, hidden)
             assert torch.isfinite(y).all(), (mode, name, rank)
             if n:
-                _assert_nvfp4_reference(y, reference, mode=mode)
+                _assert_nvfp4_reference(
+                    y,
+                    reference,
+                    mode=mode,
+                    in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+                )
     finally:
         layer.destroy()
         torch.cuda.synchronize()
@@ -1366,11 +1373,19 @@ def _run_nvfp4_routing_rounds(
 
 @pytest.mark.gpu_2
 @pytest.mark.arch_blackwell
-@pytest.mark.parametrize("mode", ["w4a4", "w4a16"])
-@pytest.mark.parametrize("token_back_mode", ["epi_warps", "reuse_dispatch_warps"])
+@pytest.mark.parametrize(
+    "mode,token_back_mode,in_kernel_fc2_reduce",
+    [
+        ("w4a4", "epi_warps", False),
+        ("w4a4", "reuse_dispatch_warps", False),
+        ("w4a16", "epi_warps", False),
+        ("w4a16", "reuse_dispatch_warps", False),
+        ("w4a16", "reuse_dispatch_warps", True),
+    ],
+)
 @pytest.mark.parametrize("load_balance_mode", ["static", "atomic_counter"])
 def test_nvfp4_mega_uneven_sources_and_empty_refill(
-    mode, token_back_mode, load_balance_mode
+    mode, token_back_mode, in_kernel_fc2_reduce, load_balance_mode
 ):
     _require_cuda()
     rank, world_size = _launcher_ranks()
@@ -1387,6 +1402,7 @@ def test_nvfp4_mega_uneven_sources_and_empty_refill(
             "load_balance_mode": load_balance_mode,
         },
         changing_batches=True,
+        in_kernel_fc2_reduce=in_kernel_fc2_reduce,
     )
 
 
@@ -1648,3 +1664,42 @@ def test_autotune_nvfp4_candidates_cover_ikr():
     pinned = nvfp4_candidates()
     assert pinned and all(not k["in_kernel_fc2_reduce"] for k in pinned)
     assert len(pinned) * 2 == len(cands)
+
+
+def test_bf16_nvfp4_ikr_permission_and_candidates():
+    from flashinfer.moe_ep import Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
+    from flashinfer.moe_ep.cute_dsl.megamoe.bf16_nvfp4 import (
+        MegaMoEBf16Nvfp4Config,
+        bf16_nvfp4_candidates,
+    )
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import tuner
+
+    assert not Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+        intermediate_size=256, top_k=2
+    ).enable_in_kernel_fc2_reduce
+    base = dict(
+        rank=0,
+        world_size=1,
+        num_tokens_per_rank=64,
+        num_topk=2,
+        num_total_experts=4,
+        hidden=256,
+        intermediate=256,
+    )
+    deterministic = bf16_nvfp4_candidates()
+    permitted = bf16_nvfp4_candidates(enable_in_kernel_fc2_reduce=True)
+    assert len(deterministic) == 4 and len(permitted) == 6
+    assert permitted[:4] == deterministic
+    for knobs in permitted:
+        assert tuner.is_valid_bf16_nvfp4(knobs)
+        config = MegaMoEBf16Nvfp4Config(
+            **base, enable_in_kernel_fc2_reduce=True, **knobs
+        )
+        assert config.in_kernel_fc2_reduce == knobs["in_kernel_fc2_reduce"]
+        if knobs["in_kernel_fc2_reduce"]:
+            assert knobs["token_back_mode"] == "reuse_dispatch_warps"
+            with pytest.raises(ValueError, match="enable_in_kernel_fc2_reduce"):
+                MegaMoEBf16Nvfp4Config(**base, **knobs)
+            assert not tuner.is_valid_bf16_nvfp4(
+                {**knobs, "token_back_mode": "epi_warps"}
+            )

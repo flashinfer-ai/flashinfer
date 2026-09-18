@@ -109,6 +109,7 @@ class Bf16Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             self.ep_rank,
             self.ep_world_size,
             gate_up_clamp=config.gate_up_clamp,
+            enable_in_kernel_fc2_reduce=config.enable_in_kernel_fc2_reduce,
             knobs=config.knobs if isinstance(config.knobs, dict) else None,
         )
 
@@ -130,6 +131,7 @@ class Bf16Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             config.intermediate_size,
             config.top_k,
             config.gate_up_clamp,
+            config.enable_in_kernel_fc2_reduce,
             knobs_pool_key(config.knobs),
         )
 

@@ -53,10 +53,12 @@ class W4A16Epilogue:
         cluster_shape_mn,
         static_expert_shape,
         token_back_by_dispatch=False,
+        in_kernel_fc2_reduce=False,
         gate_up_clamp=None,
         epi_flag_batch=(1, 1),
     ):
         self.token_back_by_dispatch = token_back_by_dispatch
+        self.in_kernel_fc2_reduce = in_kernel_fc2_reduce
         self.gate_up_clamp = gate_up_clamp
         fc1_batch, fc2_batch = (1, 1) if epi_flag_batch is None else epi_flag_batch
         self.fc1_epi_flag_batch = max(1, min(32, int(fc1_batch)))
@@ -282,6 +284,20 @@ class W4A16Fc2Epilogue(EpilogueContext):
             # register packing and STG remain.
             cute.arch.fence_view_async_tmem_load()
             acc_pipeline.consumer_release(acc_consumer_state)
+        if cutlass.const_expr(self.in_kernel_fc2_reduce):
+            # Preserve FC2's BF16 rounding before weighting; dispatch reduces
+            # these weighted BF16 contributions into the source token output.
+            for row in cutlass.range_constexpr(2):
+                token_in_tile = self.tidx % 32 + subtile_idx * 64 + row * 32
+                if token_in_tile < fc2_output_router.valid_tokens_this_cta_tile:
+                    pool_row = fc2_output_router.token_bases + token_in_tile
+                    score = self.token_comm_args.fc1_input_topk_weights_buffer[pool_row]
+                    values = cute.make_tensor(
+                        pre_store.iterator + row * 32, cute.make_layout((32,))
+                    )
+                    values.store(
+                        (values.load().to(cutlass.Float32) * score).to(cutlass.BFloat16)
+                    )
         fc2_stg_store_function(
             subtile=pre_store,
             subtile_idx=subtile_idx,

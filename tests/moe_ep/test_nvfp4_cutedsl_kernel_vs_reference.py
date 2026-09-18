@@ -453,8 +453,15 @@ def test_nvfp4_preprocess_fp4_weights_match_plain_quant(
 
 
 @pytest.mark.arch_blackwell
-@pytest.mark.parametrize("mode", NVFP4_MODES)
-@pytest.mark.parametrize("token_back_mode", ["epi_warps", "reuse_dispatch_warps"])
+@pytest.mark.parametrize(
+    "mode,tile_n,in_kernel_fc2_reduce,token_back_mode",
+    [
+        (mode, 128, False, token_back_mode)
+        for mode in NVFP4_MODES
+        for token_back_mode in ("epi_warps", "reuse_dispatch_warps")
+    ]
+    + [("w4a16", tile_n, True, "reuse_dispatch_warps") for tile_n in (64, 128)],
+)
 @pytest.mark.parametrize(
     "hidden,intermediate,num_experts,topk",
     [
@@ -467,7 +474,15 @@ def test_nvfp4_preprocess_fp4_weights_match_plain_quant(
     ],
 )
 def test_nvfp4_kernel_matches_torch_reference(
-    monkeypatch, mode, token_back_mode, hidden, intermediate, num_experts, topk
+    monkeypatch,
+    mode,
+    tile_n,
+    in_kernel_fc2_reduce,
+    token_back_mode,
+    hidden,
+    intermediate,
+    num_experts,
+    topk,
 ):
     """Single-rank ``nvfp4_mega_moe`` output matches the pure-torch oracle."""
     _require_cuda()
@@ -540,6 +555,12 @@ def test_nvfp4_kernel_matches_torch_reference(
         )
     intermediate_arg = {"w4a4": 2 * intermediate, "w4a16": intermediate}[mode]
 
+    knobs = {"token_back_mode": token_back_mode}
+    if mode == "w4a16":
+        knobs.update(
+            mma_tiler_mnk=(256, tile_n, 256), in_kernel_fc2_reduce=in_kernel_fc2_reduce
+        )
+
     # NOTE: the nvfp4 shim's ``intermediate`` is the fc1 output width (2*I),
     # matching the backend's ``2 * intermediate_size`` convention.
     symm_buffer = get_symm_buffer_for_mega_moe(
@@ -551,8 +572,10 @@ def test_nvfp4_kernel_matches_torch_reference(
         rank,
         world_size,
         gate_up_clamp=problem["gate_up_clamp"],
-        knobs={"token_back_mode": token_back_mode},
+        enable_in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+        knobs=knobs,
     )
+    graph = None
     try:
         scale_args = ()
         if mode == "w4a4":
@@ -590,22 +613,45 @@ def test_nvfp4_kernel_matches_torch_reference(
         y_kernel = torch.empty(
             num_tokens, problem["hidden"], dtype=torch.bfloat16, device="cuda"
         )
-        nvfp4_mega_moe(
-            y_kernel,
-            transformed_l1,
-            transformed_l2,
-            symm_buffer,
-            num_tokens=num_tokens,
-            gate_up_clamp=problem["gate_up_clamp"],
-        )
-        torch.cuda.synchronize()
 
-        _assert_nvfp4_reference(y_kernel, reference, mode=mode)
+        def launch():
+            nvfp4_mega_moe(
+                y_kernel,
+                transformed_l1,
+                transformed_l2,
+                symm_buffer,
+                num_tokens=num_tokens,
+                gate_up_clamp=problem["gate_up_clamp"],
+            )
+
+        launch()
+        torch.cuda.synchronize()
+        _assert_nvfp4_reference(
+            y_kernel, reference, mode=mode, in_kernel_fc2_reduce=in_kernel_fc2_reduce
+        )
+        if in_kernel_fc2_reduce:
+            # BF16 atomic combine may reorder terms; the shared oracle band
+            # covers that rounding while repeated launches catch missing zeroing.
+            for _ in range(2):
+                launch()
+                _assert_nvfp4_reference(
+                    y_kernel, reference, mode=mode, in_kernel_fc2_reduce=True
+                )
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                launch()
+            for _ in range(3):
+                graph.replay()
+                _assert_nvfp4_reference(
+                    y_kernel, reference, mode=mode, in_kernel_fc2_reduce=True
+                )
     finally:
+        if graph is not None:
+            graph.reset()
         symm_buffer.destroy()
 
 
-def _assert_nvfp4_reference(y_kernel, reference, *, mode):
+def _assert_nvfp4_reference(y_kernel, reference, *, mode, in_kernel_fc2_reduce=False):
     import torch
 
     assert mode in NVFP4_MODES, mode
@@ -613,7 +659,9 @@ def _assert_nvfp4_reference(y_kernel, reference, *, mode):
     if mode == "w4a16":
         from .mega_oracle_compare import _assert_mega_oracle_term_band_close
 
-        _assert_mega_oracle_term_band_close(y_kernel, reference, ikr=False, label=mode)
+        _assert_mega_oracle_term_band_close(
+            y_kernel, reference, ikr=in_kernel_fc2_reduce, label=mode
+        )
         return
     assert mode == "w4a4"
     y_ref = reference

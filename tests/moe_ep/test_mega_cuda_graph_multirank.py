@@ -17,6 +17,7 @@ from __future__ import annotations
 import pytest
 
 from .test_moe_ep_nvfp4_cutedsl_mega_multirank import (
+    _assert_ikr_close,
     _launcher_ranks,
     _mega_problem,
     _require_cuda,
@@ -28,15 +29,18 @@ _REPLAYS = 4
 @pytest.mark.gpu_2
 @pytest.mark.arch_blackwell
 @pytest.mark.parametrize(
-    "mode,token_back_mode,tuning",
+    "mode,token_back_mode,tuning,in_kernel_fc2_reduce",
     [
-        ("w4a4", "epi_warps", "manual"),
-        ("w4a16", "epi_warps", "manual"),
-        ("w4a16", "reuse_dispatch_warps", "manual"),
-        ("w4a16", None, "auto"),
+        ("w4a4", "epi_warps", "manual", False),
+        ("w4a16", "epi_warps", "manual", False),
+        ("w4a16", "reuse_dispatch_warps", "manual", False),
+        ("w4a16", None, "auto", False),
+        ("w4a16", "reuse_dispatch_warps", "manual", True),
     ],
 )
-def test_nvfp4_mega_two_rank_graph_replay_lockstep(mode, token_back_mode, tuning):
+def test_nvfp4_mega_two_rank_graph_replay_lockstep(
+    mode, token_back_mode, tuning, in_kernel_fc2_reduce
+):
     pytest.importorskip("flashinfer.moe_ep.kernel_src.cutedsl_megamoe")
     _require_cuda()
     rank, world_size = _launcher_ranks()
@@ -83,15 +87,20 @@ def test_nvfp4_mega_two_rank_graph_replay_lockstep(mode, token_back_mode, tuning
                 intermediate_size=problem["intermediate"],
                 top_k=problem["topk"],
                 gate_up_clamp=problem["gate_up_clamp"],
+                enable_in_kernel_fc2_reduce=in_kernel_fc2_reduce,
                 knobs="auto"
                 if tuning == "auto"
-                else {"token_back_mode": token_back_mode},
+                else {
+                    "token_back_mode": token_back_mode,
+                    "in_kernel_fc2_reduce": in_kernel_fc2_reduce,
+                },
             ),
             quantize_input=True,
             preprocess_weights=True,
         ),
     )
     assert isinstance(mega, MoEEpMegaLayer)
+    graph = None
     try:
         t = MoEEpTensors(
             hidden_states=problem["hidden_states"],
@@ -120,9 +129,12 @@ def test_nvfp4_mega_two_rank_graph_replay_lockstep(mode, token_back_mode, tuning
             graph.replay()
             torch.cuda.synchronize()
             dist.barrier()
-        assert torch.equal(y_graph, y_eager), (
-            f"rank {rank}: lockstep graph replay diverged from eager"
-        )
+        if in_kernel_fc2_reduce:
+            _assert_ikr_close(y_graph, y_eager, topk=problem["topk"])
+        else:
+            assert torch.equal(y_graph, y_eager), (
+                f"rank {rank}: lockstep graph replay diverged from eager"
+            )
 
         # Replay over mutated inputs (fresh values, same buffers).
         g = torch.Generator(device="cuda").manual_seed(1234 + rank)
@@ -142,10 +154,21 @@ def test_nvfp4_mega_two_rank_graph_replay_lockstep(mode, token_back_mode, tuning
         y_eager2 = mega.forward(t)
         torch.cuda.synchronize()
         dist.barrier()
-        assert torch.equal(y_replay, y_eager2), (
-            f"rank {rank}: replay-after-mutation diverged from eager"
-        )
+        if in_kernel_fc2_reduce:
+            _assert_ikr_close(y_replay, y_eager2, topk=problem["topk"])
+        else:
+            assert torch.equal(y_replay, y_eager2), (
+                f"rank {rank}: replay-after-mutation diverged from eager"
+            )
+        if in_kernel_fc2_reduce:
+            t.hidden_states.zero_()
+            graph.replay()
+            torch.cuda.synchronize()
+            dist.barrier()
+            assert torch.count_nonzero(y_graph) == 0
     finally:
+        if graph is not None:
+            graph.reset()
         mega.destroy()
         torch.cuda.synchronize()
         dist.barrier()
