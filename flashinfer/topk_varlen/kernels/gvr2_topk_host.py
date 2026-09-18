@@ -839,6 +839,14 @@ def _gate_first_call(raw):
         return gated
 
 
+# Programmatic dependent launch for the register families of the decode path: the
+# kernel waits (griddepcontrol.wait) before its first read, so with the launch
+# attribute set the NEXT kernel's launch processing overlaps this kernel's tail
+# (in a CUDA graph and in a serving stream alike). Measured on B200 decode cells
+# (K=2048, N=4096, 16 rows): 4.65 -> 4.0 us per call in graph replay.
+_DECODE_PDL = True
+
+
 def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False, page_shift=None):
     """Capture-time varlen plan + compiled launcher.  The gvr_main port is
     the universally correct fallback; specialist family tiers below.  Every
@@ -891,6 +899,7 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False, page
         fn = _gate_first_call(
             dev.get_compiled__regclus(
                 tuple(plan_free["tpl"]),
+                pdl=_DECODE_PDL,
                 varlen=True,
                 next_n=next_n,
                 cr_shift=cr_shift,
@@ -910,14 +919,20 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False, page
     # size, all safe upper bounds for every per-row n <= envelope; per-row n
     # / short-row handling lives in-kernel.
     if plan_free["kernel"] in ("reg", "regimg"):
+        # staged coalesced emit only for one-wave launches (rows <= SMs): it trades
+        # scattered stores for a barrier + copy, a 5-25% win when latency-bound and
+        # a 3-4% loss when the grid is several waves deep (measured B200/B300)
+        stage_out = num_rows <= sms
         fn = _gate_first_call(
             dev.get_compiled__reg(
                 tuple(plan_free["tpl"]),
+                pdl=_DECODE_PDL,
                 varlen=True,
                 next_n=next_n,
                 cr_shift=cr_shift,
                 hint_free=hint_free,
                 pt_smem=pt_smem,
+                stage_out=stage_out,
                 **pg,
             )
         )
@@ -929,7 +944,7 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False, page
                 n_kernel,
                 rt_f["CMP"],
                 rt_f["QC"],
-                dev.STATIC_BYTES + plan_free["smem"] + 4 * pt_smem,
+                dev.STATIC_BYTES + plan_free["smem"] + 4 * pt_smem + (4 * k if stage_out else 0),
             ),
         )
         _VARLEN_CACHE[key] = lc
@@ -1193,6 +1208,7 @@ def _prefill_reg_launcher(plan: dict, k: int, abs_out: bool = False) -> tuple:
             hint_free=True,
             prefill=True,
             prefill_abs=abs_out,
+            stage_out=False,  # prefill slabs are many waves deep: direct emit
         )
     )
     lc = ("reg", fn, (rt["CMP"], rt["QC"], dev.STATIC_BYTES + plan["smem"]))
@@ -1740,7 +1756,8 @@ def _build_launcher(b, n, npad, k):
         def fn(lg, pi, o, *a, _raw=raw):
             _raw(lg, pi, _dummy_kv(lg.get_device(), lg.device), o, *a)
 
-        args = (rt["n"], rt["CMP"], rt["QC"], dev.STATIC_BYTES + rd["smem"])
+        # + 4*k: the register kernel stages its k outputs in smem (stage_out default)
+        args = (rt["n"], rt["CMP"], rt["QC"], dev.STATIC_BYTES + rd["smem"] + 4 * k)
         return (fn, args, False)
     if fam == "main":
         dev = _device()
