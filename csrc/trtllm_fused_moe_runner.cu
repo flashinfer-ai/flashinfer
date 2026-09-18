@@ -509,6 +509,8 @@ void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace
   activationData.expandedIdxToPermutedIdx = workspace.expanded_idx_to_permuted_idx;
 
   activationData.totalNumPaddedTokens = workspace.total_num_padded_tokens;
+  activationData.ctaIdxXyToMnLimit = workspace.cta_idx_xy_to_mn_limit;
+  activationData.numNonExitingCtas = workspace.num_non_exiting_ctas;
 
   // SwiGLU OAI controls. The fused-epilogue paths get these through the FC1 GEMM instead; this
   // kernel only runs for DeepSeek FP8, where FC1 has no fused activation to carry them.
