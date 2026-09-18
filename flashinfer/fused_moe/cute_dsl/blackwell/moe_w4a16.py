@@ -21,7 +21,6 @@ from flashinfer.fused_moe.cute_dsl.moe_utils import (
     moe_output_memset_inplace,
     moe_permute,
     moe_sort,
-    moe_unpermute,
     normalize_cute_dsl_moe_activation_type,
     validate_cute_dsl_moe_situ_config,
 )
@@ -32,6 +31,7 @@ from flashinfer.tllm_enums import (
     DEFAULT_SWIGLU_LIMIT,
 )
 
+from .moe_finalize import moe_unpermute
 from .moe_w4a16_kernel import Sm100W4A16GroupedGemmKernel
 
 

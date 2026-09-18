@@ -507,9 +507,9 @@ def _moe_core_impl(
 
     # Step 4: Deterministic routing-weight reduction
     if not use_fused_finalize:
-        from .blackwell.expanded_finalize import moe_unpermute_expanded
+        from .blackwell.moe_finalize import moe_unpermute
 
-        moe_unpermute_expanded(
+        moe_unpermute(
             permuted_input=gemm2_output,
             output=moe_output,
             expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
@@ -517,6 +517,7 @@ def _moe_core_impl(
             num_tokens=num_tokens,
             top_k=top_k,
             enable_pdl=enable_pdl,
+            input_is_expanded=True,
         )
 
     return moe_output[:num_tokens]
