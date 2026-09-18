@@ -40,6 +40,7 @@ from .hopper.utils import TORCH_TO_CUTLASS_DTYPE
 from .moe_utils import (
     normalize_cute_dsl_moe_activation_type,
     validate_cute_dsl_moe_situ_config,
+    validate_cute_dsl_moe_swiglu_config,
 )
 
 _gather_kernel_cache: Dict[Tuple, Any] = {}
@@ -243,6 +244,7 @@ def sm90_contiguous_gather_grouped_gemm_act_fusion(
         ``w1_weight.shape[1]`` otherwise.
     """
     activation, gated = normalize_cute_dsl_moe_activation_type(activation_type)
+    validate_cute_dsl_moe_swiglu_config(swiglu_alpha, swiglu_beta, swiglu_limit)
     validate_cute_dsl_moe_situ_config(activation, situ_beta, situ_linear_beta)
     out_n_factor = 2 if gated else 1
     major, minor = get_compute_capability(x.device)

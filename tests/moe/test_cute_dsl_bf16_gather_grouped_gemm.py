@@ -312,8 +312,9 @@ def test_cute_dsl_bf16_gather_grouped_gemm_activations(
 
 @cute_dsl_available
 def test_cute_dsl_bf16_gather_grouped_gemm_rejects_bad_activation_config():
-    """Unsupported activation types and inconsistent SiTU parameters are
-    rejected when the kernel is configured, before any compilation."""
+    """Unsupported activation types, bad SwiGLU constants and inconsistent SiTU
+    parameters are rejected when the kernel is configured, before any
+    compilation, checked in that order."""
     import cutlass
 
     from flashinfer.fused_moe.cute_dsl.hopper.contiguous_gather_grouped_gemm_act_fusion import (
@@ -329,9 +330,17 @@ def test_cute_dsl_bf16_gather_grouped_gemm_rejects_bad_activation_config():
     for bad in (ActivationType.Geglu, ActivationType.Silu, ActivationType.SwigluStep):
         with pytest.raises(ValueError, match="Unsupported activation_type"):
             make(activation_type=bad.value)
+    with pytest.raises(ValueError, match="swiglu_alpha must be finite"):
+        make(swiglu_alpha=float("nan"))
+    with pytest.raises(ValueError, match="swiglu_beta must be finite"):
+        make(swiglu_beta=float("inf"))
+    with pytest.raises(ValueError, match="swiglu_limit must be positive"):
+        make(swiglu_limit=0.0)
     with pytest.raises(ValueError, match="requires situ_beta"):
         make(situ_linear_beta=25.0)
     with pytest.raises(ValueError, match="require ActivationType.Swiglu"):
         make(activation_type=ActivationType.GegluTanh.value, situ_beta=4.0)
+    with pytest.raises(ValueError, match="swiglu_limit must be positive"):
+        make(swiglu_limit=0.0, situ_linear_beta=25.0)
     assert make(activation_type=ActivationType.Relu2.value).out_n_factor == 1
     assert make(activation_type=ActivationType.GegluTanh.value).out_n_factor == 2

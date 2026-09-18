@@ -34,17 +34,17 @@ def _get_cuda_stream_ptr() -> int:
     return torch.cuda.current_stream().cuda_stream
 
 
-def _is_positive_finite_fp32(value: float) -> bool:
-    """Whether ``value`` stays positive and finite after rounding to fp32.
+def _is_finite_fp32(value: float, *, positive: bool = False) -> bool:
+    """Whether ``value`` is finite (and positive, if requested) after fp32 rounding.
 
-    The kernels consume the scale and its reciprocal as fp32 constants, so a
-    Python float that rounds to ``0.0`` or ``inf`` in fp32 is unusable even
-    though it is positive and finite in f64.
+    The kernels consume these constants (and, for the SiTU scales, their
+    reciprocals) as fp32, so a Python float that rounds to ``0.0`` or ``inf``
+    in fp32 is unusable even though it is finite and positive in f64.
     """
-    if not math.isfinite(value) or value <= 0:
+    if not math.isfinite(value) or (positive and value <= 0):
         return False
     value_f32 = torch.tensor(value, dtype=torch.float32).item()
-    return math.isfinite(value_f32) and value_f32 > 0
+    return math.isfinite(value_f32) and (not positive or value_f32 > 0)
 
 
 # ============================ Helper Functions ============================
@@ -69,6 +69,20 @@ def normalize_cute_dsl_moe_activation_type(
     return activation_type, is_gated_activation(activation_type)
 
 
+def validate_cute_dsl_moe_swiglu_config(
+    swiglu_alpha: float,
+    swiglu_beta: float,
+    swiglu_limit: float,
+) -> None:
+    """Validate the SwiGLU epilogue constants."""
+    if not _is_finite_fp32(swiglu_alpha):
+        raise ValueError("swiglu_alpha must be finite in fp32")
+    if not _is_finite_fp32(swiglu_beta):
+        raise ValueError("swiglu_beta must be finite in fp32")
+    if not _is_finite_fp32(swiglu_limit, positive=True):
+        raise ValueError("swiglu_limit must be positive and finite in fp32")
+
+
 def validate_cute_dsl_moe_situ_config(
     activation_type: ActivationType,
     situ_beta: Optional[float],
@@ -81,9 +95,11 @@ def validate_cute_dsl_moe_situ_config(
         return
     if activation_type != ActivationType.Swiglu:
         raise ValueError("SiTU parameters require ActivationType.Swiglu")
-    if not _is_positive_finite_fp32(situ_beta):
+    if not _is_finite_fp32(situ_beta, positive=True):
         raise ValueError("situ_beta must be positive and finite in fp32")
-    if situ_linear_beta is not None and not _is_positive_finite_fp32(situ_linear_beta):
+    if situ_linear_beta is not None and not _is_finite_fp32(
+        situ_linear_beta, positive=True
+    ):
         raise ValueError(
             "situ_linear_beta must be positive and finite in fp32 when set"
         )

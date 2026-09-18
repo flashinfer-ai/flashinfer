@@ -84,6 +84,7 @@ from ..common.kernel_utils import (
 from ..moe_utils import (
     normalize_cute_dsl_moe_activation_type,
     validate_cute_dsl_moe_situ_config,
+    validate_cute_dsl_moe_swiglu_config,
 )
 
 
@@ -217,6 +218,7 @@ class Sm90ContiguousGatherGroupedGemmActFusionKernel:
                 f"cluster_shape_mn={cluster_shape_mn}"
             )
         activation, gated = normalize_cute_dsl_moe_activation_type(activation_type)
+        validate_cute_dsl_moe_swiglu_config(swiglu_alpha, swiglu_beta, swiglu_limit)
         validate_cute_dsl_moe_situ_config(activation, situ_beta, situ_linear_beta)
         self.activation_type = int(activation)
         self.gated = gated

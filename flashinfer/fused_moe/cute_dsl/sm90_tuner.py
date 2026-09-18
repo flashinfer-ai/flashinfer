@@ -60,6 +60,7 @@ from .moe_utils import (
     get_max_num_permuted_tokens,
     normalize_cute_dsl_moe_activation_type,
     validate_cute_dsl_moe_situ_config,
+    validate_cute_dsl_moe_swiglu_config,
 )
 
 
@@ -203,6 +204,7 @@ class CuteDslFusedMoESm90Runner(TunableRunner):
         self.use_fused_finalize = use_fused_finalize
         self.enable_pdl = enable_pdl
         activation, self.gated = normalize_cute_dsl_moe_activation_type(activation_type)
+        validate_cute_dsl_moe_swiglu_config(swiglu_alpha, swiglu_beta, swiglu_limit)
         validate_cute_dsl_moe_situ_config(activation, situ_beta, situ_linear_beta)
         self.activation_type = int(activation)
         self.swiglu_alpha = float(swiglu_alpha)

@@ -1090,8 +1090,9 @@ def test_cute_dsl_bf16_moe_relu2_autotune_and_wrapper():
 
 @cute_dsl_available
 def test_sm90_moe_runner_rejects_bad_activation_config():
-    """Unsupported activation types and inconsistent SiTU parameters fail at
-    runner construction (before any kernel work)."""
+    """Unsupported activation types, bad SwiGLU constants and inconsistent SiTU
+    parameters fail at runner construction (before any kernel work), checked in
+    that order."""
     from flashinfer.fused_moe.cute_dsl.sm90_fused_moe import _moe_core_impl
     from flashinfer.fused_moe.cute_dsl.sm90_tuner import CuteDslFusedMoESm90Runner
     from flashinfer.tllm_enums import ActivationType
@@ -1102,6 +1103,14 @@ def test_sm90_moe_runner_rejects_bad_activation_config():
     for bad in (ActivationType.Geglu, ActivationType.Silu, ActivationType.Gelu):
         with pytest.raises(ValueError, match="Unsupported activation_type"):
             make(activation_type=bad.value)
+    for bad_alpha in (float("nan"), float("inf"), 1e39):
+        with pytest.raises(ValueError, match="swiglu_alpha must be finite"):
+            make(swiglu_alpha=bad_alpha)
+    with pytest.raises(ValueError, match="swiglu_beta must be finite"):
+        make(swiglu_beta=float("-inf"))
+    for bad_limit in (0.0, -1.0, float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="swiglu_limit must be positive"):
+            make(swiglu_limit=bad_limit)
     with pytest.raises(ValueError, match="requires situ_beta"):
         make(situ_linear_beta=25.0)
     with pytest.raises(ValueError, match="require ActivationType.Swiglu"):
@@ -1114,6 +1123,8 @@ def test_sm90_moe_runner_rejects_bad_activation_config():
             make(situ_beta=bad_scale)
         with pytest.raises(ValueError, match="situ_linear_beta must be positive"):
             make(situ_beta=4.0, situ_linear_beta=bad_scale)
+    with pytest.raises(ValueError, match="swiglu_limit must be positive"):
+        make(swiglu_limit=0.0, situ_beta=-1.0)
     assert make(activation_type=ActivationType.Relu2.value).gated is False
     assert make().gated is True
 

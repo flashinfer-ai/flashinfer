@@ -43,6 +43,7 @@ from .moe_utils import (
     moe_unpermute,
     normalize_cute_dsl_moe_activation_type,
     validate_cute_dsl_moe_situ_config,
+    validate_cute_dsl_moe_swiglu_config,
 )
 from .sm90_tuner import CuteDslFusedMoESm90Runner
 from .sm90_contiguous_gather_grouped_gemm_act_fusion import (
@@ -373,6 +374,7 @@ def cute_dsl_fused_moe_bf16(
     if num_local_experts is None:
         num_local_experts = num_experts
     activation, _ = normalize_cute_dsl_moe_activation_type(activation_type)
+    validate_cute_dsl_moe_swiglu_config(swiglu_alpha, swiglu_beta, swiglu_limit)
     validate_cute_dsl_moe_situ_config(activation, situ_beta, situ_linear_beta)
 
     num_tokens, hidden = x.shape
@@ -491,6 +493,7 @@ class CuteDslBf16MoEWrapper:
                 (requires ``situ_beta``).
         """
         activation, _ = normalize_cute_dsl_moe_activation_type(activation_type)
+        validate_cute_dsl_moe_swiglu_config(swiglu_alpha, swiglu_beta, swiglu_limit)
         validate_cute_dsl_moe_situ_config(activation, situ_beta, situ_linear_beta)
         self.activation_type = int(activation)
         self.swiglu_alpha = float(swiglu_alpha)
