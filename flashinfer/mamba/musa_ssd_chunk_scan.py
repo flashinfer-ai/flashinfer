@@ -370,7 +370,13 @@ def _chunk_scan_fwd_kernel(
         offs_m[:, None] * stride_C_seqlen + offs_k_dstate[None, :] * stride_C_dstate
     )
 
-    scale_m = fast_exp(dA_cs_m)
+    # On MUSA Triton 3.2 the native exp path is faster for this small
+    # 16x16x32 tile; the fast exp2 helper remains the default for other
+    # backends. This branch is part of the validated dashboard candidate.
+    if IS_MUSA:
+        scale_m = tl.exp(dA_cs_m)
+    else:
+        scale_m = fast_exp(dA_cs_m)
     if BLOCK_SIZE_DSTATE <= 128:
         C = tl.load(
             C_ptrs,
@@ -468,7 +474,11 @@ def _chunk_scan_fwd_kernel(
         )
         # If there's seq_idx, we already set cb[i, j] = 0 for seq_idx[i] != seq_idx[j].
         # So we don't need masking wrt seq_idx here.
-        cb *= fast_exp(tl.minimum(dA_cs_m[:, None] - dA_cs_k[None, :], 0.0))
+        exp_arg = tl.minimum(dA_cs_m[:, None] - dA_cs_k[None, :], 0.0)
+        if IS_MUSA:
+            cb *= tl.exp(exp_arg)
+        else:
+            cb *= fast_exp(exp_arg)
         dt_k = tl.load(dt_ptrs, mask=offs_k < chunk_size - k, other=0.0).to(tl.float32)
         cb *= dt_k
         if IS_CAUSAL:
