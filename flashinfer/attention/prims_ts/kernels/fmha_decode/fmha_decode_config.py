@@ -553,6 +553,9 @@ class FmhaDecodeConfig:
     # sparse routes consume query membership from a separate packed-word table;
     # Q1 uses the same scattered page route without membership masking.
     use_q_token_kv_block_sparse_route: bool = False
+    # Private prepared-plan experiment: eight query words per 32 page-4 IDs.
+    # Legacy public membership tensors keep the default page-byte encoding.
+    query_major_memberships: bool = False
     # None preserves each sparse family's default in raw/static configs too.
     share_pattern_across_kv_heads: bool | None = None
     # Allow the attention grid to acquire a programmatic launch dependency.

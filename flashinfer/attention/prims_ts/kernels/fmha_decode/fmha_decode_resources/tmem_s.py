@@ -951,6 +951,10 @@ class TmemSResource(DecodeGenResourceBase):
             lane_idx,
             cfg.softmax_score_fragment_regs,
         )
+        if cutlass.const_expr(cfg.query_major_memberships):
+            return self.page_offsets_ref.query_membership_keep_word(
+                stage_info, local_tile_idx, q_token_idx
+            ) >> Uint32(col_base // Int32(4))
         keep_word = Uint32(0)
         page_span = min(cfg.num_tokens_per_page, cfg.num_s_regs_per_thread)
         pages_per_lane = cfg.num_s_regs_per_thread // page_span

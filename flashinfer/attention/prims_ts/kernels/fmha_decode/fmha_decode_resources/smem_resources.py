@@ -1725,6 +1725,44 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
         )
 
     @cute.jit
+    def query_membership_keep_word(
+        self, stage_info: StageInfo, local_tile_idx: Int32, q_token_idx: Int32
+    ) -> Uint32:
+        """Read a private, tail-padded query bit-plane without transposing it."""
+        cfg = self.cfg
+        assert cfg.query_major_memberships and cfg.num_tokens_per_page == 4
+        assert cfg.tile_size_kv == 128 and cfg.max_seq_len_q == 8
+        query = q_token_idx & Int32(7)
+        word = Uint32(0)
+        if cutlass.const_expr(self.cache_memberships_in_smem):
+            self._create_initial_task_locals(stage_info.context)
+            word = Uint32(
+                self._smem_q_token_kv_block_sparse_memberships[
+                    local_tile_idx * Int32(8) + query
+                ]
+            )
+        else:
+            task_cache = _decode_gen_task_cache(stage_info)
+            tile = local_tile_idx + Int32(task_cache[_TASK_CACHE_KV_RAW_TILE_BASE])
+            if tile * Int32(32) <= Int32(task_cache[_TASK_CACHE_KV_PAGE_IDX_UB]):
+                head, batch = _logical_head_batch(stage_info, self.h_k_idx, self.b_idx)
+                row = cutlass.Int64(batch)
+                if cutlass.const_expr(
+                    cfg.use_persistent_scheduler and not cfg.shares_sparse_pattern
+                ):
+                    row = row * cutlass.Int64(self.num_heads_kv) + cutlass.Int64(head)
+                word = Uint32(
+                    self.q_token_kv_block_sparse_page_memberships[
+                        row
+                        * cutlass.Int64(
+                            self.q_token_kv_block_sparse_page_membership_stride
+                        )
+                        + cutlass.Int64(tile * Int32(8) + query)
+                    ]
+                )
+        return cutlass.select_(Uint32(q_token_idx) < Uint32(8), word, Uint32(0))
+
+    @cute.jit
     def q_token_kv_block_sparse_page_membership_word4(
         self,
         stage_info: StageInfo,
@@ -1982,6 +2020,12 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
                         + membership_word_idx
                         * Int32(Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIPS_PER_WORD)
                     )
+                    if cutlass.const_expr(cfg.query_major_memberships):
+                        # Every word in a query tile refers to the same 32 pages.
+                        # The private producer initializes all eight tail words.
+                        first_logical_page_idx = (
+                            raw_tile_base + membership_word_idx // Int32(8)
+                        ) * Int32(32)
                     if first_logical_page_idx <= page_idx_ub:
                         membership_word = Uint32(
                             self.q_token_kv_block_sparse_page_memberships[
@@ -2035,16 +2079,17 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
                         # The producer owns only the live byte prefix. Mask the
                         # final word here so padding bytes remain unobservable
                         # even when the caller reuses an uninitialized workspace.
-                        live_memberships = (
-                            page_idx_ub - first_logical_page_idx + Int32(1)
-                        )
-                        if live_memberships < Int32(
-                            Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIPS_PER_WORD
-                        ):
-                            live_bits = live_memberships * Int32(
-                                Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIP_BITS
+                        if cutlass.const_expr(not cfg.query_major_memberships):
+                            live_memberships = (
+                                page_idx_ub - first_logical_page_idx + Int32(1)
                             )
-                            membership_word &= (Uint32(1) << live_bits) - Uint32(1)
+                            if live_memberships < Int32(
+                                Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIPS_PER_WORD
+                            ):
+                                live_bits = live_memberships * Int32(
+                                    Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIP_BITS
+                                )
+                                membership_word &= (Uint32(1) << live_bits) - Uint32(1)
                     self._smem_q_token_kv_block_sparse_memberships[
                         membership_word_idx
                     ] = membership_word
