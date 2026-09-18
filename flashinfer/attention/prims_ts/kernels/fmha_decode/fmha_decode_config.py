@@ -52,6 +52,7 @@ from .fmha_decode_constants import (
     MAX_WARP_GROUPS,
     MIN_LOOP_ITERS_PER_SPLIT,
     PARALLEL_REDUCTION_BYTES_PER_SLICE,
+    PARALLEL_REDUCTION_SLOT_LANES,
     PARALLEL_REDUCTION_THREADS_PER_CTA,
     PARTIAL_O_ELEMENT_BYTES,
     PARTIAL_STATS_VALUES_PER_ROW,
@@ -1259,7 +1260,7 @@ class FmhaDecodeConfig:
             return 1
         return {
             8: 1,
-            16: 2,
+            16: 1,
             32: 4,
             64: 8,
             128: 16,
@@ -1276,11 +1277,22 @@ class FmhaDecodeConfig:
         )
 
     @property
+    def parallel_reduction_slot_lanes(self) -> int:
+        """Share a single-CTA fragment's split slots across adjacent lanes."""
+        if (
+            self.use_compact_parallel_reduction
+            or self.parallel_reduction_cluster_size != 1
+            or self.parallel_reduction_splits_per_cta % PARALLEL_REDUCTION_SLOT_LANES
+        ):
+            return 1
+        return PARALLEL_REDUCTION_SLOT_LANES
+
+    @property
     def parallel_reduction_threads_per_cta(self) -> int:
         """Return the thread count selected by the reducer schedule."""
         if self.use_compact_parallel_reduction:
             return REDUCTION_THREADS_PER_CTA
-        return PARALLEL_REDUCTION_THREADS_PER_CTA
+        return PARALLEL_REDUCTION_THREADS_PER_CTA * self.parallel_reduction_slot_lanes
 
     @property
     def parallel_reduction_bytes_per_slice(self) -> int:
@@ -4003,7 +4015,7 @@ def _validate_profile_support(
         padded_splits = cfg.parallel_reduction_padded_splits
         default_cluster_size = {
             8: 1,
-            16: 2,
+            16: 1,
             32: 4,
             64: 8,
             128: 16,
@@ -4016,7 +4028,7 @@ def _validate_profile_support(
         clustered_topology_supported = (
             not cfg.use_compact_parallel_reduction
             and default_cluster_size == cluster_size
-            and splits_per_cta in (2, 4, 8)
+            and splits_per_cta in (2, 4, 8, 16)
             and cluster_size * splits_per_cta == padded_splits
         )
         if not (

@@ -2998,17 +2998,20 @@ def test_attention_ts_decode_page4_encoded_subpages_all_tp_geometries(
 
 @pytest.mark.arch_blackwell
 @_REQUIRES_PAGE4_PRIMTS_GPU
-@pytest.mark.parametrize("group_size", (2, 4, 5))
+@pytest.mark.parametrize(
+    ("group_size", "splits"), ((2, 2), (4, 2), (5, 2), (4, 5), (5, 9), (5, 16))
+)
 def test_attention_ts_decode_grouped_keeps_split_reduction(
     monkeypatch,
     group_size: int,
+    splits: int,
 ) -> None:
     """Merge grouped BF16 rows with the standard split-KV reducer."""
 
     from flashinfer.attention.prims_ts import decode as decode_module
     from flashinfer.attention.prims_ts.kernels.fmha_decode import fmha_decode_config
 
-    kv_tokens = 2528
+    kv_tokens = max(2528, splits * 256 + 32)
     storage_page_size = 16
     issuers = 8
     cfg = fmha_decode_config.make_decode_config(
@@ -3042,12 +3045,12 @@ def test_attention_ts_decode_grouped_keeps_split_reduction(
         num_tokens_per_page=4,
         storage_tokens_per_page=storage_page_size,
         split_kv_mode="gmem_reduction_with_separate_kernel",
-        splits_kv=2,
-        max_splits_kv=2,
+        splits_kv=splits,
+        max_splits_kv=splits,
         mask_type="causal",
         auto_tuner=False,
     )
-    assert cfg.splits_kv == 2
+    assert cfg.splits_kv == splits
     assert cfg.use_separate_reduction_kernel
     spec = decode_module._decode_launch_spec_from_config(
         cfg,
