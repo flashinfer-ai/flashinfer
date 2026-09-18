@@ -775,7 +775,7 @@ def _moe_core_impl(
         if _prepared_launches is not None:
             _prepared_launches["gemm2_partial"] = gemm2_output
     elif not use_fused_finalize:
-        from .blackwell.expanded_finalize import moe_unpermute_expanded
+        from .blackwell.moe_finalize import moe_unpermute
 
         unpermute_kwargs = dict(
             permuted_input=gemm2_output,
@@ -785,12 +785,13 @@ def _moe_core_impl(
             num_tokens=num_tokens,
             top_k=top_k,
             enable_pdl=enable_pdl,
+            input_is_expanded=True,
         )
-        moe_unpermute_expanded(**unpermute_kwargs)
+        moe_unpermute(**unpermute_kwargs)
         if _prepared_launches is not None:
             # Fixed-address replay of the reduction (the expanded-row buffer
             # is retained through the kwargs).
-            _prepared_launches["unpermute"] = (moe_unpermute_expanded, unpermute_kwargs)
+            _prepared_launches["unpermute"] = (moe_unpermute, unpermute_kwargs)
 
     return moe_output[:num_tokens]
 
