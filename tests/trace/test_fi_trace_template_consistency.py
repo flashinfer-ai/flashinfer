@@ -1373,6 +1373,47 @@ def test_prims_ts_bound_wrapper_trace_names_preserve_plan_identity():
     assert "mask:dense" in mla_definitions[1]["tags"]
 
 
+def test_prims_ts_mla_wrapper_trace_allows_only_balanced_inactive_slots():
+    """Bind the minimum K/V length to the wrapper's installed schedule mode."""
+
+    from flashinfer.attention.prims_ts.mla_decode import (
+        BatchMLADecodePagedTSWrapper,
+    )
+    from flashinfer.fi_trace import fi_trace
+
+    wrapper = BatchMLADecodePagedTSWrapper()
+    state = {
+        "packed_query": False,
+        "mask_type": "causal",
+        "max_seq_len_q": 1,
+        "max_kv_len": 128,
+        "kv_lora_rank": 512,
+        "qk_rope_head_dim": 64,
+    }
+    kwargs = {
+        "query": torch.empty(2, 1, 16, 576, dtype=torch.bfloat16),
+        "kv_cache": torch.empty(8, 32, 576, dtype=torch.bfloat16),
+        "block_tables": torch.tensor(((0, 1, 2, 3), (4, 5, 6, 7)), dtype=torch.int32),
+        "seq_lens": torch.tensor((128, 1), dtype=torch.int32),
+    }
+
+    wrapper._plan_state = SimpleNamespace(**state, balanced_plan=None)
+    ordinary = fi_trace(wrapper.run, **kwargs)
+    wrapper._plan_state = SimpleNamespace(**state, balanced_plan=object())
+    balanced = fi_trace(
+        wrapper.run,
+        **{**kwargs, "seq_lens": torch.tensor((128, 0), dtype=torch.int32)},
+    )
+
+    assert ordinary["name"] != balanced["name"]
+    assert "min(seq_lens) >= 1" in ordinary["constraints"]
+    assert "min(seq_lens) >= 0" not in ordinary["constraints"]
+    assert "min(seq_lens) >= 0" in balanced["constraints"]
+    assert "min(seq_lens) >= 1" not in balanced["constraints"]
+    assert "scheduler:balanced" not in ordinary["tags"]
+    assert "scheduler:balanced" in balanced["tags"]
+
+
 # ---------------------------------------------------------------------------
 # End-to-end checks: fi_trace with auto-generated CPU tensors
 #
