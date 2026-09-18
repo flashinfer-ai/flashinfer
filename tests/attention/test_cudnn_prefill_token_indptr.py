@@ -4,6 +4,7 @@ Token-unit indptrs must produce the same results as the historical
 element-unit offsets, both on the direct path (cuDNN consumes the indptrs
 via cu_seq_len + ragged-offset multipliers, no conversion pre-pass) and on
 the conversion path (FlashInfer scales them to element units internally).
+The backend="cudnn" wrappers forward token-unit indptrs to this path.
 """
 
 import pytest
@@ -212,3 +213,155 @@ def test_cudnn_prefill_token_indptr_omit_actual_seq_lens(monkeypatch, direct):
 
     assert torch.equal(out_without, out_with)
     assert torch.equal(lse_without, lse_with)
+
+
+@pytest.mark.parametrize("num_kv_heads", [1, 2, 8])
+def test_cudnn_prefill_lse_is_base2(num_kv_heads):
+    """cuDNN returns base-2 LSE (log2 sum exp scores), matching every other
+    FlashInfer backend. cuDNN's frontend emits natural-log stats, so the prefill
+    path folds them to base-2; verify against a float reference."""
+    if not cudnn_prefill.CUDNN_AVAILABLE:
+        pytest.skip("cudnn-frontend python package not available")
+
+    from flashinfer.utils import log2e
+
+    torch.manual_seed(0)
+    device = "cuda:0"
+    s_q, s_kv, num_qo_heads, head_dim = 37, 64, 8, 128
+    scale = float(head_dim**-0.5)
+
+    q = torch.randn(s_q, num_qo_heads, head_dim, device=device, dtype=torch.bfloat16)
+    k = torch.randn(s_kv, num_kv_heads, head_dim, device=device, dtype=torch.bfloat16)
+    v = torch.randn(s_kv, num_kv_heads, head_dim, device=device, dtype=torch.bfloat16)
+    workspace_buffer = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device=device)
+
+    # batch_size == 1: packed q starts at token 0, so no ragged offsets needed.
+    _, lse = cudnn_batch_prefill_with_kv_cache(
+        q,
+        k,
+        v,
+        scale=scale,
+        workspace_buffer=workspace_buffer,
+        max_token_per_sequence=s_q,
+        max_sequence_kv=s_kv,
+        actual_seq_lens_q=torch.tensor([s_q], dtype=torch.int32, device=device).view(
+            1, 1, 1, 1
+        ),
+        actual_seq_lens_kv=torch.tensor([s_kv], dtype=torch.int32, device=device).view(
+            1, 1, 1, 1
+        ),
+        causal=False,
+        return_lse=True,
+    )
+
+    # Float reference LSE in base-2. GQA: broadcast each kv head to its q group.
+    kf = k.float().repeat_interleave(num_qo_heads // num_kv_heads, dim=1)
+    scores = torch.einsum("qhd,khd->hqk", q.float(), kf) * scale  # [h_qo, s_q, s_kv]
+    lse_ref = torch.logsumexp(scores, dim=-1) * log2e  # base-2, [h_qo, s_q]
+
+    lse_cudnn = lse[0, :s_q, :].transpose(0, 1)  # [h_qo, s_q]
+    torch.testing.assert_close(lse_cudnn, lse_ref, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("head_dim_qk,head_dim_vo", [(128, 128), (192, 128)])
+def test_cudnn_wrapper_token_indptr(head_dim_qk, head_dim_vo):
+    """backend="cudnn" wrappers take token-unit qo_indptr/kv_indptr like every
+    other backend, and reject the historical element-unit offsets with a
+    migration hint."""
+    if not cudnn_prefill.CUDNN_AVAILABLE:
+        pytest.skip("cudnn-frontend python package not available")
+
+    import flashinfer
+
+    torch.manual_seed(0)
+    device = "cuda:0"
+    batch_size, s_qo, s_kv = 4, 87, 512
+    num_qo_heads, num_kv_heads = 8, 4
+    scale = float(head_dim_qk**-0.5)
+
+    actual_seq_lens_q = torch.randint(
+        1, s_qo + 1, (batch_size,), dtype=torch.int32, device=device
+    )
+    actual_seq_lens_kv = torch.randint(
+        s_qo, s_kv + 1, (batch_size,), dtype=torch.int32, device=device
+    )
+    zero = torch.zeros(1, dtype=torch.int32, device=device)
+    qo_indptr = torch.cat([zero, torch.cumsum(actual_seq_lens_q, 0)]).int()
+    kv_indptr = torch.cat([zero, torch.cumsum(actual_seq_lens_kv, 0)]).int()
+
+    q = torch.randn(
+        int(actual_seq_lens_q.sum()),
+        num_qo_heads,
+        head_dim_qk,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    k = torch.randn(
+        int(actual_seq_lens_kv.sum()),
+        num_kv_heads,
+        head_dim_qk,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    v = torch.randn(
+        int(actual_seq_lens_kv.sum()),
+        num_kv_heads,
+        head_dim_vo,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+
+    def plan(wrapper, qo, kv):
+        wrapper.plan(
+            qo_indptr=qo,
+            kv_indptr=kv,
+            num_qo_heads=num_qo_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim_qk=head_dim_qk,
+            head_dim_vo=head_dim_vo,
+            causal=True,
+            sm_scale=scale,
+            q_data_type=torch.bfloat16,
+            kv_data_type=torch.bfloat16,
+            o_data_type=torch.bfloat16,
+            seq_lens=actual_seq_lens_kv.view(batch_size, 1, 1, 1),
+            seq_lens_q=actual_seq_lens_q.view(batch_size, 1, 1, 1),
+            max_token_per_sequence=s_qo,
+            max_sequence_kv=s_kv,
+        )
+
+    workspace = torch.empty(512 * 1024 * 1024, dtype=torch.int8, device=device)
+    cudnn_wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        workspace, "NHD", backend="cudnn"
+    )
+
+    # Same token-unit indptrs as the fa2 reference wrapper.
+    plan(cudnn_wrapper, qo_indptr, kv_indptr)
+    out = cudnn_wrapper.run(q, k, v)
+
+    ref_wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device), "NHD"
+    )
+    ref_wrapper.plan(
+        qo_indptr,
+        kv_indptr,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim_qk,
+        head_dim_vo=head_dim_vo,
+        causal=True,
+        sm_scale=scale,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+    )
+    out_ref = ref_wrapper.run(q, k, v)
+    torch.testing.assert_close(out, out_ref, atol=1e-2, rtol=1e-2)
+
+    # Legacy element-unit offsets are rejected with a migration hint.
+    plan(
+        cudnn_wrapper,
+        qo_indptr * (num_qo_heads * head_dim_qk),
+        kv_indptr * (num_kv_heads * head_dim_qk),
+    )
+    with pytest.raises(ValueError, match="element-unit"):
+        cudnn_wrapper.run(q, k, v)
