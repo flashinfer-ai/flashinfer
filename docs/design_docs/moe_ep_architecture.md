@@ -29,15 +29,12 @@ owns dispatch, expert compute, and combine; output is always BF16
 
 | Backend (alias) | Activation | Weight | Output | Arch | Tuning |
 |---|---|---|---|---|---|
-| `sm100_bf16_nvfp4_bf16_cutedsl` | BF16 | NVFP4 (block-16 E4M3, optional per-expert FP32 global scales) | BF16 | SM100/SM103 | same `knobs` surface as the NVFP4 backend |
+| `sm100_bf16_nvfp4_bf16_cutedsl` | BF16 | NVFP4 (block-16) | BF16 | SM100/SM103 | same `knobs` surface as the NVFP4 backend |
 | `sm100_nvfp4_nvfp4_bf16_cutedsl` (`nvfp4_cutedsl`) | NVFP4 (block-16) | NVFP4 (block-16) | BF16 | SM100 family | `knobs=None` → token-count heuristic; `knobs=dict` → pinned; `knobs="auto"` → collective compile+time sweep at first forward (never in serving); winners cacheable via `FLASHINFER_MOE_EP_KNOB_CACHE` |
 | `sm100_mxfp8_mxfp8_bf16_cutedsl` (`mxfp8_cutedsl`) | MXFP8 (block-32 UE8M0) | MXFP8 (block-32 UE8M0) | BF16 | SM100 family | same `knobs` surface as the NVFP4 backend |
 | `sm100_fp8_fp4_bf16_deepgemm` (`deep_gemm_mega`) | FP8 (E4M3, block-32 UE8M0) | FP4 (int8-packed, block-32) | BF16 | SM100 family | — (DeepGEMM selects its own JIT configs internally) |
 | `sm90_fp8_fp8_bf16_pull_cutedsl` (`sm90_pull_fp8`) | FP8 (E4M3/E5M2; per-tensor or DeepGEMM-style blockwise scales) | FP8 (same `fp8_scale_mode`) | BF16 | SM90 exactly | explicit geometry knobs on the config (`swap_ab`, `mma_tiler_mnk`); no tuner/knob-cache yet |
 | `sm90_fp8_fp8_bf16_push_cuda` (`sm90_push_fp8`) | FP8 (E4M3) | FP8 (E4M3) | BF16 | SM90 | — (static dimensions/protocol choices only) |
-
-W4A16 returns BF16 expert terms and combines them in a separate kernel,
-applying routing scores and accumulating in FP32 in fixed top-k order.
 
 The SM90 pull-style CuTeDSL tree is process-exclusive with the SM100 CuTeDSL
 tree (module names collide). Weight inputs are canonical BF16 `MoEWeightPack`
@@ -331,15 +328,13 @@ classDiagram
 
 **Mega weights:** with `preprocess_weights=True` (default), canonical bf16 or pre-quantized `MoEWeightPack` is transformed at init. With `preprocess_weights=False`, supply `MegaConfig.transformed_weights` (from `preprocess_*_mega_weights`).
 
-W4A16 additionally accepts optional FP32 `[local_experts]`
-`w13_global_scale` / `w2_global_scale` (omitted means one), applied after FP32
-GEMM accumulation. Its prepared `(weight, scale, alpha)` triples share the
-W4A4 weight/scale layout. Layer construction rejects these fields for other
-backends.
+BF16×NVFP4 accepts optional FP32 `[local_experts]` `w13_global_scale` /
+`w2_global_scale` (default one), applied after FP32 GEMMs. Prepared
+`(weight, scale, alpha)` triples use the W4A4 weight/scale layout. Routing
+weights apply after FC2; external FP32 combine is the default.
 
 **Mega activations:** with `quantize_input=True` (default), bf16 `[T, hidden]` is quantized into symm workspace at forward. Non-bf16 with `quantize_input=True` raises `MoEEpConfigError`; use `quantize_input=False` and pre-quantized activations plus `MoEEpTensors.scales`.
-The BF16-activation CuTeDSL backends, including W4A16, ignore `quantize_input`,
-copy BF16 inputs, and reject pre-quantized activation inputs.
+BF16-activation backends ignore `quantize_input` and copy BF16 inputs.
 
 ## Runtime
 
