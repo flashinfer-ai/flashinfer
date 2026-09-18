@@ -116,6 +116,10 @@ class PagedMQALogitsScheduleKernel:
             # Broadcast lane-31's inclusive sum to all lanes for next chunk carry.
             sum_carry = cute.arch.shuffle_sync(x, 31)
 
+        # The search reads other lanes' SMEM entries; shuffle.sync only
+        # synchronizes the register exchange, not these shared stores.
+        cute.arch.sync_warp()
+
         # Phase 3: distribute total segments evenly across kNumSMs CTAs.
         # Each lane processes a strip of CTA indices.
         total = sum_carry

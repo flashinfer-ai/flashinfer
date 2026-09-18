@@ -2572,6 +2572,7 @@ def fp4_paged_mqa_logits(
             schedule_meta,
             num_blocks,
             exp_B,  # kernel batch_size = q's L dim = batch * num_atoms
+            None,  # candidate validity is absent for full-context scoring
         )
     return logits
 
