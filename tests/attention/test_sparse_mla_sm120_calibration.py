@@ -355,6 +355,7 @@ def test_model_cpb_accuracy_guard_dual_cache(
                 -1,  # model_type: legacy width inference (d_qk=512 -> DSV4)
                 cpb_override,
                 False,  # extra_fp4
+                1.0,
             )
 
         return cpb_mod._time_call_fresh_indices(
