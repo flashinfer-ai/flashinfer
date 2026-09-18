@@ -529,6 +529,7 @@ def _assert_family(rows, msl_c, top_k, next_n, cr, want, hint_free=False):
         next_n,
         cr,
         hint_free,
+        None,  # page_shift: unpaged output
         _host._arch_token(),
         _host._sm_count(),
     )
