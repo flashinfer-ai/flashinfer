@@ -412,7 +412,16 @@ def test_template_axes_covered(func, template, label):
 
 
 def test_attention_ts_trace_constraints_match_cache_axes():
-    """PrimTS constraints are valid expressions over defined axes."""
+    """Live PrimTS trace schemas are wired to APIs and use valid constraints."""
+    from flashinfer.api_logging import _TRACE_DISPATCHERS
+    from flashinfer.attention.prims_ts.decode import (
+        BatchDecodePagedTSWrapper,
+        batch_decode_with_paged_kv_cache,
+    )
+    from flashinfer.attention.prims_ts.mla_decode import (
+        BatchMLADecodePagedTSWrapper,
+        batch_mla_decode_with_paged_kv_cache,
+    )
     from flashinfer.trace.templates.attention import (
         attention_ts_decode_trace_dispatch,
         prims_ts_block_sparse_trace_dispatch,
@@ -420,22 +429,28 @@ def test_attention_ts_trace_constraints_match_cache_axes():
         prims_ts_paged_block_sparse_trace_dispatch,
         prims_ts_paged_block_sparse_wrapper_trace_dispatch,
         prims_ts_decode_mla_one_shot_trace_dispatch,
-        prims_ts_decode_mla_trace_dispatch,
         prims_ts_decode_mla_wrapper_trace_dispatch,
-        prims_ts_decode_trace_dispatch,
         prims_ts_decode_wrapper_trace_dispatch,
     )
 
     fmha_dispatches = (
         attention_ts_decode_trace_dispatch,
-        prims_ts_decode_trace_dispatch,
         prims_ts_decode_wrapper_trace_dispatch,
     )
     mla_dispatches = (
-        prims_ts_decode_mla_trace_dispatch,
         prims_ts_decode_mla_one_shot_trace_dispatch,
         prims_ts_decode_mla_wrapper_trace_dispatch,
     )
+    for func, dispatch in (
+        (batch_decode_with_paged_kv_cache, attention_ts_decode_trace_dispatch),
+        (BatchDecodePagedTSWrapper.run, prims_ts_decode_wrapper_trace_dispatch),
+        (
+            batch_mla_decode_with_paged_kv_cache,
+            prims_ts_decode_mla_one_shot_trace_dispatch,
+        ),
+        (BatchMLADecodePagedTSWrapper.run, prims_ts_decode_mla_wrapper_trace_dispatch),
+    ):
+        assert _TRACE_DISPATCHERS[inspect.unwrap(func)] is dispatch
     block_sparse_templates = (
         *prims_ts_block_sparse_trace_dispatch.templates,
         *prims_ts_paged_block_sparse_trace_dispatch.templates,
@@ -459,17 +474,10 @@ def test_attention_ts_trace_constraints_match_cache_axes():
                 assert "seq_len_q >= 2" in template.constraints
             assert "seq_len_q in (2, 4, 8)" not in template.constraints
             assert "max_seq_len <= 16384" not in template.constraints
-    for dispatch, static_bound in (
-        (prims_ts_decode_trace_dispatch, "max_seq_len"),
-        (prims_ts_decode_wrapper_trace_dispatch, "max_kv_len"),
-    ):
-        for template in dispatch.templates:
-            assert (
-                "max_pages_per_seq * page_size >= max(seq_lens)" in template.constraints
-            )
-            assert "min(seq_lens) >= 1" in template.constraints
-            assert f"max(seq_lens) <= {static_bound}" in template.constraints
     for template in prims_ts_decode_wrapper_trace_dispatch.templates:
+        assert "max_pages_per_seq * page_size >= max(seq_lens)" in template.constraints
+        assert "min(seq_lens) >= 1" in template.constraints
+        assert "max(seq_lens) <= max_kv_len" in template.constraints
         plan_owns_seq_lens = bool(template.axes["plan_owns_seq_lens"].value)
         assert template.inputs["seq_lens"].optional is plan_owns_seq_lens
         assert (
