@@ -545,7 +545,23 @@ def _assert_family(rows, msl_c, top_k, next_n, cr, want, hint_free=False):
         (8, 131072, 1024, 4, 4, "reg_clus"),  # clustered register-resident
         (8, 32768, 2048, 1, 1, "reg_clus"),  # K > BLKC admitted (local), CS=4
         (64, 32768, 2048, 1, 1, "reg_clus"),  # K > BLKC, CS=2, one wave
-        (16, 65536, 2048, 2, 1, "reg_clus"),  # K > BLKC above 32K, next_n rows
+        (
+            4,
+            65536,
+            2048,
+            2,
+            1,
+            "reg_clus",
+        ),  # K > BLKC above 32K, CS=8, next_n rows (one wave on every part)
+        (
+            100,
+            65536,
+            512,
+            1,
+            1,
+            "main",
+        ),  # unsplit 75-148 row slab: two-CTA (512, 8, 2) regime (local)
+        (148, 32768, 2048, 1, 1, "main"),  # same regime, K > 1024 (KPT 4)
         (8, 6144, 512, 1, 4, "reg"),  # register-resident (local VPT=2 rung)
         (8, 8192, 512, 1, 1, "reg"),  # local VPT=2 rung, top of its band
         (256, 8192, 512, 1, 1, "reg"),  # local b > 148 BLK=512 rung (upstream: main)
@@ -1570,6 +1586,52 @@ def test_gvr2_route_reg_clus_k2048():
     assert (
         r(1, 16384, 16384, 2048)["kernel"] == "reg"
     )  # below the band: register rung as before
+
+
+def test_gvr2_route_unsplit_slab_regime():
+    """Unsplit slab rows (R == 1) in the 75-148 row band with rows of <= 64K
+    columns take the b > 148 configuration ((512, 8, 2): 512 threads, two CTAs
+    per SM) instead of upstream's one-wave 1024-thread slab; the split slab
+    (R > 1), 33-74 rows and rows above 64K keep the big regime (FlashInfer-
+    local, see _big_regime)."""
+    r = _host.route
+    for k in (512, 1024, 2048):
+        for b in (75, 104, 148):
+            for n in (32768, 49152, 65536):
+                p = r(b, n, _round64(n), k)
+                # tpl = (BLK, U, MINB, ...)
+                assert p["kernel"] == "main" and p["tpl"][:3] == (512, 8, 2), (
+                    k,
+                    b,
+                    n,
+                    p["tpl"],
+                )
+                assert p["rt"]["R"] == 1 and p["rt"]["SCAP_"] == (
+                    8192 if k > 1024 else 4096
+                )
+            # above 64K the band keeps the 1024-thread configuration
+            p = r(b, 65540, _round64(65540), k)
+            assert p["kernel"] == "main" and (p["tpl"][0], p["tpl"][2]) == (1024, 1)
+            assert p["rt"]["SCAP_"] == 16384
+    # 33-74 unsplit rows (K = 2048 above 32K) keep the big configuration
+    p = r(37, 65536, 65536, 2048)
+    assert p["kernel"] == "main" and p["tpl"][0] == 1024 and p["rt"]["R"] == 1
+    # split slab at <= 74 rows keeps the 1024-thread big configuration
+    p = r(16, 262144, 262144, 2048)
+    assert p["kernel"] == "main" and (p["tpl"][0], p["tpl"][2]) == (1024, 1)
+    assert p["rt"]["R"] > 1 and p["rt"]["SCAP_"] == 8192
+    p = r(1, 1 << 20, 1 << 20, 1024)
+    assert p["kernel"] == "main" and p["tpl"][0] == 1024 and p["rt"]["R"] == 148
+    # b > 148 unchanged
+    assert r(200, 65536, 65536, 512)["tpl"][:3] == (512, 8, 2)
+    assert r(304, 65536, 65536, 1024)["tpl"][:3] == (256, 8, 4)
+    assert _host._big_regime(148, 1, 16384) is False
+    assert _host._big_regime(148, 1, 16385) is True
+    assert (
+        _host._big_regime(74, 1, 16384) is True
+        and _host._big_regime(74, 2, 8192) is True
+    )
+    assert _host._big_regime(149, 1, 8192) is False  # b > 148: never big
 
 
 def test_gvr2_route_reg_clus_sm_count_aware():
