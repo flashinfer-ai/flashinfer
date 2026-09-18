@@ -1,6 +1,9 @@
 """
 fi_trace example: generate flashinfer-bench definition JSON files via auto-dump.
 
+The fused GVR page-transform example additionally emits
+``top_k_page_table_transform_k512_ps64.json`` on supported GPUs.
+
 Run:
     python tests/trace/example.py
 
@@ -177,6 +180,24 @@ from flashinfer.mla import BatchMLAPagedAttentionWrapper
 
 device = "cuda"
 WORKSPACE = 128 * 1024 * 1024  # 128 MB
+
+# The output contract is shared with the default fused top-k backend; backend
+# choice does not change the trace definition's mathematical operation.
+_topk_cc_major, _topk_cc_minor = torch.cuda.get_device_capability()
+if flashinfer.top_k_varlen.is_backend_supported(
+    "gvr_2", _topk_cc_major * 10 + _topk_cc_minor
+):
+    _topk_scores = torch.randn(8, 4096, device="cuda", dtype=torch.float32)
+    _topk_pages = torch.arange(8 * 64, device="cuda", dtype=torch.int32).view(8, 64)
+    _topk_lengths = torch.full((8,), 4096, device="cuda", dtype=torch.int32)
+    flashinfer.top_k_page_table_transform(
+        _topk_scores,
+        _topk_pages,
+        _topk_lengths,
+        512,
+        page_size=64,
+        backend="gvr_2",
+    )
 
 # MiniMax-H3 uses a prepared, caller-owned API. Emit its definition from meta
 # tensors so generating the trace fixture does not compile all exact-shape CUDA

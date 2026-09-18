@@ -1550,6 +1550,85 @@ def run_ws(
     _run_impl(logits, pre_idx, n_valid, indices, kernel_view(workspace), values)
 
 
+def run_page_table_transform(
+    logits, page_table, lengths, k, *, page_size=1, row_to_batch=None,
+    page_table_row_starts=None, out=None, out_raw_indices=None,
+):
+    """Hint-free fused register-family selection and physical-slot mapping.
+
+    Explicit opt-in: unsupported families raise, never silently dispatch to
+    another selection algorithm. All validation uses host tensor metadata,
+    so warmed calls are safe under CUDA graph capture.
+    """
+    from ..topk_varlen import _gvr2_top_k_varlen_check
+
+    if _on_other_device(logits):
+        with torch.cuda.device(logits.device):
+            return run_page_table_transform(
+                logits, page_table, lengths, k, page_size=page_size,
+                row_to_batch=row_to_batch, page_table_row_starts=page_table_row_starts,
+                out=out, out_raw_indices=out_raw_indices,
+            )
+    if not _gvr2_top_k_varlen_check(logits, lengths, k):
+        raise ValueError("gvr_2 page transform requires supported GPU, FP32 row-major aligned scores, and k in (512, 1024, 2048)")
+    rows, width = logits.shape
+    def check_vector(tensor, name):
+        if tensor is not None and (
+            tensor.device != logits.device or tensor.dtype != torch.int32
+            or tuple(tensor.shape) != (rows,) or not tensor.is_contiguous()
+        ):
+            raise ValueError(f"{name} must be contiguous int32 [num_rows] on the scores device")
+    check_vector(lengths, "lengths")
+    check_vector(row_to_batch, "row_to_batch")
+    check_vector(page_table_row_starts, "page_table_row_starts")
+    if (page_table.device != logits.device or page_table.dtype != torch.int32
+        or page_table.ndim != 2 or page_table.stride(1) != 1
+        or page_table.stride(0) < page_table.shape[1]):
+        raise ValueError("src_page_table must be row-major int32 on the scores device")
+    if row_to_batch is None and page_table.shape[0] < rows:
+        raise ValueError("src_page_table must contain at least num_rows rows")
+    # Only valid positions need page-table entries: a padded logits capacity
+    # may exceed the logical page-table capacity (e.g. DeepGEMM arenas).
+    if out is None:
+        out = torch.empty((rows, k), dtype=torch.int32, device=logits.device)
+    for tensor, name in ((out, "out"), (out_raw_indices, "out_raw_indices")):
+        if tensor is not None and (
+            tensor.device != logits.device or tensor.dtype != torch.int32
+            or tuple(tensor.shape) != (rows, k) or not tensor.is_contiguous()
+            or tensor.data_ptr() & 15
+        ):
+            raise ValueError(f"{name} must be aligned contiguous int32 [num_rows, k] on the scores device")
+    if out_raw_indices is not None:
+        a, b = out.data_ptr(), out_raw_indices.data_ptr()
+        if abs(a - b) < rows * k * 4:
+            raise ValueError("out and out_raw_indices must not overlap")
+    if rows == 0:
+        return out
+    pitch = logits.stride(0) if rows > 1 else width
+    lg = logits
+    if not logits.is_contiguous():
+        if logits.storage_offset() + rows * pitch > logits.untyped_storage().nbytes() // 4:
+            raise ValueError("logits view storage too small to widen to its row stride")
+        lg = logits.as_strided((rows, pitch), (pitch, 1), logits.storage_offset())
+    plan = route(rows, max(width, k + 1), pitch, k, sms=_sm_count())
+    if plan["kernel"] not in ("reg", "regimg", "reg_clus"):
+        raise NotImplementedError("gvr_2 fused page transform currently supports the register families only")
+    mapping_spec = (page_size, row_to_batch is not None, page_table_row_starts is not None, out_raw_indices is not None)
+    dev = _device()
+    compiler = dev.get_compiled__regclus if plan["kernel"] == "reg_clus" else dev.get_compiled__reg
+    compiled = _gate_first_call(compiler(
+        tuple(plan["tpl"]), varlen=True, mapping_spec=mapping_spec,
+    ))
+    anchor = _hint_free_pre_idx(rows, k, logits.device)
+    mapping = (page_table, row_to_batch, page_table_row_starts, out_raw_indices)
+    if plan["kernel"] == "reg_clus":
+        compiled(lg, anchor, lengths, out, width, mapping)
+    else:
+        compiled(lg, anchor, lengths, out, width, plan["rt"]["CMP"], plan["rt"]["QC"],
+                 dev.STATIC_BYTES + plan["smem"], mapping)
+    return out
+
+
 def run_varlen(
     logits: torch.Tensor,
     pre_idx: torch.Tensor | None,

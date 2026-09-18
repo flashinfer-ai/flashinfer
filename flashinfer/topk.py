@@ -1089,6 +1089,7 @@ def top_k_page_table_transform(
     page_size: int = 1,
     out: Optional[torch.Tensor] = None,
     out_raw_indices: Optional[torch.Tensor] = None,
+    backend: str = "auto",
 ) -> torch.Tensor:
     r"""Fused Top-K selection + Page Table Transform for sparse attention.
 
@@ -1170,6 +1171,13 @@ def top_k_page_table_transform(
         Receives selected indices relative to each score window before
         page-table translation. Padding positions are set to -1 and remain
         positionally aligned with ``out``. Must not overlap ``out``.
+    backend : str, optional
+        ``"auto"`` preserves the existing radix/clusters/CUB dispatch.
+        ``"gvr_2"`` explicitly selects hint-free fused GVR register kernels
+        (single-CTA or clustered)
+        on supported GPUs, for FP32 scores and k=512/1024/2048. Requires
+        full score rows and no deterministic or index tie-break guarantee.
+        Unsupported GVR kernel families raise ``NotImplementedError``.
 
     Returns
     -------
@@ -1229,6 +1237,27 @@ def top_k_page_table_transform(
         )
         if not out_raw_indices.is_contiguous():
             raise ValueError("out_raw_indices must be contiguous")
+
+    if backend not in ("auto", "gvr_2"):
+        raise ValueError(f"unsupported page-table top-k backend: {backend!r}")
+    if backend == "gvr_2":
+        if deterministic or tie_break != TopKTieBreak.NONE or row_starts is not None:
+            raise ValueError(
+                "gvr_2 requires full rows and no deterministic/tie-break mode"
+            )
+        from .topk_varlen.kernels.gvr2_topk_host import run_page_table_transform
+
+        return run_page_table_transform(
+            input,
+            src_page_table,
+            lengths,
+            k,
+            page_size=page_size,
+            row_to_batch=row_to_batch,
+            page_table_row_starts=page_table_row_starts,
+            out=out,
+            out_raw_indices=out_raw_indices,
+        )
 
     algo = os.environ.get("FLASHINFER_TOPK_ALGO")
     clusters_eligible = (

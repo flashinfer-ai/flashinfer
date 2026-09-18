@@ -75,6 +75,266 @@ _DEV = "cuda"
 _FMIN = -3.4028234663852886e38  # torch.finfo(torch.float32).min
 
 
+@requires_gvr2
+@pytest.mark.parametrize(
+    "width,k",
+    [
+        (256, 512),
+        (512, 512),
+        (1024, 512),
+        (2048, 512),
+        (4096, 512),
+        (8192, 512),
+        (8448, 512),
+        (16384, 512),
+        (16640, 512),
+        (32768, 512),
+        (65536, 1024),
+        (4096, 1024),
+        (8192, 2048),
+    ],
+)
+@pytest.mark.parametrize(
+    "page_size,save_raw", [(1, False), (16, True), (64, False), (256, True)]
+)
+def test_gvr2_fused_page_transform(width, k, page_size, save_raw):
+    """All register rungs, short rows, poisoned tails and real page remapping."""
+    rows = 8
+    generator = torch.Generator(device="cuda").manual_seed(731)
+    scores_arena = torch.randn((rows, width + 64), device="cuda", generator=generator)
+    scores = scores_arena[:, :width]
+    lens_host = [
+        0,
+        1,
+        min(k - 1, width),
+        min(k, width),
+        min(k + 1, width),
+        width,
+        width - 1,
+        min(width, 1537),
+    ]
+    lengths = torch.tensor(lens_host, device="cuda", dtype=torch.int32)
+    for r, n in enumerate(lens_host):
+        scores[r, n:] = 3e38
+    page_cols = (width + page_size - 1) // page_size
+    # Both the page table and scores deliberately have padded row strides.
+    pages = (
+        torch.randperm(rows * (page_cols + 5), device="cuda", generator=generator)
+        .int()
+        .view(rows, page_cols + 5)[:, : page_cols + 2]
+    )
+    row_map = torch.tensor([7, 2, 2, 0, 4, 1, 6, 3], device="cuda", dtype=torch.int32)
+    starts = torch.tensor([0, 1, 2, 1, 0, 2, 1, 0], device="cuda", dtype=torch.int32)
+    raw = torch.empty((rows, k), device="cuda", dtype=torch.int32) if save_raw else None
+    out = torch.empty((rows, k), device="cuda", dtype=torch.int32)
+    result = flashinfer.top_k_page_table_transform(
+        scores,
+        pages,
+        lengths,
+        k,
+        row_to_batch=row_map,
+        page_table_row_starts=starts,
+        page_size=page_size,
+        out=out,
+        out_raw_indices=raw,
+        backend="gvr_2",
+    )
+    assert result.data_ptr() == out.data_ptr()
+    for r, n in enumerate(lens_host):
+        expected_idx = (
+            torch.arange(n, device="cuda")
+            if n <= k
+            else torch.topk(scores[r, :n], k).indices
+        )
+        expected = (
+            pages[row_map[r].long(), starts[r].long() + expected_idx // page_size]
+            * page_size
+            + expected_idx % page_size
+        )
+        torch.testing.assert_close(
+            out[r, : min(n, k)].sort().values.long(),
+            expected.sort().values.long(),
+            rtol=0,
+            atol=0,
+        )
+        assert (out[r, min(n, k) :] == -1).all()
+        if raw is not None:
+            selected = raw[r, : min(n, k)].long()
+            assert selected.unique().numel() == min(n, k)
+            torch.testing.assert_close(
+                out[r, : min(n, k)].long(),
+                (
+                    pages[row_map[r].long(), starts[r].long() + selected // page_size]
+                    * page_size
+                    + selected % page_size
+                ).long(),
+                rtol=0,
+                atol=0,
+            )
+            assert (raw[r, min(n, k) :] == -1).all()
+            if n <= k:
+                torch.testing.assert_close(selected, expected_idx)
+
+
+@requires_gvr2
+@pytest.mark.parametrize("width", [8448, 16640])
+def test_gvr2_fused_page_transform_graph(width):
+    rows, k, page_size = 8, 512, 64
+    scores = torch.randn((rows, width), device="cuda")
+    # Fewer pages than the score allocation is legal if valid lengths fit.
+    pages = torch.randperm(rows * 128, device="cuda").int().view(rows, 128)
+    lengths = torch.full((rows,), 8192, device="cuda", dtype=torch.int32)
+    out = torch.empty((rows, k), device="cuda", dtype=torch.int32)
+    raw = torch.empty_like(out)
+
+    def run():
+        flashinfer.top_k_page_table_transform(
+            scores,
+            pages,
+            lengths,
+            k,
+            page_size=page_size,
+            out=out,
+            out_raw_indices=raw,
+            backend="gvr_2",
+        )
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for lens_host in (
+        [0, 1, 511, 512, 513, 1024, 4096, 8192],
+        [8192, 4096, 1024, 513, 512, 511, 1, 0],
+    ):
+        lengths.copy_(torch.tensor(lens_host, device="cuda", dtype=torch.int32))
+        pages.add_(1000)
+        graph.replay()
+        for r, n in enumerate(lens_host):
+            selected = raw[r, : min(n, k)].long()
+            assert (selected >= 0).all() and (selected < n).all()
+            expected_values = torch.topk(scores[r, :n], min(n, k)).values.sort().values
+            torch.testing.assert_close(
+                scores[r, selected].sort().values, expected_values, rtol=0, atol=0
+            )
+            torch.testing.assert_close(
+                out[r, : min(n, k)].long(),
+                (
+                    pages[r, selected // page_size] * page_size + selected % page_size
+                ).long(),
+                rtol=0,
+                atol=0,
+            )
+            assert (out[r, min(n, k) :] == -1).all()
+            assert (raw[r, min(n, k) :] == -1).all()
+
+
+@requires_gvr2
+@pytest.mark.parametrize("width", [512, 16640])
+def test_gvr2_fused_page_transform_padding_pages(width):
+    scores = torch.randn((3, width), device="cuda")
+    pages = torch.tensor([[7, 8], [9, 10], [11, 12]], device="cuda", dtype=torch.int32)
+    lengths = torch.tensor([width, width, width], device="cuda", dtype=torch.int32)
+    starts = torch.tensor([0, -1, 2], device="cuda", dtype=torch.int32)
+    raw = torch.empty((3, 512), device="cuda", dtype=torch.int32)
+    out = flashinfer.top_k_page_table_transform(
+        scores,
+        pages,
+        lengths,
+        512,
+        page_size=64,
+        page_table_row_starts=starts,
+        out_raw_indices=raw,
+        backend="gvr_2",
+    )
+    if width == 512:
+        torch.testing.assert_close(
+            raw.long(), torch.arange(512, device="cuda").expand(3, -1)
+        )
+    for row in range(3):
+        logical = raw[row].long()
+        torch.testing.assert_close(
+            scores[row, logical].sort().values,
+            scores[row].topk(512).values.sort().values,
+        )
+        page_col = logical // 64 + starts[row]
+        valid = (page_col >= 0) & (page_col < pages.shape[1])
+        expected = torch.full((512,), -1, device="cuda", dtype=torch.int32)
+        expected[valid] = pages[row, page_col[valid]] * 64 + (logical[valid] % 64).int()
+        torch.testing.assert_close(out[row], expected)
+
+
+@requires_gvr2
+def test_gvr2_fused_page_transform_rejections():
+    scores = torch.randn((2, 1024), device="cuda")
+    pages = torch.arange(32, device="cuda", dtype=torch.int32).view(2, 16)
+    lengths = torch.full((2,), 1024, device="cuda", dtype=torch.int32)
+    for options in (
+        dict(deterministic=True),
+        dict(tie_break=1),
+        dict(row_starts=torch.zeros_like(lengths)),
+    ):
+        with pytest.raises(ValueError):
+            flashinfer.top_k_page_table_transform(
+                scores, pages, lengths, 512, page_size=64, backend="gvr_2", **options
+            )
+    out = torch.empty((2, 512), device="cuda", dtype=torch.int32)
+    with pytest.raises(ValueError, match="overlap"):
+        flashinfer.top_k_page_table_transform(
+            scores,
+            pages,
+            lengths,
+            512,
+            page_size=64,
+            backend="gvr_2",
+            out=out,
+            out_raw_indices=out,
+        )
+
+
+@requires_gvr2
+@pytest.mark.parametrize(
+    "width,rows",
+    [(4096, 2), (8192, 256), (16384, 32), (16640, 32), (16640, 64), (32768, 8)],
+)
+@pytest.mark.parametrize(
+    "pattern", ["constant", "quantized4", "huge_flood_lt_k", "posinf"]
+)
+def test_gvr2_fused_page_transform_adversarial(width, rows, pattern):
+    k, page_size = 512, 64
+    gen = torch.Generator(device="cuda").manual_seed(901)
+    if pattern == "posinf":
+        scores = torch.randn((rows, width), device="cuda", generator=gen)
+        scores[:, ::7] = float("inf")
+    else:
+        scores = _adversarial_logits(pattern, rows, width, k, gen)
+    lengths = torch.full((rows,), width, device="cuda", dtype=torch.int32)
+    pages = (
+        torch.randperm(rows * (width // page_size), device="cuda", generator=gen)
+        .int()
+        .view(rows, -1)
+    )
+    raw = torch.full((rows, k), -99, device="cuda", dtype=torch.int32)
+    out = flashinfer.top_k_page_table_transform(
+        scores,
+        pages,
+        lengths,
+        k,
+        page_size=page_size,
+        out_raw_indices=raw,
+        backend="gvr_2",
+    )
+    expected_vals = torch.topk(scores, k).values.sort(dim=1).values
+    actual_vals = scores.gather(1, raw.long()).sort(dim=1).values
+    torch.testing.assert_close(actual_vals, expected_vals, rtol=0, atol=0)
+    expected_out = (
+        pages.gather(1, raw.long() // page_size) * page_size + raw % page_size
+    )
+    torch.testing.assert_close(out, expected_out, rtol=0, atol=0)
+    for row in raw:
+        assert row.unique().numel() == k
+
+
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
