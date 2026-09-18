@@ -176,6 +176,26 @@ struct genericMoeGemmKernelLauncher {
       // hardware resource differences. Using GemmGrouped::maximum_active_blocks() ensures
       // the occupancy query returns 0 for these configs, allowing the static heuristic to
       // correctly skip them rather than selecting a config that will fail at execution time.
+      if (inputs.occupancy != nullptr) {
+        // CUTLASS maximum_active_blocks probes opt-in shared memory with
+        // cudaFuncSetAttribute, then clears invalid-value errors. Avoid making
+        // an invalid API call for an ineligible tactic during preparation.
+        constexpr size_t dynamic_smem = sizeof(typename GemmKernel::SharedStorage);
+        if (dynamic_smem > (48 << 10)) {
+          int device = 0;
+          int max_smem = 0;
+          cudaFuncAttributes attr{};
+          tensorrt_llm::common::check_cuda_error(cudaGetDevice(&device));
+          tensorrt_llm::common::check_cuda_error(
+              cudaDeviceGetAttribute(&max_smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
+          tensorrt_llm::common::check_cuda_error(
+              cudaFuncGetAttributes(&attr, cutlass::Kernel<GemmKernel>));
+          if (dynamic_smem + attr.sharedSizeBytes > static_cast<size_t>(max_smem)) {
+            *inputs.occupancy = 0;
+            return;
+          }
+        }
+      }
       int occupancy = std::min(2, GemmGrouped::maximum_active_blocks());
       if (inputs.occupancy != nullptr) {
         *inputs.occupancy = occupancy;

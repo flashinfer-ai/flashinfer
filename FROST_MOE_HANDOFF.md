@@ -1,3 +1,39 @@
+## SM120 comparison including both PDL settings — 2026-09-17
+
+On RTX PRO 6000 Blackwell Server (188 SMs, 600W), BF16 T1/E128/top8/H2048/I768,
+PackedPrecomputed routing, the current Frost path measures **84.9495625 us**
+versus **88.0897500 us** for the freshly selected CUTLASS winner: **3.565% lower
+full-MoE latency**. Dimensions match Qwen3-30B-A3B; weights, activations and
+routing are synthetic, with a saved CPU fixture. This is operator evidence,
+not checkpoint inference, a model E2E result or a new kernel speedup from tuning.
+
+The comparison attempts all 128 exposed (PDL off/on, FC1, FC2) combinations.
+96 execute successfully. The remaining 32 fail the backend's exact prelaunch
+zero-occupancy check; they remain explicit unsupported records, never timings
+or silently removed candidates. Winner PDL-on/(1,11) passes normal execution,
+memcheck and racecheck, then four fresh ABBA processes with cold-L2 CUPTI.
+Independent audit2058 reconstructs829 raw passing comparisons,616 observable
+negative controls and5520 spans. Both backends prepare weights outside timing.
+The exposed candidate domains match the pre-fix capture exactly.
+
+This PR's companion FI change checks opt-in shared-memory capacity before
+CUTLASS's occupancy probe. An oversized candidate previously issued an invalid
+cudaFuncSetAttribute call and cleared its error internally, causing sanitizer
+failure during configuration discovery. The query now returns zero occupancy
+before that invalid call. The execution kernel and selected configuration are
+unchanged. This fixes discovery behavior; it does not explain the timing gain.
+The exact tested header differs from the formatted public header only in
+whitespace; C++ token streams match.
+
+This supersedes the SM120 PDL-off-only comparison and pending status below.
+The B200 PDL-off/on comparator is still being validated. Finalizer-PDL and
+native top8-unroll experiments remain unpublished pending their full gates.
+No broad CI, all-shape superiority or performance-roof claim is made.
+
+Credit: NVIDIA Frost/FlashInfer/TRT-LLM and CUTLASS provide the kernels and
+occupancy-query machinery. Existing Frost integration credits, including
+Yanqin/Yihua, Yanqin PR1090/CUTLASS113 and KF contributions, remain below.
+
 ## Small-row scheduler specialization — 2026-09-17
 
 For paired FC1 declarations with at most 8 routed rows, each nonempty expert
