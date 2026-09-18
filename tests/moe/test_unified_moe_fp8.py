@@ -50,10 +50,6 @@ def _build_per_tensor_fp8_runner(config):
 
 
 def _is_trtllm_fp8_arch() -> bool:
-    # Defer to the library's own FP8 table rather than restating it. Note this
-    # is _TRTLLM_ROUTED_FP8_ARCHS, not the wider _TRTLLM_ROUTED_ARCHS: the FP8
-    # cubins are validated on the SM100 family only, so this gate is
-    # deliberately narrower than the routed-MoE one.
     from flashinfer.fused_moe.api import _TRTLLM_ROUTED_FP8_ARCHS
 
     if not torch.cuda.is_available():
