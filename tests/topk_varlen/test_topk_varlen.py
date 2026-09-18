@@ -1393,6 +1393,78 @@ def test_cross_backend_value_consistency():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
+@pytest.mark.parametrize(
+    "backend", ["radix", "radix_cutlass", "radix_filter", "gvr", "gvr_2"]
+)
+def test_seq_len_below_next_n_all_backends(backend):
+    """seq_len < next_n - t makes ``seq_len - next_n + t + 1`` negative.
+
+    Padded / evicted requests reach every backend with such rows. Each must
+    treat them as empty (all -1) and stay inside its own row: a negative
+    length is neither an unsigned count (radix_cutlass) nor a write offset
+    before the row (radix / gvr identity epilogues). The caller buffer is
+    over-allocated and pre-filled with a sentinel so any write that lands
+    outside a row is detected, and full rows preceding the empty rows are
+    checked exactly so a write into a neighbour's tail is caught too.
+    """
+    if backend != "radix_cutlass" and not _IS_BLACKWELL:
+        pytest.skip(f"{backend} requires Blackwell (sm_100+) and nvidia-cutlass-dsl")
+    from flashinfer.utils import get_compute_capability
+
+    major, minor = get_compute_capability(torch.device("cuda"))
+    if not flashinfer.top_k_varlen.is_backend_supported(backend, major * 10 + minor):
+        pytest.skip(f"{backend} unsupported on this device")
+    top_k, N, next_n = 512, 8192, 3
+    # request seq_lens: three that make some numerators negative
+    # (0 -> -2,-1,0; 1 -> -1,0,1; 2 -> 0,1,2), one straddling top_k, two full.
+    # The zero-length request goes FIRST: an unclamped kernel writes row 0's
+    # `-1` padding from offset -2, i.e. into the guard row, where nothing
+    # overwrites it. Behind a full row the same stray writes land in that
+    # row's tail and are racily repaired by the full row's own kernel.
+    req_lens = [0, 1, 2, top_k + 2, N, N]
+    num_req = len(req_lens)
+    num_rows = num_req * next_n
+    torch.manual_seed(7)
+    logits = torch.randn(num_rows, N, dtype=torch.float32, device="cuda")
+    seq_lens = torch.tensor(req_lens, dtype=torch.int32, device="cuda")
+    pre_idx = torch.arange(top_k, dtype=torch.int32, device="cuda").repeat(num_req, 1)
+    sentinel = 0x7EADBEEF
+    # one guard row before and after the caller's buffer
+    arena = torch.full(
+        (num_rows + 2, top_k), sentinel, dtype=torch.int32, device="cuda"
+    )
+    out = arena[1 : num_rows + 1]
+    kwargs = {"backend": backend, "next_n": next_n, "out_indices": out}
+    if backend in ("gvr", "gvr_2"):
+        kwargs["pre_idx"] = pre_idx
+    idx, _ = flashinfer.top_k_varlen(logits, seq_lens, top_k, **kwargs)
+    torch.cuda.synchronize()
+    assert idx.data_ptr() == out.data_ptr()
+    assert (arena[0] == sentinel).all() and (arena[-1] == sentinel).all(), (
+        "write landed outside the caller's buffer"
+    )
+    arena_cpu = arena.cpu()
+    for r in range(num_rows):
+        length = max(0, req_lens[r // next_n] - next_n + (r % next_n) + 1)
+        row = arena_cpu[r + 1].tolist()
+        assert sentinel not in row, f"row={r}: slot never written"
+        valid = [i for i in row if i >= 0]
+        assert row.count(-1) == top_k - len(valid), f"row={r}: bad -1 padding"
+        if length <= top_k:
+            assert sorted(valid) == list(range(length)), (
+                f"row={r}: length={length} must select exactly [0,{length}); "
+                f"got {len(valid)} indices"
+            )
+        else:
+            assert len(valid) == top_k and max(valid) < length, (
+                f"row={r}: index past length={length}"
+            )
+            got = logits[r][torch.tensor(valid, device="cuda")].sort().values
+            ref = logits[r, :length].topk(top_k).values.sort().values
+            assert torch.equal(got, ref), f"row={r}: wrong top-k value set"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
 def test_unknown_backend_rejected():
     """Unregistered backend names — including the pre-rename 'radix_cutedsl' — raise.
 

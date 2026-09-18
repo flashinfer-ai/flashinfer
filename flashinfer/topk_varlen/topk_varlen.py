@@ -1189,7 +1189,9 @@ def _run_radix_cutlass(
         row_seq_lens = (row_seq_lens - next_n + row_offsets + 1) // compress_ratio
     else:
         row_seq_lens = seq_lens // compress_ratio
-    lengths = row_seq_lens.clamp(max=N).to(torch.int32)
+    # min=0: a padded / evicted request (seq_len < next_n - nn) gives a negative
+    # numerator; the kernel would reinterpret a negative length as unsigned.
+    lengths = row_seq_lens.clamp(min=0, max=N).to(torch.int32)
 
     # offsets=zeros: output indices are local column indices (0..N-1), no shift.
     offsets = torch.zeros(num_rows, dtype=torch.int32, device=logits.device)
