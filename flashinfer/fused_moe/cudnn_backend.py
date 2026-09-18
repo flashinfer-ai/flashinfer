@@ -143,6 +143,30 @@ def _has_canonical_fc1_parent(weights, parent):
     return True
 
 
+def _has_k64_fc1_parent(weights, parent):
+    """Validate explicit [up,gate] views of a prepared [E,K/64,2N,64] parent."""
+    if (
+        parent is None
+        or len(weights) != 2
+        or parent.ndim != 4
+        or parent.dtype != torch.bfloat16
+        or not parent.is_contiguous()
+    ):
+        return False
+    e, kb, twice_n, inner = parent.shape
+    if min(e, kb, twice_n) <= 0 or inner != 64 or twice_n % 128:
+        return False
+    n = twice_n // 2
+    return all(
+        weight.device == parent.device
+        and weight.dtype == parent.dtype
+        and tuple(weight.shape) == (e, kb, n, 64)
+        and tuple(weight.stride()) == tuple(parent.stride())
+        and weight.data_ptr() == parent.data_ptr() + row * 64 * parent.element_size()
+        for weight, row in zip(weights, (n, 0), strict=True)
+    )
+
+
 class _ParentGraphUnsupported(NotImplementedError):
     """The declared weight-parent graph declined before kernel compilation."""
 
@@ -151,6 +175,8 @@ def _prepare_fused_fc1(*args, weights_parent=None, **kwargs):
     try:
         return _Stage(*args, weights_parent=weights_parent, **kwargs)
     except _ParentGraphUnsupported as exc:
+        if kwargs.get("weight_layout") is not None:
+            raise
         # Older Frontend engines can fuse separate up/gate inputs without
         # recognizing their parent SLICE declarations. Reuse the same native
         # views and explicit tactics, with no repack and no execution fallback.
@@ -174,6 +200,7 @@ class _Stage:
         activation=None,
         tactics=(),
         weights_parent=None,
+        weight_layout=None,
     ):
         import cudnn
 
@@ -197,14 +224,28 @@ class _Stage:
             stride=[1, 1, 1],
             data_type=cudnn.data_type.INT32,
         )
+        self.weight_layout = weight_layout
+        if weight_layout not in (None, "k_blocked_64_v1"):
+            raise ValueError("Unsupported FC1 weight layout")
+        parent_valid = (
+            _has_k64_fc1_parent
+            if weight_layout is not None
+            else _has_canonical_fc1_parent
+        )
+        if weight_layout is not None and weights_parent is None:
+            raise ValueError("Prepared FC1 weights require an explicit parent")
         self.weights = []
         self.weights_parent = None
         if weights_parent is not None:
-            if not fused or not _has_canonical_fc1_parent(weights, weights_parent):
+            if not fused or not parent_valid(weights, weights_parent):
                 raise ValueError(
                     "Fused FC1 weights must be explicit views of their gate/up parent"
                 )
-            view = weights_parent.transpose(1, 2)
+            view = (
+                weights_parent
+                if weight_layout is not None
+                else weights_parent.transpose(1, 2)
+            )
             self.weights_parent = g.tensor(
                 name="gate_up_parent",
                 dim=list(view.shape),
@@ -213,7 +254,7 @@ class _Stage:
             )
         gemms = []
         for i, weight in enumerate(weights):
-            view = weight.transpose(1, 2)
+            view = weight if weight_layout is not None else weight.transpose(1, 2)
             if self.weights_parent is None:
                 desc = g.tensor(
                     name=f"weight_{i}",
@@ -223,10 +264,14 @@ class _Stage:
                 )
             else:
                 # FC1's operand order is [up, gate]; its parent is [gate, up].
-                start = weight.shape[1] if i == 0 else 0
+                width = (
+                    weight.shape[2] if weight_layout is not None else weight.shape[1]
+                )
+                start = width if i == 0 else 0
                 desc = g.slice(
                     self.weights_parent,
-                    [slice(None), slice(None), slice(start, start + weight.shape[1])],
+                    [slice(None), slice(None), slice(start, start + width)]
+                    + ([] if weight_layout is None else [slice(None)]),
                     name=f"weight_{i}",
                 ).set_stride(list(view.stride()))
             self.weights.append(desc)
@@ -237,6 +282,7 @@ class _Stage:
                     self.offsets,
                     mode=cudnn.moe_grouped_matmul_mode.NONE,
                     name=f"gemm_{i}",
+                    weight_layout=weight_layout,
                 )
             )
         self.scalar_bindings = {}
@@ -325,11 +371,20 @@ class _Stage:
                 for desc, weight in zip(self.weights, weights, strict=True)
             )
         else:
-            if not _has_canonical_fc1_parent(weights, weights_parent):
+            parent_valid = (
+                _has_k64_fc1_parent
+                if self.weight_layout is not None
+                else _has_canonical_fc1_parent
+            )
+            if not parent_valid(weights, weights_parent):
                 raise ValueError(
                     "FC1 execution must preserve its declared parent relationship"
                 )
-            pack[self.weights_parent] = weights_parent.transpose(1, 2)
+            pack[self.weights_parent] = (
+                weights_parent
+                if self.weight_layout is not None
+                else weights_parent.transpose(1, 2)
+            )
         pack.update(self.scalar_bindings)
         index = self.plan_index(tactic)
         if index == -1:
@@ -444,6 +499,11 @@ class CudnnMoeRunner(MoERunner):
             raise NotImplementedError(
                 f"CudnnMoeRunner does not support SM{major}{minor}"
             )
+        if getattr(self.backend_config, "fc1_weight_layout", None) is not None and (
+            major,
+            minor,
+        ) != (10, 0):
+            raise NotImplementedError("K64 prepared FC1 currently requires SM100")
         _check_cudnn_version(92100, "BF16 MoE")
         if not self.config.finalize.do_finalize:
             raise NotImplementedError(
@@ -522,27 +582,44 @@ class CudnnMoeRunner(MoERunner):
             x.shape[1],
         )
         tensors = [v[name] for name in ("up", "gate", "down", "gate_up")]
-        for name, t, shape in zip(
-            ("up", "gate", "down", "gate_up"),
-            tensors,
-            ((e, i, h), (e, i, h), (e, h, i), (e, 2 * i, h)),
-            strict=True,
-        ):
-            split_view = name in ("up", "gate") and tuple(t.stride()) == (
-                2 * i * h,
-                h,
-                1,
-            )
+        if getattr(self.backend_config, "fc1_weight_layout", None) is not None:
+            if not _has_k64_fc1_parent(tensors[:2], tensors[3]):
+                raise ValueError("Expected explicit prepared K64 gate/up weight views")
+            parent, down = tensors[3], tensors[2]
             if (
-                t.device != self.device
-                or t.dtype != torch.bfloat16
-                or tuple(t.shape) != shape
-                or not (t.is_contiguous() or split_view)
+                tuple(parent.shape) != (e, h // 64, 2 * i, 64)
+                or h % 64
+                or parent.device != self.device
+                or down.device != self.device
+                or down.dtype != torch.bfloat16
+                or tuple(down.shape) != (e, h, i)
+                or not down.is_contiguous()
             ):
                 raise ValueError(
-                    f"Invalid cuDNN MoE weight layout for {name}; expected BF16 {shape} "
-                    f"on {self.device}, contiguous or a canonical gate/up split view"
+                    "Invalid prepared K64 FC1 or canonical BF16 FC2 weights"
                 )
+        else:
+            for name, t, shape in zip(
+                ("up", "gate", "down", "gate_up"),
+                tensors,
+                ((e, i, h), (e, i, h), (e, h, i), (e, 2 * i, h)),
+                strict=True,
+            ):
+                split_view = name in ("up", "gate") and tuple(t.stride()) == (
+                    2 * i * h,
+                    h,
+                    1,
+                )
+                if (
+                    t.device != self.device
+                    or t.dtype != torch.bfloat16
+                    or tuple(t.shape) != shape
+                    or not (t.is_contiguous() or split_view)
+                ):
+                    raise ValueError(
+                        f"Invalid cuDNN MoE weight layout for {name}; expected BF16 {shape} "
+                        f"on {self.device}, contiguous or a canonical gate/up split view"
+                    )
         # Packed mode's public contract narrows routing weights to BF16. The
         # cuDNN adapter does not encode IDs into their high bits, but preserves
         # the same numeric boundary. Unpacked mode retains FP32 weights.
@@ -559,7 +636,10 @@ class CudnnMoeRunner(MoERunner):
         layout = tuple(
             (tuple(tensor.shape), tuple(tensor.stride())) for tensor in inputs[3:7]
         )
-        return layout, _has_canonical_fc1_parent(inputs[3:5], inputs[6])
+        return layout, (
+            _has_canonical_fc1_parent(inputs[3:5], inputs[6])
+            or _has_k64_fc1_parent(inputs[3:5], inputs[6])
+        )
 
     def _resources(self, inputs):
         x, ids, scales, up, gate, down, gate_up = inputs[:7]
@@ -615,7 +695,11 @@ class CudnnMoeRunner(MoERunner):
 
         x, _, _, up, gate, down, gate_up = inputs[:7]
         t, _ = x.shape
-        i = up.shape[1]
+        i = (
+            up.shape[2]
+            if self.backend_config.fc1_weight_layout is not None
+            else up.shape[1]
+        )
         r = self.config.routing.top_k
         # FROST's shared-A FC1 fusion is optional. A graph decline is a route
         # choice; record it and build the ordinary backend-compatible FC1.
@@ -631,9 +715,13 @@ class CudnnMoeRunner(MoERunner):
                     tactic=self.backend_config.fc1_tactic,
                     activation=self.config.activation,
                     tactics=self.backend_config.fc1_tactics,
+                    weight_layout=self.backend_config.fc1_weight_layout,
                     weights_parent=(
                         gate_up
-                        if _has_canonical_fc1_parent([up, gate], gate_up)
+                        if (
+                            _has_canonical_fc1_parent([up, gate], gate_up)
+                            or _has_k64_fc1_parent([up, gate], gate_up)
+                        )
                         else None
                     ),
                 )
@@ -644,7 +732,10 @@ class CudnnMoeRunner(MoERunner):
                 cudnn.cudnnGraphNotSupportedError,
             ) as exc:
                 _LOG.info("cuDNN MoE shared-input FC1 fusion declined: %s", exc)
-                if self.backend_config.fc1_fusion is True:
+                if (
+                    self.backend_config.fc1_fusion is True
+                    or self.backend_config.fc1_weight_layout is not None
+                ):
                     raise
         if not s["fused"]:
             s["fc1_output"] = empty((t * r, 2 * i), torch.float32)

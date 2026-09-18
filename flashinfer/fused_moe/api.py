@@ -886,6 +886,10 @@ class CudnnMoeConfig:
     ``fc1_fusion=None`` prefers supported fusion, ``True`` requires it, and
     ``False`` selects a separate FC1 and activation. Use separate backend
     candidates to measure both routes, each with its own stage domains.
+    ``fc1_weight_layout="k_blocked_64_v1"`` opts into prepared K64 FC1
+    weights on SM100. Pass the same value to ``prepare_weights`` before
+    capture; this requires the paired SwiGLU engine and never falls back
+    to an engine that expects canonical weights.
     """
 
     use_native_routing: bool = False
@@ -894,8 +898,13 @@ class CudnnMoeConfig:
     fc1_tactics: Tuple[tuple, ...] = ()
     fc2_tactics: Tuple[tuple, ...] = ()
     fc1_fusion: Optional[bool] = None
+    fc1_weight_layout: Optional[str] = None
 
     def __post_init__(self):
+        if self.fc1_weight_layout not in (None, "k_blocked_64_v1"):
+            raise ValueError("Unsupported cuDNN FC1 weight layout")
+        if self.fc1_weight_layout is not None and self.fc1_fusion is False:
+            raise ValueError("Prepared K64 weights require fused FC1")
         if self.fc1_fusion is not None and type(self.fc1_fusion) is not bool:
             raise ValueError("fc1_fusion must be None or bool")
 
@@ -945,6 +954,7 @@ class CudnnMoeConfig:
         intermediate_size: int,
         activation: Optional[ActivationConfig] = None,
         device=None,
+        fc1_weight_layout=None,
     ):
         import torch
 
@@ -960,12 +970,34 @@ class CudnnMoeConfig:
             raise ValueError(
                 "cuDNN MoE expects [up, gate] FC1 weights and [E,H,I] FC2 weights"
             )
+        if fc1_weight_layout not in (None, "k_blocked_64_v1"):
+            raise ValueError("Unsupported cuDNN FC1 weight layout")
+        if fc1_weight_layout is not None and (
+            h % 64 or i % 64 or activation != SwiGLU()
+        ):
+            raise ValueError(
+                "K64 FC1 weights require H/I multiples of 64 and standard SwiGLU"
+            )
         device = device or w1_bf16.device
         up, gate = w1_bf16.to(device).split(i, dim=1)
-        # Fused and unfused FC1 share one allocation. Each expert matrix is
-        # contiguous; the split views retain the combined tensor's expert pitch.
-        gate_up = torch.cat((gate, up), dim=1).contiguous()
-        gate, up = gate_up.split(i, dim=1)
+        if fc1_weight_layout == "k_blocked_64_v1":
+            # Concatenate directly into K64 order. Each input is a metadata-only
+            # view, avoiding an intermediate full-size canonical FC1 allocation.
+            gate_up = torch.cat(
+                (
+                    gate.unflatten(-1, (h // 64, 64)).transpose(1, 2),
+                    up.unflatten(-1, (h // 64, 64)).transpose(1, 2),
+                ),
+                dim=2,
+            ).contiguous()
+            # Flatten first to canonicalize singleton-axis strides as well.
+            gate_up = gate_up.view(-1).view(e, h // 64, 2 * i, 64)
+            gate, up = gate_up.split(i, dim=2)
+        else:
+            # Fused and unfused FC1 share one canonical allocation. Split views
+            # retain the combined tensor's expert pitch.
+            gate_up = torch.cat((gate, up), dim=1).contiguous()
+            gate, up = gate_up.split(i, dim=1)
         return {
             "up": up,
             "gate": gate,

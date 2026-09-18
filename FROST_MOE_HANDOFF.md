@@ -1,3 +1,86 @@
+## Explicit K64 FC1 layout through FE and FlashInfer — 2026-09-18
+
+Paired SM100 SwiGLU FC1 now accepts `weight_layout="k_blocked_64_v1"`.
+The physical BF16 parent is contiguous `[E,K/64,2N,64]`, with gate then up
+on its feature axis. Feature slices keep their parent strides and live pointer.
+The TMA descriptor reads this layout directly; execution performs no packing,
+allocation, compilation or synchronization. Layout participates in plan/cache
+identity. Ordinary SM100/SM120 engines decline this declaration.
+
+FlashInfer exposes the append-only `CudnnMoeConfig.fc1_weight_layout` field
+and matching preparation keyword. Both must select the same layout. The
+preparation helper creates the K64 parent directly from ordinary `[up,gate]`
+weights; FC2 is unchanged. Prepared FC1 requires SM100, standard SwiGLU,
+BF16, H/I divisible by64 and the paired engine's1–513 routed-row contract.
+An unsupported graph or device declines instead of reinterpreting the weights.
+The default canonical layout and existing tactics retain their behavior.
+
+Same-input full MoE comparison,148-SM B200 at1000W, BF16 E128/top8/H2048/I768,
+T8, identical FE/FI source and paired12-stage FC2 in both arms:
+
+| Routing | Canonical FC1 | K64 FC1 | Latency reduction |
+|---|---:|---:|---:|
+| Unpacked | 102.855000 us | 100.863000 us | 1.937% |
+| Packed | 102.914750 us | 100.942750 us | 1.916% |
+
+Job4385856 / audit2267 passes296 raw checks,120 independent changed-reference
+controls and768 CUPTI timing spans: normal/memcheck/racecheck, live inputs,
+routing and both weights, retained and legacy captures, bitwise cross-arm
+agreement, and fresh ABBA processes. PDL overlaps FC1/FC2, so component durations
+must not be added. FC2 code is unchanged. These are synthetic full-operator
+measurements, not model E2E or a fresh strongest-TRT comparison.
+
+Native graph job4385625 / audit2272 passes144 zero-skip test executions across
+normal/memcheck/racecheck,840 raw checks,252 changed-reference controls and168
+actual paired-engine routes. Coverage includes R1..513 boundaries, singleton
+K blocks, E257, live parents, retained graphs and multiwave schedules. Initial
+job4385479's two prelaunch singleton-stride failures are preserved; flatten/view
+canonicalizes those strides during preparation. No tolerance was relaxed.
+CPU contracts: FE20 and FI21 pass; six new positive FE cases fail the prior
+source as expected. Changed-file hooks pass; full repository CI is unclaimed.
+
+A subsequent preparation-only improvement eliminates one768MiB canonical FC1
+intermediate by concatenating directly into K64 order. On the local CPU host,
+eight torch threads and three ABBA cycles measure199.338774→68.9948285ms
+(65.388% lower); bytes, strides and aliases match. This excludes input loading
+and H2D and is not GPU preparation latency. Audit2267 used the older two-step
+helper; the final direct-helper GPU validation2287 also passes (below).
+Preparation remains outside hot-path timing and must be included for frequent
+weight-update workloads. Retained prepared storage is unchanged.
+
+The final direct-helper validation has now passed on B2001000W: job4386434,
+audit2287,296 raw checks,120 independent changed-reference controls and768
+CUPTI spans. It additionally checks CPU-prepared versus GPU-prepared weights
+for exact bytes, strides and parent aliases before capture in every process.
+Normal/memcheck/racecheck, retained/live/legacy replay and fresh ABBA timings
+all pass. This exact-source repeat gives:
+
+| Routing | Canonical FC1 | K64 FC1 | Latency reduction |
+|---|---:|---:|---:|
+| Unpacked | 102.366875 us | 101.046750 us | 1.290% |
+| Packed | 102.326750 us | 100.982750 us | 1.313% |
+
+This repeat validates the revised helper used by the published FI integration.
+Its preparation performance remains separately scoped to the CPU benchmark;
+no GPU preparation speedup or model E2E claim is made.
+
+Latest companion evidence available separately: public FC2 depth audit2199;
+strongest-native T8 comparator audit2167 (Frost102.232750us vs TRT96.686313us,
+Frost5.737% slower, all704 FC1/FC2/PDL combinations); SM120 audit2120 (Frost
+82.794563us vs CUTLASS87.114375us,4.959% lower after128 joint configurations).
+Those use their own matched snapshots and must not be combined with this
+K64 percentage. TRT preparation includes gate/up interleave, row shuffle and
+BlockMajorK128B conversion outside timing. The pre-existing FC2 cancellation
+limitation documented by audit2214 remains unresolved; no broad accuracy or
+performance-roof claim is made.
+
+Credit: NVIDIA Frost/CuTeDSL and the existing paired implementation; Kernel
+Factory624/2f5c/f19299 and later FC2-depth work; Yanqin Zhai's PR1090 and
+Yanqin/Yihua's parallel distillation; CUTLASS example113. TRT-LLM preparation
+motivated this exploration; its kernel body and shuffle implementation were
+not copied. The separate KF M64 scheduler ablation remains private experimental
+work pending combination and integration evidence.
+
 ## Paired FC2 admission extended to 513 routed rows — 2026-09-17
 
 The SM100 paired BF16 projection engine20402 now accepts1–513 total routed
