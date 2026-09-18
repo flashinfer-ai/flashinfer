@@ -13,12 +13,40 @@
 # limitations under the License.
 
 import inspect
+import importlib
+
+import pytest
 
 from flashinfer.fused_moe.backends.prims_ts.fp8_op import (
     _fake_prims_ts_fp8_per_tensor_scale_moe,
     prims_ts_fp8_per_tensor_scale_moe,
 )
 from flashinfer.fused_moe.core import trtllm_fp8_per_tensor_scale_moe
+
+
+@pytest.mark.parametrize(
+    "module_name,op_name",
+    [
+        ("bf16_op", "prims_ts_bf16_moe"),
+        ("fp4_op", "prims_ts_fp4_block_scale_moe"),
+        ("fp8_op", "prims_ts_fp8_per_tensor_scale_moe"),
+        ("fp8_op", "prims_ts_fp8_block_scale_moe"),
+    ],
+)
+def test_prims_ts_workload_is_not_a_custom_op_argument(module_name, op_name):
+    module = importlib.import_module(
+        f"flashinfer.fused_moe.backends.prims_ts.{module_name}"
+    )
+    public = inspect.signature(getattr(module, op_name))
+    actual = inspect.signature(
+        getattr(module, f"{op_name}_op")
+        if module_name == "bf16_op"
+        else getattr(module, op_name)
+    )
+    fake = inspect.signature(getattr(module, f"_fake_{op_name}"))
+    assert "num_local_assignments_hint" not in public.parameters
+    assert "num_local_assignments_hint" not in actual.parameters
+    assert actual.parameters == fake.parameters
 
 
 def test_prims_ts_fp8_positional_contract_matches_trtllm():

@@ -482,6 +482,7 @@ def _fake_prims_ts_fp4_block_scale_moe(
     routing_input_mode: int = RoutingInputMode.FromLogits,
     topk_ids: Optional[torch.Tensor] = None,
     topk_weights: Optional[torch.Tensor] = None,
+    num_fused_shared_experts: Optional[int] = None,
 ) -> List[torch.Tensor]:
     del (
         routing_logits,
@@ -518,6 +519,7 @@ def _fake_prims_ts_fp4_block_scale_moe(
         routing_input_mode,
         topk_ids,
         topk_weights,
+        num_fused_shared_experts,
     )
     hidden_size = (
         hidden_states.shape[-1] * 2

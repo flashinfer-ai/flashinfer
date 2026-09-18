@@ -196,7 +196,7 @@ def test_nvfp4_da_public_graph_lifecycle(monkeypatch, routing_input_mode):
         num_tokens=256,
         num_experts=64,
         local_num_experts=32,
-        local_expert_offset=16,
+        local_expert_offset=32,
         top_k=4,
         hidden_size=1024,
         intermediate_size=1024,

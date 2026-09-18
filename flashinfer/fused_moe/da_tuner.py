@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import Any, TypeAlias
 
 import numpy as np
 import torch
@@ -20,6 +22,159 @@ from flashinfer.fused_moe.da_moe import (
     DAPlanMode,
     _local_load_spectrum,
 )
+
+
+@dataclass(frozen=True)
+class FullWorkload:
+    """Profile every token-expert slot as work owned by the local rank."""
+
+    def local_assignments(
+        self,
+        capacity_tokens: int,
+        top_k: int,
+        num_experts: int,
+        num_local_experts: int,
+        local_expert_offset: int = 0,
+    ) -> int:
+        """Return the full token-expert capacity."""
+        _validate_capacity_and_top_k(capacity_tokens, top_k)
+        return capacity_tokens * top_k
+
+
+@dataclass(frozen=True)
+class BalancedEPWorkload:
+    """Hint that a full input buffer is balanced across equal EP shards.
+
+    When ``ep_size`` and ``ep_rank`` are omitted, both values are inferred
+    from the MoE operation's global and local expert geometry. Explicit values
+    are cross-checked against that geometry. The default two-times multiplier
+    was selected empirically from PrimsTS DA MoE measurements across EP sizes;
+    callers can request exact balanced occupancy with a multiplier of one.
+    """
+
+    ep_size: int | None = None
+    ep_rank: int | None = None
+    require_equal: bool = True
+    assignment_multiplier: int = 2
+
+    def __post_init__(self) -> None:
+        if (self.ep_size is None) != (self.ep_rank is None):
+            raise ValueError("ep_size and ep_rank must be provided together")
+        if self.ep_size is not None and self.ep_size <= 0:
+            raise ValueError(f"ep_size must be positive, got {self.ep_size}")
+        if self.ep_size is not None:
+            assert self.ep_rank is not None
+        if self.ep_size is not None and not 0 <= self.ep_rank < self.ep_size:
+            raise ValueError(
+                f"ep_rank must be in [0, {self.ep_size}), got {self.ep_rank}"
+            )
+        if self.assignment_multiplier <= 0:
+            raise ValueError(
+                "assignment_multiplier must be positive, got "
+                f"{self.assignment_multiplier}"
+            )
+
+    def local_assignments(
+        self,
+        capacity_tokens: int,
+        top_k: int,
+        num_experts: int,
+        num_local_experts: int,
+        local_expert_offset: int = 0,
+    ) -> int:
+        """Return this rank's synthetic work, capped at the input capacity."""
+        _validate_capacity_and_top_k(capacity_tokens, top_k)
+        if num_experts <= 0 or num_local_experts <= 0:
+            raise ValueError("global and local expert counts must be positive")
+        inferred_ep_size, shard_remainder = divmod(num_experts, num_local_experts)
+        if shard_remainder:
+            raise ValueError(
+                "BalancedEPWorkload requires equal expert shards: "
+                f"{num_experts} experts cannot be divided into shards of "
+                f"{num_local_experts}"
+            )
+        if (
+            local_expert_offset < 0
+            or local_expert_offset + num_local_experts > num_experts
+        ):
+            raise ValueError(
+                "BalancedEPWorkload requires the local expert range to lie within "
+                "the global expert domain"
+            )
+        ep_size = inferred_ep_size if self.ep_size is None else self.ep_size
+        if ep_size != inferred_ep_size:
+            raise ValueError(
+                "explicit EP topology does not match the MoE expert geometry: "
+                f"got ep_size={ep_size}; expected ep_size={inferred_ep_size}"
+            )
+
+        quotient, remainder = divmod(capacity_tokens * top_k, ep_size)
+        if self.require_equal and remainder:
+            raise ValueError(
+                "capacity_tokens * top_k must be divisible by ep_size when "
+                f"require_equal=True, got {capacity_tokens} * {top_k} % {ep_size} "
+                f"= {remainder}"
+            )
+        inferred_ep_rank, offset_remainder = divmod(
+            local_expert_offset, num_local_experts
+        )
+        if self.ep_rank is not None and not offset_remainder:
+            if self.ep_rank != inferred_ep_rank:
+                raise ValueError(
+                    "explicit EP rank does not match the aligned local expert shard: "
+                    f"got ep_rank={self.ep_rank}; expected ep_rank={inferred_ep_rank}"
+                )
+        balanced = quotient
+        if remainder:
+            if self.ep_rank is not None:
+                ep_rank = self.ep_rank
+            elif not offset_remainder:
+                ep_rank = inferred_ep_rank
+            else:
+                raise ValueError(
+                    "an unaligned local expert range requires explicit ep_rank when "
+                    "balanced work has a remainder"
+                )
+            balanced += int(ep_rank < remainder)
+        return min(capacity_tokens * top_k, balanced * self.assignment_multiplier)
+
+
+MoeWorkload: TypeAlias = FullWorkload | BalancedEPWorkload
+_current_workload: ContextVar[MoeWorkload | None] = ContextVar(
+    "moe_workload", default=None
+)
+
+
+@contextmanager
+def moe_workload(workload: MoeWorkload) -> Iterator[None]:
+    """Override DA profiling policy for internal experiments and tests.
+
+    Nested scopes restore the enclosing policy, including on exceptions.
+    This does not affect replay realization defaults or non-DA operators.
+    """
+    if not isinstance(workload, (FullWorkload, BalancedEPWorkload)):
+        raise TypeError(
+            "workload must be FullWorkload or BalancedEPWorkload, got "
+            f"{type(workload).__name__}"
+        )
+    token = _current_workload.set(workload)
+    try:
+        yield
+    finally:
+        _current_workload.reset(token)
+
+
+def get_workload() -> MoeWorkload:
+    """Return the active MoE policy, defaulting to two-times balanced EP."""
+    workload = _current_workload.get()
+    return workload if workload is not None else BalancedEPWorkload()
+
+
+def _validate_capacity_and_top_k(capacity_tokens: int, top_k: int) -> None:
+    if capacity_tokens < 0:
+        raise ValueError(f"capacity_tokens must be nonnegative, got {capacity_tokens}")
+    if top_k <= 0:
+        raise ValueError(f"top_k must be positive, got {top_k}")
 
 
 DEFAULT_DA_DISTRIBUTIONS = (
@@ -78,6 +233,8 @@ class RoutingRealizationKey:
     sample_index: int
     # First global expert ID owned by the local rank.
     local_expert_offset: int
+    # Total number of experts in the global routing domain.
+    num_experts: int
     # Number of experts owned by the local rank.
     num_local_experts: int
     # Number of distinct experts selected for every token.
@@ -86,6 +243,21 @@ class RoutingRealizationKey:
     routing_rule_fingerprint: str
     # Scalar applied after row-wise routing-weight normalization.
     routed_scaling_factor: float
+
+    # DA profiling may override occupancy; replay realizations use exact balanced EP.
+    num_local_assignments_hint: int | None = None
+
+    @property
+    def num_local_assignments(self) -> int:
+        if self.num_local_assignments_hint is not None:
+            return self.num_local_assignments_hint
+        return BalancedEPWorkload(assignment_multiplier=1).local_assignments(
+            self.num_tokens,
+            self.top_k,
+            self.num_experts,
+            self.num_local_experts,
+            self.local_expert_offset,
+        )
 
 
 @dataclass(frozen=True)
@@ -126,13 +298,33 @@ class RoutingRealizationFactory:
             raise ValueError("sample_index must be nonnegative")
         if key.num_local_experts <= 0:
             raise ValueError("num_local_experts must be positive")
-        if not 0 < key.top_k <= key.num_local_experts:
-            raise ValueError("top_k must be in [1, num_local_experts]")
+        if key.num_experts <= 0:
+            raise ValueError("num_experts must be positive")
+        if not 0 <= key.local_expert_offset < key.num_experts:
+            raise ValueError("local_expert_offset must be in the global expert domain")
+        if key.local_expert_offset + key.num_local_experts > key.num_experts:
+            raise ValueError("local expert interval exceeds the global expert domain")
+        if not 0 < key.top_k <= key.num_experts:
+            raise ValueError("top_k must be in [1, num_experts]")
         if (
             not math.isfinite(key.routed_scaling_factor)
             or key.routed_scaling_factor <= 0
         ):
             raise ValueError("routed_scaling_factor must be positive and finite")
+
+        num_nonlocal_experts = key.num_experts - key.num_local_experts
+        min_local_per_row = max(0, key.top_k - num_nonlocal_experts)
+        max_local_per_row = min(key.top_k, key.num_local_experts)
+        min_local_assignments = key.num_tokens * min_local_per_row
+        max_local_assignments = key.num_tokens * max_local_per_row
+        if not (
+            min_local_assignments <= key.num_local_assignments <= max_local_assignments
+        ):
+            raise ValueError(
+                "num_local_assignments_hint must be feasible for distinct per-row "
+                f"top-k IDs, got {key.num_local_assignments}; expected "
+                f"[{min_local_assignments}, {max_local_assignments}]"
+            )
 
         # Generate both mutable tensors outside full-op timing; measured launches only stage the
         # already-materialized realization into reusable profiling storage.
@@ -140,9 +332,18 @@ class RoutingRealizationFactory:
         probabilities = self._expert_probabilities(
             key.num_local_experts, distribution
         ).to(device=key.device, dtype=torch.float32)
-        expanded = probabilities.expand(key.num_tokens, -1)
-        local_ids = torch.multinomial(expanded, key.top_k, replacement=False)
-        expert_ids = (local_ids + key.local_expert_offset).to(torch.int32)
+        if key.num_local_assignments == key.num_tokens * key.top_k:
+            # Preserve the historical full-local realization.
+            expanded = probabilities.expand(key.num_tokens, -1)
+            local_ids = torch.multinomial(expanded, key.top_k, replacement=False)
+            expert_ids = (local_ids + key.local_expert_offset).to(torch.int32)
+        else:
+            expert_ids = self._generate_hint_local_workload(
+                key,
+                probabilities,
+                min_local_per_row=min_local_per_row,
+                max_local_per_row=max_local_per_row,
+            )
 
         fork_devices = []
         if key.device.type == "cuda":
@@ -168,6 +369,92 @@ class RoutingRealizationFactory:
         )
         self._cache[key] = realization
         return realization
+
+    @staticmethod
+    def _generate_hint_local_workload(
+        key: RoutingRealizationKey,
+        local_probabilities: torch.Tensor,
+        *,
+        min_local_per_row: int,
+        max_local_per_row: int,
+    ) -> torch.Tensor:
+        """Generate distinct global IDs matching the profiling hint."""
+        remaining = key.num_local_assignments - key.num_tokens * min_local_per_row
+        extra_per_row, extra_rows = divmod(remaining, key.num_tokens)
+        if min_local_per_row + extra_per_row > max_local_per_row:
+            raise ValueError(
+                "num_local_assignments_hint exceeds per-row local capacity"
+            )
+
+        local_counts = torch.full(
+            (key.num_tokens,),
+            min_local_per_row + extra_per_row,
+            dtype=torch.int64,
+            device=key.device,
+        )
+        if extra_rows:
+            rotation = (key.sample_index + key.local_expert_offset) % key.num_tokens
+            remainder_rows = (
+                torch.arange(extra_rows, device=key.device) + rotation
+            ) % key.num_tokens
+            local_counts[remainder_rows] += 1
+
+        nonlocal_ids = torch.cat(
+            (
+                torch.arange(
+                    0,
+                    key.local_expert_offset,
+                    dtype=torch.int64,
+                    device=key.device,
+                ),
+                torch.arange(
+                    key.local_expert_offset + key.num_local_experts,
+                    key.num_experts,
+                    dtype=torch.int64,
+                    device=key.device,
+                ),
+            )
+        )
+        result = torch.empty(
+            (key.num_tokens, key.top_k), dtype=torch.int64, device=key.device
+        )
+        for local_count in range(min_local_per_row, max_local_per_row + 1):
+            rows = torch.where(local_counts == local_count)[0]
+            if rows.numel() == 0:
+                continue
+            nonlocal_count = key.top_k - local_count
+            parts: list[torch.Tensor] = []
+            if local_count:
+                local_choices = torch.multinomial(
+                    local_probabilities.expand(rows.numel(), -1),
+                    local_count,
+                    replacement=False,
+                )
+                parts.append(local_choices + key.local_expert_offset)
+            if nonlocal_count:
+                uniform_nonlocal = torch.ones(
+                    nonlocal_ids.numel(),
+                    dtype=torch.float32,
+                    device=key.device,
+                ).expand(rows.numel(), -1)
+                nonlocal_choices = torch.multinomial(
+                    uniform_nonlocal, nonlocal_count, replacement=False
+                )
+                parts.append(nonlocal_ids[nonlocal_choices])
+            row_ids = torch.cat(parts, dim=1)
+            if row_ids.shape[1] > 1:
+                permutation = torch.rand(
+                    row_ids.shape, dtype=torch.float32, device=key.device
+                ).argsort(dim=1)
+                row_ids = row_ids.gather(1, permutation)
+            result[rows] = row_ids
+
+        local_mask = (result >= key.local_expert_offset) & (
+            result < key.local_expert_offset + key.num_local_experts
+        )
+        if int(local_mask.sum().item()) != key.num_local_assignments:
+            raise RuntimeError("generated routing does not match local workload target")
+        return result.to(torch.int32)
 
     @classmethod
     def _expert_probabilities(
@@ -530,20 +817,18 @@ class DAPlanCompiler:
             ):
                 return False, "incomplete_or_nonfinite_evidence"
 
-        # Singleton compares robust worst cases; switch charges its control overhead once to each
-        # exemplar's complete candidate invocation.
+        # Both policies require a matched win on every exemplar. Only a switch charges control
+        # overhead to each exemplar's complete candidate invocation.
         threshold_scale = 1.0 - self._margin
         if policy is DAPlanMode.DA_SINGLE_BODY:
-            candidate_worst = max(
-                selection.candidate_latency_ms for selection in selections
-            )
-            baseline_worst = max(
-                selection.baseline_latency_ms
-                for selection in selections
-                if selection.baseline_latency_ms is not None
-            )
-            admitted = candidate_worst <= baseline_worst * threshold_scale
-            return admitted, "admitted" if admitted else "singleton_guard_rejected"
+            for selection in selections:
+                assert selection.baseline_latency_ms is not None
+                if (
+                    selection.candidate_latency_ms
+                    > selection.baseline_latency_ms * threshold_scale
+                ):
+                    return False, "singleton_guard_rejected"
+            return True, "admitted"
 
         for selection in selections:
             assert selection.baseline_latency_ms is not None

@@ -238,7 +238,6 @@ def _prepare_precision(
         output=output,
         tune_max_num_tokens=shape.tune_max_num_tokens,
     )
-
     # Quantize once outside timing, then bind a closure to the exact user-facing dtype ABI.
     if name in ("nvfp4", "mxfp4", "w4a16"):
         variant = {
@@ -560,6 +559,7 @@ def _realization(
             distribution=parsed.name,
             sample_index=0,
             local_expert_offset=shape.local_expert_offset,
+            num_experts=shape.num_experts,
             num_local_experts=shape.local_num_experts,
             top_k=shape.top_k,
             routing_rule_fingerprint="benchmark:renormalize",
@@ -730,7 +730,7 @@ def _benchmark_precision(
     """Run matched NoDA and DA graphs for all distributions of one precision."""
     if backend == "prims_ts" and precision == "fp8_per_tensor":
         routing_input_mode = "logits"
-    # Prepare one public ABI and seed both lifecycle paths with the same first realization.
+    # Both graphs replay the same exact balanced EP routes.
     prepared = _prepare_precision(precision, shape, backend, routing_input_mode)
     factory = RoutingRealizationFactory()
     first_ids, first_weights = _realization(factory, shape, distributions[0])
@@ -759,7 +759,11 @@ def _benchmark_precision(
         da_autotune_start = time.perf_counter()
         with (
             torch.cuda.nvtx.range(f"DA_AUTOTUNE_{precision}"),
-            autotune(tune, cache=cache, tuning_buckets=buckets),
+            autotune(
+                tune,
+                cache=cache,
+                tuning_buckets=buckets,
+            ),
         ):
             prepared.invoke()
         torch.cuda.synchronize()
