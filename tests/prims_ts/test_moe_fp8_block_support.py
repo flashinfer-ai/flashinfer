@@ -135,39 +135,64 @@ def test_mxfp8_mxfp8_mapper_supports_tile256():
 
 
 def test_dsfp8_mxfp8_autotuner_enumerates_complete_wide_tactics():
-    tactics = valid_prims_ts_deepseek_fp8_moe_tactics(
+    common = dict(
         num_tokens=4096,
         top_k=8,
         num_local_experts=64,
         use_mxfp8_backed_dsfp8=True,
     )
+    tactics = valid_prims_ts_deepseek_fp8_moe_tactics(**common)
 
     assert len(tactics) == len({tuple(tactic) for tactic in tactics})
+    assert all(tactic[1] < 10_000 for tactic in tactics)
+    tactics = _filter_valid_moe_tactics(
+        tactics,
+        lambda tactic: map_trtllm_deepseek_fp8_moe_tactic(tactic, **common),
+    )
     wide_tiles = set()
     for tactic in tactics:
         if tactic[0] not in (128, 256):
             continue
         pair = map_trtllm_deepseek_fp8_moe_tactic(
             tactic,
-            num_tokens=4096,
-            top_k=8,
-            num_local_experts=64,
-            use_mxfp8_backed_dsfp8=True,
+            **common,
         )
         assert pair.fc1.cfg.kwargs["tile_n"] == pair.fc2.cfg.kwargs["tile_n"]
         wide_tiles.add(pair.tile_n)
     assert wide_tiles == {128, 256}
 
 
-def test_dsfp8_mxfp8_autotuner_filters_schedule_capacity_failures():
+def test_dsfp8_mxfp8_autotuner_filters_resource_capacity_failures():
     common = dict(
         num_tokens=64,
         top_k=8,
         num_local_experts=64,
         use_mxfp8_backed_dsfp8=True,
     )
+    invalid_tactic = [128, 1]
+    valid_tactic = next(
+        tactic
+        for tactic in valid_prims_ts_deepseek_fp8_moe_tactics(
+            num_tokens=4096,
+            top_k=8,
+            num_local_experts=64,
+            use_mxfp8_backed_dsfp8=True,
+        )
+        if tactic[0] == 128
+        and tactic != invalid_tactic
+        and _filter_valid_moe_tactics(
+            [tactic],
+            lambda candidate: map_trtllm_deepseek_fp8_moe_tactic(candidate, **common),
+            validate_pair=lambda pair: _validate_moe_pair_schedules(
+                pair,
+                num_experts=common["num_local_experts"],
+                num_tokens=common["num_tokens"],
+                top_k=common["top_k"],
+            ),
+        )
+    )
     filtered = _filter_valid_moe_tactics(
-        [[128, 1], [128, 10_000]],
+        [invalid_tactic, valid_tactic],
         lambda tactic: map_trtllm_deepseek_fp8_moe_tactic(tactic, **common),
         validate_pair=lambda pair: _validate_moe_pair_schedules(
             pair,
@@ -177,7 +202,7 @@ def test_dsfp8_mxfp8_autotuner_filters_schedule_capacity_failures():
         ),
     )
 
-    assert filtered == [[128, 10_000]]
+    assert filtered == [valid_tactic]
 
 
 def test_mxfp8_mxfp8_mapper_supports_geglu_tile8():
@@ -381,7 +406,7 @@ def test_deepseek_fp8_mapper_default_matches_trtllm_fallback(
 
 def test_deepseek_fp8_mapper_rejects_trtllm_unsupported_tile256():
     with pytest.raises(ValueError, match="DeepSeek FP8 tile_N=256"):
-        map_trtllm_deepseek_fp8_moe_tactic([256, 10_000])
+        map_trtllm_deepseek_fp8_moe_tactic([256, 0])
 
 
 def test_mxfp8_block_support_accepts_swiglu_oa_params(monkeypatch):

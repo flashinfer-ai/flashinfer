@@ -33,6 +33,10 @@ from flashinfer.fused_moe import (
     prims_ts_fp8_block_scale_routed_moe,
 )
 from flashinfer.prims_ts.utils import is_prims_ts_available
+from flashinfer.prims_ts.moe.config_mapper import (
+    map_trtllm_deepseek_fp8_moe_tactic,
+    valid_prims_ts_deepseek_fp8_moe_tactics,
+)
 from flashinfer.tllm_enums import ActivationType, Fp8QuantizationType
 from flashinfer.utils import device_support_pdl, get_compute_capability
 
@@ -45,6 +49,30 @@ def cache_permute_indices():
 def _skip_prims_ts_on_sm107() -> None:
     if get_compute_capability(torch.device("cuda")) == (10, 7):
         pytest.skip("Prims-TS MoE kernels support SM100 and SM103, not SM107")
+
+
+def _find_native_mxfp8_tactic(tile_n: int, tile_k: int) -> tuple[int, int]:
+    common = dict(
+        num_tokens=4096,
+        top_k=8,
+        num_local_experts=64,
+        use_mxfp8_backed_dsfp8=True,
+    )
+    for tactic in valid_prims_ts_deepseek_fp8_moe_tactics(**common):
+        if tactic[0] != tile_n:
+            continue
+        try:
+            pair = map_trtllm_deepseek_fp8_moe_tactic(tactic, **common)
+        except ValueError:
+            continue
+        fc1 = pair.fc1.cfg.kwargs
+        fc2 = pair.fc2.cfg.kwargs
+        if all(
+            cfg["mma_m"] == 256 and cfg["tile_k"] == tile_k and cfg["epi_tile_n"] == 64
+            for cfg in (fc1, fc2)
+        ):
+            return tuple(tactic)
+    raise AssertionError(f"No native MXFP8 tactic for tile-N={tile_n}, tile-K={tile_k}")
 
 
 @pytest.mark.parametrize(
@@ -245,20 +273,18 @@ def test_prims_ts_deepseek_native_mxfp8_tile8_stays_close_to_true_dsfp8(
     )
 
 
-@pytest.mark.parametrize(
-    ("tile128_tactic", "tile256_tactic"),
-    [((128, 10_000), (256, 10_000)), ((128, 10_002), (256, 10_001))],
-)
+@pytest.mark.parametrize("tile_k", [256, 128])
 def test_prims_ts_deepseek_native_mxfp8_tile256_matches_tile128(
     cache_permute_indices,
     monkeypatch,
-    tile128_tactic,
-    tile256_tactic,
+    tile_k,
 ):
     """Tile-N256 preserves the validated tile-N128 fused-MX result."""
     from flashinfer.autotuner import AutoTuner
 
     tuner = AutoTuner.get()
+    tile128_tactic = _find_native_mxfp8_tactic(128, tile_k)
+    tile256_tactic = _find_native_mxfp8_tactic(256, tile_k)
 
     def run(tactic):
         monkeypatch.setattr(

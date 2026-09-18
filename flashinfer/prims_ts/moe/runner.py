@@ -55,7 +55,6 @@ from .config_mapper import (
     map_trtllm_mxfp4_mxfp8_moe_tactic,
     map_trtllm_mxfp8_mxfp8_moe_tactic,
     map_trtllm_nvfp4_moe_tactic,
-    is_dsfp8_mxfp8_custom_tactic,
     valid_prims_ts_bf16_moe_tactics,
     valid_prims_ts_deepseek_fp8_moe_tactics,
     valid_prims_ts_fp8_per_tensor_moe_tactics,
@@ -90,21 +89,6 @@ def _moe_topk_ids_init_for_routing(
         num_experts,
         packed=(routing_input_mode != RoutingInputMode.UnpackedPrecomputed),
     )
-
-
-def _deepseek_fp8_routing_tactic(
-    resolved_tactic: list[int], *, use_mxfp8_backed_dsfp8: bool
-) -> list[int]:
-    """Map a public native-MX tactic to its routing-metadata base config."""
-
-    tile_n, config_index = (int(value) for value in resolved_tactic)
-    if use_mxfp8_backed_dsfp8 and is_dsfp8_mxfp8_custom_tactic(tile_n, config_index):
-        # These tactics are generated from DeepSeek JSON config 0 and then
-        # reshaped to the MX-style cluster/MMA topology by the mapper. Routing
-        # must allocate metadata from that same base config; the public tactic
-        # index remains distinct for autotune/cache selection.
-        config_index = 0
-    return [tile_n, config_index]
 
 
 def _per_token_sf_dtype_value(tensor: torch.Tensor) -> int:
@@ -2321,10 +2305,6 @@ class PrimsTsFp8BlockScaleMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
                 "FP8 block-scale MoE requires one tile-N for routing, FC1, and FC2; "
                 f"got FC1={fc1_tile_n}, FC2={fc2_tile_n}"
             )
-        routing_tactic = _deepseek_fp8_routing_tactic(
-            resolved_tactic,
-            use_mxfp8_backed_dsfp8=self.use_mxfp8_backed_dsfp8,
-        )
         support_check = (
             is_prims_ts_mxfp8_backed_dsfp8_supported
             if self.use_mxfp8_backed_dsfp8
@@ -2366,7 +2346,7 @@ class PrimsTsFp8BlockScaleMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             kwargs["routed_scaling_factor"],
             kwargs["routing_method_type"],
             kwargs["enable_pdl"],
-            routing_tactic,
+            resolved_tactic,
             int(kwargs.get("weight_layout", self.weight_layout)),
             int(self.activation_type),
             int(self.fp8_quantization_type),
@@ -2396,7 +2376,7 @@ class PrimsTsFp8BlockScaleMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         routed_token_capacity = _routed_token_capacity(
             self,
             moe_inputs,
-            routing_tactic,
+            resolved_tactic,
             total_num_padded_tokens,
             kwargs,
         )
