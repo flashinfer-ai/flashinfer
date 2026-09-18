@@ -12,6 +12,12 @@ parallel across cores, and is a near-free no-op when the modules are already
 present in the JIT disk cache.
 """
 
+import contextlib
+import os
+import subprocess
+import sys
+import tempfile
+
 import torch
 
 # Every _CHECKPOINTING_SSU_VARIANT_FIELDS combination requested by
@@ -1047,9 +1053,73 @@ def _triton_supports_current_arch() -> bool:
             err = (r.stderr or "") + (r.stdout or "")
             if "not defined for option 'gpu-name'" not in err:
                 return True
-        return False
+        # Arch-name guessing is inconclusive: Triton's nvidia backend can lower
+        # to a compatible family spelling (e.g. sm_103 hardware compiled
+        # through its CUDA-12.8 sm_100 gpu-name), so a negative name probe does
+        # not prove the compile aborts.  Fall back to a real subprocess compile.
+        return _triton_compile_check()
     except Exception:
         return True
+
+
+def _triton_compile_check() -> bool:
+    """Compile a trivial Triton kernel in a subprocess; True on success.
+
+    Ground-truth fallback for the ``ptxas --gpu-name`` probe above: when
+    Triton genuinely cannot target the device it ``abort()``s the whole
+    process during PTX emission, so the compile must run out-of-process and
+    any nonzero exit means the architecture is unsupported.  Defaults to True
+    on probe infrastructure failures so tests are skipped only on a
+    demonstrated compile abort.
+    """
+    probe_src = (
+        "import triton, triton.language as tl, torch\n"
+        "@triton.jit\n"
+        "def _probe(x_ptr, BLOCK: tl.constexpr):\n"
+        "    off = tl.arange(0, BLOCK)\n"
+        "    tl.store(x_ptr + off, tl.load(x_ptr + off), mask=off < BLOCK)\n"
+        "x = torch.zeros(64, device='cuda')\n"
+        "_probe[(1,)](x, BLOCK=64)\n"
+        "torch.cuda.synchronize()\n"
+        "print('TRITON_PROBE_OK')\n"
+    )
+    path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", suffix="_triton_probe.py", delete=False
+        ) as f:
+            f.write(probe_src)
+            path = f.name
+        r = subprocess.run(
+            [sys.executable, path],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        return r.returncode == 0 and "TRITON_PROBE_OK" in (r.stdout or "")
+    except Exception:
+        return True
+    finally:
+        if path is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(path)
+
+
+def _module_uses_triton(fspath) -> bool:
+    """Whether a test module ends up compiling Triton kernels.
+
+    Matches tests that compile Triton reference kernels directly and tests
+    built around the SSDCombined ``cute`` backend, whose dt preprocessor is
+    itself a Triton kernel.
+    """
+    try:
+        from pathlib import Path
+
+        text = Path(str(fspath)).read_text(encoding="utf-8")
+    except OSError:
+        # Err on the safe side: keep the skip for unreadable modules.
+        return True
+    return "triton" in text or 'backend="cute"' in text or "backend='cute'" in text
 
 
 def pytest_collection_modifyitems(config, items):
@@ -1062,6 +1132,11 @@ def pytest_collection_modifyitems(config, items):
             "abort the process at compile time)"
         )
         for item in items:
+            # Only tests that compile the Triton mamba reference kernels are
+            # affected; pure nvcc/CuTe/TVM-FFI backends (cake/vibecuda SSD,
+            # seq_chunk_cumsum, cake/selective_state_update) still run.
+            if not _module_uses_triton(item.fspath):
+                continue
             item.add_marker(skip_triton)
         return
 
