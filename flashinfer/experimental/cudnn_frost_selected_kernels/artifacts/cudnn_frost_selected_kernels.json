@@ -1,0 +1,3715 @@
+{
+  "kernels": [
+    {
+      "abi": "cudnn_frost_grouped_gemm2_v1",
+      "arch": "sm_100a",
+      "contract": {
+        "activation": "identity",
+        "experts": 12,
+        "groups": 12,
+        "k": 3072,
+        "n": 7168,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_fc2_sm_100a_e12_n7168_k3072_g12_CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_1cta_clc_stg",
+      "launch": {
+        "tail": [
+          "output"
+        ]
+      },
+      "op": "grouped_gemm2",
+      "producer_revision": "c61a5e4eb5c5d26a920d8504c655fa9a00919484",
+      "tactic": {
+        "cta_group": 1,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 128,
+          "n": 128
+        },
+        "scheduler": "clc",
+        "store_mode": "stg",
+        "template": "sm100_moe_grouped_matmul_fwd.py",
+        "tile": "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"
+      },
+      "workspace_bytes": 19072,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_fc2_sm_100a_e12_n7168_k3072_g12_CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_1cta_clc_stg.py",
+        "sha256": "1ff5302cc0eb4aaaee6a83ea935cdf7f8f976fe0732ccc00d9b03ec1d6223601"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm2_v1",
+      "arch": "sm_100a",
+      "contract": {
+        "activation": "identity",
+        "experts": 12,
+        "groups": 12,
+        "k": 3072,
+        "n": 7168,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_fc2_sm_100a_e12_n7168_k3072_g12_CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_1cta_clc_tma",
+      "launch": {
+        "tail": [
+          "output"
+        ]
+      },
+      "op": "grouped_gemm2",
+      "producer_revision": "c61a5e4eb5c5d26a920d8504c655fa9a00919484",
+      "tactic": {
+        "cta_group": 1,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 128,
+          "n": 128
+        },
+        "scheduler": "clc",
+        "store_mode": "tma",
+        "template": "sm100_moe_grouped_matmul_fwd.py",
+        "tile": "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"
+      },
+      "workspace_bytes": 38016,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_fc2_sm_100a_e12_n7168_k3072_g12_CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_1cta_clc_tma.py",
+        "sha256": "945d2f856d4078343c356eca243460cd8a440de7f7ce517662be852276c8e2db"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm2_v1",
+      "arch": "sm_100a",
+      "contract": {
+        "activation": "identity",
+        "experts": 12,
+        "groups": 12,
+        "k": 3072,
+        "n": 7168,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_fc2_sm_100a_e12_n7168_k3072_g12_CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma_2cta_clc_stg",
+      "launch": {
+        "tail": [
+          "output"
+        ]
+      },
+      "op": "grouped_gemm2",
+      "producer_revision": "c61a5e4eb5c5d26a920d8504c655fa9a00919484",
+      "tactic": {
+        "cta_group": 2,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 128,
+          "n": 256
+        },
+        "scheduler": "clc",
+        "store_mode": "stg",
+        "template": "sm100_moe_grouped_matmul_fwd.py",
+        "tile": "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma"
+      },
+      "workspace_bytes": 19072,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_fc2_sm_100a_e12_n7168_k3072_g12_CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma_2cta_clc_stg.py",
+        "sha256": "b99ee6483cc7b2b3887ffd3bf7f5c75c6bc637b1973454befb0d4f303336bc5c"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm2_v1",
+      "arch": "sm_100a",
+      "contract": {
+        "activation": "identity",
+        "experts": 12,
+        "groups": 12,
+        "k": 3072,
+        "n": 7168,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_fc2_sm_100a_e12_n7168_k3072_g12_CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma_2cta_clc_tma",
+      "launch": {
+        "tail": [
+          "output"
+        ]
+      },
+      "op": "grouped_gemm2",
+      "producer_revision": "c61a5e4eb5c5d26a920d8504c655fa9a00919484",
+      "tactic": {
+        "cta_group": 2,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 128,
+          "n": 256
+        },
+        "scheduler": "clc",
+        "store_mode": "tma",
+        "template": "sm100_moe_grouped_matmul_fwd.py",
+        "tile": "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma"
+      },
+      "workspace_bytes": 38016,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_fc2_sm_100a_e12_n7168_k3072_g12_CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma_2cta_clc_tma.py",
+        "sha256": "69c66703db2ecd5da718298d156e5106384c3a25646ebe31904e5d698395c6f5"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm2_v1",
+      "arch": "sm_100a",
+      "contract": {
+        "activation": "identity",
+        "experts": 8,
+        "groups": 8,
+        "k": 256,
+        "n": 128,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_fc2_sm_100a_e8_n128_k256_g8_CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_1cta_clc_stg",
+      "launch": {
+        "tail": [
+          "output"
+        ]
+      },
+      "op": "grouped_gemm2",
+      "producer_revision": "c61a5e4eb5c5d26a920d8504c655fa9a00919484",
+      "tactic": {
+        "cta_group": 1,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 128,
+          "n": 128
+        },
+        "scheduler": "clc",
+        "store_mode": "stg",
+        "template": "sm100_moe_grouped_matmul_fwd.py",
+        "tile": "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"
+      },
+      "workspace_bytes": 19072,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_fc2_sm_100a_e8_n128_k256_g8_CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_1cta_clc_stg.py",
+        "sha256": "1ff5302cc0eb4aaaee6a83ea935cdf7f8f976fe0732ccc00d9b03ec1d6223601"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm2_v1",
+      "arch": "sm_100a",
+      "contract": {
+        "activation": "identity",
+        "experts": 8,
+        "groups": 8,
+        "k": 256,
+        "n": 128,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_fc2_sm_100a_e8_n128_k256_g8_CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_1cta_clc_tma",
+      "launch": {
+        "tail": [
+          "output"
+        ]
+      },
+      "op": "grouped_gemm2",
+      "producer_revision": "c61a5e4eb5c5d26a920d8504c655fa9a00919484",
+      "tactic": {
+        "cta_group": 1,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 128,
+          "n": 128
+        },
+        "scheduler": "clc",
+        "store_mode": "tma",
+        "template": "sm100_moe_grouped_matmul_fwd.py",
+        "tile": "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"
+      },
+      "workspace_bytes": 38016,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_fc2_sm_100a_e8_n128_k256_g8_CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_1cta_clc_tma.py",
+        "sha256": "945d2f856d4078343c356eca243460cd8a440de7f7ce517662be852276c8e2db"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm2_v1",
+      "arch": "sm_100a",
+      "contract": {
+        "activation": "identity",
+        "experts": 8,
+        "groups": 8,
+        "k": 256,
+        "n": 128,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_fc2_sm_100a_e8_n128_k256_g8_CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma_2cta_clc_stg",
+      "launch": {
+        "tail": [
+          "output"
+        ]
+      },
+      "op": "grouped_gemm2",
+      "producer_revision": "c61a5e4eb5c5d26a920d8504c655fa9a00919484",
+      "tactic": {
+        "cta_group": 2,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 128,
+          "n": 256
+        },
+        "scheduler": "clc",
+        "store_mode": "stg",
+        "template": "sm100_moe_grouped_matmul_fwd.py",
+        "tile": "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma"
+      },
+      "workspace_bytes": 19072,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_fc2_sm_100a_e8_n128_k256_g8_CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma_2cta_clc_stg.py",
+        "sha256": "b99ee6483cc7b2b3887ffd3bf7f5c75c6bc637b1973454befb0d4f303336bc5c"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm2_v1",
+      "arch": "sm_100a",
+      "contract": {
+        "activation": "identity",
+        "experts": 8,
+        "groups": 8,
+        "k": 256,
+        "n": 128,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_fc2_sm_100a_e8_n128_k256_g8_CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma_2cta_clc_tma",
+      "launch": {
+        "tail": [
+          "output"
+        ]
+      },
+      "op": "grouped_gemm2",
+      "producer_revision": "c61a5e4eb5c5d26a920d8504c655fa9a00919484",
+      "tactic": {
+        "cta_group": 2,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 128,
+          "n": 256
+        },
+        "scheduler": "clc",
+        "store_mode": "tma",
+        "template": "sm100_moe_grouped_matmul_fwd.py",
+        "tile": "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma"
+      },
+      "workspace_bytes": 38016,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_fc2_sm_100a_e8_n128_k256_g8_CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma_2cta_clc_tma.py",
+        "sha256": "69c66703db2ecd5da718298d156e5106384c3a25646ebe31904e5d698395c6f5"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm1_swiglu_v1",
+      "arch": "sm_100a",
+      "contract": {
+        "activation": "silu(gate) * up",
+        "experts": 8,
+        "groups": 8,
+        "k": 4096,
+        "n": 14336,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm1_swiglu_sm100_e8_n14336_k4096_CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_stg_f32bcc0c0ec6",
+      "launch": {
+        "tail": [
+          "output",
+          "scale"
+        ]
+      },
+      "op": "grouped_gemm1_swiglu",
+      "producer_revision": "f32bcc0c0ec6243c788183d23d3e8a0f25efcec4",
+      "tactic": {
+        "cta_group": 1,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 128,
+          "n": 128
+        },
+        "scheduler": "clc",
+        "store_mode": "stg",
+        "template": "sm100_moe_grouped_matmul_fwd.py",
+        "tile": "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"
+      },
+      "workspace_bytes": 19072,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm1_swiglu_sm100_e8_n14336_k4096_CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_stg_f32bcc0c0ec6.py",
+        "sha256": "7a6f7fb49f335c765361cd76f565e963f8f6509cf8122268e804a54487234a02"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm1_swiglu_v1",
+      "arch": "sm_100a",
+      "contract": {
+        "activation": "silu(gate) * up",
+        "experts": 8,
+        "groups": 8,
+        "k": 4096,
+        "n": 14336,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm1_swiglu_sm100_e8_n14336_k4096_CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_tma_f32bcc0c0ec6",
+      "launch": {
+        "tail": [
+          "scale",
+          "output"
+        ]
+      },
+      "op": "grouped_gemm1_swiglu",
+      "producer_revision": "f32bcc0c0ec6243c788183d23d3e8a0f25efcec4",
+      "tactic": {
+        "cta_group": 1,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 128,
+          "n": 128
+        },
+        "scheduler": "clc",
+        "store_mode": "tma",
+        "template": "sm100_moe_grouped_matmul_fwd.py",
+        "tile": "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"
+      },
+      "workspace_bytes": 38016,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm1_swiglu_sm100_e8_n14336_k4096_CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_tma_f32bcc0c0ec6.py",
+        "sha256": "359ba8f6e9e6aacc91ea5809692f3904e51a05792ebaefdf921caaff38e44ada"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm1_swiglu_v1",
+      "arch": "sm_100a",
+      "contract": {
+        "activation": "silu(gate) * up",
+        "experts": 8,
+        "groups": 8,
+        "k": 4096,
+        "n": 14336,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm1_swiglu_sm100_e8_n14336_k4096_CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma_stg_f32bcc0c0ec6",
+      "launch": {
+        "tail": [
+          "output",
+          "scale"
+        ]
+      },
+      "op": "grouped_gemm1_swiglu",
+      "producer_revision": "f32bcc0c0ec6243c788183d23d3e8a0f25efcec4",
+      "tactic": {
+        "cta_group": 2,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 128,
+          "n": 256
+        },
+        "scheduler": "clc",
+        "store_mode": "stg",
+        "template": "sm100_moe_grouped_matmul_fwd.py",
+        "tile": "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma"
+      },
+      "workspace_bytes": 19072,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm1_swiglu_sm100_e8_n14336_k4096_CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma_stg_f32bcc0c0ec6.py",
+        "sha256": "ce5601c51fecc450de1873baa1e689469bf3c82db69f30fba4f0e1bf6f8c4ad1"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm1_swiglu_v1",
+      "arch": "sm_100a",
+      "contract": {
+        "activation": "silu(gate) * up",
+        "experts": 8,
+        "groups": 8,
+        "k": 4096,
+        "n": 14336,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm1_swiglu_sm100_e8_n14336_k4096_CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma_tma_f32bcc0c0ec6",
+      "launch": {
+        "tail": [
+          "scale",
+          "output"
+        ]
+      },
+      "op": "grouped_gemm1_swiglu",
+      "producer_revision": "f32bcc0c0ec6243c788183d23d3e8a0f25efcec4",
+      "tactic": {
+        "cta_group": 2,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 128,
+          "n": 256
+        },
+        "scheduler": "clc",
+        "store_mode": "tma",
+        "template": "sm100_moe_grouped_matmul_fwd.py",
+        "tile": "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma"
+      },
+      "workspace_bytes": 38016,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm1_swiglu_sm100_e8_n14336_k4096_CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma_tma_f32bcc0c0ec6.py",
+        "sha256": "24ebbd5071d47d35b14a187da62bb2d1ee073ebdb288a035901ade11a4ffa526"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm1_swiglu_v1",
+      "arch": "sm_107a",
+      "contract": {
+        "activation": "silu(gate) * up",
+        "experts": 12,
+        "groups": 12,
+        "k": 7168,
+        "n": 3072,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm1_swiglu_sm107_e12_n3072_k7168_CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_stg_c0fbbec4de56",
+      "launch": {
+        "tail": [
+          "output",
+          "scale"
+        ]
+      },
+      "op": "grouped_gemm1_swiglu",
+      "producer_revision": "c0fbbec4de56d9d8715587433a601d71cc703ca4",
+      "tactic": {
+        "cta_group": 1,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 128,
+          "n": 128
+        },
+        "scheduler": "clc",
+        "store_mode": "stg",
+        "swap_ab": false,
+        "template": "sm100_moe_grouped_matmul_fwd.py",
+        "tile": "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"
+      },
+      "workspace_bytes": 27776,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm1_swiglu_sm107_e12_n3072_k7168_CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_stg_c0fbbec4de56.py",
+        "sha256": "a551bc814579eac7af9a13c7eed872594cc58a4b354eaa0f0a63a6906c663700"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm1_swiglu_swap_ab_v1",
+      "arch": "sm_107a",
+      "contract": {
+        "activation": "silu(gate) * up",
+        "experts": 12,
+        "groups": 12,
+        "k": 7168,
+        "n": 3072,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm1_swiglu_sm107_e12_n3072_k7168_CONFIG_sm100_128x128x128_128x128x32_cluster2x1_2ctamma_swapAB_tma_c0fbbec4de56",
+      "launch": {
+        "tail": [
+          "scale",
+          "output"
+        ]
+      },
+      "op": "grouped_gemm1_swiglu",
+      "producer_revision": "c0fbbec4de56d9d8715587433a601d71cc703ca4",
+      "tactic": {
+        "cta_group": 2,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 128,
+          "n": 128
+        },
+        "scheduler": "clc",
+        "store_mode": "tma",
+        "swap_ab": true,
+        "template": "sm100_moe_grouped_matmul_fwd_swap_ab.py",
+        "tile": "CONFIG_sm100_128x128x128_128x128x32_cluster2x1_2ctamma_swapAB"
+      },
+      "workspace_bytes": 55424,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm1_swiglu_sm107_e12_n3072_k7168_CONFIG_sm100_128x128x128_128x128x32_cluster2x1_2ctamma_swapAB_tma_c0fbbec4de56.py",
+        "sha256": "6eb5195783d9b440bc66dceb7e8c65b50d8a83b888acdd7e8ddc1efae104fcab"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm1_swiglu_v1",
+      "arch": "sm_107a",
+      "contract": {
+        "activation": "silu(gate) * up",
+        "experts": 12,
+        "groups": 12,
+        "k": 7168,
+        "n": 3072,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm1_swiglu_sm107_e12_n3072_k7168_CONFIG_sm100_128x64x128_128x64x32_cluster1x1_1ctamma_tma_c0fbbec4de56",
+      "launch": {
+        "tail": [
+          "scale",
+          "output"
+        ]
+      },
+      "op": "grouped_gemm1_swiglu",
+      "producer_revision": "c0fbbec4de56d9d8715587433a601d71cc703ca4",
+      "tactic": {
+        "cta_group": 1,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 128,
+          "n": 64
+        },
+        "scheduler": "clc",
+        "store_mode": "tma",
+        "swap_ab": false,
+        "template": "sm100_moe_grouped_matmul_fwd.py",
+        "tile": "CONFIG_sm100_128x64x128_128x64x32_cluster1x1_1ctamma"
+      },
+      "workspace_bytes": 55424,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm1_swiglu_sm107_e12_n3072_k7168_CONFIG_sm100_128x64x128_128x64x32_cluster1x1_1ctamma_tma_c0fbbec4de56.py",
+        "sha256": "5a4d1e36e73f16af11b2ed8882816b9af98f57bee6ca30e7e6a598fb7a997f5a"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm1_swiglu_swap_ab_v1",
+      "arch": "sm_107a",
+      "contract": {
+        "activation": "silu(gate) * up",
+        "experts": 12,
+        "groups": 12,
+        "k": 7168,
+        "n": 3072,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm1_swiglu_sm107_e12_n3072_k7168_CONFIG_sm100_256x128x128_128x128x32_cluster1x1_1ctamma_swapAB_tma_c0fbbec4de56",
+      "launch": {
+        "tail": [
+          "scale",
+          "output"
+        ]
+      },
+      "op": "grouped_gemm1_swiglu",
+      "producer_revision": "c0fbbec4de56d9d8715587433a601d71cc703ca4",
+      "tactic": {
+        "cta_group": 1,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 256,
+          "n": 128
+        },
+        "scheduler": "clc",
+        "store_mode": "tma",
+        "swap_ab": true,
+        "template": "sm100_moe_grouped_matmul_fwd_swap_ab.py",
+        "tile": "CONFIG_sm100_256x128x128_128x128x32_cluster1x1_1ctamma_swapAB"
+      },
+      "workspace_bytes": 55424,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm1_swiglu_sm107_e12_n3072_k7168_CONFIG_sm100_256x128x128_128x128x32_cluster1x1_1ctamma_swapAB_tma_c0fbbec4de56.py",
+        "sha256": "4d9e6dde5ef5cec4960578bf834e96ec266754ee6d1becb819c3b20a78ca5d37"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm1_swiglu_v1",
+      "arch": "sm_107a",
+      "contract": {
+        "activation": "silu(gate) * up",
+        "experts": 12,
+        "groups": 12,
+        "k": 7168,
+        "n": 3072,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm1_swiglu_sm107_e12_n3072_k7168_CONFIG_sm100_256x128x128_128x128x32_cluster1x1_1ctamma_tma_c0fbbec4de56",
+      "launch": {
+        "tail": [
+          "scale",
+          "output"
+        ]
+      },
+      "op": "grouped_gemm1_swiglu",
+      "producer_revision": "c0fbbec4de56d9d8715587433a601d71cc703ca4",
+      "tactic": {
+        "cta_group": 1,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 256,
+          "n": 128
+        },
+        "scheduler": "clc",
+        "store_mode": "tma",
+        "swap_ab": false,
+        "template": "sm100_moe_grouped_matmul_fwd.py",
+        "tile": "CONFIG_sm100_256x128x128_128x128x32_cluster1x1_1ctamma"
+      },
+      "workspace_bytes": 55424,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm1_swiglu_sm107_e12_n3072_k7168_CONFIG_sm100_256x128x128_128x128x32_cluster1x1_1ctamma_tma_c0fbbec4de56.py",
+        "sha256": "c809d3fe239615bea7b82b81eead5ef6a3c3b9253ac9bf5d55621c4b8dcd253a"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm1_swiglu_swap_ab_v1",
+      "arch": "sm_107a",
+      "contract": {
+        "activation": "silu(gate) * up",
+        "experts": 12,
+        "groups": 12,
+        "k": 7168,
+        "n": 3072,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm1_swiglu_sm107_e12_n3072_k7168_CONFIG_sm100_256x128x128_128x128x32_cluster2x1_2ctamma_swapAB_tma_c0fbbec4de56",
+      "launch": {
+        "tail": [
+          "scale",
+          "output"
+        ]
+      },
+      "op": "grouped_gemm1_swiglu",
+      "producer_revision": "c0fbbec4de56d9d8715587433a601d71cc703ca4",
+      "tactic": {
+        "cta_group": 2,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 256,
+          "n": 128
+        },
+        "scheduler": "clc",
+        "store_mode": "tma",
+        "swap_ab": true,
+        "template": "sm100_moe_grouped_matmul_fwd_swap_ab.py",
+        "tile": "CONFIG_sm100_256x128x128_128x128x32_cluster2x1_2ctamma_swapAB"
+      },
+      "workspace_bytes": 55424,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm1_swiglu_sm107_e12_n3072_k7168_CONFIG_sm100_256x128x128_128x128x32_cluster2x1_2ctamma_swapAB_tma_c0fbbec4de56.py",
+        "sha256": "c72df83899762eebaa669e2a7793cb2a39ad1e70a04e39ac923d810d977d6105"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm1_swiglu_swap_ab_v1",
+      "arch": "sm_107a",
+      "contract": {
+        "activation": "silu(gate) * up",
+        "experts": 12,
+        "groups": 12,
+        "k": 7168,
+        "n": 3072,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm1_swiglu_sm107_e12_n3072_k7168_CONFIG_sm100_256x32x128_128x32x32_cluster1x1_1ctamma_swapAB_tma_c0fbbec4de56",
+      "launch": {
+        "tail": [
+          "scale",
+          "output"
+        ]
+      },
+      "op": "grouped_gemm1_swiglu",
+      "producer_revision": "c0fbbec4de56d9d8715587433a601d71cc703ca4",
+      "tactic": {
+        "cta_group": 1,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 256,
+          "n": 32
+        },
+        "scheduler": "clc",
+        "store_mode": "tma",
+        "swap_ab": true,
+        "template": "sm100_moe_grouped_matmul_fwd_swap_ab.py",
+        "tile": "CONFIG_sm100_256x32x128_128x32x32_cluster1x1_1ctamma_swapAB"
+      },
+      "workspace_bytes": 55424,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm1_swiglu_sm107_e12_n3072_k7168_CONFIG_sm100_256x32x128_128x32x32_cluster1x1_1ctamma_swapAB_tma_c0fbbec4de56.py",
+        "sha256": "f16814b15cfc17261356159d027dc936a824619742f1df6802e1bb04f59f97b6"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm1_swiglu_swap_ab_v1",
+      "arch": "sm_107a",
+      "contract": {
+        "activation": "silu(gate) * up",
+        "experts": 12,
+        "groups": 12,
+        "k": 7168,
+        "n": 3072,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm1_swiglu_sm107_e12_n3072_k7168_CONFIG_sm100_64x8x128_64x8x32_cluster1x1_1ctamma_swapAB_stg_c0fbbec4de56",
+      "launch": {
+        "tail": [
+          "output",
+          "scale"
+        ]
+      },
+      "op": "grouped_gemm1_swiglu",
+      "producer_revision": "c0fbbec4de56d9d8715587433a601d71cc703ca4",
+      "tactic": {
+        "cta_group": 1,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 64,
+          "n": 8
+        },
+        "scheduler": "clc",
+        "store_mode": "stg",
+        "swap_ab": true,
+        "template": "sm100_moe_grouped_matmul_fwd_swap_ab.py",
+        "tile": "CONFIG_sm100_64x8x128_64x8x32_cluster1x1_1ctamma_swapAB"
+      },
+      "workspace_bytes": 27776,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm1_swiglu_sm107_e12_n3072_k7168_CONFIG_sm100_64x8x128_64x8x32_cluster1x1_1ctamma_swapAB_stg_c0fbbec4de56.py",
+        "sha256": "841b7aec946ca2f9c925ed8515924bb7c90cbd16a5f7be68f81618fe9408a9fc"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm1_swiglu_swap_ab_v1",
+      "arch": "sm_107a",
+      "contract": {
+        "activation": "silu(gate) * up",
+        "experts": 12,
+        "groups": 12,
+        "k": 7168,
+        "n": 3072,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm1_swiglu_sm107_e12_n3072_k7168_CONFIG_sm100_64x8x128_64x8x32_cluster1x1_1ctamma_swapAB_tma_c0fbbec4de56",
+      "launch": {
+        "tail": [
+          "scale",
+          "output"
+        ]
+      },
+      "op": "grouped_gemm1_swiglu",
+      "producer_revision": "c0fbbec4de56d9d8715587433a601d71cc703ca4",
+      "tactic": {
+        "cta_group": 1,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 64,
+          "n": 8
+        },
+        "scheduler": "clc",
+        "store_mode": "tma",
+        "swap_ab": true,
+        "template": "sm100_moe_grouped_matmul_fwd_swap_ab.py",
+        "tile": "CONFIG_sm100_64x8x128_64x8x32_cluster1x1_1ctamma_swapAB"
+      },
+      "workspace_bytes": 55424,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm1_swiglu_sm107_e12_n3072_k7168_CONFIG_sm100_64x8x128_64x8x32_cluster1x1_1ctamma_swapAB_tma_c0fbbec4de56.py",
+        "sha256": "fc2e8ba6c599187f0ba9d7e5531a25b4ba65d8d833828f4ebdd1e93f013fc265"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm1_swiglu_v1",
+      "arch": "sm_107a",
+      "contract": {
+        "activation": "silu(gate) * up",
+        "experts": 64,
+        "groups": 64,
+        "k": 2048,
+        "n": 1408,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm1_swiglu_sm107_e64_n1408_k2048_CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_stg_c0fbbec4de56",
+      "launch": {
+        "tail": [
+          "output",
+          "scale"
+        ]
+      },
+      "op": "grouped_gemm1_swiglu",
+      "producer_revision": "c0fbbec4de56d9d8715587433a601d71cc703ca4",
+      "tactic": {
+        "cta_group": 1,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 128,
+          "n": 128
+        },
+        "scheduler": "clc",
+        "store_mode": "stg",
+        "swap_ab": false,
+        "template": "sm100_moe_grouped_matmul_fwd.py",
+        "tile": "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"
+      },
+      "workspace_bytes": 27776,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm1_swiglu_sm107_e64_n1408_k2048_CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_stg_c0fbbec4de56.py",
+        "sha256": "a551bc814579eac7af9a13c7eed872594cc58a4b354eaa0f0a63a6906c663700"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm1_swiglu_swap_ab_v1",
+      "arch": "sm_107a",
+      "contract": {
+        "activation": "silu(gate) * up",
+        "experts": 64,
+        "groups": 64,
+        "k": 2048,
+        "n": 1408,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm1_swiglu_sm107_e64_n1408_k2048_CONFIG_sm100_128x128x128_128x128x32_cluster2x1_2ctamma_swapAB_tma_c0fbbec4de56",
+      "launch": {
+        "tail": [
+          "scale",
+          "output"
+        ]
+      },
+      "op": "grouped_gemm1_swiglu",
+      "producer_revision": "c0fbbec4de56d9d8715587433a601d71cc703ca4",
+      "tactic": {
+        "cta_group": 2,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 128,
+          "n": 128
+        },
+        "scheduler": "clc",
+        "store_mode": "tma",
+        "swap_ab": true,
+        "template": "sm100_moe_grouped_matmul_fwd_swap_ab.py",
+        "tile": "CONFIG_sm100_128x128x128_128x128x32_cluster2x1_2ctamma_swapAB"
+      },
+      "workspace_bytes": 55424,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm1_swiglu_sm107_e64_n1408_k2048_CONFIG_sm100_128x128x128_128x128x32_cluster2x1_2ctamma_swapAB_tma_c0fbbec4de56.py",
+        "sha256": "6eb5195783d9b440bc66dceb7e8c65b50d8a83b888acdd7e8ddc1efae104fcab"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm1_swiglu_swap_ab_v1",
+      "arch": "sm_107a",
+      "contract": {
+        "activation": "silu(gate) * up",
+        "experts": 64,
+        "groups": 64,
+        "k": 2048,
+        "n": 1408,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm1_swiglu_sm107_e64_n1408_k2048_CONFIG_sm100_128x16x128_128x16x32_cluster2x1_2ctamma_swapAB_tma_c0fbbec4de56",
+      "launch": {
+        "tail": [
+          "scale",
+          "output"
+        ]
+      },
+      "op": "grouped_gemm1_swiglu",
+      "producer_revision": "c0fbbec4de56d9d8715587433a601d71cc703ca4",
+      "tactic": {
+        "cta_group": 2,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 128,
+          "n": 16
+        },
+        "scheduler": "clc",
+        "store_mode": "tma",
+        "swap_ab": true,
+        "template": "sm100_moe_grouped_matmul_fwd_swap_ab.py",
+        "tile": "CONFIG_sm100_128x16x128_128x16x32_cluster2x1_2ctamma_swapAB"
+      },
+      "workspace_bytes": 55424,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm1_swiglu_sm107_e64_n1408_k2048_CONFIG_sm100_128x16x128_128x16x32_cluster2x1_2ctamma_swapAB_tma_c0fbbec4de56.py",
+        "sha256": "9defdfec6d623910b85833231fd718b9760774373a5995716b1f2bc8091e14dd"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm1_swiglu_swap_ab_v1",
+      "arch": "sm_107a",
+      "contract": {
+        "activation": "silu(gate) * up",
+        "experts": 64,
+        "groups": 64,
+        "k": 2048,
+        "n": 1408,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm1_swiglu_sm107_e64_n1408_k2048_CONFIG_sm100_128x64x128_128x64x32_cluster2x1_2ctamma_swapAB_tma_c0fbbec4de56",
+      "launch": {
+        "tail": [
+          "scale",
+          "output"
+        ]
+      },
+      "op": "grouped_gemm1_swiglu",
+      "producer_revision": "c0fbbec4de56d9d8715587433a601d71cc703ca4",
+      "tactic": {
+        "cta_group": 2,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 128,
+          "n": 64
+        },
+        "scheduler": "clc",
+        "store_mode": "tma",
+        "swap_ab": true,
+        "template": "sm100_moe_grouped_matmul_fwd_swap_ab.py",
+        "tile": "CONFIG_sm100_128x64x128_128x64x32_cluster2x1_2ctamma_swapAB"
+      },
+      "workspace_bytes": 55424,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm1_swiglu_sm107_e64_n1408_k2048_CONFIG_sm100_128x64x128_128x64x32_cluster2x1_2ctamma_swapAB_tma_c0fbbec4de56.py",
+        "sha256": "1d29ec66e07b010041603b0d15343e83ec091f3b7d2df7108fed63993c6779c9"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm1_swiglu_swap_ab_v1",
+      "arch": "sm_107a",
+      "contract": {
+        "activation": "silu(gate) * up",
+        "experts": 64,
+        "groups": 64,
+        "k": 2048,
+        "n": 1408,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm1_swiglu_sm107_e64_n1408_k2048_CONFIG_sm100_256x64x128_128x64x32_cluster1x1_1ctamma_swapAB_tma_c0fbbec4de56",
+      "launch": {
+        "tail": [
+          "scale",
+          "output"
+        ]
+      },
+      "op": "grouped_gemm1_swiglu",
+      "producer_revision": "c0fbbec4de56d9d8715587433a601d71cc703ca4",
+      "tactic": {
+        "cta_group": 1,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 256,
+          "n": 64
+        },
+        "scheduler": "clc",
+        "store_mode": "tma",
+        "swap_ab": true,
+        "template": "sm100_moe_grouped_matmul_fwd_swap_ab.py",
+        "tile": "CONFIG_sm100_256x64x128_128x64x32_cluster1x1_1ctamma_swapAB"
+      },
+      "workspace_bytes": 55424,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm1_swiglu_sm107_e64_n1408_k2048_CONFIG_sm100_256x64x128_128x64x32_cluster1x1_1ctamma_swapAB_tma_c0fbbec4de56.py",
+        "sha256": "e58427843386157b3bdc05539347fd8d55758866d716dc7491b5d0cb73b6428c"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm1_swiglu_swap_ab_v1",
+      "arch": "sm_107a",
+      "contract": {
+        "activation": "silu(gate) * up",
+        "experts": 64,
+        "groups": 64,
+        "k": 2048,
+        "n": 1408,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm1_swiglu_sm107_e64_n1408_k2048_CONFIG_sm100_64x8x128_64x8x32_cluster1x1_1ctamma_swapAB_stg_c0fbbec4de56",
+      "launch": {
+        "tail": [
+          "output",
+          "scale"
+        ]
+      },
+      "op": "grouped_gemm1_swiglu",
+      "producer_revision": "c0fbbec4de56d9d8715587433a601d71cc703ca4",
+      "tactic": {
+        "cta_group": 1,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 64,
+          "n": 8
+        },
+        "scheduler": "clc",
+        "store_mode": "stg",
+        "swap_ab": true,
+        "template": "sm100_moe_grouped_matmul_fwd_swap_ab.py",
+        "tile": "CONFIG_sm100_64x8x128_64x8x32_cluster1x1_1ctamma_swapAB"
+      },
+      "workspace_bytes": 27776,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm1_swiglu_sm107_e64_n1408_k2048_CONFIG_sm100_64x8x128_64x8x32_cluster1x1_1ctamma_swapAB_stg_c0fbbec4de56.py",
+        "sha256": "841b7aec946ca2f9c925ed8515924bb7c90cbd16a5f7be68f81618fe9408a9fc"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm1_swiglu_swap_ab_v1",
+      "arch": "sm_107a",
+      "contract": {
+        "activation": "silu(gate) * up",
+        "experts": 8,
+        "groups": 8,
+        "k": 4096,
+        "n": 14336,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm1_swiglu_sm107_e8_n14336_k4096_CONFIG_sm100_128x128x128_128x128x32_cluster2x1_2ctamma_swapAB_tma_c0fbbec4de56",
+      "launch": {
+        "tail": [
+          "scale",
+          "output"
+        ]
+      },
+      "op": "grouped_gemm1_swiglu",
+      "producer_revision": "c0fbbec4de56d9d8715587433a601d71cc703ca4",
+      "tactic": {
+        "cta_group": 2,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 128,
+          "n": 128
+        },
+        "scheduler": "clc",
+        "store_mode": "tma",
+        "swap_ab": true,
+        "template": "sm100_moe_grouped_matmul_fwd_swap_ab.py",
+        "tile": "CONFIG_sm100_128x128x128_128x128x32_cluster2x1_2ctamma_swapAB"
+      },
+      "workspace_bytes": 55424,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm1_swiglu_sm107_e8_n14336_k4096_CONFIG_sm100_128x128x128_128x128x32_cluster2x1_2ctamma_swapAB_tma_c0fbbec4de56.py",
+        "sha256": "6eb5195783d9b440bc66dceb7e8c65b50d8a83b888acdd7e8ddc1efae104fcab"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm1_swiglu_swap_ab_v1",
+      "arch": "sm_107a",
+      "contract": {
+        "activation": "silu(gate) * up",
+        "experts": 8,
+        "groups": 8,
+        "k": 4096,
+        "n": 14336,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm1_swiglu_sm107_e8_n14336_k4096_CONFIG_sm100_128x16x128_128x16x32_cluster2x1_2ctamma_swapAB_tma_c0fbbec4de56",
+      "launch": {
+        "tail": [
+          "scale",
+          "output"
+        ]
+      },
+      "op": "grouped_gemm1_swiglu",
+      "producer_revision": "c0fbbec4de56d9d8715587433a601d71cc703ca4",
+      "tactic": {
+        "cta_group": 2,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 128,
+          "n": 16
+        },
+        "scheduler": "clc",
+        "store_mode": "tma",
+        "swap_ab": true,
+        "template": "sm100_moe_grouped_matmul_fwd_swap_ab.py",
+        "tile": "CONFIG_sm100_128x16x128_128x16x32_cluster2x1_2ctamma_swapAB"
+      },
+      "workspace_bytes": 55424,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm1_swiglu_sm107_e8_n14336_k4096_CONFIG_sm100_128x16x128_128x16x32_cluster2x1_2ctamma_swapAB_tma_c0fbbec4de56.py",
+        "sha256": "9defdfec6d623910b85833231fd718b9760774373a5995716b1f2bc8091e14dd"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm1_swiglu_swap_ab_v1",
+      "arch": "sm_107a",
+      "contract": {
+        "activation": "silu(gate) * up",
+        "experts": 8,
+        "groups": 8,
+        "k": 4096,
+        "n": 14336,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm1_swiglu_sm107_e8_n14336_k4096_CONFIG_sm100_128x32x128_128x32x32_cluster2x1_2ctamma_swapAB_tma_c0fbbec4de56",
+      "launch": {
+        "tail": [
+          "scale",
+          "output"
+        ]
+      },
+      "op": "grouped_gemm1_swiglu",
+      "producer_revision": "c0fbbec4de56d9d8715587433a601d71cc703ca4",
+      "tactic": {
+        "cta_group": 2,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 128,
+          "n": 32
+        },
+        "scheduler": "clc",
+        "store_mode": "tma",
+        "swap_ab": true,
+        "template": "sm100_moe_grouped_matmul_fwd_swap_ab.py",
+        "tile": "CONFIG_sm100_128x32x128_128x32x32_cluster2x1_2ctamma_swapAB"
+      },
+      "workspace_bytes": 55424,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm1_swiglu_sm107_e8_n14336_k4096_CONFIG_sm100_128x32x128_128x32x32_cluster2x1_2ctamma_swapAB_tma_c0fbbec4de56.py",
+        "sha256": "4796fa89de60f9ff9fc65805389b6d89af8538c6c02699f90a0e71eccbe55900"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm1_swiglu_v1",
+      "arch": "sm_107a",
+      "contract": {
+        "activation": "silu(gate) * up",
+        "experts": 8,
+        "groups": 8,
+        "k": 4096,
+        "n": 14336,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm1_swiglu_sm107_e8_n14336_k4096_CONFIG_sm100_128x64x128_128x64x32_cluster1x1_1ctamma_stg_c0fbbec4de56",
+      "launch": {
+        "tail": [
+          "output",
+          "scale"
+        ]
+      },
+      "op": "grouped_gemm1_swiglu",
+      "producer_revision": "c0fbbec4de56d9d8715587433a601d71cc703ca4",
+      "tactic": {
+        "cta_group": 1,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 128,
+          "n": 64
+        },
+        "scheduler": "clc",
+        "store_mode": "stg",
+        "swap_ab": false,
+        "template": "sm100_moe_grouped_matmul_fwd.py",
+        "tile": "CONFIG_sm100_128x64x128_128x64x32_cluster1x1_1ctamma"
+      },
+      "workspace_bytes": 27776,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm1_swiglu_sm107_e8_n14336_k4096_CONFIG_sm100_128x64x128_128x64x32_cluster1x1_1ctamma_stg_c0fbbec4de56.py",
+        "sha256": "c39e6f7b23807ceb2290e86bc35099d4e0d6fb549a5ad065bbf53591460baf29"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm1_swiglu_swap_ab_v1",
+      "arch": "sm_107a",
+      "contract": {
+        "activation": "silu(gate) * up",
+        "experts": 8,
+        "groups": 8,
+        "k": 4096,
+        "n": 14336,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm1_swiglu_sm107_e8_n14336_k4096_CONFIG_sm100_128x64x128_128x64x32_cluster2x1_2ctamma_swapAB_tma_c0fbbec4de56",
+      "launch": {
+        "tail": [
+          "scale",
+          "output"
+        ]
+      },
+      "op": "grouped_gemm1_swiglu",
+      "producer_revision": "c0fbbec4de56d9d8715587433a601d71cc703ca4",
+      "tactic": {
+        "cta_group": 2,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 128,
+          "n": 64
+        },
+        "scheduler": "clc",
+        "store_mode": "tma",
+        "swap_ab": true,
+        "template": "sm100_moe_grouped_matmul_fwd_swap_ab.py",
+        "tile": "CONFIG_sm100_128x64x128_128x64x32_cluster2x1_2ctamma_swapAB"
+      },
+      "workspace_bytes": 55424,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm1_swiglu_sm107_e8_n14336_k4096_CONFIG_sm100_128x64x128_128x64x32_cluster2x1_2ctamma_swapAB_tma_c0fbbec4de56.py",
+        "sha256": "1d29ec66e07b010041603b0d15343e83ec091f3b7d2df7108fed63993c6779c9"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm1_swiglu_swap_ab_v1",
+      "arch": "sm_107a",
+      "contract": {
+        "activation": "silu(gate) * up",
+        "experts": 8,
+        "groups": 8,
+        "k": 4096,
+        "n": 14336,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm1_swiglu_sm107_e8_n14336_k4096_CONFIG_sm100_256x128x128_128x128x32_cluster1x1_1ctamma_swapAB_tma_c0fbbec4de56",
+      "launch": {
+        "tail": [
+          "scale",
+          "output"
+        ]
+      },
+      "op": "grouped_gemm1_swiglu",
+      "producer_revision": "c0fbbec4de56d9d8715587433a601d71cc703ca4",
+      "tactic": {
+        "cta_group": 1,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 256,
+          "n": 128
+        },
+        "scheduler": "clc",
+        "store_mode": "tma",
+        "swap_ab": true,
+        "template": "sm100_moe_grouped_matmul_fwd_swap_ab.py",
+        "tile": "CONFIG_sm100_256x128x128_128x128x32_cluster1x1_1ctamma_swapAB"
+      },
+      "workspace_bytes": 55424,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm1_swiglu_sm107_e8_n14336_k4096_CONFIG_sm100_256x128x128_128x128x32_cluster1x1_1ctamma_swapAB_tma_c0fbbec4de56.py",
+        "sha256": "4d9e6dde5ef5cec4960578bf834e96ec266754ee6d1becb819c3b20a78ca5d37"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm1_swiglu_swap_ab_v1",
+      "arch": "sm_107a",
+      "contract": {
+        "activation": "silu(gate) * up",
+        "experts": 8,
+        "groups": 8,
+        "k": 4096,
+        "n": 14336,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm1_swiglu_sm107_e8_n14336_k4096_CONFIG_sm100_256x8x128_128x8x32_cluster1x1_1ctamma_swapAB_stg_c0fbbec4de56",
+      "launch": {
+        "tail": [
+          "output",
+          "scale"
+        ]
+      },
+      "op": "grouped_gemm1_swiglu",
+      "producer_revision": "c0fbbec4de56d9d8715587433a601d71cc703ca4",
+      "tactic": {
+        "cta_group": 1,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 256,
+          "n": 8
+        },
+        "scheduler": "clc",
+        "store_mode": "stg",
+        "swap_ab": true,
+        "template": "sm100_moe_grouped_matmul_fwd_swap_ab.py",
+        "tile": "CONFIG_sm100_256x8x128_128x8x32_cluster1x1_1ctamma_swapAB"
+      },
+      "workspace_bytes": 27776,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm1_swiglu_sm107_e8_n14336_k4096_CONFIG_sm100_256x8x128_128x8x32_cluster1x1_1ctamma_swapAB_stg_c0fbbec4de56.py",
+        "sha256": "7df4f9f86ca4ea66357227f07419507bd87d5fb7aaa668731246c60088ae02dc"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm1_swiglu_swap_ab_v1",
+      "arch": "sm_107a",
+      "contract": {
+        "activation": "silu(gate) * up",
+        "experts": 8,
+        "groups": 8,
+        "k": 4096,
+        "n": 14336,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm1_swiglu_sm107_e8_n14336_k4096_CONFIG_sm100_64x8x128_64x8x32_cluster1x1_1ctamma_swapAB_stg_c0fbbec4de56",
+      "launch": {
+        "tail": [
+          "output",
+          "scale"
+        ]
+      },
+      "op": "grouped_gemm1_swiglu",
+      "producer_revision": "c0fbbec4de56d9d8715587433a601d71cc703ca4",
+      "tactic": {
+        "cta_group": 1,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 64,
+          "n": 8
+        },
+        "scheduler": "clc",
+        "store_mode": "stg",
+        "swap_ab": true,
+        "template": "sm100_moe_grouped_matmul_fwd_swap_ab.py",
+        "tile": "CONFIG_sm100_64x8x128_64x8x32_cluster1x1_1ctamma_swapAB"
+      },
+      "workspace_bytes": 27776,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm1_swiglu_sm107_e8_n14336_k4096_CONFIG_sm100_64x8x128_64x8x32_cluster1x1_1ctamma_swapAB_stg_c0fbbec4de56.py",
+        "sha256": "841b7aec946ca2f9c925ed8515924bb7c90cbd16a5f7be68f81618fe9408a9fc"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm1_swiglu_v1",
+      "arch": "sm_107a",
+      "contract": {
+        "activation": "silu(gate) * up",
+        "experts": 8,
+        "groups": 8,
+        "k": 128,
+        "n": 256,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm1_swiglu_sm107_e8_n256_k128_CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_stg_c0fbbec4de56",
+      "launch": {
+        "tail": [
+          "output",
+          "scale"
+        ]
+      },
+      "op": "grouped_gemm1_swiglu",
+      "producer_revision": "c0fbbec4de56d9d8715587433a601d71cc703ca4",
+      "tactic": {
+        "cta_group": 1,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 128,
+          "n": 128
+        },
+        "scheduler": "clc",
+        "store_mode": "stg",
+        "swap_ab": false,
+        "template": "sm100_moe_grouped_matmul_fwd.py",
+        "tile": "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"
+      },
+      "workspace_bytes": 27776,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm1_swiglu_sm107_e8_n256_k128_CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_stg_c0fbbec4de56.py",
+        "sha256": "a551bc814579eac7af9a13c7eed872594cc58a4b354eaa0f0a63a6906c663700"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm1_swiglu_v1",
+      "arch": "sm_107a",
+      "contract": {
+        "activation": "silu(gate) * up",
+        "experts": 8,
+        "groups": 8,
+        "k": 128,
+        "n": 256,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm1_swiglu_sm107_e8_n256_k128_CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_tma_c0fbbec4de56",
+      "launch": {
+        "tail": [
+          "scale",
+          "output"
+        ]
+      },
+      "op": "grouped_gemm1_swiglu",
+      "producer_revision": "c0fbbec4de56d9d8715587433a601d71cc703ca4",
+      "tactic": {
+        "cta_group": 1,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 128,
+          "n": 128
+        },
+        "scheduler": "clc",
+        "store_mode": "tma",
+        "swap_ab": false,
+        "template": "sm100_moe_grouped_matmul_fwd.py",
+        "tile": "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"
+      },
+      "workspace_bytes": 55424,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm1_swiglu_sm107_e8_n256_k128_CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_tma_c0fbbec4de56.py",
+        "sha256": "bedb59879084509bb1261551dd045a16b7df451f4760b9a26ad8bb8f52bd62bd"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm1_swiglu_swap_ab_v1",
+      "arch": "sm_107a",
+      "contract": {
+        "activation": "silu(gate) * up",
+        "experts": 8,
+        "groups": 8,
+        "k": 128,
+        "n": 256,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm1_swiglu_sm107_e8_n256_k128_CONFIG_sm100_128x16x128_128x16x32_cluster1x1_1ctamma_swapAB_stg_c0fbbec4de56",
+      "launch": {
+        "tail": [
+          "output",
+          "scale"
+        ]
+      },
+      "op": "grouped_gemm1_swiglu",
+      "producer_revision": "c0fbbec4de56d9d8715587433a601d71cc703ca4",
+      "tactic": {
+        "cta_group": 1,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 128,
+          "n": 16
+        },
+        "scheduler": "clc",
+        "store_mode": "stg",
+        "swap_ab": true,
+        "template": "sm100_moe_grouped_matmul_fwd_swap_ab.py",
+        "tile": "CONFIG_sm100_128x16x128_128x16x32_cluster1x1_1ctamma_swapAB"
+      },
+      "workspace_bytes": 27776,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm1_swiglu_sm107_e8_n256_k128_CONFIG_sm100_128x16x128_128x16x32_cluster1x1_1ctamma_swapAB_stg_c0fbbec4de56.py",
+        "sha256": "6f8594a4ab492a39a5c2ab9dadeccd21e2c3e5503f9dd7ef14cb1e8bb4f28efd"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm1_swiglu_swap_ab_v1",
+      "arch": "sm_107a",
+      "contract": {
+        "activation": "silu(gate) * up",
+        "experts": 8,
+        "groups": 8,
+        "k": 128,
+        "n": 256,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm1_swiglu_sm107_e8_n256_k128_CONFIG_sm100_128x16x128_128x16x32_cluster1x1_1ctamma_swapAB_tma_c0fbbec4de56",
+      "launch": {
+        "tail": [
+          "scale",
+          "output"
+        ]
+      },
+      "op": "grouped_gemm1_swiglu",
+      "producer_revision": "c0fbbec4de56d9d8715587433a601d71cc703ca4",
+      "tactic": {
+        "cta_group": 1,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 128,
+          "n": 16
+        },
+        "scheduler": "clc",
+        "store_mode": "tma",
+        "swap_ab": true,
+        "template": "sm100_moe_grouped_matmul_fwd_swap_ab.py",
+        "tile": "CONFIG_sm100_128x16x128_128x16x32_cluster1x1_1ctamma_swapAB"
+      },
+      "workspace_bytes": 55424,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm1_swiglu_sm107_e8_n256_k128_CONFIG_sm100_128x16x128_128x16x32_cluster1x1_1ctamma_swapAB_tma_c0fbbec4de56.py",
+        "sha256": "622b6346cbc55425b78a6debc931878be86c285206e79f990ffdcdd310843eb9"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm2_v1",
+      "arch": "sm_100a",
+      "contract": {
+        "activation": "identity",
+        "experts": 12,
+        "groups": 12,
+        "k": 3072,
+        "n": 7168,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm2_sm100_e12_n7168_k3072_CONFIG_sm100_128x256x128_128x256x32_cluster2x2_2ctamma_stg_f32bcc0c0ec6",
+      "launch": {
+        "tail": [
+          "output"
+        ]
+      },
+      "op": "grouped_gemm2",
+      "producer_revision": "f32bcc0c0ec6243c788183d23d3e8a0f25efcec4",
+      "tactic": {
+        "cta_group": 2,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 128,
+          "n": 256
+        },
+        "scheduler": "clc",
+        "store_mode": "stg",
+        "template": "sm100_moe_grouped_matmul_fwd.py",
+        "tile": "CONFIG_sm100_128x256x128_128x256x32_cluster2x2_2ctamma"
+      },
+      "workspace_bytes": 17024,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm2_sm100_e12_n7168_k3072_CONFIG_sm100_128x256x128_128x256x32_cluster2x2_2ctamma_stg_f32bcc0c0ec6.py",
+        "sha256": "7f6f4b3b1c3e68cae4efce5b9e79cc9922ec412b1dc18a3c6dc85d20a8f9b64a"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm2_v1",
+      "arch": "sm_100a",
+      "contract": {
+        "activation": "identity",
+        "experts": 12,
+        "groups": 12,
+        "k": 3072,
+        "n": 7168,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm2_sm100_e12_n7168_k3072_CONFIG_sm100_128x256x128_128x256x32_cluster2x2_2ctamma_tma_f32bcc0c0ec6",
+      "launch": {
+        "tail": [
+          "output"
+        ]
+      },
+      "op": "grouped_gemm2",
+      "producer_revision": "f32bcc0c0ec6243c788183d23d3e8a0f25efcec4",
+      "tactic": {
+        "cta_group": 2,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 128,
+          "n": 256
+        },
+        "scheduler": "clc",
+        "store_mode": "tma",
+        "template": "sm100_moe_grouped_matmul_fwd.py",
+        "tile": "CONFIG_sm100_128x256x128_128x256x32_cluster2x2_2ctamma"
+      },
+      "workspace_bytes": 33920,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm2_sm100_e12_n7168_k3072_CONFIG_sm100_128x256x128_128x256x32_cluster2x2_2ctamma_tma_f32bcc0c0ec6.py",
+        "sha256": "060483eca8f0a4d617b480d393f4ef8c217e0abf686e773dda9844fe8e32eafd"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm2_v1",
+      "arch": "sm_100a",
+      "contract": {
+        "activation": "identity",
+        "experts": 8,
+        "groups": 8,
+        "k": 14336,
+        "n": 4096,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm2_sm100_e8_n4096_k14336_CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_stg_f32bcc0c0ec6",
+      "launch": {
+        "tail": [
+          "output"
+        ]
+      },
+      "op": "grouped_gemm2",
+      "producer_revision": "f32bcc0c0ec6243c788183d23d3e8a0f25efcec4",
+      "tactic": {
+        "cta_group": 1,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 128,
+          "n": 128
+        },
+        "scheduler": "clc",
+        "store_mode": "stg",
+        "template": "sm100_moe_grouped_matmul_fwd.py",
+        "tile": "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"
+      },
+      "workspace_bytes": 19072,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm2_sm100_e8_n4096_k14336_CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_stg_f32bcc0c0ec6.py",
+        "sha256": "6b6b467a54d6303b646b1d66aa783a3c440af479b8f7ba27b166140bfef4a7de"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm2_v1",
+      "arch": "sm_100a",
+      "contract": {
+        "activation": "identity",
+        "experts": 8,
+        "groups": 8,
+        "k": 14336,
+        "n": 4096,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm2_sm100_e8_n4096_k14336_CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_tma_f32bcc0c0ec6",
+      "launch": {
+        "tail": [
+          "output"
+        ]
+      },
+      "op": "grouped_gemm2",
+      "producer_revision": "f32bcc0c0ec6243c788183d23d3e8a0f25efcec4",
+      "tactic": {
+        "cta_group": 1,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 128,
+          "n": 128
+        },
+        "scheduler": "clc",
+        "store_mode": "tma",
+        "template": "sm100_moe_grouped_matmul_fwd.py",
+        "tile": "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"
+      },
+      "workspace_bytes": 38016,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm2_sm100_e8_n4096_k14336_CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_tma_f32bcc0c0ec6.py",
+        "sha256": "b34e886451377b2efa1a45ae19ea1645936092e4ac6eefbdd991c1f40cb12036"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm2_v1",
+      "arch": "sm_100a",
+      "contract": {
+        "activation": "identity",
+        "experts": 8,
+        "groups": 8,
+        "k": 14336,
+        "n": 4096,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm2_sm100_e8_n4096_k14336_CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma_stg_f32bcc0c0ec6",
+      "launch": {
+        "tail": [
+          "output"
+        ]
+      },
+      "op": "grouped_gemm2",
+      "producer_revision": "f32bcc0c0ec6243c788183d23d3e8a0f25efcec4",
+      "tactic": {
+        "cta_group": 2,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 128,
+          "n": 256
+        },
+        "scheduler": "clc",
+        "store_mode": "stg",
+        "template": "sm100_moe_grouped_matmul_fwd.py",
+        "tile": "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma"
+      },
+      "workspace_bytes": 19072,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm2_sm100_e8_n4096_k14336_CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma_stg_f32bcc0c0ec6.py",
+        "sha256": "d62262b5783dad16904f06b549363c7a7b0ab8ad0a2d1c3c775f427312c330e2"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm2_v1",
+      "arch": "sm_100a",
+      "contract": {
+        "activation": "identity",
+        "experts": 8,
+        "groups": 8,
+        "k": 14336,
+        "n": 4096,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm2_sm100_e8_n4096_k14336_CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma_tma_f32bcc0c0ec6",
+      "launch": {
+        "tail": [
+          "output"
+        ]
+      },
+      "op": "grouped_gemm2",
+      "producer_revision": "f32bcc0c0ec6243c788183d23d3e8a0f25efcec4",
+      "tactic": {
+        "cta_group": 2,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 128,
+          "n": 256
+        },
+        "scheduler": "clc",
+        "store_mode": "tma",
+        "template": "sm100_moe_grouped_matmul_fwd.py",
+        "tile": "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma"
+      },
+      "workspace_bytes": 38016,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm2_sm100_e8_n4096_k14336_CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma_tma_f32bcc0c0ec6.py",
+        "sha256": "795711334d872d6c14d058a8c0d6ab42b22cf7f8a27269498d61740316ca13ec"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm2_v1",
+      "arch": "sm_107a",
+      "contract": {
+        "activation": "identity",
+        "experts": 12,
+        "groups": 12,
+        "k": 3072,
+        "n": 7168,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm2_sm107_e12_n7168_k3072_CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_stg_c0fbbec4de56",
+      "launch": {
+        "tail": [
+          "output"
+        ]
+      },
+      "op": "grouped_gemm2",
+      "producer_revision": "c0fbbec4de56d9d8715587433a601d71cc703ca4",
+      "tactic": {
+        "cta_group": 1,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 128,
+          "n": 128
+        },
+        "scheduler": "clc",
+        "store_mode": "stg",
+        "swap_ab": false,
+        "template": "sm100_moe_grouped_matmul_fwd.py",
+        "tile": "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"
+      },
+      "workspace_bytes": 27776,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm2_sm107_e12_n7168_k3072_CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_stg_c0fbbec4de56.py",
+        "sha256": "f91d1972010425d1a0deca60524c22eefbfd7253343bd9c0c88b59bf5d2aa57d"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm2_v1",
+      "arch": "sm_107a",
+      "contract": {
+        "activation": "identity",
+        "experts": 12,
+        "groups": 12,
+        "k": 3072,
+        "n": 7168,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm2_sm107_e12_n7168_k3072_CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_tma_c0fbbec4de56",
+      "launch": {
+        "tail": [
+          "output"
+        ]
+      },
+      "op": "grouped_gemm2",
+      "producer_revision": "c0fbbec4de56d9d8715587433a601d71cc703ca4",
+      "tactic": {
+        "cta_group": 1,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 128,
+          "n": 128
+        },
+        "scheduler": "clc",
+        "store_mode": "tma",
+        "swap_ab": false,
+        "template": "sm100_moe_grouped_matmul_fwd.py",
+        "tile": "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"
+      },
+      "workspace_bytes": 55424,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm2_sm107_e12_n7168_k3072_CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_tma_c0fbbec4de56.py",
+        "sha256": "a52b2724b3b5cf3e6ab0c3cc1bc3c109a64e028827ecbbe630757c1d6ef2d611"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm2_swap_ab_v1",
+      "arch": "sm_107a",
+      "contract": {
+        "activation": "identity",
+        "experts": 12,
+        "groups": 12,
+        "k": 3072,
+        "n": 7168,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm2_sm107_e12_n7168_k3072_CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma_swapAB_tma_c0fbbec4de56",
+      "launch": {
+        "tail": [
+          "output"
+        ]
+      },
+      "op": "grouped_gemm2",
+      "producer_revision": "c0fbbec4de56d9d8715587433a601d71cc703ca4",
+      "tactic": {
+        "cta_group": 2,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 128,
+          "n": 256
+        },
+        "scheduler": "clc",
+        "store_mode": "tma",
+        "swap_ab": true,
+        "template": "sm100_moe_grouped_matmul_fwd_swap_ab.py",
+        "tile": "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma_swapAB"
+      },
+      "workspace_bytes": 55424,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm2_sm107_e12_n7168_k3072_CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma_swapAB_tma_c0fbbec4de56.py",
+        "sha256": "6f282016b4fe30bd62bf56c3ec4c8bfe9fb06d1320c963c02cf93cddcd82123d"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm2_v1",
+      "arch": "sm_107a",
+      "contract": {
+        "activation": "identity",
+        "experts": 12,
+        "groups": 12,
+        "k": 3072,
+        "n": 7168,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm2_sm107_e12_n7168_k3072_CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma_tma_c0fbbec4de56",
+      "launch": {
+        "tail": [
+          "output"
+        ]
+      },
+      "op": "grouped_gemm2",
+      "producer_revision": "c0fbbec4de56d9d8715587433a601d71cc703ca4",
+      "tactic": {
+        "cta_group": 2,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 128,
+          "n": 256
+        },
+        "scheduler": "clc",
+        "store_mode": "tma",
+        "swap_ab": false,
+        "template": "sm100_moe_grouped_matmul_fwd.py",
+        "tile": "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma"
+      },
+      "workspace_bytes": 55424,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm2_sm107_e12_n7168_k3072_CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma_tma_c0fbbec4de56.py",
+        "sha256": "43428ed580c5c7bfaf291005b8c38e85caf97aa078b213451f55e89a0694c7cf"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm2_swap_ab_v1",
+      "arch": "sm_107a",
+      "contract": {
+        "activation": "identity",
+        "experts": 12,
+        "groups": 12,
+        "k": 3072,
+        "n": 7168,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm2_sm107_e12_n7168_k3072_CONFIG_sm100_128x8x128_128x8x32_cluster1x1_1ctamma_swapAB_stg_c0fbbec4de56",
+      "launch": {
+        "tail": [
+          "output"
+        ]
+      },
+      "op": "grouped_gemm2",
+      "producer_revision": "c0fbbec4de56d9d8715587433a601d71cc703ca4",
+      "tactic": {
+        "cta_group": 1,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 128,
+          "n": 8
+        },
+        "scheduler": "clc",
+        "store_mode": "stg",
+        "swap_ab": true,
+        "template": "sm100_moe_grouped_matmul_fwd_swap_ab.py",
+        "tile": "CONFIG_sm100_128x8x128_128x8x32_cluster1x1_1ctamma_swapAB"
+      },
+      "workspace_bytes": 27776,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm2_sm107_e12_n7168_k3072_CONFIG_sm100_128x8x128_128x8x32_cluster1x1_1ctamma_swapAB_stg_c0fbbec4de56.py",
+        "sha256": "f65c068e29c1e8776ebd72b8f7ca34265b95c408e1da49707d6e5f21171b571d"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm2_swap_ab_v1",
+      "arch": "sm_107a",
+      "contract": {
+        "activation": "identity",
+        "experts": 12,
+        "groups": 12,
+        "k": 3072,
+        "n": 7168,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm2_sm107_e12_n7168_k3072_CONFIG_sm100_128x8x128_128x8x32_cluster1x1_1ctamma_swapAB_tma_c0fbbec4de56",
+      "launch": {
+        "tail": [
+          "output"
+        ]
+      },
+      "op": "grouped_gemm2",
+      "producer_revision": "c0fbbec4de56d9d8715587433a601d71cc703ca4",
+      "tactic": {
+        "cta_group": 1,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 128,
+          "n": 8
+        },
+        "scheduler": "clc",
+        "store_mode": "tma",
+        "swap_ab": true,
+        "template": "sm100_moe_grouped_matmul_fwd_swap_ab.py",
+        "tile": "CONFIG_sm100_128x8x128_128x8x32_cluster1x1_1ctamma_swapAB"
+      },
+      "workspace_bytes": 55424,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm2_sm107_e12_n7168_k3072_CONFIG_sm100_128x8x128_128x8x32_cluster1x1_1ctamma_swapAB_tma_c0fbbec4de56.py",
+        "sha256": "4f65ac36d3e75617c0fe1a72f103631f22471e55b7c21047c9a3b154273a47b1"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm2_swap_ab_v1",
+      "arch": "sm_107a",
+      "contract": {
+        "activation": "identity",
+        "experts": 12,
+        "groups": 12,
+        "k": 3072,
+        "n": 7168,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm2_sm107_e12_n7168_k3072_CONFIG_sm100_256x128x128_128x128x32_cluster1x1_1ctamma_swapAB_tma_c0fbbec4de56",
+      "launch": {
+        "tail": [
+          "output"
+        ]
+      },
+      "op": "grouped_gemm2",
+      "producer_revision": "c0fbbec4de56d9d8715587433a601d71cc703ca4",
+      "tactic": {
+        "cta_group": 1,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 256,
+          "n": 128
+        },
+        "scheduler": "clc",
+        "store_mode": "tma",
+        "swap_ab": true,
+        "template": "sm100_moe_grouped_matmul_fwd_swap_ab.py",
+        "tile": "CONFIG_sm100_256x128x128_128x128x32_cluster1x1_1ctamma_swapAB"
+      },
+      "workspace_bytes": 55424,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm2_sm107_e12_n7168_k3072_CONFIG_sm100_256x128x128_128x128x32_cluster1x1_1ctamma_swapAB_tma_c0fbbec4de56.py",
+        "sha256": "3d1984633dc028b27796875964d3c0f896981ed779fa3c72e18af318c6b00b43"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm2_swap_ab_v1",
+      "arch": "sm_107a",
+      "contract": {
+        "activation": "identity",
+        "experts": 12,
+        "groups": 12,
+        "k": 3072,
+        "n": 7168,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm2_sm107_e12_n7168_k3072_CONFIG_sm100_256x128x128_128x128x32_cluster2x1_2ctamma_swapAB_tma_c0fbbec4de56",
+      "launch": {
+        "tail": [
+          "output"
+        ]
+      },
+      "op": "grouped_gemm2",
+      "producer_revision": "c0fbbec4de56d9d8715587433a601d71cc703ca4",
+      "tactic": {
+        "cta_group": 2,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 256,
+          "n": 128
+        },
+        "scheduler": "clc",
+        "store_mode": "tma",
+        "swap_ab": true,
+        "template": "sm100_moe_grouped_matmul_fwd_swap_ab.py",
+        "tile": "CONFIG_sm100_256x128x128_128x128x32_cluster2x1_2ctamma_swapAB"
+      },
+      "workspace_bytes": 55424,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm2_sm107_e12_n7168_k3072_CONFIG_sm100_256x128x128_128x128x32_cluster2x1_2ctamma_swapAB_tma_c0fbbec4de56.py",
+        "sha256": "0eb66e58c2dbcabb4e742e9b03e1ea5bf95b8e5c700ae31b9dcd3e4d3a34addf"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm2_swap_ab_v1",
+      "arch": "sm_107a",
+      "contract": {
+        "activation": "identity",
+        "experts": 12,
+        "groups": 12,
+        "k": 3072,
+        "n": 7168,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm2_sm107_e12_n7168_k3072_CONFIG_sm100_256x16x128_128x16x32_cluster2x1_2ctamma_swapAB_stg_c0fbbec4de56",
+      "launch": {
+        "tail": [
+          "output"
+        ]
+      },
+      "op": "grouped_gemm2",
+      "producer_revision": "c0fbbec4de56d9d8715587433a601d71cc703ca4",
+      "tactic": {
+        "cta_group": 2,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 256,
+          "n": 16
+        },
+        "scheduler": "clc",
+        "store_mode": "stg",
+        "swap_ab": true,
+        "template": "sm100_moe_grouped_matmul_fwd_swap_ab.py",
+        "tile": "CONFIG_sm100_256x16x128_128x16x32_cluster2x1_2ctamma_swapAB"
+      },
+      "workspace_bytes": 27776,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm2_sm107_e12_n7168_k3072_CONFIG_sm100_256x16x128_128x16x32_cluster2x1_2ctamma_swapAB_stg_c0fbbec4de56.py",
+        "sha256": "9923d1dfc3187279f56233cbd8d50a596ab52dfe03b8d35fa6641f6534d3547a"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm2_swap_ab_v1",
+      "arch": "sm_107a",
+      "contract": {
+        "activation": "identity",
+        "experts": 12,
+        "groups": 12,
+        "k": 3072,
+        "n": 7168,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm2_sm107_e12_n7168_k3072_CONFIG_sm100_256x32x128_128x32x32_cluster1x1_1ctamma_swapAB_stg_c0fbbec4de56",
+      "launch": {
+        "tail": [
+          "output"
+        ]
+      },
+      "op": "grouped_gemm2",
+      "producer_revision": "c0fbbec4de56d9d8715587433a601d71cc703ca4",
+      "tactic": {
+        "cta_group": 1,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 256,
+          "n": 32
+        },
+        "scheduler": "clc",
+        "store_mode": "stg",
+        "swap_ab": true,
+        "template": "sm100_moe_grouped_matmul_fwd_swap_ab.py",
+        "tile": "CONFIG_sm100_256x32x128_128x32x32_cluster1x1_1ctamma_swapAB"
+      },
+      "workspace_bytes": 27776,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm2_sm107_e12_n7168_k3072_CONFIG_sm100_256x32x128_128x32x32_cluster1x1_1ctamma_swapAB_stg_c0fbbec4de56.py",
+        "sha256": "297ae4c1ee911b9ed981222998518b328f9ddfc01694f3618b456115fed0ceb9"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm2_swap_ab_v1",
+      "arch": "sm_107a",
+      "contract": {
+        "activation": "identity",
+        "experts": 12,
+        "groups": 12,
+        "k": 3072,
+        "n": 7168,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm2_sm107_e12_n7168_k3072_CONFIG_sm100_256x8x128_128x8x32_cluster1x1_1ctamma_swapAB_stg_c0fbbec4de56",
+      "launch": {
+        "tail": [
+          "output"
+        ]
+      },
+      "op": "grouped_gemm2",
+      "producer_revision": "c0fbbec4de56d9d8715587433a601d71cc703ca4",
+      "tactic": {
+        "cta_group": 1,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 256,
+          "n": 8
+        },
+        "scheduler": "clc",
+        "store_mode": "stg",
+        "swap_ab": true,
+        "template": "sm100_moe_grouped_matmul_fwd_swap_ab.py",
+        "tile": "CONFIG_sm100_256x8x128_128x8x32_cluster1x1_1ctamma_swapAB"
+      },
+      "workspace_bytes": 27776,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm2_sm107_e12_n7168_k3072_CONFIG_sm100_256x8x128_128x8x32_cluster1x1_1ctamma_swapAB_stg_c0fbbec4de56.py",
+        "sha256": "bd2f7efab0ce4f7f0c253ce844b2f934f855b7194f4575284e5cffcd8c5077ab"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm2_swap_ab_v1",
+      "arch": "sm_107a",
+      "contract": {
+        "activation": "identity",
+        "experts": 64,
+        "groups": 64,
+        "k": 1408,
+        "n": 2048,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm2_sm107_e64_n2048_k1408_CONFIG_sm100_128x16x128_128x16x32_cluster1x1_1ctamma_swapAB_tma_c0fbbec4de56",
+      "launch": {
+        "tail": [
+          "output"
+        ]
+      },
+      "op": "grouped_gemm2",
+      "producer_revision": "c0fbbec4de56d9d8715587433a601d71cc703ca4",
+      "tactic": {
+        "cta_group": 1,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 128,
+          "n": 16
+        },
+        "scheduler": "clc",
+        "store_mode": "tma",
+        "swap_ab": true,
+        "template": "sm100_moe_grouped_matmul_fwd_swap_ab.py",
+        "tile": "CONFIG_sm100_128x16x128_128x16x32_cluster1x1_1ctamma_swapAB"
+      },
+      "workspace_bytes": 55424,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm2_sm107_e64_n2048_k1408_CONFIG_sm100_128x16x128_128x16x32_cluster1x1_1ctamma_swapAB_tma_c0fbbec4de56.py",
+        "sha256": "4426172125786b5a99657103836d80356b3bcbb6a78b4dbf38dfc15442ff61fb"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm2_swap_ab_v1",
+      "arch": "sm_107a",
+      "contract": {
+        "activation": "identity",
+        "experts": 64,
+        "groups": 64,
+        "k": 1408,
+        "n": 2048,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm2_sm107_e64_n2048_k1408_CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma_swapAB_tma_c0fbbec4de56",
+      "launch": {
+        "tail": [
+          "output"
+        ]
+      },
+      "op": "grouped_gemm2",
+      "producer_revision": "c0fbbec4de56d9d8715587433a601d71cc703ca4",
+      "tactic": {
+        "cta_group": 2,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 128,
+          "n": 256
+        },
+        "scheduler": "clc",
+        "store_mode": "tma",
+        "swap_ab": true,
+        "template": "sm100_moe_grouped_matmul_fwd_swap_ab.py",
+        "tile": "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma_swapAB"
+      },
+      "workspace_bytes": 55424,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm2_sm107_e64_n2048_k1408_CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma_swapAB_tma_c0fbbec4de56.py",
+        "sha256": "6f282016b4fe30bd62bf56c3ec4c8bfe9fb06d1320c963c02cf93cddcd82123d"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm2_v1",
+      "arch": "sm_107a",
+      "contract": {
+        "activation": "identity",
+        "experts": 64,
+        "groups": 64,
+        "k": 1408,
+        "n": 2048,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm2_sm107_e64_n2048_k1408_CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma_tma_c0fbbec4de56",
+      "launch": {
+        "tail": [
+          "output"
+        ]
+      },
+      "op": "grouped_gemm2",
+      "producer_revision": "c0fbbec4de56d9d8715587433a601d71cc703ca4",
+      "tactic": {
+        "cta_group": 2,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 128,
+          "n": 256
+        },
+        "scheduler": "clc",
+        "store_mode": "tma",
+        "swap_ab": false,
+        "template": "sm100_moe_grouped_matmul_fwd.py",
+        "tile": "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma"
+      },
+      "workspace_bytes": 55424,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm2_sm107_e64_n2048_k1408_CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma_tma_c0fbbec4de56.py",
+        "sha256": "43428ed580c5c7bfaf291005b8c38e85caf97aa078b213451f55e89a0694c7cf"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm2_v1",
+      "arch": "sm_107a",
+      "contract": {
+        "activation": "identity",
+        "experts": 64,
+        "groups": 64,
+        "k": 1408,
+        "n": 2048,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm2_sm107_e64_n2048_k1408_CONFIG_sm100_128x256x128_128x256x32_cluster2x2_2ctamma_stg_c0fbbec4de56",
+      "launch": {
+        "tail": [
+          "output"
+        ]
+      },
+      "op": "grouped_gemm2",
+      "producer_revision": "c0fbbec4de56d9d8715587433a601d71cc703ca4",
+      "tactic": {
+        "cta_group": 2,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 128,
+          "n": 256
+        },
+        "scheduler": "clc",
+        "store_mode": "stg",
+        "swap_ab": false,
+        "template": "sm100_moe_grouped_matmul_fwd.py",
+        "tile": "CONFIG_sm100_128x256x128_128x256x32_cluster2x2_2ctamma"
+      },
+      "workspace_bytes": 26240,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm2_sm107_e64_n2048_k1408_CONFIG_sm100_128x256x128_128x256x32_cluster2x2_2ctamma_stg_c0fbbec4de56.py",
+        "sha256": "b7ec321ce1c75a600046f20600de07c6aacc11b02980d38f36c595e61fca73e2"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm2_swap_ab_v1",
+      "arch": "sm_107a",
+      "contract": {
+        "activation": "identity",
+        "experts": 64,
+        "groups": 64,
+        "k": 1408,
+        "n": 2048,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm2_sm107_e64_n2048_k1408_CONFIG_sm100_128x8x128_128x8x32_cluster1x1_1ctamma_swapAB_tma_c0fbbec4de56",
+      "launch": {
+        "tail": [
+          "output"
+        ]
+      },
+      "op": "grouped_gemm2",
+      "producer_revision": "c0fbbec4de56d9d8715587433a601d71cc703ca4",
+      "tactic": {
+        "cta_group": 1,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 128,
+          "n": 8
+        },
+        "scheduler": "clc",
+        "store_mode": "tma",
+        "swap_ab": true,
+        "template": "sm100_moe_grouped_matmul_fwd_swap_ab.py",
+        "tile": "CONFIG_sm100_128x8x128_128x8x32_cluster1x1_1ctamma_swapAB"
+      },
+      "workspace_bytes": 55424,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm2_sm107_e64_n2048_k1408_CONFIG_sm100_128x8x128_128x8x32_cluster1x1_1ctamma_swapAB_tma_c0fbbec4de56.py",
+        "sha256": "4f65ac36d3e75617c0fe1a72f103631f22471e55b7c21047c9a3b154273a47b1"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm2_swap_ab_v1",
+      "arch": "sm_107a",
+      "contract": {
+        "activation": "identity",
+        "experts": 64,
+        "groups": 64,
+        "k": 1408,
+        "n": 2048,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm2_sm107_e64_n2048_k1408_CONFIG_sm100_256x128x128_128x128x32_cluster2x1_2ctamma_swapAB_tma_c0fbbec4de56",
+      "launch": {
+        "tail": [
+          "output"
+        ]
+      },
+      "op": "grouped_gemm2",
+      "producer_revision": "c0fbbec4de56d9d8715587433a601d71cc703ca4",
+      "tactic": {
+        "cta_group": 2,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 256,
+          "n": 128
+        },
+        "scheduler": "clc",
+        "store_mode": "tma",
+        "swap_ab": true,
+        "template": "sm100_moe_grouped_matmul_fwd_swap_ab.py",
+        "tile": "CONFIG_sm100_256x128x128_128x128x32_cluster2x1_2ctamma_swapAB"
+      },
+      "workspace_bytes": 55424,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm2_sm107_e64_n2048_k1408_CONFIG_sm100_256x128x128_128x128x32_cluster2x1_2ctamma_swapAB_tma_c0fbbec4de56.py",
+        "sha256": "0eb66e58c2dbcabb4e742e9b03e1ea5bf95b8e5c700ae31b9dcd3e4d3a34addf"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm2_swap_ab_v1",
+      "arch": "sm_107a",
+      "contract": {
+        "activation": "identity",
+        "experts": 64,
+        "groups": 64,
+        "k": 1408,
+        "n": 2048,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm2_sm107_e64_n2048_k1408_CONFIG_sm100_256x16x128_128x16x32_cluster1x1_1ctamma_swapAB_tma_c0fbbec4de56",
+      "launch": {
+        "tail": [
+          "output"
+        ]
+      },
+      "op": "grouped_gemm2",
+      "producer_revision": "c0fbbec4de56d9d8715587433a601d71cc703ca4",
+      "tactic": {
+        "cta_group": 1,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 256,
+          "n": 16
+        },
+        "scheduler": "clc",
+        "store_mode": "tma",
+        "swap_ab": true,
+        "template": "sm100_moe_grouped_matmul_fwd_swap_ab.py",
+        "tile": "CONFIG_sm100_256x16x128_128x16x32_cluster1x1_1ctamma_swapAB"
+      },
+      "workspace_bytes": 55424,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm2_sm107_e64_n2048_k1408_CONFIG_sm100_256x16x128_128x16x32_cluster1x1_1ctamma_swapAB_tma_c0fbbec4de56.py",
+        "sha256": "c37cb9d2e113be07bb8321beaec7d0644b9b945a3b20a9b73a42219b8f9ba439"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm2_swap_ab_v1",
+      "arch": "sm_107a",
+      "contract": {
+        "activation": "identity",
+        "experts": 64,
+        "groups": 64,
+        "k": 1408,
+        "n": 2048,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm2_sm107_e64_n2048_k1408_CONFIG_sm100_256x32x128_128x32x32_cluster1x1_1ctamma_swapAB_tma_c0fbbec4de56",
+      "launch": {
+        "tail": [
+          "output"
+        ]
+      },
+      "op": "grouped_gemm2",
+      "producer_revision": "c0fbbec4de56d9d8715587433a601d71cc703ca4",
+      "tactic": {
+        "cta_group": 1,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 256,
+          "n": 32
+        },
+        "scheduler": "clc",
+        "store_mode": "tma",
+        "swap_ab": true,
+        "template": "sm100_moe_grouped_matmul_fwd_swap_ab.py",
+        "tile": "CONFIG_sm100_256x32x128_128x32x32_cluster1x1_1ctamma_swapAB"
+      },
+      "workspace_bytes": 55424,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm2_sm107_e64_n2048_k1408_CONFIG_sm100_256x32x128_128x32x32_cluster1x1_1ctamma_swapAB_tma_c0fbbec4de56.py",
+        "sha256": "e90f6a8f1bf81f21f462ba3449bd1078fd2101e448b06976b25a3637a571baf7"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm2_swap_ab_v1",
+      "arch": "sm_107a",
+      "contract": {
+        "activation": "identity",
+        "experts": 64,
+        "groups": 64,
+        "k": 1408,
+        "n": 2048,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm2_sm107_e64_n2048_k1408_CONFIG_sm100_256x64x128_128x64x32_cluster1x1_1ctamma_swapAB_tma_c0fbbec4de56",
+      "launch": {
+        "tail": [
+          "output"
+        ]
+      },
+      "op": "grouped_gemm2",
+      "producer_revision": "c0fbbec4de56d9d8715587433a601d71cc703ca4",
+      "tactic": {
+        "cta_group": 1,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 256,
+          "n": 64
+        },
+        "scheduler": "clc",
+        "store_mode": "tma",
+        "swap_ab": true,
+        "template": "sm100_moe_grouped_matmul_fwd_swap_ab.py",
+        "tile": "CONFIG_sm100_256x64x128_128x64x32_cluster1x1_1ctamma_swapAB"
+      },
+      "workspace_bytes": 55424,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm2_sm107_e64_n2048_k1408_CONFIG_sm100_256x64x128_128x64x32_cluster1x1_1ctamma_swapAB_tma_c0fbbec4de56.py",
+        "sha256": "55f0ff5cc7d939faf02428a6467c18fa58c5ad648486d364c82f28513bbef897"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm2_v1",
+      "arch": "sm_107a",
+      "contract": {
+        "activation": "identity",
+        "experts": 8,
+        "groups": 8,
+        "k": 256,
+        "n": 128,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm2_sm107_e8_n128_k256_CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_stg_c0fbbec4de56",
+      "launch": {
+        "tail": [
+          "output"
+        ]
+      },
+      "op": "grouped_gemm2",
+      "producer_revision": "c0fbbec4de56d9d8715587433a601d71cc703ca4",
+      "tactic": {
+        "cta_group": 1,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 128,
+          "n": 128
+        },
+        "scheduler": "clc",
+        "store_mode": "stg",
+        "swap_ab": false,
+        "template": "sm100_moe_grouped_matmul_fwd.py",
+        "tile": "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"
+      },
+      "workspace_bytes": 27776,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm2_sm107_e8_n128_k256_CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_stg_c0fbbec4de56.py",
+        "sha256": "f91d1972010425d1a0deca60524c22eefbfd7253343bd9c0c88b59bf5d2aa57d"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm2_v1",
+      "arch": "sm_107a",
+      "contract": {
+        "activation": "identity",
+        "experts": 8,
+        "groups": 8,
+        "k": 256,
+        "n": 128,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm2_sm107_e8_n128_k256_CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_tma_c0fbbec4de56",
+      "launch": {
+        "tail": [
+          "output"
+        ]
+      },
+      "op": "grouped_gemm2",
+      "producer_revision": "c0fbbec4de56d9d8715587433a601d71cc703ca4",
+      "tactic": {
+        "cta_group": 1,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 128,
+          "n": 128
+        },
+        "scheduler": "clc",
+        "store_mode": "tma",
+        "swap_ab": false,
+        "template": "sm100_moe_grouped_matmul_fwd.py",
+        "tile": "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"
+      },
+      "workspace_bytes": 55424,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm2_sm107_e8_n128_k256_CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_tma_c0fbbec4de56.py",
+        "sha256": "a52b2724b3b5cf3e6ab0c3cc1bc3c109a64e028827ecbbe630757c1d6ef2d611"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm2_swap_ab_v1",
+      "arch": "sm_107a",
+      "contract": {
+        "activation": "identity",
+        "experts": 8,
+        "groups": 8,
+        "k": 256,
+        "n": 128,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm2_sm107_e8_n128_k256_CONFIG_sm100_128x16x128_128x16x32_cluster1x1_1ctamma_swapAB_stg_c0fbbec4de56",
+      "launch": {
+        "tail": [
+          "output"
+        ]
+      },
+      "op": "grouped_gemm2",
+      "producer_revision": "c0fbbec4de56d9d8715587433a601d71cc703ca4",
+      "tactic": {
+        "cta_group": 1,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 128,
+          "n": 16
+        },
+        "scheduler": "clc",
+        "store_mode": "stg",
+        "swap_ab": true,
+        "template": "sm100_moe_grouped_matmul_fwd_swap_ab.py",
+        "tile": "CONFIG_sm100_128x16x128_128x16x32_cluster1x1_1ctamma_swapAB"
+      },
+      "workspace_bytes": 27776,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm2_sm107_e8_n128_k256_CONFIG_sm100_128x16x128_128x16x32_cluster1x1_1ctamma_swapAB_stg_c0fbbec4de56.py",
+        "sha256": "49126c99e20781c20f1039285b641c501d1c19d85f443cc4a12cb7eb27945be8"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm2_swap_ab_v1",
+      "arch": "sm_107a",
+      "contract": {
+        "activation": "identity",
+        "experts": 8,
+        "groups": 8,
+        "k": 256,
+        "n": 128,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm2_sm107_e8_n128_k256_CONFIG_sm100_128x16x128_128x16x32_cluster1x1_1ctamma_swapAB_tma_c0fbbec4de56",
+      "launch": {
+        "tail": [
+          "output"
+        ]
+      },
+      "op": "grouped_gemm2",
+      "producer_revision": "c0fbbec4de56d9d8715587433a601d71cc703ca4",
+      "tactic": {
+        "cta_group": 1,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 128,
+          "n": 16
+        },
+        "scheduler": "clc",
+        "store_mode": "tma",
+        "swap_ab": true,
+        "template": "sm100_moe_grouped_matmul_fwd_swap_ab.py",
+        "tile": "CONFIG_sm100_128x16x128_128x16x32_cluster1x1_1ctamma_swapAB"
+      },
+      "workspace_bytes": 55424,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm2_sm107_e8_n128_k256_CONFIG_sm100_128x16x128_128x16x32_cluster1x1_1ctamma_swapAB_tma_c0fbbec4de56.py",
+        "sha256": "4426172125786b5a99657103836d80356b3bcbb6a78b4dbf38dfc15442ff61fb"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm2_swap_ab_v1",
+      "arch": "sm_107a",
+      "contract": {
+        "activation": "identity",
+        "experts": 8,
+        "groups": 8,
+        "k": 14336,
+        "n": 4096,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm2_sm107_e8_n4096_k14336_CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma_swapAB_tma_c0fbbec4de56",
+      "launch": {
+        "tail": [
+          "output"
+        ]
+      },
+      "op": "grouped_gemm2",
+      "producer_revision": "c0fbbec4de56d9d8715587433a601d71cc703ca4",
+      "tactic": {
+        "cta_group": 2,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 128,
+          "n": 256
+        },
+        "scheduler": "clc",
+        "store_mode": "tma",
+        "swap_ab": true,
+        "template": "sm100_moe_grouped_matmul_fwd_swap_ab.py",
+        "tile": "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma_swapAB"
+      },
+      "workspace_bytes": 55424,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm2_sm107_e8_n4096_k14336_CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma_swapAB_tma_c0fbbec4de56.py",
+        "sha256": "6f282016b4fe30bd62bf56c3ec4c8bfe9fb06d1320c963c02cf93cddcd82123d"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm2_v1",
+      "arch": "sm_107a",
+      "contract": {
+        "activation": "identity",
+        "experts": 8,
+        "groups": 8,
+        "k": 14336,
+        "n": 4096,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm2_sm107_e8_n4096_k14336_CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma_tma_c0fbbec4de56",
+      "launch": {
+        "tail": [
+          "output"
+        ]
+      },
+      "op": "grouped_gemm2",
+      "producer_revision": "c0fbbec4de56d9d8715587433a601d71cc703ca4",
+      "tactic": {
+        "cta_group": 2,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 128,
+          "n": 256
+        },
+        "scheduler": "clc",
+        "store_mode": "tma",
+        "swap_ab": false,
+        "template": "sm100_moe_grouped_matmul_fwd.py",
+        "tile": "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma"
+      },
+      "workspace_bytes": 55424,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm2_sm107_e8_n4096_k14336_CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma_tma_c0fbbec4de56.py",
+        "sha256": "43428ed580c5c7bfaf291005b8c38e85caf97aa078b213451f55e89a0694c7cf"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm2_v1",
+      "arch": "sm_107a",
+      "contract": {
+        "activation": "identity",
+        "experts": 8,
+        "groups": 8,
+        "k": 14336,
+        "n": 4096,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm2_sm107_e8_n4096_k14336_CONFIG_sm100_128x256x128_128x256x32_cluster2x2_2ctamma_tma_c0fbbec4de56",
+      "launch": {
+        "tail": [
+          "output"
+        ]
+      },
+      "op": "grouped_gemm2",
+      "producer_revision": "c0fbbec4de56d9d8715587433a601d71cc703ca4",
+      "tactic": {
+        "cta_group": 2,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 128,
+          "n": 256
+        },
+        "scheduler": "clc",
+        "store_mode": "tma",
+        "swap_ab": false,
+        "template": "sm100_moe_grouped_matmul_fwd.py",
+        "tile": "CONFIG_sm100_128x256x128_128x256x32_cluster2x2_2ctamma"
+      },
+      "workspace_bytes": 52352,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm2_sm107_e8_n4096_k14336_CONFIG_sm100_128x256x128_128x256x32_cluster2x2_2ctamma_tma_c0fbbec4de56.py",
+        "sha256": "23a3b199848452d59ff08f4a955480bfab32e0db63b15c8bd5bc152ad44f7425"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm2_swap_ab_v1",
+      "arch": "sm_107a",
+      "contract": {
+        "activation": "identity",
+        "experts": 8,
+        "groups": 8,
+        "k": 14336,
+        "n": 4096,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm2_sm107_e8_n4096_k14336_CONFIG_sm100_128x8x128_128x8x32_cluster1x1_1ctamma_swapAB_stg_c0fbbec4de56",
+      "launch": {
+        "tail": [
+          "output"
+        ]
+      },
+      "op": "grouped_gemm2",
+      "producer_revision": "c0fbbec4de56d9d8715587433a601d71cc703ca4",
+      "tactic": {
+        "cta_group": 1,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 128,
+          "n": 8
+        },
+        "scheduler": "clc",
+        "store_mode": "stg",
+        "swap_ab": true,
+        "template": "sm100_moe_grouped_matmul_fwd_swap_ab.py",
+        "tile": "CONFIG_sm100_128x8x128_128x8x32_cluster1x1_1ctamma_swapAB"
+      },
+      "workspace_bytes": 27776,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm2_sm107_e8_n4096_k14336_CONFIG_sm100_128x8x128_128x8x32_cluster1x1_1ctamma_swapAB_stg_c0fbbec4de56.py",
+        "sha256": "f65c068e29c1e8776ebd72b8f7ca34265b95c408e1da49707d6e5f21171b571d"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm2_swap_ab_v1",
+      "arch": "sm_107a",
+      "contract": {
+        "activation": "identity",
+        "experts": 8,
+        "groups": 8,
+        "k": 14336,
+        "n": 4096,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm2_sm107_e8_n4096_k14336_CONFIG_sm100_256x128x128_128x128x32_cluster1x1_1ctamma_swapAB_tma_c0fbbec4de56",
+      "launch": {
+        "tail": [
+          "output"
+        ]
+      },
+      "op": "grouped_gemm2",
+      "producer_revision": "c0fbbec4de56d9d8715587433a601d71cc703ca4",
+      "tactic": {
+        "cta_group": 1,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 256,
+          "n": 128
+        },
+        "scheduler": "clc",
+        "store_mode": "tma",
+        "swap_ab": true,
+        "template": "sm100_moe_grouped_matmul_fwd_swap_ab.py",
+        "tile": "CONFIG_sm100_256x128x128_128x128x32_cluster1x1_1ctamma_swapAB"
+      },
+      "workspace_bytes": 55424,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm2_sm107_e8_n4096_k14336_CONFIG_sm100_256x128x128_128x128x32_cluster1x1_1ctamma_swapAB_tma_c0fbbec4de56.py",
+        "sha256": "3d1984633dc028b27796875964d3c0f896981ed779fa3c72e18af318c6b00b43"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm2_swap_ab_v1",
+      "arch": "sm_107a",
+      "contract": {
+        "activation": "identity",
+        "experts": 8,
+        "groups": 8,
+        "k": 14336,
+        "n": 4096,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm2_sm107_e8_n4096_k14336_CONFIG_sm100_256x128x128_128x128x32_cluster2x1_2ctamma_swapAB_stg_c0fbbec4de56",
+      "launch": {
+        "tail": [
+          "output"
+        ]
+      },
+      "op": "grouped_gemm2",
+      "producer_revision": "c0fbbec4de56d9d8715587433a601d71cc703ca4",
+      "tactic": {
+        "cta_group": 2,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 256,
+          "n": 128
+        },
+        "scheduler": "clc",
+        "store_mode": "stg",
+        "swap_ab": true,
+        "template": "sm100_moe_grouped_matmul_fwd_swap_ab.py",
+        "tile": "CONFIG_sm100_256x128x128_128x128x32_cluster2x1_2ctamma_swapAB"
+      },
+      "workspace_bytes": 27776,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm2_sm107_e8_n4096_k14336_CONFIG_sm100_256x128x128_128x128x32_cluster2x1_2ctamma_swapAB_stg_c0fbbec4de56.py",
+        "sha256": "e6f1e8bff44819cb1dac2905cac9646c697d405e884bf2d7989b9f67bc8b3b18"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm2_swap_ab_v1",
+      "arch": "sm_107a",
+      "contract": {
+        "activation": "identity",
+        "experts": 8,
+        "groups": 8,
+        "k": 14336,
+        "n": 4096,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm2_sm107_e8_n4096_k14336_CONFIG_sm100_256x128x128_128x128x32_cluster2x1_2ctamma_swapAB_tma_c0fbbec4de56",
+      "launch": {
+        "tail": [
+          "output"
+        ]
+      },
+      "op": "grouped_gemm2",
+      "producer_revision": "c0fbbec4de56d9d8715587433a601d71cc703ca4",
+      "tactic": {
+        "cta_group": 2,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 256,
+          "n": 128
+        },
+        "scheduler": "clc",
+        "store_mode": "tma",
+        "swap_ab": true,
+        "template": "sm100_moe_grouped_matmul_fwd_swap_ab.py",
+        "tile": "CONFIG_sm100_256x128x128_128x128x32_cluster2x1_2ctamma_swapAB"
+      },
+      "workspace_bytes": 55424,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm2_sm107_e8_n4096_k14336_CONFIG_sm100_256x128x128_128x128x32_cluster2x1_2ctamma_swapAB_tma_c0fbbec4de56.py",
+        "sha256": "0eb66e58c2dbcabb4e742e9b03e1ea5bf95b8e5c700ae31b9dcd3e4d3a34addf"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm2_swap_ab_v1",
+      "arch": "sm_107a",
+      "contract": {
+        "activation": "identity",
+        "experts": 8,
+        "groups": 8,
+        "k": 14336,
+        "n": 4096,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm2_sm107_e8_n4096_k14336_CONFIG_sm100_256x32x128_128x32x32_cluster1x1_1ctamma_swapAB_tma_c0fbbec4de56",
+      "launch": {
+        "tail": [
+          "output"
+        ]
+      },
+      "op": "grouped_gemm2",
+      "producer_revision": "c0fbbec4de56d9d8715587433a601d71cc703ca4",
+      "tactic": {
+        "cta_group": 1,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 256,
+          "n": 32
+        },
+        "scheduler": "clc",
+        "store_mode": "tma",
+        "swap_ab": true,
+        "template": "sm100_moe_grouped_matmul_fwd_swap_ab.py",
+        "tile": "CONFIG_sm100_256x32x128_128x32x32_cluster1x1_1ctamma_swapAB"
+      },
+      "workspace_bytes": 55424,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm2_sm107_e8_n4096_k14336_CONFIG_sm100_256x32x128_128x32x32_cluster1x1_1ctamma_swapAB_tma_c0fbbec4de56.py",
+        "sha256": "e90f6a8f1bf81f21f462ba3449bd1078fd2101e448b06976b25a3637a571baf7"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm2_swap_ab_v1",
+      "arch": "sm_107a",
+      "contract": {
+        "activation": "identity",
+        "experts": 8,
+        "groups": 8,
+        "k": 14336,
+        "n": 4096,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_gemm2_sm107_e8_n4096_k14336_CONFIG_sm100_256x64x128_128x64x32_cluster1x1_1ctamma_swapAB_tma_c0fbbec4de56",
+      "launch": {
+        "tail": [
+          "output"
+        ]
+      },
+      "op": "grouped_gemm2",
+      "producer_revision": "c0fbbec4de56d9d8715587433a601d71cc703ca4",
+      "tactic": {
+        "cta_group": 1,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 256,
+          "n": 64
+        },
+        "scheduler": "clc",
+        "store_mode": "tma",
+        "swap_ab": true,
+        "template": "sm100_moe_grouped_matmul_fwd_swap_ab.py",
+        "tile": "CONFIG_sm100_256x64x128_128x64x32_cluster1x1_1ctamma_swapAB"
+      },
+      "workspace_bytes": 55424,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_gemm2_sm107_e8_n4096_k14336_CONFIG_sm100_256x64x128_128x64x32_cluster1x1_1ctamma_swapAB_tma_c0fbbec4de56.py",
+        "sha256": "55f0ff5cc7d939faf02428a6467c18fa58c5ad648486d364c82f28513bbef897"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm1_swiglu_v1",
+      "arch": "sm_100a",
+      "contract": {
+        "activation": "silu(gate) * up",
+        "experts": 12,
+        "groups": 12,
+        "k": 7168,
+        "n": 3072,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_swiglu_sm_100a_e12_n3072_k7168_g12_CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_1cta_clc_stg",
+      "launch": {
+        "tail": [
+          "output",
+          "scale"
+        ]
+      },
+      "op": "grouped_gemm1_swiglu",
+      "producer_revision": "6f539860d6e737c59004c1fc3c1c02b2fe25b64e",
+      "tactic": {
+        "cta_group": 1,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 128,
+          "n": 128
+        },
+        "scheduler": "clc",
+        "store_mode": "stg",
+        "template": "sm100_moe_grouped_matmul_fwd.py",
+        "tile": "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"
+      },
+      "workspace_bytes": 19072,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_swiglu_sm_100a_e12_n3072_k7168_g12_CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_1cta_clc_stg.py",
+        "sha256": "cf6a7e8d579fb8df05e6a46700c2b5ad71446f6aa309a7baba9243362fc71227"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm1_swiglu_v1",
+      "arch": "sm_100a",
+      "contract": {
+        "activation": "silu(gate) * up",
+        "experts": 12,
+        "groups": 12,
+        "k": 7168,
+        "n": 3072,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_swiglu_sm_100a_e12_n3072_k7168_g12_CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_1cta_clc_tma",
+      "launch": {
+        "tail": [
+          "scale",
+          "output"
+        ]
+      },
+      "op": "grouped_gemm1_swiglu",
+      "producer_revision": "6f539860d6e737c59004c1fc3c1c02b2fe25b64e",
+      "tactic": {
+        "cta_group": 1,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 128,
+          "n": 128
+        },
+        "scheduler": "clc",
+        "store_mode": "tma",
+        "template": "sm100_moe_grouped_matmul_fwd.py",
+        "tile": "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"
+      },
+      "workspace_bytes": 38016,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_swiglu_sm_100a_e12_n3072_k7168_g12_CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_1cta_clc_tma.py",
+        "sha256": "0eea52e9e037b1cd972b0d7a773ccb2ce0b7c700b2f67029758bf18ec8ec514a"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm1_swiglu_v1",
+      "arch": "sm_100a",
+      "contract": {
+        "activation": "silu(gate) * up",
+        "experts": 12,
+        "groups": 12,
+        "k": 7168,
+        "n": 3072,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_swiglu_sm_100a_e12_n3072_k7168_g12_CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma_2cta_clc_stg",
+      "launch": {
+        "tail": [
+          "output",
+          "scale"
+        ]
+      },
+      "op": "grouped_gemm1_swiglu",
+      "producer_revision": "6f539860d6e737c59004c1fc3c1c02b2fe25b64e",
+      "tactic": {
+        "cta_group": 2,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 128,
+          "n": 256
+        },
+        "scheduler": "clc",
+        "store_mode": "stg",
+        "template": "sm100_moe_grouped_matmul_fwd.py",
+        "tile": "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma"
+      },
+      "workspace_bytes": 19072,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_swiglu_sm_100a_e12_n3072_k7168_g12_CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma_2cta_clc_stg.py",
+        "sha256": "4621d12ebca14841953171e37796e41f787e38d3a60eb131b63b3fbd4d48fb09"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm1_swiglu_v1",
+      "arch": "sm_100a",
+      "contract": {
+        "activation": "silu(gate) * up",
+        "experts": 12,
+        "groups": 12,
+        "k": 7168,
+        "n": 3072,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_swiglu_sm_100a_e12_n3072_k7168_g12_CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma_2cta_clc_tma",
+      "launch": {
+        "tail": [
+          "scale",
+          "output"
+        ]
+      },
+      "op": "grouped_gemm1_swiglu",
+      "producer_revision": "6f539860d6e737c59004c1fc3c1c02b2fe25b64e",
+      "tactic": {
+        "cta_group": 2,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 128,
+          "n": 256
+        },
+        "scheduler": "clc",
+        "store_mode": "tma",
+        "template": "sm100_moe_grouped_matmul_fwd.py",
+        "tile": "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma"
+      },
+      "workspace_bytes": 38016,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_swiglu_sm_100a_e12_n3072_k7168_g12_CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma_2cta_clc_tma.py",
+        "sha256": "3c041111367bc9270af75c6bfe574589df99d261dc43de7c989c4c05ac9214ec"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm1_swiglu_v1",
+      "arch": "sm_100a",
+      "contract": {
+        "activation": "silu(gate) * up",
+        "experts": 8,
+        "groups": 8,
+        "k": 128,
+        "n": 256,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_swiglu_sm_100a_e8_n256_k128_g8_CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_1cta_clc",
+      "launch": {
+        "tail": [
+          "scale",
+          "output"
+        ]
+      },
+      "op": "grouped_gemm1_swiglu",
+      "producer_revision": "6f539860d6e737c59004c1fc3c1c02b2fe25b64e",
+      "tactic": {
+        "cta_group": 1,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 128,
+          "n": 128
+        },
+        "scheduler": "clc",
+        "template": "sm100_moe_grouped_matmul_fwd.py",
+        "tile": "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma"
+      },
+      "workspace_bytes": 38016,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_swiglu_sm_100a_e8_n256_k128_g8_CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_1cta_clc.py",
+        "sha256": "0eea52e9e037b1cd972b0d7a773ccb2ce0b7c700b2f67029758bf18ec8ec514a"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm1_swiglu_v1",
+      "arch": "sm_100a",
+      "contract": {
+        "activation": "silu(gate) * up",
+        "experts": 8,
+        "groups": 8,
+        "k": 128,
+        "n": 256,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_swiglu_sm_100a_e8_n256_k128_g8_CONFIG_sm100_128x128x128_128x128x32_cluster2x1_2ctamma_2cta_clc",
+      "launch": {
+        "tail": [
+          "scale",
+          "output"
+        ]
+      },
+      "op": "grouped_gemm1_swiglu",
+      "producer_revision": "6f539860d6e737c59004c1fc3c1c02b2fe25b64e",
+      "tactic": {
+        "cta_group": 2,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 128,
+          "n": 128
+        },
+        "scheduler": "clc",
+        "template": "sm100_moe_grouped_matmul_fwd.py",
+        "tile": "CONFIG_sm100_128x128x128_128x128x32_cluster2x1_2ctamma"
+      },
+      "workspace_bytes": 38016,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_swiglu_sm_100a_e8_n256_k128_g8_CONFIG_sm100_128x128x128_128x128x32_cluster2x1_2ctamma_2cta_clc.py",
+        "sha256": "0181ce2975aff864dcfb90e59f70d3bbd6062b41aa834bcf21f10b467f1174a7"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm1_swiglu_v1",
+      "arch": "sm_100a",
+      "contract": {
+        "activation": "silu(gate) * up",
+        "experts": 8,
+        "groups": 8,
+        "k": 128,
+        "n": 256,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_swiglu_sm_100a_e8_n256_k128_g8_CONFIG_sm100_128x128x64_128x128x32_cluster2x1_2ctamma_2cta_clc",
+      "launch": {
+        "tail": [
+          "scale",
+          "output"
+        ]
+      },
+      "op": "grouped_gemm1_swiglu",
+      "producer_revision": "6f539860d6e737c59004c1fc3c1c02b2fe25b64e",
+      "tactic": {
+        "cta_group": 2,
+        "cta_tile": {
+          "k_bytes": 64,
+          "m": 128,
+          "n": 128
+        },
+        "scheduler": "clc",
+        "template": "sm100_moe_grouped_matmul_fwd.py",
+        "tile": "CONFIG_sm100_128x128x64_128x128x32_cluster2x1_2ctamma"
+      },
+      "workspace_bytes": 38016,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_swiglu_sm_100a_e8_n256_k128_g8_CONFIG_sm100_128x128x64_128x128x32_cluster2x1_2ctamma_2cta_clc.py",
+        "sha256": "e7844da71aa711166b4afe3728f516653a9ef75f4a3f1204a0f819e66436a532"
+      }
+    },
+    {
+      "abi": "cudnn_frost_grouped_gemm1_swiglu_v1",
+      "arch": "sm_100a",
+      "contract": {
+        "activation": "silu(gate) * up",
+        "experts": 8,
+        "groups": 8,
+        "k": 128,
+        "n": 256,
+        "output_dtype": "bfloat16",
+        "s": {
+          "min": 1
+        },
+        "token_dtype": "bfloat16",
+        "weight_dtype": "bfloat16"
+      },
+      "id": "grouped_swiglu_sm_100a_e8_n256_k128_g8_CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma_2cta_clc",
+      "launch": {
+        "tail": [
+          "scale",
+          "output"
+        ]
+      },
+      "op": "grouped_gemm1_swiglu",
+      "producer_revision": "6f539860d6e737c59004c1fc3c1c02b2fe25b64e",
+      "tactic": {
+        "cta_group": 2,
+        "cta_tile": {
+          "k_bytes": 128,
+          "m": 128,
+          "n": 256
+        },
+        "scheduler": "clc",
+        "template": "sm100_moe_grouped_matmul_fwd.py",
+        "tile": "CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma"
+      },
+      "workspace_bytes": 38016,
+      "source": {
+        "path": "sources/cudnn_frost_grouped_swiglu_sm_100a_e8_n256_k128_g8_CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma_2cta_clc.py",
+        "sha256": "3c041111367bc9270af75c6bfe574589df99d261dc43de7c989c4c05ac9214ec"
+      }
+    }
+  ],
+  "producer": {
+    "name": "cudnn_frost"
+  },
+  "schema_version": 2
+}
