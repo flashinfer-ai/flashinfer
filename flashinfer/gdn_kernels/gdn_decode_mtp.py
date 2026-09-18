@@ -2976,7 +2976,7 @@ def run_mtp_decode(
         and output_writeback is None
         and h0_source.dtype == torch.float32
         and initial_state_indices.dtype == torch.int32
-        and T in (4, 8)
+        and 4 <= T <= 8
         and K == 128
         and V == 128
         and HV % 2 == 0

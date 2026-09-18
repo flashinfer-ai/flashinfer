@@ -33,13 +33,16 @@ The next verify overwrites the raw windows; no circular cache or deferred
 state update is retained between rounds. Use identical Q/K normalization
 settings for verify and commit.
 
-The tcgen05 verify specialization uses TMA and TF32 tensor cores for T=4/8,
+The tcgen05 verify specialization uses TMA and TF32 tensor cores for T=4..8,
 B=1..256, BF16 output, int32 indices, contiguous FP32 checkpoints, normalized
 Q/K and an even value-head/key-head ratio. Other supported SM100 inputs use
 the FP32 MTP fallback. TF32 contraction changes numerical reduction precision.
 See the API docstrings for shape, index uniqueness, padding and optional
 tracked-checkpoint contracts.
 
-Commit defaults to ``backend="auto"``: normalized T=8 without tracking uses
-tcgen05; other cases use SIMT. Specify ``backend="simt"`` to keep FP32
+Commit defaults to ``backend="auto"``. With normalized K and no tracking,
+T=8 uses tcgen05; T=6/7 uses tcgen05 when B>1 and ``layers * B * HV >= 256``.
+Other cases use SIMT. Explicit ``backend="tcgen05"`` supports T=4..8.
+The heuristic uses tensor metadata, not device-resident accepted lengths;
+short accepted prefixes may favor ``backend="simt"``. SIMT also retains FP32
 contractions when checkpoint accuracy is preferred over tensor-core throughput.

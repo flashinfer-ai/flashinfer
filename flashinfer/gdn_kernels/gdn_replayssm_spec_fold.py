@@ -480,12 +480,21 @@ def commit_gdn_replayssm_fold_all_layers(
         if tensor.data_ptr() % 16:
             raise ValueError(f"{name} must have a 16-byte aligned base address")
 
-    supports_tcgen = max_cache_len == 8 and use_qk_l2norm_in_kernel and not has_track
+    supports_tcgen = (
+        4 <= max_cache_len <= 8 and use_qk_l2norm_in_kernel and not has_track
+    )
     if backend == "tcgen05" and not supports_tcgen:
-        raise ValueError("tcgen05 commit requires normalized T=8 without tracking")
+        raise ValueError("tcgen05 commit requires normalized T=4..8 without tracking")
     if B == 0:
         return
-    if supports_tcgen and backend != "simt":
+    # Short windows and small grids do not amortize the tensor-core setup.
+    # Select from metadata only: accepted lengths stay device-resident.
+    prefer_tcgen = max_cache_len == 8 or (
+        max_cache_len in (6, 7) and B > 1 and num_layers * B * HV >= 256
+    )
+    if supports_tcgen and (
+        backend == "tcgen05" or (backend == "auto" and prefer_tcgen)
+    ):
         from .gdn_replayssm_spec_fold_tcgen import run_replayssm_fold_tcgen
 
         run_replayssm_fold_tcgen(

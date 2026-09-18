@@ -207,7 +207,7 @@ def gdn_verify_kernel_mtp_replayssm_tcgen(
     t_ct_acc0 = cute.make_tensor(tmem_ptr, t_ct_acc_fake.layout)
     t_ct_acc1 = cute.make_tensor(tmem_ptr + N, t_ct_acc_fake.layout)
 
-    # Load exactly the live 2*T columns for one V row (x8 for T4, x16 for T8).
+    # Load one padded operand tile per V row (x8 for T=4, x16 for T=5..8).
     if cutlass.const_expr(N == 8):
         tmem_atom = cute.make_copy_atom(tcgen05.Ld32x32bOp(tcgen05.Repetition.x8), _ACC)
     else:
@@ -240,6 +240,12 @@ def gdn_verify_kernel_mtp_replayssm_tcgen(
                 t_ss_state[(None, empty.index)],
                 tma_bar_ptr=empty.barrier,
             )
+
+    # Zero unused MMA columns for partial tiles without reading padded tokens.
+    if cutlass.const_expr(4 < T < 8):
+        if tidx < _M:
+            for column in cutlass.range_constexpr(2 * T, N):
+                s_operand_logical[(column, tidx % _K_TILE, tidx // _K_TILE)] = 0.0
 
     # Phase 1: one of the eight warps owns each timestep.  Q/K are shared by
     # both adjacent HV heads; V and gate metadata remain head-specific.
@@ -344,7 +350,7 @@ def gdn_verify_kernel_mtp_replayssm_tcgen(
         gram_c0_acc = gram_mma.make_fragment_C(gram_mma.partition_shape_C((16, 8)))
         gram_c0_acc.fill(0.0)
 
-        if cutlass.const_expr(T == 8):
+        if cutlass.const_expr(N == 16):
             gram_b1 = cute.local_tile(operand_full, (8, 128), (1, 0))
             gram_b1_src = gram_thr_b.partition_S(gram_b1)
             gram_b1_f32 = cute.make_rmem_tensor_like(
@@ -375,7 +381,7 @@ def gdn_verify_kernel_mtp_replayssm_tcgen(
                     gram_b0_tf32[None, None, global_k_tile],
                     gram_c0_acc,
                 )
-                if cutlass.const_expr(T == 8):
+                if cutlass.const_expr(N == 16):
                     cute.gemm(
                         gram_mma,
                         gram_c1_acc,
@@ -384,7 +390,7 @@ def gdn_verify_kernel_mtp_replayssm_tcgen(
                         gram_c1_acc,
                     )
         cute.copy(gram_copy_c, gram_thr_c.retile(gram_c0_acc), gram_c0_dst)
-        if cutlass.const_expr(T == 8):
+        if cutlass.const_expr(N == 16):
             cute.copy(gram_copy_c, gram_thr_c.retile(gram_c1_acc), gram_c1_dst)
 
     # Refill the same two-stage state pipeline with the adjacent HV head while

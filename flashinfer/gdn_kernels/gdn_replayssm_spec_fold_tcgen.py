@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-"""SM100 tcgen05 specialization for normalized ReplaySSM T=8 commit.
+"""SM100 tcgen05 specialization for normalized ReplaySSM T=4..8 commit.
 
 The checkpoint streams through two half-width shared-memory stages while
 tcgen05 computes all eight ``S0 @ k_t`` vectors.  One thread then owns each V
@@ -280,8 +280,12 @@ def _gdn_replayssm_fold_tcgen_kernel(
             k_local = k_idx % _K_TILE
             s_operand_logical[(i_t, k_local, stage)] = normalized
         if lane == 0:
-            s_decay[i_t] = cute.exp(log_g[(flat_slot, i_hv, i_t)], fastmath=True)
-            s_beta[i_t] = beta[(flat_slot, i_hv, i_t)]
+            # The rank-eight MMA tile may be wider than the logical cache.
+            s_decay[i_t] = 1.0
+            s_beta[i_t] = 0.0
+            if i_t < rawk.shape[2]:
+                s_decay[i_t] = cute.exp(log_g[(flat_slot, i_hv, i_t)], fastmath=True)
+                s_beta[i_t] = beta[(flat_slot, i_hv, i_t)]
 
     # Publish scalar SMEM stores to the asynchronous MMA proxy.
     cute.arch.fence_view_async_shared()
@@ -498,17 +502,18 @@ def run_replayssm_fold_tcgen(
     *,
     null_block_id: int = -1,
 ) -> None:
-    """Launch normalized T=8 commit after the common entry validates inputs."""
+    """Launch normalized T=4..8 commit after the common entry validates inputs."""
     num_layers, num_slots, HV, _, _ = checkpoint_state.shape
     H = rawk_cache.shape[2]
+    cache_len = rawk_cache.shape[3]
     B = ssm_state_indices.shape[0]
     target = gdn_device_target(checkpoint_state.device)
     flat_slots = num_layers * num_slots
     state = checkpoint_state.view(flat_slots, HV, _D, _D)
-    rawv = rawv_cache.view(flat_slots, HV, _T, _D)
-    rawk = rawk_cache.view(flat_slots, H, _T, _D)
-    log_g = g_cache.view(flat_slots, HV, _T)
-    beta = beta_cache.view(flat_slots, HV, _T)
+    rawv = rawv_cache.view(flat_slots, HV, cache_len, _D)
+    rawk = rawk_cache.view(flat_slots, H, cache_len, _D)
+    log_g = g_cache.view(flat_slots, HV, cache_len)
+    beta = beta_cache.view(flat_slots, HV, cache_len)
     use_packed = B > 1
     key = (
         target.compile_key,
@@ -517,6 +522,7 @@ def run_replayssm_fold_tcgen(
         HV,
         int(null_block_id),
         use_packed,
+        cache_len,
     )
     cache = _CACHE.setdefault(key, {})
     stream = cuda.CUstream(

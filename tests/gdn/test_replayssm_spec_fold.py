@@ -120,6 +120,14 @@ def _offset_copy(tensor, offset):
         (257, 4, 1, 2, "default"),
         (2, 3, 2, 8, "default"),
         (17, 5, 2, 8, "default"),
+        (1, 5, 2, 8, "default"),
+        (1, 6, 2, 8, "default"),
+        (1, 7, 2, 8, "default"),
+        (17, 6, 2, 8, "default"),
+        (17, 7, 2, 8, "default"),
+        (17, 7, 2, 8, "all_padding"),
+        (17, 6, 2, 8, "inner_strided"),
+        (17, 7, 2, 8, "strided_bias"),
         (2, 16, 2, 8, "default"),
         (2, 8, 2, 8, "unnormalized"),
         (17, 4, 2, 8, "unnormalized"),
@@ -236,14 +244,14 @@ def test_replayssm_verify(batch, steps, heads, hv, variant):
         )
 
 
-@pytest.mark.parametrize("steps", [4, 8])
+@pytest.mark.parametrize("steps", [4, 5, 6, 7, 8])
 @pytest.mark.parametrize(
     "normalize,track", [(True, False), (True, True), (False, True)]
 )
 @pytest.mark.parametrize("tcgen", [False, True])
 def test_replayssm_verify_commit_cycles(steps, normalize, track, tcgen):
-    if tcgen and (steps != 8 or not normalize or track):
-        pytest.skip("tcgen commit specializes normalized T=8 without tracking")
+    if tcgen and (not normalize or track):
+        pytest.skip("tcgen commit requires normalization without tracking")
     batch = steps + 3
     args, cache = _inputs(batch, steps)
     args["use_qk_l2norm"] = normalize
@@ -325,10 +333,12 @@ def test_replayssm_verify_commit_cycles(steps, normalize, track, tcgen):
         )
 
 
-@pytest.mark.parametrize("accept", [1, 6, 8])
+@pytest.mark.parametrize(
+    "steps,accept", [(t, a) for t in (4, 5, 6, 7, 8) for a in (1, t - 1, t)]
+)
 @pytest.mark.parametrize("backend", ["auto", "simt", "tcgen05"])
-def test_replayssm_single_request_commit(accept, backend):
-    args, cache = _inputs(batch=1, steps=8)
+def test_replayssm_single_request_commit(steps, accept, backend):
+    args, cache = _inputs(batch=1, steps=steps)
     # Nonzero storage offsets are valid when the resulting pointers are aligned.
     args["initial_state"] = _offset_copy(args["initial_state"], 4)
     cache["replayssm_rawk"] = _offset_copy(cache["replayssm_rawk"], 8)
@@ -555,3 +565,52 @@ def test_replayssm_rejects_other_architectures(monkeypatch):
     )
     with pytest.raises(ValueError, match="SM100/SM103"):
         gated_delta_rule_mtp(**args, cache_replayssm=True, **cache)
+
+
+@pytest.mark.parametrize(
+    "steps,layers,batch,hv,backend,expected",
+    [
+        (4, 4, 8, 32, "auto", "simt"),
+        (5, 4, 8, 32, "auto", "simt"),
+        (5, 1, 1, 8, "tcgen05", "tcgen05"),
+        (6, 1, 7, 32, "auto", "simt"),
+        (6, 1, 8, 32, "auto", "tcgen05"),
+        (6, 4, 2, 32, "auto", "tcgen05"),
+        (6, 4, 2, 8, "auto", "simt"),
+        (7, 1, 7, 32, "auto", "simt"),
+        (7, 1, 8, 32, "auto", "tcgen05"),
+        (7, 4, 1, 64, "auto", "simt"),
+        (7, 4, 8, 32, "simt", "simt"),
+        (8, 1, 1, 8, "auto", "tcgen05"),
+        (9, 4, 8, 32, "auto", "simt"),
+    ],
+)
+def test_replayssm_commit_dispatch(
+    steps, layers, batch, hv, backend, expected, monkeypatch
+):
+    from flashinfer.gdn_kernels import gdn_replayssm_spec_fold as simt
+    from flashinfer.gdn_kernels import gdn_replayssm_spec_fold_tcgen as tcgen
+    from flashinfer.trace.templates.gdn import gdn_replayssm_commit_trace
+
+    args = gdn_replayssm_commit_trace.init(
+        batch_size=batch,
+        pool_size=batch,
+        num_layers=layers,
+        num_v_heads=hv,
+        seq_len=steps,
+    )
+    selected = []
+    # Test dispatch independently of compilation and numerical checks above.
+    monkeypatch.setattr(simt, "_CACHE", {})
+    monkeypatch.setattr(
+        simt,
+        "build_and_load_cute_dsl_kernel",
+        lambda *args, **kwargs: lambda *args: selected.append("simt"),
+    )
+    monkeypatch.setattr(
+        tcgen,
+        "run_replayssm_fold_tcgen",
+        lambda *args, **kwargs: selected.append("tcgen05"),
+    )
+    gated_delta_rule_replayssm_commit(**args, backend=backend)
+    assert selected == [expected]
