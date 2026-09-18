@@ -1,3 +1,47 @@
+## B200 comparison including both PDL settings — 2026-09-17
+
+The completed exhaustive native comparison changes the size of the remaining
+B200 gap. On one 1000W B200 (148 SMs), synthetic BF16 E128/top8/H2048/I768,
+UnpackedPrecomputed routing and fixed CPU input bytes:
+
+| Tokens | Frost | TRT-LLM | Frost higher latency | Native winner (PDL, FC1, FC2) |
+|---|---:|---:|---:|---|
+| 1 | 29.498000 us | 25.822125 us | 14.235% | on, 16, 20 |
+| 8 | 115.135375 us | 96.579125 us | 19.214% | on, 8, 17 |
+| 64 | 206.553750 us | 195.895250 us | 5.441% | on, 8, 63 |
+
+Each shape searches all 704 exported joint configurations across PDL off/on.
+All execute successfully. Each selected route passes normal execution,
+memcheck and racecheck before four fresh ABBA processes with cold-L2 CUPTI.
+Audit2069 independently checks15,255 raw passing comparisons,10,968 negative
+controls and104,112 spans, including the search. Captured graph attributes,
+kernel names and native binary hashes prove the selected PDL path. Both weight
+preparations are outside timing; the CPU TRT preparation is checked byte for
+byte against its GPU helper. No candidate is dropped after a timing failure.
+
+Frost uses paired FC1 at all three sizes, paired FC2 at T1, and the previously
+selected ordinary static128x128 FC2 at T8/T64. This is not a fresh Frost sweep.
+The frozen T1 FC1 predates the small-row scheduler published below; T8/T64
+execute the same current generic path. Neither the small-row gain nor pending
+finalizer gains are added to these separately measured comparison numbers.
+
+Timeline2086 points to FC2 as the main remaining T8 opportunity: the interval
+from FC1 completion to FC2 completion is41.049 us for Frost versus24.178 us for
+TRT, while FC1 intervals are68.017 versus66.415 us. At T1 those FC2 completion
+tails are8.282 versus5.896 us. PDL kernel intervals include dependency waits;
+they are not isolated compute costs and must not be summed across overlap.
+This attribution motivates FC2 work; it does not establish a performance roof.
+
+This supersedes the pending B200 status and older PDL-off-only comparison
+below. It is complete operator evidence, not model inference or a new kernel
+speedup from configuration search. The SM120 result retains its separate GPU,
+packed-routing and fixture scope. Native consumer-PDL/top8 composition remains
+an unpublished experiment until its direct public-baseline check completes.
+
+Credit: NVIDIA TensorRT-LLM supplies the native kernels, weight preparation and
+PDL implementation. Frost retains NVIDIA, KF624/2f5c, Yanqin PR1090/CUTLASS113,
+Yanqin/Yihua and KF small-row scheduling credits documented below.
+
 ## SM120 comparison including both PDL settings — 2026-09-17
 
 On RTX PRO 6000 Blackwell Server (188 SMs, 600W), BF16 T1/E128/top8/H2048/I768,
