@@ -1,3 +1,77 @@
+## Latest validated configuration and interface results — 2026-09-17
+
+On RTX PRO 6000 Blackwell Server (188 SMs, 600W), synthetic BF16
+T1/E128/top8/H2048/I768 with PackedPrecomputed routing, Frost measures
+**82.794563 us** versus **87.114375 us** for the freshly selected CUTLASS
+backend winner: **4.959% lower complete-MoE latency** (audit2120). This is a
+direct same-card comparison, not a sum of gains from different experiments.
+Both weight preparations are outside timing; the fixed CPU fixture and
+actual loaded sources, generated kernels and binary hashes are recorded.
+
+Frost uses the existing ordinary engine20400 for both stages: FC1 tile
+`CONFIG_sm120_16x64x128_16x16x32_cluster1x1_warps1x4`, FC2 tile
+`CONFIG_sm120_32x128x128_16x16x32_cluster1x1_warps1x8`, with public
+`SCHED_POLICY=1` for both. Relative to the preceding SM120 comparison, only
+FC2's scheduler configuration changes from dynamic to static. No kernel code
+or global dispatch default changes in this update. Separate fixed-geometry
+ablation2099 measures84.440625->82.884375 us packed (1.843% lower) and
+84.368500->82.876500 us unpacked (1.768% lower), with bitwise cross-arm outputs.
+These are configuration benefits, not new kernel implementation speedups.
+
+The competitor search covers all128 exported joint (PDL off/on, FC1, FC2)
+configurations:96 execute;32 remain explicit prelaunch zero-occupancy rejects.
+Winner PDL-on/(1,11) passes normal, memcheck and racecheck before four fresh
+ABBA processes using cold-L2 CUPTI spans. Independent audit2120 reconstructs
+829 passing raw comparisons,616 negative controls and5520 spans. The fixed
+Frost geometry is source-matched to ablation2099. The exact frozen FI runtime
+predates the later SM100-only native finalizer change; its separate SM120 API
+regression is reported below, not presented as a full-MoE retest of a new build.
+
+Timeline2133 helps direct further work:
+
+| Interval | Frost | CUTLASS |
+|---|---:|---:|
+| Before FC1 | 2.254 us | 5.120 us |
+| FC1 kernel interval | 52.532 us | 51.416 us |
+| Between FC1 and FC2 | 0.380 us | 0.116 us |
+| FC2 kernel interval | 25.552 us | 26.020 us |
+| After FC2 through final output | 2.018 us | 4.384 us |
+
+Frost has4kernel launches versus5. The largest advantages are routing and
+finalization; FC1 remains slower. These averages of per-field medians are
+not strictly additive. PDL kernel intervals can include dependency waits,
+so they are not isolated compute costs. There is no performance-roof claim.
+
+The published native-finalizer helper now also passes its separate SM120
+regression (audit2110):105zero-skip tests across normal/memcheck/racecheck,
+including60PDL-off live-capture executions,18expected unsupported-PDL
+rejections and27invalid-metadata rejections. SM120 default PDL stays disabled.
+This closes the pending SM120 regression statement in the previous update.
+
+On B200 (148 SMs, 1000W), the unpublished expansion of existing paired FC2
+admission beyond8routed rows has passed the complete T8 subexperiment:
+115.871625->103.140125 us unpacked (10.988% lower), and
+115.879500->103.183750 us packed (10.956% lower), audit2127. Each route passes
+normal/memcheck/racecheck, retained and legacy captures, live inputs and both
+weights, bitwise cross-arm agreement, and four fresh ABBA processes;296raw
+comparisons,120negative controls,768spans total. The FC2 completion tail falls
+40.924->28.272 us, while FC1 stays about69 us. This is an interface/admission
+benefit from an existing kernel, not a newly optimized kernel. T64 and a fresh
+strongest-TRT T8 comparison are still pending, so no broader adoption or
+competitor speedup is claimed. The separate FC2 small-row scheduler code
+candidate also remains unpublished pending complete-MoE validation.
+
+Credit: NVIDIA Frost supplies the configurable GEMMs/scheduler; NVIDIA
+TRT-LLM/CUTLASS and FlashInfer supply the competing kernels, routing and
+finalization. Paired FC2 retains KF624/2f5c contributions and
+YanqinPR1090/CUTLASS113 guidance; small-row work builds on KFf19299. Yanqin
+and Yihua's contributions and the other specific credits below remain.
+All results here are synthetic model-shaped operator measurements, not
+checkpoint inference, model E2E, broad CI or all-shape superiority.
+
+Earlier sections below are timestamped historical measurements and states.
+This update supersedes their SM120 comparison and pending-regression status.
+
 ## Packed decode finalizer composition — 2026-09-17
 
 For SM100-family BF16 packed T1/H2048/top8, the FI cuDNN runner now enables
@@ -33,7 +107,7 @@ PDL cases; the candidate passes35tests in each normal/memcheck/racecheck mode,
 zero skips (audit2103). That regression proof covers the exact runtime used by
 audit2080. Python ASTs and CUDA token streams of the formatted public files
 match those GPU-tested sources. SM120 runner dispatch remains PDL-disabled;
-the new helper binary has not yet received a separate SM120 regression run.
+the separate SM120 helper regression subsequently passed (audit2110, above).
 No broad architecture CI or all-shape speedup is claimed.
 
 Why this composition: the prior top8-only ablation on an already-PDL baseline
