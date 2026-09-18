@@ -173,7 +173,7 @@ _DECODE_DOTS3_SWA_DISPATCH = _DecodeDispatchEnvelope(513)
 # Calibration/documented topk values per family (the crossover sweep points).
 # Any width >= min_topk above is served; these are the values with measured
 # crossover data.
-_DECODE_DSV4_TOPKS = frozenset({128, 192, 256, 512, 1024})
+_DECODE_DSV4_TOPKS = frozenset({128, 192, 256, 512, 1024, 1152})
 _DECODE_DSV3_2_TOPKS = frozenset({128, 512, 1024, 2048})
 _DECODE_GLM53_NOPE_TOPK = 2176
 _DECODE_DOTS3_SWA_TOPK = 576
