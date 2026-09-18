@@ -1,3 +1,57 @@
+## Paired FC2 admission extended to 513 routed rows — 2026-09-17
+
+The SM100 paired BF16 projection engine20402 now accepts1–513 total routed
+rows, so FlashInfer can select it for T8/top8 and T64/top8 as well as T1.
+The canonical weight layout, stride/alignment checks, public knobs, caller
+workspace and stream contracts are unchanged. The executable kernel is
+unchanged; this extends access to its existing persistent multiwave path.
+Ordinary engine20400 remains an eligible alternative; enumeration is not a
+performance ranking and no universal dispatch preference is introduced.
+
+With paired FC1 held fixed, E128/top8/H2048/I768, synthetic BF16 inputs and
+fixed saved CPU bytes, one148SM/1000W B200 measured complete FI MoE:
+
+| Tokens | Routing | Ordinary FC2 baseline | Paired FC2 | Latency reduction |
+|---|---|---:|---:|---:|
+| 8 | Unpacked | 115.871625 us | 103.140125 us | 10.988% |
+| 8 | Packed | 115.879500 us | 103.183750 us | 10.956% |
+| 64 | Unpacked | 209.404250 us | 208.520125 us | 0.422% |
+| 64 | Packed | 209.419875 us | 208.451500 us | 0.462% |
+
+Audit2096 independently validates both shapes:592raw output comparisons,
+240observable negative controls and1536cold-L2CUPTI spans. Both routing modes
+pass normal/memcheck/racecheck, retained and legacy captures, live activations,
+IDs/scales and both expert weights, bitwise cross-arm agreement, then four
+fresh ABBA processes. The native finalizer is held identical. These numbers
+are direct comparisons, not sums of separate optimization percentages.
+T8's FC2 completion tail falls40.924->28.272 us while FC1 stays about69 us;
+T64's tail changes63.576->62.604 us. The latter benefit is modest.
+
+Graph audit2092 passes105zero-skip test executions:13GPU cases plus22contract
+cases in each normal/memcheck/racecheck mode,390raw output comparisons,
+117input-mutation controls and78actual paired-engine routes. New GPU cases
+include R9/17/64/512/513, empty/skewed groups, E257, pitched weights and
+multiple persistent waves. CPU regression validation first observed five
+new accepted-row cases rejected by the original admission, then all22contract
+cases passed. R0 and R514 declarations remain explicitly rejected.
+
+The published runtime and test files match the independently tested sources;
+all tracked Python runtime source bytes match the full-FI capsule. This is
+an interface/admission benefit, not a new kernel-code speedup. A fresh T8
+comparison against the strongest exported TRT configuration remains pending;
+no best-backend superiority, all-shape benefit, broad CI or model E2E claim is
+made. The separate FC2 small-row scheduler candidate remains unpublished
+until its full-FI composition measurement passes.
+
+Credit: NVIDIA Frost and its persistent scheduler; KF624/2f5c paired and
+compact-resource contributions; Yanqin Zhai PR1090, CUTLASS113/rank5 guidance,
+and Yanqin/Yihua. FlashInfer supplies the integration and NVIDIA TRT-LLM the
+native finalizer. The new contribution here is validating and exposing the
+existing kernel across a wider graph contract.
+
+This supersedes earlier pending T64/admission statements below. Earlier
+measurements and frozen-source scopes remain separately identified.
+
 ## Latest validated configuration and interface results — 2026-09-17
 
 On RTX PRO 6000 Blackwell Server (188 SMs, 600W), synthetic BF16
