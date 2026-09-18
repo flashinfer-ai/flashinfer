@@ -14,6 +14,7 @@
 """fp8 fc1_gate_up + SiLU + fp8 quant on CuteDSL: what one compiled kernel is specialized on."""
 
 import functools
+import math
 
 import cutlass
 import cutlass.cute as cute
@@ -66,6 +67,7 @@ class CuteDslSm120GroupedFp8Fc1ActQ1Op:
         activation: ActivationType,
         epi: EpiMethod = DEFAULT_EPI,
         enable_pdl=False,
+        swiglu_limit=None,
     ):
         if not self.can_implement(
             n=n, k=k, tile=tile, out_dtype=out_dtype, activation=activation, epi=epi
@@ -76,6 +78,7 @@ class CuteDslSm120GroupedFp8Fc1ActQ1Op:
             )
         self.n, self.k, self.tile, self.out_dtype = n, k, tuple(tile), out_dtype
         self.activation, self.epi, self.enable_pdl = activation, epi, enable_pdl
+        self.swiglu_limit = swiglu_limit
         self.ab_stage = resolve_stage(self.tile, epi)
         self.tactic = (self.tile[0], self.tile[1], epi)
         self.cfg = make_cfg(
@@ -84,6 +87,7 @@ class CuteDslSm120GroupedFp8Fc1ActQ1Op:
             epi=epi,
             activation=activation,
             enable_pdl=enable_pdl,
+            swiglu_limit=swiglu_limit,
         )
 
     @staticmethod
@@ -160,7 +164,14 @@ def split_tactic(tactic):
 
 @functools.lru_cache(maxsize=None)
 def _op(
-    n: int, k: int, tile, out_dtype, activation, epi, enable_pdl=False
+    n: int,
+    k: int,
+    tile,
+    out_dtype,
+    activation,
+    epi,
+    enable_pdl=False,
+    swiglu_limit=None,
 ) -> CuteDslSm120GroupedFp8Fc1ActQ1Op:
     return CuteDslSm120GroupedFp8Fc1ActQ1Op(
         n=n,
@@ -170,6 +181,7 @@ def _op(
         activation=activation,
         epi=epi,
         enable_pdl=enable_pdl,
+        swiglu_limit=swiglu_limit,
     )
 
 
@@ -177,7 +189,15 @@ _COMPILED: dict = {}
 
 
 def compiled_kernel(sample_args, *, op, grid_x: int, sm_version: str):
-    key = (op.tactic, op.activation, op.out_dtype, op.enable_pdl, grid_x, sm_version)
+    key = (
+        op.tactic,
+        op.activation,
+        op.out_dtype,
+        op.enable_pdl,
+        op.swiglu_limit,
+        grid_x,
+        sm_version,
+    )
     hit = _COMPILED.get(key)
     if hit is None:
         hit = cute.compile(op.build(grid_x), *sample_args)
@@ -210,6 +230,17 @@ def _check_b_scale_granularity(b_scale, k: int) -> None:
         raise ValueError(f"b_scale K extent {got} != {want} implied by k={k}")
 
 
+def _normalize_swiglu_limit(activation: ActivationType, swiglu_limit):
+    if swiglu_limit is None:
+        return None
+    if activation is not ActivationType.Swiglu:
+        raise ValueError("swiglu_limit is valid only for SwiGLU")
+    swiglu_limit = float(swiglu_limit)
+    if not math.isfinite(swiglu_limit) or swiglu_limit <= 0:
+        raise ValueError("swiglu_limit must be finite and positive")
+    return swiglu_limit
+
+
 def cute_dsl_sm12x_fc1_act_q1_fp8(
     a_q,
     a_scale,
@@ -222,8 +253,15 @@ def cute_dsl_sm12x_fc1_act_q1_fp8(
     enable_pdl: bool = False,
     *,
     activation: ActivationType = ActivationType.Swiglu,
+    swiglu_limit: float | None = None,
+    out_q: torch.Tensor | None = None,
+    out_sf: torch.Tensor | None = None,
 ):
+    swiglu_limit = _normalize_swiglu_limit(activation, swiglu_limit)
     m, n, k = int(a_q.shape[0]), int(b_q.shape[1]) // 2, int(b_q.shape[2])
+    assert not enable_pdl or (out_q is not None and out_sf is not None), (
+        "PDL requires caller-owned out_q and out_sf"
+    )
     _check_a_scale_granularity(a_scale, k)
     _check_b_scale_granularity(b_scale, k)
     props = torch.cuda.get_device_properties(a_q.device)
@@ -233,11 +271,42 @@ def cute_dsl_sm12x_fc1_act_q1_fp8(
         tile = select_tile(
             total_rows=m, n=n, k=k, num_experts=num_experts, num_sms=grid_x
         )
-    op = _op(n, k, tuple(tile), out_dtype, activation, epi, enable_pdl)
-    q = torch.empty(m, n, dtype=out_dtype, device=a_q.device)
-    sf = torch.zeros(
-        out_sf_shape(m, n, num_experts), dtype=torch.float32, device=a_q.device
+    op = _op(
+        n,
+        k,
+        tuple(tile),
+        out_dtype,
+        activation,
+        epi,
+        enable_pdl,
+        swiglu_limit,
     )
+    q = (
+        torch.empty(m, n, dtype=out_dtype, device=a_q.device)
+        if out_q is None
+        else out_q
+    )
+    sf = (
+        torch.zeros(
+            out_sf_shape(m, n, num_experts), dtype=torch.float32, device=a_q.device
+        )
+        if out_sf is None
+        else out_sf
+    )
+    if (
+        q.shape != (m, n)
+        or q.dtype is not out_dtype
+        or q.device != a_q.device
+        or not q.is_contiguous()
+    ):
+        raise ValueError("out_q does not match the Q1 output contract")
+    if (
+        sf.shape != out_sf_shape(m, n, num_experts)
+        or sf.dtype is not torch.float32
+        or sf.device != a_q.device
+        or not sf.is_contiguous()
+    ):
+        raise ValueError("out_sf does not match the Q1 scale output contract")
     args = make_args(
         a_q,
         a_scale,
