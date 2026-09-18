@@ -4002,12 +4002,17 @@ def trtllm_batch_decode_with_kv_cache(
             skip_softmax_threshold_scale_factor,
             uses_shared_paged_kv_idx,
             lse,
-            1.0,  # lse_scale
-            lse_stride_tokens,
-            lse_stride_heads,
-            enable_block_sparse_attention,
-            None,  # sparse_mla_top_k_lens
         ]
+        if backend != "cake":
+            run_args.append(1.0)  # lse_scale
+        run_args.extend(
+            [
+                lse_stride_tokens,
+                lse_stride_heads,
+                enable_block_sparse_attention,
+                None,  # sparse_mla_top_k_lens
+            ]
+        )
         if backend != "cake":
             run_args.extend(
                 (

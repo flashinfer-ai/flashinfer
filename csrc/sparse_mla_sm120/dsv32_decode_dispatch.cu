@@ -30,15 +30,12 @@ namespace flashinfer::sparse_mla_sm120 {
   } while (0)
 
 template <ModelType MT, int NUM_HEADS>
-static bool launch_decode_dsv3_2_impl(int num_heads, int topk, const bf16* Q,
-                                      const uint8_t* KV_cache, const int32_t* indices,
-                                      bf16* mid_out, float* mid_lse, const int* topk_length,
-                                      bf16* output, float* out_lse, const float* attn_sink,
-                                      int num_tokens, int num_splits, int chunks_per_block_override,
-                                      float sm_scale, size_t stride_kv_block,
-                                      size_t stride_indices_token, int stride_kv_row,
-                                      size_t stride_out_lse, int page_size, cudaStream_t stream,
-                                      float lse_scale) {
+static bool launch_decode_dsv3_2_impl(
+    int num_heads, int topk, const bf16* Q, const uint8_t* KV_cache, const int32_t* indices,
+    bf16* mid_out, float* mid_lse, const int* topk_length, bf16* output, float* out_lse,
+    const float* attn_sink, int num_tokens, int num_splits, int chunks_per_block_override,
+    float sm_scale, size_t stride_kv_block, size_t stride_indices_token, int stride_kv_row,
+    size_t stride_out_lse, int page_size, cudaStream_t stream, float lse_scale) {
   using KV = KVCacheTraits<MT>;
   static_assert(KV::D_QK == 576 || (MT == ModelType::GLM53_NOPE && KV::D_QK == 512));
   // NUM_HEADS == 0 is the runtime-head-count instantiation: num_heads (<= 128)

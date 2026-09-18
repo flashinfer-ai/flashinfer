@@ -15,7 +15,8 @@ cudaError_t launch_decode(const Dsv4Nvfp4AttentionParams& params,
                           const execution::ExecutionPlan& plan, cudaStream_t stream) {
   const auto& [q, cache, indices, mid_out, mid_lse, output, out_lse, topk_length, attn_sink,
                extra_cache, extra_indices, extra_topk_length, extra_topk, extra_page_size,
-               extra_page_stride_bytes, num_tokens, sm_scale, page_stride_bytes, lse_scale] = params;
+               extra_page_stride_bytes, num_tokens, sm_scale, page_stride_bytes, lse_scale] =
+      params;
   constexpr bool CAN_GROUP_HEADS = NUM_HEADS >= STREAMING_HEADS_PER_CTA;
   constexpr int GROUPED_H_BLOCKS =
       (NUM_HEADS + STREAMING_HEADS_PER_CTA - 1) / STREAMING_HEADS_PER_CTA;
@@ -78,7 +79,8 @@ cudaError_t launch_prefill(const Dsv4Nvfp4AttentionParams& params,
                            const execution::ExecutionPlan& plan, cudaStream_t stream) {
   const auto& [q, cache, indices, mid_out, mid_lse, output, out_lse, topk_length, attn_sink,
                extra_cache, extra_indices, extra_topk_length, extra_topk, extra_page_size,
-               extra_page_stride_bytes, num_tokens, sm_scale, page_stride_bytes, lse_scale] = params;
+               extra_page_stride_bytes, num_tokens, sm_scale, page_stride_bytes, lse_scale] =
+      params;
   const int HEAD_BLOCKS = plan.head_blocks;
   constexpr size_t DYN_SMEM_BYTES = StreamingNVFP4Smem::SIZE;
   auto kernel = sparse_mla_streaming_dsv4_nvfp4_kernel<NUM_HEADS, TOPK, PAGE_SIZE, DUAL_CACHE>;

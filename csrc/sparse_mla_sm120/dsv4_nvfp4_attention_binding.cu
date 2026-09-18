@@ -205,7 +205,8 @@ void SparseMlaSm120NVFP4Decode(TensorView q, TensorView kv_cache, TensorView ind
                                Optional<TensorView> extra_kv_cache,
                                Optional<TensorView> extra_indices,
                                Optional<TensorView> extra_topk_length,
-                               int64_t chunks_per_block_override, bool stage1_only, double lse_scale) {
+                               int64_t chunks_per_block_override, bool stage1_only,
+                               double lse_scale) {
   attention(q, kv_cache, indices, mid_out, mid_lse, output, out_lse, num_splits, sm_scale,
             topk_length, attn_sink, extra_kv_cache, extra_indices, extra_topk_length,
             chunks_per_block_override, stage1_only, false, nullptr, lse_scale);

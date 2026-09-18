@@ -475,8 +475,8 @@ __global__ void __launch_bounds__(DECODE_MERGE2_THREADS, 2)
                                                const float* __restrict__ mid_lse,
                                                bf16* __restrict__ output,
                                                float* __restrict__ out_lse,
-                                               const float* __restrict__ attn_sink,
-                                               int num_tokens, float lse_scale) {
+                                               const float* __restrict__ attn_sink, int num_tokens,
+                                               float lse_scale) {
   constexpr int D_V = 512;
   constexpr int VECS_PER_HEAD = D_V / 8;
   constexpr int H_BLOCKS = (NUM_HEADS + HPB - 1) / HPB;
