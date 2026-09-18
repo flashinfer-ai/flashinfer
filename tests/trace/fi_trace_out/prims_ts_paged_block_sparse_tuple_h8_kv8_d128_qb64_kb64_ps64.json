@@ -67,6 +67,10 @@
     "max_pages_per_seq": {
       "type": "var",
       "description": "Fixed page-table column capacity."
+    },
+    "pattern_heads_shared": {
+      "type": "const",
+      "value": 0
     }
   },
   "constraints": [
@@ -178,6 +182,11 @@
     "sm_scale": {
       "shape": null,
       "dtype": "float32",
+      "optional": true
+    },
+    "share_pattern_across_kv_heads": {
+      "shape": null,
+      "dtype": "bool",
       "optional": true
     }
   },
