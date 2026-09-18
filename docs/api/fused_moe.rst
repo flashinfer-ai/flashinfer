@@ -165,6 +165,81 @@ AlphaMoE FP8 Block-Scaled MoE (SM100/SM103)
     alphamoe_interleave_gated_weights
     alphamoe_fp8_block_scale_aligned_moe
 
+AlphaMoE NVFP4 (SM100/SM103)
+-----------------------------
+
+The AlphaMoE path consumes packed E2M1 activations and weights with linear
+per-16 E4M3 scales. The aligned entry consumes an existing routing plan; the
+routed entry aligns the supplied expert IDs before compute. Shape-selected
+stages perform gate/up projection, SwiGLU, NVFP4 requantization and down
+projection, accumulating through FP32 scratch into caller-owned BF16 output.
+Neither entry resets the caller's initial output. Three contiguous FP32
+``[E]`` tensors provide the per-expert static ModelOpt scales: the gate scale
+is applied before SiLU, the up scale before SwiGLU multiplication, and the down
+scale before route weighting.
+
+.. autosummary::
+    :toctree: ../generated
+
+    alphamoe_nvfp4_aligned_moe
+    alphamoe_nvfp4_routed_moe
+    prepare_nvfp4_w1_scales
+    prepare_nvfp4_w2_scales
+
+AlphaMoE NVFP4 prepared weight scales
+-----------------------------------
+
+The aligned entry consumes an existing routing plan. The routed entry also
+aligns raw expert IDs and initializes the accumulation buffer. Both preserve
+caller-owned BF16 output and retain the raw E4M3 scale inputs. Shape-selected
+compute stages perform gate/up projection, SwiGLU, NVFP4 requantization, down
+projection and weighted accumulation.
+
+``prepare_nvfp4_w1_scales`` and ``prepare_nvfp4_w2_scales`` permute existing
+scale bytes into immutable uint8 tensor-map panels. They perform no scale
+arithmetic or requantization. Call them after the final device-local weight
+layout is established and before warmup or graph capture. Keep the raw scale
+tensors and the resulting panels alive for the layer's current weight load.
+A subsequent weight load must replace the panels; they are derived buffers and
+need not be saved in the model checkpoint.
+
+For raw gate/up scales ``[E,N,K/16]``, the prepared shape is
+``[E*(N/128)*(K/256),16,128]``. For raw down scales
+``[E,K,N/32]``, it is ``[E*(K/128)*(N/256),8,128]``. At local dimensions
+``E=256, N=1024, K=6144`` these require an additional 96 MiB and 48 MiB,
+respectively, per weight pair. Preparation and its memory cost are separate
+from repeated-request kernel timing.
+
+Supply the buffers through optional keywords on either entry::
+
+    from flashinfer.fused_moe import (
+        prepare_nvfp4_w1_scales,
+        prepare_nvfp4_w2_scales,
+    )
+
+    # Once, after device-local weight loading:
+    w1_scale_prepared = prepare_nvfp4_w1_scales(gemm1_weights_scale)
+    w2_scale_prepared = prepare_nvfp4_w2_scales(gemm2_weights_scale)
+    prepared_scales = {
+        "w1_scale_prepared": w1_scale_prepared,
+        "w2_scale_prepared": w2_scale_prepared,
+    }
+
+    # Existing aligned or routed call: retain every raw argument and append
+    # **prepared_scales. Reuse these same tensors for subsequent requests.
+
+The current prepared routes use W1 panels for the matching 128-token and
+512-token shapes, and W2 panels for the matching 512-token shape. Other
+shapes retain their existing raw-scale paths. Missing or incompatible optional
+panels also retain raw fallback; a valid W1 panel with no valid W2 panel uses
+the W1-only path. No preparation is performed inside a request.
+
+The aligned entry keeps its existing ``None`` return value. The routed entry
+returns the caller's output tensor. Neither entry resets caller output; provide
+a zeroed output when a fresh result is wanted. The chosen implementation may
+use separate compute launches and scratch storage. It does not promise a
+single-kernel or entirely on-chip intermediate implementation.
+
 Cake NVFP4 Warp Decode (SM100/SM103)
 ------------------------------------
 

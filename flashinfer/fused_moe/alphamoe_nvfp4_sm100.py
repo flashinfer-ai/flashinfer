@@ -1,0 +1,964 @@
+"""
+Copyright (c) 2026 by FlashInfer team.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
+
+import functools
+import math
+from typing import Optional
+
+import torch
+
+from ..api_logging import flashinfer_api
+from ..jit import gen_alphamoe_nvfp4_sm100_module
+from ..trace.templates.moe import (
+    alphamoe_nvfp4_aligned_moe_trace,
+    alphamoe_nvfp4_routed_moe_trace,
+)
+from ..utils import (
+    backend_requirement,
+    supported_compute_capability,
+)
+
+_SUPPORTED_CC = [100, 103]
+_ROUTE_SUBTILE = 8
+_UP_BLOCK_K = 256
+_W1_ROWS = 256
+_INT32_MAX = 2**31 - 1
+
+
+def _require_cuda_tensor(
+    name: str,
+    tensor: torch.Tensor,
+    *,
+    dtype: torch.dtype,
+    ndim: int,
+    contiguous: bool = True,
+) -> None:
+    if not tensor.is_cuda:
+        raise ValueError(f"{name} must be a CUDA tensor")
+    if tensor.dtype != dtype:
+        raise ValueError(f"{name} must have dtype {dtype}, got {tensor.dtype}")
+    if tensor.dim() != ndim:
+        raise ValueError(f"{name} must be {ndim}D, got shape {tuple(tensor.shape)}")
+    if contiguous and not tensor.is_contiguous():
+        raise ValueError(f"{name} must be contiguous")
+
+
+@supported_compute_capability(_SUPPORTED_CC)
+def _check_alphamoe_nvfp4_supported(
+    hidden_states: torch.Tensor,
+    hidden_states_scale: torch.Tensor,
+    gemm1_weights: torch.Tensor,
+    gemm1_weights_scale: torch.Tensor,
+    gemm2_weights: torch.Tensor,
+    gemm2_weights_scale: torch.Tensor,
+    output1_scale_gate_scalar: torch.Tensor,
+    output1_scale_scalar: torch.Tensor,
+    output2_scale_scalar: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    topk_weights: torch.Tensor,
+    out: torch.Tensor,
+    top_k: int,
+    block_m: int = 8,
+    routed_scaling_factor: float = 1.0,
+    w1_scale_prepared: Optional[torch.Tensor] = None,
+    w2_scale_prepared: Optional[torch.Tensor] = None,
+) -> bool:
+    """Validate the frozen schedule's complete host-visible contract."""
+
+    _require_cuda_tensor(
+        "hidden_states",
+        hidden_states,
+        dtype=torch.uint8,
+        ndim=2,
+        contiguous=False,
+    )
+    _require_cuda_tensor(
+        "hidden_states_scale",
+        hidden_states_scale,
+        dtype=torch.float8_e4m3fn,
+        ndim=2,
+    )
+    _require_cuda_tensor("gemm1_weights", gemm1_weights, dtype=torch.uint8, ndim=3)
+    _require_cuda_tensor(
+        "gemm1_weights_scale",
+        gemm1_weights_scale,
+        dtype=torch.float8_e4m3fn,
+        ndim=3,
+    )
+    _require_cuda_tensor("gemm2_weights", gemm2_weights, dtype=torch.uint8, ndim=3)
+    _require_cuda_tensor(
+        "gemm2_weights_scale",
+        gemm2_weights_scale,
+        dtype=torch.float8_e4m3fn,
+        ndim=3,
+    )
+    _require_cuda_tensor(
+        "output1_scale_gate_scalar",
+        output1_scale_gate_scalar,
+        dtype=torch.float32,
+        ndim=1,
+    )
+    _require_cuda_tensor(
+        "output1_scale_scalar",
+        output1_scale_scalar,
+        dtype=torch.float32,
+        ndim=1,
+    )
+    _require_cuda_tensor(
+        "output2_scale_scalar",
+        output2_scale_scalar,
+        dtype=torch.float32,
+        ndim=1,
+    )
+    _require_cuda_tensor(
+        "sorted_token_ids", sorted_token_ids, dtype=torch.int32, ndim=1
+    )
+    _require_cuda_tensor("expert_ids", expert_ids, dtype=torch.int32, ndim=1)
+    _require_cuda_tensor(
+        "num_tokens_post_padded",
+        num_tokens_post_padded,
+        dtype=torch.int32,
+        ndim=1,
+    )
+    _require_cuda_tensor("topk_weights", topk_weights, dtype=torch.float32, ndim=2)
+    _require_cuda_tensor("out", out, dtype=torch.bfloat16, ndim=2)
+
+    device = hidden_states.device
+    for name, tensor in (
+        ("hidden_states_scale", hidden_states_scale),
+        ("gemm1_weights", gemm1_weights),
+        ("gemm1_weights_scale", gemm1_weights_scale),
+        ("gemm2_weights", gemm2_weights),
+        ("gemm2_weights_scale", gemm2_weights_scale),
+        ("output1_scale_gate_scalar", output1_scale_gate_scalar),
+        ("output1_scale_scalar", output1_scale_scalar),
+        ("output2_scale_scalar", output2_scale_scalar),
+        ("sorted_token_ids", sorted_token_ids),
+        ("expert_ids", expert_ids),
+        ("num_tokens_post_padded", num_tokens_post_padded),
+        ("topk_weights", topk_weights),
+        ("out", out),
+    ):
+        if tensor.device != device:
+            raise ValueError(
+                f"{name} must be on the same device as hidden_states "
+                f"({tensor.device} vs {device})"
+            )
+
+    if (
+        hidden_states.stride(-1) != 1
+        or hidden_states.stride(0) <= 0
+        or hidden_states.stride(0) < hidden_states.shape[1]
+        or hidden_states.stride(0) % 16 != 0
+    ):
+        raise ValueError(
+            "hidden_states must have unit innermost stride and a positive, "
+            "non-overlapping, 16-byte-aligned row stride"
+        )
+    if hidden_states.data_ptr() % 16 != 0:
+        raise ValueError("hidden_states data pointer must be 16-byte aligned for TMA")
+    for name, tensor in (
+        ("gemm1_weights", gemm1_weights),
+        ("gemm2_weights", gemm2_weights),
+    ):
+        if tensor.data_ptr() % 16 != 0:
+            raise ValueError(f"{name} data pointer must be 16-byte aligned for TMA")
+
+    m, packed_k = hidden_states.shape
+    k = 2 * packed_k
+    num_experts, n, w1_packed_k = gemm1_weights.shape
+    if m <= 0:
+        raise ValueError("hidden_states must contain at least one token")
+    if k < _UP_BLOCK_K or k % _UP_BLOCK_K != 0:
+        raise ValueError(
+            f"logical hidden size K ({k}) must be at least {_UP_BLOCK_K} "
+            f"and divisible by {_UP_BLOCK_K}"
+        )
+    if n < _W1_ROWS or n % _W1_ROWS != 0:
+        raise ValueError(
+            f"gemm1_weights.shape[1] ({n}) must be at least {_W1_ROWS} "
+            f"and divisible by {_W1_ROWS}"
+        )
+    if num_experts <= 0:
+        raise ValueError("gemm1_weights must contain at least one expert")
+    if w1_packed_k != packed_k:
+        raise ValueError(
+            "gemm1_weights.shape[2] must equal hidden_states.shape[1] "
+            f"({w1_packed_k} vs {packed_k})"
+        )
+
+    if not isinstance(top_k, int) or isinstance(top_k, bool) or top_k <= 0:
+        raise ValueError(f"top_k must be a positive integer, got {top_k!r}")
+    if top_k > num_experts:
+        raise ValueError(f"top_k ({top_k}) must not exceed num_experts ({num_experts})")
+    if (
+        not isinstance(block_m, int)
+        or isinstance(block_m, bool)
+        or block_m < _ROUTE_SUBTILE
+        or block_m % _ROUTE_SUBTILE != 0
+    ):
+        raise ValueError(
+            f"block_m must be a positive multiple of {_ROUTE_SUBTILE}, got {block_m!r}"
+        )
+    if not math.isfinite(routed_scaling_factor):
+        raise ValueError(
+            f"routed_scaling_factor must be finite, got {routed_scaling_factor}"
+        )
+
+    intermediate = n // 2
+    expected_shapes = {
+        "hidden_states_scale": (m, k // 16),
+        "gemm1_weights_scale": (num_experts, n, k // 16),
+        "gemm2_weights": (num_experts, k, intermediate // 2),
+        "gemm2_weights_scale": (num_experts, k, intermediate // 16),
+        "output1_scale_gate_scalar": (num_experts,),
+        "output1_scale_scalar": (num_experts,),
+        "output2_scale_scalar": (num_experts,),
+        "topk_weights": (m, top_k),
+        "out": (m, k),
+    }
+    actual_tensors = {
+        "hidden_states_scale": hidden_states_scale,
+        "gemm1_weights_scale": gemm1_weights_scale,
+        "gemm2_weights": gemm2_weights,
+        "gemm2_weights_scale": gemm2_weights_scale,
+        "output1_scale_gate_scalar": output1_scale_gate_scalar,
+        "output1_scale_scalar": output1_scale_scalar,
+        "output2_scale_scalar": output2_scale_scalar,
+        "topk_weights": topk_weights,
+        "out": out,
+    }
+    for name, expected in expected_shapes.items():
+        actual = tuple(actual_tensors[name].shape)
+        if actual != expected:
+            raise ValueError(f"{name} must have shape {expected}, got {actual}")
+    if out.data_ptr() % 16 != 0:
+        raise ValueError("out data pointer must be 16-byte aligned for bulk reduction")
+
+    if num_tokens_post_padded.numel() != 1:
+        raise ValueError(
+            "num_tokens_post_padded must contain exactly one device-side int32 value"
+        )
+    if expert_ids.numel() <= 0:
+        raise ValueError("expert_ids must not be empty")
+    required_plan_capacity = expert_ids.numel() * block_m
+    if sorted_token_ids.numel() < required_plan_capacity:
+        raise ValueError(
+            "sorted_token_ids capacity must be at least "
+            f"expert_ids.numel() * block_m ({required_plan_capacity}), got "
+            f"{sorted_token_ids.numel()}"
+        )
+    int_index_extents = {
+        "M": m,
+        "K": k,
+        "M * top_k": m * top_k,
+        "M * K": m * k,
+        "hidden_states_scale.numel()": hidden_states_scale.numel(),
+        "gemm1_weights_scale.numel()": gemm1_weights_scale.numel(),
+        "gemm2_weights_scale.numel()": gemm2_weights_scale.numel(),
+        "routing plan capacity": required_plan_capacity,
+    }
+    for name, extent in int_index_extents.items():
+        if extent > _INT32_MAX:
+            raise ValueError(f"{name} ({extent}) must fit in signed int32")
+    grid_x = expert_ids.numel() * (block_m // _ROUTE_SUBTILE)
+    if grid_x > _INT32_MAX:
+        raise ValueError(f"launch grid.x ({grid_x}) exceeds the CUDA limit")
+    if n // _W1_ROWS > 65535:
+        raise ValueError(f"launch grid.y ({n // _W1_ROWS}) exceeds the CUDA limit")
+    return True
+
+
+@functools.cache
+def get_alphamoe_nvfp4_sm100_module():
+    """Build and cache the AlphaMoE NVFP4 TVM-FFI module."""
+
+    return gen_alphamoe_nvfp4_sm100_module().build_and_load()
+
+
+@torch.library.custom_op("flashinfer::alphamoe_nvfp4_aligned_moe", mutates_args=("out",))
+def _alphamoe_nvfp4_aligned_moe_impl(
+    hidden_states: torch.Tensor,
+    hidden_states_scale: torch.Tensor,
+    gemm1_weights: torch.Tensor,
+    gemm1_weights_scale: torch.Tensor,
+    gemm2_weights: torch.Tensor,
+    gemm2_weights_scale: torch.Tensor,
+    output1_scale_gate_scalar: torch.Tensor,
+    output1_scale_scalar: torch.Tensor,
+    output2_scale_scalar: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    topk_weights: torch.Tensor,
+    out: torch.Tensor,
+    top_k: int,
+    block_m: int,
+    routed_scaling_factor: float,
+    w1_scale_prepared: Optional[torch.Tensor] = None,
+    w2_scale_prepared: Optional[torch.Tensor] = None,
+) -> None:
+    # Seed from the caller's output to preserve additive semantics. This
+    # temporary and both casts use the current stream; during graph capture
+    # its storage belongs to PyTorch's graph memory pool.
+    accumulator = out.to(torch.float32)
+    get_alphamoe_nvfp4_sm100_module().nvfp4_current_aligned_moe_op(
+        hidden_states,
+        hidden_states_scale,
+        gemm1_weights,
+        gemm1_weights_scale,
+        gemm2_weights,
+        gemm2_weights_scale,
+        output1_scale_gate_scalar,
+        output1_scale_scalar,
+        output2_scale_scalar,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        topk_weights,
+        out,
+        accumulator,
+        top_k,
+        block_m,
+        routed_scaling_factor,
+        w1_scale_prepared,
+        w2_scale_prepared,
+    )
+    out.copy_(accumulator)
+
+
+@torch.library.register_fake("flashinfer::alphamoe_nvfp4_aligned_moe")
+def _alphamoe_nvfp4_aligned_moe_fake(
+    hidden_states: torch.Tensor,
+    hidden_states_scale: torch.Tensor,
+    gemm1_weights: torch.Tensor,
+    gemm1_weights_scale: torch.Tensor,
+    gemm2_weights: torch.Tensor,
+    gemm2_weights_scale: torch.Tensor,
+    output1_scale_gate_scalar: torch.Tensor,
+    output1_scale_scalar: torch.Tensor,
+    output2_scale_scalar: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    topk_weights: torch.Tensor,
+    out: torch.Tensor,
+    top_k: int,
+    block_m: int,
+    routed_scaling_factor: float,
+    w1_scale_prepared: Optional[torch.Tensor] = None,
+    w2_scale_prepared: Optional[torch.Tensor] = None,
+) -> None:
+    pass
+
+
+@backend_requirement({}, common_check=_check_alphamoe_nvfp4_supported)
+@flashinfer_api(trace=alphamoe_nvfp4_aligned_moe_trace)
+def alphamoe_nvfp4_aligned_moe(
+    hidden_states: torch.Tensor,
+    hidden_states_scale: torch.Tensor,
+    gemm1_weights: torch.Tensor,
+    gemm1_weights_scale: torch.Tensor,
+    gemm2_weights: torch.Tensor,
+    gemm2_weights_scale: torch.Tensor,
+    output1_scale_gate_scalar: torch.Tensor,
+    output1_scale_scalar: torch.Tensor,
+    output2_scale_scalar: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    topk_weights: torch.Tensor,
+    out: torch.Tensor,
+    top_k: int,
+    block_m: int = 8,
+    routed_scaling_factor: float = 1.0,
+    w1_scale_prepared: Optional[torch.Tensor] = None,
+    w2_scale_prepared: Optional[torch.Tensor] = None,
+) -> None:
+    r"""Run AlphaMoE NVFP4 gate/up, SwiGLU, requantization and down compute.
+
+    This SM100/SM103 operator consumes a pre-aligned routing plan. Contributions
+    accumulate in a temporary FP32 ``[M, K]`` buffer initialized from the
+    caller-owned BF16 ``out`` tensor, then convert back to ``out`` once. It does
+    not run expert selection. The temporary uses ``4 * M * K`` bytes and is
+    compatible with CUDA graph capture.
+
+    ``hidden_states``, ``gemm1_weights``, and ``gemm2_weights`` store two E2M1
+    values per ``uint8`` byte, with the even logical value in the low nibble.
+    Their E4M3 scales are linear, contiguous, and cover 16 logical values each:
+
+    - ``hidden_states``: ``[M, K / 2]``; scale ``[M, K / 16]``
+    - ``gemm1_weights``: ``[E, N, K / 2]`` in conventional ``[gate; up]`` row
+      order; scale ``[E, N, K / 16]``
+    - ``gemm2_weights``: ``[E, K, N / 4]``; scale ``[E, K, N / 32]``
+
+    The scale tensors must use ``torch.float8_e4m3fn`` and the linear per-16
+    layout above. FlashInfer's 128x4-swizzled NVFP4 scale layout is a different
+    contract and must not be passed to this kernel.
+
+    ``sorted_token_ids`` and ``expert_ids`` follow the aligned MoE plan used by
+    vLLM/SGLang. ``num_tokens_post_padded`` is a one-element device tensor
+    naming the valid plan extent; blocks in the capacity-sized launch grid that
+    lie past this extent are skipped. The caller must keep that device value no
+    larger than ``expert_ids.numel() * block_m`` and provide valid expert and
+    token ids in the active plan.
+
+    Parameters
+    ----------
+    hidden_states : torch.Tensor
+        Packed E2M1 activations ``[M, K / 2]``. The innermost stride must be 1;
+        row-strided views are supported.
+    hidden_states_scale : torch.Tensor
+        Linear E4M3 scales ``[M, K / 16]``.
+    gemm1_weights : torch.Tensor
+        Packed gate/up weights ``[E, N, K / 2]`` with ``N`` divisible by 256.
+    gemm1_weights_scale : torch.Tensor
+        Linear E4M3 scales ``[E, N, K / 16]``.
+    gemm2_weights : torch.Tensor
+        Packed down weights ``[E, K, N / 4]``.
+    gemm2_weights_scale : torch.Tensor
+        Linear E4M3 scales ``[E, K, N / 32]``.
+    output1_scale_gate_scalar : torch.Tensor
+        Contiguous FP32 per-expert gate dequantization scales ``[E]``. Each
+        gate accumulator is multiplied by its routed expert's value before
+        applying SiLU.
+    output1_scale_scalar : torch.Tensor
+        Contiguous FP32 per-expert up-projection scales ``[E]``. For static
+        ModelOpt FP4 this is the up-projection global scale divided by the
+        second-activation quantization scale.
+    output2_scale_scalar : torch.Tensor
+        Contiguous FP32 per-expert down-projection scales ``[E]``. Each down
+        accumulator is multiplied by its routed expert's value before route
+        weighting and ``routed_scaling_factor``.
+    sorted_token_ids : torch.Tensor
+        Contiguous int32 aligned-plan entries.
+    expert_ids : torch.Tensor
+        Contiguous int32 expert id per ``block_m`` plan entries.
+    num_tokens_post_padded : torch.Tensor
+        One-element device int32 valid plan extent.
+    topk_weights : torch.Tensor
+        FP32 route weights ``[M, top_k]``.
+    out : torch.Tensor
+        Contiguous BF16 output ``[M, K]``. Contributions are added to its existing
+        values in FP32 before the final BF16 conversion; its data pointer must
+        be 16-byte aligned. Zero it before calling when a fresh result is wanted.
+        It must not overlap any input tensor.
+    top_k : int
+        Routes per token.
+    block_m : int
+        Routing plan block size, at least 8 and divisible by 8.
+    routed_scaling_factor : float
+        Finite scalar applied to each routed contribution.
+
+    w1_scale_prepared, w2_scale_prepared : Optional[torch.Tensor]
+        Immutable uint8 panels prepared once from the raw scale tensors
+        with prepare_nvfp4_w1_scales/prepare_nvfp4_w2_scales before
+        requests or graph capture. Raw tensors remain required.
+
+    Notes
+    -----
+    Logical ``K`` is derived as ``2 * hidden_states.shape[1]`` and must be at
+    least 256 and divisible by 256. This function mutates ``out`` and returns
+    ``None``. The FP32 bulk reduction is order-dependent and flushes subnormal
+    inputs and results to signed zero, as specified by PTX
+    ``cp.reduce.async.bulk.add.f32``.
+    """
+
+    _alphamoe_nvfp4_aligned_moe_impl(
+        hidden_states,
+        hidden_states_scale,
+        gemm1_weights,
+        gemm1_weights_scale,
+        gemm2_weights,
+        gemm2_weights_scale,
+        output1_scale_gate_scalar,
+        output1_scale_scalar,
+        output2_scale_scalar,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        topk_weights,
+        out,
+        top_k,
+        block_m,
+        routed_scaling_factor,
+        w1_scale_prepared,
+        w2_scale_prepared,
+    )
+
+
+__all__ = [
+    "alphamoe_nvfp4_aligned_moe",
+    "alphamoe_nvfp4_routed_moe",
+    "get_alphamoe_nvfp4_sm100_module",
+]
+
+
+# Small raw-ID alignment and output-seed companion; aligned API above is unchanged.
+def is_alphamoe_nvfp4_small_alignment_seed_supported(
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    block_size: int,
+    initial_out: torch.Tensor,
+    pad_sorted_token_ids: bool = True,
+) -> bool:
+    """Metadata-only dispatch predicate; callers retain their general fallback."""
+    return (
+        topk_ids.is_cuda and topk_ids.dtype == torch.int32 and topk_ids.is_contiguous()
+        and topk_ids.ndim == 2 and topk_ids.shape[0] in (1, 8) and topk_ids.shape[1] == 8
+        and num_experts in (257, 513) and block_size in (8, 16) and pad_sorted_token_ids
+        and initial_out.is_cuda and initial_out.dtype == torch.bfloat16
+        and initial_out.is_contiguous() and initial_out.ndim == 2
+        and initial_out.shape[0] == topk_ids.shape[0] and initial_out.shape[1] > 0
+        and initial_out.device == topk_ids.device
+    )
+
+
+@torch.library.custom_op(
+    "flashinfer::alphamoe_nvfp4_align_and_seed_output",
+    mutates_args=("sorted_token_ids", "expert_ids", "num_tokens_post_padded", "cumsum_buffer", "seeded_accumulator"),
+)
+def _alphamoe_nvfp4_align_and_seed_output_impl(
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    block_size: int,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    cumsum_buffer: torch.Tensor,
+    initial_out: torch.Tensor,
+    seeded_accumulator: torch.Tensor,
+    pad_sorted_token_ids: bool,
+) -> None:
+    get_alphamoe_nvfp4_sm100_module().nvfp4_align_and_seed_output_op(
+        topk_ids, num_experts, block_size, sorted_token_ids, expert_ids,
+        num_tokens_post_padded, cumsum_buffer, initial_out, seeded_accumulator, pad_sorted_token_ids,
+    )
+
+
+@torch.library.register_fake("flashinfer::alphamoe_nvfp4_align_and_seed_output")
+def _alphamoe_nvfp4_align_and_seed_output_fake(
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    block_size: int,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    cumsum_buffer: torch.Tensor,
+    initial_out: torch.Tensor,
+    seeded_accumulator: torch.Tensor,
+    pad_sorted_token_ids: bool,
+) -> None:
+    pass
+
+
+def alphamoe_nvfp4_align_and_seed_output(
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    block_size: int,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    cumsum_buffer: torch.Tensor,
+    initial_out: torch.Tensor,
+    seeded_accumulator: torch.Tensor,
+    pad_sorted_token_ids: bool = True,
+) -> None:
+    """Fill a small route plan and convert the caller BF16 seed to private FP32.
+
+    This SM100/SM103 companion accepts contiguous int32 CUDA IDs of shape
+    (1, 8) or (8, 8), a reserved-inclusive bucket count of 257 or 513, and
+    block size 8 or 16. IDs follow the existing convention: expert -1 occupies
+    reserved bucket zero, and other IDs are in [0, num_experts - 2].
+
+    All route-plan outputs are caller-owned contiguous int32 tensors on the same device.
+    sorted_token_ids must have capacity at least topk_ids.numel()*block_size;
+    expert_ids needs at least topk_ids.numel() entries. The padded extent has
+    one entry and cumsum_buffer at least num_experts+1 entries. The full sorted
+    capacity is padded with the numel sentinel. Unused expert entries remain
+    unchanged. cumsum_buffer receives each bucket start plus its actual count,
+    followed by the final padded extent. Intra-expert ordering is unspecified.
+
+    initial_out is read-only BF16 [M,K] and seeded_accumulator is a disjoint
+    contiguous FP32 tensor of the identical shape/device. Every seed element
+    is converted, including nonzero values. Pass that same accumulator to
+    the subsequent aligned compute; do not repeat its output conversion.
+
+    Select the existing general alignment operator for other metadata.
+    The existing aligned compute entry and its caller-provided plan remain
+    independently usable.
+    """
+    _require_cuda_tensor("topk_ids", topk_ids, dtype=torch.int32, ndim=2)
+    for name, tensor in (
+        ("sorted_token_ids", sorted_token_ids),
+        ("expert_ids", expert_ids),
+        ("num_tokens_post_padded", num_tokens_post_padded),
+        ("cumsum_buffer", cumsum_buffer),
+    ):
+        _require_cuda_tensor(name, tensor, dtype=torch.int32, ndim=1)
+        if tensor.device != topk_ids.device:
+            raise ValueError(f"{name} must be on the same device as topk_ids")
+    if topk_ids.shape[0] not in (1, 8) or topk_ids.shape[1] != 8:
+        raise ValueError("topk_ids must have shape (1, 8) or (8, 8)")
+    if num_experts not in (257, 513) or block_size not in (8, 16):
+        raise ValueError("alignment requires 257/513 reserved-inclusive bins and block size 8/16")
+    if not pad_sorted_token_ids:
+        raise ValueError("alignment requires full-capacity sorted-token padding")
+    pairs = topk_ids.numel()
+    if sorted_token_ids.numel() < pairs * block_size or sorted_token_ids.numel() > _INT32_MAX:
+        raise ValueError("sorted_token_ids capacity must cover every routed pair's padded block and fit int32")
+    if expert_ids.numel() < pairs:
+        raise ValueError("expert_ids must have at least topk_ids.numel() entries")
+    if num_tokens_post_padded.numel() != 1:
+        raise ValueError("num_tokens_post_padded must have one entry")
+    if cumsum_buffer.numel() < num_experts + 1:
+        raise ValueError("cumsum_buffer must have at least num_experts + 1 entries")
+    _require_cuda_tensor("initial_out", initial_out, dtype=torch.bfloat16, ndim=2)
+    _require_cuda_tensor("seeded_accumulator", seeded_accumulator, dtype=torch.float32, ndim=2)
+    if not is_alphamoe_nvfp4_small_alignment_seed_supported(
+        topk_ids, num_experts, block_size, initial_out, pad_sorted_token_ids
+    ):
+        raise ValueError("alignment and seed require supported route metadata and matching BF16 output")
+    if (seeded_accumulator.shape != initial_out.shape
+            or seeded_accumulator.device != initial_out.device):
+        raise ValueError("seeded_accumulator must match the output shape and device")
+    _alphamoe_nvfp4_align_and_seed_output_impl(
+        topk_ids, num_experts, block_size, sorted_token_ids, expert_ids,
+        num_tokens_post_padded, cumsum_buffer, initial_out, seeded_accumulator, pad_sorted_token_ids,
+    )
+
+
+@torch.library.custom_op(
+    "flashinfer::alphamoe_nvfp4_routed_moe",
+    mutates_args=("sorted_token_ids", "expert_ids", "num_tokens_post_padded", "cumsum_buffer", "out"),
+)
+def _alphamoe_nvfp4_routed_moe_impl(
+    hidden_states: torch.Tensor,
+    hidden_states_scale: torch.Tensor,
+    gemm1_weights: torch.Tensor,
+    gemm1_weights_scale: torch.Tensor,
+    gemm2_weights: torch.Tensor,
+    gemm2_weights_scale: torch.Tensor,
+    output1_scale_gate_scalar: torch.Tensor,
+    output1_scale_scalar: torch.Tensor,
+    output2_scale_scalar: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    topk_weights: torch.Tensor,
+    out: torch.Tensor,
+    topk_ids: torch.Tensor,
+    cumsum_buffer: torch.Tensor,
+    top_k: int,
+    block_m: int,
+    routed_scaling_factor: float,
+    w1_scale_prepared: Optional[torch.Tensor] = None,
+    w2_scale_prepared: Optional[torch.Tensor] = None,
+) -> None:
+    # The private buffer is seeded by the alignment kernel on this stream.
+    # During graph capture it belongs to PyTorch's graph memory pool.
+    accumulator = torch.empty_like(out, dtype=torch.float32)
+    module = get_alphamoe_nvfp4_sm100_module()
+    routed_op = (module.nvfp4_current_general_routed_seeded_moe_op
+                 if _uses_general_alignment_seed_portfolio(hidden_states, gemm1_weights, top_k, block_m)
+                 else module.nvfp4_current_routed_seeded_moe_op)
+    private_owners = ()
+    if _uses_compact_owner_routed(
+        hidden_states, hidden_states_scale, gemm1_weights, gemm1_weights_scale,
+        gemm2_weights_scale, topk_ids, out, top_k, block_m,
+        w1_scale_prepared, w2_scale_prepared,
+    ):
+        owner_capacity = (topk_ids.numel() + 31) // 32 + gemm1_weights.shape[0]
+        owner_plan = torch.empty((owner_capacity, 3), dtype=torch.int32, device=out.device)
+        owner_count = torch.empty((1,), dtype=torch.int32, device=out.device)
+        private_owners = (owner_plan, owner_count)
+        routed_op = module.nvfp4_compact_owner_routed_seeded_moe_op
+    routed_op(
+        hidden_states,
+        hidden_states_scale,
+        gemm1_weights,
+        gemm1_weights_scale,
+        gemm2_weights,
+        gemm2_weights_scale,
+        output1_scale_gate_scalar,
+        output1_scale_scalar,
+        output2_scale_scalar,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        topk_weights,
+        out,
+        accumulator,
+        topk_ids,
+        cumsum_buffer,
+        top_k,
+        block_m,
+        routed_scaling_factor,
+        w1_scale_prepared,
+        w2_scale_prepared,
+        *private_owners,
+    )
+    out.copy_(accumulator)
+
+
+@torch.library.register_fake("flashinfer::alphamoe_nvfp4_routed_moe")
+def _alphamoe_nvfp4_routed_moe_fake(
+    hidden_states: torch.Tensor,
+    hidden_states_scale: torch.Tensor,
+    gemm1_weights: torch.Tensor,
+    gemm1_weights_scale: torch.Tensor,
+    gemm2_weights: torch.Tensor,
+    gemm2_weights_scale: torch.Tensor,
+    output1_scale_gate_scalar: torch.Tensor,
+    output1_scale_scalar: torch.Tensor,
+    output2_scale_scalar: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    topk_weights: torch.Tensor,
+    out: torch.Tensor,
+    topk_ids: torch.Tensor,
+    cumsum_buffer: torch.Tensor,
+    top_k: int,
+    block_m: int,
+    routed_scaling_factor: float,
+    w1_scale_prepared: Optional[torch.Tensor] = None,
+    w2_scale_prepared: Optional[torch.Tensor] = None,
+) -> None:
+    pass
+
+
+@flashinfer_api(trace=alphamoe_nvfp4_routed_moe_trace)
+def alphamoe_nvfp4_routed_moe(
+    hidden_states: torch.Tensor,
+    hidden_states_scale: torch.Tensor,
+    gemm1_weights: torch.Tensor,
+    gemm1_weights_scale: torch.Tensor,
+    gemm2_weights: torch.Tensor,
+    gemm2_weights_scale: torch.Tensor,
+    output1_scale_gate_scalar: torch.Tensor,
+    output1_scale_scalar: torch.Tensor,
+    output2_scale_scalar: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    topk_weights: torch.Tensor,
+    out: torch.Tensor,
+    topk_ids: torch.Tensor,
+    cumsum_buffer: torch.Tensor,
+    top_k: int,
+    block_m: int = 8,
+    routed_scaling_factor: float = 1.0,
+    w1_scale_prepared: Optional[torch.Tensor] = None,
+    w2_scale_prepared: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Run selected route alignment, seed conversion and additive NVFP4 compute.
+
+    This entry supports small routes and the selected batch compute shapes.
+    Framework callers use their existing alignment and aligned API otherwise.
+    It owns one private FP32 accumulator, initializes it from every caller BF16
+    output value in the alignment launch, feeds that same buffer to the
+    selected compute, and copies back once. It returns caller out.
+    The prepared M512 route also owns private compact-owner metadata;
+    its alignment launch produces it for the selected up stage.
+    The existing aligned API above retains its original seed conversion.
+    Optional w1_scale_prepared/w2_scale_prepared tensors are immutable
+    model-load panels from prepare_nvfp4_w1_scales/prepare_nvfp4_w2_scales.
+    Keep raw scale tensors and prepare panels before requests or capture.
+    Missing or incompatible panels retain the corresponding raw fallback.
+    """
+    _check_alphamoe_nvfp4_supported(
+        hidden_states,
+        hidden_states_scale,
+        gemm1_weights,
+        gemm1_weights_scale,
+        gemm2_weights,
+        gemm2_weights_scale,
+        output1_scale_gate_scalar,
+        output1_scale_scalar,
+        output2_scale_scalar,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        topk_weights,
+        out,
+        top_k,
+        block_m,
+        routed_scaling_factor,
+        w1_scale_prepared,
+        w2_scale_prepared,
+    )
+    if not is_alphamoe_nvfp4_routed_seed_supported(
+        hidden_states, gemm1_weights, topk_ids, out, top_k, block_m
+    ):
+        raise ValueError("routed companion requires supported route metadata")
+    _alphamoe_nvfp4_routed_moe_impl(
+        hidden_states,
+        hidden_states_scale,
+        gemm1_weights,
+        gemm1_weights_scale,
+        gemm2_weights,
+        gemm2_weights_scale,
+        output1_scale_gate_scalar,
+        output1_scale_scalar,
+        output2_scale_scalar,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        topk_weights,
+        out,
+        topk_ids,
+        cumsum_buffer,
+        top_k,
+        block_m,
+        routed_scaling_factor,
+        w1_scale_prepared,
+        w2_scale_prepared,
+    )
+    return out
+
+
+def is_alphamoe_nvfp4_alignment_seed_supported(
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    block_size: int,
+    initial_out: torch.Tensor,
+    pad_sorted_token_ids: bool = True,
+) -> bool:
+    """Metadata-only dispatch predicate; callers retain their general fallback."""
+    return (
+        topk_ids.is_cuda and topk_ids.dtype == torch.int32 and topk_ids.is_contiguous()
+        and topk_ids.ndim == 2 and topk_ids.shape[0] > 0 and topk_ids.shape[1] > 0
+        and topk_ids.numel() <= 2147483647
+        and 1 < num_experts <= 1024 and block_size in (8, 16) and pad_sorted_token_ids
+        and initial_out.is_cuda and initial_out.dtype == torch.bfloat16
+        and initial_out.is_contiguous() and initial_out.ndim == 2
+        and initial_out.shape[0] == topk_ids.shape[0] and initial_out.shape[1] > 0
+        and initial_out.device == topk_ids.device
+    )
+
+
+def _uses_general_alignment_seed_portfolio(hidden_states, gemm1_weights, top_k, block_m):
+    return (hidden_states.shape[0] in (128, 512)
+            and (gemm1_weights.shape[1], hidden_states.shape[1] * 2, gemm1_weights.shape[0], top_k, block_m)
+            == (1024, 6144, 256, 8, 8))
+
+
+def is_alphamoe_nvfp4_routed_seed_supported(
+    hidden_states, gemm1_weights, topk_ids, out, top_k, block_m,
+):
+    """Return whether this exact compute route has a fused alignment/seed companion."""
+    if _uses_general_alignment_seed_portfolio(hidden_states, gemm1_weights, top_k, block_m):
+        return is_alphamoe_nvfp4_alignment_seed_supported(
+            topk_ids, gemm1_weights.shape[0] + 1, block_m, out, True)
+    return is_alphamoe_nvfp4_small_alignment_seed_supported(
+        topk_ids, gemm1_weights.shape[0] + 1, block_m, out, True)
+
+
+def prepare_nvfp4_w1_scales(w1_scale):
+    """Return native CP-layout U8 panels as ``[E*(N/128)*(K/256),16,128]``.
+
+    ``w1_scale`` keeps the original contiguous ``[E,N,K/16]`` E4M3 ABI and
+    gate/up order. The result is a separately owned tensor on the same device.
+    For row ``r=32*g+8*c+d`` and four-byte word ``k``, destination byte offset
+    inside its 2048-byte panel is ``((4*c+k)*8+d)*16+4*g``.
+    """
+    import torch
+
+    if w1_scale.dtype != torch.float8_e4m3fn:
+        raise TypeError("W1 scales must contain original E4M3 bytes")
+    if w1_scale.ndim != 3 or not w1_scale.is_contiguous():
+        raise ValueError("W1 scales must be contiguous [E,N,K/16]")
+    experts, rows, scale_columns = map(int, w1_scale.shape)
+    if min(experts, rows, scale_columns) <= 0 or rows % 128 or scale_columns % 16:
+        raise ValueError("Prepared W1 scales require N%128=0 and K%256=0")
+    panels = rows // 128
+    k_tiles = scale_columns // 16
+    # Raw axes: E, panel, g, c, d, K256 tile, word, byte.
+    raw = w1_scale.view(torch.uint8).reshape(
+        experts, panels, 4, 4, 8, k_tiles, 4, 4
+    )
+    # Prepared axes: E, panel, K256 tile, c, word, d, g, byte.
+    return raw.permute(0, 1, 5, 3, 6, 4, 2, 7).contiguous().reshape(
+        experts * panels * k_tiles, 16, 128
+    )
+
+
+def prepare_nvfp4_w2_scales(w2_scale):
+    """Return native CP-layout U8 panels ``[E*(K/128)*B,8,128]``.
+
+    Raw scales are contiguous E4M3 ``[E,K,8*B]``, B=N/256. At row
+    r=32*g+8*c+d, word q, byte b, the 1024-byte panel's destination is
+    ``((2*c+q)*8+d)*16+4*g+b``. Original raw scales remain the oracle input.
+    """
+    import torch
+
+    if w2_scale.dtype != torch.float8_e4m3fn:
+        raise TypeError("W2 scales must contain original E4M3 bytes")
+    if w2_scale.ndim != 3 or not w2_scale.is_contiguous():
+        raise ValueError("W2 scales must be contiguous [E,K,8*B]")
+    experts, rows, scale_columns = map(int, w2_scale.shape)
+    if min(experts, rows, scale_columns) <= 0 or rows % 128 or scale_columns % 8:
+        raise ValueError("Prepared W2 scales require K%128=0 and scale_columns%8=0")
+    output_tiles, intermediate_blocks = rows // 128, scale_columns // 8
+    # Original axes: E, output tile, g, c, d, intermediate block, word, byte.
+    raw = w2_scale.view(torch.uint8).reshape(
+        experts, output_tiles, 4, 4, 8, intermediate_blocks, 2, 4
+    )
+    # Native CP axes: E, output tile, intermediate block, c, word, d, g, byte.
+    return raw.permute(0, 1, 5, 3, 6, 4, 2, 7).contiguous().reshape(
+        experts * output_tiles * intermediate_blocks, 8, 128
+    )
+
+__all__ += ["prepare_nvfp4_w1_scales", "prepare_nvfp4_w2_scales"]
+
+
+def _uses_compact_owner_routed(
+    hidden_states, hidden_states_scale, gemm1_weights, gemm1_weights_scale,
+    gemm2_weights_scale, topk_ids, out, top_k, block_m,
+    w1_scale_prepared, w2_scale_prepared,
+):
+    # Only immutable metadata selects this private routed specialization.
+    m, packed_k = hidden_states.shape
+    e, n, _ = gemm1_weights.shape
+    k = packed_k * 2
+    if (m, n, k, e, top_k, block_m) != (512, 1024, 6144, 256, 8, 8):
+        return False
+    if not is_alphamoe_nvfp4_alignment_seed_supported(
+        topk_ids, e + 1, block_m, out, True
+    ):
+        return False
+    if w1_scale_prepared is None or w2_scale_prepared is None:
+        return False
+    return (
+        tuple(gemm1_weights_scale.shape) == (e, n, k // 16)
+        and tuple(gemm2_weights_scale.shape) == (e, k, n // 32)
+        and all(scale.data_ptr() % 4 == 0 for scale in (
+            hidden_states_scale, gemm1_weights_scale, gemm2_weights_scale))
+        and gemm2_weights_scale.data_ptr() % 8 == 0
+        and w1_scale_prepared.dtype == torch.uint8
+        and w1_scale_prepared.is_contiguous()
+        and w1_scale_prepared.device == gemm1_weights_scale.device
+        and tuple(w1_scale_prepared.shape) == (e * (n // 128) * (k // 256), 16, 128)
+        and w1_scale_prepared.data_ptr() % 16 == 0
+        and w2_scale_prepared.dtype == torch.uint8
+        and w2_scale_prepared.is_contiguous()
+        and w2_scale_prepared.device == gemm2_weights_scale.device
+        and tuple(w2_scale_prepared.shape) == (e * (k // 128) * (n // 256), 8, 128)
+        and w2_scale_prepared.data_ptr() % 16 == 0
+    )

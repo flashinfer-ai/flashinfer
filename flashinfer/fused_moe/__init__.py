@@ -183,6 +183,13 @@ from .trtllm_gen_routing import (  # noqa: F401
     trtllm_gen_routing as trtllm_gen_routing,
 )
 
+from .alphamoe_nvfp4_sm100 import (  # noqa: F401
+    alphamoe_nvfp4_aligned_moe as alphamoe_nvfp4_aligned_moe,
+    alphamoe_nvfp4_routed_moe as alphamoe_nvfp4_routed_moe,
+    prepare_nvfp4_w1_scales as prepare_nvfp4_w1_scales,
+    prepare_nvfp4_w2_scales as prepare_nvfp4_w2_scales,
+)
+
 from .bgmv_moe import (  # noqa: F401
     BGMVMoEBlackwellPlan as BGMVMoEBlackwellPlan,
     bgmv_moe as bgmv_moe,
@@ -362,6 +369,10 @@ __all__ = [
     "allocate_alphamoe_route_plan",
     "alphamoe_fused_router",
     "hash_topk",
+    "alphamoe_nvfp4_aligned_moe",
+    "alphamoe_nvfp4_routed_moe",
+    "prepare_nvfp4_w1_scales",
+    "prepare_nvfp4_w2_scales",
     "TrtllmGenRoutingResult",
     "trtllm_gen_routing",
     "bgmv_moe",

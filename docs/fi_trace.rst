@@ -206,6 +206,20 @@ files when ``FLASHINFER_TRACE_DUMP=1``:
    * - ``flashinfer.fused_moe``
      - ``alphamoe_fused_router``
      - ``moe_routing``
+   * - ``flashinfer.fused_moe``
+     - ``alphamoe_nvfp4_aligned_moe``
+     - ``moe``
+   * - ``flashinfer.fused_moe``
+     - ``alphamoe_nvfp4_routed_moe``
+     - ``moe``
+
+AlphaMoE aligned and routed traces include the optional uint8
+``w1_scale_prepared`` and ``w2_scale_prepared`` tensors with their supplied
+physical dimensions. They retain every raw scale input. When generating or
+replaying inputs, prepare these derived panels from the matching raw scales
+before repeated requests; unrelated panel bytes do not represent those weights.
+Omitting either optional tensor preserves the API's corresponding raw fallback.
+Routed traces also record the expert IDs and mutated alignment workspaces.
 
 MoE Routing Types
 -----------------

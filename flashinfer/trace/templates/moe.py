@@ -4011,6 +4011,226 @@ cute_dsl_mxfp8_mxfp4_moe_wrapper_run_trace = TraceTemplate(
 
 
 # ---------------------------------------------------------------------------
+# AlphaMoE NVFP4 (SM100/SM103 aligned and routed compute)
+# ---------------------------------------------------------------------------
+
+alphamoe_nvfp4_aligned_moe_trace = TraceTemplate(
+    op_type="moe",
+    name_prefix="alphamoe_nvfp4_aligned_moe",
+    description=(
+        "AlphaMoE NVFP4 up projection, SwiGLU requantization, and down "
+        "projection over a caller-provided aligned routing plan. Mutates the "
+        "preallocated BF16 out accumulator in place."
+    ),
+    axes={
+        "num_tokens": Var(description="Number of input tokens."),
+        "top_k": Const(abbrev="topk", description="Routes per token."),
+        "num_experts": Const(abbrev="e", description="Number of experts."),
+        "hidden_size": Const(abbrev="h", description="Logical hidden size K."),
+        "gemm1_out_size": Const(
+            abbrev="n", description="Combined gate/up row count N."
+        ),
+        "block_m": Const(abbrev="bm", description="Aligned-plan block size."),
+        "num_packed_hidden": Const(abbrev=""),
+        "num_hidden_scale_blocks": Const(abbrev=""),
+        "num_packed_intermediate": Const(abbrev=""),
+        "num_intermediate_scale_blocks": Const(abbrev=""),
+        "sorted_token_capacity": Var(description="Aligned-plan entry capacity."),
+        "route_block_capacity": Var(description="Aligned-plan block capacity."),
+        "one": Const(abbrev="", description="One-element device extent."),
+        "w1_prepared_panels": Var(
+            description="Physical panels of the optional W1 scale panels."
+        ),
+        "w1_prepared_rows": Var(
+            description="Physical rows of the optional W1 scale panels."
+        ),
+        "w1_prepared_columns": Var(
+            description="Physical columns of the optional W1 scale panels."
+        ),
+        "w2_prepared_panels": Var(
+            description="Physical panels of the optional W2 scale panels."
+        ),
+        "w2_prepared_rows": Var(
+            description="Physical rows of the optional W2 scale panels."
+        ),
+        "w2_prepared_columns": Var(
+            description="Physical columns of the optional W2 scale panels."
+        ),
+    },
+    inputs={
+        "hidden_states": Tensor(
+            ["num_tokens", "num_packed_hidden"],
+            dtype="uint8",
+            description="Packed E2M1 activations (even logical value in low nibble).",
+        ),
+        "hidden_states_scale": Tensor(
+            ["num_tokens", "num_hidden_scale_blocks"],
+            dtype="float8_e4m3fn",
+            description="Linear E4M3 scales, one per 16 logical values.",
+        ),
+        "gemm1_weights": Tensor(
+            ["num_experts", "gemm1_out_size", "num_packed_hidden"],
+            dtype="uint8",
+            description="Packed E2M1 gate/up weights in conventional row order.",
+        ),
+        "gemm1_weights_scale": Tensor(
+            ["num_experts", "gemm1_out_size", "num_hidden_scale_blocks"],
+            dtype="float8_e4m3fn",
+            description="Linear per-16 E4M3 gate/up weight scales.",
+        ),
+        "gemm2_weights": Tensor(
+            ["num_experts", "hidden_size", "num_packed_intermediate"],
+            dtype="uint8",
+            description="Packed E2M1 down-projection weights.",
+        ),
+        "gemm2_weights_scale": Tensor(
+            ["num_experts", "hidden_size", "num_intermediate_scale_blocks"],
+            dtype="float8_e4m3fn",
+            description="Linear per-16 E4M3 down-projection weight scales.",
+        ),
+        "w1_scale_prepared": Tensor(
+            ["w1_prepared_panels", "w1_prepared_rows", "w1_prepared_columns"],
+            dtype="uint8",
+            optional=True,
+            description="Immutable W1 scale panels prepared before requests; native rows/columns are 16/128.",
+        ),
+        "w2_scale_prepared": Tensor(
+            ["w2_prepared_panels", "w2_prepared_rows", "w2_prepared_columns"],
+            dtype="uint8",
+            optional=True,
+            description="Immutable W2 scale panels prepared before requests; native rows/columns are 8/128.",
+        ),
+        "output1_scale_gate_scalar": Tensor(
+            ["num_experts"],
+            dtype="float32",
+            description="Per-expert gate scale applied before SiLU.",
+        ),
+        "output1_scale_scalar": Tensor(
+            ["num_experts"],
+            dtype="float32",
+            description=(
+                "Per-expert up-projection scale; static ModelOpt uses the "
+                "up global scale divided by the second-activation scale."
+            ),
+        ),
+        "output2_scale_scalar": Tensor(
+            ["num_experts"],
+            dtype="float32",
+            description=(
+                "Per-expert down-projection scale applied before route weighting."
+            ),
+        ),
+        "sorted_token_ids": Tensor(
+            ["sorted_token_capacity"],
+            dtype="int32",
+            description="Capacity-sized aligned-plan token/route positions.",
+        ),
+        "expert_ids": Tensor(
+            ["route_block_capacity"],
+            dtype="int32",
+            description="Expert id for each capacity-sized routing block.",
+        ),
+        "num_tokens_post_padded": Tensor(
+            ["one"],
+            dtype="int32",
+            description="Device-side valid aligned-plan extent.",
+        ),
+        "topk_weights": Tensor(
+            ["num_tokens", "top_k"],
+            dtype="float32",
+            description="Routing weight for each token/route pair.",
+        ),
+        "out": Tensor(
+            ["num_tokens", "hidden_size"],
+            dtype="bfloat16",
+            description="Caller-owned BF16 accumulator mutated in place.",
+        ),
+        "top_k": Scalar("int32", description="Routes per token."),
+        "block_m": Scalar("int32", description="Aligned-plan block size."),
+        "routed_scaling_factor": Scalar(
+            "float32", description="Additional routed contribution scale."
+        ),
+    },
+    outputs={
+        "out": Tensor(
+            ["num_tokens", "hidden_size"],
+            param="out",
+            dtype="bfloat16",
+            description="Updated caller-owned BF16 accumulator.",
+        )
+    },
+    constraints=[
+        "hidden_size == 2 * num_packed_hidden",
+        "hidden_size == 16 * num_hidden_scale_blocks",
+        "gemm1_out_size == 4 * num_packed_intermediate",
+        "gemm1_out_size == 32 * num_intermediate_scale_blocks",
+        "hidden_size >= 256 and hidden_size % 256 == 0",
+        "gemm1_out_size >= 256 and gemm1_out_size % 256 == 0",
+        "top_k <= num_experts",
+        "block_m >= 8 and block_m % 8 == 0",
+        "sorted_token_capacity >= route_block_capacity * block_m",
+        "one == 1",
+    ],
+    tags=[
+        "status:experimental",
+        "backend:alphamoe",
+        "quantization:nvfp4",
+        "routing:prealigned",
+    ],
+)
+
+
+alphamoe_nvfp4_routed_moe_trace = TraceTemplate(
+    op_type="moe",
+    name_prefix="alphamoe_nvfp4_routed_moe",
+    description=(
+        "AlphaMoE NVFP4 route alignment, FP32 accumulator seeding, gate/up, "
+        "SwiGLU requantization, down projection and weighted accumulation. "
+        "Updates the caller's routing workspace and BF16 output in place."
+    ),
+    axes=dict(
+        alphamoe_nvfp4_aligned_moe_trace.axes,
+        cumsum_capacity=Var(description="Caller-provided route prefix-sum capacity."),
+    ),
+    inputs=dict(
+        alphamoe_nvfp4_aligned_moe_trace.inputs,
+        topk_ids=Tensor(
+            ["num_tokens", "top_k"],
+            dtype="int32",
+            description="Expert IDs for each input token and route.",
+        ),
+        cumsum_buffer=Tensor(
+            ["cumsum_capacity"],
+            dtype="int32",
+            description="Caller-owned prefix-sum workspace updated during alignment.",
+        ),
+    ),
+    outputs=dict(
+        alphamoe_nvfp4_aligned_moe_trace.outputs,
+        sorted_token_ids=Tensor(
+            ["sorted_token_capacity"], param="sorted_token_ids", dtype="int32"
+        ),
+        expert_ids=Tensor(
+            ["route_block_capacity"], param="expert_ids", dtype="int32"
+        ),
+        num_tokens_post_padded=Tensor(
+            ["one"], param="num_tokens_post_padded", dtype="int32"
+        ),
+        cumsum_buffer=Tensor(
+            ["cumsum_capacity"], param="cumsum_buffer", dtype="int32"
+        ),
+    ),
+    constraints=list(alphamoe_nvfp4_aligned_moe_trace.constraints),
+    tags=[
+        "status:experimental",
+        "backend:alphamoe",
+        "quantization:nvfp4",
+        "routing:topk_ids",
+    ],
+)
+
+
+# ---------------------------------------------------------------------------
 # B12x MoE (SM120/SM121 CuTe-DSL, bf16 input + FP4 packed weights)
 # ---------------------------------------------------------------------------
 
