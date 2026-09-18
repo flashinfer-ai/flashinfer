@@ -1297,6 +1297,27 @@ class CutlassFp8BlockConfig:
         return "CutlassFp8BlockConfig()"
 
 
+def _mxfp8_activation_quant(
+    quant: Optional[QuantConfig],
+    pair: tuple[QuantFormat, QuantFormat],
+    owner: str,
+) -> QuantConfig:
+    """Default and validate the ``quant`` passed to a CUTLASS MXFP8 preparer.
+
+    ``None`` means the pair's canonical linear pack. An explicit ``quant`` must
+    spell the same pair, so a config prepared for another layer cannot be passed
+    by accident; only ``swizzled_scale_factors`` is read from it.
+    """
+    if quant is None:
+        return QuantConfig(weight=pair[0], activation=pair[1])
+    if quant.pair != pair:
+        raise ValueError(
+            f"{owner}.prepare_activations requires {pair[0].name}×{pair[1].name}, "
+            f"got {quant!r}."
+        )
+    return quant
+
+
 @dataclass(frozen=True)
 class CutlassMxfp8Mxfp4Config:
     """CUTLASS MXFP8-activation x MXFP4-weight backend for SM100 / SM110 / SM12x.
@@ -1340,23 +1361,25 @@ class CutlassMxfp8Mxfp4Config:
         )
 
     @staticmethod
-    def prepare_activations(hidden_states_bf16, *, swizzled_scale_factors=False):
-        """Quantize BF16 activations to MXFP8.
+    def prepare_activations(hidden_states_bf16, *, quant: Optional[QuantConfig] = None):
+        """Quantize BF16 activations to MXFP8 for MXFP4×MXFP8.
 
-        The default is the canonical linear pack shared with
-        ``TrtllmFp4Config.prepare_activations`` for MXFP4×MXFP8. Pass
-        ``swizzled_scale_factors=True`` to produce the flat CUTLASS swizzled
-        1-D ``input_sf`` for a layer configured with
-        ``QuantConfig(swizzled_scale_factors=True)``.
+        Pass the layer's ``MoEConfig.quant`` so the pack layout follows the
+        declaration: the default (``None`` or ``swizzled_scale_factors`` unset /
+        ``False``) is the canonical linear pack shared with
+        ``TrtllmFp4Config.prepare_activations``; ``swizzled_scale_factors=True``
+        produces the flat CUTLASS swizzled 1-D ``input_sf``.
         """
-        if swizzled_scale_factors:
-            from .prepare import prepare_cutlass_mxfp8_activations
-
-            return prepare_cutlass_mxfp8_activations(hidden_states_bf16)
-        return TrtllmFp4Config.prepare_activations(
-            hidden_states_bf16,
-            quant=QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
+        from .prepare import (
+            prepare_cutlass_mxfp8_activations,
+            prepare_trtllm_fp4_activations,
         )
+
+        pair = (QuantFormat.MXFP4, QuantFormat.MXFP8)
+        quant = _mxfp8_activation_quant(quant, pair, "CutlassMxfp8Mxfp4Config")
+        if quant.swizzled_scale_factors is True:
+            return prepare_cutlass_mxfp8_activations(hidden_states_bf16)
+        return prepare_trtllm_fp4_activations(hidden_states_bf16, quant=quant)
 
     def __repr__(self) -> str:
         return "CutlassMxfp8Mxfp4Config()"
@@ -1406,23 +1429,26 @@ class CutlassMxfp8Config:
         )
 
     @staticmethod
-    def prepare_activations(hidden_states_bf16, *, swizzled_scale_factors=False):
-        """Quantize BF16 activations to MXFP8.
+    def prepare_activations(hidden_states_bf16, *, quant: Optional[QuantConfig] = None):
+        """Quantize BF16 activations to MXFP8 for MXFP8×MXFP8.
 
-        The default is the canonical linear pack shared with
-        ``TrtllmFp8BlockConfig.prepare_activations`` for MXFP8×MXFP8. Pass
-        ``swizzled_scale_factors=True`` to produce the flat CUTLASS swizzled
-        1-D ``input_sf`` for a layer configured with
-        ``QuantConfig(swizzled_scale_factors=True)``.
+        Pass the layer's ``MoEConfig.quant`` so the pack layout follows the
+        declaration: the default (``None`` or ``swizzled_scale_factors`` unset /
+        ``False``) is the canonical linear pack shared with
+        ``TrtllmFp8BlockConfig.prepare_activations``;
+        ``swizzled_scale_factors=True`` produces the flat CUTLASS swizzled 1-D
+        ``input_sf``.
         """
-        if swizzled_scale_factors:
-            from .prepare import prepare_cutlass_mxfp8_activations
-
-            return prepare_cutlass_mxfp8_activations(hidden_states_bf16)
-        return TrtllmFp8BlockConfig.prepare_activations(
-            hidden_states_bf16,
-            quant=QuantConfig(weight=QuantFormat.MXFP8, activation=QuantFormat.MXFP8),
+        from .prepare import (
+            prepare_cutlass_mxfp8_activations,
+            prepare_trtllm_fp8_block_activations,
         )
+
+        pair = (QuantFormat.MXFP8, QuantFormat.MXFP8)
+        quant = _mxfp8_activation_quant(quant, pair, "CutlassMxfp8Config")
+        if quant.swizzled_scale_factors is True:
+            return prepare_cutlass_mxfp8_activations(hidden_states_bf16)
+        return prepare_trtllm_fp8_block_activations(hidden_states_bf16, quant=quant)
 
     def __repr__(self) -> str:
         return "CutlassMxfp8Config()"

@@ -1060,6 +1060,19 @@ def test_cutlass_mxfp8_scale_layout_follows_swizzled_scale_factors(
     assert runner._linear_act_sf is (swizzled is not True)
 
 
+def test_cutlass_mxfp8_prepare_activations_reads_quant_config():
+    """The pack layout follows the same QuantConfig the layer declares."""
+    x = torch.randn(4, 64, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="requires MXFP8×MXFP8"):
+        CutlassMxfp8Config.prepare_activations(
+            x, quant=QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8)
+        )
+    with pytest.raises(ValueError, match="requires MXFP4×MXFP8"):
+        CutlassMxfp8Mxfp4Config.prepare_activations(
+            x, quant=QuantConfig(weight=QuantFormat.MXFP8, activation=QuantFormat.MXFP8)
+        )
+
+
 def test_cutlass_fp8_block_rejects_cuda_below_12_8(monkeypatch):
     monkeypatch.setattr(
         "flashinfer.jit.cpp_ext.is_cuda_version_at_least",
@@ -3095,8 +3108,14 @@ def test_cutlass_mxfp8_autotune_regenerates_swizzled_input_sf_across_bucket():
     x = torch.randn(num_tokens, hidden_size, device=device, dtype=torch.bfloat16) / 2
     w1, w2 = _make_bf16_experts(num_experts, hidden_size, intermediate_size, device)
     topk_ids, topk_weights = _make_routing(num_tokens, num_experts, top_k, device)
-    # The swizzled flat layout stays available behind the existing knob.
-    x_q, x_sf = CutlassMxfp8Config.prepare_activations(x, swizzled_scale_factors=True)
+    # The swizzled flat layout stays available behind the QuantConfig knob; the
+    # same quant drives both the pack layout and the layer declaration.
+    quant = QuantConfig(
+        weight=QuantFormat.MXFP8,
+        activation=QuantFormat.MXFP8,
+        swizzled_scale_factors=True,
+    )
+    x_q, x_sf = CutlassMxfp8Config.prepare_activations(x, quant=quant)
     view = CutlassMxfp8Config.prepare_weights(
         w1,
         w2,
@@ -3106,11 +3125,7 @@ def test_cutlass_mxfp8_autotune_regenerates_swizzled_input_sf_across_bucket():
         device=device,
     )
     config = _config(
-        quant=QuantConfig(
-            weight=QuantFormat.MXFP8,
-            activation=QuantFormat.MXFP8,
-            swizzled_scale_factors=True,
-        ),
+        quant=quant,
         experts=ExpertConfig(intermediate_size=intermediate_size),
         backend=BackendOptions((CutlassMxfp8Config(),)),
         execution=ExecutionConfig(enable_pdl=False, tune_max_num_tokens=8192),
