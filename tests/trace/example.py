@@ -82,14 +82,14 @@ moe_fp4_block_scale_renormalize_naive_routing_topk8_e32_h7168_i2048.json
 moe_fp4_block_scale_renormalize_routing_topk2_e8_h1024_i512_act3.json
 moe_fp4_block_scale_renormalize_routing_topk8_e32_h7168_i2048.json
 moe_fp4_block_scale_topk_routing_topk8_e32_h7168_i2048.json
-moe_fp8_block_scale_default_routing_topk8_e32_h7168_i2048.json
-moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048.json
-moe_fp8_block_scale_ds_shared_experts_s1_e33_topk8_ng8_kg4_h7168_i2048.json
-moe_fp8_block_scale_llama4_routing_topk1_e32_h7168_i2048.json
-moe_fp8_block_scale_renormalize_naive_routing_topk8_e32_h7168_i2048.json
-moe_fp8_block_scale_renormalize_routing_topk2_e8_h1024_i512.json
-moe_fp8_block_scale_renormalize_routing_topk8_e32_h7168_i2048.json
-moe_fp8_block_scale_topk_routing_topk8_e32_h7168_i2048.json
+moe_fp8_block_scale_default_routing_topk8_e32_h7168_i2048_act3.json
+moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048_act3.json
+moe_fp8_block_scale_ds_shared_experts_s1_e33_topk8_ng8_kg4_h7168_i2048_act3.json
+moe_fp8_block_scale_llama4_routing_topk1_e32_h7168_i2048_act3.json
+moe_fp8_block_scale_renormalize_naive_routing_topk8_e32_h7168_i2048_act3.json
+moe_fp8_block_scale_renormalize_routing_topk2_e8_h1024_i512_act3.json
+moe_fp8_block_scale_renormalize_routing_topk8_e32_h7168_i2048_act3.json
+moe_fp8_block_scale_topk_routing_topk8_e32_h7168_i2048_act3.json
 msa_proxy_score_fp4_h4_kv1.json
 msa_proxy_score_h4_kv1_d128.json
 msa_sparse_attention_h64_kv4_d128_topk16.json
@@ -118,7 +118,7 @@ top_p_sampling_v151936.json
 trtllm_bf16_moe_topk2_e8_h1024_i512.json
 trtllm_bf16_routed_moe_topk2_e8_h1024.json
 trtllm_fp4_block_scale_routed_moe_topk2_e8_h1024_act3.json
-trtllm_fp8_block_scale_routed_moe_topk2_e8_h1024.json
+trtllm_fp8_block_scale_routed_moe_topk2_e8_h1024_act3.json
 trtllm_fp8_per_tensor_scale_moe_topk2_e8_h1024_i512.json
 trtllm_fp8_per_tensor_scale_routed_moe_topk8_e32_h7168.json
 trtllm_gen_routing_e256_k8_t8.json
@@ -1197,6 +1197,7 @@ _moe_common = dict(
     local_expert_offset=0,
     local_num_experts=E_loc,
     routed_scaling_factor=2.5,
+    activation_type=3,
 )
 _moe_args = (routing_logits, routing_bias, hs, hs_scale, w1, w1s, w2, w2s)
 
@@ -1312,6 +1313,7 @@ with contextlib.suppress(Exception):
         topk_group=4,
         routing_method_type=2,
         num_fused_shared_experts=_S_fused,
+        activation_type=3,
     )
 
 
@@ -1687,6 +1689,7 @@ _pts_moe_fp8_block_common = dict(
     gemm1_weights_scale=_pts_moe_w1_fp8_scale,
     gemm2_weights=_pts_moe_w2_fp8,
     gemm2_weights_scale=_pts_moe_w2_fp8_scale,
+    activation_type=3,
     **_pts_moe_common,
 )
 flashinfer.prims_ts_fp8_block_scale_moe.fi_trace(
