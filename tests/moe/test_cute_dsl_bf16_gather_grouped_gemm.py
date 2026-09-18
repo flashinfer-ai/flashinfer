@@ -208,6 +208,122 @@ def _activation_cases():
 
 @cute_dsl_available
 @sm90_required
+def test_cute_dsl_bf16_gather_grouped_gemm_out_handling():
+    """Without ``out`` the gather GEMM allocates ``[permuted_m, I]`` in the
+    activation dtype and matches an explicit-buffer run bitwise; a wrong-shaped
+    ``out`` is rejected before any launch."""
+    from flashinfer.fused_moe.cute_dsl.moe_utils import moe_sort
+    from flashinfer.fused_moe.cute_dsl.sm90_contiguous_gather_grouped_gemm_act_fusion import (
+        interleave_up_gate_sm90,
+        sm90_contiguous_gather_grouped_gemm_act_fusion,
+    )
+
+    torch.manual_seed(5)
+    dtype = torch.bfloat16
+    num_experts, top_k, k, inter, num_tokens, tile_m = 8, 2, 256, 64, 37, 64
+    ids = make_random_topk_ids(num_experts, num_tokens, top_k)
+    scales = torch.rand(num_tokens, top_k, device="cuda", dtype=torch.float32)
+    (
+        tile_idx_to_expert_idx,
+        tile_idx_to_mn_limit,
+        _,
+        permuted_idx_to_expanded_idx,
+        _,
+        num_non_exiting_tiles,
+    ) = moe_sort(
+        ids, scales, num_experts=num_experts, top_k=top_k, tile_tokens_dim=tile_m
+    )
+    permuted_m = tile_idx_to_expert_idx.numel() * tile_m
+    x = torch.randn(num_tokens, k, device="cuda", dtype=dtype) / (k**0.25)
+    w1 = interleave_up_gate_sm90(
+        torch.randn(num_experts, 2 * inter, k, device="cuda", dtype=dtype) / (k**0.25)
+    )
+    args = (
+        x,
+        w1,
+        tile_idx_to_expert_idx,
+        tile_idx_to_mn_limit,
+        permuted_idx_to_expanded_idx,
+        num_non_exiting_tiles,
+    )
+    kwargs = dict(topk=top_k, permuted_m=permuted_m, tile_shape_mn=(tile_m, 64))
+
+    allocated = sm90_contiguous_gather_grouped_gemm_act_fusion(*args, **kwargs)
+    assert allocated.shape == (permuted_m, inter) and allocated.dtype == dtype
+    explicit = torch.zeros(permuted_m, inter, device="cuda", dtype=dtype)
+    sm90_contiguous_gather_grouped_gemm_act_fusion(*args, out=explicit, **kwargs)
+    n_valid_tiles = int(num_non_exiting_tiles.item())
+    valid = torch.arange(permuted_m, device="cuda") < n_valid_tiles * tile_m
+    torch.testing.assert_close(allocated[valid], explicit[valid], atol=0, rtol=0)
+
+    with pytest.raises(ValueError, match="out shape"):
+        sm90_contiguous_gather_grouped_gemm_act_fusion(
+            *args,
+            out=torch.empty(permuted_m, 2 * inter, device="cuda", dtype=dtype),
+            **kwargs,
+        )
+
+
+@cute_dsl_available
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires a CUDA GPU")
+def test_situ_f32_constant_and_runtime_beta():
+    """``situ_f32`` folds ``1 / beta`` for a trace-time Python beta and divides
+    for a runtime ``cutlass.Float32`` beta; both paths match the float32
+    reference ``beta * tanh(x / beta) * sigmoid(x)`` and each other."""
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass.cute.runtime import make_ptr
+
+    from flashinfer.fused_moe.cute_dsl.common.kernel_utils import situ_f32
+
+    @cute.kernel
+    def kernel(
+        x_ptr: cute.Pointer,
+        beta_ptr: cute.Pointer,
+        out_const_ptr: cute.Pointer,
+        out_runtime_ptr: cute.Pointer,
+        beta_const: cutlass.Constexpr[float],
+    ):
+        idx, _, _ = cute.arch.block_idx()
+        x = cutlass.Float32(x_ptr[idx])
+        out_const_ptr[idx] = situ_f32(x, beta_const)
+        out_runtime_ptr[idx] = situ_f32(x, cutlass.Float32(beta_ptr[0]))
+
+    @cute.jit
+    def launch(
+        x_ptr: cute.Pointer,
+        beta_ptr: cute.Pointer,
+        out_const_ptr: cute.Pointer,
+        out_runtime_ptr: cute.Pointer,
+        beta_const: cutlass.Constexpr[float],
+        count: cutlass.Constexpr[int],
+    ):
+        kernel(x_ptr, beta_ptr, out_const_ptr, out_runtime_ptr, beta_const).launch(
+            grid=(count, 1, 1), block=(1, 1, 1)
+        )
+
+    beta = 4.0
+    x = torch.linspace(-12.0, 12.0, 257, device="cuda", dtype=torch.float32)
+    beta_dev = torch.full((1,), beta, device="cuda", dtype=torch.float32)
+    out_const = torch.empty_like(x)
+    out_runtime = torch.empty_like(x)
+
+    def ptr(t):
+        return make_ptr(
+            cutlass.Float32, t.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
+        )
+
+    launch(ptr(x), ptr(beta_dev), ptr(out_const), ptr(out_runtime), beta, x.numel())
+    torch.cuda.synchronize()
+
+    ref = beta * torch.tanh(x / beta) * torch.sigmoid(x)
+    torch.testing.assert_close(out_const, ref, atol=2e-5, rtol=1e-5)
+    torch.testing.assert_close(out_runtime, ref, atol=2e-5, rtol=1e-5)
+    torch.testing.assert_close(out_runtime, out_const, atol=2e-6, rtol=1e-6)
+
+
+@cute_dsl_available
+@sm90_required
 @pytest.mark.parametrize("activation", _activation_cases())
 @pytest.mark.parametrize(
     "inter,tile_shape_mn",

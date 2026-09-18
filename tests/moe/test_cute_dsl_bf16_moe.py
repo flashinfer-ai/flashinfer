@@ -985,7 +985,14 @@ def _moe_activation_cases():
 
 
 def _make_activation_case(
-    activation, hidden, inter, num_experts, num_tokens, top_k, seed
+    activation,
+    hidden,
+    inter,
+    num_experts,
+    num_tokens,
+    top_k,
+    seed,
+    dtype=torch.bfloat16,
 ):
     """Inputs for one activation: the kernel's w1 (interleaved for gated
     activations, plain for ReLU2) plus the model-layout pack for the reference."""
@@ -994,7 +1001,6 @@ def _make_activation_case(
     )
 
     torch.manual_seed(seed)
-    dtype = torch.bfloat16
     gated = activation.is_gated
     x = torch.randn(num_tokens, hidden, device="cuda", dtype=dtype) / (hidden**0.25)
     w1_model = torch.randn(
@@ -1012,15 +1018,16 @@ def _make_activation_case(
 @sm90_required
 @pytest.mark.parametrize("activation", _moe_activation_cases())
 @pytest.mark.parametrize("num_tokens", [5, 640])
-def test_cute_dsl_bf16_moe_activation_types(activation, num_tokens):
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_cute_dsl_bf16_moe_activation_types(activation, num_tokens, dtype):
     """Each fused GEMM1 activation matches the shared float32 reference end
-    to end on the fixed default tactic."""
+    to end on the fixed default tactic, in bf16 and fp16."""
     from flashinfer.fused_moe.runners import _cute_dsl_activation_kwargs
     from flashinfer.fused_moe.cute_dsl.sm90_fused_moe import cute_dsl_fused_moe_bf16
 
     hidden, inter, num_experts, top_k = 1024, 256, 32, 4
     x, ids, scales, w1, w1_model, w2 = _make_activation_case(
-        activation, hidden, inter, num_experts, num_tokens, top_k, seed=21
+        activation, hidden, inter, num_experts, num_tokens, top_k, seed=21, dtype=dtype
     )
     out = cute_dsl_fused_moe_bf16(
         x,
@@ -1034,6 +1041,142 @@ def test_cute_dsl_bf16_moe_activation_types(activation, num_tokens):
     )
     ref = ref_moe(x, ids, scales, w1_model, w2, activation)
     torch.testing.assert_close(out.float(), ref, atol=3e-1, rtol=5e-2)
+
+
+@cute_dsl_available
+@sm90_required
+@pytest.mark.parametrize("activation", _moe_activation_cases())
+@pytest.mark.parametrize(
+    "tactic",
+    [
+        (64, ((64, 64), 1), ((64, 64), (1, 1), False)),
+        (128, ((128, 128), 8), ((128, 128), (1, 1), True)),
+    ],
+    ids=["m64_n64", "m128_n128_swz8_rasterM"],
+)
+def test_cute_dsl_bf16_moe_activation_explicit_tactics(activation, tactic):
+    """Every activation is correct on tactics other than the default: a 64-row
+    tile with 64-wide N tiles, and 128x128 tiles with GEMM1 walk swizzle and
+    M-major GEMM2 raster."""
+    from flashinfer.fused_moe.runners import _cute_dsl_activation_kwargs
+    from flashinfer.fused_moe.cute_dsl.sm90_fused_moe import cute_dsl_fused_moe_bf16
+
+    hidden, inter, num_experts, top_k, num_tokens = 1024, 256, 32, 4, 333
+    x, ids, scales, w1, w1_model, w2 = _make_activation_case(
+        activation, hidden, inter, num_experts, num_tokens, top_k, seed=24
+    )
+    out = cute_dsl_fused_moe_bf16(
+        x,
+        ids,
+        scales,
+        w1,
+        w2,
+        num_experts=num_experts,
+        top_k=top_k,
+        tactic=tactic,
+        **_cute_dsl_activation_kwargs(activation),
+    )
+    ref = ref_moe(x, ids, scales, w1_model, w2, activation)
+    torch.testing.assert_close(out.float(), ref, atol=3e-1, rtol=5e-2)
+
+
+@cute_dsl_available
+@sm90_required
+def test_cute_dsl_bf16_moe_activation_switching_reuses_kernels():
+    """Alternating activations on identical shapes: each call uses its own
+    GEMM1 specialization (no cross-activation result contamination) and a
+    second round compiles nothing new."""
+    from flashinfer.fused_moe.runners import _cute_dsl_activation_kwargs
+    from flashinfer.fused_moe.cute_dsl import (
+        sm90_contiguous_gather_grouped_gemm_act_fusion as gather,
+    )
+    from flashinfer.fused_moe.cute_dsl.sm90_fused_moe import cute_dsl_fused_moe_bf16
+
+    hidden, inter, num_experts, top_k, num_tokens = 1024, 256, 32, 4, 257
+    cases = []
+    for seed, param in enumerate(_moe_activation_cases(), start=30):
+        activation = param.values[0]
+        x, ids, scales, w1, w1_model, w2 = _make_activation_case(
+            activation, hidden, inter, num_experts, num_tokens, top_k, seed=seed
+        )
+        cases.append(
+            (
+                activation,
+                x,
+                ids,
+                scales,
+                w1,
+                w2,
+                ref_moe(x, ids, scales, w1_model, w2, activation),
+            )
+        )
+
+    def run_all():
+        for activation, x, ids, scales, w1, w2, ref in cases:
+            out = cute_dsl_fused_moe_bf16(
+                x,
+                ids,
+                scales,
+                w1,
+                w2,
+                num_experts=num_experts,
+                top_k=top_k,
+                **_cute_dsl_activation_kwargs(activation),
+            )
+            torch.testing.assert_close(out.float(), ref, atol=3e-1, rtol=5e-2)
+
+    run_all()
+    compiled = len(gather._gather_kernel_cache)
+    run_all()
+    assert len(gather._gather_kernel_cache) == compiled
+
+
+@cute_dsl_available
+@sm90_required
+@pytest.mark.parametrize("activation", _moe_activation_cases())
+def test_cute_dsl_bf16_moe_activation_cuda_graph_replay(activation):
+    """Non-default activations capture into a CUDA graph and a replay with
+    fresh activations and routing matches the reference."""
+    from flashinfer.fused_moe.runners import _cute_dsl_activation_kwargs
+    from flashinfer.fused_moe.cute_dsl.sm90_fused_moe import cute_dsl_fused_moe_bf16
+
+    hidden, inter, num_experts, top_k, num_tokens = 1024, 256, 32, 4, 200
+    act = _cute_dsl_activation_kwargs(activation)
+    x_st, ids_st, scales_st, w1, w1_model, w2 = _make_activation_case(
+        activation, hidden, inter, num_experts, num_tokens, top_k, seed=40
+    )
+    out_st = torch.empty(num_tokens, hidden, device="cuda", dtype=x_st.dtype)
+
+    def run():
+        return cute_dsl_fused_moe_bf16(
+            x_st,
+            ids_st,
+            scales_st,
+            w1,
+            w2,
+            num_experts=num_experts,
+            top_k=top_k,
+            moe_output=out_st,
+            **act,
+        )
+
+    for _ in range(3):
+        run()
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        run()
+
+    x_new, ids_new, scales_new, _, _, _ = _make_activation_case(
+        activation, hidden, inter, num_experts, num_tokens, top_k, seed=41
+    )
+    x_st.copy_(x_new)
+    ids_st.copy_(ids_new)
+    scales_st.copy_(scales_new)
+    g.replay()
+    torch.cuda.synchronize()
+    ref = ref_moe(x_new, ids_new, scales_new, w1_model, w2, activation)
+    torch.testing.assert_close(out_st.float(), ref, atol=3e-1, rtol=5e-2)
 
 
 @cute_dsl_available
