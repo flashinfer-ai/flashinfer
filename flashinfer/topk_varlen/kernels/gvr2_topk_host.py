@@ -270,7 +270,20 @@ def route(b: int, n: int, npad: int, k: int, sms: int = 148) -> dict[str, object
         return _reg(512, 2, 4, NB)
 
     # ---- clustered register-resident path ----
-    if n4 > 4096 and n4 <= 8 * BLKC * 4 and k <= BLKC:
+    # FlashInfer-local: K > BLKC (K = 2048) is admitted too. Upstream gates the
+    # family at k <= BLKC because its hint sample is one word per thread; the
+    # selection stages (merged scan, cursor emit, crossing-bin tie select,
+    # key-space fallback) are k-generic, and the identity write of short rows
+    # strides over k. The bracket then comes from the first BLKC row values
+    # instead of the first k (a looser bracket, same exact result). Measured
+    # B200, K = 2048, random lengths, vs the streaming slab it replaces:
+    # 1.4-2.3x for <= 32 rows at 20K-64K and for <= 64 rows at <= 32K; the
+    # 33-37 row band above 32K needs 4-CTA clusters that no longer fit one GPC
+    # wave (0.89x at 37 x 48K), hence the one-wave gate below for K > BLKC
+    # above 32K: b * cs <= 7/8 of the SM count (129 on B200/B300-148: 32 x 4
+    # admitted, 37 x 4 not; 182 on Rubin-208: 37-44 x 4 admitted, measured
+    # 2.1-2.3x vs the slab there, 52 x 4 not, 1.2-1.35x, left on the slab).
+    if n4 > 4096 and n4 <= 8 * BLKC * 4 and k <= 2 * BLKC:
         # FlashInfer-local: cluster availability from the real SM count on
         # parts with >= 148 SMs (Rubin 208: 4-CTA instead of 2-CTA clusters at
         # b 38-48, and reg_clus instead of main/clus at b 80-104 / 48K-64K,
@@ -296,7 +309,7 @@ def route(b: int, n: int, npad: int, k: int, sms: int = 148) -> dict[str, object
                     vsel = v
                     cs = c
                     break
-        if vsel and cs >= 2:
+        if vsel and cs >= 2 and (k <= BLKC or n4 <= 8192 or b * cs <= (7 * sms) // 8):
             smc = (3 * NB + 2 * CMPC) * 4
             return {
                 "kernel": "reg_clus",

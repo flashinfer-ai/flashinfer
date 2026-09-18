@@ -6951,11 +6951,15 @@ class GvrRegClusKernel:
                 n = nv
             if short != cutlass.Int32(0):
                 if rank == cutlass.Int32(0):
-                    if tid < kq:
+                    # k may exceed BLK (K = 2048 rows are admitted to this
+                    # family): stride the identity write
+                    jq = tid
+                    while jq < kq:
                         ov = cutlass.Int32(-1)
-                        if tid < nv:
-                            ov = self._ox_g(pre_idx, tid)
-                        out[row, tid] = ov
+                        if jq < nv:
+                            ov = self._ox_g(pre_idx, jq)
+                        out[row, jq] = ov
+                        jq = jq + cutlass.Int32(BLK)
 
         # ------------------------------------------------------------------
         # Predeclarations (DSL AST rule: every scalar (re)assigned under a
@@ -7073,11 +7077,13 @@ class GvrRegClusKernel:
             base4 = rank * cutlass.Int32(self.span)
             tix = (n4 << cutlass.Int32(2)) + tid  # CUDA `tidx`
 
-            # ---- P0: redundant hint gather, EVERY CTA (k<=BLK by dispatch
-            # gate). One coalesced word per thread, NO cluster barrier —
-            # GMIN/GMAX identical everywhere by construction. hint-free: the
-            # first k row positions stand in for the hint (identity sample),
-            # no pre_idx load (upstream PR NVIDIA/TensorRT-LLM#18410).
+            # ---- P0: redundant hint gather, EVERY CTA. One coalesced word per
+            # thread (the first min(k, BLK) hint / row positions; K = 2048 rows
+            # sample the first BLK, a looser bracket with the same exact
+            # result), NO cluster barrier — GMIN/GMAX identical everywhere by
+            # construction. hint-free: the first row positions stand in for the
+            # hint (identity sample), no pre_idx load (upstream PR
+            # NVIDIA/TensorRT-LLM#18410).
             if cutlass.const_expr(self.hint_free):
                 if tid < k:
                     pv0 = tid

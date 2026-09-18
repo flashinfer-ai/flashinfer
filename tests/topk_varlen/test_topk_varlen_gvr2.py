@@ -543,6 +543,9 @@ def _assert_family(rows, msl_c, top_k, next_n, cr, want, hint_free=False):
     "rows,msl_c,top_k,next_n,cr,family",
     [
         (8, 131072, 1024, 4, 4, "reg_clus"),  # clustered register-resident
+        (8, 32768, 2048, 1, 1, "reg_clus"),  # K > BLKC admitted (local), CS=4
+        (64, 32768, 2048, 1, 1, "reg_clus"),  # K > BLKC, CS=2, one wave
+        (16, 65536, 2048, 2, 1, "reg_clus"),  # K > BLKC above 32K, next_n rows
         (8, 6144, 512, 1, 4, "reg"),  # register-resident (local VPT=2 rung)
         (8, 8192, 512, 1, 1, "reg"),  # local VPT=2 rung, top of its band
         (256, 8192, 512, 1, 1, "reg"),  # local b > 148 BLK=512 rung (upstream: main)
@@ -1201,6 +1204,12 @@ def test_gvr2_route_pure_and_total():
         ([8192, 5000, 300, 1], 1, 1, 512),  # reg VPT=2 rung + short rows
         ([8192 * 4, 6000 * 4, 2048 * 4], 2, 4, 512),  # MTP rows, cr=4
         ([65536, 40000, 1000], 1, 1, 1024),  # reg_clus band
+        (
+            [32768, 20000, 2049, 2048, 1500, 1],
+            1,
+            1,
+            2048,
+        ),  # reg_clus, K > BLKC: short rows stride the identity write
         ([262144, 100000, 2047], 1, 1, 2048),  # main/clus band, K=2048
         ([8192] * 200 + [100] * 56, 1, 1, 512),  # b > sms BLK=512/VPT=4 rung
     ],
@@ -1521,6 +1530,46 @@ def test_gvr2_hint_free_concurrent_first_calls_on_many_streams_are_exact():
     assert not errors, errors
     for b, out in zip(batches, outs, strict=True):
         _check_varlen_rows(logits[:b], out, [n] * b, top_k)
+
+
+def test_gvr2_route_reg_clus_k2048():
+    """K = 2048 is admitted to the clustered register family (FlashInfer-local;
+    upstream gates it at k <= BLKC): every admitted row count up to 32K, and
+    above 32K only while the cluster grid fits one GPC wave (b * cs <= 7/8 of
+    the SM count: 129 on B200, 182 on Rubin)."""
+    r = _host.route
+    for n in (20480, 32768):
+        assert r(1, n, _round64(n), 2048)["kernel"] == "reg_clus"
+        assert (
+            r(37, n, _round64(n), 2048)["kernel"] == "reg_clus"
+        )  # 148 CTAs, still beats the slab here
+        assert r(64, n, _round64(n), 2048)["tpl"] == (1024, 4, 2)
+        assert (
+            r(75, n, _round64(n), 2048)["kernel"] == "main"
+        )  # no cluster fits (av == 1)
+    for n in (49152, 65536):
+        assert r(1, n, _round64(n), 2048)["kernel"] == "reg_clus"
+        assert r(32, n, _round64(n), 2048)["tpl"] == (
+            1024,
+            4,
+            4,
+        )  # 128 CTAs: one wave on B200
+        assert (
+            r(37, n, _round64(n), 2048)["kernel"] == "main"
+        )  # 148 CTAs of 4-clusters: two waves on B200
+        assert r(44, n, _round64(n), 2048, sms=208)["tpl"] == (
+            1024,
+            4,
+            4,
+        )  # Rubin: 176 CTAs fit
+        assert (
+            r(52, n, _round64(n), 2048, sms=208)["kernel"] == "main"
+        )  # Rubin: 208 CTAs do not
+    # K <= BLKC admission unchanged by the wave gate
+    assert r(37, 65536, 65536, 1024)["kernel"] == "reg_clus"
+    assert (
+        r(1, 16384, 16384, 2048)["kernel"] == "reg"
+    )  # below the band: register rung as before
 
 
 def test_gvr2_route_reg_clus_sm_count_aware():
