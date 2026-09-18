@@ -1455,6 +1455,7 @@ class GvrMainKernel:
         paged: bool = False,
         page_shift: int = 0,
         pt_smem: int = 0,
+        pdl: bool = False,
     ):
         assert nbs == 256, "SNB must stay 256"
         assert blk in (256, 512, 1024) and u in (1, 2, 4, 8)
@@ -1465,6 +1466,10 @@ class GvrMainKernel:
         self.nbs = nbs
         self.kpt = kpt
         self.split = bool(split)
+        # programmatic dependent launch: griddepcontrol.wait is the first
+        # instruction (before any global read), so the preceding kernel's
+        # outputs are complete; only the launch processing overlaps its tail
+        self.pdl = bool(pdl)
         # hint-free: gather_hint sites compiled out (sentinel pass-through);
         # upstream PR NVIDIA/TensorRT-LLM#18410
         self.hint_free = bool(hint_free)
@@ -1665,6 +1670,9 @@ class GvrMainKernel:
         PFD = self.pfd
         NATT = self.natt
         NW = BLK // 32
+
+        if cutlass.const_expr(self.pdl):
+            cute.arch.griddepcontrol_wait()
 
         tidx, _, _ = cute.arch.thread_idx()
         bx, by, _ = cute.arch.block_idx()  # 2-D grid (part, row)
@@ -3332,7 +3340,13 @@ class GvrMainKernel:
             amin,
             sd_en,
             tsh_en,
-        ).launch(grid=(R, b, 1), block=(self.blk, 1, 1), stream=stream, min_blocks_per_mp=self.minb)
+        ).launch(
+            grid=(R, b, 1),
+            block=(self.blk, 1, 1),
+            stream=stream,
+            min_blocks_per_mp=self.minb,
+            use_pdl=self.pdl,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -3350,6 +3364,7 @@ def get_compiled(
     paged: bool = False,
     page_shift: int = 0,
     pt_smem: int = 0,
+    pdl: bool = False,
 ):
     """Compile (or fetch) the gvr_main variant for constexpr tuple
     tpl = (BLK, U, MINB, NBS, KPT, SPLIT, TSHG)                — legacy, or
@@ -3375,6 +3390,7 @@ def get_compiled(
         paged,
         int(page_shift) if paged else 0,
         int(pt_smem) if paged else 0,
+        bool(pdl),
         C._compile_arch_token(),
     )
     if prefill and len(tpl) != 10:
@@ -3385,7 +3401,7 @@ def get_compiled(
     if len(tpl) == 7:
         blk, u, minb, nbs, kpt, split, tshg = tpl
         kern = GvrMainKernel(
-            blk, u, minb, nbs, kpt, bool(split), bool(tshg), hint_free=bool(hint_free)
+            blk, u, minb, nbs, kpt, bool(split), bool(tshg), hint_free=bool(hint_free), pdl=bool(pdl)
         )
     else:
         blk, u, minb, nbs, kpt, split, tshg, next_n, cr_shift, r_const = tpl
@@ -3407,6 +3423,7 @@ def get_compiled(
             paged=paged,
             page_shift=int(page_shift) if paged else 0,
             pt_smem=int(pt_smem) if paged else 0,
+            pdl=bool(pdl),
         )
     r0, c0 = cute.sym_int(), cute.sym_int()
     r1, c1 = cute.sym_int(), cute.sym_int()
@@ -3468,6 +3485,8 @@ def get_compiled(
         name += f"_pg{int(page_shift)}"
         if pt_smem:
             name += f"_pts{int(pt_smem)}"
+    if pdl:
+        name += "_pdl1"
     compiled = C._persist(name, _compile_fn)
     _COMPILE_CACHE[key] = compiled
     return compiled
@@ -5295,11 +5314,14 @@ class GvrClusKernel:
         paged: bool = False,
         page_shift: int = 0,
         pt_smem: int = 0,
+        pdl: bool = False,
     ):
         assert blk == 1024, "gvr_clus is always BLK=1024"
         assert minb == 1, "gvr_clus is __launch_bounds__(BLK, 1)"
         assert nbs == 256, "SNB must stay 256"
         assert u in (1, 2, 4, 8) and cs in (2, 4, 8)
+        # programmatic dependent launch (griddepcontrol.wait first, see GvrMainKernel)
+        self.pdl = bool(pdl)
         # per-row varlen mode (production heuristicTopKDecode contract, same
         # semantics as GvrMainKernel / GvrRegClusKernel): n and the sampling-
         # ladder scalars are re-derived PER ROW in-kernel from a device
@@ -5546,6 +5568,9 @@ class GvrClusKernel:
         PFD = self.pfd
         STEPC = self.stepc
         NW = BLK // 32
+
+        if cutlass.const_expr(self.pdl):
+            cute.arch.griddepcontrol_wait()
 
         tidx, _, _ = cute.arch.thread_idx()
         bx, by, _ = cute.arch.block_idx()  # (rank, row)
@@ -6547,6 +6572,7 @@ class GvrClusKernel:
             cluster=(self.cs, 1, 1),
             stream=stream,
             min_blocks_per_mp=self.minb,
+            use_pdl=self.pdl,
         )
 
 
@@ -6568,6 +6594,7 @@ def get_compiled__clus(
     paged: bool = False,
     page_shift: int = 0,
     pt_smem: int = 0,
+    pdl: bool = False,
 ):
     """Compile (or fetch) the gvr_clus variant for constexpr tuple
     tpl = (BLK, U, MINB, NBS, CS); scap/cmp are smem-extent keys (every
@@ -6584,6 +6611,7 @@ def get_compiled__clus(
         bool(paged),
         int(page_shift) if paged else 0,
         int(pt_smem) if paged else 0,
+        bool(pdl),
         C._compile_arch_token(),
     )
     if paged and not (varlen and hint_free):
@@ -6607,6 +6635,7 @@ def get_compiled__clus(
         paged=bool(paged),
         page_shift=int(page_shift) if paged else 0,
         pt_smem=int(pt_smem) if paged else 0,
+        pdl=bool(pdl),
     )
     r0, c0 = cute.sym_int(), cute.sym_int()
     r1, c1 = cute.sym_int(), cute.sym_int()
@@ -6644,6 +6673,7 @@ def get_compiled__clus(
         + ("_hf" if hint_free else "")
         + (f"_pg{int(page_shift)}" if paged else "")
         + (f"_pts{int(pt_smem)}" if (paged and pt_smem) else "")
+        + ("_pdl1" if pdl else "")
     )
     if options_extra:
         name += "_opt_" + options_extra
