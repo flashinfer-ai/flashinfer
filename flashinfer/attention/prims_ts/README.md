@@ -25,6 +25,7 @@ Import all entries below from `flashinfer.attention.prims_ts`.
 | QToken-KvBlock-Sparse-Attention | [Packed-prefill and fixed-decode example](https://github.com/PerkzZheng/prims-ts-examples/blob/main/q_token_kv_block_sparse_attention.py) | `QTokenKvBlockSparsePagedTSWrapper`, `q_token_kv_block_sparse_attention_with_paged_kv_cache`, `get_q_token_kv_block_sparse_workspace_size`, `suggest_q_token_kv_block_sparse_group_size`, `validate_q_token_kv_block_sparse_group_size`, `make_q_token_kv_block_sparse_qo_indptr` |
 | Block-sparse FMHA | — | `BlockSparseTSWrapper`, `block_sparse_attention`; fixed-Q paged KV: `BlockSparsePagedTSWrapper`, `block_sparse_attention_with_paged_kv_cache` |
 | MLA decode | [Task-Scheduled MLA Decode](kernels/mla_decode/README.md) | `BatchMLADecodePagedTSWrapper`, `batch_mla_decode_with_paged_kv_cache`, `get_prims_ts_batch_mla_decode_workspace_size`, `prims_ts_batch_mla_decode_with_kv_cache` |
+| DSV4 sparse MLA (CSA/HCA) | — | `prims_ts_dsv4_csa`, `prims_ts_dsv4_sparse_mla_rope_quant`, `prims_ts_dsv4_csa_rope_quant`, `prims_ts_dsv4_hca_rope_quant` |
 
 The component guides define supported shapes, layouts, metadata lifetime,
 output/workspace ownership, examples, limitations, and validation commands.
@@ -196,5 +197,6 @@ pytest -q \
   tests/attention/test_attention_ts_q_token_kv_block_sparse_metadata.py \
   tests/attention/test_attention_ts_block_sparse.py \
   tests/attention/test_attention_ts_mask.py \
-  tests/attention/test_attention_ts_mla_decode.py
+  tests/attention/test_attention_ts_mla_decode.py \
+  tests/attention/test_prims_ts_dsv4_csa.py
 ```

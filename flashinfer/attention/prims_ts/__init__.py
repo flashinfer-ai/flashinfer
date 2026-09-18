@@ -31,6 +31,12 @@ from .decode import (
     suggest_q_token_kv_block_sparse_group_size,
     validate_q_token_kv_block_sparse_group_size,
 )
+from .dsv4_csa import (
+    prims_ts_dsv4_csa,
+    prims_ts_dsv4_csa_rope_quant,
+    prims_ts_dsv4_hca_rope_quant,
+    prims_ts_dsv4_sparse_mla_rope_quant,
+)
 from .context import (
     BatchPrefillPagedTSWrapper,
     BatchPrefillTSWrapper,
@@ -70,6 +76,10 @@ __all__ = [
     "QTokenKvBlockSparsePagedTSWrapper",
     "get_q_token_kv_block_sparse_workspace_size",
     "q_token_kv_block_sparse_attention_with_paged_kv_cache",
+    "prims_ts_dsv4_csa",
+    "prims_ts_dsv4_sparse_mla_rope_quant",
+    "prims_ts_dsv4_csa_rope_quant",
+    "prims_ts_dsv4_hca_rope_quant",
     "BatchMLADecodePagedTSWrapper",
     "batch_mla_decode_with_paged_kv_cache",
     "get_prims_ts_batch_mla_decode_workspace_size",
