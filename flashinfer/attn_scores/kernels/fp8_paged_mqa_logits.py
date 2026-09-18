@@ -90,6 +90,26 @@ from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 # form is also accepted by older wrappers, so keep it version-independent.
 _RND_RN = "rn"
 
+
+@dsl_user_op
+def relu_f32(a: cutlass.Float32, *, loc=None, ip=None) -> cutlass.Float32:
+    """relu(x) = max(x, 0) as one FMNMX (PTX `max.NaN.f32`): exact and range-safe for
+    every finite x (no intermediate can overflow), NaN-propagating like the
+    cutlass.max it stands in for, one instruction per head where cutlass.max
+    lowers to a compare + select pair."""
+    f32_ty = cutlass.Float32.mlir_type
+    return cutlass.Float32(
+        llvm.inline_asm(
+            f32_ty,
+            [cutlass.Float32(a).ir_value(loc=loc, ip=ip)],
+            "max.NaN.f32 $0, $1, 0f00000000;",
+            "=f,f",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
 # Epilogue FMA unroll. NUM_W_IN_REG is the split point between the register
 # and SMEM weight paths, both unrolled this wide, so it must stay a multiple
 # of it -- otherwise the two paths stop tiling the subtile and the epilogue
@@ -1834,27 +1854,15 @@ class FP8MQALogitsKernel:
                                         ps0 = fma_f16x2(pa01, pw01, ps0)
                                         ps1 = fma_f16x2(pa23, pw23, ps1)
                                     else:
-                                        # relu(x) = (x + |x|) / 2: two packed
-                                        # FADD2 with a free |.| operand modifier
-                                        # replace four FMNMX (no packed f32x2 max
-                                        # exists). Exact for finite x, and the
-                                        # accumulator is a finite dot product of
-                                        # fp8 operands; the /2 folds into the
-                                        # scale multiply at the store. Ported
-                                        # from DKG MR !27837.
-                                        a0, a1 = cute.arch.add_packed_f32x2(
-                                            (acc_vec[n0], acc_vec[n0 + 1]),
-                                            (abs(acc_vec[n0]), abs(acc_vec[n0 + 1])),
-                                            rnd=_RND_RN,
-                                        )
-                                        a2, a3 = cute.arch.add_packed_f32x2(
-                                            (acc_vec[n0 + 2], acc_vec[n0 + 3]),
-                                            (
-                                                abs(acc_vec[n0 + 2]),
-                                                abs(acc_vec[n0 + 3]),
-                                            ),
-                                            rnd=_RND_RN,
-                                        )
+                                        # relu as one FMNMX per head (`max.NaN.f32`): exact and range-safe for
+                                        # every finite accumulator (the (x + |x|) / 2 form it replaces overflowed
+                                        # for x >= 2^127, reachable through unbounded scales / weights), NaN-
+                                        # propagating like the scalar max, one instruction per head. Weights are
+                                        # applied unscaled. Ported from DKG MR !27837, range-safe form.
+                                        a0 = relu_f32(acc_vec[n0])
+                                        a1 = relu_f32(acc_vec[n0 + 1])
+                                        a2 = relu_f32(acc_vec[n0 + 2])
+                                        a3 = relu_f32(acc_vec[n0 + 3])
                                         r0 = t * NUM_W_IN_REG + h_g
                                         w0 = w_cache[r0]
                                         w1 = w_cache[r0 + 1]
@@ -1903,27 +1911,15 @@ class FP8MQALogitsKernel:
                                         ps0 = fma_f16x2(pa01, pw01, ps0)
                                         ps1 = fma_f16x2(pa23, pw23, ps1)
                                     else:
-                                        # relu(x) = (x + |x|) / 2: two packed
-                                        # FADD2 with a free |.| operand modifier
-                                        # replace four FMNMX (no packed f32x2 max
-                                        # exists). Exact for finite x, and the
-                                        # accumulator is a finite dot product of
-                                        # fp8 operands; the /2 folds into the
-                                        # scale multiply at the store. Ported
-                                        # from DKG MR !27837.
-                                        a0, a1 = cute.arch.add_packed_f32x2(
-                                            (acc_vec[n0], acc_vec[n0 + 1]),
-                                            (abs(acc_vec[n0]), abs(acc_vec[n0 + 1])),
-                                            rnd=_RND_RN,
-                                        )
-                                        a2, a3 = cute.arch.add_packed_f32x2(
-                                            (acc_vec[n0 + 2], acc_vec[n0 + 3]),
-                                            (
-                                                abs(acc_vec[n0 + 2]),
-                                                abs(acc_vec[n0 + 3]),
-                                            ),
-                                            rnd=_RND_RN,
-                                        )
+                                        # relu as one FMNMX per head (`max.NaN.f32`): exact and range-safe for
+                                        # every finite accumulator (the (x + |x|) / 2 form it replaces overflowed
+                                        # for x >= 2^127, reachable through unbounded scales / weights), NaN-
+                                        # propagating like the scalar max, one instruction per head. Weights are
+                                        # applied unscaled. Ported from DKG MR !27837, range-safe form.
+                                        a0 = relu_f32(acc_vec[n0])
+                                        a1 = relu_f32(acc_vec[n0 + 1])
+                                        a2 = relu_f32(acc_vec[n0 + 2])
+                                        a3 = relu_f32(acc_vec[n0 + 3])
                                         w0 = sW[(t * num_heads + h_g, q_stage_local)]
                                         w1 = sW[
                                             (t * num_heads + h_g + 1, q_stage_local)
@@ -1956,9 +1952,7 @@ class FP8MQALogitsKernel:
                                     )
                                 else:
                                     mLogits_flat[out_off_t] = self.output_dtype(
-                                        # * 0.5 is the divisor of the
-                                        # relu(x) = (x + |x|) / 2 rewrite above
-                                        result_t * (scale_val * 0.5)
+                                        result_t * scale_val
                                     )
                             else:
                                 out_row = q_idx * next_n + t
@@ -1970,9 +1964,7 @@ class FP8MQALogitsKernel:
                                     )
                                 else:
                                     mLogits_2d[(out_row, kv_pos)] = self.output_dtype(
-                                        # * 0.5 is the divisor of the
-                                        # relu(x) = (x + |x|) / 2 rewrite above
-                                        result_t * (scale_val * 0.5)
+                                        result_t * scale_val
                                     )
                         # Advance within this q
                         kv_idx = kv_idx + NUM_MATH_WG
@@ -2270,27 +2262,15 @@ class FP8MQALogitsKernel:
                                         ps0 = fma_f16x2(pa01, pw01, ps0)
                                         ps1 = fma_f16x2(pa23, pw23, ps1)
                                     else:
-                                        # relu(x) = (x + |x|) / 2: two packed
-                                        # FADD2 with a free |.| operand modifier
-                                        # replace four FMNMX (no packed f32x2 max
-                                        # exists). Exact for finite x, and the
-                                        # accumulator is a finite dot product of
-                                        # fp8 operands; the /2 folds into the
-                                        # scale multiply at the store. Ported
-                                        # from DKG MR !27837.
-                                        a0, a1 = cute.arch.add_packed_f32x2(
-                                            (acc_vec[n0], acc_vec[n0 + 1]),
-                                            (abs(acc_vec[n0]), abs(acc_vec[n0 + 1])),
-                                            rnd=_RND_RN,
-                                        )
-                                        a2, a3 = cute.arch.add_packed_f32x2(
-                                            (acc_vec[n0 + 2], acc_vec[n0 + 3]),
-                                            (
-                                                abs(acc_vec[n0 + 2]),
-                                                abs(acc_vec[n0 + 3]),
-                                            ),
-                                            rnd=_RND_RN,
-                                        )
+                                        # relu as one FMNMX per head (`max.NaN.f32`): exact and range-safe for
+                                        # every finite accumulator (the (x + |x|) / 2 form it replaces overflowed
+                                        # for x >= 2^127, reachable through unbounded scales / weights), NaN-
+                                        # propagating like the scalar max, one instruction per head. Weights are
+                                        # applied unscaled. Ported from DKG MR !27837, range-safe form.
+                                        a0 = relu_f32(acc_vec[n0])
+                                        a1 = relu_f32(acc_vec[n0 + 1])
+                                        a2 = relu_f32(acc_vec[n0 + 2])
+                                        a3 = relu_f32(acc_vec[n0 + 3])
                                         r0 = t * NUM_W_IN_REG + h_g
                                         w0 = w_cache[r0]
                                         w1 = w_cache[r0 + 1]
@@ -2339,27 +2319,15 @@ class FP8MQALogitsKernel:
                                         ps0 = fma_f16x2(pa01, pw01, ps0)
                                         ps1 = fma_f16x2(pa23, pw23, ps1)
                                     else:
-                                        # relu(x) = (x + |x|) / 2: two packed
-                                        # FADD2 with a free |.| operand modifier
-                                        # replace four FMNMX (no packed f32x2 max
-                                        # exists). Exact for finite x, and the
-                                        # accumulator is a finite dot product of
-                                        # fp8 operands; the /2 folds into the
-                                        # scale multiply at the store. Ported
-                                        # from DKG MR !27837.
-                                        a0, a1 = cute.arch.add_packed_f32x2(
-                                            (acc_vec[n0], acc_vec[n0 + 1]),
-                                            (abs(acc_vec[n0]), abs(acc_vec[n0 + 1])),
-                                            rnd=_RND_RN,
-                                        )
-                                        a2, a3 = cute.arch.add_packed_f32x2(
-                                            (acc_vec[n0 + 2], acc_vec[n0 + 3]),
-                                            (
-                                                abs(acc_vec[n0 + 2]),
-                                                abs(acc_vec[n0 + 3]),
-                                            ),
-                                            rnd=_RND_RN,
-                                        )
+                                        # relu as one FMNMX per head (`max.NaN.f32`): exact and range-safe for
+                                        # every finite accumulator (the (x + |x|) / 2 form it replaces overflowed
+                                        # for x >= 2^127, reachable through unbounded scales / weights), NaN-
+                                        # propagating like the scalar max, one instruction per head. Weights are
+                                        # applied unscaled. Ported from DKG MR !27837, range-safe form.
+                                        a0 = relu_f32(acc_vec[n0])
+                                        a1 = relu_f32(acc_vec[n0 + 1])
+                                        a2 = relu_f32(acc_vec[n0 + 2])
+                                        a3 = relu_f32(acc_vec[n0 + 3])
                                         w0 = sW[(t * num_heads + h_g, q_stage_local)]
                                         w1 = sW[
                                             (t * num_heads + h_g + 1, q_stage_local)
@@ -2392,9 +2360,7 @@ class FP8MQALogitsKernel:
                                     )
                                 else:
                                     mLogits_flat[out_off_t] = self.output_dtype(
-                                        # * 0.5 is the divisor of the
-                                        # relu(x) = (x + |x|) / 2 rewrite above
-                                        result_t * (scale_val * 0.5)
+                                        result_t * scale_val
                                     )
                             else:
                                 out_row = q_idx * next_n + t
@@ -2406,9 +2372,7 @@ class FP8MQALogitsKernel:
                                     )
                                 else:
                                     mLogits_2d[(out_row, kv_pos)] = self.output_dtype(
-                                        # * 0.5 is the divisor of the
-                                        # relu(x) = (x + |x|) / 2 rewrite above
-                                        result_t * (scale_val * 0.5)
+                                        result_t * scale_val
                                     )
                         # Advance within this q
                         kv_idx = kv_idx + NUM_MATH_WG
