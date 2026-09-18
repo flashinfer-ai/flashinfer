@@ -7262,7 +7262,7 @@ def prepare_tf32_kda_prefill(
     sequence_lengths=None, state_indices=None, state_checkpoints=None,
     checkpoint_cu_starts=None, checkpoint_every_n_tokens=0, beta_is_logit=True,
 ):
-    """Prepare a TF32 KDA inference call on SM103a.
+    """Prepare a TF32 KDA inference call on SM100a or SM103a.
 
     Q/K/V and output are BF16; initial/final state must be FP32. Checkpoints
     remain BF16. Packed calls require host ``sequence_lengths`` matching
@@ -7274,14 +7274,14 @@ def prepare_tf32_kda_prefill(
     captured in a caller-owned CUDA graph. Beta may contain BF16 logits or
     active FP32 probabilities. Training is unsupported.
     """
-    from ._kda_tf32_runtime import (
+    from .cake_kda_tf32_runtime import (
         FlashKDABlackwellLaunch, prepare_active_beta_fwd,
     )
     import torch
     if any(t is not None and t.requires_grad for t in (q,k,v,g,beta,A_log,dt_bias,initial_state)):
         raise NotImplementedError('TF32 KDA training is not supported')
-    if torch.cuda.get_device_capability(q.device) != (10, 3):
-        raise NotImplementedError('TF32 KDA export requires SM103a')
+    from .jit.cake_kda_tf32 import device_arch, prepare_descriptors
+    device_arch(q.device)
     kwargs = dict(initial_state=initial_state, final_state=final_state,
                   cu_seqlens=cu_seqlens, sequence_lengths=sequence_lengths,
                   state_indices=state_indices, state_checkpoints=state_checkpoints,
@@ -7289,12 +7289,12 @@ def prepare_tf32_kda_prefill(
                   checkpoint_every_n_tokens=checkpoint_every_n_tokens,
                   compute_dtype='tf32')
     args = (q,k,v,g,beta,128**-.5 if scale is None else scale,out,A_log,dt_bias,lower_bound)
-    if beta_is_logit:
-        prepared = FlashKDABlackwellLaunch(*args, **kwargs)
-    else:
-        if lower_bound is None:
-            raise NotImplementedError('Active-beta TF32 export requires a bounded gate')
-        prepared = prepare_active_beta_fwd(*args, **kwargs)
-    from .jit.cake_kda_tf32 import prepare_descriptors
-    prepare_descriptors(prepared)
+    with torch.cuda.device(q.device):
+        if beta_is_logit:
+            prepared = FlashKDABlackwellLaunch(*args, **kwargs)
+        else:
+            if lower_bound is None:
+                raise NotImplementedError('Active-beta TF32 export requires a bounded gate')
+            prepared = prepare_active_beta_fwd(*args, **kwargs)
+        prepare_descriptors(prepared)
     return prepared
