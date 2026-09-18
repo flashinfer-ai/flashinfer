@@ -1145,4 +1145,4 @@ class Sm120Fc2CombineN16DualGroupKernel(Sm120MegaMoEMxfp8SwapABKernel):
     fc1fc2_kernel_impl = fc2_combine_kernel_impl
 
 
-__all__ = ["Sm120Fc2CombineKernel"]
+__all__ = ["Sm120Fc2CombineN16DualGroupKernel"]

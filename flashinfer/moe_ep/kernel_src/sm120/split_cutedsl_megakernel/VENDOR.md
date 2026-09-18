@@ -2,7 +2,7 @@
 
 The raw source under `src/` comes from `bangyus/cutedsl_megamoe`, branch
 `hanyueh/sm120-mxfp4mxfp8-split`, commit
-`0d61c208a1545edd6e18ef16d0cb30d39f4e7ef2`.
+`ea790c8d3e3aaed42439920d89b7ab6a7c46f9e5`.
 
 The raw package is named `moe_sm120_mxfp4mxfp8_split`; its weight/activation
 contract is MXFP4 E2M1 x MXFP8 E4M3 with E8M0 K32 scales.
@@ -11,6 +11,11 @@ FlashInfer code imports only this package's `shim`, never raw modules directly.
 The first integration supports the production same-NUMA `p2p_direct` path.
 The standalone cross-NUMA IBGDA transport remains outside this drop until its
 transport state is exposed through the framework API.
+
+The same-NUMA drop includes the production dispatch rank cache and owner-local
+combine policies. Their caller-stream reset, graph launch events, and finalizer
+form one replay ownership protocol and must be updated together with the raw
+kernel source.
 
 Multi-rank execution requires NVSHMEM 3.7.0 and the matching
 `nvshmem4py-cu13` 0.3.1 Python bindings. Single-rank execution can set

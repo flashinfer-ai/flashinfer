@@ -24,6 +24,7 @@ except ImportError:  # pragma: no cover -- fallback for wheels without cute.iket
 
 from .moe_utils import spin_wait
 from .sm120_ptx_helpers import (
+    atomic_cas_gpu_i32_raw,
     lds_b32_raw,
     red_add_relaxed_sys_v2_bf16x2_raw,
 )
@@ -55,6 +56,9 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
         ] = "token_strided",
         dispatch_warps_per_tile: int = 4,
         dispatch_compute_overlap: bool = True,
+        dispatch_rank_cache: bool = False,
+        dispatch_rank_cache_debug: bool = False,
+        rank_local_combine: bool = False,
         streaming_fc12: bool = False,
         k1_ready_queue: bool = False,
         k1_ready_queue_m_tiles: int = 1,
@@ -130,6 +134,9 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
         self.dispatch_pull_mode = dispatch_pull_mode
         self.dispatch_warps_per_tile = dispatch_warps_per_tile
         self.dispatch_compute_overlap = dispatch_compute_overlap
+        self.dispatch_rank_cache = dispatch_rank_cache
+        self.dispatch_rank_cache_debug = dispatch_rank_cache_debug
+        self.rank_local_combine = rank_local_combine
         self.streaming_fc12 = streaming_fc12
         self.k1_ready_queue = k1_ready_queue
         self.k1_ready_queue_m_tiles = k1_ready_queue_m_tiles
@@ -254,6 +261,10 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
         # software_grid_sync expects a dispatch-group-relative thread id.
         tid_in_group = warp_idx * Int32(self.warp_threads) + lane_idx
 
+        if cutlass.const_expr(self.rank_local_combine):
+            # Contributor counts and route-map entries are peer-written by
+            # every dispatch CTA. Flush them before SM0 publishes admission.
+            cute.arch.fence_acq_rel_sys()
         software_grid_sync(grid_sync_counter, sm_idx, num_sms, tid_in_group,
                            num_threads=self.num_dispatch_threads)
 
@@ -456,6 +467,9 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
         k1_ready_queue_ready,
         k1_ready_queue_state,
         token_src_metadata,
+        dispatch_rank_cache_state,
+        dispatch_rank_cache_sf_axis,
+        dispatch_rank_cache_debug,
         peer_rank_ptr_mapper,
         sm_idx,
         warp_idx,
@@ -481,6 +495,9 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
                 k1_ready_queue_ready,
                 k1_ready_queue_state,
                 token_src_metadata,
+                dispatch_rank_cache_state,
+                dispatch_rank_cache_sf_axis,
+                dispatch_rank_cache_debug,
                 peer_rank_ptr_mapper,
                 sm_idx,
                 warp_idx,
@@ -524,6 +541,9 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
             k1_ready_queue_ready,
             k1_ready_queue_state,
             token_src_metadata,
+            dispatch_rank_cache_state,
+            dispatch_rank_cache_sf_axis,
+            dispatch_rank_cache_debug,
             peer_rank_ptr_mapper,
             sm_idx,
             warp_idx,
@@ -550,6 +570,9 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
         k1_ready_queue_ready,
         k1_ready_queue_state,
         token_src_metadata,
+        dispatch_rank_cache_state,
+        dispatch_rank_cache_sf_axis,
+        dispatch_rank_cache_debug,
         peer_rank_ptr_mapper,
         sm_idx,
         warp_idx,
@@ -752,6 +775,89 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
                     expert_pool_block_offset * Int32(self.token_padding_block)
                     + token_idx_in_expert
                 )
+                source_token_key = (
+                    current_rank_in_expert_idx
+                    * Int32(self.max_tokens_per_rank)
+                    + src_token
+                )
+                cache_key = Int32(0)
+                cache_old = Int32(0)
+                cache_owner = Int32(0)
+                cache_master_pool = Int32(0)
+                cache_master_sf_axis = Int32(0)
+                if cutlass.const_expr(
+                    self.dispatch_rank_cache
+                    and self.comm_backend == "p2p_direct"
+                ):
+                    cache_key = source_token_key
+                    if lane_idx == Int32(0):
+                        cache_old = atomic_cas_gpu_i32_raw(
+                            (dispatch_rank_cache_state.iterator + cache_key).toint(),
+                            Int32(0),
+                            -(pool_token_idx + Int32(1)),
+                        )
+                    cache_old = cute.arch.shuffle_sync(cache_old, offset=0)
+                    if cache_old == Int32(0):
+                        cache_owner = Int32(1)
+                    elif cache_old > Int32(0):
+                        cache_master_pool = cache_old - Int32(1)
+                        if lane_idx == Int32(0):
+                            cache_master_sf_axis = dispatch_rank_cache_sf_axis[
+                                cache_key
+                            ]
+                        cache_master_sf_axis = cute.arch.shuffle_sync(
+                            cache_master_sf_axis, offset=0
+                        )
+
+                    if cutlass.const_expr(self.dispatch_rank_cache_debug):
+                        if lane_idx == Int32(0):
+                            if cache_old == Int32(0):
+                                cute.arch.atomic_add(
+                                    dispatch_rank_cache_debug.iterator,
+                                    Int32(1),
+                                    sem="relaxed",
+                                    scope="gpu",
+                                )
+                            elif cache_old > Int32(0):
+                                cute.arch.atomic_add(
+                                    dispatch_rank_cache_debug.iterator + Int32(1),
+                                    Int32(1),
+                                    sem="relaxed",
+                                    scope="gpu",
+                                )
+                            else:
+                                cute.arch.atomic_add(
+                                    dispatch_rank_cache_debug.iterator + Int32(2),
+                                    Int32(1),
+                                    sem="relaxed",
+                                    scope="gpu",
+                                )
+                            if current_rank_in_expert_idx != Int32(self.local_rank):
+                                cute.arch.atomic_add(
+                                    dispatch_rank_cache_debug.iterator + Int32(3),
+                                    Int32(1),
+                                    sem="relaxed",
+                                    scope="gpu",
+                                )
+                                if cache_old > Int32(0):
+                                    cute.arch.atomic_add(
+                                        dispatch_rank_cache_debug.iterator
+                                        + Int32(4),
+                                        Int32(1),
+                                        sem="relaxed",
+                                        scope="gpu",
+                                    )
+                if cutlass.const_expr(self.rank_local_combine):
+                    # One dispatch warp owns this pool row. The map is reset
+                    # before every replay, so absent routes cannot reuse an old
+                    # pool index.
+                    source_token_key = (
+                        current_rank_in_expert_idx
+                        * Int32(self.max_tokens_per_rank)
+                        + src_token
+                    )
+                    if lane_idx == Int32(0):
+                        sf_staging_buffer[source_token_key, src_topk] = pool_token_idx
                 sf_passes: cutlass.Constexpr[int] = (
                     self.sf_uint32_per_token + 31
                 ) // 32
@@ -866,17 +972,22 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
                     inp_tok_local_base = input_token_buffer.iterator.toint()
                     inp_sf_local_base = input_sf_buffer.iterator.toint()
                     inp_w_local_base = input_topk_weights_buffer.iterator.toint()
+                    tma_src_addr = (
+                        inp_tok_local_base
+                        + cur_peer_offset
+                        + Int64(src_token * Int32(self.hidden_bytes))
+                    )
+                    if cache_old > Int32(0):
+                        tma_src_addr = (
+                            fc1_input_token_buffer.iterator.toint()
+                            + Int64(cache_master_pool * Int32(self.hidden_bytes))
+                        )
                     with cute.arch.elect_one():
                         pull_buffer_warp_ptr = pull_buffer_ptr + (
                             warp_idx * Int32(self.hidden_bytes)
                         )
                         cute.arch.mbarrier_arrive_and_expect_tx(
                             mbar_ptr_warp, Int32(self.hidden_bytes)
-                        )
-                        tma_src_addr = (
-                            inp_tok_local_base
-                            + cur_peer_offset
-                            + Int64(src_token * Int32(self.hidden_bytes))
                         )
                         tma_load_1d_raw(
                             pull_buffer_warp_ptr,
@@ -889,19 +1000,29 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
                     for i in cutlass.range_constexpr(0, sf_passes, 1):
                         j = Int32(i * self.warp_threads) + lane_idx
                         if j < Int32(self.sf_uint32_per_token):
-                            sf_addr = (
-                                inp_sf_local_base
-                                + cur_peer_offset
-                                + Int64(
-                                    (
-                                        src_token
-                                        * Int32(self.sf_uint32_per_token)
-                                        + j
-                                    )
-                                    * Int32(4)
+                            sf_value = Int32(0)
+                            if cache_old > Int32(0):
+                                cached_sf_pos = sf_atom_int32_offset(
+                                    cache_master_sf_axis,
+                                    j,
+                                    num_k_atoms=self.sf_uint32_per_token,
                                 )
-                            )
-                            sf_vals[i] = ldg_b32_raw(sf_addr)
+                                sf_value = fc1_input_sf_buffer[cached_sf_pos]
+                            else:
+                                sf_addr = (
+                                    inp_sf_local_base
+                                    + cur_peer_offset
+                                    + Int64(
+                                        (
+                                            src_token
+                                            * Int32(self.sf_uint32_per_token)
+                                            + j
+                                        )
+                                        * Int32(4)
+                                    )
+                                )
+                                sf_value = ldg_b32_raw(sf_addr)
+                            sf_vals[i] = sf_value
                     if lane_idx == Int32(0):
                         weight_addr = (
                             inp_w_local_base
@@ -971,6 +1092,18 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
                 cute.arch.fence_acq_rel_gpu()
                 if cutlass.const_expr(self.comm_backend != "nvshmem_ibgda"):
                     cute.arch.fence_proxy("async.global")
+
+                if cutlass.const_expr(self.dispatch_rank_cache):
+                    if cache_owner != Int32(0) and lane_idx == Int32(0):
+                        dispatch_rank_cache_sf_axis[cache_key] = (
+                            sf_token_in_pool_axis
+                        )
+                        cute.arch.store(
+                            dispatch_rank_cache_state.iterator + cache_key,
+                            pool_token_idx + Int32(1),
+                            sem="release",
+                            scope="gpu",
+                        )
 
                 # Accumulate this token's release target into the rotating-lane
                 # batch tracker.  task_tile_idx is warp-uniform (token_idx /
@@ -1731,11 +1864,11 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
                 signal_phase = Int32(slot)
                 target = Int32(1)
                 if cutlass.const_expr(nvlink_barrier_counter is not None):
-                    status = nvlink_barrier_counter[counter_index] & Int32(3)
+                    status = nvlink_barrier_counter[counter_index]
                     signal_phase = status & Int32(1)
-                    signal_sign = status >> Int32(1)
-                    if signal_sign != Int32(0):
-                        target = Int32(0)
+                    # A monotonic generation prevents a stale signal from
+                    # satisfying a later replay after phase-slot reuse.
+                    target = status + Int32(1)
 
                 nbs_local_base = nvlink_barrier_signal.iterator.toint()
                 if lane_idx < Int32(self.world_size):
@@ -1775,7 +1908,7 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
                                 Int32,
                                 sem="acquire",
                                 scope="sys",
-                            ) != target:
+                            ) < target:
                                 all_ready = Int32(0)
                         if all_ready != Int32(0):
                             ready = Int32(1)
@@ -1789,6 +1922,7 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
         self,
         token_comm_args,
         token_comm_storage,
+        combine_ready_flags,
         k1_ready_queue_desc,
         k1_ready_queue_ready,
         k1_ready_queue_state,
@@ -1819,6 +1953,30 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
             # device-side NVSHMEM calls in the persistent compute kernel.
             pass
         else:
+            if cutlass.const_expr(self.rank_local_combine):
+                # The rank-local sideband is peer-written.  A fast rank may
+                # otherwise enter replay N+1 and publish its new counts while
+                # a slower peer is still completing that replay's local
+                # graph-ordered reset, which erases the fresh stores.  Join
+                # all ranks after their local reset and before the first peer
+                # write.  This is an epoch-entry ownership handoff, not a
+                # whole-dispatch admission barrier: dispatch_prep and FC1
+                # retain their ordinary fine-grained streaming protocol once
+                # the new epoch has begun.
+                self.nvlink_barrier(
+                    token_comm_args.nvlink_barrier_signal,
+                    token_comm_args.nvlink_barrier_counter,
+                    token_comm_args.grid_sync_counter,
+                    token_comm_args.peer_rank_ptr_mapper,
+                    cta_linear_id,
+                    local_warp_idx,
+                    lane_idx,
+                    slot=0,
+                    num_sms=token_comm_args.sm_count,
+                    prologue_grid_sync=True,
+                    epilogue_grid_sync=True,
+                )
+
             self.dispatch_prep(
                 token_comm_storage,
                 token_comm_args.topk_idx,
@@ -1832,6 +1990,83 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
                 num_tokens=token_comm_args.input_token_buffer.shape[0],
                 num_sms=token_comm_args.sm_count,
             )
+
+            if cutlass.const_expr(self.rank_local_combine):
+                # Publish one immutable contributor count for every
+                # (source rank, source token, destination owner).  The
+                # existing dispatch admission protocol orders these remote
+                # stores before K2 can consume them.  Publish the source
+                # epoch through the same device-side path: K2 may finish a
+                # small tile before the terminal dispatch barrier, so reading
+                # the source GPU's host-written footer directly is not a
+                # valid cross-rank happens-before edge.
+                source_tokens = Int32(
+                    self.world_size * self.max_tokens_per_rank
+                )
+                if (
+                    cta_linear_id == Int32(0)
+                    and local_warp_idx == Int32(0)
+                    and lane_idx == Int32(0)
+                ):
+                    epoch = cute.arch.load(
+                        combine_ready_flags.iterator
+                        + Int32(self.max_tokens_per_rank * self.world_size),
+                        Int32,
+                        sem="acquire",
+                        scope="gpu",
+                    )
+                    for dst in cutlass.range_constexpr(self.world_size):
+                        peer_epoch = (
+                            token_comm_args.peer_rank_ptr_mapper.ptr_map_to_rank(
+                                token_comm_args.fc2_done_counter.iterator
+                                + source_tokens
+                                + Int32(self.local_rank),
+                                Int32(dst),
+                            )
+                        )
+                        cute.arch.store(
+                            peer_epoch,
+                            epoch,
+                            sem="release",
+                            scope="sys",
+                        )
+                token = (
+                    cta_linear_id * Int32(self.num_dispatch_threads)
+                    + local_warp_idx * Int32(32)
+                    + lane_idx
+                )
+                stride = Int32(
+                    token_comm_args.sm_count * self.num_dispatch_threads
+                )
+                while token < Int32(self.max_tokens_per_rank):
+                    key = Int32(
+                        self.local_rank * self.max_tokens_per_rank
+                    ) + token
+                    for dst in cutlass.range_constexpr(self.world_size):
+                        count = Int32(0)
+                        for slot in cutlass.range_constexpr(self.num_topk):
+                            expert = Int32(
+                                token_comm_args.topk_idx[token, slot]
+                            )
+                            if (
+                                expert >= Int32(dst * self.num_experts_per_rank)
+                                and expert
+                                < Int32((dst + 1) * self.num_experts_per_rank)
+                            ):
+                                count += Int32(1)
+                        peer_count = (
+                            token_comm_args.peer_rank_ptr_mapper.ptr_map_to_rank(
+                                token_comm_args.fc2_done_counter.iterator + key,
+                                Int32(dst),
+                            )
+                        )
+                        cute.arch.store(
+                            peer_count,
+                            count,
+                            sem="release",
+                            scope="sys",
+                        )
+                    token += stride
 
         if iket_active:
             _iket.range_pop()
@@ -1882,6 +2117,9 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
             k1_ready_queue_ready,
             k1_ready_queue_state,
             token_comm_args.token_src_metadata,
+            token_comm_args.fc2_output_workspace,
+            token_comm_args.fc2_output_sf,
+            token_comm_args.combine_sf,
             token_comm_args.peer_rank_ptr_mapper,
             cta_linear_id,
             local_warp_idx,
@@ -2283,6 +2521,17 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
             while i < Int32(self.num_experts_per_rank):
                 token_comm_args.expert_recv_count_sum[i] = Int64(0)
                 i = i + stride
+
+            if cutlass.const_expr(self.rank_local_combine):
+                rank_combine_records: cutlass.Constexpr[int] = (
+                    self.world_size * self.max_tokens_per_rank
+                    + self.world_size
+                )
+                i = thread_linear
+                while i < Int32(rank_combine_records):
+                    token_comm_args.fc2_done_counter[i] = Int32(0)
+                    i = i + stride
+
             cute.arch.fence_acq_rel_sys()
 
             self.nvlink_barrier(

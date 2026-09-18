@@ -281,7 +281,13 @@ def _global_weight_problem(problem: dict) -> dict:
     )
 
 
-def _make_layer(rank: int, world_size: int, problem: dict):
+def _make_layer(
+    rank: int,
+    world_size: int,
+    problem: dict,
+    *,
+    knobs: dict | None = None,
+):
     from flashinfer.moe_ep import (
         BootstrapConfig,
         FleetParams,
@@ -302,6 +308,7 @@ def _make_layer(rank: int, world_size: int, problem: dict):
             megakernel=Sm120_Mxfp4_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
                 intermediate_size=problem["intermediate"],
                 top_k=problem["topk"],
+                knobs=knobs,
             ),
             quantize_input=True,
             preprocess_weights=True,
@@ -471,7 +478,22 @@ def test_sm120_w4a8_two_layers_share_workspace() -> None:
 
 @pytest.mark.gpu_4
 @pytest.mark.arch_sm120
-def test_sm120_w4a8_four_rank_tail_wave_and_cuda_graph_replay() -> None:
+@pytest.mark.parametrize(
+    "knobs",
+    (
+        None,
+        {
+            "dispatch_rank_cache": True,
+            "rank_local_combine": True,
+            "k2_tail_reclaim": False,
+            "k2_warps": 8,
+        },
+    ),
+    ids=("default", "rank-cache-local-combine"),
+)
+def test_sm120_w4a8_four_rank_tail_wave_and_cuda_graph_replay(
+    knobs: dict | None,
+) -> None:
     import torch.distributed as dist
 
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -490,7 +512,7 @@ def test_sm120_w4a8_four_rank_tail_wave_and_cuda_graph_replay() -> None:
         capacity=8192,
         skewed_routing=True,
     )
-    layer = _make_layer(rank, world_size, problem)
+    layer = _make_layer(rank, world_size, problem, knobs=knobs)
     try:
         eager_outputs = []
         for _ in range(2):
@@ -519,7 +541,10 @@ def test_sm120_w4a8_four_rank_tail_wave_and_cuda_graph_replay() -> None:
             captured = layer.compute_staged(output=None)
         dist.barrier()
         replays = []
-        for _ in range(16):
+        replay_count = int(
+            os.environ.get("FLASHINFER_MEGAMOE_REPLAY_ITERS", "16")
+        )
+        for _ in range(replay_count):
             graph.replay()
             replays.append(captured.clone())
         torch.cuda.synchronize()

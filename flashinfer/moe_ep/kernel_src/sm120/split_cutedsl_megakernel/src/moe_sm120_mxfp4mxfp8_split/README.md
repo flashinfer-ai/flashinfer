@@ -50,9 +50,12 @@ alignment, then scales the measured 110-SM presets proportionally for other
 SM120 devices. The FlashInfer-facing path performs no online candidate
 compilation or timing.
 
-The selector uses expected routed rows per local expert,
+The prefill selector uses expected routed rows per local expert,
 `tokens_per_rank * EP * topk / total_experts`, as its tile key: N32 below 30
-rows, N64 for 30--63 rows, and N128 from 64 rows onward. On a 110-SM RTX Pro
+rows, N64 for 30--63 rows, and N128 from 64 rows onward. Same-NUMA EP4 decode
+buckets 7/16/32/64 instead use K1 N32 plus K2 N16. Full-width production
+shapes use the dual-N8 K2 implementation, while an explicit `k2_warps=8`
+override keeps the single-group diagnostic baseline. On a 110-SM RTX Pro
 5000, same-NUMA P2P uses K1/K2 `80/30` for N64 and `72/38` otherwise;
 cross-NUMA EP uses hybrid P2P + IBGDA with K1/TX/RX/K2 `48/16/16/30`.
 Other SM120 devices preserve these ratios after Green Context alignment.
@@ -77,12 +80,19 @@ ready-work granularity is N32, N64, or N128 according to the tile heuristic,
 not a fixed 64 tokens. DP and model names are deliberately absent from the
 selector; identical EP shape and topology produce the same specialization.
 
-K2 defaults to the compact eight-warp CTA selected by
-`--k2_warp_count 8`: four compute warps, two TMA producer warps, one
-scheduler warp, and one FC2-ready auxiliary warp. It has no dispatch warp
-group. Compute warps 0-3 are reused only for K2's final rank-release/reset
-protocol after FC2 completes. `--k2_warp_count 12` retains the bring-up
-topology as a controlled performance baseline.
+The regular K2 path uses the compact eight-warp CTA: four compute warps, two
+TMA producer warps, one scheduler warp, and one FC2-ready auxiliary warp. The
+small decode heuristic selects the 12-warp dual-N8 path, where two compute
+groups share A/TMA work and can run two CTAs per SM. After K1 retires, the
+tail-reclaim launch reuses its SM partition to drain the same K2 queue; one
+finalizer owns epoch reset and cross-rank completion. The N16/N32/N64/N128
+paths use exact compact SFB selection from the fixed N128 scale staging tile.
+
+Same-NUMA P2P may also cache one dispatched activation/scale row per
+`(source token, destination rank)` when the estimated duplicate traffic is
+large enough. At 8192 tokens/rank or above, the heuristic may use owner-local
+BF16 combine before the final K3 reduction. Both choices are part of the
+compile spec and therefore part of the graph/JIT cache key.
 
 ## Framework API and JIT Cache
 

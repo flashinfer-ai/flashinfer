@@ -25,7 +25,10 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 
 from .custom_ext import Sm120SwapABMxfp8Fc12SchedExtension
 from .fc1_fc2_fuse_sched import BlockPhase, MoEFusedFc12SchedulerParams
-from .megamoe_kernel import Sm120MegaMoEMxfp8SwapABKernel
+from .megamoe_kernel import (
+    RANK_COMBINE_MAX_GROUPS,
+    Sm120MegaMoEMxfp8SwapABKernel,
+)
 from .moe_persistent_scheduler import WorkTileState
 from .moe_utils import spin_wait, spin_wait_i32_ge_inline
 from .sm120_mma import (
@@ -73,6 +76,7 @@ from .split_timestamp import (
     read_globaltimer,
     trace_word,
 )
+from src.ptx_helpers import fns_b32
 from src.token_comm import TokenSrcMetadata
 
 
@@ -96,7 +100,305 @@ class Sm120Fc2CombineKernel(Sm120MegaMoEMxfp8SwapABKernel):
             compact_k2=compact_k2,
             **kwargs,
         )
+        # Rank-local rows stay on this owner until the grouped partial is ready.
+        # The packed peer-store lane mapping is therefore not applicable.
+        if self.rank_local_combine and self.jit_config.fc2_packed_store is None:
+            self.fc2_packed_store = False
         self.k2_tile_trace_enabled = self.jit_config.enable_k2_tile_trace
+
+    @cute.jit
+    def _rank_local_tile_complete(
+        self,
+        token_comm_args,
+        route_output,
+        ready_flags,
+        tile_done,
+        work_tile_info,
+        compute_warp,
+        lane_idx,
+        last_tile,
+    ):
+        """Reduce this owner's completed BF16 routes and publish one partial.
+
+        Hidden tiles join through device-local counters.  Only the last hidden
+        tile increments contributor counts.  The last contributor for a source
+        token reduces the local route rows in top-k slot order, writes one BF16
+        owner partial to the source GPU, and publishes a system-release ready
+        word.  No remote atomics are used.
+        """
+        combine_groups: cutlass.Constexpr[int] = (
+            RANK_COMBINE_MAX_GROUPS
+            if self.hidden >= 2048
+            and self.hidden
+            % (RANK_COMBINE_MAX_GROUPS * max(128, self.mma_tiler[0]))
+            == 0
+            and self.mma_tiler[1] >= RANK_COMBINE_MAX_GROUPS
+            else 1
+        )
+        chunk_hidden: cutlass.Constexpr[int] = self.hidden // combine_groups
+        reduction_lanes: cutlass.Constexpr[int] = 16
+        vector_elems: cutlass.Constexpr[int] = 16
+        words_per_vector: cutlass.Constexpr[int] = vector_elems // 4
+        hidden_tiles: cutlass.Constexpr[int] = (
+            chunk_hidden + self.mma_tiler[0] - 1
+        ) // self.mma_tiler[0]
+        source_tokens: cutlass.Constexpr[int] = (
+            self.world_size * self.max_tokens_per_rank
+        )
+        combine_group = (
+            work_tile_info.tile_m_idx // cutlass.Int32(hidden_tiles)
+        )
+        chunk_base = combine_group * cutlass.Int32(chunk_hidden)
+        chunk_end = chunk_base + cutlass.Int32(chunk_hidden)
+
+        # Join this CTA's route stores before making the final-tile decision.
+        cute.arch.barrier(
+            barrier_id=self.epilog_sync_bar_id,
+            number_of_threads=32 * len(self.compute_warp_id),
+        )
+        pool_base = (
+            work_tile_info.cumulative_data_physical_row
+            + work_tile_info.tile_n_idx * cutlass.Int32(self.mma_tiler[1])
+        )
+        if compute_warp == cutlass.Int32(0):
+            if lane_idx == cutlass.Int32(0):
+                old_tile = cute.arch.atomic_add(
+                    tile_done.iterator + pool_base + combine_group,
+                    cutlass.Int32(1),
+                    sem="acq_rel",
+                    scope="gpu",
+                )
+                last_tile[0] = cutlass.Int32(old_tile + 1 == hidden_tiles)
+        cute.arch.barrier(
+            barrier_id=self.epilog_sync_bar_id,
+            number_of_threads=32 * len(self.compute_warp_id),
+        )
+
+        if last_tile[0] != cutlass.Int32(0):
+            for token_batch in cutlass.range(
+                0, self.mma_tiler[1], 32 * len(self.compute_warp_id)
+            ):
+                token_in_tile = (
+                    token_batch
+                    + compute_warp
+                    + lane_idx * cutlass.Int32(len(self.compute_warp_id))
+                )
+                lane_key = cutlass.Int32(0)
+                lane_src_token = cutlass.Int32(0)
+                lane_src_rank = cutlass.Int32(0)
+                last = cutlass.Int32(0)
+                if token_in_tile < work_tile_info.valid_tokens_in_tile:
+                    pool_token = pool_base + token_in_tile
+                    md = TokenSrcMetadata.load(
+                        token_comm_args.token_src_metadata.iterator.toint()
+                        + cutlass.Int64(pool_token)
+                        * cutlass.Int64(TokenSrcMetadata.nbytes)
+                    )
+                    lane_src_token = md.src_token
+                    lane_src_rank = md.src_rank
+                    lane_key = (
+                        md.src_rank * cutlass.Int32(self.max_tokens_per_rank)
+                        + md.src_token
+                    )
+                    expected = token_comm_args.fc2_done_counter[lane_key]
+                    old = cute.arch.atomic_add(
+                        tile_done.iterator
+                        + cutlass.Int32(self.pool_token_capacity)
+                        + combine_group * cutlass.Int32(source_tokens)
+                        + lane_key,
+                        cutlass.Int32(1),
+                        sem="acq_rel",
+                        scope="gpu",
+                    )
+                    last = cutlass.Int32(old + cutlass.Int32(1) == expected)
+
+                cute.arch.sync_warp()
+                winners = cutlass.Int32(
+                    cute.arch.vote_ballot_sync(last != cutlass.Int32(0))
+                )
+                while winners != cutlass.Int32(0):
+                    remaining = winners & (winners - cutlass.Int32(1))
+                    has_token = (
+                        lane_idx < cutlass.Int32(reduction_lanes)
+                    ) | (remaining != cutlass.Int32(0))
+                    leader = fns_b32(
+                        winners, cutlass.Int32(0), cutlass.Int32(1)
+                    )
+                    if lane_idx >= cutlass.Int32(reduction_lanes):
+                        if remaining != cutlass.Int32(0):
+                            leader = fns_b32(
+                                remaining, cutlass.Int32(0), cutlass.Int32(1)
+                            )
+                    key = cute.arch.shuffle_sync(lane_key, offset=leader)
+                    src_token = cute.arch.shuffle_sync(
+                        lane_src_token, offset=leader
+                    )
+                    src_rank = cute.arch.shuffle_sync(
+                        lane_src_rank, offset=leader
+                    )
+                    if has_token:
+                        local_row = cute.slice_(
+                            token_comm_args.combine_output,
+                            (src_token, cutlass.Int32(self.local_rank), None),
+                        )
+                        peer_row = cute.make_tensor(
+                            token_comm_args.peer_rank_ptr_mapper.ptr_map_to_rank(
+                                local_row.iterator, src_rank
+                            ),
+                            local_row.layout,
+                        )
+                        values = cute.make_rmem_tensor(
+                            (vector_elems,), cutlass.Float32
+                        )
+                        packed = cute.make_rmem_tensor(
+                            (vector_elems,), cutlass.BFloat16
+                        )
+                        packed_i64 = cute.recast_tensor(packed, cutlass.Int64)
+                        source = cute.make_rmem_tensor(
+                            (2 * vector_elems,), cutlass.BFloat16
+                        )
+                        source_i64 = cute.recast_tensor(source, cutlass.Int64)
+                        offset_dtype: cutlass.Constexpr = (
+                            cutlass.Int32
+                            if self.pool_token_capacity * (self.hidden // 4)
+                            < (1 << 31)
+                            else cutlass.Int64
+                        )
+                        route_offsets = cute.make_rmem_tensor(
+                            (self.num_topk,), offset_dtype
+                        )
+                        route_words = cute.recast_ptr(
+                            route_output.iterator, dtype=cutlass.Int64
+                        )
+                        peer_words = cute.recast_ptr(
+                            peer_row.iterator, dtype=cutlass.Int64
+                        )
+                        for slot in cutlass.range_constexpr(self.num_topk):
+                            route = token_comm_args.combine_sf[key, slot]
+                            route_offsets[slot] = (
+                                offset_dtype(route)
+                                * offset_dtype(self.hidden // 4)
+                            )
+                        for offset in cutlass.range(
+                            0,
+                            chunk_hidden,
+                            reduction_lanes * vector_elems,
+                        ):
+                            h = (
+                                chunk_base
+                                + offset
+                                + (
+                                    lane_idx
+                                    % cutlass.Int32(reduction_lanes)
+                                )
+                                * cutlass.Int32(vector_elems)
+                            )
+                            values.fill(cutlass.Float32(0.0))
+                            for pair in cutlass.range_constexpr(
+                                (self.num_topk + 1) // 2
+                            ):
+                                source.fill(cutlass.BFloat16(0.0))
+                                for item in cutlass.range_constexpr(2):
+                                    if cutlass.const_expr(
+                                        pair * 2 + item < self.num_topk
+                                    ):
+                                        route_offset = route_offsets[
+                                            pair * 2 + item
+                                        ]
+                                        if route_offset >= offset_dtype(0):
+                                            if h < chunk_end:
+                                                for word in cutlass.range_constexpr(
+                                                    words_per_vector
+                                                ):
+                                                    source_i64[
+                                                        item * words_per_vector + word
+                                                    ] = route_words[
+                                                        route_offset
+                                                        + offset_dtype(h // 4 + word)
+                                                    ]
+                                for item in cutlass.range_constexpr(2):
+                                    if cutlass.const_expr(
+                                        pair * 2 + item < self.num_topk
+                                    ):
+                                        for elem in cutlass.range_constexpr(
+                                            vector_elems
+                                        ):
+                                            values[elem] += cutlass.Float32(
+                                                source[
+                                                    item * vector_elems + elem
+                                                ]
+                                            )
+                            for elem in cutlass.range_constexpr(vector_elems):
+                                packed[elem] = values[elem].to(
+                                    cutlass.BFloat16
+                                )
+                            if h < chunk_end:
+                                for word in cutlass.range_constexpr(
+                                    words_per_vector
+                                ):
+                                    peer_words[h // 4 + word] = packed_i64[word]
+
+                    cute.arch.sync_warp()
+                    if (
+                        lane_idx % cutlass.Int32(reduction_lanes)
+                        == cutlass.Int32(0)
+                    ):
+                        if has_token:
+                            publish = cutlass.Int32(1)
+                            if cutlass.const_expr(combine_groups > 1):
+                                old_group = cute.arch.atomic_add(
+                                    tile_done.iterator
+                                    + cutlass.Int32(
+                                        self.pool_token_capacity
+                                        + RANK_COMBINE_MAX_GROUPS * source_tokens
+                                    )
+                                    + key,
+                                    cutlass.Int32(1),
+                                    sem="acq_rel",
+                                    scope="sys",
+                                )
+                                publish = cutlass.Int32(
+                                    old_group + 1 == combine_groups
+                                )
+                            if publish != cutlass.Int32(0):
+                                local_flag = cute.slice_(
+                                    ready_flags,
+                                    (src_token, cutlass.Int32(self.local_rank)),
+                                )
+                                peer_flag = (
+                                    token_comm_args.peer_rank_ptr_mapper
+                                    .ptr_map_to_rank(
+                                        local_flag.iterator, src_rank
+                                    )
+                                )
+                                owner_epoch = (
+                                    token_comm_args.fc2_done_counter.iterator
+                                    + cutlass.Int32(source_tokens)
+                                    + src_rank
+                                )
+                                spin_wait(
+                                    owner_epoch,
+                                    lambda value: value != cutlass.Int32(0),
+                                    fail_sleep_cycles=200,
+                                )
+                                epoch = cute.arch.load(
+                                    owner_epoch,
+                                    cutlass.Int32,
+                                    sem="acquire",
+                                    scope="sys",
+                                )
+                                cute.arch.store(
+                                    peer_flag,
+                                    epoch,
+                                    sem="release",
+                                    scope="sys",
+                                )
+                    winners = remaining & (remaining - cutlass.Int32(1))
+
+        cute.arch.barrier(
+            barrier_id=self.epilog_sync_bar_id,
+            number_of_threads=32 * len(self.compute_warp_id),
+        )
 
     @cute.kernel
     def fc2_combine_kernel_impl(self, tiled_mma: cute.TiledMma, tiled_mma_sfb: cute.TiledMma, tma_atom_fc1_weight: cute.CopyAtom, tma_tensor_fc1_weight: cute.Tensor, tma_atom_activation: cute.CopyAtom, tma_tensor_activation: cute.Tensor, tma_atom_fc1_weight_sf: cute.CopyAtom, tma_tensor_fc1_weight_sf: cute.Tensor, tma_atom_activation_sf: cute.CopyAtom, tma_tensor_activation_sf: cute.Tensor, tma_atom_fc2_weight: cute.CopyAtom, tma_tensor_fc2_weight: cute.Tensor, tma_atom_fc1_output_as_fc2_input: cute.CopyAtom, tma_tensor_fc1_output_as_fc2_input: cute.Tensor, tma_atom_fc2_weight_sf: cute.CopyAtom, tma_tensor_fc2_weight_sf: cute.Tensor, tma_atom_fc1_output_sf_as_fc2_input: cute.CopyAtom, tma_tensor_fc1_output_sf_as_fc2_input: cute.Tensor, fc1_weight_gemm: cute.Tensor, activation_gemm: cute.Tensor, fc1_output_gemm: cute.Tensor, fc1_weight_sf_gemm: cute.Tensor, activation_sf_gemm: cute.Tensor, fc1_output_sf_gemm: cute.Tensor, fc2_weight_gemm: cute.Tensor, fc2_output: cute.Tensor, fc2_weight_sf_gemm: cute.Tensor, fc1_output_sf_gemm_for_fc2_load: cute.Tensor, topk_scores: cute.Tensor, fc1_done_counter: cute.Tensor, combine_ready_flags: Optional[cute.Tensor], fc2_block_done_counter: Optional[cute.Tensor], fc1_alpha: Optional[cute.Tensor], fc2_alpha: Optional[cute.Tensor], fc1_norm_const: Optional[cute.Tensor], sched_params: MoEFusedFc12SchedulerParams, cluster_layout_vmnk: cute.Layout, cluster_layout_sfb_vmnk: cute.Layout, a_smem_layout_staged: cute.ComposedLayout, b_smem_layout_staged: cute.ComposedLayout, sfa_smem_layout_staged: cute.Layout, sfb_smem_layout_staged: cute.Layout, fc1_output_smem_layout_staged: cute.ComposedLayout, token_comm_args=None, green_trace: Optional[cute.Tensor]=None, k2_ready_queue_desc: Optional[cute.Tensor]=None, k2_ready_queue_ready: Optional[cute.Tensor]=None, k2_ready_queue_state: Optional[cute.Tensor]=None):
@@ -145,6 +447,9 @@ class Sm120Fc2CombineKernel(Sm120MegaMoEMxfp8SwapABKernel):
             sSFB: cute.struct.Align[cute.struct.MemRange[self.sf_dtype, cute.cosize(sfb_smem_layout_staged)], 128]
         smem = utils.SmemAllocator()
         storage = smem.allocate(SharedStorage)
+        rank_combine_last_tile = None
+        if cutlass.const_expr(self.rank_local_combine):
+            rank_combine_last_tile = smem.allocate_array(cutlass.Int32, 1)
         tma_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
         ab_pipeline_consumer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, len(self.compute_warp_id))
         a_producer, a_consumer = pipeline.PipelineTmaAsync.create(barrier_storage=storage.ab_full_mbar_ptr.data_ptr(), num_stages=self.num_ab_stage, producer_group=tma_pipeline_producer_group, consumer_group=ab_pipeline_consumer_group, tx_count=self.num_tma_a_load_bytes, cta_layout_vmnk=cluster_layout_vmnk, defer_sync=True).make_participants()
@@ -989,6 +1294,11 @@ class Sm120Fc2CombineKernel(Sm120MegaMoEMxfp8SwapABKernel):
                                 tile_peer_store_start = read_globaltimer()
                     if valid_token0 < work_tile_info.valid_tokens_in_tile:
                         fc2_store_token0 = pool_token0
+                        if cutlass.const_expr(
+                            self.rank_local_combine
+                            and self.pool_token_capacity * self.hidden >= (1 << 31)
+                        ):
+                            fc2_store_token0 = cutlass.Int64(pool_token0)
                         if cutlass.const_expr(self.ibgda_k2_direct_staging):
                             fc2_store_token0 = cutlass.Int32(
                                 token_comm_args.combine_sf[
@@ -1000,7 +1310,7 @@ class Sm120Fc2CombineKernel(Sm120MegaMoEMxfp8SwapABKernel):
                             )
                         if cutlass.const_expr(self.fc2_packed_store):
                             if lane_g & cutlass.Int32(1) == cutlass.Int32(0):
-                                if cutlass.const_expr(token_comm_args is not None and (not self.token_back_by_dispatch)):
+                                if cutlass.const_expr(token_comm_args is not None and (not self.token_back_by_dispatch) and (not self.rank_local_combine)):
                                     md0 = TokenSrcMetadata.load(token_comm_args.token_src_metadata.iterator.toint() + cutlass.Int64(pool_token0) * cutlass.Int64(TokenSrcMetadata.nbytes))
                                     local_row0 = cute.slice_(fc2_output, (md0.src_token, md0.src_topk, None))
                                     row0 = cute.make_tensor(token_comm_args.peer_rank_ptr_mapper.ptr_map_to_rank(local_row0.iterator, md0.src_rank), local_row0.layout)
@@ -1012,7 +1322,7 @@ class Sm120Fc2CombineKernel(Sm120MegaMoEMxfp8SwapABKernel):
                                 row0_i32_1 = cute.make_tensor(cute.recast_ptr(row0_hidden1, dtype=cutlass.Int32), cute.make_layout(1))
                                 row0_i32_0[0] = rFc2StoreI32[0]
                                 row0_i32_1[0] = rFc2StoreI32[1]
-                        elif cutlass.const_expr(token_comm_args is not None and (not self.token_back_by_dispatch)):
+                        elif cutlass.const_expr(token_comm_args is not None and (not self.token_back_by_dispatch) and (not self.rank_local_combine)):
                             md0 = TokenSrcMetadata.load(token_comm_args.token_src_metadata.iterator.toint() + cutlass.Int64(pool_token0) * cutlass.Int64(TokenSrcMetadata.nbytes))
                             local_row0 = cute.slice_(fc2_output, (md0.src_token, md0.src_topk, None))
                             peer_row0 = cute.make_tensor(token_comm_args.peer_rank_ptr_mapper.ptr_map_to_rank(local_row0.iterator, md0.src_rank), local_row0.layout)
@@ -1023,6 +1333,11 @@ class Sm120Fc2CombineKernel(Sm120MegaMoEMxfp8SwapABKernel):
                             fc2_output[fc2_store_token0, 0, hidden1] = acc[2].to(self.fc2_output_dtype)
                     if valid_token1 < work_tile_info.valid_tokens_in_tile:
                         fc2_store_token1 = pool_token1
+                        if cutlass.const_expr(
+                            self.rank_local_combine
+                            and self.pool_token_capacity * self.hidden >= (1 << 31)
+                        ):
+                            fc2_store_token1 = cutlass.Int64(pool_token1)
                         if cutlass.const_expr(self.ibgda_k2_direct_staging):
                             fc2_store_token1 = cutlass.Int32(
                                 token_comm_args.combine_sf[
@@ -1034,7 +1349,7 @@ class Sm120Fc2CombineKernel(Sm120MegaMoEMxfp8SwapABKernel):
                             )
                         if cutlass.const_expr(self.fc2_packed_store):
                             if lane_g & cutlass.Int32(1) == cutlass.Int32(0):
-                                if cutlass.const_expr(token_comm_args is not None and (not self.token_back_by_dispatch)):
+                                if cutlass.const_expr(token_comm_args is not None and (not self.token_back_by_dispatch) and (not self.rank_local_combine)):
                                     md1 = TokenSrcMetadata.load(token_comm_args.token_src_metadata.iterator.toint() + cutlass.Int64(pool_token1) * cutlass.Int64(TokenSrcMetadata.nbytes))
                                     local_row1 = cute.slice_(fc2_output, (md1.src_token, md1.src_topk, None))
                                     row1 = cute.make_tensor(token_comm_args.peer_rank_ptr_mapper.ptr_map_to_rank(local_row1.iterator, md1.src_rank), local_row1.layout)
@@ -1046,7 +1361,7 @@ class Sm120Fc2CombineKernel(Sm120MegaMoEMxfp8SwapABKernel):
                                 row1_i32_1 = cute.make_tensor(cute.recast_ptr(row1_hidden1, dtype=cutlass.Int32), cute.make_layout(1))
                                 row1_i32_0[0] = rFc2StoreI32[2]
                                 row1_i32_1[0] = rFc2StoreI32[3]
-                        elif cutlass.const_expr(token_comm_args is not None and (not self.token_back_by_dispatch)):
+                        elif cutlass.const_expr(token_comm_args is not None and (not self.token_back_by_dispatch) and (not self.rank_local_combine)):
                             md1 = TokenSrcMetadata.load(token_comm_args.token_src_metadata.iterator.toint() + cutlass.Int64(pool_token1) * cutlass.Int64(TokenSrcMetadata.nbytes))
                             local_row1 = cute.slice_(fc2_output, (md1.src_token, md1.src_topk, None))
                             peer_row1 = cute.make_tensor(token_comm_args.peer_rank_ptr_mapper.ptr_map_to_rank(local_row1.iterator, md1.src_rank), local_row1.layout)
@@ -1070,7 +1385,18 @@ class Sm120Fc2CombineKernel(Sm120MegaMoEMxfp8SwapABKernel):
                     if compute_warp == cutlass.Int32(0):
                         if lane_idx == cutlass.Int32(0):
                             tile_peer_finalize_start = read_globaltimer()
-                if cutlass.const_expr(combine_ready_flags is not None and fc2_block_done_counter is not None):
+                if cutlass.const_expr(self.rank_local_combine):
+                    self._rank_local_tile_complete(
+                        token_comm_args,
+                        fc2_output,
+                        combine_ready_flags,
+                        fc2_block_done_counter,
+                        work_tile_info,
+                        compute_warp,
+                        lane_idx,
+                        rank_combine_last_tile,
+                    )
+                elif cutlass.const_expr(combine_ready_flags is not None and fc2_block_done_counter is not None):
                     cute.arch.fence_acq_rel_sys()
                     cute.arch.barrier(barrier_id=self.epilog_sync_bar_id, number_of_threads=32 * len(self.compute_warp_id))
                     self.token_comm_hook_fc2_tile_complete(token_comm_args, combine_ready_flags, fc2_block_done_counter, work_tile_info, compute_warp=compute_warp, lane_idx=lane_idx)

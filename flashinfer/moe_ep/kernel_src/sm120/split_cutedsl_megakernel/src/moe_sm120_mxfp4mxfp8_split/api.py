@@ -27,7 +27,10 @@ from .jit_config import Sm120JitConfig
 # of the problem record, while the ABI bump also invalidates any standalone
 # 320-row artifacts compiled with the former N64 heuristic. Revision 25
 # narrows rank-local synchronization and removes tail-off graph reset nodes.
-KERNEL_CACHE_ABI = 25
+# Revision 26 adds the opt-in dispatch rank-cache workspace and code path.
+# Revision 31 adds rank-local combine on top of the rank-cache workspace.
+# Revision 32 uses the public 128-byte online TMA descriptor stride.
+KERNEL_CACHE_ABI = 32
 
 
 @dataclass(frozen=True)
@@ -332,6 +335,9 @@ def build_split_kernels(spec: MegaMoECompileSpec) -> SplitKernelBundle:
         dispatch_pull_mode=config.dispatch_pull_mode,
         dispatch_warps_per_tile=config.dispatch_warps_per_tile,
         dispatch_compute_overlap=config.dispatch_compute_overlap,
+        dispatch_rank_cache=config.dispatch_rank_cache,
+        dispatch_rank_cache_debug=config.dispatch_rank_cache_debug,
+        rank_local_combine=config.rank_local_combine,
         k1_ready_queue_workspace=config.k1_ready_queue,
         k2_ready_queue=config.k2_ready_queue,
         k2_ready_queue_bundle=config.ready_queue_bundle,
@@ -361,7 +367,11 @@ def build_split_kernels(spec: MegaMoECompileSpec) -> SplitKernelBundle:
         compact_k2=(config.k2_warps in (8, 12) or config.k2_tile[1] == 256),
         load_balance_mode=k2_load_balance,
         k2_tail_reclaim=config.k2_tail_reclaim,
-        skip_global_tail=(config.k2_tail_reclaim or config.k2_warps == 12),
+        skip_global_tail=(
+            config.k2_tail_reclaim
+            or config.k2_warps == 12
+            or config.rank_local_combine
+        ),
         producer_sm_count=(
             k1_clusters * cluster_size if options.concurrent_k1_k2 else 0
         ),
@@ -390,7 +400,11 @@ def build_split_kernels(spec: MegaMoECompileSpec) -> SplitKernelBundle:
         # launches only one drain CTA per newly released SM.
         k2_drain = k2_kernel_cls(**tail_common, **common_kwargs)
 
-    if config.k2_tail_reclaim or config.k2_warps == 12:
+    if (
+        config.k2_tail_reclaim
+        or config.k2_warps == 12
+        or config.rank_local_combine
+    ):
         finalizer_common = dict(k2_common)
         finalizer_common.update(
             group_hint=1,
@@ -459,6 +473,14 @@ def compile_combine_reduce(*args, **kwargs):
     return compile_topk_reduce(*args, **kwargs)
 
 
+def compile_rank_local_combine(*args, **kwargs):
+    """Compile the explicit owner-local BF16 K3 reduction lazily."""
+
+    from .kernel_rank_local_combine import compile_rank_local_combine as compile_k3
+
+    return compile_k3(*args, **kwargs)
+
+
 __all__ = [
     "KERNEL_CACHE_ABI",
     "MegaMoECompileSpec",
@@ -468,5 +490,6 @@ __all__ = [
     "Sm120JitConfig",
     "build_split_kernels",
     "compile_combine_reduce",
+    "compile_rank_local_combine",
     "select_compile_spec",
 ]
