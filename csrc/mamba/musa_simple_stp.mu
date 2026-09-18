@@ -252,8 +252,16 @@ __global__ __launch_bounds__(kThreads) void simple_stp_tied_fast_kernel(
   float acc0 = 0.f, acc1 = 0.f;
   uint4 rnd0a{}, rnd0b{}, rnd1a{}, rnd1b{};
   if constexpr (STOCHASTIC) {
-    const int64_t logical0 = (static_cast<int64_t>(head) * 64 + d0) * kN + n0;
-    const int64_t logical1 = (static_cast<int64_t>(head) * 64 + d1) * kN + n0;
+    // Keep the exact legacy Philox counter contract: the offset is the
+    // physical state element address (slot + head + d + n), rather than a
+    // logical head-major index. This is observable by vLLM stochastic
+    // rounding and makes fast/legacy A/B output bitwise comparable.
+    const int64_t logical0 = static_cast<int64_t>(src_i) * kSlotStride +
+                             static_cast<int64_t>(head) * 64 * kN +
+                             static_cast<int64_t>(d0) * kN + n0;
+    const int64_t logical1 = static_cast<int64_t>(src_i) * kSlotStride +
+                             static_cast<int64_t>(head) * 64 * kN +
+                             static_cast<int64_t>(d1) * kN + n0;
     rnd0a = philox4x32<ROUNDS>(*seed, logical0);
     rnd0b = philox4x32<ROUNDS>(*seed, logical0 + 4);
     rnd1a = philox4x32<ROUNDS>(*seed, logical1);
