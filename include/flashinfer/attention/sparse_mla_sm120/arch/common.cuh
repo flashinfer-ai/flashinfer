@@ -35,9 +35,6 @@
 #include <float.h>
 #include <math.h>
 
-#include <cstdio>
-#include <cstdlib>
-
 using bf16 = __nv_bfloat16;
 using fp8 = __nv_fp8_e4m3;
 using bf16_2 = __nv_bfloat162;
@@ -118,14 +115,3 @@ __device__ __forceinline__ uint32_t cvt_e4m3x4_residual(float a, float b, float 
   return cvt_e4m3x4(a - __low2float(h_ab), b - __high2float(h_ab), c - __low2float(h_cd),
                     d - __high2float(h_cd));
 }
-
-#ifndef CUDA_CHECK
-#define CUDA_CHECK(call)                                                                         \
-  do {                                                                                           \
-    cudaError_t err = (call);                                                                    \
-    if (err != cudaSuccess) {                                                                    \
-      fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
-      abort();                                                                                   \
-    }                                                                                            \
-  } while (0)
-#endif

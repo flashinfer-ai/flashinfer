@@ -56,6 +56,120 @@ from tests.trace.template_registry import collect_registered_trace_templates
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("input_layout", ["3d", "hnd", "nhd"])
+@pytest.mark.parametrize("kv_layout", [None, "HND", "NHD"])
+def test_dsv41_fp4_pack_trace(input_layout, kv_layout, tmp_path):
+    import json
+
+    from flashinfer.mla import dsv41_fp4_quantize_pack_sparse_mla_cache as pack
+
+    shapes = {"3d": (2, 8, 512), "hnd": (2, 1, 8, 512), "nhd": (2, 8, 1, 512)}
+    latent = torch.empty(shapes[input_layout], dtype=torch.float16)
+    kwargs = {} if kv_layout is None else {"kv_layout": kv_layout}
+    definition = pack.fi_trace(latent_kv=latent, save_dir=tmp_path, **kwargs)
+    axes = {
+        key: value["value"]
+        for key, value in definition["axes"].items()
+        if value["type"] == "const"
+    }
+    axes["num_pages"] = 2
+    assert (
+        tuple(axes[d] for d in definition["inputs"]["latent_kv"]["shape"])
+        == latent.shape
+    )
+    output = definition["outputs"]["cache"]
+    expected = (2, 8, 1, 288) if kv_layout == "NHD" else (2, 1, 8, 288)
+    assert tuple(axes[d] for d in output["shape"]) == expected
+    assert output["dtype"] == "uint8"
+    assert definition["inputs"]["latent_kv"]["dtype"] == "float16"
+    assert definition["inputs"]["kv_layout"]["dtype"] == "string"
+    assert "per-token" in output["description"]
+    assert (
+        json.loads((tmp_path / f"{definition['name']}.json").read_text()) == definition
+    )
+
+
+@pytest.mark.parametrize("latent_shape", [(6, 512), (2, 3, 512), (2, 1, 3, 512)])
+@pytest.mark.parametrize(
+    "cache_shape", [(2, 2304), (2, 8, 288), (2, 1, 8, 288), (2, 8, 1, 288)]
+)
+def test_dsv41_fp4_append_trace(latent_shape, cache_shape):
+    from flashinfer.mla import dsv41_fp4_quantize_append_sparse_mla_cache as append
+
+    latent = torch.empty(latent_shape, dtype=torch.bfloat16)
+    cache = torch.empty((4, *cache_shape[1:]), dtype=torch.uint8)[::2]
+    definition = append.fi_trace(
+        latent_kv=latent, slot_mapping=torch.empty(6, dtype=torch.int64), cache=cache
+    )
+    axes = {
+        key: value["value"]
+        for key, value in definition["axes"].items()
+        if value["type"] == "const"
+    }
+    inputs = definition["inputs"]
+    for name, tensor in (
+        ("latent_kv", latent),
+        ("slot_mapping", torch.empty(6)),
+        ("cache", cache),
+    ):
+        assert len(inputs[name]["shape"]) == tensor.ndim
+        for dim, size in zip(inputs[name]["shape"], tensor.shape, strict=True):
+            if dim in axes:
+                assert axes[dim] == size
+            axes[dim] = size
+    assert all(eval(constraint, {}, axes) for constraint in definition["constraints"])
+    assert inputs["slot_mapping"]["dtype"] == "int64"
+    assert inputs["latent_kv"]["dtype"] == "bfloat16"
+    assert definition["outputs"]["cache"]["shape"] == inputs["cache"]["shape"]
+    assert definition["outputs"]["cache"]["dtype"] == "uint8"
+    assert "None" in definition["description"]
+    assert "lowest-index" in inputs["slot_mapping"]["description"]
+    assert "Page-strided" in inputs["cache"]["description"]
+
+
+def test_dsv41_fp4_cache_autodump(tmp_path, monkeypatch):
+    import json
+
+    from flashinfer.mla import (
+        dsv41_fp4_quantize_append_sparse_mla_cache as append,
+        dsv41_fp4_quantize_pack_sparse_mla_cache as pack,
+    )
+    from flashinfer.trace import template
+    from flashinfer.utils import get_compute_capability
+
+    if not torch.cuda.is_available() or get_compute_capability(
+        torch.device("cuda")
+    ) not in ((12, 0), (12, 1)):
+        pytest.skip("Requires SM120/SM121")
+    monkeypatch.setenv("FLASHINFER_TRACE_DUMP", "1")
+    monkeypatch.setenv("FLASHINFER_TRACE_DUMP_DIR", str(tmp_path))
+    monkeypatch.setattr(template, "_DUMPED_NAMES", set())
+    latent = torch.randn(2, 8, 512, dtype=torch.bfloat16, device="cuda")
+    for layout in ("HND", "NHD"):
+        cache = pack(latent, kv_layout=layout)
+        full = cache.clone()
+        slots = torch.tensor([0, 0, -1, 16], dtype=torch.int32, device="cuda")
+        assert append(latent.reshape(-1, 512)[:4], slots, cache) is None
+        torch.testing.assert_close(cache, full, rtol=0, atol=0)
+        for api, kwargs in (
+            (pack, {"latent_kv": latent, "kv_layout": layout}),
+            (
+                append,
+                {
+                    "latent_kv": latent.reshape(-1, 512)[:4],
+                    "slot_mapping": slots,
+                    "cache": cache,
+                },
+            ),
+        ):
+            definition = api.fi_trace(**kwargs)
+            assert (
+                json.loads((tmp_path / f"{definition['name']}.json").read_text())
+                == definition
+            )
+    assert len(list(tmp_path.glob("*.json"))) == 4
+
+
 def test_svdquant_trace_activation_scale_tracks_variable_m():
     from flashinfer.trace.templates.gemm import mm_nvfp4_svdquant_trace
 
