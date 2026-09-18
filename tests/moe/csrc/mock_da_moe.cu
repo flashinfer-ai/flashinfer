@@ -559,9 +559,9 @@ class MockDAMoERunner {
         routing_metadata_(routing_metadata) {}
 
   /** Inject selector, pre-body work, and configured bodies into an outer capture. */
-  int64_t Capture(int num_selector_exemplars, const std::vector<int>& body_tactics,
-                  unsigned long long expected_capture_id, cudaGraphNode_t previous_conditional_node,
-                  cudaStream_t stream) const {
+  int64_t Capture(int local_expert_offset, int num_local_experts, int num_selector_exemplars,
+                  const std::vector<int>& body_tactics, unsigned long long expected_capture_id,
+                  cudaGraphNode_t previous_conditional_node, cudaStream_t stream) const {
     // Resolve the outer graph and refuse to hide graph creation inside an eager invocation.
     ActiveCaptureContext context{};
     cudaError_t status = GetActiveCaptureContext(stream, &context);
@@ -607,8 +607,8 @@ class MockDAMoERunner {
     selector_params.gridDim = dim3(1);
     selector_params.blockDim = dim3(kDASelectorBlockThreads);
     void* selector_arguments[] = {
-        &expert_ids,         &assignment_numel,      &num_experts,
-        &exemplar_spectra,   &exemplar_body_indices, &num_selector_exemplars,
+        &expert_ids,         &assignment_numel, &num_experts,           &local_expert_offset,
+        &num_local_experts,  &exemplar_spectra, &exemplar_body_indices, &num_selector_exemplars,
         &conditional_handle, &selected_body};
     selector_params.kernelParams = selector_arguments;
 
@@ -669,11 +669,16 @@ int64_t CaptureMockDAMoE(TensorView hidden_states, TensorView expert_ids, Tensor
                          TensorView exemplar_spectra, TensorView exemplar_body_indices,
                          TensorView body_tile_ns_device, TensorView selected_body,
                          TensorView routing_metadata, int64_t num_experts,
+                         int64_t local_expert_offset, int64_t num_local_experts,
                          int64_t num_selector_exemplars, Array<int64_t> body_tactic_ids,
                          int64_t expected_capture_id, int64_t previous_conditional_node_handle) {
   // Narrow public plan dimensions before building any native runner or graph state.
   const int runtime_num_selector_exemplars = ValidateNumSelectorExemplars(num_selector_exemplars);
   const int runtime_num_bodies = ValidateNumBodies(body_tactic_ids.size());
+  if (local_expert_offset < 0 || num_local_experts <= 0 ||
+      local_expert_offset + num_local_experts > num_experts) {
+    TVM_FFI_THROW(ValueError) << "The local expert shard must fit within num_experts";
+  }
   ffi::CUDADeviceGuard device_guard(hidden_states.device().device_id);
   const cudaStream_t stream = get_stream(hidden_states.device());
   std::vector<int> body_tactics;
@@ -695,6 +700,7 @@ int64_t CaptureMockDAMoE(TensorView hidden_states, TensorView expert_ids, Tensor
       static_cast<int32_t*>(selected_body.data_ptr()),
       static_cast<int32_t*>(routing_metadata.data_ptr()));
   int64_t conditional_node_handle = da_runner.Capture(
+      static_cast<int>(local_expert_offset), static_cast<int>(num_local_experts),
       runtime_num_selector_exemplars, body_tactics,
       static_cast<unsigned long long>(expected_capture_id),
       reinterpret_cast<cudaGraphNode_t>(previous_conditional_node_handle), stream);

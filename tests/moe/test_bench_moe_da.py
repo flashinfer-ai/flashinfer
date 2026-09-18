@@ -1,4 +1,4 @@
-"""End-to-end command-line contract for the production TRTLLM DA benchmark."""
+"""End-to-end command-line contract for the backend-aware DA MoE benchmark."""
 
 from __future__ import annotations
 
@@ -8,11 +8,89 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 import torch
 
+from benchmarks.bench_moe_da import _time_graphs_counterbalanced
 from flashinfer.utils import get_compute_capability
+
+
+class _FakeGraph:
+    def __init__(self, label: str, trace: list[str]) -> None:
+        self.label = label
+        self.trace = trace
+
+    def replay(self) -> None:
+        self.trace.append(self.label)
+
+
+class _FakeFlushBuffer:
+    def __init__(self, label: str, trace: list[str]) -> None:
+        self.label = label
+        self.trace = trace
+
+    def zero_(self) -> None:
+        self.trace.append(self.label)
+
+
+class _FakeEvent:
+    def record(self) -> None:
+        pass
+
+    def synchronize(self) -> None:
+        pass
+
+    def elapsed_time(self, _other: object) -> float:
+        return 1.0
+
+
+def test_graph_timing_counterbalances_order_and_flush_buffers(monkeypatch) -> None:
+    """Each graph must occupy both timing positions and see both eviction buffers."""
+    trace: list[str] = []
+    no_da_graph = _FakeGraph("noda", trace)
+    da_graph = _FakeGraph("da", trace)
+    buffers = (_FakeFlushBuffer("flush0", trace), _FakeFlushBuffer("flush1", trace))
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(torch.cuda, "Event", lambda **_kwargs: _FakeEvent())
+
+    no_da_ms, da_ms = _time_graphs_counterbalanced(
+        cast(Any, no_da_graph),
+        cast(Any, da_graph),
+        cast(Any, buffers),
+        warmup=2,
+        iterations=2,
+    )
+
+    assert no_da_ms == da_ms == 1.0
+    assert trace == [
+        "noda",
+        "da",
+        "da",
+        "noda",
+        "flush0",
+        "noda",
+        "flush1",
+        "da",
+        "flush0",
+        "da",
+        "flush1",
+        "noda",
+    ]
+
+
+@pytest.mark.parametrize("iterations", (0, 1, -2))
+def test_graph_timing_rejects_unbalanced_iteration_counts(iterations: int) -> None:
+    """Exact counterbalancing requires a positive even number of samples per graph."""
+    with pytest.raises(ValueError, match="positive, even"):
+        _time_graphs_counterbalanced(
+            cast(Any, None),
+            cast(Any, None),
+            cast(Any, ()),
+            warmup=0,
+            iterations=iterations,
+        )
 
 
 def _require_sm100() -> None:
@@ -28,7 +106,7 @@ def _benchmark_command(cache: Path, output: Path, *, cache_only: bool) -> list[s
     # Keep one compact real NVFP4 shape while exercising two distinct selector distributions.
     command = [
         sys.executable,
-        "benchmarks/bench_trtllm_moe_da.py",
+        "benchmarks/bench_moe_da.py",
         "--precision",
         "nvfp4",
         "--distributions",
@@ -54,7 +132,7 @@ def _benchmark_command(cache: Path, output: Path, *, cache_only: bool) -> list[s
         "--warmup",
         "0",
         "--iters",
-        "1",
+        "2",
         "--cache",
         str(cache),
         "--json-out",
@@ -108,12 +186,15 @@ def test_cli_json_cache_restores_in_a_fresh_process(tmp_path: Path) -> None:
     restored = tmp_path / "restored.json"
     # Start from the user environment, then pin only public tuning/cache controls for this process.
     environment = os.environ.copy()
+    python_path = [str(Path.cwd())]
+    if inherited_python_path := environment.get("PYTHONPATH"):
+        python_path.append(inherited_python_path)
     environment.update(
         {
             "FLASHINFER_DA_BASELINE_GUARD": "0",
             "FLASHINFER_WORKSPACE_BASE": str(Path.cwd() / ".cache"),
             "MAX_JOBS": "8",
-            "PYTHONPATH": str(Path.cwd()),
+            "PYTHONPATH": os.pathsep.join(python_path),
         }
     )
     for name in (
@@ -132,7 +213,11 @@ def test_cli_json_cache_restores_in_a_fresh_process(tmp_path: Path) -> None:
         env=environment,
     )
     cache_payload = json.loads(cache.read_text())
-    assert len(cache_payload["_records"]["trtllm_moe_da"]) == 1
+    da_records = cache_payload["_records"]["moe_da"]
+    assert len(da_records) == 1
+    operation_key, record = next(iter(da_records.items()))
+    assert json.loads(operation_key)["backend"] == "trtllm"
+    assert record["backend"] == "trtllm"
     _assert_result_file(tuned)
 
     # A second process proves cache-only replay can restore the same public result contract.
