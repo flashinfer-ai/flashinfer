@@ -2069,6 +2069,12 @@ class MoEWeightPack:
     Holding multiple materializations is intentional — that's the memory cost
     the user pays for cross-backend autotune.  Each view is the exact kwargs
     dict that runner's ``forward`` expects for weight-side arguments.
+
+    Every ``XxxConfig.prepare_weights`` takes the same canonical source
+    layout: ``w1`` is ``[E, 2I, H]`` for gated activations with rows in
+    ``[up, gate]`` order (``act(x @ w1[I:].T) * (x @ w1[:I].T)``), or
+    ``[E, I, H]`` for non-gated ones; ``w2`` is ``[E, H, I]``.  Backends that
+    want ``[gate, up]`` swap halves inside their prepare helper.
     """
 
     native_views: Dict[str, Dict[str, Tensor]] = field(default_factory=dict)
