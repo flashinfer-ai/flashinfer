@@ -111,7 +111,7 @@ void BatchPrefillWithPagedKVCacheRun(TensorView float_workspace_buffer,
 
         ADDITIONAL_PARAMS_SETTER
 
-        DTypeO* tmp_v = nullptr;
+        float* tmp_v = nullptr;
         float* tmp_s = nullptr;
 
         params.request_indices =
@@ -126,7 +126,7 @@ void BatchPrefillWithPagedKVCacheRun(TensorView float_workspace_buffer,
         if (plan_info.split_kv) {
           params.merge_indptr =
               GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.merge_indptr_offset);
-          tmp_v = GetPtrFromBaseOffset<DTypeO>(float_buffer_ptr, plan_info.v_offset);
+          tmp_v = GetPtrFromBaseOffset<float>(float_buffer_ptr, plan_info.v_offset);
           tmp_s = GetPtrFromBaseOffset<float>(float_buffer_ptr, plan_info.s_offset);
           if (plan_info.enable_cuda_graph) {
             params.block_valid_mask =

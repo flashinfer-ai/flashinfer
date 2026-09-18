@@ -2715,3 +2715,88 @@ def test_paged_prefill_split_kv_empty_chunk(dtype):
     assert not o.isnan().any() and not lse.isnan().any()
     torch.testing.assert_close(o, o_ref, rtol=1e-2, atol=1e-2)
     torch.testing.assert_close(lse, lse_ref, rtol=1e-2, atol=1e-2)
+
+
+def test_paged_prefill_split_kv_preserves_fp32_partials():
+    """Split-KV prefill must not round partial outputs before merging."""
+    torch.manual_seed(0)
+    num_qo_heads, num_kv_heads, head_dim = 32, 4, 128
+    kv_len, page_size = 16384, 16
+    num_pages = kv_len // page_size
+    dtype = torch.bfloat16
+
+    q = torch.randn(1, num_qo_heads, head_dim, device="cuda", dtype=dtype)
+    kv = (
+        torch.randn(
+            num_pages,
+            2,
+            page_size,
+            num_kv_heads,
+            head_dim,
+            device="cuda",
+            dtype=torch.float32,
+        )
+        * 0.5
+    ).to(dtype)
+
+    workspace = torch.empty(512 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        workspace, kv_layout="NHD", backend="fa2"
+    )
+    wrapper.plan(
+        qo_indptr=torch.tensor([0, 1], device="cuda", dtype=torch.int32),
+        paged_kv_indptr=torch.tensor([0, num_pages], device="cuda", dtype=torch.int32),
+        paged_kv_indices=torch.arange(num_pages, device="cuda", dtype=torch.int32),
+        paged_kv_last_page_len=torch.tensor(
+            [page_size], device="cuda", dtype=torch.int32
+        ),
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim_qk=head_dim,
+        page_size=page_size,
+        causal=False,
+        q_data_type=dtype,
+        kv_data_type=dtype,
+        fixed_split_size=128,
+    )
+    assert wrapper._plan_info[-1], "test configuration must exercise split-KV"
+    output = wrapper.run(q, kv)[0]
+
+    k = kv[:, 0].reshape(-1, num_kv_heads, head_dim).float()
+    v = kv[:, 1].reshape(-1, num_kv_heads, head_dim).float()
+    group_size = num_qo_heads // num_kv_heads
+    reference = torch.empty_like(output, dtype=torch.float32)
+    for head_idx in range(num_qo_heads):
+        scores = (q[0, head_idx].float() @ k[:, head_idx // group_size].T) / (
+            head_dim**0.5
+        )
+        reference[head_idx] = (
+            torch.softmax(scores, dim=-1) @ v[:, head_idx // group_size]
+        )
+
+    whole_workspace = torch.empty(512 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+    whole_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        whole_workspace, kv_layout="NHD", backend="fa2"
+    )
+    whole_wrapper.plan(
+        qo_indptr=torch.tensor([0, 1], device="cuda", dtype=torch.int32),
+        paged_kv_indptr=torch.tensor([0, num_pages], device="cuda", dtype=torch.int32),
+        paged_kv_indices=torch.arange(num_pages, device="cuda", dtype=torch.int32),
+        paged_kv_last_page_len=torch.tensor(
+            [page_size], device="cuda", dtype=torch.int32
+        ),
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim_qk=head_dim,
+        page_size=page_size,
+        causal=False,
+        q_data_type=dtype,
+        kv_data_type=dtype,
+        disable_split_kv=True,
+    )
+    whole_output = whole_wrapper.run(q, kv)[0]
+
+    rounded_reference = reference.to(dtype)
+    split_mismatches = torch.count_nonzero(output != rounded_reference).item()
+    whole_mismatches = torch.count_nonzero(whole_output != rounded_reference).item()
+    assert split_mismatches <= whole_mismatches + reference.numel() // 100
