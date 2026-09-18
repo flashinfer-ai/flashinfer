@@ -1411,19 +1411,28 @@ class TestCuteDslMoeW4A16:
             ),
         ],
     )
+    @pytest.mark.parametrize(
+        "half_tile_tail", [False, True], ids=["tail1", "tail-half-plus1"]
+    )
+    @pytest.mark.parametrize("top_k", [2, 3])
+    @pytest.mark.parametrize("use_fused_finalize", [False, True])
     def test_route_tile_boundary_accuracy(
         self,
         route_tile: int,
         gemm1_tactic: tuple,
         gemm2_tactic: tuple,
+        half_tile_tail: bool,
+        top_k: int,
+        use_fused_finalize: bool,
     ):
         from flashinfer.fused_moe.cute_dsl.blackwell.moe_w4a16 import (
             launch_w4a16_moe,
         )
         from flashinfer.fused_moe.cute_dsl.tuner import W4A16_MOE_TACTICS
 
-        num_tokens, hidden_size, intermediate_size = route_tile + 1, 256, 512
-        num_experts, top_k = 8, 2
+        num_tokens = route_tile + (route_tile // 2 + 1 if half_tile_tail else 1)
+        hidden_size, intermediate_size = 256, 512
+        num_experts = 8
         tensors = create_moe_tensors(
             num_tokens=num_tokens,
             hidden_size=hidden_size,
@@ -1432,7 +1441,7 @@ class TestCuteDslMoeW4A16:
             num_local_experts=num_experts,
             top_k=top_k,
         )
-        # Give two experts one full route tile and one boundary tile each.
+        # Give each selected expert one full route tile and one boundary tile.
         tensors["token_selected_experts"][:] = torch.arange(
             top_k, device=tensors["token_selected_experts"].device
         )
@@ -1456,7 +1465,7 @@ class TestCuteDslMoeW4A16:
             moe_output=torch.empty(
                 (num_tokens, hidden_size), dtype=torch.bfloat16, device="cuda"
             ),
-            use_fused_finalize=False,
+            use_fused_finalize=use_fused_finalize,
             enable_pdl=False,
             activation_type=ActivationType.Swiglu,
             tactic=tactic,
@@ -1600,15 +1609,20 @@ class TestCuteDslFusedMoeFunctional:
         )
 
     @pytest.mark.parametrize(
-        "quant_mode, use_per_token_activation",
-        _MOE_QUANT_MODE_CASES,
+        "quant_mode,use_per_token_activation,use_fused_finalize,hidden_sizes",
+        [
+            pytest.param("w4a4", False, True, (256, 384), id="w4a4-per-tensor"),
+            pytest.param("w4a4", True, True, (256, 384), id="w4a4-per-token"),
+            pytest.param("w4a16", False, False, (256, 384, 256), id="w4a16-ordinary"),
+            pytest.param("w4a16", False, True, (256, 384, 256), id="w4a16-fused"),
+        ],
     )
-    @pytest.mark.parametrize("hidden_size", [256, 384])
     def test_finalize_handles_cluster_padding_and_partial_tiles(
         self,
         quant_mode: str,
         use_per_token_activation: bool,
-        hidden_size: int,
+        use_fused_finalize: bool,
+        hidden_sizes: tuple[int, ...],
         monkeypatch: pytest.MonkeyPatch,
     ):
         from flashinfer.autotuner import AutoTuner
@@ -1624,8 +1638,8 @@ class TestCuteDslFusedMoeFunctional:
                 ((256, 256), (2, 2), False),
             )
         elif quant_mode == "w4a16":
-            # W4A16 clusters 128-wide M CTAs in pairs, so hidden=384 leaves a
-            # padding peer.
+            # The same cache sees a full cluster, a padding peer, then a full
+            # cluster again. Keep route tails in both finalize modes.
             tail_config = (
                 ((256, 128, 256), (2, 1), True),
                 ((256, 128, 256), (2, 1), True),
@@ -1639,17 +1653,18 @@ class TestCuteDslFusedMoeFunctional:
             return runners[0], tail_config
 
         monkeypatch.setattr(AutoTuner, "choose_one", choose_tail_config)
-        self._run_numerical_accuracy(
-            activation_type=ActivationType.Relu2,
-            num_tokens=128,
-            top_k=2,
-            hidden_size=hidden_size,
-            intermediate_size=512,
-            num_experts=8,
-            quant_mode=quant_mode,
-            use_per_token_activation=use_per_token_activation,
-            use_fused_finalize=True,
-        )
+        for hidden_size in hidden_sizes:
+            self._run_numerical_accuracy(
+                activation_type=ActivationType.Relu2,
+                num_tokens=128,
+                top_k=2,
+                hidden_size=hidden_size,
+                intermediate_size=512,
+                num_experts=8,
+                quant_mode=quant_mode,
+                use_per_token_activation=use_per_token_activation,
+                use_fused_finalize=use_fused_finalize,
+            )
 
     def _run_numerical_accuracy(
         self,
