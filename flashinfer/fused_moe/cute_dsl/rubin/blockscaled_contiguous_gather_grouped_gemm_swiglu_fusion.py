@@ -191,7 +191,7 @@ class Sm107BlockScaledContiguousGatherGroupedGemmSwigluFusionKernel:
         raster_along_m: bool = False,
         a_path: str = "cpasync",
         use_pdl: bool = True,
-        ugpu_half_gemm: bool = False,
+        localized_half_gemm: bool = False,
         enable_pdl: Optional[bool] = None,
     ):
         # flashinfer dispatcher compatibility: the pre-sync kernel took
@@ -200,9 +200,9 @@ class Sm107BlockScaledContiguousGatherGroupedGemmSwigluFusionKernel:
         if enable_pdl is not None:
             use_pdl = enable_pdl
         self.a_path = a_path
-        # uGPU half-GEMM: two partitions write their N-half into a shared
+        # locality-domain half-GEMM: two partitions write their N-half into a shared
         # full-width C/SFC buffer at a column offset (see wrapper/__call__).
-        self.ugpu_half_gemm = ugpu_half_gemm
+        self.localized_half_gemm = localized_half_gemm
         self.sf_vec_size = sf_vec_size
         self.topk = topk
         self.acc_dtype = cutlass.Float32
@@ -794,9 +794,9 @@ class Sm107BlockScaledContiguousGatherGroupedGemmSwigluFusionKernel:
         sfb = cute.make_tensor(sfb.iterator, sfb_layout)
 
         # Setup sfc tensor by filling C tensor to scale factor atom layout.
-        # For uGPU, full_c_shape carries the full N dimension so sfc gets the
-        # correct M-tile stride (two uGPUs write their N-half into the shared
-        # SF buffer without copy-back); None → use c.shape (non-uGPU).
+        # For locality-domain, full_c_shape carries the full N dimension so sfc gets the
+        # correct M-tile stride (two locality domains write their N-half into the shared
+        # SF buffer without copy-back); None → use c.shape (non-locality-domain).
         self.generate_sfc = sfc_tensor is not None and norm_const_tensor is not None
         if cutlass.const_expr(self.generate_sfc):
             sfc_shape = c.shape if full_c_shape is None else full_c_shape
@@ -3079,9 +3079,9 @@ class Sm107BlockScaledContiguousGatherGroupedGemmSwigluFusionKernel:
                             # Float4E2M1FN quantization: per-vector absmax →
                             # SFC → store SFC to gmem → quantize output by
                             # reciprocal of SFC. (Subtile is partitioned on N.)
-                            # uGPU: shift the SFC N-subtile by c_sf_n_tile_offset
+                            # locality-domain: shift the SFC N-subtile by c_sf_n_tile_offset
                             # so this partition writes into the shared full-width
-                            # SF buffer at the correct N tile (0 in non-uGPU).
+                            # SF buffer at the correct N tile (0 in non-locality-domain).
                             sfc_subtile_idx_mn = (
                                 tile_info[0] * self.epi_tile_cnt[0] + epi_m_idx,
                                 c_sf_n_tile_offset
@@ -3963,12 +3963,12 @@ class Sm107BlockScaledContiguousGatherGroupedGemmSwigluFusionKernel:
                 (32, 4, n // 128, 4, scale_k // 4, l), order=(2, 1, 4, 0, 3, 5)
             ),
         )
-        # c: runtime Int64 row stride. For uGPU half-GEMM, two partitions
+        # c: runtime Int64 row stride. For locality-domain half-GEMM, two partitions
         # interleave their N-halves into one shared full-width buffer
         # (c_stride_m = full intermediate size). A runtime stride also avoids a
         # cutlass-dsl MLIR alignment bug seen with
         # make_layout(..., stride=ordered_layout.stride). c_stride_m == 0 ->
-        # natural interm_size stride (non-uGPU, == make_ordered_layout).
+        # natural interm_size stride (non-locality-domain, == make_ordered_layout).
         actual_c_stride_m = interm_size if c_stride_m == 0 else c_stride_m
         c = cute.make_tensor(
             c_ptr,
@@ -3977,9 +3977,9 @@ class Sm107BlockScaledContiguousGatherGroupedGemmSwigluFusionKernel:
                 stride=(actual_c_stride_m, 1, m * actual_c_stride_m),
             ),
         )
-        # full_c_shape gives SFC the full-N M-tile stride in uGPU mode so the
+        # full_c_shape gives SFC the full-N M-tile stride in locality-domain mode so the
         # shared SF buffer is written without copy-back; None → use c.shape.
-        if cutlass.const_expr(not self.ugpu_half_gemm):
+        if cutlass.const_expr(not self.localized_half_gemm):
             full_c_shape = None
         else:
             full_interm_size = 2 * interm_size
