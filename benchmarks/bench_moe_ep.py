@@ -72,6 +72,15 @@ _REFERENCE = dict(
 
 
 def _parse_args() -> argparse.Namespace:
+    """Parse the CLI, resolving the geometry presets that are not plain flags.
+
+    ``--reference`` overwrites ``--num-experts`` / ``--top-k`` / ``--hidden`` /
+    ``--intermediate`` (and ``--tokens-per-rank`` if unset) in place with the
+    ep_bench reference case, so everything downstream can read those attributes
+    unconditionally. ``--ep-test-geometry`` is deliberately left unresolved here:
+    it derives from the world size, which only exists after
+    ``dist.init_process_group`` in :func:`main`.
+    """
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--backend", choices=["nccl_ep", "nixl_ep"], default="nccl_ep")
     p.add_argument(
@@ -221,6 +230,16 @@ def _comm_config(backend: str):
 
 
 def main() -> int:
+    """Run one rank of the benchmark; rank 0 prints the ``BENCH_CSV`` row.
+
+    The two timing modes differ in more than where the timer sits. Eager mode
+    times ``layer.forward`` directly and reports per-stage CUDA-event times.
+    Graph mode captures one forward against a ``MoEEpSplitGraphState`` and times
+    replays, which forces two separate warmups -- a mandatory eager one before
+    the capture (see the comment at the capture site) and an optional one over
+    the replay path -- and reports e2e only, because reading the per-stage events
+    needs a device sync that is illegal inside a capture.
+    """
     args = _parse_args()
 
     import torch
@@ -350,7 +369,17 @@ def main() -> int:
         # inside a capture, so graph mode reports e2e only.
         layer.enable_timing = False
         graph_state = layer.create_graph_state(t)
-        for _ in range(args.warmup):
+        # At least one EAGER forward before the capture, even under --warmup 0.
+        # create_graph_state() only builds the fleet and the persistent handle;
+        # it is the first forward that builds the lazy inner MoE kernel (a JIT
+        # compile) and runs its backend selection, which times its candidates in
+        # a CUDA graph of its own -- a nested capture is illegal and aborts the
+        # outer one from deep inside the tuner, with an error that says nothing
+        # about --warmup. That first forward is also what drives the transport
+        # to the steady state the capture is supposed to record. See the "warmup
+        # forward is not optional" rule in docs/design_docs/moe_ep_runbook.md.
+        # max() also covers the negative counts argparse still accepts.
+        for _ in range(max(1, args.warmup)):
             layer.forward(t, graph_state=graph_state)
         torch.cuda.synchronize()
         dist.barrier()

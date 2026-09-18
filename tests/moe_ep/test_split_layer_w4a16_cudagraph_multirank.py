@@ -47,6 +47,13 @@ TOPK = 2
 
 
 def _init_dist():
+    """Join the torchrun process group and pin this rank to its own device.
+
+    The device pin has to come first: ``_build_layer`` captures
+    ``torch.cuda.current_stream()`` and allocates the expert weights on the
+    current device, so a rank left on cuda:0 would build its layer on the
+    wrong GPU.
+    """
     import torch
     import torch.distributed as dist
 
@@ -156,6 +163,15 @@ def _build_layer(rank, world_size, backend):
 
 
 def _make_tensors(rank):
+    """Per-rank inputs for the W4A16 chain.
+
+    ``topk_weights`` comes from a softmax, so every token's combine weights
+    sum to 1 and the combined result stays O(x) rather than scaled by TOPK --
+    which keeps the eager-vs-replay tolerance meaningful. The seed is
+    rank-dependent on purpose: identical routing on every rank would make
+    dispatch trivially balanced and hide a slot-arithmetic bug behind a
+    uniform load.
+    """
     import torch
 
     from flashinfer.moe_ep import MoEEpTensors
@@ -252,7 +268,13 @@ def test_w4a16_split_layer_chain_is_capturable(backend):
 
 @pytest.mark.nvep
 @pytest.mark.gpu_4
-@pytest.mark.parametrize("backend", ["nccl_ep"])
+# nixl_ep matters here specifically. Its graph-stable routing binding -- the
+# handle-owned cast buffer that update() funnels ids through -- is otherwise
+# untested: no other test rewrites topk_ids between replays, and the identity
+# kernel used by the transport-only tests returns x under ANY routing, so it
+# cannot witness a stale binding. This test is the one that can, because it
+# rewrites the routing in place against real expert weights.
+@pytest.mark.parametrize("backend", ["nccl_ep", "nixl_ep"])
 def test_w4a16_graph_matches_eager_across_routing_changes(backend):
     """Rewriting the routing between replays must change what the graph serves.
 

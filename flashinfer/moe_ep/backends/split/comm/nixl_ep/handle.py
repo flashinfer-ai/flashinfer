@@ -32,6 +32,21 @@ class NixlEpHandle(Handle):
         params: HandleParams,
         algo_knobs: Sequence[AlgoKnob] = (),
     ) -> None:
+        """Bind the handle to this step's routing at graph-stable addresses.
+
+        When the caller's ``topk_ids`` dtype differs from the index width
+        this build binds, the destination it is cast into is owned here
+        rather than minted per call, and :meth:`update` funnels every later
+        step through it. When no cast is needed there is no such buffer and
+        the caller's tensor is bound as-is; there address stability comes
+        instead from :meth:`update` rejecting an address change under
+        capture -- a raise, not a funnel, and one that only fires while
+        capturing, so an eager rebind between replays would still move the
+        address out from under a recorded graph. Through
+        :class:`MoEEpSplitGraphState` that cannot happen (its ``_check``
+        rejects a rebound ``topk_ids`` first); a direct Handle-API caller is
+        on its own.
+        """
         self._fleet = fleet
         self._handle_knobs = _index_knobs(algo_knobs)
         self._staged = HandleAlgoKnobSplitOperation in self._handle_knobs
@@ -80,6 +95,14 @@ class NixlEpHandle(Handle):
 
     @staticmethod
     def _capturing() -> bool:
+        """The single predicate deciding this handle's capture-mode behavior.
+
+        Two things change under capture: the recv hook is dropped (see
+        :meth:`_use_hook` -- a host callback cannot replay) and :meth:`update`
+        promotes a routing-address change from a harmless rebind into an
+        error. Both ask here so they can never disagree about which mode the
+        handle is in.
+        """
         import torch
 
         return torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
@@ -87,16 +110,21 @@ class NixlEpHandle(Handle):
     def _use_hook(self) -> bool:
         """Whether to drive the Buffer in ``return_recv_hook`` mode.
 
-        Outside capture: yes. The hook is the proven completion barrier for
-        this transport (see dispatch()).
+        Outside capture: yes, matching vLLM's native nixl_ep call convention.
+        Note the hook does not itself wait for anything: it only defers
+        launching ``EP_RECV_PHASE`` (``nixl_ep.cpp`` ~:1141 dispatch, ~:1242
+        combine), which lets the caller interleave host work between send and
+        recv.
 
         Under capture: no. The hook is a HOST callback, and a CUDA graph
-        records device work only -- a captured hook runs once, at capture
-        time, and never again on replay, so replays would read data that has
-        not landed. ``return_recv_hook=False`` instead asks the kernel itself
-        to wait for arrival, which is ordinary device work and records
-        faithfully. (``async_finish`` stays False either way; its event does
-        not guarantee the RDMA landed and deadlocks combine under load.)
+        records device work only -- a captured hook runs once, at capture time
+        and never again on replay. ``return_recv_hook=False`` launches
+        ``EP_SEND_PHASE | EP_RECV_PHASE`` as one kernel and joins it back to
+        the compute stream inside the transport, so the same device code runs
+        with no host in the loop. Arrival is a device spin on a peer-written
+        flag in either mode, so dropping the hook removes no waiting.
+
+        ``async_finish`` stays False in both modes -- see ``dispatch()``.
         """
         return not self._capturing()
 
@@ -132,18 +160,18 @@ class NixlEpHandle(Handle):
         if (
             self._topk_cast_buf is None
             and bound.data_ptr() != self._topk_ids.data_ptr()
+            and self._capturing()
         ):
             # No cast buffer to funnel through, so a different tensor means a
             # different address -- silently fine eagerly, silently WRONG once
             # captured, which is the case worth naming.
-            if self._capturing():
-                raise ValueError(
-                    "NixlEpHandle.update: topk_ids moved to a different buffer "
-                    f"during capture (0x{self._topk_ids.data_ptr():x} -> "
-                    f"0x{bound.data_ptr():x}). A graph binds the address it "
-                    "saw, so replays would keep reading the old one; write the "
-                    "new ids into the registered tensor in place."
-                )
+            raise ValueError(
+                "NixlEpHandle.update: topk_ids moved to a different buffer "
+                f"during capture (0x{self._topk_ids.data_ptr():x} -> "
+                f"0x{bound.data_ptr():x}). A graph binds the address it "
+                "saw, so replays would keep reading the old one; write the "
+                "new ids into the registered tensor in place."
+            )
         self._topk_ids = bound
 
     # @flashinfer_api  # disabled per PR #3453 review
@@ -152,13 +180,17 @@ class NixlEpHandle(Handle):
         x = params.x[0]  # MVP: single token tensor
         buf = self._fleet.buffer
         use_hook = self._use_hook()
-        # async_finish is always False: the MVP's event does NOT guarantee the
-        # RDMA transfer has landed — it deadlocks combine under load (rank 0
-        # never finishes sending, peers time out on "combine receive
-        # src_rank 0"). Eagerly the recv hook is the actual completion barrier,
-        # mirroring vLLM's proven native nixl_ep path; run it now for the
-        # synchronous path, or defer it to complete() when staged (DBO). Under
-        # capture there is no hook at all — see _use_hook().
+        # async_finish is always False. Observed: with async_finish=True this
+        # path deadlocked combine under sustained load (peers timing out on
+        # "combine receive src_rank 0"), fixed in b848e0ae / PR #4139. The
+        # mechanism the transport source supports is a missing JOIN rather than
+        # RDMA-landing semantics: the pre-fix caller stashed dispatch's event in
+        # self._event and combine() then overwrote it, so nothing ever ordered
+        # the expert GEMM after dispatch. async_finish=False makes the transport
+        # issue that join itself. Eagerly the recv hook then defers the recv
+        # launch (not a wait -- see _use_hook()); run it now for the synchronous
+        # path, or defer it to complete() when staged (DBO). Under capture there
+        # is no hook at all.
         (
             recv_x,
             recv_count,

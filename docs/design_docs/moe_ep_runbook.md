@@ -678,7 +678,7 @@ inside it):
 
 ```python
 state = layer.create_graph_state(t)          # outside any capture, ALL ranks
-layer.forward(t, graph_state=state)          # warmup, still eager
+layer.forward(t, graph_state=state)          # warmup, still eager -- REQUIRED
 torch.cuda.synchronize()
 
 g = torch.cuda.CUDAGraph()
@@ -698,12 +698,40 @@ Rules, in rough order of how easily they are violated:
   re-checks all three addresses each call and raises, because a caller that
   quietly passed a fresh tensor would otherwise get a graph still serving the
   old one.
-- **The warmup forward is not optional.** It compiles/autotunes the inner
-  kernel and establishes the transport's steady state; neither can happen
-  during capture.
-- **One shape per state and per graph.** `top_k` and the token count are baked
-  into the handle *and* into the graph. A different batch size needs its own
-  state and its own graph — the usual multi-size-graph pattern.
+- **The warmup forward is not optional, and `forward()` enforces it.**
+  Capturing through a `graph_state` on a layer that has never completed an
+  eager forward raises instead of proceeding. The first round trip is what
+  builds and autotunes the inner MoE kernel — whose backend selection captures
+  a graph of its own, and nested capture is illegal — and what gives the
+  transport its steady state; neither can happen during capture, and the
+  symptom otherwise surfaces from inside the inner kernel and names nothing in
+  the EP layer. What satisfies the check is one *eager* (non-capturing)
+  forward on **this layer** that returns normally: `layer.forward(t)` and
+  `layer.forward(t, graph_state=state)` both count, since both run the same
+  round trip over the same fleet and kernel. `create_graph_state()` alone does
+  not — it builds the fleet and the handle but runs no round trip. Warm on
+  every EP rank.
+- **One shape per state and per graph — and one live state per layer.**
+  `top_k` and the token count are baked into the handle *and* into the graph,
+  so a different batch size needs its own state and its own graph, the usual
+  multi-size-graph pattern. But `create_graph_state()` refuses a second state
+  while the first is live, and destroying the live one to make room frees the
+  buffers every graph already captured from it replays against. So today a
+  second shape needs a second `MoEEpSplitLayer`, not a second state on this
+  one.
+- **Pass each layer the state its own `create_graph_state()` returned, and
+  keep that layer alive.** Fleets are per layer, so a state carries one
+  layer's handle: that layer's communicator, its transport buffers, its `out`.
+  `forward()` re-checks the owner on every call because the mixed-up case is
+  silent — with the usual homogeneous `FleetParams` no shape disagrees
+  anywhere, so the call just runs this layer's tokens over the other layer's
+  transport and writes the other state's `out`, and both forwards hand back
+  the same tensor. (A model with N MoE layers holds N layers and N states,
+  which is exactly the shape of code an off-by-one over `states[i]` lives in.)
+  The state holds only a weakref to its layer, so a `forward()` through a
+  state whose layer has already been collected is refused too, rather than
+  running on a handle whose fleet is gone — keep the layer alive at least as
+  long as the state and every graph captured from it.
 - **`enable_timing` is off-limits under capture.** It synchronizes the device
   to read its CUDA events, which capture forbids. Time `g.replay()` instead
   (`benchmarks/bench_moe_ep.py --cuda-graph` does exactly this).
@@ -713,8 +741,12 @@ Rules, in rough order of how easily they are violated:
   dispatch and combine. Replays run no host code, so every replay reuses the
   slot that was current at capture. That stays consistent only while the ranks
   agree on the call sequence.
-- **Retire the graphs before `state.destroy()`.** They hold pointers into the
-  handle's buffers.
+- **Retire the graphs before `state.destroy()` or `layer.destroy()`.** They
+  hold pointers into the handle's buffers. `layer.destroy()` tears down state
+  → fleet → comm runtime in that order (the handle borrows fleet buffers, the
+  fleet's group lives on the runtime) and is terminal: afterwards `forward()`
+  and `create_graph_state()` raise, rather than lazily rebuilding a second
+  fleet on an already-finalized comm runtime.
 
 Backend notes:
 
@@ -725,12 +757,48 @@ Backend notes:
 - **nixl_ep** has no handle-init step at all — LL dispatch recomputes routing
   in-kernel from `topk_idx`, and the recv buffers live in the Buffer's
   persistent RDMA arena. Its `update()` therefore exists to guarantee the
-  *binding* (the int64→int32 ids cast lands in a handle-owned buffer, so the
+  *binding* (when this build's index width differs from the caller's, the ids
+  cast lands in a handle-owned buffer, so the
   captured address keeps receiving new routing). Under capture the handle also
   drops its recv hook (`return_recv_hook=False`): the hook is a **host**
   callback, so a captured one runs once at capture and never on replay,
   leaving replays reading data that had not landed. The kernel's own arrival
   wait records faithfully instead.
+
+### Scope of validation, and how a stall surfaces
+
+What is covered: 4xGB200, single node, 4 ranks, 64 tokens/rank, one
+dispatch/combine pair per replay. What is **not**: the sustained serving load
+(DP8, 2048-token, ~256 concurrent prompts) under which the nixl_ep combine
+deadlock of PR #4139 appeared, and multi-node. On one NVLink node `p2p_ptr_get`
+succeeds, so the LL transfers are plain stores and the `nixlPut` /
+`nixlAtomicAdd` network path is likely never exercised under capture at all.
+The argument that dropping the recv hook is safe (it defers a kernel launch
+rather than performing a wait) is a source-reading argument, not a measurement.
+
+Know how a stall ends, because it is not an exception. LL arrival is a device
+spin bounded by `timeout_ms` (default 30 s). On expiry the kernel printfs and
+then, because the mask buffer is always allocated by `update_memory_buffers`,
+takes the **mask** branch rather than trapping: the offending peer is masked and
+the output is silently degraded, as sticky device state that every subsequent
+replay inherits. A captured graph cannot raise, so nothing surfaces in Python.
+Treat an unexplained accuracy drop after a long run as a candidate symptom, and
+check stderr for `NIXL-EP timeout`.
+
+### Why this is opt-in rather than the default
+
+The persistent-handle path is cheaper per forward -- eager `forward()` pays
+`create_handle` + `empty_like(out)` + `destroy()` every call -- so the reason
+`create_graph_state()` is explicit is semantics, not cost:
+
+* `out` becomes a **reused** buffer instead of a fresh allocation per call, which
+  changes what a caller holding last step's result observes.
+* The pointer check exists to **raise** on a rebound tensor. An implicit,
+  address-keyed cache would silently rebuild instead -- harmless eagerly, wrong
+  under capture, where the recorded graph still reads the old address. That
+  raise is the feature.
+* A handle carries state the key does not capture (bound stream, staged flag,
+  token count, nixl's cast buffer), and a pinned handle cannot be evicted.
 
 Tests: `tests/moe_ep/test_split_layer_cudagraph_multirank.py` (layer API, both
 backends) and `tests/moe_ep/test_moe_ep_cudagraph_multirank.py` (the same
