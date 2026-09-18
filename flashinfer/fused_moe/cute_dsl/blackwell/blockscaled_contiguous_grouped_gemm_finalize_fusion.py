@@ -1453,6 +1453,13 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
 
         griddepcontrol_wait()
 
+        # The standalone finalizer can prepare its independent state while
+        # FC2 runs. Its dependency wait still protects every FC2 output load.
+        if cutlass.const_expr(self.enable_pdl and not self.use_fused_finalize):
+            if warp_idx == self.mma_warp_id:
+                with cute.arch.elect_one():
+                    griddepcontrol_launch_dependents()
+
         #
         # Specialized Schedule warp
         #
