@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import ast
+from dataclasses import replace
+from pathlib import Path
+
 import pytest
 import torch
 
@@ -11,10 +15,20 @@ from flashinfer.fused_moe import (
     BackendOptions,
     CuTileBf16Config,
     CuTileBf16Runner,
+    CuTileFp8PerTensorBf16Config,
+    CuTileFp8PerTensorBf16Runner,
+    CuTileFp8PerTensorConfig,
+    CuTileFp8PerTensorRunner,
     CuTileMxfp4Bf16Config,
     CuTileMxfp4Bf16Runner,
     CuTileMxfp4Config,
     CuTileMxfp4Runner,
+    CuTileMxfp4Mxfp8Config,
+    CuTileMxfp4Mxfp8Runner,
+    CuTileMxfp8Bf16Config,
+    CuTileMxfp8Bf16Runner,
+    CuTileMxfp8Config,
+    CuTileMxfp8Runner,
     CuTileNvfp4Bf16Config,
     CuTileNvfp4Bf16Runner,
     CuTileNvfp4Config,
@@ -40,7 +54,13 @@ from flashinfer.fused_moe import (
     SwiGLU,
     SwiGLUStep,
 )
-from flashinfer.fused_moe.runners import _validate_cutile_int32_routing
+from flashinfer.fused_moe.runners import (
+    _CuTileGemmProblem,
+    _cutile_bucket_compile_token_counts,
+    _cutile_fp8_gemm_candidates,
+    _validate_cutile_int32_routing,
+)
+from flashinfer.fused_moe.utils import get_hybrid_num_tokens_buckets
 from flashinfer.tllm_enums import ActivationType
 
 from .utils import compute_reference_activation, compute_reference_moe
@@ -63,6 +83,74 @@ _CUTILE_ACTIVATIONS = (
     ReLU(),
     SiLU(),
 )
+
+
+def test_cutile_moe_workload_sizes_are_runtime_kernel_parameters():
+    """Prevent exact request sizes from becoming unbounded JIT cache keys."""
+    runtime_parameters = {
+        "assignments",
+        "grid_m",
+        "live_rows",
+        "num_assignments",
+        "num_blocks",
+        "num_rows",
+        "num_tokens",
+        "numel",
+        "rows",
+        "tokens",
+        "valid_rows",
+    }
+    cutile_dir = Path(__file__).parents[2] / "flashinfer" / "fused_moe" / "cutile"
+    violations = []
+    for path in sorted(cutile_dir.glob("*.py")):
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            arguments = (
+                *node.args.posonlyargs,
+                *node.args.args,
+                *node.args.kwonlyargs,
+            )
+            for argument in arguments:
+                if argument.arg.lower() not in runtime_parameters:
+                    continue
+                annotation = (
+                    ""
+                    if argument.annotation is None
+                    else ast.unparse(argument.annotation)
+                )
+                if "Constant" in annotation or "ConstInt" in annotation:
+                    violations.append(
+                        f"{path.name}:{node.lineno} {node.name}({argument.arg})"
+                    )
+    assert not violations, (
+        "token-dependent cuTile MoE parameters must remain runtime values: "
+        + ", ".join(violations)
+    )
+
+
+def test_cutile_autotune_uses_bounded_dispatch_representatives():
+    max_num_tokens = 8192
+    buckets = get_hybrid_num_tokens_buckets(max_num_tokens)
+    counts = tuple(
+        count
+        for bucket in buckets
+        for count in _cutile_bucket_compile_token_counts(
+            bucket,
+            tune_max_num_tokens=max_num_tokens,
+            num_experts=256,
+            top_k=8,
+            hidden_size=4096,
+            intermediate_size=1024,
+            block_size=32,
+        )
+    )
+
+    assert set(buckets).issubset(counts)
+    assert len(counts) < max_num_tokens // 16
+    assert len(counts) == len(set(counts))
+    assert all(1 <= count <= max_num_tokens for count in counts)
 
 
 @pytest.mark.parametrize("arch", (80, 86, 89, 90, 100, 103, 120, 121))
@@ -104,6 +192,16 @@ def test_cutile_activation_capabilities_and_scalar_lowering():
     assert set(CuTileNvfp4Bf16Runner.supported_activation_classes) == expected_classes
     assert set(CuTileMxfp4Runner.supported_activation_classes) == expected_classes
     assert set(CuTileMxfp4Bf16Runner.supported_activation_classes) == expected_classes
+    assert (
+        set(CuTileFp8PerTensorRunner.supported_activation_classes) == expected_classes
+    )
+    assert (
+        set(CuTileFp8PerTensorBf16Runner.supported_activation_classes)
+        == expected_classes
+    )
+    assert set(CuTileMxfp8Runner.supported_activation_classes) == expected_classes
+    assert set(CuTileMxfp8Bf16Runner.supported_activation_classes) == expected_classes
+    assert set(CuTileMxfp4Mxfp8Runner.supported_activation_classes) == expected_classes
     assert _activation_kernel_args(SwiGLU(alpha=1.7, beta=0.25, limit=6.0)) == (
         int(ActivationType.Swiglu),
         1.7,
@@ -232,6 +330,26 @@ def test_cutile_bf16_workspace_cache_uses_token_buckets(activation):
     assert module.calls[0]["block_sizes"] == (32, 64, 128)
     assert module.calls[0]["is_gated"] is activation.is_gated
     assert set(runner._workspace_cache) == {(32, 128), (64, 128)}
+
+
+def test_cutile_workspace_allocation_is_rejected_during_cuda_graph_capture(
+    monkeypatch,
+):
+    class KernelModule:
+        def allocate_workspace(self, **kwargs):
+            raise AssertionError("workspace allocation must not run during capture")
+
+    runner = CuTileBf16Runner.__new__(CuTileBf16Runner)
+    runner.config = _config()
+    runner.device = torch.device("cpu")
+    runner._built = True
+    runner._kernel_module = KernelModule()
+    runner._workspace_cache = {}
+    runner._workspace = None
+    monkeypatch.setattr(runner, "_is_current_stream_capturing", lambda: True)
+
+    with pytest.raises(RuntimeError, match="warm this bucket first"):
+        runner._ensure_workspace(17, 128)
 
 
 def test_prepare_cutile_bf16_weights_rejects_invalid_source_contract():
@@ -423,6 +541,40 @@ def test_cutile_workspace_covers_all_permute_shapes_in_bucket(
     assert workspace.hist.numel() == max_ncp * epow2
     assert workspace.base.numel() == max_ncp * epow2
     assert workspace.slab_tot.numel() == max_num_slabs * epow2
+
+
+@cutile_bf16_required
+@pytest.mark.parametrize(
+    ("num_assignments", "num_experts", "block_size", "expected_rows"),
+    (
+        (8, 256, 32, 256),
+        (256, 256, 32, 8192),
+        (257, 256, 32, 8193),
+    ),
+)
+def test_cutile_permute_workspace_does_not_pad_empty_experts(
+    num_assignments, num_experts, block_size, expected_rows
+):
+    from flashinfer.fused_moe.cutile import moe
+
+    assert (
+        moe._max_permuted_rows(num_assignments, num_experts, block_size)
+        == expected_rows
+    )
+    workspace = moe.allocate_workspace(
+        num_tokens=num_assignments,
+        hidden_size=64,
+        intermediate_size=64,
+        num_experts=num_experts,
+        top_k=1,
+        is_gated=True,
+        block_sizes=(block_size,),
+        device=torch.device("cuda"),
+    )
+    assert workspace.sorted_slots.numel() == expected_rows
+    assert (
+        workspace.block_expert.numel() == (expected_rows + block_size - 1) // block_size
+    )
 
 
 @cutile_bf16_required
@@ -1779,3 +1931,314 @@ def test_cutile_nvfp4_runs_through_unified_layer(activation):
 
     assert layer.winner_backend == "cutile_nvfp4"
     torch.testing.assert_close(actual, expected, rtol=0.25, atol=1.0)
+
+
+# ---------------------------------------------------------------------------
+# cuTile FP8 and MXFP8 precision pairs
+# ---------------------------------------------------------------------------
+
+
+_CUTILE_FP8_MODES = (
+    (
+        CuTileFp8PerTensorBf16Config,
+        CuTileFp8PerTensorBf16Runner,
+        QuantFormat.FP8PerTensor,
+        QuantFormat.BF16,
+    ),
+    (
+        CuTileFp8PerTensorConfig,
+        CuTileFp8PerTensorRunner,
+        QuantFormat.FP8PerTensor,
+        QuantFormat.FP8PerTensor,
+    ),
+    (
+        CuTileMxfp8Bf16Config,
+        CuTileMxfp8Bf16Runner,
+        QuantFormat.MXFP8,
+        QuantFormat.BF16,
+    ),
+    (
+        CuTileMxfp8Config,
+        CuTileMxfp8Runner,
+        QuantFormat.MXFP8,
+        QuantFormat.MXFP8,
+    ),
+    (
+        CuTileMxfp4Mxfp8Config,
+        CuTileMxfp4Mxfp8Runner,
+        QuantFormat.MXFP4,
+        QuantFormat.MXFP8,
+    ),
+)
+
+
+def _require_cutile_fp8(config_type):
+    if not torch.cuda.is_available() or not is_cuda_tile_available():
+        pytest.skip("requires CUDA and cuTile")
+    major, minor = torch.cuda.get_device_capability()
+    arch = major * 10 + minor
+    if not config_type.supported(arch):
+        pytest.skip(f"{config_type.__name__} does not support SM{arch}")
+
+
+def _quantize_fp8_reference(x, block_scaled, *, weight=False):
+    shape = x.shape
+    values = x.float().reshape(*shape[:-1], -1, 32) if block_scaled else x.float()
+    dims = -1 if block_scaled else ((1, 2) if weight else (0, 1))
+    amax = values.abs().amax(dims, keepdim=True)
+    scale = (amax / 448).clamp_min(2.0 ** (-127 if block_scaled else -126))
+    if block_scaled:
+        scale = torch.exp2(torch.ceil(torch.log2(scale)))
+    q = (values / scale).clamp(-448, 448).to(torch.float8_e4m3fn)
+    dequantized = (q.float() * scale).reshape(shape)
+    scale = (
+        scale.squeeze(-1).to(torch.float8_e8m0fnu)
+        if block_scaled
+        else scale.reshape(-1)
+    )
+    return q.reshape(shape), scale, dequantized
+
+
+def _make_cutile_fp8_case(mode, activation, tokens=4, hidden=128, inter=128):
+    config_type, runner_type, weight_format, activation_format = mode
+    _require_cutile_fp8(config_type)
+    torch.manual_seed(17)
+    experts, top_k = 4, 2
+    x = torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16)
+    ids = torch.randint(experts, (tokens, top_k), device="cuda", dtype=torch.int32)
+    scores = torch.softmax(torch.randn(tokens, top_k, device="cuda"), -1)
+    w1 = (
+        torch.randn(
+            experts,
+            inter * (2 if activation.is_gated else 1),
+            hidden,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        * 0.08
+    )
+    w2 = torch.randn(experts, hidden, inter, device="cuda", dtype=torch.bfloat16) * 0.08
+    block_scaled = weight_format != QuantFormat.FP8PerTensor
+    if weight_format == QuantFormat.MXFP4:
+        q1, s1, d1 = _quantize_weights(w1, scale_block_size=32)
+        q2, s2, d2 = _quantize_weights(w2, scale_block_size=32)
+    else:
+        q1, s1, d1 = _quantize_fp8_reference(w1, block_scaled, weight=True)
+        q2, s2, d2 = _quantize_fp8_reference(w2, block_scaled, weight=True)
+    view = config_type.prepare_weights(
+        q1,
+        s1,
+        q2,
+        s2,
+        num_local_experts=experts,
+        hidden_size=hidden,
+        intermediate_size=inter,
+        activation=activation,
+    )
+    weights = MoEWeightPack()
+    weights.prepare_for(runner_type.backend_key, view)
+    activations = MoEActivationPack(x, None, ids, scores)
+    config = MoEConfig(
+        routing=RoutingConfig(num_experts=experts, top_k=top_k),
+        quant=QuantConfig(weight_format, activation_format),
+        activation=activation,
+        experts=ExpertConfig(intermediate_size=inter),
+        backend=BackendOptions((config_type(),)),
+        execution=ExecutionConfig(tune_max_num_tokens=128),
+    )
+    runner = runner_type(config, torch.device("cuda"))
+    runner.check_support()
+    runner.build()
+    inputs = runner.pack_inputs(activations, weights)
+
+    reference_x = (
+        x.float()
+        if activation_format == QuantFormat.BF16
+        else _quantize_fp8_reference(x, block_scaled)[2]
+    )
+    selected_w1 = d1[ids.long().flatten()].float()
+    selected_w2 = d2[ids.long().flatten()].float()
+    gemm1 = (
+        torch.bmm(selected_w1, reference_x.repeat_interleave(top_k, 0).unsqueeze(-1))
+        .squeeze(-1)
+        .bfloat16()
+    )
+    activated = compute_reference_activation(gemm1, activation, inter)
+    reference_a = (
+        activated.float()
+        if activation_format == QuantFormat.BF16
+        else _quantize_fp8_reference(activated, block_scaled)[2]
+    )
+    gemm2 = torch.bmm(selected_w2, reference_a.unsqueeze(-1)).squeeze(-1).bfloat16()
+    expected = (
+        (gemm2.float().reshape(tokens, top_k, hidden) * scores.unsqueeze(-1))
+        .sum(1)
+        .bfloat16()
+    )
+    return runner, inputs, expected, activations, weights
+
+
+@pytest.mark.parametrize(
+    ("mode", "activation"),
+    (
+        (_CUTILE_FP8_MODES[0], SwiGLU()),
+        (_CUTILE_FP8_MODES[1], ReLU2()),
+        (_CUTILE_FP8_MODES[2], ReLU2()),
+        (_CUTILE_FP8_MODES[3], SwiGLU()),
+        (_CUTILE_FP8_MODES[4], SwiGLU()),
+    ),
+    ids=lambda value: value[0].__name__ if isinstance(value, tuple) else repr(value),
+)
+def test_cutile_fp8_precision_pairs(mode, activation):
+    runner, inputs, expected, _, _ = _make_cutile_fp8_case(mode, activation)
+    torch.testing.assert_close(runner.forward(inputs), expected, atol=0.03, rtol=0.03)
+
+
+def test_cutile_fp8_tail_graph_and_int64(monkeypatch):
+    mode = _CUTILE_FP8_MODES[4]
+    runner, inputs, expected, _, _ = _make_cutile_fp8_case(
+        mode, ReLU2(), tokens=33, hidden=160, inter=160
+    )
+    from flashinfer.fused_moe.cutile import fp8
+
+    actual = runner.forward(inputs).clone()
+    torch.testing.assert_close(actual, expected, atol=0.06, rtol=0.04)
+    monkeypatch.setattr(fp8, "needs_int64_indexing", lambda *_: True)
+    wide = runner.forward(inputs).clone()
+    torch.testing.assert_close(actual, wide, atol=0, rtol=0)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = runner.forward(inputs)
+    inputs[3].mul_(0.5)
+    captured.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(captured, wide * 0.5, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("mode", (_CUTILE_FP8_MODES[1], _CUTILE_FP8_MODES[3]))
+def test_cutile_fp8_gated_activation_int64_matches_int32(monkeypatch, mode):
+    runner, inputs, _, _, _ = _make_cutile_fp8_case(mode, SwiGLU())
+    from flashinfer.fused_moe.cutile import fp8
+
+    expected = runner.forward(inputs).clone()
+    # Materializing the natural >=2^31-element trigger is too memory-intensive
+    # for CI; force dispatch to compile and execute the same int64 kernels.
+    monkeypatch.setattr(fp8, "needs_int64_indexing", lambda *_: True)
+    actual = runner.forward(inputs).clone()
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
+    ("mode", "activation", "execution_modes"),
+    (
+        (_CUTILE_FP8_MODES[1], ReLU2(), (1, 2, 3, 4)),
+        (_CUTILE_FP8_MODES[2], SwiGLU(), (1,)),
+        (_CUTILE_FP8_MODES[4], SwiGLU(), (5,)),
+    ),
+)
+def test_cutile_fp8_sorted_execution(mode, activation, execution_modes):
+    runner, inputs, expected, _, _ = _make_cutile_fp8_case(mode, activation)
+    fallback = runner._fallback_tactic(inputs)
+    for execution_mode in execution_modes:
+        tactic = list((execution_mode, *fallback))
+        if execution_mode == 5:
+            tactic[2:5] = (128, 128, 2)
+        actual = runner.forward(inputs, tuple(tactic))
+        torch.testing.assert_close(actual, expected, atol=0.03, rtol=0.03)
+
+
+def test_cutile_fp8_capabilities_and_shortlist():
+    from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
+
+    for config_type, runner_type, weight_format, activation_format in _CUTILE_FP8_MODES:
+        assert _BACKEND_RUNNERS[config_type] is runner_type
+        assert runner_type.supports_quant(QuantConfig(weight_format, activation_format))
+        for arch in (80, 86, 89, 90, 100, 103, 107, 110, 120, 121):
+            assert config_type.supported(arch) == (arch in runner_type._supported_archs)
+
+    for arch in (89, 90, 120, 121):
+        for stage in (1, 2):
+            for block_size in (16, 32, 64, 128):
+                problem = _CuTileGemmProblem(
+                    stage=stage,
+                    arch=arch,
+                    block_size=block_size,
+                    n=2688,
+                    k=1856,
+                )
+                candidates = _cutile_fp8_gemm_candidates(problem)
+                assert len(candidates) <= 7
+                assert len(candidates) == len(set(candidates))
+
+
+def test_cutile_fp8_runs_through_unified_layer():
+    mode = _CUTILE_FP8_MODES[4]
+    runner, _, expected, activations, weights = _make_cutile_fp8_case(mode, SwiGLU())
+    layer = MoELayer(runner.config, torch.device("cuda"))
+
+    actual = layer(activations, weights)
+
+    assert layer.winner_backend == runner.backend_key
+    torch.testing.assert_close(actual, expected, atol=0.03, rtol=0.03)
+
+
+@pytest.mark.parametrize(
+    ("a16", "a8"),
+    (
+        (_CUTILE_FP8_MODES[0], _CUTILE_FP8_MODES[1]),
+        (_CUTILE_FP8_MODES[2], _CUTILE_FP8_MODES[3]),
+    ),
+)
+def test_cutile_fp8_shared_weight_views(a16, a8):
+    _require_cutile_fp8(a8[0])
+    runner, inputs, _, activations, weights = _make_cutile_fp8_case(a16, SwiGLU())
+    config = replace(
+        runner.config,
+        quant=QuantConfig(a8[2], a8[3]),
+        backend=BackendOptions((a8[0](),)),
+    )
+    other = a8[1](config, runner.device)
+    other.check_support()
+    other.build()
+    other_inputs = other.pack_inputs(activations, weights)
+    assert all(a is b for a, b in zip(inputs[4:], other_inputs[4:], strict=True))
+
+
+@pytest.mark.parametrize("block_scaled", (False, True), ids=("per_tensor", "mxfp8"))
+def test_cutile_fp8_quantization_tails(block_scaled):
+    _require_cutile_fp8(CuTileMxfp8Config if block_scaled else CuTileFp8PerTensorConfig)
+    from flashinfer.fused_moe.cutile.fp8 import quantize
+
+    x = torch.linspace(-448, 448, 33 * 160, device="cuda").bfloat16().reshape(33, 160)
+    for values in (x, torch.zeros_like(x)):
+        expected_q, expected_s, _ = _quantize_fp8_reference(values, block_scaled)
+        q = torch.empty_like(expected_q)
+        scale = torch.empty_like(expected_s)
+        partials = torch.empty((values.numel() + 4095) // 4096, device="cuda")
+        quantize(values, q, scale, partials, block_scaled=block_scaled)
+        torch.testing.assert_close(q.float(), expected_q.float(), atol=0, rtol=0)
+        torch.testing.assert_close(scale.float(), expected_s.float(), atol=0, rtol=0)
+
+
+def test_cutile_fp8_prepare_rejects_invalid_weights():
+    for mode in (_CUTILE_FP8_MODES[0], _CUTILE_FP8_MODES[2]):
+        config_type, _, weight_format, _ = mode
+        weight = torch.ones(4, 128, 128, dtype=torch.float8_e4m3fn)
+        scales = (
+            torch.ones(4, 128, 4).to(torch.float8_e8m0fnu)
+            if weight_format == QuantFormat.MXFP8
+            else torch.ones(4)
+        )
+        kwargs = dict(
+            num_local_experts=4,
+            hidden_size=128,
+            intermediate_size=128,
+            activation=ReLU2(),
+        )
+        with pytest.raises(TypeError, match="float8_e4m3fn"):
+            config_type.prepare_weights(
+                weight.bfloat16(), scales, weight, scales, **kwargs
+            )
+        with pytest.raises(ValueError, match="scale must have shape"):
+            config_type.prepare_weights(weight, scales[:2], weight, scales, **kwargs)

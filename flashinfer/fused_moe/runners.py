@@ -53,7 +53,9 @@ from .api import (
     _CUTLASS_W4A16_ARCHS,
     _CUTLASS_W4A8_ARCHS,
     _CUTILE_BF16_ARCHS,
+    _CUTILE_FP8_ARCHS,
     _CUTILE_MXFP4_ARCHS,
+    _CUTILE_MXFP8_ARCHS,
     _CUTILE_NVFP4_ARCHS,
     _CUTILE_W4A16_ARCHS,
     # Typed activation values
@@ -78,6 +80,9 @@ from .api import (
     RoutingInputMode,
 )
 from .utils import (
+    _CUTILE_PERMUTE_SMALL_MAX_ASSIGNMENTS,
+    _cutile_max_permuted_rows,
+    _cutile_permute_shape,
     make_hybrid_bucket_mapper,
     map_to_hybrid_bucket,
 )
@@ -97,6 +102,98 @@ _CUTLASS_SEMANTIC_ACTIVATIONS: tuple[type[ActivationConfig], ...] = (
 )
 
 _CUTILE_INT32_INDEX_LIMIT = 1 << 31
+
+
+def _cutile_bucket_compile_token_counts(
+    bucket: int,
+    *,
+    tune_max_num_tokens: int,
+    num_experts: int,
+    top_k: int,
+    hidden_size: int,
+    intermediate_size: int,
+    block_size: int,
+) -> tuple[int, ...]:
+    """Return the cuTile dispatch-shape representatives for one tune bucket.
+
+    cuTile specializes array arguments by a small set of alignment and shape
+    divisibility facts.  The MoE host code also has a few routing, padding, and
+    quantization regimes. Group token counts by those facts so autotuning also
+    compiles one representative per binary variant, rather than one binary per
+    possible token count.
+
+    This is intentionally independent of precision and activation: it is the
+    conservative union of the BF16, FP4, and FP8 host-side regimes.  New cuTile
+    MoE precisions therefore inherit the same serving behavior by default.
+    """
+    if bucket < 1 or tune_max_num_tokens < bucket:
+        raise ValueError("bucket must be positive and within tune_max_num_tokens.")
+    if map_to_hybrid_bucket(bucket, tune_max_num_tokens) != bucket:
+        raise ValueError(f"{bucket} is not a hybrid token bucket.")
+    if num_experts < 1 or top_k < 1:
+        raise ValueError("num_experts and top_k must be positive.")
+
+    representatives: dict[tuple[Any, ...], int] = {}
+    for num_tokens in range(1, bucket + 1):
+        if map_to_hybrid_bucket(num_tokens, tune_max_num_tokens) != bucket:
+            continue
+        assignments = num_tokens * top_k
+        rows_per_expert = (assignments + num_experts - 1) // num_experts
+
+        padded_rows = _cutile_max_permuted_rows(assignments, num_experts, block_size)
+        num_blocks = (padded_rows + block_size - 1) // block_size
+        block_shape = (
+            padded_rows % 16 == 0,
+            num_blocks % 16 == 0,
+            next_positive_power_of_2(num_blocks),
+            padded_rows * intermediate_size >= 1 << 20,
+        )
+
+        if assignments <= _CUTILE_PERMUTE_SMALL_MAX_ASSIGNMENTS:
+            routing_regime: tuple[Any, ...] = (
+                "small",
+                next_positive_power_of_2(assignments),
+            )
+        else:
+            routing_regime = (
+                "chunked",
+                *_cutile_permute_shape(assignments, num_experts),
+            )
+
+        # Thresholds below are the conservative union used by the cuTile BF16,
+        # FP4, and FP8 host launchers.  They affect a compile-time tile, fusion
+        # mode, or persistent-grid choice, so both sides must be warmed.
+        regime_flags = (
+            num_tokens <= 64,
+            num_tokens <= 256,
+            assignments < 64,
+            assignments >= 4096,
+            assignments >= 65536,
+            rows_per_expert <= 8,
+            rows_per_expert <= 16,
+            rows_per_expert < 32,
+            rows_per_expert <= 32,
+            rows_per_expert < 64,
+            rows_per_expert <= 64,
+            rows_per_expert <= 128,
+            rows_per_expert >= 192,
+            rows_per_expert >= 256,
+            rows_per_expert < 512,
+            num_tokens * hidden_size >= 1 << 20,
+        )
+        fingerprint = (
+            bucket,
+            num_tokens % 16 == 0,
+            assignments % 16 == 0,
+            routing_regime,
+            block_shape,
+            regime_flags,
+        )
+        representatives.setdefault(fingerprint, num_tokens)
+
+    # The capacity is the autotuner's profiling shape. Remaining values only
+    # populate finite cuTile JIT variants for the already-selected tactic.
+    return tuple(dict.fromkeys((bucket, *representatives.values())))
 
 
 def _validate_cutile_int32_routing(
@@ -2911,6 +3008,12 @@ class CuTileBf16Runner(MoERunner):
         self._workspace: Any = None
         self.tuning_config = TuningConfig()
 
+    def _is_current_stream_capturing(self) -> bool:
+        if self.device.type != "cuda":
+            return False
+        with torch.cuda.device(self.device):
+            return torch.cuda.is_current_stream_capturing()
+
     def _check_support(self) -> None:
         super()._check_support()
         if not self.config.finalize.do_finalize:
@@ -2955,6 +3058,53 @@ class CuTileBf16Runner(MoERunner):
         inputs[3].fill_(1.0 / top_k)
         return inputs
 
+    def _compilation_block_size(self, tactic: Any) -> int:
+        if not isinstance(tactic, (tuple, list)) or not tactic:
+            raise ValueError(f"invalid cuTile tactic: {tactic!r}.")
+        return int(tactic[0])
+
+    def _precompile_bucket_variants(
+        self, inputs: List[torch.Tensor], tactic: Any
+    ) -> None:
+        """Compile the finite request-shape variants of one autotune bucket."""
+        # An untuned fallback is intentionally shape-dependent and may choose
+        # different blocks inside one bucket. Preserve its lightweight lazy
+        # behavior; serving preparation applies to selected or persisted
+        # autotuned tactics, which are stable for the whole bucket.
+        if tactic == -1:
+            return
+        num_tokens, hidden_size = inputs[1].shape
+        ceiling = self.config.execution.tune_max_num_tokens
+        bucket = map_to_hybrid_bucket(num_tokens, ceiling)
+        counts = _cutile_bucket_compile_token_counts(
+            bucket,
+            tune_max_num_tokens=ceiling,
+            num_experts=self.config.routing.num_experts,
+            top_k=self.config.routing.top_k,
+            hidden_size=hidden_size,
+            intermediate_size=self.config.experts.intermediate_size,
+            block_size=self._compilation_block_size(tactic),
+        )
+
+        # Every cuTile MoE pack keeps output, activation, routing IDs, and
+        # routing weights in the first four positions. Build one capacity pack
+        # and take leading views so representatives do not retain allocations.
+        # The capacity is capped by the user-provided tune_max_num_tokens; an
+        # allocation failure propagates before capture so callers can lower it.
+        compile_inputs = list(inputs)
+        compile_inputs[0] = inputs[0].new_empty((bucket, *inputs[0].shape[1:]))
+        compile_inputs[1] = inputs[1].new_zeros((bucket, *inputs[1].shape[1:]))
+        compile_inputs[2] = inputs[2].new_empty((bucket, *inputs[2].shape[1:]))
+        compile_inputs[3] = inputs[3].new_empty((bucket, *inputs[3].shape[1:]))
+        self._prepare_tuning_inputs(compile_inputs)
+
+        for count in counts:
+            representative = list(compile_inputs)
+            for index in range(4):
+                representative[index] = compile_inputs[index][:count]
+            self.forward(representative, tactic=tactic)
+        torch.cuda.current_stream(self.device).synchronize()
+
     def _ensure_workspace(self, num_tokens: int, hidden_size: int) -> None:
         self._require_built()
         ceiling = self.config.execution.tune_max_num_tokens
@@ -2966,6 +3116,12 @@ class CuTileBf16Runner(MoERunner):
         key = (capacity, hidden_size)
         workspace = self._workspace_cache.get(key)
         if workspace is None:
+            if self._is_current_stream_capturing():
+                raise RuntimeError(
+                    f"{type(self).__name__} workspace for token bucket "
+                    f"{capacity} must be allocated before CUDA Graph capture; "
+                    "warm this bucket first."
+                )
             workspace = self._kernel_module.allocate_workspace(
                 num_tokens=capacity,
                 hidden_size=hidden_size,
@@ -2975,9 +3131,13 @@ class CuTileBf16Runner(MoERunner):
                 is_gated=self.config.activation.is_gated,
                 block_sizes=self._block_sizes,
                 device=self.device,
+                **self._workspace_kwargs(),
             )
             self._workspace_cache[key] = workspace
         self._workspace = workspace
+
+    def _workspace_kwargs(self) -> dict[str, Any]:
+        return {}
 
     def _validate_inputs(self, act: MoEActivationPack) -> tuple[torch.Tensor, int, int]:
         self._require_built()
@@ -3285,6 +3445,29 @@ _CUTILE_NVFP4_W4A16_SM12X_EXTRA_GEMM_CONFIGS = (
 )
 
 
+def _cutile_fp8_gemm_candidates(
+    problem: _CuTileGemmProblem,
+) -> tuple[tuple[int, int, int], ...]:
+    """Return the compact FP8 stage-tuning set for a GEMM problem."""
+    common = (
+        (64, 128, 2),
+        (128, 128, 2),
+        (64, 128, 4),
+        (128, 128, 1),
+        (128, 256, 2),
+        (256, 128, 2),
+    )
+    if problem.stage == 2:
+        return (*common, (128, 64, 4))
+    # Full-model SM89/SM90/SM120 sweeps found 256x128x1 useful only in GEMM1.
+    # The wider-K variant replaces a never-selected sparse tile for Hopper's
+    # 64-row GEMM1 schedule. Persisted tactics outside this shortlist remain
+    # valid; this only limits configurations compiled during fresh tuning.
+    if problem.arch == 90 and problem.block_size == 64:
+        return (*common[1:], (256, 128, 1), (256, 256, 1))
+    return (*common, (256, 128, 1))
+
+
 def _cutile_fp4_config_rejection_reason(
     problem: _CuTileGemmProblem, config: tuple[int, int, int]
 ) -> str | None:
@@ -3314,6 +3497,511 @@ def _cutile_fp4_config_rejection_reason(
                 f"effective tile_n={effective_tile_n}"
             )
     return None
+
+
+class _CuTileFp8StageRunner(TunableRunner):
+    def __init__(
+        self,
+        parent: Any,
+        stage: int,
+        fallback: tuple[int, ...],
+    ):
+        self.parent = parent
+        self.stage = stage
+        self.fallback = fallback
+
+    def get_valid_tactics(self, inputs: list[torch.Tensor], _profile: Any) -> list[Any]:
+        return self.parent._stage_tactics(
+            inputs, stage=self.stage, block_size=self.fallback[1]
+        )
+
+    def forward(
+        self,
+        inputs: list[torch.Tensor],
+        tactic: Any = -1,
+        do_preparation: bool = False,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        stage_slice = slice(2, 5) if self.stage == 1 else slice(5, 8)
+        values = self.fallback[stage_slice] if tactic == -1 else tuple(map(int, tactic))
+        if len(values) != 3:
+            raise ValueError(
+                f"{self.parent.backend_key} sorted GEMM{self.stage} tactics "
+                "must contain three integers."
+            )
+        compound = list(self.fallback)
+        compound[stage_slice] = values
+        return self.parent.forward(
+            inputs,
+            tactic=tuple(compound),
+            do_preparation=do_preparation,
+            **kwargs,
+        )
+
+    def get_cache_key_extras(self, inputs: list[torch.Tensor]) -> tuple[Any, ...]:
+        return (
+            "cutile_fp8_sorted_stage_v1",
+            self.fallback[0],
+            *self.parent._stage_cache_key(
+                inputs,
+                stage=self.stage,
+                block_size=self.fallback[1],
+            ),
+        )
+
+
+class _CuTileFp8Runner(CuTileBf16Runner):
+    """Shared FP8/MXFP8 adapter; routing and staged tuning follow BF16."""
+
+    _block_sizes: ClassVar[tuple[int, ...]] = (16, 32, 64, 128)
+    _activation_fp8: ClassVar[bool] = True
+    _block_scaled: ClassVar[bool] = False
+    _weight_fp4: ClassVar[bool] = False
+    _supported_archs: ClassVar[tuple[int, ...]] = _CUTILE_FP8_ARCHS
+    _precision_name = "FP8"
+
+    @staticmethod
+    def _fp8_mode(*, fused: bool, persistent: bool) -> int:
+        return 1 + int(fused) + 2 * int(persistent)
+
+    def _compilation_block_size(self, tactic: Any) -> int:
+        """Return the block size after the sorted-execution mode field."""
+        if not isinstance(tactic, (tuple, list)) or len(tactic) not in (7, 8):
+            raise ValueError(f"invalid cuTile FP8 tactic: {tactic!r}.")
+        return int(tactic[1] if len(tactic) == 8 else tactic[0])
+
+    def _fp8_sorted_modes(self, inputs: List[torch.Tensor]) -> tuple[int, ...]:
+        num_assignments = inputs[2].numel()
+        fused = (
+            (True,)
+            if self._activation_fp8
+            and self.config.activation.is_gated
+            and inputs[1].shape[0] <= 2
+            else (
+                (False, True)
+                if self._activation_fp8
+                and self.config.activation.is_gated
+                and inputs[1].shape[0] <= 4
+                else (False,)
+            )
+        )
+        rows_per_expert = (
+            num_assignments + self.config.routing.num_experts - 1
+        ) // self.config.routing.num_experts
+        persistent = (
+            (False, True)
+            if self._device_arch in (90, 120, 121)
+            and rows_per_expert >= 64
+            and not (self._activation_fp8 and self._block_scaled)
+            else (False,)
+        )
+        modes = tuple(
+            self._fp8_mode(fused=fuse, persistent=keep_resident)
+            for keep_resident in persistent
+            for fuse in fused
+        )
+        return modes
+
+    def _persistent_factors(self) -> tuple[int, int]:
+        # Cold-L2 model-shape sweeps favor different resident grids by MMA path.
+        if self._device_arch == 90:
+            return (2, 2) if self._activation_fp8 else (1, 2)
+        if not self._activation_fp8:
+            return (2, 2) if self._block_scaled else (4, 4)
+        return (2, 1) if self.config.activation.is_gated else (1, 2)
+
+    def _check_support(self) -> None:
+        super()._check_support()
+        if self.config.quant.per_token_scale:
+            raise NotImplementedError("cuTile FP8 does not support per-token scales.")
+
+    def _build(self) -> None:
+        from .cutile import fp8
+
+        self._kernel_module = fp8
+
+    def _workspace_kwargs(self) -> dict[str, Any]:
+        return dict(
+            activation_fp8=self._activation_fp8, block_scaled=self._block_scaled
+        )
+
+    def _factorized_block_sizes(self, num_assignments: int) -> tuple[int, ...]:
+        rows_per_expert = (
+            num_assignments + self.config.routing.num_experts - 1
+        ) // self.config.routing.num_experts
+        # A 16-row block avoids severe expert padding at sparse H100 loads and
+        # on the SM12x mixed FP4/FP8 path. Smaller blocks are legal but slow.
+        if rows_per_expert <= 16 and (
+            self._device_arch == 90
+            or (self._device_arch in (120, 121) and self._weight_fp4)
+        ):
+            return (16,)
+        if not self.config.activation.is_gated:
+            return super()._factorized_block_sizes(num_assignments)
+        # Balance expert padding against weight reuse for each MMA path.
+        if self._device_arch == 90 and not self._activation_fp8:
+            if rows_per_expert < 64:
+                return (32,)
+            use_wide_block = rows_per_expert >= 128 or (
+                rows_per_expert >= 64 and self.config.experts.intermediate_size > 1024
+            )
+            return (128 if use_wide_block else 64,)
+        if self._device_arch in (120, 121):
+            if not self._activation_fp8:
+                use_wide_block = (
+                    self._block_scaled
+                    and rows_per_expert >= 256
+                    and self.config.experts.intermediate_size <= 512
+                )
+                return (64 if use_wide_block else 32,)
+            if self._block_scaled and not self._weight_fp4:
+                use_wide_block = (
+                    rows_per_expert >= 192
+                    and self.config.experts.intermediate_size > 512
+                )
+                return (64 if use_wide_block else 32,)
+            return (64 if rows_per_expert >= 192 else 32,)
+        return super()._factorized_block_sizes(num_assignments)
+
+    def _stage_tactics(
+        self, inputs: List[torch.Tensor], *, stage: int, block_size: int
+    ) -> List[Any]:
+        problem = self._gemm_problem(inputs, stage=stage, block_size=block_size)
+        # Keep K tiles aligned to four scale groups; the MXFP4 scale loader
+        # additionally needs 128-wide N tiles. Tails are masked in the kernels.
+        candidates = _cutile_fp8_gemm_candidates(problem)
+        if stage == 1 and not self._activation_fp8 and inputs[1].shape[0] <= 2:
+            # Cold-L2 sweeps consistently favor occupancy 2 for sparse A16;
+            # occupancy 4 first becomes useful from four tokens onward.
+            candidates = tuple(
+                config for config in candidates if config != (64, 128, 4)
+            )
+        return _valid_cutile_gemm_configs(
+            problem, candidates, self._fp8_rejection_reason, type(self).__name__
+        )
+
+    def _fp8_rejection_reason(
+        self, problem: _CuTileGemmProblem, config: tuple[int, int, int]
+    ) -> str | None:
+        n, k, _ = config
+        if config not in _CUTILE_FP4_GEMM_CONFIGS + (
+            (64, 128, 2),
+            (64, 128, 4),
+            (128, 128, 1),
+        ):
+            return "unknown FP8 GEMM config"
+        allow_k64 = (
+            self._device_arch == 90
+            and problem.stage == 2
+            and problem.block_size == 16
+            and not self._weight_fp4
+            and config == (128, 64, 4)
+        ) or (
+            self._device_arch in (120, 121)
+            and problem.stage == 2
+            and not self._weight_fp4
+            and not self._activation_fp8
+            and self._block_scaled
+            and problem.k % 128 != 0
+        )
+        tile_k_alignment = 64 if allow_k64 else 128
+        if allow_k64 and k == 64 and n != 128:
+            return "64-wide K tiles are supported only with tile_n=128"
+        if k % tile_k_alignment or (self._weight_fp4 and n % 128):
+            return (
+                f"FP8 requires tile_k divisible by {tile_k_alignment}; "
+                "MXFP4 requires tile_n divisible by 128"
+            )
+        # Retain at least the smallest legal padded tile for tiny dimensions.
+        if n > max(128 if self._weight_fp4 else 64, 2 * problem.n) or k > max(
+            128, 2 * problem.k
+        ):
+            return f"tile {config} is oversized for N={problem.n}, K={problem.k}"
+        return None
+
+    def _stage_cache_key(
+        self, inputs: List[torch.Tensor], *, stage: int, block_size: int
+    ) -> tuple[Any, ...]:
+        return (self.backend_key, self.config.quant.pair) + super()._stage_cache_key(
+            inputs, stage=stage, block_size=block_size
+        )
+
+    def _fallback_tactic(
+        self, inputs: List[torch.Tensor]
+    ) -> tuple[int, int, int, int, int, int, int]:
+        block = self._factorized_block_sizes(inputs[2].numel())[0]
+        return (
+            block,
+            *self._stage_tactics(inputs, stage=1, block_size=block)[0],
+            *self._stage_tactics(inputs, stage=2, block_size=block)[0],
+        )
+
+    def _factorized_sorted_tactics(
+        self, inputs: List[torch.Tensor], mode: int
+    ) -> list[tuple[int, ...]]:
+        gather_fallback = self._fallback_tactic(inputs)
+        block_size = gather_fallback[0]
+        fallback = (mode, *gather_fallback)
+        gemm1_runner = _CuTileFp8StageRunner(self, 1, fallback)
+        gemm2_runner = _CuTileFp8StageRunner(self, 2, fallback)
+        tuner = AutoTuner.get()
+        tuning_config = TuningConfig(
+            use_cuda_graph=True,
+            inputs_pre_hook=self._prepare_tuning_inputs,
+        )
+        prefix = (
+            f"moe_{self.backend_key}_sorted_v1_sm{self._device_arch}_"
+            f"b{block_size}_m{mode}"
+        )
+        top_k = self._num_top_tactics_per_stage
+        gemm1 = _resolve_cutile_stage_tactics(
+            tuner.rank_tactics(
+                f"{prefix}_gemm1",
+                [gemm1_runner],
+                tuning_config,
+                inputs,
+                k=top_k,
+            ),
+            gather_fallback[1:4],
+            arity=3,
+            name=f"{self.backend_key} sorted GEMM1",
+        )
+        if gather_fallback[1:4] not in gemm1:
+            gemm1[-1] = gather_fallback[1:4]
+        gemm2_runner.fallback = (
+            mode,
+            block_size,
+            *gemm1[0],
+            *gather_fallback[4:7],
+        )
+        gemm2 = _resolve_cutile_stage_tactics(
+            tuner.rank_tactics(
+                f"{prefix}_gemm2",
+                [gemm2_runner],
+                tuning_config,
+                inputs,
+                k=top_k,
+            ),
+            gather_fallback[4:7],
+            arity=3,
+            name=f"{self.backend_key} sorted GEMM2",
+        )
+        if gather_fallback[4:7] not in gemm2:
+            gemm2[-1] = gather_fallback[4:7]
+        return [
+            (mode, block_size, *gemm1_config, *gemm2_config)
+            for gemm1_config in gemm1
+            for gemm2_config in gemm2
+        ]
+
+    def _include_gather_tactics(self, num_assignments: int) -> bool:
+        # Full-model cold-L2 sweeps found sorted input universally faster on
+        # SM89/SM90, and on SM12x for MXFP8xBF16 and MXFP4xMXFP8. Avoid tuning
+        # the two gather GEMMs where that path never wins.
+        if (
+            self._device_arch not in (120, 121)
+            or self._weight_fp4
+            or (self._block_scaled and not self._activation_fp8)
+        ):
+            return False
+        num_tokens = num_assignments // self.config.routing.top_k
+        gather_min_tokens = 16 if self._activation_fp8 else 32
+        rows_per_expert = (
+            num_assignments + self.config.routing.num_experts - 1
+        ) // self.config.routing.num_experts
+        # SM12x sweeps found no gather winner once each expert averages at
+        # least one 64-row block.
+        return num_tokens >= gather_min_tokens and rows_per_expert < 64
+
+    def get_valid_tactics(self, inputs: List[torch.Tensor], _profile: Any) -> List[Any]:
+        self._require_built()
+        gather = (
+            [(0, *tactic) for tactic in self._factorized_tactics(inputs)]
+            if self._include_gather_tactics(inputs[2].numel())
+            else []
+        )
+        modes = self._fp8_sorted_modes(inputs)
+        # GEMM rankings are independent of the exact quantization fusion mode.
+        # Rank one sorted schedule, then let the end-to-end tuner compare the
+        # small set of applicable fusion/persistence variants.
+        ranked = self._factorized_sorted_tactics(inputs, modes[0])
+        sorted_tactics = [(mode, *tactic[1:]) for mode in modes for tactic in ranked]
+        rows_per_expert = (
+            inputs[2].numel() + self.config.routing.num_experts - 1
+        ) // self.config.routing.num_experts
+        if (
+            self._activation_fp8
+            and self._block_scaled
+            and (
+                (self.config.activation.is_gated and self._weight_fp4)
+                or (not self.config.activation.is_gated and not self._weight_fp4)
+            )
+            and rows_per_expert >= 64
+        ):
+            # Gated fusion uses the measured register-safe GEMM1 tile; ungated
+            # fusion reuses the independently ranked GEMM1 winner. Pair either
+            # with two ranked GEMM2 winners for the end-to-end decision.
+            fused_gemm1 = (
+                (128, 128, 2) if self.config.activation.is_gated else ranked[0][2:5]
+            )
+            gemm2 = list(dict.fromkeys(tactic[5:8] for tactic in ranked))[:2]
+            sorted_tactics.extend(
+                (5, ranked[0][1], *fused_gemm1, *gemm2_config) for gemm2_config in gemm2
+            )
+        return list(dict.fromkeys((*gather, *sorted_tactics)))
+
+    def pack_inputs(
+        self, act: MoEActivationPack, weights: MoEWeightPack
+    ) -> List[torch.Tensor]:
+        hidden_states, tokens, hidden = self._validate_inputs(act)
+        inter = self.config.experts.intermediate_size
+        if min(hidden, inter) <= 0 or hidden % 32 or inter % 32:
+            raise ValueError(
+                "cuTile FP8 requires positive hidden/intermediate sizes divisible by 32."
+            )
+        view = weights.get_view(self.backend_key)
+        tensors = [view[key] for key in ("w1", "w1_scale", "w2", "w2_scale")]
+        experts = self.config.routing.num_experts
+        n1 = inter * (2 if self.config.activation.is_gated else 1)
+        for name, w, s, n, k in (
+            ("w1", *tensors[:2], n1, hidden),
+            ("w2", *tensors[2:], hidden, inter),
+        ):
+            shape = (experts, n, k // 2 if self._weight_fp4 else k)
+            if tuple(w.shape) != shape:
+                raise ValueError(f"{name} must have shape {shape}.")
+            dtype = torch.uint8 if self._weight_fp4 else torch.float8_e4m3fn
+            if w.dtype != dtype:
+                raise TypeError(f"{name} must use {dtype}.")
+            scale_shape: tuple[int, ...]
+            if self._weight_fp4:
+                scale_shape = (experts, (n + 127) // 128, (k // 32 + 3) // 4, 32, 16)
+            else:
+                scale_shape = (
+                    (experts, n, k // 32) if self._block_scaled else (experts,)
+                )
+            if tuple(s.shape) != scale_shape:
+                raise ValueError(f"{name}_scale must have shape {scale_shape}.")
+            scale_dtype = torch.float8_e8m0fnu if self._block_scaled else torch.float32
+            if s.dtype != scale_dtype:
+                raise TypeError(f"{name}_scale must use {scale_dtype}.")
+        if any(t.device != self.device or not t.is_contiguous() for t in tensors):
+            raise ValueError(
+                "cuTile FP8 prepared weights/scales must be contiguous on the runner device."
+            )
+        capacity = map_to_hybrid_bucket(
+            tokens, self.config.execution.tune_max_num_tokens
+        )
+        assignments = capacity * self.config.routing.top_k
+        _validate_cutile_int32_routing(
+            type(self).__name__,
+            assignments,
+            assignments + experts * (max(self._block_sizes) - 1),
+        )
+        self._configure_tuning(tokens, hidden)
+        return [
+            hidden_states.new_empty((tokens, hidden)),
+            hidden_states,
+            act.topk_ids,
+            act.topk_weights,
+            *tensors,
+        ]
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: Any = -1,
+        do_preparation: bool = False,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        self._require_built()
+        if len(inputs) != 8:
+            raise ValueError(f"{type(self).__name__} expects 8 inputs.")
+        if tactic == -1:
+            tactic = self._fallback_tactic(inputs)
+        if not isinstance(tactic, (tuple, list)) or len(tactic) not in (7, 8):
+            raise ValueError(
+                "cuTile FP8 tactic must be -1, a legacy seven-integer tuple, "
+                "or (mode, block, GEMM1 config, GEMM2 config)."
+            )
+        if len(tactic) == 7:
+            mode = 0
+            values = tuple(map(int, tactic))
+        else:
+            mode, *rest = map(int, tactic)
+            values = tuple(rest)
+        if mode not in range(6):
+            raise ValueError(f"unsupported cuTile FP8 execution mode {mode}.")
+        if mode == 5 and not (self._activation_fp8 and self._block_scaled):
+            raise ValueError(
+                "cuTile fused GEMM1 quantization requires MXFP8 activations."
+            )
+        block, g1_n, g1_k, g1_occ, g2_n, g2_k, g2_occ = values
+        configs = ((g1_n, g1_k, g1_occ), (g2_n, g2_k, g2_occ))
+        if block not in self._block_sizes:
+            raise ValueError(f"unsupported cuTile FP8 block size {block}.")
+        for stage, tile in enumerate(configs, start=1):
+            problem = self._gemm_problem(inputs, stage=stage, block_size=block)
+            reason = self._fp8_rejection_reason(problem, tile)
+            if reason is not None:
+                raise NotImplementedError(
+                    f"{type(self).__name__} GEMM{stage}: {reason}."
+                )
+        self._ensure_workspace(*inputs[1].shape)
+        return self._kernel_module.run_moe(
+            *inputs[1:4],
+            *inputs[4:],
+            inputs[0],
+            self._workspace,
+            activation=self.config.activation,
+            activation_fp8=self._activation_fp8,
+            block_scaled=self._block_scaled,
+            weight_fp4=self._weight_fp4,
+            block_size=block,
+            gemm1_config=self._kernel_module.GemmConfig(*configs[0]),
+            gemm2_config=self._kernel_module.GemmConfig(*configs[1]),
+            sorted_input=mode != 0,
+            fuse_quantization=mode in (2, 4),
+            num_sms=self._num_sms,
+            persistent_factors=(
+                self._persistent_factors()
+                if mode in (3, 4)
+                else ((0, self._persistent_factors()[1]) if mode == 5 else (0, 0))
+            ),
+            fuse_gemm1_quant=mode == 5,
+        )
+
+
+class CuTileFp8PerTensorRunner(_CuTileFp8Runner):
+    backend_key = "cutile_fp8_per_tensor"
+    supported_quant_variants = ((QuantFormat.FP8PerTensor, QuantFormat.FP8PerTensor),)
+
+
+class CuTileFp8PerTensorBf16Runner(CuTileFp8PerTensorRunner):
+    supported_quant_variants = ((QuantFormat.FP8PerTensor, QuantFormat.BF16),)
+    _activation_fp8 = False
+    _supported_archs = _CUTILE_BF16_ARCHS
+
+
+class CuTileMxfp8Runner(_CuTileFp8Runner):
+    backend_key = "cutile_mxfp8"
+    supported_quant_variants = ((QuantFormat.MXFP8, QuantFormat.MXFP8),)
+    _block_scaled = True
+    _supported_archs: ClassVar[tuple[int, ...]] = _CUTILE_MXFP8_ARCHS
+    _precision_name = "MXFP8"
+
+
+class CuTileMxfp8Bf16Runner(CuTileMxfp8Runner):
+    supported_quant_variants = ((QuantFormat.MXFP8, QuantFormat.BF16),)
+    _activation_fp8 = False
+    _supported_archs = _CUTILE_BF16_ARCHS
+
+
+class CuTileMxfp4Mxfp8Runner(CuTileMxfp8Runner):
+    backend_key = "cutile_mxfp4"
+    supported_quant_variants = ((QuantFormat.MXFP4, QuantFormat.MXFP8),)
+    _weight_fp4 = True
+    _precision_name = "MXFP4 x MXFP8"
 
 
 class _CuTileFp4Runner(CuTileBf16Runner):

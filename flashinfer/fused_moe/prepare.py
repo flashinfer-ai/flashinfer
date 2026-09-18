@@ -1683,6 +1683,74 @@ def prepare_cutile_mxfp4_weights(
     }
 
 
+def prepare_cutile_fp8_weights(
+    w1_fp8: torch.Tensor,
+    w1_scale: torch.Tensor,
+    w2_fp8: torch.Tensor,
+    w2_scale: torch.Tensor,
+    *,
+    num_local_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    block_scaled: bool,
+    activation_type: ActivationType = ActivationType.Swiglu,
+    device: Optional[torch.device] = None,
+) -> Dict[str, torch.Tensor]:
+    """Prepare checkpoint E4M3 weights without requantizing or expanding them.
+
+    Per-tensor scales are FP32, one per expert GEMM (shape ``[E]``).
+    MXFP8 scales are E8M0 bytes in logical ``[E, N, K/32]`` order.
+    Both A16 and A8 consume the same prepared tensors on every supported GPU.
+    Canonical gated GEMM1 rows arrive as ``[up, gate]`` and are prepared in the
+    kernel-consumed ``[gate, up]`` order.
+    """
+    from .api import _CUTILE_SUPPORTED_ACTIVATIONS
+
+    activation_type = ActivationType(activation_type)
+    if activation_type not in _CUTILE_SUPPORTED_ACTIVATIONS:
+        raise ValueError(f"unsupported cuTile FP8 activation {activation_type!r}.")
+    if (
+        min(hidden_size, intermediate_size) <= 0
+        or hidden_size % 32
+        or intermediate_size % 32
+    ):
+        raise ValueError(
+            "cuTile FP8 requires positive hidden/intermediate sizes divisible by 32."
+        )
+    if device is None:
+        device = w1_fp8.device
+    device = torch.device(device)
+    rows = intermediate_size * (2 if activation_type.is_gated else 1)
+    result = {}
+    for name, weight, scale, n, k in (
+        ("w1", w1_fp8, w1_scale, rows, hidden_size),
+        ("w2", w2_fp8, w2_scale, hidden_size, intermediate_size),
+    ):
+        if weight.dtype != torch.float8_e4m3fn:
+            raise TypeError("cuTile FP8 weights must use torch.float8_e4m3fn.")
+        if tuple(weight.shape) != (num_local_experts, n, k):
+            raise ValueError(f"{name} must have shape {(num_local_experts, n, k)}.")
+        shape = (
+            (num_local_experts, n, k // 32) if block_scaled else (num_local_experts,)
+        )
+        if tuple(scale.shape) != shape:
+            raise ValueError(f"{name}_scale must have shape {shape}.")
+        dtype = torch.float8_e8m0fnu if block_scaled else torch.float32
+        if scale.dtype not in ((dtype, torch.uint8) if block_scaled else (dtype,)):
+            raise TypeError(f"{name}_scale must use {dtype}.")
+        weight = weight.to(device).contiguous()
+        scale = scale.to(device).contiguous().view(dtype)
+        if name == "w1" and activation_type.is_gated:
+            up, gate = weight.view(torch.uint8).chunk(2, dim=1)
+            weight = torch.cat((gate, up), dim=1).view(torch.float8_e4m3fn)
+            if block_scaled:
+                up, gate = scale.view(torch.uint8).chunk(2, dim=1)
+                scale = torch.cat((gate, up), dim=1).view(dtype)
+        result[name] = weight
+        result[f"{name}_scale"] = scale
+    return result
+
+
 def prepare_cutile_bf16_weights(
     w1_bf16: torch.Tensor,
     w2_bf16: torch.Tensor,

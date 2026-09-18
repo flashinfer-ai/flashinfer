@@ -42,8 +42,13 @@ from .api import (
     CutlassW4A16Config,
     CutlassW4A8Config,
     CuTileBf16Config,
+    CuTileFp8PerTensorBf16Config,
+    CuTileFp8PerTensorConfig,
     CuTileMxfp4Bf16Config,
     CuTileMxfp4Config,
+    CuTileMxfp4Mxfp8Config,
+    CuTileMxfp8Bf16Config,
+    CuTileMxfp8Config,
     CuTileNvfp4Bf16Config,
     CuTileNvfp4Config,
     CuteDslConfig,
@@ -70,8 +75,13 @@ from .runners import (
     CutlassW4A16Runner,
     CutlassW4A8Runner,
     CuTileBf16Runner,
+    CuTileFp8PerTensorBf16Runner,
+    CuTileFp8PerTensorRunner,
     CuTileMxfp4Bf16Runner,
     CuTileMxfp4Runner,
+    CuTileMxfp4Mxfp8Runner,
+    CuTileMxfp8Bf16Runner,
+    CuTileMxfp8Runner,
     CuTileNvfp4Bf16Runner,
     CuTileNvfp4Runner,
     CuteDslRunner,
@@ -99,8 +109,13 @@ _RunnerT = Union[
     CutlassW4A16Runner,
     CutlassW4A8Runner,
     CuTileBf16Runner,
+    CuTileFp8PerTensorBf16Runner,
+    CuTileFp8PerTensorRunner,
     CuTileMxfp4Bf16Runner,
     CuTileMxfp4Runner,
+    CuTileMxfp4Mxfp8Runner,
+    CuTileMxfp8Bf16Runner,
+    CuTileMxfp8Runner,
     CuTileNvfp4Bf16Runner,
     CuTileNvfp4Runner,
     CuteDslRunner,
@@ -126,8 +141,13 @@ _BACKEND_RUNNERS: Dict[type, Type[_RunnerT]] = {
     CutlassW4A16Config: CutlassW4A16Runner,
     CutlassW4A8Config: CutlassW4A8Runner,
     CuTileBf16Config: CuTileBf16Runner,
+    CuTileFp8PerTensorBf16Config: CuTileFp8PerTensorBf16Runner,
+    CuTileFp8PerTensorConfig: CuTileFp8PerTensorRunner,
     CuTileMxfp4Bf16Config: CuTileMxfp4Bf16Runner,
     CuTileMxfp4Config: CuTileMxfp4Runner,
+    CuTileMxfp4Mxfp8Config: CuTileMxfp4Mxfp8Runner,
+    CuTileMxfp8Bf16Config: CuTileMxfp8Bf16Runner,
+    CuTileMxfp8Config: CuTileMxfp8Runner,
     CuTileNvfp4Bf16Config: CuTileNvfp4Bf16Runner,
     CuTileNvfp4Config: CuTileNvfp4Runner,
     CuteDslConfig: CuteDslRunner,
@@ -354,6 +374,7 @@ class MoELayer:
         best_time_ms = float("inf")
         best_runner: Optional[_RunnerT] = None
         best_tactic: Any = -1
+        best_inputs: Optional[List[torch.Tensor]] = None
 
         for runner in runners:
             inputs = runner.pack_inputs(act_pack, weight_pack)
@@ -385,8 +406,16 @@ class MoELayer:
                 best_time_ms = t_ms
                 best_runner = runner
                 best_tactic = tactic
+                best_inputs = inputs
 
         assert best_runner is not None  # runners is non-empty (checked by caller)
+        assert best_inputs is not None
+        precompile = getattr(best_runner, "_precompile_bucket_variants", None)
+        if precompile is not None:
+            # cuTile has a finite set of JIT dispatch variants inside each
+            # autotune bucket. Compile them as part of selecting that bucket's
+            # winner so ordinary serving calls need no separate warmup API.
+            precompile(best_inputs, best_tactic)
         return best_runner, best_tactic
 
     # ---- Introspection helpers ---------------------------------------------
