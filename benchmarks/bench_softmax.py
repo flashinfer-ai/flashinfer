@@ -4,10 +4,17 @@ Benchmark script comparing torch.softmax vs flashinfer.softmax performance.
 Creates a heatmap showing speedup across different batch sizes and hidden dimensions.
 """
 
+import argparse
+import json
+import math
+import os
+from pathlib import Path
+import subprocess
+import sys
+import warnings
+
 import numpy as np
 import torch
-import matplotlib.pyplot as plt
-import seaborn as sns
 from typing import List, Tuple
 import flashinfer
 from flashinfer.testing.utils import bench_gpu_time
@@ -20,17 +27,48 @@ def benchmark_torch_softmax(logits: torch.Tensor) -> float:
         lambda: torch.softmax(logits, dim=-1),
         dry_run_time_ms=100,
         repeat_time_ms=1000,
+        enable_cupti=True,
     )
     return np.median(measurements)
 
 
 @torch.inference_mode()
-def benchmark_flashinfer_softmax(logits: torch.Tensor) -> float:
+def benchmark_flashinfer_softmax(
+    logits: torch.Tensor,
+    *,
+    temperature: float | None = None,
+    enable_pdl: bool = False,
+) -> float:
     """Benchmark flashinfer's softmax."""
     measurements = bench_gpu_time(
-        lambda: flashinfer.sampling.softmax(logits, temperature=None, enable_pdl=False),
+        lambda: flashinfer.sampling.softmax(
+            logits, temperature=temperature, enable_pdl=enable_pdl
+        ),
         dry_run_time_ms=100,
         repeat_time_ms=1000,
+        enable_cupti=True,
+    )
+    return np.median(measurements)
+
+
+@torch.inference_mode()
+def benchmark_vibecuda_softmax(
+    logits: torch.Tensor,
+    *,
+    temperature: float | None = None,
+    enable_pdl: bool = False,
+) -> float:
+    """Benchmark flashinfer's vibecuda-backend softmax (SM100-class only)."""
+    measurements = bench_gpu_time(
+        lambda: flashinfer.sampling.softmax(
+            logits,
+            temperature=temperature,
+            enable_pdl=enable_pdl,
+            backend="vibecuda",
+        ),
+        dry_run_time_ms=100,
+        repeat_time_ms=1000,
+        enable_cupti=True,
     )
     return np.median(measurements)
 
@@ -43,23 +81,29 @@ def run_benchmark(
 
     Returns:
         torch_times: 2D array of torch softmax times (ms)
-        flashinfer_times: 2D array of flashinfer softmax times (ms)
-        speedups: 2D array of speedup ratios (torch_time / flashinfer_time)
+        flashinfer_times: 2D array of flashinfer (upstream backend) times (ms)
+        speedups: 2D array of speedup ratios (torch_time / flashinfer_time vs vibecuda)
     """
     n_batch = len(batch_sizes)
     n_hidden = len(hidden_sizes)
 
+    has_vibecuda = (
+        flashinfer.utils.get_compute_capability(torch.device("cuda"))[0] >= 10
+    )
+
     torch_times = np.zeros((n_batch, n_hidden))
     flashinfer_times = np.zeros((n_batch, n_hidden))
+    vibecuda_times = np.zeros((n_batch, n_hidden))
     speedups = np.zeros((n_batch, n_hidden))
 
     print("Running benchmarks...")
-    print("=" * 100)
+    print("=" * 120)
     print(
         f"{'Batch Size':<12} {'Hidden Size':<12} {'Torch (ms)':<15} "
-        f"{'FlashInfer (ms)':<18} {'Speedup':<10} {'Bandwidth (GB/s)':<18}"
+        f"{'FlashInfer (ms)':<18} {'VibeCUDA (ms)':<16} "
+        f"{'FI/VibeCUDA':<12} {'Bandwidth (GB/s)':<18}"
     )
-    print("=" * 100)
+    print("=" * 120)
 
     for i, batch_size in enumerate(batch_sizes):
         for j, hidden_size in enumerate(hidden_sizes):
@@ -73,25 +117,71 @@ def run_benchmark(
             torch_time_ms = benchmark_torch_softmax(logits)
             torch_times[i, j] = torch_time_ms
 
-            # Benchmark flashinfer softmax
+            # Benchmark flashinfer softmax (upstream backend)
             flashinfer_time_ms = benchmark_flashinfer_softmax(logits)
             flashinfer_times[i, j] = flashinfer_time_ms
 
-            # Calculate speedup
-            speedup = torch_time_ms / flashinfer_time_ms
+            # Benchmark vibecuda-backend softmax where supported and record
+            # speedup vs the upstream flashinfer backend on this workload
+            if has_vibecuda:
+                vibecuda_time_ms = benchmark_vibecuda_softmax(logits)
+                vibecuda_times[i, j] = vibecuda_time_ms
+                speedup = flashinfer_time_ms / vibecuda_time_ms
+            else:
+                vibecuda_time_ms = float("nan")
+                speedup = float("nan")
             speedups[i, j] = speedup
 
-            # Calculate effective bandwidth (read + write)
+            # Calculate effective bandwidth (read + write) of the best backend
             io_bytes = logits.numel() * logits.element_size() * 2
-            bandwidth_gb_s = io_bytes * 1e-6 / flashinfer_time_ms
+            best_ms = vibecuda_time_ms if has_vibecuda else flashinfer_time_ms
+            bandwidth_gb_s = io_bytes * 1e-6 / best_ms
 
             print(
                 f"{batch_size:<12} {hidden_size:<12} {torch_time_ms:<15.4f} "
-                f"{flashinfer_time_ms:<18.4f} {speedup:<10.2f}x {bandwidth_gb_s:<18.2f}"
+                f"{flashinfer_time_ms:<18.4f} {vibecuda_time_ms:<16.4f} "
+                f"{speedup:<12.2f}x {bandwidth_gb_s:<18.2f}"
             )
 
-    print("=" * 100)
+    print("=" * 120)
     return torch_times, flashinfer_times, speedups
+
+
+def run_pdl_benchmark() -> float:
+    """Run PR 4282's scalar-temperature PDL performance case."""
+    batch_size = 64
+    hidden_size = 32000
+    temperature = 1.0
+    torch.manual_seed(42)
+    logits = torch.randn(batch_size, hidden_size, device="cuda", dtype=torch.float32)
+
+    reference = torch.softmax(logits / temperature, dim=-1)
+    baseline = flashinfer.sampling.softmax(
+        logits, temperature=temperature, enable_pdl=True
+    )
+    candidate = flashinfer.sampling.softmax(
+        logits, temperature=temperature, enable_pdl=True, backend="vibecuda"
+    )
+    torch.testing.assert_close(baseline, reference, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(candidate, reference, rtol=1e-3, atol=1e-3)
+
+    flashinfer_time_ms = benchmark_flashinfer_softmax(
+        logits, temperature=temperature, enable_pdl=True
+    )
+    vibecuda_time_ms = benchmark_vibecuda_softmax(
+        logits, temperature=temperature, enable_pdl=True
+    )
+    speedup = flashinfer_time_ms / vibecuda_time_ms
+
+    print("\nPR 4282 scalar-temperature PDL case:")
+    print("=" * 100)
+    print(
+        f"batch={batch_size}, vocab={hidden_size}, temperature={temperature}, "
+        f"PDL=on: FlashInfer={flashinfer_time_ms:.6f} ms, "
+        f"VibeCUDA={vibecuda_time_ms:.6f} ms, speedup={speedup:.4f}x"
+    )
+    print("=" * 100)
+    return speedup
 
 
 def plot_heatmap(
@@ -101,6 +191,12 @@ def plot_heatmap(
     save_path: str = "softmax_speedup_heatmap.png",
 ):
     """Create and save a heatmap of speedup values."""
+    try:
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+    except ImportError:
+        print("matplotlib/seaborn not installed; skipping heatmap generation")
+        return
     # Create figure
     fig, ax = plt.subplots(figsize=(12, 8))
 
@@ -122,7 +218,7 @@ def plot_heatmap(
     ax.set_xlabel("Hidden Size", fontsize=12, fontweight="bold")
     ax.set_ylabel("Batch Size", fontsize=12, fontweight="bold")
     ax.set_title(
-        "FlashInfer Softmax Speedup vs PyTorch (Higher is Better)",
+        "FlashInfer VibeCUDA Softmax Speedup vs Upstream Backend (Higher is Better)",
         fontsize=14,
         fontweight="bold",
         pad=20,
@@ -177,14 +273,137 @@ def plot_heatmap(
     print(f"Trend plots saved to: {comparison_path}")
 
 
+def _paired_rows(backend):
+    rows = []
+    cases = [
+        (b, v, None, False)
+        for b in (1, 4, 8, 16, 32, 64, 128, 256, 512, 1024)
+        for v in (32000, 64000, 128000, 256000)
+    ]
+    cases.append((64, 32000, 1.0, True))
+    for batch, vocab, temperature, enable_pdl in cases:
+        torch.manual_seed(42)
+        logits = torch.randn(batch, vocab, device="cuda", dtype=torch.float32)
+        call = lambda: flashinfer.sampling.softmax(
+            logits,
+            temperature=temperature,
+            enable_pdl=enable_pdl,
+            **({"backend": "vibecuda"} if backend == "vibecuda" else {}),
+        )
+        result = call()
+        reference = torch.softmax(
+            logits if temperature is None else logits / temperature, dim=-1
+        )
+        passed = bool(torch.allclose(result, reference, atol=1e-5))
+        with warnings.catch_warnings():
+            warnings.filterwarnings("error", message=".*Falling back to CUDA events.*")
+            elapsed = bench_gpu_time(
+                call, dry_run_time_ms=100, repeat_time_ms=1000, enable_cupti=True
+            )
+        rows.append(
+            {
+                "shape": [batch, vocab, temperature, enable_pdl],
+                "median_ms": float(np.median(elapsed)),
+                "pass": passed,
+            }
+        )
+    return rows
+
+
+def _compare_cake(baseline_root, baseline_python):
+    baseline_root = baseline_root.resolve(strict=True)
+    candidate_root = Path(__file__).resolve().parents[1]
+    if not Path(flashinfer.__file__).resolve().is_relative_to(candidate_root):
+        raise RuntimeError("candidate imported the wrong FlashInfer checkout")
+    if not (baseline_root / "flashinfer" / "__init__.py").is_file():
+        raise ValueError("--baseline-root must be a FlashInfer checkout")
+    env = os.environ.copy()
+    dependency_paths = [
+        path
+        for path in env.get("PYTHONPATH", "").split(os.pathsep)
+        if path and Path(path).resolve() not in {candidate_root, baseline_root}
+    ]
+    env["PYTHONPATH"] = os.pathsep.join([str(baseline_root), *dependency_paths])
+    env["EXPECTED_BASELINE_ROOT"] = str(baseline_root)
+    child = subprocess.run(
+        [str(baseline_python), str(Path(__file__).resolve()), "--paired-child"],
+        cwd=baseline_root,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if child.returncode:
+        raise RuntimeError("CAKE benchmark failed: " + child.stderr[-2000:])
+    marker = "BASELINE_JSON="
+    payload = next(
+        (
+            line[len(marker) :]
+            for line in child.stdout.splitlines()
+            if line.startswith(marker)
+        ),
+        None,
+    )
+    if payload is None:
+        raise RuntimeError(
+            "baseline benchmark did not emit results: " + child.stderr[-1000:]
+        )
+    baseline = json.loads(payload)
+    candidate = _paired_rows("vibecuda")
+    if len(baseline) != len(candidate) or len(candidate) != 41:
+        raise RuntimeError("baseline and candidate workload matrices differ")
+    speedups = []
+    for before, after in zip(baseline, candidate, strict=True):
+        if before["shape"] != after["shape"] or not before["pass"] or not after["pass"]:
+            raise RuntimeError(f"precision or workload mismatch: {before['shape']}")
+        speedup = before["median_ms"] / after["median_ms"]
+        print(
+            f"{before['shape']}: CAKE={before['median_ms']:.6f} ms "
+            f"VibeCUDA={after['median_ms']:.6f} ms speedup={speedup:.4f}x"
+        )
+        speedups.append(speedup)
+    matched = speedups[:40]
+    print(
+        f"{torch.cuda.get_device_name()}: 40/40 precision pass; "
+        f"CUPTI cold-L2 geomean={math.exp(np.log(matched).mean()):.4f}x "
+        f"arithmetic={np.mean(matched):.4f}x min={min(matched):.4f}x"
+    )
+    print(f"Scalar-temperature PDL: {speedups[40]:.4f}x (reported separately)")
+
+
 def main():
     """Main benchmark execution."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--baseline-root",
+        type=Path,
+        help="FlashInfer PR 4282 checkout for direct CAKE comparison",
+    )
+    parser.add_argument(
+        "--baseline-python",
+        type=Path,
+        default=Path(sys.executable),
+        help="Python interpreter with PR 4282 installed",
+    )
+    parser.add_argument("--paired-child", action="store_true", help=argparse.SUPPRESS)
+    args = parser.parse_args()
+    if args.paired_child:
+        expected = os.environ.get("EXPECTED_BASELINE_ROOT", "")
+        if not expected or not Path(flashinfer.__file__).resolve().is_relative_to(
+            Path(expected)
+        ):
+            raise RuntimeError("baseline child imported the wrong FlashInfer checkout")
+        print("BASELINE_JSON=" + json.dumps(_paired_rows("default")))
+        return
+    if args.baseline_root:
+        _compare_cake(args.baseline_root, args.baseline_python)
+        return
     # Configuration
     batch_sizes = [1, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
     hidden_sizes = [32000, 64000, 128000, 256000]
 
     print("=" * 100)
-    print("FlashInfer vs PyTorch Softmax Benchmark")
+    print("FlashInfer Softmax Benchmark: torch vs upstream backend vs vibecuda backend")
     print("=" * 100)
     print(f"Batch sizes: {batch_sizes}")
     print(f"Hidden sizes: {hidden_sizes}")
@@ -194,14 +413,17 @@ def main():
 
     # Run benchmarks
     _, _, speedups = run_benchmark(batch_sizes, hidden_sizes)
+    pdl_speedup = run_pdl_benchmark()
+    all_speedups = np.append(speedups.ravel(), pdl_speedup)
 
     # Print summary statistics
     print("\nSummary Statistics:")
     print("=" * 100)
-    print(f"Average speedup: {np.mean(speedups):.2f}x")
-    print(f"Median speedup: {np.median(speedups):.2f}x")
-    print(f"Min speedup: {np.min(speedups):.2f}x")
-    print(f"Max speedup: {np.max(speedups):.2f}x")
+    print("Workloads: 41 (40 temperature=None/PDL-off + 1 scalar-temperature PDL)")
+    print(f"Average speedup: {np.mean(all_speedups):.2f}x")
+    print(f"Median speedup: {np.median(all_speedups):.2f}x")
+    print(f"Min speedup: {np.min(all_speedups):.2f}x")
+    print(f"Max speedup: {np.max(all_speedups):.2f}x")
     print("=" * 100)
 
     # Generate heatmap
