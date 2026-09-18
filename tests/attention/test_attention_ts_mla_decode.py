@@ -2373,13 +2373,26 @@ def test_attention_ts_mla_standard_plan_info_has_no_cost_model():
 
 @pytest.mark.parametrize("use_balanced", (False, True))
 def test_attention_ts_mla_auto_plan_installs_gate_selection(monkeypatch, use_balanced):
+    import flashinfer.attention.prims_ts.balanced_scheduler.plan as balanced_plan_module
+
     wrapper = BatchMLADecodePagedTSWrapper()
     calls = []
+    calibration_calls = []
 
     monkeypatch.setattr(
         mla_decode_module,
         "should_use_prims_ts_balanced_mla",
         lambda **_kwargs: use_balanced,
+    )
+    monkeypatch.setattr(
+        mla_decode_module,
+        "_resolve_cuda_device",
+        lambda _device: (torch.device("cuda:0"), 0),
+    )
+    monkeypatch.setattr(
+        balanced_plan_module,
+        "require_balanced_mla_calibration",
+        lambda device: calibration_calls.append(device),
     )
 
     def record_plan(*args, **kwargs):
@@ -2410,6 +2423,70 @@ def test_attention_ts_mla_auto_plan_installs_gate_selection(monkeypatch, use_bal
     assert len(calls) == 1
     assert calls[0][1]["balanced"] is use_balanced
     assert calls[0][1]["balanced_seq_lens"] == (seq_lens if use_balanced else None)
+    assert calibration_calls == ([torch.device("cuda:0")] if use_balanced else [])
+
+
+def test_attention_ts_mla_auto_plan_warns_and_falls_back_without_calibration(
+    monkeypatch,
+):
+    import flashinfer.attention.prims_ts.balanced_scheduler.plan as balanced_plan_module
+
+    wrapper = BatchMLADecodePagedTSWrapper()
+    calls = []
+
+    monkeypatch.setattr(
+        mla_decode_module,
+        "should_use_prims_ts_balanced_mla",
+        lambda **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        mla_decode_module,
+        "_resolve_cuda_device",
+        lambda _device: (torch.device("cuda:7"), 7),
+    )
+
+    def reject_calibration(device):
+        assert device == torch.device("cuda:7")
+        raise NotImplementedError("run calibration benchmark")
+
+    monkeypatch.setattr(
+        balanced_plan_module,
+        "require_balanced_mla_calibration",
+        reject_calibration,
+    )
+    monkeypatch.setattr(
+        wrapper,
+        "_plan",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+    seq_lens = (8192, 4096)
+
+    with pytest.warns(
+        RuntimeWarning,
+        match=r"no registered cost-model calibration.*falling back.*calibration benchmark",
+    ):
+        selected = wrapper.plan_auto(
+            "cuda:7",
+            2,
+            128,
+            _LATENT_DIM,
+            _ROPE_DIM,
+            _DEFAULT_PAGE_SIZE,
+            8192,
+            max_seq_len_q=1,
+            packed_query=False,
+            q_data_type=torch.bfloat16,
+            kv_data_type=torch.bfloat16,
+            o_data_type=torch.bfloat16,
+            seq_lens=seq_lens,
+            expected_mean_seq_len=4096,
+            expected_max_seq_len=8192,
+        )
+
+    assert selected is False
+    assert len(calls) == 1
+    assert calls[0][1]["balanced"] is False
+    assert calls[0][1]["balanced_seq_lens"] is None
 
 
 def test_attention_ts_mla_balanced_plan_fails_calibration_before_policy_or_allocation(

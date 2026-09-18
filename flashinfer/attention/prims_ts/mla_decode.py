@@ -19,6 +19,7 @@ from dataclasses import dataclass, field, replace
 import functools
 from types import MappingProxyType
 from typing import Any, Literal, Optional, cast
+import warnings
 
 import torch
 
@@ -2272,6 +2273,12 @@ class BatchMLADecodePagedTSWrapper:
         scheduler. The actual ``seq_lens`` seed the balanced schedule only
         after admission and never affect which kernel is selected.
 
+        Auto selection is conservative about device-specific tuning. If the
+        gate admits balanced execution but the exact CUDA device has no
+        registered cost-model calibration, this method emits a warning and
+        installs the standard plan instead. Explicit :meth:`plan_balanced`
+        remains fail-closed on an uncalibrated device.
+
         Returns ``True`` when a balanced plan was installed and ``False`` when
         the standard plan was installed. If the result is ``True``, call
         capture :meth:`schedule` before the balanced runs. Explicit
@@ -2293,7 +2300,9 @@ class BatchMLADecodePagedTSWrapper:
         :func:`get_prims_ts_batch_mla_decode_workspace_size`. A blanket
         ``balanced=True`` size query requires exact device calibration even
         when this gate would select standard. Omitting ``workspace_buffer``
-        lets this method allocate for the selected route directly.
+        lets this method allocate for the selected route directly and is the
+        simplest option when the device's calibration status is not already
+        known.
 
         This wrapper consumes dense page tables with page size 16, 32, 64, or
         128 and returns only the attention output. Its internal LSE scratch is
@@ -2310,9 +2319,6 @@ class BatchMLADecodePagedTSWrapper:
             If a supported auto-selection configuration is missing an
             expected length declaration, or if a declaration is invalid or
             inconsistent with the other declaration.
-        NotImplementedError
-            If the gate selects balanced execution but the exact CUDA device
-            has no registered balanced cost-model calibration.
         """
 
         use_balanced = should_use_prims_ts_balanced_mla(
@@ -2327,6 +2333,21 @@ class BatchMLADecodePagedTSWrapper:
             expected_mean_seq_len=expected_mean_seq_len,
             expected_max_seq_len=expected_max_seq_len,
         )
+        if use_balanced:
+            from .balanced_scheduler.plan import require_balanced_mla_calibration
+
+            resolved_device, _ = _resolve_cuda_device(device)
+            try:
+                require_balanced_mla_calibration(resolved_device)
+            except NotImplementedError as error:
+                warnings.warn(
+                    "balanced PrimsTS MLA auto selection was admitted, but the "
+                    "selected CUDA device has no registered cost-model calibration; "
+                    f"falling back to ordinary PrimsTS MLA. {error}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                use_balanced = False
         self._plan(
             device,
             batch_size,
