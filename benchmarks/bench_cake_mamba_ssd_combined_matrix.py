@@ -55,7 +55,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ROW_BENCH = REPO_ROOT / "benchmarks" / "bench_cake_mamba_ssd_combined.py"
 RESULTS_DIR = REPO_ROOT / "benchmarks" / "results" / "vibecuda_ssd_combined"
-CONTRACT_VERSION = "pr4576-route-matrix-12-seed7-v2"
+CONTRACT_VERSION = "pr4576-route-matrix-12-seed7-v3"
 
 # Exact rows from PR-4576's
 # tests/mamba/test_cake_ssd_combined.py::test_cake_ssd_combined_route_matrix.
@@ -327,6 +327,32 @@ def _validate_row(report: dict | None) -> list[str]:
         )
     if report.get("timing_backend") != "cupti":
         failures.append(f"unexpected timing backend {report.get('timing_backend')!r}")
+    timing = report.get("timing", {})
+    expected_timing = {
+        "backend": "cupti",
+        "cold_l2_cache": True,
+        "cuda_graph": False,
+        "dry_run_iters": 5,
+        "repeat_iters": 100,
+        "statistic": "median",
+        "timed_scope": "SSDCombined.run",
+        "timer_records_gpu_kernel_activity_only": True,
+        "caller_out_preallocated": True,
+        "runners_warmed_before_measurement": True,
+        "host_allocations_inside_callable_excluded_by_cupti": True,
+    }
+    if timing != expected_timing:
+        failures.append(f"unexpected timing contract {timing!r}")
+    provenance = report.get("provenance", {})
+    if not provenance.get("repository_commit"):
+        failures.append("missing repository commit provenance")
+    if not provenance.get("gpu_model"):
+        failures.append("missing GPU model provenance")
+    baseline = provenance.get("cake_baseline", {})
+    if baseline.get("head_commit") != "edc312de23f81e8ca38cc0e05be87c654c4b438c":
+        failures.append("unexpected Cake PR-4576 head provenance")
+    if baseline.get("merge_commit") != "624fce191f36ec143b32189ed01d14afb75c4594":
+        failures.append("unexpected Cake PR-4576 merge provenance")
     return failures
 
 
@@ -367,6 +393,9 @@ def _reused_row(results_dir: Path, name: str) -> dict | None:
         "cute_parity_passed": True,
         "full_write_passed": True,
         "cake_cute_parity": artifact.get("cake_cute_parity", {}),
+        "timing": report["timing"],
+        "precision": report["precision"],
+        "provenance": report["provenance"],
         "reused_from_artifact": True,
     }
 
@@ -546,6 +575,9 @@ def main() -> int:
                 "cute_parity_passed": True,
                 "full_write_passed": True,
                 "cake_cute_parity": artifact["cake_cute_parity"],
+                "timing": report["timing"],
+                "precision": report["precision"],
+                "provenance": report["provenance"],
             }
         )
 
@@ -556,6 +588,25 @@ def main() -> int:
         if speedups
         else float("nan")
     )
+    provenance_values = {
+        json.dumps(row["provenance"], sort_keys=True)
+        for row in rows
+        if "provenance" in row
+    }
+    timing_values = {
+        json.dumps(row["timing"], sort_keys=True) for row in rows if "timing" in row
+    }
+    precision_values = {
+        json.dumps(row["precision"], sort_keys=True)
+        for row in rows
+        if "precision" in row
+    }
+    if len(provenance_values) > 1:
+        failed.append("mixed-provenance-artifacts")
+    if len(timing_values) > 1:
+        failed.append("mixed-timing-artifacts")
+    if len(precision_values) > 1:
+        failed.append("mixed-precision-artifacts")
     summary = {
         "contract_version": CONTRACT_VERSION,
         "matrix": [name for name, _ in MATRIX],
@@ -565,6 +616,19 @@ def main() -> int:
         "denominator": "cake (PR-4576 SSDCombined backend)",
         "candidate": "vibecuda",
         "timing": "CUPTI bench_gpu_time, 5 dry-run + 100 reps, median",
+        "timing_contract": (
+            json.loads(next(iter(timing_values))) if len(timing_values) == 1 else None
+        ),
+        "precision": (
+            json.loads(next(iter(precision_values)))
+            if len(precision_values) == 1
+            else None
+        ),
+        "provenance": (
+            json.loads(next(iter(provenance_values)))
+            if len(provenance_values) == 1
+            else None
+        ),
         "rows": rows,
         "arithmetic_mean_speedup": arithmetic if speedups else None,
         "geometric_mean_speedup": geometric if speedups else None,

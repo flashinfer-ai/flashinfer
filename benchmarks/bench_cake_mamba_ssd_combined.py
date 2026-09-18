@@ -2,14 +2,71 @@
 """Direct Cake-versus-CuTe SSDCombined parity and CUPTI benchmark."""
 
 import argparse
+import hashlib
 import json
 from importlib.metadata import version
+from pathlib import Path
+import subprocess
 
 import numpy as np
 import torch
 
 from flashinfer.mamba import SSDCombined
 from flashinfer.testing.utils import bench_gpu_time
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+CAKE_PR_HEAD = "edc312de23f81e8ca38cc0e05be87c654c4b438c"
+CAKE_MERGE_COMMIT = "624fce191f36ec143b32189ed01d14afb75c4594"
+CAKE_CATALOG = (
+    REPO_ROOT / "csrc" / "cake_mamba_ssd_combined" / "generated" / "source_catalog.json"
+)
+CANDIDATE_SOURCES = (
+    REPO_ROOT / "csrc" / "vibecuda_mamba_ssd_combined.cu",
+    REPO_ROOT / "csrc" / "vibecuda_mamba_ssd_combined_jit_binding.cu",
+    REPO_ROOT / "include" / "flashinfer" / "mamba" / "vibecuda_ssd_combined.cuh",
+)
+
+
+def _sha256(paths) -> str:
+    digest = hashlib.sha256()
+    for path in paths:
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def _repository_commit() -> str:
+    return subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=REPO_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+def _provenance() -> dict:
+    catalog = json.loads(CAKE_CATALOG.read_text())
+    capability = torch.cuda.get_device_capability()
+    return {
+        "repository_commit": _repository_commit(),
+        "gpu_model": torch.cuda.get_device_name(),
+        "compute_capability": f"sm{capability[0]}{capability[1]}",
+        "torch_version": torch.__version__,
+        "cuda_version": torch.version.cuda,
+        "cupti_python_version": version("cupti-python"),
+        "candidate_ordered_source_sha256": _sha256(CANDIDATE_SOURCES),
+        "candidate_ordered_source_bytes": sum(
+            path.stat().st_size for path in CANDIDATE_SOURCES
+        ),
+        "cake_baseline": {
+            "pull_request": "https://github.com/flashinfer-ai/flashinfer/pull/4576",
+            "head_commit": CAKE_PR_HEAD,
+            "merge_commit": CAKE_MERGE_COMMIT,
+            "source_catalog_sha256": _sha256((CAKE_CATALOG,)),
+            "source_archive_sha256": catalog["source_archive_sha256"],
+        },
+    }
 
 
 def _require_cupti() -> None:
@@ -344,6 +401,8 @@ def run_workload(args) -> dict:
             enable_cupti=True,
             dry_run_iters=args.warmup,
             repeat_iters=args.repetitions,
+            cold_l2_cache=True,
+            use_cuda_graph=False,
         )
         timings[backend] = float(np.median(samples))
 
@@ -374,6 +433,24 @@ def run_workload(args) -> dict:
         },
         "cake_ms": timings["cake"],
         "timing_backend": "cupti",
+        "timing": {
+            "backend": "cupti",
+            "cold_l2_cache": True,
+            "cuda_graph": False,
+            "dry_run_iters": args.warmup,
+            "repeat_iters": args.repetitions,
+            "statistic": "median",
+            "timed_scope": "SSDCombined.run",
+            "timer_records_gpu_kernel_activity_only": True,
+            "caller_out_preallocated": True,
+            "runners_warmed_before_measurement": True,
+            "host_allocations_inside_callable_excluded_by_cupti": True,
+        },
+        "precision": {
+            "candidate_vs_cute": {"atol": 1e-2, "rtol": 1e-2},
+            "fp64_recurrence_diagnostic": {"atol": 6e-2, "rtol": 6e-2},
+        },
+        "provenance": _provenance(),
     }
     if args.reference == "cute":
         report["out"] = _diagnostic(outputs["cake"][0], outputs["cute"][0])
