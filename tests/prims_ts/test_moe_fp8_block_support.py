@@ -27,7 +27,11 @@ from flashinfer.prims_ts.moe.config_mapper import (
     valid_prims_ts_deepseek_fp8_moe_tactics,
 )
 from flashinfer.prims_ts.moe import support
-from flashinfer.prims_ts.moe.runner import PrimsTsFp8BlockScaleMoERunner
+from flashinfer.prims_ts.moe.runner import (
+    PrimsTsFp8BlockScaleMoERunner,
+    _filter_valid_moe_tactics,
+    _validate_moe_pair_schedules,
+)
 from flashinfer.tllm_enums import (
     ActivationType,
     DtypeTrtllmGen,
@@ -153,6 +157,27 @@ def test_dsfp8_mxfp8_autotuner_enumerates_complete_wide_tactics():
         assert pair.fc1.cfg.kwargs["tile_n"] == pair.fc2.cfg.kwargs["tile_n"]
         wide_tiles.add(pair.tile_n)
     assert wide_tiles == {128, 256}
+
+
+def test_dsfp8_mxfp8_autotuner_filters_schedule_capacity_failures():
+    common = dict(
+        num_tokens=64,
+        top_k=8,
+        num_local_experts=64,
+        use_mxfp8_backed_dsfp8=True,
+    )
+    filtered = _filter_valid_moe_tactics(
+        [[128, 1], [128, 10_000]],
+        lambda tactic: map_trtllm_deepseek_fp8_moe_tactic(tactic, **common),
+        validate_pair=lambda pair: _validate_moe_pair_schedules(
+            pair,
+            num_experts=common["num_local_experts"],
+            num_tokens=common["num_tokens"],
+            top_k=common["top_k"],
+        ),
+    )
+
+    assert filtered == [[128, 10_000]]
 
 
 def test_mxfp8_mxfp8_mapper_supports_geglu_tile8():

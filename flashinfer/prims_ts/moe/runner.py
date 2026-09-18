@@ -244,13 +244,38 @@ def _gemm1_oa_io_kwargs(kwargs: dict) -> dict[str, torch.Tensor | None]:
     }
 
 
-def _filter_valid_moe_tactics(valid_tactics: List[Any], map_tactic) -> List[Any]:
+def _validate_moe_pair_schedules(
+    pair,
+    *,
+    num_experts: int,
+    num_tokens: int,
+    top_k: int,
+) -> None:
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_kernel import (
+        build_batched_gemm_task_manager,
+    )
+
+    for gemm in (pair.fc1, pair.fc2):
+        build_batched_gemm_task_manager(
+            num_experts=num_experts,
+            num_tokens=num_tokens,
+            top_k=top_k,
+            verbose=False,
+            **gemm.cfg.kwargs,
+        )
+
+
+def _filter_valid_moe_tactics(
+    valid_tactics: List[Any], map_tactic, *, validate_pair=None
+) -> List[Any]:
     filtered_tactics = []
     for tactic in valid_tactics:
         try:
             pair = map_tactic(tactic)
             pair.fc1.cfg.build()
             pair.fc2.cfg.build()
+            if validate_pair is not None:
+                validate_pair(pair)
         except Exception as exc:
             logger.debug(f"[Prims-TS MoE] Skipping unsupported tactic {tactic}: {exc}")
             continue
@@ -2225,6 +2250,12 @@ class PrimsTsFp8BlockScaleMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
                                 num_local_experts=self.num_local_experts,
                                 weight_layout=int(self.weight_layout),
                                 use_mxfp8_backed_dsfp8=True,
+                            ),
+                            validate_pair=lambda pair: _validate_moe_pair_schedules(
+                                pair,
+                                num_experts=self.num_local_experts,
+                                num_tokens=num_tokens,
+                                top_k=self.top_k,
                             ),
                         )
                 else:
