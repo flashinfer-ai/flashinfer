@@ -87,7 +87,7 @@ def test_cute_dsl_sm12x_moe_gemm_fp8_matches_reference():
     assert diff < 1e-3, f"calc_diff={diff:.6e}"
 
 
-def make_gated_inputs(m_per_expert_list, n, k):
+def make_gated_inputs(m_per_expert_list, n, k, swiglu_limit=None):
     torch.random.manual_seed(0)
     offsets = [0]
     for count in m_per_expert_list:
@@ -102,7 +102,11 @@ def make_gated_inputs(m_per_expert_list, n, k):
         start, end = offsets[expert], offsets[expert + 1]
         if start < end:
             gemm1 = a[start:end] @ b[expert].t()
-            ref[start:end] = F.silu(gemm1[:, n:]) * gemm1[:, :n]
+            linear, gate = gemm1[:, :n], gemm1[:, n:]
+            if swiglu_limit is not None:
+                gate = gate.clamp(max=swiglu_limit)
+                linear = linear.clamp(-swiglu_limit, swiglu_limit)
+            ref[start:end] = F.silu(gate) * linear
     a_fp8, a_scale = per_token_cast_to_fp8_for_moe_gemm(a, m_indptr)
     b_fp8, b_scale = zip(*(per_block_cast_to_fp8(x) for x in b), strict=True)
     return (
@@ -135,6 +139,43 @@ def test_cute_dsl_sm12x_fc1_act_q1_fp8_smoke():
         and not torch.isnan(q.float()).any()
         and sf.numel() > 0
     )
+
+
+def test_cute_dsl_sm12x_fc1_act_q1_fp8_swiglu_clamp_and_output_reuse():
+    skip_if_not_sm120()
+    from flashinfer.fused_moe import cute_dsl_sm12x_fc1_act_q1_fp8
+
+    limit = 0.25
+    a, b, a_sf, b_sf, offsets, ref = make_gated_inputs(
+        [64] * 4, 512, 512, swiglu_limit=limit
+    )
+    out_q = torch.empty_like(a)
+    out_sf = torch.zeros(
+        (4, compute_padded_offset(a.shape[0], offsets.numel() - 1)),
+        dtype=torch.float32,
+        device="cuda",
+    )
+    q, sf = cute_dsl_sm12x_fc1_act_q1_fp8(
+        a,
+        a_sf,
+        b,
+        b_sf,
+        offsets,
+        swiglu_limit=limit,
+        out_q=out_q,
+        out_sf=out_sf,
+    )
+    assert q.data_ptr() == out_q.data_ptr()
+    assert sf.data_ptr() == out_sf.data_ptr()
+    dequant = torch.empty_like(ref, dtype=torch.float32)
+    for expert in range(offsets.numel() - 1):
+        start, end = map(int, offsets[expert : expert + 2].tolist())
+        padded_start = compute_padded_offset(start, expert)
+        scales = sf[:, padded_start : padded_start + end - start].t()
+        dequant[start:end] = (
+            q[start:end].float().reshape(end - start, -1, 128) * scales[:, :, None]
+        ).reshape(end - start, -1)
+    assert calc_diff(dequant, ref.float()) < 2e-2
 
 
 def test_cute_dsl_sm12x_fc2_finalize_fp8_smoke():

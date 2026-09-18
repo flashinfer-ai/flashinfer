@@ -70,6 +70,7 @@ def make_cfg(
     activation,
     fastmath=False,
     enable_pdl=False,
+    swiglu_limit=None,
 ):
     e4m3, f32, bf16 = cutlass.Float8E4M3FN, cutlass.Float32, cutlass.BFloat16
     num_math_warps = 8
@@ -104,7 +105,9 @@ def make_cfg(
         epi_bar_id=3,
         union_smem=not swap,
         reg_prod=REG_PROD_BY_TACTIC[(*ptile, epi)],
-        activation=moe_activation.make_gated_activation(activation, fastmath),
+        activation=moe_activation.make_gated_activation(
+            activation, fastmath, swiglu_limit
+        ),
         enable_pdl=enable_pdl,
     )
 

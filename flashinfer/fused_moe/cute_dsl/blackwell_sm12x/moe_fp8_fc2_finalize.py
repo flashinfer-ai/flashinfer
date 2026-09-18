@@ -166,8 +166,11 @@ def cute_dsl_sm12x_fc2_finalize_fp8(
     tile=None,
     epi: EpiMethod = DEFAULT_EPI,
     enable_pdl: bool = False,
+    *,
+    out: torch.Tensor | None = None,
 ):
     n, k = int(b_q.shape[1]), int(b_q.shape[2])
+    assert not enable_pdl or out is not None, "PDL requires caller-owned out"
     _check_a_scale_granularity(a_scale, k)
     _check_b_scale_granularity(b_scale, k)
     props = torch.cuda.get_device_properties(a_q.device)
@@ -180,7 +183,15 @@ def cute_dsl_sm12x_fc2_finalize_fp8(
             num_sms=grid_x,
         )
     op = CuteDslSm120GroupedFp8Fc2FinalizeOp(n, k, tuple(tile), epi, enable_pdl)
-    out = torch.zeros(num_tokens, n, dtype=torch.bfloat16, device=a_q.device)
+    if out is None:
+        out = torch.zeros(num_tokens, n, dtype=torch.bfloat16, device=a_q.device)
+    if (
+        out.shape != (num_tokens, n)
+        or out.dtype is not torch.bfloat16
+        or out.device != a_q.device
+        or not out.is_contiguous()
+    ):
+        raise ValueError("out does not match the FC2 output contract")
     args = make_args(
         a_q,
         a_scale,
