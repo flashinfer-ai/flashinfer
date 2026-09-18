@@ -34,6 +34,19 @@ def _get_cuda_stream_ptr() -> int:
     return torch.cuda.current_stream().cuda_stream
 
 
+def _is_positive_finite_fp32(value: float) -> bool:
+    """Whether ``value`` stays positive and finite after rounding to fp32.
+
+    The kernels consume the scale and its reciprocal as fp32 constants, so a
+    Python float that rounds to ``0.0`` or ``inf`` in fp32 is unusable even
+    though it is positive and finite in f64.
+    """
+    if not math.isfinite(value) or value <= 0:
+        return False
+    value_f32 = torch.tensor(value, dtype=torch.float32).item()
+    return math.isfinite(value_f32) and value_f32 > 0
+
+
 # ============================ Helper Functions ============================
 
 
@@ -68,12 +81,12 @@ def validate_cute_dsl_moe_situ_config(
         return
     if activation_type != ActivationType.Swiglu:
         raise ValueError("SiTU parameters require ActivationType.Swiglu")
-    if not math.isfinite(situ_beta) or situ_beta <= 0:
-        raise ValueError("situ_beta must be positive and finite")
-    if situ_linear_beta is not None and (
-        not math.isfinite(situ_linear_beta) or situ_linear_beta <= 0
-    ):
-        raise ValueError("situ_linear_beta must be positive and finite when set")
+    if not _is_positive_finite_fp32(situ_beta):
+        raise ValueError("situ_beta must be positive and finite in fp32")
+    if situ_linear_beta is not None and not _is_positive_finite_fp32(situ_linear_beta):
+        raise ValueError(
+            "situ_linear_beta must be positive and finite in fp32 when set"
+        )
 
 
 def get_max_num_tiles(
