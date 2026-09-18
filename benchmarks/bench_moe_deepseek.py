@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""DeepSeek-V3 MoE Performance Benchmark - CuteDSL vs CUTLASS vs TRTLLM.
+"""DeepSeek-V3 MoE Performance Benchmark across FlashInfer MoE backends.
 
 Compares NVFP4 and BF16 MoE backends on DeepSeek-V3 configuration:
 - CuteDSL W4A4: NVFP4 activations and weights
@@ -34,6 +34,9 @@ Usage:
 
     # Compare TRTLLM NVFP4 and BF16
     python bench_moe_deepseek.py --backends trtllm-nvfp4,trtllm-bf16
+
+    # Measure PrimsTS NVFP4 without running CuTe DSL or CUTLASS MoE
+    python bench_moe_deepseek.py --backends prims-ts-nvfp4
 
     # Disable CUDA graph (useful for debugging or profiling)
     python bench_moe_deepseek.py --no-cuda-graph
@@ -106,10 +109,8 @@ def _autotune_context(do_autotune, cache):
     """Create a tuning, cache-only, or ordinary no-cache benchmark scope."""
     from flashinfer.autotuner import autotune
 
-    if cache is not None:
+    if cache is not None or do_autotune:
         return autotune(do_autotune, cache=cache)
-    if do_autotune:
-        return autotune(True)
     return contextlib.nullcontext()
 
 
@@ -158,8 +159,8 @@ def interleave(x, gs=64):
     )
 
 
-def create_inputs(n, dev="cuda", routing_bias_scale=0.01):
-    """Create inputs for all backends (CuteDSL, CUTLASS, TRTLLM)."""
+def create_inputs(n, dev="cuda", routing_bias_scale=0.01, prepare_cutlass=True):
+    """Create deterministic inputs shared by every selected MoE backend."""
     from flashinfer.fp4_quantization import fp4_quantize
 
     torch.manual_seed(42)
@@ -208,18 +209,7 @@ def create_inputs(n, dev="cuda", routing_bias_scale=0.01):
     w1_gs = torch.tensor(w1_gs_list, device=dev)
     w2_gs = torch.tensor(w2_gs_list, device=dev)
 
-    # CUTLASS format: quantize with swizzled scale factors
-    w1_fp4_list, w1_sf_list = [], []
-    w2_fp4_list, w2_sf_list = [], []
-    for e in range(CFG.num_experts):
-        q1, s1 = fp4_quantize(w1b[e], w1_gs[e], sv, False, True)  # swizzled
-        w1_fp4_list.append(q1)
-        w1_sf_list.append(s1)
-        q2, s2 = fp4_quantize(w2b[e], w2_gs[e], sv, False, True)  # swizzled
-        w2_fp4_list.append(q2)
-        w2_sf_list.append(s2)
-
-    return {
+    inputs = {
         "router_logits": rl,
         "routing_bias": rb,
         "hidden_bf16": hb,
@@ -228,12 +218,25 @@ def create_inputs(n, dev="cuda", routing_bias_scale=0.01):
         "w1_gs": w1_gs,
         "w2_bf16": w2b,
         "w2_gs": w2_gs,
-        # CUTLASS specific
-        "w1_fp4": torch.stack(w1_fp4_list),
-        "w1_sf": torch.stack(w1_sf_list),
-        "w2_fp4": torch.stack(w2_fp4_list),
-        "w2_sf": torch.stack(w2_sf_list),
     }
+    if prepare_cutlass:
+        # CUTLASS format: quantize with swizzled scale factors.
+        w1_fp4_list, w1_sf_list = [], []
+        w2_fp4_list, w2_sf_list = [], []
+        for e in range(CFG.num_experts):
+            q1, s1 = fp4_quantize(w1b[e], w1_gs[e], sv, False, True)
+            w1_fp4_list.append(q1)
+            w1_sf_list.append(s1)
+            q2, s2 = fp4_quantize(w2b[e], w2_gs[e], sv, False, True)
+            w2_fp4_list.append(q2)
+            w2_sf_list.append(s2)
+        inputs.update(
+            w1_fp4=torch.stack(w1_fp4_list),
+            w1_sf=torch.stack(w1_sf_list),
+            w2_fp4=torch.stack(w2_fp4_list),
+            w2_sf=torch.stack(w2_sf_list),
+        )
+    return inputs
 
 
 # =============================================================================
@@ -253,17 +256,13 @@ def _measure_or_profile(
 ):
     from flashinfer.testing.utils import bench_gpu_time, get_l2_cache_size
 
-    da_capture = use_cuda_graph and os.getenv(
-        "FLASHINFER_DIST_AWARE_AUTOTUNE", "0"
-    ).lower() not in ("", "0", "false", "no", "off", "none")
-
-    if not profile_cuda and da_capture:
-        from flashinfer.fused_moe import trtllm_moe_acquire_da_graph_leases
+    if not profile_cuda and use_cuda_graph:
+        from flashinfer.fused_moe import da_moe_acquire_graph_leases
 
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             run(**input_kwargs)
-        leases = trtllm_moe_acquire_da_graph_leases(graph)
+        leases = da_moe_acquire_graph_leases(graph)
         l2_flush = torch.empty(2 * get_l2_cache_size(), device="cuda", dtype=torch.int8)
         times = []
         try:
@@ -304,12 +303,12 @@ def _measure_or_profile(
 
     leases = ()
     if use_cuda_graph:
-        from flashinfer.fused_moe import trtllm_moe_acquire_da_graph_leases
+        from flashinfer.fused_moe import da_moe_acquire_graph_leases
 
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             run(**input_kwargs)
-        leases = trtllm_moe_acquire_da_graph_leases(graph)
+        leases = da_moe_acquire_graph_leases(graph)
         runner = graph.replay
     for _ in range(3):
         runner()
@@ -723,10 +722,11 @@ def bench_trtllm(
     profile_iters=10,
     autotune_cache=None,
     routing_input_mode="logits",
-    distributions=("uniform",),
+    distribution="uniform",
     precision="nvfp4",
+    backend="trtllm",
 ):
-    """Benchmark TRTLLM NVFP4 or pure BF16 MoE with native finalize.
+    """Benchmark a TRTLLM or PrimsTS MoE backend with native finalize.
 
     Args:
         do_autotune: See ``bench_cute_dsl`` for the autotune-scope rationale.
@@ -734,6 +734,7 @@ def bench_trtllm(
             source weights outside timing. BF16 preserves the activations
             and weights without quantization; FP4 activation flags do not
             affect it.
+        backend: Ordinary MoE backend. PrimsTS currently supports NVFP4 here.
     """
     from flashinfer.fused_moe import RoutingMethodType
     from flashinfer.fused_moe.da_tuner import (
@@ -743,6 +744,8 @@ def bench_trtllm(
 
     if num_local_experts is None:
         num_local_experts = CFG.num_experts
+    if backend not in ("trtllm", "prims_ts"):
+        raise ValueError(f"Unsupported MoE backend: {backend}")
 
     n, dev = inputs["router_logits"].shape[0], inputs["router_logits"].device
     expert_start = local_expert_offset
@@ -764,6 +767,8 @@ def bench_trtllm(
     )
 
     if precision == "bf16":
+        if backend != "trtllm":
+            raise ValueError("PrimsTS BF16 is not exposed by this benchmark")
         from flashinfer.fused_moe import (
             TrtllmBf16Config,
             trtllm_bf16_moe,
@@ -787,10 +792,17 @@ def bench_trtllm(
         logits_moe, routed_moe = trtllm_bf16_moe, trtllm_bf16_routed_moe
     elif precision == "nvfp4":
         from flashinfer import SfLayout, nvfp4_quantize
-        from flashinfer.fused_moe import (
-            trtllm_fp4_block_scale_moe,
-            trtllm_fp4_block_scale_routed_moe,
-        )
+
+        if backend == "prims_ts":
+            from flashinfer.fused_moe import (
+                prims_ts_fp4_block_scale_moe as logits_moe,
+                prims_ts_fp4_block_scale_routed_moe as routed_moe,
+            )
+        else:
+            from flashinfer.fused_moe import (
+                trtllm_fp4_block_scale_moe as logits_moe,
+                trtllm_fp4_block_scale_routed_moe as routed_moe,
+            )
         from flashinfer.fused_moe.core import (
             _maybe_get_cached_w3_w1_permute_indices,
             get_w2_permute_indices_with_cache,
@@ -834,52 +846,64 @@ def bench_trtllm(
             )
             return hidden_states, hidden_states_scale, per_token_scale
 
-        hfp, hsc, hidden_per_token_scale = quantize_hidden(inputs["hidden_bf16"])
-
-        def prep(bf16, gs, M, K):
-            """Prepare weights for LOCAL experts only."""
-            fl, sl = [], []
-            for e in range(expert_start, expert_end):
-                q, s = fp4_quantize(bf16[e], gs[e], sv, False, False)
-                fl.append(q.view(torch.uint8).reshape(M, K // 2))
-                sl.append(s.view(torch.float8_e4m3fn).reshape(M, K // sv))
-            return torch.stack(fl), torch.stack(sl)
-
-        w1f, w1s = prep(
-            inputs["w1_bf16"],
-            inputs["w1_gs"],
-            2 * CFG.intermediate_size,
-            CFG.hidden_size,
+        prepared_key = (
+            "_nvfp4_prepared",
+            num_local_experts,
+            local_expert_offset,
+            use_per_token_activation,
         )
-        w2f, w2s = prep(
-            inputs["w2_bf16"], inputs["w2_gs"], CFG.hidden_size, CFG.intermediate_size
-        )
+        prepared = inputs.get(prepared_key)
+        if prepared is None:
+            hfp, hsc, hidden_per_token_scale = quantize_hidden(inputs["hidden_bf16"])
 
-        def shuf(fp4, sf, perm_fn):
-            """Shuffle weights for LOCAL experts only."""
-            fsh, ssh = [], []
-            for i in range(num_local_experts):
-                p = perm_fn(cache, fp4[i], etm)
-                fsh.append(fp4[i][p.to(dev)].contiguous())
-                ps = perm_fn(cache, sf[i].view(torch.uint8), etm, sv)
-                ssh.append(
-                    block_scale_interleave(
-                        sf[i].view(torch.uint8)[ps.to(dev)].contiguous()
+            def prep(bf16, gs, M, K):
+                """Prepare weights for LOCAL experts only."""
+                fl, sl = [], []
+                for e in range(expert_start, expert_end):
+                    q, s = fp4_quantize(bf16[e], gs[e], sv, False, False)
+                    fl.append(q.view(torch.uint8).reshape(M, K // 2))
+                    sl.append(s.view(torch.float8_e4m3fn).reshape(M, K // sv))
+                return torch.stack(fl), torch.stack(sl)
+
+            w1f, w1s = prep(
+                inputs["w1_bf16"],
+                inputs["w1_gs"],
+                2 * CFG.intermediate_size,
+                CFG.hidden_size,
+            )
+            w2f, w2s = prep(
+                inputs["w2_bf16"],
+                inputs["w2_gs"],
+                CFG.hidden_size,
+                CFG.intermediate_size,
+            )
+
+            def shuf(fp4, sf, perm_fn):
+                """Shuffle weights for LOCAL experts only."""
+                fsh, ssh = [], []
+                for i in range(num_local_experts):
+                    p = perm_fn(cache, fp4[i], etm)
+                    fsh.append(fp4[i][p.to(dev)].contiguous())
+                    ps = perm_fn(cache, sf[i].view(torch.uint8), etm, sv)
+                    ssh.append(
+                        block_scale_interleave(
+                            sf[i].view(torch.uint8)[ps.to(dev)].contiguous()
+                        )
                     )
-                )
-            return torch.stack(fsh), torch.stack(ssh)
+                return torch.stack(fsh), torch.stack(ssh)
 
-        w1f, w1s = shuf(w1f, w1s, _maybe_get_cached_w3_w1_permute_indices)
-        w2f, w2s = shuf(w2f, w2s, get_w2_permute_indices_with_cache)
-        w1s = w1s.view(torch.float8_e4m3fn).reshape(
-            num_local_experts, 2 * CFG.intermediate_size, CFG.hidden_size // sv
-        )
-        w2s = w2s.view(torch.float8_e4m3fn).reshape(
-            num_local_experts, CFG.hidden_size, CFG.intermediate_size // sv
-        )
-
-        # Scale tensors sized for LOCAL experts only
-        sc = torch.ones(num_local_experts, device=dev, dtype=torch.float32)
+            w1f, w1s = shuf(w1f, w1s, _maybe_get_cached_w3_w1_permute_indices)
+            w2f, w2s = shuf(w2f, w2s, get_w2_permute_indices_with_cache)
+            w1s = w1s.view(torch.float8_e4m3fn).reshape(
+                num_local_experts, 2 * CFG.intermediate_size, CFG.hidden_size // sv
+            )
+            w2s = w2s.view(torch.float8_e4m3fn).reshape(
+                num_local_experts, CFG.hidden_size, CFG.intermediate_size // sv
+            )
+            sc = torch.ones(num_local_experts, device=dev, dtype=torch.float32)
+            prepared = (hfp, hsc, hidden_per_token_scale, w1f, w1s, w2f, w2s, sc)
+            inputs[prepared_key] = prepared
+        hfp, hsc, hidden_per_token_scale, w1f, w1s, w2f, w2s, sc = prepared
         moe_kwargs.update(
             gemm1_weights=w1f,
             gemm1_weights_scale=w1s,
@@ -898,8 +922,6 @@ def bench_trtllm(
             hidden_states=inputs["hidden_bf16"] if include_activation_quant else hfp,
             hidden_states_scale=None if include_activation_quant else hsc,
         )
-        logits_moe = trtllm_fp4_block_scale_moe
-        routed_moe = trtllm_fp4_block_scale_routed_moe
     else:
         raise ValueError(f"Unsupported TRTLLM precision: {precision}")
 
@@ -909,17 +931,18 @@ def bench_trtllm(
     if is_routed:
         # Share this row's cached routes across precisions, including after
         # autotuning advances the RNG. Release the cache with the input row.
-        factory = inputs.get("_trtllm_routing_factory")
+        factory = inputs.get("_moe_routing_factory")
         if factory is None:
             factory = RoutingRealizationFactory()
-            inputs["_trtllm_routing_factory"] = factory
+            inputs["_moe_routing_factory"] = factory
         realized = factory.get_or_create(
             RoutingRealizationKey(
                 device=torch.device(dev),
                 num_tokens=n,
-                distribution=distributions[0],
+                distribution=distribution,
                 sample_index=0,
                 local_expert_offset=0,
+                num_experts=CFG.num_experts,
                 num_local_experts=CFG.num_experts,
                 top_k=CFG.top_k,
                 routing_rule_fingerprint="bench_moe_deepseek:renormalize",
@@ -1063,6 +1086,8 @@ def run_benchmark(
         profile_cuda: Capture one backend for an external CUDA profiler.
         profile_iters: Number of cold-L2 graph replays to capture.
         profile_backend: Backend to run when profile_cuda is enabled.
+        distributions: Runtime routing profiles. Tuning uses the complete list
+            configured by ``FLASHINFER_DA_DISTRIBUTIONS``.
 
     Returns:
         List of BenchResult objects
@@ -1081,44 +1106,57 @@ def run_benchmark(
     results = []
     rows_and_histograms = []
 
-    # Note: autotune(True) is now scoped to each bench_*'s pre-warm rather than
-    # wrapping the entire measurement loop.  See bench_cute_dsl for rationale.
+    # Tune every token bucket while measuring the first routing profile. Later profiles restore
+    # those exact plans and change only the graph-stable routing values. Reuse deterministic input
+    # and quantized-weight preparation across profiles for the same token bucket.
     for n in token_counts:
-        row, histogram_record = _benchmark_single(
-            n,
-            warmup,
-            iters,
-            num_local,
-            local_offset,
-            use_cuda_graph,
-            use_cupti,
-            use_wrapper=use_wrapper,
-            routing_bias_scale=routing_bias_scale,
-            do_autotune=do_autotune,
-            use_per_token_activation=use_per_token_activation,
-            include_activation_quant=include_activation_quant,
-            use_fused_finalize=use_fused_finalize,
-            profile_cuda=profile_cuda,
-            profile_iters=profile_iters,
-            profile_backend=profile_backend,
-            backends=backends,
-            routing_input_mode=routing_input_mode,
-            distributions=distributions,
-            autotune_cache=autotune_cache,
+        selected = set(
+            backends or ("cutedsl", "cutlass", "trtllm-nvfp4", "trtllm-bf16")
         )
-        results.extend(row)
-        rows_and_histograms.append((row, histogram_record))
-        # Each row rebuilds full-model weights; release cached allocations so
-        # measurements do not depend on the token-count scan order.
+        inputs = create_inputs(
+            n,
+            routing_bias_scale=routing_bias_scale,
+            prepare_cutlass="cutlass" in selected,
+        )
+        for distribution_index, distribution in enumerate(distributions):
+            row, histogram_record = _benchmark_single(
+                n,
+                warmup,
+                iters,
+                num_local,
+                local_offset,
+                use_cuda_graph,
+                use_cupti,
+                use_wrapper=use_wrapper,
+                routing_bias_scale=routing_bias_scale,
+                do_autotune=do_autotune and distribution_index == 0,
+                use_per_token_activation=use_per_token_activation,
+                include_activation_quant=include_activation_quant,
+                use_fused_finalize=use_fused_finalize,
+                profile_cuda=profile_cuda,
+                profile_iters=profile_iters,
+                profile_backend=profile_backend,
+                backends=backends,
+                routing_input_mode=routing_input_mode,
+                distribution=distribution,
+                autotune_cache=autotune_cache,
+                inputs=inputs,
+            )
+            results.extend(row)
+            rows_and_histograms.append((row, histogram_record, distribution))
+        # Each token bucket rebuilds full-model weights; release cached allocations so measurements
+        # do not depend on the token-count scan order.
+        del inputs
         gc.collect()
         torch.cuda.empty_cache()
 
     if verbose and backends is not None:
-        print("backend,tokens,latency_ms,tflops")
-        for row, _ in rows_and_histograms:
+        print("distribution,backend,tokens,latency_ms,tflops")
+        for row, _, distribution in rows_and_histograms:
             for result in row:
                 print(
-                    f"{result.backend},{result.tokens},{result.latency_ms:.6f},"
+                    f"{distribution},{result.backend},{result.tokens},"
+                    f"{result.latency_ms:.6f},"
                     f"{result.tflops:.6f}"
                 )
     elif verbose:
@@ -1133,7 +1171,11 @@ def run_benchmark(
             include_activation_quant=include_activation_quant,
             use_fused_finalize=use_fused_finalize,
         )
-        for row, histogram_record in rows_and_histograms:
+        current_distribution = None
+        for row, histogram_record, distribution in rows_and_histograms:
+            if distribution != current_distribution:
+                print(f"Distribution: {distribution}")
+                current_distribution = distribution
             _print_row(row, histogram_record)
         _print_footer(use_per_token_activation)
 
@@ -1159,8 +1201,9 @@ def _benchmark_single(
     profile_backend=None,
     backends=None,
     routing_input_mode="logits",
-    distributions=("uniform",),
+    distribution="uniform",
     autotune_cache=None,
+    inputs=None,
 ):
     """Benchmark all backends for a single token count.
 
@@ -1168,10 +1211,23 @@ def _benchmark_single(
         use_wrapper: If True, use CuteDslMoEWrapper API for CuteDSL.
         do_autotune: Forwarded to each bench_* function — wraps pre-warm only.
     """
-    inputs = create_inputs(n, routing_bias_scale=routing_bias_scale)
+    if inputs is None:
+        inputs = create_inputs(
+            n,
+            routing_bias_scale=routing_bias_scale,
+            prepare_cutlass=backends is None or "cutlass" in backends,
+        )
     histogram_record = _collect_expert_histogram(inputs, num_local, local_offset)
 
-    selected = set(backends or ("cutedsl", "cutlass", "trtllm-nvfp4", "trtllm-bf16"))
+    selected = set(
+        backends
+        or (
+            "cutedsl",
+            "cutlass",
+            "trtllm-nvfp4",
+            "trtllm-bf16",
+        )
+    )
     run_cute_dsl_w4a4 = "cutedsl" in selected and profile_backend in (
         None,
         "cute-dsl",
@@ -1189,6 +1245,10 @@ def _benchmark_single(
     run_trtllm_bf16 = "trtllm-bf16" in selected and profile_backend in (
         None,
         "trtllm-bf16",
+    )
+    run_prims_ts_nvfp4 = "prims-ts-nvfp4" in selected and profile_backend in (
+        None,
+        "prims-ts-nvfp4",
     )
 
     lat = {}
@@ -1265,9 +1325,30 @@ def _benchmark_single(
                 profile_iters=profile_iters,
                 autotune_cache=autotune_cache,
                 routing_input_mode=routing_input_mode,
-                distributions=distributions,
+                distribution=distribution,
                 precision=precision,
             )
+
+    if run_prims_ts_nvfp4:
+        lat["PrimsTS NVFP4"] = bench_trtllm(
+            inputs,
+            warmup,
+            iters,
+            num_local,
+            local_offset,
+            use_cuda_graph,
+            use_cupti,
+            do_autotune=do_autotune,
+            use_per_token_activation=use_per_token_activation,
+            include_activation_quant=include_activation_quant,
+            profile_cuda=profile_cuda,
+            profile_iters=profile_iters,
+            autotune_cache=autotune_cache,
+            routing_input_mode=routing_input_mode,
+            distribution=distribution,
+            precision="nvfp4",
+            backend="prims_ts",
+        )
 
     # Build results
     results = []
@@ -1560,7 +1641,10 @@ def main():
     parser.add_argument(
         "--backends",
         type=str,
-        help="Comma-separated subset of cutedsl,cutlass,trtllm-nvfp4,trtllm-bf16 (default: all)",
+        help=(
+            "Comma-separated subset of cutedsl,cutlass,trtllm-nvfp4,"
+            "trtllm-bf16,prims-ts-nvfp4 (default: all)"
+        ),
     )
     parser.add_argument(
         "--distributions",
@@ -1571,7 +1655,7 @@ def main():
         "--routing-input-mode",
         choices=("logits", "routed"),
         default="logits",
-        help="TRTLLM routing input representation",
+        help="Ordinary MoE backend routing input representation",
     )
     parser.add_argument("--quiet", action="store_true", help="Minimal output")
     parser.add_argument(
@@ -1642,6 +1726,7 @@ def main():
             "cutlass",
             "trtllm-nvfp4",
             "trtllm-bf16",
+            "prims-ts-nvfp4",
         ],
         help="Backend captured by --profile-cuda.",
     )
@@ -1665,7 +1750,14 @@ def main():
             item.strip() for item in args.backends.split(",") if item.strip()
         )
         unknown = sorted(
-            set(backends) - {"cutedsl", "cutlass", "trtllm-nvfp4", "trtllm-bf16"}
+            set(backends)
+            - {
+                "cutedsl",
+                "cutlass",
+                "trtllm-nvfp4",
+                "trtllm-bf16",
+                "prims-ts-nvfp4",
+            }
         )
         if unknown:
             parser.error(f"unknown --backends value(s): {', '.join(unknown)}")
@@ -1702,7 +1794,7 @@ def main():
 
     CFG.num_experts = args.num_experts
     if args.routing_input_mode == "routed" and not args.no_cuda_graph:
-        os.environ["FLASHINFER_DIST_AWARE_AUTOTUNE"] = "1"
+        os.environ.setdefault("FLASHINFER_DIST_AWARE_AUTOTUNE", "1")
         os.environ["FLASHINFER_DA_DISTRIBUTIONS"] = ",".join(distributions)
     else:
         os.environ["FLASHINFER_DIST_AWARE_AUTOTUNE"] = "0"
@@ -1718,20 +1810,26 @@ def main():
         parser.error("--profile-cuda requires exactly one token count")
     print("\nDeepSeek-V3 MoE Performance Benchmark")
     print(f"GPU: {torch.cuda.get_device_name(0)}")
-    print(f"CuteDSL API: {'Functional' if args.functional_api else 'Wrapper'}")
+    selected_backends = backends or (
+        "cutedsl",
+        "cutlass",
+        "trtllm-nvfp4",
+        "trtllm-bf16",
+    )
+    print(f"Selected backends: {','.join(selected_backends)}")
     print(f"Per-token activation: {args.use_per_token_activation}")
     print(f"Initial activation quantization: {args.include_activation_quant}")
-    print("CuteDSL modes: W4A4 and W4A16; baselines: TRTLLM NVFP4 and TRTLLM BF16")
+    if "cutedsl" in selected_backends:
+        print(f"CuteDSL API: {'Functional' if args.functional_api else 'Wrapper'}")
     print(f"Tensor parallelism simulation: TP={args.tp}")
     print(f"CUDA profiler capture: {args.profile_cuda}")
-    print(
-        "CuteDSL finalize: "
-        f"{'atomic fused' if args.use_fused_finalize else 'deterministic two-stage'}"
-    )
-
-    print(
-        "TRTLLM NVFP4 / TRTLLM BF16 finalize: native (unaffected by --no-fused-finalize)."
-    )
+    if "cutedsl" in selected_backends:
+        print(
+            "CuteDSL finalize: "
+            f"{'atomic fused' if args.use_fused_finalize else 'deterministic two-stage'}"
+        )
+    if {"trtllm-nvfp4", "trtllm-bf16"} & set(selected_backends):
+        print("TRTLLM finalize: native (unaffected by --no-fused-finalize).")
 
     run_benchmark(
         token_counts=tokens,
