@@ -56,7 +56,7 @@ def _bsr_to_vsa_index(
 
     Returns
     -------
-    q2k_index : torch.Tensor  shape ``[1, num_heads, MB * qhead_per_kvhead, NB]``, dtype int32
+    q2k_index : torch.Tensor  shape ``[1, num_heads, MB * qhead_per_kvhead, max_nnz]``, dtype int32
         For each q_block, the list of attended KV-block indices, padded with -1.
         The same pattern is broadcast across all heads and tiled qhead_per_kvhead times
         in the m_block dimension for GQA pack_gqa mode.
@@ -74,8 +74,9 @@ def _bsr_to_vsa_index(
             f"got min={int(indices_cpu.min())}, max={int(indices_cpu.max())}"
         )
 
-    q2k_index_flat = torch.full((MB, NB), -1, dtype=torch.int32)
     q2k_num_flat = (indptr_cpu[1:] - indptr_cpu[:-1]).to(torch.int32)
+    max_nnz = max(int(q2k_num_flat.max()), 1) if MB else NB
+    q2k_index_flat = torch.full((MB, max_nnz), -1, dtype=torch.int32)
 
     for i in range(MB):
         s = int(indptr_cpu[i].item())
@@ -94,7 +95,7 @@ def _bsr_to_vsa_index(
             qhead_per_kvhead
         )  # [MB * qhead_per_kvhead]
 
-    # Broadcast the same pattern to every KV head: [1, H, MB_packed, NB]
+    # Broadcast the same pattern to every KV head: [1, H, MB_packed, max_nnz]
     q2k_index = (
         q2k_index_flat.unsqueeze(0)
         .unsqueeze(0)
@@ -420,7 +421,7 @@ class BlockSparseAttentionWrapper:
             in the split-k algorithm. The recommended size is 128MB, the device of the workspace
             buffer should be the same as the device of the input tensors.
         backend : str
-            The implementation backend, could be ``auto``/``fa2``/``fa3`` or ``cake``. Defaults to ``auto``.
+            The implementation backend, could be ``auto``/``fa2``/``fa3`` or ``cake``. Architecture-specific options include ``vsa_sm90_blk64``. Defaults to ``auto``.
             If set to ``auto``, the function will automatically choose the backend based on the
             device architecture and kernel availability.
         """
@@ -542,13 +543,13 @@ class BlockSparseAttentionWrapper:
             The block index pointer of the block-sparse matrix on row dimension, shape ``(MB + 1,)``,
             where ``MB`` is the number of blocks in the row dimension.
             Required for all backends except ``cake``, ``vsa_sm100_blk128``,
-            ``vsa_sm100_blk64``, and ``vsa_sm120_blk64`` when ``block_mask`` is provided.
+            ``vsa_sm100_blk64``, ``vsa_sm120_blk64``, and ``vsa_sm90_blk64`` when ``block_mask`` is provided.
         indices: torch.Tensor, optional
             The block indices of the block-sparse matrix on column dimension, shape ``(nnz,)``, where
             ``nnz`` is the number of non-zero blocks. The elements in ``indices`` array should be less then ``NB``:
             the number of blocks in the column dimension.
             Required for all backends except ``cake``, ``vsa_sm100_blk128``,
-            ``vsa_sm100_blk64``, and ``vsa_sm120_blk64`` when ``block_mask`` is provided.
+            ``vsa_sm100_blk64``, ``vsa_sm120_blk64``, and ``vsa_sm90_blk64`` when ``block_mask`` is provided.
         M : int
             The number of rows of the block-sparse matrix, ``MB = ceil_div(M, R)``.
         N : int
@@ -611,7 +612,7 @@ class BlockSparseAttentionWrapper:
             ``(num_qo_heads, MB, NB)``, the first QO-head from each KV-head group is used
             (sparsity must be the same across QO-heads that share a KV-head).
             Supported by the ``cake``, ``vsa_sm100_blk128``, ``vsa_sm100_blk64``,
-            and ``vsa_sm120_blk64`` backends.  When provided,
+            ``vsa_sm120_blk64``, and ``vsa_sm90_blk64`` backends.  When provided,
             ``indptr``/``indices`` are not required and will be ignored.
         kv_block_lens : torch.Tensor, optional
             Number of valid tokens in every KV block, shape ``(NB,)``. Entries
@@ -1132,10 +1133,76 @@ class BlockSparseAttentionWrapper:
             self._sm_scale = sm_scale
             return
 
+        # ---- VSA SM90 blk64 backend (sm90_blk64 CuTe-DSL kernel) ---------------
+        if self._backend == "vsa_sm90_blk64":
+            cc = get_compute_capability(self.device)
+            arch = cc[0] * 10 + cc[1]
+            if arch // 10 != 9:
+                raise RuntimeError(
+                    f"vsa_sm90_blk64 backend requires SM90, current device is SM{arch}"
+                )
+            if R != 64 or C != 64:
+                raise ValueError(
+                    f"vsa_sm90_blk64 backend requires R == C == 64 (got R={R}, C={C})"
+                )
+            if head_dim != 128:
+                raise ValueError(
+                    f"vsa_sm90_blk64 backend requires head_dim=128 (got {head_dim})"
+                )
+            if q_data_type not in (torch.float16, torch.bfloat16):
+                raise ValueError(
+                    "vsa_sm90_blk64 backend only supports float16 and bfloat16 inputs"
+                )
+            _vsa_common_checks(
+                "vsa_sm90_blk64",
+                R,
+                C,
+                M,
+                N,
+                num_qo_heads,
+                num_kv_heads,
+                mask,
+                packed_mask,
+                causal,
+                pos_encoding_mode,
+                logits_soft_cap,
+            )
+
+            MB = M // R
+            NB = N // C
+            # sm90 handles GQA natively via gqa_ratio; index is per QO head.
+            H = num_qo_heads
+
+            if block_mask is not None:
+                if block_mask.shape != (H, MB, NB):
+                    raise ValueError(
+                        f"block_mask must have shape (num_qo_heads={H}, MB={MB}, NB={NB}), "
+                        f"got {tuple(block_mask.shape)}"
+                    )
+                self._vsa_q2k_index, self._vsa_q2k_num = _block_mask_to_vsa_index(
+                    block_mask, self.device, non_blocking
+                )
+            else:
+                if indptr is None or indices is None:
+                    raise ValueError(
+                        "vsa_sm90_blk64 backend requires either block_mask or "
+                        "(indptr, indices) to be provided."
+                    )
+                self._vsa_q2k_index, self._vsa_q2k_num = _bsr_to_vsa_index(
+                    indptr, indices, MB, NB, H, self.device, non_blocking
+                )
+
+            self.M = M
+            self.N = N
+            self.R = R
+            self.C = C
+            self._sm_scale = sm_scale
+            return
+
         if block_mask is not None:
             raise ValueError(
                 "block_mask is only supported for the vsa_sm100_blk128, vsa_sm100_blk64, "
-                "and vsa_sm120_blk64 backends."
+                "vsa_sm120_blk64, and vsa_sm90_blk64 backends."
             )
         if indptr is None or indices is None:
             raise ValueError("indptr and indices are required for non-VSA backends.")
@@ -1517,6 +1584,25 @@ class BlockSparseAttentionWrapper:
 
             return _vsa_run_core(
                 bsa_attn_sm120_blk64_fwd,
+                q,
+                k,
+                v,
+                self._vsa_q2k_index,
+                self._vsa_q2k_num,
+                self._sm_scale,
+                out,
+                lse,
+                return_lse,
+            )
+
+        # ---- VSA SM90 blk64 backend (sm90_blk64 CuTe-DSL kernel) ---------------
+        if self._backend == "vsa_sm90_blk64":
+            from flashinfer.cute_dsl.sparse.bsa_attn_sm90 import (
+                bsa_attn_sm90_blk64_fwd,
+            )  # noqa: PLC0415
+
+            return _vsa_run_core(
+                bsa_attn_sm90_blk64_fwd,
                 q,
                 k,
                 v,
