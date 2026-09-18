@@ -1004,6 +1004,7 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False, page
                 cr_shift=cr_shift,
                 hint_free=hint_free,
                 pt_smem=pt_smem,
+                pdl=_DECODE_PDL,
                 **pg,
             )
         )
@@ -1026,6 +1027,7 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False, page
             tpl[:6] + (False,) + (next_n, cr_shift, r_const),
             hint_free=hint_free,
             pt_smem=pt_smem,
+            pdl=_DECODE_PDL,
             **pg,
         )
     )
