@@ -91,6 +91,26 @@ if TYPE_CHECKING:
     from .smem_block_sparse_metadata import SmemBlockSparseKvMetadataResource
 
 
+@cute.jit
+def _q_token_membership_keep_word16(
+    word0: Uint32,
+    word1: Uint32,
+    word2: Uint32,
+    word3: Uint32,
+    query_idx: Int32,
+) -> Uint32:
+    """Extract one query's membership bit from sixteen packed page bytes."""
+    keep_word = Uint32(0)
+    shift = query_idx & Int32(7)
+    words = (word0, word1, word2, word3)
+    for word_idx in cutlass.range_constexpr(4):
+        bits = (words[word_idx] >> shift) & Uint32(0x01010101)
+        # The disjoint partial products gather four byte bits without carries.
+        nibble = (bits * Uint32(0x01020408)) >> Uint32(24)
+        keep_word |= nibble << Uint32(word_idx * 4)
+    return cutlass.select_(Uint32(query_idx) < Uint32(8), keep_word, Uint32(0))
+
+
 def _paged_sparse_kv_tma_transaction_geometry(
     *,
     tile_size_kv: int,
@@ -1778,6 +1798,48 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
             stage_info, membership_idx
         )
         return membership_word
+
+    @cute.jit
+    def q_token_kv_block_sparse_page_keep_word16(
+        self,
+        stage_info: StageInfo,
+        local_tile_idx: Int32,
+        page_frag: Int32,
+        query_idx: Int32,
+    ) -> Uint32:
+        """Extract sixteen memberships, widening only padded SMEM reads."""
+        assert self.cfg.uses_q_token_kv_block_sparse_page_membership
+        assert not self.cfg.query_major_memberships
+        if cutlass.const_expr(self.cache_memberships_in_smem):
+            self._create_initial_task_locals(stage_info.context)
+            pages_per_tile = Int32(
+                self.cfg.tile_size_kv // self.cfg.num_tokens_per_page
+            )
+            word_idx = (local_tile_idx * pages_per_tile + page_frag) // Int32(4)
+            # Callers select aligned sixteen-page windows; the producer owns
+            # and initializes the full padded SMEM tile, including its tail.
+            words = (
+                self._smem_q_token_kv_block_sparse_memberships.subview(word_idx)
+                .data_ptr()
+                .load(count=4, alignment=16)
+            )
+            word0, word1, word2, word3 = words[0], words[1], words[2], words[3]
+        else:
+            # Public GMEM rows need not have sixteen readable tail bytes.
+            # Preserve the existing live-prefix checks for each packed word.
+            word0 = self.q_token_kv_block_sparse_page_membership_word4(
+                stage_info, local_tile_idx, page_frag
+            )
+            word1 = self.q_token_kv_block_sparse_page_membership_word4(
+                stage_info, local_tile_idx, page_frag + Int32(4)
+            )
+            word2 = self.q_token_kv_block_sparse_page_membership_word4(
+                stage_info, local_tile_idx, page_frag + Int32(8)
+            )
+            word3 = self.q_token_kv_block_sparse_page_membership_word4(
+                stage_info, local_tile_idx, page_frag + Int32(12)
+            )
+        return _q_token_membership_keep_word16(word0, word1, word2, word3, query_idx)
 
     @consumer_work(returns=cached_page_ids)
     @cute.jit

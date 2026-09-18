@@ -2996,6 +2996,64 @@ def test_attention_ts_decode_page4_encoded_subpages_all_tp_geometries(
     _assert_case_correct(one_shot, case)
 
 
+@_REQUIRES_PAGE4_PRIMTS_GPU
+def test_q_token_membership_keep_word16():
+    """Packed extraction preserves all query bits and the sixteen page positions."""
+    import cutlass.cute as cute
+    from cutlass import Int32, Uint32
+    from cutlass.cute.runtime import from_dlpack
+    from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_resources.smem_resources import (
+        _q_token_membership_keep_word16,
+    )
+
+    rows, queries, expected = [], [], []
+    # Every four-page pattern at every query bit, with both clear and set
+    # non-query bits. Distinct nibbles check ordering of the four packed words.
+    for other_bits in (0, 255):
+        for query in range(8):
+            for pattern in range(16):
+                keep = sum(
+                    ((pattern + 3 * word) % 16) << (4 * word) for word in range(4)
+                )
+                page_bytes = [
+                    (other_bits & ~(1 << query)) | (((keep >> page) & 1) << query)
+                    for page in range(16)
+                ]
+                rows.append(page_bytes)
+                queries.append(query)
+                expected.append(keep)
+    for query in (8, 15, 31, 32, 63):
+        rows.append([255] * 16)
+        queries.append(query)
+        expected.append(0)
+    words = torch.tensor(rows, dtype=torch.uint8, device="cuda").view(torch.int32)
+    query_indices = torch.tensor(queries, dtype=torch.int32, device="cuda")
+    output = torch.empty(len(rows), dtype=torch.int32, device="cuda")
+
+    @cute.kernel
+    def extract(words: cute.Tensor, queries: cute.Tensor, output: cute.Tensor):
+        i = cute.arch.thread_idx()[0] + cute.arch.block_idx()[0] * 128
+        if i < output.shape[0]:
+            output[i] = Int32(
+                _q_token_membership_keep_word16(
+                    Uint32(words[i, 0]),
+                    Uint32(words[i, 1]),
+                    Uint32(words[i, 2]),
+                    Uint32(words[i, 3]),
+                    queries[i],
+                )
+            )
+
+    @cute.jit
+    def launch(words: cute.Tensor, queries: cute.Tensor, output: cute.Tensor):
+        extract(words, queries, output).launch(grid=(3, 1, 1), block=(128, 1, 1))
+
+    launch(from_dlpack(words), from_dlpack(query_indices), from_dlpack(output))
+    torch.testing.assert_close(
+        output, torch.tensor(expected, dtype=torch.int32, device="cuda"), atol=0, rtol=0
+    )
+
+
 @pytest.mark.arch_blackwell
 @_REQUIRES_PAGE4_PRIMTS_GPU
 @pytest.mark.parametrize(

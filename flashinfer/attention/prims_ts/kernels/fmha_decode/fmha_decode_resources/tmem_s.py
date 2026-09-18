@@ -958,6 +958,16 @@ class TmemSResource(DecodeGenResourceBase):
         keep_word = Uint32(0)
         page_span = min(cfg.num_tokens_per_page, cfg.num_s_regs_per_thread)
         pages_per_lane = cfg.num_s_regs_per_thread // page_span
+        if cutlass.const_expr(pages_per_lane >= 16):
+            for vector_idx in cutlass.range_constexpr(pages_per_lane // 16):
+                bits = self.page_offsets_ref.q_token_kv_block_sparse_page_keep_word16(
+                    stage_info,
+                    local_tile_idx,
+                    col_base // Int32(cfg.num_tokens_per_page) + Int32(vector_idx * 16),
+                    q_token_idx,
+                )
+                keep_word |= bits << Uint32(vector_idx * 16)
+            return keep_word
         for page_vector_idx in cutlass.range_constexpr(pages_per_lane // 4):
             memberships = (
                 self.page_offsets_ref.q_token_kv_block_sparse_page_membership_word4(
