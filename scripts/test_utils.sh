@@ -19,6 +19,9 @@ if [ -z "${MAX_JOBS:-}" ]; then
     else
         MAX_JOBS=$_num_cpus
     fi
+    # signal that the computed MAX_JOBS is a host-wide quota to share between all workers
+    FLASHINFER_AUTO_MAX_JOBS=1
+    export FLASHINFER_AUTO_MAX_JOBS
     unset _num_cpus _mem_gb
 fi
 export MAX_JOBS
