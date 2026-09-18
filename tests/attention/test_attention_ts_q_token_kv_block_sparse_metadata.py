@@ -1005,6 +1005,10 @@ def test_q_token_kv_block_sparse_sort_union_matches_reference(
         (4, False, 16_385),
         (3, True, 128 * 1024),
         (8, False, 128 * 1024),
+        # Bit maps, dynamic-SMEM opt-in, and the bounded-sort fallback.
+        (4, False, 1024 * 1024 + 1),
+        (2, True, 4 * 1024 * 1024),
+        (8, False, 8 * 1024 * 1024),
     ),
 )
 def test_q_token_kv_block_sparse_sort_union_wide_context_matches_reference(
@@ -1050,6 +1054,63 @@ def test_q_token_kv_block_sparse_sort_union_wide_context_matches_reference(
         qo_indptr,
     )
     _assert_metadata_matches(actual, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_q_token_kv_block_sparse_wide_model_many_routes() -> None:
+    """Changing map/sort occupancy must preserve the same logical union."""
+    group_size, model_bound, copies = 5, 4 * 1024 * 1024, 128
+    blocks, table, requests, positions, page_size, offsets = _make_wide_sort_union_case(
+        group_size, False, model_bound
+    )
+    expected = _reference(
+        blocks, table, requests, positions, page_size, group_size, offsets
+    )
+    actual = build_prims_ts_q_token_kv_block_sparse_metadata(
+        blocks.repeat(copies, 1),
+        table,
+        requests.repeat(copies),
+        positions.repeat(copies),
+        group_size=group_size,
+        storage_page_size=page_size,
+        max_seq_len_kv=model_bound,
+    )
+    _assert_metadata_matches(
+        actual,
+        tuple(
+            tensor.repeat((copies,) + (1,) * (tensor.ndim - 1)) for tensor in expected
+        ),
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_q_token_kv_block_sparse_ignores_nonlive_indexer_entries() -> None:
+    """Grouped metadata must not prefetch an unwritten indexer suffix."""
+    group_size, topk, page_size = 5, 512, 16
+    blocks = torch.empty((group_size, topk), dtype=torch.int32, device="cuda")
+    blocks[3:, 0] = 0
+    table = torch.zeros((1, 1), dtype=torch.int32, device="cuda")
+    requests = torch.zeros(group_size, dtype=torch.int32, device="cuda")
+    positions = torch.arange(group_size, dtype=torch.int32, device="cuda")
+    actual = build_prims_ts_q_token_kv_block_sparse_metadata(
+        blocks,
+        table,
+        requests,
+        positions,
+        group_size=group_size,
+        storage_page_size=page_size,
+        max_seq_len_kv=page_size,
+    )
+    expected = _reference(
+        torch.zeros_like(blocks, device="cpu"),
+        table.cpu(),
+        requests.cpu(),
+        positions.cpu(),
+        page_size,
+        group_size,
+        None,
+    )
+    _assert_metadata_matches(actual, tuple(tensor.to("cuda") for tensor in expected))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

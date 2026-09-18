@@ -143,6 +143,8 @@ The convenience API infers physical page size from `paged_kv_cache`; only
 the prepared wrapper's `plan` takes `page_size` explicitly.
 
 On SM90 and newer, the combined route-builder and attention launch use PDL.
+Metadata releases at entry so the attention prologue can overlap it; the
+attention dependency wait still covers all metadata stores.
 Attention initializes its independent resources before acquiring immediately
 ahead of the first metadata-dependent read. Split-KV attention releases its
 reducer only after producer completion and TMEM teardown; the reducer

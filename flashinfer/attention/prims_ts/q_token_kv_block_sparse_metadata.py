@@ -24,11 +24,12 @@ sparse block size explicitly: 4, 8, 16, 32, 64, or 128 tokens.
 Patterns can be shared across KV heads or supplied independently for each head.
 
 Construction uses one CUDA C++ CTA per route. Q1 maps selected and tail blocks
-directly. Q2--Q8 radix-sort at most ``G * (topk + 1)`` selected/tail IDs,
-segmented-OR equal-key memberships, and emit only unique pages; work and
-temporary storage are independent of the model context length. On SM90 and
-newer, the metadata grid releases the prepared attention grid through
-programmatic dependent launch (PDL).
+directly. Q2--Q8 union at most ``G * (topk + 1)`` selected/tail IDs using a
+shared byte/bit map when its model-context footprint fits without adding CTA
+waves, or a bounded radix-sort fallback. No global-cache-sized scratch is
+required. On SM90 and newer, the metadata grid releases the attention prologue
+at entry through programmatic dependent launch (PDL); the consumer wait still
+covers metadata completion.
 """
 
 from __future__ import annotations
@@ -1317,11 +1318,12 @@ def _build_prims_ts_q_token_kv_block_sparse_metadata(
     The membership output has one Int32 word per four page slots, or zero
     columns for Q1.
     Q1 uses one CUDA C++ CTA per route to map its selected blocks and causal
-    tail directly. Q2--Q8 use one CUDA C++ CTA per route to radix-sort the
-    bounded ``group_size * (block_topk + 1)`` candidates, unique them while
-    OR-reducing membership bits, and map the resulting logical pages through
-    the dense block table. The terminal metadata grid releases a following
-    PDL-capable QToken-KvBlock-Sparse-Attention attention launch when requested by the combined API.
+    tail directly. Q2--Q8 union the bounded
+    ``group_size * (block_topk + 1)`` candidates with a shared map or radix
+    sort, OR membership bits, and map the sorted unique logical blocks through
+    the dense block table. A map is used only when it fits shared memory and
+    requires no extra CTA waves. The combined API releases attention at
+    metadata entry; the consumer wait still covers every output store.
     Packed ``qo_indptr`` must be an Int32 device copy of CPU-validated route
     offsets; this builder checks only its structural tensor contract and does
     not read route values back to the host.
@@ -1449,7 +1451,7 @@ def _build_q_token_kv_block_sparse_metadata(
     physical_page * (storage_page_size/F) + subpage. No CSR conversion is needed.
 
     Q1 uses one CUDA C++ direct-mapping kernel. Q2--Q8 use one CUDA C++
-    radix-sort and union kernel per route. Neither path requires
+    map-or-sort union kernel per route. Neither path requires
     caller-provided scratch. Advanced callers that capture this raw path must
     preallocate ``out``, warm the same metadata geometry once before capture,
     and retain every tensor at a stable address through replay. The three
