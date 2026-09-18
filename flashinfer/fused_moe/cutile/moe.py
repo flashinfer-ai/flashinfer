@@ -36,6 +36,12 @@ import torch
 from ...cutile.cutile_common import cached_replace_hints
 from ...utils import next_positive_power_of_2
 from ..api import ActivationConfig
+from ..utils import (
+    _CUTILE_PERMUTE_SMALL_MAX_ASSIGNMENTS as _PERMUTE_SMALL_MAX_ASSIGNMENTS,
+    _CUTILE_PERMUTE_TILE_CAP as _PERMUTE_TILE_CAP,
+    _cutile_max_permuted_rows as _max_permuted_rows,
+    _cutile_permute_shape as _permute_shape,
+)
 from .activation import (
     _activation_kernel_args,
     _apply_ungated_activation,
@@ -48,9 +54,6 @@ ConstFloat: TypeAlias = ct.Constant[float]
 ConstInt: TypeAlias = ct.Constant[int]
 ConstBool: TypeAlias = ct.Constant[bool]
 
-_PERMUTE_TILE_CAP = 16384
-# A single-CTA histogram avoids multi-stage routing overhead at decode sizes.
-_PERMUTE_SMALL_MAX_ASSIGNMENTS = 24
 _NO_ACTIVATION = -1
 
 
@@ -78,25 +81,6 @@ class Workspace:
     gemm1_out: torch.Tensor
     activation_out: torch.Tensor
     gemm2_out: torch.Tensor
-
-
-def _permute_shape(num_assignments: int, num_experts: int) -> tuple[int, int, int]:
-    epow2 = next_positive_power_of_2(num_experts)
-    max_chunk = max(8, _PERMUTE_TILE_CAP // epow2)
-    target_chunks = max(8, _PERMUTE_TILE_CAP // (4 * epow2))
-    chunk = min(
-        max(8, max_chunk // 2),
-        max(8, next_positive_power_of_2(num_assignments) // target_chunks),
-    )
-    if 32 * max_chunk <= num_assignments < 128 * max_chunk:
-        # Bound the histogram count after the initial parallelism ramp.
-        chunk = max_chunk
-    elif num_assignments >= 128 * max_chunk:
-        # Reintroduce chunks to expose enough CTAs for large routing batches.
-        chunk = min(32, max(8, max_chunk // 2))
-    num_chunks = max(1, (num_assignments + chunk - 1) // chunk)
-    ncp = next_positive_power_of_2(num_chunks)
-    return epow2, chunk, ncp
 
 
 def _permute_workspace_shape(
@@ -133,17 +117,6 @@ def _permute_workspace_shape(
     return epow2, max_ncp, max_num_slabs
 
 
-def _max_permuted_rows(
-    num_assignments: int, num_experts: int, block_size: int
-) -> int:
-    """Upper-bound expert-padded rows without charging empty experts.
-
-    Every nonempty expert adds at most ``block_size - 1`` padding rows, and
-    there can be no more nonempty experts than routing assignments.
-    """
-    return num_assignments + min(num_assignments, num_experts) * (block_size - 1)
-
-
 def allocate_workspace(
     *,
     num_tokens: int,
@@ -173,11 +146,7 @@ def allocate_workspace(
         for block_size in block_sizes
     )
     max_blocks = max(
-        (
-            _max_permuted_rows(num_assignments, num_experts, block_size)
-            + block_size
-            - 1
-        )
+        (_max_permuted_rows(num_assignments, num_experts, block_size) + block_size - 1)
         // block_size
         for block_size in block_sizes
     )

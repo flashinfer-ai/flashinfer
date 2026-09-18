@@ -17,6 +17,10 @@
 Activation precision is identical for both GEMMs. A8 accepts BF16 at the API
 boundary and quantizes each GEMM input dynamically: one E4M3 scale per tensor,
 or one E8M0 scale per 32 values for MXFP8. A16 never quantizes activations.
+
+Request-size values remain runtime kernel parameters so serving workloads do
+not create one compiled binary per token count. Only model and tactic choices
+are compile-time constants.
 """
 
 from dataclasses import dataclass
@@ -652,7 +656,7 @@ def _sorted_gemm_tile(
     SCATTER: ConstBool,
     WRITE_AMAX: ConstBool,
     GRID_N: ConstInt,
-    ASSIGNMENTS: ConstInt,
+    assignments,
 ):
     padded = ct.load(POST_PAD, (0,), (1,)).item()
     if mblock * TM < padded:
@@ -857,7 +861,7 @@ def _sorted_gemm_tile(
                 check_bounds=True,
             )
         else:
-            values = ct.where(ct.reshape(slots < ASSIGNMENTS, (TM, 1)), values, 0)
+            values = ct.where(ct.reshape(slots < assignments, (TM, 1)), values, 0)
             ct.store(OUT, (mblock, nblock), values)
 
 
@@ -887,7 +891,7 @@ def _sorted_grouped_impl(
     SCATTER: ConstBool,
     WRITE_AMAX: ConstBool,
     GRID_N: ConstInt,
-    ASSIGNMENTS: ConstInt,
+    assignments,
 ):
     _sorted_gemm_tile(
         X,
@@ -916,7 +920,7 @@ def _sorted_grouped_impl(
         SCATTER,
         WRITE_AMAX,
         GRID_N,
-        ASSIGNMENTS,
+        assignments,
     )
 
 
@@ -946,7 +950,7 @@ def _sorted_grouped(
     SCATTER: ConstBool,
     WRITE_AMAX: ConstBool,
     GRID_N: ConstInt,
-    ASSIGNMENTS: ConstInt,
+    assignments,
 ):
     _sorted_grouped_impl(
         X,
@@ -973,7 +977,7 @@ def _sorted_grouped(
         SCATTER,
         WRITE_AMAX,
         GRID_N,
-        ASSIGNMENTS,
+        assignments,
     )
 
 
@@ -1003,7 +1007,7 @@ def _sorted_grouped_i64(
     SCATTER: ConstBool,
     WRITE_AMAX: ConstBool,
     GRID_N: ConstInt,
-    ASSIGNMENTS: ConstInt,
+    assignments,
 ):
     _sorted_grouped_impl(
         X,
@@ -1030,7 +1034,7 @@ def _sorted_grouped_i64(
         SCATTER,
         WRITE_AMAX,
         GRID_N,
-        ASSIGNMENTS,
+        assignments,
     )
 
 
@@ -1045,7 +1049,7 @@ def _sorted_grouped_persistent(
     SLOTS,
     OUT,
     AMAX_PARTIAL,
-    GRID_M: ConstInt,
+    grid_m,
     TM: ConstInt,
     TN: ConstInt,
     TK: ConstInt,
@@ -1061,10 +1065,10 @@ def _sorted_grouped_persistent(
     SCATTER: ConstBool,
     WRITE_AMAX: ConstBool,
     GRID_N: ConstInt,
-    ASSIGNMENTS: ConstInt,
+    assignments,
 ):
     padded = ct.load(POST_PAD, (0,), (1,)).item()
-    iterations = (ct.cdiv(padded, TM) - ct.bid(0) + GRID_M - 1) // GRID_M
+    iterations = (ct.cdiv(padded, TM) - ct.bid(0) + grid_m - 1) // grid_m
     for iteration in range(iterations):
         _sorted_gemm_tile(
             X,
@@ -1076,7 +1080,7 @@ def _sorted_grouped_persistent(
             SLOTS,
             OUT,
             AMAX_PARTIAL,
-            ct.bid(0) + iteration * GRID_M,
+            ct.bid(0) + iteration * grid_m,
             ct.bid(1),
             TM,
             TN,
@@ -1093,7 +1097,7 @@ def _sorted_grouped_persistent(
             SCATTER,
             WRITE_AMAX,
             GRID_N,
-            ASSIGNMENTS,
+            assignments,
         )
 
 
@@ -1337,7 +1341,7 @@ def _grouped_impl(
     POST_PAD,
     OUT,
     TOP_K: ConstInt,
-    GRID_M: ConstInt,
+    grid_m,
     K: ConstInt,
     TM: ConstInt,
     TN: ConstInt,
@@ -1354,9 +1358,9 @@ def _grouped_impl(
     padded = ct.load(POST_PAD, (0,), (1,)).item()
     nblock = ct.bid(1)
     ns = ct.reshape(nblock * TN + ct.arange(TN, dtype=ct.int32), (1, TN))
-    iterations = (ct.cdiv(padded, TM) - ct.bid(0) + GRID_M - 1) // GRID_M
+    iterations = (ct.cdiv(padded, TM) - ct.bid(0) + grid_m - 1) // grid_m
     for iteration in range(iterations):
-        mblock = ct.bid(0) + iteration * GRID_M
+        mblock = ct.bid(0) + iteration * grid_m
         if mblock * TM < padded:
             expert = ct.load(EXPERTS, (mblock,), (1,)).item()
             slots = ct.load(SLOTS, (mblock,), (TM,), padding_mode=ct.PaddingMode.ZERO)
@@ -1471,7 +1475,7 @@ def _grouped(
     POST_PAD,
     OUT,
     TOP_K: ConstInt,
-    GRID_M: ConstInt,
+    grid_m,
     K: ConstInt,
     TM: ConstInt,
     TN: ConstInt,
@@ -1494,7 +1498,7 @@ def _grouped(
         POST_PAD,
         OUT,
         TOP_K,
-        GRID_M,
+        grid_m,
         K,
         TM,
         TN,
@@ -1521,7 +1525,7 @@ def _grouped_i64(
     POST_PAD,
     OUT: ct.IndexedWithInt64,
     TOP_K: ConstInt,
-    GRID_M: ConstInt,
+    grid_m,
     K: ConstInt,
     TM: ConstInt,
     TN: ConstInt,
@@ -1544,7 +1548,7 @@ def _grouped_i64(
         POST_PAD,
         OUT,
         TOP_K,
-        GRID_M,
+        grid_m,
         K,
         TM,
         TN,

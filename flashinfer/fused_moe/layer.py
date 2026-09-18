@@ -374,6 +374,7 @@ class MoELayer:
         best_time_ms = float("inf")
         best_runner: Optional[_RunnerT] = None
         best_tactic: Any = -1
+        best_inputs: Optional[List[torch.Tensor]] = None
 
         for runner in runners:
             inputs = runner.pack_inputs(act_pack, weight_pack)
@@ -405,8 +406,16 @@ class MoELayer:
                 best_time_ms = t_ms
                 best_runner = runner
                 best_tactic = tactic
+                best_inputs = inputs
 
         assert best_runner is not None  # runners is non-empty (checked by caller)
+        assert best_inputs is not None
+        precompile = getattr(best_runner, "_precompile_bucket_variants", None)
+        if precompile is not None:
+            # cuTile has a finite set of JIT dispatch variants inside each
+            # autotune bucket. Compile them as part of selecting that bucket's
+            # winner so ordinary serving calls need no separate warmup API.
+            precompile(best_inputs, best_tactic)
         return best_runner, best_tactic
 
     # ---- Introspection helpers ---------------------------------------------
