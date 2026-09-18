@@ -81,6 +81,7 @@ def _get_cuda_graph_resources() -> _CudaGraphResources:
 def _sm90_moe_autotune_op_name(
     activation_type: int, situ_beta: Optional[float] = None
 ) -> str:
+    """Autotuner op name for one activation family (separate tuning caches)."""
     activation, _ = normalize_cute_dsl_moe_activation_type(activation_type)
     activation_name = "Situ" if situ_beta is not None else activation.name
     return f"CuteDslFusedMoE::run_moe_sm90::{activation_name}"
@@ -465,7 +466,9 @@ class CuteDslBf16MoEWrapper:
             top_k: Experts per token.
             hidden_size: Model hidden dimension.
             intermediate_size: Per-rank expert intermediate dimension
-                (``w1_weight`` is ``[E_local, 2*intermediate, hidden]`` interleaved,
+                (``w1_weight`` is ``[E_local, 2*intermediate, hidden]``
+                interleaved for gated activations or
+                ``[E_local, intermediate, hidden]`` for ``Relu2``;
                 ``w2_weight`` is ``[E_local, hidden, intermediate]``).
             num_local_experts: Experts held by this rank (EP shard);
                 defaults to ``num_experts``.
@@ -478,11 +481,14 @@ class CuteDslBf16MoEWrapper:
             use_fused_finalize: True (default) fuses the router-scaled
                 scatter-reduce into GEMM2; False selects the
                 bitwise-reproducible two-stage finalize.
-            activation_type, swiglu_alpha, swiglu_beta, swiglu_limit,
-            situ_beta, situ_linear_beta: GEMM1 activation and its constants;
-                see :func:`cute_dsl_fused_moe_bf16`. ``intermediate_size`` is
-                ``w1_weight.shape[1] // 2`` for gated activations and
-                ``w1_weight.shape[1]`` for ``Relu2``.
+            activation_type: GEMM1 activation (``ActivationType.Swiglu``,
+                ``GegluTanh`` or ``Relu2``); see :func:`cute_dsl_fused_moe_bf16`.
+            swiglu_alpha: SwiGLU sigmoid multiplier (``Swiglu`` only).
+            swiglu_beta: SwiGLU up-projection bias (``Swiglu`` only).
+            swiglu_limit: SwiGLU clamp limit (``Swiglu`` only).
+            situ_beta: With ``Swiglu``, selects the SiTU gate with this scale.
+            situ_linear_beta: Optional SiTU tanh clamp of the up branch
+                (requires ``situ_beta``).
         """
         activation, _ = normalize_cute_dsl_moe_activation_type(activation_type)
         validate_cute_dsl_moe_situ_config(activation, situ_beta, situ_linear_beta)

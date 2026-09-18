@@ -970,6 +970,7 @@ def test_sm90_moe_rejects_mismatched_row_tiles(tactic):
 
 
 def _moe_activation_cases():
+    """Non-default activation configs exercised end to end."""
     from flashinfer.fused_moe import GeGLUTanh, ReLU2, SiTU, SwiGLU
 
     return [
@@ -1107,6 +1108,12 @@ def test_sm90_moe_runner_rejects_bad_activation_config():
         make(activation_type=ActivationType.GegluTanh.value, situ_beta=4.0)
     with pytest.raises(ValueError, match="positive and finite"):
         make(situ_beta=-1.0)
+    # Positive finite in f64 but 0.0 / inf after fp32 rounding.
+    for bad_scale in (1e-50, 1e39):
+        with pytest.raises(ValueError, match="situ_beta must be positive"):
+            make(situ_beta=bad_scale)
+        with pytest.raises(ValueError, match="situ_linear_beta must be positive"):
+            make(situ_beta=4.0, situ_linear_beta=bad_scale)
     assert make(activation_type=ActivationType.Relu2.value).gated is False
     assert make().gated is True
 

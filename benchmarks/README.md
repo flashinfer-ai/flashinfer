@@ -625,7 +625,7 @@ Backend Legend:
 - trtllm-native: TensorRT-LLM (out-of-wrapper)
 - prims-ts: Experimental task-scheduled attention kernels (Blackwell SM100/SM103)
 - cuda: FlashInfer CUDA kernels
-- cute-dsl: FlashInfer CuTe-DSL kernels (Blackwell SM10.0+)
+- cute-dsl: FlashInfer CuTe-DSL kernels (Hopper SM90; Blackwell SM100+)
 - cute-dsl-prims: SM120 PRIMS FP8 batch-prefill kernels. Ragged inputs use
   packed NHD storage, while paged K/V uses HND storage. Paged attention accepts
   the standard combined cache or separate K/V pools without copying. The

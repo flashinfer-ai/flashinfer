@@ -400,6 +400,7 @@ class CuteDslFusedMoESm90Runner(TunableRunner):
         return tactics
 
     def _activation_key(self) -> Tuple[Any, ...]:
+        """Activation parameters that select a distinct GEMM1 epilogue."""
         return (
             "activation_type",
             self.activation_type,
@@ -416,6 +417,7 @@ class CuteDslFusedMoESm90Runner(TunableRunner):
         )
 
     def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> Tuple[Any, ...]:
+        """Extra autotune cache-key fields beyond the input shapes."""
         return (
             "input_dtype",
             str(inputs[0].dtype),
@@ -469,6 +471,7 @@ class CuteDslFusedMoESm90Runner(TunableRunner):
         )
 
     def __hash__(self):
+        """Runner identity for the autotuner: routing, finalize, PDL and activation."""
         return hash(
             (
                 "cute_dsl_fused_moe_bf16",

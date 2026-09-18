@@ -194,6 +194,7 @@ def test_cute_dsl_bf16_gather_grouped_gemm_swizzled_walk(swizzle_size):
 
 
 def _activation_cases():
+    """Activation configs exercised by the gather GEMM epilogue tests."""
     from flashinfer.fused_moe import GeGLUTanh, ReLU2, SiTU, SwiGLU
 
     return [

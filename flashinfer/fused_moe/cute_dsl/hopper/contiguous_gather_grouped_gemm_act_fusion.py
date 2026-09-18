@@ -279,6 +279,7 @@ class Sm90ContiguousGatherGroupedGemmActFusionKernel:
         )
 
     def _setup_attributes(self):
+        """Derive the tiled MMA, SMEM layouts, copy atoms and stage counts."""
         self.tiled_mma = sm90_utils.make_trivial_tiled_mma(
             self.a_dtype,
             self.b_dtype,
@@ -471,6 +472,7 @@ class Sm90ContiguousGatherGroupedGemmActFusionKernel:
         epi_smem_layout_staged: cute.ComposedLayout,
         tile_sched_params: utils.PersistentTileSchedulerParams,
     ):
+        """Persistent warp-specialized gather GEMM with the fused activation epilogue."""
         tidx, _, _ = cute.arch.thread_idx()
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)

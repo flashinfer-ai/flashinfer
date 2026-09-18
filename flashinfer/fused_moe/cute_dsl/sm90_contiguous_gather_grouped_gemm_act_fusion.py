@@ -210,9 +210,10 @@ def sm90_contiguous_gather_grouped_gemm_act_fusion(
             ``[num_local_experts, 2I, k]`` with up/gate interleaved at 32
             columns (see :func:`interleave_up_gate_sm90`). Non-gated:
             ``[num_local_experts, I, k]``, no interleave.
-        tile_idx_to_expert_idx / tile_idx_to_mn_limit /
-        num_non_exiting_tiles: ``moe_sort`` outputs (tile size =
-            ``tile_shape_mn[0]``).
+        tile_idx_to_expert_idx: ``moe_sort`` output, local expert per tile
+            (tile size = ``tile_shape_mn[0]``).
+        tile_idx_to_mn_limit: ``moe_sort`` output, valid-row limit per tile.
+        num_non_exiting_tiles: ``moe_sort`` output, number of live tiles.
         token_id_mapping: ``moe_sort``'s ``permuted_idx_to_expanded_idx``
             (``[permuted_m]`` int32; garbage on padding rows).
         out: Optional ``[permuted_m, I]`` output. Padding rows hold garbage.
@@ -220,9 +221,12 @@ def sm90_contiguous_gather_grouped_gemm_act_fusion(
         permuted_m: ``max_num_tiles * tile_m`` (padded row count).
         tile_shape_mn: CTA tile over the accumulator (for gated activations
             N counts up+gate columns); ``tile_n % 64 == 0``.
+        cluster_shape_mn: CTA cluster, ``(1, 1)`` or a ``(2, 1)`` M-pair.
         swizzle_size: Persistent-walk swizzle — groups the tile walk into
             blocks of this many M-tiles so each expert's B streams once per
             block instead of once per M-tile row (1 = plain N-fast walk).
+        raster_along_m: Walk the tile grid M-fast instead of N-fast.
+        enable_pdl: Launch with Programmatic Dependent Launch.
         activation_type: ``ActivationType.Swiglu`` (default; the OAI variant
             through ``swiglu_alpha``/``swiglu_beta``/``swiglu_limit``, SiTU
             through ``situ_beta``), ``ActivationType.GegluTanh`` or the
