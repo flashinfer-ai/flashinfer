@@ -47,12 +47,15 @@ def llama_rms_norm_quant(x, w, scale, quant_dtype, eps=1e-6):
     return x
 
 
-def layer_norm_quant(x, gamma, beta, scale, quant_dtype, eps=1e-6):
+def layer_norm_quant(x, gamma, beta, scale, quant_dtype, eps=1e-6, round_to_input=True):
     y = torch.nn.functional.layer_norm(
         x.float(), (x.shape[-1],), weight=gamma, bias=beta, eps=eps
     )
-    # Kernel rounds to input dtype before scaling; match it.
-    y = y.to(x.dtype).float() / scale
+    # The CUDA kernel rounds to input dtype before scaling; the CuTe-DSL
+    # kernel stays in fp32.
+    if round_to_input:
+        y = y.to(x.dtype)
+    y = y.float() / scale
     finfo = torch.finfo(quant_dtype)
     y = torch.clamp(y, finfo.min, finfo.max)
     return y.to(quant_dtype)
@@ -500,7 +503,23 @@ def test_layernorm(batch_size, hidden_size, dtype):
 @pytest.mark.parametrize("hidden_size", [111, 500, 1024, 3072, 4096, 8192, 16384])
 @pytest.mark.parametrize("quant_scale", [0.01, 1.0, 10.0])
 @pytest.mark.parametrize("quant_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
-def test_layernorm_quant(batch_size, hidden_size, quant_scale, quant_dtype):
+@pytest.mark.parametrize("backend", ["cuda", "cute-dsl"])
+def test_layernorm_quant(
+    batch_size, hidden_size, quant_scale, quant_dtype, backend, monkeypatch
+):
+    if backend == "cuda":
+        monkeypatch.setattr(flashinfer.norm, "_USE_CUDA_NORM", True)
+    elif not hasattr(flashinfer.norm, "layernorm_quant_cute"):
+        pytest.skip("nvidia-cutlass-dsl not available")
+    elif not flashinfer.norm._cute_dsl_supports_arch(
+        *torch.cuda.get_device_capability()
+    ):
+        pytest.skip("CuTe DSL cannot target this compute capability")
+    else:
+        # Dispatch also honors FLASHINFER_USE_CUDA_NORM from the environment;
+        # pin it so this branch really exercises the DSL kernel.
+        monkeypatch.setattr(flashinfer.norm, "_use_cuda_norm", lambda _device: False)
+
     # The check bounds the fraction of drifting elements, so fix the seed.
     torch.manual_seed(0)
     x = torch.randn(batch_size, hidden_size, dtype=torch.bfloat16, device="cuda")
@@ -508,7 +527,9 @@ def test_layernorm_quant(batch_size, hidden_size, quant_scale, quant_dtype):
     beta = torch.randn(hidden_size, dtype=torch.float32, device="cuda")
     scale = torch.tensor([quant_scale], dtype=torch.float32, device="cuda")
 
-    y_ref = layer_norm_quant(x, gamma, beta, scale, quant_dtype)
+    y_ref = layer_norm_quant(
+        x, gamma, beta, scale, quant_dtype, round_to_input=(backend == "cuda")
+    )
     y = torch.empty_like(x, dtype=quant_dtype)
     flashinfer.norm.layernorm_quant(y, x, gamma, beta, scale)
 
@@ -519,7 +540,21 @@ def test_layernorm_quant(batch_size, hidden_size, quant_scale, quant_dtype):
     assert default_check([y_ref], [y], max_mismatch_pct=1.0, min_cos_sim=None)
 
 
-def test_layernorm_quant_invalid_inputs():
+@pytest.mark.parametrize("backend", ["cuda", "cute-dsl"])
+def test_layernorm_quant_invalid_inputs(backend, monkeypatch):
+    if backend == "cuda":
+        monkeypatch.setattr(flashinfer.norm, "_USE_CUDA_NORM", True)
+    elif not hasattr(flashinfer.norm, "layernorm_quant_cute"):
+        pytest.skip("nvidia-cutlass-dsl not available")
+    elif not flashinfer.norm._cute_dsl_supports_arch(
+        *torch.cuda.get_device_capability()
+    ):
+        pytest.skip("CuTe DSL cannot target this compute capability")
+    else:
+        # Dispatch also honors FLASHINFER_USE_CUDA_NORM from the environment;
+        # pin it so this branch really exercises the DSL kernel.
+        monkeypatch.setattr(flashinfer.norm, "_use_cuda_norm", lambda _device: False)
+
     batch_size, hidden_size = 8, 1024
     x = torch.randn(batch_size, hidden_size, dtype=torch.bfloat16, device="cuda")
     gamma = torch.randn(hidden_size, dtype=torch.float32, device="cuda")
