@@ -48,7 +48,13 @@ _BYTES_PER_TOKEN = 384
 _CANDIDATES_PER_CHUNK = 64
 _DECODE_MAX_TOKENS = 64
 _SUPPORTED_HEADS = frozenset({16, 32, 64, 128})
-_SUPPORTED_PRIMARY_TOPKS = frozenset({128, 512})
+# The primary top-k is a runtime kernel argument (the indices-row width), so
+# any width >= _MIN_PRIMARY_TOPK dispatches; ragged tails are masked by the
+# kernels. _CALIBRATED_PRIMARY_TOPKS are the widths with measured crossover
+# data, published through ``supported_sparse_mla_sm120_configs()``; other
+# widths take the decode-first fallback until a tuning pass measures them.
+_MIN_PRIMARY_TOPK = 1
+_CALIBRATED_PRIMARY_TOPKS = frozenset({128, 512})
 _SUPPORTED_PRIMARY_PAGE_SIZES = frozenset({64})
 _SUPPORTED_EXTRA_PAGE_SIZES = frozenset({2, 64})
 
@@ -170,7 +176,7 @@ def _eligible(
     common = (
         num_tokens >= 1
         and num_heads in _SUPPORTED_HEADS
-        and topk in _SUPPORTED_PRIMARY_TOPKS
+        and topk >= _MIN_PRIMARY_TOPK
         and primary_page_size in _SUPPORTED_PRIMARY_PAGE_SIZES
         and (
             (extra_topk == 0 and extra_page_size == 0)

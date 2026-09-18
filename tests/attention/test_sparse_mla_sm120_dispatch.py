@@ -129,7 +129,7 @@ def test_supported_configs_families() -> None:
 
 
 def test_supported_configs_nvfp4_envelope() -> None:
-    """The shared query API exposes the exact, independently keyed NVFP4 set."""
+    """The shared query API exposes the NVFP4 envelope: exact heads, runtime top-k."""
     configs = supported_sparse_mla_sm120_configs(kv_cache_format="nvfp4")
     assert set(configs) == {"dsv4"}
     dsv4 = configs["dsv4"]
@@ -138,9 +138,14 @@ def test_supported_configs_nvfp4_envelope() -> None:
     assert dsv4.supported_num_heads() == (16, 32, 64, 128)
     assert dsv4.supported_topk() == (128, 512)
     assert dsv4.extra_page_block_sizes == frozenset({2, 64})
+    assert dsv4.topk_is_runtime
+    assert dsv4.min_topk == 1
     assert dsv4.supports_decode(64, 128)
     assert not dsv4.supports_decode(8, 128)
-    assert not dsv4.supports_decode(64, 256)
+    assert dsv4.supports_decode(64, 256)
+    assert dsv4.supports_decode(16, 1152)
+    assert dsv4.supports_decode(128, 389)
+    assert not dsv4.supports_decode(64, 0)
 
     with pytest.raises(ValueError, match="kv_cache_format"):
         supported_sparse_mla_sm120_configs(kv_cache_format="int4")

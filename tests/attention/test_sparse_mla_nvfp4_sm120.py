@@ -632,13 +632,20 @@ def test_nvfp4_sparse_mla_rejects_strided_optional_tensors(
 
 
 @pytest.mark.parametrize(
-    "topk,chunks_per_block,topk_len", [(128, 2, 111), (512, 6, 389)]
+    "topk,chunks_per_block,topk_len",
+    [
+        (128, 2, 111),
+        (512, 6, 389),
+        (192, 2, 192),
+        (500, 4, 461),
+        (1152, 9, 1100),
+    ],
 )
 @pytest.mark.parametrize("with_sink", [False, True])
 def test_nvfp4_sparse_mla_decode_matches_dequantized_reference(
     topk: int, chunks_per_block: int, topk_len: int, with_sink: bool
 ) -> None:
-    """Cover the direct and two-split epilogues with online quantization."""
+    """Cover the direct and split epilogues with online quantization."""
     _require_sm120()
     torch.manual_seed(20260902 + topk + int(with_sink))
     num_tokens, num_heads = 2, 128
@@ -717,6 +724,76 @@ def test_nvfp4_sparse_mla_decode_matches_dequantized_reference(
     )
     torch.testing.assert_close(prefill_output, reference, atol=5e-2, rtol=5e-2)
     torch.testing.assert_close(prefill_lse, reference_lse, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("num_heads", [16, 128])
+@pytest.mark.parametrize(
+    "wide_topk,ragged_topk,chunks_per_block",
+    # Same chunk count on both sides so the split grid is identical.
+    [(448, 389, 0), (448, 389, 3), (256, 200, 0), (1152, 1100, 5)],
+)
+def test_nvfp4_sparse_mla_ragged_topk_width_matches_topk_length(
+    num_heads: int, wide_topk: int, ragged_topk: int, chunks_per_block: int
+) -> None:
+    """topk is only the indices-row width.
+
+    A ragged row must be bitwise identical to a wider row clamped to the same
+    length via ``topk_length``: both read the same candidates through the
+    same chunk grid, so the only thing the width changes is the row stride.
+    """
+    _require_sm120()
+    torch.manual_seed(20260916 + num_heads + wide_topk)
+    num_tokens, num_pages, page_size = 3, 32, 64
+    kv_bf16 = (
+        torch.randn(num_pages, page_size, 512, dtype=torch.bfloat16, device="cuda")
+        / 10.0
+    ).clamp(-1, 1)
+    q = (
+        torch.randn(num_tokens, num_heads, 512, dtype=torch.bfloat16, device="cuda")
+        / 10.0
+    ).clamp(-1, 1)
+    wide_indices = torch.randint(
+        0,
+        num_pages * page_size,
+        (num_tokens, wide_topk),
+        dtype=torch.int32,
+        device="cuda",
+    )
+    wide_indices[:, 5:11] = -1
+    ragged_indices = wide_indices[:, :ragged_topk].contiguous()
+    lengths = torch.full((num_tokens,), ragged_topk, dtype=torch.int32, device="cuda")
+    attn_sink = torch.linspace(-1.0, 1.0, num_heads, dtype=torch.float32, device="cuda")
+    sm_scale = 512**-0.5
+    cache = nvfp4_quantize_pack_sparse_mla_cache(kv_bf16)
+
+    wide_out, wide_lse = _nvfp4_sparse_mla_decode(
+        q,
+        cache,
+        wide_indices,
+        sm_scale,
+        topk_length=lengths,
+        attn_sink=attn_sink,
+        chunks_per_block_override=chunks_per_block,
+    )
+    ragged_out, ragged_lse = _nvfp4_sparse_mla_decode(
+        q,
+        cache,
+        ragged_indices,
+        sm_scale,
+        attn_sink=attn_sink,
+        chunks_per_block_override=chunks_per_block,
+    )
+    torch.testing.assert_close(ragged_out, wide_out, atol=0, rtol=0)
+    torch.testing.assert_close(ragged_lse, wide_lse, atol=0, rtol=0)
+
+    wide_out, wide_lse = _nvfp4_sparse_mla_prefill(
+        q, cache, wide_indices, sm_scale, topk_length=lengths, attn_sink=attn_sink
+    )
+    ragged_out, ragged_lse = _nvfp4_sparse_mla_prefill(
+        q, cache, ragged_indices, sm_scale, attn_sink=attn_sink
+    )
+    torch.testing.assert_close(ragged_out, wide_out, atol=0, rtol=0)
+    torch.testing.assert_close(ragged_lse, wide_lse, atol=0, rtol=0)
 
 
 def test_nvfp4_sparse_mla_masked_rows_ignore_poisoned_slot_zero() -> None:

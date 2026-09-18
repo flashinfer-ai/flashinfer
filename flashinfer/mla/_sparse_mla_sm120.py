@@ -149,8 +149,8 @@ class SparseMLASm120DecodeConfig:
     Decode-form calls (``num_tokens <= max_num_tokens``) prefer a standalone
     decode kernel when their shape matches one of the instantiations
     described here. For FP8, the prefill orchestrator can serve remaining
-    decode-form shapes in its own envelope; NVFP4 currently uses the same
-    exact head/top-k envelope for both kernels. Crossover calibration may
+    decode-form shapes in its own envelope; NVFP4 instantiates exact head
+    counts and takes top-k at runtime for both kernels. Crossover calibration may
     route an eligible shape to prefill. This config describes decode only.
 
     Attributes
@@ -294,18 +294,24 @@ def supported_sparse_mla_sm120_configs(
             f"kv_cache_format must be either 'fp8' or 'nvfp4', got {kv_cache_format!r}"
         )
     if kv_cache_format == "nvfp4":
+        from ._sparse_mla_nvfp4_sm120_plan import (
+            _CALIBRATED_PRIMARY_TOPKS,
+            _MIN_PRIMARY_TOPK,
+            _SUPPORTED_HEADS,
+        )
+
         return {
             "dsv4": SparseMLASm120DecodeConfig(
                 d_qk=512,
                 page_block_size=64,
                 max_num_tokens=64,
-                topks=frozenset({128, 512}),
-                min_topk=128,
+                topks=_CALIBRATED_PRIMARY_TOPKS,
+                min_topk=_MIN_PRIMARY_TOPK,
                 max_num_heads=128,
                 kv_cache_format="nvfp4",
                 bytes_per_token=384,
-                head_counts=frozenset({16, 32, 64, 128}),
-                topk_is_runtime=False,
+                head_counts=_SUPPORTED_HEADS,
+                topk_is_runtime=True,
                 extra_page_block_sizes=frozenset({2, 64}),
             )
         }

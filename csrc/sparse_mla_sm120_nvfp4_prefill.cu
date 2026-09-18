@@ -33,25 +33,25 @@ namespace flashinfer::sparse_mla_sm120::nvfp4 {
 
 namespace {
 
-template <int NUM_HEADS, int TOPK, int PAGE_SIZE, bool DUAL_CACHE>
+template <int NUM_HEADS, int PAGE_SIZE, bool DUAL_CACHE>
 void launch_prefill(const bf16* q, const uint8_t* cache, const int32_t* indices, bf16* output,
                     float* out_lse, const int* topk_length, const float* attn_sink,
                     const uint8_t* extra_cache, const int32_t* extra_indices,
                     const int* extra_topk_length, int extra_topk, int extra_page_size,
-                    size_t extra_page_stride, int num_tokens, float sm_scale, size_t page_stride,
-                    cudaStream_t stream) {
+                    size_t extra_page_stride, int num_tokens, int topk, float sm_scale,
+                    size_t page_stride, cudaStream_t stream) {
   constexpr int HEADS_PER_CTA =
       NUM_HEADS < STREAMING_HEADS_PER_CTA ? NUM_HEADS : STREAMING_HEADS_PER_CTA;
   constexpr int HEAD_BLOCKS = NUM_HEADS / HEADS_PER_CTA;
   constexpr size_t DYN_SMEM_BYTES = StreamingNVFP4Smem::SIZE;
-  auto kernel = sparse_mla_streaming_dsv4_nvfp4_kernel<NUM_HEADS, TOPK, PAGE_SIZE, DUAL_CACHE>;
+  auto kernel = sparse_mla_streaming_dsv4_nvfp4_kernel<NUM_HEADS, PAGE_SIZE, DUAL_CACHE>;
   NVFP4_PREFILL_CUDA_CHECK(
       cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, DYN_SMEM_BYTES));
 
   kernel<<<dim3(num_tokens, HEAD_BLOCKS), dim3(STREAMING_BLOCK_THREADS), DYN_SMEM_BYTES, stream>>>(
       q, cache, indices, output, out_lse, nullptr, nullptr, attn_sink, topk_length, extra_cache,
       extra_indices, extra_topk_length, extra_topk, extra_page_size, extra_page_stride, num_tokens,
-      /*num_splits=*/1,
+      topk, /*num_splits=*/1,
       /*chunks_per_block=*/0, sm_scale, page_stride, /*write_direct=*/true);
   NVFP4_PREFILL_CUDA_CHECK(cudaGetLastError());
 }
@@ -165,39 +165,36 @@ void SparseMlaSm120NVFP4Prefill(TensorView q, TensorView kv_cache, TensorView in
 
   ffi::CUDADeviceGuard device_guard(q.device().device_id);
   const cudaStream_t stream = get_stream(q.device());
-#define DISPATCH_NVFP4_PREFILL(H, K)                                                              \
-  if (num_heads == (H) && topk == (K)) {                                                          \
+
+#define DISPATCH_NVFP4_PREFILL(H)                                                                 \
+  if (num_heads == (H)) {                                                                         \
     if (has_extra) {                                                                              \
-      launch_prefill<(H), (K), 64, true>(                                                         \
+      launch_prefill<(H), 64, true>(                                                              \
           static_cast<const bf16*>(q.data_ptr()),                                                 \
           static_cast<const uint8_t*>(kv_cache.data_ptr()),                                       \
           static_cast<const int32_t*>(indices.data_ptr()), static_cast<bf16*>(output.data_ptr()), \
           static_cast<float*>(out_lse.data_ptr()), topk_length_ptr, attn_sink_ptr,                \
           extra_cache_ptr, extra_indices_ptr, extra_topk_length_ptr, extra_topk,                  \
-          extra_layout.page_size, extra_layout.page_stride_bytes, num_tokens,                     \
+          extra_layout.page_size, extra_layout.page_stride_bytes, num_tokens, topk,               \
           static_cast<float>(sm_scale), layout.page_stride_bytes, stream);                        \
     } else {                                                                                      \
-      launch_prefill<(H), (K), 64, false>(                                                        \
+      launch_prefill<(H), 64, false>(                                                             \
           static_cast<const bf16*>(q.data_ptr()),                                                 \
           static_cast<const uint8_t*>(kv_cache.data_ptr()),                                       \
           static_cast<const int32_t*>(indices.data_ptr()), static_cast<bf16*>(output.data_ptr()), \
           static_cast<float*>(out_lse.data_ptr()), topk_length_ptr, attn_sink_ptr, nullptr,       \
-          nullptr, nullptr, 0, 0, 0, num_tokens, static_cast<float>(sm_scale),                    \
+          nullptr, nullptr, 0, 0, 0, num_tokens, topk, static_cast<float>(sm_scale),              \
           layout.page_stride_bytes, stream);                                                      \
     }                                                                                             \
     return;                                                                                       \
   }
-  DISPATCH_NVFP4_PREFILL(16, 128)
-  DISPATCH_NVFP4_PREFILL(16, 512)
-  DISPATCH_NVFP4_PREFILL(32, 128)
-  DISPATCH_NVFP4_PREFILL(32, 512)
-  DISPATCH_NVFP4_PREFILL(64, 128)
-  DISPATCH_NVFP4_PREFILL(64, 512)
-  DISPATCH_NVFP4_PREFILL(128, 128)
-  DISPATCH_NVFP4_PREFILL(128, 512)
+  DISPATCH_NVFP4_PREFILL(16)
+  DISPATCH_NVFP4_PREFILL(32)
+  DISPATCH_NVFP4_PREFILL(64)
+  DISPATCH_NVFP4_PREFILL(128)
 #undef DISPATCH_NVFP4_PREFILL
-  TVM_FFI_ICHECK(false) << "unsupported initial NVFP4 prefill shape: heads=" << num_heads
-                        << ", topk=" << topk;
+  TVM_FFI_ICHECK(false) << "unsupported NVFP4 prefill head count: heads=" << num_heads
+                        << " (supported: 16, 32, 64, 128)";
 }
 
 }  // namespace flashinfer::sparse_mla_sm120::nvfp4

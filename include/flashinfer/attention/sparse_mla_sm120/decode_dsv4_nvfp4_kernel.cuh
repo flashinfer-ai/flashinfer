@@ -139,7 +139,7 @@ struct DecodeNVFP4Smem {
   }
 };
 
-template <ModelType MT, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE, bool DUAL_CACHE = false>
+template <ModelType MT, int NUM_HEADS, int PAGE_BLOCK_SIZE, bool DUAL_CACHE = false>
 __global__ void __launch_bounds__(DECODE_BLOCK_THREADS) sparse_mla_decode_dsv4_nvfp4_kernel(
     const bf16* __restrict__ q, const uint8_t* __restrict__ kv_cache,
     const int32_t* __restrict__ indices, bf16* __restrict__ mid_out, float* __restrict__ mid_lse,
@@ -147,7 +147,7 @@ __global__ void __launch_bounds__(DECODE_BLOCK_THREADS) sparse_mla_decode_dsv4_n
     const int* __restrict__ topk_length_ptr, const uint8_t* __restrict__ extra_kv_cache,
     const int32_t* __restrict__ extra_indices, const int* __restrict__ extra_topk_length_ptr,
     int extra_topk, int extra_page_block_size, size_t stride_extra_kv_block, int num_tokens,
-    int num_splits, int chunks_per_block, float sm_scale, size_t stride_kv_block,
+    int topk, int num_splits, int chunks_per_block, float sm_scale, size_t stride_kv_block,
     bool write_direct) {
   using KV = KVCacheTraits<MT>;
   static_assert(MT == ModelType::DSV4);
@@ -168,8 +168,8 @@ __global__ void __launch_bounds__(DECODE_BLOCK_THREADS) sparse_mla_decode_dsv4_n
   const int split_idx = blockIdx.z;
   if (token_idx >= num_tokens) return;
 
-  int topk_len = topk_length_ptr ? __ldg(topk_length_ptr + token_idx) : TOPK;
-  topk_len = max(0, min(topk_len, TOPK));
+  int topk_len = topk_length_ptr ? __ldg(topk_length_ptr + token_idx) : topk;
+  topk_len = max(0, min(topk_len, topk));
   const int num_main_chunks = (topk_len + DECODE_CAND_WINDOW - 1) / DECODE_CAND_WINDOW;
   int extra_topk_len = 0;
   if constexpr (DUAL_CACHE) {
@@ -207,7 +207,7 @@ __global__ void __launch_bounds__(DECODE_BLOCK_THREADS) sparse_mla_decode_dsv4_n
   extern __shared__ __align__(16) char smem_raw[];
   auto sm = DecodeNVFP4Smem<MT>::init(smem_raw);
   __shared__ bf16 sm_p_full[HPB][DECODE_CAND_WINDOW];
-  const int32_t* idx_base = indices + (size_t)token_idx * TOPK;
+  const int32_t* idx_base = indices + (size_t)token_idx * topk;
 
   if (threadIdx.x == 0) {
 #pragma unroll
@@ -226,7 +226,6 @@ __global__ void __launch_bounds__(DECODE_BLOCK_THREADS) sparse_mla_decode_dsv4_n
     bool is_extra = false;
     int section_chunk = chunk_idx;
     int section_len = topk_len;
-    int section_topk = TOPK;
     int section_page_block_size = PAGE_BLOCK_SIZE;
     size_t section_stride = stride_kv_block;
     const uint8_t* section_kv = kv_cache;
@@ -236,11 +235,10 @@ __global__ void __launch_bounds__(DECODE_BLOCK_THREADS) sparse_mla_decode_dsv4_n
       if (is_extra) {
         section_chunk = chunk_idx - num_main_chunks;
         section_len = extra_topk_len;
-        section_topk = extra_topk;
         section_page_block_size = extra_page_block_size;
         section_stride = stride_extra_kv_block;
         section_kv = extra_kv_cache;
-        section_indices = extra_indices + (size_t)token_idx * section_topk;
+        section_indices = extra_indices + (size_t)token_idx * extra_topk;
       }
     }
     const int chunk_start = section_chunk * DECODE_CAND_WINDOW;

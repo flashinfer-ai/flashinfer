@@ -169,7 +169,7 @@ struct StreamingNVFP4Smem {
 
 static_assert(StreamingNVFP4Smem::SIZE <= 99 * 1024);
 
-template <int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE, bool DUAL_CACHE = false>
+template <int NUM_HEADS, int PAGE_BLOCK_SIZE, bool DUAL_CACHE = false>
 __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1)
     sparse_mla_streaming_dsv4_nvfp4_kernel(
         const bf16* __restrict__ q, const uint8_t* __restrict__ kv_cache,
@@ -178,8 +178,8 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1)
         const float* __restrict__ attn_sink, const int* __restrict__ topk_length_ptr,
         const uint8_t* __restrict__ extra_kv_cache, const int32_t* __restrict__ extra_indices,
         const int* __restrict__ extra_topk_length_ptr, int extra_topk, int extra_page_block_size,
-        size_t stride_extra_kv_block, int num_tokens, int num_splits, int chunks_per_block,
-        float sm_scale, size_t stride_kv_block, bool write_direct) {
+        size_t stride_extra_kv_block, int num_tokens, int topk, int num_splits,
+        int chunks_per_block, float sm_scale, size_t stride_kv_block, bool write_direct) {
   static_assert(NUM_HEADS <= STREAMING_HEADS_PER_CTA || NUM_HEADS % STREAMING_HEADS_PER_CTA == 0);
   constexpr int VALID_HEAD_GROUPS =
       NUM_HEADS < STREAMING_HEADS_PER_CTA ? (NUM_HEADS + HPB - 1) / HPB : STREAMING_HEAD_GROUPS;
@@ -202,8 +202,8 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1)
   const int split_idx = blockIdx.z;
   if (token_idx >= num_tokens || head_block >= HEAD_BLOCKS) return;
   const int h_start = head_block * HEADS_PER_CTA;
-  int topk_len = topk_length_ptr ? __ldg(topk_length_ptr + token_idx) : TOPK;
-  topk_len = max(0, min(topk_len, TOPK));
+  int topk_len = topk_length_ptr ? __ldg(topk_length_ptr + token_idx) : topk;
+  topk_len = max(0, min(topk_len, topk));
   const int num_main_chunks = (topk_len + STREAMING_CAND_WINDOW - 1) / STREAMING_CAND_WINDOW;
   int extra_topk_len = 0;
   if constexpr (DUAL_CACHE) {
@@ -221,7 +221,7 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1)
 
   extern __shared__ __align__(16) char smem_raw[];
   auto sm = StreamingNVFP4Smem::init(smem_raw);
-  const int32_t* idx_base = indices + (size_t)token_idx * TOPK;
+  const int32_t* idx_base = indices + (size_t)token_idx * topk;
 
   if (threadIdx.x == 0) {
 #pragma unroll
