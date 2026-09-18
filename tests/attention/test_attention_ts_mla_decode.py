@@ -52,6 +52,7 @@ from flashinfer.attention.prims_ts import (
 )
 from flashinfer.attention.prims_ts.balanced_scheduler.cost_model import (
     B200_BALANCED_COST_MODEL_ID,
+    require_balanced_cost_model_calibration,
 )
 from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_2cta.config import (
     make_mla_decode_config,
@@ -91,6 +92,30 @@ _REQUIRES_PRIMTS_GPU = pytest.mark.skipif(
     not torch.cuda.is_available()
     or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)),
     reason="PrimTS MLA decode requires SM100, SM103 or SM107",
+)
+
+
+def _has_balanced_mla_calibration() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    device_index = torch.cuda.current_device()
+    properties = torch.cuda.get_device_properties(device_index)
+    try:
+        require_balanced_cost_model_calibration(
+            device_name=properties.name,
+            compute_capability=(properties.major, properties.minor),
+            multi_processor_count=properties.multi_processor_count,
+            device_index=device_index,
+        )
+    except NotImplementedError:
+        return False
+    return True
+
+
+_HAS_BALANCED_MLA_CALIBRATION = _has_balanced_mla_calibration()
+_REQUIRES_BALANCED_MLA_CALIBRATION = pytest.mark.skipif(
+    not _HAS_BALANCED_MLA_CALIBRATION,
+    reason="balanced MLA planning requires a calibration for the exact CUDA device",
 )
 
 
@@ -887,6 +912,10 @@ def _plan_case(
     balanced: bool = False,
     **plan_options,
 ):
+    if balanced and not _HAS_BALANCED_MLA_CALIBRATION:
+        pytest.skip(
+            "balanced MLA planning requires a calibration for the exact CUDA device"
+        )
     wrapper = BatchMLADecodePagedTSWrapper()
     num_qo_heads = int(
         case.query.shape[1] if qo_indptr is not None else case.query.shape[2]
@@ -1002,6 +1031,7 @@ def test_attention_ts_mla_balanced_decode_family_overrides_only_balanced_policy(
 )
 @pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
+@_REQUIRES_BALANCED_MLA_CALIBRATION
 def test_attention_ts_mla_balanced_kernel_dtype_product(
     num_qo_heads: int,
     expected_kernel: str,
@@ -1031,6 +1061,7 @@ def test_attention_ts_mla_balanced_kernel_dtype_product(
 
 @pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
+@_REQUIRES_BALANCED_MLA_CALIBRATION
 def test_attention_ts_mla_balanced_b64_h32_uses_calibrated_1cta_family():
     """Cover the bucket where ordinary direct-output selection chose 2CTA."""
 
@@ -1054,6 +1085,7 @@ def test_attention_ts_mla_balanced_b64_h32_uses_calibrated_1cta_family():
 
 @pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
+@_REQUIRES_BALANCED_MLA_CALIBRATION
 def test_attention_ts_mla_balanced_b16_h64_uses_calibrated_1cta_family():
     """Cover the BF16 side of the measured H64 batch crossover."""
 
@@ -1077,6 +1109,7 @@ def test_attention_ts_mla_balanced_b16_h64_uses_calibrated_1cta_family():
 
 @pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
+@_REQUIRES_BALANCED_MLA_CALIBRATION
 def test_attention_ts_mla_balanced_b4_h64_fp8_uses_calibrated_1cta_family():
     """Cover the first production-gated FP8 batch using the H64 1CTA family."""
 
@@ -1114,6 +1147,7 @@ def test_attention_ts_mla_balanced_b4_h64_fp8_uses_calibrated_1cta_family():
     ids=("bf16", "fp8"),
 )
 @pytest.mark.parametrize("packed", (False, True), ids=("fixed", "packed"))
+@_REQUIRES_BALANCED_MLA_CALIBRATION
 def test_attention_ts_mla_balanced_1cta_causal_mask_respects_descriptor_end(
     num_qo_heads: int,
     expected_tile_size_q: int,
@@ -1192,6 +1226,7 @@ def test_attention_ts_mla_balanced_1cta_causal_mask_respects_descriptor_end(
 
 @pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
+@_REQUIRES_BALANCED_MLA_CALIBRATION
 def test_attention_ts_mla_balanced_forced_m32_reducer_uses_logical_query_shape(
     monkeypatch,
 ):
@@ -1253,6 +1288,7 @@ def test_attention_ts_mla_balanced_forced_m32_reducer_uses_logical_query_shape(
 
 @pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
+@_REQUIRES_BALANCED_MLA_CALIBRATION
 def test_attention_ts_mla_balanced_2cta_keeps_flat_query_tile_layout():
     """Keep H96/SQ2 producer and reducer rows on the shared M128 layout."""
 
@@ -1278,6 +1314,7 @@ def test_attention_ts_mla_balanced_2cta_keeps_flat_query_tile_layout():
 
 @pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
+@_REQUIRES_BALANCED_MLA_CALIBRATION
 def test_attention_ts_mla_balanced_2cta_keeps_flat_packed_query_tile_layout():
     """Map uneven packed H96 queries through the same flat M128 producer tiles."""
 
@@ -1310,6 +1347,7 @@ def test_attention_ts_mla_balanced_2cta_keeps_flat_packed_query_tile_layout():
 
 @pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
+@_REQUIRES_BALANCED_MLA_CALIBRATION
 def test_attention_ts_mla_balanced_causal_reducer_uses_equal_split_boundaries():
     """Include the final equal-split piece intersecting a causal row prefix."""
 
@@ -1368,6 +1406,7 @@ def test_attention_ts_mla_balanced_causal_reducer_uses_equal_split_boundaries():
     (torch.bfloat16, torch.float8_e4m3fn),
     ids=("bf16", "fp8"),
 )
+@_REQUIRES_BALANCED_MLA_CALIBRATION
 def test_attention_ts_mla_balanced_1cta_m64_uses_persistent_work_queue(
     qkv_dtype: torch.dtype,
 ):
@@ -1406,6 +1445,7 @@ def test_attention_ts_mla_balanced_1cta_m64_uses_persistent_work_queue(
         pytest.param(16, 3, 4097, id="m64-padded-flat-q"),
     ),
 )
+@_REQUIRES_BALANCED_MLA_CALIBRATION
 def test_attention_ts_mla_balanced_1cta_reducer_uses_logical_output_stride(
     num_qo_heads: int,
     seq_len_q: int,
@@ -1533,6 +1573,7 @@ def test_attention_ts_mla_balanced_1cta_reducer_waits_for_pdl_producer():
 )
 @pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
+@_REQUIRES_BALANCED_MLA_CALIBRATION
 def test_attention_ts_mla_balanced_schedule_across_graph_replay(
     num_qo_heads: int,
     expected_kernel: str,
@@ -1614,6 +1655,7 @@ def test_attention_ts_mla_balanced_schedule_across_graph_replay(
 @pytest.mark.parametrize("qkv_dtype", (torch.bfloat16, torch.float8_e4m3fn))
 @pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
+@_REQUIRES_BALANCED_MLA_CALIBRATION
 def test_attention_ts_mla_balanced_inactive_slots_across_graph_replay(
     num_qo_heads: int,
     expected_kernel: str,
@@ -1724,6 +1766,7 @@ def test_attention_ts_mla_balanced_inactive_slots_across_graph_replay(
 
 @pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
+@_REQUIRES_BALANCED_MLA_CALIBRATION
 def test_attention_ts_mla_optimized_device_schedule_is_numerically_correct():
     """The folded device plan may reorder work but must preserve attention results."""
 
@@ -1746,6 +1789,7 @@ def test_attention_ts_mla_optimized_device_schedule_is_numerically_correct():
 
 @pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
+@_REQUIRES_BALANCED_MLA_CALIBRATION
 def test_attention_ts_mla_balanced_validated_run_requires_current_schedule():
     """Validated runs reject live lengths that were not installed by schedule."""
 
@@ -1774,6 +1818,7 @@ def test_attention_ts_mla_balanced_validated_run_requires_current_schedule():
 
 @pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
+@_REQUIRES_BALANCED_MLA_CALIBRATION
 def test_attention_ts_mla_balanced_validated_run_requires_schedule_snapshot(
     monkeypatch,
 ):
@@ -1810,6 +1855,7 @@ def test_attention_ts_mla_balanced_validated_run_requires_schedule_snapshot(
 
 @pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
+@_REQUIRES_BALANCED_MLA_CALIBRATION
 def test_attention_ts_mla_balanced_workspace_size_is_publicly_queryable():
     """The public size query covers balanced scratch but not plan descriptors."""
 
@@ -1886,6 +1932,7 @@ def test_attention_ts_mla_balanced_workspace_size_is_publicly_queryable():
 
 @pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
+@_REQUIRES_BALANCED_MLA_CALIBRATION
 def test_attention_ts_mla_auto_gate_runs_balanced_and_standard_plans():
     """Exercise both production-gate decisions through the public wrapper."""
 
@@ -3074,6 +3121,7 @@ def test_attention_ts_mla_balanced_keeps_fp8_serializes_q_work_tiles():
 
 @pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
+@_REQUIRES_BALANCED_MLA_CALIBRATION
 def test_attention_ts_mla_balanced_q64_fp8_mixed_deep_queue_is_stable(
     monkeypatch,
 ):
@@ -3342,6 +3390,7 @@ def test_attention_ts_mla_balanced_1cta_packed_coordinate_bound():
 
 @pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
+@_REQUIRES_BALANCED_MLA_CALIBRATION
 def test_attention_ts_mla_public_balanced_plan_rejects_packed_coordinate_overflow():
     """Apply the packed-coordinate guard during public policy resolution."""
 
