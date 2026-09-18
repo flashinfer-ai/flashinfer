@@ -1013,38 +1013,6 @@ _CHECKPOINTING_SSU_VARIANTS = [
 _PREWARM_MIN_TESTS = 8
 
 
-def _triton_ptxas_path(major: int) -> "str | None":
-    """The ptxas binary Triton will actually invoke for this device.
-
-    Mirrors ``triton.backends.nvidia.compiler.get_ptxas``: for ``arch >= 100``
-    Triton resolves ptxas through ``TRITON_PTXAS_BLACKWELL_PATH`` and falls back
-    to the wheel's bundled ``ptxas-blackwell``; below that it uses
-    ``TRITON_PTXAS_PATH`` / bundled ``ptxas``. Probing the wrong one is not a
-    theoretical mismatch: Triton 3.8 bundles a CUDA 12.9 ``ptxas`` and a CUDA
-    13.3 ``ptxas-blackwell``, neither of which knows ``sm_107``, while Triton
-    itself compiles SM107 fine against a CUDA 13.4 ptxas supplied through the
-    environment variable.
-    """
-    import os
-
-    env_var = "TRITON_PTXAS_BLACKWELL_PATH" if major >= 10 else "TRITON_PTXAS_PATH"
-    override = os.environ.get(env_var)
-    if override and os.path.exists(override):
-        return override
-
-    import triton
-
-    bundled = os.path.join(
-        os.path.dirname(triton.__file__), "backends", "nvidia", "bin"
-    )
-    names = ("ptxas-blackwell", "ptxas") if major >= 10 else ("ptxas",)
-    for name in names:
-        candidate = os.path.join(bundled, name)
-        if os.path.exists(candidate):
-            return candidate
-    return None
-
-
 def _triton_supports_current_arch() -> bool:
     """Whether the installed Triton's PTX toolchain can target this GPU.
 
@@ -1053,6 +1021,17 @@ def _triton_supports_current_arch() -> bool:
     ``make_ptx`` calls ``abort()`` and takes the whole pytest process down —
     unskippable at test time, so probe the matching ``ptxas`` binary in a
     subprocess instead. Defaults to True on any probe uncertainty.
+
+    Which binary that is comes from Triton itself via ``get_ptxas``, rather
+    than from a local reimplementation: for ``arch >= 100`` it resolves through
+    ``TRITON_PTXAS_BLACKWELL_PATH`` and falls back to the wheel's bundled
+    ``ptxas-blackwell``, and it validates each candidate by running
+    ``--version`` rather than merely checking the path exists. Probing a
+    different binary than Triton will invoke is not a theoretical mismatch:
+    Triton 3.8 bundles a CUDA 12.9 ``ptxas`` and a CUDA 13.3
+    ``ptxas-blackwell``, neither of which knows ``sm_107``, while Triton
+    compiles SM107 fine against a CUDA 13.4 ptxas supplied through the
+    environment.
     """
     import contextlib
     import os
@@ -1065,14 +1044,16 @@ def _triton_supports_current_arch() -> bool:
 
         # Imported for the side effect: flashinfer.triton's
         # _patch_triton_ptxas_blackwell() exports TRITON_PTXAS_BLACKWELL_PATH
-        # when a CUDA >= 13 ptxas is on PATH. Probing before it runs reads a
-        # stale environment and reports False on a device Triton can target.
+        # when a CUDA >= 13 ptxas is on PATH. get_ptxas re-reads that variable
+        # on every access, so probing before this import resolves to the stale
+        # bundled binary and reports False on a device Triton can target.
         with contextlib.suppress(Exception):
             import flashinfer.triton  # noqa: F401
 
-        ptxas = _triton_ptxas_path(major)
-        if ptxas is None:
-            return True
+        from triton.backends.nvidia.compiler import get_ptxas
+
+        # get_ptxas takes the capability int (107), not the major version.
+        ptxas = get_ptxas(major * 10 + minor).path
         for gpu_name in (f"sm_{major}{minor}a", f"sm_{major}{minor}"):
             r = subprocess.run(
                 [ptxas, "--gpu-name", gpu_name, os.devnull, "-o", os.devnull],
