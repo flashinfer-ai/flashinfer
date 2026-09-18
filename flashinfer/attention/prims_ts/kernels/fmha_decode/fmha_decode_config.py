@@ -2302,6 +2302,10 @@ class FmhaDecodeConfig:
         """Whether BMM1 accumulates INT8 Q/K into INT32 scores."""
         return self.use_sage_attention and self.q_dtype == Int8
 
+    def softmax_num_warps(self, inst_id: int) -> int:
+        """Return the warps of one softmax instance."""
+        return self.softmax0_num_warps if inst_id == 0 else self.softmax1_num_warps
+
     @property
     def sage_k_groups_per_fragment(self) -> int:
         """Return the K scale groups inside one streamed K32 score fragment.
@@ -2313,6 +2317,35 @@ class FmhaDecodeConfig:
         if not self.use_sage_attention:
             return 1
         return max(1, self.softmax_score_fragment_regs // self.sage_k_block_size)
+
+    @property
+    def sage_k_scales_in_smem(self) -> bool:
+        """Whether a tile's ``sfK`` words live in SMEM instead of lane registers.
+
+        With four or more scale groups per K32 fragment (K blocks of 4 or 1
+        token) a lane would hold 16 or more multipliers per tile, so the tile
+        keeps its ``sfK`` words in a small buffer of the softmax instance and
+        both softmax passes read one fragment's groups with 16-byte loads;
+        the larger blocks keep the rotating register array. The two forms are
+        the strategies ``SmemSageKScales`` and ``RegisterSageKScales`` of the
+        scale module; this predicate selects between them.
+        """
+        return self.use_sage_attention and self.sage_k_groups_per_fragment >= 4
+
+    @property
+    def sage_int32_bias_per_score(self) -> bool:
+        """Whether the P pass removes the INT32 score bias per score, not per group.
+
+        With one score per scale group (the one-token K block) an addend per
+        group costs one FMA per score, while subtracting the bias from each
+        score pair with one packed add and using the row's addend costs half
+        of that. The subtraction is exact: biased scores are integers below
+        ``2**24``.
+        """
+        return (
+            self.uses_int32_scores
+            and self.sage_k_groups_per_fragment == self.softmax_score_fragment_regs
+        )
 
     @property
     def matches_kv256_task_topology(self) -> bool:

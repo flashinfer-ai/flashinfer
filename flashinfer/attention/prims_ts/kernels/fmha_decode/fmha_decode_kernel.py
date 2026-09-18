@@ -986,9 +986,11 @@ def _build_decode_gen_schedule(
             )
     # Where each softmax instance's Sage K scales live during the passes. The
     # S and P resources and the route metadata consumer of one instance share
-    # the strategy object.
-    sage_k_scales0 = make_sage_k_scales(cfg)
-    sage_k_scales1 = make_sage_k_scales(cfg)
+    # the strategy object; an SMEM ring is allocated through the S resource and
+    # published through the instance's own softmax named barrier (the same
+    # warps arrive on it in program order, so it needs no barrier of its own).
+    sage_k_scales0 = make_sage_k_scales(cfg, inst_id=0, sync_barrier_id=0)
+    sage_k_scales1 = make_sage_k_scales(cfg, inst_id=1, sync_barrier_id=1)
     sparse_kv_metadata0 = None
     sparse_kv_metadata1 = None
     sparse_softmax_metadata0 = None
