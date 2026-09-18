@@ -48,6 +48,11 @@
       "value": 64,
       "description": "RoPE head dimension frozen by plan()."
     },
+    "skip_corr_threshold": {
+      "type": "const",
+      "value": 0,
+      "description": "Skip-correction threshold frozen by plan() in log2 units (rounded to an integer axis); zero keeps the exact rescale."
+    },
     "num_pages": {
       "type": "var",
       "description": "Physical MLA cache page capacity."
