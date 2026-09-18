@@ -916,7 +916,7 @@ class CudnnMoeRunner(MoERunner):
             scales,
             x.shape[0],
             r,
-            # KF b0409f identified consumer PDL as a useful component direction.
+            # This consumer configuration was studied and validated in this effort.
             # Keep the native scalar kernel's dependency wait before metadata reads.
             enable_pdl=(
                 self._native_finalize_pdl
