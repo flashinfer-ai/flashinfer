@@ -21,11 +21,18 @@ from ..template import Const, Scalar, Tensor, TraceTemplate, Var
 
 @torch.no_grad()
 def _top_k_varlen_reference(
-    logits, seq_lens, top_k, pre_idx=None, row_starts=None, **_unused
+    logits,
+    seq_lens,
+    top_k,
+    pre_idx=None,
+    row_starts=None,
+    absolute_indices=False,
+    **_unused,
 ):
     """Per-row top-K with seq_lens masking (window ``[row_starts[r],
     row_starts[r] + seq_lens[r])`` with window-local indices when
-    ``row_starts`` is given). Reference uses torch.topk on each row."""
+    ``row_starts`` is given, absolute columns with ``absolute_indices``).
+    Reference uses torch.topk on each row."""
     num_rows, N = logits.shape
     indices = torch.empty(num_rows, top_k, dtype=torch.int32, device=logits.device)
     logits_f32 = logits.to(torch.float32)
@@ -34,7 +41,7 @@ def _top_k_varlen_reference(
         n = max(min(s + int(seq_lens[r].item()), N) - s, 0)
         row = logits_f32[r, s : s + n]
         _, idx = torch.topk(row, min(top_k, n), largest=True, sorted=False)
-        indices[r, : len(idx)] = idx.to(torch.int32)
+        indices[r, : len(idx)] = idx.to(torch.int32) + (s if absolute_indices else 0)
         if len(idx) < top_k:
             indices[r, len(idx) :] = -1
     return indices
@@ -47,6 +54,7 @@ def _top_k_varlen_check(
     seq_lens=None,
     top_k=None,
     row_starts=None,
+    absolute_indices=False,
     **_unused,
 ):
     """Tie-safe value check: every selected value must be >= the row's K-th largest.
@@ -86,7 +94,9 @@ def _top_k_varlen_check(
             continue
         row = logits_f32[r, s : s + n]
         kth = torch.topk(row, top_k).values[-1].item()
-        sel = act[r].long()  # window-local indices
+        sel = act[r].long()  # window-local indices (absolute: shift back by s)
+        if absolute_indices:
+            sel = sel - s
         if (row[sel] < kth - 1e-5).any():
             return False
     return True
@@ -158,8 +168,14 @@ top_k_varlen_trace = TraceTemplate(
             description=(
                 "Windowed (prefill) mode: row r ranks "
                 "logits[r, row_starts[r] : row_starts[r] + seq_lens[r]] and "
-                "returns window-local indices (gvr_2 only)."
+                "returns window-local indices (gvr_2 only; absolute columns "
+                "with absolute_indices=True)."
             ),
+        ),
+        "absolute_indices": Scalar(
+            "bool",
+            optional=True,
+            description="Windowed mode: return absolute logits columns instead of window-local indices.",
         ),
     },
     outputs={

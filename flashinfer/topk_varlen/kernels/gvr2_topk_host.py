@@ -1125,30 +1125,44 @@ _PREFILL_CLASS_BOUNDS = (2048, 4096, 8192)  # register capacity classes (VPT 1 /
 # knowledge in every serving framework, so the API asks for it.
 
 
-def _prefill_cache_key(fam: str, tier_or_tpl, k: int, n_bucket: int):
+def _prefill_cache_key(fam: str, tier_or_tpl, k: int, n_bucket: int, abs_out: bool = False):
     # main: tiers 1/2 fix U, so the bucket does not change their engine —
     # collapse it to one key so warmup covers them with a single launch.
     # reg: the compile tuple + envelope constants identify the launcher.
     if fam == "main":
         tier = tier_or_tpl
-        return ("main", tier, k, n_bucket if tier == 0 else 0, _arch_token(), _sm_count())
-    return ("reg", tier_or_tpl, k, _arch_token(), _sm_count())
+        return (
+            "main",
+            tier,
+            k,
+            n_bucket if tier == 0 else 0,
+            bool(abs_out),
+            _arch_token(),
+            _sm_count(),
+        )
+    return ("reg", tier_or_tpl, k, bool(abs_out), _arch_token(), _sm_count())
 
 
-def _prefill_reg_launcher(plan: dict, k: int) -> tuple:
+def _prefill_reg_launcher(plan: dict, k: int, abs_out: bool = False) -> tuple:
     """Windowed register-family launcher for a route() plan (hint-free varlen
     compile with the prefill flag). ABI: ``fn(logits, row_starts, kv_lens=window
     lengths, out, n_clamp, CMP, QC, smem)``."""
     rt = plan["rt"]
     tpl = tuple(plan["tpl"])
-    key = _prefill_cache_key("reg", (tpl, rt["CMP"], rt["QC"], plan["smem"]), k, 0)
+    key = _prefill_cache_key("reg", (tpl, rt["CMP"], rt["QC"], plan["smem"]), k, 0, abs_out)
     hit = _PREFILL_CACHE.get(key)
     if hit is not None:
         return hit
     dev = _device()
     fn = _gate_first_call(
         dev.get_compiled__reg(
-            tpl, varlen=True, next_n=1, cr_shift=0, hint_free=True, prefill=True
+            tpl,
+            varlen=True,
+            next_n=1,
+            cr_shift=0,
+            hint_free=True,
+            prefill=True,
+            prefill_abs=abs_out,
         )
     )
     lc = ("reg", fn, (rt["CMP"], rt["QC"], dev.STATIC_BYTES + plan["smem"]))
@@ -1156,31 +1170,37 @@ def _prefill_reg_launcher(plan: dict, k: int) -> tuple:
     return lc
 
 
-def _prefill_get(rows: int, k: int, n_hint: int, n_bucket: int, compile_ok: bool) -> tuple:
+def _prefill_get(
+    rows: int, k: int, n_hint: int, n_bucket: int, compile_ok: bool, abs_out: bool = False
+) -> tuple:
     """Launcher for one row slab: register rung when the window bound admits
     it, else the slab tier. ``compile_ok=False`` (capture) returns None on a
     cache miss instead of compiling."""
     plan = _prefill_reg_route(rows, k, n_hint)
     if plan is not None:
         key = _prefill_cache_key(
-            "reg", (tuple(plan["tpl"]), plan["rt"]["CMP"], plan["rt"]["QC"], plan["smem"]), k, 0
+            "reg",
+            (tuple(plan["tpl"]), plan["rt"]["CMP"], plan["rt"]["QC"], plan["smem"]),
+            k,
+            0,
+            abs_out,
         )
         lc = _PREFILL_CACHE.get(key)
         if lc is None and compile_ok:
-            lc = _prefill_reg_launcher(plan, k)
+            lc = _prefill_reg_launcher(plan, k, abs_out)
         return lc
     tier = _prefill_tier(rows, n_hint, k)
-    lc = _PREFILL_CACHE.get(_prefill_cache_key("main", tier, k, n_bucket))
+    lc = _PREFILL_CACHE.get(_prefill_cache_key("main", tier, k, n_bucket, abs_out))
     if lc is None and compile_ok:
-        lc = _prefill_launcher(tier, k, n_bucket)
+        lc = _prefill_launcher(tier, k, n_bucket, abs_out)
     return lc
 
 
-def _prefill_launcher(tier: int, k: int, n_bucket: int) -> tuple:
+def _prefill_launcher(tier: int, k: int, n_bucket: int, abs_out: bool = False) -> tuple:
     """Windowed slab plan + compiled launcher: ``_varlen_launcher``'s main branch
     with r_const=1, split=False, hint_free=True and the prefill compile flag.
     SCAP_/CMP_ are envelope upper bounds; the `n` slot is filled per call."""
-    key = _prefill_cache_key("main", tier, k, n_bucket)
+    key = _prefill_cache_key("main", tier, k, n_bucket, abs_out)
     hit = _PREFILL_CACHE.get(key)
     if hit is not None:
         return hit
@@ -1195,7 +1215,9 @@ def _prefill_launcher(tier: int, k: int, n_bucket: int) -> tuple:
     tpl = tuple(plan["tpl"])
     dev = _device()
     fn = _gate_first_call(
-        dev.get_compiled(tpl[:6] + (False,) + (1, 0, 1), hint_free=True, prefill=True)
+        dev.get_compiled(
+            tpl[:6] + (False,) + (1, 0, 1), hint_free=True, prefill=True, prefill_abs=abs_out
+        )
     )
     big = tier == 0
     # r_const==1 branch of the _varlen_launcher tuning scalars
@@ -1211,14 +1233,18 @@ def _prefill_launcher(tier: int, k: int, n_bucket: int) -> tuple:
     return lc
 
 
-def _launch_prefill(lg, row_starts, kv_lens, idx, ws, k, n_clamp, n_hint, npad, hinted) -> None:
+def _launch_prefill(
+    lg, row_starts, kv_lens, idx, ws, k, n_clamp, n_hint, npad, hinted, abs_out=False
+) -> None:
     """Launch the windowed engine over ``lg`` in row slabs. ABI (main varlen):
     ``fn(logits, pre_idx_slot=row_starts, out, ws, n, npad, k, SCAP_, CMP_, R,
     dead x5, kv_lens_slot=window lengths, tuning tail)``; the prefill compile
     reads ks from the pre_idx slot and the window length from the kv_lens slot
     and clamps ke to ``n_clamp`` (the logits width) in the ``n`` slot.
     ``n_hint`` (max window length, capture-stable) only selects the plan tier
-    and envelope bucket — a tuning hint, never a bound the kernel trusts."""
+    and envelope bucket — a tuning hint, never a bound the kernel trusts.
+    ``abs_out`` selects the compiled variants that emit absolute logits
+    columns (window-local + row start) instead of window-local indices."""
     num_rows = lg.shape[0]
     n_hint = min(max(int(n_hint), 1), int(n_clamp))
     n_bucket = _prefill_bucket(n_hint)
@@ -1230,14 +1256,14 @@ def _launch_prefill(lg, row_starts, kv_lens, idx, ws, k, n_clamp, n_hint, npad, 
             # the caller's window-length bound picks ONE engine for the slab:
             # a register rung whose capacity covers bound + 3 lead lanes, else
             # the streaming main tier
-            lc = _prefill_get(rows, k, n_hint, n_bucket, compile_ok=not capture)
+            lc = _prefill_get(rows, k, n_hint, n_bucket, compile_ok=not capture, abs_out=abs_out)
         else:
             # unhinted: window lengths are device data -> streaming main for
             # every row (see the note at _PREFILL_CLASS_BOUNDS)
             tier = _prefill_tier(rows, n_hint, k)
-            lc = _PREFILL_CACHE.get(_prefill_cache_key("main", tier, k, n_bucket))
+            lc = _PREFILL_CACHE.get(_prefill_cache_key("main", tier, k, n_bucket, abs_out))
             if lc is None and not capture:
-                lc = _prefill_launcher(tier, k, n_bucket)
+                lc = _prefill_launcher(tier, k, n_bucket, abs_out)
         if lc is None:
             raise RuntimeError(
                 "prefill launcher not compiled for this shape — warm up "
@@ -1261,13 +1287,16 @@ def warmup_prefill(
     max_cols: int,
     num_rows_list: Sequence[int] = (1, 149, 297),
     row_stride: int | None = None,
+    absolute_indices: bool = False,
 ) -> None:
     """Compile the windowed (prefill) engine set before serving (<= 6 per k):
     the tier-0 arm walks the pow2 envelope buckets up to 32768, tiers 1/2 need
     one launch each. ``max_cols`` is the compressed max column count (the
     logits width the serving producer emits); idempotent per done-key. Also
     creates the calling stream's default workspace slab (the windowed engine
-    is the streaming ``main`` family). TRT-LLM #18702 ``warmup_prefill`` mirror."""
+    is the streaming ``main`` family). TRT-LLM #18702 ``warmup_prefill`` mirror.
+    ``absolute_indices`` warms the absolute-column output variants (a
+    distinct compiled set); call once per output frame the server uses."""
     dev = torch.cuda.current_device()
     k = int(top_k)
     max_cols = int(max_cols)
@@ -1299,15 +1328,32 @@ def warmup_prefill(
                         (tuple(plan["tpl"]), plan["rt"]["CMP"], plan["rt"]["QC"], plan["smem"]),
                         k,
                         0,
+                        absolute_indices,
                     )
                 else:
-                    key = _prefill_cache_key("main", _prefill_tier(int(rows), n_h, k), k, bk)
-                reps.setdefault(key, (int(rows), n_h))
-    done_key = (dev, k, max_cols, tuple(sorted(int(r) for r in num_rows_list)), row_stride)
+                    key = _prefill_cache_key(
+                        "main", _prefill_tier(int(rows), n_h, k), k, bk, absolute_indices
+                    )
+                reps.setdefault(key, (int(rows), n_h, True))
+            # an unhinted call (max_seq_len=None) of a width in this bucket takes
+            # the slab tier whatever the register table admits: warm it too
+            for n_h in (max(bk // 2 + 1, k + 1), bk):  # both sides of the tier promotion
+                key = _prefill_cache_key(
+                    "main", _prefill_tier(int(rows), n_h, k), k, bk, absolute_indices
+                )
+                reps.setdefault(key, (int(rows), n_h, False))
+    done_key = (
+        dev,
+        k,
+        max_cols,
+        tuple(sorted(int(r) for r in num_rows_list)),
+        row_stride,
+        bool(absolute_indices),
+    )
     with _PREFILL_WARMUP_LOCK:
         if done_key in _PREFILL_WARMUP_DONE:
             return
-    for rows, n_h in reps.values():
+    for rows, n_h, hinted in reps.values():
         rows = _PREFILL_TIER_ROWS[_prefill_tier(rows, n_h, k)] if rows > 297 else rows
         n_w = (n_h + 3) // 4 * 4  # launch width: a 1-row view keys npad on shape[1]
         stride = row_stride if row_stride is not None else ((n_w + 256 + 255) // 256 * 256)
@@ -1317,15 +1363,27 @@ def warmup_prefill(
         ks = torch.zeros((rows,), dtype=_I32, device=dev)
         lens = torch.full((rows,), n_h, dtype=_I32, device=dev)
         out = torch.empty((rows, k), dtype=_I32, device=dev)
-        # max_seq_len = the exact hint the serving call will use (key parity)
-        run_varlen(logits[:, :n_w], None, lens, out, top_k=k, row_starts=ks, max_seq_len=n_h)
+        # hinted reps: max_seq_len = the exact hint the serving call will use
+        # (key parity); unhinted reps: the slab tier of the bucket's width
+        run_varlen(
+            logits[:, :n_w],
+            None,
+            lens,
+            out,
+            top_k=k,
+            row_starts=ks,
+            max_seq_len=n_h if hinted else None,
+            absolute_indices=absolute_indices,
+        )
         del logits, ks, lens, out
     torch.cuda.synchronize()
     with _PREFILL_WARMUP_LOCK:
         _PREFILL_WARMUP_DONE.add(done_key)
 
 
-def prefill_ready(num_rows: int, k: int, n_env: int, width: int | None = None) -> bool:
+def prefill_ready(
+    num_rows: int, k: int, n_env: int, width: int | None = None, absolute_indices: bool = False
+) -> bool:
     """True iff a windowed ``run_varlen`` call with this geometry would launch
     without compiling (the same launcher keys it looks up), so a caller can
     route around the engine under CUDA graph capture. Unhinted call: pass the
@@ -1340,11 +1398,11 @@ def prefill_ready(num_rows: int, k: int, n_env: int, width: int | None = None) -
     for r0 in range(0, num_rows, _PREFILL_ROW_SLAB):
         rows = min(r0 + _PREFILL_ROW_SLAB, num_rows) - r0
         if hinted:
-            if _prefill_get(rows, k, n_env, n_bucket, compile_ok=False) is None:
+            if _prefill_get(rows, k, n_env, n_bucket, compile_ok=False, abs_out=absolute_indices) is None:
                 return False
             continue
         tier = _prefill_tier(rows, n_env, k)  # unhinted: slab only
-        if _prefill_cache_key("main", tier, k, n_bucket) not in _PREFILL_CACHE:
+        if _prefill_cache_key("main", tier, k, n_bucket, absolute_indices) not in _PREFILL_CACHE:
             return False
     return True
 
@@ -1902,6 +1960,7 @@ def run_varlen(
     workspace: torch.Tensor | None = None,
     top_k: int | None = None,
     row_starts: torch.Tensor | None = None,
+    absolute_indices: bool = False,
 ) -> None:
     """Production-contract varlen entry (per-row device kv_lens).
 
@@ -1915,7 +1974,8 @@ def run_varlen(
     WINDOWED / PREFILL (TRT-LLM #18702 port): ``row_starts`` int32 ``[num_rows]``
     makes row ``r``'s candidates ``logits[r, ks : ks + kv_lens[r])`` with
     ``ks = row_starts[r]`` (compressed column units) and the output indices
-    LOCAL to the window (``column - ks``), ``-1`` padded, identity for short
+    LOCAL to the window (``column - ks``; the absolute column with
+    ``absolute_indices=True``), ``-1`` padded, identity for short
     windows — the DSA prefill indexer contract (packed requests along the
     column axis, causal per-row windows). Hint-free only, ``next_n == 1`` and
     ``compress_ratio == 1``; columns outside a window are never read. Runs the
@@ -2043,6 +2103,8 @@ def run_varlen(
             )
         if not row_starts.is_contiguous():
             raise RuntimeError("row_starts must be contiguous")
+    elif absolute_indices:
+        raise RuntimeError("absolute_indices requires row_starts (windowed / prefill mode)")
     d = logits.get_device()
     if not 0 <= d < _GVR_MAX_DEV:
         raise RuntimeError(f"device index out of range: {d}")
@@ -2174,10 +2236,14 @@ def run_varlen(
                 n_env,
                 npad,
                 hinted=max_seq_len is not None,
+                abs_out=bool(absolute_indices),
             )
             if vals is not None:
-                # window-local indices -> absolute columns for the gather
-                idx64 = idx.to(torch.int64) + row_starts.to(torch.int64).unsqueeze(1)
+                # absolute columns for the gather (window-local + row start
+                # unless the kernel already emitted absolute columns)
+                idx64 = idx.to(torch.int64)
+                if not absolute_indices:
+                    idx64 = idx64 + row_starts.to(torch.int64).unsqueeze(1)
                 vals.copy_(lg.gather(1, idx64.clamp_min(0).clamp_max(npad - 1)))
                 vals.masked_fill_(idx < 0, torch.finfo(_F32).min)
             return
@@ -2280,6 +2346,10 @@ def run_varlen(
             ws,
             None if vals is None else vals[r : r + 1],
         )
+        if windowed and absolute_indices:
+            # reference frame is window-local: shift the hits (not the pad)
+            rr = idx[r]
+            idx[r] = torch.where(rr >= 0, rr + ks, rr)
 
 
 __all__ = [
