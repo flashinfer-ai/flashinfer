@@ -1468,6 +1468,7 @@ _ROUTING_METHODS = [
     RoutingMethodType.TopKSigmoid,  # top_k(raw) -> sigmoid
     RoutingMethodType.DeepSeekV3,  # sigmoid+bias -> group-topk -> top_k (#2575 lives here)
     RoutingMethodType.MiniMax2,  # sigmoid+bias -> top_k -> scaled sum-norm
+    RoutingMethodType.SqrtSoftplus,  # sqrt(softplus)+bias -> top_k -> scaled sum-norm (DSV4)
     RoutingMethodType.Llama4,  # top1 -> sigmoid (top_k forced to 1)
 ]
 # Compiled in-kernel routing tiers are method-specific. Pre-routed modes bypass
@@ -1478,6 +1479,7 @@ _FROMLOGITS_MAX_EXPERTS = {
     RoutingMethodType.TopK: 256,
     RoutingMethodType.Sigmoid: 256,
     RoutingMethodType.SigmoidRenorm: 256,
+    RoutingMethodType.SqrtSoftplus: 1024,
     RoutingMethodType.Llama4: 128,
 }
 # Routing logits dtype axis: fp32 router logits are the #2796 class; bf16 is the common case.
@@ -1518,8 +1520,13 @@ _UNPACKED_VARIANT_IDS = tuple(
 )
 
 # Methods whose routing uses an additive bias (selection only -- weights stay unbiased). DeepSeekV3
-# REQUIRES a bias; MiniMax2's is optional but we always supply one to exercise the bias path.
-_BIAS_METHODS = {RoutingMethodType.DeepSeekV3, RoutingMethodType.MiniMax2}
+# REQUIRES a bias; MiniMax2's and SqrtSoftplus's are optional but we always supply one to
+# exercise the bias path.
+_BIAS_METHODS = {
+    RoutingMethodType.DeepSeekV3,
+    RoutingMethodType.MiniMax2,
+    RoutingMethodType.SqrtSoftplus,
+}
 
 # Per-test weight footprint cap so one fuzz config never hogs the GPU (parallel-CI-friendly) and the
 # CPU exact-grid snap stays sub-few-seconds. ~500M bf16 weight elems ≈ 1 GB. The cap naturally pairs
@@ -2369,10 +2376,15 @@ def _route(
         w = w / (w.sum(dim=-1, keepdim=True) + 1e-20)
     elif method == M.Llama4:  # top1 -> sigmoid weight (top_k forced to 1 by config gen)
         w, sel = torch.topk(torch.sigmoid(lf), top_k, dim=-1)
-    elif method in (M.DeepSeekV3, M.MiniMax2):
-        # Sigmoid + bias drives SELECTION; the final weights use the UNBIASED sigmoid scores
-        # (the classic "bias leaks into weights" bug). DeepSeekV3 adds a group-topk pre-mask.
-        scores = torch.sigmoid(lf)
+    elif method in (M.DeepSeekV3, M.MiniMax2, M.SqrtSoftplus):
+        # Sigmoid (or sqrt-softplus for DeepSeek-V4) + bias drives SELECTION; the final weights
+        # use the UNBIASED scores (the classic "bias leaks into weights" bug). DeepSeekV3 adds a
+        # group-topk pre-mask.
+        scores = (
+            torch.sqrt(F.softplus(lf))
+            if method == M.SqrtSoftplus
+            else torch.sigmoid(lf)
+        )
         sel_scores = scores + bias.float() if bias is not None else scores.clone()
         if method == M.DeepSeekV3 and n_group > 1:
             E = sel_scores.shape[-1]
