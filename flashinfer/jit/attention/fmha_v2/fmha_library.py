@@ -487,6 +487,9 @@ def get_kernel_code(kspec: FMHAv2KernelSpec, kname: str, lname: str) -> Optional
     sliding_or_chunked_causal_kernel_name = kname.replace(
         "__placeholder__", "_sliding_or_chunked_causal"
     )
+    bidirectional_sliding_window_kernel_name = kname.replace(
+        "__placeholder__", "_bidirectional_sliding_window"
+    )
     kernel_name = kname.replace("__placeholder__", "")
 
     # FIXME: use separate parameters when generating cubins for trtllm.
@@ -568,16 +571,24 @@ def get_kernel_code(kspec: FMHAv2KernelSpec, kname: str, lname: str) -> Optional
         flags |= 8192
 
     # only generate certain needed combinations of input_layout and mask types for trt-llm.
-    padding_mask, causal_mask, sliding_or_chunked_causal_mask, custom_mask = (
-        selected_mask_types(kspec)
-    )
+    (
+        padding_mask,
+        causal_mask,
+        sliding_or_chunked_causal_mask,
+        bidirectional_sliding_window_mask,
+        custom_mask,
+    ) = selected_mask_types(kspec)
 
     if any(
         selected_mask_flag == "1" for selected_mask_flag in selected_mask_types(kspec)
     ):
-        padding_mask, causal_mask, sliding_or_chunked_causal_mask, custom_mask = (
-            selected_mask_types(kspec)
-        )
+        (
+            padding_mask,
+            causal_mask,
+            sliding_or_chunked_causal_mask,
+            bidirectional_sliding_window_mask,
+            custom_mask,
+        ) = selected_mask_types(kspec)
     else:
         return None
 
