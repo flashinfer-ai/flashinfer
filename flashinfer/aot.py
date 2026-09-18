@@ -81,6 +81,8 @@ from .jit.flash_kda import (
     GeneratedFlashKDATarget,
     gen_flash_kda_generated_module,
     gen_flash_kda_m128_n16_checkpoint_module,
+    gen_flash_kda_persistent_m128_module,
+    gen_vibecuda_flash_kda_module,
     get_flash_kda_generated_variant_ids,
 )
 from .jit.flash_kda_decode import (
@@ -548,6 +550,12 @@ def gen_all_modules(
     has_flash_kda_prefill_sm103a = sm_capabilities.get(
         "flash_kda_prefill_sm103a", False
     )
+    has_vibecuda_flash_kda_sm100a = sm_capabilities.get(
+        "vibecuda_flash_kda_sm100a", False
+    )
+    has_vibecuda_flash_kda_sm103a = sm_capabilities.get(
+        "vibecuda_flash_kda_sm103a", False
+    )
     has_cake_kda_prefill_sm100a = sm_capabilities.get("cake_kda_prefill_sm100a", False)
     has_cake_kda_prefill_sm103a = sm_capabilities.get("cake_kda_prefill_sm103a", False)
     has_flash_kda_decode_sm100a_legacy = sm_capabilities.get(
@@ -638,7 +646,12 @@ def gen_all_modules(
                 gen_flash_kda_generated_module(variant_id)
                 for variant_id in get_flash_kda_generated_variant_ids(flash_kda_target)
             )
+            jit_specs.append(gen_flash_kda_persistent_m128_module(flash_kda_target))
             jit_specs.append(gen_flash_kda_m128_n16_checkpoint_module(flash_kda_target))
+    if has_vibecuda_flash_kda_sm100a:
+        jit_specs.append(gen_vibecuda_flash_kda_module("sm100a"))
+    if has_vibecuda_flash_kda_sm103a:
+        jit_specs.append(gen_vibecuda_flash_kda_module("sm103a"))
 
     # The Cake-owned unbounded-softplus export remains an exact-architecture
     # artifact on B200 and B300.
@@ -1225,6 +1238,14 @@ def detect_sm_capabilities():
         ),
         "flash_kda_prefill_sm103a": (
             (10, "3a") in compilation_context.TARGET_CUDA_ARCHS
+            and cuda_version >= Version("12.9")
+        ),
+        "vibecuda_flash_kda_sm100a": (
+            (10, "0a") in compilation_context.TARGET_CUDA_ARCHS
+            and cuda_version >= Version("12.8")
+        ),
+        "vibecuda_flash_kda_sm103a": (
+            bool({(10, "3a"), (10, "3f")} & compilation_context.TARGET_CUDA_ARCHS)
             and cuda_version >= Version("12.9")
         ),
         "cake_kda_prefill_sm100a": (
