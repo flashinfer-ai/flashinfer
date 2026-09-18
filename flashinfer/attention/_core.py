@@ -21,7 +21,12 @@ from typing import Optional, Tuple, Union
 import torch
 
 from ..api_logging import flashinfer_api
-from ..jit import gen_batch_attention_module
+from ..jit import gen_batch_attention_module as gen_batch_attention_module
+from ..jit.attention.modules import (
+    _gen_batch_attention_primary_module,
+    _gen_batch_attention_independent_module,
+)
+from ..jit.attention._lazy import _LazyPagedKVStrideModule
 from ..trace.templates.attention import batch_attention_run_trace
 from ..utils import (
     MaskMode,
@@ -38,7 +43,18 @@ from ..jit.utils import filename_safe_dtype_map
 
 @functools.cache
 def get_holistic_attention_module(*args):
-    return gen_batch_attention_module(*args).build_and_load()
+    return _gen_batch_attention_primary_module(*args).build_and_load()
+
+
+class _LazyBatchAttentionIndependentModule(_LazyPagedKVStrideModule):
+    _module_name = "BatchAttention"
+
+
+@functools.cache
+def get_holistic_attention_independent_module(*args):
+    return _LazyBatchAttentionIndependentModule(
+        _gen_batch_attention_independent_module(*args)
+    )
 
 
 class BatchAttention:
@@ -180,6 +196,9 @@ class BatchAttention:
             use_profiler,  # different compiler path
         )
         self.module = get_holistic_attention_module(*get_module_args)
+        self._independent_module = get_holistic_attention_independent_module(
+            *get_module_args
+        )
 
         qo_indptr_host = qo_indptr.to(torch.device("cpu"), non_blocking=True)
         kv_indptr_host = kv_indptr.to(torch.device("cpu"), non_blocking=True)
@@ -212,6 +231,28 @@ class BatchAttention:
             causal,
         )
 
+    @flashinfer_api
+    def prewarm_paged_kv_stride_variant(self, variant: str = "independent") -> None:
+        r"""Load the independent data-stride variant after :meth:`plan`.
+
+        Call this before CUDA graph capture when K and V will have different
+        page, token, or head strides. The only supported variant is
+        ``"independent"``. The equal-stride primary is loaded by :meth:`plan`.
+
+        The independent module is compiled on demand and is not included in
+        the default precompiled cache. With JIT disabled, a compatible cache
+        provider must supply it, or it must already be loaded in this process.
+        """
+        if variant != "independent":
+            raise ValueError(f"variant must be 'independent', got {variant!r}")
+        if getattr(self, "_plan_info", None) is None:
+            raise RuntimeError(
+                "plan() must complete before prewarming a paged-KV-stride variant."
+            )
+        if not self._independent_module.is_loaded:
+            with torch.cuda.device(self.float_workspace_buffer.device):
+                self._independent_module.prewarm()
+
     @flashinfer_api(trace=batch_attention_run_trace)
     def run(
         self,
@@ -236,7 +277,9 @@ class BatchAttention:
         kv_cache : Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
             Either a single packed paged KV-cache tensor (when K and V share storage) or a
             ``(k_cache, v_cache)`` pair.  Layout must match the ``kv_layout`` passed to
-            :meth:`__init__`.
+            :meth:`__init__`. Unequal K/V data strides load a separate module
+            on first use. Call :meth:`prewarm_paged_kv_stride_variant` before
+            CUDA graph capture when these strides differ.
         out : Optional[torch.Tensor]
             Optional output buffer.  If ``None``, a new tensor is allocated with the same
             shape as ``q``.
@@ -299,7 +342,16 @@ class BatchAttention:
             else (None, None)
         )
 
-        self.module.run(
+        module = self.module
+        if k_cache.stride()[:3] != v_cache.stride()[:3]:
+            # Warm holders avoid a device-context switch and capture query.
+            if self._independent_module.is_loaded:
+                module = self._independent_module.get()
+            else:
+                with torch.cuda.device(q.device):
+                    module = self._independent_module.get()
+
+        module.run(
             self.float_workspace_buffer,
             self.int_workspace_buffer,
             self._plan_info,

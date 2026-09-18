@@ -35,7 +35,6 @@ from .jit import JitSpec, build_jit_specs
 from .jit import env as jit_env
 from .jit.activation import act_func_def_str, gen_act_and_mul_module
 from .jit.attention import (
-    gen_batch_attention_module,
     gen_batch_decode_module,
     gen_batch_mla_module,
     gen_batch_prefill_module,
@@ -44,7 +43,10 @@ from .jit.attention import (
     gen_trtllm_gen_fmha_module,
     gen_trtllm_fmha_v2_sm120_module,
 )
-from .jit.attention.modules import _gen_batch_prefill_primary_module
+from .jit.attention.modules import (
+    _gen_batch_attention_primary_module,
+    _gen_batch_prefill_primary_module,
+)
 from .jit.attention.utils import _is_nvfp4_kv_dtype
 from .jit.cascade import gen_cascade_module
 from .jit.cake_fmha import gen_cake_fmha_compat_module
@@ -309,7 +311,7 @@ def gen_attention(
         # The holistic (persistent) batch-attention kernel
         # does not support head_dim=512.
         if head_dim_qk <= 256 and head_dim_vo <= 256:
-            yield gen_batch_attention_module(
+            yield _gen_batch_attention_primary_module(
                 dtype_q=dtype_qo,
                 dtype_kv=dtype_kv,
                 dtype_o=dtype_qo,

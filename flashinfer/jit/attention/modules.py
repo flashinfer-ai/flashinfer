@@ -106,6 +106,32 @@ class _BatchMLAModuleProxy:
 
 BatchPrefillPagedKVStrideMode = Literal["runtime", "equal", "independent"]
 BatchPrefillModuleSurface = Literal["full", "paged"]
+BatchAttentionKVStrideMode = Literal["runtime", "equal", "independent"]
+
+
+def _validate_batch_attention_stride_mode(
+    paged_kv_stride_mode: BatchAttentionKVStrideMode,
+) -> None:
+    if paged_kv_stride_mode not in ("runtime", "equal", "independent"):
+        raise ValueError(
+            "paged_kv_stride_mode must be one of 'runtime', 'equal', or "
+            f"'independent', got {paged_kv_stride_mode!r}"
+        )
+
+
+def _get_batch_attention_module_uri(
+    base_uri: str, paged_kv_stride_mode: BatchAttentionKVStrideMode
+) -> str:
+    _validate_batch_attention_stride_mode(paged_kv_stride_mode)
+    return (
+        base_uri
+        + {
+            "runtime": "",
+            "equal": "_kv_stride_equal",
+            "independent": "_kv_stride_independent",
+        }[paged_kv_stride_mode]
+    )
+
 
 _BATCH_PREFILL_MODULE_URI_SUFFIX = {
     ("runtime", "full"): "",
@@ -1389,7 +1415,7 @@ def gen_batch_prefill_attention_sink_module(
     )
 
 
-def gen_batch_attention_module(
+def _gen_batch_attention_module(
     dtype_q: torch.dtype,
     dtype_kv: torch.dtype,
     dtype_o: torch.dtype,
@@ -1399,6 +1425,8 @@ def gen_batch_attention_module(
     pos_encoding_mode: int,
     use_logits_soft_cap: bool,
     use_profiler: bool,
+    *,
+    paged_kv_stride_mode: BatchAttentionKVStrideMode,
 ):
     uri = get_batch_attention_uri(
         dtype_q,
@@ -1411,6 +1439,7 @@ def gen_batch_attention_module(
         use_logits_soft_cap,
         use_profiler,
     )
+    uri = _get_batch_attention_module_uri(uri, paged_kv_stride_mode)
 
     additional_tensor_names: List[str] = ["maybe_k_cache_sf", "maybe_v_cache_sf"]
     additional_tensor_dtypes: List[str] = ["uint8_t", "uint8_t"]
@@ -1419,7 +1448,7 @@ def gen_batch_attention_module(
     variant_name = f"StandardAttention<{str(use_logits_soft_cap).lower()}>"
     variant_decl = "#include<flashinfer/attention/variants.cuh>"
 
-    return gen_customize_batch_attention_module(
+    return _gen_customize_batch_attention_module(
         uri,
         dtype_q,
         dtype_kv,
@@ -1436,6 +1465,85 @@ def gen_batch_attention_module(
         pos_encoding_mode=pos_encoding_mode,
         use_logits_soft_cap=use_logits_soft_cap,
         use_profiler=use_profiler,
+        paged_kv_stride_mode=paged_kv_stride_mode,
+    )
+
+
+def gen_batch_attention_module(
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    dtype_idx: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    pos_encoding_mode: int,
+    use_logits_soft_cap: bool,
+    use_profiler: bool,
+):
+    """Generate the public compatibility module with runtime stride dispatch."""
+    return _gen_batch_attention_module(
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        dtype_idx,
+        head_dim_qk,
+        head_dim_vo,
+        pos_encoding_mode,
+        use_logits_soft_cap,
+        use_profiler,
+        paged_kv_stride_mode="runtime",
+    )
+
+
+def _gen_batch_attention_primary_module(
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    dtype_idx: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    pos_encoding_mode: int,
+    use_logits_soft_cap: bool,
+    use_profiler: bool,
+):
+    """Generate the default equal-stride persistent attention primary."""
+    return _gen_batch_attention_module(
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        dtype_idx,
+        head_dim_qk,
+        head_dim_vo,
+        pos_encoding_mode,
+        use_logits_soft_cap,
+        use_profiler,
+        paged_kv_stride_mode="equal",
+    )
+
+
+def _gen_batch_attention_independent_module(
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    dtype_idx: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    pos_encoding_mode: int,
+    use_logits_soft_cap: bool,
+    use_profiler: bool,
+):
+    """Generate the persistent attention module loaded lazily for unequal strides."""
+    return _gen_batch_attention_module(
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        dtype_idx,
+        head_dim_qk,
+        head_dim_vo,
+        pos_encoding_mode,
+        use_logits_soft_cap,
+        use_profiler,
+        paged_kv_stride_mode="independent",
     )
 
 
@@ -2211,6 +2319,49 @@ def gen_customize_batch_attention_module(
     use_logits_soft_cap: bool = False,
     use_profiler: bool = False,
 ):
+    """Generate a custom runtime-dispatched module under the caller's unchanged URI."""
+    return _gen_customize_batch_attention_module(
+        uri,
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        idtype,
+        head_dim_qk,
+        head_dim_vo,
+        additional_tensor_names,
+        additional_tensor_dtypes,
+        additional_scalar_names,
+        additional_scalar_dtypes,
+        variant_name,
+        variant_decl,
+        pos_encoding_mode=pos_encoding_mode,
+        use_logits_soft_cap=use_logits_soft_cap,
+        use_profiler=use_profiler,
+        paged_kv_stride_mode="runtime",
+    )
+
+
+def _gen_customize_batch_attention_module(
+    uri: str,
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    idtype: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    additional_tensor_names: List[str],
+    additional_tensor_dtypes: List[str],
+    additional_scalar_names: List[str],
+    additional_scalar_dtypes: List[str],
+    variant_name: str,
+    variant_decl: str,
+    pos_encoding_mode: int = 0,
+    use_logits_soft_cap: bool = False,
+    use_profiler: bool = False,
+    *,
+    paged_kv_stride_mode: BatchAttentionKVStrideMode,
+):
+    _validate_batch_attention_stride_mode(paged_kv_stride_mode)
     kwargs = {
         "variant_decl": variant_decl,
         "variant_name": variant_name,
@@ -2222,6 +2373,12 @@ def gen_customize_batch_attention_module(
         "head_dim_vo": head_dim_vo,
         "pos_encoding_mode": pos_encoding_mode_literal[pos_encoding_mode],
         "use_logits_soft_cap": str(use_logits_soft_cap).lower(),
+        "paged_kv_stride_mode": paged_kv_stride_mode,
+        "equal_kv_strides_values": {
+            "runtime": ["false", "true"],
+            "equal": ["true"],
+            "independent": ["false"],
+        }[paged_kv_stride_mode],
     }
     gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
     (additional_params_decl, additional_func_params, _) = generate_additional_params(

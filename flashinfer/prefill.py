@@ -18,7 +18,6 @@ import functools
 import logging
 import math
 import os
-import threading
 from types import SimpleNamespace
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union, overload
 
@@ -27,8 +26,8 @@ import torch
 from .api_logging import flashinfer_api
 from .cudnn import cudnn_batch_prefill_with_kv_cache
 from .cudnn.prefill import _cudnn_supports_direct_seqlens
+from .jit.attention._lazy import _LazyPagedKVStrideModule
 from .jit import (
-    MissingJITCacheError,
     gen_batch_prefill_module,
     gen_customize_batch_prefill_module,
     gen_fmha_cutlass_sm100a_module,
@@ -473,60 +472,8 @@ def get_single_prefill_module(backend, *args):
     return SimpleNamespace(run=run_single_prefill)
 
 
-class _LazyBatchPrefillIndependentModule:
-    """Load one independent-stride batch-prefill module on first eager use."""
-
-    def __init__(self, spec: Any) -> None:
-        self._spec = spec
-        self._lock = threading.Lock()
-        self._module: Optional[Any] = None
-
-    @property
-    def is_loaded(self) -> bool:
-        """Whether this holder already has an in-process loaded module."""
-        return self._module is not None
-
-    @staticmethod
-    def _check_not_capturing() -> None:
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError(
-                "The lazy independent paged-KV-stride module cannot be compiled "
-                "or loaded during CUDA graph capture. Call "
-                "prewarm_paged_kv_stride_variant('independent') after plan() "
-                "and before capture."
-            )
-
-    def get(self) -> Any:
-        """Return the loaded module, building it once outside graph capture."""
-        module = self._module
-        if module is not None:
-            return module
-
-        self._check_not_capturing()
-        with self._lock:
-            module = self._module
-            if module is not None:
-                return module
-            self._check_not_capturing()
-            try:
-                module = self._spec.build_and_load()
-            except MissingJITCacheError as exc:
-                raise MissingJITCacheError(
-                    "Unequal K/V data strides require FlashInfer's lazy "
-                    "independent paged module, which is not included in the "
-                    "default JIT cache. Use equal-stride K/V tensors, enable "
-                    "local JIT and call "
-                    "prewarm_paged_kv_stride_variant('independent') after "
-                    "plan(), or install a compatible independent-module cache "
-                    "package when one becomes available.",
-                    spec=exc.spec,
-                ) from exc
-            self._module = module
-            return module
-
-    def prewarm(self) -> None:
-        """Eagerly load the independent module for later graph capture."""
-        self.get()
+class _LazyBatchPrefillIndependentModule(_LazyPagedKVStrideModule):
+    _module_name = "paged"
 
 
 @functools.cache
