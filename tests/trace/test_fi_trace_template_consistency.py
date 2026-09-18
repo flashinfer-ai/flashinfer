@@ -1616,6 +1616,50 @@ def test_fi_trace_complete_gqa_paged_decode():
     assert "unknown" not in str(defn["outputs"])
 
 
+def test_fi_trace_cudnn_batch_decode_multi_token_rows_have_their_own_axis():
+    """q_len_per_req > 1: q / output carry batch_size * q_len_per_req rows
+    while block_tables keeps batch_size rows. One shared axis could not
+    describe both (B=4, q_len 2: q is (8, H, D), the table (4, pages)); the
+    decode template gives the rows ``num_q_rows`` and the extractors read the
+    two counts from their own tensors."""
+    from flashinfer.cudnn.decode import cudnn_batch_decode_with_kv_cache
+    from flashinfer.trace.templates.attention import (
+        _CUDNN_PAGED_AXES,
+        cudnn_batch_decode_trace,
+    )
+
+    B, QL, H, KV, D, P, NPPS = 4, 2, 8, 4, 128, 16, 4
+    kwargs = dict(
+        q=torch.zeros(B * QL, H, D, dtype=torch.bfloat16),
+        k_cache=torch.zeros(B * NPPS, KV, P, D, dtype=torch.bfloat16),
+        v_cache=torch.zeros(B * NPPS, KV, P, D, dtype=torch.bfloat16),
+        scale=1.0 / D**0.5,
+        workspace_buffer=torch.zeros(1, dtype=torch.uint8),
+        max_sequence_kv=NPPS * P,
+        block_tables=torch.zeros(B, NPPS, dtype=torch.int32),
+        q_len_per_req=QL,
+    )
+    extractors = cudnn_batch_decode_trace._build_axis_extractors()
+    assert extractors["num_q_rows"](kwargs) == B * QL
+    assert extractors["batch_size"](kwargs) == B
+    assert extractors["num_pages_per_seq"](kwargs) == NPPS
+
+    defn = cudnn_batch_decode_with_kv_cache.fi_trace(**kwargs)
+    assert defn["inputs"]["q"]["shape"] == ["num_q_rows", "num_heads_qo", "head_dim"]
+    assert defn["outputs"]["output"]["shape"][0] == "num_q_rows"
+    assert defn["inputs"]["block_tables"]["shape"] == [
+        "batch_size",
+        "num_pages_per_seq",
+    ]
+    assert defn["axes"]["num_q_rows"]["type"] == "var"
+    assert defn["axes"]["batch_size"]["type"] == "var"
+    assert defn["axes"]["num_heads_qo"]["value"] == H
+    assert defn["axes"]["head_dim"]["value"] == D
+    assert defn["axes"]["page_size"]["value"] == P
+    # The prefill template keeps the shared axis map untouched.
+    assert "num_q_rows" not in _CUDNN_PAGED_AXES
+
+
 @pytest.mark.parametrize(
     "routing_method_type,top_k,extra_kwargs,expected_name_prefix",
     [
