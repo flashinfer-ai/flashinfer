@@ -207,7 +207,7 @@ def _run_non_cp_prefill(q, k, v, alpha, beta, cu_seqlens, scale, initial_state=N
         initial_state,
         True,
         cu_seqlens,
-        True,
+        use_qk_l2norm_in_kernel=False,
         output=ref_o,
         output_state=ref_state,
         use_cp=False,
@@ -614,7 +614,7 @@ def test_cp_delta_rule_prefill_varlen_matches_non_cp_prefill(
         None,
         True,
         cu_seqlens,
-        True,
+        use_qk_l2norm_in_kernel=False,
         output=ref_o,
         output_state=ref_state,
         use_cp=False,
@@ -719,7 +719,7 @@ def test_cp_delta_rule_prefill_varlen_matches_non_cp_prefill_unequal_heads(
         None,
         True,
         cu_seqlens,
-        True,
+        use_qk_l2norm_in_kernel=False,
         output=ref_o,
         output_state=ref_state,
         use_cp=False,
@@ -928,7 +928,7 @@ def test_cp_delta_rule_e2e(
         None,
         True,
         cu_seqlens,
-        True,
+        use_qk_l2norm_in_kernel=False,
         output=ref_o,
         output_state=ref_state,
         use_cp=False,
@@ -981,10 +981,30 @@ def test_cp_delta_rule_public_wrapper_matches_non_cp_prefill(
     beta = _make_gates(total_seqlen, num_heads, 0.99, device)
 
     our_o, our_state = chunk_gated_delta_rule(
-        q, k, v, alpha, beta, scale, None, True, cu_seqlens, True, use_cp=True
+        q,
+        k,
+        v,
+        alpha,
+        beta,
+        scale,
+        None,
+        True,
+        cu_seqlens,
+        use_qk_l2norm_in_kernel=False,
+        use_cp=True,
     )
     ref_o, ref_state = chunk_gated_delta_rule(
-        q, k, v, alpha, beta, scale, None, True, cu_seqlens, True, use_cp=False
+        q,
+        k,
+        v,
+        alpha,
+        beta,
+        scale,
+        None,
+        True,
+        cu_seqlens,
+        use_qk_l2norm_in_kernel=False,
+        use_cp=False,
     )
     torch.cuda.synchronize()
 
