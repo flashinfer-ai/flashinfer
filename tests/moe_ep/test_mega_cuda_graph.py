@@ -45,7 +45,11 @@ def _require_blackwell():
 
 
 def _single_rank_layer(
-    backend_name: str, hidden: int = 2048, intermediate: int = 1024, knobs=None
+    backend_name: str,
+    hidden: int = 2048,
+    intermediate: int = 1024,
+    knobs=None,
+    quantize_input: bool = True,
 ):
     """MoEEpMegaLayer on one rank (MEGA_NO_DIST) with bf16 staging."""
     import torch
@@ -105,7 +109,7 @@ def _single_rank_layer(
         weights=MoEWeightPack(w13=w13, w2=w2),
         backend=MegaConfig(
             megakernel=mk,
-            quantize_input=True,
+            quantize_input=quantize_input,
             preprocess_weights=True,
         ),
     )
@@ -151,7 +155,10 @@ def _random_batch(problem: dict, *, seed: int, num_tokens: int = 32):
 
 
 @pytest.mark.arch_blackwell
-@pytest.mark.parametrize("backend_name", ["nvfp4", "mxfp8", "w4a16"])
+@pytest.mark.parametrize(
+    "backend_name,quantize_input",
+    [("nvfp4", True), ("mxfp8", True), ("w4a16", True), ("w4a16", False)],
+)
 @pytest.mark.parametrize(
     "hidden,intermediate",
     [
@@ -163,7 +170,7 @@ def _random_batch(problem: dict, *, seed: int, num_tokens: int = 32):
     ],
 )
 def test_mega_layer_graph_capture_replay_matches_eager(
-    monkeypatch, request, backend_name, hidden, intermediate
+    monkeypatch, request, backend_name, quantize_input, hidden, intermediate
 ):
     import torch
 
@@ -177,16 +184,16 @@ def test_mega_layer_graph_capture_replay_matches_eager(
         hidden,
         intermediate,
         knobs="auto" if backend_name == "w4a16" else None,
+        quantize_input=quantize_input,
     )
     try:
         t = _random_batch(problem, seed=3)
 
         # 1) Warmup includes the real collective autotune sweep for knobs="auto".
         # Later eager/capture/replay calls use the selected callable normally.
-        layer.warmup()
+        layer.warmup(t if not quantize_input else None)
 
-        # Eager reference on the real batch (also proves warmup's dummy batch
-        # left the layer in a working steady state).
+        # Eager reference on the real batch after warmup.
         y_eager = layer.forward(t).clone()
         torch.cuda.synchronize()
 

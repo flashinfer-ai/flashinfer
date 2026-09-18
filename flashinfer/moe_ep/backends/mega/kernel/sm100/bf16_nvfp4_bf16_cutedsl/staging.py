@@ -10,7 +10,7 @@ from typing import Any
 
 import torch
 
-from ..bf16_bf16_bf16_cutedsl.staging import (
+from ..common.bf16_staging import (
     stage_mega_moe_inputs as _torch_stage_mega_moe_inputs,
 )
 

@@ -280,9 +280,9 @@ def default_knobs(
     provenance.  ``combine_dtype`` and ``enable_in_kernel_fc2_reduce`` are
     session axes the profile is made valid against, so the result is always
     directly applicable to that session.  Permitting ikr also selects it by
-    default on every dtype (an autotune sweep may still turn it back off);
-    BF16 additionally constrains the token-back carrier to match.  Only NVFP4
-    has quantized combine.
+    default on supported dtypes (an autotune sweep may still turn it back off);
+    BF16 additionally constrains the token-back carrier to match. W4A16 always
+    uses external reduction. Only NVFP4 has quantized combine.
 
     Returns a fresh dict each call.
     """
@@ -308,7 +308,7 @@ def default_knobs(
         )
     raise ValueError(
         f"no knob profile for dtype {dtype!r}; expected 'nvfp4', 'mxfp8', "
-        "'bf16', or 'bf16_mxfp8'."
+        "'bf16', 'bf16_mxfp8', or 'w4a16'."
     )
 
 

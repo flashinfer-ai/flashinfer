@@ -15,9 +15,9 @@ from ......core.validation.common import (
     MoEEpArchError,
     MoEEpConfigError,
     validate_mega_fleet_params,
-    validate_mega_forward_inputs,
 )
 from ......weights import MoEWeightPack
+from ..common.bf16_staging import validate_bf16_forward_inputs
 from .staging import stage_mega_moe_inputs
 from .config import Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
 from .weights import (
@@ -136,10 +136,7 @@ class W4A16CutedslMegaKernelBackend(MegaKernelBackend):
     def validate_forward(
         self, t: MoEEpTensors, fleet_params: FleetParams, *, quantize_input: bool
     ) -> None:
-        if not quantize_input:
-            raise MoEEpConfigError(
-                "W4A16 MegaMoE accepts BF16 activations; keep MegaConfig.quantize_input=True"
-            )
+        del quantize_input
         if any(
             v is not None
             for v in (t.scales, t.fc1_alpha, t.fc2_alpha, t.fc1_norm_const)
@@ -150,8 +147,14 @@ class W4A16CutedslMegaKernelBackend(MegaKernelBackend):
             )
         if t.hidden_states.ndim != 2 or t.topk_ids.ndim != 2:
             raise MoEEpConfigError("W4A16 activations and routing must be 2D")
-        if t.hidden_states.dtype != torch.bfloat16:
-            raise MoEEpConfigError("W4A16 MegaMoE hidden_states must be BF16")
+        validate_bf16_forward_inputs(
+            t.hidden_states,
+            t.topk_ids,
+            t.topk_weights,
+            fleet_params,
+            top_k=self._kernel_config.top_k,
+            scales=t.scales,
+        )
         if t.topk_ids.dtype not in (torch.int32, torch.int64):
             raise MoEEpConfigError("W4A16 MegaMoE topk_ids must be int32 or int64")
         if t.topk_weights.dtype != torch.float32:
@@ -164,14 +167,6 @@ class W4A16CutedslMegaKernelBackend(MegaKernelBackend):
             raise MoEEpConfigError(
                 "W4A16 activations and routing must share a CUDA device"
             )
-        validate_mega_forward_inputs(
-            t.hidden_states,
-            t.topk_ids,
-            t.topk_weights,
-            fleet_params,
-            top_k=self._kernel_config.top_k,
-            quantize_input=True,
-        )
 
     def validate_capture_ready(
         self, workspace: Any, transformed_weights: TransformedMegaWeights
@@ -186,6 +181,7 @@ class W4A16CutedslMegaKernelBackend(MegaKernelBackend):
     def stage_inputs(
         self, t: MoEEpTensors, workspace: Any, *, quantize_input: bool
     ) -> None:
+        del quantize_input
         stage_mega_moe_inputs(
             t.hidden_states,
             t.topk_weights,

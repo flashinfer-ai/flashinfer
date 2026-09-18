@@ -296,7 +296,7 @@ def test_mega_layer_forward_rejects_topk_weights_shape_mismatch():
 
 @pytest.mark.parametrize(
     "backend_name, error",
-    (("deep_gemm", "scales is required"), ("w4a16", "quantize_input=True")),
+    (("deep_gemm", "scales is required"), ("w4a16", "Expected bf16")),
 )
 def test_mega_layer_forward_rejects_invalid_copy_mode(backend_name, error):
     import torch
