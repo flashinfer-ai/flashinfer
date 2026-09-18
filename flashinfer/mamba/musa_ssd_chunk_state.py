@@ -343,6 +343,9 @@ def _chunk_cumsum_fwd(
         and chunk_size == 128
         and nheads == 64
         and dt_bias is not None
+        and dt_softplus
+        and dt_limit[0] == 0.0
+        and dt_limit[1] >= _DT_MAX
         and dt.dtype == torch.float32
         and A.dtype == torch.float32
         and dt_bias.dtype == torch.float32

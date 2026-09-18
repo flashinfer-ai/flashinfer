@@ -103,6 +103,8 @@ std::tuple<torch::Tensor, torch::Tensor> musa_ssd_chunk_cumsum(
   TORCH_CHECK(dt.dim() == 2 && dt.size(1) == kHeads &&
                   dt.scalar_type() == torch::kFloat,
               "SSD cumsum dt must be [tokens,64] float32");
+  TORCH_CHECK(A.device() == dt.device() && bias.device() == dt.device(),
+              "SSD cumsum inputs must be on the same MUSA device");
   TORCH_CHECK(A.dim() == 1 && A.size(0) == kHeads &&
                   A.scalar_type() == torch::kFloat && A.is_contiguous(),
               "SSD cumsum A must be contiguous float32 [64]");
