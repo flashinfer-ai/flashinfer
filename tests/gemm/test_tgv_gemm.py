@@ -66,8 +66,8 @@ def _blockscaled_tgv_case(m, n, k, a_dtype, b_dtype, sf_dtype, sf_vec_size):
 def test_tgv_gemm_sm100(m, n, k, a_dtype, b_dtype, sf_dtype, sf_vec_size):
     """Test tgv_gemm_sm100 with autotuner integration."""
     device = torch.device("cuda")
-    if not _match_sm_version(device, ["100", "103"]):
-        pytest.skip("TGV GEMM requires SM100, SM103 architecture")
+    if not _match_sm_version(device, ["100", "103", "107"]):
+        pytest.skip("TGV GEMM requires SM100, SM103, SM107 architecture")
 
     if sf_dtype is not None:
         a, b, a_descale, b_descale, bias, reference = _blockscaled_tgv_case(
