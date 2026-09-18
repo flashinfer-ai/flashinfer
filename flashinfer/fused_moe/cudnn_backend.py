@@ -226,14 +226,21 @@ class _Stage:
         )
         self.weight_layout = weight_layout
         if weight_layout not in (None, "k_blocked_64_v1"):
-            raise ValueError("Unsupported FC1 weight layout")
+            raise ValueError("Unsupported cuDNN stage weight layout")
         parent_valid = (
             _has_k64_fc1_parent
             if weight_layout is not None
             else _has_canonical_fc1_parent
         )
         if weight_layout is not None and weights_parent is None:
-            raise ValueError("Prepared FC1 weights require an explicit parent")
+            if fused:
+                raise ValueError("Prepared FC1 weights require an explicit parent")
+            if (
+                len(weights) != 1
+                or weights[0].ndim != 4
+                or not weights[0].is_contiguous()
+            ):
+                raise ValueError("Prepared FC2 requires one contiguous rank-4 weight")
         self.weights = []
         self.weights_parent = None
         if weights_parent is not None:
@@ -367,7 +374,12 @@ class _Stage:
             if weights_parent is not None:
                 raise ValueError("This FC1 plan does not declare a parent weight")
             pack.update(
-                (desc, weight.transpose(1, 2))
+                (
+                    desc,
+                    weight
+                    if self.weight_layout is not None
+                    else weight.transpose(1, 2),
+                )
                 for desc, weight in zip(self.weights, weights, strict=True)
             )
         else:
@@ -499,11 +511,11 @@ class CudnnMoeRunner(MoERunner):
             raise NotImplementedError(
                 f"CudnnMoeRunner does not support SM{major}{minor}"
             )
-        if getattr(self.backend_config, "fc1_weight_layout", None) is not None and (
-            major,
-            minor,
-        ) != (10, 0):
-            raise NotImplementedError("K64 prepared FC1 currently requires SM100")
+        if any(
+            getattr(self.backend_config, stage + "_weight_layout", None) is not None
+            for stage in ("fc1", "fc2")
+        ) and (major, minor) != (10, 0):
+            raise NotImplementedError("K64 prepared FC1/FC2 currently requires SM100")
         _check_cudnn_version(92100, "BF16 MoE")
         if not self.config.finalize.do_finalize:
             raise NotImplementedError(
@@ -582,27 +594,47 @@ class CudnnMoeRunner(MoERunner):
             x.shape[1],
         )
         tensors = [v[name] for name in ("up", "gate", "down", "gate_up")]
+        down = tensors[2]
+        fc2_layout = getattr(self.backend_config, "fc2_weight_layout", None)
+        down_shape: tuple[int, ...]
+        if fc2_layout is not None:
+            if (
+                h % 128
+                or i % 64
+                or not 1 <= x.shape[0] * self.config.routing.top_k <= 513
+            ):
+                raise ValueError(
+                    "K64 FC2 requires H divisible by128, I divisible by64 and1..513 routed rows"
+                )
+            down_shape = (e, i // 64, h, 64)
+            down_storage_valid = tuple(down.stride()) == (h * i, h * 64, 64, 1)
+        else:
+            down_shape = (e, h, i)
+            down_storage_valid = down.is_contiguous()
+        if (
+            down.device != self.device
+            or down.dtype != torch.bfloat16
+            or tuple(down.shape) != down_shape
+            or not down_storage_valid
+        ):
+            raise ValueError(
+                f"Invalid cuDNN FC2 weight layout; expected BF16 {down_shape} on {self.device}"
+            )
         if getattr(self.backend_config, "fc1_weight_layout", None) is not None:
             if not _has_k64_fc1_parent(tensors[:2], tensors[3]):
                 raise ValueError("Expected explicit prepared K64 gate/up weight views")
-            parent, down = tensors[3], tensors[2]
+            parent = tensors[3]
             if (
                 tuple(parent.shape) != (e, h // 64, 2 * i, 64)
                 or h % 64
                 or parent.device != self.device
-                or down.device != self.device
-                or down.dtype != torch.bfloat16
-                or tuple(down.shape) != (e, h, i)
-                or not down.is_contiguous()
             ):
-                raise ValueError(
-                    "Invalid prepared K64 FC1 or canonical BF16 FC2 weights"
-                )
+                raise ValueError("Invalid prepared K64 FC1 weights")
         else:
             for name, t, shape in zip(
-                ("up", "gate", "down", "gate_up"),
-                tensors,
-                ((e, i, h), (e, i, h), (e, h, i), (e, 2 * i, h)),
+                ("up", "gate", "gate_up"),
+                (tensors[0], tensors[1], tensors[3]),
+                ((e, i, h), (e, i, h), (e, 2 * i, h)),
                 strict=True,
             ):
                 split_view = name in ("up", "gate") and tuple(t.stride()) == (
@@ -758,6 +790,7 @@ class CudnnMoeRunner(MoERunner):
             s["projected"],
             tactic=self.backend_config.fc2_tactic,
             tactics=self.backend_config.fc2_tactics,
+            weight_layout=self.backend_config.fc2_weight_layout,
         )
 
     def get_valid_tactics(self, inputs, profile):

@@ -890,6 +890,10 @@ class CudnnMoeConfig:
     weights on SM100. Pass the same value to ``prepare_weights`` before
     capture; this requires the paired SwiGLU engine and never falls back
     to an engine that expects canonical weights.
+    ``fc2_weight_layout="k_blocked_64_v1"`` independently prepares FC2
+    as contiguous ``[E,I/64,H,64]`` on SM100, requiring paired FC2 and
+    1..513 routed rows. Set the same option in ``prepare_weights``;
+    H must be divisible by128 and I by64. Both layouts prepare outside capture.
     """
 
     use_native_routing: bool = False
@@ -899,8 +903,11 @@ class CudnnMoeConfig:
     fc2_tactics: Tuple[tuple, ...] = ()
     fc1_fusion: Optional[bool] = None
     fc1_weight_layout: Optional[str] = None
+    fc2_weight_layout: Optional[str] = None
 
     def __post_init__(self):
+        if self.fc2_weight_layout not in (None, "k_blocked_64_v1"):
+            raise ValueError("Unsupported cuDNN FC2 weight layout")
         if self.fc1_weight_layout not in (None, "k_blocked_64_v1"):
             raise ValueError("Unsupported cuDNN FC1 weight layout")
         if self.fc1_weight_layout is not None and self.fc1_fusion is False:
@@ -955,6 +962,7 @@ class CudnnMoeConfig:
         activation: Optional[ActivationConfig] = None,
         device=None,
         fc1_weight_layout=None,
+        fc2_weight_layout=None,
     ):
         import torch
 
@@ -969,6 +977,12 @@ class CudnnMoeConfig:
         if tuple(w1_bf16.shape) != (e, 2 * i, h) or tuple(w2_bf16.shape) != (e, h, i):
             raise ValueError(
                 "cuDNN MoE expects [up, gate] FC1 weights and [E,H,I] FC2 weights"
+            )
+        if fc2_weight_layout not in (None, "k_blocked_64_v1"):
+            raise ValueError("Unsupported cuDNN FC2 weight layout")
+        if fc2_weight_layout is not None and (h % 128 or i % 64):
+            raise ValueError(
+                "K64 FC2 weights require H divisible by128 and I divisible by64"
             )
         if fc1_weight_layout not in (None, "k_blocked_64_v1"):
             raise ValueError("Unsupported cuDNN FC1 weight layout")
@@ -998,12 +1012,18 @@ class CudnnMoeConfig:
             # retain the combined tensor's expert pitch.
             gate_up = torch.cat((gate, up), dim=1).contiguous()
             gate, up = gate_up.split(i, dim=1)
-        return {
-            "up": up,
-            "gate": gate,
-            "down": w2_bf16.to(device).contiguous(),
-            "gate_up": gate_up,
-        }
+        down = w2_bf16.to(device)
+        if fc2_weight_layout is not None:
+            down = (
+                down.unflatten(-1, (i // 64, 64))
+                .transpose(1, 2)
+                .contiguous()
+                .view(-1)
+                .view(e, i // 64, h, 64)
+            )
+        else:
+            down = down.contiguous()
+        return {"up": up, "gate": gate, "down": down, "gate_up": gate_up}
 
 
 @dataclass(frozen=True)

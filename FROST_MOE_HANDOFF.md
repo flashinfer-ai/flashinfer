@@ -1,3 +1,59 @@
+## Independent K64 FC2 layout: native FE and full FlashInfer validation
+
+FC2 now independently accepts explicit `weight_layout="k_blocked_64_v1"`
+on the SM100 paired engine 20402. FI appends `fc2_weight_layout` to
+`CudnnMoeConfig` and `prepare_weights`; it prepares a dense BF16
+`[E,I/64,H,64]` buffer. FC1 and FC2 layout choices are independent.
+Canonical weights remain the default. Declared layout, exact strides,
+native binding and compile/cache identity agree; execute retains the live
+prepared pointer and performs no repacking, allocation, JIT or synchronization.
+The explicit FC2 layout requires SM100, 1–513 routed rows, H divisible by 128
+and I divisible by 64; incompatible engines decline it before execution.
+
+Matched complete synthetic BF16 MoE on one 148-SM, 1000 W B200,
+E=128, top-k=8, H=2048, I=768. M64+K64 FC1 is held fixed; only FC2 layout and its
+existing 12/6-stage option vary. Both stage choices are shown; selecting the
+faster existing depth is not counted as a new kernel optimization.
+
+| Tokens | Routing | Canonical /12 | K64 /12 | Canonical /6 | K64 /6 | Best K64 vs best canonical |
+|---:|---|---:|---:|---:|---:|---:|
+| 8 | unpacked | 100.654375 us | 101.107000 us | 100.334750 us | 99.266375 us | 1.065% lower |
+| 8 | packed | 100.662000 us | 101.058250 us | 100.322250 us | 99.266125 us | 1.053% lower |
+| 64 | unpacked | 202.073125 us | 200.893000 us | 200.273250 us | 198.665500 us | 0.803% lower |
+| 64 | packed | 202.114250 us | 200.870000 us | 200.398125 us | 198.714125 us | 0.840% lower |
+
+Weight preparation is outside replay; retained prepared storage is unchanged.
+PDL overlaps the stages, so their durations cannot be added. These results
+are complete-operator measurements, not model E2E. The geometry matches
+unsharded Qwen3-30B-A3B, but inputs, weights and routes remain synthetic.
+Latest M64/newFC2 versus strongest TRT is pending a fresh same-card comparison.
+Previous T8 matched result used M128 FC1 and the previous FC2: 101.109063 us Frost versus 96.457250 us
+TRT after 704 joint FC1/FC2/PDL choices (audit 2297); do not subtract new-run
+gains from those numbers. SM120's separately validated T1 packed result is
+82.794563 us Frost versus 87.114375 us tuned CUTLASS on RTX PRO 6000 Server at 600 W
+(audit 2120). No performance roof is claimed.
+
+Native graph audit 2345: 414 zero-skip executions (50 GPU graph cases and 88 CPU
+contracts in each normal/memcheck/racecheck mode), 1500 raw outputs,
+450 changed-reference controls and 300 captured routes. Coverage includes
+canonical/K64 layouts, 12/6 stages, R=1..513, E=257, singleton K=64, pitched canonical weights,
+live weights/inputs/offsets and retained graph bindings. CPU regressions were
+seen fail before the fix. FI CPU contracts pass 35 cases, including 9 new cases.
+
+Complete FI audit 2364 / job 4395107: 1184 raw checks,480 changed-reference controls,
+3072 CUPTI spans; both layouts/depths, T8/T64 and packed/unpacked routing pass
+normal/memcheck/racecheck before fresh forward/reverse timing processes.
+CPU/GPU prepared bytes and cross-layout outputs match bitwise; capture guards,
+actual kernel routes, workspace, live tensors and legacy graphs are checked.
+Changed-file hooks pass. Full repository CI is not claimed.
+
+Credit: NVIDIA Frost/CuTeDSL, Kernel Factory 624/2f5c and 2132/e459dff,
+validated KF round 2 M64 geometry/drain with the original scheduler retained,
+Yanqin Zhai PR #1090, Yanqin/Yihua's distillation, CUTLASS example 113 and native
+TRT-LLM routing/finalizer authors. TRT weight preparation motivated the K64
+exploration; no TRT kernel body is copied. Rejected experiments remain in
+the private evidence archive rather than this implementation.
+
 ## Explicit K64 FC1 layout through FE and FlashInfer — 2026-09-18
 
 Paired SM100 SwiGLU FC1 now accepts `weight_layout="k_blocked_64_v1"`.
@@ -11,11 +67,11 @@ FlashInfer exposes the append-only `CudnnMoeConfig.fc1_weight_layout` field
 and matching preparation keyword. Both must select the same layout. The
 preparation helper creates the K64 parent directly from ordinary `[up,gate]`
 weights; FC2 is unchanged. Prepared FC1 requires SM100, standard SwiGLU,
-BF16, H/I divisible by64 and the paired engine's1–513 routed-row contract.
+BF16, H/I divisible by 64 and the paired engine's1–513 routed-row contract.
 An unsupported graph or device declines instead of reinterpreting the weights.
 The default canonical layout and existing tactics retain their behavior.
 
-Same-input full MoE comparison,148-SM B200 at1000W, BF16 E128/top8/H2048/I768,
+Same-input full MoE comparison,148-SM B200 at1000W, BF16 E=128, top-k=8, H=2048, I=768,
 T8, identical FE/FI source and paired12-stage FC2 in both arms:
 
 | Routing | Canonical FC1 | K64 FC1 | Latency reduction |
@@ -67,7 +123,7 @@ no GPU preparation speedup or model E2E claim is made.
 Latest companion evidence available separately: public FC2 depth audit2199;
 strongest-native T8 comparator audit2167 (Frost102.232750us vs TRT96.686313us,
 Frost5.737% slower, all704 FC1/FC2/PDL combinations); SM120 audit2120 (Frost
-82.794563us vs CUTLASS87.114375us,4.959% lower after128 joint configurations).
+82.794563 us vs CUTLASS87.114375us,4.959% lower after128 joint configurations).
 Those use their own matched snapshots and must not be combined with this
 K64 percentage. TRT preparation includes gate/up interleave, row shuffle and
 BlockMajorK128B conversion outside timing. The pre-existing FC2 cancellation
@@ -75,7 +131,7 @@ limitation documented by audit2214 remains unresolved; no broad accuracy or
 performance-roof claim is made.
 
 Credit: NVIDIA Frost/CuTeDSL and the existing paired implementation; Kernel
-Factory624/2f5c/f19299 and later FC2-depth work; Yanqin Zhai's PR1090 and
+Factory624/2f5c/f19299 and later FC2-depth work; Yanqin Zhai's PR #1090 and
 Yanqin/Yihua's parallel distillation; CUTLASS example113. TRT-LLM preparation
 motivated this exploration; its kernel body and shuffle implementation were
 not copied. The separate KF M64 scheduler ablation remains private experimental
@@ -83,7 +139,7 @@ work pending combination and integration evidence.
 
 ## Paired FC2 admission extended to 513 routed rows — 2026-09-17
 
-The SM100 paired BF16 projection engine20402 now accepts1–513 total routed
+The SM100 paired BF16 projection engine 20402 now accepts1–513 total routed
 rows, so FlashInfer can select it for T8/top8 and T64/top8 as well as T1.
 The canonical weight layout, stride/alignment checks, public knobs, caller
 workspace and stream contracts are unchanged. The executable kernel is
@@ -91,7 +147,7 @@ unchanged; this extends access to its existing persistent multiwave path.
 Ordinary engine20400 remains an eligible alternative; enumeration is not a
 performance ranking and no universal dispatch preference is introduced.
 
-With paired FC1 held fixed, E128/top8/H2048/I768, synthetic BF16 inputs and
+With paired FC1 held fixed, E=128, top-k=8, H=2048, I=768, synthetic BF16 inputs and
 fixed saved CPU bytes, one148SM/1000W B200 measured complete FI MoE:
 
 | Tokens | Routing | Ordinary FC2 baseline | Paired FC2 | Latency reduction |
@@ -127,7 +183,7 @@ made. The separate FC2 small-row scheduler candidate remains unpublished
 until its full-FI composition measurement passes.
 
 Credit: NVIDIA Frost and its persistent scheduler; KF624/2f5c paired and
-compact-resource contributions; Yanqin Zhai PR1090, CUTLASS113/rank5 guidance,
+compact-resource contributions; Yanqin Zhai PR #1090, CUTLASS example 113/rank5 guidance,
 and Yanqin/Yihua. FlashInfer supplies the integration and NVIDIA TRT-LLM the
 native finalizer. The new contribution here is validating and exposing the
 existing kernel across a wider graph contract.
@@ -138,9 +194,9 @@ measurements and frozen-source scopes remain separately identified.
 ## Latest validated configuration and interface results — 2026-09-17
 
 On RTX PRO 6000 Blackwell Server (188 SMs, 600W), synthetic BF16
-T1/E128/top8/H2048/I768 with PackedPrecomputed routing, Frost measures
+T1/E=128, top-k=8, H=2048, I=768 with PackedPrecomputed routing, Frost measures
 **82.794563 us** versus **87.114375 us** for the freshly selected CUTLASS
-backend winner: **4.959% lower complete-MoE latency** (audit2120). This is a
+backend winner: **4.959% lower complete-MoE latency** (audit 2120). This is a
 direct same-card comparison, not a sum of gains from different experiments.
 Both weight preparations are outside timing; the fixed CPU fixture and
 actual loaded sources, generated kernels and binary hashes are recorded.
@@ -201,7 +257,7 @@ candidate also remains unpublished pending complete-MoE validation.
 Credit: NVIDIA Frost supplies the configurable GEMMs/scheduler; NVIDIA
 TRT-LLM/CUTLASS and FlashInfer supply the competing kernels, routing and
 finalization. Paired FC2 retains KF624/2f5c contributions and
-YanqinPR1090/CUTLASS113 guidance; small-row work builds on KFf19299. Yanqin
+YanqinPR #1090/CUTLASS example 113 guidance; small-row work builds on KFf19299. Yanqin
 and Yihua's contributions and the other specific credits below remain.
 All results here are synthetic model-shaped operator measurements, not
 checkpoint inference, model E2E, broad CI or all-shape superiority.
@@ -257,12 +313,12 @@ Credit: NVIDIA TRT-LLM authored the native finalizer and its PDL machinery.
 KF candidateb0409f identified consumer PDL as a useful component direction;
 the fixed-top8 unroll adapts that native scalar kernel. Existing Frost baseline
 credits remain: NVIDIAFrost, KF624/2f5c, KFf19299 small-row scheduler,
-YanqinPR1090/CUTLASS113 and Yanqin/Yihua. These are distinct contributions.
+YanqinPR #1090/CUTLASS example 113 and Yanqin/Yihua. These are distinct contributions.
 
 ## B200 comparison including both PDL settings — 2026-09-17
 
 The completed exhaustive native comparison changes the size of the remaining
-B200 gap. On one 1000W B200 (148 SMs), synthetic BF16 E128/top8/H2048/I768,
+B200 gap. On one 1000W B200 (148 SMs), synthetic BF16 E=128, top-k=8, H=2048, I=768,
 UnpackedPrecomputed routing and fixed CPU input bytes:
 
 | Tokens | Frost | TRT-LLM | Frost higher latency | Native winner (PDL, FC1, FC2) |
@@ -300,12 +356,12 @@ packed-routing and fixture scope. Native consumer-PDL/top8 composition remains
 an unpublished experiment until its direct public-baseline check completes.
 
 Credit: NVIDIA TensorRT-LLM supplies the native kernels, weight preparation and
-PDL implementation. Frost retains NVIDIA, KF624/2f5c, Yanqin PR1090/CUTLASS113,
+PDL implementation. Frost retains NVIDIA, KF624/2f5c, Yanqin PR #1090/CUTLASS example 113,
 Yanqin/Yihua and KF small-row scheduling credits documented below.
 
 ## SM120 comparison including both PDL settings — 2026-09-17
 
-On RTX PRO 6000 Blackwell Server (188 SMs, 600W), BF16 T1/E128/top8/H2048/I768,
+On RTX PRO 6000 Blackwell Server (188 SMs, 600W), BF16 T1/E=128, top-k=8, H=2048, I=768,
 PackedPrecomputed routing, the current Frost path measures **84.9495625 us**
 versus **88.0897500 us** for the freshly selected CUTLASS winner: **3.565% lower
 full-MoE latency**. Dimensions match Qwen3-30B-A3B; weights, activations and
@@ -337,7 +393,7 @@ No broad CI, all-shape superiority or performance-roof claim is made.
 
 Credit: NVIDIA Frost/FlashInfer/TRT-LLM and CUTLASS provide the kernels and
 occupancy-query machinery. Existing Frost integration credits, including
-Yanqin/Yihua, Yanqin PR1090/CUTLASS113 and KF contributions, remain below.
+Yanqin/Yihua, Yanqin PR #1090/CUTLASS example 113 and KF contributions, remain below.
 
 ## Small-row scheduler specialization — 2026-09-17
 
@@ -347,7 +403,7 @@ row tile-count division, L2 row rasterization and unused shared-ring fields.
 MMA, epilogue, resources and the persistent generic path for R9–513 are unchanged.
 Frozen template parameters separate the specialized compilation/cache identity.
 
-On a 1000W B200, BF16 T1/E128/top8/H2048/I768, complete synthetic FI MoE:
+On a 1000W B200, BF16 T1/E=128, top-k=8, H=2048, I=768, complete synthetic FI MoE:
 
 | Routing | Published generic scheduler | Specialized scheduler | Latency reduction |
 |---|---:|---:|---:|
@@ -404,7 +460,7 @@ a sweep-based optimization. It enables explicit paired FC1 for T8 and T64 at
 top8. Engine20402 remains limited to1..8 routed rows. Ordinary20400 remains
 available; enumerate/tune the full eligible configuration set before choosing.
 
-On one1000W B200, BF16 E128/top8/H2048/I768, full synthetic FI MoE:
+On one1000W B200, BF16 E=128, top-k=8, H=2048, I=768, full synthetic FI MoE:
 
 | Tokens / routing | Ordinary FC1 | Paired FC1 | Latency reduction |
 |---|---:|---:|---:|
@@ -426,7 +482,7 @@ R9/17/64/512/513, pitched weights, skewed groups and persistent multiwave work.
 The three runtime/test files match validated archive
 `74acba5290f6f58056f7163b99f77ddbb81110c267bdd00d514cf4dd143ad87a`.
 
-Current SM120 BF16 T1/E128/top8/H2048/I768 packed comparison, on600W RTX PRO6000
+Current SM120 BF16 T1/E=128, top-k=8, H=2048, I=768 packed comparison, on600W RTX PRO6000
 Blackwell Server, measures Frost84.904125us versus CUTLASS87.9780625us (-3.494%).
 All64 CUTLASS FC1/FC2 tactic pairs were searched; winner(4,11) passes sanitizers
 and four fresh ABBA processes (audit1965). This is current workload-specific
@@ -443,14 +499,14 @@ published T1 B200 comparison of29.484375us Frost versus28.620375us TRT-LLM.
 No model-E2E or full-repository-CI success is claimed. Historical sections below
 retain their original source scope; this section supersedes their pending status.
 
-Credit: NVIDIA Frost/FlashInfer/TRT-LLM, Yanqin Zhai PR1090 and Yanqin/Yihua's
-parallel work, KF624/2f5c, CUTLASS113 and canonical rank5/early-PDL contributions.
+Credit: NVIDIA Frost/FlashInfer/TRT-LLM, Yanqin Zhai PR #1090 and Yanqin/Yihua's
+parallel work, KF624/2f5c, CUTLASS example 113 and canonical rank5/early-PDL contributions.
 
 ## Current paired Frost versus tuned TRT-LLM — 2026-09-17
 
 The published compact-resource FC1/FC2 implementation now measures **29.484375 us**
 against TRT-LLM **28.620375 us**, or **3.019% higher latency**, on the same 1000 W
-B200. This is complete synthetic BF16 MoE, T1/E128/top8/H2048/I768, unpacked
+B200. This is complete synthetic BF16 MoE, T1/E=128, top-k=8, H=2048, I=768, unpacked
 routing. It is not yet a competitor win and does not update the T64 or SM120 result.
 
 Independent audit 1913 reconstructs 68 raw output checks, 30 changed-reference
@@ -482,7 +538,7 @@ candidate 2f5c073d; its FC1 transfer was separately measured and validated.
 The later bounded single-pass scheduler is not included: its FC1 transfer
 regressed, and the small FC2 component gain still needs full-FI confirmation.
 
-Fixed-tactic, full synthetic FI BF16 MoE on B200 at 1000 W, T1/E128/top8/H2048/I768:
+Fixed-tactic, full synthetic FI BF16 MoE on B200 at 1000 W, T1/E=128, top-k=8, H=2048, I=768:
 
 | Routing | Paired baseline | FC1 resources only | FC2 resources only | Both | Both latency reduction |
 |---|---:|---:|---:|---:|---:|
