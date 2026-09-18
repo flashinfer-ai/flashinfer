@@ -1846,6 +1846,10 @@ def prepare_cutlass_w4a16_weights(
 
 
 _NVFP4_SF_VEC_SIZE = 16
+# MinKDimAlignmentNVFP4 of the CUTLASS expand kernel: the row stride of the
+# linear activation block scale is padded to hidden_size / 16 rounded up to
+# this alignment / 16, so hidden_size itself must be a multiple of it.
+_CUTLASS_NVFP4_HIDDEN_ALIGNMENT = 64
 _NVFP4_SF_SWIZZLE_ROWS = 128
 
 
@@ -1887,13 +1891,20 @@ def prepare_cutlass_nvfp4_weights(
             "prepare_cutlass_nvfp4_weights expects BF16 weights, got "
             f"w1={w1_bf16.dtype}, w2={w2_bf16.dtype}."
         )
-    if (
-        hidden_size % _NVFP4_SF_VEC_SIZE != 0
-        or intermediate_size % _NVFP4_SF_VEC_SIZE != 0
-    ):
+    # The expand kernel reads the canonical linear input_sf with a row stride
+    # padded to MinKDimAlignmentNVFP4 (64), so a compact [M, H / 16] pack is
+    # only correct for H % 64 == 0. GEMM2's input is quantized in-kernel, so
+    # I only needs the 16-element block. Reject here, at load time, rather
+    # than on the first forward.
+    if hidden_size % _CUTLASS_NVFP4_HIDDEN_ALIGNMENT != 0:
         raise ValueError(
-            "Cutlass NVFP4 requires hidden_size and intermediate_size "
-            f"divisible by {_NVFP4_SF_VEC_SIZE}."
+            "Cutlass NVFP4 requires hidden_size divisible by "
+            f"{_CUTLASS_NVFP4_HIDDEN_ALIGNMENT}, got {hidden_size}."
+        )
+    if intermediate_size % _NVFP4_SF_VEC_SIZE != 0:
+        raise ValueError(
+            "Cutlass NVFP4 requires intermediate_size divisible by "
+            f"{_NVFP4_SF_VEC_SIZE}, got {intermediate_size}."
         )
     activation = _normalize_activation(activation)
     gemm1_rows = _gemm1_rows(intermediate_size, activation)

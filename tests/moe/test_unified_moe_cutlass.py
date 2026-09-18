@@ -283,7 +283,7 @@ def test_prepare_cutlass_nvfp4_weights_rejects_invalid_source_contract():
 
     w1 = torch.empty(2, 510, 128, dtype=torch.bfloat16)
     w2 = torch.empty(2, 128, 255, dtype=torch.bfloat16)
-    with pytest.raises(ValueError, match="divisible by 16"):
+    with pytest.raises(ValueError, match="intermediate_size divisible by 16"):
         CutlassNvfp4Config.prepare_weights(
             w1,
             w2,
@@ -292,14 +292,27 @@ def test_prepare_cutlass_nvfp4_weights_rejects_invalid_source_contract():
             intermediate_size=255,
         )
 
-    w1 = torch.empty(2, 32, 16, dtype=torch.bfloat16)
-    w2 = torch.empty(2, 16, 16, dtype=torch.bfloat16)
+    # H=80 is a multiple of 16 but not of the kernel's 64-element stride
+    # alignment; reject at load time, not on the first forward.
+    w1 = torch.empty(2, 512, 80, dtype=torch.bfloat16)
+    w2 = torch.empty(2, 80, 256, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="hidden_size divisible by 64"):
+        CutlassNvfp4Config.prepare_weights(
+            w1,
+            w2,
+            num_local_experts=2,
+            hidden_size=80,
+            intermediate_size=256,
+        )
+
+    w1 = torch.empty(2, 32, 64, dtype=torch.bfloat16)
+    w2 = torch.empty(2, 64, 16, dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="requires CUDA"):
         CutlassNvfp4Config.prepare_weights(
             w1,
             w2,
             num_local_experts=2,
-            hidden_size=16,
+            hidden_size=64,
             intermediate_size=16,
             device=torch.device("cpu"),
         )
@@ -1108,6 +1121,43 @@ def test_cutlass_nvfp4_pack_rejects_hidden_size_not_multiple_of_64():
     view = {key: torch.empty(1) for key in runner._required_weight_keys}
     with pytest.raises(ValueError, match="divisible by 64"):
         runner._pack_weight_inputs(view, hidden_size=80)
+
+
+def test_cutlass_rejects_per_token_scale():
+    """The flat CUTLASS ABI has no per-token activation scale; fail loud."""
+    runner = CutlassNvfp4Runner.__new__(CutlassNvfp4Runner)
+    runner.config = _config(
+        quant=QuantConfig(
+            weight=QuantFormat.NVFP4,
+            activation=QuantFormat.NVFP4,
+            per_token_scale=True,
+        )
+    )
+    runner.device = torch.device("cpu")
+    runner._device_arch = 100
+    with pytest.raises(NotImplementedError, match="per_token_scale=True"):
+        runner.check_support()
+
+    runner.config = _config(
+        quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4)
+    )
+    act = MoEActivationPack(
+        torch.empty(16, 64, dtype=torch.uint8),
+        torch.empty(16, 8, dtype=torch.float8_e4m3fn),
+        torch.zeros(16, 2, dtype=torch.int32),
+        torch.ones(16, 2, dtype=torch.float32),
+        per_token_scale=torch.ones(16, dtype=torch.float32),
+    )
+    with pytest.raises(ValueError, match="per_token_scale"):
+        runner._validate_activation_scale(act)
+
+
+def test_cutlass_act_sf_unit_byte_follows_scale_format():
+    # Autotune fills synthesized block scales with a unit value; E8M0 1.0 is
+    # 127, E4M3 1.0 is 0x38. Derived from the format, not per-runner.
+    for runner_cls in (CutlassMxfp8Runner, CutlassMxfp8Mxfp4Runner):
+        assert runner_cls.__new__(runner_cls)._act_sf_unit_byte == 127
+    assert CutlassNvfp4Runner.__new__(CutlassNvfp4Runner)._act_sf_unit_byte == 0x38
 
 
 def test_cutlass_mxfp8_linear_layer_rejects_swizzled_activation_scales():

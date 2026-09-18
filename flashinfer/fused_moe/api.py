@@ -503,8 +503,6 @@ _CUTLASS_HUMMING_ARCHS = (90,)
 # Default MMA pair shared by the FP4 ``prepare_*`` helpers
 # (TrtllmFp4Config, CakeWarpDecodeConfig, CuteDslConfig).
 _NVFP4_NVFP4 = QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4)
-_MXFP4_MXFP8 = QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8)
-_MXFP8_MXFP8 = QuantConfig(weight=QuantFormat.MXFP8, activation=QuantFormat.MXFP8)
 
 
 @dataclass(frozen=True)
@@ -1191,17 +1189,9 @@ class CutlassNvfp4Config:
             device=device,
         )
 
-    @staticmethod
-    def prepare_activations(hidden_states_bf16):
-        """Quantize BF16 activations into the canonical NVFP4 pack.
-
-        Identical to ``TrtllmFp4Config.prepare_activations`` for NVFP4×NVFP4:
-        packed E2M1 ``uint8 [M, H // 2]`` and a linear E4M3 block scale
-        ``[M, H // 16]`` computed with a unit global scale.
-        """
-        from .prepare import prepare_trtllm_fp4_activations
-
-        return prepare_trtllm_fp4_activations(hidden_states_bf16, quant=_NVFP4_NVFP4)
+    # The canonical NVFP4 pack: packed E2M1 ``uint8 [M, H // 2]`` and a linear
+    # E4M3 block scale ``[M, H // 16]`` with a unit global scale.
+    prepare_activations = staticmethod(TrtllmFp4Config.prepare_activations)
 
     def __repr__(self) -> str:
         return "CutlassNvfp4Config()"
@@ -1363,9 +1353,10 @@ class CutlassMxfp8Mxfp4Config:
             from .prepare import prepare_cutlass_mxfp8_activations
 
             return prepare_cutlass_mxfp8_activations(hidden_states_bf16)
-        from .prepare import prepare_trtllm_fp4_activations
-
-        return prepare_trtllm_fp4_activations(hidden_states_bf16, quant=_MXFP4_MXFP8)
+        return TrtllmFp4Config.prepare_activations(
+            hidden_states_bf16,
+            quant=QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
+        )
 
     def __repr__(self) -> str:
         return "CutlassMxfp8Mxfp4Config()"
@@ -1428,10 +1419,9 @@ class CutlassMxfp8Config:
             from .prepare import prepare_cutlass_mxfp8_activations
 
             return prepare_cutlass_mxfp8_activations(hidden_states_bf16)
-        from .prepare import prepare_trtllm_fp8_block_activations
-
-        return prepare_trtllm_fp8_block_activations(
-            hidden_states_bf16, quant=_MXFP8_MXFP8
+        return TrtllmFp8BlockConfig.prepare_activations(
+            hidden_states_bf16,
+            quant=QuantConfig(weight=QuantFormat.MXFP8, activation=QuantFormat.MXFP8),
         )
 
     def __repr__(self) -> str:

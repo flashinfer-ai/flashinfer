@@ -1434,9 +1434,6 @@ class _CutlassRunnerBase(MoERunner):
     # MXFP8 pairs may instead opt into the flat CUTLASS swizzled 1-D buffer
     # with ``QuantConfig(swizzled_scale_factors=True)``.
     _act_sf_vec_size: ClassVar[int | None] = None
-    # Byte encoding of a unit block scale (E4M3 1.0 for NVFP4, E8M0 1.0 for
-    # MXFP8); autotune fills synthesized scale buffers with it.
-    _act_sf_unit_byte: ClassVar[int] = 0x38
     # Logical hidden elements per storage column of ``hidden_states_q`` (2 for
     # packed NVFP4 uint8, 1 otherwise). Every hidden_size derivation from the
     # activation tensor must go through ``_hidden_size_of``.
@@ -1475,11 +1472,13 @@ class _CutlassRunnerBase(MoERunner):
                 f"SM{self._device_arch}; supported architectures are "
                 f"{self._supported_archs}."
             )
-        if (
-            self.config.quant.swizzled_scale_factors is True
-            and self._act_sf_vec_size is not None
-            and not self._use_mxfp8_act_scaling
-        ):
+        if self.config.quant.per_token_scale:
+            # The flat CUTLASS ABI has no per-token activation scale input;
+            # packing would silently drop ``act.per_token_scale``.
+            raise NotImplementedError(
+                f"{type(self).__name__} does not support per_token_scale=True."
+            )
+        if self.config.quant.swizzled_scale_factors is True and self._linear_act_sf:
             # Only the MXFP8 runners have a swizzled input_sf path; silently
             # reading a swizzled pack as linear would corrupt the scales.
             raise NotImplementedError(
@@ -1651,6 +1650,12 @@ class _CutlassRunnerBase(MoERunner):
         return hidden_states.shape[1] * self._act_elems_per_column
 
     @property
+    def _act_sf_unit_byte(self) -> int:
+        """Byte encoding of a unit block scale: E8M0 1.0 for MXFP8, E4M3 1.0
+        otherwise. Autotune fills synthesized scale buffers with it."""
+        return 127 if self._use_mxfp8_act_scaling else 0x38
+
+    @property
     def _swizzled_act_sf(self) -> bool:
         """Activation block scale factor (flat ``input_sf``) is the CUTLASS
         128x4-swizzled 1-D buffer: MXFP8 with ``swizzled_scale_factors=True``."""
@@ -1685,7 +1690,7 @@ class _CutlassRunnerBase(MoERunner):
             inputs[-1] = torch.full(
                 (
                     _mxfp8_swizzled_act_sf_numel(
-                        hidden_states.shape[0], hidden_states.shape[1]
+                        hidden_states.shape[0], self._hidden_size_of(hidden_states)
                     ),
                 ),
                 self._act_sf_unit_byte,
@@ -1887,6 +1892,8 @@ class _CutlassRunnerBase(MoERunner):
         ]
 
     def _validate_activation_scale(self, act: MoEActivationPack) -> None:
+        if act.per_token_scale is not None:
+            raise ValueError(f"{type(self).__name__} does not consume per_token_scale.")
         if self._linear_act_sf:
             scale = act.hidden_states_scale
             num_tokens = act.hidden_states_q.shape[0]
@@ -1910,7 +1917,8 @@ class _CutlassRunnerBase(MoERunner):
             return
         if self._swizzled_act_sf:
             scale = act.hidden_states_scale
-            num_tokens, hidden_size = act.hidden_states_q.shape
+            num_tokens = act.hidden_states_q.shape[0]
+            hidden_size = self._hidden_size_of(act.hidden_states_q)
             expected = _mxfp8_swizzled_act_sf_numel(num_tokens, hidden_size)
             # ndim == 1 distinguishes the flat swizzled buffer from the
             # canonical 2-D [M, H // 32] pack, whose numel coincides whenever
@@ -2205,11 +2213,9 @@ class CutlassNvfp4Runner(_CutlassRunnerBase):
         ) = (view[key] for key in self._required_weight_keys)
         num_experts = self.config.routing.num_experts
         intermediate_size = self.config.experts.intermediate_size
-        # The expand kernel reads the linear input_sf with a row stride of
-        # padded_hidden_size / 16, padded to MinKDimAlignmentNVFP4 (64), while
-        # the canonical pack is a compact [M, H / 16]; any H that is not a
-        # multiple of 64 would be read with the wrong stride (and past the
-        # end). GEMM2's input is quantized in-kernel, so I only needs 16.
+        # Same alignment prepare_cutlass_nvfp4_weights enforces at load time
+        # (see _CUTLASS_NVFP4_HIDDEN_ALIGNMENT there); re-checked because the
+        # view may not have come from that helper.
         if hidden_size % 64 != 0 or intermediate_size % 16 != 0:
             raise ValueError(
                 "Cutlass NVFP4 requires hidden_size divisible by 64 and "
@@ -2428,7 +2434,6 @@ class CutlassMxfp8Mxfp4Runner(_CutlassRunnerBase):
     _weight_dtype = torch.int64
     _use_mxfp8_act_scaling = True
     _act_sf_vec_size = 32
-    _act_sf_unit_byte = 127
     _required_weight_keys = (
         "fc1_expert_weights",
         "fc2_expert_weights",
@@ -2526,7 +2531,6 @@ class CutlassMxfp8Runner(_CutlassRunnerBase):
     _weight_dtype = torch.float8_e4m3fn
     _use_mxfp8_act_scaling = True
     _act_sf_vec_size = 32
-    _act_sf_unit_byte = 127
     _required_weight_keys = (
         "fc1_expert_weights",
         "fc2_expert_weights",
@@ -4041,6 +4045,12 @@ class CuteDslRunner(MoERunner):
 
     def _check_support(self) -> None:
         super()._check_support()
+        if self.config.quant.swizzled_scale_factors is True:
+            raise NotImplementedError(
+                f"{type(self).__name__} consumes only the linear activation "
+                "block-scale layout; swizzled_scale_factors=True is supported "
+                "by the CUTLASS MXFP8 runners only."
+            )
         if isinstance(self.config.activation, SiTU) and (
             self.config.activation.clamp_limit is not None
         ):
@@ -4398,6 +4408,17 @@ class _TrtllmRunnerBase(MoERunner):
 
     _module: Any
     _inner: Any
+
+    def _check_support(self) -> None:
+        super()._check_support()
+        if self.config.quant.swizzled_scale_factors is True:
+            # TRT-LLM consumes the canonical linear block scale only; the flat
+            # CUTLASS swizzled input_sf is a CUTLASS MXFP8 opt-in.
+            raise NotImplementedError(
+                f"{type(self).__name__} consumes only the linear activation "
+                "block-scale layout; swizzled_scale_factors=True is supported "
+                "by the CUTLASS MXFP8 runners only."
+            )
 
     def _build(self) -> None:
         from .core import get_trtllm_moe_sm100_module
