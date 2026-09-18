@@ -1279,3 +1279,26 @@ def compute_reference_moe_relu2(
             output[token_idx] += scale * fc2_out.squeeze(0)
 
     return output
+
+
+# ---------------------------------------------------------------------------
+# Per-tensor FP8 -- static calibration helpers shared by the unified MoE suites
+# ---------------------------------------------------------------------------
+
+
+def fp8_per_tensor_global_scale(x: torch.Tensor) -> torch.Tensor:
+    """The static E4M3 multiplier a calibration pass would derive: ``fp8_max / amax``."""
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    amax = x.float().abs().amax()
+    return torch.where(amax > 0, fp8_max / amax, torch.ones_like(amax))
+
+
+def fp8_per_tensor_requant_hook(intermediate_scale_global: torch.Tensor):
+    """Model the kernel's static E4M3 requantization of GEMM1 output before GEMM2."""
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+
+    def hook(intermediate: torch.Tensor) -> torch.Tensor:
+        q = (intermediate * intermediate_scale_global).clamp(-fp8_max, fp8_max)
+        return q.to(torch.float8_e4m3fn).float() / intermediate_scale_global
+
+    return hook

@@ -233,6 +233,7 @@ from flashinfer.quantization import e2m1_and_ufp8sf_scale_to_float
 from flashinfer.quantization.fp8_quantization import mxfp8_quantize
 from flashinfer.tllm_enums import RoutingMethodType
 from flashinfer.utils import get_compute_capability
+from tests.moe.utils import fp8_per_tensor_global_scale, fp8_per_tensor_requant_hook
 
 from tests.test_helpers.fuzz_ledger import FuzzLedger
 
@@ -766,14 +767,8 @@ def _block_fp8_reference(
     return out
 
 
-def _fp8_per_tensor_global_scale(x):
-    fp8_max = torch.finfo(torch.float8_e4m3fn).max
-    amax = x.float().abs().amax()
-    return torch.where(amax > 0, fp8_max / amax, torch.ones_like(amax))
-
-
 def _fp8_per_tensor_act_pack_logits(x, routing_logits, routing_bias):
-    input_scale = _fp8_per_tensor_global_scale(x)
+    input_scale = fp8_per_tensor_global_scale(x)
     q, sf = TrtllmFp8PerTensorConfig.prepare_activations(
         x, hidden_states_scale_global=input_scale
     )
@@ -787,7 +782,7 @@ def _fp8_per_tensor_act_pack_logits(x, routing_logits, routing_bias):
 
 
 def _fp8_per_tensor_act_pack(x, selected_experts, final_scales):
-    input_scale = _fp8_per_tensor_global_scale(x)
+    input_scale = fp8_per_tensor_global_scale(x)
     q, sf = TrtllmFp8PerTensorConfig.prepare_activations(
         x, hidden_states_scale_global=input_scale
     )
@@ -820,7 +815,7 @@ def _fp8_per_tensor_reference(
 ):
     fp8_max = torch.finfo(torch.float8_e4m3fn).max
     final_scales = final_scales.to(torch.bfloat16).float()
-    input_scale = _fp8_per_tensor_global_scale(x)
+    input_scale = fp8_per_tensor_global_scale(x)
     intermediate_scale = torch.tensor(64.0, device=x.device)
     x_q = (x.float() * input_scale).clamp(-fp8_max, fp8_max)
     x32 = x_q.to(torch.float8_e4m3fn).float() / input_scale
@@ -905,9 +900,18 @@ def _contract_fp8_act_pack(config_cls):
 
 
 def _semantic_reference(
-    x, w1, w2, selected_experts, final_scales, intermediate_size, activation
+    x,
+    w1,
+    w2,
+    selected_experts,
+    final_scales,
+    intermediate_size,
+    activation,
+    intermediate_hook=None,
 ):
     """Semantic CUTLASS/b12x reference in canonical [up, gate] row order.
+
+    ``intermediate_hook`` models a backend's static GEMM2-input requantization.
 
     Keep routing weights in FP32: these runners consume separate precomputed
     tensors, unlike TRTLLM's packed-ID path, which truncates weights to BF16.
@@ -923,6 +927,8 @@ def _semantic_reference(
             continue
         fc1 = x32[token] @ w1[expert].float().t()
         inter = _apply_typed_activation(fc1, activation, intermediate_size)
+        if intermediate_hook is not None:
+            inter = intermediate_hook(inter)
         expert_out = inter @ w2[expert].float().t()
         out[token] += final_scales[token, slot, None].float() * expert_out
     return out
@@ -997,6 +1003,7 @@ def _cutlass_post_reference(backend_key):
         x, w1, w2, selected_experts, final_scales, intermediate_size, view, activation
     ):
         x_ref, w1_ref, w2_ref = x, w1, w2
+        intermediate_hook = None
         if backend_key == "cutlass_nvfp4":
             one = torch.ones(1, device=x.device)
             x_q, x_sf = fp4_quantize(
@@ -1010,7 +1017,14 @@ def _cutlass_post_reference(backend_key):
                 view["fc2_expert_weights"], view["fc2_weight_block_scale"], x.device
             )
         elif backend_key == "cutlass_fp8_per_tensor":
-            x_ref = view["_activation_q"].float() * view["_activation_scale"]
+            # Canonical TRTLLM pack: static multipliers live in the view and the
+            # pack carries no scale; GEMM1 output is requantized with the
+            # static intermediate multiplier before GEMM2.
+            assert view["_activation_scale"] is None
+            x_ref = view["_activation_q"].float() / view["hidden_states_scale_global"]
+            intermediate_hook = fp8_per_tensor_requant_hook(
+                view["intermediate_scale_global"]
+            )
             w1_ref = (
                 view["fc1_expert_weights"].float() * view["fc1_dequant"][:, None, None]
             )
@@ -1091,6 +1105,7 @@ def _cutlass_post_reference(backend_key):
             final_scales,
             intermediate_size,
             activation,
+            intermediate_hook=intermediate_hook,
         )
 
     return reference
@@ -1288,7 +1303,8 @@ _CONTRACT_HANDLERS = {
     "cutlass_fp8_per_tensor": _contract_handler(
         CutlassFp8PerTensorConfig,
         "fp8pertensor",
-        activation_pack=_contract_fp8_act_pack(CutlassFp8PerTensorConfig),
+        # Same static-scale pack as the TRTLLM per-tensor handler.
+        activation_pack=_fp8_per_tensor_act_pack,
         reference=_cutlass_post_reference("cutlass_fp8_per_tensor"),
         atol_frac=0.1,
         rtol=0.1,
@@ -2892,9 +2908,9 @@ def test_unified_moe_fuzz(cfg):
         # NVFP4/MXFP4/W4A16. Both need the logical variant to select preparation.
         if BackendCfg in (TrtllmFp8BlockConfig, TrtllmFp4Config):
             prepare_kwargs["quant"] = _quant_config_for_handler(handler)
-        elif BackendCfg is TrtllmFp8PerTensorConfig:
+        elif BackendCfg in (TrtllmFp8PerTensorConfig, CutlassFp8PerTensorConfig):
             prepare_kwargs.update(
-                hidden_states_scale_global=_fp8_per_tensor_global_scale(x),
+                hidden_states_scale_global=fp8_per_tensor_global_scale(x),
                 intermediate_scale_global=torch.tensor(64.0, device=dev),
             )
         view = (
