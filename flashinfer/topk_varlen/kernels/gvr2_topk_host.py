@@ -881,6 +881,10 @@ def _gate_first_call(raw):
 # (in a CUDA graph and in a serving stream alike). Measured on B200 decode cells
 # (K=2048, N=4096, 16 rows): 4.65 -> 4.0 us per call in graph replay.
 _DECODE_PDL = True
+# clustered register family, paged output: winners staged into rank 0's smem
+# and written in one coalesced epilogue (the paged transform applied there)
+# instead of per-winner scattered stores with the transform inline
+_REGCLUS_STAGE_OUT = True
 
 
 def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False, page_shift=None):
@@ -932,6 +936,16 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False, page
     # safety is unchanged; per-row n / short-row handling lives in-kernel.
     plan_free = route(num_rows, n_route, npad, k, sms=sms)
     if plan_free["kernel"] == "reg_clus":
+        # Paged output: winners staged into rank 0's smem and mapped in one
+        # coalesced epilogue, which reads the page table from global (L2-hot
+        # by then) instead of staging the table row in the prologue. Measured
+        # B200 vs the scattered emit with the smem-staged table: 0.2-0.7 us
+        # (3-9%) on every clustered cell except K = 2048 below 16 rows, where
+        # the two-pass epilogue over 2048 words costs more than it saves (-0.3
+        # us at 1 x 32K); those keep the scattered emit. Unpaged output stays
+        # scattered: funnelling every rank's winners through rank 0 lost
+        # 0.3-0.8 us at 16-64 rows there.
+        stage_rc = bool(_REGCLUS_STAGE_OUT) and paged and (k <= 1024 or num_rows >= 16)
         fn = _gate_first_call(
             dev.get_compiled__regclus(
                 tuple(plan_free["tpl"]),
@@ -940,7 +954,8 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False, page
                 next_n=next_n,
                 cr_shift=cr_shift,
                 hint_free=hint_free,
-                pt_smem=pt_smem,
+                pt_smem=0 if stage_rc else pt_smem,
+                stage_out=stage_rc,
                 **pg,
             )
         )
