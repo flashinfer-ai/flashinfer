@@ -52,8 +52,8 @@ Usage:
         -o moe_bf16 python bench_moe_deepseek.py --num-tokens 32 --ep 8 \
         --profile-cuda --profile-backend trtllm-bf16 --profile-iters 20
 
-    # CuTe DSL finalize modes (TRTLLM keeps its native finalize)
-    python bench_moe_deepseek.py --functional-api  # atomic fused (default)
+    # CuTe DSL / CUTLASS finalize modes (TRTLLM keeps its native finalize)
+    python bench_moe_deepseek.py --functional-api  # fused allowed (default)
     python bench_moe_deepseek.py --functional-api --no-fused-finalize  # deterministic
 
 Metrics:
@@ -595,6 +595,7 @@ def bench_cutlass(
     use_cupti=True,
     do_autotune=True,
     include_activation_quant=False,
+    use_fused_finalize=True,
     profile_cuda=False,
     profile_iters=10,
     autotune_cache=None,
@@ -603,6 +604,8 @@ def bench_cutlass(
 
     Args:
         do_autotune: See ``bench_cute_dsl`` for the autotune-scope rationale.
+        use_fused_finalize: Allow fused-finalize tactics when True; exclude
+            them when False. Autotuning may still choose an unfused tactic.
     """
     from flashinfer.fused_moe import fused_topk_deepseek, cutlass_fused_moe
     from flashinfer.fp4_quantization import fp4_quantize
@@ -679,6 +682,7 @@ def bench_cutlass(
             output=output,
             ep_size=ep_size,
             ep_rank=0,  # Simulating rank 0 of EP
+            use_fused_finalize=use_fused_finalize,
         )
         return output
 
@@ -1058,8 +1062,8 @@ def run_benchmark(
             per-token NVFP4 activation scaling.
         include_activation_quant: Include the initial activation FP4
             quantization in each backend's timing.
-        use_fused_finalize: Use atomic fused finalize; otherwise use the
-            deterministic two-stage finalize.
+        use_fused_finalize: Use atomic fused CuTe DSL finalize and allow
+            CUTLASS fused-finalize tactics; otherwise use non-fused finalize.
         profile_cuda: Capture one backend for an external CUDA profiler.
         profile_iters: Number of cold-L2 graph replays to capture.
         profile_backend: Backend to run when profile_cuda is enabled.
@@ -1241,6 +1245,7 @@ def _benchmark_single(
             use_cupti,
             do_autotune=do_autotune,
             include_activation_quant=include_activation_quant,
+            use_fused_finalize=use_fused_finalize,
             profile_cuda=profile_cuda,
             profile_iters=profile_iters,
             autotune_cache=autotune_cache,
@@ -1334,6 +1339,10 @@ def _print_header(
     print(
         "CuteDSL finalize: "
         f"{'atomic fused' if use_fused_finalize else 'deterministic two-stage'}"
+    )
+    print(
+        "CUTLASS fused-finalize tactics: "
+        f"{'allowed' if use_fused_finalize else 'disabled'}"
     )
     print(
         "TRTLLM NVFP4 / TRTLLM BF16 finalize: native (unaffected by --no-fused-finalize)."
@@ -1621,7 +1630,7 @@ def main():
         "--no-fused-finalize",
         action="store_false",
         dest="use_fused_finalize",
-        help="Use deterministic two-stage CuTe DSL finalize instead of atomic fused finalize.",
+        help="Use deterministic two-stage CuTe DSL finalize and disable CUTLASS fused-finalize tactics.",
     )
     parser.add_argument(
         "--profile-cuda",
@@ -1727,6 +1736,10 @@ def main():
     print(
         "CuteDSL finalize: "
         f"{'atomic fused' if args.use_fused_finalize else 'deterministic two-stage'}"
+    )
+    print(
+        "CUTLASS fused-finalize tactics: "
+        f"{'allowed' if args.use_fused_finalize else 'disabled'}"
     )
 
     print(
