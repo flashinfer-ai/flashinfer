@@ -653,12 +653,13 @@ def test_batch_fast_decode_tensor_cores_cuda_graph(
 
 @pytest.mark.parametrize("batch_size", [1, 17])
 @pytest.mark.parametrize("page_size", [1, 16])
-@pytest.mark.parametrize("pass_seq_lens", [False, True])
+@pytest.mark.parametrize("seq_lens_dtype", [None, torch.int32, torch.uint32])
 def test_batch_decode_tensor_cores_plan_max_kv_len(
-    batch_size, page_size, pass_seq_lens
+    batch_size, page_size, seq_lens_dtype
 ):
     """plan() derives the longest KV length from the page table or from
-    seq_lens. A single request is the one-element case of the reduction."""
+    seq_lens, which may be int32 or uint32. A single request is the
+    one-element case of the reduction."""
     torch.manual_seed(batch_size * 31 + page_size)
     kv_lens = torch.randint(1, 513, (batch_size,), dtype=torch.int32)
     num_pages = (kv_lens + page_size - 1) // page_size
@@ -680,7 +681,7 @@ def test_batch_decode_tensor_cores_plan_max_kv_len(
         128,
         page_size,
         q_data_type=torch.float16,
-        seq_lens=kv_lens.cuda() if pass_seq_lens else None,
+        seq_lens=None if seq_lens_dtype is None else kv_lens.to(seq_lens_dtype).cuda(),
     )
 
     assert type(wrapper._max_kv_len) is int

@@ -1235,7 +1235,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         if seq_lens is None:
             kv_lens_arr_host = get_seq_lens(indptr_host, last_page_len_host, page_size)
         else:
-            kv_lens_arr_host = seq_lens.cpu()
+            kv_lens_arr_host = seq_lens.cpu().to(torch.int32)
         if q_len_per_req > 1:
             min_kv_len = int(kv_lens_arr_host.min())
             if min_kv_len < q_len_per_req:
@@ -1642,7 +1642,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         if seq_lens is None:
             kv_lens_arr_host = get_seq_lens(indptr_host, last_page_len_host, page_size)
         else:
-            kv_lens_arr_host = seq_lens.cpu()
+            kv_lens_arr_host = seq_lens.cpu().to(torch.int32)
         if q_len_per_req > 1 and is_causal:
             min_kv_len = int(kv_lens_arr_host.min())
             if min_kv_len < q_len_per_req:

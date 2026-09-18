@@ -2222,7 +2222,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 paged_kv_indptr_host, paged_kv_last_page_len_host, page_size
             )
         else:
-            kv_lens_arr_host = seq_lens.cpu().flatten()
+            kv_lens_arr_host = seq_lens.cpu().flatten().to(torch.int32)
 
         if self.is_cuda_graph_enabled:
             if batch_size != self._fixed_batch_size:
@@ -2545,7 +2545,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     paged_kv_indptr_host, paged_kv_last_page_len_host, page_size
                 )
             else:
-                kv_lens_arr_host = seq_lens.cpu().flatten()
+                kv_lens_arr_host = seq_lens.cpu().flatten().to(torch.int32)
             required_size = len(kv_lens_arr_host)
             if required_size > self._kv_lens_buffer.shape[0]:
                 self._kv_lens_buffer = torch.empty(
