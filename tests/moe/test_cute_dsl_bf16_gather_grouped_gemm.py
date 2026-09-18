@@ -303,7 +303,9 @@ def test_cute_dsl_bf16_gather_grouped_gemm_activations(
             values = torch.cat((up, gate), dim=-1)
         else:
             values = xe @ w1[e].float().T
-        ref[rows_e] = compute_reference_activation(values, activation, inter).float()
+        ref[rows_e] = compute_reference_activation(
+            values, activation, inter, dtype
+        ).float()
 
     torch.testing.assert_close(
         out[row_valid].float(), ref[row_valid], atol=2e-1, rtol=3e-2

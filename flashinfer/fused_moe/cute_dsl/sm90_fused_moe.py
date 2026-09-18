@@ -293,7 +293,10 @@ def cute_dsl_fused_moe_bf16(
         * Arch: SM90 (Hopper) only.
         * Dtypes: bf16 or fp16 activations and weights (must match), fp32
           accumulation; output dtype = input dtype. No quantized paths.
-        * Activation: SwiGLU (SiLU-gated) etc, fused into GEMM1.
+        * Activation, fused into GEMM1: ``ActivationType.Swiglu`` (default;
+          the OAI variant via ``swiglu_alpha``/``swiglu_beta``/``swiglu_limit``,
+          SiTU via ``situ_beta``), ``ActivationType.GegluTanh``, or the
+          non-gated ``ActivationType.Relu2``.
         * Routing: pre-routed contract only — the caller runs the router and
           passes global expert ids plus **normalized** scales. ``top_k`` is a
           compile-time constant of the kernels.

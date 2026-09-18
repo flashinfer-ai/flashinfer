@@ -149,10 +149,11 @@ def make_random_topk(num_experts, num_tokens, top_k, device="cuda"):
     return ids, scales
 
 
-def ref_activation(xe, w1_e, activation=None):
-    """Float32 GEMM1 + activation of one expert. ``w1_e`` is the model's
-    ``[gate; up]`` pack for gated activations, ``[I, hidden]`` for ReLU2;
-    ``activation`` is a typed ``ActivationConfig`` (default SwiGLU)."""
+def ref_activation(xe, w1_e, activation=None, out_dtype=torch.bfloat16):
+    """Float32 GEMM1 + activation of one expert, rounded to ``out_dtype`` (the
+    kernel's intermediate dtype). ``w1_e`` is the model's ``[gate; up]`` pack
+    for gated activations, ``[I, hidden]`` for ReLU2; ``activation`` is a typed
+    ``ActivationConfig`` (default SwiGLU)."""
     from tests.moe.utils import compute_reference_activation
     from flashinfer.fused_moe import SwiGLU
 
@@ -163,7 +164,7 @@ def ref_activation(xe, w1_e, activation=None):
     else:
         inter = w1_e.shape[0]
         values = xe @ w1_e.T
-    return compute_reference_activation(values, activation, inter).float()
+    return compute_reference_activation(values, activation, inter, out_dtype).float()
 
 
 def ref_moe(x, ids, scales, w_gate_up, w2, activation=None):
@@ -179,7 +180,9 @@ def ref_moe(x, ids, scales, w_gate_up, w2, activation=None):
         s = scales[:, kk].unsqueeze(1)
         for e in torch.unique(e_ids).tolist():
             m = e_ids == e
-            out[m] += s[m] * (ref_activation(xf[m], w1f[e], activation) @ w2f[e].T)
+            out[m] += s[m] * (
+                ref_activation(xf[m], w1f[e], activation, x.dtype) @ w2f[e].T
+            )
     return out
 
 

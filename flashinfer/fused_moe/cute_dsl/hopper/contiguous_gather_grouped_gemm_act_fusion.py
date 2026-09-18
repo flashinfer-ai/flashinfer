@@ -360,9 +360,11 @@ class Sm90ContiguousGatherGroupedGemmActFusionKernel:
         """Compile-time entry.
 
         :param a: Unpermuted token activations (orig_m, K, 1), K-major.
-        :param b: Expert weights (N, K, E), K-major, up/gate interleaved at
-            32 columns along N.
-        :param c: Output (permuted_m, N/2, 1), N-major.
+        :param b: Expert weights (N, K, E), K-major; for gated activations
+            up/gate interleaved at 32 columns along N (N = 2I), for ``Relu2``
+            the plain projection (N = I).
+        :param c: Output (permuted_m, N // out_n_factor, 1), N-major:
+            N/2 columns for gated activations, N for ``Relu2``.
         :param token_id_mapping: (permuted_m,) Int32
             ``permuted_idx_to_expanded_idx`` (garbage on padding rows).
         """

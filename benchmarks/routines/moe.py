@@ -1655,7 +1655,7 @@ def testCuteDslBf16Moe(args):
        to the kernel's 32-column up/gate interleave; ReLU2: a single [E, I, H]
        projection) and pre-routed top-k ids/scales
     2. Runs MoE via CuteDslBf16MoEWrapper (or cute_dsl_fused_moe_bf16 when
-       ``--use_functional_api`` is set). ``--activation_type`` selects Swiglu
+       ``--use_functional_api`` is set). ``--activation-type`` selects Swiglu
        (default), GegluTanh or Relu2. ``--autotune`` runs the AutoTuner pass,
        compiling each candidate specialization as it is profiled.
     3. Measures performance metrics (TFLOPS, TB/sec)

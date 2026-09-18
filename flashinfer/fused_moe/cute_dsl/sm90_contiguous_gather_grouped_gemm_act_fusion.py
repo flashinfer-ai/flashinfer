@@ -161,11 +161,13 @@ def _interleave_gated_halves(up: torch.Tensor, gate: torch.Tensor) -> torch.Tens
 
 
 def interleave_up_gate_sm90(w_gate_up: torch.Tensor) -> torch.Tensor:
-    """Repack ``[E, 2I, K]`` gate-first concatenated weights:
-    ``[gate; up]``) into the 32-column up/gate interleave this kernel expects.
+    """Repack ``[E, 2I, K]`` gate-first concatenated weights (``[gate; up]``)
+    into the 32-column up/gate interleave this kernel expects.
 
+    The input order is the reverse of the unified MoE canonical ``[up, gate]``
+    pack; :func:`_interleave_gated_halves` takes the two halves explicitly.
     Reference implementation, used by the in-tree tests — frameworks own
-    their weight conversion and keep a local copy of this trivial reshape
+    their weight conversion and keep a local copy of this trivial reshape.
     The result places each 32-column up block immediately before its matching
     gate block."""
     inter = w_gate_up.shape[1] // 2

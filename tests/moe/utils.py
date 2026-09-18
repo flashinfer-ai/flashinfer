@@ -96,8 +96,9 @@ def compute_reference_activation(
     values: torch.Tensor,
     activation: ActivationConfig,
     intermediate_size: int,
+    out_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
-    """Apply the typed unified-MoE activation with its BF16 precision boundary."""
+    """Apply the typed unified-MoE activation and round to the intermediate dtype."""
     if activation.is_gated:
         up, gate = values.split(intermediate_size, dim=-1)
         gate = gate.float()
@@ -144,7 +145,7 @@ def compute_reference_activation(
             result = F.silu(values)
         else:
             raise ValueError(f"unsupported non-gated activation {activation!r}")
-    return result.to(torch.bfloat16)
+    return result.to(out_dtype)
 
 
 def compute_reference_moe(

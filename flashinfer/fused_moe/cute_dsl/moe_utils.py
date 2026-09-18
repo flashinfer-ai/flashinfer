@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import ctypes
 import functools
 import math
 from enum import IntEnum
@@ -43,7 +44,7 @@ def _is_finite_fp32(value: float, *, positive: bool = False) -> bool:
     """
     if not math.isfinite(value) or (positive and value <= 0):
         return False
-    value_f32 = torch.tensor(value, dtype=torch.float32).item()
+    value_f32 = ctypes.c_float(value).value
     return math.isfinite(value_f32) and (not positive or value_f32 > 0)
 
 
