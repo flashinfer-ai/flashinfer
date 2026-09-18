@@ -63,8 +63,9 @@ def _ssd_autotune_configs():
     if override is not None:
         return override
     # MUSA Triton 3.2.x cannot compile the broad upstream autotune search.
-    # The 16x16x32 tile is retained, while four warps provide the latency
-    # hiding measured on the Nemotron H=64, headdim=64, dstate=128 path. The
+    # The 16x16x32 tile is retained, while two warps preserve the stable MUSA
+    # Triton 3.2 launch contract. A separate dashboard sweep found a four-warp
+    # diagnostic candidate, but it remains pending production/E2E validation.
     # explicit environment override above remains available for shape-specific
     # replay until the full serving matrix is measured.
 
@@ -73,7 +74,7 @@ def _ssd_autotune_configs():
             triton.Config(
                 {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 16, "BLOCK_SIZE_K": 32},
                 num_stages=1,
-                num_warps=4,
+                num_warps=2,
             )
         ]
     return [
