@@ -122,6 +122,34 @@ def test_output_only_precomputed_gate(B, T, H, HV, backend):
     torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=1e-2)
 
 
+def test_output_only_wy_grid_exceeds_one_wave():
+    """WY decode over a grid that needs more than one wave of CTAs.
+
+    The kernel launches ``HV * B`` CTAs, and its launch bound
+    (``min_blocks_per_mp``) scales with that count; every other case in this
+    file stays under 250 CTAs, which is a single wave on any supported part,
+    so the multi-wave regime is otherwise untested. ``T`` does not enter the
+    grid, so keep it at 1 to bound the state pool.
+    """
+    num_sms = torch.cuda.get_device_properties(
+        torch.device("cuda")
+    ).multi_processor_count
+    H = HV = 16
+    B = 2 * num_sms  # HV * B = 32 CTAs per SM, several waves at any occupancy
+    q, k, v, _, beta, h0, idx, _, _ = _make_inputs(B, 1, H, HV, seed=3)
+    g_log = F.logsigmoid(
+        torch.randn(B, 1, HV, 128, dtype=torch.float32, device=q.device)
+    ).to(torch.bfloat16)
+    scale = 128**-0.5
+    out = kda_output_only_decode(
+        q, k, v, g_log, beta, h0, idx, scale=scale, backend="wy"
+    )
+    ref = naive_output_only_reference(
+        l2n(q), l2n(k), v, g_log.float(), beta.float(), h0, idx, scale
+    )
+    torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=1e-2)
+
+
 @pytest.mark.parametrize("backend", ["wy", "recurrent"])
 @pytest.mark.parametrize("lower_bound", [-5.0, None])
 @pytest.mark.parametrize("beta_is_logit", [False, True])

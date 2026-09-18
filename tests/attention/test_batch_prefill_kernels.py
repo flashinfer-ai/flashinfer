@@ -28,6 +28,23 @@ from tests.test_helpers.utils_fp4 import create_nvfp4_kv, nvfp4_to_float
 from flashinfer.utils import get_compute_capability, has_flashinfer_jit_cache
 
 
+def _reset_workspace_for_plan(wrapper, *plan_args, **plan_kwargs):
+    try:
+        float_size, int_size = wrapper.workspace_size(
+            *[t.to("cuda:0") if torch.is_tensor(t) else t for t in plan_args],
+            **plan_kwargs,
+        )
+    except NotImplementedError:
+        # Only the FA2 planner reports its size, and it is the only one that
+        # reserves split-KV partials. FA3 (auto on SM90) stores work indices
+        # alone, so the fixed workspace is enough for it.
+        return
+    wrapper.reset_workspace_buffer(
+        torch.empty(float_size, dtype=torch.uint8, device="cuda:0"),
+        torch.empty(int_size, dtype=torch.uint8, device="cuda:0"),
+    )
+
+
 def head_dim_512_supported() -> bool:
     # 16-bit FA2 head_dim > 256 uses the Ampere+ large-head path.
     return get_compute_capability(torch.device("cuda:0"))[0] >= 8
@@ -127,10 +144,6 @@ def test_batch_prefill_with_paged_kv_cache(
     return_lse,
     contiguous_kv,
 ):
-    if use_cuda_graph:
-        pytest.xfail(
-            "NOTE(Zihao): temporarily disable cuda graph until we fully fix the workspace buffer overflow issue for prefill + cudagraph"
-        )
     if qo_len > kv_len and causal:
         pytest.skip("qo_len > kv_len and causal is not supported")
     q = torch.randn(
@@ -227,6 +240,22 @@ def test_batch_prefill_with_paged_kv_cache(
             paged_kv_indptr_buf=kv_indptr_buffer,
             paged_kv_indices_buf=kv_indices_buffer,
             paged_kv_last_page_len_buf=kv_last_page_len_buffer,
+        )
+        # Graph buffers must not move between capture and replay, so reserve what
+        # the final plan needs up front instead of a fixed-size workspace.
+        _reset_workspace_for_plan(
+            wrapper,
+            q_indptr_cpu,
+            kv_indptr_cpu,
+            kv_indices_cpu,
+            kv_last_page_len_cpu,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            causal=causal,
+            pos_encoding_mode=pos_encoding_mode,
+            logits_soft_cap=logits_soft_cap,
         )
         q_indptr_warmup = torch.arange(0, batch_size + 1).int() * qo_len
         kv_indptr_warmup = torch.arange(0, batch_size + 1).int()
@@ -638,10 +667,6 @@ def test_batch_prefill_with_tuple_paged_kv_cache(
     return_lse,
     contiguous_kv,
 ):
-    if use_cuda_graph:
-        pytest.xfail(
-            "NOTE(Zihao): temporarily disable cuda graph until we fully fix the workspace buffer overflow issue for prefill + cudagraph"
-        )
     if qo_len > kv_len and causal:
         pytest.skip("qo_len > kv_len and causal is not supported")
     q = torch.randn(
@@ -737,6 +762,22 @@ def test_batch_prefill_with_tuple_paged_kv_cache(
             paged_kv_indptr_buf=kv_indptr_buffer,
             paged_kv_indices_buf=kv_indices_buffer,
             paged_kv_last_page_len_buf=kv_last_page_len_buffer,
+        )
+        # Graph buffers must not move between capture and replay, so reserve what
+        # the final plan needs up front instead of a fixed-size workspace.
+        _reset_workspace_for_plan(
+            wrapper,
+            q_indptr_cpu,
+            kv_indptr_cpu,
+            kv_indices_cpu,
+            kv_last_page_len_cpu,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            causal=causal,
+            pos_encoding_mode=pos_encoding_mode,
+            logits_soft_cap=logits_soft_cap,
         )
         q_indptr_warmup = torch.arange(0, batch_size + 1).int() * qo_len
         kv_indptr_warmup = torch.arange(0, batch_size + 1).int()
@@ -2295,6 +2336,26 @@ def test_batch_prefill_with_ragged_kv_cache_nvfp4(
         torch.testing.assert_close(o_i, o_ref_i, rtol=1e-1, atol=1e-1)
 
 
+@pytest.mark.parametrize("q_dtype", [torch.float16, torch.bfloat16])
+def test_batch_prefill_with_paged_kv_cache_nvfp4_head_dim_256(q_dtype):
+    # Symmetric head_dim 256 is the widest repack-eligible NVFP4 shape: the 16-bit staging
+    # buffer costs max(head_dim_qk, head_dim_vo) * 16 * NUM_WARPS_KV * sizeof(DTypeQ) per
+    # NUM_MMA_KV, twice the head_dim 128 case the parametrized test above covers. Kept as a
+    # single focused case per Q dtype rather than another axis on that matrix.
+    skip_if_head_dim_unsupported(256)
+    test_batch_prefill_with_paged_kv_cache_nvfp4(
+        batch_size=1,
+        kv_len=256,
+        qo_len=128,
+        page_size=16,
+        num_kv_heads=1,
+        num_qo_heads=1,
+        head_dim=256,
+        causal=False,
+        q_dtype=q_dtype,
+    )
+
+
 def test_batch_prefill_with_paged_kv_cache_nvfp4_large_head():
     skip_if_head_dim_unsupported(512)
     test_batch_prefill_with_paged_kv_cache_nvfp4(
@@ -2354,6 +2415,24 @@ def test_batch_prefill_with_paged_kv_cache_nvfp4_rope_large_head_bf16():
         causal=False,
         q_dtype=torch.bfloat16,
         pos_encoding_mode="ROPE_LLAMA",
+    )
+
+
+@pytest.mark.parametrize("q_dtype", [torch.float16, torch.bfloat16])
+def test_batch_prefill_with_ragged_kv_cache_nvfp4_head_dim_256(q_dtype):
+    # Ragged counterpart of the paged head_dim 256 case above: the two launchers size their
+    # shared-memory budget independently, so the widest repack-eligible shape has to run on
+    # both.
+    skip_if_head_dim_unsupported(256)
+    test_batch_prefill_with_ragged_kv_cache_nvfp4(
+        batch_size=1,
+        kv_len=256,
+        qo_len=128,
+        num_kv_heads=1,
+        num_qo_heads=1,
+        head_dim=256,
+        causal=False,
+        q_dtype=q_dtype,
     )
 
 

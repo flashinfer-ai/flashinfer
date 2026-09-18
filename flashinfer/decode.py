@@ -235,6 +235,68 @@ def sm110_gqa_decode(
     )
 
 
+@flashinfer_experimental_api(feature="Prepared SM110 GQA decode")
+def prepare_sm110_gqa_decode(
+    inputs: dict[str, Any], num_splits: Optional[int] = None
+) -> dict[str, Any]:
+    r"""Prepare repeated FP16 GQA decode launches on an exact SM110 GPU.
+
+    Parameters
+    ----------
+    inputs : dict[str, Any]
+        Contiguous CUDA tensors ``Q`` [B,32,128], ``KV`` [B,2,8,capacity,128],
+        caller-owned ``O`` [B,32,128] (all FP16), and int32
+        ``sequence_lengths`` [B]. All tensors must share one CUDA device and
+        ``O`` must not alias any input storage. Optional ``q_scale`` defaults
+        to 1.0 and must be finite and positive.
+    num_splits : Optional[int]
+        ``None`` selects the prepared shape specialization. Above capacity 64,
+        ``1`` selects the original long kernel. B=1 with capacity 1024 or 4096
+        also supports its fixed split count of ``10``. Above capacity 64,
+        other split choices are rejected. Capacities up to 64 always use the
+        original short kernel; accepted explicit counts are 1, 2, 4, 8, 10, 16.
+
+    Returns
+    -------
+    dict[str, Any]
+        Opaque prepared state owning tensor references and any workspace.
+        Pass it to :func:`launch_sm110_gqa_decode_prepared` without modifying it.
+
+    Notes
+    -----
+    This opt-in interface separates allocation and JIT compilation from
+    sustained decode. Default specializations cover B=4/capacity=256 and
+    B=1/capacity=1024 or 4096; other shapes use the original kernels.
+    Every sequence length must remain in ``[1, capacity]`` at every launch.
+    GPU length values may change between launches; preparation does not read
+    them back to the host. The caller is responsible for this precondition.
+    Prepare and warm up before CUDA Graph capture. Retain the prepared state
+    until all asynchronous work completes and captured Graphs are retired.
+    """
+    from .experimental.sm110_gqa_decode import prepare_for_launch
+
+    return prepare_for_launch(inputs, num_splits=num_splits)
+
+
+@flashinfer_experimental_api(feature="Prepared SM110 GQA decode launch")
+def launch_sm110_gqa_decode_prepared(prepared: dict[str, Any]) -> torch.Tensor:
+    r"""Launch prepared decode on the current PyTorch stream and return its O.
+
+    ``prepared`` is the unmodified result of :func:`prepare_sm110_gqa_decode`.
+    Its tensors and workspace must remain alive through asynchronous launches
+    and CUDA Graph replays. GPU sequence lengths may change within the valid
+    range, while shapes, storage, and query scale remain fixed.
+
+    Concurrent invocations require independent prepared objects and output/
+    workspace storage. A prepared object can be reused on ordered streams,
+    including event-ordered stream handoffs. No allocations or host reads of
+    sequence lengths occur in this launch path.
+    """
+    from .experimental.sm110_gqa_decode import launch_prepared
+
+    return launch_prepared(prepared)
+
+
 @functools.cache
 def get_single_decode_module(*args):
     uri = get_single_decode_uri(*args)

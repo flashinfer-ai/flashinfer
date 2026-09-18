@@ -22,6 +22,7 @@ import torch
 import torch.nn.functional as F
 from packaging.version import Version
 
+from flashinfer import recurrent_kda as public_recurrent_kda
 from flashinfer.kda_decode import recurrent_kda
 
 kda_decode_module = importlib.import_module("flashinfer.kda_decode")
@@ -2062,6 +2063,82 @@ def _unbounded_softplus_cake_ineligible_case(device, *, num_sequences, num_heads
 
 
 @pytest.mark.parametrize("num_sequences", [2, 4])
+def test_t1_unbounded_softplus_default_auto_falls_back_with_dense_state(
+    flash_kda_device, monkeypatch, num_sequences
+):
+    """The public default preserves caller-owned state when Cake rejects.
+
+    Two and four sequences straddle the grouped-CTA/one-warp threshold at 32
+    heads while exercising the same dense, unindexed state contract.
+    """
+
+    num_heads = 32
+    case = _unbounded_softplus_cake_ineligible_case(
+        flash_kda_device,
+        num_sequences=num_sequences,
+        num_heads=num_heads,
+        seed=4941,
+    )
+    assert case["cu_seqlens"] is None
+    assert case["ssm_state_indices"] is None
+    assert case["initial_state"].is_contiguous()
+
+    baseline_case = dict(case)
+    for name in ("q", "k", "v", "g", "beta", "A_log", "dt_bias"):
+        baseline_case[name] = case[name].clone()
+    baseline_state = case["initial_state"].clone()
+    expected_output, expected_state = recurrent_kda(
+        **_call_kwargs(
+            baseline_case,
+            state=baseline_state,
+            output=torch.empty_like(case["output"]),
+        ),
+        backend="cute-dsl",
+    )
+
+    selected_variants = []
+    select_flash_kda_variant = recurrent_module._select_flash_kda_decode_variant
+
+    def track_flash_kda_selection(**kwargs):
+        variant = select_flash_kda_variant(**kwargs)
+        selected_variants.append(variant)
+        return variant
+
+    monkeypatch.setattr(
+        recurrent_module,
+        "_select_flash_kda_decode_variant",
+        track_flash_kda_selection,
+    )
+    monkeypatch.setattr(
+        recurrent_module,
+        "_run_flash_kda_decode",
+        lambda *args, **kwargs: pytest.fail("Cake must not launch after selector miss"),
+    )
+    actual_state = case["initial_state"].clone()
+    actual_before = actual_state.clone()
+    actual_output, actual_state_result = public_recurrent_kda(
+        **_call_kwargs(
+            dict(case),
+            state=actual_state,
+            output=torch.empty_like(case["output"]),
+        )
+    )
+
+    assert selected_variants == [None]
+    assert actual_state_result is actual_state
+    torch.testing.assert_close(
+        actual_output.float(), expected_output.float(), atol=0, rtol=0
+    )
+    torch.testing.assert_close(
+        actual_state_result.float(), expected_state.float(), atol=0, rtol=0
+    )
+    torch.testing.assert_close(
+        actual_state.float(), baseline_state.float(), atol=0, rtol=0
+    )
+    assert torch.count_nonzero(actual_state != actual_before).item() > 0
+
+
+@pytest.mark.parametrize("num_sequences", [2, 4])
 def test_t1_unbounded_softplus_auto_fallback_handles_absent_and_strided_state(
     flash_kda_device, num_sequences
 ):
@@ -2126,6 +2203,18 @@ def test_t1_unbounded_softplus_auto_fallback_handles_absent_and_strided_state(
         flash_kda_device, num_sequences=num_sequences, num_heads=num_heads, seed=4939
     )
     case.update(ssm_state_indices=state_indices)
+    before = strided_pool.clone()
+    with pytest.raises(ValueError, match="non-contiguous initial_state"):
+        recurrent_kda(
+            **_call_kwargs(
+                dict(case),
+                state=strided_pool,
+                output=torch.empty_like(case["output"]),
+            ),
+            backend="cute-dsl",
+        )
+    torch.testing.assert_close(strided_pool, before, atol=0, rtol=0)
+
     baseline_pool = strided_pool.contiguous().clone()
     expected = recurrent_kda(
         **_call_kwargs(
@@ -2135,7 +2224,6 @@ def test_t1_unbounded_softplus_auto_fallback_handles_absent_and_strided_state(
         ),
         backend="auto",
     )
-    before = strided_pool.clone()
     actual = recurrent_kda(
         **_call_kwargs(
             dict(case), state=strided_pool, output=torch.empty_like(case["output"])
