@@ -10,16 +10,16 @@ It spans **two repositories**:
 - **FlashInfer** — branch `feat/vllm-moe-ep-api` off `upstream/main`
   (`github.com/Anerudhan/flashinfer`, remote `origin`).
 - **vLLM** — branch `feat/flashinfer-ep-all2all` off `Anerudhan/vllm` `main`
-  (upstream `vllm-project/vllm` fork), cloned at `/home/scratch.agopal_sw/play/NCCL/vllm`.
+  (upstream `vllm-project/vllm` fork), cloned locally.
 
-> Status: code complete + **GPU-validated on Pre-Nyx (8×GPU, single node, CUDA 13.2)** — see
+> Status: code complete + **GPU-validated (8×B200 single node, CUDA 13.2)** — see
 > §0. Both `flashinfer_ep_low_latency` and `flashinfer_ep_high_throughput` pass end-to-end
 > (smoke, GSM8K, throughput). Deferred: DeepEP comparison column (DeepEP's own CUDA-13.2 build
 > fails), raw NCCL-EP backend (not in upstream vLLM), 2-node, and `bench serve` TTFT/TPOT.
 
 ---
 
-## 0. Validated results (Pre-Nyx, 8×GPU single node, CUDA 13.2)
+## 0. Validated results (8×B200 single node, CUDA 13.2)
 
 Base image `nvcr.io/nvidia/pytorch:26.05-py3`; vLLM built from source (torch gate passed);
 FlashInfer run from the branch. All checks below **pass**:
@@ -163,7 +163,7 @@ Base image is **forced** to `nvcr.io/nvidia/pytorch:26.05-py3` (CUDA 13.2): cros
 aborts (`nccl_ep.cc:2884 illegal memory access`) on any non-13.2 stack, and the plan requires
 2-node HT. vLLM is therefore built **from source** against the image's torch.
 
-> **Pre-Nyx (and most SLURM clusters) have no Docker daemon** — images are built with
+> **The validation cluster (like most SLURM clusters) has no Docker daemon** — images are built with
 > **pyxis/enroot** via `srun --container-save`, not `docker build`. This is how the `.sqsh`
 > images used for all results were produced. The `docker/Dockerfile.*` files remain the
 > canonical build spec and are usable on a machine that *does* have Docker (see the optional
@@ -197,7 +197,7 @@ so the build uses NGC-26.05's torch. If they are incompatible the vLLM build fai
 before anything else. Runtime env baked in: `NCCL_NET_PLUGIN=none` (HPC-X v8 segfaults NCCL
 ≥2.30), the 2.30.7 `libnccl` symlink, and the HT-JIT toolchain env.
 
-**Optional — on a Docker host / CI** (not Pre-Nyx): the same images build directly from the
+**Optional — on a Docker host / CI** (not the SLURM cluster): the same images build directly from the
 Dockerfiles.
 ```bash
 docker build -f docker/Dockerfile.flashinfer-ep-pytorch -t flashinfer-ep:pt2605 .

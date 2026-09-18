@@ -57,7 +57,9 @@ from flashinfer.mla._sparse_mla_sm120 import (
     _MODEL_TYPE_GLM_NSA,
     _MODEL_TYPE_GLM53_NOPE,
     _MODEL_TYPE_DOTS3_SWA,
+    _decode_scratch_views,
     _decode_dispatch_error_message,
+    _packed_kv_page_block_size,
     _resolve_model_type,
 )
 from flashinfer.mla._sparse_mla_sm120_plan import (
@@ -124,6 +126,63 @@ def test_supported_configs_families() -> None:
     )
     assert "supported_sparse_mla_sm120_configs" in dir(flashinfer.mla)
     assert "SparseMLASm120DecodeConfig" in dir(flashinfer.mla)
+
+
+def test_supported_configs_nvfp4_envelope() -> None:
+    """The shared query API exposes the exact, independently keyed NVFP4 set."""
+    configs = supported_sparse_mla_sm120_configs(kv_cache_format="nvfp4")
+    assert set(configs) == {"dsv4"}
+    dsv4 = configs["dsv4"]
+    assert dsv4.kv_cache_format == "nvfp4"
+    assert dsv4.bytes_per_token == 384
+    assert dsv4.supported_num_heads() == (16, 32, 64, 128)
+    assert dsv4.supported_topk() == (128, 512)
+    assert dsv4.extra_page_block_sizes == frozenset({2, 64})
+    assert dsv4.supports_decode(64, 128)
+    assert not dsv4.supports_decode(8, 128)
+    assert not dsv4.supports_decode(64, 256)
+
+    with pytest.raises(ValueError, match="kv_cache_format"):
+        supported_sparse_mla_sm120_configs(kv_cache_format="int4")
+
+
+@pytest.mark.parametrize("layout", ["2d", "3d", "hnd", "nhd"])
+def test_glm53_canonical_payload_is_scoped_to_model(layout: str) -> None:
+    """A 528-byte row is valid only with GLM NoPE geometry and scale semantics."""
+    glm = _resolve_model_type(512, "arbitrary_fp32")
+    assert glm == _MODEL_TYPE_GLM53_NOPE
+    assert _resolve_model_type(512, "auto") == _MODEL_TYPE_DSV4
+    assert supported_sparse_mla_sm120_configs()["glm53_nope"].bytes_per_token == 528
+    shape = {
+        "2d": (2, 64 * 528),
+        "3d": (2, 64, 528),
+        "hnd": (2, 1, 64, 528),
+        "nhd": (2, 64, 1, 528),
+    }[layout]
+    cache = torch.empty(shape, dtype=torch.uint8, device="meta")
+    assert _packed_kv_page_block_size(cache, model_type=glm, name="kv") == 64
+    for model_type in (_MODEL_TYPE_DSV4, _MODEL_TYPE_DSV3_2, _MODEL_TYPE_GLM_NSA):
+        with pytest.raises(ValueError):
+            _packed_kv_page_block_size(cache, model_type=model_type, name="kv")
+
+
+def test_nvfp4_exact_head_scratch_view() -> None:
+    """The shared scratch slicer also supports NVFP4's exact-head ABI."""
+    mid_out = torch.empty((8, 64, 9, 512), dtype=torch.bfloat16, device="meta")
+    mid_lse = torch.empty((8, 64, 9), dtype=torch.float32, device="meta")
+
+    out_view, lse_view = _decode_scratch_views(
+        mid_out,
+        mid_lse,
+        num_tokens=2,
+        num_heads=16,
+        num_splits=2,
+        d_v=512,
+        scratch_heads=16,
+    )
+
+    assert out_view.shape == (2, 16, 2, 512)
+    assert lse_view.shape == (2, 16, 2)
 
 
 def test_supported_helpers() -> None:

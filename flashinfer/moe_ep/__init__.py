@@ -65,9 +65,16 @@ from .backends.mega.kernel.sm100.bf16_bf16_bf16_cutedsl import (
     Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig,
     preprocess_mega_weights as preprocess_bf16_cutedsl_mega_weights,
 )
+from .backends.mega.kernel.sm100.bf16_bf16_bf16_rank_major_cuda import (
+    Sm100_Bf16_Bf16_Bf16_RankMajorCuda_MegaMoeConfig,
+    preprocess_mega_weights as preprocess_bf16_rank_major_cuda_mega_weights,
+)
 from .backends.mega.kernel.sm100.mxfp8_mxfp8_bf16_cutedsl import (
     Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
     preprocess_mega_weights as preprocess_mxfp8_cutedsl_mega_weights,
+)
+from .backends.mega.kernel.sm100.bf16_mxfp8_bf16_cutedsl import (
+    Sm100_Bf16_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
 )
 from .backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl import (
     Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
@@ -103,6 +110,11 @@ Nvfp4CutedslMegaMoeConfig = Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
 Sm90PullFp8MegaMoeConfig = Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig
 Sm90PushFp8MegaMoeConfig = Sm90_Fp8_Fp8_Bf16_PushCuda_MegaMoeConfig
 
+from .cake_mxfp8_megamoe_ep16 import (
+    CakeMxfp8MegaMoeEp16,
+    CakeMxfp8MegaMoeEp16Weights,
+    preprocess_cake_mxfp8_megamoe_ep16_weights,
+)
 from .config import (
     BootstrapConfig,
     CombineInputParams,
@@ -147,6 +159,7 @@ from .modes import (
     IdentityConfig,
     MegaConfig,
     MoEEpMegaLayer,
+    MoEEpMegaWorkspace,
     MoEEpSplitLayer,
     NCCLEPConfig,
     NcclEpConfig,
@@ -167,8 +180,12 @@ from .weights import (
 __all__ = [
     "AlgoKnob",
     "BootstrapConfig",
+    "CakeMxfp8MegaMoeEp16",
+    "CakeMxfp8MegaMoeEp16Weights",
+    "preprocess_cake_mxfp8_megamoe_ep16_weights",
     "Bf16CutedslMegaMoeConfig",
     "Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig",
+    "Sm100_Bf16_Bf16_Bf16_RankMajorCuda_MegaMoeConfig",
     "CombineInputParams",
     "CombineOutput",
     "Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig",
@@ -205,6 +222,7 @@ __all__ = [
     "MoEEpFaultToleranceUnsupportedError",
     "MoEEpLayer",
     "MoEEpMegaLayer",
+    "MoEEpMegaWorkspace",
     "MoEEpNotBuiltError",
     "MoEEpRankEvictedError",
     "MoEEpSplitLayer",
@@ -213,6 +231,7 @@ __all__ = [
     "MoEWeightPack",
     "PrequantizedMoEWeights",
     "UnquantizedMoEWeights",
+    "Sm100_Bf16_Mxfp8_Bf16_Cutedsl_MegaMoeConfig",
     "Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig",
     "NCCLEPConfig",
     "NcclEpConfig",
@@ -239,6 +258,7 @@ __all__ = [
     "kernel_requires_weights",
     "preprocess_mega_weights",
     "preprocess_bf16_cutedsl_mega_weights",
+    "preprocess_bf16_rank_major_cuda_mega_weights",
     "preprocess_mxfp8_cutedsl_mega_weights",
     "preprocess_nvfp4_cutedsl_mega_weights",
     "preprocess_sm120_mxfp4_mxfp8_cutedsl_mega_weights",
@@ -314,7 +334,7 @@ def supports_fault_tolerance(backend: str) -> bool:
 
     Rank masking needs more than the backend being present:
 
-    * ``nccl_ep`` also needs an nccl4py whose ``GroupConfig`` carries
+    * ``nccl_ep`` also needs an nccl-extensions whose ``GroupConfig`` carries
       ``enable_mask`` and a libnccl exporting the ``ncclEpMask*`` symbols.
       Both are feature-detected, never version-pinned.
     * ``nixl_ep``'s mask buffer is allocated unconditionally by

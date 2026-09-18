@@ -20,12 +20,14 @@ from .checkpointing_ssu import (
     allocate_checkpointing_ssu_scratch,
     checkpointing_ssu,
 )
+from .replayssm_materialize import replayssm_materialize
 
 __all__ = [
     "cake_selective_state_update",
     "selective_state_update",
     "checkpointing_ssu",
     "allocate_checkpointing_ssu_scratch",
+    "replayssm_materialize",
 ]
 
 try:

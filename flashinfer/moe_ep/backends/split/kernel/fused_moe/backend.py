@@ -47,12 +47,15 @@ class FusedMoeSplitKernelBackend(SplitKernelBackend):
     ) -> None:
         validate_compute_consistency(fleet_params, bootstrap, self._moe_config)
         if self._mxfp8_dispatch:
-            from ......fused_moe.api import CuteDslConfig, QuantVariant
+            from ......fused_moe.api import CuteDslConfig, QuantFormat
             from .....core.validation.common import MoEEpConfigError
 
-            if self._moe_config.quant.variant is not QuantVariant.MXFP4:
+            if self._moe_config.quant.pair != (
+                QuantFormat.MXFP4,
+                QuantFormat.MXFP8,
+            ):
                 raise MoEEpConfigError(
-                    "mxfp8_dispatch requires MoEConfig quant variant MXFP4."
+                    "mxfp8_dispatch requires MoEConfig quant pair MXFP4×MXFP8."
                 )
             backends = tuple(self._moe_config.backend)
             if len(backends) != 1 or not isinstance(backends[0], CuteDslConfig):
@@ -95,8 +98,8 @@ class FusedMoeSplitKernelBackend(SplitKernelBackend):
 
     def compute(self, ctx: SplitKernelContext):
         expert_tensors = ctx.expert_tensors
-        quant_variant = self._moe_config.quant.variant
-        per_token_activation = bool(self._moe_config.quant.per_token_scale)
+        quant = self._moe_config.quant
+        per_token_activation = bool(quant.per_token_scale)
         offset = self._moe_config.experts.local_expert_offset
         dim0, dim1, _ = expert_tensors.shape
 
@@ -114,7 +117,7 @@ class FusedMoeSplitKernelBackend(SplitKernelBackend):
                 ctx.recv_topk_weights,
                 num_local_experts=self._moe_config.experts.local_num_experts,
                 local_expert_offset=offset,
-                quant_variant=quant_variant,
+                quant=quant,
                 per_token_activation=per_token_activation,
                 mxfp8_dispatch=self._mxfp8_dispatch,
                 hidden_size=fleet_params.token_hidden_size,
@@ -123,7 +126,7 @@ class FusedMoeSplitKernelBackend(SplitKernelBackend):
             act_pack = build_activation_pack(
                 expert_tensors,
                 local_expert_offset=offset,
-                quant_variant=quant_variant,
+                quant=quant,
                 per_token_activation=per_token_activation,
                 mxfp8_dispatch=self._mxfp8_dispatch,
                 hidden_size=fleet_params.token_hidden_size,
