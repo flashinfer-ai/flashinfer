@@ -1793,11 +1793,9 @@ class _CutlassRunnerBase(MoERunner):
         self._activation_params = self._resolve_activation_params(view)
 
         # Token-dynamic dims are only the packed prerouted buffers (output,
-        # hidden, topk_ids, topk_weights). Per-tensor FP8 scales are static
-        # 0-dim entries of the weight view; MXFP8 input_sf is a swizzled 1-D
-        # buffer resized by ConstraintSpec. Sniffing shape[0] == num_tokens
-        # treated a (1,) scale at M=1 as token-dynamic and let autotune replace
-        # it with a bucket-sized tensor.
+        # hidden, topk_ids, topk_weights). Weight-view entries are static, even
+        # 0-dim / (1,) per-tensor scales; MXFP8 input_sf is a swizzled 1-D
+        # buffer resized by ConstraintSpec.
         input_idxs: tuple[int, ...] = (0, 1, 2, 3)
         dim_idxs: tuple[int, ...] = (0, 0, 0, 0)
 
@@ -1875,10 +1873,7 @@ class _CutlassRunnerBase(MoERunner):
     ) -> List[torch.Tensor]:
         if self._use_mxfp8_act_scaling:
             assert act.hidden_states_scale is not None
-            scale = act.hidden_states_scale
-            if self._use_mxfp8_act_scaling:
-                scale = scale.reshape(-1)
-            return [scale]
+            return [act.hidden_states_scale.reshape(-1)]
         return []
 
     def _pack_weight_inputs(
@@ -2209,10 +2204,11 @@ class CutlassFp8PerTensorRunner(_CutlassRunnerBase):
 
     Activations use the TRTLLM canonical per-tensor FP8 pack: E4M3
     ``[M, H]`` quantized with the static calibration multiplier
-    ``hidden_states_scale_global`` and no ``hidden_states_scale``. Both static
-    multipliers (``hidden_states_scale_global``, ``intermediate_scale_global``)
-    live in the weight view, exactly as in the ``trtllm_fp8_per_tensor`` view,
-    and are folded into the flat CUTLASS ``quant_scales`` at launch.
+    ``hidden_states_scale_global`` and no ``hidden_states_scale``. The view
+    carries the flat CUTLASS ``quant_scales`` already folded by
+    ``prepare_cutlass_fp8_per_tensor_weights`` (``[fc1_dequant_scale,
+    fc2_act_quant_scale, fc2_dequant_scale, fc1_act_dequant_scale]``); the
+    runner validates and passes them through.
     """
 
     backend_key = "cutlass_fp8_per_tensor"
@@ -2224,17 +2220,17 @@ class CutlassFp8PerTensorRunner(_CutlassRunnerBase):
     _required_weight_keys = (
         "fc1_expert_weights",
         "fc2_expert_weights",
-        "fc1_dequant",
-        "fc2_dequant",
-        "hidden_states_scale_global",
-        "intermediate_scale_global",
+        "fc1_dequant_scale",
+        "fc2_act_quant_scale",
+        "fc2_dequant_scale",
+        "fc1_act_dequant_scale",
     )
     _expected_num_inputs = 10
 
     def _pack_weight_inputs(
         self, view: dict[str, torch.Tensor], hidden_size: int
     ) -> List[torch.Tensor]:
-        w1, w2, w1_dequant, w2_dequant, act_scale, inter_scale = (
+        w1, w2, fc1_dequant, fc2_act_quant, fc2_dequant, fc1_act_dequant = (
             view[key] for key in self._required_weight_keys
         )
         num_experts = self.config.routing.num_experts
@@ -2249,77 +2245,17 @@ class CutlassFp8PerTensorRunner(_CutlassRunnerBase):
                 f"Cutlass FP8 weight shapes {tuple(w1.shape)}/{tuple(w2.shape)} "
                 f"!= expected {expected_w1}/{expected_w2}."
             )
-        if (
-            w1_dequant.dtype is not torch.float32
-            or w2_dequant.dtype is not torch.float32
+        for name, scale, shape in (
+            ("fc1_dequant_scale", fc1_dequant, (num_experts,)),
+            ("fc2_act_quant_scale", fc2_act_quant, ()),
+            ("fc2_dequant_scale", fc2_dequant, (num_experts,)),
+            ("fc1_act_dequant_scale", fc1_act_dequant, ()),
         ):
-            raise TypeError("Cutlass FP8 dequant scales must be float32.")
-        expected_scale = (num_experts,)
-        if (
-            tuple(w1_dequant.shape) != expected_scale
-            or tuple(w2_dequant.shape) != expected_scale
-        ):
-            raise ValueError(
-                "Cutlass FP8 dequant scale shapes "
-                f"{tuple(w1_dequant.shape)}/{tuple(w2_dequant.shape)} != "
-                f"expected {expected_scale}."
-            )
-        for name, scale in (
-            ("hidden_states_scale_global", act_scale),
-            ("intermediate_scale_global", inter_scale),
-        ):
-            _require_cutlass_tensor(scale, name=name, dtype=torch.float32, shape=())
+            _require_cutlass_tensor(scale, name=name, dtype=torch.float32, shape=shape)
         self._validate_weight_storage(
-            (w1, w2, w1_dequant, w2_dequant, act_scale, inter_scale)
+            (w1, w2, fc1_dequant, fc2_act_quant, fc2_dequant, fc1_act_dequant)
         )
-        return [
-            w1,
-            w2,
-            *self._fp8_abi_scales(w1_dequant, w2_dequant, act_scale, inter_scale),
-        ]
-
-    def _fp8_abi_scales(
-        self,
-        w1_dequant: torch.Tensor,
-        w2_dequant: torch.Tensor,
-        act_scale: torch.Tensor,
-        inter_scale: torch.Tensor,
-    ) -> List[torch.Tensor]:
-        """Fold the static view scales into the flat ``quant_scales`` ABI once.
-
-        Flat ABI: ``[fc1_dequant, fc2_act_quant, fc2_dequant, fc1_act_dequant]``.
-        The view stores quant *multipliers* (``q = x * scale``), so the
-        activation dequant is their reciprocal. ``MoELayer`` packs on every
-        call, so the folded tensors are cached per view, keyed by the storage
-        pointers of the four source tensors; recomputing them per forward
-        would add three launches per step and move pointers out from under a
-        captured CUDA graph.
-
-        Contract: the registered scales are immutable once packed. An in-place
-        write (``view["intermediate_scale_global"].copy_(...)``) keeps the
-        pointer and is therefore not observed -- all four folded tensors keep
-        the old calibration, consistently. Re-calibrating means registering
-        new tensors (new storage) and calling ``pack_inputs`` again. Static
-        per-tensor scales come from the checkpoint, so this is the normal
-        framework flow.
-        """
-        key = tuple(
-            t.data_ptr() for t in (w1_dequant, w2_dequant, act_scale, inter_scale)
-        )
-        cached = getattr(self, "_fp8_abi_cache", None)
-        if cached is None or cached[0] != key:
-            act_dequant = act_scale.reciprocal()
-            scales = [
-                (w1_dequant * act_dequant).contiguous(),
-                # Cloned, not aliased: an in-place update of the view must not
-                # change one ABI slot while the folded ones keep the old value.
-                inter_scale.clone(),
-                (w2_dequant / inter_scale).contiguous(),
-                act_dequant,
-            ]
-            cached = (key, scales)
-            self._fp8_abi_cache = cached
-        return list(cached[1])
+        return [w1, w2, fc1_dequant, fc2_act_quant, fc2_dequant, fc1_act_dequant]
 
     def _quant_scales(self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
         return list(inputs[6:10])

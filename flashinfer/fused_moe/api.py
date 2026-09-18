@@ -1194,12 +1194,12 @@ class CutlassFp8PerTensorConfig:
 
     Activations follow the TRTLLM canonical per-tensor FP8 pack: E4M3
     quantized with the static ``hidden_states_scale_global`` multiplier and
-    ``hidden_states_scale=None``. Both static multipliers live in the weight
-    view (as in ``TrtllmFp8PerTensorConfig``), so one ``MoEActivationPack``
-    feeds both backends. Weights stay unshuffled; this is not the TRTLLM
-    MajorK view. Packed precomputed routing with all flat CUTLASS activation
-    semantics and ``do_finalize=True``. Not in the default backend search
-    list.
+    ``hidden_states_scale=None``. Both static multipliers are
+    ``prepare_weights`` inputs (as in ``TrtllmFp8PerTensorConfig``), so one
+    ``MoEActivationPack`` feeds both backends. Weights stay unshuffled; this
+    is not the TRTLLM MajorK view. Packed precomputed routing with all flat
+    CUTLASS activation semantics and ``do_finalize=True``. Not in the default
+    backend search list; opt in through ``BackendOptions``.
     """
 
     @classmethod
@@ -1223,9 +1223,8 @@ class CutlassFp8PerTensorConfig:
 
         ``hidden_states_scale_global`` / ``intermediate_scale_global`` are the
         same static calibration multipliers ``TrtllmFp8PerTensorConfig``
-        takes; they are stored in the view and folded into the launch. The
-        runner folds them once per view: treat the registered scales as
-        immutable and re-prepare (new tensors) instead of writing in place.
+        takes. The flat CUTLASS ``quant_scales`` are folded from them here;
+        re-calibrating means calling ``prepare_weights`` again.
         """
         from .prepare import prepare_cutlass_fp8_per_tensor_weights
 
@@ -1241,19 +1240,8 @@ class CutlassFp8PerTensorConfig:
             device=device,
         )
 
-    @staticmethod
-    def prepare_activations(hidden_states_bf16, *, hidden_states_scale_global):
-        """Quantize BF16 activations with the static E4M3 multiplier.
-
-        Identical to ``TrtllmFp8PerTensorConfig.prepare_activations``; returns
-        ``(q, None)`` because the scale lives in the weight view.
-        """
-        from .prepare import prepare_trtllm_fp8_per_tensor_activations
-
-        return prepare_trtllm_fp8_per_tensor_activations(
-            hidden_states_bf16,
-            hidden_states_scale_global=hidden_states_scale_global,
-        )
+    # Same canonical pack as TRT-LLM: ``(q, None)``, the scale lives in the view.
+    prepare_activations = staticmethod(TrtllmFp8PerTensorConfig.prepare_activations)
 
     def __repr__(self) -> str:
         return "CutlassFp8PerTensorConfig()"

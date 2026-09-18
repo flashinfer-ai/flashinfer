@@ -233,6 +233,7 @@ from flashinfer.quantization import e2m1_and_ufp8sf_scale_to_float
 from flashinfer.quantization.fp8_quantization import mxfp8_quantize
 from flashinfer.tllm_enums import RoutingMethodType
 from flashinfer.utils import get_compute_capability
+from tests.moe.utils import fp8_per_tensor_global_scale, fp8_per_tensor_requant_hook
 
 from tests.test_helpers.fuzz_ledger import FuzzLedger
 
@@ -766,14 +767,8 @@ def _block_fp8_reference(
     return out
 
 
-def _fp8_per_tensor_global_scale(x):
-    fp8_max = torch.finfo(torch.float8_e4m3fn).max
-    amax = x.float().abs().amax()
-    return torch.where(amax > 0, fp8_max / amax, torch.ones_like(amax))
-
-
 def _fp8_per_tensor_act_pack_logits(x, routing_logits, routing_bias):
-    input_scale = _fp8_per_tensor_global_scale(x)
+    input_scale = fp8_per_tensor_global_scale(x)
     q, sf = TrtllmFp8PerTensorConfig.prepare_activations(
         x, hidden_states_scale_global=input_scale
     )
@@ -787,7 +782,7 @@ def _fp8_per_tensor_act_pack_logits(x, routing_logits, routing_bias):
 
 
 def _fp8_per_tensor_act_pack(x, selected_experts, final_scales):
-    input_scale = _fp8_per_tensor_global_scale(x)
+    input_scale = fp8_per_tensor_global_scale(x)
     q, sf = TrtllmFp8PerTensorConfig.prepare_activations(
         x, hidden_states_scale_global=input_scale
     )
@@ -820,7 +815,7 @@ def _fp8_per_tensor_reference(
 ):
     fp8_max = torch.finfo(torch.float8_e4m3fn).max
     final_scales = final_scales.to(torch.bfloat16).float()
-    input_scale = _fp8_per_tensor_global_scale(x)
+    input_scale = fp8_per_tensor_global_scale(x)
     intermediate_scale = torch.tensor(64.0, device=x.device)
     x_q = (x.float() * input_scale).clamp(-fp8_max, fp8_max)
     x32 = x_q.to(torch.float8_e4m3fn).float() / input_scale
@@ -1027,13 +1022,9 @@ def _cutlass_post_reference(backend_key):
             # static intermediate multiplier before GEMM2.
             assert view["_activation_scale"] is None
             x_ref = view["_activation_q"].float() / view["hidden_states_scale_global"]
-            inter_scale = view["intermediate_scale_global"]
-            fp8_max = torch.finfo(torch.float8_e4m3fn).max
-
-            def intermediate_hook(inter, inter_scale=inter_scale):
-                q = (inter * inter_scale).clamp(-fp8_max, fp8_max)
-                return q.to(torch.float8_e4m3fn).float() / inter_scale
-
+            intermediate_hook = fp8_per_tensor_requant_hook(
+                view["intermediate_scale_global"]
+            )
             w1_ref = (
                 view["fc1_expert_weights"].float() * view["fc1_dequant"][:, None, None]
             )
@@ -2919,7 +2910,7 @@ def test_unified_moe_fuzz(cfg):
             prepare_kwargs["quant"] = _quant_config_for_handler(handler)
         elif BackendCfg in (TrtllmFp8PerTensorConfig, CutlassFp8PerTensorConfig):
             prepare_kwargs.update(
-                hidden_states_scale_global=_fp8_per_tensor_global_scale(x),
+                hidden_states_scale_global=fp8_per_tensor_global_scale(x),
                 intermediate_scale_global=torch.tensor(64.0, device=dev),
             )
         view = (
