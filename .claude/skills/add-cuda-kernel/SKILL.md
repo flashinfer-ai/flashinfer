@@ -234,7 +234,7 @@ def gen_scale_module(dtype_in, dtype_out):
 - No Jinja template needed for simple operations
 - Just copy source files to generation directory
 - URI uniquely identifies the module configuration
-- **NEVER write to package directories** - see "JIT Directory Rules" in `CLAUDE.md`
+- **NEVER write to package directories** - see "JIT Directory Rules" in `AGENTS.md`
 
 ### (Optional) Specifying Supported CUDA Architectures
 
@@ -717,8 +717,8 @@ Key rules:
 ### 6b. Attach the template to the API
 
 ```python
-# flashinfer/norm.py  (real file)
-from .trace.templates.norm import rmsnorm_trace
+# flashinfer/norm/__init__.py  (real file)
+from ..trace.templates.norm import rmsnorm_trace
 
 @flashinfer_api(trace=rmsnorm_trace)
 def rmsnorm(input: torch.Tensor, weight: torch.Tensor, ...) -> torch.Tensor:
