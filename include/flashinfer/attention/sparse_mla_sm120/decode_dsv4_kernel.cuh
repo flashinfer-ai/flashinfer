@@ -167,6 +167,13 @@ struct DecodeDsv4Smem {
   }
 };
 
+// PAGE_BLOCK_SIZE sentinel: this instantiation reads the main cache's page
+// geometry from the runtime argument instead of the template parameter, so one
+// kernel serves every page size. Any other value compiles that size in, which
+// folds the page divide into a shift and keeps the calibrated address
+// arithmetic of the 64-token layout every shipped caller uses.
+constexpr int kRuntimePageSize = 0;
+
 // No minBlocksPerSM on launch_bounds: kernel is smem-bound at 1 block/SM, and
 // the unconstrained register budget avoids the per-warp spill the hint forces.
 template <ModelType MT, int NUM_HEADS, int PAGE_BLOCK_SIZE>
@@ -189,7 +196,7 @@ __global__ void __launch_bounds__(DecodeTileCfg<MT>::BLOCK_THREADS) sparse_mla_d
     int chunks_per_block, float sm_scale, size_t stride_kv_block,
     // Row strides of (extra_)indices; either may exceed the row width when the
     // caller views a wider persistent buffer (last dim must stay contiguous).
-    size_t stride_indices_token, size_t stride_extra_indices_token) {
+    size_t stride_indices_token, size_t stride_extra_indices_token, int page_block_size) {
   using KV = KVCacheTraits<MT>;
   using Cfg = DecodeTileCfg<MT>;
   static_assert(MT == ModelType::DSV4 || MT == ModelType::DOTS3_SWA,
@@ -204,7 +211,9 @@ __global__ void __launch_bounds__(DecodeTileCfg<MT>::BLOCK_THREADS) sparse_mla_d
   constexpr int KV_SMEM_STRIDE = KV::KV_SMEM_STRIDE;                // 464
   constexpr int SCALE_BYTES_PER_TOKEN = KV::SCALE_BYTES_PER_TOKEN;  // 8
   constexpr int IO_STRIDE = D_NOPE + D_ROPE_C * 2;                  // 576
-  constexpr int pbs = PAGE_BLOCK_SIZE;
+  // Page geometry of the main cache: compiled in, or read from the argument
+  // under the kRuntimePageSize sentinel (see above).
+  const int pbs = PAGE_BLOCK_SIZE == kRuntimePageSize ? page_block_size : PAGE_BLOCK_SIZE;
   // Kernel always computes a full HPB×CAND tile (zero-Q-padded for unused
   // head slots). NUM_HEADS == 0 selects the runtime-head-count instantiation:
   // one kernel per model type serves any num_heads <= 128. Q/output carry the
@@ -351,9 +360,8 @@ __global__ void __launch_bounds__(DecodeTileCfg<MT>::BLOCK_THREADS) sparse_mla_d
         is_extra ? (extra_indices + (size_t)t_idx * stride_extra_indices_token) : idx_base;
     const uint8_t* section_kv = is_extra ? extra_KV_cache : KV_cache;
     const size_t section_stride = is_extra ? stride_extra_kv_block : stride_kv_block;
-    // Page block size of THIS section. Main is compile-time constexpr (typ.
-    // 64); extra is runtime (DSv4 C128A passes 2). The 8-cycle runtime div
-    // is dwarfed by the cp.async.bulk that follows.
+    // Page geometry only affects gather addresses and the scale-footer
+    // offset; the shared-memory and MMA tiles do not depend on it.
     const int section_pbs = is_extra ? pbs_extra : pbs;
     uint8_t* kv_fp8_dst = sm.kv_fp8(buf);
     bf16* kv_rope_dst = sm.kv_rope(buf);

@@ -64,6 +64,7 @@ from flashinfer.mla._sparse_mla_sm120 import (
 )
 from flashinfer.mla._sparse_mla_sm120_plan import (
     _PREFILL_IMPL_SWAPAB,
+    _decode_scratch_heads,
     _normalize_prefill_impl,
     decode_splitk_eligible,
     plan,
@@ -81,6 +82,7 @@ def test_supported_configs_families() -> None:
     dsv4 = configs["dsv4"]
     assert dsv4.d_qk == 512
     assert dsv4.page_block_size == 64
+    assert dsv4.page_block_size_is_runtime
     assert dsv4.max_num_tokens == _DECODE_MAX_TOKENS
     assert dsv4.max_num_heads == 128
     assert dsv4.topks == frozenset({128, 192, 256, 512, 1024})  # calibrated values
@@ -185,6 +187,27 @@ def test_nvfp4_exact_head_scratch_view() -> None:
     assert lse_view.shape == (2, 16, 2)
 
 
+def test_decode_scratch_heads_pins_a_dedicated_h8_kernel() -> None:
+    """h=8 needs its own instantiation on every page path, runtime ones too.
+
+    The split-K scratch ABI is per-instantiation: the dedicated ``NUM_HEADS=8``
+    kernel strides ``mid_out`` / ``mid_lse`` by the true head count, while the
+    runtime-H kernel strides them by ``gridDim.y * HPB`` — 16 rows. Every other
+    eligible count is already HPB-aligned here, so only h=8 diverges, and
+    routing it to the runtime-H fallback (for a runtime page size, say) would
+    write past scratch sized by this helper. ``launch_sparse_mla_decode_dsv4``
+    keeps a dedicated h=8 instantiation on both page paths for that reason.
+    """
+    assert _decode_scratch_heads(8) == 8  # exact-H ABI; not HPB-aligned
+    for num_heads in (1, 12, 16, 24, 32, 64, 128):
+        assert _decode_scratch_heads(num_heads) == ((num_heads + 15) // 16) * 16
+    # Both page paths route h=8 to a kernel honoring that scratch contract.
+    for page_block_size in (64, 32, 1):
+        assert decode_splitk_eligible(
+            _MODEL_TYPE_DSV4, 8, 1152, page_block_size, False, 1
+        )
+
+
 def test_supported_helpers() -> None:
     """supported_num_heads / supported_topk return sorted tuples."""
     dsv4 = supported_sparse_mla_sm120_configs()["dsv4"]
@@ -229,7 +252,8 @@ def test_supports_decode_rejects_mismatches() -> None:
     assert not dsv4.supports_decode(64, 0)  # topk below min_topk=1
     assert not dsv4.supports_decode(256, 256)  # num_heads past the runtime-H ceiling
     assert dsv4.supports_decode(48, 256)  # arbitrary H <= 128 rides runtime-H
-    assert not dsv4.supports_decode(64, 256, page_block_size=32)
+    assert not dsv4.supports_decode(64, 256, page_block_size=0)
+    assert not dsv4.supports_decode(64, 256, page_block_size=-1)
     assert not dsv4.supports_decode(64, 256, num_tokens=_DECODE_MAX_TOKENS + 1)
     assert dsv4.supports_decode(64, 256, num_tokens=_DECODE_MAX_TOKENS)
     assert not decode_splitk_eligible(
@@ -292,23 +316,89 @@ def test_error_message_names_both_mismatches() -> None:
     assert "num_heads=256 exceeds the decode envelope [1, 128]" in msg
 
 
-def test_error_message_names_page_block_size_mismatch() -> None:
+@pytest.mark.parametrize(
+    "model_type,d_qk", [(_MODEL_TYPE_DSV3_2, 576), (_MODEL_TYPE_DOTS3_SWA, 1088)]
+)
+def test_error_message_names_page_block_size_mismatch(
+    model_type: int, d_qk: int
+) -> None:
     """An uninstantiated page size is named; valid pairs are not blamed."""
     msg = _decode_dispatch_error_message(
         num_tokens=1,
         num_heads=64,
-        topk=256,
-        d_qk=512,
+        topk=576,
+        d_qk=d_qk,
         page_block_size=32,
-        model_type=_MODEL_TYPE_DSV4,
+        model_type=model_type,
         extra_topk=0,
     )
     assert "page_block_size=32 is unsupported" in msg
     assert "instantiated only for page_block_size=64" in msg
-    # (num_heads=64, topk=256) is inside the envelope, so the Mismatch
+    # (num_heads=64, topk=576) is inside the envelope, so the Mismatch
     # reasons blame neither (the shape summary echo is expected).
     assert "num_heads=64 exceeds" not in msg
-    assert "topk=256 is below" not in msg
+    assert "topk=576 is below" not in msg
+
+
+@pytest.mark.parametrize("page_block_size", [-1, 0, 1, 2, 16, 32, 48, 64, 128])
+@pytest.mark.parametrize("has_extra", [False, True])
+def test_dsv4_runtime_page_size_envelope(page_block_size: int, has_extra: bool) -> None:
+    """The query and planner agree for the V4.1 top-k width and runtime heads."""
+    configs = supported_sparse_mla_sm120_configs()
+    for num_heads in (8, 12, 16, 32, 64, 128):
+        for num_tokens in (1, _DECODE_MAX_TOKENS, _DECODE_MAX_TOKENS + 1):
+            expected = page_block_size > 0 and num_tokens <= _DECODE_MAX_TOKENS
+            assert (
+                configs["dsv4"].supports_decode(
+                    num_heads,
+                    1152,
+                    page_block_size=page_block_size,
+                    num_tokens=num_tokens,
+                )
+                == expected
+            )
+            assert (
+                decode_splitk_eligible(
+                    _MODEL_TYPE_DSV4,
+                    num_heads,
+                    1152,
+                    page_block_size,
+                    has_extra,
+                    num_tokens,
+                )
+                == expected
+            )
+
+    # Other FP8 families and NVFP4 keep their existing page-size constraints.
+    for family, config in configs.items():
+        if family != "dsv4":
+            assert not config.page_block_size_is_runtime
+            assert config.supports_decode(16, 576, page_block_size=page_block_size) == (
+                page_block_size == 64
+            )
+    nvfp4 = supported_sparse_mla_sm120_configs(kv_cache_format="nvfp4")["dsv4"]
+    assert not nvfp4.page_block_size_is_runtime
+    assert nvfp4.supports_decode(16, 128, page_block_size=page_block_size) == (
+        page_block_size == 64
+    )
+
+
+@pytest.mark.parametrize("page_block_size", [-1, 0, 32])
+def test_dsv4_page_size_diagnostics(page_block_size: int) -> None:
+    msg = _decode_dispatch_error_message(
+        num_tokens=1,
+        num_heads=256,
+        topk=1152,
+        d_qk=512,
+        page_block_size=page_block_size,
+        model_type=_MODEL_TYPE_DSV4,
+        extra_topk=0,
+    )
+    assert "num_heads=256 exceeds" in msg
+    assert "instantiated only for page_block_size=64" not in msg
+    assert (f"page_block_size={page_block_size} must be positive" in msg) == (
+        page_block_size <= 0
+    )
 
 
 def test_error_message_dsv3_2_family() -> None:
@@ -448,6 +538,44 @@ def test_plan_off_grid_topk_rides_runtime_topk(known_crossover) -> None:
         assert planned is not None
         assert planned.variant is plan_mod.KernelVariant.DECODE_SPLITK
         assert planned.cpb == -1  # no calibrated constants
+
+
+@pytest.mark.parametrize("has_extra", [False, True])
+@pytest.mark.parametrize("crossover", [None, 1])
+def test_plan_dsv4_runtime_page_size(
+    known_crossover, has_extra: bool, crossover
+) -> None:
+    """A crossover measured at pbs=64 cannot route pbs=32 to unsupported prefill."""
+    plan_mod, table = known_crossover
+    table["dsv4|8|1152"] = crossover
+    for num_tokens in (8, _DECODE_MAX_TOKENS):
+        planned = plan_mod.plan(
+            num_tokens,
+            8,
+            1152,
+            _MODEL_TYPE_DSV4,
+            32,
+            has_extra,
+            plan_mod._PREFILL_IMPL_AUTO,
+            torch.device("cpu"),
+            extra_topk=128 if has_extra else 0,
+        )
+        assert planned is not None
+        assert planned.variant is plan_mod.KernelVariant.DECODE_SPLITK
+    assert (
+        plan_mod.plan(
+            _DECODE_MAX_TOKENS + 1,
+            8,
+            1152,
+            _MODEL_TYPE_DSV4,
+            32,
+            has_extra,
+            plan_mod._PREFILL_IMPL_AUTO,
+            torch.device("cpu"),
+            extra_topk=128 if has_extra else 0,
+        )
+        is None
+    )
 
 
 def test_plan_neither_envelope_returns_none(known_crossover) -> None:
@@ -603,17 +731,24 @@ def test_plan_above_decode_form_cutoff(known_crossover) -> None:
     assert planned is not None and planned.variant is plan_mod.KernelVariant.PREFILL_MG
 
 
-def test_plan_page_block_size_mismatch(known_crossover) -> None:
-    """A non-64 page size is served by neither envelope (pbs=64 is hardwired
-    in every instantiation); the planner returns None instead of letting C++
-    launch with a mismatched stride."""
+@pytest.mark.parametrize(
+    "model_type",
+    [
+        _MODEL_TYPE_DSV3_2,
+        _MODEL_TYPE_GLM_NSA,
+        _MODEL_TYPE_GLM53_NOPE,
+        _MODEL_TYPE_DOTS3_SWA,
+    ],
+)
+def test_plan_page_block_size_mismatch(known_crossover, model_type: int) -> None:
+    """Non-DSv4 families still require 64-token pages in both envelopes."""
     plan_mod, _ = known_crossover
     assert (
         plan_mod.plan(
             8,
             64,
-            512,
-            _MODEL_TYPE_DSV4,
+            576,
+            model_type,
             32,
             False,
             plan_mod._PREFILL_IMPL_AUTO,

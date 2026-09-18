@@ -119,8 +119,8 @@ inline PagedKVLayout parse_paged_kv_layout(const TensorView& kv, int bpt, bool i
 
 // Thin TVM-FFI wrapper for the decode-dsv4 standalone path. The caller passes
 // already-sized scratch tensors mid_out + mid_lse plus the output and lse.
-// Handles DSV4 decode with page_block_size=64 and the supported head/top-k
-// instantiation grid in sparse_mla_sm120_decode_dsv4.cu.
+// Handles DSV4 decode with runtime page sizes and DOTS3_SWA with 64-token pages.
+// The launch envelope is checked in sparse_mla_sm120_decode_dsv4.cu.
 void SparseMlaSm120DecodeDsv4(TensorView q, TensorView kv_cache, TensorView indices,
                               TensorView mid_out, TensorView mid_lse, TensorView output,
                               TensorView out_lse, int64_t num_splits, double sm_scale,

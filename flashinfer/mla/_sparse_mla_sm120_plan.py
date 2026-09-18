@@ -286,11 +286,13 @@ def decode_splitk_eligible(
     num_tokens: int,
 ) -> bool:
     """True iff a standalone decode kernel is instantiated for this shape."""
-    if num_tokens > _DECODE_MAX_TOKENS or page_block_size != _PAGE_BLOCK_SIZE:
+    if num_tokens > _DECODE_MAX_TOKENS or page_block_size <= 0:
         return False
     if model_type == _MODEL_TYPE_DSV4:
-        # The decode-dsv4 kernel takes the secondary cache as runtime args.
+        # Both caches' page sizes are runtime arguments for DSv4 decode.
         return (num_heads, topk) in _DECODE_DSV4_DISPATCH
+    if page_block_size != _PAGE_BLOCK_SIZE:
+        return False
     if model_type == _MODEL_TYPE_GLM53_NOPE:
         # decode-v32 has no dual-cache form.
         return not has_extra and (num_heads, topk) in _DECODE_GLM53_NOPE_DISPATCH
