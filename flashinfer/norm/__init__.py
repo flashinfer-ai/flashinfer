@@ -284,6 +284,7 @@ def gated_residual_next_rmsnorm(
     *,
     post_weight: Optional[torch.Tensor] = None,
     post_gain_center: float = 0.0,
+    enable_pdl: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Blend a normalized branch and apply the next RMSNorm in one launch.
 
@@ -321,6 +322,9 @@ def gated_residual_next_rmsnorm(
         Optional BF16 input scale for the first RMSNorm, with shape ``(8192,)``.
     post_gain_center : float
         Constant added to ``post_weight`` in FP32; unused when it is ``None``.
+    enable_pdl : bool
+        Whether to enable programmatic dependent launch. Defaults to ``True``;
+        pass ``False`` to disable it.
 
     Returns
     -------
@@ -372,6 +376,7 @@ def gated_residual_next_rmsnorm(
         post_weight,
         post_gain_center,
         alpha_scalar,
+        enable_pdl,
     )
     return residual_out, ffn_input
 
@@ -394,7 +399,10 @@ def _gated_residual_next_rmsnorm_impl(
     post_weight: Optional[torch.Tensor],
     post_gain_center: float,
     alpha_scalar: Optional[float] = None,
+    enable_pdl: bool = True,
 ) -> None:
+    if enable_pdl:
+        enable_pdl = device_support_pdl(branch.device)
     _gated_residual_next_rmsnorm_cute(
         branch,
         residual,
@@ -408,6 +416,7 @@ def _gated_residual_next_rmsnorm_impl(
         ffn_input,
         post_weight,
         post_gain_center,
+        enable_pdl,
         alpha_scalar,
     )
 
@@ -427,6 +436,7 @@ def _gated_residual_next_rmsnorm_fake(
     post_weight: Optional[torch.Tensor],
     post_gain_center: float,
     alpha_scalar: Optional[float] = None,
+    enable_pdl: bool = True,
 ) -> None:
     return None
 
@@ -546,12 +556,17 @@ def rmsnorm_sigmoid_gate(
     input: torch.Tensor,
     gate: torch.Tensor,
     eps: float = 1e-5,
+    *,
+    enable_pdl: bool = True,
 ) -> None:
     r"""Apply per-head RMSNorm and a sigmoid gate to ``input`` in place.
 
     The last dimension is normalized independently, multiplied by
     ``sigmoid(gate)``, and written back to ``input``. The optimized kernel
     supports contiguous BF16 head rows of width 64 on SM100 and SM103 GPUs.
+
+    Programmatic dependent launch is enabled by default. Pass
+    ``enable_pdl=False`` to disable it.
     """
     if input.ndim not in (2, 3) or gate.shape != input.shape:
         raise ValueError("input and gate must have matching 2-D or 3-D shapes")
@@ -571,7 +586,7 @@ def rmsnorm_sigmoid_gate(
         or not _is_aligned(gate)
     ):
         raise ValueError("tensors do not satisfy the rmsnorm_sigmoid_gate contract")
-    _rmsnorm_sigmoid_gate_impl(input, gate, eps)
+    _rmsnorm_sigmoid_gate_impl(input, gate, eps, enable_pdl)
 
 
 @register_custom_op("flashinfer::rmsnorm_sigmoid_gate", mutates_args=("input",))
@@ -579,8 +594,11 @@ def _rmsnorm_sigmoid_gate_impl(
     input: torch.Tensor,
     gate: torch.Tensor,
     eps: float,
+    enable_pdl: bool = True,
 ) -> None:
-    _rmsnorm_sigmoid_gate_cute(input, gate, eps)
+    if enable_pdl:
+        enable_pdl = device_support_pdl(input.device)
+    _rmsnorm_sigmoid_gate_cute(input, gate, eps, enable_pdl=enable_pdl)
 
 
 @register_fake_op("flashinfer::rmsnorm_sigmoid_gate")
@@ -588,6 +606,7 @@ def _rmsnorm_sigmoid_gate_fake(
     input: torch.Tensor,
     gate: torch.Tensor,
     eps: float,
+    enable_pdl: bool = True,
 ) -> None:
     return None
 

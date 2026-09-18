@@ -183,6 +183,7 @@ if HAS_CUTEDSL:
         lanes: cutlass.Constexpr,
         threads: cutlass.Constexpr,
         full_tiles: cutlass.Constexpr,
+        enable_pdl: cutlass.Constexpr[bool],
     ):
         vector_size = cutlass.const_expr(HEAD_DIM // lanes)
         vector_bytes = cutlass.const_expr(vector_size * 2)
@@ -201,6 +202,9 @@ if HAS_CUTEDSL:
             cutlass.BFloat16,
             num_bits_per_copy=copy_bits,
         )
+        if enable_pdl:
+            cute.arch.griddepcontrol_wait()
+
         x_fragments = _load_rows(
             atom,
             x_address,
@@ -246,6 +250,9 @@ if HAS_CUTEDSL:
             full_tiles,
         )
 
+        if enable_pdl:
+            cute.arch.griddepcontrol_launch_dependents()
+
     @cute.jit
     def _launch(
         x: cute.Tensor,
@@ -260,6 +267,7 @@ if HAS_CUTEDSL:
         lanes: cutlass.Constexpr,
         warps: cutlass.Constexpr,
         cluster: cutlass.Constexpr,
+        enable_pdl: cutlass.Constexpr[bool],
     ):
         rows = x.shape[0] * num_heads
         rows_per_cta = cutlass.const_expr(32 * warps // lanes)
@@ -280,11 +288,13 @@ if HAS_CUTEDSL:
             lanes,
             32 * warps,
             full_tiles,
+            enable_pdl,
         ).launch(
             grid=(grid, 1, 1),
             block=(32 * warps, 1, 1),
             cluster=(cluster, 1, 1),
             stream=stream,
+            use_pdl=enable_pdl,
         )
 
 
@@ -304,6 +314,7 @@ def _get_compiled(
     lanes: int,
     warps: int,
     cluster: int,
+    enable_pdl: bool = False,
 ):
     shape = (cute.sym_int(), num_heads, HEAD_DIM)
     x = cute.runtime.make_fake_tensor(
@@ -321,7 +332,7 @@ def _get_compiled(
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     kernel_name = (
         f"h{num_heads}_xs{x_token_stride}_gs{gate_token_stride}_l{lanes}_"
-        f"w{warps}_c{cluster}"
+        f"w{warps}_c{cluster}_pdl{int(enable_pdl)}"
     )
     return build_and_load_cute_dsl_kernel(
         "rmsnorm_sigmoid_gate",
@@ -340,6 +351,7 @@ def _get_compiled(
             lanes,
             warps,
             cluster,
+            enable_pdl,
             options="--enable-tvm-ffi",
         ),
         extra_key_files=(__file__,),
@@ -350,6 +362,7 @@ def rmsnorm_sigmoid_gate(
     x: torch.Tensor,
     gate: torch.Tensor,
     eps: float,
+    enable_pdl: bool = False,
 ) -> None:
     if not HAS_CUTEDSL:
         raise RuntimeError("rmsnorm_sigmoid_gate requires nvidia-cutlass-dsl")
@@ -387,6 +400,7 @@ def rmsnorm_sigmoid_gate(
         lanes,
         warps,
         cluster,
+        enable_pdl,
     )
     compiled(x, gate, x, eps)
 

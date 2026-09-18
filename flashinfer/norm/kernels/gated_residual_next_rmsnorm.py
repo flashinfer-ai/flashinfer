@@ -127,6 +127,7 @@ def _dual_norm_kernel(
     has_post_weight: cutlass.Constexpr,
     post_gain: cutlass.Constexpr,
     alpha_scalar: cutlass.Constexpr,
+    enable_pdl: cutlass.Constexpr[bool],
 ):
     tidx, _, _ = cute.arch.thread_idx()
     bidx, cy, _ = cute.arch.block_idx()
@@ -155,6 +156,9 @@ def _dual_norm_kernel(
     fWt = cute.make_fragment_like(tWt)
     fRo = cute.make_fragment_like(tRo)
     fFo = cute.make_fragment_like(tFo)
+
+    if enable_pdl:
+        cute.arch.griddepcontrol_wait()
 
     cute.autovec_copy(tBr, fBr)
     cute.autovec_copy(tSt, fSt)
@@ -216,6 +220,9 @@ def _dual_norm_kernel(
     fFo.store(out.to(gFo.element_type))
     cute.autovec_copy(fFo, tFo)
 
+    if enable_pdl:
+        cute.arch.griddepcontrol_launch_dependents()
+
 
 @cute.jit
 def _launch(
@@ -233,6 +240,7 @@ def _launch(
     has_post_weight: cutlass.Constexpr,
     post_gain: cutlass.Constexpr,
     alpha_scalar: cutlass.Constexpr,
+    enable_pdl: cutlass.Constexpr[bool],
     stream: cuda_driver.CUstream,
 ):
     tiler = (1, VEC)
@@ -260,12 +268,14 @@ def _launch(
         has_post_weight,
         post_gain,
         alpha_scalar,
+        enable_pdl,
     ).launch(
         grid=[mBr.shape[0], CLUSTER_N, 1],
         block=[THREADS, 1, 1],
         cluster=[1, CLUSTER_N, 1] if const_expr(CLUSTER_N > 1) else None,
         smem=1024,
         stream=stream,
+        use_pdl=enable_pdl,
     )
 
 
@@ -281,6 +291,7 @@ def _get_compiled(
     has_post_weight: bool,
     post_gain_center: float,
     alpha_scalar: float | None = None,
+    enable_pdl: bool = False,
 ):
     sym_m = cute.sym_int()
     branch = cute.runtime.make_fake_compact_tensor(
@@ -324,6 +335,7 @@ def _get_compiled(
             "alpha_tensor"
             if alpha_scalar is None
             else f"alpha{_float_key(alpha_scalar)}",
+            f"pdl{int(enable_pdl)}",
         )
     )
     return build_and_load_cute_dsl_kernel(
@@ -345,6 +357,7 @@ def _get_compiled(
             has_post_weight,
             post_gain_center,
             alpha_scalar,
+            enable_pdl,
             cuda_stream,
             options="--enable-tvm-ffi",
         ),
@@ -366,6 +379,7 @@ def run(
     post_weight: torch.Tensor | None = None,
     post_gain_center: float = 0.0,
     alpha_scalar: float | None = None,
+    enable_pdl: bool = False,
 ) -> None:
     if branch.shape[0] == 0:
         return
@@ -376,6 +390,7 @@ def run(
         post_weight is not None,
         float(post_gain_center) if post_weight is not None else 0.0,
         alpha_scalar,
+        enable_pdl,
     )
     fn(
         branch,
@@ -402,6 +417,7 @@ def gated_residual_next_rmsnorm(
     ffn_input: torch.Tensor,
     post_weight: torch.Tensor | None = None,
     post_gain_center: float = 0.0,
+    enable_pdl: bool = False,
     alpha_scalar: float | None = None,
 ) -> None:
     """Run the fixed-width fused gated-residual plus next-RMSNorm kernel."""
@@ -419,4 +435,5 @@ def gated_residual_next_rmsnorm(
         post_weight,
         post_gain_center,
         alpha_scalar,
+        enable_pdl,
     )
