@@ -37,13 +37,17 @@ GMEM (no pipeline)
 - GmemOResource     : No pipeline, Correction -> GMEM
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, ClassVar
 
 import cutlass
 import cutlass.cute as cute
+import cutlass.pipeline as pipeline
 from cutlass.experimental import primitives as prims
 from cutlass import Boolean, Float32, Int16, Int32, Int64
+from cutlass._mlir.dialects import llvm
+from cutlass.cutlass_dsl import T as mlir_T
+from cutlass.pipeline.helpers import _get_thread_arrive_count
 
 from cutlass.experimental.task_scheduling.resources import (
     MemoryResource,
@@ -52,7 +56,11 @@ from cutlass.experimental.task_scheduling.resources import (
     WorkQueue,
 )
 from cutlass.experimental.task_scheduling.resources import consumer_work, producer_work
-from cutlass.experimental.task_scheduling.enums import WorkAttr
+from cutlass.experimental.task_scheduling.enums import PipelineType, WorkAttr
+from flashinfer.cute_dsl.attention.dsa.gather4_utils import (
+    gather4_tma_descriptor_address,
+    issue_gather4_tma_2cta,
+)
 from ...mask import kv_tile_needs_right_mask
 from ...tensor_map import transform_ragged_coords
 
@@ -80,10 +88,13 @@ from ..helpers.tile_scheduler import (
     divmod_constexpr_power_of_two_or_fdd,
 )
 from ..helpers.math import (
+    NEG_FLT_MAX,
     ceil_div,
     mma_k_step_for_qkv,
     mma_kind_for_qkv,
     add_packed_f32x2,
+    fadd2,
+    ffma2,
     fma_packed_f32x2,
     mul_packed_f32x2,
     output_dtype,
@@ -100,10 +111,27 @@ from ..helpers.math import (
     qkv_major_k_stride_bytes_for,
 )
 from ..helpers.ops import (
+    add_ftz_f32,
+    affine2_contractible_f32,
+    convert_f32_vector_to_bf16_satfinite,
+    dsv4_clc_response_predicated,
+    dsv4_cp_async_cg_l2_128b,
+    dsv4_code_fence,
+    dsv4_reset_cold_block,
+    dsv4_sched_res_busy_xu64,
+    dsv4_set_cold_block,
+    dsv4_warp_switch,
     fp8_log2_quant_scale,
     fp8_quant_scale_rcp,
+    fma_ftz_f32,
+    ld_global_v4_f32,
     fmax_f32,
+    fnma_ftz_f32,
+    mul_ftz_f32,
     pack_float4_to_fp8_e4m3,
+    prefetch_global_l1,
+    rcp_approx_ftz_f32,
+    sub_ftz_f32,
 )
 from ..helpers.mask import MaskType, mask_visible_k_length
 from ..helpers.query import (
@@ -115,6 +143,51 @@ from .work_partition import (
     runtime_split_kv_cap,
     runtime_split_tile_range,
 )
+
+
+@cutlass.dsl_user_op
+def max_xorsign_abs_f32(lhs, rhs, *, loc=None, ip=None):
+    """Return the larger FP32 magnitude; the result sign is intentionally junk."""
+
+    return Float32(
+        llvm.inline_asm(
+            mlir_T.f32(),
+            [
+                Float32(lhs).ir_value(loc=loc, ip=ip),
+                Float32(rhs).ir_value(loc=loc, ip=ip),
+            ],
+            "max.xorsign.abs.f32 $0, $1, $2;",
+            "=f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@cutlass.dsl_user_op
+def max3_abs_ftz_f32(first, second, third, *, loc=None, ip=None):
+    """Return the largest magnitude of three FP32 inputs on SM100."""
+
+    return Float32(
+        llvm.inline_asm(
+            mlir_T.f32(),
+            [
+                Float32(first).ir_value(loc=loc, ip=ip),
+                Float32(second).ir_value(loc=loc, ip=ip),
+                Float32(third).ir_value(loc=loc, ip=ip),
+            ],
+            "max.abs.ftz.f32 $0, $1, $2, $3;",
+            "=f,f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
 
 
 def _install_task_local_specs(resource: object, specs: tuple[tuple, ...]) -> None:
@@ -134,6 +207,308 @@ def _install_task_local_specs(resource: object, specs: tuple[tuple, ...]) -> Non
         )
 
 
+def _make_deferred_mbarrier_array(
+    barrier_storage,
+    num_stages: int,
+    agent,
+    tx_count: int = 0,
+    name: str = "",
+):
+    """Build ``MbarrierArray`` state without emitting constructor init ops.
+
+    CUTLASS exposes the same no-init construction pattern through
+    ``MbarrierArray.recast_to_new_op_type``.  DSV4 uses it directly here so
+    all active arrays can be initialized together after TaskManager has
+    assigned their final unified-SMEM pointers.
+    """
+
+    sync = object.__new__(pipeline.MbarrierArray)
+    sync.barrier_storage = barrier_storage
+    sync.tx_count = tx_count
+    sync.num_stages = num_stages
+    sync.op_type, sync.cg = agent
+    sync.arrive_count = _get_thread_arrive_count(sync.cg)
+    sync.mbarrier_layout = pipeline.MbarrierLayout.V0
+    sync.name = name
+    sync.mbarrier_base = barrier_storage
+    return sync
+
+
+def _dsv4_cta_layout(pipeline_config):
+    layout = pipeline_config.cta_layout_vmnk
+    if layout is None:
+        return cute.make_layout((1, 1, 1, 1))
+    if not isinstance(layout, cute.Layout):
+        return cute.make_layout(layout)
+    return layout
+
+
+def _create_dsv4_deferred_pipeline(resource, pipeline_config):
+    """Mirror the active CUTLASS pipeline constructors but defer all init."""
+
+    barrier_ptr = pipeline_config.barrier_ptr
+    if barrier_ptr is None:
+        raise ValueError("source mbarrier init requires unified barrier storage")
+    stages = pipeline_config.num_stages
+    full_ptr = barrier_ptr.align(min_align=8)
+    empty_ptr = full_ptr + stages
+    pipeline_type = pipeline_config.pipeline_type
+
+    if pipeline_type == PipelineType.AsyncAsync:
+        full = _make_deferred_mbarrier_array(
+            full_ptr,
+            stages,
+            (pipeline_config.async_producer_op, pipeline_config.producer_group),
+            name=f"{resource.name}.full",
+        )
+        empty = _make_deferred_mbarrier_array(
+            empty_ptr,
+            stages,
+            (pipeline.PipelineOp.AsyncThread, pipeline_config.consumer_group),
+            name=f"{resource.name}.empty",
+        )
+        return pipeline.PipelineAsync(full, empty, stages, None, None)
+
+    if pipeline_type == PipelineType.TmaUmma:
+        cta_layout = _dsv4_cta_layout(pipeline_config)
+        full = _make_deferred_mbarrier_array(
+            full_ptr,
+            stages,
+            (pipeline.PipelineOp.TmaLoad, pipeline_config.producer_group),
+            pipeline_config.num_bytes,
+            f"{resource.name}.full",
+        )
+        empty = _make_deferred_mbarrier_array(
+            empty_ptr,
+            stages,
+            (pipeline.PipelineOp.TCGen05Mma, pipeline_config.consumer_group),
+            name=f"{resource.name}.empty",
+        )
+        if cute.size(cta_layout) == 1:
+            producer_mask = None
+            is_leader_cta = True
+        else:
+            producer_mask = pipeline.PipelineTmaUmma._compute_mcast_arrival_mask(
+                cta_layout, pipeline_config.mcast_mode_mn
+            )
+            is_leader_cta = pipeline.PipelineTmaUmma._compute_is_leader_cta(cta_layout)
+        consumer_mask = producer_mask
+        cta_group = (
+            cute.nvgpu.tcgen05.CtaGroup.ONE
+            if cute.size(cta_layout, mode=[0]) == 1
+            else cute.nvgpu.tcgen05.CtaGroup.TWO
+        )
+        result = pipeline.PipelineTmaUmma(
+            full,
+            empty,
+            stages,
+            producer_mask,
+            consumer_mask,
+            is_leader_cta,
+            cta_group,
+        )
+        return resource._apply_task_warp_leader_to_tma_umma(result)
+
+    if pipeline_type == PipelineType.UmmaAsync:
+        cta_layout = _dsv4_cta_layout(pipeline_config)
+        full = _make_deferred_mbarrier_array(
+            full_ptr,
+            stages,
+            (pipeline.PipelineOp.TCGen05Mma, pipeline_config.producer_group),
+            name=f"{resource.name}.full",
+        )
+        empty = _make_deferred_mbarrier_array(
+            empty_ptr,
+            stages,
+            (pipeline.PipelineOp.AsyncThread, pipeline_config.consumer_group),
+            name=f"{resource.name}.empty",
+        )
+        producer_mask = (
+            None
+            if cute.size(cta_layout) == 1
+            else pipeline.PipelineUmmaAsync._compute_tmem_sync_mask(cta_layout)
+        )
+        consumer_mask = (
+            None
+            if cute.size(cta_layout, mode=[0]) == 1
+            else pipeline.PipelineUmmaAsync._compute_peer_cta_rank()
+        )
+        cta_group = (
+            cute.nvgpu.tcgen05.CtaGroup.ONE
+            if cute.size(cta_layout, mode=[0]) == 1
+            else cute.nvgpu.tcgen05.CtaGroup.TWO
+        )
+        return pipeline.PipelineUmmaAsync(
+            full,
+            empty,
+            stages,
+            producer_mask,
+            consumer_mask,
+            cta_group,
+        )
+
+    if pipeline_type == PipelineType.ClcFetchAsync:
+        cta_layout = _dsv4_cta_layout(pipeline_config)
+        full = _make_deferred_mbarrier_array(
+            full_ptr,
+            stages,
+            (pipeline.PipelineOp.ClcLoad, pipeline_config.producer_group),
+            pipeline_config.num_bytes,
+            f"{resource.name}.full",
+        )
+        empty = _make_deferred_mbarrier_array(
+            empty_ptr,
+            stages,
+            (pipeline.PipelineOp.AsyncThread, pipeline_config.consumer_group),
+            name=f"{resource.name}.empty",
+        )
+        tidx, _, _ = cute.arch.thread_idx()
+        producer_mask, is_signaling_thread = (
+            pipeline.PipelineClcFetchAsync._init_full_barrier_arrive_signal(
+                cta_layout, tidx
+            )
+        )
+        return pipeline.PipelineClcFetchAsync(
+            full,
+            empty,
+            stages,
+            producer_mask,
+            0,
+            is_signaling_thread,
+        )
+
+    raise ValueError(
+        f"DSV4 source mbarrier init does not support pipeline type {pipeline_type}"
+    )
+
+
+def _dsv4_arrival_runs(arrival_counts: tuple[int, ...]):
+    """Compress a static per-slot count table for compact scalar selects."""
+
+    runs = []
+    start = 0
+    current = arrival_counts[0]
+    for index, count in enumerate(arrival_counts[1:], 1):
+        if count != current:
+            runs.append((start, index, current))
+            start = index
+            current = count
+    runs.append((start, len(arrival_counts), current))
+    return tuple(runs)
+
+
+def _dsv4_select_arrival_count(slot, arrival_counts: tuple[int, ...]):
+    result = Int32(arrival_counts[0])
+    for start, end, count in _dsv4_arrival_runs(arrival_counts)[1:]:
+        in_run = slot >= Int32(start)
+        if end != len(arrival_counts):
+            in_run = in_run & (slot < Int32(end))
+        result = Int32(cutlass.select_(in_run, Int32(count), result))
+    return result
+
+
+def prepare_dsv4_source_mbarriers(task_manager):
+    """Allocate and bind one contiguous barrier block before resource create.
+
+    This throughput kernel supplies its payload arrays from the kernel
+    prologue, so TaskManager intentionally has no unified ``SmemAllocator``.
+    Explicitly binding only the barrier storage makes contiguity a real DSV4
+    contract instead of relying on incidental static-allocation placement.
+    """
+
+    barrier_resources = tuple(
+        resource
+        for resource in task_manager.resources
+        if resource.pipeline_config is not None and resource.pipeline_group is None
+    )
+    total_slots = sum(
+        2 * resource.pipeline_config.num_stages for resource in barrier_resources
+    )
+    if total_slots <= 0 or total_slots > 64:
+        raise ValueError(
+            f"source mbarrier init requires 1..64 active slots, got {total_slots}"
+        )
+    barrier_storage = cutlass.Array(
+        Int64,
+        total_slots,
+        space=cutlass.AddressSpace.smem,
+        alignment=8,
+    )
+    base_ptr = cute.make_ptr(
+        Int64,
+        barrier_storage.data_ptr(),
+        mem_space=cutlass.AddressSpace.smem,
+    )
+    offset = 0
+    for resource in barrier_resources:
+        pipeline_config = resource.pipeline_config
+        resource.pipeline_config = replace(
+            pipeline_config,
+            barrier_ptr=base_ptr + offset,
+        )
+        offset += 2 * pipeline_config.num_stages
+    task_manager._dsv4_source_barrier_resources = barrier_resources
+    task_manager._dsv4_source_barrier_storage = barrier_storage
+    return barrier_storage
+
+
+@cute.jit
+def _initialize_dsv4_source_mbarrier_block(
+    base_ptr,
+    arrival_counts: cutlass.Constexpr,
+) -> None:
+    """Emit the single staged W0 initialization region."""
+
+    warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+    if warp_idx == 0:
+        tidx, _, _ = cute.arch.thread_idx()
+        lane = tidx & Int32(31)
+        first_slots = min(len(arrival_counts), 32)
+        if first_slots == 32:
+            cute.arch.mbarrier_init(
+                base_ptr + lane,
+                _dsv4_select_arrival_count(lane, arrival_counts),
+            )
+        else:
+            if lane < Int32(first_slots):
+                cute.arch.mbarrier_init(
+                    base_ptr + lane,
+                    _dsv4_select_arrival_count(lane, arrival_counts),
+                )
+        if len(arrival_counts) > 32:
+            second_slot = lane + Int32(32)
+            if lane < Int32(len(arrival_counts) - 32):
+                cute.arch.mbarrier_init(
+                    base_ptr + second_slot,
+                    _dsv4_select_arrival_count(second_slot, arrival_counts),
+                )
+
+
+def initialize_dsv4_source_mbarriers(task_manager) -> None:
+    """Initialize the explicitly contiguous barrier block from W0 lanes."""
+
+    barrier_resources = task_manager._dsv4_source_barrier_resources
+    if not barrier_resources:
+        return
+
+    arrival_counts = []
+    for resource in barrier_resources:
+        pipeline_object = resource.pipeline
+        stages = resource.pipeline_config.num_stages
+        full_count = pipeline_object.sync_object_full.arrive_count
+        empty_count = pipeline_object.sync_object_empty.arrive_count
+        if not isinstance(full_count, int) or not isinstance(empty_count, int):
+            raise ValueError("source mbarrier init requires static arrival counts")
+        arrival_counts.extend([full_count] * stages)
+        arrival_counts.extend([empty_count] * stages)
+    arrival_counts = tuple(arrival_counts)
+    if len(arrival_counts) > 64:
+        raise ValueError("source mbarrier init supports at most 64 active slots")
+
+    base_ptr = barrier_resources[0].pipeline_config.barrier_ptr.align(min_align=8)
+    _initialize_dsv4_source_mbarrier_block(base_ptr, arrival_counts)
+
+
 @dataclass(kw_only=True)
 class HighThroughputMlaResource(MemoryResource):
     """Base class that binds captured-schedule task-local variables."""
@@ -142,6 +517,184 @@ class HighThroughputMlaResource(MemoryResource):
 
     def __post_init__(self) -> None:
         _install_task_local_specs(self, self._task_local_specs)
+
+    def create_pipeline(self, pipeline_config):
+        cfg = getattr(self, "cfg", None)
+        if cfg is not None and cfg.is_dynamic_token_sparse:
+            return _create_dsv4_deferred_pipeline(self, pipeline_config)
+        return super().create_pipeline(pipeline_config)
+
+
+@cute.jit
+def routing_row_index(cfg, tile_idx, logical_seq_len_q, cu_seqlens_q=None):
+    """Return the metadata row owned by one logical MLA work tile.
+
+    Dense MLA metadata is per batch.  DSV4 CSA instead supplies one routing
+    row per query token, flattened in ``(batch, query)`` order.
+    """
+
+    if cutlass.const_expr(cfg.is_dynamic_token_sparse):
+        batch_idx = Int32(tile_idx[2])
+        query_idx = Int32(tile_idx[1])
+        if cutlass.const_expr(cu_seqlens_q is not None):
+            query_start = Int32(cu_seqlens_q[batch_idx])
+            query_len = Int32(cu_seqlens_q[batch_idx + Int32(1)]) - query_start
+            # The grid is sized for the largest request.  Clamp inactive
+            # padded tiles before indexing packed per-query metadata; the
+            # work queue subsequently gives those tiles an empty K domain.
+            safe_query_idx = cute.math.min(
+                query_idx, cute.math.max(query_len - Int32(1), Int32(0))
+            )
+            return query_start + safe_query_idx
+        return batch_idx * Int32(logical_seq_len_q) + query_idx
+    return Int32(tile_idx[2])
+
+
+# =====================================================================
+# Dsv4PageOffsetRingResource -- W9 page-index cp.async ring
+# =====================================================================
+
+
+@dataclass(kw_only=True)
+class Dsv4PageOffsetRingResource(HighThroughputMlaResource):
+    """Stage DSV4 sparse token indices in the source kernel's W9 ring.
+
+    One producer stage is ``int32[256]``: the first and second halves are
+    the two adjacent K128 sparse-token tiles.  W9 copies four indices per
+    lane into both halves using 16-byte ``cp.async`` operations.  The
+    ``AsyncLoad`` pipeline configuration turns ``commit`` into a
+    ``cp.async.mbarrier.arrive`` for every W9 lane, so a W12--W15 consumer
+    can wait on data completion rather than merely instruction issue.
+    """
+
+    page_offsets: Any = None
+    cu_seqlens_q: Any = None
+    logical_seq_len_q: cutlass.Constexpr[int] = 1
+    cfg: cutlass.Constexpr = field(default_factory=MlaDecodeConfig)
+    smem_page_offsets: Any = None
+    _smem_page_offsets: Any = field(init=False, default=None)
+    page_offset_stage: cutlass.Constexpr[TaskLocalVariable] = (
+        TaskLocalVariable.uninitialized()
+    )
+    _task_local_specs: ClassVar[tuple[tuple, ...]] = (
+        (
+            "page_offset_stage",
+            Int32,
+            Int32(0),
+            "Physical W9 ring stage selected by the current consumer wait.",
+        ),
+    )
+
+    @cute.jit
+    def _init_smem_state(self, stage_info: StageInfo) -> None:
+        """Bind the kernel-prologue page-index SMEM allocation.
+
+        This throughput kernel predates TaskManager's unified
+        ``SmemAllocator``: Q/K/V/P are all static ``cutlass.Array`` objects
+        allocated in the kernel prologue and passed to their resources.  The
+        DSV4 ring must use that same allocation model; ``stage_info.context``
+        deliberately has no unified ``smem_base`` in this kernel.
+        """
+        del stage_info
+        assert self.smem_page_offsets is not None
+        self._smem_page_offsets = self.smem_page_offsets
+
+    @producer_work(work_attrs=WorkAttr.AUXILIARY)
+    @cute.jit
+    def init_load_state(self, stage_info: StageInfo) -> None:
+        """Initialize W9's view before issuing the page-index copies."""
+        self._init_smem_state(stage_info)
+
+    @consumer_work(work_attrs=WorkAttr.AUXILIARY)
+    @cute.jit
+    def init_read_state(self, stage_info: StageInfo) -> None:
+        """Initialize W12--W15's view of the same page-index ring."""
+        self._init_smem_state(stage_info)
+
+    @producer_work
+    @cute.jit
+    def prefetch_pair(self, stage_info: StageInfo) -> None:
+        """Copy two adjacent K128 index sets into one W9 pipeline stage.
+
+        The index calculation is the source ``SmemPageOffsetsKv`` mapping:
+        ``(k_tile_base + loop_offset) * 128 + lane * 4`` and the same
+        address plus 128.  Source addresses are clamped to the last aligned
+        four-index vector, preserving the generated kernel's tail behaviour.
+        """
+        cfg = self.cfg
+        work_tile = stage_info.work_tile
+        route_row = routing_row_index(
+            cfg, work_tile.tile_idx, self.logical_seq_len_q, self.cu_seqlens_q
+        )
+        page_offsets_row = self.page_offsets[None, route_row]
+        page_offsets_flat = cute.flat_divide(page_offsets_row, (1,))
+        lane_idx = cute.arch.thread_idx()[0] & Int32(31)
+        k_tile = work_tile.k_index_base + Int32(stage_info.loop_offset)
+        pair_base = k_tile * Int32(128)
+        # The producer is never entered for an empty domain.  Retain a
+        # non-negative clamped vector address for the final odd K128 tile.
+        last_vector_base = (
+            cute.math.max(work_tile.k_len - Int32(1), Int32(0)) >> Int32(2)
+        ) << Int32(2)
+        src_idx_0 = cute.math.min(pair_base + lane_idx * Int32(4), last_vector_base)
+        src_idx_1 = cute.math.min(
+            pair_base + Int32(128) + lane_idx * Int32(4), last_vector_base
+        )
+        stage_base = Int32(stage_info.stage_idx) * Int32(
+            cfg.dsv4_page_offsets_entries_per_stage
+        )
+        # ``cp.async`` takes a 32-bit shared address.  Do not pass the DSL's
+        # generic pointer representation directly: its address-space cast is
+        # not implicit on SM100 and produces a hardware exception at issue.
+        dst_0 = cutlass.inttoptr(
+            self._smem_page_offsets.data_ptr(stage_base + lane_idx * Int32(4)).toint(
+                Int32
+            ),
+            3,
+            Int32,
+        )
+        dst_1 = cutlass.inttoptr(
+            self._smem_page_offsets.data_ptr(
+                stage_base + Int32(128) + lane_idx * Int32(4)
+            ).toint(Int32),
+            3,
+            Int32,
+        )
+        src_0 = page_offsets_flat[None, src_idx_0].iterator.llvm_ptr
+        src_1 = page_offsets_flat[None, src_idx_1].iterator.llvm_ptr
+        dsv4_cp_async_cg_l2_128b(dst_0, src_0)
+        dsv4_cp_async_cg_l2_128b(dst_1, src_1)
+
+    @consumer_work(returns=page_offset_stage)
+    @cute.jit
+    def read_k_stage(self, stage_info: StageInfo) -> Int32:
+        """Publish the W9 ring stage consumed by the K Gather4 edge.
+
+        K and V intentionally consume different, identically populated W9
+        stages for each adjacent K128 pair.  Keep two labelled consumer
+        operations so the source-pair task can recover and validate both
+        dependency segments from the captured schedule; the returned physical
+        stage still comes from the same consumer pipeline state.
+        """
+        del stage_info
+        return Int32(self.state_src.consumer_work_stage)
+
+    @consumer_work(returns=page_offset_stage)
+    @cute.jit
+    def read_v_stage(self, stage_info: StageInfo) -> Int32:
+        """Publish the W9 ring stage consumed by the V Gather4 edge."""
+        del stage_info
+        return Int32(self.state_src.consumer_work_stage)
+
+    @cute.jit
+    def page_quad(self, offset: Int32) -> cutlass.Array:
+        """Read four page indices from the currently waited ring stage."""
+        stage_base = self.state_src.consumer_work_stage * Int32(
+            self.cfg.dsv4_page_offsets_entries_per_stage
+        )
+        return self._smem_page_offsets.load(
+            stage_base + Int32(offset), vector_size=4, alignment=16
+        )
 
 
 # =====================================================================
@@ -153,12 +706,21 @@ class HighThroughputMlaResource(MemoryResource):
 class WorkThrottleBarrierResource(MemoryResource):
     """Pace CLC schedule token reuse against the leader CTA's active MMA task.
 
-    The barrier has no payload.  Its producer task already runs only on CTA 0,
-    so ordinary public pipeline ownership is sufficient for every stage and
-    producer-tail operation.
+    The barrier has no payload.  Source advances this software-pipeline state
+    only on CTA rank 0.  Some TS users (notably DSV4 W12--W15) execute the
+    surrounding producer task on both CTAs and gate only the signal, so mark
+    the state itself leader-owned as well.  Otherwise CTA rank 1 advances an
+    uncommitted local cursor and deadlocks in ``producer_tail`` at kernel exit.
     """
 
     is_barrier: cutlass.Constexpr[bool] = True
+    producer_state_owned_by_signaling_ctas_only: cutlass.Constexpr[bool] = True
+    cfg: cutlass.Constexpr = None
+
+    def create_pipeline(self, pipeline_config):
+        if self.cfg is not None and self.cfg.is_dynamic_token_sparse:
+            return _create_dsv4_deferred_pipeline(self, pipeline_config)
+        return super().create_pipeline(pipeline_config)
 
 
 # =====================================================================
@@ -286,7 +848,8 @@ class MlaWorkQueue(WorkQueue):
     """
 
     tile_sched_params: Any = None
-    cache_seqs: Any = None  # cache_seqs tensor for k_tile_count
+    cache_seqs: Any = None  # raw per-request KV sequence lengths
+    sparse_topk_lens: Any = None  # per-packed-Q sparse scan widths (DSV4)
     split_kv: Any = None  # maximum split slots in the launch/workspace
     block_split_kvs: Any = None  # optional per-batch split caps
     is_var_split_kv: cutlass.Constexpr[bool] = False
@@ -308,6 +871,7 @@ class MlaWorkQueue(WorkQueue):
         self,
         tile_sched_params,
         cache_seqs=None,
+        sparse_topk_lens=None,
         split_kv=None,
         block_split_kvs=None,
         is_var_split_kv=False,
@@ -336,6 +900,7 @@ class MlaWorkQueue(WorkQueue):
             self.tile_scheduler_config = None
         self.tile_sched_params = tile_sched_params
         self.cache_seqs = cache_seqs
+        self.sparse_topk_lens = sparse_topk_lens
         self.split_kv = split_kv
         self.block_split_kvs = block_split_kvs
         self.is_var_split_kv = is_var_split_kv
@@ -370,6 +935,11 @@ class MlaWorkQueue(WorkQueue):
         return create_mla_static_tile_scheduler(
             self.tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
         )
+
+    def create_pipeline(self, pipeline_config):
+        if self.cfg is not None and self.cfg.is_dynamic_token_sparse:
+            return _create_dsv4_deferred_pipeline(self, pipeline_config)
+        return super().create_pipeline(pipeline_config)
 
     def _create_placeholder_tile_scheduler(self):
         """Create a dead structural scheduler for the shared prologue.
@@ -428,6 +998,64 @@ class MlaWorkQueue(WorkQueue):
         )
 
     @cute.jit
+    def _dsv4_work_tile_from_clc_response(self, result_addr):
+        """Decode a CLC response and read DSV4 metadata only when valid."""
+
+        m_idx, n_idx, l_idx, valid_i32 = dsv4_clc_response_predicated(result_addr)
+        if cutlass.const_expr(self.tile_scheduler.insert_fence):
+            cute.arch.fence_proxy("async.shared", space="cta")
+        is_valid = Boolean(valid_i32 == Int32(1))
+
+        def make_valid_tile():
+            m_raster, _, l_raster = self.tile_scheduler._swizzle_and_rasterize(
+                m_idx, n_idx, l_idx
+            )
+            cta_m, _, _ = self.tile_scheduler.cta_id_in_cluster
+            query_cluster_idx = m_raster + cta_m
+            split_batch_idx = l_raster
+
+            params = self.tile_sched_params
+            cluster_width = Int32(params.cluster_shape_mnk[0])
+            s_idx = query_cluster_idx // cluster_width
+            cluster_idx = query_cluster_idx % cluster_width
+            split_kv_idx, b_idx = divmod_constexpr_power_of_two_or_fdd(
+                split_batch_idx,
+                self.static_problem_shape_b,
+                params.problem_shape_b_fdd,
+            )
+            tile = self._make_work_tile_info(
+                (cluster_idx, s_idx, b_idx, split_kv_idx),
+                Boolean(True),
+            )
+            return (
+                tile.tile_idx[0],
+                tile.tile_idx[1],
+                tile.tile_idx[2],
+                tile.tile_idx[3],
+                tile.k_len,
+                tile.k_tile_count,
+                tile.k_index_base,
+            )
+
+        def make_terminal_tile():
+            zero = Int32(0)
+            return (zero, zero, zero, zero, zero, zero, zero)
+
+        tile_values = cutlass.if_generate(
+            is_valid,
+            make_valid_tile,
+            make_terminal_tile,
+            return_types=[Int32] * 7,
+        )
+        return MlaTsWorkTileInfo(
+            tuple(tile_values[:4]),
+            is_valid,
+            tile_values[4],
+            tile_values[5],
+            tile_values[6],
+        )
+
+    @cute.jit
     def _make_work_tile_info(
         self,
         tile_idx,
@@ -440,7 +1068,17 @@ class MlaWorkQueue(WorkQueue):
         if cutlass.const_expr(self.static_seq_len_k is not None):
             K = Int32(self.static_seq_len_k)
         else:
-            K = Int32(self.cache_seqs[safe_b_idx])
+            metadata_row = routing_row_index(
+                cfg,
+                (Int32(0), s_idx, safe_b_idx, split_kv_idx),
+                self.logical_seq_len_q,
+                self.cu_seqlens_q,
+            )
+            K = Int32(
+                self.sparse_topk_lens[metadata_row]
+                if cutlass.const_expr(cfg.is_dynamic_token_sparse)
+                else self.cache_seqs[metadata_row]
+            )
         sequence_k_len = K
 
         # The launch uses the largest flat-Q tile count in the batch. Shorter
@@ -461,7 +1099,9 @@ class MlaWorkQueue(WorkQueue):
             safe_b_idx,
         )
         if cutlass.const_expr(
-            cfg.mask_type == MaskType.CAUSAL.value and self.logical_seq_len_q > 1
+            cfg.mask_type == MaskType.CAUSAL.value
+            and self.logical_seq_len_q > 1
+            and not cfg.is_dynamic_token_sparse
         ):
             # Split partitioning owns the mask-visible CTA domain. The final
             # physical row resolves to the tile's latest valid Q
@@ -599,9 +1239,9 @@ class MlaWorkQueue(WorkQueue):
     def advance_tile(self, stage_info: StageInfo):
         """Advance CLC through its response pipeline; static is task-owned."""
         if cutlass.const_expr(self.use_clc_dynamic):
-            # Decode through the public scheduler/config surfaces so the
-            # task-local value keeps its MLA type and cached runtime K-domain
-            # fields without depending on WorkQueue's private response helpers.
+            # DSV4 locally predicates CLC coordinate decode and metadata on a
+            # successful cancellation. Dense MLA retains the public scheduler
+            # path below. Both produce the same MLA task-local value type.
             assert self.tile_scheduler_config is not None
             assert self.tile_scheduler_config.response_ptr is not None
             assert self.tile_scheduler is not None
@@ -609,6 +1249,8 @@ class MlaWorkQueue(WorkQueue):
             stage_response_ptr = self.tile_scheduler_config.response_ptr
             if cutlass.const_expr(self.pipeline_config.num_stages > 1):
                 stage_response_ptr = stage_response_ptr + stage_info.stage_idx
+            if cutlass.const_expr(self.cfg.is_dynamic_token_sparse):
+                return self._dsv4_work_tile_from_clc_response(stage_response_ptr)
             work_tile = self.tile_scheduler.work_tile_info_from_clc_response(
                 stage_response_ptr
             )
@@ -889,7 +1531,18 @@ class SmemQResource(HighThroughputMlaResource):
         mask_q = Int16(Int32(1) << cta_v)
         q_mbar_arr = cutlass.Array(stage_info.barrier.data_ptr(), dtype=Int64)
 
-        if prims.elect_sync():
+        # In the DSV4 split-load schedule this resource is called by the
+        # W12--W15 Gather4 task.  The generated kernel permits every one of
+        # those warps to enter the Q pipeline, but emits its TMA transactions
+        # only from its first warp (W12).  Without this predicate each warp
+        # independently elects a lane and sends the same TMA four times.
+        issue_q_tma = prims.elect_sync()
+        if cutlass.const_expr(cfg.is_dynamic_token_sparse):
+            issue_q_tma = issue_q_tma & (
+                cute.arch.make_warp_uniform(cute.arch.warp_idx())
+                == Int32(cfg.load_v_warp_id)
+            )
+        if issue_q_tma:
             # Load Q latent sub-tiles
             q_latent_stage_elems = cutlass.const_expr(
                 cfg.mma_qk_tiler[0] // cfg.num_mma_ctas * cfg.mma_qk_tiler_k
@@ -1267,6 +1920,16 @@ class SmemKResource(HighThroughputMlaResource):
     page_offsets: Any = None
     tma_desc_c_latent: Any = None
     tma_desc_c_rope: Any = None
+    sparse_tma_atom_swa: Any = None
+    sparse_tma_tensor_swa: Any = None
+    sparse_tma_atom_compressed: Any = None
+    sparse_tma_tensor_compressed: Any = None
+    raw_tma_descriptor_swa: Any = None
+    raw_tma_descriptor_compressed: Any = None
+    sparse_coord_tensor: Any = None
+    sparse_smem_tensor: Any = None
+    smem_page_offsets: Any = None
+    cu_seqlens_q: Any = None
     logical_seq_len_q: cutlass.Constexpr[int] = 1
     cfg: cutlass.Constexpr = field(default_factory=MlaDecodeConfig)
     desc_k_base: cutlass.Constexpr[TaskLocalVariable] = (
@@ -1285,7 +1948,7 @@ class SmemKResource(HighThroughputMlaResource):
     @producer_work
     @cute.jit
     def tma_load_direct(self, stage_info: StageInfo) -> None:
-        """TMA load one full K tile using page offsets read directly from GMEM."""
+        """TMA load one dense K tile using page offsets read from GMEM."""
         cfg = self.cfg
         stage_idx = stage_info.stage_idx
         stage_base = stage_idx * cfg.smem_k_stage_elems
@@ -1293,7 +1956,9 @@ class SmemKResource(HighThroughputMlaResource):
         blk_coord = work_tile.tile_idx
         k_index = work_tile.k_index_base + Int32(stage_info.loop_offset)
 
-        page_row_idx = blk_coord[2]
+        page_row_idx = routing_row_index(
+            cfg, blk_coord, self.logical_seq_len_q, self.cu_seqlens_q
+        )
         page_offsets_batch = self.page_offsets[None, page_row_idx]
         kv_mbar_arr = cutlass.Array(stage_info.barrier.data_ptr(), dtype=Int64)
         pages_per_k_cta = cfg.pages_per_k_cta
@@ -1373,6 +2038,150 @@ class SmemKResource(HighThroughputMlaResource):
                         group=prims.CTAGroup.CTA_2,
                     )
 
+    @producer_work
+    @cute.jit
+    def tma_load_from_page_ring_pair(
+        self,
+        stage_info: StageInfo,
+        *,
+        page_offset_stage: Int32,
+    ) -> None:
+        """Issue K from the source pair-ring half selected by its K-tile parity.
+
+        Unlike ``k_tile_delta``, selector-half selection must not change the
+        logical K index or producer pipeline stage.  This is used only by the
+        dedicated source-pair FSM, whose ``stage_info.loop_offset`` remains
+        the full K-tile index while W9 holds one selector stage across even
+        and odd tiles.
+        """
+        self._tma_load_sparse_from_ring(
+            stage_info,
+            page_offset_stage=page_offset_stage,
+            page_offset_half=Int32(stage_info.loop_offset) & Int32(1),
+        )
+
+    @cute.jit
+    def _issue_sparse_ring_bundle(
+        self,
+        *,
+        raw_tma,
+        stage_base,
+        cta_rank,
+        local_load_warp,
+        completion_mbarrier,
+        page_offset_stage,
+        page_offset_half,
+    ) -> None:
+        """Issue one source-shaped K Gather4 bundle for a fixed tensor map.
+
+        Keeping the descriptor fixed across this inlined bundle is important:
+        ptxas can predicate each elected-lane TMA exactly as it does for the
+        generated source.  A descriptor branch inside the elected region
+        instead creates one divergent reconvergence region per transaction.
+        """
+        cfg = self.cfg
+        for quad_idx in cutlass.range_constexpr(4):
+            token_group = local_load_warp * Int32(4) + Int32(quad_idx * 16)
+            page_quad = self.smem_page_offsets.load(
+                page_offset_stage * Int32(cfg.dsv4_page_offsets_entries_per_stage)
+                + page_offset_half * Int32(128)
+                + cta_rank * Int32(64)
+                + token_group,
+                vector_size=4,
+                alignment=16,
+            )
+            dst_token_base = stage_base + token_group * Int32(128)
+            for head_dim_stage in cutlass.range_constexpr(4):
+                dst_smem = cute.make_ptr(
+                    qkv_dtype(cfg),
+                    self.smem_k.data_ptr(dst_token_base + Int32(head_dim_stage * 8192)),
+                    mem_space=cutlass.AddressSpace.smem,
+                )
+                if prims.elect_sync():
+                    issue_gather4_tma_2cta(
+                        raw_tma,
+                        dst_smem,
+                        completion_mbarrier,
+                        Int32(head_dim_stage * 128),
+                        (page_quad[0], page_quad[1], page_quad[2], page_quad[3]),
+                    )
+
+    @cute.jit
+    def _tma_load_sparse_from_ring(
+        self,
+        stage_info: StageInfo,
+        *,
+        page_offset_stage: Int32,
+        k_tile_delta: cutlass.Constexpr[int] = 0,
+        page_offset_half: Int32 | None = None,
+    ) -> None:
+        """Issue the source W12--W15 K Gather4 work from the W9 SMEM ring.
+
+        Every load warp owns four page quads and emits all four D128 slices.
+        This is deliberately a raw Gather4 path: CuTe's high-level atom takes
+        indices from a GMEM coordinate tensor, while DSV4's latency-hiding
+        contract requires the four indices to come from W9's cp.async ring.
+        """
+
+        cfg = self.cfg
+        work_tile = stage_info.work_tile
+        k_index = (
+            work_tile.k_index_base + Int32(stage_info.loop_offset) + Int32(k_tile_delta)
+        )
+        stage_base = Int32(stage_info.stage_idx) * Int32(cfg.smem_k_stage_elems)
+        cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+        local_load_warp = cute.arch.make_warp_uniform(cute.arch.warp_idx()) - Int32(
+            cfg.load_v_warp_id
+        )
+        completion_mbarrier = cute.make_ptr(
+            Int64,
+            stage_info.barrier.data_ptr(),
+            mem_space=cutlass.AddressSpace.smem,
+            assumed_align=8,
+        )
+        raw_tma_swa = (
+            self.raw_tma_descriptor_swa
+            if self.raw_tma_descriptor_swa is not None
+            else gather4_tma_descriptor_address(self.sparse_tma_atom_swa)
+        )
+        raw_tma_compressed = (
+            self.raw_tma_descriptor_compressed
+            if self.raw_tma_descriptor_compressed is not None
+            else gather4_tma_descriptor_address(self.sparse_tma_atom_compressed)
+        )
+        # K's 64 sparse-token rows are split across the two CTA ranks.  The
+        # destination mapping and four H128 slices are verbatim from
+        # ``SmemKv.h`` in the generated TRT-LLM kernel.
+        page_offset_half = (
+            Int32(k_tile_delta)
+            if cutlass.const_expr(page_offset_half is None)
+            else page_offset_half
+        )
+        # Source places this tile0 branch outside the entire unrolled bundle.
+        # Both paths are intentionally separate rather than merged through a
+        # descriptor-pointer phi: the latter does not preserve tensor-map
+        # pointer semantics in the current CuTe DSL lowering.
+        if k_index == Int32(0):
+            self._issue_sparse_ring_bundle(
+                raw_tma=raw_tma_swa,
+                stage_base=stage_base,
+                cta_rank=cta_rank,
+                local_load_warp=local_load_warp,
+                completion_mbarrier=completion_mbarrier,
+                page_offset_stage=page_offset_stage,
+                page_offset_half=page_offset_half,
+            )
+        else:
+            self._issue_sparse_ring_bundle(
+                raw_tma=raw_tma_compressed,
+                stage_base=stage_base,
+                cta_rank=cta_rank,
+                local_load_warp=local_load_warp,
+                completion_mbarrier=completion_mbarrier,
+                page_offset_stage=page_offset_stage,
+                page_offset_half=page_offset_half,
+            )
+
     @consumer_work(returns=desc_k_base)
     @cute.jit
     def k_desc(self, stage_info: StageInfo, *, k_subtile_idx: cutlass.Constexpr[int]):
@@ -1440,6 +2249,21 @@ class SmemVResource(HighThroughputMlaResource):
     smem_v: Any = None
     page_offsets: Any = None
     tma_desc_c_transpose: Any = None
+    sparse_tma_atom_swa: Any = None
+    sparse_tma_tensor_swa: Any = None
+    sparse_tma_atom_compressed: Any = None
+    sparse_tma_tensor_compressed: Any = None
+    # Generated DSV4 uses the K tensor map for both raw K and raw V Gather4
+    # instructions.  V's own atom only supplies a descriptor address when no
+    # raw descriptor pair is bound.
+    raw_tma_atom_swa: Any = None
+    raw_tma_atom_compressed: Any = None
+    raw_tma_descriptor_swa: Any = None
+    raw_tma_descriptor_compressed: Any = None
+    sparse_coord_tensor: Any = None
+    sparse_smem_tensor: Any = None
+    smem_page_offsets: Any = None
+    cu_seqlens_q: Any = None
     logical_seq_len_q: cutlass.Constexpr[int] = 1
     cfg: cutlass.Constexpr = field(default_factory=MlaDecodeConfig)
     desc_v_base: cutlass.Constexpr[TaskLocalVariable] = (
@@ -1458,14 +2282,16 @@ class SmemVResource(HighThroughputMlaResource):
     @producer_work
     @cute.jit
     def tma_load_direct(self, stage_info: StageInfo) -> None:
-        """TMA load one full V tile using page offsets read directly from GMEM."""
+        """TMA load one dense V tile using page offsets read from GMEM."""
         cfg = self.cfg
         stage_idx = stage_info.stage_idx
         stage_base = stage_idx * cfg.smem_v_stage_elems
         work_tile = stage_info.work_tile
         blk_coord = work_tile.tile_idx
         k_index = work_tile.k_index_base + Int32(stage_info.loop_offset)
-        page_row_idx = blk_coord[2]
+        page_row_idx = routing_row_index(
+            cfg, blk_coord, self.logical_seq_len_q, self.cu_seqlens_q
+        )
         page_offsets_batch = self.page_offsets[None, page_row_idx]
 
         v_mbar_arr = cutlass.Array(stage_info.barrier.data_ptr(), dtype=Int64)
@@ -1546,6 +2372,140 @@ class SmemVResource(HighThroughputMlaResource):
                         group=prims.CTAGroup.CTA_2,
                     )
 
+    @producer_work
+    @cute.jit
+    def tma_load_from_page_ring_pair(
+        self,
+        stage_info: StageInfo,
+        *,
+        page_offset_stage: Int32,
+    ) -> None:
+        """Issue V from the source pair-ring half selected by K-tile parity."""
+        self._tma_load_sparse_from_ring(
+            stage_info,
+            page_offset_stage=page_offset_stage,
+            page_offset_half=Int32(stage_info.loop_offset) & Int32(1),
+        )
+
+    @cute.jit
+    def _issue_sparse_ring_bundle(
+        self,
+        *,
+        raw_tma,
+        stage_base,
+        cta_rank,
+        local_load_warp,
+        completion_mbarrier,
+        page_offset_stage,
+        page_offset_half,
+    ) -> None:
+        """Issue one source-shaped V Gather4 bundle for a fixed tensor map."""
+        cfg = self.cfg
+        for quad_idx in cutlass.range_constexpr(8):
+            token_group = local_load_warp * Int32(4) + Int32(quad_idx * 16)
+            page_quad = self.smem_page_offsets.load(
+                page_offset_stage * Int32(cfg.dsv4_page_offsets_entries_per_stage)
+                + page_offset_half * Int32(128)
+                + token_group,
+                vector_size=4,
+                alignment=16,
+            )
+            dst_token_base = stage_base + token_group * Int32(128)
+            for head_dim_stage in cutlass.range_constexpr(2):
+                dst_smem = cute.make_ptr(
+                    qkv_dtype(cfg),
+                    self.smem_v.data_ptr(
+                        dst_token_base + Int32(head_dim_stage * 16384)
+                    ),
+                    mem_space=cutlass.AddressSpace.smem,
+                )
+                if prims.elect_sync():
+                    issue_gather4_tma_2cta(
+                        raw_tma,
+                        dst_smem,
+                        completion_mbarrier,
+                        cta_rank * Int32(128) + Int32(head_dim_stage * 256),
+                        (page_quad[0], page_quad[1], page_quad[2], page_quad[3]),
+                    )
+
+    @cute.jit
+    def _tma_load_sparse_from_ring(
+        self,
+        stage_info: StageInfo,
+        *,
+        page_offset_stage: Int32,
+        k_tile_delta: cutlass.Constexpr[int] = 0,
+        page_offset_half: Int32 | None = None,
+    ) -> None:
+        """Issue the source W12--W15 V Gather4 work from the W9 SMEM ring."""
+
+        cfg = self.cfg
+        work_tile = stage_info.work_tile
+        k_index = (
+            work_tile.k_index_base + Int32(stage_info.loop_offset) + Int32(k_tile_delta)
+        )
+        stage_base = Int32(stage_info.stage_idx) * Int32(cfg.smem_v_stage_elems)
+        cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+        local_load_warp = cute.arch.make_warp_uniform(cute.arch.warp_idx()) - Int32(
+            cfg.load_v_warp_id
+        )
+        completion_mbarrier = cute.make_ptr(
+            Int64,
+            stage_info.barrier.data_ptr(),
+            mem_space=cutlass.AddressSpace.smem,
+            assumed_align=8,
+        )
+        raw_tma_swa = (
+            self.raw_tma_descriptor_swa
+            if self.raw_tma_descriptor_swa is not None
+            else gather4_tma_descriptor_address(
+                self.raw_tma_atom_swa
+                if self.raw_tma_atom_swa is not None
+                else self.sparse_tma_atom_swa
+            )
+        )
+        raw_tma_compressed = (
+            self.raw_tma_descriptor_compressed
+            if self.raw_tma_descriptor_compressed is not None
+            else gather4_tma_descriptor_address(
+                self.raw_tma_atom_compressed
+                if self.raw_tma_atom_compressed is not None
+                else self.sparse_tma_atom_compressed
+            )
+        )
+        # V is multicast across the CTA pair, so its source page quad has no
+        # CTA-rank term. CTA rank instead selects interleaved V128 columns.
+        # The generated kernel gives every W12--W15 warp eight interleaved
+        # page quads and two H256 slices each: 4 * 8 * 2 = 64 Gather4
+        # transactions, satisfying the source-sized 64 KiB completion
+        # barrier. Four quads would cover just 64 KV rows and deadlock the
+        # consumer wait with half of the expected transaction count missing.
+        page_offset_half = (
+            Int32(k_tile_delta)
+            if cutlass.const_expr(page_offset_half is None)
+            else page_offset_half
+        )
+        if k_index == Int32(0):
+            self._issue_sparse_ring_bundle(
+                raw_tma=raw_tma_swa,
+                stage_base=stage_base,
+                cta_rank=cta_rank,
+                local_load_warp=local_load_warp,
+                completion_mbarrier=completion_mbarrier,
+                page_offset_stage=page_offset_stage,
+                page_offset_half=page_offset_half,
+            )
+        else:
+            self._issue_sparse_ring_bundle(
+                raw_tma=raw_tma_compressed,
+                stage_base=stage_base,
+                cta_rank=cta_rank,
+                local_load_warp=local_load_warp,
+                completion_mbarrier=completion_mbarrier,
+                page_offset_stage=page_offset_stage,
+                page_offset_half=page_offset_half,
+            )
+
     @consumer_work(returns=desc_v_base)
     @cute.jit
     def v_desc(self, stage_info: StageInfo, *, v_subtile_idx: cutlass.Constexpr[int]):
@@ -1558,15 +2518,27 @@ class SmemVResource(HighThroughputMlaResource):
             stage_info.stage_idx * cfg.smem_v_stage_elems
             + v_subtile_idx * svc_copy_elems
         )
-        leading_byte_offset = cutlass.const_expr(
-            V_SMEM_K_BLOCK_TOKENS * V_TMA_LATENT_ELEMENTS * cfg.qkv_dtype_bytes
-        )
-        stride_byte_offset = cutlass.const_expr(
-            qkv_major_k_stride_bytes_for(cfg, cfg.mma_pv_tiler[2])
-        )
-        layout = cutlass.const_expr(
-            qk_desc_layout_for_head_dim(cfg, cfg.mma_pv_tiler[2])
-        )
+        if cutlass.const_expr(cfg.is_dynamic_token_sparse):
+            # The generated DSV4 BMM2 descriptor is
+            # ``leadingDimInBytes=0, strideInBytes=1024, swizzleMode=S128B``.
+            # Raw Gather4 has already placed both H256 pieces at the S128B
+            # locations, so adding a leading dimension makes tcgen05 consume
+            # a different V tile.
+            leading_byte_offset = cutlass.const_expr(0)
+            stride_byte_offset = cutlass.const_expr(
+                8 * (cfg.mma_pv_tiler[1] // cfg.num_mma_ctas) * cfg.qkv_dtype_bytes
+            )
+            layout = cutlass.const_expr(2)  # S128B
+        else:
+            leading_byte_offset = cutlass.const_expr(
+                V_SMEM_K_BLOCK_TOKENS * V_TMA_LATENT_ELEMENTS * cfg.qkv_dtype_bytes
+            )
+            stride_byte_offset = cutlass.const_expr(
+                qkv_major_k_stride_bytes_for(cfg, cfg.mma_pv_tiler[2])
+            )
+            layout = cutlass.const_expr(
+                qk_desc_layout_for_head_dim(cfg, cfg.mma_pv_tiler[2])
+            )
         svc_ptr = self.smem_v.data_ptr(subtile_offset)
         desc = Int64(
             prims.Tcgen05SmemDesc.build(
@@ -1598,15 +2570,24 @@ class SmemVResource(HighThroughputMlaResource):
         subtile_offset = stage_info.stage_idx * cfg.smem_v_stage_elems + (
             v_call * svc_copy_elems
         )
-        leading_byte_offset = cutlass.const_expr(
-            V_SMEM_K_BLOCK_TOKENS * V_TMA_LATENT_ELEMENTS * cfg.qkv_dtype_bytes
-        )
-        stride_byte_offset = cutlass.const_expr(
-            qkv_major_k_stride_bytes_for(cfg, cfg.mma_pv_tiler[2])
-        )
-        layout = cutlass.const_expr(
-            qk_desc_layout_for_head_dim(cfg, cfg.mma_pv_tiler[2])
-        )
+        if cutlass.const_expr(cfg.is_dynamic_token_sparse):
+            # Keep the N-major PV path byte-for-byte compatible with the
+            # source BMM2 descriptor (leading=0, stride=1024, S128B).
+            leading_byte_offset = cutlass.const_expr(0)
+            stride_byte_offset = cutlass.const_expr(
+                8 * (cfg.mma_pv_tiler[1] // cfg.num_mma_ctas) * cfg.qkv_dtype_bytes
+            )
+            layout = cutlass.const_expr(2)  # S128B
+        else:
+            leading_byte_offset = cutlass.const_expr(
+                V_SMEM_K_BLOCK_TOKENS * V_TMA_LATENT_ELEMENTS * cfg.qkv_dtype_bytes
+            )
+            stride_byte_offset = cutlass.const_expr(
+                qkv_major_k_stride_bytes_for(cfg, cfg.mma_pv_tiler[2])
+            )
+            layout = cutlass.const_expr(
+                qk_desc_layout_for_head_dim(cfg, cfg.mma_pv_tiler[2])
+            )
         svc_ptr = self.smem_v.data_ptr(subtile_offset)
         desc = Int64(
             prims.Tcgen05SmemDesc.build(
@@ -1639,6 +2620,8 @@ class TmemSResource(HighThroughputMlaResource):
     smem_p: Any = None  # SMEM P array
     smem_exchange: Any = None  # SMEM array for cross-warp max exchange
     softmax_scale_log2: Any = None  # softmax_scale * log2(e)
+    adjusted_skip_corr_threshold: Any = None  # threshold / softmax_scale_log2
+    log2_softmax_p_scale: Any = None  # log2(1.75) when skip correction is enabled
     cache_seqs: Any = None  # per-batch valid K length
     cu_seqlens_q: Any = None  # cumulative compact-Q offsets, or None for fixed Q
     split_kv: Any = None  # per-work-tile split count
@@ -1753,7 +2736,10 @@ class TmemSResource(HighThroughputMlaResource):
         del stage_info
         self.cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
         self.is_leader = self.cta_rank == 0
-        self.row_max_state = Float32(-Float32.inf)
+        initial_row_max = Float32(-Float32.inf)
+        if cutlass.const_expr(self.cfg.is_dynamic_token_sparse):
+            initial_row_max = Float32(NEG_FLT_MAX)
+        self.row_max_state = initial_row_max
         self.row_sum_state = Float32(0)
         return (
             cutlass.Array(
@@ -1761,7 +2747,7 @@ class TmemSResource(HighThroughputMlaResource):
                 64,
                 space=cutlass.AddressSpace.rmem,
             ),
-            Float32(-Float32.inf),
+            initial_row_max,
             Float32(0),
             Float32(0),
             Float32(0),
@@ -1787,7 +2773,10 @@ class TmemSResource(HighThroughputMlaResource):
         del stage_info
         self.cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
         self.is_leader = self.cta_rank == 0
-        self.row_max_state = Float32(-Float32.inf)
+        initial_row_max = Float32(-Float32.inf)
+        if cutlass.const_expr(self.cfg.is_dynamic_token_sparse):
+            initial_row_max = Float32(NEG_FLT_MAX)
+        self.row_max_state = initial_row_max
         self.row_sum_state = Float32(0)
         return (
             cutlass.Array(
@@ -1795,7 +2784,7 @@ class TmemSResource(HighThroughputMlaResource):
                 64,
                 space=cutlass.AddressSpace.rmem,
             ),
-            Float32(-Float32.inf),
+            initial_row_max,
             Float32(0),
             Float32(0),
             Float32(0),
@@ -1921,6 +2910,53 @@ class TmemSResource(HighThroughputMlaResource):
                             Boolean(True),
                         )
 
+    @cute.jit
+    def source_preacquire_pair(self) -> None:
+        """Acquire S[0] and S[1] once before source W8's persistent loop.
+
+        Source uses one syntactic state for this lookahead and for commits,
+        but the state is observed at two different logical times.  Prim-TS
+        represents that contract explicitly: ``producer_state`` is the
+        acquire cursor and ``producer_commit_state`` is the lagging QK commit
+        cursor.  Opening both empty stages here leaves acquire exactly two
+        tokens ahead without making a cloned state escape captured control
+        flow.
+        """
+        assert self.pipeline is not None
+        assert self.pipeline_config is not None
+        assert self.pipeline_config.advance_on_acquire
+        for _ in cutlass.range_constexpr(2):
+            token = self.pipeline.producer_try_acquire(self.producer_state)
+            self.pipeline.producer_acquire(self.producer_state, token)
+            self.producer_state.advance()
+
+    @producer_work(work_attrs=WorkAttr.AUXILIARY)
+    @cute.jit
+    def source_acquire_next_stage(self, stage_info: StageInfo) -> None:
+        """Wait for ``producer_state + 1`` without moving the owned cursor.
+
+        W8 uses this shifted tail acquire to observe the final softmax P store
+        before PV consumes it.  It corresponds to generated
+        ``makePipelineState(tmemS0ProdState, 1)``.
+        """
+        del stage_info
+        assert self.pipeline is not None
+        next_state = self.producer_state.clone()
+        next_state.advance()
+        next_token = self.pipeline.producer_try_acquire(next_state)
+        self.pipeline.producer_acquire(next_state, next_token)
+
+    @cute.jit
+    def source_balance_after_persistent_loop(self) -> None:
+        """Emit source W8's two final S commits after all persistent tiles."""
+        assert self.pipeline is not None
+        assert self.pipeline_config is not None
+        assert self.pipeline_config.advance_on_acquire
+        self.pipeline.producer_commit(self.producer_commit_state)
+        self.producer_commit_state.advance()
+        self.pipeline.producer_commit(self.producer_commit_state)
+        self.producer_commit_state.advance()
+
     @consumer_work(work_attrs=WorkAttr.AUXILIARY, returns=(row_sum, row_sum_out))
     @cute.jit
     def finish_row_sum(
@@ -1933,14 +2969,63 @@ class TmemSResource(HighThroughputMlaResource):
     ):
         """Finish row-sum reduction after P is published to SMEM."""
         del stage_info
-        row_sum = row_sum * correction_factor_out
-        row_sum_vec = (Float32(0), Float32(0))
-        for i in cutlass.range_constexpr(0, 64, 2):
-            row_sum_vec = add_packed_f32x2(
-                row_sum_vec,
-                (qk_acc_regs[i], qk_acc_regs[i + 1]),
+        cfg = self.cfg
+        if cutlass.const_expr(cfg.is_dynamic_token_sparse):
+            # The generated task places this compiler fence and a second
+            # async-shared proxy fence after S release and before the global
+            # softmax sum.  TmemP's first view fence remains attached to the
+            # packed P store itself.
+            dsv4_code_fence()
+            prims.fence_proxy(
+                kind=prims.Proxy.ASYNC_SHARED,
+                space=prims.SharedSpace.shared_cta,
             )
-        row_sum = row_sum_vec[0] + row_sum_vec[1] + row_sum
+        if cutlass.const_expr(cfg.is_dynamic_token_sparse):
+            sum0 = (Float32(0), Float32(0))
+            sum1 = (Float32(0), Float32(0))
+            sum2 = (Float32(0), Float32(0))
+            sum3 = (Float32(0), Float32(0))
+            for i in cutlass.range_constexpr(0, 64, 8):
+                dsv4_warp_switch()
+                sum0 = fadd2(sum0, (qk_acc_regs[i], qk_acc_regs[i + 1]))
+                dsv4_warp_switch()
+                sum1 = fadd2(sum1, (qk_acc_regs[i + 2], qk_acc_regs[i + 3]))
+                dsv4_warp_switch()
+                sum2 = fadd2(sum2, (qk_acc_regs[i + 4], qk_acc_regs[i + 5]))
+                dsv4_warp_switch()
+                sum3 = fadd2(sum3, (qk_acc_regs[i + 6], qk_acc_regs[i + 7]))
+            sum0 = fadd2(sum0, sum1)
+            sum2 = fadd2(sum2, sum3)
+            sum0 = fadd2(sum0, sum2)
+            local_sum = add_ftz_f32(sum0[0], sum0[1])
+            # The structural P path carries oldMax-newMax in this slot so
+            # expScale remains after the local reduction, exactly as in
+            # TmemSoftmaxGlobal rather than being hoisted ahead of MUFU P.
+            correction_factor = Float32(1)
+            if cutlass.const_expr(cfg.dsv4_enable_skip_correction):
+                # Source computeExpScale leaves the identity value in place
+                # when max freeze made oldMax == newMax.  Avoiding this MUFU
+                # is part of skip correction's performance contract.
+                if correction_factor_out != Float32(0):
+                    correction_factor = cute.math.exp2(
+                        mul_ftz_f32(correction_factor_out, self.softmax_scale_log2),
+                        fastmath=True,
+                    )
+            else:
+                correction_factor = cute.math.exp2(
+                    mul_ftz_f32(correction_factor_out, self.softmax_scale_log2),
+                    fastmath=True,
+                )
+            row_sum = fma_ftz_f32(correction_factor, row_sum, local_sum)
+        else:
+            row_sum = row_sum * correction_factor_out
+            row_sum_vec = (Float32(0), Float32(0))
+            for i in cutlass.range_constexpr(0, 64, 2):
+                row_sum_vec = add_packed_f32x2(
+                    row_sum_vec,
+                    (qk_acc_regs[i], qk_acc_regs[i + 1]),
+                )
+            row_sum = row_sum_vec[0] + row_sum_vec[1] + row_sum
         self.row_sum_state = row_sum
         return row_sum, row_sum
 
@@ -1958,14 +3043,56 @@ class TmemSResource(HighThroughputMlaResource):
     ):
         """Finish odd-lane row-sum reduction after P is published to SMEM."""
         del stage_info
-        row_sum = row_sum_odd * correction_factor_out_odd
-        row_sum_vec = (Float32(0), Float32(0))
-        for i in cutlass.range_constexpr(0, 64, 2):
-            row_sum_vec = add_packed_f32x2(
-                row_sum_vec,
-                (qk_acc_regs_odd[i], qk_acc_regs_odd[i + 1]),
+        cfg = self.cfg
+        if cutlass.const_expr(cfg.is_dynamic_token_sparse):
+            dsv4_code_fence()
+            prims.fence_proxy(
+                kind=prims.Proxy.ASYNC_SHARED,
+                space=prims.SharedSpace.shared_cta,
             )
-        row_sum = row_sum_vec[0] + row_sum_vec[1] + row_sum
+        if cutlass.const_expr(cfg.is_dynamic_token_sparse):
+            sum0 = (Float32(0), Float32(0))
+            sum1 = (Float32(0), Float32(0))
+            sum2 = (Float32(0), Float32(0))
+            sum3 = (Float32(0), Float32(0))
+            for i in cutlass.range_constexpr(0, 64, 8):
+                dsv4_warp_switch()
+                sum0 = fadd2(sum0, (qk_acc_regs_odd[i], qk_acc_regs_odd[i + 1]))
+                dsv4_warp_switch()
+                sum1 = fadd2(sum1, (qk_acc_regs_odd[i + 2], qk_acc_regs_odd[i + 3]))
+                dsv4_warp_switch()
+                sum2 = fadd2(sum2, (qk_acc_regs_odd[i + 4], qk_acc_regs_odd[i + 5]))
+                dsv4_warp_switch()
+                sum3 = fadd2(sum3, (qk_acc_regs_odd[i + 6], qk_acc_regs_odd[i + 7]))
+            sum0 = fadd2(sum0, sum1)
+            sum2 = fadd2(sum2, sum3)
+            sum0 = fadd2(sum0, sum2)
+            local_sum = add_ftz_f32(sum0[0], sum0[1])
+            correction_factor = Float32(1)
+            if cutlass.const_expr(cfg.dsv4_enable_skip_correction):
+                if correction_factor_out_odd != Float32(0):
+                    correction_factor = cute.math.exp2(
+                        mul_ftz_f32(
+                            correction_factor_out_odd,
+                            self.softmax_scale_log2,
+                        ),
+                        fastmath=True,
+                    )
+            else:
+                correction_factor = cute.math.exp2(
+                    mul_ftz_f32(correction_factor_out_odd, self.softmax_scale_log2),
+                    fastmath=True,
+                )
+            row_sum = fma_ftz_f32(correction_factor, row_sum_odd, local_sum)
+        else:
+            row_sum = row_sum_odd * correction_factor_out_odd
+            row_sum_vec = (Float32(0), Float32(0))
+            for i in cutlass.range_constexpr(0, 64, 2):
+                row_sum_vec = add_packed_f32x2(
+                    row_sum_vec,
+                    (qk_acc_regs_odd[i], qk_acc_regs_odd[i + 1]),
+                )
+            row_sum = row_sum_vec[0] + row_sum_vec[1] + row_sum
         self.row_sum_state = row_sum
         return row_sum, row_sum
 
@@ -2024,8 +3151,15 @@ class TmemSResource(HighThroughputMlaResource):
                 Int32(cfg.mma_qk_tiler[1]),
                 K,
             )
+        # DSV4's first sparse tile owns the fixed SWA slot range.  It is
+        # independently bounded by the causal raw timeline even if Lq is a
+        # multiple of 128, so it always needs the right-mask path.
+        if cutlass.const_expr(cfg.is_dynamic_token_sparse):
+            group_needs_mask = group_needs_mask | (k_index == Int32(0))
 
         neg_inf = Float32(-Float32.inf)
+        if cutlass.const_expr(cfg.is_dynamic_token_sparse):
+            neg_inf = Float32(NEG_FLT_MAX)
         row_max_tile = row_max
         warp_id = local_tidx >> 5
         tmem_warp_row_id = self.tmem_base_addr + warp_id * TCGEN05_32B_REGS_PER_LOAD
@@ -2041,7 +3175,36 @@ class TmemSResource(HighThroughputMlaResource):
             qk_acc_regs.store(loaded, load_idx * TCGEN05_32B_REGS_PER_LOAD)
 
         if group_needs_mask:
-            if cutlass.const_expr(needs_row_causal_mask):
+            if cutlass.const_expr(cfg.is_dynamic_token_sparse):
+                dsv4_set_cold_block()
+            row_k_len = K
+            if cutlass.const_expr(cfg.is_dynamic_token_sparse):
+                if k_index == Int32(0):
+                    batch_idx = Int32(work_tile.tile_idx[2])
+                    _, logical_seq_len_q = query_batch_bounds(
+                        self.cu_seqlens_q,
+                        batch_idx,
+                        self.logical_seq_len_q,
+                    )
+                    _, _, logical_q_idx, _, _ = flat_query_row_state(
+                        Int32(self.logical_num_heads_q - 1),
+                        work_tile.tile_idx[1],
+                        cfg.mma_qk_tiler[0],
+                        self.logical_num_heads_q,
+                        self.logical_seq_len_q,
+                        self.cu_seqlens_q,
+                        batch_idx,
+                    )
+                    raw_visible = mask_visible_k_length(
+                        MaskType.CAUSAL.value,
+                        self.cache_seqs[batch_idx],
+                        logical_q_idx,
+                        logical_seq_len_q,
+                    )
+                    row_k_len = cute.math.min(
+                        cute.math.min(raw_visible, Int32(cfg.sparse_swa_topk)), K
+                    )
+            elif cutlass.const_expr(needs_row_causal_mask):
                 # Clamp padded physical tail rows to the request's last real
                 # row. Their Q/output accesses remain independently
                 # predicated, while this keeps the masking arithmetic safe.
@@ -2065,7 +3228,9 @@ class TmemSResource(HighThroughputMlaResource):
             ) << EPILOGUE_COLUMN_GROUP_SHIFT
             for i in cutlass.range_constexpr(64):
                 token_idx = tile_offset_k + tidx_col + Int32(i)
-                if cutlass.const_expr(needs_row_causal_mask):
+                if cutlass.const_expr(cfg.is_dynamic_token_sparse):
+                    token_is_visible = token_idx < row_k_len
+                elif cutlass.const_expr(needs_row_causal_mask):
                     mask_flat_row = Int32(self.logical_num_heads_q) * (
                         token_idx - K + logical_seq_len_q
                     )
@@ -2073,20 +3238,40 @@ class TmemSResource(HighThroughputMlaResource):
                 else:
                     token_is_visible = token_idx < K
                 qk_acc_regs[i] = qk_acc_regs[i] if token_is_visible else neg_inf
+            if cutlass.const_expr(cfg.is_dynamic_token_sparse):
+                dsv4_reset_cold_block()
 
-        max0 = neg_inf
-        max1 = neg_inf
-        max2 = neg_inf
-        max3 = neg_inf
-        for i in cutlass.range_constexpr(16):
-            max0 = fmax_f32(max0, qk_acc_regs[i])
-            max1 = fmax_f32(max1, qk_acc_regs[i + 16])
-            max2 = fmax_f32(max2, qk_acc_regs[i + 32])
-            max3 = fmax_f32(max3, qk_acc_regs[i + 48])
-        row_max_tile = fmax_f32(
-            row_max_tile,
-            fmax_f32(fmax_f32(max0, max1), fmax_f32(max2, max3)),
-        )
+        max0 = row_max_tile
+        max1 = row_max_tile
+        max2 = row_max_tile
+        max3 = row_max_tile
+        if cutlass.const_expr(cfg.is_dynamic_token_sparse):
+            # TmemS consumes sequential groups of four into independent ILP
+            # chains.  The dense path uses four strided 16-element chains;
+            # both compute the same max but expose different dependencies to
+            # ptxas, and the DSV4 schedule is tuned around this order.
+            for i in cutlass.range_constexpr(0, 64, 4):
+                dsv4_warp_switch()
+                max0 = fmax_f32(max0, qk_acc_regs[i])
+                dsv4_warp_switch()
+                max1 = fmax_f32(max1, qk_acc_regs[i + 1])
+                dsv4_warp_switch()
+                max2 = fmax_f32(max2, qk_acc_regs[i + 2])
+                dsv4_warp_switch()
+                max3 = fmax_f32(max3, qk_acc_regs[i + 3])
+            dsv4_warp_switch()
+            max0 = fmax_f32(max0, max2)
+            dsv4_warp_switch()
+            max1 = fmax_f32(max1, max3)
+            dsv4_warp_switch()
+            row_max_tile = fmax_f32(max0, max1)
+        else:
+            for i in cutlass.range_constexpr(16):
+                max0 = fmax_f32(max0, qk_acc_regs[i])
+                max1 = fmax_f32(max1, qk_acc_regs[i + 16])
+                max2 = fmax_f32(max2, qk_acc_regs[i + 32])
+                max3 = fmax_f32(max3, qk_acc_regs[i + 48])
+            row_max_tile = fmax_f32(fmax_f32(max0, max1), fmax_f32(max2, max3))
         cute.arch.fence_view_async_tmem_load()
         return (
             qk_acc_regs,
@@ -2171,7 +3356,7 @@ class TmemSResource(HighThroughputMlaResource):
         )
 
     @cute.jit
-    def _finish_softmax_impl(
+    def _finish_softmax_max_impl(
         self,
         stage_info: StageInfo,
         *,
@@ -2184,33 +3369,62 @@ class TmemSResource(HighThroughputMlaResource):
         no_correction_out,
         softmax_group_id: cutlass.Constexpr[int] = 0,
     ):
-        """Finish row-max exchange, online correction, and P exponentiation."""
+        """Finish row-max exchange without materializing P.
+
+        Keeping this phase separate lets the DSV4 source schedule publish
+        ``(old_max, new_max)`` to Correction before the comparatively long P
+        exponentiation/store path.  The regular schedule immediately calls
+        :meth:`_materialize_softmax_p_impl`, preserving its prior behavior.
+        """
         del row_sum_out, correction_factor_out, no_correction_out
         cfg = self.cfg
         tidx = cute.arch.thread_idx()[0]
         num_compute_threads = cfg.num_compute_warps * cfg.threads_per_warp
         local_tidx = tidx % num_compute_threads
-        neg_inf = Float32(-Float32.inf)
         row_max_prev = row_max
         row_sum_prev = row_sum
         row_max_tile = row_max_new
 
-        group_exchange_base = Int32(softmax_group_id * num_compute_threads)
-        self.smem_exchange[group_exchange_base + local_tidx] = row_max_tile
-        prims.barrier_cta_sync(
-            cfg.softmax_sync_bar_id + softmax_group_id,
-            thread_count=cfg.softmax_sync_threads,
-        )
-        peer_idx = (local_tidx + 64) % num_compute_threads
-        row_max_tile = fmax_f32(
-            row_max_tile, self.smem_exchange[group_exchange_base + peer_idx]
-        )
-        # The exchange buffer is reused on the next KV iteration.  Keep every
-        # peer read ahead of any warp's next write to the same slot.
-        prims.barrier_cta_sync(
-            cfg.softmax_sync_bar_id + softmax_group_id,
-            thread_count=cfg.softmax_sync_threads,
-        )
+        if cutlass.const_expr(cfg.is_dynamic_token_sparse):
+            # Match source reduceWarpGrp2x2 exactly.  The M128 cta_group_2
+            # result is laid out as a 2x2 warp group, so W0 exchanges with W2
+            # and W1 with W3.  Each S pipeline stage owns a disjoint 128-float
+            # buffer.  Passing the barrier slot as a runtime Int32 is
+            # intentional: barrier.cta.sync accepts a register barrier ID.
+            stage_exchange_base = Int32(stage_info.stage_idx) * Int32(
+                num_compute_threads
+            )
+            warp_idx_local = local_tidx >> 5
+            row_idx = local_tidx % Int32(64)
+            col_idx = local_tidx >> 6
+            exchange_idx = stage_exchange_base + row_idx * Int32(2) + col_idx
+            peer_idx = stage_exchange_base + row_idx * Int32(2) + (col_idx ^ Int32(1))
+            self.smem_exchange[exchange_idx] = row_max_tile
+            pair_barrier_id = Int32(cfg.softmax_sync_bar_id) + (
+                warp_idx_local & Int32(1)
+            )
+            prims.barrier_cta_sync(
+                pair_barrier_id,
+                thread_count=cfg.softmax_sync_threads,
+            )
+            row_max_tile = fmax_f32(row_max_tile, self.smem_exchange[peer_idx])
+        else:
+            group_exchange_base = Int32(softmax_group_id * num_compute_threads)
+            self.smem_exchange[group_exchange_base + local_tidx] = row_max_tile
+            prims.barrier_cta_sync(
+                cfg.softmax_sync_bar_id + softmax_group_id,
+                thread_count=cfg.softmax_sync_threads,
+            )
+            peer_idx = (local_tidx + 64) % num_compute_threads
+            row_max_tile = fmax_f32(
+                row_max_tile, self.smem_exchange[group_exchange_base + peer_idx]
+            )
+            # The generic path uses one exchange buffer on consecutive KV
+            # iterations, so keep every peer read ahead of the next write.
+            prims.barrier_cta_sync(
+                cfg.softmax_sync_bar_id + softmax_group_id,
+                thread_count=cfg.softmax_sync_threads,
+            )
 
         if cutlass.const_expr(cfg.use_fp8_dual_softmax_schedule):
             stage_idx = stage_info.stage_idx
@@ -2247,35 +3461,203 @@ class TmemSResource(HighThroughputMlaResource):
                     row_max_prev, row_sum_prev = load_peer_state()
 
         row_max_new = fmax_f32(row_max_prev, row_max_tile)
+        if cutlass.const_expr(cfg.dsv4_enable_skip_correction):
+            # TRTLLM-gen pre-divides the user threshold by scaleSoftmaxLog2,
+            # then freezes a candidate row max whose raw-score increase fits
+            # inside that bound.  P can consequently grow by at most 2^T and
+            # the previous O accumulation needs no rescale for this row.
+            if self.adjusted_skip_corr_threshold > Float32(0):
+                max_increase = sub_ftz_f32(row_max_new, row_max_prev)
+                if max_increase <= self.adjusted_skip_corr_threshold:
+                    row_max_new = row_max_prev
+        return (
+            qk_acc_regs,
+            row_max_prev,
+            row_sum_prev,
+            row_sum_prev,
+            row_max_new,
+            Float32(0),
+            Int32(0),
+        )
+
+    @cute.jit
+    def _store_source_packed_p(self, stage_info: StageInfo, packed_p) -> None:
+        """Store the 16 delayed E4M3x4 registers in source's P layout."""
+        cfg = self.cfg
+        tidx = cute.arch.thread_idx()[0]
+        num_compute_threads = cfg.num_compute_warps * cfg.threads_per_warp
+        local_tidx = tidx % num_compute_threads
+        stage_idx = Int32(stage_info.loop_offset) & Int32(1)
+        stage_stride_elems = cutlass.const_expr(
+            cfg.mma_pv_tiler[0]
+            // cfg.num_mma_ctas
+            * cfg.mma_pv_tiler[2]
+            * cfg.iterations_pv_k
+        )
+        smem_p_base_bytes = (
+            self.smem_p.data_ptr().toint(Int32)
+            + stage_idx * stage_stride_elems * cfg.qkv_dtype_bytes
+        )
+        row = local_tidx % Int32(64)
+        warp_col = local_tidx // Int32(64)
+        xor_col = local_tidx % Int32(8)
+        for store_i in cutlass.range_constexpr(4):
+            smem_col = Int32(store_i) + warp_col * Int32(4)
+            swizzled_col = smem_col ^ xor_col
+            dst_addr = smem_p_base_bytes + row * Int32(128) + swizzled_col * Int32(16)
+            smem_ptr = cutlass.inttoptr(dst_addr, 3, Int32)
+            smem_ptr.store(packed_p.load(store_i * 4, 4), alignment=16)
+        # This is TmemP's first fence_view_async_shared.  The generated task
+        # has a second cfence + async-shared proxy fence only after S release,
+        # immediately before the global row-sum reduction.
+        cute.arch.fence_view_async_shared()
+
+    @cute.jit
+    def _materialize_softmax_p_impl(
+        self,
+        stage_info: StageInfo,
+        *,
+        qk_acc_regs,
+        row_max,
+        row_sum,
+        row_sum_out,
+        row_max_new,
+        correction_factor_out,
+        no_correction_out,
+    ):
+        """Apply online correction and exponentiate the current P tile."""
+        del row_sum_out, correction_factor_out, no_correction_out
+        cfg = self.cfg
+        if cutlass.const_expr(cfg.is_dynamic_token_sparse):
+            dsv4_sched_res_busy_xu64()
+        neg_inf = Float32(-Float32.inf)
+        if cutlass.const_expr(cfg.is_dynamic_token_sparse):
+            neg_inf = Float32(NEG_FLT_MAX)
+        row_max_prev = row_max
+        row_sum_prev = row_sum
         row_has_values = row_max_new != neg_inf
         safe_row_max_prev = row_max_prev if row_has_values else Float32(0)
         safe_row_max_new = row_max_new if row_has_values else Float32(0)
         # Exact max equality makes the correction scale exactly one. Keep that
         # lane on the identity value and avoid issuing exp2 altogether.
         max_changed = safe_row_max_prev != safe_row_max_new
+        max_diff = (
+            sub_ftz_f32(safe_row_max_prev, safe_row_max_new)
+            if cutlass.const_expr(cfg.is_dynamic_token_sparse)
+            else safe_row_max_prev - safe_row_max_new
+        )
         correction_factor = Float32(1)
-        if max_changed:
+        if cutlass.const_expr(cfg.is_dynamic_token_sparse):
+            # TmemSoftmaxGlobal evaluates exp2 only after its four-way local
+            # sum.  Carry max_diff through the existing task-local slot to
+            # preserve that program order.
+            correction_factor = max_diff
+        elif max_changed:
             correction_factor = cute.math.exp2(
-                (safe_row_max_prev - safe_row_max_new) * self.softmax_scale_log2,
+                max_diff * self.softmax_scale_log2,
                 fastmath=True,
             )
         no_correction = Int32(not max_changed)
 
         fma_b = self.softmax_scale_log2
-        fma_c = Float32(0) - safe_row_max_new * self.softmax_scale_log2
+        fma_bias = Float32(0)
         if cutlass.const_expr(cfg.is_fp8_qkv()):
-            # Match the 448-scaled E4M3 P convention used by the reference
-            # output and the 1CTA implementation.
-            fma_c = fma_c + fp8_log2_quant_scale()
-        for i in cutlass.range_constexpr(0, 64, 2):
-            fma_result = fma_packed_f32x2(
-                (qk_acc_regs[i], qk_acc_regs[i + 1]),
-                (fma_b, fma_b),
-                (fma_c, fma_c),
+            fma_bias = (
+                self.log2_softmax_p_scale
+                if cutlass.const_expr(cfg.is_dynamic_token_sparse)
+                else fp8_log2_quant_scale()
             )
-            qk_acc_regs[i] = cute.math.exp2(fma_result[0], fastmath=True)
-            qk_acc_regs[i + 1] = cute.math.exp2(fma_result[1], fastmath=True)
+        if cutlass.const_expr(cfg.is_dynamic_token_sparse):
+            # Source --use_fast_math contracts ``-max * scale + bias`` into
+            # one FFMA.FTZ before the scalar-prefetched first P pair.
+            fma_c = fnma_ftz_f32(safe_row_max_new, fma_b, fma_bias)
+        else:
+            fma_c = Float32(0) - safe_row_max_new * fma_b + fma_bias
+        if cutlass.const_expr(cfg.is_dynamic_token_sparse):
+            packed_p = cutlass.Array(
+                Int32,
+                16,
+                space=cutlass.AddressSpace.rmem,
+            )
+            # mNumPrefetchedFmas=4.  Source deliberately spells the first
+            # pair as scalar FMA to avoid later register-move lowering.  The
+            # generated C++ spells every subsequent pair as FMUL2+FADD2, but
+            # source ptxas contracts those 31 pairs to FFMA2 in final SASS.
+            qk_acc_regs[0] = fma_ftz_f32(fma_b, qk_acc_regs[0], fma_c)
+            qk_acc_regs[1] = fma_ftz_f32(fma_b, qk_acc_regs[1], fma_c)
+            if cutlass.const_expr(cfg.is_dynamic_token_sparse):
+                fma_result = affine2_contractible_f32(
+                    fma_b,
+                    fma_b,
+                    qk_acc_regs[2],
+                    qk_acc_regs[3],
+                    fma_c,
+                    fma_c,
+                )
+            else:
+                fma_result = ffma2(
+                    (fma_b, fma_b),
+                    (qk_acc_regs[2], qk_acc_regs[3]),
+                    (fma_c, fma_c),
+                )
+            qk_acc_regs[2] = fma_result[0]
+            qk_acc_regs[3] = fma_result[1]
 
+            for i in cutlass.range_constexpr(0, 64, 2):
+                # mNumDelayedCvtElts=12. Convert one E4M3x4 register before
+                # every other even MUFU after the twelve-element latency
+                # window; the final three conversions remain post-loop.
+                if cutlass.const_expr(i >= 12 and i % 4 == 0):
+                    cvt_offset = i - 12
+                    packed_p[cvt_offset // 4] = pack_float4_to_fp8_e4m3(
+                        qk_acc_regs[cvt_offset],
+                        qk_acc_regs[cvt_offset + 1],
+                        qk_acc_regs[cvt_offset + 2],
+                        qk_acc_regs[cvt_offset + 3],
+                    )
+                dsv4_code_fence()
+                qk_acc_regs[i] = cute.math.exp2(qk_acc_regs[i], fastmath=True)
+                if cutlass.const_expr(i + 4 < 64):
+                    fma_offset = i + 4
+                    if cutlass.const_expr(cfg.is_dynamic_token_sparse):
+                        fma_result = affine2_contractible_f32(
+                            fma_b,
+                            fma_b,
+                            qk_acc_regs[fma_offset],
+                            qk_acc_regs[fma_offset + 1],
+                            fma_c,
+                            fma_c,
+                        )
+                    else:
+                        fma_result = ffma2(
+                            (fma_b, fma_b),
+                            (
+                                qk_acc_regs[fma_offset],
+                                qk_acc_regs[fma_offset + 1],
+                            ),
+                            (fma_c, fma_c),
+                        )
+                    qk_acc_regs[fma_offset] = fma_result[0]
+                    qk_acc_regs[fma_offset + 1] = fma_result[1]
+                qk_acc_regs[i + 1] = cute.math.exp2(qk_acc_regs[i + 1], fastmath=True)
+            dsv4_code_fence()
+            for cvt_offset in cutlass.range_constexpr(52, 64, 4):
+                packed_p[cvt_offset // 4] = pack_float4_to_fp8_e4m3(
+                    qk_acc_regs[cvt_offset],
+                    qk_acc_regs[cvt_offset + 1],
+                    qk_acc_regs[cvt_offset + 2],
+                    qk_acc_regs[cvt_offset + 3],
+                )
+            self._store_source_packed_p(stage_info, packed_p)
+        else:
+            for i in cutlass.range_constexpr(0, 64, 2):
+                fma_result = fma_packed_f32x2(
+                    (qk_acc_regs[i], qk_acc_regs[i + 1]),
+                    (fma_b, fma_b),
+                    (fma_c, fma_c),
+                )
+                qk_acc_regs[i] = cute.math.exp2(fma_result[0], fastmath=True)
+                qk_acc_regs[i + 1] = cute.math.exp2(fma_result[1], fastmath=True)
         self.row_max_state = row_max_new
         return (
             qk_acc_regs,
@@ -2285,6 +3667,126 @@ class TmemSResource(HighThroughputMlaResource):
             row_max_new,
             correction_factor,
             no_correction,
+        )
+
+    @cute.jit
+    def _finish_softmax_impl(
+        self,
+        stage_info: StageInfo,
+        *,
+        qk_acc_regs,
+        row_max,
+        row_sum,
+        row_sum_out,
+        row_max_new,
+        correction_factor_out,
+        no_correction_out,
+        softmax_group_id: cutlass.Constexpr[int] = 0,
+    ):
+        """Finish row max and immediately materialize P (dense schedule)."""
+        (
+            qk_acc_regs,
+            row_max,
+            row_sum,
+            row_sum_out,
+            row_max_new,
+            correction_factor_out,
+            no_correction_out,
+        ) = self._finish_softmax_max_impl(
+            stage_info,
+            qk_acc_regs=qk_acc_regs,
+            row_max=row_max,
+            row_sum=row_sum,
+            row_sum_out=row_sum_out,
+            row_max_new=row_max_new,
+            correction_factor_out=correction_factor_out,
+            no_correction_out=no_correction_out,
+            softmax_group_id=softmax_group_id,
+        )
+        return self._materialize_softmax_p_impl(
+            stage_info,
+            qk_acc_regs=qk_acc_regs,
+            row_max=row_max,
+            row_sum=row_sum,
+            row_sum_out=row_sum_out,
+            row_max_new=row_max_new,
+            correction_factor_out=correction_factor_out,
+            no_correction_out=no_correction_out,
+        )
+
+    @consumer_work(
+        work_attrs=WorkAttr.AUXILIARY,
+        returns=(
+            qk_acc_regs,
+            row_max,
+            row_sum,
+            row_sum_out,
+            row_max_new,
+            correction_factor_out,
+            no_correction_out,
+        ),
+    )
+    @cute.jit
+    def finish_softmax_max(
+        self,
+        stage_info: StageInfo,
+        *,
+        qk_acc_regs,
+        row_max,
+        row_sum,
+        row_sum_out,
+        row_max_new,
+        correction_factor_out,
+        no_correction_out,
+    ):
+        """Publishable row-max phase for source DSV4 early correction."""
+        return self._finish_softmax_max_impl(
+            stage_info,
+            qk_acc_regs=qk_acc_regs,
+            row_max=row_max,
+            row_sum=row_sum,
+            row_sum_out=row_sum_out,
+            row_max_new=row_max_new,
+            correction_factor_out=correction_factor_out,
+            no_correction_out=no_correction_out,
+            softmax_group_id=0,
+        )
+
+    @consumer_work(
+        work_attrs=WorkAttr.AUXILIARY,
+        returns=(
+            qk_acc_regs,
+            row_max,
+            row_sum,
+            row_sum_out,
+            row_max_new,
+            correction_factor_out,
+            no_correction_out,
+        ),
+    )
+    @cute.jit
+    def materialize_softmax_p(
+        self,
+        stage_info: StageInfo,
+        *,
+        qk_acc_regs,
+        row_max,
+        row_sum,
+        row_sum_out,
+        row_max_new,
+        correction_factor_out,
+        no_correction_out,
+    ):
+        """Exponentiate P after the source early-correction commit."""
+        return self._materialize_softmax_p_impl(
+            stage_info,
+            qk_acc_regs=qk_acc_regs,
+            row_max=row_max,
+            row_sum=row_sum,
+            row_sum_out=row_sum_out,
+            row_max_new=row_max_new,
+            correction_factor_out=correction_factor_out,
+            no_correction_out=no_correction_out,
         )
 
     @consumer_work(
@@ -2387,13 +3889,12 @@ class SmemPResource(HighThroughputMlaResource):
     )
 
     @cute.jit
-    def _store_p_impl(self, stage_info: StageInfo, *, qk_acc_regs) -> None:
+    def _store_p_impl(self, stage_idx, *, qk_acc_regs) -> None:
         """Store softmax P tile to SMEM for PV MMA.
 
         Converts P values to FP16 and stores to SMEM with correct swizzle layout.
         """
         cfg = self.cfg
-        stage_idx = stage_info.stage_idx
         num_mma_ctas = cfg.num_mma_ctas
 
         tidx = cute.arch.thread_idx()[0]
@@ -2419,7 +3920,25 @@ class SmemPResource(HighThroughputMlaResource):
             + stage_idx * sp_stage_stride_elems * cfg.qkv_dtype_bytes
         )
 
-        if cutlass.const_expr(cfg.is_fp8_qkv()):
+        if cutlass.const_expr(
+            cfg.is_dynamic_token_sparse and cfg.mma_pv_tiler[2] == 128
+        ):
+            # TRTLLM-gen's ``storeWarpGrp2x2SmemP<1, 16>`` layout.  BMM2
+            # owns one K128 P partition; each W0--W3 thread stores four
+            # 16-B vectors into a 128-B S128B-swizzled row.
+            row = local_tidx % Int32(64)
+            warp_col = local_tidx // Int32(64)
+            xor_col = local_tidx % Int32(8)
+            for store_i in cutlass.range_constexpr(4):
+                smem_col = Int32(store_i) + warp_col * Int32(4)
+                swizzled_col = smem_col ^ xor_col
+                dst_addr = (
+                    smem_p_base_bytes + row * Int32(128) + swizzled_col * Int32(16)
+                )
+                vec = s_regs.load(store_i * 16, 16)
+                smem_ptr = cutlass.inttoptr(dst_addr, 3, qkv_element_dtype)
+                smem_ptr.store(vec, alignment=16)
+        elif cutlass.const_expr(cfg.is_fp8_qkv()):
             # FP8 P layout:
             # S<2,4,3> o ((64,32),1,2,(2,2)):((64,1),0,32,(4096,8192)).
             # Each universal SMEM copy is 128 bits, i.e. 16 E4M3 elements.
@@ -2504,18 +4023,29 @@ class SmemPResource(HighThroughputMlaResource):
     @cute.jit
     def store_p(self, stage_info: StageInfo, *, qk_acc_regs) -> None:
         """Store P from the even softmax group."""
-        self._store_p_impl(stage_info, qk_acc_regs=qk_acc_regs)
+        self._store_p_impl(stage_info.stage_idx, qk_acc_regs=qk_acc_regs)
 
     @producer_work
     @cute.jit
     def store_p_odd(self, stage_info: StageInfo, *, qk_acc_regs_odd) -> None:
         """Store P from the odd softmax group."""
-        self._store_p_impl(stage_info, qk_acc_regs=qk_acc_regs_odd)
+        self._store_p_impl(stage_info.stage_idx, qk_acc_regs=qk_acc_regs_odd)
 
-    @consumer_work(returns=desc_p_base)
+    @producer_work(work_attrs=WorkAttr.AUXILIARY)
     @cute.jit
-    def p_desc(self, stage_info: StageInfo):
-        """MMA warp builds P SMEM descriptor for PV MMA."""
+    def mark_p_source_pipelined_store(self, stage_info: StageInfo) -> None:
+        """Represent TmemS's fused packed-P store in the resource DAG.
+
+        The delayed-conversion schedule must keep ``regsP`` local to TmemS,
+        so the physical store happens inside ``materialize_softmax_p``.  This
+        zero-instruction work item retains the logical tmem_s -> smem_p edge
+        without adding a P mbarrier or duplicating the store.
+        """
+        del stage_info
+
+    @cute.jit
+    def _p_desc_at_stage(self, stage_idx):
+        """Build the PV descriptor for an explicit two-buffer P stage."""
         cfg = self.cfg
         sp_stage_stride_elems = cutlass.const_expr(
             cfg.mma_pv_tiler[0]
@@ -2523,8 +4053,8 @@ class SmemPResource(HighThroughputMlaResource):
             * cfg.mma_pv_tiler[2]
             * cfg.iterations_pv_k
         )
-        sp_ptr = self.smem_p.data_ptr(stage_info.stage_idx * sp_stage_stride_elems)
-        desc_p = Int64(
+        sp_ptr = self.smem_p.data_ptr(stage_idx * sp_stage_stride_elems)
+        return Int64(
             prims.Tcgen05SmemDesc.build(
                 start_address=sp_ptr.toint(Int32),
                 leading_byte_offset=p_desc_leading_byte_offset(cfg),
@@ -2532,7 +4062,29 @@ class SmemPResource(HighThroughputMlaResource):
                 layout=p_desc_layout(cfg),
             )
         )
-        return desc_p
+
+    @consumer_work(returns=desc_p_base)
+    @cute.jit
+    def p_desc(self, stage_info: StageInfo):
+        """MMA warp builds P SMEM descriptor for PV MMA."""
+        return self._p_desc_at_stage(stage_info.stage_idx)
+
+    @consumer_work(returns=desc_p_base)
+    @cute.jit
+    def p_desc_source_direct_prior(self, stage_info: StageInfo):
+        """Return P[(current K tile - 1) mod 2] for source W8 LOOP PV."""
+        return self._p_desc_at_stage(
+            (cutlass.Int32(stage_info.loop_offset) - cutlass.Int32(1))
+            & cutlass.Int32(1)
+        )
+
+    @consumer_work(returns=desc_p_base)
+    @cute.jit
+    def p_desc_source_direct_tail(self, stage_info: StageInfo):
+        """Return P[(final K tile) mod 2] for source W8 TAIL PV."""
+        return self._p_desc_at_stage(
+            cutlass.Int32(stage_info.loop_offset) & cutlass.Int32(1)
+        )
 
 
 # =====================================================================
@@ -2550,6 +4102,7 @@ class TmemCorrResource(HighThroughputMlaResource):
 
     tmem_base_addr: Any = None
     smem_exchange: Any = None
+    softmax_scale_log2: Any = None
     cfg: cutlass.Constexpr = field(default_factory=MlaDecodeConfig)
     cta_rank: Any = field(init=False, default=None)
     final_row_stats: Any = field(init=False, default=None)
@@ -2697,6 +4250,122 @@ class TmemCorrResource(HighThroughputMlaResource):
             arrive_peer=True,
         )
 
+    @cute.jit
+    def _store_source_stats_pair(
+        self,
+        stage_info: StageInfo,
+        *,
+        first,
+        second,
+    ) -> None:
+        """Store one generated-DSV4 two-float stats payload in TMEM."""
+        cfg = self.cfg
+        tidx = cute.arch.thread_idx()[0]
+        local_tidx = tidx % (cfg.num_compute_warps * cfg.threads_per_warp)
+        warp_id = local_tidx >> 5
+        # TmemSoftmaxLocal reserves one 32-column tcgen05 row per stage:
+        # [128,160) and [160,192) in the generated DSV4 kernel.
+        col_offset = cfg.correction_factor_offset + stage_info.stage_idx * 32
+        tmem_warp_row_id = self.tmem_base_addr + warp_id * TCGEN05_32B_REGS_PER_LOAD
+        tmem_raw_addr = (tmem_warp_row_id << 16) | col_offset
+        tmem_ptr = prims.make_tmem_ptr(tmem_raw_addr, Float32)
+        stats = cutlass.Array(Float32, 2, space=cutlass.AddressSpace.rmem)
+        stats[0] = first
+        stats[1] = second
+        prims.tcgen05_st(TCGEN05_32B_SHAPE, tmem_ptr, stats[0:2])
+        cute.arch.fence_view_async_tmem_store()
+
+    @producer_work
+    @cute.jit
+    def store_source_early(
+        self,
+        stage_info: StageInfo,
+        *,
+        row_max_old,
+        row_max_new,
+    ) -> None:
+        """Publish ``(old_max, new_max)`` before source DSV4 creates P."""
+        self._store_source_stats_pair(
+            stage_info,
+            first=row_max_old,
+            second=row_max_new,
+        )
+
+    @producer_work
+    @cute.jit
+    def store_source_final(
+        self,
+        stage_info: StageInfo,
+        *,
+        row_sum,
+        row_max,
+    ) -> None:
+        """Publish terminal ``(row_sum, row_max)`` after the final P tile."""
+        self._store_source_stats_pair(
+            stage_info,
+            first=row_sum,
+            second=row_max,
+        )
+
+    @consumer_work
+    @cute.jit
+    def consume_source_head(self, stage_info: StageInfo) -> None:
+        """Advance over early[0], for which no previous O tile exists."""
+        pass
+
+    @consumer_work(returns=(row_sum, row_max, correction_factor, no_correction))
+    @cute.jit
+    def load_source_early(self, stage_info: StageInfo):
+        """Load an early max pair and compute source's O rescale factor."""
+        cfg = self.cfg
+        tidx = cute.arch.thread_idx()[0]
+        local_tidx = tidx % (cfg.num_compute_warps * cfg.threads_per_warp)
+        warp_id = local_tidx >> 5
+        col_offset = cfg.correction_factor_offset + stage_info.stage_idx * 32
+        tmem_warp_row_id = self.tmem_base_addr + warp_id * TCGEN05_32B_REGS_PER_LOAD
+        tmem_raw_addr = (tmem_warp_row_id << 16) | col_offset
+        tmem_ptr = prims.make_tmem_ptr(tmem_raw_addr, Float32)
+        prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
+        loaded = prims.tcgen05_ld(TCGEN05_32B_SHAPE, tmem_ptr, num=2)
+        cute.arch.fence_view_async_tmem_load()
+
+        max_changed = loaded[0] != loaded[1]
+        max_diff = sub_ftz_f32(loaded[0], loaded[1]) if max_changed else Float32(0)
+        correction_factor = Float32(1)
+        no_correction = Int32(0)
+        if cutlass.const_expr(cfg.dsv4_enable_skip_correction):
+            no_correction = Int32(not max_changed)
+            if max_changed:
+                correction_factor = cute.math.exp2(
+                    mul_ftz_f32(max_diff, self.softmax_scale_log2),
+                    fastmath=True,
+                )
+        else:
+            correction_factor = cute.math.exp2(
+                mul_ftz_f32(max_diff, self.softmax_scale_log2),
+                fastmath=True,
+            )
+        return Float32(0), loaded[1], correction_factor, no_correction
+
+    @consumer_work(returns=(row_sum, row_max, correction_factor, no_correction))
+    @cute.jit
+    def load_source_final(self, stage_info: StageInfo):
+        """Load the terminal sum/max pair used by the output epilogue."""
+        cfg = self.cfg
+        tidx = cute.arch.thread_idx()[0]
+        local_tidx = tidx % (cfg.num_compute_warps * cfg.threads_per_warp)
+        warp_id = local_tidx >> 5
+        col_offset = cfg.correction_factor_offset + stage_info.stage_idx * 32
+        tmem_warp_row_id = self.tmem_base_addr + warp_id * TCGEN05_32B_REGS_PER_LOAD
+        tmem_raw_addr = (tmem_warp_row_id << 16) | col_offset
+        tmem_ptr = prims.make_tmem_ptr(tmem_raw_addr, Float32)
+        prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
+        loaded = prims.tcgen05_ld(TCGEN05_32B_SHAPE, tmem_ptr, num=2)
+        cute.arch.fence_view_async_tmem_load()
+        self.final_row_stats[0] = loaded[0]
+        self.final_row_stats[1] = loaded[1]
+        return loaded[0], loaded[1], Float32(1), Int32(1)
+
     @consumer_work(returns=(row_sum, row_max, correction_factor, no_correction))
     @cute.jit
     def load_corr(self, stage_info: StageInfo):
@@ -2759,7 +4428,11 @@ class TmemCorrResource(HighThroughputMlaResource):
             3,
             Float32,
         )
-        row_sum = row_sum + peer_ptr.load()
+        row_sum = (
+            add_ftz_f32(row_sum, peer_ptr.load())
+            if cutlass.const_expr(cfg.is_dynamic_token_sparse)
+            else row_sum + peer_ptr.load()
+        )
         prims.barrier_cta_sync(
             cfg.epilogue_sync_bar_id, thread_count=cfg.epilogue_sync_threads
         )
@@ -2978,11 +4651,38 @@ class TmemOResource(HighThroughputMlaResource):
                     chunk = prims.tcgen05_ld(
                         t2r_shape, tmem_ptr, num=TCGEN05_32B_REGS_PER_LOAD
                     )
-                    scaled = chunk * cutlass.full_like(chunk, correction_factor)
+                    if cutlass.const_expr(cfg.is_dynamic_token_sparse):
+                        scaled = cutlass.Array(
+                            Float32,
+                            TCGEN05_32B_REGS_PER_LOAD,
+                            space=cutlass.AddressSpace.rmem,
+                        )
+                        for pair in cutlass.range_constexpr(
+                            0, TCGEN05_32B_REGS_PER_LOAD, 2
+                        ):
+                            dsv4_warp_switch()
+                            scaled_pair = mul_packed_f32x2(
+                                (chunk[pair], chunk[pair + 1]),
+                                (correction_factor, correction_factor),
+                            )
+                            scaled[pair] = scaled_pair[0]
+                            scaled[pair + 1] = scaled_pair[1]
+                        scaled = scaled.load(0, TCGEN05_32B_REGS_PER_LOAD)
+                    else:
+                        scaled = chunk * cutlass.full_like(chunk, correction_factor)
                     prims.tcgen05_st(t2r_shape, tmem_ptr, scaled)
 
-        prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
-        cute.arch.fence_view_async_tmem_store()
+            if cutlass.const_expr(cfg.dsv4_fuses_inv_rope_fp8_quant):
+                # The fence wrapper is itself one tcgen05.wait::st.  Match the
+                # generated DSV4 correction path: complete issued stores once,
+                # and do no TMEM completion work when correction was skipped.
+                cute.arch.fence_view_async_tmem_store()
+
+        if cutlass.const_expr(not cfg.dsv4_fuses_inv_rope_fp8_quant):
+            # Preserve the existing completion protocol outside RopeQuant;
+            # F-150 is intentionally limited to its source-equivalent path.
+            prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
+            cute.arch.fence_view_async_tmem_store()
 
     @consumer_work
     @cute.jit
@@ -3020,7 +4720,25 @@ class TmemOResource(HighThroughputMlaResource):
                 chunk = prims.tcgen05_ld(
                     t2r_shape, tmem_ptr, num=TCGEN05_32B_REGS_PER_LOAD
                 )
-                scaled = chunk * cutlass.full_like(chunk, correction_factor)
+                if cutlass.const_expr(cfg.is_dynamic_token_sparse):
+                    scaled = cutlass.Array(
+                        Float32,
+                        TCGEN05_32B_REGS_PER_LOAD,
+                        space=cutlass.AddressSpace.rmem,
+                    )
+                    for pair in cutlass.range_constexpr(
+                        0, TCGEN05_32B_REGS_PER_LOAD, 2
+                    ):
+                        dsv4_warp_switch()
+                        scaled_pair = mul_packed_f32x2(
+                            (chunk[pair], chunk[pair + 1]),
+                            (correction_factor, correction_factor),
+                        )
+                        scaled[pair] = scaled_pair[0]
+                        scaled[pair + 1] = scaled_pair[1]
+                    scaled = scaled.load(0, TCGEN05_32B_REGS_PER_LOAD)
+                else:
+                    scaled = chunk * cutlass.full_like(chunk, correction_factor)
                 prims.tcgen05_st(t2r_shape, tmem_ptr, scaled)
 
         prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
@@ -3037,6 +4755,9 @@ class GmemOResource(HighThroughputMlaResource):
     """GMEM output.  Producer: Correction (epilogue store).  No pipeline."""
 
     output: Any = None
+    dsv4_inv_rope_cos_sin_cache: Any = None
+    dsv4_o_scale: Any = None
+    cache_seqs: Any = None
     partial_output: Any = None
     lse: Any = None
     partial_lse: Any = None
@@ -3044,11 +4765,13 @@ class GmemOResource(HighThroughputMlaResource):
     tmem_corr_ref: Any = None  # Reference to TmemCorrResource for correction data
     output_scale: Any = None
     softmax_scale_log2: Any = None
+    softmax_p_scale_rcp: Any = None
     smem_exchange: Any = None  # SMEM for row_sum exchange (as Int32 base addr)
     split_kv: Any = None
     cu_seqlens_q: Any = None
     logical_num_heads_q: cutlass.Constexpr[int] = 128
     logical_seq_len_q: cutlass.Constexpr[int] = 1
+    stores_lse: cutlass.Constexpr[bool] = True
     cfg: cutlass.Constexpr = field(default_factory=MlaDecodeConfig)
 
     @cute.jit
@@ -3106,7 +4829,11 @@ class GmemOResource(HighThroughputMlaResource):
             3,
             Float32,
         )
-        row_sum = row_sum + peer_ptr.load()
+        row_sum = (
+            add_ftz_f32(row_sum, peer_ptr.load())
+            if cutlass.const_expr(cfg.is_dynamic_token_sparse)
+            else row_sum + peer_ptr.load()
+        )
         prims.barrier_cta_sync(
             cfg.epilogue_sync_bar_id, thread_count=cfg.epilogue_sync_threads
         )
@@ -3142,16 +4869,49 @@ class GmemOResource(HighThroughputMlaResource):
             storage_flat_query_row,
             logical_head_idx,
             logical_q_idx,
-            _,
+            storage_q_idx,
             query_is_valid,
         ) = self._query_row_state(row_in_tile, seq_q_idx, batch_idx)
+
+        if cutlass.const_expr(cfg.dsv4_fuses_inv_rope_fp8_quant):
+            # Resolve the inverse-RoPE cache row before the TMEM loads, as
+            # TRTLLM-gen does at its output-task start.  Computing it inside
+            # the D384 store branch put three dependent global loads
+            # (cu_seqlens x2, cache_seqs) plus the first cos/sin miss on the
+            # exposed epilogue path; short generation work tiles cannot hide
+            # that behind other work.  The row is CTA-uniform (one query
+            # token per work tile), so two L1 lines cover every thread.
+            # Padded rows keep a clamped in-range query index; prefetch of a
+            # stale row never faults and the loads stay under query_is_valid.
+            _, rope_query_len = query_batch_bounds(
+                self.cu_seqlens_q,
+                batch_idx,
+                self.logical_seq_len_q,
+            )
+            rope_position = (
+                Int32(self.cache_seqs[batch_idx])
+                - Int32(rope_query_len)
+                + Int32(logical_q_idx)
+            )
+            rope_cos_sin_addr = (
+                self.dsv4_inv_rope_cos_sin_cache.iterator.raw_ptr()
+                + Int64(rope_position) * Int64(64)
+            ).toint(Int64)
+            if g_j == Int32(128):
+                prefetch_global_l1(rope_cos_sin_addr)
+                prefetch_global_l1(rope_cos_sin_addr + Int64(128))
 
         # Fully masked split rows can occur when physical tail rows or earlier
         # causal query rows have no visible K values in this split. Store zero
         # O and -inf LSE so split-KV reduction gives those rows zero weight.
         row_has_values = row_sum > Float32(0)
         safe_row_sum = row_sum if row_has_values else Float32(1)
-        norm_scale = self.output_scale * cute.math.rcp(safe_row_sum, approx=True)
+        row_sum_rcp = cute.math.rcp(safe_row_sum, approx=True)
+        norm_scale = (
+            mul_ftz_f32(self.output_scale, row_sum_rcp)
+            if cutlass.const_expr(cfg.is_dynamic_token_sparse)
+            else self.output_scale * row_sum_rcp
+        )
 
         for iter_n in cutlass.range_constexpr(cfg.iterations_pv_n):
             # Load O from TMEM
@@ -3159,26 +4919,444 @@ class GmemOResource(HighThroughputMlaResource):
             tmem_raw_addr_n = tmem_raw_addr + (
                 iter_n * (cfg.mma_pv_tiler[1] // cfg.warps_in_n)
             )
-            for load_idx in cutlass.range_constexpr(num_tmem_loads):
-                curr_addr = tmem_raw_addr_n + load_idx * TCGEN05_32B_REGS_PER_LOAD
-                tmem_ptr = prims.make_tmem_ptr(curr_addr, Float32)
-                loaded = prims.tcgen05_ld(
-                    t2r_shape, tmem_ptr, num=TCGEN05_32B_REGS_PER_LOAD
-                )
-                qk_acc_regs.store(loaded, load_idx * TCGEN05_32B_REGS_PER_LOAD)
+            # The RopeQuant D384 stage loads the upper half [64:128] first
+            # and rotates it while only 64 accumulators are live.  With all
+            # 128 loaded, the correction warps' 144-register budget leaves no
+            # room to keep cos/sin loads in flight (F-152 attempt01 spilled).
+            rope_stage = cutlass.const_expr(
+                cfg.dsv4_fuses_inv_rope_fp8_quant and iter_n == 1
+            )
+            load_halves = ((2, 3), (0, 1)) if rope_stage else ((0, 1, 2, 3),)
+            for half_idx in cutlass.range_constexpr(len(load_halves)):
+                half = load_halves[half_idx]
+                for chunk_idx in cutlass.range_constexpr(len(half)):
+                    load_idx = half[chunk_idx]
+                    curr_addr = tmem_raw_addr_n + load_idx * TCGEN05_32B_REGS_PER_LOAD
+                    tmem_ptr = prims.make_tmem_ptr(curr_addr, Float32)
+                    loaded = prims.tcgen05_ld(
+                        t2r_shape, tmem_ptr, num=TCGEN05_32B_REGS_PER_LOAD
+                    )
+                    qk_acc_regs.store(loaded, load_idx * TCGEN05_32B_REGS_PER_LOAD)
 
-            # Normalize: O = O * output_scale / row_sum
-            for i in cutlass.range_constexpr(0, 128, 2):
-                scaled = mul_packed_f32x2(
-                    (qk_acc_regs[i], qk_acc_regs[i + 1]),
-                    (norm_scale, norm_scale),
-                )
-                qk_acc_regs[i] = scaled[0]
-                qk_acc_regs[i + 1] = scaled[1]
+                # Normalize: O = O * output_scale / row_sum
+                for chunk_idx in cutlass.range_constexpr(len(half)):
+                    chunk_base = half[chunk_idx] * TCGEN05_32B_REGS_PER_LOAD
+                    for i in cutlass.range_constexpr(
+                        chunk_base, chunk_base + TCGEN05_32B_REGS_PER_LOAD, 2
+                    ):
+                        if cutlass.const_expr(cfg.is_dynamic_token_sparse):
+                            dsv4_warp_switch()
+                        scaled = mul_packed_f32x2(
+                            (qk_acc_regs[i], qk_acc_regs[i + 1]),
+                            (norm_scale, norm_scale),
+                        )
+                        qk_acc_regs[i] = scaled[0]
+                        qk_acc_regs[i + 1] = scaled[1]
+
+                if cutlass.const_expr(rope_stage and half_idx == 0):
+                    # DSv4 inverse RoPE covers D[448:512], the upper half of
+                    # the D384 quant block (g_j == 128 in this stage); D256
+                    # rows pass through.  Cache row layout is [cos(32),
+                    # sin(32)].  Two batches of 16 pairs: eight 128-bit loads
+                    # (four cos, four sin) are issued together, then 16
+                    # rotations consume them, so the row costs two round trips
+                    # instead of 64 dependent scalar loads (F-152).  Loads and
+                    # the F-141 FMA rounding tree share one warp-uniform guard;
+                    # scalars are staged around the branch (F-145) so the
+                    # frontend joins scalars rather than an Array.  Invalid
+                    # padded rows are never stored, so the guard only has to
+                    # keep their loads out.
+                    for rope_batch_idx in cutlass.range_constexpr(2):
+                        value_base = 64 + rope_batch_idx * 32
+                        first_0 = qk_acc_regs[value_base + 0]
+                        second_0 = qk_acc_regs[value_base + 1]
+                        first_1 = qk_acc_regs[value_base + 2]
+                        second_1 = qk_acc_regs[value_base + 3]
+                        first_2 = qk_acc_regs[value_base + 4]
+                        second_2 = qk_acc_regs[value_base + 5]
+                        first_3 = qk_acc_regs[value_base + 6]
+                        second_3 = qk_acc_regs[value_base + 7]
+                        first_4 = qk_acc_regs[value_base + 8]
+                        second_4 = qk_acc_regs[value_base + 9]
+                        first_5 = qk_acc_regs[value_base + 10]
+                        second_5 = qk_acc_regs[value_base + 11]
+                        first_6 = qk_acc_regs[value_base + 12]
+                        second_6 = qk_acc_regs[value_base + 13]
+                        first_7 = qk_acc_regs[value_base + 14]
+                        second_7 = qk_acc_regs[value_base + 15]
+                        first_8 = qk_acc_regs[value_base + 16]
+                        second_8 = qk_acc_regs[value_base + 17]
+                        first_9 = qk_acc_regs[value_base + 18]
+                        second_9 = qk_acc_regs[value_base + 19]
+                        first_10 = qk_acc_regs[value_base + 20]
+                        second_10 = qk_acc_regs[value_base + 21]
+                        first_11 = qk_acc_regs[value_base + 22]
+                        second_11 = qk_acc_regs[value_base + 23]
+                        first_12 = qk_acc_regs[value_base + 24]
+                        second_12 = qk_acc_regs[value_base + 25]
+                        first_13 = qk_acc_regs[value_base + 26]
+                        second_13 = qk_acc_regs[value_base + 27]
+                        first_14 = qk_acc_regs[value_base + 28]
+                        second_14 = qk_acc_regs[value_base + 29]
+                        first_15 = qk_acc_regs[value_base + 30]
+                        second_15 = qk_acc_regs[value_base + 31]
+                        rotated_first_0 = first_0
+                        rotated_second_0 = second_0
+                        rotated_first_1 = first_1
+                        rotated_second_1 = second_1
+                        rotated_first_2 = first_2
+                        rotated_second_2 = second_2
+                        rotated_first_3 = first_3
+                        rotated_second_3 = second_3
+                        rotated_first_4 = first_4
+                        rotated_second_4 = second_4
+                        rotated_first_5 = first_5
+                        rotated_second_5 = second_5
+                        rotated_first_6 = first_6
+                        rotated_second_6 = second_6
+                        rotated_first_7 = first_7
+                        rotated_second_7 = second_7
+                        rotated_first_8 = first_8
+                        rotated_second_8 = second_8
+                        rotated_first_9 = first_9
+                        rotated_second_9 = second_9
+                        rotated_first_10 = first_10
+                        rotated_second_10 = second_10
+                        rotated_first_11 = first_11
+                        rotated_second_11 = second_11
+                        rotated_first_12 = first_12
+                        rotated_second_12 = second_12
+                        rotated_first_13 = first_13
+                        rotated_second_13 = second_13
+                        rotated_first_14 = first_14
+                        rotated_second_14 = second_14
+                        rotated_first_15 = first_15
+                        rotated_second_15 = second_15
+                        if (
+                            row_in_tile < physical_tile_rows
+                            and query_is_valid
+                            and g_j == Int32(128)
+                        ):
+                            batch_addr = rope_cos_sin_addr + Int64(rope_batch_idx * 64)
+                            cos_0, cos_1, cos_2, cos_3 = ld_global_v4_f32(
+                                batch_addr + Int64(0)
+                            )
+                            cos_4, cos_5, cos_6, cos_7 = ld_global_v4_f32(
+                                batch_addr + Int64(16)
+                            )
+                            cos_8, cos_9, cos_10, cos_11 = ld_global_v4_f32(
+                                batch_addr + Int64(32)
+                            )
+                            cos_12, cos_13, cos_14, cos_15 = ld_global_v4_f32(
+                                batch_addr + Int64(48)
+                            )
+                            sin_0, sin_1, sin_2, sin_3 = ld_global_v4_f32(
+                                batch_addr + Int64(128)
+                            )
+                            sin_4, sin_5, sin_6, sin_7 = ld_global_v4_f32(
+                                batch_addr + Int64(144)
+                            )
+                            sin_8, sin_9, sin_10, sin_11 = ld_global_v4_f32(
+                                batch_addr + Int64(160)
+                            )
+                            sin_12, sin_13, sin_14, sin_15 = ld_global_v4_f32(
+                                batch_addr + Int64(176)
+                            )
+                            sin_prod_0 = mul_packed_f32x2(
+                                (second_0, first_0), (sin_0, sin_0), ftz=True
+                            )
+                            rotated_0 = fma_packed_f32x2(
+                                (first_0, second_0),
+                                (cos_0, cos_0),
+                                (sin_prod_0[0], -sin_prod_0[1]),
+                                ftz=True,
+                            )
+                            rotated_first_0 = rotated_0[0]
+                            rotated_second_0 = rotated_0[1]
+                            sin_prod_1 = mul_packed_f32x2(
+                                (second_1, first_1), (sin_1, sin_1), ftz=True
+                            )
+                            rotated_1 = fma_packed_f32x2(
+                                (first_1, second_1),
+                                (cos_1, cos_1),
+                                (sin_prod_1[0], -sin_prod_1[1]),
+                                ftz=True,
+                            )
+                            rotated_first_1 = rotated_1[0]
+                            rotated_second_1 = rotated_1[1]
+                            sin_prod_2 = mul_packed_f32x2(
+                                (second_2, first_2), (sin_2, sin_2), ftz=True
+                            )
+                            rotated_2 = fma_packed_f32x2(
+                                (first_2, second_2),
+                                (cos_2, cos_2),
+                                (sin_prod_2[0], -sin_prod_2[1]),
+                                ftz=True,
+                            )
+                            rotated_first_2 = rotated_2[0]
+                            rotated_second_2 = rotated_2[1]
+                            sin_prod_3 = mul_packed_f32x2(
+                                (second_3, first_3), (sin_3, sin_3), ftz=True
+                            )
+                            rotated_3 = fma_packed_f32x2(
+                                (first_3, second_3),
+                                (cos_3, cos_3),
+                                (sin_prod_3[0], -sin_prod_3[1]),
+                                ftz=True,
+                            )
+                            rotated_first_3 = rotated_3[0]
+                            rotated_second_3 = rotated_3[1]
+                            sin_prod_4 = mul_packed_f32x2(
+                                (second_4, first_4), (sin_4, sin_4), ftz=True
+                            )
+                            rotated_4 = fma_packed_f32x2(
+                                (first_4, second_4),
+                                (cos_4, cos_4),
+                                (sin_prod_4[0], -sin_prod_4[1]),
+                                ftz=True,
+                            )
+                            rotated_first_4 = rotated_4[0]
+                            rotated_second_4 = rotated_4[1]
+                            sin_prod_5 = mul_packed_f32x2(
+                                (second_5, first_5), (sin_5, sin_5), ftz=True
+                            )
+                            rotated_5 = fma_packed_f32x2(
+                                (first_5, second_5),
+                                (cos_5, cos_5),
+                                (sin_prod_5[0], -sin_prod_5[1]),
+                                ftz=True,
+                            )
+                            rotated_first_5 = rotated_5[0]
+                            rotated_second_5 = rotated_5[1]
+                            sin_prod_6 = mul_packed_f32x2(
+                                (second_6, first_6), (sin_6, sin_6), ftz=True
+                            )
+                            rotated_6 = fma_packed_f32x2(
+                                (first_6, second_6),
+                                (cos_6, cos_6),
+                                (sin_prod_6[0], -sin_prod_6[1]),
+                                ftz=True,
+                            )
+                            rotated_first_6 = rotated_6[0]
+                            rotated_second_6 = rotated_6[1]
+                            sin_prod_7 = mul_packed_f32x2(
+                                (second_7, first_7), (sin_7, sin_7), ftz=True
+                            )
+                            rotated_7 = fma_packed_f32x2(
+                                (first_7, second_7),
+                                (cos_7, cos_7),
+                                (sin_prod_7[0], -sin_prod_7[1]),
+                                ftz=True,
+                            )
+                            rotated_first_7 = rotated_7[0]
+                            rotated_second_7 = rotated_7[1]
+                            sin_prod_8 = mul_packed_f32x2(
+                                (second_8, first_8), (sin_8, sin_8), ftz=True
+                            )
+                            rotated_8 = fma_packed_f32x2(
+                                (first_8, second_8),
+                                (cos_8, cos_8),
+                                (sin_prod_8[0], -sin_prod_8[1]),
+                                ftz=True,
+                            )
+                            rotated_first_8 = rotated_8[0]
+                            rotated_second_8 = rotated_8[1]
+                            sin_prod_9 = mul_packed_f32x2(
+                                (second_9, first_9), (sin_9, sin_9), ftz=True
+                            )
+                            rotated_9 = fma_packed_f32x2(
+                                (first_9, second_9),
+                                (cos_9, cos_9),
+                                (sin_prod_9[0], -sin_prod_9[1]),
+                                ftz=True,
+                            )
+                            rotated_first_9 = rotated_9[0]
+                            rotated_second_9 = rotated_9[1]
+                            sin_prod_10 = mul_packed_f32x2(
+                                (second_10, first_10), (sin_10, sin_10), ftz=True
+                            )
+                            rotated_10 = fma_packed_f32x2(
+                                (first_10, second_10),
+                                (cos_10, cos_10),
+                                (sin_prod_10[0], -sin_prod_10[1]),
+                                ftz=True,
+                            )
+                            rotated_first_10 = rotated_10[0]
+                            rotated_second_10 = rotated_10[1]
+                            sin_prod_11 = mul_packed_f32x2(
+                                (second_11, first_11), (sin_11, sin_11), ftz=True
+                            )
+                            rotated_11 = fma_packed_f32x2(
+                                (first_11, second_11),
+                                (cos_11, cos_11),
+                                (sin_prod_11[0], -sin_prod_11[1]),
+                                ftz=True,
+                            )
+                            rotated_first_11 = rotated_11[0]
+                            rotated_second_11 = rotated_11[1]
+                            sin_prod_12 = mul_packed_f32x2(
+                                (second_12, first_12), (sin_12, sin_12), ftz=True
+                            )
+                            rotated_12 = fma_packed_f32x2(
+                                (first_12, second_12),
+                                (cos_12, cos_12),
+                                (sin_prod_12[0], -sin_prod_12[1]),
+                                ftz=True,
+                            )
+                            rotated_first_12 = rotated_12[0]
+                            rotated_second_12 = rotated_12[1]
+                            sin_prod_13 = mul_packed_f32x2(
+                                (second_13, first_13), (sin_13, sin_13), ftz=True
+                            )
+                            rotated_13 = fma_packed_f32x2(
+                                (first_13, second_13),
+                                (cos_13, cos_13),
+                                (sin_prod_13[0], -sin_prod_13[1]),
+                                ftz=True,
+                            )
+                            rotated_first_13 = rotated_13[0]
+                            rotated_second_13 = rotated_13[1]
+                            sin_prod_14 = mul_packed_f32x2(
+                                (second_14, first_14), (sin_14, sin_14), ftz=True
+                            )
+                            rotated_14 = fma_packed_f32x2(
+                                (first_14, second_14),
+                                (cos_14, cos_14),
+                                (sin_prod_14[0], -sin_prod_14[1]),
+                                ftz=True,
+                            )
+                            rotated_first_14 = rotated_14[0]
+                            rotated_second_14 = rotated_14[1]
+                            sin_prod_15 = mul_packed_f32x2(
+                                (second_15, first_15), (sin_15, sin_15), ftz=True
+                            )
+                            rotated_15 = fma_packed_f32x2(
+                                (first_15, second_15),
+                                (cos_15, cos_15),
+                                (sin_prod_15[0], -sin_prod_15[1]),
+                                ftz=True,
+                            )
+                            rotated_first_15 = rotated_15[0]
+                            rotated_second_15 = rotated_15[1]
+                        qk_acc_regs[value_base + 0] = rotated_first_0
+                        qk_acc_regs[value_base + 1] = rotated_second_0
+                        qk_acc_regs[value_base + 2] = rotated_first_1
+                        qk_acc_regs[value_base + 3] = rotated_second_1
+                        qk_acc_regs[value_base + 4] = rotated_first_2
+                        qk_acc_regs[value_base + 5] = rotated_second_2
+                        qk_acc_regs[value_base + 6] = rotated_first_3
+                        qk_acc_regs[value_base + 7] = rotated_second_3
+                        qk_acc_regs[value_base + 8] = rotated_first_4
+                        qk_acc_regs[value_base + 9] = rotated_second_4
+                        qk_acc_regs[value_base + 10] = rotated_first_5
+                        qk_acc_regs[value_base + 11] = rotated_second_5
+                        qk_acc_regs[value_base + 12] = rotated_first_6
+                        qk_acc_regs[value_base + 13] = rotated_second_6
+                        qk_acc_regs[value_base + 14] = rotated_first_7
+                        qk_acc_regs[value_base + 15] = rotated_second_7
+                        qk_acc_regs[value_base + 16] = rotated_first_8
+                        qk_acc_regs[value_base + 17] = rotated_second_8
+                        qk_acc_regs[value_base + 18] = rotated_first_9
+                        qk_acc_regs[value_base + 19] = rotated_second_9
+                        qk_acc_regs[value_base + 20] = rotated_first_10
+                        qk_acc_regs[value_base + 21] = rotated_second_10
+                        qk_acc_regs[value_base + 22] = rotated_first_11
+                        qk_acc_regs[value_base + 23] = rotated_second_11
+                        qk_acc_regs[value_base + 24] = rotated_first_12
+                        qk_acc_regs[value_base + 25] = rotated_second_12
+                        qk_acc_regs[value_base + 26] = rotated_first_13
+                        qk_acc_regs[value_base + 27] = rotated_second_13
+                        qk_acc_regs[value_base + 28] = rotated_first_14
+                        qk_acc_regs[value_base + 29] = rotated_second_14
+                        qk_acc_regs[value_base + 30] = rotated_first_15
+                        qk_acc_regs[value_base + 31] = rotated_second_15
 
             # Store O to GMEM
             if row_in_tile < physical_tile_rows and query_is_valid:
-                if cutlass.const_expr(self.partial_output is not None):
+                if cutlass.const_expr(cfg.dsv4_fuses_inv_rope_fp8_quant):
+                    # Source physical output layout: [H/8, T, 8, D].
+                    total_q = Int64(cute.size(self.output)) // Int64(
+                        self.logical_num_heads_q * D
+                    )
+                    group_idx = Int64(logical_head_idx >> Int32(3))
+                    head_idx_in_group = Int64(logical_head_idx & Int32(7))
+                    head_dim_offset = Int32(iter_n * tile_d) + Int32(g_j)
+                    quant_block_idx = Int64(head_dim_offset >> Int32(7))
+                    max0 = Float32(1.0e-12)
+                    max1 = Float32(1.0e-12)
+                    for reduce_idx in cutlass.range_constexpr(32):
+                        value_idx = reduce_idx * 4
+                        max0 = max3_abs_ftz_f32(
+                            max0,
+                            qk_acc_regs[value_idx],
+                            qk_acc_regs[value_idx + 1],
+                        )
+                        max1 = max3_abs_ftz_f32(
+                            max1,
+                            qk_acc_regs[value_idx + 2],
+                            qk_acc_regs[value_idx + 3],
+                        )
+                    amax = max3_abs_ftz_f32(
+                        max0,
+                        max1,
+                        Float32(1.0e-12),
+                    )
+                    scale_buf_m = (total_q + Int64(3)) & Int64(-4)
+                    scale_offset = (
+                        group_idx * Int64(32) * scale_buf_m
+                        + (head_idx_in_group * Int64(4) + quant_block_idx) * scale_buf_m
+                        + Int64(storage_q_idx)
+                    )
+                    dequant_scale = amax * Float32(1.0 / 448.0)
+                    inv_scale = rcp_approx_ftz_f32(amax) * Float32(448.0)
+                    (self.dsv4_o_scale.iterator.raw_ptr() + scale_offset).store(
+                        dequant_scale
+                    )
+                    fp8_output_offset = (
+                        group_idx * total_q * Int64(8 * D)
+                        + Int64(storage_q_idx) * Int64(8 * D)
+                        + head_idx_in_group * Int64(D)
+                        + Int64(head_dim_offset)
+                    )
+                    output_base = self.output.iterator.raw_ptr() + fp8_output_offset
+                    for load_idx in cutlass.range_constexpr(num_tmem_loads):
+                        offset = load_idx * TCGEN05_32B_REGS_PER_LOAD
+                        vec_f32 = qk_acc_regs.load(offset, TCGEN05_32B_REGS_PER_LOAD)
+                        packed_o = cutlass.Array(
+                            Int32,
+                            PACKED_FP8_OUTPUT_REGS * 2,
+                            space=cutlass.AddressSpace.rmem,
+                        )
+                        for pack_idx in cutlass.range_constexpr(
+                            PACKED_FP8_OUTPUT_REGS * 2
+                        ):
+                            pack_offset = pack_idx * 4
+                            # Packed RN multiplies halve the issue slots of
+                            # the scale step; per lane they are the same
+                            # mul.rn.f32 as the scalar form (F-153).
+                            scaled_lo = mul_packed_f32x2(
+                                (vec_f32[pack_offset], vec_f32[pack_offset + 1]),
+                                (inv_scale, inv_scale),
+                            )
+                            scaled_hi = mul_packed_f32x2(
+                                (vec_f32[pack_offset + 2], vec_f32[pack_offset + 3]),
+                                (inv_scale, inv_scale),
+                            )
+                            packed_o[pack_idx] = pack_float4_to_fp8_e4m3(
+                                scaled_lo[0], scaled_lo[1], scaled_hi[0], scaled_hi[1]
+                            )
+                        raw_ptr = cutlass.inttoptr(
+                            (output_base + load_idx * TCGEN05_32B_REGS_PER_LOAD).toint(
+                                Int64
+                            ),
+                            mem_space=1,
+                            dtype=Int32,
+                        )
+                        raw_ptr.store(
+                            packed_o.load(0, PACKED_FP8_OUTPUT_REGS * 2),
+                            alignment=32,
+                        )
+                elif cutlass.const_expr(self.partial_output is not None):
                     # Split-KV partial O uses BF16 workspace storage.  LSE and
                     # the eventual cross-split accumulation remain FP32.
                     S_q = (
@@ -3210,7 +5388,9 @@ class GmemOResource(HighThroughputMlaResource):
                             vec_f32 = qk_acc_regs.load(
                                 offset, BF16_OUTPUT_VECTOR_ELEMENTS
                             )
-                            vec_partial = vec_f32.to(cutlass.BFloat16)
+                            vec_partial = convert_f32_vector_to_bf16_satfinite(
+                                vec_f32, BF16_OUTPUT_VECTOR_ELEMENTS
+                            )
                             (
                                 output_base
                                 + load_idx * TCGEN05_32B_REGS_PER_LOAD
@@ -3282,7 +5462,14 @@ class GmemOResource(HighThroughputMlaResource):
                                     alignment=16,
                                 )
                             else:
-                                vec_o = vec_f32.to(output_dtype(self.cfg))
+                                if cutlass.const_expr(
+                                    output_dtype(self.cfg) is cutlass.BFloat16
+                                ):
+                                    vec_o = convert_f32_vector_to_bf16_satfinite(
+                                        vec_f32, FP8_OUTPUT_VECTOR_ELEMENTS
+                                    )
+                                else:
+                                    vec_o = vec_f32.to(output_dtype(self.cfg))
                                 (
                                     output_base
                                     + load_idx * TCGEN05_32B_REGS_PER_LOAD
@@ -3292,67 +5479,74 @@ class GmemOResource(HighThroughputMlaResource):
                                     evict="noallocate",
                                 )
 
-        # Compute and store LSE in the same row-sum domain used by P.
-        lse_row_sum = row_sum
-        if cutlass.const_expr(cfg.is_fp8_qkv()):
-            lse_row_sum = lse_row_sum * fp8_quant_scale_rcp()
-        lse = (
-            cute.math.log2(lse_row_sum, fastmath=True)
-            + self.softmax_scale_log2 * row_max
-            if row_has_values
-            else Float32(-Float32.inf)
-        )
+        if cutlass.const_expr(self.stores_lse):
+            # Compute and store LSE in the same row-sum domain used by P.
+            lse_row_sum = row_sum
+            if cutlass.const_expr(cfg.is_fp8_qkv()):
+                lse_row_sum = lse_row_sum * (
+                    self.softmax_p_scale_rcp
+                    if cutlass.const_expr(cfg.is_dynamic_token_sparse)
+                    else fp8_quant_scale_rcp()
+                )
+            lse = (
+                cute.math.log2(lse_row_sum, fastmath=True)
+                + self.softmax_scale_log2 * row_max
+                if row_has_values
+                else Float32(-Float32.inf)
+            )
 
-        # Use local_tidx (0..127 within correction warpgroup) for LSE
-        # indexing, not global tidx (which is 128..255 for correction warps).
-        lse_tidx = local_tidx
-        if lse_tidx < tile_h:
-            lse_row_in_tile = head_tile_idx * tile_h + lse_tidx
-            (
-                storage_flat_lse_row,
-                logical_lse_head_idx,
-                logical_lse_q_idx,
-                _,
-                lse_query_is_valid,
-            ) = self._query_row_state(lse_row_in_tile, seq_q_idx, batch_idx)
-            if lse_row_in_tile < physical_tile_rows and lse_query_is_valid:
-                if cutlass.const_expr(self.partial_lse is not None):
-                    S_q = (
-                        cutlass.Int32(self.partial_lse.shape[2])
-                        if self.partial_lse is not None
-                        else Int32(1)
-                    )
-                    lse_base_ptr = (
-                        self.partial_lse.iterator.raw_ptr()
-                        + Int64(lse_row_in_tile) * Int64(self.split_kv)
-                        + Int64(split_kv_idx)
-                        + Int64(seq_q_idx)
-                        * Int64(physical_tile_rows)
-                        * Int64(self.split_kv)
-                        + Int64(batch_idx)
-                        * Int64(physical_tile_rows)
-                        * Int64(self.split_kv)
-                        * Int64(S_q)
-                    )
-                    lse_base_ptr.store(lse)
-                elif cutlass.const_expr(self.lse is not None):
-                    if cutlass.const_expr(self.cu_seqlens_q is not None):
-                        lse_base_ptr = (
-                            self.lse.iterator.raw_ptr() + storage_flat_lse_row
-                        )
-                    else:
+            # Use local_tidx (0..127 within correction warpgroup) for LSE
+            # indexing, not global tidx (which is 128..255 for correction warps).
+            lse_tidx = local_tidx
+            if lse_tidx < tile_h:
+                lse_row_in_tile = head_tile_idx * tile_h + lse_tidx
+                (
+                    storage_flat_lse_row,
+                    logical_lse_head_idx,
+                    logical_lse_q_idx,
+                    _,
+                    lse_query_is_valid,
+                ) = self._query_row_state(lse_row_in_tile, seq_q_idx, batch_idx)
+                if lse_row_in_tile < physical_tile_rows and lse_query_is_valid:
+                    if cutlass.const_expr(self.partial_lse is not None):
                         S_q = (
-                            cutlass.Int32(self.lse.shape[1])
-                            if self.lse is not None
+                            cutlass.Int32(self.partial_lse.shape[2])
+                            if self.partial_lse is not None
                             else Int32(1)
                         )
                         lse_base_ptr = (
-                            self.lse.iterator.raw_ptr()
-                            + Int64(logical_lse_head_idx)
-                            + Int64(logical_lse_q_idx) * Int64(logical_num_heads_q)
-                            + Int64(batch_idx) * Int64(logical_num_heads_q) * Int64(S_q)
+                            self.partial_lse.iterator.raw_ptr()
+                            + Int64(lse_row_in_tile) * Int64(self.split_kv)
+                            + Int64(split_kv_idx)
+                            + Int64(seq_q_idx)
+                            * Int64(physical_tile_rows)
+                            * Int64(self.split_kv)
+                            + Int64(batch_idx)
+                            * Int64(physical_tile_rows)
+                            * Int64(self.split_kv)
+                            * Int64(S_q)
                         )
-                    lse_base_ptr.store(lse)
+                        lse_base_ptr.store(lse)
+                    elif cutlass.const_expr(self.lse is not None):
+                        if cutlass.const_expr(self.cu_seqlens_q is not None):
+                            lse_base_ptr = (
+                                self.lse.iterator.raw_ptr() + storage_flat_lse_row
+                            )
+                        else:
+                            S_q = (
+                                cutlass.Int32(self.lse.shape[1])
+                                if self.lse is not None
+                                else Int32(1)
+                            )
+                            lse_base_ptr = (
+                                self.lse.iterator.raw_ptr()
+                                + Int64(logical_lse_head_idx)
+                                + Int64(logical_lse_q_idx) * Int64(logical_num_heads_q)
+                                + Int64(batch_idx)
+                                * Int64(logical_num_heads_q)
+                                * Int64(S_q)
+                            )
+                        lse_base_ptr.store(lse)
 
         prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
         cute.arch.fence_view_async_tmem_load()
@@ -3396,8 +5590,15 @@ class GmemOResource(HighThroughputMlaResource):
 
         row_has_values = row_sum > Float32(0)
         safe_row_sum = row_sum if row_has_values else Float32(1)
-        norm_scale = self.output_scale * cute.math.rcp(safe_row_sum, approx=True)
+        row_sum_rcp = cute.math.rcp(safe_row_sum, approx=True)
+        norm_scale = (
+            mul_ftz_f32(self.output_scale, row_sum_rcp)
+            if cutlass.const_expr(cfg.is_dynamic_token_sparse)
+            else self.output_scale * row_sum_rcp
+        )
         for i in cutlass.range_constexpr(0, 128, 2):
+            if cutlass.const_expr(cfg.is_dynamic_token_sparse):
+                dsv4_warp_switch()
             scaled = mul_packed_f32x2(
                 (qk_acc_regs[i], qk_acc_regs[i + 1]),
                 (norm_scale, norm_scale),
@@ -3456,7 +5657,9 @@ class GmemOResource(HighThroughputMlaResource):
                             + j * BF16_OUTPUT_VECTOR_ELEMENTS
                         )
                         vec_f32 = qk_acc_regs.load(offset, BF16_OUTPUT_VECTOR_ELEMENTS)
-                        vec_partial = vec_f32.to(cutlass.BFloat16)
+                        vec_partial = convert_f32_vector_to_bf16_satfinite(
+                            vec_f32, BF16_OUTPUT_VECTOR_ELEMENTS
+                        )
                         (
                             output_base
                             + load_idx * TCGEN05_32B_REGS_PER_LOAD
@@ -3523,7 +5726,14 @@ class GmemOResource(HighThroughputMlaResource):
                                 alignment=16,
                             )
                         else:
-                            vec_o = vec_f32.to(output_dtype(self.cfg))
+                            if cutlass.const_expr(
+                                output_dtype(self.cfg) is cutlass.BFloat16
+                            ):
+                                vec_o = convert_f32_vector_to_bf16_satfinite(
+                                    vec_f32, FP8_OUTPUT_VECTOR_ELEMENTS
+                                )
+                            else:
+                                vec_o = vec_f32.to(output_dtype(self.cfg))
                             (
                                 output_base
                                 + load_idx * TCGEN05_32B_REGS_PER_LOAD
@@ -3533,10 +5743,14 @@ class GmemOResource(HighThroughputMlaResource):
                                 evict="noallocate",
                             )
 
-        if cutlass.const_expr(iter_n == 0):
+        if cutlass.const_expr(self.stores_lse and iter_n == 0):
             lse_row_sum = row_sum
             if cutlass.const_expr(cfg.is_fp8_qkv()):
-                lse_row_sum = lse_row_sum * fp8_quant_scale_rcp()
+                lse_row_sum = lse_row_sum * (
+                    self.softmax_p_scale_rcp
+                    if cutlass.const_expr(cfg.is_dynamic_token_sparse)
+                    else fp8_quant_scale_rcp()
+                )
             lse = (
                 cute.math.log2(lse_row_sum, fastmath=True)
                 + self.softmax_scale_log2 * row_max
