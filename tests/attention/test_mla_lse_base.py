@@ -1,14 +1,14 @@
 """LSE base selection for trtllm-gen MLA decode (issue #4485).
 
-The returned log-sum-exp is base-2 by default on trtllm-gen. ``return_lse_base_on_e``
+The returned log-sum-exp is base-2 by default on trtllm-gen. ``return_lse_base``
 is a *guarantee* about the units of the returned tensor, not a transformation request:
 
     None   -> the backend's default base (base-2 for trtllm-gen)
-    False  -> base-2, whichever backend ran
-    True   -> base-e, whichever backend ran
+    "base2" -> base-2, whichever backend ran
+    "basee" -> base-e, whichever backend ran
 
 The conversion is a float multiplier applied in ``ComputeLSEFromMDKernel``
-(``include/flashinfer/trtllm/fmha/lse.cuh``), so the ``None``/``False`` paths multiply
+(``include/flashinfer/trtllm/fmha/lse.cuh``), so the ``None``/``"base2"`` paths multiply
 by exactly ``1.0f`` and must stay bit-identical to the pre-#4485 output.
 
 ``test_trtllm_ragged_lse_is_base2`` guards a path that has *no* flag: the ragged
@@ -29,6 +29,80 @@ from flashinfer.utils import get_compute_capability
 LOG2E = math.log2(math.e)  # 1.4426950408889634
 
 WORKSPACE_BYTES = 128 * 1024 * 1024
+
+
+def _public_mla_entrypoint(entrypoint):
+    if entrypoint == "decode":
+        return flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla
+    if entrypoint == "prefill":
+        return flashinfer.mla.trtllm_prefill_with_kv_cache_mla
+    return flashinfer.prefill.trtllm_prefill_with_kv_cache_mla
+
+
+def _cpu_mla_arguments():
+    """Small host tensors for validation/forwarding, never a kernel launch."""
+    return dict(
+        query=torch.empty(1, 1, 8, 576, dtype=torch.bfloat16),
+        kv_cache=torch.empty(1, 1, 64, 576, dtype=torch.bfloat16),
+        workspace_buffer=torch.empty(1, dtype=torch.uint8),
+        qk_nope_head_dim=128,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        block_tables=torch.zeros(1, 1, dtype=torch.int32),
+        seq_lens=torch.ones(1, dtype=torch.int32),
+        max_seq_len=1,
+    )
+
+
+@pytest.mark.parametrize("entrypoint", ["decode", "prefill", "prefill_alias"])
+@pytest.mark.parametrize("return_lse", [False, True])
+@pytest.mark.parametrize(
+    "selector", [True, False, 0, 1, -1, 2, "unknown", "none", "base_e", "base_2", ""]
+)
+def test_mla_lse_base_rejects_invalid_selector_before_device_probe(
+    monkeypatch, entrypoint, return_lse, selector
+):
+    from flashinfer.mla import _core
+
+    def unexpected_probe(*args, **kwargs):
+        pytest.fail("invalid LSE selector reached device/backend probing")
+
+    monkeypatch.setattr(_core, "get_compute_capability", unexpected_probe)
+    monkeypatch.setattr(_core, "is_sm12x_supported", unexpected_probe)
+    monkeypatch.setattr(torch.cuda, "current_stream", unexpected_probe)
+    with pytest.raises(ValueError, match="return_lse_base"):
+        _public_mla_entrypoint(entrypoint)(
+            **_cpu_mla_arguments(),
+            return_lse=return_lse,
+            return_lse_base=selector,
+        )
+
+
+@pytest.mark.parametrize("entrypoint", ["decode", "prefill", "prefill_alias"])
+@pytest.mark.parametrize("return_lse", [False, True])
+@pytest.mark.parametrize("selector", ["omitted", None, "basee", "base2"])
+def test_mla_lse_base_public_forwarding(monkeypatch, entrypoint, return_lse, selector):
+    from flashinfer.mla import _core
+
+    seen = []
+    output = torch.empty(1, 1, 8, 512, dtype=torch.bfloat16)
+    expected_result = (output, torch.empty(1, 8)) if return_lse else output
+
+    def implementation(**kwargs):
+        seen.append(kwargs)
+        return expected_result
+
+    monkeypatch.setattr(
+        _core, "_trtllm_batch_decode_with_kv_cache_mla_impl", implementation
+    )
+    kwargs = _cpu_mla_arguments()
+    if selector != "omitted":
+        kwargs["return_lse_base"] = selector
+    result = _public_mla_entrypoint(entrypoint)(**kwargs, return_lse=return_lse)
+    assert result is expected_result
+    assert len(seen) == 1
+    assert seen[0]["return_lse_base"] == (None if selector == "omitted" else selector)
+    assert seen[0]["return_lse"] is return_lse
 
 
 def _require_trtllm_gen(device: torch.device) -> None:
@@ -163,7 +237,7 @@ def _run_mla_decode(
     block_tables,
     seq_lens,
     *,
-    return_lse_base_on_e,
+    return_lse_base,
     backend="trtllm-gen",
     cute_dsl_impl="auto",
     provide_lse=True,
@@ -199,7 +273,7 @@ def _run_mla_decode(
         cute_dsl_impl=cute_dsl_impl,
         lse=lse,
         return_lse=True,
-        return_lse_base_on_e=return_lse_base_on_e,
+        return_lse_base=return_lse_base,
     )
     if provide_lse:
         assert lse_out is lse
@@ -209,14 +283,14 @@ def _run_mla_decode(
 
 
 def _run_cute_dsl_decode(
-    query, kv_cache, block_tables, seq_lens, *, flag, max_seq_len=SEQ_LEN
+    query, kv_cache, block_tables, seq_lens, *, lse_base, max_seq_len=SEQ_LEN
 ):
     return _run_mla_decode(
         query,
         kv_cache,
         block_tables,
         seq_lens,
-        return_lse_base_on_e=flag,
+        return_lse_base=lse_base,
         max_seq_len=max_seq_len,
         backend="cute-dsl",
         # Pin monolithic: the modular impl raises NotImplementedError on
@@ -376,9 +450,9 @@ def test_planned_mla_preserves_lse_base(backend, dtype, return_lse, seq_len):
 
 
 @pytest.mark.arch_blackwell
-@pytest.mark.parametrize("return_lse_base_on_e", [None, False, True])
-def test_trtllm_gen_mla_decode_lse_base(return_lse_base_on_e):
-    """Each flag state lands on the base it promises, checked against fp32 softmax."""
+@pytest.mark.parametrize("return_lse_base", [None, "base2", "basee"])
+def test_trtllm_gen_mla_decode_lse_base(return_lse_base):
+    """Each selector value lands on the base it promises, checked against fp32 softmax."""
     device = torch.device("cuda")
     _require_trtllm_gen(device)
 
@@ -388,50 +462,52 @@ def test_trtllm_gen_mla_decode_lse_base(return_lse_base_on_e):
         kv_cache,
         block_tables,
         seq_lens,
-        return_lse_base_on_e=return_lse_base_on_e,
+        return_lse_base=return_lse_base,
     )
 
     ref_natural = _mla_reference_lse_natural(query, kv_cache, block_tables, seq_lens)
-    # None and False both mean base-2 on trtllm-gen; only True is base-e.
-    expected = ref_natural if return_lse_base_on_e is True else ref_natural * LOG2E
+    # None and "base2" both mean base-2 on trtllm-gen; only "basee" is base-e.
+    expected = ref_natural if return_lse_base == "basee" else ref_natural * LOG2E
 
     # bf16 inputs, fp32 accumulation: the two bases are 1.44x apart, so this
     # tolerance still rejects the wrong one by a wide margin.
     torch.testing.assert_close(lse, expected, rtol=2e-2, atol=2e-2)
 
-    wrong_base = ref_natural * LOG2E if return_lse_base_on_e is True else ref_natural
+    wrong_base = ref_natural * LOG2E if return_lse_base == "basee" else ref_natural
     assert not torch.allclose(lse, wrong_base, rtol=0.1, atol=0.1), (
-        f"return_lse_base_on_e={return_lse_base_on_e} returned the other base"
+        f"return_lse_base={return_lse_base} returned the other base"
     )
 
 
 @pytest.mark.arch_blackwell
 def test_trtllm_gen_mla_decode_lse_base_relationship():
-    """None == False bit-for-bit, and True is exactly the base-2 result over log2(e)."""
+    """None matches base2 bit-for-bit, and basee is exactly the base-2 result over log2(e)."""
     device = torch.device("cuda")
     _require_trtllm_gen(device)
 
     query, kv_cache, block_tables, seq_lens = _mla_decode_inputs(device, torch.bfloat16)
     runs = {
-        flag: _run_mla_decode(
-            query, kv_cache, block_tables, seq_lens, return_lse_base_on_e=flag
+        lse_base: _run_mla_decode(
+            query, kv_cache, block_tables, seq_lens, return_lse_base=lse_base
         )[1]
-        for flag in (None, False, True)
+        for lse_base in (None, "base2", "basee")
     }
 
     # The default path multiplies by literal 1.0f, so it must not merely be close
     # to the explicit base-2 path -- it must be the same bits.
-    assert torch.equal(runs[None], runs[False]), (
-        "return_lse_base_on_e=None and False must be bit-identical on trtllm-gen"
+    assert torch.equal(runs[None], runs["base2"]), (
+        "return_lse_base=None and base2 must be bit-identical on trtllm-gen"
     )
 
-    # True differs from False by one fp32 multiply by 1/log2(e).
-    torch.testing.assert_close(runs[True] * LOG2E, runs[False], rtol=1e-6, atol=1e-6)
+    # basee differs from base2 by one fp32 multiply by 1/log2(e).
+    torch.testing.assert_close(
+        runs["basee"] * LOG2E, runs["base2"], rtol=1e-6, atol=1e-6
+    )
 
 
 @pytest.mark.arch_blackwell
 def test_trtllm_gen_mla_decode_lse_base_ignored_without_return_lse():
-    """Passing the flag with return_lse=False is silently ignored, not an error."""
+    """Passing a valid selector with return_lse=False is silently ignored, not an error."""
     device = torch.device("cuda")
     _require_trtllm_gen(device)
 
@@ -450,7 +526,7 @@ def test_trtllm_gen_mla_decode_lse_base_ignored_without_return_lse():
         bmm2_scale=1.0,
         backend="trtllm-gen",
         return_lse=False,
-        return_lse_base_on_e=True,
+        return_lse_base="basee",
     )
     assert isinstance(out, torch.Tensor)
     assert torch.isfinite(out.float()).all()
@@ -563,7 +639,7 @@ def test_trtllm_ragged_lse_is_base2():
 #
 # These kernels compute LSE in base 2 internally and apply the caller's multiplier at
 # each user-facing store, so the scale mapping is the inverse of trtllm-gen's: None and
-# True are both 1.0 / log2e (today's behaviour, unchanged), and only False -- base 2 --
+# basee are both 1.0 / log2e (today's behaviour, unchanged), and only base2 -- base 2 --
 # is a new path.
 #
 # "monolithic" is two near-duplicate kernels, mla_decode_fp16.py and mla_decode_fp8.py,
@@ -583,9 +659,9 @@ _SPLIT_KV_LENS = [
 @pytest.mark.arch_blackwell
 @pytest.mark.parametrize("dtype", _MLA_DTYPES)
 @pytest.mark.parametrize("seq_len", _SPLIT_KV_LENS)
-@pytest.mark.parametrize("return_lse_base_on_e", [None, False, True])
-def test_cute_dsl_monolithic_lse_base(return_lse_base_on_e, seq_len, dtype):
-    """None and True stay base-e on monolithic; False switches it to base-2."""
+@pytest.mark.parametrize("return_lse_base", [None, "base2", "basee"])
+def test_cute_dsl_monolithic_lse_base(return_lse_base, seq_len, dtype):
+    """None and basee stay base-e on monolithic; base2 selects base-2."""
     device = torch.device("cuda")
     _require_trtllm_gen(device)
 
@@ -597,17 +673,17 @@ def test_cute_dsl_monolithic_lse_base(return_lse_base_on_e, seq_len, dtype):
         kv_cache,
         block_tables,
         seq_lens,
-        flag=return_lse_base_on_e,
+        lse_base=return_lse_base,
         max_seq_len=seq_len,
     )
 
     ref_natural = _mla_reference_lse_natural(query, kv_cache, block_tables, seq_lens)
-    expected = ref_natural * LOG2E if return_lse_base_on_e is False else ref_natural
+    expected = ref_natural * LOG2E if return_lse_base == "base2" else ref_natural
     torch.testing.assert_close(lse, expected, **_lse_tolerance(dtype))
 
-    wrong_base = ref_natural if return_lse_base_on_e is False else ref_natural * LOG2E
+    wrong_base = ref_natural if return_lse_base == "base2" else ref_natural * LOG2E
     assert not torch.allclose(lse, wrong_base, **_WRONG_BASE_TOL), (
-        f"return_lse_base_on_e={return_lse_base_on_e} returned the other base"
+        f"return_lse_base={return_lse_base} returned the other base"
     )
 
 
@@ -615,7 +691,7 @@ def test_cute_dsl_monolithic_lse_base(return_lse_base_on_e, seq_len, dtype):
 @pytest.mark.parametrize("dtype", _MLA_DTYPES)
 @pytest.mark.parametrize("seq_len", _SPLIT_KV_LENS)
 def test_cute_dsl_monolithic_lse_base_relationship(seq_len, dtype):
-    """None == True bit-for-bit (same scale), and False is that times log2(e).
+    """None matches basee bit-for-bit (same scale), and base2 is that times log2(e).
 
     Reference-free, so it isolates the scalar plumbing from kernel numerics: all three
     runs are the same kernel on the same inputs with only the runtime multiplier
@@ -629,23 +705,23 @@ def test_cute_dsl_monolithic_lse_base_relationship(seq_len, dtype):
         device, dtype, seq_len=seq_len
     )
     runs = {
-        flag: _run_cute_dsl_decode(
+        lse_base: _run_cute_dsl_decode(
             query,
             kv_cache,
             block_tables,
             seq_lens,
-            flag=flag,
+            lse_base=lse_base,
             max_seq_len=seq_len,
         )[1]
-        for flag in (None, False, True)
+        for lse_base in (None, "base2", "basee")
     }
 
     # Both resolve to the same 1.0 / log2e multiplier, so this is exact -- it is the
     # check that the default path did not change when the scalar was threaded through.
-    assert torch.equal(runs[None], runs[True]), (
-        "None and True must be bit-identical on cute-dsl monolithic (same scale)"
+    assert torch.equal(runs[None], runs["basee"]), (
+        "None and basee must be bit-identical on cute-dsl monolithic (same scale)"
     )
-    torch.testing.assert_close(runs[None] * LOG2E, runs[False], rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(runs[None] * LOG2E, runs["base2"], rtol=1e-6, atol=1e-6)
 
 
 # --------------------------------------------------------------------------------------
@@ -654,9 +730,9 @@ def test_cute_dsl_monolithic_lse_base_relationship(seq_len, dtype):
 
 
 @pytest.mark.arch_blackwell
-@pytest.mark.parametrize("return_lse_base_on_e", [False, True])
-def test_lse_base_agrees_across_backends(return_lse_base_on_e):
-    """An explicit flag pins the units, so which backend ran stops mattering."""
+@pytest.mark.parametrize("return_lse_base", ["base2", "basee"])
+def test_lse_base_agrees_across_backends(return_lse_base):
+    """An explicit selector pins the units, so which backend ran stops mattering."""
     device = torch.device("cuda")
     _require_trtllm_gen(device)
 
@@ -666,10 +742,10 @@ def test_lse_base_agrees_across_backends(return_lse_base_on_e):
         kv_cache,
         block_tables,
         seq_lens,
-        return_lse_base_on_e=return_lse_base_on_e,
+        return_lse_base=return_lse_base,
     )
     _, cute = _run_cute_dsl_decode(
-        query, kv_cache, block_tables, seq_lens, flag=return_lse_base_on_e
+        query, kv_cache, block_tables, seq_lens, lse_base=return_lse_base
     )
     # Two different kernels, so this is a numerical comparison, not a bitwise one.
     torch.testing.assert_close(trt, cute, rtol=2e-2, atol=2e-2)
@@ -688,9 +764,11 @@ def test_lse_base_default_still_differs_across_backends():
 
     query, kv_cache, block_tables, seq_lens = _mla_decode_inputs(device, torch.bfloat16)
     _, trt = _run_mla_decode(
-        query, kv_cache, block_tables, seq_lens, return_lse_base_on_e=None
+        query, kv_cache, block_tables, seq_lens, return_lse_base=None
     )
-    _, cute = _run_cute_dsl_decode(query, kv_cache, block_tables, seq_lens, flag=None)
+    _, cute = _run_cute_dsl_decode(
+        query, kv_cache, block_tables, seq_lens, lse_base=None
+    )
     ratio = trt / cute
     torch.testing.assert_close(
         ratio, torch.full_like(ratio, LOG2E), rtol=2e-2, atol=2e-2

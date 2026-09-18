@@ -4195,7 +4195,7 @@ def _trtllm_batch_decode_mla_reference(
     calls return ``[num_tokens, num_heads, kv_lora_rank]``.
 
     This reference models only the attention output, not optional LSE output.
-    ``return_lse_base_on_e`` is accepted in kwargs and does not affect it.
+    ``return_lse_base`` is accepted in kwargs and does not affect it.
     """
     cum_seq_lens_q = kwargs.get("cum_seq_lens_q")
     if cum_seq_lens_q is None:
@@ -4273,7 +4273,7 @@ def _trtllm_batch_decode_mla_sparse_reference(
     """Reference for sparse top-k page MLA decode.
 
     This reference models only the attention output, not optional LSE output.
-    ``return_lse_base_on_e`` is accepted in kwargs and does not affect it.
+    ``return_lse_base`` is accepted in kwargs and does not affect it.
     """
     del workspace_buffer, qk_nope_head_dim, seq_lens, max_seq_len, sparse_mla_top_k
     batch_size, q_len, num_heads, head_dim_qk = query.shape
@@ -4578,12 +4578,13 @@ trtllm_batch_decode_mla_dense_trace = TraceTemplate(
             optional=True,
             description="Scale applied after softmax @ V.",
         ),
-        "return_lse_base_on_e": Scalar(
-            "bool",
+        "return_lse_base": Scalar(
+            "string",
             optional=True,
             description=(
-                "LSE base: True selects base-e, False selects base-2, and None "
-                "preserves the backend default. Does not affect attention output."
+                "LSE base: 'basee' selects base-e, 'base2' selects base-2, and None "
+                "preserves the backend's historical default. "
+                "Does not affect attention output."
             ),
         ),
         "skip_softmax_threshold_scale_factor": Scalar(
@@ -4682,12 +4683,13 @@ trtllm_batch_decode_mla_ragged_trace = TraceTemplate(
             optional=True,
             description="Maximum query sequence length when cum_seq_lens_q is provided.",
         ),
-        "return_lse_base_on_e": Scalar(
-            "bool",
+        "return_lse_base": Scalar(
+            "string",
             optional=True,
             description=(
-                "LSE base: True selects base-e, False selects base-2, and None "
-                "preserves the backend default. Does not affect attention output."
+                "LSE base: 'basee' selects base-e, 'base2' selects base-2, and None "
+                "preserves the backend's historical default. "
+                "Does not affect attention output."
             ),
         ),
     },
@@ -4784,12 +4786,13 @@ trtllm_batch_decode_mla_sparse_trace = TraceTemplate(
                 "kwarg when sparse_mla_top_k>0; documented for completeness)."
             ),
         ),
-        "return_lse_base_on_e": Scalar(
-            "bool",
+        "return_lse_base": Scalar(
+            "string",
             optional=True,
             description=(
-                "LSE base: True selects base-e, False selects base-2, and None "
-                "preserves the backend default. Does not affect attention output."
+                "LSE base: 'basee' selects base-e, 'base2' selects base-2, and None "
+                "preserves the backend's historical default. "
+                "Does not affect attention output."
             ),
         ),
     },

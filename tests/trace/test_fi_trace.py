@@ -1305,8 +1305,8 @@ def test_trtllm_batch_decode_mla_fi_trace_dense_and_ragged():
 
 
 @pytest.mark.parametrize("layout", ["dense", "ragged", "sparse"])
-@pytest.mark.parametrize("return_lse_base_on_e", [True, False, None])
-def test_trtllm_mla_fi_trace_lse_base(layout, return_lse_base_on_e, tmp_path):
+@pytest.mark.parametrize("return_lse_base", ["basee", "base2", None])
+def test_trtllm_mla_fi_trace_lse_base(layout, return_lse_base, tmp_path):
     import flashinfer.mla
     from flashinfer.trace.templates import attention
 
@@ -1321,7 +1321,7 @@ def test_trtllm_mla_fi_trace_lse_base(layout, return_lse_base_on_e, tmp_path):
         "block_tables": torch.zeros(1, 1, dtype=torch.int32),
         "seq_lens": torch.tensor([2], dtype=torch.int32),
         "max_seq_len": 2,
-        "return_lse_base_on_e": return_lse_base_on_e,
+        "return_lse_base": return_lse_base,
     }
     if layout == "ragged":
         kwargs["query"] = kwargs["query"].reshape(1, 2, 6)
@@ -1336,9 +1336,10 @@ def test_trtllm_mla_fi_trace_lse_base(layout, return_lse_base_on_e, tmp_path):
     )
     assert definition["name"].startswith(f"trtllm_batch_decode_mla_{layout}")
     serialized = json.loads((tmp_path / f"{definition['name']}.json").read_text())
-    option = serialized["inputs"]["return_lse_base_on_e"]
+    assert "return_lse_base_on_e" not in serialized["inputs"]
+    option = serialized["inputs"]["return_lse_base"]
     assert option["shape"] is None
-    assert option["dtype"] == "bool"
+    assert option["dtype"] == "string"
     assert option["optional"] is True
 
     # These templates currently model only the attention output, which must

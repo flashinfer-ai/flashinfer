@@ -419,7 +419,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         :param lse_scale: Multiplier applied to the stored LSE. This kernel
             accumulates LSE in base 2, so ``1 / log2(e)`` yields natural-log
             values and ``1.0`` keeps base 2. Plumbed from
-            ``return_lse_base_on_e`` on the public MLA decode API.
+            ``return_lse_base`` on the public MLA decode API.
         :type lse_scale: cutlass.Float32
         :param stream: The CUDA stream to execute the kernel on
         :type stream: cuda.CUstream
@@ -1076,7 +1076,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         :param lse_scale: Multiplier applied to the stored LSE. This kernel
             accumulates LSE in base 2, so ``1 / log2(e)`` yields natural-log
             values and ``1.0`` keeps base 2. Plumbed from
-            ``return_lse_base_on_e`` on the public MLA decode API.
+            ``return_lse_base`` on the public MLA decode API.
         :type lse_scale: cutlass.Float32
         :param q_latent_smem_layout_staged: Shared memory layout for query latent tensor
         :type q_latent_smem_layout_staged: cute.ComposedLayout
@@ -1726,7 +1726,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         :param lse_scale: Multiplier applied to the stored LSE. This kernel
             accumulates LSE in base 2, so ``1 / log2(e)`` yields natural-log
             values and ``1.0`` keeps base 2. Plumbed from
-            ``return_lse_base_on_e`` on the public MLA decode API.
+            ``return_lse_base`` on the public MLA decode API.
         :type lse_scale: cutlass.Float32
         """
         bidx, bidy, bidz = cute.arch.block_idx()

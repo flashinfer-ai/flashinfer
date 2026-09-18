@@ -139,10 +139,11 @@ class _NormalizedSparseMLASegment:
     lengths: Optional[torch.Tensor]
 
 
-def _cute_dsl_monolithic_log_scale(return_lse_base_on_e: Optional[bool]) -> float:
-    """Monolithic converts to base e at every store, so None and True keep that
-    conversion and only False (base 2) drops it."""
-    return 1.0 if return_lse_base_on_e is False else 1.0 / log2e
+def _cute_dsl_monolithic_log_scale(
+    return_lse_base: Optional[Literal["basee", "base2"]],
+) -> float:
+    """Preserve monolithic base-e output unless base-2 is explicitly requested."""
+    return 1.0 if return_lse_base == "base2" else 1.0 / log2e
 
 
 def _normalize_optional_mla_sink(
@@ -2957,7 +2958,7 @@ class TrtllmGenMlaDecodeRunner(TunableRunner):
         uses_shared_paged_kv_idx: bool,
         return_lse: bool,
         lse: Optional[torch.Tensor],
-        return_lse_base_on_e: Optional[bool],
+        return_lse_base: Optional[Literal["basee", "base2"]],
         use_fp16_softmax: Optional[bool] = None,
     ):
         self._run = get_trtllm_gen_fmha_module().trtllm_paged_attention_decode
@@ -2986,7 +2987,7 @@ class TrtllmGenMlaDecodeRunner(TunableRunner):
         self.uses_shared_paged_kv_idx = uses_shared_paged_kv_idx
         self.return_lse = return_lse
         self.lse = lse
-        self.return_lse_base_on_e = return_lse_base_on_e
+        self.return_lse_base = return_lse_base
         self.use_fp16_softmax = use_fp16_softmax
 
     def __hash__(self):
@@ -3050,7 +3051,7 @@ class TrtllmGenMlaDecodeRunner(TunableRunner):
 
         lse_scale = 1.0
         if self.return_lse:
-            if self.return_lse_base_on_e is True:
+            if self.return_lse_base == "basee":
                 lse_scale = 1.0 / log2e
             lse_shape = (batch_size * max_q_len, num_qo_heads)
             # Reuse caller's lse when its shape matches the current input
@@ -3157,7 +3158,7 @@ class CuteDslMlaDecodeRunner(TunableRunner):
         uses_shared_paged_kv_idx: bool,
         lse: Optional[torch.Tensor],
         return_lse: bool,
-        return_lse_base_on_e: Optional[bool],
+        return_lse_base: Optional[Literal["basee", "base2"]],
         sinks: Optional[torch.Tensor],
         cute_dsl_impl: str,
         enable_dcp: bool = False,
@@ -3185,7 +3186,7 @@ class CuteDslMlaDecodeRunner(TunableRunner):
         self.uses_shared_paged_kv_idx = uses_shared_paged_kv_idx
         self.lse = lse
         self.return_lse = return_lse
-        self.return_lse_base_on_e = return_lse_base_on_e
+        self.return_lse_base = return_lse_base
         self.sinks = sinks
         self.cute_dsl_impl = cute_dsl_impl
         self.enable_dcp = enable_dcp
@@ -3282,7 +3283,7 @@ class CuteDslMlaDecodeRunner(TunableRunner):
         # provide matching temporary storage while retaining the caller's LSE
         # for the final invocation.
         lse = self.lse
-        lse_scale = _cute_dsl_monolithic_log_scale(self.return_lse_base_on_e)
+        lse_scale = _cute_dsl_monolithic_log_scale(self.return_lse_base)
         if self.return_lse:
             expected_numel = query.shape[0] * query.shape[1] * query.shape[2]
             if lse is None or lse.numel() != expected_numel:
@@ -3360,7 +3361,7 @@ def _trtllm_batch_decode_with_kv_cache_mla_impl(
     cp_rank: int = 0,
     causal_seqlens_kv_global: Optional[torch.Tensor] = None,
     use_fp16_softmax: Optional[bool] = None,
-    return_lse_base_on_e: Optional[bool] = None,
+    return_lse_base: Optional[Literal["basee", "base2"]] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Decode MLA with TRTLLM-GEN, CuteDSL, XQA, or SM120/SM121 sparse kernels.
 
@@ -3501,12 +3502,16 @@ def _trtllm_batch_decode_with_kv_cache_mla_impl(
         ``cute-dsl``, and ``sparse`` backends. When True, the function
         returns ``(out, lse)``. With compact variable Q, LSE is currently
         supported only by monolithic CuTeDSL.
-    return_lse_base_on_e : Optional[bool] = None
-        Controls the logarithm base of the returned LSE. Supported by ``trtllm-gen``,
-        ``cute-dsl``, and ``sparse`` backends. When ``True`` the LSE is returned in base-e,
-        when ``False`` in base-2. If ``None`` (default), each backend returns its default
-        base: base-2 for ``trtllm-gen`` and ``sparse``, and natural-log for monolithic
-        ``cute-dsl``. Pass True or False for a defined base under ``backend="auto"``.
+    return_lse_base : Optional[Literal["basee", "base2"]] = None
+        Logarithm base of LSE values, including values written to a supplied
+        ``lse`` buffer. Supported by ``trtllm-gen``, ``cute-dsl``, and ``sparse``
+        backends. ``"basee"`` selects natural-log units and ``"base2"`` selects
+        base-2 units. ``None`` preserves each backend's historical default:
+        base-2 for ``trtllm-gen`` and ``sparse``, and natural-log for monolithic
+        ``cute-dsl``. Select an explicit base for stable units under
+        ``backend="auto"``. This option does not enable LSE output; use
+        ``return_lse=True`` to request it. Other values raise
+        :class:`ValueError`.
     cute_dsl_impl : str = "auto"
         Which cute-dsl implementation to use. Honored when
         ``backend="cute-dsl"`` and when ``backend="auto"`` considers the
@@ -3614,6 +3619,14 @@ def _trtllm_batch_decode_with_kv_cache_mla_impl(
     the production page-sharing pattern of your workload (e.g., heavily shared
     prefix → smaller pool; independent contexts → larger pool).
     """
+    if return_lse_base is not None and (
+        not isinstance(return_lse_base, str)
+        or return_lse_base not in ("basee", "base2")
+    ):
+        raise ValueError(
+            "return_lse_base must be 'basee', 'base2', or None; "
+            f"got {return_lse_base!r}"
+        )
     if isinstance(bmm1_scale, torch.Tensor):
         if bmm1_scale.dtype != torch.float32:
             raise TypeError("bmm1_scale tensor must have dtype torch.float32")
@@ -3762,7 +3775,7 @@ def _trtllm_batch_decode_with_kv_cache_mla_impl(
                 "multi_ctas_kv_counter_buffer is only supported by the trtllm-gen backend"
             )
         lse_scale = 1.0
-        if return_lse_base_on_e is True:
+        if return_lse_base == "basee":
             lse_scale = 1.0 / log2e
         return _trtllm_batch_decode_sparse_mla_v32_sm120(
             query=query,
@@ -3967,7 +3980,7 @@ def _trtllm_batch_decode_with_kv_cache_mla_impl(
                 )
 
         if selected_var_q_backend == "cute-dsl":
-            lse_scale = _cute_dsl_monolithic_log_scale(return_lse_base_on_e)
+            lse_scale = _cute_dsl_monolithic_log_scale(return_lse_base)
             if multi_ctas_kv_counter_buffer is not None:
                 raise ValueError(
                     "multi_ctas_kv_counter_buffer is only supported by the "
@@ -4178,7 +4191,7 @@ def _trtllm_batch_decode_with_kv_cache_mla_impl(
                 uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
                 return_lse=return_lse,
                 lse=lse,
-                return_lse_base_on_e=return_lse_base_on_e,
+                return_lse_base=return_lse_base,
                 use_fp16_softmax=use_fp16_softmax,
             )
         )
@@ -4206,7 +4219,7 @@ def _trtllm_batch_decode_with_kv_cache_mla_impl(
                 uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
                 lse=lse,
                 return_lse=return_lse,
-                return_lse_base_on_e=return_lse_base_on_e,
+                return_lse_base=return_lse_base,
                 sinks=cute_dsl_sinks,
                 cute_dsl_impl=cute_dsl_impl,
                 enable_dcp=enable_dcp,
@@ -4295,7 +4308,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
     cp_rank: int = 0,
     causal_seqlens_kv_global: Optional[torch.Tensor] = None,
     use_fp16_softmax: Optional[bool] = None,
-    return_lse_base_on_e: Optional[bool] = None,
+    return_lse_base: Optional[Literal["basee", "base2"]] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """See :func:`_trtllm_batch_decode_with_kv_cache_mla_impl` for parameter documentation."""
     return _trtllm_batch_decode_with_kv_cache_mla_impl(
@@ -4331,6 +4344,7 @@ def trtllm_batch_decode_with_kv_cache_mla(
         cp_rank=cp_rank,
         causal_seqlens_kv_global=causal_seqlens_kv_global,
         use_fp16_softmax=use_fp16_softmax,
+        return_lse_base=return_lse_base,
     )
 
 
@@ -4373,6 +4387,7 @@ def trtllm_prefill_with_kv_cache_mla(
     cp_rank: int = 0,
     causal_seqlens_kv_global: Optional[torch.Tensor] = None,
     use_fp16_softmax: Optional[bool] = None,
+    return_lse_base: Optional[Literal["basee", "base2"]] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Run MLA with decode-compatible semantics for prefill callers.
 
@@ -4425,7 +4440,7 @@ def trtllm_prefill_with_kv_cache_mla(
         cp_rank=cp_rank,
         causal_seqlens_kv_global=causal_seqlens_kv_global,
         use_fp16_softmax=use_fp16_softmax,
-        return_lse_base_on_e=return_lse_base_on_e,
+        return_lse_base=return_lse_base,
     )
 
 
