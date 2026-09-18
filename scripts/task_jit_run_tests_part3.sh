@@ -15,4 +15,5 @@ fi
 
 # Run each test file separately to isolate CUDA memory issues
 pytest -s tests/utils/test_sampling.py
+pytest -s tests/utils/test_sampling_fuzz.py
 pytest -s tests/utils/test_topk.py
