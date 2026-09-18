@@ -265,7 +265,7 @@ _BATCH_CASES = [
 ]
 
 
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 @pytest.mark.parametrize("batch", _BATCH_CASES)
 def test_packed_kda_decode_matches_reference_and_preserves_pool(
     packed_kda_device, batch
@@ -300,7 +300,7 @@ def test_packed_kda_decode_matches_reference_and_preserves_pool(
     _assert_mutation_contract(case, before_storage)
 
 
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 def test_packed_kda_decode_allocates_canonical_output(packed_kda_device):
     case = _make_case(8, packed_kda_device, seed=20260820)
     _, reference_state = _clone_padded_state(case)
@@ -331,7 +331,7 @@ def test_packed_kda_decode_allocates_canonical_output(packed_kda_device):
     _assert_close(case["state"], reference_state)
 
 
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 def test_packed_kda_decode_all_inactive_is_bitwise_noop(packed_kda_device):
     case = _make_case(1, packed_kda_device, seed=20260821, inactive=False)
     case["indices_host"] = [-1]
@@ -352,7 +352,7 @@ def test_packed_kda_decode_all_inactive_is_bitwise_noop(packed_kda_device):
     )
 
 
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 @pytest.mark.parametrize(
     ("batch", "state_padding"),
     [(8, 17), (8, _PRODUCTION_STATE_PADDING), (64, _PRODUCTION_STATE_PADDING)],
@@ -370,7 +370,7 @@ def test_packed_kda_decode_sanitizer_schedules(packed_kda_device, batch, state_p
     torch.cuda.synchronize(packed_kda_device)
 
 
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 @pytest.mark.parametrize("batch", [8, 64])
 def test_packed_kda_decode_uses_current_stream(packed_kda_device, batch):
     case = _make_case(batch, packed_kda_device, seed=20260830 + batch)
@@ -396,7 +396,7 @@ def test_packed_kda_decode_uses_current_stream(packed_kda_device, batch):
     _assert_close(case["state"], reference_state)
 
 
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 @pytest.mark.parametrize("batch", [8, 64])
 def test_packed_kda_decode_cuda_graph_replays_changed_inputs_and_indices(
     packed_kda_device, batch
@@ -476,7 +476,7 @@ def test_packed_kda_decode_cuda_graph_replays_changed_inputs_and_indices(
     _assert_mutation_contract(case, initial_storage)
 
 
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 @pytest.mark.long_running
 def test_packed_kda_decode_512_step_fp64_diagnostic(packed_kda_device):
     steps = 512

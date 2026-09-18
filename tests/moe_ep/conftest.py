@@ -57,7 +57,7 @@ def isolated_deep_gemm_cache():
 
 
 # NOTE: ``pytest_addoption`` (--backend), ``pytest_configure`` (nvep/gpu_*/
-# arch_blackwell markers), and ``pytest_collection_modifyitems`` (env/GPU/arch
+# arch_sm10x markers), and ``pytest_collection_modifyitems`` (env/GPU/arch
 # auto-skips) are intentionally defined ONLY in the root ``tests/conftest.py``.
 # Re-declaring them here triggers a duplicate-option error
 # ("option names {'--backend'} already added") because pytest loads both the

@@ -24,7 +24,7 @@ def _require_cuda():
 
 
 @cuda_13_required
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 @pytest.mark.parametrize(
     ("kind", "weight_dtype_name"),
     [
@@ -151,7 +151,7 @@ def test_bf16_mxfp8_kernel_matches_mega_reference(
 
 
 @cuda_13_required
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 def test_bf16_mxfp8_preprocesses_canonical_prequantized_weights():
     _require_cuda()
     import torch

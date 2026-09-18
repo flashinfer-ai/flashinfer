@@ -30,7 +30,7 @@ Direct invocation on the required hardware:
 ```bash
 torchrun --standalone --nproc_per_node=8 -m pytest \
   tests/moe_ep/test_moe_ep_bf16_rank_major_cuda_multirank.py -v \
-  -m "gpu_8 and arch_blackwell"
+  -m "gpu_8 and arch_sm10x"
 ```
 
 The explicit target fails when its hardware requirements are not met. General

@@ -177,7 +177,9 @@ def pytest_configure(config):
     config.addinivalue_line("markers", "gpu_2: requires >=2 GPUs")
     config.addinivalue_line("markers", "gpu_4: requires >=4 GPUs")
     config.addinivalue_line("markers", "gpu_8: requires >=8 GPUs")
-    config.addinivalue_line("markers", "arch_blackwell: requires sm_100 or sm_103")
+    config.addinivalue_line(
+        "markers", "arch_sm10x: requires the sm_10x family (sm_100/sm_103/sm_107)"
+    )
     config.addinivalue_line("markers", "arch_hopper: requires sm_90 (Hopper)")
     config.addinivalue_line(
         "markers", "arch_sm120: requires sm_120/sm_121 (Blackwell-consumer)"
@@ -244,8 +246,8 @@ def pytest_collection_modifyitems(config, items):
         # Hopper (below) or the consumer sm_11x/sm_12x families (which use
         # their own kernel trees), so >= would let them collect on hosts
         # where the kernel cannot compile.
-        if "arch_blackwell" in item.keywords and cc[0] != 10:
-            item.add_marker(pytest.mark.skip(reason="needs sm_100/sm_103"))
+        if "arch_sm10x" in item.keywords and cc[0] != 10:
+            item.add_marker(pytest.mark.skip(reason="needs the sm_10x family"))
         # Exactly sm_90: the SM90 mega kernels are Hopper-only (Blackwell
         # hosts use the sm_100 tree's kernels instead).
         if "arch_hopper" in item.keywords and cc != (9, 0):

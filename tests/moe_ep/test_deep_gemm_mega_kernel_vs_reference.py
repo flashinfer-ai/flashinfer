@@ -23,7 +23,7 @@ unit-test jobs) the test self-bootstraps a 1-rank group via an explicit
 ``tcp://`` init so no torchrun launch is needed::
 
     pytest tests/moe_ep/test_deep_gemm_mega_kernel_vs_reference.py -v \\
-        -m arch_blackwell
+        -m arch_sm10x
 """
 
 from __future__ import annotations
@@ -213,7 +213,7 @@ def _make_problem():
     )
 
 
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 def test_deep_gemm_mega_kernel_matches_torch_reference():
     pytest.importorskip("deep_gemm")
     pytest.importorskip("triton")

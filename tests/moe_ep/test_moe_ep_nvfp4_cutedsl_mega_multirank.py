@@ -1,7 +1,7 @@
 """Multi-rank smoke + correctness tests for MoEEpMegaLayer (sm100_nvfp4_nvfp4_bf16_cutedsl).
 
 Launched via torchrun:
-    torchrun --nproc_per_node=4 -m pytest tests/moe_ep/test_moe_ep_nvfp4_cutedsl_mega_multirank.py -v -m "gpu_4 and arch_blackwell"
+    torchrun --nproc_per_node=4 -m pytest tests/moe_ep/test_moe_ep_nvfp4_cutedsl_mega_multirank.py -v -m "gpu_4 and arch_sm10x"
 
 Requires Blackwell (sm_100+), >=4 GPUs, and CuTeDSL runtime deps
 (``nvidia-cutlass-dsl[cu13]``, ``nvshmem4py-cu13``).  Kernels ship in-tree under
@@ -582,7 +582,7 @@ def _run_mega_layer(
 
 
 @pytest.mark.gpu_4
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 def test_moe_ep_nvfp4_cutedsl_mega_layer_matches_reference():
     """MoEEpMegaLayer (sm100_nvfp4_nvfp4_bf16_cutedsl) with on-the-fly bf16→NVFP4 staging.
 
@@ -600,7 +600,7 @@ def test_moe_ep_nvfp4_cutedsl_mega_layer_matches_reference():
 
 
 @pytest.mark.gpu_4
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 def test_moe_ep_nvfp4_cutedsl_mega_layer_prestaged_inputs_matches_reference():
     """MoEEpMegaLayer (sm100_nvfp4_nvfp4_bf16_cutedsl) with pre-staged NVFP4 activations.
 
@@ -618,7 +618,7 @@ def test_moe_ep_nvfp4_cutedsl_mega_layer_prestaged_inputs_matches_reference():
 
 
 @pytest.mark.gpu_4
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 def test_moe_ep_nvfp4_cutedsl_mega_layer_large_tokens_matches_reference():
     """Large-token (>=2048) path: exercises the tuner's LARGE profile.
 
@@ -640,7 +640,7 @@ def test_moe_ep_nvfp4_cutedsl_mega_layer_large_tokens_matches_reference():
 
 
 @pytest.mark.gpu_4
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 @pytest.mark.parametrize("num_tokens", [64, 2048])
 def test_moe_ep_nvfp4_cutedsl_mega_layer_output_view(num_tokens):
     """Public output-view API is bit-exact and reusable on every EP rank."""
@@ -660,7 +660,7 @@ def test_moe_ep_nvfp4_cutedsl_mega_layer_output_view(num_tokens):
 
 
 @pytest.mark.gpu_4
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 @pytest.mark.parametrize("num_tokens", [512, 1024])
 def test_moe_ep_nvfp4_cutedsl_mega_layer_mid_tokens_matches_reference(num_tokens):
     """Mid-token paths: exercise the tuner's MID / MID-LARGE profiles.
@@ -690,7 +690,7 @@ def test_moe_ep_nvfp4_cutedsl_mega_layer_mid_tokens_matches_reference(num_tokens
 
 
 @pytest.mark.gpu_4
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 def test_moe_ep_nvfp4_cutedsl_mega_layer_in_kernel_fc2_reduce():
     """In-flight top-k combine (``in_kernel_fc2_reduce=True``).
 
@@ -880,7 +880,7 @@ def _run_mega_layer_zero_token_ikr_regression(
 
 
 @pytest.mark.gpu_4
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 def test_moe_ep_nvfp4_cutedsl_mega_layer_in_kernel_fc2_reduce_zero_token_regression():
     """Zero-token / in_kernel_fc2_reduce livelock regression guard (NVFP4).
 
@@ -901,7 +901,7 @@ def test_moe_ep_nvfp4_cutedsl_mega_layer_in_kernel_fc2_reduce_zero_token_regress
 
 
 @pytest.mark.gpu_4
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 @pytest.mark.parametrize("combine_dtype", ["nvfp4", "mxfp8"])
 def test_moe_ep_nvfp4_cutedsl_mega_layer_quantized_combine(combine_dtype):
     """Quantized cross-rank combine wire (``combine_dtype`` != bf16).
@@ -1188,7 +1188,7 @@ def _run_mega_torch_oracle(
 
 
 @pytest.mark.gpu_4
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 @pytest.mark.parametrize(
     "in_kernel_fc2_reduce,combine_dtype",
     [
@@ -1219,7 +1219,7 @@ def test_moe_ep_nvfp4_cutedsl_mega_multirank_torch_oracle(
     )
 
 
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 def test_nvfp4_cutedsl_preprocess_accepts_sglang_packed_weights():
     _require_cuda()
 
@@ -1265,7 +1265,7 @@ def test_nvfp4_cutedsl_preprocess_accepts_sglang_packed_weights():
     assert fc2_sf.shape[0] == num_local_experts
 
 
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 def test_nvfp4_cutedsl_staging_uses_input_norm_const():
     _require_cuda()
 

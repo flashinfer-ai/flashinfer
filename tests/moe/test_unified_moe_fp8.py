@@ -50,13 +50,17 @@ def _build_per_tensor_fp8_runner(config):
 
 
 def _is_trtllm_fp8_arch() -> bool:
-    return torch.cuda.is_available() and get_compute_capability(
-        torch.device("cuda")
-    ) in ((10, 0), (10, 3))
+    from flashinfer.fused_moe.api import _TRTLLM_ROUTED_FP8_ARCHS
+
+    if not torch.cuda.is_available():
+        return False
+    major, minor = get_compute_capability(torch.device("cuda"))
+    return major * 10 + minor in _TRTLLM_ROUTED_FP8_ARCHS
 
 
 pytestmark = pytest.mark.skipif(
-    not _is_trtllm_fp8_arch(), reason="TRTLLM block-FP8 MoE requires SM100/103"
+    not _is_trtllm_fp8_arch(),
+    reason="TRTLLM block-FP8 MoE requires an arch in _TRTLLM_ROUTED_FP8_ARCHS",
 )
 
 HIDDEN = 256

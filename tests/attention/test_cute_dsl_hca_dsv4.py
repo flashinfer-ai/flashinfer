@@ -469,7 +469,7 @@ def test_dsv4_hca_compressed_page_aligned_tag_rejects_query_batch_mismatch(monke
         trtllm_batch_decode_sparse_mla_dsv4(**args)
 
 
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 def test_dsv4_hca_compressed_page_aligned_conversion_rejects_mixed_devices():
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
@@ -690,7 +690,7 @@ def _reference_hca(
     return output
 
 
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 @pytest.mark.parametrize(
     "compare_trtllm", (False, True), ids=("pytorch-reference", "trtllm-parity")
 )
@@ -997,7 +997,7 @@ def test_cute_dsl_hca_fp8_to_bf16_correctness(monkeypatch, compare_trtllm):
     assert torch.isneginf(captured["lse"]).all()
 
 
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 @pytest.mark.parametrize(
     ("num_heads", "window_page_size", "compressed_page_size"),
     ((64, 32, 128), (128, 32, 16), (128, 16, 32)),

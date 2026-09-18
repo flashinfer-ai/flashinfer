@@ -254,7 +254,7 @@ def test_backend_warns_on_auto_knobs():
         )
 
 
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 def test_symm_buffer_resolves_cached_knobs(monkeypatch, tmp_path):
     """knobs=None buffer creation must pick up the recorded winner."""
     import torch
