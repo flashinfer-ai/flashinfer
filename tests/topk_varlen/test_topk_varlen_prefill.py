@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Windowed (prefill) ``top_k_varlen``: per-row ``[row_starts[r], row_starts[r] +
-seq_lens[r])`` candidate windows with window-local output indices, served by the
+seq_lens[r])`` candidate windows with window-local output indices (absolute
+logits columns with ``absolute_indices=True``), served by the
 gvr_2 prefill engines (TRT-LLM #18702 port).
 
 Contract under test: exact top-k of the window (tie-aware), ``-1`` pad, identity
@@ -641,3 +642,162 @@ def test_prefill_api_validation_and_admission():
             ["radix", "gvr_2", "radix_cutlass", "radix_filter"], lg, le, k, **common
         )
         assert order[0] == "gvr_2"
+
+
+def _abs_lens(rows, ncols, ks, top_k):
+    """Window-length menu per row: empty, one, K-1, K, K+3, mid, the largest
+    register-class bounds; every row fits its request's slice."""
+    menu = [0, 1, top_k - 1, top_k, top_k + 3, 1500, 2045, 2048]
+    return [max(0, min(ncols - s, menu[r % len(menu)])) for r, s in enumerate(ks)]
+
+
+def _same_rows(a, b):
+    """Row-wise index-set equality (the engines' emit order is not fixed)."""
+    return torch.equal(torch.sort(a, dim=1).values, torch.sort(b, dim=1).values)
+
+
+@requires_gvr2
+@pytest.mark.parametrize("hinted", [False, True], ids=["unhinted", "hinted"])
+@pytest.mark.parametrize("top_k", [512, 2048], ids=lambda k: f"k{k}")
+def test_prefill_absolute_indices(top_k, hinted):
+    """``absolute_indices=True`` returns logits columns: every hit is the
+    window-local index plus ``row_starts[r]``, ``-1`` pads are untouched and
+    identity (short) windows are shifted too. Both engine families: the hinted
+    bound admits the register rung, the unhinted call takes the slab. Values
+    are the logits at the absolute columns."""
+    rows, ncols = 96, 6144
+    ks = [(r * 61) % 3000 + (r % 4) for r in range(rows)]  # every lead 0..3
+    lens = _abs_lens(rows, ncols, ks, top_k)
+    lg, rs, le = _make_case(rows, ncols, ks, lens, seed=11 + top_k)
+    kw = {"max_seq_len": 2048} if hinted else {}
+    loc = _run(lg, rs, le, top_k, **kw)
+    _check_windowed(lg, loc, rs, le, top_k)
+    ab, vals = flashinfer.top_k_varlen(
+        lg,
+        le,
+        top_k,
+        row_starts=rs,
+        backend="gvr_2",
+        absolute_indices=True,
+        return_values=True,
+        **kw,
+    )
+    torch.cuda.synchronize()
+    assert _same_rows(ab, torch.where(loc >= 0, loc + rs.unsqueeze(1), loc))
+    hit = ab >= 0
+    assert torch.equal(vals[hit], lg.gather(1, ab.clamp_min(0).long())[hit])
+    assert bool((vals[~hit] == torch.finfo(torch.float32).min).all())
+
+
+@requires_gvr2
+def test_prefill_absolute_indices_reference_engine():
+    """The host-loop reference engine honours ``absolute_indices`` (value
+    multisets agree with the in-kernel engine; pads coincide)."""
+    top_k = 512
+    rows, ncols = 24, 4096
+    ks = [(r * 53) % 1500 + (r % 4) for r in range(rows)]
+    lens = _abs_lens(rows, ncols, ks, top_k)
+    lg, rs, le = _make_case(lg_rows := rows, ncols, ks, lens, seed=21)
+    o1 = torch.empty(lg_rows, top_k, dtype=torch.int32, device=_DEV)
+    o2 = torch.empty_like(o1)
+    _host.run_varlen(
+        lg,
+        None,
+        le,
+        o1,
+        top_k=top_k,
+        row_starts=rs,
+        max_seq_len=ncols,
+        absolute_indices=True,
+    )
+    _host.run_varlen(
+        lg,
+        None,
+        le,
+        o2,
+        top_k=top_k,
+        row_starts=rs,
+        max_seq_len=ncols,
+        engine="reference",
+        absolute_indices=True,
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(o1 < 0, o2 < 0)
+    for r in range(rows):
+        m = min(lens[r], top_k)
+        assert bool((o1[r, :m] >= ks[r]).all()) and bool(
+            (o1[r, :m] < ks[r] + lens[r]).all()
+        )
+        assert torch.equal(
+            torch.sort(lg[r, o1[r, :m].long()]).values,
+            torch.sort(lg[r, o2[r, :m].long()]).values,
+        )
+
+
+@requires_gvr2
+def test_prefill_absolute_indices_warmup_and_graph_replay():
+    """``warmup_prefill(absolute_indices=True)`` compiles the absolute variants
+    (a distinct set: the local one is not implied), ``prefill_ready`` sees
+    them, and a captured absolute call replays exactly on new windows."""
+    top_k, n, rows = 512, 4096, 48
+    _host._PREFILL_CACHE.clear()
+    _host._PREFILL_WARMUP_DONE.clear()
+    _host.warmup_prefill(top_k, n, absolute_indices=True)
+    assert _host.prefill_ready(rows, top_k, n, absolute_indices=True)
+    assert _host.prefill_ready(rows, top_k, 2048, width=n, absolute_indices=True)
+    assert not _host.prefill_ready(rows, top_k, n)
+    stride = ((n + 256 + 255) // 256) * 256
+    full = torch.randn((rows, stride), dtype=torch.float32, device=_DEV)
+    lg = full[:, :n]
+    rs = torch.zeros((rows,), dtype=torch.int32, device=_DEV)
+    le = torch.full((rows,), n, dtype=torch.int32, device=_DEV)
+    out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    s = torch.cuda.Stream()
+    with torch.cuda.stream(s):
+        flashinfer.top_k_varlen(
+            lg,
+            le,
+            top_k,
+            row_starts=rs,
+            out_indices=out,
+            backend="gvr_2",
+            absolute_indices=True,
+        )
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s), torch.cuda.graph(g, stream=s):
+        flashinfer.top_k_varlen(
+            lg,
+            le,
+            top_k,
+            row_starts=rs,
+            out_indices=out,
+            backend="gvr_2",
+            absolute_indices=True,
+        )
+    torch.cuda.current_stream().wait_stream(s)
+    ks2 = [(r // 12) * 1001 + (r % 4) for r in range(rows)]
+    le2 = [min(n - ks2[r], (r % 12 + 1) * 250) for r in range(rows)]
+    rs.copy_(torch.tensor(ks2, dtype=torch.int32))
+    le.copy_(torch.tensor(le2, dtype=torch.int32))
+    full.normal_()
+    g.replay()
+    torch.cuda.synchronize()
+    loc = _run(lg, rs, le, top_k)
+    _check_windowed(lg, loc, rs, le, top_k)
+    assert _same_rows(out, torch.where(loc >= 0, loc + rs.unsqueeze(1), loc))
+
+
+def test_prefill_absolute_indices_validation():
+    n, rows, k = 4096, 8, 512
+    lg = torch.randn((rows, n), dtype=torch.float32, device=_DEV)
+    le = torch.full((rows,), n, dtype=torch.int32, device=_DEV)
+    rs = torch.zeros((rows,), dtype=torch.int32, device=_DEV)
+    if flashinfer.top_k_varlen.is_backend_supported("gvr_2", _cc()):
+        for bad in (1, "yes", None):
+            with pytest.raises(ValueError, match="absolute_indices"):
+                flashinfer.top_k_varlen(lg, le, k, row_starts=rs, absolute_indices=bad)
+    # decode mode has no window frame to shift: refused on every backend
+    with pytest.raises(ValueError, match="absolute_indices"):
+        flashinfer.top_k_varlen(lg, le, k, absolute_indices=True)
