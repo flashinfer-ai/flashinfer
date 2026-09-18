@@ -471,7 +471,14 @@ class MoEEpSplitLayer(nn.Module):
         )
         return self._kernel.compute(ctx)
 
-    def _round_trip(self, handle, t: "MoEEpTensors", out: torch.Tensor) -> torch.Tensor:
+    def _round_trip(
+        self,
+        handle,
+        t: "MoEEpTensors",
+        out: torch.Tensor,
+        *,
+        out_is_stable: bool = False,
+    ) -> torch.Tensor:
         """dispatch -> inner kernel -> combine, on an already-bound handle."""
         if not self.enable_timing:
             dispatch = handle.dispatch(
@@ -480,7 +487,9 @@ class MoEEpSplitLayer(nn.Module):
                 )
             )
             expert_out = self._inner_compute(dispatch)
-            combine = handle.combine(CombineInputParams(x=[expert_out], out=out))
+            combine = handle.combine(
+                CombineInputParams(x=[expert_out], out=out, out_is_stable=out_is_stable)
+            )
             return combine.x
 
         ev = {
@@ -499,7 +508,9 @@ class MoEEpSplitLayer(nn.Module):
         expert_out = self._inner_compute(dispatch)
         ev["compute"][1].record()
         ev["combine"][0].record()
-        combine = handle.combine(CombineInputParams(x=[expert_out], out=out))
+        combine = handle.combine(
+            CombineInputParams(x=[expert_out], out=out, out_is_stable=out_is_stable)
+        )
         ev["combine"][1].record()
         torch.cuda.synchronize()
         self.last_timings_ms = {
@@ -574,7 +585,9 @@ class MoEEpSplitLayer(nn.Module):
             # into the handle's existing buffers. Recorded inside the capture.
             handle.update(HandleParams(topk_ids=t.topk_ids))
             try:
-                out = self._round_trip(handle, t, graph_state._out)
+                # The state owns this buffer for its lifetime, so the
+                # transport may cache per-address state for it.
+                out = self._round_trip(handle, t, graph_state._out, out_is_stable=True)
             finally:
                 # complete() only waits on staged work; the handle deliberately
                 # survives, so no destroy() here.
@@ -601,6 +614,8 @@ class MoEEpSplitLayer(nn.Module):
             algo_knobs=handle_knobs,
         )
         try:
+            # A fresh buffer per call: out_is_stable stays False so the
+            # transport does not pin an address it will never see again.
             out = self._round_trip(handle, t, torch.empty_like(t.hidden_states))
         finally:
             handle.complete()

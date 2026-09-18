@@ -776,14 +776,28 @@ succeeds, so the LL transfers are plain stores and the `nixlPut` /
 The argument that dropping the recv hook is safe (it defers a kernel launch
 rather than performing a wait) is a source-reading argument, not a measurement.
 
-Know how a stall ends, because it is not an exception. LL arrival is a device
-spin bounded by `timeout_ms` (default 30 s). On expiry the kernel printfs and
-then, because the mask buffer is always allocated by `update_memory_buffers`,
-takes the **mask** branch rather than trapping: the offending peer is masked and
-the output is silently degraded, as sticky device state that every subsequent
-replay inherits. A captured graph cannot raise, so nothing surfaces in Python.
-Treat an unexplained accuracy drop after a long run as a candidate symptom, and
-check stderr for `NIXL-EP timeout`.
+Know how a stall ends, because **the two backends end it differently** and
+neither raises a Python exception. LL arrival is a device-side spin on a
+peer-written flag, bounded by a timeout:
+
+| backend | timeout | on expiry |
+|---|---|---|
+| `nixl_ep` | 30 s (`DEFAULT_TIMEOUT_MS`) | printf, then the **mask** branch -- `update_memory_buffers` always allocates the mask buffer, so `trap()` is never reached. The peer is masked, its tokens are dropped, and the mask is sticky device state every later replay inherits: **output silently degrades**. |
+| `nccl_ep` | ~97 s (compile-time default) | `rankMask` is null unless `FleetAlgoKnobFaultTolerance` set `enable_mask`, so the default path **`trap()`s** -- a hard CUDA error on the next sync. Loud, not silent. |
+
+So on nixl_ep treat an unexplained accuracy drop after a long run as a candidate
+symptom and check stderr for `NIXL-EP timeout`; on nccl_ep you will get an error
+instead.
+
+What actually causes a replay to stall: a replay runs no host code, so anything
+the transport keeps on the host freezes. Concretely, nixl_ep toggles a
+double-buffer index (`buffer_idx ^= 1`) per dispatch and per combine on the
+**host**, so under replay it stays at its capture-time value forever. If one
+rank's sequence of eager calls and replays diverges from its peers', the sender
+writes slot A while the receiver polls slot B, and the receiver spins to
+timeout. That is the concrete failure behind the lockstep rule above, and it is
+why the capture tests assert that output tracks in-place input rewrites --
+nothing weaker proves a replay actually ran.
 
 ### Why this is opt-in rather than the default
 
