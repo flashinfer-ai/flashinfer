@@ -63,10 +63,9 @@ def _ssd_autotune_configs():
     if override is not None:
         return override
     # MUSA Triton 3.2.x cannot compile the broad upstream autotune search.
-    # The 16x16x32 tile is retained, while two warps preserve the stable MUSA
-    # Triton 3.2 launch contract. The v14 packed-CB contract sweep validated
-    # this shape with four warps on all six Nemotron workloads; retain the
-    # explicit environment override for shape-specific replay.
+    # MUSA Triton 3.2 cannot compile the broad upstream search. The v14
+    # packed-CB contract sweep validated this 16x16x32 tile with four warps on
+    # all six Nemotron workloads; retain the explicit override for replay.
     # The explicit environment override above remains available for
     # shape-specific replay until the full serving matrix is measured.
 
