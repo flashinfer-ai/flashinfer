@@ -124,8 +124,16 @@ class JitSpecCuteDsl(JitSpec):
 
     @property
     def lock_path(self) -> Path:
-        # Module-level lock: kernels of one op family serialize their builds
-        # (meta.json wipes/writes must not race sibling kernel exports).
+        # Per-kernel, so two specializations of one op family compile at the same
+        # time. Digested because kernel names run to ~210 characters and a path
+        # component has to fit 255.
+        digest = hashlib.sha256(self.kernel_name.encode()).hexdigest()[:16]
+        return get_tmpdir() / f"{self.module_dir_name}_{digest}.lock"
+
+    @property
+    def module_lock_path(self) -> Path:
+        """Guards what kernels of one op family share: the meta.json wipe and
+        the export, both of which race sibling artifacts."""
         return get_tmpdir() / f"{self.module_dir_name}.lock"
 
     @property
@@ -162,41 +170,18 @@ class JitSpecCuteDsl(JitSpec):
     def build(self) -> None:
         """Compile via ``cute.compile`` and export the ``.o`` artifact.
 
-        Runs under ``lock_path`` when invoked via ``build_and_load()``.
+        ``build_and_load()`` holds the per-kernel ``lock_path`` across this call.
+        ``module_lock_path`` is taken twice and briefly instead, around the
+        stale-module wipe and the export, so one specialization's compile never
+        blocks a sibling's.
+
         Persistence failures degrade gracefully: the in-process kernel is
         kept for load(); only the disk write is lost.
         Stale modules (dsl version / source change) are wiped like a ninja rebuild.
         """
-        if (
-            self.module_dir.exists()
-            and _read_meta(self.meta_path) != self.expected_meta
-        ):
-            logger.info(f"Invalidating stale CuTe-DSL module {self.module_dir_name}")
-            shutil.rmtree(self.module_dir, ignore_errors=True)
-
-        logger.info(f"Compiling CuTe-DSL kernel {self.name}")
-        self._compiled_kernel = self.compile_fn()
-        try:
-            self._export()
-        except Exception as e:
-            logger.warning(
-                f"Failed to persist CuTe-DSL kernel {self.name} to "
-                f"{self.object_path}: {e}. The kernel will be recompiled next run."
-            )
-
-    def compile_and_persist(self) -> None:
-        """Compile outside the module lock; commit the artifact under it.
-
-        ``build_and_load()`` holds the module lock for the whole build.
-        This variant runs ``compile_fn`` unlocked and takes the lock only
-        for the stale-module wipe and the artifact export (~ms).
-
-        Meant for parallel precompilation workers.
-        """
         from filelock import FileLock
 
-        self._compiled_kernel = self.compile_fn()
-        with FileLock(self.lock_path, thread_local=False):
+        with FileLock(self.module_lock_path, thread_local=False):
             if (
                 self.module_dir.exists()
                 and _read_meta(self.meta_path) != self.expected_meta
@@ -205,6 +190,11 @@ class JitSpecCuteDsl(JitSpec):
                     f"Invalidating stale CuTe-DSL module {self.module_dir_name}"
                 )
                 shutil.rmtree(self.module_dir, ignore_errors=True)
+
+        logger.info(f"Compiling CuTe-DSL kernel {self.name}")
+        self._compiled_kernel = self.compile_fn()
+
+        with FileLock(self.module_lock_path, thread_local=False):
             try:
                 self._export()
             except Exception as e:  # noqa: BLE001 -- persistence is best-effort
