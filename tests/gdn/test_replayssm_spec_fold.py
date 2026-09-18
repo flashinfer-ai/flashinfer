@@ -118,7 +118,8 @@ def _offset_copy(tensor, offset):
         (17, 4, 2, 8, "default"),
         (256, 8, 1, 2, "default"),
         (257, 4, 1, 2, "default"),
-        (2, 3, 2, 8, "default"),
+        pytest.param(2, 3, 2, 8, "default", id="T3-inline"),
+        pytest.param(17, 3, 2, 8, "default", id="T3-warp"),
         (17, 5, 2, 8, "default"),
         (1, 5, 2, 8, "default"),
         (1, 6, 2, 8, "default"),
@@ -244,21 +245,22 @@ def test_replayssm_verify(batch, steps, heads, hv, variant):
         )
 
 
-@pytest.mark.parametrize("steps", [4, 5, 6, 7, 8])
+@pytest.mark.parametrize("steps", [3, 4, 5, 6, 7, 8], ids=lambda t: f"T{t}")
 @pytest.mark.parametrize(
     "normalize,track", [(True, False), (True, True), (False, True)]
 )
 @pytest.mark.parametrize("tcgen", [False, True])
 def test_replayssm_verify_commit_cycles(steps, normalize, track, tcgen):
-    if tcgen and (not normalize or track):
-        pytest.skip("tcgen commit requires normalization without tracking")
-    batch = steps + 3
+    if tcgen and (steps < 4 or not normalize or track):
+        pytest.skip("tcgen commit requires normalized T=4..8 without tracking")
+    # The extra full-accept row preserves final-step tracking coverage at T=3,
+    # where the first full-accept row exercises an intermediate tracked step.
+    counts = list(range(steps + 1)) + [steps, 0, steps]
+    batch = len(counts)
     args, cache = _inputs(batch, steps)
     args["use_qk_l2norm"] = normalize
     # Include every accepted length, a zero-accept live row and a null row.
-    accepts = torch.tensor(
-        list(range(steps + 1)) + [0, steps], device="cuda", dtype=torch.int32
-    )
+    accepts = torch.tensor(counts, device="cuda", dtype=torch.int32)
     layers = 2
     slots, hv, v, k = args["initial_state"].shape
     checkpoint = torch.randn(layers, slots * 2, hv, v, k, device="cuda") * 0.1
@@ -334,10 +336,17 @@ def test_replayssm_verify_commit_cycles(steps, normalize, track, tcgen):
 
 
 @pytest.mark.parametrize(
-    "steps,accept", [(t, a) for t in (4, 5, 6, 7, 8) for a in (1, t - 1, t)]
+    "steps,accept",
+    [
+        pytest.param(t, a, id=f"T{t}-accept{a}")
+        for t in (3, 4, 5, 6, 7, 8)
+        for a in (1, t - 1, t)
+    ],
 )
 @pytest.mark.parametrize("backend", ["auto", "simt", "tcgen05"])
 def test_replayssm_single_request_commit(steps, accept, backend):
+    if steps < 4 and backend == "tcgen05":
+        pytest.skip("tcgen commit requires T=4..8")
     args, cache = _inputs(batch=1, steps=steps)
     # Nonzero storage offsets are valid when the resulting pointers are aligned.
     args["initial_state"] = _offset_copy(args["initial_state"], 4)
@@ -505,6 +514,7 @@ def test_replayssm_cuda_graph(backend):
         "backend",
         "tcgen_track",
         "tcgen_norm",
+        "tcgen_short_window",
         "track_pair",
         "dtype",
         "shape",
@@ -525,6 +535,9 @@ def test_replayssm_commit_validation(invalid):
             track_state_indices=args["state_indices"],
             track_steps=args["accept_lens"],
         )
+    if invalid == "tcgen_short_window":
+        args = gdn_replayssm_commit_trace.init(seq_len=3)
+        args["backend"] = "tcgen05"
     if invalid == "tcgen_norm":
         args.update(backend="tcgen05", use_qk_l2norm=False)
     if invalid == "track_pair":
@@ -570,6 +583,7 @@ def test_replayssm_rejects_other_architectures(monkeypatch):
 @pytest.mark.parametrize(
     "steps,layers,batch,hv,backend,expected",
     [
+        (3, 4, 8, 32, "auto", "simt"),
         (4, 4, 8, 32, "auto", "simt"),
         (5, 4, 8, 32, "auto", "simt"),
         (5, 1, 1, 8, "tcgen05", "tcgen05"),
