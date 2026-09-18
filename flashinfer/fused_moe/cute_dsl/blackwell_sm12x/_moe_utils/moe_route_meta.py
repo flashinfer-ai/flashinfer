@@ -35,6 +35,34 @@ def count_expert_kernel(
 
 
 @triton.jit
+def count_routes_kernel(
+    topk_ids, counts, total_pairs: tl.constexpr, block_n: tl.constexpr
+):
+    pair_idx = tl.program_id(0) * block_n + tl.arange(0, block_n)
+    valid = pair_idx < total_pairs
+    expert = tl.load(topk_ids + pair_idx, mask=valid, other=0)
+    tl.atomic_add(counts + expert, 1, mask=valid, sem="relaxed")
+
+
+@triton.jit
+def prefix_cursor_kernel(
+    counts,
+    offsets,
+    cursor,
+    num_experts: tl.constexpr,
+    block_e: tl.constexpr,
+):
+    expert = tl.arange(0, block_e)
+    valid = expert < num_experts
+    count = tl.load(counts + expert, mask=valid, other=0)
+    inclusive = tl.cumsum(count, axis=0)
+    exclusive = inclusive - count
+    tl.store(offsets + expert, exclusive, mask=valid)
+    tl.store(cursor + expert, exclusive, mask=valid)
+    tl.store(offsets + expert + 1, inclusive, mask=expert == num_experts - 1)
+
+
+@triton.jit
 def route_assign_kernel(
     topk_ids,
     topk_weights,
@@ -296,8 +324,10 @@ class Mxfp8Mxfp4TileSelectorRuntime:
 __all__ = [
     "Mxfp8Mxfp4TileSelectorRuntime",
     "count_expert_kernel",
+    "count_routes_kernel",
     "moe_tile_select_kernel",
     "moe_tile_selector",
+    "prefix_cursor_kernel",
     "route_assign_decode_kernel",
     "route_assign_kernel",
 ]
