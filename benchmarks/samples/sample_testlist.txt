@@ -77,6 +77,13 @@
 --routine cute_dsl_fp4_block_scale_moe --num_tokens 1024 --hidden_size 7168 --intermediate_size 2048 --num_experts 256 --top_k 8 --autotune -vv --generate_repro_command --case_tag "cute_dsl_moe_autotune"
 --routine cute_dsl_fp4_block_scale_moe --num_tokens 1024 --hidden_size 7168 --intermediate_size 2048 --num_experts 256 --top_k 8 --local_expert_offset 0 --local_num_experts 32 -vv --generate_repro_command --case_tag "cute_dsl_moe_ep8"
 
+# CuteDSL BF16/FP16 MoE (Hopper SM9.0 only; --activation-type Swiglu/GegluTanh/Relu2; pre-routed top-k ids and scales; per-rank shapes for TP, --local_num_experts/--local_expert_offset for EP)
+--routine cute_dsl_bf16_moe --num_tokens 1 --hidden_size 2048 --intermediate_size 768 --num_experts 128 --top_k 8 --input_dtype bfloat16 --refcheck -vv --generate_repro_command --case_tag "cute_dsl_bf16_moe_qwen3_30b_decode"
+--routine cute_dsl_bf16_moe --num_tokens 4096 --hidden_size 2048 --intermediate_size 768 --num_experts 128 --top_k 8 --input_dtype bfloat16 --autotune -vv --generate_repro_command --case_tag "cute_dsl_bf16_moe_qwen3_30b_prefill_autotune"
+--routine cute_dsl_bf16_moe --num_tokens 256 --hidden_size 4096 --intermediate_size 384 --num_experts 128 --top_k 8 --input_dtype float16 --refcheck -vv --generate_repro_command --case_tag "cute_dsl_bf16_moe_qwen3_235b_tp4_fp16"
+--routine cute_dsl_bf16_moe --num_tokens 1024 --hidden_size 2048 --intermediate_size 512 --num_experts 512 --top_k 10 --local_num_experts 64 --local_expert_offset 64 --input_dtype bfloat16 --refcheck -vv --generate_repro_command --case_tag "cute_dsl_bf16_moe_qwen3_next_ep8"
+--routine cute_dsl_bf16_moe --num_tokens 256 --hidden_size 4096 --intermediate_size 14336 --num_experts 8 --top_k 2 --input_dtype bfloat16 -vv --generate_repro_command --case_tag "cute_dsl_bf16_moe_mixtral_8x7b"
+
 # b12x NVFP4 MoE (Blackwell SM12.0/SM12.1 only; SwiGLU or ReLU2, bf16 input)
 --routine b12x_fused_moe --num_tokens 1024 --hidden_size 1024 --intermediate_size 2688 --num_experts 512 --top_k 22 -vv --generate_repro_command --case_tag "b12x_moe_swiglu"
 --routine b12x_fused_moe --num_tokens 1 --hidden_size 1024 --intermediate_size 2688 --num_experts 512 --top_k 22 --activation-type Relu2 -vv --generate_repro_command --case_tag "b12x_moe_relu2_decode"

@@ -932,10 +932,23 @@ def prepare_trtllm_fp8_block_activations(
 
 
 def _fp8_per_tensor_scale(
-    scale: Union[float, torch.Tensor], *, name: str, device: torch.device
+    scale: Union[float, torch.Tensor],
+    *,
+    name: str,
+    device: torch.device,
+    validate: bool = True,
 ) -> torch.Tensor:
+    """Return ``scale`` as a 0-dim float32 tensor on ``device``.
+
+    ``validate=False`` skips the finite / positive checks, which read the value
+    back to the host. Weight preparation always validates; activation
+    preparation passes ``validate=False`` for a scale that is already a device
+    tensor, so the per-step path launches no sync and can be graph-captured.
+    """
     value = torch.as_tensor(scale, dtype=torch.float32, device=device)
-    if value.numel() != 1 or not bool(torch.isfinite(value).all()) or value.item() <= 0:
+    if value.numel() != 1:
+        raise ValueError(f"{name} must be one FP32 value, got {scale!r}.")
+    if validate and (not bool(torch.isfinite(value).all()) or value.item() <= 0):
         raise ValueError(
             f"{name} must be one finite positive FP32 value, got {scale!r}."
         )
@@ -1065,7 +1078,13 @@ def prepare_trtllm_fp8_per_tensor_activations(
     *,
     hidden_states_scale_global: Union[float, torch.Tensor],
 ) -> Tuple[torch.Tensor, None]:
-    """Quantize ``[M, H]`` BF16 activations with one calibrated E4M3 scale."""
+    """Quantize ``[M, H]`` BF16 activations with one calibrated E4M3 scale.
+
+    A ``hidden_states_scale_global`` that is already a CUDA tensor (the value
+    ``prepare_weights`` validated and stored in the view) is used as-is, so
+    this is a pure device op that can run under CUDA graph capture. A Python
+    float or CPU tensor is validated and copied to the device.
+    """
     if hidden_states_bf16.dtype != torch.bfloat16 or hidden_states_bf16.dim() != 2:
         raise ValueError(
             "prepare_trtllm_fp8_per_tensor_activations expects a 2D BF16 tensor, "
@@ -1076,6 +1095,10 @@ def prepare_trtllm_fp8_per_tensor_activations(
         hidden_states_scale_global,
         name="hidden_states_scale_global",
         device=hidden_states_bf16.device,
+        validate=not (
+            isinstance(hidden_states_scale_global, torch.Tensor)
+            and hidden_states_scale_global.is_cuda
+        ),
     )
     fp8_max = torch.finfo(torch.float8_e4m3fn).max
     quantized = (hidden_states_bf16.float() * scale).clamp(-fp8_max, fp8_max)
@@ -2037,29 +2060,12 @@ def _require_canonical_cutlass_bf16_weights(
     return w1_bf16.to(device).contiguous(), w2_bf16.to(device).contiguous(), device
 
 
-def prepare_cutlass_fp8_per_tensor_activations(
-    hidden_states_bf16: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Quantize ``[M, H]`` BF16 activations to E4M3 plus a scalar dequant scale."""
-    if hidden_states_bf16.dtype != torch.bfloat16 or hidden_states_bf16.dim() != 2:
-        raise ValueError(
-            "prepare_cutlass_fp8_per_tensor_activations expects a 2D BF16 tensor, "
-            f"got shape={tuple(hidden_states_bf16.shape)}, "
-            f"dtype={hidden_states_bf16.dtype}."
-        )
-    fp8_max = torch.finfo(torch.float8_e4m3fn).max
-    amax = hidden_states_bf16.float().abs().amax()
-    dequant = torch.where(
-        amax > 0, amax / fp8_max, torch.ones_like(amax, dtype=torch.float32)
-    ).to(torch.float32)
-    quantized = (hidden_states_bf16.float() / dequant).clamp(-fp8_max, fp8_max)
-    return quantized.to(torch.float8_e4m3fn), dequant.reshape(())
-
-
 def prepare_cutlass_fp8_per_tensor_weights(
     w1_bf16: torch.Tensor,
     w2_bf16: torch.Tensor,
     *,
+    hidden_states_scale_global: Union[float, torch.Tensor],
+    intermediate_scale_global: Union[float, torch.Tensor],
     num_local_experts: int,
     hidden_size: int,
     intermediate_size: int,
@@ -2068,9 +2074,23 @@ def prepare_cutlass_fp8_per_tensor_weights(
 ) -> Dict[str, torch.Tensor]:
     """Build the unshuffled per-tensor FP8 view for ``CutlassFp8PerTensorRunner``.
 
-    Each expert uses one E4M3 multiplier. The returned ``fc1_dequant`` /
-    ``fc2_dequant`` tensors are the CUTLASS dequant scales (``amax / fp8_max``),
-    not TRTLLM's inverted calibration multipliers.
+    Each expert uses one E4M3 multiplier. ``hidden_states_scale_global`` and
+    ``intermediate_scale_global`` are the same static calibration
+    *multipliers* the TRTLLM per-tensor view carries (``q = x * scale``);
+    activations are quantized with the former by
+    ``prepare_trtllm_fp8_per_tensor_activations`` and carry no pack scale, and
+    GEMM1 output is requantized with the latter before GEMM2.
+
+    The flat CUTLASS ``quant_scales`` ABI is folded here, once at load time:
+    ``fc1_dequant_scale = fc1_dequant / hidden_states_scale_global`` (``[E]``),
+    ``fc2_act_quant_scale = intermediate_scale_global`` (0-dim),
+    ``fc2_dequant_scale = fc2_dequant / intermediate_scale_global`` (``[E]``),
+    ``fc1_act_dequant_scale = 1 / hidden_states_scale_global`` (0-dim). The
+    runner passes these four through unchanged. ``fc1_dequant`` /
+    ``fc2_dequant`` (per-expert weight dequant, ``amax / fp8_max``) and the two
+    global multipliers are kept as calibration metadata for callers preparing
+    activations or building a reference; the runner ignores them. To
+    re-calibrate, call this function again.
     """
     w1_bf16, w2_bf16, device = _require_canonical_cutlass_bf16_weights(
         w1_bf16,
@@ -2084,11 +2104,27 @@ def prepare_cutlass_fp8_per_tensor_weights(
     )
     w1_q, w1_mult = _quantize_fp8_per_expert(w1_bf16)
     w2_q, w2_mult = _quantize_fp8_per_expert(w2_bf16)
+    act_scale = _fp8_per_tensor_scale(
+        hidden_states_scale_global, name="hidden_states_scale_global", device=device
+    )
+    inter_scale = _fp8_per_tensor_scale(
+        intermediate_scale_global, name="intermediate_scale_global", device=device
+    )
+    fc1_dequant = (1.0 / w1_mult).contiguous()
+    fc2_dequant = (1.0 / w2_mult).contiguous()
     return {
         "fc1_expert_weights": w1_q,
         "fc2_expert_weights": w2_q,
-        "fc1_dequant": (1.0 / w1_mult).contiguous(),
-        "fc2_dequant": (1.0 / w2_mult).contiguous(),
+        # Flat quant_scales ABI, in slot order.
+        "fc1_dequant_scale": (fc1_dequant / act_scale).contiguous(),
+        "fc2_act_quant_scale": inter_scale.clone(),
+        "fc2_dequant_scale": (fc2_dequant / inter_scale).contiguous(),
+        "fc1_act_dequant_scale": act_scale.reciprocal(),
+        # Calibration metadata; the runner ignores these keys.
+        "fc1_dequant": fc1_dequant,
+        "fc2_dequant": fc2_dequant,
+        "hidden_states_scale_global": act_scale,
+        "intermediate_scale_global": inter_scale,
     }
 
 

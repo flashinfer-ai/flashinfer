@@ -342,6 +342,13 @@ The CuteDSL backends are conditionally available when the
 
     .. automethod:: __init__
 
+.. autoclass:: CuteDslBf16MoEWrapper
+    :members:
+    :inherited-members:
+    :show-inheritance:
+
+    .. automethod:: __init__
+
 .. autoclass:: CuteDslMxfp8Mxfp4MoEWrapper
     :members:
     :inherited-members:

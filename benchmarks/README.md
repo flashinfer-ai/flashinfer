@@ -52,6 +52,7 @@ Currently supports testing attention, gemm, fused MOE, normalization, quantizati
     - `trtllm_fp8_block_scale_moe` - MOE with FP8 quantized weights and block-wise scaling.
     - `trtllm_fp8_per_tensor_scale_moe` - MOE with FP8 quantized weights and per-tensor scaling.
     - `cutlass_fused_moe` - CUTLASS fused MoE (base/fp8/nvfp4 variants with optional TP/EP)
+    - `cute_dsl_bf16_moe` - CuTe-DSL BF16/FP16 fused MoE for Hopper.
     - `unified_moe` - Unified MoE API comparison between the CUTLASS and cuTile backends. It supports BF16, NVFP4 and MXFP4 W4A4/W4A16, per-tensor FP8 and MXFP8 W8A8/W8A16, and MXFP4 W4A8 with gated SwiGLU, SwiGLU-Step, GeGLU, GeGLU-Tanh, and SiTU or non-gated GELU, ReLU, SiLU, ReLU2, and Identity; filters unsupported backends at runtime; and can autotune each backend independently.
 - MOE Communication:
     - `moe_a2a_dispatch_combine` - MoE All-to-All dispatch + combine benchmark for multi-GPU expert-parallel inference. Requires `mpirun` for multi-GPU execution. Supports optional quantization (FP8, NVFP4, FP8 block-scale) and real MoE kernel computation.
@@ -578,6 +579,7 @@ Legend:
 | **trtllm_fp8_block_scale_moe** |  |  |  |  |  | trtllm | trtllm |  |
 | **trtllm_fp8_per_tensor_scale_moe** |  |  |  |  |  | trtllm | trtllm |  |
 | **cutlass_fused_moe** |  |  |  |  |  | cutlass | cutlass |  |
+| **cute_dsl_bf16_moe** |  |  |  |  | cute-dsl |  |  |  |
 | **unified_moe** |  |  |  | cutlass (BF16), cutile (BF16, NVFP4/MXFP4 W4A16) | cutlass (BF16, MXFP4 W4A16), cutile (BF16, NVFP4/MXFP4 W4A16) | cutlass | cutlass | cutlass (BF16, NVFP4 W4A4), cutile (BF16, NVFP4/MXFP4 W4A4/W4A16) |
 | **moe_a2a_dispatch_combine** |  |  |  |  |  | moe_a2a | moe_a2a |  |
 | **allreduce_fusion** |  |  |  |  |  | allreduce | allreduce |  |
@@ -636,7 +638,7 @@ Backend Legend:
 - trtllm-native: TensorRT-LLM (out-of-wrapper)
 - prims-ts: Experimental task-scheduled attention kernels (Blackwell SM100/SM103)
 - cuda: FlashInfer CUDA kernels
-- cute-dsl: FlashInfer CuTe-DSL kernels (Blackwell SM10.0+)
+- cute-dsl: FlashInfer CuTe-DSL kernels (Hopper SM90; Blackwell SM100+)
 - cute-dsl-prims: SM120 PRIMS FP8 batch-prefill kernels. Ragged inputs use
   packed NHD storage, while paged K/V uses HND storage. Paged attention accepts
   the standard combined cache or separate K/V pools without copying. The
