@@ -127,6 +127,7 @@ class _MLADecodePlanState:
     compiled: Callable[..., object]
     policy: tuple[tuple[str, object], ...]
     split_kv: int
+    skip_corr_threshold: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -137,6 +138,7 @@ class _MLARuntime:
     num_physical_pages: int
     bmm1_scale: float
     bmm2_scale: float
+    skip_corr_threshold: float = 0.0
 
 
 def _make_mla_workspace_layout(
@@ -667,6 +669,26 @@ def _validate_out(
     _validate_16byte_alignment(out, "out")
 
 
+def _validate_mla_skip_corr_threshold(
+    threshold: object, *, q_dtype: torch.dtype, bmm1_scale: float
+) -> float:
+    """Validate the public skip-correction threshold against the QKV dtype.
+
+    The bound is 8 for E4M3 QKV (``1.75 * 2**8 == 448``) and 64 for BF16 QKV;
+    see ``max_skip_corr_threshold`` for the derivation.
+    """
+
+    from .kernels.mla_decode.throughput_2cta.config import (
+        validate_skip_corr_threshold,
+    )
+
+    return validate_skip_corr_threshold(
+        threshold,
+        qkv_dtype=_kernel_dtype_name(_dtype_key(q_dtype)),
+        bmm1_scale=bmm1_scale,
+    )
+
+
 def _kernel_dtype_name(dtype_key: str) -> str:
     names = {
         "bfloat16": "bf16",
@@ -716,6 +738,7 @@ def _resolve_mla_decode_launch_spec(
     output_dtype_key: str,
     mask_type: str,
     seq_len_q: int = 1,
+    enable_skip_correction: bool = False,
 ):
     """Resolve and cache MLA policy/workspace without compiling."""
 
@@ -858,6 +881,7 @@ def _resolve_mla_decode_launch_spec(
                 explicit_split_kv=None,
                 explicit_persistent=None,
                 mask_type=mask_type,
+                enable_skip_correction=enable_skip_correction,
             )
             final_cfg = kernel._make_config()
             split_kv = int(final_cfg.num_ctas_per_seq_kv)
@@ -940,6 +964,7 @@ def _resolve_mla_decode_launch_spec(
                 seq_len_q=seq_len_q,
                 batch_size=batch_size,
                 mask_type=mask_type,
+                enable_skip_correction=enable_skip_correction,
             )
             workspace_size = compute_2cta_workspace_size(
                 tile_size_q=int(launch_shape.tile_size_q),
@@ -1042,6 +1067,8 @@ def _get_compiled_mla_decode(
 
     import cutlass
     import cutlass.cute as cute
+
+    from .kernels.mla_decode.throughput_2cta.kernel import MlaDecodeTs
 
     device_index = compile_spec.device_index
     num_heads = compile_spec.num_heads
@@ -1160,24 +1187,54 @@ def _get_compiled_mla_decode(
 
     # Task objects carry loop-local state through generated control flow, so
     # select the public staged frontend for this compilation.
+    compile_args = [
+        q_latent_fake,
+        q_rope_fake,
+        c_latent_fake,
+        c_rope_fake,
+        page_offsets_fake,
+        out_fake,
+        lse_fake,
+        workspace_fake,
+        cutlass.Int32(compile_spec.split_kv),
+        cache_seqs_fake,
+        qo_indptr_fake,
+        None,
+        cutlass.Float32(1.0),
+        cutlass.Float32(1.0),
+    ]
+    if isinstance(kernel, MlaDecodeTs):
+        # DSV4's raw Gather4 tensor-map pair has its own ABI slot.  Dense
+        # throughput-2CTA does not use it, so retain an explicit optional
+        # pointer rather than aliasing kernel_workspace.
+        compile_args.insert(8, None)
+        # The sparse DSV4 specialization has a separate per-query scan-width
+        # input between raw cache lengths and packed-Q offsets.  Dense MLA
+        # keeps it specialized to None.
+        compile_args.insert(11, None)
+        # The 2CTA kernel has one additional cache argument for its sparse
+        # specialization.  Compile the dense path with an ignored tensor
+        # rather than an optional pointer so TVM-FFI retains an unambiguous
+        # runtime ABI.
+        compile_args.append(c_latent_fake)
+        # Throughput-2CTA accepts maxQ as a runtime scheduler scalar. Dense
+        # MLA keeps the existing static policy key, while DSV4 can reuse one
+        # specialization across serving B/maxQ changes.
+        compile_args.append(cutlass.Int32(max_seq_len_q))
+        # Dense MLA does not use DSV4's skip-correction approximation.  Keep
+        # the shared 2CTA runtime ABI explicit and select the disabled value.
+        compile_args.append(cutlass.Float32(0.0))
+        # Dense MLA does not use DSv4's inverse-RoPE/FP8-quant outputs.
+        compile_args.extend((None, None))
+    else:
+        # The 1CTA kernel takes the runtime skip-correction threshold after
+        # the two scales.
+        compile_args.append(cutlass.Float32(0.0))
+    compile_args.append(stream_fake)
     with torch.cuda.device(device_index):
         compiled = cute.compile[cute.FrontendNext](
             kernel,
-            q_latent_fake,
-            q_rope_fake,
-            c_latent_fake,
-            c_rope_fake,
-            page_offsets_fake,
-            out_fake,
-            lse_fake,
-            workspace_fake,
-            cutlass.Int32(compile_spec.split_kv),
-            cache_seqs_fake,
-            qo_indptr_fake,
-            None,
-            cutlass.Float32(1.0),
-            cutlass.Float32(1.0),
-            stream_fake,
+            *compile_args,
             options=_COMPILE_OPTIONS,
         )
     return compiled
@@ -1272,6 +1329,7 @@ def _prepare_mla_runtime(
     bmm2_scale: float,
     out: Optional[torch.Tensor],
     validate: bool,
+    skip_corr_threshold: float = 0.0,
 ) -> _MLARuntime:
     """Normalize one launch, optionally validating its public arguments."""
 
@@ -1312,7 +1370,13 @@ def _prepare_mla_runtime(
             )
         effective_bmm1_scale = _validate_scale(bmm1_scale, "bmm1_scale")
         effective_bmm2_scale = _validate_scale(bmm2_scale, "bmm2_scale")
+        effective_skip_corr_threshold = _validate_mla_skip_corr_threshold(
+            skip_corr_threshold,
+            q_dtype=q_dtype,
+            bmm1_scale=effective_bmm1_scale,
+        )
     else:
+        effective_skip_corr_threshold = float(skip_corr_threshold)
         normalized_cache = kv_cache[:, 0] if kv_cache.ndim == 4 else kv_cache
         num_physical_pages = int(normalized_cache.shape[0])
         effective_bmm1_scale = bmm1_scale
@@ -1343,6 +1407,7 @@ def _prepare_mla_runtime(
         num_physical_pages=num_physical_pages,
         bmm1_scale=effective_bmm1_scale,
         bmm2_scale=effective_bmm2_scale,
+        skip_corr_threshold=effective_skip_corr_threshold,
     )
 
 
@@ -1354,9 +1419,11 @@ def _launch_mla_decode(
     qo_indptr: Optional[torch.Tensor],
     packed_query: bool,
     kv_lora_rank: int,
+    max_seq_len_q: int,
     split_kv: int,
     workspace: _MLAWorkspaceViews,
     compiled: Callable[..., object],
+    uses_throughput_2cta: bool,
 ) -> torch.Tensor:
     """Form the dimension-first views and launch one compiled MLA kernel."""
 
@@ -1378,7 +1445,7 @@ def _launch_mla_decode(
     c_latent = runtime.normalized_cache[..., :kv_lora_rank].permute(1, 2, 0)
     c_rope = runtime.normalized_cache[..., kv_lora_rank:].permute(1, 2, 0)
     page_offsets = block_tables.transpose(0, 1)
-    compiled(
+    launch_args = [
         q_latent,
         q_rope,
         c_latent,
@@ -1393,7 +1460,17 @@ def _launch_mla_decode(
         None,
         runtime.bmm1_scale,
         runtime.bmm2_scale,
-    )
+    ]
+    if uses_throughput_2cta:
+        launch_args.insert(8, None)
+        launch_args.insert(11, None)
+        launch_args.append(c_latent)
+        launch_args.append(max_seq_len_q)
+        launch_args.append(runtime.skip_corr_threshold)
+        launch_args.extend((None, None))
+    else:
+        launch_args.append(runtime.skip_corr_threshold)
+    compiled(*launch_args)
     return runtime.out
 
 
@@ -1415,6 +1492,7 @@ def prims_ts_batch_mla_decode_with_kv_cache(
     bmm2_scale: float = 1.0,
     mask_type: Literal["dense", "causal"] = "causal",
     out_dtype: torch.dtype = torch.bfloat16,
+    skip_corr_threshold: float = 0.0,
 ) -> torch.Tensor:
     """Launch fixed or packed-query paged MLA decode with caller-owned scratch.
 
@@ -1480,6 +1558,13 @@ def prims_ts_batch_mla_decode_with_kv_cache(
         Attention mask mode.
     out_dtype : torch.dtype
         Output dtype.
+    skip_corr_threshold : float
+        Skip-correction threshold in log2 units. ``0.0``
+        (default) keeps the exact online-softmax rescale. A positive value
+        freezes the running row max while a K tile raises it by at most this
+        amount and skips the O rescale for such tiles. The bound is 8 for E4M3
+        QKV (``1.75 * 2**8 == 448``) and 64 for BF16 QKV. Both the
+        1CTA and 2CTA MLA kernels support it.
     """
 
     packed_query = qo_indptr is not None
@@ -1529,6 +1614,11 @@ def prims_ts_batch_mla_decode_with_kv_cache(
         )
     _validate_mask(mask_type)
     _validate_mla_dtype_pair(query.dtype, normalized_cache.dtype, out_dtype)
+    skip_corr_threshold = _validate_mla_skip_corr_threshold(
+        skip_corr_threshold,
+        q_dtype=query.dtype,
+        bmm1_scale=_validate_scale(bmm1_scale, "bmm1_scale"),
+    )
     device_index = _validate_runtime_device(query.device)
     spec_key = (
         device_index,
@@ -1544,7 +1634,9 @@ def prims_ts_batch_mla_decode_with_kv_cache(
         mask_type,
         max_seq_len_q,
     )
-    spec = _resolve_mla_decode_launch_spec(*spec_key)
+    spec = _resolve_mla_decode_launch_spec(
+        *spec_key, enable_skip_correction=skip_corr_threshold > 0.0
+    )
     layout = _make_mla_workspace_layout(
         spec.kernel_workspace_bytes, batch_size, num_heads, max_seq_len_q
     )
@@ -1570,6 +1662,7 @@ def prims_ts_batch_mla_decode_with_kv_cache(
         bmm2_scale=bmm2_scale,
         out=out,
         validate=True,
+        skip_corr_threshold=skip_corr_threshold,
     )
     compile_spec = _make_mla_decode_compile_spec(
         spec,
@@ -1592,9 +1685,11 @@ def prims_ts_batch_mla_decode_with_kv_cache(
         qo_indptr=qo_indptr,
         packed_query=packed_query,
         kv_lora_rank=kv_lora_rank,
+        max_seq_len_q=max_seq_len_q,
         split_kv=spec.split_kv,
         workspace=workspace,
         compiled=compiled,
+        uses_throughput_2cta=dict(spec.policy)["kernel"] == "throughput_2cta",
     )
 
 
@@ -1624,6 +1719,7 @@ class BatchMLADecodePagedTSWrapper:
         o_data_type: torch.dtype,
         mask_type: Literal["dense", "causal"] = "causal",
         workspace_buffer: Optional[torch.Tensor] = None,
+        skip_corr_threshold: float = 0.0,
     ) -> None:
         """Compile one static MLA shape and bind its reusable workspace.
 
@@ -1666,6 +1762,13 @@ class BatchMLADecodePagedTSWrapper:
             must be 32-byte aligned and large enough for the selected plan.
             When omitted, planning allocates the buffer. The retained buffer
             is exclusive to one in-flight launch or graph replay.
+        skip_corr_threshold : float
+            Skip-correction threshold in log2 units. ``0.0``
+            (default) keeps the exact online-softmax rescale. A positive value
+            freezes the running row max while a K tile raises it by at most this
+            amount and skips the O rescale for such tiles. The bound is 8 for E4M3
+            QKV (``1.75 * 2**8 == 448``) and 64 for BF16 QKV. Both the
+            1CTA and 2CTA MLA kernels support it.
         """
 
         if not isinstance(packed_query, bool):
@@ -1684,6 +1787,11 @@ class BatchMLADecodePagedTSWrapper:
             max_seq_len_q=max_seq_len_q,
         )
         _validate_mla_dtype_pair(q_data_type, kv_data_type, o_data_type)
+        # Range check only: ``bmm1_scale`` is a run() argument and is always
+        # validated positive there, which the enabled protocol requires.
+        skip_corr_threshold = _validate_mla_skip_corr_threshold(
+            skip_corr_threshold, q_dtype=q_data_type, bmm1_scale=1.0
+        )
         device, device_index = _resolve_cuda_device(device)
         required_page_columns = _ceil_div(max_kv_len, page_size)
 
@@ -1701,7 +1809,9 @@ class BatchMLADecodePagedTSWrapper:
             mask_type,
             max_seq_len_q,
         )
-        spec = _resolve_mla_decode_launch_spec(*spec_key)
+        spec = _resolve_mla_decode_launch_spec(
+            *spec_key, enable_skip_correction=skip_corr_threshold > 0.0
+        )
         compile_spec = _make_mla_decode_compile_spec(
             spec,
             device_index=device_index,
@@ -1754,6 +1864,7 @@ class BatchMLADecodePagedTSWrapper:
             compiled=compiled,
             policy=policy,
             split_kv=int(dict(policy)["split_kv"]),
+            skip_corr_threshold=skip_corr_threshold,
         )
 
     @flashinfer_experimental_api(trace=prims_ts_decode_mla_wrapper_trace_dispatch)
@@ -1832,6 +1943,7 @@ class BatchMLADecodePagedTSWrapper:
             bmm2_scale=bmm2_scale,
             out=out,
             validate=validate,
+            skip_corr_threshold=state.skip_corr_threshold,
         )
         if validate:
             _validate_mla_run_metadata(
@@ -1851,6 +1963,8 @@ class BatchMLADecodePagedTSWrapper:
             split_kv=state.split_kv,
             workspace=state.workspace_views,
             compiled=state.compiled,
+            max_seq_len_q=state.max_seq_len_q,
+            uses_throughput_2cta=(dict(state.policy)["kernel"] == "throughput_2cta"),
         )
 
 
@@ -1871,6 +1985,7 @@ def batch_mla_decode_with_paged_kv_cache(
     bmm2_scale: float = 1.0,
     out: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
+    skip_corr_threshold: float = 0.0,
 ) -> torch.Tensor:
     """One-shot convenience wrapper for fixed or packed-query MLA decode.
 
@@ -1909,6 +2024,13 @@ def batch_mla_decode_with_paged_kv_cache(
         Caller-owned output tensor.
     out_dtype : torch.dtype
         Output dtype.
+    skip_corr_threshold : float
+        Skip-correction threshold in log2 units. ``0.0``
+        (default) keeps the exact online-softmax rescale. A positive value
+        freezes the running row max while a K tile raises it by at most this
+        amount and skips the O rescale for such tiles. The bound is 8 for E4M3
+        QKV (``1.75 * 2**8 == 448``) and 64 for BF16 QKV. Both the
+        1CTA and 2CTA MLA kernels support it.
 
     Returns
     -------
@@ -2036,6 +2158,7 @@ def batch_mla_decode_with_paged_kv_cache(
         kv_data_type=normalized_cache.dtype,
         o_data_type=out_dtype,
         mask_type=mask_type,
+        skip_corr_threshold=skip_corr_threshold,
     )
     return wrapper.run(
         query,

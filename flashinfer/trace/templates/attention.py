@@ -1630,6 +1630,14 @@ def _make_prims_ts_decode_mla_trace(*, rank4_cache: bool, packed_query: bool):
             "max_seq_len_q": Scalar("int32", optional=not packed_query),
             "bmm1_scale": Scalar("float32", optional=True),
             "bmm2_scale": Scalar("float32", optional=True),
+            "skip_corr_threshold": Scalar(
+                "float32",
+                optional=True,
+                description=(
+                    "Skip-correction threshold in log2 units; 0 keeps the exact "
+                    "rescale, a positive value selects the max-freeze kernel."
+                ),
+            ),
             "mask_type": Scalar("string", optional=True),
             "out_dtype": Scalar("dtype", optional=True),
         },
@@ -1736,6 +1744,14 @@ def _make_prims_ts_decode_mla_one_shot_trace(*, rank4_cache: bool, packed_query:
             "max_kv_len": Scalar("int32", optional=True),
             "bmm1_scale": Scalar("float32", optional=True),
             "bmm2_scale": Scalar("float32", optional=True),
+            "skip_corr_threshold": Scalar(
+                "float32",
+                optional=True,
+                description=(
+                    "Skip-correction threshold in log2 units; 0 keeps the exact "
+                    "rescale, a positive value selects the max-freeze kernel."
+                ),
+            ),
             "mask_type": Scalar("string", optional=True),
             "out_dtype": Scalar("dtype", optional=True),
         },
@@ -1792,6 +1808,7 @@ def _make_prims_ts_decode_mla_wrapper_trace(
     max_kv_len: int,
     kv_lora_rank: int,
     qk_rope_head_dim: int,
+    skip_corr_threshold: float = 0.0,
 ):
     cache_suffix = "_rank4" if rank4_cache else ""
     q_suffix = "_packed_q" if packed_query else ""
@@ -1823,6 +1840,14 @@ def _make_prims_ts_decode_mla_wrapper_trace(
             abbrev="kpe",
             value=qk_rope_head_dim,
             description="RoPE head dimension frozen by plan().",
+        ),
+        "skip_corr_threshold": Const(
+            abbrev="",
+            value=int(round(skip_corr_threshold)),
+            description=(
+                "Skip-correction threshold frozen by plan() in log2 units "
+                "(rounded to an integer axis); zero keeps the exact rescale."
+            ),
         ),
         "num_pages": Var(description="Physical MLA cache page capacity."),
         "page_size": Const(abbrev="ps"),
@@ -1925,6 +1950,7 @@ _PRIMS_TS_DECODE_MLA_WRAPPER_TRACE_EXAMPLES = {
         max_kv_len=1,
         kv_lora_rank=512,
         qk_rope_head_dim=64,
+        skip_corr_threshold=0.0,
     )
     for rank4_cache in (False, True)
     for packed_query in (False, True)
@@ -1943,6 +1969,7 @@ def _get_prims_ts_decode_mla_wrapper_trace(
     max_kv_len: int,
     kv_lora_rank: int,
     qk_rope_head_dim: int,
+    skip_corr_threshold: float = 0.0,
 ) -> TraceTemplate:
     """Return one stable trace template for a frozen MLA plan identity."""
 
@@ -1954,6 +1981,7 @@ def _get_prims_ts_decode_mla_wrapper_trace(
         max_kv_len=max_kv_len,
         kv_lora_rank=kv_lora_rank,
         qk_rope_head_dim=qk_rope_head_dim,
+        skip_corr_threshold=skip_corr_threshold,
     )
 
 
@@ -1990,6 +2018,7 @@ def prims_ts_decode_mla_wrapper_trace_dispatch(**kwargs):
         max_kv_len=int(state.max_kv_len),
         kv_lora_rank=int(state.kv_lora_rank),
         qk_rope_head_dim=int(state.qk_rope_head_dim),
+        skip_corr_threshold=float(getattr(state, "skip_corr_threshold", 0.0)),
     )
 
 
@@ -5968,4 +5997,181 @@ cute_dsl_batch_prefill_run_trace = TraceTemplate(
     },
     tags=["status:verified", "stage:prefill", "backend:cute-dsl"],
     reference=_cute_dsl_batch_prefill_run_reference,
+)
+
+
+# ---------------------------------------------------------------------------
+# PrimTS DSV4 sparse MLA (CSA / HCA share one compiled kernel)
+# ---------------------------------------------------------------------------
+
+
+def _dsv4_sparse_mla_axes() -> dict[str, Var | Const]:
+    return {
+        "total_q": Var(description="Packed query-token count T."),
+        "num_heads": Const(abbrev="h", value=128),
+        "head_dim": Const(abbrev="d", value=512),
+        "swa_rows": Var(description="Physical rows in the sliding-window pool."),
+        "compressed_rows": Var(description="Physical rows in the compressed pool."),
+        "sparse_capacity": Var(
+            description="Routing slots per query (Kmax): 128 SWA + compressed."
+        ),
+        "batch_size": Var(description="Packed request count B."),
+        "len_cu_seqlens_q": Var(description="B + 1 cumulative Q offsets."),
+    }
+
+
+def _dsv4_sparse_mla_inputs() -> dict[str, Tensor | Scalar]:
+    return {
+        "query": Tensor(["total_q", "num_heads", "head_dim"]),
+        "compressed_kv_pool": Tensor(["compressed_rows", "head_dim"]),
+        "sliding_window_kv_pool": Tensor(["swa_rows", "head_dim"]),
+        "ptr_page_idx_kv": Tensor(
+            ["total_q", "sparse_capacity"],
+            dtype="int32",
+            description=(
+                "Physical routes: slots [0,128) address the SWA pool (-1 = "
+                "inactive), the remaining slots address the compressed pool."
+            ),
+        ),
+        "ptr_sparse_mla_topk_lens": Tensor(
+            ["total_q"], dtype="int32", description="Active scan width per query."
+        ),
+        "ptr_seq_lens_kv": Tensor(
+            ["batch_size"], dtype="int32", description="Raw post-append KV lengths."
+        ),
+        "ptr_cum_seq_lens_q": Tensor(["len_cu_seqlens_q"], dtype="int32"),
+        "max_seq_len_q": Scalar(
+            "int32", description="Runtime maximum request-local Q length."
+        ),
+        "bmm1_scale": Scalar("float32", optional=True),
+        "bmm2_scale": Scalar("float32", optional=True),
+        "skip_corr_threshold": Scalar(
+            "float32",
+            optional=True,
+            description="E4M3 skip-correction threshold in log2 units, in [0, 8].",
+        ),
+    }
+
+
+_DSV4_SPARSE_MLA_CONSTRAINTS = [
+    "num_heads == 128",
+    "head_dim == 512",
+    "sparse_capacity >= 128",
+    "sparse_capacity % 4 == 0",
+    "len_cu_seqlens_q == batch_size + 1",
+    "total_q == ptr_cum_seq_lens_q[-1].item()",
+    "min(ptr_sparse_mla_topk_lens) >= 128",
+    "max(ptr_sparse_mla_topk_lens) <= sparse_capacity",
+]
+
+prims_ts_dsv4_sparse_mla_trace = TraceTemplate(
+    op_type="mla_sparse",
+    name_prefix="prims_ts_dsv4_sparse_mla",
+    description=(
+        "PrimTS DSV4 sparse MLA decode over packed E4M3 queries and separate "
+        "sliding-window / compressed KV pools with per-query physical routing; "
+        "CSA and HCA differ only in routing metadata.  BF16 output."
+    ),
+    axes=_dsv4_sparse_mla_axes(),
+    inputs=_dsv4_sparse_mla_inputs(),
+    outputs={
+        "output": Tensor(
+            ["total_q", "num_heads", "head_dim"], dtype="bfloat16", param="out"
+        ),
+    },
+    constraints=_DSV4_SPARSE_MLA_CONSTRAINTS,
+    tags=["stage:decode", "backend:prims-ts", "status:experimental", "mla", "dsv4"],
+)
+
+
+def _dsv4_rope_quant_axes() -> dict[str, Var | Const]:
+    axes = _dsv4_sparse_mla_axes()
+    axes["max_position"] = Var(description="Rows of the inverse-RoPE cos/sin cache.")
+    axes["rope_cache_width"] = Const(abbrev="", value=64)
+    axes["head_groups"] = Const(abbrev="", value=16)
+    axes["heads_per_group"] = Const(abbrev="", value=8)
+    axes["scale_rows"] = Const(abbrev="", value=32)
+    axes["scale_cols"] = Var(description="pad4(total_q) FP32 scale columns.")
+    return axes
+
+
+def _dsv4_rope_quant_inputs() -> dict[str, Tensor | Scalar]:
+    inputs = _dsv4_sparse_mla_inputs()
+    inputs["inv_rope_cos_sin_cache"] = Tensor(
+        ["max_position", "rope_cache_width"],
+        description="FP32 [cos(32), sin(32)] rows indexed by raw KV position.",
+    )
+    return inputs
+
+
+prims_ts_dsv4_sparse_mla_rope_quant_trace = TraceTemplate(
+    op_type="mla_sparse",
+    name_prefix="prims_ts_dsv4_sparse_mla_rope_quant",
+    description=(
+        "PrimTS DSV4 sparse MLA decode with the fused inverse-RoPE + "
+        "grouped E4M3 output epilogue: O is [16, T, 8, 512] E4M3 with one FP32 "
+        "dequant scale per contiguous D128 block in [16, 32, pad4(T)]."
+    ),
+    axes=_dsv4_rope_quant_axes(),
+    inputs=_dsv4_rope_quant_inputs(),
+    outputs={
+        "output": Tensor(
+            ["head_groups", "total_q", "heads_per_group", "head_dim"],
+            dtype="float8_e4m3fn",
+            param="out",
+        ),
+        "output_scale": Tensor(
+            ["head_groups", "scale_rows", "scale_cols"],
+            dtype="float32",
+            param="out_scale",
+        ),
+    },
+    constraints=[
+        *_DSV4_SPARSE_MLA_CONSTRAINTS,
+        "rope_cache_width == 64",
+        "scale_cols == (total_q + 3) // 4 * 4",
+        "max_position >= max(ptr_seq_lens_kv)",
+    ],
+    tags=["stage:decode", "backend:prims-ts", "status:experimental", "mla", "dsv4"],
+)
+
+
+def _dsv4_rope_quant_ue8m0_axes() -> dict[str, Var | Const]:
+    axes = _dsv4_rope_quant_axes()
+    del axes["scale_rows"]
+    axes["scale_cols"] = Var(description="pad4(total_q) packed UE8M0 scale words.")
+    return axes
+
+
+prims_ts_dsv4_sparse_mla_rope_quant_ue8m0_trace = TraceTemplate(
+    op_type="mla_sparse",
+    name_prefix="prims_ts_dsv4_sparse_mla_rope_quant_ue8m0",
+    description=(
+        "PrimTS DSV4 sparse MLA decode with the fused inverse-RoPE + "
+        "grouped E4M3 output epilogue and packed UE8M0 scales "
+        "(RopeQuantUe8m0Sf): O is [16, T, 8, 512] E4M3; out_scale is INT32 "
+        "[16, 8, pad4(T)] where each word packs the four D128-block exponent "
+        "bytes of one head, scale = 2 ** (byte - 127)."
+    ),
+    axes=_dsv4_rope_quant_ue8m0_axes(),
+    inputs=_dsv4_rope_quant_inputs(),
+    outputs={
+        "output": Tensor(
+            ["head_groups", "total_q", "heads_per_group", "head_dim"],
+            dtype="float8_e4m3fn",
+            param="out",
+        ),
+        "output_scale": Tensor(
+            ["head_groups", "heads_per_group", "scale_cols"],
+            dtype="int32",
+            param="out_scale",
+        ),
+    },
+    constraints=[
+        *_DSV4_SPARSE_MLA_CONSTRAINTS,
+        "rope_cache_width == 64",
+        "scale_cols == (total_q + 3) // 4 * 4",
+        "max_position >= max(ptr_seq_lens_kv)",
+    ],
+    tags=["stage:decode", "backend:prims-ts", "status:experimental", "mla", "dsv4"],
 )
