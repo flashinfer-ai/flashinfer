@@ -1,7 +1,7 @@
 """Multi-rank smoke + correctness tests for MoEEpMegaLayer (DeepGEMM backend).
 
 Launched via torchrun:
-    torchrun --nproc_per_node=4 -m pytest tests/moe_ep/test_moe_ep_deep_gemm_mega_multirank.py -v -m "gpu_4 and arch_blackwell"
+    torchrun --nproc_per_node=4 -m pytest tests/moe_ep/test_moe_ep_deep_gemm_mega_multirank.py -v -m "gpu_4 and arch_sm10x"
 
 Requires Blackwell (sm_100+), >=4 GPUs, and the ``deep_gemm`` package with
 ``fp8_fp4_mega_moe`` support.
@@ -314,7 +314,7 @@ def _run_mega_layer(rank, world_size):
 
 
 @pytest.mark.gpu_4
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 def test_moe_ep_mega_layer_matches_deep_gemm_reference():
     """MoEEpMegaLayer matches the deep_gemm mega-MoE reference."""
     pytest.importorskip("deep_gemm")
@@ -598,7 +598,7 @@ def _run_mega_torch_oracle(rank, world_size):
 
 
 @pytest.mark.gpu_4
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 def test_moe_ep_deep_gemm_mega_multirank_torch_oracle():
     """Real cross-rank EP kernel vs pure-torch global math (see helper doc)."""
     pytest.importorskip("deep_gemm")

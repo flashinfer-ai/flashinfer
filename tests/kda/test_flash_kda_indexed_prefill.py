@@ -347,7 +347,7 @@ def test_source_backend_rejects_output_alias_before_dispatch(
 
 
 @pytest.mark.gpu
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 def test_indexed_fp32_source_backend_matches_flash_kda_reference() -> None:
     reference_root_value = os.environ.get("FLASH_KDA_REFERENCE_ROOT")
     if reference_root_value is None:

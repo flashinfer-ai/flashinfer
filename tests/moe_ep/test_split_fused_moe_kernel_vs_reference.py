@@ -19,7 +19,7 @@ Run on one Blackwell GPU (no torchrun required)::
 
     CUDA_VISIBLE_DEVICES=0 pytest \\
         tests/moe_ep/test_split_fused_moe_kernel_vs_reference.py -v \\
-        -m arch_blackwell
+        -m arch_sm10x
 """
 
 from __future__ import annotations
@@ -174,7 +174,7 @@ def _fp4_quant_dequant(t_2d_bf16):
     return deq.to(t_2d_bf16.device)
 
 
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 def test_split_bf16_kernel_matches_torch_reference():
     """``trtllm_bf16_routed`` (all experts local) matches the fp32 torch oracle."""
     _require_backend(TrtllmBf16Config)
@@ -221,7 +221,7 @@ def test_split_bf16_kernel_matches_torch_reference():
     torch.testing.assert_close(yk, yr, rtol=3e-2, atol=3e-2)
 
 
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 def test_split_nvfp4_kernel_matches_torch_reference():
     """``trtllm_fp4_routed`` (all experts local) matches the dequant torch oracle."""
     _require_backend(TrtllmFp4Config)
@@ -289,7 +289,7 @@ def test_split_nvfp4_kernel_matches_torch_reference():
     assert rel_l2.item() < 0.05
 
 
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 def test_split_w4a8_kernel_matches_direct_runner():
     import torch
 

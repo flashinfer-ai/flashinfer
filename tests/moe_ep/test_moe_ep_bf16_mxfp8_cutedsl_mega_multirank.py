@@ -1,7 +1,7 @@
 """Multi-rank fused-launch tests for MoEEpMegaLayer (sm100_bf16_mxfp8_bf16_cutedsl).
 
 Launched via torchrun:
-    torchrun --nproc_per_node=4 -m pytest tests/moe_ep/test_moe_ep_bf16_mxfp8_cutedsl_mega_multirank.py -v -m "gpu_4 and arch_blackwell"
+    torchrun --nproc_per_node=4 -m pytest tests/moe_ep/test_moe_ep_bf16_mxfp8_cutedsl_mega_multirank.py -v -m "gpu_4 and arch_sm10x"
 """
 
 from __future__ import annotations
@@ -448,7 +448,7 @@ def _run_mega_torch_oracle(rank, world_size, *, in_kernel_fc2_reduce: bool = Fal
 
 @cuda_13_required
 @pytest.mark.gpu_4
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 def test_moe_ep_bf16_mxfp8_cutedsl_mega_layer_matches_reference():
     _require_cuda()
     rank, world_size = _launcher_ranks()
@@ -460,7 +460,7 @@ def test_moe_ep_bf16_mxfp8_cutedsl_mega_layer_matches_reference():
 
 @cuda_13_required
 @pytest.mark.gpu_4
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 def test_moe_ep_bf16_mxfp8_cutedsl_mega_layer_in_kernel_fc2_reduce():
     _require_cuda()
     rank, world_size = _launcher_ranks()
@@ -475,7 +475,7 @@ def test_moe_ep_bf16_mxfp8_cutedsl_mega_layer_in_kernel_fc2_reduce():
 
 @cuda_13_required
 @pytest.mark.gpu_4
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 @pytest.mark.parametrize("in_kernel_fc2_reduce", [False, True])
 def test_moe_ep_bf16_mxfp8_cutedsl_mega_multirank_torch_oracle(in_kernel_fc2_reduce):
     _require_cuda()

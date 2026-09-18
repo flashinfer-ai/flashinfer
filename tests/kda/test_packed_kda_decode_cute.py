@@ -277,7 +277,7 @@ def test_packed_kda_cute_tile_selection_cpu():
     assert _select_tile_v(512) == 128
 
 
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 @pytest.mark.parametrize("batch", _BATCH_CASES)
 def test_packed_kda_cute_matches_reference_and_preserves_pool(
     packed_kda_cute_device, batch
@@ -304,7 +304,7 @@ def test_packed_kda_cute_matches_reference_and_preserves_pool(
     _assert_mutation_contract(case, before_storage)
 
 
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 @pytest.mark.parametrize("tile_v", [8, 16, 32, 64, 128])
 def test_packed_kda_cute_forced_tiles_match_reference(packed_kda_cute_device, tile_v):
     case = _make_case(8, packed_kda_cute_device, seed=20261100 + tile_v)
@@ -326,7 +326,7 @@ def test_packed_kda_cute_forced_tiles_match_reference(packed_kda_cute_device, ti
     _assert_close(case["state"], reference_state)
 
 
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 @pytest.mark.parametrize(
     ("batch", "state_padding"),
     [
@@ -364,7 +364,7 @@ def _shifted_contiguous(tensor):
     return shifted
 
 
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 @pytest.mark.parametrize(
     "target",
     [
@@ -401,7 +401,7 @@ def test_packed_kda_cute_shifted_tensors_match_reference(
     _assert_close(case["state"], reference_state)
 
 
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 @pytest.mark.parametrize("tile_v", [8, 64])
 def test_packed_kda_cute_out_of_range_slots_are_inactive(
     packed_kda_cute_device, tile_v
@@ -433,7 +433,7 @@ def test_packed_kda_cute_out_of_range_slots_are_inactive(
     _assert_mutation_contract(case, before_storage)
 
 
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 def test_packed_kda_cute_all_inactive_is_bitwise_noop(packed_kda_cute_device):
     case = _make_case(1, packed_kda_cute_device, seed=20261200, inactive=False)
     case["indices_host"] = [-1]
@@ -451,7 +451,7 @@ def test_packed_kda_cute_all_inactive_is_bitwise_noop(packed_kda_cute_device):
     )
 
 
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 def test_packed_kda_cute_cuda_graph_replay(packed_kda_cute_device):
     case = _make_case(8, packed_kda_cute_device, seed=20261300)
     initial_storage = case["state_storage"].clone()
@@ -490,7 +490,7 @@ def test_packed_kda_cute_cuda_graph_replay(packed_kda_cute_device):
     _assert_close(case["state"], reference_state)
 
 
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 @pytest.mark.parametrize("batch", [8, 64])
 def test_packed_kda_cute_uses_current_stream(packed_kda_cute_device, batch):
     case = _make_case(batch, packed_kda_cute_device, seed=20261400 + batch)
@@ -516,7 +516,7 @@ def test_packed_kda_cute_uses_current_stream(packed_kda_cute_device, batch):
     _assert_close(case["state"], reference_state)
 
 
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 @pytest.mark.parametrize("batch", [8, 64])
 def test_packed_kda_cute_cuda_graph_replays_changed_inputs_and_indices(
     packed_kda_cute_device, batch
@@ -693,7 +693,7 @@ def _run_packed_kda_512_step_fp64_diagnostic(device):
     assert float(state_error.max()) <= _ATOL
 
 
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 @pytest.mark.long_running
 def test_packed_kda_cute_512_step_fp64_diagnostic(packed_kda_cute_device):
     _run_packed_kda_512_step_fp64_diagnostic(packed_kda_cute_device)
@@ -743,7 +743,7 @@ def _call_recurrent_kda(case, batch, contiguous=False):
     return out
 
 
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 @pytest.mark.parametrize("batch", [8, 64])
 def test_recurrent_kda_t1_fast_path_matches_reference(
     packed_kda_cute_device, monkeypatch, batch
@@ -790,7 +790,7 @@ def test_recurrent_kda_t1_fast_path_matches_reference(
     _assert_close(case2["state"], reference_state)
 
 
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 def test_recurrent_kda_t1_fast_path_toggle(packed_kda_cute_device, monkeypatch):
     """The env toggle switches dispatch: the fast path accepts a padded state
     pool that the generic path rejects, which proves which path ran."""
@@ -805,7 +805,7 @@ def test_recurrent_kda_t1_fast_path_toggle(packed_kda_cute_device, monkeypatch):
         _call_recurrent_kda(case, 8)
 
 
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 def test_recurrent_kda_t1_ineligible_calls_fall_back(
     packed_kda_cute_device, monkeypatch
 ):
@@ -854,7 +854,7 @@ def test_recurrent_kda_t1_ineligible_calls_fall_back(
     _assert_close(case["state"], reference_state)
 
 
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 @pytest.mark.parametrize("batch", [8, 64])
 def test_recurrent_kda_t1_fast_path_precomputed_gate(
     packed_kda_cute_device, monkeypatch, batch

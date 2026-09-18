@@ -16,7 +16,7 @@ Run on one Blackwell GPU from the FlashInfer repo root (no torchrun required)::
     export PYTHONPATH="${PWD}:${PYTHONPATH}"
     MEGA_NO_DIST=1 CUDA_VISIBLE_DEVICES=0 pytest \\
         tests/moe_ep/test_mega_cuda_graph.py -v \\
-        -m arch_blackwell --confcutdir=tests/moe_ep
+        -m arch_sm10x --confcutdir=tests/moe_ep
 """
 
 from __future__ import annotations
@@ -132,7 +132,7 @@ def _random_batch(problem: dict, *, seed: int, num_tokens: int = 32):
     )
 
 
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 @pytest.mark.parametrize("backend_name", ["nvfp4", "mxfp8"])
 @pytest.mark.parametrize(
     "hidden,intermediate",
@@ -196,7 +196,7 @@ def test_mega_layer_graph_capture_replay_matches_eager(
         layer.destroy()
 
 
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 def test_mega_layer_capture_without_warmup_raises(monkeypatch):
     """Lazy workspace alloc inside capture must fail loudly, not corrupt."""
     import torch
@@ -219,7 +219,7 @@ def test_mega_layer_capture_without_warmup_raises(monkeypatch):
         layer.destroy()
 
 
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 def test_mega_compute_output_none_returns_workspace_view(monkeypatch):
     """compute(output=None) is a zero-copy view, bit-equal to the copy path."""
     import torch
@@ -244,7 +244,7 @@ def test_mega_compute_output_none_returns_workspace_view(monkeypatch):
         layer.destroy()
 
 
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 def test_mega_layer_forward_output_view_public_api(monkeypatch):
     """The public opt-in returns the same workspace view as output=None."""
     import torch
@@ -270,7 +270,7 @@ def test_mega_layer_forward_output_view_public_api(monkeypatch):
         layer.destroy()
 
 
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 def test_mega_layer_multi_size_graphs_and_eager_interleave(monkeypatch):
     """Engine pattern: one graph per batch size + eager calls, interleaved.
 

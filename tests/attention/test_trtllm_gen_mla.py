@@ -1700,7 +1700,7 @@ def test_trtllm_batch_decode_mla_preallocated_out(
             )
 
 
-@pytest.mark.arch_blackwell
+@pytest.mark.arch_sm10x
 def test_trtllm_mla_prefill_matches_decode_multi_token_bf16():
     """The prefill name preserves explicit TRTLLM-GEN output/LSE semantics."""
     cc = get_compute_capability(torch.device("cuda"))
