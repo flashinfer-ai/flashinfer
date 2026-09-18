@@ -425,9 +425,12 @@ def _gated_activation_quantize_mx_impl(
     P2: ConstFloat,
     P3: ConstFloat,
     INTER: ConstInt,
+    I64: ConstBool,
 ):
     rows = ct.bid(0) * 16 + ct.arange(16, dtype=ct.int32)
     columns = ct.bid(1) * 128 + ct.arange(128, dtype=ct.int32)
+    if I64:
+        rows = ct.astype(rows, ct.int64)
     base = ct.reshape(rows, (16, 1)) * (2 * INTER) + ct.reshape(columns, (1, 128))
     gate = ct.astype(
         ct.gather(X, (base,), check_bounds=True, padding_value=0), ct.float32
@@ -466,7 +469,7 @@ def _gated_activation_quantize_mx(
     P3: ConstFloat,
     INTER: ConstInt,
 ):
-    _gated_activation_quantize_mx_impl(X, OUT, OS, ACT, P1, P2, P3, INTER)
+    _gated_activation_quantize_mx_impl(X, OUT, OS, ACT, P1, P2, P3, INTER, False)
 
 
 @ct.kernel
@@ -480,7 +483,7 @@ def _gated_activation_quantize_mx_i64(
     P3: ConstFloat,
     INTER: ConstInt,
 ):
-    _gated_activation_quantize_mx_impl(X, OUT, OS, ACT, P1, P2, P3, INTER)
+    _gated_activation_quantize_mx_impl(X, OUT, OS, ACT, P1, P2, P3, INTER, True)
 
 
 @ct.function
@@ -494,9 +497,12 @@ def _gated_activation_amax_impl(
     P3: ConstFloat,
     INTER: ConstInt,
     NUM_COLUMN_TILES: ConstInt,
+    I64: ConstBool,
 ):
     rows = ct.bid(0) * 16 + ct.arange(16, dtype=ct.int32)
     columns = ct.bid(1) * 128 + ct.arange(128, dtype=ct.int32)
+    if I64:
+        rows = ct.astype(rows, ct.int64)
     base = ct.reshape(rows, (16, 1)) * (2 * INTER) + ct.reshape(columns, (1, 128))
     gate = ct.astype(
         ct.gather(X, (base,), check_bounds=True, padding_value=0), ct.float32
@@ -531,7 +537,7 @@ def _gated_activation_amax(
     NUM_COLUMN_TILES: ConstInt,
 ):
     _gated_activation_amax_impl(
-        X, PARTIAL, POST_PAD, ACT, P1, P2, P3, INTER, NUM_COLUMN_TILES
+        X, PARTIAL, POST_PAD, ACT, P1, P2, P3, INTER, NUM_COLUMN_TILES, False
     )
 
 
@@ -548,7 +554,7 @@ def _gated_activation_amax_i64(
     NUM_COLUMN_TILES: ConstInt,
 ):
     _gated_activation_amax_impl(
-        X, PARTIAL, POST_PAD, ACT, P1, P2, P3, INTER, NUM_COLUMN_TILES
+        X, PARTIAL, POST_PAD, ACT, P1, P2, P3, INTER, NUM_COLUMN_TILES, True
     )
 
 
@@ -562,9 +568,12 @@ def _gated_activation_quantize_tensor_impl(
     P2: ConstFloat,
     P3: ConstFloat,
     INTER: ConstInt,
+    I64: ConstBool,
 ):
     rows = ct.bid(0) * 16 + ct.arange(16, dtype=ct.int32)
     columns = ct.bid(1) * 128 + ct.arange(128, dtype=ct.int32)
+    if I64:
+        rows = ct.astype(rows, ct.int64)
     base = ct.reshape(rows, (16, 1)) * (2 * INTER) + ct.reshape(columns, (1, 128))
     gate = ct.astype(
         ct.gather(X, (base,), check_bounds=True, padding_value=0), ct.float32
@@ -597,7 +606,7 @@ def _gated_activation_quantize_tensor(
     P3: ConstFloat,
     INTER: ConstInt,
 ):
-    _gated_activation_quantize_tensor_impl(X, SCALE, OUT, ACT, P1, P2, P3, INTER)
+    _gated_activation_quantize_tensor_impl(X, SCALE, OUT, ACT, P1, P2, P3, INTER, False)
 
 
 @ct.kernel
@@ -611,7 +620,7 @@ def _gated_activation_quantize_tensor_i64(
     P3: ConstFloat,
     INTER: ConstInt,
 ):
-    _gated_activation_quantize_tensor_impl(X, SCALE, OUT, ACT, P1, P2, P3, INTER)
+    _gated_activation_quantize_tensor_impl(X, SCALE, OUT, ACT, P1, P2, P3, INTER, True)
 
 
 @ct.function

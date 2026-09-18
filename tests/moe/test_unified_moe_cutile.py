@@ -332,6 +332,26 @@ def test_cutile_bf16_workspace_cache_uses_token_buckets(activation):
     assert set(runner._workspace_cache) == {(32, 128), (64, 128)}
 
 
+def test_cutile_workspace_allocation_is_rejected_during_cuda_graph_capture(
+    monkeypatch,
+):
+    class KernelModule:
+        def allocate_workspace(self, **kwargs):
+            raise AssertionError("workspace allocation must not run during capture")
+
+    runner = CuTileBf16Runner.__new__(CuTileBf16Runner)
+    runner.config = _config()
+    runner.device = torch.device("cpu")
+    runner._built = True
+    runner._kernel_module = KernelModule()
+    runner._workspace_cache = {}
+    runner._workspace = None
+    monkeypatch.setattr(runner, "_is_current_stream_capturing", lambda: True)
+
+    with pytest.raises(RuntimeError, match="warm this bucket first"):
+        runner._ensure_workspace(17, 128)
+
+
 def test_prepare_cutile_bf16_weights_rejects_invalid_source_contract():
     with pytest.raises(TypeError, match="expects BF16 weights"):
         CuTileBf16Config.prepare_weights(
@@ -2089,15 +2109,30 @@ def test_cutile_fp8_tail_graph_and_int64(monkeypatch):
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         captured = runner.forward(inputs)
+    inputs[3].mul_(0.5)
+    captured.fill_(float("nan"))
     graph.replay()
     torch.cuda.synchronize()
-    torch.testing.assert_close(captured, wide, atol=0, rtol=0)
+    torch.testing.assert_close(captured, wide * 0.5, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("mode", (_CUTILE_FP8_MODES[1], _CUTILE_FP8_MODES[3]))
+def test_cutile_fp8_gated_activation_int64_matches_int32(monkeypatch, mode):
+    runner, inputs, _, _, _ = _make_cutile_fp8_case(mode, SwiGLU())
+    from flashinfer.fused_moe.cutile import fp8
+
+    expected = runner.forward(inputs).clone()
+    # Materializing the natural >=2^31-element trigger is too memory-intensive
+    # for CI; force dispatch to compile and execute the same int64 kernels.
+    monkeypatch.setattr(fp8, "needs_int64_indexing", lambda *_: True)
+    actual = runner.forward(inputs).clone()
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize(
     ("mode", "activation", "execution_modes"),
     (
-        (_CUTILE_FP8_MODES[1], ReLU2(), (1, 2)),
+        (_CUTILE_FP8_MODES[1], ReLU2(), (1, 2, 3, 4)),
         (_CUTILE_FP8_MODES[2], SwiGLU(), (1,)),
         (_CUTILE_FP8_MODES[4], SwiGLU(), (5,)),
     ),
@@ -2135,6 +2170,17 @@ def test_cutile_fp8_capabilities_and_shortlist():
                 candidates = _cutile_fp8_gemm_candidates(problem)
                 assert len(candidates) <= 7
                 assert len(candidates) == len(set(candidates))
+
+
+def test_cutile_fp8_runs_through_unified_layer():
+    mode = _CUTILE_FP8_MODES[4]
+    runner, _, expected, activations, weights = _make_cutile_fp8_case(mode, SwiGLU())
+    layer = MoELayer(runner.config, torch.device("cuda"))
+
+    actual = layer(activations, weights)
+
+    assert layer.winner_backend == runner.backend_key
+    torch.testing.assert_close(actual, expected, atol=0.03, rtol=0.03)
 
 
 @pytest.mark.parametrize(

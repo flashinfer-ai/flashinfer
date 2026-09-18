@@ -3008,6 +3008,12 @@ class CuTileBf16Runner(MoERunner):
         self._workspace: Any = None
         self.tuning_config = TuningConfig()
 
+    def _is_current_stream_capturing(self) -> bool:
+        if self.device.type != "cuda":
+            return False
+        with torch.cuda.device(self.device):
+            return torch.cuda.is_current_stream_capturing()
+
     def _check_support(self) -> None:
         super()._check_support()
         if not self.config.finalize.do_finalize:
@@ -3083,6 +3089,8 @@ class CuTileBf16Runner(MoERunner):
         # Every cuTile MoE pack keeps output, activation, routing IDs, and
         # routing weights in the first four positions. Build one capacity pack
         # and take leading views so representatives do not retain allocations.
+        # The capacity is capped by the user-provided tune_max_num_tokens; an
+        # allocation failure propagates before capture so callers can lower it.
         compile_inputs = list(inputs)
         compile_inputs[0] = inputs[0].new_empty((bucket, *inputs[0].shape[1:]))
         compile_inputs[1] = inputs[1].new_zeros((bucket, *inputs[1].shape[1:]))
@@ -3108,6 +3116,12 @@ class CuTileBf16Runner(MoERunner):
         key = (capacity, hidden_size)
         workspace = self._workspace_cache.get(key)
         if workspace is None:
+            if self._is_current_stream_capturing():
+                raise RuntimeError(
+                    f"{type(self).__name__} workspace for token bucket "
+                    f"{capacity} must be allocated before CUDA Graph capture; "
+                    "warm this bucket first."
+                )
             workspace = self._kernel_module.allocate_workspace(
                 num_tokens=capacity,
                 hidden_size=hidden_size,

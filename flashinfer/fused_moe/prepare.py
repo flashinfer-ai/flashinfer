@@ -1701,7 +1701,8 @@ def prepare_cutile_fp8_weights(
     Per-tensor scales are FP32, one per expert GEMM (shape ``[E]``).
     MXFP8 scales are E8M0 bytes in logical ``[E, N, K/32]`` order.
     Both A16 and A8 consume the same prepared tensors on every supported GPU.
-    Canonical gated GEMM1 rows are ``[up, gate]``.
+    Canonical gated GEMM1 rows arrive as ``[up, gate]`` and are prepared in the
+    kernel-consumed ``[gate, up]`` order.
     """
     from .api import _CUTILE_SUPPORTED_ACTIVATIONS
 
