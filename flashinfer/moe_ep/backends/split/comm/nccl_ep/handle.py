@@ -233,6 +233,15 @@ class NcclEpHandle(Handle):
         never alias the wrong layout — a reused address with a different
         shape/dtype misses and builds a fresh wrapper. Large tensors are
         wrapped per call (see _WRAP_MEMO_MAX_BYTES).
+
+        ONLY call this for a tensor whose address the caller keeps stable. The
+        wrapper holds its torch tensor alive, so memoizing a per-call buffer
+        pins it, stops the allocator handing that address back, and leaks one
+        buffer per call — the memo then misses every time, defeating its own
+        premise. Combine's output is exactly that case and is gated on
+        ``CombineInputParams.out_is_stable``; do not route a churning tensor
+        here on the assumption that a repeated address proves stability, since
+        a freed-then-reallocated buffer repeats on the very next call.
         """
         if t.numel() * t.element_size() > self._WRAP_MEMO_MAX_BYTES:
             return self._ep.Tensor(t)
@@ -707,8 +716,17 @@ class NcclEpHandle(Handle):
             config = self._ep.CombineConfig(send_only=int(self._staged))
             self._hot[ck] = config
         inputs = self._ep.CombineInputs(tokens=self._wrap(x))
+        # Memoize the output descriptor only when the caller owns a stable
+        # buffer (a graph state does; the default forward's empty_like does
+        # not). Caching a per-call buffer pins it and leaks one output per
+        # forward -- see _wrap.
+        out_w = (
+            self._wrap(out_t)
+            if getattr(params, "out_is_stable", False)
+            else self._ep.Tensor(out_t)
+        )
         outputs = self._ep.CombineOutputs(
-            tokens=self._wrap(out_t),
+            tokens=out_w,
             topk_weights=weights_t,
         )
 
