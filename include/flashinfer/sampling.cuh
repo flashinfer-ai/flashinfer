@@ -738,6 +738,18 @@ __device__ __forceinline__ vec_t<DType, VEC_SIZE> GenerateGumbelNoise(uint64_t p
   }
 }
 
+// The original logits sampler reduces each vocabulary tile, then keeps the later
+// tile on ties. Preserve that ordering when accumulating locally before the one
+// block reduction. Within a tile, keep CUB's original right-biased tie ordering.
+template <uint32_t TILE_SIZE, typename DType, typename IdType>
+struct LogitsTileMax {
+  __device__ DataAndIndex<DType, IdType> operator()(const DataAndIndex<DType, IdType>& a,
+                                                    const DataAndIndex<DType, IdType>& b) const {
+    return (a.data > b.data || (a.data == b.data && a.index / TILE_SIZE > b.index / TILE_SIZE)) ? a
+                                                                                                : b;
+  }
+};
+
 template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, bool DETERMINISTIC,
           typename DType, typename IdType>
@@ -757,7 +769,12 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void SamplingFromLog
   auto& temp_storage = reinterpret_cast<SharedMem&>(smem_sampling_logit);
 
   vec_t<DType, VEC_SIZE> logits_vec;
-  DataAndIndex<DType, IdType> max_data = {-cuda::std::numeric_limits<DType>::infinity(), 0};
+  DataAndIndex<DType, IdType> local_max[VEC_SIZE];
+  const LogitsTileMax<BLOCK_THREADS * VEC_SIZE, DType, IdType> max_op;
+#pragma unroll
+  for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+    local_max[j] = {-cuda::std::numeric_limits<DType>::infinity(), 0};
+  }
   for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
     logits_vec.fill(-cuda::std::numeric_limits<DType>::infinity());
     if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
@@ -774,16 +791,16 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void SamplingFromLog
       const bool valid = token_idx < d;
       cur_data[j].data =
           valid ? logits_vec[j] + gumbel_noise[j] : -cuda::std::numeric_limits<DType>::infinity();
-      cur_data[j].index = valid ? token_idx : 0;
+      // Retain the padded position for tile ordering; clamp the final output.
+      cur_data[j].index = token_idx;
+      local_max[j] = max_op(local_max[j], cur_data[j]);
     }
-
-    max_data +=
-        BlockReduce<DataAndIndex<DType, IdType>, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage)
-            .template Sum<VEC_SIZE>(cur_data);
-    __syncthreads();
   }
+  const auto max_data =
+      BlockReduce<DataAndIndex<DType, IdType>, BLOCK_THREADS, REDUCE_ALGORITHM>(temp_storage)
+          .Reduce(local_max, max_op);
   if (tx == 0) {
-    output[bx] = max_data.index;
+    output[bx] = max_data.index < d ? max_data.index : 0;
   }
 }
 
