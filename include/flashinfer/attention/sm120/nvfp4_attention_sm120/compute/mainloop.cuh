@@ -606,9 +606,10 @@ struct CollectiveMainloopFwd {
     Tensor tSsSFK = smem_thr_copy_SFK.partition_S(as_position_independent_swizzle_tensor(sSFK));
     Tensor tSrSFK_copy_view = smem_thr_copy_SFK.retile_D(tSrSFK);
 
+    auto tile_shape_mnk_pv = tile_shape(tiled_mma_pv);
     auto smem_tiled_copy_SFV =
         make_tiled_copy_impl(SmemCopyAtomSF{}, get_layoutSFB_TV(tiled_mma_pv),
-                             make_shape(size<1>(tile_shape_mnk), size<2>(tile_shape_mnk)));
+                             make_shape(size<1>(tile_shape_mnk_pv), size<2>(tile_shape_mnk_pv)));
     auto smem_thr_copy_SFV = smem_tiled_copy_SFV.get_thread_slice(thread_idx);
     Tensor tOsSFVt = smem_thr_copy_SFV.partition_S(as_position_independent_swizzle_tensor(sSFVt));
     Tensor tOrSFVt_copy_view = smem_thr_copy_SFV.retile_D(tOrSFVt);
