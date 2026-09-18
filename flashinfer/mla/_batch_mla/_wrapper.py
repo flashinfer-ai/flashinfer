@@ -499,7 +499,11 @@ class BatchMLAPagedAttentionWrapper:
 
         Metadata tensors may be on CPU or the wrapper device. They are
         normalized to the device required by the selected backend; tensors on
-        another accelerator device are rejected. Passing flat CSR or dense
+        another accelerator device are rejected. For FA2/FA3 CSR planning, CPU
+        query offsets, KV offsets, and KV lengths avoid device-to-host transfers;
+        page indices may remain on the GPU. GPU CSR metadata is staged once per
+        plan request and reused for validation and host planning.
+        Passing flat CSR or dense
         metadata fields remains supported for compatibility, but is deprecated
         in favor of the ``metadata=`` object form. TRTLLM-GEN, XQA, and CuTe
         DSL CUDA graph plans require supplied contiguous ``int32`` dense

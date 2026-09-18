@@ -75,6 +75,7 @@ from .utils import (
     _check_kv_layout,
     _check_pos_encoding_mode,
     _check_workspace_buffer_alignment,
+    _copy_to_cpu,
     _get_cache_alibi_slopes_buf,
     _get_cache_buf,
     _get_trtllm_gen_multi_ctas_kv_counter_buffer,
@@ -2467,16 +2468,24 @@ class BatchPrefillWithPagedKVCacheWrapper:
             fixed_split_size = -1
 
         batch_size = len(qo_indptr) - 1
-        qo_indptr_host = qo_indptr.to("cpu")
+        (
+            qo_indptr_host,
+            paged_kv_indptr_host,
+            paged_kv_last_page_len_host,
+            *seq_lens_host,
+        ) = _copy_to_cpu(
+            qo_indptr,
+            paged_kv_indptr,
+            paged_kv_last_page_len,
+            *((seq_lens,) if seq_lens is not None else ()),
+        )
         total_num_rows = int(qo_indptr_host[-1])
-        paged_kv_indptr_host = paged_kv_indptr.to("cpu")
-        paged_kv_last_page_len_host = paged_kv_last_page_len.to("cpu")
         if seq_lens is None:
             kv_lens_arr_host = get_seq_lens(
                 paged_kv_indptr_host, paged_kv_last_page_len_host, page_size
             )
         else:
-            kv_lens_arr_host = seq_lens.cpu().flatten()
+            kv_lens_arr_host = seq_lens_host[0].flatten()
 
         if self.is_cuda_graph_enabled:
             if batch_size != self._fixed_batch_size:
@@ -2723,6 +2732,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
         is not equal to ``num_kv_heads``, the function will use
         `grouped query attention <https://arxiv.org/abs/2305.13245>`_.
 
+        Planning reads indptr and length metadata on the CPU. Passing these
+        tensors on the CPU avoids device-to-host synchronization; page indices
+        may still reside on the GPU. GPU metadata is staged together before
+        host planning. ``non_blocking`` controls host-to-device transfers and
+        does not remove the wait for GPU-produced metadata.
+
         The :meth:`plan` method cannot be used in Cuda Graph or in ``torch.compile``.
         """
         _check_workspace_buffer_alignment(
@@ -2780,8 +2795,20 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._token_pos_in_items_len = token_pos_in_items_len
         self._max_item_len_ptr = max_item_len_ptr
 
-        # NOTE(Zihao): only required if qo_indptr/paged_kv_indptr are device tensors
-        qo_indptr_host = qo_indptr.to("cpu")
+        if max_sequence_kv is None:
+            (
+                qo_indptr_host,
+                paged_kv_indptr_host,
+                paged_kv_last_page_len_host,
+                *seq_lens_host,
+            ) = _copy_to_cpu(
+                qo_indptr,
+                paged_kv_indptr,
+                paged_kv_last_page_len,
+                *((seq_lens,) if seq_lens is not None else ()),
+            )
+        else:
+            (qo_indptr_host,) = _copy_to_cpu(qo_indptr)
         self._qo_indptr_last = int(qo_indptr_host[-1])
         total_num_rows = self._qo_indptr_last
         if max_token_per_sequence is not None:
@@ -2792,14 +2819,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
         if max_sequence_kv is not None:
             self._max_kv_len = max_sequence_kv
         else:
-            paged_kv_indptr_host = paged_kv_indptr.to("cpu")
-            paged_kv_last_page_len_host = paged_kv_last_page_len.to("cpu")
             if seq_lens is None:
                 kv_lens_arr_host = get_seq_lens(
                     paged_kv_indptr_host, paged_kv_last_page_len_host, page_size
                 )
             else:
-                kv_lens_arr_host = seq_lens.cpu().flatten()
+                kv_lens_arr_host = seq_lens_host[0].flatten()
             required_size = len(kv_lens_arr_host)
             if required_size > self._kv_lens_buffer.shape[0]:
                 self._kv_lens_buffer = torch.empty(
@@ -4277,6 +4302,12 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         is not equal to ``num_kv_heads``, the function will use
         `grouped query attention <https://arxiv.org/abs/2305.13245>`_.
 
+        Planning reads indptr and length metadata on the CPU. Passing these
+        tensors on the CPU avoids device-to-host synchronization.
+        GPU metadata is staged together before
+        host planning. ``non_blocking`` controls host-to-device transfers and
+        does not remove the wait for GPU-produced metadata.
+
         The :meth:`plan` method cannot be used in Cuda Graph or in ``torch.compile``.
         """
         q_data_type = canonicalize_torch_dtype(q_data_type)
@@ -4312,9 +4343,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 bitorder="little",
             )
 
-        # NOTE(Zihao): only required if qo_indptr/paged_kv_indptr are device tensors
-        qo_indptr_host = qo_indptr.to("cpu")
-        kv_indptr_host = kv_indptr.to("cpu")
+        qo_indptr_host, kv_indptr_host = _copy_to_cpu(qo_indptr, kv_indptr)
 
         self._qo_indptr_last = int(qo_indptr_host[-1])
         total_num_rows = self._qo_indptr_last
@@ -4486,13 +4515,12 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             if self._cute_dsl_use_fmha:
                 # Wrapper-owned buffers (populated above): stable addresses
                 # for CUDA-graph mode, single normalized copy otherwise.
-                q_lens = self._qo_indptr_buf[1:] - self._qo_indptr_buf[:-1]
                 k_lens = self._kv_indptr_buf[1:] - self._kv_indptr_buf[:-1]
                 # Snapshot host-side seq-lens at plan time so run() can pass
                 # them into trtllm_ragged_attention_deepseek without touching
                 # the device during CUDA graph capture (see issue #4609).
-                q_lens_cpu = q_lens.to(torch.int32).cpu()
-                k_lens_cpu = k_lens.to(torch.int32).cpu()
+                q_lens_cpu = (qo_indptr_host[1:] - qo_indptr_host[:-1]).to(torch.int32)
+                k_lens_cpu = (kv_indptr_host[1:] - kv_indptr_host[:-1]).to(torch.int32)
                 self._cute_dsl_fmha_plan = {
                     "qo_indptr": self._qo_indptr_buf,
                     "kv_indptr": self._kv_indptr_buf,
@@ -4500,8 +4528,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     "q_seq_lens_cpu": q_lens_cpu,
                     "kv_seq_lens_cpu": k_lens_cpu,
                     "batch_size": qo_indptr.shape[0] - 1,
-                    "max_q_len": int(q_lens.max().item()),
-                    "max_kv_len": int(k_lens.max().item()),
+                    "max_q_len": max_qo_len,
+                    "max_kv_len": max_seq_in_batch,
                     "sm_scale": _sm_scale,
                     "causal": causal,
                     "window_left": window_left,

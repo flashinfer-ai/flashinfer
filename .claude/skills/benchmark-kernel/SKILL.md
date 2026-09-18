@@ -39,6 +39,16 @@ FlashInfer supports two timing methods:
 > overridden with `FLASHINFER_CONFIDENTIAL_COMPUTE=0/1`. (Full env-var reference
 > in `CLAUDE.md`.)
 
+### Host planning and synchronization
+
+For host planning overhead, use `python benchmarks/bench_plan_metadata.py
+--output plan-metadata.json` on both revisions with the same arguments.
+It reports host wall-clock latency after JIT warmup and CUDA runtime copy/wait
+counts for attention and MLA, with both CPU and GPU metadata. It includes idle
+streams and streams with a queued GEMM. GPU kernel timers exclude the CPU work
+and blocking waits targeted by this benchmark; these results must not be
+reported as attention-kernel or whole-model speedups.
+
 ## Installation
 
 ### Install CUPTI (Recommended)
