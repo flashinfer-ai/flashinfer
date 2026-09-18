@@ -553,7 +553,7 @@ class FmhaDecodeConfig:
     # sparse routes consume query membership from a separate packed-word table;
     # Q1 uses the same scattered page route without membership masking.
     use_q_token_kv_block_sparse_route: bool = False
-    # Private prepared-plan experiment: eight query words per 32 page-4 IDs.
+    # Private prepared-plan layout: eight query words per 32 page-4 IDs.
     # Legacy public membership tensors keep the default page-byte encoding.
     query_major_memberships: bool = False
     # None preserves each sparse family's default in raw/static configs too.
@@ -759,6 +759,19 @@ class FmhaDecodeConfig:
             and self.use_q_token_kv_block_sparse_route
             and 0 < self.max_seq_len_q <= Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIP_BITS
             and self.grouped_q_fits_tile
+        )
+
+    @property
+    def supports_query_major_memberships(self) -> bool:
+        """Whether this CTA can read one eight-query/page-4 membership tile."""
+        return (
+            self.uses_q_token_kv_block_sparse_page_membership
+            and self.use_keeps_mma_ab
+            and self.max_seq_len_q == 8
+            and self.has_single_q_cta
+            and self.num_tokens_per_page == 4
+            and self.tile_size_kv == 128
+            and self.tile_size_q in (64, 128)
         )
 
     @property

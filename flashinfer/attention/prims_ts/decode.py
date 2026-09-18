@@ -15,7 +15,7 @@
 """Task-scheduled paged decode with a FlashInfer-style plan/run lifecycle."""
 
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import functools
 import math
 import numbers
@@ -3216,6 +3216,7 @@ def _prepare_prims_ts_batch_decode_plan(
     kv_layout: Literal["HND"],
     page_size: Optional[int],
     q_token_kv_block_sparse_page_memberships: Optional[torch.Tensor] = None,
+    query_major_memberships: bool = False,
     use_q_token_kv_block_sparse_route: bool = False,
     use_pdl: bool = False,
     split_kv: bool = True,
@@ -3321,6 +3322,10 @@ def _prepare_prims_ts_batch_decode_plan(
         share_pattern_across_kv_heads,
     )
     spec = _resolve_decode_launch_spec(*policy_args)
+    if query_major_memberships:
+        if not spec.config.supports_query_major_memberships:
+            raise ValueError("query-major memberships require one G8 Keeps/page-4 CTA")
+        spec = replace(spec, config=replace(spec.config, query_major_memberships=True))
     if spec.config.uses_q_token_kv_block_sparse_page_membership:
         if q_token_kv_block_sparse_page_memberships is None:
             raise ValueError(

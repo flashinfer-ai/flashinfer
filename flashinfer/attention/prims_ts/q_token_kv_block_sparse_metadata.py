@@ -188,6 +188,7 @@ class _PrimsTSQTokenKvBlockSparseWorkspaceLayout:
     attention_workspace_byte_offset: int
     attention_scratch_bytes: int
     uses_split_kv: bool
+    query_major_memberships: bool
     max_seq_len: int
     total_bytes: int
 
@@ -971,7 +972,10 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
     )
 
     from .decode import (
-        _resolve_decode_workspace_layout,
+        _dtype_key,
+        _make_decode_workspace_layout,
+        _resolve_cuda_device,
+        _resolve_decode_launch_spec,
         _validate_prims_ts_q_token_kv_block_sparse_group_capacity,
     )
 
@@ -998,6 +1002,51 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
         (max_seq_len_kv + sparse_block_size - 1) // sparse_block_size,
     )
     page_capacity = block_capacity * (sparse_block_size // fragment_size)
+    # Padding is an allocation property, not additional selected KV work.
+    max_seq_len = (
+        block_topk * sparse_block_size + (sparse_block_size - 1)
+        if group_size == 1
+        else page_capacity * fragment_size
+    )
+    max_seq_len = min(max_seq_len, max_seq_len_kv)
+    if kv_dtype is None:
+        kv_dtype = q_dtype
+    if out_dtype is None:
+        out_dtype = q_dtype
+    _, device_index = _resolve_cuda_device(device)
+    spec = _resolve_decode_launch_spec(
+        device_index,
+        groups,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        fragment_size,
+        max_seq_len,
+        group_size,
+        _dtype_key(q_dtype),
+        _dtype_key(kv_dtype),
+        _dtype_key(kv_dtype),
+        _dtype_key(out_dtype),
+        "HND",
+        "causal",
+        use_packed_q,
+        -1,
+        storage_page_size,
+        True,
+        True,
+        split_kv,
+        share_pattern_across_kv_heads,
+    )
+    # The private fused producer currently emits the G8/page-4 format. FP8
+    # benefits from avoiding repeated membership extraction; keep 16-bit
+    # routes on the existing layout until complete-path gains are established.
+    query_major_memberships = (
+        sparse_block_size == 4
+        and spec.config.use_fp8_qkv
+        and spec.config.supports_query_major_memberships
+    )
+    if query_major_memberships:
+        page_capacity = (page_capacity + 31) // 32 * 32
     membership_words = (
         0
         if group_size == 1
@@ -1021,38 +1070,11 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
     )
     seq_lens_numel = metadata_rows
     seq_lens_bytes = seq_lens_numel * 4
-    max_seq_len = (
-        block_topk * sparse_block_size + (sparse_block_size - 1)
-        if group_size == 1
-        else page_capacity * fragment_size
-    )
-    max_seq_len = min(max_seq_len, max_seq_len_kv)
-    if kv_dtype is None:
-        kv_dtype = q_dtype
-    if out_dtype is None:
-        out_dtype = q_dtype
-    attention_layout = _resolve_decode_workspace_layout(
-        groups,
-        num_qo_heads,
-        num_kv_heads,
-        head_dim,
-        fragment_size,
-        max_seq_len,
-        group_size,
-        q_dtype,
-        kv_dtype,
-        kv_dtype,
+    attention_layout = _make_decode_workspace_layout(
+        spec.scratch_shapes,
         out_dtype,
-        "HND",
-        "causal",
-        use_packed_q,
-        -1,
-        storage_page_size,
-        device,
-        use_q_token_kv_block_sparse_route=True,
-        use_pdl=True,
-        split_kv=split_kv,
-        share_pattern_across_kv_heads=share_pattern_across_kv_heads,
+        use_separate_reduction_kernel=spec.config.use_separate_reduction_kernel,
+        use_split_kv=spec.config.use_split_kv,
     )
     attention_scratch_bytes = attention_layout.total_bytes
     attention_workspace_byte_offset = _align_up_q_token_kv_block_sparse_workspace(
@@ -1069,6 +1091,7 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
         attention_workspace_byte_offset=attention_workspace_byte_offset,
         attention_scratch_bytes=attention_scratch_bytes,
         uses_split_kv=attention_layout.uses_split_kv,
+        query_major_memberships=query_major_memberships,
         max_seq_len=max_seq_len,
         total_bytes=attention_workspace_byte_offset + attention_scratch_bytes,
     )
@@ -1512,6 +1535,7 @@ def _prepare_prims_ts_q_token_kv_block_sparse_metadata_plan(
     max_seq_len_kv: int,
     sparse_block_size: int = 4,
     qo_indptr: Optional[torch.Tensor] = None,
+    query_major_memberships: bool = False,
 ) -> _PrimsTSQTokenKvBlockSparseMetadataPlan:
     """Freeze validated metadata tensors and launch constants."""
 
@@ -1529,9 +1553,16 @@ def _prepare_prims_ts_q_token_kv_block_sparse_metadata_plan(
     )
     release_attention_pdl = device_support_pdl(block_indices.device)
     metadata_module = _get_prims_ts_q_token_kv_block_sparse_metadata_module()
-    metadata_run = (
-        metadata_module.run_packed if use_packed_q else metadata_module.run_fixed
-    )
+    if query_major_memberships:
+        metadata_run = (
+            metadata_module.run_packed_query_major
+            if use_packed_q
+            else metadata_module.run_fixed_query_major
+        )
+    else:
+        metadata_run = (
+            metadata_module.run_packed if use_packed_q else metadata_module.run_fixed
+        )
     return _PrimsTSQTokenKvBlockSparseMetadataPlan(
         q_token_kv_block_sparse_page_indices=q_token_kv_block_sparse_page_indices,
         q_token_kv_block_sparse_page_memberships=q_token_kv_block_sparse_page_memberships,
@@ -1740,6 +1771,7 @@ def _prepare_q_token_kv_block_sparse_attention(
         max_seq_len_kv=max_seq_len_kv,
         sparse_block_size=sparse_block_size,
         qo_indptr=qo_indptr,
+        query_major_memberships=layout.query_major_memberships,
     )
     from .decode import _prepare_prims_ts_batch_decode_plan, _validate_scale
 
@@ -1765,6 +1797,7 @@ def _prepare_q_token_kv_block_sparse_attention(
         kv_layout="HND",
         page_size=math.gcd(sparse_block_size, int(k_cache.shape[2])),
         direct_q1_sparse_block_size=sparse_block_size,
+        query_major_memberships=layout.query_major_memberships,
         use_q_token_kv_block_sparse_route=True,
         use_pdl=True,
         split_kv=split_kv,

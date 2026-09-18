@@ -2384,27 +2384,37 @@ def test_q_token_kv_block_sparse_fixed_multiple_query_groups_match_packed_layout
 
 
 @_REQUIRES_PRIMS_TS_ATTENTION
-@pytest.mark.parametrize("group_size", (1, 2, 4, 5))
+@pytest.mark.parametrize(
+    ("group_size", "dtype"),
+    (
+        (1, torch.bfloat16),
+        (2, torch.bfloat16),
+        (4, torch.bfloat16),
+        (5, torch.bfloat16),
+        (8, torch.float8_e4m3fn),
+    ),
+)
 def test_prepared_q_token_kv_block_sparse_plan_keeps_metadata_and_attention_scratch_disjoint(
     monkeypatch: pytest.MonkeyPatch,
     group_size: int,
+    dtype: torch.dtype,
 ) -> None:
     from flashinfer.attention.prims_ts import decode as decode_module
 
     blocks, table, requests, positions, storage_page_size = _make_case(group_size, 8)
     num_routes = table.shape[0]
     query_shape = _fixed_q_token_kv_block_sparse_shape(num_routes, group_size)
-    query = torch.zeros(query_shape, dtype=torch.bfloat16, device="cuda")
+    query = torch.zeros(query_shape, dtype=dtype, device="cuda")
     k_cache = torch.zeros(
         int(table.max().item()) + 1,
         1,
         storage_page_size,
         256,
-        dtype=torch.bfloat16,
+        dtype=dtype,
         device="cuda",
     )
     v_cache = torch.zeros_like(k_cache)
-    output = torch.empty_like(query)
+    output = torch.empty_like(query, dtype=torch.bfloat16)
     layout = _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
         blocks.shape[0],
         blocks.shape[1],
@@ -2420,7 +2430,9 @@ def test_prepared_q_token_kv_block_sparse_plan_keeps_metadata_and_attention_scra
         out_dtype=output.dtype,
         device="cuda",
     )
-    workspace = torch.empty(layout.total_bytes, dtype=torch.uint8, device="cuda")
+    workspace = torch.full(
+        (layout.total_bytes,), 0xA5, dtype=torch.uint8, device="cuda"
+    )
     views = layout.bind(workspace)
     calls: dict[str, object] = {}
 
@@ -2463,6 +2475,7 @@ def test_prepared_q_token_kv_block_sparse_plan_keeps_metadata_and_attention_scra
         )
         actual_output = kwargs["out"]
         assert isinstance(actual_output, torch.Tensor)
+        assert kwargs["query_major_memberships"] == layout.query_major_memberships
         return FakeAttentionPlan(), actual_output
 
     monkeypatch.setattr(
@@ -2513,14 +2526,27 @@ def test_prepared_q_token_kv_block_sparse_plan_keeps_metadata_and_attention_scra
         storage_page_size,
         group_size,
     )
-    _assert_metadata_matches(
-        (
-            views.q_token_kv_block_sparse_page_indices,
-            views.q_token_kv_block_sparse_page_memberships,
-            views.seq_lens,
-        ),
-        expected,
-    )
+    actual_indices = views.q_token_kv_block_sparse_page_indices
+    actual_members = views.q_token_kv_block_sparse_page_memberships
+    if layout.query_major_memberships:
+        # Normalize the private representation for the independent semantic
+        # reference; do not reinterpret public metadata outputs as query words.
+        planes = actual_members.reshape(actual_members.shape[0], -1, 8).to(torch.int64)
+        bits = torch.arange(32, device="cuda")
+        queries = torch.arange(8, device="cuda")
+        page_bytes = (
+            (((planes[..., None] >> bits) & 1) << queries[None, None, :, None])
+            .sum(2)
+            .to(torch.uint8)
+            .reshape(actual_members.shape[0], -1)
+        )
+        for row, length in enumerate(views.seq_lens.cpu().tolist()):
+            pages = (length + 3) // 4
+            assert torch.all(page_bytes[row, pages : (pages + 31) // 32 * 32] == 0)
+        columns = expected[0].shape[1]
+        actual_indices = actual_indices[:, :columns]
+        actual_members = page_bytes[:, :columns].contiguous().view(torch.int32)
+    _assert_metadata_matches((actual_indices, actual_members, views.seq_lens), expected)
 
     replacement_query = query.clone()
     replacement_blocks = blocks.clone()
