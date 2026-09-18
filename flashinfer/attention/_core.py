@@ -242,6 +242,12 @@ class BatchAttention:
         The independent module is compiled on demand and is not included in
         the default precompiled cache. With JIT disabled, a compatible cache
         provider must supply it, or it must already be loaded in this process.
+
+        Parameters
+        ----------
+        variant : str, optional
+            The variant to prewarm. The only supported value is
+            ``"independent"``, which is also the default.
         """
         if variant != "independent":
             raise ValueError(f"variant must be 'independent', got {variant!r}")
