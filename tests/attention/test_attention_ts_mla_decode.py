@@ -1713,6 +1713,42 @@ def test_attention_ts_mla_balanced_validated_run_requires_current_schedule():
 
 @pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
+def test_attention_ts_mla_balanced_validated_run_requires_schedule_snapshot(
+    monkeypatch,
+):
+    """A nonvalidating schedule cannot authorize a later validating run."""
+
+    case = _make_mla_case(
+        batch_size=2,
+        num_qo_heads=16,
+        max_seq_len=512,
+        kv_seq_lens=(512, 128),
+        qkv_dtype=torch.bfloat16,
+        device="cuda",
+        seed=33704,
+    )
+    case.seq_lens.copy_(torch.tensor((128, 0), dtype=torch.int32, device="cuda"))
+    wrapper = _plan_case(case, balanced=True)
+    wrapper.schedule(case.seq_lens, validate=False)
+    case.seq_lens.copy_(torch.tensor((512, 128), dtype=torch.int32, device="cuda"))
+
+    original_launch = mla_decode_module._launch_mla_decode
+
+    def unexpected_launch(*_args, **_kwargs):
+        raise AssertionError("validation must reject before launching attention")
+
+    monkeypatch.setattr(mla_decode_module, "_launch_mla_decode", unexpected_launch)
+    with pytest.raises(RuntimeError, match=r"snapshot is unavailable.*schedule"):
+        _run_case(wrapper, case)
+
+    monkeypatch.setattr(mla_decode_module, "_launch_mla_decode", original_launch)
+    wrapper.schedule(case.seq_lens)
+    output = _run_case(wrapper, case)
+    _assert_case_correct(output, case, _policy_dict(wrapper))
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
 def test_attention_ts_mla_balanced_workspace_size_is_publicly_queryable():
     """The public size query covers balanced scratch but not plan descriptors."""
 

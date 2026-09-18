@@ -471,11 +471,18 @@ def _validate_mla_run_metadata(
     if any(seq_len < minimum_seq_len for seq_len in seq_lens_host):
         requirement = "non-negative" if minimum_seq_len == 0 else "positive"
         raise ValueError(f"every runtime K/V length must be {requirement}")
-    if state.planned_seq_lens is not None and seq_lens_host != state.planned_seq_lens:
-        raise ValueError(
-            "balanced MLA live seq_lens must exactly match the installed "
-            "schedule; call schedule() with the live CUDA lengths before run()"
-        )
+    if state.balanced_plan is not None:
+        if state.planned_seq_lens is None:
+            raise RuntimeError(
+                "balanced MLA cannot validate the installed schedule because its "
+                "sequence-length snapshot is unavailable; call "
+                "schedule(validate=True) before run(validate=True)"
+            )
+        if seq_lens_host != state.planned_seq_lens:
+            raise ValueError(
+                "balanced MLA live seq_lens must exactly match the installed "
+                "schedule; call schedule() with the live CUDA lengths before run()"
+            )
     runtime_max_kv_len = max(seq_lens_host)
     if runtime_max_kv_len > state.max_kv_len:
         raise ValueError(
@@ -2404,7 +2411,9 @@ class BatchMLADecodePagedTSWrapper:
         launch. These checks synchronize metadata to the host. Set
         ``validate=False`` only after validating representative inputs, and use
         it for ``torch.compile`` or CUDA graph capture. For a balanced plan,
-        nonvalidating execution requires live ``seq_lens`` to match the most
+        a validating run requires the most recent :meth:`schedule` call to use
+        ``validate=True`` so a diagnostic length snapshot is available.
+        Nonvalidating execution requires live ``seq_lens`` to match the most
         recently planned lengths; that invariant cannot be checked without
         synchronizing.
 
