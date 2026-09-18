@@ -15,7 +15,7 @@ cudaError_t launch_decode(const Dsv4Nvfp4AttentionParams& params,
                           const execution::ExecutionPlan& plan, cudaStream_t stream) {
   const auto& [q, cache, indices, mid_out, mid_lse, output, out_lse, topk_length, attn_sink,
                extra_cache, extra_indices, extra_topk_length, extra_topk, extra_page_size,
-               extra_page_stride_bytes, num_tokens, sm_scale, page_stride_bytes] = params;
+               extra_page_stride_bytes, num_tokens, sm_scale, page_stride_bytes, lse_scale] = params;
   constexpr bool CAN_GROUP_HEADS = NUM_HEADS >= STREAMING_HEADS_PER_CTA;
   constexpr int GROUPED_H_BLOCKS =
       (NUM_HEADS + STREAMING_HEADS_PER_CTA - 1) / STREAMING_HEADS_PER_CTA;
@@ -36,7 +36,8 @@ cudaError_t launch_decode(const Dsv4Nvfp4AttentionParams& params,
                DYN_SMEM_BYTES, stream>>>(
           q, cache, indices, output, out_lse, mid_out, mid_lse, attn_sink, topk_length, extra_cache,
           extra_indices, extra_topk_length, extra_topk, extra_page_size, extra_page_stride_bytes,
-          num_tokens, active_splits, chunks_per_block, sm_scale, page_stride_bytes, write_direct);
+          num_tokens, active_splits, chunks_per_block, sm_scale, page_stride_bytes, write_direct,
+          lse_scale);
     }
   }
   if (!use_grouped) {
@@ -50,7 +51,8 @@ cudaError_t launch_decode(const Dsv4Nvfp4AttentionParams& params,
              DYN_SMEM_BYTES, stream>>>(
         q, cache, indices, mid_out, mid_lse, output, out_lse, attn_sink, topk_length, extra_cache,
         extra_indices, extra_topk_length, extra_topk, extra_page_size, extra_page_stride_bytes,
-        num_tokens, active_splits, chunks_per_block, sm_scale, page_stride_bytes, write_direct);
+        num_tokens, active_splits, chunks_per_block, sm_scale, page_stride_bytes, write_direct,
+        lse_scale);
   }
   auto status = cudaGetLastError();
   if (status != cudaSuccess || stage1_only || write_direct) return status;
@@ -58,7 +60,7 @@ cudaError_t launch_decode(const Dsv4Nvfp4AttentionParams& params,
     constexpr int MERGE_H_BLOCKS = (NUM_HEADS + HPB - 1) / HPB;
     auto kernel = sparse_mla_decode_dsv4_nvfp4_merge2_kernel<NUM_HEADS>;
     kernel<<<dim3(num_tokens, MERGE_H_BLOCKS), dim3(DECODE_MERGE2_THREADS), 0, stream>>>(
-        mid_out, mid_lse, output, out_lse, attn_sink, num_tokens);
+        mid_out, mid_lse, output, out_lse, attn_sink, num_tokens, lse_scale);
     return cudaGetLastError();
   }
   constexpr int MERGE_THREADS = 64;
@@ -67,7 +69,7 @@ cudaError_t launch_decode(const Dsv4Nvfp4AttentionParams& params,
   const size_t merge_smem = static_cast<size_t>(active_splits) * sizeof(float);
   kernel<<<dim3(num_tokens, NUM_HEADS), dim3(MERGE_THREADS), merge_smem, stream>>>(
       mid_out, mid_lse, output, out_lse, attn_sink, num_tokens, active_splits, NUM_HEADS, NUM_HEADS,
-      NUM_HEADS);
+      NUM_HEADS, lse_scale);
   return cudaGetLastError();
 }
 
@@ -76,7 +78,7 @@ cudaError_t launch_prefill(const Dsv4Nvfp4AttentionParams& params,
                            const execution::ExecutionPlan& plan, cudaStream_t stream) {
   const auto& [q, cache, indices, mid_out, mid_lse, output, out_lse, topk_length, attn_sink,
                extra_cache, extra_indices, extra_topk_length, extra_topk, extra_page_size,
-               extra_page_stride_bytes, num_tokens, sm_scale, page_stride_bytes] = params;
+               extra_page_stride_bytes, num_tokens, sm_scale, page_stride_bytes, lse_scale] = params;
   const int HEAD_BLOCKS = plan.head_blocks;
   constexpr size_t DYN_SMEM_BYTES = StreamingNVFP4Smem::SIZE;
   auto kernel = sparse_mla_streaming_dsv4_nvfp4_kernel<NUM_HEADS, TOPK, PAGE_SIZE, DUAL_CACHE>;
@@ -87,7 +89,7 @@ cudaError_t launch_prefill(const Dsv4Nvfp4AttentionParams& params,
       q, cache, indices, output, out_lse, nullptr, nullptr, attn_sink, topk_length, extra_cache,
       extra_indices, extra_topk_length, extra_topk, extra_page_size, extra_page_stride_bytes,
       num_tokens, plan.scratch_split_stride, plan.cpb, sm_scale, page_stride_bytes,
-      plan.merge == execution::Merge::Direct);
+      plan.merge == execution::Merge::Direct, lse_scale);
   return cudaGetLastError();
 }
 

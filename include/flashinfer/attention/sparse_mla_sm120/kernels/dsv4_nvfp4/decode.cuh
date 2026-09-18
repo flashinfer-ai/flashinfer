@@ -20,6 +20,7 @@
 #include "../../arch/matrix_memory.cuh"
 #include "../../arch/mma_sm120.cuh"
 #include "../../arch/mma_sm120_nvfp4.cuh"
+#include "../../common/lse.cuh"
 #include "../../common/zero_row.cuh"
 #include "../../compute/nvfp4_vt.cuh"
 #include "../../compute/warp_tiles.cuh"
@@ -39,7 +40,7 @@ __global__ void __launch_bounds__(DECODE_BLOCK_THREADS) sparse_mla_decode_dsv4_n
     const int32_t* __restrict__ extra_indices, const int* __restrict__ extra_topk_length_ptr,
     int extra_topk, int extra_page_block_size, size_t extra_page_stride_bytes, int num_tokens,
     int scratch_split_stride, int chunks_per_block, float sm_scale, size_t page_stride_bytes,
-    bool write_direct) {
+    bool write_direct, float lse_scale) {
   using KV = KVCacheTraits<MT>;
   static_assert(MT == ModelType::DSV4);
   constexpr int D_NOPE = KV::D_NOPE;
@@ -84,7 +85,7 @@ __global__ void __launch_bounds__(DECODE_BLOCK_THREADS) sparse_mla_decode_dsv4_n
         if (threadIdx.x < VALID_HPB) {
           const int h = h_start + threadIdx.x;
           out_lse[(size_t)token_idx * NUM_HEADS + h] =
-              attn_sink ? __ldg(attn_sink + h) * LOG2E : -INFINITY;
+              scale_output_lse(attn_sink ? __ldg(attn_sink + h) * LOG2E : -INFINITY, lse_scale);
         }
       } else if (threadIdx.x < VALID_HPB) {
         const int h = h_start + threadIdx.x;
@@ -449,10 +450,11 @@ __global__ void __launch_bounds__(DECODE_BLOCK_THREADS) sparse_mla_decode_dsv4_n
   }
   if (warp_id == 0 && tid == 0) {
     if (write_direct) {
-      out_lse[(size_t)token_idx * NUM_HEADS + h_start + gid] = sm.reduce_scratch_second()[gid];
+      out_lse[(size_t)token_idx * NUM_HEADS + h_start + gid] =
+          scale_output_lse(sm.reduce_scratch_second()[gid], lse_scale);
       if constexpr (VALID_HPB > 8) {
         out_lse[(size_t)token_idx * NUM_HEADS + h_start + gid + 8] =
-            sm.reduce_scratch_second()[gid + 8];
+            scale_output_lse(sm.reduce_scratch_second()[gid + 8], lse_scale);
       }
     } else {
       const float lse0 = global_sum[0] > 0.f ? log2f(global_sum[0]) + global_max[0] : -1e30f;
@@ -474,7 +476,7 @@ __global__ void __launch_bounds__(DECODE_MERGE2_THREADS, 2)
                                                bf16* __restrict__ output,
                                                float* __restrict__ out_lse,
                                                const float* __restrict__ attn_sink,
-                                               int num_tokens) {
+                                               int num_tokens, float lse_scale) {
   constexpr int D_V = 512;
   constexpr int VECS_PER_HEAD = D_V / 8;
   constexpr int H_BLOCKS = (NUM_HEADS + HPB - 1) / HPB;
@@ -514,7 +516,7 @@ __global__ void __launch_bounds__(DECODE_MERGE2_THREADS, 2)
     weight0[local_head] = (lse0 > -1e29f ? exp2f(lse0 - global_max) : 0.f) * inv_total;
     weight1[local_head] = (lse1 > -1e29f ? exp2f(lse1 - global_max) : 0.f) * inv_total;
     out_lse[(size_t)token_idx * NUM_HEADS + h] =
-        total > 0.f ? log2f(total) + global_max : -INFINITY;
+        scale_output_lse(total > 0.f ? log2f(total) + global_max : -INFINITY, lse_scale);
   }
   __syncthreads();
 
