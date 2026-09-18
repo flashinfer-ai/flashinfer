@@ -31,7 +31,7 @@ if TYPE_CHECKING:
 
 
 @register_mega_kernel("sm100_bf16_nvfp4_bf16_cutedsl")
-class W4A16CutedslMegaKernelBackend(MegaKernelBackend):
+class Bf16Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
     supports_global_weight_scales = True
 
     @classmethod
@@ -95,12 +95,12 @@ class W4A16CutedslMegaKernelBackend(MegaKernelBackend):
         )
 
     def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
-        from ......cute_dsl.megamoe.nvfp4_w4a16 import (
-            get_symm_buffer_for_w4a16_mega_moe,
+        from ......cute_dsl.megamoe.bf16_nvfp4 import (
+            get_symm_buffer_for_bf16_nvfp4_mega_moe,
         )
 
         config = self._kernel_config
-        return get_symm_buffer_for_w4a16_mega_moe(
+        return get_symm_buffer_for_bf16_nvfp4_mega_moe(
             fleet_params.num_experts,
             fleet_params.max_tokens_per_rank,
             config.top_k,
@@ -198,13 +198,13 @@ class W4A16CutedslMegaKernelBackend(MegaKernelBackend):
         *,
         output: torch.Tensor,
     ) -> torch.Tensor:
-        from ......cute_dsl.megamoe.nvfp4_w4a16 import w4a16_mega_moe
+        from ......cute_dsl.megamoe.bf16_nvfp4 import bf16_nvfp4_mega_moe
 
         if self._autotune_pending:
-            from ......cute_dsl.megamoe.nvfp4_w4a16 import autotune_w4a16_mega_moe
+            from ......cute_dsl.megamoe.bf16_nvfp4 import autotune_bf16_nvfp4_mega_moe
 
             self._autotune_winner = dict(
-                autotune_w4a16_mega_moe(
+                autotune_bf16_nvfp4_mega_moe(
                     output,
                     transformed_weights[0],
                     transformed_weights[1],
@@ -214,7 +214,7 @@ class W4A16CutedslMegaKernelBackend(MegaKernelBackend):
                 )
             )
             self._autotune_pending = False
-        w4a16_mega_moe(
+        bf16_nvfp4_mega_moe(
             output,
             transformed_weights[0],
             transformed_weights[1],

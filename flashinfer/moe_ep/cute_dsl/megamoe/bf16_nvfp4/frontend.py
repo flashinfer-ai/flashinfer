@@ -22,7 +22,7 @@ from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
 
 
 @dataclasses.dataclass(frozen=True)
-class MegaMoEW4A16Config:
+class MegaMoEBf16Nvfp4Config:
     """Compile-time and launch-time W4A16 MegaMoE configuration."""
 
     rank: int
@@ -103,7 +103,7 @@ class MegaMoEW4A16Config:
 
 
 @dataclass
-class MegaMoEW4A16Inputs:
+class MegaMoEBf16Nvfp4Inputs:
     activation: torch.Tensor
     topk_idx: torch.Tensor
     topk_weights: torch.Tensor
@@ -116,16 +116,16 @@ class MegaMoEW4A16Inputs:
     combine_output: torch.Tensor
 
 
-class MegaMoEW4A16Frontend:
+class MegaMoEBf16Nvfp4Frontend:
     """Host wrapper for ``Sm100W4A16MegaMoEKernel``."""
 
-    def __init__(self, config: MegaMoEW4A16Config) -> None:
+    def __init__(self, config: MegaMoEBf16Nvfp4Config) -> None:
         self._config = config
         self._mega: Optional[_CompiledMega] = None
         self._reduce = None
 
     @property
-    def config(self) -> MegaMoEW4A16Config:
+    def config(self) -> MegaMoEBf16Nvfp4Config:
         return self._config
 
     def set_gate_up_clamp(self, clamp: Optional[float]) -> None:
@@ -174,7 +174,7 @@ class MegaMoEW4A16Frontend:
             leading_dim=cutlass_torch.get_leading_dim(tensor)
         )
 
-    def _ensure_compiled(self, inputs: MegaMoEW4A16Inputs) -> _CompiledMega:
+    def _ensure_compiled(self, inputs: MegaMoEBf16Nvfp4Inputs) -> _CompiledMega:
         # The frozen config changes only through the setters, which release
         # the previous compilation and its workspace together.
         if self._mega is not None:
@@ -244,7 +244,9 @@ class MegaMoEW4A16Frontend:
         self._mega = mega
         return mega
 
-    def _runtime_kwargs(self, inputs: MegaMoEW4A16Inputs, mega: _CompiledMega) -> dict:
+    def _runtime_kwargs(
+        self, inputs: MegaMoEBf16Nvfp4Inputs, mega: _CompiledMega
+    ) -> dict:
         import cuda.bindings.driver as cuda
         from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import SymBufferHost
 
@@ -275,7 +277,7 @@ class MegaMoEW4A16Frontend:
 
     def run(
         self,
-        inputs: MegaMoEW4A16Inputs,
+        inputs: MegaMoEBf16Nvfp4Inputs,
         *,
         num_tokens: Optional[int] = None,
         sync: bool = False,
@@ -304,7 +306,7 @@ class MegaMoEW4A16Frontend:
             torch.cuda.synchronize()
         return inputs.combine_output[:n]
 
-    def make_launch_thunk(self, inputs: MegaMoEW4A16Inputs) -> Callable[[], None]:
+    def make_launch_thunk(self, inputs: MegaMoEBf16Nvfp4Inputs) -> Callable[[], None]:
         self._validate(inputs, inputs.activation.shape[0])
         mega = self._ensure_compiled(inputs)
         kwargs = self._runtime_kwargs(inputs, mega)
@@ -315,7 +317,7 @@ class MegaMoEW4A16Frontend:
 
         return thunk
 
-    def _validate(self, inputs: MegaMoEW4A16Inputs, num_tokens: int) -> None:
+    def _validate(self, inputs: MegaMoEBf16Nvfp4Inputs, num_tokens: int) -> None:
         c = self.config
         if not 0 <= num_tokens <= c.num_tokens_per_rank:
             raise ValueError(
@@ -416,7 +418,7 @@ class MegaMoEW4A16Frontend:
 
 
 @dataclass
-class MegaMoEW4A16SymmBuffer:
+class MegaMoEBf16Nvfp4SymmBuffer:
     num_total_experts: int
     num_max_tokens: int
     num_topk: int
@@ -428,7 +430,7 @@ class MegaMoEW4A16SymmBuffer:
     topk_idx: torch.Tensor
     topk_weights: torch.Tensor
     combine_output: torch.Tensor
-    _frontend: MegaMoEW4A16Frontend
+    _frontend: MegaMoEBf16Nvfp4Frontend
     _sym_roots: list[torch.Tensor] = field(default_factory=list)
     _destroyed: bool = False
 
@@ -449,7 +451,7 @@ def init_dist() -> Tuple[int, int]:
     return rank, world_size
 
 
-def get_symm_buffer_for_w4a16_mega_moe(
+def get_symm_buffer_for_bf16_nvfp4_mega_moe(
     num_total_experts: int,
     num_max_tokens: int,
     num_topk: int,
@@ -465,7 +467,7 @@ def get_symm_buffer_for_w4a16_mega_moe(
         Literal["epi_warps", "standalone_warps", "reuse_dispatch_warps"]
     ] = None,
     knobs: Optional[dict] = None,
-) -> MegaMoEW4A16SymmBuffer:
+) -> MegaMoEBf16Nvfp4SymmBuffer:
     clamp = resolve_gate_up_clamp(
         gate_up_clamp=gate_up_clamp, activation_clamp=activation_clamp
     )
@@ -475,7 +477,7 @@ def get_symm_buffer_for_w4a16_mega_moe(
     # lookup; an explicit dict (including {}) bypasses cache and defaults.
     if knobs is None:
         resolved_knobs, _ = resolve_knobs(
-            dtype="w4a16",
+            dtype="bf16_nvfp4",
             world_size=world_size,
             hidden=hidden,
             intermediate=intermediate,
@@ -493,7 +495,7 @@ def get_symm_buffer_for_w4a16_mega_moe(
         **({"token_back_mode": token_back_mode} if token_back_mode is not None else {}),
         **(knobs or {}),
     }
-    cfg = MegaMoEW4A16Config(
+    cfg = MegaMoEBf16Nvfp4Config(
         rank=rank,
         world_size=world_size,
         num_tokens_per_rank=num_max_tokens,
@@ -511,7 +513,7 @@ def get_symm_buffer_for_w4a16_mega_moe(
         (num_max_tokens, num_topk, hidden),
         torch.bfloat16,
     )
-    return MegaMoEW4A16SymmBuffer(
+    return MegaMoEBf16Nvfp4SymmBuffer(
         num_total_experts,
         num_max_tokens,
         num_topk,
@@ -523,16 +525,16 @@ def get_symm_buffer_for_w4a16_mega_moe(
         topk_idx,
         topk_weights,
         combine_output,
-        MegaMoEW4A16Frontend(cfg),
+        MegaMoEBf16Nvfp4Frontend(cfg),
         [x, topk_idx, topk_weights, combine_output],
     )
 
 
-def w4a16_mega_moe(
+def bf16_nvfp4_mega_moe(
     y: torch.Tensor,
     transformed_l1: TransformedWeights,
     transformed_l2: TransformedWeights,
-    symm_buffer: MegaMoEW4A16SymmBuffer,
+    symm_buffer: MegaMoEBf16Nvfp4SymmBuffer,
     *,
     num_tokens: Optional[int] = None,
     gate_up_clamp: Optional[float] = None,
@@ -562,7 +564,7 @@ def w4a16_mega_moe(
     if clamp is not None:
         symm_buffer._frontend.set_gate_up_clamp(clamp)
     result = symm_buffer._frontend.run(
-        MegaMoEW4A16Inputs(
+        MegaMoEBf16Nvfp4Inputs(
             symm_buffer.x,
             symm_buffer.topk_idx,
             symm_buffer.topk_weights,
@@ -581,13 +583,13 @@ def w4a16_mega_moe(
         torch.cuda.synchronize()
 
 
-def w4a16_mega_launch_thunk(
+def bf16_nvfp4_mega_launch_thunk(
     transformed_l1: TransformedWeights,
     transformed_l2: TransformedWeights,
-    symm_buffer: MegaMoEW4A16SymmBuffer,
+    symm_buffer: MegaMoEBf16Nvfp4SymmBuffer,
 ) -> Callable[[], None]:
     return symm_buffer._frontend.make_launch_thunk(
-        MegaMoEW4A16Inputs(
+        MegaMoEBf16Nvfp4Inputs(
             symm_buffer.x,
             symm_buffer.topk_idx,
             symm_buffer.topk_weights,
@@ -603,13 +605,13 @@ def w4a16_mega_launch_thunk(
 
 
 __all__ = [
-    "MegaMoEW4A16Config",
-    "MegaMoEW4A16Frontend",
-    "MegaMoEW4A16Inputs",
-    "MegaMoEW4A16SymmBuffer",
+    "MegaMoEBf16Nvfp4Config",
+    "MegaMoEBf16Nvfp4Frontend",
+    "MegaMoEBf16Nvfp4Inputs",
+    "MegaMoEBf16Nvfp4SymmBuffer",
     "TransformedWeights",
-    "w4a16_mega_launch_thunk",
-    "w4a16_mega_moe",
-    "get_symm_buffer_for_w4a16_mega_moe",
+    "bf16_nvfp4_mega_launch_thunk",
+    "bf16_nvfp4_mega_moe",
+    "get_symm_buffer_for_bf16_nvfp4_mega_moe",
     "init_dist",
 ]

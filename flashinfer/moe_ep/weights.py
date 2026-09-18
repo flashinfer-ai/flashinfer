@@ -152,7 +152,7 @@ class PrequantizedMoEWeights(MoEWeightPack):
     scales and from activation quantization. The W4A16 mega backend applies
     them after FP32 GEMM accumulation. Only W4A16 MegaMoE supports these
     fields; layer construction rejects them for other backends. When preparing
-    weights directly, use ``preprocess_w4a16_cutedsl_mega_weights`` for packs
+    weights directly, use ``preprocess_bf16_nvfp4_cutedsl_mega_weights`` for packs
     with global scales.
     """
 

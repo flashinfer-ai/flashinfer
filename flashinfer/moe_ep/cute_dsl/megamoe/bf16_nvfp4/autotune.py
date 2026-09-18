@@ -16,7 +16,7 @@ class _CollectiveGraphTimingError(RuntimeError):
     """A private graph timing failure that must stop the collective sweep."""
 
 
-def w4a16_candidates() -> List[Dict[str, Any]]:
+def bf16_nvfp4_candidates() -> List[Dict[str, Any]]:
     """Four M256 W4A16 tactics with flag batch 4 and scheduler depth 2.
 
     Both geometries use two-CTA instructions and two dequantization warp
@@ -109,7 +109,7 @@ def _sample_graph_seconds(
                 ) from exc
 
 
-def autotune_w4a16_mega_moe(
+def autotune_bf16_nvfp4_mega_moe(
     y: torch.Tensor,
     transformed_l1: Any,
     transformed_l2: Any,
@@ -131,10 +131,10 @@ def autotune_w4a16_mega_moe(
     At least one eager preparation forward runs before each capture, even
     when ``warmup_iters=0``, to compile the fused kernel and reducer.
     """
-    from .frontend import w4a16_mega_moe
+    from .frontend import bf16_nvfp4_mega_moe
 
     def launch(*, sync: bool) -> None:
-        w4a16_mega_moe(
+        bf16_nvfp4_mega_moe(
             y,
             transformed_l1,
             transformed_l2,
@@ -150,9 +150,9 @@ def autotune_w4a16_mega_moe(
 
     cfg = symm_buffer._frontend.config
     frontend = symm_buffer._frontend
-    candidates = w4a16_candidates() if candidates is None else candidates
+    candidates = bf16_nvfp4_candidates() if candidates is None else candidates
     warmup_iters = max(1, warmup_iters)
-    label = "w4a16_mega"
+    label = "bf16_nvfp4_mega"
     if not candidates:
         raise ValueError("autotune_knobs needs a non-empty candidate list.")
 
@@ -214,7 +214,7 @@ def autotune_w4a16_mega_moe(
 
         record_knobs(
             winner,
-            dtype="w4a16",
+            dtype="bf16_nvfp4",
             world_size=cfg.world_size,
             hidden=cfg.hidden,
             intermediate=cfg.intermediate,
@@ -237,4 +237,4 @@ def autotune_w4a16_mega_moe(
     return winner
 
 
-__all__ = ["autotune_w4a16_mega_moe", "w4a16_candidates"]
+__all__ = ["autotune_bf16_nvfp4_mega_moe", "bf16_nvfp4_candidates"]

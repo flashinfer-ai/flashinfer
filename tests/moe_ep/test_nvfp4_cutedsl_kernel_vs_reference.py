@@ -357,7 +357,7 @@ def test_nvfp4_preprocess_fp4_weights_match_plain_quant(
         )
     elif mode == "w4a16":
         from flashinfer.moe_ep import (
-            preprocess_w4a16_cutedsl_mega_weights as preprocess_mega_weights,
+            preprocess_bf16_nvfp4_cutedsl_mega_weights as preprocess_mega_weights,
         )
     else:
         raise AssertionError(f"unsupported precision mode: {mode}")
@@ -496,14 +496,14 @@ def test_nvfp4_kernel_matches_torch_reference(
         )
     elif mode == "w4a16":
         from flashinfer.moe_ep import (
-            preprocess_w4a16_cutedsl_mega_weights as preprocess_mega_weights,
+            preprocess_bf16_nvfp4_cutedsl_mega_weights as preprocess_mega_weights,
         )
         from flashinfer.moe_ep.backends.mega.kernel.sm100.bf16_nvfp4_bf16_cutedsl.staging import (
             stage_mega_moe_inputs,
         )
-        from flashinfer.moe_ep.cute_dsl.megamoe.nvfp4_w4a16 import (
-            get_symm_buffer_for_w4a16_mega_moe as get_symm_buffer_for_mega_moe,
-            w4a16_mega_moe as nvfp4_mega_moe,
+        from flashinfer.moe_ep.cute_dsl.megamoe.bf16_nvfp4 import (
+            get_symm_buffer_for_bf16_nvfp4_mega_moe as get_symm_buffer_for_mega_moe,
+            bf16_nvfp4_mega_moe as nvfp4_mega_moe,
         )
     else:
         raise AssertionError(f"unsupported precision mode: {mode}")

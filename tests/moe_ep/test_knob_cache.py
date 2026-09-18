@@ -257,7 +257,7 @@ def test_backend_warns_on_auto_knobs():
 @pytest.mark.arch_blackwell
 @pytest.mark.parametrize(
     "mode,mma_m,explicit",
-    [("nvfp4", 256, False), ("w4a16", 128, False), ("w4a16", 128, True)],
+    [("nvfp4", 256, False), ("bf16_nvfp4", 128, False), ("bf16_nvfp4", 128, True)],
 )
 def test_symm_buffer_resolves_cached_knobs(
     monkeypatch, tmp_path, mode, mma_m, explicit
@@ -278,9 +278,9 @@ def test_symm_buffer_resolves_cached_knobs(
         record_knobs,
     )
 
-    if mode == "w4a16":
-        from flashinfer.moe_ep.cute_dsl.megamoe.nvfp4_w4a16 import (
-            get_symm_buffer_for_w4a16_mega_moe as get_symm_buffer_for_mega_moe,
+    if mode == "bf16_nvfp4":
+        from flashinfer.moe_ep.cute_dsl.megamoe.bf16_nvfp4 import (
+            get_symm_buffer_for_bf16_nvfp4_mega_moe as get_symm_buffer_for_mega_moe,
         )
 
     monkeypatch.setenv("MEGA_NO_DIST", "1")
@@ -288,7 +288,7 @@ def test_symm_buffer_resolves_cached_knobs(
     hidden, intermediate2x, num_experts, topk, max_tokens = 2048, 2048, 4, 4, 64
     token_back_mode = {
         "nvfp4": "standalone_warps",
-        "w4a16": "reuse_dispatch_warps",
+        "bf16_nvfp4": "reuse_dispatch_warps",
     }[mode]
     cached = {
         "mma_tiler_mnk": (mma_m, 128, 256),

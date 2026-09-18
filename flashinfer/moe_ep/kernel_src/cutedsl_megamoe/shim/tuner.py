@@ -157,7 +157,7 @@ _MXFP8_LARGE_TOKEN_KNOBS: Dict[str, Any] = {
 }
 
 # W4A16 uses the measured flag4/epi-warp atomic profile at every buffer size.
-_W4A16_TOKEN_KNOBS: Dict[str, Any] = {
+_BF16_NVFP4_TOKEN_KNOBS: Dict[str, Any] = {
     "mma_tiler_mnk": (256, 128, 256),
     "cluster_shape_mnk": (2, 1, 1),
     "group_hint": 512,
@@ -286,8 +286,8 @@ def default_knobs(
 
     Returns a fresh dict each call.
     """
-    if dtype == "w4a16":
-        return dict(_W4A16_TOKEN_KNOBS)
+    if dtype == "bf16_nvfp4":
+        return dict(_BF16_NVFP4_TOKEN_KNOBS)
     if dtype == "bf16":
         return _bf16_default_knobs(
             enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce
@@ -308,7 +308,7 @@ def default_knobs(
         )
     raise ValueError(
         f"no knob profile for dtype {dtype!r}; expected 'nvfp4', 'mxfp8', "
-        "'bf16', 'bf16_mxfp8', or 'w4a16'."
+        "'bf16', 'bf16_mxfp8', or 'bf16_nvfp4'."
     )
 
 

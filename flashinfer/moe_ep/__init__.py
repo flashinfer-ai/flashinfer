@@ -74,7 +74,7 @@ from .backends.mega.kernel.sm100.bf16_bf16_bf16_rank_major_cuda import (
 )
 from .backends.mega.kernel.sm100.bf16_nvfp4_bf16_cutedsl import (
     Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
-    preprocess_mega_weights as preprocess_w4a16_cutedsl_mega_weights,
+    preprocess_mega_weights as preprocess_bf16_nvfp4_cutedsl_mega_weights,
 )
 from .backends.mega.kernel.sm100.mxfp8_mxfp8_bf16_cutedsl import (
     Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
@@ -262,7 +262,7 @@ __all__ = [
     "preprocess_mega_weights",
     "preprocess_bf16_cutedsl_mega_weights",
     "preprocess_bf16_rank_major_cuda_mega_weights",
-    "preprocess_w4a16_cutedsl_mega_weights",
+    "preprocess_bf16_nvfp4_cutedsl_mega_weights",
     "preprocess_mxfp8_cutedsl_mega_weights",
     "preprocess_nvfp4_cutedsl_mega_weights",
     "preprocess_sm120_mxfp8_cutedsl_mega_weights",
