@@ -39,34 +39,6 @@ def _ceil_div(a: int, b: int) -> int:
     return (a + b - 1) // b
 
 
-def _storage_ranges_overlap(left: torch.Tensor, right: torch.Tensor) -> bool:
-    """Conservatively test whether two positive-strided tensors share bytes."""
-    if left.device != right.device or not left.numel() or not right.numel():
-        return False
-
-    def storage_end(tensor: torch.Tensor) -> int:
-        max_offset = sum(
-            (size - 1) * stride
-            for size, stride in zip(tensor.shape, tensor.stride(), strict=True)
-            if size > 0
-        )
-        return tensor.data_ptr() + (max_offset + 1) * tensor.element_size()
-
-    return left.data_ptr() < storage_end(right) and right.data_ptr() < storage_end(left)
-
-
-def _has_internal_overlap(tensor: torch.Tensor) -> bool:
-    required_stride = 1
-    for size, stride in sorted(
-        zip(tensor.shape, tensor.stride(), strict=True), key=lambda dim: dim[1]
-    ):
-        if size > 1:
-            if stride < required_stride:
-                return True
-            required_stride = stride * size
-    return False
-
-
 def _prepare_sm120_sparse_metadata(
     q2k_block_index: torch.Tensor,
     q2k_block_nums: Optional[torch.Tensor],
@@ -85,10 +57,6 @@ def _prepare_sm120_sparse_metadata(
     if q2k_block_index.device != device:
         raise ValueError(
             f"q2k_block_index must be on {device}, got {q2k_block_index.device}"
-        )
-    if q2k_block_index.ndim != 4:
-        raise ValueError(
-            f"q2k_block_index must be 4D (B, H, Q, K), got {q2k_block_index.ndim}D"
         )
     if q2k_block_index.shape[:3] != (batch_size, num_heads, num_q_blocks):
         raise ValueError(
@@ -173,7 +141,8 @@ def _prepare_sm120_sparse_metadata(
 _sm120_compile_cache = get_jit_cache("bsa_fwd_sm120")
 
 
-def _bsa_attn_fp16_blk64_fwd(
+@flashinfer_api
+def bsa_attn_sm120_blk64_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -185,84 +154,87 @@ def _bsa_attn_fp16_blk64_fwd(
     return_lse: bool = False,
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
-    *,
-    backend_name: str,
-    arch_major: int,
-    compile_cache,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Architecture-shared Hopper warp-MMA/TMA block-sparse forward path."""
+    """Forward pass for BSA block-sparse attention using the sm120_blk64 CuTe-DSL kernel (SM120/SM121 only).
+
+    Args:
+        q: Query tensor (batch, seqlen_q, num_heads, head_dim), fp16/bf16.
+        k: Key tensor (batch, seqlen_k, num_kv_heads, head_dim).
+        v: Value tensor (batch, seqlen_k, num_kv_heads, head_dim).
+        q2k_block_index: (batch, num_heads, num_q_blocks, max_kv_blocks) int32.
+        block_sparse_num: Number of KV blocks per Q block. Ignored when q2k_block_nums is provided.
+        block_sizes: Actual token count per KV block, int32. Shape: (num_kv_blocks,) or
+            (batch, num_kv_blocks) or (batch, num_heads, num_kv_blocks). Pass None to
+            skip per-block padding masking.
+        q2k_block_nums: Per-(batch, head, q_block) KV block count,
+            (batch, num_heads, num_q_blocks) int32. Optional.
+        softmax_scale: Softmax scale (default: 1/sqrt(head_dim)).
+        return_lse: Whether to return log-sum-exp.
+        out: Pre-allocated output tensor (batch, seqlen_q, num_heads, head_dim).
+        lse: Pre-allocated LSE tensor (batch, num_heads, seqlen_q).
+    """
     from .sm120_blk64.flash_fwd_sm120 import BlockSparseAttnForwardSm120Blk64  # noqa: PLC0415
 
-    if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
-        raise ValueError("q, k, and v must be 4D BSHD tensors")
-    if q.dtype not in (torch.float16, torch.bfloat16):
-        raise TypeError(f"{backend_name}_blk64 only supports fp16/bf16, got {q.dtype}")
-    if q.dtype != k.dtype or q.dtype != v.dtype:
-        raise TypeError("q, k, and v must have the same dtype")
-    if not q.is_cuda or not k.is_cuda or not v.is_cuda:
-        raise ValueError("q, k, and v must be CUDA tensors")
-    if q.device != k.device or q.device != v.device:
-        raise ValueError("q, k, and v must be on the same CUDA device")
+    assert q.dtype in (torch.float16, torch.bfloat16), (
+        "bsa_attn_sm120_blk64_fwd only supports fp16/bf16"
+    )
+    assert q.dtype == k.dtype == v.dtype, "q, k, v must have the same dtype"
+    assert q.is_cuda and k.is_cuda and v.is_cuda, "inputs must be on CUDA device"
+    assert q.dim() == 4 and k.dim() == 4 and v.dim() == 4
 
     major, minor = torch.cuda.get_device_capability(q.device)
     arch = major * 10 + minor
-    if major != arch_major:
+    if arch // 10 != 12:
         raise RuntimeError(
-            f"{backend_name}_blk64 only supports SM{arch_major}x, current device is SM{arch}"
+            f"bsa_attn_sm120_blk64_fwd (sm120_blk64) only supports SM120/SM121, current device is SM{arch}"
         )
 
     batch, seqlen_q, num_heads, head_dim = q.shape
-    seqlen_k, num_kv_heads = k.shape[1:3]
-    if batch <= 0 or seqlen_q <= 0 or seqlen_k <= 0:
-        raise ValueError("batch and sequence dimensions must be positive")
-    if head_dim != 128 or k.shape != (batch, seqlen_k, num_kv_heads, 128):
-        raise ValueError("q and k must have head_dim=128 and matching batch size")
-    if v.shape != (batch, seqlen_k, num_kv_heads, 128):
-        raise ValueError("v must match k shape and have value_dim=128")
-    if num_heads <= 0 or num_kv_heads <= 0 or num_heads % num_kv_heads != 0:
-        raise ValueError("num_heads must be a positive multiple of num_kv_heads")
-    if q.stride(-1) != 1 or k.stride(-1) != 1 or v.stride(-1) != 1:
-        raise ValueError("q, k, and v must have a contiguous head dimension")
+    seqlen_k = k.shape[1]
+    num_kv_heads = k.shape[2]
+    head_dim_v = v.shape[3]
+
+    assert head_dim == 128, f"sm120_blk64 requires head_dim=128, got {head_dim}"
+    assert head_dim_v == 128, f"sm120_blk64 requires head_dim_v=128, got {head_dim_v}"
+    assert num_heads % num_kv_heads == 0, "num_heads must be divisible by num_kv_heads"
+    assert q.stride(-1) == 1 and k.stride(-1) == 1 and v.stride(-1) == 1
 
     gqa_ratio = num_heads // num_kv_heads
     num_q_blocks = _ceil_div(seqlen_q, _BLOCK_SIZE)
     num_kv_blocks = _ceil_div(seqlen_k, _BLOCK_SIZE)
+
     if softmax_scale is None:
         softmax_scale = head_dim**-0.5
 
-    q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
-    if q.data_ptr() % 128:
-        q = q.clone()
-    if k.data_ptr() % 128:
-        k = k.clone()
-    if v.data_ptr() % 128:
-        v = v.clone()
+    q = q.contiguous()
+    k = k.contiguous()
+    v = v.contiguous()
 
-    expected_out_shape = (batch, seqlen_q, num_heads, 128)
     if out is not None:
-        if out.dtype != q.dtype:
-            raise TypeError("out dtype must match q dtype")
-        if out.shape != expected_out_shape or out.device != q.device:
-            raise ValueError(f"out must have shape {expected_out_shape} on {q.device}")
-        if out.stride(-1) != 1:
-            raise ValueError("out must have a contiguous head dimension")
-        if _has_internal_overlap(out):
-            raise ValueError("out must not have internal storage overlap")
-    else:
-        out = torch.empty(expected_out_shape, dtype=q.dtype, device=q.device)
-
-    expected_lse_shape = (batch, num_heads, seqlen_q)
+        assert out.dtype == q.dtype, (
+            f"out.dtype ({out.dtype}) must match q.dtype ({q.dtype}): "
+            "the kernel reuses Q shared memory for the O epilogue and requires identical dtypes"
+        )
+        assert out.shape == (batch, seqlen_q, num_heads, head_dim_v), (
+            f"out.shape {tuple(out.shape)} must be "
+            f"(batch={batch}, seqlen_q={seqlen_q}, num_heads={num_heads}, head_dim_v={head_dim_v})"
+        )
+    if out is None:
+        out = torch.empty(
+            (batch, seqlen_q, num_heads, head_dim_v), dtype=q.dtype, device=q.device
+        )
     if lse is not None:
-        if lse.dtype != torch.float32:
-            raise TypeError("lse dtype must be float32")
-        if lse.shape != expected_lse_shape or lse.device != q.device:
-            raise ValueError(f"lse must have shape {expected_lse_shape} on {q.device}")
-        if lse.stride(-1) != 1:
-            raise ValueError("lse must have a contiguous sequence dimension")
-        if _has_internal_overlap(lse):
-            raise ValueError("lse must not have internal storage overlap")
-    else:
-        lse = torch.empty(expected_lse_shape, dtype=torch.float32, device=q.device)
+        assert lse.dtype == torch.float32, (
+            f"lse.dtype ({lse.dtype}) must be float32: the kernel always writes LSE in float32"
+        )
+        assert lse.shape == (batch, num_heads, seqlen_q), (
+            f"lse.shape {tuple(lse.shape)} must be "
+            f"(batch={batch}, num_heads={num_heads}, seqlen_q={seqlen_q})"
+        )
+    if lse is None:
+        lse = torch.empty(
+            (batch, num_heads, seqlen_q), dtype=torch.float32, device=q.device
+        )
 
     (
         has_block_nums,
@@ -283,18 +255,17 @@ def _bsa_attn_fp16_blk64_fwd(
         device=q.device,
     )
 
-    output_overlaps_input = any(
-        _storage_ranges_overlap(out, tensor) for tensor in (q, k, v)
-    )
-    kernel_out = (
-        out
-        if out.data_ptr() % 128 == 0 and not output_overlaps_input
-        else torch.empty_like(out)
-    )
+    # Transpose from BSHD to the layout expected by the sm120 kernel:
+    # Q/K/O: (B,S,H,D) -> (S,D,H,B), leading_dim=1 (D stride=1 preserved as view)
+    # V:     (B,S,H,D) -> (D,S,H,B), leading_dim=0 (D stride=1 preserved as view)
+    # LSE:   (B,H,S)   -> (S,H,B)
+    # NOTE: no .contiguous() — we need to preserve the original stride[leading_dim]=1
+    # so that mark_layout_dynamic works. The kernel writes directly into the view,
+    # which shares memory with the user-provided out/lse tensors.
     q_t = q.permute(1, 3, 2, 0)
     k_t = k.permute(1, 3, 2, 0)
     v_t = v.permute(3, 1, 2, 0)
-    out_t = kernel_out.permute(1, 3, 2, 0)
+    out_t = out.permute(1, 3, 2, 0)
     lse_t = lse.permute(2, 1, 0)
 
     q_cute = to_cute_tensor(q_t, assumed_align=128, leading_dim=1, enable_tvm_ffi=False)
@@ -319,12 +290,13 @@ def _bsa_attn_fp16_blk64_fwd(
     current_stream = (
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         if is_fake_mode()
-        else cuda.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
+        else cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     )
+
     fwd_kernel = BlockSparseAttnForwardSm120Blk64(
         gqa_ratio=gqa_ratio,
         head_dim=head_dim,
-        value_dim=128,
+        value_dim=head_dim_v,
         blocksparse_blocksize_q=_BLOCK_SIZE,
         blocksparse_blocksize_k=_BLOCK_SIZE,
         dtype=torch2cute_dtype_map[q.dtype],
@@ -333,14 +305,17 @@ def _bsa_attn_fp16_blk64_fwd(
         has_block_nums=has_block_nums,
         block_sizes_mode=block_sizes_mode,
     )
+
     compile_key = (
-        f"{backend_name}_blk64_fwd",
-        arch,
+        "sm120_blk64_fwd",
+        int(arch),
         q.dtype,
-        gqa_ratio,
-        has_block_nums,
-        has_block_sizes,
-        block_sizes_mode,
+        int(head_dim),
+        int(head_dim_v),
+        int(gqa_ratio),
+        bool(has_block_nums),
+        bool(has_block_sizes),
+        int(block_sizes_mode),
         q_t.stride(),
         k_t.stride(),
         v_t.stride(),
@@ -350,6 +325,7 @@ def _bsa_attn_fp16_blk64_fwd(
         q2k_nums_t.stride(),
         block_sizes_t.stride(),
     )
+
     args = (
         q_cute,
         k_cute,
@@ -363,50 +339,16 @@ def _bsa_attn_fp16_blk64_fwd(
         cutlass.Float32(softmax_scale),
         current_stream,
     )
-    if compile_key not in compile_cache:
-        compile_cache[compile_key] = cute.compile(fwd_kernel, *args)
+
+    if compile_key not in _sm120_compile_cache:
+        _sm120_compile_cache[compile_key] = cute.compile(fwd_kernel, *args)
+
     if not is_fake_mode():
-        with torch.cuda.nvtx.range(f"bsa_attn_{backend_name}_blk64_fwd_kernel"):
-            compile_cache[compile_key](*args)
-    if kernel_out is not out:
-        out.copy_(kernel_out)
+        with torch.cuda.nvtx.range("bsa_attn_sm120_blk64_fwd_kernel"):
+            _sm120_compile_cache[compile_key](*args)
+
+    # out_t and lse_t are views of out/lse — kernel already wrote results in-place.
     return out, lse if return_lse else None
-
-
-@flashinfer_api
-def bsa_attn_sm120_blk64_fwd(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    q2k_block_index: torch.Tensor,
-    block_sparse_num: int,
-    block_sizes: Optional[torch.Tensor] = None,
-    q2k_block_nums: Optional[torch.Tensor] = None,
-    softmax_scale: Optional[float] = None,
-    return_lse: bool = False,
-    out: Optional[torch.Tensor] = None,
-    lse: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Run FP16/BF16 block-sparse attention on SM120/SM121."""
-    if not q.is_cuda:
-        raise ValueError("q must be a CUDA tensor")
-    with torch.cuda.device(q.device):
-        return _bsa_attn_fp16_blk64_fwd(
-            q,
-            k,
-            v,
-            q2k_block_index,
-            block_sparse_num,
-            block_sizes,
-            q2k_block_nums,
-            softmax_scale,
-            return_lse,
-            out,
-            lse,
-            backend_name="sm120",
-            arch_major=12,
-            compile_cache=_sm120_compile_cache,
-        )
 
 
 def _bsa_attn_sm120_blk64_sage_fwd_cake(
