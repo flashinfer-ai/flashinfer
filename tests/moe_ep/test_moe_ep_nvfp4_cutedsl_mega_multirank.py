@@ -1250,7 +1250,6 @@ def _run_nvfp4_routing_rounds(
     from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import nvfp4_quantize_per_block_16
     from .test_nvfp4_cutedsl_kernel_vs_reference import (
         NVFP4_MODES,
-        _single_rank_problem,
         _nvfp4_reference_from_weights,
         _assert_nvfp4_reference,
     )
@@ -1334,16 +1333,23 @@ def _run_nvfp4_routing_rounds(
                 ("refill", 9, False),
             )
         for name, n, skewed in rounds:
-            problem = _single_rank_problem(
-                hidden,
-                intermediate,
+            # _make_inputs seeds with 7 + rank; retain the original 73 + rank
+            # inputs without allocating the unused single-rank expert weights.
+            hidden_states, topk_weights, topk_ids = _make_inputs(
+                rank + 66,
+                num_tokens=n,
+                hidden=hidden,
                 num_experts=num_experts,
                 topk=topk,
-                num_tokens=n,
-                max_tokens=capacity,
-                seed=73 + rank,
             )
-            problem["gate_up_clamp"] = 1.5
+            problem = dict(
+                hidden=hidden,
+                intermediate=intermediate,
+                gate_up_clamp=1.5,
+                hidden_states=hidden_states,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+            )
             if skewed:
                 problem["topk_ids"][:] = torch.tensor([0, 1], device="cuda")
             reference = (
