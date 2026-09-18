@@ -18,7 +18,7 @@ from ......core.validation.common import (
 )
 from ......weights import MoEWeightPack
 from ..common.bf16_staging import validate_bf16_forward_inputs
-from .staging import stage_mega_moe_inputs
+from .staging import forget_staged_inputs, stage_mega_moe_inputs
 from .config import Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
 from .weights import (
     TransformedMegaWeights,
@@ -188,6 +188,9 @@ class Bf16Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
                 "call layer.warmup(..., workspace=workspace) first"
             )
 
+    def _forget_workspace_state(self, workspace: Any) -> None:
+        forget_staged_inputs(workspace.topk_idx)
+
     def stage_inputs(
         self, t: MoEEpTensors, workspace: Any, *, quantize_input: bool
     ) -> None:
@@ -225,6 +228,11 @@ class Bf16Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
                     workspace,
                     num_tokens=output.shape[0],
                     gate_up_clamp=self._kernel_config.gate_up_clamp,
+                    process_group=(
+                        self.ep_comm_group
+                        if torch.distributed.is_initialized()
+                        else None
+                    ),
                 )
             )
             self._autotune_pending = False

@@ -402,8 +402,13 @@ class MegaMoEBf16Nvfp4Frontend:
             c.num_tokens_per_rank,
             combine_topk,
             c.hidden,
+        ) or (
+            not inputs.combine_output.is_cuda
+            or inputs.combine_output.dtype != torch.bfloat16
         ):
-            raise ValueError("combine_output has an invalid shape.")
+            raise ValueError(
+                "combine_output must be CUDA BF16 with the expected shape."
+            )
 
     def reduce_topk(self, combined, scores, output):
         """Apply FP32 routing scores after the BF16 FC2 cast, accumulating in FP32."""

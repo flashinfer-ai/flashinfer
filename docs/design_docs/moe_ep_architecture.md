@@ -340,7 +340,7 @@ Both paths call `ensure_moe_ep_cuda_device()` at init. With `auto_bootstrap=True
 | Requirement | Used by |
 |-------------|---------|
 | `torch_dist` | split comm, all mega kernels |
-| `nvshmem` | `sm100_nvfp4_nvfp4_bf16_cutedsl`, `sm100_mxfp8_mxfp8_bf16_cutedsl` (skip with `MEGA_NO_DIST=1`) |
+| `nvshmem` | `sm100_nvfp4_nvfp4_bf16_cutedsl`, `sm100_mxfp8_mxfp8_bf16_cutedsl`, `sm100_bf16_nvfp4_bf16_cutedsl` (skip with `MEGA_NO_DIST=1`) |
 
 **Host framework bootstrap (e.g. vLLM):** when the host already initialized `torch.distributed` and EP uses a subgroup, pass `BootstrapConfig(process_group=ep_group, world_size=ep_size, rank=ep_rank, auto_bootstrap=False)` and call `bootstrap_moe_ep_runtime(bootstrap, reqs)` once per worker after dist init. Mega kernels resolve comm via `bootstrap_comm_group` / `bootstrap_ep_rank_world` (`MegaKernelBackend.bind_ep_bootstrap`).
 

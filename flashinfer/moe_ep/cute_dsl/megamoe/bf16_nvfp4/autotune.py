@@ -4,9 +4,7 @@
 
 from __future__ import annotations
 
-import math
 import statistics
-import warnings
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 import torch
@@ -46,15 +44,12 @@ def bf16_nvfp4_candidates(
 
 
 def _sample_graph_seconds(
-    launch: Callable[[], None], timed_iters: int
+    launch: Callable[[], None], timed_iters: int, process_group: Any = None
 ) -> Sequence[float]:
     """Own one full-forward graph until all replay work and reset complete."""
     import torch.distributed as dist
 
-    from flashinfer.testing.utils import bench_gpu_time_with_cuda_event
-
     collective = dist.is_available() and dist.is_initialized()
-    rank = dist.get_rank() if collective else 0
     graph: Optional[torch.cuda.CUDAGraph] = None
     capture_error: Optional[Exception] = None
     try:
@@ -70,7 +65,7 @@ def _sample_graph_seconds(
         ready = capture_error is None
         if collective:
             status = torch.tensor(int(ready), dtype=torch.int32, device="cuda")
-            dist.all_reduce(status, op=dist.ReduceOp.MIN)
+            dist.all_reduce(status, op=dist.ReduceOp.MIN, group=process_group)
             ready = bool(status.item())
         if not ready:
             raise _CollectiveGraphTimingError(
@@ -78,22 +73,24 @@ def _sample_graph_seconds(
             ) from capture_error
         assert graph is not None
 
-        def select_own_rank(values: Sequence[float]) -> float:
-            # Keep local samples: the sweep takes MAX of rank medians. The
-            # event utility's default per-iteration MAX changes that metric.
-            return values[rank]
-
-        milliseconds = bench_gpu_time_with_cuda_event(
-            graph.replay,
-            dry_run_iters=0,
-            repeat_iters=timed_iters,
-            cold_l2_cache=False,
-            sleep_after_run=False,
-            input_args=(),
-            input_kwargs={},
-            aggregate_op=select_own_rank,
-        )
-        return [sample / 1000.0 for sample in milliseconds]
+        # Keep the event helper's six untimed replays, but sample locally:
+        # its implicit WORLD gathers would include ranks outside this EP group.
+        for _ in range(6):
+            graph.replay()
+        torch.cuda.synchronize()
+        if collective:
+            dist.barrier(group=process_group)
+        starts = [torch.cuda.Event(enable_timing=True) for _ in range(timed_iters)]
+        ends = [torch.cuda.Event(enable_timing=True) for _ in range(timed_iters)]
+        for start, end in zip(starts, ends, strict=True):
+            start.record()
+            graph.replay()
+            end.record()
+        torch.cuda.synchronize()
+        return [
+            start.elapsed_time(end) / 1000.0
+            for start, end in zip(starts, ends, strict=True)
+        ]
     except _CollectiveGraphTimingError:
         raise
     except Exception as exc:
@@ -126,6 +123,7 @@ def autotune_bf16_nvfp4_mega_moe(
     candidates: Optional[List[Dict[str, Any]]] = None,
     warmup_iters: int = 3,
     timed_iters: int = 10,
+    process_group: Any = None,
 ) -> Dict[str, Any]:
     """Collectively tune W4A16 on staged BF16 inputs and prepared NVFP4 weights.
 
@@ -135,6 +133,9 @@ def autotune_bf16_nvfp4_mega_moe(
     Output overwrites ``y``. Every EP rank must call outside graph capture.
     At least one eager preparation forward runs before each capture, even
     when ``warmup_iters=0``, to compile the fused kernel and reducer.
+    ``process_group`` selects the EP group; ``None`` uses the default group.
+    Candidate failures abort the sweep; distributed failure recovery belongs
+    to the caller, since preparation also allocates symmetric storage.
     """
     from .frontend import bf16_nvfp4_mega_moe
 
@@ -178,47 +179,33 @@ def autotune_bf16_nvfp4_mega_moe(
     import torch.distributed as dist
 
     collective = dist.is_available() and dist.is_initialized()
-    rank = dist.get_rank() if collective else 0
+    rank = dist.get_rank(group=process_group) if collective else 0
 
     def _barrier() -> None:
         if collective:
-            dist.barrier()
+            dist.barrier(group=process_group)
 
     scores: List[float] = []
     for knobs in candidates:
-        # A candidate failure (ctor reject / compile error) is deterministic
-        # across ranks -- same static problem, same knobs -- so scoring it inf
-        # keeps the collective iteration aligned.
-        try:
-            frontend.apply_knobs(knobs)
-            _barrier()
-            for _ in range(warmup_iters):  # first launch compiles
-                launch(sync=True)
-            _barrier()
-            scores.append(
-                statistics.median(_sample_graph_seconds(launch_async, timed_iters))
+        # Rank-local allocation/compile errors need not be deterministic.
+        # Abort the sweep; continuing could enter a different collective from
+        # a peer still preparing or launching this candidate.
+        frontend.apply_knobs(knobs)
+        _barrier()
+        for _ in range(warmup_iters):  # first launch compiles
+            launch(sync=True)
+        _barrier()
+        scores.append(
+            statistics.median(
+                _sample_graph_seconds(launch_async, timed_iters, process_group)
             )
-        except _CollectiveGraphTimingError:
-            # A peer may already be waiting in a captured collective. Never
-            # advance to a different candidate after graph timing fails.
-            raise
-        except Exception as exc:  # noqa: BLE001 -- score-and-continue by design
-            warnings.warn(
-                f"[cutedsl-autotune] {label}: candidate {knobs} failed: {exc}",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-            scores.append(math.inf)
+        )
         _barrier()
 
     t = torch.tensor(scores, dtype=torch.float64, device="cuda")
     if collective:
-        dist.all_reduce(t, op=dist.ReduceOp.MAX)  # slowest rank = real latency
+        dist.all_reduce(t, op=dist.ReduceOp.MAX, group=process_group)
     best = int(torch.argmin(t).item())
-    if not math.isfinite(float(t[best])):
-        raise RuntimeError(
-            f"[cutedsl-autotune] {label}: every candidate failed to compile/run."
-        )
     winner = candidates[best]
     frontend.apply_knobs(winner)
     p50_s = float(t[best])

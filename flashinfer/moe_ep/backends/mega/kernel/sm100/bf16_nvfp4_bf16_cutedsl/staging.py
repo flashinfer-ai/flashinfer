@@ -25,6 +25,21 @@ class _CompiledStager:
 _STAGERS: dict[tuple, _CompiledStager] = {}
 
 
+def forget_staged_inputs(topk_idx_out: torch.Tensor) -> None:
+    """Drop workspace-bound views before freeing their symmetric allocation."""
+    device, ptr = topk_idx_out.device.index, topk_idx_out.data_ptr()
+    for key, stager in _STAGERS.items():
+        if (
+            key[0] == device
+            and stager.launch_key is not None
+            and stager.launch_key[0][4][0] == ptr
+        ):
+            # Keep the compiled kernel; only its zero-copy argument views
+            # belong to this workspace and must be rebound after teardown.
+            stager.launch_key = None
+            stager.launch_args = None
+
+
 def _supported(tensors: tuple[torch.Tensor, ...]) -> bool:
     hidden, ids = tensors[:2]
     # The backend already validates dtypes, dimensions, common device and
