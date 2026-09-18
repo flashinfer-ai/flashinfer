@@ -839,7 +839,7 @@ def _gate_first_call(raw):
         return gated
 
 
-def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False):
+def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False, page_shift=None):
     """Capture-time varlen plan + compiled launcher.  The gvr_main port is
     the universally correct fallback; specialist family tiers below.  Every
     choice here is a function of capture-stable quantities only — mirroring
@@ -848,10 +848,24 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False):
     ``hint_free`` selects the engines with the hint-gather sites compiled out
     (upstream PR NVIDIA/TensorRT-LLM#18410): the register families bracket on
     the first k row values they already hold, the streaming families run on the
-    sample alone. Part of the cache key (distinct compiled objects)."""
+    sample alone. Part of the cache key (distinct compiled objects).
+    ``page_shift`` (log2 page size, hint-free only) selects the PAGED engines: the
+    page table rides in the dead pre_idx slot and every emitted index leaves the
+    kernel as a physical KV slot (see ``_pt_xf`` in the device module)."""
     sms = _sm_count()
     hint_free = bool(hint_free)
-    key = (num_rows, npad, k, n_env, next_n, cr, hint_free, _arch_token(), sms)
+    paged = page_shift is not None
+    if paged and not hint_free:
+        raise RuntimeError("paged engines are hint-free only")
+    pg = dict(paged=paged, page_shift=int(page_shift) if paged else 0)
+    # every family stages the page-table row in smem when it is small (<= 4 KB):
+    # entries needed for the widest row, rounded to a power of two
+    pt_smem = 0
+    if paged:
+        need_pages = (min(n_env, npad) + (1 << page_shift) - 1) >> page_shift
+        if need_pages <= 1024:
+            pt_smem = 1 << max(need_pages - 1, 0).bit_length()
+    key = (num_rows, npad, k, n_env, next_n, cr, hint_free, page_shift, _arch_token(), sms)
     hit = _VARLEN_CACHE.get(key)
     if hit is not None:
         return hit
@@ -881,6 +895,8 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False):
                 next_n=next_n,
                 cr_shift=cr_shift,
                 hint_free=hint_free,
+                pt_smem=pt_smem,
+                **pg,
             )
         )
         lc = ("reg_clus", fn, n_kernel)
@@ -901,13 +917,20 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False):
                 next_n=next_n,
                 cr_shift=cr_shift,
                 hint_free=hint_free,
+                pt_smem=pt_smem,
+                **pg,
             )
         )
         rt_f = plan_free["rt"]
         lc = (
             "reg",
             fn,
-            (n_kernel, rt_f["CMP"], rt_f["QC"], dev.STATIC_BYTES + plan_free["smem"]),
+            (
+                n_kernel,
+                rt_f["CMP"],
+                rt_f["QC"],
+                dev.STATIC_BYTES + plan_free["smem"] + 4 * pt_smem,
+            ),
         )
         _VARLEN_CACHE[key] = lc
         return lc
@@ -929,6 +952,8 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False):
                 next_n=next_n,
                 cr_shift=cr_shift,
                 hint_free=hint_free,
+                pt_smem=pt_smem,
+                **pg,
             )
         )
         lc = (
@@ -946,7 +971,12 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False):
     # machinery in whenever SPLIT); normalize it out of the compile key so
     # row counts differing only in that slot share one engine
     fn = _gate_first_call(
-        dev.get_compiled(tpl[:6] + (False,) + (next_n, cr_shift, r_const), hint_free=hint_free)
+        dev.get_compiled(
+            tpl[:6] + (False,) + (next_n, cr_shift, r_const),
+            hint_free=hint_free,
+            pt_smem=pt_smem,
+            **pg,
+        )
     )
     big = num_rows * r_const <= 148
     aim_base = (
@@ -1961,6 +1991,8 @@ def run_varlen(
     top_k: int | None = None,
     row_starts: torch.Tensor | None = None,
     absolute_indices: bool = False,
+    page_table: torch.Tensor | None = None,
+    page_size: int = 1,
 ) -> None:
     """Production-contract varlen entry (per-row device kv_lens).
 
@@ -2105,6 +2137,42 @@ def run_varlen(
             raise RuntimeError("row_starts must be contiguous")
     elif absolute_indices:
         raise RuntimeError("absolute_indices requires row_starts (windowed / prefill mode)")
+    paged = page_table is not None
+    page_shift = None
+    if paged:
+        # PAGED output (decode): every selected column c of request q leaves the
+        # kernel as page_table[q, c // page_size] * page_size + c % page_size, the
+        # physical KV slot the sparse-attention kernel reads (the SGLang
+        # DSA decode contract). Hint-free only (the page table rides in the
+        # pre_idx ABI slot), no windows, no values (the raw indices are gone).
+        if windowed:
+            raise RuntimeError("page_table is a decode-mode option (no row_starts)")
+        if not hint_free:
+            raise RuntimeError("page_table requires pre_idx=None (hint-free engines)")
+        if values is not None:
+            raise RuntimeError("page_table cannot be combined with values (raw indices are not kept)")
+        ps = _index(page_size)
+        if ps < 1 or ps > (1 << 30) or ps & (ps - 1):
+            raise RuntimeError(f"page_size must be a power of two in [1, 2**30], got {page_size}")
+        page_shift = ps.bit_length() - 1
+        if not (isinstance(page_table, _TENSOR) and page_table.is_cuda):
+            raise RuntimeError("page_table must be a CUDA tensor")
+        if page_table.dtype is not _I32:
+            raise RuntimeError("page_table must be int32")
+        if page_table.dim() != 2 or page_table.shape[0] != batch:
+            raise RuntimeError(
+                f"page_table must be [batch={batch}, max_pages] (one row per request), "
+                f"got {tuple(page_table.shape)}"
+            )
+        if not page_table.is_contiguous():
+            raise RuntimeError("page_table must be contiguous")
+        # every column the kernels can emit (< min(envelope, width)) needs a page
+        need_pages = (min(_index(max_seq_len) // cr if max_seq_len is not None else logits.shape[1], logits.shape[1]) + ps - 1) // ps
+        if page_table.shape[1] < need_pages:
+            raise RuntimeError(
+                f"page_table has {page_table.shape[1]} pages per request; the logits width "
+                f"needs {need_pages} at page_size={ps}"
+            )
     d = logits.get_device()
     if not 0 <= d < _GVR_MAX_DEV:
         raise RuntimeError(f"device index out of range: {d}")
@@ -2247,7 +2315,7 @@ def run_varlen(
                 vals.copy_(lg.gather(1, idx64.clamp_min(0).clamp_max(npad - 1)))
                 vals.masked_fill_(idx < 0, torch.finfo(_F32).min)
             return
-        key = (num_rows, npad, k, n_env, nn, cr, hint_free, _arch_token(), _sm_count())
+        key = (num_rows, npad, k, n_env, nn, cr, hint_free, page_shift, _arch_token(), _sm_count())
         lc = _VARLEN_CACHE.get(key)
         if lc is None:
             if _is_capturing():
@@ -2255,7 +2323,7 @@ def run_varlen(
                     "varlen launcher not compiled for this shape — warm up "
                     "before CUDA graph capture"
                 )
-            lc = _varlen_launcher(num_rows, npad, k, n_env, nn, cr, hint_free)
+            lc = _varlen_launcher(num_rows, npad, k, n_env, nn, cr, hint_free, page_shift)
         idx = indices
         if idx.shape[1] != k:
             idx = idx.reshape(-1)[: num_rows * k].view(num_rows, k)
@@ -2263,8 +2331,9 @@ def run_varlen(
         if vals is not None and vals.shape[1] != k:
             vals = vals.reshape(-1)[: num_rows * k].view(num_rows, k)
         # hint-free engines never read the pre_idx ABI slot: pass the output
-        # buffer (int32, 16-byte aligned) to satisfy the compiled fake
-        pre_arg = idx if hint_free else pre_idx
+        # buffer (int32, 16-byte aligned) to satisfy the compiled fake; the
+        # paged engines read the page table from that slot instead
+        pre_arg = page_table if paged else (idx if hint_free else pre_idx)
         if lc[0] == "reg_clus":
             # compiled ABI: (logits, pre_idx, kv_lens, out, n_envelope)
             lc[1](lg, pre_arg, kv_lens, idx, lc[2])
@@ -2350,6 +2419,11 @@ def run_varlen(
             # reference frame is window-local: shift the hits (not the pad)
             rr = idx[r]
             idx[r] = torch.where(rr >= 0, rr + ks, rr)
+        if paged:
+            rr = idx[r].to(torch.int64)
+            pt = page_table[req].to(torch.int64)
+            phys = (pt[(rr >> page_shift).clamp_min(0)] << page_shift) | (rr & ((1 << page_shift) - 1))
+            idx[r] = torch.where(rr >= 0, phys, rr).to(_I32)
 
 
 __all__ = [
@@ -2387,6 +2461,7 @@ def warmup_varlen(
     next_n: int = 1,
     num_rows_list: Sequence[int] = (1,),
     row_stride: int | None = None,
+    page_size: int | None = None,
 ) -> None:
     """TESTING/INIT ONLY — compile the varlen engine's envelope tuples.
 
@@ -2403,7 +2478,17 @@ def warmup_varlen(
     producer layout (e.g. the DSL paged-MQA arena's 256-element rounding)
     must pass it; the 64-element default only matches producers that round
     the same way.
+
+    ``page_size`` additionally compiles the PAGED hint-free engines and
+    launchers for that page size (``run_varlen(page_table=..., page_size=)``
+    is a distinct compiled set per page size).
     """
+    page_shift = None
+    if page_size is not None:
+        ps = int(page_size)
+        if ps < 1 or ps > (1 << 30) or ps & (ps - 1):
+            raise RuntimeError(f"page_size must be a power of two in [1, 2**30], got {page_size}")
+        page_shift = ps.bit_length() - 1
     dev = torch.cuda.current_device()
     nn = max(1, int(next_n))
     # round each request down to a next_n multiple (min next_n) and dedup
@@ -2458,7 +2543,16 @@ def warmup_varlen(
             raise RuntimeError(
                 f"row_stride must be a float4-multiple >= n_env={n_env}, got {row_stride}"
             )
-    key = (dev, int(top_k), int(max_seq_len), int(compress_ratio), nn, tuple(rows_list), npad)
+    key = (
+        dev,
+        int(top_k),
+        int(max_seq_len),
+        int(compress_ratio),
+        nn,
+        tuple(rows_list),
+        npad,
+        page_shift,
+    )
     n_env_l = min(max(int(max_seq_len) >> (0 if int(compress_ratio) == 1 else 2), 1), npad)
     with _VARLEN_WARMUP_LOCK:
         bands_done = key in _VARLEN_WARMUP_DONE
@@ -2472,6 +2566,10 @@ def warmup_varlen(
         for r in req_rows:
             for hf in (False, True):
                 _varlen_launcher(r, npad, int(top_k), n_env_l, nn, int(compress_ratio), hf)
+            if page_shift is not None:
+                _varlen_launcher(
+                    r, npad, int(top_k), n_env_l, nn, int(compress_ratio), True, page_shift
+                )
         return
     rows_max = rows_list[-1]
     # one allocation at the largest geometry; smaller row counts run on
@@ -2483,8 +2581,26 @@ def warmup_varlen(
     kv_lens = torch.full((rows_max // nn,), int(max_seq_len), dtype=torch.int32, device=dev)
     pre_idx = torch.zeros((rows_max // nn, int(top_k)), dtype=torch.int32, device=dev)
     out = torch.empty((rows_max, int(top_k)), dtype=torch.int32, device=dev)
+    page_tab = None
+    if page_shift is not None:
+        page_tab = torch.zeros(
+            (rows_max // nn, (npad + (1 << page_shift) - 1) >> page_shift), dtype=torch.int32, device=dev
+        )
     for rows in rows_list:
         batch = rows // nn
+        if page_tab is not None:
+            run_varlen(
+                logits[:rows],
+                None,
+                kv_lens[:batch],
+                out[:rows],
+                next_n=nn,
+                compress_ratio=int(compress_ratio),
+                max_seq_len=int(max_seq_len),
+                top_k=int(top_k),
+                page_table=page_tab[:batch],
+                page_size=1 << page_shift,
+            )
         for hint in (pre_idx[:batch], None):
             run_varlen(
                 logits[:rows],
@@ -2496,7 +2612,7 @@ def warmup_varlen(
                 max_seq_len=int(max_seq_len),
                 top_k=int(top_k),
             )
-    del logits, kv_lens, pre_idx, out
+    del logits, kv_lens, pre_idx, out, page_tab
     torch.cuda.synchronize()
     # band launches compiled every ENGINE; now populate the per-row-count
     # LAUNCHER cache entries for the exact requested row counts (pure host
@@ -2505,5 +2621,9 @@ def warmup_varlen(
     for r in req_rows:
         for hf in (False, True):
             _varlen_launcher(r, npad, int(top_k), n_env_l, nn, int(compress_ratio), hf)
+        if page_shift is not None:
+            _varlen_launcher(
+                r, npad, int(top_k), n_env_l, nn, int(compress_ratio), True, page_shift
+            )
     with _VARLEN_WARMUP_LOCK:
         _VARLEN_WARMUP_DONE.add(key)
