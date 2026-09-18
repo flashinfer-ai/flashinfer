@@ -247,7 +247,7 @@ positive; the kernel does not check the values.
 | V dtype (`v_data_type`) | `torch.float8_e4m3fn`; defaults to `kv_data_type`, so INT8 K must name it explicitly |
 | Output dtype (`o_data_type`) | `torch.bfloat16` (default with `sage`) or `torch.float16` |
 | `SageAttentionConfig.q_block_size` | Power of two no larger than the Q tile (64 or 128, see below); default 1 |
-| `SageAttentionConfig.k_block_size` | One of `SAGE_K_BLOCK_SIZES == (16, 32, 64, 128, 256)`; default 16 |
+| `SageAttentionConfig.k_block_size` | One of `SAGE_K_BLOCK_SIZES == (1, 4, 16, 32, 64, 128, 256)`; default 16 |
 | `SageAttentionConfig.v_mean` | `True` when every run supplies `v_mean`; default `False` |
 | Head dimension | 128 |
 | K/V storage | Contiguous `[B, S, Hkv, D]` only; the paged wrappers accept neither `sage` nor INT8 |
@@ -259,10 +259,9 @@ positive; the kernel does not check the values.
 V) names `v_data_type` explicitly, and `(int8, int8)` and
 `(float8_e4m3fn, int8)` are rejected. The defaults
 (`q_block_size=1`, `k_block_size=16`) are TensorRT-LLM's production recipe
-`(1, 16, 1)`. Its `(1, 1, 1)` and `(1, 4, 1)` recipes are not supported: the
-softmax applies one multiplier per compile-time group of a K32 score
-fragment, and K blocks below 16 tokens would need distinct multipliers inside
-a group.
+`(1, 16, 1)`; its `(1, 4, 1)` and `(1, 1, 1)` recipes run with eight and 32
+scale groups per K32 score fragment, whose `sfK` words the softmax reads from
+SMEM per fragment instead of holding one multiplier per group in registers.
 
 The profile follows from the same `q_block_size`/`kv_block_size` plan
 arguments as 16-bit decode: `kv_block_size` must be a positive multiple of
@@ -328,12 +327,13 @@ the output tile's columns split between the two lane groups of the tail, an
 INT8 accumulator seeded with an FP32 bias so scores need no conversion, and a
 smaller instruction footprint in the masked softmax paths. On B200 with the
 `(fp8, fp8, (1, 16, 1))` recipe, kernel time relative to the BF16 kernel of
-the same plan (both scheduled by the same launch heuristic) is
-0.82 on dense S=10800 H=40, 0.94 on dense S=4096 H=8, 0.90 on block-sparse
-S=4096 H=8 (density 0.25), 0.78 on a VSA-shaped block-sparse case (S=15360,
-H=40, density 0.125), 0.79 on the SOL exact case (S=10800, H=40, density
-0.175) and 0.79 on its proxy variant; the numbers do not depend on the logit
-distribution. The INT8 recipe is within 0-4% of the FP8 recipe.
+the same plan (both scheduled by the same launch heuristic) is 0.83 on
+dense S=10800 H=40, 1.00 on dense S=4096 H=8 (the small dense case gains
+nothing over the persistent BF16 kernel), 0.91 on block-sparse S=4096 H=8
+(density 0.25), 0.81 on a VSA-shaped block-sparse case (S=15360, H=40,
+density 0.125), 0.82 on the SOL exact case (S=10800, H=40, density 0.175)
+and 0.86 on its proxy variant; the numbers do not depend on the logit
+distribution. The INT8 recipe is within 1-4% of the FP8 recipe.
 `k_block_size=32` is neutral for FP8 and 3-4% faster than 16 for INT8.
 
 ### Examples
@@ -355,9 +355,14 @@ fp8 = torch.float8_e4m3fn
 
 wrapper = BlockSparseTSWrapper()
 wrapper.plan(
-    B, Sq, Skv, Hq, Hkv, D,
-    64,   # q_block_size: 64 rows per KV head select the Q64/KV256 profile
-    64,   # kv_block_size: a multiple of 64
+    B,
+    Sq,
+    Skv,
+    Hq,
+    Hkv,
+    D,
+    64,  # q_block_size: 64 rows per KV head select the Q64/KV256 profile
+    64,  # kv_block_size: a multiple of 64
     device=device,
     use_block_sparse=False,
     q_data_type=fp8,
@@ -388,28 +393,46 @@ num_kv_blocks = math.ceil(Skv / kv_block_size)
 
 wrapper = BlockSparseTSWrapper()
 wrapper.plan(
-    B, Sq, Skv, Hq, Hkv, D,
-    64, kv_block_size,
+    B,
+    Sq,
+    Skv,
+    Hq,
+    Hkv,
+    D,
+    64,
+    kv_block_size,
     device=device,
     max_blocks_per_row=max_blocks_per_row,
     use_kv_valid_bits=False,
     use_proxy_routes=True,
     q_data_type=torch.int8,
     kv_data_type=torch.int8,
-    v_data_type=fp8,           # INT8 K requires E4M3 V, named explicitly
+    v_data_type=fp8,  # INT8 K requires E4M3 V, named explicitly
     o_data_type=torch.bfloat16,
-    sage=SageAttentionConfig(),  # the (1, 16, 1) recipe
+    sage_config=SageAttentionConfig(),  # the (1, 16, 1) recipe
 )
 
-q = (torch.randn(B, Sq, Hq, D, device=device) * 40).round().clamp(-127, 127).to(torch.int8)
-k = (torch.randn(B, Skv, Hkv, D, device=device) * 40).round().clamp(-127, 127).to(torch.int8)
+q = (
+    (torch.randn(B, Sq, Hq, D, device=device) * 40)
+    .round()
+    .clamp(-127, 127)
+    .to(torch.int8)
+)
+k = (
+    (torch.randn(B, Skv, Hkv, D, device=device) * 40)
+    .round()
+    .clamp(-127, 127)
+    .to(torch.int8)
+)
 v = torch.randn(B, Skv, Hkv, D, device=device).to(fp8)
 scales = SageAttentionParams(
     q_scale=torch.rand(Hq, flat_scale_numel(B, Sq, 1), device=device),
     k_scale=torch.rand(Hkv, flat_scale_numel(B, Skv, 16), device=device),
     v_scale=torch.rand(Hkv, D, device=device),
     # The K summaries are quantized as their own sequence of num_kv_blocks tokens.
-    k_summary_scale=torch.rand(Hkv, flat_scale_numel(B, num_kv_blocks, 16), device=device),
+    k_summary_scale=torch.rand(
+        Hkv, flat_scale_numel(B, num_kv_blocks, 16), device=device
+    ),
 )
 # block_indptr [B, Hkv, ceil(Sq / q_block_size) + 1] and block_indices select
 # the exact blocks; k_summary (int8) and v_summary (fp8) are the per-block

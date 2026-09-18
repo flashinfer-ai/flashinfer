@@ -393,7 +393,7 @@ performance choices gated on `use_8bit_qkv`, not dtype requirements.
 Each softmax lane owns one Q row and streams its 128 score columns as four
 K32 fragments. Per tile the lane loads `sfQ[row]` once. Per fragment it loads
 the K scales covering its 32 columns: with `k_block_size >= 32` one scale,
-with `k_block_size == 16` two, giving `sage_k_groups_per_fragment`
+with 16 two, with 4 eight and with 1 thirty-two, giving `sage_k_groups_per_fragment`
 compile-time groups (the fragment is unrolled, so group boundaries cost no
 per-element work). With `c = sm_scale * log2(e)`:
 
@@ -410,21 +410,27 @@ correction skip and LSE all operate on the dequantized maximum and are
 unchanged. Both passes use one algebra: the tile's raw `sfK` words per scale
 group, and the row's `sfQ` applied once per tile (to the tile maximum, to the
 `c * sfQ` factor of the exponent multipliers, and to the proxy tail shift).
-Where the `sfK` words live is a strategy object in `sage_scales.py`, shared
-by the S and P resources and the route metadata consumer of one softmax
-instance: `RegisterSageKScales` keeps the lane's words in a rotating register
-array that both passes read fragment by fragment without runtime indexing.
-The passes see only the strategy's `open`, `fragment` and `advance`. The
-sources are the same for both: the contiguous provider derives each
-fragment's first token from the tile offset and loads `sfK` from the softmax
-threads before the score wait (`load_lane_k_scales`); the block-sparse
-provider moves the loads off the softmax warps, the load warp resolving and
-staging the route's `sfK` words (`sage_k_scale_words` per route, ordered by
-consuming half and lane array) next to the route metadata from the route's
-K64 atom origins; a proxy route switches the K source to `k_summary_scale`
-indexed by summary position (`block_sparse_k_scale_source`). Tokens beyond
-the sequence end and Q rows beyond the valid count clamp to the last valid
-slot, so masked columns keep a finite scale and exponentiate to zero.
+Where the `sfK` words live is a compile-time strategy in `sage_scales.py`,
+selected by `sage_k_scales_in_smem` and shared by the S and P resources and
+the route metadata consumer of one softmax instance: `RegisterSageKScales`
+(K blocks of 16 tokens and larger) keeps the lane's words in a rotating
+register array that both passes read fragment by fragment without runtime
+indexing; `SmemSageKScales` (blocks of 4 and 1 token, too many groups for
+registers) keeps the tile's words in a two-tile SMEM ring of the instance
+(filled from `k_scale` by the lanes of a dense tile or copied from the route
+stage, published with one named barrier) that both passes read with 16-byte
+broadcast loads per fragment. The passes see only the strategy's `open`,
+`fragment` and `advance`. The sources are the same for both: the contiguous
+provider derives each fragment's first token from the tile offset and loads
+`sfK` from the softmax threads before the score wait (`load_lane_k_scales`);
+the block-sparse provider moves the loads off the softmax warps, the load
+warp resolving and staging the route's `sfK` words (`sage_k_scale_words` per
+route, ordered by consuming half and lane array) next to the route metadata
+from the route's K64 atom origins; a proxy route switches the K source to
+`k_summary_scale` indexed by summary position (`block_sparse_k_scale_source`).
+Tokens beyond the sequence end and Q rows beyond the valid count clamp to the
+last valid slot, so masked columns keep a finite scale and exponentiate to
+zero.
 
 The epilogue (`_store_final_o_columns`) multiplies each output column by
 `norm_scale * sfV[c]` and adds `v_mean[c]` when configured. Both vectors are

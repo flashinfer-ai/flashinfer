@@ -36,7 +36,7 @@ import torch
 
 from flashinfer.utils import ceil_div
 
-SAGE_K_BLOCK_SIZES = (16, 32, 64, 128, 256)
+SAGE_K_BLOCK_SIZES = (1, 4, 16, 32, 64, 128, 256)
 # The Sage scale slots of the contiguous attention adapter, in ABI order.
 SAGE_ADAPTER_SLOTS = ("q_scale", "k_scale", "k_summary_scale", "v_scale", "v_mean")
 

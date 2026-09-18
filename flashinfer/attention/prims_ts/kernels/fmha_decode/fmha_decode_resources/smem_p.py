@@ -86,7 +86,6 @@ from .sage_scales import SageKScales
 from .smem_block_sparse_metadata import _route_is_proxy
 from .tmem_s import TmemSResource
 
-
 # Tunable: number of score pairs per streamed fragment whose exponentials run
 # as FMA polynomials instead of MUFU. The MUFU issue rate bounds the fragment
 # otherwise, while the FMA pipe is nearly idle in the softmax warps. Larger
@@ -145,8 +144,8 @@ class SmemPResource(DecodeGenResourceBase):
     use_variable_seqlens_kv: Constexpr[bool] = False
     tmem_s_ref: Constexpr[TmemSResource] = None
     tmem_o_ref: Constexpr[object] = None
-    # Where the tile's ``sfK`` words live during the softmax passes; shared
-    # with the S resource and the route metadata consumer of the same instance.
+    # Where the tile's ``sfK`` words live (shared with the S resource and the
+    # route metadata consumer of the same instance).
     sage_k_scales: Constexpr[SageKScales | None] = None
     _alloc: Constexpr[SmemAllocation | None] = None
     _fragment_ready_alloc: Constexpr[SmemAllocation | None] = None
@@ -489,12 +488,13 @@ class SmemPResource(DecodeGenResourceBase):
         )
         if cutlass.const_expr(prefetches_next):
             self._load_score_fragment(tmem_base, Int32(0), pending_scores)
-        for fragment_idx in cutlass.range(num_fragments, unroll=1):
+        for fragment_idx in cutlass.range(cfg.num_softmax_score_fragments, unroll=1):
             fragment = Int32(fragment_idx)
             fragment_multipliers = None
             if cutlass.const_expr(cfg.use_sage_attention):
+                # Issued before the score wait so an SMEM read hides behind it.
                 fragment_multipliers = self.sage_k_scales.fragment(
-                    scales_view, fragment, exp_scale
+                    scales_view, fragment
                 )
                 self.sage_k_scales.advance(scales_view)
             if cutlass.const_expr(not prefetches_next):
@@ -615,17 +615,42 @@ class SmemPResource(DecodeGenResourceBase):
         compile-time scale group; without Sage attention there is one group
         holding the softmax scale.
         """
-        pairs_per_fragment = self.cfg.softmax_score_fragment_regs // 2
-        pairs_per_group = pairs_per_fragment // self.cfg.sage_k_groups_per_fragment
-        for pair_idx in cutlass.range_constexpr(pairs_per_fragment):
-            value_idx = pair_idx * 2
-            multiplier = Float32(group_multipliers[pair_idx // pairs_per_group])
-            addend = Float32(group_addends[pair_idx // pairs_per_group])
-            s_arr[value_idx], s_arr[value_idx + 1] = cute.arch.fma_packed_f32x2(
-                (Float32(s_arr[value_idx]), Float32(s_arr[value_idx + 1])),
-                (multiplier, multiplier),
-                (addend, addend),
+        for pair_idx in cutlass.range_constexpr(
+            self.cfg.softmax_score_fragment_regs // 2
+        ):
+            s_arr[pair_idx * 2], s_arr[pair_idx * 2 + 1] = self._exponent_pair(
+                s_arr, pair_idx * 2, group_addends, group_multipliers
             )
+
+    @cute.jit
+    def _exponent_pair(
+        self,
+        s_arr: cutlass.Array,
+        value_idx: Constexpr[int],
+        group_addends: cutlass.Array,
+        group_multipliers: cutlass.Array,
+    ) -> tuple[Float32, Float32]:
+        """Return the log2 exponents of the score pair at ``value_idx``.
+
+        Both scores of a pair share a scale group unless the group is one
+        score wide (the one-token K block), so each takes the multiplier and
+        addend of its own group. Biased INT32 scores drop their bias first.
+        """
+        group_regs = (
+            self.cfg.softmax_score_fragment_regs // self.cfg.sage_k_groups_per_fragment
+        )
+        group0: Constexpr[int] = value_idx // group_regs
+        group1: Constexpr[int] = (value_idx + 1) // group_regs
+        scores = (Float32(s_arr[value_idx]), Float32(s_arr[value_idx + 1]))
+        if cutlass.const_expr(self.cfg.sage_int32_bias_per_score):
+            scores = cute.arch.add_packed_f32x2(
+                scores, (Float32(-INT32_SCORE_BIAS), Float32(-INT32_SCORE_BIAS))
+            )
+        return cute.arch.fma_packed_f32x2(
+            scores,
+            (Float32(group_multipliers[group0]), Float32(group_multipliers[group1])),
+            (Float32(group_addends[group0]), Float32(group_addends[group1])),
+        )
 
     @cute.jit
     def _fragment_exponent_terms(
@@ -654,7 +679,9 @@ class SmemPResource(DecodeGenResourceBase):
             group_multipliers[0] = self.scale_softmax_log2
         for group_idx in cutlass.range_constexpr(groups):
             group_addends[group_idx] = exponent_addend
-            if cutlass.const_expr(cfg.uses_int32_scores):
+            if cutlass.const_expr(
+                cfg.uses_int32_scores and not cfg.sage_int32_bias_per_score
+            ):
                 # Every biased score carries ``INT32_SCORE_BIAS``, so the
                 # addend removes ``bias * multiplier`` for its group: one
                 # rounding of the addend per group instead of one conversion
@@ -694,7 +721,6 @@ class SmemPResource(DecodeGenResourceBase):
         """
         pairs_per_fragment = self.cfg.softmax_score_fragment_regs // 2
         assert pairs_per_fragment >= 4
-        pairs_per_group = pairs_per_fragment // self.cfg.sage_k_groups_per_fragment
         sum_chains = cutlass.Array(Float32, 8, space=cutlass.AddressSpace.rmem)
         for pair_idx in cutlass.range_constexpr(pairs_per_fragment):
             value_idx = pair_idx * 2
@@ -702,12 +728,8 @@ class SmemPResource(DecodeGenResourceBase):
                 p0 = Float32(s_arr[value_idx])
                 p1 = Float32(s_arr[value_idx + 1])
             else:
-                multiplier = Float32(group_multipliers[pair_idx // pairs_per_group])
-                addend = Float32(group_addends[pair_idx // pairs_per_group])
-                p0, p1 = cute.arch.fma_packed_f32x2(
-                    (Float32(s_arr[value_idx]), Float32(s_arr[value_idx + 1])),
-                    (multiplier, multiplier),
-                    (addend, addend),
+                p0, p1 = self._exponent_pair(
+                    s_arr, value_idx, group_addends, group_multipliers
                 )
             if cutlass.const_expr(
                 _pair_uses_ex2_emulation(pair_idx, pairs_per_fragment)

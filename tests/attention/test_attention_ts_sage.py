@@ -164,15 +164,17 @@ def test_log2_block_size_rejects_other_sizes(block_size: int) -> None:
 
 
 @pytest.mark.parametrize("tile_size_q", (64, 128))
-@pytest.mark.parametrize("k_block_size", (16, 32, 64, 128, 256))
+@pytest.mark.parametrize("k_block_size", (1, 4, 16, 32, 64, 128, 256))
 def test_sage_scale_arr_size_follows_fragment_groups(
     tile_size_q: int, k_block_size: int
 ) -> None:
-    """Both streamed profiles own four K32 fragments; only ``blk=16`` splits them.
+    """Both streamed profiles own four K32 fragments; blocks below 32 split them.
 
     The Sage predicates follow the K block size alone: a 16-token block splits
-    every K32 fragment into two scale groups, larger blocks share one scale
-    per fragment, and a profile without a K block size runs without Sage.
+    every K32 fragment into two scale groups, a 4-token block into eight and a
+    one-token block into 32, larger blocks share one scale per fragment, and a
+    profile without a K block size runs without Sage. Blocks below 16 tokens
+    keep the tile's ``sfK`` words in SMEM instead of a lane register array.
     """
 
     cfg = make_sage_decode_config(
@@ -180,12 +182,16 @@ def test_sage_scale_arr_size_follows_fragment_groups(
         tile_size_kv=256 if tile_size_q == 64 else 128,
         sage_args={"sage_k_block_size": k_block_size},
     )
-    groups = 2 if k_block_size == 16 else 1
+    groups = max(1, 32 // k_block_size)
     assert cfg.use_sage_attention and cfg.streams_tmem_p_fragments
     assert not cfg.uses_int32_scores
     assert cfg.num_softmax_score_fragments == 4
     assert cfg.sage_k_groups_per_fragment == groups
     assert sage_scales.sage_scale_arr_size(cfg) == 4 * groups
+    assert cfg.sage_k_scales_in_smem == (k_block_size < 16)
+    assert sage_scales.sage_k_scale_words(cfg) == (
+        (2 if tile_size_q == 64 else 1) * 4 * groups
+    )
 
     plain = replace(cfg, sage_k_block_size=0, sage_q_block_size=0)
     assert not plain.use_sage_attention
@@ -365,7 +371,7 @@ def test_sage_config_defaults_follow_the_production_recipe() -> None:
     _validate(params, config)
 
 
-@pytest.mark.parametrize("k_block_size", (16, 32, 64, 128, 256))
+@pytest.mark.parametrize("k_block_size", (1, 4, 16, 32, 64, 128, 256))
 @pytest.mark.parametrize("q_block_size", (1, 4, 64))
 @pytest.mark.parametrize("with_mean", (False, True))
 def test_sage_params_accept_supported_shapes(
@@ -664,6 +670,43 @@ _DENSE_SAGE_CASES = (
         out_dtype=torch.float16,
         mask_type="causal",
     ),
+    # A 4-token K block splits every K32 fragment into eight scale groups.
+    _DenseSageCase(
+        name="kv256_k4_q1_bf16",
+        **_KV256_MHA,
+        sage_k_block_size=4,
+        out_dtype=torch.bfloat16,
+    ),
+    _DenseSageCase(
+        name="q128_k4_q1_bf16_mean_causal",
+        **_Q128_GQA,
+        sage_k_block_size=4,
+        with_mean=True,
+        out_dtype=torch.bfloat16,
+        mask_type="causal",
+    ),
+    # A one-token K block gives every score its own scale; the tile's sfK
+    # words live in SMEM.
+    _DenseSageCase(
+        name="kv256_k1_q1_bf16",
+        **_KV256_MHA,
+        sage_k_block_size=1,
+        out_dtype=torch.bfloat16,
+    ),
+    _DenseSageCase(
+        name="kv256_gqa4_k1_q1_fp16_mean_causal",
+        **_KV256_GQA,
+        sage_k_block_size=1,
+        with_mean=True,
+        out_dtype=torch.float16,
+        mask_type="causal",
+    ),
+    _DenseSageCase(
+        name="q128_k1_q1_bf16",
+        **_Q128_GQA,
+        sage_k_block_size=1,
+        out_dtype=torch.bfloat16,
+    ),
     # INT8 Q/K accumulate INT32 scores; the exact dot product leaves input
     # quantization as the only error, so the FP32 reference applies unchanged.
     _DenseSageCase(
@@ -689,6 +732,22 @@ _DENSE_SAGE_CASES = (
         out_dtype=torch.bfloat16,
         qk_dtype=torch.int8,
     ),
+    _DenseSageCase(
+        name="kv256_int8_k4_q1_fp16_causal",
+        **_KV256_MHA,
+        sage_k_block_size=4,
+        out_dtype=torch.float16,
+        mask_type="causal",
+        qk_dtype=torch.int8,
+    ),
+    _DenseSageCase(
+        name="q128_int8_k1_q1_bf16_mean",
+        **_Q128_GQA,
+        sage_k_block_size=1,
+        with_mean=True,
+        out_dtype=torch.bfloat16,
+        qk_dtype=torch.int8,
+    ),
 )
 # The dense persistent loop resolves every tile through the work tile; cover
 # one E4M3 case, one causal case with the V mean, one INT8 case, and the
@@ -698,11 +757,10 @@ _PERSISTENT_DENSE_SAGE_CASE_NAMES = (
     "kv256_k16_q1_fp16_mean_causal",
     "kv256_int8_k16_q1_bf16",
     "q128_int8_k16_q1_bf16_mean",
+    "kv256_k1_q1_bf16",
 )
-_DENSE_SAGE_CASES += tuple(
-    replace(case, name=f"{case.name}_persistent", scheduler="persistent")
-    for case in _DENSE_SAGE_CASES
-    if case.name in _PERSISTENT_DENSE_SAGE_CASE_NAMES
+_DENSE_SAGE_CASES = _with_persistent_replicas(
+    _DENSE_SAGE_CASES, _PERSISTENT_DENSE_SAGE_CASE_NAMES
 )
 
 
@@ -1138,8 +1196,14 @@ def _quantized_recipe_inputs(case: _SageCase, q_magnitude: float, device: torch.
 )
 @pytest.mark.parametrize(
     "case",
-    _cases_named(_DENSE_SAGE_CASES, "kv256_k16_q1_bf16", "q128_k16_q1_bf16_mean"),
-    ids=("kv256", "q128"),
+    _cases_named(
+        _DENSE_SAGE_CASES,
+        "kv256_k16_q1_bf16",
+        "q128_k16_q1_bf16_mean",
+        "kv256_k4_q1_bf16",
+        "kv256_k1_q1_bf16",
+    ),
+    ids=("kv256", "q128", "kv256-k4", "kv256-k1"),
 )
 @pytest.mark.parametrize("qk_dtype", (_FP8, torch.int8), ids=("fp8", "int8"))
 @torch.no_grad()
@@ -1338,6 +1402,65 @@ _SPARSE_SAGE_CASES = (
         out_dtype=torch.bfloat16,
         use_proxy_routes=False,
     ),
+    # A 4-token K block stages 64 (KV256) or 32 (KV128) sfK words per route,
+    # two 32-lane rounds of the load warp on KV256.
+    _SparseSageCase(
+        name="kv256_exact_k4_q1_bf16_mask",
+        **_SPARSE_KV256_MHA,
+        kv_block_size=64,
+        sage_k_block_size=4,
+        out_dtype=torch.bfloat16,
+        use_proxy_routes=False,
+        use_token_mask=True,
+    ),
+    _SparseSageCase(
+        name="kv256_proxy_k4_q1_bf16_mean",
+        **_SPARSE_KV256_MHA,
+        kv_block_size=64,
+        sage_k_block_size=4,
+        with_mean=True,
+        out_dtype=torch.bfloat16,
+        use_proxy_routes=True,
+    ),
+    _SparseSageCase(
+        name="q128_gqa8_int8_proxy_k4_q1_fp16",
+        **_SPARSE_Q128_GQA,
+        kv_block_size=64,
+        sage_k_block_size=4,
+        out_dtype=torch.float16,
+        use_proxy_routes=True,
+        qk_dtype=torch.int8,
+    ),
+    # A one-token K block stages 256 (KV256) or 128 (KV128) sfK words per
+    # route and reads them from SMEM; the summary sequence gets one scale per
+    # summary.
+    _SparseSageCase(
+        name="kv256_exact_k1_q1_bf16_mask",
+        **_SPARSE_KV256_MHA,
+        kv_block_size=64,
+        sage_k_block_size=1,
+        out_dtype=torch.bfloat16,
+        use_proxy_routes=False,
+        use_token_mask=True,
+    ),
+    _SparseSageCase(
+        name="kv256_proxy_k1_q1_bf16_mean",
+        **_SPARSE_KV256_MHA,
+        kv_block_size=64,
+        sage_k_block_size=1,
+        with_mean=True,
+        out_dtype=torch.bfloat16,
+        use_proxy_routes=True,
+    ),
+    _SparseSageCase(
+        name="q128_gqa8_int8_proxy_k1_q1_fp16",
+        **_SPARSE_Q128_GQA,
+        kv_block_size=64,
+        sage_k_block_size=1,
+        out_dtype=torch.float16,
+        use_proxy_routes=True,
+        qk_dtype=torch.int8,
+    ),
     _SparseSageCase(
         name="q128_gqa8_proxy_bk128_k32_q4_fp16_mean",
         **_SPARSE_Q128_GQA,
@@ -1416,11 +1539,10 @@ _PERSISTENT_SPARSE_SAGE_CASE_NAMES = (
     "kv256_proxy_k16_q1_bf16_mean",
     "q128_gqa8_proxy_bk128_k32_q4_fp16_mean",
     "kv256_int8_proxy_bk128_k64_q64_bf16_mean",
+    "kv256_proxy_k1_q1_bf16_mean",
 )
-_SPARSE_SAGE_CASES += tuple(
-    replace(case, name=f"{case.name}_persistent", scheduler="persistent")
-    for case in _SPARSE_SAGE_CASES
-    if case.name in _PERSISTENT_SPARSE_SAGE_CASE_NAMES
+_SPARSE_SAGE_CASES = _with_persistent_replicas(
+    _SPARSE_SAGE_CASES, _PERSISTENT_SPARSE_SAGE_CASE_NAMES
 )
 
 
@@ -1895,8 +2017,16 @@ def _sparse_bf16_reference(
         "kv256_exact_k16_q1_bf16",
         "kv256_proxy_k16_q1_bf16_mean",
         "q128_gqa8_proxy_bk128_k32_q4_fp16_mean",
+        "kv256_proxy_k4_q1_bf16_mean",
+        "kv256_proxy_k1_q1_bf16_mean",
     ),
-    ids=("kv256-exact", "kv256-proxy", "q128-proxy"),
+    ids=(
+        "kv256-exact",
+        "kv256-proxy",
+        "q128-proxy",
+        "kv256-proxy-k4",
+        "kv256-proxy-k1",
+    ),
 )
 @pytest.mark.parametrize("qk_dtype", (_FP8, torch.int8), ids=("fp8", "int8"))
 @torch.no_grad()

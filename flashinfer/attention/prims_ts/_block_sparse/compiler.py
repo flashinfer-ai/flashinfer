@@ -182,7 +182,7 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
                 )
             # Exact routes address K/V through the summary TensorMaps as well;
             # proxy routes address the caller's block summaries.
-            if cutlass.const_expr(use_proxy_routes):
+            if cutlass.const_expr(static_config.use_block_sparse_proxy_routes):
                 k_summary_iter = k_summary.iterator
                 v_summary_iter = v_summary.iterator
             else:
@@ -393,7 +393,7 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
                 4,
             )
             route_workspace_fake = fake_compact(Int32, (cute.sym_int(),), 4)
-        sage_fakes: tuple[object | None, ...] = (None, None, None, None, None)
+        sage_fakes: tuple[object | None, ...] = sage_adapter_slots({})
         if key.sage is not None:
             # The scale shapes of this plan fill the adapter slots the same
             # way ``sage_launch_args`` binds the run's tensors: the summary K

@@ -2925,7 +2925,8 @@ def _softmax_schedule_body(
         # The lane's Q row is fixed for the work tile.
         sage_q_scale = tmem_s.load_sage_q_scale()
     # The Sage loops take the row's ``sfQ`` and the routed ``sage_scale_arr``
-    # (the lane's raw ``sfK`` array), the block-sparse loops the
+    # (the lane's raw ``sfK`` array, or a placeholder when the tile's words
+    # live in the instance's SMEM ring), the block-sparse loops the
     # register-resident route payload and the proxy P pass its route kind;
     # the work framework routes arguments by token and rejects ``None``, so
     # each combination is its own work callable.
@@ -2961,14 +2962,15 @@ def _softmax_schedule_body(
                 sparse_token_word3,
             ) = sparse_softmax_metadata.load_route()
             if cutlass.const_expr(cfg.use_sage_attention):
-                # The route's staged ``sfK`` words become the lane's array.
+                # The route's staged ``sfK`` words go where the strategy keeps
+                # them: the lane's array or the instance's SMEM ring.
                 sage_scale_arr = sparse_softmax_metadata.load_route_sage_k_scales()
             sparse_softmax_metadata.release()
         if cutlass.const_expr(cfg.use_sage_attention and not use_sparse):
             # A dense tile's ``sfK`` loads are issued ahead of the score wait
             # so their latency hides behind the QK MMA; a route's words came
             # with its metadata above.
-            sage_scale_arr = tmem_s.load_sage_scales()
+            sage_scale_arr = tmem_s.load_sage_k_scales()
         # ConsWait/ConsWork: load S from TMEM and compute the tile max.
         tmem_s.wait()
         softmax_loop_kwargs = dict(

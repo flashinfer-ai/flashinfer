@@ -3666,6 +3666,8 @@ def test_dense_contiguous_plans_take_clc_beyond_one_wave(
                 kv_block_size=kv_block_size,
                 kv_route_size=kv_route_size,
                 dtype_key=dtype_key,
+                out_dtype_key=dtype_key,
+                v_dtype_key=dtype_key,
                 mask_type="dense",
                 use_kv_valid_bits=False,
                 max_row_route_capacity=0,
