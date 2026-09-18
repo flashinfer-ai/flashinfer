@@ -2067,8 +2067,10 @@ def prepare_cutlass_fp8_per_tensor_weights(
         # Calibration metadata; the runner ignores these keys.
         "fc1_dequant": fc1_dequant,
         "fc2_dequant": fc2_dequant,
-        "hidden_states_scale_global": act_scale,
-        "intermediate_scale_global": inter_scale,
+        # Copies, so the view never aliases a caller tensor that may be written
+        # in place after preparation.
+        "hidden_states_scale_global": act_scale.clone(),
+        "intermediate_scale_global": inter_scale.clone(),
     }
 
 
