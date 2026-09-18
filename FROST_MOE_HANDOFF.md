@@ -1,3 +1,42 @@
+## Optimization provenance and collaborative scope — 2026-09-18
+
+This work develops complementary cuDNN/FlashInfer capabilities alongside NVIDIA
+TensorRT-LLM and CUTLASS. Comparisons describe matched latency, supported shapes
+and integration costs; they retain the original authors' credit. PR descriptions
+and future commit messages should use the same collaborative language.
+
+A conservative inventory separates four locally developed or campaign-derived
+implementation directions from reuse and adaptations. This is implementation
+provenance, not a claim that these optimization techniques are new to the field.
+
+| Direction | Origin and contribution | Matched full-MoE latency reduction |
+|---|---|---|
+| Small-workload stable-rank routing + input permutation + offsets | New local CUDA implementation using existing FI contracts; not a port of the TRT-LLM routing body | B200 T1: 8.31–8.38%; T64: 1.37–1.38% |
+| Compact paired FC1/FC2 resources | KF candidate 2f5c; independent FC1 transfer and integration. TMEM 512 to 32 columns, one accumulator stage, no dynamic register redistribution | B200 T1: 9.66–9.82% (audit 1899) |
+| Small-row FC1 scheduler | KF f19299; specialize the existing Frost scheduler for at most eight routed rows | B200 T1: 1.00–1.17% (audit 2018) |
+| M64 paired FC1 implementation | KF round 2 candidate 14306536 geometry/drain/counters; retain original Frost scheduler after rejecting the candidate scheduler's race | B200 T8/T64: 1.19–1.53% (audit 2326) |
+
+All four build on existing NVIDIA/FI infrastructure. The paired-kernel foundation
+also credits Yanqin Zhai's #1090 orientation, CUTLASS example 113 and canonical
+pairing guidance. M64 required a new supported implementation; selecting it by
+sweep is not an additional optimization. The percentages are separate matched
+synthetic BF16 operator ablations, exclude preparation and model execution, and
+must not be summed or multiplied into an overall originality percentage.
+
+Direct reuse: the native finalizer and fallback router are NVIDIA TRT-LLM/FI
+contributions. Consumer PDL/top8 finalization is an adaptation of that finalizer
+(KF b0409f direction plus local integration), not an independently authored base
+kernel; its packed-T1 composition reduced latency 2.124% (audit 2080).
+TRT-LLM weight preparation motivated K64 layouts; the Frost descriptor/storage
+implementation is local, but the layout direction is not counted as independent
+original work. Final FC1 helper: 1.29–1.31% (audit 2287); FC2: 0.80–1.06%
+(audit 2364, best among both existing depths in each layout).
+Swap-AB lowering belongs to Yanqin's #1090; the SM120 prototype additionally
+references NVIDIA CuTeDSL MegaMoE. Neither is counted as our original idea.
+Configuration sweeps, stage-depth selection, admission extensions, correctness
+repairs and API/graph integration are tracked separately. They can be useful
+engineering contributions without establishing a new GEMM algorithm.
+
 ## Independent K64 FC2 layout: native FE and full FlashInfer validation
 
 FC2 now independently accepts explicit `weight_layout="k_blocked_64_v1"`
@@ -211,7 +250,7 @@ ablation2099 measures84.440625->82.884375 us packed (1.843% lower) and
 84.368500->82.876500 us unpacked (1.768% lower), with bitwise cross-arm outputs.
 These are configuration benefits, not new kernel implementation speedups.
 
-The competitor search covers all128 exported joint (PDL off/on, FC1, FC2)
+The reference-backend search covers all128 exported joint (PDL off/on, FC1, FC2)
 configurations:96 execute;32 remain explicit prelaunch zero-occupancy rejects.
 Winner PDL-on/(1,11) passes normal, memcheck and racecheck before four fresh
 ABBA processes using cold-L2 CUPTI spans. Independent audit2120 reconstructs
@@ -251,11 +290,11 @@ comparisons,120negative controls,768spans total. The FC2 completion tail falls
 40.924->28.272 us, while FC1 stays about69 us. This is an interface/admission
 benefit from an existing kernel, not a newly optimized kernel. T64 and a fresh
 strongest-TRT T8 comparison are still pending, so no broader adoption or
-competitor speedup is claimed. The separate FC2 small-row scheduler code
+cross-backend latency reduction is claimed. The separate FC2 small-row scheduler code
 candidate also remains unpublished pending complete-MoE validation.
 
 Credit: NVIDIA Frost supplies the configurable GEMMs/scheduler; NVIDIA
-TRT-LLM/CUTLASS and FlashInfer supply the competing kernels, routing and
+TRT-LLM/CUTLASS and FlashInfer supply the reference kernels, routing and
 finalization. Paired FC2 retains KF624/2f5c contributions and
 YanqinPR #1090/CUTLASS example 113 guidance; small-row work builds on KFf19299. Yanqin
 and Yihua's contributions and the other specific credits below remain.
@@ -421,7 +460,7 @@ A separate 44-case large finite cancellation diagnostic compares generic and
 specialized outputs bitwise: all 44 match. Both versions fail 15 FP32-reference
 checks. This establishes no new numerical change on these cases; it does not
 waive the existing cancellation behavior or claim all-input numerical accuracy.
-No new competing-backend, SM120, model-E2E or full-repository-CI claim is made.
+No new reference-backend, SM120, model-E2E or full-repository-CI claim is made.
 The native PDL-off/on comparator refresh and finalizer PDL experiment remain
 pending, as qualified below.
 
@@ -446,7 +485,7 @@ the flag to their implementation; neither setting can be assumed neutral.
 These measurements and correctness checks remain evidence for their recorded
 settings. The fixed-source Frost ablations, including the9.66–9.82% compact
 resource gain and larger-row admission results, keep their stated scope.
-Claims of a strongest competing backend require searching PDL off and on,
+Claims of a fastest reference-backend configuration require searching PDL off and on,
 then revalidating and retiming the selected route. That broader comparison
 is pending; no new performance numbers or runtime changes are published here.
 This clarification supersedes unqualified "strongest" wording below.
@@ -507,7 +546,7 @@ parallel work, KF624/2f5c, CUTLASS example 113 and canonical rank5/early-PDL con
 The published compact-resource FC1/FC2 implementation now measures **29.484375 us**
 against TRT-LLM **28.620375 us**, or **3.019% higher latency**, on the same 1000 W
 B200. This is complete synthetic BF16 MoE, T1/E=128, top-k=8, H=2048, I=768, unpacked
-routing. It is not yet a competitor win and does not update the T64 or SM120 result.
+routing. The reference implementation has lower latency in this comparison and does not update the T64 or SM120 result.
 
 Independent audit 1913 reconstructs 68 raw output checks, 30 changed-reference
 controls and 384 cold-L2 timing spans. Both paths pass normal, memcheck and
@@ -565,7 +604,7 @@ NCU confirms essentially unchanged DRAM/L2 traffic and 210944 B dynamic shared
 memory, with increased achieved bandwidth and a small active-warp change.
 It does not establish a large occupancy gain or a performance roof. A fresh
 strongest-TRT comparison for this version is still required; the resource
-table alone is not a competitor or model-E2E win. SM120 kernels are unchanged.
+table alone does not establish a cross-backend or model-E2E benefit. SM120 kernels are unchanged.
 
 # Frost / FlashInfer MoE pathfinding handoff
 
@@ -605,7 +644,7 @@ output checks,120 independently changed-reference controls and768 spans.
 Two retained parent captures, live X/IDs/scales/FC1 and FC2 weights, and
 independent legacy weights are covered. PDL intervals overlap; stage durations
 must not be added. This is a synthetic model-shaped operator result, not model
-E2E or a new competitor victory. It supersedes the earlier private FC2 override
+E2E or a new cross-backend benefit. It supersedes the earlier private FC2 override
 as evidence for the real public graph path.
 
 Evidence: local `artifacts/analysis1883/public.json` and
@@ -782,7 +821,7 @@ pytest -q tests/moe/test_moe_cudnn_bf16_weight_views.py
 The TRT-LLM BF16 comparator uses its required gate/up interleaving, MMA row
 shuffle and 128-byte K-block BlockMajorK layout. The uint8 view is a byte-level
 layout operation; weights remain BF16. Both backends prepare before timing.
-The historical competitor measurement used Frost's legacy dense preparation;
+The historical reference-backend measurement used Frost's legacy dense preparation;
 the shared and private blocked candidates have not yet been freshly paired
 against TRT-LLM.
 
@@ -860,7 +899,7 @@ T1 unpacked/packed 134.144/134.167 -> 133.224/133.167 us (0.69/0.75% reduction),
 T64 797.267/797.084 -> 795.247/795.325 us (0.25/0.22%). These are independent
 incremental comparisons; do not add their percentages to the routing table.
 
-The stronger B200 baseline still wins. After selecting TRT-LLM from 352 joint
+The tuned TRT-LLM reference has lower latency on this B200 fixture. After selecting TRT-LLM from 352 joint
 tactics, a separate same-card comparison measures Frost/TRT-LLM at 33.816/29.120
 us for T1 and 215.600/197.120 us for T64: Frost is 16.13%/9.38% slower. Actual
 native BMM symbols and cubin hashes match the search winners. Both arms pass
@@ -872,7 +911,7 @@ validated standalone fused router; it is not a timing of the publication layout.
 Separately, selecting an existing SM120 M16x64 static FC1 configuration gives
 59.71/59.74 us at T1 unpacked/packed after independent gates. This is tuning,
 not a new kernel optimization, and it is not included in the routing-gain table.
-Best-to-best swap-AB tests have not beaten ordinary Frost configurations;
+Best-to-best swap-AB tests have not reduced latency relative to ordinary Frost configurations;
 the fixed-geometry swap observation retained below is historical. Current
 counter work and grid-size experiments do not yet establish a hardware roof.
 
@@ -938,7 +977,7 @@ handoff; these frozen IDs identify the tested source, not the published heads.
 | Repository | Change | Purpose |
 |---|---|---|
 | Frontend | Async shared-memory lifetime fence before releasing an A/B stage | Fixes the ordinary-execution FC1 corruption found with the large SM120 tile; prevents the next TMA load from reusing a stage too early. |
-| Frontend | Explicit SM120 static scheduling alongside dynamic scheduling | Allows tuning away atomic work distribution when a regular workload benefits; does not assume static always wins. |
+| Frontend | Explicit SM120 static scheduling alongside dynamic scheduling | Allows tuning away atomic work distribution when a regular workload benefits; does not assume static is always faster. |
 | Frontend | Shared-A paired grouped GEMM on SM120, with epilogue and shared-memory capacity accounting | Enables gate/up projection and activation fusion, saving the FP32 intermediate roundtrip and separate activation launch. |
 | Frontend | Multi-output, pitched-weight, multiwave and scheduler regression coverage | Checks the new fusion and scheduler contracts under live-input capture replay. |
 | FlashInfer | Explicit fused/unfused BF16 FC1 route choice | Makes the fusion route selectable and replayable rather than silently conflating different graphs. |
@@ -1094,7 +1133,7 @@ All four arms pass20 strict full-output checks and2 skipped-replay negative
 controls before384 raw spans. Inputs/routing change and buffers are poisoned.
 Independent audit1453 verifies exact source hashes, all spans and actual stage
 routes. Synchronization validation, fresh-process repetition, tile tuning and a
-tuned competing-backend comparison remain open. This experimental
+tuned reference-backend comparison remain open. This experimental
 merge is not included in this PR's runtime changes; no model-E2E gain is claimed.
 
 ## Qualification of experimental observations
