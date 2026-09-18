@@ -173,6 +173,26 @@ CMPC = 4096  # crossing-bin slots per CTA, clustered register path
 BLKC = 1024  # CTA size of the clustered register path
 
 
+def _big_regime(b: int, R: int, n4: int) -> bool:
+    """Streaming-slab regime selector (one place for route / route_dynamic /
+    route_streaming / the varlen launcher).
+
+    Upstream: ``b * R <= 148`` (the grid fits one wave) selects the "big"
+    configuration: 1024-thread CTAs, one per SM, with the large sample caps
+    (SCAP 16384, CMP 4096). FlashInfer-local: UNSPLIT rows (R == 1) in the
+    75-148 row band with rows of <= 64K columns take the b > 148 configuration
+    instead ((512, U 8, MINB 2): 512 threads, the smaller caps). Measured
+    same-node, K in {512, 1024, 2048}, N 32K-64K, 75-148 rows: 1.5-2.5x faster
+    on B200, B300 and B100, 1.5-2.6x on DRIVE P2021 (68 SMs), 1.2-2.1x on Rubin;
+    forcing the U=8 unroll on the 1024-thread kernel changes nothing and the
+    host sample constants do not matter, so it is the 512-thread CTA shape with
+    its BLK-derived caps. Outside that band it is not a win: 33-74 unsplit rows
+    (K = 2048 only reaches the slab there) lose at 64K (0.75x at 37 rows) and
+    rows above 64K are mixed to bad (0.5x at 75-148 rows x 256K), so both keep
+    upstream's regime, as do the split slab (R > 1) and b > 148."""
+    return b * R <= 148 and not (R == 1 and b >= 75 and n4 <= 16384)
+
+
 def route(b: int, n: int, npad: int, k: int, sms: int = 148) -> dict[str, object]:
     """Mirror of the CUDA gvr_topk_launch dispatch. Pure. See module doc.
 
@@ -381,7 +401,7 @@ def route(b: int, n: int, npad: int, k: int, sms: int = 148) -> dict[str, object
         R = p2
         useclus = True
 
-    big = b * R <= 148
+    big = _big_regime(b, R, n >> 2)
     SCAP = (16384 if R == 1 else 8192) if big else (8192 if k > 1024 else 4096)
     CMP = (4096 if k > 1024 else 2048) if big else 1024
 
@@ -620,7 +640,10 @@ def route_dynamic(static: dict[str, object], n: int) -> tuple[dict[str, object],
     else:
         R = static["rt"]["R"]
         scap = static["rt"]["SCAP_"]
-    big = b * R <= 148
+    # the regime is a static-plan property (a band boundary at 64K for the
+    # unsplit 75-148 row slab): clus is split-only (n-independent), main's
+    # big configuration is the only one with 1024-thread CTAs
+    big = _big_regime(b, R, 0) if fam == "clus" else static["tpl"][0] == 1024
     aim = (
         ((4 * k if k >= 1024 else 2 * k) if R == 1 else 2 * k)
         if big
@@ -709,7 +732,7 @@ def route_streaming(
             p2 = 4
         R = p2
         useclus = True
-    big = b * R <= 148
+    big = _big_regime(b, R, n >> 2)
     scap = (16384 if R == 1 else 8192) if big else (8192 if k > 1024 else 4096)
     cmp_ = (4096 if k > 1024 else 2048) if big else 1024
     aim = (
@@ -1006,7 +1029,7 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False, page
             **pg,
         )
     )
-    big = num_rows * r_const <= 148
+    big = _big_regime(num_rows, r_const, n_route >> 2)
     aim_base = (
         ((4 * k if k >= 1024 else 2 * k) if r_const == 1 else 2 * k)
         if big
