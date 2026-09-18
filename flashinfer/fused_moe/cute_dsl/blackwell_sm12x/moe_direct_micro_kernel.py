@@ -45,6 +45,7 @@ from flashinfer.cute_dsl.fp4_common import (
     pack_f32x2_to_f16x2,
     prefetch_global_l2,
     quant_dequant_2,
+    rcp_rn,
     spin_wait_global_eq_i32,
     st_global_i32,
     st_global_release_i32,
@@ -319,8 +320,10 @@ class MoEDirectMicroKernel:
     """Decode-focused direct-routed MoE kernel for SM12x.
 
     Scale contract: w1_alphas/input_gs/down_input_scale are per-expert
-    [weight_E] f32 tensors, with input_gs and down_input_scale in multiplier
-    form; reciprocal-form scales must be inverted host-side before launch.
+    [weight_E] f32 tensors. By default input_gs/down_input_scale are reciprocal
+    multipliers, preserving the low-level API contract. Set
+    input_scales_are_reciprocal=False for ordinary NVFP4 API scales; the kernel
+    converts them to multipliers when loading, preserving zeros.
     """
 
     def __init__(
@@ -330,6 +333,7 @@ class MoEDirectMicroKernel:
         output_tile_count_n: int,
         *,
         fast_math: bool = False,
+        input_scales_are_reciprocal: bool = True,
         activation: str = "silu",
         share_input_across_experts: bool = False,
         share_expert_scales: bool = False,
@@ -352,6 +356,10 @@ class MoEDirectMicroKernel:
             raise ValueError(f"unsupported micro scale_format {scale_format!r}")
         if w4a16_mode and a8_mx_mode:
             raise ValueError("w4a16_mode and a8_mx_mode are mutually exclusive")
+        if not input_scales_are_reciprocal and (w4a16_mode or a8_mx_mode):
+            raise ValueError(
+                "input_scales_are_reciprocal=False is only supported for NVFP4"
+            )
         if scale_format == "e8m0_k32" and not (w4a16_mode or a8_mx_mode):
             raise ValueError("e8m0_k32 scales require the W4A16 or a8_mx micro mode")
         if e8m0_scale_layout not in {"packed", "logical"}:
@@ -375,6 +383,7 @@ class MoEDirectMicroKernel:
         self.swiglu_alpha = float(swiglu_alpha)
         self.swiglu_beta = float(swiglu_beta)
         self.sf_vec_size = sf_vec_size
+        self.input_scales_are_reciprocal = input_scales_are_reciprocal
         # Accepted for call compatibility with the MMA micro kernels; this
         # CUDA-core body has no fast-math variant, so the flag is a no-op.
         del fast_math
@@ -403,6 +412,7 @@ class MoEDirectMicroKernel:
     def __cache_key__(self):
         return (
             self.sf_vec_size,
+            self.input_scales_are_reciprocal,
             self.activation,
             self.is_gelu_tanh,
             self.share_input_across_experts,
@@ -426,6 +436,13 @@ class MoEDirectMicroKernel:
             self.m1_fc2_rows_per_cta,
             self.launch_block_dim,
         )
+
+    @cute.jit
+    def _input_scale_multiplier(self, value: Float32) -> Float32:
+        if cutlass.const_expr(not self.input_scales_are_reciprocal):
+            if value != Float32(0.0):
+                value = rcp_rn(value)
+        return value
 
     @cute.jit
     def _fp4_dot4_for_math(
@@ -641,6 +658,39 @@ class MoEDirectMicroKernel:
             m=m, k=k, n=n, num_topk=num_topk, weight_E=weight_E, is_gated=self.is_gated
         )
         num_fc1_chunks = _fc1_chunks_for_m(m, n)
+        if max_active_ctas is None:
+            max_active_ctas = min(get_num_sm(device), get_max_active_clusters(1))
+        if (
+            m == 1
+            and n % 32 == 0
+            and k <= 2560
+            and self.compile_time_phase == 0
+            and num_topk * (n // 32) <= max_active_ctas < num_topk * (n // 16)
+            and self.is_gated
+            and not self.w4a16_mode
+            and not self.a8_mx_mode
+            and not self.dynamic_down_scale
+        ):
+            # Merge two FC1 task waves into one to quantize the input once.
+            # Keeping a single wave avoids extra row work on the slowest CTA.
+            # Longer K paths can regress with two rows/warp; keep their tuning,
+            # split phases, and dynamic per-chunk FC2 scaling unchanged.
+            num_fc1_chunks = _fc1_chunks_for_m(2, n)
+        elif (
+            m == 2
+            and n % 64 == 0
+            and k <= 2560
+            and self.compile_time_phase == 0
+            and m * num_topk * (n // 64) <= max_active_ctas < m * num_topk * (n // 32)
+            and self.is_gated
+            and not self.w4a16_mode
+            and not self.a8_mx_mode
+            and not self.dynamic_down_scale
+        ):
+            # Keep the slowest CTA's four FC1 rows/warp in one task,
+            # avoiding a second input quantization and task barriers.
+            # Whole N64 chunks retain four independent Q1 block writers.
+            num_fc1_chunks = _fc1_chunks_for_m(4, n)
         if self.w4a16_mode and m == 1 and n <= 2048:
             # 4 rows/warp only helps the k_segments==8 aligned gated path (its
             # reg-hoist + dual-dot assume 4 rows). The k_segments==12 path is
@@ -678,8 +728,6 @@ class MoEDirectMicroKernel:
             fc2_tasks = (m * cfg.k_dim) // (_K_PER_CTA * 2)
         else:
             fc2_tasks = (m * cfg.k_dim) // (_K_PER_CTA * 4)
-        if max_active_ctas is None:
-            max_active_ctas = min(get_num_sm(device), get_max_active_clusters(1))
         if self.compile_time_phase == 1:
             # A standalone FC1 phase has no cooperative-grid requirement.
             grid_x = max(1, fc1_tasks)
@@ -693,6 +741,31 @@ class MoEDirectMicroKernel:
             grid_x = max(1, min(int(max_active_ctas), fc2_tasks))
         else:
             grid_x = max(1, min(int(max_active_ctas), fc1_tasks, fc2_tasks))
+        if (
+            m == 3
+            and n == 320
+            and k == 2560
+            and self.compile_time_phase == 0
+            and self.is_gated
+            and not self.w4a16_mode
+            and not self.a8_mx_mode
+            and not self.dynamic_down_scale
+        ):
+            narrow_chunks = _fc1_chunks_for_m(2, n)
+            # Both choices stay on the FC2-sized grid branch above. Narrow
+            # whole-N32 tasks can balance the last FC1 wave without adding
+            # row work to the slowest CTA; extra Q0 calls remain a tradeoff.
+            if num_fc1_chunks < narrow_chunks < 16:
+                narrow_cfg = _remake_shape_config_fc1(cfg, narrow_chunks)
+                narrow_tasks = m * cfg.num_topk * narrow_chunks
+                old_max_rows = (
+                    (fc1_tasks + grid_x - 1) // grid_x * cfg.rows_per_warp_fc1
+                )
+                new_max_rows = (
+                    (narrow_tasks + grid_x - 1) // grid_x * narrow_cfg.rows_per_warp_fc1
+                )
+                if new_max_rows < old_max_rows:
+                    cfg = narrow_cfg
         m1_fc2_onepass = bool(m == 1 and grid_x >= fc2_tasks)
 
         if self.a8_mx_mode and self.compile_time_phase != 1 and cfg.i_chunk % 32 != 0:
@@ -2128,7 +2201,9 @@ class MoEDirectMicroKernel:
                 eid_addr_0 = t0 * Int32(cfg.num_topk) + (
                     route_idx_0 - t0 * Int32(cfg.num_topk)
                 )
-                gs_fc1_0 = input_gs[Int32(topk_ids[eid_addr_0])]
+                gs_fc1_0 = self._input_scale_multiplier(
+                    input_gs[Int32(topk_ids[eid_addr_0])]
+                )
                 in_blk = tidx
                 while in_blk < Int32(cfg.k_dim // _BLOCK_SIZE):
                     x_base = t0 * Int32(cfg.k_dim) + in_blk * Int32(_BLOCK_SIZE)
@@ -2216,8 +2291,8 @@ class MoEDirectMicroKernel:
                 gs_fc2 = Float32(1.0)
             else:
                 alpha_fc1 = w1_alphas[eid]
-                gs_fc1 = input_gs[eid]
-                gs_fc2 = down_input_scale[eid]
+                gs_fc1 = self._input_scale_multiplier(input_gs[eid])
+                gs_fc2 = self._input_scale_multiplier(down_input_scale[eid])
                 if cutlass.const_expr(self.a8_mx_mode):
                     # a8_mx activations are self-ranging: fold the calibrated
                     # input global scale out of the combined nvfp4 alpha.
@@ -4446,7 +4521,9 @@ class MoEDirectMicroKernel:
                     next_eid_addr = t_next * Int32(cfg.num_topk) + (
                         next_route - t_next * Int32(cfg.num_topk)
                     )
-                    gs_fc1_next = input_gs[Int32(topk_ids[next_eid_addr])]
+                    gs_fc1_next = self._input_scale_multiplier(
+                        input_gs[Int32(topk_ids[next_eid_addr])]
+                    )
                     next_buf_base = (Int32(1) - buf_idx) * Int32(cfg.smem_xh_size)
                     in_blk = tidx
                     while in_blk < Int32(cfg.k_dim // _BLOCK_SIZE):
@@ -4986,6 +5063,7 @@ def build_direct_micro_kernel(
     *,
     activation: str = "silu",
     fast_math: bool = False,
+    input_scales_are_reciprocal: bool = True,
     share_input_across_experts: bool = False,
     share_expert_scales: bool = False,
     single_token: bool = False,
@@ -5006,13 +5084,16 @@ def build_direct_micro_kernel(
 
     Returns the configured (uncompiled) kernel; the caller keys its compile
     cache on ``kernel.__cache_key__`` plus the topk_ids dtype and launches
-    with ``kernel.grid_x``.
+    with ``kernel.grid_x``. Scales default to the low-level reciprocal
+    multiplier contract; ordinary NVFP4 API scales require
+    ``input_scales_are_reciprocal=False``.
     """
     kernel = MoEDirectMicroKernel(
         sf_vec_size=16,
         mma_tiler_mn=(64, 128),
         output_tile_count_n=1,
         fast_math=fast_math,
+        input_scales_are_reciprocal=input_scales_are_reciprocal,
         activation=activation,
         share_input_across_experts=share_input_across_experts,
         share_expert_scales=share_expert_scales,
