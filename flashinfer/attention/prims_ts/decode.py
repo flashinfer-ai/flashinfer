@@ -4083,7 +4083,6 @@ def batch_decode_with_paged_kv_cache(
     split_kv : bool
         Allow automatic split fanout (True, default), or force S1 (False),
         independently of packed/fixed query storage.
-
     workspace_buffer : torch.Tensor, optional
         Zero-initialized caller-owned byte scratch; re-zero when layout inputs
         (including batch size) change. Exclusive to one in-flight launch/graph.
@@ -4233,6 +4232,7 @@ def batch_decode_with_paged_kv_cache(
             kv_layout=kv_layout,
             storage_page_size=storage_page_size,
             device=q.device,
+            split_kv=split_kv,
         )
         workspace_buffer = torch.empty(
             workspace_bytes, dtype=torch.int8, device=q.device

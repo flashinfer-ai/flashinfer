@@ -3951,6 +3951,63 @@ def test_attention_ts_decode_runtime_kv_ceil_div_covers_int32_domain() -> None:
         )
 
 
+@pytest.mark.parametrize("split_kv", (False, True))
+@pytest.mark.parametrize("workspace_mode", ("owned", "validated", "trusted"))
+def test_attention_ts_decode_one_shot_forwards_split_kv(
+    monkeypatch, split_kv, workspace_mode
+):
+    """Workspace sizing and planning must select the same split policy."""
+
+    from unittest.mock import Mock
+
+    from flashinfer.attention.prims_ts import decode as decode_module
+
+    q = torch.empty((1, 8, 64), dtype=torch.float16)
+    cache = torch.empty((1, 1, 32, 64), dtype=q.dtype)
+    seq_lens = torch.tensor([32], dtype=torch.int32)
+    block_tables = torch.zeros((1, 1), dtype=torch.int32)
+    workspace = torch.empty(128, dtype=torch.int8)
+    wrapper = Mock()
+    workspace_size = Mock(return_value=workspace.numel())
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(
+        decode_module, "BatchDecodePagedTSWrapper", Mock(return_value=wrapper)
+    )
+    monkeypatch.setattr(
+        decode_module, "get_prims_ts_batch_decode_workspace_size", workspace_size
+    )
+    monkeypatch.setattr(
+        decode_module, "_validate_block_table_metadata", lambda *_: (q.device, 1, 1)
+    )
+    monkeypatch.setattr(decode_module, "_validate_q", lambda *_, **__: None)
+    monkeypatch.setattr(
+        decode_module,
+        "_normalize_paged_kv_cache_views",
+        lambda *_, **__: (cache, cache, 1, 1, 32, 64),
+    )
+
+    output = batch_decode_with_paged_kv_cache(
+        q,
+        (cache, cache),
+        block_tables,
+        seq_lens,
+        split_kv=split_kv,
+        workspace_buffer=None if workspace_mode == "owned" else workspace,
+        max_kv_len=32,
+        validate=workspace_mode != "trusted",
+    )
+
+    assert output is wrapper.run.return_value
+    wrapper.plan.assert_called_once()
+    assert wrapper.plan.call_args.kwargs["split_kv"] is split_kv
+    if workspace_mode == "owned":
+        workspace_size.assert_called_once()
+        assert workspace_size.call_args.kwargs["split_kv"] is split_kv
+    else:
+        workspace_size.assert_not_called()
+        assert wrapper.plan.call_args.kwargs["workspace_buffer"] is workspace
+
+
 def test_attention_ts_decode_run_requires_plan():
     wrapper = BatchDecodePagedTSWrapper()
     with pytest.raises(RuntimeError, match=r"plan\(\) must be called before run\(\)"):
