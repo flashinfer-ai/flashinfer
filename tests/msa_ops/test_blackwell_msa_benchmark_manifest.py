@@ -56,6 +56,20 @@ def test_manifest_records_complete_provenance_and_baseline_support():
     assert all("MiniMax-AI/MSA@80434d7f" in shape.provenance for shape in official_rows)
 
 
+def test_vibecuda_reference_tolerance_follows_output_dtype():
+    from benchmarks import bench_vibecuda_msa_sm100 as vibecuda_benchmark
+
+    fp8_kv_shape = next(
+        shape
+        for shape in vibecuda_benchmark.SHAPE_MANIFEST
+        if shape.q_dtype == "bfloat16" and shape.kv_dtype == "float8_e4m3fn"
+    )
+    assert vibecuda_benchmark._reference_tolerance(fp8_kv_shape) == {
+        "atol": 1e-2,
+        "rtol": 1e-2,
+    }
+
+
 def test_manifest_covers_audited_shape_axes_and_route_complements():
     shapes = benchmark.SHAPE_MANIFEST
 
