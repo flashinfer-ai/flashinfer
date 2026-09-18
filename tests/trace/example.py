@@ -27,6 +27,7 @@ fmha_v2_prefill_sm120_h4_d128.json
 gdn_decode_qk4_v8_d128.json
 gdn_fused_decode_h5120_v48_d128.json
 gdn_mtp_qk4_v8_d128.json
+gdn_replayssm_commit_k2_v8_d128.json
 gdn_prefill_qk4_v8_d128.json
 gdn2_prefill_qk4_v8_d128.json
 gdp_prefill_n2_qk4_v8_d128.json
@@ -985,6 +986,14 @@ b_m = torch.zeros(B, T_mtp, HV, dtype=torch.bfloat16, device=device)
 flashinfer.gdn_decode.gated_delta_rule_mtp(
     q_m, k_m, v_m, init_state, init_idx, A_log_m, a_m, dt_bias_m, b_m
 )
+
+# ── ReplaySSM accepted-prefix commit (SM100/SM103) ────────────────────────
+if torch.cuda.get_device_capability()[0] == 10:
+    from flashinfer.trace.templates.gdn import gdn_replayssm_commit_trace
+
+    flashinfer.gdn_decode.gated_delta_rule_replayssm_commit(
+        **gdn_replayssm_commit_trace.init(device=device)
+    )
 
 # ── GDN fused decode step (the registry's SM120 geometry, TP=1) ──────────────
 # Suppressed like the other optional-dependency examples: on a non-SM120 card
