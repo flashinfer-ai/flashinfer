@@ -14,18 +14,17 @@ and implementation notes are maintained separately for the handoff.
 
 ## Contributions developed in this effort
 
-Kernel Factory is part of this effort's optimization workflow. Its discoveries,
-independent validation and integration count as project contributions. The
-following rows describe newly implemented improvements on the existing
-infrastructure, without claiming that the underlying techniques are new to the
-field. Configuration search is excluded from these implementation benefits.
+The following improvements were developed and independently validated in this
+effort, building on the credited infrastructure below. We report their measured
+impact without claiming that the underlying techniques are new to the field.
+Configuration search is excluded from these implementation benefits.
 
 | Contribution | Origin | Full-MoE latency reduction on the measured B200 fixture |
 |---|---|---:|
 | Small-batch routing path | Local implementation | T1: 8.31–8.38%; T64: 1.37–1.38% |
-| Small-batch GEMM execution efficiency | Kernel Factory discovery, local validation and integration | T1: 9.66–9.82% |
-| Additional small-batch execution specialization | Kernel Factory discovery, local validation and integration | T1: 1.00–1.17% |
-| GEMM implementation for larger batches | Kernel Factory discovery, local validation and integration | T8/T64: 1.19–1.53% |
+| Small-batch GEMM execution efficiency | Research, implementation and validation in this effort | T1: 9.66–9.82% |
+| Additional small-batch execution specialization | Research, implementation and validation in this effort | T1: 1.00–1.17% |
+| GEMM implementation for larger batches | Research, implementation and validation in this effort | T8/T64: 1.19–1.53% |
 
 These are separate matched synthetic BF16 operator ablations on a 148-SM,
 1000 W B200, E=128, top-k=8, H=2048, I=768. They use fixed configurations
@@ -50,8 +49,9 @@ overall attribution percentage or a model-level speedup claim.
 - NVIDIA CUTLASS example 113 and the NVIDIA CuTeDSL MegaMoE team's implementation
   informed distinct parts of the exploration. Referenced designs and reused
   source retain their original authorship and license headers.
-- Kernel Factory campaigns contributed the project improvements listed above.
-  Candidates without independently validated benefit are not counted.
+- The improvements developed in this effort are reported separately from
+  credited external contributions. Candidates without independently validated
+  benefit are not counted.
 
 API support, correctness repairs, validation and configuration selection are
 valuable engineering work, but are not counted as new optimization discoveries.
