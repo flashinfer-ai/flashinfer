@@ -898,6 +898,12 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, const void* __res
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
     const int lane = tid % 32;
+    // Round-141 (supervisor directive, H%8!=0 beta-LDG route): see the
+    // m128 slab TU comment. Host passes the ORIGINAL beta tensor; the
+    // descriptor slot stays unencoded; full-chunk logits are fetched by
+    // per-lane global loads and gate_raw_full expect_tx drops beta's 512
+    // bytes. Host and kernel derive the same (num_heads & 7) switch.
+    const int beta_ldg = (num_heads & 7) != 0;
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -2253,9 +2259,9 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, const void* __res
                     if (next_chunk_m < num_chunks_2 && seq_len_2 >= (next_chunk_m + 1) * 32) {
                         mbarrier_wait(raw_inputs_free_addr + (mma_stage) * 8, _phase_mma_raw_free);
                         if (elect_sync()) {
-                            mbarrier_arrive_expect_tx(gate_raw_full_addr + (mma_stage) * 8, 8704);
+                            mbarrier_arrive_expect_tx(gate_raw_full_addr + (mma_stage) * 8, beta_ldg ? 8192 : 8704);
                             tma_3d_gmem2smem(smem_g_raw_addr + mma_stage * KDA_STAGE_BYTES, g_tma, 0, head_idx_m, (int)(bos_2 + (long long)(next_chunk_m * 32)), gate_raw_full_addr + (mma_stage) * 8);
-                            tma_2d_gmem2smem(smem_beta_raw_addr + mma_stage * KDA_STAGE_BYTES, beta_tma, head_idx_m / 8 * 8, (int)(bos_2 + (long long)(next_chunk_m * 32)), gate_raw_full_addr + (mma_stage) * 8);
+                            if (!beta_ldg) tma_2d_gmem2smem(smem_beta_raw_addr + mma_stage * KDA_STAGE_BYTES, beta_tma, head_idx_m / 8 * 8, (int)(bos_2 + (long long)(next_chunk_m * 32)), gate_raw_full_addr + (mma_stage) * 8);
                             mbarrier_arrive_expect_tx(qk_raw_full_addr + (mma_stage) * 8, 16384);
                             tma_4d_gmem2smem(smem_kd_addr + mma_stage * KDA_STAGE_BYTES, k_tma, 0, (int)(bos_2 + (long long)(next_chunk_m * 32)), head_idx_m, 0, qk_raw_full_addr + (mma_stage) * 8);
                         }
@@ -2763,9 +2769,9 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, const void* __res
                 _phase_raw_inputs_free ^= 1;
                 if (prep_local_warp == 0) {
                     if (elect_sync()) {
-                        mbarrier_arrive_expect_tx(gate_raw_full_addr + (prep_stage) * 8, 8704);
+                        mbarrier_arrive_expect_tx(gate_raw_full_addr + (prep_stage) * 8, beta_ldg ? 8192 : 8704);
                         tma_3d_gmem2smem(smem_g_raw_addr + prep_stage * KDA_STAGE_BYTES, g_tma, 0, head_idx_3, (int)(bos_4 + (long long)(prep_instance * 32)), gate_raw_full_addr + (prep_stage) * 8);
-                        tma_2d_gmem2smem(smem_beta_raw_addr + prep_stage * KDA_STAGE_BYTES, beta_tma, head_idx_3 / 8 * 8, (int)(bos_4 + (long long)(prep_instance * 32)), gate_raw_full_addr + (prep_stage) * 8);
+                        if (!beta_ldg) tma_2d_gmem2smem(smem_beta_raw_addr + prep_stage * KDA_STAGE_BYTES, beta_tma, head_idx_3 / 8 * 8, (int)(bos_4 + (long long)(prep_instance * 32)), gate_raw_full_addr + (prep_stage) * 8);
                         mbarrier_arrive_expect_tx(qk_raw_full_addr + (prep_stage) * 8, 8192);
                         tma_4d_gmem2smem(smem_kd_addr + prep_stage * KDA_STAGE_BYTES, k_tma, 0, (int)(bos_4 + (long long)(prep_instance * 32)), head_idx_3, 0, qk_raw_full_addr + (prep_stage) * 8);
                     }
@@ -2788,9 +2794,9 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, const void* __res
                 _phase_raw_inputs_free ^= 1;
                 if (prep_local_warp == 0) {
                     if (elect_sync()) {
-                        mbarrier_arrive_expect_tx(gate_raw_full_addr + (prep_stage) * 8, 8704);
+                        mbarrier_arrive_expect_tx(gate_raw_full_addr + (prep_stage) * 8, beta_ldg ? 8192 : 8704);
                         tma_3d_gmem2smem(smem_g_raw_addr + prep_stage * KDA_STAGE_BYTES, g_tma, 0, head_idx_3, (int)(bos_4 + (long long)(prep_instance * 32)), gate_raw_full_addr + (prep_stage) * 8);
-                        tma_2d_gmem2smem(smem_beta_raw_addr + prep_stage * KDA_STAGE_BYTES, beta_tma, head_idx_3 / 8 * 8, (int)(bos_4 + (long long)(prep_instance * 32)), gate_raw_full_addr + (prep_stage) * 8);
+                        if (!beta_ldg) tma_2d_gmem2smem(smem_beta_raw_addr + prep_stage * KDA_STAGE_BYTES, beta_tma, head_idx_3 / 8 * 8, (int)(bos_4 + (long long)(prep_instance * 32)), gate_raw_full_addr + (prep_stage) * 8);
                     }
                 }
             }
@@ -2834,9 +2840,9 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, const void* __res
                     mbarrier_wait(raw_inputs_free_addr + (prep_stage) * 8, _phase_raw_inputs_free);
                     if (prep_local_warp == 0) {
                         if (elect_sync()) {
-                            mbarrier_arrive_expect_tx(gate_raw_full_addr + (prep_stage) * 8, 8704);
+                            mbarrier_arrive_expect_tx(gate_raw_full_addr + (prep_stage) * 8, beta_ldg ? 8192 : 8704);
                             tma_3d_gmem2smem(smem_g_raw_addr + prep_stage * KDA_STAGE_BYTES, g_tma, 0, head_idx_3, (int)(bos_4 + (long long)(chunk_idx_3 * 32)), gate_raw_full_addr + (prep_stage) * 8);
-                            tma_2d_gmem2smem(smem_beta_raw_addr + prep_stage * KDA_STAGE_BYTES, beta_tma, head_idx_3 / 8 * 8, (int)(bos_4 + (long long)(chunk_idx_3 * 32)), gate_raw_full_addr + (prep_stage) * 8);
+                            if (!beta_ldg) tma_2d_gmem2smem(smem_beta_raw_addr + prep_stage * KDA_STAGE_BYTES, beta_tma, head_idx_3 / 8 * 8, (int)(bos_4 + (long long)(chunk_idx_3 * 32)), gate_raw_full_addr + (prep_stage) * 8);
                             // Map-only: no q TMA rides this barrier (skipped
                             // below), so qk_raw_full expects only k's bytes.
                             mbarrier_arrive_expect_tx(qk_raw_full_addr + (prep_stage) * 8, map_only_2 ? 8192 : 16384);
@@ -2849,6 +2855,13 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, const void* __res
                     mbarrier_wait(gate_raw_full_addr + (prep_stage) * 8, _phase_gate_raw_full);
 #endif
                     if (prep_local_warp == 2 && lane < 32) {
+                        if (beta_ldg) {
+                            // Round-141 beta-LDG (H%8!=0): full-chunk logits
+                            // are fetched straight from the original [T, H]
+                            // layout, exactly like the tail-chunk path below
+                            // (full chunks are always entirely in range).
+                            early_beta_value = kda_sigmoid((float)beta[(bos_4 + (long long)(chunk_idx_3 * 32 + lane)) * (long long)num_heads + (long long)head_idx_3]);
+                        } else {
                         unsigned int beta_raw_pair[1];
                         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&beta_raw_pair[0])) : "r"(smem_beta_raw_addr + prep_stage * KDA_STAGE_BYTES + (unsigned int)(lane * 16) + (unsigned int)(head_idx_3 % 8 / 2 * 4)));
                         float beta_raw_pair_fp32[2];
@@ -2867,6 +2880,7 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, const void* __res
                             beta_logit = beta_raw_pair_fp32[1];
                         }
                         early_beta_value = kda_sigmoid(beta_logit);
+                        }
                     }
 #if !defined(KDA_F32X2)
                     if (prep_tid < 128) {
@@ -4585,9 +4599,9 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, const void* __res
                         _phase_raw_inputs_free ^= 1;
                         if (prep_local_warp == 0) {
                             if (elect_sync()) {
-                                mbarrier_arrive_expect_tx(gate_raw_full_addr + (prep_stage) * 8, 8704);
+                                mbarrier_arrive_expect_tx(gate_raw_full_addr + (prep_stage) * 8, beta_ldg ? 8192 : 8704);
                                 tma_3d_gmem2smem(smem_g_raw_addr + prep_stage * KDA_STAGE_BYTES, g_tma, 0, head_idx_3, (int)(bos_4 + (long long)(next_chunk_3 * 32)), gate_raw_full_addr + (prep_stage) * 8);
-                                tma_2d_gmem2smem(smem_beta_raw_addr + prep_stage * KDA_STAGE_BYTES, beta_tma, head_idx_3 / 8 * 8, (int)(bos_4 + (long long)(next_chunk_3 * 32)), gate_raw_full_addr + (prep_stage) * 8);
+                                if (!beta_ldg) tma_2d_gmem2smem(smem_beta_raw_addr + prep_stage * KDA_STAGE_BYTES, beta_tma, head_idx_3 / 8 * 8, (int)(bos_4 + (long long)(next_chunk_3 * 32)), gate_raw_full_addr + (prep_stage) * 8);
                                 mbarrier_arrive_expect_tx(qk_raw_full_addr + (prep_stage) * 8, 8192);
                                 tma_4d_gmem2smem(smem_kd_addr + prep_stage * KDA_STAGE_BYTES, k_tma, 0, (int)(bos_4 + (long long)(next_chunk_3 * 32)), head_idx_3, 0, qk_raw_full_addr + (prep_stage) * 8);
                             }
@@ -4608,9 +4622,9 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, const void* __res
                         _phase_raw_inputs_free ^= 1;
                         if (prep_local_warp == 0) {
                             if (elect_sync()) {
-                                mbarrier_arrive_expect_tx(gate_raw_full_addr + (prep_stage) * 8, 8704);
+                                mbarrier_arrive_expect_tx(gate_raw_full_addr + (prep_stage) * 8, beta_ldg ? 8192 : 8704);
                                 tma_3d_gmem2smem(smem_g_raw_addr + prep_stage * KDA_STAGE_BYTES, g_tma, 0, head_idx_3, (int)(bos_4 + (long long)(next_chunk_3 * 32)), gate_raw_full_addr + (prep_stage) * 8);
-                                tma_2d_gmem2smem(smem_beta_raw_addr + prep_stage * KDA_STAGE_BYTES, beta_tma, head_idx_3 / 8 * 8, (int)(bos_4 + (long long)(next_chunk_3 * 32)), gate_raw_full_addr + (prep_stage) * 8);
+                                if (!beta_ldg) tma_2d_gmem2smem(smem_beta_raw_addr + prep_stage * KDA_STAGE_BYTES, beta_tma, head_idx_3 / 8 * 8, (int)(bos_4 + (long long)(next_chunk_3 * 32)), gate_raw_full_addr + (prep_stage) * 8);
                             }
                         }
                     }

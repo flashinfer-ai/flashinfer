@@ -25,6 +25,19 @@ typedef signed int         int32_t;
 typedef short int          int16_t;
 
 #include <cuda_bf16.h>
+// Round-148 (supervisor directive) H12 compile-time head-count
+// specialization: this clone of the slab m128 image pins the head count to
+// 12 so every in-kernel use resolves to a compile-time constant — the
+// per-role task decodes (task / num_heads, task % num_heads) become
+// multiply-shift pairs instead of runtime division sequences, every
+// (token * num_heads + head) * 128 global-address stride folds to 1536/12
+// constants, and the beta-LDG (num_heads & 7) != 0 switch resolves at
+// compile time. The 5 function parameters below were renamed num_heads_rt
+// (launch-signature compatibility; the value passed is always 12 and is
+// unused). Length- and packed-layout-generic: cu_seqlens/seq_order/seq_len
+// all stay runtime values. File-scope constexpr has internal linkage, so it
+// does not interact with the generic slab/union/kw images.
+constexpr int num_heads = 12;
 // Round-109 (supervisor directive): SM103 prep-schedule gate. When the host
 // build tags this image as KDA_SM103 (kernel.py: sm_103a gencode only), the
 // operand-prep normalize/decay formation switches to the ILP-batched
@@ -39,6 +52,13 @@ typedef short int          int16_t;
 // backstop pinning the schedule selection to the architecture macro alone.
 #if defined(KDA_SM103) && !defined(KDA_PREP_NORM_ILP)
 #define KDA_PREP_NORM_ILP
+#endif
+// Round-162 (SM100 supervisor directive): KDA_H12_SCALRD enables the scalar
+// bank-permuted gate-prefix reads implemented below; kernel.py passes the
+// define only to the sm_100a h12 build, and these shared-window undefs make
+// any leaked define a no-op on the sm_103a image regardless.
+#if defined(KDA_H12_SCALRD) && defined(KDA_SM103)
+#undef KDA_H12_SCALRD
 #endif
 // Round-127 two-half gate-prefix scan ILP (SM103-gated, A/B pending): the
 // packed full-chunk column scan's 32-row prefix chain is split into two
@@ -218,6 +238,23 @@ typedef short int          int16_t;
 #define THREADS 1024
 
 #include <math_constants.h>
+
+#if defined(KDA_H12_SCALRD)
+// Round-162 (supervisor directive, sm_100a h12 image): LDS.64 shared load the
+// compiler cannot fold into the conflicting LDS.128 pair. Combined with the
+// parity-swapped issue schedule in the gate-prefix reader, the R162
+// NCU-confirmed 2-way-conflicting merged LDS.128s (+0x6400/+0x6410, 786432
+// of 933888 kernel-wide L1TEX shared wavefronts, case 10) become four
+// conflict-free 8B loads. Address comes from a generic pointer already in
+// bounds of dynamic shared memory; cvta.to.shared maps it to the 32-bit
+// shared window. Values are bit-identical to the vector path.
+__device__ __forceinline__ float2 __kda_lds_f32x2(const float* p) {
+    uint32_t _sa = (uint32_t)__cvta_generic_to_shared(p);
+    float _x, _y;
+    asm volatile("ld.shared.v2.f32 {%0, %1}, [%2];" : "=f"(_x), "=f"(_y) : "r"(_sa));
+    return make_float2(_x, _y);
+}
+#endif
 
 __device__ __forceinline__ uint32_t elect_sync() {
     uint32_t pred = 0;
@@ -829,7 +866,7 @@ __global__ __launch_bounds__(1024) void
         }                                                                            \
     }
 
-kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, const void* __restrict__ q_tma, __nv_bfloat16* __restrict__ k, const void* __restrict__ k_tma, __nv_bfloat16* __restrict__ v, const void* __restrict__ v_tma, __nv_bfloat16* __restrict__ g, const void* __restrict__ g_tma, __nv_bfloat16* __restrict__ beta, const void* __restrict__ beta_tma, float* __restrict__ A_log, float* __restrict__ dt_bias, long long* __restrict__ cu_seqlens, int* __restrict__ seq_order, __nv_bfloat16* initial_state, __nv_bfloat16* __restrict__ out, const void* __restrict__ out_tma, const void* __restrict__ out2_tma, __nv_bfloat16* final_state, int num_heads, int use_initial_state, int store_final_state, float scale, float lower_bound, int split_num_parts, float* split_state, float* split_gamma, int fixup_mode, int* progress_flags, __nv_bfloat16* map_state_bf16, int ft_slab
+kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, const void* __restrict__ q_tma, __nv_bfloat16* __restrict__ k, const void* __restrict__ k_tma, __nv_bfloat16* __restrict__ v, const void* __restrict__ v_tma, __nv_bfloat16* __restrict__ g, const void* __restrict__ g_tma, __nv_bfloat16* __restrict__ beta, const void* __restrict__ beta_tma, float* __restrict__ A_log, float* __restrict__ dt_bias, long long* __restrict__ cu_seqlens, int* __restrict__ seq_order, __nv_bfloat16* initial_state, __nv_bfloat16* __restrict__ out, const void* __restrict__ out_tma, const void* __restrict__ out2_tma, __nv_bfloat16* final_state, int num_heads_rt, int use_initial_state, int store_final_state, float scale, float lower_bound, int split_num_parts, float* split_state, float* split_gamma, int fixup_mode, int* progress_flags, __nv_bfloat16* map_state_bf16, int ft_slab
 #if defined(KDA_GPREP)
     // Round-75 GPREP: preprocessed operand buffers (qd1/kd1/ki [T,H,128]
     // bf16 canonical, gt [nchunks,H,128] fp32 with gt = 2^total_gate_log2,
@@ -861,6 +898,19 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, const void* __res
 // main pass. Superposition holds because the recurrence is affine in state.
 // FLASHINFER INTEGRATION END: allow exact state alias
 {
+#if defined(KDA_FAM)
+    // Round-182 (supervisor directive): fam v2 = the EVOLVED slab ledger
+    // (R10-R88 device-side bakes: initial-state prefetch, first-chunk TMA
+    // issue placement, prep ILP, barrier-count reductions) under compile-time
+    // head specialization plus the textual single-kernel recurrence pins.
+    // The fam2 bindings only ever launch the plain per-(sequence, head) main
+    // pass (grid = seqs*heads, grid_y == 1, fixup_mode == 0,
+    // split_num_parts == 1); pinning those two values lets the compiler
+    // dead-code-eliminate every split/map/correction/finish/band-scan region
+    // below (same trick as the round-181 fam v1, now on the evolved base).
+#define fixup_mode 0
+#define split_num_parts 1
+#endif
 #if defined(KDA_PDL)
     // Round-134 programmatic dependent launch (see LaunchM128 in
     // kda_flash_binding_m128slab.cu): on the sm_103a image this kernel is
@@ -1944,13 +1994,25 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, const void* __res
 #endif
                 }
 #if !defined(KDA_UIHI)
+                // Round-183 (variant C): release this stage's V slot the
+                // moment the residual math above has consumed the prefetched
+                // V registers — every LDS input to the FADD2/FMUL stream has
+                // retired by loop exit, and bar.warp.sync extends that
+                // guarantee across all 32 lanes before the elect arrive.
+                // Hypothesis (to be verified by correctness A/B): the
+                // prep-side inversion reads of inv_work (the V-slot alias
+                // tenant) are already complete at this point, so the V ring
+                // no longer needs to wait on the u_inp TMEM store tail —
+                // decoupling V slot turnover from the state-scale pipeline.
+                asm volatile("bar.warp.sync 0;" ::: "memory");
+                if (elect_sync() && !map_only_0) {
+                    mbarrier_arrive(v_free_addr + (compute_stage) * 8);
+                }
                 asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                 if (elect_sync()) {
                     // Map-only: no v producer/consumer; only u_inp_ready feeds
-                    // the MMA warp's UMMA-3 wait in this launch.
-                    if (!map_only_0) {
-                        mbarrier_arrive(v_free_addr + (compute_stage) * 8);
-                    }
+                    // the MMA warp's UMMA-3 wait in this launch. (Round-183:
+                    // v_free was already arrived above, before this store.)
                     mbarrier_arrive(u_inp_ready_addr + (compute_stage) * 8);
                 }
 #endif
@@ -2331,6 +2393,77 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, const void* __res
             if (epilogue_local_warp == 0) {
                 if (elect_sync()) {
                     mbarrier_arrive(tmem_dealloc_ready_addr);
+                }
+            }
+        }
+    // ---- Role: light-warp recurrence lookahead prefetch (R185 supervisor)
+    } else if (warp == 8 || warp == 11) {
+        { // w8pf_main
+            // R185 (supervisor directive, H12 FAM2 path): warps 8 and 11 are
+            // the existing idle LIGHT warps (KDA_LIGHT register budget; no
+            // current role). Use them to prefetch the NEXT recurrence step's
+            // state/global-memory dependencies so they overlap the current
+            // step's TMEM drain instead of exposing latency on the serial
+            // chain:
+            //  (a) this CTA's 32KB initial-state slab (the state stream the
+            //      compute warps LDG after the TMA prologue; ~6us long-
+            //      scoreboard startup ramp measured in R59/R62): warp 8
+            //      covers lines 0..127, warp 11 lines 128..255, issued at
+            //      role entry so the fetch overlaps mbarrier/TMEM init and
+            //      the chunk-0 TMA prologue.
+            //  (b) the H12 direct-heads beta token rows (R141 beta-LDG:
+            //      original-layout global stream consumed by prep warp 2,
+            //      one lane per token row; all 12 head-CTAs of a sequence
+            //      share the same 128B lines at stride num_heads*2B). A
+            //      5-chunk seed is issued at entry; steady-state lookahead
+            //      spins read-only on final_ready[c%5] (the epilogue's
+            //      per-chunk tmem_out drain window opens exactly at this
+            //      phase edge) and prefetches chunk c+5's 32 beta rows,
+            //      i.e. the prep slot that becomes issueable when chunk c's
+            //      raw_inputs_free retires. Prefetch is a fault-ignoring
+            //      read-only hint: no barrier arrive counts, no SMEM, and
+            //      no shared-mutable state change.
+            int task_idx_w = blockIdx.x;
+            int seq_idx_w = seq_order[task_idx_w / num_heads];
+            int head_idx_w = task_idx_w % num_heads;
+            long long bos_w = cu_seqlens[seq_idx_w];
+            long long eos_w = cu_seqlens[seq_idx_w + 1];
+            int seq_len_w = (int)(eos_w - bos_w);
+            int num_chunks_w = (seq_len_w + 32 - 1) / 32;
+            if (use_initial_state != 0) {
+                const char* _spw = reinterpret_cast<const char*>(initial_state)
+                    + (((long long)seq_idx_w * (long long)num_heads + (long long)head_idx_w) << 15)
+                    + (long long)((warp == 11) ? 16384 : 0);
+                #pragma unroll
+                for (int _lw = 0; _lw < 4; _lw++) {
+                    asm volatile("prefetch.global.L2 [%0];"
+                        :: "l"(_spw + (long long)(_lw * 32 + lane) * 128));
+                }
+            }
+            if (beta_ldg && num_chunks_w > 0) {
+                const __nv_bfloat16* _bw = beta;
+                int seed_chunks = num_chunks_w < 5 ? num_chunks_w : 5;
+                for (int c = 0; c < seed_chunks; c++) {
+                    long long tok = bos_w + (long long)(c * 32 + lane);
+                    if (tok < eos_w) {
+                        asm volatile("prefetch.global.L1 [%0];"
+                            :: "l"(_bw + tok * (long long)num_heads + (long long)head_idx_w));
+                    }
+                }
+                unsigned int _wstage = 0;
+                unsigned int _wphase = 0;
+                for (int c = 0; c < num_chunks_w; c++) {
+                    mbarrier_wait(final_ready_addr + _wstage * 8, _wphase);
+                    _wstage += 1;
+                    if (_wstage == NUM_CHUNK_PIPE_STAGES) { _wstage = 0; _wphase ^= 1; }
+                    int cn = c + 5;
+                    if (cn < num_chunks_w) {
+                        long long tok = bos_w + (long long)(cn * 32 + lane);
+                        if (tok < eos_w) {
+                            asm volatile("prefetch.global.L1 [%0];"
+                                :: "l"(_bw + tok * (long long)num_heads + (long long)head_idx_w));
+                        }
+                    }
                 }
             }
         }
@@ -4176,6 +4309,52 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, const void* __res
                         const float2 _gv2[4] = {
                             make_float2(_ga4.x, _ga4.y), make_float2(_ga4.z, _ga4.w),
                             make_float2(_gb4.x, _gb4.y), make_float2(_gb4.z, _gb4.w)};
+#elif defined(KDA_H12_SCALRD)
+                        // Round-162 (SM100 supervisor directive, sm_100a h12
+                        // image only): R161 case-10 NCU showed the kernel at
+                        // 227,840B dynamic SMEM -> 1 CTA/SM, 42.2% achieved
+                        // occupancy, latency-bound (44.1% long_scoreboard);
+                        // R162 source counters (r162_case10_srcatt.ncu-rep)
+                        // attributed 786,432 of 933,888 kernel-wide L1TEX
+                        // shared wavefronts (84%) to the two compiler-merged
+                        // LDS.128s the ELSE branch below generates (SASS
+                        // [R6+0x6400]/[R6+0x6410]). In the swizzle-OFF
+                        // geometry (16 lanes per 128-float row, row stride
+                        // 128 == 0 mod 32 banks) the natural pair order reads
+                        // every step's banks as {8a + const} for BOTH row
+                        // parities (lane>31>>=1 sees identical bank offsets
+                        // for the adjacent row), so any vectorized or
+                        // natural-order scalar read of 8 consecutive floats
+                        // per lane is unavoidably multi-wavefront — and the
+                        // closed layout family (R66 swizzle latency-neutral,
+                        // R141 gsw 0.980-0.994x) permits no layout edit
+                        // inside the fixed 227,840B footprint. Instead the
+                        // four 8B pairs are ISSUED in a lane-parity-swapped
+                        // order: half-warp (lane>>4)==0 issues pairs in the
+                        // order 0,1,2,3 while (lane>>4)==1 issues 1,0,3,2,
+                        // i.e. step _t loads pair (_t ^ (lane>>4)). At every
+                        // step the two half-warps therefore land on disjoint
+                        // bank sets ({8a+2t,+1} vs {8a+2t+2,+3}); same-row
+                        // bank-group lanes (segment_1 == a mod 4) read the
+                        // SAME word -> hardware broadcast merge -> every one
+                        // of the four LDS.64 instructions is conflict-free at
+                        // its 2-wavefront ideal, halving the pair's total
+                        // shared-data-path cost from 16 to 8 wavefronts with
+                        // zero SMEM footprint change. Slots _pfs0..3 hold the
+                        // pairs in STEP order (slot _t == pair _t^par); the
+                        // consumer below rebinds pair _lp to slot (_lp ^ par)
+                        // with per-lane select instructions (all indices
+                        // static -> everything stays in registers, bit-
+                        // identical values).
+                        float2 _pfs0, _pfs1, _pfs2, _pfs3;
+                        const int _par = lane >> 4;
+                        {
+                            const float* _pb = &smem_gate_all[stage_f32 + row_1 * 128 + segment_1 * 8];
+                            _pfs0 = __kda_lds_f32x2(_pb + 2 * (0 ^ _par));
+                            _pfs1 = __kda_lds_f32x2(_pb + 2 * (1 ^ _par));
+                            _pfs2 = __kda_lds_f32x2(_pb + 2 * (2 ^ _par));
+                            _pfs3 = __kda_lds_f32x2(_pb + 2 * (3 ^ _par));
+                        }
 #endif
 #endif  // !KDA_PREP_NORM_ILP
                         #pragma unroll
@@ -4194,6 +4373,18 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, const void* __res
                             float2 p2 = *reinterpret_cast<const float2*>(&smem_gate_all[stage_f32 + row_1 * 128 + col_e]);
 #elif defined(KDA_GATE_SWIZZLE)
                             float2 p2 = _gv2[_lp];
+#elif defined(KDA_H12_SCALRD)
+                            // Round-162: rebind pair _lp to its step-order
+                            // slot (_lp ^ par) with per-lane selects — 2 SELs
+                            // per pair, uniform control flow, bit-identical
+                            // to the ELSE branch's float2 fetch below.
+                            float2 p2;
+                            // _lp is a static unrolled index, so exactly one
+                            // of these ternaries survives per iteration.
+                            if (_lp == 0)      p2 = (_par != 0) ? _pfs1 : _pfs0;
+                            else if (_lp == 1) p2 = (_par != 0) ? _pfs0 : _pfs1;
+                            else if (_lp == 2) p2 = (_par != 0) ? _pfs3 : _pfs2;
+                            else               p2 = (_par != 0) ? _pfs2 : _pfs3;
 #else
                             int col_e = segment_1 * 8 + _lp * 2;
                             float2 p2 = *reinterpret_cast<const float2*>(&smem_gate_all[stage_f32 + row_1 * 128 + col_e]);
@@ -5675,6 +5866,11 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, const void* __res
 
     // Cleanup
 }
+#if defined(KDA_FAM)
+#undef fixup_mode
+#undef split_num_parts
+#endif
+
 
 // Split-seq dense scan: compose the per-part affine transforms exported by the
 // main and map passes into per-part prefix (carry) states:
@@ -5710,7 +5906,7 @@ __global__ __launch_bounds__(256) void kernel_flashkda_split_scan_m128(
     const float* __restrict__ map_state,
     float* __restrict__ carry,
     const int* __restrict__ seq_order,
-    int num_heads, int split_num_parts, int use_initial_state)
+    int num_heads_rt, int split_num_parts, int use_initial_state)
 {
     // Round-45 latency fix (torch.profiler on the four split shapes: scan is
     // 635us of 880us at 131072xH1 and 754us of 2075us at 1048576xH1, ~5us per
@@ -5923,7 +6119,7 @@ __global__ __launch_bounds__(128) void kernel_flashkda_split_scan_bf16_m128(
     const __nv_bfloat16* __restrict__ map_state_bf16,
     float* __restrict__ carry,
     const int* __restrict__ seq_order,
-    int num_heads, int split_num_parts, int use_initial_state,
+    int num_heads_rt, int split_num_parts, int use_initial_state,
     const int* __restrict__ dead_flags)
 {
     extern __shared__ __align__(1024) float scan_smem[];
@@ -6078,7 +6274,7 @@ __global__ __launch_bounds__(256) void kernel_flashkda_split_lookback_m128(
     float* __restrict__ carry,
     int* __restrict__ flags,
     const int* __restrict__ seq_order,
-    int num_heads, int split_num_parts)
+    int num_heads_rt, int split_num_parts)
 {
     extern __shared__ __align__(1024) float lb_smem[];
     constexpr int MPAD = LOOKBACK_MPAD;
@@ -6224,7 +6420,7 @@ __global__ void __launch_bounds__(256)
 kernel_flashkda_split_out_add_m128(const __nv_bfloat16* __restrict__ scratch,
                                    __nv_bfloat16* __restrict__ out,
                                    long long tokens_per_seq, int num_seqs, int num_parts,
-                                   int num_heads) {
+                                   int num_heads_rt) {
     const long long vecs_per_token = (long long)num_heads * 16;  // 128 bf16 = 16 uint4
     const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     const long long total_vec = tokens_per_seq * (long long)num_seqs * vecs_per_token;

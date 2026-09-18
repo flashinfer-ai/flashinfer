@@ -444,6 +444,9 @@ void RunM128SplitFull(const void* q_ptr, const void* k_ptr, const void* v_ptr, c
     // every non-fused launch — which under the P=2 specialization includes the
     // carry-copy path even if KDA_FUSED_SCAN is set.
     {
+      // Correction launch (round-200 retained path on both targets): the
+      // walk covers each part's full window and takes no progress channel;
+      // the dead-map channel remains a main/map-pass mechanism only.
       LaunchM128(tma, q_ptr, k_ptr, v_ptr, g_ptr, beta_ptr, A_log_ptr, dt_bias_ptr, cu_seqlens_ptr,
                  seq_order_ptr, carry_ptr, out_ptr, final_state_ptr, num_seqs, num_heads,
                  // Round-79 contract correction: the last correction part emits the
@@ -453,12 +456,15 @@ void RunM128SplitFull(const void* q_ptr, const void* k_ptr, const void* v_ptr, c
                  /*use_initial_state=*/1,
                  /*store_final_state=*/(use_initial_state != 0) ? 1 : 0, scale, lower_bound,
                  num_parts, split_state_ptr, /*split_gamma_ptr=*/nullptr, /*fixup_mode=*/1,
-                 /*grid_y=*/num_parts - 1, stream, /*progress_flags=*/nullptr,
+                 /*grid_y=*/num_parts - 1, stream,
+                 /*progress_flags=*/nullptr,
                  /*map_state_bf16_ptr=*/nullptr, ft_slab);
     }
   }
   {
-    // Fixed layout only (split gate): uniform tokens per sequence.
+    // Fixed layout only (split gate): uniform tokens per sequence. The add
+    // range is the full set of full-chunk rows of parts [1, P) (round-200
+    // retained form on both targets).
     const int64_t tokens_per_seq = token_count / num_seqs;
     const int64_t total_vec = token_count * num_heads * 16;
     const int threads = 256;

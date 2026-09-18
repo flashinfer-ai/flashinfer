@@ -988,12 +988,15 @@ def load_flash_kda_module(variant: FlashKDAVariant, target: FlashKDATarget):
 
 
 # VibeCUDA FlashKDA prefill module: one .so holding the whole VibeCUDA
-# prefill kernel family (union M128, slab M128, M64, persistent M128, plus
-# the TVM-FFI export TU exposing run_m128 / run_m128_split / run_m64 /
-# run_persistent_m128 / sort_seqs_into). The four binding TUs define
-# distinct raw-pointer launchers in the kda_flash / kda_flash_slab
-# namespaces, so they link together in a single module.
-_VIBECUDA_FLASH_KDA_MODULE_IDENT = "35f07079a1"
+# prefill kernel family (union M128, slab M128, M64, persistent M128, the
+# head-family fam2 image set, the fused N16 prepare/chain set, plus the
+# TVM-FFI export TU exposing run_m128 / run_m128_split / run_m64 /
+# run_persistent_m128 / run_fam2 / run_bt16_fused / sort_seqs_into). The
+# binding TUs define distinct raw-pointer launchers in the kda_flash /
+# kda_flash_slab / kda_fam2 / kda_bt16_* namespaces, so they link together
+# in a single module. Bump this ident on any binding-ABI or source change so
+# stale JIT caches rebuild.
+_VIBECUDA_FLASH_KDA_MODULE_IDENT = "c9d21e4a70"
 
 
 def get_vibecuda_flash_kda_uri(target: VibeCUDAFlashKDATarget) -> str:
@@ -1012,7 +1015,9 @@ def gen_vibecuda_flash_kda_module(target: VibeCUDAFlashKDATarget) -> JitSpec:
     schedules, so the module builds with the same SM100-family NVCC flags.
     The defines reproduce the measured default build: ``KDA_DTB_HOIST``
     (dt_bias register hoist) and ``KDA_F32X2`` (packed f32x2 prep math) are
-    enabled on both targets, while ``KDA_PREP_NORM_ILP`` selects the retained
+    enabled on both targets; ``KDA_SCAN_ILP4`` (four-way gate-prefix scan
+    ILP) and ``KDA_W8PF`` (light-warp state prefetch in the fam2 image) are
+    SM100-only measured wins; ``KDA_PREP_NORM_ILP`` selects the retained
     SM103 operand-preparation schedule. The half/bfloat conversion undefs
     match the generated kernels' arithmetic expectations.
     """
@@ -1026,6 +1031,13 @@ def gen_vibecuda_flash_kda_module(target: VibeCUDAFlashKDATarget) -> JitSpec:
         csrc_dir / "vibecuda_flashkda_bf16_fused_m128_slab_binding.cu",
         csrc_dir / "vibecuda_flashkda_bf16_fused_m64_binding.cu",
         csrc_dir / "vibecuda_flashkda_bf16_persistent_m128_binding.cu",
+        csrc_dir / "vibecuda_flashkda_fam2_binding_h12.cu",
+        csrc_dir / "vibecuda_flashkda_fam2_binding_h64.cu",
+        csrc_dir / "vibecuda_flashkda_fam2_binding_h96.cu",
+        csrc_dir / "vibecuda_bt16_binding_fused_prepare.cu",
+        csrc_dir / "vibecuda_bt16_binding_fused_chain_s7.cu",
+        csrc_dir / "vibecuda_bt16_binding_fused_chain_s8.cu",
+        csrc_dir / "vibecuda_bt16_binding_fused_chain_s9.cu",
     ]
     for source in sources:
         if not source.exists():
@@ -1041,6 +1053,7 @@ def gen_vibecuda_flash_kda_module(target: VibeCUDAFlashKDATarget) -> JitSpec:
         extra_cuda_cflags=[
             *(["-DKDA_SM103"] if target == "sm103a" else []),
             *(["-DKDA_PREP_NORM_ILP"] if target == "sm103a" else []),
+            *(["-DKDA_SCAN_ILP4", "-DKDA_W8PF"] if target == "sm100a" else []),
             "--extra-device-vectorization",
             "-DKDA_DTB_HOIST",
             "-DKDA_F32X2",

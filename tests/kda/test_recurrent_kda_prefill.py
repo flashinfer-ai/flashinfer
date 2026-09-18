@@ -6535,6 +6535,40 @@ def test_frozen_prefill_cuda_graph_workspaces_are_isolated(flash_kda_device):
 
 # ---------------------------------------------------------------------------
 # VibeCUDA prefill backend (backend="vibecuda")
+#
+# Upstream-baseline test -> VibeCUDA coverage map. Public-behavior contracts
+# proven against the CAKE (or cute-dsl) baseline elsewhere in this file map
+# one-to-one onto VibeCUDA tests here; baseline tests of private module/FFI
+# internals stay baseline-only, as do features the VibeCUDA plain-prefill
+# contract deliberately excludes (those get strict-backend rejection tests):
+#
+#   test_initial_state_is_updated_in_place
+#       -> test_vibecuda_initial_state_is_updated_in_place
+#   test_stream_workspace_does_not_allocate_state_scratch_for_inplace_update
+#       -> test_vibecuda_stream_workspace_does_not_allocate_state_scratch_for_inplace_update
+#   test_direct_packed_prefill_automatically_sorts_sequences
+#       -> test_vibecuda_packed_prefill_sorts_sequences_on_device
+#   frozen/reference precision runs (frozen-cake comparisons, H12/H96/H64)
+#       -> test_vibecuda_prefill_matches_frozen_cake
+#   test_b200_prefill_without_initial_state_stays_direct
+#       -> test_vibecuda_prefill_without_initial_state
+#   CUDA graph capture/replay coverage (fixed + packed)
+#       -> test_vibecuda_m128_prefill_cuda_graph_capture_and_replay
+#          test_vibecuda_packed_prefill_cuda_graph_capture_and_replay
+#          test_vibecuda_graph_capture_requires_explicit_workspace
+#   checkpoint-stream cross-backend comparison (cake vs cute-dsl)
+#       -> test_vibecuda_prefill_rejects_state_checkpoints (contract exclusion)
+#   state-pool cross-backend comparison (cake vs cute-dsl)
+#       -> test_vibecuda_prefill_rejects_state_pool_inputs (contract exclusion)
+#          test_vibecuda_prefill_rejects_initial_state_source_inputs
+#   serving-only features (token-row-strided beta,
+#   initial_state_source/indices, missing A_log/dt_bias/lower_bound)
+#       -> test_vibecuda_prefill_rejects_token_row_strided_beta
+#          test_vibecuda_prefill_rejects_missing_prep_operands
+#          test_vibecuda_prefill_rejects_initial_state_source_inputs
+#          test_public_prefill_vibecuda_backend_is_strict
+#   decode path on the prefill API
+#       -> test_public_decode_vibecuda_backend_is_prefill_only
 # ---------------------------------------------------------------------------
 
 
@@ -6582,6 +6616,82 @@ def test_vibecuda_prefill_rejects_non_sm100_arch(cuda_device, monkeypatch):
 
     with pytest.raises(RuntimeError, match="backend='vibecuda'"):
         recurrent_kda(**_strict_prefill_kwargs(inputs), backend="vibecuda")
+
+
+@pytest.mark.parametrize(
+    ("seq_lens", "num_heads", "packed", "seed"),
+    [
+        ([4, 4], 96, False, 4201),  # upstream oracle shape family (H=2 is mock-only)
+        ([3, 5], 96, True, 4202),  # upstream packed oracle shape family + seq_order
+        ([512], 64, False, 4203),  # fixed single-seq H64: M64 two-CTA route
+        ([1024], 96, False, 4204),  # fixed single-seq H96: M128 slab route
+        ([16384], 1, False, 4205),  # fixed H1 long chain: split-seq prefix route
+        ([8192], 4, False, 4206),  # fixed H4 long chain: multi-part split route
+        ([1300, 547, 2048], 96, True, 4207),  # packed ragged: direct M128 route
+        ([128] * 8, 96, True, 4208),  # packed deep: device-planned persistent route
+        ([4096], 12, False, 4209),  # fixed Kimi-K3 TP8 H12: 16B-aligned beta pad
+        ([1024] * 4, 12, True, 4210),  # packed H12: aligned beta pad, M128 route
+    ],
+)
+def test_vibecuda_prefill_matches_torch_reference(
+    flash_kda_device, seq_lens, num_heads, packed, seed
+):
+    # Precision-reference policy: the upstream CAKE precision family anchored
+    # by ``test_frozen_prefill_matches_reference`` validates against the local
+    # torch ``_reference`` callable at atol=rtol=1e-2 on both the output and
+    # the mutated state. The VibeCUDA backend is held to the same oracle
+    # callable, error metric, and tolerances here — candidate-versus-CAKE
+    # parity (``test_vibecuda_prefill_matches_frozen_cake``) is an additional
+    # diagnostic only and does not replace this reference check. The first two
+    # parameter rows mirror the upstream test's pack layout and seq_order use;
+    # the production head counts stand in for the upstream test's H=2, which
+    # only runs through the mocked module, not a real kernel.
+    inputs = _make_inputs(
+        seq_lens=seq_lens,
+        num_heads=num_heads,
+        packed=packed,
+        initial_state=True,
+        seed=seed,
+    )
+    reference_inputs = {
+        **inputs,
+        "initial_state": inputs["initial_state"].clone(),
+    }
+    expected_output, expected_state = _reference(reference_inputs)
+    output = torch.empty_like(inputs["q"])
+    state_identity = inputs["initial_state"]
+    seq_order = (
+        torch.tensor(
+            sorted(range(len(seq_lens)), key=seq_lens.__getitem__, reverse=True),
+            dtype=torch.int32,
+            device=flash_kda_device,
+        )
+        if packed
+        else None
+    )
+
+    actual_output, actual_state = recurrent_kda(
+        **_strict_prefill_kwargs(inputs),
+        output=output,
+        output_final_state=True,
+        seq_order=seq_order,
+        backend="vibecuda",
+    )
+
+    assert actual_output.data_ptr() == output.data_ptr()
+    assert actual_state is state_identity
+    torch.testing.assert_close(
+        actual_output.float(),
+        expected_output.float(),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+    torch.testing.assert_close(
+        actual_state.float(),
+        expected_state.float(),
+        atol=1e-2,
+        rtol=1e-2,
+    )
 
 
 @pytest.mark.parametrize(
@@ -6828,6 +6938,70 @@ def test_vibecuda_prefill_rejects_state_pool_inputs(flash_kda_device):
         )
 
 
+@pytest.mark.parametrize("field", ("A_log", "dt_bias", "lower_bound"))
+def test_vibecuda_prefill_rejects_missing_prep_operands(flash_kda_device, field):
+    # The baseline's frozen schedules reach native FFI with every prep
+    # operand; VibeCUDA's plain-prefill contract requires them too, so each
+    # missing operand is a strict-backend rejection.
+    inputs = _make_inputs(
+        seq_lens=[512], num_heads=96, packed=False, initial_state=True, seed=4223
+    )
+    kwargs = {**_strict_prefill_kwargs(inputs), field: None}
+
+    with pytest.raises(ValueError, match="backend='vibecuda' does not support"):
+        recurrent_kda(**kwargs, backend="vibecuda")
+
+
+def test_vibecuda_prefill_rejects_initial_state_source_inputs(flash_kda_device):
+    # The queued backends support pooled state sources (cake vs cute-dsl in
+    # the cross-backend state-pool test); VibeCUDA's contract excludes them
+    # via a strict-backend rejection, mirroring the ssm_state_indices case.
+    inputs = _make_inputs(
+        seq_lens=[512], num_heads=96, packed=False, initial_state=True, seed=4224
+    )
+    source_pool = torch.zeros(
+        (4, 96, 128, 128), dtype=torch.bfloat16, device=flash_kda_device
+    )
+    source_indices = torch.zeros((1,), dtype=torch.int32, device=flash_kda_device)
+
+    with pytest.raises(ValueError, match="backend='vibecuda' does not support"):
+        recurrent_kda(
+            **_strict_prefill_kwargs(inputs),
+            initial_state_source=source_pool,
+            initial_state_indices=source_indices,
+            backend="vibecuda",
+        )
+
+
+def test_vibecuda_prefill_rejects_state_checkpoints(flash_kda_device):
+    # The queued backends cross-compare checkpoint streams against Cake in
+    # ``test_cute_dsl_checkpoints_match_cake``. The VibeCUDA plain-prefill
+    # contract deliberately excludes checkpointing, so the equivalent
+    # candidate coverage is the strict-backend rejection of checkpoint
+    # arguments (mirroring the state-pool rejection above).
+    inputs = _make_inputs(
+        seq_lens=[512], num_heads=96, packed=False, initial_state=True, seed=4222
+    )
+    interval = 32
+    num_checkpoints = (512 + interval - 1) // interval
+    checkpoints = torch.empty(
+        (num_checkpoints, 96, 128, 128), dtype=torch.bfloat16, device=flash_kda_device
+    )
+    checkpoint_cu_starts = torch.tensor(
+        [0, num_checkpoints], dtype=torch.int64, device=flash_kda_device
+    )
+
+    with pytest.raises(ValueError, match="backend='vibecuda' does not support"):
+        recurrent_kda(
+            **_strict_prefill_kwargs(inputs),
+            output=torch.empty_like(inputs["q"]),
+            state_checkpoints=checkpoints,
+            checkpoint_cu_starts=checkpoint_cu_starts,
+            checkpoint_every_n_tokens=interval,
+            backend="vibecuda",
+        )
+
+
 def test_vibecuda_graph_capture_requires_explicit_workspace(flash_kda_device):
     inputs = _make_inputs(
         seq_lens=[512], num_heads=96, packed=False, initial_state=True, seed=4230
@@ -7046,6 +7220,157 @@ def test_vibecuda_cuda_graph_workspaces_are_isolated(flash_kda_device):
             atol=1e-2,
             rtol=1e-2,
         )
+def test_vibecuda_initial_state_is_updated_in_place(flash_kda_device):
+    # VibeCUDA equivalent of the CAKE contract test
+    # ``test_initial_state_is_updated_in_place``. Where the CAKE test proves
+    # the in-place store through the recorded module call, the VibeCUDA proof
+    # is real execution: the returned state is the caller's own tensor and its
+    # contents hold the frozen CAKE final state. (The CAKE test uses a toy
+    # H=2 module mock; real VibeCUDA kernels run the production H=96 route
+    # here — the contract under test is identity plus in-place mutation, not
+    # the toy shape.)
+    inputs = _make_inputs(
+        seq_lens=[512], num_heads=96, packed=False, initial_state=True, seed=4233
+    )
+    original_state = inputs["initial_state"]
+    pristine = original_state.clone()
+    # Primary oracle: the same torch ``_reference`` callable, error metric,
+    # and tolerances used by the upstream CAKE precision family
+    # (``test_frozen_prefill_matches_reference``).
+    expected_output, expected_state = _reference(
+        {**inputs, "initial_state": pristine.clone()}
+    )
+    output = torch.empty_like(inputs["q"])
+    actual, returned_state = recurrent_kda(
+        **_strict_prefill_kwargs(inputs),
+        output=output,
+        output_final_state=True,
+        backend="vibecuda",
+    )
+    assert actual is output
+    assert returned_state is original_state
+
+    # The caller's tensor itself now carries the final recurrent state and
+    # both mutated outputs match the torch reference oracle.
+    torch.testing.assert_close(
+        actual.float(), expected_output.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        returned_state.float(), expected_state.float(), atol=1e-2, rtol=1e-2
+    )
+    # The store really happened in place (the call was not a no-op alias).
+    assert not torch.equal(returned_state, pristine)
+
+    # Additional diagnostic only: frozen CAKE parity on an identical clone.
+    cake_state = pristine.clone()
+    cake_output, cake_final = recurrent_kda(
+        **_strict_prefill_kwargs({**inputs, "initial_state": cake_state}),
+        output=torch.empty_like(inputs["q"]),
+        output_final_state=True,
+        backend="cake",
+    )
+    torch.testing.assert_close(
+        actual.float(), cake_output.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        returned_state.float(), cake_final.float(), atol=1e-2, rtol=1e-2
+    )
+
+
+def test_vibecuda_stream_workspace_does_not_allocate_state_scratch_for_inplace_update(
+    flash_kda_device, monkeypatch
+):
+    # VibeCUDA equivalent of the CAKE contract test
+    # ``test_stream_workspace_does_not_allocate_state_scratch_for_inplace_update``
+    # (same mixed fixed/packed layout pattern). Both workspace classes share
+    # the same base and the same ``_state_scratch`` slot; the VibeCUDA proof
+    # adds real-execution assertions the mocked CAKE test cannot make: every
+    # call returns the caller's own initial_state tensor after mutating it in
+    # place, and a steady-state pass through the warm workspace performs no
+    # device allocation at all.
+    #
+    # Observation design (why `memory_allocated <= before` alone is not
+    # enough):
+    #
+    # 1. Caller-owned outputs are preallocated BEFORE the observed window,
+    #    so an output allocation cannot hide inside the accounting.
+    # 2. A transient state-scratch tensor that is allocated and freed inside
+    #    a single call is invisible to a before/after `memory_allocated`
+    #    snapshot whenever the caching allocator retains the freed block. The
+    #    cumulative `num_device_alloc` counter from `torch.cuda.memory_stats`
+    #    records every segment-level device allocation even when the memory
+    #    is released again before the check. `torch.cuda.empty_cache()` first
+    #    evicts every unreferenced cached segment, so a per-call transient
+    #    scratch can no longer be served from the cache and must show up as a
+    #    fresh device allocation. All warm workspace tensors stay referenced
+    #    (workspace buffers, cached metadata, the preallocated outputs), so
+    #    the expected counter delta for a scratch-free steady pass is zero.
+    monkeypatch.setattr(kda_vibecuda_api, "_vibecuda_stream_workspaces", {})
+    cases = [
+        _make_inputs(
+            seq_lens=[512], num_heads=96, packed=False, initial_state=True, seed=4240
+        ),
+        _make_inputs(
+            seq_lens=[128, 256, 512],
+            num_heads=96,
+            packed=True,
+            initial_state=True,
+            seed=4241,
+        ),
+        _make_inputs(
+            seq_lens=[256, 256],
+            num_heads=96,
+            packed=False,
+            initial_state=True,
+            seed=4242,
+        ),
+    ]
+    # Caller preallocates outputs outside the observed window, matching the
+    # frozen public contract (allocation is not part of the operator call).
+    outputs = [torch.empty_like(inputs["q"]) for inputs in cases]
+
+    def run(inputs, output):
+        original_state = inputs["initial_state"]
+        _, returned_state = recurrent_kda(
+            **_strict_prefill_kwargs(inputs),
+            output=output,
+            output_final_state=True,
+            backend="vibecuda",
+        )
+        # In-place aliasing contract on every layout.
+        assert returned_state is original_state
+
+    # Warm pass: create the implicit workspace and grow its buffers once.
+    for inputs, output in zip(cases, outputs):
+        run(inputs, output)
+
+    assert len(kda_vibecuda_api._vibecuda_stream_workspaces) == 1
+    (workspace,) = kda_vibecuda_api._vibecuda_stream_workspaces.values()
+    # Same assertion as the CAKE test: the in-place update never allocates a
+    # state-sized scratch buffer on the workspace.
+    assert workspace._state_scratch is None
+
+    # Steady pass through the warm workspace. Evict unreferenced cached
+    # segments, then require an exactly-zero cumulative device-allocation
+    # delta: any per-call state scratch — including one freed before this
+    # check — would force a fresh segment allocation here.
+    torch.cuda.synchronize(flash_kda_device)
+    torch.cuda.empty_cache()
+    stats_before = torch.cuda.memory_stats(flash_kda_device)
+    bytes_before = torch.cuda.memory_allocated(flash_kda_device)
+    for inputs, output in zip(cases, outputs):
+        run(inputs, output)
+    torch.cuda.synchronize(flash_kda_device)
+    stats_after = torch.cuda.memory_stats(flash_kda_device)
+    device_allocs = (
+        stats_after["num_device_alloc"] - stats_before["num_device_alloc"]
+    )
+    assert device_allocs == 0, (
+        "steady-state vibecuda prefill performed "
+        f"{device_allocs} device allocation(s); the in-place update must "
+        "not allocate transient state scratch"
+    )
+    assert torch.cuda.memory_allocated(flash_kda_device) <= bytes_before
 
 
 @pytest.mark.parametrize(

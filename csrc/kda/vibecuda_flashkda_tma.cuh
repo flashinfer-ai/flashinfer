@@ -190,7 +190,18 @@ inline TmaPointers EncodeTmaPointersAll(const void* q, const void* k, const void
         EncodeValueTma<ValueRows, ChunkTokens>(v, token_count * num_heads * kHeadDim, num_heads,
                                                kHeadDim),
         EncodeGateTma<ChunkTokens>(g, token_count * num_heads * kHeadDim, num_heads, kHeadDim),
-        EncodeBetaTma<ChunkTokens>(beta_tma, beta_tma_numel, beta_tma_dim1),
+        // Beta direct-read route: a bf16 head count that is not a multiple
+        // of 8 makes the [T, H] row pitch a non-16B multiple, which
+        // cuTensorMapEncodeTiled rejects; those head counts take the
+        // kernel-side beta direct-read path (original layout, no padded
+        // copy), so the descriptor slot is left zero-filled. Every beta TMA
+        // issue site in the patched kernels derives the same (num_heads & 7)
+        // switch and skips the transfer, so the stale slot is never
+        // dereferenced (the fence.acquire on the slot address is a
+        // memory-ordering op, not a map read, and stays valid).
+        ((num_heads & 7) == 0
+             ? EncodeBetaTma<ChunkTokens>(beta_tma, beta_tma_numel, beta_tma_dim1)
+             : CUtensorMap{}),
         EncodeOutputTma<ValueRows, ChunkTokens>(out, token_count * num_heads * kHeadDim, num_heads,
                                                 kHeadDim),
         EncodeOutputTma<ValueRows, ChunkTokens>(scratch_base, token_count * num_heads * kHeadDim,

@@ -552,7 +552,12 @@ void RunM128SplitFull(const void* q_ptr, const void* k_ptr, const void* v_ptr, c
                  /*use_initial_state=*/1,
                  /*store_final_state=*/(use_initial_state != 0) ? 1 : 0, scale, lower_bound,
                  num_parts, split_state_ptr, /*split_gamma_ptr=*/nullptr, /*fixup_mode=*/1,
-                 /*grid_y=*/num_parts - 1, stream, /*progress_flags=*/nullptr,
+                 /*grid_y=*/num_parts - 1, stream,
+                 // Correction launch (round-200 retained path on both
+                 // targets): the walk covers each part's full window and
+                 // takes no progress channel; the dead-map channel remains a
+                 // main/map-pass mechanism only.
+                 /*progress_flags=*/nullptr,
                  /*map_state_bf16_ptr=*/nullptr, ft_slab);
     }
   }

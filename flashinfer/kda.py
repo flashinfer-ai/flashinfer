@@ -479,6 +479,53 @@ def recurrent_kda(
         q, cu_seqlens, num_spec_tokens
     )
     if backend == "vibecuda":
+        # Eager fast-plan probe (SM100/SM103): metadata-keyed hit re-enacts a
+        # proven generic run without re-deriving eligibility and dispatch;
+        # a miss is side-effect free and falls through to the full path.
+        # The fused-N16 classes never record plans, so skip even the probe
+        # call for them (their kernels are short and host-dominated).
+        if not (
+            q.ndim == 4
+            and q.shape[2] == 12
+            and (
+                (cu_seqlens is None and q.shape[0] == 1 and q.shape[1] <= 1024)
+                or (
+                    isinstance(cu_seqlens, torch.Tensor)
+                    and cu_seqlens.ndim == 1
+                    and cu_seqlens.numel() - 1 <= 6
+                )
+            )
+        ):
+            fast_result = _kda_vibecuda._try_run_fast_vibecuda_kda_prefill(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                scale=scale,
+                initial_state=initial_state,
+                output_final_state=output_final_state,
+                lower_bound=lower_bound,
+                cu_seqlens=cu_seqlens,
+                output=output,
+                seq_order=seq_order,
+                prefill_workspace=prefill_workspace,
+                ssm_state_indices=ssm_state_indices,
+                num_spec_tokens=num_spec_tokens,
+                num_accepted_tokens=num_accepted_tokens,
+                initial_state_source=initial_state_source,
+                initial_state_indices=initial_state_indices,
+                state_checkpoints=state_checkpoints,
+                checkpoint_cu_starts=checkpoint_cu_starts,
+                checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                use_gate_in_kernel=use_gate_in_kernel,
+                beta_is_logit=beta_is_logit,
+            )
+            if fast_result is not None:
+                return fast_result
         if not is_plain_prefill:
             raise ValueError(
                 "backend='vibecuda' does not support this recurrent_kda "

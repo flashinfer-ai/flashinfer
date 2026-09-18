@@ -2622,13 +2622,22 @@ def _generated_affine_carriers(
         )
         workspace._generated_affine_carriers = carriers
     return carriers
+# Raw current-stream pointer lookup. ``torch._C._cuda_getCurrentRawStream``
+# returns the stream pointer for a device index without allocating a
+# ``torch.cuda.Stream`` wrapper object (~0.1us against ~3us per call), which
+# matters because the workspace caches below key on it once per public call
+# (and several times per packed call). Fall back to the public API if a
+# future torch drops the private entry point.
+_raw_stream_ptr = getattr(torch._C, "_cuda_getCurrentRawStream", None)
 
 
 def _stream_cache_key(device: torch.device) -> tuple[int, int]:
-    stream = torch.cuda.current_stream(device)
     device_index = (
         device.index if device.index is not None else torch.cuda.current_device()
     )
+    if _raw_stream_ptr is not None:
+        return device_index, int(_raw_stream_ptr(device_index))
+    stream = torch.cuda.current_stream(device)
     return device_index, int(stream.cuda_stream)
 
 
@@ -2730,9 +2739,9 @@ def _workspace_buffer(
     zero_on_allocate: bool = False,
 ) -> torch.Tensor:
     buffer = getattr(workspace, attribute)
-    capturing = torch.cuda.is_current_stream_capturing()
     if buffer is None or buffer.numel() < numel:
-        if capturing:
+        # The capture check only guards the grow path; warm hits skip it.
+        if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(capture_error)
         factory = torch.zeros if zero_on_allocate else torch.empty
         buffer = factory(numel, dtype=dtype, device=device)
@@ -3151,11 +3160,14 @@ def _storage_ranges_overlap(
         return False
 
     def storage_end(tensor: torch.Tensor) -> int:
-        max_element_offset = sum(
-            (size - 1) * stride
-            for size, stride in zip(tensor.shape, tensor.stride(), strict=True)
-            if size > 0
-        )
+        if tensor.is_contiguous():
+            # For contiguous layouts sum((size - 1) * stride) reduces to
+            # numel - 1; the general path below only runs for strided views.
+            return tensor.data_ptr() + tensor.numel() * tensor.element_size()
+        max_element_offset = 0
+        for size, stride in zip(tensor.shape, tensor.stride()):
+            if size > 0:
+                max_element_offset += (size - 1) * stride
         return tensor.data_ptr() + (max_element_offset + 1) * tensor.element_size()
 
     left_start = left.data_ptr()
@@ -6253,7 +6265,7 @@ def _run_flash_kda_prefill(
     scale_value = _FLASH_KDA_DEFAULT_SCALE if scale is None else float(scale)
     if not math.isfinite(scale_value):
         raise ValueError(f"scale must be finite, got {scale_value}")
-    stream_ptr = int(torch.cuda.current_stream(q.device).cuda_stream)
+    stream_ptr = _stream_cache_key(q.device)[1]
     explicit_workspace = prefill_workspace is not None
     workspace: _RecurrentKDAPrefillWorkspaceBase
     if prefill_workspace is None:
