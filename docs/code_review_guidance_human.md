@@ -107,8 +107,38 @@ embodies a design decision for durable code, capture the principle as a markdown
 (see [design_docs/](design_docs/)) so reviewers — human or agent — can enforce against a written
 rationale instead of re-deriving it each PR.
 
+## Reviewing the agent review
+
+Agent reviewers (CodeRabbit, Gemini Code Assist, etc.) run on every PR automatically.
+**The human reviewer's job includes reviewing the agent's review**, not just the code diff.
+
+### Why
+
+> *"It's very hard for agents to get the balance right. If you ignore human code review
+> entirely and leave it to agents, every PR will either suffer from scope creep or ship
+> critical issues."*
+> — [Pragmatic Engineer, "What is happening with code reviews?" (Sep 2026)](https://newsletter.pragmaticengineer.com/p/what-is-happening-with-code-reviews)
+
+### Workflow
+
+1. **Agent reviewer reviews the PR** (CodeRabbit, Gemini Code Assist, etc. — runs automatically).
+2. **PR author triages the agent review.** This covers both kinds of agent output:
+   - **Top-level summary** (e.g. CodeRabbit's Walkthrough, risk/impact assessment, key
+     changes list): If the summary mischaracterizes the PR's intent or risk,
+     comment to correct it.
+   - **Inline comments**: Address comments that make sense, push back or dismiss comments
+     that don't, and leave a brief note on anything non-obvious ("accepted — agent caught
+     a real OOB risk here", "dismissed — agent is suggesting a refactor outside this PR's
+     scope", etc.).
+3. **Human reviewer reviews the agent review *and* the author's handling of the agent review.**
+   This happens alongside the human review of the diff (with "Focus" areas as defined above).
+   Start with the agent's **top-level summary** (Walkthrough, risk assessment, key changes),
+   then look at inline comments.
+
 ## Checklist
 
+- [ ] Reviewed the agent review, checked for blind spots, checked that the PR author triaged all
+      agent comments
 - [ ] Crash/OOB/overflow/allocation defects
 - [ ] API shape, naming, convention consistency; `include/`/`import` stays Torch-free library-side
 - [ ] Tests cover new behavior/edge cases; refcheck for numerics
