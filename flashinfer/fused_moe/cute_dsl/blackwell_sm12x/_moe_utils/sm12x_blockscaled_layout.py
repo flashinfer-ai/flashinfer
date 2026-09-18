@@ -64,11 +64,26 @@ def _make_nvfp4_smem_layout_sfb(tiledmma, tile, sf_vec, stages):
 
 class Sm120SfConfigNvfp4:
     SF_VEC = 16
+    PACK_NSF = 4
+    KTILE_SF = 1
 
     def __init__(self, sf_dtype=cutlass.Float8E4M3FN):
-        self.sf_dtype = sf_dtype
+        self.mma_sf_dtype = sf_dtype
+        self.sf_dtype = cutlass.Int32
         self.use_ue8m0 = False
         self.sf_load_warp = 1
+
+    def sf_in_tile_k(self, tile_k):
+        assert tile_k % (self.SF_VEC * self.PACK_NSF) == 0
+        return ceil_div(tile_k, self.SF_VEC * self.PACK_NSF)
+
+    def _make_int32_sf_layout(self, layout):
+        return cute.coalesce(
+            cute.filter_zeros(
+                cute.recast_layout(self.sf_dtype.width, self.mma_sf_dtype.width, layout)
+            ),
+            target_profile=(1, 1, 1),
+        )
 
     def ab_stages_contract(self, ab_stage):
         return ab_stage > 0
@@ -111,26 +126,43 @@ class Sm120SfConfigNvfp4:
         return self.sfb_tile_n(tile_n) // tile_n
 
     def deduce_sfa_layout(self, mn, K, L):
-        return blockscaled_utils.tile_atom_to_shape_SF((mn, K, L), self.SF_VEC)
+        layout = blockscaled_utils.tile_atom_to_shape_SF((mn, K, L), self.SF_VEC)
+        return self._make_int32_sf_layout(layout)
 
     def deduce_sfb_layout(self, mn, K, L):
-        return blockscaled_utils.tile_atom_to_shape_SF((mn, K, L), self.SF_VEC)
+        layout = blockscaled_utils.tile_atom_to_shape_SF((mn, K, L), self.SF_VEC)
+        return self._make_int32_sf_layout(layout)
 
     def make_smem_layout_sfa(self, tiledmma, tile, ab_stage):
-        return _make_nvfp4_smem_layout_sfa(tiledmma, tile, self.SF_VEC, ab_stage)
+        layout = _make_nvfp4_smem_layout_sfa(tiledmma, tile, self.SF_VEC, ab_stage)
+        return self._make_int32_sf_layout(layout)
 
     def make_smem_layout_sfb(self, tiledmma, tile, ab_stage):
-        return _make_nvfp4_smem_layout_sfb(tiledmma, tile, self.SF_VEC, ab_stage)
+        layout = _make_nvfp4_smem_layout_sfb(tiledmma, tile, self.SF_VEC, ab_stage)
+        return self._make_int32_sf_layout(layout)
+
+    def sfa_tiler(self, tile):
+        return (self.sfa_tile_m(tile[0]), self.sf_in_tile_k(tile[2]))
+
+    def sfb_tiler(self, tile):
+        return (self.sfb_tile_n(tile[1]), self.sf_in_tile_k(tile[2]))
 
     def thrfrg_SFA(self, sf_layout, tiled_mma):
         atom_shape_mnk = tiled_mma.shape_mnk
         perm = tiled_mma.permutation_mnk
         thr_vmnk = tiled_mma.thr_layout_vmnk
-        atom_sf_layout = cute.make_layout(((2, 2, 8), 64), stride=((8, 0, 1), 16))
-        t_tensor = cute.logical_divide(sf_layout, (perm[0], perm[2]))
+        atom_sf_layout = cute.make_layout(
+            ((2, 2, 8), self.KTILE_SF), stride=((8, 0, 1), 16)
+        )
+        t_tensor = cute.logical_divide(
+            sf_layout, (perm[0], cute.make_layout(self.KTILE_SF))
+        )
         a_tensor = cute.zipped_divide(
             t_tensor,
-            (cute.make_layout(atom_shape_mnk[0]), cute.make_layout(atom_shape_mnk[2])),
+            (
+                cute.make_layout(atom_shape_mnk[0]),
+                cute.make_layout(self.KTILE_SF),
+            ),
         )
         tv_tensor = cute.composition(a_tensor, (atom_sf_layout, None))
         return cute.zipped_divide(
@@ -148,11 +180,16 @@ class Sm120SfConfigNvfp4:
         atom_shape_mnk = tiled_mma.shape_mnk
         perm = tiled_mma.permutation_mnk
         thr_vmnk = tiled_mma.thr_layout_vmnk
-        atom_sf_layout = cute.make_layout(((4, 8), 64), stride=((0, 1), 8))
-        t_tensor = cute.logical_divide(sf_layout, (perm[1], perm[2]))
+        atom_sf_layout = cute.make_layout(((4, 8), self.KTILE_SF), stride=((0, 1), 8))
+        t_tensor = cute.logical_divide(
+            sf_layout, (perm[1], cute.make_layout(self.KTILE_SF))
+        )
         a_tensor = cute.zipped_divide(
             t_tensor,
-            (cute.make_layout(atom_shape_mnk[1]), cute.make_layout(atom_shape_mnk[2])),
+            (
+                cute.make_layout(atom_shape_mnk[1]),
+                cute.make_layout(self.KTILE_SF),
+            ),
         )
         tv_tensor = cute.composition(a_tensor, (atom_sf_layout, None))
         return cute.zipped_divide(
@@ -177,7 +214,7 @@ class Sm120SfConfigNvfp4:
         )
         thr_vmnk = thr_mma.thr_layout_vmnk.get_flat_coord(tidx)
         thr_vmk = (thr_vmnk[0], (thr_vmnk[1], thr_vmnk[3]))
-        return cute.make_fragment_like(self._thr_partition(thr_tensor, thr_vmk))
+        return cute.make_rmem_tensor_like(self._thr_partition(thr_tensor, thr_vmk))
 
     def partition_fragment_SFB(self, sf_tensor, thr_mma, tidx):
         thr_tensor = cute.make_tensor(
@@ -185,12 +222,12 @@ class Sm120SfConfigNvfp4:
         )
         thr_vmnk = thr_mma.thr_layout_vmnk.get_flat_coord(tidx)
         thr_vnk = (thr_vmnk[0], (thr_vmnk[2], thr_vmnk[3]))
-        return cute.make_fragment_like(self._thr_partition(thr_tensor, thr_vnk))
+        return cute.make_rmem_tensor_like(self._thr_partition(thr_tensor, thr_vnk))
 
     def get_layoutSFA_TV(self, tiledmma):
         perm = tiledmma.permutation_mnk
         thr_vmnk = tiledmma.thr_layout_vmnk
-        ref = cute.make_layout((cute.size(perm[0]), cute.size(perm[2])))
+        ref = cute.make_layout((cute.size(perm[0]), self.KTILE_SF))
         atile = (
             None,
             (
@@ -207,7 +244,7 @@ class Sm120SfConfigNvfp4:
     def get_layoutSFB_TV(self, tiledmma):
         perm = tiledmma.permutation_mnk
         thr_vmnk = tiledmma.thr_layout_vmnk
-        ref = cute.make_layout((cute.size(perm[1]), cute.size(perm[2])))
+        ref = cute.make_layout((cute.size(perm[1]), self.KTILE_SF))
         atile = (
             None,
             (
@@ -224,6 +261,26 @@ class Sm120SfConfigNvfp4:
     def make_s2r_sf(self, tv_layout, tiler):
         atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), self.sf_dtype)
         return cute.make_tiled_copy(atom, tv_layout, tiler)
+
+    def make_sf_e4m3_view(self, fragment):
+        shape, stride = fragment.layout.shape, fragment.layout.stride
+        layout = cute.make_layout(
+            ((self.SF_VEC, self.PACK_NSF), shape[1], shape[2]),
+            stride=(
+                (0, 1),
+                cute.transform_leaf(lambda value: value * self.PACK_NSF, stride[1]),
+                cute.transform_leaf(lambda value: value * self.PACK_NSF, stride[2]),
+            ),
+        )
+        return cute.make_tensor(
+            cute.recast_ptr(fragment.iterator, dtype=self.mma_sf_dtype), layout
+        )
+
+    def make_sfa_e4m3_view(self, fragment):
+        return self.make_sf_e4m3_view(fragment)
+
+    def make_sfb_e4m3_view(self, fragment):
+        return self.make_sf_e4m3_view(fragment)
 
 
 class Sm120SfConfigMxfp8Mxfp4:

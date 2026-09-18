@@ -131,12 +131,16 @@ def make_a_sfa_partitions(
     )
     if cutlass.const_expr(swap):
         gSFA_mkl = cute.local_tile(
-            tma_tensor_sfa, (sfa_tile_m, tile_mnk[2]), (None, None, None)
+            tma_tensor_sfa,
+            (sfa_tile_m, cute.size(sSFA, mode=[1])),
+            (None, None, None),
         )
     else:
         sf_m_off = compute_padded_offset(tile.m_offset, tile.group, cutlass.Int32(128))
         mSFA = cute.domain_offset((sf_m_off, 0, 0), tma_tensor_sfa)
-        gSFA_mkl = cute.local_tile(mSFA, (sfa_tile_m, tile_mnk[2]), (None, None, None))
+        gSFA_mkl = cute.local_tile(
+            mSFA, (sfa_tile_m, cute.size(sSFA, mode=[1])), (None, None, None)
+        )
     tAsSFA, tAgSFA = cpasync.tma_partition(
         tma_atom_sfa,
         cutlass.Int32(0),
@@ -181,13 +185,17 @@ def make_b_sfb_partitions(
         )
         sf_m_off = compute_padded_offset(tile.m_offset, tile.group, cutlass.Int32(128))
         mSFB = cute.domain_offset((sf_m_off, 0, 0), tma_tensor_sfb)
-        gSFB_nkl = cute.local_tile(mSFB, (sfb_tile_n, tile_mnk[2]), (None, None, None))
+        gSFB_nkl = cute.local_tile(
+            mSFB, (sfb_tile_n, cute.size(sSFB, mode=[1])), (None, None, None)
+        )
     else:
         gB_nkl = cute.local_tile(
             tma_tensor_b, cute.slice_(tile_mnk, (0, None, None)), (None, None, None)
         )
         gSFB_nkl = cute.local_tile(
-            tma_tensor_sfb, cute.slice_(tile_mnk, (0, None, None)), (None, None, None)
+            tma_tensor_sfb,
+            (sfb_tile_n, cute.size(sSFB, mode=[1])),
+            (None, None, None),
         )
     tBsB, tBgB = cpasync.tma_partition(
         tma_atom_b,
@@ -361,11 +369,13 @@ def make_b_sfb_gate_partitions(
         (None, None, None),
     )
     gSFB_nkl = cute.local_tile(
-        tma_tensor_sfb, cute.slice_(tile_mnk, (0, None, None)), (None, None, None)
+        tma_tensor_sfb,
+        (tile_mnk[1], cute.size(sSFB, mode=[1])),
+        (None, None, None),
     )
     gSFG_nkl = cute.local_tile(
         cute.domain_offset((n_gate_off, 0, 0), tma_tensor_sfb),
-        cute.slice_(tile_mnk, (0, None, None)),
+        (tile_mnk[1], cute.size(sSFG, mode=[1])),
         (None, None, None),
     )
     tBsB, tBgB = cpasync.tma_partition(
@@ -432,11 +442,13 @@ def make_a_sfa_gate_partitions_swap(
         (None, None, None),
     )
     gSFA_mkl = cute.local_tile(
-        tma_tensor_sfa, (tile_mnk[0], tile_mnk[2]), (None, None, None)
+        tma_tensor_sfa,
+        (tile_mnk[0], cute.size(sSFA, mode=[1])),
+        (None, None, None),
     )
     gSFG_mkl = cute.local_tile(
         cute.domain_offset((n_gate_off, 0, 0), tma_tensor_sfa),
-        (tile_mnk[0], tile_mnk[2]),
+        (tile_mnk[0], cute.size(sSFG, mode=[1])),
         (None, None, None),
     )
     tAsA, tAgA = cpasync.tma_partition(
@@ -638,19 +650,16 @@ def mma(
     tCrSFA = sf_cfg.partition_fragment_SFA(sSFA[None, None, 0], thr, tidx)
     tCrSFB = sf_cfg.partition_fragment_SFB(sSFB[None, None, 0], thr, tidx)
     tCrSFG = sf_cfg.partition_fragment_SFB(sSFG[None, None, 0], thr, tidx)
+    tCrSFA_frg = sf_cfg.make_sfa_e4m3_view(tCrSFA)
+    tCrSFB_frg = sf_cfg.make_sfb_e4m3_view(tCrSFB)
+    tCrSFG_frg = sf_cfg.make_sfb_e4m3_view(tCrSFG)
     s2r_sfa = sf_cfg.make_s2r_sf(
         sf_cfg.get_layoutSFA_TV(tiledmma),
-        (
-            cute.size(tiledmma.permutation_mnk[0]),
-            cute.size(tiledmma.permutation_mnk[2]),
-        ),
+        (cute.size(tiledmma.permutation_mnk[0]), sf_cfg.KTILE_SF),
     )
     s2r_sfb = sf_cfg.make_s2r_sf(
         sf_cfg.get_layoutSFB_TV(tiledmma),
-        (
-            cute.size(tiledmma.permutation_mnk[1]),
-            cute.size(tiledmma.permutation_mnk[2]),
-        ),
+        (cute.size(tiledmma.permutation_mnk[1]), sf_cfg.KTILE_SF),
     )
     thr_sfa, thr_sfb = s2r_sfa.get_slice(tidx), s2r_sfb.get_slice(tidx)
     tCrSFA_v = thr_sfa.retile(tCrSFA)
@@ -676,8 +685,8 @@ def mma(
             cute.copy(s2r_sfa, tAsSFA[None, None, k], tCrSFA_v[None, None, k])
             cute.copy(s2r_sfb, tBsSFB[None, None, k], tCrSFB_v[None, None, k])
             cute.copy(s2r_sfb, tGsSFG[None, None, k], tCrSFG_v[None, None, k])
-        cute.gemm(tiledmma, acc, [tCrA, tCrSFA], [tCrB, tCrSFB], acc)
-        cute.gemm(tiledmma, acc_g, [tCrA, tCrSFA], [tCrG, tCrSFG], acc_g)
+        cute.gemm(tiledmma, acc, [tCrA, tCrSFA_frg], [tCrB, tCrSFB_frg], acc)
+        cute.gemm(tiledmma, acc_g, [tCrA, tCrSFA_frg], [tCrG, tCrSFG_frg], acc_g)
         cute.arch.mbarrier_arrive(a_empty + stage)
         cute.arch.mbarrier_arrive(b_empty + stage)
         stage += 1
@@ -737,19 +746,16 @@ def mma_swap(
     tCrSFA = sf_cfg.partition_fragment_SFA(sSFA[None, None, 0], thr, tidx)
     tCrSFG = sf_cfg.partition_fragment_SFA(sSFG[None, None, 0], thr, tidx)
     tCrSFB = sf_cfg.partition_fragment_SFB(sSFB[None, None, 0], thr, tidx)
+    tCrSFA_frg = sf_cfg.make_sfa_e4m3_view(tCrSFA)
+    tCrSFG_frg = sf_cfg.make_sfa_e4m3_view(tCrSFG)
+    tCrSFB_frg = sf_cfg.make_sfb_e4m3_view(tCrSFB)
     s2r_sfa = sf_cfg.make_s2r_sf(
         sf_cfg.get_layoutSFA_TV(tiledmma),
-        (
-            cute.size(tiledmma.permutation_mnk[0]),
-            cute.size(tiledmma.permutation_mnk[2]),
-        ),
+        (cute.size(tiledmma.permutation_mnk[0]), sf_cfg.KTILE_SF),
     )
     s2r_sfb = sf_cfg.make_s2r_sf(
         sf_cfg.get_layoutSFB_TV(tiledmma),
-        (
-            cute.size(tiledmma.permutation_mnk[1]),
-            cute.size(tiledmma.permutation_mnk[2]),
-        ),
+        (cute.size(tiledmma.permutation_mnk[1]), sf_cfg.KTILE_SF),
     )
     thr_sfa, thr_sfb = s2r_sfa.get_slice(tidx), s2r_sfb.get_slice(tidx)
     tCrSFA_v, tCrSFG_v = thr_sfa.retile(tCrSFA), thr_sfa.retile(tCrSFG)
@@ -775,8 +781,8 @@ def mma_swap(
             cute.copy(s2r_sfa, tAsSFA[None, None, k], tCrSFA_v[None, None, k])
             cute.copy(s2r_sfa, tGsSFG[None, None, k], tCrSFG_v[None, None, k])
             cute.copy(s2r_sfb, tBsSFB[None, None, k], tCrSFB_v[None, None, k])
-        cute.gemm(tiledmma, acc, [tCrA, tCrSFA], [tCrB, tCrSFB], acc)
-        cute.gemm(tiledmma, acc_g, [tCrG, tCrSFG], [tCrB, tCrSFB], acc_g)
+        cute.gemm(tiledmma, acc, [tCrA, tCrSFA_frg], [tCrB, tCrSFB_frg], acc)
+        cute.gemm(tiledmma, acc_g, [tCrG, tCrSFG_frg], [tCrB, tCrSFB_frg], acc_g)
         cute.arch.mbarrier_arrive(a_empty + stage)
         cute.arch.mbarrier_arrive(b_empty + stage)
         stage += 1
@@ -883,7 +889,7 @@ class CuteDslSm120MoeNvfp4Fc1ActQ1:
             cpasync.CopyBulkTensorTileG2SOp(),
             gSFA,
             sfa_stage,
-            (cfg.load_sf.sfa_tile_m(bm), bk),
+            cfg.load_sf.sfa_tiler(cfg.TILE),
             num_multicast=1,
             internal_type=cfg.I16,
         )
@@ -894,7 +900,7 @@ class CuteDslSm120MoeNvfp4Fc1ActQ1:
             cpasync.CopyBulkTensorTileG2SOp(),
             gSFB,
             sfb_stage,
-            (cfg.load_sf.sfb_tile_n(bn), bk),
+            cfg.load_sf.sfb_tiler(cfg.TILE),
             num_multicast=1,
             internal_type=cfg.I16,
         )
@@ -1278,7 +1284,7 @@ class CuteDslSm120MoeNvfp4Fc1ActQ1:
                     sfa_tile_offset = tile.m_block & i32(sfa_tiles_per_block - 1)
                     sSFA_tile = cute.local_tile(
                         sSFA,
-                        cute.slice_(cfg.TILE, (None, 0, None)),
+                        (bm, cute.size(sSFA, mode=[1])),
                         (sfa_tile_offset, 0, None),
                     )
                 else:
@@ -1287,7 +1293,7 @@ class CuteDslSm120MoeNvfp4Fc1ActQ1:
                     sfb_tile_offset = tile.n_block & i32(sfb_tiles_per_block - 1)
                     sSFB_tile = cute.local_tile(
                         sSFB,
-                        cute.slice_(cfg.TILE, (0, None, None)),
+                        (bn, cute.size(sSFB, mode=[1])),
                         (sfb_tile_offset, 0, None),
                     )
                 else:

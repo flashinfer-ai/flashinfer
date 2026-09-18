@@ -114,12 +114,16 @@ def make_a_sfa_partitions(
     )
     if cutlass.const_expr(swap):
         gSFA_mkl = cute.local_tile(
-            tma_tensor_sfa, (sfa_tile_m, tile_mnk[2]), (None, None, None)
+            tma_tensor_sfa,
+            (sfa_tile_m, cute.size(sSFA, mode=[1])),
+            (None, None, None),
         )
     else:
         sf_m_off = compute_padded_offset(tile.m_offset, tile.group, cutlass.Int32(128))
         mSFA = cute.domain_offset((sf_m_off, 0, 0), tma_tensor_sfa)
-        gSFA_mkl = cute.local_tile(mSFA, (sfa_tile_m, tile_mnk[2]), (None, None, None))
+        gSFA_mkl = cute.local_tile(
+            mSFA, (sfa_tile_m, cute.size(sSFA, mode=[1])), (None, None, None)
+        )
     tAsSFA, tAgSFA = cpasync.tma_partition(
         tma_atom_sfa,
         cutlass.Int32(0),
@@ -164,13 +168,17 @@ def make_b_sfb_partitions(
         )
         sf_m_off = compute_padded_offset(tile.m_offset, tile.group, cutlass.Int32(128))
         mSFB = cute.domain_offset((sf_m_off, 0, 0), tma_tensor_sfb)
-        gSFB_nkl = cute.local_tile(mSFB, (sfb_tile_n, tile_mnk[2]), (None, None, None))
+        gSFB_nkl = cute.local_tile(
+            mSFB, (sfb_tile_n, cute.size(sSFB, mode=[1])), (None, None, None)
+        )
     else:
         gB_nkl = cute.local_tile(
             tma_tensor_b, cute.slice_(tile_mnk, (0, None, None)), (None, None, None)
         )
         gSFB_nkl = cute.local_tile(
-            tma_tensor_sfb, cute.slice_(tile_mnk, (0, None, None)), (None, None, None)
+            tma_tensor_sfb,
+            (sfb_tile_n, cute.size(sSFB, mode=[1])),
+            (None, None, None),
         )
     tBsB, tBgB = cpasync.tma_partition(
         tma_atom_b,
@@ -357,19 +365,15 @@ def mma(
     tCrA_v, tCrB_v = thr_a.retile(tCrA), thr_b.retile(tCrB)
     tCrSFA = sf_cfg.partition_fragment_SFA(sSFA[None, None, 0], thr, tidx)
     tCrSFB = sf_cfg.partition_fragment_SFB(sSFB[None, None, 0], thr, tidx)
+    tCrSFA_frg = sf_cfg.make_sfa_e4m3_view(tCrSFA)
+    tCrSFB_frg = sf_cfg.make_sfb_e4m3_view(tCrSFB)
     s2r_sfa = sf_cfg.make_s2r_sf(
         sf_cfg.get_layoutSFA_TV(tiledmma),
-        (
-            cute.size(tiledmma.permutation_mnk[0]),
-            cute.size(tiledmma.permutation_mnk[2]),
-        ),
+        (cute.size(tiledmma.permutation_mnk[0]), sf_cfg.KTILE_SF),
     )
     s2r_sfb = sf_cfg.make_s2r_sf(
         sf_cfg.get_layoutSFB_TV(tiledmma),
-        (
-            cute.size(tiledmma.permutation_mnk[1]),
-            cute.size(tiledmma.permutation_mnk[2]),
-        ),
+        (cute.size(tiledmma.permutation_mnk[1]), sf_cfg.KTILE_SF),
     )
     thr_sfa, thr_sfb = s2r_sfa.get_slice(tidx), s2r_sfb.get_slice(tidx)
     tCrSFA_v, tCrSFB_v = thr_sfa.retile(tCrSFA), thr_sfb.retile(tCrSFB)
@@ -389,7 +393,7 @@ def mma(
         for k in cutlass.range_constexpr(0, sf_blocks):
             cute.copy(s2r_sfa, tAsSFA[None, None, k], tCrSFA_v[None, None, k])
             cute.copy(s2r_sfb, tBsSFB[None, None, k], tCrSFB_v[None, None, k])
-        cute.gemm(tiledmma, acc, [tCrA, tCrSFA], [tCrB, tCrSFB], acc)
+        cute.gemm(tiledmma, acc, [tCrA, tCrSFA_frg], [tCrB, tCrSFB_frg], acc)
         cute.arch.mbarrier_arrive(a_empty + stage)
         cute.arch.mbarrier_arrive(b_empty + stage)
         stage += 1
@@ -485,7 +489,7 @@ class CuteDslSm120MoeNvfp4Grouped:
             cpasync.CopyBulkTensorTileG2SOp(),
             gSFA,
             sfa_stage,
-            (cfg.load_sf.sfa_tile_m(bm), bk),
+            cfg.load_sf.sfa_tiler(cfg.TILE),
             num_multicast=1,
             internal_type=cfg.I16,
         )
@@ -496,7 +500,7 @@ class CuteDslSm120MoeNvfp4Grouped:
             cpasync.CopyBulkTensorTileG2SOp(),
             gSFB,
             sfb_stage,
-            (cfg.load_sf.sfb_tile_n(bn), bk),
+            cfg.load_sf.sfb_tiler(cfg.TILE),
             num_multicast=1,
             internal_type=cfg.I16,
         )
@@ -786,7 +790,7 @@ class CuteDslSm120MoeNvfp4Grouped:
                     sfa_tile_offset = tile.m_block & i32(sfa_tiles_per_block - 1)
                     sSFA_tile = cute.local_tile(
                         sSFA,
-                        cute.slice_(cfg.TILE, (None, 0, None)),
+                        (bm, cute.size(sSFA, mode=[1])),
                         (sfa_tile_offset, 0, None),
                     )
                 else:
@@ -795,7 +799,7 @@ class CuteDslSm120MoeNvfp4Grouped:
                     sfb_tile_offset = tile.n_block & i32(sfb_tiles_per_block - 1)
                     sSFB_tile = cute.local_tile(
                         sSFB,
-                        cute.slice_(cfg.TILE, (0, None, None)),
+                        (bn, cute.size(sSFB, mode=[1])),
                         (sfb_tile_offset, 0, None),
                     )
                 else:
