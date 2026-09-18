@@ -105,7 +105,14 @@ def should_use_prims_ts_balanced_mla(
     Unsupported query widths, head counts, dimensions, or dtype pairs route to
     the standard scheduler without requiring declarations. A supported auto
     configuration requires both declarations rather than guessing from live
-    sequence lengths or a model context limit.
+    sequence lengths or a model context limit; a missing declaration raises
+    :class:`ValueError` rather than returning ``False``.
+
+    This predicate deliberately does not inspect the CUDA device or its
+    calibration registry. A ``True`` result is only the route decision;
+    balanced planning subsequently requires an exact-device cost-model
+    calibration and raises :class:`NotImplementedError` when none is
+    registered.
     """
 
     if max_seq_len_q != 1:
