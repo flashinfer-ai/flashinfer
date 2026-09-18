@@ -1,3 +1,37 @@
+## Small-row scheduler specialization — 2026-09-17
+
+For paired FC1 declarations with at most 8 routed rows, each nonempty expert
+has one token tile. The plan selects a smaller scheduler path that eliminates
+row tile-count division, L2 row rasterization and unused shared-ring fields.
+MMA, epilogue, resources and the persistent generic path for R9–513 are unchanged.
+Frozen template parameters separate the specialized compilation/cache identity.
+
+On a 1000W B200, BF16 T1/E128/top8/H2048/I768, complete synthetic FI MoE:
+
+| Routing | Published generic scheduler | Specialized scheduler | Latency reduction |
+|---|---:|---:|---:|
+| Unpacked | 29.787375 us |  29.439375 us | 1.168% |
+| Packed | 29.703875 us |  29.407875 us | 0.997% |
+
+These are fixed-geometry ablations with the same paired FC2, routing and native
+finalizer, using four fresh ABBA processes and cold-L2 CUPTI spans. Independent
+audit 2018 checks 296 raw outputs, 120 observable input/weight mutation controls
+and 768 spans, with normal/memcheck/racecheck all passing. Graph audit 1972 checks
+51 zero-skip test executions, 420 outputs, 126 controls and 84 actual routes,
+including R8/E257 pitched weights and generic R9–513 persistent scheduling.
+
+A separate 44-case large finite cancellation diagnostic compares generic and
+specialized outputs bitwise: all 44 match. Both versions fail 15 FP32-reference
+checks. This establishes no new numerical change on these cases; it does not
+waive the existing cancellation behavior or claim all-input numerical accuracy.
+No new competing-backend, SM120, model-E2E or full-repository-CI claim is made.
+The native PDL-off/on comparator refresh and finalizer PDL experiment remain
+pending, as qualified below.
+
+Credit: KF candidate f19299a8e3a54d5767c2e3b96fb2b21a3a46922d89663c88921ad18fc0a081a1
+identified the small-row scheduler simplification. This builds on NVIDIA Frost,
+KF 624/2f5c, Yanqin Zhai PR #1090 / CUTLASS example 113 and Yanqin/Yihua's parallel work.
+
 ## Comparator PDL scope clarification — 2026-09-17
 
 The latest B200 TRT-LLM comparison (audit1913, Frost29.484375us versus
