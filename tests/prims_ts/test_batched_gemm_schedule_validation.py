@@ -64,6 +64,237 @@ def _fused_operand_sf_config(**overrides):
     return cfg
 
 
+def test_persistent_cta_swizzle_config_and_cli_mapping():
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+        CtaRasterOrder,
+        TileScheduler,
+        make_config,
+        validate_config,
+    )
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
+        _parse_overrides,
+        build_arg_parser,
+    )
+
+    parser = build_arg_parser()
+    args = parser.parse_args(
+        [
+            "--tile-scheduler",
+            "persistent",
+            "--cta-swizzle-type",
+            "rasterizeAlongN",
+        ]
+    )
+    overrides = _parse_overrides(args)
+    cfg = make_config(**overrides)
+
+    validate_config(cfg)
+    assert cfg.cta_raster_order == int(CtaRasterOrder.ALONG_N)
+    assert cfg.tile_scheduler == int(TileScheduler.PERSISTENT)
+    assert not cfg.raster_along_m
+
+
+def test_along_n_cta_swizzle_rejects_non_persistent_scheduler():
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+        CtaRasterOrder,
+        make_config,
+        validate_config,
+    )
+
+    cfg = make_config(cta_raster_order=int(CtaRasterOrder.ALONG_N))
+
+    with pytest.raises(ValueError, match="requires persistent scheduling"):
+        validate_config(cfg)
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    (
+        ([], 32),
+        (["--tmem-ldst-max-num-regs", "32"], 32),
+        (["--tmem-ldst-max-num-regs", "64"], 64),
+    ),
+)
+def test_tmem_ldst_max_num_regs_cli_mapping(argv, expected):
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import make_config
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
+        _parse_overrides,
+        build_arg_parser,
+    )
+
+    args = build_arg_parser().parse_args(argv)
+    cfg = make_config(**_parse_overrides(args))
+
+    assert cfg.tmem_ldst_max_num_regs == expected
+
+
+@pytest.mark.parametrize(
+    ("max_regs", "epi_tile_n", "expected_overlap_loads"),
+    ((32, 64, 2), (64, 64, 1), (64, 128, 2)),
+)
+def test_non_swap_ht256_overlap_uses_epilogue_tile_width(
+    max_regs, epi_tile_n, expected_overlap_loads
+):
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+        SfLayout,
+        TileScheduler,
+        compute_warp_layout,
+        make_config,
+        validate_config,
+    )
+
+    cfg = make_config(
+        cluster_m=2,
+        tile_m=128,
+        tile_n=256,
+        tile_k=256,
+        epi_tile_m=128,
+        epi_tile_n=epi_tile_n,
+        mma_m=256,
+        mma_n=256,
+        mma_k=64,
+        tile_scheduler=int(TileScheduler.PERSISTENT),
+        num_stages_tmem_acc=1,
+        sf_layout_a=int(SfLayout.R128c4),
+        sf_layout_b=int(SfLayout.R128c4),
+        use_max_tmem_overlap=1,
+        use_tma_store=1,
+        tmem_ldst_max_num_regs=max_regs,
+    )
+    compute_warp_layout(cfg)
+    validate_config(cfg)
+
+    assert cfg.num_epilogue_warps == 4
+    assert cfg.non_swap_tmem_overlap_loads == expected_overlap_loads
+    max_swizzled_cols = 128 * 8 // cfg.dtype_c_bits
+    assert cfg.non_swap_tma_store_cols == min(cfg.epi_tile_n, max_swizzled_cols)
+    assert cfg.epi_tile_n % cfg.non_swap_tma_store_cols == 0
+    tma_store_bytes = cfg.tile_m * cfg.non_swap_tma_store_cols * cfg.dtype_c_bits // 8
+    assert cfg.num_bytes_c_per_stage % tma_store_bytes == 0
+
+
+def test_nvfp4_instruction_descriptor_uses_mxf4_element_encoding():
+    from cutlass.experimental import primitives as prims
+
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+        MX_MMA_FORMAT_E2M1,
+    )
+    from flashinfer.prims_ts.batched_gemm.tmem_c_resources import (
+        _build_nvfp4_instr_desc,
+        _mx_dtype_from_format,
+    )
+
+    nvfp4_desc = _build_nvfp4_instr_desc(n_dim=256, m_dim=256)
+    assert int(nvfp4_desc.a_format) == 1
+    assert int(nvfp4_desc.b_format) == 1
+    assert int(nvfp4_desc) & 0xFFFFFFFF == 0x10400480
+
+    # OCP MXFP4 uses kind::mxf8f6f4, whose E2M1 encoding remains 5.
+    mx_e2m1 = _mx_dtype_from_format(MX_MMA_FORMAT_E2M1)
+    mx_desc = prims.Tcgen05MxInstrDesc.build(
+        a_dtype=mx_e2m1,
+        b_dtype=mx_e2m1,
+        scale_format=1,
+        n_dim=256,
+        m_dim=256,
+    )
+    assert int(mx_desc.a_format) == 5
+    assert int(mx_desc.b_format) == 5
+
+
+@pytest.mark.timeout(180)
+def test_trtllm_equiv_task_manager_smem_matches_kernel_allocation():
+    """Cover the configuration in run_prims_ts_fp4_fc2_trtllm_equiv.sh."""
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+        BatchMode,
+        BiasType,
+        DType,
+        SfLayout,
+        TileScheduler,
+        make_config,
+    )
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_kernel import (
+        _build_schedule_validate,
+        _make_tmem_ptr_smem_allocation,
+    )
+
+    cfg = make_config(
+        route_act=0,
+        act_kind=0,
+        dtype_a=int(DType.E2M1),
+        dtype_b=int(DType.E2M1),
+        dtype_c=int(DType.BF16),
+        sf_layout_a=int(SfLayout.R128c4),
+        sf_layout_b=int(SfLayout.R128c4),
+        sf_layout_c=int(SfLayout.R128c4),
+        cluster_m=2,
+        tile_m=128,
+        tile_n=256,
+        tile_k=256,
+        mma_m=256,
+        mma_n=256,
+        mma_k=64,
+        epi_tile_n=64,
+        tile_scheduler=int(TileScheduler.PERSISTENT),
+        batch_mode=int(BatchMode.BATCH_M),
+        transpose_mma_output=0,
+        num_stages_a=5,
+        num_stages_b=5,
+        num_stages_smem_sfa=6,
+        num_stages_smem_sfb=6,
+        num_stages_tmem_acc=1,
+        num_stages_tmem_sfa=5,
+        num_stages_tmem_sfb=1,
+        num_stages_c_smem=1,
+        use_tma_oob_opt=1,
+        use_tma_store=1,
+        use_unroll_loop_2x_for_mma=0,
+        use_max_tmem_overlap=1,
+        use_early_exit=1,
+        use_pdl=0,
+        use_per_token_sf_b=0,
+        per_token_sf_dtype=int(DType.FP32),
+        bias_type=int(BiasType.NONE),
+        epilogue_regs=176,
+        mma_regs=80,
+        load_regs=80,
+        load_sf_regs=80,
+        copy_sf_regs=80,
+        workid_regs=80,
+        padding_regs=80,
+    )
+    _, _, smem_allocator, _ = _build_schedule_validate(cfg, num_k_tiles=16)
+
+    assert smem_allocator.total_smem_bytes == 217088
+    assert smem_allocator.barrier_smem_bytes == 464
+    assert [
+        (r.name, r.pipeline_config.num_stages)
+        for r in smem_allocator._barrier_resources
+    ] == [
+        ("SmemA", 5),
+        ("SmemB", 5),
+        ("SmemSfA", 6),
+        ("SmemSfB", 6),
+        ("WorkQueue", 3),
+        ("TmemC", 1),
+        ("WorkThrottle", 3),
+    ]
+
+    tmem_ptr = _make_tmem_ptr_smem_allocation()
+    assert (tmem_ptr.size_bytes, tmem_ptr.alignment, tmem_ptr.count) == (8, 8, 1)
+
+    # GPU assembly additionally adds the aligned TMEM pointer, the cluster
+    # deallocation mbarrier, and the CLC response. Scheduler barrier pairs are
+    # already included in ``barrier_smem_bytes``.
+    scheduler_data_bytes = 8 + 8 + 48
+    assert (
+        smem_allocator.total_smem_bytes
+        + scheduler_data_bytes
+        + smem_allocator.barrier_smem_bytes
+        == 217616
+    )
+
+
 @pytest.mark.timeout(240)
 def test_schedule_checker_reports_no_persistent_c_scratch_ab_alias_race():
     """Persistent multi-stage work IDs keep C scratch separate from A/B.

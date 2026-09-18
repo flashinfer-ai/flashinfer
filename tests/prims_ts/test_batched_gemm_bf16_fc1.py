@@ -231,6 +231,7 @@ class TestBf16Fc1GatherGPU:
         top_k=1,
         swap_ab=False,
         cluster_m=1,
+        tile_scheduler=1,
         problem_k=None,
     ):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
@@ -245,8 +246,8 @@ class TestBf16Fc1GatherGPU:
         }
         if cluster_m >= 2:
             cfg["mma_m"] = 256
-            cfg["tile_scheduler"] = 1
-            cfg["num_stages_tmem_acc"] = 2
+            cfg["tile_scheduler"] = tile_scheduler
+            cfg["num_stages_tmem_acc"] = 2 if tile_scheduler == 1 else 1
             # num_gather_warps computed by kernel's compute_warp_layout
         result = reference_check(
             num_experts=num_experts,
@@ -306,6 +307,17 @@ class TestBf16Fc1GatherGPU:
             tile_n=64,
             swap_ab=True,
             cluster_m=2,
+            num_experts=2,
+            num_tokens=256,
+            pipeline_stages=4,
+        )
+
+    def test_gather_noswap_2cta_static_tile64(self):
+        self._run(
+            tile_n=64,
+            swap_ab=False,
+            cluster_m=2,
+            tile_scheduler=0,
             num_experts=2,
             num_tokens=256,
             pipeline_stages=4,
