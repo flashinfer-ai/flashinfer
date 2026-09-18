@@ -26,6 +26,8 @@ Entry points:
   - MlaDecodeTs                    -- class with @cute.kernel for GPU execution
 """
 
+from dataclasses import replace
+
 import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
@@ -33,6 +35,8 @@ import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.experimental.cuda as cuda
 from cutlass import Int32, Int64
+from cutlass._mlir.dialects import llvm
+from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.cute.testing import assert_ as runtime_assert
 from cutlass.cute.nvgpu import OperandMajorMode, tcgen05
 from cutlass.experimental import primitives as prims
@@ -42,11 +46,14 @@ from cutlass.experimental.task_scheduling.resources import (
     PipelineConfig,
     TileSchedulerConfig,
 )
-from cutlass.experimental.task_scheduling.enums import SignalingThreads
+from cutlass.experimental.task_scheduling.enums import PipelineType, SignalingThreads
 from cutlass.experimental.task_scheduling.task_manager import TaskManager
 from ...tensor_map import (
     create_tensor_map_ragged_from_tensor,
     create_tensor_map_tiled_from_view,
+)
+from flashinfer.cute_dsl.attention.dsa.gather4_utils import (
+    make_gather4_2sm_tma_atom,
 )
 
 from .config import (
@@ -71,6 +78,7 @@ from .work_partition import (
 )
 from .resources import (
     PageOffsetWindowResource,
+    PageIndexRingResource,
     SmemQResource,
     SmemKResource,
     SmemKVResource,
@@ -82,6 +90,11 @@ from .resources import (
     GmemOResource,
     MlaWorkQueue,
     WorkThrottleBarrierResource,
+    routing_row_index,
+)
+from ..helpers.deferred_mbarrier import (
+    initialize_deferred_mbarriers,
+    prepare_deferred_mbarriers,
 )
 from ..helpers.math import qkv_dtype
 from ..parallel_reduction_topology import (
@@ -104,9 +117,15 @@ from ..helpers.tile_scheduler import (
 )
 from .tasks import (
     MlaClcTask,
+    MlaPairRingClcLoadTask,
+    MlaPairRingClcProducerTask,
+    MlaPairRingLoadTask,
+    MlaPairRingProducerTask,
     MlaInterleavedTask,
     MlaTask,
     create_load_k_task,
+    create_load_gather_kv_task,
+    create_load_page_index_ring_task,
     create_load_v_task,
     create_load_tma_task,
     create_mma_task,
@@ -119,9 +138,222 @@ from .tasks import (
 )
 
 
+@dsl_user_op
+def _gmem_pointer_to_generic(gmem_ptr, *, loc=None, ip=None):
+    """Cast a runtime GMEM tensor-map address for ``prefetch.tensormap``."""
+
+    if gmem_ptr.memspace == cutlass.AddressSpace.generic:
+        return gmem_ptr
+    if gmem_ptr.memspace != cutlass.AddressSpace.gmem:
+        raise ValueError(
+            "tensor-map prefetch expects a GMEM or generic pointer, got "
+            f"{gmem_ptr.memspace}"
+        )
+    llvm_ptr = gmem_ptr.to_llvm_ptr(loc=loc, ip=ip)
+    generic_llvm_ptr = llvm.addrspacecast(
+        llvm.PointerType.get(cutlass.AddressSpace.generic),
+        llvm_ptr,
+        loc=loc,
+        ip=ip,
+    )
+    return cute.make_ptr(
+        gmem_ptr.dtype,
+        generic_llvm_ptr,
+        cutlass.AddressSpace.generic,
+        assumed_align=gmem_ptr.alignment,
+        loc=loc,
+        ip=ip,
+    )
+
+
 def ceil_div(a, b):
     """Return the ceiling of a divided by b."""
     return (a + b - 1) // b
+
+
+def _build_token_sparse_tasks(
+    cfg: MlaDecodeConfig,
+    *,
+    smem_q,
+    smem_k,
+    smem_v,
+    smem_p,
+    tmem_s,
+    tmem_corr,
+    tmem_o,
+    gmem_o,
+    page_index_ring,
+    gather_load_throttle,
+    work_queue,
+    use_clc_dynamic,
+    non_interleaved_task_class,
+    task_domain,
+    producer_reg_count,
+    gather4_reg_count,
+) -> "tuple[list, dict[MemoryResource, list[MemoryResource]], dict]":
+    """Build the dynamic-token-sparse task list and dependency graph.
+
+    Resources and pipeline configs are created by the caller; this function
+    only constructs tasks.  Warp roles: W8 fused QK+PV MMA, W9 page-index
+    ring producer, W10 CLC scheduler (or padding), W11 padding, W12-W15
+    Gather4 Q/K/V loads.
+
+    Returns
+    -------
+    list, dict, dict
+        ``task_list``, ``resource_dependency_graph`` and
+        ``dma_consumer_release_labels`` for ``TaskManager``.
+    """
+    assert page_index_ring is not None
+    # W9 does not own Q here; it produces the six-stage sparse-index
+    # ring while W12-W15 own Q/K/V below.
+    load_q_task = create_load_page_index_ring_task(
+        page_index_ring,
+        work_queue=work_queue,
+        task_class=(
+            MlaPairRingClcProducerTask if use_clc_dynamic else MlaPairRingProducerTask
+        ),
+        domain=task_domain,
+        num_registers=producer_reg_count,
+        warp_idx=cfg.load_tma_warp_id,
+    )
+    load_k_task = create_load_gather_kv_task(
+        smem_q,
+        smem_k,
+        smem_v,
+        page_index_ring,
+        work_queue=work_queue,
+        work_throttle=gather_load_throttle,
+        task_class=(MlaPairRingClcLoadTask if use_clc_dynamic else MlaPairRingLoadTask),
+        domain=task_domain,
+        num_registers=gather4_reg_count,
+        warp_idx=cfg.load_v_warp_id,
+        num_warps=cfg.load_v_num_warps,
+    )
+    mma_qk_task = create_mma_task(
+        smem_q,
+        smem_k,
+        smem_p,
+        tmem_s,
+        tmem_o,
+        iterations_qk=cfg.iterations_qk,
+        iterations_pv=cfg.iterations_pv_k * cfg.iterations_pv_n,
+        work_queue=work_queue,
+        task_class=non_interleaved_task_class,
+        smem_v=smem_v,
+        held_s=True,
+        domain=task_domain,
+        num_registers=producer_reg_count,
+    )
+
+    # Warpgroup 0 (warps 0-3): all 4 warps are in SoftmaxTask.  The sparse
+    # schedule has no dual (odd/even) softmax.
+    softmax_task = create_softmax_task(
+        tmem_s,
+        tmem_corr,
+        smem_p,
+        work_queue=work_queue,
+        task_class=non_interleaved_task_class,
+        domain=task_domain,
+        domain_start=0,
+        step=1,
+        num_registers=cfg.softmax_reg_num,
+        softmax_group_id=0,
+        held_s=True,
+    )
+
+    # Warpgroup 1 (warps 4-7): all 4 warps are in CorrectionTask.  The fused
+    # MMA task hands off the whole O tile, so Correction uses one O token per
+    # tile rather than one per N-slice.
+    correction_task = create_correction_task(
+        tmem_corr,
+        tmem_o,
+        gmem_o,
+        iterations_pv_n=cfg.iterations_pv_n,
+        per_n_o_pipeline=False,
+        split_corr_stats=True,
+        work_queue=work_queue,
+        task_class=non_interleaved_task_class,
+        domain=task_domain,
+        num_registers=cfg.correction_reg_num,
+    )
+
+    task_list = [
+        load_k_task,
+        load_q_task,
+        mma_qk_task,
+        softmax_task,
+        correction_task,
+    ]
+    if use_clc_dynamic:
+        scheduler_task = create_scheduler_task(
+            work_queue,
+            gather_load_throttle,
+            task_class=non_interleaved_task_class,
+            num_registers=producer_reg_count,
+            warp_idx=cfg.scheduler_warp_id,
+            throttle_per_workid=True,
+        )
+        task_list.append(scheduler_task)
+        # QK/PV are fused into W8, so W10 does CLC scheduling and
+        # W11 needs an explicit padding task.
+        task_list.append(
+            create_padding_task(
+                work_queue=work_queue,
+                task_class=non_interleaved_task_class,
+                domain=task_domain,
+                num_registers=producer_reg_count,
+                warp_idx=cfg.padding_warp_id,
+            )
+        )
+    else:
+        # W8 owns both MMAs.  Without CLC, W10/W11 are padding only:
+        # this branch uses per-task local strides, not the CLC
+        # WorkId/throttle protocol.
+        padding_task = create_padding_task(
+            work_queue=work_queue,
+            task_class=non_interleaved_task_class,
+            domain=task_domain,
+            num_registers=producer_reg_count,
+            warp_idx=cfg.scheduler_warp_id,
+            num_warps=2,
+        )
+        task_list.append(padding_task)
+
+    # ──────────────────────────────────────────────────────────────
+    # Dependency graph
+    # ──────────────────────────────────────────────────────────────
+    # The W9 cp.async -> W12-W15 sparse-index edge is a resource in its own
+    # right, so TaskManager validates the six-stage acquire/wait/release
+    # protocol instead of treating Gather4 coordinates as an untracked GMEM
+    # side input.  K and V share one dependency list, so the caller's
+    # work-queue edge is appended to it once.
+    gather_load_dependencies = [page_index_ring]
+    resource_dependency_graph = {
+        page_index_ring: [],
+        smem_q: [],  # Q loads (independent)
+        smem_k: gather_load_dependencies,
+        smem_v: gather_load_dependencies,
+        tmem_s: [smem_k, smem_q],  # QK MMA needs K and Q
+        smem_p: [tmem_s],  # softmax reads S -> writes P
+        tmem_corr: [tmem_s],  # softmax produces correction
+        tmem_o: [smem_p, smem_v],  # PV MMA needs P and V
+        gmem_o: [tmem_o, tmem_corr],  # epilogue needs O + correction
+    }
+    if gather_load_throttle is not None:
+        # The throttle is a control-only root; keeping it independent
+        # avoids a WorkQueue<->throttle circular wait.
+        resource_dependency_graph[gather_load_throttle] = []
+    # W12-W15 release the same W9 ring once after K and once after V.  The
+    # separate consumer labels make those two releases match the correct
+    # downstream DMA edge during DAG validation.
+    dma_consumer_release_labels = {
+        (smem_k, tmem_s): {"k_desc"},
+        (smem_v, tmem_o): {"v_desc", "v_desc_n_major"},
+        (page_index_ring, smem_k): {"read_k_stage"},
+        (page_index_ring, smem_v): {"read_v_stage"},
+    }
+    return task_list, resource_dependency_graph, dma_consumer_release_labels
 
 
 def build_mla_decode_task_manager(
@@ -132,19 +364,27 @@ def build_mla_decode_task_manager(
     smem_kc_arr=None,
     smem_vc_arr=None,
     smem_p_arr=None,
+    smem_page_offsets_arr=None,
     # TMA descriptors (None for validate-only)
     tma_desc_q_latent=None,
     tma_desc_q_rope=None,
     tma_desc_c_latent=None,
     tma_desc_c_rope=None,
     tma_desc_c_transpose=None,
+    sparse_tma_atom_k_swa=None,
+    sparse_tma_atom_k_compressed=None,
+    raw_tma_descriptor_swa=None,
+    raw_tma_descriptor_compressed=None,
     # Page-offset tensor
     page_offsets=None,
+    sparse_topk_lens=None,
     # Runtime coordinates
     blk_coord=None,
     tidx=None,
     # GMEM output tensors
     output=None,
+    dsv4_inv_rope_cos_sin_cache=None,
+    dsv4_o_scale=None,
     acc_output=None,
     lse=None,
     acc_lse=None,
@@ -169,7 +409,10 @@ def build_mla_decode_task_manager(
     calls pass a concrete integer ``domain`` and no runtime tensors; JIT calls
     pass symbolic runtime state and skip schedule validation. The dependency
     graph relies on TaskManager DMA-order validation to keep SMEM producers
-    alive until async TMEM consumers have launched.
+    alive until async TMEM consumers have launched.  Pipeline configs and
+    resources for all three schedules (BF16, dense FP8, dynamic token sparse)
+    are built here; the sparse task list and dependency graph come from
+    ``_build_token_sparse_tasks``.
 
     Parameters
     ----------
@@ -191,7 +434,10 @@ def build_mla_decode_task_manager(
     WARP_SIZE = 32
     Agent = pipeline.Agent
     use_clc_dynamic = bool(work_queue is not None and work_queue.use_clc_dynamic)
+    # dynamic token sparse paces the CLC WorkId path with its own W12-W15 -> W10 throttle
+    # edge.  Dense BF16 keeps the generic W8-owned throttle.
     use_work_throttle = use_clc_dynamic and not cfg.use_fp8_split_mma_schedule
+    use_gather_load_throttle = use_clc_dynamic and cfg.is_dynamic_token_sparse
     non_interleaved_task_class = MlaClcTask if use_clc_dynamic else MlaTask
     task_domain = (
         MlaClcTask.get_domain
@@ -222,6 +468,14 @@ def build_mla_decode_task_manager(
     # Pipeline configs
     # ──────────────────────────────────────────────────────────────
 
+    # dynamic token sparse issues Q/K/V TMA from W12-W15; only each task
+    # warp's leader signals the TMA/UMMA producer barriers.
+    tma_producer_signaling_threads = (
+        SignalingThreads.TaskWarpLeader
+        if cfg.is_dynamic_token_sparse
+        else SignalingThreads.All
+    )
+
     # SmemQ: TmaUmma, 1 stage, LoadTma -> Mma
     smem_q_pipeline_cfg = PipelineConfig.create_tma_umma_pipeline_cfg(
         num_stages=cfg.load_q_stage,
@@ -229,9 +483,33 @@ def build_mla_decode_task_manager(
         producer_group=tma_producer_group,
         consumer_group=umma_hw_group,
         cta_layout_vmnk=cluster_shape_vmnk,
+        producer_signaling_threads=tma_producer_signaling_threads,
         consumer_signaling_threads=SignalingThreads.CtaLeader,
-        num_bytes_per_warp_per_cta=(cfg.tma_copy_q_bytes // cfg.num_mma_ctas),
+        num_bytes_per_warp_per_cta=(
+            cfg.tma_copy_q_bytes
+            // cfg.num_mma_ctas
+            // (cfg.load_v_num_warps if cfg.is_dynamic_token_sparse else 1)
+        ),
     )
+
+    page_index_ring_pipeline_cfg = None
+    if cfg.is_dynamic_token_sparse:
+        # W9 is the single cp.async producer warp; its four W12-W15
+        # consumers share a CTA-private six-stage ring.
+        page_index_ring_pipeline_cfg = PipelineConfig(
+            num_stages=cfg.page_index_ring_stages,
+            num_bytes=0,
+            producer_group=pipeline.CooperativeGroup(Agent.Thread, WARP_SIZE),
+            consumer_group=pipeline.CooperativeGroup(
+                Agent.Thread, cfg.load_v_num_warps * WARP_SIZE
+            ),
+            pipeline_type=PipelineType.AsyncAsync,
+            # AsyncLoad completes each stage with a single .noinc
+            # cp.async.mbarrier.arrive instead of a counted arrive plus a
+            # per-lane arrival.
+            async_producer_op=pipeline.PipelineOp.AsyncLoad,
+            advance_on_wait=True,
+        )
 
     if cfg.use_fp8_split_mma_schedule:
         # FP8 uses independent whole-tile K and V pipelines so QK and PV have
@@ -243,8 +521,11 @@ def build_mla_decode_task_manager(
             producer_group=tma_producer_group,
             consumer_group=umma_hw_group,
             cta_layout_vmnk=cluster_shape_vmnk,
+            producer_signaling_threads=tma_producer_signaling_threads,
             consumer_signaling_threads=SignalingThreads.CtaLeader,
-            num_bytes_per_warp_per_cta=(cfg.tma_copy_k_tile_bytes // cfg.num_mma_ctas),
+            num_bytes_per_warp_per_cta=(
+                cfg.tma_copy_k_tile_bytes // cfg.num_mma_ctas // cfg.load_v_num_warps
+            ),
         )
         smem_v_pipeline_cfg = PipelineConfig.create_tma_umma_pipeline_cfg(
             num_stages=cfg.load_v_stage,
@@ -252,8 +533,11 @@ def build_mla_decode_task_manager(
             producer_group=tma_producer_group,
             consumer_group=umma_hw_group,
             cta_layout_vmnk=cluster_shape_vmnk,
+            producer_signaling_threads=tma_producer_signaling_threads,
             consumer_signaling_threads=SignalingThreads.CtaLeader,
-            num_bytes_per_warp_per_cta=(cfg.tma_copy_v_tile_bytes // cfg.num_mma_ctas),
+            num_bytes_per_warp_per_cta=(
+                cfg.tma_copy_v_tile_bytes // cfg.num_mma_ctas // cfg.load_v_num_warps
+            ),
         )
         smem_kv_pipeline_cfg = None
     else:
@@ -279,16 +563,30 @@ def build_mla_decode_task_manager(
         producer_signaling_threads=SignalingThreads.CtaLeader,
         interleave_stride=(1, 1, 2, 2) if cfg.use_fp8_dual_softmax_schedule else 1,
     )
-
-    # SmemP: AsyncUmma, 2 stages, SoftmaxTask -> MmaTask
-    smem_p_pipeline_cfg = PipelineConfig.create_async_umma_pipeline_cfg(
-        num_stages=cfg.p_mma_stage,
-        producer_group=compute_group_cluster,
-        consumer_group=umma_hw_group,
-        cta_layout_vmnk=cluster_shape_vmnk,
-        consumer_signaling_threads=SignalingThreads.CtaLeader,
-        interleave_stride=(2, 2, 1, 1) if cfg.use_fp8_dual_softmax_schedule else 1,
+    # dynamic token sparse runs the S empty-barrier acquire cursor two stages ahead of the
+    # QK commit cursor (split acquire/commit producer state); the W8 prologue
+    # below opens both stages exactly once.  P readiness rides on the S
+    # release, so there is no separate P pipeline.
+    tmem_s_pipeline_cfg = replace(
+        tmem_s_pipeline_cfg,
+        advance_on_acquire=cfg.is_dynamic_token_sparse,
     )
+
+    # dynamic token sparse has a two-buffer P allocation but no P mbarrier: producer and
+    # consumer select P by logical K-tile parity.  Dense schedules keep the
+    # stock P pipeline.
+    smem_p_pipeline_cfg = None
+    if not cfg.is_dynamic_token_sparse:
+        smem_p_pipeline_cfg = PipelineConfig.create_async_umma_pipeline_cfg(
+            num_stages=cfg.p_mma_stage,
+            producer_group=compute_group_cluster,
+            consumer_group=umma_hw_group,
+            cta_layout_vmnk=cluster_shape_vmnk,
+            consumer_signaling_threads=SignalingThreads.CtaLeader,
+            interleave_stride=(
+                (2, 2, 1, 1) if cfg.use_fp8_dual_softmax_schedule else 1
+            ),
+        )
 
     # TmemCorr: AsyncAsync, 2 stages, Softmax -> Correction
     tmem_corr_pipeline_cfg = PipelineConfig.create_async_async_pipeline_cfg(
@@ -322,7 +620,25 @@ def build_mla_decode_task_manager(
                 producer_signaling_threads=SignalingThreads.CtaLeader,
                 consumer_signaling_threads=SignalingThreads.CtaLeader,
             ),
+            cfg=cfg,
             name="work_throttle",
+        )
+    gather_load_throttle = None
+    if use_gather_load_throttle:
+        # One-stage W12-W15 -> W10 pacing edge.  Keep it separate from WorkId
+        # and out of the work-queue DAG prerequisites: the two pipelines have
+        # different producers, consumers, and state ownership.
+        gather_load_throttle = WorkThrottleBarrierResource(
+            pipeline_config=PipelineConfig.create_async_async_pipeline_cfg(
+                num_stages=1,
+                producer_group=pipeline.CooperativeGroup(Agent.Thread, 128),
+                consumer_group=pipeline.CooperativeGroup(Agent.Thread, 32),
+                cta_layout_vmnk=cluster_shape_vmnk,
+                producer_signaling_threads=SignalingThreads.CtaLeader,
+                consumer_signaling_threads=SignalingThreads.CtaLeader,
+            ),
+            cfg=cfg,
+            name="gather_load_throttle",
         )
 
     # ──────────────────────────────────────────────────────────────
@@ -335,6 +651,17 @@ def build_mla_decode_task_manager(
         pipeline_config=None,
         name="page_offset_window",
     )
+    page_index_ring = None
+    if cfg.is_dynamic_token_sparse:
+        page_index_ring = PageIndexRingResource(
+            page_offsets=page_offsets,
+            cu_seqlens_q=cu_seqlens_q,
+            logical_seq_len_q=logical_seq_len_q,
+            cfg=cfg,
+            smem_page_offsets=smem_page_offsets_arr,
+            pipeline_config=page_index_ring_pipeline_cfg,
+            name="page_index_ring",
+        )
 
     smem_q = SmemQResource(
         smem_q_latent=smem_q_latent_arr,
@@ -355,6 +682,12 @@ def build_mla_decode_task_manager(
             page_offsets=page_offsets,
             tma_desc_c_latent=tma_desc_c_latent,
             tma_desc_c_rope=tma_desc_c_rope,
+            sparse_tma_atom_swa=sparse_tma_atom_k_swa,
+            sparse_tma_atom_compressed=sparse_tma_atom_k_compressed,
+            raw_tma_descriptor_swa=raw_tma_descriptor_swa,
+            raw_tma_descriptor_compressed=raw_tma_descriptor_compressed,
+            smem_page_offsets=smem_page_offsets_arr,
+            cu_seqlens_q=cu_seqlens_q,
             logical_seq_len_q=logical_seq_len_q,
             cfg=cfg,
             pipeline_config=smem_k_pipeline_cfg,
@@ -364,6 +697,15 @@ def build_mla_decode_task_manager(
             smem_v=smem_vc_arr,
             page_offsets=page_offsets,
             tma_desc_c_transpose=tma_desc_c_transpose,
+            # V reuses the K Gather4 map: a [128, 1] box over the [head_dim,
+            # token] view is one H128 transaction, and V issues its second H128
+            # at coord0 + 256.
+            sparse_tma_atom_swa=sparse_tma_atom_k_swa,
+            sparse_tma_atom_compressed=sparse_tma_atom_k_compressed,
+            raw_tma_descriptor_swa=raw_tma_descriptor_swa,
+            raw_tma_descriptor_compressed=raw_tma_descriptor_compressed,
+            smem_page_offsets=smem_page_offsets_arr,
+            cu_seqlens_q=cu_seqlens_q,
             logical_seq_len_q=logical_seq_len_q,
             cfg=cfg,
             pipeline_config=smem_v_pipeline_cfg,
@@ -423,6 +765,9 @@ def build_mla_decode_task_manager(
     gmem_o = GmemOResource(
         cfg=cfg,
         output=output,
+        dsv4_inv_rope_cos_sin_cache=dsv4_inv_rope_cos_sin_cache,
+        dsv4_o_scale=dsv4_o_scale,
+        cache_seqs=cache_seqs,
         partial_output=acc_output,
         lse=lse,
         partial_lse=acc_lse,
@@ -435,6 +780,7 @@ def build_mla_decode_task_manager(
         cu_seqlens_q=cu_seqlens_q,
         logical_num_heads_q=logical_num_heads_q,
         logical_seq_len_q=logical_seq_len_q,
+        stores_lse=cfg.stores_lse,
         name="gmem_o",
     )
 
@@ -446,209 +792,247 @@ def build_mla_decode_task_manager(
     # Keep this explicit for both validation and codegen so the scheduler's
     # register-budget check accounts for the real MLA warpgroup layout.
     wg2_reg_count = cfg.other_reg_num
+    producer_reg_count = cfg.producer_reg_num
+    gather4_reg_count = cfg.gather4_reg_num
 
-    if cfg.use_fp8_split_mma_schedule:
-        load_k_task = create_load_k_task(
-            smem_q,
-            smem_k,
-            work_queue=work_queue,
-            domain=domain,
-            num_registers=wg2_reg_count,
+    if cfg.is_dynamic_token_sparse:
+        task_list, resource_dependency_graph, dma_consumer_release_labels = (
+            _build_token_sparse_tasks(
+                cfg,
+                smem_q=smem_q,
+                smem_k=smem_k,
+                smem_v=smem_v,
+                smem_p=smem_p,
+                tmem_s=tmem_s,
+                tmem_corr=tmem_corr,
+                tmem_o=tmem_o,
+                gmem_o=gmem_o,
+                page_index_ring=page_index_ring,
+                gather_load_throttle=gather_load_throttle,
+                work_queue=work_queue,
+                use_clc_dynamic=use_clc_dynamic,
+                non_interleaved_task_class=non_interleaved_task_class,
+                task_domain=task_domain,
+                producer_reg_count=producer_reg_count,
+                gather4_reg_count=gather4_reg_count,
+            )
         )
-        load_v_task = create_load_v_task(
-            smem_v,
-            work_queue=work_queue,
-            domain=domain,
-            num_registers=wg2_reg_count,
-        )
-        mma_task = None
-        mma_qk_task = create_mma_qk_direct_task(
-            smem_q,
-            smem_k,
-            tmem_s,
-            iterations_qk=cfg.iterations_qk,
-            work_queue=work_queue,
-            domain=domain,
-            num_registers=wg2_reg_count,
-        )
-        mma_pv_task = create_mma_pv_direct_task(
-            smem_v,
-            smem_p,
-            tmem_o,
-            iterations_pv=cfg.iterations_pv_k * cfg.iterations_pv_n,
-            iterations_pv_k=cfg.iterations_pv_k,
-            iterations_pv_n=cfg.iterations_pv_n,
-            per_n_o_pipeline=cfg.use_fp8_split_mma_schedule,
-            work_queue=work_queue,
-            domain=domain,
-            num_registers=wg2_reg_count,
-        )
-        load_tma_task = None
     else:
-        load_k_task = None
-        load_v_task = None
-        load_tma_task = create_load_tma_task(
-            page_offset_window,
-            smem_q,
-            smem_kv,
-            iterations_qk=cfg.iterations_qk_stages,
-            iterations_pv=cfg.iterations_pv_stages,
-            work_queue=work_queue,
-            task_class=non_interleaved_task_class,
-            domain=task_domain,
-            num_registers=wg2_reg_count,
-        )
-        mma_task = create_mma_task(
-            smem_q,
-            smem_kv,
-            smem_p,
-            tmem_s,
-            tmem_o,
-            iterations_qk=cfg.iterations_qk_stages,
-            iterations_pv=cfg.iterations_pv_stages,
-            work_queue=work_queue,
-            work_throttle=work_throttle,
-            task_class=non_interleaved_task_class,
-            domain=task_domain,
-            num_registers=wg2_reg_count,
-        )
-        mma_qk_task = None
-        mma_pv_task = None
+        if cfg.use_fp8_split_mma_schedule:
+            load_k_task = create_load_k_task(
+                smem_q,
+                smem_k,
+                work_queue=work_queue,
+                task_class=non_interleaved_task_class,
+                domain=task_domain,
+                num_registers=wg2_reg_count,
+            )
+            load_v_task = create_load_v_task(
+                smem_v,
+                work_queue=work_queue,
+                task_class=non_interleaved_task_class,
+                domain=task_domain,
+                num_registers=wg2_reg_count,
+                warp_idx=cfg.load_v_warp_id,
+                num_warps=cfg.load_v_num_warps,
+            )
+            mma_task = None
+            mma_qk_task = create_mma_qk_direct_task(
+                smem_q,
+                smem_k,
+                tmem_s,
+                iterations_qk=cfg.iterations_qk,
+                work_queue=work_queue,
+                task_class=non_interleaved_task_class,
+                domain=task_domain,
+                num_registers=wg2_reg_count,
+            )
+            mma_pv_task = create_mma_pv_direct_task(
+                smem_v,
+                smem_p,
+                tmem_o,
+                iterations_pv=cfg.iterations_pv_k * cfg.iterations_pv_n,
+                iterations_pv_k=cfg.iterations_pv_k,
+                iterations_pv_n=cfg.iterations_pv_n,
+                per_n_o_pipeline=cfg.use_fp8_split_mma_schedule,
+                work_queue=work_queue,
+                task_class=non_interleaved_task_class,
+                domain=task_domain,
+                num_registers=wg2_reg_count,
+            )
+            load_tma_task = None
+        else:
+            load_k_task = None
+            load_v_task = None
+            load_tma_task = create_load_tma_task(
+                page_offset_window,
+                smem_q,
+                smem_kv,
+                iterations_qk=cfg.iterations_qk_stages,
+                iterations_pv=cfg.iterations_pv_stages,
+                work_queue=work_queue,
+                task_class=non_interleaved_task_class,
+                domain=task_domain,
+                num_registers=wg2_reg_count,
+            )
+            mma_task = create_mma_task(
+                smem_q,
+                smem_kv,
+                smem_p,
+                tmem_s,
+                tmem_o,
+                iterations_qk=cfg.iterations_qk_stages,
+                iterations_pv=cfg.iterations_pv_stages,
+                work_queue=work_queue,
+                work_throttle=work_throttle,
+                task_class=non_interleaved_task_class,
+                domain=task_domain,
+                num_registers=wg2_reg_count,
+            )
+            mma_qk_task = None
+            mma_pv_task = None
 
-    # Warpgroup 0 (warps 0-3): all 4 warps are in SoftmaxTask,
-    # so setmaxnreg.inc 192 is safe (all warps participate).
-    softmax_task = create_softmax_task(
-        tmem_s,
-        tmem_corr,
-        smem_p,
-        work_queue=work_queue,
-        task_class=(
-            MlaInterleavedTask
-            if cfg.use_fp8_dual_softmax_schedule
-            else non_interleaved_task_class
-        ),
-        domain=(domain if cfg.use_fp8_dual_softmax_schedule else task_domain),
-        domain_start=0,
-        step=2 if cfg.use_fp8_dual_softmax_schedule else 1,
-        num_registers=cfg.softmax_reg_num,
-        softmax_group_id=0,
-    )
-    if cfg.use_fp8_dual_softmax_schedule:
-        second_softmax_task = create_softmax_task(
+        # Warpgroup 0 (warps 0-3): all 4 warps are in SoftmaxTask,
+        # so setmaxnreg.inc 192 is safe (all warps participate).
+        softmax_task = create_softmax_task(
             tmem_s,
             tmem_corr,
             smem_p,
             work_queue=work_queue,
-            task_class=MlaInterleavedTask,
-            domain=domain,
-            domain_start=1,
-            step=2,
+            task_class=(
+                MlaInterleavedTask
+                if cfg.use_fp8_dual_softmax_schedule
+                else non_interleaved_task_class
+            ),
+            domain=(domain if cfg.use_fp8_dual_softmax_schedule else task_domain),
+            domain_start=0,
+            step=2 if cfg.use_fp8_dual_softmax_schedule else 1,
             num_registers=cfg.softmax_reg_num,
-            warp_idx=cfg.second_compute_warp_ids[0],
-            name="SoftmaxOddTask",
-            softmax_group_id=1,
+            softmax_group_id=0,
+            held_s=False,
         )
-    else:
-        second_softmax_task = None
+        if cfg.use_fp8_dual_softmax_schedule:
+            second_softmax_task = create_softmax_task(
+                tmem_s,
+                tmem_corr,
+                smem_p,
+                work_queue=work_queue,
+                task_class=MlaInterleavedTask,
+                domain=domain,
+                domain_start=1,
+                step=2,
+                num_registers=cfg.softmax_reg_num,
+                warp_idx=cfg.second_compute_warp_ids[0],
+                name="SoftmaxOddTask",
+                softmax_group_id=1,
+            )
+        else:
+            second_softmax_task = None
 
-    # Warpgroup 1 (warps 4-7): all 4 warps are in CorrectionTask,
-    # so setmaxnreg.inc 208 is safe (all warps participate).
-    correction_task = create_correction_task(
-        tmem_corr,
-        tmem_o,
-        gmem_o,
-        iterations_pv_n=cfg.iterations_pv_n,
-        per_n_o_pipeline=cfg.use_fp8_split_mma_schedule,
-        work_queue=work_queue,
-        task_class=non_interleaved_task_class,
-        domain=task_domain,
-        num_registers=cfg.correction_reg_num,
-    )
-
-    if cfg.use_fp8_split_mma_schedule:
-        task_list = [
-            load_k_task,
-            load_v_task,
-        ]
-        task_list.extend([mma_qk_task, softmax_task])
-        if second_softmax_task is not None:
-            task_list.append(second_softmax_task)
-        task_list.extend([mma_pv_task, correction_task])
-    else:
-        task_list = [
-            load_tma_task,
-        ]
-        task_list.extend([mma_task, softmax_task, correction_task])
-
-    if not cfg.use_fp8_split_mma_schedule and use_clc_dynamic:
-        padding_task = create_padding_task(
+        # Warpgroup 1 (warps 4-7): all 4 warps are in CorrectionTask,
+        # so setmaxnreg.inc 208 is safe (all warps participate).
+        correction_task = create_correction_task(
+            tmem_corr,
+            tmem_o,
+            gmem_o,
+            iterations_pv_n=cfg.iterations_pv_n,
+            # Keep Correction's O wait/release cardinality coupled to the MMA
+            # producer: dense FP8 publishes one O token per N-slice.
+            per_n_o_pipeline=cfg.use_fp8_split_mma_schedule,
+            split_corr_stats=False,
             work_queue=work_queue,
             task_class=non_interleaved_task_class,
             domain=task_domain,
-            num_registers=wg2_reg_count,
-            warp_idx=10,
+            num_registers=cfg.correction_reg_num,
         )
-        task_list.append(padding_task)
-        scheduler_task = create_scheduler_task(
-            work_queue,
-            work_throttle,
-            task_class=non_interleaved_task_class,
-            num_registers=wg2_reg_count,
-        )
-        task_list.append(scheduler_task)
-    elif not cfg.use_fp8_split_mma_schedule:
-        # BF16 uses only three one-warp producer tasks in warpgroup 2.  Keep an
-        # explicit warp-11 placeholder so register validation sees the complete
-        # four-warp group with the low-register producer budget.
-        padding_task = create_padding_task(
-            work_queue=work_queue,
-            domain=domain,
-            num_registers=wg2_reg_count,
-            warp_idx=10,
-            num_warps=2,
-        )
-        task_list.append(padding_task)
 
-    # ──────────────────────────────────────────────────────────────
-    # Dependency graph
-    # ──────────────────────────────────────────────────────────────
-    if cfg.use_fp8_split_mma_schedule:
-        resource_dependency_graph = {
-            smem_q: [],  # Q loads (independent)
-            smem_k: [],  # K loads read page offsets directly
-            smem_v: [],  # V loads read page offsets directly
-            tmem_s: [smem_k, smem_q],  # QK MMA needs K and Q
-            smem_p: [tmem_s],  # softmax reads S -> writes P
-            tmem_corr: [tmem_s],  # softmax produces correction
-            tmem_o: [smem_p, smem_v],  # PV MMA needs P and V
-            gmem_o: [tmem_o, tmem_corr],  # epilogue needs O + correction
-        }
-        dma_consumer_release_labels = {
-            (smem_k, tmem_s): {"k_desc"},
-            (smem_v, tmem_o): {"v_desc", "v_desc_n_major"},
-        }
-    else:
-        resource_dependency_graph = {
-            page_offset_window: [],  # register-held page-table window
-            smem_q: [],  # Q loads (independent)
-            # Page offsets are cached into registers inside LoadTmaTask before K/V TMA.
-            smem_kv: [],
-            tmem_s: [smem_kv, smem_q],  # QK MMA needs K and Q
-            smem_p: [tmem_s],  # softmax reads S -> writes P
-            tmem_corr: [tmem_s],  # softmax produces correction
-            tmem_o: [smem_p, smem_kv],  # PV MMA needs P and V
-            gmem_o: [tmem_o, tmem_corr],  # epilogue needs O + correction
-        }
-        dma_consumer_release_labels = {
-            (smem_kv, tmem_s): {"k_desc"},
-            (smem_kv, tmem_o): {"v_desc"},
-        }
+        if cfg.use_fp8_split_mma_schedule:
+            task_list = [
+                load_k_task,
+                load_v_task,
+                mma_qk_task,
+                softmax_task,
+            ]
+            if second_softmax_task is not None:
+                task_list.append(second_softmax_task)
+            task_list.append(mma_pv_task)
+            task_list.append(correction_task)
+        else:
+            task_list = [
+                load_tma_task,
+            ]
+            task_list.extend([mma_task, softmax_task, correction_task])
+
+        if not cfg.use_fp8_split_mma_schedule and use_clc_dynamic:
+            padding_task = create_padding_task(
+                work_queue=work_queue,
+                task_class=non_interleaved_task_class,
+                domain=task_domain,
+                num_registers=wg2_reg_count,
+                warp_idx=10,
+            )
+            task_list.append(padding_task)
+            scheduler_task = create_scheduler_task(
+                work_queue,
+                work_throttle,
+                task_class=non_interleaved_task_class,
+                num_registers=wg2_reg_count,
+            )
+            task_list.append(scheduler_task)
+        elif not cfg.use_fp8_split_mma_schedule:
+            # BF16 uses only three one-warp producer tasks in warpgroup 2.  Keep an
+            # explicit warp-11 placeholder so register validation sees the complete
+            # four-warp group with the low-register producer budget.
+            padding_task = create_padding_task(
+                work_queue=work_queue,
+                domain=domain,
+                num_registers=wg2_reg_count,
+                warp_idx=10,
+                num_warps=2,
+            )
+            task_list.append(padding_task)
+
+        # ──────────────────────────────────────────────────────────────
+        # Dependency graph
+        # ──────────────────────────────────────────────────────────────
+        if cfg.use_fp8_split_mma_schedule:
+            resource_dependency_graph = {
+                smem_q: [],  # Q loads (independent)
+                smem_k: [],
+                smem_v: [],
+                tmem_s: [smem_k, smem_q],  # QK MMA needs K and Q
+                smem_p: [tmem_s],  # softmax reads S -> writes P
+                tmem_corr: [tmem_s],  # softmax produces correction
+                tmem_o: [smem_p, smem_v],  # PV MMA needs P and V
+                gmem_o: [tmem_o, tmem_corr],  # epilogue needs O + correction
+            }
+            dma_consumer_release_labels = {
+                (smem_k, tmem_s): {"k_desc"},
+                (smem_v, tmem_o): {"v_desc", "v_desc_n_major"},
+            }
+        else:
+            resource_dependency_graph = {
+                page_offset_window: [],  # register-held page-table window
+                smem_q: [],  # Q loads (independent)
+                # Page offsets are cached into registers inside LoadTmaTask before K/V TMA.
+                smem_kv: [],
+                tmem_s: [smem_kv, smem_q],  # QK MMA needs K and Q
+                smem_p: [tmem_s],  # softmax reads S -> writes P
+                tmem_corr: [tmem_s],  # softmax produces correction
+                tmem_o: [smem_p, smem_kv],  # PV MMA needs P and V
+                gmem_o: [tmem_o, tmem_corr],  # epilogue needs O + correction
+            }
+            dma_consumer_release_labels = {
+                (smem_kv, tmem_s): {"k_desc"},
+                (smem_kv, tmem_o): {"v_desc"},
+            }
     if work_queue is not None:
         if use_clc_dynamic:
             for resource, dependencies in tuple(resource_dependency_graph.items()):
                 if (
                     resource is not work_queue
                     and resource is not page_offset_window
+                    and resource is not gather_load_throttle
                     and work_queue not in dependencies
                 ):
                     dependencies.append(work_queue)
@@ -722,6 +1106,12 @@ class MlaDecodeTs:
         seq_len_q=1,
         batch_size=1,
         mask_type: MaskType | str = MaskType.CAUSAL,
+        is_dynamic_token_sparse=False,
+        sparse_swa_topk=128,
+        enable_skip_correction=False,
+        dsv4_fuses_inv_rope_fp8_quant=False,
+        dsv4_uses_ue8m0_scale_o=False,
+        stores_lse=True,
     ):
         """
         Parameters
@@ -809,6 +1199,21 @@ class MlaDecodeTs:
         )
         self.num_q_tiles = self.query_tile_layout.num_tiles
         self.tail_q_rows = self.query_tile_layout.tail_rows
+        self.is_dynamic_token_sparse = is_dynamic_token_sparse
+        self.sparse_swa_topk = sparse_swa_topk
+        self.enable_skip_correction = enable_skip_correction
+        self.dsv4_fuses_inv_rope_fp8_quant = dsv4_fuses_inv_rope_fp8_quant
+        self.dsv4_uses_ue8m0_scale_o = dsv4_uses_ue8m0_scale_o
+        self.stores_lse = stores_lse
+        if self.is_dynamic_token_sparse:
+            if self.num_heads != 128:
+                raise NotImplementedError(
+                    "dynamic-token-sparse MLA currently requires num_heads=128"
+                )
+            if self.mma_qk_tiler_mn[0] != 128:
+                raise NotImplementedError(
+                    "dynamic-token-sparse MLA requires one query token per M128 work tile"
+                )
         self.parallel_reduction_topology: ParallelReductionTopology | None = None
         self.use_parallel_reduction = False
         self._parallel_reduction_shape_is_eligible = (
@@ -821,6 +1226,36 @@ class MlaDecodeTs:
             and not is_persistent
         )
         self._configure_parallel_reduction_topology()
+
+    def _make_decode_config(self):
+        """Build the single canonical config used by host and device lowering.
+
+        Keep every static dynamic token sparse specialization here.  Both ``__call__`` and
+        ``split_kv_kernel`` execute this helper during CUTE compilation; a new
+        field therefore cannot silently reach descriptor construction while
+        being omitted from the actual device task graph.
+        """
+
+        cfg = make_mla_decode_config(
+            mma_qk_tiler_mn=self.mma_qk_tiler_mn,
+            mma_pv_tiler_mn=self.mma_pv_tiler_mn,
+            rope_dim=self.rope_dim,
+            page_size=self.page_size,
+            qkv_dtype=self.qkv_dtype,
+            o_dtype=self.out_dtype,
+            max_active_clusters=self.max_active_clusters,
+            is_persistent=self.is_persistent,
+            is_var_seq=self.is_var_seq,
+            is_var_split_kv=self.is_var_split_kv,
+            mask_type=self.mask_type,
+            is_dynamic_token_sparse=self.is_dynamic_token_sparse,
+            sparse_swa_topk=self.sparse_swa_topk,
+            enable_skip_correction=self.enable_skip_correction,
+            dsv4_fuses_inv_rope_fp8_quant=(self.dsv4_fuses_inv_rope_fp8_quant),
+            dsv4_uses_ue8m0_scale_o=self.dsv4_uses_ue8m0_scale_o,
+            stores_lse=self.stores_lse,
+        )
+        return cfg
 
     def _effective_reduction_shape(self) -> tuple[int, int]:
         """Return physical row/tile extents used by the split workspace."""
@@ -848,6 +1283,7 @@ class MlaDecodeTs:
             self.num_heads,
             self.seq_len_q,
             self.mask_type,
+            self.enable_skip_correction,
             self.reduction_split_capacity,
             self.query_tile_layout,
             self.num_q_tiles,
@@ -926,30 +1362,43 @@ class MlaDecodeTs:
         o: cute.Tensor,
         lse: cute.Tensor,
         workspace: cute.Tensor,
+        raw_tma_descriptor_pair: cute.Tensor | None,
         split_kv: cutlass.Int32,
         cache_seqs: cute.Tensor,
+        sparse_topk_lens: cute.Tensor | None,
         cu_seqlens_q: cute.Tensor | None,
         block_split_kvs: cute.Tensor,
         softmax_scale: cutlass.Float32,
         output_scale: cutlass.Float32,
+        swa_cache: cute.Tensor | None,
+        runtime_max_seq_len_q: cutlass.Int32,
+        skip_corr_threshold: cutlass.Float32,
+        dsv4_inv_rope_cos_sin_cache: cute.Tensor | None,
+        dsv4_o_scale: cute.Tensor | None,
         stream: object,
     ):
         """Execute the MLA decode TS kernel."""
-        cfg = make_mla_decode_config(
-            mma_qk_tiler_mn=self.mma_qk_tiler_mn,
-            mma_pv_tiler_mn=self.mma_pv_tiler_mn,
-            rope_dim=self.rope_dim,
-            page_size=self.page_size,
-            qkv_dtype=self.qkv_dtype,
-            o_dtype=self.out_dtype,
-            max_active_clusters=self.max_active_clusters,
-            is_persistent=self.is_persistent,
-            is_var_seq=self.is_var_seq,
-            is_var_split_kv=self.is_var_split_kv,
-            mask_type=self.mask_type,
-        )
+        cfg = self._make_decode_config()
+        if cutlass.const_expr(cfg.is_dynamic_token_sparse):
+            if cutlass.const_expr(sparse_topk_lens is None):
+                raise ValueError("dynamic-token sparse MLA requires sparse_topk_lens")
+        if cutlass.const_expr(cfg.dsv4_fuses_inv_rope_fp8_quant):
+            if cutlass.const_expr(
+                dsv4_inv_rope_cos_sin_cache is None or dsv4_o_scale is None
+            ):
+                raise ValueError(
+                    "DSV4 inverse-RoPE FP8 quant fusion requires cos/sin and scale tensors"
+                )
         physical_tile_rows = self.mma_qk_tiler_mn[0]
-        num_query_tiles = self.num_q_tiles
+        if cutlass.const_expr(cfg.is_dynamic_token_sparse):
+            # dynamic token sparse H128/M128 assigns one query token to each runtime tile.
+            runtime_assert(
+                runtime_max_seq_len_q > Int32(0),
+                "runtime_max_seq_len_q must be positive",
+            )
+            num_query_tiles = Int32(runtime_max_seq_len_q)
+        else:
+            num_query_tiles = self.num_q_tiles
         # Fixed public tensors retain [H,D,SQ,B]/[H,SQ,B]; variable-Q tensors
         # compact batches into [H,D,totalQ]/[H,totalQ]. The scheduler/workspace
         # use physical flat-query tile coordinates, while resources map
@@ -975,23 +1424,59 @@ class MlaDecodeTs:
             q_rope.stride[2] == q_rope.shape[0] * q_rope.stride[0],
             "q_rope must be compact across the head and query dimensions",
         )
-        runtime_assert(
-            o.stride[1] == 1,
-            "o must have a contiguous dimension axis",
-        )
-        runtime_assert(
-            o.stride[0] == o.shape[1] * o.stride[1],
-            "o must be compact from the dimension axis into the head axis",
-        )
-        runtime_assert(
-            o.stride[2] == o.shape[0] * o.stride[0],
-            "o must be compact from the head axis into the query axis",
-        )
-        if cutlass.const_expr(cu_seqlens_q is None):
+        if cutlass.const_expr(cfg.dsv4_fuses_inv_rope_fp8_quant):
             runtime_assert(
-                o.stride[3] == o.shape[2] * o.stride[2],
-                "o must be compact from the query axis into the batch axis",
+                o.stride[0] == 1,
+                "dynamic token sparse physical FP8 O must be flat/compact",
             )
+            runtime_assert(
+                cute.size(o)
+                == q_latent.shape[2] * Int32(self.num_heads * cfg.latent_dim),
+                "dynamic token sparse physical FP8 O must contain T*128*512 elements",
+            )
+            runtime_assert(
+                dsv4_o_scale.stride[0] == 1,
+                "dynamic token sparse output scale must be flat/compact",
+            )
+            # FP32 scales hold 16 groups x 32 (head, D128 block) rows; packed
+            # UE8M0 words hold 16 groups x 8 heads, one word per token.
+            scale_words_per_token = Int32(
+                16 * 8 if cfg.dsv4_uses_ue8m0_scale_o else 16 * 32
+            )
+            runtime_assert(
+                cute.size(dsv4_o_scale) % scale_words_per_token == Int32(0),
+                "dynamic token sparse output scale extent must be divisible by 16*32 (FP32) "
+                "or 16*8 (UE8M0)",
+            )
+            scale_buf_m = cute.size(dsv4_o_scale) // scale_words_per_token
+            runtime_assert(
+                (scale_buf_m >= q_latent.shape[2])
+                & (scale_buf_m < q_latent.shape[2] + Int32(4)),
+                "dynamic token sparse output scale M must be pad4(T)",
+            )
+            runtime_assert(
+                (dsv4_inv_rope_cos_sin_cache.stride[0] == 1)
+                & (cute.size(dsv4_inv_rope_cos_sin_cache) % Int32(64) == Int32(0)),
+                "DSV4 inverse-RoPE cos/sin cache must be flat rows of 64 FP32 values",
+            )
+        else:
+            runtime_assert(
+                o.stride[1] == 1,
+                "o must have a contiguous dimension axis",
+            )
+            runtime_assert(
+                o.stride[0] == o.shape[1] * o.stride[1],
+                "o must be compact from the dimension axis into the head axis",
+            )
+            runtime_assert(
+                o.stride[2] == o.shape[0] * o.stride[0],
+                "o must be compact from the head axis into the query axis",
+            )
+            if cutlass.const_expr(cu_seqlens_q is None):
+                runtime_assert(
+                    o.stride[3] == o.shape[2] * o.stride[2],
+                    "o must be compact from the query axis into the batch axis",
+                )
         runtime_assert(
             lse.stride[0] == 1,
             "lse must have a contiguous head axis",
@@ -1127,6 +1612,90 @@ class MlaDecodeTs:
             l2_promotion=cuda.TensorMapL2Promotion.l2_128b,
         )
 
+        sparse_tma_atom_k_swa = None
+        sparse_tma_atom_k_compressed = None
+        sparse_k_swa = None
+        sparse_k_compressed = None
+        sparse_coord_k = None
+        sparse_k_smem_layout = None
+        if cutlass.const_expr(cfg.is_dynamic_token_sparse):
+            if cutlass.const_expr(swa_cache is None):
+                raise ValueError("dynamic-token sparse MLA requires swa_cache")
+
+            sparse_qk_mma = sm100_utils.make_trivial_tiled_mma(
+                qkv_dtype(cfg),
+                qkv_dtype(cfg),
+                OperandMajorMode.K,
+                OperandMajorMode.K,
+                self.acc_dtype,
+                tcgen05.CtaGroup.TWO,
+                cfg.mma_qk_tiler[:2],
+            )
+
+            # Gather4 coordinates are ``[head_dim, page0, ..., page3]``, so both
+            # K and V tensor maps must expose head_dim as dimension zero.  A
+            # ``(token, D)`` K map would still receive 0/128/256/384 as coord 0,
+            # address outside a small token pool, and leave the completion
+            # mbarrier unresolved.
+            sparse_k_compressed = cute.make_tensor(
+                c_latent.iterator,
+                cute.make_layout(
+                    (c_latent.shape[1], c_latent.shape[2]),
+                    stride=(c_latent.stride[1], c_latent.stride[2]),
+                ),
+            )
+            sparse_k_swa = cute.make_tensor(
+                swa_cache.iterator,
+                cute.make_layout(
+                    (swa_cache.shape[1], swa_cache.shape[2]),
+                    stride=(swa_cache.stride[1], swa_cache.stride[2]),
+                ),
+            )
+            sparse_coord_count = page_offsets.shape[0] * page_offsets.shape[1]
+            sparse_coord_k = cute.make_tensor(
+                page_offsets.iterator,
+                cute.make_layout((cfg.latent_dim, sparse_coord_count), stride=(0, 1)),
+            )
+
+            k_smem_layout_base = sm100_utils.make_smem_layout(
+                OperandMajorMode.K,
+                (
+                    cfg.mma_qk_tiler[1] // sparse_qk_mma.thr_id.shape,
+                    cfg.mma_qk_tiler[2],
+                ),
+                qkv_dtype(cfg),
+                cfg.iterations_qk_latent * cfg.load_k_stage,
+            )
+            sparse_k_smem_layout = cute.tiled_divide(
+                k_smem_layout_base,
+                (
+                    cfg.mma_qk_tiler[1] // sparse_qk_mma.thr_id.shape,
+                    cfg.mma_qk_tiler[2],
+                ),
+            )
+            sparse_k_smem_layout = cute.logical_divide(
+                sparse_k_smem_layout,
+                (None, None, None, cfg.iterations_qk_latent),
+            )
+
+            sparse_tma_atom_k_swa, sparse_k_swa = make_gather4_2sm_tma_atom(
+                sparse_k_swa,
+                cute.select(sparse_k_smem_layout, mode=[0]),
+                (cfg.mma_qk_tiler[1], cfg.mma_qk_tiler[2]),
+                sparse_qk_mma,
+                sparse_coord_k,
+            )
+            (
+                sparse_tma_atom_k_compressed,
+                sparse_k_compressed,
+            ) = make_gather4_2sm_tma_atom(
+                sparse_k_compressed,
+                cute.select(sparse_k_smem_layout, mode=[0]),
+                (cfg.mma_qk_tiler[1], cfg.mma_qk_tiler[2]),
+                sparse_qk_mma,
+                sparse_coord_k,
+            )
+
         softmax_scale_log2 = softmax_scale * LOG2_E
 
         kernel_split_kv = (
@@ -1143,7 +1712,11 @@ class MlaDecodeTs:
             cfg.cluster_shape_mnk,
             kernel_split_kv,
         )
-        use_clc_dynamic = self.is_persistent and not cfg.is_fp8_qkv()
+        # Persistent dynamic token sparse uses a tiled CLC launch: W10 owns the one-stage
+        # WorkId response and W12-W15 use the separate throttle edge.
+        use_clc_dynamic = self.is_persistent and (
+            cfg.is_dynamic_token_sparse or not cfg.is_fp8_qkv()
+        )
         clc_tile_sched_params = None
         if cutlass.const_expr(use_clc_dynamic):
             # Keep the physical query-tile dimension in grid X and flatten
@@ -1187,16 +1760,23 @@ class MlaDecodeTs:
             c_latent,
             c_rope,
             page_offsets,
+            sparse_tma_atom_k_swa,
+            sparse_tma_atom_k_compressed,
             o,
             lse,
+            raw_tma_descriptor_pair,
             acc_o,
             acc_lse,
             kernel_split_kv,
             cache_seqs,
+            sparse_topk_lens,
             cu_seqlens_q,
             block_split_kvs,
             softmax_scale_log2,
             output_scale,
+            skip_corr_threshold,
+            dsv4_inv_rope_cos_sin_cache,
+            dsv4_o_scale,
             tile_sched_params,
             clc_tile_sched_params,
         ).launch(
@@ -1273,35 +1853,38 @@ class MlaDecodeTs:
         c_latent: cute.Tensor,
         c_rope: cute.Tensor,
         page_offsets: cute.Tensor,
+        sparse_tma_atom_k_swa: cute.CopyAtom | None,
+        sparse_tma_atom_k_compressed: cute.CopyAtom | None,
         o: cute.Tensor,
         lse: cute.Tensor,
+        raw_tma_descriptor_pair: cute.Tensor,
         acc_o: cute.Tensor,
         acc_lse: cute.Tensor,
         split_kv: cutlass.Int32,
         cache_seqs: cute.Tensor,
+        sparse_topk_lens: cute.Tensor | None,
         cu_seqlens_q: cute.Tensor | None,
         block_split_kvs: cute.Tensor,
         softmax_scale_log2: cutlass.Float32,
         output_scale: cutlass.Float32,
+        skip_corr_threshold: cutlass.Float32,
+        dsv4_inv_rope_cos_sin_cache: cute.Tensor | None,
+        dsv4_o_scale: cute.Tensor | None,
         tile_sched_params: MLAStaticTileSchedulerParams,
         clc_tile_sched_params: object,
     ) -> None:
         """MLA decode TS kernel: persistent tile-scheduled execution."""
-        cfg = make_mla_decode_config(
-            mma_qk_tiler_mn=self.mma_qk_tiler_mn,
-            mma_pv_tiler_mn=self.mma_pv_tiler_mn,
-            rope_dim=self.rope_dim,
-            page_size=self.page_size,
-            qkv_dtype=self.qkv_dtype,
-            o_dtype=self.out_dtype,
-            max_active_clusters=self.max_active_clusters,
-            is_persistent=self.is_persistent,
-            is_var_seq=self.is_var_seq,
-            is_var_split_kv=self.is_var_split_kv,
-            mask_type=self.mask_type,
+        cfg = self._make_decode_config()
+        # ``__call__`` has already encoded the launch's effective runtime
+        # B/S extents in tile_sched_params.  Keeping the static overrides
+        # unset here leaves the sparse kernel's packed B/maxQ out of the JIT key while
+        # preserving the dense MLA specialization.
+        static_problem_shape_s = (
+            None if cfg.is_dynamic_token_sparse else self.num_q_tiles
         )
-        num_query_tiles = self.num_q_tiles
-        use_clc_dynamic = self.is_persistent and not cfg.is_fp8_qkv()
+        use_clc_dynamic = self.is_persistent and (
+            cfg.is_dynamic_token_sparse or not cfg.is_fp8_qkv()
+        )
         tiled_mma_qk = None
         if cutlass.const_expr(cfg.is_fp8_qkv()):
             tiled_mma_qk = sm100_utils.make_trivial_tiled_mma(
@@ -1320,13 +1903,27 @@ class MlaDecodeTs:
 
         mma_tile_coord_v = cluster_idx % 2
 
-        # Prefetch TMA descriptors on MMA warp
+        # Prefetch TMA descriptors from one elected lane of the MMA warp.  dynamic token sparse
+        # touches Q plus the two raw Gather4 descriptors; K and V share each
+        # pool's [H128, page-slot=1] map and differ only in coord0.
         if warp_idx == cfg.mma_warp_id:
-            prims.prefetch_tensormap(tma_desc_q_latent.get_ptr())
-            prims.prefetch_tensormap(tma_desc_q_rope.get_ptr())
-            prims.prefetch_tensormap(tma_desc_c_latent.get_ptr())
-            prims.prefetch_tensormap(tma_desc_c_rope.get_ptr())
-            prims.prefetch_tensormap(tma_desc_c_transpose.get_ptr())
+            if cutlass.const_expr(cfg.is_dynamic_token_sparse):
+                if prims.elect_sync():
+                    prims.prefetch_tensormap(tma_desc_q_latent.get_ptr())
+                    prims.prefetch_tensormap(
+                        _gmem_pointer_to_generic(raw_tma_descriptor_pair.iterator)
+                    )
+                    prims.prefetch_tensormap(
+                        _gmem_pointer_to_generic(
+                            raw_tma_descriptor_pair.iterator + Int64(128)
+                        )
+                    )
+            else:
+                prims.prefetch_tensormap(tma_desc_q_latent.get_ptr())
+                prims.prefetch_tensormap(tma_desc_q_rope.get_ptr())
+                prims.prefetch_tensormap(tma_desc_c_latent.get_ptr())
+                prims.prefetch_tensormap(tma_desc_c_rope.get_ptr())
+                prims.prefetch_tensormap(tma_desc_c_transpose.get_ptr())
 
         # Allocate SMEM
         qkv_element_dtype = qkv_dtype(cfg)
@@ -1336,12 +1933,18 @@ class MlaDecodeTs:
             space=cutlass.AddressSpace.smem,
             alignment=1024,
         )
-        smem_q_rope_arr = cutlass.Array(
-            qkv_element_dtype,
-            max(1, cfg.smem_q_rope_elems),
-            space=cutlass.AddressSpace.smem,
-            alignment=1024,
-        )
+        # DSV4 stores a pre-rotated H512 Q vector and has no RoPE operand.
+        # Alias Q latent instead of a one-element placeholder, whose 1024-byte
+        # alignment would shift every later SMEM object by a KiB; every RoPE
+        # loop is compile-time empty when rope_dim == 0.
+        smem_q_rope_arr = smem_q_latent_arr
+        if cutlass.const_expr(cfg.smem_q_rope_elems > 0):
+            smem_q_rope_arr = cutlass.Array(
+                qkv_element_dtype,
+                cfg.smem_q_rope_elems,
+                space=cutlass.AddressSpace.smem,
+                alignment=1024,
+            )
         smem_kc_arr = cutlass.Array(
             qkv_element_dtype,
             cfg.smem_kc_elems,
@@ -1362,6 +1965,17 @@ class MlaDecodeTs:
             space=cutlass.AddressSpace.smem,
             alignment=1024,
         )
+        smem_page_offsets_arr = None
+        if cutlass.const_expr(cfg.is_dynamic_token_sparse):
+            # W9's CTA-private, 128-byte aligned six-stage ``int32[256]``
+            # cp.async ring lives outside the K/V buffers so its lifetime and
+            # mbarriers remain an independent DAG edge.
+            smem_page_offsets_arr = cutlass.Array(
+                Int32,
+                cfg.page_index_ring_stages * cfg.page_index_ring_entries_per_stage,
+                space=cutlass.AddressSpace.smem,
+                alignment=128,
+            )
         softmax_exchange_arr = cutlass.Array(
             self.acc_dtype,
             cfg.softmax_exchange_elems,
@@ -1382,12 +1996,14 @@ class MlaDecodeTs:
         )
         clc_response_ptr = None
         if cutlass.const_expr(use_clc_dynamic):
-            # Keep both response stages in the ordinary dynamic-SMEM arena.
-            # ``alloc_smem`` creates a separately rounded static section, which
-            # needlessly exceeds this kernel's near-capacity SMEM budget.
+            # dynamic token sparse uses a one-stage WorkId pipeline, hence a single 16-byte
+            # CLC response; the other persistent MLA schedules keep the
+            # two-stage response ring.  No fast-drain/try_cancel storage is
+            # needed because this kernel never executes those paths.
+            clc_response_stages = 1 if cfg.is_dynamic_token_sparse else 2
             clc_response_arr = cutlass.Array(
                 cutlass.Int128,
-                2,
+                clc_response_stages,
                 space=cutlass.AddressSpace.smem,
                 alignment=16,
             )
@@ -1402,7 +2018,9 @@ class MlaDecodeTs:
             if prims.elect_sync():
                 prims.mbarrier_init(tmem_dealloc_mbar_arr, TMEM_DEALLOC_MBAR_THREADS)
 
-        # setmaxnreg.dec: ALL warps in warpgroup 2 (warps 8-11)
+        # Release the producer warpgroup register allocation before the
+        # high-register softmax/correction groups execute their task-local
+        # setmaxnreg.inc instructions.
         if warp_idx >= 8:
             prims.setmaxregister(cfg.other_reg_num, prims.SetMaxRegisterAction.DECREASE)
 
@@ -1431,7 +2049,7 @@ class MlaDecodeTs:
             cluster_idx = current_work_linear_idx % Int32(cfg.cluster_shape_mnk[0])
             current_work_after_seq_q, seq_q_idx = divmod_constexpr_power_of_two_or_fdd(
                 current_work_cluster_batch,
-                num_query_tiles,
+                static_problem_shape_s,
                 tile_sched_params.problem_shape_s_fdd,
             )
             current_work_after_batch, batch_idx = divmod_constexpr_power_of_two_or_fdd(
@@ -1457,6 +2075,7 @@ class MlaDecodeTs:
         fixed_nonempty_single_split = (
             not self.is_var_seq
             and not self.is_var_split_kv
+            and not self.is_dynamic_token_sparse
             and self.static_split_kv == 1
             and cu_seqlens_q is None
         )
@@ -1482,7 +2101,14 @@ class MlaDecodeTs:
             if cutlass.const_expr(self.static_seq_len_k is not None):
                 K = Int32(self.static_seq_len_k)
             else:
-                K = cache_seqs[tile_batch_idx]
+                metadata_row = routing_row_index(
+                    cfg, blk_coord, self.seq_len_q, cu_seqlens_q
+                )
+                K = (
+                    sparse_topk_lens[metadata_row]
+                    if cutlass.const_expr(cfg.is_dynamic_token_sparse)
+                    else cache_seqs[metadata_row]
+                )
 
             _, q_len = query_batch_bounds(
                 cu_seqlens_q,
@@ -1498,7 +2124,9 @@ class MlaDecodeTs:
                 tile_batch_idx,
             )
             if cutlass.const_expr(
-                cfg.mask_type == MaskType.CAUSAL.value and self.seq_len_q > 1
+                cfg.mask_type == MaskType.CAUSAL.value
+                and not cfg.is_dynamic_token_sparse
+                and self.seq_len_q > 1
             ):
                 _, _, logical_q_idx, _, _ = flat_query_row_state(
                     Int32(self.mma_qk_tiler_mn[0] - 1),
@@ -1561,6 +2189,8 @@ class MlaDecodeTs:
                 participates_in_tmem_sync = participates_in_tmem_sync or (
                     warp_idx == cfg.pv_mma_warp_id
                 )
+            if cutlass.const_expr(cfg.is_dynamic_token_sparse):
+                participates_in_tmem_sync = True
             if cutlass.const_expr(cfg.use_fp8_dual_softmax_schedule):
                 participates_in_tmem_sync = participates_in_tmem_sync or (
                     warp_idx >= cfg.second_compute_warp_ids[0]
@@ -1588,16 +2218,22 @@ class MlaDecodeTs:
             if cutlass.const_expr(use_clc_dynamic):
                 work_queue_pipeline_config = (
                     PipelineConfig.create_clc_fetch_async_pipeline_cfg(
-                        num_stages=2,
+                        # dynamic token sparse uses a one-stage WorkId pipeline.
+                        num_stages=(1 if cfg.is_dynamic_token_sparse else 2),
                         num_bytes=16,
                         producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
                         consumer_group=pipeline.CooperativeGroup(
                             pipeline.Agent.Thread,
-                            # CTA1 omits both the leader-only MMA warp and the
-                            # leader-only scheduler warp. Exclude both from the
-                            # cluster-wide empty-barrier arrival count.
-                            cfg.threads_per_cta * cfg.num_mma_ctas
-                            - 2 * cfg.threads_per_warp,
+                            # CTA1 omits the leader-only MMA warp and the
+                            # leader-only scheduler warp. Exclude them from the
+                            # cluster-wide empty-barrier arrival count.  Both CLC
+                            # schedules (BF16 and dynamic token sparse, which
+                            # fuses QK/PV into W8) have exactly two such warps;
+                            # dense FP8 never uses CLC.
+                            (
+                                cfg.threads_per_cta * cfg.num_mma_ctas
+                                - 2 * cfg.threads_per_warp
+                            ),
                         ),
                         cta_layout_vmnk=(cfg.num_mma_ctas, 1, 1, 1),
                         producer_signaling_threads=SignalingThreads.CtaLeader,
@@ -1612,6 +2248,7 @@ class MlaDecodeTs:
             mla_work_queue = MlaWorkQueue(
                 tile_sched_params=tile_sched_params,
                 cache_seqs=cache_seqs,
+                sparse_topk_lens=sparse_topk_lens,
                 split_kv=max_split_kv,
                 block_split_kvs=block_split_kvs,
                 is_var_split_kv=self.is_var_split_kv,
@@ -1622,7 +2259,7 @@ class MlaDecodeTs:
                 logical_num_heads_q=self.num_heads,
                 logical_seq_len_q=self.seq_len_q,
                 static_problem_shape_b=None,
-                static_problem_shape_s=num_query_tiles,
+                static_problem_shape_s=static_problem_shape_s,
                 use_clc_dynamic=use_clc_dynamic,
                 tile_scheduler_config=work_queue_tile_scheduler_config,
                 pipeline_config=work_queue_pipeline_config,
@@ -1636,21 +2273,42 @@ class MlaDecodeTs:
                 smem_kc_arr=smem_kc_arr,
                 smem_vc_arr=smem_vc_arr,
                 smem_p_arr=smem_p_arr,
+                smem_page_offsets_arr=smem_page_offsets_arr,
                 tma_desc_q_latent=tma_desc_q_latent.get_ptr(),
                 tma_desc_q_rope=tma_desc_q_rope.get_ptr(),
                 tma_desc_c_latent=tma_desc_c_latent.get_ptr(),
                 tma_desc_c_rope=tma_desc_c_rope.get_ptr(),
                 tma_desc_c_transpose=tma_desc_c_transpose.get_ptr(),
+                sparse_tma_atom_k_swa=sparse_tma_atom_k_swa,
+                sparse_tma_atom_k_compressed=sparse_tma_atom_k_compressed,
+                # The raw tensor-map pair is deliberately independent of
+                # split-KV workspace.  Static split=1 has no scratch storage;
+                # aliasing a 256-B descriptor as that workspace makes the
+                # partial-O/LSE views write through the descriptor on a later
+                # launch.  It is present only for dynamic sparse dynamic token sparse.
+                raw_tma_descriptor_swa=(
+                    raw_tma_descriptor_pair.iterator
+                    if cutlass.const_expr(cfg.is_dynamic_token_sparse)
+                    else None
+                ),
+                raw_tma_descriptor_compressed=(
+                    raw_tma_descriptor_pair.iterator + Int64(128)
+                    if cutlass.const_expr(cfg.is_dynamic_token_sparse)
+                    else None
+                ),
                 page_offsets=page_offsets,
                 blk_coord=blk_coord,
                 tidx=tidx,
                 output=o,
+                dsv4_inv_rope_cos_sin_cache=dsv4_inv_rope_cos_sin_cache,
+                dsv4_o_scale=dsv4_o_scale,
                 acc_output=acc_o,
                 lse=lse,
                 acc_lse=acc_lse,
                 domain=Int32(1),  # dummy; MlaTask recomputes per-task to avoid spills
                 work_queue=mla_work_queue,
                 cache_seqs=cache_seqs,
+                sparse_topk_lens=sparse_topk_lens,
                 cu_seqlens_q=cu_seqlens_q,
                 split_kv=max_split_kv,
                 logical_num_heads_q=self.num_heads,
@@ -1658,8 +2316,14 @@ class MlaDecodeTs:
                 tiled_mma_qk=tiled_mma_qk,
             )
 
-            # Initialize pipelines (creates mbarriers in SMEM)
+            # Initialize pipelines (creates mbarriers in SMEM).  With deferred
+            # init every active resource is first bound to one contiguous
+            # mbarrier block so the constructors emit no local init CFGs.
+            if cutlass.const_expr(cfg.uses_deferred_mbarrier_init):
+                prepare_deferred_mbarriers(task_manager)
             task_manager.setup_resources_and_tasks()
+            if cutlass.const_expr(cfg.uses_deferred_mbarrier_init):
+                initialize_deferred_mbarriers(task_manager)
 
             # Fence mbarrier init then cluster sync so both CTAs see
             # initialized barriers before tcgen05_alloc.  The alloc with
@@ -1687,6 +2351,8 @@ class MlaDecodeTs:
                 participates_in_tmem_sync = participates_in_tmem_sync or (
                     warp_idx == cfg.pv_mma_warp_id
                 )
+            if cutlass.const_expr(cfg.is_dynamic_token_sparse):
+                participates_in_tmem_sync = True
             if cutlass.const_expr(cfg.use_fp8_dual_softmax_schedule):
                 participates_in_tmem_sync = participates_in_tmem_sync or (
                     warp_idx >= cfg.second_compute_warp_ids[0]
@@ -1711,15 +2377,39 @@ class MlaDecodeTs:
 
             # Set runtime params on TmemS (softmax)
             named_res["tmem_s"].softmax_scale_log2 = softmax_scale_log2
+            named_res["tmem_s"].adjusted_skip_corr_threshold = (
+                skip_corr_threshold / softmax_scale_log2
+                if cutlass.const_expr(cfg.enable_skip_correction)
+                else cutlass.Float32(0)
+            )
+            # E4M3 P: log2(1.75) with skip correction (1.75 * 2^8 == 448) and
+            # log2(448) without.  BF16 P is never scaled, so its log2 scale is 0.
+            if cutlass.const_expr(cfg.is_fp8_qkv()):
+                named_res["tmem_s"].log2_softmax_p_scale = (
+                    cutlass.Float32(0.80735493)
+                    if cutlass.const_expr(cfg.enable_skip_correction)
+                    else cutlass.Float32(8.8073549)
+                )
+            else:
+                named_res["tmem_s"].log2_softmax_p_scale = cutlass.Float32(0)
             named_res["tmem_s"].smem_exchange = softmax_exchange_arr
 
             named_res[
                 "tmem_corr"
             ].smem_exchange = epilogue_exchange_arr.data_ptr().toint(Int32)
+            named_res["tmem_corr"].softmax_scale_log2 = softmax_scale_log2
 
             # Set runtime params on GmemO (epilogue)
             named_res["gmem_o"].output_scale = output_scale
             named_res["gmem_o"].softmax_scale_log2 = softmax_scale_log2
+            if cutlass.const_expr(cfg.is_fp8_qkv()):
+                named_res["gmem_o"].softmax_p_scale_rcp = (
+                    cutlass.Float32(1.0 / 1.75)
+                    if cutlass.const_expr(cfg.enable_skip_correction)
+                    else cutlass.Float32(1.0 / 448.0)
+                )
+            else:
+                named_res["gmem_o"].softmax_p_scale_rcp = cutlass.Float32(1.0)
             named_res["gmem_o"].smem_exchange = epilogue_exchange_arr.data_ptr().toint(
                 Int32
             )
@@ -1727,7 +2417,8 @@ class MlaDecodeTs:
 
             task_manager.run()
 
-        # TMEM deallocation (MMA warp)
+        # TMEM deallocation waits for TmemO's producer tail and then uses
+        # the MMA warp in each CTA for a symmetric cluster join.
         if warp_idx == cfg.mma_warp_id:
             cta_rank = cute.arch.make_warp_uniform(mma_tile_coord_v)
             peer_cta_rank = cta_rank ^ 1
@@ -1810,6 +2501,8 @@ class MlaDecodeTs:
             qkv_dtype=self.qkv_dtype,
             o_dtype=self.out_dtype,
             mask_type=self.mask_type,
+            is_dynamic_token_sparse=self.is_dynamic_token_sparse,
+            sparse_swa_topk=self.sparse_swa_topk,
         )
         if cutlass.const_expr(not self.is_persistent):
             prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
@@ -1850,6 +2543,8 @@ class MlaDecodeTs:
             qkv_dtype=self.qkv_dtype,
             o_dtype=self.out_dtype,
             mask_type=self.mask_type,
+            is_dynamic_token_sparse=self.is_dynamic_token_sparse,
+            sparse_swa_topk=self.sparse_swa_topk,
         )
         if cutlass.const_expr(not self.is_persistent):
             prims.griddepcontrol(kind=prims.GridDepAction.WAIT)

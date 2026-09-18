@@ -25,9 +25,30 @@ Import all entries below from `flashinfer.attention.prims_ts`.
 | QToken-KvBlock-Sparse-Attention | [Packed-prefill and fixed-decode example](https://github.com/PerkzZheng/prims-ts-examples/blob/main/q_token_kv_block_sparse_attention.py) | `QTokenKvBlockSparsePagedTSWrapper`, `q_token_kv_block_sparse_attention_with_paged_kv_cache`, `get_q_token_kv_block_sparse_workspace_size`, `suggest_q_token_kv_block_sparse_group_size`, `validate_q_token_kv_block_sparse_group_size`, `make_q_token_kv_block_sparse_qo_indptr` |
 | Block-sparse FMHA | — | `BlockSparseTSWrapper`, `block_sparse_attention`; fixed-Q paged KV: `BlockSparsePagedTSWrapper`, `block_sparse_attention_with_paged_kv_cache` |
 | MLA decode | [Task-Scheduled MLA Decode](kernels/mla_decode/README.md) | `BatchMLADecodePagedTSWrapper`, `batch_mla_decode_with_paged_kv_cache`, `get_prims_ts_batch_mla_decode_workspace_size`, `prims_ts_batch_mla_decode_with_kv_cache` |
+| DSV4 sparse MLA (CSA/HCA share one kernel) | — | `prims_ts_dsv4_sparse_mla`, `prims_ts_dsv4_sparse_mla_rope_quant`, `prims_ts_dsv4_sparse_mla_rope_quant_ue8m0` |
 
 The component guides define supported shapes, layouts, metadata lifetime,
 output/workspace ownership, examples, limitations, and validation commands.
+
+DSV4 sparse MLA has no separate guide yet. All entry points take the
+sliding-window pool before the compressed pool and consume DeepSeek V4
+physical routing (`sparse_indices`: 128 sliding-window slots followed by
+compressed-pool slots per packed query, with `sparse_topk_lens`, `seq_lens`,
+and `cum_seq_lens_q` as in `trtllm_batch_decode_sparse_mla_dsv4`). They pick
+the static 2CTA grid while `B * max_seq_len_q` fits one resident wave of 2CTA
+clusters and the CLC persistent kernel beyond it (the dense MLA resident-wave
+rule), and accept `skip_corr_threshold` in `[0, 8]` for their E4M3 P. Dense MLA
+`plan()` and the one-shot APIs accept `skip_corr_threshold` as well: the bound
+is 8 for E4M3 QKV (`1.75 * 2**8 == 448`) and 64 for BF16 QKV, the default `0.0`
+keeps the exact online-softmax rescale, and both MLA kernel families accept it.
+The two RoPE/FP8 entry points share one fused epilogue and differ only in the
+dequant-scale format: `prims_ts_dsv4_sparse_mla_rope_quant` writes one FP32
+`amax / 448` per D128 block (`[16, 32, pad4(T)]`), while
+`prims_ts_dsv4_sparse_mla_rope_quant_ue8m0` writes one INT32 word per head
+(`[16, 8, pad4(T)]`) packing four UE8M0 exponent bytes with
+`scale = 2 ** (byte - 127)` and `exp2(ceil(log2(max(amax, 1e-10) / 448)))`
+rounding; its `out_scale.permute(2, 0, 1)[:T]` view is the `[T, 16, 8]` scale
+tensor consumed by UE8M0 block-scaled GEMMs.
 
 The contiguous and paged context, FMHA decode, and MLA decode wrappers separate
 reusable static state from per-run request state. `plan()` compiles a static
@@ -219,5 +240,10 @@ pytest -q \
   tests/attention/test_attention_ts_q_token_kv_block_sparse_metadata.py \
   tests/attention/test_attention_ts_block_sparse.py \
   tests/attention/test_attention_ts_mask.py \
-  tests/attention/test_attention_ts_mla_decode.py
+  tests/attention/test_attention_ts_mla_decode.py \
+  tests/attention/test_attention_ts_dsv4.py
 ```
+
+The CuTe DSL compiles these kernels with the `ptxas` bundled in the
+`nvidia-cutlass-dsl` wheel, not the system toolkit; with a CUDA 13 PyTorch
+install `nvidia-cutlass-dsl[cu13]` so Blackwell kernels are compiled by ptxas 13.x.

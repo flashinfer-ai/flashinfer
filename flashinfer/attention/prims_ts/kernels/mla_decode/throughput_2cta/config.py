@@ -24,6 +24,13 @@ from typing import Tuple
 from ..helpers.constants import MAX_MLA_SPLITS_KV, SUPPORTED_MLA_PAGE_SIZES
 from ..helpers.mask import MaskType, normalize_mask_type
 
+# Re-exported for callers and tests that import the skip-correction bounds from
+# the throughput 2CTA config module.
+from ..helpers.math import (  # noqa: F401
+    max_skip_corr_threshold,
+    validate_skip_corr_threshold,
+)
+
 
 # Softmax converts natural-scale scores to exp2 with log2(e).
 LOG2_E = 1.4426950408889634074
@@ -48,6 +55,11 @@ V_SMEM_K_BLOCK_TOKENS = 32
 
 # Each transpose-TMA issue stages one 64-element slice of the latent dimension.
 V_TMA_LATENT_ELEMENTS = 64
+
+# tcgen05.alloc hands out TMEM in 32-column units.  A dynamic token sparse
+# correction-factor stage carries two floats per row but still reserves one
+# full allocation unit so each stage starts on an allocation boundary.
+TMEM_ALLOC_MIN_COLS = 32
 
 
 def ceil_div(a: int, b: int) -> int:
@@ -170,6 +182,24 @@ class MlaDecodeConfig:
     p_cor_stage: int = 2
     mma_o_stage: int = 1
 
+    # Dynamic token sparse W9 owns an independent cp.async page-index ring.
+    # Each stage holds ``page_index_ring_tiles_per_stage`` consecutive sparse
+    # K tiles of int32 token indices; six stages stay live.  The entry count is
+    # derived in ``make_mla_decode_config`` as tiles per stage x K-tile width
+    # (2 x 128 = 256 for the current profile).
+    page_index_ring_stages: int = 6
+    page_index_ring_tiles_per_stage: int = 2
+    page_index_ring_entries_per_stage: int = 256  # computed
+    # Threshold-based skip correction.  The threshold stays a runtime scalar;
+    # this static flag adds the row-max-freeze and warp-vote paths for any QKV
+    # dtype.  With E4M3 P it also moves the P scale from 448 to 1.75; BF16 P
+    # stays unscaled.  See ``max_skip_corr_threshold`` for the bounds.
+    enable_skip_correction: bool = False
+    # Public callers that do not request LSE must not pay for invisible
+    # softmax-stat writes.  The flag is static because it changes the
+    # epilogue instruction stream.
+    stores_lse: bool = True
+
     # Base BF16 warp assignments for the 12-warp CTA. Softmax and correction
     # each own a contiguous four-warp group; the remaining warps issue MMA and
     # TMA (including register-held page IDs) or provide scheduler/alignment
@@ -179,6 +209,10 @@ class MlaDecodeConfig:
     correction_warp_ids: Tuple[int, ...] = (4, 5, 6, 7)
     mma_warp_id: int = 8
     load_tma_warp_id: int = 9
+    load_v_warp_id: int = 10
+    load_v_num_warps: int = 1
+    scheduler_warp_id: int = 10
+    padding_warp_id: int = 11
     pv_mma_warp_id: int = 11
     empty_warp_ids: Tuple[int, ...] = (11,)
     second_compute_warp_ids: Tuple[int, ...] = ()
@@ -194,6 +228,11 @@ class MlaDecodeConfig:
     softmax_reg_num: int = 192
     correction_reg_num: int = 208
     other_reg_num: int = 96
+    # Dynamic token sparse gives its MMA/page/scheduler/padding warps a higher
+    # budget than the four Gather4 TMA issuer warps.  ``other_reg_num`` is only
+    # the prologue decrease budget; each task then requests its own final budget.
+    producer_reg_num: int = 96
+    gather4_reg_num: int = 96
 
     # Named barrier IDs and thread counts.  IDs are local to this kernel's
     # manual synchronization protocol and are kept away from the TMEM barrier.
@@ -262,6 +301,27 @@ class MlaDecodeConfig:
     # the ordinary per-batch KV tail at ``cache_seqs[batch]``.
     mask_type: str = MaskType.CAUSAL.value
 
+    # Dynamic token sparse specialization.  Sparse routing treats every
+    # page-table entry as one physical token and stores one routing row per
+    # logical query token.  The first ``sparse_swa_topk`` entries address the
+    # SWA pool; the remaining entries address the compressed pool.  The pool
+    # boundary must fall on one full K tile (``mma_qk_tiler_mn[1]``).
+    is_dynamic_token_sparse: bool = False
+    sparse_swa_topk: int = 128
+    # Initialize all active mbarriers from one staged block after SMEM binding
+    # instead of per resource; ``make_mla_decode_config`` defaults this to
+    # ``is_dynamic_token_sparse`` unless a caller opts in explicitly.
+    uses_deferred_mbarrier_init: bool = False
+    # Fused epilogue: normalize FP32 O, apply inverse RoPE to D[448:512],
+    # quantize each contiguous D128 block to E4M3, and write the grouped
+    # physical O/FP32-scale layouts consumed by the next GEMM.
+    dsv4_fuses_inv_rope_fp8_quant: bool = False
+    # Store each D128 block's dequant scale as a UE8M0 exponent byte
+    # (``exp2(ceil(log2(max(amax, 1e-10) / 448)))``) packed four-per-head into
+    # INT32 words instead of the FP32 ``amax / 448`` value.  Requires
+    # ``dsv4_fuses_inv_rope_fp8_quant``.
+    dsv4_uses_ue8m0_scale_o: bool = False
+
     @property
     def tokens_per_k_tile(self) -> int:
         """Return the logical KV-token count covered by one QK tile."""
@@ -322,6 +382,60 @@ class MlaDecodeConfig:
         return self.qkv_dtype == "e4m3"
 
 
+def _apply_fp8_split_mma_profile(cfg: MlaDecodeConfig) -> None:
+    """Apply the 16-warp E4M3 split QK/PV schedule shared by dense FP8 and sparse.
+
+    Dense FP8 additionally runs the odd/even dual-softmax schedule on W12-W15;
+    the dynamic token sparse profile below reassigns those warps.
+    """
+    cfg.threads_per_cta = cfg.threads_per_warp * 16
+    cfg.softmax_reg_num = 160
+    cfg.correction_reg_num = 160
+    cfg.other_reg_num = 32
+    cfg.mma_o_stage = 2
+    cfg.epilogue_sync_bar_id = 4
+    if cfg.use_fp8_dual_softmax_schedule:
+        cfg.second_compute_warp_ids = (12, 13, 14, 15)
+        cfg.num_softmax_groups = 2
+
+
+def _apply_token_sparse_profile(cfg: MlaDecodeConfig) -> None:
+    """Apply the dynamic token sparse overrides on top of the FP8 split profile."""
+    # Pipeline depths: Q=1, K=2, V=2, S=2, P=2, O=1.  ``load_k_stage`` and
+    # ``mma_o_stage`` differ from dense FP8, whose split-QK/PV schedule needs
+    # an additional K/O stage.
+    cfg.load_k_stage = 2
+    cfg.load_v_stage = 2
+    cfg.mma_s_stage = 2
+    cfg.p_mma_stage = 2
+    cfg.p_cor_stage = 2
+    cfg.mma_o_stage = 1
+
+    # Softmax reduces each M128 row across the 2x2 warp layout with two
+    # 64-thread named barriers: W0/W2 use slot 1, W1/W3 use slot 2.  The
+    # scratch is double-buffered with the two S stages, so no second WAR
+    # barrier is needed before the next KV tile.
+    cfg.softmax_sync_bar_id = 1
+    cfg.softmax_sync_threads = 64
+
+    # setmaxnreg budgets: W0-W3 softmax=152, W4-W7 correction=144,
+    # W8-W11 MMA/page/scheduler/padding=136, W12-W15 Gather4=72.  All
+    # producer warps start at the Gather4 floor; each Task raises its own.
+    cfg.softmax_reg_num = 152
+    cfg.correction_reg_num = 144
+    cfg.other_reg_num = 72
+    cfg.producer_reg_num = 136
+    cfg.gather4_reg_num = 72
+    # W12-W15 issue distributed Gather4 V loads instead of a second softmax.
+    cfg.load_v_warp_id = 12
+    cfg.load_v_num_warps = 4
+    cfg.scheduler_warp_id = 10
+    # QK and PV MMA are fused into W8, leaving W11 as Padding.
+    cfg.padding_warp_id = 11
+    cfg.pv_mma_warp_id = 11
+    cfg.empty_warp_ids = ()
+
+
 def make_mla_decode_config(
     mma_qk_tiler_mn: Tuple[int, int] = (128, 128),
     mma_pv_tiler_mn: Tuple[int, int] = (128, 256),
@@ -334,8 +448,19 @@ def make_mla_decode_config(
     is_var_seq: bool = False,
     is_var_split_kv: bool = False,
     mask_type: MaskType | str = MaskType.CAUSAL,
+    is_dynamic_token_sparse: bool = False,
+    sparse_swa_topk: int = 128,
+    enable_skip_correction: bool = False,
+    dsv4_fuses_inv_rope_fp8_quant: bool = False,
+    dsv4_uses_ue8m0_scale_o: bool = False,
+    stores_lse: bool = True,
+    uses_deferred_mbarrier_init: bool | None = None,
 ) -> MlaDecodeConfig:
-    """Create and populate a MlaDecodeConfig from problem parameters."""
+    """Create and populate a MlaDecodeConfig from problem parameters.
+
+    ``uses_deferred_mbarrier_init=None`` resolves to ``is_dynamic_token_sparse``;
+    other kernel families can opt in explicitly.
+    """
     cfg = MlaDecodeConfig()
     cfg.mma_qk_tiler_mn = mma_qk_tiler_mn
     cfg.mma_pv_tiler_mn = mma_pv_tiler_mn
@@ -348,6 +473,33 @@ def make_mla_decode_config(
     cfg.is_var_seq = is_var_seq
     cfg.is_var_split_kv = is_var_split_kv
     cfg.mask_type = normalize_mask_type(mask_type)
+    cfg.is_dynamic_token_sparse = is_dynamic_token_sparse
+    cfg.sparse_swa_topk = sparse_swa_topk
+    cfg.enable_skip_correction = enable_skip_correction
+    cfg.dsv4_fuses_inv_rope_fp8_quant = dsv4_fuses_inv_rope_fp8_quant
+    cfg.dsv4_uses_ue8m0_scale_o = dsv4_uses_ue8m0_scale_o
+    cfg.stores_lse = stores_lse
+    cfg.uses_deferred_mbarrier_init = (
+        is_dynamic_token_sparse
+        if uses_deferred_mbarrier_init is None
+        else bool(uses_deferred_mbarrier_init)
+    )
+    if is_dynamic_token_sparse and qkv_dtype != "e4m3":
+        raise ValueError("dynamic-token sparse MLA requires qkv_dtype='e4m3'")
+    if dsv4_fuses_inv_rope_fp8_quant and (
+        not is_dynamic_token_sparse
+        or qkv_dtype != "e4m3"
+        or o_dtype != "e4m3"
+        or rope_dim != 0
+    ):
+        raise ValueError(
+            "DSV4 inverse-RoPE FP8 quant fusion requires dynamic sparse "
+            "E4M3 MLA, E4M3 output, and rope_dim=0"
+        )
+    if dsv4_uses_ue8m0_scale_o and not dsv4_fuses_inv_rope_fp8_quant:
+        raise ValueError(
+            "DSV4 UE8M0 output scales require the inverse-RoPE FP8 quant fusion"
+        )
 
     def _require_positive(name: str, value: int) -> None:
         """Validate that a named configuration value is positive."""
@@ -373,10 +525,30 @@ def make_mla_decode_config(
     if rope_dim < 0:
         raise ValueError(f"rope_dim must be non-negative, got {rope_dim}")
     _require_positive("page_size", page_size)
-    if page_size not in SUPPORTED_MLA_PAGE_SIZES:
+    if page_size not in SUPPORTED_MLA_PAGE_SIZES and not (
+        is_dynamic_token_sparse and page_size == 1
+    ):
         raise ValueError(
             f"page_size must be one of {SUPPORTED_MLA_PAGE_SIZES}, got {page_size}"
         )
+    if is_dynamic_token_sparse:
+        if page_size != 1:
+            raise ValueError(
+                f"dynamic-token sparse MLA requires page_size=1, got {page_size}"
+            )
+        if rope_dim != 0:
+            raise ValueError(
+                "dynamic-token sparse MLA requires rope_dim=0 because the "
+                "sparse KV cache stores the complete pre-rotated H512 vector"
+            )
+        # The SWA pool boundary must fall on one full K tile so the first
+        # sparse tile addresses only the SWA pool.
+        if sparse_swa_topk != mma_qk_tiler_mn[1]:
+            raise ValueError(
+                "dynamic-token sparse MLA currently requires the SWA pool "
+                f"boundary to equal one K tile (mma_qk_tiler_mn[1]="
+                f"{mma_qk_tiler_mn[1]} entries), got {sparse_swa_topk}"
+            )
     if page_size > mma_qk_tiler_mn[1] or mma_qk_tiler_mn[1] % page_size != 0:
         raise ValueError(
             "page_size must exactly partition the throughput 2CTA K tile: "
@@ -392,17 +564,17 @@ def make_mla_decode_config(
     cfg.use_bf16_output = int(o_dtype == "bf16")
     cfg.use_fp8_output = int(o_dtype == "e4m3")
     cfg.use_fp8_split_mma_schedule = qkv_dtype == "e4m3"
-    cfg.use_fp8_dual_softmax_schedule = qkv_dtype == "e4m3"
+    # Dynamic token sparse assigns W12-W15 to distributed Gather4 V loads.
+    # Dense FP8 keeps the original odd/even dual-softmax schedule on those warps.
+    cfg.use_fp8_dual_softmax_schedule = (
+        qkv_dtype == "e4m3" and not is_dynamic_token_sparse
+    )
     cfg.empty_warp_ids = () if cfg.use_fp8_split_mma_schedule else (cfg.pv_mma_warp_id,)
     if cfg.use_fp8_split_mma_schedule:
-        cfg.second_compute_warp_ids = (12, 13, 14, 15)
-        cfg.num_softmax_groups = 2
-        cfg.threads_per_cta = cfg.threads_per_warp * 16
-        cfg.softmax_reg_num = 160
-        cfg.correction_reg_num = 160
-        cfg.other_reg_num = 32
-        cfg.mma_o_stage = 2
-        cfg.epilogue_sync_bar_id = 4
+        _apply_fp8_split_mma_profile(cfg)
+    if is_dynamic_token_sparse:
+        # Sparse implies E4M3, so this always layers on the FP8 split profile.
+        _apply_token_sparse_profile(cfg)
 
     # Derived MMA tilers. FP8 latent QK uses K=128 while the separate RoPE MMA
     # keeps K=64.
@@ -421,7 +593,12 @@ def make_mla_decode_config(
     )
     cfg.mma_qk_tiler = (mma_qk_tiler_mn[0], mma_qk_tiler_mn[1], cfg.mma_qk_tiler_k)
     cfg.mma_qk_rope_tiler = (mma_qk_tiler_mn[0], mma_qk_tiler_mn[1], cfg.rope_dim)
-    pv_k = mma_qk_tiler_mn[1] * cfg.mma_qk_tiler_k // mma_pv_tiler_mn[1]
+    # Dynamic token sparse PV consumes one P[K128] operand per V[D256] panel.
+    pv_k = (
+        mma_qk_tiler_mn[1]
+        if is_dynamic_token_sparse
+        else mma_qk_tiler_mn[1] * cfg.mma_qk_tiler_k // mma_pv_tiler_mn[1]
+    )
     _require_divisible("mma_qk_tiler_mn[1]", mma_qk_tiler_mn[1], "pv_k", pv_k)
     _require_divisible(
         "latent_dim", cfg.latent_dim, "mma_pv_tiler_mn[1]", mma_pv_tiler_mn[1]
@@ -460,6 +637,16 @@ def make_mla_decode_config(
             f"tokens_per_v_tile={cfg.tokens_per_v_tile}, "
             f"tokens_per_k_tile={cfg.tokens_per_k_tile}"
         )
+
+    # Page-index ring geometry: each stage holds whole sparse K tiles of int32
+    # token indices, so the entry count follows the K-tile width.
+    _require_positive("page_index_ring_stages", cfg.page_index_ring_stages)
+    _require_positive(
+        "page_index_ring_tiles_per_stage", cfg.page_index_ring_tiles_per_stage
+    )
+    cfg.page_index_ring_entries_per_stage = (
+        cfg.page_index_ring_tiles_per_stage * cfg.tokens_per_k_tile
+    )
 
     # Page-offset tile sizes
     num_mma_ctas = cfg.cluster_shape_mnk[0]
@@ -536,15 +723,46 @@ def make_mla_decode_config(
         * cfg.iterations_pv_k
         * cfg.p_mma_stage
     )
-    cfg.softmax_exchange_elems = (
-        cfg.num_compute_warps
-        * cfg.threads_per_warp
-        * (1 if not cfg.use_fp8_dual_softmax_schedule else 2)
-    )
+    cfg.softmax_exchange_elems = cfg.num_compute_warps * cfg.threads_per_warp
+    if is_dynamic_token_sparse:
+        # One 128-float softmax row-reduction scratch per S stage.
+        cfg.softmax_exchange_elems *= cfg.mma_s_stage
+    elif cfg.use_fp8_dual_softmax_schedule:
+        cfg.softmax_exchange_elems *= 2
 
-    # TMEM layout
-    cfg.tmem_o_offset = cfg.mma_s_stage * cfg.mma_qk_tiler[1] // cfg.warps_in_n
-    cfg.correction_factor_offset = cfg.tmem_o_offset + cfg.latent_dim // cfg.warps_in_n
+    # TMEM layout.  Each CTA of the pair owns ``mma_qk_tiler[1] // warps_in_n``
+    # S columns per S stage and ``mma_pv_tiler[1] // warps_in_n`` O columns per
+    # D panel.
+    tmem_s_cols = cfg.mma_s_stage * cfg.mma_qk_tiler[1] // cfg.warps_in_n
+    tmem_o_cols = cfg.iterations_pv_n * cfg.mma_pv_tiler[1] // cfg.warps_in_n
+    if is_dynamic_token_sparse:
+        # Sparse order: S stages, then ``p_cor_stage`` correction-factor stages
+        # of one TMEM allocation unit each, then the O panels.  For the current
+        # profile: S0/S1=[0,128), correction [128,160) and [160,192), O panels
+        # [192,320) and [320,448).
+        tmem_corr_cols = cfg.p_cor_stage * TMEM_ALLOC_MIN_COLS
+        cfg.correction_factor_offset = tmem_s_cols
+        cfg.tmem_o_offset = cfg.correction_factor_offset + tmem_corr_cols
+        for name, offset in (
+            ("correction_factor_offset", cfg.correction_factor_offset),
+            ("tmem_o_offset", cfg.tmem_o_offset),
+        ):
+            if offset % TMEM_ALLOC_MIN_COLS != 0:
+                raise ValueError(
+                    f"{name}={offset} must be a multiple of "
+                    f"TMEM_ALLOC_MIN_COLS={TMEM_ALLOC_MIN_COLS}"
+                )
+        tmem_cols_used = cfg.tmem_o_offset + tmem_o_cols
+    else:
+        # Dense order: S stages, then the O panels, then correction factors.
+        cfg.tmem_o_offset = tmem_s_cols
+        cfg.correction_factor_offset = cfg.tmem_o_offset + tmem_o_cols
+        tmem_cols_used = cfg.correction_factor_offset
+    if tmem_cols_used > cfg.num_tmem_cols:
+        raise ValueError(
+            f"TMEM layout needs {tmem_cols_used} columns, exceeding "
+            f"num_tmem_cols={cfg.num_tmem_cols}"
+        )
 
     # TMA byte counts
     q_latent_tile_bytes = (
@@ -574,7 +792,14 @@ def make_mla_decode_config(
         * cfg.qkv_dtype_bytes
         * num_mma_ctas
     )
-    if cfg.tma_copy_kc_bytes != cfg.tma_copy_vc_bytes:
+    # Generic dense decode uses a shared K/V subtile contract.  Dynamic token
+    # sparse keeps independent K128 and V(K128,D256) Gather4 pipelines, whose
+    # individual transaction sizes differ while their full-tile completion
+    # sizes match.
+    if (
+        cfg.tma_copy_kc_bytes != cfg.tma_copy_vc_bytes
+        and not cfg.is_dynamic_token_sparse
+    ):
         raise ValueError(
             "K and V TMA subtile byte counts must match: "
             f"tma_copy_kc_bytes={cfg.tma_copy_kc_bytes}, "
@@ -589,14 +814,19 @@ def make_mla_decode_config(
         cfg.tma_copy_vc_bytes * cfg.iterations_pv_k * cfg.iterations_pv_n
     )
 
-    # TMEM sync barrier thread count: QK MMA + softmax + correction, plus
-    # the FP8 PV-MMA warp when it participates in TMEM O production.
-    cfg.tmem_sync_bar_threads = (
-        cfg.threads_per_warp * (2 if cfg.use_fp8_split_mma_schedule else 1)
-        + cfg.threads_per_warp * cfg.num_compute_warps
-        + cfg.threads_per_warp * cfg.num_compute_warps
-    )
-    if cfg.use_fp8_dual_softmax_schedule:
-        cfg.tmem_sync_bar_threads += cfg.threads_per_warp * cfg.num_compute_warps
+    # Dynamic token sparse syncs the full CTA after the TMEM allocation so the
+    # Gather4 producers cannot race ahead of the alloc publication.
+    if cfg.is_dynamic_token_sparse:
+        cfg.tmem_sync_bar_threads = cfg.threads_per_cta
+    else:
+        # TMEM sync barrier thread count: QK MMA + softmax + correction, plus
+        # the FP8 PV-MMA warp when it participates in TMEM O production.
+        cfg.tmem_sync_bar_threads = (
+            cfg.threads_per_warp * (2 if cfg.use_fp8_split_mma_schedule else 1)
+            + cfg.threads_per_warp * cfg.num_compute_warps
+            + cfg.threads_per_warp * cfg.num_compute_warps
+        )
+        if cfg.use_fp8_dual_softmax_schedule:
+            cfg.tmem_sync_bar_threads += cfg.threads_per_warp * cfg.num_compute_warps
 
     return cfg

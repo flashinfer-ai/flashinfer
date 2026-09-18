@@ -141,6 +141,12 @@
       "dtype": "float32",
       "optional": true
     },
+    "skip_corr_threshold": {
+      "shape": null,
+      "dtype": "float32",
+      "optional": true,
+      "description": "Skip-correction threshold in log2 units; 0 keeps the exact rescale, a positive value selects the max-freeze kernel."
+    },
     "mask_type": {
       "shape": null,
       "dtype": "string",

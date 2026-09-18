@@ -17,6 +17,8 @@
 import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, Int64, Uint32
+from cutlass._mlir.dialects import llvm
+from cutlass.cutlass_dsl import T as mlir_T
 from cutlass.experimental import primitives as cprims
 
 from .constants import (
@@ -42,6 +44,75 @@ primitives_inline_ptx = cprims.inline_ptx
 
 inline_ptx = cute.arch.inline_ptx
 """CuTe inline PTX entry point used by MLA helper ops."""
+
+
+@cutlass.dsl_user_op
+def clc_response_predicated(result_addr, *, loc=None, ip=None):
+    """Decode one CLC response in a single asm block, predicating the CTA-id query.
+
+    ``get_first_ctaid`` is defined only when ``is_canceled`` succeeds, so the
+    CTA-coordinate query is predicated on that result inside one asm block.
+    Coordinate outputs are unspecified on failure and must only be consumed
+    under the returned valid predicate.
+    """
+
+    # CLC response storage is a CuTe SMEM pointer; its ``toint`` chooses the
+    # address-space-native Int32 token without an explicit dtype argument.
+    result_addr_i32 = result_addr.toint(loc=loc, ip=ip)
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([mlir_T.i32()] * 4),
+        [result_addr_i32.ir_value(loc=loc, ip=ip)],
+        """
+        {
+          .reg .pred p1;
+          .reg .b128 clc_result;
+          ld.shared.b128 clc_result, [$4];
+          clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_result;
+          selp.u32 $3, 1, 0, p1;
+          @p1 clusterlaunchcontrol.query_cancel.get_first_ctaid.v4.b32.b128 {$0, $1, $2, _}, clc_result;
+        }
+        """,
+        "=r,=r,=r,=r,r,~{memory}",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return tuple(
+        Int32(llvm.extractvalue(mlir_T.i32(), result, [idx], loc=loc, ip=ip))
+        for idx in range(4)
+    )
+
+
+@cutlass.dsl_user_op
+def cp_async_cg_16b_l2_128b(dst, src, *, loc=None, ip=None) -> None:
+    """Issue one 16-byte ``cp.async.cg.shared.global.L2::128B``.
+
+    CuTe's ``cp_async_shared_global`` exposes the L1 cache scope but not the
+    PTX L2 prefetch-size qualifier, which helps streams that read consecutive
+    16-byte index records (e.g. a page-index selector ring).
+    """
+
+    dst_addr = dst.toint(Int32, loc=loc, ip=ip)
+    # Tensor iterator ``llvm_ptr`` is already an LLVM pointer OpResult rather
+    # than a CuTe ``Pointer`` wrapper.  Convert that exact value explicitly;
+    # calling ``Pointer.toint`` here would be a front-end type error.
+    src_addr = llvm.ptrtoint(mlir_T.i64(), src, loc=loc, ip=ip)
+    llvm.inline_asm(
+        mlir_T.i32(),
+        [
+            dst_addr.ir_value(loc=loc, ip=ip),
+            src_addr,
+        ],
+        ("{ cp.async.cg.shared.global.L2::128B [$1], [$2], 16; mov.u32 $0, 0; }"),
+        "=r,r,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
 
 
 @cute.jit
@@ -218,6 +289,182 @@ def pack_float4_to_fp8_e4m3(v0: Float32, v1: Float32, v2: Float32, v3: Float32):
 
 
 @cute.jit
+def convert_f32_vector_to_bf16_satfinite(values, num_elements: cutlass.Constexpr[int]):
+    """Pack an even Float32 vector to BF16 with ``cvt.rn.satfinite.bf16x2.f32``.
+
+    ``TensorSSA.to(BFloat16)`` lowers to plain ``cvt.rn.bf16x2.f32``. The
+    satfinite modifier is observable when a runtime output scale overflows
+    BF16, so it is part of the numerical contract. The result stays packed in
+    32-bit registers so callers keep their 128/256-bit GMEM stores.
+    """
+
+    if cutlass.const_expr(num_elements <= 0 or num_elements % 2 != 0):
+        raise ValueError("BF16 satfinite conversion requires a positive even vector")
+    packed = cutlass.Array(
+        Int32,
+        num_elements // 2,
+        space=cutlass.AddressSpace.rmem,
+    )
+    for pair_idx in cutlass.range_constexpr(num_elements // 2):
+        src_idx = pair_idx * 2
+        packed[pair_idx] = inline_ptx(
+            "cvt.rn.satfinite.bf16x2.f32 {$w0}, {$r1}, {$r0};",
+            write_only_types=[Int32],
+            read_only_args=[values[src_idx], values[src_idx + 1]],
+        )
+    return packed.load(0, num_elements // 2).bitcast(cutlass.BFloat16)
+
+
+@cute.jit
+def ld_global_v4_f32(addr: Int64):
+    """Load four consecutive FP32 values with one 128-bit global load.
+
+    ``addr`` must be 16-byte aligned. Used for the CTA-uniform 256-byte
+    cos/sin cache row so the rotation issues 16 vector loads instead of 64
+    scalar loads, which ptxas serializes under high register pressure.
+    """
+
+    return inline_ptx(
+        "ld.global.v4.f32 {{$w0}, {$w1}, {$w2}, {$w3}}, [{$r0}];",
+        write_only_types=[Float32, Float32, Float32, Float32],
+        read_only_args=[addr],
+    )
+
+
+@cute.jit
+def prefetch_global_l1(addr: Int64):
+    """Warm one L1 line for a later dependent global load; never faults."""
+
+    inline_ptx("prefetch.global.L1 [{$r0}];", read_only_args=[addr])
+
+
+@cute.jit
+def mul_ftz_f32(lhs: Float32, rhs: Float32):
+    """Multiply scalar FP32 with fast-math FTZ semantics."""
+
+    return inline_ptx(
+        "mul.rn.ftz.f32 {$w0}, {$r0}, {$r1};",
+        write_only_types=[Float32],
+        read_only_args=[lhs, rhs],
+    )
+
+
+@cute.jit
+def rcp_approx_ftz_f32(value: Float32):
+    """Approximate scalar reciprocal (``rcp.approx.ftz.f32``, as in ``__fdividef``)."""
+
+    return inline_ptx(
+        "rcp.approx.ftz.f32 {$w0}, {$r0};",
+        write_only_types=[Float32],
+        read_only_args=[value],
+    )
+
+
+@cute.jit
+def add_ftz_f32(lhs: Float32, rhs: Float32):
+    """Add scalar FP32 with fast-math FTZ semantics."""
+
+    return inline_ptx(
+        "add.rn.ftz.f32 {$w0}, {$r0}, {$r1};",
+        write_only_types=[Float32],
+        read_only_args=[lhs, rhs],
+    )
+
+
+@cute.jit
+def sub_ftz_f32(lhs: Float32, rhs: Float32):
+    """Subtract scalar FP32 with fast-math FTZ semantics."""
+
+    return inline_ptx(
+        "sub.rn.ftz.f32 {$w0}, {$r0}, {$r1};",
+        write_only_types=[Float32],
+        read_only_args=[lhs, rhs],
+    )
+
+
+@cute.jit
+def fma_ftz_f32(lhs: Float32, rhs: Float32, addend: Float32):
+    """FMA scalar FP32 with fast-math FTZ semantics."""
+
+    return inline_ptx(
+        "fma.rn.ftz.f32 {$w0}, {$r0}, {$r1}, {$r2};",
+        write_only_types=[Float32],
+        read_only_args=[lhs, rhs, addend],
+    )
+
+
+@cutlass.dsl_user_op
+def affine2_contractible_f32(
+    lhs0: Float32,
+    lhs1: Float32,
+    rhs0: Float32,
+    rhs1: Float32,
+    add0: Float32,
+    add1: Float32,
+    *,
+    loc=None,
+    ip=None,
+):
+    """Compute two affine values with contractible ``mul.f32x2`` + ``add.f32x2``.
+
+    ptxas contracts the modifier-free pair to FFMA2 while keeping a different
+    scheduling graph than an explicit ``fma.rn.f32x2``. Returning both scalars
+    from one asm block keeps the unpack adjacent to the producing instruction.
+    """
+
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([mlir_T.f32(), mlir_T.f32()]),
+        [
+            Float32(lhs0).ir_value(loc=loc, ip=ip),
+            Float32(lhs1).ir_value(loc=loc, ip=ip),
+            Float32(rhs0).ir_value(loc=loc, ip=ip),
+            Float32(rhs1).ir_value(loc=loc, ip=ip),
+            Float32(add0).ir_value(loc=loc, ip=ip),
+            Float32(add1).ir_value(loc=loc, ip=ip),
+        ],
+        """
+        {
+          .reg .b64 lhs;
+          .reg .b64 rhs;
+          .reg .b64 addend;
+          .reg .b64 product;
+          .reg .b64 affine;
+          mov.b64 lhs, {$2, $3};
+          mov.b64 rhs, {$4, $5};
+          mov.b64 addend, {$6, $7};
+          mul.f32x2 product, lhs, rhs;
+          add.f32x2 affine, product, addend;
+          mov.b64 {$0, $1}, affine;
+        }
+        """,
+        "=f,=f,f,f,f,f,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return (
+        Float32(llvm.extractvalue(mlir_T.f32(), result, [0], loc=loc, ip=ip)),
+        Float32(llvm.extractvalue(mlir_T.f32(), result, [1], loc=loc, ip=ip)),
+    )
+
+
+@cute.jit
+def fnma_ftz_f32(lhs: Float32, rhs: Float32, addend: Float32):
+    """Compute ``-lhs * rhs + addend`` with one FTZ FMA."""
+
+    # Keep the negation outside inline PTX: NVVM expresses it as an operand
+    # modifier and ptxas folds it into a single FFMA.FTZ.
+    return cute.math.fma(
+        -lhs,
+        rhs,
+        addend,
+        ftz=True,
+    )
+
+
+@cute.jit
 def fp8_log2_quant_scale():
     """Return log2(448) for the E4M3 P scaling convention."""
     return Float32(8.8073549)
@@ -227,6 +474,30 @@ def fp8_log2_quant_scale():
 def fp8_quant_scale_rcp():
     """Return the reciprocal of the shared E4M3 probability scale."""
     return Float32(1.0 / 448.0)
+
+
+@cute.jit
+def fp8_log2_p_scale(cfg):
+    """Return log2 of the E4M3 P scale selected by the config.
+
+    With threshold skip correction the frozen row max lets P grow by up to
+    ``2**8``, so the scale drops from 448 to 1.75 (``1.75 * 2**8 == 448``);
+    without it the full 448 scale is used.
+    """
+    return (
+        Float32(0.80735493)
+        if cutlass.const_expr(cfg.enable_skip_correction)
+        else fp8_log2_quant_scale()
+    )
+
+
+def fp8_p_scale_rcp(cfg):
+    """Return the reciprocal of ``fp8_log2_p_scale``'s scale (1.75 or 448)."""
+    return (
+        Float32(1.0 / 1.75)
+        if cutlass.const_expr(cfg.enable_skip_correction)
+        else fp8_quant_scale_rcp()
+    )
 
 
 @cute.jit
@@ -408,3 +679,33 @@ def float_to_u32_bits(val):
 def u32_bits_to_float(val: Uint32):
     """Return the Float32 value represented by raw Uint32 bits."""
     return cprims.mov_b32(val, target_type=Float32)
+
+
+@cute.jit
+def ue8m0_scale_byte_from_scale(scale_raw: Float32):
+    """Return the UE8M0 exponent byte of ``exp2(ceil(log2(scale_raw)))``.
+
+    Adding ``0x007FFFFF`` to the FP32 bit pattern carries into the exponent
+    exactly when the mantissa is non-zero, so the shifted result is the biased
+    exponent of the next power of two (or of ``scale_raw`` itself when it is
+    one). The caller clamps ``scale_raw`` to a positive normal value.
+    """
+
+    return (float_to_u32_bits(scale_raw) + Uint32(0x007FFFFF)) >> Uint32(23)
+
+
+@cute.jit
+def ue8m0_inv_scale_from_byte(scale_byte: Uint32):
+    """Return ``exp2(127 - scale_byte)`` as an exact FP32 power of two."""
+
+    return u32_bits_to_float((Uint32(254) - scale_byte) << Uint32(23))
+
+
+@cute.jit
+def st_global_u8(addr: Int64, value: Uint32):
+    """Store the low byte of ``value`` to global memory at byte address ``addr``."""
+
+    inline_ptx(
+        "{\n  .reg .b16 lo;\n  cvt.u16.u32 lo, {$r1};\n  st.global.u8 [{$r0}], lo;\n}",
+        read_only_args=[addr, value],
+    )

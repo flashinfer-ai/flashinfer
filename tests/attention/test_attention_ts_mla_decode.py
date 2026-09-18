@@ -363,8 +363,15 @@ def _fp8_request_reference(
     num_insts_kv: int,
     tile_size_kv: int,
     splits_kv: int,
+    skip_corr_threshold: float = 0.0,
 ) -> torch.Tensor:
-    """Model P448 probabilities across split-local KV instruction streams."""
+    """Model E4M3 probabilities per split-local KV stream; a positive threshold uses the 1.75 P scale and frozen row max."""
+    p_scale = 1.75 if skip_corr_threshold > 0.0 else _FP8_PROBABILITY_SCALE
+    raw_freeze_threshold = (
+        skip_corr_threshold / (bmm1_scale * math.log2(math.e))
+        if skip_corr_threshold > 0.0
+        else 0.0
+    )
 
     if num_insts_kv <= 0 or tile_size_kv <= 0 or splits_kv <= 0:
         raise ValueError("KV instruction, tile, and split counts must be positive")
@@ -407,9 +414,11 @@ def _fp8_request_reference(
                 if stream_valid[stream_idx]
                 else local_max
             )
+            if stream_valid[stream_idx] and skip_corr_threshold > 0.0:
+                frozen = (new_max - stream_max[stream_idx]) <= raw_freeze_threshold
+                new_max = torch.where(frozen, stream_max[stream_idx], new_max)
             probabilities = (
-                torch.exp((tile_scores - new_max[:, None]) * bmm1_scale)
-                * _FP8_PROBABILITY_SCALE
+                torch.exp((tile_scores - new_max[:, None]) * bmm1_scale) * p_scale
             )
             quantized_probabilities = probabilities.to(_FP8).float()
             tile_sum = probabilities.sum(dim=-1)
@@ -458,6 +467,7 @@ def _mla_reference(
     splits_kv: int = 1,
     batch_indices: Sequence[int] | None = None,
     qo_indptr: torch.Tensor | None = None,
+    skip_corr_threshold: float = 0.0,
 ) -> torch.Tensor:
     """Return the selected policy's independent FP32 MLA output oracle."""
 
@@ -491,6 +501,7 @@ def _mla_reference(
                     num_insts_kv=num_insts_kv,
                     tile_size_kv=tile_size_kv,
                     splits_kv=splits_kv,
+                    skip_corr_threshold=skip_corr_threshold,
                 )
             else:
                 scores = (
@@ -719,6 +730,7 @@ def _plan_case(
     *,
     qo_indptr: torch.Tensor | None = None,
     max_seq_len_q: int | None = None,
+    skip_corr_threshold: float = 0.0,
 ):
     wrapper = BatchMLADecodePagedTSWrapper()
     num_heads = int(
@@ -745,6 +757,7 @@ def _plan_case(
         kv_data_type=case.kv_cache.dtype,
         o_data_type=case.output_dtype,
         mask_type=case.mask_type,
+        skip_corr_threshold=skip_corr_threshold,
     )
     return wrapper
 
@@ -889,7 +902,9 @@ def _assert_auto_policy(
             assert policy[key] == expected, (key, policy, expected_b200)
 
 
-def _assert_case_correct(output, case, policy, *, qo_indptr=None):
+def _assert_case_correct(
+    output, case, policy, *, qo_indptr=None, skip_corr_threshold=0.0
+):
     expected_shape = (
         (case.query.shape[0], case.query.shape[1], _LATENT_DIM)
         if qo_indptr is not None
@@ -916,6 +931,7 @@ def _assert_case_correct(output, case, policy, *, qo_indptr=None):
         splits_kv=int(policy["split_kv"]),
         batch_indices=batch_indices,
         qo_indptr=qo_indptr,
+        skip_corr_threshold=skip_corr_threshold,
     )
     actual = (
         output.float() if qo_indptr is not None else output[list(batch_indices)].float()
@@ -1195,7 +1211,12 @@ def test_attention_ts_mla_wrapper_uses_compile_oriented_contract():
         "o_data_type",
         "mask_type",
         "workspace_buffer",
+        "skip_corr_threshold",
     )
+    # Skip correction selects a kernel specialization, so it is a static plan
+    # knob rather than run() request metadata; it stays opt-in.
+    assert plan_parameters["skip_corr_threshold"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert plan_parameters["skip_corr_threshold"].default == 0.0
     for name in (
         "device",
         "batch_size",
@@ -1257,7 +1278,8 @@ def test_attention_ts_mla_plan_publishes_frozen_state_after_workspace_binding(
         assert device == "cuda:0"
         return torch.device("cpu"), 0
 
-    def resolve_spec(*args):
+    def resolve_spec(*args, enable_skip_correction=False):
+        assert enable_skip_correction is False
         events.append("spec")
         return spec
 
@@ -1315,7 +1337,7 @@ def test_attention_ts_mla_plan_publishes_frozen_state_after_workspace_binding(
     with pytest.raises(FrozenInstanceError):
         state.batch_size = 2
 
-    def fail_replan(*args):
+    def fail_replan(*args, enable_skip_correction=False):
         raise RuntimeError("replan failed")
 
     monkeypatch.setattr(
@@ -1479,6 +1501,8 @@ def test_attention_ts_mla_run_validate_false_bypasses_explicit_validators(
         split_kv=1,
         workspace_views=object(),
         compiled=object(),
+        policy=(("kernel", "throughput_2cta"),),
+        skip_corr_threshold=0.0,
     )
     runtime = _empty_mla_runtime()
     sentinel = torch.empty(1)
@@ -2938,3 +2962,123 @@ def test_attention_ts_mla_decode_runtime_k_pruning_product(
         case,
         expected_b200={"kernel": expected_kernel},
     )
+
+
+@pytest.mark.parametrize(
+    ("shape", "qkv_dtype", "skip_corr_threshold", "expected_kernel"),
+    (
+        ((8, 128, 2049), torch.bfloat16, 8.0, "throughput_2cta"),
+        ((8, 128, 2049), torch.bfloat16, 64.0, "throughput_2cta"),
+        ((8, 128, 2049), torch.float8_e4m3fn, 8.0, "throughput_2cta"),
+        ((2, 8, 2048), torch.bfloat16, 8.0, "throughput_latency_1cta"),
+        ((128, 32, 2048), torch.bfloat16, 64.0, "throughput_latency_1cta"),
+        ((4, 16, 4097), torch.float8_e4m3fn, 8.0, "throughput_latency_1cta"),
+    ),
+    ids=(
+        "2cta-bf16-t8",
+        "2cta-bf16-t64",
+        "2cta-fp8-t8",
+        "1cta-bf16-cluster-reduction-t8",
+        "1cta-bf16-direct-t64",
+        "1cta-fp8-parallel-reduction-t8",
+    ),
+)
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_mla_decode_skip_correction(
+    shape: tuple[int, int, int],
+    qkv_dtype: torch.dtype,
+    skip_corr_threshold: float,
+    expected_kernel: str,
+) -> None:
+    """Skip correction matches the protocol oracle on both the 1CTA and 2CTA kernels.
+
+    BF16 P is unscaled, so the exact softmax oracle applies; E4M3 P uses the
+    1.75 scale, which the FP8 oracle models per KV stream.
+    """
+
+    batch_size, num_qo_heads, max_seq_len = shape
+    case = _make_mla_case(
+        batch_size=batch_size,
+        num_qo_heads=num_qo_heads,
+        max_seq_len=max_seq_len,
+        qkv_dtype=qkv_dtype,
+        device="cuda",
+        seed=36000
+        + int(skip_corr_threshold)
+        + (1 if qkv_dtype == _FP8 else 0)
+        + 7 * batch_size,
+    )
+    wrapper = _plan_case(case, skip_corr_threshold=skip_corr_threshold)
+    policy = _policy_dict(wrapper)
+    assert policy["kernel"] == expected_kernel
+    assert wrapper._plan_state is not None
+    assert wrapper._plan_state.skip_corr_threshold == skip_corr_threshold
+
+    output = _run_case(wrapper, case)
+    _assert_case_correct(output, case, policy, skip_corr_threshold=skip_corr_threshold)
+
+    # The exact-rescale plan on identical inputs agrees to output rounding.
+    baseline = _run_case(_plan_case(case), case)
+    rtol, atol = _mla_tolerances(qkv_dtype)
+    torch.testing.assert_close(output.float(), baseline.float(), rtol=rtol, atol=atol)
+
+    one_shot = batch_mla_decode_with_paged_kv_cache(
+        case.query,
+        case.kv_cache,
+        case.block_tables,
+        case.seq_lens,
+        bmm1_scale=case.bmm1_scale,
+        bmm2_scale=case.bmm2_scale,
+        mask_type=case.mask_type,
+        skip_corr_threshold=skip_corr_threshold,
+    )
+    torch.testing.assert_close(one_shot, output, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    ("qkv_dtype", "threshold"),
+    (
+        (torch.bfloat16, 64.5),
+        (torch.float8_e4m3fn, 8.5),
+        (torch.bfloat16, -1.0),
+        (torch.bfloat16, math.inf),
+        (torch.bfloat16, math.nan),
+        (torch.bfloat16, True),
+        (torch.bfloat16, "8"),
+    ),
+    ids=(
+        "bf16-above-64",
+        "fp8-above-8",
+        "negative",
+        "inf",
+        "nan",
+        "bool",
+        "string",
+    ),
+)
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_mla_decode_rejects_skip_correction_threshold(
+    qkv_dtype: torch.dtype, threshold
+) -> None:
+    """The per-dtype bound (E4M3: 8, BF16: 64) is enforced before planning."""
+
+    wrapper = BatchMLADecodePagedTSWrapper()
+    with pytest.raises(ValueError, match="skip_corr_threshold"):
+        wrapper.plan(
+            torch.device("cuda"),
+            8,
+            128,
+            _LATENT_DIM,
+            _ROPE_DIM,
+            _DEFAULT_PAGE_SIZE,
+            2049,
+            max_seq_len_q=1,
+            packed_query=False,
+            q_data_type=qkv_dtype,
+            kv_data_type=qkv_dtype,
+            o_data_type=torch.bfloat16,
+            skip_corr_threshold=threshold,
+        )
+    assert wrapper._plan_state is None

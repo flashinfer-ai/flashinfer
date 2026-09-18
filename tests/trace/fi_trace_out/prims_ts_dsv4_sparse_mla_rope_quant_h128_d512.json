@@ -1,0 +1,187 @@
+{
+  "name": "prims_ts_dsv4_sparse_mla_rope_quant_h128_d512",
+  "description": "PrimTS DSV4 sparse MLA decode with the fused inverse-RoPE + grouped E4M3 output epilogue: O is [16, T, 8, 512] E4M3 with one FP32 dequant scale per contiguous D128 block in [16, 32, pad4(T)].",
+  "op_type": "mla_sparse",
+  "tags": [
+    "fi_api:flashinfer.attention.prims_ts.dsv4.prims_ts_dsv4_sparse_mla_rope_quant",
+    "stage:decode",
+    "backend:prims-ts",
+    "status:experimental",
+    "mla",
+    "dsv4"
+  ],
+  "axes": {
+    "total_q": {
+      "type": "var",
+      "description": "Packed query-token count T."
+    },
+    "num_heads": {
+      "type": "const",
+      "value": 128
+    },
+    "head_dim": {
+      "type": "const",
+      "value": 512
+    },
+    "swa_rows": {
+      "type": "var",
+      "description": "Physical rows in the sliding-window pool."
+    },
+    "compressed_rows": {
+      "type": "var",
+      "description": "Physical rows in the compressed pool."
+    },
+    "sparse_capacity": {
+      "type": "var",
+      "description": "Routing slots per query (Kmax): 128 SWA + compressed."
+    },
+    "batch_size": {
+      "type": "var",
+      "description": "Packed request count B."
+    },
+    "len_cu_seqlens_q": {
+      "type": "var",
+      "description": "B + 1 cumulative Q offsets."
+    },
+    "max_position": {
+      "type": "var",
+      "description": "Rows of the inverse-RoPE cos/sin cache."
+    },
+    "rope_cache_width": {
+      "type": "const",
+      "value": 64
+    },
+    "head_groups": {
+      "type": "const",
+      "value": 16
+    },
+    "heads_per_group": {
+      "type": "const",
+      "value": 8
+    },
+    "scale_rows": {
+      "type": "const",
+      "value": 32
+    },
+    "scale_cols": {
+      "type": "var",
+      "description": "pad4(total_q) FP32 scale columns."
+    }
+  },
+  "constraints": [
+    "num_heads == 128",
+    "head_dim == 512",
+    "sparse_capacity >= 128",
+    "sparse_capacity % 4 == 0",
+    "len_cu_seqlens_q == batch_size + 1",
+    "total_q == cum_seq_lens_q[-1].item()",
+    "min(sparse_topk_lens) >= 128",
+    "max(sparse_topk_lens) <= sparse_capacity",
+    "rope_cache_width == 64",
+    "scale_cols == (total_q + 3) // 4 * 4",
+    "max_position >= max(seq_lens)"
+  ],
+  "inputs": {
+    "query": {
+      "shape": [
+        "total_q",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "float8_e4m3fn"
+    },
+    "compressed_kv_pool": {
+      "shape": [
+        "compressed_rows",
+        "head_dim"
+      ],
+      "dtype": "float8_e4m3fn"
+    },
+    "sliding_window_kv_pool": {
+      "shape": [
+        "swa_rows",
+        "head_dim"
+      ],
+      "dtype": "float8_e4m3fn"
+    },
+    "sparse_indices": {
+      "shape": [
+        "total_q",
+        "sparse_capacity"
+      ],
+      "dtype": "int32",
+      "description": "Physical routes: slots [0,128) address the SWA pool (-1 = inactive), the remaining slots address the compressed pool."
+    },
+    "sparse_topk_lens": {
+      "shape": [
+        "total_q"
+      ],
+      "dtype": "int32",
+      "description": "Active scan width per query."
+    },
+    "seq_lens": {
+      "shape": [
+        "batch_size"
+      ],
+      "dtype": "int32",
+      "description": "Raw post-append KV lengths."
+    },
+    "cum_seq_lens_q": {
+      "shape": [
+        "len_cu_seqlens_q"
+      ],
+      "dtype": "int32"
+    },
+    "max_seq_len_q": {
+      "shape": null,
+      "dtype": "int32",
+      "description": "Runtime maximum request-local Q length."
+    },
+    "bmm1_scale": {
+      "shape": null,
+      "dtype": "float32",
+      "optional": true
+    },
+    "bmm2_scale": {
+      "shape": null,
+      "dtype": "float32",
+      "optional": true
+    },
+    "skip_corr_threshold": {
+      "shape": null,
+      "dtype": "float32",
+      "optional": true,
+      "description": "E4M3 skip-correction threshold in log2 units, in [0, 8]."
+    },
+    "inv_rope_cos_sin_cache": {
+      "shape": [
+        "max_position",
+        "rope_cache_width"
+      ],
+      "dtype": "float32",
+      "description": "FP32 [cos(32), sin(32)] rows indexed by raw KV position."
+    }
+  },
+  "outputs": {
+    "output": {
+      "shape": [
+        "head_groups",
+        "total_q",
+        "heads_per_group",
+        "head_dim"
+      ],
+      "dtype": "float8_e4m3fn",
+      "param": "out"
+    },
+    "output_scale": {
+      "shape": [
+        "head_groups",
+        "scale_rows",
+        "scale_cols"
+      ],
+      "dtype": "float32",
+      "param": "out_scale"
+    }
+  },
+  "check": "def standard_check(\n    reference_outputs: Any,\n    actual_outputs: Any,\n    *,\n    rtol: Optional[float] = None,\n    atol: Optional[float] = None,\n    max_mismatch_pct: float = 0.0,\n    min_cos_sim: Optional[float] = 1.0 - 1e-3,\n) -> bool:\n    \"\"\"Default trace correctness check used when a template does not override it.\"\"\"\n    from flashinfer.trace import default_check\n\n    return default_check(\n        reference_outputs,\n        actual_outputs,\n        rtol=rtol,\n        atol=atol,\n        max_mismatch_pct=max_mismatch_pct,\n        min_cos_sim=min_cos_sim,\n    )\n"
+}

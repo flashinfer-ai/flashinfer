@@ -71,6 +71,9 @@ prims_ts_decode_wrapper_tuple_encoded_page4_multi_q_causal_plan_seq_lens_sq4_max
 prims_ts_decode_mla_one_shot_h128_d_qk576_ckv512_kpe64_ps32_sq4.json
 prims_ts_batch_decode_mla_h128_d_qk576_ckv512_kpe64_ps32_s2048_sq4.json
 prims_ts_decode_mla_wrapper_causal_maxq4_maxk2048_h128_d_qk576_ckv512_kpe64_ps32_sq4.json
+prims_ts_dsv4_sparse_mla_h128_d512.json
+prims_ts_dsv4_sparse_mla_rope_quant_h128_d512.json
+prims_ts_dsv4_sparse_mla_rope_quant_ue8m0_h128_d512.json
 mm_bf16_fp4_cudnn_N2048_K7168_block_size16.json
 mm_bf16_fp4_cute_dsl_N2048_K7168_block_size16.json
 mono_moe_topk8_h2048_i512.json
@@ -1084,7 +1087,7 @@ _alpha_router_logits = torch.randn(32, 512, dtype=torch.float32, device=device)
 _alpha_router_cc = torch.cuda.get_device_capability(device)
 if (
     _alpha_router_cc in {(10, 0), (10, 3)}
-    and is_sm100a_supported(device)
+    and is_sm100a_supported(torch.device(device))
     and is_cuda_version_at_least("12.9" if _alpha_router_cc == (10, 3) else "12.8")
 ):
     flashinfer.fused_moe.alphamoe_fused_router(
@@ -2703,3 +2706,70 @@ with contextlib.suppress(Exception):
             _fp4_in["seq_lens"],
             _fp4_in["max_seq_len"],
         )
+
+
+# PrimTS DSV4 sparse MLA (CSA/HCA share one kernel): BF16 output and the fused
+# inverse-RoPE + grouped E4M3 output epilogue (SM100/SM103 only).
+with contextlib.suppress(Exception):
+    from flashinfer.attention.prims_ts import (
+        prims_ts_dsv4_sparse_mla as _dsv4_sparse_mla,
+        prims_ts_dsv4_sparse_mla_rope_quant as _dsv4_sparse_mla_rope_quant,
+        prims_ts_dsv4_sparse_mla_rope_quant_ue8m0 as _dsv4_sparse_mla_rope_quant_ue8m0,
+    )
+
+    _dsv4_T, _dsv4_H, _dsv4_D, _dsv4_K, _dsv4_KV = 2, 128, 512, 256, 600
+    _dsv4_fp8 = torch.float8_e4m3fn
+    _dsv4_q = (0.5 * torch.randn(_dsv4_T, _dsv4_H, _dsv4_D, device=device)).to(
+        _dsv4_fp8
+    )
+    _dsv4_swa = torch.randn(_dsv4_KV, _dsv4_D, device=device).to(_dsv4_fp8)
+    _dsv4_comp = torch.randn(_dsv4_KV // 4, _dsv4_D, device=device).to(_dsv4_fp8)
+    _dsv4_routes = torch.zeros(_dsv4_T, _dsv4_K, dtype=torch.int32, device=device)
+    _dsv4_routes[:, :128] = torch.arange(128, dtype=torch.int32, device=device)
+    _dsv4_routes[:, 128:] = torch.arange(
+        _dsv4_K - 128, dtype=torch.int32, device=device
+    )
+    _dsv4_lens = torch.full((_dsv4_T,), _dsv4_K, dtype=torch.int32, device=device)
+    _dsv4_seq_lens_kv = torch.tensor([_dsv4_KV], dtype=torch.int32, device=device)
+    _dsv4_cu = torch.tensor([0, _dsv4_T], dtype=torch.int32, device=device)
+    _dsv4_sparse_mla(
+        _dsv4_q,
+        _dsv4_swa,
+        _dsv4_comp,
+        _dsv4_routes,
+        _dsv4_lens,
+        _dsv4_seq_lens_kv,
+        _dsv4_cu,
+        max_seq_len_q=_dsv4_T,
+        bmm1_scale=1.0 / 512**0.5,
+    )
+    _dsv4_pos = torch.arange(_dsv4_KV, device=device, dtype=torch.float32)[:, None]
+    _dsv4_dim = torch.arange(32, device=device, dtype=torch.float32)[None, :]
+    _dsv4_angles = (_dsv4_pos + 1.0) * (_dsv4_dim + 1.0) * 0.001
+    _dsv4_cos_sin = torch.cat(
+        (torch.cos(_dsv4_angles), torch.sin(_dsv4_angles)), dim=-1
+    ).contiguous()
+    _dsv4_sparse_mla_rope_quant(
+        _dsv4_q,
+        _dsv4_swa,
+        _dsv4_comp,
+        _dsv4_routes,
+        _dsv4_lens,
+        _dsv4_seq_lens_kv,
+        _dsv4_cu,
+        _dsv4_cos_sin,
+        max_seq_len_q=_dsv4_T,
+        bmm1_scale=1.0 / 512**0.5,
+    )
+    _dsv4_sparse_mla_rope_quant_ue8m0(
+        _dsv4_q,
+        _dsv4_swa,
+        _dsv4_comp,
+        _dsv4_routes,
+        _dsv4_lens,
+        _dsv4_seq_lens_kv,
+        _dsv4_cu,
+        _dsv4_cos_sin,
+        max_seq_len_q=_dsv4_T,
+        bmm1_scale=1.0 / 512**0.5,
+    )
