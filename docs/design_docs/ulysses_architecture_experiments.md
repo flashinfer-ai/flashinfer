@@ -13,8 +13,14 @@ every architecture has been validated with this port.
 | Origin | Included implementation | Not included / acceptance still needed |
 | --- | --- | --- |
 | SM100 | BF16 distributed-Q/O FA4 runner, peer-address checks, remote Q reads, owner-O writeback, O-TMA and padding-query scheduler extent; pinned external kernel patch | Not FP8 FA4; not a general mask/varlen backend; B200 U2/U4/U8 correctness, lifetime and paired performance reruns required |
-| SM90 | BF16-to-E4M3 per-head quantization fused with destination-major QKV packing | No FA3 compute backend, automatic global-scale reduction, FP8 output communication, or complete transport pipeline; Hopper tests required |
-| SM120 | Coarse QKV GEMM producer groups spanning every destination rank; benchmark-local stream/event pipeline; full-head-geometry K-mean helper for future Sage integration | No bundled Sage/BSA kernel, SGLang-specific QK norm/RoPE-to-wire kernel, CE transport or complete FP8 attention backend; multi-GPU and model-quality gates remain |
+| SM90 | BF16-to-E4M3 per-head quantization fused with destination-major QKV packing; new complete examples using existing FlashInfer FA3 BF16/FP8 | No new FA3 kernel implementation, automatic global-scale reduction or FP8 output communication; Hopper tests required |
+| SM120 | Coarse producer and K-mean primitives; new complete examples using existing FlashInfer BF16 BSA, FP8 FMHA and Sage kernels | No new Sage/BSA kernel implementation, SGLang-specific norm/RoPE-to-wire or CE transport; multi-GPU and model-quality gates remain |
+
+The [native-kernel examples](ulysses_native_attention_examples.md) now connect
+ordinary/whole-QKV/head-chunk Ulysses to **existing in-tree** attention kernels
+on SM90, SM100 and SM120. These examples use BF16 communication and do not need
+the external FA4 patch. The SM100 remote-Q/owner-O experiment remains separate;
+the native SM100 example uses TRT-LLM Gen, not that distributed FA4 kernel.
 
 These are explicit experimental APIs under
 `flashinfer.comm.ulysses_experimental`. Implementations live under
@@ -130,8 +136,9 @@ byte-exact reference check and is deliberately not used.
 
 Transport may reinterpret E4M3 storage as bytes if its backend lacks FP8 dtype
 support. The consumer must interpret scales/head order consistently and supply
-them to its FP8 attention backend. This PR does **not** implement that full
-consumer or guarantee end-to-end attention quality. Quantization remains lossy
+them to its FP8 attention backend. The new native examples quantize **after BF16
+communication**, using a fixed scalar recipe; they do not demonstrate transport
+of this per-head FP8 payload or guarantee model quality. Quantization remains lossy
 relative to BF16 even when pack output matches the quantized reference exactly.
 
 ## SM120 producer and K-mean
@@ -163,6 +170,9 @@ only whole versus grouped QKV projection changes. Timing is X to local all-head
 O, **excluding** QK norm, RoPE and output projection. This is not the historical
 SGLang full-sublayer benchmark. Samples alternate AB/BA and use max-rank latency.
 No small-head or bandwidth/compute tradeoff policy is enabled automatically.
+The producer benchmark also accepts `--attention sm120-sage` (or any native
+example backend), replacing its default SDPA compute with the same in-tree
+kernel adapter used by the complete QKV-to-O examples.
 
 ## Current validation, not historical performance
 

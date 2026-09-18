@@ -19,6 +19,7 @@ import torch.nn.functional as F
 
 from flashinfer.comm import UlyssesCommunicator
 from flashinfer.comm.ulysses_experimental import prepare_ulysses_producer
+from benchmarks.comm.ulysses_native_attention import BACKENDS, NativeAttention
 
 
 def main():
@@ -31,6 +32,7 @@ def main():
     parser.add_argument("--hidden", type=int, default=256)
     parser.add_argument("--schedule", default="14,14")
     parser.add_argument("--iterations", type=int, default=20)
+    parser.add_argument("--attention", choices=("sdpa", *BACKENDS), default="sdpa")
     args = parser.parse_args()
     torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
     dist.init_process_group("nccl")
@@ -84,6 +86,34 @@ def main():
     wi = cin.create_workspace(max_elems=3 * capacity)
     wo = cout.create_workspace(max_elems=capacity)
     attention_outputs = [None] * len(schedule)
+    native = []
+    error = None
+    try:
+        if args.attention != "sdpa":
+            native = [
+                NativeAttention(
+                    args.attention,
+                    sequence=args.seq,
+                    used=args.seq,
+                    heads=count,
+                    dim=args.dim,
+                )
+                for count in schedule
+            ]
+            comp.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(comp):
+                for op in native:
+                    sample = torch.zeros(
+                        1, args.seq, op.heads, args.dim, device=device, dtype=dtype
+                    )
+                    op(sample, sample, sample)
+            torch.cuda.synchronize()
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+    reports = [None] * world
+    dist.all_gather_object(reports, error)
+    if any(reports):
+        raise RuntimeError(f"native attention preparation failed: {reports}")
 
     def run(coarse):
         caller = torch.cuda.current_stream()
@@ -112,10 +142,13 @@ def main():
             with torch.cuda.stream(comp):
                 comp.wait_event(incoming[i])
                 a, b, c = received[i].split(args.dim, -1)
-                y = F.scaled_dot_product_attention(
-                    a.transpose(1, 2), b.transpose(1, 2), c.transpose(1, 2)
-                )
-                attention_outputs[i] = y.transpose(1, 2).contiguous()
+                if native:
+                    attention_outputs[i] = native[i](a, b, c)
+                else:
+                    y = F.scaled_dot_product_attention(
+                        a.transpose(1, 2), b.transpose(1, 2), c.transpose(1, 2)
+                    )
+                    attention_outputs[i] = y.transpose(1, 2).contiguous()
                 computed[i].record()
             with torch.cuda.stream(outs):
                 outs.wait_event(computed[i])
@@ -162,7 +195,7 @@ def main():
                     "gpu": torch.cuda.get_device_name(),
                     "world": world,
                     "shape": vars(args),
-                    "scope": "projection + dense SDPA pipeline, no norm/RoPE/output projection",
+                    "scope": "projection + selected attention pipeline, no norm/RoPE/output projection",
                     "median_ms": {k: statistics.median(v) for k, v in samples.items()},
                     "samples_ms": samples,
                 },
