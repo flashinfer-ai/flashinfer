@@ -3490,13 +3490,22 @@ class TmemSPResource(MemoryResource):
         stage_info: StageInfo,
         *,
         row_max: SoftmaxScalar,
+        section: cutlass.Constexpr[FmhaStage] = FmhaStage.Loop,
     ) -> tuple[SoftmaxScalar, SoftmaxScalar]:
-        """Exclude TMA zero-fill lanes in a partial fixed dense K/V tile."""
+        """Exclude TMA zero-fill lanes in a partial fixed dense K/V tile.
+
+        ``section=Tail``: called once for the last tile, mask always applied.
+        ``section=Loop``: used in loop, masks only on the last iteration.
+        """
         tmem_x = self.cfg.tmem_x_load_s
         num_chunks = self.cfg.qk_mma_tiler[1] // tmem_x
         s_data = self._load_s_chunks(stage_info)
 
-        if stage_info.loop_offset == stage_info.loop_end - Int32(1):
+        if cutlass.const_expr(section == FmhaStage.Tail):
+            is_tail_tile = True
+        else:
+            is_tail_tile = stage_info.loop_offset == stage_info.loop_end - Int32(1)
+        if is_tail_tile:
             neg_inf = cutlass.vector.full(
                 [tmem_x],
                 self.cfg.qk_acc_dtype(-Float32.inf),
