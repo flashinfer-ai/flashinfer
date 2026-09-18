@@ -1549,8 +1549,10 @@ def top_k_varlen(
         of ``compress_ratio`` (the raw sequence length, not a length already
         divided by the compression factor). Row ``t`` of request ``i`` (``t``
         in ``[0, next_n)``) ranks its first
-        ``(seq_lens[i] - next_n + t + 1) // compress_ratio`` logit columns;
-        logits at or beyond that count are excluded from the search. Passing
+        ``max(0, (seq_lens[i] - next_n + t + 1) // compress_ratio)`` logit
+        columns (padded or evicted slots can make the numerator negative; such
+        rows have no valid columns and are emitted as all ``-1``); logits at or
+        beyond that count are excluded from the search. Passing
         lengths already expressed in compressed / logit-column units together
         with ``compress_ratio > 1`` would divide the search range twice.
         A row whose length exceeds the logits width (the dynamic length has
@@ -1580,8 +1582,9 @@ def top_k_varlen(
         KV-index compression factor (``1`` for DSv3.2, ``4`` for DSv4): every
         logit column stands for ``compress_ratio`` consecutive KV tokens.
         ``seq_lens`` stay in KV-token units; the kernels derive each row's
-        valid column count as ``(seq_len - next_n + t + 1) // compress_ratio``
-        (see ``seq_lens``). Default ``1``.
+        valid column count as
+        ``max(0, (seq_len - next_n + t + 1) // compress_ratio)`` (see
+        ``seq_lens``). Default ``1``.
     next_n : int, optional
         Speculative-decode temporal stride.  Default ``1``.
     return_values : bool, optional
