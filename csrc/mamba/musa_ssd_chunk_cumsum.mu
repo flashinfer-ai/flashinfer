@@ -1,4 +1,5 @@
-// Native MUSA SSD chunk-cumsum kernel.
+// Native MUSA SSD chunk-cumsum kernel, derived from ExecBench submission
+// 77317 (source SHA 3bc58d0858800aaac6dd1cdd72c7ae73199e7c48a355c08bd6f0dc05e2cbeebd).
 //
 // This is the shape-specialized implementation from the FlashInfer MUSA
 // dashboard problem ``flashinfer_musa_ssd_chunk_cumsum_h64_c128``.  A block

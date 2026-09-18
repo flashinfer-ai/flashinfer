@@ -1,4 +1,5 @@
-// Native MUSA Simple STP selective state update.
+// Native MUSA Simple STP selective state update, derived from ExecBench
+// submission 77543 (source SHA d6d922fd3ed7d686f9456f26eb01219b83831357df654a0f1f08159c734f0fc1).
 //
 // This is the 4-warp SM90 Simple-STP dataflow specialized for the S5000
 // Nemotron decode shape (B=1,H=64,D=64,N=128,G=8).  One CTA owns four
