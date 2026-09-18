@@ -511,6 +511,14 @@ def test_layernorm_quant(
         monkeypatch.setattr(flashinfer.norm, "_USE_CUDA_NORM", True)
     elif not hasattr(flashinfer.norm, "layernorm_quant_cute"):
         pytest.skip("nvidia-cutlass-dsl not available")
+    elif not flashinfer.norm._cute_dsl_supports_arch(
+        *torch.cuda.get_device_capability()
+    ):
+        pytest.skip("CuTe DSL cannot target this compute capability")
+    else:
+        # Dispatch also honors FLASHINFER_USE_CUDA_NORM from the environment;
+        # pin it so this branch really exercises the DSL kernel.
+        monkeypatch.setattr(flashinfer.norm, "_use_cuda_norm", lambda _device: False)
 
     # The check bounds the fraction of drifting elements, so fix the seed.
     torch.manual_seed(0)
@@ -538,6 +546,14 @@ def test_layernorm_quant_invalid_inputs(backend, monkeypatch):
         monkeypatch.setattr(flashinfer.norm, "_USE_CUDA_NORM", True)
     elif not hasattr(flashinfer.norm, "layernorm_quant_cute"):
         pytest.skip("nvidia-cutlass-dsl not available")
+    elif not flashinfer.norm._cute_dsl_supports_arch(
+        *torch.cuda.get_device_capability()
+    ):
+        pytest.skip("CuTe DSL cannot target this compute capability")
+    else:
+        # Dispatch also honors FLASHINFER_USE_CUDA_NORM from the environment;
+        # pin it so this branch really exercises the DSL kernel.
+        monkeypatch.setattr(flashinfer.norm, "_use_cuda_norm", lambda _device: False)
 
     batch_size, hidden_size = 8, 1024
     x = torch.randn(batch_size, hidden_size, dtype=torch.bfloat16, device="cuda")
