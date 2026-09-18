@@ -2476,7 +2476,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 paged_kv_indptr_host, paged_kv_last_page_len_host, page_size
             )
         else:
-            kv_lens_arr_host = seq_lens.cpu().flatten()
+            kv_lens_arr_host = seq_lens.cpu().flatten().to(torch.int32)
 
         if self.is_cuda_graph_enabled:
             if batch_size != self._fixed_batch_size:
@@ -2787,7 +2787,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         if max_token_per_sequence is not None:
             self._max_q_len = max_token_per_sequence
         else:
-            self._max_q_len = max(qo_indptr_host[1:] - qo_indptr_host[:-1]).item()
+            self._max_q_len = (qo_indptr_host[1:] - qo_indptr_host[:-1]).max().item()
 
         if max_sequence_kv is not None:
             self._max_kv_len = max_sequence_kv
@@ -2799,7 +2799,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     paged_kv_indptr_host, paged_kv_last_page_len_host, page_size
                 )
             else:
-                kv_lens_arr_host = seq_lens.cpu().flatten()
+                kv_lens_arr_host = seq_lens.cpu().flatten().to(torch.int32)
             required_size = len(kv_lens_arr_host)
             if required_size > self._kv_lens_buffer.shape[0]:
                 self._kv_lens_buffer = torch.empty(
@@ -2808,7 +2808,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             self._kv_lens_buffer[:required_size].copy_(
                 kv_lens_arr_host, non_blocking=non_blocking
             )
-            self._max_kv_len = max(kv_lens_arr_host).item()
+            self._max_kv_len = kv_lens_arr_host.max().item()
 
         if self.is_cuda_graph_enabled:
             if self._max_total_num_rows is None:
