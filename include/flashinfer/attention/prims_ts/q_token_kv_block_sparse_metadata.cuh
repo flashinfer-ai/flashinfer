@@ -314,7 +314,7 @@ __launch_bounds__(kQTokenKvBlockSparseQ1BlockThreads) void QTokenKvBlockSparseQ1
 #endif
 }
 
-template <typename PositionType, int GroupSize>
+template <typename PositionType, int GroupSize, bool QueryMajor = false>
 __device__ __forceinline__ int BuildTouchedUnion(
     const QTokenKvBlockSparseTouchedMetadataParams<PositionType>& params,
     QTokenKvBlockSparseTouchedMetadataSharedStorage<
@@ -432,6 +432,12 @@ __device__ __forceinline__ int BuildTouchedUnion(
   QTokenKvBlockSparseOutputRankScan<kBlockThreads>(shared.temp.output_rank_scan)
       .ExclusiveSum(local_unique_count, thread_output_begin, union_pages);
 
+  if constexpr (QueryMajor) {
+    // Every neighbor-key read must finish before membership bytes reuse the
+    // now-dead sorted-key storage. Do not depend on CUB's internal barriers.
+    __syncthreads();
+  }
+
   int local_output_rank = 0;
 #pragma unroll
   for (int item = 0; item < kItemsPerThread; ++item) {
@@ -445,7 +451,7 @@ __device__ __forceinline__ int BuildTouchedUnion(
   return union_pages;
 }
 
-template <typename PositionType, int GroupSize, bool PackedQuery>
+template <typename PositionType, int GroupSize, bool PackedQuery, bool QueryMajor = false>
 __global__ __launch_bounds__(
     QTokenKvBlockSparseTouchedMetadataKernelTraits<GroupSize>::
         kBlockThreads) void QTokenKvBlockSparseTouchedMetadataKernel(const __grid_constant__
@@ -486,6 +492,13 @@ __global__ __launch_bounds__(
   uint8_t* group_memberships =
       reinterpret_cast<uint8_t*>(params.q_token_kv_block_sparse_page_memberships +
                                  static_cast<int64_t>(blockIdx.x) * params.membership_words);
+  if constexpr (QueryMajor) {
+    static_assert(GroupSize == 8);
+    static_assert(sizeof(shared.sorted_logical_blocks) >= kMaximumCandidates);
+    // The private entry point requires one page-4 fragment per semantic block.
+    // No extra shared allocation or intermediate GMEM membership write is needed.
+    group_memberships = reinterpret_cast<uint8_t*>(shared.sorted_logical_blocks);
+  }
 
   // bit_width(N) leaves an all-ones sentinel strictly above every live
   // [0, N) key, including when N is a power of two.
@@ -495,7 +508,7 @@ __global__ __launch_bounds__(
                                        ? active_radix_end_bit_unclamped
                                        : params.model_radix_end_bit;
   const uint32_t low_mask = (uint32_t{1} << active_radix_end_bit) - 1;
-  const int union_pages = BuildTouchedUnion<PositionType, GroupSize>(
+  const int union_pages = BuildTouchedUnion<PositionType, GroupSize, QueryMajor>(
       params, shared, active_logical_capacity, active_radix_end_bit, low_mask, group_indices,
       group_memberships);
   if (threadIdx.x == 0) {
@@ -524,6 +537,28 @@ __global__ __launch_bounds__(
   }
   __syncthreads();
 
+  if constexpr (QueryMajor) {
+    const int lane = threadIdx.x % 32;
+    const int warp = threadIdx.x / 32;
+    const int tiles = shared.union_pages == 0 ? 1 : (shared.union_pages + 31) / 32;
+    uint32_t* query_words =
+        reinterpret_cast<uint32_t*>(params.q_token_kv_block_sparse_page_memberships) +
+        static_cast<int64_t>(blockIdx.x) * params.membership_words;
+    for (int tile = warp; tile < tiles; tile += kBlockThreads / 32) {
+      const int page = tile * 32 + lane;
+      const uint32_t member = page < shared.union_pages ? group_memberships[page] : 0;
+      uint32_t own_word = 0;
+#pragma unroll
+      for (int query = 0; query < 8; ++query) {
+        const uint32_t word = __ballot_sync(0xffffffffu, (member & (1u << query)) != 0);
+        if (lane == query) own_word = word;
+      }
+      // One coalesced 32-byte output. All tail bits and inert-route words are zero.
+      if (lane < 8) query_words[tile * 8 + lane] = own_word;
+    }
+    __syncthreads();
+  }
+
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   if (params.release_pdl) {
     // Every CTA, including an inert packed route, executes the release after
@@ -535,12 +570,13 @@ __global__ __launch_bounds__(
 #endif
 }
 
-template <typename PositionType, int GroupSize, bool PackedQuery>
+template <typename PositionType, int GroupSize, bool PackedQuery, bool QueryMajor = false>
 cudaError_t LaunchQTokenKvBlockSparseTouchedMetadataTyped(
     QTokenKvBlockSparseTouchedMetadataParams<PositionType> params, cudaStream_t stream) {
   constexpr int kBlockThreads =
       QTokenKvBlockSparseTouchedMetadataKernelTraits<GroupSize>::kBlockThreads;
-  auto kernel = QTokenKvBlockSparseTouchedMetadataKernel<PositionType, GroupSize, PackedQuery>;
+  auto kernel =
+      QTokenKvBlockSparseTouchedMetadataKernel<PositionType, GroupSize, PackedQuery, QueryMajor>;
   kernel<<<params.groups* static_cast<uint32_t>(params.pattern_heads), kBlockThreads, 0, stream>>>(
       params);
   return cudaGetLastError();
@@ -557,13 +593,20 @@ cudaError_t LaunchQTokenKvBlockSparseQ1MetadataTyped(
 
 }  // namespace detail
 
-template <typename PositionType, bool PackedQuery>
+template <typename PositionType, bool PackedQuery, bool QueryMajor = false>
 cudaError_t LaunchQTokenKvBlockSparseTouchedMetadata(
     QTokenKvBlockSparseTouchedMetadataParams<PositionType> params, int32_t group_size,
     cudaStream_t stream) {
   static_assert(std::is_same_v<PositionType, int32_t> || std::is_same_v<PositionType, int64_t>);
   if (params.groups == 0) {
     return cudaSuccess;
+  }
+  if constexpr (QueryMajor) {
+    if (group_size != 8 || params.sparse_block_size != 4 || params.fragment_size != 4) {
+      return cudaErrorInvalidValue;
+    }
+    return detail::LaunchQTokenKvBlockSparseTouchedMetadataTyped<PositionType, 8, PackedQuery,
+                                                                 true>(params, stream);
   }
   switch (group_size) {
     case 1:
