@@ -2838,10 +2838,11 @@ def test_batch_prefill_cuda_graph_padding_without_split_kv(kv_cache):
 
 @pytest.mark.parametrize("batch_size", [1, 17])
 @pytest.mark.parametrize("page_size", [1, 16])
-def test_batch_prefill_plan_max_lens(batch_size, page_size):
+@pytest.mark.parametrize("seq_lens_dtype", [None, torch.int32, torch.uint32])
+def test_batch_prefill_plan_max_lens(batch_size, page_size, seq_lens_dtype):
     """plan() derives the longest query and KV length when the caller omits
-    max_token_per_sequence and max_sequence_kv. A single request is the
-    one-element case of the reduction."""
+    max_token_per_sequence and max_sequence_kv. seq_lens may be int32 or
+    uint32. A single request is the one-element case of the reduction."""
     torch.manual_seed(batch_size * 31 + page_size)
     q_lens = torch.randint(1, 65, (batch_size,), dtype=torch.int32)
     kv_lens = torch.maximum(
@@ -2869,6 +2870,7 @@ def test_batch_prefill_plan_max_lens(batch_size, page_size):
         page_size,
         causal=True,
         q_data_type=torch.float16,
+        seq_lens=None if seq_lens_dtype is None else kv_lens.to(seq_lens_dtype).cuda(),
     )
 
     assert type(wrapper._max_q_len) is int
