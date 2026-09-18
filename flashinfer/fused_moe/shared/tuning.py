@@ -149,7 +149,7 @@ def make_moe_tuning_config(
     init_packed_topk_ids: Callable | None,
     tune_max_num_tokens: int = 8192,
     act_sf_layout: SfLayout = SUPPORTED_MOE_ACT_SF_LAYOUT,
-    deepseek_input_is_mxfp8: bool = False,
+    use_mxfp8_backed_dsfp8: bool = False,
     **kwargs: Any,
 ) -> TuningConfig:
     """Build a TuningConfig for a MoE runner instance.
@@ -158,6 +158,10 @@ def make_moe_tuning_config(
     ``hidden_states_scale``; resolve it in the caller with
     :func:`~flashinfer.fused_moe.shared.validation.resolve_moe_act_sf_layout`
     so its DeprecationWarning is attributed to the user's call site.
+
+    ``use_mxfp8_backed_dsfp8`` is the public recipe selector. It also tells
+    profile generation that a DeepSeek recipe input uses token-major native-MX
+    scales rather than the ordinary ``[K/128, tokens]`` DSFP8 scale tensor.
     """
 
     spec = {
@@ -275,7 +279,7 @@ def make_moe_tuning_config(
             t = moe_inputs.hidden_states_scale
             if (
                 fp8_quantization_type == Fp8QuantizationType.DeepSeekFp8
-                and not deepseek_input_is_mxfp8
+                and not use_mxfp8_backed_dsfp8
             ):
                 assert t.shape == (hidden_size // 128, num_tokens), (
                     f"hidden_states_scale shape {tuple(t.shape)} does not match "

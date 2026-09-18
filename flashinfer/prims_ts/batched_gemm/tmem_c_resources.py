@@ -210,7 +210,7 @@ class TmemCResource(MemoryResource):
                 self.cfg.num_stages_tmem_sfa
                 if (
                     self.cfg.uses_unfused_tmem_sf_copy
-                    or self.cfg.dsfp8_mxfp8_expands_in_tmem
+                    or self.cfg.dsfp8_mxfp8_sfb_is_mxfp8
                 )
                 else 1
             )
@@ -522,9 +522,9 @@ class TmemCResource(MemoryResource):
 
         else:
             # FP4 path: block-scaled MMA
-            if cutlass.const_expr(self.cfg.dsfp8_mxfp8_expands_in_tmem):
-                # Compact FP32 scales were converted directly into the TMEM
-                # rings by LoadSfAbNativeTask.
+            if cutlass.const_expr(self.cfg.dsfp8_mxfp8_sfb_is_mxfp8):
+                # The independent CopySfA and CopySfB tasks have already
+                # published the staged native-MX scale rings in TMEM.
                 pass
             elif cutlass.const_expr(not self.cfg.uses_unfused_tmem_sf_copy):
                 # Fused S2T+MMA: do S2T copy here, then MMA.
@@ -582,8 +582,7 @@ class TmemCResource(MemoryResource):
 
             # Block-scaled MMA with scale factors in TMEM
             if cutlass.const_expr(
-                self.cfg.uses_unfused_tmem_sf_copy
-                or self.cfg.dsfp8_mxfp8_expands_in_tmem
+                self.cfg.uses_unfused_tmem_sf_copy or self.cfg.dsfp8_mxfp8_sfb_is_mxfp8
             ):
                 # SF stage offsets from separate CopySf pipeline
                 sfa_offset = sfa_stage_col_offset

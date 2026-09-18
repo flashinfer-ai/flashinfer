@@ -348,7 +348,7 @@ def _runtime_config(cfg, in_hidden: int):
                 "use_deepseek_fp8=1 requires tile_k=128 to match the "
                 f"128-K DeepSeek scale-factor blocks, got {cfg.tile_k}"
             )
-    if (cfg.has_deepseek_fp8 or cfg.has_mxfp8_deepseek_fp8) and (
+    if (cfg.has_deepseek_fp8 or cfg.has_mxfp8_backed_dsfp8) and (
         in_hidden % _DSFP8_K_BLOCK != 0
     ):
         scale_path = (
@@ -495,7 +495,7 @@ def _cutlass_data_dtype(dtype_kind: int):
 def _sf_ab_cutlass_dtype(cfg):
     if cfg.has_deepseek_fp8:
         return cutlass.Float32
-    if cfg.has_mxfp8_deepseek_fp8:
+    if cfg.has_mxfp8_backed_dsfp8:
         return cutlass.Float32
     return cutlass.Float8E8M0FNU if cfg.uses_mx_scale_factors else cutlass.Float8E4M3FN
 
@@ -562,7 +562,7 @@ def _create_mxfp8_deepseek_compact_sf_tensors(
     device: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Create compact K128 FP32 scales that require UE8M0 rounding."""
-    if not cfg.has_mxfp8_deepseek_fp8:
+    if not cfg.has_mxfp8_backed_dsfp8:
         raise ValueError("native MXFP8 compact scales require use_mxfp8_deepseek_fp8=1")
     k128_blocks = in_hidden // 128
     n128_blocks = _round_up(out_hidden, 128) // 128
@@ -1960,7 +1960,7 @@ def reference_check(
         reference_activation_sf_layout = activation_sf_layout
         weight_sf_layout = cfg.sf_layout_a if cfg.is_swap_ab else cfg.sf_layout_b
 
-        if cfg.act_kind != int(ActKind.NONE) and not cfg.has_mxfp8_deepseek_fp8:
+        if cfg.act_kind != int(ActKind.NONE) and not cfg.has_mxfp8_backed_dsfp8:
             # Fused-activation runs: Kaiming-init the data in fp32 and then
             # quantize. This keeps GEMM outputs O(1) instead of summing large
             # random products that catastrophically cancel to tiny values
@@ -2006,7 +2006,7 @@ def reference_check(
                 fan_in=in_hidden,
                 device=device,
             )
-            if cfg.has_mxfp8_deepseek_fp8:
+            if cfg.has_mxfp8_backed_dsfp8:
                 native_activation_rows = (
                     total_tokens if cfg.has_routed_sfs else total_padded_tokens
                 )
@@ -2026,17 +2026,17 @@ def reference_check(
                     total_padded_tokens=native_activation_rows,
                     device=device,
                 )
-                expanded_mxfp8_weight_scales = _materialize_dsfp8_weight_scales(
+                reference_mxfp8_weight_scales = _materialize_dsfp8_weight_scales(
                     compact_mxfp8_weight_scales
                 )
-                expanded_mxfp8_activation_scales = _materialize_dsfp8_activation_scales(
-                    compact_mxfp8_activation_scales,
-                    layout=native_activation_layout,
+                reference_mxfp8_activation_scales = (
+                    _materialize_dsfp8_activation_scales(
+                        compact_mxfp8_activation_scales,
+                        layout=native_activation_layout,
+                    )
                 )
-                reference_mxfp8_weight_scales = expanded_mxfp8_weight_scales
-                reference_mxfp8_activation_scales = expanded_mxfp8_activation_scales
                 sf_weights = compact_mxfp8_weight_scales
-                sf_activations = expanded_mxfp8_activation_scales
+                sf_activations = reference_mxfp8_activation_scales
             elif cfg.has_routed_sfs:
                 # Activation SF = linear, weight SF = R128c4
                 sf_activations = _create_sf_linear(
@@ -2097,7 +2097,7 @@ def reference_check(
         shuffled_weights = shuffle_matrix(preprocessed_weights, cfg.tile_m)
         kernel_a = _block_major_k_weight_tensor(shuffled_weights, cfg)
         kernel_b = activations_torch
-        if cfg.has_mxfp8_deepseek_fp8:
+        if cfg.has_mxfp8_backed_dsfp8:
             sf_a = sf_weights
         else:
             sf_a = _kernel_weight_sf(
@@ -3043,8 +3043,6 @@ def _build_launch_io(
     total_padded_tokens = token_layout.total_padded_tokens
     compact_mxfp8_weight_scales = None
     compact_mxfp8_activation_scales = None
-    expanded_mxfp8_weight_scales = None
-    expanded_mxfp8_activation_scales = None
 
     # Create domain tensors. Routed kernels consume compact activation rows;
     # non-routed kernels consume the expanded/padded expert-token layout.
@@ -3208,7 +3206,7 @@ def _build_launch_io(
             else activation_sf_layout
         )
         weight_sf_layout = cfg.sf_layout_a if cfg.is_swap_ab else cfg.sf_layout_b
-        if cfg.has_mxfp8_deepseek_fp8:
+        if cfg.has_mxfp8_backed_dsfp8:
             native_activation_rows = (
                 num_tokens if cfg.has_routed_sfs else total_padded_tokens
             )
@@ -3224,13 +3222,11 @@ def _build_launch_io(
                 device=device,
             )
             if cfg.dsfp8_mxfp8_sfb_is_mxfp8:
-                expanded_mxfp8_activation_scales = _materialize_dsfp8_activation_scales(
+                sf_activations = _materialize_dsfp8_activation_scales(
                     compact_mxfp8_activation_scales,
                     layout=native_activation_layout,
                 )
-                expanded_mxfp8_weight_scales = None
                 sf_weights = compact_mxfp8_weight_scales
-                sf_activations = expanded_mxfp8_activation_scales
             else:
                 sf_weights = compact_mxfp8_weight_scales
                 sf_activations = compact_mxfp8_activation_scales
@@ -3279,7 +3275,7 @@ def _build_launch_io(
             cfg,
         )
         kernel_b = activations_torch
-        if cfg.has_mxfp8_deepseek_fp8:
+        if cfg.has_mxfp8_backed_dsfp8:
             sf_a = sf_weights
         else:
             sf_a = _kernel_weight_sf(
@@ -3582,8 +3578,6 @@ def _build_launch_io(
             total_num_padded_tokens_torch,
             compact_mxfp8_weight_scales,
             compact_mxfp8_activation_scales,
-            expanded_mxfp8_weight_scales,
-            expanded_mxfp8_activation_scales,
         )
         if tensor is not None
     ]
@@ -3625,8 +3619,6 @@ def _build_launch_io(
         "sf_c_torch": sf_c_torch,
         "compact_mxfp8_weight_scales": compact_mxfp8_weight_scales,
         "compact_mxfp8_activation_scales": compact_mxfp8_activation_scales,
-        "expanded_mxfp8_weight_scales": expanded_mxfp8_weight_scales,
-        "expanded_mxfp8_activation_scales": expanded_mxfp8_activation_scales,
         "_keepalive": _keepalive,
     }
 

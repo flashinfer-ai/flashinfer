@@ -36,6 +36,9 @@ from flashinfer.prims_ts.moe.support import (
     is_prims_ts_fp8_per_tensor_supported,
 )
 from flashinfer.tllm_enums import ActivationType, Fp8QuantizationType
+
+# Select a separate trace template for the MXFP8-backed DSFP8 scale layout.
+# Other PrimsTS calls reuse the existing TRT-LLM trace templates.
 from flashinfer.trace.templates.moe import (
     prims_ts_fp8_block_scale_moe_trace_dispatch,
     prims_ts_fp8_block_scale_routed_moe_trace_dispatch,
@@ -588,7 +591,7 @@ def prims_ts_fp8_block_scale_moe(
         logical ``[gate; up]`` weight rows, then apply
         :func:`flashinfer.quantization.fp4_quantization.shuffle_matrix_a` with
         ``epilogue_tile_m=128`` to the byte view. Keep the compact FC1 scale
-        tensor in checkpoint order; the direct-TMEM loader maps shuffled weight
+        tensor in checkpoint order; the scale loader maps shuffled weight
         rows back to those logical K128x128 scale blocks.
 
     Returns
@@ -755,7 +758,7 @@ def prims_ts_fp8_block_scale_routed_moe(
         logical ``[gate; up]`` weight rows, then apply
         :func:`flashinfer.quantization.fp4_quantization.shuffle_matrix_a` with
         ``epilogue_tile_m=128`` to the byte view. Keep the compact FC1 scale
-        tensor in checkpoint order; the direct-TMEM loader maps shuffled weight
+        tensor in checkpoint order; the scale loader maps shuffled weight
         rows back to those logical K128x128 scale blocks.
 
     Returns

@@ -2172,7 +2172,7 @@ class PrimsTsFp8BlockScaleMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             num_experts=self.num_experts,
             hidden_size=self.hidden_size,
             fp8_quantization_type=self.fp8_quantization_type,
-            deepseek_input_is_mxfp8=self.use_mxfp8_backed_dsfp8,
+            use_mxfp8_backed_dsfp8=self.use_mxfp8_backed_dsfp8,
             init_packed_topk_ids=_moe_topk_ids_init_for_routing(
                 self.num_experts, routing_input_mode
             ),

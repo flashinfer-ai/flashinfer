@@ -38,6 +38,8 @@ from .smem_ab_resources import (
     SmemTmaGatherResource,
 )
 from .smem_sf_resources import (
+    SmemDsFp8MxFp8SfAResource,
+    SmemDsFp8MxFp8SfBResource,
     SmemSfAResource,
     SmemSfBResource,
     SmemSfGatherResource,
@@ -57,8 +59,6 @@ from .smem_deepseek_sf_resources import (
 )
 from .tmem_sf_resources import (
     TmemCastAResource,
-    TmemDsFp8MxFp8SfAResource,
-    TmemDsFp8MxFp8SfBResource,
     TmemSfAResource,
     TmemSfABResource,
     TmemSfBResource,
@@ -81,6 +81,8 @@ __all__ = [
     "SmemAResource",
     "SmemBResource",
     "SmemDeepSeekSfAbResource",
+    "SmemDsFp8MxFp8SfAResource",
+    "SmemDsFp8MxFp8SfBResource",
     "SmemGatherResource",
     "SmemSfAResource",
     "SmemSfBResource",
@@ -93,8 +95,6 @@ __all__ = [
     "SmemTmaGatherResource",
     "TmemCastAResource",
     "TmemCResource",
-    "TmemDsFp8MxFp8SfAResource",
-    "TmemDsFp8MxFp8SfBResource",
     "TmemSfAResource",
     "TmemSfABResource",
     "TmemSfBResource",

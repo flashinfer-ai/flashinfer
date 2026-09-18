@@ -90,6 +90,8 @@ from .batched_gemm_resources import (
     SmemSfGatherBResource,
     SmemSfLdgstsAResource,
     SmemSfLdgstsBResource,
+    SmemDsFp8MxFp8SfAResource,
+    SmemDsFp8MxFp8SfBResource,
     TmemCastAResource,
     TmemSfAResource,
     TmemSfABResource,
@@ -99,8 +101,6 @@ from .batched_gemm_resources import (
     TmemCResource,
     GmemCResource,
     SmemDeepSeekSfAbResource,
-    TmemDsFp8MxFp8SfAResource,
-    TmemDsFp8MxFp8SfBResource,
 )
 from .batched_gemm_tasks import (
     create_load_a_task,
@@ -111,7 +111,6 @@ from .batched_gemm_tasks import (
     create_sync_task,
     create_load_sfa_task,
     create_load_sfb_task,
-    create_load_sfab_native_task,
     create_cast_a_task,
     create_copy_sfa_task,
     create_copy_sfab_task,
@@ -280,7 +279,16 @@ def _make_pipeline_configs(cfg):
             advance_on_wait=cfg.has_cluster and cfg.use_combined_sfab_copy,
             num_bytes_per_warp_per_cta=smem_sfa_num_bytes_per_warp_per_cta,
         )
-        if cfg.has_cast_a:
+        if cfg.dsfp8_mxfp8_sfb_is_mxfp8:
+            smem_sfa_cfg = PipelineConfig.create_async_async_pipeline_cfg(
+                num_stages=cfg.num_stages_smem_sfa,
+                producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 32),
+                consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 128),
+                cta_layout_vmnk=None,
+                producer_signaling_threads=SignalingThreads.All,
+                consumer_signaling_threads=SignalingThreads.All,
+            )
+        elif cfg.has_cast_a:
             smem_sfa_cfg = PipelineConfig.create_tma_async_pipeline_cfg(
                 num_stages=cfg.num_stages_smem_sfa,
                 num_bytes=cfg.num_bytes_sfa_per_stage,
@@ -343,8 +351,15 @@ def _make_pipeline_configs(cfg):
             consumer_signaling_threads=SignalingThreads.CtaLeader,
             num_bytes_per_warp_per_cta=smem_sfb_num_bytes_per_warp_per_cta,
         )
-        if cfg.dsfp8_mxfp8_expands_in_tmem:
-            pass
+        if cfg.dsfp8_mxfp8_sfb_is_mxfp8:
+            smem_sfb_cfg = PipelineConfig.create_async_async_pipeline_cfg(
+                num_stages=cfg.num_stages_smem_sfb,
+                producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 32),
+                consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 128),
+                cta_layout_vmnk=None,
+                producer_signaling_threads=SignalingThreads.All,
+                consumer_signaling_threads=SignalingThreads.All,
+            )
         elif cfg.sfb_smem_to_tmem_copy == int(
             SfSmemToTmemCopy.LDS_STTM
         ) and cfg.smem_sfb_layout == int(SfLayout.R8c4):
@@ -485,7 +500,7 @@ def _make_pipeline_configs(cfg):
         if (
             cfg.has_routed_sfs
             and cfg.uses_ldgsts_routed_sfs
-            and not cfg.dsfp8_mxfp8_expands_in_tmem
+            and not cfg.has_mxfp8_backed_dsfp8
         ):
             ldgsts_consumer_signaling = (
                 SignalingThreads.CtaLeader if cfg.has_cluster else SignalingThreads.All
@@ -550,35 +565,29 @@ def _make_pipeline_configs(cfg):
             else:
                 result["smem_sfa"] = ldgsts_sfa_cfg
 
-    # TmemSf pipeline: the combined tcgen05_cp path uses, so
-    # the full-barrier commit is a UMMA/TCGen05 producer arrival.  Compact SFB
-    # uses LDS+STTM and keeps async-producer + UMMA-consumer semantics.
+    # TmemSf pipelines. The combined tcgen05_cp path has one UMMA producer;
+    # LDS+STTM paths use async-thread producers and UMMA consumers.
     if cfg.has_scale_factors and (
-        cfg.uses_unfused_tmem_sf_copy or cfg.dsfp8_mxfp8_expands_in_tmem
+        cfg.uses_unfused_tmem_sf_copy or cfg.dsfp8_mxfp8_sfb_is_mxfp8
     ):
-        if cfg.dsfp8_mxfp8_expands_in_tmem:
-            # LoadSf warps perform the FP32 conversion and warp-collective
-            # tcgen05_st directly into the TMEM scale rings.
-            result["tmem_sfa"] = PipelineConfig.create_async_umma_pipeline_cfg(
-                num_stages=cfg.num_stages_tmem_sfa,
-                producer_group=pipeline.CooperativeGroup(
-                    pipeline.Agent.Thread, cfg.num_load_sfa_warps * 32
-                ),
-                consumer_group=one_thread,
-                cta_layout_vmnk=cluster_vmnk,
-                producer_signaling_threads=SignalingThreads.CtaLeader,
-                consumer_signaling_threads=SignalingThreads.CtaLeader,
-            )
-            result["tmem_sfb"] = PipelineConfig.create_async_umma_pipeline_cfg(
-                num_stages=cfg.num_stages_tmem_sfb,
-                producer_group=pipeline.CooperativeGroup(
-                    pipeline.Agent.Thread, cfg.num_load_sfb_warps * 32
-                ),
-                consumer_group=one_thread,
-                cta_layout_vmnk=cluster_vmnk,
-                producer_signaling_threads=SignalingThreads.CtaLeader,
-                consumer_signaling_threads=SignalingThreads.CtaLeader,
-            )
+        if cfg.dsfp8_mxfp8_sfb_is_mxfp8:
+            for operand, num_stages, num_copy_warps in (
+                ("a", cfg.num_stages_tmem_sfa, cfg.num_copy_sfa_warps),
+                ("b", cfg.num_stages_tmem_sfb, cfg.num_copy_sfb_warps),
+            ):
+                result[f"tmem_sf{operand}"] = (
+                    PipelineConfig.create_async_umma_pipeline_cfg(
+                        num_stages=num_stages,
+                        producer_group=pipeline.CooperativeGroup(
+                            pipeline.Agent.Thread,
+                            num_copy_warps * 32 * cfg.cluster_m,
+                        ),
+                        consumer_group=one_thread,
+                        cta_layout_vmnk=cluster_vmnk,
+                        producer_signaling_threads=SignalingThreads.All,
+                        consumer_signaling_threads=SignalingThreads.CtaLeader,
+                    )
+                )
         elif cfg.use_combined_sfab_copy:
             result["tmem_sfab"] = PipelineConfig.create_umma_umma_pipeline_cfg(
                 num_stages=max(cfg.num_stages_tmem_sfa, cfg.num_stages_tmem_sfb),
@@ -685,25 +694,16 @@ def _make_pipeline_configs(cfg):
         add_clc_consumer_warps(cfg.num_cast_a_warps)
         add_clc_consumer_warps(cfg.num_mma_warps, leader_only=cfg.has_cluster)
         add_clc_consumer_warps(cfg.num_workid_warps, leader_only=cfg.has_cluster)
-        if cfg.dsfp8_mxfp8_expands_in_tmem:
-            # LoadSfAbNative is one physical warpgroup producing both logical
-            # scale resources, and CTA-2 runs it on the leader only. Count it
-            # exactly once in the CLC empty-barrier arrival contract.
-            add_clc_consumer_warps(
-                cfg.num_load_sfa_warps,
-                leader_only=cfg.has_cluster,
-            )
-        elif cfg.has_scale_factor_a and not cfg.fuse_operand_sf_loads:
+        if cfg.has_scale_factor_a and not cfg.fuse_operand_sf_loads:
             add_clc_consumer_warps(cfg.num_load_sfa_warps)
         if cfg.has_deepseek_fp8:
             add_clc_consumer_warps(cfg.num_load_sfab_warps)
-        if (
-            cfg.has_scale_factors
-            and not cfg.dsfp8_mxfp8_expands_in_tmem
-            and not cfg.fuse_operand_sf_loads
-        ):
+        if cfg.has_scale_factors and not cfg.fuse_operand_sf_loads:
             add_clc_consumer_warps(cfg.num_load_sfb_warps)
-            if cfg.use_combined_sfab_copy:
+            if cfg.dsfp8_mxfp8_sfb_is_mxfp8:
+                add_clc_consumer_warps(cfg.num_copy_sfa_warps)
+                add_clc_consumer_warps(cfg.num_copy_sfb_warps)
+            elif cfg.use_combined_sfab_copy:
                 add_clc_consumer_warps(
                     cfg.num_copy_sfa_warps,
                     leader_only=cfg.has_cluster,
@@ -974,19 +974,13 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
     if cfg.has_scale_factors:
         gmem_sfa = GmemSfAResource(cfg=cfg, name="GmemSfA")
         gmem_sfb = GmemSfBResource(cfg=cfg, name="GmemSfB")
-        if cfg.dsfp8_mxfp8_expands_in_tmem:
-            tmem_sfa = TmemDsFp8MxFp8SfAResource(
-                cfg=cfg,
-                pipeline_config=pcfgs["tmem_sfa"],
-                name="TmemSfA",
+        if cfg.dsfp8_mxfp8_sfb_is_mxfp8:
+            smem_sfa = SmemDsFp8MxFp8SfAResource(
+                cfg=cfg, pipeline_config=pcfgs["smem_sfa"], name="SmemSfA"
             )
-            tmem_sfb = TmemDsFp8MxFp8SfBResource(
-                cfg=cfg,
-                pipeline_config=pcfgs["tmem_sfb"],
-                name="TmemSfB",
+            smem_sfb = SmemDsFp8MxFp8SfBResource(
+                cfg=cfg, pipeline_config=pcfgs["smem_sfb"], name="SmemSfB"
             )
-            smem_sfa = tmem_sfa
-            smem_sfb = tmem_sfb
         elif cfg.has_routed_sfs and cfg.uses_ldgsts_routed_sfs:
             if cfg.is_swap_ab:
                 smem_sfa = SmemSfAResource(
@@ -1017,73 +1011,45 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
                 cfg=cfg, pipeline_config=pcfgs["smem_sfb"], name="SmemSfB"
             )
 
-        if cfg.dsfp8_mxfp8_expands_in_tmem:
-            pass
-        elif cfg.use_combined_sfab_copy:
+        if cfg.use_combined_sfab_copy:
             tmem_sfab = TmemSfABResource(
                 cfg=cfg, pipeline_config=pcfgs["tmem_sfab"], name="TmemSfAb"
             )
-        elif cfg.uses_unfused_tmem_sf_copy:
-            # Separate CopySf tasks: TmemSf with pipelines
-            if cfg.is_swap_ab:
+        elif cfg.uses_unfused_tmem_sf_copy or cfg.dsfp8_mxfp8_sfb_is_mxfp8:
+            sfa_uses_route_resource = (
+                cfg.has_routed_sfs and not cfg.is_swap_ab
+            ) or cfg.sfa_smem_to_tmem_copy == int(SfSmemToTmemCopy.LDS_STTM)
+            sfb_uses_route_resource = (
+                cfg.has_routed_sfs and cfg.is_swap_ab
+            ) or cfg.sfb_smem_to_tmem_copy == int(SfSmemToTmemCopy.LDS_STTM)
+            if sfa_uses_route_resource:
+                tmem_sfa = TmemSfRouteAResource(
+                    cfg=cfg,
+                    smem_sf_resource=smem_sfa,
+                    pipeline_config=pcfgs["tmem_sfa"],
+                    name="TmemSfA",
+                )
+            else:
                 tmem_sfa = TmemSfAResource(
                     cfg=cfg, pipeline_config=pcfgs["tmem_sfa"], name="TmemSfA"
                 )
-                if cfg.has_routed_sfs or cfg.sfb_smem_to_tmem_copy == int(
-                    SfSmemToTmemCopy.LDS_STTM
-                ):
-                    tmem_sfb = TmemSfRouteBResource(
-                        cfg=cfg,
-                        smem_sf_resource=smem_sfb,
-                        pipeline_config=pcfgs["tmem_sfb"],
-                        name="TmemSfB",
-                    )
-                else:
-                    tmem_sfb = TmemSfBResource(
-                        cfg=cfg, pipeline_config=pcfgs["tmem_sfb"], name="TmemSfB"
-                    )
+            if sfb_uses_route_resource:
+                tmem_sfb = TmemSfRouteBResource(
+                    cfg=cfg,
+                    smem_sf_resource=smem_sfb,
+                    pipeline_config=pcfgs["tmem_sfb"],
+                    name="TmemSfB",
+                )
             else:
-                if cfg.has_routed_sfs:
-                    tmem_sfa = TmemSfRouteAResource(
-                        cfg=cfg,
-                        smem_sf_resource=smem_sfa,
-                        pipeline_config=pcfgs["tmem_sfa"],
-                        name="TmemSfA",
-                    )
-                else:
-                    tmem_sfa = TmemSfAResource(
-                        cfg=cfg, pipeline_config=pcfgs["tmem_sfa"], name="TmemSfA"
-                    )
-                if cfg.sfb_smem_to_tmem_copy == int(SfSmemToTmemCopy.LDS_STTM):
-                    tmem_sfb = TmemSfRouteBResource(
-                        cfg=cfg,
-                        smem_sf_resource=smem_sfb,
-                        pipeline_config=pcfgs["tmem_sfb"],
-                        name="TmemSfB",
-                    )
-                else:
-                    tmem_sfb = TmemSfBResource(
-                        cfg=cfg, pipeline_config=pcfgs["tmem_sfb"], name="TmemSfB"
-                    )
+                tmem_sfb = TmemSfBResource(
+                    cfg=cfg, pipeline_config=pcfgs["tmem_sfb"], name="TmemSfB"
+                )
         else:
             # Fused S2T in MMA: no pipeline on TmemSf
             tmem_sfa = TmemSfAResource(cfg=cfg, pipeline_config=None, name="TmemSfA")
             tmem_sfb = TmemSfBResource(cfg=cfg, pipeline_config=None, name="TmemSfB")
 
-        if cfg.dsfp8_mxfp8_expands_in_tmem:
-            load_sfab = create_load_sfab_native_task(
-                cfg,
-                gmem_sfa,
-                gmem_sfb,
-                tmem_sfa,
-                tmem_sfb,
-                work_queue,
-                num_k_tiles,
-                pdl_wait_resource=pdl_wait_resource,
-                pdl_launch_resource=pdl_launch_resource,
-            )
-            task_list.append(load_sfab)
-        elif cfg.fuse_operand_sf_loads:
+        if cfg.fuse_operand_sf_loads:
             task_list = [
                 create_fused_load_a_sfa_task(
                     cfg,
@@ -1128,7 +1094,7 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
             )
             task_list += [load_sfa, load_sfb]
 
-        if cfg.uses_unfused_tmem_sf_copy and not cfg.dsfp8_mxfp8_expands_in_tmem:
+        if cfg.uses_unfused_tmem_sf_copy or cfg.dsfp8_mxfp8_sfb_is_mxfp8:
             if cfg.use_combined_sfab_copy:
                 copy_sfab = create_copy_sfab_task(
                     cfg, smem_sfa, smem_sfb, tmem_sfab, work_queue, num_k_tiles
@@ -1158,7 +1124,7 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
             tmem_cast_a=tmem_cast_a,
         )
     elif cfg.has_scale_factors and (
-        cfg.uses_unfused_tmem_sf_copy or cfg.dsfp8_mxfp8_expands_in_tmem
+        cfg.uses_unfused_tmem_sf_copy or cfg.dsfp8_mxfp8_sfb_is_mxfp8
     ):
         if cfg.use_combined_sfab_copy:
             mma = create_mma_task(
@@ -1255,10 +1221,17 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
         smem_b: [gmem_b],
         gmem_c: [tmem_c],
     }
-    if cfg.has_scale_factors and cfg.dsfp8_mxfp8_expands_in_tmem:
-        resource_dependency_graph[tmem_sfa] = [gmem_sfa]
-        resource_dependency_graph[tmem_sfb] = [gmem_sfb]
-        resource_dependency_graph[tmem_c] = [smem_a, smem_b, tmem_sfa, tmem_sfb]
+    if cfg.has_scale_factors and cfg.dsfp8_mxfp8_sfb_is_mxfp8:
+        resource_dependency_graph[smem_sfa] = [gmem_sfa]
+        resource_dependency_graph[smem_sfb] = [gmem_sfb]
+        resource_dependency_graph[tmem_sfa] = [smem_sfa]
+        resource_dependency_graph[tmem_sfb] = [smem_sfb]
+        resource_dependency_graph[tmem_c] = [
+            smem_a,
+            smem_b,
+            tmem_sfa,
+            tmem_sfb,
+        ]
     elif cfg.has_scale_factors and cfg.uses_unfused_tmem_sf_copy:
         resource_dependency_graph[smem_sfa] = [gmem_sfa]
         resource_dependency_graph[smem_sfb] = [gmem_sfb]
@@ -1362,7 +1335,9 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
     tmem_allocator.add_resource(tmem_c)
     if cfg.has_cast_a:
         tmem_allocator.add_resource(tmem_cast_a)
-    if cfg.has_scale_factors and cfg.uses_unfused_tmem_sf_copy:
+    if cfg.has_scale_factors and (
+        cfg.uses_unfused_tmem_sf_copy or cfg.dsfp8_mxfp8_sfb_is_mxfp8
+    ):
         if cfg.use_combined_sfab_copy:
             tmem_allocator.add_resource(tmem_sfab)
         else:
@@ -1669,12 +1644,35 @@ def _batched_gemm_kernel_bf16_body(
         # Routed operand's SF uses gather4 when route_sfs_act == TMA.
         # non-swapAB: A=activations (routed) → SFA gathered.
         # swapAB: B=activations (routed) → SFB gathered.
-        if cutlass.const_expr(cfg.dsfp8_mxfp8_expands_in_tmem):
-            # Compact FP32 scales bypass the ordinary SMEM scale resources;
-            # the direct resources below are both the GMEM producer
-            # destination and the MMA-visible TMEM ring.
-            smem_sfa = None
-            smem_sfb = None
+        if cutlass.const_expr(cfg.dsfp8_mxfp8_sfb_is_mxfp8):
+            smem_sfa = SmemDsFp8MxFp8SfAResource(
+                cfg=cfg,
+                compact_scales=cutlass.make_array_view(sfa_gmem_tensor),
+                problem_rows=problem_m,
+                source_rows=problem_m_tiles,
+                problem_k=problem_k,
+                pipeline_config=pcfgs["smem_sfa"],
+                name="SmemSfA",
+            )
+            smem_sfb = SmemDsFp8MxFp8SfBResource(
+                cfg=cfg,
+                compact_scales=cutlass.make_array_view(sfb_gmem_tensor),
+                problem_rows=problem_n,
+                source_rows=num_tokens if cfg.has_routed_sfs else problem_n,
+                problem_k=problem_k,
+                route_map=(
+                    cutlass.make_array_view(route_map_tensor)
+                    if cfg.has_routed_sfs
+                    else None
+                ),
+                mn_limit=(
+                    cutlass.make_array_view(mn_limit_tensor)
+                    if cfg.has_routed_sfs
+                    else None
+                ),
+                pipeline_config=pcfgs["smem_sfb"],
+                name="SmemSfB",
+            )
         elif cutlass.const_expr(cfg.has_routed_sfs and cfg.uses_tma_routed_sfs):
             route_map_sf = cutlass.make_array_view(route_map_tensor)
             mn_limit_sf = cutlass.make_array_view(mn_limit_tensor)
@@ -1768,96 +1766,45 @@ def _batched_gemm_kernel_bf16_body(
                 pipeline_config=pcfgs["smem_sfb"],
                 name="SmemSfB",
             )
-        # TmemSf resources: when SF is routed, separate CopySf tasks need pipelines.
-        # When not routed, S2T is fused in MMA (pipeline_config=None).
-        if cutlass.const_expr(cfg.dsfp8_mxfp8_expands_in_tmem):
-            tmem_sfa = TmemDsFp8MxFp8SfAResource(
-                cfg=cfg,
-                compact_scales=cutlass.make_array_view(sfa_gmem_tensor),
-                problem_rows=problem_m,
-                source_rows=problem_m_tiles,
-                problem_k=problem_k,
-                pipeline_config=pcfgs["tmem_sfa"],
-                name="TmemSfA",
-            )
-            tmem_sfb = TmemDsFp8MxFp8SfBResource(
-                cfg=cfg,
-                compact_scales=cutlass.make_array_view(sfb_gmem_tensor),
-                problem_rows=problem_n,
-                source_rows=num_tokens if cfg.has_routed_sfs else problem_n,
-                problem_k=problem_k,
-                route_map=(
-                    cutlass.make_array_view(route_map_tensor)
-                    if cfg.has_routed_sfs
-                    else None
-                ),
-                mn_limit=(
-                    cutlass.make_array_view(mn_limit_tensor)
-                    if cfg.has_routed_sfs
-                    else None
-                ),
-                pipeline_config=pcfgs["tmem_sfb"],
-                name="TmemSfB",
-            )
-            # The existing LoadSf task factories are generic producer loops.
-            # In direct-TMEM mode their destination is the TMEM scale ring.
-            smem_sfa = tmem_sfa
-            smem_sfb = tmem_sfb
-        elif cutlass.const_expr(cfg.use_combined_sfab_copy):
+        # Separate CopySf tasks use pipelined TMEM resources. Route resources
+        # implement routed operands and generated LDS+STTM copies.
+        if cutlass.const_expr(cfg.use_combined_sfab_copy):
             tmem_sfab = TmemSfABResource(
                 cfg=cfg,
                 pipeline_config=pcfgs["tmem_sfab"],
                 name="TmemSfAb",
             )
-        elif cutlass.const_expr(cfg.uses_unfused_tmem_sf_copy):
-            # Routed SF uses TmemSfRouteResource (LDS+STTM).
-            # Non-routed SF uses standard TmemSfA/BResource (tcgen05_cp S2T).
-            # Both get AsyncUmma pipeline for separate CopySf tasks.
-            if cutlass.const_expr(cfg.is_swap_ab):
-                # swapAB: SFB is routed (activations), SFA is not (weights)
+        elif cutlass.const_expr(
+            cfg.uses_unfused_tmem_sf_copy or cfg.dsfp8_mxfp8_sfb_is_mxfp8
+        ):
+            sfa_uses_route_resource = (
+                cfg.has_routed_sfs and not cfg.is_swap_ab
+            ) or cfg.sfa_smem_to_tmem_copy == int(SfSmemToTmemCopy.LDS_STTM)
+            sfb_uses_route_resource = (
+                cfg.has_routed_sfs and cfg.is_swap_ab
+            ) or cfg.sfb_smem_to_tmem_copy == int(SfSmemToTmemCopy.LDS_STTM)
+            if cutlass.const_expr(sfa_uses_route_resource):
+                tmem_sfa = TmemSfRouteAResource(
+                    cfg=cfg,
+                    smem_sf_resource=smem_sfa,
+                    pipeline_config=pcfgs["tmem_sfa"],
+                    name="TmemSfA",
+                )
+            else:
                 tmem_sfa = TmemSfAResource(
                     cfg=cfg, pipeline_config=pcfgs["tmem_sfa"], name="TmemSfA"
                 )
-                if cutlass.const_expr(
-                    cfg.has_routed_sfs
-                    or cfg.sfb_smem_to_tmem_copy == int(SfSmemToTmemCopy.LDS_STTM)
-                ):
-                    tmem_sfb = TmemSfRouteBResource(
-                        cfg=cfg,
-                        smem_sf_resource=smem_sfb,
-                        pipeline_config=pcfgs["tmem_sfb"],
-                        name="TmemSfB",
-                    )
-                else:
-                    tmem_sfb = TmemSfBResource(
-                        cfg=cfg, pipeline_config=pcfgs["tmem_sfb"], name="TmemSfB"
-                    )
+            if cutlass.const_expr(sfb_uses_route_resource):
+                tmem_sfb = TmemSfRouteBResource(
+                    cfg=cfg,
+                    smem_sf_resource=smem_sfb,
+                    pipeline_config=pcfgs["tmem_sfb"],
+                    name="TmemSfB",
+                )
             else:
-                # non-swapAB: SFA is routed (activations), SFB is not (weights)
-                if cutlass.const_expr(cfg.has_routed_sfs):
-                    tmem_sfa = TmemSfRouteAResource(
-                        cfg=cfg,
-                        smem_sf_resource=smem_sfa,
-                        pipeline_config=pcfgs["tmem_sfa"],
-                        name="TmemSfA",
-                    )
-                else:
-                    tmem_sfa = TmemSfAResource(
-                        cfg=cfg, pipeline_config=pcfgs["tmem_sfa"], name="TmemSfA"
-                    )
-                if cutlass.const_expr(
-                    cfg.sfb_smem_to_tmem_copy == int(SfSmemToTmemCopy.LDS_STTM)
-                ):
-                    tmem_sfb = TmemSfRouteBResource(
-                        cfg=cfg,
-                        smem_sf_resource=smem_sfb,
-                        pipeline_config=pcfgs["tmem_sfb"],
-                        name="TmemSfB",
-                    )
-                else:
-                    tmem_sfb = TmemSfBResource(
-                        cfg=cfg, pipeline_config=pcfgs["tmem_sfb"], name="TmemSfB"
-                    )
+                tmem_sfb = TmemSfBResource(
+                    cfg=cfg, pipeline_config=pcfgs["tmem_sfb"], name="TmemSfB"
+                )
         else:
             # Not routed: fused S2T in MMA, no pipeline
             tmem_sfa = TmemSfAResource(cfg=cfg, pipeline_config=None, name="TmemSfA")
@@ -1944,7 +1891,6 @@ def _batched_gemm_kernel_bf16_body(
             pipeline_config=pcfgs["work_throttle"],
             name="WorkThrottle",
         )
-
     # SMEM allocator
     smem_allocator = SmemAllocator()
     smem_resources: tuple[Any, ...] = (smem_a, smem_b)
@@ -1984,7 +1930,10 @@ def _batched_gemm_kernel_bf16_body(
     tmem_allocator.add_resource(tmem_c)
     if cutlass.const_expr(cfg.has_cast_a):
         tmem_allocator.add_resource(tmem_cast_a)
-    if cutlass.const_expr(cfg.has_scale_factors and cfg.uses_unfused_tmem_sf_copy):
+    if cutlass.const_expr(
+        cfg.has_scale_factors
+        and (cfg.uses_unfused_tmem_sf_copy or cfg.dsfp8_mxfp8_sfb_is_mxfp8)
+    ):
         if cutlass.const_expr(cfg.use_combined_sfab_copy):
             tmem_allocator.add_resource(tmem_sfab)
         else:
@@ -2145,49 +2094,35 @@ def _batched_gemm_kernel_bf16_body(
         task_list += [load_sfa, cast_a]
 
     if cutlass.const_expr(cfg.has_scale_factors and not cfg.fuse_operand_sf_loads):
-        if cutlass.const_expr(cfg.dsfp8_mxfp8_expands_in_tmem):
-            load_sfab = create_load_sfab_native_task(
-                cfg,
-                gmem_sfa,
-                gmem_sfb,
-                tmem_sfa,
-                tmem_sfb,
-                work_queue,
-                k_tile_cnt,
-                pdl_wait_resource=pdl_wait_resource,
-                pdl_launch_resource=pdl_launch_resource,
-            )
-            task_list.append(load_sfab)
-        else:
-            load_sfa = create_load_sfa_task(
-                cfg,
-                gmem_sfa,
-                smem_sfa,
-                work_queue,
-                k_tile_cnt,
-                pdl_wait_resource=(
-                    None if cutlass.const_expr(cfg.is_swap_ab) else pdl_wait_resource
-                ),
-                pdl_launch_resource=(
-                    None if cutlass.const_expr(cfg.is_swap_ab) else pdl_launch_resource
-                ),
-            )
-            load_sfb = create_load_sfb_task(
-                cfg,
-                gmem_sfb,
-                smem_sfb,
-                work_queue,
-                k_tile_cnt,
-                pdl_wait_resource=(
-                    pdl_wait_resource if cutlass.const_expr(cfg.is_swap_ab) else None
-                ),
-                pdl_launch_resource=(
-                    pdl_launch_resource if cutlass.const_expr(cfg.is_swap_ab) else None
-                ),
-            )
-            task_list += [load_sfa, load_sfb]
+        load_sfa = create_load_sfa_task(
+            cfg,
+            gmem_sfa,
+            smem_sfa,
+            work_queue,
+            k_tile_cnt,
+            pdl_wait_resource=(
+                None if cutlass.const_expr(cfg.is_swap_ab) else pdl_wait_resource
+            ),
+            pdl_launch_resource=(
+                None if cutlass.const_expr(cfg.is_swap_ab) else pdl_launch_resource
+            ),
+        )
+        load_sfb = create_load_sfb_task(
+            cfg,
+            gmem_sfb,
+            smem_sfb,
+            work_queue,
+            k_tile_cnt,
+            pdl_wait_resource=(
+                pdl_wait_resource if cutlass.const_expr(cfg.is_swap_ab) else None
+            ),
+            pdl_launch_resource=(
+                pdl_launch_resource if cutlass.const_expr(cfg.is_swap_ab) else None
+            ),
+        )
+        task_list += [load_sfa, load_sfb]
         if cutlass.const_expr(
-            cfg.uses_unfused_tmem_sf_copy and not cfg.dsfp8_mxfp8_expands_in_tmem
+            cfg.uses_unfused_tmem_sf_copy or cfg.dsfp8_mxfp8_sfb_is_mxfp8
         ):
             # Separate CopySf tasks for SMEM→TMEM when SF is routed.
             if cutlass.const_expr(cfg.use_combined_sfab_copy):
@@ -2208,7 +2143,7 @@ def _batched_gemm_kernel_bf16_body(
     # Otherwise MMA consumes SmemSf and does fused S2T in producer_work.
     if cutlass.const_expr(
         cfg.has_scale_factors
-        and (cfg.uses_unfused_tmem_sf_copy or cfg.dsfp8_mxfp8_expands_in_tmem)
+        and (cfg.uses_unfused_tmem_sf_copy or cfg.dsfp8_mxfp8_sfb_is_mxfp8)
     ):
         # MMA consumes TmemSf — SF already in TMEM from CopySf tasks
         smem_sfa_for_mma = None
@@ -2225,7 +2160,7 @@ def _batched_gemm_kernel_bf16_body(
         tmem_sfa
         if cutlass.const_expr(
             cfg.has_scale_factors
-            and (cfg.uses_unfused_tmem_sf_copy or cfg.dsfp8_mxfp8_expands_in_tmem)
+            and (cfg.uses_unfused_tmem_sf_copy or cfg.dsfp8_mxfp8_sfb_is_mxfp8)
             and not cfg.use_combined_sfab_copy
         )
         else None
@@ -2234,7 +2169,7 @@ def _batched_gemm_kernel_bf16_body(
         tmem_sfb
         if cutlass.const_expr(
             cfg.has_scale_factors
-            and (cfg.uses_unfused_tmem_sf_copy or cfg.dsfp8_mxfp8_expands_in_tmem)
+            and (cfg.uses_unfused_tmem_sf_copy or cfg.dsfp8_mxfp8_sfb_is_mxfp8)
             and not cfg.use_combined_sfab_copy
         )
         else None
@@ -2296,10 +2231,17 @@ def _batched_gemm_kernel_bf16_body(
         smem_b: [gmem_b],
         gmem_c: [tmem_c],
     }
-    if cutlass.const_expr(cfg.has_scale_factors and cfg.dsfp8_mxfp8_expands_in_tmem):
-        resource_dependency_graph[tmem_sfa] = [gmem_sfa]
-        resource_dependency_graph[tmem_sfb] = [gmem_sfb]
-        resource_dependency_graph[tmem_c] = [smem_a, smem_b, tmem_sfa, tmem_sfb]
+    if cutlass.const_expr(cfg.has_scale_factors and cfg.dsfp8_mxfp8_sfb_is_mxfp8):
+        resource_dependency_graph[smem_sfa] = [gmem_sfa]
+        resource_dependency_graph[smem_sfb] = [gmem_sfb]
+        resource_dependency_graph[tmem_sfa] = [smem_sfa]
+        resource_dependency_graph[tmem_sfb] = [smem_sfb]
+        resource_dependency_graph[tmem_c] = [
+            smem_a,
+            smem_b,
+            tmem_sfa,
+            tmem_sfb,
+        ]
     elif cutlass.const_expr(cfg.has_scale_factors and cfg.uses_unfused_tmem_sf_copy):
         resource_dependency_graph[smem_sfa] = [gmem_sfa]
         resource_dependency_graph[smem_sfb] = [gmem_sfb]
@@ -2887,9 +2829,7 @@ def gemm(
     # E8M0 scale factors are packed 2 per uint16 for TMA transport.
     tma_sfa_desc = None
     tma_sfb_desc = None
-    if cutlass.const_expr(
-        cfg.has_scale_factor_a and not cfg.dsfp8_mxfp8_expands_in_tmem
-    ):
+    if cutlass.const_expr(cfg.has_scale_factor_a and not cfg.dsfp8_mxfp8_sfb_is_mxfp8):
         sf_vec_size = cfg.sf_vec_size
         sf_tma_ptr_dtype = cutlass.Uint8
         # Each K-block = 4 SF atoms. dim0 = tile_mn * 4 / 2 (uint16 packing)
@@ -3375,17 +3315,13 @@ def gemm(
     )
 
     # SF TMA descriptors: real only for operands that have scale factors.
-    if cutlass.const_expr(
-        not cfg.has_scale_factor_a or cfg.dsfp8_mxfp8_expands_in_tmem
-    ):
+    if cutlass.const_expr(not cfg.has_scale_factor_a or cfg.dsfp8_mxfp8_sfb_is_mxfp8):
         tma_sfa_desc = tma_a_desc  # dummy, never accessed
-    if cutlass.const_expr(
-        not cfg.has_scale_factor_b or cfg.dsfp8_mxfp8_expands_in_tmem
-    ):
+    if cutlass.const_expr(not cfg.has_scale_factor_b or cfg.dsfp8_mxfp8_sfb_is_mxfp8):
         tma_sfb_desc = tma_b_desc  # dummy, never accessed
 
     # SF GMEM tensors for LDGSTS SF loading.
-    if cutlass.const_expr(cfg.has_mxfp8_deepseek_fp8):
+    if cutlass.const_expr(cfg.has_mxfp8_backed_dsfp8):
         k128_blocks = k // Int32(128)
         weight_n128_blocks = (
             (m + Int32(127)) // Int32(128)

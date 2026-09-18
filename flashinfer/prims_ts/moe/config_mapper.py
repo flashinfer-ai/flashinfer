@@ -2076,7 +2076,7 @@ def map_trtllm_deepseek_fp8_moe_tactic(
 ) -> PrimsTsGemmPair:
     """Return Prims-TS FC1/FC2 configs for Prims-TS DeepSeek FP8 MoE.
 
-    ``use_mxfp8_backed_dsfp8=True`` selects the direct-TMEM path. Both FCs
+    ``use_mxfp8_backed_dsfp8=True`` selects the staged native-MX path. Both FCs
     consume native UE8M0 K32 activation scales, while weights retain compact
     K128 FP32 checkpoint scales. FC1 SwiGLU emits true MXFP8 for FC2 to consume
     directly. The former pre-expanded GMEM recipe has been removed.
@@ -2149,10 +2149,16 @@ def map_trtllm_deepseek_fp8_moe_tactic(
         sf_layout_a=int(_SfLayout.R128c4),
         sf_layout_b=interstage_sf_layout,
         num_load_sfab_warps=0,
+        # The staged recipe adds two independent four-warp CopySf groups.
+        # Inheriting the DeepSeek FC1 row's 80-register load budget for those
+        # eight warps can starve SETMAXNREG redistribution and deadlock the
+        # CTA-2 kernel.  The copy loops need only the established 64-register
+        # native-MX budget.
+        copy_sf_regs=64,
     )
     if tile_n == 128:
         # The DeepSeek JSON includes FC2 variants with four accumulator stages.
-        # Native direct-TMEM SFA/SFB adds 48 columns, so those variants would
+        # Native SFA/SFB TMEM rings add 48 columns, so those variants would
         # require 560 columns and cannot fit tcgen05's 512-column allocation.
         # Two accumulator stages preserve the ping-pong contract and leave room
         # for both scale rings.
@@ -2197,9 +2203,8 @@ def map_trtllm_deepseek_fp8_moe_tactic(
         route_sfs_act=int(_RouteImpl.NONE),
     )
     # Preserve approximately the same buffered K depth and memory footprint
-    # after doubling tile_k.  Direct TMEM does not allocate the SMEM scale
-    # stages, but keeping every pipeline's stage count paired avoids inflated
-    # TMEM allocation and makes the mapping explicit.
+    # after doubling tile_k. Keeping the operand and scale pipelines paired
+    # avoids inflated SMEM/TMEM allocation and makes the mapping explicit.
     for native_kwargs in (fc1_kwargs, fc2_kwargs):
         k128_blocks_per_stage = int(native_kwargs["tile_k"]) // 128
         for stage_name in (
