@@ -201,12 +201,13 @@ void moe_unpermute_bf16_float_scale_tiled(int64_t input_ptr, int64_t output_ptr,
 void moe_unpermute_bf16_float_scale_native(int64_t input_ptr, int64_t output_ptr,
                                            int64_t inverse_ptr, int64_t scales_ptr,
                                            int32_t num_tokens, int32_t hidden_size, int32_t top_k,
-                                           bool round_scales_to_bf16, int64_t cuda_stream_ptr) {
+                                           bool round_scales_to_bf16, int64_t cuda_stream_ptr,
+                                           bool enable_pdl) {
   namespace tg = batchedGemm::trtllm::gen;
   moe::dev::finalize::Data data;
   data.mDtypeElt = tg::Dtype::Bfloat16;
   data.mDtypeExpW = tg::Dtype::Fp32;
-  data.mUsePdl = false;
+  data.mUsePdl = enable_pdl;
   data.mUseDeepSeekFp8 = false;
   data.inPtr = reinterpret_cast<void*>(input_ptr);
   data.outPtr = reinterpret_cast<void*>(output_ptr);

@@ -1,3 +1,53 @@
+## Packed decode finalizer composition — 2026-09-17
+
+For SM100-family BF16 packed T1/H2048/top8, the FI cuDNN runner now enables
+native consumer PDL and a fixed-top8 scalar finalizer specialization. The
+dependency wait stays before every routing-metadata and FC2-data read. Ordered
+FP32 accumulation and the live FP32-to-BF16 scale-rounding boundary are retained.
+Unpacked dispatch keeps the original finalizer. The helper API permits explicit
+PDL only for SM100-family scalar T1..64/H2048/top8; default runner adoption is
+narrower, limited to the measured packed T1 case. Its cache identity advances.
+
+On a 1000W B200, E128/I768 with the already-published small-row FC1 and paired
+FC2, the directly measured complete synthetic FI MoE comparison is:
+
+| Routing | Published finalizer | New composition | Latency change |
+|---|---:|---:|---:|
+| Packed | 28.652000 us | 28.043375 us | 2.124% lower |
+| Unpacked | 28.631750 us | 28.655750 us | 0.084% higher |
+
+Audit2080 reconstructs296 passing raw outputs,120 independent mutation controls
+and768 cold-L2 spans. Both routing modes pass normal/memcheck/racecheck,
+retained captures, live X/IDs/scales/FC1+FC2 weights and legacy separate-weight
+checks. Outputs agree bitwise across the two arms. Four fresh ABBA processes
+measure the selected composition directly; separate scheduler/PDL/unroll gains
+are not added. Unpacked kernel routes are identical and show no measured win.
+The longer PDL finalizer interval includes earlier launch and waiting; it is
+not an isolated compute cost. This is operator evidence, not model E2E or a
+refreshed comparison against the strongest TRT configuration.
+
+The updated public native-finalizer test retains the old scalar/vector, masking,
+rounding and live-capture cases. It adds bounded PDL atT1/T8/T64 and invalid
+token/hidden/topk bounds. On B200, the old implementation fails exactly6new
+PDL cases; the candidate passes35tests in each normal/memcheck/racecheck mode,
+zero skips (audit2103). That regression proof covers the exact runtime used by
+audit2080. Python ASTs and CUDA token streams of the formatted public files
+match those GPU-tested sources. SM120 runner dispatch remains PDL-disabled;
+the new helper binary has not yet received a separate SM120 regression run.
+No broad architecture CI or all-shape speedup is claimed.
+
+Why this composition: the prior top8-only ablation on an already-PDL baseline
+improved packed latency1.086% but regressed unpacked0.381% (audit2065). The
+selected default therefore uses it only for packed T1. T8/T64 PDL-only gains
+were small and do not broaden default adoption. The broad FC2 row-range
+experiment remains separate and unpublished pending complete FI timing.
+
+Credit: NVIDIA TRT-LLM authored the native finalizer and its PDL machinery.
+KF candidateb0409f identified consumer PDL as a useful component direction;
+the fixed-top8 unroll adapts that native scalar kernel. Existing Frost baseline
+credits remain: NVIDIAFrost, KF624/2f5c, KFf19299 small-row scheduler,
+YanqinPR1090/CUTLASS113 and Yanqin/Yihua. These are distinct contributions.
+
 ## B200 comparison including both PDL settings — 2026-09-17
 
 The completed exhaustive native comparison changes the size of the remaining

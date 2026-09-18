@@ -720,6 +720,56 @@ __global__ void finalizeKernel(KernelParams params) {
   }
 }
 
+// Bounded top-8 specialization of the NVIDIA TRT-LLM scalar finalizer.
+// Keep the dependency wait before metadata reads and preserve ordered accumulation.
+// The experiment isolates loop unrolling from the existing consumer-PDL optimization.
+template <typename KernelParams, bool RoundWeightsToBf16 = false>
+__global__ void finalizeKernelTop8(KernelParams params) {
+  using Type = typename KernelParams::Type;
+  using TypeExpW = typename KernelParams::TypeExpW;
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+  // wait on primary kernel when using PDL
+  if constexpr (KernelParams::UsePdl) {
+    cudaGridDependencySynchronize();
+  }
+#endif
+
+  for (int tokenIdx = blockIdx.y; tokenIdx < params.numTokens; tokenIdx += gridDim.y) {
+    // Loop over hidden dim
+    for (int hiddenIdx = threadIdx.x + blockDim.x * blockIdx.x; hiddenIdx < params.hiddenDim;
+         hiddenIdx += blockDim.x * gridDim.x) {
+      // Accumulate chunk of token into registers
+      float data = 0.0F;
+
+// Write to topK places
+#pragma unroll 8
+      for (int k = 0; k < 8; k++) {
+        int const expandedIdx = tokenIdx * params.topK + k;
+        int const permutedIdx = params.expandedIdxToPermutedIdx[expandedIdx];
+
+        if (permutedIdx == -1) {
+          continue;
+        }
+
+        if (params.expertWeightsPtr != nullptr) {
+          float scale = float{params.expertWeightsPtr[expandedIdx]};
+          // FI PackedPrecomputed contract: preserve BF16 rounding of live FP32 weights.
+          if constexpr (RoundWeightsToBf16) {
+            scale = __bfloat162float(__float2bfloat16_rn(scale));
+          }
+          data +=
+              float{scale} * float{params.inPtr[permutedIdx * params.hiddenDimPadded + hiddenIdx]};
+        } else {
+          data += float{params.inPtr[permutedIdx * params.hiddenDimPadded + hiddenIdx]};
+        }
+      }
+
+      params.outPtr[tokenIdx * params.hiddenDim + hiddenIdx] = static_cast<Type>(data);
+    }
+  }
+}
+
 constexpr static int FINALIZE_THREADS_PER_BLOCK = 256;
 
 __device__ float4 vectorizedLoadPtx(float4 const* ptr) {
@@ -1049,10 +1099,11 @@ void run(Data const& data, void* stream) {
 
 // Adaptation of the NVIDIA TRT-LLM kernels and scheduling, with
 // FP32-to-BF16 weight rounding fused before accumulation. No conversion launch.
-// PDL-off and BF16 data / FP32 weights are checked by the Python boundary.
-template <int Unroll>
-void launchRounded(Data const& data, void* stream) {
-  using Params = KernelParams<cutlass::bfloat16_t, float, Unroll, false>;
+// The Python boundary restricts PDL to the bounded SM100 scalar route.
+// Its existing dependency wait remains before all metadata and FC2 reads.
+template <int Unroll, bool UsePdl>
+void launchRoundedImpl(Data const& data, void* stream) {
+  using Params = KernelParams<cutlass::bfloat16_t, float, Unroll, UsePdl>;
   auto params = Params::setKernelParams(data);
   int const blocksX = (data.hiddenDim + 255) / 256;
   int const blocksY = std::min(8192, data.numTokens);
@@ -1063,22 +1114,35 @@ void launchRounded(Data const& data, void* stream) {
   config.stream = static_cast<cudaStream_t>(stream);
   cudaLaunchAttribute attributes[2] = {};
   attributes[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-  attributes[0].val.programmaticStreamSerializationAllowed = 0;
+  attributes[0].val.programmaticStreamSerializationAllowed = int(UsePdl);
   attributes[1].id = cudaLaunchAttributeCooperative;
   attributes[1].val.cooperative = 0;
   config.attrs = attributes;
   config.numAttrs = 2;
   if (vector) {
     CHECK_CUDA_ERROR(cudaLaunchKernelEx(&config, finalizeKernelVecLoad<Params, true>, params));
+  } else if (UsePdl && data.numTokens == 1 && data.hiddenDim == 2048 && data.topK == 8) {
+    CHECK_CUDA_ERROR(cudaLaunchKernelEx(&config, finalizeKernelTop8<Params, true>, params));
   } else {
     CHECK_CUDA_ERROR(cudaLaunchKernelEx(&config, finalizeKernel<Params, true>, params));
   }
 }
 
+template <int Unroll>
+void launchRounded(Data const& data, void* stream) {
+  if (data.mUsePdl)
+    launchRoundedImpl<Unroll, true>(data, stream);
+  else
+    launchRoundedImpl<Unroll, false>(data, stream);
+}
+
 void run_rounded(Data const& data, void* stream) {
   FLASHINFER_CHECK(data.mDtypeElt == tg::Dtype::Bfloat16 && data.mDtypeExpW == tg::Dtype::Fp32 &&
-                       !data.mUsePdl && !data.mUseDeepSeekFp8 && data.topK > 0 && data.topK <= 64,
-                   "Rounded finalizer requires BF16 data, FP32 weights, top-k 1..64 and PDL off");
+                       !data.mUseDeepSeekFp8 && data.topK > 0 && data.topK <= 64,
+                   "Rounded finalizer requires BF16 data, FP32 weights and top-k 1..64");
+  FLASHINFER_CHECK(!data.mUsePdl || (data.numTokens > 0 && data.numTokens <= 64 &&
+                                     data.hiddenDim == 2048 && data.topK == 8),
+                   "Rounded finalizer PDL prototype requires tokens1..64, H2048 and top-k8");
   if (data.topK % 4 == 0)
     launchRounded<4>(data, stream);
   else if (data.topK % 2 == 0)

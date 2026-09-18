@@ -372,8 +372,9 @@ def moe_unpermute(
 
         use_native_finalize: Reuse NVIDIA TensorRT-LLM's BF16 finalizer on
             SM100/SM120, with FP32 scales and Int32 permutation indices.
-            Requires contiguous, 16-byte aligned tensors, PDL off and permuted
-            input. Top-k must be 1..64. The vector route requires hidden size
+            Requires contiguous, 16-byte aligned tensors and permuted input.
+            PDL is experimental and restricted to SM100, tokens 1..64, H2048,
+            top-k8 (the scalar route). Top-k otherwise must be 1..64. The vector route requires hidden size
             divisible by 8. Packed weight rounding is fused when requested.
             This option is mutually exclusive with use_wide_tiling.
 
@@ -398,8 +399,7 @@ def moe_unpermute(
 
     if use_native_finalize:
         if (
-            enable_pdl
-            or input_is_expanded
+            input_is_expanded
             or use_wide_tiling
             or permuted_input.dtype != torch.bfloat16
             or output.dtype != torch.bfloat16
@@ -408,7 +408,7 @@ def moe_unpermute(
         ):
             raise ValueError(
                 "Native finalize requires BF16 data, FP32 scales, Int32 indices, "
-                "permuted input and PDL off; wide tiling is mutually exclusive"
+                "permuted input; wide tiling is mutually exclusive"
             )
         tensors = (permuted_input, output, expanded_idx_to_permuted_idx, topk_scales)
         if not all(
@@ -443,6 +443,16 @@ def moe_unpermute(
             raise ValueError(
                 "Native vector finalize requires hidden size divisible by eight"
             )
+        if enable_pdl and not (
+            torch.cuda.get_device_capability(output.device)[0] == 10
+            and 0 < num_tokens <= 64
+            and hidden_size == 2048
+            and top_k == 8
+            and not vector
+        ):
+            raise ValueError(
+                "Native finalize PDL prototype requires SM100, tokens1..64, H2048 and top-k8"
+            )
         with torch.cuda.device(output.device):
             module["flashinfer_moe_unpermute_bf16_float_scale_native"](
                 permuted_input.data_ptr(),
@@ -454,6 +464,7 @@ def moe_unpermute(
                 top_k,
                 round_scales_to_bf16,
                 _get_cuda_stream_ptr(),
+                enable_pdl,
             )
         return
 

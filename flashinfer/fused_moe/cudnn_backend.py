@@ -408,7 +408,7 @@ class CudnnMoeRunner(MoERunner):
     backend_key = "cudnn"
     _backend_config_type: type = CudnnMoeConfig
     # Joint stage tactics and explicit fusion routes change cache identities.
-    _cache_version = "cudnn-bf16-v8-shared-weight-views"
+    _cache_version = "cudnn-bf16-v10-native-packed-decode-finalizer"
     _activation_dtype = torch.bfloat16
     supported_routing_modes = (
         RoutingInputMode.PackedPrecomputed,
@@ -429,6 +429,9 @@ class CudnnMoeRunner(MoERunner):
             raise ValueError("CudnnMoeRunner requires a CUDA device")
         if self.device.index is None:
             self.device = torch.device("cuda", torch.cuda.current_device())
+        self._native_finalize_pdl = (
+            torch.cuda.get_device_capability(self.device)[0] == 10
+        )
         # Exact shapes retain the caller's routing tensors when profiling. No
         # synthetic integer expert IDs or independent block-scale offsets.
         self.tuning_config = TuningConfig(use_cuda_graph=True, use_cold_l2_cache=True)
@@ -789,7 +792,15 @@ class CudnnMoeRunner(MoERunner):
             scales,
             x.shape[0],
             r,
-            enable_pdl=False,
+            # KF b0409f identified consumer PDL as a useful component direction.
+            # Keep the native scalar kernel's dependency wait before metadata reads.
+            enable_pdl=(
+                self._native_finalize_pdl
+                and inputs[8]
+                and x.shape[0] == 1
+                and output.shape[1] == 2048
+                and r == 8
+            ),
             round_scales_to_bf16=inputs[8],
             # Reuse the NVIDIA TRT-LLM finalizer for the measured small-token
             # H2048/top8 region; preserve the routing mode's scale precision.
