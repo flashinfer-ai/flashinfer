@@ -93,51 +93,103 @@ struct DeviceWorkspace {
   int32_t* chunkRanks;
 };
 
+struct DeviceWorkspaceLayout {
+  size_t state;
+  size_t blocks;
+  size_t lptOrder;
+  size_t longOrder;
+  size_t piecesPerRequest;
+  size_t splitBegin;
+  size_t chunkBegin;
+  size_t chunkCount;
+  size_t candidates;
+  size_t candidateDescriptors;
+  size_t selected;
+  size_t partitionCounts;
+  size_t candidateCosts;
+  size_t run;
+  size_t chunks;
+  size_t chunkCosts;
+  size_t chunkRanks;
+  size_t totalBytes;
+};
+
+__host__ __device__ __forceinline__ size_t alignWorkspaceOffset(size_t offset, size_t alignment) {
+  return (offset + alignment - 1) & ~(alignment - 1);
+}
+
 __device__ __forceinline__ char* alignWorkspaceCursor(char* cursor, size_t alignment) {
   uintptr_t const value = reinterpret_cast<uintptr_t>(cursor);
-  return reinterpret_cast<char*>((value + alignment - 1) & ~(alignment - 1));
+  return reinterpret_cast<char*>(alignWorkspaceOffset(value, alignment));
+}
+
+__host__ __device__ __forceinline__ DeviceWorkspaceLayout getWorkspaceLayout(int32_t N, int32_t P) {
+  size_t const requestCount = static_cast<size_t>(N);
+  size_t const partitionCount = static_cast<size_t>(P);
+  size_t const chunkCapacity = requestCount + partitionCount;
+  size_t cursor = 0;
+  DeviceWorkspaceLayout layout;
+  layout.state = cursor;
+  cursor += sizeof(DevicePlannerState);
+  layout.blocks = cursor;
+  cursor += requestCount * sizeof(int32_t);
+  layout.lptOrder = cursor;
+  cursor += requestCount * sizeof(int32_t);
+  layout.longOrder = cursor;
+  cursor += requestCount * sizeof(int32_t);
+  layout.piecesPerRequest = cursor;
+  cursor += requestCount * sizeof(int32_t);
+  layout.splitBegin = cursor;
+  cursor += requestCount * sizeof(int32_t);
+  layout.chunkBegin = cursor;
+  cursor += requestCount * sizeof(int32_t);
+  layout.chunkCount = cursor;
+  cursor += requestCount * sizeof(int32_t);
+  layout.candidates = cursor;
+  cursor += static_cast<size_t>(kMaxCandidates) * sizeof(int32_t);
+  layout.candidateDescriptors = cursor;
+  cursor += static_cast<size_t>(kMaxCandidates) * sizeof(int32_t);
+  layout.selected = cursor;
+  cursor += partitionCount * sizeof(int32_t);
+  layout.partitionCounts = cursor;
+  cursor += partitionCount * sizeof(int32_t);
+  cursor = alignWorkspaceOffset(cursor, alignof(int64_t));
+  layout.candidateCosts = cursor;
+  cursor += static_cast<size_t>(kMaxCandidates) * sizeof(int64_t);
+  layout.run = cursor;
+  cursor += partitionCount * sizeof(int64_t);
+  layout.chunks = cursor;
+  cursor += chunkCapacity * sizeof(DeviceChunk);
+  cursor = alignWorkspaceOffset(cursor, alignof(int64_t));
+  layout.chunkCosts = cursor;
+  cursor += chunkCapacity * sizeof(int64_t);
+  layout.chunkRanks = cursor;
+  cursor += chunkCapacity * sizeof(int32_t);
+  layout.totalBytes = cursor;
+  return layout;
 }
 
 __device__ __forceinline__ DeviceWorkspace getWorkspace(BalancedSchedDeviceParams const& p) {
-  int32_t const N = p.batchSize;
-  int32_t const P = p.numSmParts;
-  char* cursor = static_cast<char*>(p.workspacePtr);
+  DeviceWorkspaceLayout const layout = getWorkspaceLayout(p.batchSize, p.numSmParts);
+  char* base = static_cast<char*>(p.workspacePtr);
   DeviceWorkspace ws;
-  ws.state = reinterpret_cast<DevicePlannerState*>(cursor);
-  cursor += sizeof(DevicePlannerState);
-  ws.blocks = reinterpret_cast<int32_t*>(cursor);
-  cursor += static_cast<size_t>(N) * sizeof(int32_t);
-  ws.lptOrder = reinterpret_cast<int32_t*>(cursor);
-  cursor += static_cast<size_t>(N) * sizeof(int32_t);
-  ws.longOrder = reinterpret_cast<int32_t*>(cursor);
-  cursor += static_cast<size_t>(N) * sizeof(int32_t);
-  ws.piecesPerRequest = reinterpret_cast<int32_t*>(cursor);
-  cursor += static_cast<size_t>(N) * sizeof(int32_t);
-  ws.splitBegin = reinterpret_cast<int32_t*>(cursor);
-  cursor += static_cast<size_t>(N) * sizeof(int32_t);
-  ws.chunkBegin = reinterpret_cast<int32_t*>(cursor);
-  cursor += static_cast<size_t>(N) * sizeof(int32_t);
-  ws.chunkCount = reinterpret_cast<int32_t*>(cursor);
-  cursor += static_cast<size_t>(N) * sizeof(int32_t);
-  ws.candidates = reinterpret_cast<int32_t*>(cursor);
-  cursor += static_cast<size_t>(kMaxCandidates) * sizeof(int32_t);
-  ws.candidateDescriptors = reinterpret_cast<int32_t*>(cursor);
-  cursor += static_cast<size_t>(kMaxCandidates) * sizeof(int32_t);
-  ws.selected = reinterpret_cast<int32_t*>(cursor);
-  cursor += static_cast<size_t>(P) * sizeof(int32_t);
-  ws.partitionCounts = reinterpret_cast<int32_t*>(cursor);
-  cursor += static_cast<size_t>(P) * sizeof(int32_t);
-  cursor = alignWorkspaceCursor(cursor, alignof(int64_t));
-  ws.candidateCosts = reinterpret_cast<int64_t*>(cursor);
-  cursor += static_cast<size_t>(kMaxCandidates) * sizeof(int64_t);
-  ws.run = reinterpret_cast<int64_t*>(cursor);
-  cursor += static_cast<size_t>(P) * sizeof(int64_t);
-  ws.chunks = reinterpret_cast<DeviceChunk*>(cursor);
-  cursor += static_cast<size_t>(N + P) * sizeof(DeviceChunk);
-  cursor = alignWorkspaceCursor(cursor, alignof(int64_t));
-  ws.chunkCosts = reinterpret_cast<int64_t*>(cursor);
-  cursor += static_cast<size_t>(N + P) * sizeof(int64_t);
-  ws.chunkRanks = reinterpret_cast<int32_t*>(cursor);
+  ws.state = reinterpret_cast<DevicePlannerState*>(base + layout.state);
+  ws.blocks = reinterpret_cast<int32_t*>(base + layout.blocks);
+  ws.lptOrder = reinterpret_cast<int32_t*>(base + layout.lptOrder);
+  ws.longOrder = reinterpret_cast<int32_t*>(base + layout.longOrder);
+  ws.piecesPerRequest = reinterpret_cast<int32_t*>(base + layout.piecesPerRequest);
+  ws.splitBegin = reinterpret_cast<int32_t*>(base + layout.splitBegin);
+  ws.chunkBegin = reinterpret_cast<int32_t*>(base + layout.chunkBegin);
+  ws.chunkCount = reinterpret_cast<int32_t*>(base + layout.chunkCount);
+  ws.candidates = reinterpret_cast<int32_t*>(base + layout.candidates);
+  ws.candidateDescriptors = reinterpret_cast<int32_t*>(base + layout.candidateDescriptors);
+  ws.selected = reinterpret_cast<int32_t*>(base + layout.selected);
+  ws.partitionCounts = reinterpret_cast<int32_t*>(base + layout.partitionCounts);
+  ws.candidateCosts = reinterpret_cast<int64_t*>(base + layout.candidateCosts);
+  ws.run = reinterpret_cast<int64_t*>(base + layout.run);
+  ws.chunks = reinterpret_cast<DeviceChunk*>(base + layout.chunks);
+  ws.chunkCosts = reinterpret_cast<int64_t*>(base + layout.chunkCosts);
+  ws.chunkRanks = reinterpret_cast<int32_t*>(base + layout.chunkRanks);
   return ws;
 }
 
@@ -1516,9 +1568,15 @@ void ensureFoldDynamicSharedMemoryCapacity(size_t dynamicBytes) {
 }  // namespace
 
 void runBalancedSchedDevice(BalancedSchedDeviceParams const& params) {
-  FLASHINFER_CHECK(params.workspaceBytes >=
-                       getBalancedSchedDeviceWorkspaceSize(params.batchSize, params.numSmParts),
-                   "Balanced device scheduler workspace is too small");
+  size_t const layoutBytes = getWorkspaceLayout(params.batchSize, params.numSmParts).totalBytes;
+  size_t const publicWorkspaceBytes =
+      getBalancedSchedDeviceWorkspaceSize(params.batchSize, params.numSmParts);
+  FLASHINFER_CHECK(layoutBytes <= publicWorkspaceBytes,
+                   "Balanced device scheduler internal workspace layout requires ", layoutBytes,
+                   " bytes, exceeding its public ", publicWorkspaceBytes, "-byte allocation");
+  FLASHINFER_CHECK(params.workspaceBytes >= layoutBytes,
+                   "Balanced device scheduler workspace is too small: requires ", layoutBytes,
+                   " bytes, got ", params.workspaceBytes);
   if (params.useOptimizedSchedule) {
     FLASHINFER_CHECK(params.numSmParts <= kFoldThreads,
                      "Balanced device optimized scheduler supports at most ", kFoldThreads,
