@@ -6586,7 +6586,7 @@ def test_public_prefill_vibecuda_forwards_public_contract(monkeypatch):
         lambda **kwargs: calls.append(kwargs) or sentinel,
     )
 
-    assert recurrent_kda(**_cpu_route_tensors(), backend="vibecuda") is sentinel
+    assert recurrent_kda(**cpu_route_tensors(), backend="vibecuda") is sentinel
     assert len(calls) == 1
     assert calls[0]["output_final_state"] is False
 
@@ -6599,12 +6599,12 @@ def test_public_prefill_vibecuda_backend_is_strict(monkeypatch):
     )
 
     with pytest.raises(ValueError, match="backend='vibecuda' does not support"):
-        recurrent_kda(**_cpu_route_tensors(), backend="vibecuda")
+        recurrent_kda(**cpu_route_tensors(), backend="vibecuda")
 
 
 def test_public_decode_vibecuda_backend_is_prefill_only():
     with pytest.raises(ValueError, match="backend='vibecuda' does not support"):
-        recurrent_kda(**_cpu_route_tensors(token_count=1), backend="vibecuda")
+        recurrent_kda(**cpu_route_tensors(token_count=1), backend="vibecuda")
 
 
 def test_vibecuda_prefill_rejects_non_sm100_arch(cuda_device, monkeypatch):
@@ -6751,7 +6751,7 @@ def test_vibecuda_prefill_matches_precision_reference(
     assert actual[1] is call_inputs["initial_state"]
 
 
-def test_vibecuda_initial_state_is_updated_in_place(flash_kda_device):
+def test_vibecuda_initial_state_is_updated_in_place_extended(flash_kda_device):
     inputs = _make_inputs(
         seq_lens=[512], num_heads=64, packed=False, initial_state=True, seed=4209
     )
@@ -6773,7 +6773,7 @@ def test_vibecuda_initial_state_is_updated_in_place(flash_kda_device):
     )
 
 
-def test_vibecuda_stream_workspace_does_not_allocate_state_scratch_for_inplace_update(
+def test_vibecuda_stream_workspace_does_not_allocate_state_scratch_for_inplace_update_extended(
     flash_kda_device, monkeypatch
 ):
     monkeypatch.setattr(kda_vibecuda_api, "_vibecuda_stream_workspaces", {})
@@ -7220,6 +7220,8 @@ def test_vibecuda_cuda_graph_workspaces_are_isolated(flash_kda_device):
             atol=1e-2,
             rtol=1e-2,
         )
+
+
 def test_vibecuda_initial_state_is_updated_in_place(flash_kda_device):
     # VibeCUDA equivalent of the CAKE contract test
     # ``test_initial_state_is_updated_in_place``. Where the CAKE test proves
@@ -7341,7 +7343,7 @@ def test_vibecuda_stream_workspace_does_not_allocate_state_scratch_for_inplace_u
         assert returned_state is original_state
 
     # Warm pass: create the implicit workspace and grow its buffers once.
-    for inputs, output in zip(cases, outputs):
+    for inputs, output in zip(cases, outputs, strict=True):
         run(inputs, output)
 
     assert len(kda_vibecuda_api._vibecuda_stream_workspaces) == 1
@@ -7358,13 +7360,11 @@ def test_vibecuda_stream_workspace_does_not_allocate_state_scratch_for_inplace_u
     torch.cuda.empty_cache()
     stats_before = torch.cuda.memory_stats(flash_kda_device)
     bytes_before = torch.cuda.memory_allocated(flash_kda_device)
-    for inputs, output in zip(cases, outputs):
+    for inputs, output in zip(cases, outputs, strict=True):
         run(inputs, output)
     torch.cuda.synchronize(flash_kda_device)
     stats_after = torch.cuda.memory_stats(flash_kda_device)
-    device_allocs = (
-        stats_after["num_device_alloc"] - stats_before["num_device_alloc"]
-    )
+    device_allocs = stats_after["num_device_alloc"] - stats_before["num_device_alloc"]
     assert device_allocs == 0, (
         "steady-state vibecuda prefill performed "
         f"{device_allocs} device allocation(s); the in-place update must "

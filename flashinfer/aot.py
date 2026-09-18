@@ -81,11 +81,7 @@ from .jit.flash_kda import (
     GeneratedFlashKDATarget,
     gen_flash_kda_generated_module,
     gen_flash_kda_m128_n16_checkpoint_module,
-    gen_flash_kda_m128_n16_module,
-    gen_flash_kda_m128_n16_short_module,
-    gen_flash_kda_piece_persistent_m128_module,
     gen_flash_kda_persistent_m128_module,
-    gen_flash_kda_small_bh_m128_module,
     gen_vibecuda_flash_kda_module,
     get_flash_kda_generated_variant_ids,
 )

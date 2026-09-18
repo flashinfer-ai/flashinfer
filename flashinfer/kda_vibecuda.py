@@ -388,15 +388,10 @@ def _vibecuda_fn16_buffers(
     w = _buffer("_fn16_w", num_heads * padded_tokens * _HEAD_DIM, torch.bfloat16)
     qk = _buffer(
         "_fn16_qk",
-        num_heads
-        * total_chunks
-        * _FN16_CHUNK_TOKENS
-        * _FN16_CHUNK_TOKENS,
+        num_heads * total_chunks * _FN16_CHUNK_TOKENS * _FN16_CHUNK_TOKENS,
         torch.bfloat16,
     )
-    diag = _buffer(
-        "_fn16_diag", num_heads * total_chunks * _HEAD_DIM, torch.float32
-    )
+    diag = _buffer("_fn16_diag", num_heads * total_chunks * _HEAD_DIM, torch.float32)
     return qd, kd, w, qk, diag
 
 
@@ -994,9 +989,7 @@ def _try_run_fast_vibecuda_kda_prefill(
         )
     else:
         assert cu_seqlens is not None
-        cu_seqlens_i64 = (
-            cu_seqlens if plan.cu_is_int64 else cu_seqlens.to(torch.int64)
-        )
+        cu_seqlens_i64 = cu_seqlens if plan.cu_is_int64 else cu_seqlens.to(torch.int64)
     module = plan.module
     if seq_order is not None:
         seq_order_i32 = _validate_prefill_seq_order(
@@ -1035,15 +1028,13 @@ def _try_run_fast_vibecuda_kda_prefill(
         if plan.split_parts >= 2:
             num_tasks = plan.num_sequences * num_heads
             split_buffers = (
-                *_vibecuda_split_buffers(
-                    state, q.device, num_tasks, plan.split_parts
-                ),
+                *_vibecuda_split_buffers(state, q.device, num_tasks, plan.split_parts),
                 _vibecuda_split_out_buffer(state, q.device, out_buf.numel()),
                 _vibecuda_split_lookback_flags(
                     state, q.device, num_tasks, plan.split_parts
                 ),
             )
-        ptrs = (
+        ptrs: tuple[int, ...] = (
             q.data_ptr(),
             k.data_ptr(),
             v.data_ptr(),
@@ -1464,9 +1455,7 @@ def _run_vibecuda_kda_prefill(
             beta,
             state,
             direct_heads=(
-                use_fn16
-                or variant
-                in ("m128", "fam2h12", "fam2h64", "fam2h96")
+                use_fn16 or variant in ("m128", "fam2h12", "fam2h64", "fam2h96")
             ),
         )
         if use_fn16:
@@ -1494,9 +1483,7 @@ def _run_vibecuda_kda_prefill(
             prep_desc = int(
                 state.descriptor_signatures.get("fn16_prepare") != sig_prepare
             )
-            chain_desc = int(
-                state.descriptor_signatures.get("fn16_chain") != sig_chain
-            )
+            chain_desc = int(state.descriptor_signatures.get("fn16_chain") != sig_chain)
             if capturing and (prep_desc or chain_desc):
                 raise RuntimeError(
                     "RecurrentKDAPrefillWorkspace is not warmed for the "
@@ -1761,10 +1748,7 @@ def _run_vibecuda_kda_prefill(
                 beta_direct_heads = variant in ("m128", "fam2h12", "fam2h64", "fam2h96")
                 beta_needs_pad = not (
                     (beta_direct_heads and num_heads % _BETA_TMA_MIN_HEADS != 0)
-                    or (
-                        padded_tokens == total_tokens
-                        and padded_heads == num_heads
-                    )
+                    or (padded_tokens == total_tokens and padded_heads == num_heads)
                 )
                 _record_fast_plan(
                     state=state,
@@ -1776,9 +1760,7 @@ def _run_vibecuda_kda_prefill(
                     fixed_layout=fixed_layout,
                     sm_count=sm_count,
                     descriptor_storage=descriptor_storage,
-                    cu_is_int64=(
-                        fixed_layout or cu_seqlens.dtype == torch.int64
-                    ),
+                    cu_is_int64=(fixed_layout or cu_seqlens.dtype == torch.int64),
                     beta_direct_heads=beta_direct_heads,
                     beta_needs_pad=beta_needs_pad,
                     beta_rows=total_tokens,

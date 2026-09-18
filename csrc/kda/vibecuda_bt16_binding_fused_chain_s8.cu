@@ -39,10 +39,10 @@ void RunFull(const void* ws_qd_ptr, const void* ws_kd_ptr, const void* ws_w_ptr,
              const void* initial_state_ptr, void* out_ptr, void* final_state_ptr,
              void* descriptor_storage, int64_t prepare_descriptors, int64_t tokens,
              int64_t total_chunks, int64_t num_heads, int64_t use_initial_state,
-             int64_t store_final_state, double scale, int64_t grid_x, int64_t cuda_stream, int64_t num_seqs) {
+             int64_t store_final_state, double scale, int64_t grid_x, int64_t cuda_stream,
+             int64_t num_seqs) {
   using namespace kda_bt16;
-  const cudaStream_t stream =
-      reinterpret_cast<cudaStream_t>(static_cast<uintptr_t>(cuda_stream));
+  const cudaStream_t stream = reinterpret_cast<cudaStream_t>(static_cast<uintptr_t>(cuda_stream));
   CheckCuda(cudaFuncSetAttribute(kernel_flashkda_bf16_bt16_chain_m64_fn16_s8_local,
                                  cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_TOTAL),
             "cudaFuncSetAttribute(BT16 chain s8)");

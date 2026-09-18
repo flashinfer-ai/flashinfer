@@ -7,9 +7,9 @@
 // device-side bake is retained, with the textual fixup_mode/split_num_parts
 // pins dead-code-eliminating all split/map/correction/finish/band-scan
 // machinery (single-kernel per-(sequence, head) recurrence).
-#include "vibecuda_flashkda_tma.cuh"
-
 #include <cstdlib>
+
+#include "vibecuda_flashkda_tma.cuh"
 
 // The generated standalone source declares its own fixed-width typedefs;
 // isolate them so they do not collide with this TU's CUDA headers.
@@ -68,9 +68,8 @@ void RunFam2H96(const void* q_ptr, const void* k_ptr, const void* v_ptr, const v
                 const void* initial_state_ptr, void* out_ptr, void* final_state_ptr,
                 void* descriptor_storage_ptr, int64_t token_count, int64_t num_seqs,
                 int64_t prepare_descriptors, int64_t num_heads, int64_t use_initial_state,
-                int64_t store_final_state, double scale, double lower_bound,
-                int64_t beta_tma_rows, int64_t beta_tma_dim1, int64_t ft_slab,
-                int64_t cuda_stream) {
+                int64_t store_final_state, double scale, double lower_bound, int64_t beta_tma_rows,
+                int64_t beta_tma_dim1, int64_t ft_slab, int64_t cuda_stream) {
   constexpr int32_t kSmemBytes = SMEM_TOTAL;
   static const bool kSmemAttrOnce = [] {
     CheckCuda(cudaFuncSetAttribute(kernel_flashkda_fam2_h96,
@@ -103,25 +102,26 @@ void RunFam2H96(const void* q_ptr, const void* k_ptr, const void* v_ptr, const v
     pdl_cfg.stream = stream;
     pdl_cfg.attrs = pdl_attr;
     pdl_cfg.numAttrs = 1;
-    CheckCuda(cudaLaunchKernelEx(&pdl_cfg, kernel_flashkda_fam2_h96,
-        reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(q_ptr)), tma.q,
-        reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(k_ptr)), tma.k,
-        reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(v_ptr)), tma.v,
-        reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(g_ptr)), tma.g,
-        reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(beta_ptr)), tma.beta,
-        reinterpret_cast<float*>(const_cast<void*>(A_log_ptr)),
-        reinterpret_cast<float*>(const_cast<void*>(dt_bias_ptr)),
-        reinterpret_cast<long long*>(const_cast<void*>(cu_seqlens_ptr)),
-        reinterpret_cast<int*>(const_cast<void*>(seq_order_ptr)),
-        reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(initial_state_ptr)),
-        reinterpret_cast<__nv_bfloat16*>(out_ptr), tma.out, tma.out,
-        reinterpret_cast<__nv_bfloat16*>(final_state_ptr), static_cast<int>(num_heads),
-        static_cast<int>(use_initial_state), static_cast<int>(store_final_state),
-        static_cast<float>(scale), static_cast<float>(lower_bound),
-        /*split_num_parts=*/1, /*split_state=*/nullptr, /*split_gamma=*/nullptr,
-        /*fixup_mode=*/0, /*progress_flags=*/nullptr,
-        /*map_state_bf16=*/nullptr, static_cast<int>(ft_slab)),
-        "kernel_flashkda_fam2_h96 PDL launch");
+    CheckCuda(cudaLaunchKernelEx(
+                  &pdl_cfg, kernel_flashkda_fam2_h96,
+                  reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(q_ptr)), tma.q,
+                  reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(k_ptr)), tma.k,
+                  reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(v_ptr)), tma.v,
+                  reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(g_ptr)), tma.g,
+                  reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(beta_ptr)), tma.beta,
+                  reinterpret_cast<float*>(const_cast<void*>(A_log_ptr)),
+                  reinterpret_cast<float*>(const_cast<void*>(dt_bias_ptr)),
+                  reinterpret_cast<long long*>(const_cast<void*>(cu_seqlens_ptr)),
+                  reinterpret_cast<int*>(const_cast<void*>(seq_order_ptr)),
+                  reinterpret_cast<__nv_bfloat16*>(const_cast<void*>(initial_state_ptr)),
+                  reinterpret_cast<__nv_bfloat16*>(out_ptr), tma.out, tma.out,
+                  reinterpret_cast<__nv_bfloat16*>(final_state_ptr), static_cast<int>(num_heads),
+                  static_cast<int>(use_initial_state), static_cast<int>(store_final_state),
+                  static_cast<float>(scale), static_cast<float>(lower_bound),
+                  /*split_num_parts=*/1, /*split_state=*/nullptr, /*split_gamma=*/nullptr,
+                  /*fixup_mode=*/0, /*progress_flags=*/nullptr,
+                  /*map_state_bf16=*/nullptr, static_cast<int>(ft_slab)),
+              "kernel_flashkda_fam2_h96 PDL launch");
     return;
   }
 #endif

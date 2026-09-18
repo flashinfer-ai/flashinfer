@@ -2622,6 +2622,8 @@ def _generated_affine_carriers(
         )
         workspace._generated_affine_carriers = carriers
     return carriers
+
+
 # Raw current-stream pointer lookup. ``torch._C._cuda_getCurrentRawStream``
 # returns the stream pointer for a device index without allocating a
 # ``torch.cuda.Stream`` wrapper object (~0.1us against ~3us per call), which
@@ -3165,7 +3167,7 @@ def _storage_ranges_overlap(
             # numel - 1; the general path below only runs for strided views.
             return tensor.data_ptr() + tensor.numel() * tensor.element_size()
         max_element_offset = 0
-        for size, stride in zip(tensor.shape, tensor.stride()):
+        for size, stride in zip(tensor.shape, tensor.stride(), strict=True):
             if size > 0:
                 max_element_offset += (size - 1) * stride
         return tensor.data_ptr() + (max_element_offset + 1) * tensor.element_size()

@@ -277,8 +277,7 @@ int64_t CheckVibeCUDAPrefillInputs(
   TVM_FFI_ICHECK(beta_tma_dim1 >= num_heads && beta_tma.numel() % beta_tma_dim1 == 0)
       << "beta_tma must be [rows, H] with H >= num_heads";
   const int64_t beta_tma_rows = beta_tma.numel() / beta_tma_dim1;
-  TVM_FFI_ICHECK(beta_tma_rows >= token_count)
-      << "beta_tma must cover all tokens";
+  TVM_FFI_ICHECK(beta_tma_rows >= token_count) << "beta_tma must cover all tokens";
   // Padded-beta routes (the descriptor fetches a full 32-token/8-head box)
   // need both invariants; the direct-read beta route (head count not a TMA
   // box multiple) leaves the slot unencoded, so only the row coverage above
@@ -648,13 +647,12 @@ void RunBt16Fused(TensorView q, TensorView k, TensorView g, TensorView beta, Ten
   CheckNoOverlap(out, "out", beta, "beta");
   CheckNoOverlap(out, "out", initial_state, "initial_state");
 
-  kda_bt16_prepare_fused::Run(q.data_ptr(), k.data_ptr(), g.data_ptr(), beta.data_ptr(),
-                              A_log.data_ptr(), dt_bias.data_ptr(), cu_seqlens.data_ptr(),
-                              /*cu_chunks_ptr=*/nullptr, /*chunk_to_seq_ptr=*/nullptr,
-                              ws_qd.data_ptr(), ws_kd.data_ptr(), ws_w.data_ptr(),
-                              ws_qk.data_ptr(), ws_diag.data_ptr(), desc_prepare.data_ptr(),
-                              prep_desc, tokens, total_chunks, num_heads, lower_bound,
-                              prepare_total_ctas, cuda_stream, num_seqs);
+  kda_bt16_prepare_fused::Run(
+      q.data_ptr(), k.data_ptr(), g.data_ptr(), beta.data_ptr(), A_log.data_ptr(),
+      dt_bias.data_ptr(), cu_seqlens.data_ptr(),
+      /*cu_chunks_ptr=*/nullptr, /*chunk_to_seq_ptr=*/nullptr, ws_qd.data_ptr(), ws_kd.data_ptr(),
+      ws_w.data_ptr(), ws_qk.data_ptr(), ws_diag.data_ptr(), desc_prepare.data_ptr(), prep_desc,
+      tokens, total_chunks, num_heads, lower_bound, prepare_total_ctas, cuda_stream, num_seqs);
   auto* run_chain = (schedule == 7)   ? kda_bt16_chain_fn16_s7::RunFull
                     : (schedule == 9) ? kda_bt16_chain_fn16_s9::RunFull
                                       : kda_bt16_chain_fn16_s8::RunFull;

@@ -33,14 +33,13 @@ namespace kda_bt16_prepare_fused {
 
 void Run(const void* q_ptr, const void* k_ptr, const void* g_ptr, const void* beta_ptr,
          const void* a_log_ptr, const void* dt_bias_ptr, const void* cu_seqlens_ptr,
-         const void* cu_chunks_ptr, const void* chunk_to_seq_ptr, void* ws_qd_ptr,
-         void* ws_kd_ptr, void* ws_w_ptr, void* ws_qk_ptr, void* ws_diag_ptr,
-         void* descriptor_storage, int64_t prepare_descriptors, int64_t tokens,
-         int64_t total_chunks, int64_t num_heads, double gate_lower_bound,
-         int64_t prepare_total_ctas, int64_t cuda_stream, int64_t num_seqs) {
+         const void* cu_chunks_ptr, const void* chunk_to_seq_ptr, void* ws_qd_ptr, void* ws_kd_ptr,
+         void* ws_w_ptr, void* ws_qk_ptr, void* ws_diag_ptr, void* descriptor_storage,
+         int64_t prepare_descriptors, int64_t tokens, int64_t total_chunks, int64_t num_heads,
+         double gate_lower_bound, int64_t prepare_total_ctas, int64_t cuda_stream,
+         int64_t num_seqs) {
   using namespace kda_bt16;
-  const cudaStream_t stream =
-      reinterpret_cast<cudaStream_t>(static_cast<uintptr_t>(cuda_stream));
+  const cudaStream_t stream = reinterpret_cast<cudaStream_t>(static_cast<uintptr_t>(cuda_stream));
   CheckCuda(cudaFuncSetAttribute(kernel_flashkda_bf16_bt16_prepare_fn16_local,
                                  cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_TOTAL),
             "cudaFuncSetAttribute(BT16 prepare)");
@@ -85,9 +84,9 @@ void Run(const void* q_ptr, const void* k_ptr, const void* g_ptr, const void* be
       reinterpret_cast<const flashkda_generated_CakeTensorMap*>(maps_bytes + 5 * kStride),
       reinterpret_cast<__nv_bfloat16*>(ws_w_ptr),
       reinterpret_cast<const flashkda_generated_CakeTensorMap*>(maps_bytes + 6 * kStride),
-      reinterpret_cast<__nv_bfloat16*>(ws_qk_ptr),
-      reinterpret_cast<float*>(ws_diag_ptr), static_cast<int>(total_chunks),
-      static_cast<int>(num_heads), static_cast<float>(gate_lower_bound), static_cast<int>(num_seqs));
+      reinterpret_cast<__nv_bfloat16*>(ws_qk_ptr), reinterpret_cast<float*>(ws_diag_ptr),
+      static_cast<int>(total_chunks), static_cast<int>(num_heads),
+      static_cast<float>(gate_lower_bound), static_cast<int>(num_seqs));
   CheckCuda(cudaGetLastError(), "kernel_flashkda_bf16_bt16_prepare_fn16_local launch");
 }
 

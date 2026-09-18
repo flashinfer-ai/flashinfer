@@ -199,9 +199,8 @@ inline TmaPointers EncodeTmaPointersAll(const void* q, const void* k, const void
         // switch and skips the transfer, so the stale slot is never
         // dereferenced (the fence.acquire on the slot address is a
         // memory-ordering op, not a map read, and stays valid).
-        ((num_heads & 7) == 0
-             ? EncodeBetaTma<ChunkTokens>(beta_tma, beta_tma_numel, beta_tma_dim1)
-             : CUtensorMap{}),
+        ((num_heads & 7) == 0 ? EncodeBetaTma<ChunkTokens>(beta_tma, beta_tma_numel, beta_tma_dim1)
+                              : CUtensorMap{}),
         EncodeOutputTma<ValueRows, ChunkTokens>(out, token_count * num_heads * kHeadDim, num_heads,
                                                 kHeadDim),
         EncodeOutputTma<ValueRows, ChunkTokens>(scratch_base, token_count * num_heads * kHeadDim,
