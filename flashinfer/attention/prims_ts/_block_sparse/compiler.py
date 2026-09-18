@@ -21,6 +21,7 @@ import torch
 
 from flashinfer.utils import ceil_div
 
+from .common import _num_sparse_pattern_heads
 from .config import _BlockSparseCompileKey, _make_block_sparse_config
 
 
@@ -44,9 +45,12 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
     )
 
     config = _make_block_sparse_config(key)
+    pattern_heads = _num_sparse_pattern_heads(
+        key.num_kv_heads, key.share_pattern_across_kv_heads
+    )
     prepare_kwargs = {
         "batch_size": key.batch_size,
-        "num_kv_heads": key.num_kv_heads,
+        "num_kv_heads": pattern_heads,
         "seq_len_q": key.seq_len_q,
         "seq_len_kv": key.seq_len_kv,
         "q_block_size": key.q_block_size,
@@ -384,7 +388,7 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
     num_kv_blocks = ceil_div(key.seq_len_kv, key.kv_block_size)
     indptr_fake = fake_compact(
         Int32,
-        (key.batch_size, key.num_kv_heads, num_q_blocks + 1),
+        (key.batch_size, pattern_heads, num_q_blocks + 1),
         4,
     )
     indices_fake = fake_compact(Int32, (logical_nnz,), 4)
@@ -395,7 +399,7 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
     )
     row_route_offsets_fake = fake_compact(
         Int32,
-        (key.batch_size * key.num_kv_heads * num_q_blocks + 1,),
+        (key.batch_size * pattern_heads * num_q_blocks + 1,),
         4,
     )
     route_workspace_fake = fake_compact(
@@ -421,7 +425,7 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
             cutlass.Uint32,
             (
                 key.batch_size,
-                key.num_kv_heads,
+                pattern_heads,
                 num_q_blocks,
                 ceil_div(num_kv_blocks, 32),
             ),

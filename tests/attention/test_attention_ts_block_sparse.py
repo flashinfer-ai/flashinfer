@@ -1837,7 +1837,7 @@ def test_decode_schedule_revalidates_mutable_paged_staging_config(
             tile_size_kv=128,
             page_offsets_num_warps=2,
         )
-        message = "exactly one producer warp"
+        message = "page-offset staging requires one producer warp"
     else:
         cfg = block_sparse_config._make_block_sparse_config(
             block_sparse_config._BlockSparseCompileKey(
@@ -2757,6 +2757,7 @@ def test_gqa_runtime_uses_distinct_q_and_kv_head_shapes() -> None:
     )
 
     state = SimpleNamespace(
+        share_pattern_across_kv_heads=False,
         device=torch.device("cpu"),
         batch_size=1,
         seq_len_q=8,
@@ -3800,6 +3801,7 @@ def test_paged_inspection_launches_share_one_summary(
     result = inspect_paged(
         *metadata,
         static=SimpleNamespace(
+            share_pattern_across_kv_heads=False,
             batch_size=1,
             num_kv_heads=1,
             seq_len_q=64,
