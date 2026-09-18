@@ -22,6 +22,7 @@ import pytest
 
 from flashinfer.utils import get_compute_capability, is_sm100a_supported
 from flashinfer.gdn_prefill import chunk_gated_delta_rule
+from flashinfer.jit.cake_gdn import CakeGDNUnsupportedError
 
 
 INTEGER_DTYPES = (
@@ -29,14 +30,38 @@ INTEGER_DTYPES = (
     torch.int64,
 )
 
+# Cake CP is selected explicitly by backend="cake_gdn", use_cp=True.
+# auto/flashinfer retain the baseline implementation for both CP and non-CP.
+BACKEND_CP_CASES = (
+    pytest.param("flashinfer", False, id="flashinfer-non-cp"),
+    pytest.param("flashinfer", True, id="flashinfer-cp"),
+    pytest.param("cake_gdn", False, id="cake_gdn-non-cp"),
+    pytest.param("cake_gdn", True, id="cake_gdn-cp"),
+)
 
-def _skip_if_not_supported():
+# Non-CP Cake variants cover BF16 H=16; Cake CP shares the H=8 baseline cases.
+BACKEND_CP_HEAD_CASES = (
+    pytest.param("flashinfer", False, 8, id="flashinfer-non-cp"),
+    pytest.param("flashinfer", True, 8, id="flashinfer-cp"),
+    pytest.param("cake_gdn", False, 16, id="cake_gdn-non-cp"),
+    pytest.param("cake_gdn", True, 8, id="cake_gdn-cp"),
+)
+
+
+def _skip_if_not_supported(backend, use_cp):
     device = torch.device("cuda")
-    major, _ = get_compute_capability(device)
+    major, minor = get_compute_capability(device)
+    if backend == "cake_gdn" and (major, minor) not in ((10, 0), (10, 3)):
+        pytest.skip("cake_gdn prefill requires SM100 or SM103")
     if major not in (9, 10, 12):
         pytest.skip("state_indices GDN prefill path requires SM90, SM100, or SM120")
-    cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
-    if is_sm100a_supported(device) and cuda_major < 13:
+    cuda_version = tuple(
+        int(part) for part in (torch.version.cuda or "0.0").split(".")[:2]
+    )
+    cuda_major = cuda_version[0]
+    if backend == "cake_gdn" and use_cp is True and cuda_version < (12, 8):
+        pytest.skip(f"Cake GDN CP requires CUDA 12.8+, got {torch.version.cuda}")
+    if backend != "cake_gdn" and is_sm100a_supported(device) and cuda_major < 13:
         pytest.skip(f"SM100 GDN prefill requires CUDA 13+, got {torch.version.cuda}")
 
 
@@ -90,6 +115,7 @@ def _run(
     output_state,
     state_indices,
     use_cp,
+    backend,
 ):
     total, H, D = q.shape
     out = torch.empty(total, H, D, dtype=q.dtype, device=q.device)
@@ -108,10 +134,8 @@ def _run(
         output_state=output_state,
         state_indices=state_indices,
         use_cp=use_cp,
-        # This file checks the existing implementation's indexed and packed
-        # paths for bitwise identity.  Cake is covered separately against the
-        # independent sequential recurrence.
-        backend="flashinfer",
+        max_seqlen=total,
+        backend=backend,
     )
     return output, final
 
@@ -144,19 +168,31 @@ def _make_pool(init_state, perm, n_pool, pad, dtype, device, inner_stride=1):
     return pool
 
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "dtype,H,backend,use_cp",
+    [
+        (dtype, H, "flashinfer", use_cp)
+        for dtype in (torch.bfloat16, torch.float16)
+        for H in (8, 16, 32)
+        for use_cp in (False, True)
+    ]
+    + [(torch.bfloat16, 16, "cake_gdn", False)]
+    + [
+        (dtype, H, "cake_gdn", True)
+        for dtype in (torch.bfloat16, torch.float16)
+        for H in (8, 16, 32)
+    ],
+)
 @pytest.mark.parametrize(
     "seq_lens",
     [[128], [256], [128, 192, 64], [64, 512]],
 )
-@pytest.mark.parametrize("H", [8, 16, 32])
 @pytest.mark.parametrize("pad", [0, 96])  # 0 = compact pool, 96 = non-compact
-@pytest.mark.parametrize("use_cp", [False, True])
-def test_prefill_state_indices_matches_packed(dtype, seq_lens, H, pad, use_cp):
+def test_prefill_state_indices_matches_packed(dtype, seq_lens, H, pad, backend, use_cp):
     """A pool + state_indices in-place update must match the packed,
     sequence-ordered baseline bitwise (the kernel math is identical; only the
     addressed gmem row differs)."""
-    _skip_if_not_supported()
+    _skip_if_not_supported(backend, use_cp)
     device = torch.device("cuda")
     D = 128
     num_seqs = len(seq_lens)
@@ -178,6 +214,7 @@ def test_prefill_state_indices_matches_packed(dtype, seq_lens, H, pad, use_cp):
         out_state_a,
         None,
         use_cp,
+        backend,
     )
     torch.cuda.synchronize()
 
@@ -187,7 +224,7 @@ def test_prefill_state_indices_matches_packed(dtype, seq_lens, H, pad, use_cp):
     assert len(set(perm)) == num_seqs  # distinct slots
     pool = _make_pool(init_state, perm, n_pool, pad, state_dtype, device)
     idx = torch.tensor(perm, dtype=torch.int32, device=device)
-    output_b, _ = _run(q, k, v, g, beta, cu_seqlens, pool, pool, idx, use_cp)
+    output_b, _ = _run(q, k, v, g, beta, cu_seqlens, pool, pool, idx, use_cp, backend)
     torch.cuda.synchronize()
 
     assert not torch.isnan(output_b).any()
@@ -201,12 +238,12 @@ def test_prefill_state_indices_matches_packed(dtype, seq_lens, H, pad, use_cp):
 
 
 @pytest.mark.parametrize("index_dtype", INTEGER_DTYPES)
-@pytest.mark.parametrize("use_cp", [False, True])
-def test_prefill_integer_index_dtypes(index_dtype, use_cp):
+@pytest.mark.parametrize("backend,use_cp,H", BACKEND_CP_HEAD_CASES)
+def test_prefill_integer_index_dtypes(index_dtype, backend, use_cp, H):
     """Sequence and state indices retain their integer dtype across dispatch."""
-    _skip_if_not_supported()
+    _skip_if_not_supported(backend, use_cp)
     device = torch.device("cuda")
-    H, D = 8, 128
+    D = 128
     seq_lens = [64]
     q, k, v, g, beta, cu_seqlens, init_state = _make_inputs(
         seq_lens, H, D, torch.bfloat16, device, seed=5
@@ -225,6 +262,7 @@ def test_prefill_integer_index_dtypes(index_dtype, use_cp):
         packed_state,
         None,
         use_cp,
+        backend,
     )
 
     slots = [2]
@@ -241,6 +279,7 @@ def test_prefill_integer_index_dtypes(index_dtype, use_cp):
         pool,
         state_indices,
         use_cp,
+        backend,
     )
     torch.cuda.synchronize()
 
@@ -248,12 +287,12 @@ def test_prefill_integer_index_dtypes(index_dtype, use_cp):
     assert torch.equal(packed_final, indexed_final[slots])
 
 
-@pytest.mark.parametrize("use_cp", [False, True])
-def test_prefill_state_indices_preserves_inner_strides(use_cp):
-    """Indexed state views use the tensor's actual shape and strides."""
-    _skip_if_not_supported()
+@pytest.mark.parametrize("backend,use_cp,H", BACKEND_CP_HEAD_CASES)
+def test_prefill_state_indices_preserves_inner_strides(backend, use_cp, H):
+    """Indexed views preserve inner strides or reject unsupported layouts."""
+    _skip_if_not_supported(backend, use_cp)
     device = torch.device("cuda")
-    H, D = 8, 128
+    D = 128
     seq_lens = [64]
     q, k, v, g, beta, cu_seqlens, init_state = _make_inputs(
         seq_lens, H, D, torch.bfloat16, device, seed=6
@@ -271,6 +310,7 @@ def test_prefill_state_indices_preserves_inner_strides(use_cp):
         packed_state,
         None,
         use_cp,
+        backend,
     )
 
     slots = [2]
@@ -287,6 +327,7 @@ def test_prefill_state_indices_preserves_inner_strides(use_cp):
         contiguous_pool,
         state_indices,
         use_cp,
+        backend,
     )
     assert torch.equal(packed_output, contiguous_output)
     assert torch.equal(packed_final, contiguous_final[slots])
@@ -300,6 +341,22 @@ def test_prefill_state_indices_preserves_inner_strides(use_cp):
         device,
         inner_stride=2,
     )
+    if backend == "cake_gdn" and use_cp is not True:
+        with pytest.raises(CakeGDNUnsupportedError, match=r"contiguous \[H,V,K\] rows"):
+            _run(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                cu_seqlens,
+                pool,
+                pool,
+                state_indices,
+                use_cp,
+                backend,
+            )
+        return
     indexed_output, indexed_final = _run(
         q,
         k,
@@ -311,6 +368,7 @@ def test_prefill_state_indices_preserves_inner_strides(use_cp):
         pool,
         state_indices,
         use_cp,
+        backend,
     )
     torch.cuda.synchronize()
 
@@ -318,11 +376,15 @@ def test_prefill_state_indices_preserves_inner_strides(use_cp):
     assert torch.equal(packed_final, indexed_final[slots])
 
 
-def test_prefill_state_indices_requires_output_state_pool():
+@pytest.mark.parametrize(
+    "backend,use_cp",
+    [("auto", "auto"), ("cake_gdn", "auto"), ("cake_gdn", True)],
+)
+def test_prefill_state_indices_requires_output_state_pool(backend, use_cp):
     """With state_indices set, output_state must be a caller-provided pool: an
     auto-allocated compact [num_seqs, ...] tensor would be indexed out of bounds
     by the pool slot ids, so output_state=None must be rejected."""
-    _skip_if_not_supported()
+    _skip_if_not_supported(backend, use_cp)
     device = torch.device("cuda")
     H, D = 16, 128
     seq_lens = [128, 64]
@@ -352,19 +414,45 @@ def test_prefill_state_indices_requires_output_state_pool():
             output=out,
             output_state=None,  # must be rejected when state_indices is set
             state_indices=idx,
+            backend=backend,
+            use_cp=use_cp,
         )
 
 
-@pytest.mark.parametrize("use_cp", [False, True])
-def test_prefill_state_indices_without_final_state(use_cp):
-    """A state pool can supply initial state without requesting a final state."""
-    _skip_if_not_supported()
+@pytest.mark.parametrize("backend,use_cp", BACKEND_CP_CASES)
+def test_prefill_state_indices_without_final_state(backend, use_cp):
+    """Backends support read-only state pools or explicitly reject them."""
+    _skip_if_not_supported(backend, use_cp)
     device = torch.device("cuda")
     H, D = 16, 128
     seq_lens = [64, 512]
     q, k, v, g, beta, cu_seqlens, init_state = _make_inputs(
         seq_lens, H, D, torch.bfloat16, device, seed=4
     )
+
+    slots = [3, 0]
+    pool = _make_pool(init_state, slots, 5, 96, init_state.dtype, device)
+    state_indices = torch.tensor(slots, dtype=torch.int32, device=device)
+    if backend == "cake_gdn" and use_cp is not True:
+        with pytest.raises(
+            CakeGDNUnsupportedError,
+            match="indexed state requires initial and final state",
+        ):
+            chunk_gated_delta_rule(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                initial_state=pool,
+                output_final_state=False,
+                cu_seqlens=cu_seqlens,
+                state_indices=state_indices,
+                use_cp=use_cp,
+                backend=backend,
+                max_seqlen=max(seq_lens),
+            )
+        return
 
     packed_output = chunk_gated_delta_rule(
         q,
@@ -376,11 +464,10 @@ def test_prefill_state_indices_without_final_state(use_cp):
         output_final_state=False,
         cu_seqlens=cu_seqlens,
         use_cp=use_cp,
+        backend=backend,
+        max_seqlen=max(seq_lens),
     )
 
-    slots = [3, 0]
-    pool = _make_pool(init_state, slots, 5, 96, init_state.dtype, device)
-    state_indices = torch.tensor(slots, dtype=torch.int32, device=device)
     indexed_output = chunk_gated_delta_rule(
         q,
         k,
@@ -392,16 +479,18 @@ def test_prefill_state_indices_without_final_state(use_cp):
         cu_seqlens=cu_seqlens,
         state_indices=state_indices,
         use_cp=use_cp,
+        backend=backend,
+        max_seqlen=max(seq_lens),
     )
     torch.cuda.synchronize()
 
     assert torch.equal(packed_output, indexed_output)
 
 
-@pytest.mark.parametrize("use_cp", [False, True])
-def test_prefill_state_indices_none_is_default(use_cp):
+@pytest.mark.parametrize("backend,use_cp", BACKEND_CP_CASES)
+def test_prefill_state_indices_none_is_default(backend, use_cp):
     """state_indices=None must reproduce the packed path exactly (default)."""
-    _skip_if_not_supported()
+    _skip_if_not_supported(backend, use_cp)
     device = torch.device("cuda")
     H, D = 16, 128
     seq_lens = [128, 192]
@@ -410,9 +499,13 @@ def test_prefill_state_indices_none_is_default(use_cp):
         seq_lens, H, D, torch.bfloat16, device, seed=1
     )
     s1 = torch.empty(num_seqs, H, D, D, dtype=init_state.dtype, device=device)
-    o1, f1 = _run(q, k, v, g, beta, cu_seqlens, init_state.clone(), s1, None, use_cp)
+    o1, f1 = _run(
+        q, k, v, g, beta, cu_seqlens, init_state.clone(), s1, None, use_cp, backend
+    )
     s2 = torch.empty(num_seqs, H, D, D, dtype=init_state.dtype, device=device)
-    o2, f2 = _run(q, k, v, g, beta, cu_seqlens, init_state.clone(), s2, None, use_cp)
+    o2, f2 = _run(
+        q, k, v, g, beta, cu_seqlens, init_state.clone(), s2, None, use_cp, backend
+    )
     torch.cuda.synchronize()
     assert torch.equal(o1, o2)
     assert torch.equal(f1, f2)
