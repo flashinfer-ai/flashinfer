@@ -32,6 +32,8 @@ from flashinfer.fused_moe.da_tuner import (
     DADistribution,
     factorized_tactic_to_body,
     FullOpMeasurementCache,
+    FullWorkload,
+    get_workload,
     RoutingRealization,
     RoutingRealizationFactory,
     RoutingRealizationKey,
@@ -164,6 +166,8 @@ class DaMoeOperationKey:
     num_local_experts: int
     # Number of selected experts in each token row.
     top_k: int
+    # Synthetic local token-expert assignment hint used during profiling.
+    num_local_assignments_hint: int
     # Public routing-method enum affecting the operation contract.
     routing_method_type: int
     # Precomputed routing representation consumed during replay.
@@ -193,6 +197,7 @@ class DaMoeOperationKey:
                 "local_expert_offset": self.local_expert_offset,
                 "num_local_experts": self.num_local_experts,
                 "top_k": self.top_k,
+                "num_local_assignments_hint": self.num_local_assignments_hint,
                 "routing_method_type": self.routing_method_type,
                 "routing_input_mode": self.routing_input_mode,
                 "routing_id_index": self.routing_id_index,
@@ -203,6 +208,12 @@ class DaMoeOperationKey:
             sort_keys=True,
             separators=(",", ":"),
         )
+
+    def runtime_key(self) -> str:
+        """Return the workload-independent identity used after warmup."""
+        payload = json.loads(self.cache_key())
+        del payload["num_local_assignments_hint"]
+        return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
 
 def make_da_moe_operation_key(
@@ -216,6 +227,7 @@ def make_da_moe_operation_key(
     local_expert_offset: int,
     num_local_experts: int,
     top_k: int,
+    num_local_assignments_hint: int,
     routing_method_type: int,
     routing_input_mode: int,
     routing_id_index: int,
@@ -246,6 +258,7 @@ def make_da_moe_operation_key(
         local_expert_offset=local_expert_offset,
         num_local_experts=num_local_experts,
         top_k=top_k,
+        num_local_assignments_hint=num_local_assignments_hint,
         routing_method_type=routing_method_type,
         routing_input_mode=routing_input_mode,
         routing_id_index=routing_id_index,
@@ -340,17 +353,23 @@ def run_dist_aware_tactic(
             "DA runtime backend does not match its operation domain: "
             f"{runtime_backend.value} != {backend_identity.value}"
         )
-    # Synthetic DA profiles draw top_k distinct experts from the local shard. Until the
-    # separate partial-occupancy workload model is implemented, keep valid EP shapes whose
-    # global top-k exceeds the local shard on the ordinary autotuner path.
-    if top_k > num_local_experts:
+    workload = get_workload()
+    if isinstance(workload, FullWorkload) and top_k > num_local_experts:
+        return run_fixed_tactic(baseline_tactic)
+
+    hidden_states = inputs[MoeRunnerInputs.idx("hidden_states")]
+    if not isinstance(hidden_states, torch.Tensor):
+        raise TypeError("DA requires tensor hidden states")
+    num_tokens = int(hidden_states.shape[0])
+    num_local_assignments_hint = workload.local_assignments(
+        num_tokens, top_k, num_experts, num_local_experts, local_expert_offset
+    )
+    # Distinct all-local top-k IDs cannot fit in an undersized local shard.
+    if num_local_assignments_hint == num_tokens * top_k and top_k > num_local_experts:
         return run_fixed_tactic(baseline_tactic)
     if routing_input_mode == RoutingInputMode.FromLogits:
         routing_logits = inputs[routing_id_index]
-        hidden_states = inputs[MoeRunnerInputs.idx("hidden_states")]
-        if not isinstance(routing_logits, torch.Tensor) or not isinstance(
-            hidden_states, torch.Tensor
-        ):
+        if not isinstance(routing_logits, torch.Tensor):
             raise TypeError("FromLogits DA requires tensor routing and hidden states")
         if routing_logits.shape[0] != hidden_states.shape[0]:
             raise ValueError(
@@ -375,6 +394,7 @@ def run_dist_aware_tactic(
         local_expert_offset=local_expert_offset,
         num_local_experts=num_local_experts,
         top_k=top_k,
+        num_local_assignments_hint=num_local_assignments_hint,
         routing_method_type=routing_method_type,
         routing_input_mode=routing_input_mode,
         routing_id_index=routing_id_index,
@@ -414,6 +434,8 @@ def run_dist_aware_tactic(
             runner_kwargs=runner_kwargs,
             bindings=bindings,
         )
+        if state.tuned:
+            DA_MOE_REGISTRY.activate(state)
         DA_MOE_REGISTRY.publish_cache(tuner)
     else:
         state = DA_MOE_REGISTRY.find_or_restore(key, tuner)
@@ -923,8 +945,10 @@ class DaMoeOperationState:
             distribution=distribution.name,
             sample_index=sample_index,
             local_expert_offset=self.key.local_expert_offset,
+            num_experts=self.key.num_experts,
             num_local_experts=self.key.num_local_experts,
             top_k=self.key.top_k,
+            num_local_assignments_hint=self.key.num_local_assignments_hint,
             routing_rule_fingerprint=(
                 f"mode={self.key.routing_input_mode};method={self.key.routing_method_type}"
             ),
@@ -1285,6 +1309,9 @@ class DaMoeRegistry:
         """Create an empty thread-safe state registry."""
         # State indexed by immutable operation domain.
         self._states: dict[DaMoeOperationKey, DaMoeOperationState] = {}
+        # Latest successfully tuned or restored state for ordinary execution
+        # and CUDA Graph capture after the autotune context has exited.
+        self._active_states: dict[str, DaMoeOperationState] = {}
         # Registry lock protecting lookup and cache snapshots.
         self._lock = threading.RLock()
 
@@ -1298,12 +1325,23 @@ class DaMoeRegistry:
         with self._lock:
             return self._states.get(key)
 
+    def activate(self, state: DaMoeOperationState) -> None:
+        """Publish one complete state for workload-independent runtime lookup."""
+        with self._lock:
+            self._active_states[state.key.runtime_key()] = state
+
     def find_or_restore(
         self, key: DaMoeOperationKey, tuner: AutoTuner
     ) -> DaMoeOperationState | None:
         """Return process state or transactionally restore its cache record."""
+        with self._lock:
+            state = self._active_states.get(key.runtime_key())
+        if state is not None:
+            return state
         state = self.find(key)
         if state is not None:
+            if state.tuned:
+                self.activate(state)
             return state
         record = tuner.get_namespaced_records(DA_MOE_CACHE_NAMESPACE).get(
             key.cache_key()
@@ -1320,7 +1358,9 @@ class DaMoeRegistry:
             )
             return None
         with self._lock:
-            return self._states.setdefault(key, candidate)
+            state = self._states.setdefault(key, candidate)
+            self._active_states[key.runtime_key()] = state
+            return state
 
     def publish_cache(self, tuner: AutoTuner) -> None:
         """Merge tuned states into the shared fused-MoE cache namespace."""
