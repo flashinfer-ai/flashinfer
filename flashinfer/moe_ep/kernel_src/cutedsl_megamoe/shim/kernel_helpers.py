@@ -99,6 +99,10 @@ _LAZY = {
         "moe_mxfp8_glu.mega_reference_mxfp8",
         "compute_megamoe_reference_mxfp8",
     ),
+    "compute_megamoe_reference_bf16_mxfp8": (
+        "moe_mxfp8_bf16_glu.mega_reference_mxfp8_bf16",
+        "compute_megamoe_reference_mxfp8_bf16",
+    ),
     "CombineFormat": ("src.token_comm", "CombineFormat"),
     "combine_roundtrip_to_fp32": (
         "moe_nvfp4_swapab.mega_reference",
@@ -166,4 +170,5 @@ __all__ = [
     "combine_roundtrip_to_fp32",  # noqa: F822
     "compute_megamoe_reference_mxfp8",  # noqa: F822
     "compute_megamoe_reference_bf16",  # noqa: F822
+    "compute_megamoe_reference_bf16_mxfp8",  # noqa: F822
 ]

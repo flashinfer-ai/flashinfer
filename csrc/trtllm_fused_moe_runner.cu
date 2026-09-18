@@ -757,7 +757,7 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
         workspace.expanded_idx_to_permuted_idx,
         reinterpret_cast<uint8_t*>(workspace.activation_output),
         reinterpret_cast<uint8_t*>(workspace.activation_output_scale),
-        reinterpret_cast<float*>(workspace.token_scales_fc2), sfLayout, stream);
+        reinterpret_cast<float*>(workspace.token_scales_fc2), sfLayout, stream, enable_pdl);
 
     gemm2_input = workspace.activation_output;
     gemm2_input_scale = workspace.activation_output_scale;

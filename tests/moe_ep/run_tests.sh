@@ -116,6 +116,7 @@ run_unit() {
     --ignore=tests/moe_ep/test_moe_ep_nvfp4_cutedsl_mega_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_mxfp8_cutedsl_mega_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_bf16_cutedsl_mega_multirank.py \
+    --ignore=tests/moe_ep/test_moe_ep_bf16_mxfp8_cutedsl_mega_multirank.py \
     --ignore=tests/moe_ep/test_mega_native_topk_reduce_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_bf16_rank_major_cuda_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_fault_tolerance_multirank.py \
@@ -126,6 +127,7 @@ run_unit() {
     --ignore=tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py \
     --ignore=tests/moe_ep/test_deep_gemm_mega_kernel_vs_reference.py \
     --ignore=tests/moe_ep/test_sm90_pull_fp8_kernel_vs_reference.py \
+    --ignore=tests/moe_ep/test_sm90_pull_fp8_tuner.py \
     --ignore=tests/moe_ep/test_split_fused_moe_kernel_vs_reference.py \
     --ignore=tests/moe_ep/test_moe_ep_compute_correctness.py \
     --ignore=tests/moe_ep/test_moe_ep_compute_correctness_nvfp4.py \
@@ -142,7 +144,15 @@ run_unit() {
   # per-file, and in every subset tried (see moe_ep runbook "unit suite"
   # notes; observed since 2026-07-22).
   pytest_no_finalize -v "${MOE_EP_PYTEST_FLAGS[@]}" \
-    "tests/moe_ep/test_workspace_pool.py::test_two_nvfp4_layers_share_one_symm_buffer"
+    "tests/moe_ep/test_workspace_pool.py::test_two_nvfp4_layers_share_one_symm_buffer" \
+    || return 1
+  # The SM90 pull tuner tests import the sm90 pull_style_cutedsl_megakernel
+  # tree, which shares top-level module names (common, src, moe_nvfp4_swapab)
+  # with the SM100 cutedsl_megamoe tree the tests above load; the shim's
+  # bootstrap_paths guard refuses to mix them in one process, so they get
+  # their own interpreter.
+  pytest_no_finalize -v "${MOE_EP_PYTEST_FLAGS[@]}" \
+    tests/moe_ep/test_sm90_pull_fp8_tuner.py
 }
 
 run_multirank() {
@@ -231,6 +241,7 @@ run_oracle() {
   MEGA_NO_DIST=1 "${TORCHRUN}" --standalone --nproc_per_node=1 -m pytest \
     "${MOE_EP_PYTEST_FLAGS[@]}" \
     tests/moe_ep/test_mxfp8_cutedsl_preprocess_vs_reference.py \
+    tests/moe_ep/test_bf16_mxfp8_cutedsl_kernel_vs_reference.py \
     tests/moe_ep/test_bf16_cutedsl_kernel_vs_reference.py \
     tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py -v \
     -m arch_blackwell || rc=1
@@ -275,12 +286,14 @@ run_mega() {
     tests/moe_ep/test_moe_ep_nvfp4_cutedsl_mega_multirank.py \
     tests/moe_ep/test_moe_ep_bf16_cutedsl_mega_multirank.py \
     tests/moe_ep/test_moe_ep_mxfp8_cutedsl_mega_multirank.py \
+    tests/moe_ep/test_moe_ep_bf16_mxfp8_cutedsl_mega_multirank.py \
     tests/moe_ep/test_mega_native_topk_reduce_multirank.py -v \
     -m "gpu_4 and arch_blackwell" || rc=1
 
   MEGA_NO_DIST=1 "${TORCHRUN}" --nproc_per_node=1 -m pytest \
     "${MOE_EP_PYTEST_FLAGS[@]}" \
     tests/moe_ep/test_mxfp8_cutedsl_preprocess_vs_reference.py \
+    tests/moe_ep/test_bf16_mxfp8_cutedsl_kernel_vs_reference.py \
     tests/moe_ep/test_bf16_cutedsl_kernel_vs_reference.py \
     tests/moe_ep/test_nvfp4_cutedsl_kernel_vs_reference.py -v \
     -m arch_blackwell || rc=1

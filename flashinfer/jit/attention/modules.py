@@ -25,7 +25,6 @@ from ..core import (
     JitSpec,
     common_nvcc_flags,
     gen_jit_spec,
-    logger,
     sm90a_nvcc_flags,
     current_compilation_context,
 )
@@ -322,116 +321,6 @@ def gen_batch_mla_module(
         extra_cuda_cflags=extra_cuda_cflags,
         post_load_adapter=_BatchMLAModuleProxy,
     )
-
-
-def get_batch_decode_mla_uri(
-    dtype_q: torch.dtype,
-    dtype_kv: torch.dtype,
-    dtype_o: torch.dtype,
-    dtype_idx: torch.dtype,
-    head_dim_ckv: int,
-    use_sliding_window: bool,
-    use_logits_soft_cap: bool,
-    arc: str,
-) -> str:
-    return (
-        f"batch_decode_mla_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
-        f"dtype_kv_{filename_safe_dtype_map_kv(dtype_kv)}_"
-        f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
-        f"dtype_idx_{filename_safe_dtype_map[dtype_idx]}_"
-        f"head_dim_ckv{head_dim_ckv}_"
-        f"use_swa_{use_sliding_window}_"
-        f"use_logits_cap_{use_logits_soft_cap}_"
-        f"arc_{arc}"
-    )
-
-
-def gen_batch_decode_mla_module(
-    dtype_q: torch.dtype,
-    dtype_kv: torch.dtype,
-    dtype_o: torch.dtype,
-    dtype_idx: torch.dtype,
-    head_dim: int,
-    num_qo_heads: int,
-    use_sliding_window: bool,
-    use_logits_soft_cap: bool,
-    use_tensor_cores: bool,
-) -> JitSpec:
-    cuda_arch_major = torch.cuda.get_device_properties(0).major
-
-    if cuda_arch_major >= 9:  # smem size of SM90 can accommodate all 128 qo-heads data
-        qo_tile_len = 128
-    else:
-        qo_tile_len = 64
-
-    if (
-        use_tensor_cores
-        and cuda_arch_major >= 8
-        and num_qo_heads % qo_tile_len == 0
-        and dtype_q == torch.float16
-        and dtype_kv == torch.float16
-        and dtype_o == torch.float16
-    ):
-        logger.info("Use tensor-core SM80 version of MLA decode kernel.")
-        arc = "sm80"
-    else:
-        logger.info("Fall back to cuda-core version of MLA decode kernel.")
-        arc = "cuda_core"
-
-    uri = get_batch_decode_mla_uri(
-        dtype_q,
-        dtype_kv,
-        dtype_o,
-        dtype_idx,
-        head_dim,
-        use_sliding_window,
-        use_logits_soft_cap,
-        arc,
-    )
-    gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
-    os.makedirs(gen_directory, exist_ok=True)
-
-    with open(jit_env.FLASHINFER_CSRC_DIR / "batch_decode_mla_config.jinja") as f:
-        config_templ = jinja2.Template(f.read())
-    generated_config_path = gen_directory / "mla_config.inc"
-    write_if_different(
-        generated_config_path,
-        config_templ.render(
-            dtype_q=dtype_map[dtype_q],
-            dtype_kv=dtype_map_kv[dtype_kv],
-            dtype_o=dtype_map[dtype_o],
-            dtype_idx=dtype_map[dtype_idx],
-            head_dim_ckv=head_dim,
-            head_dim_kpe=head_dim // 8,
-            qo_tile_len=qo_tile_len,
-            use_sliding_window=str(use_sliding_window).lower(),
-            use_logits_soft_cap=str(use_logits_soft_cap).lower(),
-        ),
-    )
-
-    filenames = []
-    if arc == "sm80":
-        filenames = [
-            "batch_decode_mla_cute_sm80.cu",
-            "batch_decode_mla_binding.cu",
-        ]
-    else:
-        filenames = [
-            "batch_decode_mla_plan.cu",
-            "batch_decode_mla_run.cu",
-            "batch_decode_mla_binding.cu",
-        ]
-
-    source_paths = []
-    for filename in filenames:
-        src_path = jit_env.FLASHINFER_CSRC_DIR / filename
-        dest_path = gen_directory / filename
-        source_paths.append(dest_path)
-        with open(src_path, "r") as f:
-            source = f.read()
-        write_if_different(dest_path, source)
-
-    return gen_jit_spec(uri, source_paths)
 
 
 def get_single_prefill_uri(
@@ -1448,14 +1337,13 @@ def _fa2_head_dim_nvcc_flags(
 ) -> Optional[List[str]]:
     """Return arch flags for FA2 large-head modules.
 
-    For 16-bit KV, head_dim > 256 uses the Ampere+ large-head path. NVFP4 KV
-    can opt into the same arch set only for validated FA2 prefill read paths.
-    Other one-byte large-head modules remain restricted to SM100+ until those
-    variants are validated separately.
+    For 16-bit and FP8 KV, head_dim > 256 uses the Ampere+ large-head path.
+    NVFP4 KV can opt into the same arch set only for validated FA2 prefill
+    read paths; NVFP4 large-head decode remains restricted to SM100+.
     """
     if head_dim_qk > 256 or head_dim_vo > 256:
-        if dtype_kv.itemsize == 1:
-            if not (allow_nvfp4_sm8_large_head and _is_nvfp4_kv_dtype(dtype_kv)):
+        if _is_nvfp4_kv_dtype(dtype_kv):
+            if not allow_nvfp4_sm8_large_head:
                 return current_compilation_context.get_nvcc_flags_list(
                     supported_major_versions=[10, 11, 12]
                 )
