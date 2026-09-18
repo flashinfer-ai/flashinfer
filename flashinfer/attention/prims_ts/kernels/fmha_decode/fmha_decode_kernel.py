@@ -385,6 +385,8 @@ def _build_decode_gen_schedule(
         (task_list, dep_graph, dma labels, smem_allocator, tmem_allocator,
         eager_init_resources)
     """
+    if cfg.use_block_sparse and cfg.num_insts_kv != 2:
+        raise ValueError("block-sparse attention requires num_insts_kv == 2")
     if cfg.use_keeps_mma_ab and cfg.num_insts_kv == 1 and not cfg.uses_tmem_p:
         raise ValueError(
             "one-instance KeepsMmaAb is enabled only for the staged headDim=256 "

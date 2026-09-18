@@ -983,6 +983,7 @@ def test_attention_ts_encoded_page4_trace_separates_semantic_and_storage_pages()
     for definition in definitions:
         assert "_encoded_page4" in definition["name"]
         assert definition["axes"]["storage_page_size"]["value"] == 32
+        assert definition["axes"]["kv_storage_head_dim"]["value"] == head_dim
         assert definition["axes"]["page_size"]["value"] == 4
         assert "optional" not in definition["inputs"]["semantic_page_size"]
         assert "storage_page_size > page_size" in definition["constraints"]
@@ -992,7 +993,7 @@ def test_attention_ts_encoded_page4_trace_separates_semantic_and_storage_pages()
                 "num_pages",
                 "num_kv_heads",
                 "storage_page_size",
-                "head_dim",
+                "kv_storage_head_dim",
             ]
 
     default_template = attention_ts_decode_trace_dispatch(

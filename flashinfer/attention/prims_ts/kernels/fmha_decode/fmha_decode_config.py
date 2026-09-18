@@ -746,18 +746,19 @@ class FmhaDecodeConfig:
 
     @property
     def uses_task_register_reallocation(self) -> bool:
-        return self.use_transform_kv or (
-            self.use_keeps_mma_ab
-            and (
-                self.tile_size_q == 128
-                or (
-                    self.tile_size_q == 64
-                    and self.tile_size_kv == 256
-                    and self.total_kv_tiles
-                    >= KV_TILE_256_REGISTER_REALLOCATION_MIN_TILES
-                )
+        if (
+            self.use_transform_kv
+            or (self.use_keeps_mma_ab and self.tile_size_q == 128)
+            or (
+                self.use_keeps_mma_ab
+                and self.tile_size_q == 64
+                and self.tile_size_kv == 256
+                and self.total_kv_tiles >= KV_TILE_256_REGISTER_REALLOCATION_MIN_TILES
             )
-        )
+        ):
+            return True
+        else:
+            return False
 
     @property
     def softmax_task_num_registers(self) -> int | None:
@@ -1410,17 +1411,52 @@ class FmhaDecodeConfig:
             (q_dtype_bits * self.headdim // BITS_PER_BYTE + Q_ROW_ALIGNMENT_BYTES - 1)
             // Q_ROW_ALIGNMENT_BYTES
         ) * Q_ROW_ALIGNMENT_BYTES
-        q_tile_kib = q_row_bytes * self.tile_size_q // BYTES_PER_KIB
-        kv_budget_kib = min(
-            MAX_KV_STAGE_SMEM_KIB,
-            TOTAL_SMEM_BUDGET_KIB - q_tile_kib * self.q_stages,
+        fixed_bytes = (
+            q_row_bytes * self.tile_size_q * self.q_stages
+            + self.correction_sum_scratch_entries * FP32_BYTES
         )
+        if not self.uses_tmem_p:
+            fixed_bytes += self.num_insts_kv * self.smem_p_tile_bytes
+        if not self.use_keeps_mma_ab:
+            fixed_bytes += self.tile_size_q * self.headdim * max(self.o_dtype_bytes, 2)
+        if self.use_paged_kv:
+            page_ids_per_stage = WARP_THREADS
+            if self.uses_held_encoded_locator_window:
+                page_ids_per_stage = max(
+                    page_ids_per_stage,
+                    self.static_local_kv_tiles
+                    * self.tile_size_kv
+                    // self.num_tokens_per_page,
+                )
+            fixed_bytes += self.page_offsets_stages * page_ids_per_stage * 4
+        if self.use_cluster_smem_reduction:
+            fixed_bytes += self.cluster_transaction_bytes
+
         kv_stage_head_dim = self.head_dim_per_stage_kv or self.headdim
         kv_tile_bits = q_dtype_bits * self.tile_size_kv * kv_stage_head_dim
-        return max(
-            1,
-            kv_budget_kib * BYTES_PER_KIB * BITS_PER_BYTE // kv_tile_bits,
+        if self.use_transform_kv:
+            # Raw storage and converted operands coexist. When the converted
+            # depth is still implicit, budget both rings per stage; otherwise
+            # reserve the configured converted ring before sizing raw storage.
+            kv_tile_bits = (
+                self.smem_kv_storage_tile_bytes + self.smem_kv_sf_tile_bytes
+            ) * BITS_PER_BYTE
+            if not self.store_transformed_kv_in_tmem:
+                if self.transformed_kv_stages > 0:
+                    fixed_bytes += (
+                        self.transformed_kv_stages * self.smem_transformed_kv_tile_bytes
+                    )
+                else:
+                    kv_tile_bits += self.smem_transformed_kv_tile_bytes * BITS_PER_BYTE
+
+        # Reserve common buffers for every profile, leaving hardware SMEM
+        # above this budget for alignment, barriers, and scheduler state.
+        kv_budget_bytes = min(
+            MAX_KV_STAGE_SMEM_KIB * BYTES_PER_KIB,
+            TOTAL_SMEM_BUDGET_KIB * BYTES_PER_KIB - fixed_bytes,
         )
+        inferred_stages = max(1, kv_budget_bytes * BITS_PER_BYTE // kv_tile_bits)
+        return inferred_stages
 
     def validate_dtypes(self) -> None:
         """Validate decode input, output, and accumulator dtypes."""
@@ -1521,6 +1557,9 @@ class FmhaDecodeConfig:
                     "sparse execution policy requires block-sparse attention"
                 )
             return
+
+        if self.num_insts_kv != 2:
+            raise ValueError("block-sparse attention requires num_insts_kv == 2")
 
         if not (self.q_dtype == self.kv_dtype == self.out_dtype):
             raise ValueError("block-sparse requires q_dtype == kv_dtype == out_dtype")
@@ -2557,11 +2596,14 @@ def _finalize_static_decode_config(
             or cfg.transformed_kv_stages == 0
         ):
             cfg.transformed_kv_stages = (
-                TMEM_MAX_ALLOCATION_COLUMNS - cfg.tmem_total_cols
+                TMEM_MAX_ALLOCATION_COLUMNS
+                - cfg.tmem_total_cols
+                + cfg.tmem_transformed_kv_stage_cols * cfg.transformed_kv_stages
+                # tmem_total_cols already includes the tmem of transform kv task. drop it
             ) // cfg.tmem_transformed_kv_stage_cols
 
-    if cfg.tile_size_kv != 256 and "kv_stages" not in explicit_fields:
-        cfg.kv_stages = cfg.inferred_kv_stages
+    if cfg.tile_size_kv != 256:
+        _set_if_implicit(cfg, "kv_stages", cfg.inferred_kv_stages, explicit_fields)
 
     if (
         cfg.use_transform_kv

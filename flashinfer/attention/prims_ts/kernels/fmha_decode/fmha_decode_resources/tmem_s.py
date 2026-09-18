@@ -638,6 +638,7 @@ class TmemSResource(DecodeGenResourceBase):
         )
 
         q_is_a, mma_m, mma_n = _qk_mma_operand_contract_for_config(cfg)
+        # currently bmm uses q dtype as precision of mma.
         idesc = prims.Tcgen05InstrDesc.build(
             c_dtype=Float32,
             a_dtype=cfg.q_dtype,

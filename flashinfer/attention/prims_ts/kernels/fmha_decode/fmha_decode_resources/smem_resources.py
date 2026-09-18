@@ -1148,10 +1148,10 @@ class SmemKvTileResource(DecodeGenResourceBase):
                                 stage_info.barrier,
                             )
             else:
-                # 16-bit pages are copied in 64-column chunks so the SMEM
-                # layout matches the K/V tcgen05 descriptor swizzle.
-                chunk_hd = min(head_dim_stage, 64)
-                num_chunks = head_dim_stage // chunk_hd
+                # 128B TMA swizzling permits 64 columns per copy for 16-bit K/V.
+                # Store each chunk as a separate slab matching the tcgen05 layout.
+                chunk_hd = min(head_dim_stage, 128 // cfg.kv_dtype_bytes)
+                num_head_dim_tma_chunks = head_dim_stage // chunk_hd
                 tile_chunk_elems = chunk_hd * cfg.tile_size_kv
                 page_chunk_elems = chunk_hd * cfg.num_tokens_per_page
                 if cutlass.const_expr(cfg.uses_scattered_page_route):
@@ -1165,11 +1165,11 @@ class SmemKvTileResource(DecodeGenResourceBase):
                     # copy to a disjoint destination, not a warp-wide copy
                     # that needs election. Electing here would omit fragments.
                     assert page_fragments == 32
-                    assert num_chunks in (1, 2, 4)
+                    assert num_head_dim_tma_chunks in (1, 2, 4)
                     assert cfg.load_num_warps in (1, 2, 4, 8)
                     partition_stage_base = self._stage_base(stage_info)
                     lane_page_frag = cute.arch.thread_idx()[0] & Int32(0x1F)
-                    num_transactions = page_fragments * num_chunks
+                    num_transactions = page_fragments * num_head_dim_tma_chunks
                     assert num_transactions % cfg.load_num_warps == 0
                     transactions_per_warp = num_transactions // cfg.load_num_warps
                     transactions_per_lane = (transactions_per_warp + 31) // 32
@@ -1238,7 +1238,7 @@ class SmemKvTileResource(DecodeGenResourceBase):
                 stage_base = self._stage_base(stage_info)
                 if prims.elect_sync():
                     page_ids = self.page_offsets_kv.page_ids(tile_idx, local_tile_idx)
-                    for chunk_idx in cutlass.range_constexpr(num_chunks):
+                    for chunk_idx in cutlass.range_constexpr(num_head_dim_tma_chunks):
                         local_head_dim_offset = chunk_idx * chunk_hd
                         global_head_dim_offset = (
                             head_dim_stage_offset + local_head_dim_offset
@@ -2418,10 +2418,10 @@ class SmemKvResource(DecodeGenResourceBase):
                             stage_info.barrier,
                         )
             else:
-                # 16-bit pages are split into 64-column chunks inside the
-                # staged head-dim slice.
-                chunk_hd = min(head_dim_stage, 64)
-                num_chunks = head_dim_stage // chunk_hd
+                # 128B TMA swizzling permits 64 columns per copy for 16-bit K/V.
+                # Store each chunk as a separate slab matching the tcgen05 layout.
+                chunk_hd = min(head_dim_stage, 128 // cfg.kv_dtype_bytes)
+                num_head_dim_tma_chunks = head_dim_stage // chunk_hd
                 tile_chunk_elems = chunk_hd * cfg.tile_size_kv
                 page_chunk_elems = chunk_hd * cfg.num_tokens_per_page
                 stage_base = self._stage_base(stage_info)
@@ -2445,7 +2445,9 @@ class SmemKvResource(DecodeGenResourceBase):
                         lane_token_offset, lane_physical_page = (
                             _decode_native_page_locator(cfg, lane_page_locator)
                         )
-                        for lane_chunk_idx in cutlass.range_constexpr(num_chunks):
+                        for lane_chunk_idx in cutlass.range_constexpr(
+                            num_head_dim_tma_chunks
+                        ):
                             lane_local_head_dim_offset = lane_chunk_idx * chunk_hd
                             lane_global_head_dim_offset = (
                                 head_dim_stage_offset + lane_local_head_dim_offset
@@ -2468,9 +2470,9 @@ class SmemKvResource(DecodeGenResourceBase):
                             )
                         return
 
-                    assert num_chunks in (1, 2, 4)
+                    assert num_head_dim_tma_chunks in (1, 2, 4)
                     assert cfg.load_num_warps in (2, 4, 8)
-                    num_transactions = page_fragments * num_chunks
+                    num_transactions = page_fragments * num_head_dim_tma_chunks
                     assert num_transactions % cfg.load_num_warps == 0
                     transactions_per_warp = num_transactions // cfg.load_num_warps
                     # Seed branch-local coordinates with their traced scalar
@@ -2541,7 +2543,9 @@ class SmemKvResource(DecodeGenResourceBase):
                         token_offset, physical_page = _decode_native_page_locator(
                             cfg, Int32(page_ids[page_frag])
                         )
-                        for chunk_idx in cutlass.range_constexpr(num_chunks):
+                        for chunk_idx in cutlass.range_constexpr(
+                            num_head_dim_tma_chunks
+                        ):
                             local_head_dim_offset = chunk_idx * chunk_hd
                             global_head_dim_offset = (
                                 head_dim_stage_offset + local_head_dim_offset

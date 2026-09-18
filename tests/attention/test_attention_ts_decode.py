@@ -4148,13 +4148,17 @@ def test_attention_ts_nvfp4_cache_contract():
 @pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
 @pytest.mark.parametrize("batch_size", [1, 4], ids=lambda value: f"b{value}")
-@pytest.mark.parametrize("seq_len_kv", [128, 1024], ids=lambda value: f"kv{value}")
+@pytest.mark.parametrize(
+    "seq_len_kv",
+    [128, 2048, 2049, 2051, 2177, 4096, 4097, 8192],
+    ids=lambda value: f"kv{value}",
+)
 @pytest.mark.parametrize(
     "seq_len_q",
-    [1],
+    [1, 4, 8],
     ids=lambda value: f"q{value}",
 )
-@pytest.mark.parametrize("head_dim", [128, 256], ids=lambda value: f"d{value}")
+@pytest.mark.parametrize("head_dim", [64, 128, 256], ids=lambda value: f"d{value}")
 @pytest.mark.parametrize(
     ("num_qo_heads", "num_kv_heads"),
     [(32, 4)],

@@ -1087,12 +1087,14 @@ def _make_attention_ts_decode_trace(
             ),
             "k_sf_cache": Tensor(
                 ["num_pages", "num_kv_heads", storage_axis, "kv_scale_groups"],
+                dtype="float8_e4m3fn",
                 param="kv_scale_factors",
                 tuple_idx=0,
                 optional=True,
             ),
             "v_sf_cache": Tensor(
                 ["num_pages", "num_kv_heads", storage_axis, "kv_scale_groups"],
+                dtype="float8_e4m3fn",
                 param="kv_scale_factors",
                 tuple_idx=1,
                 optional=True,
@@ -1244,12 +1246,14 @@ def _make_prims_ts_decode_trace(
             "seq_lens": Tensor(["batch_size"], dtype="int32"),
             "k_sf_cache": Tensor(
                 ["num_pages", "num_kv_heads", storage_axis, "kv_scale_groups"],
+                dtype="float8_e4m3fn",
                 param="kv_scale_factors",
                 tuple_idx=0,
                 optional=True,
             ),
             "v_sf_cache": Tensor(
                 ["num_pages", "num_kv_heads", storage_axis, "kv_scale_groups"],
+                dtype="float8_e4m3fn",
                 param="kv_scale_factors",
                 tuple_idx=1,
                 optional=True,
@@ -1466,12 +1470,14 @@ def _make_prims_ts_decode_wrapper_trace(
             ),
             "k_sf_cache": Tensor(
                 ["num_pages", "num_kv_heads", storage_axis, "kv_scale_groups"],
+                dtype="float8_e4m3fn",
                 param="kv_scale_factors",
                 tuple_idx=0,
                 optional=True,
             ),
             "v_sf_cache": Tensor(
                 ["num_pages", "num_kv_heads", storage_axis, "kv_scale_groups"],
+                dtype="float8_e4m3fn",
                 param="kv_scale_factors",
                 tuple_idx=1,
                 optional=True,
