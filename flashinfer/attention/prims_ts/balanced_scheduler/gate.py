@@ -110,9 +110,9 @@ def should_use_prims_ts_balanced_mla(
 
     This predicate deliberately does not inspect the CUDA device or its
     calibration registry. A ``True`` result is only the route decision;
-    balanced planning subsequently requires an exact-device cost-model
-    calibration and raises :class:`NotImplementedError` when none is
-    registered.
+    automatic planning subsequently checks the exact-device calibration and
+    falls back to ordinary MLA with a warning when none is registered.
+    Explicit balanced planning remains fail-closed.
     """
 
     if max_seq_len_q != 1:
