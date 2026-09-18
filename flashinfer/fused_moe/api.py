@@ -1192,13 +1192,14 @@ class CutlassNvfp4Config:
 class CutlassFp8PerTensorConfig:
     """CUTLASS per-tensor FP8 backend.
 
-    Activations are prequantized E4M3 with a scalar dequant scale on
-    ``MoEActivationPack.hidden_states_scale``. Weights stay unshuffled; this is
-    not the TRTLLM MajorK view. Packed precomputed routing with all flat
-    CUTLASS activation semantics and
-    ``do_finalize=True``. Not in the default backend search list: TRTLLM
-    per-tensor FP8 folds the activation scale into the weight view, so the two
-    contracts cannot share one pack without a conversion.
+    Activations follow the TRTLLM canonical per-tensor FP8 pack: E4M3
+    quantized with the static ``hidden_states_scale_global`` multiplier and
+    ``hidden_states_scale=None``. Both static multipliers are
+    ``prepare_weights`` inputs (as in ``TrtllmFp8PerTensorConfig``), so one
+    ``MoEActivationPack`` feeds both backends. Weights stay unshuffled; this
+    is not the TRTLLM MajorK view. Packed precomputed routing with all flat
+    CUTLASS activation semantics and ``do_finalize=True``. Not in the default
+    backend search list; opt in through ``BackendOptions``.
     """
 
     @classmethod
@@ -1210,18 +1211,28 @@ class CutlassFp8PerTensorConfig:
         w1_bf16,
         w2_bf16,
         *,
+        hidden_states_scale_global,
+        intermediate_scale_global,
         num_local_experts: int,
         hidden_size: int,
         intermediate_size: int,
         activation: Optional[ActivationConfig] = None,
         device=None,
     ):
-        """Quantize canonical BF16 weights into unshuffled per-tensor FP8."""
+        """Quantize canonical BF16 weights into unshuffled per-tensor FP8.
+
+        ``hidden_states_scale_global`` / ``intermediate_scale_global`` are the
+        same static calibration multipliers ``TrtllmFp8PerTensorConfig``
+        takes. The flat CUTLASS ``quant_scales`` are folded from them here;
+        re-calibrating means calling ``prepare_weights`` again.
+        """
         from .prepare import prepare_cutlass_fp8_per_tensor_weights
 
         return prepare_cutlass_fp8_per_tensor_weights(
             w1_bf16,
             w2_bf16,
+            hidden_states_scale_global=hidden_states_scale_global,
+            intermediate_scale_global=intermediate_scale_global,
             num_local_experts=num_local_experts,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
@@ -1229,12 +1240,8 @@ class CutlassFp8PerTensorConfig:
             device=device,
         )
 
-    @staticmethod
-    def prepare_activations(hidden_states_bf16):
-        """Quantize BF16 activations to E4M3 plus a scalar dequant scale."""
-        from .prepare import prepare_cutlass_fp8_per_tensor_activations
-
-        return prepare_cutlass_fp8_per_tensor_activations(hidden_states_bf16)
+    # Same canonical pack as TRT-LLM: ``(q, None)``, the scale lives in the view.
+    prepare_activations = staticmethod(TrtllmFp8PerTensorConfig.prepare_activations)
 
     def __repr__(self) -> str:
         return "CutlassFp8PerTensorConfig()"
@@ -1873,13 +1880,9 @@ class MoEActivationPack:
       ``float32 [H/128, M]`` block scales.
     * MXFP8: ``float8_e4m3fn [M, H]`` values with token-major
       ``uint8 [M, H/32]`` UE8M0 scales.
-    * FP8 per-tensor with ``TrtllmFp8PerTensorConfig``: ``float8_e4m3fn
-      [M, H]`` values with no activation scale; the calibrated scalar is
-      folded into the TRT-LLM weight view.
-    * FP8 per-tensor with ``CutlassFp8PerTensorConfig``: ``float8_e4m3fn
-      [M, H]`` values with a scalar ``float32`` dequantization scale. Obtain
-      both tensors from ``CutlassFp8PerTensorConfig.prepare_activations``.
-      This pack cannot be shared with the TRT-LLM per-tensor backend.
+    * FP8 per-tensor (``TrtllmFp8PerTensorConfig``, ``CutlassFp8PerTensorConfig``):
+      ``float8_e4m3fn [M, H]`` values with no activation scale; the static
+      calibration multipliers live in each backend's weight view.
 
     ``routing_input_mode`` selects how routing reaches the kernel (the runner reads it directly):
 
@@ -1908,7 +1911,7 @@ class MoEActivationPack:
 
     # Backend-native activation payload; layouts documented above.
     hidden_states_q: Tensor
-    # Pair-specific scales documented above; None for BF16 and TRT-LLM FP8.
+    # Pair-specific scales documented above; None for BF16 and per-tensor FP8.
     hidden_states_scale: Optional[Tensor]
     # Pre-routed top-k selection (Packed/Unpacked modes); None under FromLogits.
     topk_ids: Optional[Tensor] = None  # [M, top_k] int32 (expert indices)
@@ -2066,6 +2069,12 @@ class MoEWeightPack:
     Holding multiple materializations is intentional — that's the memory cost
     the user pays for cross-backend autotune.  Each view is the exact kwargs
     dict that runner's ``forward`` expects for weight-side arguments.
+
+    Every ``XxxConfig.prepare_weights`` takes the same canonical source
+    layout: ``w1`` is ``[E, 2I, H]`` for gated activations with rows in
+    ``[up, gate]`` order (``act(x @ w1[I:].T) * (x @ w1[:I].T)``), or
+    ``[E, I, H]`` for non-gated ones; ``w2`` is ``[E, H, I]``.  Backends that
+    want ``[gate, up]`` swap halves inside their prepare helper.
     """
 
     native_views: Dict[str, Dict[str, Tensor]] = field(default_factory=dict)

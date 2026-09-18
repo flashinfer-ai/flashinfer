@@ -2538,13 +2538,18 @@ def _make_bf16_packs_and_config(
     seed: int = 42,
     routing_input_mode: RoutingInputMode = RoutingInputMode.PackedPrecomputed,
     routing_weights_dtype: torch.dtype = torch.float32,
+    gate_up_scale: tuple[float, float] | None = None,
+    backend_configs: tuple = (TrtllmBf16Config(),),
 ):
     """Build (act_pack, weight_pack, config, tensors_dict) for the bf16 path.
 
     Mirrors ``_make_packs_and_config`` but with raw bf16 activations — no
     quantization and no scale tensors (the runner reads ``hidden_states_q``
     directly and ignores ``hidden_states_scale``).  ``tensors_dict`` holds the
-    UNSHUFFLED weights for ``_bf16_dense_reference``.
+    UNSHUFFLED weights for ``_bf16_dense_reference``.  ``gate_up_scale``
+    multiplies the canonical ``[up, gate]`` halves of ``w1`` so a swapped
+    reading is numerically distinguishable.  One native view is prepared per
+    entry of ``backend_configs``.
     """
     local_num_experts = local_num_experts or num_experts
     max_tokens = max_tokens or max(num_tokens, 8192)
@@ -2562,6 +2567,9 @@ def _make_bf16_packs_and_config(
         )
         / hidden_size**0.5
     )
+    if gate_up_scale is not None:
+        up, gate = w1.chunk(2, dim=1)
+        w1 = torch.cat((up * gate_up_scale[0], gate * gate_up_scale[1]), dim=1)
     w2 = (
         torch.randn(
             local_num_experts,
@@ -2596,17 +2604,18 @@ def _make_bf16_packs_and_config(
     )
 
     weight_pack = MoEWeightPack()
-    weight_pack.prepare_for(
-        "trtllm_bf16_routed",
-        TrtllmBf16Config.prepare_weights(
-            w1,
-            w2,
-            num_local_experts=local_num_experts,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            device=device,
-        ),
-    )
+    for backend_cfg in backend_configs:
+        weight_pack.prepare_for(
+            _BACKEND_RUNNERS[type(backend_cfg)].backend_key,
+            type(backend_cfg).prepare_weights(
+                w1,
+                w2,
+                num_local_experts=local_num_experts,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                device=device,
+            ),
+        )
 
     config = MoEConfig(
         routing=RoutingConfig(num_experts=num_experts, top_k=top_k),
@@ -2617,7 +2626,7 @@ def _make_bf16_packs_and_config(
             local_num_experts=local_num_experts,
         ),
         activation=SwiGLU(),
-        backend=BackendOptions(candidates=(TrtllmBf16Config(),)),
+        backend=BackendOptions(candidates=backend_configs),
         execution=ExecutionConfig(tune_max_num_tokens=max_tokens),
     )
     return act_pack, weight_pack, config, {"x": x, "w1": w1, "w2": w2}
@@ -2810,6 +2819,41 @@ def _bf16_ref(act_pack, tensors, expert_offset=0):
 
 def _bf16_check(out, ref, label):
     torch.testing.assert_close(out.float(), ref, rtol=BF16_RTOL, atol=BF16_ATOL)
+
+
+@sm100_required
+def test_bf16_gate_up_row_order_is_up_then_gate():
+    """TRT-LLM and CUTLASS BF16 read canonical gated ``w1`` rows as ``[up, gate]``.
+
+    Random weights let a backend and a reference that share the same swapped
+    reading agree; scaling the halves apart makes ``[gate, up]`` fail loudly.
+    """
+    arch = get_compute_capability(torch.device("cuda"))
+    arch = arch[0] * 10 + arch[1]
+    configs = tuple(
+        cfg for cfg in (TrtllmBf16Config(), CutlassBf16Config()) if cfg.supported(arch)
+    )
+    act, weights, config, tensors = _make_bf16_packs_and_config(
+        256,
+        max_tokens=256,
+        gate_up_scale=(0.25, 4.0),
+        backend_configs=configs,
+        **SMALL,
+    )
+    ref = _bf16_ref(act, tensors)
+    swapped_w1 = torch.cat(tensors["w1"].chunk(2, dim=1)[::-1], dim=1)
+    swapped_ref = _bf16_ref(act, {**tensors, "w1": swapped_w1})
+    assert not torch.allclose(ref, swapped_ref, rtol=BF16_RTOL, atol=BF16_ATOL), (
+        "fixture cannot distinguish [up, gate] from [gate, up]"
+    )
+
+    layer = MoELayer(config)
+    assert {r.backend_key for r in layer.runners} == {
+        _BACKEND_RUNNERS[type(cfg)].backend_key for cfg in configs
+    }
+    for runner in layer.runners:
+        out = runner.forward(runner.pack_inputs(act, weights), tactic=-1)
+        _bf16_check(out, ref, runner.backend_key)
 
 
 @sm100_required
