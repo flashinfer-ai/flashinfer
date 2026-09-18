@@ -80,6 +80,10 @@ from .backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl import (
     Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
     preprocess_mega_weights as preprocess_nvfp4_cutedsl_mega_weights,
 )
+from .backends.mega.kernel.sm120.mxfp4_mxfp8_bf16_cutedsl import (
+    Sm120_Mxfp4_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
+    preprocess_mega_weights as preprocess_sm120_mxfp4_mxfp8_cutedsl_mega_weights,
+)
 from .backends.mega.kernel.sm120.mxfp8_mxfp8_bf16_cutedsl import (
     Sm120_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
     preprocess_mega_weights as preprocess_sm120_mxfp8_cutedsl_mega_weights,
@@ -235,6 +239,7 @@ __all__ = [
     "NvepConfig",
     "QuantType",
     "Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig",
+    "Sm120_Mxfp4_Mxfp8_Bf16_Cutedsl_MegaMoeConfig",
     "Sm120_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig",
     "SplitConfig",
     "SplitKernelContext",
@@ -256,6 +261,7 @@ __all__ = [
     "preprocess_bf16_rank_major_cuda_mega_weights",
     "preprocess_mxfp8_cutedsl_mega_weights",
     "preprocess_nvfp4_cutedsl_mega_weights",
+    "preprocess_sm120_mxfp4_mxfp8_cutedsl_mega_weights",
     "preprocess_sm120_mxfp8_cutedsl_mega_weights",
     "preprocess_sm90_pull_fp8_mega_weights",
     "preprocess_sm90_push_fp8_mega_weights",
