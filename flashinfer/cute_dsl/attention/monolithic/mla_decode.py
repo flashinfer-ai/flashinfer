@@ -233,7 +233,7 @@ def _get_compiled_mla_kernel(
     Returns a callable that accepts (q_latent, q_rope, c_latent, c_rope,
     page_table, o, lse, workspace, split_kv_scalar, cache_seqs,
     cum_seq_lens_q, causal_seqlens_kv_global, cp_rank_scalar,
-    block_split_kvs, softmax_scale_scalar, output_scale_scalar).
+    block_split_kvs, softmax_scale_scalar, output_scale_scalar, lse_scale_scalar).
 
     All scalar arguments must be pre-wrapped as Int32/Float32.
     """

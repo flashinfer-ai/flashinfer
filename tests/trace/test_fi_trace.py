@@ -1304,6 +1304,50 @@ def test_trtllm_batch_decode_mla_fi_trace_dense_and_ragged():
     assert ragged["inputs"]["max_q_len"]["shape"] is None
 
 
+@pytest.mark.parametrize("layout", ["dense", "ragged", "sparse"])
+@pytest.mark.parametrize("return_lse_base_on_e", [True, False, None])
+def test_trtllm_mla_fi_trace_lse_base(layout, return_lse_base_on_e, tmp_path):
+    import flashinfer.mla
+    from flashinfer.trace.templates import attention
+
+    # Small CPU tensors exercise schema dispatch and the reference without a kernel.
+    kwargs = {
+        "query": torch.ones(1, 1, 2, 6),
+        "kv_cache": torch.ones(1, 1, 2, 6),
+        "workspace_buffer": torch.empty(1, dtype=torch.uint8),
+        "qk_nope_head_dim": 4,
+        "kv_lora_rank": 4,
+        "qk_rope_head_dim": 2,
+        "block_tables": torch.zeros(1, 1, dtype=torch.int32),
+        "seq_lens": torch.tensor([2], dtype=torch.int32),
+        "max_seq_len": 2,
+        "return_lse_base_on_e": return_lse_base_on_e,
+    }
+    if layout == "ragged":
+        kwargs["query"] = kwargs["query"].reshape(1, 2, 6)
+        kwargs["cum_seq_lens_q"] = torch.tensor([0, 1], dtype=torch.int32)
+        kwargs["max_q_len"] = 1
+    elif layout == "sparse":
+        kwargs["block_tables"] = kwargs["block_tables"].reshape(1, 1, 1)
+        kwargs["sparse_mla_top_k"] = 1
+
+    definition = flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla.fi_trace(
+        save_dir=tmp_path, **kwargs
+    )
+    assert definition["name"].startswith(f"trtllm_batch_decode_mla_{layout}")
+    serialized = json.loads((tmp_path / f"{definition['name']}.json").read_text())
+    option = serialized["inputs"]["return_lse_base_on_e"]
+    assert option["shape"] is None
+    assert option["dtype"] == "bool"
+    assert option["optional"] is True
+
+    # These templates currently model only the attention output, which must
+    # remain unchanged when the requested LSE base changes.
+    template = getattr(attention, f"trtllm_batch_decode_mla_{layout}_trace")
+    output = template.reference(**kwargs)
+    torch.testing.assert_close(output, torch.ones(*kwargs["query"].shape[:-1], 4))
+
+
 def test_trtllm_mla_prefill_fi_trace_only_changes_public_api_tag():
     import flashinfer.mla
     import flashinfer.prefill

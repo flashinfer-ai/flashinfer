@@ -18,6 +18,7 @@ silently emits an all-zero LSE.
 """
 
 import math
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -223,6 +224,155 @@ def _run_cute_dsl_decode(
         cute_dsl_impl="monolithic",
         provide_lse=False,
     )
+
+
+@pytest.mark.parametrize("with_lse", [False, True])
+def test_planned_trtllm_launch_lse_scale(with_lse):
+    from flashinfer.mla._batch_mla._backends.trtllm_gen_backend import (
+        _BatchMLAPagedAttentionTrtllmGenBackend,
+    )
+
+    calls = []
+    backend = _BatchMLAPagedAttentionTrtllmGenBackend.__new__(
+        _BatchMLAPagedAttentionTrtllmGenBackend
+    )
+    backend._module = SimpleNamespace(
+        trtllm_paged_attention_decode=lambda *args: calls.append(args)
+    )
+    backend._float_workspace_buffer = torch.empty(16, dtype=torch.uint8)
+    backend._multi_ctas_kv_counter_buffer = object()
+    backend._block_tables = object()
+    backend._seq_lens = object()
+    backend._max_q_len = 1
+    backend._max_seq_len = SEQ_LEN
+    backend._batch_size = BATCH_SIZE
+    backend._sm_count = 148
+    backend._enable_pdl = False
+    lse = object() if with_lse else None
+    token_stride, head_stride = (NUM_HEADS, 1) if with_lse else (0, 0)
+    backend._launch_native(
+        out=object(),
+        query=object(),
+        kv_cache=object(),
+        bmm1_scale=BMM1_SCALE,
+        bmm2_scale=1.0,
+        sinks=None,
+        cum_seq_lens_q=None,
+        skip_softmax_threshold_scale_factor=None,
+        lse=lse,
+        lse_stride_tokens=token_stride,
+        lse_stride_heads=head_stride,
+    )
+    (args,) = calls
+    assert len(args) == 36
+    assert args[28] is lse
+    assert args[29:] == (1.0, token_stride, head_stride, False, None, 0, None)
+
+
+def test_planned_monolithic_launch_lse_scale():
+    from flashinfer.mla._batch_mla._backends.cute_dsl_monolithic_backend import (
+        _BatchMLAPagedAttentionCuteDslMonolithicBackend,
+    )
+
+    calls = []
+    backend = _BatchMLAPagedAttentionCuteDslMonolithicBackend.__new__(
+        _BatchMLAPagedAttentionCuteDslMonolithicBackend
+    )
+    backend._execution_state = SimpleNamespace(
+        Int32=int, Float32=float, compiled_kernel=lambda *args: calls.append(args)
+    )
+    launch_args = tuple(object() for _ in range(13))
+    backend._launch_compiled_kernel(launch_args, sinks=None)
+    (args,) = calls
+    assert len(args) == 17
+    assert args[:10] == launch_args[:10]
+    assert args[10:13] == (None, None, 0)
+    assert args[13:16] == launch_args[10:]
+    assert args[16] == math.log(2.0)
+
+
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize("backend", ["trtllm-gen", "cute-dsl-monolithic"])
+@pytest.mark.parametrize("dtype", _MLA_DTYPES)
+@pytest.mark.parametrize("return_lse", [False, True])
+@pytest.mark.parametrize("seq_len", [SEQ_LEN_SINGLE_TILE, SEQ_LEN])
+def test_planned_mla_preserves_lse_base(backend, dtype, return_lse, seq_len):
+    """Planned adapters retain their native LSE units after the ABI expansion."""
+    device = torch.device("cuda")
+    _require_trtllm_gen(device)
+    query, kv_cache, block_tables, seq_lens = _mla_decode_inputs(
+        device, dtype, seq_len=seq_len
+    )
+    wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
+        _workspace(device), backend=backend
+    )
+    natural = backend == "cute-dsl-monolithic"
+    wrapper.plan(
+        metadata=flashinfer.mla.MLAPlanMetadata.dense(
+            cum_seq_lens_q=torch.arange(
+                BATCH_SIZE + 1, dtype=torch.int32, device=device
+            ),
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            max_q_len=1,
+        ),
+        num_heads=NUM_HEADS,
+        head_dim_ckv=KV_LORA_RANK,
+        head_dim_kpe=QK_ROPE_HEAD_DIM,
+        page_size=PAGE_SIZE,
+        causal=False,
+        sm_scale=BMM1_SCALE,
+        q_data_type=dtype,
+        kv_data_type=dtype,
+        output_dtype=torch.bfloat16,
+        lse_mode=("basee" if natural else "base2") if return_lse else "none",
+        scale_mode="bmm-scalar",
+        enable_pdl=False,
+    )
+    out = torch.empty(
+        (BATCH_SIZE, NUM_HEADS, KV_LORA_RANK), dtype=torch.bfloat16, device=device
+    )
+    lse = (
+        torch.full(
+            (BATCH_SIZE, NUM_HEADS), float("nan"), dtype=torch.float32, device=device
+        )
+        if return_lse
+        else None
+    )
+    result = wrapper.run(
+        query=query.reshape(BATCH_SIZE, NUM_HEADS, QK_HEAD_DIM),
+        kv_cache=kv_cache,
+        out=out,
+        lse=lse,
+        return_lse=return_lse,
+        return_lse_base_on_e=natural and return_lse,
+        bmm1_scale=BMM1_SCALE,
+        bmm2_scale=1.0,
+    )
+    assert (result[0] if return_lse else result) is out
+    expected_out = []
+    for batch_idx in range(BATCH_SIZE):
+        kv = kv_cache.float()[block_tables[batch_idx].long()].reshape(-1, QK_HEAD_DIM)
+        scores = query[batch_idx, 0].float() @ kv.T * BMM1_SCALE
+        expected_out.append(scores.softmax(dim=-1) @ kv[:, :KV_LORA_RANK])
+    expected_out = torch.stack(expected_out)
+    # FP8 values are damped by 0.1, giving outputs of order 0.1/sqrt(seq_len).
+    # The LSE atol=0.2 would accept an all-zero attention output at these scales.
+    output_tolerance = (
+        {"rtol": 0.1, "atol": 1e-3} if dtype == _FP8 else _lse_tolerance(dtype)
+    )
+    assert not torch.allclose(
+        torch.zeros_like(expected_out), expected_out, **output_tolerance
+    )
+    torch.testing.assert_close(out.float(), expected_out, **output_tolerance)
+    if return_lse:
+        assert result[1] is lse
+        expected_lse = _mla_reference_lse_natural(
+            query, kv_cache, block_tables, seq_lens
+        )
+        if not natural:
+            expected_lse *= LOG2E
+        torch.testing.assert_close(lse, expected_lse, **_lse_tolerance(dtype))
 
 
 @pytest.mark.arch_blackwell
