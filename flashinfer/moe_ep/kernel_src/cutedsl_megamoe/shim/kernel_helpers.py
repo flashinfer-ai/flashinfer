@@ -74,10 +74,6 @@ _LAZY = {
         "moe_nvfp4_swapab.moe_utils",
         "compute_expert_token_count_from_sizes",
     ),
-    "compute_expert_token_range": (
-        "moe_nvfp4_swapab.moe_utils",
-        "compute_expert_token_range",
-    ),
     "eval_function_mapping": ("moe_nvfp4_swapab.contract", "eval_function_mapping"),
     "fmax": ("common.moe_utils", "fmax"),
     "fmin": ("common.moe_utils", "fmin"),
@@ -124,34 +120,6 @@ def __getattr__(name):  # PEP 562: keep cutlass out of the import-time path
 
 
 __all__ = [
-    "Contract",  # noqa: F822
-    "FunctionMapping",  # noqa: F822
-    "GpuReleaseFlagBatchTracker",  # noqa: F822
-    "MoESchedConsumer",  # noqa: F822
-    "MoESchedExtension",  # noqa: F822
-    "MoESchedulerBase",  # noqa: F822
-    "MoESchedulerParamsBase",  # noqa: F822
-    "MoEWorkTileInfo",  # noqa: F822
-    "Space",  # noqa: F822
-    "SymBufferDeviceBase",  # noqa: F822
-    "SymBufferHost",  # noqa: F822
-    "TokenCommArgs",  # noqa: F822
-    "TokenInPullTokenBackPush",  # noqa: F822
-    "TokenSrcMetadata",  # noqa: F822
-    "TopkReduce",  # noqa: F822
-    "WorkTileState",  # noqa: F822
-    "_DEFAULT_SCHED_EXT",  # noqa: F822
-    "compute_expert_token_count_from_sizes",  # noqa: F822
-    "compute_expert_token_range",  # noqa: F822
-    "eval_function_mapping",  # noqa: F822
-    "fmax",  # noqa: F822
-    "fmin",  # noqa: F822
-    "get_cutedsl_target_arch",  # noqa: F822
-    "iket",  # noqa: F822
-    "mbarrier_arrive_expect_tx_on_peer",  # noqa: F822
-    "rewrite_tensor_shape",  # noqa: F822
-    "spin_wait",  # noqa: F822
-    "store_i32_to_peer_cluster_smem_async",  # noqa: F822
     # eager
     "Mxfp8BlockSize",
     "Mxfp8ScaleDtype",
@@ -172,3 +140,4 @@ __all__ = [
     "compute_megamoe_reference_bf16",  # noqa: F822
     "compute_megamoe_reference_bf16_mxfp8",  # noqa: F822
 ]
+__all__ += [name for name in _LAZY if name not in __all__]

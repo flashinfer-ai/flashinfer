@@ -29,7 +29,6 @@ from __future__ import annotations
 # packages (moe_nvfp4_swapab, common, ...).  ``bootstrap_paths`` is re-exported
 # here so callers (e.g. core runtime) reach it through this public boundary.
 from .shim import (
-    bootstrap_dist,
     free_sym_tensor,
     resolve_gate_up_clamp,
     sym_zeros,
@@ -97,48 +96,19 @@ from .shim import (
     tuner,
     with_knobs,
 )
+
+from .shim import kernel_helpers as _kernel_helpers
 from .shim.autotune import _session_candidates
 from .shim.comm import _CompiledMega, _compute_peer_offsets
-from .shim.tuner import is_valid
+from .shim.nvfp4 import _resolve_per_expert_epilogue
 
 # Heavy kernel helpers (``mega_runner`` byte-stacking, ``mega_runner`` fp8/E8M0
 # tensor makers, and the MXFP8 torch reference) pull ``cutlass`` transitively.
 # Expose them lazily so ``import ...cutedsl_megamoe`` stays CPU-safe; the FI
 # backend + verification tests still reach them only through this boundary (the
 # access happens inside their functions).  See ``shim/kernel_helpers.py``.
-_KERNEL_PRIMITIVES = (
-    "Contract",
-    "FunctionMapping",
-    "GpuReleaseFlagBatchTracker",
-    "MoESchedConsumer",
-    "MoESchedExtension",
-    "MoESchedulerBase",
-    "MoESchedulerParamsBase",
-    "MoEWorkTileInfo",
-    "Space",
-    "SymBufferDeviceBase",
-    "SymBufferHost",
-    "TokenCommArgs",
-    "TokenInPullTokenBackPush",
-    "TokenSrcMetadata",
-    "TopkReduce",
-    "WorkTileState",
-    "_DEFAULT_SCHED_EXT",
-    "compute_expert_token_count_from_sizes",
-    "compute_expert_token_range",
-    "eval_function_mapping",
-    "fmax",
-    "fmin",
-    "get_cutedsl_target_arch",
-    "iket",
-    "mbarrier_arrive_expect_tx_on_peer",
-    "rewrite_tensor_shape",
-    "spin_wait",
-    "store_i32_to_peer_cluster_smem_async",
-)
-
 _LAZY_HELPERS = (
-    *_KERNEL_PRIMITIVES,
+    *_kernel_helpers.__all__,
     "CombineFormat",
     "_make_e8m0_scale_tensor",
     "_make_fp8_tensor",
@@ -150,10 +120,6 @@ _LAZY_HELPERS = (
 
 
 def __getattr__(name):  # PEP 562
-    if name == "_resolve_per_expert_epilogue":
-        from .shim.nvfp4 import _resolve_per_expert_epilogue
-
-        return _resolve_per_expert_epilogue
     if name in _LAZY_HELPERS:
         from .shim import kernel_helpers
 
@@ -165,16 +131,13 @@ def __getattr__(name):  # PEP 562
 create_dummy_inputs = create_dummy_nvfp4_inputs
 
 __all__ = [
-    *_KERNEL_PRIMITIVES,
     "_CompiledMega",
     "_compute_peer_offsets",
     "_resolve_per_expert_epilogue",
     "_session_candidates",
-    "bootstrap_dist",
     "free_sym_tensor",
     "resolve_gate_up_clamp",
     "sym_zeros",
-    "is_valid",
     "COMBINE_FORMAT_NAMES",
     "CombineFormat",
     "MegaMoEBf16SymmBuffer",
@@ -247,3 +210,4 @@ __all__ = [
     "_make_fp8_tensor",
     "_stack_byte_reinterpretable_tensors",
 ]
+__all__ += [name for name in _kernel_helpers.__all__ if name not in __all__]

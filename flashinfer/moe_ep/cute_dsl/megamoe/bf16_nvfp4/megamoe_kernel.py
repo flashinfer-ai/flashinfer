@@ -113,7 +113,6 @@ class Sm100W4A16MegaMoEKernel:
     def __init__(
         self,
         *,
-        local_rank,
         mma_tiler_mnk,
         cluster_shape_mnk,
         use_2cta_instrs,
@@ -129,9 +128,7 @@ class Sm100W4A16MegaMoEKernel:
         num_sched_stages=None,
         ab_dtype=cutlass.BFloat16,
         acc_dtype=cutlass.Float32,
-        fc2_in_kernel_topk_reduce=False,
         in_kernel_fc2_reduce=False,
-        token_back_by_dispatch=None,
         token_back_mode="epi_warps",
         apply_topk_in_fc1=False,
         gate_up_clamp=None,
@@ -152,11 +149,9 @@ class Sm100W4A16MegaMoEKernel:
                 "W4A16 supports epi_warps or reuse_dispatch_warps token return."
             )
         by_dispatch = token_back_mode == "reuse_dispatch_warps"
-        self.in_kernel_fc2_reduce = fc2_in_kernel_topk_reduce or in_kernel_fc2_reduce
+        self.in_kernel_fc2_reduce = in_kernel_fc2_reduce
         if self.in_kernel_fc2_reduce and not by_dispatch:
             raise ValueError("W4A16 in-kernel FC2 reduction requires dispatch return.")
-        if token_back_by_dispatch is not None and token_back_by_dispatch != by_dispatch:
-            raise ValueError("token_back_by_dispatch must match token_back_mode.")
         if mma_tiler_mnk not in (
             (128, 64, 256),
             (128, 128, 256),
@@ -421,7 +416,6 @@ class Sm100W4A16MegaMoEKernel:
         fc2_weight: cute.Tensor,
         fc2_weight_sf: cute.Tensor,
         fc2_alpha: cute.Tensor,
-        fc1_c: Optional[cute.Tensor],  # fc1 c output
         # Combine destination (peer write target via the epilogue Fc2OutputDest).
         combine_output: cute.Tensor,  # (T, 1 if in-kernel reduce else num_topk, H) BF16
         # Opaque workspaces.

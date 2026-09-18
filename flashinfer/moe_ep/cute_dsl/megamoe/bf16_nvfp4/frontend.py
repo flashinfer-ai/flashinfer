@@ -13,9 +13,9 @@ import torch
 from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
     _CompiledMega,
     _compute_peer_offsets,
-    bootstrap_dist,
     ensure_not_capturing,
     free_sym_tensor,
+    init_dist,
     resolve_gate_up_clamp,
     sym_zeros,
 )
@@ -218,12 +218,10 @@ class MegaMoEBf16Nvfp4Frontend:
             num_sched_stages=c.num_sched_stages,
             ab_dtype=cutlass.BFloat16,
             world_size=c.world_size,
-            local_rank=c.rank,
             num_topk=c.num_topk,
             max_tokens_per_rank=c.num_tokens_per_rank,
             hidden=c.hidden,
-            fc2_in_kernel_topk_reduce=c.in_kernel_fc2_reduce,
-            token_back_by_dispatch=c.token_back_mode != "epi_warps",
+            in_kernel_fc2_reduce=c.in_kernel_fc2_reduce,
             token_back_mode=c.token_back_mode,
             epi_flag_batch=c.epi_flag_batch,
             flag_batch=c.flag_batch,
@@ -278,7 +276,6 @@ class MegaMoEBf16Nvfp4Frontend:
             "fc2_weight": self._to_cute(inputs.fc2_weight),
             "fc2_weight_sf": self._to_cute(inputs.fc2_weight_sf),
             "fc2_alpha": self._to_cute(inputs.fc2_alpha, assumed_align=4),
-            "fc1_c": None,
             "combine_output": self._to_cute(inputs.combine_output),
             "local_workspace": self._to_cute(mega.local_workspace, static_layout=True),
             "shared_workspace": self._to_cute(mega.shared_workspace),
@@ -485,11 +482,6 @@ class MegaMoEBf16Nvfp4SymmBuffer:
 
 
 TransformedWeights = Tuple[torch.Tensor, torch.Tensor]
-
-
-def init_dist() -> Tuple[int, int]:
-    _, rank, world_size, _ = bootstrap_dist()
-    return rank, world_size
 
 
 def get_symm_buffer_for_bf16_nvfp4_mega_moe(

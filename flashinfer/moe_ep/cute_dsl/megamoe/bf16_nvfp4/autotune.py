@@ -139,7 +139,7 @@ def autotune_bf16_nvfp4_mega_moe(
     """
     from .frontend import bf16_nvfp4_mega_moe
 
-    def launch(*, sync: bool) -> None:
+    def launch(*, sync: bool = False) -> None:
         bf16_nvfp4_mega_moe(
             y,
             transformed_l1,
@@ -150,9 +150,6 @@ def autotune_bf16_nvfp4_mega_moe(
             activation_clamp=activation_clamp,
             sync=sync,
         )
-
-    def launch_async() -> None:
-        launch(sync=False)
 
     cfg = symm_buffer._frontend.config
     frontend = symm_buffer._frontend
@@ -196,9 +193,7 @@ def autotune_bf16_nvfp4_mega_moe(
             launch(sync=True)
         _barrier()
         scores.append(
-            statistics.median(
-                _sample_graph_seconds(launch_async, timed_iters, process_group)
-            )
+            statistics.median(_sample_graph_seconds(launch, timed_iters, process_group))
         )
         _barrier()
 
