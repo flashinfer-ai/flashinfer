@@ -1219,6 +1219,253 @@ def test_moe_ep_nvfp4_cutedsl_mega_multirank_torch_oracle(
     )
 
 
+def _run_nvfp4_routing_rounds(
+    rank,
+    world_size,
+    *,
+    mode,
+    hidden,
+    intermediate,
+    knobs,
+    changing_batches,
+    num_tokens=257,
+    in_kernel_fc2_reduce=False,
+    alpha_source="config",
+):
+    """One public layer reuses its workspace across skew, empty sources and refill."""
+    import dataclasses
+    import torch
+    import torch.distributed as dist
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        FleetParams,
+        MegaConfig,
+        MoEEpMegaLayer,
+        MoEEpTensors,
+        PrequantizedMoEWeights,
+        Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+        Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+        ensure_moe_ep_cuda_device,
+    )
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import nvfp4_quantize_per_block_16
+    from .test_nvfp4_cutedsl_kernel_vs_reference import (
+        NVFP4_MODES,
+        _nvfp4_reference_from_weights,
+        _assert_nvfp4_reference,
+    )
+
+    assert mode in NVFP4_MODES, mode
+    assert alpha_source in ("config", "runtime"), alpha_source
+    bootstrap = BootstrapConfig(world_size=world_size, rank=rank)
+    ensure_moe_ep_cuda_device(bootstrap)
+    num_experts, topk, capacity = 4, 2, num_tokens
+    assert num_experts % world_size == 0
+    local_experts = num_experts // world_size
+    w13, w2 = _make_bf16_weights(
+        rank, num_local_experts=local_experts, hidden=hidden, intermediate=intermediate
+    )
+    # Both precision modes share the canonical packed weight/SF input.
+    q13, s13 = nvfp4_quantize_per_block_16(w13.float().reshape(-1, hidden), 1.0)
+    q2, s2 = nvfp4_quantize_per_block_16(w2.float().reshape(-1, intermediate), 1.0)
+    alpha1, alpha2 = None, None
+    if mode == "w4a16":
+        # Preserve expert-shard views, including their scalar-only alignment.
+        alpha1 = (
+            torch.linspace(0.71013, 1.23017, num_experts, device="cuda") / hidden**0.5
+        )[rank * local_experts : (rank + 1) * local_experts]
+        alpha2 = torch.linspace(1.17019, 0.83023, num_experts, device="cuda")[
+            rank * local_experts : (rank + 1) * local_experts
+        ]
+    weights = PrequantizedMoEWeights(
+        w13=q13.view(torch.uint8).reshape(local_experts, 2 * intermediate, hidden // 2),
+        w2=q2.view(torch.uint8).reshape(local_experts, hidden, intermediate // 2),
+        w13_scale=s13.reshape(local_experts, 2 * intermediate, hidden // 16),
+        w2_scale=s2.reshape(local_experts, hidden, intermediate // 16),
+    )
+    alphas = dict(fc1_alpha=alpha1, fc2_alpha=alpha2)
+    configs = {
+        "w4a4": Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+        "w4a16": Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+    }
+    layer = MoEEpMegaLayer(
+        bootstrap=bootstrap,
+        fleet_params=FleetParams(
+            num_experts=num_experts,
+            max_tokens_per_rank=capacity,
+            token_hidden_size=hidden,
+        ),
+        weights=weights,
+        backend=MegaConfig(
+            megakernel=configs[mode](
+                intermediate_size=intermediate,
+                top_k=topk,
+                gate_up_clamp=1.5,
+                enable_in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+                knobs={**knobs, "in_kernel_fc2_reduce": in_kernel_fc2_reduce},
+                **(alphas if alpha_source == "config" else {}),
+            )
+        ),
+    )
+    try:
+        # Gather the actual local expert weights rather than rely on equal RNG
+        # states; an empty input rank still owns experts needed by its peers.
+        global_weights = dataclasses.replace(
+            weights,
+            **{
+                field.name: _all_gather_stack(value).flatten(0, 1)
+                for field in dataclasses.fields(weights)
+                if (value := getattr(weights, field.name)) is not None
+            },
+        )
+        global_alphas = {
+            name: _all_gather_stack(value).flatten() if value is not None else None
+            for name, value in alphas.items()
+        }
+        rounds = (("skewed_tiles", num_tokens, True),)
+        if changing_batches:
+            rounds = (
+                ("balanced", 17, False),
+                ("uneven_sources", 5 if rank == 0 else 17, False),
+                ("skewed", 17, True),
+                ("single_token", 1 if rank == 0 else 0, False),
+                ("empty_source", 0 if rank == 0 else 11, False),
+                ("all_empty", 0, False),
+                ("refill", 9, False),
+            )
+        for name, n, skewed in rounds:
+            # _make_inputs seeds with 7 + rank; retain the original 73 + rank
+            # inputs without allocating the unused single-rank expert weights.
+            hidden_states, topk_weights, topk_ids = _make_inputs(
+                rank + 66,
+                num_tokens=n,
+                hidden=hidden,
+                num_experts=num_experts,
+                topk=topk,
+            )
+            problem = dict(
+                hidden=hidden,
+                intermediate=intermediate,
+                gate_up_clamp=1.5,
+                hidden_states=hidden_states,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+            )
+            if skewed:
+                problem["topk_ids"][:] = torch.tensor([0, 1], device="cuda")
+            reference = (
+                _nvfp4_reference_from_weights(
+                    problem, global_weights, mode=mode, **global_alphas
+                )
+                if n
+                else None
+            )
+            tensors = MoEEpTensors(
+                **{
+                    key: problem[key]
+                    for key in ("hidden_states", "topk_ids", "topk_weights")
+                },
+                **(alphas if alpha_source == "runtime" else {}),
+            )
+            dist.barrier()
+            y = layer.forward(tensors)
+            torch.cuda.synchronize()
+            dist.barrier()
+            assert y.dtype == torch.bfloat16 and y.shape == (n, hidden)
+            assert torch.isfinite(y).all(), (mode, name, rank)
+            if n:
+                _assert_nvfp4_reference(
+                    y,
+                    reference,
+                    mode=mode,
+                    in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+                )
+    finally:
+        layer.destroy()
+        torch.cuda.synchronize()
+        dist.barrier()
+
+
+@pytest.mark.gpu_2
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize(
+    "mode,token_back_mode,in_kernel_fc2_reduce,alpha_source",
+    [
+        ("w4a4", "epi_warps", False, "config"),
+        ("w4a4", "reuse_dispatch_warps", False, "config"),
+        ("w4a16", "epi_warps", False, "config"),
+        ("w4a16", "reuse_dispatch_warps", False, "config"),
+        ("w4a16", "reuse_dispatch_warps", True, "config"),
+        ("w4a16", "reuse_dispatch_warps", False, "runtime"),
+        ("w4a16", "reuse_dispatch_warps", True, "runtime"),
+    ],
+)
+@pytest.mark.parametrize("load_balance_mode", ["static", "atomic_counter"])
+def test_nvfp4_mega_uneven_sources_and_empty_refill(
+    mode, token_back_mode, in_kernel_fc2_reduce, alpha_source, load_balance_mode
+):
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size != 2:
+        pytest.skip("requires two ranks")
+    _run_nvfp4_routing_rounds(
+        rank,
+        world_size,
+        mode=mode,
+        hidden=256,
+        intermediate=256,
+        knobs={
+            "token_back_mode": token_back_mode,
+            "load_balance_mode": load_balance_mode,
+        },
+        changing_batches=True,
+        in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+        alpha_source=alpha_source,
+    )
+
+
+@pytest.mark.gpu_2
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize("token_back_mode", ["epi_warps", "reuse_dispatch_warps"])
+@pytest.mark.parametrize(
+    "mode,hidden,intermediate,tile_n",
+    [
+        pytest.param("w4a4", 1600, 832, 128, id="w4a4-tail"),
+        pytest.param("w4a16", 64, 64, 128, id="w4a16-small"),
+        pytest.param("w4a16", 288, 448, 64, id="w4a16-tail"),
+        pytest.param("w4a16", 7200, 2112, 64, id="w4a16-n64-wrap"),
+        pytest.param("w4a16", 7200, 2112, 128, id="w4a16-n128-wrap"),
+        pytest.param("w4a16", 18272, 64, 64, id="w4a16-activation-tail"),
+    ],
+)
+def test_nvfp4_mega_geometry_and_pipeline_tails(
+    mode, hidden, intermediate, tile_n, token_back_mode
+):
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size != 2:
+        pytest.skip("requires two ranks")
+    # 257 routed rows cross a work-tile boundary. Large K wraps both operand
+    # rings; the skinny shape exercises the activation-stage fit and K tail.
+    _run_nvfp4_routing_rounds(
+        rank,
+        world_size,
+        mode=mode,
+        hidden=hidden,
+        intermediate=intermediate,
+        knobs={
+            "mma_tiler_mnk": (256, tile_n, 256),
+            "cluster_shape_mnk": (2, 1, 1),
+            "use_2cta_instrs": True,
+            "group_hint": 512,
+            "flag_batch": 4,
+            "epi_flag_batch": (2, 4),
+            "token_back_mode": token_back_mode,
+            "load_balance_mode": "atomic_counter",
+        },
+        changing_batches=False,
+    )
+
+
 @pytest.mark.arch_blackwell
 def test_nvfp4_cutedsl_preprocess_accepts_sglang_packed_weights():
     _require_cuda()
@@ -1434,3 +1681,42 @@ def test_autotune_nvfp4_candidates_cover_ikr():
     pinned = nvfp4_candidates()
     assert pinned and all(not k["in_kernel_fc2_reduce"] for k in pinned)
     assert len(pinned) * 2 == len(cands)
+
+
+def test_bf16_nvfp4_ikr_permission_and_candidates():
+    from flashinfer.moe_ep import Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
+    from flashinfer.moe_ep.cute_dsl.megamoe.bf16_nvfp4 import (
+        MegaMoEBf16Nvfp4Config,
+        bf16_nvfp4_candidates,
+    )
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import tuner
+
+    assert not Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+        intermediate_size=256, top_k=2
+    ).enable_in_kernel_fc2_reduce
+    base = dict(
+        rank=0,
+        world_size=1,
+        num_tokens_per_rank=64,
+        num_topk=2,
+        num_total_experts=4,
+        hidden=256,
+        intermediate=256,
+    )
+    deterministic = bf16_nvfp4_candidates()
+    permitted = bf16_nvfp4_candidates(enable_in_kernel_fc2_reduce=True)
+    assert len(deterministic) == 4 and len(permitted) == 6
+    assert permitted[:4] == deterministic
+    for knobs in permitted:
+        assert tuner.is_valid_bf16_nvfp4(knobs)
+        config = MegaMoEBf16Nvfp4Config(
+            **base, enable_in_kernel_fc2_reduce=True, **knobs
+        )
+        assert config.in_kernel_fc2_reduce == knobs["in_kernel_fc2_reduce"]
+        if knobs["in_kernel_fc2_reduce"]:
+            assert knobs["token_back_mode"] == "reuse_dispatch_warps"
+            with pytest.raises(ValueError, match="enable_in_kernel_fc2_reduce"):
+                MegaMoEBf16Nvfp4Config(**base, **knobs)
+            assert not tuner.is_valid_bf16_nvfp4(
+                {**knobs, "token_back_mode": "epi_warps"}
+            )

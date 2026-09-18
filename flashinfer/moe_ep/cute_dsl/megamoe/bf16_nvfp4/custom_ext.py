@@ -1,0 +1,345 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: BSD-3-Clause
+"""W4A16-owned FC1/FC2 work records, readiness, and GMEM slicing."""
+
+from typing import List, Optional, Tuple, Union
+
+import cutlass
+import cutlass.cute as cute
+from cutlass.cute.typing import Pointer
+from cutlass.cutlass_dsl import (
+    Int32,
+    dsl_user_op,
+    extract_mlir_values,
+    new_from_mlir_values,
+)
+from cutlass._mlir import ir
+
+from cutlass.utils.blockscaled_layout import tile_atom_to_shape_SF
+from .fc1_fc2_fuse_sched import BlockPhase
+from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import rewrite_tensor_shape, spin_wait
+from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+    MoESchedExtension,
+    MoEWorkTileInfo,
+)
+
+PhaseBits = 16
+PhaseMask = (1 << PhaseBits) - 1
+PeekReadyBit = 1 << PhaseBits
+
+
+# =============================================================================
+
+
+class W4A16Fc12WorkTileInfo(MoEWorkTileInfo):
+    """Seven work fields in an eight-word ring record; slot 4 is reserved."""
+
+    TotalFields = 8
+
+    def __init__(
+        self,
+        expert_idx: Int32,
+        tile_m_idx: Int32,
+        tile_n_idx: Int32,
+        cumulative_data_physical_row: Int32,
+        cumulative_token_block_count: Int32,
+        valid_tokens_in_cta_tile: Int32,
+        phase_and_peek: Int32,
+    ):
+        super().__init__(
+            expert_idx,
+            tile_m_idx,
+            tile_n_idx,
+            cumulative_data_physical_row,
+        )
+        self.cumulative_data_physical_row = self.k_tile_cnt
+        self.cumulative_token_block_count = cumulative_token_block_count
+        self.valid_tokens_in_cta_tile = valid_tokens_in_cta_tile
+        # Slot 7 is the packed (BlockPhase | (peek_ready << 16)) field.
+        # The ``.phase`` and ``.peek_ready`` properties below unpack it;
+        # consumers call them directly so the codebase reads as if the
+        # two pieces were separate fields.
+        self.phase_and_peek = phase_and_peek
+
+    @property
+    def phase(self) -> Int32:
+        """Decode the BlockPhase from slot 7's low 16 bits."""
+        return self.phase_and_peek & Int32(PhaseMask)
+
+    @property
+    def peek_ready(self):
+        """Decode the sched-warp counter peek result from slot 7's bit 16.
+
+        True when the phase-specific counter was ready during enrichment,
+        allowing the activation loader to skip its later blocking wait.
+        """
+        return ((self.phase_and_peek >> Int32(PhaseBits)) & Int32(1)) != Int32(0)
+
+    def __extract_mlir_values__(self) -> List[ir.Value]:
+        # Base's __extract_mlir_values__ already emits the first 4 slots
+        # (slot 3 = self.k_tile_cnt = cumulative_data_physical_row).
+        values = super().__extract_mlir_values__()
+        values.extend(extract_mlir_values(self.cumulative_token_block_count))
+        values.extend(extract_mlir_values(self.valid_tokens_in_cta_tile))
+        values.extend(extract_mlir_values(self.phase_and_peek))
+        return values
+
+    def __new_from_mlir_values__(
+        self, values: List[ir.Value]
+    ) -> "W4A16Fc12WorkTileInfo":
+        assert len(values) == 7
+        return type(self)(
+            expert_idx=new_from_mlir_values(self.expert_idx, [values[0]]),
+            tile_m_idx=new_from_mlir_values(self.tile_m_idx, [values[1]]),
+            tile_n_idx=new_from_mlir_values(self.tile_n_idx, [values[2]]),
+            cumulative_data_physical_row=new_from_mlir_values(
+                self.cumulative_data_physical_row, [values[3]]
+            ),
+            cumulative_token_block_count=new_from_mlir_values(
+                self.cumulative_token_block_count, [values[4]]
+            ),
+            valid_tokens_in_cta_tile=new_from_mlir_values(
+                self.valid_tokens_in_cta_tile, [values[5]]
+            ),
+            phase_and_peek=new_from_mlir_values(self.phase_and_peek, [values[6]]),
+        )
+
+    @dsl_user_op
+    @cute.jit
+    def write_to_smem(
+        self,
+        smem_buf_tensor: cute.Tensor,
+        dependency,
+        *,
+        loc: Optional[ir.Location] = None,
+        ip: Optional[ir.InsertionPoint] = None,
+    ) -> None:
+        """Publish one coherent record while all scheduler lanes signal the pipeline."""
+        pipe, state = dependency
+        copy_atom = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(), cutlass.Int32, num_bits_per_copy=128
+        )
+        pipe.producer_acquire(state)
+        with cute.arch.elect_one():
+            rmem = self.to_rmem()
+            cute.copy(copy_atom, rmem, smem_buf_tensor[(None, state.index)])
+        cute.arch.fence_proxy("async.shared", space="cta")
+        pipe.producer_commit(state)
+        state.advance()
+
+    def to_rmem(self) -> cute.Tensor:
+        rmem = cute.make_rmem_tensor((self.TotalFields,), Int32)
+        rmem[0] = self.expert_idx
+        rmem[1] = self.tile_m_idx
+        rmem[2] = self.tile_n_idx
+        rmem[3] = self.k_tile_cnt  # = cumulative_data_physical_row
+        rmem[4] = Int32(0)  # Keep the scheduler ring stride at eight words.
+        rmem[5] = self.cumulative_token_block_count
+        rmem[6] = self.valid_tokens_in_cta_tile
+        rmem[7] = self.phase_and_peek
+        return rmem
+
+    @classmethod
+    def from_rmem(cls, rmem: cute.Tensor) -> "W4A16Fc12WorkTileInfo":
+        return cls(
+            expert_idx=rmem[0],  # type: ignore[arg-type]
+            tile_m_idx=rmem[1],  # type: ignore[arg-type]
+            tile_n_idx=rmem[2],  # type: ignore[arg-type]
+            cumulative_data_physical_row=rmem[3],  # type: ignore[arg-type]
+            cumulative_token_block_count=rmem[5],  # type: ignore[arg-type]
+            valid_tokens_in_cta_tile=rmem[6],  # type: ignore[arg-type]
+            phase_and_peek=rmem[7],  # type: ignore[arg-type]
+        )
+
+
+class W4A16Fc12SchedExtension(MoESchedExtension):
+    """Sched extension for the fused fc1+fc2 swap-AB SwiGLU W4A16 kernel.
+
+    ``WorkTileInfo = W4A16Fc12WorkTileInfo``.  The 8th slot stores
+    ``phase_and_peek`` (low 16 bit BlockPhase, bit 16 sched-warp peek result);
+    consumers read it through ``.phase`` and ``.peek_ready``.
+
+    `enrich_work_tile_info` packs the phase-specific readiness peek.
+    `get_gmem_tensor` is phase-invariant; the caller supplies the phase-specific
+    physical tensor.
+    """
+
+    WorkTileInfo = W4A16Fc12WorkTileInfo
+
+    def __init__(
+        self,
+        sf_vec_size: int,
+        fc1_done_counter_ptr: Pointer,
+        fc2_spin_threshold: Union[int, Int32],
+        fc1_ready_counter_ptr: Pointer,
+    ):
+        super().__init__(workspace=None)
+        if sf_vec_size <= 0:
+            raise ValueError(f"sf_vec_size must be positive, got {sf_vec_size}.")
+        self.sf_vec_size = sf_vec_size
+        self.fc1_done_counter_ptr = fc1_done_counter_ptr
+        # Coerce to Int32 SSA so downstream serialization / arithmetic
+        # never has to type-discriminate.  Python-int callers (the
+        # ``static_expert_shape`` path) get a constant SSA op which IR
+        # canonicalize folds to an immediate; runtime-Int32 callers
+        # passthrough.  Net IR is identical.
+        self.fc2_spin_threshold = Int32(fc2_spin_threshold)
+        self.fc1_ready_counter_ptr = fc1_ready_counter_ptr
+
+    def __extract_mlir_values__(self) -> List[ir.Value]:
+        values: List[ir.Value] = []
+        values.extend(extract_mlir_values(self.fc1_done_counter_ptr))
+        values.extend(extract_mlir_values(self.fc2_spin_threshold))
+        values.extend(extract_mlir_values(self.fc1_ready_counter_ptr))
+        return values
+
+    def __new_from_mlir_values__(
+        self, values: List[ir.Value]
+    ) -> "W4A16Fc12SchedExtension":
+        ptr_len = len(extract_mlir_values(self.fc1_done_counter_ptr))
+        thresh_len = len(extract_mlir_values(self.fc2_spin_threshold))
+        idx = 0
+        new_ptr = new_from_mlir_values(
+            self.fc1_done_counter_ptr, values[idx : idx + ptr_len]
+        )
+        idx += ptr_len
+        new_threshold = new_from_mlir_values(
+            self.fc2_spin_threshold, values[idx : idx + thresh_len]
+        )
+        idx += thresh_len
+        ready_ptr_len = len(extract_mlir_values(self.fc1_ready_counter_ptr))
+        new_ready_ptr = new_from_mlir_values(
+            self.fc1_ready_counter_ptr, values[idx : idx + ready_ptr_len]
+        )
+        idx += ready_ptr_len
+        assert idx == len(values), (
+            f"W4A16Fc12SchedExtension serialization mismatch: "
+            f"idx={idx} len(values)={len(values)}"
+        )
+        result = W4A16Fc12SchedExtension.__new__(W4A16Fc12SchedExtension)
+        result.workspace = None
+        result.sf_vec_size = self.sf_vec_size  # codegen const passthrough
+        result.fc1_done_counter_ptr = new_ptr
+        result.fc2_spin_threshold = new_threshold
+        result.fc1_ready_counter_ptr = new_ready_ptr
+        return result
+
+    # --------------------------------------------------------------
+    # enrich_work_tile_info — sched-warp fc2 counter peek + pack
+    # --------------------------------------------------------------
+
+    @cute.jit
+    def enrich_work_tile_info(
+        self,
+        base_work: W4A16Fc12WorkTileInfo,
+    ) -> W4A16Fc12WorkTileInfo:
+        """Pack a non-blocking counter peek into ``phase_and_peek``.
+
+        - fc2 tiles always peek the fc1->fc2 ``fc1_done_counter`` at
+          ``cumulative_token_block_count + tile_n_idx`` against
+          ``self.fc2_spin_threshold`` (work-tile-invariant const).
+        - fc1 tiles peek the dispatch->fc1 ``fc1_ready_counter`` at the
+          same slot index (``tile_n_idx``) but with ``valid_tokens_in_cta_tile`` as threshold
+          (per-tile dynamic).
+        """
+        # Invalid tiles keep (None_ | 0); do not index an arbitrary counter slot.
+        is_valid = base_work.is_valid_tile
+
+        new_phase_and_peek = base_work.phase_and_peek
+        if is_valid:
+            # Same slot index for both phases -- fc1 release-add (dispatch
+            # pull) and fc2 release-add (fc1 epi) target the per-task-tile
+            # counter slot indexed by ``cumulative_token_block_count + tile_n_idx``.
+            counter_slot = base_work.cumulative_token_block_count + base_work.tile_n_idx
+            is_fc1 = base_work.phase == Int32(int(BlockPhase.Linear1))
+            is_fc2 = base_work.phase == Int32(int(BlockPhase.Linear2))
+
+            # FC1 phase peek on fc1_ready_counter. Threshold
+            # is dynamic (per-tile valid count) because dispatch does not
+            # pull padding tokens, so the counter's terminal value matches
+            # the tile's valid_tokens_in_cta_tile (cluster_tile_m for full
+            # tiles, less for an expert's last partial tile).
+            if is_fc1:
+                counter_ptr = self.fc1_ready_counter_ptr + counter_slot
+                peek_ready = spin_wait(
+                    counter_ptr,
+                    lambda v: v >= base_work.valid_tokens_in_cta_tile,
+                    peek_only=True,
+                )
+                peek_bit = Int32(0)
+                if peek_ready:
+                    peek_bit = Int32(PeekReadyBit)
+                new_phase_and_peek = base_work.phase_and_peek | peek_bit
+
+            # fc2 tiles can skip the later TMA-B spin (existing path).
+            if is_fc2:
+                counter_ptr = self.fc1_done_counter_ptr + counter_slot
+                # peek_only=True: single ld.cg + cmp, returns Boolean.
+                # ``self.fc2_spin_threshold`` was Int32-coerced in __init__.
+                peek_ready = spin_wait(
+                    counter_ptr,
+                    lambda v: v >= self.fc2_spin_threshold,
+                    peek_only=True,
+                )
+                # Pack peek bit into slot 7's bit 16.  Use the runtime-if
+                # assign-an-iter-arg-int idiom (same pattern as
+                # ``_advance_expert_within_phase`` for phase-aware tile
+                # count selection); avoids relying on Boolean->Int32
+                # implicit casts whose presence is dialect-version-dependent.
+                peek_bit = Int32(0)
+                if peek_ready:
+                    peek_bit = Int32(PeekReadyBit)
+                new_phase_and_peek = base_work.phase_and_peek | peek_bit
+
+        return W4A16Fc12WorkTileInfo(
+            expert_idx=base_work.expert_idx,
+            tile_m_idx=base_work.tile_m_idx,
+            tile_n_idx=base_work.tile_n_idx,
+            cumulative_data_physical_row=base_work.cumulative_data_physical_row,
+            cumulative_token_block_count=base_work.cumulative_token_block_count,
+            valid_tokens_in_cta_tile=base_work.valid_tokens_in_cta_tile,
+            phase_and_peek=new_phase_and_peek,
+        )
+
+    # --------------------------------------------------------------
+    # get_gmem_tensor — phase-aware
+    # --------------------------------------------------------------
+
+    @cute.jit
+    def get_gmem_tensor(
+        self,
+        tensor_name: str,
+        gmem_tensor_in_moe_view: cute.Tensor,
+        work_tile_info: W4A16Fc12WorkTileInfo,
+    ) -> Tuple[cute.Tensor, Optional[Pointer]]:
+        """Slice expert weights/scales or BF16 token inputs/outputs."""
+        expert_idx = work_tile_info.expert_idx
+        data_token_offset = work_tile_info.cumulative_data_physical_row
+
+        shape = gmem_tensor_in_moe_view.shape
+        stride = gmem_tensor_in_moe_view.stride
+        c1 = cutlass.Int32(1)
+        sf_vec_size = self.sf_vec_size
+
+        if cutlass.const_expr(tensor_name == "a"):
+            real = cute.domain_offset((0, 0, expert_idx), gmem_tensor_in_moe_view)
+            real = rewrite_tensor_shape(real, (shape[0], shape[1], c1))  # type: ignore[index]
+            return (real, None)
+
+        elif cutlass.const_expr(tensor_name in ("b", "c")):
+            real = cute.domain_offset(
+                (data_token_offset, 0, 0), gmem_tensor_in_moe_view
+            )
+            real = rewrite_tensor_shape(real, (shape[0], shape[1], c1))  # type: ignore[index]
+            return (real, None)
+
+        elif cutlass.const_expr(tensor_name == "sfa"):
+            real = cute.domain_offset((0, 0, expert_idx), gmem_tensor_in_moe_view)
+            per_expert_shape = (shape[0], shape[1], c1)  # type: ignore[index]
+            sf_layout = tile_atom_to_shape_SF(per_expert_shape, sf_vec_size)
+            real = cute.make_tensor(
+                real.iterator, cute.make_layout(sf_layout.shape, stride=stride)
+            )
+            return (real, None)
+
+        raise ValueError(f"Unknown tensor_name: {tensor_name!r}.")

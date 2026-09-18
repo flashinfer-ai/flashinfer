@@ -11,16 +11,19 @@ Package layout::
         mega/
           kernel/           fused comm + local MoE kernels
       modes/                split and mega orchestration layers
+      cute_dsl/             FlashInfer-maintained CuTe DSL implementations
       kernel_src/           vendored kernel drops (verbatim src/ + shim/)
 
 Import layering (strict, one direction)::
 
-    layer / modes / core  -->  backends  -->  kernel_src.<drop> shim  -->  src/
+    layer / modes / core  -->  backends  -->  cute_dsl or kernel_src.<drop>
+    cute_dsl  -->  kernel_src.<drop> public helpers  -->  shim/  -->  src/
 
 - Only a drop's ``shim/`` may import that drop's vendored ``src/`` tree;
   nothing else imports ``src/``, ever.
-- Only ``backends/`` may import a drop's shim, and only through the drop's
-  package ``__init__`` (``kernel_src.<drop>``), never shim submodules.
+- Only ``backends/`` and ``cute_dsl/`` may import a drop's shim, and only
+  through the drop's package ``__init__`` (``kernel_src.<drop>``), never shim
+  submodules.
 - The layer, ``modes/``, ``core/``, and everything above use backend APIs
   only (config classes + the ``core.kernel.registry``) — no ``kernel_src``,
   no shim.
@@ -68,6 +71,10 @@ from .backends.mega.kernel.sm100.bf16_bf16_bf16_cutedsl import (
 from .backends.mega.kernel.sm100.bf16_bf16_bf16_rank_major_cuda import (
     Sm100_Bf16_Bf16_Bf16_RankMajorCuda_MegaMoeConfig,
     preprocess_mega_weights as preprocess_bf16_rank_major_cuda_mega_weights,
+)
+from .backends.mega.kernel.sm100.bf16_nvfp4_bf16_cutedsl import (
+    Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+    preprocess_mega_weights as preprocess_bf16_nvfp4_cutedsl_mega_weights,
 )
 from .backends.mega.kernel.sm100.mxfp8_mxfp8_bf16_cutedsl import (
     Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
@@ -182,6 +189,7 @@ __all__ = [
     "Bf16CutedslMegaMoeConfig",
     "Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig",
     "Sm100_Bf16_Bf16_Bf16_RankMajorCuda_MegaMoeConfig",
+    "Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig",
     "CombineInputParams",
     "CombineOutput",
     "Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig",
@@ -254,6 +262,7 @@ __all__ = [
     "preprocess_mega_weights",
     "preprocess_bf16_cutedsl_mega_weights",
     "preprocess_bf16_rank_major_cuda_mega_weights",
+    "preprocess_bf16_nvfp4_cutedsl_mega_weights",
     "preprocess_mxfp8_cutedsl_mega_weights",
     "preprocess_nvfp4_cutedsl_mega_weights",
     "preprocess_sm120_mxfp8_cutedsl_mega_weights",

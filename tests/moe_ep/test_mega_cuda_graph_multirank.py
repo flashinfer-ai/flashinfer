@@ -17,6 +17,7 @@ from __future__ import annotations
 import pytest
 
 from .test_moe_ep_nvfp4_cutedsl_mega_multirank import (
+    _assert_ikr_close,
     _launcher_ranks,
     _mega_problem,
     _require_cuda,
@@ -27,7 +28,21 @@ _REPLAYS = 4
 
 @pytest.mark.gpu_2
 @pytest.mark.arch_blackwell
-def test_nvfp4_mega_two_rank_graph_replay_lockstep():
+@pytest.mark.parametrize(
+    "mode,token_back_mode,tuning,in_kernel_fc2_reduce,alpha_source",
+    [
+        ("w4a4", "epi_warps", "manual", False, "config"),
+        ("w4a16", "epi_warps", "manual", False, "config"),
+        ("w4a16", "reuse_dispatch_warps", "manual", False, "config"),
+        ("w4a16", None, "auto", False, "config"),
+        ("w4a16", "reuse_dispatch_warps", "manual", True, "config"),
+        ("w4a16", "reuse_dispatch_warps", "manual", False, "runtime"),
+        ("w4a16", "reuse_dispatch_warps", "manual", True, "runtime"),
+    ],
+)
+def test_nvfp4_mega_two_rank_graph_replay_lockstep(
+    mode, token_back_mode, tuning, in_kernel_fc2_reduce, alpha_source
+):
     pytest.importorskip("flashinfer.moe_ep.kernel_src.cutedsl_megamoe")
     _require_cuda()
     rank, world_size = _launcher_ranks()
@@ -45,6 +60,7 @@ def test_nvfp4_mega_two_rank_graph_replay_lockstep():
         MoEEpMegaLayer,
         MoEEpTensors,
         Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+        Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
         MoEWeightPack,
         ensure_moe_ep_cuda_device,
     )
@@ -53,6 +69,20 @@ def test_nvfp4_mega_two_rank_graph_replay_lockstep():
     ensure_moe_ep_cuda_device(bootstrap)
     problem = _mega_problem(rank, world_size)
 
+    assert mode in ("w4a4", "w4a16"), mode
+    assert tuning in ("manual", "auto"), tuning
+    assert tuning == "manual" or (mode == "w4a16" and token_back_mode is None)
+    alphas = {}
+    if mode == "w4a16":
+        local_experts = problem["num_experts"] // world_size
+        alphas = dict(
+            fc1_alpha=torch.linspace(0.71013, 1.23017, local_experts, device="cuda"),
+            fc2_alpha=torch.linspace(1.17019, 0.83023, local_experts, device="cuda"),
+        )
+    configs = {
+        "w4a4": Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+        "w4a16": Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+    }
     mega = MoEEpLayer(
         bootstrap=bootstrap,
         fleet_params=FleetParams(
@@ -62,21 +92,31 @@ def test_nvfp4_mega_two_rank_graph_replay_lockstep():
         ),
         weights=MoEWeightPack(w13=problem["w13"], w2=problem["w2"]),
         backend=MegaConfig(
-            megakernel=Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+            megakernel=configs[mode](
                 intermediate_size=problem["intermediate"],
                 top_k=problem["topk"],
                 gate_up_clamp=problem["gate_up_clamp"],
+                enable_in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+                **(alphas if alpha_source == "config" else {}),
+                knobs="auto"
+                if tuning == "auto"
+                else {
+                    "token_back_mode": token_back_mode,
+                    "in_kernel_fc2_reduce": in_kernel_fc2_reduce,
+                },
             ),
             quantize_input=True,
             preprocess_weights=True,
         ),
     )
     assert isinstance(mega, MoEEpMegaLayer)
+    graph = None
     try:
         t = MoEEpTensors(
             hidden_states=problem["hidden_states"],
             topk_ids=problem["topk_ids"],
             topk_weights=problem["topk_weights"],
+            **(alphas if alpha_source == "runtime" else {}),
         )
 
         # Collective warmup: compile + workspace + one real launch, all ranks.
@@ -100,9 +140,12 @@ def test_nvfp4_mega_two_rank_graph_replay_lockstep():
             graph.replay()
             torch.cuda.synchronize()
             dist.barrier()
-        assert torch.equal(y_graph, y_eager), (
-            f"rank {rank}: lockstep graph replay diverged from eager"
-        )
+        if in_kernel_fc2_reduce:
+            _assert_ikr_close(y_graph, y_eager, topk=problem["topk"])
+        else:
+            assert torch.equal(y_graph, y_eager), (
+                f"rank {rank}: lockstep graph replay diverged from eager"
+            )
 
         # Replay over mutated inputs (fresh values, same buffers).
         g = torch.Generator(device="cuda").manual_seed(1234 + rank)
@@ -114,6 +157,10 @@ def test_nvfp4_mega_two_rank_graph_replay_lockstep():
                 generator=g,
             )
         )
+        if alpha_source == "runtime":
+            # Capture must read each new override's contents on replay.
+            t.fc1_alpha.mul_(0.5)
+            t.fc2_alpha.mul_(1.25)
         graph.replay()
         torch.cuda.synchronize()
         dist.barrier()
@@ -122,10 +169,21 @@ def test_nvfp4_mega_two_rank_graph_replay_lockstep():
         y_eager2 = mega.forward(t)
         torch.cuda.synchronize()
         dist.barrier()
-        assert torch.equal(y_replay, y_eager2), (
-            f"rank {rank}: replay-after-mutation diverged from eager"
-        )
+        if in_kernel_fc2_reduce:
+            _assert_ikr_close(y_replay, y_eager2, topk=problem["topk"])
+        else:
+            assert torch.equal(y_replay, y_eager2), (
+                f"rank {rank}: replay-after-mutation diverged from eager"
+            )
+        if in_kernel_fc2_reduce:
+            t.hidden_states.zero_()
+            graph.replay()
+            torch.cuda.synchronize()
+            dist.barrier()
+            assert torch.count_nonzero(y_graph) == 0
     finally:
+        if graph is not None:
+            graph.reset()
         mega.destroy()
         torch.cuda.synchronize()
         dist.barrier()
