@@ -56,7 +56,7 @@ def _bsr_to_vsa_index(
 
     Returns
     -------
-    q2k_index : torch.Tensor  shape ``[1, num_heads, MB * qhead_per_kvhead, NB]``, dtype int32
+    q2k_index : torch.Tensor  shape ``[1, num_heads, MB * qhead_per_kvhead, max_nnz]``, dtype int32
         For each q_block, the list of attended KV-block indices, padded with -1.
         The same pattern is broadcast across all heads and tiled qhead_per_kvhead times
         in the m_block dimension for GQA pack_gqa mode.
@@ -74,8 +74,9 @@ def _bsr_to_vsa_index(
             f"got min={int(indices_cpu.min())}, max={int(indices_cpu.max())}"
         )
 
-    q2k_index_flat = torch.full((MB, NB), -1, dtype=torch.int32)
     q2k_num_flat = (indptr_cpu[1:] - indptr_cpu[:-1]).to(torch.int32)
+    max_nnz = max(int(q2k_num_flat.max()), 1) if MB else NB
+    q2k_index_flat = torch.full((MB, max_nnz), -1, dtype=torch.int32)
 
     for i in range(MB):
         s = int(indptr_cpu[i].item())
@@ -94,7 +95,7 @@ def _bsr_to_vsa_index(
             qhead_per_kvhead
         )  # [MB * qhead_per_kvhead]
 
-    # Broadcast the same pattern to every KV head: [1, H, MB_packed, NB]
+    # Broadcast the same pattern to every KV head: [1, H, MB_packed, max_nnz]
     q2k_index = (
         q2k_index_flat.unsqueeze(0)
         .unsqueeze(0)
