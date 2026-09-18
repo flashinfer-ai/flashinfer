@@ -22,7 +22,7 @@ import json
 
 import torch
 
-from flashinfer.mla._sparse_mla_nvfp4_sm120_plan import (
+from flashinfer.mla._sparse_mla_sm120._dsv4_nvfp4_policy import (
     _CROSSOVER_PROBED_T,
     calibrate_nvfp4_sparse_mla_sm120,
     plan_nvfp4_sparse_mla_sm120,

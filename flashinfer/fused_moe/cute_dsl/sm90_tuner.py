@@ -29,7 +29,7 @@ Tactic format: ``(tile_size, gemm1_tactic, gemm2_tactic)`` where
 """
 
 import itertools
-from typing import Any, Callable, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 
@@ -38,6 +38,12 @@ from ...autotuner import (
     OptimizationProfile,
     TunableRunner,
     TuningConfig,
+)
+from ...tllm_enums import (
+    DEFAULT_SWIGLU_ALPHA,
+    DEFAULT_SWIGLU_BETA,
+    DEFAULT_SWIGLU_LIMIT,
+    ActivationType,
 )
 from ..utils import (
     get_hybrid_num_tokens_buckets,
@@ -50,7 +56,12 @@ from .hopper.contiguous_grouped_gemm_finalize_fusion import (
     Sm90ContiguousGroupedGemmFinalizeFusionKernel,
 )
 from .hopper.utils import TORCH_TO_CUTLASS_DTYPE
-from .moe_utils import get_max_num_permuted_tokens
+from .moe_utils import (
+    get_max_num_permuted_tokens,
+    normalize_cute_dsl_moe_activation_type,
+    validate_cute_dsl_moe_situ_config,
+    validate_cute_dsl_moe_swiglu_config,
+)
 
 
 TILE_SIZES: Tuple[int, ...] = (64, 128)
@@ -110,8 +121,13 @@ def is_valid_tactic(
     intermediate_size: int,
     top_k: int,
     num_local_experts: int,
+    gated: bool = True,
 ) -> bool:
-    """Whether the tactic is valid for the problem."""
+    """Whether the tactic is valid for the problem.
+
+    ``gated`` selects GEMM1's N: ``2 * intermediate_size`` (up/gate pairs)
+    for gated activations, ``intermediate_size`` for ``Relu2``.
+    """
     params = _extract_tactic_params(tactic)
     cutlass_dtype = TORCH_TO_CUTLASS_DTYPE[dtype]
     permuted_m = get_max_num_permuted_tokens(
@@ -124,7 +140,7 @@ def is_valid_tactic(
         params["gemm1_tile_shape_mn"],
         (1, 1),
         permuted_m,
-        2 * intermediate_size,
+        intermediate_size * (2 if gated else 1),
         hidden_size,
         num_local_experts,
         swizzle_size=params["gemm1_swizzle_size"],
@@ -159,6 +175,7 @@ class CuteDslFusedMoESm90Runner(TunableRunner):
         1: token_selected_experts (num_tokens, top_k) int32
         2: token_final_scales (num_tokens, top_k) fp32
         3: w1_weight (E_local, 2I, hidden) — 32-col up/gate interleaved
+           (gated activations), or (E_local, I, hidden) for ``Relu2``
         4: w2_weight (E_local, hidden, I)
         5: moe_output (num_tokens, hidden)
     """
@@ -172,6 +189,12 @@ class CuteDslFusedMoESm90Runner(TunableRunner):
         local_expert_offset: int = 0,
         use_fused_finalize: bool = True,
         enable_pdl: bool = True,
+        activation_type: int = ActivationType.Swiglu.value,
+        swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
+        swiglu_beta: float = DEFAULT_SWIGLU_BETA,
+        swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
+        situ_beta: Optional[float] = None,
+        situ_linear_beta: Optional[float] = None,
     ):
         self.forward_impl = forward_impl
         self.num_experts = num_experts
@@ -180,6 +203,15 @@ class CuteDslFusedMoESm90Runner(TunableRunner):
         self.local_expert_offset = local_expert_offset
         self.use_fused_finalize = use_fused_finalize
         self.enable_pdl = enable_pdl
+        activation, self.gated = normalize_cute_dsl_moe_activation_type(activation_type)
+        validate_cute_dsl_moe_swiglu_config(swiglu_alpha, swiglu_beta, swiglu_limit)
+        validate_cute_dsl_moe_situ_config(activation, situ_beta, situ_linear_beta)
+        self.activation_type = int(activation)
+        self.swiglu_alpha = float(swiglu_alpha)
+        self.swiglu_beta = float(swiglu_beta)
+        self.swiglu_limit = float(swiglu_limit)
+        self.situ_beta = situ_beta
+        self.situ_linear_beta = situ_linear_beta
 
         seeded = lambda device: torch.Generator(device=device).manual_seed(  # noqa: E731
             515
@@ -272,20 +304,24 @@ class CuteDslFusedMoESm90Runner(TunableRunner):
         """Return the default followed by pruned legal GEMM combinations.
 
         Every legal N tile of both GEMMs is a candidate. Swizzling is
-        limited to at least eight routed rows per expert and weight matrices
-        below 48 MiB when more than 16 experts are local. GEMM2 multicast
+        limited to at least eight routed rows per expert
+        (``num_tokens * top_k / num_experts``) and to expert weights below
+        48 MiB when the model has more than 16 experts. GEMM2 multicast
         needs I >= 192; M-major raster is considered only at M=128, I <= 384.
 
-        The list depends only on the problem shapes and the global expert
-        count, never on the local shard, so expert-parallel ranks tuning
-        under ``set_autotune_process_group`` profile identical sequences.
+        The gates use the global expert count; the local shard enters only
+        through the padded row bound (``permuted_m``, always a multiple of
+        the tile) and the ``l >= 1`` legality check. Expert-parallel ranks
+        with different shard sizes therefore enumerate the same list, as
+        ``set_autotune_process_group`` requires.
         """
-        x, w2_weight = inputs[0], inputs[4]
+        x, w1_weight, w2_weight = inputs[0], inputs[3], inputs[4]
         num_tokens, hidden_size = x.shape
+        gemm1_n = w1_weight.shape[1]  # 2I for gated activations, I for Relu2
         intermediate_size = w2_weight.shape[2]
         dtype = TORCH_TO_CUTLASS_DTYPE[x.dtype]
         routed_rows = num_tokens * self.top_k
-        expert_b_bytes = 2 * intermediate_size * hidden_size * x.element_size()
+        expert_b_bytes = gemm1_n * hidden_size * x.element_size()
         tactics: List[Any] = [-1]
         for tile_size in TILE_SIZES:
             permuted_m = get_max_num_permuted_tokens(
@@ -309,7 +345,7 @@ class CuteDslFusedMoESm90Runner(TunableRunner):
                     (tile_size, tile_n),
                     (1, 1),
                     permuted_m,
-                    2 * intermediate_size,
+                    gemm1_n,
                     hidden_size,
                     self.num_local_experts,
                 )
@@ -360,11 +396,30 @@ class CuteDslFusedMoESm90Runner(TunableRunner):
                     intermediate_size=intermediate_size,
                     top_k=self.top_k,
                     num_local_experts=self.num_local_experts,
+                    gated=self.gated,
                 )
             )
         return tactics
 
+    def _activation_key(self) -> Tuple[Any, ...]:
+        """Activation parameters that select a distinct GEMM1 epilogue."""
+        return (
+            "activation_type",
+            self.activation_type,
+            "swiglu_alpha",
+            self.swiglu_alpha,
+            "swiglu_beta",
+            self.swiglu_beta,
+            "swiglu_limit",
+            self.swiglu_limit,
+            "situ_beta",
+            self.situ_beta,
+            "situ_linear_beta",
+            self.situ_linear_beta,
+        )
+
     def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> Tuple[Any, ...]:
+        """Extra autotune cache-key fields beyond the input shapes."""
         return (
             "input_dtype",
             str(inputs[0].dtype),
@@ -372,6 +427,7 @@ class CuteDslFusedMoESm90Runner(TunableRunner):
             self.use_fused_finalize,
             "enable_pdl",
             self.enable_pdl,
+            *self._activation_key(),
         )
 
     def forward(
@@ -406,11 +462,18 @@ class CuteDslFusedMoESm90Runner(TunableRunner):
             moe_output=moe_output,
             use_fused_finalize=self.use_fused_finalize,
             enable_pdl=self.enable_pdl,
+            activation_type=self.activation_type,
+            swiglu_alpha=self.swiglu_alpha,
+            swiglu_beta=self.swiglu_beta,
+            swiglu_limit=self.swiglu_limit,
+            situ_beta=self.situ_beta,
+            situ_linear_beta=self.situ_linear_beta,
             **params,
             **kwargs,
         )
 
     def __hash__(self):
+        """Runner identity for the autotuner: routing, finalize, PDL and activation."""
         return hash(
             (
                 "cute_dsl_fused_moe_bf16",
@@ -420,5 +483,6 @@ class CuteDslFusedMoESm90Runner(TunableRunner):
                 self.local_expert_offset,
                 self.use_fused_finalize,
                 self.enable_pdl,
+                *self._activation_key(),
             )
         )

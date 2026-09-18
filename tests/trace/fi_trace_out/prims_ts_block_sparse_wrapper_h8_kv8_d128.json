@@ -46,6 +46,10 @@
     "num_block_indices": {
       "type": "var",
       "description": "Capacity of the runtime KV-block ID tensor."
+    },
+    "pattern_heads_shared": {
+      "type": "const",
+      "value": 0
     }
   },
   "constraints": [
