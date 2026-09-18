@@ -567,8 +567,20 @@ def _validate_mla_run_metadata(
     seq_lens_host = tuple(int(value) for value in seq_lens_kv.tolist())
     if cp_world > 1 and any(length < 0 for length in seq_lens_host):
         raise ValueError("global runtime KV lengths must be nonnegative with CP")
-    if state.balanced_plan is not None and state.planned_seq_lens is not None and seq_lens_host != state.planned_seq_lens:
-        raise ValueError("balanced MLA live seq_lens must match the installed schedule; call schedule() with the live CUDA lengths before run()")
+    if state.balanced_plan is not None and any(length < 0 for length in seq_lens_host):
+        raise ValueError("every runtime K/V length must be non-negative")
+    if state.balanced_plan is not None:
+        if state.planned_seq_lens is None:
+            raise RuntimeError(
+                "balanced MLA cannot validate the installed schedule because its "
+                "sequence-length snapshot is unavailable; call "
+                "schedule(validate=True) before run(validate=True)"
+            )
+        if seq_lens_host != state.planned_seq_lens:
+            raise ValueError(
+                "balanced MLA live seq_lens must exactly match the installed "
+                "schedule; call schedule() with the live CUDA lengths before run()"
+            )
     local_lengths = tuple(
         _mla_cp_local_length(length, cp_world, cp_interleave_size, cp_rank)
         for length in seq_lens_host
@@ -2763,7 +2775,9 @@ class BatchMLADecodePagedTSWrapper:
         launch. These checks synchronize metadata to the host. Set
         ``validate=False`` only after validating representative inputs, and use
         it for ``torch.compile`` or CUDA graph capture. For a balanced plan,
-        nonvalidating execution requires live ``seq_lens`` to match the most
+        a validating run requires the most recent :meth:`schedule` call to use
+        ``validate=True`` so a diagnostic length snapshot is available.
+        Nonvalidating execution requires live ``seq_lens`` to match the most
         recently planned lengths; that invariant cannot be checked without
         synchronizing.
 
