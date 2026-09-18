@@ -137,10 +137,12 @@ def _canonicalize_quant_mode(quant_mode: str) -> str:
     return quant_mode
 
 
-#: ``(data_ptr, device index, e4m3_max)`` of GEMM2-input scales already checked
-#: against their recipe. The scale is a weight-pack constant, so checking it
-#: once per tensor avoids a device->host sync on every forward.
-_validated_gemm2_input_scales: set[tuple[int, int, float]] = set()
+#: ``(data_ptr, device index, e4m3_max, _version)`` of GEMM2-input scales
+#: already checked against their recipe. The scale is a weight-pack constant,
+#: so checking it once per tensor avoids a device->host sync on every forward.
+#: An in-place write bumps ``_version`` and re-checks; a ``weakref.finalize``
+#: evicts the entry when the tensor dies, so a reused address is re-checked.
+_validated_gemm2_input_scales: set[tuple[int, int, float, int]] = set()
 
 
 def _check_gemm2_input_scale(
@@ -161,7 +163,12 @@ def _check_gemm2_input_scale(
     key = None
     if isinstance(fc2_input_scale, torch.Tensor):
         if fc2_input_scale.is_cuda:
-            key = (fc2_input_scale.data_ptr(), fc2_input_scale.device.index, e4m3_max)
+            key = (
+                fc2_input_scale.data_ptr(),
+                fc2_input_scale.device.index,
+                e4m3_max,
+                fc2_input_scale._version,
+            )
             if key in _validated_gemm2_input_scales:
                 return
             if _is_current_stream_capturing():
@@ -184,6 +191,7 @@ def _check_gemm2_input_scale(
         )
     if key is not None:
         _validated_gemm2_input_scales.add(key)
+        weakref.finalize(fc2_input_scale, _validated_gemm2_input_scales.discard, key)
 
 
 def _get_cuda_graph_resources() -> Dict[str, Any]:

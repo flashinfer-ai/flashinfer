@@ -1737,9 +1737,9 @@ def nvfp4_quantize(
             is_sf_swizzled_layout = sfLayout != SfLayout.layout_linear
             is_sf_8x4_layout = sfLayout == SfLayout.layout_8x4
 
-        # fp4_quantize resolves for itself; it must also still be able to tell
-        # an explicit recipe from an environment-derived one, since only the
-        # former makes fp8 input an error there.
+        # Forward the caller's setting, not the resolved recipe: fp4_quantize
+        # is a public boundary that resolves for itself, and only an explicit
+        # recipe makes fp8 input an error there.
         a_fp4, a_sf = fp4_quantize(
             a.cuda(),
             a_global_sf.cuda(),
@@ -1748,7 +1748,7 @@ def nvfp4_quantize(
             is_sf_swizzled_layout=is_sf_swizzled_layout,
             is_sf_8x4_layout=is_sf_8x4_layout,
             enable_pdl=enable_pdl,
-            nvfp4_4over6=nvfp4_4over6_config,
+            nvfp4_4over6=nvfp4_4over6,
         )
     elif backend == "cute-dsl":
         from ..cute_dsl import is_cute_dsl_available
