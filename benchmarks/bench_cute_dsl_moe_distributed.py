@@ -716,8 +716,6 @@ def _create_shared_ep_weights(rank, world_size, device):
         w2=w2_q,
         w13_scale=w13_sf,
         w2_scale=w2_sf,
-        w13_global_scale=alpha,
-        w2_global_scale=alpha,
     )
 
     def split_scale(scales, rows, cols):

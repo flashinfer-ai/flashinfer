@@ -9,7 +9,7 @@ import torch
 from ......config import BootstrapConfig, FleetParams
 from ......core.kernel.base import MegaKernelBackend
 from ......core.kernel.registry import register_mega_kernel
-from ......core.kernel.workspace_pool import knobs_pool_key
+from ......core.kernel.workspace_pool import epilogue_pool_key, knobs_pool_key
 from ......core.runtime import bf16_cutedsl_runtime_requirements
 from ......core.validation.common import (
     MoEEpArchError,
@@ -32,8 +32,6 @@ if TYPE_CHECKING:
 
 @register_mega_kernel("sm100_bf16_nvfp4_bf16_cutedsl")
 class Bf16Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
-    supports_global_weight_scales = True
-
     @classmethod
     def kernel_name(cls) -> str:
         return "sm100_bf16_nvfp4_bf16_cutedsl"
@@ -110,6 +108,8 @@ class Bf16Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             self.ep_world_size,
             gate_up_clamp=config.gate_up_clamp,
             enable_in_kernel_fc2_reduce=config.enable_in_kernel_fc2_reduce,
+            fc1_alpha=config.fc1_alpha,
+            fc2_alpha=config.fc2_alpha,
             knobs=config.knobs if isinstance(config.knobs, dict) else None,
         )
 
@@ -132,6 +132,8 @@ class Bf16Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             config.top_k,
             config.gate_up_clamp,
             config.enable_in_kernel_fc2_reduce,
+            epilogue_pool_key(config.fc1_alpha),
+            epilogue_pool_key(config.fc2_alpha),
             knobs_pool_key(config.knobs),
         )
 
@@ -139,13 +141,9 @@ class Bf16Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         self, t: MoEEpTensors, fleet_params: FleetParams, *, quantize_input: bool
     ) -> None:
         del quantize_input
-        if any(
-            v is not None
-            for v in (t.scales, t.fc1_alpha, t.fc2_alpha, t.fc1_norm_const)
-        ):
+        if t.scales is not None or t.fc1_norm_const is not None:
             raise MoEEpConfigError(
-                "W4A16 MegaMoE does not accept activation quantization fields; "
-                "pass weight global scales in PrequantizedMoEWeights"
+                "W4A16 MegaMoE does not accept activation quantization fields"
             )
         if t.hidden_states.ndim != 2 or t.topk_ids.ndim != 2:
             raise MoEEpConfigError("W4A16 activations and routing must be 2D")
@@ -169,6 +167,16 @@ class Bf16Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             raise MoEEpConfigError(
                 "W4A16 activations and routing must share a CUDA device"
             )
+        for name in ("fc1_alpha", "fc2_alpha"):
+            alpha = getattr(t, name)
+            if alpha is not None and (
+                alpha.dtype != torch.float32
+                or alpha.shape != (fleet_params.num_experts // self.ep_world_size,)
+                or alpha.device != t.hidden_states.device
+            ):
+                raise MoEEpConfigError(
+                    f"{name} must be FP32 [local_experts] on the activation device"
+                )
 
     def validate_capture_ready(
         self, workspace: Any, transformed_weights: TransformedMegaWeights
@@ -192,6 +200,10 @@ class Bf16Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             workspace.topk_idx,
             workspace.topk_weights,
         )
+        if t.fc1_alpha is not None:
+            workspace.fc1_alpha.copy_(t.fc1_alpha)
+        if t.fc2_alpha is not None:
+            workspace.fc2_alpha.copy_(t.fc2_alpha)
 
     def compute(
         self,

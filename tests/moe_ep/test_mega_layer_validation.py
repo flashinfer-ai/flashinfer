@@ -54,13 +54,12 @@ def _mega_layer(
         if backend_name == "deep_gemm":
             transformed_weights = _fake_deep_gemm_transformed()
         elif backend_name == "w4a16":
-            # Aligned fixture: packed K-major weights, native per-expert SF,
-            # and separate FP32 global scales. No preprocessing/quantizer mock.
+            # Aligned fixture: packed K-major weights and native per-expert SF.
+            # No preprocessing/quantizer mock.
             transformed_weights = tuple(
                 (
                     torch.zeros(2, rows, 64, dtype=torch.uint8).transpose(1, 2),
                     torch.zeros(2, rows * 8, dtype=torch.uint8),
-                    torch.ones(2, dtype=torch.float32),
                 )
                 for rows in (256, 128)
             )
@@ -127,61 +126,6 @@ def test_mega_layer_requires_weights():
                 transformed_weights=_fake_deep_gemm_transformed(),
             ),
         )
-
-
-@pytest.mark.parametrize(
-    "backend_name", ("w4a4", "w4a16", "bf16", "bf16_mxfp8", "split")
-)
-@pytest.mark.parametrize("scale_field", ("w13_global_scale", "w2_global_scale"))
-def test_layer_global_weight_scale_support(backend_name, scale_field):
-    import torch
-
-    from flashinfer.moe_ep import (
-        BootstrapConfig,
-        FleetParams,
-        MegaConfig,
-        MoEEpConfigError,
-        MoEEpLayer,
-        PrequantizedMoEWeights,
-        Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig,
-        Sm100_Bf16_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
-        Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
-        Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
-    )
-
-    config_types = {
-        "w4a4": Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
-        "w4a16": Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
-        "bf16": Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig,
-        "bf16_mxfp8": Sm100_Bf16_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
-    }
-    if backend_name == "split":
-        backend = "nccl_ep"
-    else:
-        backend = MegaConfig(
-            megakernel=config_types[backend_name](intermediate_size=128, top_k=2),
-            preprocess_weights=False,
-        )
-    weights = PrequantizedMoEWeights(
-        torch.zeros(2, 256, 64, dtype=torch.uint8),
-        torch.zeros(2, 128, 64, dtype=torch.uint8),
-        torch.zeros(2, 256, 8, dtype=torch.float8_e4m3fn),
-        torch.zeros(2, 128, 8, dtype=torch.float8_e4m3fn),
-        **{scale_field: torch.full((2,), 2.0)},
-    )
-    with (
-        mock.patch("torch.cuda.is_available", return_value=False),
-        nullcontext()
-        if backend_name == "w4a16"
-        else pytest.raises(MoEEpConfigError, match="global weight scales"),
-    ):
-        layer = MoEEpLayer(
-            BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False),
-            FleetParams(num_experts=2, max_tokens_per_rank=64, token_hidden_size=128),
-            weights,
-            backend=backend,
-        )
-        layer.destroy()
 
 
 def test_mega_layer_forward_rejects_token_overflow():
@@ -457,9 +401,7 @@ def test_mega_layer_forward_rejects_invalid_input(backend_name, field, dtype, er
         layer.forward(MoEEpTensors(**inputs))
 
 
-@pytest.mark.parametrize(
-    "field", ("scales", "fc1_alpha", "fc2_alpha", "fc1_norm_const")
-)
+@pytest.mark.parametrize("field", ("scales", "fc1_norm_const"))
 def test_mega_layer_scale_free_input_rejects_quantization_fields(field):
     import torch
 

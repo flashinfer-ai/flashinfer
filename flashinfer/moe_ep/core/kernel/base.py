@@ -78,8 +78,6 @@ class MegaKernelBackend(ABC):
     # this capability during backend registration.  Keep the default false so
     # existing backends retain the materializing output path.
     supports_output_view: bool = False
-    # Separate per-expert weight scales must be consumed explicitly.
-    supports_global_weight_scales: bool = False
 
     def __init__(self, config: object) -> None:
         self._config = config

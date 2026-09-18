@@ -29,17 +29,19 @@ _REPLAYS = 4
 @pytest.mark.gpu_2
 @pytest.mark.arch_blackwell
 @pytest.mark.parametrize(
-    "mode,token_back_mode,tuning,in_kernel_fc2_reduce",
+    "mode,token_back_mode,tuning,in_kernel_fc2_reduce,alpha_source",
     [
-        ("w4a4", "epi_warps", "manual", False),
-        ("w4a16", "epi_warps", "manual", False),
-        ("w4a16", "reuse_dispatch_warps", "manual", False),
-        ("w4a16", None, "auto", False),
-        ("w4a16", "reuse_dispatch_warps", "manual", True),
+        ("w4a4", "epi_warps", "manual", False, "config"),
+        ("w4a16", "epi_warps", "manual", False, "config"),
+        ("w4a16", "reuse_dispatch_warps", "manual", False, "config"),
+        ("w4a16", None, "auto", False, "config"),
+        ("w4a16", "reuse_dispatch_warps", "manual", True, "config"),
+        ("w4a16", "reuse_dispatch_warps", "manual", False, "runtime"),
+        ("w4a16", "reuse_dispatch_warps", "manual", True, "runtime"),
     ],
 )
 def test_nvfp4_mega_two_rank_graph_replay_lockstep(
-    mode, token_back_mode, tuning, in_kernel_fc2_reduce
+    mode, token_back_mode, tuning, in_kernel_fc2_reduce, alpha_source
 ):
     pytest.importorskip("flashinfer.moe_ep.kernel_src.cutedsl_megamoe")
     _require_cuda()
@@ -70,6 +72,13 @@ def test_nvfp4_mega_two_rank_graph_replay_lockstep(
     assert mode in ("w4a4", "w4a16"), mode
     assert tuning in ("manual", "auto"), tuning
     assert tuning == "manual" or (mode == "w4a16" and token_back_mode is None)
+    alphas = {}
+    if mode == "w4a16":
+        local_experts = problem["num_experts"] // world_size
+        alphas = dict(
+            fc1_alpha=torch.linspace(0.71013, 1.23017, local_experts, device="cuda"),
+            fc2_alpha=torch.linspace(1.17019, 0.83023, local_experts, device="cuda"),
+        )
     configs = {
         "w4a4": Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
         "w4a16": Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
@@ -88,6 +97,7 @@ def test_nvfp4_mega_two_rank_graph_replay_lockstep(
                 top_k=problem["topk"],
                 gate_up_clamp=problem["gate_up_clamp"],
                 enable_in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+                **(alphas if alpha_source == "config" else {}),
                 knobs="auto"
                 if tuning == "auto"
                 else {
@@ -106,6 +116,7 @@ def test_nvfp4_mega_two_rank_graph_replay_lockstep(
             hidden_states=problem["hidden_states"],
             topk_ids=problem["topk_ids"],
             topk_weights=problem["topk_weights"],
+            **(alphas if alpha_source == "runtime" else {}),
         )
 
         # Collective warmup: compile + workspace + one real launch, all ranks.
@@ -146,6 +157,10 @@ def test_nvfp4_mega_two_rank_graph_replay_lockstep(
                 generator=g,
             )
         )
+        if alpha_source == "runtime":
+            # Capture must read each new override's contents on replay.
+            t.fc1_alpha.mul_(0.5)
+            t.fc2_alpha.mul_(1.25)
         graph.replay()
         torch.cuda.synchronize()
         dist.barrier()

@@ -1230,6 +1230,7 @@ def _run_nvfp4_routing_rounds(
     changing_batches,
     num_tokens=257,
     in_kernel_fc2_reduce=False,
+    alpha_source="config",
 ):
     """One public layer reuses its workspace across skew, empty sources and refill."""
     import dataclasses
@@ -1255,6 +1256,7 @@ def _run_nvfp4_routing_rounds(
     )
 
     assert mode in NVFP4_MODES, mode
+    assert alpha_source in ("config", "runtime"), alpha_source
     bootstrap = BootstrapConfig(world_size=world_size, rank=rank)
     ensure_moe_ep_cuda_device(bootstrap)
     num_experts, topk, capacity = 4, 2, num_tokens
@@ -1263,8 +1265,7 @@ def _run_nvfp4_routing_rounds(
     w13, w2 = _make_bf16_weights(
         rank, num_local_experts=local_experts, hidden=hidden, intermediate=intermediate
     )
-    # The canonical packed input is shared by both precision modes. Only W4A16
-    # has post-MMA global scales; keep those separate from the decoded weights.
+    # Both precision modes share the canonical packed weight/SF input.
     q13, s13 = nvfp4_quantize_per_block_16(w13.float().reshape(-1, hidden), 1.0)
     q2, s2 = nvfp4_quantize_per_block_16(w2.float().reshape(-1, intermediate), 1.0)
     alpha1, alpha2 = None, None
@@ -1281,9 +1282,8 @@ def _run_nvfp4_routing_rounds(
         w2=q2.view(torch.uint8).reshape(local_experts, hidden, intermediate // 2),
         w13_scale=s13.reshape(local_experts, 2 * intermediate, hidden // 16),
         w2_scale=s2.reshape(local_experts, hidden, intermediate // 16),
-        w13_global_scale=alpha1,
-        w2_global_scale=alpha2,
     )
+    alphas = dict(fc1_alpha=alpha1, fc2_alpha=alpha2)
     configs = {
         "w4a4": Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
         "w4a16": Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
@@ -1303,6 +1303,7 @@ def _run_nvfp4_routing_rounds(
                 gate_up_clamp=1.5,
                 enable_in_kernel_fc2_reduce=in_kernel_fc2_reduce,
                 knobs={**knobs, "in_kernel_fc2_reduce": in_kernel_fc2_reduce},
+                **(alphas if alpha_source == "config" else {}),
             )
         ),
     )
@@ -1317,6 +1318,10 @@ def _run_nvfp4_routing_rounds(
                 if (value := getattr(weights, field.name)) is not None
             },
         )
+        global_alphas = {
+            name: _all_gather_stack(value).flatten() if value is not None else None
+            for name, value in alphas.items()
+        }
         rounds = (("skewed_tiles", num_tokens, True),)
         if changing_batches:
             rounds = (
@@ -1342,7 +1347,9 @@ def _run_nvfp4_routing_rounds(
             if skewed:
                 problem["topk_ids"][:] = torch.tensor([0, 1], device="cuda")
             reference = (
-                _nvfp4_reference_from_weights(problem, global_weights, mode=mode)
+                _nvfp4_reference_from_weights(
+                    problem, global_weights, mode=mode, **global_alphas
+                )
                 if n
                 else None
             )
@@ -1350,7 +1357,8 @@ def _run_nvfp4_routing_rounds(
                 **{
                     key: problem[key]
                     for key in ("hidden_states", "topk_ids", "topk_weights")
-                }
+                },
+                **(alphas if alpha_source == "runtime" else {}),
             )
             dist.barrier()
             y = layer.forward(tensors)
@@ -1374,18 +1382,20 @@ def _run_nvfp4_routing_rounds(
 @pytest.mark.gpu_2
 @pytest.mark.arch_blackwell
 @pytest.mark.parametrize(
-    "mode,token_back_mode,in_kernel_fc2_reduce",
+    "mode,token_back_mode,in_kernel_fc2_reduce,alpha_source",
     [
-        ("w4a4", "epi_warps", False),
-        ("w4a4", "reuse_dispatch_warps", False),
-        ("w4a16", "epi_warps", False),
-        ("w4a16", "reuse_dispatch_warps", False),
-        ("w4a16", "reuse_dispatch_warps", True),
+        ("w4a4", "epi_warps", False, "config"),
+        ("w4a4", "reuse_dispatch_warps", False, "config"),
+        ("w4a16", "epi_warps", False, "config"),
+        ("w4a16", "reuse_dispatch_warps", False, "config"),
+        ("w4a16", "reuse_dispatch_warps", True, "config"),
+        ("w4a16", "reuse_dispatch_warps", False, "runtime"),
+        ("w4a16", "reuse_dispatch_warps", True, "runtime"),
     ],
 )
 @pytest.mark.parametrize("load_balance_mode", ["static", "atomic_counter"])
 def test_nvfp4_mega_uneven_sources_and_empty_refill(
-    mode, token_back_mode, in_kernel_fc2_reduce, load_balance_mode
+    mode, token_back_mode, in_kernel_fc2_reduce, alpha_source, load_balance_mode
 ):
     _require_cuda()
     rank, world_size = _launcher_ranks()
@@ -1403,6 +1413,7 @@ def test_nvfp4_mega_uneven_sources_and_empty_refill(
         },
         changing_batches=True,
         in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+        alpha_source=alpha_source,
     )
 
 

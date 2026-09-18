@@ -150,6 +150,10 @@ _LAZY_HELPERS = (
 
 
 def __getattr__(name):  # PEP 562
+    if name == "_resolve_per_expert_epilogue":
+        from .shim.nvfp4 import _resolve_per_expert_epilogue
+
+        return _resolve_per_expert_epilogue
     if name in _LAZY_HELPERS:
         from .shim import kernel_helpers
 
@@ -164,6 +168,7 @@ __all__ = [
     *_KERNEL_PRIMITIVES,
     "_CompiledMega",
     "_compute_peer_offsets",
+    "_resolve_per_expert_epilogue",
     "_session_candidates",
     "bootstrap_dist",
     "free_sym_tensor",

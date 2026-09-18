@@ -10,18 +10,8 @@ from ..nvfp4_nvfp4_bf16_cutedsl.weights import (
     _interleave_gate_up_16,
 )
 
-ExpertWeight = tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+ExpertWeight = tuple[torch.Tensor, torch.Tensor]
 TransformedMegaWeights = tuple[ExpertWeight, ExpertWeight]
-
-
-def _global_scale(scale: torch.Tensor | None, weight: torch.Tensor) -> torch.Tensor:
-    if scale is None:
-        return torch.ones(weight.shape[0], dtype=torch.float32, device=weight.device)
-    if scale.dtype != torch.float32 or scale.shape != (weight.shape[0],):
-        raise ValueError("W4A16 global weight scales must be FP32 [local_experts]")
-    if scale.device != weight.device:
-        raise ValueError("W4A16 global weight scales must be on the weight device")
-    return scale.contiguous()
 
 
 def _validate_weight(
@@ -68,14 +58,13 @@ def preprocess_mega_weights(
     intermediate_size: int,
     hidden_size: int,
 ) -> TransformedMegaWeights:
-    """Canonical gate/up weights → packed kernel layout and separate alphas.
+    """Canonical gate/up weights → the NVFP4 packed kernel layout.
 
     FC1 uses the same alternating 16-row gate/up blocks as W4A4. Packed
     weights expose K-major transpose views [E,K/2,N]; native block scales
     expose [E,padded_scale_bytes]. Both match W4A4's prepared byte layout.
-    Runtime launches consume these buffers directly. Global scales
-    remain FP32 epilogue operands: multiplying them into
-    decoded BF16 weights would change the existing W4A16 rounding contract.
+    Runtime launches consume these buffers directly; per-expert FP32
+    epilogue scales are supplied separately through the session.
     """
     from flashinfer.quantization import block_scale_interleave
 
@@ -111,8 +100,6 @@ def preprocess_mega_weights(
     _validate_weight(w2, s2, (local_experts, hidden_size, intermediate_size // 2))
     if w13.device != w2.device:
         raise ValueError("W4A16 FC1 and FC2 weights must be on the same device")
-    alpha1 = _global_scale(weights.w13_global_scale, w13)
-    alpha2 = _global_scale(weights.w2_global_scale, w2)
     w13 = _interleave_gate_up_16(
         w13.view(torch.uint8), intermediate_size=intermediate_size
     )
@@ -123,14 +110,12 @@ def preprocess_mega_weights(
             block_scale_interleave(s13.contiguous().view(torch.uint8))
             .view(torch.float8_e4m3fn)
             .view(local_experts, -1),
-            alpha1,
         ),
         (
             _as_fp4_weight(w2.view(torch.uint8).contiguous()).transpose(1, 2),
             block_scale_interleave(s2.contiguous().view(torch.uint8))
             .view(torch.float8_e4m3fn)
             .view(local_experts, -1),
-            alpha2,
         ),
     )
 
@@ -143,23 +128,20 @@ def validate_transformed_mega_weights(
     world_size: int,
     num_experts: int,
 ) -> None:
-    if len(transformed) != 2 or any(len(parts) != 3 for parts in transformed):
-        raise ValueError(
-            "W4A16 transformed weights require two (weight, scale, alpha) triples"
-        )
+    if len(transformed) != 2 or any(len(parts) != 2 for parts in transformed):
+        raise ValueError("W4A16 transformed weights require two (weight, scale) pairs")
     local_experts = num_experts // world_size
     shapes = (
         (local_experts, 2 * intermediate_size, hidden_size // 2),
         (local_experts, hidden_size, intermediate_size // 2),
     )
-    for (weight, scale, alpha), shape in zip(transformed, shapes, strict=True):
+    for (weight, scale), shape in zip(transformed, shapes, strict=True):
         _validate_weight(weight, scale, shape, prepared_layout=True)
-        _global_scale(alpha, weight)
         if not weight.transpose(1, 2).is_contiguous():
             raise ValueError(
                 "W4A16 transformed weights require a K-major transpose view"
             )
-        if not scale.is_contiguous() or not alpha.is_contiguous():
-            raise ValueError("W4A16 transformed scales and alphas must be contiguous")
+        if not scale.is_contiguous():
+            raise ValueError("W4A16 transformed scales must be contiguous")
     if transformed[0][0].device != transformed[1][0].device:
         raise ValueError("W4A16 FC1 and FC2 weights must be on the same device")

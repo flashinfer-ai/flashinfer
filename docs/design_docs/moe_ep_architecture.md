@@ -328,10 +328,7 @@ classDiagram
 
 **Mega weights:** with `preprocess_weights=True` (default), canonical bf16 or pre-quantized `MoEWeightPack` is transformed at init. With `preprocess_weights=False`, supply `MegaConfig.transformed_weights` (from `preprocess_*_mega_weights`).
 
-BF16×NVFP4 accepts optional FP32 `[local_experts]` `w13_global_scale` /
-`w2_global_scale` (default one), applied after FP32 GEMMs. Prepared
-`(weight, scale, alpha)` triples use the W4A4 weight/scale layout. Routing
-weights apply after FC2; external FP32 combine is the default.
+BF16×NVFP4 applies routing weights after FC2; external FP32 combine is the default.
 
 **Mega activations:** with `quantize_input=True` (default), bf16 `[T, hidden]` is quantized into symm workspace at forward. Non-bf16 with `quantize_input=True` raises `MoEEpConfigError`; use `quantize_input=False` and pre-quantized activations plus `MoEEpTensors.scales`.
 BF16-activation backends ignore `quantize_input` and copy BF16 inputs.

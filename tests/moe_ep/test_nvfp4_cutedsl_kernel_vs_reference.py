@@ -371,11 +371,8 @@ def test_nvfp4_preprocess_fp4_weights_match_plain_quant(
         intermediate_size=problem["intermediate"],
         hidden_size=problem["hidden"],
     )
-    fc1_kernel, fc1_kernel_sf = transformed_l1[:2]
-    fc2_kernel, fc2_kernel_sf = transformed_l2[:2]
-    if mode == "w4a16":
-        for _, _, alpha in (transformed_l1, transformed_l2):
-            torch.testing.assert_close(alpha, torch.ones_like(alpha), atol=0, rtol=0)
+    fc1_kernel, fc1_kernel_sf = transformed_l1
+    fc2_kernel, fc2_kernel_sf = transformed_l2
 
     fc1_plain, fc1_sf, fc2_plain, fc2_sf = _plain_nvfp4_from_bf16(problem)
 
@@ -419,9 +416,9 @@ def test_nvfp4_preprocess_fp4_weights_match_plain_quant(
         )
 
     # Canonical prepacked inputs must produce the same weight/SF bytes and
-    # K-major strides. W4A16 also accepts typed FP4 aliases and FP32 globals.
+    # K-major strides. W4A16 also accepts typed FP4 aliases.
     packed = {}
-    for name, start, end in ("w13", 0.71013, 1.23017), ("w2", 1.17019, 0.83023):
+    for name in ("w13", "w2"):
         weight = problem[name]
         q, sf = nvfp4_quantize_per_block_16(
             weight.float().reshape(-1, weight.shape[-1]), 1.0
@@ -430,26 +427,17 @@ def test_nvfp4_preprocess_fp4_weights_match_plain_quant(
             q = q.view(torch.uint8)
         packed[name] = q.reshape(*weight.shape[:-1], weight.shape[-1] // 2)
         packed[f"{name}_scale"] = sf.reshape(*weight.shape[:-1], weight.shape[-1] // 16)
-        if mode == "w4a16":
-            packed[f"{name}_global_scale"] = torch.linspace(
-                start, end, num_experts, device="cuda"
-            )
     prepacked = preprocess_mega_weights(
         MoEWeightPack(**packed), intermediate_size=intermediate, hidden_size=hidden
     )
-    for name, reference, actual in zip(
-        ("w13", "w2"), (transformed_l1, transformed_l2), prepacked, strict=True
+    for reference, actual in zip(
+        (transformed_l1, transformed_l2), prepacked, strict=True
     ):
-        for expected, result in zip(reference[:2], actual[:2], strict=True):
+        for expected, result in zip(reference, actual, strict=True):
             assert (
                 expected.shape == result.shape and expected.stride() == result.stride()
             )
             assert torch.equal(expected.view(torch.uint8), result.view(torch.uint8))
-        if mode == "w4a16":
-            assert actual[2].dtype == torch.float32
-            torch.testing.assert_close(
-                actual[2], packed[f"{name}_global_scale"], rtol=0, atol=0
-            )
 
 
 @pytest.mark.arch_blackwell
@@ -545,14 +533,11 @@ def test_nvfp4_kernel_matches_torch_reference(
 
     fc1_plain, fc1_sf, fc2_plain, fc2_sf = _plain_nvfp4_from_bf16(problem)
 
+    alpha1, alpha2 = None, None
     if mode == "w4a16":
-        # Non-BF16-representable FP32 globals exercise post-MMA scale use.
-        transformed_l1[2].copy_(
-            torch.linspace(0.71013, 1.23017, num_experts, device="cuda")
-        )
-        transformed_l2[2].copy_(
-            torch.linspace(1.17019, 0.83023, num_experts, device="cuda")
-        )
+        # Non-BF16-representable FP32 alphas exercise post-MMA scale use.
+        alpha1 = torch.linspace(0.71013, 1.23017, num_experts, device="cuda")
+        alpha2 = torch.linspace(1.17019, 0.83023, num_experts, device="cuda")
     intermediate_arg = {"w4a4": 2 * intermediate, "w4a16": intermediate}[mode]
 
     knobs = {"token_back_mode": token_back_mode}
@@ -573,6 +558,8 @@ def test_nvfp4_kernel_matches_torch_reference(
         world_size,
         gate_up_clamp=problem["gate_up_clamp"],
         enable_in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+        fc1_alpha=alpha1,
+        fc2_alpha=alpha2,
         knobs=knobs,
     )
     graph = None
@@ -605,8 +592,8 @@ def test_nvfp4_kernel_matches_torch_reference(
             intermediate=problem["intermediate"],
             gate_up_clamp=problem["gate_up_clamp"],
             mode=mode,
-            fc1_alpha=transformed_l1[2] if mode == "w4a16" else None,
-            fc2_alpha=transformed_l2[2] if mode == "w4a16" else None,
+            fc1_alpha=alpha1,
+            fc2_alpha=alpha2,
             return_terms=mode == "w4a16",
         )
 
@@ -683,7 +670,9 @@ def _assert_nvfp4_reference(y_kernel, reference, *, mode, in_kernel_fc2_reduce=F
     assert rel_l2.item() < 0.02
 
 
-def _nvfp4_reference_from_weights(problem, weights, *, mode):
+def _nvfp4_reference_from_weights(
+    problem, weights, *, mode, fc1_alpha=None, fc2_alpha=None
+):
     """Shared oracle input assembly from canonical prequantized weight packs."""
     import torch
     from flashinfer.moe_ep import PrequantizedMoEWeights
@@ -702,12 +691,11 @@ def _nvfp4_reference_from_weights(problem, weights, *, mode):
     fc2, sf2 = weights.w2, weights.w2_scale
     x, sf, alpha1, alpha2 = problem["hidden_states"], None, None, None
     if mode == "w4a4":
-        assert weights.w13_global_scale is None and weights.w2_global_scale is None
+        assert fc1_alpha is None and fc2_alpha is None
         x, sf = nvfp4_quantize_per_block_16(x.float(), 1.0)
     elif mode == "w4a16":
         ones = torch.ones(fc1.shape[0], device=x.device, dtype=torch.float32)
-        alpha1 = weights.w13_global_scale
-        alpha2 = weights.w2_global_scale
+        alpha1, alpha2 = fc1_alpha, fc2_alpha
         if alpha1 is None:
             alpha1 = ones
         if alpha2 is None:
@@ -733,8 +721,9 @@ def _nvfp4_reference_from_weights(problem, weights, *, mode):
 
 @pytest.mark.arch_blackwell
 @pytest.mark.parametrize("token_back_mode", ["epi_warps", "reuse_dispatch_warps"])
+@pytest.mark.parametrize("alpha_source", ["config", "runtime"])
 def test_nvfp4_w4a16_fp32_scales_and_routing(
-    monkeypatch, token_back_mode, w4a16_single_rank_runtime
+    monkeypatch, token_back_mode, alpha_source, w4a16_single_rank_runtime
 ):
     """Cancellation distinguishes FP32 routing/globals from premature BF16 casts."""
     import torch
@@ -742,6 +731,7 @@ def test_nvfp4_w4a16_fp32_scales_and_routing(
         BootstrapConfig,
         FleetParams,
         MegaConfig,
+        MoEEpConfigError,
         MoEEpMegaLayer,
         MoEEpTensors,
         PrequantizedMoEWeights,
@@ -760,8 +750,10 @@ def test_nvfp4_w4a16_fp32_scales_and_routing(
         w2=w2,
         w13_scale=torch.ones((4, 512, 16), device="cuda").to(torch.float8_e4m3fn),
         w2_scale=torch.ones((4, 256, 16), device="cuda").to(torch.float8_e4m3fn),
-        w13_global_scale=torch.full((4,), 1.00390625, device="cuda"),
-        w2_global_scale=torch.full((4,), 1.001953125, device="cuda"),
+    )
+    alphas = dict(
+        fc1_alpha=torch.full((4,), 1.00390625, device="cuda"),
+        fc2_alpha=torch.full((4,), 1.001953125, device="cuda"),
     )
     problem["hidden_states"].zero_()
     problem["hidden_states"][:, 0] = torch.tensor([0.5, 1.0, 2.0, 4.0], device="cuda")
@@ -769,7 +761,7 @@ def test_nvfp4_w4a16_fp32_scales_and_routing(
     problem["topk_weights"][:, 0], problem["topk_weights"][:, 1] = 1.00390625, 1.0
     # Preserve the exact, unclamped precision fixture from the W4A16 suite.
     problem["gate_up_clamp"] = None
-    reference = _nvfp4_reference_from_weights(problem, weights, mode="w4a16")
+    reference = _nvfp4_reference_from_weights(problem, weights, mode="w4a16", **alphas)
     expected = reference.sum(1).bfloat16()
     assert torch.count_nonzero(expected[:, 0]) == 4
     layer = MoEEpMegaLayer(
@@ -783,18 +775,50 @@ def test_nvfp4_w4a16_fp32_scales_and_routing(
                 intermediate_size=256,
                 top_k=2,
                 knobs={"token_back_mode": token_back_mode},
+                **(alphas if alpha_source == "config" else {}),
             )
         ),
     )
+    graph = None
     try:
-        actual = layer.forward(
-            MoEEpTensors(
-                **{
-                    key: problem[key]
-                    for key in ("hidden_states", "topk_ids", "topk_weights")
-                }
-            )
+        inputs = {
+            key: problem[key] for key in ("hidden_states", "topk_ids", "topk_weights")
+        }
+        if alpha_source == "runtime":
+            for name, alpha in alphas.items():
+                for invalid in (alpha[:1], alpha.bfloat16(), alpha.cpu()):
+                    with pytest.raises(MoEEpConfigError, match=f"{name} must be FP32"):
+                        layer.forward(MoEEpTensors(**inputs, **{name: invalid}))
+        tensors = MoEEpTensors(
+            **inputs, **(alphas if alpha_source == "runtime" else {})
         )
+        actual = layer.forward(tensors)
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            actual_graph = layer.forward(tensors)
+        for step in range(3):
+            if alpha_source == "runtime" and step == 1:
+                alphas["fc1_alpha"].mul_(2.0)
+                alphas["fc2_alpha"].mul_(0.5)
+                reference = _nvfp4_reference_from_weights(
+                    problem, weights, mode="w4a16", **alphas
+                )
+                expected = reference.sum(1).bfloat16()
+            graph.replay()
+            torch.testing.assert_close(actual_graph, expected, atol=0, rtol=0)
+        if alpha_source == "runtime":
+            # Like W4A4, omitting an override retains the workspace's values.
+            actual = layer.forward(
+                MoEEpTensors(
+                    **{
+                        key: problem[key]
+                        for key in ("hidden_states", "topk_ids", "topk_weights")
+                    }
+                )
+            )
+            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
     finally:
+        if graph is not None:
+            graph.reset()
         layer.destroy()

@@ -394,9 +394,9 @@ class MegaMoEBf16Nvfp4Frontend:
                     f"with shape {expected_sf}."
                 )
             if alpha.shape != (c.num_experts_per_rank,) or alpha.dtype != torch.float32:
-                raise ValueError("weight global scales must be FP32 per expert.")
+                raise ValueError("fc1_alpha/fc2_alpha must be FP32 per expert.")
             if not all(t.is_cuda and t.is_contiguous() for t in (scale, alpha)):
-                raise ValueError("weight scales must be contiguous CUDA tensors.")
+                raise ValueError("scales and alphas must be contiguous CUDA tensors.")
         combine_topk = 1 if c.in_kernel_fc2_reduce else c.num_topk
         if inputs.combine_output.shape != (
             c.num_tokens_per_rank,
@@ -456,6 +456,8 @@ class MegaMoEBf16Nvfp4SymmBuffer:
     topk_idx: torch.Tensor
     topk_weights: torch.Tensor
     combine_output: torch.Tensor
+    fc1_alpha: torch.Tensor
+    fc2_alpha: torch.Tensor
     _frontend: MegaMoEBf16Nvfp4Frontend
     _sym_roots: list[torch.Tensor] = field(default_factory=list)
     _destroyed: bool = False
@@ -477,7 +479,7 @@ class MegaMoEBf16Nvfp4SymmBuffer:
             self._destroyed = True
 
 
-TransformedWeights = Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+TransformedWeights = Tuple[torch.Tensor, torch.Tensor]
 
 
 def init_dist() -> Tuple[int, int]:
@@ -497,6 +499,8 @@ def get_symm_buffer_for_bf16_nvfp4_mega_moe(
     gate_up_clamp: Optional[float] = None,
     activation_clamp: Optional[float] = None,
     enable_in_kernel_fc2_reduce: bool = False,
+    fc1_alpha: torch.Tensor | int | float | None = None,
+    fc2_alpha: torch.Tensor | int | float | None = None,
     token_back_mode: Optional[
         Literal["epi_warps", "standalone_warps", "reuse_dispatch_warps"]
     ] = None,
@@ -506,6 +510,7 @@ def get_symm_buffer_for_bf16_nvfp4_mega_moe(
         gate_up_clamp=gate_up_clamp, activation_clamp=activation_clamp
     )
     from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+        _resolve_per_expert_epilogue,
         resolve_knobs,
         tuner,
         with_knobs,
@@ -550,6 +555,12 @@ def get_symm_buffer_for_bf16_nvfp4_mega_moe(
             f"{tuner.describe_invalid_knobs(cfg, optional_config, tuner.is_valid_bf16_nvfp4_for_config)}."
         )
     cfg = with_knobs(cfg, optional_config)
+    fc1_alpha = _resolve_per_expert_epilogue(
+        "fc1_alpha", fc1_alpha, cfg.num_experts_per_rank
+    )
+    fc2_alpha = _resolve_per_expert_epilogue(
+        "fc2_alpha", fc2_alpha, cfg.num_experts_per_rank
+    )
     x = sym_zeros((num_max_tokens, hidden), torch.bfloat16)
     topk_idx = sym_zeros((num_max_tokens, num_topk), torch.int64)
     topk_idx.fill_(-1)
@@ -570,6 +581,8 @@ def get_symm_buffer_for_bf16_nvfp4_mega_moe(
         topk_idx,
         topk_weights,
         combine_output,
+        fc1_alpha,
+        fc2_alpha,
         MegaMoEBf16Nvfp4Frontend(cfg),
         [x, topk_idx, topk_weights, combine_output],
     )
@@ -616,10 +629,10 @@ def bf16_nvfp4_mega_moe(
             symm_buffer.topk_weights,
             transformed_l1[0],
             transformed_l1[1],
-            transformed_l1[2],
+            symm_buffer.fc1_alpha,
             transformed_l2[0],
             transformed_l2[1],
-            transformed_l2[2],
+            symm_buffer.fc2_alpha,
             symm_buffer.kernel_combine_output,
         ),
         num_tokens=n,
@@ -644,10 +657,10 @@ def bf16_nvfp4_mega_launch_thunk(
             symm_buffer.topk_weights,
             transformed_l1[0],
             transformed_l1[1],
-            transformed_l1[2],
+            symm_buffer.fc1_alpha,
             transformed_l2[0],
             transformed_l2[1],
-            transformed_l2[2],
+            symm_buffer.fc2_alpha,
             symm_buffer.kernel_combine_output,
         )
     )
