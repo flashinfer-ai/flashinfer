@@ -51,6 +51,7 @@ build/JIT, and state-pool reset are outside the measured region.
 """
 
 import argparse
+import inspect
 import json
 import subprocess
 from dataclasses import dataclass
@@ -471,6 +472,12 @@ def _make_case(
         else None
     )
     scale = float(1.0 / np.sqrt(128.0))
+    backend_options = {"backend": candidate_backend}
+    if "backend" not in inspect.signature(recurrent_kda).parameters:
+        if candidate_backend != "cake":
+            raise RuntimeError("this FlashInfer revision only exposes CAKE prefill")
+        # Older public APIs select CAKE implicitly; verify the observed route below.
+        backend_options = {}
 
     def candidate_run():
         state_index = state_cursors["pr"][0]
@@ -497,7 +504,7 @@ def _make_case(
             beta_is_logit=True,
             seq_order=seq_order,
             prefill_workspace=candidate_workspace,
-            backend=candidate_backend,
+            **backend_options,
         )
         return output, final_state
 
@@ -592,11 +599,25 @@ def _make_case(
     # untimed warmup. This avoids duplicating dispatcher policy in the evidence
     # harness while keeping route logging out of every timed call.
     kda_prefill_module = import_module("flashinfer.kda_prefill")
-    kda_prefill_cute_module = import_module("flashinfer.kda_prefill_cute")
-    cudnn_module = import_module("flashinfer.cudnn")
+    kda_prefill_cute_module = (
+        import_module("flashinfer.kda_prefill_cute")
+        if candidate_backend in ("auto", "cute-dsl")
+        else None
+    )
+    cudnn_module = (
+        import_module("flashinfer.cudnn")
+        if candidate_backend in ("auto", "cudnn")
+        else None
+    )
     original_get_module = kda_prefill_module._get_flash_kda_prefill_module
-    original_cute_run = kda_prefill_cute_module._run_cute_dsl_kda_prefill
-    original_cudnn_run = cudnn_module.cudnn_recurrent_kda
+    original_cute_run = (
+        kda_prefill_cute_module._run_cute_dsl_kda_prefill
+        if kda_prefill_cute_module is not None
+        else None
+    )
+    original_cudnn_run = (
+        cudnn_module.cudnn_recurrent_kda if cudnn_module is not None else None
+    )
     resolved_cake_routes = []
     resolved_backends = []
     resolved_cudnn_calls = []
@@ -614,15 +635,19 @@ def _make_case(
         return original_cudnn_run(*call_args, **kwargs)
 
     kda_prefill_module._get_flash_kda_prefill_module = recording_get_module
-    kda_prefill_cute_module._run_cute_dsl_kda_prefill = recording_cute_run
-    cudnn_module.cudnn_recurrent_kda = recording_cudnn_run
+    if kda_prefill_cute_module is not None:
+        kda_prefill_cute_module._run_cute_dsl_kda_prefill = recording_cute_run
+    if cudnn_module is not None:
+        cudnn_module.cudnn_recurrent_kda = recording_cudnn_run
     try:
         candidate_run()
         torch.cuda.synchronize()
     finally:
         kda_prefill_module._get_flash_kda_prefill_module = original_get_module
-        kda_prefill_cute_module._run_cute_dsl_kda_prefill = original_cute_run
-        cudnn_module.cudnn_recurrent_kda = original_cudnn_run
+        if kda_prefill_cute_module is not None:
+            kda_prefill_cute_module._run_cute_dsl_kda_prefill = original_cute_run
+        if cudnn_module is not None:
+            cudnn_module.cudnn_recurrent_kda = original_cudnn_run
         reset_state_pools()
     if resolved_cudnn_calls:
         if len(resolved_cudnn_calls) != 1 or resolved_backends or resolved_cake_routes:
