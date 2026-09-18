@@ -24,6 +24,7 @@ _kernel_cache: dict[tuple, Any] = {}
 
 @dsl_user_op
 def _fma_rn(a, b, c, *, loc=None, ip=None):
+    # Match the native finalizer's --use_fast_math FP32 FMA, including FTZ.
     return cutlass.Float32(
         llvm.inline_asm(
             T.f32(),
@@ -111,7 +112,7 @@ class _MoeFinalizeKernel:
             cute.nvgpu.CopyUniversalOp(), cutlass.BFloat16, num_bits_per_copy=128
         )
 
-        # Routing is complete before FC2 can launch this dependent grid.
+        # The caller guarantees routing is ready before FC2 signals us.
         # Only expert outputs depend on the still-running FC2 grid.
         for slot in cutlass.range_constexpr(self.top_k):
             if cutlass.const_expr(self.input_is_expanded):
@@ -124,7 +125,7 @@ class _MoeFinalizeKernel:
             cute.arch.griddepcontrol_wait()
 
         # Preserve native moeUnpermuteKernel's top-k order and fast-math FMA.
-        # Mask before loading: nonlocal expanded rows are uninitialized.
+        # Mask before loading: nonlocal routes have no initialized expert row.
         for slot in cutlass.range_constexpr(self.top_k):
             row = cutlass.Int64(rows[slot])
             valid = rows[slot] >= 0
@@ -166,11 +167,13 @@ def moe_unpermute(
 ) -> None:
     """Reduce BF16 expert rows in ascending top-k order using FP32 FMA.
 
-    Routing metadata must be complete before launch: W4A4 uses non-PDL sort;
-    W4A16 signals dependents only after FC2 waits for its preceding grid.
-    Metadata is read before this kernel's PDL wait; all expert-output reads
-    follow it. Negative mapping entries skip their
-    row entirely. An all-masked token writes exactly zero.
+    Routing metadata must be ready before FC2 signals this dependent grid.
+    W4A4 uses non-PDL sort; W4A16's permute waits for sort before signaling
+    FC1, and FC2 waits for FC1 before signaling this kernel. Metadata reads
+    precede this kernel's PDL wait; all expert-output reads follow it.
+    Negative mapping entries skip their row entirely. An all-masked token
+    writes exactly zero. FP32 FMA flushes subnormals to zero to match native
+    ``moeUnpermuteKernel`` compiled with ``--use_fast_math``.
 
     With ``input_is_expanded=True``, input rows are ``token * top_k + slot``;
     otherwise each nonnegative mapping value is the permuted input row.

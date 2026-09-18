@@ -516,8 +516,8 @@ def _moe_core_impl(
             topk_scales=token_final_scales,
             num_tokens=num_tokens,
             top_k=top_k,
-            enable_pdl=enable_pdl,
             input_is_expanded=True,
+            enable_pdl=enable_pdl,
         )
 
     return moe_output[:num_tokens]
