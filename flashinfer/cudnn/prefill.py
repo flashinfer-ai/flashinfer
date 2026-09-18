@@ -1,6 +1,7 @@
 import contextlib
 import functools
 import os
+import warnings
 from enum import Enum
 from typing import Optional
 
@@ -76,6 +77,16 @@ _OVERRIDE_CACHE_BATCH = 4096
 
 
 @functools.cache
+def _cudnn_frontend_version() -> tuple[int, int]:
+    """(major, minor) of the installed cudnn-frontend python package, (0, 0) when unknown."""
+    try:
+        major, minor = map(int, cudnn.__version__.split(".")[:2])
+        return (major, minor)
+    except Exception:
+        return (0, 0)
+
+
+@functools.cache
 def _cudnn_version_supports_shape_override() -> bool:
     """SDPA shape override needs the unified engine's support (cuDNN 9.22+) and a
     cudnn-frontend whose pygraph takes is_override_shape_enabled (1.29+)."""
@@ -84,16 +95,51 @@ def _cudnn_version_supports_shape_override() -> bool:
     try:
         if cudnn.backend_version() < 92200:
             return False
-        major, minor = map(int, cudnn.__version__.split(".")[:2])
-        return (major, minor) >= (1, 29)
+        return _cudnn_frontend_version() >= (1, 29)
     except Exception:
         return False
 
 
+# cudnn-frontend's FROST (python) SDPA engines are opt-in through this environment
+# variable and, once opted in, rank ahead of the cuDNN backend plans. Before
+# cudnn-frontend 1.30 their execute path read the DECLARED geometry, so an
+# override graph served by a FROST plan raised on every call
+# (cudnn-frontend #1098, fixed by #1119 / #1132); the exact-shape graph is the
+# only form those releases can run.
+_FROST_OPT_IN_ENV = "CUDNN_FRONTEND_ENABLE_FROST_ENGINES"
+_FROST_OVERRIDE_MIN_FRONTEND = (1, 30)
+_warned_frost_override = False
+
+
+def _frost_engines_opted_in() -> bool:
+    return os.environ.get(_FROST_OPT_IN_ENV, "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
 def _cudnn_supports_shape_override() -> bool:
+    global _warned_frost_override
     if os.environ.get(_PREFILL_SHAPE_OVERRIDE_ENV, "1") == "0":
         return False
-    return _cudnn_version_supports_shape_override()
+    if not _cudnn_version_supports_shape_override():
+        return False
+    if (
+        _frost_engines_opted_in()
+        and _cudnn_frontend_version() < _FROST_OVERRIDE_MIN_FRONTEND
+    ):
+        if not _warned_frost_override:
+            _warned_frost_override = True
+            warnings.warn(
+                f"{_FROST_OPT_IN_ENV} is set but cudnn-frontend {cudnn.__version__} predates 1.30, "
+                "the first release whose FROST SDPA engines honor execute-time shape overrides; the cuDNN "
+                "ragged prefill declares the exact shape per call instead (one plan build per new shape).",
+                stacklevel=2,
+            )
+        return False
+    return True
 
 
 def _override_seq_class(max_seq: int, *, is_q: bool) -> int:

@@ -5,6 +5,8 @@ is 55-70 ms). These tests pin the cache-shape function, count graph builds acros
 a stream of shapes, and check numerics against FA2 in both length classes.
 """
 
+import warnings
+
 import pytest
 import torch
 
@@ -169,6 +171,33 @@ def test_shape_stream_builds_one_graph_per_length_class():
     assert cudnn_prefill._prefill_graph_builds == before, (
         "a new (batch, max_len) rebuilt the cuDNN graph"
     )
+
+
+@requires_override
+def test_frost_opt_in_needs_cudnn_frontend_1_30(monkeypatch):
+    """With cudnn-frontend's FROST engines opted in, the override graph needs a frontend whose FROST
+    execute honors overrides (1.30+); below that the exact-shape graph is used and one warning says why."""
+    monkeypatch.setenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
+    monkeypatch.setattr(cudnn_prefill, "_warned_frost_override", False)
+    monkeypatch.setattr(cudnn_prefill.cudnn, "__version__", "1.29.0")
+    cudnn_prefill._cudnn_frontend_version.cache_clear()
+    try:
+        with pytest.warns(UserWarning, match="predates 1.30"):
+            assert cudnn_prefill._cudnn_supports_shape_override() is False
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")  # the warning is emitted once per process
+            assert cudnn_prefill._cudnn_supports_shape_override() is False
+        monkeypatch.setattr(cudnn_prefill.cudnn, "__version__", "1.30.0")
+        cudnn_prefill._cudnn_frontend_version.cache_clear()
+        assert cudnn_prefill._cudnn_supports_shape_override() is True
+        monkeypatch.delenv("CUDNN_FRONTEND_ENABLE_FROST_ENGINES")
+        monkeypatch.setattr(cudnn_prefill.cudnn, "__version__", "1.29.0")
+        cudnn_prefill._cudnn_frontend_version.cache_clear()
+        assert (
+            cudnn_prefill._cudnn_supports_shape_override() is True
+        )  # backend plans honor overrides on 1.29
+    finally:
+        cudnn_prefill._cudnn_frontend_version.cache_clear()
 
 
 @requires_override
