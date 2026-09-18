@@ -1535,7 +1535,6 @@ def _launch_mla_decode(
     workspace: _MLAWorkspaceViews,
     compiled: Callable[..., object],
     balanced_plan: Any = None,
-    uses_extended_2cta_abi: bool = True,
 ) -> torch.Tensor:
     """Form the dimension-first views and launch one compiled MLA kernel."""
 
@@ -1792,7 +1791,6 @@ def prims_ts_batch_mla_decode_with_kv_cache(
         split_kv=spec.split_kv,
         workspace=workspace,
         compiled=compiled,
-        uses_extended_2cta_abi=dict(spec.policy)["kernel"] == "throughput_2cta",
     )
 
 
@@ -2303,6 +2301,18 @@ class BatchMLADecodePagedTSWrapper:
         backend mode (such as DCP) that requires LSE. CSR token indices or a
         page-size-1 cache require a separate adapter rather than direct
         substitution.
+
+        Raises
+        ------
+        TypeError
+            If an expected sequence-length declaration is not an integer.
+        ValueError
+            If a supported auto-selection configuration is missing an
+            expected length declaration, or if a declaration is invalid or
+            inconsistent with the other declaration.
+        NotImplementedError
+            If the gate selects balanced execution but the exact CUDA device
+            has no registered balanced cost-model calibration.
         """
 
         use_balanced = should_use_prims_ts_balanced_mla(
