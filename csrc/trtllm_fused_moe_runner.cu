@@ -25,6 +25,7 @@
 #include "flashinfer/trtllm/fused_moe/RoutingKernel.h"
 #include "flashinfer/trtllm/fused_moe/runner.h"
 #include "tensorrt_llm/common/envUtils.h"
+#include "tensorrt_llm/kernels/nvfp4Recipe.h"
 #include "tensorrt_llm/kernels/quantization.h"
 
 namespace tensorrt_llm {
@@ -746,18 +747,19 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
                          btg::sfLayoutToString(sfLayoutB));
     }
 
-    float globalScaleInv = 1.f / (448.f * 6.f);
-    if (tensorrt_llm::common::getEnvNVFP4Use4Over6() &&
-        tensorrt_llm::common::getEnvNVFP44Over6E4M3Use256()) {
-      globalScaleInv = 1.f / (256.f * 6.f);
-    }
+    // One NVFP4RecipeSpec per launch feeds both the runtime globalScaleInv and the
+    // compile-time e4m3Max, so they cannot desync.
+    // TODO(aleozlx, #5141): thread a caller-supplied recipe code through the
+    // trtllm_fp4_block_scale_moe FFI; until then this runner resolves from the env.
+    auto const recipe =
+        tensorrt_llm::kernels::resolveNVFP4Recipe(tensorrt_llm::kernels::kNVFP44Over6FromEnv);
     invokeNvfp4QuantAndPerTokenScale<__nv_bfloat16>(
         args.num_tokens * totalExpertsPerToken, args.intermediate_size,
-        reinterpret_cast<__nv_bfloat16 const*>(workspace.gemm1_output), globalScaleInv,
+        reinterpret_cast<__nv_bfloat16 const*>(workspace.gemm1_output), recipe.globalScaleInv(),
         workspace.expanded_idx_to_permuted_idx,
         reinterpret_cast<uint8_t*>(workspace.activation_output),
         reinterpret_cast<uint8_t*>(workspace.activation_output_scale),
-        reinterpret_cast<float*>(workspace.token_scales_fc2), sfLayout, stream, enable_pdl);
+        reinterpret_cast<float*>(workspace.token_scales_fc2), sfLayout, recipe, stream, enable_pdl);
 
     gemm2_input = workspace.activation_output;
     gemm2_input_scale = workspace.activation_output_scale;

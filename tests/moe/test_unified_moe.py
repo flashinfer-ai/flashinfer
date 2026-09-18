@@ -105,7 +105,35 @@ from flashinfer.tllm_enums import (
     Fp8QuantizationType,
     WeightLayout,
 )
+from flashinfer.quantization.nvfp4_quantization_utils import (
+    NVFP44Over6Config,
+    _UNSET,
+    nvfp4_4over6_cache_key,
+)
 from flashinfer.utils import get_compute_capability
+
+# The explicit states of QuantConfig.nvfp4_4over6 (the field's default, an
+# unset sentinel, is the third: "read the environment").  ``None`` (off) and
+# an explicit config are only legal with activation=QuantFormat.NVFP4 (see
+# TestQuantConfig below), so this list is used with NVFP4 configs.
+NVFP4_4OVER6_SETTINGS = [
+    None,
+    NVFP44Over6Config(),
+    NVFP44Over6Config(e4m3_max=256, err_mode="MSE", err_use_fast_math=True),
+]
+
+NVFP4_4OVER6_ENV_VARS = (
+    "FLASHINFER_NVFP4_4OVER6",
+    "FLASHINFER_NVFP4_4OVER6_ERR_MODE",
+    "FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH",
+    "FLASHINFER_NVFP4_4OVER6_E4M3_USE_256",
+)
+
+
+def _clear_4over6_env(monkeypatch) -> None:
+    """Delete every 4over6 variable so ambient shell state cannot skew a test."""
+    for name in NVFP4_4OVER6_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
 
 
 def _build_direct_runner(runner_type, config, device):
@@ -411,6 +439,63 @@ class TestReprRoundTrip:
         ):
             assert _eval_repr(cfg) == cfg
 
+    @pytest.mark.parametrize("setting", NVFP4_4OVER6_SETTINGS, ids=repr)
+    def test_quant_config_nvfp4_4over6(self, setting):
+        """Every explicit 4over6 setting must survive repr/eval.
+
+        This is why ``NVFP44Over6Config`` and ``NVFP44Over6ErrMode`` carry a
+        hand-written ``__repr__`` and why
+        ``flashinfer/fused_moe/api.py`` imports the two type names it never
+        calls — ``_eval_repr`` evaluates in that module's namespace.
+        """
+        cfg = QuantConfig(
+            weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4, nvfp4_4over6=setting
+        )
+        assert _eval_repr(cfg) == cfg
+
+    def test_quant_config_repr_keeps_none_but_elides_unset(self):
+        """``None`` means 4over6 off; the unset default is not emitted.
+
+        Eliding ``None`` would make ``eval(repr(cfg))`` return an unset config,
+        which compares unequal to the original.
+        """
+        axes = (
+            "weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4, "
+            "output=QuantFormat.BF16"
+        )
+        assert repr(
+            QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4)
+        ) == (f"QuantConfig({axes})")
+        assert (
+            repr(
+                QuantConfig(
+                    weight=QuantFormat.NVFP4,
+                    activation=QuantFormat.NVFP4,
+                    nvfp4_4over6=None,
+                )
+            )
+            == f"QuantConfig({axes}, nvfp4_4over6=None)"
+        )
+
+    @pytest.mark.parametrize("setting", NVFP4_4OVER6_SETTINGS, ids=repr)
+    def test_moe_config_with_nvfp4_4over6(self, setting):
+        """The setting must round-trip through a whole MoEConfig too."""
+        cfg = MoEConfig(
+            routing=RoutingConfig(num_experts=32, top_k=2),
+            quant=QuantConfig(
+                weight=QuantFormat.NVFP4,
+                activation=QuantFormat.NVFP4,
+                nvfp4_4over6=setting,
+            ),
+            experts=ExpertConfig(intermediate_size=512),
+            activation=SwiGLU(),
+            backend=BackendOptions(candidates=(CuteDslConfig(),)),
+        )
+        assert _eval_repr(cfg) == cfg
+        # MoEConfig is used as a dict key elsewhere in this file; the new field
+        # must not make it unhashable.
+        assert hash(cfg) == hash(_eval_repr(cfg))
+
     def test_activation_config(self):
         for cfg in (
             SwiGLU(),
@@ -635,6 +720,68 @@ class TestQuantConfig:
             cfg, weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8
         )
         assert changed.pair == (QuantFormat.MXFP4, QuantFormat.MXFP8)
+
+    def test_nvfp4_4over6_defaults_to_unset(self):
+        assert QuantConfig().nvfp4_4over6 is _UNSET
+        assert "nvfp4_4over6" not in repr(QuantConfig())
+
+    @pytest.mark.parametrize("activation", list(QuantFormat))
+    def test_unset_is_legal_on_every_activation_format(self, activation):
+        """The default must not break a single existing non-NVFP4 config."""
+        cfg = QuantConfig(activation=activation)
+        assert cfg.nvfp4_4over6 is _UNSET
+        assert _eval_repr(cfg) == cfg
+
+    @pytest.mark.parametrize(
+        "activation", [f for f in QuantFormat if f is not QuantFormat.NVFP4]
+    )
+    @pytest.mark.parametrize(
+        "setting",
+        [
+            None,
+            NVFP44Over6Config(),
+            NVFP44Over6Config(e4m3_max=256, err_mode="MSE"),
+        ],
+        ids=repr,
+    )
+    def test_explicit_4over6_rejected_on_non_nvfp4_activation(
+        self, activation, setting
+    ):
+        """A cross-field mistake must name itself, not vanish.
+
+        Raised in ``__post_init__`` rather than a runner's ``_check_support``
+        on purpose: ``MoELayer`` swallows support-check exceptions to filter
+        backends, so this would otherwise surface as "no backend available".
+        The recipe governs activation quantization, so the weight axis may be
+        NVFP4 (W4A16) and the config is still rejected.
+        """
+        with pytest.raises(ValueError, match=r"activation=QuantFormat\.NVFP4"):
+            QuantConfig(
+                weight=QuantFormat.NVFP4, activation=activation, nvfp4_4over6=setting
+            )
+
+    @pytest.mark.parametrize("bogus", ["auto", 3, 1.5, ["MAE"]])
+    def test_bogus_4over6_rejected_where_it_is_written(self, bogus):
+        """Type errors surface at config construction, not at kernel launch."""
+        with pytest.raises(TypeError, match="nvfp4_4over6"):
+            QuantConfig(
+                weight=QuantFormat.NVFP4,
+                activation=QuantFormat.NVFP4,
+                nvfp4_4over6=bogus,
+            )
+
+    @pytest.mark.parametrize("setting", NVFP4_4OVER6_SETTINGS, ids=repr)
+    def test_quant_config_stays_hashable(self, setting):
+        cfg = QuantConfig(
+            weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4, nvfp4_4over6=setting
+        )
+        assert hash(cfg) == hash(
+            QuantConfig(
+                weight=QuantFormat.NVFP4,
+                activation=QuantFormat.NVFP4,
+                nvfp4_4over6=setting,
+            )
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1307,6 +1454,33 @@ class TestMoERunnerSupport:
         with pytest.raises(NotImplementedError, match=r"W4A8.*SM107"):
             runner.check_support()
 
+    def test_cute_dsl_pinned_4over6_requires_per_token_scale(self):
+        """The guard lives in _check_support(), so it fires on every device.
+
+        Without per-token scales GEMM1's NVFP4 epilogue produces the GEMM2
+        input and has no 4over6 variant; a pinned recipe must be refused, not
+        silently dropped.  ``None`` (off) is what that path already does.
+        """
+        runner = CuteDslRunner.__new__(CuteDslRunner)
+        runner.config = self._nvfp4_swiglu(
+            quant=QuantConfig(
+                weight=QuantFormat.NVFP4,
+                activation=QuantFormat.NVFP4,
+                nvfp4_4over6=NVFP44Over6Config(),
+            )
+        )
+        with pytest.raises(NotImplementedError, match="per_token_scale=True"):
+            runner.check_support()
+
+        runner.config = self._nvfp4_swiglu(
+            quant=QuantConfig(
+                weight=QuantFormat.NVFP4,
+                activation=QuantFormat.NVFP4,
+                nvfp4_4over6=None,
+            )
+        )
+        assert runner.check_support() is None
+
     def test_cute_dsl_w4a8_requires_fused_finalize(self):
         runner = CuteDslRunner.__new__(CuteDslRunner)
         runner.config = self._nvfp4_swiglu(
@@ -1705,6 +1879,121 @@ class TestMoERunnerSupport:
             NotImplementedError, match="declares no supported activation classes"
         ):
             runner.check_support()
+
+
+def _make_4over6_runner_class(supports: bool):
+    """A minimal concrete MoERunner that only varies in 4over6 support."""
+
+    class _Runner(MoERunner):
+        backend_key = "fake_4over6" if supports else "fake_env_only"
+        supported_quant_variants = ((QuantFormat.NVFP4, QuantFormat.NVFP4),)
+        supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
+        supported_activation_classes = (SwiGLU,)
+        supports_nvfp4_4over6 = supports
+
+        def __init__(self, config, device=None):
+            super().__init__()
+            self.config = config
+            self.device = device
+
+        def get_valid_tactics(self, inputs, profile):
+            return []
+
+        def forward(self, inputs, **kwargs):
+            return None
+
+    return _Runner
+
+
+class TestRunner4Over6Support:
+    """``MoERunner.supports_nvfp4_4over6`` is an opt-in, and silence is a bug.
+
+    A backend whose activation quantizer still reads
+    ``FLASHINFER_NVFP4_4OVER6*`` directly cannot honor a pinned recipe.
+    Accepting one and quantizing with whatever the environment happens to say
+    is the exact failure mode issue #5141 exists to remove, so the runner must
+    refuse loudly.
+    """
+
+    @staticmethod
+    def _config(setting, **overrides):
+        base = dict(
+            routing=RoutingConfig(num_experts=32, top_k=2),
+            quant=QuantConfig(
+                weight=QuantFormat.NVFP4,
+                activation=QuantFormat.NVFP4,
+                nvfp4_4over6=setting,
+            ),
+            experts=ExpertConfig(intermediate_size=512),
+            activation=SwiGLU(),
+        )
+        base.update(overrides)
+        return MoEConfig(**base)
+
+    def test_base_default_is_opt_out(self):
+        """Default False: a new runner cannot accidentally claim support."""
+        assert MoERunner.supports_nvfp4_4over6 is False
+
+    @pytest.mark.parametrize("setting", NVFP4_4OVER6_SETTINGS, ids=repr)
+    def test_unsupporting_runner_rejects_explicit_recipe(self, setting):
+        runner_cls = _make_4over6_runner_class(supports=False)
+        runner = runner_cls(self._config(setting))
+        with pytest.raises(NotImplementedError, match="nvfp4_4over6"):
+            runner.check_support()
+
+    def test_unsupporting_runner_accepts_unset(self):
+        """Reading the environment is what every backend already does — stay silent."""
+        runner_cls = _make_4over6_runner_class(supports=False)
+        runner = runner_cls(self._config(_UNSET))
+        assert runner.check_support() is None
+
+    @pytest.mark.parametrize("setting", NVFP4_4OVER6_SETTINGS + [_UNSET], ids=repr)
+    def test_supporting_runner_accepts_every_state(self, setting):
+        runner_cls = _make_4over6_runner_class(supports=True)
+        runner = runner_cls(self._config(setting))
+        assert runner.check_support() is None
+
+    @pytest.mark.parametrize("setting", [None, NVFP44Over6Config()], ids=repr)
+    def test_trtllm_fp4_runner_rejects_explicit_recipe(self, setting):
+        """The real env-only backend, not just the synthetic one."""
+        runner = TrtllmFp4RoutedRunner.__new__(TrtllmFp4RoutedRunner)
+        runner.config = self._config(setting)
+        runner.device = torch.device("cuda")
+        with pytest.raises(NotImplementedError, match="nvfp4_4over6"):
+            runner.check_support()
+
+    def test_moe_layer_names_the_setting_when_no_backend_can_honor_it(
+        self, monkeypatch
+    ):
+        """A pinned recipe nobody implements must be diagnosable.
+
+        ``MoELayer`` catches ``NotImplementedError`` from ``check_support()``
+        to filter backends, so without deliberate reporting the user sees only
+        "none of the configured backends are usable on arch sm100" — with no
+        hint that the 4over6 recipe is what disqualified them.  The whole point
+        of the field is to replace a silent environment read with a loud
+        contract, so the message must name ``nvfp4_4over6``.
+        """
+        from flashinfer.fused_moe import layer as layer_mod
+
+        monkeypatch.setattr(layer_mod, "get_compute_capability", lambda _: (10, 0))
+        monkeypatch.setitem(
+            layer_mod._BACKEND_RUNNERS,
+            CuteDslConfig,
+            _make_4over6_runner_class(supports=False),
+        )
+        config = self._config(
+            NVFP44Over6Config(),
+            backend=BackendOptions(candidates=(CuteDslConfig(),)),
+        )
+        with pytest.raises((RuntimeError, NotImplementedError)) as excinfo:
+            MoELayer(config, device=torch.device("cuda"))
+        assert "nvfp4_4over6" in str(excinfo.value), (
+            "MoELayer dropped the reason each backend was rejected. "
+            "flashinfer/fused_moe/layer.py must collect the check_support() "
+            "messages it swallows and include them in the RuntimeError, or a "
+            "pinned 4over6 recipe fails as an unexplained 'no usable backend'."
+        )
 
 
 class TestBuiltInRunnerLifecycle:
@@ -4054,6 +4343,153 @@ def test_quant_variant_changes_both_cache_keys(
     other = _cache_key_runner(runner_cls, _cache_key_config(backend_cfg, alt_variant))
     assert hash(base) != hash(other)
     assert str(base.get_cache_key_extras([])) != str(other.get_cache_key_extras([]))
+
+
+# ---------------------------------------------------------------------------
+# 4over6 in the tactic cache key
+# ---------------------------------------------------------------------------
+# The recipe changes the quantized activation values a tactic is timed and
+# ranked on, and nothing else in the extras tuple reflects it. Both halves
+# matter: an explicit recipe must separate from ``None`` (off), and an unset
+# field must resolve before it is keyed — otherwise two processes with opposite
+# FLASHINFER_NVFP4_4OVER6 settings write the same ``file_key`` to disk.
+
+
+def _nvfp4_cache_key_config(setting, **overrides):
+    """``_cache_key_config`` for TRT-LLM FP4, with a 4over6 setting attached."""
+    return _cache_key_config(
+        TrtllmFp4Config(),
+        QuantConfig(
+            weight=QuantFormat.NVFP4,
+            activation=QuantFormat.NVFP4,
+            nvfp4_4over6=setting,
+        ),
+        **overrides,
+    )
+
+
+def _extras_for(setting, **overrides):
+    """Build a fresh runner and return its (memory, on-disk) key pair.
+
+    Fresh every time on purpose: ``MoERunner._nvfp4_4over6_key`` is a
+    ``functools.cached_property``, so one instance cannot observe two different
+    environments.
+    """
+    runner = _cache_key_runner(
+        TrtllmFp4RoutedRunner, _nvfp4_cache_key_config(setting, **overrides)
+    )
+    return hash(runner), str(runner.get_cache_key_extras([]))
+
+
+def test_off_and_explicit_recipe_have_different_cache_keys(monkeypatch):
+    _clear_4over6_env(monkeypatch)
+    standard = _extras_for(None)
+    enabled = _extras_for(NVFP44Over6Config())
+    assert standard[0] != enabled[0], (
+        "None and NVFP44Over6Config() share a runner_hash, so one in-memory "
+        "tuned tactic would serve both recipes."
+    )
+    assert standard[1] != enabled[1], (
+        "None and NVFP44Over6Config() share a persisted cache key, so the "
+        "on-disk tactic (which drops runner_hash) collides."
+    )
+
+
+@pytest.mark.parametrize(
+    "a,b",
+    [
+        (NVFP44Over6Config(), NVFP44Over6Config(e4m3_max=256)),
+        (NVFP44Over6Config(), NVFP44Over6Config(err_mode="MSE")),
+        (NVFP44Over6Config(), NVFP44Over6Config(err_use_fast_math=True)),
+    ],
+    ids=["e4m3_max", "err_mode", "err_use_fast_math"],
+)
+def test_every_recipe_field_changes_both_cache_keys(monkeypatch, a, b):
+    _clear_4over6_env(monkeypatch)
+    assert _extras_for(a) != _extras_for(b)
+
+
+def test_unset_cache_key_follows_the_environment(monkeypatch):
+    """An unset field must be *resolved* before it lands in the key.
+
+    The sentinel's ``str`` renders identically in a process running with
+    ``FLASHINFER_NVFP4_4OVER6=1`` and one running without it, so keying the
+    unresolved setting would let a tactic tuned for 4over6 be replayed for
+    standard NVFP4 (and vice versa) through the on-disk cache.
+    """
+    _clear_4over6_env(monkeypatch)
+    env_off = _extras_for(_UNSET)
+
+    monkeypatch.setenv("FLASHINFER_NVFP4_4OVER6", "1")
+    env_on = _extras_for(_UNSET)
+
+    assert env_off[0] != env_on[0]
+    assert env_off[1] != env_on[1]
+
+    # ... and each must agree with the pinned recipe it resolves to, so a
+    # process that pins the recipe reuses the tactics an env-driven process
+    # tuned rather than re-tuning from scratch.
+    assert env_on == _extras_for(NVFP44Over6Config())
+    monkeypatch.delenv("FLASHINFER_NVFP4_4OVER6")
+    assert env_off == _extras_for(None)
+
+
+def test_unset_cache_key_tracks_every_environment_variable(monkeypatch):
+    _clear_4over6_env(monkeypatch)
+    monkeypatch.setenv("FLASHINFER_NVFP4_4OVER6", "1")
+    base = _extras_for(_UNSET)
+    for name, value, pinned in (
+        ("FLASHINFER_NVFP4_4OVER6_ERR_MODE", "MSE", {"err_mode": "MSE"}),
+        (
+            "FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH",
+            "1",
+            {"err_use_fast_math": True},
+        ),
+        ("FLASHINFER_NVFP4_4OVER6_E4M3_USE_256", "1", {"e4m3_max": 256}),
+    ):
+        monkeypatch.setenv(name, value)
+        varied = _extras_for(_UNSET)
+        assert varied != base, f"{name} does not reach the tactic cache key"
+        assert varied == _extras_for(NVFP44Over6Config(**pinned))
+        monkeypatch.delenv(name)
+
+
+def test_4over6_cache_key_element_is_the_canonical_token(monkeypatch):
+    """The keyed element is the shared ``nvfp4_4over6_cache_key`` string.
+
+    A plain ``str`` (not the enum or the dataclass) because
+    ``ProfilingCacheKey.file_key`` stringifies the extras and writes them to
+    disk; reusing the canonical token keeps that file key aligned with the
+    CuTe-DSL kernel-artifact name for the same recipe.
+    """
+    _clear_4over6_env(monkeypatch)
+    for setting, resolved in (
+        (None, None),
+        (NVFP44Over6Config(), NVFP44Over6Config()),
+        (
+            NVFP44Over6Config(e4m3_max=256, err_mode="MSE", err_use_fast_math=True),
+            NVFP44Over6Config(e4m3_max=256, err_mode="MSE", err_use_fast_math=True),
+        ),
+    ):
+        runner = _cache_key_runner(
+            TrtllmFp4RoutedRunner, _nvfp4_cache_key_config(setting)
+        )
+        extras = runner.get_cache_key_extras([])
+        token = nvfp4_4over6_cache_key(resolved)
+        assert token in extras, (
+            f"expected the canonical token {token!r} in the cache-key extras "
+            f"for nvfp4_4over6={setting!r}, got {extras!r}"
+        )
+        assert all(
+            isinstance(e, (int, float, str, bool, tuple, type(None))) for e in extras
+        )
+
+
+def test_4over6_does_not_split_the_key_for_identical_configs(monkeypatch):
+    """Guard the opposite failure: over-keying makes every layer re-tune."""
+    _clear_4over6_env(monkeypatch)
+    for setting in (_UNSET, None, NVFP44Over6Config()):
+        assert _extras_for(setting) == _extras_for(setting)
 
 
 @pytest.mark.parametrize("runner_cls,backend_cfg,variant,alt_variant", _RUNNERS)

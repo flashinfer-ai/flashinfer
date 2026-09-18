@@ -41,6 +41,12 @@ from ..autotuner import (
     TunableRunner,
     TuningConfig,
 )
+from ..quantization.nvfp4_quantization_utils import (
+    _UNSET,
+    NVFP44Over6Config,
+    nvfp4_4over6_cache_key,
+    resolve_nvfp4_4over6,
+)
 from ..utils import next_positive_power_of_2, round_up
 from .api import (
     _CUTLASS_BF16_ARCHS,
@@ -475,6 +481,9 @@ class MoERunner(TunableRunner):
     # Cleared by backends whose kernels cannot map global expert ids onto a
     # local shard (local_expert_offset / local_num_experts != num_experts).
     supports_expert_parallelism: ClassVar[bool] = True
+    # Set to True only by runners that thread QuantConfig.nvfp4_4over6 into
+    # their activation quantizer instead of letting it read the environment.
+    supports_nvfp4_4over6: ClassVar[bool] = False
 
     config: MoEConfig
 
@@ -562,6 +571,7 @@ class MoERunner(TunableRunner):
             )
         self._assert_shared_experts_supported()
         self._assert_expert_parallelism_supported()
+        self._assert_nvfp4_4over6_supported()
         self._check_activation_parameters()
 
     def _check_activation_parameters(self) -> None:
@@ -575,6 +585,24 @@ class MoERunner(TunableRunner):
                 f"{type(self).__name__} does not support fused shared experts "
                 f"(num_fused_shared_experts={s})."
             )
+
+    def _assert_nvfp4_4over6_supported(self) -> None:
+        """Reject an explicit 4over6 recipe on a backend that has not opted in.
+
+        Silence is the contract only for an unset field.  A pinned
+        recipe that the backend would quietly ignore is the exact failure mode
+        the field exists to eliminate, so it must be loud.
+        """
+        setting = self.config.quant.nvfp4_4over6
+        if setting is _UNSET or self.supports_nvfp4_4over6:
+            return
+        raise NotImplementedError(
+            f"{type(self).__name__} cannot honor an explicit "
+            f"QuantConfig.nvfp4_4over6={setting!r}: its activation quantizer "
+            "reads the FLASHINFER_NVFP4_4OVER6* environment variables "
+            "directly. Leave the field unset to use them, or "
+            "select a backend that implements it."
+        )
 
     def _assert_expert_parallelism_supported(self) -> None:
         """Reject EP shards for backends that cannot compute a local expert subset."""
@@ -610,6 +638,23 @@ class MoERunner(TunableRunner):
             raise RuntimeError(
                 f"{type(self).__name__}.build() must be called before execution."
             )
+
+    @functools.cached_property
+    def _nvfp4_4over6_key(self) -> str:
+        """The *resolved* 4over6 recipe as a cache-key token.
+
+        Resolved, because ``ProfilingCacheKey.file_key`` stringifies the extras:
+        an unset field would key identically in two processes with opposite
+        ``FLASHINFER_NVFP4_4OVER6`` settings. Cached because ``__hash__`` runs
+        on every autotuner lookup; flipping the environment mid-process does
+        not re-key. ``"n/a"`` for non-NVFP4 activations, so the environment
+        does not leak into BF16 / FP8 tactic keys.
+        """
+        if self.config.quant.activation is not QuantFormat.NVFP4:
+            return "n/a"
+        return nvfp4_4over6_cache_key(
+            resolve_nvfp4_4over6(self.config.quant.nvfp4_4over6)
+        )
 
     # Anything the profiled tensor shapes cannot reveal has to be listed here.
     # One stable tuple feeds both __hash__ (in-memory) and the persisted key,
@@ -647,6 +692,12 @@ class MoERunner(TunableRunner):
             # Declared quant flags are keyed before runners begin consuming them.
             self.config.quant.per_token_scale,
             self.config.quant.swizzled_scale_factors,
+            # The 4over6 recipe changes the quantized values a tactic is timed
+            # and ranked on, and nothing else in this tuple reflects it: before
+            # this entry, tuning with FLASHINFER_NVFP4_4OVER6=1 and then running
+            # with it off replayed the stale tactic, and the persisted key
+            # collided across processes as well.
+            self._nvfp4_4over6_key,
         )
 
     def __hash__(self) -> int:
@@ -3931,6 +3982,10 @@ class CuteDslRunner(MoERunner):
         (QuantFormat.NVFP4, QuantFormat.BF16),
     )
     supported_activation_classes = (SwiGLU, GeGLUTanh, ReLU2, SiTU)
+    # The GEMM2 input is quantized by nvfp4_quantize_per_token_cute_dsl, which
+    # takes the recipe as an argument; _check_support() below narrows this to
+    # the per-token path, the only one that runs that quantizer.
+    supports_nvfp4_4over6 = True
 
     def _check_support(self) -> None:
         super()._check_support()
@@ -3963,6 +4018,21 @@ class CuteDslRunner(MoERunner):
 
             if get_compute_capability(self.device) == (10, 7):
                 raise NotImplementedError("CuTe-DSL W4A8 does not support SM107.")
+        if (
+            isinstance(self.config.quant.nvfp4_4over6, NVFP44Over6Config)
+            and not self.config.quant.per_token_scale
+        ):
+            # Without per-token activation scales the GEMM2 input is produced
+            # by GEMM1's NVFP4 epilogue, which has no 4over6 variant. Only a
+            # pinned recipe is rejected: ``None`` (4over6 off) is exactly what
+            # that path already does, since it never reads the environment.
+            raise NotImplementedError(
+                f"{type(self).__name__} honors a pinned QuantConfig.nvfp4_4over6 "
+                "only with per_token_scale=True, the one path where it quantizes "
+                "the GEMM2 input itself (nvfp4_quantize_per_token_cute_dsl). "
+                "Otherwise GEMM1's epilogue emits NVFP4 directly and has no "
+                "4over6 variant."
+            )
         self._assert_rubin_cute_dsl_available()
 
     def _assert_rubin_cute_dsl_available(self) -> None:
@@ -4029,6 +4099,7 @@ class CuteDslRunner(MoERunner):
         self.config = config
         self.device = torch.device(device)
         self._inner: Any = None
+        self._forward_kwargs: dict[str, Any] = {}
         self.tuning_config = TuningConfig()
 
     def _build(self) -> None:
@@ -4081,6 +4152,16 @@ class CuteDslRunner(MoERunner):
             raise NotImplementedError(
                 f"CuteDslRunner does not support {self.config.quant}."
             )
+        # Forwarded only when the caller pinned a recipe, so the default path
+        # stays byte-identical to the pre-existing env-driven behaviour (the
+        # same "only forward an explicit value" rule use_fused_finalize follows).
+        # It rides on **kwargs through the inner tuning runner and lands on
+        # _cute_dsl_fused_moe_nvfp4_impl.
+        self._forward_kwargs = (
+            {}
+            if self.config.quant.nvfp4_4over6 is _UNSET
+            else {"nvfp4_4over6": self.config.quant.nvfp4_4over6}
+        )
         # tuning_config is an instance attribute on the inner runner (its
         # dummy expert-id span depends on num_experts/offset), so read it from
         # the instance we just built, not off the class.
@@ -4105,7 +4186,11 @@ class CuteDslRunner(MoERunner):
     ) -> torch.Tensor:
         self._require_built()
         return self._inner.forward(
-            inputs, tactic=tactic, do_preparation=do_preparation, **kwargs
+            inputs,
+            tactic=tactic,
+            do_preparation=do_preparation,
+            **self._forward_kwargs,
+            **kwargs,
         )
 
     def pack_inputs(
