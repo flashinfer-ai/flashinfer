@@ -6871,6 +6871,7 @@ class GvrRegClusKernel:
         paged: bool = False,
         page_shift: int = 0,
         pt_smem: int = 0,
+        stage_out: bool = False,
     ):
         assert blk == BLKC, "all instantiations BLK=BLKC=1024"
         assert vpt in (1, 2, 4) and cs in (2, 4, 8)
@@ -6878,6 +6879,13 @@ class GvrRegClusKernel:
         self.vpt = vpt
         self.cs = cs
         self.pdl = bool(pdl)
+        # staged coalesced output: every rank writes its winners into rank 0's
+        # k-word staging region (DSMEM stores, tail of the dynamic window after
+        # the page-table row) and rank 0 writes the row in one coalesced pass
+        # after the final cluster rendezvous, applying the paged transform
+        # there. Replaces the per-winner scattered global stores (one L1 store
+        # sector each, with the page-table read inline when paged).
+        self.stage_out = bool(stage_out)
         # per-row varlen mode (production heuristicTopKDecode contract, same
         # semantics as GvrMainKernel): n is re-derived PER ROW in-kernel from
         # a device kv_lens tensor; the scalar n launch arg becomes the
@@ -6929,6 +6937,18 @@ class GvrRegClusKernel:
                 v & cutlass.Int32((1 << ps) - 1)
             )
         return self._ox_g(pre_idx, v)
+
+    def _emit(self, out_row, pos, v, pre_idx, s_pt, stage_addr):
+        """Winner store at position `pos`: into rank 0's staging region (stage_out;
+        the transform is applied by the epilogue) or straight to the row."""
+        if self.stage_out:
+            _st_shared_cluster_i32(
+                _mapa_shared_cluster_addr(stage_addr + (pos << cutlass.Int32(2)), cutlass.Int32(0)),
+                v,
+            )
+        else:
+            out_row[pos] = self._ox(pre_idx, s_pt, v)
+
     @cute.kernel
     def kern(
         self,
@@ -7050,6 +7070,8 @@ class GvrRegClusKernel:
         tval = cutlass.Float32(_NEG_INF__regclus)
         LOQ = cutlass.Float32(0.0)
         qv = cutlass.Float32(0.0)
+        jo = cutlass.Int32(0)
+        vo = cutlass.Int32(0)
 
         if short == cutlass.Int32(0):
             npad = cutlass.Int32(logits.shape[1])  # noqa: F841
@@ -7101,6 +7123,21 @@ class GvrRegClusKernel:
                         ent = pre_idx[req_pt, jp]
                     s_pt[jp] = ent
                     jp = jp + cutlass.Int32(BLK)
+            # ---- staged output: k words after the page-table row, in rank 0's
+            # window (peers reach it through mapa); rank 0 clears it before the
+            # first cluster rendezvous, so every remote winner store lands later
+            stage_addr = sbase + cutlass.Int32(SMEM_BYTES + 4 * self.pt_smem)
+            s_out = s_ci  # placeholder view when the output is not staged
+            if cutlass.const_expr(self.stage_out):
+                s_out = cute.make_tensor(
+                    cute.make_ptr(cutlass.Int32, stage_addr, cute.AddressSpace.smem, assumed_align=16),
+                    cute.make_layout((k,)),
+                )
+                if rank == cutlass.Int32(0):
+                    jo = tid
+                    while jo < k:
+                        s_out[jo] = cutlass.Int32(-1)
+                        jo = jo + cutlass.Int32(BLK)
 
             n4 = n >> cutlass.Int32(2)
             ntail = n - (n4 << cutlass.Int32(2))
@@ -7264,7 +7301,7 @@ class GvrRegClusKernel:
                             (base4 + tid + cutlass.Int32((s // 4) * self.blk)) << cutlass.Int32(2)
                         ) + cutlass.Int32(s % 4)
                         if p < lim1:
-                            out_row[p] = self._ox(pre_idx, s_pt, idx)
+                            self._emit(out_row, p, idx, pre_idx, s_pt, stage_addr)
                         else:
                             if whole == cutlass.Int32(0):
                                 # crossing overflow -> striped DSMEM slabs; TWO
@@ -7285,7 +7322,7 @@ class GvrRegClusKernel:
                     bn = _umin_u32__regclus(f2u_rz(qv), cutlass.Uint32(NB__regclus - 1))
                     p = atomic_add_cta(s_mrg.iterator + cutlass.Int32(bn), cutlass.Int32(1))
                     if p < lim1:
-                        out_row[p] = self._ox(pre_idx, s_pt, tix)
+                        self._emit(out_row, p, tix, pre_idx, s_pt, stage_addr)
                     else:
                         if whole == cutlass.Int32(0):
                             q2i = p - above
@@ -7326,7 +7363,7 @@ class GvrRegClusKernel:
                                     rnk = rnk + tinc
                                     j = j + cutlass.Int32(1)
                                 if rnk < need:
-                                    out_row[above + rnk] = self._ox(pre_idx, s_pt, s_ci[i])
+                                    self._emit(out_row, above + rnk, s_ci[i], pre_idx, s_pt, stage_addr)
                                 i = i + cutlass.Int32(BLK)
                         else:
                             # (2) key-space narrowing over striped DSMEM slabs:
@@ -7477,10 +7514,10 @@ class GvrRegClusKernel:
                                 p2e = b2 + popc(n2 & lml)
                                 if q1f == cutlass.Int32(1):
                                     if p1e < aboveC:
-                                        out_row[above + p1e] = self._ox(pre_idx, s_pt, idv)
+                                        self._emit(out_row, above + p1e, idv, pre_idx, s_pt, stage_addr)
                                 if q2f == cutlass.Int32(1):
                                     if p2e < needC:
-                                        out_row[above + aboveC + p2e] = self._ox(pre_idx, s_pt, idv)
+                                        self._emit(out_row, above + aboveC + p2e, idv, pre_idx, s_pt, stage_addr)
                                 it = it + cutlass.Int32(1)
                     else:
                         # (3) degen safety net: crossing bin larger than the
@@ -7591,15 +7628,27 @@ class GvrRegClusKernel:
                             p2e = b2 + popc(n2 & lml)
                             if q1f == cutlass.Int32(1):
                                 if p1e < nA:
-                                    out_row[p1e] = self._ox(pre_idx, s_pt, i)
+                                    self._emit(out_row, p1e, i, pre_idx, s_pt, stage_addr)
                             if q2f == cutlass.Int32(1):
                                 if p2e < nT:
-                                    out_row[nA + p2e] = self._ox(pre_idx, s_pt, i)
+                                    self._emit(out_row, nA + p2e, i, pre_idx, s_pt, stage_addr)
                             it = it + cutlass.Int32(1)
 
             # ---- P10: FINAL cluster rendezvous — ALL ranks reach it;
-            # keeps peers resident until rank 0 has read their ck/ci.
+            # keeps peers resident until rank 0 has read their ck/ci, and
+            # publishes every rank's staged winner stores to rank 0.
             _cluster_sync_aligned()
+            if cutlass.const_expr(self.stage_out):
+                # coalesced epilogue: rank 0 alone, one pass over the k staged
+                # winners, paged transform applied here
+                if rank == cutlass.Int32(0):
+                    jo = tid
+                    while jo < k:
+                        vo = s_out[jo]
+                        if vo >= cutlass.Int32(0):
+                            vo = self._ox(pre_idx, s_pt, vo)
+                        out_row[jo] = vo
+                        jo = jo + cutlass.Int32(BLK)
 
     # ------------------------------------------------------------------
     @cute.jit
@@ -7613,12 +7662,15 @@ class GvrRegClusKernel:
         stream,
     ):
         b = out.shape[0]
+        smem = SMEM_BYTES + 4 * self.pt_smem
+        if self.stage_out:
+            smem = smem + out.shape[1] * 4  # k-word staging region (rank 0 reads it)
         self.kern(logits, pre_idx, kv_lens, out, n).launch(
             grid=(self.cs, b, 1),
             block=(self.blk, 1, 1),
             cluster=(self.cs, 1, 1),
             stream=stream,
-            smem=SMEM_BYTES + 4 * self.pt_smem,
+            smem=smem,
             min_blocks_per_mp=1,
             use_pdl=self.pdl,
         )
@@ -7641,6 +7693,7 @@ def get_compiled__regclus(
     paged=False,
     page_shift=0,
     pt_smem=0,
+    stage_out=False,
 ):
     """Compile (or fetch) the variant for constexpr tuple (BLK, VPT, CS)."""
     key = (
@@ -7653,6 +7706,7 @@ def get_compiled__regclus(
         bool(paged),
         int(page_shift) if paged else 0,
         int(pt_smem) if paged else 0,
+        bool(stage_out),
         C._compile_arch_token(),
     )
     if paged and not (varlen and hint_free):
@@ -7674,6 +7728,7 @@ def get_compiled__regclus(
             paged=bool(paged),
             page_shift=int(page_shift) if paged else 0,
             pt_smem=int(pt_smem) if paged else 0,
+            stage_out=bool(stage_out),
         )
         nb_, nc_ = cute.sym_int(), cute.sym_int()
         nb2_, nc2_ = cute.sym_int(), cute.sym_int()
@@ -7718,6 +7773,7 @@ def get_compiled__regclus(
                 + ("_hf" if hint_free else "")
                 + (f"_pg{int(page_shift)}" if paged else "")
                 + (f"_pts{int(pt_smem)}" if (paged and pt_smem) else "")
+                + ("_ds" if stage_out else "")
             )
             compiled = C._persist(name, _compile_fn)
         _COMPILE_CACHE__regclus[key] = compiled
