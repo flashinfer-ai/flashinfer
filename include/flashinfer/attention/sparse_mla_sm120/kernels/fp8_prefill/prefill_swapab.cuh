@@ -467,7 +467,7 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
 #pragma unroll
       for (int ih = 0; ih < 2; ih++)
         out_lse[(size_t)s_i * cold.out_lse_stride_elems + h_base + 2 * tid + ih] =
-            scale_output_lse(lse[ih], cold.lse_scale);
+            flashinfer::sparse_mla_sm120::scale_output_lse(lse[ih], cold.lse_scale);
     }
 
     const size_t out_base = ((size_t)s_i * NUM_HEADS + h_base) * D_V;

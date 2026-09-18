@@ -50,6 +50,7 @@ using flashinfer::sparse_mla_sm120::pv_fp8_d2_16x8;
 using flashinfer::sparse_mla_sm120::pv_fp8_d2_16x8_pair;
 using flashinfer::sparse_mla_sm120::qk_bf16_from_fp8_nope_16x8;
 using flashinfer::sparse_mla_sm120::qk_fp8_scale_group_16x8;
+using flashinfer::sparse_mla_sm120::scale_output_lse;
 using flashinfer::sparse_mla_sm120::pipeline::BulkReady;
 using flashinfer::sparse_mla_sm120::pipeline::RoleSync;
 using flashinfer::sparse_mla_sm120::pipeline::SlotRelease;
