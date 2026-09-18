@@ -39,11 +39,13 @@ The BF16 register roles are:
 """
 
 from collections.abc import Callable
+from dataclasses import dataclass
 
 import cutlass
 import cutlass.cute as cute
 
 from cutlass.experimental.task_scheduling.memory import ResourceContext
+from cutlass.experimental.task_scheduling.enums import ScheduleStage
 from cutlass.experimental.task_scheduling.schedule_builder import (
     domain_loop,
     schedule,
@@ -53,8 +55,10 @@ from cutlass.experimental.task_scheduling.resources import StageInfo
 from cutlass.experimental.task_scheduling.task import Task
 
 from .resources import (
+    MlaTsWorkTileInfo,
     MlaWorkQueue,
     WorkThrottleBarrierResource,
+    Dsv4PageOffsetRingResource,
     PageOffsetWindowResource,
     SmemQResource,
     SmemKResource,
@@ -72,8 +76,10 @@ from ..helpers.schedule import (
     staged_pv_mma,
     staged_pv_mma_v_tile,
     staged_pv_mma_v_tile_per_n,
+    staged_pv_mma_v_tile_parity_p,
     staged_qk_mma,
     staged_qk_mma_k_tile,
+    staged_qk_mma_k_tile_from_acquired_s,
     work_queue_tail,
 )
 
@@ -91,10 +97,92 @@ def _fixed_lane_work_tile_bounds(fixed_lane, cumulative_k_parity, actual_domain)
     return mapped_start, fixed_loop_end
 
 
+@dataclass(frozen=True)
+class Dsv4PairRingEvent:
+    """One ownership event in the W9 selector-ring contract.
+
+    Host-only model of the ring state machine: two producer stages per K-tile
+    pair, plus one held consumer stage per operand and pair.
+    """
+
+    kind: str
+    operand: str
+    tile: int
+    pair: int
+    half: int
+    stage: int
+
+
+def dsv4_pair_ring_event_plan(k_tiles: int) -> tuple[Dsv4PairRingEvent, ...]:
+    """Return the W9 pair-ring ownership plan for ``k_tiles`` K128 tiles.
+
+    For pair ``p``, W9 commits identical ``int32[256]`` payloads to K stage
+    ``2*p`` and V stage ``2*p+1`` of the six-stage ring, tile ``2*p`` in half
+    zero and ``2*p+1`` in half one. W12--W15 hold each stage across both tiles
+    and release after the second. HEAD consumes K0; LOOP ``i`` consumes K(i+1)
+    then V(i); TAIL releases K, consumes V(last), releases V.
+    """
+
+    if k_tiles < 0:
+        raise ValueError(f"k_tiles must be non-negative, got {k_tiles}")
+
+    events: list[Dsv4PairRingEvent] = []
+    pair_count = (k_tiles + 1) // 2
+    for pair in range(pair_count):
+        for operand, stage_offset in (("K", 0), ("V", 1)):
+            events.append(
+                Dsv4PairRingEvent(
+                    "produce", operand, pair * 2, pair, 0, (pair * 2 + stage_offset) % 6
+                )
+            )
+
+    if not k_tiles:
+        return tuple(events)
+
+    def append_consumer(kind: str, operand: str, tile: int) -> None:
+        pair, half = divmod(tile, 2)
+        stage_offset = 0 if operand == "K" else 1
+        events.append(
+            Dsv4PairRingEvent(
+                kind, operand, tile, pair, half, (2 * pair + stage_offset) % 6
+            )
+        )
+
+    # HEAD: wait/read the K pair then issue K[0].
+    append_consumer("wait", "K", 0)
+    append_consumer("gather", "K", 0)
+
+    # LOOP: K is deliberately one tile ahead of V.  The K and V selector
+    # stages are independently held for the two halves of their pair.
+    for loop_offset in range(k_tiles - 1):
+        k_tile = loop_offset + 1
+        if k_tile % 2 == 0:
+            append_consumer("wait", "K", k_tile)
+        append_consumer("gather", "K", k_tile)
+        if k_tile % 2 == 1 and k_tile != k_tiles - 1:
+            append_consumer("release", "K", k_tile)
+
+        if loop_offset % 2 == 0:
+            append_consumer("wait", "V", loop_offset)
+        append_consumer("gather", "V", loop_offset)
+        if loop_offset % 2 == 1:
+            append_consumer("release", "V", loop_offset)
+
+    # TAIL: release the final K stage before issuing V[last].
+    append_consumer("release", "K", k_tiles - 1)
+    last_tile = k_tiles - 1
+    if last_tile % 2 == 0:
+        append_consumer("wait", "V", last_tile)
+    append_consumer("gather", "V", last_tile)
+    append_consumer("release", "V", last_tile)
+    return tuple(events)
+
+
 def _capture_clc_work_tile_body(
     work_queue,
     body: Callable[..., None],
     non_skippable_prelude: Callable[[], object] | None = None,
+    non_skippable_control: Callable[[], None] | None = None,
     *,
     use_clc_dynamic: bool = False,
 ) -> None:
@@ -103,13 +191,17 @@ def _capture_clc_work_tile_body(
     Pure register-state initializers may run in ``non_skippable_prelude`` so
     values they create dominate the separately guarded HEAD, LOOP, and TAIL
     regions emitted by the stock skipped-tile executor.  The prelude must not
-    issue memory operations or advance pipeline state.
+    issue memory operations or advance pipeline state. ``non_skippable_control``
+    carries pipeline events that advance once per WorkId even when that tile
+    has no active data work.
     """
 
     def run_body():
         prelude_state = (
             non_skippable_prelude() if non_skippable_prelude is not None else None
         )
+        if non_skippable_control is not None:
+            non_skippable_control()
         if non_skippable_prelude is None:
             body()
         else:
@@ -123,6 +215,8 @@ def _capture_clc_work_tile_body(
             prelude_state = (
                 non_skippable_prelude() if non_skippable_prelude is not None else None
             )
+            if non_skippable_control is not None:
+                non_skippable_control()
             with work_tiles.skippable():
                 if non_skippable_prelude is None:
                     body()
@@ -139,11 +233,287 @@ class MlaClcTask(Task):
     """Stock Task persistent loop with an MLA-specific dynamic K domain."""
 
     @cute.jit
+    def _work_tile_scalars(self, work_tile):
+        """Flatten a runtime MLA work tile into scalar loop-carried values.
+
+        CuTe DSL containers cannot be rebound inside ``scf.while`` once a member
+        is a runtime SSA value, and in-place mutation is not yielded through the
+        loop. Carry the CLC cursor as eight scalars instead.
+        """
+
+        cluster_idx, seq_q_idx, batch_idx, split_kv_idx = work_tile.tile_idx
+        return (
+            cluster_idx,
+            seq_q_idx,
+            batch_idx,
+            split_kv_idx,
+            work_tile.is_valid_tile,
+            work_tile.k_len,
+            work_tile.k_tile_count,
+            work_tile.k_index_base,
+        )
+
+    @cute.jit
+    def _work_tile_from_scalars(
+        self,
+        cluster_idx,
+        seq_q_idx,
+        batch_idx,
+        split_kv_idx,
+        is_valid,
+        k_len,
+        k_tile_count,
+        k_index_base,
+    ):
+        """Materialize a short-lived work-tile value from scalar state."""
+
+        return MlaTsWorkTileInfo(
+            (cluster_idx, seq_q_idx, batch_idx, split_kv_idx),
+            is_valid,
+            k_len,
+            k_tile_count,
+            k_index_base,
+        )
+
+    @cute.jit
+    def _run_clc_work_tile_from_scalars(
+        self,
+        cluster_idx,
+        seq_q_idx,
+        batch_idx,
+        split_kv_idx,
+        is_valid,
+        k_len,
+        k_tile_count,
+        k_index_base,
+        context: ResourceContext | None = None,
+    ) -> None:
+        """Run one CLC tile without carrying a container across the loop."""
+
+        work_tile = self._work_tile_from_scalars(
+            cluster_idx,
+            seq_q_idx,
+            batch_idx,
+            split_kv_idx,
+            is_valid,
+            k_len,
+            k_tile_count,
+            k_index_base,
+        )
+        if cutlass.const_expr(self._has_skip_if):
+            skip_work_tile = self._should_skip_work_tile(work_tile)
+            self._run_task_body_impl(work_tile, skip_work_tile, context)
+        else:
+            self._run_task_body_impl(work_tile, context=context)
+
+    @cute.jit
     def get_domain(self, tile_coord):
         """Recompute the loop bound required by the stock Task public API."""
 
         assert isinstance(self.work_queue, MlaWorkQueue)
         return self.work_queue.k_tile_count_for_tile(tile_coord)
+
+    @cute.jit
+    def _run_task_body_persistent(
+        self,
+        context: ResourceContext | None = None,
+    ) -> None:
+        """Run CLC with an explicitly scalarized MLA work-tile cursor.
+
+        ``MlaTsWorkTileInfo`` carries staged fields once B/S extents are runtime
+        values; rebinding it triggers ``CONTAINER_OBJECT_REPLACED`` and in-place
+        mutation is not yielded through the loop. All eight fields are carried
+        as scalars; the acquire/work/tail protocol is unchanged.
+        """
+
+        assert self.work_queue is not None
+        work_tile = self.work_queue.initial_work_tile_info()
+        self.work_queue._set_consumer_var_from_ts("work_tile", work_tile)
+
+        self._run_pre_work_loop_entries(work_tile, context)
+        (
+            cluster_idx,
+            seq_q_idx,
+            batch_idx,
+            split_kv_idx,
+            is_valid,
+            k_len,
+            k_tile_count,
+            k_index_base,
+        ) = self._work_tile_scalars(
+            self.work_queue._get_consumer_var_from_ts("work_tile")
+        )
+        for resource in self.dst_resources:
+            if cutlass.const_expr(
+                resource.pipeline_config is not None
+                and resource.pipeline_config.advance_on_acquire
+                and not self._is_fork_secondary(resource)
+            ):
+                self._thread_advance_on_acquire_state(resource)
+        while is_valid:
+            self._run_clc_work_tile_from_scalars(
+                cluster_idx,
+                seq_q_idx,
+                batch_idx,
+                split_kv_idx,
+                is_valid,
+                k_len,
+                k_tile_count,
+                k_index_base,
+                context,
+            )
+            (
+                cluster_idx,
+                seq_q_idx,
+                batch_idx,
+                split_kv_idx,
+                is_valid,
+                k_len,
+                k_tile_count,
+                k_index_base,
+            ) = self._work_tile_scalars(
+                self.work_queue._get_consumer_var_from_ts("work_tile")
+            )
+
+        terminal_work_tile = self._work_tile_from_scalars(
+            cluster_idx,
+            seq_q_idx,
+            batch_idx,
+            split_kv_idx,
+            is_valid,
+            k_len,
+            k_tile_count,
+            k_index_base,
+        )
+        self._run_post_work_loop_entries(terminal_work_tile, context)
+        for resource in self.dst_resources:
+            if cutlass.const_expr(
+                resource.pipeline_config is not None
+                and resource is not self.work_queue
+                and not self._is_fork_secondary(resource)
+            ):
+                pipeline_config = resource.pipeline_config
+                assert pipeline_config is not None
+                if cutlass.const_expr(pipeline_config.advance_on_acquire):
+                    self._thread_advance_on_acquire_state(resource)
+                self._producer_tail(resource)
+        if cutlass.const_expr(
+            self.work_queue in self.dst_resources
+            and self.work_queue.pipeline_config is not None
+        ):
+            self.work_queue.producer_tail()
+
+
+class MlaDsv4WholeTileGuardClcTask(MlaClcTask):
+    """Run DSV4 data under one guard between common head and tail entries.
+
+    The generic skipped-tile executor emits separate dynamic guards for the
+    HEAD/LOOP/TAIL regions. Here cursor initialization and the W12--W15
+    throttle form a common head, all data events one guarded region, and
+    WorkQueue progress a common tail, so the common paths are not cloned into
+    active and skipped CFG diamonds.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+
+        # Single-envelope lowering requires common HEAD entries before data
+        # HEAD entries and common TAIL entries after data TAIL entries. Fail
+        # construction if a schedule interleaves either class.
+        seen_data_head = False
+        for is_skippable, _ in self._head_exec_groups:
+            if is_skippable:
+                seen_data_head = True
+            elif seen_data_head:
+                raise ValueError(
+                    "DSV4 whole-tile guard requires a common-head/data-head envelope"
+                )
+        seen_common_tail = False
+        for is_skippable, _ in self._tail_exec_groups:
+            if not is_skippable:
+                seen_common_tail = True
+            elif seen_common_tail:
+                raise ValueError(
+                    "DSV4 whole-tile guard requires a data-tail/common-tail envelope"
+                )
+
+    @cute.jit
+    def _run_task_body_impl_schedule(
+        self,
+        work_tile,
+        skip_work_tile=None,
+        context: ResourceContext | None = None,
+    ) -> None:
+        """Lower common HEAD -> one guarded data body -> common TAIL."""
+
+        if cutlass.const_expr(skip_work_tile is None):
+            Task._run_task_body_impl_schedule(self, work_tile, skip_work_tile, context)
+            return
+
+        # Common entries do not consume the K loop, but Task's entry helpers
+        # require its domain in StageInfo. Reuse the already-decoded value so
+        # a padded WorkId does not perform a second metadata lookup.
+        common_domain = work_tile.k_tile_count
+
+        for is_skippable, head_entries in self._head_exec_groups:
+            if cutlass.const_expr(not is_skippable):
+                self._run_head_entry_group(
+                    head_entries, work_tile, common_domain, context
+                )
+
+        if skip_work_tile == cutlass.Boolean(False):
+            # Keep the active-data domain lookup; replacing it with the cached
+            # value is a separate optimization.
+            data_domain = self.get_domain(work_tile.tile_idx)
+            for is_skippable, head_entries in self._head_exec_groups:
+                if cutlass.const_expr(is_skippable):
+                    self._run_head_entry_group(
+                        head_entries, work_tile, data_domain, context
+                    )
+            if cutlass.const_expr(self._has_last_iter):
+                self._run_loop_peeled(data_domain, work_tile, context)
+            else:
+                self._run_loop_simple(data_domain, work_tile, context)
+            for is_skippable, tail_entries in self._tail_exec_groups:
+                if cutlass.const_expr(is_skippable):
+                    self._run_tail_entry_group(
+                        tail_entries, work_tile, data_domain, context
+                    )
+
+        for is_skippable, tail_entries in self._tail_exec_groups:
+            if cutlass.const_expr(not is_skippable):
+                self._run_tail_entry_group(
+                    tail_entries, work_tile, common_domain, context
+                )
+
+    @cute.jit
+    def _run_clc_work_tile_from_scalars(
+        self,
+        cluster_idx,
+        seq_q_idx,
+        batch_idx,
+        split_kv_idx,
+        is_valid,
+        k_len,
+        k_tile_count,
+        k_index_base,
+        context: ResourceContext | None = None,
+    ) -> None:
+        work_tile = self._work_tile_from_scalars(
+            cluster_idx,
+            seq_q_idx,
+            batch_idx,
+            split_kv_idx,
+            is_valid,
+            k_len,
+            k_tile_count,
+            k_index_base,
+        )
+        if cutlass.const_expr(self._has_skip_if):
+            skip_work_tile = self._should_skip_work_tile(work_tile)
+            self._run_task_body_impl(work_tile, skip_work_tile, context)
+        else:
+            self._run_task_body_impl(work_tile, context=context)
 
 
 class MlaTask(Task):
@@ -249,6 +619,549 @@ class MlaTask(Task):
         self.work_queue._set_consumer_var_from_ts("work_tile", work_tile)
         self._run_post_work_loop_entries(work_tile, context)
         self._drain_mla_work_tile_tails()
+
+
+class MlaDsv4SHandoffTask(MlaTask):
+    """Persistent W8 executor with a cross-work-tile S state machine.
+
+    The base task's HEAD/LOOP/TAIL are per work tile. W8 instead acquires two
+    S stages once before the persistent loop and balances them with two
+    commits once at exit, so neither can be a captured HEAD/TAIL entry.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        source_resources = [
+            resource
+            for resource in self.dst_resources
+            if isinstance(resource, TmemSResource)
+        ]
+        if len(source_resources) != 1:
+            raise ValueError(
+                "MlaDsv4SHandoffTask requires exactly one TmemSResource destination"
+            )
+        self._dsv4_handoff_s = source_resources[0]
+
+    @cute.jit
+    def _run_task_body_persistent(
+        self,
+        context: ResourceContext | None = None,
+    ) -> None:
+        self._dsv4_handoff_s.preacquire_pair()
+        super()._run_task_body_persistent(context)
+
+    @cute.jit
+    def _drain_mla_work_tile_tails(self) -> None:
+        # The two S pre-acquires are balanced by exactly two terminal commits.
+        # A generic ``producer_tail`` for S afterwards would wait on a third
+        # protocol that does not exist and deadlock, so S is excluded from the
+        # base drain below.
+        self._dsv4_handoff_s.balance_commits_after_persistent_loop()
+        for resource in self.dst_resources:
+            if cutlass.const_expr(
+                resource is not self._dsv4_handoff_s
+                and resource.pipeline_config is not None
+                and resource is not self.work_queue
+                and not self._is_fork_secondary(resource)
+            ):
+                if cutlass.const_expr(
+                    resource.pipeline_config.producer_acquire_interleave_stride > 1
+                    or resource.pipeline_config.producer_commit_interleave_stride > 1
+                ):
+                    pass
+                else:
+                    self._producer_tail(resource)
+        if cutlass.const_expr(
+            self.work_queue is not None
+            and self.work_queue in self.dst_resources
+            and self.work_queue.pipeline_config is not None
+        ):
+            self.work_queue.producer_tail()
+
+
+class MlaDsv4SHandoffClcTask(MlaDsv4WholeTileGuardClcTask):
+    """CLC W8 executor with the cross-work-tile S cursor protocol.
+
+    ``Task`` owns the CLC WorkId loop; ``MlaDsv4SHandoffTask`` owns the
+    static grid-stride loop. S lookahead sits outside either loop: acquire
+    S0/S1 once before the first WorkId and commit twice after the terminal
+    WorkId. The stock CLC tail drains every ``advance_on_acquire`` destination
+    uniformly, so the S tail stays explicit.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        source_resources = [
+            resource
+            for resource in self.dst_resources
+            if isinstance(resource, TmemSResource)
+        ]
+        if len(source_resources) != 1:
+            raise ValueError(
+                "MlaDsv4SHandoffClcTask requires exactly one TmemSResource destination"
+            )
+        self._dsv4_handoff_s = source_resources[0]
+
+    @cute.jit
+    def _run_task_body_persistent(
+        self,
+        context: ResourceContext | None = None,
+    ) -> None:
+        """Run the WorkId loop between the one-time S pre-acquire and balance."""
+
+        assert self.work_queue is not None
+        self._dsv4_handoff_s.preacquire_pair()
+
+        work_tile = self.work_queue.initial_work_tile_info()
+        self.work_queue._set_consumer_var_from_ts("work_tile", work_tile)
+        self._run_pre_work_loop_entries(work_tile, context)
+        (
+            cluster_idx,
+            seq_q_idx,
+            batch_idx,
+            split_kv_idx,
+            is_valid,
+            k_len,
+            k_tile_count,
+            k_index_base,
+        ) = self._work_tile_scalars(
+            self.work_queue._get_consumer_var_from_ts("work_tile")
+        )
+
+        while is_valid:
+            self._run_clc_work_tile_from_scalars(
+                cluster_idx,
+                seq_q_idx,
+                batch_idx,
+                split_kv_idx,
+                is_valid,
+                k_len,
+                k_tile_count,
+                k_index_base,
+                context,
+            )
+            (
+                cluster_idx,
+                seq_q_idx,
+                batch_idx,
+                split_kv_idx,
+                is_valid,
+                k_len,
+                k_tile_count,
+                k_index_base,
+            ) = self._work_tile_scalars(
+                self.work_queue._get_consumer_var_from_ts("work_tile")
+            )
+
+        terminal_work_tile = self._work_tile_from_scalars(
+            cluster_idx,
+            seq_q_idx,
+            batch_idx,
+            split_kv_idx,
+            is_valid,
+            k_len,
+            k_tile_count,
+            k_index_base,
+        )
+        self._run_post_work_loop_entries(terminal_work_tile, context)
+        self._dsv4_handoff_s.balance_commits_after_persistent_loop()
+
+        # Task's CLC tail for every destination except S, which was balanced
+        # above; a generic producer_tail would wait on a third protocol and
+        # deadlock.
+        for resource in self.dst_resources:
+            if cutlass.const_expr(
+                resource is not self._dsv4_handoff_s
+                and resource.pipeline_config is not None
+                and resource is not self.work_queue
+                and not self._is_fork_secondary(resource)
+            ):
+                pipeline_config = resource.pipeline_config
+                assert pipeline_config is not None
+                if cutlass.const_expr(pipeline_config.advance_on_acquire):
+                    self._thread_advance_on_acquire_state(resource)
+                self._producer_tail(resource)
+        if cutlass.const_expr(
+            self.work_queue in self.dst_resources
+            and self.work_queue.pipeline_config is not None
+        ):
+            self.work_queue.producer_tail()
+
+
+class MlaDsv4PairProducerTask(MlaTask):
+    """W9 task whose domain is sparse K-tile pairs, not individual K tiles.
+
+    The rest of the kernel retains the full K-tile domain.  Only W9 produces
+    two selector stages per adjacent pair, so mapping its local pair index back
+    to ``2 * pair`` avoids a dynamic branch around ``cp.async``/commit.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._dsv4_full_k_domain = cutlass.Int32(0)
+
+    @cute.jit
+    def _run_one_mla_work_tile(
+        self,
+        work_tile,
+        context: ResourceContext | None = None,
+    ) -> None:
+        self._dsv4_full_k_domain = work_tile.k_tile_count
+        self.domain = (self._dsv4_full_k_domain + cutlass.Int32(1)) // cutlass.Int32(2)
+        self._run_task_body_impl(work_tile, context=context)
+
+    @cute.jit
+    def _create_stage_info(
+        self,
+        resource,
+        idx,
+        work_tile=None,
+        is_producer=None,
+        resolved_domain=None,
+        label=None,
+        schedule_stage=None,
+        routing_slot=None,
+        context: ResourceContext | None = None,
+    ) -> StageInfo:
+        """Expose pair base ``2*p`` to W9's page-index calculation."""
+
+        base_info = Task._create_stage_info(
+            self,
+            resource,
+            idx,
+            work_tile,
+            is_producer,
+            resolved_domain,
+            label,
+            schedule_stage,
+            routing_slot,
+            context=context,
+        )
+        return StageInfo(
+            loop_offset=cutlass.Int32(base_info.loop_offset) * cutlass.Int32(2),
+            loop_start=cutlass.Int32(base_info.loop_start) * cutlass.Int32(2),
+            loop_end=self._dsv4_full_k_domain,
+            loop_step=cutlass.Int32(base_info.loop_step) * cutlass.Int32(2),
+            stage_idx=base_info.stage_idx,
+            label=base_info.label,
+            barrier=base_info.barrier,
+            work_tile=base_info.work_tile,
+            num_active_stages=base_info.num_active_stages,
+            context=base_info.context,
+            task_cache=base_info.task_cache,
+        )
+
+
+class MlaDsv4PairLoadTask(MlaTask):
+    """W12--W15 pair-ring consumer with K one tile ahead of V.
+
+    The captured schedule has one K and one V producer segment; this task
+    replays them in K-ahead-of-V order rather than the generic same-iteration
+    K/V order. W9 ring wait/release state advances only at a pair boundary,
+    while K/V TMA stage indices keep the full logical K-tile index.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._init_dsv4_pair_loop_groups()
+
+    def _init_dsv4_pair_loop_groups(self) -> None:
+        """Decode the pair schedule by semantic labels, not fixed offsets.
+
+        ``create_load_dsv4_task`` has two page-ring segments, ``wait/read_k ->
+        K acquire/work/commit -> release`` and the V equivalent. Routing labels
+        are the ABI boundary; a changed data-flow shape is rejected explicitly
+        instead of silently mis-slicing.
+        """
+
+        loop_entries = [
+            (resource, stage, call_id, label)
+            for resource, stage, call_id, _guard, label in self.loop_schedule_list
+        ]
+
+        def parse_operand_segment(label: str, start: int):
+            read_positions = [
+                idx
+                for idx in range(start, len(loop_entries))
+                if loop_entries[idx][2] is not None and loop_entries[idx][3] == label
+            ]
+            if len(read_positions) != 1:
+                raise ValueError(
+                    f"DSV4 pair-ring expected exactly one {label!r} loop entry, "
+                    f"found {len(read_positions)}"
+                )
+            read_idx = read_positions[0]
+            page_ring = loop_entries[read_idx][0]
+            wait_entries = loop_entries[start : read_idx + 1]
+            if not wait_entries or any(
+                entry[0] is not page_ring for entry in wait_entries
+            ):
+                raise ValueError(
+                    f"DSV4 pair-ring {label!r} wait group must use one page-offset ring"
+                )
+            if wait_entries[-1][1] != ScheduleStage.ConsumerWork:
+                raise ValueError(
+                    f"DSV4 pair-ring {label!r} must end its wait group in ConsumerWork"
+                )
+            if any(
+                entry[1]
+                not in {
+                    ScheduleStage.ConsumerTryWait,
+                    ScheduleStage.ConsumerWait,
+                    ScheduleStage.ConsumerWork,
+                }
+                for entry in wait_entries
+            ):
+                raise ValueError(
+                    f"DSV4 pair-ring {label!r} has an unexpected page-ring wait stage"
+                )
+
+            release_positions = [
+                idx
+                for idx in range(read_idx + 1, len(loop_entries))
+                if loop_entries[idx][0] is page_ring
+                and loop_entries[idx][1] == ScheduleStage.ConsumerRelease
+            ]
+            if not release_positions:
+                raise ValueError(
+                    f"DSV4 pair-ring {label!r} is missing page-ring ConsumerRelease"
+                )
+            release_idx = release_positions[0]
+            work_entries = loop_entries[read_idx + 1 : release_idx]
+            expected_work_stages = (
+                ScheduleStage.ProducerAcquire,
+                ScheduleStage.ProducerWork,
+                ScheduleStage.ProducerCommit,
+            )
+            if (
+                len(work_entries) != len(expected_work_stages)
+                or tuple(entry[1] for entry in work_entries) != expected_work_stages
+                or len({id(entry[0]) for entry in work_entries}) != 1
+                or work_entries[0][0] is page_ring
+            ):
+                raise ValueError(
+                    f"DSV4 pair-ring {label!r} requires one K/V acquire-work-commit group"
+                )
+            return (
+                wait_entries,
+                work_entries,
+                [loop_entries[release_idx]],
+                release_idx + 1,
+                work_entries[0][0],
+            )
+
+        (
+            self._dsv4_k_wait_entries,
+            self._dsv4_k_work_entries,
+            self._dsv4_k_release_entries,
+            next_start,
+            k_resource,
+        ) = parse_operand_segment("read_k_stage", 0)
+        (
+            self._dsv4_v_wait_entries,
+            self._dsv4_v_work_entries,
+            self._dsv4_v_release_entries,
+            next_start,
+            v_resource,
+        ) = parse_operand_segment("read_v_stage", next_start)
+        if k_resource is v_resource or next_start != len(loop_entries):
+            raise ValueError(
+                "DSV4 pair-ring requires adjacent, distinct K and V loop segments"
+            )
+
+    @cute.jit
+    def _run_loop_simple(
+        self,
+        resolved_domain,
+        work_tile,
+        context: ResourceContext | None,
+    ) -> None:
+        """Run the W12--W15 HEAD/LOOP/TAIL for one K-tile domain."""
+
+        # CLC rewrites a skipped tile's dynamic domain to zero while keeping the
+        # outer WorkQueue advance. This body carries its own HEAD and TAIL, so
+        # all K/V/page-ring state stays untouched for that tile; the throttle
+        # advances once per WorkId as a non-skippable head entry outside it.
+        if resolved_domain > cutlass.Int32(0):
+            # HEAD: Q was issued by the captured head schedule.  Consume
+            # selector K-pair 0 and issue K0 before any V work.
+            self._run_group_entries(
+                self._dsv4_k_wait_entries,
+                cutlass.Int32(0),
+                work_tile,
+                resolved_domain,
+                context,
+            )
+            self._run_group_entries(
+                self._dsv4_k_work_entries,
+                cutlass.Int32(0),
+                work_tile,
+                resolved_domain,
+                context,
+            )
+
+            # LOOP i: K[i+1] is one tile ahead of V[i].  Every operand keeps
+            # its own W9 selector stage for the pair's two halves.
+            for loop_offset in cutlass.range(
+                cutlass.Int32(0),
+                resolved_domain - cutlass.Int32(1),
+                cutlass.Int32(1),
+            ):
+                next_k_tile = loop_offset + cutlass.Int32(1)
+                if (next_k_tile & cutlass.Int32(1)) == cutlass.Int32(0):
+                    self._run_group_entries(
+                        self._dsv4_k_wait_entries,
+                        next_k_tile,
+                        work_tile,
+                        resolved_domain,
+                        context,
+                    )
+                self._run_group_entries(
+                    self._dsv4_k_work_entries,
+                    next_k_tile,
+                    work_tile,
+                    resolved_domain,
+                    context,
+                )
+                if (next_k_tile & cutlass.Int32(1)) == cutlass.Int32(
+                    1
+                ) and next_k_tile != resolved_domain - cutlass.Int32(1):
+                    self._run_group_entries(
+                        self._dsv4_k_release_entries,
+                        next_k_tile,
+                        work_tile,
+                        resolved_domain,
+                        context,
+                    )
+
+                if (loop_offset & cutlass.Int32(1)) == cutlass.Int32(0):
+                    self._run_group_entries(
+                        self._dsv4_v_wait_entries,
+                        loop_offset,
+                        work_tile,
+                        resolved_domain,
+                        context,
+                    )
+                self._run_group_entries(
+                    self._dsv4_v_work_entries,
+                    loop_offset,
+                    work_tile,
+                    resolved_domain,
+                    context,
+                )
+                if (loop_offset & cutlass.Int32(1)) == cutlass.Int32(1):
+                    self._run_group_entries(
+                        self._dsv4_v_release_entries,
+                        loop_offset,
+                        work_tile,
+                        resolved_domain,
+                        context,
+                    )
+
+            # TAIL: release the final K selector before issuing V[last].
+            last_tile = resolved_domain - cutlass.Int32(1)
+            self._run_group_entries(
+                self._dsv4_k_release_entries,
+                last_tile,
+                work_tile,
+                resolved_domain,
+                context,
+            )
+            if (last_tile & cutlass.Int32(1)) == cutlass.Int32(0):
+                self._run_group_entries(
+                    self._dsv4_v_wait_entries,
+                    last_tile,
+                    work_tile,
+                    resolved_domain,
+                    context,
+                )
+            self._run_group_entries(
+                self._dsv4_v_work_entries,
+                last_tile,
+                work_tile,
+                resolved_domain,
+                context,
+            )
+            self._run_group_entries(
+                self._dsv4_v_release_entries,
+                last_tile,
+                work_tile,
+                resolved_domain,
+                context,
+            )
+
+
+class MlaDsv4PairClcProducerTask(MlaClcTask):
+    """CLC form of W9's pair-index producer.
+
+    The generic CLC task owns the WorkId persistent loop. Only W9's local
+    domain changes from K128 tiles to adjacent K-tile pairs; its stage
+    metadata still exposes the pair base in K128 token-index coordinates.
+    """
+
+    @cute.jit
+    def get_domain(self, tile_coord):
+        assert isinstance(self.work_queue, MlaWorkQueue)
+        full_k_domain = self.work_queue.k_tile_count_for_tile(tile_coord)
+        return (full_k_domain + cutlass.Int32(1)) // cutlass.Int32(2)
+
+    @cute.jit
+    def _create_stage_info(
+        self,
+        resource,
+        idx,
+        work_tile=None,
+        is_producer=None,
+        resolved_domain=None,
+        label=None,
+        schedule_stage=None,
+        routing_slot=None,
+        context: ResourceContext | None = None,
+    ) -> StageInfo:
+        """Map CLC pair-loop offsets to the full K128 selector row."""
+
+        base_info = Task._create_stage_info(
+            self,
+            resource,
+            idx,
+            work_tile,
+            is_producer,
+            resolved_domain,
+            label,
+            schedule_stage,
+            routing_slot,
+            context=context,
+        )
+        # The CLC executor always resolves a work tile before any entry runs;
+        # W9's pair->K128 remap has no meaning without one.
+        assert work_tile is not None, "pair producer stage info needs a work tile"
+        full_k_domain = work_tile.k_tile_count
+        return StageInfo(
+            loop_offset=cutlass.Int32(base_info.loop_offset) * cutlass.Int32(2),
+            loop_start=cutlass.Int32(base_info.loop_start) * cutlass.Int32(2),
+            loop_end=full_k_domain,
+            loop_step=cutlass.Int32(base_info.loop_step) * cutlass.Int32(2),
+            stage_idx=base_info.stage_idx,
+            label=base_info.label,
+            barrier=base_info.barrier,
+            work_tile=base_info.work_tile,
+            num_active_stages=base_info.num_active_stages,
+            context=base_info.context,
+            task_cache=base_info.task_cache,
+        )
+
+
+class MlaDsv4PairClcLoadTask(MlaDsv4WholeTileGuardClcTask):
+    """CLC form of the W12--W15 pair-ring consumer."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        MlaDsv4PairLoadTask._init_dsv4_pair_loop_groups(self)
+
+    # The pair timeline depends only on the captured schedule entries and the
+    # dynamic full-K domain, so the loop body is shared; unlike __init__, it
+    # has no MlaTask-specific super() state.
+    _run_loop_simple = MlaDsv4PairLoadTask._run_loop_simple
 
 
 class MlaInterleavedTask(MlaTask):
@@ -526,9 +1439,15 @@ def create_load_v_task(
     smem_v: SmemVResource,
     work_queue: MlaWorkQueue = None,
     task_class: type = MlaTask,
+    warp_idx: int = 10,
+    num_warps: int = 1,
     **task_kwargs,
 ) -> Task:
-    """Create the FP8 V TMA task (warp 10)."""
+    """Create the FP8 V TMA task.
+
+    Dense FP8 uses W10. DSV4 sparse attention distributes Gather4 issues over
+    W12-W15 while TaskWarpLeader aggregates their transaction-barrier arm.
+    """
     loop_start, loop_end, loop_step = captured_loop_bounds(task_kwargs, 0)
 
     @schedule
@@ -551,10 +1470,228 @@ def create_load_v_task(
     return task_class(
         src_resources=src,
         dst_resources=[smem_v],
-        warp_idx=10,
-        num_warps=1,
+        warp_idx=warp_idx,
+        num_warps=num_warps,
         schedule=schedule_result,
         name="LoadVTask",
+        **task_kwargs,
+    )
+
+
+def create_load_q_task(
+    smem_q: SmemQResource,
+    work_queue: MlaWorkQueue = None,
+    task_class: type = MlaTask,
+    warp_idx: int = 9,
+    **task_kwargs,
+) -> Task:
+    """Create the single-warp Q TMA producer used by DSV4 compatibility mode."""
+    # Q itself has no per-K-tile work, but the empty loop below carries the
+    # dynamic-domain metadata required by the persistent Task runtime.
+    loop_start, loop_end, loop_step = captured_loop_bounds(task_kwargs, 0)
+
+    @schedule
+    def load_q_schedule(smem_q, work_queue=None):
+        smem_q.init_load_state()
+        smem_q.acquire()
+        smem_q.tma_load()
+        smem_q.commit()
+        with domain_loop(loop_start, loop_end, loop_step):
+            pass
+        work_queue_tail(work_queue, advance_label="advance_tile")
+
+    schedule_result = (
+        load_q_schedule(smem_q)
+        if work_queue is None
+        else load_q_schedule(smem_q, work_queue)
+    )
+    src = [work_queue] if work_queue is not None else []
+    return task_class(
+        src_resources=src,
+        dst_resources=[smem_q],
+        warp_idx=warp_idx,
+        num_warps=1,
+        schedule=schedule_result,
+        name="LoadQTask",
+        **task_kwargs,
+    )
+
+
+def create_load_page_offsets_dsv4_task(
+    page_offset_ring: Dsv4PageOffsetRingResource,
+    work_queue: MlaWorkQueue = None,
+    task_class: type = MlaTask,
+    warp_idx: int = 9,
+    **task_kwargs,
+) -> Task:
+    """Create the W9 page-index producer with the pair contract explicit.
+
+    W9 commits two identical ``int32[256]`` stages per adjacent K128-tile
+    pair, one for K and one for V, each holding both tiles in its two
+    128-entry halves. The schedule exposes the producer and K/V consumer
+    segments by semantic label; ``MlaDsv4PairProducerTask`` and
+    ``MlaDsv4PairLoadTask`` replay them stepping two K tiles per iteration.
+    """
+    loop_start, loop_end, loop_step = captured_loop_bounds(task_kwargs, 0)
+
+    @schedule
+    def page_offsets_schedule(page_offset_ring, work_queue=None):
+        page_offset_ring.init_load_state()
+        with domain_loop(loop_start, loop_end, loop_step):
+            page_offset_ring.acquire()
+            page_offset_ring.prefetch_pair()
+            page_offset_ring.commit()
+            page_offset_ring.acquire()
+            page_offset_ring.prefetch_pair()
+            page_offset_ring.commit()
+        work_queue_tail(work_queue, advance_label="advance_tile")
+
+    schedule_result = (
+        page_offsets_schedule(page_offset_ring)
+        if work_queue is None
+        else page_offsets_schedule(page_offset_ring, work_queue)
+    )
+    src = [work_queue] if work_queue is not None else []
+    return task_class(
+        src_resources=src,
+        dst_resources=[page_offset_ring],
+        warp_idx=warp_idx,
+        num_warps=1,
+        schedule=schedule_result,
+        name="LoadPageOffsetsTask",
+        **task_kwargs,
+    )
+
+
+def create_load_dsv4_task(
+    smem_q: SmemQResource,
+    smem_k: SmemKResource,
+    smem_v: SmemVResource,
+    page_offset_ring: Dsv4PageOffsetRingResource,
+    work_queue: MlaWorkQueue = None,
+    work_throttle: WorkThrottleBarrierResource = None,
+    task_class: type = MlaTask,
+    warp_idx: int = 12,
+    num_warps: int = 4,
+    **task_kwargs,
+) -> Task:
+    """Create DSV4's four-warp K/V Gather4 producer task.
+
+    W12--W15 share one combined Q/K/V load task. Only W12 issues the one-time
+    Q TMA transaction; all four warps issue K/V Gather4 transactions after W9
+    has published a page-index ring stage.
+    """
+    loop_start, loop_end, loop_step = captured_loop_bounds(task_kwargs, 0)
+    use_clc_dynamic = bool(work_queue is not None and work_queue.use_clc_dynamic)
+
+    def load_dsv4_prelude(
+        smem_q,
+        smem_k,
+        smem_v,
+        page_offset_ring,
+    ):
+        """Initialize per-task register cursors outside the CLC skip guard."""
+        smem_q.init_load_state()
+        smem_k.init_load_state()
+        smem_v.init_load_state()
+        page_offset_ring.init_read_state()
+
+    def load_dsv4_control(work_throttle):
+        """Advance the W12--W15 -> W10 throttle edge once per WorkId."""
+
+        work_throttle.try_acquire()
+        work_throttle.acquire()
+        work_throttle.commit()
+
+    def load_dsv4_body(
+        smem_q,
+        smem_k,
+        smem_v,
+        page_offset_ring,
+    ):
+        """Publish Q once and K/V stages through the four-warp Gather4 group."""
+
+        # Every W12--W15 lane joins the Q pipeline's acquire/commit;
+        # ``SmemQResource.tma_load`` gates the TMA issue to W12 without changing
+        # the collective arrival protocol.
+        smem_q.acquire()
+        smem_q.tma_load()
+        smem_q.commit()
+
+        # W9 holds one selector stage over both halves of a K128-tile pair.
+        # The pair Gather4 methods select the page-index half from the
+        # runtime K-tile parity carried by the pair task's HEAD/LOOP/TAIL FSM.
+        with domain_loop(loop_start, loop_end, loop_step):
+            page_offset_ring.wait()
+            k_page_offset_stage = page_offset_ring.read_k_stage()
+            smem_k.acquire()
+            smem_k.tma_load_from_page_ring_pair(page_offset_stage=k_page_offset_stage)
+            smem_k.commit()
+            page_offset_ring.release()
+
+            page_offset_ring.wait()
+            v_page_offset_stage = page_offset_ring.read_v_stage()
+            smem_v.acquire()
+            smem_v.tma_load_from_page_ring_pair(page_offset_stage=v_page_offset_stage)
+            smem_v.commit()
+            page_offset_ring.release()
+
+    @schedule
+    def load_dsv4_schedule(
+        smem_q,
+        smem_k,
+        smem_v,
+        page_offset_ring,
+        work_queue=None,
+        work_throttle=None,
+    ):
+        """Capture active Q/K/V work and unconditional queue progress."""
+
+        _capture_clc_work_tile_body(
+            work_queue,
+            lambda _load_state: load_dsv4_body(
+                smem_q,
+                smem_k,
+                smem_v,
+                page_offset_ring,
+            ),
+            lambda: load_dsv4_prelude(
+                smem_q,
+                smem_k,
+                smem_v,
+                page_offset_ring,
+            ),
+            (
+                None
+                if work_throttle is None
+                else lambda: load_dsv4_control(work_throttle)
+            ),
+            use_clc_dynamic=use_clc_dynamic,
+        )
+
+    if work_queue is None:
+        schedule_result = load_dsv4_schedule(smem_q, smem_k, smem_v, page_offset_ring)
+    elif work_throttle is None:
+        schedule_result = load_dsv4_schedule(
+            smem_q, smem_k, smem_v, page_offset_ring, work_queue
+        )
+    else:
+        schedule_result = load_dsv4_schedule(
+            smem_q, smem_k, smem_v, page_offset_ring, work_queue, work_throttle
+        )
+    src = [page_offset_ring]
+    if work_queue is not None:
+        src.append(work_queue)
+    dst = [smem_q, smem_k, smem_v]
+    if work_throttle is not None:
+        dst.append(work_throttle)
+    return task_class(
+        src_resources=src,
+        dst_resources=dst,
+        warp_idx=warp_idx,
+        num_warps=num_warps,
+        schedule=schedule_result,
+        name="LoadDsv4Task",
         **task_kwargs,
     )
 
@@ -890,6 +2027,110 @@ def create_mma_pv_direct_task(
     )
 
 
+def create_mma_dsv4_fused_task(
+    smem_q: SmemQResource,
+    smem_k: SmemKResource,
+    smem_v: SmemVResource,
+    smem_p: SmemPResource,
+    tmem_s: TmemSResource,
+    tmem_o: TmemOResource,
+    iterations_qk: int = 4,
+    iterations_pv_k: int = 1,
+    iterations_pv_n: int = 2,
+    work_queue: MlaWorkQueue = None,
+    task_class: type = MlaTask,
+    **task_kwargs,
+) -> Task:
+    """Create the DSV4 fused W8 task: QK runs exactly one KV tile ahead of PV.
+
+    HEAD publishes S[0]. LOOP starts at one and publishes S[n] into the second
+    S-pipeline state before consuming P[n-1]/V[n-1]; ``domain_start=1`` gives
+    HEAD and the first LOOP body distinct producer states, one per S
+    pre-acquire. TAIL consumes the final P/V pair. W11 is left free for the
+    padding role.
+    """
+    loop_start, loop_end, loop_step = captured_loop_bounds(task_kwargs, 1)
+    use_clc_dynamic = bool(work_queue is not None and work_queue.use_clc_dynamic)
+
+    def mma_dsv4_fused_body(smem_q, smem_k, smem_v, smem_p, tmem_s, tmem_o):
+        """Run HEAD -> (QK[n], PV[n-1]) -> TAIL on W8."""
+        smem_q.wait()
+        smem_q.q_desc()
+        staged_qk_mma_k_tile_from_acquired_s(smem_k, tmem_s, iterations_qk)
+
+        # Both D256 PV MMAs run under one whole-D512 O pipeline token; P
+        # readiness rides on the S handoff rather than a P mbarrier.
+        with domain_loop(loop_start, loop_end, loop_step):
+            staged_qk_mma_k_tile_from_acquired_s(smem_k, tmem_s, iterations_qk)
+            # QK[n] commits first; this acquire observes softmax's release of
+            # S[n-1], which also means P[n-1] is stored; then PV[n-1].
+            tmem_s.acquire()
+            staged_pv_mma_v_tile_parity_p(
+                smem_v,
+                smem_p,
+                tmem_o,
+                iterations=iterations_pv_k * iterations_pv_n,
+            )
+
+        # The acquire cursor is two stages ahead of the QK commit cursor, so
+        # this acquire waits for softmax to release S[N-1], which also means
+        # P[N-1] is stored, before the final PV.
+        tmem_s.acquire()
+        staged_pv_mma_v_tile_parity_p(
+            smem_v,
+            smem_p,
+            tmem_o,
+            iterations=iterations_pv_k * iterations_pv_n,
+            is_tail=True,
+        )
+        smem_q.release()
+
+    @schedule
+    def mma_dsv4_fused_schedule(
+        smem_q, smem_k, smem_v, smem_p, tmem_s, tmem_o, work_queue=None
+    ):
+        """Capture one active fused-MMA tile and unconditional queue progress."""
+
+        _capture_clc_work_tile_body(
+            work_queue,
+            lambda: mma_dsv4_fused_body(
+                smem_q,
+                smem_k,
+                smem_v,
+                smem_p,
+                tmem_s,
+                tmem_o,
+            ),
+            use_clc_dynamic=use_clc_dynamic,
+        )
+
+    schedule_result = (
+        mma_dsv4_fused_schedule(smem_q, smem_k, smem_v, smem_p, tmem_s, tmem_o)
+        if work_queue is None
+        else mma_dsv4_fused_schedule(
+            smem_q, smem_k, smem_v, smem_p, tmem_s, tmem_o, work_queue
+        )
+    )
+    src = [smem_q, smem_k, smem_v, smem_p]
+    if work_queue is not None:
+        src.append(work_queue)
+    selected_task_class = (
+        MlaDsv4SHandoffClcTask
+        if issubclass(task_class, MlaClcTask)
+        else MlaDsv4SHandoffTask
+    )
+    return selected_task_class(
+        src_resources=src,
+        dst_resources=[tmem_s, tmem_o],
+        warp_idx=8,
+        num_warps=1,
+        schedule=schedule_result,
+        name="MmaDsv4FusedTask",
+        run_only_on_cta_id=0,
+        **task_kwargs,
+    )
+
+
 def create_softmax_task(
     tmem_s: TmemSResource,
     tmem_corr: TmemCorrResource,
@@ -899,6 +2140,7 @@ def create_softmax_task(
     warp_idx: int = 0,
     name: str = "SoftmaxTask",
     softmax_group_id: int = 0,
+    dsv4_schedule: bool = False,
     **task_kwargs,
 ) -> Task:
     """Create the Softmax task (warps 0-3, 4 warps, 192 regs).
@@ -906,9 +2148,17 @@ def create_softmax_task(
     domain_start=0: processes all k_tile_count S tiles.
 
     LOOP: consume S, compute softmax, produce correction factors + P.
+
+    ``dsv4_schedule`` selects the DSV4 CSA protocol: S is held until P is
+    stored and fenced, P readiness rides on the S handoff instead of a P
+    mbarrier, softmax publishes (old_max, new_max) early-correction tokens
+    plus one terminal (row_sum, row_max) token, and the packed-P store is
+    fused into TmemS's software pipeline.
     """
     loop_start, loop_end, loop_step = captured_loop_bounds(task_kwargs, 0)
     use_clc_dynamic = bool(work_queue is not None and work_queue.use_clc_dynamic)
+    if dsv4_schedule and softmax_group_id != 0:
+        raise ValueError("the DSV4 schedule supports the softmax group only")
 
     def softmax_prelude(tmem_s):
         """Create softmax register arrays before the dynamic skip guard."""
@@ -984,8 +2234,54 @@ def create_softmax_task(
                     correction_factor_out=correction_factor_out,
                     no_correction_out=no_correction_out,
                 )
-            tmem_s.release()
-            if softmax_group_id == 1:
+            # With ``dsv4_schedule`` S is held until P is stored and fenced;
+            # the next S producer acquire is then the P-ready dependency.
+            if not dsv4_schedule:
+                tmem_s.release()
+            if dsv4_schedule:
+                (
+                    qk_acc_regs,
+                    row_max,
+                    row_sum,
+                    row_sum_out,
+                    row_max_new,
+                    correction_factor_out,
+                    no_correction_out,
+                ) = tmem_s.finish_softmax_max(
+                    qk_acc_regs=qk_acc_regs,
+                    row_max=row_max,
+                    row_sum=row_sum,
+                    row_sum_out=row_sum_out,
+                    row_max_new=row_max_new,
+                    correction_factor_out=correction_factor_out,
+                    no_correction_out=no_correction_out,
+                )
+                # Publish old/new max before P exp/store so Correction[n]
+                # overlaps softmax's P[n] critical path.
+                tmem_corr.acquire()
+                tmem_corr.store_early_stats(
+                    row_max_old=row_max,
+                    row_max_new=row_max_new,
+                )
+                tmem_corr.commit()
+                (
+                    qk_acc_regs,
+                    row_max,
+                    row_sum,
+                    row_sum_out,
+                    row_max_new,
+                    correction_factor_out,
+                    no_correction_out,
+                ) = tmem_s.materialize_softmax_p(
+                    qk_acc_regs=qk_acc_regs,
+                    row_max=row_max,
+                    row_sum=row_sum,
+                    row_sum_out=row_sum_out,
+                    row_max_new=row_max_new,
+                    correction_factor_out=correction_factor_out,
+                    no_correction_out=no_correction_out,
+                )
+            elif softmax_group_id == 1:
                 (
                     qk_acc_regs,
                     row_max,
@@ -1021,12 +2317,21 @@ def create_softmax_task(
                     correction_factor_out=correction_factor_out,
                     no_correction_out=no_correction_out,
                 )
-            smem_p.acquire()
-            if softmax_group_id == 1:
-                store_p(qk_acc_regs_odd=qk_acc_regs)
+            if dsv4_schedule:
+                # FP8 conversion is delayed 16 MUFU elements, so the packed
+                # registers stay inside TmemS.materialize_softmax_p until its
+                # direct SMEM store and fence. S release is then the P-ready
+                # signal; the P buffer follows K-tile parity, no P mbarrier.
+                smem_p.mark_p_fused_store()
             else:
-                store_p(qk_acc_regs=qk_acc_regs)
-            smem_p.commit()
+                smem_p.acquire()
+                if softmax_group_id == 1:
+                    store_p(qk_acc_regs_odd=qk_acc_regs)
+                else:
+                    store_p(qk_acc_regs=qk_acc_regs)
+                smem_p.commit()
+            if dsv4_schedule:
+                tmem_s.release()
             if softmax_group_id == 1:
                 row_sum, row_sum_out = finish_row_sum(
                     qk_acc_regs_odd=qk_acc_regs,
@@ -1039,21 +2344,29 @@ def create_softmax_task(
                     row_sum=row_sum,
                     correction_factor_out=correction_factor_out,
                 )
+            if not dsv4_schedule:
+                tmem_corr.acquire()
+                if softmax_group_id == 1:
+                    store_corr(
+                        row_sum_out_odd=row_sum_out,
+                        row_max_new_odd=row_max_new,
+                        correction_factor_out_odd=correction_factor_out,
+                        no_correction_out_odd=no_correction_out,
+                    )
+                else:
+                    store_corr(
+                        row_sum_out=row_sum_out,
+                        row_max_new=row_max_new,
+                        correction_factor_out=correction_factor_out,
+                        no_correction_out=no_correction_out,
+                    )
+                tmem_corr.commit()
+
+        if dsv4_schedule:
+            # One extra token terminates the K early-message stream and makes
+            # final row stats available only after the online sum is complete.
             tmem_corr.acquire()
-            if softmax_group_id == 1:
-                store_corr(
-                    row_sum_out_odd=row_sum_out,
-                    row_max_new_odd=row_max_new,
-                    correction_factor_out_odd=correction_factor_out,
-                    no_correction_out_odd=no_correction_out,
-                )
-            else:
-                store_corr(
-                    row_sum_out=row_sum_out,
-                    row_max_new=row_max_new,
-                    correction_factor_out=correction_factor_out,
-                    no_correction_out=no_correction_out,
-                )
+            tmem_corr.store_final_stats(row_sum=row_sum, row_max=row_max)
             tmem_corr.commit()
 
     @schedule
@@ -1098,6 +2411,7 @@ def create_correction_task(
     gmem_o: GmemOResource,
     iterations_pv_n: int = 1,
     per_n_o_pipeline: bool = False,
+    dsv4_early_corr: bool = False,
     work_queue: MlaWorkQueue = None,
     task_class: type = MlaTask,
     **task_kwargs,
@@ -1127,13 +2441,23 @@ def create_correction_task(
 
         # HEAD: consume the first correction factors. There is no O tile yet.
         tmem_corr.wait()
-        row_sum, row_max, correction_factor, no_correction = tmem_corr.load_corr()
+        if dsv4_early_corr:
+            tmem_corr.consume_early_head()
+        else:
+            row_sum, row_max, correction_factor, no_correction = tmem_corr.load_corr()
         tmem_corr.release()
 
         with domain_loop(loop_start, loop_end, loop_step):
             # LOOP: consume Corr[n] and rescale O[n-1].
             tmem_corr.wait()
-            row_sum, row_max, correction_factor, no_correction = tmem_corr.load_corr()
+            if dsv4_early_corr:
+                row_sum, row_max, correction_factor, no_correction = (
+                    tmem_corr.load_early_stats()
+                )
+            else:
+                row_sum, row_max, correction_factor, no_correction = (
+                    tmem_corr.load_corr()
+                )
             tmem_corr.release()
             if per_n_o_pipeline:
                 for iter_n in range(iterations_pv_n):
@@ -1151,6 +2475,15 @@ def create_correction_task(
                     no_correction=no_correction,
                 )
                 tmem_o.release()
+
+        if dsv4_early_corr:
+            # A distinct terminal sum/max token follows all K early-max tokens;
+            # it is the epilogue's normalization state.
+            tmem_corr.wait()
+            row_sum, row_max, correction_factor, no_correction = (
+                tmem_corr.load_final_stats()
+            )
+            tmem_corr.release()
 
         # TAIL: consume final O. Do not call rescale_o here; the correction was
         # already applied in LOOP and the last loop correction value would be
@@ -1255,9 +2588,11 @@ def create_scheduler_task(
     work_queue: MlaWorkQueue,
     work_throttle: WorkThrottleBarrierResource = None,
     task_class: type = MlaTask,
+    warp_idx: int = 11,
+    throttle_per_workid: bool = False,
     **task_kwargs,
 ) -> Task:
-    """Create the BF16 cluster-wide CLC scheduler on warp 11."""
+    """Create the cluster-wide CLC scheduler task."""
 
     @schedule
     def scheduler_schedule(work_queue, work_throttle=None):
@@ -1267,10 +2602,15 @@ def create_scheduler_task(
             work_queue,
             skip_if=MlaWorkQueue.skip_work_tile_if,
         ) as work_tiles:
+            if cutlass.const_expr(work_throttle is not None and throttle_per_workid):
+                work_throttle.wait()
+                work_throttle.release()
             with work_tiles.skippable():
                 with domain_loop(0, 0, 1):
                     pass
-                if work_throttle is not None:
+                if cutlass.const_expr(
+                    work_throttle is not None and not throttle_per_workid
+                ):
                     work_throttle.wait()
                     work_throttle.release()
             work_queue.acquire()
@@ -1289,7 +2629,7 @@ def create_scheduler_task(
     return task_class(
         src_resources=src,
         dst_resources=[work_queue],
-        warp_idx=11,
+        warp_idx=warp_idx,
         num_warps=1,
         schedule=captured_schedule,
         name="SchedulerTask",
