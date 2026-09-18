@@ -1173,7 +1173,6 @@ routine_cc_to_supported_backends = {
             "flashinfer",
             "flashinfer-decomp",
             "flashinfer-fused",
-            "cutekda",
             "flash-kda",
         ],
         "12.1": [],

@@ -46,6 +46,7 @@ from flashinfer.gemm.gemm_svdquant import (  # noqa: E402
     _svdquant_kernel_source_files,
 )
 
+from flashinfer.jit.cute_dsl_core import JitSpecCuteDsl  # noqa: E402
 from flashinfer.quantization.kernels.nvfp4_quantize import (  # noqa: E402
     SF_LAYOUT_8x4,
     SF_LAYOUT_128x4,
@@ -323,3 +324,20 @@ def test_mm_fp4_kernel_name_varies_with_every_argument(param):
     )
     for name in (baseline_name, perturbed_name):
         assert re.fullmatch(r"[0-9A-Za-z_]+", name), name
+
+
+# ---------------------------------------------------------------------------
+# Explicit compile target
+# ---------------------------------------------------------------------------
+
+
+def test_explicit_arch_names_the_module_and_meta():
+    """An adopter compiling for a fixed target labels the artifact with it.
+
+    Otherwise the module directory and meta.json would carry whatever
+    ``CUTE_DSL_ARCH`` or the current device resolves to, which need not be the
+    target the object file was actually built for.
+    """
+    spec = JitSpecCuteDsl("some_op", "k", lambda: None, "sha", arch="sm_120a")
+    assert spec.module_dir_name == "some_op_sm120a_cute_dsl"
+    assert spec.expected_meta["arch"] == "sm120a"
