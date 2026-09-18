@@ -126,6 +126,91 @@ def should_use_cp_host(
     return num_parallel_work * threshold_den < num_sms * threshold_num
 
 
+#: The exact longest sequence at or above which SM80 CP is worth selecting,
+#: and the parallelism at or below which it is. Fitted over a 32-cell sweep
+#: that separated every cell at both boundaries, and re-measured on the frozen
+#: pointer entries with the shared invocation context. Both are needed: CP wins
+#: on long sequences whose head count leaves the fused kernel's grid too small
+#: to fill the device, and loses as soon as either side of that stops holding.
+CP_SM80_MIN_MAX_SEQ_LEN = 8192
+CP_SM80_MAX_PARALLEL_WORK = 8
+
+
+def should_use_cp_sm80_host(
+    max_seq_len: int | None,
+    num_parallel_work: int,
+    device_capability: tuple[int, int],
+) -> bool:
+    """Whether SM80 `use_cp="auto"` should dispatch to CP.
+
+    `max_seq_len` is the *exact* longest sequence, which only the caller knows:
+    `cu_seqlens` lives on the device and reading it here would synchronize on
+    every call. Given `None` this returns False -- the fused path is the
+    fallback, not a guess from `total_seq_len`, which over-states the maximum
+    for every multi-sequence batch and would select CP for batches it loses on.
+
+    Restricted to compute capability 8.0. SM86 and SM89 have a different SM
+    count, a different L2 and a smaller register file per SM, and the two
+    thresholds were fitted on neither; they stay on the fused path until they
+    are measured.
+    """
+    if device_capability != (8, 0):
+        return False
+    if max_seq_len is None:
+        return False
+    return (
+        max_seq_len >= CP_SM80_MIN_MAX_SEQ_LEN
+        and num_parallel_work <= CP_SM80_MAX_PARALLEL_WORK
+    )
+
+
+#: The V32 fused specialization's measured contract. Everything here was
+#: measured on `1x8192 gva4x16`, in three independent processes, with the
+#: caller handing its bf16 state pool rows in directly. Against the shipped
+#: V64 fused path it is 1.066x-1.093x on all four items -- bare and with the
+#: shipped norm, at the backend and integration boundaries -- which is why it
+#: is selected here. Against Triton it is ahead at the bare backend boundary
+#: (1.010x-1.025x), at parity at the normalized backend boundary
+#: (0.993x-1.007x), and behind at both integration boundaries
+#: (0.975x-0.991x): it narrows the fused path's gap rather than closing it.
+#: Nothing outside this contract has been measured, so nothing outside it is
+#: selected.
+V32_SM80_MAX_SEQ_LEN = 8192
+V32_SM80_NUM_SEQS = 1
+V32_SM80_NUM_Q_HEADS = 4
+V32_SM80_NUM_V_HEADS = 16
+
+
+def should_use_v32_sm80_host(
+    max_seq_len: int | None,
+    num_seqs: int,
+    num_q_heads: int,
+    num_v_heads: int,
+    device_capability: tuple[int, int],
+) -> bool:
+    """Whether auto should take the V32 fused specialization.
+
+    Host-side only, and deliberately exact rather than a region: this is one
+    validated shape, not a heuristic. An unknown longest sequence means no --
+    the value cannot be read off the device without a synchronization, which
+    is what the caller passes it to avoid.
+
+    Compute capability 8.0 only. 8.6 and 8.9 have a different shared-memory
+    budget per SM and have never been run, and the specialization adds four
+    shared buffers, so they are excluded until they are.
+    """
+    if device_capability != (8, 0):
+        return False
+    if max_seq_len is None:
+        return False
+    return (
+        max_seq_len == V32_SM80_MAX_SEQ_LEN
+        and num_seqs == V32_SM80_NUM_SEQS
+        and num_q_heads == V32_SM80_NUM_Q_HEADS
+        and num_v_heads == V32_SM80_NUM_V_HEADS
+    )
+
+
 def choose_cp_chunk_len_host(
     max_seqlen: int,
     num_heads: int,
