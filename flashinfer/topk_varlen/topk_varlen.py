@@ -1545,11 +1545,18 @@ def top_k_varlen(
         such constraint.
     seq_lens : torch.Tensor
         1-D ``int32`` tensor of shape ``(num_rows // next_n,)`` with the
-        effective KV-cache length per request.  Logits at or beyond
-        ``seq_lens[i]`` are excluded from the search. A row whose length
-        exceeds the logits width (the dynamic length has outgrown the static
-        buffer, e.g. under CUDA-graph replay) is clamped to the width by every
-        backend: only the scores present in the buffer are ranked.
+        effective KV-cache length per request, in **KV-token units** regardless
+        of ``compress_ratio`` (the raw sequence length, not a length already
+        divided by the compression factor). Row ``t`` of request ``i`` (``t``
+        in ``[0, next_n)``) ranks its first
+        ``(seq_lens[i] - next_n + t + 1) // compress_ratio`` logit columns;
+        logits at or beyond that count are excluded from the search. Passing
+        lengths already expressed in compressed / logit-column units together
+        with ``compress_ratio > 1`` would divide the search range twice.
+        A row whose length exceeds the logits width (the dynamic length has
+        outgrown the static buffer, e.g. under CUDA-graph replay) is clamped
+        to the width by every backend: only the scores present in the buffer
+        are ranked.
     top_k : int
         Number of top elements per row.  GVR backend supports
         ``{512, 1024, 2048}``; radix backend has no restriction.
@@ -1570,8 +1577,11 @@ def top_k_varlen(
         call runs hint-free (``gvr_2`` with its hint-free engines; an explicit
         ``"gvr"`` request is refused).
     compress_ratio : int, optional
-        KV-index compression factor (``1`` for DSv3.2, ``4`` for DSv4).
-        Default ``1``.
+        KV-index compression factor (``1`` for DSv3.2, ``4`` for DSv4): every
+        logit column stands for ``compress_ratio`` consecutive KV tokens.
+        ``seq_lens`` stay in KV-token units; the kernels derive each row's
+        valid column count as ``(seq_len - next_n + t + 1) // compress_ratio``
+        (see ``seq_lens``). Default ``1``.
     next_n : int, optional
         Speculative-decode temporal stride.  Default ``1``.
     return_values : bool, optional
