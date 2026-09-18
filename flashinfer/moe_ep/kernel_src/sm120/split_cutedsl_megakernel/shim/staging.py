@@ -58,14 +58,12 @@ def _stage_bf16_inputs_kernel(
     amax = tl.maximum(tl.max(hidden_groups, axis=1), 1.0e-4)
     scale = amax / 448.0
     scale_bits = scale.to(tl.uint32, bitcast=True)
-    scale_exp = ((scale_bits >> 23) & 0xFF) + (
-        (scale_bits & 0x7FFFFF) != 0
-    ).to(tl.uint32)
+    scale_exp = ((scale_bits >> 23) & 0xFF) + ((scale_bits & 0x7FFFFF) != 0).to(
+        tl.uint32
+    )
     scale_exp = tl.minimum(tl.maximum(scale_exp, 1), 254)
     rounded_scale = (scale_exp << 23).to(tl.float32, bitcast=True)
-    scaled = tl.reshape(hidden, [num_groups, GROUP_K]) * (
-        1.0 / rounded_scale
-    )[:, None]
+    scaled = tl.reshape(hidden, [num_groups, GROUP_K]) * (1.0 / rounded_scale)[:, None]
     fp8 = tl.reshape(scaled, [BLOCK_K]).to(tl.float8e4nv)
     tl.store(
         x_fp8 + token_id * x_stride_m + k_offsets * x_stride_k,
@@ -76,9 +74,7 @@ def _stage_bf16_inputs_kernel(
     scale_offsets = tl.arange(0, num_groups)
     packed_scale = tl.sum(scale_exp << (scale_offsets * 8), axis=0).to(tl.int32)
     tl.store(
-        x_sf_packed
-        + token_id * x_sf_stride_m
-        + k_block_id * x_sf_stride_k,
+        x_sf_packed + token_id * x_sf_stride_m + k_block_id * x_sf_stride_k,
         packed_scale,
         mask=active,
     )
@@ -88,9 +84,7 @@ def _stage_bf16_inputs_kernel(
         topk_mask = topk_offsets < top_k
         live_mask = active & topk_mask
         ids = tl.load(
-            topk_ids
-            + token_id * topk_ids_stride_m
-            + topk_offsets * topk_ids_stride_k,
+            topk_ids + token_id * topk_ids_stride_m + topk_offsets * topk_ids_stride_k,
             mask=live_mask,
             other=-1,
         ).to(tl.int64)

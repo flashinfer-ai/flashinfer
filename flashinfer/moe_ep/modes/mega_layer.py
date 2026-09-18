@@ -432,9 +432,7 @@ class MoEEpMegaLayer(nn.Module):
             fleet_params, backend_workspace = self._resolve_workspace(workspace)
         quantize_input = self._resolve_quantize_input(t)
         signature = self._input_signature(t)
-        validation_key = (
-            None if backend_workspace is None else id(backend_workspace)
-        )
+        validation_key = None if backend_workspace is None else id(backend_workspace)
         previous_signature = (
             None
             if validation_key is None

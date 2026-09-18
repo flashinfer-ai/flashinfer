@@ -97,13 +97,15 @@ def test_sm120_w4a8_frontend_graph_cache_key_includes_bucket() -> None:
     assert key256 != key320
 
 
-def _packed_e2m1(
-    shape: tuple[int, ...], generator: torch.Generator
-) -> torch.Tensor:
+def _packed_e2m1(shape: tuple[int, ...], generator: torch.Generator) -> torch.Tensor:
     """Sparse finite E2M1 pairs with logical values in {0, 0.5}."""
 
-    low = torch.randint(0, 2, shape, dtype=torch.uint8, device="cuda", generator=generator)
-    high = torch.randint(0, 2, shape, dtype=torch.uint8, device="cuda", generator=generator)
+    low = torch.randint(
+        0, 2, shape, dtype=torch.uint8, device="cuda", generator=generator
+    )
+    high = torch.randint(
+        0, 2, shape, dtype=torch.uint8, device="cuda", generator=generator
+    )
     return (low | (high << 4)).view(torch.float4_e2m1fn_x2)
 
 
@@ -163,20 +165,14 @@ def _torch_reference(problem: dict) -> torch.Tensor:
         row, slot = torch.where(inputs.topk_ids == expert)
         if row.numel() == 0:
             continue
-        w13 = _dequant(
-            _unpack_e2m1(weights.w13[expert]), weights.w13_scale[expert]
-        )
+        w13 = _dequant(_unpack_e2m1(weights.w13[expert]), weights.w13_scale[expert])
         fc1 = activation[row] @ w13.transpose(0, 1)
         gate, up = fc1.chunk(2, dim=-1)
         swiglu = torch.nn.functional.silu(gate) * up
         swiglu *= inputs.topk_weights[row, slot].unsqueeze(1)
-        fc1_q, fc1_scale = mxfp8_quantize_per_block_32_row(
-            swiglu, torch.float8_e4m3fn
-        )
+        fc1_q, fc1_scale = mxfp8_quantize_per_block_32_row(swiglu, torch.float8_e4m3fn)
         fc1_dequant = _dequant(fc1_q, fc1_scale)
-        w2 = _dequant(
-            _unpack_e2m1(weights.w2[expert]), weights.w2_scale[expert]
-        )
+        w2 = _dequant(_unpack_e2m1(weights.w2[expert]), weights.w2_scale[expert])
         terms[row, slot] = fc1_dequant @ w2.transpose(0, 1)
     return terms.sum(dim=1)
 
@@ -201,12 +197,8 @@ def _problem(
     generator = torch.Generator(device="cuda").manual_seed(
         20260815 + rank + seed_offset
     )
-    w13 = _packed_e2m1(
-        (local_experts, 2 * intermediate, hidden // 2), generator
-    )
-    w2 = _packed_e2m1(
-        (local_experts, hidden, intermediate // 2), generator
-    )
+    w13 = _packed_e2m1((local_experts, 2 * intermediate, hidden // 2), generator)
+    w2 = _packed_e2m1((local_experts, hidden, intermediate // 2), generator)
     scale_dtype = torch.float8_e8m0fnu
     w13_scale = torch.full(
         (local_experts, 2 * intermediate, hidden // 32),
@@ -220,13 +212,16 @@ def _problem(
         dtype=torch.uint8,
         device="cuda",
     ).view(scale_dtype)
-    hidden_states = torch.randn(
-        tokens,
-        hidden,
-        dtype=torch.bfloat16,
-        device="cuda",
-        generator=generator,
-    ) * 0.125
+    hidden_states = (
+        torch.randn(
+            tokens,
+            hidden,
+            dtype=torch.bfloat16,
+            device="cuda",
+            generator=generator,
+        )
+        * 0.125
+    )
     slots = torch.arange(topk, device="cuda", dtype=torch.int64)
     topk_ids = (
         torch.arange(tokens, device="cuda", dtype=torch.int64).unsqueeze(1) + slots
@@ -334,10 +329,7 @@ def test_sm120_w4a8_single_rank_replay_and_cuda_graph() -> None:
         torch.testing.assert_close(eager0, eager1, atol=0.0, rtol=0.0)
         frontends_before_capture = len(layer._workspace._frontends)
         reference = _torch_reference(problem)
-        rel_l2 = (
-            (eager0.float() - reference).norm()
-            / reference.norm().clamp_min(1e-6)
-        )
+        rel_l2 = (eager0.float() - reference).norm() / reference.norm().clamp_min(1e-6)
         assert rel_l2.item() < 0.03, f"single-rank rel_l2={rel_l2.item():.5f}"
 
         graph = torch.cuda.CUDAGraph()
@@ -387,16 +379,13 @@ def test_sm120_w4a8_workspace_capacity_is_independent_of_compile_bucket() -> Non
     try:
         outputs = []
         for bucket, problem in ((7, problem7), (16, problem16)):
-            layer.stage_inputs(
-                problem["inputs"], compile_tokens_per_rank=bucket
-            )
+            layer.stage_inputs(problem["inputs"], compile_tokens_per_rank=bucket)
             outputs.append(layer.compute_staged(output=None).clone())
             torch.cuda.synchronize()
             reference = _torch_reference(problem)
             rel_l2 = (
-                (outputs[-1].float() - reference).norm()
-                / reference.norm().clamp_min(1e-6)
-            )
+                outputs[-1].float() - reference
+            ).norm() / reference.norm().clamp_min(1e-6)
             assert rel_l2.item() < 0.03
 
         workspace = layer._workspace
@@ -456,9 +445,8 @@ def test_sm120_w4a8_two_layers_share_workspace() -> None:
         torch.cuda.synchronize()
         for output, problem in ((output1, first), (output2, second)):
             reference = _torch_reference(problem)
-            rel_l2 = (
-                (output.float() - reference).norm()
-                / reference.norm().clamp_min(1e-6)
+            rel_l2 = (output.float() - reference).norm() / reference.norm().clamp_min(
+                1e-6
             )
             assert rel_l2.item() < 0.03
 
@@ -526,10 +514,7 @@ def test_sm120_w4a8_four_rank_tail_wave_and_cuda_graph_replay(
         torch.testing.assert_close(eager0, eager1, atol=0.0, rtol=0.0)
 
         reference = _torch_reference(_global_weight_problem(problem))
-        rel_l2 = (
-            (eager0.float() - reference).norm()
-            / reference.norm().clamp_min(1e-6)
-        )
+        rel_l2 = (eager0.float() - reference).norm() / reference.norm().clamp_min(1e-6)
         assert rel_l2.item() < 0.03, f"rank {rank} rel_l2={rel_l2.item():.5f}"
 
         dist.barrier()
@@ -541,9 +526,7 @@ def test_sm120_w4a8_four_rank_tail_wave_and_cuda_graph_replay(
             captured = layer.compute_staged(output=None)
         dist.barrier()
         replays = []
-        replay_count = int(
-            os.environ.get("FLASHINFER_MEGAMOE_REPLAY_ITERS", "16")
-        )
+        replay_count = int(os.environ.get("FLASHINFER_MEGAMOE_REPLAY_ITERS", "16"))
         for _ in range(replay_count):
             graph.replay()
             replays.append(captured.clone())

@@ -97,7 +97,9 @@ class MegaMoESm120W4A8Config:
         if self.num_total_experts % self.world_size:
             raise ValueError("num_total_experts must be divisible by EP world size")
         if self.hidden % 32 or self.intermediate % 32:
-            raise ValueError("hidden and post-SwiGLU intermediate must be multiples of 32")
+            raise ValueError(
+                "hidden and post-SwiGLU intermediate must be multiples of 32"
+            )
         if self.num_topk <= 0 or self.num_topk > self.num_total_experts:
             raise ValueError("invalid top-k")
         if self.max_tokens_per_rank <= 0:
@@ -439,9 +441,7 @@ class MegaMoESm120W4A8Frontend:
                 dtype=torch.uint8,
                 device="cuda",
             )
-            shared_workspace = sym_zeros(
-                (bundle.shared_workspace_bytes,), torch.uint8
-            )
+            shared_workspace = sym_zeros((bundle.shared_workspace_bytes,), torch.uint8)
             self.workspace._sym_roots.append(shared_workspace)
             combine_output, root = sym_byte_view(
                 (
@@ -576,9 +576,7 @@ class MegaMoESm120W4A8Frontend:
             # The dual-N8 specialization is verified at two resident CTAs/SM.
             # Use both slots on the SMs released by K1 during the drain phase.
             drain_ctas_per_sm = 2 if spec.kernel.k2_warps == 12 else 1
-            k2_drain_launch_clusters = (
-                spec.kernel.k1_sms * drain_ctas_per_sm
-            )
+            k2_drain_launch_clusters = spec.kernel.k1_sms * drain_ctas_per_sm
             compiled_drain = cute.compile(
                 bundle.k2_drain,
                 **dict(
@@ -635,9 +633,7 @@ class MegaMoESm120W4A8Frontend:
         k1_executor = compiled_k1.to(None)
         k2_executor = compiled_k2.to(None)
         drain_executor = compiled_drain.to(None) if compiled_drain else None
-        finalizer_executor = (
-            compiled_finalizer.to(None) if compiled_finalizer else None
-        )
+        finalizer_executor = compiled_finalizer.to(None) if compiled_finalizer else None
         k3_executor = compiled_k3.to(None)
         graph_owns_epoch_reset = (
             spec.kernel.k2_tail_reclaim or finalizer_executor is not None
@@ -732,14 +728,12 @@ class MegaMoESm120W4A8Frontend:
             name = "rank_combine_route_map"
             offset = int(kernel._local_offsets[name])
             size = int(kernel._local_region_by_name[name].nbytes)
-            execution.local_workspace[offset : offset + size].view(
-                torch.int32
-            ).fill_(-1)
+            execution.local_workspace[offset : offset + size].view(torch.int32).fill_(
+                -1
+            )
         if execution.rank_combine_ready is not None:
             self._rank_combine_epoch += 1
-            execution.rank_combine_ready[-1, 0].fill_(
-                self._rank_combine_epoch
-            )
+            execution.rank_combine_ready[-1, 0].fill_(self._rank_combine_epoch)
         # The graph finalizer owns peer-written expert_recv_count and its
         # published sum. It clears both between two rank barriers; clearing
         # either here can erase an early peer's next-epoch dispatch write.
@@ -756,9 +750,7 @@ class MegaMoESm120W4A8Frontend:
         compiled.graph.launch(torch.cuda.current_stream())
         return inputs.output
 
-    def _reset_dispatch_rank_cache(
-        self, execution: _ExecutionBuffers
-    ) -> None:
+    def _reset_dispatch_rank_cache(self, execution: _ExecutionBuffers) -> None:
         kernel = execution.bundle.k1
         for name in self._DISPATCH_CACHE_RESET_REGIONS:
             if name not in kernel._local_offsets:
@@ -802,9 +794,7 @@ def allocate_workspace(
         (config.max_tokens_per_rank, scale_columns), SCALE_DTYPE
     )
     roots.append(root)
-    topk_ids = sym_zeros(
-        (config.max_tokens_per_rank, config.num_topk), torch.int64
-    )
+    topk_ids = sym_zeros((config.max_tokens_per_rank, config.num_topk), torch.int64)
     topk_ids.fill_(-1)
     roots.append(topk_ids)
     topk_weights = sym_zeros(
@@ -836,8 +826,7 @@ def _frontend_graph_cache_key(
 ) -> tuple[int, ...]:
     (fc1_weight, fc1_scale), (fc2_weight, fc2_scale) = transformed_weights
     return tuple(
-        tensor.data_ptr()
-        for tensor in (fc1_weight, fc1_scale, fc2_weight, fc2_scale)
+        tensor.data_ptr() for tensor in (fc1_weight, fc1_scale, fc2_weight, fc2_scale)
     ) + (graph_output.data_ptr(), compile_bucket)
 
 

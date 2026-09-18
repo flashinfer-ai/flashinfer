@@ -44,9 +44,7 @@ def _effective_clamp(
 class Sm120Mxfp4Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
     supports_output_view = True
 
-    def __init__(
-        self, config: Sm120_Mxfp4_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
-    ) -> None:
+    def __init__(self, config: Sm120_Mxfp4_Mxfp8_Bf16_Cutedsl_MegaMoeConfig) -> None:
         super().__init__(config)
         self._kernel_config = config
         if config.intermediate_size <= 0 or config.top_k <= 0:
@@ -194,9 +192,7 @@ class Sm120Mxfp4Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
         if (
             direct_output is not None
             and torch.cuda.is_current_stream_capturing()
-            and not workspace._has_prepared_frontend(
-                transformed_weights, direct_output
-            )
+            and not workspace._has_prepared_frontend(transformed_weights, direct_output)
         ):
             # CUDA Graph capture uses a private allocator pool, so an output
             # allocated inside capture can have a different address from the
