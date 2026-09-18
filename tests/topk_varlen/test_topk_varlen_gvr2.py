@@ -1227,6 +1227,39 @@ def test_gvr2_hint_free_exact(kv, next_n, cr, top_k):
 
 
 @requires_gvr2
+@pytest.mark.parametrize("hinted", [True, False], ids=["hinted", "hint_free"])
+@pytest.mark.parametrize("n", [4160, 8192])
+@pytest.mark.parametrize("rows", [600, 1024])
+def test_gvr2_k2048_register_rung_oracle(rows, n, hinted):
+    """GPU oracle for the FlashInfer-local K = 2048 register rung (BLK=512,
+    VPT=4, MINB=2), admitted through 1024 rows over the whole 4K < n <= 8K
+    band (upstream: 592 rows); the route tests pin only the selection. Mixed
+    lengths (short rows, rows at K and K + 1, full rows), hinted and
+    hint-free, at the newly admitted 600 / 1024 row counts and both band
+    edges."""
+    from flashinfer.topk_varlen.kernels import gvr2_topk_host as _host
+
+    top_k = 2048
+    gen = torch.Generator(device=_DEV).manual_seed(rows + n)
+    kv = torch.randint(1, n + 1, (rows,), generator=gen, device=_DEV).tolist()
+    kv[0] = n  # pin the envelope so route sees the full width
+    kv[1], kv[2], kv[3] = (
+        top_k,
+        top_k + 1,
+        1,
+    )  # identity edge, first real row, 1-token row
+    logits, seq_lens, pre_idx, n_r, msl_c = _make_varlen_case(
+        kv, 1, 1, top_k, seed=rows, msl_c=_round64(n)
+    )
+    plan = _host.route(rows, msl_c, msl_c, top_k, sms=_host._sm_count())
+    assert plan["kernel"] == "reg" and plan["tpl"][:3] == (512, 4, 2), plan["tpl"]
+    indices, values = _run_gvr2(
+        logits, seq_lens, top_k, pre_idx if hinted else None, return_values=True
+    )
+    _check_varlen_rows(logits, indices, n_r, top_k, values)
+
+
+@requires_gvr2
 def test_gvr2_hint_free_cuda_graph_replay():
     """Hint-free calls replay under CUDA graphs: the hint-free engines are
     distinct compiled objects (hint-gather sites compiled out, TRT-LLM #18410),
