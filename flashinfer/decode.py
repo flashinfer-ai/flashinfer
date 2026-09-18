@@ -363,6 +363,9 @@ def get_single_decode_module(*args):
 def get_batch_decode_jit_module(module_name: str, jit_module: Any):
     plan_func = jit_module.plan
     workspace_size_func = getattr(jit_module, "workspace_size", None)
+    workspace_size_upper_bound_func = getattr(
+        jit_module, "workspace_size_upper_bound", None
+    )
     run_func = jit_module.run
 
     @register_custom_op(
@@ -434,6 +437,7 @@ def get_batch_decode_jit_module(module_name: str, jit_module: Any):
     return SimpleNamespace(
         plan=plan_func,
         workspace_size=workspace_size_func,
+        workspace_size_upper_bound=workspace_size_upper_bound_func,
         run=run_batch_decode,
     )
 
@@ -444,6 +448,7 @@ def get_batch_decode_module(*args):
     mod = gen_batch_decode_module(*args).build_and_load()
     plan_func = mod.plan
     workspace_size_func = getattr(mod, "workspace_size", None)
+    workspace_size_upper_bound_func = getattr(mod, "workspace_size_upper_bound", None)
     run_func = mod.run
 
     # torch library for batch_decode_with_paged_kv_cache_run
@@ -533,6 +538,7 @@ def get_batch_decode_module(*args):
     return SimpleNamespace(
         plan=plan_func,
         workspace_size=workspace_size_func,
+        workspace_size_upper_bound=workspace_size_upper_bound_func,
         run=run_batch_decode,
     )
 
@@ -874,6 +880,43 @@ def single_decode_with_kv_cache(
         return out, lse
     else:
         return out
+
+
+def _resolve_decode_tensor_core_backend(
+    backend: str,
+    device: torch.device,
+    pos_encoding_mode: str,
+    q_data_type: torch.dtype,
+    kv_data_type: torch.dtype,
+    head_dim: int,
+    q_len_per_req: int,
+) -> str:
+    """Resolve ``auto`` for the tensor-core path exactly the way :meth:`plan` does.
+
+    Decode on tensor cores is planned through the prefill scheduler, and which
+    one it gets depends on the dtypes, so sizing has to answer this question
+    the same way the plan will.
+    """
+    if backend == "auto":
+        if {torch.float8_e4m3fn, torch.float8_e5m2} & {q_data_type, kv_data_type}:
+            backend = determine_attention_backend(
+                device,
+                PosEncodingMode[pos_encoding_mode].value,
+                False,  # use_fp16_qk_reductions
+                False,  # use_custom_mask
+                q_data_type,
+                kv_data_type,
+                head_dim_qk=head_dim,
+                head_dim_vo=head_dim,
+            )
+        else:
+            backend = "fa2"
+    if q_len_per_req > 1 and backend == "fa3":
+        raise NotImplementedError(
+            "q_len_per_req > 1 is currently only supported on the "
+            "fa2 tensor-core backend."
+        )
+    return backend
 
 
 class BatchDecodeWithPagedKVCacheWrapper:
@@ -1327,26 +1370,15 @@ class BatchDecodeWithPagedKVCacheWrapper:
             if self._jit_module is not None:
                 module = self._jit_module
             else:
-                if backend == "auto":
-                    if {
-                        torch.float8_e4m3fn,
-                        torch.float8_e5m2,
-                    } & {q_data_type, kv_data_type}:
-                        backend = determine_attention_backend(
-                            self.device,
-                            PosEncodingMode[pos_encoding_mode].value,
-                            False,  # use_fp16_qk_reductions
-                            False,  # use_custom_mask
-                            q_data_type,
-                            kv_data_type,
-                        )
-                    else:
-                        backend = "fa2"
-                if q_len_per_req > 1 and backend == "fa3":
-                    raise NotImplementedError(
-                        "q_len_per_req > 1 is currently only supported on the "
-                        "fa2 tensor-core backend."
-                    )
+                backend = _resolve_decode_tensor_core_backend(
+                    backend,
+                    self.device,
+                    pos_encoding_mode,
+                    q_data_type,
+                    kv_data_type,
+                    head_dim,
+                    q_len_per_req,
+                )
                 module = get_batch_prefill_module(
                     backend,
                     q_data_type,
@@ -1422,6 +1454,211 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 f"workspace_size is not available for decode backend {backend!r}"
             )
         float_workspace_size, int_workspace_size = module.workspace_size(*args)
+        return int(float_workspace_size), int(int_workspace_size)
+
+    @flashinfer_api
+    def workspace_size_upper_bound(
+        self,
+        *,
+        max_batch_size: int,
+        max_num_pages_per_request: int,
+        num_qo_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        page_size: int,
+        pos_encoding_mode: str = "NONE",
+        window_left: int = -1,
+        logits_soft_cap: Optional[float] = None,
+        q_data_type: Optional[Union[str, torch.dtype]] = "float16",
+        kv_data_type: Optional[Union[str, torch.dtype]] = None,
+        o_data_type: Optional[Union[str, torch.dtype]] = None,
+        q_len_per_req: int = 1,
+        fixed_split_size: Optional[int] = None,
+        disable_split_kv: bool = False,
+    ) -> Tuple[int, int]:
+        r"""Return a workspace size no plan within the given bounds can exceed.
+
+        :meth:`workspace_size` answers for one specific ``plan()``. This answers
+        for every ``plan()`` with at most ``max_batch_size`` requests of at most
+        ``max_num_pages_per_request`` pages each, so a caller that must reserve
+        before it knows the shapes it will serve can size the buffers once.
+
+        The bound comes from the same work-estimation call the real plan makes,
+        run against the largest batch of the longest requests, and from the
+        ceiling the partition search enforces on ``padded_batch_size``. It
+        always assumes the partitioned kernel, which is the allocating case.
+
+        Parameters
+        ----------
+        max_batch_size : int
+            Largest ``batch_size`` (that is, ``len(indptr) - 1``) any plan will use.
+        max_num_pages_per_request : int
+            Largest paged-KV length of a single request, in pages.
+        num_qo_heads : int
+            The number of query/output heads.
+        num_kv_heads : int
+            The number of key/value heads.
+        head_dim : int
+            The dimension of the heads.
+        page_size : int
+            The size of each page in the paged kv-cache.
+        pos_encoding_mode : str
+            The position encoding applied inside attention kernels, could be
+            ``NONE``/``ROPE_LLAMA`` (LLAMA style rotary embedding) /``ALIBI``.
+            Defaults to ``NONE``.
+        window_left : int
+            The left (inclusive) window size for the attention window, when set to ``-1``,
+            the window size will be set to the full length of the sequence.
+            Defaults to ``-1``.
+        logits_soft_cap : Optional[float]
+            The attention logits soft capping value (used in Gemini, Grok and Gemma-2,
+            etc.), if not provided, will be set to ``0``.
+        q_data_type : Optional[Union[str, torch.dtype]]
+            The data type of the query tensor. Defaults to ``torch.float16``.
+        kv_data_type : Optional[Union[str, torch.dtype]]
+            The data type of the key/value tensor. If ``None``, will be set to
+            ``q_data_type``.
+        o_data_type : Optional[Union[str, torch.dtype]]
+            The data type of the output tensor. If ``None``, will be set to
+            ``q_data_type``.
+        q_len_per_req : int
+            Query rows per request, for the tensor-core path where decode is
+            planned as a prefill. Defaults to ``1``.
+        fixed_split_size : Optional[int]
+            The fixed split size the plans will use, in pages. A fixed split
+            bypasses the scheduler's own ceiling, so the bound has to know
+            about it. Only the tensor-core path accepts one.
+        disable_split_kv : bool
+            Whether the plans will disable split-kv. Defaults to ``False``.
+            Only the tensor-core path accepts it.
+
+        Returns
+        -------
+        Tuple[int, int]
+            ``(float_workspace_size, int_workspace_size)`` in bytes.
+
+        Raises
+        ------
+        NotImplementedError
+            If the resolved backend cannot bound its workspace. Callers must
+            fall back to their own default allocation in that case.
+        """
+        if max_batch_size < 0 or max_num_pages_per_request < 0:
+            raise ValueError("workspace_size_upper_bound bounds must be non-negative")
+        if q_len_per_req < 1:
+            raise ValueError("q_len_per_req must be at least 1")
+
+        q_data_type = canonicalize_torch_dtype(q_data_type)
+        if kv_data_type is None:
+            kv_data_type = q_data_type
+        kv_data_type = canonicalize_torch_dtype(kv_data_type)
+        if o_data_type is None:
+            o_data_type = q_data_type
+        o_data_type = canonicalize_torch_dtype(o_data_type)
+        if logits_soft_cap is None:
+            logits_soft_cap = 0.0
+
+        backend = self._backend
+        if backend in ("cute-dsl", "trtllm-gen"):
+            raise NotImplementedError(
+                "workspace_size_upper_bound is not available for decode backend "
+                f"{backend!r}"
+            )
+
+        if self.use_tensor_cores:
+            # The tensor-core path plans decode through the prefill scheduler,
+            # so its bound is the prefill bound for q_len_per_req rows each.
+            # Which prefill scheduler it gets depends on the dtypes, so it is
+            # resolved the way plan() resolves it rather than assumed.
+            if self._jit_module is not None:
+                module = self._jit_module
+            else:
+                backend = _resolve_decode_tensor_core_backend(
+                    backend,
+                    self.device,
+                    pos_encoding_mode,
+                    q_data_type,
+                    kv_data_type,
+                    head_dim,
+                    q_len_per_req,
+                )
+                module = get_batch_prefill_module(
+                    backend,
+                    q_data_type,
+                    kv_data_type,
+                    o_data_type,
+                    torch.int32,
+                    head_dim,
+                    head_dim,
+                    PosEncodingMode[pos_encoding_mode].value,
+                    window_left >= 0,
+                    logits_soft_cap > 0,
+                    False,
+                )
+            bound_fn = getattr(module, "workspace_size_upper_bound", None)
+            if bound_fn is None:
+                raise NotImplementedError(
+                    "workspace_size_upper_bound is not available for decode "
+                    f"backend {backend!r}"
+                )
+            args = [
+                self._float_workspace_buffer,
+                max_batch_size,
+                max_batch_size * q_len_per_req,
+                max_num_pages_per_request,
+                num_qo_heads,
+                num_kv_heads,
+                page_size,
+                self.is_cuda_graph_enabled,
+                head_dim,
+                head_dim,
+                -1 if fixed_split_size is None else fixed_split_size,
+                disable_split_kv,
+                0,  # num_colocated_ctas
+            ]
+        else:
+            if fixed_split_size is not None or disable_split_kv:
+                raise NotImplementedError(
+                    "fixed_split_size and disable_split_kv are only accepted "
+                    "on the tensor-core decode path"
+                )
+            if self._jit_module is not None:
+                module = self._jit_module
+            else:
+                module = get_batch_decode_module(
+                    q_data_type,
+                    kv_data_type,
+                    o_data_type,
+                    torch.int32,
+                    head_dim,
+                    head_dim,
+                    PosEncodingMode[pos_encoding_mode].value,
+                    window_left != -1,
+                    logits_soft_cap > 0,
+                )
+            bound_fn = getattr(module, "workspace_size_upper_bound", None)
+            if bound_fn is None:
+                raise NotImplementedError(
+                    "workspace_size_upper_bound is not available for decode "
+                    f"backend {backend!r}"
+                )
+            args = [
+                self._float_workspace_buffer,
+                max_batch_size,
+                max_num_pages_per_request,
+                num_qo_heads,
+                num_kv_heads,
+                page_size,
+                self.is_cuda_graph_enabled,
+                window_left,
+                logits_soft_cap,
+                head_dim,
+                head_dim,
+                torch.empty(0, dtype=q_data_type),
+                torch.empty(0, dtype=kv_data_type),
+            ]
+
+        float_workspace_size, int_workspace_size = bound_fn(*args)
         return int(float_workspace_size), int(int_workspace_size)
 
     @flashinfer_api(trace=gqa_paged_decode_plan_trace)
@@ -1922,28 +2159,15 @@ class BatchDecodeWithPagedKVCacheWrapper:
             if self._jit_module is not None:
                 self._cached_module = self._jit_module
             else:
-                if self._backend == "auto":
-                    if {
-                        torch.float8_e4m3fn,
-                        torch.float8_e5m2,
-                    } & {q_data_type, kv_data_type}:
-                        self._backend = determine_attention_backend(
-                            self.device,
-                            PosEncodingMode[pos_encoding_mode].value,
-                            False,  # use_fp16_qk_reductions
-                            False,  # use_custom_mask
-                            q_data_type,
-                            kv_data_type,
-                            head_dim_qk=head_dim,
-                            head_dim_vo=head_dim,
-                        )
-                    else:
-                        self._backend = "fa2"
-                if q_len_per_req > 1 and self._backend == "fa3":
-                    raise NotImplementedError(
-                        "q_len_per_req > 1 is currently only supported on the "
-                        "fa2 tensor-core backend."
-                    )
+                self._backend = _resolve_decode_tensor_core_backend(
+                    self._backend,
+                    self.device,
+                    pos_encoding_mode,
+                    q_data_type,
+                    kv_data_type,
+                    head_dim,
+                    q_len_per_req,
+                )
                 self._cached_module = get_batch_prefill_module(
                     self._backend,
                     q_data_type,
