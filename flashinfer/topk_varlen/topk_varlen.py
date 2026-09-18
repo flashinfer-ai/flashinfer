@@ -174,6 +174,7 @@ def _radix_cutlass_top_k_varlen_check(
     workspace=None,
     row_starts=None,
     max_seq_len=None,
+    absolute_indices=False,
 ):  # extra kwargs mirror the public signature; unused by the check
     """Radix masked-fallback: runs on all supported SM tiers, on contiguous
     logits (the CUDA launcher checks contiguity; gating here lets ``auto``
@@ -233,6 +234,7 @@ def _gvr_top_k_varlen_check(
     workspace=None,
     row_starts=None,
     max_seq_len=None,
+    absolute_indices=False,
 ):
     """Return True only when GVR can run on this exact configuration.
 
@@ -282,6 +284,7 @@ def _gvr2_top_k_varlen_check(
     workspace=None,
     row_starts=None,
     max_seq_len=None,
+    absolute_indices=False,
 ):
     """Return True only when the self-sampling GVR V2 port can run this config.
 
@@ -343,6 +346,7 @@ def _top_k_varlen_heuristic(
     workspace=None,
     row_starts=None,
     max_seq_len=None,
+    absolute_indices=False,
 ):
     """Shape/dtype-aware ranking so auto tracks the measured per-config winner.
 
@@ -1100,6 +1104,7 @@ def _run_gvr2(
     workspace: Optional[dict] = None,
     row_starts: Optional[torch.Tensor] = None,
     max_seq_len: Optional[int] = None,
+    absolute_indices: bool = False,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Self-sampling GVR V2: one launch for the whole batch via the per-row
     in-kernel varlen engine (TRT-LLM ``run_varlen`` port). ``row_starts``
@@ -1144,6 +1149,7 @@ def _run_gvr2(
         workspace=workspace.get("gvr2_workspace") if workspace else None,
         top_k=top_k,
         row_starts=row_starts,
+        absolute_indices=absolute_indices,
     )
     return out_indices, (out_values if return_output_values else None)
 
@@ -1287,6 +1293,7 @@ def _radix_top_k_varlen_check(
     workspace=None,
     row_starts=None,
     max_seq_len=None,
+    absolute_indices=False,
 ):
     """CuTe DSL multi-CTA radix: Blackwell-plus only, no pre_idx required.
     Overlapping row layouts (stride(0) < shape[1]) fail the kernel's stride
@@ -1430,6 +1437,7 @@ def _radix_filter_top_k_varlen_check(
     workspace=None,
     row_starts=None,
     max_seq_len=None,
+    absolute_indices=False,
 ):
     """Return True only when the vendored DKG kernel covers this configuration.
 
@@ -1562,6 +1570,7 @@ def top_k_varlen(
     workspace: Optional[dict] = None,
     row_starts: Optional[torch.Tensor] = None,
     max_seq_len: Optional[int] = None,
+    absolute_indices: bool = False,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     r"""Top-K selection over batched decode-step logits.
 
@@ -1612,7 +1621,8 @@ def top_k_varlen(
         Windowed (prefill) mode. 1-D ``int32`` CUDA tensor of shape
         ``(num_rows,)``: row ``r``'s candidates are
         ``logits[r, row_starts[r] : row_starts[r] + seq_lens[r]]`` and the
-        returned indices are LOCAL to that window (``column - row_starts[r]``),
+        returned indices are LOCAL to that window (``column - row_starts[r]``;
+        absolute columns with ``absolute_indices=True``),
         ``-1`` padded, identity for windows shorter than ``top_k``. This is the
         DSA prefill-indexer layout: every request's keys packed along the
         column axis, one query row per prompt token with a causal window into
@@ -1635,6 +1645,17 @@ def top_k_varlen(
         ``-1`` on the register engine (never a truncated ranking); a bound
         larger than the logits width is clamped. Ignored when ``row_starts``
         is ``None``.
+    absolute_indices : bool, optional
+        Windowed mode only. ``True`` returns each hit as its absolute column
+        of ``logits`` (``window-local index + row_starts[r]``) instead of the
+        window-local index; ``-1`` padding is unchanged. In the DSA prefill
+        layout the column axis is the batch's packed key sequence, so this
+        is the flattened-KV position the sparse-attention kernel consumes
+        directly, saving the framework a separate offset-add launch over
+        ``num_rows * top_k`` indices. Fused into the kernels' index emit (no
+        extra memory traffic); a distinct compiled variant, so warm up with
+        the same value (``warmup_prefill(..., absolute_indices=True)``).
+        Default ``False``.
     top_k : int
         Number of top elements per row.  GVR backend supports
         ``{512, 1024, 2048}``; radix backend has no restriction.
@@ -1934,6 +1955,15 @@ def top_k_varlen(
             raise ValueError(
                 f"max_seq_len must be a positive int (window-length bound), got {max_seq_len!r}"
             )
+        if not isinstance(absolute_indices, bool):
+            raise ValueError(
+                f"absolute_indices must be a bool, got {absolute_indices!r}"
+            )
+    elif absolute_indices:
+        raise ValueError(
+            "absolute_indices=True requires row_starts (windowed mode): decode "
+            "indices are already columns of logits"
+        )
 
     # A malformed hint is discarded, loudly: the call runs hint-free (the
     # checkers above already treated it as absent, so `auto` never selected a
@@ -2074,6 +2104,7 @@ def top_k_varlen(
             workspace=workspace,
             row_starts=row_starts,
             max_seq_len=max_seq_len,
+            absolute_indices=absolute_indices,
         )
     elif row_starts is not None:
         # reachable under skip_check=True only (the checkers refuse it)
