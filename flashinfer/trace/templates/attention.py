@@ -5023,6 +5023,17 @@ _CUDNN_PAGED_AXES: dict[str, Var | Const] = {
     "page_size": Const(abbrev="ps"),
 }
 
+# Decode-only: q / output carry batch_size * q_len_per_req rows (one request's
+# rows consecutive), while block_tables and the per-request lengths keep
+# batch_size rows. Kept out of _CUDNN_PAGED_AXES because prefill uses that map
+# with num_tokens.
+_CUDNN_PAGED_DECODE_AXES: dict[str, Var | Const] = {
+    **_CUDNN_PAGED_AXES,
+    "num_q_rows": Var(
+        description="q.shape[0] = batch_size * q_len_per_req (batch_size for one-token decode)."
+    ),
+}
+
 
 @torch.no_grad()
 def _cudnn_batch_decode_reference(
@@ -5169,11 +5180,12 @@ cudnn_batch_decode_trace = TraceTemplate(
     description=(
         "Standalone cuDNN paged decode. Separate k_cache/v_cache "
         "[total_num_pages, Hkv, page_size, D], rectangular block_tables, "
-        "single sm_scale. No plan() — block_tables passed at call time."
+        "single sm_scale. No plan() — block_tables passed at call time. "
+        "q has num_q_rows = batch_size * q_len_per_req rows."
     ),
-    axes=_CUDNN_PAGED_AXES,
+    axes=_CUDNN_PAGED_DECODE_AXES,
     inputs={
-        "q": Tensor(["batch_size", "num_heads_qo", "head_dim"]),
+        "q": Tensor(["num_q_rows", "num_heads_qo", "head_dim"]),
         "k_cache": Tensor(["total_num_pages", "num_heads_kv", "page_size", "head_dim"]),
         "v_cache": Tensor(["total_num_pages", "num_heads_kv", "page_size", "head_dim"]),
         "scale": Scalar("float32", description="Softmax scale, typically 1/sqrt(d)."),
@@ -5207,7 +5219,7 @@ cudnn_batch_decode_trace = TraceTemplate(
         ),
     },
     outputs={
-        "output": Tensor(["batch_size", "num_heads_qo", "head_dim"], dtype_from="q"),
+        "output": Tensor(["num_q_rows", "num_heads_qo", "head_dim"], dtype_from="q"),
     },
     tags=["status:verified", "stage:decode", "backend:cudnn"],
     reference=_cudnn_batch_decode_reference,

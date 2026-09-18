@@ -773,6 +773,14 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 f"[INFO] {cudnn_backend} backend does not support speculative decode. Skipping."
             )
             remove_cudnn = True
+        elif speculative_decode and spec_dec_mask_mode != "causal":
+            # The cudnn graph applies the bottom-right causal diagonal to
+            # multi-token rows; it takes no explicit draft-block mask.
+            print(
+                f"[INFO] {cudnn_backend} backend applies the causal mask to multi-token "
+                f"decode; spec_dec_mask={spec_dec_mask_mode!r} is not supported. Skipping."
+            )
+            remove_cudnn = True
         if not (q_dtype == kv_dtype == o_data_type) or q_dtype not in (
             torch.bfloat16,
             torch.float16,

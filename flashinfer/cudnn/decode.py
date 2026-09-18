@@ -1,5 +1,5 @@
 from enum import Enum
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 import torch
 
@@ -246,7 +246,7 @@ if CUDNN_AVAILABLE:
             # alignment (the diagonal is its right bound). FlashInfer's
             # window_left counts the keys strictly before the diagonal; cuDNN's
             # left bound counts the diagonal too, hence the + 1.
-            mask_kwargs = {}
+            mask_kwargs: dict[str, Any] = {}
             if s_qo > 1 or window_left >= 0:
                 mask_kwargs["use_causal_mask_bottom_right"] = True
             if window_left >= 0:
