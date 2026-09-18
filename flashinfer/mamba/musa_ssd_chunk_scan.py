@@ -7,6 +7,8 @@
 # ruff: noqa: E501,SIM102
 
 
+import os
+
 from packaging import version
 
 from .musa_ssd_helpers import fast_exp
@@ -20,7 +22,46 @@ def is_musa_triton_32():
     return triton.__version__.split(".")[:2] == ["3", "2"]
 
 
+def _scan_config_override():
+    """Return one explicit tile for isolated S5000 benchmark runs.
+
+    The override is intentionally opt-in and evaluated before Triton's
+    autotune decorator is built.  Production callers retain the existing
+    version-gated configuration unless a benchmark process explicitly sets
+    ``FLASHINFER_MUSA_SSD_SCAN_CONFIG`` to a value such as
+    ``32x32x32x1x4``.  Keeping this hook in the provider lets us compare
+    configs with identical Python wrappers and metadata, instead of copying
+    the kernel into a separate benchmark-only implementation.
+    """
+    raw = os.environ.get("FLASHINFER_MUSA_SSD_SCAN_CONFIG", "").strip().lower()
+    if not raw:
+        return None
+    fields = raw.replace("-", "x").split("x")
+    if len(fields) != 5:
+        raise ValueError(
+            "FLASHINFER_MUSA_SSD_SCAN_CONFIG must be MxNxKxstagesxwarps"
+        )
+    try:
+        m, n, k, stages, warps = (int(field) for field in fields)
+    except ValueError as exc:
+        raise ValueError(
+            "FLASHINFER_MUSA_SSD_SCAN_CONFIG must be MxNxKxstagesxwarps"
+        ) from exc
+    if min(m, n, k, stages, warps) <= 0:
+        raise ValueError("FLASHINFER_MUSA_SSD_SCAN_CONFIG values must be positive")
+    return [
+        triton.Config(
+            {"BLOCK_SIZE_M": m, "BLOCK_SIZE_N": n, "BLOCK_SIZE_K": k},
+            num_stages=stages,
+            num_warps=warps,
+        )
+    ]
+
+
 def _ssd_autotune_configs():
+    override = _scan_config_override()
+    if override is not None:
+        return override
     # MUSA Triton 3.2.x cannot compile the
     # broad upstream autotune search. Use a conservative tile only for that
     # stack while preserving CUDA/ROCm and newer Triton behavior.
