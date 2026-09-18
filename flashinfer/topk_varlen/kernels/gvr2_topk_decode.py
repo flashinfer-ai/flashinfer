@@ -3763,6 +3763,7 @@ class GvrTopkRegKernel:
         paged: bool = False,
         page_shift: int = 0,
         pt_smem: int = 0,
+        stage_out: bool = True,
     ):
         assert blk in (256, 512, 1024) and vpt in (1, 2, 4)
         assert nbh in (256, 512, 1024, 2048)
@@ -3806,6 +3807,10 @@ class GvrTopkRegKernel:
         # kernel on this family without it).
         self.pt_smem = int(pt_smem)
         assert self.pt_smem == 0 or (self.paged and self.pt_smem & (self.pt_smem - 1) == 0)
+        # staged coalesced output (k-word smem region + one copy pass): a win when
+        # the launch is one wave (latency-bound), a 3-4% loss when it is
+        # throughput-bound over several waves -- the host picks per launch
+        self.stage_out = bool(stage_out)
         self.use_bm = (not deg) and (not img) and kpt >= 2 and vpt == 1 and (not hint_free)
         self.use_img = img and vpt == 1 and (not hint_free)
         # hint-free bracket policy (FlashInfer-local refinement of TRT-LLM
@@ -3881,6 +3886,25 @@ class GvrTopkRegKernel:
         tid, _, _ = cute.arch.thread_idx()
         row, _, _ = cute.arch.block_idx()
         lane = tid & cutlass.Int32(31)
+
+        # ---- early row load (decode): the float4 batch is bounded by the launch
+        # envelope `n` (<= the row width, so memory-safe), issued BEFORE the per-row
+        # length read below so the two global latencies overlap instead of
+        # serializing (measured ~0.3 us of a 3.5 us kernel at N=4096). Lanes at or
+        # beyond the row's own float4 count are -inf-filled in the body. Prefill
+        # keeps its in-body load: its base depends on the row_starts read.
+        n4e = n >> cutlass.Int32(2)
+        atom128 = g2r_atom_f32(128, invariant=True)
+        frags = [cute.make_rmem_tensor((4,), cutlass.Float32) for _ in range(VPT)]
+        if cutlass.const_expr(not self.prefill):
+            x_addr0 = logits[row, None].iterator.toint()
+            for u in cutlass.range_constexpr(VPT):
+                ie = tid + cutlass.Int32(u * self.blk)
+                if ie < n4e:
+                    ld_g_f32x4(atom128, x_addr0, ie, frags[u])
+                else:
+                    for q in cutlass.range_constexpr(4):
+                        frags[u][q] = cutlass.Float32(_NEG_INF__reg)
 
         # ================= per-row varlen prologue (varlen mode only) =========
         # Production heuristicTopKDecode contract (GvrMainKernel /
@@ -4135,6 +4159,25 @@ class GvrTopkRegKernel:
                         ent = pre_idx[req_pt, jp]
                     s_pt[jp] = ent
                     jp = jp + cutlass.Int32(BLK)
+            # ---- output staging: the emit positions of a warp are scattered (per-bin
+            # cursors), so direct global stores cost one L1 sector per index (5x the
+            # sectors of a coalesced write, ~1 us at k=2048 on B200). Stage the k
+            # outputs in smem and write them coalesced at the end (see the tail).
+            s_out = ck  # placeholder view when the output is written directly
+            if cutlass.const_expr(self.stage_out):
+                s_out = cute.make_tensor(
+                    cute.make_ptr(
+                        cutlass.Int32,
+                        sbase + smem_bytes - cutlass.Int32(self.pt_smem * 4) - k * cutlass.Int32(4),
+                        cute.AddressSpace.smem,
+                        assumed_align=16,
+                    ),
+                    cute.make_layout((65536,)),
+                )  # typed view, no bound (k live entries)
+                io = tid
+                while io < k:
+                    s_out[io] = cutlass.Int32(-1)  # unwritten slots surface as pads
+                    io = io + cutlass.Int32(BLK)
             n4 = n >> cutlass.Int32(2)
             ntail = n - (n4 << cutlass.Int32(2))
             tix = (n4 << cutlass.Int32(2)) + tid  # CUDA `tidx`
@@ -4153,20 +4196,27 @@ class GvrTopkRegKernel:
                             pv = ld_g_i32(p_addr, j)
                     pvs.append(pv)
 
-            # ---- row load: exact-fit peel + float4[VPT] register batch
-            atom128 = g2r_atom_f32(128, invariant=True)
-            frags = [cute.make_rmem_tensor((4,), cutlass.Float32) for _ in range(VPT)]
-            if n4 >= cutlass.Int32(self.blk * self.vpt):  # block-uniform peel
-                for u in cutlass.range_constexpr(VPT):
-                    ld_g_f32x4(atom128, x_addr, tid + cutlass.Int32(u * self.blk), frags[u])
-            else:  # predicated flat batch
+            # ---- row load: prefill loads here (window base from row_starts); the
+            # decode path loaded the envelope at kernel start and only masks the
+            # lanes beyond this row's float4 count
+            if cutlass.const_expr(self.prefill):
+                if n4 >= cutlass.Int32(self.blk * self.vpt):  # block-uniform peel
+                    for u in cutlass.range_constexpr(VPT):
+                        ld_g_f32x4(atom128, x_addr, tid + cutlass.Int32(u * self.blk), frags[u])
+                else:  # predicated flat batch
+                    for u in cutlass.range_constexpr(VPT):
+                        i = tid + cutlass.Int32(u * self.blk)
+                        if i < n4:
+                            ld_g_f32x4(atom128, x_addr, i, frags[u])
+                    for u in cutlass.range_constexpr(VPT):
+                        i = tid + cutlass.Int32(u * self.blk)
+                        if i >= n4:  # -INFINITY fill
+                            for q in cutlass.range_constexpr(4):
+                                frags[u][q] = cutlass.Float32(_NEG_INF__reg)
+            else:
                 for u in cutlass.range_constexpr(VPT):
                     i = tid + cutlass.Int32(u * self.blk)
-                    if i < n4:
-                        ld_g_f32x4(atom128, x_addr, i, frags[u])
-                for u in cutlass.range_constexpr(VPT):
-                    i = tid + cutlass.Int32(u * self.blk)
-                    if i >= n4:  # -INFINITY fill
+                    if i >= n4:  # beyond this row's length: -INFINITY fill
                         for q in cutlass.range_constexpr(4):
                             frags[u][q] = cutlass.Float32(_NEG_INF__reg)
 
@@ -4580,10 +4630,16 @@ class GvrTopkRegKernel:
                     p2e = b2 + popc(n2 & lml)
                     if q1e == cutlass.Int32(1):
                         if p1e < nA:
-                            out_row[p1e] = self._ox(pre_idx, s_pt, ixv + ofs_e)
+                            if cutlass.const_expr(self.stage_out):
+                                s_out[p1e] = ixv + ofs_e
+                            else:
+                                out_row[p1e] = self._ox(pre_idx, s_pt, ixv + ofs_e)
                     if q2e == cutlass.Int32(1):
                         if p2e < nT:
-                            out_row[nA + p2e] = self._ox(pre_idx, s_pt, ixv + ofs_e)
+                            if cutlass.const_expr(self.stage_out):
+                                s_out[nA + p2e] = ixv + ofs_e
+                            else:
+                                out_row[nA + p2e] = self._ox(pre_idx, s_pt, ixv + ofs_e)
                 # tail element
                 u64 = cutlass.Int64(-1)
                 if tid < ntail:
@@ -4609,10 +4665,16 @@ class GvrTopkRegKernel:
                 p2e = b2 + popc(n2 & lml)
                 if q1e == cutlass.Int32(1):
                     if p1e < nA:
-                        out_row[p1e] = self._ox(pre_idx, s_pt, tix + ofs_e)
+                        if cutlass.const_expr(self.stage_out):
+                            s_out[p1e] = tix + ofs_e
+                        else:
+                            out_row[p1e] = self._ox(pre_idx, s_pt, tix + ofs_e)
                 if q2e == cutlass.Int32(1):
                     if p2e < nT:
-                        out_row[nA + p2e] = self._ox(pre_idx, s_pt, tix + ofs_e)
+                        if cutlass.const_expr(self.stage_out):
+                            s_out[nA + p2e] = tix + ofs_e
+                        else:
+                            out_row[nA + p2e] = self._ox(pre_idx, s_pt, tix + ofs_e)
                 # (CUDA returns here — everything below is the else-arm)
             else:
                 # ---- emit
@@ -4649,7 +4711,10 @@ class GvrTopkRegKernel:
                                     s_hist.iterator + cutlass.Int32(bn), cutlass.Int32(1)
                                 )
                                 if p < lim1:
-                                    out_row[p] = self._ox(pre_idx, s_pt, idx + ofs_e)
+                                    if cutlass.const_expr(self.stage_out):
+                                        s_out[p] = idx + ofs_e
+                                    else:
+                                        out_row[p] = self._ox(pre_idx, s_pt, idx + ofs_e)
                                 else:
                                     if whole == cutlass.Int32(0):
                                         q2i = p - above
@@ -4666,7 +4731,10 @@ class GvrTopkRegKernel:
                         bn = _umin_u32(f2u_rz(qt2), cutlass.Uint32(self.nbh - 1))
                         p = atomic_add_cta(s_hist.iterator + cutlass.Int32(bn), cutlass.Int32(1))
                         if p < lim1:
-                            out_row[p] = self._ox(pre_idx, s_pt, tix + ofs_e)
+                            if cutlass.const_expr(self.stage_out):
+                                s_out[p] = tix + ofs_e
+                            else:
+                                out_row[p] = self._ox(pre_idx, s_pt, tix + ofs_e)
                         else:
                             if whole == cutlass.Int32(0):
                                 q2i = p - above
@@ -4742,12 +4810,18 @@ class GvrTopkRegKernel:
                             << cutlass.Int32(2)
                         ) + (sdyn & cutlass.Int32(3))
                         if p1 < lim1:
-                            out_row[p1] = self._ox(pre_idx, s_pt, idx + ofs_e)
+                            if cutlass.const_expr(self.stage_out):
+                                s_out[p1] = idx + ofs_e
+                            else:
+                                out_row[p1] = self._ox(pre_idx, s_pt, idx + ofs_e)
                         p1 = p1 + cutlass.Int32(1)
                         wm = wm & (wm - cutlass.Int32(1))
                     if t1 == cutlass.Int32(1):
                         if p1 < lim1:
-                            out_row[p1] = self._ox(pre_idx, s_pt, tix + ofs_e)
+                            if cutlass.const_expr(self.stage_out):
+                                s_out[p1] = tix + ofs_e
+                            else:
+                                out_row[p1] = self._ox(pre_idx, s_pt, tix + ofs_e)
                         p1 = p1 + cutlass.Int32(1)
                     if m2 != cutlass.Int32(0):  # static-unrolled
                         for s in cutlass.range_constexpr(S):
@@ -4798,7 +4872,10 @@ class GvrTopkRegKernel:
                                 r = r + tinc
                                 j = j + cutlass.Int32(1)
                             if r < need:
-                                out_row[above + r] = self._ox(pre_idx, s_pt, ci[i])
+                                if cutlass.const_expr(self.stage_out):
+                                    s_out[above + r] = ci[i]
+                                else:
+                                    out_row[above + r] = self._ox(pre_idx, s_pt, ci[i])
                             i = i + cutlass.Int32(BLK)
                     else:
                         # ---- fallback: exact key-space narrowing
@@ -4914,11 +4991,27 @@ class GvrTopkRegKernel:
                             p2e = b2 + popc(n2 & lml)
                             if q1f == cutlass.Int32(1):
                                 if p1e < aboveC:
-                                    out_row[above + p1e] = self._ox(pre_idx, s_pt, idv)
+                                    if cutlass.const_expr(self.stage_out):
+                                        s_out[above + p1e] = idv
+                                    else:
+                                        out_row[above + p1e] = self._ox(pre_idx, s_pt, idv)
                             if q2f == cutlass.Int32(1):
                                 if p2e < needC:
-                                    out_row[above + aboveC + p2e] = self._ox(pre_idx, s_pt, idv)
+                                    if cutlass.const_expr(self.stage_out):
+                                        s_out[above + aboveC + p2e] = idv
+                                    else:
+                                        out_row[above + aboveC + p2e] = self._ox(pre_idx, s_pt, idv)
                             it = it + cutlass.Int32(1)
+            # ---- coalesced output write (all emit paths converge here) ----
+            if cutlass.const_expr(self.stage_out):
+                cute.arch.barrier()  # staged outputs complete
+                io = tid
+                while io < k:
+                    vo = cutlass.Int32(s_out[io])
+                    if vo >= cutlass.Int32(0):
+                        vo = self._ox(pre_idx, s_pt, vo)
+                    out_row[io] = vo
+                    io = io + cutlass.Int32(BLK)
 
     # ------------------------------------------------------------------
     @cute.jit
@@ -4964,6 +5057,7 @@ def get_compiled__reg(
     paged=False,
     page_shift=0,
     pt_smem=0,
+    stage_out=True,
 ):
     """Compile (or fetch) the variant for constexpr tuple
     (BLK, VPT, MINB, KPT, CUR, DEG, IMG, NBH).
@@ -4992,6 +5086,7 @@ def get_compiled__reg(
         paged,
         int(page_shift) if paged else 0,
         int(pt_smem) if paged else 0,
+        bool(stage_out),
         C._compile_arch_token(),
     )
     compiled = _COMPILE_CACHE__reg.get(key)
@@ -5018,6 +5113,7 @@ def get_compiled__reg(
             paged=paged,
             page_shift=int(page_shift) if paged else 0,
             pt_smem=int(pt_smem) if paged else 0,
+            stage_out=bool(stage_out),
         )
         nb_, nc_ = cute.sym_int(), cute.sym_int()
         nb2_, nc2_ = cute.sym_int(), cute.sym_int()
@@ -5079,6 +5175,7 @@ def get_compiled__reg(
                 + ("_abs" if (prefill and prefill_abs) else "")
                 + (f"_pg{int(page_shift)}" if paged else "")
                 + (f"_pts{int(pt_smem)}" if (paged and pt_smem) else "")
+                + ("" if stage_out else "_ds")
             )
             compiled = C._persist(name, _compile_fn)
         _COMPILE_CACHE__reg[key] = compiled
@@ -5102,7 +5199,7 @@ def reg_topk(logits, pre_idx, n, out, rd=None):
     rt = rd["rt"]
     assert rt["IMGOFF"] == tpl[7], (rt["IMGOFF"], tpl[7])  # IMGOFF == NBH
     compiled = get_compiled__reg(tpl)
-    smem = STATIC_BYTES + rd["smem"]
+    smem = STATIC_BYTES + rd["smem"] + 4 * pre_idx.shape[1]  # + output staging
     try:
         from .gvr2_topk_host import _dummy_kv
     except ImportError:
