@@ -1225,3 +1225,41 @@ if __name__ == "__main__":
     # test_top_k_mask_logits(99, 989, 10)
     # test_chain_speculative_sampling(3, 111, 3, False)
     # test_chain_speculative_sampling(3, 111, 3, True)
+
+
+@pytest.mark.parametrize("api", ["top_k", "top_k_top_p"])
+@pytest.mark.parametrize("indices_dtype", [torch.int32, torch.int64])
+def test_per_request_top_k_with_indices_dtype(api, indices_dtype):
+    """A per-request top_k must be read correctly for both ``indices`` dtypes.
+
+    The kernel reads ``top_k_arr`` with the element type it uses for ``indices`` and
+    the output, so an int64 ``indices`` used to reinterpret pairs of int32 thresholds
+    as one int64 and read past the end of the array. Three identical rows with
+    k = 1 / 2 / 4 give three distinct exact answers.
+    """
+    row = [0.5, 0.25, 0.125, 0.125]
+    probs = torch.tensor([row] * 3, dtype=torch.float32, device="cuda:0")
+    top_k = torch.tensor([1, 2, 4], dtype=torch.int64, device="cuda:0")
+    indices = torch.arange(3, dtype=indices_dtype, device="cuda:0")
+    lanes = torch.arange(3, device="cuda:0")
+    seen = torch.zeros(3, len(row), dtype=torch.bool, device="cuda:0")
+    # 512 launches: the smallest retained class has probability 1/8, so a lane misses
+    # one with probability at most 4 * (7/8)**512 (~1e-29).
+    for seed in range(512):
+        if api == "top_k":
+            out = flashinfer.sampling.top_k_sampling_from_probs(
+                probs, top_k, indices=indices, seed=seed, offset=0
+            )
+        else:
+            out = flashinfer.sampling.top_k_top_p_sampling_from_probs(
+                probs,
+                top_k,
+                1.0,
+                indices=indices,
+                filter_apply_order="joint",
+                seed=seed,
+                offset=0,
+            )
+        seen[lanes, out.long()] = True
+    drawn = [sorted(torch.nonzero(seen[i]).flatten().tolist()) for i in range(3)]
+    assert drawn == [[0], [0, 1], [0, 1, 2, 3]], drawn
