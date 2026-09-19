@@ -679,6 +679,11 @@ def _cute_dsl_nvfp4_svdquant_requirement(*args, **kwargs):
     return True
 
 
+@supported_compute_capability([120])
+def _cutlass_sm120_nvfp4_svdquant_requirement(*args, **kwargs):
+    return True
+
+
 def _heuristic_func_nvfp4_svdquant(
     suitable_backends: List[str], *args, **kwargs
 ) -> List[str]:
@@ -687,7 +692,16 @@ def _heuristic_func_nvfp4_svdquant(
     # implementation tuning configuration.
     # The generated Cake implementation is explicit-only; preserve the
     # existing automatic backend selection and autotuning denominator.
-    return [backend for backend in suitable_backends if backend != "cake"]
+    #
+    # cutlass-sm120 is dropped rather than ordered. It is a second SM120
+    # implementation that has never been measured against cute-dsl, so letting
+    # "auto" reach it would be picking a winner by declaration order. Ask for it
+    # by name until the comparison exists.
+    return [
+        backend
+        for backend in suitable_backends
+        if backend not in ("cake", "cutlass-sm120")
+    ]
 
 
 def _check_mm_nvfp4_svdquant_problem(
@@ -701,7 +715,7 @@ def _check_mm_nvfp4_svdquant_problem(
     bias: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
     backend: Literal[
-        "cutlass", "cake", "cute-dsl", "cute-dsl-unfused", "auto"
+        "cutlass", "cake", "cute-dsl", "cute-dsl-unfused", "cutlass-sm120", "auto"
     ] = "auto",
     enable_pdl: Optional[bool] = None,
 ):
@@ -772,6 +786,7 @@ def _check_mm_nvfp4_svdquant_problem(
         "cake": _cake_nvfp4_svdquant_requirement,
         "cute-dsl": _cute_dsl_nvfp4_svdquant_requirement,
         "cute-dsl-unfused": _cute_dsl_nvfp4_svdquant_requirement,
+        "cutlass-sm120": _cutlass_sm120_nvfp4_svdquant_requirement,
     },
     common_check=_check_mm_nvfp4_svdquant_problem,
     heuristic_func=_heuristic_func_nvfp4_svdquant,
@@ -788,7 +803,7 @@ def mm_nvfp4_svdquant(
     bias: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
     backend: Literal[
-        "cutlass", "cake", "cute-dsl", "cute-dsl-unfused", "auto"
+        "cutlass", "cake", "cute-dsl", "cute-dsl-unfused", "cutlass-sm120", "auto"
     ] = "auto",
     enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
@@ -833,12 +848,13 @@ def mm_nvfp4_svdquant(
         SM120/SM121 CuTe DSL kernel.
     out: Optional[torch.Tensor]
         Output tensor, shape ``(m, n)`` bf16; allocated when ``None``.
-    backend: Literal["cutlass", "cake", "cute-dsl", "cute-dsl-unfused", "auto"]
+    backend: Literal["cutlass", "cake", "cute-dsl", "cute-dsl-unfused", "cutlass-sm120", "auto"]
         ``"cutlass"`` selects the existing fused SM100/SM103 implementation;
         ``"cake"`` selects the generated fused SM100/SM103 implementation
         and requires CUDA 13.0 or later;
         ``"cute-dsl"`` selects the fused SM120/SM121 implementation;
         ``"cute-dsl-unfused"`` selects its compositional reference path;
+        ``"cutlass-sm120"`` explicitly selects the SM120 CUTLASS implementation;
         ``"auto"`` (default) selects by compute capability. On SM120/SM121,
         fused and unfused are compared only while autotuning is enabled;
         otherwise the fused-first runner is selected.
@@ -921,6 +937,13 @@ def mm_nvfp4_svdquant(
         )
         runner(inputs=inputs, tactic=tactic)
         return out
+
+    if backend == "cutlass-sm120":
+        from .svdquant_sm120_cutlass import mm_nvfp4_svdquant as _sm120_cutlass_mm
+
+        return _sm120_cutlass_mm(
+            a, b, a_sf, b_sf, alpha_scalar, d, l1, bias, out, enable_pdl
+        )
 
     if backend == "cute-dsl-unfused":
         return _mm_nvfp4_svdquant_sm120_unfused(
@@ -1066,7 +1089,9 @@ def svdquant_linear(
     global_scale: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
     enable_pdl: Optional[bool] = None,
-    backend: Literal["cutlass", "cute-dsl", "cute-dsl-unfused", "auto"] = "auto",
+    backend: Literal[
+        "cutlass", "cute-dsl", "cute-dsl-unfused", "cutlass-sm120", "auto"
+    ] = "auto",
 ) -> torch.Tensor:
     r"""The full SVDQuant linear operator: ``y = x_hat @ (R + L1 @ L2)ᵀ [+ bias]`` where
     ``x_hat = x * pre_quant_scale`` and ``R`` is the NVFP4-quantized residual weight.
@@ -1105,15 +1130,35 @@ def svdquant_linear(
         Optional per-column bias, shape ``(n,)`` bf16.
     enable_pdl: Optional[bool]
         Whether to launch with Programmatic Dependent Launch. Defaults to the device default.
-    backend: Literal["cutlass", "cute-dsl", "cute-dsl-unfused", "auto"]
+    backend: Literal["cutlass", "cute-dsl", "cute-dsl-unfused", "cutlass-sm120", "auto"]
         Backend forwarded to smooth quantization and SVDQuant GEMM. Defaults to
         architecture-based automatic selection.
+        ``"cutlass-sm120"`` supports ranks 32 and 64, with fused or separate
+        quantization and LoRA-down selected by complete-linear autotuning.
 
     Returns
     -------
     out: torch.Tensor
         Output tensor, shape ``(m, n)`` bf16.
     """
+    if backend == "cutlass-sm120":
+        from .svdquant_sm120_cutlass import svdquant_linear as _sm120_cutlass_linear
+
+        # Both ranks can fuse smooth quantization and LoRA-down and tune the
+        # preprocessing route together with the GEMM.
+        return _sm120_cutlass_linear(
+            x,
+            weight_fp4,
+            weight_sf,
+            alpha,
+            pre_quant_scale,
+            l2t_smoothed,
+            l1_scaled,
+            global_scale,
+            bias,
+            enable_pdl,
+        )
+
     quantize_backend = "cute-dsl" if backend == "cute-dsl-unfused" else backend
     xq, x_sf = nvfp4_quantize_smooth(
         x,

@@ -130,6 +130,7 @@ from .jit.gemm import (
     gen_gemm_sm100_module,
     gen_gemm_sm100_module_cutlass_fp4,
     gen_gemm_sm100_module_cutlass_nvfp4_svdquant,
+    gen_gemm_sm120_module_cutlass_nvfp4_svdquant,
     gen_gemm_sm100_module_cutlass_fp8,
     gen_gemm_sm100_module_cutlass_mxfp8,
     gen_gemm_sm120_module,
@@ -803,6 +804,9 @@ def gen_all_modules(
             jit_specs.append(gen_fp4_quantization_sm110_module())
         if has_sm120:
             jit_specs.append(gen_fp4_quantization_sm120_module())
+            # SM120 only: the CUTLASS SVDQuant kernel is compiled for sm120a and
+            # is not shared with SM121, unlike the modules in the branch below.
+            jit_specs.append(gen_gemm_sm120_module_cutlass_nvfp4_svdquant())
         if has_sm121:
             jit_specs.append(gen_fp4_quantization_sm121_module())
         if has_sm120 or has_sm121:
