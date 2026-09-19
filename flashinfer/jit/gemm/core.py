@@ -32,6 +32,7 @@ from ..core import (
     current_compilation_context,
 )
 from ..cubin_loader import (
+    artifact_include_root,
     get_artifact,
     get_meta_hash,
     ensure_symlink,
@@ -750,10 +751,15 @@ def gen_trtllm_gen_gemm_module(enable_rubin: bool = False) -> JitSpec:
             f"{gemm_export_path}/{header}", get_meta_hash(checksum, header)
         )
         assert h, f"{header} not found"
-    # Per-module export-header root: the Blackwell and Rubin variants must not
-    # share this symlink, or an AOT build (all modules generated, then compiled)
-    # lets the last gen_* call's target win and skews the other module's ABI.
-    gen_root = jit_env.FLASHINFER_GEN_SRC_DIR / "trtllm_export" / module_name
+    # Per-module, per-artifact-version export-header root. Keying the root on
+    # the artifact hash as well as on the module keeps the Blackwell and Rubin
+    # variants apart -- an AOT build generates every module before compiling
+    # any, so a shared symlink would let the last gen_* call's target win and
+    # skew the other module's ABI -- and keeps another artifact version from
+    # re-pointing this module's headers underneath it.
+    gen_root = artifact_include_root(
+        jit_env.FLASHINFER_GEN_SRC_DIR / "trtllm_export", module_name, gemm_checksum
+    )
     symlink_path = gen_root / "flashinfer" / "trtllm" / "gemm" / "trtllmGen_gemm_export"
     ensure_symlink(symlink_path, jit_env.FLASHINFER_CUBIN_DIR / gemm_export_path)
     verify_symlinked_headers(symlink_path, GEMM_EXPORT_HEADERS, checksum)
@@ -777,6 +783,9 @@ def gen_trtllm_gen_gemm_module(enable_rubin: bool = False) -> JitSpec:
             jit_env.FLASHINFER_CUBIN_DIR,
             jit_env.FLASHINFER_CUBIN_DIR / include_path,
         ],
+        # The exported headers are part of this module's build identity: another
+        # artifact version must not reuse these objects or this .so.
+        artifact_version=gemm_checksum,
     )
 
 
@@ -933,10 +942,15 @@ def gen_trtllm_low_latency_gemm_module(enable_rubin: bool = False) -> JitSpec:
             f"{gemm_export_path}/{header}", get_meta_hash(checksum, header)
         )
         assert h, f"{header} not found"
-    # Per-module export-header root: the Blackwell and Rubin variants must not
-    # share this symlink, or an AOT build (all modules generated, then compiled)
-    # lets the last gen_* call's target win and skews the other module's ABI.
-    gen_root = jit_env.FLASHINFER_GEN_SRC_DIR / "trtllm_export" / module_name
+    # Per-module, per-artifact-version export-header root. Keying the root on
+    # the artifact hash as well as on the module keeps the Blackwell and Rubin
+    # variants apart -- an AOT build generates every module before compiling
+    # any, so a shared symlink would let the last gen_* call's target win and
+    # skew the other module's ABI -- and keeps another artifact version from
+    # re-pointing this module's headers underneath it.
+    gen_root = artifact_include_root(
+        jit_env.FLASHINFER_GEN_SRC_DIR / "trtllm_export", module_name, gemm_checksum
+    )
     symlink_path = gen_root / "flashinfer" / "trtllm" / "gemm" / "trtllmGen_gemm_export"
     ensure_symlink(symlink_path, jit_env.FLASHINFER_CUBIN_DIR / gemm_export_path)
     verify_symlinked_headers(symlink_path, GEMM_EXPORT_HEADERS, checksum)
@@ -960,5 +974,8 @@ def gen_trtllm_low_latency_gemm_module(enable_rubin: bool = False) -> JitSpec:
             jit_env.FLASHINFER_CUBIN_DIR,
             jit_env.FLASHINFER_CUBIN_DIR / include_path,
         ],
+        # The exported headers are part of this module's build identity: another
+        # artifact version must not reuse these objects or this .so.
+        artifact_version=gemm_checksum,
         extra_ldflags=["-lcuda"],
     )

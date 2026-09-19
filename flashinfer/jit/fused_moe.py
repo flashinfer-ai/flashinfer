@@ -29,6 +29,7 @@ from .core import (
 )
 from .cpp_ext import is_cuda_version_at_least
 from .cubin_loader import (
+    artifact_include_root,
     get_artifact,
     get_meta_hash,
     ensure_symlink,
@@ -307,10 +308,15 @@ def gen_trtllm_gen_fused_moe_sm100_module(enable_rubin: bool = False) -> JitSpec
     for header in BMM_EXPORT_HEADERS:
         h = get_artifact(f"{bmm_export_path}/{header}", get_meta_hash(checksum, header))
         assert h, f"{header} not found"
-    # Per-module export-header root: the Blackwell and Rubin variants must not
-    # share this symlink, or an AOT build (all modules generated, then compiled)
-    # lets the last gen_* call's target win and skews the other module's ABI.
-    gen_root = jit_env.FLASHINFER_GEN_SRC_DIR / "trtllm_export" / module_name
+    # Per-module, per-artifact-version export-header root. Keying the root on
+    # the artifact hash as well as on the module keeps the Blackwell and Rubin
+    # variants apart -- an AOT build generates every module before compiling
+    # any, so a shared symlink would let the last gen_* call's target win and
+    # skew the other module's ABI -- and keeps another artifact version from
+    # re-pointing this module's headers underneath it.
+    gen_root = artifact_include_root(
+        jit_env.FLASHINFER_GEN_SRC_DIR / "trtllm_export", module_name, bmm_checksum
+    )
     symlink_path = (
         gen_root / "flashinfer" / "trtllm" / "batched_gemm" / "trtllmGen_bmm_export"
     )
@@ -388,6 +394,9 @@ def gen_trtllm_gen_fused_moe_sm100_module(enable_rubin: bool = False) -> JitSpec
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/include",
         ],
+        # The exported headers are part of this module's build identity: another
+        # artifact version must not reuse these objects or this .so.
+        artifact_version=bmm_checksum,
     )
 
 
@@ -399,6 +408,7 @@ def gen_trtllm_gen_routing_module() -> JitSpec:
     tested without the batched-GEMM stack of fused_moe_trtllm_sm100. Only the
     BMM export headers are needed (for btg::Dtype et al.), not the GEMM cubins.
     """
+    module_name = "trtllm_gen_routing"
     checksum = get_artifact(
         f"{ArtifactPath.TRTLLM_GEN_BMM}/checksums.txt", CheckSumHash.TRTLLM_GEN_BMM
     )
@@ -407,12 +417,17 @@ def gen_trtllm_gen_routing_module() -> JitSpec:
     for header in BMM_EXPORT_HEADERS:
         h = get_artifact(f"{bmm_export_path}/{header}", get_meta_hash(checksum, header))
         assert h, f"{header} not found"
+    # Versioned, module-scoped root under the writable generated-sources tree.
+    # The artifact cache it used to link into can be a read-only installed
+    # package, and a root that is not keyed on the artifact version is what let
+    # one version re-point another's includes.
+    gen_root = artifact_include_root(
+        jit_env.FLASHINFER_GEN_SRC_DIR / "trtllm_export",
+        module_name,
+        CheckSumHash.TRTLLM_GEN_BMM,
+    )
     symlink_path = (
-        jit_env.FLASHINFER_CUBIN_DIR
-        / "flashinfer"
-        / "trtllm"
-        / "batched_gemm"
-        / "trtllmGen_bmm_export"
+        gen_root / "flashinfer" / "trtllm" / "batched_gemm" / "trtllmGen_bmm_export"
     )
     ensure_symlink(symlink_path, jit_env.FLASHINFER_CUBIN_DIR / bmm_export_path)
     verify_symlinked_headers(symlink_path, BMM_EXPORT_HEADERS, checksum)
@@ -428,7 +443,7 @@ def gen_trtllm_gen_routing_module() -> JitSpec:
     )
 
     return gen_jit_spec(
-        "trtllm_gen_routing",
+        module_name,
         [
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_fused_moe_routing_binding.cu",
             jit_env.FLASHINFER_CSRC_DIR
@@ -450,11 +465,13 @@ def gen_trtllm_gen_routing_module() -> JitSpec:
         ],
         extra_cuda_cflags=nvcc_flags,
         extra_include_paths=[
+            gen_root,
             jit_env.FLASHINFER_CSRC_DIR,
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/include",
             jit_env.FLASHINFER_CUBIN_DIR,
         ],
+        artifact_version=CheckSumHash.TRTLLM_GEN_BMM,
     )
 
 
