@@ -5,9 +5,10 @@
 # Default environment variables
 : "${JUNIT_DIR:=$(realpath ./junit)}"
 
-# Cap ninja parallelism by available RAM (~12 GB per nvcc process) to avoid OOM
-# during JIT compilation.  Exported because flashinfer/jit/cpp_ext.py reads it
-# from the environment (os.environ) inside the child Python process.
+# MAX_JOBS controls Ninja parallelism for JIT builds.  It is limited by
+# available RAM (~12 GB per nvcc process) to avoid OOM during JIT compilation.
+# Exported because flashinfer/jit/cpp_ext.py reads it from the environment
+# (os.environ) inside the child Python process.
 if [ -z "${MAX_JOBS:-}" ]; then
     _num_cpus=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
     _mem_gb=$(awk '/MemAvailable/ {printf "%d", $2/1024/1024}' /proc/meminfo 2>/dev/null)

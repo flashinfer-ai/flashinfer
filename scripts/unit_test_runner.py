@@ -57,9 +57,10 @@ EXIT_HELP = (
 )
 DEFAULT_DEADLINE_SECONDS = 0
 DEFAULT_UNIT_TIMEOUT_SECONDS = 2 * 60 * 60
-# Deliberately overcommit ordinary worker JITs for the CI A/B experiment. The
-# serialized prebuild path continues to use the host-wide budget.
-_JIT_WORKER_JOB_MULTIPLIER = 2
+# MAX_JOBS controls JIT/Ninja build parallelism and is derived from a
+# memory-limited host budget. H100 CI workers have validated headroom for this
+# 3x per-worker JIT-build allowance; serialized prebuilds keep the host budget.
+_JIT_WORKER_JOB_MULTIPLIER = 3
 
 
 def _env_int(name: str, default: int) -> int:
