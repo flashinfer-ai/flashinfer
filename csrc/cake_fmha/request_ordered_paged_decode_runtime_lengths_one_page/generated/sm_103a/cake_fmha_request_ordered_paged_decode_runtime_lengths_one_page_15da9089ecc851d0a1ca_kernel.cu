@@ -505,8 +505,7 @@ kernel_cake_fmha_request_ordered_paged_decode_runtime_lengths_one_page_15da9089e
 {
     const int tid = threadIdx.x;
     const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
-    uint32_t lane;
-    asm("mov.u32 %0, %%laneid;" : "=r"(lane));
+    const uint32_t lane = static_cast<uint32_t>(tid) & 31u;
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -637,9 +636,6 @@ kernel_cake_fmha_request_ordered_paged_decode_runtime_lengths_one_page_15da9089e
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
-
-    // Publish explicit kernel-setup mbarrier initialization.
-    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
 
     __syncwarp();
 
