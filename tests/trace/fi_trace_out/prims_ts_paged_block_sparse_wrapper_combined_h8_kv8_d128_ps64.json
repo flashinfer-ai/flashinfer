@@ -64,6 +64,10 @@
     "max_pages_per_seq": {
       "type": "var",
       "description": "Fixed page-table column capacity."
+    },
+    "pattern_heads_shared": {
+      "type": "const",
+      "value": 0
     }
   },
   "constraints": [

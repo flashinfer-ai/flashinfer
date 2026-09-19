@@ -235,6 +235,68 @@ def sm110_gqa_decode(
     )
 
 
+@flashinfer_experimental_api(feature="Prepared SM110 GQA decode")
+def prepare_sm110_gqa_decode(
+    inputs: dict[str, Any], num_splits: Optional[int] = None
+) -> dict[str, Any]:
+    r"""Prepare repeated FP16 GQA decode launches on an exact SM110 GPU.
+
+    Parameters
+    ----------
+    inputs : dict[str, Any]
+        Contiguous CUDA tensors ``Q`` [B,32,128], ``KV`` [B,2,8,capacity,128],
+        caller-owned ``O`` [B,32,128] (all FP16), and int32
+        ``sequence_lengths`` [B]. All tensors must share one CUDA device and
+        ``O`` must not alias any input storage. Optional ``q_scale`` defaults
+        to 1.0 and must be finite and positive.
+    num_splits : Optional[int]
+        ``None`` selects the prepared shape specialization. Above capacity 64,
+        ``1`` selects the original long kernel. B=1 with capacity 1024 or 4096
+        also supports its fixed split count of ``10``. Above capacity 64,
+        other split choices are rejected. Capacities up to 64 always use the
+        original short kernel; accepted explicit counts are 1, 2, 4, 8, 10, 16.
+
+    Returns
+    -------
+    dict[str, Any]
+        Opaque prepared state owning tensor references and any workspace.
+        Pass it to :func:`launch_sm110_gqa_decode_prepared` without modifying it.
+
+    Notes
+    -----
+    This opt-in interface separates allocation and JIT compilation from
+    sustained decode. Default specializations cover B=4/capacity=256 and
+    B=1/capacity=1024 or 4096; other shapes use the original kernels.
+    Every sequence length must remain in ``[1, capacity]`` at every launch.
+    GPU length values may change between launches; preparation does not read
+    them back to the host. The caller is responsible for this precondition.
+    Prepare and warm up before CUDA Graph capture. Retain the prepared state
+    until all asynchronous work completes and captured Graphs are retired.
+    """
+    from .experimental.sm110_gqa_decode import prepare_for_launch
+
+    return prepare_for_launch(inputs, num_splits=num_splits)
+
+
+@flashinfer_experimental_api(feature="Prepared SM110 GQA decode launch")
+def launch_sm110_gqa_decode_prepared(prepared: dict[str, Any]) -> torch.Tensor:
+    r"""Launch prepared decode on the current PyTorch stream and return its O.
+
+    ``prepared`` is the unmodified result of :func:`prepare_sm110_gqa_decode`.
+    Its tensors and workspace must remain alive through asynchronous launches
+    and CUDA Graph replays. GPU sequence lengths may change within the valid
+    range, while shapes, storage, and query scale remain fixed.
+
+    Concurrent invocations require independent prepared objects and output/
+    workspace storage. A prepared object can be reused on ordered streams,
+    including event-ordered stream handoffs. No allocations or host reads of
+    sequence lengths occur in this launch path.
+    """
+    from .experimental.sm110_gqa_decode import launch_prepared
+
+    return launch_prepared(prepared)
+
+
 @functools.cache
 def get_single_decode_module(*args):
     uri = get_single_decode_uri(*args)
@@ -941,8 +1003,13 @@ class BatchDecodeWithPagedKVCacheWrapper:
             no RoPE/ALiBi/soft-cap).
             The ``cudnn`` backend runs cuDNN's paged SDPA decode graph
             (:func:`flashinfer.decode.cudnn_batch_decode_with_kv_cache`). It supports
-            fp16/bf16 q/kv/o of one dtype, GQA, ``return_lse`` and CUDA graphs, but not
-            ``q_len_per_req > 1``, RoPE, soft-cap, sliding window, sinks, fp8 or NVFP4 KV.
+            fp16/bf16 q/kv/o of one dtype, GQA, ``return_lse``, CUDA graphs,
+            multi-token decode (``q_len_per_req > 1``, bottom-right causal), a left
+            sliding window (``window_left``) and attention ``sinks``, but not RoPE,
+            soft-cap, fp8 or NVFP4 KV. A sink at ``q_len_per_req == 1`` is served when
+            the cuDNN stack's SDPA engines accept it (cudnn-frontend 1.30+ with the
+            FROST engines enabled); the backend engine raises a not-supported error
+            at the first run.
             Pass a fixed ``block_tables`` to :meth:`plan` when capturing CUDA graphs so
             the captured block-table buffer is stable across re-plans.
 
@@ -1560,10 +1627,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
             )
         qo_indptr_host = _get_range_buf(batch_size + 1, "cpu")
         if q_len_per_req > 1:
-            if not self.use_tensor_cores:
+            if not self.use_tensor_cores and self._backend != "cudnn":
                 raise ValueError(
                     "q_len_per_req > 1 requires tensor-core decode "
-                    "(use_tensor_cores=True or the trtllm-gen/cute-dsl backend)."
+                    "(use_tensor_cores=True or the trtllm-gen/cute-dsl/cudnn backend)."
                 )
             qo_indptr_host = qo_indptr_host * q_len_per_req
         if self.is_cuda_graph_enabled:
@@ -1986,16 +2053,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 "cudnn decode backend does not apply position encoding "
                 f"(pos_encoding_mode must be 'NONE'); got {pos_encoding_mode!r}."
             )
-        if window_left >= 0:
-            raise NotImplementedError(
-                "cudnn decode backend does not support sliding window "
-                f"(window_left={window_left})."
-            )
-        if q_len_per_req > 1:
-            raise NotImplementedError(
-                "cudnn decode backend supports q_len_per_req == 1 only "
-                f"(got {q_len_per_req})."
-            )
         if q_data_type not in (torch.float16, torch.bfloat16) or not (
             q_data_type == kv_data_type == o_data_type
         ):
@@ -2324,14 +2381,14 @@ class BatchDecodeWithPagedKVCacheWrapper:
             # Infer runtime q_len from q.size(0). Doesn't need to match planned q_len
             q_len_per_req = q.size(0) // actual_batch_size
 
-        if not self.use_tensor_cores and q_len_per_req > 1:
+        if not self.use_tensor_cores and self._backend != "cudnn" and q_len_per_req > 1:
             raise ValueError(
                 f"q implies q_len_per_req={q_len_per_req}, but the "
                 "non-tensor-core decode kernel only supports q_len_per_req=1."
             )
         planned_q_len = getattr(self, "_q_len_per_req", 1) or 1
         if (
-            self.use_tensor_cores
+            (self.use_tensor_cores or self._backend == "cudnn")
             and self._backend not in ("trtllm-gen", "cute-dsl")
             and q_len_per_req != planned_q_len
         ):
@@ -2511,10 +2568,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
             q = q.view(q.size(0) // q_len_per_req, q_len_per_req, q.size(1), q.size(2))
 
         if self._backend == "cudnn":
-            if sinks is not None:
-                raise NotImplementedError(
-                    "cudnn decode backend does not support attention sinks."
-                )
             if kv_cache_sf is not None:
                 raise NotImplementedError(
                     "cudnn decode backend does not support NVFP4 KV cache."
@@ -2522,11 +2575,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
             if skip_softmax_threshold_scale_factor is not None:
                 raise NotImplementedError(
                     "cudnn decode backend does not support skip-softmax."
-                )
-            if q.shape[0] != actual_batch_size:
-                raise NotImplementedError(
-                    "cudnn decode backend requires q_len_per_req == 1 "
-                    f"(got q.shape[0]={q.shape[0]}, batch_size={actual_batch_size})."
                 )
             if v_cache.dtype != self._cached_kv_data_type:
                 raise ValueError(
@@ -2554,6 +2602,12 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 out=out,
                 return_lse=return_lse,
                 lse=lse,
+                # q has batch * q_len_per_req consecutive rows per request; the
+                # graph applies the bottom-right causal diagonal for q_len > 1,
+                # the left window bound and the per-head sink logits.
+                q_len_per_req=q_len_per_req,
+                window_left=window_left,
+                sinks=sinks,
             )
         elif self.use_tensor_cores:
             run_args = [self._float_workspace_buffer]

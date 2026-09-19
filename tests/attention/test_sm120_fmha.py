@@ -275,9 +275,269 @@ def test_sm120_ragged_empty_kv_return_lse():
     assert torch.isneginf(lse).all()
 
 
+@pytest.mark.parametrize(
+    "D",
+    [
+        pytest.param(64, id="d64-fixed-buffer"),
+        pytest.param(128, id="d128-direct-state-ring"),
+        pytest.param(256, id="d256-distributed-state-ring"),
+    ],
+)
+def test_sm120_ragged_skip_softmax_omits_negligible_tiles(D):
+    """A threshold above one skips one equal-score tile from output and LSE."""
+    H, Sq, Skv = 2, 128, 256
+    q = torch.zeros(Sq, H, D, device="cuda", dtype=torch.float8_e4m3fn)
+    k = torch.zeros(Skv, H, D, device="cuda", dtype=torch.float8_e4m3fn)
+    v = torch.empty_like(k)
+    v[:128] = -1
+    v[128:] = 1
+    cu_q = torch.tensor([0, Sq], device="cuda", dtype=torch.int32)
+    cu_k = torch.tensor([0, Skv], device="cuda", dtype=torch.int32)
+    dense = torch.empty(Sq, H, D, device="cuda", dtype=torch.float16)
+    skipped = torch.empty_like(dense)
+    dense_lse = torch.empty(Sq, H, device="cuda", dtype=torch.float32)
+    skipped_lse = torch.empty_like(dense_lse)
+
+    sm120_fmha_fp8_ragged_prefill(
+        q,
+        k,
+        v,
+        dense,
+        cu_q,
+        cu_k,
+        q_tile=128,
+        kv_tile=128,
+        lse=dense_lse,
+    )
+    sm120_fmha_fp8_ragged_prefill(
+        q,
+        k,
+        v,
+        skipped,
+        cu_q,
+        cu_k,
+        q_tile=128,
+        kv_tile=128,
+        lse=skipped_lse,
+        # The equal-score left tile contributes exp(0) = 1, so 2 skips it.
+        skip_softmax_threshold=2.0,
+    )
+
+    torch.testing.assert_close(dense, torch.zeros_like(dense), atol=1e-3, rtol=0)
+    torch.testing.assert_close(skipped, torch.ones_like(skipped), atol=1e-3, rtol=0)
+    torch.testing.assert_close(
+        dense_lse, torch.full_like(dense_lse, 8.0), atol=2e-3, rtol=0
+    )
+    torch.testing.assert_close(
+        skipped_lse, torch.full_like(skipped_lse, 7.0), atol=2e-3, rtol=0
+    )
+
+
+def test_sm120_ragged_tensor_threshold_updates_between_graph_replays():
+    """A stable per-request tensor can be updated between graph replays."""
+    batch_size, H, D, Sq, Skv = 2, 2, 64, 128, 256
+    q = torch.zeros(batch_size * Sq, H, D, device="cuda", dtype=torch.float8_e4m3fn)
+    k = torch.zeros(batch_size * Skv, H, D, device="cuda", dtype=torch.float8_e4m3fn)
+    v = torch.empty_like(k)
+    for batch_idx in range(batch_size):
+        start = batch_idx * Skv
+        v[start : start + 128] = -1
+        v[start + 128 : start + Skv] = 1
+    cu_q = torch.tensor([0, Sq, 2 * Sq], device="cuda", dtype=torch.int32)
+    cu_k = torch.tensor([0, Skv, 2 * Skv], device="cuda", dtype=torch.int32)
+    threshold = torch.zeros(batch_size, device="cuda", dtype=torch.float32)
+    out = torch.empty_like(q, dtype=torch.float16)
+
+    # Compile the one skip-enabled specialization before capture.
+    sm120_fmha_fp8_ragged_prefill(
+        q,
+        k,
+        v,
+        out,
+        cu_q,
+        cu_k,
+        max_seqlen_q=Sq,
+        skip_softmax_threshold=threshold,
+        enable_pdl=True,
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        sm120_fmha_fp8_ragged_prefill(
+            q,
+            k,
+            v,
+            out,
+            cu_q,
+            cu_k,
+            max_seqlen_q=Sq,
+            skip_softmax_threshold=threshold,
+            enable_pdl=True,
+        )
+
+    threshold.copy_(torch.tensor([2.0, 0.0], device="cuda"))
+    graph.replay()
+    torch.cuda.synchronize()
+    expected = torch.cat((torch.ones_like(out[:Sq]), torch.zeros_like(out[Sq:])), dim=0)
+    torch.testing.assert_close(out, expected, atol=1e-3, rtol=0)
+
+    threshold.copy_(torch.tensor([0.0, 2.0], device="cuda"))
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, 1 - expected, atol=1e-3, rtol=0)
+
+
 # ---------------------------------------------------------------------------
 # Paged prefill shared block-table contract
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("D", [64, 128, 256])
+def test_sm120_paged_tensor_threshold_omits_negligible_tile(D):
+    """Exercise real skips and LSE in the fixed-buffer and both ring paths."""
+    H, Sq, Skv, page_size = 2, 128, 256, 128
+    q = torch.zeros(Sq, H, D, device="cuda", dtype=torch.float8_e4m3fn)
+    k_pool = torch.zeros(2, H, page_size, D, device="cuda", dtype=torch.float8_e4m3fn)
+    v_pool = torch.empty_like(k_pool)
+    v_pool[1].fill_(-1)
+    v_pool[0].fill_(1)
+    block_tables = torch.tensor([[1, 0]], device="cuda", dtype=torch.int32)
+    seqlens_kv = torch.tensor([Skv], device="cuda", dtype=torch.int32)
+    cu_q = torch.tensor([0, Sq], device="cuda", dtype=torch.int32)
+    dense = torch.empty(Sq, H, D, device="cuda", dtype=torch.float16)
+    skipped = torch.empty_like(dense)
+    dense_lse = torch.empty(Sq, H, device="cuda", dtype=torch.float32)
+    skipped_lse = torch.empty_like(dense_lse)
+
+    sm120_fmha_fp8_paged_prefill(
+        q,
+        k_pool,
+        v_pool,
+        dense,
+        block_tables,
+        seqlens_kv,
+        cu_q,
+        max_seqlen_q=Sq,
+        q_tile=128,
+        kv_tile=128,
+        lse=dense_lse,
+    )
+    sm120_fmha_fp8_paged_prefill(
+        q,
+        k_pool,
+        v_pool,
+        skipped,
+        block_tables,
+        seqlens_kv,
+        cu_q,
+        max_seqlen_q=Sq,
+        q_tile=128,
+        kv_tile=128,
+        lse=skipped_lse,
+        skip_softmax_threshold=torch.tensor([2.0], device="cuda"),
+    )
+
+    torch.testing.assert_close(dense, torch.zeros_like(dense), atol=1e-3, rtol=0)
+    torch.testing.assert_close(skipped, torch.ones_like(skipped), atol=1e-3, rtol=0)
+    torch.testing.assert_close(
+        dense_lse, torch.full_like(dense_lse, 8.0), atol=2e-3, rtol=0
+    )
+    torch.testing.assert_close(
+        skipped_lse, torch.full_like(skipped_lse, 7.0), atol=2e-3, rtol=0
+    )
+
+
+@pytest.mark.parametrize("D", [64, 128, 256])
+@pytest.mark.parametrize("storage", ["ragged", "paged"])
+def test_sm120_causal_skip_softmax_masked_frontier(D, storage):
+    """Skip a non-initial causal frontier tile and preserve output and LSE."""
+    Hq, Hkv, Sq, Skv, tile = 4, 2, 129, 449, 128
+    q = torch.zeros(Sq, Hq, D, device="cuda", dtype=torch.float8_e4m3fn)
+    k = torch.zeros(Skv, Hkv, D, device="cuda", dtype=q.dtype)
+    v = (
+        (torch.arange(Skv, device="cuda") // tile - 2)
+        .view(Skv, 1, 1)
+        .expand(Skv, Hkv, D)
+        .to(q.dtype)
+        .contiguous()
+    )
+    cu_q = torch.tensor([0, Sq], device="cuda", dtype=torch.int32)
+    dense = torch.empty_like(q, dtype=torch.float16)
+    skipped = torch.empty_like(dense)
+    dense_lse = torch.empty(Sq, Hq, device="cuda", dtype=torch.float32)
+    skipped_lse = torch.empty_like(dense_lse)
+
+    if storage == "ragged":
+        run = sm120_fmha_fp8_ragged_prefill
+        kv_args = (k, v)
+        metadata = (cu_q, torch.tensor([0, Skv], device="cuda", dtype=torch.int32))
+    else:
+        page_size = 32
+        num_pages = (Skv + page_size - 1) // page_size
+        k_pool = torch.zeros(num_pages, Hkv, page_size, D, device="cuda", dtype=q.dtype)
+        # Poison padding so a missing K-tail mask also changes the result.
+        v_pool = torch.full_like(k_pool, 16)
+        for logical_page in range(num_pages):
+            start = logical_page * page_size
+            end = min(start + page_size, Skv)
+            v_pool[num_pages - 1 - logical_page, :, : end - start].copy_(
+                v[start:end].transpose(0, 1)
+            )
+        block_tables = torch.arange(
+            num_pages - 1, -1, -1, device="cuda", dtype=torch.int32
+        ).view(1, -1)
+        run = sm120_fmha_fp8_paged_prefill
+        kv_args = (k_pool, v_pool)
+        metadata = (
+            block_tables,
+            torch.tensor([Skv], device="cuda", dtype=torch.int32),
+            cu_q,
+        )
+
+    for out, lse, threshold in [
+        (dense, dense_lse, None),
+        (skipped, skipped_lse, 2.0),
+    ]:
+        run(
+            q,
+            *kv_args,
+            out,
+            *metadata,
+            max_seqlen_q=Sq,
+            is_causal=True,
+            q_tile=tile,
+            kv_tile=tile,
+            lse=lse,
+            skip_softmax_threshold=threshold,
+        )
+
+    ref_out, ref_lse = _ref_fmha_and_lse(
+        q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0), 1.0 / math.sqrt(D), True
+    )
+    torch.testing.assert_close(dense, ref_out[0].to(dense.dtype), atol=1e-3, rtol=0)
+    torch.testing.assert_close(dense_lse, ref_lse[0], atol=2e-3, rtol=0)
+
+    # The bottom-right offset is 320. In CTA 0, rows 0:64 have an entirely
+    # masked first tile (K[384:512]) and must initialize on the second tile.
+    # Rows 64:128 initialize on the first tile, then skip the second tile
+    # while is_masked_frontier_tile=True and uses_softmax_init_path=False.
+    # These groups align with 16-row warps, so each row retains just its
+    # rightmost visible tile. CTA 1 also exercises a partial Q/K tail.
+    valid_cols = torch.arange(Sq, device="cuda") + (Skv - Sq) + 1
+    retained_tile = (valid_cols - 1) // tile
+    expected_out = (retained_tile - 2).view(Sq, 1, 1).expand_as(skipped)
+    expected_lse = (
+        (valid_cols - retained_tile * tile)
+        .float()
+        .log2()
+        .view(Sq, 1)
+        .expand_as(skipped_lse)
+    )
+    torch.testing.assert_close(
+        skipped, expected_out.to(skipped.dtype), atol=1e-3, rtol=0
+    )
+    torch.testing.assert_close(skipped_lse, expected_lse, atol=2e-3, rtol=0)
+    assert not torch.allclose(skipped, dense, atol=1e-3, rtol=0)
+    assert torch.all(skipped_lse < dense_lse)
 
 
 def _run_paged_case(

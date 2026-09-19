@@ -7,8 +7,12 @@ cuDNN-backed attention kernels. These wrappers call into NVIDIA's cuDNN runtime
 for batch prefill and batch decode, and are reachable as ``backend="cudnn"`` on
 ``BatchPrefillWithPagedKVCacheWrapper`` / ``BatchDecodeWithPagedKVCacheWrapper``
 (or directly) when cuDNN is available on the host GPU. For decode the wrapper
-backend covers fp16/bf16 GQA with ``return_lse`` and CUDA graphs; it does not
-support ``q_len_per_req > 1``, RoPE, soft-cap, sliding window, sinks or fp8/NVFP4 KV.
+backend covers fp16/bf16 GQA with ``return_lse``, CUDA graphs, multi-token
+decode (``q_len_per_req > 1``, bottom-right causal), a left sliding window
+(``window_left``) and attention ``sinks``; it does not support RoPE, soft-cap
+or fp8/NVFP4 KV. A sink at ``q_len_per_req == 1`` is served when the cuDNN
+stack's SDPA engines accept it (cudnn-frontend 1.30+ with the FROST engines
+enabled); the backend engine raises a not-supported error at the first run.
 
 .. currentmodule:: flashinfer.cudnn
 

@@ -52,6 +52,7 @@ from cutlass.experimental.task_scheduling.schedule_builder import (
 from cutlass.experimental.task_scheduling.task import Task
 
 from ..stage import FmhaStage
+from .direct_sparse_metadata import DirectSparseMetadataView
 from .fmha_decode_config import FmhaDecodeConfig
 from .fmha_decode_constants import (
     KV_INST0,
@@ -133,6 +134,11 @@ def _loop_domain_after_head(
     remaining = cute.math.max(remaining, cutlass.Int32(0))
     insts = cutlass.Int32(num_insts_kv)
     return (remaining + insts - cutlass.Int32(1)) // insts
+
+
+@dataclass(kw_only=True)
+class SparseMembershipLifetimeResource(MemoryResource):
+    """Keep the membership row live until every softmax stream releases it."""
 
 
 @dataclass(kw_only=True)
@@ -572,6 +578,8 @@ def _prepared_sparse_row_address(
     q_token_base = _q_group_token_base(cfg, q_group_idx)
     q_block = q_token_base // cutlass.Int32(cfg.q_block_size)
     num_q_blocks = (cfg.max_seq_len_q + cfg.q_block_size - 1) // cfg.q_block_size
+    if cutlass.const_expr(cfg.shares_sparse_pattern):
+        return b_idx * cutlass.Int32(num_q_blocks) + q_block
     return (b_idx * num_heads_kv + h_idx) * cutlass.Int32(num_q_blocks) + q_block
 
 
@@ -933,7 +941,17 @@ class DecodeGenTask(Task):
         if self.seqlens_kv is None:
             seq_len_kv = cutlass.Int32(self.max_seq_len_kv)
         else:
-            seq_len_kv = cutlass.Int32(self.seqlens_kv[b_idx])
+            metadata_row = cutlass.Int64(b_idx)
+            if cutlass.const_expr(
+                self.cfg.uses_q_token_kv_block_sparse_page_route
+                and self.cfg.use_persistent_scheduler
+                and not self.cfg.shares_sparse_pattern
+                and not isinstance(self.seqlens_kv, DirectSparseMetadataView)
+            ):
+                metadata_row = metadata_row * cutlass.Int64(
+                    self.num_heads_kv
+                ) + cutlass.Int64(tile_coord[1])
+            seq_len_kv = cutlass.Int32(self.seqlens_kv[metadata_row])
         self._seq_len_kv = seq_len_kv
         if cutlass.const_expr(self.cfg.use_paged_kv):
             # Native paged KV uses a fixed-stride dense page table. The row's
@@ -1033,7 +1051,7 @@ class DecodeGenTask(Task):
 
 
 # ======================================================================
-# LoadTask — warp 13 (or warp 15 under CLC persistent), 1 warp
+# LoadTask — independently configured Q/K/V TMA issuer warps
 # K and V share a single SmemKv ring; loads alternate K and V tiles.
 #   HEAD:    Q + K0 + K1
 #   LOOP[i]: K(i+2) + V(i)
@@ -1347,27 +1365,33 @@ def create_page_offsets_task(
     cfg: FmhaDecodeConfig,
     *,
     domain: int | cutlass.Int32,
+    membership_lifetime: MemoryResource | None = None,
     warp_idx: int | None = None,
     num_warps: int | None = None,
     task_class: type[DecodeGenTask] = DecodeGenTask,
     **kw: TaskKwarg,
 ) -> Task:
-    """Prefetch page-table entries that LoadTask consumes for paged KV.
+    """Prefetch page-table entries for the shared-KV load task.
 
-    The schedule matches LoadTask's K/V cadence exactly so the page-offsets
-    ring and the SmemKv ring stay aligned.
+    A held native window is published once per CTA work item and retained
+    through the V tail. Other profiles mirror LoadTask's K/V cadence.
     """
     hold_page_window = _can_hold_native_page_window(cfg, smem_page_offsets)
 
     def page_offsets_schedule_body(
         smem_page_offsets: MemoryResource,
+        membership_lifetime: MemoryResource | None,
     ) -> None:
         """Schedule page-offset prefetches for the shared-KV load cadence."""
+        if membership_lifetime is not None:
+            membership_lifetime.acquire()
         smem_page_offsets.init_load_state()
         if hold_page_window:
             # K0's held window covers every tile assigned to this CTA work
             # item, and native paged KV uses those same locators for V.
             _page_offsets_produce(smem_page_offsets, "load_k0", FmhaStage.Head)
+            if membership_lifetime is not None:
+                membership_lifetime.commit()
             # Preserve the runtime domain contract even though this fast path
             # needs no per-iteration page-window work.
             with domain_loop(0, domain, 1, unroll=1):
@@ -1377,6 +1401,8 @@ def create_page_offsets_task(
         # issue K/V TMA copies without reading page tables itself.
         # HEAD: produce page IDs for the two prefetched K tiles.
         _produce_staged_page_offsets(smem_page_offsets, "load_k0", FmhaStage.Head, cfg)
+        if membership_lifetime is not None:
+            membership_lifetime.commit()
         _produce_staged_page_offsets(smem_page_offsets, "load_k1", FmhaStage.Head, cfg)
 
         # LOOP: mirror LoadTask's K/V production cadence exactly.
@@ -1395,29 +1421,29 @@ def create_page_offsets_task(
         for label in ("load_v0", "load_v1"):
             _produce_staged_page_offsets(smem_page_offsets, label, FmhaStage.Tail, cfg)
 
-    @schedule
+    @_schedule_with_optional_resources
     def page_offsets_schedule(
         smem_page_offsets: MemoryResource,
+        membership_lifetime: MemoryResource | None,
         work_queue: WorkQueue | None = None,
     ) -> None:
         """Wrap page-offset data work in packed persistent skip handling."""
         _decode_work_tile_schedule(
             cfg,
             work_queue,
-            lambda: page_offsets_schedule_body(smem_page_offsets),
+            lambda: page_offsets_schedule_body(smem_page_offsets, membership_lifetime),
         )
 
-    captured_schedule = (
-        page_offsets_schedule(smem_page_offsets)
-        if work_queue is None
-        else page_offsets_schedule(smem_page_offsets, work_queue)
+    captured_schedule = page_offsets_schedule(
+        smem_page_offsets, membership_lifetime, work_queue
     )
     src = []
     if work_queue is not None:
         src.append(work_queue)
     return task_class(
         src_resources=src,
-        dst_resources=[smem_page_offsets],
+        dst_resources=[smem_page_offsets]
+        + ([membership_lifetime] if membership_lifetime is not None else []),
         q_bound_resources=((smem_page_offsets, False),),
         cfg=cfg,
         warp_idx=cfg.page_offsets_warp_idx if warp_idx is None else warp_idx,
@@ -1436,6 +1462,7 @@ def create_page_offsets_task_split_kv(
     cfg: FmhaDecodeConfig,
     *,
     domain: int | cutlass.Int32,
+    membership_lifetime: MemoryResource | None = None,
     warp_idx: int | None = None,
     num_warps: int | None = None,
     task_class: type[DecodeGenTask] = DecodeGenTask,
@@ -1446,13 +1473,18 @@ def create_page_offsets_task_split_kv(
     def page_offsets_schedule_body(
         smem_page_offsets_k: MemoryResource,
         smem_page_offsets_v: MemoryResource,
+        membership_lifetime: MemoryResource | None,
     ) -> None:
         """Publish one page-offset stage for every paired K/V tile."""
+        if membership_lifetime is not None:
+            membership_lifetime.acquire()
         smem_page_offsets_k.init_load_state()
         smem_page_offsets_v.init_load_state()
 
         # HEAD: publish the initial K0/K1 pair as two independent stages.
         _page_offsets_produce(smem_page_offsets_k, "load_k0", FmhaStage.Head)
+        if membership_lifetime is not None:
+            membership_lifetime.commit()
         _page_offsets_produce(smem_page_offsets_k, "load_k1", FmhaStage.Head)
 
         # LOOP: mirror LoadTask's cross-resource consumption order exactly.
@@ -1466,10 +1498,11 @@ def create_page_offsets_task_split_kv(
         _page_offsets_produce(smem_page_offsets_v, "load_v0", FmhaStage.Tail)
         _page_offsets_produce(smem_page_offsets_v, "load_v1", FmhaStage.Tail)
 
-    @schedule
+    @_schedule_with_optional_resources
     def page_offsets_schedule(
         smem_page_offsets_k: MemoryResource,
         smem_page_offsets_v: MemoryResource,
+        membership_lifetime: MemoryResource | None,
         work_queue: WorkQueue | None = None,
     ) -> None:
         """Wrap split page-offset work in packed persistent skip handling."""
@@ -1479,20 +1512,20 @@ def create_page_offsets_task_split_kv(
             lambda: page_offsets_schedule_body(
                 smem_page_offsets_k,
                 smem_page_offsets_v,
+                membership_lifetime,
             ),
         )
 
-    schedule_result = (
-        page_offsets_schedule(smem_page_offsets_k, smem_page_offsets_v)
-        if work_queue is None
-        else page_offsets_schedule(smem_page_offsets_k, smem_page_offsets_v, work_queue)
+    schedule_result = page_offsets_schedule(
+        smem_page_offsets_k, smem_page_offsets_v, membership_lifetime, work_queue
     )
     src = []
     if work_queue is not None:
         src.append(work_queue)
     return task_class(
         src_resources=src,
-        dst_resources=[smem_page_offsets_k, smem_page_offsets_v],
+        dst_resources=[smem_page_offsets_k, smem_page_offsets_v]
+        + ([membership_lifetime] if membership_lifetime is not None else []),
         q_bound_resources=(
             (smem_page_offsets_k, False),
             (smem_page_offsets_v, False),
@@ -1513,24 +1546,30 @@ def create_page_offsets_task_one_inst_qkv(
     cfg: FmhaDecodeConfig,
     *,
     domain: int | cutlass.Int32,
+    membership_lifetime: MemoryResource | None = None,
     warp_idx: int | None = None,
     num_warps: int | None = None,
     task_class: type[DecodeGenTask] = DecodeGenTask,
     **kw: TaskKwarg,
 ) -> Task:
-    """Prefetch page-table entries for the one-inst keepsMmaAb QKV path."""
+    """Prefetch offsets for one-instance Keeps, using the configured producer warps."""
     hold_page_window = _can_hold_native_page_window(cfg, smem_page_offsets)
 
     def page_offsets_schedule_body(
         smem_page_offsets: MemoryResource,
+        membership_lifetime: MemoryResource | None,
     ) -> None:
         """Schedule page-offset prefetches for the one-inst QKV load cadence."""
+        if membership_lifetime is not None:
+            membership_lifetime.acquire()
         smem_page_offsets.init_load_state()
 
         if hold_page_window:
             # Publish the complete CTA-local physical-KV128 locator span once.
             # The load task retains this stage from its K head through V tail.
             _page_offsets_produce(smem_page_offsets, "load_k0", FmhaStage.Head)
+            if membership_lifetime is not None:
+                membership_lifetime.commit()
             # Keep the task domain identical to the ordinary cadence even
             # though the held stage needs no per-iteration producer work.
             with domain_loop(0, domain, 1, unroll=1):
@@ -1538,34 +1577,36 @@ def create_page_offsets_task_one_inst_qkv(
             return
 
         _page_offsets_produce(smem_page_offsets, "load_k0", FmhaStage.Head)
+        if membership_lifetime is not None:
+            membership_lifetime.commit()
         with domain_loop(0, domain, 1, unroll=1):
             for label in ("load_k0", "load_v0"):
                 _page_offsets_produce(smem_page_offsets, label, FmhaStage.Loop)
         _page_offsets_produce(smem_page_offsets, "load_v0", FmhaStage.Tail)
 
-    @schedule
+    @_schedule_with_optional_resources
     def page_offsets_schedule(
         smem_page_offsets: MemoryResource,
+        membership_lifetime: MemoryResource | None,
         work_queue: WorkQueue | None = None,
     ) -> None:
         """Wrap one-inst page-offset work in packed persistent skip handling."""
         _decode_work_tile_schedule(
             cfg,
             work_queue,
-            lambda: page_offsets_schedule_body(smem_page_offsets),
+            lambda: page_offsets_schedule_body(smem_page_offsets, membership_lifetime),
         )
 
-    schedule_result = (
-        page_offsets_schedule(smem_page_offsets)
-        if work_queue is None
-        else page_offsets_schedule(smem_page_offsets, work_queue)
+    schedule_result = page_offsets_schedule(
+        smem_page_offsets, membership_lifetime, work_queue
     )
     src = []
     if work_queue is not None:
         src.append(work_queue)
     return task_class(
         src_resources=src,
-        dst_resources=[smem_page_offsets],
+        dst_resources=[smem_page_offsets]
+        + ([membership_lifetime] if membership_lifetime is not None else []),
         q_bound_resources=((smem_page_offsets, False),),
         cfg=cfg,
         warp_idx=cfg.page_offsets_warp_idx if warp_idx is None else warp_idx,
@@ -1612,6 +1653,9 @@ def create_load_task_split_kv(
         raise ValueError("each split K resource requires its matching V resource")
     if smem_k0 is None and smem_k1 is None:
         raise ValueError("at least one split K/V instance is required")
+    hold_page_window = smem_page_offsets_v is None and _can_hold_native_page_window(
+        cfg, smem_page_offsets
+    )
 
     def load_schedule_body(
         smem_q: MemoryResource | None,
@@ -1681,19 +1725,26 @@ def create_load_task_split_kv(
             section: FmhaStage,
         ) -> None:
             """Acquire, load all head-dim stages, and release page offsets."""
-            _page_offsets_consume(offsets, label.replace("load", "read_offsets"))
+            if not hold_page_window:
+                _page_offsets_consume(offsets, label.replace("load", "read_offsets"))
             for head_dim_stage_idx in range(cfg.num_head_dim_stages_kv):
                 resource.acquire()
                 getattr(resource, label)(
                     section=section, head_dim_stage_idx=head_dim_stage_idx
                 )
                 resource.commit()
-            _page_offsets_release(offsets)
+            if not hold_page_window:
+                _page_offsets_release(offsets)
 
         if smem_q is not None:
             smem_q.acquire()
             smem_q.tma_load()
             smem_q.commit()
+
+        if hold_page_window:
+            # Both instruction streams use the same immutable locator span.
+            # Keep its stage live across all K/V tiles, not one stage per load.
+            _page_offsets_consume(smem_page_offsets)
 
         head_routes = []
         for (
@@ -1752,6 +1803,8 @@ def create_load_task_split_kv(
                     smem_page_offsets_v_local,
                     FmhaStage.Tail,
                 )
+        if hold_page_window:
+            _page_offsets_release(smem_page_offsets)
 
     @_schedule_with_optional_resources
     def load_schedule(
@@ -2838,6 +2891,7 @@ def create_softmax0_task(
     cfg: FmhaDecodeConfig,
     *,
     domain: int | cutlass.Int32,
+    membership_lifetime: MemoryResource | None = None,
     task_class: type[DecodeGenTask] = DecodeGenTask,
     **kw: TaskKwarg,
 ) -> Task:
@@ -2850,8 +2904,11 @@ def create_softmax0_task(
         tmem_softmax_global0: MemoryResource,
         tmem_softmax_order: MemoryResource | None,
         sparse_softmax_metadata: MemoryResource | None,
+        membership_lifetime: MemoryResource | None,
     ) -> None:
         """Build the softmax0 loop, P publication, and final stats handoff."""
+        if membership_lifetime is not None:
+            membership_lifetime.wait()
         (
             old_max_arr,
             sum_arr,
@@ -3003,6 +3060,8 @@ def create_softmax0_task(
                 # on the same physical TMEM stage.
                 tmem_softmax_local0.acquire()
                 tmem_softmax_local0.commit()
+        if membership_lifetime is not None:
+            membership_lifetime.release()
 
     @_schedule_with_optional_resources
     def softmax0_schedule(
@@ -3012,6 +3071,7 @@ def create_softmax0_task(
         tmem_softmax_global0: MemoryResource,
         tmem_softmax_order: MemoryResource | None,
         sparse_softmax_metadata: MemoryResource | None,
+        membership_lifetime: MemoryResource | None,
         work_queue: WorkQueue | None,
     ) -> None:
         """Schedule softmax0 with the supplied order and sparse resources."""
@@ -3025,6 +3085,7 @@ def create_softmax0_task(
                 tmem_softmax_global0,
                 tmem_softmax_order,
                 sparse_softmax_metadata,
+                membership_lifetime,
             ),
         )
 
@@ -3035,11 +3096,14 @@ def create_softmax0_task(
         tmem_softmax_global0,
         tmem_softmax_order,
         sparse_softmax_metadata,
+        membership_lifetime,
         work_queue,
     )
     src = [tmem_s0]
     if sparse_softmax_metadata is not None:
         src.append(sparse_softmax_metadata)
+    if membership_lifetime is not None:
+        src.append(membership_lifetime)
     if work_queue is not None:
         src.append(work_queue)
     dst = [tmem_softmax_local0, smem_p0, tmem_softmax_global0]
@@ -3073,6 +3137,7 @@ def create_softmax1_task(
     cfg: FmhaDecodeConfig,
     *,
     domain: int | cutlass.Int32,
+    membership_lifetime: MemoryResource | None = None,
     task_class: type[DecodeGenTask] = DecodeGenTask,
     **kw: TaskKwarg,
 ) -> Task:
@@ -3085,8 +3150,11 @@ def create_softmax1_task(
         tmem_softmax_global1: MemoryResource,
         tmem_softmax_order: MemoryResource | None,
         sparse_softmax_metadata: MemoryResource | None,
+        membership_lifetime: MemoryResource | None,
     ) -> None:
         """Build the softmax1 loop, P publication, and final stats handoff."""
+        if membership_lifetime is not None:
+            membership_lifetime.wait()
         (
             old_max_arr,
             sum_arr,
@@ -3221,6 +3289,8 @@ def create_softmax1_task(
                 sum_arr=sum_arr,
             )
             tmem_softmax_local1.commit()
+        if membership_lifetime is not None:
+            membership_lifetime.release()
 
     @_schedule_with_optional_resources
     def softmax1_schedule(
@@ -3230,6 +3300,7 @@ def create_softmax1_task(
         tmem_softmax_global1: MemoryResource,
         tmem_softmax_order: MemoryResource | None,
         sparse_softmax_metadata: MemoryResource | None,
+        membership_lifetime: MemoryResource | None,
         work_queue: WorkQueue | None,
     ) -> None:
         """Schedule softmax1 with the supplied order and sparse resources."""
@@ -3249,6 +3320,7 @@ def create_softmax1_task(
                 tmem_softmax_global1,
                 tmem_softmax_order,
                 sparse_softmax_metadata,
+                membership_lifetime,
             ),
         )
 
@@ -3259,6 +3331,7 @@ def create_softmax1_task(
         tmem_softmax_global1,
         tmem_softmax_order,
         sparse_softmax_metadata,
+        membership_lifetime,
         work_queue,
     )
     src = [tmem_s1]
@@ -3266,6 +3339,8 @@ def create_softmax1_task(
         src.append(sparse_softmax_metadata)
     if tmem_softmax_order is not None:
         src.append(tmem_softmax_order)
+    if membership_lifetime is not None:
+        src.append(membership_lifetime)
     if work_queue is not None:
         src.append(work_queue)
     return task_class(

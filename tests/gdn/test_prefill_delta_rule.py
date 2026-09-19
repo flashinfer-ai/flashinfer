@@ -142,6 +142,7 @@ def _test_prefill_kernel(
         output=our_o,
         output_state=our_state,
         use_cp=use_cp,
+        max_seqlen=max(seq_lens),
     )
 
     torch.cuda.synchronize()
@@ -421,6 +422,7 @@ def test_prefill_kernel_zero_length_sequence(
         True,
         output=our_o,
         use_cp=use_cp,
+        max_seqlen=seq_len,
     )
     torch.cuda.synchronize()
 
@@ -482,6 +484,7 @@ def test_prefill_zero_length_sequence_state_untouched(
         output=our_o,
         output_state=our_state,
         use_cp=use_cp,
+        max_seqlen=seq_len,
     )
     torch.cuda.synchronize()
 
@@ -790,6 +793,7 @@ def _test_checkpoint(
         checkpoint_every_n_tokens=checkpoint_every_n_tokens,
         use_cp=use_cp,
         _cp_chunk_len=checkpoint_every_n_tokens if use_cp else None,
+        max_seqlen=max(seq_lens),
     )
     torch.cuda.synchronize()
 
@@ -1134,6 +1138,7 @@ def _test_prefill_kernel_state_dtype(
         output=our_o,
         output_state=our_state,
         use_cp=use_cp,
+        max_seqlen=max(seq_lens),
     )
 
     torch.cuda.synchronize()
