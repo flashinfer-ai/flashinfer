@@ -391,6 +391,7 @@ def _megakernel_config(
     mma_tiler_mnk=None,
     pingpong=None,
     cluster_shape_mnk=None,
+    tail_split_pairs: bool | None = None,
 ):
     from flashinfer.moe_ep import Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig
 
@@ -421,6 +422,7 @@ def _megakernel_config(
         mma_tiler_mnk=mma_tiler_mnk,
         pingpong=pingpong,
         cluster_shape_mnk=cluster_shape_mnk,
+        tail_split_pairs=tail_split_pairs,
         fc1_activation_dequant_scale=FC1_ACT_SCALE,
         fc2_activation_dequant_scale=FC2_ACT_SCALE,
     )
@@ -445,6 +447,7 @@ def _run_mega_layer(
     mma_tiler_mnk=None,
     pingpong=None,
     cluster_shape_mnk=None,
+    tail_split_pairs: bool | None = None,
     num_experts: int = 8,
     topk: int = 4,
     hidden: int = 2048,
@@ -496,6 +499,7 @@ def _run_mega_layer(
             mma_tiler_mnk=mma_tiler_mnk,
             pingpong=pingpong,
             cluster_shape_mnk=cluster_shape_mnk,
+            tail_split_pairs=tail_split_pairs,
         )
     )
     runtime = bootstrap_moe_ep_runtime(
@@ -983,6 +987,63 @@ def test_moe_ep_sm90_pull_fp8_mega_layer_recalibrated_heuristic_rows(case):
         f"rank {rank}: sm90_fp8_fp8_bf16_pull_cutedsl mega layer "
         f"(recalibrated row {scale} swap={swap_ab} tile={tile} pp={pingpong} "
         f"cga={cga} tb={token_back} tokens={num_tokens}) matches reference"
+    )
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_hopper
+@pytest.mark.parametrize(
+    "case",
+    [
+        # (scale, swap_ab, tile, pingpong, cga, token_back): the tail-split
+        # geometries of the 2026-09-18 heuristic rows (swap-AB ping-pong
+        # M128N128 cga(1,2,1) for per_tensor 1024-32768, non-swap cooperative
+        # M64N256 cga(2,1,1) for blockwise 8192), under both token-back
+        # placements (the dispatch-driven one gates on the fc2_done count the
+        # split tail changes).
+        ("per_tensor", True, (128, 128, 128), True, (1, 2, 1), "epi_warps"),
+        ("per_tensor", True, (128, 128, 128), True, (1, 2, 1), "reuse_dispatch_warps"),
+        ("blockwise", False, (64, 256, 128), False, (2, 1, 1), "epi_warps"),
+        ("blockwise", False, (64, 256, 128), False, (2, 1, 1), "reuse_dispatch_warps"),
+    ],
+    ids=[
+        "pt_pp_M128N128_cga12_epi",
+        "pt_pp_M128N128_cga12_reuse",
+        "bw_coop_N256_cga21_epi",
+        "bw_coop_N256_cga21_reuse",
+    ],
+)
+def test_moe_ep_sm90_pull_fp8_mega_layer_tail_split_pairs(case):
+    """Bit-exact check of the tail-split pair tasks against the reference.
+
+    1088 tokens per rank over 8 experts / top-4 give ~544 rows per expert:
+    4.25 swap-AB N=128 token tiles and 8.5 non-swap M=64 tiles, so every
+    expert ends in an odd CTA-tile count and its tail cluster block runs as
+    pair tasks (both CTAs on the single valid token tile, adjacent weights).
+    """
+    scale, swap_ab, tile, pingpong, cga, token_back = case
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size < 4:
+        pytest.skip("needs >=4 ranks")
+    rank = _run_mega_layer(
+        rank,
+        world_size,
+        quantize_input=True,
+        fp8_scale_mode=scale,
+        swap_ab=swap_ab,
+        num_tokens=1088,
+        max_tokens=1088,
+        token_back_mode=token_back,
+        mma_tiler_mnk=tile,
+        pingpong=pingpong,
+        cluster_shape_mnk=cga,
+        tail_split_pairs=True,
+    )
+    print(
+        f"rank {rank}: sm90_fp8_fp8_bf16_pull_cutedsl mega layer "
+        f"(tail-split pair tasks {scale} swap={swap_ab} tile={tile} "
+        f"pp={pingpong} cga={cga} tb={token_back}) matches reference"
     )
 
 

@@ -953,6 +953,7 @@ class MegaMoEFp8Tester(MegaMoETester):
             epi_flag_batch=self.impl.epi_flag_batch,
             flag_batch=self.impl.flag_batch,
             gate_up_clamp=self.problem.gate_up_clamp,
+            tail_split_pairs=self.impl.tail_split_pairs,
         )
 
         # -- 2. Workspaces (local cuda + sym-heap) --
@@ -1205,6 +1206,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "accumulator (BF16, kernel column order) to a separate fc1_c tensor "
         "and validate it against the reference (non-swap layouts only).",
     )
+    parser.add_argument(
+        "--tail_split_pairs", action="store_true", default=False,
+        help="Split the tail cluster block of an expert with an odd CTA-tile "
+             "count into pair tasks (both CTAs compute the single valid token "
+             "tile against adjacent weight tiles).  Requires a token-side "
+             "cluster of 2 (swap-AB cga 1,2,1 or non-swap cga 2,1,1).  "
+             "Default: the heuristic table entry, or FP8_TAIL_SPLIT=1 when "
+             "the selected geometry qualifies.",
+    )
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument(
         "--in_kernel_fc2_reduce", action="store_true", default=False,
@@ -1272,6 +1282,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             else None
         ),
         accum_mode=args.fp8_accum_mode,
+        generate_c=args.generate_c,
     )
     launch_config = config_selection.config
     # Explicit CLI choice wins; else the table's per-bucket winner.
@@ -1280,6 +1291,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         if args.token_back_mode is not None
         else launch_config.token_back_mode
     )
+    group_hint = (
+        args.group_hint if args.group_hint is not None else launch_config.group_hint
+    )
+    # CLI flag or table entry (with the FP8_TAIL_SPLIT override applied).
+    tail_split_pairs = bool(args.tail_split_pairs or launch_config.tail_split_pairs)
     if rank == 0:
         bucket = (
             str(config_selection.token_bucket)
@@ -1295,7 +1311,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             f"mma_tiler_mnk={launch_config.mma_tiler_mnk} "
             f"cluster_shape_mnk={launch_config.cluster_shape_mnk} "
             f"accum_mode={launch_config.accum_mode} "
-            f"token_back_mode={token_back_mode}",
+            f"token_back_mode={token_back_mode} group_hint={group_hint} "
+            f"tail_split_pairs={tail_split_pairs}",
             flush=True,
         )
 
@@ -1308,13 +1325,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         clc_bundle_size=args.clc_bundle_size,
         num_sched_stages=args.num_sched_stages,
         load_balance_mode=args.load_balance_mode,
-        group_hint=args.group_hint,
+        group_hint=group_hint,
         non_ubulk_fc2_store=True,
         in_kernel_fc2_reduce=args.in_kernel_fc2_reduce,
         token_back_mode=token_back_mode,
         epi_flag_batch=(2, 4),
         flag_batch=1,
         generate_c=args.generate_c,
+        tail_split_pairs=tail_split_pairs,
     )
 
     misc = MiscDesc(

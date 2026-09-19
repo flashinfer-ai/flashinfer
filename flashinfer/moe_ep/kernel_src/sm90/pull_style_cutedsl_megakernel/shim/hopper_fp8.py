@@ -199,6 +199,13 @@ class MegaMoEHopperFp8Config:
     # both layouts and both scale modes.  Off by default; the kernel store
     # path is compiled out when off.
     generate_c: bool = False
+    # Tail-split pair tasks: the tail cluster block of an expert with an odd
+    # CTA token-tile count becomes pair tasks (both CTAs compute the single
+    # valid token tile against adjacent, non-multicast weight tiles) instead
+    # of leaving one CTA idle.  Legal only with a 2-CTA token cluster and a
+    # 1-CTA weight cluster: swap-AB cga (1, 2, 1) or non-swap cga (2, 1, 1).
+    # Output-invariant; the heuristic table turns it on per bucket.
+    tail_split_pairs: bool = False
     # deepgemm compute graph: routing weights folded into the SwiGLU output
     # before FC1-output quantization (the driver's ref_compute_graph switch).
     # False leaves the staged FC2 terms unweighted and applies scores in the
@@ -371,6 +378,16 @@ class MegaMoEHopperFp8Config:
             raise ValueError(
                 f"group_hint must be positive when set, got {self.group_hint}."
             )
+        if self.tail_split_pairs:
+            cm, cn = self.cluster_shape_mnk[0], self.cluster_shape_mnk[1]
+            token_cluster, weight_cluster = (cn, cm) if self.swap_ab else (cm, cn)
+            if token_cluster != 2 or weight_cluster != 1:
+                raise ValueError(
+                    "tail_split_pairs requires a token-side cluster of 2 and a "
+                    "weight-side cluster of 1 (swap-AB cga (1, 2, 1) or non-swap "
+                    f"cga (2, 1, 1)); got cluster_shape_mnk={self.cluster_shape_mnk} "
+                    f"with swap_ab={self.swap_ab}."
+                )
         if self.flag_batch < 1 or self.flag_batch > 32:
             raise ValueError(f"flag_batch must be in [1, 32], got {self.flag_batch}.")
         eb = self.epi_flag_batch
@@ -649,6 +666,7 @@ class MegaMoEHopperFp8Frontend:
             c.epi_flag_batch,
             c.in_kernel_fc2_reduce,
             c.resolved_token_back_mode,
+            c.tail_split_pairs,
             c.apply_topk_in_fc1,
             self._gate_up_clamp,
             c.enable_iket,
@@ -767,6 +785,7 @@ class MegaMoEHopperFp8Frontend:
             fc1_early_done_publish=c.fc1_early_done_publish,
             fold_producer_warps=c.fold_producer_warps,
             generate_c=c.generate_c,
+            tail_split_pairs=c.tail_split_pairs,
         )
 
         local_ws_bytes, shared_ws_bytes = kernel.get_workspace_sizes()
@@ -1345,7 +1364,10 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
     generate_c: bool = False,
     apply_topk_in_fc1: bool = True,
     load_balance_mode: Literal["static", "atomic_counter"] = "static",
+    # None = the heuristic table's per-bucket value (manual geometry: the
+    # kernel default / FP8_TAIL_SPLIT override); an explicit bool wins.
     group_hint: Optional[int] = None,
+    tail_split_pairs: Optional[bool] = None,
     clc_bundle_size: Optional[int] = None,
     num_sched_stages: Optional[int] = None,
     flag_batch: int = 1,
@@ -1422,6 +1444,8 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
         mma_tiler_mnk = launch.mma_tiler_mnk
         cluster_shape_mnk = launch.cluster_shape_mnk
         fp8_accum_mode = launch.accum_mode
+        if tail_split_pairs is None:
+            tail_split_pairs = launch.tail_split_pairs
     else:
         # knobs=None (or "auto", which starts from the same resolution and
         # re-tunes at the first compute): pure lookup — offline-tuned cache
@@ -1431,10 +1455,13 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
         from .knob_cache import resolve_knobs as _resolve_cached_knobs
         from .tuner import GEOMETRY_KNOBS, default_knobs
 
+        geometry = default_knobs(
+            num_max_tokens, fp8_scale_mode=fp8_scale_mode, generate_c=generate_c
+        )
         if isinstance(knobs, dict):
             resolved = dict(knobs)
         else:
-            resolved, _ = _resolve_cached_knobs(
+            resolved, source = _resolve_cached_knobs(
                 dtype=kind,
                 fp8_scale_mode=fp8_scale_mode,
                 world_size=world_size,
@@ -1444,18 +1471,38 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
                 topk=num_topk,
                 max_tokens=num_max_tokens,
             )
-        geometry = default_knobs(num_max_tokens, fp8_scale_mode=fp8_scale_mode)
-        geometry.update({k: resolved[k] for k in GEOMETRY_KNOBS if k in resolved})
+            if source == "heuristic":
+                # Same table row, with the generate_c overrides applied.
+                resolved = dict(geometry)
+        # The table row's scheduler companions (group_hint / tail_split_pairs)
+        # were tuned together with its geometry: keep them only while the
+        # geometry stays on the table row; a cache / dict entry that moves the
+        # geometry brings its own values (or the kernel defaults).
+        table_defaults = {
+            "group_hint": geometry.pop("group_hint"),
+            "tail_split_pairs": geometry.pop("tail_split_pairs"),
+        }
+        cached_geometry = {k: resolved[k] for k in GEOMETRY_KNOBS if k in resolved}
+        if any(geometry[k] != v for k, v in cached_geometry.items()):
+            table_defaults = {}
+        geometry.update(cached_geometry)
         swap_ab = bool(geometry["swap_ab"])
         pingpong = bool(geometry["pingpong"])
         mma_tiler_mnk = tuple(geometry["mma_tiler_mnk"])
         cluster_shape_mnk = tuple(geometry["cluster_shape_mnk"])
         fp8_accum_mode = geometry["fp8_accum_mode"]
-        knob_overrides = {k: v for k, v in resolved.items() if k not in GEOMETRY_KNOBS}
-        # An explicit caller token-back choice wins over the heuristic
-        # table's / cache's per-bucket pick.
+        knob_overrides = {
+            **table_defaults,
+            **{k: v for k, v in resolved.items() if k not in GEOMETRY_KNOBS},
+        }
+        # An explicit caller choice wins over the heuristic table's / cache's
+        # per-bucket pick (token-back placement, scheduler group, tail split).
         if token_back_mode is not None or token_back_by_dispatch:
             knob_overrides.pop("token_back_mode", None)
+        if group_hint is not None:
+            knob_overrides.pop("group_hint", None)
+        if tail_split_pairs is not None:
+            knob_overrides.pop("tail_split_pairs", None)
         # The combine wire (dedup + format) is a collective correctness
         # setting the caller passes explicitly; a cached sweep entry must not
         # silently switch it.
@@ -1493,6 +1540,7 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
         apply_topk_in_fc1=apply_topk_in_fc1,
         load_balance_mode=load_balance_mode,
         group_hint=group_hint,
+        tail_split_pairs=bool(tail_split_pairs),
         clc_bundle_size=clc_bundle_size,
         num_sched_stages=num_sched_stages,
         flag_batch=flag_batch,
