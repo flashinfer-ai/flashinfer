@@ -1,45 +1,45 @@
-"""The AOT gate for the sparse-score module.
+"""The AOT gate for the QSA modules.
+
+Three modules go in together or not at all -- the scorer, the route it expands
+and the gate that closes the step -- because a build carrying some of them
+would report a capability it cannot serve. The pre-indexer is JIT-only and is
+deliberately not in the set.
 
 The scorer multiplies with m16n8k16, which every SM8-or-newer device has, so
-the build has to register it whenever any target is that new. An earlier gate
-keyed on the sm80 capability flag, which is only set when an 8.x target is in
-the build, and so skipped the module on an SM90-only or SM120-only build.
+the gate is the target list. An earlier gate keyed on the ``sm80`` capability
+flag, which is only set when an 8.x target is in the build, and so skipped the
+modules on an SM90-only or SM120-only build.
 """
 
 from types import SimpleNamespace
 
 import pytest
 
+QSA_MODULES = {"qsa_output_gate", "sparse_route", "sparse_scores"}
 
-@pytest.mark.parametrize(
-    ("target_archs", "expected"),
-    [
-        ({(8, "0")}, True),
-        ({(9, "0a")}, True),
-        ({(10, "0a")}, True),
-        ({(12, "0f")}, True),
-        ({(9, "0a"), (12, "0f")}, True),
-        ({(7, "5")}, False),
-    ],
-)
-def test_the_scorer_is_registered_for_every_sm8_or_newer_target(
-    monkeypatch, target_archs, expected
-) -> None:
+
+def _collect(monkeypatch, target_archs, add_misc):
+    """Which module names ``gen_all_modules`` asks for, as a set.
+
+    A set rather than a list: what matters is that the three are there or none
+    of them is, not the order the builder happens to append them in.
+    """
     from flashinfer import aot
     from flashinfer.jit import core as jit_core
 
-    calls = []
+    names = set()
 
     monkeypatch.setattr(
         jit_core,
         "current_compilation_context",
         SimpleNamespace(TARGET_CUDA_ARCHS=target_archs),
     )
-    monkeypatch.setattr(
-        aot,
-        "gen_sparse_scores_module",
-        lambda: calls.append("sparse_scores") or SimpleNamespace(name="sparse_scores"),
-    )
+    for name in QSA_MODULES:
+        monkeypatch.setattr(
+            aot,
+            f"gen_{name}_module",
+            (lambda n: lambda: names.add(n) or SimpleNamespace(name=n))(name),
+        )
     monkeypatch.setattr(
         aot, "gen_spdlog_module", lambda: SimpleNamespace(name="spdlog")
     )
@@ -48,8 +48,6 @@ def test_the_scorer_is_registered_for_every_sm8_or_newer_target(
         aot, "gen_cudnn_fmha_module", lambda: SimpleNamespace(name="cudnn")
     )
 
-    # The sm80 flag stays off throughout, so a gate that still keyed on it
-    # would register nothing for any of these targets.
     aot.gen_all_modules(
         [],
         [],
@@ -57,45 +55,42 @@ def test_the_scorer_is_registered_for_every_sm8_or_newer_target(
         [],
         [],
         [],
-        {},
+        {},  # sm_capabilities: the sm80 flag stays off throughout, so a gate
+        # that still keyed on it would register nothing for any target.
         False,  # add_comm
         False,  # add_gemma
         False,  # add_oai_oss
         False,  # add_moe
         False,  # add_act
-        True,  # add_misc
+        add_misc,
         False,  # add_xqa
     )
+    return names
 
-    assert (calls == ["sparse_scores"]) is expected
 
-
-def test_the_scorer_is_left_out_when_the_misc_modules_are(monkeypatch) -> None:
-    from flashinfer import aot
-    from flashinfer.jit import core as jit_core
-
-    calls = []
-
-    monkeypatch.setattr(
-        jit_core,
-        "current_compilation_context",
-        SimpleNamespace(TARGET_CUDA_ARCHS={(8, "0")}),
-    )
-    monkeypatch.setattr(
-        aot,
-        "gen_sparse_scores_module",
-        lambda: calls.append("sparse_scores") or SimpleNamespace(name="sparse_scores"),
-    )
-    monkeypatch.setattr(
-        aot, "gen_spdlog_module", lambda: SimpleNamespace(name="spdlog")
-    )
-    monkeypatch.setattr(aot, "gen_attention", lambda *args: ())
-    monkeypatch.setattr(
-        aot, "gen_cudnn_fmha_module", lambda: SimpleNamespace(name="cudnn")
-    )
-
-    aot.gen_all_modules(
-        [], [], [], [], [], [], {}, False, False, False, False, False, False, False
-    )
-
-    assert calls == []
+@pytest.mark.parametrize(
+    ("target_archs", "add_misc", "expected"),
+    [
+        ({(7, "5")}, True, False),
+        ({(8, "0")}, True, True),
+        ({(9, "0a")}, True, True),
+        ({(10, "0a")}, True, True),
+        ({(12, "0f")}, True, True),
+        ({(7, "5"), (9, "0a")}, True, True),
+        ({(8, "0")}, False, False),
+    ],
+    ids=[
+        "sm75",
+        "sm80",
+        "sm90-only",
+        "sm100-only",
+        "sm120-only",
+        "sm75+sm90",
+        "sm80-without-misc",
+    ],
+)
+def test_the_qsa_modules_go_in_together_or_not_at_all(
+    monkeypatch, target_archs, add_misc, expected
+) -> None:
+    names = _collect(monkeypatch, target_archs, add_misc)
+    assert names == (QSA_MODULES if expected else set())

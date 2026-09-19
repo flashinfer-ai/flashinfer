@@ -415,3 +415,27 @@ del _log_import_version
 
 from .kda_prefill import prepare_tf32_kda_prefill as prepare_tf32_kda_prefill
 from .kda_prefill import prepare_bf16_kda_prefill as prepare_bf16_kda_prefill
+from .topk import (
+    PreparedTopKRaggedTransform as PreparedTopKRaggedTransform,
+)
+from .sparse_pre_indexer import qsa_pre_indexer as qsa_pre_indexer
+from .sparse_route import expand_block_route as expand_block_route
+from .sparse_route import qsa_route_from_blocks as qsa_route_from_blocks
+from .sparse_route import qsa_route_from_logical as qsa_route_from_logical
+from .sparse_scores import sparse_paged_scores as sparse_paged_scores
+from .qsa_output_gate import qsa_output_gate as qsa_output_gate
+from .qsa import QSA as QSA
+from .qsa import QSAConfig as QSAConfig
+from .qsa import QSAWorkspaceRequirements as QSAWorkspaceRequirements
+from .qsa_attention import QSAAttention as QSAAttention
+from .qsa_attention import row_buckets as row_buckets
+from .qsa_capabilities import QSA_CAP_ATTENTION_PAGED as QSA_CAP_ATTENTION_PAGED
+from .qsa_capabilities import QSA_CAP_FP8 as QSA_CAP_FP8
+from .qsa_capabilities import QSA_CAP_NVFP4 as QSA_CAP_NVFP4
+from .qsa_capabilities import QSA_CAP_OUTPUT_GATE as QSA_CAP_OUTPUT_GATE
+from .qsa_capabilities import QSA_CAP_SELECTION as QSA_CAP_SELECTION
+from .qsa_capabilities import qsa_capabilities as qsa_capabilities
+from .qsa_capabilities import qsa_capability_names as qsa_capability_names
+from .qsa_selection import QSASelection as QSASelection
+from .qsa_selection import selection_columns as selection_columns
+from .qsa_selection import selection_route_width as selection_route_width
