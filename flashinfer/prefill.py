@@ -2351,6 +2351,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
         paged_kv_last_page_len : torch.Tensor
             The number of entries in the last page of each request in the paged
             kv-cache, shape: ``[batch_size]``.
+            A request's KV length is ``(num_pages - 1) * page_size +
+            last_page_len``, so a value below one reserves trailing pages that
+            carry no tokens. The fa2 kernels never read those pages, which lets
+            a caller plan from an upper bound of the KV length; the sum must not
+            be negative. Other backends are untested with such tables.
         num_qo_heads : int
             The number of query/output heads.
         num_kv_heads : int
@@ -2618,6 +2623,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
         paged_kv_last_page_len : torch.Tensor
             The number of entries in the last page of each request in the paged
             kv-cache, shape: ``[batch_size]``.
+            A request's KV length is ``(num_pages - 1) * page_size +
+            last_page_len``, so a value below one reserves trailing pages that
+            carry no tokens. The fa2 kernels never read those pages, which lets
+            a caller plan from an upper bound of the KV length; the sum must not
+            be negative. Other backends are untested with such tables.
         num_qo_heads : int
             The number of query/output heads.
         num_kv_heads : int
