@@ -98,6 +98,9 @@ from .jit.cake_kda_packed_t1 import (
 )
 from .jit.cake_megamoe_topk_reduce import gen_cake_megamoe_topk_reduce_module
 from .jit.nvfp4_attention_sm120 import gen_nvfp4_attention_sm120_module
+from .jit.qk_mxfp8_pv_nvfp4_attention_sm120 import (
+    gen_qk_mxfp8_pv_nvfp4_attention_sm120_module,
+)
 from .jit.fp8_quantization import gen_mxfp8_quantization_sm100_module
 from .jit.fused_moe import (
     gen_alphamoe_fused_router_module,
@@ -605,6 +608,7 @@ def gen_all_modules(
         jit_specs.append(gen_cake_fmha_compat_module("sm103a"))
     if has_sm120 or has_sm121:
         jit_specs.append(gen_nvfp4_attention_sm120_module())
+        jit_specs.append(gen_qk_mxfp8_pv_nvfp4_attention_sm120_module())
     blackwell_msa_targets: tuple[tuple[BlackwellMSATarget, bool], ...] = (
         ("sm100a", has_blackwell_msa_sm100a),
         ("sm103a", has_blackwell_msa_sm103a),
