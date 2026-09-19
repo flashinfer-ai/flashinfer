@@ -45,6 +45,7 @@ concurrency:
 permissions:
   contents: read
   pull-requests: write
+  statuses: read # reads the ci/test-scope status published by ci-bot-commands.yml
   actions: read
 
 env:
@@ -100,6 +101,8 @@ jobs:
       skip_build: ${{ steps.check.outputs.skip }}
       test_matrix: ${{ steps.matrix.outputs.matrix }}
       test_count: ${{ steps.matrix.outputs.count }}
+      # Surfaced so the required check can say a green result was scoped.
+      test_scope: ${{ steps.scope.outputs.test_path }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -153,6 +156,38 @@ jobs:
           fi
 
       # Built here rather than written inline in the test job because the
+      # `@flashinfer-bot run <paths>` publishes the requested scope as a `ci/test-scope`
+      # commit status on this SHA (see ci-bot-commands.yml). Read it verbatim - the
+      # comment was parsed once, there, and nothing is re-parsed here.
+      #
+      # Statuses come back newest-first, so the newest for this context is the last
+      # command issued. No status means nobody asked for a scope: run the full suite.
+      # Because the status is keyed to the SHA, a scope cannot outlive the commit it was
+      # requested for.
+      - name: Read requested test scope
+        id: scope
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          # The combined endpoint (/status, not /statuses) returns one entry per
+          # context, already the latest. Using it means re-triggering overwrites
+          # cleanly without this step deduplicating by hand, and without depending on
+          # the raw list's ordering, which is not a documented guarantee.
+          SCOPE=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/status" --jq '
+              .statuses
+              | map(select(.context | test("^ci/test-scope-[0-9]+$")))
+              | map({n: (.context | sub("^ci/test-scope-"; "") | tonumber),
+                     d: (.description // "")})
+              | sort_by(.n) | map(.d) | map(select(. != "")) | join(" ")')
+          if [ -z "$SCOPE" ]; then
+            echo "No requested scope for ${HEAD_SHA}; running the full suite"
+          else
+            echo "Requested scope: ${SCOPE}"
+          fi
+          echo "test_path=${SCOPE}" >> "$GITHUB_OUTPUT"
+
       # skip_aot / skip_gpu dispatch inputs have to drop entries before the
       # matrix expands - a job-level `if` cannot see the matrix context, and
       # skipping inside the job would still claim a runner first.
@@ -162,6 +197,9 @@ jobs:
           SKIP_AOT: ${{ github.event.inputs.skip_aot }}
           SKIP_GPU: ${{ github.event.inputs.skip_gpu }}
           RUNTIME_CUDA_MATRIX: ${{ steps.cuda-versions.outputs.runtime }}
+          # Targets requested by the triggering `@flashinfer-bot run <paths>` comment,
+          # already validated in the step above. Empty for an unparameterised run.
+          REQUESTED_TEST_PATH: ${{ steps.scope.outputs.test_path }}
         run: |
           {
             if [ "$SKIP_AOT" != "true" ]; then
@@ -179,7 +217,7 @@ jobs:
               done
             fi
 
-            if [ "$SKIP_GPU" != "true" ]; then
+            if [ "$SKIP_GPU" != "true" ] && [ -z "${REQUESTED_TEST_PATH}" ]; then
               for shard in 1 2 3 4 5; do
                 jq -nc --arg shard "$shard" '{
                   name: "JIT Unittest \($shard) (A10G)",
@@ -206,6 +244,49 @@ jobs:
                 runner: ["self-hosted", "linux", "x64", "gpu", "h100"],
                 cuda: "cu129",
                 script: "task_run_unit_tests.sh",
+                timeout: 480
+              }'
+            elif [ "$SKIP_GPU" != "true" ]; then
+              # A `@flashinfer-bot run <paths>` comment retargets the GPU lanes at those
+              # paths. There is deliberately no arch selection: tests carry their own
+              # arch guards (is_sm90a_supported() and friends) and skip themselves where
+              # unsupported, so the targets can run across the whole GPU matrix and the
+              # right subset executes per runner. Narrowing the scope reduces what runs
+              # in each cell, not which cells run - and nobody has to keep a
+              # path-to-arch mapping in sync with the tests.
+              #
+              # The default shards (task_jit_run_tests_part*.sh) are fixed pytest lists
+              # and take no arguments, so a targeted run uses task_run_unit_tests.sh --
+              # the script that forwards "$@" into TEST_PATH -- on every GPU runner.
+              #
+              # This step does NOT parse the PR body. Turning a declared scope into paths
+              # happens once, in whoever issues the trigger (a reviewer, or the screening
+              # watcher posting under its own identity). CI runs what it is told.
+              jq -nc --arg test_path "${REQUESTED_TEST_PATH}" '{
+                name: "Targeted Unittest (A10G)",
+                kind: "gpu",
+                runner: ["self-hosted", "linux", "x64", "gpu", "sm86", "on-demand"],
+                cuda: "cu129",
+                script: "task_run_unit_tests.sh",
+                test_path: $test_path,
+                timeout: 360
+              }'
+              jq -nc --arg test_path "${REQUESTED_TEST_PATH}" '{
+                name: "Targeted Unittest (T4)",
+                kind: "gpu",
+                runner: ["self-hosted", "linux", "x64", "gpu", "sm75", "on-demand"],
+                cuda: "cu129",
+                script: "task_run_unit_tests.sh",
+                test_path: $test_path,
+                timeout: 360
+              }'
+              jq -nc --arg test_path "${REQUESTED_TEST_PATH}" '{
+                name: "Targeted Unittest (H100)",
+                kind: "h100",
+                runner: ["self-hosted", "linux", "x64", "gpu", "h100"],
+                cuda: "cu129",
+                script: "task_run_unit_tests.sh",
+                test_path: $test_path,
                 timeout: 480
               }'
             fi
@@ -240,6 +321,9 @@ jobs:
       MATRIX_ARCH: ${{ matrix.runner[2] }}
       MATRIX_CUDA: ${{ matrix.cuda }}
       TEST_SCRIPT: ${{ matrix.script }}
+      # Empty for every lane except the experimental one. Quoted at the use site and
+      # never interpolated into script text - it originates from the PR body.
+      TEST_PATH_ARG: ${{ matrix.test_path }}
     steps:
       - name: Cleanup
         if: matrix.kind != 'h100'
@@ -351,7 +435,22 @@ jobs:
               exit 1
               ;;
           esac
-          bash ci/bash.sh "${DOCKER_IMAGE}" "./scripts/${TEST_SCRIPT}"
+          if [ -n "${TEST_PATH_ARG:-}" ]; then
+            # Read into an array and expand quoted, rather than relying on word
+            # splitting: this keeps the shell safe on its own terms instead of
+            # inheriting the validator's charset guarantee. Globbing is off for the
+            # same reason.
+            set -f
+            read -r -a TEST_TARGETS <<< "${TEST_PATH_ARG}"
+            set +f
+            # --test-path, not bare positionals: task_run_unit_tests.sh forwards "$@"
+            # to unit_test_runner.py, whose parser takes the scope as an option (or the
+            # TEST_PATH env var, which ci/bash.sh does not forward into the container).
+            # Bare paths fail argument-preflight with "unrecognized arguments".
+            bash ci/bash.sh "${DOCKER_IMAGE}" "./scripts/${TEST_SCRIPT}" --test-path "${TEST_TARGETS[@]}"
+          else
+            bash ci/bash.sh "${DOCKER_IMAGE}" "./scripts/${TEST_SCRIPT}"
+          fi
 
       - name: Make JUnit XML readable
         if: ${{ always() && matrix.kind == 'h100' }}
@@ -516,6 +615,12 @@ jobs:
 
       - name: Check Results
         if: needs.gate.outputs.authorized == 'true'
+        env:
+          # Bound, not interpolated into the script body. The value originates from a
+          # commit status description, which anything holding statuses:write can set;
+          # TARGET_RE happens to exclude quotes and backticks, but that guarantee lives
+          # in another file and must not be what keeps this step from being injectable.
+          TEST_SCOPE: ${{ needs.setup.outputs.test_scope }}
         run: |
           echo "## Test Results Summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -540,6 +645,18 @@ jobs:
           RESULT="${{ needs.test.result }}"
           echo "Tests: ${{ needs.setup.outputs.test_count }}, result: $RESULT" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
+
+          # A scope is sticky per SHA: re-applying run-ci by hand on a commit that
+          # once had a scoped bot run silently reuses it, so this required check can
+          # go green having run three narrow lanes. The job names change from "JIT
+          # Unittest" to "Targeted Unittest", but that is easy to miss on a check
+          # list -- say it outright on the check a merge decision actually reads.
+          if [ -n "${TEST_SCOPE:-}" ]; then
+            echo "> **Scoped run — NOT the full suite.**" >> $GITHUB_STEP_SUMMARY
+            echo "> Tested only: \`${TEST_SCOPE}\`" >> $GITHUB_STEP_SUMMARY
+            echo "> Comment \`@flashinfer-bot run\` with no paths for full coverage." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
 
           if [ "$RESULT" == "success" ] || [ "$RESULT" == "skipped" ]; then
             echo "Result: Tests Passed" >> $GITHUB_STEP_SUMMARY

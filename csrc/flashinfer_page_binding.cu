@@ -40,9 +40,18 @@ void append_paged_mla_kv_cache(TensorView append_ckv, TensorView append_kpe,
                                TensorView kpe_cache, TensorView kv_indices, TensorView kv_indptr,
                                TensorView kv_last_page_len);
 
+void nvfp4_quantize_append_paged_mla_kv_cache(TensorView append_ckv, TensorView append_kpe,
+                                              TensorView batch_indices, TensorView positions,
+                                              TensorView ckv_cache, TensorView ckv_sf_cache,
+                                              TensorView kpe_cache, TensorView kv_indices,
+                                              TensorView kv_indptr, TensorView kv_last_page_len,
+                                              double ckv_scale, double kpe_scale);
+
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(append_paged_kv_cache, append_paged_kv_cache);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_quantize_append_paged_kv_cache,
                               nvfp4_quantize_append_paged_kv_cache);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_quantize_append_paged_kv_cache_with_slot_mapping,
                               nvfp4_quantize_append_paged_kv_cache_with_slot_mapping);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(append_paged_mla_kv_cache, append_paged_mla_kv_cache);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_quantize_append_paged_mla_kv_cache,
+                              nvfp4_quantize_append_paged_mla_kv_cache);
