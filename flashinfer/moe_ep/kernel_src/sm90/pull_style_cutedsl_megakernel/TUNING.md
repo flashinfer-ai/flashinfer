@@ -9,14 +9,17 @@ mirrors the structure of the SM100 tree's `TUNING.md`.
 Unless noted otherwise, every measurement comes from a single 4x NVIDIA
 H200 141GB node (EP=4) taken in one session: the two microbenchmark tables
 below and the companion `benchmarks/pull_and_push_comparison.md` are one
-2026-09-18 session (current table: tail-split pair tasks + per-bucket
-group_hint + FC2 16-byte stores, compact pull buffer, swap-AB N=8 rows;
-sweep and pull/push comparison back to back on the same node — NOTE this
-node ran at its 1980 MHz boost clock, not the 1830 MHz lock of the earlier
-sessions, so its absolute numbers sit above the 2026-09-12 table for that
-reason alone), while the same-node before/after paragraphs are the
-2026-09-18 (tail-split port), 2026-09-12 (compact pull buffer) and
-2026-09-03 (fold layout) sessions, each on its own node (never compare
+2026-09-19 session (current table: group_hint 264 on every bucket up to
+8192, tail-split pair tasks, FC2 16-byte stores, fused swap-AB generate_c
+store, compact pull buffer, swap-AB N=8 rows; sweep and pull/push
+comparison back to back on the same node — NOTE this node ran at its
+1980 MHz boost clock, not the 1830 MHz lock of the 2026-09-12 session;
+unlocked, the long blockwise 8192 / 32768 points lose 3-5% to power-cap
+dips, so their absolute numbers are NOT comparable with that table),
+while the same-node before/after paragraphs are the 2026-09-19
+(small-bucket group_hint), 2026-09-18 (tail-split port), 2026-09-12
+(compact pull buffer) and 2026-09-03 (fold layout) sessions, each on its
+own node (never compare
 numbers across sessions; node-to-node offsets of ~2% are documented in
 "Next levers") — at the
 kernel drop's DSV4-Pro P03
@@ -28,12 +31,12 @@ config per point is the drop's token-bucket heuristic table
 (`moe_hopper_fp8/heuristic_config.py`, geometry derived from the kernel
 team's 2026-08-19 four-rank H200 sweep at the same vendored kernel
 sources, plus the locally added per-bucket `token_back_mode` column from
-the 2026-08-23 epi-vs-reuse sweep, and the kernel team's 2026-09-18
-tail-split / group_hint / token-back retune — see the knob list below).
-Raw rows: `benchmark_data/20260918/20260918_102532_mega_sm90_heuristic_both.csv`
+the 2026-08-23 epi-vs-reuse sweep, and the kernel team's 2026-09-18/19
+tail-split / group_hint / token-back retunes — see the knob list below).
+Raw rows: `benchmark_data/20260919/20260919_054455_mega_sm90_heuristic_both.csv`
 (local archive, not committed).
 
-## Microbenchmark results (2026-09-18, heuristic launch configs, max-rank µs)
+## Microbenchmark results (2026-09-19, heuristic launch configs, max-rank µs)
 
 Two timed series per point — the difference is WHAT each call includes:
 
@@ -61,41 +64,57 @@ now selects (`epi` = `epi_warps`, `reuse` = `reuse_dispatch_warps`; blank
 group hint = one wave of clusters).  All other knobs are at their config
 defaults — notably `active_dispatch_warps=1` (see "The knob surface").
 
-**per_tensor** — peak 985 TFLOPS/rank:
+**per_tensor** — peak 975 TFLOPS/rank:
 
 | tok/rank | heuristic config                   | token back | group hint | tail split | compute µs | TFLOPS | e2e µs   | e2e TFLOPS |
 |---------:|------------------------------------|:----------:|-----------:|:----------:|-----------:|-------:|---------:|-----------:|
-|        8 | swap-AB M256N16 CGA2x1             |    epi     |            |            |      772.5 |    8.2 |    931.3 |        6.8 |
-|       16 | swap-AB ping-pong M128N16 CGA1x2   |    epi     |            |            |     1235.0 |   10.3 |   1356.7 |        9.3 |
-|       32 | swap-AB M256N8 CGA2x1              |    epi     |            |            |     1399.7 |   18.1 |   1512.2 |       16.8 |
-|       64 | swap-AB M128N8 CGA1x2              |    epi     |            |            |     1654.1 |   30.7 |   1770.5 |       28.6 |
-|      128 | swap-AB ping-pong M128N8 CGA1x2    |    epi     |            |            |     1760.7 |   57.6 |   1899.2 |       53.4 |
-|      256 | swap-AB M256N32 CGA2x1             |    epi     |            |            |     1670.8 |  121.5 |   1832.8 |      110.7 |
-|      512 | swap-AB M256N64 CGA1x1             |    epi     |        264 |            |     1684.4 |  241.0 |   1812.7 |      223.9 |
-|     1024 | swap-AB ping-pong M128N64 CGA1x2   |    epi     |        264 |    yes     |     1716.8 |  472.8 |   1840.8 |      441.0 |
-|     2048 | swap-AB ping-pong M128N128 CGA1x2  |    epi     |        264 |    yes     |     2278.9 |  712.4 |   2403.9 |      675.4 |
-|     4096 | swap-AB ping-pong M128N128 CGA1x2  |    epi     |        264 |    yes     |     3795.9 |  855.4 |   3924.3 |      827.4 |
-|     8192 | swap-AB ping-pong M128N128 CGA1x2  |    epi     |        264 |    yes     |     6965.2 |  932.4 |   7190.8 |      903.1 |
-|    16384 | swap-AB ping-pong M128N128 CGA1x2  |    epi     |            |    yes     |    13266.7 |  979.0 |  13846.0 |      938.0 |
-|    32768 | swap-AB ping-pong M128N128 CGA1x2  |    epi     |            |    yes     |    26361.4 |  985.4 |  27447.1 |      946.4 |
+|        8 | swap-AB M256N16 CGA2x1             |    epi     |        264 |            |      745.9 |    8.5 |    868.0 |        7.3 |
+|       16 | swap-AB ping-pong M128N16 CGA1x2   |    epi     |        264 |            |     1076.5 |   11.8 |   1194.5 |       10.6 |
+|       32 | swap-AB M256N8 CGA2x1              |    epi     |        264 |            |     1359.4 |   18.7 |   1476.3 |       17.2 |
+|       64 | swap-AB M128N8 CGA1x2              |    epi     |        264 |            |     1494.5 |   34.0 |   1608.0 |       31.6 |
+|      128 | swap-AB ping-pong M128N8 CGA1x2    |    epi     |        264 |            |     1530.1 |   66.3 |   1649.7 |       61.5 |
+|      256 | swap-AB M256N32 CGA2x1             |    epi     |        264 |            |     1606.1 |  126.3 |   1728.0 |      117.4 |
+|      512 | swap-AB M256N64 CGA1x1             |    epi     |        264 |            |     1692.3 |  239.8 |   1814.8 |      223.6 |
+|     1024 | swap-AB ping-pong M128N64 CGA1x2   |    epi     |        264 |    yes     |     1720.2 |  471.9 |   1841.7 |      440.8 |
+|     2048 | swap-AB ping-pong M128N128 CGA1x2  |    epi     |        264 |    yes     |     2270.9 |  714.9 |   2405.0 |      675.0 |
+|     4096 | swap-AB ping-pong M128N128 CGA1x2  |    epi     |        264 |    yes     |     3790.2 |  856.7 |   3960.0 |      820.0 |
+|     8192 | swap-AB ping-pong M128N128 CGA1x2  |    epi     |        264 |    yes     |     6937.9 |  936.0 |   7184.5 |      903.9 |
+|    16384 | swap-AB ping-pong M128N128 CGA1x2  |    epi     |            |    yes     |    13389.9 |  970.0 |  13882.3 |      935.6 |
+|    32768 | swap-AB ping-pong M128N128 CGA1x2  |    epi     |            |    yes     |    26631.4 |  975.4 |  27674.9 |      938.6 |
 
-**blockwise** — peak 819 TFLOPS/rank:
+**blockwise** — peak 817 TFLOPS/rank:
 
 | tok/rank | heuristic config                   | token back | group hint | tail split | compute µs | TFLOPS | e2e µs   | e2e TFLOPS |
 |---------:|------------------------------------|:----------:|-----------:|:----------:|-----------:|-------:|---------:|-----------:|
-|        8 | swap-AB M256N16 CGA2x1             |    epi     |            |            |      784.6 |    8.1 |   1006.5 |        6.3 |
-|       16 | swap-AB M256N16 CGA1x1             |    epi     |            |            |     1153.2 |   11.0 |   1376.5 |        9.2 |
-|       32 | swap-AB ping-pong M128N16 CGA1x2   |    epi     |            |    yes     |     1654.5 |   15.3 |   1903.2 |       13.3 |
-|       64 | swap-AB M256N32 CGA2x1             |    epi     |            |            |     1637.6 |   31.0 |   1880.3 |       27.0 |
-|      128 | swap-AB M256N16 CGA2x1             |    epi     |            |            |     1636.8 |   62.0 |   1881.3 |       53.9 |
-|      256 | swap-AB ping-pong M128N32 CGA1x2   |    epi     |            |            |     2048.6 |   99.1 |   2286.5 |       88.8 |
-|      512 | non-swap M64N256 CGA1x1            |    epi     |        264 |            |     1735.6 |  233.8 |   1984.2 |      204.6 |
-|     1024 | non-swap M64N256 CGA2x2            |    epi     |        264 |            |     2008.5 |  404.1 |   2247.1 |      361.2 |
-|     2048 | non-swap M64N256 CGA2x2            |    epi     |        264 |            |     2866.7 |  566.3 |   3104.5 |      522.9 |
-|     4096 | non-swap M64N256 CGA1x1            |    epi     |            |            |     5395.6 |  601.8 |   5793.0 |      560.5 |
-|     8192 | non-swap M64N256 CGA2x1            |    epi     |        264 |    yes     |     8526.9 |  761.6 |   9136.2 |      710.8 |
-|    16384 | non-swap M64N256 CGA1x2            |   reuse    |            |            |    17500.2 |  742.2 |  18988.7 |      684.0 |
-|    32768 | non-swap M64N256 CGA2x1            |   reuse    |            |            |    31728.8 |  818.7 |  34562.9 |      751.6 |
+|        8 | swap-AB M256N16 CGA2x1             |    epi     |        264 |            |      754.4 |    8.4 |    958.5 |        6.6 |
+|       16 | swap-AB M256N16 CGA1x1             |    epi     |        264 |            |     1117.7 |   11.3 |   1320.7 |        9.6 |
+|       32 | swap-AB ping-pong M128N16 CGA1x2   |    epi     |        264 |    yes     |     1359.1 |   18.7 |   1565.1 |       16.2 |
+|       64 | swap-AB M256N32 CGA2x1             |    epi     |        264 |            |     1563.6 |   32.5 |   1767.5 |       28.7 |
+|      128 | swap-AB M256N16 CGA2x1             |    epi     |        264 |            |     1580.4 |   64.2 |   1784.1 |       56.9 |
+|      256 | swap-AB ping-pong M128N32 CGA1x2   |    epi     |        264 |            |     1691.3 |  120.0 |   1879.1 |      108.0 |
+|      512 | non-swap M64N256 CGA1x1            |    epi     |        264 |            |     1732.5 |  234.3 |   1939.7 |      209.2 |
+|     1024 | non-swap M64N256 CGA2x2            |    epi     |        264 |            |     2019.8 |  401.9 |   2203.2 |      368.4 |
+|     2048 | non-swap M64N256 CGA2x2            |    epi     |        264 |            |     2850.4 |  569.6 |   3063.4 |      530.0 |
+|     4096 | non-swap M64N256 CGA1x1            |    epi     |            |            |     5367.8 |  604.9 |   5792.2 |      560.6 |
+|     8192 | non-swap M64N256 CGA2x1            |    epi     |        264 |    yes     |     8566.6 |  758.1 |   9215.0 |      704.7 |
+|    16384 | non-swap M64N256 CGA1x2            |   reuse    |            |            |    17623.5 |  737.0 |  19066.3 |      681.2 |
+|    32768 | non-swap M64N256 CGA2x1            |   reuse    |            |            |    31796.8 |  816.9 |  34570.7 |      751.4 |
+
+**Before/after on one node (2026-09-19 session, this table's node)** —
+`group_hint` 264 on the 8-256 buckets (kernel team's retune; every bucket
+up to 8192 now carries it) versus the 2026-09-18 table, same node, 2
+interleaved rounds, e2e median: geomean **+3.70%** (per_tensor +3.89%,
+blockwise +3.50%); compute series +3.99%.  Per bucket (e2e): pt16
+**+12.9%**, pt64 **+10.4%**, pt128 **+14.1%**, pt256 +4.6%, pt8 +3.6%,
+pt32 +3.2%; bw32 **+18.3%**, bw256 **+19.2%**, bw64 +3.7%, bw8 +3.1%,
+bw128 +3.0%, bw16 +1.7%; 512 and up unchanged (within ±1.5%, their rows
+did not move).  At these token counts each expert has only a few rows,
+so a launch is one pass over the active experts' weights: with the
+one-wave default group the FC2 tiles of an expert are handed out right
+behind its 48 FC1 tiles and the activation TMA producer spends ~25% of
+its time in the fc2 fc1_done spin (kernel team's 4-rank IKET trace);
+six experts per group removes the spin.  All 26 points reference-checked
+`pass` in both trees and both rounds.
 
 **Before/after on one node (2026-09-18 session, this table's node)** —
 the kernel team's tail-split port (tail-split pair tasks, per-bucket
@@ -408,11 +427,13 @@ token-back modes — 38 candidates.
   tiles.  Several experts per group keep the FC2 tiles of one expert from
   spinning on `fc1_done` right behind that expert's own FC1 tiles, which
   only matters while experts are small (few tiles each).  Left unset it
-  follows the heuristic table's per-bucket value (2026-09-18: 264 on
-  per_tensor 512-8192 and blockwise 512-2048 / 8192; the kernel team's
-  same-node 4x H200 A/B measured −3..−16% on those buckets, the largest
-  gains at per_tensor 1024 and blockwise 1024 / 2048 where it also lets
-  epi_warps overtake reuse_dispatch_warps).  An explicit value wins over
+  follows the heuristic table's per-bucket value (264 on every bucket up
+  to 8192 except blockwise 4096: 2026-09-18 for 512-8192, where the kernel
+  team's same-node 4x H200 A/B measured −3..−16% and it lets epi_warps
+  overtake reuse_dispatch_warps at blockwise 1024 / 2048; 2026-09-19 for
+  8-256, where the one-wave group made the activation TMA producer spend
+  ~25% of its time in the fc2 fc1_done spin — FlashInfer same-node A/B
+  pt16/64/128 +10..+14%, bw32/256 +18..+19%, the rest +2..+5%).  An explicit value wins over
   the table; a knob-cache / `knobs=` entry that moves the geometry drops
   the table's value (it was tuned with that geometry).  Output-invariant
   tuner axis.

@@ -107,12 +107,22 @@ def _config(
 
 HEURISTIC_CONFIGS = {
     "per_tensor": {
-        8: _config(swap_ab=True, pingpong=False, tile=(256, 16, 128), cga=(2, 1, 1)),
-        16: _config(swap_ab=True, pingpong=True, tile=(128, 16, 128), cga=(1, 2, 1)),
-        32: _config(swap_ab=True, pingpong=False, tile=(256, 8, 128), cga=(2, 1, 1)),
-        64: _config(swap_ab=True, pingpong=False, tile=(128, 8, 128), cga=(1, 2, 1)),
-        128: _config(swap_ab=True, pingpong=True, tile=(128, 8, 128), cga=(1, 2, 1)),
-        256: _config(swap_ab=True, pingpong=False, tile=(256, 32, 128), cga=(2, 1, 1)),
+        # 8-256 (2026-09-19, 4x H200, two interleaved rounds): group_hint 264
+        # keeps FC2 tiles from spinning on fc1_done right behind their FC1
+        # tiles (the one-wave default made that spin 25% of the TMA producer):
+        # -2/-15/-3/-11/-12/-4%.
+        8: _config(swap_ab=True, pingpong=False, tile=(256, 16, 128), cga=(2, 1, 1),
+                   group_hint=264),
+        16: _config(swap_ab=True, pingpong=True, tile=(128, 16, 128), cga=(1, 2, 1),
+                    group_hint=264),
+        32: _config(swap_ab=True, pingpong=False, tile=(256, 8, 128), cga=(2, 1, 1),
+                    group_hint=264),
+        64: _config(swap_ab=True, pingpong=False, tile=(128, 8, 128), cga=(1, 2, 1),
+                    group_hint=264),
+        128: _config(swap_ab=True, pingpong=True, tile=(128, 8, 128), cga=(1, 2, 1),
+                     group_hint=264),
+        256: _config(swap_ab=True, pingpong=False, tile=(256, 32, 128), cga=(2, 1, 1),
+                     group_hint=264),
         # 512 / 1024 (2026-09-18, 4x H200, two interleaved rounds): group_hint
         # 264 -3% / -10%; 1024 with tail-split pair tasks on top -15%.
         512: _config(swap_ab=True, pingpong=False, tile=(256, 64, 128), cga=(1, 1, 1),
@@ -157,14 +167,20 @@ HEURISTIC_CONFIGS = {
     # basic, which is why it was never selected before; the layout, not the
     # register refit, is what makes the 2-WG modes viable here.
     "blockwise": {
-        8: _config(swap_ab=True, pingpong=False, tile=(256, 16, 128), cga=(2, 1, 1)),
-        16: _config(swap_ab=True, pingpong=False, tile=(256, 16, 128), cga=(1, 1, 1)),
-        # 32: tail-split pair tasks -3% (2026-09-18, two rounds, all ranks).
+        # 8-256 (2026-09-19, 4x H200, two interleaved rounds): group_hint 264
+        # -2/-1/-17/-4/-3/-20% (see per_tensor); 32 also tail-split -3%.
+        8: _config(swap_ab=True, pingpong=False, tile=(256, 16, 128), cga=(2, 1, 1),
+                   group_hint=264),
+        16: _config(swap_ab=True, pingpong=False, tile=(256, 16, 128), cga=(1, 1, 1),
+                    group_hint=264),
         32: _config(swap_ab=True, pingpong=True, tile=(128, 16, 128), cga=(1, 2, 1),
-                    tail_split_pairs=True),
-        64: _config(swap_ab=True, pingpong=False, tile=(256, 32, 128), cga=(2, 1, 1)),
-        128: _config(swap_ab=True, pingpong=False, tile=(256, 16, 128), cga=(2, 1, 1)),
-        256: _config(swap_ab=True, pingpong=True, tile=(128, 32, 128), cga=(1, 2, 1)),
+                    group_hint=264, tail_split_pairs=True),
+        64: _config(swap_ab=True, pingpong=False, tile=(256, 32, 128), cga=(2, 1, 1),
+                    group_hint=264),
+        128: _config(swap_ab=True, pingpong=False, tile=(256, 16, 128), cga=(2, 1, 1),
+                     group_hint=264),
+        256: _config(swap_ab=True, pingpong=True, tile=(128, 32, 128), cga=(1, 2, 1),
+                     group_hint=264),
         # 512-8192 (2026-09-18, 4x H200, two interleaved rounds): group_hint
         # 264 -3% (512); epi_warps + group_hint 264 -21% / -16% (1024 / 2048);
         # epi_warps -3% (4096); tail-split + group_hint 264 + epi_warps -8%

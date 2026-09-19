@@ -20,12 +20,14 @@ SCALE_MODES = ("per_tensor", "blockwise")
 # (group_hint, tail_split_pairs) per bucket where the table sets them.
 KNOB_TABLE = {
     "per_tensor": {
-        512: (264, False), 1024: (264, True),
+        8: (264, False), 16: (264, False), 32: (264, False), 64: (264, False),
+        128: (264, False), 256: (264, False), 512: (264, False), 1024: (264, True),
         2048: (264, True), 4096: (264, True), 8192: (264, True),
         16384: (None, True), 32768: (None, True),
     },
     "blockwise": {
-        32: (None, True), 512: (264, False), 1024: (264, False),
+        8: (264, False), 16: (264, False), 32: (264, True), 64: (264, False),
+        128: (264, False), 256: (264, False), 512: (264, False), 1024: (264, False),
         2048: (264, False), 8192: (264, True),
     },
 }
