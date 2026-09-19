@@ -2,7 +2,7 @@ import contextlib
 import functools
 import os
 from enum import Enum
-from typing import Optional
+from typing import Optional, Union
 
 import torch
 
@@ -159,6 +159,37 @@ def _get_dummy_scale_tensor(device: torch.device):
     return t
 
 
+# Scalar scales are memoised per (value, device): the variant pack needs a
+# device tensor, and building one per run() call would put a 4-byte H2D copy on
+# the hot path for what is almost always the same handful of values. Bounded so
+# a caller sweeping scales cannot grow it without limit.
+_SCALE_TENSOR_CACHE_MAX = 64
+_scale_tensors: dict[tuple[float, torch.device], torch.Tensor] = {}
+
+
+def _as_scale_tensor(
+    value: Optional[Union[float, int, torch.Tensor]], device: torch.device
+) -> Optional[torch.Tensor]:
+    """Normalise a scale to the 1x1x1x1 fp32 tensor cuDNN's variant pack expects.
+
+    ``BatchPrefillWithRaggedKVCacheWrapper.run()`` advertises its scales as
+    ``Optional[float]`` and forwards them here unchanged, while cuDNN reads
+    scales from device tensors -- a float reaching the variant pack fails with
+    ``Object does not have the __dlpack__() method``. Accept either form so the
+    wrapper's documented signature works against this backend.
+    """
+    if value is None or isinstance(value, torch.Tensor):
+        return value
+    key = (float(value), device)
+    t = _scale_tensors.get(key)
+    if t is None:
+        t = torch.full((1, 1, 1, 1), float(value), device=device, dtype=torch.float32)
+        if len(_scale_tensors) >= _SCALE_TENSOR_CACHE_MAX:
+            _scale_tensors.clear()
+        _scale_tensors[key] = t
+    return t
+
+
 def _create_cudnn_handle(stream: torch.cuda.Stream):
     global _cudnn_handle
 
@@ -199,6 +230,8 @@ class UIDs(Enum):
     S_DESCALE_UID = 154  # Descale tensor
     O_SCALE_UID = 155  # Output scale tensor
 
+    SINK_TOKEN_UID = 170  # Per-head attention sink logits
+
     S_AMAX_UID = 160  # Scale amax tensor
     O_AMAX_UID = 161  # Output amax tensor
 
@@ -228,6 +261,8 @@ def _sdpa_prefill_key_fn(
     lse: Optional[torch.Tensor] = None,
     o_data_type: Optional[torch.dtype] = None,
     override_cache: Optional[tuple[int, int, int]] = None,
+    window_left: Optional[int] = None,
+    sinks: Optional[torch.Tensor] = None,
 ):
     if actual_seq_lens_q is not None:
         graph_b = actual_seq_lens_q.shape[0]
@@ -281,6 +316,10 @@ def _sdpa_prefill_key_fn(
         # (see _build_prefill_graph); omitting it here silently replays a
         # stale-scale graph for any same-shape call with a different scale.
         scale,
+        # The window bound is baked into the mask subgraph, and a sink adds an
+        # input tensor, so neither can share a graph with a plain causal call.
+        window_left,
+        sinks is not None,
     )
     return key
 
@@ -313,6 +352,8 @@ if CUDNN_AVAILABLE:
         lse: Optional[torch.Tensor] = None,
         o_data_type: Optional[torch.dtype] = None,
         override_cache: Optional[tuple[int, int, int]] = None,
+        window_left: Optional[int] = None,
+        sinks: Optional[torch.Tensor] = None,
     ):
         global _prefill_graph_builds
         _prefill_graph_builds += 1
@@ -634,6 +675,30 @@ if CUDNN_AVAILABLE:
                     ),
                 }
 
+            # Sliding window. The two libraries count the band differently and
+            # the conversion was measured, not assumed: FlashInfer's
+            # `window_left = W` admits keys in [p - W, p] for a query at
+            # absolute position p, i.e. W + 1 tokens including the diagonal,
+            # while cuDNN's `diagonal_band_left_bound = L` admits L tokens
+            # including the diagonal ([p - (L - 1), p]). Passing W through
+            # unchanged drops the oldest key of every window. `-1` (disabled)
+            # is normalised to None upstream.
+            mask_kwargs = {}
+            if window_left is not None:
+                mask_kwargs["diagonal_band_left_bound"] = window_left + 1
+
+            # Attention sinks: one extra logit per head that joins the softmax
+            # denominator without contributing a value row.
+            if sinks is not None:
+                cudnn_sinks = g.tensor(
+                    name="sink_token",
+                    dim=(1, sinks.shape[0], 1, 1),
+                    stride=(sinks.shape[0], 1, 1, 1),
+                    data_type=cudnn.datatypes._torch_to_cudnn_data_type(sinks.dtype),
+                )
+                cudnn_sinks.set_uid(UIDs.SINK_TOKEN_UID.value)
+                mask_kwargs["sink_token"] = cudnn_sinks
+
             if (
                 cudnn_q_data_type == cudnn.data_type.BFLOAT16
                 or cudnn_q_data_type == cudnn.data_type.HALF
@@ -648,6 +713,7 @@ if CUDNN_AVAILABLE:
                     attn_scale=scale,
                     generate_stats=return_lse,
                     use_causal_mask_bottom_right=bottom_right_causal_mask,
+                    **mask_kwargs,
                     paged_attention_k_table=(
                         cudnn_k_block_tables if block_tables is not None else None
                     ),
@@ -678,6 +744,7 @@ if CUDNN_AVAILABLE:
                     attn_scale=scale,
                     use_causal_mask_bottom_right=bottom_right_causal_mask,
                     use_padding_mask=padding_mask,
+                    **mask_kwargs,
                     # cu_seq_len kwargs (direct path) exist on sdpa_fp8 only in
                     # cudnn-frontend 1.27+; the version gate guarantees that.
                     **seq_len_kwargs,
@@ -813,9 +880,9 @@ def _batch_prefill_with_kv_cache(
     block_tables: Optional[torch.Tensor] = None,
     causal: bool,
     return_lse: bool,
-    q_scale: Optional[torch.Tensor] = None,
-    k_scale: Optional[torch.Tensor] = None,
-    v_scale: Optional[torch.Tensor] = None,
+    q_scale: Optional[Union[float, torch.Tensor]] = None,
+    k_scale: Optional[Union[float, torch.Tensor]] = None,
+    v_scale: Optional[Union[float, torch.Tensor]] = None,
     batch_offsets_q: Optional[torch.Tensor] = None,
     batch_offsets_o: Optional[torch.Tensor] = None,
     batch_offsets_k: Optional[torch.Tensor] = None,
@@ -825,6 +892,8 @@ def _batch_prefill_with_kv_cache(
     lse: Optional[torch.Tensor] = None,
     o_data_type: Optional[torch.dtype] = None,
     lse_base: str = "log2",
+    window_left: Optional[int] = None,
+    sinks: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # Shape override covers the fully ragged token-indptr path (3-D q/k/v with
     # cu_seq_lens on both sides, 16-bit inputs); paged, per-batch-length and fp8
@@ -870,6 +939,8 @@ def _batch_prefill_with_kv_cache(
             out=out,
             lse=lse,
             o_data_type=o_data_type,
+            window_left=window_left,
+            sinks=sinks,
         )
 
     graph, tensors = _build_prefill_graph(
@@ -931,16 +1002,19 @@ def _batch_prefill_with_kv_cache(
         if batch_offsets_stats is not None:
             var_map[UIDs.RAGGED_STATS_UID.value] = batch_offsets_stats
 
+    if sinks is not None:
+        var_map[UIDs.SINK_TOKEN_UID.value] = sinks
+
     if q_scale is not None:
         dummy_scale_tensor = _get_dummy_scale_tensor(q.device)
-        var_map[UIDs.Q_SCALE_UID.value] = q_scale
+        var_map[UIDs.Q_SCALE_UID.value] = _as_scale_tensor(q_scale, q.device)
         var_map[UIDs.S_SCALE_UID.value] = dummy_scale_tensor
         var_map[UIDs.S_DESCALE_UID.value] = dummy_scale_tensor
         var_map[UIDs.O_SCALE_UID.value] = dummy_scale_tensor
     if k_scale is not None:
-        var_map[UIDs.K_SCALE_UID.value] = k_scale
+        var_map[UIDs.K_SCALE_UID.value] = _as_scale_tensor(k_scale, q.device)
     if v_scale is not None:
-        var_map[UIDs.V_SCALE_UID.value] = v_scale
+        var_map[UIDs.V_SCALE_UID.value] = _as_scale_tensor(v_scale, q.device)
 
     handle = _create_cudnn_handle(torch.cuda.current_stream(q.device))
     execute_kwargs = {}
@@ -984,9 +1058,9 @@ def cudnn_batch_prefill_with_kv_cache(
     block_tables: Optional[torch.Tensor] = None,
     causal: bool,
     return_lse: bool,
-    q_scale: Optional[torch.Tensor] = None,
-    k_scale: Optional[torch.Tensor] = None,
-    v_scale: Optional[torch.Tensor] = None,
+    q_scale: Optional[Union[float, torch.Tensor]] = None,
+    k_scale: Optional[Union[float, torch.Tensor]] = None,
+    v_scale: Optional[Union[float, torch.Tensor]] = None,
     batch_offsets_q: Optional[torch.Tensor] = None,
     batch_offsets_o: Optional[torch.Tensor] = None,
     batch_offsets_k: Optional[torch.Tensor] = None,
@@ -999,6 +1073,8 @@ def cudnn_batch_prefill_with_kv_cache(
     backend: Optional[str] = None,
     o_data_type: Optional[torch.dtype] = None,
     lse_base: str = "log2",
+    window_left: Optional[int] = None,
+    sinks: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     r"""Batched prefill attention with paged KV cache, backed by cuDNN SDPA.
 
@@ -1237,6 +1313,8 @@ def cudnn_batch_prefill_with_kv_cache(
             lse=lse,
             o_data_type=o_data_type,
             lse_base=lse_base,
+            window_left=window_left,
+            sinks=sinks,
         )
 
         if batch_offsets_units == "tokens":

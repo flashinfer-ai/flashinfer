@@ -1845,7 +1845,7 @@ def _blackwell_ragged_auto_upgrade(
     has_sinks: bool,
     cudnn_indptr_is_int32: bool,
     cutlass_work_items: int,
-    cuda_graph_enabled: bool,
+    cutlass_replan_under_capture: bool,
     cutlass_indptr_is_int32: bool = False,
     single_token_gqa: bool = False,
 ) -> Optional[str]:
@@ -1875,24 +1875,32 @@ def _blackwell_ragged_auto_upgrade(
     ``auto`` routes past them instead of failing (``cudnn_indptr_is_int32`` and
     ``cutlass_work_items`` both exist for that reason).
     """
+    # Universal disqualifiers: no backend in the walk implements these, so an
+    # upgrade would silently drop the feature.
     if (
         kv_layout != "NHD"
         or q_data_type != kv_data_type
         or pos_encoding_mode != PosEncodingMode.NONE.value
         or has_custom_mask
-        or window_left >= 0
         or logits_soft_cap != 0.0
         or has_multi_item_scoring
-        or has_sinks
     ):
         return None
+    # Sliding window and attention sinks are per-backend: cuDNN builds both into
+    # its SDPA graph (diagonal_band_left_bound / sink_token), while the CUTLASS
+    # run path receives only `causal` and the scales and would ignore them.
+    needs_window_or_sinks = window_left >= 0 or has_sinks
     for backend in _blackwell_ragged_auto_order(head_dim_qk, head_dim_vo):
         if backend == "cudnn":
             if (
                 is_sm100a_supported(device)
-                # fp16 / bf16 only: the cuDNN run branch below takes the caller's
-                # tensors as they are, and the wrapper's fp8 handling (scales,
-                # descale tensors) lives on the paths after it.
+                # fp16 / bf16 only. cuDNN itself does fp8 (`sdpa_fp8`), and the
+                # wrapper's cuDNN branch now normalises scalar scales so an fp8
+                # call reaches it intact -- but `auto` still stays away: the fp8
+                # output is not yet validated against a reference here, and the
+                # fp8 graph has been observed taking minutes to compile at
+                # production shapes, which is not something to hand a caller who
+                # only asked for "auto". Explicit `backend="cudnn"` works.
                 and q_data_type in (torch.float16, torch.bfloat16)
                 and _cudnn_supports_direct_seqlens(q_data_type)
                 and (head_dim_qk, head_dim_vo) in _CUDNN_RAGGED_AUTO_HEAD_DIMS
@@ -1908,6 +1916,8 @@ def _blackwell_ragged_auto_upgrade(
                 and not single_token_gqa
             ):
                 return backend
+        elif backend == "cutlass" and needs_window_or_sinks:
+            continue
         elif backend == "cutlass":
             if (
                 (is_sm100a_supported(device) or is_sm110a_supported(device))
@@ -1925,10 +1935,10 @@ def _blackwell_ragged_auto_upgrade(
                 and (head_dim_qk, head_dim_vo) in _CUTLASS_RAGGED_AUTO_HEAD_DIMS
                 and cutlass_work_items <= _CUTLASS_PLAN_WORK_CAPACITY
                 # `fmha_varlen_plan` allocates fresh work-index buffers on every
-                # call, so a re-plan silently leaves a captured graph pointing at
-                # the previous allocation. Until those buffers are updated in
-                # place, CUTLASS is not graph-safe and `auto` stays away.
-                and not cuda_graph_enabled
+                # call, so a re-plan leaves a captured graph pointing at the
+                # previous allocation. The first plan is safe (nothing has been
+                # captured yet), so only a re-plan under capture is excluded.
+                and not cutlass_replan_under_capture
             ):
                 return backend
     return None
@@ -4056,6 +4066,10 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             device="cpu",
         )
         self._use_cuda_graph = use_cuda_graph
+        # Tracks whether a CUTLASS plan has already been built on this
+        # wrapper: its work-index buffers are reallocated per plan(), so a
+        # re-plan under graph capture is the unsafe case, not the first plan.
+        self._cutlass_graph_planned = False
         if use_cuda_graph:
             if not torch.is_tensor(qo_indptr_buf):
                 raise ValueError(
@@ -4679,7 +4693,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                         cutlass_work_items=_cutlass_plan_work_items(
                             qo_indptr_host, num_qo_heads
                         ),
-                        cuda_graph_enabled=self.is_cuda_graph_enabled,
+                        cutlass_replan_under_capture=(
+                            self.is_cuda_graph_enabled and self._cutlass_graph_planned
+                        ),
                         cutlass_indptr_is_int32=(
                             self._qo_indptr_buf.dtype == torch.int32
                             and self._kv_indptr_buf.dtype == torch.int32
@@ -4756,17 +4772,22 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             self._cudnn_stats_offsets = self._qo_indptr_buf
 
         if self._backend == "cutlass":
-            if self.is_cuda_graph_enabled:
-                # `fmha_varlen_plan` allocates new work-index buffers per call,
-                # so a captured graph keeps pointing at the previous ones. The
-                # fix is to update them in place; until then, refuse rather than
-                # replay against a stale plan. `auto` never lands here -- it
-                # treats graph mode as CUTLASS-ineligible and routes elsewhere.
+            if self.is_cuda_graph_enabled and self._cutlass_graph_planned:
+                # `fmha_varlen_plan` allocates new work-index buffers on every
+                # call, so a graph captured against the first plan keeps
+                # pointing at that allocation. Planning once and then capturing
+                # is therefore fine -- it is the *re*-plan that strands the
+                # captured graph on stale buffers, so only that is refused.
+                # The fix is to update those buffers in place; until then
+                # `auto` declines CUTLASS on re-plan and routes elsewhere.
                 raise ValueError(
-                    "the cutlass backend allocates its plan buffers per plan() "
-                    "call and is not CUDA-graph safe; use backend='auto' to get "
-                    "a graph-safe backend, or an explicit 'cudnn'/'fa2'"
+                    "the cutlass backend allocates fresh plan buffers on every "
+                    "plan() call, so re-planning under CUDA graph capture would "
+                    "leave the captured graph pointing at the previous ones; "
+                    "use backend='auto', or an explicit 'cudnn'/'fa2', if you "
+                    "need to re-plan inside a graph"
                 )
+            self._cutlass_graph_planned = True
             # Device mirrors, not the caller's tensors: in CUDA-graph mode the
             # kernel reads the registered buffers, and a host-side indptr would
             # otherwise be planned against.
@@ -5269,12 +5290,6 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 raise NotImplementedError(
                     "cuDNN ragged prefill backend requires kv_layout='NHD'"
                 )
-            if getattr(self, "_sinks", None) is not None:
-                raise NotImplementedError(
-                    "attention sinks were set on the wrapper (_sinks) but the "
-                    "cuDNN ragged prefill backend does not consume them; plan() "
-                    "again (auto routes past cuDNN when sinks are set) or use fa2"
-                )
             if (
                 return_lse
                 and self._max_token_per_sequence == 1
@@ -5322,6 +5337,10 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 out=out,
                 lse=lse,
                 o_data_type=out_dtype,
+                # cuDNN builds the band into the mask subgraph; -1 (disabled)
+                # becomes None so a full-attention call keeps its plain graph.
+                window_left=(window_left if window_left >= 0 else None),
+                sinks=getattr(self, "_sinks", None),
             )
 
             # base already handled inside cudnn_batch_prefill_with_kv_cache
