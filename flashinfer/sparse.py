@@ -793,6 +793,51 @@ class BlockSparseAttentionWrapper:
         input -- so all this needs is a device to say which architecture is
         being asked about, and the indptr that fixes the batch.
 
+        Parameters
+        ----------
+        device : torch.device
+            The device the sizes are asked about. The planner is instantiated
+            per architecture, so the answer is per device.
+        indptr : torch.Tensor
+            The block row pointer, as :meth:`plan` takes it. Its length fixes
+            the number of rows the plan covers.
+        M : int
+            The number of rows of the block-sparse matrix.
+        R : int
+            The number of rows in each block.
+        C : int
+            The number of columns in each block.
+        num_qo_heads : int
+            The number of query/output heads.
+        num_kv_heads : int
+            The number of key/value heads.
+        head_dim : int
+            The dimension of the heads.
+        causal : bool
+            Whether the attention is causal.
+        pos_encoding_mode : str
+            The position encoding applied inside the attention kernel, one of
+            ``NONE``, ``ROPE_LLAMA`` or ``ALIBI``.
+        use_fp16_qk_reduction : bool
+            Whether to use f16 for QK reduction.
+        logits_soft_cap : Optional[float]
+            The attention logits soft capping value, disabled when ``None`` or
+            ``0.0``.
+        q_data_type : Union[str, torch.dtype]
+            The query data type.
+        kv_data_type : Optional[Union[str, torch.dtype]]
+            The key/value data type, defaulting to ``q_data_type``.
+        o_data_type : Union[str, torch.dtype]
+            The output data type.
+        use_custom_mask : bool
+            Whether the plan will carry a custom mask. It changes the sizes,
+            so it is asked for here rather than assumed.
+        kv_cache_page_size : Optional[int]
+            The page size of a paged KV cache, or ``None`` for a raw one.
+        backend : str
+            The backend the sizes are for, one of ``auto``, ``fa2``, ``fa3``
+            or ``trtllm-gen``.
+
         Returns
         -------
         Tuple[int, int]

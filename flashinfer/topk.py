@@ -1346,7 +1346,6 @@ def top_k_page_table_transform(
     return out
 
 
-@flashinfer_api(trace=top_k_ragged_transform_trace)
 def resolve_ragged_transform_backend(
     *,
     num_rows: int,
@@ -1365,6 +1364,34 @@ def resolve_ragged_transform_backend(
     :func:`top_k_ragged_transform` and the prepared transform that fixes its
     backend up front. Splitting the rule in two would let a caller plan against
     one kernel and run on another.
+
+    Parameters
+    ----------
+    num_rows : int
+        The number of rows in the batch.
+    max_len : int
+        The widest row the transform may see.
+    k : int
+        The number of entries kept per row.
+    dtype : torch.dtype
+        The score dtype.
+    device : torch.device
+        The device the call runs on. Backends differ by architecture, so the
+        answer is per device.
+    deterministic : bool
+        Whether the caller asked for a reproducible ordering.
+    tie_break : int
+        The tie-break rule, a :class:`TopKTieBreak` value.
+    dsa_graph_safe : bool
+        Whether the call has to be safe to capture. A backend that plans or
+        allocates inside the call cannot serve one that is.
+    use_row_starts : bool
+        Whether the caller supplies per-row start offsets.
+
+    Returns
+    -------
+    str
+        One of ``"cub"``, ``"clusters"`` or ``"radix"``.
     """
     algo = os.environ.get("FLASHINFER_TOPK_ALGO")
     clusters_eligible = (
@@ -1390,6 +1417,7 @@ def resolve_ragged_transform_backend(
     return "radix"
 
 
+@flashinfer_api(trace=top_k_ragged_transform_trace)
 def top_k_ragged_transform(
     input: torch.Tensor,
     offsets: torch.Tensor,
