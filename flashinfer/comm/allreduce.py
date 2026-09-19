@@ -52,7 +52,7 @@ Example usage:
         >>> workspace.destroy()
 """
 
-from typing import Union, Literal, Optional, Tuple, List, cast, Any
+from typing import Callable, Dict, Union, Literal, Optional, Tuple, List, cast, Any
 from .workspace_base import AllReduceFusionWorkspace
 
 import torch
@@ -60,7 +60,11 @@ from torch.distributed import ProcessGroup
 
 from flashinfer.api_logging import flashinfer_api
 from flashinfer.trace.templates.comm import allreduce_fusion_trace
-from flashinfer.utils import is_confidential_compute
+from flashinfer.utils import (
+    BackendSupportedError,
+    is_confidential_compute,
+    supported_compute_capability,
+)
 
 from .trtllm_ar import trtllm_allreduce_fusion
 from .trtllm_ar import trtllm_create_ipc_workspace_for_all_reduce_fusion
@@ -279,6 +283,13 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
 # ============================================================================
 
 
+# The fused AllReduce kernels are built per architecture family, not per SM: the
+# TRT-LLM comm module covers major versions 9/10/12 and the MNNVL comm module
+# covers 9/10 (see gen_trtllm_comm_module / gen_trtllm_mnnvl_comm_module in
+# flashinfer/jit/comm.py). A device outside a backend's family cannot be served
+# at any point in a workspace lifetime, so the family is part of the hard
+# requirements of the backend rather than a runtime detail of one kernel.
+@supported_compute_capability([90, 100, 103, 120, 121])
 def _trtllm_workspace_check(
     backend: str,
     world_size: int,
@@ -292,8 +303,103 @@ def _trtllm_workspace_check(
 
     Hard requirements:
     - Up to 16 ranks supported.
+    - Hopper (9.x), Blackwell datacenter (10.x) or Blackwell consumer (12.x).
     """
     return world_size <= 16
+
+
+@supported_compute_capability([90, 100, 103])
+def _mnnvl_workspace_check(
+    backend: str,
+    world_size: int,
+    rank: int,
+    max_token_num: int,
+    hidden_dim: int,
+    dtype: torch.dtype,
+) -> bool:
+    """
+    Check if mnnvl backend CAN be used for workspace creation.
+
+    Hard requirements:
+    - Hopper (9.x) or Blackwell datacenter (10.x); the MNNVL comm module has no
+      kernels for any other family.
+
+    Whether multicast and fabric handles are usable at all is a property of the
+    group rather than of a device, so it stays in the creation-time topology
+    probe instead of being answered here.
+    """
+    return True
+
+
+# The backends selectable through the ``backend`` argument of
+# create_allreduce_fusion_workspace. "auto" is a selection policy over this
+# registry, not an implementation, so it is deliberately not a key.
+_BACKEND_CHECKS: Dict[str, Callable] = {
+    "trtllm": _trtllm_workspace_check,
+    "mnnvl": _mnnvl_workspace_check,
+}
+
+
+def _has_backend(backend: str) -> bool:
+    """Whether ``backend`` names an implementation of this API family."""
+    return backend in _BACKEND_CHECKS
+
+
+def _has_backend_choices() -> bool:
+    """create_allreduce_fusion_workspace selects among ``_BACKEND_CHECKS``."""
+    return True
+
+
+def _has_no_backend_choices() -> bool:
+    """allreduce_fusion takes no backend argument; the workspace selects it."""
+    return False
+
+
+def _is_backend_supported(backend: str, cc: Optional[int] = None) -> bool:
+    """Whether ``backend`` is implemented, optionally for capability ``cc``.
+
+    Only the name and the architecture family are answerable from here. What
+    makes a backend unusable for one configuration -- ``world_size``, problem
+    size, group topology -- needs arguments this query does not carry, and is
+    checked where those arguments are known.
+    """
+    if backend not in _BACKEND_CHECKS:
+        return False
+    if cc is None:
+        return True
+    checker = _BACKEND_CHECKS[backend]
+    # A checker that carries no compute capability metadata cannot answer for a
+    # capability, so it counts as unsupported rather than as unknown.
+    return hasattr(checker, "is_compute_capability_supported") and (
+        checker.is_compute_capability_supported(cc)
+    )
+
+
+def _is_compute_capability_supported(cc: int) -> bool:
+    """Whether any implementation of this API family has kernels for ``cc``."""
+    return any(
+        hasattr(check, "is_compute_capability_supported")
+        and check.is_compute_capability_supported(cc)
+        for check in _BACKEND_CHECKS.values()
+    )
+
+
+def _allreduce_fusion_is_backend_supported(backend, cc=None) -> bool:
+    """``is_backend_supported`` for the API that declares no backend choices.
+
+    Same contract as flashinfer.utils.backend_requirement with an empty backend
+    map: a backend argument is meaningless there, so the call is refused instead
+    of being answered with a guess about the intended workspace.
+    """
+    raise ValueError(
+        "Invalid is_backend_supported call: no backend choices for allreduce_fusion"
+    )
+
+
+def _device_capability() -> int:
+    """Compute capability of the current device as ``major * 10 + minor``."""
+    major, minor = torch.cuda.get_device_capability()
+    return major * 10 + minor
 
 
 # ============================================================================
@@ -452,11 +558,32 @@ def create_allreduce_fusion_workspace(
     ... )
 
     """
+    if backend != "auto":
+        # Refuse an unusable explicit backend before anything is allocated or
+        # rendezvoused. Each rank decides from its own device: a backend's
+        # kernels either exist for this architecture or never will, and a group
+        # spanning two architecture families is not a configuration these
+        # collectives support.
+        if not _has_backend(backend):
+            raise BackendSupportedError(
+                f"Unknown backend {backend!r} for "
+                f"{create_allreduce_fusion_workspace.__name__}; expected one of "
+                f"{sorted(_BACKEND_CHECKS)} or 'auto'"
+            )
+        capability = _device_capability()
+        if not _is_backend_supported(backend, capability):
+            raise BackendSupportedError(
+                f"Backend {backend!r} does not support compute capability "
+                f"{capability}"
+            )
+
     if gpus_per_node is None:
         gpus_per_node = min(torch.cuda.device_count(), world_size)
     # Determine the actual backend to use
     if backend == "auto":
-        # Find suitable backends (any compute capability check needs to be checked at kernel runtime, since there are no tensor available at this point)
+        capability = _device_capability()
+        # Find suitable backends (any problem size check still belongs to kernel
+        # runtime, since there is no tensor available at this point)
         suitable_backends = []
         if _trtllm_workspace_check(
             backend=backend,
@@ -465,16 +592,22 @@ def create_allreduce_fusion_workspace(
             max_token_num=max_token_num,
             hidden_dim=hidden_dim,
             dtype=dtype,
-        ):
+        ) and _is_backend_supported("trtllm", capability):
             suitable_backends.append("trtllm")
+        # Voted on by every rank even when this rank's architecture already
+        # rules MNNVL out: the vote is a collective, so no rank may skip it.
         local_mnnvl_supported = is_multicast_supported(torch.cuda.current_device())
-        if all_ranks_support_mnnvl(
+        mnnvl_available = all_ranks_support_mnnvl(
             local_mnnvl_supported, world_size, comm_backend, group
-        ):
+        )
+        if mnnvl_available and _is_backend_supported("mnnvl", capability):
             suitable_backends.append("mnnvl")
 
         if not suitable_backends:
-            raise ValueError("No suitable backend found. ")
+            raise ValueError(
+                f"No suitable backend found for compute capability {capability}. "
+                f"Supported backends: {sorted(_BACKEND_CHECKS)}"
+            )
 
         # Apply heuristic to select best backend
         selected = _workspace_creation_heuristic(
@@ -537,6 +670,18 @@ def create_allreduce_fusion_workspace(
         )
     else:
         raise RuntimeError(f"Unknown backend: {actual_backend}")
+
+
+# Support-check queries, in the shape flashinfer.utils.backend_requirement adds
+# to every API it decorates. That decorator is not applicable here: it reads the
+# compute capability from a tensor argument, and workspace creation runs before
+# any tensor exists, so it would filter every backend out as unknown-capability.
+create_allreduce_fusion_workspace.is_backend_supported = _is_backend_supported
+create_allreduce_fusion_workspace.is_compute_capability_supported = (
+    _is_compute_capability_supported
+)
+create_allreduce_fusion_workspace.has_backend = _has_backend
+create_allreduce_fusion_workspace.has_backend_choices = _has_backend_choices
 
 
 # ============================================================================
@@ -1230,3 +1375,14 @@ def allreduce_fusion(
             "MNNVLAllReduceFusionWorkspace, or "
             "MNNVLCuteDSLAllReduceFusionWorkspace"
         )
+
+
+# allreduce_fusion takes no backend argument -- the workspace carries the
+# decision -- so it has no backend choices to answer for, the same position
+# flashinfer.utils.backend_requirement takes for an API with an empty backend
+# map. The architecture question stays answerable, and is the union over the
+# implementations this family can dispatch to.
+allreduce_fusion.is_backend_supported = _allreduce_fusion_is_backend_supported
+allreduce_fusion.is_compute_capability_supported = _is_compute_capability_supported
+allreduce_fusion.has_backend = _has_backend
+allreduce_fusion.has_backend_choices = _has_no_backend_choices
