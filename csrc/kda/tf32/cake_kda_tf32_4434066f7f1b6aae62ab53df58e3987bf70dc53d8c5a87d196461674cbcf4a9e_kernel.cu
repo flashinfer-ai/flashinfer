@@ -112,21 +112,21 @@ __device__ __forceinline__ uint32_t mbarrier_try_wait_cluster(int mbar_addr, int
     return token;
 }
 
-// Match CUTLASS ClusterBarrier::wait: a large suspendTimeHint lets the hardware
-// take the blocking phase-check slowpath instead of spinning on TRYWAIT misses.
+// CTA-local pipelines have short, resident producer/consumer edges. Omitting
+// suspendTimeHint keeps misses on the lightweight TRYWAIT retry path; the loop
+// remains blocking until acquire succeeds.
 __device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
-    uint32_t ticks = 0x989680;
     asm volatile(
         "{\n\t"
         ".reg .pred P1;\n\t"
         "LAB_WAIT:\n\t"
         "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-        " P1, [%0], %1, %2;\n\t"
+        " P1, [%0], %1;\n\t"
         "@P1 bra.uni DONE;\n\t"
         "bra.uni LAB_WAIT;\n\t"
         "DONE:\n\t"
         "}\n"
-        :: "r"(mbar_addr), "r"(phase), "r"(ticks) : "memory");
+        :: "r"(mbar_addr), "r"(phase) : "memory");
 }
 
 // Exact source ports may request the PTX suspendTimeHint operand explicitly.
