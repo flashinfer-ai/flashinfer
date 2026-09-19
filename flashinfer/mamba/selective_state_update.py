@@ -30,6 +30,30 @@ from ..jit.mamba import (
 from ..utils import get_compute_capability, register_custom_op, register_fake_op
 
 
+def _musa_stream_is_capturing() -> bool:
+    """Query capture state without touching device tensors.
+
+    The MUSA graph path must never call ``.item()``, ``.cpu()`` or
+    ``tolist()`` on query metadata. Those operations synchronize the stream
+    and are rejected while CUDA-graph-compatible capture is active.
+    """
+    musa = getattr(torch, "musa", None)
+    if musa is None:
+        get_device_module = getattr(torch, "get_device_module", None)
+        if get_device_module is not None:
+            try:
+                musa = get_device_module()
+            except Exception:
+                musa = None
+    query = getattr(musa, "is_current_stream_capturing", None)
+    if query is None:
+        return False
+    try:
+        return bool(query())
+    except Exception:
+        return False
+
+
 @functools.cache
 def _get_module(
     state_dtype: torch.dtype,
@@ -306,11 +330,13 @@ def selective_state_update(
     # silently ignore a different pair (which would turn a malformed offset
     # into an out-of-bounds reference fallback).  Multi-token varlen metadata
     # is handled by the varlen provider below.
+    capturing = _musa_stream_is_capturing()
     if (
         cu_seqlens is not None
         and x.dim() == 3
         and x.shape[0] == 1
         and cu_seqlens.numel() == 2
+        and not capturing
         and [int(v) for v in cu_seqlens.detach().cpu().tolist()] != [0, 1]
     ):
         raise ValueError(
@@ -404,8 +430,13 @@ def selective_state_update(
                 or (
                     x.shape[0] == 1
                     and cu_seqlens.numel() == 2
-                    and int(cu_seqlens[0].item()) == 0
-                    and int(cu_seqlens[1].item()) == 1
+                    and (
+                        capturing
+                        or (
+                            int(cu_seqlens[0].item()) == 0
+                            and int(cu_seqlens[1].item()) == 1
+                        )
+                    )
                 )
             )
             and state.dtype in (torch.float16, torch.bfloat16, torch.float32)
