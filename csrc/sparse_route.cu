@@ -51,7 +51,6 @@ void expand_block_route(TensorView block_indices, TensorView query_positions,
   TVM_FFI_ICHECK_EQ(output_width, block_topk * compress_ratio + compress_ratio - 1)
       << "route width must be block_topk * compress_ratio + compress_ratio - 1, got "
       << output_width;
-  TVM_FFI_ICHECK_EQ(query_positions.dtype(), block_indices.dtype());
   TVM_FFI_ICHECK_EQ(sequence_lengths.dtype(), block_indices.dtype());
   TVM_FFI_ICHECK_EQ(token_to_req.dtype(), block_indices.dtype());
   TVM_FFI_ICHECK_EQ(out.dtype(), block_indices.dtype());
@@ -59,21 +58,23 @@ void expand_block_route(TensorView block_indices, TensorView query_positions,
   ffi::CUDADeviceGuard device_guard(out.device().device_id);
   const cudaStream_t stream = get_stream(out.device());
   DISPATCH_DLPACK_IDTYPE_TO_CTYPE(block_indices.dtype(), c_idtype, [&] {
-    cudaError_t status = ExpandBlockRoute<c_idtype>(
-        static_cast<const c_idtype*>(block_indices.data_ptr()),
-        static_cast<const c_idtype*>(query_positions.data_ptr()),
-        static_cast<const c_idtype*>(sequence_lengths.data_ptr()),
-        static_cast<const c_idtype*>(token_to_req.data_ptr()),
-        static_cast<c_idtype*>(out.data_ptr()), static_cast<uint32_t>(block_indices.stride(0)),
-        static_cast<uint32_t>(block_indices.stride(1)), static_cast<uint32_t>(out.stride(0)),
-        static_cast<uint32_t>(out.stride(1)), static_cast<uint32_t>(rows),
-        static_cast<uint32_t>(sequence_lengths.size(0)), static_cast<uint32_t>(block_topk),
-        static_cast<uint32_t>(compress_ratio), static_cast<uint32_t>(output_width), stream);
-    TVM_FFI_ICHECK(status != cudaErrorInvalidValue)
-        << "unsupported compress_ratio " << compress_ratio << "; expected a power of two <= 32";
-    TVM_FFI_ICHECK(status == cudaSuccess)
-        << "ExpandBlockRoute failed: " << cudaGetErrorString(status);
-    return true;
+    return DISPATCH_DLPACK_IDTYPE_TO_CTYPE(query_positions.dtype(), c_postype, [&] {
+      cudaError_t status = ExpandBlockRoute<c_idtype, c_postype>(
+          static_cast<const c_idtype*>(block_indices.data_ptr()),
+          static_cast<const c_postype*>(query_positions.data_ptr()),
+          static_cast<const c_idtype*>(sequence_lengths.data_ptr()),
+          static_cast<const c_idtype*>(token_to_req.data_ptr()),
+          static_cast<c_idtype*>(out.data_ptr()), static_cast<uint32_t>(block_indices.stride(0)),
+          static_cast<uint32_t>(block_indices.stride(1)), static_cast<uint32_t>(out.stride(0)),
+          static_cast<uint32_t>(out.stride(1)), static_cast<uint32_t>(rows),
+          static_cast<uint32_t>(sequence_lengths.size(0)), static_cast<uint32_t>(block_topk),
+          static_cast<uint32_t>(compress_ratio), static_cast<uint32_t>(output_width), stream);
+      TVM_FFI_ICHECK(status != cudaErrorInvalidValue)
+          << "unsupported compress_ratio " << compress_ratio << "; expected a power of two <= 32";
+      TVM_FFI_ICHECK(status == cudaSuccess)
+          << "ExpandBlockRoute failed: " << cudaGetErrorString(status);
+      return true;
+    });
   });
 }
 
@@ -139,7 +140,6 @@ void qsa_route_from_blocks(TensorView block_indices, TensorView query_positions,
   TVM_FFI_ICHECK_EQ(out_logical.dtype(), block_indices.dtype());
   TVM_FFI_ICHECK_EQ(out_route.dtype(), block_indices.dtype());
   TVM_FFI_ICHECK_EQ(block_table.dtype(), block_indices.dtype());
-  TVM_FFI_ICHECK_EQ(query_positions.dtype(), block_indices.dtype());
   TVM_FFI_ICHECK_EQ(sequence_lengths.dtype(), block_indices.dtype());
   TVM_FFI_ICHECK_EQ(token_to_req.dtype(), block_indices.dtype());
   // A row indexes both by the same request, so a shorter table would be read
@@ -150,26 +150,29 @@ void qsa_route_from_blocks(TensorView block_indices, TensorView query_positions,
   ffi::CUDADeviceGuard device_guard(out_route.device().device_id);
   const cudaStream_t stream = get_stream(out_route.device());
   DISPATCH_DLPACK_IDTYPE_TO_CTYPE(block_indices.dtype(), c_idtype, [&] {
-    cudaError_t status = QSARouteFromBlocks<c_idtype>(
-        static_cast<const c_idtype*>(block_indices.data_ptr()),
-        static_cast<const c_idtype*>(query_positions.data_ptr()),
-        static_cast<const c_idtype*>(sequence_lengths.data_ptr()),
-        static_cast<const c_idtype*>(token_to_req.data_ptr()),
-        static_cast<const c_idtype*>(block_table.data_ptr()),
-        static_cast<c_idtype*>(out_logical.data_ptr()),
-        static_cast<c_idtype*>(out_route.data_ptr()), static_cast<uint8_t*>(out_mask.data_ptr()),
-        static_cast<uint32_t>(block_indices.stride(0)),
-        static_cast<uint32_t>(block_indices.stride(1)),
-        static_cast<uint32_t>(out_logical.stride(0)), static_cast<uint32_t>(block_table.stride(0)),
-        static_cast<uint32_t>(rows), static_cast<uint32_t>(sequence_lengths.size(0)),
-        static_cast<uint32_t>(block_topk), static_cast<uint32_t>(block_table.size(1)),
-        static_cast<uint32_t>(page_size), static_cast<uint32_t>(num_slots),
-        static_cast<uint32_t>(mask_bytes), static_cast<uint32_t>(compress_ratio), stream);
-    TVM_FFI_ICHECK(status != cudaErrorInvalidValue)
-        << "unsupported compress_ratio " << compress_ratio << "; expected a power of two <= 32";
-    TVM_FFI_ICHECK(status == cudaSuccess)
-        << "QSARouteFromBlocks failed: " << cudaGetErrorString(status);
-    return true;
+    return DISPATCH_DLPACK_IDTYPE_TO_CTYPE(query_positions.dtype(), c_postype, [&] {
+      cudaError_t status = QSARouteFromBlocks<c_idtype, c_postype>(
+          static_cast<const c_idtype*>(block_indices.data_ptr()),
+          static_cast<const c_postype*>(query_positions.data_ptr()),
+          static_cast<const c_idtype*>(sequence_lengths.data_ptr()),
+          static_cast<const c_idtype*>(token_to_req.data_ptr()),
+          static_cast<const c_idtype*>(block_table.data_ptr()),
+          static_cast<c_idtype*>(out_logical.data_ptr()),
+          static_cast<c_idtype*>(out_route.data_ptr()), static_cast<uint8_t*>(out_mask.data_ptr()),
+          static_cast<uint32_t>(block_indices.stride(0)),
+          static_cast<uint32_t>(block_indices.stride(1)),
+          static_cast<uint32_t>(out_logical.stride(0)),
+          static_cast<uint32_t>(block_table.stride(0)), static_cast<uint32_t>(rows),
+          static_cast<uint32_t>(sequence_lengths.size(0)), static_cast<uint32_t>(block_topk),
+          static_cast<uint32_t>(block_table.size(1)), static_cast<uint32_t>(page_size),
+          static_cast<uint32_t>(num_slots), static_cast<uint32_t>(mask_bytes),
+          static_cast<uint32_t>(compress_ratio), stream);
+      TVM_FFI_ICHECK(status != cudaErrorInvalidValue)
+          << "unsupported compress_ratio " << compress_ratio << "; expected a power of two <= 32";
+      TVM_FFI_ICHECK(status == cudaSuccess)
+          << "QSARouteFromBlocks failed: " << cudaGetErrorString(status);
+      return true;
+    });
   });
 }
 

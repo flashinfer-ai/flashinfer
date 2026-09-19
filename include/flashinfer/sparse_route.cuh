@@ -102,10 +102,10 @@ inline cudaError_t choose_wide(uint32_t wide_blocks, bool* wide) {
  * \tparam IdType index type of both the selection and the route
  */
 template <uint32_t COMPRESS_RATIO, bool CONTIGUOUS_COLUMNS, uint32_t TILE, uint32_t THREADS,
-          typename IdType>
+          typename IdType, typename PosType>
 __global__ void __launch_bounds__(THREADS)
     ExpandBlockRouteKernel(const IdType* __restrict__ block_indices,
-                           const IdType* __restrict__ query_positions,
+                           const PosType* __restrict__ query_positions,
                            const IdType* __restrict__ sequence_lengths,
                            const IdType* __restrict__ token_to_req, IdType* __restrict__ out,
                            uint32_t stride_blocks_row, uint32_t stride_blocks_col,
@@ -131,8 +131,13 @@ __global__ void __launch_bounds__(THREADS)
     // in for the bound. The position and the length have nothing above them at
     // all.
     constexpr IdType kInt32Max = static_cast<IdType>(2147483647);
-    const IdType position_raw = query_positions[row];
-    const int32_t query_position = (position_raw >= IdType(0) && position_raw <= kInt32Max)
+    // Positions carry their own type: a position is bounded by the context
+    // length, not by what indexes the cache, and a caller that builds them
+    // beside a slot mapping keeps them in int64. Narrowed here, and anything
+    // that does not fit is not a position.
+    constexpr PosType kPosInt32Max = static_cast<PosType>(2147483647);
+    const PosType position_raw = query_positions[row];
+    const int32_t query_position = (position_raw >= PosType(0) && position_raw <= kPosInt32Max)
                                        ? static_cast<int32_t>(position_raw)
                                        : -1;
     const IdType request_raw = token_to_req[row];
@@ -230,9 +235,9 @@ __global__ void __launch_bounds__(THREADS)
  * \tparam MASK_BYTES_PER_ROW ceil(output_width / 8), the stride of one mask row
  */
 template <uint32_t COMPRESS_RATIO, bool CONTIGUOUS_COLUMNS, uint32_t TILE, uint32_t THREADS,
-          typename IdType>
+          typename IdType, typename PosType>
 __global__ void __launch_bounds__(THREADS) QSARouteFromBlocksKernel(
-    const IdType* __restrict__ block_indices, const IdType* __restrict__ query_positions,
+    const IdType* __restrict__ block_indices, const PosType* __restrict__ query_positions,
     const IdType* __restrict__ sequence_lengths, const IdType* __restrict__ token_to_req,
     const IdType* __restrict__ block_table, IdType* __restrict__ out_logical,
     IdType* __restrict__ out_route, uint8_t* __restrict__ out_mask, uint32_t stride_blocks_row,
@@ -254,8 +259,13 @@ __global__ void __launch_bounds__(THREADS) QSARouteFromBlocksKernel(
     // in for the bound. The position and the length have nothing above them at
     // all.
     constexpr IdType kInt32Max = static_cast<IdType>(2147483647);
-    const IdType position_raw = query_positions[row];
-    const int32_t query_position = (position_raw >= IdType(0) && position_raw <= kInt32Max)
+    // Positions carry their own type: a position is bounded by the context
+    // length, not by what indexes the cache, and a caller that builds them
+    // beside a slot mapping keeps them in int64. Narrowed here, and anything
+    // that does not fit is not a position.
+    constexpr PosType kPosInt32Max = static_cast<PosType>(2147483647);
+    const PosType position_raw = query_positions[row];
+    const int32_t query_position = (position_raw >= PosType(0) && position_raw <= kPosInt32Max)
                                        ? static_cast<int32_t>(position_raw)
                                        : -1;
     const IdType request_raw = token_to_req[row];
@@ -518,8 +528,8 @@ cudaError_t QSARouteFromLogical(const IdType* logical, const IdType* token_to_re
   return cudaGetLastError();
 }
 
-template <typename IdType>
-cudaError_t ExpandBlockRoute(const IdType* block_indices, const IdType* query_positions,
+template <typename IdType, typename PosType>
+cudaError_t ExpandBlockRoute(const IdType* block_indices, const PosType* query_positions,
                              const IdType* sequence_lengths, const IdType* token_to_req,
                              IdType* out, uint32_t stride_blocks_row, uint32_t stride_blocks_col,
                              uint32_t stride_out_row, uint32_t stride_out_col, uint32_t rows,
@@ -528,8 +538,8 @@ cudaError_t ExpandBlockRoute(const IdType* block_indices, const IdType* query_po
   if (rows == 0 || output_width == 0) return cudaSuccess;
   const uint32_t wide_blocks = rows * ceil_div(output_width, sparse_route::kWideTile);
   bool wide = true;
-  constexpr auto kWideKernel =
-      ExpandBlockRouteKernel<1, true, sparse_route::kWideTile, sparse_route::kWideThreads, IdType>;
+  constexpr auto kWideKernel = ExpandBlockRouteKernel<1, true, sparse_route::kWideTile,
+                                                      sparse_route::kWideThreads, IdType, PosType>;
   const cudaError_t shape_status =
       sparse_route::choose_wide<kWideKernel, sparse_route::kWideThreads>(wide_blocks, &wide);
   FLASHINFER_CUDA_CALL(shape_status);
@@ -540,9 +550,10 @@ cudaError_t ExpandBlockRoute(const IdType* block_indices, const IdType* query_po
   const bool contiguous = stride_blocks_col == 1 && stride_out_col == 1;
 
 #define _FI_LAUNCH_CFG(RATIO, CONTIGUOUS, TILE, THREADS)                                          \
-  ExpandBlockRouteKernel<RATIO, CONTIGUOUS, TILE, THREADS, IdType><<<grid, THREADS, 0, stream>>>( \
-      block_indices, query_positions, sequence_lengths, token_to_req, out, stride_blocks_row,     \
-      stride_blocks_col, stride_out_row, stride_out_col, rows, num_requests, block_topk)
+  ExpandBlockRouteKernel<RATIO, CONTIGUOUS, TILE, THREADS, IdType, PosType>                       \
+      <<<grid, THREADS, 0, stream>>>(                                                             \
+          block_indices, query_positions, sequence_lengths, token_to_req, out, stride_blocks_row, \
+          stride_blocks_col, stride_out_row, stride_out_col, rows, num_requests, block_topk)
 
 #define _FI_LAUNCH(RATIO, CONTIGUOUS)                                                             \
   do {                                                                                            \
@@ -580,8 +591,8 @@ cudaError_t ExpandBlockRoute(const IdType* block_indices, const IdType* query_po
   return cudaGetLastError();
 }
 
-template <typename IdType>
-cudaError_t QSARouteFromBlocks(const IdType* block_indices, const IdType* query_positions,
+template <typename IdType, typename PosType>
+cudaError_t QSARouteFromBlocks(const IdType* block_indices, const PosType* query_positions,
                                const IdType* sequence_lengths, const IdType* token_to_req,
                                const IdType* block_table, IdType* out_logical, IdType* out_route,
                                uint8_t* out_mask, uint32_t stride_blocks_row,
@@ -594,8 +605,9 @@ cudaError_t QSARouteFromBlocks(const IdType* block_indices, const IdType* query_
   if (rows == 0 || output_width == 0) return cudaSuccess;
   const uint32_t wide_blocks = rows * ceil_div(output_width, sparse_route::kWideTile);
   bool wide = true;
-  constexpr auto kWideKernel = QSARouteFromBlocksKernel<1, true, sparse_route::kWideTile,
-                                                        sparse_route::kWideThreads, IdType>;
+  constexpr auto kWideKernel =
+      QSARouteFromBlocksKernel<1, true, sparse_route::kWideTile, sparse_route::kWideThreads, IdType,
+                               PosType>;
   const cudaError_t shape_status =
       sparse_route::choose_wide<kWideKernel, sparse_route::kWideThreads>(wide_blocks, &wide);
   FLASHINFER_CUDA_CALL(shape_status);
@@ -604,7 +616,7 @@ cudaError_t QSARouteFromBlocks(const IdType* block_indices, const IdType* query_
   const bool contiguous = stride_blocks_col == 1;
 
 #define _FI_ROUTE_CFG(RATIO, CONTIGUOUS, TILE, THREADS)                                           \
-  QSARouteFromBlocksKernel<RATIO, CONTIGUOUS, TILE, THREADS, IdType>                              \
+  QSARouteFromBlocksKernel<RATIO, CONTIGUOUS, TILE, THREADS, IdType, PosType>                     \
       <<<grid, THREADS, 0, stream>>>(block_indices, query_positions, sequence_lengths,            \
                                      token_to_req, block_table, out_logical, out_route, out_mask, \
                                      stride_blocks_row, stride_blocks_col, stride_logical_row,    \
