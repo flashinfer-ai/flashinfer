@@ -512,6 +512,10 @@ class BlockSparseAttnForwardSageSm120Blk64(BatchedStaticSchedulerMixin):
                 n_tile_idx,
             )
 
+            # Order generic-proxy LDSM reads before the next TMA (async-proxy)
+            # overwrite of this stage. The empty mbarrier alone is not a
+            # cross-proxy fence; concurrent memory traffic exposes this WAR race.
+            cute.arch.fence_view_async_shared()
             K_pipeline.consumer_release(K_consumer_state)
             K_consumer_state.advance()
 
@@ -564,6 +568,8 @@ class BlockSparseAttnForwardSageSm120Blk64(BatchedStaticSchedulerMixin):
                 smem_tiled_copy_V,
             )
             _accumulate_o_block_fp8(tOrO, tOrO_block)
+            # As for K, finish generic-proxy reads before releasing V to TMA.
+            cute.arch.fence_view_async_shared()
             V_pipeline.consumer_release(V_consumer_state)
             V_consumer_state.advance()
 
