@@ -402,6 +402,31 @@ jobs:
           else
             echo "::warning::sccache stats were not produced"
           fi
+          # Advanced stats are a superset; fall back to the basic dump.
+          for JSON_STATS_FILE in \
+              "${GITHUB_WORKSPACE}/sccache-stats/sccache-advanced-stats.json" \
+              "${GITHUB_WORKSPACE}/sccache-stats/sccache-stats.json"; do
+            if [ -s "${JSON_STATS_FILE}" ]; then
+              echo "== $(basename "${JSON_STATS_FILE}")"
+              python3 scripts/summarize_sccache_stats.py "${JSON_STATS_FILE}"
+              break
+            fi
+          done
+
+      # Diagnostic scaffolding for the slow-AOT-build investigation; remove once
+      # the cause of the non-cacheable CUDA compiles is settled.
+      - name: Summarize sccache nvcc decomposition
+        if: always() && matrix.kind == 'aot'
+        run: |
+          SERVER_LOG="${GITHUB_WORKSPACE}/sccache-stats/sccache-server.log"
+          if [ ! -s "${SERVER_LOG}" ]; then
+            echo "::warning::sccache server log was not produced"
+            exit 0
+          fi
+          ls -lh "${SERVER_LOG}"
+          python3 scripts/summarize_sccache_nvcc_log.py "${SERVER_LOG}"
+          # The trace-level log is large; keep the artifact small enough to upload.
+          gzip -9 "${SERVER_LOG}"
 
       - name: Record sccache job metadata
         if: always() && matrix.kind == 'aot'
