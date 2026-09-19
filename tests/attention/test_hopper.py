@@ -542,6 +542,143 @@ def test_batch_prefill_with_paged_kv_cache_multi_item_scoring_fa3_bsz2(
     torch.testing.assert_close(o_fa2, o_fa3, rtol=1e-3, atol=1e-3)
 
 
+def _paged_attention_reference(
+    q,
+    k_pool,
+    v_pool,
+    qo_indptr,
+    kv_indptr,
+    kv_indices,
+    kv_lens,
+    page_size,
+    kv_layout,
+    causal,
+    window_left,
+):
+    """fp32 attention over the tokens a paged KV cache actually holds."""
+    num_qo_heads, head_dim = q.shape[1], q.shape[2]
+    num_kv_heads = k_pool.shape[2] if kv_layout == "NHD" else k_pool.shape[1]
+    group_size = num_qo_heads // num_kv_heads
+    out = torch.empty(q.shape, dtype=torch.float32, device=q.device)
+    for b in range(qo_indptr.numel() - 1):
+        qs, qe = qo_indptr[b].item(), qo_indptr[b + 1].item()
+        pages = kv_indices[kv_indptr[b].item() : kv_indptr[b + 1].item()].long()
+        k = k_pool[pages]
+        v = v_pool[pages]
+        if kv_layout == "HND":
+            k, v = k.transpose(1, 2), v.transpose(1, 2)
+        kv_len = kv_lens[b]
+        k = k.reshape(-1, num_kv_heads, head_dim)[:kv_len].float()
+        v = v.reshape(-1, num_kv_heads, head_dim)[:kv_len].float()
+        k = k.repeat_interleave(group_size, dim=1)
+        v = v.repeat_interleave(group_size, dim=1)
+        qo_len = qe - qs
+        s = torch.einsum("qhd,khd->hqk", q[qs:qe].float(), k) * head_dim**-0.5
+        q_pos = torch.arange(qo_len, device=q.device)[:, None] + kv_len - qo_len
+        k_pos = torch.arange(kv_len, device=q.device)[None, :]
+        mask = torch.ones(qo_len, kv_len, dtype=torch.bool, device=q.device)
+        if causal:
+            mask &= k_pos <= q_pos
+        if window_left >= 0:
+            mask &= k_pos >= q_pos - window_left
+        p = torch.softmax(s.masked_fill(~mask[None], float("-inf")), dim=-1)
+        out[qs:qe] = torch.einsum("hqk,khd->qhd", p, v)
+    return out
+
+
+@pytest.mark.parametrize("page_size", [8, 16, 32, 48, 64, 128, 256])
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
+@pytest.mark.parametrize("window_left", [-1, 333])
+def test_batch_paged_prefill_page_table(
+    page_size, head_dim, causal, kv_layout, window_left
+):
+    """Scattered page tables with NaN in every unused KV slot, across page sizes.
+
+    page_size >= 16 exercises the TMA gather in the SM90 paged mainloop; 8 keeps the cp.async
+    path covered. The NaN poison verifies rows past kv_len never reach P*V.
+    """
+    if not is_sm90a_supported(torch.device("cuda")):
+        pytest.skip("SM90A is not supported")
+    torch.manual_seed(42)
+    num_qo_heads, num_kv_heads = 8, 2
+    lens = [(11, 11), (12, 99), (300, 4096), (5, 517), (129, 129), (2, 4099)]
+    qo_lens = [l[0] for l in lens]
+    kv_lens = [l[1] for l in lens]
+    pages_per_request = [(kv_len + page_size - 1) // page_size for kv_len in kv_lens]
+    total_pages = sum(pages_per_request) + 3
+    pool_shape = (
+        (total_pages, page_size, num_kv_heads, head_dim)
+        if kv_layout == "NHD"
+        else (total_pages, num_kv_heads, page_size, head_dim)
+    )
+    k_pool = torch.randn(pool_shape, dtype=torch.half, device="cuda")
+    v_pool = torch.randn(pool_shape, dtype=torch.half, device="cuda")
+    kv_indices = torch.randperm(total_pages)[: sum(pages_per_request)].int()
+    kv_indptr = torch.tensor([0] + pages_per_request).cumsum(0).int()
+    qo_indptr = torch.tensor([0] + qo_lens).cumsum(0).int()
+    last_page_len = torch.tensor(
+        [
+            kv_len - (n - 1) * page_size
+            for kv_len, n in zip(kv_lens, pages_per_request, strict=True)
+        ]
+    ).int()
+
+    used = torch.zeros(total_pages, page_size, dtype=torch.bool)
+    for b in range(len(lens)):
+        pages = kv_indices[kv_indptr[b] : kv_indptr[b + 1]].tolist()
+        used[pages[:-1]] = True
+        used[pages[-1], : last_page_len[b]] = True
+    unused = ~used.cuda()
+    if kv_layout == "HND":
+        unused = unused[:, None, :].expand(-1, num_kv_heads, -1)
+    k_pool[unused] = float("nan")
+    v_pool[unused] = float("nan")
+
+    q = torch.randn(
+        sum(qo_lens), num_qo_heads, head_dim, dtype=torch.half, device="cuda"
+    )
+    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+    outputs = {}
+    for backend in ["fa2", "fa3"]:
+        wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+            workspace_buffer, kv_layout, backend=backend
+        )
+        wrapper.plan(
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            last_page_len,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            causal=causal,
+            window_left=window_left,
+            q_data_type=torch.half,
+        )
+        outputs[backend] = wrapper.run(q, (k_pool, v_pool))
+
+    o_ref = _paged_attention_reference(
+        q,
+        k_pool,
+        v_pool,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        kv_lens,
+        page_size,
+        kv_layout,
+        causal,
+        window_left,
+    )
+    torch.testing.assert_close(outputs["fa3"].float(), o_ref, rtol=2e-2, atol=2e-2)
+    if causal or window_left < 0:
+        # fa2 mishandles the first query tile of non-causal sliding-window requests (#4972).
+        torch.testing.assert_close(outputs["fa3"], outputs["fa2"], rtol=1e-3, atol=1e-3)
+
+
 if __name__ == "__main__":
     # test_batch_prefill(14, 64, 32, 32, False, 128)
     # test_batch_prefill(1, 32767, 8, 8, True, 128)
