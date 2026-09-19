@@ -363,6 +363,47 @@ def selective_state_update(
             "async_horizontal",
         ):
             raise ValueError(f"unknown MUSA SSU algorithm={algorithm!r}")
+
+        # vLLM Mamba2 speculative decode uses packed varlen tensors: the
+        # token axis is flattened and the sequence boundaries/accepted-token
+        # metadata stay on device.  The old MUSA provider sent this shape to
+        # the Python recurrence, which performs host reads and cannot be
+        # captured.  Keep this provider boundary in FlashInfer and dispatch a
+        # capture-safe Triton recurrence before the one-token fast path.
+        if (
+            is_varlen
+            and state_batch_indices is not None
+            and state_batch_indices.dim() == 2
+            and intermediate_states_buffer is None
+            and intermediate_state_scales is None
+            and state_scale is None
+            and not disable_state_update
+            and state.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        ):
+            from .musa_ssu_varlen import ssu_varlen_musa_triton
+
+            return ssu_varlen_musa_triton(
+                state,
+                x,
+                dt,
+                A,
+                B,
+                C,
+                D,
+                dt_bias=dt_bias,
+                z=z,
+                dt_softplus=dt_softplus,
+                state_batch_indices=state_batch_indices,
+                dst_state_batch_indices=dst_state_batch_indices,
+                null_block_id=-1 if pad_slot_id is None else int(pad_slot_id),
+                out=out,
+                num_accepted_tokens=num_accepted_tokens,
+                cu_seqlens=cu_seqlens,
+                enable_stochastic_rounding=rand_seed is not None,
+                cache_philox_rounds=philox_rounds,
+                rand_seed=rand_seed,
+            )
+
         fused_state_batch_indices = state_batch_indices
         fused_dst_state_batch_indices = dst_state_batch_indices
         fused_pad_slot_id = -1 if pad_slot_id is None else int(pad_slot_id)
