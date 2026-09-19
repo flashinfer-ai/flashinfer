@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import functools
+import os
 from typing import Optional
 
 import torch
@@ -27,6 +28,30 @@ from ..jit.mamba import (
     gen_selective_state_update_sm90_module,
 )
 from ..utils import get_compute_capability, register_custom_op, register_fake_op
+
+
+def _musa_stream_is_capturing() -> bool:
+    """Query capture state without touching device tensors.
+
+    The MUSA graph path must never call ``.item()``, ``.cpu()`` or
+    ``tolist()`` on query metadata. Those operations synchronize the stream
+    and are rejected while CUDA-graph-compatible capture is active.
+    """
+    musa = getattr(torch, "musa", None)
+    if musa is None:
+        get_device_module = getattr(torch, "get_device_module", None)
+        if get_device_module is not None:
+            try:
+                musa = get_device_module()
+            except Exception:
+                musa = None
+    query = getattr(musa, "is_current_stream_capturing", None)
+    if query is None:
+        return False
+    try:
+        return bool(query())
+    except Exception:
+        return False
 
 
 @functools.cache
@@ -275,7 +300,7 @@ def selective_state_update(
     if rand_seed is not None:
         if not isinstance(rand_seed, torch.Tensor):
             raise TypeError(
-                f"rand_seed must be a CUDA int64 tensor, got {type(rand_seed).__name__}"
+                f"rand_seed must be a CUDA/MUSA int64 tensor, got {type(rand_seed).__name__}"
             )
         if rand_seed.numel() != 1:
             raise ValueError(
@@ -283,8 +308,8 @@ def selective_state_update(
             )
         if rand_seed.dtype != torch.int64:
             raise ValueError(f"rand_seed must have dtype int64, got {rand_seed.dtype}")
-        if not rand_seed.is_cuda:
-            raise ValueError("rand_seed must be a CUDA tensor")
+        if rand_seed.device.type not in ("cuda", "musa"):
+            raise ValueError("rand_seed must be a CUDA or MUSA tensor")
         if state_scale is not None:
             raise ValueError("rand_seed and state_scale cannot both be provided")
         if philox_rounds <= 0:
@@ -300,10 +325,325 @@ def selective_state_update(
             "intermediate_states_buffer and dst_state_batch_indices are mutually exclusive"
         )
 
+    # A one-token decode may carry the v1 query-start metadata [0, 1].  The
+    # native Simple STP kernel consumes already-flattened tensors and must not
+    # silently ignore a different pair (which would turn a malformed offset
+    # into an out-of-bounds reference fallback).  Multi-token varlen metadata
+    # is handled by the varlen provider below.
+    capturing = _musa_stream_is_capturing()
+    if (
+        cu_seqlens is not None
+        and x.dim() == 3
+        and x.shape[0] == 1
+        and cu_seqlens.numel() == 2
+        and not capturing
+        and [int(v) for v in cu_seqlens.detach().cpu().tolist()] != [0, 1]
+    ):
+        raise ValueError(
+            "single-token cu_seqlens must be the canonical [0, 1] pair; "
+            "use a valid multi-token varlen request for other offsets"
+        )
+
     if out is None:
         output = torch.empty_like(x)
     else:
         output = out
+
+    # MUSA has a separate provider boundary.  Do not send MUSA tensors through
+    # the CUDA JIT module: its launchers include CUDA runtime headers and its
+    # architecture dispatch is NVIDIA-SM specific.  The initial MUSA provider
+    # is deliberately a correctness scaffold; the native MUSA kernel will keep
+    # this exact call boundary when it lands.
+    if state.device.type == "musa":
+        if algorithm not in (
+            "auto",
+            "simple",
+            "vertical",
+            "horizontal",
+            "async_horizontal",
+        ):
+            raise ValueError(f"unknown MUSA SSU algorithm={algorithm!r}")
+
+        # vLLM Mamba2 speculative decode uses packed varlen tensors: the
+        # token axis is flattened and the sequence boundaries/accepted-token
+        # metadata stay on device.  The old MUSA provider sent this shape to
+        # the Python recurrence, which performs host reads and cannot be
+        # captured.  Keep this provider boundary in FlashInfer and dispatch a
+        # capture-safe Triton recurrence before the one-token fast path.
+        if (
+            is_varlen
+            and state_batch_indices is not None
+            and state_batch_indices.dim() in (1, 2)
+            and intermediate_states_buffer is None
+            and intermediate_state_scales is None
+            and state_scale is None
+            and not disable_state_update
+            and state.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        ):
+            from .musa_ssu_varlen import ssu_varlen_musa_triton
+
+            return ssu_varlen_musa_triton(
+                state,
+                x,
+                dt,
+                A,
+                B,
+                C,
+                D,
+                dt_bias=dt_bias,
+                z=z,
+                dt_softplus=dt_softplus,
+                state_batch_indices=state_batch_indices,
+                dst_state_batch_indices=dst_state_batch_indices,
+                null_block_id=-1 if pad_slot_id is None else int(pad_slot_id),
+                out=out,
+                num_accepted_tokens=num_accepted_tokens,
+                cu_seqlens=cu_seqlens,
+                enable_stochastic_rounding=rand_seed is not None,
+                cache_philox_rounds=philox_rounds,
+                rand_seed=rand_seed,
+            )
+
+        fused_state_batch_indices = state_batch_indices
+        fused_dst_state_batch_indices = dst_state_batch_indices
+        fused_pad_slot_id = -1 if pad_slot_id is None else int(pad_slot_id)
+        state_indices_are_one_token = state_batch_indices is not None and (
+            state_batch_indices.dim() == 1
+            or (state_batch_indices.dim() == 2 and state_batch_indices.shape[1] == 1)
+        )
+        dst_indices_are_one_token = (
+            dst_state_batch_indices is None
+            or dst_state_batch_indices.dim() == 1
+            or (
+                dst_state_batch_indices.dim() == 2
+                and dst_state_batch_indices.shape[1] == 1
+            )
+        )
+        if (
+            x.dim() == 3
+            and state_batch_indices is not None
+            and state_batch_indices.dim() == 2
+            and state_batch_indices.shape[1] == 1
+        ):
+            fused_state_batch_indices = state_batch_indices[:, -1].contiguous()
+        if (
+            x.dim() == 3
+            and dst_state_batch_indices is not None
+            and dst_state_batch_indices.dim() == 2
+            and dst_state_batch_indices.shape[1] == 1
+        ):
+            fused_dst_state_batch_indices = dst_state_batch_indices[:, -1].contiguous()
+        if (
+            (z is None or (z.dim() == 3 and z.shape == x.shape))
+            and (
+                dt_bias is None
+                or (dt_bias.dim() == 1 and dt_bias.shape[0] == x.shape[1])
+                or (dt_bias.dim() == 2 and dt_bias.shape == x.shape[1:3])
+            )
+            and (
+                fused_state_batch_indices is not None
+                and (
+                    fused_dst_state_batch_indices is None
+                    or fused_dst_state_batch_indices.shape
+                    == fused_state_batch_indices.shape
+                )
+            )
+            and intermediate_states_buffer is None
+            and (
+                rand_seed is None
+                or (
+                    state.dtype == torch.float16
+                    and state.shape[-1] in (64, 128, 256)
+                    and rand_seed.dtype == torch.int64
+                    and rand_seed.numel() == 1
+                    and rand_seed.device == state.device
+                    and philox_rounds in (5, 10)
+                    and algorithm in ("auto", "simple")
+                )
+            )
+            and num_accepted_tokens is None
+            and not disable_state_update
+            # vLLM's decode path supplies a two-entry query_start_loc even
+            # for one token. The Simple-STP kernel consumes the already
+            # flattened token tensors, so that metadata is safe to ignore.
+            and (
+                cu_seqlens is None
+                or (
+                    x.shape[0] == 1
+                    and cu_seqlens.numel() == 2
+                    and (
+                        capturing
+                        or (
+                            int(cu_seqlens[0].item()) == 0
+                            and int(cu_seqlens[1].item()) == 1
+                        )
+                    )
+                )
+            )
+            and state.dtype in (torch.float16, torch.bfloat16, torch.float32)
+            and state.dim() == 4
+            and x.dim() == 3
+            and state.shape[1:3] == x.shape[1:3]
+            and state_indices_are_one_token
+            and dst_indices_are_one_token
+            and state_batch_indices.numel() == x.shape[0]
+            and (
+                dst_state_batch_indices is None
+                or dst_state_batch_indices.numel() == x.shape[0]
+            )
+            and dt.dim() == 3
+            and A.dim() == 3
+            and B.dim() == 3
+            and C.dim() == 3
+            and dt.shape == x.shape
+            and A.shape[:2] == x.shape[1:3]
+            and B.shape == C.shape
+            and B.shape[0] == x.shape[0]
+            and B.shape[2] == A.shape[2]
+            and D is not None
+            and (
+                (D.dim() == 1 and D.shape[0] == x.shape[1])
+                or (D.dim() == 2 and D.shape == x.shape[1:3])
+            )
+            and fused_state_batch_indices is not None
+            and fused_state_batch_indices.dim() == 1
+            and x.shape[1] % B.shape[1] == 0
+        ):
+            # S5000's low-parallel Nemotron shape maps to the NVIDIA SM90
+            # Simple STP contract: four D rows per 128-thread CTA. Keep this
+            # shape-gated so every other MUSA shape retains the generic
+            # Triton provider.
+            native_stp_contract = (
+                x.shape[0] == 1
+                and x.shape[1:] == (64, 64)
+                and state.shape[-1] == 128
+                and B.shape[1] == 8
+                and state.dtype == torch.float16
+                and x.dtype == torch.bfloat16
+                and B.dtype == x.dtype
+                and C.dtype == x.dtype
+                and dt.dtype == torch.float32
+                and A.dtype == torch.float32
+                and D.dtype in (torch.float32, x.dtype)
+                and state.is_contiguous()
+                and all(t.device == state.device for t in (x, dt, A, B, C, D))
+                and fused_state_batch_indices.device == state.device
+                and (
+                    fused_dst_state_batch_indices is None
+                    or fused_dst_state_batch_indices.device == state.device
+                )
+                and (z is None or (z.dtype == x.dtype and z.device == state.device))
+                and (out is None or (out.dtype == x.dtype and out.device == state.device))
+                and (
+                    dt_bias is None
+                    or (dt_bias.dtype == torch.float32 and dt_bias.device == state.device)
+                )
+                and A.stride(1) == 0
+                and A.stride(2) == 0
+                and dt.stride(2) == 0
+                and (
+                    dt_bias is None
+                    or dt_bias.dim() == 1
+                    or dt_bias.stride(1) == 0
+                )
+            )
+            if native_stp_contract:
+                if os.environ.get("FLASHINFER_MUSA_SIMPLE_STP_NATIVE") == "1":
+                    from .musa_ssu_native import musa_ssu_one_token_native
+
+                    return musa_ssu_one_token_native(
+                        state,
+                        x,
+                        dt,
+                        A,
+                        B,
+                        C,
+                        D,
+                        fused_state_batch_indices,
+                        fused_dst_state_batch_indices
+                        if fused_dst_state_batch_indices is not None
+                        else fused_state_batch_indices,
+                        dt_bias,
+                        z,
+                        dt_softplus,
+                        fused_pad_slot_id,
+                        out,
+                        rand_seed,
+                        philox_rounds,
+                    )
+
+                from .musa_ssu_simple import ssu_one_token_musa_simple
+
+                return ssu_one_token_musa_simple(
+                    state,
+                    x,
+                    dt,
+                    A,
+                    B,
+                    C,
+                    D,
+                    fused_state_batch_indices,
+                    dt_bias=dt_bias,
+                    z=z,
+                    dt_softplus=dt_softplus,
+                    pad_slot_id=fused_pad_slot_id,
+                    dst_state_batch_indices=fused_dst_state_batch_indices,
+                    out=out,
+                    rand_seed=rand_seed,
+                    philox_rounds=philox_rounds,
+                )
+
+            from .musa_ssu_triton import ssu_one_token_musa_triton
+
+            return ssu_one_token_musa_triton(
+                state,
+                x,
+                dt,
+                A,
+                B,
+                C,
+                D,
+                fused_state_batch_indices,
+                dt_bias=dt_bias,
+                z=z,
+                dt_softplus=dt_softplus,
+                pad_slot_id=fused_pad_slot_id,
+                dst_state_batch_indices=fused_dst_state_batch_indices,
+                out=out,
+                rand_seed=rand_seed,
+                philox_rounds=philox_rounds,
+            )
+        # The correctness provider has one recurrence implementation.  The
+        # algorithm value remains accepted so callers can use the upstream
+        # API while native vertical/horizontal kernels are added.
+        from .musa_reference import selective_state_update_musa_reference
+
+        return selective_state_update_musa_reference(
+            state,
+            x,
+            dt,
+            A,
+            B,
+            C,
+            D,
+            z,
+            dt_bias,
+            dt_softplus,
+            state_batch_indices,
+            dst_state_batch_indices,
+            pad_slot_id,
+            output,
+            disable_state_update,
+            intermediate_states_buffer,
+            intermediate_state_indices,
+            state_scale,
+            intermediate_state_scales,
+            rand_seed,
+            philox_rounds,
+            cache_steps,
+            cu_seqlens,
+            num_accepted_tokens,
+        )
 
     # Determine stateIndex dtype from index tensors, default to int32
     stateIndex_dtype = torch.int32
@@ -537,3 +877,11 @@ def _selective_state_update_fake(
 ) -> None:
     """Fake implementation for torch.compile() meta tensor propagation."""
     pass
+
+
+# Build/import the opt-in native extension before vLLM starts graph capture.
+# Generic Triton/CUDA imports never execute this branch.
+if os.environ.get("FLASHINFER_MUSA_SIMPLE_STP_NATIVE") == "1":
+    from .musa_ssu_native import preload_musa_simple_stp
+
+    preload_musa_simple_stp()

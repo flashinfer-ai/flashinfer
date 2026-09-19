@@ -11,14 +11,14 @@ import torch
 
 import flashinfer
 from flashinfer.utils import is_cvt_rs_supported, is_sm100a_supported
+from .utils import TEST_DEVICE, create_test_inputs, clone_preserving_strides
 
 _requires_sm100 = pytest.mark.skipif(
-    not is_sm100a_supported(torch.device("cuda")),
+    TEST_DEVICE != "musa" and not is_sm100a_supported(torch.device(TEST_DEVICE)),
     reason="Vertical/horizontal MTP kernel requires SM100+ (Blackwell)",
 )
 
 from .triton_reference.selective_state_update import selective_state_update_triton
-from .utils import create_test_inputs, clone_preserving_strides
 
 
 # Base combination: batch=64, nheads=64, dim=64, dstate=128, cache_steps=4,
@@ -40,6 +40,16 @@ _BASE_PARAMS = (
     (  64,    64,     64,  128,    4,           torch.float16,      torch.float32,  True ),  # state_dtype=f16
     (  64,    64,     64,  128,    4,           torch.bfloat16,     torch.float32,  False),  # use_out_tensor=False
 )
+if TEST_DEVICE == "musa":
+    _BASE_PARAMS = (
+        (1, 64, 64, 128, 4, torch.bfloat16, torch.float32, True),
+        (2, 8, 8, 16, 3, torch.bfloat16, torch.float32, True),
+        (1, 8, 8, 16, 3, torch.bfloat16, torch.float32, True),
+        (2, 8, 8, 16, 1, torch.bfloat16, torch.float32, True),
+        (2, 8, 8, 16, 4, torch.float32, torch.float32, True),
+        (2, 8, 8, 16, 3, torch.float16, torch.float32, True),
+        (2, 8, 8, 16, 3, torch.bfloat16, torch.float32, False),
+    )
 # fmt: on
 
 
@@ -928,7 +938,7 @@ class TestSelectiveStateUpdateMTPInt16(TestSelectiveStateUpdateMTP):
         )
 
         # Vertical/horizontal don't support scaled (quantized) state
-        if self._algo in ("vertical", "horizontal"):
+        if TEST_DEVICE != "musa" and self._algo in ("vertical", "horizontal"):
             with pytest.raises(RuntimeError, match="does not support scaled"):
                 self.run_kernel(inputs)
             return
@@ -1067,7 +1077,7 @@ class TestSelectiveStateUpdateMTPInt16IntermediateStates(
         )
 
         # Vertical/horizontal don't support scaled (quantized) state
-        if self._algo in ("vertical", "horizontal"):
+        if TEST_DEVICE != "musa" and self._algo in ("vertical", "horizontal"):
             with pytest.raises(RuntimeError, match="does not support scaled"):
                 self.run_kernel_with_intermediate_states(inputs)
             return
@@ -1191,7 +1201,7 @@ class TestSelectiveStateUpdateMTPStochasticRounding(TestSelectiveStateUpdateMTP)
     ATOL = 0.001
     RTOL = 0.01
 
-    RAND_SEED = torch.tensor(42, dtype=torch.int64, device="cuda")
+    RAND_SEED = torch.tensor(42, dtype=torch.int64, device=TEST_DEVICE)
 
     def make_inputs(
         self, batch, nheads, dim, dstate, cache_steps, _state_dtype, weight_dtype
@@ -1220,7 +1230,7 @@ class TestSelectiveStateUpdateMTPStochasticRounding(TestSelectiveStateUpdateMTP)
         # on unsupported GPUs the Triton reference falls back to regular
         # rounding while the CUDA kernel still exercises its software
         # stochastic rounding path.
-        rand_seed = self.RAND_SEED if is_cvt_rs_supported() else None
+        rand_seed = self.RAND_SEED if is_cvt_rs_supported(torch.device(TEST_DEVICE)) else None
         y_ref = selective_state_update_triton(
             state_ref,
             inputs["x"],
@@ -1290,6 +1300,11 @@ class TestSelectiveStateUpdateMTPStochasticRounding(TestSelectiveStateUpdateMTP)
         (  64,    64,     64,   64,    4,           torch.float16,  torch.float32,  True ),  # dstate=64
         (  64,    64,     64,   96,    4,           torch.float16,  torch.float32,  True ),  # dstate=96 (odd stateValuesPerThread)
     )
+    if TEST_DEVICE == "musa":
+        _SR_PARAMS = (
+            (2, 8, 8, 16, 3, torch.float16, torch.float32, True),
+            (2, 8, 8, 8, 3, torch.float16, torch.float32, True),
+        )
     # fmt: on
 
     @pytest.mark.parametrize(
@@ -1327,7 +1342,7 @@ class TestSelectiveStateUpdateMTPStochasticRoundingWithIntermediateStates(
     ATOL = 0.001
     RTOL = 0.01
 
-    RAND_SEED = torch.tensor(42, dtype=torch.int64, device="cuda")
+    RAND_SEED = torch.tensor(42, dtype=torch.int64, device=TEST_DEVICE)
 
     def make_inputs(
         self, batch, nheads, dim, dstate, cache_steps, _state_dtype, weight_dtype
@@ -1357,7 +1372,7 @@ class TestSelectiveStateUpdateMTPStochasticRoundingWithIntermediateStates(
         # on unsupported GPUs the Triton reference falls back to regular
         # rounding while the CUDA kernel still exercises its software
         # stochastic rounding path.
-        rand_seed = self.RAND_SEED if is_cvt_rs_supported() else None
+        rand_seed = self.RAND_SEED if is_cvt_rs_supported(torch.device(TEST_DEVICE)) else None
 
         y_ref = selective_state_update_triton(
             state_ref,
@@ -1411,6 +1426,10 @@ class TestSelectiveStateUpdateMTPStochasticRoundingWithIntermediateStates(
         (  64,    64,     64,   64,    4,           torch.float16,  torch.float32,  True ),  # dstate=64
         (  64,    64,     64,   96,    4,           torch.float16,  torch.float32,  True ),  # dstate=96 (odd stateValuesPerThread)
     )
+    if TEST_DEVICE == "musa":
+        _SR_INTERMEDIATE_PARAMS = (
+            (2, 8, 8, 16, 3, torch.float16, torch.float32, True),
+        )
     # fmt: on
 
     @pytest.mark.parametrize(

@@ -497,7 +497,15 @@ class CakeSSDCombined:
         has_z: bool,
         seq_idx_dtype: torch.dtype,
     ) -> None:
-        if chunk_size != _CHUNK_SIZE or headdim != _HEADDIM or dstate != _DSTATE:
+        self._chunk_size = chunk_size
+        musa_runtime = (
+            hasattr(torch.version, "musa")
+            and torch.version.musa is not None
+            and torch.musa.is_available()
+        )
+        if not musa_runtime and (
+            chunk_size != _CHUNK_SIZE or headdim != _HEADDIM or dstate != _DSTATE
+        ):
             raise ValueError(
                 "Cake SSDCombined requires chunk_size=128, headdim=64, and dstate=128"
             )
@@ -511,7 +519,8 @@ class CakeSSDCombined:
             raise ValueError("Cake SSDCombined state dtype must be bfloat16 or float16")
         if seq_idx_dtype not in (torch.int32, torch.int64):
             raise ValueError("Cake SSDCombined seq_idx dtype must be int32 or int64")
-        _target_arch()
+        if not musa_runtime:
+            _target_arch()
         self.nheads = nheads
         self.ngroups = ngroups
         self.state_dtype = state_dtype
@@ -689,6 +698,83 @@ class CakeSSDCombined:
         out: Optional[torch.Tensor] = None,
         return_final_states: bool = True,
     ):
+        if x.device.type == "musa":
+            if x.dim() != 4:
+                if x.dim() != 3 or seq_idx is None:
+                    raise ValueError("MUSA Cake packed path requires x[T,H,D] and seq_idx[T]")
+                from .ssd_combined import ssd_combined_fwd_varlen
+
+                if out is None:
+                    out = torch.empty_like(x)
+
+                seq_tokens = seq_idx.reshape(-1).to(torch.int64)
+                if seq_tokens.numel() != x.shape[0]:
+                    raise ValueError("packed seq_idx must contain one id per token")
+                boundaries = [0]
+                for token in range(1, x.shape[0]):
+                    if int(seq_tokens[token]) != int(seq_tokens[token - 1]):
+                        boundaries.append(token)
+                boundaries.append(x.shape[0])
+                cu_seqlens = torch.tensor(boundaries, device=x.device, dtype=torch.int32)
+                if chunk_offsets is not None and chunk_offsets.numel() >= 2:
+                    cu_chunk_seqlens = chunk_offsets.to(torch.int32)
+                else:
+                    cu_chunk_seqlens = torch.tensor(
+                        [0, x.shape[0]], device=x.device, dtype=torch.int32
+                    )
+                num_chunks = cu_chunk_seqlens.numel() - 1
+                chunk_ids = seq_tokens.new_zeros(num_chunks)
+                for chunk in range(num_chunks):
+                    chunk_ids[chunk] = seq_tokens[int(cu_chunk_seqlens[chunk])]
+                last = torch.stack(
+                    [
+                        (chunk_ids == sequence).nonzero(as_tuple=False)[-1, 0]
+                        for sequence in torch.unique(seq_tokens)
+                    ]
+                ).to(torch.int32)
+                final_states = ssd_combined_fwd_varlen(
+                    x,
+                    dt,
+                    A,
+                    B,
+                    C,
+                    self._chunk_size,
+                    cu_seqlens,
+                    cu_chunk_seqlens,
+                    last,
+                    chunk_ids.to(torch.int32),
+                    D=D,
+                    z=z,
+                    dt_bias=dt_bias,
+                    dt_softplus=dt_softplus,
+                    dt_limit=dt_limit,
+                    initial_states=initial_states,
+                    out=out,
+                    return_intermediate_states=not return_final_states,
+                    checkpoint_token_indices=checkpoint_token_indices,
+                    checkpoint_state_slots=checkpoint_state_slots,
+                    checkpoint_states=checkpoint_states,
+                )
+                return out, final_states
+            from .ssd_combined import ssd_combined_fwd
+
+            return ssd_combined_fwd(
+                x,
+                dt,
+                A,
+                B,
+                C,
+                D=D,
+                z=z,
+                dt_bias=dt_bias,
+                dt_softplus=dt_softplus,
+                dt_limit=dt_limit,
+                initial_states=initial_states,
+                seq_idx=seq_idx,
+                out=out,
+                return_final_states=return_final_states,
+            )
+
         batch, seqlen, nheads, headdim = x.shape
         if seqlen % _CHUNK_SIZE:
             raise ValueError("seqlen must be divisible by chunk_size=128")

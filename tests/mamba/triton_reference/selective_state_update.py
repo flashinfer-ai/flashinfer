@@ -344,7 +344,9 @@ def _selective_scan_update_kernel(
                     tl.store(iscale_ptrs, decode_scale_i, mask=offs_m < dim)
                     # Quantize and store
                     q_state = state * encode_scale_i[:, None]
-                    q_state = tl.extra.cuda.libdevice.round(q_state)
+                    q_state = tl.where(
+                        q_state >= 0, tl.floor(q_state + 0.5), tl.ceil(q_state - 0.5)
+                    )
                     q_state = tl.minimum(tl.maximum(q_state, -int16_max_i), int16_max_i)
                     tl.store(
                         cache_ptrs, q_state.to(cache_ptrs.dtype.element_ty), mask=mask
@@ -403,7 +405,9 @@ def _selective_scan_update_kernel(
             tl.store(state_scale_ptrs, new_decode_scale, mask=dst_scales_mask)
             # Quantize
             state = state * encode_scale
-            state = tl.extra.cuda.libdevice.round(state)
+            state = tl.where(
+                state >= 0, tl.floor(state + 0.5), tl.ceil(state - 0.5)
+            )
             state = tl.minimum(tl.maximum(state, -int16_max), int16_max)
             tl.store(state_ptrs, state.to(state_ptrs.dtype.element_ty), mask=mask)
         elif USE_RS_ROUNDING:
@@ -588,7 +592,7 @@ def selective_state_update_triton(
         else (0, 0)
     )
 
-    with torch.cuda.device(x.device.index):
+    with (torch.musa if x.device.type == "musa" else torch.cuda).device(x.device.index):
         _selective_scan_update_kernel[grid](
             state,
             state_scale,

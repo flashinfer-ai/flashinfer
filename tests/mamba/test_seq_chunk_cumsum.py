@@ -7,6 +7,8 @@ ranges for varlen parallelization.
 
 import torch
 
+from .utils import TEST_DEVICE
+
 
 def seq_chunk_cumsum_reference(
     seq_idx, chunk_indices, chunk_offsets, chunk_size, num_seqs
@@ -40,7 +42,7 @@ def seq_chunk_cumsum_reference(
 def _make_equal_seqs(num_seqs, chunks_per_seq, chunk_size):
     """Helper: equal-length sequences, each chunk-aligned."""
     total_seqlen = num_seqs * chunks_per_seq * chunk_size
-    seq_idx = torch.zeros(1, total_seqlen, dtype=torch.int32, device="cuda")
+    seq_idx = torch.zeros(1, total_seqlen, dtype=torch.int32, device=TEST_DEVICE)
     for s in range(num_seqs):
         start = s * chunks_per_seq * chunk_size
         end = start + chunks_per_seq * chunk_size
@@ -55,8 +57,8 @@ def _make_equal_seqs(num_seqs, chunks_per_seq, chunk_size):
             chunk_indices.append(phys)
             chunk_offsets.append(0)
 
-    chunk_indices = torch.tensor(chunk_indices, dtype=torch.int32, device="cuda")
-    chunk_offsets = torch.tensor(chunk_offsets, dtype=torch.int32, device="cuda")
+    chunk_indices = torch.tensor(chunk_indices, dtype=torch.int32, device=TEST_DEVICE)
+    chunk_offsets = torch.tensor(chunk_offsets, dtype=torch.int32, device=TEST_DEVICE)
     return seq_idx, chunk_indices, chunk_offsets
 
 
@@ -65,7 +67,7 @@ def _make_variable_seqs(chunks_per_seq_list, chunk_size):
     num_seqs = len(chunks_per_seq_list)
     total_chunks = sum(chunks_per_seq_list)
     total_seqlen = total_chunks * chunk_size
-    seq_idx = torch.zeros(1, total_seqlen, dtype=torch.int32, device="cuda")
+    seq_idx = torch.zeros(1, total_seqlen, dtype=torch.int32, device=TEST_DEVICE)
     pos = 0
     for s, n in enumerate(chunks_per_seq_list):
         length = n * chunk_size
@@ -81,8 +83,8 @@ def _make_variable_seqs(chunks_per_seq_list, chunk_size):
             chunk_offsets.append(0)
             phys += 1
 
-    chunk_indices = torch.tensor(chunk_indices, dtype=torch.int32, device="cuda")
-    chunk_offsets = torch.tensor(chunk_offsets, dtype=torch.int32, device="cuda")
+    chunk_indices = torch.tensor(chunk_indices, dtype=torch.int32, device=TEST_DEVICE)
+    chunk_offsets = torch.tensor(chunk_offsets, dtype=torch.int32, device=TEST_DEVICE)
     return seq_idx, chunk_indices, chunk_offsets, num_seqs
 
 
@@ -92,11 +94,17 @@ class TestSeqChunkCumsum:
     CHUNK_SIZE = 128
 
     def _call_kernel(self, seq_idx, chunk_indices, chunk_offsets, chunk_size, num_seqs):
+        if TEST_DEVICE == "musa":
+            from flashinfer.mamba.musa_seq_chunk import seq_chunk_cumsum
+
+            return seq_chunk_cumsum(
+                seq_idx, chunk_indices, chunk_offsets, chunk_size, num_seqs
+            )
         from flashinfer.mamba.ssd_combined import _get_seq_chunk_cumsum_module
 
         module = _get_seq_chunk_cumsum_module()
         num_logical_chunks = len(chunk_indices)
-        output = torch.zeros(num_seqs + 1, dtype=torch.int32, device="cuda")
+        output = torch.zeros(num_seqs + 1, dtype=torch.int32, device=TEST_DEVICE)
         module.seq_chunk_cumsum(
             seq_idx,
             chunk_indices,
@@ -192,12 +200,23 @@ class TestSeqChunkCumsum:
             seq_idx, chunk_indices, chunk_offsets, self.CHUNK_SIZE, num_seqs
         )
 
+        if TEST_DEVICE == "musa":
+            from flashinfer.mamba.musa_seq_chunk import seq_chunk_cumsum
+
+            output = torch.zeros(num_seqs + 1, dtype=torch.int32, device=TEST_DEVICE)
+            tile_state = torch.empty(1024 * 1024, dtype=torch.uint8, device=TEST_DEVICE)
+            seq_chunk_cumsum(
+                seq_idx, chunk_indices, chunk_offsets, self.CHUNK_SIZE, num_seqs,
+                out=output, tile_state=tile_state,
+            )
+            torch.testing.assert_close(output, ref)
+            return
         module = _get_seq_chunk_cumsum_module()
         num_logical_chunks = len(chunk_indices)
-        output = torch.zeros(num_seqs + 1, dtype=torch.int32, device="cuda")
+        output = torch.zeros(num_seqs + 1, dtype=torch.int32, device=TEST_DEVICE)
 
         # Allocate a tile_state buffer large enough (1 MB is way more than needed)
-        tile_state = torch.empty(1024 * 1024, dtype=torch.uint8, device="cuda")
+        tile_state = torch.empty(1024 * 1024, dtype=torch.uint8, device=TEST_DEVICE)
 
         module.seq_chunk_cumsum(
             seq_idx,

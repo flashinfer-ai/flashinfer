@@ -6,12 +6,15 @@ import flashinfer
 from flashinfer.utils import get_compute_capability, is_cvt_rs_supported
 
 from .triton_reference.selective_state_update import selective_state_update_triton
-from .utils import create_test_inputs, clone_preserving_strides
+from .independent_reference import ssu_one_token
+from .utils import TEST_DEVICE, create_test_inputs, clone_preserving_strides
 
 
 def _get_algorithms():
     """Return list of algorithms supported on the current GPU."""
-    major, _ = get_compute_capability(torch.device("cuda"))
+    if TEST_DEVICE == "musa":
+        return ["simple"]
+    major, _ = get_compute_capability(torch.device(TEST_DEVICE))
     algos = ["simple"]
     if major >= 9:
         algos.extend(["vertical", "horizontal"])
@@ -36,6 +39,19 @@ _BASE_PARAMS = [
     (  64,    64,     64,  128,     torch.bfloat16,     torch.bfloat16,    True ),  # weight_dtype=bf16
     (  64,    64,     64,  128,     torch.bfloat16,     torch.float32,     False),  # use_out_tensor=False
 ]
+if TEST_DEVICE == "musa":
+    _BASE_PARAMS = [
+        (1, 64, 64, 128, torch.bfloat16, torch.float32, True),
+        (2, 8, 8, 16, torch.bfloat16, torch.float32, True),
+        (2, 8, 8, 16, torch.float32, torch.float32, True),
+        (1, 8, 8, 16, torch.bfloat16, torch.float32, True),
+        (2, 8, 8, 16, torch.bfloat16, torch.float32, True),
+        (2, 8, 16, 16, torch.bfloat16, torch.float32, True),
+        (2, 8, 8, 8, torch.bfloat16, torch.float32, True),
+        (2, 8, 8, 16, torch.float16, torch.float32, True),
+        (2, 8, 8, 16, torch.bfloat16, torch.bfloat16, True),
+        (2, 8, 8, 16, torch.bfloat16, torch.float32, False),
+    ]
 # fmt: on
 
 
@@ -43,8 +59,9 @@ class TestSelectiveStateUpdate:
     """Test class for selective state update kernels."""
 
     # Test configuration
-    ATOL = 1e-3
-    RTOL = 1e-2
+    # BF16 output quantization on MUSA is one ulp at roughly 0.015625.
+    ATOL = 3e-2 if TEST_DEVICE == "musa" else 1e-3
+    RTOL = 5e-2 if TEST_DEVICE == "musa" else 1e-2
     NGROUPS = 8
     INPUT_DTYPE = torch.bfloat16
     MATRIX_A_DTYPE = torch.float32
@@ -67,6 +84,13 @@ class TestSelectiveStateUpdate:
 
     def make_reference_output(self, inputs):
         """Compute reference output using triton implementation."""
+        if TEST_DEVICE == "musa":
+            y_ref, state_ref, scale_ref = ssu_one_token(
+                inputs["state_cache"], inputs["x"], inputs["dt"], inputs["A"],
+                inputs["B"], inputs["C"], inputs["D"], inputs["dt_bias"],
+                inputs["slot_idx"], state_scale=inputs.get("state_scale"), z=inputs.get("z"), dt_softplus=inputs.get("dt_softplus", True),
+            )
+            return (y_ref, state_ref, scale_ref) if inputs.get("state_scale") is not None else (y_ref, state_ref)
         state_ref = inputs["state_cache"].clone()
         y_ref = selective_state_update_triton(
             state_ref,
@@ -188,7 +212,7 @@ class TestSelectiveStateUpdate:
 
         # Prepare output tensor if requested
         if use_out_tensor:
-            out = torch.empty(batch, nheads, dim, dtype=self.INPUT_DTYPE, device="cuda")
+            out = torch.empty(batch, nheads, dim, dtype=self.INPUT_DTYPE, device=TEST_DEVICE)
         else:
             out = None
 
@@ -303,7 +327,7 @@ class TestSelectiveStateUpdateDisableStateUpdate(TestSelectiveStateUpdate):
 
         # Prepare output tensor if requested
         if use_out_tensor:
-            out = torch.empty(batch, nheads, dim, dtype=self.INPUT_DTYPE, device="cuda")
+            out = torch.empty(batch, nheads, dim, dtype=self.INPUT_DTYPE, device=TEST_DEVICE)
         else:
             out = None
 
@@ -370,6 +394,13 @@ class TestSelectiveStateUpdateNonContiguous(TestSelectiveStateUpdate):
 
     def make_reference_output(self, inputs):
         """Compute reference output, preserving non-contiguous strides."""
+        if TEST_DEVICE == "musa":
+            y_ref, state_ref, scale_ref = ssu_one_token(
+                inputs["state_cache"], inputs["x"], inputs["dt"], inputs["A"],
+                inputs["B"], inputs["C"], inputs["D"], inputs["dt_bias"],
+                inputs["slot_idx"], state_scale=inputs.get("state_scale"), z=inputs.get("z"), dt_softplus=inputs.get("dt_softplus", True),
+            )
+            return (y_ref, state_ref, scale_ref) if inputs.get("state_scale") is not None else (y_ref, state_ref)
         state_ref = clone_preserving_strides(inputs["state_cache"])
         y_ref = selective_state_update_triton(
             state_ref,
@@ -479,6 +510,15 @@ _INT16_PARAMS = [
     (  64,    64,     64,  256,    torch.float32,     True ),  # dstate=256
     (  64,    64,     64,  128,    torch.bfloat16,    True ),  # weight_dtype=bf16
 ]
+if TEST_DEVICE == "musa":
+    _INT16_PARAMS = [
+        (2, 8, 8, 16, torch.float32, True),
+        (1, 8, 8, 16, torch.float32, True),
+        (2, 8, 8, 16, torch.float32, True),
+        (2, 8, 16, 16, torch.float32, True),
+        (2, 8, 8, 8, torch.float32, True),
+        (2, 8, 8, 16, torch.bfloat16, True),
+    ]
 # fmt: on
 
 
@@ -506,6 +546,13 @@ class TestSelectiveStateUpdateInt16(TestSelectiveStateUpdate):
 
     def make_reference_output(self, inputs):
         """Compute reference output using Triton with state_scale."""
+        if TEST_DEVICE == "musa":
+            y_ref, state_ref, scale_ref = ssu_one_token(
+                inputs["state_cache"], inputs["x"], inputs["dt"], inputs["A"],
+                inputs["B"], inputs["C"], inputs["D"], inputs["dt_bias"],
+                inputs["slot_idx"], state_scale=inputs["state_scale"], z=inputs.get("z"), dt_softplus=inputs.get("dt_softplus", True),
+            )
+            return y_ref, state_ref, scale_ref
         state_ref = inputs["state_cache"].clone()
         state_scale_ref = inputs["state_scale"].clone()
         y_ref = selective_state_update_triton(
@@ -611,7 +658,7 @@ class TestSelectiveStateUpdateInt16(TestSelectiveStateUpdate):
         y_ref, state_ref, state_scale_ref = self.make_reference_output(inputs)
 
         if use_out_tensor:
-            out = torch.empty(batch, nheads, dim, dtype=self.INPUT_DTYPE, device="cuda")
+            out = torch.empty(batch, nheads, dim, dtype=self.INPUT_DTYPE, device=TEST_DEVICE)
         else:
             out = None
 
@@ -632,8 +679,10 @@ class TestSelectiveStateUpdateInt16(TestSelectiveStateUpdate):
 
 
 def _get_algorithms_no_horizontal():
+    if TEST_DEVICE == "musa":
+        return ["simple"]
     """Return algorithms that support stochastic rounding (no horizontal)."""
-    major, _ = get_compute_capability(torch.device("cuda"))
+    major, _ = get_compute_capability(torch.device(TEST_DEVICE))
     algos = ["simple"]
     if major >= 9:
         algos.append("vertical")
@@ -643,10 +692,10 @@ def _get_algorithms_no_horizontal():
 class TestSelectiveStateUpdateStochasticRounding(TestSelectiveStateUpdate):
     """Test fp16 state with stochastic rounding vs Triton reference."""
 
-    ATOL = 0.001
-    RTOL = 0.01
+    ATOL = 2e-2 if TEST_DEVICE == "musa" else 0.001
+    RTOL = 5e-2 if TEST_DEVICE == "musa" else 0.01
 
-    RAND_SEED = torch.tensor(42, dtype=torch.int64, device="cuda")
+    RAND_SEED = torch.tensor(42, dtype=torch.int64, device=TEST_DEVICE)
 
     def make_inputs(self, batch, nheads, dim, dstate, _state_dtype, weight_dtype):
         """Create test inputs with fp16 state."""
@@ -665,13 +714,21 @@ class TestSelectiveStateUpdateStochasticRounding(TestSelectiveStateUpdate):
         )
 
     def make_reference_output(self, inputs):
-        """Compute reference output using Triton with stochastic rounding."""
+        """Compute reference output using Triton with stochastic rounding.
+        """
+        if TEST_DEVICE == "musa":
+            y_ref, state_ref, scale_ref = ssu_one_token(
+                inputs["state_cache"], inputs["x"], inputs["dt"], inputs["A"],
+                inputs["B"], inputs["C"], inputs["D"], inputs["dt_bias"],
+                inputs["slot_idx"], state_scale=inputs.get("state_scale"), z=inputs.get("z"), dt_softplus=inputs.get("dt_softplus", True),
+            )
+            return y_ref, state_ref
         state_ref = inputs["state_cache"].clone()
         # Triton cvt.rs.f16x2.f32 requires SM100a (non-forward-compatible);
         # on unsupported GPUs the Triton reference falls back to regular
         # rounding while the CUDA kernel still exercises its software
         # stochastic rounding path.
-        rand_seed = self.RAND_SEED if is_cvt_rs_supported() else None
+        rand_seed = self.RAND_SEED if TEST_DEVICE == "musa" or is_cvt_rs_supported() else None
         y_ref = selective_state_update_triton(
             state_ref,
             inputs["x"],
@@ -741,6 +798,11 @@ class TestSelectiveStateUpdateStochasticRounding(TestSelectiveStateUpdate):
         (  64,    64,     64,  128,     torch.float16,  torch.float32,  True ),  # base
         (  64,    64,     64,   64,     torch.float16,  torch.float32,  True ),  # dstate=64
     )
+    if TEST_DEVICE == "musa":
+        _SR_PARAMS = (
+            (2, 8, 8, 16, torch.float16, torch.float32, True),
+            (2, 8, 8, 8, torch.float16, torch.float32, True),
+        )
     # fmt: on
 
     @pytest.mark.parametrize("algorithm", _get_algorithms_no_horizontal())
@@ -832,6 +894,11 @@ class TestSelectiveStateUpdateVariousNgroups(TestSelectiveStateUpdate):
         (  64,    64,     64,  128,    torch.bfloat16,     torch.float32,  True,           32),  # ratio=2
         (  64,    64,     64,  128,    torch.bfloat16,     torch.float32,  True,           64),  # ratio=1
     )
+    if TEST_DEVICE == "musa":
+        _NGROUPS_PARAMS = tuple(
+            (2, 8, 8, 16, torch.bfloat16, torch.float32, True, ngroups)
+            for ngroups in (1, 2, 4, 8)
+        )
     # fmt: on
 
     @pytest.mark.parametrize("algorithm", _get_algorithms())
@@ -868,7 +935,7 @@ class TestSelectiveStateUpdateVariousNgroups(TestSelectiveStateUpdate):
         y_ref, state_ref = self.make_reference_output(inputs)
 
         if use_out_tensor:
-            out = torch.empty(batch, nheads, dim, dtype=self.INPUT_DTYPE, device="cuda")
+            out = torch.empty(batch, nheads, dim, dtype=self.INPUT_DTYPE, device=TEST_DEVICE)
         else:
             out = None
 

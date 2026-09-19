@@ -5,6 +5,7 @@ Test 2: CUDA vs Triton stochastic rounding (cvt.rs.f16x2.f32) — bitwise compar
 """
 
 import pathlib
+import os
 
 import pytest
 import torch
@@ -13,6 +14,12 @@ import triton.language as tl
 from torch.utils.cpp_extension import load_inline
 
 from flashinfer.utils import get_compute_capability, is_cvt_rs_supported
+
+if os.environ.get("FLASHINFER_MAMBA_TEST_DEVICE") == "musa":
+    pytest.skip(
+        "CUDA C++ Philox extension tests are NVIDIA-specific; MUSA public stochastic API is covered in test_musa_public_api.py",
+        allow_module_level=True,
+    )
 
 
 # ---------------------------------------------------------------------------

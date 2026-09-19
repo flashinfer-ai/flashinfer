@@ -4835,7 +4835,7 @@ def replay_selective_state_update(
         )
 
     # ---- Mode dispatch ----------------------------------------------------
-    with torch.cuda.device(device.index):
+    with (torch.musa if device.type == "musa" else torch.cuda).device(device.index):
         if mode == "persistent_dynamic":
             # Single-launch persistent kernel covering the full batch.  Each
             # work-item dispatches via runtime PNAT check.  Kernel ignores

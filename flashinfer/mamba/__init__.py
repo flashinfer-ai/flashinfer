@@ -21,6 +21,7 @@ from .checkpointing_ssu import (
     checkpointing_ssu,
 )
 from .replayssm_materialize import replayssm_materialize
+from .cake_ssd_combined import CakeSSDCombined
 
 __all__ = [
     "cake_selective_state_update",
@@ -28,11 +29,24 @@ __all__ = [
     "checkpointing_ssu",
     "allocate_checkpointing_ssu_scratch",
     "replayssm_materialize",
+    "CakeSSDCombined",
 ]
 
 try:
-    from .ssd_combined import SSDCombined, ssd_combined_fwd
+    from .ssd_combined import (
+        SSDCombined,
+        mamba_chunk_scan_combined_varlen,
+        ssd_combined_fwd,
+        ssd_combined_fwd_varlen,
+    )
 
-    __all__.extend(("SSDCombined", "ssd_combined_fwd"))
+    __all__.extend(
+        (
+            "SSDCombined",
+            "ssd_combined_fwd",
+            "ssd_combined_fwd_varlen",
+            "mamba_chunk_scan_combined_varlen",
+        )
+    )
 except ImportError:
     pass
