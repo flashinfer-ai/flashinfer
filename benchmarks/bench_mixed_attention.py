@@ -208,7 +208,6 @@ def run_bench(
                 q_d,
                 kv_d,
                 causal_p=causal,
-                causal_d=causal,
             )
         )
         ms_pod = np.median(measurements)
