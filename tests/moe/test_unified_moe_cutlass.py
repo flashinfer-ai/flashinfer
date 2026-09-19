@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -2573,7 +2575,33 @@ def _nvfp4_quantized_reference(
         ]
     )
     ref_act = MoEActivationPack(x_dq, None, act.topk_ids, act.topk_weights)
-    return _reference(ref_act, w1, w2, activation)
+    return _reference(
+        ref_act, w1, w2, activation, intermediate_hook=_nvfp4_requant_hook(x.device)
+    )
+
+
+def _nvfp4_requant_hook(device):
+    """Model the kernels' NVFP4 requantization of the GEMM1 output (unit
+    global scale, 16-element E4M3 block scales) before GEMM2. Every NVFP4
+    backend does this, so a reference without it carries ~2x the error."""
+    from flashinfer import fp4_quantize
+
+    one = torch.ones(1, device=device)
+
+    def hook(intermediate: torch.Tensor) -> torch.Tensor:
+        q, sf = fp4_quantize(
+            intermediate.to(torch.bfloat16).reshape(1, -1),
+            global_scale=one,
+            sf_vec_size=16,
+            is_sf_swizzled_layout=False,
+        )
+        return (
+            _dequantize_cutlass_nvfp4_matrix(q, sf, swizzled=False)
+            .to(device=device, dtype=torch.float32)
+            .reshape(-1)
+        )
+
+    return hook
 
 
 @cutlass_nvfp4_required
@@ -3479,6 +3507,25 @@ def _assert_backends_share_activation_pack(
         experts=ExpertConfig(intermediate_size=intermediate_size),
         activation=activation,
         backend=BackendOptions(tuple(cfg for cfg, _ in candidates)),
+    )
+    # A candidate may decline this pair on this device (CuTe-DSL W4A8 on
+    # SM107); the test is about the survivors sharing one pack, so drop those
+    # rather than fail, but keep at least the CUTLASS runner and one peer.
+    supported = []
+    for cfg, key in candidates:
+        runner = _BACKEND_RUNNERS[type(cfg)](config, device)
+        try:
+            runner.check_support()
+        except NotImplementedError as exc:
+            if key == cutlass_key:
+                pytest.skip(f"{key} unsupported here: {exc}")
+            continue
+        supported.append((cfg, key))
+    if len(supported) < 2:
+        pytest.skip("needs at least two backends that support this pair here")
+    candidates = tuple(supported)
+    config = dataclasses.replace(
+        config, backend=BackendOptions(tuple(cfg for cfg, _ in candidates))
     )
     weights = MoEWeightPack()
     for cfg, key in candidates:
