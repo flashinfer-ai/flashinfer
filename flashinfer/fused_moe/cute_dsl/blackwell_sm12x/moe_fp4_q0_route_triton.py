@@ -23,6 +23,8 @@ import triton.language as tl
 from ....utils import ceil_div
 from ....utils import round_up as align
 from ._moe_utils.moe_route_meta import count_expert_kernel as _count_expert_kernel
+from ._moe_utils.moe_route_meta import count_routes_kernel as _count_routes_kernel
+from ._moe_utils.moe_route_meta import prefix_cursor_kernel as _prefix_cursor_kernel
 from ._moe_utils.moe_route_meta import (
     route_assign_decode_kernel as _route_assign_decode_kernel,
 )
@@ -34,6 +36,7 @@ DIRECT_BLOCK_K = 256
 NVFP4_SF_M_ALIGN = 128
 SF_COL_ALIGN = 4
 DECODE_BLOCK_N = 256
+PREFILL_FUSED_PREFIX_MAX_EXPERTS = 1024
 ALIGN_BYTES = 16
 
 
@@ -328,12 +331,26 @@ def nvfp4_q0_route_triton(
         )
     else:
         block_n = 256
-        workspace.offsets[:1].zero_()
-        _count_expert_kernel[(num_experts,)](
-            topk_ids, workspace.counts, total_pairs, block_n
-        )
-        workspace.offsets[1:] = workspace.counts.cumsum(0)
-        workspace.expert_cursor.copy_(workspace.offsets[:-1])
+        if num_experts <= PREFILL_FUSED_PREFIX_MAX_EXPERTS:
+            workspace.counts.zero_()
+            _count_routes_kernel[(ceil_div(total_pairs, block_n),)](
+                topk_ids, workspace.counts, total_pairs, block_n, num_warps=4
+            )
+            _prefix_cursor_kernel[(1,)](
+                workspace.counts,
+                workspace.offsets,
+                workspace.expert_cursor,
+                num_experts,
+                triton.next_power_of_2(num_experts),
+                num_warps=8,
+            )
+        else:
+            workspace.offsets[:1].zero_()
+            _count_expert_kernel[(num_experts,)](
+                topk_ids, workspace.counts, total_pairs, block_n
+            )
+            workspace.offsets[1:] = workspace.counts.cumsum(0)
+            workspace.expert_cursor.copy_(workspace.offsets[:-1])
         _route_assign_kernel[(ceil_div(total_pairs, block_n),)](
             topk_ids,
             topk_weights,
