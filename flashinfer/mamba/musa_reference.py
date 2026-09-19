@@ -50,6 +50,100 @@ def _philox_uniform(
     return ((c0.to(torch.float32) + 0.5) / 4294967296.0).reshape(value.shape)
 
 
+def _musa_stream_is_capturing() -> bool:
+    musa = getattr(torch, "musa", None)
+    query = getattr(musa, "is_current_stream_capturing", None)
+    if query is None:
+        return False
+    try:
+        return bool(query())
+    except Exception:
+        return False
+
+
+def _musa_mtp_capture_update(
+    state,
+    x,
+    dt,
+    A,
+    B,
+    C,
+    D,
+    z,
+    dt_bias,
+    dt_softplus,
+    state_batch_indices,
+    dst_state_batch_indices,
+    out,
+    disable_state_update,
+    intermediate_states_buffer,
+    intermediate_state_indices,
+    num_accepted_tokens,
+):
+    """Tensor-only MTP recurrence used while MUSA graph capture is active."""
+    if x.dim() == 4:
+        batch, steps = x.shape[:2]
+        x4, dt4, b4, c4 = x, dt, B, C
+        flatten = False
+    elif x.dim() == 3:
+        batch, steps = 1, x.shape[0]
+        x4, dt4 = x.unsqueeze(0), dt.unsqueeze(0)
+        b4, c4 = B.unsqueeze(0), C.unsqueeze(0)
+        flatten = True
+    else:
+        raise RuntimeError("capture-safe MTP SSU requires a dense decode window")
+    nheads, dim = x4.shape[-2], x4.shape[-1]
+    ngroups = b4.shape[-2]
+    if nheads % ngroups or state.dim() < 4:
+        raise RuntimeError("unsupported capture-safe MTP state layout")
+    ratio = nheads // ngroups
+    fp = torch.float32
+    a_h = (A if A.dim() == 3 else A.unsqueeze(0)).to(fp)
+    b_h = b4.to(fp).repeat_interleave(ratio, dim=-2)
+    c_h = c4.to(fp).repeat_interleave(ratio, dim=-2)
+    x_h, dt_h = x4.to(fp), dt4.to(fp)
+    if dt_bias is not None:
+        dt_h = dt_h + dt_bias.to(fp).view(1, 1, -1)
+    if dt_softplus:
+        dt_h = torch.nn.functional.softplus(dt_h)
+    if state_batch_indices is None:
+        slots = torch.arange(batch, device=state.device, dtype=torch.long)
+        slots = slots.remainder(state.shape[0])[:, None].expand(batch, steps)
+    else:
+        slots = state_batch_indices.to(torch.long)
+        if slots.dim() == 1:
+            slots = slots[:, None].expand(batch, steps)
+    accepted = num_accepted_tokens.to(torch.long).reshape(-1)
+    accepted = accepted.clamp(min=1, max=steps) - 1
+    running = state.index_select(0, slots.gather(1, accepted[:, None]).squeeze(1)).to(fp)
+    if dst_state_batch_indices is None:
+        dst = slots
+    else:
+        dst = dst_state_batch_indices.to(torch.long)
+        if dst.dim() == 1:
+            dst = dst[:, None].expand(batch, steps)
+    dst = dst.clamp(min=0, max=state.shape[0] - 1)
+    outputs = []
+    for token in range(steps):
+        dt_t, x_t = dt_h[:, token], x_h[:, token]
+        running = running * torch.exp(a_h[None] * dt_t[:, :, None, None])
+        running = running + (dt_t[:, :, None, None] * x_t[:, :, :, None]) * b_h[:, token, :, None, :]
+        y = (c_h[:, token, :, None, :] * running).sum(dim=-1)
+        if D is not None:
+            y = y + D.to(fp).view(1, nheads, dim) * x_t
+        if z is not None:
+            z_t = z[:, token].to(fp) if z.dim() == 4 else z[token].to(fp)
+            y = y * z_t * torch.sigmoid(z_t)
+        outputs.append(y)
+        if not disable_state_update:
+            state.index_copy_(0, dst[:, token], running.to(state.dtype))
+    result = torch.stack(outputs, dim=1).to(out.dtype)
+    if flatten:
+        result = result.squeeze(0)
+    out.copy_(result)
+    return out
+
+
 def _stochastic_cast(
     value: torch.Tensor,
     target_dtype: torch.dtype,
@@ -148,6 +242,13 @@ def selective_state_update_musa_reference(
     state/index/replay contract.  Native MUSA kernels will replace this slow
     reference implementation behind the same boundary.
     """
+    if _musa_stream_is_capturing() and num_accepted_tokens is not None:
+        return _musa_mtp_capture_update(
+            state, x, dt, A, B, C, D, z, dt_bias, dt_softplus,
+            state_batch_indices, dst_state_batch_indices, out,
+            disable_state_update, intermediate_states_buffer,
+            intermediate_state_indices, num_accepted_tokens,
+        )
     quantized_state = state.dtype in (torch.int8, torch.int16, torch.float8_e4m3fn)
     if state.dtype not in (
         torch.int8, torch.int16, torch.float8_e4m3fn,
