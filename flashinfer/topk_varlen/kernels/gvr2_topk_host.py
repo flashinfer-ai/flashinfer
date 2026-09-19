@@ -173,6 +173,26 @@ CMPC = 4096  # crossing-bin slots per CTA, clustered register path
 BLKC = 1024  # CTA size of the clustered register path
 
 
+def _big_regime(b: int, R: int, n4: int) -> bool:
+    """Streaming-slab regime selector (one place for route / route_dynamic /
+    route_streaming / the varlen launcher).
+
+    Upstream: ``b * R <= 148`` (the grid fits one wave) selects the "big"
+    configuration: 1024-thread CTAs, one per SM, with the large sample caps
+    (SCAP 16384, CMP 4096). FlashInfer-local: UNSPLIT rows (R == 1) in the
+    75-148 row band with rows of <= 64K columns take the b > 148 configuration
+    instead ((512, U 8, MINB 2): 512 threads, the smaller caps). Measured
+    same-node, K in {512, 1024, 2048}, N 32K-64K, 75-148 rows: 1.5-2.5x faster
+    on B200, B300 and B100, 1.5-2.6x on DRIVE P2021 (68 SMs), 1.2-2.1x on Rubin;
+    forcing the U=8 unroll on the 1024-thread kernel changes nothing and the
+    host sample constants do not matter, so it is the 512-thread CTA shape with
+    its BLK-derived caps. Outside that band it is not a win: 33-74 unsplit rows
+    (K = 2048 only reaches the slab there) lose at 64K (0.75x at 37 rows) and
+    rows above 64K are mixed to bad (0.5x at 75-148 rows x 256K), so both keep
+    upstream's regime, as do the split slab (R > 1) and b > 148."""
+    return b * R <= 148 and not (R == 1 and b >= 75 and n4 <= 16384)
+
+
 def route(b: int, n: int, npad: int, k: int, sms: int = 148) -> dict[str, object]:
     """Mirror of the CUDA gvr_topk_launch dispatch. Pure. See module doc.
 
@@ -270,7 +290,20 @@ def route(b: int, n: int, npad: int, k: int, sms: int = 148) -> dict[str, object
         return _reg(512, 2, 4, NB)
 
     # ---- clustered register-resident path ----
-    if n4 > 4096 and n4 <= 8 * BLKC * 4 and k <= BLKC:
+    # FlashInfer-local: K > BLKC (K = 2048) is admitted too. Upstream gates the
+    # family at k <= BLKC because its hint sample is one word per thread; the
+    # selection stages (merged scan, cursor emit, crossing-bin tie select,
+    # key-space fallback) are k-generic, and the identity write of short rows
+    # strides over k. The bracket then comes from the first BLKC row values
+    # instead of the first k (a looser bracket, same exact result). Measured
+    # B200, K = 2048, random lengths, vs the streaming slab it replaces:
+    # 1.4-2.3x for <= 32 rows at 20K-64K and for <= 64 rows at <= 32K; the
+    # 33-37 row band above 32K needs 4-CTA clusters that no longer fit one GPC
+    # wave (0.89x at 37 x 48K), hence the one-wave gate below for K > BLKC
+    # above 32K: b * cs <= 7/8 of the SM count (129 on B200/B300-148: 32 x 4
+    # admitted, 37 x 4 not; 182 on Rubin-208: 37-44 x 4 admitted, measured
+    # 2.1-2.3x vs the slab there, 52 x 4 not, 1.2-1.35x, left on the slab).
+    if n4 > 4096 and n4 <= 8 * BLKC * 4 and k <= 2 * BLKC:
         # FlashInfer-local: cluster availability from the real SM count on
         # parts with >= 148 SMs (Rubin 208: 4-CTA instead of 2-CTA clusters at
         # b 38-48, and reg_clus instead of main/clus at b 80-104 / 48K-64K,
@@ -296,7 +329,7 @@ def route(b: int, n: int, npad: int, k: int, sms: int = 148) -> dict[str, object
                     vsel = v
                     cs = c
                     break
-        if vsel and cs >= 2:
+        if vsel and cs >= 2 and (k <= BLKC or n4 <= 8192 or b * cs <= (7 * sms) // 8):
             smc = (3 * NB + 2 * CMPC) * 4
             return {
                 "kernel": "reg_clus",
@@ -368,7 +401,7 @@ def route(b: int, n: int, npad: int, k: int, sms: int = 148) -> dict[str, object
         R = p2
         useclus = True
 
-    big = b * R <= 148
+    big = _big_regime(b, R, n >> 2)
     SCAP = (16384 if R == 1 else 8192) if big else (8192 if k > 1024 else 4096)
     CMP = (4096 if k > 1024 else 2048) if big else 1024
 
@@ -607,7 +640,10 @@ def route_dynamic(static: dict[str, object], n: int) -> tuple[dict[str, object],
     else:
         R = static["rt"]["R"]
         scap = static["rt"]["SCAP_"]
-    big = b * R <= 148
+    # the regime is a static-plan property (a band boundary at 64K for the
+    # unsplit 75-148 row slab): clus is split-only (n-independent), main's
+    # big configuration is the only one with 1024-thread CTAs
+    big = _big_regime(b, R, 0) if fam == "clus" else static["tpl"][0] == 1024
     aim = (
         ((4 * k if k >= 1024 else 2 * k) if R == 1 else 2 * k)
         if big
@@ -696,7 +732,7 @@ def route_streaming(
             p2 = 4
         R = p2
         useclus = True
-    big = b * R <= 148
+    big = _big_regime(b, R, n >> 2)
     scap = (16384 if R == 1 else 8192) if big else (8192 if k > 1024 else 4096)
     cmp_ = (4096 if k > 1024 else 2048) if big else 1024
     aim = (
@@ -839,7 +875,19 @@ def _gate_first_call(raw):
         return gated
 
 
-def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False):
+# Programmatic dependent launch for the register families of the decode path: the
+# kernel waits (griddepcontrol.wait) before its first read, so with the launch
+# attribute set the NEXT kernel's launch processing overlaps this kernel's tail
+# (in a CUDA graph and in a serving stream alike). Measured on B200 decode cells
+# (K=2048, N=4096, 16 rows): 4.65 -> 4.0 us per call in graph replay.
+_DECODE_PDL = True
+# clustered register family, paged output: winners staged into rank 0's smem
+# and written in one coalesced epilogue (the paged transform applied there)
+# instead of per-winner scattered stores with the transform inline
+_REGCLUS_STAGE_OUT = True
+
+
+def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False, page_shift=None):
     """Capture-time varlen plan + compiled launcher.  The gvr_main port is
     the universally correct fallback; specialist family tiers below.  Every
     choice here is a function of capture-stable quantities only — mirroring
@@ -848,10 +896,24 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False):
     ``hint_free`` selects the engines with the hint-gather sites compiled out
     (upstream PR NVIDIA/TensorRT-LLM#18410): the register families bracket on
     the first k row values they already hold, the streaming families run on the
-    sample alone. Part of the cache key (distinct compiled objects)."""
+    sample alone. Part of the cache key (distinct compiled objects).
+    ``page_shift`` (log2 page size, hint-free only) selects the PAGED engines: the
+    page table rides in the dead pre_idx slot and every emitted index leaves the
+    kernel as a physical KV slot (see ``_pt_xf`` in the device module)."""
     sms = _sm_count()
     hint_free = bool(hint_free)
-    key = (num_rows, npad, k, n_env, next_n, cr, hint_free, _arch_token(), sms)
+    paged = page_shift is not None
+    if paged and not hint_free:
+        raise RuntimeError("paged engines are hint-free only")
+    pg = dict(paged=paged, page_shift=int(page_shift) if paged else 0)
+    # every family stages the page-table row in smem when it is small (<= 4 KB):
+    # entries needed for the widest row, rounded to a power of two
+    pt_smem = 0
+    if paged:
+        need_pages = (min(n_env, npad) + (1 << page_shift) - 1) >> page_shift
+        if need_pages <= 1024:
+            pt_smem = 1 << max(need_pages - 1, 0).bit_length()
+    key = (num_rows, npad, k, n_env, next_n, cr, hint_free, page_shift, _arch_token(), sms)
     hit = _VARLEN_CACHE.get(key)
     if hit is not None:
         return hit
@@ -874,13 +936,27 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False):
     # safety is unchanged; per-row n / short-row handling lives in-kernel.
     plan_free = route(num_rows, n_route, npad, k, sms=sms)
     if plan_free["kernel"] == "reg_clus":
+        # Paged output: winners staged into rank 0's smem and mapped in one
+        # coalesced epilogue, which reads the page table from global (L2-hot
+        # by then) instead of staging the table row in the prologue. Measured
+        # B200 vs the scattered emit with the smem-staged table: 0.2-0.7 us
+        # (3-9%) on every clustered cell except K = 2048 below 16 rows, where
+        # the two-pass epilogue over 2048 words costs more than it saves (-0.3
+        # us at 1 x 32K); those keep the scattered emit. Unpaged output stays
+        # scattered: funnelling every rank's winners through rank 0 lost
+        # 0.3-0.8 us at 16-64 rows there.
+        stage_rc = bool(_REGCLUS_STAGE_OUT) and paged and (k <= 1024 or num_rows >= 16)
         fn = _gate_first_call(
             dev.get_compiled__regclus(
                 tuple(plan_free["tpl"]),
+                pdl=_DECODE_PDL,
                 varlen=True,
                 next_n=next_n,
                 cr_shift=cr_shift,
                 hint_free=hint_free,
+                pt_smem=0 if stage_rc else pt_smem,
+                stage_out=stage_rc,
+                **pg,
             )
         )
         lc = ("reg_clus", fn, n_kernel)
@@ -894,20 +970,33 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False):
     # size, all safe upper bounds for every per-row n <= envelope; per-row n
     # / short-row handling lives in-kernel.
     if plan_free["kernel"] in ("reg", "regimg"):
+        # staged coalesced emit only for one-wave launches (rows <= SMs): it trades
+        # scattered stores for a barrier + copy, a 5-25% win when latency-bound and
+        # a 3-4% loss when the grid is several waves deep (measured B200/B300)
+        stage_out = num_rows <= sms
         fn = _gate_first_call(
             dev.get_compiled__reg(
                 tuple(plan_free["tpl"]),
+                pdl=_DECODE_PDL,
                 varlen=True,
                 next_n=next_n,
                 cr_shift=cr_shift,
                 hint_free=hint_free,
+                pt_smem=pt_smem,
+                stage_out=stage_out,
+                **pg,
             )
         )
         rt_f = plan_free["rt"]
         lc = (
             "reg",
             fn,
-            (n_kernel, rt_f["CMP"], rt_f["QC"], dev.STATIC_BYTES + plan_free["smem"]),
+            (
+                n_kernel,
+                rt_f["CMP"],
+                rt_f["QC"],
+                dev.STATIC_BYTES + plan_free["smem"] + 4 * pt_smem + (4 * k if stage_out else 0),
+            ),
         )
         _VARLEN_CACHE[key] = lc
         return lc
@@ -929,6 +1018,9 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False):
                 next_n=next_n,
                 cr_shift=cr_shift,
                 hint_free=hint_free,
+                pt_smem=pt_smem,
+                pdl=_DECODE_PDL,
+                **pg,
             )
         )
         lc = (
@@ -946,9 +1038,15 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False):
     # machinery in whenever SPLIT); normalize it out of the compile key so
     # row counts differing only in that slot share one engine
     fn = _gate_first_call(
-        dev.get_compiled(tpl[:6] + (False,) + (next_n, cr_shift, r_const), hint_free=hint_free)
+        dev.get_compiled(
+            tpl[:6] + (False,) + (next_n, cr_shift, r_const),
+            hint_free=hint_free,
+            pt_smem=pt_smem,
+            pdl=_DECODE_PDL,
+            **pg,
+        )
     )
-    big = num_rows * r_const <= 148
+    big = _big_regime(num_rows, r_const, n_route >> 2)
     aim_base = (
         ((4 * k if k >= 1024 else 2 * k) if r_const == 1 else 2 * k)
         if big
@@ -973,6 +1071,439 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False):
     lc = ("main", fn, pre, tail)
     _VARLEN_CACHE[key] = lc
     return lc
+
+
+# ---- prefill (windowed) launcher cache --------------------------------------
+# Windowed rows (TRT-LLM #18702 port) always run the streaming `main` family
+# with R == 1 (one CTA per row, no SPLIT, no workspace publish). The compiled
+# launcher depends only on the row tier, k and a power-of-two envelope bucket —
+# never on the exact row count or npad — so the cache stays bounded on a
+# long-running server; the per-call envelope (ke clamp) rides in the `n` slot.
+_PREFILL_CACHE: dict = {}
+_PREFILL_ROW_SLAB = 32768  # gridDim.y <= 65535; slab so keys stay bounded
+_PREFILL_TIER_ROWS = (75, 149, 297)  # (rows<=148, 149..296, >296) band reps
+# The tier-0 plan is the BLK=1024 non-split slab, whose compile-time pair-sample
+# gate is n > 16384, so under an envelope <= 16384 every row runs the unsampled
+# path. The tier-1 BLK=512 plan samples above its own gate (4096 for k <= 1024,
+# 8192 for k > 1024); <= 148-row launches take it when the envelope is above
+# that gate by a margin (just above the gate the freshly sampling BLK=512 plan
+# is slower than the unsampled BLK=1024 plan for b >= 32) and at most 16384
+# (above that the BLK=1024 plan samples too and is the better slab). Upstream
+# TRT-LLM refinement of #18702.
+_PREFILL_T1_MARGIN = 256
+_PREFILL_T1_MAX = 16384
+
+
+def _prefill_scpb_tier1(k: int) -> int:
+    return 8192 if k > 1024 else 4096
+
+
+def _prefill_tier(rows: int, n_env: int, k: int) -> int:
+    tier = 0 if rows <= 148 else 1 if rows <= 296 else 2
+    if tier == 0 and _prefill_scpb_tier1(k) + _PREFILL_T1_MARGIN < n_env <= _PREFILL_T1_MAX:
+        tier = 1
+    return tier
+
+
+def _prefill_bucket(n_env: int) -> int:
+    # pow2-quantize the envelope so a growing envelope reuses one plan; cap at
+    # 32768 because U=8 for every n>=32768 on the tier-0 arm.
+    return min(1 << max(int(n_env) - 1, 1).bit_length(), 32768)
+
+
+# ---- family routing for windowed rows ---------------------------------------
+# The window engines exist for two families: the register-resident `reg`
+# kernels (BLK=512, VPT in {1,2,4}: the row is read once into registers) and
+# the streaming `main` slab. The register rungs need the whole scan extent
+# (max window length + up to 3 lead lanes) to fit their capacity, so they are
+# only reachable when the caller's ``max_seq_len`` bounds the windows; without
+# it every launch takes the slab. A row that violates the bound on a register
+# rung is reported as all -1 (never a truncated ranking). Table and numbers:
+# _prefill_reg_route.
+_PREFILL_REG_MAX_N4 = 2048  # register capacity ceiling: 512 threads x VPT 4 float4
+
+
+def _reg_plan(blk: int, vpt: int, minb: int, n: int, k: int, b: int) -> dict:
+    """Register-family plan for the non-``wide`` band (b > sms): mirror of
+    route()'s register-band constants (CMP / QC / CURE / DEGE / NBSEL) for an
+    explicit (BLK, VPT, MINB) rung — the windowed router picks rungs the decode
+    router does not (occupancy variants), so it cannot go through route()."""
+    sms = _sm_count()
+    wide = b <= sms
+    cmp_ = n if n < 2560 else 2560
+    qc = 1024 if b > sms else QUADC
+    cure = not (n < 2 * k and b > sms)
+    dege = (n <= 3 * k) or (n <= 4 * k + 64)
+    if dege and cmp_ < n:
+        cmp_ = n
+    n4 = n >> 2
+    nbsel = (2 * NB) if (n4 > 512 and not (n4 <= 2048 and not wide)) else NB
+    if dege:
+        tpl = (blk, vpt, minb, 1, cure, True, False, nbsel)
+    else:
+        kpt = 1 if k <= blk else (2 if k <= 2 * blk else 4)
+        tpl = (blk, vpt, minb, kpt, cure, False, False, nbsel)
+    return {
+        "kernel": "reg",
+        "tpl": tpl,
+        "rt": {"n": n, "npad": n, "k": k, "CMP": cmp_, "IMGOFF": nbsel, "QC": qc},
+        "smem": (nbsel + 2 * cmp_) * 4,
+    }
+
+
+def _prefill_reg_route(rows: int, k: int, n_hint: int) -> dict | None:
+    """Register rung (BLK=512, VPT, MINB) for windowed rows whose scan extent
+    ``n_hint + 3`` (lead lanes) fits its capacity, or None for the slab.
+
+    Per-part table from the causal-staircase sweep (rows 2K-32K, K in {512,
+    2048}, window bounds filling each class; logs prefill_reg_sweep, same node
+    vs sglang topk_v2, 3 interleaved reps, min; B200 and B300 agree within
+    3%, Rubin differs):
+      * L <= 2048: B200/B300 VPT=1/MINB=4 (K <= 1024) or VPT=2/MINB=4 (K =
+        2048), 1.6-2.0x the slab at every row count. Rubin: VPT=1/MINB=4 only
+        while the launch is small (K <= 1024: <= 16K rows; K = 2048: <= 4K
+        rows) — above that Rubin's slab is as fast or faster (up to 1.4x).
+      * L <= 4096: B200/B300 VPT=2/MINB=4 (the decode rung), 1.6-1.7x the
+        slab. Rubin: VPT=2/MINB=2 — the MINB=4 rung is register-starved there
+        (1.4-2x slower than the slab) while MINB=2 is 1.4x faster; bounds
+        <= 2560 (one empty float4 per thread) keep the small-launch gate of
+        the class below (6-40% behind the slab at 8K-32K rows otherwise).
+      * L <= 8192: K = 2048 -> VPT=4/MINB=2 (5-8% ahead of the slab on every
+        part); K <= 1024 -> slab (the register rungs lose 10-25%).
+      * above: slab (streaming main).
+    Occupancy variants of the same rung (MINB 1/2/4, BLK 1024) were measured
+    and lose everywhere else."""
+    # Capacity: the register batch holds BLK*VPT float4 = cap elements and the
+    # kernel's scalar tail lane covers up to 3 more (ntail = n - 4*n4 < 4), so a
+    # rung ranks scan extents nv + lead <= cap + 3 exactly, i.e. any window
+    # bound <= cap (the <= 3 lead lanes ride in the tail). Classes are keyed on
+    # the bound itself so 2048 / 4096 / 8192-token prompts keep their rung.
+    n_hint = int(n_hint)
+    if n_hint > _PREFILL_REG_MAX_N4 * 4 or n_hint <= k:
+        return None
+    rows = int(rows)
+    rubin = "107" in _arch_token()
+    # Rubin's slab is the faster engine for short windows at high row counts
+    # (K <= 1024: above 16K rows; K = 2048: above 4K rows). That gate covers
+    # the VPT=1 class and the low half of the VPT=2 class (a 2049-2560 bound
+    # lands on VPT=2 with one empty float4 per thread: measured 6-40% behind
+    # the slab at 8K-32K rows on Rubin, ahead of it below).
+    rubin_short_gate = rubin and ((k <= 1024 and rows > 16384) or (k > 1024 and rows > 4096))
+    if n_hint <= 2048:
+        if rubin:
+            if rubin_short_gate:
+                return None
+            rung = (512, 1, 4)
+        else:
+            rung = (512, 2, 4) if k == 2048 else (512, 1, 4)
+    elif n_hint <= 4096:
+        if rubin:
+            if rubin_short_gate and n_hint <= 2560:
+                return None
+            rung = (512, 2, 2)
+        else:
+            rung = (512, 2, 4)
+    else:
+        if k != 2048:
+            return None
+        rung = (512, 4, 2)
+    blk, vpt, minb = rung
+    assert blk * vpt * 4 >= n_hint
+    return _reg_plan(blk, vpt, minb, blk * vpt * 4, k, rows)
+
+
+_PREFILL_CLASS_BOUNDS = (2048, 4096, 8192)  # register capacity classes (VPT 1 / 2 / 4)
+# Unhinted windowed calls (no max_seq_len) run the slab for every row. A
+# per-row split across two launches (register rung + slab, each skipping the
+# other's rows) was measured and rejected: the slab launch that only skips
+# still schedules one CTA per row at its 1-2 CTA/SM smem occupancy (~35 us per
+# 32K rows on B200), and without the bound the register launch must take the
+# largest class, which is the wrong kernel for short windows (VPT=4 on 2K
+# windows: slower than the slab itself at K = 2048). The bound is host
+# knowledge in every serving framework, so the API asks for it.
+
+
+def _prefill_cache_key(fam: str, tier_or_tpl, k: int, n_bucket: int, abs_out: bool = False):
+    # main: tiers 1/2 fix U, so the bucket does not change their engine —
+    # collapse it to one key so warmup covers them with a single launch.
+    # reg: the compile tuple + envelope constants identify the launcher.
+    if fam == "main":
+        tier = tier_or_tpl
+        return (
+            "main",
+            tier,
+            k,
+            n_bucket if tier == 0 else 0,
+            bool(abs_out),
+            _arch_token(),
+            _sm_count(),
+        )
+    return ("reg", tier_or_tpl, k, bool(abs_out), _arch_token(), _sm_count())
+
+
+def _prefill_reg_launcher(plan: dict, k: int, abs_out: bool = False) -> tuple:
+    """Windowed register-family launcher for a route() plan (hint-free varlen
+    compile with the prefill flag). ABI: ``fn(logits, row_starts, kv_lens=window
+    lengths, out, n_clamp, CMP, QC, smem)``."""
+    rt = plan["rt"]
+    tpl = tuple(plan["tpl"])
+    key = _prefill_cache_key("reg", (tpl, rt["CMP"], rt["QC"], plan["smem"]), k, 0, abs_out)
+    hit = _PREFILL_CACHE.get(key)
+    if hit is not None:
+        return hit
+    dev = _device()
+    fn = _gate_first_call(
+        dev.get_compiled__reg(
+            tpl,
+            varlen=True,
+            next_n=1,
+            cr_shift=0,
+            hint_free=True,
+            prefill=True,
+            prefill_abs=abs_out,
+            stage_out=False,  # prefill slabs are many waves deep: direct emit
+        )
+    )
+    lc = ("reg", fn, (rt["CMP"], rt["QC"], dev.STATIC_BYTES + plan["smem"]))
+    _PREFILL_CACHE[key] = lc
+    return lc
+
+
+def _prefill_get(
+    rows: int, k: int, n_hint: int, n_bucket: int, compile_ok: bool, abs_out: bool = False
+) -> tuple:
+    """Launcher for one row slab: register rung when the window bound admits
+    it, else the slab tier. ``compile_ok=False`` (capture) returns None on a
+    cache miss instead of compiling."""
+    plan = _prefill_reg_route(rows, k, n_hint)
+    if plan is not None:
+        key = _prefill_cache_key(
+            "reg",
+            (tuple(plan["tpl"]), plan["rt"]["CMP"], plan["rt"]["QC"], plan["smem"]),
+            k,
+            0,
+            abs_out,
+        )
+        lc = _PREFILL_CACHE.get(key)
+        if lc is None and compile_ok:
+            lc = _prefill_reg_launcher(plan, k, abs_out)
+        return lc
+    tier = _prefill_tier(rows, n_hint, k)
+    lc = _PREFILL_CACHE.get(_prefill_cache_key("main", tier, k, n_bucket, abs_out))
+    if lc is None and compile_ok:
+        lc = _prefill_launcher(tier, k, n_bucket, abs_out)
+    return lc
+
+
+def _prefill_launcher(tier: int, k: int, n_bucket: int, abs_out: bool = False) -> tuple:
+    """Windowed slab plan + compiled launcher: ``_varlen_launcher``'s main branch
+    with r_const=1, split=False, hint_free=True and the prefill compile flag.
+    SCAP_/CMP_ are envelope upper bounds; the `n` slot is filled per call."""
+    key = _prefill_cache_key("main", tier, k, n_bucket, abs_out)
+    hit = _PREFILL_CACHE.get(key)
+    if hit is not None:
+        return hit
+    b_route = _PREFILL_TIER_ROWS[tier]
+    n_route = max(n_bucket, k + 1)
+    plan = route_streaming(b_route, n_route, n_route, k, force_main=True)
+    if plan["kernel"] != "main":
+        raise RuntimeError(f"prefill route did not land on gvr_main: {plan['kernel']}")
+    rt = plan["rt"]
+    if rt["R"] != 1:
+        raise RuntimeError(f"prefill requires R==1 (got {rt['R']})")
+    tpl = tuple(plan["tpl"])
+    dev = _device()
+    fn = _gate_first_call(
+        dev.get_compiled(
+            tpl[:6] + (False,) + (1, 0, 1), hint_free=True, prefill=True, prefill_abs=abs_out
+        )
+    )
+    big = tier == 0
+    # r_const==1 branch of the _varlen_launcher tuning scalars
+    aim_base = (
+        (4 * k if k >= 1024 else 2 * k) if big else ((11 * k) // 8 if k >= 1024 else (3 * k) // 2)
+    )
+    sfac = 64 if k >= 1024 else 32
+    amin = (7 * k) // 2
+    sd_en = 1 if (k > 1024 and not big) else 0
+    tail = (aim_base, sfac, amin, sd_en, 0)  # tsh_en=0 (split=False)
+    lc = ("main", fn, (rt["SCAP_"], rt["CMP_"]), tail)
+    _PREFILL_CACHE[key] = lc
+    return lc
+
+
+def _launch_prefill(
+    lg, row_starts, kv_lens, idx, ws, k, n_clamp, n_hint, npad, hinted, abs_out=False
+) -> None:
+    """Launch the windowed engine over ``lg`` in row slabs. ABI (main varlen):
+    ``fn(logits, pre_idx_slot=row_starts, out, ws, n, npad, k, SCAP_, CMP_, R,
+    dead x5, kv_lens_slot=window lengths, tuning tail)``; the prefill compile
+    reads ks from the pre_idx slot and the window length from the kv_lens slot
+    and clamps ke to ``n_clamp`` (the logits width) in the ``n`` slot.
+    ``n_hint`` (max window length, capture-stable) only selects the plan tier
+    and envelope bucket — a tuning hint, never a bound the kernel trusts.
+    ``abs_out`` selects the compiled variants that emit absolute logits
+    columns (window-local + row start) instead of window-local indices."""
+    num_rows = lg.shape[0]
+    n_hint = min(max(int(n_hint), 1), int(n_clamp))
+    n_bucket = _prefill_bucket(n_hint)
+    capture = _is_capturing()
+    for r0 in range(0, num_rows, _PREFILL_ROW_SLAB):
+        r1 = min(r0 + _PREFILL_ROW_SLAB, num_rows)
+        rows = r1 - r0
+        if hinted:
+            # the caller's window-length bound picks ONE engine for the slab:
+            # a register rung whose capacity covers bound + 3 lead lanes, else
+            # the streaming main tier
+            lc = _prefill_get(rows, k, n_hint, n_bucket, compile_ok=not capture, abs_out=abs_out)
+        else:
+            # unhinted: window lengths are device data -> streaming main for
+            # every row (see the note at _PREFILL_CLASS_BOUNDS)
+            tier = _prefill_tier(rows, n_hint, k)
+            lc = _PREFILL_CACHE.get(_prefill_cache_key("main", tier, k, n_bucket, abs_out))
+            if lc is None and not capture:
+                lc = _prefill_launcher(tier, k, n_bucket, abs_out)
+        if lc is None:
+            raise RuntimeError(
+                "prefill launcher not compiled for this shape — warm up "
+                "(warmup_prefill or one eager windowed call) before CUDA graph capture"
+            )
+        if lc[0] == "reg":
+            # register rung ABI: (logits, row_starts, window lengths, out, n_clamp, CMP, QC, smem)
+            lc[1](lg[r0:r1], row_starts[r0:r1], kv_lens[r0:r1], idx[r0:r1], n_clamp, *lc[2])
+            continue
+        _, fn, (scap, cmp_), tail = lc
+        pre = (n_clamp, npad, k, scap, cmp_, 1, 0, 0, 0, 0, 0)
+        fn(lg[r0:r1], row_starts[r0:r1], idx[r0:r1], ws, *pre, kv_lens[r0:r1], *tail)
+
+
+_PREFILL_WARMUP_DONE: set = set()
+_PREFILL_WARMUP_LOCK = threading.Lock()
+
+
+def warmup_prefill(
+    top_k: int,
+    max_cols: int,
+    num_rows_list: Sequence[int] = (1, 149, 297),
+    row_stride: int | None = None,
+    absolute_indices: bool = False,
+) -> None:
+    """Compile the windowed (prefill) engine set before serving (<= 6 per k):
+    the tier-0 arm walks the pow2 envelope buckets up to 32768, tiers 1/2 need
+    one launch each. ``max_cols`` is the compressed max column count (the
+    logits width the serving producer emits); idempotent per done-key. Also
+    creates the calling stream's default workspace slab (the windowed engine
+    is the streaming ``main`` family). TRT-LLM #18702 ``warmup_prefill`` mirror.
+    ``absolute_indices`` warms the absolute-column output variants (a
+    distinct compiled set); call once per output frame the server uses."""
+    dev = torch.cuda.current_device()
+    k = int(top_k)
+    max_cols = int(max_cols)
+    lo = _prefill_bucket(k + 1)
+    hi = _prefill_bucket(max_cols)
+    buckets = []
+    b = lo
+    while b <= hi:
+        buckets.append(b)
+        b <<= 1
+    if not buckets:
+        buckets = [hi]
+    # (rows, max window hint) representatives: every bucket at both edges (the
+    # slab tier and the register rung both depend on the hint inside a bucket:
+    # tier-0 -> tier-1 promotion, VPT 1/2/4 capacity steps at 2045/4093/8189)
+    reps = {}
+    for rows in num_rows_list:
+        for bk in buckets:
+            hints = {max(bk // 2 + 1, k + 1), bk}
+            for cap in (2048, 4096, 8192):  # register capacity classes (bound <= cap)
+                if bk // 2 < cap <= bk:
+                    hints.add(cap)
+                    hints.add(min(cap + 1, bk))
+            for n_h in sorted(hints):
+                plan = _prefill_reg_route(int(rows), k, n_h)
+                if plan is not None:
+                    key = _prefill_cache_key(
+                        "reg",
+                        (tuple(plan["tpl"]), plan["rt"]["CMP"], plan["rt"]["QC"], plan["smem"]),
+                        k,
+                        0,
+                        absolute_indices,
+                    )
+                else:
+                    key = _prefill_cache_key(
+                        "main", _prefill_tier(int(rows), n_h, k), k, bk, absolute_indices
+                    )
+                reps.setdefault(key, (int(rows), n_h, True))
+            # an unhinted call (max_seq_len=None) of a width in this bucket takes
+            # the slab tier whatever the register table admits: warm it too
+            for n_h in (max(bk // 2 + 1, k + 1), bk):  # both sides of the tier promotion
+                key = _prefill_cache_key(
+                    "main", _prefill_tier(int(rows), n_h, k), k, bk, absolute_indices
+                )
+                reps.setdefault(key, (int(rows), n_h, False))
+    done_key = (
+        dev,
+        k,
+        max_cols,
+        tuple(sorted(int(r) for r in num_rows_list)),
+        row_stride,
+        bool(absolute_indices),
+    )
+    with _PREFILL_WARMUP_LOCK:
+        if done_key in _PREFILL_WARMUP_DONE:
+            return
+    for rows, n_h, hinted in reps.values():
+        rows = _PREFILL_TIER_ROWS[_prefill_tier(rows, n_h, k)] if rows > 297 else rows
+        n_w = (n_h + 3) // 4 * 4  # launch width: a 1-row view keys npad on shape[1]
+        stride = row_stride if row_stride is not None else ((n_w + 256 + 255) // 256 * 256)
+        if stride < n_w or stride % 4:
+            stride = (max(stride, n_w) + 256 + 255) // 256 * 256
+        logits = torch.zeros((rows, stride), dtype=torch.float32, device=dev)
+        ks = torch.zeros((rows,), dtype=_I32, device=dev)
+        lens = torch.full((rows,), n_h, dtype=_I32, device=dev)
+        out = torch.empty((rows, k), dtype=_I32, device=dev)
+        # hinted reps: max_seq_len = the exact hint the serving call will use
+        # (key parity); unhinted reps: the slab tier of the bucket's width
+        run_varlen(
+            logits[:, :n_w],
+            None,
+            lens,
+            out,
+            top_k=k,
+            row_starts=ks,
+            max_seq_len=n_h if hinted else None,
+            absolute_indices=absolute_indices,
+        )
+        del logits, ks, lens, out
+    torch.cuda.synchronize()
+    with _PREFILL_WARMUP_LOCK:
+        _PREFILL_WARMUP_DONE.add(done_key)
+
+
+def prefill_ready(
+    num_rows: int, k: int, n_env: int, width: int | None = None, absolute_indices: bool = False
+) -> bool:
+    """True iff a windowed ``run_varlen`` call with this geometry would launch
+    without compiling (the same launcher keys it looks up), so a caller can
+    route around the engine under CUDA graph capture. Unhinted call: pass the
+    logits width as ``n_env`` and leave ``width`` None. Hinted call: ``n_env``
+    is the ``max_seq_len`` bound and ``width`` the logits width."""
+    if num_rows == 0:
+        return True
+    hinted = width is not None
+    width = int(n_env) if width is None else int(width)
+    n_env = min(max(int(n_env), 1), width)
+    n_bucket = _prefill_bucket(n_env)
+    for r0 in range(0, num_rows, _PREFILL_ROW_SLAB):
+        rows = min(r0 + _PREFILL_ROW_SLAB, num_rows) - r0
+        if hinted:
+            if _prefill_get(rows, k, n_env, n_bucket, compile_ok=False, abs_out=absolute_indices) is None:
+                return False
+            continue
+        tier = _prefill_tier(rows, n_env, k)  # unhinted: slab only
+        if _prefill_cache_key("main", tier, k, n_bucket, absolute_indices) not in _PREFILL_CACHE:
+            return False
+    return True
 
 
 def route_bands(
@@ -1278,7 +1809,8 @@ def _build_launcher(b, n, npad, k):
         def fn(lg, pi, o, *a, _raw=raw):
             _raw(lg, pi, _dummy_kv(lg.get_device(), lg.device), o, *a)
 
-        args = (rt["n"], rt["CMP"], rt["QC"], dev.STATIC_BYTES + rd["smem"])
+        # + 4*k: the register kernel stages its k outputs in smem (stage_out default)
+        args = (rt["n"], rt["CMP"], rt["QC"], dev.STATIC_BYTES + rd["smem"] + 4 * k)
         return (fn, args, False)
     if fam == "main":
         dev = _device()
@@ -1527,6 +2059,10 @@ def run_varlen(
     engine: str = "auto",
     workspace: torch.Tensor | None = None,
     top_k: int | None = None,
+    row_starts: torch.Tensor | None = None,
+    absolute_indices: bool = False,
+    page_table: torch.Tensor | None = None,
+    page_size: int = 1,
 ) -> None:
     """Production-contract varlen entry (per-row device kv_lens).
 
@@ -1536,6 +2072,17 @@ def run_varlen(
     hinted call; only the sampling anchor is weaker. When both are given they
     must agree. Hint mode is a warm-up dimension: hinted and hint-free
     launchers are distinct compiled objects (``warmup_varlen`` compiles both).
+
+    WINDOWED / PREFILL (TRT-LLM #18702 port): ``row_starts`` int32 ``[num_rows]``
+    makes row ``r``'s candidates ``logits[r, ks : ks + kv_lens[r])`` with
+    ``ks = row_starts[r]`` (compressed column units) and the output indices
+    LOCAL to the window (``column - ks``; the absolute column with
+    ``absolute_indices=True``), ``-1`` padded, identity for short
+    windows — the DSA prefill indexer contract (packed requests along the
+    column axis, causal per-row windows). Hint-free only, ``next_n == 1`` and
+    ``compress_ratio == 1``; columns outside a window are never read. Runs the
+    dedicated prefill engines of the streaming ``main`` family (one CTA per
+    row); ``warmup_prefill`` compiles them ahead of CUDA-graph capture.
 
     Row semantics (mirror of ``heuristicTopKDecode.cu`` and the in-tree
     ``cute_dsl_gvr_topk_decode`` runner):
@@ -1557,6 +2104,9 @@ def run_varlen(
     constant, e.g. dsa.py's ``indexer_max_seq_len``) the call performs NO
     host reads.  Without ``max_seq_len`` the envelope comes from ONE
     ``kv_lens.max()`` host read (documented sync, refused under capture).
+    With ``row_starts`` (windowed mode) ``max_seq_len`` is the max WINDOW
+    length and only selects the plan tier / envelope bucket; the kernel
+    always clamps windows to the logits width, never to ``max_seq_len``.
     ``engine="reference"`` keeps the b=1 host-loop reference implementation —
     the differential oracle the in-kernel engine is validated against.
 
@@ -1584,6 +2134,7 @@ def run_varlen(
                 engine=engine,
                 workspace=workspace,
                 top_k=top_k,
+                row_starts=row_starts,
             )
     if logits.dtype is not torch.float32:
         raise RuntimeError(
@@ -1633,6 +2184,65 @@ def run_varlen(
                 f"pre_idx must be [batch={batch}, k] REQUEST-level, got {tuple(pre_idx.shape)}"
             )
         k = pre_idx.shape[1]
+    windowed = row_starts is not None
+    if windowed:
+        # prefill scope (upstream #18702): hint-free, one row per request, no
+        # compression shift — kv_lens IS the window length in column units
+        if not hint_free:
+            raise RuntimeError("row_starts (windowed / prefill mode) requires pre_idx=None")
+        if nn != 1 or cr != 1:
+            raise RuntimeError(
+                f"row_starts requires next_n == 1 and compress_ratio == 1, got {nn} / {cr}"
+            )
+        if not (isinstance(row_starts, _TENSOR) and row_starts.is_cuda):
+            raise RuntimeError("row_starts must be a CUDA tensor")
+        if row_starts.dtype is not _I32:
+            raise RuntimeError("row_starts must be int32")
+        if row_starts.dim() != 1 or row_starts.shape[0] != num_rows:
+            raise RuntimeError(
+                f"row_starts must be 1-D of length num_rows={num_rows}, "
+                f"got {tuple(row_starts.shape)}"
+            )
+        if not row_starts.is_contiguous():
+            raise RuntimeError("row_starts must be contiguous")
+    elif absolute_indices:
+        raise RuntimeError("absolute_indices requires row_starts (windowed / prefill mode)")
+    paged = page_table is not None
+    page_shift = None
+    if paged:
+        # PAGED output (decode): every selected column c of request q leaves the
+        # kernel as page_table[q, c // page_size] * page_size + c % page_size, the
+        # physical KV slot the sparse-attention kernel reads (the SGLang
+        # DSA decode contract). Hint-free only (the page table rides in the
+        # pre_idx ABI slot), no windows, no values (the raw indices are gone).
+        if windowed:
+            raise RuntimeError("page_table is a decode-mode option (no row_starts)")
+        if not hint_free:
+            raise RuntimeError("page_table requires pre_idx=None (hint-free engines)")
+        if values is not None:
+            raise RuntimeError("page_table cannot be combined with values (raw indices are not kept)")
+        ps = _index(page_size)
+        if ps < 1 or ps > (1 << 30) or ps & (ps - 1):
+            raise RuntimeError(f"page_size must be a power of two in [1, 2**30], got {page_size}")
+        page_shift = ps.bit_length() - 1
+        if not (isinstance(page_table, _TENSOR) and page_table.is_cuda):
+            raise RuntimeError("page_table must be a CUDA tensor")
+        if page_table.dtype is not _I32:
+            raise RuntimeError("page_table must be int32")
+        if page_table.dim() != 2 or page_table.shape[0] != batch:
+            raise RuntimeError(
+                f"page_table must be [batch={batch}, max_pages] (one row per request), "
+                f"got {tuple(page_table.shape)}"
+            )
+        if not page_table.is_contiguous():
+            raise RuntimeError("page_table must be contiguous")
+        # every column the kernels can emit (< min(envelope, width)) needs a page
+        need_pages = (min(_index(max_seq_len) // cr if max_seq_len is not None else logits.shape[1], logits.shape[1]) + ps - 1) // ps
+        if page_table.shape[1] < need_pages:
+            raise RuntimeError(
+                f"page_table has {page_table.shape[1]} pages per request; the logits width "
+                f"needs {need_pages} at page_size={ps}"
+            )
     d = logits.get_device()
     if not 0 <= d < _GVR_MAX_DEV:
         raise RuntimeError(f"device index out of range: {d}")
@@ -1719,7 +2329,11 @@ def run_varlen(
                     f"got {tuple(values.shape)}"
                 )
         cshift = 0 if cr == 1 else 2
-        if max_seq_len is not None:
+        if windowed and max_seq_len is None:
+            # unhinted windowed call: the envelope is the logits width (no
+            # host read of device data); the rows are routed per row below
+            n_env = npad
+        elif max_seq_len is not None:
             n_env = int(max_seq_len) >> cshift
         else:
             if _is_capturing():
@@ -1734,7 +2348,44 @@ def run_varlen(
             # R increment (bounded plans, bounded _VARLEN_CACHE)
             n_env = 1 << max(n_env - 1, 1).bit_length()
         n_env = min(max(n_env, 1), npad)
-        key = (num_rows, npad, k, n_env, nn, cr, hint_free, _arch_token(), _sm_count())
+        if windowed:
+            idx = indices
+            if idx.shape[1] != k:
+                idx = idx.reshape(-1)[: num_rows * k].view(num_rows, k)
+            vals = values
+            if vals is not None and vals.shape[1] != k:
+                vals = vals.reshape(-1)[: num_rows * k].view(num_rows, k)
+            if ws is None:
+                ws = _ws_hot.get(_ws_key(d))
+                if ws is None:
+                    ws = default_workspace(logits)  # raises under capture
+            # the kernel clamps every window to the logits WIDTH (memory
+            # safety; a caller's max_seq_len must never truncate a window);
+            # max_seq_len, if given, is the max window length used only to
+            # pick the plan tier / envelope bucket
+            _launch_prefill(
+                lg,
+                row_starts,
+                kv_lens,
+                idx,
+                ws,
+                k,
+                min(logits.shape[1], npad),
+                n_env,
+                npad,
+                hinted=max_seq_len is not None,
+                abs_out=bool(absolute_indices),
+            )
+            if vals is not None:
+                # absolute columns for the gather (window-local + row start
+                # unless the kernel already emitted absolute columns)
+                idx64 = idx.to(torch.int64)
+                if not absolute_indices:
+                    idx64 = idx64 + row_starts.to(torch.int64).unsqueeze(1)
+                vals.copy_(lg.gather(1, idx64.clamp_min(0).clamp_max(npad - 1)))
+                vals.masked_fill_(idx < 0, torch.finfo(_F32).min)
+            return
+        key = (num_rows, npad, k, n_env, nn, cr, hint_free, page_shift, _arch_token(), _sm_count())
         lc = _VARLEN_CACHE.get(key)
         if lc is None:
             if _is_capturing():
@@ -1742,7 +2393,7 @@ def run_varlen(
                     "varlen launcher not compiled for this shape — warm up "
                     "before CUDA graph capture"
                 )
-            lc = _varlen_launcher(num_rows, npad, k, n_env, nn, cr, hint_free)
+            lc = _varlen_launcher(num_rows, npad, k, n_env, nn, cr, hint_free, page_shift)
         idx = indices
         if idx.shape[1] != k:
             idx = idx.reshape(-1)[: num_rows * k].view(num_rows, k)
@@ -1750,8 +2401,9 @@ def run_varlen(
         if vals is not None and vals.shape[1] != k:
             vals = vals.reshape(-1)[: num_rows * k].view(num_rows, k)
         # hint-free engines never read the pre_idx ABI slot: pass the output
-        # buffer (int32, 16-byte aligned) to satisfy the compiled fake
-        pre_arg = idx if hint_free else pre_idx
+        # buffer (int32, 16-byte aligned) to satisfy the compiled fake; the
+        # paged engines read the page table from that slot instead
+        pre_arg = page_table if paged else (idx if hint_free else pre_idx)
         if lc[0] == "reg_clus":
             # compiled ABI: (logits, pre_idx, kv_lens, out, n_envelope)
             lc[1](lg, pre_arg, kv_lens, idx, lc[2])
@@ -1804,6 +2456,7 @@ def run_varlen(
     if vals is not None and vals.shape[1] != k:
         vals = vals.reshape(-1)[: num_rows * k].view(num_rows, k)
     kl = kv_lens.tolist()  # the ONE documented D2H sync of this engine
+    ksl = row_starts.tolist() if windowed else None
     if ws is None:
         ws = default_workspace(logits)
     for r in range(num_rows):
@@ -1812,14 +2465,35 @@ def run_varlen(
         # contract the in-kernel engine implements
         actual = max(kl[r // nn] - nn + (r % nn) + 1, 0)
         req = r // nn
+        row_logits = logits[r : r + 1]
+        if windowed:
+            # window [ks, ks + len) clamped to the row: copy it to a fresh
+            # 16-byte-aligned buffer (ks need not be a multiple of 4) so the
+            # batch-uniform kernel sees a plain row; indices come out local
+            ks = max(min(ksl[r], logits.shape[1]), 0)
+            actual = max(min(actual, logits.shape[1] - ks), 0)
+            wlen = max((actual + 3) // 4 * 4, 4)
+            row_logits = torch.full(
+                (1, wlen), float("-inf"), dtype=_F32, device=logits.device
+            )
+            row_logits[0, :actual] = logits[r, ks : ks + actual]
         _run_impl(
-            logits[r : r + 1],
+            row_logits,
             pre_idx[req : req + 1],
             actual // cr,
             idx[r : r + 1],
             ws,
             None if vals is None else vals[r : r + 1],
         )
+        if windowed and absolute_indices:
+            # reference frame is window-local: shift the hits (not the pad)
+            rr = idx[r]
+            idx[r] = torch.where(rr >= 0, rr + ks, rr)
+        if paged:
+            rr = idx[r].to(torch.int64)
+            pt = page_table[req].to(torch.int64)
+            phys = (pt[(rr >> page_shift).clamp_min(0)] << page_shift) | (rr & ((1 << page_shift) - 1))
+            idx[r] = torch.where(rr >= 0, phys, rr).to(_I32)
 
 
 __all__ = [
@@ -1857,6 +2531,7 @@ def warmup_varlen(
     next_n: int = 1,
     num_rows_list: Sequence[int] = (1,),
     row_stride: int | None = None,
+    page_size: int | None = None,
 ) -> None:
     """TESTING/INIT ONLY — compile the varlen engine's envelope tuples.
 
@@ -1873,7 +2548,17 @@ def warmup_varlen(
     producer layout (e.g. the DSL paged-MQA arena's 256-element rounding)
     must pass it; the 64-element default only matches producers that round
     the same way.
+
+    ``page_size`` additionally compiles the PAGED hint-free engines and
+    launchers for that page size (``run_varlen(page_table=..., page_size=)``
+    is a distinct compiled set per page size).
     """
+    page_shift = None
+    if page_size is not None:
+        ps = int(page_size)
+        if ps < 1 or ps > (1 << 30) or ps & (ps - 1):
+            raise RuntimeError(f"page_size must be a power of two in [1, 2**30], got {page_size}")
+        page_shift = ps.bit_length() - 1
     dev = torch.cuda.current_device()
     nn = max(1, int(next_n))
     # round each request down to a next_n multiple (min next_n) and dedup
@@ -1928,7 +2613,16 @@ def warmup_varlen(
             raise RuntimeError(
                 f"row_stride must be a float4-multiple >= n_env={n_env}, got {row_stride}"
             )
-    key = (dev, int(top_k), int(max_seq_len), int(compress_ratio), nn, tuple(rows_list), npad)
+    key = (
+        dev,
+        int(top_k),
+        int(max_seq_len),
+        int(compress_ratio),
+        nn,
+        tuple(rows_list),
+        npad,
+        page_shift,
+    )
     n_env_l = min(max(int(max_seq_len) >> (0 if int(compress_ratio) == 1 else 2), 1), npad)
     with _VARLEN_WARMUP_LOCK:
         bands_done = key in _VARLEN_WARMUP_DONE
@@ -1942,6 +2636,10 @@ def warmup_varlen(
         for r in req_rows:
             for hf in (False, True):
                 _varlen_launcher(r, npad, int(top_k), n_env_l, nn, int(compress_ratio), hf)
+            if page_shift is not None:
+                _varlen_launcher(
+                    r, npad, int(top_k), n_env_l, nn, int(compress_ratio), True, page_shift
+                )
         return
     rows_max = rows_list[-1]
     # one allocation at the largest geometry; smaller row counts run on
@@ -1953,8 +2651,26 @@ def warmup_varlen(
     kv_lens = torch.full((rows_max // nn,), int(max_seq_len), dtype=torch.int32, device=dev)
     pre_idx = torch.zeros((rows_max // nn, int(top_k)), dtype=torch.int32, device=dev)
     out = torch.empty((rows_max, int(top_k)), dtype=torch.int32, device=dev)
+    page_tab = None
+    if page_shift is not None:
+        page_tab = torch.zeros(
+            (rows_max // nn, (npad + (1 << page_shift) - 1) >> page_shift), dtype=torch.int32, device=dev
+        )
     for rows in rows_list:
         batch = rows // nn
+        if page_tab is not None:
+            run_varlen(
+                logits[:rows],
+                None,
+                kv_lens[:batch],
+                out[:rows],
+                next_n=nn,
+                compress_ratio=int(compress_ratio),
+                max_seq_len=int(max_seq_len),
+                top_k=int(top_k),
+                page_table=page_tab[:batch],
+                page_size=1 << page_shift,
+            )
         for hint in (pre_idx[:batch], None):
             run_varlen(
                 logits[:rows],
@@ -1966,7 +2682,7 @@ def warmup_varlen(
                 max_seq_len=int(max_seq_len),
                 top_k=int(top_k),
             )
-    del logits, kv_lens, pre_idx, out
+    del logits, kv_lens, pre_idx, out, page_tab
     torch.cuda.synchronize()
     # band launches compiled every ENGINE; now populate the per-row-count
     # LAUNCHER cache entries for the exact requested row counts (pure host
@@ -1975,5 +2691,9 @@ def warmup_varlen(
     for r in req_rows:
         for hf in (False, True):
             _varlen_launcher(r, npad, int(top_k), n_env_l, nn, int(compress_ratio), hf)
+        if page_shift is not None:
+            _varlen_launcher(
+                r, npad, int(top_k), n_env_l, nn, int(compress_ratio), True, page_shift
+            )
     with _VARLEN_WARMUP_LOCK:
         _VARLEN_WARMUP_DONE.add(key)
