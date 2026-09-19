@@ -103,10 +103,7 @@ def _musa_mtp_capture_update(
     c_h = c4.to(fp).repeat_interleave(ratio, dim=-2)
     x_h, dt_h = x4.to(fp), dt4.to(fp)
     if dt_bias is not None:
-        if dt_h.dim() == 4:
-            dt_h = dt_h + dt_bias.to(fp).view(1, 1, nheads, dim)
-        else:
-            dt_h = dt_h + dt_bias.to(fp).view(1, 1, -1)
+        dt_h = dt_h + dt_bias.to(fp).view(1, 1, -1)
     if dt_softplus:
         dt_h = torch.nn.functional.softplus(dt_h)
     if state_batch_indices is None:
@@ -129,10 +126,8 @@ def _musa_mtp_capture_update(
     outputs = []
     for token in range(steps):
         dt_t, x_t = dt_h[:, token], x_h[:, token]
-        if dt_t.dim() == 2:
-            dt_t = dt_t[:, :, None].expand(-1, -1, dim)
-        running = running * torch.exp(a_h[None] * dt_t[:, :, :, None])
-        running = running + (dt_t * x_t)[:, :, :, None] * b_h[:, token, :, None, :]
+        running = running * torch.exp(a_h[None] * dt_t[:, :, None, None])
+        running = running + (dt_t[:, :, None, None] * x_t[:, :, :, None]) * b_h[:, token, :, None, :]
         y = (c_h[:, token, :, None, :] * running).sum(dim=-1)
         if D is not None:
             y = y + D.to(fp).view(1, nheads, dim) * x_t
