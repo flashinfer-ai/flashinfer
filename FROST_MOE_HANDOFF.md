@@ -33,6 +33,26 @@ routing. Weight preparation, router-logit/top-k computation and model execution
 are excluded. The percentages must not be added or compounded. They are not an
 overall attribution percentage or a model-level speedup claim.
 
+A further optional BF16 implementation was researched and validated in this
+effort on trained Qwen3-30B-A3B layer-0 causal-prefill inputs. In a separate
+matched B200 run, it reduced complete-MoE subgraph latency relative to the
+previous published implementation at T64:
+
+| Routing input format | Previous implementation | New optional implementation | Latency reduction |
+|---|---:|---:|---:|
+| Unpacked | 137.054 us | 135.083 us | 1.44% |
+| Packed | 136.978 us | 135.502 us | 1.08% |
+
+Each value averages four trial medians across two fresh measurement processes
+per implementation, in forward and reverse order. Both new-implementation
+processes were faster than both previous-implementation processes for each
+format. T8 did not benefit (0.16–0.25% higher latency), so existing defaults and
+candidate ordering remain unchanged. This is an implementation ablation with
+fixed configurations, not a gain credited to configuration search. It excludes
+weight preparation, router-logit/top-k computation, attention and model execution.
+These measurements have a separate baseline from the synthetic ablations and
+the NVIDIA reference comparisons below; their percentages must not be combined.
+
 ## Reuse and acknowledgements
 
 - NVIDIA Frost/CuTeDSL and FlashInfer supply the kernel and integration foundations.
@@ -56,7 +76,7 @@ overall attribution percentage or a model-level speedup claim.
 API support, correctness repairs, validation and configuration selection are
 valuable engineering work, but are not counted as new optimization discoveries.
 
-## Current matched reference comparisons
+## Matched NVIDIA reference comparisons
 
 Each row is its own matched run; differences between rows are not optimization
 deltas. Preparations are excluded for both paths. B200 reference searches cover
@@ -86,6 +106,12 @@ measurement processes. The trained-Qwen comparison additionally checks direct
 Hugging Face outputs: 10170 raw checks, 7312 changed-reference controls and
 69408 timing spans across the two shapes. Reference comparisons and contribution
 ablations retain their separate source snapshots and evidence records.
+The additional trained-Qwen implementation ablation passed the same full-path
+gates with 1184 raw checks, 480 changed-reference controls and 3072 timing spans.
+Its native validation completed 624 zero-skip test executions across ordinary,
+memcheck and racecheck runs. The publication adapter and kernels match that
+validated executable source; the additional enumeration changes passed 100 CPU
+contract tests. This does not claim a new full-GPU run of the publication checkout.
 
 An existing paired-FC2 accumulation-fidelity failure on strongly cancelling
 BF16 dot products remains unresolved. Original and updated stage-depth versions
