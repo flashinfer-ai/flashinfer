@@ -104,11 +104,14 @@ def _configure_jit_parallelism(workers: int) -> None:
     if automatic:
         host_jobs = int(max_jobs)
         per_worker_jobs = max(1, host_jobs // workers)
+        os.environ.setdefault("FLASHINFER_JIT_PREBUILD_MAX_JOBS", str(host_jobs))
         os.environ["MAX_JOBS"] = str(per_worker_jobs)
         print(
             "JIT PARALLELISM: phase=workers mode=automatic "
             f"host_max_jobs={host_jobs} workers={workers} "
             f"max_jobs_per_worker={per_worker_jobs} "
+            "prebuild_max_jobs="
+            f"{os.environ['FLASHINFER_JIT_PREBUILD_MAX_JOBS']} "
             f"nvcc_threads={nvcc_threads}",
             flush=True,
         )

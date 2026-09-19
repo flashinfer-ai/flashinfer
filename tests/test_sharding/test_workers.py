@@ -13,6 +13,7 @@ import pytest
 from scripts.test_sharding import workers as workers_module
 from scripts.test_sharding.models import Batch, Unit
 from scripts.test_sharding.progress import encode_pytest_event
+from scripts.unit_test_runner import _configure_jit_parallelism
 from scripts.test_sharding.workers import (
     BatchExecutionRequest,
     _BatchProgress,
@@ -224,6 +225,20 @@ def test_worker_master_port_defines_a_valid_block() -> None:
         _worker_master_port(-1)
     with pytest.raises(ValueError, match="no valid rendezvous port block"):
         _worker_master_port(360)
+
+
+def test_automatic_jit_parallelism_preserves_host_budget_for_prebuilds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MAX_JOBS", "163")
+    monkeypatch.setenv("FLASHINFER_AUTO_MAX_JOBS", "1")
+    monkeypatch.delenv("FLASHINFER_JIT_PREBUILD_MAX_JOBS", raising=False)
+
+    _configure_jit_parallelism(workers=4)
+
+    assert os.environ["MAX_JOBS"] == "40"
+    assert os.environ["FLASHINFER_JIT_PREBUILD_MAX_JOBS"] == "163"
+    assert "FLASHINFER_AUTO_MAX_JOBS" not in os.environ
 
 
 def test_host_cpu_percentages_separate_busy_from_iowait() -> None:

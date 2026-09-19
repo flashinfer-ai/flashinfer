@@ -162,6 +162,21 @@ def test_run_ninja_uses_max_jobs(monkeypatch, tmp_path):
     ]
 
 
+def test_run_ninja_explicit_jobs_override_worker_environment(monkeypatch, tmp_path):
+    commands = []
+
+    def fake_run(command, **kwargs):
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setenv("MAX_JOBS", "40")
+    monkeypatch.setattr(cpp_ext.subprocess, "run", fake_run)
+
+    cpp_ext.run_ninja(tmp_path, tmp_path / "build.ninja", verbose=False, max_jobs=163)
+
+    assert commands[0][-2:] == ["-j", "163"]
+
+
 @pytest.fixture
 def jit_spec_nvcc(monkeypatch, tmp_path):
     monkeypatch.setattr(core.jit_env, "FLASHINFER_JIT_DIR", tmp_path / "jit")
@@ -186,6 +201,22 @@ def test_jit_spec_build_rewrites_ninja_before_build(monkeypatch, jit_spec_nvcc):
     spec.build(verbose=False, need_lock=False)
 
     assert writes == [True]
+
+
+def test_build_jit_specs_uses_host_prebuild_budget(monkeypatch, jit_spec_nvcc):
+    calls = []
+    monkeypatch.setenv("MAX_JOBS", "40")
+    monkeypatch.setenv("FLASHINFER_JIT_PREBUILD_MAX_JOBS", "163")
+    monkeypatch.setattr(jit_spec_nvcc, "write_ninja", lambda: None)
+    monkeypatch.setattr(
+        core,
+        "run_ninja",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    core.build_jit_specs([jit_spec_nvcc], skip_prebuilt=False)
+
+    assert calls[0][1]["max_jobs"] == 163
 
 
 @pytest.mark.parametrize("cached", [False, True])
