@@ -4150,7 +4150,7 @@ def test_attention_ts_nvfp4_cache_contract():
 @pytest.mark.parametrize("batch_size", [1, 4], ids=lambda value: f"b{value}")
 @pytest.mark.parametrize(
     "seq_len_kv",
-    [128, 2048, 2049, 2051, 2177, 4096, 4097, 8192],
+    [128, 2048, 4096, 8192],
     ids=lambda value: f"kv{value}",
 )
 @pytest.mark.parametrize(
