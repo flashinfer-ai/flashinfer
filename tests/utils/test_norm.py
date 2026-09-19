@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import math
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -22,6 +24,21 @@ import flashinfer
 from flashinfer.jit import env as jit_env
 from flashinfer.jit.core import gen_jit_spec
 from flashinfer.utils import device_support_pdl
+
+
+def _skip_if_fused_norm_smem_exceeds_limit(hidden_size, dtype, device):
+    # Match FusedAddRMSNorm{,Quant} and GemmaFusedAddRMSNorm in norm.cuh:
+    # one FP32 row plus the warp-reduction scratch space. A 16384-wide row
+    # needs 65664 bytes, exceeding T4's 65536-byte opt-in per-block limit.
+    vec_size = math.gcd(16 // dtype.itemsize, hidden_size)
+    num_warps = (min(1024, hidden_size // vec_size) + 31) // 32
+    required = (hidden_size + ((num_warps + 3) // 4) * 4) * 4
+    limit = torch.cuda.get_device_properties(device).shared_memory_per_block_optin
+    if required > limit:
+        pytest.skip(
+            f"Fused norm requires {required} bytes of shared memory per block, "
+            f"but this device supports {limit}"
+        )
 
 
 def llama_rms_norm(x, w, eps=1e-6):
@@ -255,6 +272,8 @@ def test_qknorm(
 @pytest.mark.parametrize("enable_pdl", [True, False])
 @pytest.mark.parametrize("contiguous", [True, False])
 def test_fused_add_rmsnorm(batch_size, hidden_size, dtype, enable_pdl, contiguous):
+    _skip_if_fused_norm_smem_exceeds_limit(hidden_size, dtype, "cuda")
+
     eps = 1e-6
 
     if contiguous:
@@ -293,6 +312,8 @@ def test_fused_add_rmsnorm(batch_size, hidden_size, dtype, enable_pdl, contiguou
 def test_fused_add_rmsnorm_quant(
     batch_size, hidden_size, dtype, quant_dtype, quant_scale, enable_pdl, contiguous
 ):
+    _skip_if_fused_norm_smem_exceeds_limit(hidden_size, dtype, "cuda")
+
     eps = 1e-6
 
     if contiguous:
@@ -504,6 +525,8 @@ def test_gemma_norm(
 def test_gemma_fused_add_rmsnorm(
     batch_size, hidden_size, dtype, enable_pdl, contiguous
 ):
+    _skip_if_fused_norm_smem_exceeds_limit(hidden_size, dtype, "cuda")
+
     eps = 1e-6
 
     if contiguous:
