@@ -8,8 +8,8 @@
 SCCACHE_VERSION="0.17.0"
 SCCACHE_CUDA_134_REVISION="e9b15a35f7240a7edd1b9644583edb388c6cb5f9"
 SCCACHE_CUDA_134_SOURCE_SHA256="9e444cc5097a839f03c81c59c5cadebc20090aad1fc699e398d5c1c18c44118c"
-# The v0.17 client-side architecture remains opt-in while this change isolates
-# the version upgrade from a separate execution-mode change.
+JIT_CACHE_NVCC_TIMEOUT="90m"
+JIT_CACHE_NVCC_KILL_AFTER="2m"
 
 # Compute MAX_JOBS and FLASHINFER_NVCC_THREADS from system memory/CPU,
 # clamping FLASHINFER_NVCC_THREADS to a sane range and budgeting per-job
@@ -365,12 +365,21 @@ setup_sccache() {
   sccache_arch=$(uname -m)
   install_sccache "${SCCACHE_VERSION}" "${sccache_arch}"
 
+  if ! command -v timeout >/dev/null 2>&1; then
+    echo "GNU timeout is required for bounded JIT-cache nvcc compilation" >&2
+    return 1
+  fi
+
   export SCCACHE_REGION="${SCCACHE_REGION:-us-west-2}"
   export SCCACHE_BASEDIRS="${source_root}${SCCACHE_BASEDIRS:+:${SCCACHE_BASEDIRS}}"
   export SCCACHE_S3_KEY_PREFIX="${key_prefix}"
   export SCCACHE_IDLE_TIMEOUT=0
+  # Run nvcc in the sccache client process so timeout owns the compiler's
+  # process group. Without client-side mode, killing the short-lived client can
+  # leave the sccache daemon's compiler process running.
+  export SCCACHE_CLIENT_SIDE=1
   export FLASHINFER_CXX_LAUNCHER="sccache"
-  export FLASHINFER_NVCC_LAUNCHER="sccache"
+  export FLASHINFER_NVCC_LAUNCHER="timeout --verbose --signal=TERM --kill-after=${JIT_CACHE_NVCC_KILL_AFTER} ${JIT_CACHE_NVCC_TIMEOUT} sccache"
 
   # Avoid leaking AWS credentials under set -x.
   local _sccache_xtrace=0

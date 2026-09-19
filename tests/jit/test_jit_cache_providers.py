@@ -381,6 +381,36 @@ test "${{PIP_BUILD_CONSTRAINT}}" = /tmp/original-build-constraint
     assert trap_marker.is_file()
 
 
+def test_sccache_setup_bounds_nvcc_compilation(tmp_path):
+    common_script = (
+        Path(__file__).resolve().parents[2] / "scripts" / "jit_cache_build_common.sh"
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    for command in ("sccache", "timeout"):
+        executable = fake_bin / command
+        executable.write_text("#!/bin/bash\nexit 0\n")
+        executable.chmod(0o755)
+
+    script = f"""
+set -euo pipefail
+source "{common_script}"
+install_sccache() {{
+  export FLASHINFER_SCCACHE_INSTALL_SOURCE=test
+  export FLASHINFER_SCCACHE_REVISION=test
+}}
+export PATH="{fake_bin}:$PATH"
+export SCCACHE_BUCKET=test-bucket
+setup_sccache test-prefix "{tmp_path}"
+test "${{SCCACHE_CLIENT_SIDE}}" = 1
+test "${{FLASHINFER_CXX_LAUNCHER}}" = sccache
+test "${{FLASHINFER_NVCC_LAUNCHER}}" = \
+  "timeout --verbose --signal=TERM --kill-after=2m 90m sccache"
+"""
+
+    subprocess.run(["bash", "-c", script], check=True)
+
+
 @pytest.mark.parametrize(
     ("binary_target", "device_architecture", "expected"),
     [
