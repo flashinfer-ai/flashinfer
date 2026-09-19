@@ -566,6 +566,13 @@ def moe_a2a_dispatch(
     backend : {"trtllm", "cake"}
         Defaults to ``"trtllm"``. Pass ``"cake"`` to opt in on CC 10.0/10.3;
         must match workspace initialization, combine, and all peer ranks.
+    recv_view_cache : dict, optional
+        Opaque cache of receive views. Pass an empty dictionary to enable
+        caching; ``None`` (default) disables it. The cache retains a reference
+        to ``workspace`` and is cleared when a different workspace tensor is
+        passed. Keep the backing allocation alive and do not change workspace
+        or cached-view shape, strides, or storage in place. Clear the dictionary
+        to release its references; otherwise, leave its contents unchanged.
 
     Returns
     -------
@@ -603,16 +610,21 @@ def moe_a2a_dispatch(
         active_rank_mask,
     )
 
+    # Bind once per dispatch without pointer/device queries in the hot path.
+    if (
+        recv_view_cache is not None
+        and recv_view_cache.get("_workspace") is not workspace
+    ):
+        recv_view_cache.clear()
+        recv_view_cache["_workspace"] = workspace
+
     output_payloads = []
     for input_payload, offset, size in zip(
         input_payloads, recv_offsets, recv_sizes, strict=True
     ):
         # This uses absolute offsets in the workspace, so skip indexing into the workspace
-        # The view depends only on (leading shape, offset, size, dtype), all of which are
-        # constant across calls at a given runtime_max_tokens_per_rank. Rebuilding it costs
-        # four tensor constructions per payload of pure host time on the decode critical
-        # path, so reuse it when the caller supplies a cache. The tensor is a view onto the
-        # persistent workspace, so a reused view still observes the bytes this call writes.
+        # Reuse views to avoid four tensor constructions per payload. Cached views
+        # still observe fresh writes to the workspace bound above.
         key = (ep_size, runtime_max_tokens_per_rank, offset, size, input_payload.dtype)
         payload_view = None if recv_view_cache is None else recv_view_cache.get(key)
         if payload_view is None:
@@ -1179,10 +1191,9 @@ class MoeAlltoAll:
         self.workspace = self._WORKSPACE["workspace"]
         self.metainfo = self._WORKSPACE["metainfo"]
         self._state = _A2AState()
-        # Receive-view cache for dispatch. Owned by the instance because its validity
-        # is tied to self.workspace, which the instance keeps alive; a module-level
-        # cache keyed on a data pointer could alias a freed-and-reallocated workspace.
-        self._recv_view_cache: dict = {}
+        # Keep views across combine calls while retaining the workspace and its
+        # MNNVL allocation through this instance.
+        self._recv_view_cache: dict = {"_workspace": self.workspace}
 
     @property
     def eplb_gathered_stats(self) -> Optional[torch.Tensor]:
