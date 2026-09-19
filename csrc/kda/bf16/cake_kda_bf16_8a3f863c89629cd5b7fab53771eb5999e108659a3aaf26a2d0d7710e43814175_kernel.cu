@@ -2432,6 +2432,24 @@ kernel_cake_kda_bf16_8a3f863c89629cd5b7fab53771eb5999e108659a3aaf26a2d0d7710e438
                     for (int value_idx_1 = 0; value_idx_1 < 8; value_idx_1++) {
                         n_values[value_idx_1] = n_values[value_idx_1] + product[value_idx_1];
                     }
+                    unsigned int low_word_9[1];
+                    unsigned int high_word_10[1];
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 1; _lp++) {
+                        __half2 _h2 = __float22half2_rn(make_float2(n_values[_lp*2 + 0], n_values[_lp*2+1 + 0]));
+                        low_word_9[_lp] = *(uint32_t*)&_h2;
+                    }
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 1; _lp++) {
+                        __half2 _h2 = __float22half2_rn(make_float2(n_values[_lp*2 + 6], n_values[_lp*2+1 + 6]));
+                        high_word_10[_lp] = *(uint32_t*)&_h2;
+                    }
+                    n_frag[0] = 0;
+                    n_frag[1] = 0;
+                    n_frag[2] = 0;
+                    n_frag[3] = 0;
+                    n_frag[0] = low_word_9[0];
+                    n_frag[3] = high_word_10[0];
                     unsigned int binv_frag[4];
                     binv_frag[0] = 0;
                     binv_frag[1] = 0;
@@ -2445,19 +2463,19 @@ kernel_cake_kda_bf16_8a3f863c89629cd5b7fab53771eb5999e108659a3aaf26a2d0d7710e438
                     a21_frag[2] = 0;
                     a21_frag[3] = 0;
                     a21_frag[1] = l_frag[1];
-                    unsigned int rhs_trans_frag_9[4];
+                    unsigned int rhs_trans_frag_11[4];
                     #pragma unroll
                     for (int word_4 = 0; word_4 < 4; word_4++) {
                         asm volatile("movmatrix.sync.aligned.m8n8.trans.b16 %0, %1;\n"
-                            : "=r"(rhs_trans_frag_9[word_4])
+                            : "=r"(rhs_trans_frag_11[word_4])
                             : "r"(a21_frag[word_4]));
                     }
                     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\n"
                         : "=f"(product[0]), "=f"(product[1]), "=f"(product[2]), "=f"(product[3])
-                        : "r"(binv_frag[0]), "r"(binv_frag[1]), "r"(binv_frag[2]), "r"(binv_frag[3]), "r"(rhs_trans_frag_9[0]), "r"(rhs_trans_frag_9[1]), "f"(0.0f), "f"(0.0f), "f"(0.0f), "f"(0.0f));
+                        : "r"(binv_frag[0]), "r"(binv_frag[1]), "r"(binv_frag[2]), "r"(binv_frag[3]), "r"(rhs_trans_frag_11[0]), "r"(rhs_trans_frag_11[1]), "f"(0.0f), "f"(0.0f), "f"(0.0f), "f"(0.0f));
                     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\n"
                         : "=f"(product[4]), "=f"(product[(4) + 1]), "=f"(product[(4) + 2]), "=f"(product[(4) + 3])
-                        : "r"(binv_frag[0]), "r"(binv_frag[1]), "r"(binv_frag[2]), "r"(binv_frag[3]), "r"(rhs_trans_frag_9[2]), "r"(rhs_trans_frag_9[(2) + 1]), "f"(0.0f), "f"(0.0f), "f"(0.0f), "f"(0.0f));
+                        : "r"(binv_frag[0]), "r"(binv_frag[1]), "r"(binv_frag[2]), "r"(binv_frag[3]), "r"(rhs_trans_frag_11[2]), "r"(rhs_trans_frag_11[(2) + 1]), "f"(0.0f), "f"(0.0f), "f"(0.0f), "f"(0.0f));
                     float correction_values[2];
                     correction_values[0] = -product[2];
                     correction_values[1] = -product[3];
@@ -2473,19 +2491,19 @@ kernel_cake_kda_bf16_8a3f863c89629cd5b7fab53771eb5999e108659a3aaf26a2d0d7710e438
                     correction_frag[2] = 0;
                     correction_frag[3] = 0;
                     correction_frag[1] = correction_word[0];
-                    unsigned int rhs_trans_frag_10[4];
+                    unsigned int rhs_trans_frag_12[4];
                     #pragma unroll
                     for (int word_5 = 0; word_5 < 4; word_5++) {
                         asm volatile("movmatrix.sync.aligned.m8n8.trans.b16 %0, %1;\n"
-                            : "=r"(rhs_trans_frag_10[word_5])
+                            : "=r"(rhs_trans_frag_12[word_5])
                             : "r"(binv_frag[word_5]));
                     }
                     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\n"
                         : "=f"(product[0]), "=f"(product[1]), "=f"(product[2]), "=f"(product[3])
-                        : "r"(correction_frag[0]), "r"(correction_frag[1]), "r"(correction_frag[2]), "r"(correction_frag[3]), "r"(rhs_trans_frag_10[0]), "r"(rhs_trans_frag_10[1]), "f"(0.0f), "f"(0.0f), "f"(0.0f), "f"(0.0f));
+                        : "r"(correction_frag[0]), "r"(correction_frag[1]), "r"(correction_frag[2]), "r"(correction_frag[3]), "r"(rhs_trans_frag_12[0]), "r"(rhs_trans_frag_12[1]), "f"(0.0f), "f"(0.0f), "f"(0.0f), "f"(0.0f));
                     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\n"
                         : "=f"(product[4]), "=f"(product[(4) + 1]), "=f"(product[(4) + 2]), "=f"(product[(4) + 3])
-                        : "r"(correction_frag[0]), "r"(correction_frag[1]), "r"(correction_frag[2]), "r"(correction_frag[3]), "r"(rhs_trans_frag_10[2]), "r"(rhs_trans_frag_10[(2) + 1]), "f"(0.0f), "f"(0.0f), "f"(0.0f), "f"(0.0f));
+                        : "r"(correction_frag[0]), "r"(correction_frag[1]), "r"(correction_frag[2]), "r"(correction_frag[3]), "r"(rhs_trans_frag_12[2]), "r"(rhs_trans_frag_12[(2) + 1]), "f"(0.0f), "f"(0.0f), "f"(0.0f), "f"(0.0f));
                     n_values[2] = product[2];
                     n_values[3] = product[3];
                     #pragma unroll
@@ -2619,9 +2637,9 @@ kernel_cake_kda_bf16_8a3f863c89629cd5b7fab53771eb5999e108659a3aaf26a2d0d7710e438
                     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
                         : "+f"(acc[4]), "+f"(acc[(4) + 1]), "+f"(acc[(4) + 2]), "+f"(acc[(4) + 3])
                         : "r"(a_frag[0]), "r"(a_frag[1]), "r"(a_frag[2]), "r"(a_frag[3]), "r"(b_frag[2]), "r"(b_frag[(2) + 1]));
-                    int row0_11 = lane / 4;
-                    int row1_12 = row0_11 + 8;
-                    int col0_13 = lane % 4 * 2;
+                    int row0_13 = lane / 4;
+                    int row1_14 = row0_13 + 8;
+                    int col0_15 = lane % 4 * 2;
                     float mqk[8];
                     mqk[0] = 0.0f;
                     mqk[1] = 0.0f;
@@ -2631,28 +2649,28 @@ kernel_cake_kda_bf16_8a3f863c89629cd5b7fab53771eb5999e108659a3aaf26a2d0d7710e438
                     mqk[5] = 0.0f;
                     mqk[6] = 0.0f;
                     mqk[7] = 0.0f;
-                    if (row0_11 >= col0_13) {
+                    if (row0_13 >= col0_15) {
                         mqk[0] = acc[0];
                     }
-                    if (row0_11 >= col0_13 + 1) {
+                    if (row0_13 >= col0_15 + 1) {
                         mqk[1] = acc[1];
                     }
-                    if (row1_12 >= col0_13) {
+                    if (row1_14 >= col0_15) {
                         mqk[2] = acc[2];
                     }
-                    if (row1_12 >= col0_13 + 1) {
+                    if (row1_14 >= col0_15 + 1) {
                         mqk[3] = acc[3];
                     }
-                    if (row0_11 >= col0_13 + 8) {
+                    if (row0_13 >= col0_15 + 8) {
                         mqk[4] = acc[4];
                     }
-                    if (row0_11 >= col0_13 + 9) {
+                    if (row0_13 >= col0_15 + 9) {
                         mqk[5] = acc[5];
                     }
-                    if (row1_12 >= col0_13 + 8) {
+                    if (row1_14 >= col0_15 + 8) {
                         mqk[6] = acc[6];
                     }
-                    if (row1_12 >= col0_13 + 9) {
+                    if (row1_14 >= col0_15 + 9) {
                         mqk[7] = acc[7];
                     }
                     unsigned int mqk_packed[4];
@@ -2675,9 +2693,9 @@ kernel_cake_kda_bf16_8a3f863c89629cd5b7fab53771eb5999e108659a3aaf26a2d0d7710e438
                     mbarrier_arrive(aux_pairwise_consumed_addr + (aux_stage) * 8);
                     int lane_row = lane % 16;
                     int lane_col = lane / 16 * 8;
-                    int byte_off_14 = (int)aux_stage * 5120 + lane_row * 128 + lane_col * 2;
-                    int swizzled_off_15 = byte_off_14 ^ (byte_off_14 >> 7 & 7) << 4;
-                    int inv16_addr = smem_inv_work_addr + (unsigned int)swizzled_off_15;
+                    int byte_off_16 = (int)aux_stage * 5120 + lane_row * 128 + lane_col * 2;
+                    int swizzled_off_17 = byte_off_16 ^ (byte_off_16 >> 7 & 7) << 4;
+                    int inv16_addr = smem_inv_work_addr + (unsigned int)swizzled_off_17;
                     unsigned int inv16_frag[4];
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                         : "=r"(inv16_frag[0]), "=r"(inv16_frag[1]), "=r"(inv16_frag[2]), "=r"(inv16_frag[3])

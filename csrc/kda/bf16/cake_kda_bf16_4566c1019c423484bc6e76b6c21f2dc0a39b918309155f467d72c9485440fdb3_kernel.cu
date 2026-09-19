@@ -4690,6 +4690,24 @@ kernel_cake_kda_bf16_4566c1019c423484bc6e76b6c21f2dc0a39b918309155f467d72c948544
                             for (int value_idx_6 = 0; value_idx_6 < 8; value_idx_6++) {
                                 n_values[value_idx_6] = n_values[value_idx_6] + product_2[value_idx_6];
                             }
+                            unsigned int low_word_9[1];
+                            unsigned int high_word_10[1];
+                            #pragma unroll
+                            for (int _lp = 0; _lp < 1; _lp++) {
+                                __half2 _h2 = __float22half2_rn(make_float2(n_values[_lp*2 + 0], n_values[_lp*2+1 + 0]));
+                                low_word_9[_lp] = *(uint32_t*)&_h2;
+                            }
+                            #pragma unroll
+                            for (int _lp = 0; _lp < 1; _lp++) {
+                                __half2 _h2 = __float22half2_rn(make_float2(n_values[_lp*2 + 6], n_values[_lp*2+1 + 6]));
+                                high_word_10[_lp] = *(uint32_t*)&_h2;
+                            }
+                            n_frag[0] = 0;
+                            n_frag[1] = 0;
+                            n_frag[2] = 0;
+                            n_frag[3] = 0;
+                            n_frag[0] = low_word_9[0];
+                            n_frag[3] = high_word_10[0];
                             unsigned int binv_frag[4];
                             binv_frag[0] = 0;
                             binv_frag[1] = 0;
@@ -4703,19 +4721,19 @@ kernel_cake_kda_bf16_4566c1019c423484bc6e76b6c21f2dc0a39b918309155f467d72c948544
                             a21_frag[2] = 0;
                             a21_frag[3] = 0;
                             a21_frag[1] = l_frag[1];
-                            unsigned int rhs_trans_frag_9[4];
+                            unsigned int rhs_trans_frag_11[4];
                             #pragma unroll
                             for (int word_10 = 0; word_10 < 4; word_10++) {
                                 asm volatile("movmatrix.sync.aligned.m8n8.trans.b16 %0, %1;\n"
-                                    : "=r"(rhs_trans_frag_9[word_10])
+                                    : "=r"(rhs_trans_frag_11[word_10])
                                     : "r"(a21_frag[word_10]));
                             }
                             asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\n"
                                 : "=f"(product_2[0]), "=f"(product_2[1]), "=f"(product_2[2]), "=f"(product_2[3])
-                                : "r"(binv_frag[0]), "r"(binv_frag[1]), "r"(binv_frag[2]), "r"(binv_frag[3]), "r"(rhs_trans_frag_9[0]), "r"(rhs_trans_frag_9[1]), "f"(0.0f), "f"(0.0f), "f"(0.0f), "f"(0.0f));
+                                : "r"(binv_frag[0]), "r"(binv_frag[1]), "r"(binv_frag[2]), "r"(binv_frag[3]), "r"(rhs_trans_frag_11[0]), "r"(rhs_trans_frag_11[1]), "f"(0.0f), "f"(0.0f), "f"(0.0f), "f"(0.0f));
                             asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\n"
                                 : "=f"(product_2[4]), "=f"(product_2[(4) + 1]), "=f"(product_2[(4) + 2]), "=f"(product_2[(4) + 3])
-                                : "r"(binv_frag[0]), "r"(binv_frag[1]), "r"(binv_frag[2]), "r"(binv_frag[3]), "r"(rhs_trans_frag_9[2]), "r"(rhs_trans_frag_9[(2) + 1]), "f"(0.0f), "f"(0.0f), "f"(0.0f), "f"(0.0f));
+                                : "r"(binv_frag[0]), "r"(binv_frag[1]), "r"(binv_frag[2]), "r"(binv_frag[3]), "r"(rhs_trans_frag_11[2]), "r"(rhs_trans_frag_11[(2) + 1]), "f"(0.0f), "f"(0.0f), "f"(0.0f), "f"(0.0f));
                             float correction_values[2];
                             correction_values[0] = -product_2[2];
                             correction_values[1] = -product_2[3];
@@ -4731,19 +4749,19 @@ kernel_cake_kda_bf16_4566c1019c423484bc6e76b6c21f2dc0a39b918309155f467d72c948544
                             correction_frag[2] = 0;
                             correction_frag[3] = 0;
                             correction_frag[1] = correction_word[0];
-                            unsigned int rhs_trans_frag_10[4];
+                            unsigned int rhs_trans_frag_12[4];
                             #pragma unroll
                             for (int word_11 = 0; word_11 < 4; word_11++) {
                                 asm volatile("movmatrix.sync.aligned.m8n8.trans.b16 %0, %1;\n"
-                                    : "=r"(rhs_trans_frag_10[word_11])
+                                    : "=r"(rhs_trans_frag_12[word_11])
                                     : "r"(binv_frag[word_11]));
                             }
                             asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\n"
                                 : "=f"(product_2[0]), "=f"(product_2[1]), "=f"(product_2[2]), "=f"(product_2[3])
-                                : "r"(correction_frag[0]), "r"(correction_frag[1]), "r"(correction_frag[2]), "r"(correction_frag[3]), "r"(rhs_trans_frag_10[0]), "r"(rhs_trans_frag_10[1]), "f"(0.0f), "f"(0.0f), "f"(0.0f), "f"(0.0f));
+                                : "r"(correction_frag[0]), "r"(correction_frag[1]), "r"(correction_frag[2]), "r"(correction_frag[3]), "r"(rhs_trans_frag_12[0]), "r"(rhs_trans_frag_12[1]), "f"(0.0f), "f"(0.0f), "f"(0.0f), "f"(0.0f));
                             asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\n"
                                 : "=f"(product_2[4]), "=f"(product_2[(4) + 1]), "=f"(product_2[(4) + 2]), "=f"(product_2[(4) + 3])
-                                : "r"(correction_frag[0]), "r"(correction_frag[1]), "r"(correction_frag[2]), "r"(correction_frag[3]), "r"(rhs_trans_frag_10[2]), "r"(rhs_trans_frag_10[(2) + 1]), "f"(0.0f), "f"(0.0f), "f"(0.0f), "f"(0.0f));
+                                : "r"(correction_frag[0]), "r"(correction_frag[1]), "r"(correction_frag[2]), "r"(correction_frag[3]), "r"(rhs_trans_frag_12[2]), "r"(rhs_trans_frag_12[(2) + 1]), "f"(0.0f), "f"(0.0f), "f"(0.0f), "f"(0.0f));
                             n_values[2] = product_2[2];
                             n_values[3] = product_2[3];
                             #pragma unroll
