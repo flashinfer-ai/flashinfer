@@ -1228,49 +1228,75 @@ if __name__ == "__main__":
 
 
 @pytest.mark.parametrize("api", ["top_k", "min_p"])
-def test_per_request_param_indexed_by_row(api):
-    # Regression: a per-request threshold tensor must be indexed by the probs row that
-    # `indices` selects, not by the output position. Three rows, each with argmax class 0.
-    probs = torch.tensor(
+@pytest.mark.parametrize("remap", ["keep_all", "argmax", "mixed"])
+@pytest.mark.parametrize("expanded", [False, True], ids=["equal_rows", "more_outputs"])
+def test_per_request_param_indexed_by_row(api, remap, expanded):
+    """A per-request threshold must be read from the probs row ``indices`` selects.
+
+    The three rows have different argmax classes and binary-exact probabilities, so
+    the expected answer for each row is an exact set. Each lane's threshold either
+    keeps everything or keeps the argmax alone, and the remapping gives neighbouring
+    lanes different rows, so reading the threshold by output position changes at
+    least one lane's answer in every case here.
+
+    ``equal_rows`` repeats the rows and the thresholds so that the output-indexed
+    read stays in bounds: it is a negative control with a wrong answer rather than a
+    crash. ``more_outputs`` is the shape the fix enables -- fewer probs rows than
+    outputs -- where the output-indexed read would run off the threshold array.
+    """
+    rows = torch.tensor(
         [
-            [0.70, 0.20, 0.07, 0.03],
-            [0.40, 0.30, 0.20, 0.10],
-            [0.60, 0.30, 0.07, 0.03],
+            [0.5, 0.25, 0.125, 0.125],
+            [0.125, 0.5, 0.25, 0.125],
+            [0.125, 0.125, 0.5, 0.25],
         ],
+        dtype=torch.float32,
         device="cuda:0",
     )
-    all_classes = [0, 1, 2, 3]
-    only_argmax = {"top_k": 1, "min_p": 0.9}[api]
-    keep_all = {"top_k": 4, "min_p": 0.01}[api]
+    num_classes = rows.size(1)
+    lanes = 1024
+    # row 1 keeps every class; rows 0 and 2 keep their argmax only.
+    if api == "top_k":
+        values, dtype = [1, num_classes, 1], torch.int32
+    else:
+        values, dtype = [0.9, 0.01, 0.9], torch.float32
+    threshold = torch.tensor(values, dtype=dtype, device=rows.device)
+    mapping = {"keep_all": [1, 1, 1], "argmax": [2, 0, 2], "mixed": [1, 2, 0]}[remap]
+    indices = torch.tensor(mapping, dtype=torch.int32, device=rows.device).repeat(lanes)
+    if expanded:
+        probs = rows
+    else:
+        probs = rows.repeat(lanes, 1)
+        threshold = threshold.repeat(lanes)
 
-    def drawn(values, indices, n=600):
-        # Accumulate on the GPU and sync once. 600 launches give P(missing a p>=0.03 class)
-        # = 0.97**600 ~ 1e-8 per output, so the exact-set assertions do not flake.
-        threshold = torch.tensor(values, device="cuda:0")
-        indices = torch.tensor(indices, dtype=torch.int32, device="cuda:0")
-        num_out = indices.numel()
-        rows = torch.arange(num_out, device="cuda:0")
-        seen = torch.zeros(num_out, probs.size(1), dtype=torch.bool, device="cuda:0")
-        for seed in range(n):
-            if api == "top_k":
-                out = flashinfer.sampling.top_k_sampling_from_probs(
-                    probs, threshold, indices=indices, seed=seed, offset=0
-                )
-            else:
-                out = flashinfer.sampling.min_p_sampling_from_probs(
-                    probs, threshold, indices=indices, seed=seed, offset=0
-                )
-            seen[rows, out.long()] = True
-        return [
-            sorted(torch.nonzero(seen[i]).flatten().tolist()) for i in range(num_out)
-        ]
-
-    # All outputs read row 2 (keep-all threshold) -> every position shows all classes.
-    assert drawn([only_argmax, only_argmax, keep_all], [2, 2, 2]) == [all_classes] * 3
-    # All outputs read row 0 (argmax-only threshold) -> every position shows only class 0.
-    assert drawn([only_argmax, keep_all, keep_all], [0, 0, 0]) == [[0]] * 3
-    # len(indices) > number of rows: still indexed by row, no out-of-bounds read.
-    assert (
-        drawn([only_argmax, only_argmax, keep_all], [2, 2, 2, 2, 2])
-        == [all_classes] * 5
+    probs_before = probs.clone()
+    threshold_before = threshold.clone()
+    indices_before = indices.clone()
+    fn = (
+        flashinfer.sampling.top_k_sampling_from_probs
+        if api == "top_k"
+        else flashinfer.sampling.min_p_sampling_from_probs
     )
+    samples, valid = fn(
+        probs, threshold, indices=indices, seed=20260919, offset=0, return_valid=True
+    )
+
+    assert samples.shape == indices.shape
+    assert samples.dtype == indices.dtype
+    assert valid.shape == indices.shape and valid.dtype == torch.bool
+    assert bool(valid.all())
+    assert bool(((samples >= 0) & (samples < num_classes)).all())
+    assert torch.equal(probs, probs_before)
+    assert torch.equal(threshold, threshold_before)
+    assert torch.equal(indices, indices_before)
+
+    samples = samples.reshape(lanes, len(mapping))
+    for lane, row_idx in enumerate(mapping):
+        counts = torch.bincount(samples[:, lane].long(), minlength=num_classes)
+        if row_idx == 1:
+            # Every class of row 1 has probability >= 1/8, so a lane that keeps all of
+            # them misses one with probability at most 4 * (7/8)**1024 (~1e-59).
+            assert bool((counts > 0).all()), (remap, lane, counts)
+        else:
+            # rows 0 and 2 keep their argmax alone, and row i's argmax is class i.
+            assert counts[row_idx].item() == lanes, (remap, lane, counts)
