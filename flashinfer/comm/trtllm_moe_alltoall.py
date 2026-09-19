@@ -516,6 +516,7 @@ def moe_a2a_dispatch(
     active_rank_mask: Optional[torch.Tensor] = None,
     *,
     backend: MoeAlltoAllBackend = "trtllm",
+    recv_view_cache: Optional[dict] = None,
 ):
     r"""Dispatch tokens and payloads to their target expert ranks.
 
@@ -607,15 +608,24 @@ def moe_a2a_dispatch(
         input_payloads, recv_offsets, recv_sizes, strict=True
     ):
         # This uses absolute offsets in the workspace, so skip indexing into the workspace
-        output_payloads.append(
-            moe_a2a_wrap_payload_tensor_in_workspace(
+        # The view depends only on (leading shape, offset, size, dtype), all of which are
+        # constant across calls at a given runtime_max_tokens_per_rank. Rebuilding it costs
+        # four tensor constructions per payload of pure host time on the decode critical
+        # path, so reuse it when the caller supplies a cache. The tensor is a view onto the
+        # persistent workspace, so a reused view still observes the bytes this call writes.
+        key = (ep_size, runtime_max_tokens_per_rank, offset, size, input_payload.dtype)
+        payload_view = None if recv_view_cache is None else recv_view_cache.get(key)
+        if payload_view is None:
+            payload_view = moe_a2a_wrap_payload_tensor_in_workspace(
                 workspace,
                 [ep_size, runtime_max_tokens_per_rank],
                 offset,
                 offset + size,
                 input_payload.dtype,
             )
-        )
+            if recv_view_cache is not None:
+                recv_view_cache[key] = payload_view
+        output_payloads.append(payload_view)
 
     eplb_gathered_stats = None
     if eplb_gathered_stats_offset >= 0:
@@ -1169,6 +1179,10 @@ class MoeAlltoAll:
         self.workspace = self._WORKSPACE["workspace"]
         self.metainfo = self._WORKSPACE["metainfo"]
         self._state = _A2AState()
+        # Receive-view cache for dispatch. Owned by the instance because its validity
+        # is tied to self.workspace, which the instance keeps alive; a module-level
+        # cache keyed on a data pointer could alias a freed-and-reallocated workspace.
+        self._recv_view_cache: dict = {}
 
     @property
     def eplb_gathered_stats(self) -> Optional[torch.Tensor]:
@@ -1357,6 +1371,7 @@ class MoeAlltoAll:
             enable_rank_mask=self.enable_rank_mask,
             active_rank_mask=active_rank_mask,
             backend=self._backend,
+            recv_view_cache=self._recv_view_cache,
         )
 
         # Update state
