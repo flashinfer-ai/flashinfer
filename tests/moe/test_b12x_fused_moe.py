@@ -256,52 +256,48 @@ def test_sm120_backend_cutovers_are_precision_specific(monkeypatch):
     from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
 
     _clear_static_cutover_env(monkeypatch)
-    moe_dispatch._STATIC_COMPACT_CUTOVER_PAIRS_CACHE.clear()
-    try:
-        # NVFP4's retained static implementation owns a wider band (1024
-        # routed pairs) than MXFP4's generic implementation (640 pairs).
-        assert (
-            moe_dispatch.select_sm120_moe_backend(
-                num_tokens=128,
-                num_topk=8,
-                activation_precision="fp4",
-            )
-            == "static"
+    # NVFP4's retained static implementation owns a wider band (1024
+    # routed pairs) than MXFP4's generic implementation (640 pairs).
+    assert (
+        moe_dispatch.select_sm120_moe_backend(
+            num_tokens=128,
+            num_topk=8,
+            activation_precision="fp4",
         )
-        assert (
-            moe_dispatch.select_sm120_moe_backend(
-                num_tokens=129,
-                num_topk=8,
-                activation_precision="fp4",
-            )
-            == "dynamic"
+        == "static"
+    )
+    assert (
+        moe_dispatch.select_sm120_moe_backend(
+            num_tokens=129,
+            num_topk=8,
+            activation_precision="fp4",
         )
-        assert (
-            moe_dispatch.select_sm120_moe_backend(
-                num_tokens=81,
-                num_topk=8,
-                quant_mode="mxfp4",
-            )
-            == "dynamic"
+        == "dynamic"
+    )
+    assert (
+        moe_dispatch.select_sm120_moe_backend(
+            num_tokens=81,
+            num_topk=8,
+            quant_mode="mxfp4",
         )
-        assert (
-            moe_dispatch.select_sm120_moe_backend(
-                num_tokens=16,
-                num_topk=8,
-                quant_mode="w4a16",
-            )
-            == "w4a16"
+        == "dynamic"
+    )
+    assert (
+        moe_dispatch.select_sm120_moe_backend(
+            num_tokens=16,
+            num_topk=8,
+            quant_mode="w4a16",
         )
-        assert (
-            moe_dispatch.select_sm120_moe_backend(
-                num_tokens=1024,
-                num_topk=8,
-                quant_mode="w4a16",
-            )
-            == "w4a16"
+        == "w4a16"
+    )
+    assert (
+        moe_dispatch.select_sm120_moe_backend(
+            num_tokens=1024,
+            num_topk=8,
+            quant_mode="w4a16",
         )
-    finally:
-        moe_dispatch._STATIC_COMPACT_CUTOVER_PAIRS_CACHE.clear()
+        == "w4a16"
+    )
 
 
 @cute_dsl_available
@@ -329,8 +325,9 @@ def test_static_workspace_uses_disjoint_route_output_scratch():
 
 
 @cute_dsl_available
-def test_static_workspace_pads_odd_retained_group_geometry():
-    """Five N128 slices are padded to six before retained2 scheduling."""
+def test_static_workspace_rounds_odd_retained_group_count_up():
+    """Five N128 slices keep their native extent; retained2 rounds the
+    group count up so the phantom sixth slice has a route-scratch slot."""
     from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
 
     workspace = moe_dispatch.allocate_sm120_static_workspace(
@@ -344,7 +341,7 @@ def test_static_workspace_pads_odd_retained_group_geometry():
         quant_mode="nvfp4",
     )
 
-    assert workspace.n == 768
+    assert workspace.n == 640
     assert workspace.route_output_scratch.shape == (8, 3, 256)
 
 
@@ -560,51 +557,53 @@ def test_w4a16_static_cutover_env_override_is_precision_scoped(monkeypatch):
     from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
 
     _clear_static_cutover_env(monkeypatch)
-    moe_dispatch._STATIC_COMPACT_CUTOVER_PAIRS_CACHE.clear()
     monkeypatch.setenv("FLASHINFER_B12X_W4A16_STATIC_COMPACT_CUTOVER_PAIRS", "256")
-    try:
-        assert moe_dispatch._get_static_compact_cutover_pairs("fp4") == 640
-        assert (
-            moe_dispatch.select_sm120_moe_backend(
-                num_tokens=32,
-                num_topk=8,
-                quant_mode="w4a16",
-            )
-            == "w4a16"
+    assert moe_dispatch._get_static_compact_cutover_pairs("fp4") == 640
+    assert (
+        moe_dispatch.select_sm120_moe_backend(
+            num_tokens=32,
+            num_topk=8,
+            quant_mode="w4a16",
         )
-        assert (
-            moe_dispatch.select_sm120_moe_backend(
-                num_tokens=33,
-                num_topk=8,
-                quant_mode="w4a16",
-            )
-            == "w4a16"
+        == "w4a16"
+    )
+    assert (
+        moe_dispatch.select_sm120_moe_backend(
+            num_tokens=33,
+            num_topk=8,
+            quant_mode="w4a16",
         )
-    finally:
-        moe_dispatch._STATIC_COMPACT_CUTOVER_PAIRS_CACHE.clear()
+        == "w4a16"
+    )
 
-    moe_dispatch._STATIC_COMPACT_CUTOVER_PAIRS_CACHE.clear()
     monkeypatch.setenv("FLASHINFER_B12X_STATIC_COMPACT_CUTOVER_PAIRS", "256")
-    try:
-        assert moe_dispatch._get_static_compact_cutover_pairs("fp4") == 256
-        assert (
-            moe_dispatch.select_sm120_moe_backend(
-                num_tokens=32,
-                num_topk=8,
-                quant_mode="nvfp4",
-            )
-            == "static"
+    assert moe_dispatch._get_static_compact_cutover_pairs("fp4") == 256
+    assert (
+        moe_dispatch.select_sm120_moe_backend(
+            num_tokens=32,
+            num_topk=8,
+            quant_mode="nvfp4",
         )
-        assert (
-            moe_dispatch.select_sm120_moe_backend(
-                num_tokens=33,
-                num_topk=8,
-                quant_mode="nvfp4",
-            )
-            == "dynamic"
+        == "static"
+    )
+    assert (
+        moe_dispatch.select_sm120_moe_backend(
+            num_tokens=33,
+            num_topk=8,
+            quant_mode="nvfp4",
         )
-    finally:
-        moe_dispatch._STATIC_COMPACT_CUTOVER_PAIRS_CACHE.clear()
+        == "dynamic"
+    )
+    monkeypatch.delenv("FLASHINFER_B12X_STATIC_COMPACT_CUTOVER_PAIRS")
+    assert moe_dispatch._get_static_compact_cutover_pairs("fp4") == 640
+    assert (
+        moe_dispatch.select_sm120_moe_backend(
+            num_tokens=33,
+            num_topk=8,
+            quant_mode="nvfp4",
+        )
+        == "static"
+    )
 
 
 @cute_dsl_available
@@ -905,13 +904,13 @@ def test_wrapper_cuda_graph_capture_requires_preallocated_buffers(monkeypatch):
     moe = b12x_moe_mod.B12xMoEWrapper(
         num_experts=1,
         top_k=1,
-        hidden_size=16,
+        hidden_size=128,
         intermediate_size=16,
         use_cuda_graph=False,
     )
     monkeypatch.setattr(b12x_moe_mod, "_is_cuda_graph_capturing", lambda: True)
 
-    x = torch.empty((1, 16), dtype=torch.bfloat16)
+    x = torch.empty((1, 128), dtype=torch.bfloat16)
     weight = torch.empty((1, 1, 1), dtype=torch.uint8)
     scale = torch.empty((1, 1, 1), dtype=torch.float8_e4m3fn)
     alpha = torch.ones((1,), dtype=torch.float32)
