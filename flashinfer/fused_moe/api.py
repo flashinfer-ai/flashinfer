@@ -499,6 +499,10 @@ _CUTLASS_MXFP8_ARCHS = (100, 103, 107)
 _CUTLASS_W4A8_ARCHS = (90,)
 _CUTLASS_HUMMING_ARCHS = (90,)
 
+# Standalone FC1/SwiGLU/FC2 MegaMOE kernels.  Each runner additionally
+# validates the precision-family-specific architecture contract.
+_MEGAMOE_FC12_ARCHS = (90, 100, 103, 107, 120, 121)
+
 
 # Default MMA pair shared by the FP4 ``prepare_*`` helpers
 # (TrtllmFp4Config, CakeWarpDecodeConfig, CuteDslConfig).
@@ -1519,6 +1523,49 @@ class CuteDslConfig:
 
 
 @dataclass(frozen=True)
+class MegaMoeFc12Config:
+    """CuTe-DSL MegaMOE FC1/SwiGLU/FC2 compute backend.
+
+    This is a local compute backend: routing, permutation, and output
+    finalization are provided by the unified fused-MoE runner contract.  It
+    therefore works both directly and through the split EP bridge.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in _MEGAMOE_FC12_ARCHS
+
+    @staticmethod
+    def prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        *,
+        quant: QuantConfig,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
+        device=None,
+    ):
+        """Build the ``megamoe_fc12`` native view from canonical weights."""
+        from .megamoe_fc12 import prepare_megamoe_fc12_weights
+
+        return prepare_megamoe_fc12_weights(
+            w1_bf16,
+            w2_bf16,
+            quant=quant,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation=activation,
+            device=device,
+        )
+
+    def __repr__(self) -> str:
+        return "MegaMoeFc12Config()"
+
+
+@dataclass(frozen=True)
 class B12xNvfp4Config:
     """SM120/SM121 CuTe-DSL b12x NVFP4/W4A4 backend."""
 
@@ -1625,6 +1672,7 @@ BackendConfigType = Union[
     CutlassW4A8Config,
     CutlassHummingConfig,
     CuteDslConfig,
+    MegaMoeFc12Config,
     B12xNvfp4Config,
     B12xW4A16Config,
 ]
@@ -1651,6 +1699,7 @@ ALL_BACKEND_CONFIGS = (
     CutlassW4A8Config,
     CutlassHummingConfig,
     CuteDslConfig,
+    MegaMoeFc12Config,
     B12xNvfp4Config,
     B12xW4A16Config,
 )
@@ -1703,6 +1752,7 @@ _DEFAULT_BACKEND = BackendOptions(
         TrtllmFp8BlockConfig(),
         TrtllmFp8PerTensorConfig(),
         TrtllmBf16Config(),
+        MegaMoeFc12Config(),
         TrtllmMxInt4Config(),
         CutlassBf16Config(),
         CutlassW4A16Config(),
@@ -1874,6 +1924,8 @@ class MoEActivationPack:
     * NVFP4×BF16 (CuTe-DSL / b12x W4A16): raw ``bfloat16 [M, H]`` values with no
       activation scale; weights use the NVFP4 preparation contract.
     * BF16: raw ``bfloat16 [M, H]`` values with no scale tensor.
+    * BF16×MXFP8: raw ``bfloat16 [M, H]`` values with no scale tensor;
+      FC12 uses MXFP8 weight values and their native scale planes.
     * MxInt4: raw ``bfloat16 [M, H]`` values with no scale tensor; weights are
       packed signed INT4 with BF16 block scales.
     * DeepSeek FP8: ``float8_e4m3fn [M, H]`` values with transposed

@@ -476,6 +476,7 @@ def allocate_moe_sort_buffers(
     num_local_experts: Optional[int] = None,
     tile_tokens_dim: int = 128,
     device: str = "cuda",
+    include_expert_counts: bool = False,
 ) -> Dict[str, torch.Tensor]:
     """
     Pre-allocate output buffers for moe_sort for CUDA graph compatibility.
@@ -500,6 +501,7 @@ def allocate_moe_sort_buffers(
             - out_permuted_idx_to_expanded_idx
             - out_total_num_padded_tokens
             - out_num_non_exiting_tiles
+            - out_expert_counts (when ``include_expert_counts=True``)
 
     Example:
         >>> # Pre-allocate before CUDA graph capture
@@ -524,7 +526,7 @@ def allocate_moe_sort_buffers(
         num_tokens, top_k, num_local_experts, tile_tokens_dim
     )
 
-    return {
+    buffers = {
         "out_tile_idx_to_expert_idx": torch.empty(
             (max_num_tiles,), dtype=torch.int32, device=device
         ),
@@ -543,7 +545,13 @@ def allocate_moe_sort_buffers(
         "out_num_non_exiting_tiles": torch.empty(
             (1,), dtype=torch.int32, device=device
         ),
+        "out_expert_counts": torch.empty(
+            (2 * num_experts,), dtype=torch.int32, device=device
+        )
+        if include_expert_counts
+        else None,
     }
+    return buffers
 
 
 def moe_sort(
@@ -562,13 +570,15 @@ def moe_sort(
     out_permuted_idx_to_expanded_idx: Optional[torch.Tensor] = None,
     out_total_num_padded_tokens: Optional[torch.Tensor] = None,
     out_num_non_exiting_tiles: Optional[torch.Tensor] = None,
-) -> Tuple[
-    torch.Tensor,  # tile_idx_to_expert_idx
-    torch.Tensor,  # tile_idx_to_mn_limit
-    torch.Tensor,  # expanded_idx_to_permuted_idx
-    torch.Tensor,  # permuted_idx_to_expanded_idx
-    torch.Tensor,  # total_num_padded_tokens [1], int32 (device tensor for CUDA graph compatibility)
-    torch.Tensor,  # num_non_exiting_tiles
+    out_expert_counts: Optional[torch.Tensor] = None,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    Optional[torch.Tensor],
 ]:
     """
     Sort tokens by expert assignment and generate mapping tensors.
@@ -611,9 +621,13 @@ def moe_sort(
         out_permuted_idx_to_expanded_idx: Pre-allocated buffer for permuted_idx_to_expanded_idx.
         out_total_num_padded_tokens: Pre-allocated buffer for total_num_padded_tokens.
         out_num_non_exiting_tiles: Pre-allocated buffer for num_non_exiting_tiles.
+        out_expert_counts: Optional pre-allocated ``2 * num_experts`` int32
+            buffer. Routing uses the first half as the histogram and the
+            second half as per-expert tile cursors. Its local-expert slice is
+            returned as the final value.
 
     Returns:
-        tuple: A tuple of 6 elements:
+        tuple: A tuple of 7 elements:
             - tile_idx_to_expert_idx: [max_num_tiles], int32
                 Mapping from tile index to local expert index (0 to num_local_experts-1).
             - tile_idx_to_mn_limit: [max_num_tiles], int32
@@ -627,6 +641,8 @@ def moe_sort(
                 Total number of padded tokens. Returned as tensor for CUDA graph compatibility.
             - num_non_exiting_tiles: [1], int32 (device tensor)
                 Number of non-exiting (active) tiles.
+            - expert_counts: [num_local_experts], int32 local routing histogram,
+              or None when ``out_expert_counts`` is not supplied.
 
     Example:
         >>> import torch
@@ -725,17 +741,25 @@ def moe_sort(
     else:
         num_non_exiting_tiles = torch.empty((1,), dtype=torch.int32, device=device)
 
-    # Allocate expert counts buffer for large token counts (>1024).
-    # Required size: 2 * num_experts. The kernel zeros this internally via
-    # launchInitExpertCounts before reading, so no Python-side init is needed
-    # (matching trt-llm's torch::empty allocation pattern).
-    if num_tokens > 1024:
-        expert_counts = torch.empty(
+    if out_expert_counts is not None and (
+        out_expert_counts.dtype != torch.int32
+        or out_expert_counts.numel() < 2 * num_experts
+    ):
+        raise ValueError(
+            "out_expert_counts must be an int32 tensor with at least "
+            f"2 * num_experts ({2 * num_experts}) entries."
+        )
+    routing_expert_counts = out_expert_counts
+    if routing_expert_counts is None and num_tokens > 1024:
+        routing_expert_counts = torch.empty(
             (2 * num_experts,), dtype=torch.int32, device=device
         )
-        expert_counts_ptr = expert_counts.data_ptr()
-    else:
-        expert_counts_ptr = 0  # Will be set to nullptr in kernel
+    expert_counts_ptr = (
+        routing_expert_counts.data_ptr() if routing_expert_counts is not None else 0
+    )
+    out_expert_counts_ptr = (
+        out_expert_counts.data_ptr() if out_expert_counts is not None else 0
+    )
 
     # Get the JIT module and call the kernel
     module = _get_moe_utils_module()
@@ -764,9 +788,17 @@ def moe_sort(
         num_non_exiting_tiles.data_ptr(),
         # Optional buffer
         expert_counts_ptr,
+        out_expert_counts_ptr,
         # CUDA stream for CUDA graph compatibility
         cuda_stream_ptr,
     )
+
+    if out_expert_counts is not None:
+        local_expert_counts = out_expert_counts[
+            local_expert_offset : local_expert_offset + num_local_experts
+        ]
+    else:
+        local_expert_counts = None
 
     # Return total_num_padded_tokens as tensor for CUDA graph compatibility
     # (avoiding .item() which causes CPU-GPU sync)
@@ -777,6 +809,7 @@ def moe_sort(
         permuted_idx_to_expanded_idx,
         total_num_padded_tokens_tensor,
         num_non_exiting_tiles,
+        local_expert_counts,
     )
 
 
