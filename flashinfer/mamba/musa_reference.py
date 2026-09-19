@@ -242,11 +242,7 @@ def selective_state_update_musa_reference(
     state/index/replay contract.  Native MUSA kernels will replace this slow
     reference implementation behind the same boundary.
     """
-    # MTP's accepted-count metadata is device-resident and the same recurrence
-    # is valid in eager mode. Use the tensor-only implementation whenever MTP
-    # is selected; this prevents a graph capture from falling into the Python
-    # reference (which necessarily reads metadata to the host).
-    if num_accepted_tokens is not None:
+    if _musa_stream_is_capturing() and num_accepted_tokens is not None:
         return _musa_mtp_capture_update(
             state, x, dt, A, B, C, D, z, dt_bias, dt_softplus,
             state_batch_indices, dst_state_batch_indices, out,
