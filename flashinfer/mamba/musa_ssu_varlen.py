@@ -13,7 +13,7 @@ import triton
 import triton.language as tl
 
 from .musa_ssd_helpers import fast_exp
-from .musa_stochastic import cvt_rs_f16
+from .musa_stochastic import cvt_rs_f16, philox4x32
 
 
 @triton.jit
@@ -283,11 +283,14 @@ def _musa_varlen_ssu_kernel(
                 offs_m[:, None] * stride_state_dim
                 + offs_n[None, :] * stride_state_dstate
             )
-            # Generate random 32-bits for each element in state
-            if PHILOX_ROUNDS > 0:
-                rand = tl.randint(rand_seed, rand_offsets, PHILOX_ROUNDS)
-            else:
-                rand = tl.randint(rand_seed, rand_offsets)
+            # Use the same explicit Philox4x32 lowering as the other MUSA
+            # providers.  Triton 3.2 and 3.6 expose different tl.randint
+            # signatures on MUSA; keeping the counter construction here makes
+            # the capture path version-stable.
+            r0, _, _, _ = philox4x32(
+                rand_seed, rand_offsets, PHILOX_ROUNDS if PHILOX_ROUNDS > 0 else 10
+            )
+            rand = r0
             # Convert state to fp16 with RS rounding
             state = _convert_rs_fp16x2(state, rand)
             tl.static_assert(state.dtype == tl.float16, "state must be fp16")
@@ -358,18 +361,36 @@ def ssu_varlen_musa_triton(
         dst_state_batch_indices = dst_state_batch_indices[:, None]
     if state_batch_indices.dim() != 2 or dst_state_batch_indices.dim() != 2:
         raise ValueError("state index tensors must be rank 2 in packed varlen mode")
+    tensors = (x, dt, A, B, C, D, state_batch_indices, dst_state_batch_indices, cu_seqlens)
+    if any(t.device != state.device for t in tensors):
+        raise ValueError("packed varlen tensors must share the state device")
+    if state_batch_indices.dtype not in (torch.int32, torch.int64):
+        raise ValueError("state_batch_indices must be int32 or int64")
+    if dst_state_batch_indices.dtype != state_batch_indices.dtype:
+        raise ValueError("source and destination index dtypes must match")
     if out is None:
         out = torch.empty_like(x)
     if out.shape != x.shape or out.dtype != x.dtype:
         raise ValueError("out must match x in packed varlen mode")
     if cu_seqlens.dim() != 1 or not cu_seqlens.is_contiguous():
         raise ValueError("cu_seqlens must be a contiguous rank-1 tensor")
+    if cu_seqlens.device != state.device or cu_seqlens.dtype not in (
+        torch.int32,
+        torch.int64,
+    ):
+        raise ValueError("cu_seqlens must be int32/int64 on the state device")
     nseq = cu_seqlens.numel() - 1
     if nseq < 1 or state_batch_indices.shape[0] < nseq:
         raise ValueError("cu_seqlens/index batch mismatch")
+    if dst_state_batch_indices.shape[0] < nseq:
+        raise ValueError("cu_seqlens/destination-index batch mismatch")
     if num_accepted_tokens is not None:
         if num_accepted_tokens.dim() != 1 or num_accepted_tokens.numel() < nseq:
             raise ValueError("num_accepted_tokens must have one entry per sequence")
+        if num_accepted_tokens.device != state.device:
+            raise ValueError("num_accepted_tokens must share the state device")
+        if num_accepted_tokens.dtype not in (torch.int32, torch.int64):
+            raise ValueError("num_accepted_tokens must be int32 or int64")
     if enable_stochastic_rounding and state.dtype != torch.float16:
         raise ValueError("stochastic rounding requires FP16 state")
     if enable_stochastic_rounding and cache_philox_rounds not in (5, 10):
@@ -385,10 +406,12 @@ def ssu_varlen_musa_triton(
         raise ValueError("D shape does not match state")
     if dt_bias is not None and dt_bias.shape not in ((nheads,), (nheads, dim)):
         raise ValueError("dt_bias shape does not match state")
-    if z is not None and z.shape != x.shape:
+    if z is not None and (z.shape != x.shape or z.device != state.device):
         raise ValueError("z shape does not match x")
     if nheads % ngroups:
         raise ValueError("nheads must be divisible by ngroups")
+    if dt_bias is not None and dt_bias.device != state.device:
+        raise ValueError("dt_bias must share the state device")
 
     block_m, num_warps = _select_block_config(dim, dstate, nseq, nheads)
     idx_strides = (state_batch_indices.stride(0), state_batch_indices.stride(1))
