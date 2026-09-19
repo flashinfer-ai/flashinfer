@@ -397,6 +397,8 @@ def ssu_varlen_musa_triton(
         raise ValueError("cu_seqlens/index batch mismatch")
     if dst_state_batch_indices.shape[0] < nseq:
         raise ValueError("cu_seqlens/destination-index batch mismatch")
+    if state_batch_indices.shape[1] < 1 or dst_state_batch_indices.shape[1] < 1:
+        raise ValueError("state index tensors must have at least one slot column")
     if num_accepted_tokens is not None:
         if num_accepted_tokens.dim() != 1 or num_accepted_tokens.numel() < nseq:
             raise ValueError("num_accepted_tokens must have one entry per sequence")
@@ -413,7 +415,12 @@ def ssu_varlen_musa_triton(
 
     _, nheads, dim, dstate = state.shape
     ngroups = B.shape[1]
-    if x.shape[1:] != (nheads, dim) or B.shape[1:] != (ngroups, dstate):
+    if (
+        x.shape[1:] != (nheads, dim)
+        or B.shape[0] != x.shape[0]
+        or C.shape[0] != x.shape[0]
+        or B.shape[1:] != (ngroups, dstate)
+    ):
         raise ValueError("packed varlen tensor dimensions do not match state")
     if A.shape[1:] != (dim, dstate) or A.shape[0] not in (1, nheads):
         raise ValueError("A shape does not match state")
