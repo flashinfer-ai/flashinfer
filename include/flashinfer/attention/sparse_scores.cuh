@@ -89,11 +89,11 @@ constexpr uint32_t kMultiTileSliceK = 64;
  * \tparam TILE_N query heads the multiply covers at once, 8 or 16
  */
 template <uint32_t HEAD_DIM, uint32_t TILES_PER_BLOCK, uint32_t SLICE_K, uint32_t WARPS,
-          uint32_t TILE_N, typename DType, typename IdType>
+          uint32_t TILE_N, typename DType, typename IdType, typename PosType>
 __global__ void __launch_bounds__(WARPS * 32) SparsePagedScoresKernel(
     const DType* __restrict__ q, const DType* __restrict__ k_cache,
     const IdType* __restrict__ page_table, const IdType* __restrict__ token_to_req,
-    const IdType* __restrict__ query_positions, const IdType* __restrict__ sequence_lengths,
+    const PosType* __restrict__ query_positions, const IdType* __restrict__ sequence_lengths,
     IdType* __restrict__ visible_out, float* __restrict__ logits, uint32_t stride_q_row,
     uint32_t stride_q_head, uint32_t stride_cache_page, uint32_t stride_cache_entry,
     uint32_t stride_table_req, uint32_t stride_logits_row, uint32_t rows, uint32_t num_columns,
@@ -146,8 +146,13 @@ __global__ void __launch_bounds__(WARPS * 32) SparsePagedScoresKernel(
   const int32_t request = request_valid ? static_cast<int32_t>(request_raw) : -1;
   const int32_t safe_request =
       request_valid ? min(request, static_cast<int32_t>(num_requests) - 1) : 0;
-  const IdType position_raw = query_positions[row];
-  const int32_t query_position = (position_raw >= IdType(0) && position_raw <= kInt32Max)
+  // Positions come in as whatever the caller keeps them in -- a request's
+  // position is bounded by the context length, but a caller that builds them
+  // beside a slot mapping keeps them in int64. Read in that type, narrowed
+  // here, and anything that does not fit is not a position.
+  constexpr PosType kPosInt32Max = static_cast<PosType>(2147483647);
+  const PosType position_raw = query_positions[row];
+  const int32_t query_position = (position_raw >= PosType(0) && position_raw <= kPosInt32Max)
                                      ? static_cast<int32_t>(position_raw)
                                      : -1;
   IdType length_raw = request_valid ? sequence_lengths[safe_request] : IdType(0);
@@ -467,9 +472,9 @@ __global__ void __launch_bounds__(WARPS * 32) SparsePagedScoresKernel(
   }
 }
 
-template <uint32_t HEAD_DIM, typename DType, typename IdType>
+template <uint32_t HEAD_DIM, typename DType, typename IdType, typename PosType>
 cudaError_t SparsePagedScores(const DType* q, const DType* k_cache, const IdType* page_table,
-                              const IdType* token_to_req, const IdType* query_positions,
+                              const IdType* token_to_req, const PosType* query_positions,
                               const IdType* sequence_lengths, IdType* visible_out, float* logits,
                               uint32_t stride_q_row, uint32_t stride_q_head,
                               uint32_t stride_cache_page, uint32_t stride_cache_entry,
@@ -532,7 +537,8 @@ cudaError_t SparsePagedScores(const DType* q, const DType* k_cache, const IdType
     constexpr uint32_t WARPS = kWarpsPerBlock;
     constexpr uint32_t THREADS = WARPS * 32;
     const size_t smem_size = smem_for(TILES, SLICE_K);
-    auto kernel = SparsePagedScoresKernel<HEAD_DIM, TILES, SLICE_K, WARPS, TILE_N, DType, IdType>;
+    auto kernel =
+        SparsePagedScoresKernel<HEAD_DIM, TILES, SLICE_K, WARPS, TILE_N, DType, IdType, PosType>;
     // The opt-in is a property of the kernel on the device, not of the launch.
     static thread_local int opted_in_dev = -1;
     if (opted_in_dev != dev_id) {
