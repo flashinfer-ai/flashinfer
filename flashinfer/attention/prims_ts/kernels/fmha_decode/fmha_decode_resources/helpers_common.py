@@ -24,7 +24,7 @@ from typing import ClassVar
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import BFloat16, Float16, Float32, Int32, Int64, Uint32
+from cutlass import BFloat16, Float16, Float32, Float8E4M3FN, Int32, Int64, Uint32
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.experimental import primitives as prims
@@ -154,14 +154,30 @@ def _swaps_routed_coordinate(
     return atom_origin, atom_origin + Int32(token_offset) + lane_k_offset
 
 
-def _mma_kind_for_qkv(cfg: FmhaDecodeConfig) -> prims.Tcgen05MMAKind:
-    """Select the tcgen05 MMA opcode family used for Q/K/V operands."""
-    return prims.Tcgen05MMAKind.F8F6F4 if cfg.use_fp8_qkv else prims.Tcgen05MMAKind.F16
+def _mma_kind_for_qk(cfg: FmhaDecodeConfig) -> prims.Tcgen05MMAKind:
+    """Select the tcgen05 MMA kind of BMM1 from the Q/K dtype.
+
+    Int8 accumulates INT32 scores; E4M3 and the 16-bit types accumulate FP32.
+    """
+    if cfg.uses_int32_scores:
+        return prims.Tcgen05MMAKind.INT8
+    return prims.Tcgen05MMAKind.F8F6F4 if cfg.use_8bit_qkv else prims.Tcgen05MMAKind.F16
 
 
-def _mma_k_step(cfg: FmhaDecodeConfig) -> int:
-    """Return the K dimension advanced by one tcgen05 MMA instruction."""
-    return 32 if cfg.use_fp8_qkv else 16
+def _mma_kind_for_pv(cfg: FmhaDecodeConfig) -> prims.Tcgen05MMAKind:
+    """Select the tcgen05 MMA kind of BMM2 from the V (and hence P) dtype."""
+    if cfg.v_dtype == Float8E4M3FN:
+        return prims.Tcgen05MMAKind.F8F6F4
+    return prims.Tcgen05MMAKind.F16
+
+
+def _qk_accumulator_dtype(cfg: FmhaDecodeConfig) -> type:
+    """Return the type BMM1 accumulates one score as: Int32 for Int8 Q/K.
+
+    INT32 scores are accumulated on top of ``INT32_SCORE_BIAS``, so the
+    softmax reads every score tile as FP32.
+    """
+    return Int32 if cfg.uses_int32_scores else Float32
 
 
 @cute.jit
@@ -242,6 +258,32 @@ def _keeps_q64_col_base(lane_idx: Int32, half_cols: int) -> Int32:
 
 
 @cute.jit
+def _keeps_spatial_half(
+    cfg: Constexpr[FmhaDecodeConfig], warp_grp_thread_idx: Int32
+) -> Int32:
+    """Return the spatial half a Keeps warp-group thread belongs to.
+
+    KV256 threads ``[0, 64)`` and ``[64, 128)`` own the two spatial KV128
+    partials of one logical Q row (``FmhaDecodeConfig.keeps_spatial_halves``);
+    every other Keeps profile has a single half.
+    """
+    if cutlass.const_expr(cfg.keeps_spatial_halves == 2):
+        return warp_grp_thread_idx >> Int32(6)
+    return Int32(0)
+
+
+@cute.jit
+def _keeps_route_atom(cfg: Constexpr[FmhaDecodeConfig], half: Int32, position) -> Int32:
+    """Return the route atom a Keeps spatial half owns at ``position``.
+
+    The halves interleave over the route's atoms: half ``h`` owns atoms ``h``,
+    ``h + halves``, ... in order, so its ``position``-th atom is ``position *
+    halves + h`` (``FmhaDecodeConfig.keeps_route_atom_owner`` is the inverse).
+    """
+    return position * Int32(cfg.keeps_spatial_halves) + half
+
+
+@cute.jit
 def _keeps_row_idx(cfg: Constexpr[FmhaDecodeConfig], warp_grp_thread_idx: Int32):
     """Map a correction lane to the logical output row it owns."""
     if cutlass.const_expr(cfg.tile_size_kv == 256):
@@ -274,16 +316,18 @@ def _keeps_score_col(
 ) -> Int32:
     """Return the semantic KV column represented by one Keeps score register."""
     if cutlass.const_expr(cfg.tile_size_kv == 256):
-        # A physical thread owns four K32 fragments. The spatial half selects
-        # alternating KV64 blocks; the temporal fragment selects the low/high
-        # K32 sub-block inside that semantic KV64 block.
-        spatial = warp_grp_thread_idx >> Int32(6)
-        fragment = reg_idx // 32
-        semantic_block = Int32(2 * (fragment // 2)) + spatial
+        # A physical thread owns four K32 fragments: ``keeps_fragments_per_atom``
+        # per layout atom of its spatial half (``_keeps_route_atom``), each
+        # fragment one K32 sub-block of that atom.
+        fragment_regs = cfg.softmax_score_fragment_regs
+        fragments_per_atom = cfg.keeps_fragments_per_atom
+        spatial = _keeps_spatial_half(cfg, warp_grp_thread_idx)
+        fragment = reg_idx // fragment_regs
+        semantic_block = _keeps_route_atom(cfg, spatial, fragment // fragments_per_atom)
         return (
-            semantic_block * Int32(64)
-            + Int32((fragment % 2) * 32)
-            + Int32(reg_idx % 32)
+            semantic_block * Int32(cfg.keeps_atom_tokens)
+            + Int32((fragment % fragments_per_atom) * fragment_regs)
+            + Int32(reg_idx % fragment_regs)
         )
     return col_base + Int32(reg_idx)
 
@@ -354,7 +398,7 @@ def _pack_float2_to_bf16(v0: Float32, v1: Float32) -> Int32:
 
 def _qkv_smem_swizzle(cfg: FmhaDecodeConfig) -> prims.Tcgen05SmemSwizzle:
     """Select the tcgen05 SMEM swizzle for staged Q/K/V tiles."""
-    if cfg.use_fp8_qkv and cfg.headdim == 64:
+    if cfg.use_8bit_qkv and cfg.headdim == 64:
         return prims.Tcgen05SmemSwizzle.SWIZZLE_64B
     return prims.Tcgen05SmemSwizzle.SWIZZLE_128B
 
@@ -376,15 +420,23 @@ def _major_k_stride_bytes(dtype_bytes: int, headdim: int) -> int:
     return 128 * rows_per_swizzle_blk
 
 
-@cute.jit
-def _fp8_log2_quant_scale() -> Float32:
-    """Return log2 scaling used by FP8 probability quantization."""
-    return Float32(8.8073549)
-
-
 def _neg_max_f32() -> Float32:
     """Return the negative sentinel used for running softmax maxima."""
     return Float32(NEG_FLT_MAX)
+
+
+@cute.jit
+def _masked_weighted_sum(terms: tuple) -> Float32:
+    """Return the sum of ``value * weight`` over ``(uses, value, weight)`` terms.
+
+    The terms are added in order and a term whose ``uses`` is false is skipped.
+    """
+    total = Float32(0.0)
+    for term_idx in cutlass.range_constexpr(len(terms)):
+        uses, value, weight = terms[term_idx]
+        if uses:
+            total += value * weight
+    return total
 
 
 def _softmax_tile_idx(

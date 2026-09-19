@@ -33,9 +33,8 @@ pytest.importorskip(
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import BFloat16, Float16, Float8E4M3FN, Int32
+from cutlass import BFloat16, Float16, Float8E4M3FN, Int8, Int32
 from cutlass.cute.runtime import make_ptr
-from cutlass import utils as cutlass_utils
 from cutlass.experimental.task_scheduling.memory import SmemAllocation
 
 from flashinfer.attention.prims_ts import (
@@ -68,8 +67,13 @@ from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_config import
     make_decode_config,
 )
 from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_constants import (
+    BYTES_PER_KIB,
+    FP8_P_QUANT_SCALE,
+    KV_TILE_256_BYTE_WIDE_SHARED_FIFO_STAGES,
+    KV_TILE_256_SHARED_FIFO_STAGES,
     Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIP_BITS,
     Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIPS_PER_WORD,
+    TOTAL_SMEM_BUDGET_KIB,
 )
 from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_kernel import (
     _build_decode_gen_schedule,
@@ -89,6 +93,13 @@ from flashinfer.decode import (
     validate_q_token_kv_block_sparse_group_size as validate_prims_ts_q_token_kv_block_sparse_group_size,
 )
 from flashinfer.utils import is_sm100a_supported
+
+from tests.attention.prims_ts_test_utils import (
+    FP8 as _FP8,
+    assert_decode_smem_within_capacity,
+    dense_stream_columns,
+    make_sage_decode_config,
+)
 
 
 @pytest.mark.parametrize(
@@ -324,8 +335,6 @@ _Q_TOKEN_KV_BLOCK_SPARSE_TP_HEAD_GEOMETRIES = (
 )
 
 
-_FP8 = torch.float8_e4m3fn
-_FP8_PROBABILITY_SCALE = 448.0
 _FP8_KV_TILE_SIZE = 128
 _FP8_NUM_KV_INSTANCES = 2
 
@@ -628,9 +637,16 @@ def _fp8_decode_reference(
     qo_indptr: Optional[torch.Tensor] = None,
     splits_kv: int = 1,
     num_insts_kv: int = _FP8_NUM_KV_INSTANCES,
-    probability_scale: float = _FP8_PROBABILITY_SCALE,
+    probability_scale: float = FP8_P_QUANT_SCALE,
+    kv_tile_size: int = _FP8_KV_TILE_SIZE,
 ) -> torch.Tensor:
-    """Model the kernel's FP8-P operand and split/instance stream merge."""
+    """Model the kernel's FP8-P operand and split/instance stream merge.
+
+    Every online-softmax stream quantizes P against its own running maximum,
+    so the streams must match the kernel: one per split and K/V instance, and
+    for KV256 one more per spatial half, whose columns are the tile's KV64
+    blocks 0 and 2 or 1 and 3.
+    """
 
     if q.dtype != _FP8 or k_cache.dtype != _FP8 or v_cache.dtype != _FP8:
         raise ValueError("the FP8 reference requires E4M3 Q, K, and V")
@@ -640,6 +656,9 @@ def _fp8_decode_reference(
         raise ValueError("splits_kv and num_insts_kv must be positive")
     if not math.isfinite(probability_scale) or probability_scale <= 0:
         raise ValueError("probability_scale must be finite and positive")
+    if kv_tile_size not in (128, 256):
+        raise ValueError("the FP8 reference models KV128 and KV256 tiles")
+    half_columns = dense_stream_columns(kv_tile_size, q.device)
 
     packed_q = qo_indptr is not None
     if packed_q:
@@ -712,9 +731,7 @@ def _fp8_decode_reference(
             scores = torch.einsum(
                 "hd,thd->ht", request_queries[query_idx], visible_keys
             )
-            num_tiles = (
-                visible_keys.shape[0] + _FP8_KV_TILE_SIZE - 1
-            ) // _FP8_KV_TILE_SIZE
+            num_tiles = (visible_keys.shape[0] + kv_tile_size - 1) // kv_tile_size
             tiles_per_group = splits_kv * num_insts_kv
             groups_per_split = (num_tiles + tiles_per_group - 1) // tiles_per_group
             local_tiles = max(
@@ -733,7 +750,9 @@ def _fp8_decode_reference(
                         num_insts_kv,
                     )
                     if tile_indices.start < tile_indices.stop:
-                        stream_tiles.append(tile_indices)
+                        stream_tiles.extend(
+                            (tile_indices, columns) for columns in half_columns
+                        )
 
             stream_max = [
                 torch.full(
@@ -758,13 +777,15 @@ def _fp8_decode_reference(
             ]
             stream_valid = [False] * len(stream_tiles)
 
-            for stream_idx, tile_indices in enumerate(stream_tiles):
+            for stream_idx, (tile_indices, columns) in enumerate(stream_tiles):
                 for tile_idx in tile_indices:
-                    tile_begin = tile_idx * _FP8_KV_TILE_SIZE
-                    tile_end = min(
-                        tile_begin + _FP8_KV_TILE_SIZE, visible_keys.shape[0]
-                    )
-                    tile_scores = scores[:, tile_begin:tile_end]
+                    stream_columns = columns + tile_idx * kv_tile_size
+                    stream_columns = stream_columns[
+                        stream_columns < visible_keys.shape[0]
+                    ]
+                    if stream_columns.numel() == 0:
+                        continue
+                    tile_scores = scores[:, stream_columns]
                     local_max = tile_scores.max(dim=-1).values
                     new_max = (
                         torch.maximum(stream_max[stream_idx], local_max)
@@ -780,7 +801,7 @@ def _fp8_decode_reference(
                     tile_acc = torch.einsum(
                         "ht,thd->hd",
                         quantized_probabilities,
-                        visible_values[tile_begin:tile_end],
+                        visible_values[stream_columns],
                     )
                     if stream_valid[stream_idx]:
                         correction = torch.exp(
@@ -1571,6 +1592,7 @@ def _exercise_public_paths(
             qo_indptr=qo_indptr,
             splits_kv=int(policy["splits_kv"]),
             num_insts_kv=int(policy["num_insts_kv"]),
+            kv_tile_size=int(policy["tile_size_kv"]),
         )
     eager = _run_case(
         wrapper,
@@ -1617,6 +1639,7 @@ def _with_reference(
     qo_indptr: Optional[torch.Tensor] = None,
     splits_kv: int = 1,
     num_insts_kv: int = _FP8_NUM_KV_INSTANCES,
+    kv_tile_size: int = _FP8_KV_TILE_SIZE,
 ):
     """Return a case whose oracle reflects its current mutable Q/K/V data."""
 
@@ -1638,6 +1661,7 @@ def _with_reference(
             qo_indptr=qo_indptr,
             splits_kv=splits_kv,
             num_insts_kv=num_insts_kv,
+            kv_tile_size=kv_tile_size,
         )
     else:
         reference = _decode_reference(
@@ -1714,6 +1738,20 @@ def _exercise_auto_case(
     return policy
 
 
+_EXPLICIT_KV256_PROFILE = {
+    "use_keeps_mma_ab": True,
+    "tile_size_q": 64,
+    "tile_size_kv": 256,
+    "groups_tokens_heads_q": True,
+}
+_EXPLICIT_Q128_PROFILE = {
+    "use_keeps_mma_ab": True,
+    "tile_size_q": 128,
+    "tile_size_kv": 128,
+    "groups_tokens_heads_q": True,
+}
+
+
 def _exercise_explicit_kv256_case(
     monkeypatch: pytest.MonkeyPatch,
     case: _DecodeCase,
@@ -1722,18 +1760,29 @@ def _exercise_explicit_kv256_case(
 ) -> dict[str, object]:
     """Run a public path with the qualified logical KV256 profile pinned."""
 
+    return _exercise_explicit_profile_case(
+        monkeypatch,
+        case,
+        _EXPLICIT_KV256_PROFILE,
+        exercise_all_paths=exercise_all_paths,
+    )
+
+
+def _exercise_explicit_profile_case(
+    monkeypatch: pytest.MonkeyPatch,
+    case: _DecodeCase,
+    explicit_profile: dict[str, object],
+    *,
+    exercise_all_paths: bool = False,
+) -> dict[str, object]:
+    """Run a public path with the given config fields pinned as explicit."""
+
     from flashinfer.attention.prims_ts import decode as decode_module
     from flashinfer.attention.prims_ts.kernels.fmha_decode import fmha_decode_config
 
     original_make_decode_config = fmha_decode_config.make_decode_config
-    explicit_profile = {
-        "use_keeps_mma_ab": True,
-        "tile_size_q": 64,
-        "tile_size_kv": 256,
-        "groups_tokens_heads_q": True,
-    }
 
-    def _make_explicit_kv256_config(*args, **kwargs):
+    def _make_explicit_profile_config(*args, **kwargs):
         source = kwargs.get("args")
         kwargs["args"] = (
             explicit_profile if source is None else (source, explicit_profile)
@@ -1743,7 +1792,7 @@ def _exercise_explicit_kv256_case(
     monkeypatch.setattr(
         fmha_decode_config,
         "make_decode_config",
-        _make_explicit_kv256_config,
+        _make_explicit_profile_config,
     )
     decode_module._resolve_decode_launch_spec.cache_clear()
     decode_module._get_compiled_decode.cache_clear()
@@ -1902,6 +1951,7 @@ def test_attention_ts_decode_fp8_bf16_reduction_requires_sparse_page_route(
         headdim=256,
         q_dtype=Float8E4M3FN,
         kv_dtype=Float8E4M3FN,
+        v_dtype=Float8E4M3FN,
         out_dtype=BFloat16,
         use_paged_kv=True,
         num_tokens_per_page=page_size,
@@ -2514,10 +2564,6 @@ def test_attention_ts_decode_bound_wrapper_trace_uses_plan_state():
     assert "mask:causal" in defn["tags"]
 
 
-def _align_up(value: int, alignment: int) -> int:
-    return (value + alignment - 1) // alignment * alignment
-
-
 def _decode_resources_by_name(resource_dependency_graph):
     resources_by_id = {}
     for resource, dependencies in resource_dependency_graph.items():
@@ -2553,12 +2599,18 @@ def _make_contiguous_keeps_config(*, dtype, tile_size_q: int, headdim: int = 128
 def _make_contiguous_kv256_config(
     *,
     dtype=BFloat16,
+    o_dtype=None,
     persistent: bool | None = None,
     config_args: dict[str, object] | None = None,
     split_kv_mode: str = "disabled",
     splits_kv: int = 1,
+    qkv_layout: str = "contiguousKv",
+    num_tokens_per_page: int = 32,
 ):
-    """Build the qualified Q64/KV256 profile for schedule-level tests."""
+    """Build the qualified Q64/KV256 profile for schedule-level tests.
+
+    The output dtype follows ``dtype`` unless ``o_dtype`` names another one.
+    """
 
     args = {
         "use_keeps_mma_ab": True,
@@ -2579,8 +2631,9 @@ def _make_contiguous_kv256_config(
         num_heads_q=32,
         num_heads_kv=32,
         qkv_dtype=dtype,
-        o_dtype=dtype,
-        qkv_layout="contiguousKv",
+        o_dtype=dtype if o_dtype is None else o_dtype,
+        qkv_layout=qkv_layout,
+        num_tokens_per_page=num_tokens_per_page,
         split_kv_mode=split_kv_mode,
         splits_kv=splits_kv,
         mask_type="dense",
@@ -2651,15 +2704,6 @@ def _build_decode_resources(cfg):
         smem_allocator,
         tmem_allocator,
     )
-
-
-def _assert_decode_smem_within_capacity(cfg, smem_allocator) -> None:
-    unified_smem_bytes = (
-        _align_up(smem_allocator.total_smem_bytes, 8)
-        + smem_allocator.barrier_smem_bytes
-    )
-    launch_smem_bytes = _align_up(unified_smem_bytes, cfg.stensor_align)
-    assert launch_smem_bytes <= cutlass_utils.get_smem_capacity_in_bytes("sm_100")
 
 
 @pytest.mark.parametrize("page_size", (4, 16, 32, 64, 128))
@@ -3455,7 +3499,7 @@ def test_attention_ts_decode_q128_tmem_p_aliases_consumed_s_region(
     assert resources["smemP1"]._alloc is None
     assert {"smemK0", "smemK1", "smemV0", "smemV1"} <= resources.keys()
     assert tmem_allocator.total_tmem_columns == cfg.tmem_total_cols <= 512
-    _assert_decode_smem_within_capacity(cfg, smem_allocator)
+    assert_decode_smem_within_capacity(cfg, smem_allocator)
 
 
 def test_attention_ts_decode_kv256_uses_fragment_ready_p_policy() -> None:
@@ -3487,7 +3531,110 @@ def test_attention_ts_decode_kv256_uses_fragment_ready_p_policy() -> None:
         assert p._fragment_ready_alloc.size_bytes == (
             cfg.num_softmax_score_fragments * 8
         )
-    _assert_decode_smem_within_capacity(cfg, smem_allocator)
+    assert_decode_smem_within_capacity(cfg, smem_allocator)
+
+
+def test_attention_ts_decode_kv256_fp8_tiles_size_the_ring_and_alias_p() -> None:
+    """FP8 KV256 stages one byte per element; the ring holds whole tiles and P aliases S.
+
+    ``test_attention_ts_decode_kv256_ring_depth_follows_element_width`` pins the
+    stage count and the SMEM capacity; this test pins the byte accounting and
+    the TMEM layout behind it.
+    """
+
+    cfg = _make_contiguous_kv256_config(dtype=Float8E4M3FN)
+    assert cfg.use_8bit_qkv
+    assert cfg.smem_kv_tile_bytes == cfg.tile_size_kv * cfg.headdim
+    pipeline_smem_bytes = (
+        cfg.q_stages * cfg.smem_q_tile_bytes + cfg.kv_stages * cfg.smem_kv_tile_bytes
+    )
+    assert pipeline_smem_bytes <= TOTAL_SMEM_BUDGET_KIB * BYTES_PER_KIB
+
+    resources, _smem_allocator, _tmem_allocator = _build_decode_resources(cfg)
+    assert resources["smemKv"]._alloc.size_bytes == (
+        cfg.kv_stages * cfg.smem_kv_tile_bytes
+    )
+    assert resources["tmemO"]._alloc.offset == 0
+    assert resources["smemP0"]._tmem_alloc.offset == resources["tmemS0"]._alloc.offset
+    assert resources["smemP0"]._tmem_alloc.num_columns == cfg.fragment_p_packed_cols * (
+        cfg.num_softmax_score_fragments
+    )
+
+
+@pytest.mark.parametrize(
+    ("dtype", "qkv_layout", "expected_kv_stages"),
+    (
+        pytest.param(
+            BFloat16, "contiguousKv", KV_TILE_256_SHARED_FIFO_STAGES, id="bf16"
+        ),
+        pytest.param(
+            Float16, "contiguousKv", KV_TILE_256_SHARED_FIFO_STAGES, id="fp16"
+        ),
+        pytest.param(
+            BFloat16, "pagedKv", KV_TILE_256_SHARED_FIFO_STAGES, id="bf16-paged"
+        ),
+        pytest.param(
+            Float8E4M3FN,
+            "contiguousKv",
+            KV_TILE_256_BYTE_WIDE_SHARED_FIFO_STAGES,
+            id="fp8",
+        ),
+        pytest.param(
+            Float8E4M3FN,
+            "pagedKv",
+            KV_TILE_256_BYTE_WIDE_SHARED_FIFO_STAGES,
+            id="fp8-paged",
+        ),
+    ),
+)
+@pytest.mark.parametrize("persistent", (False, True), ids=("static", "persistent"))
+def test_attention_ts_decode_kv256_ring_depth_follows_element_width(
+    dtype,
+    qkv_layout: str,
+    expected_kv_stages: int,
+    persistent: bool,
+) -> None:
+    """Byte-wide K/V tiles fund a deeper shared ring; 16-bit tiles keep three."""
+
+    cfg = _make_contiguous_kv256_config(
+        dtype=dtype,
+        o_dtype=Float16 if dtype == Float8E4M3FN else dtype,
+        persistent=persistent,
+        qkv_layout=qkv_layout,
+        num_tokens_per_page=128 if qkv_layout == "pagedKv" else 32,
+    )
+    assert cfg.kv_stages == expected_kv_stages
+    assert cfg.use_8bit_qkv == (
+        expected_kv_stages == KV_TILE_256_BYTE_WIDE_SHARED_FIFO_STAGES
+    )
+    if not persistent:
+        resources, smem_allocator, _tmem_allocator = _build_decode_resources(cfg)
+        assert resources["smemKv"].pipeline_config.num_stages == expected_kv_stages
+        assert_decode_smem_within_capacity(cfg, smem_allocator)
+
+
+def test_attention_ts_decode_kv256_fp8_explicit_ring_depth_is_honored() -> None:
+    """An explicit kv_stages overrides the byte-wide default in both directions."""
+
+    for kv_stages in (KV_TILE_256_SHARED_FIFO_STAGES, 6):
+        cfg = _make_contiguous_kv256_config(
+            dtype=Float8E4M3FN, config_args={"kv_stages": kv_stages}
+        )
+        assert cfg.kv_stages == kv_stages
+        resources, smem_allocator, _tmem_allocator = _build_decode_resources(cfg)
+        assert resources["smemKv"].pipeline_config.num_stages == kv_stages
+        assert_decode_smem_within_capacity(cfg, smem_allocator)
+
+
+def test_attention_ts_decode_kv256_fp8_rejects_attention_sinks() -> None:
+    """FP8 KV256 follows the FP8 Keeps recipes and excludes attention sinks."""
+
+    assert _make_contiguous_kv256_config(dtype=Float8E4M3FN).use_8bit_qkv
+    with pytest.raises(ValueError, match="KV256 supports only"):
+        _make_contiguous_kv256_config(
+            dtype=Float8E4M3FN,
+            config_args={"use_attention_sinks": True},
+        )
 
 
 @pytest.mark.parametrize("persistent", (False, True))
@@ -3500,8 +3647,11 @@ def test_attention_ts_decode_streamed_p_fragments_follow_kv_tile(
     the fragment register count, so the profile property and the fragment
     count are pinned together. They also run their two softmax groups
     unordered. Dense 16-bit Q128/KV128 keeps the complete P row because its
-    route loop is not load-bound; only block-sparse Q128 streams. FP8 Q128
-    publishes a complete packed row and never streams.
+    route loop is not load-bound; only block-sparse Q128 streams. FP8 streams
+    the same fragments with four probabilities per packed column, one PV MMA
+    per fragment, and the exact row maximum as the exponent anchor because
+    the static 448 quantization scale requires probabilities at most one;
+    dense FP8 Q128 streams as well.
     """
 
     kv256 = _make_contiguous_kv256_config(persistent=persistent)
@@ -3510,6 +3660,19 @@ def test_attention_ts_decode_streamed_p_fragments_follow_kv_tile(
     assert kv256.num_softmax_score_fragments == 4
     assert kv256.kv_block_size % kv256.softmax_score_fragment_regs == 0
     assert not kv256.uses_ordered_softmax_barrier
+    assert kv256.fragment_p_packed_cols == 16
+    assert kv256.pv_mma_steps_per_fragment == 2
+    assert kv256.defers_softmax_anchor_updates
+
+    kv256_fp8 = _make_contiguous_kv256_config(dtype=Float8E4M3FN, persistent=persistent)
+    assert kv256_fp8.use_8bit_qkv
+    assert kv256_fp8.streams_tmem_p_fragments
+    assert kv256_fp8.softmax_score_fragment_regs == 32
+    assert kv256_fp8.num_softmax_score_fragments == 4
+    assert kv256_fp8.fragment_p_packed_cols == 8
+    assert kv256_fp8.pv_mma_steps_per_fragment == 1
+    assert kv256_fp8.tmem_p_cols_per_inst == 32
+    assert not kv256_fp8.defers_softmax_anchor_updates
 
     q128 = _make_contiguous_keeps_config(dtype=BFloat16, tile_size_q=128)
     assert q128.tile_size_kv == 128 and q128.uses_two_inst_tmem_p
@@ -3518,8 +3681,219 @@ def test_attention_ts_decode_streamed_p_fragments_follow_kv_tile(
 
     q128_fp8 = _make_contiguous_keeps_config(dtype=Float8E4M3FN, tile_size_q=128)
     assert q128_fp8.uses_two_inst_tmem_p
-    assert q128_fp8.num_softmax_score_fragments == 1
-    assert not q128_fp8.streams_tmem_p_fragments
+    assert q128_fp8.streams_tmem_p_fragments
+    assert q128_fp8.softmax_score_fragment_regs == 32
+    assert q128_fp8.num_softmax_score_fragments == 4
+    assert q128_fp8.fragment_p_packed_cols == 8
+    assert q128_fp8.pv_mma_steps_per_fragment == 1
+    assert not q128_fp8.defers_softmax_anchor_updates
+
+    q128_fp8_sparse = replace(
+        q128_fp8, use_block_sparse=True, q_block_size=128, kv_block_size=128
+    )
+    assert q128_fp8_sparse.streams_tmem_p_fragments
+    assert q128_fp8_sparse.softmax_score_fragment_regs == 32
+    assert q128_fp8_sparse.fragment_p_packed_cols == 8
+    assert q128_fp8_sparse.pv_mma_steps_per_fragment == 1
+    assert not q128_fp8_sparse.defers_softmax_anchor_updates
+
+
+@pytest.mark.parametrize("tile_size_q", (64, 128))
+@pytest.mark.parametrize("o_dtype", (BFloat16, Float16))
+def test_attention_ts_decode_sage_profile_accepts_int8_qk_with_e4m3_v(
+    tile_size_q: int, o_dtype
+) -> None:
+    """INT8 Q/K keeps the byte-wide data path and switches BMM1 to INT32 scores."""
+
+    from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_resources.helpers_common import (
+        _mma_kind_for_pv,
+        _mma_kind_for_qk,
+    )
+    from cutlass.experimental.primitives import Tcgen05MMAKind
+
+    cfg = make_sage_decode_config(
+        tile_size_q=tile_size_q,
+        tile_size_kv=256 if tile_size_q == 64 else 128,
+        qkv_dtype=Int8,
+        v_dtype=Float8E4M3FN,
+        o_dtype=o_dtype,
+    )
+    assert cfg.use_sage_attention and cfg.uses_int32_scores
+    assert cfg.q_dtype == cfg.kv_dtype == Int8
+    assert cfg.v_dtype == Float8E4M3FN
+    assert cfg.use_8bit_qkv
+    assert cfg.q_dtype_bytes == cfg.kv_dtype_bytes == 1
+    assert cfg.streams_tmem_p_fragments
+    assert cfg.fragment_p_packed_cols == 8
+    assert cfg.pv_mma_steps_per_fragment == 1
+    assert not cfg.defers_softmax_anchor_updates
+    assert _mma_kind_for_qk(cfg) == Tcgen05MMAKind.INT8
+    assert _mma_kind_for_pv(cfg) == Tcgen05MMAKind.F8F6F4
+
+    fp8_cfg = make_sage_decode_config(
+        tile_size_q=tile_size_q, tile_size_kv=256 if tile_size_q == 64 else 128
+    )
+    assert fp8_cfg.v_dtype == Float8E4M3FN
+    assert fp8_cfg.use_8bit_qkv
+    assert not fp8_cfg.uses_int32_scores
+    assert _mma_kind_for_qk(fp8_cfg) == Tcgen05MMAKind.F8F6F4
+    assert _mma_kind_for_pv(fp8_cfg) == Tcgen05MMAKind.F8F6F4
+
+    bf16_cfg = _make_contiguous_kv256_config()
+    assert bf16_cfg.v_dtype == bf16_cfg.kv_dtype == BFloat16
+    assert not bf16_cfg.use_8bit_qkv
+    assert _mma_kind_for_qk(bf16_cfg) == Tcgen05MMAKind.F16
+    assert _mma_kind_for_pv(bf16_cfg) == Tcgen05MMAKind.F16
+
+
+def test_attention_ts_decode_v_dtype_follows_the_probe_dtype_flip() -> None:
+    """The grouped-Q selector scores BF16 Q64 as its FP16 twin; V flips with K.
+
+    A V dtype left at BF16 would fail the K/V rule inside the selector's probe
+    and silently drop the Q64 candidate, so BF16 would never select Q64/KV256.
+    """
+
+    for shape in (
+        dict(
+            seq_len_q=4, seq_len_kv=4096, batch_size=1, num_heads_q=64, num_heads_kv=1
+        ),
+        dict(
+            seq_len_q=8, seq_len_kv=32768, batch_size=64, num_heads_q=16, num_heads_kv=1
+        ),
+    ):
+        cfg = make_decode_config(
+            headdim=128,
+            qkv_dtype=BFloat16,
+            o_dtype=BFloat16,
+            qkv_layout="pagedKv",
+            mask_type="causal",
+            **shape,
+        )
+        assert (cfg.tile_size_q, cfg.tile_size_kv) == (64, 256)
+        assert cfg.v_dtype == cfg.kv_dtype == BFloat16
+
+
+def test_attention_ts_decode_config_names_v_with_an_8bit_k() -> None:
+    """A directly constructed config names V; the K/V rule catches an omission."""
+
+    cfg = FmhaDecodeConfig(q_dtype=Float8E4M3FN, kv_dtype=Float8E4M3FN)
+    with pytest.raises(ValueError, match="V follows the K dtype"):
+        cfg.validate_dtypes()
+    cfg.v_dtype = Float8E4M3FN
+    cfg.validate_dtypes()
+
+
+# Dense Sage grids: both streamed Keeps profiles qualify for the static and the
+# persistent scheduler.
+_DENSE_SAGE_GRIDS = ((64, False), (64, True), (128, False), (128, True))
+
+
+@pytest.mark.parametrize(("tile_size_q", "persistent"), _DENSE_SAGE_GRIDS)
+@pytest.mark.parametrize("o_dtype", (BFloat16, Float16))
+@pytest.mark.parametrize("mask_type", ("dense", "causal"))
+def test_attention_ts_decode_sage_profile_accepts_streamed_e4m3_recipes(
+    tile_size_q: int, o_dtype, mask_type: str, persistent: bool
+) -> None:
+    """Sage runs the two streamed Keeps profiles on their qualified grids.
+
+    The scale addressing resolves the tile through the work tile, so the
+    persistent scheduler shares the static kernel's Sage passes wherever the
+    profile admits it.
+    """
+
+    cfg = make_sage_decode_config(
+        tile_size_q=tile_size_q,
+        tile_size_kv=256 if tile_size_q == 64 else 128,
+        o_dtype=o_dtype,
+        mask_type=mask_type,
+        sage_args={"use_persistent_scheduler": persistent},
+    )
+    assert cfg.use_sage_attention
+    assert cfg.use_persistent_scheduler is persistent
+    assert cfg.streams_tmem_p_fragments
+    assert cfg.use_8bit_qkv and not cfg.uses_int32_scores
+    assert cfg.out_dtype == o_dtype
+    assert not cfg.defers_softmax_anchor_updates
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    (
+        pytest.param(
+            {
+                "qkv_dtype": Int8,
+                "v_dtype": Float8E4M3FN,
+                "sage_args": {"sage_k_block_size": 0, "sage_q_block_size": 0},
+            },
+            "Int8 Q/K requires Sage attention",
+            id="int8-without-sage",
+        ),
+        pytest.param(
+            {"qkv_dtype": Int8},
+            "Int8 Q/K requires Float8E4M3FN V",
+            id="int8-v-defaults-to-k",
+        ),
+        pytest.param(
+            {"qkv_dtype": Int8, "v_dtype": Int8},
+            "Int8 Q/K requires Float8E4M3FN V",
+            id="int8-v",
+        ),
+        pytest.param({"v_dtype": Float16}, "v_dtype", id="fp8-k-16-bit-v"),
+        pytest.param({"v_dtype": Int8}, "v_dtype: Int8", id="fp8-k-int8-v"),
+        pytest.param(
+            {"qkv_dtype": Float16, "o_dtype": Float16},
+            "Float8E4M3FN or Int8 Q and K",
+            id="16-bit-qk",
+        ),
+        pytest.param(
+            {
+                "sage_args": {"use_split_kv": True, "splits_kv": 2, "max_splits_kv": 2},
+                "split_kv_mode": "gmem_reduction",
+                "splits_kv": 2,
+            },
+            "split-KV",
+            id="split-kv",
+        ),
+        pytest.param(
+            {"qkv_layout": "pagedKv", "num_tokens_per_page": 128},
+            "contiguous K/V",
+            id="paged-kv",
+        ),
+        pytest.param(
+            {"o_dtype": Float8E4M3FN}, "Float16 or BFloat16 output", id="fp8-output"
+        ),
+        pytest.param(
+            {"sage_args": {"sage_k_block_size": 8}}, "sage_k_block_size", id="k-block-8"
+        ),
+        pytest.param(
+            {"sage_args": {"sage_q_block_size": 3}}, "sage_q_block_size", id="q-block-3"
+        ),
+        pytest.param(
+            {"sage_args": {"sage_q_block_size": 128}},
+            "sage_q_block_size",
+            id="q-block-128",
+        ),
+        pytest.param(
+            {
+                "o_dtype": Float16,
+                "sage_args": {"sage_k_block_size": 0, "sage_v_mean": True},
+            },
+            "require sage_k_block_size",
+            id="v-mean-without-k-block",
+        ),
+    ),
+)
+def test_attention_ts_decode_sage_profile_rejects_unsupported_dtypes_and_recipes(
+    overrides: dict[str, object], match: str
+) -> None:
+    """The Sage profile rejects dtypes and recipes outside its contract.
+
+    It takes 8-bit Q/K (E4M3 V with INT8 Q/K, otherwise V follows K), a 16-bit
+    output, contiguous single-split K/V and the documented scale block sizes.
+    """
+
+    with pytest.raises(ValueError, match=match):
+        make_sage_decode_config(tile_size_q=64, tile_size_kv=256, **overrides)
 
 
 def test_attention_ts_decode_kv256_static_skips_unmodeled_fragment_alias_check() -> (
@@ -3646,7 +4020,7 @@ def test_attention_ts_decode_kv256_explicit_pipeline_depth_contract(
     if not persistent:
         resources, smem_allocator, _tmem_allocator = _build_decode_resources(cfg)
         assert resources["smemKv"].pipeline_config.num_stages == 2
-        _assert_decode_smem_within_capacity(cfg, smem_allocator)
+        assert_decode_smem_within_capacity(cfg, smem_allocator)
 
 
 @pytest.mark.parametrize("persistent", (False, True))
@@ -3676,7 +4050,7 @@ def test_attention_ts_decode_kv256_uses_dedicated_fragment_exchange(
 
     if not persistent:
         _resources, smem_allocator, _tmem_allocator = _build_decode_resources(cfg)
-        _assert_decode_smem_within_capacity(cfg, smem_allocator)
+        assert_decode_smem_within_capacity(cfg, smem_allocator)
 
 
 @pytest.mark.parametrize(
@@ -3813,7 +4187,7 @@ def test_attention_ts_decode_q64_keeps_p_in_smem_within_capacity(
     assert "tmemStatsDone0" not in resources
     assert "tmemStatsDone1" not in resources
     assert tmem_allocator.total_tmem_columns == cfg.tmem_total_cols <= 512
-    _assert_decode_smem_within_capacity(cfg, smem_allocator)
+    assert_decode_smem_within_capacity(cfg, smem_allocator)
 
 
 @pytest.mark.parametrize("dtype", (BFloat16, Float8E4M3FN))
@@ -3844,7 +4218,7 @@ def test_attention_ts_decode_d256_staged_tmem_p_has_overwrite_gate(
     assert s.offset <= p.offset
     assert p.offset + p.num_columns <= s.offset + s.num_columns
     assert cfg.tmem_total_cols <= tmem_allocator.total_tmem_columns <= 512
-    _assert_decode_smem_within_capacity(cfg, smem_allocator)
+    assert_decode_smem_within_capacity(cfg, smem_allocator)
 
 
 @pytest.mark.parametrize(
@@ -6355,6 +6729,22 @@ def test_attention_ts_decode_qfirst_auto_selects_q64_kv256(
             True,
             id="bf16-separate-long-kv",
         ),
+        pytest.param(
+            _FP8,
+            8192,
+            16,
+            "gmem_reduction",
+            False,
+            id="fp8-fused",
+        ),
+        pytest.param(
+            _FP8,
+            8192,
+            32,
+            None,
+            True,
+            id="fp8-separate-multi-head",
+        ),
     ),
 )
 def test_attention_ts_decode_q64_kv256_split_launch(
@@ -6482,6 +6872,127 @@ def test_attention_ts_decode_q64_kv256_boundaries(
     assert policy["use_persistent_scheduler"] is persistent
     if persistent:
         assert policy["use_split_kv"] is False
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.parametrize(
+    (
+        "seq_len_q",
+        "kv_lens",
+        "num_qo_heads",
+        "num_kv_heads",
+        "mask_type",
+        "output_dtype",
+        "persistent",
+    ),
+    (
+        pytest.param(
+            1024,
+            (10800,),
+            40,
+            40,
+            "dense",
+            torch.float16,
+            True,
+            id="dense-sq1024-kv10800-persistent",
+        ),
+        pytest.param(
+            1024,
+            (10800,),
+            40,
+            40,
+            "causal",
+            torch.float16,
+            True,
+            id="causal-sq1024-kv10800-persistent",
+        ),
+        pytest.param(
+            64,
+            (2049, 769, 1281),
+            40,
+            40,
+            "causal",
+            _FP8,
+            False,
+            id="causal-ragged-fp8-out",
+        ),
+        pytest.param(
+            8,
+            (1281, 769),
+            64,
+            8,
+            "dense",
+            torch.float16,
+            False,
+            id="dense-gqa8-sq8",
+        ),
+    ),
+)
+def test_attention_ts_decode_q64_kv256_fp8_streams_p_fragments(
+    monkeypatch: pytest.MonkeyPatch,
+    seq_len_q: int,
+    kv_lens: tuple[int, ...],
+    num_qo_heads: int,
+    num_kv_heads: int,
+    mask_type: str,
+    output_dtype: torch.dtype,
+    persistent: bool,
+):
+    """Check the FP8 KV256 streamed pipeline against the four-stream reference."""
+
+    case = _make_decode_case(
+        kv_lens=kv_lens,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=128,
+        seq_len_q=seq_len_q,
+        page_size=128,
+        qkv_dtype=_FP8,
+        output_dtype=output_dtype,
+        cache_form="combined",
+        mask_type=mask_type,
+        device="cuda",
+        seed=20260908 + seq_len_q + max(kv_lens),
+    )
+
+    policy = _exercise_explicit_kv256_case(monkeypatch, case)
+
+    assert policy["tile_size_q"] == 64
+    assert policy["tile_size_kv"] == 256
+    assert policy["use_split_kv"] is False
+    assert policy["use_persistent_scheduler"] is persistent
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.parametrize("mask_type", ("dense", "causal"))
+def test_attention_ts_decode_fp8_q128_dense_streams_p_fragments(
+    monkeypatch: pytest.MonkeyPatch,
+    mask_type: str,
+):
+    """Dense FP8 Q128/KV128 streams its P fragments."""
+
+    case = _make_decode_case(
+        kv_lens=(4097, 2050),
+        num_qo_heads=128,
+        num_kv_heads=4,
+        head_dim=128,
+        seq_len_q=4,
+        page_size=32,
+        qkv_dtype=_FP8,
+        output_dtype=_FP8,
+        cache_form="combined",
+        mask_type=mask_type,
+        device="cuda",
+        seed=20260909,
+    )
+
+    policy = _exercise_explicit_profile_case(monkeypatch, case, _EXPLICIT_Q128_PROFILE)
+
+    assert policy["tile_size_q"] == 128
+    assert policy["tile_size_kv"] == 128
+    assert policy["mma_variant"] == "keeps_mma_ab"
 
 
 @pytest.mark.arch_blackwell
@@ -7115,12 +7626,8 @@ def test_block_sparse_pattern_heads_graph(storage, fmt, shared):
         block_sparse_attention,
         block_sparse_attention_with_paged_kv_cache,
     )
-    from tests.attention.test_attention_ts_block_sparse import (
-        _Case,
-        _make_bsr,
-        _make_exact_block_bits,
-        _reference,
-    )
+    from tests.attention.prims_ts_test_utils import make_bsr, make_exact_block_bits
+    from tests.attention.test_attention_ts_block_sparse import _Case, _reference
 
     block, mask = 64, "causal"
     torch.manual_seed(45132)
@@ -7163,8 +7670,8 @@ def test_block_sparse_pattern_heads_graph(storage, fmt, shared):
         return raw, full
 
     raw, full = patterns(0)
-    indptr, indices = _make_bsr(raw)
-    bits = _make_exact_block_bits(raw, sk // block)
+    indptr, indices = make_bsr(raw)
+    bits = make_exact_block_bits(raw, sk // block)
     static = dict(
         device=q.device,
         max_blocks_per_row=2,
@@ -7248,10 +7755,10 @@ def test_block_sparse_pattern_heads_graph(storage, fmt, shared):
     with torch.cuda.graph(graph):
         run()
     raw, full = patterns(1)
-    new_indptr, new_indices = _make_bsr(raw)
+    new_indptr, new_indices = make_bsr(raw)
     indptr.copy_(new_indptr)
     indices.copy_(new_indices)
-    bits.copy_(_make_exact_block_bits(raw, sk // block))
+    bits.copy_(make_exact_block_bits(raw, sk // block))
     graph.replay()
     expected = _reference(case, q, k, v, full, valid, dim**-0.5)
     torch.testing.assert_close(out, expected, rtol=0.03, atol=0.01)

@@ -643,6 +643,7 @@ def test_prims_ts_block_sparse_trace_describes_gqa_contract():
         "prims_ts_block_sparse_bitmask_shared",
         "prims_ts_block_sparse_bsr_proxy_shared",
         "prims_ts_block_sparse_bitmask_proxy_shared",
+        "prims_ts_block_sparse_dense",
     }
     contiguous_wrapper_traces = {
         template.name_prefix: template
@@ -657,6 +658,7 @@ def test_prims_ts_block_sparse_trace_describes_gqa_contract():
         "prims_ts_block_sparse_wrapper_bitmask_shared",
         "prims_ts_block_sparse_wrapper_bsr_proxy_shared",
         "prims_ts_block_sparse_wrapper_bitmask_proxy_shared",
+        "prims_ts_block_sparse_wrapper_dense",
     }
     route_modes = {
         ("bsr", False): ("", {"block_indptr", "block_indices"}),
@@ -681,6 +683,23 @@ def test_prims_ts_block_sparse_trace_describes_gqa_contract():
         prims_ts_block_sparse_trace_dispatch()
         is one_shot_traces["prims_ts_block_sparse"]
     )
+    dense_trace = prims_ts_block_sparse_trace_dispatch(use_block_sparse=False)
+    assert dense_trace is one_shot_traces["prims_ts_block_sparse_dense"]
+    dense_wrapper = SimpleNamespace(
+        _plan_state=SimpleNamespace(
+            use_block_sparse=False, sparse_format="bsr", use_proxy_routes=False
+        )
+    )
+    dense_wrapper_trace = contiguous_wrapper_traces[
+        "prims_ts_block_sparse_wrapper_dense"
+    ]
+    assert (
+        prims_ts_block_sparse_wrapper_trace_dispatch(self=dense_wrapper)
+        is dense_wrapper_trace
+    )
+    for template in (dense_trace, dense_wrapper_trace):
+        assert not (set(template.inputs) & all_route_inputs)
+        assert "kv_valid_bits" not in template.inputs
     for (sparse_format, use_proxy_routes), (
         suffix,
         expected_inputs,

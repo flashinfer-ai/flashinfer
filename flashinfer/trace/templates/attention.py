@@ -406,7 +406,7 @@ def _block_sparse_route_schema(
         )
         inputs["v_summary"] = Tensor(
             ["batch_size", "num_kv_blocks", "num_kv_heads", "head_dim"],
-            description="Per-block summed V vectors for proxy routes.",
+            description="Per-block mean V vectors for proxy routes.",
         )
         constraints.extend(
             [
@@ -466,14 +466,28 @@ def _prims_ts_sparse_pattern_trace(
 
 
 def _make_prims_ts_block_sparse_trace(
-    *, sparse_format: str, use_proxy_routes: bool, wrapper: bool
+    *,
+    sparse_format: str,
+    use_proxy_routes: bool,
+    wrapper: bool,
+    use_block_sparse: bool = True,
 ) -> TraceTemplate:
-    route_axes, route_inputs, route_constraints, suffix = _block_sparse_route_schema(
-        sparse_format, use_proxy_routes, kv_len_axis="seq_len_kv"
-    )
-    route_name = "BSR" if sparse_format == "bsr" else "bitmask"
-    if use_proxy_routes:
-        route_name += " proxy"
+    """Describe one contiguous mode: a route frontend with its source mode, or dense.
+
+    The dense mode keeps the Q/K/V tensors, the block-size tile selectors and
+    the mask type; it carries no route metadata and no token mask.
+    """
+    if use_block_sparse:
+        route_axes, route_inputs, route_constraints, suffix = (
+            _block_sparse_route_schema(
+                sparse_format, use_proxy_routes, kv_len_axis="seq_len_kv"
+            )
+        )
+        route_name = "BSR" if sparse_format == "bsr" else "bitmask"
+        if use_proxy_routes:
+            route_name += " proxy"
+    else:
+        route_axes, route_inputs, route_constraints, suffix = {}, {}, [], "_dense"
     axes: dict[str, Var | Const] = {
         "batch_size": Var(description="Number of requests."),
         "seq_len_q": Var(description="Fixed query length per request."),
@@ -531,18 +545,52 @@ def _make_prims_ts_block_sparse_trace(
         "kv_valid_bits is None or num_kv_valid_words == (seq_len_kv + 31) // 32",
         *route_constraints,
     ]
-    if wrapper:
-        description = (
-            "Reusable PrimTS block-sparse MHA/GQA/MQA attention over compact "
-            f"BSHD Q/K/V and live per-KV-head {route_name} metadata. Block "
-            "geometry and mask type are retained by plan() and represented "
-            "as optional trace context."
-        )
+    if use_block_sparse:
+        tags = [
+            "backend:prims-ts",
+            "sparse:block",
+            f"sparse-format:{sparse_format}",
+            "routes:proxy" if use_proxy_routes else "routes:exact",
+            "status:experimental",
+        ]
+        if wrapper:
+            description = (
+                "Reusable PrimTS block-sparse MHA/GQA/MQA attention over compact "
+                f"BSHD Q/K/V and live per-KV-head {route_name} metadata. Block "
+                "geometry and mask type are retained by plan() and represented "
+                "as optional trace context."
+            )
+        else:
+            description = (
+                "One-shot PrimTS block-sparse MHA/GQA/MQA attention over compact "
+                f"BSHD Q/K/V and per-KV-head {route_name} metadata."
+            )
     else:
-        description = (
-            "One-shot PrimTS block-sparse MHA/GQA/MQA attention over compact "
-            f"BSHD Q/K/V and per-KV-head {route_name} metadata."
+        # A dense plan attends over the whole K/V sequence: run() takes Q/K/V
+        # only, so the token mask and its axis leave with the route metadata.
+        del axes["num_kv_valid_words"]
+        del inputs["kv_valid_bits"]
+        constraints.remove(
+            "kv_valid_bits is None or num_kv_valid_words == (seq_len_kv + 31) // 32"
         )
+        tags = [
+            "backend:prims-ts",
+            "sparse:none",
+            "routes:dense",
+            "status:experimental",
+        ]
+        if wrapper:
+            description = (
+                "Reusable PrimTS dense MHA/GQA/MQA attention over compact BSHD "
+                "Q/K/V, the dense mode of the block-sparse wrapper. Block geometry "
+                "and mask type are retained by plan() and represented as optional "
+                "trace context."
+            )
+        else:
+            description = (
+                "One-shot PrimTS dense MHA/GQA/MQA attention over compact BSHD "
+                "Q/K/V, the dense mode of the block-sparse API."
+            )
     return TraceTemplate(
         op_type="block_sparse",
         name_prefix=f"prims_ts_block_sparse{'_wrapper' if wrapper else ''}{suffix}",
@@ -557,13 +605,7 @@ def _make_prims_ts_block_sparse_trace(
             )
         },
         constraints=constraints,
-        tags=[
-            "backend:prims-ts",
-            "sparse:block",
-            f"sparse-format:{sparse_format}",
-            "routes:proxy" if use_proxy_routes else "routes:exact",
-            "status:experimental",
-        ],
+        tags=tags,
     )
 
 
@@ -576,11 +618,16 @@ _PRIMS_TS_BLOCK_SPARSE_TRACES = {
     for sparse_format, use_proxy_routes in _BLOCK_SPARSE_ROUTE_MODES
 }
 prims_ts_block_sparse_trace = _PRIMS_TS_BLOCK_SPARSE_TRACES[("bsr", False)]
+_PRIMS_TS_DENSE_TRACE = _make_prims_ts_block_sparse_trace(
+    sparse_format="bsr", use_proxy_routes=False, wrapper=False, use_block_sparse=False
+)
 
 
 def prims_ts_block_sparse_trace_dispatch(**kwargs):
-    """Select a contiguous one-shot schema from its explicit route mode."""
+    """Select a contiguous one-shot schema from its explicit mode arguments."""
 
+    if not kwargs.get("use_block_sparse", True):
+        return _PRIMS_TS_DENSE_TRACE
     sparse_format = kwargs.get("sparse_format", "bsr")
     use_proxy_routes = kwargs.get("use_proxy_routes", False)
     return _prims_ts_sparse_pattern_trace(
@@ -594,7 +641,7 @@ prims_ts_block_sparse_trace_dispatch.templates = [  # type: ignore[attr-defined]
     _prims_ts_sparse_pattern_trace(template, shared, bound=False)
     for template in _PRIMS_TS_BLOCK_SPARSE_TRACES.values()
     for shared in (False, True)
-]
+] + [_PRIMS_TS_DENSE_TRACE]
 
 
 def _make_prims_ts_paged_block_sparse_trace(
@@ -796,6 +843,9 @@ _PRIMS_TS_BLOCK_SPARSE_WRAPPER_TRACES = {
     )
     for sparse_format, use_proxy_routes in _BLOCK_SPARSE_ROUTE_MODES
 }
+_PRIMS_TS_DENSE_WRAPPER_TRACE = _make_prims_ts_block_sparse_trace(
+    sparse_format="bsr", use_proxy_routes=False, wrapper=True, use_block_sparse=False
+)
 
 
 def _require_prims_ts_block_sparse_wrapper_state(
@@ -820,6 +870,8 @@ def prims_ts_block_sparse_wrapper_trace_dispatch(**kwargs):
     """Trace a planned contiguous block-sparse wrapper run."""
 
     state = _require_prims_ts_block_sparse_wrapper_state(kwargs, "BlockSparseTSWrapper")
+    if not getattr(state, "use_block_sparse", True):
+        return _PRIMS_TS_DENSE_WRAPPER_TRACE
     route_mode = (
         state.sparse_format,  # type: ignore[attr-defined]
         state.use_proxy_routes,  # type: ignore[attr-defined]
@@ -835,7 +887,7 @@ prims_ts_block_sparse_wrapper_trace_dispatch.templates = [  # type: ignore[attr-
     _prims_ts_sparse_pattern_trace(template, shared, bound=True)
     for template in _PRIMS_TS_BLOCK_SPARSE_WRAPPER_TRACES.values()
     for shared in (False, True)
-]
+] + [_PRIMS_TS_DENSE_WRAPPER_TRACE]
 
 
 _PRIMS_TS_PAGED_BLOCK_SPARSE_WRAPPER_TRACES = {

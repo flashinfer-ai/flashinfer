@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Integer constants shared by the FMHA decode TS implementation.
+"""Constants shared by the FMHA decode TS implementation.
 
-Keep non-obvious integer constants here with their rationale so config,
-resource, and reduction code can use named values without duplicating comments.
+Keep non-obvious constants here with their rationale so config, resource, and
+reduction code can use named values without duplicating comments.
 """
+
+import math
 
 # B200 has 148 SMs. Use this only when the runtime SM query is unavailable,
 # so auto split-KV selection remains deterministic in offline/test flows.
@@ -29,17 +31,32 @@ TOTAL_SMEM_BUDGET_KIB = 218
 MAX_KV_STAGE_SMEM_KIB = 144
 BYTES_PER_KIB = 1024
 
-# The supported BF16 M64N256 profile uses a 64-KiB shared K/V stage. Three
-# stages occupy 192 KiB; its 16-KiB Q stage and small metadata/barrier
-# allocations fit in the remaining SM100 budget. Persistent direct-output tail
-# correction rotates a compact 35,840-byte exchange payload over one drained
-# 64-KiB stage in this ring; split-KV keeps its fixed full exchange allocation.
-# Keep this exact-profile override separate from the conservative,
-# topology-independent MAX_KV_STAGE_SMEM_KIB inference above.
+# The M64N256 profile stages one complete 256-row K or V tile per shared-ring
+# slot, so the ring depth follows the element width. A 16-bit tile is 64 KiB:
+# three stages occupy 192 KiB, and with the 16-KiB Q stage, the dedicated tail
+# exchange, and the metadata/barrier allocations the CTA sits at about 227 KiB,
+# the SM100 carveout. A byte-wide tile (E4M3 or Int8 K with E4M3 V) is 32 KiB,
+# and four stages is the depth at which every K load takes the slot the
+# previous QK freed instead of waiting for a V slot that its tile's PV still
+# holds. The four-stage build demotes one pair of persistent scheduler words
+# per warp role to local memory; that costs no measurable time, and four
+# stages measure equal or faster than five on every byte-wide case. The
+# measurements are in the K/V ring depth section of
+# flashinfer/attention/prims_ts/kernels/fmha_decode/README.md. Keep both
+# exact-profile depths separate from the conservative, topology-independent
+# MAX_KV_STAGE_SMEM_KIB inference above.
 KV_TILE_256_SHARED_FIFO_STAGES = 3
+KV_TILE_256_BYTE_WIDE_SHARED_FIFO_STAGES = 4
 
-# The four semantic K64 atoms are stored in the physical K slots consumed by
-# the two interleaved QK instructions in this order.
+# The four semantic K64 atoms of a KV256 tile are staged in these physical K
+# slots. QK and PV both run the WS 2x2 datapath, whose two TMEM lane halves are
+# independent 64-row datapaths: QK splits its 256 B columns into two
+# contiguous 128-column halves, one per lane half, while PV consumes adjacent
+# KV64 block pairs per K step (lane half 0 multiplies block 2j, lane half 1
+# block 2j+1, both against the same P columns). Staging K as (0, 2, 1, 3)
+# makes the QK lane halves produce the token blocks {0, 2} and {1, 3}, so P
+# aliases S unchanged and V stays in natural order; the score column mapping
+# undoes the permutation for masking and Sage scales.
 KV_TILE_256_K_SLOT_FOR_SEMANTIC_ATOM = (0, 2, 1, 3)
 
 # Keep the old maximum as the exponent reference while a new maximum is at
@@ -140,6 +157,22 @@ PACKED_REGISTER_BYTES = 4
 FP8_VALUES_PER_REG = 4
 FP16_VALUES_PER_REG = 2
 
+# Bytes of the K-major operand row one tcgen05 MMA instruction consumes: 32
+# one-byte or 16 two-byte K elements, so a streamed K32 score fragment feeds
+# one byte-wide PV instruction or two 16-bit ones.
+MMA_K_STEP_BYTES = 32
+
+# FP8 probabilities are quantized as 448 * p (the E4M3 maximum). Row sums and
+# attention-sink terms follow the same scale; the output normalization divides
+# it back out. The log2 form is the addend of the exp2-domain softmax.
+FP8_P_QUANT_SCALE = 448.0
+FP8_P_QUANT_LOG2_SCALE = math.log2(FP8_P_QUANT_SCALE)
+
+# tcgen05 SMEM descriptor geometry: address offsets count 16-byte units and a
+# 128-byte swizzle atom spans one 128-byte row per K or MN index.
+SMEM_DESC_UNIT_BYTES = 16
+SWIZZLE_128B_ROW_BYTES = 128
+
 # Per-lane register ownership denominators for packed output fragments.
 FP8_OUTPUT_ELEMENTS_PER_REG_GROUP = 512
 FP16_OUTPUT_ELEMENTS_PER_REG_GROUP = 256
@@ -173,3 +206,26 @@ PARALLEL_REDUCTION_FINAL_REDUCERS = 4
 OUTPUT_VALUES_PER_THREAD = 8
 FP8_PACKED_OUTPUT_REGS_PER_THREAD = 2
 PACKED_OUTPUT_REGS_PER_THREAD = 4
+
+# INT8 Q/K scores are accumulated on top of the bit pattern of ``1.5 * 2**23``:
+# every integer in ``[2**23, 2**24)`` is an FP32 number with unit spacing, and
+# every INT8 dot product satisfies ``|score| <= 128 * 128 * 128 = 2**21`` for
+# ``D = 128`` (the only Sage head dimension), so the final INT32 accumulator
+# ``bias + score`` is exactly the FP32 number ``12582912.0 + score``. The
+# softmax reads the scores as FP32 without a per-element conversion; the max
+# pass subtracts the bias once per scale group and the exp pass folds
+# ``-bias * multiplier`` into each group's exponent addend.
+INT32_SCORE_BIAS = 12582912.0
+# The bias is written by one ``kind::f16`` MMA step before the INT8 K steps.
+# Both operands read the same BF16 tile, whose every K = 16 row is
+# ``[1024, 1024, 1024, 0]`` repeated: the twelve nonzero products ``2**20``
+# sum to exactly ``1.5 * 2**23`` (every product and partial sum is a multiple
+# of ``2**20`` below ``2**24``). One shared operand descriptor keeps the MMA
+# warp's live state small. The tile is stored as unswizzled K-major 32-byte
+# rows whose 8x16-byte core matrices are 128 bytes apart along the row and
+# 256 bytes apart between eight-row groups; every 16-byte chunk holds the
+# pattern, so the two packed words alternate with the word index.
+INT32_SCORE_SEED_MMA_K = 16
+INT32_SCORE_SEED_TILE_WORDS = (0x44804480, 0x00004480)
+INT32_SCORE_SEED_TILE_LBO = 128
+INT32_SCORE_SEED_TILE_SBO = 256
