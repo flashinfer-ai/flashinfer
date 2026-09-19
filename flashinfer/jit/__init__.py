@@ -25,7 +25,6 @@ from .activation import gen_act_and_mul_module as gen_act_and_mul_module
 from .activation import get_act_and_mul_cu_str as get_act_and_mul_cu_str
 from .attention import gen_cudnn_fmha_module as gen_cudnn_fmha_module
 from .attention import gen_batch_attention_module as gen_batch_attention_module
-from .attention import gen_batch_decode_mla_module as gen_batch_decode_mla_module
 from .attention import gen_batch_decode_module as gen_batch_decode_module
 from .attention import gen_batch_mla_module as gen_batch_mla_module
 from .attention import gen_batch_prefill_module as gen_batch_prefill_module
@@ -47,7 +46,6 @@ from .attention import gen_pod_module as gen_pod_module
 from .attention import gen_single_decode_module as gen_single_decode_module
 from .attention import gen_single_prefill_module as gen_single_prefill_module
 from .attention import get_batch_attention_uri as get_batch_attention_uri
-from .attention import get_batch_decode_mla_uri as get_batch_decode_mla_uri
 from .attention import get_batch_decode_uri as get_batch_decode_uri
 from .attention import get_batch_mla_uri as get_batch_mla_uri
 from .attention import get_batch_prefill_uri as get_batch_prefill_uri
@@ -95,8 +93,30 @@ from .dsv3_optimizations import (
 )
 from .tinygemm2 import gen_tinygemm2_module as gen_tinygemm2_module
 from .tinygemm2 import gen_tinygemm2_sm100_module as gen_tinygemm2_sm100_module
+from .cake_megamoe_topk_reduce import (
+    gen_cake_megamoe_topk_reduce_module as gen_cake_megamoe_topk_reduce_module,
+)
+from .cake_megamoe_topk_reduce import (
+    get_cake_megamoe_topk_reduce_module as get_cake_megamoe_topk_reduce_module,
+)
+from .cake_megamoe_topk_reduce import (
+    get_cake_megamoe_topk_reduce_uri as get_cake_megamoe_topk_reduce_uri,
+)
+from .cake_megamoe_topk_reduce import (
+    load_cake_megamoe_topk_reduce_module as load_cake_megamoe_topk_reduce_module,
+)
+from .cake_megamoe_topk_reduce import (
+    is_cake_megamoe_topk_reduce_module_loaded as is_cake_megamoe_topk_reduce_module_loaded,
+)
+from .cake_megamoe_topk_reduce import (
+    run_cake_megamoe_topk_reduce as run_cake_megamoe_topk_reduce,
+)
+from .fused_moe import gen_alphamoe_sm100_module as gen_alphamoe_sm100_module
 from .moe_utils import gen_moe_utils_module as gen_moe_utils_module
 from .hash_topk import gen_hash_topk_module as gen_hash_topk_module
+from .q_token_kv_block_sparse_metadata import (
+    gen_prims_ts_q_token_kv_block_sparse_metadata_module as gen_prims_ts_q_token_kv_block_sparse_metadata_module,
+)
 from .fp4_kv_dequantization import (
     gen_fp4_kv_dequantization_module as gen_fp4_kv_dequantization_module,
 )
@@ -120,6 +140,21 @@ from .cake_kda import (
 )
 from .cake_kda import (
     load_cake_kda_m128_unbounded_softplus_module as load_cake_kda_m128_unbounded_softplus_module,
+)
+from .cake_fused_moe_warp_decode import (
+    CakeWarpDecodeTarget as CakeWarpDecodeTarget,
+)
+from .cake_fused_moe_warp_decode import (
+    gen_cake_fused_moe_warp_decode_module as gen_cake_fused_moe_warp_decode_module,
+)
+from .cake_fused_moe_warp_decode import (
+    get_cake_fused_moe_warp_decode_module as get_cake_fused_moe_warp_decode_module,
+)
+from .cake_fused_moe_warp_decode import (
+    get_cake_fused_moe_warp_decode_uri as get_cake_fused_moe_warp_decode_uri,
+)
+from .cake_fused_moe_warp_decode import (
+    load_cake_fused_moe_warp_decode_module as load_cake_fused_moe_warp_decode_module,
 )
 from .flash_kda import (
     gen_flash_kda_m64_module as gen_flash_kda_m64_module,
@@ -163,6 +198,9 @@ from .blackwell_bgmv_moe import (
 )
 from .monomoe import gen_monomoe_module as gen_monomoe_module
 from .monomoe import load_monomoe_module as load_monomoe_module
+from .fused_moe import (
+    gen_alphamoe_fused_router_module as gen_alphamoe_fused_router_module,
+)
 
 
 cuda_lib_path = os.environ.get(

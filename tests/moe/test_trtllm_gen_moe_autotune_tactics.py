@@ -31,7 +31,7 @@ from flashinfer import (
     shuffle_matrix_a,
     shuffle_matrix_sf_a,
 )
-from flashinfer.autotuner import AutoTuner
+from flashinfer.autotuner import AutoTuner, TunableRunner
 from flashinfer.fused_moe import (
     trtllm_fp4_block_scale_moe,
     trtllm_fp4_block_scale_routed_moe,
@@ -78,6 +78,8 @@ def _moe_profile_shapes(
     def _bucket(t: torch.Tensor | None, dim: int = 0) -> tuple:
         if t is None:
             return (0,)
+        # Non-None routing placeholders remain dynamic autotuner inputs even
+        # when empty, so their persisted key uses the token bucket as well.
         s = list(t.shape)
         s[dim] = bucket_m
         return tuple(s)
@@ -107,13 +109,22 @@ def _force_tactic_in_autotuner_cache(
     profile_shapes: tuple,
     tactic: list[int] | None,
     custom_op: str,
+    runner: TunableRunner,
 ) -> None:
-    file_key = str((custom_op, _TEST_RUNNER, profile_shapes, ()))
+    runner_name = runner.__class__.__name__
+    file_key = str(
+        (
+            custom_op,
+            runner_name,
+            profile_shapes,
+            runner.get_cache_key_extras([]),
+        )
+    )
     tuner = AutoTuner.get()
     tuner.profiling_cache.clear()
     tuner._file_configs.clear()
     if tactic is not None:
-        tuner._file_configs[file_key] = (_TEST_RUNNER, list(tactic))
+        tuner._file_configs[file_key] = (runner_name, list(tactic))
 
 
 def _check_tactic(
@@ -335,6 +346,7 @@ def _enumerate_valid_tactics(
             Fp8QuantizationType.NoneFp8,
             top_k,
             hidden_size,
+            hidden_size,
             intermediate_size,
             num_experts,  # num_local_experts
             activation_type.value,
@@ -362,7 +374,9 @@ def test_nvfp4_per_token_all_tactics_are_correct(
         pytest.skip("Only work on SM100 / SM103.")
 
     torch.manual_seed(42)
-    moe_op = gen_trtllm_gen_fused_moe_sm100_module().build_and_load()
+    moe_op = gen_trtllm_gen_fused_moe_sm100_module(
+        enable_rubin=get_compute_capability(torch.device(device="cuda")) == (10, 7)
+    ).build_and_load()
     valid_tactics = _enumerate_valid_tactics(
         moe_op,
         "NvFP4xNvFP4",
@@ -403,6 +417,7 @@ def test_nvfp4_per_token_all_tactics_are_correct(
                     use_4over6=True,
                     weights_use_4over6=True,
                     activation_type=activation_type,
+                    zero_rows=False,
                 )
         except Exception as err:
             raise AssertionError(
@@ -436,9 +451,27 @@ def test_nvfp4_per_tensor_small_shape_all_tactics_are_correct():
         device=device,
     )
     profile_shapes = _moe_profile_shapes(inputs, num_tokens, num_tokens)
+    moe_module = get_trtllm_moe_sm100_module()
+    cfg = _quant_mode_config("NvFP4xNvFP4")
+    forced_runner = moe_module.MoERunner(
+        moe_module.moe_op,
+        top_k=top_k,
+        num_local_experts=num_experts,
+        dtype_act=cfg["dtype_act"],
+        dtype_weights=cfg["dtype_weights"],
+        fp8_quantization_type=Fp8QuantizationType.NoneFp8,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        activation_type=ActivationType.Swiglu.value,
+        weight_layout=WeightLayout.MajorK,
+        use_shuffled_weight=True,
+        num_experts=num_experts,
+    )
 
     def _run(tactic: list[int] | None) -> torch.Tensor:
-        _force_tactic_in_autotuner_cache(profile_shapes, tactic, custom_op=_TEST_OP_FP4)
+        _force_tactic_in_autotuner_cache(
+            profile_shapes, tactic, custom_op=_TEST_OP_FP4, runner=forced_runner
+        )
         output = trtllm_fp4_block_scale_routed_moe(
             topk_ids=inputs["packed_topk"],
             routing_bias=None,
@@ -473,7 +506,7 @@ def test_nvfp4_per_tensor_small_shape_all_tactics_are_correct():
         torch.cuda.synchronize()
         return output
 
-    moe_op = gen_trtllm_gen_fused_moe_sm100_module().build_and_load()
+    moe_op = moe_module.moe_op
     valid_tactics = _enumerate_valid_tactics(
         moe_op,
         "NvFP4xNvFP4",
@@ -551,9 +584,27 @@ def test_trtllm_fp4_routed_moe_all_tactics_correctness(
     tune_max_num_tokens = max(last_positive_power_of_2(num_tokens), 16)
     bucket_m = min(last_positive_power_of_2(num_tokens), tune_max_num_tokens)
     profile_shapes = _moe_profile_shapes(inputs, num_tokens, bucket_m)
+    moe_module = get_trtllm_moe_sm100_module()
+    cfg = _quant_mode_config(quant_mode)
+    forced_runner = moe_module.MoERunner(
+        moe_module.moe_op,
+        top_k=top_k,
+        num_local_experts=num_experts,
+        dtype_act=cfg["dtype_act"],
+        dtype_weights=cfg["dtype_weights"],
+        fp8_quantization_type=Fp8QuantizationType.NoneFp8,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        activation_type=ActivationType.Swiglu.value,
+        weight_layout=WeightLayout.MajorK,
+        use_shuffled_weight=True,
+        num_experts=num_experts,
+    )
 
     def _run_kernel_with_tactic(tactic: list[int] | None) -> torch.Tensor:
-        _force_tactic_in_autotuner_cache(profile_shapes, tactic, custom_op=_TEST_OP_FP4)
+        _force_tactic_in_autotuner_cache(
+            profile_shapes, tactic, custom_op=_TEST_OP_FP4, runner=forced_runner
+        )
         out = trtllm_fp4_block_scale_routed_moe(
             topk_ids=inputs["packed_topk"],
             routing_bias=None,
@@ -595,7 +646,7 @@ def test_trtllm_fp4_routed_moe_all_tactics_correctness(
         f"[{quant_mode}] reference output is not finite — bad test setup"
     )
 
-    moe_op = gen_trtllm_gen_fused_moe_sm100_module().build_and_load()
+    moe_op = moe_module.moe_op
     valid_tactics = _enumerate_valid_tactics(
         moe_op,
         quant_mode,
@@ -846,6 +897,7 @@ def _enumerate_fp8_valid_tactics(
             cfg["fp8_quantization_type"],
             top_k,
             hidden_size,
+            hidden_size,
             intermediate_size,
             num_experts,  # num_local_experts
             ActivationType.Swiglu.value,
@@ -899,9 +951,26 @@ def test_trtllm_fp8_routed_moe_all_tactics_correctness(
     profile_shapes = _moe_profile_shapes(
         inputs, num_tokens, bucket_m, scale_dim=cfg["scale_dim"]
     )
+    moe_module = get_trtllm_moe_sm100_module()
+    forced_runner = moe_module.MoERunner(
+        moe_module.moe_op,
+        top_k=top_k,
+        num_local_experts=num_experts,
+        dtype_act=cfg["dtype_act"],
+        dtype_weights=cfg["dtype_weights"],
+        fp8_quantization_type=cfg["fp8_quantization_type"],
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        activation_type=ActivationType.Swiglu.value,
+        weight_layout=cfg["weight_layout"],
+        use_shuffled_weight=cfg["use_shuffled_weight"],
+        num_experts=num_experts,
+    )
 
     def _run_kernel_with_tactic(tactic: list[int] | None) -> torch.Tensor:
-        _force_tactic_in_autotuner_cache(profile_shapes, tactic, custom_op=_TEST_OP_FP8)
+        _force_tactic_in_autotuner_cache(
+            profile_shapes, tactic, custom_op=_TEST_OP_FP8, runner=forced_runner
+        )
         out = torch.empty(num_tokens, hidden_size, dtype=torch.bfloat16, device=device)
         trtllm_fp8_block_scale_routed_moe(
             topk_ids=inputs["packed_topk"],
@@ -939,7 +1008,7 @@ def test_trtllm_fp8_routed_moe_all_tactics_correctness(
         f"[{quant_mode}] reference output is not finite — bad test setup"
     )
 
-    moe_op = gen_trtllm_gen_fused_moe_sm100_module().build_and_load()
+    moe_op = moe_module.moe_op
     valid_tactics = _enumerate_fp8_valid_tactics(
         moe_op,
         quant_mode,

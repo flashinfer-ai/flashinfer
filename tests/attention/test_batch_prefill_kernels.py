@@ -20,11 +20,29 @@ import numpy
 import pytest
 import torch
 from tests.test_helpers.jit_utils import gen_prefill_attention_modules
+from tests.test_helpers.paged_kv import make_padded_paged_kv_view
 
 import flashinfer
 from tests.test_helpers.test_helpers import assert_close_chunked, ref_single_prefill
 from tests.test_helpers.utils_fp4 import create_nvfp4_kv, nvfp4_to_float
 from flashinfer.utils import get_compute_capability, has_flashinfer_jit_cache
+
+
+def _reset_workspace_for_plan(wrapper, *plan_args, **plan_kwargs):
+    try:
+        float_size, int_size = wrapper.workspace_size(
+            *[t.to("cuda:0") if torch.is_tensor(t) else t for t in plan_args],
+            **plan_kwargs,
+        )
+    except NotImplementedError:
+        # Only the FA2 planner reports its size, and it is the only one that
+        # reserves split-KV partials. FA3 (auto on SM90) stores work indices
+        # alone, so the fixed workspace is enough for it.
+        return
+    wrapper.reset_workspace_buffer(
+        torch.empty(float_size, dtype=torch.uint8, device="cuda:0"),
+        torch.empty(int_size, dtype=torch.uint8, device="cuda:0"),
+    )
 
 
 def head_dim_512_supported() -> bool:
@@ -126,10 +144,6 @@ def test_batch_prefill_with_paged_kv_cache(
     return_lse,
     contiguous_kv,
 ):
-    if use_cuda_graph:
-        pytest.xfail(
-            "NOTE(Zihao): temporarily disable cuda graph until we fully fix the workspace buffer overflow issue for prefill + cudagraph"
-        )
     if qo_len > kv_len and causal:
         pytest.skip("qo_len > kv_len and causal is not supported")
     q = torch.randn(
@@ -226,6 +240,22 @@ def test_batch_prefill_with_paged_kv_cache(
             paged_kv_indptr_buf=kv_indptr_buffer,
             paged_kv_indices_buf=kv_indices_buffer,
             paged_kv_last_page_len_buf=kv_last_page_len_buffer,
+        )
+        # Graph buffers must not move between capture and replay, so reserve what
+        # the final plan needs up front instead of a fixed-size workspace.
+        _reset_workspace_for_plan(
+            wrapper,
+            q_indptr_cpu,
+            kv_indptr_cpu,
+            kv_indices_cpu,
+            kv_last_page_len_cpu,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            causal=causal,
+            pos_encoding_mode=pos_encoding_mode,
+            logits_soft_cap=logits_soft_cap,
         )
         q_indptr_warmup = torch.arange(0, batch_size + 1).int() * qo_len
         kv_indptr_warmup = torch.arange(0, batch_size + 1).int()
@@ -336,6 +366,173 @@ def test_batch_prefill_with_paged_kv_cache(
         o_i = o[q_indptr_cpu[i] : q_indptr_cpu[i + 1]]
         _accumulate_mismatch_count(mismatch_counts, o_i, o_ref_i, rtol=1e-3, atol=1e-3)
     _assert_no_ref_mismatch(mismatch_counts)
+
+
+@pytest.mark.parametrize("kv_layout,head_dim", [("NHD", 64), ("HND", 128)])
+def test_batch_prefill_lazy_stride_router_plan_reuse(kv_layout, head_dim):
+    """Reuse one equal-primary plan across equal/unequal/equal paged runs."""
+    torch.manual_seed(42)
+    batch_size, qo_len, kv_len, page_size = 2, 17, 97, 16
+    num_qo_heads, num_kv_heads = 8, 2
+    pages_per_request = (kv_len + page_size - 1) // page_size
+    total_pages = batch_size * pages_per_request
+
+    q = torch.randn(
+        batch_size * qo_len,
+        num_qo_heads,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    if kv_layout == "NHD":
+        cache_shape = (total_pages, page_size, num_kv_heads, head_dim)
+        to_dense = lambda cache: cache.reshape(-1, num_kv_heads, head_dim)
+    else:
+        cache_shape = (total_pages, num_kv_heads, page_size, head_dim)
+        to_dense = lambda cache: cache.permute(0, 2, 1, 3).reshape(
+            -1, num_kv_heads, head_dim
+        )
+
+    k = torch.randn(cache_shape, device="cuda", dtype=torch.bfloat16) / 4
+    v_equal = torch.randn(cache_shape, device="cuda", dtype=torch.bfloat16) / 4
+    v_unequal = make_padded_paged_kv_view(v_equal, kv_layout)
+    assert k.shape == v_equal.shape == v_unequal.shape
+    assert k.stride() == v_equal.stride()
+    assert k.stride() != v_unequal.stride()
+
+    qo_indptr = (
+        torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * qo_len
+    )
+    kv_indptr = (
+        torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32)
+        * pages_per_request
+    )
+    kv_indices = torch.arange(total_pages, device="cuda", dtype=torch.int32)
+    last_page_len = torch.full(
+        (batch_size,),
+        (kv_len - 1) % page_size + 1,
+        device="cuda",
+        dtype=torch.int32,
+    )
+
+    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        torch.empty(128 * 1024 * 1024, device="cuda", dtype=torch.uint8),
+        kv_layout,
+        backend="fa2",
+    )
+    wrapper.plan(
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        causal=True,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+        fixed_split_size=2,
+    )
+    plan_info = tuple(wrapper._plan_info)
+    outputs = [
+        wrapper.run(q, cache) for cache in ((k, v_equal), (k, v_unequal), (k, v_equal))
+    ]
+    assert tuple(wrapper._plan_info) == plan_info
+
+    expected_batches = []
+    for batch_idx in range(batch_size):
+        q_i = q[batch_idx * qo_len : (batch_idx + 1) * qo_len]
+        page_slice = slice(
+            batch_idx * pages_per_request,
+            (batch_idx + 1) * pages_per_request,
+        )
+        expected_i, _ = ref_single_prefill(
+            q_i,
+            to_dense(k[page_slice])[:kv_len],
+            to_dense(v_equal[page_slice])[:kv_len],
+            causal=True,
+        )
+        expected_batches.append(expected_i)
+    expected = torch.cat(expected_batches)
+    for output in outputs:
+        torch.testing.assert_close(output, expected, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(outputs[0], outputs[1], rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(outputs[0], outputs[2], rtol=1e-2, atol=1e-2)
+
+
+def test_batch_prefill_lazy_stride_router_nvfp4():
+    """Route on data strides while preserving independent NVFP4 scale strides."""
+    torch.manual_seed(42)
+    batch_size, qo_len, kv_len, page_size = 1, 17, 33, 16
+    num_qo_heads, num_kv_heads, head_dim = 4, 2, 128
+    pages_per_request = (kv_len + page_size - 1) // page_size
+    total_pages = batch_size * pages_per_request
+
+    q = torch.randn(
+        batch_size * qo_len,
+        num_qo_heads,
+        head_dim,
+        device="cuda",
+        dtype=torch.float16,
+    )
+    packed_shape = (total_pages, page_size, num_kv_heads, head_dim // 2)
+    k_packed, k_sf, k_scale = create_nvfp4_kv(packed_shape, "cuda")
+    v_packed, v_sf, v_scale = create_nvfp4_kv(packed_shape, "cuda")
+    v_packed_unequal = make_padded_paged_kv_view(v_packed, "NHD")
+    k_sf_unequal = make_padded_paged_kv_view(k_sf, "NHD", padding_heads=1)
+    v_sf_unequal = make_padded_paged_kv_view(v_sf, "NHD", padding_heads=3)
+    assert k_packed.stride() == v_packed.stride()
+    assert k_packed.stride() != v_packed_unequal.stride()
+    assert k_sf_unequal.stride() != v_sf_unequal.stride()
+
+    qo_indptr = torch.tensor([0, qo_len], device="cuda", dtype=torch.int32)
+    kv_indptr = torch.tensor([0, pages_per_request], device="cuda", dtype=torch.int32)
+    kv_indices = torch.arange(total_pages, device="cuda", dtype=torch.int32)
+    last_page_len = torch.tensor(
+        [(kv_len - 1) % page_size + 1], device="cuda", dtype=torch.int32
+    )
+    custom_mask = torch.tril(
+        torch.ones(qo_len, kv_len, device="cuda", dtype=torch.bool),
+        diagonal=kv_len - qo_len,
+    ).flatten()
+    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        torch.empty(128 * 1024 * 1024, device="cuda", dtype=torch.uint8),
+        "NHD",
+        backend="fa2",
+    )
+    wrapper.plan(
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        custom_mask=custom_mask,
+        q_data_type=torch.float16,
+        kv_data_type=torch.uint8,
+    )
+    plan_info = tuple(wrapper._plan_info)
+    equal_output = wrapper.run(
+        q,
+        (k_packed, v_packed),
+        kv_cache_sf=(k_sf_unequal, v_sf_unequal),
+        k_scale=k_scale.item(),
+        v_scale=v_scale.item(),
+    )
+
+    wrapper.prewarm_paged_kv_stride_variant("independent")
+    unequal_output = wrapper.run(
+        q,
+        (k_packed, v_packed_unequal),
+        kv_cache_sf=(k_sf_unequal, v_sf_unequal),
+        k_scale=k_scale.item(),
+        v_scale=v_scale.item(),
+    )
+    assert tuple(wrapper._plan_info) == plan_info
+    torch.testing.assert_close(unequal_output, equal_output, rtol=1e-3, atol=1e-3)
 
 
 @pytest.mark.parametrize("causal", [False, True])
@@ -470,10 +667,6 @@ def test_batch_prefill_with_tuple_paged_kv_cache(
     return_lse,
     contiguous_kv,
 ):
-    if use_cuda_graph:
-        pytest.xfail(
-            "NOTE(Zihao): temporarily disable cuda graph until we fully fix the workspace buffer overflow issue for prefill + cudagraph"
-        )
     if qo_len > kv_len and causal:
         pytest.skip("qo_len > kv_len and causal is not supported")
     q = torch.randn(
@@ -569,6 +762,22 @@ def test_batch_prefill_with_tuple_paged_kv_cache(
             paged_kv_indptr_buf=kv_indptr_buffer,
             paged_kv_indices_buf=kv_indices_buffer,
             paged_kv_last_page_len_buf=kv_last_page_len_buffer,
+        )
+        # Graph buffers must not move between capture and replay, so reserve what
+        # the final plan needs up front instead of a fixed-size workspace.
+        _reset_workspace_for_plan(
+            wrapper,
+            q_indptr_cpu,
+            kv_indptr_cpu,
+            kv_indices_cpu,
+            kv_last_page_len_cpu,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            causal=causal,
+            pos_encoding_mode=pos_encoding_mode,
+            logits_soft_cap=logits_soft_cap,
         )
         q_indptr_warmup = torch.arange(0, batch_size + 1).int() * qo_len
         kv_indptr_warmup = torch.arange(0, batch_size + 1).int()
@@ -2127,6 +2336,26 @@ def test_batch_prefill_with_ragged_kv_cache_nvfp4(
         torch.testing.assert_close(o_i, o_ref_i, rtol=1e-1, atol=1e-1)
 
 
+@pytest.mark.parametrize("q_dtype", [torch.float16, torch.bfloat16])
+def test_batch_prefill_with_paged_kv_cache_nvfp4_head_dim_256(q_dtype):
+    # Symmetric head_dim 256 is the widest repack-eligible NVFP4 shape: the 16-bit staging
+    # buffer costs max(head_dim_qk, head_dim_vo) * 16 * NUM_WARPS_KV * sizeof(DTypeQ) per
+    # NUM_MMA_KV, twice the head_dim 128 case the parametrized test above covers. Kept as a
+    # single focused case per Q dtype rather than another axis on that matrix.
+    skip_if_head_dim_unsupported(256)
+    test_batch_prefill_with_paged_kv_cache_nvfp4(
+        batch_size=1,
+        kv_len=256,
+        qo_len=128,
+        page_size=16,
+        num_kv_heads=1,
+        num_qo_heads=1,
+        head_dim=256,
+        causal=False,
+        q_dtype=q_dtype,
+    )
+
+
 def test_batch_prefill_with_paged_kv_cache_nvfp4_large_head():
     skip_if_head_dim_unsupported(512)
     test_batch_prefill_with_paged_kv_cache_nvfp4(
@@ -2186,6 +2415,24 @@ def test_batch_prefill_with_paged_kv_cache_nvfp4_rope_large_head_bf16():
         causal=False,
         q_dtype=torch.bfloat16,
         pos_encoding_mode="ROPE_LLAMA",
+    )
+
+
+@pytest.mark.parametrize("q_dtype", [torch.float16, torch.bfloat16])
+def test_batch_prefill_with_ragged_kv_cache_nvfp4_head_dim_256(q_dtype):
+    # Ragged counterpart of the paged head_dim 256 case above: the two launchers size their
+    # shared-memory budget independently, so the widest repack-eligible shape has to run on
+    # both.
+    skip_if_head_dim_unsupported(256)
+    test_batch_prefill_with_ragged_kv_cache_nvfp4(
+        batch_size=1,
+        kv_len=256,
+        qo_len=128,
+        num_kv_heads=1,
+        num_qo_heads=1,
+        head_dim=256,
+        causal=False,
+        q_dtype=q_dtype,
     )
 
 
@@ -2297,6 +2544,17 @@ def test_single_prefill_torch_compile_cuda_graph():
     # in CI containers where the uid has no /etc/passwd entry. Setting USER avoids this.
     env = os.environ.copy()
     env.setdefault("USER", "ci")
+
+    # Preflight in-process so a module missing from the jit-cache skips via
+    # conftest's MissingJITCacheError handler instead of failing in the
+    # subprocess; also keeps JIT compilation out of the subprocess timeout.
+    S, QH, KH, D = 128, 8, 8, 128
+    flashinfer.single_prefill_with_kv_cache(
+        torch.randn(S, QH, D, device="cuda", dtype=torch.float16),
+        torch.randn(S, KH, D, device="cuda", dtype=torch.float16),
+        torch.randn(S, KH, D, device="cuda", dtype=torch.float16),
+        causal=True,
+    )
 
     # The parent pytest process has already run thousands of prefill cases in this
     # file. Release its cached blocks before the subprocess initializes

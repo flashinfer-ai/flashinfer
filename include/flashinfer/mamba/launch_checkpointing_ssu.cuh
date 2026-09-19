@@ -62,6 +62,7 @@ void dispatch_precompute_num_warps(int nw, Fn&& fn) {
 template <typename input_t, typename dt_t, typename weight_t, typename matrixA_t, typename state_t,
           typename stateIndex_t, typename state_scale_t, int D_SPLIT, bool VARLEN>
 void launchCheckpointingSsuImpl(CheckpointingSsuParams& params, int precompute_heads_per_cta,
+                                int main_pipeline_stages, int main_ctas_per_sm,
                                 cudaStream_t stream) {
   constexpr int NUM_WARPS = 4;
 
@@ -254,9 +255,11 @@ void launchCheckpointingSsuImpl(CheckpointingSsuParams& params, int precompute_h
       };
       auto const regime = [](int /*total_work*/) -> MainRegime { return {1, 16}; }(main_total_work);
 
+      // Explicit host handles take precedence over the experiment-only envs.
       // Envs are read PER LAUNCH (getenv is ~ns against a launch): tests monkeypatch them
       // per-case, and a static latch would pin the first-seen value for the whole process.
       int const main_cta_per_sm = [&] {
+        if (main_ctas_per_sm > 0) return main_ctas_per_sm;
         char const* e = std::getenv("FLASHINFER_SSU_MAIN_CTA_PER_SM");
         int const v = e ? std::atoi(e) : 0;  // unset/<=0 → regime default
         return v > 0 ? v : regime.cta_per_sm;
@@ -266,6 +269,12 @@ void launchCheckpointingSsuImpl(CheckpointingSsuParams& params, int precompute_h
           static_cast<int>(main_grid_ll < main_total_work ? main_grid_ll : main_total_work);
 
       int const main_stages = [&] {
+        if (main_pipeline_stages > 0) {
+          FLASHINFER_CHECK(main_pipeline_stages == 1 || main_pipeline_stages == 2,
+                           "main_pipeline_stages must be 0 (heuristic), 1, or 2, got ",
+                           main_pipeline_stages);
+          return main_pipeline_stages;
+        }
         char const* e = std::getenv("FLASHINFER_SSU_MAIN_PIPELINE_STAGES");
         int const v = e ? std::atoi(e) : 0;  // unset → regime default
         FLASHINFER_CHECK(v == 0 || v == 1 || v == 2,
@@ -395,12 +404,12 @@ void launchCheckpointingSsuImpl(CheckpointingSsuParams& params, int precompute_h
 template <typename input_t, typename dt_t, typename weight_t, typename matrixA_t, typename state_t,
           typename stateIndex_t, typename state_scale_t>
 void launchCheckpointingSsu(CheckpointingSsuParams& params, int precompute_heads_per_cta,
-                            cudaStream_t stream) {
+                            int main_pipeline_stages, int main_ctas_per_sm, cudaStream_t stream) {
   bool const is_varlen = (params.cu_seqlens != nullptr);
   auto launch = [&]<int D_SPLIT, bool VARLEN>() {
     launchCheckpointingSsuImpl<input_t, dt_t, weight_t, matrixA_t, state_t, stateIndex_t,
-                               state_scale_t, D_SPLIT, VARLEN>(params, precompute_heads_per_cta,
-                                                               stream);
+                               state_scale_t, D_SPLIT, VARLEN>(
+        params, precompute_heads_per_cta, main_pipeline_stages, main_ctas_per_sm, stream);
   };
   auto launch_d_split = [&]<int D_SPLIT>() {
     if (is_varlen) {

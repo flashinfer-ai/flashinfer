@@ -47,6 +47,10 @@ vLLM uses a device buffer with shape `(num_layers, max_num_batched_tokens, top_k
 - This view is passed as `routing_replay_out` to the FlashInfer kernel
 - The `(L, N, K)` layout ensures zero-copy per-layer slicing
 
+Fused shared experts (`num_fused_shared_experts > 0`) keep this routed-only
+layout: `dim1` is still `top_k`. Shared-expert slots are not written into the
+replay buffer.
+
 ### Integration Pattern
 
 ```python

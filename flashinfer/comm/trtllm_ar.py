@@ -18,7 +18,7 @@ import functools
 import logging
 from ctypes import c_void_p, cast, create_string_buffer
 from types import SimpleNamespace
-from typing import List, Optional, Tuple, Union
+from typing import List, Literal, Optional, Tuple, Union
 from typing_extensions import deprecated
 
 from flashinfer.comm.mnnvl import CommBackend, SymmDeviceMemory, TorchDistBackend
@@ -106,8 +106,6 @@ class QuantizationSFLayout:
     # The scale factor block rows map to data block rows in an interleaved pattern:
     # For a scale factor row 'i', it maps to data block row: (i % 4) * 32 + (i / 4)
     # Column 'j' in the scale factor block corresponds to scaling the j-th block in the data tensor.
-    #
-    # Please refer to https://nvbugs/4165523 for more details about the swizzled layout.
     SWIZZLED_128x4 = 0
     SWIZZLED_8x4 = 1
     # Block scale factors are stored in linear layout (row-major). This is used in some trtllm-gen
@@ -140,85 +138,6 @@ def get_trtllm_comm_module():
     ) -> None:
         module.trtllm_lamport_initialize_all(
             buffer_0_ptr, buffer_1_ptr, buffer_2_ptr, size, dtype
-        )
-
-    @deprecated(
-        "trtllm_create_ipc_workspace_for_all_reduce and trtllm_custom_all_reduce are deprecated and will be removed in the next major bump, use allreduce.py instead."
-    )
-    @register_custom_op(
-        "flashinfer::trtllm_custom_all_reduce",
-        mutates_args=[
-            "inp",
-            "out",
-            "tp_size",
-            "tp_rank",
-            "token_num",
-            "fusion_op_code",
-            "strategy_code",
-            "config_code",
-            "launch_with_pdl",
-            "flag_value",
-            "peer_comm_buffer_ptrs",
-            "peer_barrier_ptrs_in",
-            "peer_barrier_ptrs_out",
-            "bias",
-            "residual",
-            "weight",
-            "weight_pre_residual_norm",
-            "eps",
-            "intermediate_buffer",
-            "lamport_peer_comm_buffer_ptrs_0",
-            "lamport_peer_comm_buffer_ptrs_1",
-            "lamport_peer_comm_buffer_ptrs_2",
-        ],
-    )
-    def trtllm_custom_all_reduce(
-        inp: torch.Tensor,
-        out: torch.Tensor,
-        tp_size: int,
-        tp_rank: int,
-        token_num: int,
-        fusion_op_code: AllReduceFusionOp,
-        strategy_code: AllReduceStrategyType,
-        config_code: AllReduceStrategyConfig,
-        launch_with_pdl: bool,
-        flag_value: int,
-        peer_comm_buffer_ptrs: torch.Tensor,
-        peer_barrier_ptrs_in: torch.Tensor,
-        peer_barrier_ptrs_out: torch.Tensor,
-        bias: Optional[torch.Tensor],
-        residual: Optional[torch.Tensor],
-        weight: Optional[torch.Tensor],
-        weight_pre_residual_norm: Optional[torch.Tensor],
-        eps: Optional[float],
-        intermediate_buffer: Optional[torch.Tensor],
-        lamport_peer_comm_buffer_ptrs_0: Optional[torch.Tensor],
-        lamport_peer_comm_buffer_ptrs_1: Optional[torch.Tensor],
-        lamport_peer_comm_buffer_ptrs_2: Optional[torch.Tensor],
-    ) -> None:
-        module.trtllm_custom_all_reduce(
-            inp,
-            out,
-            tp_size,
-            tp_rank,
-            token_num,
-            fusion_op_code,
-            strategy_code,
-            config_code,
-            launch_with_pdl,
-            flag_value,
-            peer_comm_buffer_ptrs,
-            peer_barrier_ptrs_in,
-            peer_barrier_ptrs_out,
-            bias,
-            residual,
-            weight,
-            weight_pre_residual_norm,
-            eps,
-            intermediate_buffer,
-            lamport_peer_comm_buffer_ptrs_0,
-            lamport_peer_comm_buffer_ptrs_1,
-            lamport_peer_comm_buffer_ptrs_2,
         )
 
     @register_custom_op(
@@ -418,127 +337,34 @@ def get_trtllm_comm_module():
     return SimpleNamespace(
         trtllm_lamport_initialize=trtllm_lamport_initialize,
         trtllm_lamport_initialize_all=trtllm_lamport_initialize_all,
-        trtllm_custom_all_reduce=trtllm_custom_all_reduce,
         trtllm_allreduce_fusion=trtllm_allreduce_fusion,
         trtllm_moe_allreduce_fusion=trtllm_moe_allreduce_fusion,
         trtllm_moe_finalize_allreduce_fusion=trtllm_moe_finalize_allreduce_fusion,
     )
 
 
-# NOTE(Yingyi): The customAllReduce and allReduceFusion require different buffer size
-# since allreduceFusion kernels are an improved implementation
-OneShotMaxToken = 128
-MAX_ALL_REDUCE_BLOCKS = 24
-LamportTokenNumThreshold = 16
+@functools.cache
+def get_cake_moe_allreduce_module(device_index: int):
+    """Load the isolated SM100/SM103 MoE all-reduce module."""
+    from ..jit.cake_trtllm_moe_allreduce import load
+
+    return load(device_index)
+
 
 _symm_workspace_refs: dict[int, list[object]] = {}
-
-
-@deprecated(
-    "trtllm_create_ipc_workspace_for_all_reduce and trtllm_custom_all_reduce are deprecated and will be removed in the next major bump, use allreduce.py instead."
-)
-def trtllm_create_ipc_workspace_for_all_reduce(
-    rank: int,
-    tp_size: int,
-    max_token_num: int,
-    hidden_dim,
-    group: Optional[ProcessGroup] = None,
-) -> List[List[int]]:
-    """
-    Parameters:
-    - rank: the rank of the current process.
-    - tp_size: the size of the process group.
-    - max_token_num: the maximum number of tokens in a sequence.
-    - hidden_dim: the dimension of the hidden states.
-    - group: the process group to use.
-
-    Note:
-    This function is used to create a workspace for all reduce.
-    The workspace is a list of IPC handles.
-    The workspace should be initialized before calling trtllm_custom_all_reduce.
-    The workspace should be destroyed after calling trtllm_custom_all_reduce.
-    The workspace can be reused for multiple all reduce calls under the same configuration.
-
-    We would init 7 IPC buffers for trtllm_custom_all_reduce.
-    They are sized as follows:
-    [buffer_size, buffer_size, flag_size, flag_size, lamport_buffer_size, lamport_buffer_size, lamport_buffer_size]
-    where:
-    - buffer_size: tp_size * max_token_num * hidden_dim * sizeof(float) * (maxBeamWidth)
-    - flag_size: (MAX_ALL_REDUCE_BLOCKS + 1) * sizeof(uint32_t) * tp_size * 2
-    - lamport_buffer_size: tp_size * LamportTokenNumThreshold * tp_size * hidden_dim * sizeof(half)
-
-    They are for:
-    ipcHandles[0] - peer_comm_buffer_ptrs
-    ipcHandles[2] - peer_barrier_ptrs_in
-    ipcHandles[3] - peer_barrier_ptrs_out
-    ipcHandles[4] - lamport_peer_comm_buffer_ptrs[0:tp_size]
-    ipcHandles[5] - lamport_peer_comm_buffer_ptrs[tp_size:tp_size * 2]
-    ipcHandles[6] - lamport_peer_comm_buffer_ptrs[tp_size * 2:tp_size * 3]
-
-    We use tp_size and world_size here interchangeably (customAllReduce).
-
-    Reference: trtllm, cpp/tests/unit_tests/kernels/allReduce/allReduceKernelTest.cu, Workspace init
-    """
-
-    buffer_size = tp_size * max_token_num * hidden_dim * 4
-    FLAG_SIZE = (MAX_ALL_REDUCE_BLOCKS + 1) * 4
-    flag_size = FLAG_SIZE * tp_size * 2
-    lamport_buffer_size = tp_size * LamportTokenNumThreshold * tp_size * hidden_dim * 2
-
-    device = torch.device(f"cuda:{torch.cuda.current_device()}")
-    group_name = (
-        group.group_name
-        if group is not None
-        else torch.distributed.group.WORLD.group_name
-    )
-    symm_refs: list[torch.Tensor] = []
-    ipc_handles = list()
-
-    for size, dtype in [
-        (buffer_size, torch.float32),
-        (buffer_size, torch.float32),
-        (flag_size, torch.int32),
-        (flag_size, torch.int32),
-        (lamport_buffer_size, torch.float16),
-        (lamport_buffer_size, torch.float16),
-        (lamport_buffer_size, torch.float16),
-    ]:
-        aligned_size = round_up(size, 16)
-        ptrs, tensor, handle = _alloc_symm_buffer_bytes(
-            aligned_size,
-            tp_size,
-            dtype,
-            device,
-            group_name,
-        )
-        symm_refs.append((tensor, handle))
-        ipc_handles.append(ptrs)
-
-    logger.debug(
-        "rank %s allocated ipc_handles: %s",
-        rank,
-        [[hex(handle) for handle in sublist] for sublist in ipc_handles],
-    )
-
-    _symm_workspace_refs[id(ipc_handles)] = symm_refs
-
-    trtllm_lamport_initialize_all(
-        ipc_handles[4][rank],
-        ipc_handles[5][rank],
-        ipc_handles[6][rank],
-        lamport_buffer_size // 2,
-        torch.float16,
-    )
-
-    dist.barrier(group=group)  # must sync after create_workspace
-
-    return ipc_handles
 
 
 def trtllm_destroy_ipc_workspace_for_all_reduce(
     workspace: List[List[int]], group: Optional[ProcessGroup] = None
 ) -> None:
-    """Destroy a workspace created by trtllm_create_ipc_workspace_for_all_reduce.
+    """Release the symmetric-memory references held for an IPC workspace.
+
+    Kept for backwards compatibility with existing callers. The legacy
+    ``trtllm_create_ipc_workspace_for_all_reduce`` it was originally paired with
+    has been removed; use
+    :func:`trtllm_destroy_ipc_workspace_for_all_reduce_fusion` for workspaces
+    created by ``trtllm_create_ipc_workspace_for_all_reduce_fusion``. The two
+    are behaviourally identical.
 
     Releases the symmetric memory references held internally. The workspace
     list should not be used after this call.
@@ -884,90 +710,6 @@ def trtllm_lamport_initialize_all(
     )
 
 
-@deprecated(
-    "trtllm_create_ipc_workspace_for_all_reduce and trtllm_custom_all_reduce are deprecated, use trtllm_create_ipc_workspace_for_all_reduce_fusion and trtllm_allreduce_fusion instead"
-)
-def trtllm_custom_all_reduce(
-    inp: torch.Tensor,
-    out: torch.Tensor,
-    tp_size: int,
-    tp_rank: int,
-    token_num: int,
-    fusion_op_code: AllReduceFusionOp,
-    strategy_code: AllReduceStrategyType,
-    config_code: AllReduceStrategyConfig,
-    launch_with_pdl: bool,
-    flag_value: int,
-    peer_comm_buffer_ptrs: torch.Tensor,
-    peer_barrier_ptrs_in: torch.Tensor,
-    peer_barrier_ptrs_out: torch.Tensor,
-    bias: Optional[torch.Tensor],
-    residual: Optional[torch.Tensor],
-    weight: Optional[torch.Tensor],
-    weight_pre_residual_norm: Optional[torch.Tensor],
-    eps: Optional[float],
-    intermediate_buffer: Optional[torch.Tensor],
-    lamport_peer_comm_buffer_ptrs_0: Optional[torch.Tensor],
-    lamport_peer_comm_buffer_ptrs_1: Optional[torch.Tensor],
-    lamport_peer_comm_buffer_ptrs_2: Optional[torch.Tensor],
-) -> None:
-    """
-    Parameters:
-    - inp: the input tensor. [token_num, hidden_dim]
-    - out: the output tensor. [token_num, hidden_dim]
-    - tp_size: the size of the process group.
-    - tp_rank: the rank of the current process.
-    - token_num: the number of tokens in the sequence.
-    - fusion_op_code: the fusion operation code.
-    - strategy_code: the strategy code.
-    - config_code: the config code.
-    - launch_with_pdl: whether to launch with pdl.
-    - flag_value: monotonic counter, same value on all ranks for a given call.
-      Calls that dispatch to the lamport kernel (see ``is_lamport_supported``
-      in the kernel header) need consecutive flag values across those calls:
-      keep a separate counter for them, or re-run
-      ``trtllm_lamport_initialize_all`` before each one. Sharing one counter
-      with other calls silently corrupts the lamport output.
-    - peer_comm_buffer_ptrs: the peer communication buffer pointers.
-    - peer_barrier_ptrs_in: the peer barrier pointers in.
-    - peer_barrier_ptrs_out: the peer barrier pointers out.
-    - bias: the bias tensor. [hidden_dim]
-    - residual: the residual tensor. [token_num, hidden_dim]
-    - weight: the weight tensor. [hidden_dim]
-    - weight_pre_residual_norm: the weight pre residual norm tensor. [hidden_dim]
-    - eps: the epsilon value.
-    - intermediate_buffer: the intermediate buffer tensor.
-    - lamport_peer_comm_buffer_ptrs_0: the lamport peer communication buffer pointers 0.
-    - lamport_peer_comm_buffer_ptrs_1: the lamport peer communication buffer pointers 1.
-    - lamport_peer_comm_buffer_ptrs_2: the lamport peer communication buffer pointers 2.
-    """
-
-    get_trtllm_comm_module().trtllm_custom_all_reduce(
-        inp,
-        out,
-        tp_size,
-        tp_rank,
-        token_num,
-        fusion_op_code,
-        strategy_code,
-        config_code,
-        launch_with_pdl,
-        flag_value,
-        peer_comm_buffer_ptrs,
-        peer_barrier_ptrs_in,
-        peer_barrier_ptrs_out,
-        bias,
-        residual,
-        weight,
-        weight_pre_residual_norm,
-        eps,
-        intermediate_buffer,
-        lamport_peer_comm_buffer_ptrs_0,
-        lamport_peer_comm_buffer_ptrs_1,
-        lamport_peer_comm_buffer_ptrs_2,
-    )
-
-
 # Heuristics based on all configs of trtllm_allreduce_fusion on B200.
 # Empirically, the fusion pattern and fp32_acc are irrelevant to the decision.
 _use_oneshot_heuristics: dict[int, int] = {
@@ -1159,6 +901,139 @@ def trtllm_allreduce_fusion(
     )
 
 
+_CakeMoeAllReduceBackend = Literal["trtllm", "cake"]
+_CAKE_MOE_ALLREDUCE_HIDDEN_DIM = 7168
+
+
+def _check_cake_moe_allreduce_backend(backend: str) -> None:
+    if backend not in ("trtllm", "cake"):
+        raise ValueError(f"unsupported MoE all-reduce backend: {backend!r}")
+
+
+def _check_cake_moe_allreduce_tensor(
+    tensor: torch.Tensor,
+    name: str,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    numel: Optional[int] = None,
+) -> None:
+    if tensor.device != device:
+        raise ValueError(f"{name} must be on {device}")
+    if tensor.dtype != dtype:
+        raise ValueError(f"{name} must have dtype {dtype}")
+    if numel is not None and tensor.numel() != numel:
+        raise ValueError(f"{name} must contain {numel} elements")
+    if not tensor.is_contiguous():
+        raise ValueError(f"{name} must be contiguous")
+
+
+def _check_cake_moe_allreduce_arch(device_index: int) -> None:
+    capability = torch.cuda.get_device_capability(device_index)
+    if capability not in ((10, 0), (10, 3)):
+        raise ValueError(
+            "Cake MoE all-reduce requires SM100 or SM103, got "
+            f"SM{capability[0]}{capability[1]}"
+        )
+
+
+def _validate_cake_moe_allreduce(
+    *,
+    world_size: int,
+    world_rank: int,
+    token_num: int,
+    hidden_dim: int,
+    workspace_ptrs: torch.Tensor,
+    residual_in: torch.Tensor,
+    rms_gamma: torch.Tensor,
+    moe_reduction_device_num_experts: int,
+    moe_reduction_scale_input: torch.Tensor,
+    moe_reduction_active_experts_token_input: torch.Tensor,
+    moe_reduction_token_input: torch.Tensor,
+    layout_code: Optional[QuantizationSFLayout],
+    moe_allreduce_out: Optional[torch.Tensor],
+    residual_out: Optional[torch.Tensor],
+    norm_out: Optional[torch.Tensor],
+    quant_out: Optional[torch.Tensor],
+    scale_out: Optional[torch.Tensor],
+) -> int:
+    if moe_reduction_active_experts_token_input.device.type != "cuda":
+        raise ValueError("Cake MoE all-reduce inputs must be CUDA tensors")
+    if moe_reduction_active_experts_token_input.dtype not in (
+        torch.float16,
+        torch.bfloat16,
+    ):
+        raise ValueError("Cake MoE all-reduce supports FP16 and BF16 only")
+    if world_size not in (2, 4, 8):
+        raise ValueError("Cake MoE all-reduce supports world_size 2, 4, or 8 only")
+    if not 0 <= world_rank < world_size:
+        raise ValueError("world_rank must be in [0, world_size)")
+    if token_num < 1:
+        raise ValueError("Cake MoE all-reduce requires at least 1 token")
+    if hidden_dim != _CAKE_MOE_ALLREDUCE_HIDDEN_DIM:
+        raise ValueError(
+            f"Cake MoE all-reduce requires hidden_dim={_CAKE_MOE_ALLREDUCE_HIDDEN_DIM}"
+        )
+
+    device = moe_reduction_active_experts_token_input.device
+    dtype = moe_reduction_active_experts_token_input.dtype
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    _check_cake_moe_allreduce_arch(device_index)
+    _check_cake_moe_allreduce_tensor(
+        workspace_ptrs,
+        "workspace_ptrs",
+        device=device,
+        dtype=torch.int64,
+    )
+    minimum_workspace_ptrs = 3 * world_size + 1
+    if workspace_ptrs.numel() < minimum_workspace_ptrs:
+        raise ValueError(
+            f"workspace_ptrs must contain at least {minimum_workspace_ptrs} pointers"
+        )
+    if moe_reduction_device_num_experts <= 0:
+        raise ValueError("moe_reduction_device_num_experts must be positive")
+    if residual_out is None or norm_out is None:
+        raise ValueError("Cake MoE all-reduce requires residual_out and norm_out")
+    if quant_out is not None or scale_out is not None or layout_code is not None:
+        raise ValueError("Cake MoE all-reduce does not support quantization")
+
+    token_elements = token_num * hidden_dim
+    expert_elements = moe_reduction_device_num_experts * token_elements
+    _check_cake_moe_allreduce_tensor(
+        moe_reduction_scale_input,
+        "moe_reduction_scale_input",
+        device=device,
+        dtype=torch.float32,
+        numel=moe_reduction_device_num_experts * token_num,
+    )
+    for tensor, name, numel in (
+        (
+            moe_reduction_active_experts_token_input,
+            "moe_reduction_active_experts_token_input",
+            expert_elements,
+        ),
+        (moe_reduction_token_input, "moe_reduction_token_input", token_elements),
+        (residual_in, "residual_in", token_elements),
+        (rms_gamma, "rms_gamma", hidden_dim),
+        (residual_out, "residual_out", token_elements),
+        (norm_out, "norm_out", token_elements),
+    ):
+        _check_cake_moe_allreduce_tensor(
+            tensor, name, device=device, dtype=dtype, numel=numel
+        )
+    if moe_allreduce_out is not None:
+        _check_cake_moe_allreduce_tensor(
+            moe_allreduce_out,
+            "moe_allreduce_out",
+            device=device,
+            dtype=dtype,
+            numel=token_elements,
+        )
+    return device_index
+
+
 def trtllm_moe_allreduce_fusion(
     world_size: int,
     world_rank: int,
@@ -1181,6 +1056,8 @@ def trtllm_moe_allreduce_fusion(
     quant_out: Optional[torch.Tensor],
     scale_out: Optional[torch.Tensor],
     weight_bias: Optional[float] = None,
+    *,
+    backend: _CakeMoeAllReduceBackend = "trtllm",
 ) -> None:
     """
     Parameters:
@@ -1207,7 +1084,17 @@ def trtllm_moe_allreduce_fusion(
     - weight_bias: bias added to rms_gamma before scaling.
                    None or 0.0 -> standard RMSNorm (out = gamma * x * rsqrt(...)).
                    1.0          -> Gemma / Qwen3.5 RMSNorm (out = (1 + gamma) * x * rsqrt(...)).
+    - backend: ``"trtllm"`` (default) or the constrained ``"cake"`` SM100/SM103
+      backend. The public Python API has 22 parameters; the isolated source
+      module's ``run_reduction`` entry has an exact 18-argument FFI ABI.
+      The optional backend supports contiguous FP16/BF16 tensors, world sizes 2, 4,
+      and 8, hidden_dim=7168, token payloads within the existing Lamport
+      ``MAX_COMM_SIZE`` byte limit, and residual plus norm outputs. It does not
+      support quantization. ``weight_bias`` remains a runtime value; ``None`` is
+      passed to the kernel as 0.0.
     """
+
+    _check_cake_moe_allreduce_backend(backend)
 
     required_lamport_comm_size = moe_reduction_token_input.numel() * 2 * world_size
 
@@ -1216,6 +1103,48 @@ def trtllm_moe_allreduce_fusion(
         raise ValueError(
             f"required_lamport_comm_size {required_lamport_comm_size} is greater than MAX_COMM_SIZE {MAX_COMM_SIZE}. Cannot use oneshot in this case."
         )
+
+    if backend == "cake":
+        device_index = _validate_cake_moe_allreduce(
+            world_size=world_size,
+            world_rank=world_rank,
+            token_num=token_num,
+            hidden_dim=hidden_dim,
+            workspace_ptrs=workspace_ptrs,
+            residual_in=residual_in,
+            rms_gamma=rms_gamma,
+            moe_reduction_device_num_experts=moe_reduction_device_num_experts,
+            moe_reduction_scale_input=moe_reduction_scale_input,
+            moe_reduction_active_experts_token_input=moe_reduction_active_experts_token_input,
+            moe_reduction_token_input=moe_reduction_token_input,
+            layout_code=layout_code,
+            moe_allreduce_out=moe_allreduce_out,
+            residual_out=residual_out,
+            norm_out=norm_out,
+            quant_out=quant_out,
+            scale_out=scale_out,
+        )
+        get_cake_moe_allreduce_module(device_index).run_reduction(
+            world_size,
+            world_rank,
+            token_num,
+            hidden_dim,
+            workspace_ptrs,
+            launch_with_pdl,
+            residual_in,
+            rms_gamma,
+            rms_eps,
+            scale_factor,
+            moe_reduction_device_num_experts,
+            moe_reduction_scale_input,
+            moe_reduction_active_experts_token_input,
+            moe_reduction_token_input,
+            moe_allreduce_out,
+            residual_out,
+            norm_out,
+            weight_bias,
+        )
+        return
 
     get_trtllm_comm_module().trtllm_moe_allreduce_fusion(
         world_size=world_size,
@@ -1260,6 +1189,8 @@ def trtllm_moe_finalize_allreduce_fusion(
     expert_scale_factor: Optional[torch.Tensor],
     routed_scaling_factor: Optional[float],
     weight_bias: Optional[float] = None,
+    *,
+    backend: Literal["trtllm", "cake"] = "trtllm",
 ) -> None:
     """
     Parameters:
@@ -1285,7 +1216,13 @@ def trtllm_moe_finalize_allreduce_fusion(
     - weight_bias: bias added to rms_gamma before scaling.
                    None or 0.0 -> standard RMSNorm (out = gamma * x * rsqrt(...)).
                    1.0          -> Gemma / Qwen3.5 RMSNorm (out = (1 + gamma) * x * rsqrt(...)).
+    - backend: implementation to launch. ``"trtllm"`` preserves the existing
+      backend. ``"cake"`` selects the source-built SM100/SM103 kernels for
+      hidden size 7168 and tensor-parallel sizes 2, 4, or 8.
     """
+
+    if backend not in ("trtllm", "cake"):
+        raise ValueError(f"backend must be 'trtllm' or 'cake', got {backend!r}")
 
     # The Lamport allreduce payload is the finalized token output [token_num, hidden_dim],
     # not the padded/permuted expert buffer allreduce_in.
@@ -1298,6 +1235,31 @@ def trtllm_moe_finalize_allreduce_fusion(
         raise ValueError(
             f"required_lamport_comm_size {required_lamport_comm_size} is greater than MAX_COMM_SIZE {MAX_COMM_SIZE}. Cannot use oneshot in this case."
         )
+
+    if backend == "cake":
+        from ..jit.cake_moe_finalize_comm import run_cake_moe_finalize
+
+        run_cake_moe_finalize(
+            backend="cake",
+            allreduce_in=allreduce_in,
+            residual_in=residual_in,
+            norm_weight=norm_weight,
+            expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+            norm_out=norm_out,
+            residual_out=residual_out,
+            quant_out=quant_out,
+            scale_out=scale_out,
+            workspace_ptrs=workspace_ptrs,
+            launch_with_pdl=launch_with_pdl,
+            world_rank=world_rank,
+            world_size=world_size,
+            eps=eps,
+            shared_expert_output=shared_expert_output,
+            expert_scale_factor=expert_scale_factor,
+            routed_scaling_factor=routed_scaling_factor,
+            weight_bias=weight_bias,
+        )
+        return
 
     get_trtllm_comm_module().trtllm_moe_finalize_allreduce_fusion(
         allreduce_in=allreduce_in,

@@ -22,8 +22,11 @@ compiled adapter on the caller's CUDA stream. The one-shot entry point retains
 synchronous canonical-BSR inspection to derive its temporary plan capacity.
 
 ``BlockSparsePagedTSWrapper`` shares the same scheduling policy and decode
-kernel, but freezes request-level page spans and sequence lengths at plan time
-while accepting physical page IDs and sparse routes at run time.
+kernel, but plans only fixed Q geometry and maximum K/V capacity. Page spans,
+physical page IDs, sequence lengths, sparse routes, and token bits are all live
+run inputs. Reusable runs validate their tensor ABI but trust their values,
+while the paged one-shot API synchronously validates both before creating its
+temporary plan.
 """
 
 import threading
@@ -31,25 +34,27 @@ from typing import Literal
 
 import torch
 
-from flashinfer.api_logging import flashinfer_api
+from flashinfer.api_logging import flashinfer_experimental_api
 from flashinfer.trace.templates.attention import (
-    prims_ts_block_sparse_trace,
+    prims_ts_block_sparse_trace_dispatch,
+    prims_ts_block_sparse_wrapper_trace_dispatch,
     prims_ts_paged_block_sparse_trace_dispatch,
+    prims_ts_paged_block_sparse_wrapper_trace_dispatch,
 )
 
-from ._block_sparse.config import (
-    _BlockSparseStaticProfile,
-    _validate_block_sparse_static_profile,
+from ._block_sparse.common import (
+    _num_sparse_pattern_heads,
+    _validate_contiguous_route_mode,
 )
+from ._block_sparse.config import _validate_block_sparse_static_profile
 from ._block_sparse.inspection import (
-    _BlockSparseInspection,
     _inspect_block_sparse_bsr,
+    _inspect_paged_block_sparse_metadata,
 )
 from ._block_sparse.plan import (
     _BlockSparsePlanState,
     _build_block_sparse_plan_state,
     _serialize_plan,
-    _snapshot_paged_kv_plan_metadata,
     _wait_and_record_block_sparse_plan,
 )
 from ._block_sparse.runtime import (
@@ -57,15 +62,13 @@ from ._block_sparse.runtime import (
     _ContiguousKVStorage,
     _PagedKVStorage,
     launch_block_sparse as _launch_block_sparse,
+    prepare_block_sparse_run_unchecked as _prepare_block_sparse_run_unchecked,
     record_block_sparse_run_args as _record_block_sparse_run_args,
     validate_block_sparse_metadata as _validate_block_sparse_metadata,
     validate_block_sparse_run as _validate_block_sparse_run,
+    validate_paged_kv_storage as _validate_paged_kv_storage,
 )
-from .decode import (
-    PagedKVCache,
-    _normalize_paged_kv_cache,
-    _resolve_cuda_device,
-)
+from .decode import PagedKVCache, _resolve_cuda_device
 
 
 class _BlockSparseWrapperBase:
@@ -114,10 +117,12 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
     Q is ``[B, Sq, Hq, D]`` and K/V are ``[B, Skv, Hkv, D]``. Sparse rows are
     owned per batch, KV head, and query block, so every Q head in one grouped
     KV head consumes the same sparse row. A plan fixes geometry and a per-row
-    capacity; every run supplies its own BSR and optional token mask.
-    Callers must keep those tensors alive and immutable until the queued run or
-    captured graph finishes using them. CUDA Graph capture pins plan-owned
-    state only, so captured routing storage remains the caller's responsibility.
+    capacity; every run supplies either BSR or a packed exact-block bitmask.
+    Proxy-enabled plans additionally consume caller-owned K/V summaries, while
+    an optional token mask applies only to exact routes. Callers must keep those
+    tensors alive and immutable until the queued run or captured graph finishes
+    using them. CUDA Graph capture pins plan-owned state only, so captured
+    routing storage remains the caller's responsibility.
 
     One plan revision owns one mutable route workspace. Its runs must be ordered
     on one stream or externally synchronized; unordered concurrent runs require
@@ -139,7 +144,10 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         device: torch.device | str | int,
         max_blocks_per_row: int,
         use_kv_valid_bits: bool,
+        sparse_format: Literal["bsr", "bitmask"] = "bsr",
+        use_proxy_routes: bool = False,
         mask_type: Literal["dense", "causal"] = "dense",
+        share_pattern_across_kv_heads: bool = False,
         q_data_type: torch.dtype = torch.float16,
         kv_data_type: torch.dtype | None = None,
         o_data_type: torch.dtype | None = None,
@@ -147,11 +155,20 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         """Choose a legal profile and allocate reusable routing capacity.
 
         The plan owns immutable geometry and a uniform route workspace, not a
-        sparse pattern. ``max_blocks_per_row`` bounds each runtime BSR row in
-        semantic ``kv_block_size`` blocks. ``use_kv_valid_bits`` selects whether
-        every :meth:`run` must supply the shared batch token mask. Callers may
-        pass different routing tensor identities and index extents to each run
-        as long as they fit this declared capacity.
+        sparse pattern. ``max_blocks_per_row`` bounds each runtime sparse row in
+        semantic ``kv_block_size`` blocks. ``sparse_format="bsr"`` consumes
+        canonical CSR-style rows, while ``"bitmask"`` consumes packed exact-
+        block bits. Enabling proxy routes represents unselected blocks through
+        caller-provided K/V summaries and currently requires
+        ``mask_type="dense"``. Exact-only plans continue to support causal
+        masking. ``use_kv_valid_bits`` selects whether every :meth:`run` must
+        supply the shared batch token mask. Callers may pass different routing
+        tensor identities and index extents to each run as long as they fit
+        this declared capacity.
+
+        ``share_pattern_across_kv_heads=False`` retains independent per-KV-head
+        patterns. True uses a singleton head axis in BSR/bitmask inputs and
+        prepares each pattern once. K/V values still have every physical head.
 
         MHA, GQA, and MQA are supported with ``Hq / Hkv`` a power of two no
         greater than 32 and ``D=128``. Q, K, V, and O use one matching
@@ -165,18 +182,22 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         respectively. ``kv_block_size`` may be 8, 16, 32, or a positive
         multiple of 64. The Q tile groups complete Q-head groups and as many Q
         tokens as fit without crossing a semantic Q-block row, up to Q128;
-        fine KV blocks cap this at a SWAPAB Q32 tile. Every run prepares
-        per-KV-head canonical BSR into compact, profile-selected fixed-width
-        route metadata, and the attention core consumes only that metadata.
-        This remains true when every KV block is selected;
+        fine KV blocks cap this at a SWAPAB Q32 tile. Proxy routes reuse the
+        same Q-tile, KV-route, and MMA geometry as exact routes, but currently
+        use the direct scheduler because reusable planning cannot observe live
+        exact-route work. Every run prepares its selected BSR or bitmask into
+        compact, profile-selected fixed-width route metadata, and the attention
+        core consumes only that metadata. This remains true when every KV block
+        is selected;
         callers that know a pattern is dense should choose the dense FMHA API
         explicitly.
 
         Planning does not inspect routing values and does not synchronize the
-        host. Runtime preparation validates ranges and capacity without dynamic
-        allocation. The one-shot :func:`block_sparse_attention` entry point
-        retains synchronous canonical-BSR inspection so it can derive the
-        smallest semantic row bound for that call.
+        host. Reusable runs trust those values; assertion-enabled CuTe DSL
+        builds diagnose contract violations on device. The one-shot
+        :func:`block_sparse_attention` entry point retains synchronous
+        canonical-BSR inspection so it can derive the smallest semantic row
+        bound for that call.
 
         Concurrent plans are serialized; run keeps using the published state.
         One revision has one mutable route workspace, so its runs must be
@@ -184,6 +205,7 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         runs require distinct wrappers.
         """
 
+        _validate_contiguous_route_mode(sparse_format, use_proxy_routes)
         static = _validate_block_sparse_static_profile(
             batch_size=batch_size,
             seq_len_q=seq_len_q,
@@ -194,12 +216,15 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
             q_block_size=q_block_size,
             kv_block_size=kv_block_size,
             use_kv_valid_bits=use_kv_valid_bits,
+            share_pattern_across_kv_heads=share_pattern_across_kv_heads,
             mask_type=mask_type,
             q_dtype=q_data_type,
             kv_dtype=kv_data_type,
             output_dtype=o_data_type,
             max_blocks_per_row=max_blocks_per_row,
         )
+        if use_proxy_routes and static.mask_type != "dense":
+            raise ValueError("block-sparse proxy routes require mask_type='dense'")
         device, device_index = _resolve_cuda_device(device)
         plan_stream = torch.cuda.current_stream(device)
         with torch.cuda.device(device_index), torch.cuda.stream(plan_stream):
@@ -212,24 +237,29 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
                 device=device,
                 device_index=device_index,
                 plan_stream=plan_stream,
-                paged_kv=None,
+                sparse_format=sparse_format,
+                use_proxy_routes=use_proxy_routes,
             )
         # This is the only wrapper mutation. Every failure above leaves the
         # previously published revision intact and runnable.
         self._plan_state = candidate
 
-    @flashinfer_api
+    @flashinfer_experimental_api(trace=prims_ts_block_sparse_wrapper_trace_dispatch)
     def run(
         self,
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        block_indptr: torch.Tensor,
-        block_indices: torch.Tensor,
+        block_indptr: torch.Tensor | None = None,
+        block_indices: torch.Tensor | None = None,
         *,
+        exact_block_bits: torch.Tensor | None = None,
+        k_summary: torch.Tensor | None = None,
+        v_summary: torch.Tensor | None = None,
         kv_valid_bits: torch.Tensor | None = None,
         sm_scale: float | None = None,
         out: torch.Tensor | None = None,
+        validate: bool = True,
     ) -> torch.Tensor:
         """Launch the current plan on the caller's current CUDA stream.
 
@@ -241,17 +271,34 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         Only O is returned; this PrimTS API does not return LSE. The launch is
         enqueued asynchronously on the caller's current CUDA stream.
 
-        ``block_indptr`` is compact Int32
-        ``[B, Hkv, ceil(Sq / q_block_size) + 1]`` and indexes compact
-        ``block_indices``. Every row must fit the planned semantic-block
-        capacity; referenced block IDs must be strictly increasing, unique,
-        and in range. Runtime value violations cannot raise a synchronous host
-        exception: preparation marks only the invalid row with a negative
-        header, attention consumes it as empty, and that row's output is finite
-        zero without reading route payload. A masked plan requires
+        ``validate=True`` performs structural and plan-geometry validation
+        without reading tensor values; it is the safe public default.
+        ``validate=False`` treats every run argument as a trusted binding and
+        performs no explicit wrapper validation. K/V view selection, scale
+        forwarding, and optional output allocation are unavoidable in both
+        modes.
+
+        A BSR plan consumes compact Int32 ``block_indptr`` with shape
+        ``[B, Hkv, ceil(Sq / q_block_size) + 1]`` and compact Int32
+        ``block_indices``. A bitmask plan instead requires both BSR arguments
+        to be ``None`` and consumes packed UInt32 ``exact_block_bits`` with
+        shape ``[B, Hkv, ceil(Sq / q_block_size), ceil(num_kv_blocks / 32)]``.
+        Bit ``r`` of word ``w`` selects block ``32 * w + r``; final-word
+        padding bits are ignored. A proxy plan additionally consumes compact
+        ``k_summary`` and ``v_summary`` with shape
+        ``[B, num_kv_blocks, Hkv, D]``. K summaries are block means and V
+        summaries are block sums; the final partial block covers only its
+        structural tokens.
+
+        Every row must fit the planned semantic-block capacity. Reusable runs
+        trust routing values. CuTe DSL assertions can diagnose violations when
+        enabled before compilation; otherwise invalid values have undefined
+        behavior and may access out of bounds. A masked plan requires
         ``kv_valid_bits`` with shape
         ``[B, ceil(Skv / 32)]`` and dtype UInt32; an unmasked plan requires
-        ``None``. Routing tensors may have different identities on every run.
+        ``None``. The mask applies only to raw exact routes; proxy summaries and
+        their represented-token mass remain caller-defined. Routing tensors may
+        have different identities on every run.
 
         Keep this wrapper alive until every captured CUDA Graph is destroyed.
 
@@ -264,12 +311,19 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         v : torch.Tensor
             Compact value tensor with the same shape, dtype, and strides as
             ``k``.
-        block_indptr : torch.Tensor
+        block_indptr : torch.Tensor, optional
             Contiguous Int32 BSR row offsets with shape
-            ``[B, Hkv, ceil(Sq / q_block_size) + 1]``.
-        block_indices : torch.Tensor
+            ``[B, Hpattern, ceil(Sq / q_block_size) + 1]``, where Hpattern is one
+            when the plan shares patterns and Hkv otherwise. Required by BSR plans.
+        block_indices : torch.Tensor, optional
             Contiguous Int32 semantic KV-block IDs referenced by
-            ``block_indptr``.
+            ``block_indptr``. Required by BSR plans.
+        exact_block_bits : torch.Tensor, optional
+            Compact packed UInt32 exact-block bitmap required by bitmask plans.
+        k_summary : torch.Tensor, optional
+            Per-block mean K tensor required by proxy plans.
+        v_summary : torch.Tensor, optional
+            Per-block summed V tensor required by proxy plans.
         kv_valid_bits : torch.Tensor, optional
             Contiguous UInt32 token-validity bitmap ``[B, ceil(Skv / 32)]``.
             Supply it exactly when the plan enabled token validity bits.
@@ -277,7 +331,11 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
             Softmax scale. Defaults to ``1 / sqrt(D)``.
         out : torch.Tensor, optional
             Caller-owned compact output buffer ``[B, Sq, Hq, D]`` with the
-            planned output dtype.
+            planned output dtype. Must not overlap any live input or plan-owned
+            buffer; storage overlap is not checked.
+        validate : bool
+            Whether to validate tensor structure and plan geometry before
+            launching. Defaults to ``True``.
 
         Returns
         -------
@@ -286,77 +344,59 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         """
 
         state = self._require_run_state()
-        run_stream = torch.cuda.current_stream(state.device)
-        run_args = _validate_block_sparse_run(
+        if not isinstance(validate, bool):
+            raise TypeError("validate must be a bool")
+        prepare_run = (
+            _validate_block_sparse_run
+            if validate
+            else _prepare_block_sparse_run_unchecked
+        )
+        run_args = prepare_run(
             q,
             _ContiguousKVStorage(k=k, v=v),
             state=state,
             block_indptr=block_indptr,
             block_indices=block_indices,
+            exact_block_bits=exact_block_bits,
+            k_summary=k_summary,
+            v_summary=v_summary,
             kv_valid_bits=kv_valid_bits,
             sm_scale=sm_scale,
             out=out,
         )
+        run_stream = torch.cuda.current_stream(state.device)
         return self._launch_validated_run(state, run_args, run_stream)
 
 
-def _inspect_one_shot_block_sparse_routes(
-    block_indptr: torch.Tensor,
-    block_indices: torch.Tensor,
-    kv_valid_bits: torch.Tensor | None,
-    *,
-    static: _BlockSparseStaticProfile,
-    device: torch.device,
-) -> _BlockSparseInspection:
-    """Validate and synchronously inspect one one-shot canonical BSR pattern."""
-
-    _validate_block_sparse_metadata(
-        block_indptr,
-        block_indices,
-        kv_valid_bits,
-        device=device,
-        batch_size=static.batch_size,
-        seq_len_q=static.seq_len_q,
-        seq_len_kv=static.seq_len_kv,
-        num_kv_heads=static.num_kv_heads,
-        q_block_size=static.q_block_size,
-        use_kv_valid_bits=static.use_kv_valid_bits,
-    )
-    return _inspect_block_sparse_bsr(
-        block_indptr,
-        block_indices,
-        batch_size=static.batch_size,
-        num_kv_heads=static.num_kv_heads,
-        seq_len_q=static.seq_len_q,
-        seq_len_kv=static.seq_len_kv,
-        q_block_size=static.q_block_size,
-        kv_block_size=static.kv_block_size,
-        stream=torch.cuda.current_stream(device),
-    )
-
-
-@flashinfer_api(trace=prims_ts_block_sparse_trace)
+@flashinfer_experimental_api(trace=prims_ts_block_sparse_trace_dispatch)
 def block_sparse_attention(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    block_indptr: torch.Tensor,
-    block_indices: torch.Tensor,
+    block_indptr: torch.Tensor | None,
+    block_indices: torch.Tensor | None,
     q_block_size: int,
     kv_block_size: int,
     *,
+    exact_block_bits: torch.Tensor | None = None,
+    k_summary: torch.Tensor | None = None,
+    v_summary: torch.Tensor | None = None,
     kv_valid_bits: torch.Tensor | None = None,
+    sparse_format: Literal["bsr", "bitmask"] = "bsr",
+    use_proxy_routes: bool = False,
     mask_type: Literal["dense", "causal"] = "dense",
+    share_pattern_across_kv_heads: bool = False,
     sm_scale: float | None = None,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Plan and run one compact-BSHD block-sparse attention launch.
 
-    This one-shot form synchronously inspects canonical BSR, derives its largest
-    semantic row, creates a capacity-only plan, and passes the original routing
-    tensors to :meth:`BlockSparseTSWrapper.run`. It therefore cannot be invoked
-    inside CUDA Graph capture; plan a wrapper outside capture and capture only
-    ``run()`` instead.
+    This one-shot form creates a capacity-only plan and passes the original
+    routing tensors to :meth:`BlockSparseTSWrapper.run`. BSR inputs are
+    synchronously inspected to validate canonical rows and derive their maximum
+    width. Bitmask inputs use the structural KV-block count as a conservative
+    capacity bound. It therefore cannot be invoked inside CUDA Graph capture;
+    plan a wrapper outside capture and capture only ``run()`` instead.
 
     Parameters
     ----------
@@ -366,11 +406,13 @@ def block_sparse_attention(
         Compact key tensor ``[B, Skv, Hkv, D]``.
     v : torch.Tensor
         Compact value tensor with the same shape, dtype, and strides as ``k``.
-    block_indptr : torch.Tensor
+    block_indptr : torch.Tensor, optional
         Contiguous Int32 BSR row offsets with shape
-        ``[B, Hkv, ceil(Sq / q_block_size) + 1]``.
-    block_indices : torch.Tensor
+        ``[B, Hpattern, ceil(Sq / q_block_size) + 1]``. Hpattern is one for
+        shared patterns and Hkv otherwise. Required in BSR mode.
+    block_indices : torch.Tensor, optional
         Contiguous Int32 semantic KV-block IDs referenced by ``block_indptr``.
+        Required in BSR mode.
     q_block_size : int
         Positive number of logical query tokens represented by one BSR row.
         The product with ``Hq / Hkv`` must be divisible by 8 so a physical Q
@@ -378,14 +420,30 @@ def block_sparse_attention(
     kv_block_size : int
         Number of logical KV tokens represented by one BSR block ID; it must
         be 8, 16, 32, or a positive multiple of 64.
+    exact_block_bits : torch.Tensor, optional
+        Compact UInt32 exact-block bitmap required in bitmask mode.
+    k_summary : torch.Tensor, optional
+        Per-block mean K tensor required when proxy routes are enabled.
+    v_summary : torch.Tensor, optional
+        Per-block summed V tensor required when proxy routes are enabled.
     kv_valid_bits : torch.Tensor, optional
         Contiguous UInt32 token-validity bitmap ``[B, ceil(Skv / 32)]``.
+    sparse_format : {"bsr", "bitmask"}, optional
+        Runtime sparse representation. Defaults to ``"bsr"``.
+    use_proxy_routes : bool, optional
+        Represent unselected blocks through K/V summaries. Proxy routes
+        currently require dense masking.
     mask_type : {"dense", "causal"}, optional
         Attention mask applied inside each selected sparse block.
     sm_scale : float, optional
         Softmax scale. Defaults to ``1 / sqrt(D)``.
     out : torch.Tensor, optional
         Caller-owned compact output buffer ``[B, Sq, Hq, D]``.
+        Must not overlap any live input; storage overlap is not checked.
+
+    share_pattern_across_kv_heads : bool
+        False (default) uses one pattern per KV head. True requires a singleton
+        pattern-head axis and reuses those rows across all physical KV heads.
 
     Returns
     -------
@@ -408,6 +466,7 @@ def block_sparse_attention(
         raise ValueError("K and V must have identical shapes")
 
     use_kv_valid_bits = kv_valid_bits is not None
+    _validate_contiguous_route_mode(sparse_format, use_proxy_routes)
     static = _validate_block_sparse_static_profile(
         batch_size=batch_size,
         seq_len_q=seq_len_q,
@@ -418,19 +477,45 @@ def block_sparse_attention(
         q_block_size=q_block_size,
         kv_block_size=kv_block_size,
         use_kv_valid_bits=use_kv_valid_bits,
+        share_pattern_across_kv_heads=share_pattern_across_kv_heads,
         mask_type=mask_type,
         q_dtype=q.dtype,
         kv_dtype=k.dtype,
         output_dtype=q.dtype if out is None else out.dtype,
     )
+    if use_proxy_routes and static.mask_type != "dense":
+        raise ValueError("block-sparse proxy routes require mask_type='dense'")
     device, _ = _resolve_cuda_device(q.device)
-    inspection = _inspect_one_shot_block_sparse_routes(
-        block_indptr,
-        block_indices,
-        kv_valid_bits,
-        static=static,
+    _validate_block_sparse_metadata(
+        sparse_format=sparse_format,
+        block_indptr=block_indptr,
+        block_indices=block_indices,
+        exact_block_bits=exact_block_bits,
+        kv_valid_bits=kv_valid_bits,
         device=device,
+        batch_size=static.batch_size,
+        seq_len_q=static.seq_len_q,
+        seq_len_kv=static.seq_len_kv,
+        num_kv_heads=_num_sparse_pattern_heads(
+            static.num_kv_heads, static.share_pattern_across_kv_heads
+        ),
+        q_block_size=static.q_block_size,
+        kv_block_size=static.kv_block_size,
+        use_kv_valid_bits=static.use_kv_valid_bits,
     )
+    if sparse_format == "bsr":
+        max_blocks_per_row = _inspect_block_sparse_bsr(
+            block_indptr,
+            block_indices,
+            static=static,
+            stream=torch.cuda.current_stream(device),
+        )
+    elif sparse_format == "bitmask":
+        max_blocks_per_row = (
+            static.seq_len_kv + static.kv_block_size - 1
+        ) // static.kv_block_size
+    else:
+        raise AssertionError(f"unsupported sparse format {sparse_format!r}")
 
     wrapper = BlockSparseTSWrapper()
     wrapper.plan(
@@ -443,12 +528,15 @@ def block_sparse_attention(
         static.q_block_size,
         static.kv_block_size,
         device=device,
-        max_blocks_per_row=inspection.max_row_block_count,
+        max_blocks_per_row=max_blocks_per_row,
         use_kv_valid_bits=static.use_kv_valid_bits,
+        sparse_format=sparse_format,
+        use_proxy_routes=use_proxy_routes,
         mask_type=static.mask_type,
         q_data_type=static.q_dtype,
         kv_data_type=static.kv_dtype,
         o_data_type=static.output_dtype,
+        share_pattern_across_kv_heads=static.share_pattern_across_kv_heads,
     )
     return wrapper.run(
         q,
@@ -456,48 +544,24 @@ def block_sparse_attention(
         v,
         block_indptr,
         block_indices,
+        exact_block_bits=exact_block_bits,
+        k_summary=k_summary,
+        v_summary=v_summary,
         kv_valid_bits=kv_valid_bits,
         sm_scale=sm_scale,
         out=out,
     )
 
 
-def _validate_paged_kv_indptr_tensor(
-    paged_kv_indptr: torch.Tensor,
-) -> tuple[torch.device, int]:
-    """Validate the plan-owned page-row source without reading its values."""
-
-    if not isinstance(paged_kv_indptr, torch.Tensor):
-        raise TypeError("paged_kv_indptr must be a torch.Tensor")
-    if paged_kv_indptr.dtype != torch.int32:
-        raise TypeError("paged_kv_indptr must have dtype torch.int32")
-    if paged_kv_indptr.ndim != 1:
-        raise ValueError("paged_kv_indptr must be one-dimensional")
-    if paged_kv_indptr.device.type != "cuda":
-        raise ValueError("paged_kv_indptr must be a CUDA tensor")
-    if not paged_kv_indptr.is_contiguous():
-        raise ValueError("paged_kv_indptr must be contiguous")
-    if paged_kv_indptr.data_ptr() % 4 != 0:
-        raise ValueError("paged_kv_indptr data pointer must be 4-byte aligned")
-    if paged_kv_indptr.numel() < 2:
-        raise ValueError("paged_kv_indptr must describe at least one request")
-    return paged_kv_indptr.device, paged_kv_indptr.numel() - 1
-
-
 class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
-    """Plan stable logical geometry and run with live sparse/page mappings."""
-
-    def _published_state(self) -> _BlockSparsePlanState:
-        state = super()._published_state()
-        assert state.paged_kv is not None
-        return state
+    """Plan fixed capacity and run with entirely live request metadata."""
 
     @_serialize_plan
     def plan(
         self,
-        paged_kv_indptr: torch.Tensor,
+        batch_size: int,
         seq_len_q: int,
-        seq_len_kv: int,
+        max_seq_len_kv: int,
         num_qo_heads: int,
         num_kv_heads: int,
         head_dim: int,
@@ -505,26 +569,26 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
         kv_block_size: int,
         page_size: int,
         *,
+        device: torch.device | str | int,
         max_blocks_per_row: int,
         use_kv_valid_bits: bool,
-        seq_lens_kv: torch.Tensor | None = None,
         mask_type: Literal["dense", "causal"] = "dense",
+        share_pattern_across_kv_heads: bool = False,
         q_data_type: torch.dtype = torch.float16,
         kv_data_type: torch.dtype | None = None,
         o_data_type: torch.dtype | None = None,
     ) -> None:
-        """Plan fixed-Q geometry and snapshot stable page and length metadata.
+        """Plan fixed-Q geometry and a maximum variable-K capacity.
 
-        Without ``seq_lens_kv``, ``seq_len_kv`` is the exact shared K/V length.
-        With it, ``seq_len_kv`` is a static maximum and ``seq_lens_kv`` supplies
-        one length per request. Both ``paged_kv_indptr`` and ``seq_lens_kv`` are
-        copied through a D2H snapshot, validated, and republished as plan-owned
-        CUDA tensors. Changing either therefore requires a new plan.
+        ``share_pattern_across_kv_heads=True`` accepts a singleton pattern-head
+        axis and prepares each BSR row once for all KV heads. False (default)
+        retains separate patterns. Cache head count and Q layout do not change.
 
-        Each page-table row needs only ``ceil(seq_lens_kv[b] / page_size)``
-        live entries; extra entries are spare capacity and are not read. Physical
-        page IDs and block-sparse routes remain runtime inputs, so graph replays
-        may remap them in place between completed replays.
+        The plan stores no request metadata. Every run supplies a live fixed 2D
+        page table of physical page IDs, per-request K/V lengths, sparse routes,
+        and optional token bits. ``max_seq_len_kv`` fixes compilation and mask
+        capacity. Attention consumes caller-owned live lengths directly, without
+        a plan-owned copy or device-to-host validation.
 
         ``q_block_size`` may be any positive signed-Int32 value satisfying
         ``q_block_size * (Hq / Hkv) % 8 == 0``. This row-purity condition keeps
@@ -533,11 +597,10 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
         multiple of 64.
         """
 
-        source_device, batch_size = _validate_paged_kv_indptr_tensor(paged_kv_indptr)
         static = _validate_block_sparse_static_profile(
             batch_size=batch_size,
             seq_len_q=seq_len_q,
-            seq_len_kv=seq_len_kv,
+            seq_len_kv=max_seq_len_kv,
             num_qo_heads=num_qo_heads,
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
@@ -545,6 +608,7 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
             kv_block_size=kv_block_size,
             page_size=page_size,
             use_kv_valid_bits=use_kv_valid_bits,
+            share_pattern_across_kv_heads=share_pattern_across_kv_heads,
             mask_type=mask_type,
             q_dtype=q_data_type,
             kv_dtype=kv_data_type,
@@ -552,60 +616,66 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
             max_blocks_per_row=max_blocks_per_row,
         )
         assert static.page_size is not None
-        device, device_index = _resolve_cuda_device(source_device)
+        device, device_index = _resolve_cuda_device(device)
         plan_stream = torch.cuda.current_stream(device)
         with torch.cuda.device(device_index), torch.cuda.stream(plan_stream):
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError(
                     "paged block-sparse planning is unsupported during CUDA Graph capture"
                 )
-            paged_kv = _snapshot_paged_kv_plan_metadata(
-                paged_kv_indptr,
-                seq_lens_kv,
-                static=static,
-                device=device,
-                plan_stream=plan_stream,
-            )
             candidate = _build_block_sparse_plan_state(
                 static,
                 device=device,
                 device_index=device_index,
                 plan_stream=plan_stream,
-                paged_kv=paged_kv,
             )
         self._plan_state = candidate
 
-    @flashinfer_api
+    @flashinfer_experimental_api(
+        trace=prims_ts_paged_block_sparse_wrapper_trace_dispatch
+    )
     def run(
         self,
         q: torch.Tensor,
         paged_kv_cache: PagedKVCache,
-        paged_kv_indices: torch.Tensor,
+        block_tables: torch.Tensor,
+        seq_lens_kv: torch.Tensor,
         block_indptr: torch.Tensor,
         block_indices: torch.Tensor,
         *,
         kv_valid_bits: torch.Tensor | None = None,
         sm_scale: float | None = None,
         out: torch.Tensor | None = None,
+        validate: bool = True,
     ) -> torch.Tensor:
-        """Launch with live physical page IDs and per-KV-head sparse routes.
+        """Launch with live lengths, page tables, and sparse routes.
 
         Q and O are compact ``[B, Sq, Hq, D]`` tensors, including ``Sq=1``.
         The cache is either combined ``[P, 2, Hkv, page, D]`` or a ``(K, V)``
         tuple whose members are ``[P, Hkv, page, D]`` with compact inner HND
         strides and arbitrary non-overlapping outer page strides.
 
-        ``paged_kv_indices`` is compact Int32 with the exact final extent
-        snapshotted from ``paged_kv_indptr`` by :meth:`plan`. Its page IDs,
-        ``block_indptr``, ``block_indices``, and optional token bits are read at
-        run time. Within every sparse row, BSR block IDs must be strictly
-        increasing and unique. Each selected block must start before the
-        request's frozen live K/V length (the static ``seq_len_kv`` for a
-        fixed-length plan). Because the row is sorted, preparation validates
-        this live bound from its final block. ``max_blocks_per_row`` applies to
-        the provided live row. Referenced physical page IDs must be in
-        ``[0, P)``; an invalid BSR or page ID makes its affected row fail closed
-        to finite zero without reading a K/V payload out of bounds.
+        ``validate=True`` performs structural and plan-geometry validation
+        without reading tensor values; it is the safe public default.
+        ``validate=False`` treats every run argument as a trusted binding and
+        performs no explicit wrapper validation. K/V view selection, scale
+        forwarding, and optional output allocation are unavoidable in both
+        modes.
+
+        ``block_tables`` is Int32 ``[B, C]``, contiguous within each row but
+        permitted to use a padded outer row stride; ``seq_lens_kv`` is compact
+        Int32 ``[B]``. All values are read on device. The caller must keep
+        every dense length in ``[1, max_seq_len_kv]`` and every causal length
+        in ``[Sq, max_seq_len_kv]``. Every page-table row must contain at least
+        ``ceil(seq_lens_kv[b] / page_size)`` live entries. Every page ID in its
+        live prefix must lie in ``[0, P)``. Each BSR row must contain strictly
+        increasing, unique block IDs whose final block starts before that
+        request's live K/V length, and its width must not exceed the planned
+        ``max_blocks_per_row``. Reusable runs trust all of these device-side
+        values; assertion-enabled CuTe DSL builds diagnose violations
+        encountered while preparing selected routes, while default builds
+        leave invalid values undefined and may access out of bounds. No runtime
+        value validation synchronizes or copies metadata to the host.
 
         In eager execution, ``record_stream`` extends the allocator lifetime of
         every launch tensor (Q, normalized K/V, O, BSR metadata, token bits,
@@ -625,24 +695,33 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
             Either a combined cache ``[P, 2, Hkv, page_size, D]`` or a
             ``(K, V)`` tuple whose tensors are
             ``[P, Hkv, page_size, D]``.
-        paged_kv_indices : torch.Tensor
-            Contiguous Int32 physical page IDs. Its length must equal the
-            final offset snapshotted from ``paged_kv_indptr`` during planning.
+        block_tables : torch.Tensor
+            Live Int32 physical page IDs with shape ``[B, C]``. Entries are
+            contiguous within each row; padded, non-overlapping row strides are
+            supported and inactive tail entries are ignored.
+        seq_lens_kv : torch.Tensor
+            Contiguous Int32 live logical K/V lengths with shape ``[B]``.
+            Values must satisfy the dense or causal bounds above.
         block_indptr : torch.Tensor
             Contiguous Int32 BSR row offsets with shape
-            ``[B, Hkv, ceil(Sq / q_block_size) + 1]``.
+            ``[B, Hpattern, ceil(Sq / q_block_size) + 1]``. Hpattern is one for
+            shared patterns and Hkv otherwise.
         block_indices : torch.Tensor
             Contiguous Int32 logical KV-block IDs referenced by
             ``block_indptr``.
         kv_valid_bits : torch.Tensor, optional
             Contiguous UInt32 logical-token validity bitmap
-            ``[B, ceil(seq_len_kv / 32)]``. Supply it exactly when the plan
+            ``[B, ceil(max_seq_len_kv / 32)]``. Supply it exactly when the plan
             enabled token validity bits.
         sm_scale : float, optional
             Softmax scale. Defaults to ``1 / sqrt(D)``.
         out : torch.Tensor, optional
             Caller-owned compact output buffer ``[B, Sq, Hq, D]`` with the
-            planned output dtype.
+            planned output dtype. Must not overlap any live input or plan-owned
+            buffer; storage overlap is not checked.
+        validate : bool
+            Whether to validate tensor structure and plan geometry before
+            launching. Defaults to ``True``.
 
         Returns
         -------
@@ -651,12 +730,20 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
         """
 
         state = self._require_run_state()
+        if not isinstance(validate, bool):
+            raise TypeError("validate must be a bool")
         run_stream = torch.cuda.current_stream(state.device)
-        run_args = _validate_block_sparse_run(
+        prepare_run = (
+            _validate_block_sparse_run
+            if validate
+            else _prepare_block_sparse_run_unchecked
+        )
+        run_args = prepare_run(
             q,
             _PagedKVStorage(
                 paged_kv_cache=paged_kv_cache,
-                paged_kv_indices=paged_kv_indices,
+                block_tables=block_tables,
+                seq_lens_kv=seq_lens_kv,
             ),
             state=state,
             block_indptr=block_indptr,
@@ -668,30 +755,31 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
         return self._launch_validated_run(state, run_args, run_stream)
 
 
-@flashinfer_api(trace=prims_ts_paged_block_sparse_trace_dispatch)
+@flashinfer_experimental_api(trace=prims_ts_paged_block_sparse_trace_dispatch)
 def block_sparse_attention_with_paged_kv_cache(
     q: torch.Tensor,
     paged_kv_cache: PagedKVCache,
-    paged_kv_indptr: torch.Tensor,
-    paged_kv_indices: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens_kv: torch.Tensor,
     block_indptr: torch.Tensor,
     block_indices: torch.Tensor,
     q_block_size: int,
     kv_block_size: int,
     *,
-    seq_len_kv: int,
-    seq_lens_kv: torch.Tensor | None = None,
+    max_seq_len_kv: int,
     kv_valid_bits: torch.Tensor | None = None,
     mask_type: Literal["dense", "causal"] = "dense",
+    share_pattern_across_kv_heads: bool = False,
     sm_scale: float | None = None,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Plan and run one fixed-Q paged block-sparse attention launch.
 
-    This one-shot entry point mirrors :class:`BlockSparsePagedTSWrapper`: the
-    logical request-to-page spans come from ``paged_kv_indptr`` and optional
-    ``seq_lens_kv``, while live physical page IDs and sparse routes still come
-    from ``paged_kv_indices`` plus BSR metadata at run time.
+    This convenience entry point synchronously validates the live page tables,
+    K/V lengths, and sparse metadata, creates a capacity-only temporary plan,
+    then forwards the inspected tensors through the trusted live run API. It
+    cannot run during CUDA Graph capture; plan a wrapper outside capture and
+    capture only :meth:`BlockSparsePagedTSWrapper.run` instead.
 
     Parameters
     ----------
@@ -700,14 +788,17 @@ def block_sparse_attention_with_paged_kv_cache(
     paged_kv_cache : PagedKVCache
         Either a combined cache ``[P, 2, Hkv, page_size, D]`` or a ``(K, V)``
         tuple whose tensors are ``[P, Hkv, page_size, D]``.
-    paged_kv_indptr : torch.Tensor
-        Contiguous Int32 request offsets into ``paged_kv_indices``, with shape
-        ``[B + 1]``.
-    paged_kv_indices : torch.Tensor
-        Contiguous Int32 physical page IDs referenced by ``paged_kv_indptr``.
+    block_tables : torch.Tensor
+        Int32 physical page IDs ``[B, C]``, contiguous within each row and free
+        to use a padded outer row stride. ``C * page_size`` must cover
+        ``max_seq_len_kv``; only the first ``ceil(seq_lens_kv[b] / page_size)``
+        entries of each row are read.
+    seq_lens_kv : torch.Tensor
+        Contiguous Int32 per-request logical KV lengths with shape ``[B]``.
     block_indptr : torch.Tensor
         Contiguous Int32 BSR row offsets with shape
-        ``[B, Hkv, ceil(Sq / q_block_size) + 1]``.
+        ``[B, Hpattern, ceil(Sq / q_block_size) + 1]``. Hpattern is one for
+        shared patterns and Hkv otherwise.
     block_indices : torch.Tensor
         Contiguous Int32 logical KV-block IDs referenced by ``block_indptr``.
     q_block_size : int
@@ -717,20 +808,22 @@ def block_sparse_attention_with_paged_kv_cache(
     kv_block_size : int
         Number of logical KV tokens represented by one BSR block ID; it must
         be 8, 16, 32, or a positive multiple of 64.
-    seq_len_kv : int
-        Exact shared logical KV length, or the maximum logical length when
-        ``seq_lens_kv`` is provided.
-    seq_lens_kv : torch.Tensor, optional
-        Contiguous Int32 per-request logical KV lengths with shape ``[B]``.
+    max_seq_len_kv : int
+        Static maximum logical K/V length used for planning.
     kv_valid_bits : torch.Tensor, optional
         Contiguous UInt32 logical-token validity bitmap
-        ``[B, ceil(seq_len_kv / 32)]``.
+        ``[B, ceil(max_seq_len_kv / 32)]``.
     mask_type : {"dense", "causal"}, optional
         Attention mask applied inside each selected sparse block.
     sm_scale : float, optional
         Softmax scale. Defaults to ``1 / sqrt(D)``.
     out : torch.Tensor, optional
         Caller-owned compact output buffer ``[B, Sq, Hq, D]``.
+        Must not overlap any live input; storage overlap is not checked.
+
+    share_pattern_across_kv_heads : bool
+        False (default) uses one pattern per KV head. True requires a singleton
+        pattern-head axis and reuses those rows across all physical KV heads.
 
     Returns
     -------
@@ -745,64 +838,73 @@ def block_sparse_attention_with_paged_kv_cache(
     if out is not None and not isinstance(out, torch.Tensor):
         raise TypeError("out must be a torch.Tensor")
 
-    metadata_device, batch_size = _validate_paged_kv_indptr_tensor(paged_kv_indptr)
-    if metadata_device != q.device:
-        raise ValueError(
-            f"paged_kv_indptr must be on q.device {q.device}, got {metadata_device}"
-        )
-
-    batch_q, seq_len_q, num_qo_heads, head_dim = map(int, q.shape)
-    if batch_q != batch_size:
-        raise ValueError(
-            "the paged metadata batch size must equal q.shape[0]: "
-            f"expected {batch_q}, got {batch_size}"
-        )
-
-    (
-        k_cache,
-        _,
-        _,
-        num_kv_heads,
-        page_size,
-        runtime_head_dim,
-        _,
-        _,
-    ) = _normalize_paged_kv_cache(paged_kv_cache, expected_device=q.device)
-    if runtime_head_dim != head_dim:
+    batch_size, seq_len_q, num_qo_heads, head_dim = map(int, q.shape)
+    metadata_device, _ = _resolve_cuda_device(q.device)
+    paged = _validate_paged_kv_storage(
+        _PagedKVStorage(
+            paged_kv_cache=paged_kv_cache,
+            block_tables=block_tables,
+            seq_lens_kv=seq_lens_kv,
+        ),
+        expected_device=q.device,
+        expected_batch_size=batch_size,
+        seq_len_kv=max_seq_len_kv,
+    )
+    if paged.head_dim != head_dim:
         raise ValueError(
             "Q and paged K/V head dimensions must agree: "
-            f"expected {head_dim}, got {runtime_head_dim}"
+            f"expected {head_dim}, got {paged.head_dim}"
         )
 
     use_kv_valid_bits = kv_valid_bits is not None
     static = _validate_block_sparse_static_profile(
         batch_size=batch_size,
         seq_len_q=seq_len_q,
-        seq_len_kv=seq_len_kv,
+        seq_len_kv=max_seq_len_kv,
         num_qo_heads=num_qo_heads,
-        num_kv_heads=num_kv_heads,
+        num_kv_heads=paged.num_kv_heads,
         head_dim=head_dim,
         q_block_size=q_block_size,
         kv_block_size=kv_block_size,
-        page_size=page_size,
+        page_size=paged.page_size,
         use_kv_valid_bits=use_kv_valid_bits,
+        share_pattern_across_kv_heads=share_pattern_across_kv_heads,
         mask_type=mask_type,
         q_dtype=q.dtype,
-        kv_dtype=k_cache.dtype,
+        kv_dtype=paged.k.dtype,
         output_dtype=q.dtype if out is None else out.dtype,
     )
-    inspection = _inspect_one_shot_block_sparse_routes(
+    _validate_block_sparse_metadata(
+        sparse_format="bsr",
+        block_indptr=block_indptr,
+        block_indices=block_indices,
+        exact_block_bits=None,
+        kv_valid_bits=kv_valid_bits,
+        device=metadata_device,
+        batch_size=static.batch_size,
+        seq_len_q=static.seq_len_q,
+        seq_len_kv=static.seq_len_kv,
+        num_kv_heads=_num_sparse_pattern_heads(
+            static.num_kv_heads, static.share_pattern_across_kv_heads
+        ),
+        q_block_size=static.q_block_size,
+        kv_block_size=static.kv_block_size,
+        use_kv_valid_bits=static.use_kv_valid_bits,
+    )
+    max_blocks_per_row = _inspect_paged_block_sparse_metadata(
         block_indptr,
         block_indices,
-        kv_valid_bits,
+        block_tables,
+        seq_lens_kv,
         static=static,
-        device=metadata_device,
+        num_physical_kv_pages=paged.payload.num_physical_kv_pages,
+        stream=torch.cuda.current_stream(metadata_device),
     )
 
     wrapper = BlockSparsePagedTSWrapper()
     assert static.page_size is not None
     wrapper.plan(
-        paged_kv_indptr,
+        static.batch_size,
         static.seq_len_q,
         static.seq_len_kv,
         static.num_qo_heads,
@@ -811,18 +913,20 @@ def block_sparse_attention_with_paged_kv_cache(
         static.q_block_size,
         static.kv_block_size,
         static.page_size,
-        max_blocks_per_row=inspection.max_row_block_count,
+        device=metadata_device,
+        max_blocks_per_row=max_blocks_per_row,
         use_kv_valid_bits=static.use_kv_valid_bits,
-        seq_lens_kv=seq_lens_kv,
         mask_type=static.mask_type,
         q_data_type=static.q_dtype,
         kv_data_type=static.kv_dtype,
         o_data_type=static.output_dtype,
+        share_pattern_across_kv_heads=static.share_pattern_across_kv_heads,
     )
     return wrapper.run(
         q,
         paged_kv_cache,
-        paged_kv_indices,
+        block_tables,
+        seq_lens_kv,
         block_indptr,
         block_indices,
         kv_valid_bits=kv_valid_bits,

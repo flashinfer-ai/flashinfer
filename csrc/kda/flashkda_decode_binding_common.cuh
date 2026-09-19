@@ -83,9 +83,9 @@ inline void CheckFlashKDADecodeTarget(int32_t device_id) {
   CheckCuda(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device_id),
             "cudaDeviceGetAttribute(minor)");
   if (kFlashKDADecodeTargetKind == kFlashKDADecodeFamilyTarget) {
-    TVM_FFI_ICHECK(major == 10 && (minor == 0 || minor == 3))
+    TVM_FFI_ICHECK(major == 10 && (minor == 0 || minor == 3 || minor == 7))
         << "this frozen FlashKDA decode module was compiled for the SM100 family "
-           "(compute capability 10.0 or 10.3), got "
+           "(compute capability 10.0, 10.3 or 10.7), got "
         << major << "." << minor;
     return;
   }

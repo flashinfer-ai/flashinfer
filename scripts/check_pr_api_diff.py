@@ -6,6 +6,9 @@ used by the release API diff tooling: a public callable is a Python function
 decorated with ``@flashinfer_api``.  Unlike a release comparison, this is
 scoped to one pull request's base and head commits.
 
+The experimental track is out of scope: it carries no compatibility guarantees,
+so it is not part of the surface this check defends (see ``EXPERIMENTAL_PACKAGE``).
+
 By default findings are GitHub Actions warnings so the check is safe to roll
 out without blocking contributors.  ``--strict`` makes findings fail the job.
 """
@@ -52,6 +55,31 @@ class ChangedFile:
     status: str
     old_path: str | None
     new_path: str | None
+
+
+# Experimental track, excluded from the public surface on two independent axes:
+#
+# - path — everything under ``flashinfer/experimental/`` is an experimental
+#   backend by construction (see ``flashinfer/experimental/README.md``);
+# - decorator — experimental APIs live in core modules but are marked
+#   ``@flashinfer_experimental_api``, which ``is_decorated_with(..., "flashinfer_api")``
+#   deliberately does not match (suffix matching requires a dot before the name).
+#
+# Only the path axis needs code here; the decorator axis falls out of the
+# literal name.  Excluding an experimental *file* rather than the whole change
+# keeps a core -> experimental move visible: the API disappears from the stable
+# side and is still reported as a removal, while experimental -> core (a
+# graduation) reports nothing.
+EXPERIMENTAL_PACKAGE = ("flashinfer", "experimental")
+
+
+def is_experimental_path(path: str | None) -> bool:
+    """True for files in the experimental track, which has no API guarantees."""
+    if path is None:
+        return False
+    return tuple(PurePosixPath(path).parts[: len(EXPERIMENTAL_PACKAGE)]) == (
+        EXPERIMENTAL_PACKAGE
+    )
 
 
 def git(*args: str) -> str:
@@ -426,6 +454,12 @@ def module_apis(
         return cache[module]
 
     module_path = module.replace(".", "/")
+    if is_experimental_path(f"{module_path}.py"):
+        # A stable API re-exported from the experimental track is no longer
+        # covered by the stable contract; report it as removed rather than as
+        # still re-exported.
+        cache[module] = {}
+        return cache[module]
     for candidate in (f"{module_path}.py", f"{module_path}/__init__.py"):
         source = git_file(revision, candidate)
         if source is not None:
@@ -487,6 +521,8 @@ def changed_files(base: str, head: str) -> list[ChangedFile]:
 def public_module(path: str | None, *, has_decorated_api: bool = False) -> str | None:
     if path is None:
         return None
+    if is_experimental_path(path):
+        return None
     parts = list(PurePosixPath(path).parts)
     if not path.endswith(".py") or not parts or parts[0] != "flashinfer":
         return None
@@ -529,12 +565,12 @@ def check(base: str, head: str) -> list[PrFinding]:
         old_path, new_path = change.old_path, change.new_path
         old = (
             extract_public_apis(old_path or "", git_file(base, old_path))
-            if old_path
+            if old_path and not is_experimental_path(old_path)
             else {}
         )
         new = (
             extract_public_apis(new_path or "", git_file(head, new_path))
-            if new_path
+            if new_path and not is_experimental_path(new_path)
             else {}
         )
         api_changes[change] = (old, new)
