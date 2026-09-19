@@ -43,6 +43,7 @@ def gen_moe_utils_module() -> JitSpec:
     # which imports this module — so ArtifactPath/CheckSumHash aren't defined yet
     # at module load time if these imports are at the top level.
     from .cubin_loader import (
+        artifact_include_root,
         get_artifact,
         get_meta_hash,
         ensure_symlink,
@@ -58,12 +59,13 @@ def gen_moe_utils_module() -> JitSpec:
     for header in BMM_EXPORT_HEADERS:
         h = get_artifact(f"{bmm_export_path}/{header}", get_meta_hash(checksum, header))
         assert h, f"{header} not found"
+    gen_root = artifact_include_root(
+        jit_env.FLASHINFER_GEN_SRC_DIR / "trtllm_export",
+        "moe_utils",
+        CheckSumHash.TRTLLM_GEN_BMM,
+    )
     symlink_path = (
-        jit_env.FLASHINFER_GEN_SRC_DIR
-        / "flashinfer"
-        / "trtllm"
-        / "batched_gemm"
-        / "trtllmGen_bmm_export"
+        gen_root / "flashinfer" / "trtllm" / "batched_gemm" / "trtllmGen_bmm_export"
     )
     ensure_symlink(symlink_path, jit_env.FLASHINFER_CUBIN_DIR / bmm_export_path)
     verify_symlinked_headers(symlink_path, BMM_EXPORT_HEADERS, checksum)
@@ -114,6 +116,9 @@ def gen_moe_utils_module() -> JitSpec:
         ],
         extra_cuda_cflags=nvcc_flags,
         extra_include_paths=[
+            # The versioned export root is searched before every source-tree
+            # root, so it is the only place these headers can come from.
+            gen_root,
             jit_env.FLASHINFER_CSRC_DIR,
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal" / "include",
@@ -137,4 +142,7 @@ def gen_moe_utils_module() -> JitSpec:
             jit_env.FLASHINFER_GEN_SRC_DIR,
             jit_env.FLASHINFER_CUBIN_DIR,
         ],
+        # The exported headers are part of this module's build identity: another
+        # artifact version must not reuse these objects or this .so.
+        artifact_version=CheckSumHash.TRTLLM_GEN_BMM,
     )

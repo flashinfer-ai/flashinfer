@@ -155,7 +155,12 @@ def build_common_cflags(
     common_cflags += _get_glibcxx_abi_build_flags()
     if extra_include_dirs is not None:
         for extra_dir in extra_include_dirs:
-            common_cflags.append(f"-I{extra_dir.resolve()}")
+            include_dir = str(extra_dir.resolve())
+            # A space in an -I path would split the flag once ninja expands the
+            # command line, so quote only the paths that need it.
+            if " " in include_dir:
+                include_dir = f'"{include_dir}"'
+            common_cflags.append(f"-I{include_dir}")
     # Vendored CCCL headers use -I (not -isystem) so they take precedence
     # over the CTK-bundled copy. CCCL headers use #pragma system_header
     # internally to suppress warnings. See https://github.com/NVIDIA/cccl/issues/527
@@ -246,6 +251,7 @@ def generate_ninja_build_for_op(
     extra_include_dirs: Optional[List[Path]],
     needs_device_linking: bool = False,
     embedded_cubins: Optional[Mapping[str, Path]] = None,
+    build_dir: Optional[Path] = None,
 ) -> str:
     cuda_home = get_cuda_path()
     common_cflags = build_common_cflags(cuda_home, extra_include_dirs)
@@ -334,7 +340,9 @@ def generate_ninja_build_for_op(
     # Use absolute paths for outputs so ninja files work with any workdir
     # This enables isolated workdirs for runtime JIT (avoiding .ninja_log races)
     # while still supporting subninja for parallel AOT builds
-    output_dir = jit_env.FLASHINFER_JIT_DIR / name
+    # The spec owns the build directory: modules compiled against a versioned
+    # artifact must not write into another version's objects or .so.
+    output_dir = jit_env.FLASHINFER_JIT_DIR / name if build_dir is None else build_dir
 
     objects = []
     for source in sources:
