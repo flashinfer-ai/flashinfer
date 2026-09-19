@@ -155,6 +155,29 @@ def tmem_load_32dp32b32x(tmem_addr: Int32) -> Tuple[Float32, ...]:
 
 
 @cute.jit
+def tmem_load_red_max_32dp32b16x(
+    tmem_addr: Int32,
+) -> Tuple[Tuple[Float32, ...], Float32]:
+    """Load 16 FP32 TMEM values and return their hardware-reduced maximum."""
+    out = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32()] * 17),
+        [Int32(cute.arch.make_warp_uniform(tmem_addr)).ir_value()],
+        "tcgen05.ld.red.sync.aligned.32x32b.x16.max.f32 "
+        "{"
+        "$0, $1, $2, $3, $4, $5, $6, $7, "
+        "$8, $9, $10, $11, $12, $13, $14, $15"
+        "}, $16, [$17];",
+        ",".join(["=r"] * 17 + ["r"]),
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    values = tuple(Float32(llvm.extractvalue(T.f32(), out, [i])) for i in range(16))
+    row_max = Float32(llvm.extractvalue(T.f32(), out, [16]))
+    return values, row_max
+
+
+@cute.jit
 def cvt_f32x2_to_bf16x2(a: Float32, b: Float32) -> Int32:
     return Int32(
         llvm.inline_asm(
