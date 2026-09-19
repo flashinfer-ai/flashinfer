@@ -4176,7 +4176,7 @@ MODULES = {
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
         "sources": [
-            "csrc/kda/tf32/cake_kda_tf32_de0b648b181aea585317a33cbb59f25b403246d990627eb3e6cdab1a9c874ab0_kernel.cu",
+            "csrc/kda/tf32/cake_kda_tf32_de0b648b181aea585317a33cbb59f25b403246d990627eb3e6cdab1a9c874ab0_sm_103a_kernel.cu",
             "csrc/kda/tf32/cake_kda_tf32_de0b648b181aea585317a33cbb59f25b403246d990627eb3e6cdab1a9c874ab0_binding.cu",
         ],
         "tma_workspace_bytes": 896,
@@ -4350,7 +4350,7 @@ MODULES = {
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
         "sources": [
-            "csrc/kda/tf32/cake_kda_tf32_5631aff0c79ab029e651a941cb484c602c9b853fccab131b625b56d5c4a4ce27_kernel.cu",
+            "csrc/kda/tf32/cake_kda_tf32_5631aff0c79ab029e651a941cb484c602c9b853fccab131b625b56d5c4a4ce27_sm_103a_kernel.cu",
             "csrc/kda/tf32/cake_kda_tf32_5631aff0c79ab029e651a941cb484c602c9b853fccab131b625b56d5c4a4ce27_binding.cu",
         ],
         "tma_workspace_bytes": 1024,
@@ -4461,7 +4461,7 @@ MODULES = {
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
         "sources": [
-            "csrc/kda/tf32/cake_kda_tf32_83d5b769f4ecd1825483a3d09349e9e95d14d3fe125dfb25559cfc17dad6a705_kernel.cu",
+            "csrc/kda/tf32/cake_kda_tf32_83d5b769f4ecd1825483a3d09349e9e95d14d3fe125dfb25559cfc17dad6a705_sm_103a_kernel.cu",
             "csrc/kda/tf32/cake_kda_tf32_83d5b769f4ecd1825483a3d09349e9e95d14d3fe125dfb25559cfc17dad6a705_binding.cu",
         ],
         "tma_workspace_bytes": 1024,
@@ -4524,7 +4524,7 @@ MODULES = {
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
         "sources": [
-            "csrc/kda/tf32/cake_kda_tf32_b6beda89dac6ab15d4e6112deae14c4a0eddb6863a26e546b9378f7b0824305c_kernel.cu",
+            "csrc/kda/tf32/cake_kda_tf32_b6beda89dac6ab15d4e6112deae14c4a0eddb6863a26e546b9378f7b0824305c_sm_103a_kernel.cu",
             "csrc/kda/tf32/cake_kda_tf32_b6beda89dac6ab15d4e6112deae14c4a0eddb6863a26e546b9378f7b0824305c_binding.cu",
         ],
         "tma_workspace_bytes": 1024,
@@ -4756,7 +4756,7 @@ MODULES = {
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
         "sources": [
-            "csrc/kda/tf32/cake_kda_tf32_3d86251533a484c214da6dbd74f67a85119edf8c03d8c7ecad2cbef7f423a1b0_kernel.cu",
+            "csrc/kda/tf32/cake_kda_tf32_3d86251533a484c214da6dbd74f67a85119edf8c03d8c7ecad2cbef7f423a1b0_sm_103a_kernel.cu",
             "csrc/kda/tf32/cake_kda_tf32_3d86251533a484c214da6dbd74f67a85119edf8c03d8c7ecad2cbef7f423a1b0_binding.cu",
         ],
         "tma_workspace_bytes": 1024,
@@ -5016,7 +5016,7 @@ MODULES = {
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
         "sources": [
-            "csrc/kda/tf32/cake_kda_tf32_aa4d61bbbcd9a21d62b25651d953d1239bdd239892e3d30b101e0ab2e429ab62_kernel.cu",
+            "csrc/kda/tf32/cake_kda_tf32_aa4d61bbbcd9a21d62b25651d953d1239bdd239892e3d30b101e0ab2e429ab62_sm_103a_kernel.cu",
             "csrc/kda/tf32/cake_kda_tf32_aa4d61bbbcd9a21d62b25651d953d1239bdd239892e3d30b101e0ab2e429ab62_binding.cu",
         ],
         "tma_workspace_bytes": 896,
@@ -5142,7 +5142,7 @@ MODULES = {
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
         "sources": [
-            "csrc/kda/tf32/cake_kda_tf32_12803094a6532d7d485f52f8a46877b86249c37c80feaf014cbf182dc84dc5b8_kernel.cu",
+            "csrc/kda/tf32/cake_kda_tf32_12803094a6532d7d485f52f8a46877b86249c37c80feaf014cbf182dc84dc5b8_sm_103a_kernel.cu",
             "csrc/kda/tf32/cake_kda_tf32_12803094a6532d7d485f52f8a46877b86249c37c80feaf014cbf182dc84dc5b8_binding.cu",
         ],
         "tma_workspace_bytes": 1024,
@@ -5342,7 +5342,7 @@ MODULES = {
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
         "sources": [
-            "csrc/kda/tf32/cake_kda_tf32_39a2d34aff6b2793f048ebaaafc57abde68ac0ec0d9f4faaf7f567c69c35c398_kernel.cu",
+            "csrc/kda/tf32/cake_kda_tf32_39a2d34aff6b2793f048ebaaafc57abde68ac0ec0d9f4faaf7f567c69c35c398_sm_103a_kernel.cu",
             "csrc/kda/tf32/cake_kda_tf32_39a2d34aff6b2793f048ebaaafc57abde68ac0ec0d9f4faaf7f567c69c35c398_binding.cu",
         ],
         "tma_workspace_bytes": 1024,
@@ -5405,7 +5405,7 @@ MODULES = {
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
         "sources": [
-            "csrc/kda/tf32/cake_kda_tf32_ea088cb31c6390f9a82f101f421a357e121f55e292b08c186f237b5c974fa3b6_kernel.cu",
+            "csrc/kda/tf32/cake_kda_tf32_ea088cb31c6390f9a82f101f421a357e121f55e292b08c186f237b5c974fa3b6_sm_103a_kernel.cu",
             "csrc/kda/tf32/cake_kda_tf32_ea088cb31c6390f9a82f101f421a357e121f55e292b08c186f237b5c974fa3b6_binding.cu",
         ],
         "tma_workspace_bytes": 1024,
@@ -5468,7 +5468,7 @@ MODULES = {
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
         "sources": [
-            "csrc/kda/tf32/cake_kda_tf32_8c3b14205a9ffc1d6bb1736e329eb5d7a8f0d6e562e4bfae418f027e14352380_kernel.cu",
+            "csrc/kda/tf32/cake_kda_tf32_8c3b14205a9ffc1d6bb1736e329eb5d7a8f0d6e562e4bfae418f027e14352380_sm_103a_kernel.cu",
             "csrc/kda/tf32/cake_kda_tf32_8c3b14205a9ffc1d6bb1736e329eb5d7a8f0d6e562e4bfae418f027e14352380_binding.cu",
         ],
         "tma_workspace_bytes": 1024,
@@ -5783,7 +5783,7 @@ MODULES = {
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
         "sources": [
-            "csrc/kda/tf32/cake_kda_tf32_0aaa66f8b0fff559171a9d75b17859de6cf328b991c01274a3419eb656c327bd_kernel.cu",
+            "csrc/kda/tf32/cake_kda_tf32_0aaa66f8b0fff559171a9d75b17859de6cf328b991c01274a3419eb656c327bd_sm_103a_kernel.cu",
             "csrc/kda/tf32/cake_kda_tf32_0aaa66f8b0fff559171a9d75b17859de6cf328b991c01274a3419eb656c327bd_binding.cu",
         ],
         "tma_workspace_bytes": 1024,
@@ -5806,7 +5806,7 @@ MODULES = {
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
         "sources": [
-            "csrc/kda/tf32/cake_kda_tf32_2fe63c12a8b7535f696d880d5a9cfe26a51eb33a21585f698d09d089d7022b38_kernel.cu",
+            "csrc/kda/tf32/cake_kda_tf32_2fe63c12a8b7535f696d880d5a9cfe26a51eb33a21585f698d09d089d7022b38_sm_103a_kernel.cu",
             "csrc/kda/tf32/cake_kda_tf32_2fe63c12a8b7535f696d880d5a9cfe26a51eb33a21585f698d09d089d7022b38_binding.cu",
         ],
         "tma_workspace_bytes": 0,
@@ -5975,7 +5975,7 @@ MODULES = {
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
         "sources": [
-            "csrc/kda/tf32/cake_kda_tf32_4c99177c07ace7591e287d6d59191c460b0038d21d7697a719b133f5316847ff_kernel.cu",
+            "csrc/kda/tf32/cake_kda_tf32_4c99177c07ace7591e287d6d59191c460b0038d21d7697a719b133f5316847ff_sm_103a_kernel.cu",
             "csrc/kda/tf32/cake_kda_tf32_4c99177c07ace7591e287d6d59191c460b0038d21d7697a719b133f5316847ff_binding.cu",
         ],
         "tma_workspace_bytes": 896,
@@ -6023,7 +6023,7 @@ MODULES = {
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
         "sources": [
-            "csrc/kda/tf32/cake_kda_tf32_dd0f76773ac27a364fcf5df27f69697e3b1af22c2f77595b41b23945752e90f8_kernel.cu",
+            "csrc/kda/tf32/cake_kda_tf32_dd0f76773ac27a364fcf5df27f69697e3b1af22c2f77595b41b23945752e90f8_sm_103a_kernel.cu",
             "csrc/kda/tf32/cake_kda_tf32_dd0f76773ac27a364fcf5df27f69697e3b1af22c2f77595b41b23945752e90f8_binding.cu",
         ],
         "tma_workspace_bytes": 896,
@@ -6129,7 +6129,7 @@ MODULES = {
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
         "sources": [
-            "csrc/kda/tf32/cake_kda_tf32_de45e5779221499b4fca8178ae5978c301d146b0f716eb1c561363d7f6e327d7_kernel.cu",
+            "csrc/kda/tf32/cake_kda_tf32_de45e5779221499b4fca8178ae5978c301d146b0f716eb1c561363d7f6e327d7_sm_103a_kernel.cu",
             "csrc/kda/tf32/cake_kda_tf32_de45e5779221499b4fca8178ae5978c301d146b0f716eb1c561363d7f6e327d7_binding.cu",
         ],
         "tma_workspace_bytes": 896,
@@ -6255,7 +6255,7 @@ MODULES = {
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
         "sources": [
-            "csrc/kda/tf32/cake_kda_tf32_49252b8acc3d5b1acefaed3f94b8367860dbaadd9fe3f9b99d32883f1e60a7d4_kernel.cu",
+            "csrc/kda/tf32/cake_kda_tf32_49252b8acc3d5b1acefaed3f94b8367860dbaadd9fe3f9b99d32883f1e60a7d4_sm_103a_kernel.cu",
             "csrc/kda/tf32/cake_kda_tf32_49252b8acc3d5b1acefaed3f94b8367860dbaadd9fe3f9b99d32883f1e60a7d4_binding.cu",
         ],
         "tma_workspace_bytes": 1024,
@@ -6303,7 +6303,7 @@ MODULES = {
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
         "sources": [
-            "csrc/kda/tf32/cake_kda_tf32_8c9b5bf0fe92d7019f7d08f543e32a256a7e03d683da4d7d3b5ab288ee71d730_kernel.cu",
+            "csrc/kda/tf32/cake_kda_tf32_8c9b5bf0fe92d7019f7d08f543e32a256a7e03d683da4d7d3b5ab288ee71d730_sm_103a_kernel.cu",
             "csrc/kda/tf32/cake_kda_tf32_8c9b5bf0fe92d7019f7d08f543e32a256a7e03d683da4d7d3b5ab288ee71d730_binding.cu",
         ],
         "tma_workspace_bytes": 896,
@@ -6429,7 +6429,7 @@ MODULES = {
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
         "sources": [
-            "csrc/kda/tf32/cake_kda_tf32_ed27d260f4765acbb3c477d97df9ea0e8f2813abc82edba26d7c65b5aabea2df_kernel.cu",
+            "csrc/kda/tf32/cake_kda_tf32_ed27d260f4765acbb3c477d97df9ea0e8f2813abc82edba26d7c65b5aabea2df_sm_103a_kernel.cu",
             "csrc/kda/tf32/cake_kda_tf32_ed27d260f4765acbb3c477d97df9ea0e8f2813abc82edba26d7c65b5aabea2df_binding.cu",
         ],
         "tma_workspace_bytes": 1024,
@@ -6573,7 +6573,7 @@ MODULES = {
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
         "sources": [
-            "csrc/kda/tf32/cake_kda_tf32_c32f7c95ae09b258fda8b0619acf43969b48c31be2f0bec1efec7ad7b2e54852_kernel.cu",
+            "csrc/kda/tf32/cake_kda_tf32_c32f7c95ae09b258fda8b0619acf43969b48c31be2f0bec1efec7ad7b2e54852_sm_103a_kernel.cu",
             "csrc/kda/tf32/cake_kda_tf32_c32f7c95ae09b258fda8b0619acf43969b48c31be2f0bec1efec7ad7b2e54852_binding.cu",
         ],
         "tma_workspace_bytes": 896,
@@ -6636,7 +6636,7 @@ MODULES = {
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
         "sources": [
-            "csrc/kda/tf32/cake_kda_tf32_13d49901e42bbadbd8e8a22bffe61095c491acbfc893466a0dd647543a607a80_kernel.cu",
+            "csrc/kda/tf32/cake_kda_tf32_13d49901e42bbadbd8e8a22bffe61095c491acbfc893466a0dd647543a607a80_sm_103a_kernel.cu",
             "csrc/kda/tf32/cake_kda_tf32_13d49901e42bbadbd8e8a22bffe61095c491acbfc893466a0dd647543a607a80_binding.cu",
         ],
         "tma_workspace_bytes": 1024,
@@ -6888,7 +6888,7 @@ MODULES = {
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
         "sources": [
-            "csrc/kda/tf32/cake_kda_tf32_4409b00951db691ca33b764132c53a194cabef81f6f94dde882398b1fdc2e1da_kernel.cu",
+            "csrc/kda/tf32/cake_kda_tf32_4409b00951db691ca33b764132c53a194cabef81f6f94dde882398b1fdc2e1da_sm_103a_kernel.cu",
             "csrc/kda/tf32/cake_kda_tf32_4409b00951db691ca33b764132c53a194cabef81f6f94dde882398b1fdc2e1da_binding.cu",
         ],
         "tma_workspace_bytes": 1024,
@@ -6951,7 +6951,7 @@ MODULES = {
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
         "sources": [
-            "csrc/kda/tf32/cake_kda_tf32_572fd9b9998720563112d5c68df0101895e01e09bbdb475d52448d0c27f5d7fd_kernel.cu",
+            "csrc/kda/tf32/cake_kda_tf32_572fd9b9998720563112d5c68df0101895e01e09bbdb475d52448d0c27f5d7fd_sm_103a_kernel.cu",
             "csrc/kda/tf32/cake_kda_tf32_572fd9b9998720563112d5c68df0101895e01e09bbdb475d52448d0c27f5d7fd_binding.cu",
         ],
         "tma_workspace_bytes": 1024,
@@ -6977,7 +6977,7 @@ MODULES = {
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
         "sources": [
-            "csrc/kda/tf32/cake_kda_tf32_4434066f7f1b6aae62ab53df58e3987bf70dc53d8c5a87d196461674cbcf4a9e_kernel.cu",
+            "csrc/kda/tf32/cake_kda_tf32_4434066f7f1b6aae62ab53df58e3987bf70dc53d8c5a87d196461674cbcf4a9e_sm_103a_kernel.cu",
             "csrc/kda/tf32/cake_kda_tf32_4434066f7f1b6aae62ab53df58e3987bf70dc53d8c5a87d196461674cbcf4a9e_binding.cu",
         ],
         "tma_workspace_bytes": 256,

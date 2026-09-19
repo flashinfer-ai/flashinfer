@@ -410,8 +410,7 @@ kernel_cake_kda_tf32_de45e5779221499b4fca8178ae5978c301d146b0f716eb1c561363d7f6e
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
-    asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
-    smem = make_warp_uniform(smem);
+    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
 
     const int mbar_base = smem;
     #define gate_raw_full_addr (mbar_base + 0)

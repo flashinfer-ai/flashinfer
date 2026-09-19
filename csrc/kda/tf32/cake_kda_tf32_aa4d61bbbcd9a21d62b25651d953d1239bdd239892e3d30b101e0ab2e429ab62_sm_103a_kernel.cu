@@ -1006,7 +1006,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(512) void
-kernel_cake_kda_tf32_c32f7c95ae09b258fda8b0619acf43969b48c31be2f0bec1efec7ad7b2e54852(float* __restrict__ ws_qd, CakeTensorMap const* ws_qd_tma, float* __restrict__ ws_kd, CakeTensorMap const* ws_kd_tma, float* __restrict__ ws_w, CakeTensorMap const* ws_w_tma, float* __restrict__ ws_qk, CakeTensorMap const* ws_qk_tma, float* __restrict__ ws_diag, CakeTensorMap const* ws_diag_tma, __nv_bfloat16* __restrict__ v, CakeTensorMap const* v_tma, long long* __restrict__ cu_seqlens, int* __restrict__ cu_chunks, int* __restrict__ seq_order, __nv_bfloat16* __restrict__ initial_state, __nv_bfloat16* __restrict__ out, CakeTensorMap const* out_tma, __nv_bfloat16* __restrict__ final_state, int num_heads, int use_initial_state, int store_final_state, float scale, unsigned long long state_indices_addr, long long state_slot_stride, int use_state_indices, float* __restrict__ initial_state_f32, float* __restrict__ final_state_f32, __nv_bfloat16* __restrict__ state_checkpoints, long long* __restrict__ checkpoint_cu_starts, int checkpoint_every_n_tokens)
+kernel_cake_kda_tf32_aa4d61bbbcd9a21d62b25651d953d1239bdd239892e3d30b101e0ab2e429ab62(float* __restrict__ ws_qd, CakeTensorMap const* ws_qd_tma, float* __restrict__ ws_kd, CakeTensorMap const* ws_kd_tma, float* __restrict__ ws_w, CakeTensorMap const* ws_w_tma, float* __restrict__ ws_qk, CakeTensorMap const* ws_qk_tma, float* __restrict__ ws_diag, CakeTensorMap const* ws_diag_tma, __nv_bfloat16* __restrict__ v, CakeTensorMap const* v_tma, long long* __restrict__ cu_seqlens, int* __restrict__ cu_chunks, int* __restrict__ seq_order, __nv_bfloat16* __restrict__ initial_state, __nv_bfloat16* __restrict__ out, CakeTensorMap const* out_tma, __nv_bfloat16* __restrict__ final_state, int num_heads, int use_initial_state, int store_final_state, float scale, unsigned long long state_indices_addr, long long state_slot_stride, int use_state_indices, float* __restrict__ initial_state_f32, float* __restrict__ final_state_f32, __nv_bfloat16* __restrict__ state_checkpoints, long long* __restrict__ checkpoint_cu_starts, int checkpoint_every_n_tokens)
 {
     const int tid = threadIdx.x;
     const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
@@ -1015,8 +1015,7 @@ kernel_cake_kda_tf32_c32f7c95ae09b258fda8b0619acf43969b48c31be2f0bec1efec7ad7b2e
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
-    asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
-    smem = make_warp_uniform(smem);
+    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
 
     const int mbar_base = smem;
     #define qk_full_addr (mbar_base + 0)
@@ -1374,6 +1373,30 @@ kernel_cake_kda_tf32_c32f7c95ae09b258fda8b0619acf43969b48c31be2f0bec1efec7ad7b2e
                     : "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[0])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[1])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[2])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[3])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[4])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[5])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[6])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[7])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[8])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[9])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[10])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[11])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[12])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[13])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[14])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[15])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[16])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[17])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[18])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[19])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[20])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[21])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[22])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[23])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[24])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[25])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[26])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[27])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[28])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[29])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[30])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[31]))
                     : "r"(taddr + (unsigned int)(compute_left_state * 128) + (unsigned int)tmem_row_base_1));
                 asm volatile("tcgen05.wait::ld.sync.aligned;");
+                {
+                    if (_chunk_idx * 16 % checkpoint_every_n_tokens == 0) {
+                        long long checkpoint_row = checkpoint_cu_starts[seq_idx_1] + (long long)(_chunk_idx * 16 / checkpoint_every_n_tokens);
+                        long long checkpoint_base = ((checkpoint_row * (long long)num_heads + (long long)head_idx_1) * 128 + (long long)state_band_row) * 128 + (long long)state_band_column;
+                        if (((unsigned long long)state_checkpoints & 15) == 0) {
+                            #pragma unroll
+                            for (int checkpoint_vector = 0; checkpoint_vector < 4; checkpoint_vector++) {
+                                {
+                                    __nv_bfloat162 _pk[4];
+                                    _pk[0] = __floats2bfloat162_rn(_tmem_load_0[checkpoint_vector * 8 + 0], _tmem_load_0[checkpoint_vector * 8 + 1]);
+                                    _pk[1] = __floats2bfloat162_rn(_tmem_load_0[checkpoint_vector * 8 + 2], _tmem_load_0[checkpoint_vector * 8 + 3]);
+                                    _pk[2] = __floats2bfloat162_rn(_tmem_load_0[checkpoint_vector * 8 + 4], _tmem_load_0[checkpoint_vector * 8 + 5]);
+                                    _pk[3] = __floats2bfloat162_rn(_tmem_load_0[checkpoint_vector * 8 + 6], _tmem_load_0[checkpoint_vector * 8 + 7]);
+                                    *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(state_checkpoints + (checkpoint_base + (long long)(checkpoint_vector * 8))))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+                                }
+                            }
+                        } else {
+                            #pragma unroll
+                            for (int checkpoint_word = 0; checkpoint_word < 32; checkpoint_word++) {
+                                state_checkpoints[checkpoint_base + (long long)checkpoint_word] = _tmem_load_0[checkpoint_word];
+                            }
+                        }
+                    }
+                }
                 mbarrier_wait(qk_full_addr + (compute_left_tma_stage) * 8, compute_left_tma_phase);
                 #pragma unroll
                 for (int state_pair = 0; state_pair < 16; state_pair++) {
@@ -1545,6 +1568,30 @@ kernel_cake_kda_tf32_c32f7c95ae09b258fda8b0619acf43969b48c31be2f0bec1efec7ad7b2e
                     : "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[0])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[1])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[2])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[3])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[4])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[5])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[6])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[7])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[8])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[9])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[10])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[11])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[12])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[13])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[14])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[15])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[16])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[17])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[18])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[19])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[20])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[21])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[22])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[23])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[24])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[25])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[26])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[27])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[28])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[29])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[30])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_2[31]))
                     : "r"(taddr + (unsigned int)(compute_state * 128) + (unsigned int)tmem_row_base_2 + 64));
                 asm volatile("tcgen05.wait::ld.sync.aligned;");
+                {
+                    if (chunk_idx_1 * 16 % checkpoint_every_n_tokens == 0) {
+                        long long checkpoint_row_1 = checkpoint_cu_starts[seq_idx_2] + (long long)(chunk_idx_1 * 16 / checkpoint_every_n_tokens);
+                        long long checkpoint_base_1 = ((checkpoint_row_1 * (long long)num_heads + (long long)head_idx_2) * 128 + (long long)state_band_row_1) * 128 + (long long)state_band_column_1;
+                        if (((unsigned long long)state_checkpoints & 15) == 0) {
+                            #pragma unroll
+                            for (int checkpoint_vector_1 = 0; checkpoint_vector_1 < 4; checkpoint_vector_1++) {
+                                {
+                                    __nv_bfloat162 _pk[4];
+                                    _pk[0] = __floats2bfloat162_rn(_tmem_load_2[checkpoint_vector_1 * 8 + 0], _tmem_load_2[checkpoint_vector_1 * 8 + 1]);
+                                    _pk[1] = __floats2bfloat162_rn(_tmem_load_2[checkpoint_vector_1 * 8 + 2], _tmem_load_2[checkpoint_vector_1 * 8 + 3]);
+                                    _pk[2] = __floats2bfloat162_rn(_tmem_load_2[checkpoint_vector_1 * 8 + 4], _tmem_load_2[checkpoint_vector_1 * 8 + 5]);
+                                    _pk[3] = __floats2bfloat162_rn(_tmem_load_2[checkpoint_vector_1 * 8 + 6], _tmem_load_2[checkpoint_vector_1 * 8 + 7]);
+                                    *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(state_checkpoints + (checkpoint_base_1 + (long long)(checkpoint_vector_1 * 8))))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+                                }
+                            }
+                        } else {
+                            #pragma unroll
+                            for (int checkpoint_word_1 = 0; checkpoint_word_1 < 32; checkpoint_word_1++) {
+                                state_checkpoints[checkpoint_base_1 + (long long)checkpoint_word_1] = _tmem_load_2[checkpoint_word_1];
+                            }
+                        }
+                    }
+                }
                 mbarrier_wait(qk_full_addr + (compute_tma_stage) * 8, compute_tma_phase);
                 #pragma unroll
                 for (int state_pair_1 = 0; state_pair_1 < 16; state_pair_1++) {

@@ -401,7 +401,7 @@ __device__ __forceinline__ void tma_store_5d(
 extern "C" {
 
 __global__ __launch_bounds__(128, 6) void
-kernel_cake_kda_tf32_de45e5779221499b4fca8178ae5978c301d146b0f716eb1c561363d7f6e327d7(__nv_bfloat16* __restrict__ q, CakeTensorMap const* q_tma, __nv_bfloat16* __restrict__ k, CakeTensorMap const* k_tma, __nv_bfloat16* __restrict__ raw_gate, CakeTensorMap const* raw_gate_tma, __nv_bfloat16* __restrict__ beta_logits, float* __restrict__ beta_active_f32, CakeTensorMap const* beta_logits_tma, float* __restrict__ a_log, float* __restrict__ dt_bias, long long* __restrict__ cu_seqlens, int* __restrict__ cu_chunks, int* __restrict__ chunk_to_seq, float* __restrict__ ws_qd, CakeTensorMap const* ws_qd_tma, float* __restrict__ ws_kd, CakeTensorMap const* ws_kd_tma, float* __restrict__ ws_w, CakeTensorMap const* ws_w_tma, float* __restrict__ ws_qk_t, float* __restrict__ ws_diag, int total_chunks, int num_heads, float gate_lower_bound, long long beta_token_stride)
+kernel_cake_kda_tf32_4c99177c07ace7591e287d6d59191c460b0038d21d7697a719b133f5316847ff(__nv_bfloat16* __restrict__ q, CakeTensorMap const* q_tma, __nv_bfloat16* __restrict__ k, CakeTensorMap const* k_tma, __nv_bfloat16* __restrict__ raw_gate, CakeTensorMap const* raw_gate_tma, __nv_bfloat16* __restrict__ beta_logits, float* __restrict__ beta_active_f32, CakeTensorMap const* beta_logits_tma, float* __restrict__ a_log, float* __restrict__ dt_bias, long long* __restrict__ cu_seqlens, int* __restrict__ cu_chunks, int* __restrict__ chunk_to_seq, float* __restrict__ ws_qd, CakeTensorMap const* ws_qd_tma, float* __restrict__ ws_kd, CakeTensorMap const* ws_kd_tma, float* __restrict__ ws_w, CakeTensorMap const* ws_w_tma, float* __restrict__ ws_qk_t, float* __restrict__ ws_diag, int total_chunks, int num_heads, float gate_lower_bound, long long beta_token_stride)
 {
     const int tid = threadIdx.x;
     const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
@@ -410,8 +410,7 @@ kernel_cake_kda_tf32_de45e5779221499b4fca8178ae5978c301d146b0f716eb1c561363d7f6e
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
-    asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
-    smem = make_warp_uniform(smem);
+    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
 
     const int mbar_base = smem;
     #define gate_raw_full_addr (mbar_base + 0)
@@ -539,9 +538,7 @@ kernel_cake_kda_tf32_de45e5779221499b4fca8178ae5978c301d146b0f716eb1c561363d7f6e
                 if (beta_token < eos) {
                     long long beta_index = beta_token * beta_token_stride + (long long)head_idx;
                     {
-                        float _tanh_approx_1;
-                        asm volatile("tanh.approx.f32 %0, %1;" : "=f"(_tanh_approx_1) : "f"((float)beta_logits[beta_index] * 0.5f));
-                        beta_value = _tanh_approx_1 * 0.5f + 0.5f;
+                        beta_value = beta_active_f32[beta_index];
                     }
                 }
             }

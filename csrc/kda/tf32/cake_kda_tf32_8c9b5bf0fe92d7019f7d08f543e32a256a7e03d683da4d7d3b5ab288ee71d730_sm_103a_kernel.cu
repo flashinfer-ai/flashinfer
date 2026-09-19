@@ -1006,7 +1006,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(512) void
-kernel_cake_kda_tf32_c32f7c95ae09b258fda8b0619acf43969b48c31be2f0bec1efec7ad7b2e54852(float* __restrict__ ws_qd, CakeTensorMap const* ws_qd_tma, float* __restrict__ ws_kd, CakeTensorMap const* ws_kd_tma, float* __restrict__ ws_w, CakeTensorMap const* ws_w_tma, float* __restrict__ ws_qk, CakeTensorMap const* ws_qk_tma, float* __restrict__ ws_diag, CakeTensorMap const* ws_diag_tma, __nv_bfloat16* __restrict__ v, CakeTensorMap const* v_tma, long long* __restrict__ cu_seqlens, int* __restrict__ cu_chunks, int* __restrict__ seq_order, __nv_bfloat16* __restrict__ initial_state, __nv_bfloat16* __restrict__ out, CakeTensorMap const* out_tma, __nv_bfloat16* __restrict__ final_state, int num_heads, int use_initial_state, int store_final_state, float scale, unsigned long long state_indices_addr, long long state_slot_stride, int use_state_indices, float* __restrict__ initial_state_f32, float* __restrict__ final_state_f32, __nv_bfloat16* __restrict__ state_checkpoints, long long* __restrict__ checkpoint_cu_starts, int checkpoint_every_n_tokens)
+kernel_cake_kda_tf32_8c9b5bf0fe92d7019f7d08f543e32a256a7e03d683da4d7d3b5ab288ee71d730(float* __restrict__ ws_qd, CakeTensorMap const* ws_qd_tma, float* __restrict__ ws_kd, CakeTensorMap const* ws_kd_tma, float* __restrict__ ws_w, CakeTensorMap const* ws_w_tma, float* __restrict__ ws_qk, CakeTensorMap const* ws_qk_tma, float* __restrict__ ws_diag, CakeTensorMap const* ws_diag_tma, __nv_bfloat16* __restrict__ v, CakeTensorMap const* v_tma, long long* __restrict__ cu_seqlens, int* __restrict__ cu_chunks, int* __restrict__ seq_order, __nv_bfloat16* __restrict__ initial_state, __nv_bfloat16* __restrict__ out, CakeTensorMap const* out_tma, __nv_bfloat16* __restrict__ final_state, int num_heads, int use_initial_state, int store_final_state, float scale, unsigned long long state_indices_addr, long long state_slot_stride, int use_state_indices, float* __restrict__ initial_state_f32, float* __restrict__ final_state_f32, __nv_bfloat16* __restrict__ state_checkpoints, long long* __restrict__ checkpoint_cu_starts, int checkpoint_every_n_tokens)
 {
     const int tid = threadIdx.x;
     const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
@@ -1015,8 +1015,7 @@ kernel_cake_kda_tf32_c32f7c95ae09b258fda8b0619acf43969b48c31be2f0bec1efec7ad7b2e
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
-    asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
-    smem = make_warp_uniform(smem);
+    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
 
     const int mbar_base = smem;
     #define qk_full_addr (mbar_base + 0)
@@ -1825,58 +1824,9 @@ kernel_cake_kda_tf32_c32f7c95ae09b258fda8b0619acf43969b48c31be2f0bec1efec7ad7b2e
                 mbarrier_wait(qk_full_addr + (mma_tma_stage) * 8, mma_tma_phase);
                 {
                     if (_chunk_idx_2 != 0) {
-                        mbarrier_wait(recurrence_left_done_addr + (mma_previous_stage) * 8, mma_previous_phase);
-                    }
-                    int _mma_b_lo_2 = make_warp_uniform((((smem_kd_left_addr) >> 4) & 0x3FFF) + (mma_stage) * 1792);
-                    asm volatile(
-                    "{\n\t"
-                    ".reg .pred leader, p0, p1;\n\t"
-                    ".reg .b32 dhi, blo, ta, id;\n\t"
-                    ".reg .b64 db;\n\t"
-                    "elect.sync _|leader, 0xFFFFFFFF;\n\t"
-                    "setp.ne.b32 p0, %3, 0;\n\t"
-                    "setp.ne.b32 p1, 1, 0;\n\t"
-                    ""
-                    "mov.b32 dhi, 0x40004040;\n\t"
-                    "mov.b32 id, 67373328;\n\t"
-                    "mov.b32 ta, %2;\n\t"
-                    "mov.b32 blo, %1;\n\t"
-                    "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::tf32 [%0], [ta], db, id, p0;\n\t"
-                    "add.u32 ta, ta, 8;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::tf32 [%0], [ta], db, id, p1;\n\t"
-                    "add.u32 ta, ta, 8;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::tf32 [%0], [ta], db, id, p1;\n\t"
-                    "add.u32 ta, ta, 8;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::tf32 [%0], [ta], db, id, p1;\n\t"
-                    "add.u32 ta, ta, 8;\n\t"
-                    "add.u32 blo, blo, 122;\n\t"
-                    "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::tf32 [%0], [ta], db, id, p1;\n\t"
-                    "add.u32 ta, ta, 8;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::tf32 [%0], [ta], db, id, p1;\n\t"
-                    "add.u32 ta, ta, 8;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::tf32 [%0], [ta], db, id, p1;\n\t"
-                    "add.u32 ta, ta, 8;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::tf32 [%0], [ta], db, id, p1;\n\t"
-                    "}\n"
-                    :: "r"(tmem_tmem_u_acc), "r"(_mma_b_lo_2), "r"(tmem_tmem_state + mma_current_state * 128), "r"(0));
-                    if (_chunk_idx_2 != 0) {
                         mbarrier_wait(recurrence_right_done_addr + (mma_previous_stage) * 8, mma_previous_phase);
                     }
-                    int _mma_b_lo_3 = make_warp_uniform((((smem_kd_right_addr) >> 4) & 0x3FFF) + (mma_stage) * 1792);
+                    int _mma_b_lo_4 = make_warp_uniform((((smem_kd_addr) >> 4) & 0x3FFF) + (mma_stage) * 1792);
                     asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -1920,8 +1870,40 @@ kernel_cake_kda_tf32_c32f7c95ae09b258fda8b0619acf43969b48c31be2f0bec1efec7ad7b2e
                     "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
                     "@leader tcgen05.mma.cta_group::1.kind::tf32 [%0], [ta], db, id, p1;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
+                    "add.u32 blo, blo, 122;\n\t"
+                    "mov.b64 db, {blo, dhi};\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::tf32 [%0], [ta], db, id, p1;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
+                    "mov.b64 db, {blo, dhi};\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::tf32 [%0], [ta], db, id, p1;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
+                    "mov.b64 db, {blo, dhi};\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::tf32 [%0], [ta], db, id, p1;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
+                    "mov.b64 db, {blo, dhi};\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::tf32 [%0], [ta], db, id, p1;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
+                    "add.u32 blo, blo, 122;\n\t"
+                    "mov.b64 db, {blo, dhi};\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::tf32 [%0], [ta], db, id, p1;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
+                    "mov.b64 db, {blo, dhi};\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::tf32 [%0], [ta], db, id, p1;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
+                    "mov.b64 db, {blo, dhi};\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::tf32 [%0], [ta], db, id, p1;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
+                    "mov.b64 db, {blo, dhi};\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::tf32 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
-                    :: "r"(tmem_tmem_u_acc), "r"(_mma_b_lo_3), "r"(tmem_tmem_state + (mma_current_state * 128 + 64)), "r"(1));
+                    :: "r"(tmem_tmem_u_acc), "r"(_mma_b_lo_4), "r"(tmem_tmem_state + mma_current_state * 128), "r"(0));
                 }
                 if (_chunk_idx_2 != 0) {
                     mma_previous_stage += 1;

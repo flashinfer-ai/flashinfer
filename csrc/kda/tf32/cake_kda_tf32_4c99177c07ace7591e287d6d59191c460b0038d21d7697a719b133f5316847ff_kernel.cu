@@ -150,9 +150,10 @@ __device__ __forceinline__ uint32_t mbarrier_try_wait_cluster(int mbar_addr, int
     return token;
 }
 
-// CTA-local pipelines have short, resident producer/consumer edges. Omitting
-// suspendTimeHint keeps misses on the lightweight TRYWAIT retry path; the loop
-// remains blocking until acquire succeeds.
+
+// CTA-local pipelines have short, resident producer/consumer edges.  Omitting
+// suspendTimeHint keeps a miss on the lightweight TRYWAIT retry path; the
+// explicit loop still makes this helper blocking until acquire succeeds.
 __device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
     asm volatile(
         "{\n\t"
@@ -163,6 +164,22 @@ __device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
         "@P1 bra.uni DONE;\n\t"
         "bra.uni LAB_WAIT;\n\t"
         "DONE:\n\t"
+        "}\n"
+        :: "r"(mbar_addr), "r"(phase) : "memory");
+}
+
+// Source-faithful relaxed CTA wait used only by a typed protocol that does
+// not attach the PTX acquire qualifier, such as FA4's interior P-ready edge.
+__device__ __forceinline__ void mbarrier_wait_relaxed(int mbar_addr, int phase) {
+    asm volatile(
+        "{\n\t"
+        ".reg .pred P1;\n\t"
+        "LAB_WAIT_RELAXED:\n\t"
+        "mbarrier.try_wait.parity.shared::cta.b64"
+        " P1, [%0], %1, 10000000;\n\t"
+        "@P1 bra.uni DONE_RELAXED;\n\t"
+        "bra.uni LAB_WAIT_RELAXED;\n\t"
+        "DONE_RELAXED:\n\t"
         "}\n"
         :: "r"(mbar_addr), "r"(phase) : "memory");
 }
@@ -393,7 +410,8 @@ kernel_cake_kda_tf32_4c99177c07ace7591e287d6d59191c460b0038d21d7697a719b133f5316
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
-    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+    asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
+    smem = make_warp_uniform(smem);
 
     const int mbar_base = smem;
     #define gate_raw_full_addr (mbar_base + 0)
@@ -450,9 +468,9 @@ kernel_cake_kda_tf32_4c99177c07ace7591e287d6d59191c460b0038d21d7697a719b133f5316
         // --- pipeline 'raw_pipe' ---
         // gate_raw_full: 2 barriers, init_count=1
         // qk_raw_full: 2 barriers, init_count=1
-        // Warp-cooperative initialization, grouped by equal arrival count.
-        for (int _bar = lane; _bar < 4; _bar += 32) {
-            mbarrier_init(smem + 0 + _bar * 8, 1);
+        // Warp-cooperative initialization in physical record order.
+        if (lane < 4) {
+            mbarrier_init(smem + 0 + lane * 8, 1);
         }
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
@@ -967,11 +985,14 @@ kernel_cake_kda_tf32_4c99177c07ace7591e287d6d59191c460b0038d21d7697a719b133f5316
             }
             #pragma unroll
             for (int inner = 1; inner < 7; inner++) {
-                float _shfl_0 = __shfl_sync(0xFFFFFFFF, (l_values + 0)[inner % 2], lane / 4 * 4 + (unsigned int)(inner / 2));
+                float _shfl_0;
+                asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(_shfl_0) : "f"((l_values + 0)[inner % 2]), "r"(lane / 4 * 4 + (unsigned int)(inner / 2)));
                 float coeff = _shfl_0;
-                float _shfl_1 = __shfl_sync(0xFFFFFFFF, inverse_low[0], (unsigned int)(inner * 4) + lane % 4);
+                float _shfl_1;
+                asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(_shfl_1) : "f"(inverse_low[0]), "r"((unsigned int)(inner * 4) + lane % 4));
                 float prior0 = _shfl_1;
-                float _shfl_2 = __shfl_sync(0xFFFFFFFF, inverse_low[1], (unsigned int)(inner * 4) + lane % 4);
+                float _shfl_2;
+                asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(_shfl_2) : "f"(inverse_low[1]), "r"((unsigned int)(inner * 4) + lane % 4));
                 float prior1 = _shfl_2;
                 if (lane / 4 > (unsigned int)inner) {
                     float _fma_2 = __fmaf_rn(-coeff, prior0, inverse_low[0]);
@@ -992,11 +1013,14 @@ kernel_cake_kda_tf32_4c99177c07ace7591e287d6d59191c460b0038d21d7697a719b133f5316
             }
             #pragma unroll
             for (int inner_1 = 1; inner_1 < 7; inner_1++) {
-                float _shfl_3 = __shfl_sync(0xFFFFFFFF, (l_values + 6)[inner_1 % 2], lane / 4 * 4 + (unsigned int)(inner_1 / 2));
+                float _shfl_3;
+                asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(_shfl_3) : "f"((l_values + 6)[inner_1 % 2]), "r"(lane / 4 * 4 + (unsigned int)(inner_1 / 2)));
                 float coeff_1 = _shfl_3;
-                float _shfl_4 = __shfl_sync(0xFFFFFFFF, inverse_high[0], (unsigned int)(inner_1 * 4) + lane % 4);
+                float _shfl_4;
+                asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(_shfl_4) : "f"(inverse_high[0]), "r"((unsigned int)(inner_1 * 4) + lane % 4));
                 float prior0_1 = _shfl_4;
-                float _shfl_5 = __shfl_sync(0xFFFFFFFF, inverse_high[1], (unsigned int)(inner_1 * 4) + lane % 4);
+                float _shfl_5;
+                asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(_shfl_5) : "f"(inverse_high[1]), "r"((unsigned int)(inner_1 * 4) + lane % 4));
                 float prior1_1 = _shfl_5;
                 if (lane / 4 > (unsigned int)inner_1) {
                     float _fma_4 = __fmaf_rn(-coeff_1, prior0_1, inverse_high[0]);
@@ -1026,9 +1050,11 @@ kernel_cake_kda_tf32_4c99177c07ace7591e287d6d59191c460b0038d21d7697a719b133f5316
             for (int word_4 = 0; word_4 < 2; word_4++) {
                 int col_0 = lane % 4 + (unsigned int)(word_4 * 4);
                 int a_lane = lane / 4 * 4 + (unsigned int)(col_0 / 2);
-                float _shfl_6 = __shfl_sync(0xFFFFFFFF, reinterpret_cast<float*>(inv8_lhs_words)[0], a_lane);
+                float _shfl_6;
+                asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(_shfl_6) : "f"(reinterpret_cast<float*>(inv8_lhs_words)[0]), "r"(a_lane));
                 float a_low = _shfl_6;
-                float _shfl_7 = __shfl_sync(0xFFFFFFFF, reinterpret_cast<float*>(inv8_lhs_words)[1], a_lane);
+                float _shfl_7;
+                asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(_shfl_7) : "f"(reinterpret_cast<float*>(inv8_lhs_words)[1]), "r"(a_lane));
                 float a_high = _shfl_7;
                 float a_value = a_low;
                 if ((lane & 1) != 0) {
@@ -1037,9 +1063,11 @@ kernel_cake_kda_tf32_4c99177c07ace7591e287d6d59191c460b0038d21d7697a719b133f5316
                 inv8_a[word_4 * 2] = a_value;
                 inv8_a[word_4 * 2 + 1] = a_value;
                 int b_lane = (unsigned int)(col_0 * 4) + lane / 4 / 2;
-                float _shfl_8 = __shfl_sync(0xFFFFFFFF, reinterpret_cast<float*>(inv8_rhs_words)[0], b_lane);
+                float _shfl_8;
+                asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(_shfl_8) : "f"(reinterpret_cast<float*>(inv8_rhs_words)[0]), "r"(b_lane));
                 float b_low = _shfl_8;
-                float _shfl_9 = __shfl_sync(0xFFFFFFFF, reinterpret_cast<float*>(inv8_rhs_words)[1], b_lane);
+                float _shfl_9;
+                asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(_shfl_9) : "f"(reinterpret_cast<float*>(inv8_rhs_words)[1]), "r"(b_lane));
                 float b_high = _shfl_9;
                 inv8_b[word_4] = b_low;
                 if ((lane / 4 & 1) != 0) {
@@ -1078,9 +1106,11 @@ kernel_cake_kda_tf32_4c99177c07ace7591e287d6d59191c460b0038d21d7697a719b133f5316
             for (int word_5 = 0; word_5 < 2; word_5++) {
                 int col_0_1 = lane % 4 + (unsigned int)(word_5 * 4);
                 int a_lane_1 = lane / 4 * 4 + (unsigned int)(col_0_1 / 2);
-                float _shfl_10 = __shfl_sync(0xFFFFFFFF, reinterpret_cast<float*>(inv8_lhs_words_0)[0], a_lane_1);
+                float _shfl_10;
+                asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(_shfl_10) : "f"(reinterpret_cast<float*>(inv8_lhs_words_0)[0]), "r"(a_lane_1));
                 float a_low_1 = _shfl_10;
-                float _shfl_11 = __shfl_sync(0xFFFFFFFF, reinterpret_cast<float*>(inv8_lhs_words_0)[1], a_lane_1);
+                float _shfl_11;
+                asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(_shfl_11) : "f"(reinterpret_cast<float*>(inv8_lhs_words_0)[1]), "r"(a_lane_1));
                 float a_high_1 = _shfl_11;
                 float a_value_1 = a_low_1;
                 if ((lane & 1) != 0) {
@@ -1089,9 +1119,11 @@ kernel_cake_kda_tf32_4c99177c07ace7591e287d6d59191c460b0038d21d7697a719b133f5316
                 inv8_a_2[word_5 * 2] = a_value_1;
                 inv8_a_2[word_5 * 2 + 1] = a_value_1;
                 int b_lane_1 = (unsigned int)(col_0_1 * 4) + lane / 4 / 2;
-                float _shfl_12 = __shfl_sync(0xFFFFFFFF, reinterpret_cast<float*>(inv8_rhs_words_1)[0], b_lane_1);
+                float _shfl_12;
+                asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(_shfl_12) : "f"(reinterpret_cast<float*>(inv8_rhs_words_1)[0]), "r"(b_lane_1));
                 float b_low_1 = _shfl_12;
-                float _shfl_13 = __shfl_sync(0xFFFFFFFF, reinterpret_cast<float*>(inv8_rhs_words_1)[1], b_lane_1);
+                float _shfl_13;
+                asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(_shfl_13) : "f"(reinterpret_cast<float*>(inv8_rhs_words_1)[1]), "r"(b_lane_1));
                 float b_high_1 = _shfl_13;
                 inv8_b_3[word_5] = b_low_1;
                 if ((lane / 4 & 1) != 0) {

@@ -179,9 +179,10 @@ __device__ __forceinline__ uint32_t mbarrier_try_wait_cluster(int mbar_addr, int
     return token;
 }
 
-// CTA-local pipelines have short, resident producer/consumer edges. Omitting
-// suspendTimeHint keeps misses on the lightweight TRYWAIT retry path; the loop
-// remains blocking until acquire succeeds.
+
+// CTA-local pipelines have short, resident producer/consumer edges.  Omitting
+// suspendTimeHint keeps a miss on the lightweight TRYWAIT retry path; the
+// explicit loop still makes this helper blocking until acquire succeeds.
 __device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
     asm volatile(
         "{\n\t"
@@ -192,6 +193,22 @@ __device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
         "@P1 bra.uni DONE;\n\t"
         "bra.uni LAB_WAIT;\n\t"
         "DONE:\n\t"
+        "}\n"
+        :: "r"(mbar_addr), "r"(phase) : "memory");
+}
+
+// Source-faithful relaxed CTA wait used only by a typed protocol that does
+// not attach the PTX acquire qualifier, such as FA4's interior P-ready edge.
+__device__ __forceinline__ void mbarrier_wait_relaxed(int mbar_addr, int phase) {
+    asm volatile(
+        "{\n\t"
+        ".reg .pred P1;\n\t"
+        "LAB_WAIT_RELAXED:\n\t"
+        "mbarrier.try_wait.parity.shared::cta.b64"
+        " P1, [%0], %1, 10000000;\n\t"
+        "@P1 bra.uni DONE_RELAXED;\n\t"
+        "bra.uni LAB_WAIT_RELAXED;\n\t"
+        "DONE_RELAXED:\n\t"
         "}\n"
         :: "r"(mbar_addr), "r"(phase) : "memory");
 }
@@ -321,7 +338,8 @@ __device__ __forceinline__ void tcgen05_mma_tf32(
         "tcgen05.mma.cta_group::1.kind::tf32 [%0], %1, %2, %3, p;\n\t"
         "}\n"
         :: "r"(taddr), "l"(a_desc), "l"(b_desc),
-           "r"(i_desc), "r"(enable_input_d));
+           "r"(i_desc), "r"(enable_input_d)
+         : "memory");
 }
 
 
@@ -330,42 +348,16 @@ __device__ __forceinline__ uint64_t desc_encode(uint64_t x) {
 }
 
 
-__device__ __forceinline__ void mma_ss_step(
-    int a_lo, int b_lo, int taddr, uint32_t i_desc, int enable_d,
-    uint32_t a_dhi, uint32_t b_dhi) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred leader, p;\n\t"
-        ".reg .b32 adhi, bdhi;\n\t"
-        ".reg .b64 da, db;\n\t"
-        "elect.sync _|leader, 0xFFFFFFFF;\n\t"
-        "setp.ne.b32 p, %4, 0;\n\t"
-        "mov.b32 adhi, %5;\n\t"
-        "mov.b32 bdhi, %6;\n\t"
-        "mov.b64 da, {%0, adhi};\n\t"
-        "mov.b64 db, {%1, bdhi};\n\t"
-        "@leader tcgen05.mma.cta_group::1.kind::tf32 [%2], da, db, %3, p;\n\t"
-        "}\n"
-        :: "r"(a_lo), "r"(b_lo), "r"(taddr), "r"(i_desc), "r"(enable_d), "r"(a_dhi), "r"(b_dhi));
-}
+union MmaSmemDesc {
+    uint64_t u64;
+    uint32_t u32[2];
+};
 
-
-__device__ __forceinline__ void mma_ts_step(
-    int taddr_out, int taddr_a, int b_lo, uint32_t b_dhi,
-    uint32_t i_desc, int enable_d) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred leader, p;\n\t"
-        ".reg .b32 dhi;\n\t"
-        ".reg .b64 db;\n\t"
-        "elect.sync _|leader, 0xFFFFFFFF;\n\t"
-        "setp.ne.b32 p, %5, 0;\n\t"
-        "mov.b32 dhi, %3;\n\t"
-        "mov.b64 db, {%2, dhi};\n\t"
-        "@leader tcgen05.mma.cta_group::1.kind::tf32 [%0], [%1], db, %4, p;\n\t"
-        "}\n"
-        :: "r"(taddr_out), "r"(taddr_a), "r"(b_lo), "r"(b_dhi),
-           "r"(i_desc), "r"(enable_d));
+__device__ __forceinline__ void incr_smem_desc_lo(uint64_t& smem_desc, uint32_t offset) {
+    MmaSmemDesc tmp;
+    tmp.u64 = smem_desc;
+    tmp.u32[0] += offset;
+    smem_desc = tmp.u64;
 }
 
 
@@ -499,7 +491,7 @@ __device__ __forceinline__ void fma_f32x2_noftz_inplace(float2* a, float2 b, flo
 }
 
 __device__ __forceinline__ void mul_f32x2_inplace(float2* a, float2 b) {
-    asm("mul.rn.ftz.f32x2 %0, %0, %1;"
+    asm("mul.rn.f32x2 %0, %0, %1;"
         : "+l"(*(unsigned long long*)a) : "l"(*(unsigned long long*)&b));
 }
 
@@ -606,7 +598,7 @@ __device__ __forceinline__ float2 fma_sub_f32x2(float2 a, float2 b, float2 c) {
 
 __device__ __forceinline__ float2 mul_f32x2(float2 a, float2 b) {
     float2 r;
-    asm("mul.rn.ftz.f32x2 %0, %1, %2;"
+    asm("mul.rn.f32x2 %0, %1, %2;"
         : "=l"(*(unsigned long long*)&r)
         : "l"(*(unsigned long long*)&a), "l"(*(unsigned long long*)&b));
     return r;
@@ -1083,7 +1075,8 @@ kernel_cake_kda_tf32_83d5b769f4ecd1825483a3d09349e9e95d14d3fe125dfb25559cfc17dad
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
-    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+    asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
+    smem = make_warp_uniform(smem);
 
     const int mbar_base = smem;
     #define pair_done_addr (mbar_base + 0)
@@ -1097,7 +1090,6 @@ kernel_cake_kda_tf32_83d5b769f4ecd1825483a3d09349e9e95d14d3fe125dfb25559cfc17dad
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 224);
     if (warp == 3) {
         uint64_t __cake_tensormap_acquire_addr = (uint64_t)(q_tma);
         if (lane == 1) __cake_tensormap_acquire_addr = (uint64_t)(k_tma);
@@ -1174,15 +1166,12 @@ kernel_cake_kda_tf32_83d5b769f4ecd1825483a3d09349e9e95d14d3fe125dfb25559cfc17dad
         // --- pipeline 'raw_pipe' ---
         // gate_raw_full: 6 barriers, init_count=1
         // qk_raw_full: 6 barriers, init_count=1
-        // Warp-cooperative initialization, grouped by equal arrival count.
-        for (int _bar = lane; _bar < 10; _bar += 32) {
-            mbarrier_init(smem + 0 + _bar * 8, 1);
-        }
-        for (int _bar = lane; _bar < 6; _bar += 32) {
-            mbarrier_init(smem + 80 + _bar * 8, 128);
-        }
-        for (int _bar = lane; _bar < 12; _bar += 32) {
-            mbarrier_init(smem + 128 + _bar * 8, 1);
+        // Warp-cooperative initialization in physical record order.
+        uint32_t _mbarrier_init_count_0_0 = 1;
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_0) : "r"(lane), "n"(16), "r"((uint32_t)(128)));
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_0) : "r"(lane), "n"(10), "r"((uint32_t)(1)));
+        if (lane < 28) {
+            mbarrier_init(smem + 0 + lane * 8, _mbarrier_init_count_0_0);
         }
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
@@ -1190,14 +1179,16 @@ kernel_cake_kda_tf32_83d5b769f4ecd1825483a3d09349e9e95d14d3fe125dfb25559cfc17dad
     __syncwarp();
 
     // TMEM alloc (512 columns, 480 used)
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 224);
     if (warp == 0) {
         int _tmem_hold = smem + 224;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(512) : "memory");
+        __syncwarp();
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
     }
 
     __syncthreads();
-    asm volatile("tcgen05.fence::after_thread_sync;");
+    asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
     const int taddr = tmem_addr_storage[0];
 

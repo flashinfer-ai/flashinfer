@@ -391,8 +391,7 @@ kernel_cake_kda_tf32_4434066f7f1b6aae62ab53df58e3987bf70dc53d8c5a87d196461674cbc
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
-    asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
-    smem = make_warp_uniform(smem);
+    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
 
     const int mbar_base = smem;
     #define loaded_addr (mbar_base + 0)
