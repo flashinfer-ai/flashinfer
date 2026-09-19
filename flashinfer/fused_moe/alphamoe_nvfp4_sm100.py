@@ -670,6 +670,14 @@ def _alphamoe_nvfp4_routed_moe_impl(
     w1_scale_prepared: Optional[torch.Tensor] = None,
     w2_scale_prepared: Optional[torch.Tensor] = None,
 ) -> None:
+    if _alphamoe_try_complete_routed(
+        hidden_states, hidden_states_scale, gemm1_weights, gemm1_weights_scale,
+        gemm2_weights, gemm2_weights_scale, output1_scale_gate_scalar,
+        output1_scale_scalar, output2_scale_scalar, sorted_token_ids, expert_ids,
+        num_tokens_post_padded, topk_weights, out, topk_ids, cumsum_buffer,
+        top_k, block_m, routed_scaling_factor, w1_scale_prepared,
+    ):
+        return
     # The private buffer is seeded by the alignment kernel on this stream.
     # During graph capture it belongs to PyTorch's graph memory pool.
     accumulator = torch.empty_like(out, dtype=torch.float32)
@@ -767,20 +775,20 @@ def alphamoe_nvfp4_routed_moe(
     w1_scale_prepared: Optional[torch.Tensor] = None,
     w2_scale_prepared: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Run selected route alignment, seed conversion and additive NVFP4 compute.
+    """Run route alignment, complete expert computation and weighted accumulation.
 
-    This entry supports small routes and the selected batch compute shapes.
-    Framework callers use their existing alignment and aligned API otherwise.
-    It owns one private FP32 accumulator, initializes it from every caller BF16
-    output value in the alignment launch, feeds that same buffer to the
-    selected compute, and copies back once. It returns caller out.
-    The prepared M512 route also owns private compact-owner metadata;
-    its alignment launch produces it for the selected up stage.
-    The existing aligned API above retains its original seed conversion.
-    Optional w1_scale_prepared/w2_scale_prepared tensors are immutable
-    model-load panels from prepare_nvfp4_w1_scales/prepare_nvfp4_w2_scales.
-    Keep raw scale tensors and prepare panels before requests or capture.
-    Missing or incompatible panels retain the corresponding raw fallback.
+    Selected complete routes use private per-route accumulators and finalize
+    contributions in route order, preserving the caller's existing output.
+    The exact route controls seed initialization, FP32 or BF16 route storage,
+    optional compact-owner metadata and immutable prepared W1 scales. Buffer
+    initialization, expert computation and finalization all stay inside this
+    call and use the current stream, including during CUDA graph capture.
+
+    Inputs without a selected complete route retain the existing alignment,
+    accumulator and compute path. The aligned API is unchanged. Prepared scale
+    tensors remain optional immutable model-load inputs; this function performs
+    no weight preparation, host device-count read or automatic model fetching.
+    The caller-owned output is updated and returned.
     """
     _check_alphamoe_nvfp4_supported(
         hidden_states,
@@ -803,9 +811,12 @@ def alphamoe_nvfp4_routed_moe(
         w1_scale_prepared,
         w2_scale_prepared,
     )
-    if not is_alphamoe_nvfp4_routed_seed_supported(
+    if not (is_alphamoe_nvfp4_routed_seed_supported(
         hidden_states, gemm1_weights, topk_ids, out, top_k, block_m
-    ):
+    ) or _alphamoe_complete_route_id(
+        hidden_states, hidden_states_scale, gemm1_weights, gemm1_weights_scale,
+        gemm2_weights_scale, topk_ids, out, top_k, block_m, w1_scale_prepared,
+    )):
         raise ValueError("routed companion requires supported route metadata")
     _alphamoe_nvfp4_routed_moe_impl(
         hidden_states,
@@ -962,3 +973,99 @@ def _uses_compact_owner_routed(
         and tuple(w2_scale_prepared.shape) == (e * (k // 128) * (n // 256), 8, 128)
         and w2_scale_prepared.data_ptr() % 16 == 0
     )
+
+
+def _alphamoe_complete_route_id(
+    hidden_states, hidden_states_scale, gemm1_weights, gemm1_weights_scale,
+    gemm2_weights_scale, topk_ids, out, top_k, block_m, w1_scale_prepared,
+):
+    """Select complete routes from immutable host metadata and owned sidecars."""
+    m, packed_k = hidden_states.shape
+    e, n, _ = gemm1_weights.shape
+    k = packed_k * 2
+    if (n, k, e, top_k, block_m) != (1024, 6144, 256, 8, 8):
+        return 0
+    if m == 1 and is_alphamoe_nvfp4_small_alignment_seed_supported(
+        topk_ids, e + 1, block_m, out, True
+    ):
+        return 1
+    if w1_scale_prepared is None:
+        return 0
+    prepared = (
+        w1_scale_prepared.dtype == torch.uint8
+        and w1_scale_prepared.is_contiguous()
+        and w1_scale_prepared.device == gemm1_weights_scale.device
+        and tuple(gemm1_weights_scale.shape) == (e, n, k // 16)
+        and tuple(w1_scale_prepared.shape) == (e * (n // 128) * (k // 256), 16, 128)
+        and w1_scale_prepared.data_ptr() % 16 == 0
+        and all(scale.data_ptr() % 4 == 0 for scale in
+                (hidden_states_scale, gemm1_weights_scale, gemm2_weights_scale))
+    )
+    if not prepared or not is_alphamoe_nvfp4_alignment_seed_supported(
+        topk_ids, e + 1, block_m, out, True
+    ):
+        return 0
+    if m == 8:
+        return 2
+    if m == 128:
+        return 3
+    if m == 512:
+        return 4 if out.data_ptr() % 16 == 0 else 5
+    if m >= 128:
+        return 6
+    # Smaller remaining shapes retain the existing public fallback contract.
+    return 7 if m >= 8 else 0
+
+
+def _alphamoe_try_complete_routed(
+    hidden_states, hidden_states_scale, gemm1_weights, gemm1_weights_scale,
+    gemm2_weights, gemm2_weights_scale, output1_scale_gate_scalar,
+    output1_scale_scalar, output2_scale_scalar, sorted_token_ids, expert_ids,
+    num_tokens_post_padded, topk_weights, out, topk_ids, cumsum_buffer,
+    top_k, block_m, routed_scaling_factor, w1_scale_prepared,
+):
+    route_id = _alphamoe_complete_route_id(
+        hidden_states, hidden_states_scale, gemm1_weights, gemm1_weights_scale,
+        gemm2_weights_scale, topk_ids, out, top_k, block_m, w1_scale_prepared,
+    )
+    if route_id == 0:
+        return False
+    m, k = out.shape
+    e, n, _ = gemm1_weights.shape
+    capacity = expert_ids.numel()
+    blocks = n // 256
+    owner_plan = owner_count = initial_out = None
+    partial_workspace = act_workspace = sf_workspace = None
+    if route_id == 1:
+        initial_out = torch.empty_like(out, dtype=torch.float32)
+        route_accumulator = torch.empty((m * top_k, k), dtype=torch.float32, device=out.device)
+        route_experts = torch.empty((m * top_k,), dtype=torch.int32, device=out.device)
+        partial_workspace = torch.empty((capacity * blocks, 8192),
+                                        dtype=torch.float32, device=hidden_states.device)
+    else:
+        owner_capacity = (topk_ids.numel() + 31) // 32 + e
+        owner_plan = torch.empty((owner_capacity, 3), dtype=torch.int32, device=hidden_states.device)
+        owner_count = torch.empty((1,), dtype=torch.int32, device=hidden_states.device)
+        if route_id in (2, 6, 7):
+            initial_out = torch.empty_like(out, dtype=torch.float32)
+        act_workspace = torch.empty((capacity * blocks, 512), dtype=torch.uint8,
+                                    device=hidden_states.device)
+        sf_workspace = torch.empty((capacity * blocks, 1024), dtype=torch.uint8,
+                                   device=hidden_states.device)
+        route_dtype = torch.bfloat16 if route_id in (4, 5, 6) else torch.float32
+        allocate_routes = torch.zeros if route_id == 7 else torch.empty
+        route_accumulator = allocate_routes((m * top_k, k), dtype=route_dtype, device=out.device)
+        if route_id in (2, 3):
+            route_experts = torch.empty((m * top_k,), dtype=torch.int32, device=out.device)
+        else:
+            route_experts = torch.full((m * top_k,), -1, dtype=torch.int32, device=out.device)
+    get_alphamoe_nvfp4_sm100_module().nvfp4_complete_routed_moe_op(
+        hidden_states, hidden_states_scale, gemm1_weights, gemm1_weights_scale,
+        gemm2_weights, gemm2_weights_scale, output1_scale_gate_scalar,
+        output1_scale_scalar, output2_scale_scalar, sorted_token_ids, expert_ids,
+        num_tokens_post_padded, topk_weights, out, topk_ids, cumsum_buffer,
+        route_accumulator, route_experts, owner_plan, owner_count, initial_out,
+        partial_workspace, act_workspace, sf_workspace, top_k, block_m,
+        routed_scaling_factor, w1_scale_prepared, route_id,
+    )
+    return True
