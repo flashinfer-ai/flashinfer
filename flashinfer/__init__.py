@@ -418,11 +418,6 @@ from .kda_prefill import prepare_bf16_kda_prefill as prepare_bf16_kda_prefill
 from .topk import (
     PreparedTopKRaggedTransform as PreparedTopKRaggedTransform,
 )
-from .sparse_pre_indexer import qsa_pre_indexer as qsa_pre_indexer
-from .sparse_route import expand_block_route as expand_block_route
-from .sparse_route import qsa_route_from_blocks as qsa_route_from_blocks
-from .sparse_route import qsa_route_from_logical as qsa_route_from_logical
-from .sparse_scores import sparse_paged_scores as sparse_paged_scores
 from .qsa_output_gate import qsa_output_gate as qsa_output_gate
 from .qsa import QSA as QSA
 from .qsa import QSAConfig as QSAConfig

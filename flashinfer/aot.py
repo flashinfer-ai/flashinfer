@@ -34,9 +34,6 @@ from .compilation_context import CompilationContext
 from .jit import JitSpec, build_jit_specs
 from .jit import env as jit_env
 from .jit.activation import act_func_def_str, gen_act_and_mul_module
-from .jit.qsa_output_gate import gen_qsa_output_gate_module
-from .jit.sparse_route import gen_sparse_route_module
-from .jit.sparse_scores import gen_sparse_scores_module
 from .jit.attention import (
     gen_batch_attention_module,
     gen_batch_decode_module,
@@ -181,6 +178,7 @@ from .jit.topk import gen_topk_module
 from .jit.sparse_route import gen_sparse_route_module
 from .jit.xqa import gen_xqa_module, gen_xqa_module_mla
 from .jit.sparse_pre_indexer import gen_sparse_pre_indexer_module
+from .jit.qsa_output_gate import gen_qsa_output_gate_module
 
 
 def gen_fa2(
