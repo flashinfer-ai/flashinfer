@@ -480,8 +480,13 @@ def try_cake_selective_state_update(
         or state_scale is not None
         or intermediate_state_scales is not None
         or rand_seed is not None
-        or cu_seqlens is not None
-        or num_accepted_tokens is not None
+        # The raw SGLang MTP cache kernel owns a fixed six-token window and
+        # writes all intermediate states for the scheduler to select. It does
+        # not need to read num_accepted_tokens on the host; allowing these
+        # metadata tensors here keeps MTP out of the Python reference fallback
+        # during graph capture. Other layouts still reject varlen metadata.
+        or (cu_seqlens is not None and not raw_sglang_layout)
+        or (num_accepted_tokens is not None and not raw_sglang_layout)
         or state.ndim != 4
         or state.dtype not in (torch.bfloat16, torch.float32)
         or x.dtype != torch.bfloat16
