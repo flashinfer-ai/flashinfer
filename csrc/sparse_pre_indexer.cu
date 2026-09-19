@@ -41,9 +41,9 @@ struct type_tag {
 // The narrowing arm and the bit that advertises it are the same decision, so they come
 // from one guard: a build without e4m3 has neither.
 #ifdef FLASHINFER_ENABLE_FP8_E4M3
-#define QSA_PRE_INDEXER_NARROWING_ARM()                  \
-  if (q_out.dtype() == dl_float8_e4m3fn) {               \
-    return launch_with(type_tag<__nv_fp8_e4m3>{});       \
+#define QSA_PRE_INDEXER_NARROWING_ARM()            \
+  if (q_out.dtype() == dl_float8_e4m3fn) {         \
+    return launch_with(type_tag<__nv_fp8_e4m3>{}); \
   }
 #define QSA_PRE_INDEXER_NARROW_E4M3_BIT (int64_t{1} << 1)
 #else
@@ -196,65 +196,65 @@ void qsa_pre_indexer(TensorView q, TensorView k, TensorView positions, TensorVie
   const cudaStream_t stream = get_stream(q.device());
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(q.dtype(), c_type, [&] {
     auto launch_with = [&](auto out_tag) -> bool {
-    using OutDType = typename decltype(out_tag)::type;
-    QSAPreIndexerParams<c_type, OutDType> p{};
-    p.q = static_cast<const c_type*>(q.data_ptr());
-    p.q_stride_token = q.stride(0);
-    p.k = static_cast<const c_type*>(k.data_ptr());
-    p.k_stride_token = k.stride(0);
-    p.positions = static_cast<const int64_t*>(positions.data_ptr());
-    p.pos_stride_axis = pos_2d ? positions.stride(0) : 0;
-    p.pos_stride_token = pos_2d ? positions.stride(1) : positions.stride(0);
-    p.cos_sin = static_cast<const c_type*>(cos_sin_cache.data_ptr());
-    // Rows the table holds: the kernel keeps a coordinate inside them rather
-    // than reading off the end.
-    p.cos_sin_rows = cos_sin_cache.numel() / (head_dim / 2);
-    p.q_norm_weight = static_cast<const c_type*>(q_norm_weight.data_ptr());
-    p.k_norm_weight = static_cast<const c_type*>(k_norm_weight.data_ptr());
-    p.eps = static_cast<float>(eps);
-    p.q_out = static_cast<OutDType*>(q_out.data_ptr());
-    p.q_out_stride_token = q_out.stride(0);
-    p.q_out_stride_head = q_out.stride(1);
-    p.state_cache = static_cast<c_type*>(state_cache.data_ptr());
-    p.state_stride_block = state_cache.stride(0);
-    p.state_stride_token = state_cache.stride(1);
-    p.state_slots = static_cast<const int64_t*>(state_slots.data_ptr());
-    p.state_table = static_cast<const int32_t*>(state_block_table.data_ptr());
-    p.state_table_stride_req = state_block_table.stride(0);
-    p.query_start_loc = static_cast<const int32_t*>(query_start_loc.data_ptr());
-    p.logical_positions = static_cast<const int64_t*>(logical_positions.data_ptr());
-    p.compressed_slots = static_cast<const int64_t*>(compressed_slots.data_ptr());
-    p.work_metadata = static_cast<const int32_t*>(work_metadata.data_ptr());
-    p.compressed_cache = static_cast<OutDType*>(compressed_cache.data_ptr());
-    p.compressed_stride_block = compressed_cache.stride(0);
-    p.compressed_stride_token = compressed_cache.stride(1);
-    p.num_tokens = static_cast<int32_t>(num_tokens);
-    p.num_state_blocks = static_cast<int32_t>(state_cache.size(0));
-    p.num_compressed_blocks = static_cast<int32_t>(compressed_cache.size(0));
-    p.num_k_work = static_cast<int32_t>(work_metadata.size(0));
-    p.num_requests = static_cast<int32_t>(state_block_table.size(0));
-    p.num_q_heads = static_cast<int32_t>(num_q_heads);
-    p.compress_ratio = static_cast<int32_t>(compress_ratio);
-    p.state_size = static_cast<int32_t>(state_cache.size(1));
-    p.comp_page_size = static_cast<int32_t>(compressed_cache.size(1));
-    p.mrope_h = static_cast<int32_t>(mrope_h);
-    p.mrope_w = static_cast<int32_t>(mrope_w);
-    p.ratio_shift = shift_of(compress_ratio);
-    p.state_shift = shift_of(p.state_size);
-    p.comp_shift = shift_of(p.comp_page_size);
-    p.inv_ratio = 1.f / static_cast<float>(compress_ratio);
+      using OutDType = typename decltype(out_tag)::type;
+      QSAPreIndexerParams<c_type, OutDType> p{};
+      p.q = static_cast<const c_type*>(q.data_ptr());
+      p.q_stride_token = q.stride(0);
+      p.k = static_cast<const c_type*>(k.data_ptr());
+      p.k_stride_token = k.stride(0);
+      p.positions = static_cast<const int64_t*>(positions.data_ptr());
+      p.pos_stride_axis = pos_2d ? positions.stride(0) : 0;
+      p.pos_stride_token = pos_2d ? positions.stride(1) : positions.stride(0);
+      p.cos_sin = static_cast<const c_type*>(cos_sin_cache.data_ptr());
+      // Rows the table holds: the kernel keeps a coordinate inside them rather
+      // than reading off the end.
+      p.cos_sin_rows = cos_sin_cache.numel() / (head_dim / 2);
+      p.q_norm_weight = static_cast<const c_type*>(q_norm_weight.data_ptr());
+      p.k_norm_weight = static_cast<const c_type*>(k_norm_weight.data_ptr());
+      p.eps = static_cast<float>(eps);
+      p.q_out = static_cast<OutDType*>(q_out.data_ptr());
+      p.q_out_stride_token = q_out.stride(0);
+      p.q_out_stride_head = q_out.stride(1);
+      p.state_cache = static_cast<c_type*>(state_cache.data_ptr());
+      p.state_stride_block = state_cache.stride(0);
+      p.state_stride_token = state_cache.stride(1);
+      p.state_slots = static_cast<const int64_t*>(state_slots.data_ptr());
+      p.state_table = static_cast<const int32_t*>(state_block_table.data_ptr());
+      p.state_table_stride_req = state_block_table.stride(0);
+      p.query_start_loc = static_cast<const int32_t*>(query_start_loc.data_ptr());
+      p.logical_positions = static_cast<const int64_t*>(logical_positions.data_ptr());
+      p.compressed_slots = static_cast<const int64_t*>(compressed_slots.data_ptr());
+      p.work_metadata = static_cast<const int32_t*>(work_metadata.data_ptr());
+      p.compressed_cache = static_cast<OutDType*>(compressed_cache.data_ptr());
+      p.compressed_stride_block = compressed_cache.stride(0);
+      p.compressed_stride_token = compressed_cache.stride(1);
+      p.num_tokens = static_cast<int32_t>(num_tokens);
+      p.num_state_blocks = static_cast<int32_t>(state_cache.size(0));
+      p.num_compressed_blocks = static_cast<int32_t>(compressed_cache.size(0));
+      p.num_k_work = static_cast<int32_t>(work_metadata.size(0));
+      p.num_requests = static_cast<int32_t>(state_block_table.size(0));
+      p.num_q_heads = static_cast<int32_t>(num_q_heads);
+      p.compress_ratio = static_cast<int32_t>(compress_ratio);
+      p.state_size = static_cast<int32_t>(state_cache.size(1));
+      p.comp_page_size = static_cast<int32_t>(compressed_cache.size(1));
+      p.mrope_h = static_cast<int32_t>(mrope_h);
+      p.mrope_w = static_cast<int32_t>(mrope_w);
+      p.ratio_shift = shift_of(compress_ratio);
+      p.state_shift = shift_of(p.state_size);
+      p.comp_shift = shift_of(p.comp_page_size);
+      p.inv_ratio = 1.f / static_cast<float>(compress_ratio);
 
-    const cudaError_t status =
-        head_dim == 128
-            ? QSAPreIndexer<128, c_type, OutDType>(p, is_k_mrope, pos_2d, cache_has_rope_pos,
-                                                   stream)
-            : QSAPreIndexer<256, c_type, OutDType>(p, is_k_mrope, pos_2d, cache_has_rope_pos,
-                                                   stream);
-    TVM_FFI_ICHECK(status != cudaErrorInvalidValue)
-        << "qsa_pre_indexer: unsupported rotary configuration (three-axis positions need a "
-           "three-axis key)";
-    TVM_FFI_ICHECK(status == cudaSuccess) << "QSAPreIndexer failed: " << cudaGetErrorString(status);
-    return true;
+      const cudaError_t status = head_dim == 128
+                                     ? QSAPreIndexer<128, c_type, OutDType>(
+                                           p, is_k_mrope, pos_2d, cache_has_rope_pos, stream)
+                                     : QSAPreIndexer<256, c_type, OutDType>(
+                                           p, is_k_mrope, pos_2d, cache_has_rope_pos, stream);
+      TVM_FFI_ICHECK(status != cudaErrorInvalidValue)
+          << "qsa_pre_indexer: unsupported rotary configuration (three-axis positions need a "
+             "three-axis key)";
+      TVM_FFI_ICHECK(status == cudaSuccess)
+          << "QSAPreIndexer failed: " << cudaGetErrorString(status);
+      return true;
     };
 
     if (q_out.dtype() == q.dtype()) {
