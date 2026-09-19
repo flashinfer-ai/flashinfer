@@ -82,56 +82,61 @@ void sparse_paged_scores(TensorView q, TensorView k_cache, TensorView page_table
   TVM_FFI_ICHECK_EQ(sequence_lengths.size(0), page_table.size(0));
   TVM_FFI_ICHECK_EQ(logits.dtype(), dl_float32) << "logits must be float32";
   TVM_FFI_ICHECK_EQ(k_cache.dtype(), q.dtype()) << "cache and query dtype must match";
-  // Every index tensor is read through one pointer type.
+  // Every index into the cache is read through one pointer type, taken from
+  // the block table. Positions are not an index into anything -- a position is
+  // a number bounded by the context length -- and a caller that builds them
+  // beside a slot mapping keeps them in int64, so they carry their own type
+  // and the kernel narrows them.
   TVM_FFI_ICHECK_EQ(token_to_req.dtype(), page_table.dtype());
-  TVM_FFI_ICHECK_EQ(query_positions.dtype(), page_table.dtype());
   TVM_FFI_ICHECK_EQ(sequence_lengths.dtype(), page_table.dtype());
   TVM_FFI_ICHECK_EQ(visible_blocks.dtype(), page_table.dtype());
 
   ffi::CUDADeviceGuard device_guard(logits.device().device_id);
   const cudaStream_t stream = get_stream(logits.device());
   DISPATCH_DLPACK_IDTYPE_TO_CTYPE(page_table.dtype(), c_idtype, [&] {
-    return DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(q.dtype(), c_type, [&] {
-      cudaError_t status = cudaErrorInvalidValue;
-      auto launch = [&](auto head_dim_tag) {
-        constexpr uint32_t HEAD_DIM = decltype(head_dim_tag)::value;
-        status = SparsePagedScores<HEAD_DIM, c_type, c_idtype>(
-            static_cast<const c_type*>(q.data_ptr()),
-            static_cast<const c_type*>(k_cache.data_ptr()),
-            static_cast<const c_idtype*>(page_table.data_ptr()),
-            static_cast<const c_idtype*>(token_to_req.data_ptr()),
-            static_cast<const c_idtype*>(query_positions.data_ptr()),
-            static_cast<const c_idtype*>(sequence_lengths.data_ptr()),
-            static_cast<c_idtype*>(visible_blocks.data_ptr()),
-            static_cast<float*>(logits.data_ptr()), static_cast<uint32_t>(q.stride(0)),
-            static_cast<uint32_t>(q.stride(1)), static_cast<uint32_t>(k_cache.stride(0)),
-            static_cast<uint32_t>(k_cache.stride(1)), static_cast<uint32_t>(page_table.stride(0)),
-            static_cast<uint32_t>(logits.stride(0)), static_cast<uint32_t>(rows),
-            static_cast<uint32_t>(num_columns), static_cast<uint32_t>(k_cache.size(0)),
-            static_cast<uint32_t>(page_table.size(0)), static_cast<uint32_t>(page_table.size(1)),
-            static_cast<uint32_t>(num_heads), static_cast<uint32_t>(k_cache.size(1)),
-            static_cast<uint32_t>(compress_ratio), static_cast<float>(divisor), stream);
-      };
-      switch (head_dim) {
-        case 64:
-          launch(std::integral_constant<uint32_t, 64>{});
-          break;
-        case 128:
-          launch(std::integral_constant<uint32_t, 128>{});
-          break;
-        case 192:
-          launch(std::integral_constant<uint32_t, 192>{});
-          break;
-        case 256:
-          launch(std::integral_constant<uint32_t, 256>{});
-          break;
-        default:
-          TVM_FFI_ICHECK(false) << "unsupported head_dim " << head_dim
-                                << "; expected 64, 128, 192 or 256";
-      }
-      TVM_FFI_ICHECK(status == cudaSuccess)
-          << "SparsePagedScores failed: " << cudaGetErrorString(status);
-      return true;
+    return DISPATCH_DLPACK_IDTYPE_TO_CTYPE(query_positions.dtype(), c_postype, [&] {
+      return DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(q.dtype(), c_type, [&] {
+        cudaError_t status = cudaErrorInvalidValue;
+        auto launch = [&](auto head_dim_tag) {
+          constexpr uint32_t HEAD_DIM = decltype(head_dim_tag)::value;
+          status = SparsePagedScores<HEAD_DIM, c_type, c_idtype, c_postype>(
+              static_cast<const c_type*>(q.data_ptr()),
+              static_cast<const c_type*>(k_cache.data_ptr()),
+              static_cast<const c_idtype*>(page_table.data_ptr()),
+              static_cast<const c_idtype*>(token_to_req.data_ptr()),
+              static_cast<const c_postype*>(query_positions.data_ptr()),
+              static_cast<const c_idtype*>(sequence_lengths.data_ptr()),
+              static_cast<c_idtype*>(visible_blocks.data_ptr()),
+              static_cast<float*>(logits.data_ptr()), static_cast<uint32_t>(q.stride(0)),
+              static_cast<uint32_t>(q.stride(1)), static_cast<uint32_t>(k_cache.stride(0)),
+              static_cast<uint32_t>(k_cache.stride(1)), static_cast<uint32_t>(page_table.stride(0)),
+              static_cast<uint32_t>(logits.stride(0)), static_cast<uint32_t>(rows),
+              static_cast<uint32_t>(num_columns), static_cast<uint32_t>(k_cache.size(0)),
+              static_cast<uint32_t>(page_table.size(0)), static_cast<uint32_t>(page_table.size(1)),
+              static_cast<uint32_t>(num_heads), static_cast<uint32_t>(k_cache.size(1)),
+              static_cast<uint32_t>(compress_ratio), static_cast<float>(divisor), stream);
+        };
+        switch (head_dim) {
+          case 64:
+            launch(std::integral_constant<uint32_t, 64>{});
+            break;
+          case 128:
+            launch(std::integral_constant<uint32_t, 128>{});
+            break;
+          case 192:
+            launch(std::integral_constant<uint32_t, 192>{});
+            break;
+          case 256:
+            launch(std::integral_constant<uint32_t, 256>{});
+            break;
+          default:
+            TVM_FFI_ICHECK(false) << "unsupported head_dim " << head_dim
+                                  << "; expected 64, 128, 192 or 256";
+        }
+        TVM_FFI_ICHECK(status == cudaSuccess)
+            << "SparsePagedScores failed: " << cudaGetErrorString(status);
+        return true;
+      });
     });
   });
 }
