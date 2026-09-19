@@ -54,6 +54,7 @@ DCP_KWARGS = (
     "cp_world",
     "cp_rank",
     "causal_seqlens_kv_global",
+    "cp_interleave_granularity",
 )
 
 
@@ -89,10 +90,20 @@ def _validate_dcp_kwargs(kwargs: dict) -> bool:
     cp_world = kwargs.get("cp_world", 1)
     cp_rank = kwargs.get("cp_rank", 0)
     causal_seqlens_kv_global = kwargs.get("causal_seqlens_kv_global")
+    cp_interleave_granularity = kwargs.get("cp_interleave_granularity", 1)
     if not isinstance(cp_world, int) or isinstance(cp_world, bool) or cp_world <= 0:
         raise ValueError(f"cp_world must be a positive integer, got {cp_world!r}")
     if not isinstance(cp_rank, int) or isinstance(cp_rank, bool):
         raise TypeError(f"cp_rank must be an integer, got {type(cp_rank).__name__}")
+    if (
+        not isinstance(cp_interleave_granularity, int)
+        or isinstance(cp_interleave_granularity, bool)
+        or cp_interleave_granularity <= 0
+    ):
+        raise ValueError(
+            "cp_interleave_granularity must be a positive integer, got "
+            f"{cp_interleave_granularity!r}"
+        )
     if enable_dcp and not 0 <= cp_rank < cp_world:
         raise ValueError(
             f"cp_rank must satisfy 0 <= cp_rank < cp_world, got "
@@ -106,6 +117,10 @@ def _validate_dcp_kwargs(kwargs: dict) -> bool:
             nondefault.append(f"cp_rank={cp_rank!r}")
         if causal_seqlens_kv_global is not None:
             nondefault.append("causal_seqlens_kv_global")
+        if cp_interleave_granularity != 1:
+            nondefault.append(
+                f"cp_interleave_granularity={cp_interleave_granularity!r}"
+            )
         if nondefault:
             raise ValueError(
                 "DCP arguments require enable_dcp=True; got " + ", ".join(nondefault)
