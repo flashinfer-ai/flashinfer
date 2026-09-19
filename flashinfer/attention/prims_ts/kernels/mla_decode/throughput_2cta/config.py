@@ -118,6 +118,23 @@ def compute_workspace_size(
     )
 
 
+def compute_balanced_workspace_size(
+    *,
+    num_heads: int,
+    seq_len_q: int,
+    latent_dim: int,
+    partial_capacity: int,
+    partial_o_dtype,
+    lse_dtype,
+) -> int:
+    """Return compact partial scratch for a balanced descriptor plan."""
+
+    partial_rows = partial_capacity * num_heads * seq_len_q
+    return partial_rows * (
+        latent_dim * partial_o_dtype.width // 8 + lse_dtype.width // 8
+    )
+
+
 @dataclass
 class MlaDecodeConfig:
     """MLA decode kernel configuration.

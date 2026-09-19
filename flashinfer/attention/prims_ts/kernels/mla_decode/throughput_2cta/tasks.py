@@ -161,7 +161,7 @@ class MlaTask(Task):
         # Keep task bodies on that cached value so page-offset/TMA/MMA/softmax
         # paths do not each rebuild the same split-KV arithmetic.
         self.domain = work_tile.k_tile_count
-        self._run_task_body_impl(work_tile, context=context)
+        self._run_task_body_impl(work_tile)
 
     @cute.jit
     def _drain_mla_work_tile_tails(self) -> None:
@@ -201,16 +201,60 @@ class MlaTask(Task):
 
         params = self.work_queue.tile_sched_params
 
+        if cutlass.const_expr(self.work_queue.use_balanced_scheduler):
+            cluster_width = cutlass.Int32(params.cluster_shape_mnk[0])
+            partition_idx = cute.arch.block_idx()[0] // cluster_width
+            descriptor_idx = cutlass.Int32(
+                self.work_queue.balanced_partition_offsets[partition_idx]
+            )
+            descriptor_end = cutlass.Int32(
+                self.work_queue.balanced_partition_offsets[partition_idx + 1]
+            )
+            work_tile = self.work_queue._work_tile_from_balanced_descriptor(
+                descriptor_idx,
+                cutlass.Int32(0),
+                descriptor_idx < descriptor_end,
+            )
+            self.work_queue._set_consumer_var_from_ts("work_tile", work_tile)
+            self._run_pre_work_loop_entries(work_tile)
+            while descriptor_idx < descriptor_end:
+                seq_q_idx = cutlass.Int32(0)
+                while seq_q_idx < params.problem_shape_s:
+                    work_tile.update_from(
+                        self.work_queue._work_tile_from_balanced_descriptor(
+                            descriptor_idx,
+                            seq_q_idx,
+                            cutlass.Boolean(True),
+                        )
+                    )
+                    self.work_queue._set_consumer_var_from_ts("work_tile", work_tile)
+                    if work_tile.k_tile_count > cutlass.Int32(0):
+                        self._run_one_mla_work_tile(work_tile, context)
+                    seq_q_idx += cutlass.Int32(1)
+                descriptor_idx += cutlass.Int32(1)
+                self.dummy = True
+            work_tile.update_from(
+                self.work_queue._work_tile_from_balanced_descriptor(
+                    descriptor_idx,
+                    cutlass.Int32(0),
+                    cutlass.Boolean(False),
+                )
+            )
+            self.work_queue._set_consumer_var_from_ts("work_tile", work_tile)
+            self._run_post_work_loop_entries(work_tile)
+            self._drain_mla_work_tile_tails()
+            return
+
         if cutlass.const_expr(not params.is_persistent):
             work_tile = self.work_queue._work_tile_from_block_idx(cute.arch.block_idx())
             self.work_queue._set_consumer_var_from_ts("work_tile", work_tile)
-            self._run_pre_work_loop_entries(work_tile, context)
+            self._run_pre_work_loop_entries(work_tile)
             # Runtime K/Q metadata can make a statically launched split empty.
             # Keep the CTA on the ordinary initialized-pipeline path, but skip
             # its captured HEAD/LOOP/TAIL data work when the domain is zero.
             if work_tile.k_tile_count > cutlass.Int32(0):
                 self._run_one_mla_work_tile(work_tile, context)
-            self._run_post_work_loop_entries(work_tile, context)
+            self._run_post_work_loop_entries(work_tile)
             self._drain_mla_work_tile_tails()
             return
 
@@ -224,7 +268,7 @@ class MlaTask(Task):
         work_tile = self.work_queue._work_tile_from_linear_idx(current_work_linear_idx)
         self.work_queue._set_consumer_var_from_ts("work_tile", work_tile)
 
-        self._run_pre_work_loop_entries(work_tile, context)
+        self._run_pre_work_loop_entries(work_tile)
         while current_work_linear_idx < num_blocks:
             work_tile.update_from(
                 self.work_queue._work_tile_from_linear_idx(current_work_linear_idx)
@@ -247,7 +291,7 @@ class MlaTask(Task):
             self.work_queue._work_tile_from_linear_idx(current_work_linear_idx)
         )
         self.work_queue._set_consumer_var_from_ts("work_tile", work_tile)
-        self._run_post_work_loop_entries(work_tile, context)
+        self._run_post_work_loop_entries(work_tile)
         self._drain_mla_work_tile_tails()
 
 
@@ -281,7 +325,7 @@ class MlaInterleavedTask(MlaTask):
         ) // cutlass.Int32(2)
         self._fixed_loop_end = fixed_lane + lane_iterations * cutlass.Int32(2)
         self.domain = self._fixed_loop_end
-        self._run_task_body_impl(work_tile, context=context)
+        self._run_task_body_impl(work_tile)
         self._cumulative_k_parity = (
             self._cumulative_k_parity + self._actual_domain
         ) % cutlass.Int32(2)
@@ -311,7 +355,6 @@ class MlaInterleavedTask(MlaTask):
             label,
             schedule_stage,
             routing_slot,
-            context=context,
         )
         actual_loop_offset = self._mapped_domain_start + (
             cutlass.Int32(base_info.loop_offset) - cutlass.Int32(self.domain_start)
@@ -361,23 +404,32 @@ def create_load_tma_task(
 
     def load_tma_body(page_offset_window, smem_q, smem_kv, cached_page_state):
         """Load Q once and load K/V tiles with the K-before-V cadence."""
-        cached_k_pages, cached_v_pages, cached_next_v_pages, cached_window_page = (
-            cached_page_state
-        )
+        (
+            cached_k_pages,
+            cached_v_pages,
+            cached_next_v_pages,
+            cached_window_page,
+            prefetched_window_page,
+        ) = cached_page_state
 
         # HEAD: Q is independent of page IDs.  Enqueue it before the TMA warp
         # refreshes its first coalesced 32-entry page-table window.
         smem_q.acquire()
         smem_q.tma_load()
         smem_q.commit()
-        cached_k_pages, cached_v_pages, cached_next_v_pages, cached_window_page = (
-            page_offset_window.read_page_offset_window(
-                cached_k_pages=cached_k_pages,
-                cached_v_pages=cached_v_pages,
-                cached_next_v_pages=cached_next_v_pages,
-                cached_window_page=cached_window_page,
-                init_v_cache=True,
-            )
+        (
+            cached_k_pages,
+            cached_v_pages,
+            cached_next_v_pages,
+            cached_window_page,
+            prefetched_window_page,
+        ) = page_offset_window.read_page_offset_window(
+            cached_k_pages=cached_k_pages,
+            cached_v_pages=cached_v_pages,
+            cached_next_v_pages=cached_next_v_pages,
+            cached_window_page=cached_window_page,
+            prefetched_window_page=prefetched_window_page,
+            init_v_cache=True,
         )
         staged_kv_tma_load(
             smem_kv,
@@ -390,13 +442,18 @@ def create_load_tma_task(
 
         with domain_loop(loop_start, loop_end, loop_step):
             # LOOP: cache K[n]/V[n] offsets, load K[n], then deferred V[n-1].
-            cached_k_pages, cached_v_pages, cached_next_v_pages, cached_window_page = (
-                page_offset_window.read_page_offset_window(
-                    cached_k_pages=cached_k_pages,
-                    cached_v_pages=cached_v_pages,
-                    cached_next_v_pages=cached_next_v_pages,
-                    cached_window_page=cached_window_page,
-                )
+            (
+                cached_k_pages,
+                cached_v_pages,
+                cached_next_v_pages,
+                cached_window_page,
+                prefetched_window_page,
+            ) = page_offset_window.read_page_offset_window(
+                cached_k_pages=cached_k_pages,
+                cached_v_pages=cached_v_pages,
+                cached_next_v_pages=cached_next_v_pages,
+                cached_window_page=cached_window_page,
+                prefetched_window_page=prefetched_window_page,
             )
             # K sub-tiles then deferred V sub-tiles, each with its own local
             # sub-tile index; ``is_v`` tells the loader which path to take.

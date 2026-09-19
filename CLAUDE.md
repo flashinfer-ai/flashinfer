@@ -40,6 +40,8 @@ FlashInfer is a GPU kernel library for LLM serving that uses **JIT (Just-In-Time
 | Override MoE EP knob-cache path | `export FLASHINFER_MOE_EP_KNOB_CACHE=/path/to/knobs.json` |
 | Disable MoE EP fused staging kernel | `export FLASHINFER_MEGA_FUSED_STAGE=0` |
 | Enable distribution-aware MoE autotune and kernel dispatch (experimental; TRT-LLM MoE only) | `export FLASHINFER_DIST_AWARE_AUTOTUNE=1` |
+| Declare expected mean K/V length for PrimsTS MLA balanced auto-routing | `export FLASHINFER_MLA_EXPECTED_MEAN_SEQ_LEN=<tokens>` |
+| Declare expected maximum K/V length for PrimsTS MLA balanced auto-routing | `export FLASHINFER_MLA_EXPECTED_MAX_SEQ_LEN=<tokens>` |
 | Prims-TS debug checks / task-manager verify | `export FLASHINFER_PRIMS_TS_DEBUG_CHECKS=1` |
 | Override Prims-TS CuTe-DSL compile options | `export FLASHINFER_PRIMS_TS_COMPILE_OPTIONS="--opt-level 2"` |
 

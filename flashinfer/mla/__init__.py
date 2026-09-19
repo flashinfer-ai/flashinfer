@@ -19,6 +19,7 @@ _PRIMS_TS_LAZY_EXPORTS = frozenset(
     {
         "get_prims_ts_batch_mla_decode_workspace_size",
         "prims_ts_batch_mla_decode_with_kv_cache",
+        "should_use_prims_ts_balanced_mla",
     }
 )
 

@@ -16,10 +16,12 @@
 
 from __future__ import annotations
 
+import ast
 from dataclasses import FrozenInstanceError, dataclass, replace
 import inspect
 import math
-from types import SimpleNamespace
+import textwrap
+from types import MappingProxyType, SimpleNamespace
 from typing import Sequence
 
 import pytest
@@ -45,6 +47,10 @@ from flashinfer.attention.prims_ts import (
     BatchMLADecodePagedTSWrapper,
     batch_mla_decode_with_paged_kv_cache,
 )
+from flashinfer.attention.prims_ts.balanced_scheduler.cost_model import (
+    B200_BALANCED_COST_MODEL_ID,
+    require_balanced_cost_model_calibration,
+)
 from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_2cta.config import (
     make_mla_decode_config,
 )
@@ -54,7 +60,11 @@ from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_2cta.kernel imp
 from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_2cta.resources import (
     MlaWorkQueue,
 )
+from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_2cta.work_partition import (
+    equal_split_row_prefix_active_split_count,
+)
 from flashinfer.attention.prims_ts.kernels.mla_decode.kernel_policy import (
+    select_balanced_decode_mla_kernel_policy,
     select_mla_ts_kernel,
 )
 from flashinfer.attention.prims_ts.kernels.mla_decode.helpers.query import (
@@ -62,6 +72,9 @@ from flashinfer.attention.prims_ts.kernels.mla_decode.helpers.query import (
 )
 from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_latency_1cta.config import (
     make_throughput_latency_mla_config,
+)
+from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_latency_1cta.kernel import (
+    ThroughputLatencyMlaDecodeTs,
 )
 from flashinfer.mla import (
     get_prims_ts_batch_mla_decode_workspace_size,
@@ -74,6 +87,30 @@ _REQUIRES_PRIMTS_GPU = pytest.mark.skipif(
     not torch.cuda.is_available()
     or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
     reason="PrimTS MLA decode requires SM100 or SM103",
+)
+
+
+def _has_balanced_mla_calibration() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    device_index = torch.cuda.current_device()
+    properties = torch.cuda.get_device_properties(device_index)
+    try:
+        require_balanced_cost_model_calibration(
+            device_name=properties.name,
+            compute_capability=(properties.major, properties.minor),
+            multi_processor_count=properties.multi_processor_count,
+            device_index=device_index,
+        )
+    except NotImplementedError:
+        return False
+    return True
+
+
+_HAS_BALANCED_MLA_CALIBRATION = _has_balanced_mla_calibration()
+_REQUIRES_BALANCED_MLA_CALIBRATION = pytest.mark.skipif(
+    not _HAS_BALANCED_MLA_CALIBRATION,
+    reason="balanced MLA planning requires a calibration for the exact CUDA device",
 )
 
 
@@ -135,6 +172,47 @@ _INTERNAL_TUNING_TOKEN_SEQUENCES = (
 
 
 @pytest.mark.parametrize(
+    "num_heads,seq_len_q,expected",
+    (
+        (8, 1, "throughput_latency_1cta"),
+        (32, 1, "throughput_latency_1cta"),
+        (33, 1, "throughput_2cta"),
+        (64, 1, "throughput_2cta"),
+        (128, 1, "throughput_2cta"),
+        (32, 2, None),
+        (64, 2, None),
+    ),
+)
+def test_attention_ts_mla_balanced_decode_family_policy(num_heads, seq_len_q, expected):
+    """Keep balanced decode selection independent of ordinary split topology."""
+
+    assert select_balanced_decode_mla_kernel_policy(num_heads, seq_len_q) == expected
+
+
+def test_attention_ts_mla_balanced_decode_family_cost_model_boundary():
+    assert (
+        select_balanced_decode_mla_kernel_policy(64, 1, batch_size=8, dtype_name="bf16")
+        == "throughput_2cta"
+    )
+    assert (
+        select_balanced_decode_mla_kernel_policy(
+            64, 1, batch_size=16, dtype_name="bf16"
+        )
+        == "throughput_latency_1cta"
+    )
+    assert (
+        select_balanced_decode_mla_kernel_policy(64, 1, batch_size=4, dtype_name="fp8")
+        == "throughput_latency_1cta"
+    )
+    assert (
+        select_balanced_decode_mla_kernel_policy(
+            64, 1, batch_size=128, dtype_name="fp8"
+        )
+        == "throughput_latency_1cta"
+    )
+
+
+@pytest.mark.parametrize(
     "num_heads,seq_len_q,tile_size_q,expected",
     (
         (128, 3, 128, (384, 3, 128)),
@@ -165,6 +243,51 @@ def test_attention_ts_mla_flat_query_tile_layout_rejects_invalid_extent(
 ):
     with pytest.raises(ValueError):
         FlatQueryTileLayout.for_tile(num_heads, seq_len_q, tile_size_q)
+
+
+@pytest.mark.parametrize(
+    "row_tiles,expected_pieces",
+    (
+        (0, 0),
+        (1, 1),
+        (248, 62),
+        (249, 63),
+        (251, 63),
+        (252, 64),
+        (254, 64),
+        (255, 65),
+        (256, 65),
+        (257, 65),
+    ),
+)
+def test_attention_ts_mla_equal_split_causal_prefix_boundaries(
+    row_tiles: int,
+    expected_pieces: int,
+):
+    """Match 257/65 quotient-remainder descriptor boundaries exactly."""
+
+    assert (
+        equal_split_row_prefix_active_split_count(row_tiles, 257, 65) == expected_pieces
+    )
+
+
+@pytest.mark.parametrize(
+    "row_tiles,expected_pieces",
+    ((0, 0), (1, 1), (4, 1), (5, 2), (252, 63), (253, 64), (256, 64), (257, 65)),
+)
+def test_attention_ts_mla_equal_split_causal_prefix_uses_cta_work_units(
+    row_tiles: int,
+    expected_pieces: int,
+):
+    assert (
+        equal_split_row_prefix_active_split_count(
+            row_tiles,
+            257,
+            65,
+            tiles_per_work_unit=2,
+        )
+        == expected_pieces
+    )
 
 
 @dataclass(frozen=True)
@@ -342,6 +465,24 @@ def _gather_request_cache(case: _MLACase, batch_idx: int) -> torch.Tensor:
     page_ids = case.block_tables[batch_idx, :page_count].long()
     cache_pages = case.kv_cache[:, 0] if case.kv_cache.ndim == 4 else case.kv_cache
     return cache_pages[page_ids].reshape(-1, _QK_DIM)[:seq_len].float()
+
+
+def _fill_logical_cache_tokens(
+    case: _MLACase,
+    *,
+    token_begin: int,
+    token_end: int,
+    value: float,
+) -> None:
+    """Fill a request's latent values through its shuffled logical page map."""
+
+    if case.block_tables.shape[0] != 1:
+        raise ValueError("marker helper requires exactly one request")
+    stored_value = value / case.bmm2_scale
+    for token_idx in range(token_begin, token_end):
+        page_slot, page_offset = divmod(token_idx, case.page_size)
+        physical_page = int(case.block_tables[0, page_slot].item())
+        case.kv_cache[physical_page, 0, page_offset, :_LATENT_DIM] = stored_value
 
 
 def _visible_kv_len(
@@ -719,7 +860,12 @@ def _plan_case(
     *,
     qo_indptr: torch.Tensor | None = None,
     max_seq_len_q: int | None = None,
+    balanced: bool = False,
 ):
+    if balanced and not _HAS_BALANCED_MLA_CALIBRATION:
+        pytest.skip(
+            "balanced MLA planning requires a calibration for the exact CUDA device"
+        )
     wrapper = BatchMLADecodePagedTSWrapper()
     num_heads = int(
         case.query.shape[1] if qo_indptr is not None else case.query.shape[2]
@@ -731,7 +877,11 @@ def _plan_case(
     )
     if resolved_max_seq_len_q is None:
         raise ValueError("packed plan coverage requires max_seq_len_q")
-    wrapper.plan(
+    plan = wrapper.plan_balanced if balanced else wrapper.plan
+    plan_kwargs = {}
+    if balanced:
+        plan_kwargs["seq_lens"] = tuple(int(value) for value in case.seq_lens.cpu())
+    plan(
         case.query.device,
         int(case.block_tables.shape[0]),
         num_heads,
@@ -745,6 +895,7 @@ def _plan_case(
         kv_data_type=case.kv_cache.dtype,
         o_data_type=case.output_dtype,
         mask_type=case.mask_type,
+        **plan_kwargs,
     )
     return wrapper
 
@@ -761,6 +912,1013 @@ def _run_case(wrapper, case, *, qo_indptr=None, out=None, validate=True):
         out=out,
         validate=validate,
     )
+
+
+@pytest.mark.parametrize(
+    "batch_size,num_qo_heads,balanced_kernel,ordinary_kernel",
+    (
+        (64, 32, "throughput_latency_1cta", "throughput_2cta"),
+        (8, 64, "throughput_2cta", "throughput_latency_1cta"),
+    ),
+)
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_mla_balanced_decode_family_overrides_only_balanced_policy(
+    batch_size: int,
+    num_qo_heads: int,
+    balanced_kernel: str,
+    ordinary_kernel: str,
+):
+    """Apply the calibrated family crossover without changing ordinary MLA."""
+
+    common = (
+        torch.cuda.current_device(),
+        batch_size,
+        num_qo_heads,
+        _LATENT_DIM,
+        _ROPE_DIM,
+        _DEFAULT_PAGE_SIZE,
+        131072,
+        "bfloat16",
+        "bfloat16",
+        "bfloat16",
+        "causal",
+        1,
+    )
+    balanced = mla_decode_module._resolve_mla_decode_launch_spec(*common, True)
+    ordinary = mla_decode_module._resolve_mla_decode_launch_spec(*common, False)
+
+    assert dict(balanced.policy)["kernel"] == balanced_kernel
+    assert dict(ordinary.policy)["kernel"] == ordinary_kernel
+
+
+@pytest.mark.parametrize(
+    ("num_qo_heads", "qkv_dtype", "expected_kernel"),
+    (
+        pytest.param(16, torch.bfloat16, "throughput_latency_1cta", id="1cta-bf16"),
+        pytest.param(16, torch.float8_e4m3fn, "throughput_latency_1cta", id="1cta-fp8"),
+        pytest.param(64, torch.bfloat16, "throughput_2cta", id="h64-bf16-low-batch"),
+        pytest.param(
+            64,
+            torch.float8_e4m3fn,
+            "throughput_2cta",
+            id="h64-fp8-below-calibrated-range",
+        ),
+        pytest.param(128, torch.bfloat16, "throughput_2cta", id="2cta-bf16"),
+        pytest.param(128, torch.float8_e4m3fn, "throughput_2cta", id="2cta-fp8"),
+    ),
+)
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+@_REQUIRES_BALANCED_MLA_CALIBRATION
+def test_attention_ts_mla_balanced_kernel_dtype_product(
+    num_qo_heads: int,
+    expected_kernel: str,
+    qkv_dtype: torch.dtype,
+):
+    """Exercise balanced 1CTA/2CTA producers with BF16 and E4M3 inputs."""
+
+    case = _make_mla_case(
+        batch_size=2,
+        num_qo_heads=num_qo_heads,
+        max_seq_len=32768,
+        kv_seq_lens=(32768, 257),
+        qkv_dtype=qkv_dtype,
+        device="cuda",
+        seed=33100 + num_qo_heads + (1 if qkv_dtype == _FP8 else 0),
+    )
+    wrapper = _plan_case(case, balanced=True)
+    policy = _policy_dict(wrapper)
+    assert policy["kernel"] == expected_kernel
+    assert policy["balanced_scheduler"] is True
+    assert wrapper._plan_state is not None
+    assert wrapper._plan_state.balanced_plan is not None
+
+    output = _run_case(wrapper, case)
+    _assert_case_correct(output, case, policy)
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+@_REQUIRES_BALANCED_MLA_CALIBRATION
+def test_attention_ts_mla_balanced_b64_h32_uses_calibrated_1cta_family():
+    """Cover the bucket where ordinary direct-output selection chose 2CTA."""
+
+    batch_size = 64
+    case = _make_mla_case(
+        batch_size=batch_size,
+        num_qo_heads=32,
+        max_seq_len=32768,
+        kv_seq_lens=(32768,) + (257,) * (batch_size - 1),
+        qkv_dtype=torch.bfloat16,
+        device="cuda",
+        seed=33164,
+    )
+    wrapper = _plan_case(case, balanced=True)
+    policy = _policy_dict(wrapper)
+
+    assert policy["kernel"] == "throughput_latency_1cta"
+    output = _run_case(wrapper, case)
+    _assert_case_correct(output, case, policy)
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+@_REQUIRES_BALANCED_MLA_CALIBRATION
+def test_attention_ts_mla_balanced_b16_h64_uses_calibrated_1cta_family():
+    """Cover the BF16 side of the measured H64 batch crossover."""
+
+    batch_size = 16
+    case = _make_mla_case(
+        batch_size=batch_size,
+        num_qo_heads=64,
+        max_seq_len=32768,
+        kv_seq_lens=(32768,) + (257,) * (batch_size - 1),
+        qkv_dtype=torch.bfloat16,
+        device="cuda",
+        seed=33116,
+    )
+    wrapper = _plan_case(case, balanced=True)
+    policy = _policy_dict(wrapper)
+
+    assert policy["kernel"] == "throughput_latency_1cta"
+    output = _run_case(wrapper, case)
+    _assert_case_correct(output, case, policy)
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+@_REQUIRES_BALANCED_MLA_CALIBRATION
+def test_attention_ts_mla_balanced_b4_h64_fp8_uses_calibrated_1cta_family():
+    """Cover the first production-gated FP8 batch using the H64 1CTA family."""
+
+    batch_size = 4
+    case = _make_mla_case(
+        batch_size=batch_size,
+        num_qo_heads=64,
+        max_seq_len=32768,
+        kv_seq_lens=(32768,) + (257,) * (batch_size - 1),
+        qkv_dtype=torch.float8_e4m3fn,
+        device="cuda",
+        seed=33104,
+    )
+    wrapper = _plan_case(case, balanced=True)
+    policy = _policy_dict(wrapper)
+
+    assert policy["kernel"] == "throughput_latency_1cta"
+    output = _run_case(wrapper, case)
+    _assert_case_correct(output, case, policy)
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.parametrize(
+    ("num_qo_heads", "expected_tile_size_q"),
+    (
+        pytest.param(4, 8, id="m8"),
+        pytest.param(8, 16, id="m16"),
+        pytest.param(16, 32, id="m32"),
+    ),
+)
+@pytest.mark.parametrize(
+    "qkv_dtype",
+    (torch.bfloat16, torch.float8_e4m3fn),
+    ids=("bf16", "fp8"),
+)
+@pytest.mark.parametrize("packed", (False, True), ids=("fixed", "packed"))
+@_REQUIRES_BALANCED_MLA_CALIBRATION
+def test_attention_ts_mla_balanced_1cta_causal_mask_respects_descriptor_end(
+    num_qo_heads: int,
+    expected_tile_size_q: int,
+    qkv_dtype: torch.dtype,
+    packed: bool,
+):
+    """Do not expose a paired MMA tile beyond an odd balanced descriptor."""
+
+    case = _make_mla_case(
+        batch_size=1,
+        num_qo_heads=num_qo_heads,
+        seq_len_q=2,
+        max_seq_len=257,
+        kv_seq_lens=(257,),
+        qkv_dtype=qkv_dtype,
+        device="cuda",
+        seed=33400
+        + expected_tile_size_q
+        + (1 if qkv_dtype == _FP8 else 0)
+        + (2 if packed else 0),
+    )
+    case.query.zero_()
+    case.kv_cache.zero_()
+    # The final page in descriptor [0, 1) is deliberately nonzero. The
+    # swaps-MMA-AB producer pads that descriptor to a second 128-token tile;
+    # clamped page lookup must not make four copies of this page visible.
+    _fill_logical_cache_tokens(case, token_begin=96, token_end=128, value=1.0)
+
+    qo_indptr = None
+    if packed:
+        case, qo_indptr = _pack_mla_case(case, (2,))
+    wrapper = _plan_case(
+        case,
+        qo_indptr=qo_indptr,
+        max_seq_len_q=2 if packed else None,
+        balanced=True,
+    )
+    policy = _policy_dict(wrapper)
+    assert policy["kernel"] == "throughput_latency_1cta"
+    assert policy["balanced_scheduler"] is True
+    assert policy["tile_size_q"] == expected_tile_size_q
+    plan = wrapper._plan_state.balanced_plan
+    assert plan is not None
+    assert plan.num_insts_kv == int(policy["num_insts_kv"])
+    descriptors = plan.work_descriptors[: plan.last_descriptor_count].cpu()
+    assert torch.any(descriptors[:, 2] - descriptors[:, 1] == 1)
+
+    output_shape = (
+        (2, num_qo_heads, _LATENT_DIM) if packed else (1, 2, num_qo_heads, _LATENT_DIM)
+    )
+    graph_out = torch.empty(output_shape, dtype=torch.bfloat16, device="cuda")
+    _run_case(wrapper, case, qo_indptr=qo_indptr, out=graph_out)
+    _assert_case_correct(graph_out, case, policy, qo_indptr=qo_indptr)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = _run_case(
+            wrapper,
+            case,
+            qo_indptr=qo_indptr,
+            out=graph_out,
+            validate=False,
+        )
+    assert captured is graph_out
+
+    for runtime_seq_len in (129, 257):
+        case.seq_lens.fill_(runtime_seq_len)
+        wrapper.schedule(case.seq_lens)
+        graph_out.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        _assert_case_correct(graph_out, case, policy, qo_indptr=qo_indptr)
+
+    _CUDA_GRAPH_ANCHOR_OWNERS.append((graph, graph_out, wrapper, case, qo_indptr))
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+@_REQUIRES_BALANCED_MLA_CALIBRATION
+def test_attention_ts_mla_balanced_forced_m32_reducer_uses_logical_query_shape(
+    monkeypatch,
+):
+    """Keep both K129 pieces visible for logical H128/SQ1 on physical M32."""
+
+    from flashinfer.attention.prims_ts.kernels.mla_decode import kernel_policy
+    from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_latency_1cta import (
+        config as one_cta_config,
+    )
+
+    def force_one_cta_policy(*args, **kwargs):
+        del args, kwargs
+        return "throughput_latency_1cta", "forced-test"
+
+    def force_m32_launch_shape(*, num_heads_q, seq_len_q):
+        return one_cta_config.FlatQueryLaunchShape.for_tile(
+            num_heads_q,
+            seq_len_q,
+            32,
+        )
+
+    monkeypatch.setattr(
+        kernel_policy,
+        "resolve_mla_kernel_policy",
+        force_one_cta_policy,
+    )
+    monkeypatch.setattr(
+        one_cta_config,
+        "resolve_auto_flat_query_launch_shape",
+        force_m32_launch_shape,
+    )
+    mla_decode_module._resolve_mla_decode_launch_spec.cache_clear()
+    try:
+        case = _make_mla_case(
+            batch_size=1,
+            num_qo_heads=128,
+            seq_len_q=1,
+            max_seq_len=129,
+            kv_seq_lens=(129,),
+            qkv_dtype=torch.bfloat16,
+            device="cuda",
+            seed=33529,
+        )
+        wrapper = _plan_case(case, balanced=True)
+        assert wrapper._plan_state is not None
+        policy = dict(wrapper._plan_state.policy)
+        assert policy["kernel"] == "throughput_latency_1cta"
+        assert policy["source"] == "forced-test"
+        assert policy["tile_size_q"] == 32
+        assert int(policy["split_kv"]) > 1
+
+        output = _run_case(wrapper, case)
+
+        _assert_case_correct(output, case, policy)
+    finally:
+        # Do not retain the test-only forced policy after monkeypatch teardown.
+        mla_decode_module._resolve_mla_decode_launch_spec.cache_clear()
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+@_REQUIRES_BALANCED_MLA_CALIBRATION
+def test_attention_ts_mla_balanced_2cta_keeps_flat_query_tile_layout():
+    """Keep H96/SQ2 producer and reducer rows on the shared M128 layout."""
+
+    case = _make_mla_case(
+        batch_size=2,
+        num_qo_heads=96,
+        seq_len_q=2,
+        max_seq_len=32768,
+        kv_seq_lens=(32768, 257),
+        qkv_dtype=torch.bfloat16,
+        device="cuda",
+        seed=33196,
+    )
+    wrapper = _plan_case(case, balanced=True)
+    policy = _policy_dict(wrapper)
+    assert policy["kernel"] == "throughput_2cta"
+    assert policy["balanced_scheduler"] is True
+    assert int(policy["split_kv"]) > 1
+
+    output = _run_case(wrapper, case)
+    _assert_case_correct(output, case, policy)
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+@_REQUIRES_BALANCED_MLA_CALIBRATION
+def test_attention_ts_mla_balanced_2cta_keeps_flat_packed_query_tile_layout():
+    """Map uneven packed H96 queries through the same flat M128 producer tiles."""
+
+    q_lens = (2, 1, 0)
+    case = _make_mla_case(
+        batch_size=len(q_lens),
+        num_qo_heads=96,
+        seq_len_q=max(q_lens),
+        max_seq_len=32768,
+        kv_seq_lens=(32768, 2049, 257),
+        qkv_dtype=torch.bfloat16,
+        device="cuda",
+        seed=33296,
+    )
+    case, qo_indptr = _pack_mla_case(case, q_lens)
+    wrapper = _plan_case(
+        case,
+        qo_indptr=qo_indptr,
+        max_seq_len_q=max(q_lens),
+        balanced=True,
+    )
+    policy = _policy_dict(wrapper)
+    assert policy["kernel"] == "throughput_2cta"
+    assert policy["balanced_scheduler"] is True
+    assert int(policy["split_kv"]) > 1
+
+    output = _run_case(wrapper, case, qo_indptr=qo_indptr)
+    _assert_case_correct(output, case, policy, qo_indptr=qo_indptr)
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+@_REQUIRES_BALANCED_MLA_CALIBRATION
+def test_attention_ts_mla_balanced_causal_reducer_uses_equal_split_boundaries():
+    """Include the final equal-split piece intersecting a causal row prefix."""
+
+    case = _make_mla_case(
+        batch_size=1,
+        num_qo_heads=128,
+        seq_len_q=2,
+        max_seq_len=32769,
+        kv_seq_lens=(32769,),
+        qkv_dtype=torch.bfloat16,
+        device="cuda",
+        seed=33328,
+    )
+    wrapper = _plan_case(case, balanced=True)
+    policy = _policy_dict(wrapper)
+    assert policy["kernel"] == "throughput_2cta"
+    assert policy["balanced_scheduler"] is True
+    assert wrapper._plan_state is not None
+    plan = wrapper._plan_state.balanced_plan
+    assert plan is not None
+    # This regression targets the four-tile equal-split geometry, independent of
+    # whichever target the device's calibrated cost model currently selects.
+    plan.schedule_device(case.seq_lens, forced_target_piece_tiles=4)
+    assert plan.last_target_piece_tiles == 4
+    assert plan.last_combine_request_count == 1
+    combine = plan.combine_descriptors[0].cpu().tolist()
+    assert combine[:3] == [0, 65, 0]
+
+    graph_out = torch.empty(
+        (1, 2, 128, _LATENT_DIM),
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    eager = _run_case(wrapper, case, out=graph_out)
+    _assert_case_correct(eager, case, policy)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = _run_case(wrapper, case, out=graph_out, validate=False)
+    assert captured is graph_out
+
+    wrapper.schedule(case.seq_lens)
+    kernel_workspace = wrapper._plan_state.workspace_views.kernel_workspace
+    assert kernel_workspace is not None
+    kernel_workspace.fill_(-1)
+    graph_out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    _assert_case_correct(graph_out, case, policy)
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.parametrize(
+    "qkv_dtype",
+    (torch.bfloat16, torch.float8_e4m3fn),
+    ids=("bf16", "fp8"),
+)
+@_REQUIRES_BALANCED_MLA_CALIBRATION
+def test_attention_ts_mla_balanced_1cta_m64_uses_persistent_work_queue(
+    qkv_dtype: torch.dtype,
+):
+    """Exercise persistent keeps-MMA-AB and its per-work-tile scratch reset."""
+
+    case = _make_mla_case(
+        batch_size=1,
+        num_qo_heads=16,
+        seq_len_q=3,
+        max_seq_len=4097,
+        kv_seq_lens=(4097,),
+        qkv_dtype=qkv_dtype,
+        device="cuda",
+        seed=33164 + (1 if qkv_dtype == _FP8 else 0),
+    )
+    wrapper = _plan_case(case, balanced=True)
+    policy = _policy_dict(wrapper)
+    assert policy["kernel"] == "throughput_latency_1cta"
+    assert policy["balanced_scheduler"] is True
+    assert policy["tile_size_q"] == 64
+    assert policy["num_insts_kv"] == 1
+    assert policy["use_persistent_scheduler"] is True
+    assert policy["use_clc_dynamic_persistent_scheduler"] is False
+    assert int(policy["split_kv"]) > 1
+
+    output = _run_case(wrapper, case)
+    _assert_case_correct(output, case, policy)
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.parametrize(
+    ("num_qo_heads", "seq_len_q", "max_seq_len"),
+    (
+        pytest.param(6, 1, 32768, id="m8-padded-heads"),
+        pytest.param(16, 3, 4097, id="m64-padded-flat-q"),
+    ),
+)
+@_REQUIRES_BALANCED_MLA_CALIBRATION
+def test_attention_ts_mla_balanced_1cta_reducer_uses_logical_output_stride(
+    num_qo_heads: int,
+    seq_len_q: int,
+    max_seq_len: int,
+):
+    """Publish padded 1CTA replays within the logical public batch extent."""
+
+    case = _make_mla_case(
+        batch_size=2,
+        num_qo_heads=num_qo_heads,
+        seq_len_q=seq_len_q,
+        max_seq_len=max_seq_len,
+        kv_seq_lens=(max_seq_len, max_seq_len),
+        qkv_dtype=torch.bfloat16,
+        device="cuda",
+        seed=33106 + seq_len_q,
+    )
+    wrapper = _plan_case(case, balanced=True)
+    policy = _policy_dict(wrapper)
+    assert policy["kernel"] == "throughput_latency_1cta"
+    assert policy["balanced_scheduler"] is True
+    logical_rows = seq_len_q * num_qo_heads
+    tile_size_q = int(policy["tile_size_q"])
+    physical_rows = tile_size_q * math.ceil(logical_rows / tile_size_q)
+    assert physical_rows > logical_rows
+    assert int(policy["split_kv"]) > 1
+
+    output_elements = 2 * logical_rows * _LATENT_DIM
+    guard_elements = 128 * _LATENT_DIM
+    sentinel = 123.0
+    storage = torch.full(
+        (guard_elements + output_elements + guard_elements,),
+        sentinel,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    output = storage[guard_elements : guard_elements + output_elements].view(
+        2, seq_len_q, num_qo_heads, _LATENT_DIM
+    )
+
+    def assert_output_and_guards():
+        torch.testing.assert_close(
+            storage[:guard_elements],
+            torch.full_like(storage[:guard_elements], sentinel),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            storage[-guard_elements:],
+            torch.full_like(storage[-guard_elements:], sentinel),
+            rtol=0,
+            atol=0,
+        )
+        _assert_case_correct(output, case, policy)
+
+    _run_case(wrapper, case, out=output)
+    torch.cuda.synchronize()
+    assert_output_and_guards()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        wrapper.schedule(case.seq_lens, validate=False)
+        captured = _run_case(wrapper, case, out=output, validate=False)
+    assert captured is output
+
+    # The captured topology first runs split work, switches entirely to direct
+    # output, then returns to split reduction without changing public strides.
+    for runtime_seq_lens in (
+        (max_seq_len, max_seq_len),
+        (max(seq_len_q, 127), max(seq_len_q, 65)),
+        (max_seq_len, max_seq_len),
+    ):
+        case.seq_lens.copy_(
+            torch.tensor(runtime_seq_lens, dtype=torch.int32, device="cuda")
+        )
+        storage.fill_(sentinel)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert_output_and_guards()
+
+
+def test_attention_ts_mla_balanced_1cta_reducer_waits_for_pdl_producer():
+    """Read split partials only after accepting the producer's PDL signal."""
+
+    source = textwrap.dedent(
+        inspect.getsource(ThroughputLatencyMlaDecodeTs.balanced_gmem_reduction_kernel)
+    )
+    function = ast.parse(source).body[0]
+    calls = [node for node in ast.walk(function) if isinstance(node, ast.Call)]
+    waits = [
+        call
+        for call in calls
+        if isinstance(call.func, ast.Attribute)
+        and call.func.attr == "griddepcontrol"
+        and any(
+            keyword.arg == "kind"
+            and isinstance(keyword.value, ast.Attribute)
+            and keyword.value.attr == "WAIT"
+            for keyword in call.keywords
+        )
+    ]
+    reduction_calls = [
+        call
+        for call in calls
+        if isinstance(call.func, ast.Name)
+        and call.func.id == "run_balanced_reduction_kernel"
+    ]
+
+    assert len(waits) == 1
+    assert len(reduction_calls) == 1
+    assert waits[0].lineno < reduction_calls[0].lineno
+
+
+@pytest.mark.parametrize(
+    ("num_qo_heads", "expected_kernel", "qkv_dtype"),
+    (
+        pytest.param(
+            16,
+            "throughput_latency_1cta",
+            torch.float8_e4m3fn,
+            id="1cta-fp8",
+        ),
+        pytest.param(128, "throughput_2cta", torch.bfloat16, id="2cta-bf16"),
+    ),
+)
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+@_REQUIRES_BALANCED_MLA_CALIBRATION
+def test_attention_ts_mla_balanced_schedule_across_graph_replay(
+    num_qo_heads: int,
+    expected_kernel: str,
+    qkv_dtype: torch.dtype,
+):
+    """Refill descriptors; the 1CTA case covers swaps register-state reset."""
+
+    case = _make_mla_case(
+        batch_size=2,
+        num_qo_heads=num_qo_heads,
+        max_seq_len=32768,
+        kv_seq_lens=(32768, 257),
+        qkv_dtype=qkv_dtype,
+        device="cuda",
+        seed=33200 + num_qo_heads + (1 if qkv_dtype == _FP8 else 0),
+    )
+    wrapper = _plan_case(case, balanced=True)
+    policy = _policy_dict(wrapper)
+    assert policy["kernel"] == expected_kernel
+    if expected_kernel == "throughput_latency_1cta":
+        assert int(policy["tile_size_q"]) < 64
+        assert int(policy["num_insts_kv"]) == 2
+    assert wrapper._plan_state is not None
+    plan = wrapper._plan_state.balanced_plan
+    assert plan is not None
+    plan_addresses = (
+        plan.work_descriptors.data_ptr(),
+        plan.partition_offsets.data_ptr(),
+        plan.combine_descriptors.data_ptr(),
+        plan.num_combine_descriptors.data_ptr(),
+    )
+
+    graph_out = torch.empty(
+        (2, 1, num_qo_heads, _LATENT_DIM),
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    _run_case(wrapper, case, out=graph_out)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = _run_case(wrapper, case, out=graph_out, validate=False)
+    assert captured is graph_out
+
+    for runtime_seq_lens in ((127, 65), (16385, 129), (32768, 257)):
+        case.seq_lens.copy_(
+            torch.tensor(runtime_seq_lens, dtype=torch.int32, device="cuda")
+        )
+        wrapper.schedule(case.seq_lens)
+        kernel_workspace = wrapper._plan_state.workspace_views.kernel_workspace
+        if kernel_workspace is not None:
+            # Make an early reducer read deterministic and visibly invalid.
+            # Every active split producer must replace these bytes before the
+            # PDL-dependent reducer consumes its partials.
+            kernel_workspace.fill_(-1)
+        graph_out.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        replayed = graph_out.clone()
+
+        eager = _run_case(wrapper, case)
+        torch.testing.assert_close(replayed, eager, rtol=0, atol=0)
+        _assert_case_correct(replayed, case, policy)
+
+    assert plan_addresses == (
+        plan.work_descriptors.data_ptr(),
+        plan.partition_offsets.data_ptr(),
+        plan.combine_descriptors.data_ptr(),
+        plan.num_combine_descriptors.data_ptr(),
+    )
+
+
+@pytest.mark.parametrize(
+    ("num_qo_heads", "expected_kernel"),
+    (
+        pytest.param(16, "throughput_latency_1cta", id="1cta"),
+        pytest.param(128, "throughput_2cta", id="2cta"),
+    ),
+)
+@pytest.mark.parametrize("qkv_dtype", (torch.bfloat16, torch.float8_e4m3fn))
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+@_REQUIRES_BALANCED_MLA_CALIBRATION
+def test_attention_ts_mla_balanced_inactive_slots_across_graph_replay(
+    num_qo_heads: int,
+    expected_kernel: str,
+    qkv_dtype: torch.dtype,
+):
+    """A compact reducer grid-strides zero-KV slots across graph replays."""
+
+    batch_size = 160
+    storage_seq_lens = (4096,) + (257,) * (batch_size - 1)
+    initial_seq_lens = (0,) * batch_size
+    case = _make_mla_case(
+        batch_size=batch_size,
+        num_qo_heads=num_qo_heads,
+        max_seq_len=4096,
+        kv_seq_lens=storage_seq_lens,
+        qkv_dtype=qkv_dtype,
+        device="cuda",
+        seed=33600 + num_qo_heads + qkv_dtype.itemsize,
+    )
+    case.seq_lens.zero_()
+    wrapper = _plan_case(case, balanced=True)
+    policy = _policy_dict(wrapper)
+    assert policy["kernel"] == expected_kernel
+    assert policy["balanced_reducer_capacity"] < batch_size
+    assert wrapper._plan_state is not None
+    plan = wrapper._plan_state.balanced_plan
+    assert plan is not None
+
+    graph_out = torch.empty(
+        (*case.query.shape[:-1], _LATENT_DIM),
+        dtype=case.output_dtype,
+        device=case.query.device,
+    )
+    _run_case(wrapper, case, out=graph_out)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _run_case(wrapper, case, out=graph_out, validate=False)
+
+    for runtime_seq_lens in (
+        storage_seq_lens,
+        (0,) + storage_seq_lens[1:],
+        initial_seq_lens,
+        (4096,) + (0,) * (batch_size - 1),
+        storage_seq_lens,
+    ):
+        case.seq_lens.copy_(
+            torch.tensor(runtime_seq_lens, dtype=torch.int32, device="cuda")
+        )
+        wrapper.schedule(case.seq_lens)
+        graph_out.fill_(float("nan"))
+        wrapper._plan_state.workspace_views.lse.fill_(float("nan"))
+        kernel_workspace = wrapper._plan_state.workspace_views.kernel_workspace
+        if kernel_workspace is not None:
+            kernel_workspace.fill_(-1)
+        graph.replay()
+        torch.cuda.synchronize()
+
+        inactive = tuple(
+            request_idx
+            for request_idx, seq_len in enumerate(runtime_seq_lens)
+            if seq_len == 0
+        )
+        active = tuple(
+            request_idx
+            for request_idx, seq_len in enumerate(runtime_seq_lens)
+            if seq_len > 0
+        )
+        descriptor_requests = set(
+            plan.work_descriptors[: plan.last_descriptor_count, 0].cpu().tolist()
+        )
+        combine_requests = set(
+            plan.combine_descriptors[: plan.last_combine_request_count, 0]
+            .cpu()
+            .tolist()
+        )
+        # The scheduler deliberately omits empty rows from both descriptor
+        # streams. Their public zero output and -inf LSE therefore cannot come
+        # from either the mainloop or the ordinary combine path.
+        assert descriptor_requests == set(active)
+        assert combine_requests.issubset(active)
+        if inactive:
+            torch.testing.assert_close(
+                graph_out[list(inactive)],
+                torch.zeros_like(graph_out[list(inactive)]),
+                rtol=0,
+                atol=0,
+            )
+            assert torch.isneginf(
+                wrapper._plan_state.workspace_views.lse[list(inactive)]
+            ).all()
+        if active:
+            expected = _mla_reference(
+                case,
+                num_insts_kv=int(policy["num_insts_kv"]),
+                tile_size_kv=int(policy["tile_size_kv"]),
+                splits_kv=int(policy["split_kv"]),
+                batch_indices=active,
+            )
+            actual = graph_out[list(active)].float()
+            rtol, atol = _mla_tolerances(case.query.dtype)
+            if case.query.dtype == torch.float8_e4m3fn:
+                # This large-capacity test checks more than ten million FP8
+                # outputs per full transition; retain the normal relative
+                # tolerance while allowing the observed sub-2e-3 tail.
+                atol = max(atol, 2e-3)
+            torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+@_REQUIRES_BALANCED_MLA_CALIBRATION
+def test_attention_ts_mla_optimized_device_schedule_is_numerically_correct():
+    """The folded device plan may reorder work but must preserve attention results."""
+
+    case = _make_mla_case(
+        batch_size=8,
+        num_qo_heads=16,
+        max_seq_len=32768,
+        kv_seq_lens=(32768, 16384, 8192, 4096, 2048, 1024, 512, 129),
+        qkv_dtype=torch.bfloat16,
+        device="cuda",
+        seed=33703,
+    )
+    wrapper = _plan_case(case, balanced=True)
+
+    wrapper.schedule(case.seq_lens, scheduler="optimized")
+    output = _run_case(wrapper, case)
+
+    _assert_case_correct(output, case, _policy_dict(wrapper))
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+@_REQUIRES_BALANCED_MLA_CALIBRATION
+def test_attention_ts_mla_balanced_validated_run_requires_current_schedule():
+    """Validated runs reject live lengths that were not installed by schedule."""
+
+    case = _make_mla_case(
+        batch_size=2,
+        num_qo_heads=16,
+        max_seq_len=512,
+        kv_seq_lens=(512, 129),
+        qkv_dtype=torch.bfloat16,
+        device="cuda",
+        seed=33701,
+    )
+    wrapper = _plan_case(case, balanced=True)
+
+    updated_seq_lens = (385, 65)
+    case.seq_lens.copy_(
+        torch.tensor(updated_seq_lens, dtype=torch.int32, device="cuda")
+    )
+    with pytest.raises(ValueError, match=r"live seq_lens.*schedule"):
+        _run_case(wrapper, case)
+
+    wrapper.schedule(case.seq_lens)
+    output = _run_case(wrapper, case)
+    _assert_case_correct(output, case, _policy_dict(wrapper))
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+@_REQUIRES_BALANCED_MLA_CALIBRATION
+def test_attention_ts_mla_balanced_validated_run_requires_schedule_snapshot(
+    monkeypatch,
+):
+    """A nonvalidating schedule cannot authorize a later validating run."""
+
+    case = _make_mla_case(
+        batch_size=2,
+        num_qo_heads=16,
+        max_seq_len=512,
+        kv_seq_lens=(512, 128),
+        qkv_dtype=torch.bfloat16,
+        device="cuda",
+        seed=33704,
+    )
+    case.seq_lens.copy_(torch.tensor((128, 0), dtype=torch.int32, device="cuda"))
+    wrapper = _plan_case(case, balanced=True)
+    wrapper.schedule(case.seq_lens, validate=False)
+    case.seq_lens.copy_(torch.tensor((512, 128), dtype=torch.int32, device="cuda"))
+
+    original_launch = mla_decode_module._launch_mla_decode
+
+    def unexpected_launch(*_args, **_kwargs):
+        raise AssertionError("validation must reject before launching attention")
+
+    monkeypatch.setattr(mla_decode_module, "_launch_mla_decode", unexpected_launch)
+    with pytest.raises(RuntimeError, match=r"snapshot is unavailable.*schedule"):
+        _run_case(wrapper, case)
+
+    monkeypatch.setattr(mla_decode_module, "_launch_mla_decode", original_launch)
+    wrapper.schedule(case.seq_lens)
+    output = _run_case(wrapper, case)
+    _assert_case_correct(output, case, _policy_dict(wrapper))
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+@_REQUIRES_BALANCED_MLA_CALIBRATION
+def test_attention_ts_mla_balanced_workspace_size_is_publicly_queryable():
+    """The public size query covers balanced scratch but not plan descriptors."""
+
+    case = _make_mla_case(
+        batch_size=2,
+        num_qo_heads=16,
+        max_seq_len=32768,
+        kv_seq_lens=(32768, 257),
+        qkv_dtype=torch.bfloat16,
+        device="cuda",
+        seed=33702,
+    )
+    workspace_size = get_prims_ts_batch_mla_decode_workspace_size(
+        2,
+        16,
+        _LATENT_DIM,
+        _ROPE_DIM,
+        case.page_size,
+        case.max_seq_len,
+        max_seq_len_q=1,
+        q_dtype=case.query.dtype,
+        kv_dtype=case.kv_cache.dtype,
+        out_dtype=case.output_dtype,
+        mask_type=case.mask_type,
+        balanced=True,
+        device=case.query.device,
+    )
+    workspace = torch.empty(workspace_size, dtype=torch.int8, device="cuda")
+    wrapper = BatchMLADecodePagedTSWrapper()
+    wrapper.plan_balanced(
+        case.query.device,
+        2,
+        16,
+        _LATENT_DIM,
+        _ROPE_DIM,
+        case.page_size,
+        case.max_seq_len,
+        max_seq_len_q=1,
+        packed_query=False,
+        q_data_type=case.query.dtype,
+        kv_data_type=case.kv_cache.dtype,
+        o_data_type=case.output_dtype,
+        seq_lens=(32768, 257),
+        mask_type=case.mask_type,
+        workspace_buffer=workspace,
+    )
+
+    assert wrapper._plan_state is not None
+    state = wrapper._plan_state
+    assert workspace_size == state.workspace_layout.total_bytes
+    assert state.workspace_layout.lse.byte_size == 2 * 16 * 4
+    assert state.balanced_plan is not None
+    plan_info = wrapper.plan_info
+    assert dict(plan_info["policy"]) == dict(state.policy)
+    assert plan_info["balanced"] is True
+    assert plan_info["cost_model"]["model_id"] == B200_BALANCED_COST_MODEL_ID
+    assert plan_info["cost_model"]["bucket"] == (state.balanced_plan.last_cost_bucket)
+    assert plan_info["cost_model"]["parameters"] == state.balanced_plan.cost
+    workspace_end = workspace.data_ptr() + workspace.numel()
+    for descriptor in (
+        state.balanced_plan.work_descriptors,
+        state.balanced_plan.partition_offsets,
+        state.balanced_plan.combine_descriptors,
+        state.balanced_plan.num_combine_descriptors,
+    ):
+        descriptor_begin = descriptor.data_ptr()
+        descriptor_end = (
+            descriptor_begin + descriptor.numel() * descriptor.element_size()
+        )
+        assert (
+            descriptor_end <= workspace.data_ptr() or descriptor_begin >= workspace_end
+        )
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+@_REQUIRES_BALANCED_MLA_CALIBRATION
+def test_attention_ts_mla_auto_gate_runs_balanced_and_standard_plans():
+    """Exercise both production-gate decisions through the public wrapper."""
+
+    case = _make_mla_case(
+        batch_size=2,
+        num_qo_heads=128,
+        max_seq_len=8192,
+        kv_seq_lens=(8192, 512),
+        qkv_dtype=torch.bfloat16,
+        device="cuda",
+        seed=33703,
+    )
+    wrapper = BatchMLADecodePagedTSWrapper()
+    plan_kwargs = {
+        "device": case.query.device,
+        "batch_size": 2,
+        "num_heads": 128,
+        "kv_lora_rank": _LATENT_DIM,
+        "qk_rope_head_dim": _ROPE_DIM,
+        "page_size": case.page_size,
+        "max_kv_len": case.max_seq_len,
+        "max_seq_len_q": 1,
+        "packed_query": False,
+        "q_data_type": case.query.dtype,
+        "kv_data_type": case.kv_cache.dtype,
+        "o_data_type": case.output_dtype,
+        "seq_lens": tuple(int(value) for value in case.seq_lens.cpu()),
+        "mask_type": case.mask_type,
+    }
+
+    assert wrapper.plan_auto(
+        **plan_kwargs,
+        expected_mean_seq_len=4096,
+        expected_max_seq_len=8192,
+    )
+    assert wrapper.plan_info["balanced"] is True
+    balanced_output = _run_case(wrapper, case)
+    _assert_case_correct(balanced_output, case, _policy_dict(wrapper))
+
+    assert not wrapper.plan_auto(
+        **plan_kwargs,
+        expected_mean_seq_len=8192,
+        expected_max_seq_len=8192,
+    )
+    assert wrapper.plan_info["balanced"] is False
+    standard_output = _run_case(wrapper, case)
+    _assert_case_correct(standard_output, case, _policy_dict(wrapper))
 
 
 def _run_standalone(
@@ -1138,6 +2296,7 @@ def test_attention_ts_mla_public_surfaces_hide_internal_tuning_policy():
     surfaces = (
         BatchMLADecodePagedTSWrapper.__init__,
         BatchMLADecodePagedTSWrapper.plan,
+        BatchMLADecodePagedTSWrapper.plan_auto,
         BatchMLADecodePagedTSWrapper.run,
         batch_mla_decode_with_paged_kv_cache,
         get_prims_ts_batch_mla_decode_workspace_size,
@@ -1168,6 +2327,216 @@ def test_attention_ts_mla_public_surfaces_hide_internal_tuning_policy():
                 violations.append(f"{surface.__qualname__}.{parameter.name}")
 
     assert violations == []
+
+
+def test_attention_ts_mla_plan_info_is_read_only_and_requires_plan():
+    wrapper = BatchMLADecodePagedTSWrapper()
+    with pytest.raises(RuntimeError, match=r"plan\(\) must be called"):
+        _ = wrapper.plan_info
+
+    model_info = MappingProxyType(
+        {
+            "model_id": "test-model",
+            "source": "calibrated-registry",
+            "bucket": "sparse",
+        }
+    )
+    wrapper._plan_state = SimpleNamespace(
+        policy=(("source", "auto"), ("kernel", "throughput_2cta")),
+        balanced_plan=SimpleNamespace(cost_model_info=model_info),
+    )
+    info = wrapper.plan_info
+
+    assert info["balanced"] is True
+    assert info["policy"]["kernel"] == "throughput_2cta"
+    assert info["cost_model"] == model_info
+    with pytest.raises(TypeError):
+        info["balanced"] = False
+    with pytest.raises(TypeError):
+        info["policy"]["kernel"] = "throughput_latency_1cta"
+    with pytest.raises(TypeError):
+        info["cost_model"]["bucket"] = "dense_large"
+
+
+def test_attention_ts_mla_standard_plan_info_has_no_cost_model():
+    wrapper = BatchMLADecodePagedTSWrapper()
+    wrapper._plan_state = SimpleNamespace(
+        policy=(("source", "auto"), ("kernel", "throughput_2cta")),
+        balanced_plan=None,
+    )
+
+    info = wrapper.plan_info
+
+    assert info["balanced"] is False
+    assert info["cost_model"] is None
+
+
+@pytest.mark.parametrize("use_balanced", (False, True))
+def test_attention_ts_mla_auto_plan_installs_gate_selection(monkeypatch, use_balanced):
+    import flashinfer.attention.prims_ts.balanced_scheduler.plan as balanced_plan_module
+
+    wrapper = BatchMLADecodePagedTSWrapper()
+    calls = []
+    calibration_calls = []
+
+    monkeypatch.setattr(
+        mla_decode_module,
+        "should_use_prims_ts_balanced_mla",
+        lambda **_kwargs: use_balanced,
+    )
+    monkeypatch.setattr(
+        mla_decode_module,
+        "_resolve_cuda_device",
+        lambda _device: (torch.device("cuda:0"), 0),
+    )
+    monkeypatch.setattr(
+        balanced_plan_module,
+        "require_balanced_mla_calibration",
+        lambda device: calibration_calls.append(device),
+    )
+
+    def record_plan(*args, **kwargs):
+        calls.append((args, kwargs))
+
+    monkeypatch.setattr(wrapper, "_plan", record_plan)
+    seq_lens = (8192, 4096)
+
+    selected = wrapper.plan_auto(
+        "cuda:0",
+        2,
+        128,
+        _LATENT_DIM,
+        _ROPE_DIM,
+        _DEFAULT_PAGE_SIZE,
+        8192,
+        max_seq_len_q=1,
+        packed_query=False,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+        o_data_type=torch.bfloat16,
+        seq_lens=seq_lens,
+        expected_mean_seq_len=4096,
+        expected_max_seq_len=8192,
+    )
+
+    assert selected is use_balanced
+    assert len(calls) == 1
+    assert calls[0][1]["balanced"] is use_balanced
+    assert calls[0][1]["balanced_seq_lens"] == (seq_lens if use_balanced else None)
+    assert calibration_calls == ([torch.device("cuda:0")] if use_balanced else [])
+
+
+def test_attention_ts_mla_auto_plan_warns_and_falls_back_without_calibration(
+    monkeypatch,
+):
+    import flashinfer.attention.prims_ts.balanced_scheduler.plan as balanced_plan_module
+
+    wrapper = BatchMLADecodePagedTSWrapper()
+    calls = []
+
+    monkeypatch.setattr(
+        mla_decode_module,
+        "should_use_prims_ts_balanced_mla",
+        lambda **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        mla_decode_module,
+        "_resolve_cuda_device",
+        lambda _device: (torch.device("cuda:7"), 7),
+    )
+
+    def reject_calibration(device):
+        assert device == torch.device("cuda:7")
+        raise NotImplementedError("run calibration benchmark")
+
+    monkeypatch.setattr(
+        balanced_plan_module,
+        "require_balanced_mla_calibration",
+        reject_calibration,
+    )
+    monkeypatch.setattr(
+        wrapper,
+        "_plan",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+    seq_lens = (8192, 4096)
+
+    with pytest.warns(
+        RuntimeWarning,
+        match=r"no registered cost-model calibration.*falling back.*calibration benchmark",
+    ):
+        selected = wrapper.plan_auto(
+            "cuda:7",
+            2,
+            128,
+            _LATENT_DIM,
+            _ROPE_DIM,
+            _DEFAULT_PAGE_SIZE,
+            8192,
+            max_seq_len_q=1,
+            packed_query=False,
+            q_data_type=torch.bfloat16,
+            kv_data_type=torch.bfloat16,
+            o_data_type=torch.bfloat16,
+            seq_lens=seq_lens,
+            expected_mean_seq_len=4096,
+            expected_max_seq_len=8192,
+        )
+
+    assert selected is False
+    assert len(calls) == 1
+    assert calls[0][1]["balanced"] is False
+    assert calls[0][1]["balanced_seq_lens"] is None
+
+
+def test_attention_ts_mla_balanced_plan_fails_calibration_before_policy_or_allocation(
+    monkeypatch,
+):
+    import flashinfer.attention.prims_ts.balanced_scheduler.plan as balanced_plan_module
+
+    events = []
+
+    def reject_calibration(_device):
+        events.append("calibration")
+        raise NotImplementedError("run calibration benchmark")
+
+    def unexpected_policy(*_args, **_kwargs):
+        events.append("policy")
+        raise AssertionError("policy resolution must not run")
+
+    monkeypatch.setattr(
+        mla_decode_module,
+        "_resolve_cuda_device",
+        lambda _device: (torch.device("cuda:7"), 7),
+    )
+    monkeypatch.setattr(
+        balanced_plan_module,
+        "require_balanced_mla_calibration",
+        reject_calibration,
+    )
+    monkeypatch.setattr(
+        mla_decode_module, "_resolve_mla_decode_launch_spec", unexpected_policy
+    )
+
+    wrapper = BatchMLADecodePagedTSWrapper()
+    with pytest.raises(NotImplementedError, match="run calibration benchmark"):
+        wrapper.plan_balanced(
+            "cuda:7",
+            1,
+            8,
+            _LATENT_DIM,
+            _ROPE_DIM,
+            _DEFAULT_PAGE_SIZE,
+            128,
+            max_seq_len_q=1,
+            packed_query=False,
+            q_data_type=torch.bfloat16,
+            kv_data_type=torch.bfloat16,
+            o_data_type=torch.bfloat16,
+            seq_lens=(128,),
+        )
+
+    assert events == ["calibration"]
 
 
 def test_attention_ts_mla_wrapper_uses_compile_oriented_contract():
@@ -1539,6 +2908,156 @@ def test_attention_ts_mla_explicit_split_preserves_explicit_profile():
         )
 
 
+def test_attention_ts_mla_balanced_keeps_fp8_serializes_q_work_tiles():
+    """Keep the load task behind the previous balanced q64 MMA tail."""
+
+    config_kwargs = {
+        "batch_size": 2,
+        "num_heads_q": 64,
+        "seq_len_q": 1,
+        "seq_len_kv": 32768,
+        "qkv_dtype": "e4m3",
+        "profile": "h64_keeps_mma_ab",
+        "max_active_clusters": 148,
+    }
+    direct = make_throughput_latency_mla_config(**config_kwargs)
+    balanced = make_throughput_latency_mla_config(
+        **config_kwargs,
+        use_balanced_scheduler=True,
+        balanced_descriptor_capacity=2,
+        balanced_partial_capacity=2,
+    )
+
+    assert direct.q_stages == 2
+    assert balanced.q_stages == 1
+    assert direct.use_balanced_scheduler is False
+    assert balanced.use_balanced_scheduler is True
+    # Preserve the long-descriptor K/V pipeline; Q is the per-work-tile fence.
+    assert balanced.kv_stages == direct.kv_stages == 8
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+@_REQUIRES_BALANCED_MLA_CALIBRATION
+def test_attention_ts_mla_balanced_q64_fp8_mixed_deep_queue_is_stable(
+    monkeypatch,
+):
+    """Exercise the mixed B256 schedule that exposed cross-work-tile state."""
+
+    from flashinfer.attention.prims_ts.kernels.mla_decode import kernel_policy
+
+    device = torch.device("cuda")
+    batch_size = 256
+    num_heads = 64
+    long_kv_len = 50048
+    short_kv_len = 128
+    seq_lens_cpu = torch.tensor(
+        (long_kv_len,) * (batch_size // 2) + (short_kv_len,) * (batch_size // 2),
+        dtype=torch.int32,
+    )
+    pages_per_row = math.ceil(long_kv_len / _DEFAULT_PAGE_SIZE)
+    # Reuse a deterministic physical-page pool to keep this exact scheduling
+    # reproducer small enough for routine GPU acceptance runs.
+    num_physical_pages = 8192
+    block_tables = (
+        torch.arange(
+            batch_size * pages_per_row,
+            dtype=torch.int32,
+            device=device,
+        ).reshape(batch_size, pages_per_row)
+        % num_physical_pages
+    )
+    generator = torch.Generator(device=device).manual_seed(33864)
+    q_scale, kv_scale = 0.0625, 0.125
+    query = _stored(
+        0.2
+        * torch.randn(
+            batch_size,
+            1,
+            num_heads,
+            _QK_DIM,
+            dtype=torch.bfloat16,
+            generator=generator,
+            device=device,
+        ),
+        _FP8,
+        q_scale,
+    )
+    kv_cache = _stored(
+        0.2
+        * torch.randn(
+            num_physical_pages,
+            1,
+            _DEFAULT_PAGE_SIZE,
+            _QK_DIM,
+            dtype=torch.bfloat16,
+            generator=generator,
+            device=device,
+        ),
+        _FP8,
+        kv_scale,
+    )
+    case = _MLACase(
+        query=query,
+        kv_cache=kv_cache,
+        block_tables=block_tables,
+        seq_lens=seq_lens_cpu.to(device),
+        max_seq_len=long_kv_len,
+        page_size=_DEFAULT_PAGE_SIZE,
+        output_dtype=torch.bfloat16,
+        mask_type="causal",
+        bmm1_scale=q_scale * kv_scale / math.sqrt(_QK_DIM),
+        bmm2_scale=kv_scale,
+    )
+
+    selected_family = "throughput_latency_1cta"
+
+    def force_family(*args, **kwargs):
+        del args, kwargs
+        return selected_family, "forced-deep-queue-test"
+
+    monkeypatch.setattr(kernel_policy, "resolve_mla_kernel_policy", force_family)
+    mla_decode_module._resolve_mla_decode_launch_spec.cache_clear()
+    try:
+        one_cta = _plan_case(case, balanced=True)
+        assert one_cta._plan_state is not None
+        one_plan = one_cta._plan_state.balanced_plan
+        assert one_plan is not None
+        # This kernel-state regression specifically needs the deep exact/LPT
+        # queue. Production defaults to the shallower optimized fold.
+        one_plan.schedule_device(case.seq_lens, scheduler="exact")
+        partition_offsets = one_plan.partition_offsets.cpu()
+        partition_depths = partition_offsets[1:] - partition_offsets[:-1]
+        assert one_plan.last_descriptor_count == batch_size
+        assert partition_depths.numel() == 148
+        assert int(partition_depths.max()) >= 6
+        assert int((partition_depths > 1).sum()) >= 20
+
+        selected_family = "throughput_2cta"
+        mla_decode_module._resolve_mla_decode_launch_spec.cache_clear()
+        two_cta = _plan_case(case, balanced=True)
+
+        one_cta_output = _run_case(one_cta, case)
+        two_cta_output = _run_case(two_cta, case)
+        torch.cuda.synchronize()
+
+        assert torch.isfinite(one_cta_output).all()
+        assert torch.isfinite(two_cta_output).all()
+        assert (
+            float((one_cta_output.float() - two_cta_output.float()).abs().max()) < 2e-3
+        )
+        one_lse = one_cta._plan_state.workspace_views.lse
+        two_lse = two_cta._plan_state.workspace_views.lse
+        assert float((one_lse - two_lse).abs().max()) < 1e-4
+
+        for _ in range(4):
+            repeated = _run_case(one_cta, case)
+            torch.cuda.synchronize()
+            assert torch.equal(repeated, one_cta_output)
+    finally:
+        mla_decode_module._resolve_mla_decode_launch_spec.cache_clear()
+
+
 def test_attention_ts_mla_partial_tail_rejects_cluster_reduction():
     """Keep partial flat-row tails on the predicated standalone reducer."""
 
@@ -1563,6 +3082,35 @@ def test_attention_ts_mla_partial_tail_rejects_cluster_reduction():
         make_throughput_latency_mla_config(
             **config_kwargs,
             reduction_mode="cluster",
+        )
+
+
+def test_attention_ts_mla_balanced_rejects_cluster_reduction():
+    """Balanced descriptors require the standalone GMEM reduction path."""
+
+    config_kwargs = {
+        "batch_size": 1,
+        "num_heads_q": 8,
+        "seq_len_q": 1,
+        "seq_len_kv": 4096,
+        "tile_size_q": 8,
+        "explicit_split_kv": 2,
+        "max_active_clusters": 148,
+        "reduction_mode": "cluster",
+    }
+    ordinary = make_throughput_latency_mla_config(**config_kwargs)
+    assert ordinary.kernel_variant == "swaps_mma_ab"
+    assert ordinary.use_cluster_reduction == 1
+
+    with pytest.raises(
+        ValueError,
+        match="balanced 1CTA MLA does not support cluster reduction",
+    ):
+        make_throughput_latency_mla_config(
+            **config_kwargs,
+            use_balanced_scheduler=True,
+            balanced_descriptor_capacity=2,
+            balanced_partial_capacity=2,
         )
 
 
@@ -1632,6 +3180,48 @@ def test_attention_ts_mla_int32_kv_coordinate_bound():
     with pytest.raises(RuntimeError, match=r"span no larger than 32768.*got 33024"):
         mla_decode_module._validate_mla_policy_coordinate_span(
             (*maximal_policy[:-1], ("split_kv", 129))
+        )
+
+
+def test_attention_ts_mla_balanced_1cta_packed_coordinate_bound():
+    """Reject only balanced queue coordinates above signed Int32 maximum."""
+
+    mla_decode_module._validate_balanced_1cta_packed_coordinate(
+        batch_size=32768,
+        num_head_tiles=1,
+        descriptor_capacity=65536,
+    )
+    with pytest.raises(
+        NotImplementedError,
+        match=r"balanced 1CTA packed work coordinate must fit in a signed int32",
+    ):
+        mla_decode_module._validate_balanced_1cta_packed_coordinate(
+            batch_size=32769,
+            num_head_tiles=1,
+            descriptor_capacity=65536,
+        )
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+@_REQUIRES_BALANCED_MLA_CALIBRATION
+def test_attention_ts_mla_public_balanced_plan_rejects_packed_coordinate_overflow():
+    """Apply the packed-coordinate guard during public policy resolution."""
+
+    with pytest.raises(
+        NotImplementedError,
+        match=r"balanced 1CTA packed work coordinate must fit in a signed int32",
+    ):
+        get_prims_ts_batch_mla_decode_workspace_size(
+            50_000,
+            8,
+            _LATENT_DIM,
+            _ROPE_DIM,
+            _DEFAULT_PAGE_SIZE,
+            257,
+            max_seq_len_q=1,
+            balanced=True,
+            device="cuda",
         )
 
 
