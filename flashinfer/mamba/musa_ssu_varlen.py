@@ -13,6 +13,7 @@ import triton
 import triton.language as tl
 
 from .musa_ssd_helpers import fast_exp
+from .musa_compile import device_context
 from .musa_stochastic import cvt_rs_f16, philox4x32
 
 
@@ -303,7 +304,9 @@ def _musa_varlen_ssu_kernel(
         tl.store(dst_state_ptrs, state, mask=mask)
 
 
-def _select_block_config(dim: int, dstate: int, batch: int, nheads: int) -> tuple[int, int]:
+def _select_block_config(
+    dim: int, dstate: int, batch: int, nheads: int
+) -> tuple[int, int]:
     """Small deterministic launch table for the S5000 packed MTP shape."""
     # The Nemotron TP1 contract is D=64/N=128.  Four rows and four warps
     # match the existing MUSA decode provider and keep register pressure low.
@@ -361,7 +364,17 @@ def ssu_varlen_musa_triton(
         dst_state_batch_indices = dst_state_batch_indices[:, None]
     if state_batch_indices.dim() != 2 or dst_state_batch_indices.dim() != 2:
         raise ValueError("state index tensors must be rank 2 in packed varlen mode")
-    tensors = (x, dt, A, B, C, D, state_batch_indices, dst_state_batch_indices, cu_seqlens)
+    tensors = (
+        x,
+        dt,
+        A,
+        B,
+        C,
+        D,
+        state_batch_indices,
+        dst_state_batch_indices,
+        cu_seqlens,
+    )
     if any(t.device != state.device for t in tensors):
         raise ValueError("packed varlen tensors must share the state device")
     if state_batch_indices.dtype not in (torch.int32, torch.int64):
@@ -370,7 +383,7 @@ def ssu_varlen_musa_triton(
         raise ValueError("source and destination index dtypes must match")
     if out is None:
         out = torch.empty_like(x)
-    if out.shape != x.shape or out.dtype != x.dtype:
+    if out.shape != x.shape or out.dtype != x.dtype or out.device != state.device:
         raise ValueError("out must match x in packed varlen mode")
     if cu_seqlens.dim() != 1 or not cu_seqlens.is_contiguous():
         raise ValueError("cu_seqlens must be a contiguous rank-1 tensor")
@@ -391,6 +404,8 @@ def ssu_varlen_musa_triton(
             raise ValueError("num_accepted_tokens must share the state device")
         if num_accepted_tokens.dtype not in (torch.int32, torch.int64):
             raise ValueError("num_accepted_tokens must be int32 or int64")
+        if not num_accepted_tokens.is_contiguous():
+            raise ValueError("num_accepted_tokens must be contiguous")
     if enable_stochastic_rounding and state.dtype != torch.float16:
         raise ValueError("stochastic rounding requires FP16 state")
     if enable_stochastic_rounding and cache_philox_rounds not in (5, 10):
@@ -400,11 +415,16 @@ def ssu_varlen_musa_triton(
     ngroups = B.shape[1]
     if x.shape[1:] != (nheads, dim) or B.shape[1:] != (ngroups, dstate):
         raise ValueError("packed varlen tensor dimensions do not match state")
-    if A.shape != (nheads, dim, dstate):
+    if A.shape[1:] != (dim, dstate) or A.shape[0] not in (1, nheads):
         raise ValueError("A shape does not match state")
-    if D.shape not in ((nheads,), (nheads, dim)):
+    if D.shape not in ((nheads,), (1, nheads), (nheads, dim), (1, dim)):
         raise ValueError("D shape does not match state")
-    if dt_bias is not None and dt_bias.shape not in ((nheads,), (nheads, dim)):
+    if dt_bias is not None and dt_bias.shape not in (
+        (nheads,),
+        (1, nheads),
+        (nheads, dim),
+        (1, dim),
+    ):
         raise ValueError("dt_bias shape does not match state")
     if z is not None and (z.shape != x.shape or z.device != state.device):
         raise ValueError("z shape does not match x")
@@ -417,87 +437,109 @@ def ssu_varlen_musa_triton(
     idx_strides = (state_batch_indices.stride(0), state_batch_indices.stride(1))
     dst_strides = (dst_state_batch_indices.stride(0), dst_state_batch_indices.stride(1))
     z_strides = (z.stride(0), z.stride(1), z.stride(2)) if z is not None else (0, 0, 0)
-    bias_strides = (dt_bias.stride(0), dt_bias.stride(1)) if dt_bias is not None and dt_bias.dim() == 2 else ((dt_bias.stride(0), 0) if dt_bias is not None else (0, 0))
-    d_strides = (D.stride(0), D.stride(1) if D.dim() == 2 else 0)
+    bias_strides = (
+        (
+            0 if dt_bias.shape[0] == 1 else dt_bias.stride(0),
+            dt_bias.stride(1),
+        )
+        if dt_bias is not None and dt_bias.dim() == 2
+        else ((dt_bias.stride(0), 0) if dt_bias is not None else (0, 0))
+    )
+    d_strides = (
+        0 if D.shape[0] == 1 else D.stride(0),
+        D.stride(1) if D.dim() == 2 else 0,
+    )
+    a_stride0 = 0 if A.shape[0] == 1 else A.stride(0)
     if enable_stochastic_rounding:
         if rand_seed is None:
             rand_seed = torch.randint(
                 0, 2**32, (1,), device=state.device, dtype=torch.int64
             )
-        elif rand_seed.dtype != torch.int64 or rand_seed.numel() != 1:
-            raise ValueError("rand_seed must be one int64 value")
+        elif (
+            rand_seed.dtype != torch.int64
+            or rand_seed.numel() != 1
+            or rand_seed.device != state.device
+            or not rand_seed.is_contiguous()
+        ):
+            raise ValueError(
+                "rand_seed must be one contiguous int64 on the state device"
+            )
     else:
         rand_seed = None
     grid = (triton.cdiv(dim, block_m), nseq, nheads)
-    _musa_varlen_ssu_kernel[grid](
-        state,
-        rand_seed,
-        x,
-        dt,
-        dt_bias,
-        A,
-        B,
-        C,
-        D,
-        z,
-        out,
-        state_batch_indices,
-        dst_state_batch_indices,
-        null_block_id,
-        num_accepted_tokens,
-        cu_seqlens,
-        x.shape[0],
-        nheads,
-        dim,
-        dstate,
-        nheads // ngroups,
-        state.stride(0),
-        state.stride(1),
-        state.stride(2),
-        state.stride(3),
-        x.stride(0),
-        x.stride(1),
-        x.stride(2),
-        dt.stride(0),
-        dt.stride(1),
-        dt.stride(2),
-        bias_strides[0],
-        bias_strides[1],
-        A.stride(0),
-        A.stride(1),
-        A.stride(2),
-        B.stride(0),
-        B.stride(1),
-        B.stride(2),
-        C.stride(0),
-        C.stride(1),
-        C.stride(2),
-        d_strides[0],
-        d_strides[1],
-        z_strides[0],
-        z_strides[1],
-        z_strides[2],
-        out.stride(0),
-        out.stride(1),
-        out.stride(2),
-        idx_strides[0],
-        idx_strides[1],
-        dst_strides[0],
-        dst_strides[1],
-        dt_softplus,
-        A.stride(-1) == 0 and A.stride(-2) == 0 and dt.stride(-1) == 0 and (dt_bias is None or dt_bias.stride(-1) == 0),
-        block_m,
-        num_warps=num_warps,
-        USE_RS_ROUNDING=enable_stochastic_rounding,
-        PHILOX_ROUNDS=cache_philox_rounds,
-        HAS_DT_BIAS=dt_bias is not None,
-        HAS_D=True,
-        HAS_Z=z is not None,
-        HAS_STATE_BATCH_INDICES=True,
-        IS_SPEC_DECODING=num_accepted_tokens is not None,
-        IS_VARLEN=True,
-        BLOCK_SIZE_DSTATE=triton.next_power_of_2(dstate),
-    )
+    with device_context(state.device.index):
+        _musa_varlen_ssu_kernel[grid](
+            state,
+            rand_seed,
+            x,
+            dt,
+            dt_bias,
+            A,
+            B,
+            C,
+            D,
+            z,
+            out,
+            state_batch_indices,
+            dst_state_batch_indices,
+            null_block_id,
+            num_accepted_tokens,
+            cu_seqlens,
+            x.shape[0],
+            nheads,
+            dim,
+            dstate,
+            nheads // ngroups,
+            state.stride(0),
+            state.stride(1),
+            state.stride(2),
+            state.stride(3),
+            x.stride(0),
+            x.stride(1),
+            x.stride(2),
+            dt.stride(0),
+            dt.stride(1),
+            dt.stride(2),
+            bias_strides[0],
+            bias_strides[1],
+            a_stride0,
+            A.stride(1),
+            A.stride(2),
+            B.stride(0),
+            B.stride(1),
+            B.stride(2),
+            C.stride(0),
+            C.stride(1),
+            C.stride(2),
+            d_strides[0],
+            d_strides[1],
+            z_strides[0],
+            z_strides[1],
+            z_strides[2],
+            out.stride(0),
+            out.stride(1),
+            out.stride(2),
+            idx_strides[0],
+            idx_strides[1],
+            dst_strides[0],
+            dst_strides[1],
+            dt_softplus,
+            A.stride(-1) == 0
+            and A.stride(-2) == 0
+            and dt.stride(-1) == 0
+            and (dt_bias is None or dt_bias.stride(-1) == 0),
+            block_m,
+            num_warps=num_warps,
+            USE_RS_ROUNDING=enable_stochastic_rounding,
+            PHILOX_ROUNDS=cache_philox_rounds,
+            HAS_DT_BIAS=dt_bias is not None,
+            HAS_D=True,
+            HAS_Z=z is not None,
+            HAS_STATE_BATCH_INDICES=True,
+            IS_SPEC_DECODING=num_accepted_tokens is not None,
+            IS_VARLEN=True,
+            BLOCK_SIZE_DSTATE=triton.next_power_of_2(dstate),
+        )
     return out
 
 

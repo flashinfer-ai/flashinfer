@@ -373,7 +373,7 @@ def selective_state_update(
         if (
             is_varlen
             and state_batch_indices is not None
-            and state_batch_indices.dim() == 2
+            and state_batch_indices.dim() in (1, 2)
             and intermediate_states_buffer is None
             and intermediate_state_scales is None
             and state_scale is None
