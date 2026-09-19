@@ -10,6 +10,16 @@ The public ``recurrent_kda`` API supports standard decode with one token per
 sequence (``T=1``) and packed speculative decode with two or more tokens per
 sequence (``T>=2``).
 
+``fused_kda_decode`` combines width-four causal convolution, one KDA update,
+and gated RMSNorm for ``T=1``. ``packed_fused_kda_decode`` extends the same
+pipeline to packed ragged speculative decode, retaining one recurrent
+checkpoint per token and an extended rolling convolution window. Its optional
+``t1_state_indices`` argument is a T=1-only fast path containing caller-resolved
+per-row cache slots. T>1 always uses the ``state_indices[N, T]``,
+``query_start_loc``, and ``num_accepted_tokens`` metadata with the multitoken
+kernel; passing ``t1_state_indices`` for T>1 is rejected. No T>1 kernel
+behavior or performance is changed by this optimization.
+
 Pass ``backend="cake"`` to select the exported Cake backend. On SM100-family
 SM100a (B200/GB200) and SM103a (B300/GB300) devices, its D128 ``T=1..6``
 family with in-kernel QK normalization exports 25 frozen CUDA bodies:
@@ -125,5 +135,6 @@ small ``B * HV * T``. Requires SM90+ for the WY path and ``K = V = 128``;
     :toctree: ../generated
 
     fused_kda_decode
+    packed_fused_kda_decode
     packed_kda_decode
     recurrent_kda
