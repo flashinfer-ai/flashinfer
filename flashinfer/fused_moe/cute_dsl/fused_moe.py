@@ -50,6 +50,7 @@ Example (Wrapper API with CUDA Graph):
     >>> g.replay()
 """
 
+import functools
 from typing import Any, Dict, Optional, Tuple
 
 import warnings
@@ -235,6 +236,15 @@ def _moe_core_impl(
     swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
     situ_beta: Optional[float] = None,
     situ_linear_beta: Optional[float] = None,
+    # Cross-GPU peer-scatter combine (Blackwell only). Passing peer_addresses
+    # makes GEMM2 write each (token, k_slot) row straight into the combine
+    # buffer of the rank that owns the token, at tile granularity and
+    # overlapped with GEMM2's own compute, instead of into a local buffer.
+    peer_addresses: Optional[torch.Tensor] = None,
+    token_dst_rank: Optional[torch.Tensor] = None,
+    token_dst_local_idx: Optional[torch.Tensor] = None,
+    combine_buffer: Optional[torch.Tensor] = None,
+    peer_release_fence: bool = False,
 ) -> torch.Tensor:
     """Core MoE implementation shared by functional and wrapper APIs.
 
@@ -461,8 +471,26 @@ def _moe_core_impl(
         )
 
     # Atomic finalize requires a zeroed token output. Deterministic finalize
-    # writes each route to a unique expanded row.
-    if use_fused_finalize:
+    # writes each route to a unique expanded row. Peer scatter writes each
+    # route to a unique slot in the owning rank's combine buffer, so it needs
+    # no local buffer and no zeroing: exactly one rank owns the expert for a
+    # given route, so every slot has exactly one writer across the world.
+    use_peer_scatter = peer_addresses is not None
+    if use_peer_scatter:
+        if use_fused_finalize:
+            raise ValueError(
+                "peer_addresses requires use_fused_finalize=False: the "
+                "routing-weight reduction must run after the peer writes "
+                "land, on the rank that owns each token."
+            )
+        if combine_buffer is None:
+            raise ValueError(
+                "peer_addresses requires combine_buffer: this rank's own "
+                "symmetric combine buffer, shaped "
+                "(max_tokens_per_rank * top_k, hidden_size)"
+            )
+        gemm2_output = combine_buffer
+    elif use_fused_finalize:
         if use_async_memset:
             with torch.cuda.stream(aux_stream):
                 main_event.wait()
@@ -504,7 +532,20 @@ def _moe_core_impl(
         cluster_shape_mn=gemm2_cluster_shape_mn,
         enable_pdl=enable_pdl,
         use_fused_finalize=use_fused_finalize,
+        peer_addresses=peer_addresses,
+        token_dst_rank=token_dst_rank,
+        token_dst_local_idx=token_dst_local_idx,
+        peer_release_fence=peer_release_fence,
     )
+
+    if use_peer_scatter:
+        # The routing-weight reduction is deliberately NOT done here. GEMM2's
+        # writes landed in other ranks' memory, so the caller must first wait
+        # for every rank's GEMM2 to complete -- a barrier on the process group
+        # backing the symmetric memory -- and only then reduce over top_k on
+        # the rank that owns each token. Return the raw per-slot buffer for
+        # that step.
+        return combine_buffer
 
     # Step 4: Deterministic routing-weight reduction
     if not use_fused_finalize:
@@ -1081,9 +1122,24 @@ def _cute_dsl_fused_moe_impl(
     swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
     situ_beta: Optional[float] = None,
     situ_linear_beta: Optional[float] = None,
+    # Peer-scatter inputs. These are bound with functools.partial before the
+    # runner is built rather than appended to the autotuner's positional
+    # `inputs` list, because they are per-call context and not something the
+    # autotuner tunes over -- and because appending to `inputs` would shift the
+    # hardcoded tensor indices in CuteDslFusedMoERunner.tuning_config.
+    peer_addresses: Optional[torch.Tensor] = None,
+    token_dst_rank: Optional[torch.Tensor] = None,
+    token_dst_local_idx: Optional[torch.Tensor] = None,
+    combine_buffer: Optional[torch.Tensor] = None,
+    peer_release_fence: bool = False,
 ) -> torch.Tensor:
     """Internal implementation called by auto-tuner for functional API."""
     return _moe_core_impl(
+        peer_addresses=peer_addresses,
+        token_dst_rank=token_dst_rank,
+        token_dst_local_idx=token_dst_local_idx,
+        combine_buffer=combine_buffer,
+        peer_release_fence=peer_release_fence,
         x=x,
         x_sf=x_sf,
         token_selected_experts=token_selected_experts,
@@ -1157,6 +1213,11 @@ def cute_dsl_fused_moe(
     quant_mode: str = "w4a4",
     per_token_scale: Optional[torch.Tensor] = None,
     tactic: Optional[Tuple] = None,
+    peer_addresses: Optional[torch.Tensor] = None,
+    token_dst_rank: Optional[torch.Tensor] = None,
+    token_dst_local_idx: Optional[torch.Tensor] = None,
+    combine_buffer: Optional[torch.Tensor] = None,
+    peer_release_fence: bool = False,
 ) -> torch.Tensor:
     r"""Run a fused MoE forward pass using CuTe-DSL block-scaled kernels.
 
@@ -1246,6 +1307,24 @@ def cute_dsl_fused_moe(
     _require_cute_dsl_arch_for(x.device, native_only=True)
     activation, _ = normalize_cute_dsl_moe_activation_type(activation_type)
     quant_mode = _canonicalize_quant_mode(quant_mode)
+
+    if peer_addresses is not None:
+        # Peer scatter is wired only through CuteDslFusedMoERunner (the
+        # w4a4/w4a8 path); CuteDslFusedMoEW4A16Runner has no peer parameters,
+        # so accepting them here would silently drop the cross-GPU combine.
+        if quant_mode == "w4a16":
+            raise NotImplementedError(
+                "peer_addresses is not supported with quant_mode='w4a16'"
+            )
+        # Autotuning replays GEMM2 once per candidate tactic. In peer-scatter
+        # mode each replay writes into other ranks' combine buffers, so tune
+        # with peer scatter off and reuse the chosen tactic here.
+        if tactic is None and AutoTuner.get().is_tuning_mode:
+            raise RuntimeError(
+                "peer_addresses cannot be combined with an active autotune() "
+                "context: profiling replays would write into peer memory. "
+                "Tune without peer_addresses, then pass the resulting tactic."
+            )
     validate_cute_dsl_moe_situ_config(activation, situ_beta, situ_linear_beta)
 
     if quant_mode == "w4a8":
@@ -1275,7 +1354,18 @@ def cute_dsl_fused_moe(
     if quant_mode in ("w4a4", "w4a8"):
         use_per_token_activation = per_token_scale is not None
         runner = CuteDslFusedMoERunner(
-            forward_impl=_cute_dsl_fused_moe_impl,
+            forward_impl=(
+                _cute_dsl_fused_moe_impl
+                if peer_addresses is None
+                else functools.partial(
+                    _cute_dsl_fused_moe_impl,
+                    peer_addresses=peer_addresses,
+                    token_dst_rank=token_dst_rank,
+                    token_dst_local_idx=token_dst_local_idx,
+                    combine_buffer=combine_buffer,
+                    peer_release_fence=peer_release_fence,
+                )
+            ),
             num_experts=num_experts,
             top_k=top_k,
             num_local_experts=num_local_experts,
@@ -1411,6 +1501,11 @@ def cute_dsl_fused_moe_nvfp4(
     *,
     quant_mode: str = "w4a4",
     per_token_scale: Optional[torch.Tensor] = None,
+    peer_addresses: Optional[torch.Tensor] = None,
+    token_dst_rank: Optional[torch.Tensor] = None,
+    token_dst_local_idx: Optional[torch.Tensor] = None,
+    combine_buffer: Optional[torch.Tensor] = None,
+    peer_release_fence: bool = False,
 ) -> torch.Tensor:
     r"""Run a fused MoE forward pass using the CuTe-DSL NVFP4 kernels.
 
@@ -1457,6 +1552,11 @@ def cute_dsl_fused_moe_nvfp4(
         situ_linear_beta,
         quant_mode=quant_mode,
         per_token_scale=per_token_scale,
+        peer_addresses=peer_addresses,
+        token_dst_rank=token_dst_rank,
+        token_dst_local_idx=token_dst_local_idx,
+        combine_buffer=combine_buffer,
+        peer_release_fence=peer_release_fence,
     )
 
 
