@@ -61,6 +61,48 @@ are designed to co-exist, and neither supersedes the other.
     .. automethod:: __init__
     .. automethod:: __call__
 
+Explicit cuDNN BF16 backend
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``BackendOptions((CudnnMoeConfig(...),))`` selects the cuDNN BF16 MoE candidate,
+including SM120. Packed and unpacked precomputed routing are supported; native
+sort/permutation helpers are enabled with ``use_native_routing=True``.
+Set ``ExecutionConfig(enable_pdl=False)`` for this backend.
+
+The SM120 Frost path requires a cuDNN Frontend build containing the SM120
+grouped-MoE kernels and their scheduler-ring synchronization fix. Enable Frost
+with ``CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1``. When shared-input FC1 fusion is
+unavailable, the adapter keeps FC1 output in FP32 through the separate gated
+activation and converts its result to BF16 before FC2. Explicit ``fc1_tactic``
+and ``fc2_tactic`` records replay the selected engine and public knobs.
+
+This architecture extension applies to ``CudnnMoeConfig``; FP8 MoE retains its
+own support domain. Validation status and measurements are recorded in
+``FROST_MOE_HANDOFF.md`` at the repository root.
+
+Prepared K64 FC1 weights (SM100)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Set ``fc1_weight_layout="k_blocked_64_v1"`` in both ``CudnnMoeConfig`` and
+its ``prepare_weights`` call to opt into the paired Frost SwiGLU engine's
+prepared layout. The default retains canonical weights. This layout requires
+BF16 weights, standard SwiGLU, hidden/intermediate sizes divisible by 64,
+and the paired engine's supported routed-row range (1 through 513).
+
+``prepare_weights`` takes ordinary ``[up, gate]`` FC1 weights and returns
+one contiguous ``[E, H/64, 2*I, 64]`` gate-then-up parent plus its ``gate``
+and ``up`` views. FC2 weights keep their existing layout. Preparation allocates
+and may copy; perform it before plan preparation and CUDA Graph capture.
+The returned pack retains one FC1 allocation. Plan execution binds the live
+prepared parent directly, without conversion or a cached copy of its contents.
+
+For weight updates, update this prepared allocation or prepare a new pack.
+An incompatible device, layout, graph, or fusion request raises an error;
+prepared weights cannot silently fall back to a canonical-weight engine.
+Explicit ``fc1_fusion=False`` is therefore incompatible with this option.
+Report preparation costs separately when benchmarking, and include them for
+workloads with frequent weight updates. Full MoE gains remain workload-dependent.
+
 Utility Functions
 -----------------
 

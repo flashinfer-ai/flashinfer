@@ -82,15 +82,21 @@ def gen_moe_utils_module() -> JitSpec:
     # flags, so omitting it here is not merely redundant -- it breaks the build.
     # SM90 is included for the Hopper CuTe-DSL MoE path: every kernel in this
     # module only requires __CUDA_ARCH__ >= 900 (PDL guards), and moe_sort's
-    # routing kernels are documented as SM90+ (grid-sync).
+    # routing kernels are documented as SM90+ (grid-sync). SM120 uses the same
+    # helpers for native sort/permutation in the BF16 cuDNN MoE adapter.
     nvcc_flags += current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[9, 10], map_sm107_to_100f=True
+        supported_major_versions=[9, 10, 12], map_sm107_to_100f=True
     )
 
     return gen_jit_spec(
         "moe_utils",
         [
             jit_env.FLASHINFER_CSRC_DIR / "moe_utils_binding.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "moe_route_permute.cu",
+            # Reuse the existing NVIDIA TRT-LLM finalizer without loading the
+            # complete TRT MoE/GEMM module. Rounded weights fuse in this kernel.
+            jit_env.FLASHINFER_CSRC_DIR
+            / "fused_moe/trtllm_backend/trtllm_fused_moe_dev_kernel.cu",
             jit_env.FLASHINFER_CSRC_DIR
             / "nv_internal/tensorrt_llm/kernels/cuteDslKernels/moeUtils.cu",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/envUtils.cpp",

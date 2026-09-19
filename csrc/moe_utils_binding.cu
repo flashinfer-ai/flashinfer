@@ -24,6 +24,7 @@
 #include <cuda_fp4.h>
 #endif
 
+#include "flashinfer/trtllm/fused_moe/DevKernel.h"
 #include "flashinfer/trtllm/fused_moe/RoutingKernel.h"
 #include "tensorrt_llm/kernels/cuteDslKernels/moeUtils.h"
 #include "tvm_ffi_utils.h"
@@ -164,6 +165,66 @@ void moe_unpermute_bf16_float_scale(int64_t permuted_input_ptr, int64_t output_p
       reinterpret_cast<int32_t const*>(expanded_idx_to_permuted_idx_ptr),
       reinterpret_cast<float const*>(topk_scales_ptr), num_tokens, hidden_size, top_k,
       input_is_expanded, enable_pdl, stream);
+}
+
+void moe_unpermute_bf16_float_scale_rounded(int64_t permuted_input_ptr, int64_t output_ptr,
+                                            int64_t expanded_idx_to_permuted_idx_ptr,
+                                            int64_t topk_scales_ptr, int32_t num_tokens,
+                                            int32_t hidden_size, int32_t top_k,
+                                            bool input_is_expanded, bool enable_pdl,
+                                            int64_t cuda_stream_ptr) {
+  cudaStream_t stream =
+      cuda_stream_ptr != 0 ? reinterpret_cast<cudaStream_t>(cuda_stream_ptr) : get_current_stream();
+  moeUnpermuteRoundScales<__nv_bfloat16>(
+      reinterpret_cast<__nv_bfloat16 const*>(permuted_input_ptr),
+      reinterpret_cast<__nv_bfloat16*>(output_ptr),
+      reinterpret_cast<int32_t const*>(expanded_idx_to_permuted_idx_ptr),
+      reinterpret_cast<float const*>(topk_scales_ptr), num_tokens, hidden_size, top_k,
+      input_is_expanded, enable_pdl, stream);
+}
+
+void moe_unpermute_bf16_float_scale_tiled(int64_t input_ptr, int64_t output_ptr,
+                                          int64_t inverse_ptr, int64_t scales_ptr, int32_t tokens,
+                                          int32_t hidden, int32_t top_k, bool expanded,
+                                          bool round_scales, int64_t stream_ptr) {
+  cudaStream_t stream =
+      stream_ptr != 0 ? reinterpret_cast<cudaStream_t>(stream_ptr) : get_current_stream();
+  moeUnpermuteTiled<__nv_bfloat16>(reinterpret_cast<__nv_bfloat16 const*>(input_ptr),
+                                   reinterpret_cast<__nv_bfloat16*>(output_ptr),
+                                   reinterpret_cast<int32_t const*>(inverse_ptr),
+                                   reinterpret_cast<float const*>(scales_ptr), tokens, hidden,
+                                   top_k, expanded, round_scales, stream);
+}
+
+// Reuse NVIDIA TensorRT-LLM's native finalizer. The BF16 path does not read
+// totalNumPaddedTokens; that field is used only by the DeepSeek FP8 finalizer.
+void moe_unpermute_bf16_float_scale_native(int64_t input_ptr, int64_t output_ptr,
+                                           int64_t inverse_ptr, int64_t scales_ptr,
+                                           int32_t num_tokens, int32_t hidden_size, int32_t top_k,
+                                           bool round_scales_to_bf16, int64_t cuda_stream_ptr,
+                                           bool enable_pdl) {
+  namespace tg = batchedGemm::trtllm::gen;
+  moe::dev::finalize::Data data;
+  data.mDtypeElt = tg::Dtype::Bfloat16;
+  data.mDtypeExpW = tg::Dtype::Fp32;
+  data.mUsePdl = enable_pdl;
+  data.mUseDeepSeekFp8 = false;
+  data.inPtr = reinterpret_cast<void*>(input_ptr);
+  data.outPtr = reinterpret_cast<void*>(output_ptr);
+  data.expertWeightsPtr = reinterpret_cast<void*>(scales_ptr);
+  data.expandedIdxToPermutedIdx = reinterpret_cast<int32_t*>(inverse_ptr);
+  data.totalNumPaddedTokens = nullptr;
+  data.numTokens = num_tokens;
+  data.numExperts = 0;  // Not read by the BF16 finalizer.
+  data.topK = top_k;
+  data.hiddenDim = hidden_size;
+  data.hiddenDimPadded = hidden_size;
+  cudaStream_t stream =
+      cuda_stream_ptr != 0 ? reinterpret_cast<cudaStream_t>(cuda_stream_ptr) : get_current_stream();
+  if (round_scales_to_bf16)
+    moe::dev::finalize::run_rounded(data, stream);
+  else
+    moe::dev::finalize::run(data, stream);
 }
 
 void moe_unpermute_bf16_bf16_scale(int64_t permuted_input_ptr, int64_t output_ptr,
@@ -310,6 +371,12 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(flashinfer_moe_unpermute_fp16_half_scale,
 #ifdef ENABLE_BF16
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(flashinfer_moe_unpermute_bf16_float_scale,
                               moe_unpermute_bf16_float_scale);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(flashinfer_moe_unpermute_bf16_float_scale_rounded,
+                              moe_unpermute_bf16_float_scale_rounded);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(flashinfer_moe_unpermute_bf16_float_scale_tiled,
+                              moe_unpermute_bf16_float_scale_tiled);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(flashinfer_moe_unpermute_bf16_float_scale_native,
+                              moe_unpermute_bf16_float_scale_native);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(flashinfer_moe_unpermute_bf16_bf16_scale,
                               moe_unpermute_bf16_bf16_scale);
 #endif
@@ -351,7 +418,7 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(flashinfer_moe_activation_bf16, moe_activation_bf1
 // on the fused MoE pipeline at 128K.
 static constexpr int32_t kContiguousRouteWindowMinTokens = 65536;
 
-void moe_sort(
+void moe_sort_with_offsets(
     // Inputs
     int64_t token_selected_experts_ptr,  // [num_tokens, top_k], int32
     int64_t token_final_scales_ptr,      // [num_tokens, top_k], float32 or bf16
@@ -366,7 +433,7 @@ void moe_sort(
     int64_t expert_counts_ptr,
     // Optional: explicit CUDA stream pointer for CUDA graph compatibility
     // If 0, uses TVM FFI's current stream
-    int64_t cuda_stream_ptr) {
+    int64_t cuda_stream_ptr, int64_t expert_first_token_offset_ptr) {
   // Set up the routing data structure
   moe::dev::routing::routingDeepSeek::Data routingData;
 
@@ -394,6 +461,8 @@ void moe_sort(
 
   // Not using packed format since we have explicit TopK IDs
   routingData.mPtrTopKPacked = nullptr;
+  routingData.mPtrExpertFirstTokenOffset =
+      reinterpret_cast<int32_t*>(expert_first_token_offset_ptr);
 
   // Expert counts buffer: required when num_tokens > 1024
   // The kernel will set this to nullptr internally for small token counts
@@ -433,4 +502,29 @@ void moe_sort(
   moe::dev::routing::routingDeepSeek::run(routingData, stream);
 }
 
+void moe_sort(
+    // Inputs
+    int64_t token_selected_experts_ptr,  // [num_tokens, top_k], int32
+    int64_t token_final_scales_ptr,      // [num_tokens, top_k], float32 or bf16
+    int32_t num_tokens, int32_t num_experts, int32_t top_k, int32_t local_expert_offset,
+    int32_t num_local_experts, int32_t tile_tokens_dim, bool use_pdl,
+    // Outputs (pre-allocated buffers)
+    int64_t tile_idx_to_expert_idx_ptr, int64_t tile_idx_to_mn_limit_ptr,
+    int64_t expanded_idx_to_permuted_idx_ptr, int64_t permuted_idx_to_expanded_idx_ptr,
+    int64_t total_num_padded_tokens_ptr, int64_t num_non_exiting_tiles_ptr,
+    // Optional: expert counts buffer for large token counts (>1024)
+    // Should be size 2 * num_experts, int32
+    int64_t expert_counts_ptr,
+    // Optional: explicit CUDA stream pointer for CUDA graph compatibility
+    // If 0, uses TVM FFI's current stream
+    int64_t cuda_stream_ptr) {
+  moe_sort_with_offsets(token_selected_experts_ptr, token_final_scales_ptr, num_tokens, num_experts,
+                        top_k, local_expert_offset, num_local_experts, tile_tokens_dim, use_pdl,
+                        tile_idx_to_expert_idx_ptr, tile_idx_to_mn_limit_ptr,
+                        expanded_idx_to_permuted_idx_ptr, permuted_idx_to_expanded_idx_ptr,
+                        total_num_padded_tokens_ptr, num_non_exiting_tiles_ptr, expert_counts_ptr,
+                        cuda_stream_ptr, 0);
+}
+
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(flashinfer_moe_sort, moe_sort);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(flashinfer_moe_sort_with_offsets, moe_sort_with_offsets);

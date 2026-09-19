@@ -20,6 +20,7 @@ by measuring each runner's best tactic, then dispatches to the winner.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from statistics import median
 from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
@@ -29,10 +30,13 @@ from ..api_logging import flashinfer_api
 from ..autotuner import AutoTuner
 from ..utils import get_compute_capability
 from .api import (
+    BackendOptions,
     B12xNvfp4Config,
     B12xW4A16Config,
     CakeWarpDecodeConfig,
     CutlassBf16Config,
+    CudnnMoeConfig,
+    CudnnFp8PerTensorConfig,
     CutlassFp8BlockConfig,
     CutlassFp8PerTensorConfig,
     CutlassHummingConfig,
@@ -81,13 +85,15 @@ from .runners import (
     TrtllmFp8PerTensorRunner,
     TrtllmMxInt4RoutedRunner,
 )
+from .cudnn_backend import CudnnMoeRunner
+from .cudnn_fp8_backend import CudnnFp8PerTensorRunner
 from .utils import map_to_hybrid_bucket
-
 
 # Union of the concrete runners the layer dispatches to.  All share
 # backend_key / tuning_config / pack_inputs as attributes or class members;
 # typing the list with this Union gives mypy the visibility it needs.
 _RunnerT = Union[
+    CudnnMoeRunner,
     CakeWarpDecodeRunner,
     CutlassBf16Runner,
     CutlassFp8BlockRunner,
@@ -115,6 +121,8 @@ _RunnerT = Union[
 
 # Map backend-config class -> runner class
 _BACKEND_RUNNERS: Dict[type, Type[_RunnerT]] = {
+    CudnnMoeConfig: CudnnMoeRunner,
+    CudnnFp8PerTensorConfig: CudnnFp8PerTensorRunner,
     CakeWarpDecodeConfig: CakeWarpDecodeRunner,
     CutlassBf16Config: CutlassBf16Runner,
     CutlassFp8BlockConfig: CutlassFp8BlockRunner,
@@ -200,7 +208,13 @@ class MoELayer:
                 # Construction is inside the guard because a runner may reject an
                 # unsupported config while binding backend resources; letting that
                 # escape would abort selection instead of skipping the backend.
-                runner = runner_cls(config, device=self.device)
+                # Runners select their backend options from config. Bind this
+                # candidate so repeated configs of the same type cannot all
+                # select the first one (e.g. an FC1/FC2 tactic sweep).
+                runner_config = replace(
+                    config, backend=BackendOptions(candidates=(backend_cfg,))
+                )
+                runner = runner_cls(runner_config, device=self.device)
                 runner.check_support()
             except (NotImplementedError, ValueError, RuntimeError):
                 continue
@@ -343,14 +357,7 @@ class MoELayer:
         weight_pack: MoEWeightPack,
         runners: List[_RunnerT],
     ) -> Tuple[_RunnerT, Any]:
-        """Run per-runner autotune, then measure each winner-tactic and
-        pick cross-backend winner."""
-        # Lazy import: keep the library import path (``import flashinfer``) free
-        # of a dependency on the testing framework. The GPU timing helper is only
-        # needed here, on the autotune path. Relocating it to a non-testing
-        # utility module is the cleaner long-term fix (post-MVP).
-        from ..testing.utils import bench_gpu_time
-
+        """Select each runner's tactic, then compare multiple backend candidates."""
         best_time_ms = float("inf")
         best_runner: Optional[_RunnerT] = None
         best_tactic: Any = -1
@@ -366,6 +373,16 @@ class MoELayer:
                 inputs=inputs,
                 **launch_kwargs,
             )
+            # Tactics can still compete within this runner. With only one
+            # runner, a cross-backend measurement cannot change the winner.
+            if len(runners) == 1:
+                return runner, tactic
+            # Lazy import: keep the library import path (``import flashinfer``)
+            # free of a dependency on the testing framework. This timer is
+            # needed only when multiple backend candidates compete. Relocating
+            # it to a non-testing utility remains a separate cleanup.
+            from ..testing.utils import bench_gpu_time
+
             # Measure runner at its winning tactic.  Use CUDA-graph timing so
             # the cross-backend comparison reflects production (graph-captured)
             # latency rather than per-call launch/Python overhead — at low token
