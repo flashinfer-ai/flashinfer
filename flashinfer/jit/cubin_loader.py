@@ -237,14 +237,33 @@ def get_artifact(file_name: str, sha256: str, session=None) -> bytes:
 get_cubin = get_artifact
 
 
+def artifact_include_root(
+    root: Union[str, pathlib.Path],
+    module: str,
+    version: str,
+) -> pathlib.Path:
+    """Return the include root that exposes *module*'s exported artifact headers.
+
+    *version* is the artifact's content hash, so the root is a pure function of
+    ``(root, module, artifact)``: two artifact versions -- or two modules
+    exporting same-named headers -- resolve to different directories and can
+    never shadow each other, even when they share one cache directory.
+    :func:`ensure_symlink` populates the directory and
+    :func:`verify_symlinked_headers` validates it; it is not written here.
+    """
+    return pathlib.Path(root) / module / version
+
+
 def ensure_symlink(
     link: Union[str, pathlib.Path], target: Union[str, pathlib.Path]
 ) -> None:
     """Create or update a symlink, removing any stale file/directory at *link*.
 
-    This is used to map C++ include paths (e.g.
-    ``GEN_SRC_DIR/flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export``) to the
-    canonical artifact directory where ``get_artifact()`` stores downloaded files.
+    This is used to map C++ include paths under a versioned include root (see
+    :func:`artifact_include_root`, e.g.
+    ``GEN_SRC_DIR/trtllm_export/<module>/<artifact>/flashinfer/trtllm/...``) to
+    the canonical artifact directory where ``get_artifact()`` stores downloaded
+    files.
     """
     link = pathlib.Path(link)
     target = pathlib.Path(target)
