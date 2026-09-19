@@ -291,8 +291,13 @@ def get_sampling_module():
         device = probs.device
         probs = probs.float()
         batch_size = indices.size(0) if indices is not None else probs.size(0)
-        maybe_top_k_arr = maybe_top_k_arr.int() if maybe_top_k_arr is not None else None
         out_dtype = indices.dtype if indices is not None else torch.int32
+        # The kernels read the per-row top-k as IdType, which the C++ launcher keys off the
+        # output dtype, so materialize it in that dtype instead of always int32 (int64 indices
+        # would otherwise have the int32 buffer read as int64).
+        maybe_top_k_arr = (
+            maybe_top_k_arr.to(out_dtype) if maybe_top_k_arr is not None else None
+        )
         samples = torch.empty(batch_size, dtype=out_dtype, device=device)
         valid = torch.empty(batch_size, dtype=torch.bool, device=device)
         if seed is None or offset is None:
@@ -421,12 +426,17 @@ def get_sampling_module():
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         device = probs.device
         probs = probs.float()
-        maybe_top_k_arr = maybe_top_k_arr.int() if maybe_top_k_arr is not None else None
         maybe_top_p_arr = (
             maybe_top_p_arr.float() if maybe_top_p_arr is not None else None
         )
         batch_size = indices.size(0) if indices is not None else probs.size(0)
         out_dtype = indices.dtype if indices is not None else torch.int32
+        # The kernels read the per-row top-k as IdType, which the C++ launcher keys off the
+        # output dtype, so materialize it in that dtype instead of always int32 (int64 indices
+        # would otherwise have the int32 buffer read as int64).
+        maybe_top_k_arr = (
+            maybe_top_k_arr.to(out_dtype) if maybe_top_k_arr is not None else None
+        )
         samples = torch.empty(batch_size, dtype=out_dtype, device=device)
         valid = torch.empty(batch_size, dtype=torch.bool, device=device)
         if seed is None or offset is None:
