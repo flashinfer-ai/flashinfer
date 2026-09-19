@@ -57,6 +57,10 @@ EXIT_HELP = (
 )
 DEFAULT_DEADLINE_SECONDS = 0
 DEFAULT_UNIT_TIMEOUT_SECONDS = 2 * 60 * 60
+# MAX_JOBS controls JIT/Ninja build parallelism and is derived from a
+# memory-limited host budget. H100 CI workers have validated headroom for this
+# 3x per-worker JIT-build allowance; serialized prebuilds keep the host budget.
+_JIT_WORKER_JOB_MULTIPLIER = 3
 
 
 def _env_int(name: str, default: int) -> int:
@@ -88,6 +92,60 @@ def _configure_output() -> None:
         reconfigure = getattr(stream, "reconfigure", None)
         if reconfigure is not None:
             reconfigure(line_buffering=True)
+
+
+def _configure_jit_parallelism(workers: int) -> None:
+    """Turn an automatically computed host budget into a per-worker limit."""
+
+    max_jobs = os.environ.get("MAX_JOBS")
+    if max_jobs is None:
+        return
+    if workers <= 0:
+        raise ValueError("workers must be positive")
+
+    nvcc_threads = os.environ.get("FLASHINFER_NVCC_THREADS", "1")
+    automatic = os.environ.pop("FLASHINFER_AUTO_MAX_JOBS", None) == "1"
+    if automatic:
+        host_jobs = int(max_jobs)
+        per_worker_jobs = max(1, host_jobs // workers) * _JIT_WORKER_JOB_MULTIPLIER
+        os.environ.setdefault("FLASHINFER_JIT_PREBUILD_MAX_JOBS", str(host_jobs))
+        os.environ["MAX_JOBS"] = str(per_worker_jobs)
+        print(
+            "JIT PARALLELISM: phase=workers mode=automatic "
+            f"host_max_jobs={host_jobs} workers={workers} "
+            f"max_jobs_per_worker={per_worker_jobs} "
+            f"worker_job_multiplier={_JIT_WORKER_JOB_MULTIPLIER} "
+            "prebuild_max_jobs="
+            f"{os.environ['FLASHINFER_JIT_PREBUILD_MAX_JOBS']} "
+            f"nvcc_threads={nvcc_threads}",
+            flush=True,
+        )
+        return
+
+    print(
+        "JIT PARALLELISM: phase=workers mode=explicit "
+        f"workers={workers} max_jobs_per_worker={max_jobs} "
+        f"nvcc_threads={nvcc_threads}",
+        flush=True,
+    )
+
+
+def _report_collection_jit_parallelism(workers: int) -> None:
+    max_jobs = os.environ.get("MAX_JOBS")
+    if max_jobs is None:
+        return
+    mode = (
+        "automatic-host-budget"
+        if os.environ.get("FLASHINFER_AUTO_MAX_JOBS") == "1"
+        else "explicit"
+    )
+    nvcc_threads = os.environ.get("FLASHINFER_NVCC_THREADS", "1")
+    print(
+        "JIT PARALLELISM: phase=collection "
+        f"mode={mode} max_jobs={max_jobs} workers={workers} "
+        f"nvcc_threads={nvcc_threads}",
+        flush=True,
+    )
 
 
 def _test_started_at(
@@ -359,6 +417,7 @@ def _execute_command(args: argparse.Namespace, operation_started_at: float) -> i
             "UNIT_TEST_TIMEOUT_GRACE_SECONDS or --timeout-grace-seconds"
         )
 
+    _report_collection_jit_parallelism(args.workers)
     pytest_command_prefix = _pytest_command_prefix()
     planning = PlanningOptions(
         checkpoint_seconds=args.checkpoint_seconds,
@@ -455,6 +514,7 @@ def _execute_command(args: argparse.Namespace, operation_started_at: float) -> i
             )
     if args.command == "plan":
         return 0
+    _configure_jit_parallelism(args.workers)
     execution = ExecutionSettings(
         workers=args.workers,
         shard_index=args.shard_index,

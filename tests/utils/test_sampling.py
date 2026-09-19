@@ -18,6 +18,10 @@ import pytest
 import torch
 
 import flashinfer
+from tests.test_helpers.parametrize import (
+    parametrize_product,
+    pairwise_product_cases,
+)
 
 
 def normal_distribution(std):
@@ -373,10 +377,11 @@ def test_top_k_top_p_joint_sampling_from_probs(batch_size, vocab_size, p):
         ]
 
 
-@pytest.mark.parametrize("batch_size", [1, 99, 989])
-@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
-@pytest.mark.parametrize("k", [100])
-@pytest.mark.parametrize("p", [0.1, 0.5])
+@parametrize_product(
+    "batch_size,vocab_size,k,p",
+    ([1, 99, 989], [111, 32000, 128256], [100], [0.1, 0.5]),
+    regular=pairwise_product_cases,
+)
 def test_top_k_top_p_sampling_from_probs_logits_alignment(batch_size, vocab_size, k, p):
     torch.manual_seed(42)
     logits = torch.randn(batch_size, vocab_size, device="cuda:0") * 5

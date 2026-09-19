@@ -13,7 +13,8 @@ FlashInfer is a GPU kernel library for LLM serving that uses **JIT (Just-In-Time
 | Install for development | `pip install --no-build-isolation -e . -v` |
 | Initialize submodules | `git submodule update --init --recursive` |
 | Install CUPTI for benchmarking | `pip install -U cupti-python` |
-| Run all tests | `pytest tests/` |
+| Run regular tests | `pytest tests/` |
+| Run full parameter matrices | `pytest tests/ --full` |
 | Run specific test | `pytest tests/path/test_file.py::test_function` |
 | Run multi-GPU test | `mpirun -np 4 pytest tests/comm/test_allreduce_unified_api.py` |
 | Run benchmark | `python benchmarks/flashinfer_benchmark.py --routine <name> <flags>` |
@@ -95,10 +96,16 @@ FlashInfer provides optional pre-compiled packages for users who want faster ini
 
 ## Testing
 
-Run all tests:
+Run the regular test suite:
 
 ```bash
 pytest tests/
+```
+
+Run full parameter matrices (used by nightly testing):
+
+```bash
+pytest tests/ --full
 ```
 
 Run specific test file:

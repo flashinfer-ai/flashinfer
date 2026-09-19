@@ -23,6 +23,10 @@ from tests.test_helpers.jit_utils import (
     gen_prefill_attention_modules,
 )
 from tests.test_helpers.utils_fp4 import create_nvfp4_kv, nvfp4_to_float
+from tests.test_helpers.parametrize import (
+    parametrize_product,
+    pairwise_product_cases,
+)
 from functools import partial
 import flashinfer
 from flashinfer.cutile.cutile_common import is_cuda_tile_available
@@ -229,19 +233,25 @@ def _run_batch_decode_with_paged_kv_cache_case(
     torch.testing.assert_close(o, o_buffer, rtol=1e-3, atol=1e-3)
 
 
-@pytest.mark.parametrize("batch_size", [12, 17, 128])
-@pytest.mark.parametrize("kv_len", [54, 97, 512, 2048, 16384])
-@pytest.mark.parametrize("page_size", [1, 8, 16])
-@pytest.mark.parametrize("num_kv_heads", [4])
-@pytest.mark.parametrize("num_qo_heads", [4, 32])
-@pytest.mark.parametrize("head_dim", [128, 256, 512])
-@pytest.mark.parametrize("kv_layout", ["NHD"])
-@pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA"])
-@pytest.mark.parametrize("logits_soft_cap", [0.0])
-@pytest.mark.parametrize("return_lse", [True])
-@pytest.mark.parametrize("q_dtype", [torch.float16])
-@pytest.mark.parametrize("kv_dtype", [torch.float16, torch.float8_e4m3fn])
-@pytest.mark.parametrize("contiguous_kv", [True])
+@parametrize_product(
+    "batch_size,kv_len,page_size,num_kv_heads,num_qo_heads,head_dim,kv_layout,pos_encoding_mode,logits_soft_cap,return_lse,q_dtype,kv_dtype,contiguous_kv",
+    (
+        [12, 17, 128],
+        [54, 97, 512, 2048, 16384],
+        [1, 8, 16],
+        [4],
+        [4, 32],
+        [128, 256, 512],
+        ["NHD"],
+        ["NONE", "ROPE_LLAMA"],
+        [0.0],
+        [True],
+        [torch.float16],
+        [torch.float16, torch.float8_e4m3fn],
+        [True],
+    ),
+    regular=pairwise_product_cases,
+)
 def test_batch_decode_with_paged_kv_cache(
     batch_size,
     kv_len,

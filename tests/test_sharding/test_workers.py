@@ -13,11 +13,19 @@ import pytest
 from scripts.test_sharding import workers as workers_module
 from scripts.test_sharding.models import Batch, Unit
 from scripts.test_sharding.progress import encode_pytest_event
+from scripts.unit_test_runner import _configure_jit_parallelism
 from scripts.test_sharding.workers import (
     BatchExecutionRequest,
     _BatchProgress,
+    _HostCpuTimes,
+    _ProcessCpuStat,
+    _ResourceSample,
     _forward_pytest_output,
+    _host_cpu_percentages,
+    _parse_process_cpu_stat,
     _pytest_environment,
+    _resource_csv,
+    _summarize_process_tree,
     _worker_master_port,
     execute_batch,
 )
@@ -217,6 +225,92 @@ def test_worker_master_port_defines_a_valid_block() -> None:
         _worker_master_port(-1)
     with pytest.raises(ValueError, match="no valid rendezvous port block"):
         _worker_master_port(360)
+
+
+def test_automatic_jit_parallelism_preserves_host_budget_for_prebuilds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MAX_JOBS", "163")
+    monkeypatch.setenv("FLASHINFER_AUTO_MAX_JOBS", "1")
+    monkeypatch.delenv("FLASHINFER_JIT_PREBUILD_MAX_JOBS", raising=False)
+
+    _configure_jit_parallelism(workers=4)
+
+    assert os.environ["MAX_JOBS"] == "120"
+    assert os.environ["FLASHINFER_JIT_PREBUILD_MAX_JOBS"] == "163"
+    assert "FLASHINFER_AUTO_MAX_JOBS" not in os.environ
+
+
+def test_host_cpu_percentages_separate_busy_from_iowait() -> None:
+    busy, iowait = _host_cpu_percentages(
+        _HostCpuTimes(total=100, idle=30, iowait=10),
+        _HostCpuTimes(total=200, idle=50, iowait=20),
+    )
+
+    assert busy == pytest.approx(70.0)
+    assert iowait == pytest.approx(10.0)
+    assert _host_cpu_percentages(None, None) == (None, None)
+
+
+def test_resource_csv_includes_host_and_process_tree_diagnostics() -> None:
+    output = _resource_csv(
+        (
+            _ResourceSample(
+                timestamp=123.0,
+                host_rss_mib=456.0,
+                gpu_memory_mib=789.0,
+                host_cpu_percent=80.0,
+                host_iowait_percent=2.5,
+                load1=10.0,
+                load5=8.0,
+                load15=6.0,
+                worker_cpu_seconds=12.0,
+                descendant_cpu_seconds=34.0,
+                descendant_process_count=5,
+                running_process_count=3,
+                disk_sleep_process_count=1,
+            ),
+        )
+    )
+
+    header, row = output.splitlines()
+    assert "host_cpu_percent" in header
+    assert "host_iowait_percent" in header
+    assert "descendant_cpu_seconds" in header
+    assert "disk_sleep_process_count" in header
+    assert (
+        row
+        == "123.000000,456.000,789.000,80.000,2.500,10.000,8.000,6.000,12.000,34.000,5,3,1"
+    )
+
+
+def test_process_cpu_stat_handles_parentheses_in_process_name() -> None:
+    # Fields after the process name begin at state (field 3). CPU counters are
+    # utime, stime, cutime and cstime (fields 14 through 17).
+    stat = "123 (compiler worker (sm90)) R " + " ".join(
+        ["0"] * 10 + ["100", "50", "25", "5"]
+    )
+
+    parsed = _parse_process_cpu_stat(stat, ticks_per_second=10)
+
+    assert parsed.state == "R"
+    assert parsed.own_cpu_seconds == 15
+    assert parsed.children_cpu_seconds == 3
+
+
+def test_process_tree_cpu_includes_reaped_and_live_descendants() -> None:
+    stats = {
+        10: _ProcessCpuStat("S", own_cpu_seconds=2, children_cpu_seconds=7),
+        11: _ProcessCpuStat("R", own_cpu_seconds=3, children_cpu_seconds=5),
+    }
+
+    summary = _summarize_process_tree(10, stats)
+
+    assert summary.worker_cpu_seconds == 2
+    assert summary.descendant_cpu_seconds == 15
+    assert summary.descendant_process_count == 1
+    assert summary.running_process_count == 1
+    assert _summarize_process_tree(99, stats).worker_cpu_seconds == 0
 
 
 def _install_fake_pytest(

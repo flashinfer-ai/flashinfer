@@ -93,6 +93,46 @@ _CONSOLE_LOCK = threading.Lock()
 _OUTPUT_DRAIN_SECONDS = 5.0
 
 
+@dataclass(frozen=True)
+class _HostCpuTimes:
+    total: int
+    idle: int
+    iowait: int
+
+
+@dataclass(frozen=True)
+class _ProcessTreeStats:
+    worker_cpu_seconds: float
+    descendant_cpu_seconds: float
+    descendant_process_count: int
+    running_process_count: int
+    disk_sleep_process_count: int
+
+
+@dataclass(frozen=True)
+class _ProcessCpuStat:
+    state: str
+    own_cpu_seconds: float
+    children_cpu_seconds: float
+
+
+@dataclass(frozen=True)
+class _ResourceSample:
+    timestamp: float
+    host_rss_mib: float
+    gpu_memory_mib: float
+    host_cpu_percent: float | None
+    host_iowait_percent: float | None
+    load1: float
+    load5: float
+    load15: float
+    worker_cpu_seconds: float
+    descendant_cpu_seconds: float
+    descendant_process_count: int
+    running_process_count: int
+    disk_sleep_process_count: int
+
+
 def write_console(message: str) -> None:
     with _CONSOLE_LOCK:
         print(message, flush=True)
@@ -175,15 +215,115 @@ def _gpu_mib(pids: set[int]) -> float:
     return total
 
 
-def _monitor_memory(
+def _read_host_cpu_times() -> _HostCpuTimes | None:
+    try:
+        fields = Path("/proc/stat").read_text(encoding="utf-8").splitlines()[0].split()
+        if not fields or fields[0] != "cpu":
+            return None
+        values = [int(value) for value in fields[1:]]
+    except (OSError, ValueError):
+        return None
+    if len(values) < 5:
+        return None
+    # Linux reports guest time again inside user/nice, so only the first eight
+    # non-guest counters belong in the total.
+    return _HostCpuTimes(total=sum(values[:8]), idle=values[3], iowait=values[4])
+
+
+def _host_cpu_percentages(
+    previous: _HostCpuTimes | None, current: _HostCpuTimes | None
+) -> tuple[float | None, float | None]:
+    if previous is None or current is None:
+        return None, None
+    total = current.total - previous.total
+    if total <= 0:
+        return None, None
+    idle = max(0, current.idle - previous.idle)
+    iowait = max(0, current.iowait - previous.iowait)
+    busy = max(0, total - idle - iowait)
+    return 100 * busy / total, 100 * iowait / total
+
+
+def _parse_process_cpu_stat(stat: str, ticks_per_second: float) -> _ProcessCpuStat:
+    fields = stat[stat.rfind(")") + 2 :].split()
+    return _ProcessCpuStat(
+        state=fields[0],
+        own_cpu_seconds=(int(fields[11]) + int(fields[12])) / ticks_per_second,
+        children_cpu_seconds=(int(fields[13]) + int(fields[14])) / ticks_per_second,
+    )
+
+
+def _process_tree_stats(root_pid: int, pids: set[int]) -> _ProcessTreeStats:
+    try:
+        ticks_per_second = float(os.sysconf("SC_CLK_TCK"))
+    except (OSError, ValueError):
+        ticks_per_second = 100.0
+    cpu_stats: dict[int, _ProcessCpuStat] = {}
+    for pid in pids:
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+            cpu_stat = _parse_process_cpu_stat(stat, ticks_per_second)
+            cpu_stats[pid] = cpu_stat
+        except (IndexError, OSError, ValueError):
+            continue
+    return _summarize_process_tree(root_pid, cpu_stats)
+
+
+def _summarize_process_tree(
+    root_pid: int, cpu_stats: dict[int, _ProcessCpuStat]
+) -> _ProcessTreeStats:
+    states = Counter(stats.state for stats in cpu_stats.values())
+    root_stats = cpu_stats.get(root_pid)
+    return _ProcessTreeStats(
+        worker_cpu_seconds=root_stats.own_cpu_seconds if root_stats else 0.0,
+        descendant_cpu_seconds=(root_stats.children_cpu_seconds if root_stats else 0.0)
+        + sum(
+            stats.own_cpu_seconds + stats.children_cpu_seconds
+            for pid, stats in cpu_stats.items()
+            if pid != root_pid
+        ),
+        descendant_process_count=max(0, len(cpu_stats) - int(root_pid in cpu_stats)),
+        running_process_count=states["R"],
+        disk_sleep_process_count=states["D"],
+    )
+
+
+def _monitor_resources(
     pid: int,
     stop: threading.Event,
-    samples: list[tuple[float, float, float]],
+    samples: list[_ResourceSample],
     interval: float,
 ) -> None:
+    previous_cpu = _read_host_cpu_times()
     while not stop.is_set():
         pids = _descendant_pids(pid)
-        samples.append((time.time(), _rss_mib(pids), _gpu_mib(pids)))
+        current_cpu = _read_host_cpu_times()
+        host_cpu_percent, host_iowait_percent = _host_cpu_percentages(
+            previous_cpu, current_cpu
+        )
+        previous_cpu = current_cpu
+        try:
+            load1, load5, load15 = os.getloadavg()
+        except OSError:
+            load1 = load5 = load15 = 0.0
+        process_stats = _process_tree_stats(pid, pids)
+        samples.append(
+            _ResourceSample(
+                timestamp=time.time(),
+                host_rss_mib=_rss_mib(pids),
+                gpu_memory_mib=_gpu_mib(pids),
+                host_cpu_percent=host_cpu_percent,
+                host_iowait_percent=host_iowait_percent,
+                load1=load1,
+                load5=load5,
+                load15=load15,
+                worker_cpu_seconds=process_stats.worker_cpu_seconds,
+                descendant_cpu_seconds=process_stats.descendant_cpu_seconds,
+                descendant_process_count=process_stats.descendant_process_count,
+                running_process_count=process_stats.running_process_count,
+                disk_sleep_process_count=process_stats.disk_sleep_process_count,
+            )
+        )
         stop.wait(interval)
 
 
@@ -292,6 +432,7 @@ class _BatchArtifacts:
     temporary_xml: Path
     temporary_results: Path
     temporary_telemetry: Path
+    collection_stacks: Path
     log: Path
 
     @property
@@ -317,7 +458,7 @@ class _ProcessOutcome:
     aborted: bool
     termination_signal: str
     output_error: str
-    samples: tuple[tuple[float, float, float], ...]
+    samples: tuple[_ResourceSample, ...]
     progress: _BatchProgress
 
 
@@ -332,6 +473,7 @@ def _batch_artifacts(request: BatchExecutionRequest) -> _BatchArtifacts:
         temporary_xml=_temporary(final_xml),
         temporary_results=_temporary(directory / f"{batch_id}.results.json"),
         temporary_telemetry=_temporary(directory / f"{batch_id}.telemetry.json"),
+        collection_stacks=directory / f"{batch_id}.collection-stacks.log",
         log=directory / f"{batch_id}.log",
     )
 
@@ -351,6 +493,7 @@ def _pytest_command(
         f"--flashinfer-node-file={artifacts.selection}",
         f"--flashinfer-result-json={artifacts.temporary_results}",
         f"--flashinfer-telemetry-json={artifacts.temporary_telemetry}",
+        f"--flashinfer-collection-stack-path={artifacts.collection_stacks}",
         f"--junitxml={artifacts.temporary_xml}",
         request.batch.source_file,
     ]
@@ -389,7 +532,7 @@ def _run_pytest(
 ) -> _ProcessOutcome:
     launched_at = time.time()
     environment = _pytest_environment(request)
-    samples: list[tuple[float, float, float]] = []
+    samples: list[_ResourceSample] = []
     stop_monitor = threading.Event()
     monitor: threading.Thread | None = None
     termination_signal = ""
@@ -436,7 +579,7 @@ def _run_pytest(
         output_thread.start()
         if request.monitor_memory:
             monitor = threading.Thread(
-                target=_monitor_memory,
+                target=_monitor_resources,
                 args=(process.pid, stop_monitor, samples, request.memory_interval),
                 daemon=True,
             )
@@ -506,13 +649,49 @@ def _run_pytest(
     )
 
 
-def _memory_csv(samples: tuple[tuple[float, float, float], ...]) -> str:
-    memory_stream = io.StringIO(newline="")
-    memory_writer = csv.writer(memory_stream, lineterminator="\n")
-    memory_writer.writerow(["timestamp", "host_rss_mib", "gpu_memory_mib"])
-    for timestamp, rss_mib, gpu_mib in samples:
-        memory_writer.writerow([f"{timestamp:.6f}", f"{rss_mib:.3f}", f"{gpu_mib:.3f}"])
-    return memory_stream.getvalue()
+def _resource_csv(samples: tuple[_ResourceSample, ...]) -> str:
+    resource_stream = io.StringIO(newline="")
+    resource_writer = csv.writer(resource_stream, lineterminator="\n")
+    resource_writer.writerow(
+        [
+            "timestamp",
+            "host_rss_mib",
+            "gpu_memory_mib",
+            "host_cpu_percent",
+            "host_iowait_percent",
+            "load1",
+            "load5",
+            "load15",
+            "worker_cpu_seconds",
+            "descendant_cpu_seconds",
+            "descendant_process_count",
+            "running_process_count",
+            "disk_sleep_process_count",
+        ]
+    )
+    for sample in samples:
+        resource_writer.writerow(
+            [
+                f"{sample.timestamp:.6f}",
+                f"{sample.host_rss_mib:.3f}",
+                f"{sample.gpu_memory_mib:.3f}",
+                ""
+                if sample.host_cpu_percent is None
+                else f"{sample.host_cpu_percent:.3f}",
+                ""
+                if sample.host_iowait_percent is None
+                else f"{sample.host_iowait_percent:.3f}",
+                f"{sample.load1:.3f}",
+                f"{sample.load5:.3f}",
+                f"{sample.load15:.3f}",
+                f"{sample.worker_cpu_seconds:.3f}",
+                f"{sample.descendant_cpu_seconds:.3f}",
+                sample.descendant_process_count,
+                sample.running_process_count,
+                sample.disk_sleep_process_count,
+            ]
+        )
+    return resource_stream.getvalue()
 
 
 def _timeout_result(
@@ -578,7 +757,7 @@ def _promote_batch_artifacts(
         )
     atomic_write_text(
         artifacts.final_xml.with_name(f"{batch.id}.memory.csv"),
-        _memory_csv(outcome.samples),
+        _resource_csv(outcome.samples),
     )
     atomic_write_json(
         artifacts.final_xml.with_name(f"{batch.id}.meta.json"),
@@ -599,6 +778,7 @@ def _promote_batch_artifacts(
 
 def execute_batch(request: BatchExecutionRequest) -> BatchExecution:
     artifacts = _batch_artifacts(request)
+    artifacts.collection_stacks.unlink(missing_ok=True)
     atomic_write_json(artifacts.selection, list(request.batch.nodeids))
     outcome = _run_pytest(request, artifacts, _pytest_command(request, artifacts))
     if outcome.output_error:
