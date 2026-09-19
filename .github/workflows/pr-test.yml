@@ -469,6 +469,7 @@ jobs:
             junit/**/*.telemetry.json
             junit/**/*.meta.json
             junit/**/*.memory.csv
+            junit/**/*.collection-stacks.log
           if-no-files-found: warn
           retention-days: 30
 

@@ -7,9 +7,11 @@ command line.
 
 from __future__ import annotations
 
+import faulthandler
 import json
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -33,6 +35,44 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     group.addoption("--flashinfer-node-file", metavar="PATH")
     group.addoption("--flashinfer-result-json", metavar="PATH")
     group.addoption("--flashinfer-telemetry-json", metavar="PATH")
+    group.addoption("--flashinfer-collection-stack-path", metavar="PATH")
+    group.addoption(
+        "--flashinfer-collection-stack-seconds",
+        type=float,
+        default=120.0,
+        help="dump Python stacks at this interval while collection is still running",
+    )
+
+
+def _dump_collection_stacks(
+    stop: threading.Event,
+    interval: float,
+    session_start: float,
+    stack_path: Path,
+) -> None:
+    while not stop.wait(interval):
+        elapsed = time.time() - session_start
+        try:
+            with stack_path.open("a", encoding="utf-8") as stream:
+                stream.write(
+                    "\nFLASHINFER COLLECTION STACK DUMP "
+                    f"elapsed={elapsed:.1f}s interval={interval:g}s\n"
+                )
+                stream.flush()
+                faulthandler.dump_traceback(file=stream, all_threads=True)
+                stream.flush()
+        except OSError as error:
+            sys.__stderr__.write(
+                f"FLASHINFER COLLECTION STACK DUMP FAILED: {type(error).__name__}: {error}\n"
+            )
+            sys.__stderr__.flush()
+
+
+def _stop_collection_stack_monitor(config: pytest.Config) -> None:
+    state = config._flashinfer_sharding  # type: ignore[attr-defined]
+    stop = state.get("collection_stack_stop")
+    if stop is not None:
+        stop.set()
 
 
 def pytest_configure(config: pytest.Config) -> None:
@@ -48,13 +88,28 @@ def pytest_configure(config: pytest.Config) -> None:
         "markers",
         "long_running: dispatch every unit from this source before normal work",
     )
-    config._flashinfer_sharding = {  # type: ignore[attr-defined]
-        "session_start": time.time(),
+    session_start = time.time()
+    state = {
+        "session_start": session_start,
         "collection_complete": None,
         "first_case_start": None,
         "report_complete": None,
         "nodes": {},
+        "collection_stack_stop": None,
     }
+    config._flashinfer_sharding = state  # type: ignore[attr-defined]
+    stack_path_value = config.getoption("--flashinfer-collection-stack-path")
+    stack_path = Path(stack_path_value) if stack_path_value else None
+    stack_interval = config.getoption("--flashinfer-collection-stack-seconds")
+    if stack_path and stack_interval > 0:
+        stop = threading.Event()
+        state["collection_stack_stop"] = stop
+        threading.Thread(
+            target=_dump_collection_stacks,
+            args=(stop, stack_interval, session_start, stack_path),
+            name="flashinfer-collection-stack-monitor",
+            daemon=True,
+        ).start()
 
 
 def _marker_name(item: pytest.Item) -> str | None:
@@ -139,6 +194,7 @@ def pytest_collection_modifyitems(
 def pytest_collection_finish(session: pytest.Session) -> None:
     state = session.config._flashinfer_sharding  # type: ignore[attr-defined]
     state["collection_complete"] = time.time()
+    _stop_collection_stack_monitor(session.config)
 
 
 def pytest_runtest_logstart(nodeid: str, location: tuple[str, int | None, str]) -> None:
@@ -229,6 +285,7 @@ def _final_outcome(record: dict[str, Any]) -> str:
 def pytest_sessionfinish(
     session: pytest.Session, exitstatus: int | pytest.ExitCode
 ) -> None:
+    _stop_collection_stack_monitor(session.config)
     now = time.time()
     state = session.config._flashinfer_sharding  # type: ignore[attr-defined]
     state["report_complete"] = now

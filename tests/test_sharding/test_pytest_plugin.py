@@ -166,3 +166,24 @@ def test_plugin_emits_detailed_failure_event_as_soon_as_report_is_available(
     assert failure["nodeid"].endswith("test_failure.py::test_failure")
     assert failure["phase"] == "call"
     assert "specific failure detail" in failure["diagnostic"]
+
+
+def test_plugin_dumps_stacks_when_collection_is_slow(tmp_path: Path) -> None:
+    test_file = tmp_path / "test_slow_collection.py"
+    test_file.write_text(
+        "import time\ntime.sleep(0.2)\n\ndef test_case():\n    pass\n",
+        encoding="utf-8",
+    )
+    stack_path = tmp_path / "collection-stacks.log"
+
+    result = _pytest(
+        tmp_path,
+        f"--flashinfer-collection-stack-path={stack_path}",
+        "--flashinfer-collection-stack-seconds=0.05",
+        str(test_file),
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    stack_output = stack_path.read_text(encoding="utf-8")
+    assert "FLASHINFER COLLECTION STACK DUMP" in stack_output
+    assert "Current thread" in stack_output
