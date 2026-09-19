@@ -272,7 +272,7 @@ users have migrated, which is exactly the cost the separate entry point was mean
 
 ### 4.3 Version policy
 
-Under the right-shifted scheme in `CLAUDE.md`, **removing** `autotune(cache=<path>)` /
+Under the right-shifted scheme in `AGENTS.md`, **removing** `autotune(cache=<path>)` /
 `save_configs` / `load_configs` is an incompatible API change and requires a **major** bump — as
 does eventually dropping the `autotune_v2` alias. So:
 
