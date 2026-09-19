@@ -1225,3 +1225,52 @@ if __name__ == "__main__":
     # test_top_k_mask_logits(99, 989, 10)
     # test_chain_speculative_sampling(3, 111, 3, False)
     # test_chain_speculative_sampling(3, 111, 3, True)
+
+
+@pytest.mark.parametrize("api", ["top_k", "min_p"])
+def test_per_request_param_indexed_by_row(api):
+    # Regression: a per-request threshold tensor must be indexed by the probs row that
+    # `indices` selects, not by the output position. Three rows, each with argmax class 0.
+    probs = torch.tensor(
+        [
+            [0.70, 0.20, 0.07, 0.03],
+            [0.40, 0.30, 0.20, 0.10],
+            [0.60, 0.30, 0.07, 0.03],
+        ],
+        device="cuda:0",
+    )
+    all_classes = [0, 1, 2, 3]
+    only_argmax = {"top_k": 1, "min_p": 0.9}[api]
+    keep_all = {"top_k": 4, "min_p": 0.01}[api]
+
+    def drawn(values, indices, n=600):
+        # Accumulate on the GPU and sync once. 600 launches give P(missing a p>=0.03 class)
+        # = 0.97**600 ~ 1e-8 per output, so the exact-set assertions do not flake.
+        threshold = torch.tensor(values, device="cuda:0")
+        indices = torch.tensor(indices, dtype=torch.int32, device="cuda:0")
+        num_out = indices.numel()
+        rows = torch.arange(num_out, device="cuda:0")
+        seen = torch.zeros(num_out, probs.size(1), dtype=torch.bool, device="cuda:0")
+        for seed in range(n):
+            if api == "top_k":
+                out = flashinfer.sampling.top_k_sampling_from_probs(
+                    probs, threshold, indices=indices, seed=seed, offset=0
+                )
+            else:
+                out = flashinfer.sampling.min_p_sampling_from_probs(
+                    probs, threshold, indices=indices, seed=seed, offset=0
+                )
+            seen[rows, out.long()] = True
+        return [
+            sorted(torch.nonzero(seen[i]).flatten().tolist()) for i in range(num_out)
+        ]
+
+    # All outputs read row 2 (keep-all threshold) -> every position shows all classes.
+    assert drawn([only_argmax, only_argmax, keep_all], [2, 2, 2]) == [all_classes] * 3
+    # All outputs read row 0 (argmax-only threshold) -> every position shows only class 0.
+    assert drawn([only_argmax, keep_all, keep_all], [0, 0, 0]) == [[0]] * 3
+    # len(indices) > number of rows: still indexed by row, no out-of-bounds read.
+    assert (
+        drawn([only_argmax, only_argmax, keep_all], [2, 2, 2, 2, 2])
+        == [all_classes] * 5
+    )
