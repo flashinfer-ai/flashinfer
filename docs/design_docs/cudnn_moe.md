@@ -158,3 +158,25 @@ physical capacity for the runtime guard. Ragged MXFP8/FP4 use therefore requires
 that frontend fix as well as this FlashInfer adapter. A globally quantized SFA
 blob is only layout-compatible when the group boundaries satisfy its packing;
 changing offsets alone is not a valid quantized autotune input generator.
+
+### Additional cached-decode integration validation
+
+On a 148-SM, 1000 W B200, a further integration refinement reduced complete
+BF16 MoE latency from 29.756 us to 29.003 us (2.53%) for a single-token
+Qwen3-30B-A3B layer-0 cached-decode fixture (E=128, top-k=8, H=2048, I=768)
+with unpacked routing inputs. The unchanged packed-input control measured
+28.732 us and 28.728 us. Values average four trial medians across two fresh
+processes per implementation in forward and reverse order; both updated
+unpacked processes were faster than both previous processes.
+
+This is an integration benefit using the existing NVIDIA TensorRT-LLM/FlashInfer
+native finalizer, whose authors retain implementation credit. It is measured
+against the previous Frost integration with fixed GEMM configurations. It
+excludes weight preparation, router-logit/top-k computation, attention and
+model execution, and must not be added to results with different baselines.
+The measured source passed direct-reference, live-input/weight, retained-graph,
+actual-route, memcheck and racecheck gates, with an independent audit of
+296 raw checks, 120 changed-reference controls and 768 timing spans. Publication
+preserves the validated executable path; CPU dispatch checks also cover excluded
+shapes and routing precision. This is not a new full-GPU run of the publication
+checkout or a model-level speedup claim.

@@ -475,7 +475,7 @@ class CudnnMoeRunner(MoERunner):
     backend_key = "cudnn"
     _backend_config_type: type = CudnnMoeConfig
     # Joint stage tactics and explicit fusion routes change cache identities.
-    _cache_version = "cudnn-bf16-v10-native-packed-decode-finalizer"
+    _cache_version = "cudnn-bf16-v11-native-decode-finalizer"
     _activation_dtype = torch.bfloat16
     supported_routing_modes = (
         RoutingInputMode.PackedPrecomputed,
@@ -920,7 +920,6 @@ class CudnnMoeRunner(MoERunner):
             # Keep the native scalar kernel's dependency wait before metadata reads.
             enable_pdl=(
                 self._native_finalize_pdl
-                and inputs[8]
                 and x.shape[0] == 1
                 and output.shape[1] == 2048
                 and r == 8
