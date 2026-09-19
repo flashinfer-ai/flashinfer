@@ -61,15 +61,12 @@ minimax_h3_mxfp8_pre_attention_p8_hdst7_d128.json
 mla_paged_decode_h16_ckv512_kpe64_ps1.json
 mla_paged_decode_h16_ckv512_kpe64_ps64.json
 attention_ts_decode_tuple_multi_q_sq4_h32_kv4_d128_ps32.json
-prims_ts_batch_decode_tuple_multi_q_sq4_h32_kv4_d128_ps32_s2048.json
 prims_ts_decode_wrapper_tuple_multi_q_causal_sq4_maxq4_maxk2048_wl-1_pf0_um0_h32_kv4_d128_ps32.json
 prims_ts_decode_wrapper_tuple_multi_q_causal_plan_seq_lens_sq4_maxq4_maxk2048_wl-1_pf1_um1_h32_kv4_d128_ps32.json
 attention_ts_decode_tuple_encoded_page4_multi_q_sq4_h32_kv4_d128_sps4_ps32.json
-prims_ts_batch_decode_tuple_encoded_page4_multi_q_sq4_h32_kv4_d128_sps4_s2048_ps32.json
 prims_ts_decode_wrapper_tuple_encoded_page4_multi_q_causal_sq4_maxq4_maxk2048_wl-1_pf0_um0_h32_kv4_d128_sps4_ps32.json
 prims_ts_decode_wrapper_tuple_encoded_page4_multi_q_causal_plan_seq_lens_sq4_maxq4_maxk2048_wl-1_pf1_um1_h32_kv4_d128_sps4_ps32.json
 prims_ts_decode_mla_one_shot_h128_d_qk576_ckv512_kpe64_ps32_sq4.json
-prims_ts_batch_decode_mla_h128_d_qk576_ckv512_kpe64_ps32_s2048_sq4.json
 prims_ts_decode_mla_wrapper_causal_maxq4_maxk2048_h128_d_qk576_ckv512_kpe64_ps32_sq4.json
 mm_bf16_fp4_cudnn_N2048_K7168_block_size16.json
 mm_bf16_fp4_cute_dsl_N2048_K7168_block_size16.json
@@ -2135,7 +2132,6 @@ for _pts_semantic_PS in (32, 4):
             BatchDecodePagedTSWrapper as _PrimTSDecodeWrapper,
             batch_decode_with_paged_kv_cache as _attention_ts_decode,
             get_prims_ts_batch_decode_workspace_size as _prims_ts_fmha_ws_size,
-            prims_ts_batch_decode_with_kv_cache as _prims_ts_fmha_decode,
         )
 
         _pts_B, _pts_SQ, _pts_SK = 4, 4, 2048
@@ -2195,13 +2191,13 @@ for _pts_semantic_PS in (32, 4):
         _pts_workspace = torch.zeros(
             _pts_workspace_size, dtype=torch.int8, device=device
         )
-        _prims_ts_fmha_decode(
+        _attention_ts_decode(
             _pts_q,
             _pts_cache,
-            _pts_workspace,
             _pts_block_tables,
             _pts_seq_lens,
-            _pts_SK,
+            workspace_buffer=_pts_workspace,
+            max_kv_len=_pts_SK,
             seq_len_q=_pts_SQ,
             mask_type="causal",
             kv_layout="HND",
@@ -2240,7 +2236,6 @@ with contextlib.suppress(Exception):
         BatchMLADecodePagedTSWrapper as _PrimTSMLADecodeWrapper,
         batch_mla_decode_with_paged_kv_cache as _attention_ts_mla_decode,
         get_prims_ts_batch_mla_decode_workspace_size as _prims_ts_mla_ws_size,
-        prims_ts_batch_mla_decode_with_kv_cache as _prims_ts_mla_decode,
     )
 
     _pmla_B, _pmla_SQ, _pmla_SK, _pmla_PS = 4, 4, 2048, 32
@@ -2294,15 +2289,15 @@ with contextlib.suppress(Exception):
         device=_pmla_q.device,
     )
     _pmla_workspace = torch.empty(_pmla_workspace_size, dtype=torch.int8, device=device)
-    _prims_ts_mla_decode(
+    _attention_ts_mla_decode(
         _pmla_q,
         _pmla_cache,
-        _pmla_workspace,
-        _pmla_CKV,
-        _pmla_KPE,
         _pmla_block_tables,
         _pmla_seq_lens,
-        _pmla_SK,
+        workspace_buffer=_pmla_workspace,
+        max_kv_len=_pmla_SK,
+        kv_lora_rank=_pmla_CKV,
+        qk_rope_head_dim=_pmla_KPE,
         max_seq_len_q=_pmla_SQ,
         mask_type="causal",
     )

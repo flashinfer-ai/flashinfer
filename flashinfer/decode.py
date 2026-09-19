@@ -158,7 +158,6 @@ _PRIMS_TS_LAZY_EXPORTS = (
             "get_prims_ts_batch_decode_workspace_size",
             "make_q_token_kv_block_sparse_qo_indptr",
             "prepare_prims_ts_batch_decode_with_kv_cache",
-            "prims_ts_batch_decode_with_kv_cache",
             "suggest_q_token_kv_block_sparse_group_size",
             "validate_q_token_kv_block_sparse_group_size",
         }
