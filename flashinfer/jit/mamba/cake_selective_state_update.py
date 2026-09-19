@@ -457,19 +457,6 @@ def try_cake_selective_state_update(
             intermediate_state_indices=intermediate_state_indices,
         )
     )
-    if os.environ.get("FLASHINFER_MUSA_DEBUG_MTP"):
-        print(
-            "[flashinfer-musa] cake layout",
-            {"x": tuple(x.shape), "dt": tuple(dt.shape), "B": tuple(B.shape),
-             "state": tuple(state.shape), "C": tuple(C.shape),
-             "dt_bias": dt_bias is not None,
-             "state_idx": None if state_batch_indices is None else (tuple(state_batch_indices.shape), str(state_batch_indices.dtype)),
-             "dst_idx": None if dst_state_batch_indices is None else (tuple(dst_state_batch_indices.shape), str(dst_state_batch_indices.dtype)),
-             "intermediate": None if intermediate_states_buffer is None else tuple(intermediate_states_buffer.shape),
-             "intermediate_idx": None if intermediate_state_indices is None else (tuple(intermediate_state_indices.shape), str(intermediate_state_indices.dtype)),
-             "raw": raw_sglang_layout},
-            flush=True,
-        )
     legacy_types = (
         state_batch_indices is not None
         and state_batch_indices.dtype == torch.int64
