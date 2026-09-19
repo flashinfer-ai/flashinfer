@@ -1455,13 +1455,11 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
         from .knob_cache import resolve_knobs as _resolve_cached_knobs
         from .tuner import GEOMETRY_KNOBS, default_knobs
 
-        geometry = default_knobs(
-            num_max_tokens, fp8_scale_mode=fp8_scale_mode, generate_c=generate_c
-        )
+        geometry = default_knobs(num_max_tokens, fp8_scale_mode=fp8_scale_mode)
         if isinstance(knobs, dict):
             resolved = dict(knobs)
         else:
-            resolved, source = _resolve_cached_knobs(
+            resolved, _ = _resolve_cached_knobs(
                 dtype=kind,
                 fp8_scale_mode=fp8_scale_mode,
                 world_size=world_size,
@@ -1471,9 +1469,6 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
                 topk=num_topk,
                 max_tokens=num_max_tokens,
             )
-            if source == "heuristic":
-                # Same table row, with the generate_c overrides applied.
-                resolved = dict(geometry)
         # The table row's scheduler companions (group_hint / tail_split_pairs)
         # were tuned together with its geometry: keep them only while the
         # geometry stays on the table row; a cache / dict entry that moves the

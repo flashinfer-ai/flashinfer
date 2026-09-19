@@ -196,19 +196,6 @@ HEURISTIC_CONFIGS = {
 }
 
 
-# generate_c (training forward) overrides.  The swap-AB M128N128 ping-pong
-# kernel spills once the raw fc1_c store is added, so per_tensor 16384 keeps
-# the previous entry there (2026-09-18: 13.4 ms vs 14.3 ms with the table
-# entry; inference stays on the table entry, 12.0 ms vs 13.1 ms).
-HEURISTIC_GENERATE_C_OVERRIDES = {
-    "per_tensor": {
-        16384: _config(swap_ab=False, pingpong=False, tile=(64, 256, 128), cga=(2, 1, 1),
-                       token_back="reuse_dispatch_warps"),
-    },
-    "blockwise": {},
-}
-
-
 def token_bucket(tokens_per_rank: int) -> int:
     """Map a positive token count to the next measured power-of-two bucket."""
     if tokens_per_rank <= 0:
@@ -245,7 +232,7 @@ def _apply_tail_split_env_override(config: HopperFp8Config) -> HopperFp8Config:
 
 
 def select_heuristic_config(
-    scale_mode: str, tokens_per_rank: int, *, generate_c: bool = False
+    scale_mode: str, tokens_per_rank: int
 ) -> HopperFp8ConfigSelection:
     normalized_scale_mode = scale_mode.replace("-", "_")
     try:
@@ -253,11 +240,8 @@ def select_heuristic_config(
     except KeyError as error:
         raise ValueError(f"Unsupported FP8 scale mode: {scale_mode!r}") from error
     bucket = token_bucket(tokens_per_rank)
-    config = configs[bucket]
-    if generate_c:
-        config = HEURISTIC_GENERATE_C_OVERRIDES[normalized_scale_mode].get(bucket, config)
     return HopperFp8ConfigSelection(
-        config=_apply_tail_split_env_override(config),
+        config=_apply_tail_split_env_override(configs[bucket]),
         source="heuristic",
         token_bucket=bucket,
     )
@@ -272,7 +256,6 @@ def resolve_hopper_fp8_config(
     mma_tiler_mnk: Optional[Tuple[int, int, int]] = None,
     cluster_shape_mnk: Optional[Tuple[int, int, int]] = None,
     accum_mode: Optional[str] = None,
-    generate_c: bool = False,
 ) -> HopperFp8ConfigSelection:
     """Select the heuristic unless geometry or scheduling was set manually."""
     manual = any(
@@ -281,9 +264,7 @@ def resolve_hopper_fp8_config(
     )
     resolved_accum_mode = accum_mode or DEFAULT_ACCUM_MODE
     if not manual:
-        selection = select_heuristic_config(
-            scale_mode, tokens_per_rank, generate_c=generate_c
-        )
+        selection = select_heuristic_config(scale_mode, tokens_per_rank)
         if resolved_accum_mode == selection.config.accum_mode:
             return selection
         return HopperFp8ConfigSelection(
@@ -316,7 +297,6 @@ def resolve_hopper_fp8_config(
 
 __all__ = [
     "HEURISTIC_CONFIGS",
-    "HEURISTIC_GENERATE_C_OVERRIDES",
     "HopperFp8Config",
     "HopperFp8ConfigSelection",
     "TAIL_SPLIT_ENV",

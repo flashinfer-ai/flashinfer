@@ -8,7 +8,6 @@ from unittest.mock import patch
 from moe_hopper_fp8.heuristic_config import (
     ALL_EXPERTS_GROUP,
     HEURISTIC_CONFIGS,
-    HEURISTIC_GENERATE_C_OVERRIDES,
     TAIL_SPLIT_ENV,
     TOKEN_BUCKETS,
     resolve_hopper_fp8_config,
@@ -152,38 +151,6 @@ class HopperFp8HeuristicConfigTest(unittest.TestCase):
                     self.assertEqual(config.tail_split_pairs, tail_split)
                     if tail_split:
                         self.assertTrue(config.tail_split_geometry)
-
-    def test_generate_c_override_only_where_measured(self) -> None:
-        # Training forward: only per_tensor 16384 swaps to its previous entry.
-        for scale_mode in SCALE_MODES:
-            overrides = HEURISTIC_GENERATE_C_OVERRIDES[scale_mode]
-            for bucket in TOKEN_BUCKETS:
-                table_config = HEURISTIC_CONFIGS[scale_mode][bucket]
-                with self.subTest(scale_mode=scale_mode, bucket=bucket):
-                    inference = select_heuristic_config(scale_mode, bucket)
-                    training = select_heuristic_config(
-                        scale_mode, bucket, generate_c=True
-                    )
-                    self.assertEqual(inference.config, table_config)
-                    self.assertEqual(
-                        training.config, overrides.get(bucket, table_config)
-                    )
-                    self.assertEqual(training.source, "heuristic")
-        self.assertEqual(set(HEURISTIC_GENERATE_C_OVERRIDES["per_tensor"]), {16384})
-        self.assertEqual(HEURISTIC_GENERATE_C_OVERRIDES["blockwise"], {})
-        override = select_heuristic_config("per_tensor", 16384, generate_c=True).config
-        self.assertFalse(override.swap_ab)
-        self.assertEqual(override.mma_tiler_mnk, (64, 256, 128))
-        self.assertEqual(override.cluster_shape_mnk, (2, 1, 1))
-        self.assertEqual(override.token_back_mode, "reuse_dispatch_warps")
-        self.assertFalse(override.tail_split_pairs)
-        resolved = resolve_hopper_fp8_config("per_tensor", 16384, generate_c=True)
-        self.assertEqual(resolved.config, override)
-        manual = resolve_hopper_fp8_config(
-            "per_tensor", 16384, swap_ab=True, cluster_shape_mnk=(1, 2, 1),
-            generate_c=True,
-        )
-        self.assertEqual(manual.source, "manual")
 
     def test_tail_split_env_off_returns_table_entry(self) -> None:
         with patch.dict(os.environ, {TAIL_SPLIT_ENV: "0"}):

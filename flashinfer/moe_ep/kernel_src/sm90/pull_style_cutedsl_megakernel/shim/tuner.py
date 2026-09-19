@@ -92,10 +92,7 @@ GEOMETRY_KNOBS = (
 
 
 def default_knobs(
-    num_tokens: int,
-    *,
-    fp8_scale_mode: str = "per_tensor",
-    generate_c: bool = False,
+    num_tokens: int, *, fp8_scale_mode: str = "per_tensor"
 ) -> Dict[str, Any]:
     """Default geometry knobs for a compile-time token count (buffer size).
 
@@ -106,15 +103,12 @@ def default_knobs(
     table also carries the per-bucket ``token_back_mode``, ``group_hint``
     and ``tail_split_pairs``; perf knobs it does not cover (``flag_batch`` /
     ``epi_flag_batch``) are left unset -- the config defaults apply.
-    ``generate_c`` selects the table's training-forward overrides.
 
     Returns a fresh dict each call.
     """
     from moe_hopper_fp8.heuristic_config import select_heuristic_config
 
-    sel = select_heuristic_config(
-        fp8_scale_mode, max(int(num_tokens), 1), generate_c=generate_c
-    )
+    sel = select_heuristic_config(fp8_scale_mode, max(int(num_tokens), 1))
     c = sel.config
     return {
         "swap_ab": c.swap_ab,

@@ -34,6 +34,7 @@ from moe_hopper_fp8.epilogue_fp8_common import (
     clamp_and_swiglu_sm90,
     consume_initial_pingpong_work,
     consume_next_pingpong_work,
+    pack_f32x2_to_bf16x2,
     stg_128b_bf16x8,
     stg_fc1_block_scale_row,
     tma_store_fc1_output,
@@ -419,6 +420,7 @@ class SwapABFp8GluEpilogue:
         output_rcp: Float32,
         real_topk_scores: cute.Tensor,
         token_tile_base,
+        c_ctx,
     ) -> None:
         thread_in_warp = tidx % WarpThreadCount
         lane_group = thread_in_warp // 4
@@ -443,6 +445,11 @@ class SwapABFp8GluEpilogue:
             )
             r_up[dst + 1] = (
                 accumulators[src + 3] * fc1_act_weight_dequant_scale
+            )
+        if cutlass.const_expr(self._generate_c):
+            self._store_fc1_c_group_swapab(
+                r_gate, r_up, c_ctx[0], c_ctx[1], c_ctx[2], token0, lane_group,
+                c_ctx[3], c_ctx[4],
             )
 
         r_swiglu = cute.make_rmem_tensor(group_layout.shape, self.acc_dtype)
@@ -509,16 +516,11 @@ class SwapABFp8GluEpilogue:
         token_tile_base = work_tile_info.tile_n_idx * cutlass.Int32(
             self._token_tile_n
         )
+        c_ctx = None
         if cutlass.const_expr(self._generate_c):
-            self._store_fc1_c_swapab(
-                work_tile_info=work_tile_info,
-                accumulators=accumulators,
-                n_half=n_half,
-                gmem_fc1_c=gmem_fc1_c,
-                token_tile_base=token_tile_base,
-                local_warp_idx=local_warp_idx,
-                tidx=tidx,
-                c_scale=fc1_act_weight_dequant_scale,
+            c_ctx = self._fc1_c_context_swapab(
+                work_tile_info, n_half, gmem_fc1_c, token_tile_base,
+                local_warp_idx, tidx,
             )
 
         for token_group in cutlass.range_constexpr(self._token_group_count):
@@ -532,6 +534,7 @@ class SwapABFp8GluEpilogue:
                 output_rcp=output_rcp,
                 real_topk_scores=real_topk_scores,
                 token_tile_base=token_tile_base,
+                c_ctx=c_ctx,
             )
         if _iket_active:
             iket.range_pop()  # swapab_fc1_epi_m{token_tile_n}n64_pt
@@ -542,6 +545,8 @@ class SwapABFp8GluEpilogue:
         chunk_idx: cutlass.Constexpr,
         accumulators: cute.Tensor,
         r_swiglu: cute.Tensor,
+        tidx,
+        c_ctx,
     ) -> None:
         groups_per_chunk = self._blockwise_fc1_groups_per_chunk
         folded_values_per_chunk_m64 = 2 * groups_per_chunk
@@ -565,6 +570,16 @@ class SwapABFp8GluEpilogue:
                 r_gate[dst + 1] = accumulators[src + 1]
                 r_up[dst + 0] = accumulators[src + 2]
                 r_up[dst + 1] = accumulators[src + 3]
+            if cutlass.const_expr(self._generate_c):
+                thread_in_warp = tidx % WarpThreadCount
+                token0 = (
+                    cutlass.Int32(token_group * 8)
+                    + (thread_in_warp % 4) * cutlass.Int32(2)
+                )
+                self._store_fc1_c_group_swapab(
+                    r_gate, r_up, c_ctx[0], c_ctx[1], c_ctx[2], token0,
+                    thread_in_warp // 4, c_ctx[3], c_ctx[4],
+                )
             group_swiglu_view = cute.make_tensor(
                 r_swiglu.iterator + pair_base, group_swiglu_layout
             )
@@ -577,64 +592,63 @@ class SwapABFp8GluEpilogue:
             )
 
     @cute.jit
-    def _store_fc1_c_swapab(
+    def _store_fc1_c_group_swapab(
+        self,
+        r_gate: cute.Tensor,
+        r_up: cute.Tensor,
+        g_c: cute.Tensor,
+        c_row_base,
+        c_col,
+        token0,
+        lane_group,
+        c_valid_tokens,
+        c_valid_gateup_n,
+    ) -> None:
+        """Store one token group of pre-SwiGLU gate/up values as BF16 (generate_c).
+
+        Fused into the SwiGLU pass so the accumulators are read once and die
+        group by group instead of staying live across a separate C pass.
+        """
+        r_pack = cute.make_rmem_tensor(8, cutlass.BFloat16)
+        w_u32 = cute.recast_tensor(r_pack, cutlass.Uint32)
+        for v in cutlass.range_constexpr(4):
+            w_u32[v] = pack_f32x2_to_bf16x2(r_gate[v], r_up[v])
+        o0, o1, o2, o3 = transpose_token_group_bf16x8(r_pack, lane_group)
+        token = token0 + ((lane_group >> cutlass.Int32(1)) & cutlass.Int32(1))
+        if token < c_valid_tokens and c_col < c_valid_gateup_n:
+            stg_128b_bf16x8(g_c, o0, o1, o2, o3, c_row_base + token, c_col)
+
+    @cute.jit
+    def _fc1_c_context_swapab(
         self,
         work_tile_info,
-        accumulators: cute.Tensor,
         n_half: cutlass.Constexpr,
         gmem_fc1_c: cute.Tensor,
         token_tile_base,
         local_warp_idx: int,
         tidx,
-        c_scale: Float32,
-    ) -> None:
-        """Store pre-clamp, pre-SwiGLU, unweighted FC1 output as BF16.
-
-        Preserve the kernel's gate/up-interleaved column order.
-        c_scale is the per-tensor dequantization factor, or 1.0 for blockwise.
-        """
-        thread_in_warp = tidx % WarpThreadCount
-        lane_group = thread_in_warp // 4
-        lane_mod = thread_in_warp % 4
-        valid_tokens = work_tile_info.valid_tokens_in_cta_tile
-        valid_gateup_n = cutlass.Int32(gmem_fc1_c.shape[1])
+    ):
+        """Per-task constants of the generate_c store: pool slice, row base,
+        this lane's 8-column block (kernel gate/up-interleaved order), bounds."""
+        lane_group = (tidx % WarpThreadCount) // 4
         g_c = cute.slice_(gmem_fc1_c, (None, None, 0))
-        row_base = work_tile_info.cumulative_data_physical_row + token_tile_base
-        c_col_base = (
-            work_tile_info.tile_m_idx * cutlass.Int32(self._wgmma_fragment_count)
-            + cutlass.Int32(n_half)
-        ) * cutlass.Int32(128)
-        lane_group_bit2 = (lane_group >> cutlass.Int32(2)) & cutlass.Int32(1)
-        lane_group_bit1 = (lane_group >> cutlass.Int32(1)) & cutlass.Int32(1)
-        lane_group_bit0 = lane_group & cutlass.Int32(1)
-        # Lane-group bits select the M64 fragment, token row, and gate/up block.
-        col = (
-            c_col_base
-            + lane_group_bit2 * cutlass.Int32(64)
+        c_row_base = work_tile_info.cumulative_data_physical_row + token_tile_base
+        c_col = (
+            (
+                work_tile_info.tile_m_idx * cutlass.Int32(self._wgmma_fragment_count)
+                + cutlass.Int32(n_half)
+            ) * cutlass.Int32(128)
+            + ((lane_group >> cutlass.Int32(2)) & cutlass.Int32(1)) * cutlass.Int32(64)
             + cutlass.Int32(local_warp_idx * 16)
-            + lane_group_bit0 * cutlass.Int32(8)
+            + (lane_group & cutlass.Int32(1)) * cutlass.Int32(8)
         )
-        for token_group in cutlass.range_constexpr(self._token_group_count):
-            token0 = cutlass.Int32(token_group * 8) + lane_mod * cutlass.Int32(2)
-            # r_pack[2k + b]: value k = m_sub*2 + t, b = 0 gate / 1 up (acc regs
-            # src+0/1 gate token0/1, src+2/3 up token0/1).
-            r_fp32 = cute.make_rmem_tensor(8, self.acc_dtype)
-            for m_sub in cutlass.range_constexpr(2):
-                accum_base = m_sub * self._accum_regs_per_m64 + token_group * 4
-                for token_sel in cutlass.range_constexpr(2):
-                    value_idx = 2 * m_sub + token_sel
-                    r_fp32[2 * value_idx] = (
-                        accumulators[accum_base + token_sel] * c_scale
-                    )
-                    r_fp32[2 * value_idx + 1] = (
-                        accumulators[accum_base + 2 + token_sel] * c_scale
-                    )
-            r_pack = cute.make_rmem_tensor(8, cutlass.BFloat16)
-            r_pack.store(r_fp32.load().to(cutlass.BFloat16))
-            o0, o1, o2, o3 = transpose_token_group_bf16x8(r_pack, lane_group)
-            token = token0 + lane_group_bit1
-            if token < valid_tokens and col < valid_gateup_n:
-                stg_128b_bf16x8(g_c, o0, o1, o2, o3, row_base + token, col)
+        return (
+            g_c,
+            c_row_base,
+            c_col,
+            work_tile_info.valid_tokens_in_cta_tile,
+            cutlass.Int32(gmem_fc1_c.shape[1]),
+        )
 
     @cute.jit
     def _apply_fc1_topk_swapab(
@@ -922,16 +936,11 @@ class SwapABFp8GluEpilogue:
         token_tile_base = work_tile_info.tile_n_idx * cutlass.Int32(
             self._token_tile_n
         )
+        c_ctx = None
         if cutlass.const_expr(self._generate_c):
-            self._store_fc1_c_swapab(
-                work_tile_info=work_tile_info,
-                accumulators=accumulators,
-                n_half=n_half,
-                gmem_fc1_c=gmem_fc1_c,
-                token_tile_base=token_tile_base,
-                local_warp_idx=local_warp_idx,
-                tidx=tidx,
-                c_scale=Float32(1.0),
+            c_ctx = self._fc1_c_context_swapab(
+                work_tile_info, n_half, gmem_fc1_c, token_tile_base,
+                local_warp_idx, tidx,
             )
 
         for chunk_idx in cutlass.range_constexpr(
@@ -942,6 +951,8 @@ class SwapABFp8GluEpilogue:
                 chunk_idx=chunk_idx,
                 accumulators=accumulators,
                 r_swiglu=r_swiglu,
+                tidx=tidx,
+                c_ctx=c_ctx,
             )
             self._apply_fc1_topk_chunk_swapab(
                 chunk_idx=chunk_idx,

@@ -451,6 +451,8 @@ class Fp8GluEpilogue:
                     real_topk_scores[token_tile_base + token_row1]
                 )
             if cutlass.const_expr(self._generate_c):
+                if _iket_active:
+                    iket.range_push("nswap_fc1_c_store")
                 self._store_fc1_c_m64_half(
                     work_tile_info=work_tile_info,
                     accumulators=accumulators,
@@ -463,6 +465,8 @@ class Fp8GluEpilogue:
                     tidx=tidx,
                     c_scale=fc1_act_weight_dequant_scale,
                 )
+                if _iket_active:
+                    iket.range_pop()
             for subtile_idx in cutlass.range_constexpr(
                 subtile_begin, subtile_end, 1
             ):
@@ -791,6 +795,8 @@ class Fp8GluEpilogue:
                     real_topk_scores[token_tile_base + token_row1]
                 )
             if cutlass.const_expr(self._generate_c):
+                if _iket_active:
+                    iket.range_push("nswap_fc1_c_store")
                 self._store_fc1_c_m64_half(
                     work_tile_info=work_tile_info,
                     accumulators=accumulators,
@@ -803,6 +809,8 @@ class Fp8GluEpilogue:
                     tidx=tidx,
                     c_scale=Float32(1.0),
                 )
+                if _iket_active:
+                    iket.range_pop()
             swiglu = cute.make_rmem_tensor(r_layout.shape, self.acc_dtype)
             for subtile_idx in cutlass.range_constexpr(
                 subtile_begin, subtile_end, 1

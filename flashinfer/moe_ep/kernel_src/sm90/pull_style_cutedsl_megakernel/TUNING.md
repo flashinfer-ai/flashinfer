@@ -261,7 +261,14 @@ token-back modes — 38 candidates.
   hold one 16-byte chunk per (token, m_sub, gate/up), two 32-bit butterfly
   levels on lane-group bits 2/1 plus a `prmt` half-word exchange on bit 0
   leave each lane group one chunk (1 STG.128 per token group instead of 8
-  STG.16).  The GMEM pointer carries an explicit 16-byte alignment
+  STG.16).  On swap-AB the store is fused into the SwiGLU pass (one token
+  group at a time, packing the already scaled gate/up registers with
+  `cvt.rn.bf16x2` before the lane transpose): a separate raw-C pass kept
+  all 128 accumulator registers live and made the M128N128 ping-pong
+  kernel spill 868 B, which turned a 3 µs pass into a 25 µs SwiGLU
+  epilogue (17-22% generate_c overhead at 2048-32768 tokens in the drop
+  harness); fused, spills are zero and the drop's overhead is 0.7-2.4%, with
+  the generate_c=off kernels PTX-identical.  The GMEM pointer carries an explicit 16-byte alignment
   assumption (`make_ptr(..., assumed_align=16)`): a plain `autovec_copy`
   into the BF16 view has no alignment fact and degrades to 16-bit stores
   — the first version's "bf16x2" pair stores compiled to `STG.E.U16`,
@@ -271,11 +278,16 @@ token-back modes — 38 candidates.
   and rejected — the 16 KB per warpgroup comes out of the AB pipeline
   budget and drops the N256 configs from 4 to 3 stages (−10..−38% on
   those buckets) while gaining only +2..+3% where it fits.
-  Cost when on (FlashInfer bench, 4x H200 at 1830 MHz, 2 interleaved
-  rounds, e2e median): every bucket within −1..−3% of the same tree with
-  generate_c off (geomean e2e −0.9%, compute −1.2%; was −5.2% / −5.4%
-  with the 16-bit stores: non-swap buckets −8..−16%).  Off costs nothing:
-  the store path is compiled out (off-vs-off sweeps within noise).  Test
+  Cost when on (FlashInfer bench, 4x H200, 2 interleaved generate_c rounds
+  against one generate_c=off run, e2e median, 2026-09-18 node at 1980 MHz):
+  geomean +1.1% (per_tensor) / +0.5% (blockwise); the swap-AB M128N128
+  tail-split rows pay pt2048 +2.5, pt4096 +2.8, pt8192 +1.0, pt16384 +3.1,
+  pt32768 +2.4% — before the fused store they paid +14.9 / +14.5 / +16.3 /
+  +5.9 / +14.2% on the same node (per_tensor geomean +5.1%), and with the
+  16-bit stores the non-swap rows of the older table paid −8..−16%.  Off
+  costs nothing: the store path is compiled out (same-node off-vs-off
+  between the fused and the separate-pass build within ±1.6% per bucket,
+  one round).  Test
   `test_..._generate_c` (both layouts x both scale modes vs the multi-rank
   torch reference's `return_fc1_gateup`).
 - `compact_pull_buffer` (default True) — size the dispatch pull buffer by
@@ -426,9 +438,12 @@ token-back modes — 38 candidates.
   harness and shim alike, through `heuristic_config`).  Bit-exact with the
   plain schedule (`test_..._tail_split_pairs`: both layouts x both
   token-back placements at an odd CTA-tile count, plus the drop's
-  `test_tail_split_sched.py` scheduler contract).  generate_c keeps the
-  previous per_tensor 16384 row (`HEURISTIC_GENERATE_C_OVERRIDES`): the
-  swap-AB M128N128 kernel spills once the raw fc1_c store is added.
+  `test_tail_split_sched.py` scheduler contract).  generate_c runs the same
+  rows: the swap-AB raw fc1_c store is fused into the SwiGLU pass (per
+  token group, from the already scaled gate/up registers), so the M128N128
+  ping-pong kernel no longer spills with it on — the drop's 4-rank
+  generate_c overhead fell from 17-22% to 0.7-2.4% at 2048-32768 and the
+  earlier per_tensor 16384 training override was dropped again.
 - `dedup_dispatch`, `grouped_token_back`, `combine_format` — top-k dedup
   on dispatch / combine and the quantized combine wire; see
   `dedup_topk_design.md`.
