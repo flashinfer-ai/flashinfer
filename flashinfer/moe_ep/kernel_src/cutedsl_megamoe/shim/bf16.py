@@ -14,6 +14,7 @@ from .comm import (
     _CompiledMega,
     _compute_peer_offsets,
     bootstrap_dist,
+    ensure_not_capturing,
     free_sym_tensor,
     resolve_gate_up_clamp,
     sym_zeros,
@@ -41,6 +42,7 @@ class MegaMoEBf16Config:
     num_sched_stages: Optional[int] = None
     flag_batch: int = 1
     epi_flag_batch: Tuple[int, int] = (1, 1)
+    enable_in_kernel_fc2_reduce: bool = False
     in_kernel_fc2_reduce: bool = False
     token_back_mode: Literal[
         "epi_warps", "standalone_warps", "reuse_dispatch_warps"
@@ -75,6 +77,10 @@ class MegaMoEBf16Config:
             "reuse_dispatch_warps",
         ):
             raise ValueError(f"unsupported token_back_mode={self.token_back_mode!r}.")
+        if self.in_kernel_fc2_reduce and not self.enable_in_kernel_fc2_reduce:
+            raise ValueError(
+                "in_kernel_fc2_reduce knob selected without enable_in_kernel_fc2_reduce."
+            )
         if self.in_kernel_fc2_reduce and self.token_back_mode == "epi_warps":
             raise ValueError(
                 "in_kernel_fc2_reduce requires standalone or reused dispatch token-back."
@@ -112,6 +118,7 @@ class MegaMoEBf16Frontend:
 
     def set_gate_up_clamp(self, clamp: Optional[float]) -> None:
         if self._gate_up_clamp != clamp:
+            ensure_not_capturing("set_gate_up_clamp (clamp change)")
             self._release_workspace()
             self._gate_up_clamp = clamp
             self._mega_key = None
@@ -119,12 +126,16 @@ class MegaMoEBf16Frontend:
 
     def apply_knobs(self, knobs: dict) -> None:
         """Apply a validated BF16 tuning configuration and invalidate its compile."""
-        from .tuner import is_valid_bf16, with_knobs
+        from .tuner import describe_invalid_knobs, is_valid_bf16_for_config, with_knobs
 
-        if not is_valid_bf16(knobs):
-            raise ValueError(f"unsupported BF16 MegaMoE knobs: {knobs}.")
+        if not is_valid_bf16_for_config(self.config, knobs):
+            raise ValueError(
+                f"unsupported BF16 MegaMoE knobs {knobs}: "
+                f"{describe_invalid_knobs(self.config, knobs, is_valid_bf16_for_config)}."
+            )
         new_config = with_knobs(self.config, knobs)
         if new_config != self._config:
+            ensure_not_capturing("apply_knobs (config change)")
             self._release_workspace()
             self._config = new_config
             self._mega_key = None
@@ -177,6 +188,7 @@ class MegaMoEBf16Frontend:
         if self._mega is not None and self._mega_key == key:
             return self._mega
 
+        ensure_not_capturing("cute.compile + symmetric-heap allocation")
         self._release_workspace()
         import cutlass
         import cutlass.cute as cute
@@ -290,7 +302,7 @@ class MegaMoEBf16Frontend:
         if self.config.in_kernel_fc2_reduce:
             inputs.combine_output.zero_()
         mega.compiled(**mega.launch_kwargs)
-        if sync:
+        if sync and not torch.cuda.is_current_stream_capturing():
             torch.cuda.synchronize()
         return inputs.combine_output[:n]
 
@@ -359,6 +371,7 @@ class MegaMoEBf16Frontend:
 
     def _release_workspace(self) -> None:
         if self._mega is not None:
+            ensure_not_capturing("workspace release (symmetric-heap free)")
             free_sym_tensor(self._mega.shared_workspace)
 
 
@@ -375,9 +388,17 @@ class MegaMoEBf16SymmBuffer:
     topk_idx: torch.Tensor
     topk_weights: torch.Tensor
     combine_output: torch.Tensor
+    reduced_output: torch.Tensor
     _frontend: MegaMoEBf16Frontend
     _sym_roots: list[torch.Tensor] = field(default_factory=list)
     _destroyed: bool = False
+
+    @property
+    def kernel_combine_output(self) -> torch.Tensor:
+        """The tensor the kernel writes: reduced rows under ikr, else partials."""
+        if self._frontend.config.in_kernel_fc2_reduce:
+            return self.reduced_output
+        return self.combine_output
 
     def destroy(self) -> None:
         if not self._destroyed:
@@ -407,15 +428,30 @@ def get_symm_buffer_for_bf16_mega_moe(
     *,
     gate_up_clamp: Optional[float] = None,
     activation_clamp: Optional[float] = None,
-    in_kernel_fc2_reduce: bool = False,
-    token_back_mode: Literal[
-        "epi_warps", "standalone_warps", "reuse_dispatch_warps"
-    ] = "epi_warps",
+    enable_in_kernel_fc2_reduce: bool = False,
     knobs: Optional[dict] = None,
 ) -> MegaMoEBf16SymmBuffer:
     clamp = resolve_gate_up_clamp(
         gate_up_clamp=gate_up_clamp, activation_clamp=activation_clamp
     )
+    from .knob_cache import resolve_knobs
+    from .tuner import (
+        describe_invalid_knobs,
+        is_valid_bf16_for_config,
+        with_knobs,
+    )
+
+    if knobs is None:
+        knobs, _ = resolve_knobs(
+            dtype="bf16",
+            world_size=world_size,
+            hidden=hidden,
+            intermediate=intermediate,
+            num_experts=num_total_experts,
+            topk=num_topk,
+            max_tokens=num_max_tokens,
+            enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
+        )
     cfg = MegaMoEBf16Config(
         rank=rank,
         world_size=world_size,
@@ -425,18 +461,22 @@ def get_symm_buffer_for_bf16_mega_moe(
         hidden=hidden,
         intermediate=intermediate,
         gate_up_clamp=clamp,
-        in_kernel_fc2_reduce=in_kernel_fc2_reduce,
-        token_back_mode=token_back_mode,
-        **(knobs or {}),
+        enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
     )
+    if not is_valid_bf16_for_config(cfg, knobs):
+        raise ValueError(
+            f"unsupported BF16 MegaMoE knobs {knobs}: "
+            f"{describe_invalid_knobs(cfg, knobs, is_valid_bf16_for_config)}."
+        )
+    cfg = with_knobs(cfg, knobs)
+
     x = sym_zeros((num_max_tokens, hidden), torch.bfloat16)
     topk_idx = sym_zeros((num_max_tokens, num_topk), torch.int64)
     topk_idx.fill_(-1)
     topk_weights = sym_zeros((num_max_tokens, num_topk), torch.float32)
-    combine_output = sym_zeros(
-        (num_max_tokens, 1 if in_kernel_fc2_reduce else num_topk, hidden),
-        torch.bfloat16,
-    )
+    # We need to allocate both since we dont always know what final knobs will be selected
+    combine_output = sym_zeros((num_max_tokens, num_topk, hidden), torch.bfloat16)
+    reduced_output = sym_zeros((num_max_tokens, 1, hidden), torch.bfloat16)
     return MegaMoEBf16SymmBuffer(
         num_total_experts,
         num_max_tokens,
@@ -449,13 +489,14 @@ def get_symm_buffer_for_bf16_mega_moe(
         topk_idx,
         topk_weights,
         combine_output,
+        reduced_output,
         MegaMoEBf16Frontend(cfg),
-        [x, topk_idx, topk_weights, combine_output],
+        [x, topk_idx, topk_weights, combine_output, reduced_output],
     )
 
 
 def bf16_mega_moe(
-    y: torch.Tensor,
+    y: Optional[torch.Tensor],
     transformed_l1: TransformedWeights,
     transformed_l2: TransformedWeights,
     symm_buffer: MegaMoEBf16SymmBuffer,
@@ -465,12 +506,15 @@ def bf16_mega_moe(
     activation_clamp: Optional[float] = None,
     fast_math: bool = True,
     sync: bool = False,
-) -> None:
+) -> Optional[torch.Tensor]:
     del fast_math
     if symm_buffer._destroyed:
         raise RuntimeError("symm_buffer.destroy() was already called.")
     n = symm_buffer.num_max_tokens if num_tokens is None else num_tokens
-    if y.shape != (n, symm_buffer.hidden) or y.dtype != torch.bfloat16:
+    in_kernel_reduce = symm_buffer._frontend.config.in_kernel_fc2_reduce
+    if y is not None and (
+        y.shape != (n, symm_buffer.hidden) or y.dtype != torch.bfloat16
+    ):
         raise ValueError(f"y must be bfloat16 with shape ({n}, {symm_buffer.hidden}).")
     clamp = resolve_gate_up_clamp(
         gate_up_clamp=gate_up_clamp, activation_clamp=activation_clamp
@@ -484,15 +528,139 @@ def bf16_mega_moe(
             symm_buffer.topk_weights,
             transformed_l1[0],
             transformed_l2[0],
-            symm_buffer.combine_output,
+            symm_buffer.kernel_combine_output,
         ),
         num_tokens=n,
-        sync=sync,
+        sync=False,
     )
-    if symm_buffer._frontend.config.in_kernel_fc2_reduce:
-        y.copy_(result[:, 0])
+    if in_kernel_reduce:
+        out = result[:, 0]
+        if y is not None:
+            y.copy_(out)
     else:
-        y.copy_(result.sum(dim=1))
+        # Reduce straight into the result buffer
+        out = y if y is not None else symm_buffer.reduced_output[:n, 0]
+        torch.sum(result, dim=1, out=out)
+
+    if sync and not torch.cuda.is_current_stream_capturing():
+        torch.cuda.synchronize()
+
+    # Return the inplace zero-copy result if y is None
+    return out if y is None else None
+
+
+def _create_dummy_weights(
+    num_local_experts: int,
+    hidden: int,
+    intermediate: int,
+    generator: torch.Generator,
+) -> Tuple[TransformedWeights, TransformedWeights]:
+    """Random BF16 weights in the kernel's K-major layout.
+
+    Allocated canonical and transposed, so the strides (and hence the leading
+    dim the frontend marks dynamic) match ``preprocess_mega_weights`` output
+    instead of a fresh contiguous alloc.
+    """
+    fc1 = torch.randn(
+        (num_local_experts, 2 * intermediate, hidden),
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=generator,
+    ).transpose(1, 2)
+    fc2 = torch.randn(
+        (num_local_experts, hidden, intermediate),
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=generator,
+    ).transpose(1, 2)
+    return (fc1, None), (fc2, None)
+
+
+def create_dummy_inputs(
+    rank: int,
+    world_size: int,
+    num_total_experts: int,
+    num_max_tokens: int,
+    num_tokens: int,
+    num_topk: int,
+    hidden: int,
+    intermediate: int,
+    *,
+    gate_up_clamp: Optional[float] = None,
+    activation_clamp: Optional[float] = None,
+    enable_in_kernel_fc2_reduce: bool = False,
+    knobs: Optional[dict] = None,
+    seed: int = 0,
+) -> tuple[
+    torch.Tensor,
+    TransformedWeights,
+    TransformedWeights,
+    MegaMoEBf16SymmBuffer,
+]:
+    """Allocate symm buffer, BF16 weights, and stage activations + routing."""
+    if num_tokens < 0 or num_tokens > num_max_tokens:
+        raise ValueError(
+            f"num_tokens must be in [0, {num_max_tokens}], got {num_tokens}."
+        )
+
+    num_local_experts = num_total_experts // world_size
+    clamp = resolve_gate_up_clamp(
+        gate_up_clamp=gate_up_clamp, activation_clamp=activation_clamp
+    )
+
+    gen = torch.Generator(device="cuda")
+    gen.manual_seed(seed + rank)
+
+    symm_buffer = get_symm_buffer_for_bf16_mega_moe(
+        num_total_experts,
+        num_max_tokens,
+        num_topk,
+        hidden,
+        intermediate,
+        rank,
+        world_size,
+        gate_up_clamp=clamp,
+        enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
+        knobs=knobs,
+    )
+
+    transformed_l1, transformed_l2 = _create_dummy_weights(
+        num_local_experts,
+        hidden,
+        intermediate,
+        gen,
+    )
+
+    activation = torch.randn(
+        (num_tokens, hidden),
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=gen,
+    )
+    scores = torch.randn(
+        num_tokens,
+        num_total_experts,
+        device="cuda",
+        dtype=torch.float32,
+        generator=gen,
+    )
+    topk_weights, topk_idx = torch.topk(
+        scores,
+        num_topk,
+        dim=-1,
+        largest=True,
+        sorted=False,
+    )
+
+    symm_buffer.x[:num_tokens].copy_(activation)
+    symm_buffer.topk_idx[:num_tokens].copy_(topk_idx.to(torch.int64))
+    # Mask pad rows (and stale routes from a previous larger staging): the
+    # launch covers the full buffer and relies on topk_idx[n:] == -1.
+    symm_buffer.topk_idx[num_tokens:].fill_(-1)
+    symm_buffer.topk_weights[:num_tokens].copy_(topk_weights.to(torch.float32))
+
+    y = torch.empty(num_tokens, hidden, device="cuda", dtype=torch.bfloat16)
+    return y, transformed_l1, transformed_l2, symm_buffer
 
 
 def bf16_mega_launch_thunk(
@@ -500,16 +668,29 @@ def bf16_mega_launch_thunk(
     transformed_l2: TransformedWeights,
     symm_buffer: MegaMoEBf16SymmBuffer,
 ) -> Callable[[], None]:
-    return symm_buffer._frontend.make_launch_thunk(
+    launch = symm_buffer._frontend.make_launch_thunk(
         MegaMoEBf16Inputs(
             symm_buffer.x,
             symm_buffer.topk_idx,
             symm_buffer.topk_weights,
             transformed_l1[0],
             transformed_l2[0],
-            symm_buffer.combine_output,
+            symm_buffer.kernel_combine_output,
         )
     )
+    if symm_buffer._frontend.config.in_kernel_fc2_reduce:
+        return launch
+
+    # Form A's host reduce is part of the forward; a thunk without it would
+    # under-report the deterministic path against ikr.
+    partials = symm_buffer.combine_output
+    out = symm_buffer.reduced_output[:, 0]
+
+    def thunk() -> None:
+        launch()
+        torch.sum(partials, dim=1, out=out)
+
+    return thunk
 
 
 __all__ = [
@@ -520,6 +701,7 @@ __all__ = [
     "TransformedWeights",
     "bf16_mega_launch_thunk",
     "bf16_mega_moe",
+    "create_dummy_inputs",
     "get_symm_buffer_for_bf16_mega_moe",
     "init_dist",
 ]

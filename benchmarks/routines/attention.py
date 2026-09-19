@@ -766,9 +766,19 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
         if cudnn_backend not in backends:
             continue
         remove_cudnn = False
-        if speculative_decode:
+        if speculative_decode and cudnn_backend == "cudnn-native":
+            # The wrapper backend forwards q_len_per_req > 1 (bottom-right
+            # causal rows); the standalone call here is shaped for one row.
             print(
                 f"[INFO] {cudnn_backend} backend does not support speculative decode. Skipping."
+            )
+            remove_cudnn = True
+        elif speculative_decode and spec_dec_mask_mode != "causal":
+            # The cudnn graph applies the bottom-right causal diagonal to
+            # multi-token rows; it takes no explicit draft-block mask.
+            print(
+                f"[INFO] {cudnn_backend} backend applies the causal mask to multi-token "
+                f"decode; spec_dec_mask={spec_dec_mask_mode!r} is not supported. Skipping."
             )
             remove_cudnn = True
         if not (q_dtype == kv_dtype == o_data_type) or q_dtype not in (
@@ -1049,6 +1059,9 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 data_type=kv_dtype,
                 o_data_type=o_data_type,
                 block_tables=block_tables,
+                # Multi-token rows are a plan-time property (the deprecated
+                # run-time q_len_per_req only validates against it).
+                q_len_per_req=s_qo,
             )
             resolved_backends[backend] = backend_wrappers[backend]._backend
         else:

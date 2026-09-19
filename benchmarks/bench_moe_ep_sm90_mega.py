@@ -591,7 +591,7 @@ def _megakernel_config(args, scale_mode: str, operand_order: str, tile, tokens=N
         cluster_shape_mnk=cluster_shape_mnk,
         load_balance_mode=args.load_balance_mode,
         gate_up_clamp=args.gate_up_clamp,
-        in_kernel_fc2_reduce=False,
+        enable_in_kernel_fc2_reduce=False,
         token_back_mode=(
             "reuse_dispatch_warps"
             if args.grouped_token_back
