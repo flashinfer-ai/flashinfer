@@ -35,6 +35,9 @@
 #   FP8_ACCUM_MODE=2xacc bash ... --scale-mode per-tensor     # legacy 2xacc
 #   FP8_NON_SWAP_M=64 FP8_NON_SWAP_N=128 bash .../run_mega_tests.sh M01
 #   FP8_SWAP_AB_M=256 FP8_SWAP_AB_N=32 bash .../run_mega_tests.sh --swapab M01
+#   FP8_TAIL_SPLIT=1 appends --tail_split_pairs (needs a 2-CTA token cluster:
+#   FP8_CLUSTER_SHAPE=1,2,1 with --swapab or 2,1,1 without), e.g.
+#   FP8_TAIL_SPLIT=1 FP8_CLUSTER_SHAPE=2,1,1 FP8_NON_SWAP_N=256 bash .../run_mega_tests.sh
 #
 # Selective execution (positional args; substring match against test names,
 # OR-combined across multiple selectors):
@@ -199,6 +202,28 @@ fi
 if [ "$PINGPONG" -eq 1 ]; then
     TILE_ARGS=(--pingpong "${TILE_ARGS[@]}")
 fi
+
+# FP8_TAIL_SPLIT=1: the whole run shares one geometry, so reject an
+# incompatible cluster shape up front.
+FP8_TAIL_SPLIT="${FP8_TAIL_SPLIT:-0}"
+case "$FP8_TAIL_SPLIT" in
+    1)
+        if { [ "$SWAP_AB" -eq 1 ] && [ "$FP8_CLUSTER_SHAPE" = "1,2,1" ]; } \
+            || { [ "$SWAP_AB" -eq 0 ] && [ "$FP8_CLUSTER_SHAPE" = "2,1,1" ]; }; then
+            TILE_ARGS+=(--tail_split_pairs)
+        else
+            echo "ERROR: FP8_TAIL_SPLIT=1 requires FP8_CLUSTER_SHAPE=1,2,1 with --swapab or FP8_CLUSTER_SHAPE=2,1,1 without it (got swap_ab=$SWAP_AB, cluster $FP8_CLUSTER_SHAPE)" >&2
+            exit 2
+        fi
+        ;;
+    0)
+        ;;
+    *)
+        echo "ERROR: FP8_TAIL_SPLIT must be 0 or 1" >&2
+        exit 2
+        ;;
+esac
+export FP8_TAIL_SPLIT
 
 resolve_mode_args() {
     local scale_mode="$1"

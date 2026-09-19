@@ -18,7 +18,7 @@ Two knob classes (same taxonomy as the SM100 tree):
     ``swap_ab`` / ``pingpong`` / ``mma_tiler_mnk`` / ``cluster_shape_mnk`` /
     ``fp8_accum_mode`` select numerically equivalent execution geometries,
     so they live in the perf class together with ``group_hint`` /
-    ``flag_batch`` / ``epi_flag_batch``.
+    ``tail_split_pairs`` / ``flag_batch`` / ``epi_flag_batch``.
 
 The built-in heuristic (:func:`default_knobs`) wraps the kernel drop's
 token-bucket table (``moe_hopper_fp8/heuristic_config.py``), so
@@ -73,6 +73,10 @@ PERF_KNOBS: Dict[str, Tuple[Any, ...]] = {
     "fp8_accum_mode": ("1xacc", "2xacc"),
     # ``group_hint=None`` means "use max_active_clusters" (occupancy hint).
     "group_hint": (None, 64, 128, 256, 512),
+    # Tail-split pair tasks (both CTAs of a 2-CTA token cluster compute the
+    # single valid tail token tile against adjacent weight tiles); legal only
+    # with swap-AB cga (1, 2, 1) or non-swap cga (2, 1, 1).  Output-invariant.
+    "tail_split_pairs": (False, True),
     "flag_batch": (1, 2, 4, 8),
     "epi_flag_batch": ((1, 1), (2, 2), (2, 4), (4, 4), (4, 8)),
 }
@@ -95,8 +99,9 @@ def default_knobs(
     Wraps the kernel drop's token-bucket heuristic table
     (``heuristic_config.select_heuristic_config``), keyed on
     ``fp8_scale_mode`` and the buffer capacity, so the ``knobs=None``
-    fallback matches the shim's established default launch configs.
-    Perf knobs the table does not cover (``group_hint`` / ``flag_batch`` /
+    fallback matches the shim's established default launch configs.  The
+    table also carries the per-bucket ``token_back_mode``, ``group_hint``
+    and ``tail_split_pairs``; perf knobs it does not cover (``flag_batch`` /
     ``epi_flag_batch``) are left unset -- the config defaults apply.
 
     Returns a fresh dict each call.
@@ -112,6 +117,8 @@ def default_knobs(
         "cluster_shape_mnk": tuple(c.cluster_shape_mnk),
         "fp8_accum_mode": c.accum_mode,
         "token_back_mode": c.token_back_mode,
+        "group_hint": c.group_hint,
+        "tail_split_pairs": c.tail_split_pairs,
     }
 
 
@@ -142,6 +149,11 @@ def is_valid(knobs: Dict[str, Any], *, apply_topk_in_fc1: bool = True) -> bool:
         return False
     if ck != 1 or (cm, cn) not in ((1, 1), (2, 1), (1, 2), (2, 2)):
         return False
+    if knobs.get("tail_split_pairs", False):
+        # Exactly two CTAs along the tokens and one along the weights.
+        token_cluster, weight_cluster = (cn, cm) if swap_ab else (cm, cn)
+        if token_cluster != 2 or weight_cluster != 1:
+            return False
     if accum not in ("1xacc", "2xacc"):
         return False
     if knobs.get("token_back_mode") not in (
