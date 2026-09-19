@@ -1,0 +1,18 @@
+{
+  "architecture": "sm_110a",
+  "shape_count": 7,
+  "shapes": [
+    {"name": "tree_fp16_contiguous", "batch": 1, "query_tokens": 20, "query_heads": 32, "kv_heads": 4, "head_dim": 512, "capacity": 256, "kv_dtype": "float16", "page_size": 0, "mask": "causal"},
+    {"name": "tree_fp16_paged", "batch": 1, "query_tokens": 20, "query_heads": 32, "kv_heads": 4, "head_dim": 512, "capacity": 256, "kv_dtype": "float16", "page_size": 128, "mask": "causal"},
+    {"name": "tree_fp8_contiguous", "batch": 1, "query_tokens": 20, "query_heads": 32, "kv_heads": 4, "head_dim": 512, "capacity": 256, "kv_dtype": "float8_e4m3fn", "page_size": 0, "mask": "causal"},
+    {"name": "tree_fp8_paged", "batch": 1, "query_tokens": 20, "query_heads": 32, "kv_heads": 4, "head_dim": 512, "capacity": 256, "kv_dtype": "float8_e4m3fn", "page_size": 128, "mask": "causal"},
+    {"name": "decode_b1_c1024", "batch": 1, "query_tokens": 1, "query_heads": 32, "kv_heads": 4, "head_dim": 128, "capacity": 1024, "kv_dtype": "float16", "page_size": 0},
+    {"name": "decode_b2_c512", "batch": 2, "query_tokens": 1, "query_heads": 32, "kv_heads": 4, "head_dim": 128, "capacity": 512, "kv_dtype": "float16", "page_size": 0},
+    {"name": "decode_b4_c256", "batch": 4, "query_tokens": 1, "query_heads": 32, "kv_heads": 4, "head_dim": 128, "capacity": 256, "kv_dtype": "float16", "page_size": 0}
+  ],
+  "inputs": {
+    "tree": {"distribution": "uniform", "minimum": -1.0, "maximum": 1.0, "seed": 0},
+    "decode": {"distribution": "normal", "mean": 0.0, "std": 1.0, "seed": 0}
+  },
+  "timing": {"method": "CUPTI", "cold_l2": true, "max_export_relative_latency_error": 0.03}
+}

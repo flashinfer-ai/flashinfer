@@ -1,0 +1,296 @@
+{
+  "architecture": "sm_110a",
+  "gpu": "NVIDIA Thor",
+  "compute_capability": [
+    11,
+    0
+  ],
+  "multiprocessors": 20,
+  "cuda_toolkit": "13.4.59",
+  "protocol": {
+    "backend": "CUPTI",
+    "cold_l2": true,
+    "allow_fallback": false,
+    "warmup_ms": 250,
+    "samples_per_round": 256,
+    "alternating_pairs": 6,
+    "metric": "ratio of median round medians",
+    "gate": "absolute relative latency difference <= 3% on every row"
+  },
+  "rows": [
+    {
+      "name": "tree_fp16_contiguous",
+      "frozen_schedule_us": 61.608000000000004,
+      "native_export_us": 60.9285,
+      "absolute_relative_error_percent": 1.1029411764705954,
+      "passed": true,
+      "round_export_over_schedule": [
+        0.8502075902808738,
+        0.9851948051948052,
+        0.9870331950207468,
+        0.9924437756720484,
+        0.9893696442482471,
+        0.9895726579148569
+      ]
+    },
+    {
+      "name": "tree_fp16_paged",
+      "frozen_schedule_us": 63.408500000000004,
+      "native_export_us": 62.55225,
+      "absolute_relative_error_percent": 1.3503710070416508,
+      "passed": true,
+      "round_export_over_schedule": [
+        0.9868885526979324,
+        0.9893675845616695,
+        0.986624053030303,
+        0.9853721203332256,
+        0.9876215947551537,
+        0.983602940597102
+      ]
+    },
+    {
+      "name": "tree_fp8_contiguous",
+      "frozen_schedule_us": 59.21600000000001,
+      "native_export_us": 60.808749999999996,
+      "absolute_relative_error_percent": 2.6897291272628854,
+      "passed": true,
+      "round_export_over_schedule": [
+        1.0264721772015126,
+        1.0281233098972418,
+        1.0275440003376526,
+        1.0259174892432297,
+        1.0284001555709623,
+        1.0267652027027026
+      ]
+    },
+    {
+      "name": "tree_fp8_paged",
+      "frozen_schedule_us": 62.08,
+      "native_export_us": 62.9605,
+      "absolute_relative_error_percent": 1.4183311855670233,
+      "passed": true,
+      "round_export_over_schedule": [
+        1.0136410825949445,
+        1.0144440414298954,
+        1.0165454090325499,
+        1.0144336038124677,
+        1.0133719526912865,
+        1.013932761732852
+      ]
+    },
+    {
+      "name": "decode_b1_c1024",
+      "frozen_schedule_us": 26.288249999999998,
+      "native_export_us": 26.39225,
+      "absolute_relative_error_percent": 0.3956140100615402,
+      "passed": true,
+      "round_export_over_schedule": [
+        0.9969549330085262,
+        1.0042630126558187,
+        1.0012135922330097,
+        1.004904197080292,
+        0.9969660194174758,
+        1.011002444987775
+      ]
+    },
+    {
+      "name": "decode_b2_c512",
+      "frozen_schedule_us": 26.32025,
+      "native_export_us": 26.256500000000003,
+      "absolute_relative_error_percent": 0.24220894558371064,
+      "passed": true,
+      "round_export_over_schedule": [
+        0.9981831395348838,
+        0.9976049270072993,
+        0.9975509274201204,
+        0.9891043223304644,
+        0.9993917274939172,
+        1.0012121212121212
+      ]
+    },
+    {
+      "name": "decode_b4_c256",
+      "frozen_schedule_us": 24.767999999999997,
+      "native_export_us": 24.816,
+      "absolute_relative_error_percent": 0.19379844961240345,
+      "passed": true,
+      "round_export_over_schedule": [
+        0.9987129987129987,
+        1.012377598175933,
+        1.003896103896104,
+        1.003875968992248,
+        0.9980481719218462,
+        1.0012919896640826
+      ]
+    }
+  ],
+  "all_rows_passed": true,
+  "physical_seconds": {
+    "native_build_and_tests": 92.43142461776733,
+    "native_sanitizers": 137.38820385932922,
+    "paired_with_queue": 298.5998191833496,
+    "paired_payload": 153.00820998311974
+  },
+  "sanitizers": [
+    {
+      "row": "tree_fp16_contiguous",
+      "tool": "synccheck",
+      "status": "passed",
+      "elapsed_seconds": 10.88374412804842,
+      "timeout_seconds": 20
+    },
+    {
+      "row": "tree_fp16_contiguous",
+      "tool": "racecheck",
+      "status": "passed",
+      "elapsed_seconds": 8.718401946825907,
+      "timeout_seconds": 20
+    },
+    {
+      "row": "tree_fp16_paged",
+      "tool": "synccheck",
+      "status": "passed",
+      "elapsed_seconds": 8.256798231042922,
+      "timeout_seconds": 20
+    },
+    {
+      "row": "tree_fp16_paged",
+      "tool": "racecheck",
+      "status": "passed",
+      "elapsed_seconds": 8.813276120927185,
+      "timeout_seconds": 20
+    },
+    {
+      "row": "tree_fp8_contiguous",
+      "tool": "synccheck",
+      "status": "passed",
+      "elapsed_seconds": 8.13182907900773,
+      "timeout_seconds": 20
+    },
+    {
+      "row": "tree_fp8_contiguous",
+      "tool": "racecheck",
+      "status": "passed",
+      "elapsed_seconds": 8.636371202999726,
+      "timeout_seconds": 20
+    },
+    {
+      "row": "tree_fp8_paged",
+      "tool": "synccheck",
+      "status": "passed",
+      "elapsed_seconds": 8.530732847051695,
+      "timeout_seconds": 20
+    },
+    {
+      "row": "tree_fp8_paged",
+      "tool": "racecheck",
+      "status": "passed",
+      "elapsed_seconds": 8.752012984128669,
+      "timeout_seconds": 20
+    },
+    {
+      "row": "decode_b1_c1024",
+      "tool": "synccheck",
+      "status": "passed",
+      "elapsed_seconds": 8.056973116006702,
+      "timeout_seconds": 20
+    },
+    {
+      "row": "decode_b1_c1024",
+      "tool": "racecheck",
+      "status": "passed",
+      "elapsed_seconds": 8.354592107934877,
+      "timeout_seconds": 20
+    },
+    {
+      "row": "decode_b2_c512",
+      "tool": "synccheck",
+      "status": "passed",
+      "elapsed_seconds": 7.9058050769381225,
+      "timeout_seconds": 20
+    },
+    {
+      "row": "decode_b2_c512",
+      "tool": "racecheck",
+      "status": "passed",
+      "elapsed_seconds": 8.201368333073333,
+      "timeout_seconds": 20
+    },
+    {
+      "row": "decode_b4_c256",
+      "tool": "synccheck",
+      "status": "passed",
+      "elapsed_seconds": 7.9904564179014415,
+      "timeout_seconds": 20
+    },
+    {
+      "row": "decode_b4_c256",
+      "tool": "racecheck",
+      "status": "passed",
+      "elapsed_seconds": 8.243538160109892,
+      "timeout_seconds": 20
+    }
+  ],
+  "public_api_validation": {
+    "tests_passed": 89,
+    "test_seconds": 11.76,
+    "ruff_version": "0.12.8",
+    "ruff_passed": true,
+    "format_preserves_ast": true,
+    "public_benchmark_rows": 7,
+    "physical_turnaround_seconds": 121.04376196861267
+  },
+  "wheel_smoke": {
+    "passed": true,
+    "physical_seconds": 83.37240044097416,
+    "phases": [
+      {
+        "exit_code": 0,
+        "phase": "wheel",
+        "physical_seconds": 39.54704423993826
+      },
+      {
+        "exit_code": 0,
+        "phase": "install",
+        "physical_seconds": 5.168202699162066
+      },
+      {
+        "exit_code": 0,
+        "phase": "native-smoke",
+        "physical_seconds": 26.347899769898504
+      }
+    ],
+    "routes": [
+      {
+        "capacity": 256,
+        "replays": 2,
+        "route": "decode_fp16_contiguous_single_partition"
+      },
+      {
+        "capacity": 1024,
+        "replays": 2,
+        "route": "decode_fp16_contiguous"
+      },
+      {
+        "capacity": 256,
+        "replays": 2,
+        "route": "tree_fp8_paged"
+      }
+    ],
+    "dependency_environment": {
+      "build_requirement_satisfied": false,
+      "caveat": "Known development environment only; does not establish satisfaction of the declared dependency range or dependency-resolved installation.",
+      "declared_build_requirement": "apache-tvm-ffi>=0.1.11,<0.2",
+      "dependency_resolution": "disabled; preinstalled environment reused",
+      "exact_tested_development_exception": true,
+      "installed_distribution_version": "0.1.dev1+gd1fd51222",
+      "wheel_runtime_requirements": [
+        {
+          "requirement": "apache-tvm-ffi<0.2,>=0.1.11",
+          "version_specifier_satisfied": false
+        }
+      ]
+    },
+    "scope": "sparse-source wheel; independent installed import and fresh JIT"
+  }
+}
