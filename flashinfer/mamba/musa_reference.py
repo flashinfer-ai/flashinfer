@@ -14,18 +14,6 @@ from typing import Optional
 import torch
 
 
-def _musa_stream_is_capturing() -> bool:
-    """Return capture state without synchronizing device metadata."""
-    musa = getattr(torch, "musa", None)
-    query = getattr(musa, "is_current_stream_capturing", None)
-    if query is None:
-        return False
-    try:
-        return bool(query())
-    except Exception:
-        return False
-
-
 def _philox_uniform(
     value: torch.Tensor, rand_seed: torch.Tensor, offset: int = 0, rounds: int = 10
 ) -> torch.Tensor:
@@ -262,17 +250,7 @@ def selective_state_update_musa_reference(
     if is_varlen:
         if cu_seqlens.dim() != 1 or cu_seqlens.dtype not in (torch.int32, torch.int64):
             raise ValueError("cu_seqlens must be a 1D int32 or int64 tensor")
-        if _musa_stream_is_capturing():
-            # MTP target verification enters capture with one packed sequence;
-            # its token count is a static launch shape. Reading cu_seqlens to
-            # host here would synchronize and is illegal during capture.
-            if cu_seqlens.numel() != 2:
-                raise ValueError(
-                    "captured MUSA varlen SSU requires one packed sequence"
-                )
-            cu_values = [0, int(x.shape[0])]
-        else:
-            cu_values = [int(v) for v in cu_seqlens.detach().cpu().tolist()]
+        cu_values = [int(v) for v in cu_seqlens.detach().cpu().tolist()]
         if not cu_values or cu_values[0] != 0:
             raise ValueError("cu_seqlens must start at zero")
         if any(
