@@ -4553,7 +4553,11 @@ def test_attention_ts_decode_block_table_structure_accepts_padded_rows() -> None
 @pytest.mark.parametrize(
     ("seq_lens", "table_values", "message"),
     (
-        ((0, 1), ((0, -101), (1, -102)), "values must be positive"),
+        (
+            (0, 1),
+            ((0, -101), (1, -102)),
+            r"plan seq_lens values must be within \[1, 1\]; request 0 has 0",
+        ),
         ((65, 1), ((0, 1), (2, -102)), "does not have enough columns"),
         ((1, 1), ((0, -101), (8, -102)), "must index the physical K/V cache"),
     ),
@@ -4566,7 +4570,7 @@ def test_attention_ts_decode_one_shot_rejects_malformed_fixed_metadata(
     table_values,
     message,
 ) -> None:
-    """The one-shot surface validates fixed-table values before planning."""
+    """The one-shot surface validates fixed-table values through its wrapper."""
 
     device = torch.device("cuda")
     q = torch.empty((2, 8, 64), dtype=torch.float16, device=device)
