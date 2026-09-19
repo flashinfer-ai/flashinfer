@@ -236,7 +236,7 @@ def test_automatic_jit_parallelism_preserves_host_budget_for_prebuilds(
 
     _configure_jit_parallelism(workers=4)
 
-    assert os.environ["MAX_JOBS"] == "40"
+    assert os.environ["MAX_JOBS"] == "80"
     assert os.environ["FLASHINFER_JIT_PREBUILD_MAX_JOBS"] == "163"
     assert "FLASHINFER_AUTO_MAX_JOBS" not in os.environ
 

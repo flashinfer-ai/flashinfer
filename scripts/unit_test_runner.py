@@ -57,6 +57,9 @@ EXIT_HELP = (
 )
 DEFAULT_DEADLINE_SECONDS = 0
 DEFAULT_UNIT_TIMEOUT_SECONDS = 2 * 60 * 60
+# Deliberately overcommit ordinary worker JITs for the CI A/B experiment. The
+# serialized prebuild path continues to use the host-wide budget.
+_JIT_WORKER_JOB_MULTIPLIER = 2
 
 
 def _env_int(name: str, default: int) -> int:
@@ -103,13 +106,14 @@ def _configure_jit_parallelism(workers: int) -> None:
     automatic = os.environ.pop("FLASHINFER_AUTO_MAX_JOBS", None) == "1"
     if automatic:
         host_jobs = int(max_jobs)
-        per_worker_jobs = max(1, host_jobs // workers)
+        per_worker_jobs = max(1, host_jobs // workers) * _JIT_WORKER_JOB_MULTIPLIER
         os.environ.setdefault("FLASHINFER_JIT_PREBUILD_MAX_JOBS", str(host_jobs))
         os.environ["MAX_JOBS"] = str(per_worker_jobs)
         print(
             "JIT PARALLELISM: phase=workers mode=automatic "
             f"host_max_jobs={host_jobs} workers={workers} "
             f"max_jobs_per_worker={per_worker_jobs} "
+            f"worker_job_multiplier={_JIT_WORKER_JOB_MULTIPLIER} "
             "prebuild_max_jobs="
             f"{os.environ['FLASHINFER_JIT_PREBUILD_MAX_JOBS']} "
             f"nvcc_threads={nvcc_threads}",
