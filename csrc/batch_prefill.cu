@@ -16,6 +16,8 @@
 #include <flashinfer/attention/mask.cuh>
 #include <flashinfer/attention/scheduler.cuh>
 #include <flashinfer/pos_enc.cuh>
+#include <type_traits>
+#include <utility>
 
 #include "batch_prefill_config.inc"
 #include "tvm/ffi/container/array.h"
@@ -41,6 +43,12 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
 
 using namespace flashinfer;
 
+// A block-sparse route may address one KV entry per index while the cache still
+// stores whole pages. Only the modules that declare the scalar carry the field,
+// so detect it here rather than in the shared attention headers -- the generated
+// translation unit does not include them.
+namespace {}  // namespace
+
 using tvm::ffi::Array;
 using tvm::ffi::Optional;
 
@@ -51,6 +59,22 @@ Array<int64_t> BatchPrefillWithKVCachePlan(
     int64_t num_kv_heads, int64_t page_size, bool enable_cuda_graph, int64_t head_dim_qk,
     int64_t head_dim_vo, bool causal, int64_t window_left, int64_t fixed_split_size,
     bool disable_split_kv, int64_t num_colocated_ctas = 0, int64_t uniform_q_len = 0) {
+  // The planner walks these three on the host. A caller inside a
+  // ``torch.device`` context -- which is where a model gets built -- makes
+  // device tensors without asking, and dereferencing one here is a segfault
+  // rather than an error anybody can act on. So it is an error, and a
+  // ValueError: it is the caller's input that is wrong, not this library's
+  // state.
+  TVM_FFI_CHECK(qo_indptr.device().device_type == kDLCPU, ValueError)
+      << "qo_indptr must be a host tensor, the planner reads it on the host";
+  TVM_FFI_CHECK(kv_indptr.device().device_type == kDLCPU, ValueError)
+      << "kv_indptr must be a host tensor, the planner reads it on the host";
+  TVM_FFI_CHECK(kv_len_arr.device().device_type == kDLCPU, ValueError)
+      << "kv_len_arr must be a host tensor, the planner reads it on the host";
+  TVM_FFI_CHECK(qo_indptr.IsContiguous(), ValueError) << "qo_indptr must be contiguous";
+  TVM_FFI_CHECK(kv_indptr.IsContiguous(), ValueError) << "kv_indptr must be contiguous";
+  TVM_FFI_CHECK(kv_len_arr.IsContiguous(), ValueError) << "kv_len_arr must be contiguous";
+
   size_t float_workspace_size_in_bytes =
       float_workspace_buffer.size(0) * get_element_size(float_workspace_buffer);
   size_t int_workspace_size_in_bytes =
@@ -81,6 +105,21 @@ Array<int64_t> BatchPrefillWithKVCacheWorkspaceSize(
     int64_t page_size, bool enable_cuda_graph, int64_t head_dim_qk, int64_t head_dim_vo,
     bool causal, int64_t window_left, int64_t fixed_split_size, bool disable_split_kv,
     int64_t num_colocated_ctas = 0, int64_t uniform_q_len = 0) {
+  // The planner walks these three on the host. A caller inside a
+  // ``torch.device`` context -- which is where a model gets built -- makes
+  // device tensors without asking, and dereferencing one here is a segfault
+  // rather than an error anybody can act on. So it is an error, and a
+  // ValueError: it is the caller's input that is wrong, not this library's
+  // state.
+  TVM_FFI_CHECK(qo_indptr.device().device_type == kDLCPU, ValueError)
+      << "qo_indptr must be a host tensor, the planner reads it on the host";
+  TVM_FFI_CHECK(kv_indptr.device().device_type == kDLCPU, ValueError)
+      << "kv_indptr must be a host tensor, the planner reads it on the host";
+  TVM_FFI_CHECK(kv_len_arr.device().device_type == kDLCPU, ValueError)
+      << "kv_len_arr must be a host tensor, the planner reads it on the host";
+  TVM_FFI_CHECK(qo_indptr.IsContiguous(), ValueError) << "qo_indptr must be contiguous";
+  TVM_FFI_CHECK(kv_indptr.IsContiguous(), ValueError) << "kv_indptr must be contiguous";
+  TVM_FFI_CHECK(kv_len_arr.IsContiguous(), ValueError) << "kv_len_arr must be contiguous";
   (void)kv_len_arr;
   (void)causal;
   size_t float_workspace_size_in_bytes = 0;

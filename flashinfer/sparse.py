@@ -15,7 +15,7 @@ limitations under the License.
 """
 
 import math
-from typing import Optional, Tuple, Union
+from typing import Optional, Sequence, Tuple, Union
 
 import torch
 
@@ -28,7 +28,9 @@ from .decode import get_batch_decode_module
 from .prefill import _compute_page_mask_indptr, get_batch_prefill_module
 from .quantization import segment_packbits
 from .utils import (
+    _check_workspace_buffer_alignment,
     MaskMode,
+    _unpack_paged_kv_cache,
     PosEncodingMode,
     TensorLayout,
     _check_pos_encoding_mode,
@@ -40,6 +42,127 @@ from .utils import (
     get_compute_capability,
     is_float8,
 )
+
+
+def _check_paged_cache(
+    tensors: Sequence[Tuple[str, torch.Tensor]],
+    kv_layout: str,
+    page_size: int,
+    num_kv_heads: int,
+    num_entries: int,
+) -> None:
+    """Validate the raw paged KV tensors against the planned geometry.
+
+    The kernel derives page and head geometry from the key tensor alone and
+    then applies the value tensor's own strides, so a value cache that is
+    shorter or shaped differently does not raise -- it reads past the end.
+    Every check here is one the kernel cannot make for itself.
+    """
+    page_axis, head_axis = (1, 2) if kv_layout == "NHD" else (2, 1)
+    reference = None
+    for name, tensor in tensors:
+        if tensor.dim() != 4:
+            raise ValueError(
+                f"a route over a raw paged cache needs a 4D {name} tensor "
+                f"(num_pages, ...), got {tensor.dim()}D"
+            )
+        if tensor.shape[page_axis] != page_size:
+            raise ValueError(
+                f"{name} cache has {tensor.shape[page_axis]} entries per page "
+                f"under {kv_layout}, but plan() was given "
+                f"kv_cache_page_size={page_size}"
+            )
+        if tensor.shape[head_axis] != num_kv_heads:
+            raise ValueError(
+                f"{name} cache has {tensor.shape[head_axis]} KV heads under "
+                f"{kv_layout}, but plan() was given num_kv_heads={num_kv_heads}"
+            )
+        if tensor.stride(-1) != 1:
+            raise ValueError(
+                f"{name} cache must be contiguous in its innermost dimension, "
+                f"got stride {tensor.stride(-1)}"
+            )
+        if tensor.shape[0] * page_size < num_entries:
+            raise ValueError(
+                f"{name} cache holds {tensor.shape[0] * page_size} KV entries, "
+                f"which the route can address past: plan() was given N="
+                f"{num_entries}"
+            )
+        if reference is None:
+            reference = (name, tensor)
+            continue
+        ref_name, ref = reference
+        if tensor.shape[0] != ref.shape[0]:
+            raise ValueError(
+                f"{name} cache has {tensor.shape[0]} pages but {ref_name} has "
+                f"{ref.shape[0]}; one route addresses both"
+            )
+        if tensor.device != ref.device:
+            raise ValueError(
+                f"{name} cache is on {tensor.device}, {ref_name} on {ref.device}"
+            )
+
+
+def _check_nvfp4_kv(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    kv_cache_sf: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+    kv_layout: str,
+    head_dim: int,
+) -> None:
+    """Validate the NVFP4 contract the C++ binding cannot recover from.
+
+    ``GetFP4ScaleStrides`` only checks rank and the innermost stride, and the
+    generated binding then casts the pointer to ``uint8_t*``. A scale tensor on
+    the wrong device or with too few scale groups therefore turns into an
+    illegal address or an out-of-bounds read inside the kernel.
+    """
+    if head_dim % 16:
+        raise ValueError(
+            "NVFP4 packs one E4M3 scale per 16 elements, so head_dim must be a "
+            f"multiple of 16, got {head_dim}"
+        )
+    if k.dtype != torch.uint8 or v.dtype != torch.uint8:
+        raise ValueError(
+            "NVFP4 attention requires packed uint8 key and value caches, got "
+            f"{k.dtype} and {v.dtype}"
+        )
+    if k.shape[-1] != head_dim // 2 or v.shape[-1] != head_dim // 2:
+        raise ValueError(
+            "packed NVFP4 key/value caches must have a last dimension of "
+            f"head_dim // 2 == {head_dim // 2}, got {k.shape[-1]} and "
+            f"{v.shape[-1]}"
+        )
+    # Compare the caller's tensors as given: _unpack_paged_kv_cache would
+    # expand rank and make a shape mismatch look like a rank mismatch.
+    if isinstance(kv_cache_sf, tuple):
+        k_sf, v_sf = kv_cache_sf
+    else:
+        k_sf, v_sf = kv_cache_sf.unbind(dim=1)
+    for name, data, sf in (("key", k, k_sf), ("value", v, v_sf)):
+        if sf.dtype not in (torch.uint8, torch.float8_e4m3fn):
+            raise ValueError(
+                f"NVFP4 {name} scales must be uint8 or float8_e4m3fn, got {sf.dtype}"
+            )
+        if sf.device != data.device:
+            raise ValueError(
+                f"NVFP4 {name} scales must live on {data.device}, got {sf.device}"
+            )
+        if sf.stride(-1) != 1:
+            raise ValueError(
+                f"NVFP4 {name} scales must be contiguous in their innermost "
+                f"dimension, got stride {sf.stride(-1)}"
+            )
+        if sf.shape[-1] != head_dim // 16:
+            raise ValueError(
+                f"NVFP4 {name} scales must carry head_dim // 16 == "
+                f"{head_dim // 16} groups, got {sf.shape[-1]}"
+            )
+        if sf.shape[:-1] != data.shape[:-1]:
+            raise ValueError(
+                f"NVFP4 {name} scales must match the cache in every dimension "
+                f"but the last, got {tuple(sf.shape)} against {tuple(data.shape)}"
+            )
 
 
 def _bsr_to_vsa_index(
@@ -360,6 +483,70 @@ def _vsa_run_core_blk64(
     return _vsa_finish_output(o_bsa, lse_bsa, out, lse, return_lse)
 
 
+def _resolve_prefill_module(
+    *,
+    device: torch.device,
+    requested_backend: str,
+    kv_cache_page_size: Optional[int],
+    pos_encoding_mode: str,
+    use_fp16_qk_reduction: bool,
+    use_custom_mask: bool,
+    q_data_type: torch.dtype,
+    kv_data_type: torch.dtype,
+    index_dtype: torch.dtype,
+    head_dim: int,
+    logits_soft_cap: float,
+    o_data_type: torch.dtype,
+):
+    """Which backend serves this geometry, and the module that does.
+
+    Shared by :meth:`plan` and :meth:`workspace_size` so the second answers
+    for the kernel the first will build. Nothing here is written back to the
+    wrapper: asking how large a workspace has to be must not change which
+    backend a later plan picks.
+    """
+    backend = requested_backend
+    if kv_cache_page_size is not None:
+        # Only the FA2 paged entry point divides a route element back into
+        # (page, entry); every other backend would read the slots as page
+        # ids and address past the cache.
+        #
+        # Read from what the caller asked for, not from what a previous
+        # plan() left behind: "auto" that resolved to fa3 once would
+        # otherwise refuse a paged route the caller is entitled to.
+        if backend not in ("auto", "fa2"):
+            raise ValueError(
+                "a route over a raw paged cache is only served by the "
+                f"fa2 backend, got {backend!r}"
+            )
+        backend = "fa2"
+    if backend == "auto":
+        backend = determine_attention_backend(
+            device,
+            PosEncodingMode[pos_encoding_mode].value,
+            use_fp16_qk_reduction,
+            use_custom_mask,
+            q_data_type,
+            kv_data_type,
+            head_dim_qk=head_dim,
+            head_dim_vo=head_dim,
+        )
+    module = get_batch_prefill_module(
+        backend,
+        q_data_type,
+        kv_data_type,
+        o_data_type,
+        index_dtype,
+        head_dim,  # head_dim_qk
+        head_dim,  # head_dim_vo
+        PosEncodingMode[pos_encoding_mode].value,
+        False,  # use_sliding_window
+        logits_soft_cap > 0,  # use_logits_soft_cap
+        use_fp16_qk_reduction,
+    )
+    return backend, module
+
+
 class BlockSparseAttentionWrapper:
     r"""Wrapper class for attention computation with a block-sparse matrix as attention mask.
     The definition of block sparse matrix can be found at
@@ -410,6 +597,9 @@ class BlockSparseAttentionWrapper:
         self,
         float_workspace_buffer: torch.Tensor,
         backend: str = "auto",
+        kv_layout: str = "NHD",
+        int_workspace_buffer: Optional[torch.Tensor] = None,
+        pin_memory_int_workspace_buffer: Optional[torch.Tensor] = None,
     ) -> None:
         r"""Constructs of :class:`BlockSparseAttentionWrapper`.
 
@@ -423,13 +613,43 @@ class BlockSparseAttentionWrapper:
             The implementation backend, could be ``auto``/``fa2``/``fa3`` or ``cake``. Defaults to ``auto``.
             If set to ``auto``, the function will automatically choose the backend based on the
             device architecture and kernel availability.
+        kv_layout : str
+            Layout of the KV tensors passed to :meth:`run`, either ``NHD`` or
+            ``HND``. Only a route over a raw paged cache (see
+            ``kv_cache_page_size`` in :meth:`plan`) can be ``HND``; a flat KV
+            tensor has no page axis to order against the heads.
+        int_workspace_buffer : Optional[torch.Tensor]
+            Where the planner writes the scheduler metadata, and where ``run``
+            reads it back. One is allocated when this is omitted, which is what
+            a wrapper holding a single plan wants.
+
+            Passing one lets several wrappers draw from a single arena instead
+            of each taking eight megabytes of their own. The region a live plan
+            was given is **its own**: ``plan`` keeps byte offsets into it and
+            ``run`` reads them, so a second plan writing the same bytes leaves
+            the first reading someone else's schedule. Give each live plan a
+            slice no other one touches, sized by :meth:`workspace_size`. This is
+            a precondition, not something the wrapper can check -- it never sees
+            the other wrappers.
+        pin_memory_int_workspace_buffer : Optional[torch.Tensor]
+            The host staging buffer the planner copies through. It is consumed
+            before ``plan`` returns, so serialized planning can share one; it
+            has to be pinned host memory of at least the integer workspace's
+            size. One is allocated when this is omitted.
         """
+        if kv_layout not in ("NHD", "HND"):
+            raise ValueError(f"kv_layout must be NHD or HND, got {kv_layout!r}")
         self._float_workspace_buffer = float_workspace_buffer
         self.device = float_workspace_buffer.device
         self._workspace_size = (
             float_workspace_buffer.numel() * float_workspace_buffer.element_size()
         )
         self._backend = _BACKEND_ALIASES.get(backend, backend)
+        # plan() overwrites _backend when it resolves "auto", and the wrapper
+        # keeps that. Gates that are about what the caller selected have to read
+        # this instead, or a second plan() is refused for a backend the caller
+        # never named.
+        self._requested_backend = self._backend
         if self._backend == "cake":
             # Cake consumes the caller's direct VSA metadata and never invokes
             # the generic sparse planner. Avoid allocating its per-wrapper 8 MiB
@@ -438,18 +658,54 @@ class BlockSparseAttentionWrapper:
             self._int_workspace_buffer = torch.empty(
                 (0,), dtype=torch.uint8, device=self.device
             )
-            self._kv_lens_buffer = torch.empty(
-                (0,), dtype=torch.int32, device=self.device
-            )
             self._pin_memory_int_workspace_buffer = torch.empty(
                 (0,), dtype=torch.uint8, device="cpu"
             )
+        elif int_workspace_buffer is not None:
+            if int_workspace_buffer.device != self.device:
+                raise ValueError(
+                    "int_workspace_buffer has to be on the wrapper's device, "
+                    f"got {int_workspace_buffer.device} for {self.device}"
+                )
+            if int_workspace_buffer.dtype != torch.uint8:
+                raise ValueError(
+                    "int_workspace_buffer has to be uint8, got "
+                    f"{int_workspace_buffer.dtype}"
+                )
+            # The planner carves aligned allocations out of this buffer and
+            # counts what is left, so a slice starting off a 16-byte boundary
+            # loses room the size query said it had -- and fails inside the
+            # planner rather than here.
+            _check_workspace_buffer_alignment(
+                int_workspace_buffer, "int_workspace_buffer"
+            )
+            self._int_workspace_buffer = int_workspace_buffer
+            self._pin_memory_int_workspace_buffer = (
+                pin_memory_int_workspace_buffer
+                if pin_memory_int_workspace_buffer is not None
+                else torch.empty(
+                    int_workspace_buffer.shape,
+                    dtype=torch.uint8,
+                    pin_memory=True,
+                    device="cpu",
+                )
+            )
+            if (
+                self._pin_memory_int_workspace_buffer.numel()
+                < int_workspace_buffer.numel()
+            ):
+                raise ValueError(
+                    "pin_memory_int_workspace_buffer is smaller than the "
+                    "integer workspace it stages"
+                )
         else:
+            if pin_memory_int_workspace_buffer is not None:
+                raise ValueError(
+                    "pin_memory_int_workspace_buffer needs an "
+                    "int_workspace_buffer to stage"
+                )
             self._int_workspace_buffer = torch.empty(
                 (8 * 1024 * 1024,), dtype=torch.uint8, device=self.device
-            )
-            self._kv_lens_buffer = torch.empty(
-                (32768,), dtype=torch.int32, device=self.device
             )
             self._pin_memory_int_workspace_buffer = torch.empty(
                 self._int_workspace_buffer.shape,
@@ -458,7 +714,8 @@ class BlockSparseAttentionWrapper:
                 device="cpu",
             )
         self._use_cuda_graph = False
-        self._kv_layout = "NHD"
+        self._kv_layout = kv_layout
+        self._kv_cache_page_size: Optional[int] = None
         self._qo_indptr: Optional[torch.Tensor] = None
         self._paged_kv_indptr_buf: Optional[torch.Tensor] = None
         self._paged_kv_indices_buf: Optional[torch.Tensor] = None
@@ -499,6 +756,212 @@ class BlockSparseAttentionWrapper:
             pin_memory=True,
         )
 
+    def _resolve_prefill_module(self, **kwargs):
+        """The wrapper's own view of :func:`_resolve_prefill_module`."""
+        return _resolve_prefill_module(
+            device=self.device, requested_backend=self._requested_backend, **kwargs
+        )
+
+    @staticmethod
+    @flashinfer_api
+    def query_workspace_size(
+        device: torch.device,
+        indptr: torch.Tensor,
+        M: int,
+        R: int,
+        C: int,
+        num_qo_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        causal: bool = False,
+        pos_encoding_mode: str = "NONE",
+        use_fp16_qk_reduction: bool = False,
+        logits_soft_cap: Optional[float] = None,
+        q_data_type: Union[str, torch.dtype] = "float16",
+        kv_data_type: Optional[Union[str, torch.dtype]] = None,
+        o_data_type: Union[str, torch.dtype] = "float16",
+        use_custom_mask: bool = False,
+        kv_cache_page_size: Optional[int] = None,
+        backend: str = "auto",
+    ) -> Tuple[int, int]:
+        r"""The same answer as :meth:`workspace_size`, and it allocates nothing.
+
+        Constructing a wrapper to ask how large its workspace has to be takes
+        eight megabytes of device memory and as much pinned host memory, which
+        is a strange price for a question. Both sizes are *computed* by the
+        planner from the geometry -- the float workspace is an answer, not an
+        input -- so all this needs is a device to say which architecture is
+        being asked about, and the indptr that fixes the batch.
+
+        Parameters
+        ----------
+        device : torch.device
+            The device the sizes are asked about. The planner is instantiated
+            per architecture, so the answer is per device.
+        indptr : torch.Tensor
+            The block row pointer, as :meth:`plan` takes it. Its length fixes
+            the number of rows the plan covers.
+        M : int
+            The number of rows of the block-sparse matrix.
+        R : int
+            The number of rows in each block.
+        C : int
+            The number of columns in each block.
+        num_qo_heads : int
+            The number of query/output heads.
+        num_kv_heads : int
+            The number of key/value heads.
+        head_dim : int
+            The dimension of the heads.
+        causal : bool
+            Whether the attention is causal.
+        pos_encoding_mode : str
+            The position encoding applied inside the attention kernel, one of
+            ``NONE``, ``ROPE_LLAMA`` or ``ALIBI``.
+        use_fp16_qk_reduction : bool
+            Whether to use f16 for QK reduction.
+        logits_soft_cap : Optional[float]
+            The attention logits soft capping value, disabled when ``None`` or
+            ``0.0``.
+        q_data_type : Union[str, torch.dtype]
+            The query data type.
+        kv_data_type : Optional[Union[str, torch.dtype]]
+            The key/value data type, defaulting to ``q_data_type``.
+        o_data_type : Union[str, torch.dtype]
+            The output data type.
+        use_custom_mask : bool
+            Whether the plan will carry a custom mask. It changes the sizes,
+            so it is asked for here rather than assumed.
+        kv_cache_page_size : Optional[int]
+            The page size of a paged KV cache, or ``None`` for a raw one.
+        backend : str
+            The backend the sizes are for, one of ``auto``, ``fa2``, ``fa3``
+            or ``trtllm-gen``.
+
+        Returns
+        -------
+        Tuple[int, int]
+            The float and integer workspace sizes, in bytes.
+        """
+        if logits_soft_cap is None:
+            logits_soft_cap = 0.0
+        q_data_type = canonicalize_torch_dtype(q_data_type)
+        if kv_data_type is None:
+            kv_data_type = q_data_type
+        kv_data_type = canonicalize_torch_dtype(kv_data_type)
+        o_data_type = canonicalize_torch_dtype(o_data_type)
+
+        resolved, module = _resolve_prefill_module(
+            device=device,
+            requested_backend=_BACKEND_ALIASES.get(backend, backend),
+            kv_cache_page_size=kv_cache_page_size,
+            pos_encoding_mode=pos_encoding_mode,
+            use_fp16_qk_reduction=use_fp16_qk_reduction,
+            use_custom_mask=use_custom_mask,
+            q_data_type=q_data_type,
+            kv_data_type=kv_data_type,
+            index_dtype=indptr.dtype,
+            head_dim=head_dim,
+            logits_soft_cap=logits_soft_cap,
+            o_data_type=o_data_type,
+        )
+        if getattr(module, "workspace_size", None) is None:
+            raise NotImplementedError(
+                f"workspace_size is not available for the {resolved!r} backend"
+            )
+
+        num_blocks_row = len(indptr) - 1
+        # ``device="cpu"`` on every one of these, explicitly. The planner reads
+        # them through host pointers, and a caller inside a ``torch.device``
+        # context -- which is where a model is built -- would otherwise hand it
+        # CUDA tensors and the dereference is a segfault, not an error.
+        kv_indptr_host = indptr.to("cpu").contiguous()
+        qo_indptr_host = R * torch.arange(
+            num_blocks_row + 1, dtype=torch.int32, device="cpu"
+        )
+        qo_indptr_host[-1] = M
+        kv_lens_arr_host = ((kv_indptr_host[1:] - kv_indptr_host[:-1]) * C).contiguous()
+
+        # Only the device and its stream are read from this one; the planner
+        # computes both sizes rather than fitting them to a buffer.
+        args = [
+            torch.empty(0, dtype=torch.uint8, device=device),
+            qo_indptr_host,
+            kv_indptr_host,
+            kv_lens_arr_host,
+            M,  # total_num_rows
+            num_blocks_row,  # batch_size
+            num_qo_heads,
+            num_kv_heads,
+            C,  # page_size
+            False,  # is_cuda_graph_enabled
+            head_dim,
+            head_dim,
+            causal,
+            -1,  # window_left
+        ]
+        if resolved == "fa2":
+            args.append(-1)  # fixed_split_size
+            args.append(False)  # disable_split_kv
+            args.append(0)  # num_colocated_ctas
+            args.append(0)  # uniform_q_len
+        float_bytes, int_bytes = module.workspace_size(*args)
+        return int(float_bytes), int(int_bytes)
+
+    def workspace_size(
+        self,
+        indptr: torch.Tensor,
+        M: int,
+        R: int,
+        C: int,
+        num_qo_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        causal: bool = False,
+        pos_encoding_mode: str = "NONE",
+        use_fp16_qk_reduction: bool = False,
+        logits_soft_cap: Optional[float] = None,
+        q_data_type: Union[str, torch.dtype] = "float16",
+        kv_data_type: Optional[Union[str, torch.dtype]] = None,
+        o_data_type: Union[str, torch.dtype] = "float16",
+        use_custom_mask: bool = False,
+        kv_cache_page_size: Optional[int] = None,
+    ) -> Tuple[int, int]:
+        r"""How many bytes a plan for this geometry needs, before making one.
+
+        A caller that hands the wrapper its buffers has to size them, and a
+        caller holding several plans at once has to give each its own
+        non-overlapping region of the integer workspace: ``plan`` writes the
+        scheduler's own metadata there and keeps byte offsets into it, which
+        ``run`` reads back. Two live plans sharing those bytes means the second
+        plan overwrites what the first will read.
+
+        Nothing is planned and nothing is written here; the wrapper is left as
+        it was. :meth:`query_workspace_size` answers the same question without
+        a wrapper at all, which is what a caller sizing an arena before it
+        builds anything wants.
+        """
+        return BlockSparseAttentionWrapper.query_workspace_size(
+            self.device,
+            indptr,
+            M,
+            R,
+            C,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            causal=causal,
+            pos_encoding_mode=pos_encoding_mode,
+            use_fp16_qk_reduction=use_fp16_qk_reduction,
+            logits_soft_cap=logits_soft_cap,
+            q_data_type=q_data_type,
+            kv_data_type=kv_data_type,
+            o_data_type=o_data_type,
+            use_custom_mask=use_custom_mask,
+            kv_cache_page_size=kv_cache_page_size,
+            backend=self._requested_backend,
+        )
+
     @flashinfer_api
     def plan(
         self,
@@ -533,6 +996,7 @@ class BlockSparseAttentionWrapper:
         q_scale: Optional[torch.Tensor] = None,
         k_scale: Optional[torch.Tensor] = None,
         v_scale: Optional[torch.Tensor] = None,
+        kv_cache_page_size: Optional[int] = None,
     ) -> None:
         r"""Create auxiliary data structures for block sparse attention.
 
@@ -649,6 +1113,12 @@ class BlockSparseAttentionWrapper:
         v_scale : torch.Tensor, optional
             Sage FP8 quantization scale for ``v``, shape ``(num_qo_heads, head_dim)``,
             float32. See ``q_scale``.
+        kv_cache_page_size : int, optional
+            Page size of a paged KV cache passed to :meth:`run` as raw pages,
+            rather than as the gathered blocks the wrapper otherwise expects.
+            Read by the FA2 planner, so it is only supported for the ``auto``
+            and ``fa2`` backends and must be ``None`` for every other, which
+            plan without it.
 
         The :meth:`plan` method should be called before any :meth:`run` or
         :meth:`run_return_lse` calls, auxiliary data structures will be created
@@ -667,6 +1137,21 @@ class BlockSparseAttentionWrapper:
             kv_data_type = q_data_type
         kv_data_type = canonicalize_torch_dtype(kv_data_type)
         self._o_dtype = canonicalize_torch_dtype(o_data_type)
+
+        # plan() resolves the backend and writes the answer back, so a second
+        # plan has to start from the request again -- otherwise a paged plan
+        # that settled on fa2 keeps every later flat plan on fa2 too, and the
+        # resolution never runs a second time.
+        self._backend = self._requested_backend
+
+        if kv_cache_page_size is not None and self._requested_backend not in (
+            "auto",
+            "fa2",
+        ):
+            raise ValueError(
+                "kv_cache_page_size is read by the FA2 planner and is not "
+                f"supported for backend={self._requested_backend!r}"
+            )
 
         if self._backend != "vsa_sm100_blk64" and (
             kv_splits is not None
@@ -1143,12 +1628,41 @@ class BlockSparseAttentionWrapper:
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
 
+        if kv_cache_page_size is None and self._kv_layout == "HND":
+            raise ValueError(
+                "kv_layout='HND' only describes a raw paged cache; pass "
+                "kv_cache_page_size to plan() or construct the wrapper with "
+                "kv_layout='NHD'"
+            )
+        if kv_cache_page_size is not None:
+            if kv_cache_page_size < 1:
+                raise ValueError(
+                    f"kv_cache_page_size must be positive, got {kv_cache_page_size}"
+                )
+            if C != 1:
+                raise ValueError(
+                    "a route over a raw paged cache addresses one KV entry per "
+                    f"index, so C must be 1, got {C}"
+                )
+
         num_blocks_row = len(indptr) - 1
-        qo_indptr_host = R * torch.arange(num_blocks_row + 1, dtype=torch.int32)
+        # ``device="cpu"``: the planner reads this one through a host pointer,
+        # and a caller inside a ``torch.device`` context would otherwise build
+        # it on the device. See query_workspace_size.
+        qo_indptr_host = R * torch.arange(
+            num_blocks_row + 1, dtype=torch.int32, device="cpu"
+        )
         qo_indptr_host[-1] = M
         qo_indptr = qo_indptr_host.to(indptr.device, non_blocking=non_blocking)
-        if indices.numel() > 0 and indices.max().item() * C > N:
-            raise ValueError("indices out of bound")
+        if indices.numel():
+            # The kernel loads a route element into a uint32_t, so a negative
+            # index does not read low -- it reads far past the cache. The
+            # highest entry a route element covers is index * C + C - 1, which
+            # has to stay inside N.
+            if indices.min().item() < 0:
+                raise ValueError("indices must be non-negative")
+            if indices.max().item() * C + C > N:
+                raise ValueError("indices out of bound")
         last_block_len = torch.full(
             (num_blocks_row,), C, dtype=torch.int32, device=indptr.device
         )
@@ -1167,6 +1681,17 @@ class BlockSparseAttentionWrapper:
             packed_mask, mask_indptr = segment_packbits(
                 mask.contiguous().view(-1), mask_indptr, bitorder="little"
             )
+        elif packed_mask is not None:
+            # The row pointer above counts mask *bits*, which is what packing
+            # consumes; the kernel indexes the packed mask by *byte*. Building
+            # the mask here goes through segment_packbits, which returns the
+            # byte pointer -- a caller who packed the mask itself has to be
+            # given the same thing, or every row after the first is read from
+            # the wrong offset.
+            bits_per_row = mask_indptr[1:] - mask_indptr[:-1]
+            bytes_per_row = (bits_per_row + 7) // 8
+            mask_indptr = torch.zeros_like(mask_indptr)
+            torch.cumsum(bytes_per_row, dim=0, out=mask_indptr[1:])
 
         self._qo_indptr = qo_indptr.to(self.device, non_blocking=non_blocking)
         self._paged_kv_indptr_buf = indptr.to(self.device, non_blocking=non_blocking)
@@ -1192,16 +1717,27 @@ class BlockSparseAttentionWrapper:
         self.N = N
         self.R = R
         self.C = C
+        self._kv_cache_page_size = kv_cache_page_size
+        self._num_kv_heads = num_kv_heads
 
-        kv_indptr_host = indptr.to("cpu")
+        kv_indptr_host = indptr.to("cpu").contiguous()
 
         # NOTE(Zihao): we haven't supported mask in cuda-core implementations but it should
         # be easy to add support for it if needed, leave it as a future work.
         # at this moment, when mask is provided, we use the tensor-core implementation
+        # A packed NVFP4 cache is only served by the tensor-core FA2 prefill
+        # kernel: the decode path takes no block-scale tensors, so letting the
+        # heuristic pick it would silently read the FP4 bytes as plain values.
+        # A route over a raw paged cache is likewise FA2-only -- the decode
+        # entry point has no logical block size, so it would read the route's
+        # slots as page ids and address out of bounds.
+        nvfp4_kv = kv_data_type == torch.uint8
         if (
             R * (num_qo_heads // num_kv_heads) < 4
             and mask_mode != MaskMode.CUSTOM.value
             and q_data_type not in [torch.float8_e4m3fn, torch.float8_e5m2]
+            and not nvfp4_kv
+            and kv_cache_page_size is None
         ):
             # If the operation is not compute-bound, we use the cuda-core implementation
             self._use_tensor_cores = False
@@ -1238,43 +1774,24 @@ class BlockSparseAttentionWrapper:
             # if the operation is compute-bound, we use the tensor-core implementation
             self._use_tensor_cores = True
 
-            if self._backend == "auto":
-                self._backend = determine_attention_backend(
-                    self.device,
-                    PosEncodingMode[pos_encoding_mode].value,
-                    use_fp16_qk_reduction,
-                    mask_mode == MaskMode.CUSTOM.value,  # use_custom_mask
-                    q_data_type,
-                    kv_data_type,
-                    head_dim_qk=head_dim,
-                    head_dim_vo=head_dim,
-                )
-
-            get_module_args = (
-                q_data_type,
-                kv_data_type,
-                self._o_dtype,
-                indptr.dtype,
-                head_dim,  # head_dim_qk
-                head_dim,  # head_dim_vo
-                PosEncodingMode[pos_encoding_mode].value,
-                False,  # use_sliding_window
-                logits_soft_cap > 0,  # use_logits_soft_cap
-                use_fp16_qk_reduction,
-            )
-            self._cached_module = get_batch_prefill_module(
-                self._backend, *get_module_args
+            self._backend, self._cached_module = self._resolve_prefill_module(
+                kv_cache_page_size=kv_cache_page_size,
+                pos_encoding_mode=pos_encoding_mode,
+                use_fp16_qk_reduction=use_fp16_qk_reduction,
+                use_custom_mask=mask_mode == MaskMode.CUSTOM.value,
+                q_data_type=q_data_type,
+                kv_data_type=kv_data_type,
+                index_dtype=indptr.dtype,
+                head_dim=head_dim,
+                logits_soft_cap=logits_soft_cap,
+                o_data_type=self._o_dtype,
             )
 
-            kv_lens_arr_host = (kv_indptr_host[1:] - kv_indptr_host[:-1]) * self.C
-            required_size = len(kv_lens_arr_host)
-            if required_size > self._kv_lens_buffer.shape[0]:
-                self._kv_lens_buffer = torch.empty(
-                    (required_size,), dtype=torch.int32, device=self.device
-                )
-            self._kv_lens_buffer[:required_size].copy_(
-                kv_lens_arr_host,
-            )
+            # The planner takes the host copy; nothing downstream reads a
+            # device-side one, so none is kept.
+            kv_lens_arr_host = (
+                (kv_indptr_host[1:] - kv_indptr_host[:-1]) * self.C
+            ).contiguous()
 
             args = [
                 self._float_workspace_buffer,
@@ -1349,6 +1866,11 @@ class BlockSparseAttentionWrapper:
         lse: Optional[torch.Tensor] = None,
         return_lse: bool = False,
         enable_pdl: Optional[bool] = None,
+        kv_cache_sf: Optional[
+            Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+        ] = None,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute block-sparse attention between Q/K/V tensors.
 
@@ -1357,12 +1879,27 @@ class BlockSparseAttentionWrapper:
         q : torch.Tensor
             The query tensor with shape ``(M, num_qo_heads, head_dim)``.
         k : torch.Tensor
-            The key tensor with shape ``(N, num_kv_heads, head_dim)``.
+            The key tensor with shape ``(N, num_kv_heads, head_dim)``, or, when
+            ``plan`` was given ``kv_cache_page_size``, a paged cache with shape
+            ``(num_pages, page_size, num_kv_heads, head_dim)`` in NHD layout or
+            ``(num_pages, num_kv_heads, page_size, head_dim)`` in HND. The route
+            indexes it by entry and the wrapper resolves the page.
         v : torch.Tensor
-            The value tensor with shape ``(N, num_kv_heads, head_dim)``.
+            The value tensor, laid out as ``k``.
         scale_q : Optional[torch.Tensor]
             The scale tensor for query, per-head quantization with shape: ``[num_qo_heads]``.
             Used with FP8 Quantization. If not provided, will be set to ``1.0``.
+        kv_cache_sf : Optional[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]]
+            Per-block scale factors for an NVFP4 KV cache, either a stacked tensor
+            split on dim 1 or a ``(k_scales, v_scales)`` pair. Required when ``k``
+            and ``v`` are packed ``uint8`` FP4 tensors whose last dimension is
+            ``head_dim // 2``. Only the innermost scale dimension has to be
+            contiguous; page/token/head strides are read from the tensors.
+        k_scale : Optional[float]
+            Global dequantization scale for the key cache. Defaults to ``1.0``.
+        v_scale : Optional[float]
+            Global dequantization scale for the value cache, applied to the
+            output after normalization. Defaults to ``1.0``.
         scale_k : Optional[torch.Tensor]
             The scale tensor for key, per-head quantization with shape: ``[num_kv_heads]``.
             Used with FP8 Quantization. If not provided, will be set to ``1.0``.
@@ -1542,8 +2079,60 @@ class BlockSparseAttentionWrapper:
             rope_scale = 1.0
         if rope_theta is None:
             rope_theta = 1e4
-        k = k.reshape(-1, self.C, *k.shape[-2:])
-        v = v.reshape(-1, self.C, *v.shape[-2:])
+        if (k.dtype == torch.uint8 or v.dtype == torch.uint8) and kv_cache_sf is None:
+            raise ValueError("kv_cache_sf must be provided for an NVFP4 KV cache.")
+        if kv_cache_sf is not None:
+            _check_nvfp4_kv(k, v, kv_cache_sf, self._kv_layout, q.size(-1))
+        for name, value in (("k_scale", k_scale), ("v_scale", v_scale)):
+            if value is None:
+                continue
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be positive and finite, got {value}")
+        # Global scales fold outside the dots: the key scale multiplies the
+        # logits through sm_scale, the value scale the normalized output. This
+        # is how a packed NVFP4 cache carries its scale, and it is also the only
+        # way an FP8 cache can on FA2 -- the per-head scale tensors reach the
+        # FA3 entry point alone.
+        if k_scale is not None and k_scale != 1.0:
+            sm_scale = sm_scale * k_scale
+        key_block_scales, value_block_scales = (
+            _unpack_paged_kv_cache(kv_cache_sf, self._kv_layout)
+            if kv_cache_sf is not None
+            else (None, None)
+        )
+        if self._kv_cache_page_size is None:
+            k = k.reshape(-1, self.C, *k.shape[-2:])
+            v = v.reshape(-1, self.C, *v.shape[-2:])
+            if key_block_scales is not None:
+                # Scales follow the KV block structure, so give them the same
+                # (num_blocks, C, ...) shape the kernel expects for the data.
+                key_block_scales = key_block_scales.reshape(
+                    -1, self.C, *key_block_scales.shape[-2:]
+                )
+                value_block_scales = value_block_scales.reshape(
+                    -1, self.C, *value_block_scales.shape[-2:]
+                )
+        else:
+            # The route names KV entries of a cache that still stores whole
+            # pages, so the tensors keep their paged shape and the kernel
+            # divides each index back into (page, entry). Reshaping to blocks
+            # here is what would force an HND cache through a copy.
+            _check_paged_cache(
+                [
+                    (name, tensor)
+                    for name, tensor in (
+                        ("key", k),
+                        ("value", v),
+                        ("key scale", key_block_scales),
+                        ("value scale", value_block_scales),
+                    )
+                    if tensor is not None
+                ],
+                self._kv_layout,
+                self._kv_cache_page_size,
+                self._num_kv_heads,
+                self.N,
+            )
 
         if return_lse:
             if lse is None:
@@ -1567,11 +2156,26 @@ class BlockSparseAttentionWrapper:
 
             if scale_q is None:
                 scale_q = torch.ones(q.shape[1], dtype=torch.float32, device=q.device)
+        if is_float8(q) or is_float8(k):
+            # An FP8 cache carries its dequantization scale per KV head. The
+            # query does not have to be FP8 for that to apply: reading an FP8
+            # cache with a higher-precision query is the common paged case, and
+            # leaving these unset there drops the scale entirely.
+            # Length is the KV-head count, which plan() recorded: by this point
+            # k has either kept its 4D cache shape or been reshaped to
+            # (-1, C, heads, dim), so its second axis is a page size or a block
+            # width, and a shorter tensor is indexed past its end by kv_head.
             if scale_k is None:
-                scale_k = torch.ones(k.shape[1], dtype=torch.float32, device=q.device)
+                scale_k = torch.ones(
+                    self._num_kv_heads, dtype=torch.float32, device=q.device
+                )
             if scale_v is None:
-                scale_v = torch.ones(v.shape[1], dtype=torch.float32, device=q.device)
+                scale_v = torch.ones(
+                    self._num_kv_heads, dtype=torch.float32, device=q.device
+                )
 
+        # The scalar only exists on an NVFP4 module, and only that module can
+        # read a route of physical slots.
         if self._use_tensor_cores:
             self._cached_module.paged_run(
                 self._float_workspace_buffer,
@@ -1606,6 +2210,12 @@ class BlockSparseAttentionWrapper:
                 rope_theta,
                 0,  # token_pos_in_items_len
                 self._workspace_size,  # workspace_size
+                key_block_scales=key_block_scales,
+                value_block_scales=value_block_scales,
+                # The cache may still store whole pages while this route
+                # addresses one KV entry per index; the kernel needs both sizes
+                # to resolve a slot. Ignored unless the two differ.
+                kv_logical_block_size=self.C,
             )
         else:
             self._cached_module.run(
@@ -1630,6 +2240,24 @@ class BlockSparseAttentionWrapper:
                 rope_scale,
                 rope_theta,
             )
+
+        if v_scale is not None and v_scale != 1.0:
+            # Mirrors the paged wrapper: the value scale folds into the
+            # normalized output rather than the dots, and an 8-bit output takes
+            # the multiply in float32 because torch has no in-place float
+            # multiply for it.
+            if is_float8(out):
+                # In place, because `out` may be the caller's buffer: rebinding
+                # the name would return a scaled tensor and leave theirs holding
+                # the unscaled one.
+                #
+                # Reached through the cuda-core decode path, which is what a
+                # narrow flat route without a custom mask plans. The tensor-core
+                # prefill generators refuse an 8-bit output outright, so this
+                # never fires there.
+                out.copy_((out.to(torch.float32) * v_scale).to(out.dtype))
+            else:
+                out *= v_scale
 
         return (out, lse) if return_lse else out
 
@@ -1695,9 +2323,6 @@ class VariableBlockSparseAttentionWrapper:
             (8 * 1024 * 1024,), dtype=torch.uint8, device=self.device
         )
 
-        self._kv_lens_buffer = torch.empty(
-            (32768,), dtype=torch.int32, device=self.device
-        )
         self._pin_memory_int_workspace_buffer = torch.empty(
             self._int_workspace_buffer.shape,
             dtype=torch.uint8,
@@ -1956,15 +2581,9 @@ class VariableBlockSparseAttentionWrapper:
         )
         self._cached_module = get_batch_prefill_module(self._backend, *get_module_args)
 
+        # The planner takes the host copy; nothing downstream reads a
+        # device-side one, so none is kept.
         kv_lens_arr_host = kv_indptr_host[1:] - kv_indptr_host[:-1]  # page_size == 1
-        required_size = len(kv_lens_arr_host)
-        if required_size > self._kv_lens_buffer.shape[0]:
-            self._kv_lens_buffer = torch.empty(
-                (required_size,), dtype=torch.int32, device=self.device
-            )
-        self._kv_lens_buffer[:required_size].copy_(
-            kv_lens_arr_host,
-        )
 
         args = [
             self._float_workspace_buffer,
