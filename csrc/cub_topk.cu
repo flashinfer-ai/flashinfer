@@ -735,6 +735,65 @@ int64_t cub_topk_ragged_transform_workspace_size(TensorView input, TensorView le
   return static_cast<int64_t>(workspace_bytes);
 }
 
+// The same size query, from a description rather than from tensors. The query
+// above reads nothing but the shape, the dtype and the device -- it says so
+// itself, the iterator bases are never dereferenced -- so a caller sizing a
+// workspace before it has anything to put in it should not have to build a
+// score buffer to ask. `dtype_code` is 0 for float32, 1 for float16 and 2 for
+// bfloat16.
+int64_t cub_topk_ragged_transform_workspace_size_for(int64_t num_rows, int64_t max_len,
+                                                     int64_t dtype_code, int64_t device_id,
+                                                     int64_t top_k, int64_t tie_break,
+                                                     bool with_row_starts) {
+  TVM_FFI_ICHECK_GE(num_rows, 0) << "num_rows must not be negative";
+  TVM_FFI_ICHECK_GT(max_len, 0) << "max_len must be positive";
+  TVM_FFI_ICHECK_GT(top_k, 0) << "top_k must be positive";
+  TVM_FFI_ICHECK_LE(top_k, max_len) << "top_k must not exceed the row width";
+  if (num_rows == 0) {
+    return 0;
+  }
+
+  ffi::CUDADeviceGuard device_guard(static_cast<int>(device_id));
+  cudaStream_t stream = nullptr;
+
+  Optional<TensorView> no_workspace;
+  size_t workspace_bytes = 0;
+  cudaError_t status = cudaErrorInvalidValue;
+  // Stand-ins, in the same places the tensor-taking query puts them: the
+  // lengths base and the row-starts base are only ever used to pick the
+  // iterator type.
+  const int32_t* lengths_stub = nullptr;
+  const int32_t* row_starts_stub = with_row_starts ? lengths_stub : nullptr;
+  auto d_values_out = cuda::make_transform_iterator(cuda::make_counting_iterator(int64_t{0}),
+                                                    CUBMakeRaggedRowOut{nullptr, nullptr, top_k});
+  const int64_t row_stride = max_len;
+  switch (dtype_code) {
+    case 0:
+      status = CUBBatchedTopKVarLenTransform<float>(
+          nullptr, row_stride, row_starts_stub, d_values_out, lengths_stub, no_workspace, num_rows,
+          max_len, top_k, tie_break, &workspace_bytes, stream);
+      break;
+    case 1:
+      status = CUBBatchedTopKVarLenTransform<half>(
+          nullptr, row_stride, row_starts_stub, d_values_out, lengths_stub, no_workspace, num_rows,
+          max_len, top_k, tie_break, &workspace_bytes, stream);
+      break;
+    case 2:
+      status = CUBBatchedTopKVarLenTransform<nv_bfloat16>(
+          nullptr, row_stride, row_starts_stub, d_values_out, lengths_stub, no_workspace, num_rows,
+          max_len, top_k, tie_break, &workspace_bytes, stream);
+      break;
+    default:
+      TVM_FFI_ICHECK(false) << "dtype_code must be 0 (float32), 1 (float16) or 2 (bfloat16), got "
+                            << dtype_code;
+  }
+
+  TVM_FFI_ICHECK(status == cudaSuccess)
+      << "cub_topk_ragged_transform workspace-size query failed with error code "
+      << cudaGetErrorString(status);
+  return static_cast<int64_t>(workspace_bytes);
+}
+
 // CUB-backed plain batched top-k (torch.topk-style): for each row i of the dense
 // (num_rows, d) input, the top_k largest (value, index) pairs are written to
 // output_values[i] / output_indices[i], unsorted. Every row is full width — there is no
