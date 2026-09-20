@@ -499,21 +499,27 @@ def _support_agreement_comm(
 
         if dist.is_initialized():
             comm = TorchDistBackend(group=group)
+            comm_size = comm.Get_size()
         else:
             try:
                 comm = MPIBackend()
+                # The MPI adapter is lazy: with mpi4py absent the constructor
+                # succeeds and the first attribute access is what raises, so the
+                # optional dependency is probed by the size query, not by the call.
+                comm_size = comm.Get_size()
             except ImportError as exc:
-                # mpi4py is optional. With no caller-supplied collective and no
-                # initialized process group there is no way to reach the other
-                # ranks from here, and a variable *launch* environment must not
-                # turn a working rank-local decision into an exception.
+                # No caller-supplied collective and no initialized process group:
+                # there is no way to reach the other ranks from here, and a launch
+                # environment without mpi4py must not turn a working rank-local
+                # decision into an exception.
                 logger.debug(
                     "[allreduce-fusion] no support-agreement collective (%s); "
                     "each rank decides on its own",
                     exc,
                 )
                 return None
-    comm_size = comm.Get_size()
+    else:
+        comm_size = comm.Get_size()
     if comm_size != world_size:
         logger.warning(
             "[allreduce-fusion] support-agreement comm size %d != world_size %d; "

@@ -36,7 +36,7 @@ from flashinfer.comm import (
     create_allreduce_fusion_workspace,
 )
 from flashinfer.comm.allreduce import TRTLLMAllReduceFusionWorkspace
-from flashinfer.utils import BackendSupportedError
+from flashinfer.utils import BackendSupportedError, is_sm90a_supported
 
 # The architecture of the L20 (Ada) parts this work targets. Both backends of
 # the family are built for newer families, so 89 is the interesting rejection.
@@ -574,17 +574,30 @@ def test_comm_scoped_to_other_ranks_warns_and_decides_locally(monkeypatch):
 
 
 def test_absent_collective_leaves_the_rank_local_decision_alone(monkeypatch):
-    """B1-13: mpi4py is optional, so no collective means no new failure."""
+    """B1-13: mpi4py is optional, so no collective means no new failure.
 
-    class _NoMpi:
+    ``MPIBackend`` is a *lazy* adapter -- with mpi4py absent the constructor
+    succeeds and the first attribute access raises -- so the probe has to reach
+    ``Get_size()``; a stub that raises in ``__init__`` would pass while the real
+    adapter still turned a rejected creation into an ImportError.
+    """
+
+    class _LazyNoMpi:
+        def __init__(self):
+            pass
+
+        def Get_size(self):
+            raise ImportError("mpi4py is not installed")
+
+    class _EagerNoMpi:
         def __init__(self):
             raise ImportError("mpi4py is not installed")
 
-    monkeypatch.setattr(allreduce, "MPIBackend", _NoMpi)
     monkeypatch.setattr(dist, "is_initialized", lambda: False)
-
-    assert allreduce._agree_on_support(_SUPPORTED, 2, None, None) == _SUPPORTED
-    assert allreduce._agree_on_support(_REFUSED, 2, None, None) == _REFUSED
+    for adapter in (_LazyNoMpi, _EagerNoMpi):
+        monkeypatch.setattr(allreduce, "MPIBackend", adapter)
+        assert allreduce._agree_on_support(_SUPPORTED, 2, None, None) == _SUPPORTED
+        assert allreduce._agree_on_support(_REFUSED, 2, None, None) == _REFUSED
 
 
 # ---------------------------------------------------------------------------
@@ -592,13 +605,15 @@ def test_absent_collective_leaves_the_rank_local_decision_alone(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.arch_hopper
 def test_hopper_host_answers_supported_for_the_fast_path():
     """B1-14: where the architecture exists, the query says so.
 
-    The marker is what keeps this from passing on a host that cannot run the
-    path at all; the CI lane for it has to be a Hopper one.
+    Skips unless the host is SM90a, the way the attention suites gate on Hopper:
+    this asserts the *positive* answer, and the negative direction is covered on
+    every host by the capability-refusal cases above.
     """
+    if not torch.cuda.is_available() or not is_sm90a_supported(torch.device("cuda")):
+        pytest.skip("requires SM90a")
     major, minor = torch.cuda.get_device_capability()
     cc = major * 10 + minor
     assert cc == HOPPER_COMPUTE_CAPABILITY
@@ -606,12 +621,15 @@ def test_hopper_host_answers_supported_for_the_fast_path():
     assert create_allreduce_fusion_workspace.is_backend_supported("trtllm", cc) is True
 
 
-@pytest.mark.arch_hopper
 def test_two_rank_allreduce_matches_the_reference():
     """B1-11: the supported collective against ``torch.distributed``.
 
     Run with: mpirun -np 2 pytest -s tests/comm/test_comm_support_checks.py
+    Skips unless the host is SM90a and at least two ranks are launched; the
+    TRT-LLM allreduce kernels this builds a workspace for are Hopper-or-newer.
     """
+    if not torch.cuda.is_available() or not is_sm90a_supported(torch.device("cuda")):
+        pytest.skip("requires SM90a")
     from tests.test_helpers.comm import (
         cleanup_torch_distributed,
         init_torch_distributed_from_mpi,
