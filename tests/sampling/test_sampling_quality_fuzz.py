@@ -158,15 +158,21 @@ def _call(case, value, indices, seed: int, offset: int):
             **common,
         )
     elif api == "top_k_top_p_sampling_from_logits":
-        out = fn(value, _param(top_k), _param(top_p), filter_apply_order=spec.order, **common)
+        out = fn(
+            value, _param(top_k), _param(top_p), filter_apply_order=spec.order, **common
+        )
     else:
         raise ValueError(f"unhandled API {api}")
     return (out[0], out[1]) if want_valid else (out, None)
 
 
-def _open_stream(gen: torch.Generator, api: str, rows: int, dev: torch.device) -> Tuple[int, int]:
+def _open_stream(
+    gen: torch.Generator, api: str, rows: int, dev: torch.device
+) -> Tuple[int, int]:
     """Advance the generator by the API's documented reservation and return (seed, offset)."""
-    return flashinfer.sampling.get_seed_and_offset(rows * cases.ROWS_PER_DRAW[api], gen, dev)
+    return flashinfer.sampling.get_seed_and_offset(
+        rows * cases.ROWS_PER_DRAW[api], gen, dev
+    )
 
 
 def _stream_offset(gen: torch.Generator) -> int:
@@ -181,7 +187,9 @@ def _expected(case) -> Tuple[torch.Tensor, torch.Tensor]:
     else:
         probs = torch.tensor(case.probs, dtype=torch.float64)
     indices = None if case.indices is None else torch.tensor(case.indices)
-    return ref.target_distribution(probs, case.spec, indices=indices, keying=case.keying)
+    return ref.target_distribution(
+        probs, case.spec, indices=indices, keying=case.keying
+    )
 
 
 def _draw(case, dev: torch.device, gen: torch.Generator):
@@ -216,7 +224,10 @@ def _versions() -> Dict[str, str]:
 def _code_path(case, dev: torch.device) -> str:
     """Which internal path the case exercises (the fast path needs a scalar top_k on a large
     vocabulary), so a ledger entry names the code that actually ran."""
-    if case.api not in ("top_k_top_p_sampling_from_probs", "top_k_top_p_sampling_from_logits"):
+    if case.api not in (
+        "top_k_top_p_sampling_from_probs",
+        "top_k_top_p_sampling_from_logits",
+    ):
         return "direct-kernel"
     if case.spec.order == ref.ORDER_JOINT:
         return "joint-kernel"
@@ -264,7 +275,9 @@ def _ledger(case, tag: str, why: str, extra: Dict) -> None:
     )
     with open(path, "w") as handle:
         json.dump(entry, handle, indent=2, sort_keys=True, default=str)
-    pytest.fail(f"{tag}: {why}\n{json.dumps(entry, indent=2, sort_keys=True, default=str)}")
+    pytest.fail(
+        f"{tag}: {why}\n{json.dumps(entry, indent=2, sort_keys=True, default=str)}"
+    )
 
 
 def _ids(case_list) -> List[str]:
@@ -293,10 +306,19 @@ def test_one_hot_and_singular_support(case):
             case,
             "one-hot",
             "a singular-support row returned a token outside its only legal class",
-            {"streams": log, "reference_support": support.tolist(), "observed": samples.tolist()},
+            {
+                "streams": log,
+                "reference_support": support.tolist(),
+                "observed": samples.tolist(),
+            },
         )
     if valid is not None and not bool(valid[only].all()):
-        _ledger(case, "one-hot", "a legal singleton row reported valid=False", {"streams": log})
+        _ledger(
+            case,
+            "one-hot",
+            "a legal singleton row reported valid=False",
+            {"streams": log},
+        )
     print(f"{case.cid}: api={case.api} filter={case.spec.label()} note={case.note}")
     print(cases.replay_command(case.cid))
 
@@ -334,14 +356,24 @@ def test_support_set_and_zero_probability_tokens(case):
             case,
             "zero-probability",
             "a token with zero target mass was sampled",
-            {"streams": log, "reference_target": target.tolist(), "observed": samples.tolist()},
+            {
+                "streams": log,
+                "reference_target": target.tolist(),
+                "observed": samples.tolist(),
+            },
         )
-    if valid is not None and not torch.equal(valid, support.any(dim=-1).repeat(case.calls)):
+    if valid is not None and not torch.equal(
+        valid, support.any(dim=-1).repeat(case.calls)
+    ):
         _ledger(
             case,
             "valid",
             "valid mask disagrees with the oracle's legal-token set",
-            {"streams": log, "reference_support": support.tolist(), "valid": valid.tolist()},
+            {
+                "streams": log,
+                "reference_support": support.tolist(),
+                "valid": valid.tolist(),
+            },
         )
     print(
         f"{case.cid}: api={case.api} filter={case.spec.label()} draws={samples.numel()} "
@@ -385,7 +417,9 @@ def test_filter_values(case):
     else:
         got = fn(
             values,
-            _param(case.spec.top_p if case.api == "top_p_renorm_probs" else case.spec.top_k),
+            _param(
+                case.spec.top_p if case.api == "top_p_renorm_probs" else case.spec.top_k
+            ),
         )
         if not torch.equal(got > 0, support):
             _ledger(
@@ -451,7 +485,9 @@ def test_top_k_first_fast_path_and_slow_path_differ():
     stream = torch.Generator(device=dev).manual_seed(7)
     fast, slow = [], []
     for _ in range(calls):
-        seed, offset = _open_stream(stream, "top_k_top_p_sampling_from_probs", rows, dev)
+        seed, offset = _open_stream(
+            stream, "top_k_top_p_sampling_from_probs", rows, dev
+        )
         fast.append(
             flashinfer.sampling.top_k_top_p_sampling_from_probs(
                 probs, top_k, top_p, seed=seed, offset=offset
@@ -459,7 +495,9 @@ def test_top_k_first_fast_path_and_slow_path_differ():
         )
     k_tensor = torch.full((rows,), top_k, dtype=torch.int32, device=dev)
     for _ in range(calls):
-        seed, offset = _open_stream(stream, "top_k_top_p_sampling_from_probs", rows, dev)
+        seed, offset = _open_stream(
+            stream, "top_k_top_p_sampling_from_probs", rows, dev
+        )
         slow.append(
             flashinfer.sampling.top_k_top_p_sampling_from_probs(
                 probs, k_tensor, top_p, seed=seed, offset=offset
@@ -467,10 +505,14 @@ def test_top_k_first_fast_path_and_slow_path_differ():
         )
     fast, slow = torch.cat(fast), torch.cat(slow)
     assert flashinfer.sampling._top_k_first_fast_path_applicable(probs, top_k, None)
-    assert not flashinfer.sampling._top_k_first_fast_path_applicable(probs, k_tensor, None)
+    assert not flashinfer.sampling._top_k_first_fast_path_applicable(
+        probs, k_tensor, None
+    )
     legal = int(support.sum())
     for name, got in (("fast", fast), ("slow", slow)):
-        assert bool(support[0, got.long()].all()), f"{name} path left the value-based support"
+        assert bool(support[0, got.long()].all()), (
+            f"{name} path left the value-based support"
+        )
         assert int(got.max()) < legal, f"{name} path sampled an exactly-zero token"
     distinct_fast = int(fast.unique().numel())
     distinct_slow = int(slow.unique().numel())
@@ -524,7 +566,9 @@ def test_rng_stream_contract(case):
         )
     again, _ = _call(case, value, indices, seed, offset)
     if not torch.equal(first, again):
-        _ledger(case, "rng-replay", "the same (seed, offset) did not reproduce bitwise", {})
+        _ledger(
+            case, "rng-replay", "the same (seed, offset) did not reproduce bitwise", {}
+        )
     gen.set_state(gen.get_state())
     seed2, offset2 = _open_stream(gen, case.api, rows, dev)
     if (seed2, offset2) != (seed, offset):
@@ -536,13 +580,22 @@ def test_rng_stream_contract(case):
         )
     third, _ = _call(case, value, indices, seed2, offset2)
     if not torch.equal(first, third):
-        _ledger(case, "rng-state", "restored generator state did not reproduce the samples", {})
+        _ledger(
+            case,
+            "rng-state",
+            "restored generator state did not reproduce the samples",
+            {},
+        )
     support, _ = _expected(case)
     shifted = ""
     if int(support.sum(dim=-1).max()) > 1:
         other, _ = _call(case, value, indices, seed, offset + 4)
-        shifted = f" shifted_offset_changed={int((first != other).sum())}/{first.numel()}"
-    print(f"{case.cid}: step={step} rows_per_draw={cases.ROWS_PER_DRAW[case.api]}{shifted}")
+        shifted = (
+            f" shifted_offset_changed={int((first != other).sum())}/{first.numel()}"
+        )
+    print(
+        f"{case.cid}: step={step} rows_per_draw={cases.ROWS_PER_DRAW[case.api]}{shifted}"
+    )
 
 
 # --------------------------------------------------------------------------------------
@@ -583,8 +636,12 @@ def test_indices_map_outputs_to_the_declared_source_rows():
                 indices=tuple(pattern),
                 index_dtype=index_dtype,
             )
-            seed, offset = _open_stream(torch.Generator(device=dev).manual_seed(5), api, 4, dev)
-            got, _ = _call(case, logits if api in LOGITS_APIS else probs, indices, seed, offset)
+            seed, offset = _open_stream(
+                torch.Generator(device=dev).manual_seed(5), api, 4, dev
+            )
+            got, _ = _call(
+                case, logits if api in LOGITS_APIS else probs, indices, seed, offset
+            )
             if got.dtype != index_dtype or not torch.equal(got, want):
                 _ledger(
                     case,
@@ -610,7 +667,9 @@ def test_check_nan_is_per_function():
     probs = torch.tensor([good, bad], dtype=torch.float32, device=dev)
     logits = torch.zeros((2, 8), dtype=torch.float32, device=dev)
     logits[1] = float("nan")
-    nan_probs_case = cases.SupportCase("det/nan/probs", "sampling_from_probs", (good, bad))
+    nan_probs_case = cases.SupportCase(
+        "det/nan/probs", "sampling_from_probs", (good, bad)
+    )
     nan_logits_case = cases.SupportCase(
         "det/nan/logits", "sampling_from_logits", (good, bad), logits=bad
     )
@@ -685,7 +744,9 @@ def test_return_valid_and_output_dtype_contract():
         samples, valid = fn(value, return_valid=True, **kwargs)
         assert samples.dtype == torch.int32 and samples.shape == (3,)
         assert valid.dtype == torch.bool and valid.shape == (3,) and bool(valid.all())
-        typed = fn(value, indices=torch.arange(3, dtype=torch.int64, device=dev), **kwargs)
+        typed = fn(
+            value, indices=torch.arange(3, dtype=torch.int64, device=dev), **kwargs
+        )
         assert typed.dtype == torch.int64 and typed.shape == (3,)
         plain = fn(value, **kwargs)
         assert plain.dtype == torch.int32 and plain.shape == (3,)
@@ -717,10 +778,30 @@ def test_degenerate_row_contract():
     zero_row = (0.0,) * 8
     normal_row = (0.125,) * 8
     checks = (
-        ("det/degenerate/from_probs", "sampling_from_probs", ref.FilterSpec(), zero_row),
-        ("det/degenerate/top_k", "top_k_sampling_from_probs", ref.FilterSpec(top_k=4), zero_row),
-        ("det/degenerate/top_p", "top_p_sampling_from_probs", ref.FilterSpec(top_p=0.9), zero_row),
-        ("det/degenerate/min_p", "min_p_sampling_from_probs", ref.FilterSpec(min_p=0.1), zero_row),
+        (
+            "det/degenerate/from_probs",
+            "sampling_from_probs",
+            ref.FilterSpec(),
+            zero_row,
+        ),
+        (
+            "det/degenerate/top_k",
+            "top_k_sampling_from_probs",
+            ref.FilterSpec(top_k=4),
+            zero_row,
+        ),
+        (
+            "det/degenerate/top_p",
+            "top_p_sampling_from_probs",
+            ref.FilterSpec(top_p=0.9),
+            zero_row,
+        ),
+        (
+            "det/degenerate/min_p",
+            "min_p_sampling_from_probs",
+            ref.FilterSpec(min_p=0.1),
+            zero_row,
+        ),
         (
             "det/degenerate/joint",
             "top_k_top_p_sampling_from_probs",
@@ -754,7 +835,8 @@ def test_degenerate_row_contract():
         if got != want:
             if finding is not None:
                 LEDGER.report_expected_failures(
-                    [(finding, cid)], context=f"{cid}: got {got}, contract expects {want}"
+                    [(finding, cid)],
+                    context=f"{cid}: got {got}, contract expects {want}",
                 )
             _ledger(
                 case,
@@ -808,8 +890,12 @@ def test_distribution_matches_the_oracle(case):
     effective = p > 0
     zero_hits = int(counts[~effective].sum())
     deviation = (p_hat - p).abs()
-    bad = [int(c) for c in range(vocab) if bool(effective[c]) and float(deviation[c]) > hw]
-    assert int(effective.sum()) == per_case[case.cid], "declared K disagrees with the oracle"
+    bad = [
+        int(c) for c in range(vocab) if bool(effective[c]) and float(deviation[c]) > hw
+    ]
+    assert int(effective.sum()) == per_case[case.cid], (
+        "declared K disagrees with the oracle"
+    )
     print(
         f"{case.cid}: api={case.api} filter={case.spec.label()} N={N_TRIALS} K={k} "
         f"hw={hw:.6f} classes={int(effective.sum())} max|dp|="

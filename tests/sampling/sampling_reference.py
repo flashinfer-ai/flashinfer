@@ -43,7 +43,9 @@ KEYING_BLOCK = "block"
 
 def _f64(x: torch.Tensor) -> torch.Tensor:
     if x.dim() != 2:
-        raise ValueError(f"expected a 2D (rows, vocab) tensor, got shape {tuple(x.shape)}")
+        raise ValueError(
+            f"expected a 2D (rows, vocab) tensor, got shape {tuple(x.shape)}"
+        )
     t = x if x.dtype == torch.float64 else x.double()
     if t.numel() and (bool(torch.isnan(t).any()) or float(t.min()) < 0.0):
         raise ValueError("the oracle needs non-negative probabilities")
@@ -86,7 +88,9 @@ def group_stats(probs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         torch.where(is_new, idx, torch.full_like(idx, -1)), dim=-1
     ).values
     mass = torch.empty_like(sorted_p).scatter_(-1, order, mass_at_start)
-    count = torch.empty_like(sorted_p, dtype=torch.int64).scatter_(-1, order, pos_at_start)
+    count = torch.empty_like(sorted_p, dtype=torch.int64).scatter_(
+        -1, order, pos_at_start
+    )
     return mass, count
 
 
@@ -126,7 +130,9 @@ def expand_param(
     if t.dim() == 0:
         return t.expand(src.numel())
     if t.dim() != 1:
-        raise ValueError(f"filter parameter must be 0D or 1D, got shape {tuple(t.shape)}")
+        raise ValueError(
+            f"filter parameter must be 0D or 1D, got shape {tuple(t.shape)}"
+        )
     if t.numel() != n_prob_rows:
         raise ValueError(
             f"filter parameter length {t.numel()} does not match the {n_prob_rows} "
@@ -176,8 +182,12 @@ def retained_mask(
     rows = p.index_select(0, source_rows(n_prob_rows, indices))
     mass, count = group_stats(rows)
     keep = torch.ones_like(rows, dtype=torch.bool)
-    top_k = expand_param(spec.top_k, n_prob_rows=n_prob_rows, indices=indices, keying=keying)
-    top_p = expand_param(spec.top_p, n_prob_rows=n_prob_rows, indices=indices, keying=keying)
+    top_k = expand_param(
+        spec.top_k, n_prob_rows=n_prob_rows, indices=indices, keying=keying
+    )
+    top_p = expand_param(
+        spec.top_p, n_prob_rows=n_prob_rows, indices=indices, keying=keying
+    )
     if spec.order not in (ORDER_TOP_K_FIRST, ORDER_JOINT):
         raise ValueError(f"unknown filter order {spec.order!r}")
     if top_k is not None:
@@ -203,7 +213,7 @@ def retained_mask(
 
 def target_distribution(
     probs: torch.Tensor,
-    spec: FilterSpec = FilterSpec(),
+    spec: Optional[FilterSpec] = None,
     *,
     indices: Optional[torch.Tensor] = None,
     keying: str = KEYING_ROW,
@@ -215,6 +225,8 @@ def target_distribution(
     with an empty support yields an all-zero target row: no legal token exists for it, which the
     sampling APIs report through ``valid`` (see :func:`degenerate_expectation`).
     """
+    if spec is None:
+        spec = FilterSpec()
     p = _f64(probs)
     rows = p.index_select(0, source_rows(p.shape[0], indices))
     keep = retained_mask(p, spec, indices=indices, keying=keying) & (rows > 0)

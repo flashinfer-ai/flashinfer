@@ -69,7 +69,10 @@ def test_hand_solvable_top_k_and_top_p():
     support, target = ref.target_distribution(p, ref.FilterSpec(top_k=2))
     assert support.tolist() == [[True, True, False, False]]
     torch.testing.assert_close(
-        target, torch.tensor([[2 / 3, 1 / 3, 0.0, 0.0]], dtype=torch.float64), atol=0, rtol=0
+        target,
+        torch.tensor([[2 / 3, 1 / 3, 0.0, 0.0]], dtype=torch.float64),
+        atol=0,
+        rtol=0,
     )
     # k = 3 reaches the two-way tie at 1/8, and a value-based top-k keeps both.
     support, target = ref.target_distribution(p, ref.FilterSpec(top_k=3))
@@ -81,7 +84,10 @@ def test_hand_solvable_top_k_and_top_p():
     support, target = ref.target_distribution(p, ref.FilterSpec(top_p=0.75))
     assert support.tolist() == [[True, True, False, False]]
     torch.testing.assert_close(
-        target, torch.tensor([[2 / 3, 1 / 3, 0.0, 0.0]], dtype=torch.float64), atol=0, rtol=0
+        target,
+        torch.tensor([[2 / 3, 1 / 3, 0.0, 0.0]], dtype=torch.float64),
+        atol=0,
+        rtol=0,
     )
     # ... and included once the cumulative mass passes it.
     support, _ = ref.target_distribution(p, ref.FilterSpec(top_p=0.875))
@@ -105,7 +111,9 @@ def test_hand_solvable_min_p_is_inclusive():
     """p = (1/2, 1/4, 1/4): min-p keeps the exact relative threshold, top-p does not."""
     p = torch.tensor([[0.5, 0.25, 0.25]])
     support, _ = ref.target_distribution(p, ref.FilterSpec(min_p=0.5))
-    assert support.tolist() == [[True, True, True]], "min_p is inclusive at max(p) * min_p"
+    assert support.tolist() == [[True, True, True]], (
+        "min_p is inclusive at max(p) * min_p"
+    )
     support, _ = ref.target_distribution(p, ref.FilterSpec(min_p=0.500001))
     assert support.tolist() == [[True, False, False]]
     support, _ = ref.target_distribution(p, ref.FilterSpec(top_p=0.5))
@@ -133,7 +141,9 @@ def test_hand_solvable_top_k_first_vs_joint():
     assert k_first.tolist() == [[True, True, True, False, False, False, False, False]]
     assert joint.tolist() == [[True, True, True, True, False, False, False, False]]
     assert bool((joint & ~k_first).any()), "this case must separate the two orders"
-    kept_k = torch.tensor([[0.5, 0.25, 0.125, 0.0, 0.0, 0.0, 0.0, 0.0]], dtype=torch.float64)
+    kept_k = torch.tensor(
+        [[0.5, 0.25, 0.125, 0.0, 0.0, 0.0, 0.0, 0.0]], dtype=torch.float64
+    )
     kept_joint = torch.tensor(
         [[0.5, 0.25, 0.125, 0.0625, 0.0, 0.0, 0.0, 0.0]], dtype=torch.float64
     )
@@ -185,7 +195,9 @@ def test_shard_plan_is_an_exact_cover():
     shards = 4
     per_shard = [cases.shard_ids(i, shards) for i in range(shards)]
     flat = [cid for group in per_shard for cid in group]
-    assert sorted(flat) == sorted(cases.ALL_IDS), "a shard must not drop or duplicate a case"
+    assert sorted(flat) == sorted(cases.ALL_IDS), (
+        "a shard must not drop or duplicate a case"
+    )
     # The plan is a pure function of (shard index, shard count): re-running a shard resumes it.
     assert per_shard == [cases.shard_ids(i, shards) for i in range(shards)]
 
@@ -200,11 +212,15 @@ def test_single_case_replay_selects_exactly_one(monkeypatch):
     owning = next(i for i in range(4) if target.cid in cases.shard_ids(i, 4))
     monkeypatch.setattr(cases, "ONLY_CASE", target.cid)
     monkeypatch.setattr(cases, "SHARD", "")
-    assert [c.cid for c in cases.select(cases.SUPPORT_CASES)] == [target.cid], "no shard filter"
+    assert [c.cid for c in cases.select(cases.SUPPORT_CASES)] == [target.cid], (
+        "no shard filter"
+    )
     monkeypatch.setattr(cases, "SHARD", f"{owning}/4")
     assert [c.cid for c in cases.select(cases.SUPPORT_CASES)] == [target.cid]
     monkeypatch.setattr(cases, "SHARD", f"{(owning + 1) % 4}/4")
-    assert cases.select(cases.SUPPORT_CASES) == [], "a shard must drop the cases it does not own"
+    assert cases.select(cases.SUPPORT_CASES) == [], (
+        "a shard must drop the cases it does not own"
+    )
     # An unknown case id is rejected at load time, not silently collected as nothing.
     with pytest.raises(ValueError, match="not a declared case id"):
         cases.validate_only_case("no/such/case")
@@ -267,7 +283,9 @@ def test_oracle_rejects_wrong_distribution_and_wrong_row_mapping():
     hw = stats.half_width(n_trials, k)
     rng = torch.Generator().manual_seed(20260919)
     target = torch.tensor([REFERENCE_P], dtype=torch.float64)
-    observed = ref.frequencies(ref.inverse_cdf_sample(target, n_trials, rng), len(REFERENCE_P))
+    observed = ref.frequencies(
+        ref.inverse_cdf_sample(target, n_trials, rng), len(REFERENCE_P)
+    )
     assert stats.violations(observed[0].tolist(), REFERENCE_P, hw) == []
     # An exactly-zero class is unreachable: a structural check, not a statistical one.
     assert float(observed[0][-1]) == 0.0

@@ -102,9 +102,18 @@ def _support_cases() -> List[SupportCase]:
     # runs on its own Philox subsequence, so one call is 4096 independent draws of that row.
     draws = tuple([0] * TRIAL_ROWS)
 
-    def single(cid, api, row, spec, note, indices=draws, calls=1, index_dtype=torch.int32):
+    def single(
+        cid, api, row, spec, note, indices=draws, calls=1, index_dtype=torch.int32
+    ):
         return SupportCase(
-            cid, api, (row,), spec, indices=indices, index_dtype=index_dtype, calls=calls, note=note
+            cid,
+            api,
+            (row,),
+            spec,
+            indices=indices,
+            index_dtype=index_dtype,
+            calls=calls,
+            note=note,
         )
 
     one_hot_specs = (
@@ -262,7 +271,10 @@ def _support_cases() -> List[SupportCase]:
 def _dist_cases() -> List[DistCase]:
     return [
         DistCase(
-            "dist/uniform/from_probs", "sampling_from_probs", (UNIFORM8,), note="uniform 8"
+            "dist/uniform/from_probs",
+            "sampling_from_probs",
+            (UNIFORM8,),
+            note="uniform 8",
         ),
         DistCase(
             "dist/uniform/from_logits",
@@ -271,7 +283,10 @@ def _dist_cases() -> List[DistCase]:
             note="equal logits => uniform",
         ),
         DistCase(
-            "dist/bimodal/from_probs", "sampling_from_probs", (BIMODAL8,), note="dyadic bimodal"
+            "dist/bimodal/from_probs",
+            "sampling_from_probs",
+            (BIMODAL8,),
+            note="dyadic bimodal",
         ),
         DistCase(
             "dist/sparse/from_probs",
@@ -385,7 +400,9 @@ def validate_only_case(spec: Optional[str] = None) -> None:
     """
     raw = ONLY_CASE if spec is None else spec
     if raw and raw not in ALL_IDS:
-        raise ValueError(f"FLASHINFER_SAMPLING_FUZZ_ONLY_CASE={raw} is not a declared case id")
+        raise ValueError(
+            f"FLASHINFER_SAMPLING_FUZZ_ONLY_CASE={raw} is not a declared case id"
+        )
 
 
 validate_only_case()
@@ -408,20 +425,28 @@ def dist_logits(case: DistCase) -> torch.Tensor:
     """Logits whose softmax is the case distribution (logits entry points only)."""
     probs = torch.tensor(case.probs, dtype=torch.float64)
     if not bool((probs > 0).all()):
-        raise ValueError(f"{case.cid}: logits cases need a strictly positive distribution")
+        raise ValueError(
+            f"{case.cid}: logits cases need a strictly positive distribution"
+        )
     return torch.log(probs)
 
 
 def dist_target(case: DistCase) -> Tuple[torch.Tensor, torch.Tensor]:
     """(support, target) for a distribution case, in float64 on the CPU."""
     if case.api in ("sampling_from_logits", "top_k_top_p_sampling_from_logits"):
-        return ref.target_distribution(ref.reference_softmax(dist_logits(case)), case.spec)
-    return ref.target_distribution(torch.tensor(case.probs, dtype=torch.float64), case.spec)
+        return ref.target_distribution(
+            ref.reference_softmax(dist_logits(case)), case.spec
+        )
+    return ref.target_distribution(
+        torch.tensor(case.probs, dtype=torch.float64), case.spec
+    )
 
 
 def round_comparisons() -> Tuple[int, Dict[str, int]]:
     """Declared ``K``: (config x effective class) comparisons over the distribution layer."""
-    per_case = {case.cid: ref.effective_classes(dist_target(case)[1]) for case in DIST_CASES}
+    per_case = {
+        case.cid: ref.effective_classes(dist_target(case)[1]) for case in DIST_CASES
+    }
     return sum(per_case.values()), per_case
 
 
@@ -465,7 +490,9 @@ def select(cases: Sequence, ids: Optional[Sequence[str]] = None) -> List:
         chosen = [c for c in chosen if c.cid == ONLY_CASE]
     shard = parse_shard()
     if shard is not None:
-        owned = set(shard_ids(shard[0], shard[1], list(ids if ids is not None else ALL_IDS)))
+        owned = set(
+            shard_ids(shard[0], shard[1], list(ids if ids is not None else ALL_IDS))
+        )
         chosen = [c for c in chosen if c.cid in owned]
     return chosen
 

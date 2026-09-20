@@ -174,7 +174,9 @@ def calibrate(
             else:
                 power_hits[slot] += int(bool(bad))
         counts = draw_counts(p, n_trials, rng)
-        power_perm += int(bool(violations([c / n_trials for c in reversed(counts)], p, hw)))
+        power_perm += int(
+            bool(violations([c / n_trials for c in reversed(counts)], p, hw))
+        )
     return Calibration(
         n_trials=n_trials,
         n_comparisons=n_comparisons,
