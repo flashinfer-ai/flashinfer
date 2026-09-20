@@ -14,6 +14,8 @@ on:
       - 'build_utils.py'
       - 'ci/cuda-versions.json'
       - 'ci/validate_cuda_versions.py'
+      - 'flashinfer/artifacts.py'
+      - 'flashinfer-cubin/**'
       - 'flashinfer-jit-cache-provider/**'
       - 'flashinfer-jit-cache/**'
       - 'scripts/build_flashinfer_jit_cache_artifact.sh'
@@ -190,12 +192,22 @@ jobs:
         with:
           python-version-file: '.python-version'
 
+      - name: Restore cubin download cache
+        id: cubin-cache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: flashinfer-cubin/flashinfer_cubin/cubins
+          key: flashinfer-cubins-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flashinfer/artifacts.py') }}
+          restore-keys: |
+            flashinfer-cubins-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flashinfer/artifacts.py') }}-partial-
+
       - name: Install build dependencies
         run: |
           python -m pip install --upgrade pip
           pip install build twine wheel
 
       - name: Build flashinfer-cubin wheel
+        id: build-cubin-wheel
         run: |
           echo "Building flashinfer-cubin..."
           echo "Git commit: $(git rev-parse HEAD)"
@@ -205,6 +217,24 @@ jobs:
           ls -lh dist/
           mkdir -p ../dist
           cp dist/*.whl ../dist/
+
+      - name: Remove cubin cache lock files
+        if: always()
+        run: find flashinfer-cubin/flashinfer_cubin/cubins -type f -name '*.lock' -delete
+
+      - name: Save partial cubin download cache
+        if: failure() && steps.build-cubin-wheel.outcome == 'failure' && steps.cubin-cache-restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: flashinfer-cubin/flashinfer_cubin/cubins
+          key: flashinfer-cubins-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flashinfer/artifacts.py') }}-partial-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Save complete cubin download cache
+        if: steps.build-cubin-wheel.outcome == 'success' && steps.cubin-cache-restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: flashinfer-cubin/flashinfer_cubin/cubins
+          key: flashinfer-cubins-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flashinfer/artifacts.py') }}
 
       - name: Upload flashinfer-cubin artifact
         uses: actions/upload-artifact@v4

@@ -126,12 +126,22 @@ jobs:
         with:
           python-version-file: '.python-version'
 
+      - name: Restore cubin download cache
+        id: cubin-cache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: flashinfer-cubin/flashinfer_cubin/cubins
+          key: flashinfer-cubins-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flashinfer/artifacts.py') }}
+          restore-keys: |
+            flashinfer-cubins-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flashinfer/artifacts.py') }}-partial-
+
       - name: Install build dependencies
         run: |
           python -m pip install --upgrade pip
           pip install build twine wheel
 
       - name: Build flashinfer-cubin wheel
+        id: build-cubin-wheel
         env:
           FLASHINFER_DEV_RELEASE_SUFFIX: ${{ needs.setup.outputs.dev_suffix }}
         run: |
@@ -143,6 +153,24 @@ jobs:
           ls -lh dist/
           mkdir -p ../dist
           cp dist/*.whl ../dist/
+
+      - name: Remove cubin cache lock files
+        if: always()
+        run: find flashinfer-cubin/flashinfer_cubin/cubins -type f -name '*.lock' -delete
+
+      - name: Save partial cubin download cache
+        if: failure() && steps.build-cubin-wheel.outcome == 'failure' && steps.cubin-cache-restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: flashinfer-cubin/flashinfer_cubin/cubins
+          key: flashinfer-cubins-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flashinfer/artifacts.py') }}-partial-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Save complete cubin download cache
+        if: steps.build-cubin-wheel.outcome == 'success' && steps.cubin-cache-restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: flashinfer-cubin/flashinfer_cubin/cubins
+          key: flashinfer-cubins-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flashinfer/artifacts.py') }}
 
       - name: Upload flashinfer-cubin artifact
         uses: actions/upload-artifact@v4
@@ -358,6 +386,8 @@ jobs:
           RELEASE_SUFFIX: ${{ needs.setup.outputs.dev_suffix }}
           RELEASE_TAG: ${{ needs.setup.outputs.release_tag }}
           RELEASE_VERSION: ${{ needs.setup.outputs.version }}
+          SOURCE_COMMIT_URL: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
+          SOURCE_SHA: ${{ github.sha }}
         run: |
           # Delete existing release and tag if they exist
           if gh release view "${RELEASE_TAG}" --repo "${NIGHTLY_RELEASE_REPOSITORY}" &>/dev/null; then
@@ -369,10 +399,16 @@ jobs:
           fi
 
           # Create new release without assets first
+          printf -v RELEASE_NOTES \
+            'Automated nightly build for version %s (dev%s)\n\nSource commit: [%s](%s)' \
+            "${RELEASE_VERSION}" \
+            "${RELEASE_SUFFIX}" \
+            "${SOURCE_SHA}" \
+            "${SOURCE_COMMIT_URL}"
           gh release create "${RELEASE_TAG}" \
             --repo "${NIGHTLY_RELEASE_REPOSITORY}" \
             --title "Nightly Release v${RELEASE_VERSION}-${RELEASE_SUFFIX}" \
-            --notes "Automated nightly build for version ${RELEASE_VERSION} (dev${RELEASE_SUFFIX})" \
+            --notes "${RELEASE_NOTES}" \
             --prerelease
 
       - name: Download flashinfer-python artifact

@@ -134,7 +134,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             gate_up_clamp=_resolve_gate_up_clamp(k),
             activation_clamp=k.activation_clamp,
             apply_topk_in_fc1=k.apply_topk_in_fc1,
-            in_kernel_fc2_reduce=k.in_kernel_fc2_reduce,
+            enable_in_kernel_fc2_reduce=k.enable_in_kernel_fc2_reduce,
             defer_topk_reduce=self._uses_native_topk_reduce(fleet_params),
             combine_dtype=k.combine_dtype,
             fc1_alpha=k.fc1_alpha,
@@ -152,7 +152,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             and fleet_params.max_tokens_per_rank in (256, 4096)
             and fleet_params.token_hidden_size == 4096
             and k.top_k == 6
-            and not k.in_kernel_fc2_reduce
+            and not k.enable_in_kernel_fc2_reduce
             and k.combine_dtype == "bf16"
             and k.apply_topk_in_fc1
         )
@@ -423,7 +423,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             2 * k.intermediate_size,
             _resolve_gate_up_clamp(k),
             k.apply_topk_in_fc1,
-            k.in_kernel_fc2_reduce,
+            k.enable_in_kernel_fc2_reduce,
             self._uses_native_topk_reduce(fleet_params),
             k.combine_dtype,
             epilogue_pool_key(k.fc1_alpha),

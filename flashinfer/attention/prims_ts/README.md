@@ -5,6 +5,11 @@ kernels for NVIDIA Blackwell GPUs. Scheduling, tile selection, and split-KV
 reduction are implementation details; the public interfaces expose attention
 and cache semantics without tuning knobs.
 
+Public entry points marked with `@flashinfer_experimental_api` warn once on
+first use and provide no compatibility guarantee. Calling an API is the opt-in;
+no environment variable is required. Existing API logging and `fi_trace`
+bindings remain available.
+
 Current accuracy and performance signoff is on SM100a/B200. SM103a/B300 is
 admitted by the runtime architecture guard but is not yet signoff-qualified.
 The QToken-KvBlock-Sparse-Attention extension is separately validated on SM103/GB300.
@@ -57,13 +62,18 @@ and fixed decode using a caller-cached SM count, then fixes G for each plan.
 ## QToken-KvBlock-Sparse-Attention interface
 
 QToken-KvBlock-Sparse-Attention consumes per-query indexer output directly.
-`indexer_block_ids[total_q, block_topk]` contains logical K/V-block IDs;
-it is deliberately not named `block_indices`, which belongs to BSR.
+`indexer_block_ids` contains logical K/V-block IDs: `[total_q, block_topk]`
+when `share_pattern_across_kv_heads=True` (default), otherwise
+`[total_q, Hkv, block_topk]`. It is deliberately not named `block_indices`,
+which belongs to BSR. The last dimension is contiguous.
 `block_table[num_requests, max_storage_pages]` maps each request's logical
 storage pages to separate HND K/V caches shaped
 `[num_pages, Hkv, page_size, D]`. `kv_block_size` is the semantic indexer
-atom and currently supports only four tokens; `page_size` is the independent
-physical cache-page extent.
+atom, supporting 4/8/16/32/64/128 tokens; `page_size` is the independent
+physical cache-page extent and must be a positive multiple of four. Semantic
+blocks may cross physical pages. The loader resolves each fragment of size
+`gcd(kv_block_size, page_size)` through the dense table, without assuming
+physical adjacency. The KV-cache writer must zero-fill unused page padding.
 
 The public lifecycle matches paged block-sparse attention:
 
@@ -89,18 +99,34 @@ be divisible by a suggested group: packed mode permits a shorter final route,
 while fixed mode may append consecutive semantic dummy rows and discard their
 outputs.
 
+`split_kv=False` selects nonsplit execution and omits reduction scratch;
+`split_kv=True` permits useful automatic splitting. The caller chooses the
+phase policy: typically False for prefill and True for decode. This choice is
+independent of packed/fixed Q and must match workspace sizing and planning.
+
 `get_q_token_kv_block_sparse_workspace_size` sizes persistent compact route
 metadata plus disjoint attention scratch. The model's per-request
 `max_seq_len_kv`, rather than the global physical page-pool capacity, bounds
-the plan. The private route builder forms at most
+the plan. Each group and pattern head forms at most
 `G * (block_topk + 1)` selected/tail candidates, sorts and unique-reduces
-them in one CTA, and ORs per-query membership bits. Its work is independent of
-model context length. Q1 maps selected and tail blocks directly without a
-membership table.
+them in one CTA, and ORs per-query membership bits. It processes only candidate
+IDs, with no full-context bitmap or scan. Shared patterns prepare one row per
+group; independent patterns prepare one per group and KV head. G1 resolves
+selected blocks and the causal tail inside attention, without a metadata launch.
 
-The production specialization is causal and non-windowed, uses KV128 for
-Q1/Q2/Q4/Q5, and requires
-`seq_len_q * (Hq / Hkv) <= TileQ64`. The pure-host
+Nonsplit sparse grids larger than one service wave use the common CLC
+persistent scheduler. Each work item resolves its own request, query group and
+KV-head metadata. Page producers stage locators with `cp.async`; grouped
+membership storage is retained until all softmax consumers finish the item.
+The same paths support fixed and packed Q, including partial and empty packed
+groups. `split_kv=False` disables splitting, not persistent scheduling.
+
+The production specialization supports D64/D128/D256, matching FP16/BF16
+Q/K/V/output, or FP8 E4M3 Q/K/V with FP16/BF16 output. It is causal and
+non-windowed, uses KV128 for Q1--Q8, and requires
+`seq_len_q * (Hq / Hkv) <= TileQ128`. Groups exceeding 64 token/head rows
+use TileQ128; per-fragment query membership still occupies one byte.
+The pure-host
 `suggest_q_token_kv_block_sparse_group_size` helper takes a caller-cached SM
 count and prefers the largest legal group that can fill one service wave using
 independent routes plus useful split-KV work. It falls back toward Q1 when a
@@ -125,22 +151,22 @@ retain stream ordering.
 
 For `BlockSparsePagedTSWrapper`, `plan` freezes only the compact fixed-Q
 geometry, dtypes, sparse-route capacity, and `max_seq_len_kv`; it retains no
-request metadata. Every `run` reads live paged-KV row offsets, physical page
-IDs, per-request K/V lengths, per-KV-head sparse routes, and optional token
-bits from device tensors. The physical-page ID tensor is capacity: its live
-prefix ends at `paged_kv_indptr[-1]`, which may be smaller than its `numel()`.
-The caller owns every live value contract: dense K/V lengths must be in
-`[1, max_seq_len_kv]`, and causal lengths must be in `[Sq, max_seq_len_kv]`.
-`paged_kv_indptr` must start at zero and contain bounded, monotone rows with at
-least `ceil(seq_lens_kv[b] / page_size)` entries; every physical page ID in
-the live prefix ending at `paged_kv_indptr[-1]` must lie in `[0, P)`. Every BSR
-row must have bounded offsets, strictly increasing unique block IDs, and at
-most the planned `max_blocks_per_row` entries. Contiguous IDs must lie below
+request metadata. Every `run` reads live page tables, per-request K/V lengths,
+sparse routes, and optional token bits from device tensors.
+`block_tables` is Int32 `[B, C]`, contiguous within each row and free to use a
+padded outer row stride; `C * page_size` must cover `max_seq_len_kv`, and only
+the first `ceil(seq_lens_kv[b] / page_size)` entries of each row are read. The
+caller owns every live value contract: dense K/V lengths must be in
+`[1, max_seq_len_kv]`, causal lengths must be in `[Sq, max_seq_len_kv]`, and
+every live physical page ID must lie in `[0, P)`. Every BSR row must have
+bounded offsets, strictly increasing unique block IDs, and at most the planned
+`max_blocks_per_row` entries. Contiguous IDs must lie below
 `ceil(seq_len_kv / kv_block_size)`; paged IDs must start below the owning
 request's live K/V length.
 
-Reusable wrappers validate tensor structure but read values directly without
-host synchronization. Invalid values therefore have undefined behavior and
+Reusable wrappers validate tensor structure by default and read values
+directly without host synchronization; `validate=False` skips the
+structural checks as well. Invalid values therefore have undefined behavior and
 may access out of bounds. Set `CUTE_DSL_ENABLE_ASSERTIONS=1` before the process
 first compiles these kernels to diagnose violations encountered while preparing
 selected routes; such assertions report asynchronously and leave the CUDA
@@ -173,8 +199,10 @@ tighter caller-provided bound. Proxy routes are supported across the existing
 contiguous block-sparse profiles and preserve the profile's Q tile, KV route,
 and KeepsAB/SWAPAB geometry. Proxy routes currently require
 `mask_type="dense"`; paged K/V proxy execution remains unsupported. Route rows
-are owned by `(batch, KV head, Q block)`, so all Q heads in one GQA/MQA group
-share sparsity. A proxy run supplies one K arithmetic mean and one V sum per
+are owned by `(batch, pattern head, Q block)`. Both block-sparse APIs default
+to `share_pattern_across_kv_heads=False`; True uses a singleton pattern-head
+axis shared by all KV heads. K/V and proxy summaries retain their physical
+head axis in either mode. A proxy run supplies one K arithmetic mean and one V sum per
 semantic KV block. The final partial block uses only its structural tokens.
 Optional `kv_valid_bits` filters exact K/V tokens only and does not change
 proxy summaries or their represented mass.

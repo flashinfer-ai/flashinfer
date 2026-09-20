@@ -29,8 +29,13 @@ Results:
 - ulysses_scatter_qkv_sage2_sm89_sm120_h8_d64_p8_u513.json
 - ulysses_scatter_qkv_sage2_sm89_sm120_h8_d128_p8_u513.json
 - We would get these example json files under fi_trace_out directory:
+alphamoe_fused_router_e512_k8_bm16_shared0.json
 bmm_mxfp8_N128_K128.json
 cute_dsl_fused_moe_bf16_h2048_e128_topk8.json
+dsv41_fp4_quantize_pack_sparse_mla_cache_3d_hnd_ps8.json
+dsv41_fp4_quantize_pack_sparse_mla_cache_3d_nhd_ps8.json
+dsv41_fp4_quantize_append_sparse_mla_cache_2d_hnd_ps8.json
+dsv41_fp4_quantize_append_sparse_mla_cache_2d_nhd_ps8.json
 fused_add_rmsnorm_h5120.json
 fused_add_rmsnorm_quant_h7168.json
 fmha_v2_prefill_sm120_h4_d128.json
@@ -138,6 +143,7 @@ top_k_top_p_sampling calls top_p_sampling internally.
 FP4 MoE files are only generated on Blackwell (SM100+) GPUs with fp4_quantize available.
 GDN prefill files require SM90+ (Hopper) GPU.
 MSA (msa_*) files require SM120/SM121 (consumer Blackwell) GPUs.
+dsv41_fp4_quantize_*_sparse_mla_cache_*.json are only generated on SM120/SM121 GPUs.
 trtllm_batch_decode_block_sparse_h16_kv2_d128_ps16.json requires SM100/SM103 GPUs.
 trtllm_gen_routing_e256_k8_t8.json requires SM100/SM103/SM120/SM121 GPUs.
 """
@@ -167,6 +173,8 @@ import flashinfer.kda_decode
 import flashinfer.fused_moe
 import flashinfer.activation
 import flashinfer.cascade
+from flashinfer.jit.cpp_ext import is_cuda_version_at_least
+from flashinfer.utils import is_sm100a_supported
 from flashinfer.cake_minimax_h3 import MiniMaxH3Mxfp8PreAttention
 from flashinfer.attention.prims_ts.block_sparse import (
     BlockSparsePagedTSWrapper,
@@ -325,6 +333,29 @@ flashinfer.apply_rope_with_cos_sin_cache(
 flashinfer.apply_rope_with_cos_sin_cache_inplace(
     rope_positions, rope_query.clone(), rope_key.clone(), rope_D, rope_cos_sin
 )
+
+
+def example_dsv41_fp4_cache():
+    from flashinfer.mla import (
+        dsv41_fp4_quantize_append_sparse_mla_cache,
+        dsv41_fp4_quantize_pack_sparse_mla_cache,
+    )
+    from flashinfer.utils import get_compute_capability
+
+    if get_compute_capability(torch.device(device)) not in ((12, 0), (12, 1)):
+        print("Skipping DSV4.1 FP4 cache examples: requires SM120/SM121")
+        return
+    latent = torch.randn(4, 8, 512, dtype=torch.bfloat16, device=device)
+    for layout in ("HND", "NHD"):
+        cache = dsv41_fp4_quantize_pack_sparse_mla_cache(latent, kv_layout=layout)
+        slots = torch.tensor([0, 9, 9, -1, 32], dtype=torch.int64, device=device)
+        dsv41_fp4_quantize_append_sparse_mla_cache(
+            latent.reshape(-1, 512)[:5], slots, cache
+        )
+
+
+example_dsv41_fp4_cache()
+
 
 # ── Quantization (FP4 / NVFP4 / MXFP4 / MXFP8, SM100+) ────────────────────────
 # Kernels are SM100+ only; trace is dumped before kernel launch so JSONs are
@@ -760,16 +791,14 @@ block_sparse_attention.fi_trace(
 bs_page_size = 64
 bs_pages_per_request = bs_Skv // bs_page_size
 bs_num_pages = bs_B * bs_pages_per_request
-bs_paged_kv_indptr = (
-    torch.arange(bs_B + 1, dtype=torch.int32, device=device) * bs_pages_per_request
+# Keep one spare column to demonstrate that page tables may use a padded row
+# stride: only the first ceil(seq_lens_kv[b] / page_size) entries are live.
+bs_block_table_storage = torch.full(
+    (bs_B, bs_pages_per_request + 1), -1, dtype=torch.int32, device=device
 )
-# Keep one spare entry to demonstrate that this tensor is capacity: the live
-# prefix is selected by bs_paged_kv_indptr[-1].
-bs_paged_kv_indices = torch.cat(
-    (
-        torch.arange(bs_num_pages, dtype=torch.int32, device=device),
-        torch.zeros(1, dtype=torch.int32, device=device),
-    )
+bs_block_tables = bs_block_table_storage[:, :bs_pages_per_request]
+bs_block_tables.copy_(
+    torch.arange(bs_num_pages, dtype=torch.int32, device=device).view(bs_B, -1)
 )
 bs_seq_lens_kv = torch.full((bs_B,), bs_Skv, dtype=torch.int32, device=device)
 # Exercise a live length that does not fill its last page.
@@ -790,14 +819,13 @@ for bs_paged_cache in ((bs_k_cache, bs_v_cache), bs_combined_cache):
         save_dir=SAVE_DIR,
         q=bs_q,
         paged_kv_cache=bs_paged_cache,
-        paged_kv_indptr=bs_paged_kv_indptr,
-        paged_kv_indices=bs_paged_kv_indices,
+        block_tables=bs_block_tables,
+        seq_lens_kv=bs_seq_lens_kv,
         block_indptr=bs_block_indptr,
         block_indices=bs_block_indices,
         q_block_size=bs_q_block,
         kv_block_size=bs_kv_block,
         max_seq_len_kv=bs_Skv,
-        seq_lens_kv=bs_seq_lens_kv,
         kv_valid_bits=bs_valid_bits,
         mask_type="dense",
         out=bs_out,
@@ -849,8 +877,7 @@ with contextlib.suppress(Exception):
         bs_paged_wrapper.run(
             bs_q,
             bs_paged_cache,
-            bs_paged_kv_indptr,
-            bs_paged_kv_indices,
+            bs_block_tables,
             bs_seq_lens_kv,
             bs_block_indptr,
             bs_block_indices,
@@ -1066,6 +1093,29 @@ flashinfer.kda_decode.fused_kda_decode(
     fk_output_gate,
     fk_norm_weight,
 )
+
+# ── AlphaMoE fused router (SM100/SM103) ──────────────────────────────────────
+_alpha_router_logits = torch.randn(32, 512, dtype=torch.float32, device=device)
+_alpha_router_cc = torch.cuda.get_device_capability(device)
+if (
+    _alpha_router_cc in {(10, 0), (10, 3)}
+    and is_sm100a_supported(device)
+    and is_cuda_version_at_least("12.9" if _alpha_router_cc == (10, 3) else "12.8")
+):
+    flashinfer.fused_moe.alphamoe_fused_router(
+        _alpha_router_logits,
+        top_k=8,
+        block_m=16,
+        has_shared_expert=False,
+    )
+else:
+    flashinfer.fused_moe.alphamoe_fused_router.fi_trace(
+        logits=_alpha_router_logits,
+        top_k=8,
+        block_m=16,
+        has_shared_expert=False,
+        save_dir=SAVE_DIR,
+    )
 
 # ── mono_moe / monomoe (Qwen3.5-35B block-FP8 MonoMoe kernel, SM90a) ────────────
 # Fixed shape: E=256, N(intermediate)=512, K(hidden)=2048, BS<=8 tokens.

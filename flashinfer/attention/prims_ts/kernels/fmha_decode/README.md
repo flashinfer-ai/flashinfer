@@ -7,24 +7,30 @@ packed variable-length queries over a paged K/V cache.
 
 The public API describes attention semantics and cache metadata. Tile shapes
 and launch policy are selected internally for the problem and GPU. Fixed-Q
-plans may use direct, persistent, or split-KV execution. Packed-Q and
-sliding-window plans remain nonsplit, but may use direct or CLC-persistent
-execution. There is no public scheduler or tuning knob and no fallback to
-another attention backend.
+and packed-Q plans may use direct, persistent, or split-KV execution according
+to the caller's split permission. Sliding-window plans remain nonsplit, but
+may use direct or CLC-persistent execution. There is no public scheduler or
+tuning knob and no fallback to another attention backend.
 
 For eligible nonsplit grids with more than one resident wave, cluster launch
-control (CLC) assigns work to resident CTAs. Underfilled fixed-Q grids may
+control (CLC) assigns work to resident CTAs. Underfilled fixed- or packed-Q grids may
 instead split the K/V sequence and reduce partial outputs; other grids use the
 direct static launch.
 
 QToken-KvBlock-Sparse-Attention metadata uses one CUDA C++ CTA per route. Q1 maps its selected logical
-blocks and causal tail directly through the dense page table. Q2/Q4/Q5 sort at
+blocks and causal tail directly through the dense page table. Q2--Q8 sort at
 most ``group_size * (block_topk + 1)`` tagged selected/tail candidates in
 shared memory, unique equal logical IDs while OR-reducing query-membership
 bits, and map only the compact union. Work and temporary storage therefore do
 not scale with the configured model length or global cache capacity. Plain
 Int32 locators and packed membership words remain separate outputs; membership
 bits are never fused into a locator.
+
+Attention caches a grouped membership row in SMEM only when the complete
+resource layout, including barriers, fits the compilation budget. Larger rows
+stay in the existing immutable metadata buffer; Softmax reads packed words for
+the current KV tile directly from GMEM. This does not change query grouping or
+the caller's split-KV permission.
 
 The combined QToken-KvBlock-Sparse-Attention metadata+attention API uses programmatic dependent launch
 (PDL) for its final metadata-to-attention handoff. QToken-KvBlock-Sparse-Attention metadata producers
@@ -117,11 +123,11 @@ supported. Rows may have padding between them; each row must be contiguous.
 | Q/K/V dtype | Q and K/V must match: `torch.float16`, `torch.bfloat16`, or `torch.float8_e4m3fn` |
 | Output dtype | `torch.float16` for `torch.float16` input; `torch.bfloat16` for `torch.bfloat16` input; `torch.float16` or `torch.float8_e4m3fn` for `torch.float8_e4m3fn` input |
 | K/V layout | HND paged cache, combined or separate K/V tensors |
-| Page size | 4, 16, 32, 64, or 128 tokens |
+| Page size | 4, 8, 16, 32, 64, or 128 tokens; a logical fragment must divide the physical cache page |
 | Maximum K/V length | `2,147,483,392` (`INT32_MAX - 255`), reserving the padded endpoint of a 256-token K/V tile |
 | Mask | Dense or bottom-right causal |
 | Sliding window | Causal left window; `window_left=-1` disables it and non-negative values include the current token |
-| Scheduling | Automatic direct or CLC-persistent launch; eligible underfilled fixed-Q grids may use split-KV. Packed-Q and sliding-window grids remain nonsplit. No public tuning knob. |
+| Scheduling | Automatic direct or CLC-persistent launch; `split_kv=True` permits eligible underfilled fixed/packed-Q grids to split. False disables splitting. Automatic sliding-window splits remain unqualified. |
 | Accumulation | FP32 QK/PV and softmax state |
 
 Current accuracy and performance signoff is on SM100a/B200. SM103a/B300 is
@@ -193,9 +199,10 @@ Q + paged K/V
 
 Eligible nonsplit work that exceeds one resident SM wave uses CLC-persistent
 scheduling. A scheduler warp discovers each schedule token once and broadcasts it to
-the worker tasks. Underfilled fixed-Q grids may instead split the K/V sequence
-and reduce partial outputs. Packed-Q and sliding-window work remains nonsplit:
-it uses CLC above one resident wave and the direct static path otherwise.
+the worker tasks. Underfilled fixed- or packed-Q grids may instead split the
+K/V sequence when the caller permits it with `split_kv=True`. False disables
+splitting independently of Q layout. Automatic sliding-window splitting
+remains unqualified; nonsplit work uses the same CLC/direct selection.
 
 Fixed-table page IDs and packed-Q offsets are per-run bindings and are loaded
 on every run and graph replay. K/V lengths come from exactly one source. A

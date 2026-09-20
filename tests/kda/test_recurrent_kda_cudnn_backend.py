@@ -45,13 +45,21 @@ import torch.nn.functional as F
 
 from flashinfer.cudnn import cudnn_recurrent_kda
 from flashinfer.kda import recurrent_kda
-from flashinfer.kda_prefill import RecurrentKDAPrefillWorkspace
+from flashinfer.kda_prefill import (
+    _FLASH_KDA_SUPPORTED_COMPUTE_CAPABILITIES,
+    RecurrentKDAPrefillWorkspace,
+)
+from flashinfer.kda_prefill_cute import (
+    _SUPPORTED_COMPUTE_CAPABILITIES as _CUTE_DSL_SUPPORTED_COMPUTE_CAPABILITIES,
+)
+from flashinfer.utils import get_compute_capability
 from tests.test_helpers.cudnn_linear_attention import (
     HEAD_DIM,
     assert_rel_close,
     assert_state_orientation,
     kda_safe_gate,
     packed_offsets,
+    reference_kernel_or_skip,
     rel_err,
     requires_cudnn_linear_attention,
     serial_delta_rule,
@@ -63,6 +71,13 @@ pytestmark = requires_cudnn_linear_attention
 LOWER_BOUND = -5.0
 KERNEL_TOLERANCE = 2e-2
 SERIAL_TOLERANCE = 5e-2
+
+# cuDNN serves the whole SM100 family, FlashInfer's own prefill backends only
+# part of it, so the cross-kernel arm has to follow the narrower set.
+_REFERENCE_BACKEND_CAPABILITIES = {
+    "cute-dsl": _CUTE_DSL_SUPPORTED_COMPUTE_CAPABILITIES,
+    "cake": _FLASH_KDA_SUPPORTED_COMPUTE_CAPABILITIES,
+}
 
 
 def _make_inputs(
@@ -203,19 +218,23 @@ def test_cudnn_backend_matches_default(
     seq_lens, num_heads, use_initial_state, reference_backend
 ):
     """Each of FlashInfer's own recurrent KDA backends as the oracle."""
+    capability = get_compute_capability(torch.device("cuda"))
+    if capability not in _REFERENCE_BACKEND_CAPABILITIES[reference_backend]:
+        pytest.skip(
+            f"reference backend {reference_backend} does not support "
+            f"sm{capability[0]}{capability[1]}"
+        )
     inputs = _make_inputs(seq_lens, num_heads, initial_state=use_initial_state, seed=11)
     state = inputs["initial_state"]
     kwargs = _gate_kwargs(inputs, output_final_state=True)
     args = (inputs["q"], inputs["k"], inputs["v"], inputs["g"], inputs["beta"])
-    try:
-        ref_out, ref_state = recurrent_kda(
-            *args,
-            initial_state=None if state is None else state.clone(),
-            backend=reference_backend,
-            **kwargs,
-        )
-    except (ImportError, NotImplementedError) as exc:
-        pytest.skip(f"reference backend {reference_backend} unavailable: {exc}")
+    ref_out, ref_state = reference_kernel_or_skip(
+        recurrent_kda,
+        *args,
+        initial_state=None if state is None else state.clone(),
+        backend=reference_backend,
+        **kwargs,
+    )
     out, final_state = _run(
         inputs, initial_state=None if state is None else state.clone(), **kwargs
     )
