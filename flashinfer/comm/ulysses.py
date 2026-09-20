@@ -943,7 +943,11 @@ class UlyssesCommunicator:
         except Exception as e:  # noqa: BLE001
             reason = f"rank {self.rank} PCIe exchange: {type(e).__name__}: {e}"
             if self.transport == "p2p":
-                self._poison_pcie_p2p(reason)
+                # The all-P2P barrier has no abort protocol: a peer may spin on
+                # a barrier this rank never completes, so teardown must not
+                # synchronize or unmap. The RDMA routes published the sticky
+                # abort natively and keep close() usable.
+                self._pcie_python_teardown_safe = False
             self._raise_pcie_broken(reason)
         return out
 
@@ -957,12 +961,17 @@ class UlyssesCommunicator:
     ) -> torch.Tensor:
         """Run one multi-rank PCIe collective under its failure envelope.
 
-        The all-P2P barrier has no bounded abort protocol. A peer may enqueue
-        before this rank fails validation, capture detection, stream handoff,
-        or wrapper dispatch. Such a local failure therefore poisons teardown
-        before it enters BROKEN, even when this rank never reached native code.
+        A failure before native code runs (validation, capture detection,
+        stream binding, wrapper dispatch) is decided from this call's own
+        arguments, so under the SPMD contract every rank rejects the same call
+        and no peer has entered the barrier: the RDMA routes raise the ordinary
+        error and stay OPEN. The all-P2P barrier has no abort protocol at all,
+        so a peer that did enqueue could spin forever; that route poisons
+        teardown and enters BROKEN instead. A failure inside native code has
+        already been handled by _pcie_exchange (the RDMA routes publish the
+        sticky abort there and keep close() usable), so it passes through
+        untouched.
         """
-        was_open = self._state == _OPEN
         try:
             if workspace is not None:
                 raise ValueError(
@@ -985,11 +994,15 @@ class UlyssesCommunicator:
                     "FLASHINFER_ULYSSES_PCIE_ROUTE=p2p on every rank gives a "
                     "capturable all-P2P route."
                 )
+            self._validate_out(out, shape, op, dtype)
+            self._validate_no_overlap(x, out, op)
             if not capturing:
                 # Like PcieIpcAllReduceWorkspace, the communicator is bound to
                 # the stream of its first collective; peers order their copies
                 # against this rank's caller stream, so silently accepting a
                 # second stream could let a consumer race the next exchange.
+                # Bound only once the call is known to be valid, so a rejected
+                # call does not pin the stream.
                 current = torch.cuda.current_stream(self.device)
                 if self._pcie_stream is None:
                     self._pcie_stream = current
@@ -998,11 +1011,11 @@ class UlyssesCommunicator:
                         "PCIe Ulysses collectives are bound to the stream of "
                         "their first call; use one stream per communicator"
                     )
-            self._validate_out(out, shape, op, dtype)
-            self._validate_no_overlap(x, out, op)
             return self._pcie_exchange(x, out, mode)
         except Exception as e:  # noqa: BLE001
-            if was_open and self.transport == "p2p" and self._pcie_python_teardown_safe:
+            # Still OPEN means the failure happened before native code ran;
+            # _pcie_exchange has already moved a native failure to BROKEN.
+            if self._state == _OPEN and self.transport == "p2p":
                 self._poison_pcie_p2p(
                     f"rank {self.rank} PCIe {op} before/during enqueue: "
                     f"{type(e).__name__}: {e}"
