@@ -948,7 +948,12 @@ class UlyssesCommunicator:
         return out
 
     def _pcie_collective(
-        self, x, out, op: str, dtype: Optional[torch.dtype] = None
+        self,
+        x,
+        out,
+        op: str,
+        dtype: Optional[torch.dtype] = None,
+        workspace: Optional[UlyssesWorkspace] = None,
     ) -> torch.Tensor:
         """Run one multi-rank PCIe collective under its failure envelope.
 
@@ -959,6 +964,11 @@ class UlyssesCommunicator:
         """
         was_open = self._state == _OPEN
         try:
+            if workspace is not None:
+                raise ValueError(
+                    f"multi-rank PCIe {op} takes no workspace=: the transport has "
+                    "no staging buffers, outputs come from allocate_output()"
+                )
             self._validate(x, op, dtype)
             shape, mode = self._output_geometry(x, op)
             if out is None:
@@ -1424,7 +1434,9 @@ class UlyssesCommunicator:
 
         This operation is rank-local and non-collective. ``max_elems``
         defaults to the communicator capacity and may be smaller when a
-        caller knows the maximum chunk size it will communicate.
+        caller knows the maximum chunk size it will communicate. The
+        multi-rank pcie backend has no staging buffers and rejects this call;
+        its outputs are registered with :meth:`allocate_output` instead.
 
         Parameters
         ----------
@@ -1442,6 +1454,12 @@ class UlyssesCommunicator:
             raise RuntimeError(
                 "create_workspace called on a "
                 f"{self._state} UlyssesCommunicator (use-after-close)"
+            )
+        if self.backend == "pcie" and self.world_size > 1:
+            raise NotImplementedError(
+                "create_workspace is not available on the multi-rank pcie backend: "
+                "the PCIe transport has no send/receive staging buffers; register "
+                "outputs with allocate_output() instead"
             )
         capacity_elems = self.max_bytes // self.dtype.itemsize
         if max_elems is None:
@@ -1505,7 +1523,9 @@ class UlyssesCommunicator:
             and dtype as ``x``.
         """
         if self.backend == "pcie" and self.world_size > 1:
-            return self._pcie_collective(x, out, "scatter_heads", dtype)
+            return self._pcie_collective(
+                x, out, "scatter_heads", dtype, workspace=workspace
+            )
         self._validate(x, "scatter_heads", dtype)
         shape, _mode = self._output_geometry(x, "scatter_heads")
         # ulysses_a2a is parameterized by the [B, S_local, H, D] layout, which
@@ -1601,6 +1621,12 @@ class UlyssesCommunicator:
         )
 
         self._require_open("scatter_qkv_head_chunk")
+        if self.backend == "pcie" and self.world_size > 1:
+            raise NotImplementedError(
+                "scatter_qkv_head_chunk is not available on the multi-rank pcie "
+                "backend: the PCIe transport moves whole registered outputs; pack "
+                "the band and use scatter_heads with out= from allocate_output()"
+            )
         B, S_local, local_heads, D, payload_elems = _validate_qkv_geometry(
             query,
             key,
@@ -1833,7 +1859,9 @@ class UlyssesCommunicator:
             dtype as ``x``.
         """
         if self.backend == "pcie" and self.world_size > 1:
-            return self._pcie_collective(x, out, "gather_heads", dtype)
+            return self._pcie_collective(
+                x, out, "gather_heads", dtype, workspace=workspace
+            )
         self._validate(x, "gather_heads", dtype)
         B, S_global, H_local, D = x.shape
         if S_global % self.world_size != 0:
@@ -1915,6 +1943,12 @@ class UlyssesCommunicator:
         )
 
         self._require_open("gather_output_head_chunk")
+        if self.backend == "pcie" and self.world_size > 1:
+            raise NotImplementedError(
+                "gather_output_head_chunk is not available on the multi-rank pcie "
+                "backend: the PCIe transport moves whole registered outputs; use "
+                "gather_heads with out= from allocate_output()"
+            )
         local_heads = _positive_int(local_heads, "local_heads")
         head_offset = _nonnegative_int(head_offset, "head_offset")
         x = _validate_cuda_tensor(
