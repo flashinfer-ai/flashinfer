@@ -108,11 +108,17 @@ independent of packed/fixed Q and must match workspace sizing and planning.
 metadata plus disjoint attention scratch. The model's per-request
 `max_seq_len_kv`, rather than the global physical page-pool capacity, bounds
 the plan. Each group and pattern head forms at most
-`G * (block_topk + 1)` selected/tail candidates, sorts and unique-reduces
-them in one CTA, and ORs per-query membership bits. It processes only candidate
-IDs, with no full-context bitmap or scan. Shared patterns prepare one row per
+`G * (block_topk + 1)` selected/tail candidates and ORs per-query membership
+bits in one CTA. A shared byte/bit map forms the sorted union when its footprint
+fits without adding CTA waves; otherwise bounded radix sort is used. This
+temporary map is sized by model context, not physical cache capacity, and adds
+no caller-owned workspace. Shared patterns prepare one row per
 group; independent patterns prepare one per group and KV head. G1 resolves
 selected blocks and the causal tail inside attention, without a metadata launch.
+
+Prepared FP8 G8/page-4 routes store query-oriented membership words internally,
+with complete tail tiles reserved in the workspace. Standalone metadata outputs
+retain four membership bytes per Int32 word; the public plan/run API is unchanged.
 
 Nonsplit sparse grids larger than one service wave use the common CLC
 persistent scheduler. Each work item resolves its own request, query group and

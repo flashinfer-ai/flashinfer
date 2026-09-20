@@ -26,6 +26,12 @@ waves. The map is sized by model context, never global cache capacity. Plain
 Int32 locators and packed membership words remain separate outputs; membership
 bits are never fused into a locator.
 
+Compatible FP8 G8/page-4 plans instead use eight query words per 32-page tile,
+emitted directly into the same workspace with initialized tail bits. The public
+standalone metadata format remains page-byte masks. Sparse FP8 D256 Keeps
+loads a full head stage as two SW128 planes and uses compact single-head
+TensorMaps when cache strides permit; other cache layouts retain their descriptors.
+
 Attention caches a grouped membership row in SMEM only when the complete
 resource layout, including barriers, fits the compilation budget. Larger rows
 stay in the existing immutable metadata buffer; Softmax reads packed words for

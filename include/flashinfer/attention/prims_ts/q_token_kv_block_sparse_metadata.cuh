@@ -324,6 +324,33 @@ __launch_bounds__(kQTokenKvBlockSparseQ1BlockThreads) void QTokenKvBlockSparseQ1
   __syncthreads();
 }
 
+// Call after publishing the live membership bytes with a CTA barrier.
+// Both union algorithms emit the same eight-query/32-page tile, including
+// zero tail bits and a complete zero tile for an inert route.
+template <typename PositionType, int BlockThreads>
+__device__ __forceinline__ void StoreQueryMajorMemberships(
+    const QTokenKvBlockSparseTouchedMetadataParams<PositionType>& params,
+    const uint8_t* group_memberships, int union_pages) {
+  const int lane = threadIdx.x % 32;
+  const int warp = threadIdx.x / 32;
+  const int tiles = union_pages == 0 ? 1 : (union_pages + 31) / 32;
+  uint32_t* query_words =
+      reinterpret_cast<uint32_t*>(params.q_token_kv_block_sparse_page_memberships) +
+      static_cast<int64_t>(blockIdx.x) * params.membership_words;
+  for (int tile = warp; tile < tiles; tile += BlockThreads / 32) {
+    const int page = tile * 32 + lane;
+    const uint32_t member = page < union_pages ? group_memberships[page] : 0;
+    uint32_t own_word = 0;
+#pragma unroll
+    for (int query = 0; query < 8; ++query) {
+      const uint32_t word = __ballot_sync(0xffffffffu, (member & (1u << query)) != 0);
+      if (lane == query) own_word = word;
+    }
+    if (lane < 8) query_words[tile * 8 + lane] = own_word;
+  }
+  __syncthreads();
+}
+
 template <typename PositionType, int GroupSize, bool QueryMajor = false>
 __device__ __forceinline__ int BuildTouchedUnion(
     const QTokenKvBlockSparseTouchedMetadataParams<PositionType>& params,
@@ -549,25 +576,8 @@ __global__ __launch_bounds__(
   __syncthreads();
 
   if constexpr (QueryMajor) {
-    const int lane = threadIdx.x % 32;
-    const int warp = threadIdx.x / 32;
-    const int tiles = shared.union_pages == 0 ? 1 : (shared.union_pages + 31) / 32;
-    uint32_t* query_words =
-        reinterpret_cast<uint32_t*>(params.q_token_kv_block_sparse_page_memberships) +
-        static_cast<int64_t>(blockIdx.x) * params.membership_words;
-    for (int tile = warp; tile < tiles; tile += kBlockThreads / 32) {
-      const int page = tile * 32 + lane;
-      const uint32_t member = page < shared.union_pages ? group_memberships[page] : 0;
-      uint32_t own_word = 0;
-#pragma unroll
-      for (int query = 0; query < 8; ++query) {
-        const uint32_t word = __ballot_sync(0xffffffffu, (member & (1u << query)) != 0);
-        if (lane == query) own_word = word;
-      }
-      // One coalesced 32-byte output. All tail bits and inert-route words are zero.
-      if (lane < 8) query_words[tile * 8 + lane] = own_word;
-    }
-    __syncthreads();
+    StoreQueryMajorMemberships<PositionType, kBlockThreads>(params, group_memberships,
+                                                            shared.union_pages);
   }
 }
 
@@ -1001,25 +1011,8 @@ __launch_bounds__(kQTokenKvBlockSparseBitmapBlockThreads) void QTokenKvBlockSpar
   }
   __syncthreads();
   if constexpr (QueryMajor) {
-    const int lane = threadIdx.x % 32;
-    const int warp = threadIdx.x / 32;
-    const int tiles = shared.union_pages == 0 ? 1 : (shared.union_pages + 31) / 32;
-    uint32_t* query_words =
-        reinterpret_cast<uint32_t*>(params.q_token_kv_block_sparse_page_memberships) +
-        static_cast<int64_t>(blockIdx.x) * params.membership_words;
-    for (int tile = warp; tile < tiles; tile += kBlockThreads / 32) {
-      const int page = tile * 32 + lane;
-      const uint32_t member = page < shared.union_pages ? group_memberships[page] : 0;
-      uint32_t own_word = 0;
-#pragma unroll
-      for (int query = 0; query < 8; ++query) {
-        const uint32_t word = __ballot_sync(0xffffffffu, (member & (1u << query)) != 0);
-        if (lane == query) own_word = word;
-      }
-      // One coalesced 32-byte output. All tail bits and inert-route words are zero.
-      if (lane < 8) query_words[tile * 8 + lane] = own_word;
-    }
-    __syncthreads();
+    StoreQueryMajorMemberships<PositionType, kBlockThreads>(params, group_memberships,
+                                                            shared.union_pages);
   }
 }
 

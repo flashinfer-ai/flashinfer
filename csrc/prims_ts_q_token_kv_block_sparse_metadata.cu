@@ -335,7 +335,7 @@ void PrimsTSQTokenKvBlockSparseMetadataRunPacked(
             release_pdl);
 }
 
-// Private experimental entries; existing metadata APIs retain byte membership.
+// Prepared-plan entries; standalone metadata APIs retain byte membership.
 void PrimsTSQTokenKvBlockSparseMetadataRunFixedQueryMajor(
     TensorView block_indices, TensorView block_table, TensorView token_to_request,
     TensorView query_positions, TensorView q_token_kv_block_sparse_page_indices,

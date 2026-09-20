@@ -1038,9 +1038,8 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
         split_kv,
         share_pattern_across_kv_heads,
     )
-    # The private fused producer currently emits the G8/page-4 format. FP8
-    # benefits from avoiding repeated membership extraction; keep 16-bit
-    # routes on the existing layout until complete-path gains are established.
+    # Qualified FP8 G8/page-4 profiles consume one bit-plane per query.
+    # Other profiles and the standalone metadata API retain page-byte masks.
     query_major_memberships = (
         sparse_block_size == 4
         and spec.config.use_fp8_qkv

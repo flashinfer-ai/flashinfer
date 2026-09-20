@@ -2193,10 +2193,10 @@ def test_attention_ts_decode_register_reallocation_fits_initial_cta_pool(
         use_keeps_mma_ab=True,
         tile_size_q=128,
         tile_size_kv=128,
-        headdim=256,
-        head_dim_per_stage_kv=128,
+        headdim=256 if num_insts_kv == 1 else 128,
+        head_dim_per_stage_kv=128 if num_insts_kv == 1 else 0,
         num_insts_kv=num_insts_kv,
-        o_stages=1,
+        o_stages=1 if num_insts_kv == 1 else 2,
         load_warp_idx=16,
         load_num_warps=load_warps,
     )
