@@ -3710,9 +3710,12 @@ def test_grouped_q_token_kv_block_sparse_physical_sparse_pages_match_torch_refer
 
 @_REQUIRES_PRIMS_TS_ATTENTION
 @pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float8_e4m3fn))
-@pytest.mark.parametrize("kv_heads", (1, 2))
+@pytest.mark.parametrize(
+    ("kv_heads", "share_pattern"),
+    ((1, True), (2, True), (2, False), (4, True), (4, False)),
+)
 def test_grouped_cache_stride_rebinding_graph(
-    dtype: torch.dtype, kv_heads: int
+    dtype: torch.dtype, kv_heads: int, share_pattern: bool
 ) -> None:
     """Compact and padded page strides must not share incompatible TensorMaps."""
     torch.manual_seed(82173)
@@ -3742,11 +3745,13 @@ def test_grouped_cache_stride_rebinding_graph(
     )
     candidates = 256
     blocks = (
-        torch.rand(rows, candidates, device="cuda")
-        .argsort(-1)[:, :topk]
+        torch.rand(rows, 1 if share_pattern else kv_heads, candidates, device="cuda")
+        .argsort(-1)[..., :topk]
         .to(torch.int32)
         .contiguous()
     )
+    if share_pattern:
+        blocks = blocks[:, 0].contiguous()
     qo_indptr = make_prims_ts_q_token_kv_block_sparse_qo_indptr(
         torch.tensor([0, 9, rows], dtype=torch.int32),
         rows,
@@ -3755,16 +3760,17 @@ def test_grouped_cache_stride_rebinding_graph(
     )
     output = torch.empty_like(query, dtype=torch.bfloat16)
     workspace = torch.empty(
-        get_prims_ts_q_token_kv_block_sparse_workspace_size(
+        get_q_token_kv_block_sparse_workspace_size(
             query,
             cache[0],
             table,
             block_topk=topk,
             max_seq_len_kv=context,
-            out_dtype=output.dtype,
+            o_data_type=output.dtype,
             qo_indptr=qo_indptr,
-            max_seq_len_q=group,
+            seq_len_q=group,
             split_kv=False,
+            share_pattern_across_kv_heads=share_pattern,
         ),
         device="cuda",
         dtype=torch.uint8,
@@ -3786,6 +3792,7 @@ def test_grouped_cache_stride_rebinding_graph(
         split_kv=False,
         q_data_type=query.dtype,
         o_data_type=output.dtype,
+        share_pattern_across_kv_heads=share_pattern,
     )
     tokens = torch.arange(context, device="cuda")
     physical = table[requests.long()[:, None], tokens[None, :] // page].long()
@@ -3798,16 +3805,17 @@ def test_grouped_cache_stride_rebinding_graph(
     ].float()
 
     def check():
-        visible = (tokens[None, :, None] // 4 == blocks[:, None, :]).any(-1)
-        visible |= tokens[None, :] // 4 == (positions[:, None] + 1) // 4
-        visible &= tokens[None, :] <= positions[:, None]
+        per_head = blocks[:, None, :] if share_pattern else blocks
+        visible = (tokens[None, None, :, None] // 4 == per_head[:, :, None, :]).any(-1)
+        visible |= tokens[None, None, :] // 4 == (positions[:, None, None] + 1) // 4
+        visible &= tokens[None, None, :] <= positions[:, None, None]
         scores = (
             torch.einsum(
                 "qhrd,qthd->qhrt", query.float().view(rows, kv_heads, 12, dim), keys
             )
             * dim**-0.5
         )
-        scores.masked_fill_(~visible[:, None, None, :], -torch.inf)
+        scores.masked_fill_(~visible[:, :, None, :], -torch.inf)
         expected = torch.einsum(
             "qhrt,qthd->qhrd", scores.softmax(-1), values
         ).reshape_as(output)
@@ -3840,6 +3848,12 @@ def test_grouped_cache_stride_rebinding_graph(
         output.fill_(torch.nan)
         graph.replay()
         check()
+
+    blocks.fill_(-1)
+    positions.fill_(-1)
+    output.fill_(torch.nan)
+    graph.replay()
+    assert torch.count_nonzero(output).item() == 0
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

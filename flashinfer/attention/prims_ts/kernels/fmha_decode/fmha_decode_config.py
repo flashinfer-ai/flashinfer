@@ -1172,6 +1172,8 @@ class FmhaDecodeConfig:
     # Prepared single-head compact caches can view all storage pages as rows
     # of one TensorMap, while retaining the same encoded fragment indices.
     use_flat_native_kv_tma: bool = False
+    # Prepared locators count the complete physical head span between pages.
+    flat_native_kv_num_heads: int = 1
     # Maximum number of pages per (batch, head_kv) — sizes the page index
     # table stride.
     max_num_pages_per_seq_kv: int = 1

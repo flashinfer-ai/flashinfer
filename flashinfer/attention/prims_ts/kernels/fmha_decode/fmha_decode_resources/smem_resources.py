@@ -175,11 +175,19 @@ def _kv_dtype_bytes_for_kind(
 def _decode_native_page_locator(
     cfg: Constexpr[FmhaDecodeConfig],
     page_locator: Int32,
+    kv_head: Int32 = 0,
 ) -> tuple[Int32, Int32]:
     """Return ``(token_offset, physical_page)`` for one native table entry."""
     if cutlass.const_expr(cfg.use_flat_native_kv_tma):
-        # The bound cache has one head and compact storage. Encoded fragments
-        # already count its physical rows; -1 remains an OOB zero-fill copy.
+        # The prepared locator is the head-zero origin in the compact cache.
+        # Keep the entire fragment OOB when adding a head offset to a sentinel.
+        if cutlass.const_expr(cfg.flat_native_kv_num_heads > 1):
+            head_fragments = (
+                cfg.effective_storage_tokens_per_page // cfg.num_tokens_per_page
+            )
+            page_locator = (page_locator + kv_head * Int32(head_fragments)) | (
+                page_locator >> Int32(31)
+            )
         return page_locator * Int32(cfg.num_tokens_per_page), Int32(0)
     token_offset = Int32(0)
     physical_page = page_locator
@@ -300,7 +308,7 @@ def _issue_sparse_page_copies(
             for i in cutlass.range_constexpr(fragments_per_warp):
                 fragment = warp * Int32(fragments_per_warp) + Int32(i)
                 token_offset, physical_page = _decode_native_page_locator(
-                    cfg, locators[i]
+                    cfg, locators[i], kv_head
                 )
                 for chunk in cutlass.range_constexpr(chunks):
                     smem_offset = Int32(
@@ -312,7 +320,9 @@ def _issue_sparse_page_copies(
                         (
                             Int32(head_dim_stage_offset + chunk * chunk_hd),
                             token_offset,
-                            kv_head,
+                            Int32(0)
+                            if cutlass.const_expr(cfg.use_flat_native_kv_tma)
+                            else kv_head,
                             physical_page,
                         ),
                         barrier,
@@ -329,7 +339,9 @@ def _issue_sparse_page_copies(
             chunk = copy // Int32(fragments)
             fragment = copy % Int32(fragments)
             locator = page_offsets.page_id(tile_idx, local_tile_idx, fragment)
-            token_offset, physical_page = _decode_native_page_locator(cfg, locator)
+            token_offset, physical_page = _decode_native_page_locator(
+                cfg, locator, kv_head
+            )
             smem_offset = chunk * Int32(chunk_hd * cfg.tile_size_kv) + fragment * Int32(
                 chunk_hd * cfg.num_tokens_per_page
             )
@@ -339,7 +351,9 @@ def _issue_sparse_page_copies(
                 (
                     Int32(head_dim_stage_offset) + chunk * Int32(chunk_hd),
                     token_offset,
-                    kv_head,
+                    Int32(0)
+                    if cutlass.const_expr(cfg.use_flat_native_kv_tma)
+                    else kv_head,
                     physical_page,
                 ),
                 barrier,

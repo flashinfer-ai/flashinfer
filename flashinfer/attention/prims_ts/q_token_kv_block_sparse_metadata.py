@@ -247,6 +247,7 @@ class _PrimsTSQTokenKvBlockSparseMetadataPlan:
     storage_page_size: int
     max_seq_len_kv: int
     release_attention_pdl: bool
+    locator_head_multiplier: int = 1
 
     def run(
         self,
@@ -272,6 +273,7 @@ class _PrimsTSQTokenKvBlockSparseMetadataPlan:
                 self.sparse_block_size,
                 self.max_seq_len_kv,
                 self.release_attention_pdl,
+                self.locator_head_multiplier,
             )
         else:
             self.metadata_run(
@@ -287,6 +289,7 @@ class _PrimsTSQTokenKvBlockSparseMetadataPlan:
                 self.sparse_block_size,
                 self.max_seq_len_kv,
                 self.release_attention_pdl,
+                self.locator_head_multiplier,
             )
 
 
@@ -1406,6 +1409,7 @@ def _build_prims_ts_q_token_kv_block_sparse_metadata(
             sparse_block_size,
             max_seq_len_kv,
             release_attention_pdl,
+            1,
         )
     else:
         metadata_module.run_fixed(
@@ -1421,6 +1425,7 @@ def _build_prims_ts_q_token_kv_block_sparse_metadata(
             sparse_block_size,
             max_seq_len_kv,
             release_attention_pdl,
+            1,
         )
     return outputs
 
@@ -1537,6 +1542,7 @@ def _prepare_prims_ts_q_token_kv_block_sparse_metadata_plan(
     sparse_block_size: int = 4,
     qo_indptr: Optional[torch.Tensor] = None,
     query_major_memberships: bool = False,
+    locator_head_multiplier: int = 1,
 ) -> _PrimsTSQTokenKvBlockSparseMetadataPlan:
     """Freeze validated metadata tensors and launch constants."""
 
@@ -1576,6 +1582,7 @@ def _prepare_prims_ts_q_token_kv_block_sparse_metadata_plan(
         storage_page_size=storage_page_size,
         max_seq_len_kv=max_seq_len_kv,
         release_attention_pdl=release_attention_pdl,
+        locator_head_multiplier=locator_head_multiplier,
     )
 
 
@@ -1759,21 +1766,6 @@ def _prepare_q_token_kv_block_sparse_attention(
         share_pattern_across_kv_heads=share_pattern_across_kv_heads,
     )
     views = layout.bind(workspace_buffer)
-    metadata_plan = _prepare_prims_ts_q_token_kv_block_sparse_metadata_plan(
-        block_indices,
-        block_table,
-        token_to_request,
-        query_positions,
-        views.q_token_kv_block_sparse_page_indices,
-        views.q_token_kv_block_sparse_page_memberships,
-        views.seq_lens,
-        group_size=group_size,
-        storage_page_size=int(k_cache.shape[2]),
-        max_seq_len_kv=max_seq_len_kv,
-        sparse_block_size=sparse_block_size,
-        qo_indptr=qo_indptr,
-        query_major_memberships=layout.query_major_memberships,
-    )
     from .decode import _prepare_prims_ts_batch_decode_plan, _validate_scale
 
     scale_qk = _validate_scale(
@@ -1812,6 +1804,25 @@ def _prepare_q_token_kv_block_sparse_attention(
             else ()
         ),
         direct_q1_max_model_len=max_seq_len_kv if group_size == 1 else None,
+        allow_head_aware_locators=group_size > 1,
+    )
+    # Preparation only binds shapes and storage; attention does not read these
+    # outputs until metadata runs. Use its resolved format for the producer.
+    metadata_plan = _prepare_prims_ts_q_token_kv_block_sparse_metadata_plan(
+        block_indices,
+        block_table,
+        token_to_request,
+        query_positions,
+        views.q_token_kv_block_sparse_page_indices,
+        views.q_token_kv_block_sparse_page_memberships,
+        views.seq_lens,
+        group_size=group_size,
+        storage_page_size=int(k_cache.shape[2]),
+        max_seq_len_kv=max_seq_len_kv,
+        sparse_block_size=sparse_block_size,
+        qo_indptr=qo_indptr,
+        query_major_memberships=layout.query_major_memberships,
+        locator_head_multiplier=attention_plan._flat_locator_heads,
     )
     return _PrimsTSQTokenKvBlockSparsePlan(
         _metadata_plan=metadata_plan,

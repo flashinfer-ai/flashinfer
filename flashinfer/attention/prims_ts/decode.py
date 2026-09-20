@@ -1396,6 +1396,7 @@ def _make_decode_compile_spec(
 
     config_items = dict(launch_spec.config.compile_signature())
     config_items["use_flat_native_kv_tma"] = flat_native_kv_tma
+    config_items["flat_native_kv_num_heads"] = num_kv_heads if flat_native_kv_tma else 1
     return _DecodeCompileSpec(
         device_index=device_index,
         config_items=tuple(config_items.items()),
@@ -2360,6 +2361,7 @@ class PrimsTSBatchDecodePlan:
     _compiled_main: Callable[..., object]
     _compiled_reducer: Optional[Callable[..., object]]
     _direct_q1_inputs: tuple[torch.Tensor, ...] = ()
+    _flat_locator_heads: int = 1
 
     def run(
         self,
@@ -3224,6 +3226,7 @@ def _prepare_prims_ts_batch_decode_plan(
     direct_q1_max_model_len: Optional[int] = None,
     direct_q1_sparse_block_size: int = 4,
     share_pattern_across_kv_heads: bool = True,
+    allow_head_aware_locators: bool = False,
 ) -> tuple[PrimsTSBatchDecodePlan, torch.Tensor]:
     """Validate and freeze one dense-block-table PrimTS launch contract."""
 
@@ -3385,6 +3388,16 @@ def _prepare_prims_ts_batch_decode_plan(
             kv_block_size=direct_q1_sparse_block_size,
             page_capacity=max_num_pages,
         )
+    flat_native_kv_tma = (
+        use_q_token_kv_block_sparse_route
+        and spec.config.uses_staged_one_inst_tmem_p
+        and query.dtype in (torch.bfloat16, torch.float8_e4m3fn)
+        and spec.config.has_storage_subpages
+        and (num_kv_heads == 1 or (allow_head_aware_locators and not direct_q1_inputs))
+        and k_cache.is_contiguous()
+        and normalized_cache.v_cache.is_contiguous()
+        and int(k_cache.shape[0]) * storage_page_size * num_kv_heads < (1 << 31)
+    )
     compile_spec = _make_decode_compile_spec(
         spec,
         device_index=device_index,
@@ -3402,16 +3415,7 @@ def _prepare_prims_ts_batch_decode_plan(
         kv_prefix_mode="dynamic",
         kv_lengths_mode="dynamic",
         direct_q1_spec=direct_q1_spec,
-        flat_native_kv_tma=(
-            use_q_token_kv_block_sparse_route
-            and spec.config.uses_staged_one_inst_tmem_p
-            and query.dtype in (torch.bfloat16, torch.float8_e4m3fn)
-            and spec.config.has_storage_subpages
-            and num_kv_heads == 1
-            and k_cache.is_contiguous()
-            and normalized_cache.v_cache.is_contiguous()
-            and int(k_cache.shape[0]) * storage_page_size < (1 << 31)
-        ),
+        flat_native_kv_tma=flat_native_kv_tma,
     )
     compiled_main, compiled_reducer = _get_compiled_decode(compile_spec)
     workspace = _bind_decode_workspace(workspace_buffer, layout)
@@ -3440,6 +3444,7 @@ def _prepare_prims_ts_batch_decode_plan(
         _compiled_main=compiled_main,
         _compiled_reducer=compiled_reducer,
         _direct_q1_inputs=direct_q1_inputs,
+        _flat_locator_heads=num_kv_heads if flat_native_kv_tma else 1,
     )
     return plan, out
 

@@ -93,6 +93,7 @@ struct QTokenKvBlockSparseTouchedMetadataParams {
   uint_fastdiv candidates_per_query;
   uint_fastdiv subpages_per_storage_page;
   uint_fastdiv pattern_heads;
+  int32_t locator_page_stride;
   bool release_pdl;
 };
 
@@ -235,7 +236,7 @@ ResolveFragment(const QTokenKvBlockSparseTouchedMetadataParams<PositionType>& pa
                            static_cast<int64_t>(storage_page) * params.block_table_page_stride];
     if (physical_page >= 0) {
       return static_cast<int32_t>(static_cast<uint32_t>(physical_page) *
-                                      static_cast<uint32_t>(params.subpages_per_storage_page) +
+                                      static_cast<uint32_t>(params.locator_page_stride) +
                                   subpage);
     }
   }
