@@ -1,6 +1,10 @@
 # Experimental PCIe Ulysses backend
 
-`UlyssesCommunicator(backend="pcie")` is a single-node transport for PCIe-connected GPU groups. It is experimental, so `backend="auto"` reaches it only where NVLink is unavailable *and* `FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1` is exported identically on every rank; without the opt-in auto still falls back to NCCL, naming the variable in its reason. An explicit `backend="pcie"` never needs it. One rank is an identity path; two ranks use CUDA peer copies; four or eight ranks prefer an all-RDMA route (every peer's payload over the rank-local mlx5 RC QP with an interleaved UMR) and fall back to all-P2P when the mlx5/GPUDirect requirements are not met; `FLASHINFER_ULYSSES_PCIE_ROUTE` forces the all-P2P route, the all-RDMA route at any multi-rank world size, or the eight-rank 4+4 NUMA hybrid (same-NUMA CUDA peer copies, cross-NUMA mlx5). Every route lands the Ulysses transforms directly in their final layouts, with no pack/unpack or staging output tensor.
+`UlyssesCommunicator(backend="pcie")` is a single-node transport for PCIe-connected GPU groups. It is experimental, so `backend="auto"` reaches it only where NVLink is unavailable *and* `FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1` is exported identically on every rank; without the opt-in auto still falls back to NCCL, naming the variable in its reason. An explicit `backend="pcie"` never needs it.
+
+One rank is an identity path; two ranks use CUDA peer copies; four or eight ranks prefer an all-RDMA route (every peer's payload over the rank-local mlx5 RC QP with an interleaved UMR) and fall back to all-P2P when the mlx5/GPUDirect requirements are not met.
+
+`FLASHINFER_ULYSSES_PCIE_ROUTE` forces the all-P2P route, the all-RDMA route at any multi-rank world size, or the eight-rank 4+4 NUMA hybrid (same-NUMA CUDA peer copies, cross-NUMA mlx5). Every route lands the Ulysses transforms directly in their final layouts, with no pack/unpack or staging output tensor.
 
 Why copy engines rather than SM stores: the fused-transpose kernel behind `backend="nvlink"` (`include/flashinfer/comm/ulysses_all_to_all.cuh`) lets SM threads write into a peer-visible staging buffer, which is right for NVLink but degenerates into small transactions across a PCIe host bridge — 5-13x slower than this backend's all-P2P copy-engine route on the 8-GPU PCIe node it targets, at equal (bit-identical) outputs. (Measured 2026-08 during bring-up on the reference node — 8x RTX PRO 5000, dual-NUMA 4+4, PCIe Gen5 — with a one-off engine-comparison script that was not kept; only this conclusion survives.)
 
@@ -16,8 +20,13 @@ Why copy engines rather than SM stores: the fused-transpose kernel behind `backe
 | Input | Contiguous 4-D CUDA tensor with a 1-, 2- or 4-byte element type (FP16/BF16/FP32, FP8, INT8/UINT8); any batch size on the all-P2P route |
 | Execution | P2P enqueues asynchronously on the caller stream; the RDMA routes block the host until every rank reaches the barrier (unbounded) and until RDMA completes (fixed 10 s deadline); one in-flight operation per communicator, bound to the stream of the first call |
 | CUDA Graphs | All-P2P: capturable when every output comes from `allocate_output`; hybrid/all-RDMA: refused |
+| Workspaces | None: `workspace=`, `create_workspace` and the head-chunk primitives are refused at world size above one; `allocate_output` registers outputs instead |
 
-Full-group CUDA P2P is required even on the RDMA routes because every exchange's opening and closing epoch barriers read CUDA-mapped signals from all ranks. All routes share one translation unit, so the JIT compile/link needs the libibverbs and libmlx5 headers/libraries and the CUDA driver library (`-lcuda`) even when topology selects all-P2P; runtime verbs requirements apply only to the RDMA routes. The transport calls `ibv_query_gid_ex` (rdma-core 35.0), `ibv_reg_dmabuf_mr` and the interleaved-MKey `mlx5dv_wr_mkey_configure` / `mlx5dv_wr_set_mkey_layout_interleaved` family (rdma-core 33.0), so build against rdma-core >= 36; the reference node runs 39.0. `missing_ulysses_pcie_dependencies()` checks only that the libraries are present, so an older rdma-core surfaces as a JIT compile or link failure naming the missing symbol rather than as a route-planning fallback. Topology probing selects one GID index per rank and native initialization revalidates it (port active, RoCE v2, IPv4-mapped) before creating QPs. A forced backend raises collectively when no route is available.
+Full-group CUDA P2P is required even on the RDMA routes because every exchange's opening and closing epoch barriers read CUDA-mapped signals from all ranks.
+
+All routes share one translation unit, so the JIT compile/link needs the libibverbs and libmlx5 headers/libraries and the CUDA driver library (`-lcuda`) even when topology selects all-P2P; runtime verbs requirements apply only to the RDMA routes. The transport calls `ibv_query_gid_ex` (rdma-core 35.0), `ibv_reg_dmabuf_mr` and the interleaved-MKey `mlx5dv_wr_mkey_configure` / `mlx5dv_wr_set_mkey_layout_interleaved` family (rdma-core 33.0), so build against rdma-core >= 36; the reference node runs 39.0. `missing_ulysses_pcie_dependencies()` checks only that the libraries are present, so an older rdma-core surfaces as a JIT compile or link failure naming the missing symbol rather than as a route-planning fallback.
+
+Topology probing selects one GID index per rank and native initialization revalidates it (port active, RoCE v2, IPv4-mapped) before creating QPs. A forced backend raises collectively when no route is available.
 
 ## Device and lifecycle
 
@@ -37,6 +46,19 @@ with UlyssesCommunicator(
 Multi-rank construction, each new output registration, and `close()` are collective, and all ranks must issue public calls in the same order. Teardown first verifies on every rank that native work is bounded, then closes peer imports group-wide, and only then releases local registrations and the transport — so no rank frees an export a peer may still reference. A failed `close()` raises on all ranks and may be retried.
 
 On the RDMA routes (hybrid and all-RDMA) the barrier rendezvous is unbounded — a slow rank (a cold JIT compile, a long host-side stall) only delays its peers — while a rank that fails while running publishes a sticky abort to every peer and drains posted work requests; the communicator is then broken group-wide and must be closed and rebuilt. RDMA completion is bounded by a fixed 10 s deadline, so a stalled NIC breaks the group the same way instead of hanging it. If the abort drain cannot be confirmed, `close()` refuses to synchronize or unmap and the process must exit (see `csrc/ulysses_pcie_transport.cuh` for the protocol). On either route a rank that exits or diverges from the group call order is not detectable and leaves its peers waiting; the launcher must terminate the job.
+
+## Failure envelope
+
+Failures split by where they happen. A rejection before native code runs is decided from the call's own arguments; under the SPMD contract (same call sequence, consistent shapes on every rank) every rank rejects it and nobody has entered the barrier. A failure inside the transport is fail-stop: the communicator enters BROKEN, rejects further collectives and permits only a collective `close()`.
+
+| Failure | Route | Outcome |
+|---|---|---|
+| Rejected in Python before native code runs (bad shape or dtype, missing `out=`, refused capture, a second stream, `workspace=`) | hybrid, all-RDMA | The ordinary `ValueError` / `RuntimeError`; the communicator stays OPEN. A rank that violates the contract and issues the next collective while a peer waits in the barrier is not detected today (second follow-up below) |
+| Rejected in Python before native code runs | all-P2P | BROKEN with teardown poisoned: the all-P2P barrier has no abort protocol, so a peer that did enqueue could spin forever; `close()` refuses to synchronize and reports that the process must exit |
+| Rejected or failed inside the native exchange (operand re-check against the registered buffer, geometry rebind, MKey setup, a NIC stall past the 10 s deadline) | hybrid, all-RDMA | The failing rank publishes the sticky abort and quiesces its queue pairs; peers leave the barrier with "peer N aborted the exchange"; the group is BROKEN and `close()` completes on every rank |
+| Failed inside the native exchange | all-P2P | BROKEN with teardown poisoned; `close()` refuses as above |
+
+Planned follow-ups, in the order they unblock each other: publish the abort from Python on every route, so the two Python-side rows join the native RDMA row (the all-P2P route already imports every peer's signal buffer); publish a geometry word with the opening epoch so ranks that call with different shapes at the same position break the group instead of writing a misdescribed layout (the remote bound today is the local output size, and `BufferWire` carries no length); post the RDMA receive before the opening barrier to remove the RNR retry stall; build the all-P2P route without rdma-core; accept `out=None` by registering outputs lazily; size registrations with a per-output capacity.
 
 ## Output lifetime
 

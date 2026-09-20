@@ -296,8 +296,9 @@ def gen_ulysses_a2a_module() -> JitSpec:
 def gen_ulysses_pcie_module() -> JitSpec:
     """Build the optional single-node PCIe/mlx5 Ulysses transport.
 
-    Reached only for an explicit ``backend="pcie"``, and deliberately absent
-    from ``flashinfer/aot.py``, so nothing else ever needs rdma-core.
+    Reached for ``backend="pcie"`` -- named explicitly, or chosen by ``auto``
+    behind the experimental opt-in -- and deliberately absent from
+    ``flashinfer/aot.py``, so nothing else ever needs rdma-core.
 
     ``csrc/ulysses_pcie_transport.cuh`` is intentionally not in ``sources``
     (a ``.cuh`` there would become its own translation unit); ninja's depfile

@@ -293,7 +293,9 @@ constructor, strictly before any IPC allocation or JIT compilation:
 ============== ==================================================================
 ``"auto"``     fused-transpose NVLink-P2P kernel when the group is a verified
                single-node all-pairs NVLink mesh with a supported world size
-               (2/4/6/8); NCCL otherwise. The instance exposes ``.backend``
+               (2/4/6/8); the experimental PCIe transport where NVLink is
+               unavailable and ``FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1``
+               is set on every rank; NCCL otherwise. The instance exposes ``.backend``
                (effective), ``.fallback_reason`` and ``.decision`` /
                ``.topology_decision``.
 ``"nvlink"``   force the fused kernel; raises on every rank (before IPC/JIT for
@@ -368,10 +370,19 @@ size and can be captured when every output comes from
 :meth:`UlyssesCommunicator.allocate_output`. The JIT module links
 libibverbs, libmlx5 and the CUDA driver library even when topology selects
 the all-P2P route, so the rdma-core development packages must be present;
-it is the only FlashInfer JIT module that links them. Multi-rank PCIe calls require ``out=``
-from :meth:`UlyssesCommunicator.allocate_output`, and a transport failure is
-unrecoverable: the communicator enters a BROKEN state that permits only a
-collective ``close``.
+it is the only FlashInfer JIT module that links them. Multi-rank PCIe calls
+require ``out=`` from :meth:`UlyssesCommunicator.allocate_output`; the
+backend has no staging buffers, so ``workspace=``,
+:meth:`UlyssesCommunicator.create_workspace` and the head-chunk primitives
+are refused at world size above one. A rejection before native code runs
+(a bad operand, a refused capture, a second stream) leaves the RDMA routes
+usable, since every rank rejects the same call under the SPMD contract; the
+all-P2P route, whose barrier has no abort protocol, treats it as fail-stop.
+A failure inside the transport is fail-stop on every route: the communicator
+enters a BROKEN state that permits only a collective ``close``. On the RDMA
+routes it publishes a sticky abort that releases the peers and ``close``
+completes; on all-P2P ``close`` refuses to synchronize and the process must
+exit.
 See the `PCIe Ulysses design note
 <https://github.com/flashinfer-ai/flashinfer/blob/main/docs/design_docs/ulysses_pcie.md>`_
 for the support matrix, output-lifetime rules, teardown protocol, routing

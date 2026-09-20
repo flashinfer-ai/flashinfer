@@ -920,7 +920,8 @@ def gen_all_modules(
         jit_specs.append(gen_pcie_ipc_comm_module())
         # gen_ulysses_a2a_module and gen_ulysses_pcie_module are deliberately
         # absent: Ulysses is JIT-only, and the PCIe module additionally links
-        # -libverbs -lmlx5, which an AOT wheel builder cannot be assumed to have.
+        # -libverbs -lmlx5 -lcuda, which an AOT wheel builder cannot be assumed
+        # to have.
 
     if add_misc:
         jit_specs += [
