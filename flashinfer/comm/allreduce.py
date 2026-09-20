@@ -573,8 +573,7 @@ def create_allreduce_fusion_workspace(
         capability = _device_capability()
         if not _is_backend_supported(backend, capability):
             raise BackendSupportedError(
-                f"Backend {backend!r} does not support compute capability "
-                f"{capability}"
+                f"Backend {backend!r} does not support compute capability {capability}"
             )
 
     if gpus_per_node is None:
