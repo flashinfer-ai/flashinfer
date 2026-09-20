@@ -515,6 +515,8 @@ def _is_gdn_cp_sm100_supported_shape(
         and hv > 0
         and ((hq == hk and hv % hq == 0) or (hk == hv and hq % hk == 0))
     )
+
+
 def _allocate_output_state(
     num_seqs: int,
     num_sab_heads: int,
