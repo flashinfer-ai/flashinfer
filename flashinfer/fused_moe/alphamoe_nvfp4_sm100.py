@@ -1013,8 +1013,7 @@ def _alphamoe_complete_route_id(
         return 4 if out.data_ptr() % 16 == 0 else 5
     if m >= 128:
         return 6
-    # Smaller remaining shapes retain the existing public fallback contract.
-    return 7 if m >= 8 else 0
+    return 7 if m >= 8 else (8 if m >= 2 else 0)
 
 
 def _alphamoe_try_complete_routed(
@@ -1042,6 +1041,21 @@ def _alphamoe_try_complete_routed(
         route_experts = torch.empty((m * top_k,), dtype=torch.int32, device=out.device)
         partial_workspace = torch.empty((capacity * blocks, 8192),
                                         dtype=torch.float32, device=hidden_states.device)
+    elif route_id == 8:
+        get_alphamoe_nvfp4_sm100_module().nvfp4_complete_small_alignment_op(
+            hidden_states, hidden_states_scale, gemm1_weights, gemm1_weights_scale,
+            gemm2_weights, gemm2_weights_scale, output1_scale_gate_scalar,
+            output1_scale_scalar, output2_scale_scalar, sorted_token_ids, expert_ids,
+            num_tokens_post_padded, topk_weights, out, topk_ids, cumsum_buffer,
+            top_k, block_m, routed_scaling_factor,
+        )
+        initial_out = out.to(torch.float32)
+        route_accumulator = torch.zeros((m * top_k, k), dtype=torch.float32, device=out.device)
+        route_experts = torch.full((m * top_k,), -1, dtype=torch.int32, device=out.device)
+        act_workspace = torch.empty((capacity * blocks, 512), dtype=torch.uint8,
+                                    device=hidden_states.device)
+        sf_workspace = torch.empty((capacity * blocks, 1024), dtype=torch.uint8,
+                                   device=hidden_states.device)
     else:
         owner_capacity = (topk_ids.numel() + 31) // 32 + e
         owner_plan = torch.empty((owner_capacity, 3), dtype=torch.int32, device=hidden_states.device)
