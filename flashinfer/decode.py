@@ -39,6 +39,8 @@ from .mla import (
 )
 from .xqa import xqa, xqa_mla as xqa_mla
 from .cudnn import cudnn_batch_decode_with_kv_cache as cudnn_batch_decode_with_kv_cache
+from .cudnn.decode import CUDNN_AVAILABLE as _CUDNN_GRAPH_AVAILABLE
+from .cudnn.decode import CudnnDecodeGraph, prepare_cudnn_batch_decode
 from .jit import (
     gen_batch_decode_module,
     gen_customize_batch_decode_module,
@@ -1072,6 +1074,11 @@ class BatchDecodeWithPagedKVCacheWrapper:
             )
         self._trtllm_gen_multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None
         self._cudnn_block_tables: Optional[torch.Tensor] = None
+        # cudnn backend: the graph prepared at the first run() after plan() (validated
+        # once, per-step run() rebinds only the tensors that change) and the planned
+        # per-batch KV-length view it binds.
+        self._cudnn_prepared: Optional[CudnnDecodeGraph] = None
+        self._cudnn_kv_lens_view: Optional[torch.Tensor] = None
 
         if use_cuda_graph:
             if not torch.is_tensor(paged_kv_indptr_buffer):
@@ -1149,6 +1156,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             float_workspace_buffer, "float_workspace_buffer"
         )
         _check_workspace_buffer_alignment(int_workspace_buffer, "int_workspace_buffer")
+        self._cudnn_prepared = None
         self._float_workspace_buffer = float_workspace_buffer
         self._int_workspace_buffer = int_workspace_buffer
         self._pin_memory_int_workspace_buffer = torch.empty(
@@ -2090,6 +2098,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     f"max kv_len={max_kv_len}, page_size={page_size})."
                 )
             self._max_kv_len = self._block_tables.shape[1] * page_size
+            self._cudnn_kv_lens_view = self._kv_lens_buffer[:batch_size].view(
+                batch_size, 1, 1, 1
+            )
+            self._cudnn_prepared = None
             return
 
         # cuDNN bakes max_seq_len_kv and the block-table width into the built graph,
@@ -2126,6 +2138,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
         table.copy_(host_table, non_blocking=non_blocking)
         self._block_tables = table
         self._max_kv_len = max_kv_len
+        self._cudnn_kv_lens_view = self._kv_lens_buffer[:batch_size].view(
+            batch_size, 1, 1, 1
+        )
+        self._cudnn_prepared = None
 
     @flashinfer_api
     def prewarm_paged_kv_stride_variant(self, variant: str = "independent") -> None:
@@ -2586,29 +2602,73 @@ class BatchDecodeWithPagedKVCacheWrapper:
             if self._kv_layout == "NHD":
                 k_cache = k_cache.transpose(-3, -2)
                 v_cache = v_cache.transpose(-3, -2)
+            if q.stride(-1) != 1:
+                q = q.contiguous()
             # Staged at plan() time (device buffers, no host sync): safe to capture.
-            cudnn_batch_decode_with_kv_cache(
-                q,
-                k_cache,
-                v_cache,
-                sm_scale,
-                self._float_workspace_buffer,
-                max_sequence_kv=self._max_kv_len,
-                actual_seq_lens_kv=self._kv_lens_buffer[:actual_batch_size].view(
+            # The graph is prepared once per signature (validation, graph-cache
+            # lookup, variant pack); a step rebinds q / caches / out / lse and runs.
+            # q has batch * q_len_per_req consecutive rows per request; the graph
+            # applies the bottom-right causal diagonal for q_len > 1, the left
+            # window bound and the per-head sink logits.
+            kv_lens = self._cudnn_kv_lens_view
+            if kv_lens is None or kv_lens.shape[0] != actual_batch_size:
+                kv_lens = self._kv_lens_buffer[:actual_batch_size].view(
                     actual_batch_size, 1, 1, 1
-                ),
+                )
+            signature = dict(
+                max_sequence_kv=self._max_kv_len,
+                actual_seq_lens_kv=kv_lens,
                 block_tables=self._block_tables,
-                is_cuda_graph_compatible=self.is_cuda_graph_enabled,
-                out=out,
                 return_lse=return_lse,
-                lse=lse,
-                # q has batch * q_len_per_req consecutive rows per request; the
-                # graph applies the bottom-right causal diagonal for q_len > 1,
-                # the left window bound and the per-head sink logits.
                 q_len_per_req=q_len_per_req,
                 window_left=window_left,
-                sinks=sinks,
             )
+            if not _CUDNN_GRAPH_AVAILABLE:
+                # No cuDNN graph API installed: the public entry point's cubin fallback.
+                cudnn_batch_decode_with_kv_cache(
+                    q,
+                    k_cache,
+                    v_cache,
+                    sm_scale,
+                    self._float_workspace_buffer,
+                    is_cuda_graph_compatible=self.is_cuda_graph_enabled,
+                    out=out,
+                    lse=lse,
+                    sinks=sinks,
+                    **signature,
+                )
+            else:
+                prepared = self._cudnn_prepared
+                if prepared is None or not prepared.matches(
+                    q,
+                    k_cache,
+                    v_cache,
+                    sm_scale,
+                    out=out,
+                    lse=lse,
+                    sinks=sinks,
+                    **signature,
+                ):
+                    prepared = self._cudnn_prepared = prepare_cudnn_batch_decode(
+                        q,
+                        k_cache,
+                        v_cache,
+                        sm_scale,
+                        out=out,
+                        lse=lse,
+                        sinks=sinks,
+                        **signature,
+                    )
+                prepared.run(
+                    q,
+                    k_cache,
+                    v_cache,
+                    out,
+                    lse,
+                    self._float_workspace_buffer,
+                    actual_seq_lens_kv=kv_lens,
+                    block_tables=self._block_tables,
+                )
         elif self.use_tensor_cores:
             run_args = [self._float_workspace_buffer]
             if self._backend == "trtllm-gen":

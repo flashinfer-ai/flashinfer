@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Optional, Union
 
@@ -310,6 +311,199 @@ if CUDNN_AVAILABLE:
         return g, tensors_to_return
 
 
+@dataclass(frozen=True)
+class _DecodeInputs:
+    """Validated call buffers; only the prepared path retains the sink view."""
+
+    q: torch.Tensor
+    out: torch.Tensor
+    lse: Optional[torch.Tensor]
+    sinks: Optional[torch.Tensor]
+    batch_size: int
+
+
+def _decode_q_view(q: torch.Tensor, batch_size: int, q_len_per_req: int):
+    if q_len_per_req == 1:
+        return q
+    return q.view(batch_size, q_len_per_req, q.shape[1], q.shape[2]).transpose(1, 2)
+
+
+def _validate_decode_devices(device, tensors):
+    # Keys describe tensor geometry, not placement. Rebound pointers must be
+    # checked even when a graph signature matches.
+    for name, tensor in tensors:
+        if tensor is not None and tensor.device != device:
+            raise ValueError(
+                f"{name} must be on the same device as q ({device}), got {tensor.device}"
+            )
+
+
+def _normalize_decode_inputs(
+    q,
+    k_cache,
+    v_cache,
+    workspace_buffer,
+    *,
+    actual_seq_lens_kv,
+    block_tables,
+    out,
+    return_lse,
+    lse,
+    q_len_per_req,
+    sinks,
+) -> _DecodeInputs:
+    """Shared cold validation, output allocation and query/sink normalization.
+
+    The public entry can allocate outputs and copy a strided query. The
+    prepared entry checks its narrower, supplied-buffer contract first.
+    """
+    if q_len_per_req < 1:
+        raise ValueError(f"q_len_per_req must be >= 1, got {q_len_per_req}")
+    if q.dim() != 3 or q.shape[0] % q_len_per_req != 0:
+        raise ValueError(
+            "q must have shape (batch_size * q_len_per_req, num_heads_qo, head_dim); "
+            f"got {tuple(q.shape)} with q_len_per_req={q_len_per_req}"
+        )
+    rows = q.shape[0]
+    bs = rows // q_len_per_req
+    h_qo = q.shape[1]
+    d_vo = v_cache.shape[3]
+
+    supported_dtypes = (torch.float16, torch.bfloat16)
+    for name, t in (("q", q), ("k_cache", k_cache), ("v_cache", v_cache)):
+        if t.dtype not in supported_dtypes:
+            raise ValueError(
+                f"cudnn_batch_decode_with_kv_cache only supports torch.float16 "
+                f"and torch.bfloat16, got {name}.dtype={t.dtype}"
+            )
+    if out is not None and out.dtype != q.dtype:
+        raise ValueError(
+            f"out.dtype ({out.dtype}) must match q.dtype ({q.dtype}); the "
+            "output is produced in the query's data type"
+        )
+
+    if return_lse:
+        if not CUDNN_AVAILABLE:
+            raise NotImplementedError(
+                "return_lse=True requires the cuDNN graph backend; it is not "
+                "supported by the fallback cubin decode path"
+            )
+        if lse is None:
+            lse = torch.empty(rows, h_qo, device=q.device, dtype=torch.float32)
+        elif (
+            lse.shape != (rows, h_qo)
+            or lse.dtype != torch.float32
+            or not lse.is_contiguous()
+            or lse.device != q.device
+        ):
+            raise ValueError(
+                "lse must be a contiguous float32 tensor of shape "
+                f"(batch_size * q_len_per_req, num_heads_qo) = ({rows}, {h_qo}), "
+                f"got shape {tuple(lse.shape)} with dtype {lse.dtype}"
+            )
+
+    if out is None:
+        out = torch.empty(rows, h_qo, d_vo, device=q.device, dtype=q.dtype)
+    elif (
+        out.shape != (rows, h_qo, d_vo)
+        or out.device != q.device
+        or not out.is_contiguous()
+    ):
+        # O is bound with contiguous (rows, heads, d_vo) strides.
+        raise ValueError(
+            f"out must be a contiguous tensor of shape ({rows}, {h_qo}, {d_vo}) on "
+            f"{q.device}, got shape {tuple(out.shape)} on {out.device}"
+        )
+    sinks_view = None
+    if sinks is not None:
+        if (
+            sinks.dim() != 1
+            or sinks.shape[0] != h_qo
+            or sinks.dtype != torch.float32
+            or sinks.device != q.device
+        ):
+            raise ValueError(
+                "sinks must be a float32 tensor of shape (num_heads_qo,) = "
+                f"({h_qo},) on {q.device}, got shape {tuple(sinks.shape)} with "
+                f"dtype {sinks.dtype} on {sinks.device}"
+            )
+        # The graph binds the sink logits as a (1, H, 1, 1) fp32 tensor.
+        sinks_view = sinks.contiguous().view(1, h_qo, 1, 1)
+    # Every tensor bound to the graph (and the workspace) must live where q
+    # does; the graph executes on q's device with raw pointers.
+    _validate_decode_devices(
+        q.device,
+        (
+            ("k_cache", k_cache),
+            ("v_cache", v_cache),
+            ("workspace_buffer", workspace_buffer),
+            ("lse", lse),
+            ("block_tables", block_tables),
+            ("actual_seq_lens_kv", actual_seq_lens_kv if CUDNN_AVAILABLE else None),
+        ),
+    )
+    if q.stride(-1) != 1:
+        # The graph honors arbitrary batch/head strides but needs a unit
+        # innermost stride (TMA/vector loads); such inputs are rare, copy them.
+        q = q.contiguous()
+
+    return _DecodeInputs(q, out, lse, sinks_view, bs)
+
+
+def _execute_decode(
+    graph,
+    q,
+    k_cache,
+    v_cache,
+    out,
+    lse,
+    workspace_buffer,
+    *,
+    actual_seq_lens_q,
+    actual_seq_lens_kv,
+    block_tables,
+    return_lse,
+    sinks,
+    batch_offsets_q=None,
+    batch_offsets_o=None,
+):
+    """Bind call-local pointers and apply the public base-2 LSE contract."""
+    handle_ = _create_cudnn_handle(torch.cuda.current_stream(q.device))
+
+    var_map = {
+        UIDs.Q_UID.value: q,
+        UIDs.K_UID.value: k_cache,
+        UIDs.V_UID.value: v_cache,
+        UIDs.O_UID.value: out,
+    }
+    if return_lse:
+        var_map[UIDs.STATS_UID.value] = lse
+    if sinks is not None:
+        var_map[UIDs.SINK_UID.value] = sinks
+    if actual_seq_lens_q is not None:
+        var_map[UIDs.ACTUAL_SEQ_LENS_Q_UID.value] = actual_seq_lens_q
+    if actual_seq_lens_kv is not None:
+        var_map[UIDs.ACTUAL_SEQ_LENS_KV_UID.value] = actual_seq_lens_kv
+
+    if batch_offsets_q is not None:
+        var_map[UIDs.RAGGED_Q_UID.value] = batch_offsets_q
+    if batch_offsets_o is not None:
+        var_map[UIDs.RAGGED_O_UID.value] = batch_offsets_o
+
+    if block_tables is not None:
+        var_map[UIDs.BLOCK_TABLES_K_UID.value] = block_tables
+        var_map[UIDs.BLOCK_TABLES_V_UID.value] = block_tables
+
+    graph.execute(var_map, workspace=workspace_buffer, handle=handle_)
+
+    if return_lse:
+        # cuDNN emits natural-log softmax stats; FlashInfer's LSE contract is
+        # base-2 (the cascade-merge kernels consume it), as in the prefill path.
+        lse.mul_(log2e)
+
+    return out
+
+
 def _batch_decode_with_kv_cache(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -351,40 +545,265 @@ def _batch_decode_with_kv_cache(
         sinks=sinks,
     )
 
-    handle_ = _create_cudnn_handle(torch.cuda.current_stream())
+    return _execute_decode(
+        graph,
+        q,
+        k_cache,
+        v_cache,
+        out,
+        lse,
+        workspace_buffer,
+        actual_seq_lens_q=actual_seq_lens_q,
+        actual_seq_lens_kv=actual_seq_lens_kv,
+        block_tables=block_tables,
+        return_lse=return_lse,
+        sinks=sinks,
+        batch_offsets_q=batch_offsets_q,
+        batch_offsets_o=batch_offsets_o,
+    )
 
-    var_map = {
-        UIDs.Q_UID.value: q,
-        UIDs.K_UID.value: k_cache,
-        UIDs.V_UID.value: v_cache,
-        UIDs.O_UID.value: out,
-    }
-    if return_lse:
-        var_map[UIDs.STATS_UID.value] = lse
-    if sinks is not None:
-        var_map[UIDs.SINK_UID.value] = sinks
-    if actual_seq_lens_q is not None:
-        var_map[UIDs.ACTUAL_SEQ_LENS_Q_UID.value] = actual_seq_lens_q
-    if actual_seq_lens_kv is not None:
-        var_map[UIDs.ACTUAL_SEQ_LENS_KV_UID.value] = actual_seq_lens_kv
 
-    if batch_offsets_q is not None:
-        var_map[UIDs.RAGGED_Q_UID.value] = batch_offsets_q
-    if batch_offsets_o is not None:
-        var_map[UIDs.RAGGED_O_UID.value] = batch_offsets_o
+class CudnnDecodeGraph:
+    """Wrapper-owned paged-decode graph and constant query-length/sink buffers.
 
-    if block_tables is not None:
-        var_map[UIDs.BLOCK_TABLES_K_UID.value] = block_tables
-        var_map[UIDs.BLOCK_TABLES_V_UID.value] = block_tables
+    Each run binds a fresh variant pack; the plan never retains changing
+    query, cache, output or metadata pointers. Callers check ``matches`` before
+    running, and invalidate this object on plan/workspace replacement.
 
-    graph.execute(var_map, workspace=workspace_buffer, handle=handle_)
+    The signature is the graph-cache key of :func:`_build_decode_graph`
+    (shapes, strides, dtypes, scale, presence flags, mask parameters), so a
+    prepared graph is reused exactly where the graph cache would replay the
+    same graph; anything else re-prepares. Input validation happens in
+    :func:`prepare_cudnn_batch_decode`; runtime devices are checked on every
+    rebind. The
+    constant per-batch query-length tensor the graph binds is allocated
+    there instead of on every step.
+    """
 
-    if return_lse:
-        # cuDNN emits natural-log softmax stats; FlashInfer's LSE contract is
-        # base-2 (the cascade-merge kernels consume it), as in the prefill path.
-        lse.mul_(log2e)
+    __slots__ = (
+        "key",
+        "graph",
+        "return_lse",
+        "batch_size",
+        "q_len_per_req",
+        "out_shape",
+        "lse_shape",
+        "sinks_view",
+        "seq_lens_q",
+    )
 
-    return out
+    def __init__(
+        self,
+        key,
+        graph,
+        *,
+        return_lse: bool,
+        batch_size: int,
+        q_len_per_req: int,
+        out_shape: tuple,
+        lse_shape: Optional[tuple],
+        sinks_view: Optional[torch.Tensor],
+        seq_lens_q: torch.Tensor,
+    ):
+        self.key = key
+        self.graph = graph
+        self.return_lse = return_lse
+        self.batch_size = batch_size
+        self.q_len_per_req = q_len_per_req
+        self.out_shape = out_shape
+        self.lse_shape = lse_shape
+        self.sinks_view = sinks_view
+        self.seq_lens_q = seq_lens_q
+
+    def _q_graph(self, q: torch.Tensor) -> torch.Tensor:
+        return _decode_q_view(q, self.batch_size, self.q_len_per_req)
+
+    def matches(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        scale: float,
+        *,
+        max_sequence_kv: int,
+        actual_seq_lens_kv: torch.Tensor,
+        block_tables: torch.Tensor,
+        return_lse: bool,
+        q_len_per_req: int,
+        window_left: int,
+        out: torch.Tensor,
+        lse: Optional[torch.Tensor],
+        sinks: Optional[torch.Tensor],
+    ) -> bool:
+        """Whether this prepared graph serves the call: same graph-cache key
+        (shapes, strides, dtypes, scale, flags, mask), out / lse keep their
+        layout, the sink logits are the same buffer."""
+        if (
+            q_len_per_req != self.q_len_per_req
+            or q.shape[0] != self.batch_size * q_len_per_req
+        ):
+            return False
+        if (sinks is None) != (self.sinks_view is None) or (
+            sinks is not None
+            and (
+                sinks.data_ptr() != self.sinks_view.data_ptr()
+                or sinks.shape != (q.shape[1],)
+                or sinks.dtype != torch.float32
+                or sinks.device != q.device
+                or not sinks.is_contiguous()
+            )
+        ):
+            return False
+        if (
+            out.shape != self.out_shape
+            or not out.is_contiguous()
+            or out.dtype != q.dtype
+            or out.device != q.device
+        ):
+            return False
+        if self.return_lse != return_lse or (
+            return_lse
+            and (
+                lse is None
+                or lse.shape != self.lse_shape
+                or not lse.is_contiguous()
+                or lse.dtype != torch.float32
+                or lse.device != q.device
+            )
+        ):
+            return False
+        key = _sdpa_decode_key_fn(
+            self._q_graph(q),
+            k_cache,
+            v_cache,
+            scale,
+            max_sequence_kv=max_sequence_kv,
+            block_size=k_cache.shape[2],
+            actual_seq_lens_q=self.seq_lens_q,
+            actual_seq_lens_kv=actual_seq_lens_kv,
+            block_tables=block_tables,
+            return_lse=return_lse,
+            q_len_per_req=q_len_per_req,
+            window_left=window_left,
+            sinks=self.sinks_view,
+        )
+        return key == self.key
+
+    def run(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        out: torch.Tensor,
+        lse: Optional[torch.Tensor],
+        workspace_buffer: torch.Tensor,
+        *,
+        actual_seq_lens_kv: torch.Tensor,
+        block_tables: torch.Tensor,
+    ) -> torch.Tensor:
+        # Matching graph metadata does not enforce the runtime device contract.
+        # Revalidate every rebound buffer before handing raw pointers to cuDNN,
+        # including the plan-owned constant and a replaced workspace.
+        _validate_decode_devices(
+            q.device,
+            (
+                ("seq_lens_q", self.seq_lens_q),
+                ("k_cache", k_cache),
+                ("v_cache", v_cache),
+                ("workspace_buffer", workspace_buffer),
+                ("actual_seq_lens_kv", actual_seq_lens_kv),
+                ("block_tables", block_tables),
+            ),
+        )
+        return _execute_decode(
+            self.graph,
+            self._q_graph(q),
+            k_cache,
+            v_cache,
+            out,
+            lse,
+            workspace_buffer,
+            actual_seq_lens_q=self.seq_lens_q,
+            actual_seq_lens_kv=actual_seq_lens_kv,
+            block_tables=block_tables,
+            return_lse=self.return_lse,
+            sinks=self.sinks_view,
+        )
+
+
+def prepare_cudnn_batch_decode(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    scale: float,
+    *,
+    max_sequence_kv: int,
+    actual_seq_lens_kv: torch.Tensor,
+    block_tables: torch.Tensor,
+    out: torch.Tensor,
+    return_lse: bool,
+    lse: Optional[torch.Tensor],
+    q_len_per_req: int,
+    window_left: int,
+    sinks: Optional[torch.Tensor],
+) -> CudnnDecodeGraph:
+    """Validate once and build (or fetch from the graph cache) the paged-decode
+    graph for this signature; steps then execute through
+    :meth:`CudnnDecodeGraph.run`. Same contract as
+    :func:`cudnn_batch_decode_with_kv_cache` in the paged, per-batch-length,
+    ``out``-provided form the wrappers use."""
+    if not CUDNN_AVAILABLE:
+        raise NotImplementedError(
+            "prepare_cudnn_batch_decode requires the cuDNN graph backend"
+        )
+    if out is None or (return_lse and lse is None):
+        raise ValueError("prepared decode requires supplied out and active lse buffers")
+    if q.dim() > 0 and q.stride(-1) != 1:
+        raise ValueError("q must have a unit innermost stride")
+    if actual_seq_lens_kv is None or block_tables is None:
+        raise ValueError("prepared decode requires KV lengths and block tables")
+    inputs = _normalize_decode_inputs(
+        q,
+        k_cache,
+        v_cache,
+        None,
+        actual_seq_lens_kv=actual_seq_lens_kv,
+        block_tables=block_tables,
+        out=out,
+        return_lse=return_lse,
+        lse=lse,
+        q_len_per_req=q_len_per_req,
+        sinks=sinks,
+    )
+    bs, sinks_view = inputs.batch_size, inputs.sinks
+    seq_lens_q = torch.full(
+        (bs, 1, 1, 1), q_len_per_req, device=q.device, dtype=torch.int32
+    )
+    q_graph = _decode_q_view(q, bs, q_len_per_req)
+    kwargs = dict(
+        max_sequence_kv=max_sequence_kv,
+        block_size=k_cache.shape[2],
+        actual_seq_lens_q=seq_lens_q,
+        actual_seq_lens_kv=actual_seq_lens_kv,
+        block_tables=block_tables,
+        return_lse=return_lse,
+        q_len_per_req=q_len_per_req,
+        window_left=window_left,
+        sinks=sinks_view,
+    )
+    graph, _ = _build_decode_graph(q_graph, k_cache, v_cache, scale, **kwargs)
+    key = _sdpa_decode_key_fn(q_graph, k_cache, v_cache, scale, **kwargs)
+    return CudnnDecodeGraph(
+        key,
+        graph,
+        return_lse=return_lse,
+        batch_size=bs,
+        q_len_per_req=q_len_per_req,
+        out_shape=tuple(out.shape),
+        lse_shape=tuple(lse.shape) if return_lse else None,
+        sinks_view=sinks_view,
+        seq_lens_q=seq_lens_q,
+    )
 
 
 @flashinfer_api(trace=cudnn_batch_decode_trace)
@@ -504,97 +923,26 @@ def cudnn_batch_decode_with_kv_cache(
     they are folded to base-2 here.
     """
 
-    if q_len_per_req < 1:
-        raise ValueError(f"q_len_per_req must be >= 1, got {q_len_per_req}")
-    if q.dim() != 3 or q.shape[0] % q_len_per_req != 0:
-        raise ValueError(
-            "q must have shape (batch_size * q_len_per_req, num_heads_qo, head_dim); "
-            f"got {tuple(q.shape)} with q_len_per_req={q_len_per_req}"
-        )
-    rows = q.shape[0]
-    bs = rows // q_len_per_req
-    h_qo = q.shape[1]
-    d_vo = v_cache.shape[3]
-
-    supported_dtypes = (torch.float16, torch.bfloat16)
-    for name, t in (("q", q), ("k_cache", k_cache), ("v_cache", v_cache)):
-        if t.dtype not in supported_dtypes:
-            raise ValueError(
-                f"cudnn_batch_decode_with_kv_cache only supports torch.float16 "
-                f"and torch.bfloat16, got {name}.dtype={t.dtype}"
-            )
-    if out is not None and out.dtype != q.dtype:
-        raise ValueError(
-            f"out.dtype ({out.dtype}) must match q.dtype ({q.dtype}); the "
-            "output is produced in the query's data type"
-        )
-
-    if return_lse:
-        if not CUDNN_AVAILABLE:
-            raise NotImplementedError(
-                "return_lse=True requires the cuDNN graph backend; it is not "
-                "supported by the fallback cubin decode path"
-            )
-        if lse is None:
-            lse = torch.empty(rows, h_qo, device=q.device, dtype=torch.float32)
-        elif (
-            lse.shape != (rows, h_qo)
-            or lse.dtype != torch.float32
-            or not lse.is_contiguous()
-            or lse.device != q.device
-        ):
-            raise ValueError(
-                "lse must be a contiguous float32 tensor of shape "
-                f"(batch_size * q_len_per_req, num_heads_qo) = ({rows}, {h_qo}), "
-                f"got shape {tuple(lse.shape)} with dtype {lse.dtype}"
-            )
-
-    if out is None:
-        out = torch.empty(rows, h_qo, d_vo, device=q.device, dtype=q.dtype)
-    elif (
-        out.shape != (rows, h_qo, d_vo)
-        or out.device != q.device
-        or not out.is_contiguous()
-    ):
-        # O is bound with contiguous (rows, heads, d_vo) strides.
-        raise ValueError(
-            f"out must be a contiguous tensor of shape ({rows}, {h_qo}, {d_vo}) on "
-            f"{q.device}, got shape {tuple(out.shape)} on {out.device}"
-        )
-    sinks_view = None
-    if sinks is not None:
-        if (
-            sinks.dim() != 1
-            or sinks.shape[0] != h_qo
-            or sinks.dtype != torch.float32
-            or sinks.device != q.device
-        ):
-            raise ValueError(
-                "sinks must be a float32 tensor of shape (num_heads_qo,) = "
-                f"({h_qo},) on {q.device}, got shape {tuple(sinks.shape)} with "
-                f"dtype {sinks.dtype} on {sinks.device}"
-            )
-        # The graph binds the sink logits as a (1, H, 1, 1) fp32 tensor.
-        sinks_view = sinks.contiguous().view(1, h_qo, 1, 1)
-    # Every tensor bound to the graph (and the workspace) must live where q
-    # does; the graph executes on q's device with raw pointers.
-    for name, tensor in (
-        ("k_cache", k_cache),
-        ("v_cache", v_cache),
-        ("workspace_buffer", workspace_buffer),
-        ("lse", lse),
-        ("block_tables", block_tables),
-        ("actual_seq_lens_kv", actual_seq_lens_kv if CUDNN_AVAILABLE else None),
-    ):
-        if tensor is not None and tensor.device != q.device:
-            raise ValueError(
-                f"{name} must be on the same device as q ({q.device}), "
-                f"got {tensor.device}"
-            )
-    if q.stride(-1) != 1:
-        # The graph honors arbitrary batch/head strides but needs a unit
-        # innermost stride (TMA/vector loads); such inputs are rare, copy them.
-        q = q.contiguous()
+    inputs = _normalize_decode_inputs(
+        q,
+        k_cache,
+        v_cache,
+        workspace_buffer,
+        actual_seq_lens_kv=actual_seq_lens_kv,
+        block_tables=block_tables,
+        out=out,
+        return_lse=return_lse,
+        lse=lse,
+        q_len_per_req=q_len_per_req,
+        sinks=sinks,
+    )
+    q, out, lse, sinks_view, bs = (
+        inputs.q,
+        inputs.out,
+        inputs.lse,
+        inputs.sinks,
+        inputs.batch_size,
+    )
 
     if not CUDNN_AVAILABLE:
         if q_len_per_req > 1 or window_left >= 0 or sinks is not None:
@@ -637,11 +985,7 @@ def cudnn_batch_decode_with_kv_cache(
         # Multi-token rows are presented to the graph as (batch, heads,
         # q_len_per_req, d): a strided view, no copy (the rows of one request
         # are consecutive in q, whatever its batch stride).
-        q_graph = (
-            q
-            if q_len_per_req == 1
-            else q.view(bs, q_len_per_req, h_qo, q.shape[-1]).transpose(1, 2)
-        )
+        q_graph = _decode_q_view(q, bs, q_len_per_req)
 
         _batch_decode_with_kv_cache(
             q=q_graph,

@@ -26,7 +26,13 @@ import torch
 
 from .api_logging import flashinfer_api
 from .cudnn import cudnn_batch_prefill_with_kv_cache
-from .cudnn.prefill import _cudnn_supports_direct_seqlens
+from .cudnn.prefill import (
+    CUDNN_AVAILABLE as _CUDNN_GRAPH_AVAILABLE,
+    _cudnn_supports_direct_seqlens,
+    CudnnPrefillGraph,
+    _PrefillMetadata,
+    prepare_cudnn_batch_prefill,
+)
 from .jit import (
     MissingJITCacheError,
     gen_batch_prefill_module,
@@ -2248,6 +2254,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._seq_lens_kv = None
         self._seq_lens_q = None
         self._block_tables = None
+        self._cudnn_prepared: Optional[CudnnPrefillGraph] = None
         self._prims_backend = None
         if backend == "cute-dsl-prims":
             try:
@@ -2285,6 +2292,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         )
         _check_workspace_buffer_alignment(int_workspace_buffer, "int_workspace_buffer")
         self._float_workspace_buffer = float_workspace_buffer
+        self._cudnn_prepared = None
         self._int_workspace_buffer = int_workspace_buffer
         self._pin_memory_int_workspace_buffer = torch.empty(
             self._int_workspace_buffer.shape,
@@ -3586,6 +3594,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
             mask_mode = MaskMode.MULTIITEMSCORING.value
 
         if self._backend == "cudnn":
+            # The cuDNN graph declares dense output and Stats strides.
+            if not out.is_contiguous():
+                raise ValueError("out must be contiguous for the cuDNN backend")
+            if return_lse and not lse.is_contiguous():
+                raise ValueError("lse must be contiguous for the cuDNN backend")
             if self._seq_lens_q is not None and self._seq_lens_q.dim() == 1:
                 self._seq_lens_q = self._seq_lens_q.reshape(self._batch_size, 1, 1, 1)
 
@@ -3596,29 +3609,79 @@ class BatchPrefillWithPagedKVCacheWrapper:
             # consumes it directly as cu_seq_len_q / the Q and O ragged offsets,
             # applying the per-tensor (num_heads * head_dim) multipliers itself, so
             # head_dim_qk != head_dim_vo is handled without any offset rescaling.
-            cudnn_batch_prefill_with_kv_cache(
-                q,
-                k_cache,  # Need to be changed
-                v_cache,  # Need to be changed
-                self._sm_scale,
-                self._float_workspace_buffer,
-                actual_seq_lens_q=self._seq_lens_q,
-                actual_seq_lens_kv=self._seq_lens_kv,
-                max_token_per_sequence=self._max_q_len,
-                max_sequence_kv=self._max_kv_len,
-                block_tables=self._block_tables,
-                causal=self._causal,
-                return_lse=return_lse,
-                lse_base=lse_base,
-                q_scale=q_scale,
-                k_scale=k_scale,
-                v_scale=v_scale,
-                batch_offsets_q=self._qo_indptr_buf,
-                batch_offsets_units="tokens",
-                out=out,
-                lse=lse,
-                o_data_type=out_dtype,
-            )
+            if (
+                _CUDNN_GRAPH_AVAILABLE
+                and not return_lse
+                and q_scale is None
+                and k_scale is None
+                and v_scale is None
+                and self._block_tables is not None
+                and self._seq_lens_kv is not None
+                and _cudnn_supports_direct_seqlens(q.dtype, mixed=True)
+            ):
+                # Prepared-graph fast path (the mixed direct form the public
+                # entry resolves to): the graph the cache would replay stays on
+                # the wrapper and is re-prepared only when its signature moves;
+                # each step rebinds the tensors and executes. return_lse keeps
+                # the public entry, which validates the LSE layout.
+                metadata = _PrefillMetadata(
+                    max_token_per_sequence=self._max_q_len,
+                    max_sequence_kv=self._max_kv_len,
+                    actual_seq_lens_q=self._seq_lens_q,
+                    actual_seq_lens_kv=self._seq_lens_kv,
+                    cu_seq_lens_q=self._qo_indptr_buf,
+                    block_tables=self._block_tables,
+                    batch_offsets_q=self._qo_indptr_buf,
+                    batch_offsets_o=self._qo_indptr_buf,
+                    causal=self._causal,
+                    return_lse=False,
+                    o_data_type=out_dtype,
+                )
+                prepared = self._cudnn_prepared
+                if prepared is None or not prepared.matches(
+                    q, k_cache, v_cache, self._sm_scale, metadata=metadata
+                ):
+                    prepared = self._cudnn_prepared = prepare_cudnn_batch_prefill(
+                        q,
+                        k_cache,
+                        v_cache,
+                        self._sm_scale,
+                        self._float_workspace_buffer,
+                        metadata=metadata,
+                    )
+                prepared.run(
+                    q,
+                    k_cache,
+                    v_cache,
+                    out,
+                    None,
+                    self._float_workspace_buffer,
+                    metadata=metadata,
+                )
+            else:
+                cudnn_batch_prefill_with_kv_cache(
+                    q,
+                    k_cache,  # Need to be changed
+                    v_cache,  # Need to be changed
+                    self._sm_scale,
+                    self._float_workspace_buffer,
+                    actual_seq_lens_q=self._seq_lens_q,
+                    actual_seq_lens_kv=self._seq_lens_kv,
+                    max_token_per_sequence=self._max_q_len,
+                    max_sequence_kv=self._max_kv_len,
+                    block_tables=self._block_tables,
+                    causal=self._causal,
+                    return_lse=return_lse,
+                    lse_base=lse_base,
+                    q_scale=q_scale,
+                    k_scale=k_scale,
+                    v_scale=v_scale,
+                    batch_offsets_q=self._qo_indptr_buf,
+                    batch_offsets_units="tokens",
+                    out=out,
+                    lse=lse,
+                    o_data_type=out_dtype,
+                )
         else:
             if self._backend != "trtllm-gen":
                 assert self._plan_info is not None, "plan info is not initialized"
@@ -4088,6 +4151,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         # cudnn: stats ragged offset so the LSE lands packed as
         # [total_tokens, num_qo_heads]; token-unit, so it is qo_indptr itself.
         self._cudnn_stats_offsets: Optional[torch.Tensor] = None
+        self._cudnn_prepared: Optional[CudnnPrefillGraph] = None
 
     @property
     def is_cuda_graph_enabled(self) -> bool:
@@ -4109,6 +4173,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             be the same as the device of the input tensors.
         """
         self._float_workspace_buffer = float_workspace_buffer
+        self._cudnn_prepared = None
         self._int_workspace_buffer = int_workspace_buffer
         self._pin_memory_int_workspace_buffer = torch.empty(
             self._int_workspace_buffer.shape,
@@ -5262,6 +5327,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 else out
             )
         elif self._backend == "cudnn":
+            # The cuDNN graph declares dense output and Stats strides.
+            if not out.is_contiguous():
+                raise ValueError("out must be contiguous for the cuDNN backend")
+            if return_lse and not lse.is_contiguous():
+                raise ValueError("lse must be contiguous for the cuDNN backend")
             # cuDNN's ragged prefill graph has no kv_layout input and reads
             # k.shape[1] as the kv head count, i.e. it assumes NHD. Reject HND
             # loudly rather than silently addressing the wrong data.
@@ -5296,33 +5366,88 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             if self._seq_lens_kv is not None and self._seq_lens_kv.dim() == 1:
                 self._seq_lens_kv = self._seq_lens_kv.reshape(-1, 1, 1, 1)
 
-            cudnn_batch_prefill_with_kv_cache(
-                q,
-                k,
-                v,
-                sm_scale,
-                self._float_workspace_buffer,
-                max_token_per_sequence=self._max_token_per_sequence,
-                max_sequence_kv=self._max_sequence_kv,
-                actual_seq_lens_q=self._seq_lens_q,
-                actual_seq_lens_kv=self._seq_lens_kv,
-                return_lse=return_lse,
-                causal=self._causal,
-                q_scale=q_scale,
-                k_scale=k_scale,
-                v_scale=v_scale,
-                batch_offsets_q=self._qo_indptr_buf,
-                batch_offsets_k=self._kv_indptr_buf,
-                batch_offsets_v=self._v_indptr_buf,
-                batch_offsets_o=self._o_indptr_buf,
-                batch_offsets_stats=(self._cudnn_stats_offsets if return_lse else None),
-                batch_offsets_units="tokens",
-                is_cuda_graph_compatible=self._use_cuda_graph,
-                lse_base=lse_base,
-                out=out,
-                lse=lse,
-                o_data_type=out_dtype,
-            )
+            if (
+                _CUDNN_GRAPH_AVAILABLE
+                and q_scale is None
+                and k_scale is None
+                and v_scale is None
+                and _cudnn_supports_direct_seqlens(q.dtype)
+            ):
+                # Prepared-graph fast path (the direct token-unit form the
+                # public entry resolves to): the graph the cache would replay
+                # stays on the wrapper and is re-prepared only when its
+                # signature moves; each step rebinds the tensors and executes.
+                # out/lse were validated above.
+                metadata = _PrefillMetadata(
+                    max_token_per_sequence=self._max_token_per_sequence,
+                    max_sequence_kv=self._max_sequence_kv,
+                    actual_seq_lens_q=self._seq_lens_q,
+                    actual_seq_lens_kv=self._seq_lens_kv,
+                    cu_seq_lens_q=self._qo_indptr_buf,
+                    cu_seq_lens_kv=self._kv_indptr_buf,
+                    batch_offsets_q=self._qo_indptr_buf,
+                    batch_offsets_k=self._kv_indptr_buf,
+                    batch_offsets_v=self._v_indptr_buf,
+                    batch_offsets_o=self._o_indptr_buf,
+                    batch_offsets_stats=(
+                        self._cudnn_stats_offsets if return_lse else None
+                    ),
+                    causal=self._causal,
+                    return_lse=return_lse,
+                    o_data_type=out_dtype,
+                )
+                prepared = self._cudnn_prepared
+                if prepared is None or not prepared.matches(
+                    q, k, v, sm_scale, metadata=metadata
+                ):
+                    prepared = self._cudnn_prepared = prepare_cudnn_batch_prefill(
+                        q,
+                        k,
+                        v,
+                        sm_scale,
+                        self._float_workspace_buffer,
+                        metadata=metadata,
+                    )
+                prepared.run(
+                    q,
+                    k,
+                    v,
+                    out,
+                    lse,
+                    self._float_workspace_buffer,
+                    lse_base=lse_base,
+                    metadata=metadata,
+                )
+            else:
+                cudnn_batch_prefill_with_kv_cache(
+                    q,
+                    k,
+                    v,
+                    sm_scale,
+                    self._float_workspace_buffer,
+                    max_token_per_sequence=self._max_token_per_sequence,
+                    max_sequence_kv=self._max_sequence_kv,
+                    actual_seq_lens_q=self._seq_lens_q,
+                    actual_seq_lens_kv=self._seq_lens_kv,
+                    return_lse=return_lse,
+                    causal=self._causal,
+                    q_scale=q_scale,
+                    k_scale=k_scale,
+                    v_scale=v_scale,
+                    batch_offsets_q=self._qo_indptr_buf,
+                    batch_offsets_k=self._kv_indptr_buf,
+                    batch_offsets_v=self._v_indptr_buf,
+                    batch_offsets_o=self._o_indptr_buf,
+                    batch_offsets_stats=(
+                        self._cudnn_stats_offsets if return_lse else None
+                    ),
+                    batch_offsets_units="tokens",
+                    is_cuda_graph_compatible=self._use_cuda_graph,
+                    lse_base=lse_base,
+                    out=out,
+                    lse=lse,
+                    o_data_type=out_dtype,
+                )
 
             # base already handled inside cudnn_batch_prefill_with_kv_cache
             return (
