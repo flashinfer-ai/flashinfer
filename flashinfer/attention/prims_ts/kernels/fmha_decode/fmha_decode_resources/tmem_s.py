@@ -98,6 +98,7 @@ from .smem_block_sparse_metadata import (
 )
 from .sage_scales import (
     SageKScales,
+    _groups_or_default,
     dense_k_scale_token,
     load_k_scale,
     load_q_scale,
@@ -294,8 +295,12 @@ class TmemSResource(DecodeGenResourceBase):
     _seed_alloc: Constexpr[SmemAllocation | None] = None
     # Where the tile's ``sfK`` words live during the softmax passes (the lane's
     # register array or the instance's SMEM ring); shared with the P resource
-    # and the route metadata consumer of the same instance.
+    # and the route metadata consumer of the same instance. Exact routes and
+    # dense tiles use ``sage_k_scales``; proxy routes use
+    # ``sage_summary_k_scales``, the same object unless the summary scales
+    # have their own K block size.
     sage_k_scales: Constexpr[SageKScales | None] = None
+    sage_summary_k_scales: Constexpr[SageKScales | None] = None
     old_max_arr: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     sum_arr: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     new_max_arr: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
@@ -358,6 +363,11 @@ class TmemSResource(DecodeGenResourceBase):
         allocations = [self._scratch_alloc]
         if self.sage_k_scales is not None:
             allocations.extend(self.sage_k_scales.smem_requirements(self.name))
+        if (
+            self.sage_summary_k_scales is not None
+            and self.sage_summary_k_scales is not self.sage_k_scales
+        ):
+            allocations.extend(self.sage_summary_k_scales.smem_requirements(self.name))
         if self.cfg.uses_int32_scores and self.score_seed_owner is None:
             if self._seed_alloc is None:
                 self._seed_alloc = SmemAllocation(
@@ -2410,7 +2420,11 @@ class TmemSResource(DecodeGenResourceBase):
                 kv_token_idx=dense_k_scale_token(cfg, half, lane_entry, tile_offset_k),
             )
 
-        return self.sage_k_scales.load_tile(stage_info, word_value)
+        words = cutlass.Array(
+            Float32, self.sage_k_scales.routed_words, space=cutlass.AddressSpace.rmem
+        )
+        self.sage_k_scales.load_tile(stage_info, word_value, words)
+        return words
 
     @consumer_work(returns=("old_max_arr", "sum_arr", "new_max_arr", "s_arr"))
     @cute.jit
@@ -2717,6 +2731,8 @@ class TmemSResource(DecodeGenResourceBase):
         tail_fragment_mask = Int32(0)
         tail_lane: Constexpr[int] = 0
         shifts_tail: Constexpr[bool] = False
+        route_is_proxy = cutlass.Boolean(False)
+        mixed_scales: Constexpr[bool] = use_sparse and cfg.sage_mixed_k_geometry
         if cutlass.const_expr(use_sparse and cfg.use_block_sparse_proxy_routes):
             # The route kind and the tail location are the same for every
             # lane; stating that keeps the fold and the load/store branch
@@ -2756,12 +2772,17 @@ class TmemSResource(DecodeGenResourceBase):
         # The strategy hands each fragment its raw ``sfK`` words; ``sfQ`` is one
         # per-lane factor and applies once to the tile maximum below.
         scales_view = None
+        summary_view = None
         if cutlass.const_expr(cfg.use_sage_attention):
             scales_view = self.sage_k_scales.open(stage_info, sage_scale_arr, None)
+            if cutlass.const_expr(mixed_scales):
+                summary_view = self.sage_summary_k_scales.open(
+                    stage_info, sage_scale_arr, None
+                )
 
         if warp_scores_are_unmasked:
             for fragment_idx in cutlass.range_constexpr(num_fragments):
-                if cutlass.const_expr(cfg.use_sage_attention):
+                if cutlass.const_expr(cfg.use_sage_attention and not mixed_scales):
                     # Issued ahead of the score load so an SMEM read hides
                     # behind the TMEM wait.
                     fragment_scales = self.sage_k_scales.fragment(
@@ -2777,7 +2798,28 @@ class TmemSResource(DecodeGenResourceBase):
                     offset=cfg.tile_size_kv // 2,
                 )
                 prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
-                if cutlass.const_expr(cfg.use_sage_attention):
+                if cutlass.const_expr(mixed_scales):
+                    # The route kind is CTA-uniform; each kind folds with its
+                    # own strategy and scale-group geometry.
+                    if route_is_proxy:
+                        self._fold_fragment_max_with(
+                            self.sage_summary_k_scales,
+                            summary_view,
+                            Int32(fragment_idx),
+                            loaded,
+                            max_chains,
+                            chain_base=fragment_idx * self.sage_summary_k_scales.groups,
+                        )
+                    else:
+                        self._fold_fragment_max_with(
+                            self.sage_k_scales,
+                            scales_view,
+                            Int32(fragment_idx),
+                            loaded,
+                            max_chains,
+                            chain_base=fragment_idx * self.sage_k_scales.groups,
+                        )
+                elif cutlass.const_expr(cfg.use_sage_attention):
                     self._fold_sage_fragment_max(
                         max_chains,
                         loaded,
@@ -2816,26 +2858,54 @@ class TmemSResource(DecodeGenResourceBase):
             # keep words rotate down each iteration and the scale strategy
             # advances with them, so no runtime selection is needed.
             for fragment in cutlass.range(num_fragments, unroll=1):
-                fragment_scales = None
-                if cutlass.const_expr(cfg.use_sage_attention):
-                    fragment_scales = self.sage_k_scales.fragment(
-                        scales_view, Int32(fragment)
+                if cutlass.const_expr(mixed_scales):
+                    if route_is_proxy:
+                        self._mask_score_fragment_with(
+                            self.sage_summary_k_scales,
+                            summary_view,
+                            score_tmem_addr,
+                            Int32(fragment),
+                            keep_word=Uint32(keep_words[0]),
+                            max_chains=max_chains,
+                            may_hold_tail=shifts_tail,
+                            tail_fragment_mask=tail_fragment_mask,
+                            tail_shift=tail_shift,
+                            tail_lane=tail_lane,
+                        )
+                    else:
+                        self._mask_score_fragment_with(
+                            self.sage_k_scales,
+                            scales_view,
+                            score_tmem_addr,
+                            Int32(fragment),
+                            keep_word=Uint32(keep_words[0]),
+                            max_chains=max_chains,
+                            may_hold_tail=shifts_tail,
+                            tail_fragment_mask=tail_fragment_mask,
+                            tail_shift=tail_shift,
+                            tail_lane=tail_lane,
+                        )
+                else:
+                    fragment_scales = None
+                    if cutlass.const_expr(cfg.use_sage_attention):
+                        fragment_scales = self.sage_k_scales.fragment(
+                            scales_view, Int32(fragment)
+                        )
+                    self._mask_score_fragment(
+                        score_tmem_addr,
+                        Int32(fragment),
+                        keep_word=Uint32(keep_words[0]),
+                        max_chains=max_chains,
+                        fragment_scales=fragment_scales,
+                        may_hold_tail=shifts_tail,
+                        tail_fragment_mask=tail_fragment_mask,
+                        tail_shift=tail_shift,
+                        tail_lane=tail_lane,
                     )
-                self._mask_score_fragment(
-                    score_tmem_addr,
-                    Int32(fragment),
-                    keep_word=Uint32(keep_words[0]),
-                    max_chains=max_chains,
-                    fragment_scales=fragment_scales,
-                    may_hold_tail=shifts_tail,
-                    tail_fragment_mask=tail_fragment_mask,
-                    tail_shift=tail_shift,
-                    tail_lane=tail_lane,
-                )
+                    if cutlass.const_expr(cfg.use_sage_attention):
+                        self.sage_k_scales.advance(scales_view)
                 for entry in cutlass.range_constexpr(num_fragments - 1):
                     keep_words[entry] = Uint32(keep_words[entry + 1])
-                if cutlass.const_expr(cfg.use_sage_attention):
-                    self.sage_k_scales.advance(scales_view)
             prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
             cute.arch.fence_view_async_tmem_store()
 
@@ -2859,6 +2929,60 @@ class TmemSResource(DecodeGenResourceBase):
         old_max_arr[0] = old_max
         new_max_arr[0] = new_max
         return old_max_arr, sum_arr, new_max_arr, s_arr
+
+    @cute.jit
+    def _fold_fragment_max_with(
+        self,
+        scales: Constexpr[SageKScales],
+        view,
+        fragment: Int32,
+        scores,
+        max_chains: cutlass.Array,
+        *,
+        chain_base: Constexpr[int],
+    ) -> None:
+        """Fold one unmasked fragment's maxima with one route kind's strategy."""
+        fragment_scales = scales.fragment(view, fragment)
+        self._fold_sage_fragment_max(
+            max_chains,
+            scores,
+            fragment_scales=fragment_scales,
+            chain_base=chain_base,
+            may_be_masked=False,
+            groups=scales.groups,
+        )
+        scales.advance(view)
+
+    @cute.jit
+    def _mask_score_fragment_with(
+        self,
+        scales: Constexpr[SageKScales],
+        view,
+        score_tmem_addr: Int32,
+        fragment: Int32,
+        *,
+        keep_word: Uint32,
+        max_chains: cutlass.Array,
+        may_hold_tail: Constexpr[bool],
+        tail_fragment_mask: Int32,
+        tail_shift: Float32,
+        tail_lane: Constexpr[int],
+    ) -> None:
+        """Mask, fold and write back one fragment with one route kind's strategy."""
+        fragment_scales = scales.fragment(view, fragment)
+        self._mask_score_fragment(
+            score_tmem_addr,
+            fragment,
+            keep_word=keep_word,
+            max_chains=max_chains,
+            fragment_scales=fragment_scales,
+            may_hold_tail=may_hold_tail,
+            tail_fragment_mask=tail_fragment_mask,
+            tail_shift=tail_shift,
+            tail_lane=tail_lane,
+            groups=scales.groups,
+        )
+        scales.advance(view)
 
     @cute.jit
     def _proxy_tail_fragment_mask(
@@ -2910,6 +3034,7 @@ class TmemSResource(DecodeGenResourceBase):
         tail_fragment_mask: Int32,
         tail_shift: Float32,
         tail_lane: Constexpr[int],
+        groups: Constexpr[int | None] = None,
     ) -> None:
         """Mask one K32 score fragment in place, fold its maximum, write it back.
 
@@ -2946,9 +3071,8 @@ class TmemSResource(DecodeGenResourceBase):
                 if ((tail_fragment_mask >> fragment) & Int32(1)) != Int32(0):
                     lane_shift = tail_shift
                     if cutlass.const_expr(cfg.use_sage_attention):
-                        groups = cfg.sage_k_groups_per_fragment
                         tail_group: Constexpr[int] = tail_lane // (
-                            fragment_regs // groups
+                            fragment_regs // _groups_or_default(cfg, groups)
                         )
                         lane_shift = tail_shift * cute.math.rcp(
                             Float32(fragment_scales[tail_group]), approx=True
@@ -2967,6 +3091,7 @@ class TmemSResource(DecodeGenResourceBase):
                 fragment_scales=fragment_scales,
                 chain_base=0,
                 may_be_masked=True,
+                groups=groups,
             )
         _keeps_tcgen05_st(
             cfg,
@@ -2981,6 +3106,7 @@ class TmemSResource(DecodeGenResourceBase):
         scores,
         first: Constexpr[int],
         may_be_masked: Constexpr[bool],
+        groups: Constexpr[int | None] = None,
     ) -> Float32:
         """Return the maximum of one scale group's scores.
 
@@ -2992,7 +3118,7 @@ class TmemSResource(DecodeGenResourceBase):
         score's sentinel stays exact.
         """
         cfg = self.cfg
-        group_regs = cfg.softmax_score_fragment_regs // cfg.sage_k_groups_per_fragment
+        group_regs = cfg.softmax_score_fragment_regs // _groups_or_default(cfg, groups)
         if cutlass.const_expr(group_regs < 4):
             group_max = Float32(scores[first])
             for elem in cutlass.range_constexpr(1, group_regs):
@@ -3027,6 +3153,7 @@ class TmemSResource(DecodeGenResourceBase):
         fragment_scales: cutlass.Array,
         chain_base: Constexpr[int],
         may_be_masked: Constexpr[bool],
+        groups: Constexpr[int | None] = None,
     ) -> None:
         """Fold one fragment's dequantized group maxima into the max chains.
 
@@ -3047,7 +3174,7 @@ class TmemSResource(DecodeGenResourceBase):
         ``chain_base=0``; the final reduction over all chains is unaffected.
         """
         cfg = self.cfg
-        groups = cfg.sage_k_groups_per_fragment
+        groups = _groups_or_default(cfg, groups)
         group_regs = cfg.softmax_score_fragment_regs // groups
         width: Constexpr[int] = 1 if groups == 1 else 2
         assert groups % width == 0
@@ -3056,7 +3183,10 @@ class TmemSResource(DecodeGenResourceBase):
             for elem in cutlass.range_constexpr(width):
                 maxima += (
                     self._group_max(
-                        scores, (group_base + elem) * group_regs, may_be_masked
+                        scores,
+                        (group_base + elem) * group_regs,
+                        may_be_masked,
+                        groups,
                     ),
                 )
             if cutlass.const_expr(width == 1):

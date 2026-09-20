@@ -995,8 +995,12 @@ def _build_decode_gen_schedule(
     # the strategy object; an SMEM ring is allocated through the S resource and
     # published through the instance's own softmax named barrier (the same
     # warps arrive on it in program order, so it needs no barrier of its own).
-    sage_k_scales0 = make_sage_k_scales(cfg, inst_id=0, sync_barrier_id=0)
-    sage_k_scales1 = make_sage_k_scales(cfg, inst_id=1, sync_barrier_id=1)
+    sage_k_scales0, sage_summary_k_scales0 = make_sage_k_scales(
+        cfg, inst_id=0, sync_barrier_id=0
+    )
+    sage_k_scales1, sage_summary_k_scales1 = make_sage_k_scales(
+        cfg, inst_id=1, sync_barrier_id=1
+    )
     sparse_kv_metadata0 = None
     sparse_kv_metadata1 = None
     sparse_softmax_metadata0 = None
@@ -1045,6 +1049,7 @@ def _build_decode_gen_schedule(
             route_metadata=sparse_route_metadata,
             route_layout=prepared_route_layout,
             sage_k_scales=sage_k_scales0,
+            sage_summary_k_scales=sage_summary_k_scales0,
             name="smemBlockSparseSoftmaxMetadata0",
             **sage_scale_sources,
         )
@@ -1055,6 +1060,7 @@ def _build_decode_gen_schedule(
             route_metadata=sparse_route_metadata,
             route_layout=prepared_route_layout,
             sage_k_scales=sage_k_scales1,
+            sage_summary_k_scales=sage_summary_k_scales1,
             name="smemBlockSparseSoftmaxMetadata1",
             **sage_scale_sources,
         )
@@ -1208,6 +1214,7 @@ def _build_decode_gen_schedule(
         b_idx=b_idx,
         sync_barrier_id=0,
         sage_k_scales=sage_k_scales0,
+        sage_summary_k_scales=sage_summary_k_scales0,
         name="tmemS0",
         **sage_qk_scale_sources,
     )
@@ -1226,6 +1233,7 @@ def _build_decode_gen_schedule(
         sync_barrier_id=1,
         score_seed_owner=tmem_s0,
         sage_k_scales=sage_k_scales1,
+        sage_summary_k_scales=sage_summary_k_scales1,
         name="tmemS1",
         **sage_qk_scale_sources,
     )
@@ -1247,6 +1255,7 @@ def _build_decode_gen_schedule(
         scale_softmax_log2=scale_softmax_log2,
         use_variable_seqlens_kv=use_runtime_seqlens_kv,
         sage_k_scales=sage_k_scales0,
+        sage_summary_k_scales=sage_summary_k_scales0,
         name="smemP0",
     )
     smem_p1 = SmemPResource(
@@ -1256,6 +1265,7 @@ def _build_decode_gen_schedule(
         scale_softmax_log2=scale_softmax_log2,
         use_variable_seqlens_kv=use_runtime_seqlens_kv,
         sage_k_scales=sage_k_scales1,
+        sage_summary_k_scales=sage_summary_k_scales1,
         name="smemP1",
     )
 

@@ -294,6 +294,7 @@ positive; the kernel does not check the values.
 | Output dtype (`o_data_type`) | `torch.bfloat16` (default with `sage`) or `torch.float16` |
 | `SageAttentionConfig.q_block_size` | Power of two no larger than the Q tile (64 or 128, see below); default 1 |
 | `SageAttentionConfig.k_block_size` | One of `SAGE_K_BLOCK_SIZES == (1, 4, 16, 32, 64, 128, 256)`; default 16 |
+| `SageAttentionConfig.k_summary_block_size` | K block size of a proxy plan's summary scales, one of `SAGE_K_BLOCK_SIZES`; default `None` = `k_block_size`. Ignored without proxy routes |
 | `SageAttentionConfig.v_mean` | `True` when every run supplies `v_mean`; default `False` |
 | Head dimension | 128 |
 | K/V storage | Contiguous `[B, S, Hkv, D]` only; the paged wrappers accept neither `sage` nor INT8 |
@@ -339,7 +340,7 @@ layout with the same `flat_scale_slot`.
 | `k_scale` | `[Hkv, flat_scale_numel(B, Skv, k_block_size)]` | One scale per KV head and K token block |
 | `v_scale` | `[Hkv, D]` | One scale per KV head and channel, shared across the batch |
 | `v_mean` (optional) | `[Hkv, D]` | Per-channel mean added back after normalization |
-| `k_summary_scale` | `[Hkv, flat_scale_numel(B, ceil(Skv / kv_block_size), k_block_size)]` | Required by, and only by, block-sparse proxy plans |
+| `k_summary_scale` | `[Hkv, flat_scale_numel(B, ceil(Skv / kv_block_size), summary_k_block_size)]` | Required by, and only by, block-sparse proxy plans; `summary_k_block_size` is `k_summary_block_size` or, unset, `k_block_size` |
 
 The recipe (`SageAttentionConfig`) is compile-time and joins the kernel cache
 key; the scale tensors are run inputs, validated for shape, dtype, device and
@@ -353,8 +354,14 @@ array never needs padding beyond `flat_scale_numel`.
 Proxy routes treat the K summaries as one more K sequence of
 `ceil(Skv / kv_block_size)` tokens: `k_summary` holds the per-block K means
 quantized in the K dtype (INT8 or E4M3) with `sageQuant` applied to the
-summary tensor as if it were K, and `k_summary_scale` is the resulting
-flat-layout array. `v_summary` holds the per-block V means (the final partial
+summary tensor as if it were K with the recipe's summary K block size
+(`k_summary_block_size`, defaulting to `k_block_size`), and
+`k_summary_scale` is the resulting flat-layout array. Summaries are block
+means whose magnitudes spread more than the tokens', so an INT8 recipe can
+take one scale per summary (`k_summary_block_size=1`) while its exact routes
+keep the 16-token block; the kernel then reads the two route kinds' scales
+with their own group geometry and strategy (register array for blocks of 16
+and larger, an SMEM ring for 4 and 1), selected per tile on the route kind. `v_summary` holds the per-block V means (the final partial
 block averages only its structural tokens) quantized to E4M3 with the shared
 `v_scale`; with `v_mean`, build them from `V - v_mean`. A proxy block stands
 for as many identical tokens as it covers, so its mass enters the proxy

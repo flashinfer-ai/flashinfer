@@ -82,7 +82,7 @@ from .helpers_softmax import (
     _pack_float4_to_fp8_e4m3,
     _pack_float4_to_fp8_e4m3_inline,
 )
-from .sage_scales import SageKScales
+from .sage_scales import SageKScales, _groups_or_default
 from .smem_block_sparse_metadata import _route_is_proxy
 from .tmem_s import TmemSResource
 
@@ -145,8 +145,12 @@ class SmemPResource(DecodeGenResourceBase):
     tmem_s_ref: Constexpr[TmemSResource] = None
     tmem_o_ref: Constexpr[object] = None
     # Where the tile's ``sfK`` words live (shared with the S resource and the
-    # route metadata consumer of the same instance).
+    # route metadata consumer of the same instance): ``sage_k_scales`` for
+    # exact routes and dense tiles, ``sage_summary_k_scales`` for proxy
+    # routes (the same object unless the summary scales have their own K
+    # block size).
     sage_k_scales: Constexpr[SageKScales | None] = None
+    sage_summary_k_scales: Constexpr[SageKScales | None] = None
     _alloc: Constexpr[SmemAllocation | None] = None
     _fragment_ready_alloc: Constexpr[SmemAllocation | None] = None
     _tmem_alloc: Constexpr[TmemAllocation | None] = None
@@ -469,9 +473,15 @@ class SmemPResource(DecodeGenResourceBase):
         # to the raw ``sfK`` words where that is cheapest for its storage.
         exp_scale = None
         scales_view = None
+        summary_view = None
+        mixed_scales: Constexpr[bool] = cfg.sage_mixed_k_geometry
         if cutlass.const_expr(cfg.use_sage_attention):
             exp_scale = self.scale_softmax_log2 * sage_q_scale
             scales_view = self.sage_k_scales.open(stage_info, sage_scale_arr, exp_scale)
+            if cutlass.const_expr(mixed_scales):
+                summary_view = self.sage_summary_k_scales.open(
+                    stage_info, sage_scale_arr, exp_scale
+                )
 
         # With ``prefetches_next_p_fragment`` the loop loads the next fragment
         # behind the scale FFMAs and carries the running sum as a packed pair;
@@ -491,7 +501,7 @@ class SmemPResource(DecodeGenResourceBase):
         for fragment_idx in cutlass.range(cfg.num_softmax_score_fragments, unroll=1):
             fragment = Int32(fragment_idx)
             fragment_multipliers = None
-            if cutlass.const_expr(cfg.use_sage_attention):
+            if cutlass.const_expr(cfg.use_sage_attention and not mixed_scales):
                 # Issued before the score wait so an SMEM read hides behind it.
                 fragment_multipliers = self.sage_k_scales.fragment(
                     scales_view, fragment
@@ -503,20 +513,52 @@ class SmemPResource(DecodeGenResourceBase):
             for score_idx in cutlass.range_constexpr(fragment_regs):
                 s_arr[score_idx] = pending_scores[score_idx]
 
-            group_multipliers, group_addends = self._fragment_exponent_terms(
-                fragment_multipliers, exponent_addend
-            )
-            if cutlass.const_expr(prefetches_next):
-                self._scale_fragment_pairs(s_arr, group_addends, group_multipliers)
-                # The last iteration reloads its own fragment so the loop body
-                # stays branch-free; the wait after the loop retires it.
+            if cutlass.const_expr(mixed_scales):
+                # The route kind is CTA-uniform; each kind scales the fragment
+                # in place with its own strategy and scale-group geometry, so
+                # nothing but the scores crosses the branch. The next
+                # fragment's load then sits between the scaling and the
+                # exponentials, as on the single-geometry path.
+                assert prefetches_next
+                if route_is_proxy:
+                    self._scale_fragment_with(
+                        self.sage_summary_k_scales,
+                        summary_view,
+                        fragment,
+                        s_arr,
+                        exponent_addend,
+                    )
+                else:
+                    self._scale_fragment_with(
+                        self.sage_k_scales,
+                        scales_view,
+                        fragment,
+                        s_arr,
+                        exponent_addend,
+                    )
                 next_fragment = fragment + Int32(1)
                 if next_fragment > last_fragment:
                     next_fragment = last_fragment
                 self._load_score_fragment(tmem_base, next_fragment, pending_scores)
-            local_sum_pair = self._exponentiate_fragment_pairs(
-                s_arr, group_addends, group_multipliers, scaled=prefetches_next
-            )
+                local_sum_pair = self._exponentiate_fragment_pairs(
+                    s_arr, None, None, scaled=True
+                )
+            else:
+                group_multipliers, group_addends = self._fragment_exponent_terms(
+                    fragment_multipliers, exponent_addend
+                )
+                if cutlass.const_expr(prefetches_next):
+                    self._scale_fragment_pairs(s_arr, group_addends, group_multipliers)
+                    # The last iteration reloads its own fragment so the loop
+                    # body stays branch-free; the wait after the loop retires
+                    # it.
+                    next_fragment = fragment + Int32(1)
+                    if next_fragment > last_fragment:
+                        next_fragment = last_fragment
+                    self._load_score_fragment(tmem_base, next_fragment, pending_scores)
+                local_sum_pair = self._exponentiate_fragment_pairs(
+                    s_arr, group_addends, group_multipliers, scaled=prefetches_next
+                )
             if cutlass.const_expr(prefetches_next):
                 total_sum_pair = cute.arch.add_packed_f32x2(
                     total_sum_pair, local_sum_pair
@@ -551,6 +593,26 @@ class SmemPResource(DecodeGenResourceBase):
             prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
             total_sum = Float32(total_sum_pair[0] + total_sum_pair[1])
         self.tmem_s_ref.store_p_local_sum(0, total_sum)
+
+    @cute.jit
+    def _scale_fragment_with(
+        self,
+        scales: Constexpr[SageKScales],
+        view,
+        fragment: Int32,
+        s_arr: cutlass.Array,
+        exponent_addend: Float32,
+    ) -> None:
+        """Turn one fragment's scores into log2 exponents with one route kind's strategy."""
+        groups = scales.groups
+        fragment_multipliers = scales.fragment(view, fragment)
+        scales.advance(view)
+        group_multipliers, group_addends = self._fragment_exponent_terms(
+            fragment_multipliers, exponent_addend, groups=groups
+        )
+        self._scale_fragment_pairs(
+            s_arr, group_addends, group_multipliers, groups=groups
+        )
 
     @cute.jit
     def _publish_p_fragment(
@@ -608,18 +670,20 @@ class SmemPResource(DecodeGenResourceBase):
         s_arr: cutlass.Array,
         group_addends: cutlass.Array,
         group_multipliers: cutlass.Array,
+        groups: Constexpr[int | None] = None,
     ) -> None:
         """Turn one fragment of scores into log2 exponents in place.
 
         Each score pair uses the exponent multiplier and addend of its
         compile-time scale group; without Sage attention there is one group
-        holding the softmax scale.
+        holding the softmax scale. ``groups`` is the route kind's scale
+        groups per fragment, the exact-route geometry by default.
         """
         for pair_idx in cutlass.range_constexpr(
             self.cfg.softmax_score_fragment_regs // 2
         ):
             s_arr[pair_idx * 2], s_arr[pair_idx * 2 + 1] = self._exponent_pair(
-                s_arr, pair_idx * 2, group_addends, group_multipliers
+                s_arr, pair_idx * 2, group_addends, group_multipliers, groups
             )
 
     @cute.jit
@@ -629,6 +693,7 @@ class SmemPResource(DecodeGenResourceBase):
         value_idx: Constexpr[int],
         group_addends: cutlass.Array,
         group_multipliers: cutlass.Array,
+        groups: Constexpr[int | None] = None,
     ) -> tuple[Float32, Float32]:
         """Return the log2 exponents of the score pair at ``value_idx``.
 
@@ -637,8 +702,8 @@ class SmemPResource(DecodeGenResourceBase):
         addend of its own group; a biased INT32 score's bias is already in
         the group addend.
         """
-        group_regs = (
-            self.cfg.softmax_score_fragment_regs // self.cfg.sage_k_groups_per_fragment
+        group_regs = self.cfg.softmax_score_fragment_regs // _groups_or_default(
+            self.cfg, groups
         )
         group0: Constexpr[int] = value_idx // group_regs
         group1: Constexpr[int] = (value_idx + 1) // group_regs
@@ -653,6 +718,7 @@ class SmemPResource(DecodeGenResourceBase):
         self,
         fragment_multipliers: cutlass.Array | None,
         exponent_addend: Float32,
+        groups: Constexpr[int | None] = None,
     ) -> tuple[cutlass.Array, cutlass.Array]:
         """Return one fragment's exponent multipliers and addends per scale group.
 
@@ -663,7 +729,7 @@ class SmemPResource(DecodeGenResourceBase):
         group.
         """
         cfg = self.cfg
-        groups = cfg.sage_k_groups_per_fragment
+        groups = _groups_or_default(cfg, groups)
         group_multipliers = cutlass.Array(
             Float32, groups, space=cutlass.AddressSpace.rmem
         )
@@ -711,16 +777,17 @@ class SmemPResource(DecodeGenResourceBase):
     def _exponentiate_fragment_pairs(
         self,
         s_arr: cutlass.Array,
-        group_addends: cutlass.Array,
-        group_multipliers: cutlass.Array,
+        group_addends: cutlass.Array | None,
+        group_multipliers: cutlass.Array | None,
         *,
         scaled: Constexpr[bool],
+        groups: Constexpr[int | None] = None,
     ) -> tuple[Float32, Float32]:
         """Turn one fragment of scores into probabilities in place.
 
         ``scaled`` tells whether ``_scale_fragment_pairs`` has already turned
         the scores into log2 exponents, in which case ``group_addends`` and
-        ``group_multipliers`` are ignored; otherwise each pair is scaled with
+        ``group_multipliers`` are unused (and may be ``None``); otherwise each pair is scaled with
         the multiplier and addend of its compile-time scale group right before
         its exponential. Returns the fragment's probability sum as a packed
         pair.
@@ -739,7 +806,7 @@ class SmemPResource(DecodeGenResourceBase):
                 p1 = Float32(s_arr[value_idx + 1])
             else:
                 p0, p1 = self._exponent_pair(
-                    s_arr, value_idx, group_addends, group_multipliers
+                    s_arr, value_idx, group_addends, group_multipliers, groups
                 )
             if cutlass.const_expr(
                 _pair_uses_ex2_emulation(pair_idx, pairs_per_fragment)

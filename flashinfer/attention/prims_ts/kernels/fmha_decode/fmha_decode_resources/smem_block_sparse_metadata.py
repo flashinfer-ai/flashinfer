@@ -72,6 +72,7 @@ from .sage_scales import (
     load_k_scale,
     route_scale_word_position,
     sage_k_scale_words,
+    sage_staged_k_scale_words,
 )
 
 
@@ -806,8 +807,11 @@ class SmemBlockSparseSoftmaxMetadataResource(DecodeGenResourceBase):
     _smem_scales: cutlass.Array = None
     # Where the tile's ``sfK`` words live during the softmax passes (shared
     # with the S and P resources of the same instance); a route's staged words
-    # are copied into its SMEM ring or into the lane's register array.
+    # are copied into its SMEM ring or into the lane's register array. Exact
+    # routes use ``sage_k_scales``, proxy routes ``sage_summary_k_scales``
+    # (the same object unless the summary scales have their own K block size).
     sage_k_scales: Constexpr[SageKScales | None] = None
+    sage_summary_k_scales: Constexpr[SageKScales | None] = None
     softmax_sage_k_scales: Constexpr[TaskLocalVariable] = (
         TaskLocalVariable.uninitialized()
     )
@@ -844,7 +848,7 @@ class SmemBlockSparseSoftmaxMetadataResource(DecodeGenResourceBase):
             use_keeps_mma_ab=self.cfg.use_keeps_mma_ab,
             route_layout=self.route_layout,
             num_stages=self.pipeline_config.num_stages,
-            sage_scale_words=sage_k_scale_words(self.cfg),
+            sage_scale_words=sage_staged_k_scale_words(self.cfg),
         )
         super().__post_init__()
 
@@ -1196,21 +1200,19 @@ class SmemBlockSparseSoftmaxMetadataResource(DecodeGenResourceBase):
     ) -> None:
         """Gather one route's ``sfK`` words, one per lane and 32-word chunk.
 
-        Lane ``l`` owns staged words ``l + 32 * c`` below
+        Lane ``l`` owns staged words ``l + 32 * c`` below the route kind's
         ``sage_k_scale_words``, resolves each word's atom origin from the
         lane-distributed record (or the broadcast origin pair of a two-atom
         route without one-warp transport) and loads the K scale of the
-        group's first token. Proxy routes read the summary scale array.
-        Invalid atoms carry origin ``-1``; their scores are masked, so the
-        clamp to token zero only keeps the load in bounds. Routes with at
-        most 32 words take one chunk.
+        group's first token. Proxy routes read the summary scale array with
+        the summary K block size and, when that differs from the token block
+        size, stage their own word count. Invalid atoms carry origin ``-1``;
+        their scores are masked, so the clamp to token zero only keeps the
+        load in bounds. Routes with at most 32 words take one chunk.
         """
 
         cfg = self.cfg
         assert self.staging_layout.sage_scale_words_word_offset is not None
-        num_words = sage_k_scale_words(cfg)
-        num_origins = self.route_layout.logical_origins_per_route
-        lane_idx = cute.arch.thread_idx()[0] & Int32(0x1F)
         route_is_proxy = cutlass.Boolean(False)
         if cutlass.const_expr(cfg.use_block_sparse_proxy_routes):
             route_is_proxy = cutlass.Boolean(
@@ -1223,7 +1225,7 @@ class SmemBlockSparseSoftmaxMetadataResource(DecodeGenResourceBase):
                 != Int32(0)
             )
         task_cache = _decode_gen_task_cache(stage_info)
-        scale_addr, scale_head_stride, scale_seq_len = block_sparse_k_scale_source(
+        scale_source = block_sparse_k_scale_source(
             cfg,
             k_scale_ptr=self.k_scale_ptr,
             k_scale_head_stride=self.k_scale_head_stride,
@@ -1235,9 +1237,30 @@ class SmemBlockSparseSoftmaxMetadataResource(DecodeGenResourceBase):
         kv_head_idx, batch_idx = _logical_head_batch(
             stage_info, self.h_k_idx, self.b_idx
         )
-        for chunk in cutlass.range_constexpr((num_words + 31) // 32):
+        scale_addr, scale_head_stride, scale_seq_len, log2_k_block_size = scale_source
+        exact_groups = cfg.sage_k_groups_per_fragment
+        summary_groups = cfg.sage_summary_k_groups_per_fragment
+        num_words = Int32(sage_k_scale_words(cfg, exact_groups))
+        if cutlass.const_expr(cfg.sage_mixed_k_geometry):
+            # Both geometries resolve every word at trace time; the route kind
+            # selects between them, so the load warp stays branch-free.
+            if route_is_proxy:
+                num_words = Int32(sage_k_scale_words(cfg, summary_groups))
+        num_origins = self.route_layout.logical_origins_per_route
+        lane_idx = cute.arch.thread_idx()[0] & Int32(0x1F)
+        max_words = sage_staged_k_scale_words(cfg)
+        for chunk in cutlass.range_constexpr((max_words + 31) // 32):
             word_idx = lane_idx + Int32(chunk * 32)
-            atom_idx, token_offset = route_scale_word_position(cfg, word_idx)
+            atom_idx, token_offset = route_scale_word_position(
+                cfg, word_idx, exact_groups
+            )
+            if cutlass.const_expr(cfg.sage_mixed_k_geometry):
+                summary_atom_idx, summary_token_offset = route_scale_word_position(
+                    cfg, word_idx, summary_groups
+                )
+                if route_is_proxy:
+                    atom_idx = summary_atom_idx
+                    token_offset = summary_token_offset
             atom_idx = cute.math.min(atom_idx, Int32(num_origins - 1))
             if cutlass.const_expr(
                 num_origins == 2 and not self.route_layout.uses_one_warp_transport
@@ -1258,6 +1281,7 @@ class SmemBlockSparseSoftmaxMetadataResource(DecodeGenResourceBase):
                     batch_idx=batch_idx,
                     seq_len_kv=scale_seq_len,
                     kv_token_idx=cute.math.max(origin, Int32(0)) + token_offset,
+                    log2_k_block_size=log2_k_block_size,
                 )
                 self._smem_scales[
                     stage_base
@@ -1278,16 +1302,36 @@ class SmemBlockSparseSoftmaxMetadataResource(DecodeGenResourceBase):
 
         assert self.cfg.use_sage_attention and self.cfg.use_keeps_mma_ab
         assert self.staging_layout.sage_scale_words_word_offset is not None
-        source = self._consumer_stage_base() + Int32(
-            self.staging_layout.sage_scale_words_word_offset
-        )
+        stage_base = self._consumer_stage_base()
+        source = stage_base + Int32(self.staging_layout.sage_scale_words_word_offset)
         staged = self._smem_scales
 
         def word_value(word_idx: Int32, half: Int32, lane_entry: Int32) -> Float32:
             _ = half, lane_entry
             return Float32(staged[source + word_idx])
 
-        return self.sage_k_scales.load_tile(stage_info, word_value)
+        words = cutlass.Array(
+            Float32, self.sage_k_scales.routed_words, space=cutlass.AddressSpace.rmem
+        )
+        if cutlass.const_expr(self.cfg.sage_mixed_k_geometry):
+            assert self.staging_layout.route_flags_word_offset is not None
+            route_is_proxy = cute.arch.make_warp_uniform(
+                _route_is_proxy(
+                    Int32(
+                        self._smem_words[
+                            stage_base
+                            + Int32(self.staging_layout.route_flags_word_offset)
+                        ]
+                    )
+                )
+            )
+            if route_is_proxy:
+                self.sage_summary_k_scales.load_tile(stage_info, word_value, words)
+            else:
+                self.sage_k_scales.load_tile(stage_info, word_value, words)
+        else:
+            self.sage_k_scales.load_tile(stage_info, word_value, words)
+        return words
 
     @producer_work
     @cute.jit

@@ -52,11 +52,27 @@ class SageAttentionConfig:
     and must be one of ``SAGE_K_BLOCK_SIZES``. ``v_mean`` says whether every
     run supplies a per-channel V mean that is added back to the normalized
     output. The defaults are TensorRT-LLM's production recipe ``(1, 16, 1)``.
+
+    ``k_summary_block_size`` is the K block size of a block-sparse proxy
+    plan's summary scales (``k_summary_scale``), also one of
+    ``SAGE_K_BLOCK_SIZES``; ``None`` follows ``k_block_size``. Summaries are
+    block means whose magnitudes spread more than the tokens', so an INT8
+    recipe may want finer summary blocks than token blocks; exact routes keep
+    ``k_block_size`` either way. Plans without proxy routes ignore the field.
     """
 
     q_block_size: int = 1
     k_block_size: int = 16
     v_mean: bool = False
+    k_summary_block_size: int | None = None
+
+    @property
+    def summary_k_block_size(self) -> int:
+        """Return the K block size of the summary scales."""
+
+        if self.k_summary_block_size is None:
+            return self.k_block_size
+        return self.k_summary_block_size
 
 
 @dataclass(frozen=True)
@@ -69,10 +85,10 @@ class SageAttentionParams:
     :class:`SageAttentionConfig`. ``v_scale`` and ``v_mean`` are FP32
     ``[Hkv, D]``; ``v_mean`` is present exactly when the plan's
     :class:`SageAttentionConfig` has ``v_mean=True``. ``k_summary_scale`` is FP32
-    ``[Hkv, flat_scale_numel(B, num_kv_blocks, k_block_size)]``: the flat-layout
-    scales of block-sparse proxy K summaries, quantized as one more K sequence
-    of ``num_kv_blocks`` tokens. It is required by proxy plans and rejected
-    otherwise. Every scale must be positive and finite; the kernel does not
+    ``[Hkv, flat_scale_numel(B, num_kv_blocks, summary_k_block_size)]``: the
+    flat-layout scales of block-sparse proxy K summaries, quantized as one more
+    K sequence of ``num_kv_blocks`` tokens with the recipe's summary K block
+    size. It is required by proxy plans and rejected otherwise. Every scale must be positive and finite; the kernel does not
     check the values.
     """
 
@@ -170,7 +186,8 @@ def sage_scale_shapes(
     Q/K scales are ``[heads, flat slots]`` in the flat layout of the recipe's
     block sizes, V scales and means are ``[kv heads, head dim]``. The K
     summary scales appear only for a proxy plan, whose ``summary_seq_len`` is
-    its number of KV blocks, and ``v_mean`` only when the recipe has one.
+    its number of KV blocks, in the flat layout of the recipe's summary K
+    block size; ``v_mean`` appears only when the recipe has one.
     """
 
     shapes = {
@@ -187,7 +204,7 @@ def sage_scale_shapes(
     if summary_seq_len is not None:
         shapes["k_summary_scale"] = (
             num_kv_heads,
-            flat_scale_numel(batch_size, summary_seq_len, config.k_block_size),
+            flat_scale_numel(batch_size, summary_seq_len, config.summary_k_block_size),
         )
     if config.v_mean:
         shapes["v_mean"] = (num_kv_heads, head_dim)

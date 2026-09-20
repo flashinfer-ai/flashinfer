@@ -351,6 +351,8 @@ def test_sage_config_defaults_follow_the_production_recipe() -> None:
 
     config = SageAttentionConfig()
     assert (config.q_block_size, config.k_block_size, config.v_mean) == (1, 16, False)
+    assert config.k_summary_block_size is None
+    assert config.summary_k_block_size == 16
     params = SageAttentionParams(
         q_scale=torch.rand(
             (
@@ -437,6 +439,89 @@ def test_sage_params_reject_non_fp32_or_strided_scales() -> None:
         _validate(replace(params, k_summary_scale=params.k_scale.clone()))
 
 
+@pytest.mark.parametrize("k_summary_block_size", (1, 4, 16, 64))
+def test_summary_scales_follow_the_summary_block_size(
+    k_summary_block_size: int,
+) -> None:
+    """``k_summary_scale`` uses the recipe's summary K block size, not ``k_block_size``."""
+
+    kv_block_size = 64
+    num_kv_blocks = -(-_GEOMETRY["seq_len_kv"] // kv_block_size)
+    config = SageAttentionConfig(
+        k_block_size=16, k_summary_block_size=k_summary_block_size
+    )
+    assert config.summary_k_block_size == k_summary_block_size
+    shapes = sage_scale_shapes(config, **_GEOMETRY, summary_seq_len=num_kv_blocks)
+    assert shapes["k_scale"][1] == flat_scale_numel(
+        _GEOMETRY["batch_size"], _GEOMETRY["seq_len_kv"], 16
+    )
+    assert shapes["k_summary_scale"][1] == flat_scale_numel(
+        _GEOMETRY["batch_size"], num_kv_blocks, k_summary_block_size
+    )
+
+
+@pytest.mark.parametrize("use_proxy_routes", (False, True))
+def test_summary_block_size_reaches_only_proxy_kernels(use_proxy_routes: bool) -> None:
+    """Plans without proxy routes compile one kernel per recipe, whatever the summary block."""
+
+    from flashinfer.attention.prims_ts._block_sparse import (
+        config as block_sparse_config,
+    )
+
+    key = make_block_sparse_compile_key(
+        seq_len_q=64,
+        seq_len_kv=4096,
+        q_block_size=64,
+        kv_block_size=64,
+        kv_route_size=256,
+        dtype_key="float8_e4m3fn",
+        sparse_format="bitmask",
+        use_proxy_routes=use_proxy_routes,
+        out_dtype_key="bfloat16",
+        sage=SageAttentionConfig(k_summary_block_size=1),
+    )
+    cfg = block_sparse_config._make_block_sparse_config(key)
+    assert cfg.sage_k_block_size == 16
+    assert cfg.sage_k_summary_block_size == (1 if use_proxy_routes else 0)
+    assert cfg.sage_mixed_k_geometry == use_proxy_routes
+    assert cfg.sage_summary_k_groups_per_fragment == (32 if use_proxy_routes else 2)
+    if use_proxy_routes:
+        assert cfg.sage_k_scales_in_smem_for(cfg.sage_summary_k_groups_per_fragment)
+        assert not cfg.sage_k_scales_in_smem
+        assert sage_scales.sage_staged_k_scale_words(cfg) == 2 * 4 * 32
+    else:
+        assert sage_scales.sage_staged_k_scale_words(cfg) == 2 * 4 * 2
+
+
+def test_summary_block_size_is_validated() -> None:
+    """A proxy plan needs a supported summary block; other plans must leave it unset."""
+
+    with pytest.raises(ValueError, match="sage_k_summary_block_size"):
+        make_sage_decode_config(
+            tile_size_q=64,
+            tile_size_kv=256,
+            sage_args={"sage_k_block_size": 16, "sage_k_summary_block_size": 16},
+        )
+    from flashinfer.attention.prims_ts._block_sparse import (
+        config as block_sparse_config,
+    )
+
+    key = make_block_sparse_compile_key(
+        seq_len_q=64,
+        seq_len_kv=4096,
+        q_block_size=64,
+        kv_block_size=64,
+        kv_route_size=256,
+        dtype_key="float8_e4m3fn",
+        sparse_format="bitmask",
+        use_proxy_routes=True,
+        out_dtype_key="bfloat16",
+        sage=SageAttentionConfig(k_summary_block_size=3),
+    )
+    with pytest.raises(ValueError, match="sage_k_summary_block_size"):
+        block_sparse_config._make_block_sparse_config(key)
+
+
 def test_sage_params_require_summary_scale_with_proxy_routes() -> None:
     """``k_summary_scale`` covers the summary sequence in the flat layout."""
 
@@ -506,6 +591,8 @@ class _SageCase:
     # The recipe defaults to the production ``(1, 16, no mean)``.
     sage_q_block_size: int = 1
     sage_k_block_size: int = 16
+    # ``None`` follows ``sage_k_block_size`` (one scale-group geometry).
+    sage_k_summary_block_size: int | None = None
     with_mean: bool = False
     qk_dtype: torch.dtype = _FP8
     # "auto" follows the planner's heuristic; "static" and "persistent" force
@@ -517,11 +604,16 @@ class _SageCase:
         return 64 if self.expected_kv_tile == 256 else 128
 
     @property
+    def summary_k_block_size(self) -> int:
+        return self.sage_config.summary_k_block_size
+
+    @property
     def sage_config(self) -> SageAttentionConfig:
         return SageAttentionConfig(
             q_block_size=self.sage_q_block_size,
             k_block_size=self.sage_k_block_size,
             v_mean=self.with_mean,
+            k_summary_block_size=self.sage_k_summary_block_size,
         )
 
 
@@ -1461,6 +1553,56 @@ _SPARSE_SAGE_CASES = (
         use_proxy_routes=True,
         qk_dtype=torch.int8,
     ),
+    # Summary scales with their own K block size: exact routes keep the
+    # register strategy of the 16-token block while proxy routes read
+    # one-token summary scales from SMEM.
+    _SparseSageCase(
+        name="kv256_proxy_k16_s1_q1_bf16_mean",
+        **_SPARSE_KV256_MHA,
+        kv_block_size=64,
+        sage_k_summary_block_size=1,
+        with_mean=True,
+        out_dtype=torch.bfloat16,
+        use_proxy_routes=True,
+    ),
+    _SparseSageCase(
+        name="q128_gqa8_int8_proxy_k16_s1_q1_fp16",
+        **_SPARSE_Q128_GQA,
+        kv_block_size=64,
+        sage_k_summary_block_size=1,
+        out_dtype=torch.float16,
+        use_proxy_routes=True,
+        qk_dtype=torch.int8,
+    ),
+    # Both route kinds in SMEM with different word counts.
+    _SparseSageCase(
+        name="kv256_proxy_k4_s1_q1_bf16",
+        **_SPARSE_KV256_MHA,
+        kv_block_size=64,
+        sage_k_block_size=4,
+        sage_k_summary_block_size=1,
+        out_dtype=torch.bfloat16,
+        use_proxy_routes=True,
+    ),
+    # Exact routes in SMEM, summaries in registers.
+    _SparseSageCase(
+        name="kv256_proxy_k1_s16_q1_bf16",
+        **_SPARSE_KV256_MHA,
+        kv_block_size=64,
+        sage_k_block_size=1,
+        sage_k_summary_block_size=16,
+        out_dtype=torch.bfloat16,
+        use_proxy_routes=True,
+    ),
+    # The ragged final summary of a two-group route under the summary geometry.
+    _SparseSageCase(
+        name="kv256_proxy_two_groups_k16_s1_q1_bf16",
+        **{**_SPARSE_KV256_MHA, "seq_len_kv": 20520},
+        kv_block_size=64,
+        sage_k_summary_block_size=1,
+        out_dtype=torch.bfloat16,
+        use_proxy_routes=True,
+    ),
     _SparseSageCase(
         name="q128_gqa8_proxy_bk128_k32_q4_fp16_mean",
         **_SPARSE_Q128_GQA,
@@ -1629,7 +1771,7 @@ def _random_sparse_sage_inputs(case: _SparseSageCase, device: torch.device):
             (
                 case.num_kv_heads,
                 flat_scale_numel(
-                    case.batch_size, case.num_kv_blocks, case.sage_k_block_size
+                    case.batch_size, case.num_kv_blocks, case.summary_k_block_size
                 ),
             ),
             0.5 * qk_scale_factor,
@@ -1722,7 +1864,7 @@ def _sage_sparse_reference(
     v_raw = v.float()
     if summaries is not None:
         k_summary_real = dequantize_token_blocks(
-            summaries[0], params.k_summary_scale, block_size=case.sage_k_block_size
+            summaries[0], params.k_summary_scale, block_size=case.summary_k_block_size
         )
         v_summary_raw = summaries[1].float()
     num_streams = 4 if case.expected_kv_tile == 256 else 2
@@ -2059,7 +2201,9 @@ def test_block_sparse_sage_recipe_tracks_bf16_attention(
         k_summary_bf16 = block_mean(k_bf16, case.kv_block_size, torch.bfloat16)
         v_summary_bf16 = block_mean(v_bf16, case.kv_block_size, torch.bfloat16)
         k_summary_quant, k_summary_scale = quantize_token_blocks(
-            k_summary_bf16, block_size=recipe_case.sage_k_block_size, dtype=qk_dtype
+            k_summary_bf16,
+            block_size=recipe_case.summary_k_block_size,
+            dtype=qk_dtype,
         )
         v_summary_fp8 = quantize_v_channels_with_scale(v_summary_bf16, params.v_scale)
         summaries = (k_summary_quant, v_summary_fp8)

@@ -113,28 +113,37 @@ def load_k_scale(
     batch_idx: Int32,
     seq_len_kv: Int32,
     kv_token_idx: Int32,
+    log2_k_block_size: Int32 | None = None,
 ) -> Float32:
     """Return ``sfK`` for one token of one KV head from a flat scale array.
 
-    ``k_scale_addr`` is the base address of ``k_scale`` or ``k_summary_scale``
-    and ``seq_len_kv`` the length of the sequence it covers.
+    ``k_scale_addr`` is the base address of ``k_scale`` or ``k_summary_scale``,
+    ``seq_len_kv`` the length of the sequence it covers and
+    ``log2_k_block_size`` the log2 of its K block size, the recipe's token
+    block by default.
     """
+    log2_block = log2_k_block_size
+    if cutlass.const_expr(log2_block is None):
+        log2_block = Int32(log2_block_size(cfg.sage_k_block_size))
     kv_token_idx = cute.math.min(kv_token_idx, seq_len_kv - Int32(1))
-    slot = flat_scale_slot(
-        batch_idx,
-        kv_token_idx,
-        seq_len_kv,
-        log2_block_size(cfg.sage_k_block_size),
-    )
+    slot = flat_scale_slot(batch_idx, kv_token_idx, seq_len_kv, log2_block)
     return _load_scale(k_scale_addr, kv_head_idx * k_scale_head_stride + slot)
 
 
-def sage_scale_arr_size(cfg: FmhaDecodeConfig) -> int:
-    """Return the number of ``sfK`` words one softmax lane holds per tile."""
-    return cfg.num_softmax_score_fragments * cfg.sage_k_groups_per_fragment
+def _groups_or_default(cfg: FmhaDecodeConfig, groups: int | None) -> int:
+    return cfg.sage_k_groups_per_fragment if groups is None else groups
 
 
-def sage_k_scale_words(cfg: FmhaDecodeConfig) -> int:
+def sage_scale_arr_size(cfg: FmhaDecodeConfig, groups: int | None = None) -> int:
+    """Return the number of ``sfK`` words one softmax lane holds per tile.
+
+    ``groups`` is the scale groups per fragment of the tile's route kind; the
+    exact-route geometry is the default.
+    """
+    return cfg.num_softmax_score_fragments * _groups_or_default(cfg, groups)
+
+
+def sage_k_scale_words(cfg: FmhaDecodeConfig, groups: int | None = None) -> int:
     """Return the number of ``sfK`` words that cover one KV tile for every spatial half.
 
     Zero without Sage attention, so the block-sparse staging layout can take
@@ -143,16 +152,27 @@ def sage_k_scale_words(cfg: FmhaDecodeConfig) -> int:
     (``sage_scale_arr_size`` words per half); this is the layout of the words
     a block-sparse route stages and of the tile buffer of
     :class:`SmemSageKScales`, so a softmax thread reads its half's values with
-    contiguous vector loads.
+    contiguous vector loads. ``groups`` selects the route kind's geometry.
     """
     if not cfg.use_sage_attention:
         return 0
-    return cfg.keeps_spatial_halves * sage_scale_arr_size(cfg)
+    return cfg.keeps_spatial_halves * sage_scale_arr_size(cfg, groups)
+
+
+def sage_staged_k_scale_words(cfg: FmhaDecodeConfig) -> int:
+    """Return the ``sfK`` words a block-sparse route stages: the larger geometry."""
+    return max(
+        sage_k_scale_words(cfg, cfg.sage_k_groups_per_fragment),
+        sage_k_scale_words(cfg, cfg.sage_summary_k_groups_per_fragment),
+    )
 
 
 @cute.jit
 def sage_word_position(
-    cfg: Constexpr[FmhaDecodeConfig], half: Int32, lane_entry
+    cfg: Constexpr[FmhaDecodeConfig],
+    half: Int32,
+    lane_entry,
+    groups: Constexpr[int | None] = None,
 ) -> tuple[Int32, Int32]:
     """Return ``(atom, token offset in the atom)`` of one ``sfK`` word.
 
@@ -164,9 +184,10 @@ def sage_word_position(
     The atom is the Keeps layout atom
     (``FmhaDecodeConfig.keeps_fragments_per_atom``), which block-sparse routes
     share as their route atom. A constant ``lane_entry`` folds everything but
-    the half interleave at trace time.
+    the half interleave at trace time. ``groups`` is the route kind's scale
+    groups per fragment, the exact-route geometry by default.
     """
-    groups = cfg.sage_k_groups_per_fragment
+    groups = _groups_or_default(cfg, groups)
     fragments_per_atom = cfg.keeps_fragments_per_atom
     fragment_regs = cfg.softmax_score_fragment_regs
     group_tokens = fragment_regs // groups
@@ -181,12 +202,14 @@ def sage_word_position(
 
 @cute.jit
 def route_scale_word_position(
-    cfg: Constexpr[FmhaDecodeConfig], word_idx: Int32
+    cfg: Constexpr[FmhaDecodeConfig],
+    word_idx: Int32,
+    groups: Constexpr[int | None] = None,
 ) -> tuple[Int32, Int32]:
     """Return ``sage_word_position`` of word ``word_idx`` of the staged layout."""
-    arr_size = sage_scale_arr_size(cfg)
+    arr_size = sage_scale_arr_size(cfg, groups)
     return sage_word_position(
-        cfg, word_idx // Int32(arr_size), word_idx % Int32(arr_size)
+        cfg, word_idx // Int32(arr_size), word_idx % Int32(arr_size), groups
     )
 
 
@@ -241,14 +264,24 @@ class RegisterSageKScales:
     leading ``groups`` entries for the fragment at hand and rotates the
     array down by one fragment, so neither the unrolled nor the rolled
     fragment loop indexes registers at run time.
+
+    ``groups`` is the scale groups per fragment of the route kind the
+    strategy serves. ``routed_words`` may exceed the lane's word count when
+    the other route kind's strategy routes more entries; the extra entries
+    are padding.
     """
 
     cfg: FmhaDecodeConfig
+    groups: int
+    routed_words: int = 0
+
+    def __post_init__(self) -> None:
+        self.routed_words = max(self.routed_words, self.arr_size)
 
     @property
-    def routed_words(self) -> int:
-        """Return the number of entries of the routed ``sage_scale_arr``."""
-        return sage_scale_arr_size(self.cfg)
+    def arr_size(self) -> int:
+        """Return the number of ``sfK`` words one lane holds per tile."""
+        return sage_scale_arr_size(self.cfg, self.groups)
 
     def smem_requirements(self, owner_name: str) -> list[SmemAllocation]:
         """Return the SMEM this strategy needs: none."""
@@ -257,27 +290,30 @@ class RegisterSageKScales:
 
     @cute.jit
     def load_tile(
-        self, stage_info: StageInfo, word_value: Constexpr[Callable[..., Float32]]
-    ) -> cutlass.Array:
-        """Return the lane's ``sfK`` words of the tile as the routed array.
+        self,
+        stage_info: StageInfo,
+        word_value: Constexpr[Callable[..., Float32]],
+        words: cutlass.Array,
+    ) -> None:
+        """Fill ``words`` (the routed array) with the lane's ``sfK`` words of the tile.
 
         ``word_value(word_idx, half, lane_entry)`` returns word ``word_idx =
         half * arr_size + lane_entry`` of the ``sage_k_scale_words`` layout
         from whichever coordinates it needs; the lane takes the
         ``sage_scale_arr_size`` words of its spatial half, so its entries are
-        constants.
+        constants. Padding entries past the lane's words are set to one.
         """
         cfg = self.cfg
-        arr_size = sage_scale_arr_size(cfg)
+        arr_size = self.arr_size
         warp_grp_thread_idx = Int32(
             _decode_gen_task_cache(stage_info)[_TASK_CACHE_WARP_GRP_THREAD_IDX]
         )
         half = _keeps_spatial_half(cfg, warp_grp_thread_idx)
         half_base = half * Int32(arr_size)
-        words = cutlass.Array(Float32, arr_size, space=cutlass.AddressSpace.rmem)
         for entry in cutlass.range_constexpr(arr_size):
             words[entry] = word_value(half_base + Int32(entry), half, entry)
-        return words
+        for entry in cutlass.range_constexpr(arr_size, self.routed_words):
+            words[entry] = Float32(1.0)
 
     @cute.jit
     def open(
@@ -288,7 +324,7 @@ class RegisterSageKScales:
     ) -> cutlass.Array:
         """Return the tile's ``factor * sfK`` words as a fresh rotating array."""
         _ = stage_info
-        arr_size = sage_scale_arr_size(self.cfg)
+        arr_size = self.arr_size
         words = cutlass.Array(Float32, arr_size, space=cutlass.AddressSpace.rmem)
         for entry in cutlass.range_constexpr(arr_size):
             words[entry] = Float32(scale_arr[entry])
@@ -300,7 +336,7 @@ class RegisterSageKScales:
     def fragment(self, words: cutlass.Array, fragment_idx: Int32) -> cutlass.Array:
         """Return the leading fragment's ``groups`` words, the factor applied."""
         _ = fragment_idx
-        groups = self.cfg.sage_k_groups_per_fragment
+        groups = self.groups
         values = cutlass.Array(Float32, groups, space=cutlass.AddressSpace.rmem)
         for group_idx in cutlass.range_constexpr(groups):
             values[group_idx] = Float32(words[group_idx])
@@ -309,8 +345,8 @@ class RegisterSageKScales:
     @cute.jit
     def advance(self, words: cutlass.Array) -> None:
         """Rotate the array down by one fragment."""
-        groups = self.cfg.sage_k_groups_per_fragment
-        for entry in cutlass.range_constexpr(sage_scale_arr_size(self.cfg) - groups):
+        groups = self.groups
+        for entry in cutlass.range_constexpr(self.arr_size - groups):
             words[entry] = Float32(words[entry + groups])
 
 
@@ -328,26 +364,33 @@ class SmemSageKScales:
     one named barrier of the instance publishes them. Consecutive tiles
     alternate between the two tile slots of the ring, so a fill never
     overwrites words the previous tile's P pass may still be reading in
-    another warp. The routed ``sage_scale_arr`` is a one-element placeholder
-    here.
+    another warp. The routed ``sage_scale_arr`` holds no words here; its
+    entries are padding for the other route kind's register strategy.
+
+    ``groups`` is the scale groups per fragment of the route kind the
+    strategy serves; ``name`` distinguishes the ring of a proxy-summary
+    strategy from the exact-route one when a plan holds both.
     """
 
     cfg: FmhaDecodeConfig
     inst_id: int
     sync_barrier_id: int
+    groups: int
+    name: str = "sageKScales"
+    routed_words: int = 1
     _alloc: SmemAllocation | None = None
 
     @property
-    def routed_words(self) -> int:
-        """Return the number of entries of the routed ``sage_scale_arr``: one."""
-        return 1
+    def tile_words(self) -> int:
+        """Return the ``sfK`` words of one tile slot."""
+        return sage_k_scale_words(self.cfg, self.groups)
 
     def smem_requirements(self, owner_name: str) -> list[SmemAllocation]:
         """Return the ring's allocation, registered by the owning S resource."""
         if self._alloc is None:
             self._alloc = SmemAllocation(
-                name=f"{owner_name}_sageKScales",
-                size_bytes=2 * sage_k_scale_words(self.cfg) * 4,
+                name=f"{owner_name}_{self.name}",
+                size_bytes=2 * self.tile_words * 4,
                 alignment=16,
             )
         return [self._alloc]
@@ -358,20 +401,23 @@ class SmemSageKScales:
         return cutlass.Array(
             context.smem_base.data_ptr() + self._alloc.offset,
             dtype=Float32,
-            shape=(2 * sage_k_scale_words(self.cfg),),
+            shape=(2 * self.tile_words,),
             addrspace=3,
         )
 
     @cute.jit
     def tile_base(self, stage_info: StageInfo) -> Int32:
         """Return the word base of the current tile's slot of the ring."""
-        return (stage_info.loop_offset & Int32(1)) * Int32(sage_k_scale_words(self.cfg))
+        return (stage_info.loop_offset & Int32(1)) * Int32(self.tile_words)
 
     @cute.jit
     def load_tile(
-        self, stage_info: StageInfo, word_value: Constexpr[Callable[..., Float32]]
-    ) -> cutlass.Array:
-        """Fill the current tile's slot, publish it, and return the placeholder.
+        self,
+        stage_info: StageInfo,
+        word_value: Constexpr[Callable[..., Float32]],
+        words: cutlass.Array,
+    ) -> None:
+        """Fill the current tile's slot, publish it, and pad the routed array.
 
         ``word_value(word_idx, half, lane_entry)`` returns word ``word_idx =
         half * arr_size + lane_entry`` of the ``sage_k_scale_words`` layout
@@ -380,8 +426,8 @@ class SmemSageKScales:
         barrier publishes the slot to both passes.
         """
         cfg = self.cfg
-        num_words = sage_k_scale_words(cfg)
-        arr_size = sage_scale_arr_size(cfg)
+        num_words = self.tile_words
+        arr_size = sage_scale_arr_size(cfg, self.groups)
         threads = 32 * cfg.softmax_num_warps(self.inst_id)
         warp_grp_thread_idx = Int32(
             _decode_gen_task_cache(stage_info)[_TASK_CACHE_WARP_GRP_THREAD_IDX]
@@ -395,9 +441,8 @@ class SmemSageKScales:
                     word_idx, word_idx // Int32(arr_size), word_idx % Int32(arr_size)
                 )
         prims.barrier_cta_sync(self.sync_barrier_id, thread_count=threads)
-        placeholder = cutlass.Array(Float32, 1, space=cutlass.AddressSpace.rmem)
-        placeholder[0] = Float32(1.0)
-        return placeholder
+        for entry in cutlass.range_constexpr(self.routed_words):
+            words[entry] = Float32(1.0)
 
     @cute.jit
     def open(
@@ -413,7 +458,7 @@ class SmemSageKScales:
         )
         half_base = self.tile_base(stage_info) + _keeps_spatial_half(
             self.cfg, warp_grp_thread_idx
-        ) * Int32(sage_scale_arr_size(self.cfg))
+        ) * Int32(sage_scale_arr_size(self.cfg, self.groups))
         return self.words(stage_info.context), half_base, factor
 
     @cute.jit
@@ -424,7 +469,7 @@ class SmemSageKScales:
         latency hides behind it.
         """
         buffer, half_base, factor = view
-        groups = self.cfg.sage_k_groups_per_fragment
+        groups = self.groups
         values = _load_f32_chunks(
             buffer.data_ptr() + half_base + fragment_idx * Int32(groups), groups
         )
@@ -443,13 +488,36 @@ SageKScales = RegisterSageKScales | SmemSageKScales
 
 def make_sage_k_scales(
     cfg: FmhaDecodeConfig, *, inst_id: int, sync_barrier_id: int
-) -> SageKScales | None:
-    """Return the K scale strategy of one softmax instance, ``None`` without Sage."""
+) -> tuple[SageKScales | None, SageKScales | None]:
+    """Return one softmax instance's ``sfK`` strategies for exact and proxy routes.
+
+    Both entries are ``None`` without Sage attention and the same object
+    unless the plan's summary scales use another K block size than its token
+    scales (``sage_mixed_k_geometry``); then the proxy strategy is built for
+    the summary geometry, with its own SMEM ring and named barrier
+    (``sync_barrier_id + 2``) if it lives in SMEM, and both route the larger
+    ``sage_scale_arr``.
+    """
     if not cfg.use_sage_attention:
-        return None
-    if cfg.sage_k_scales_in_smem:
-        return SmemSageKScales(cfg, inst_id, sync_barrier_id)
-    return RegisterSageKScales(cfg)
+        return None, None
+
+    def build(groups: int, barrier_id: int, name: str) -> SageKScales:
+        if cfg.sage_k_scales_in_smem_for(groups):
+            return SmemSageKScales(cfg, inst_id, barrier_id, groups, name=name)
+        return RegisterSageKScales(cfg, groups)
+
+    exact = build(cfg.sage_k_groups_per_fragment, sync_barrier_id, "sageKScales")
+    if not cfg.sage_mixed_k_geometry:
+        return exact, exact
+    proxy = build(
+        cfg.sage_summary_k_groups_per_fragment,
+        sync_barrier_id + 2,
+        "sageSummaryKScales",
+    )
+    routed_words = max(exact.routed_words, proxy.routed_words)
+    exact.routed_words = routed_words
+    proxy.routed_words = routed_words
+    return exact, proxy
 
 
 @cute.jit
@@ -462,23 +530,26 @@ def block_sparse_k_scale_source(
     k_summary_scale_head_stride: Int32 | None,
     seq_len_kv: Int32,
     route_is_proxy: cutlass.Boolean,
-) -> tuple[Int64, Int32, Int32]:
+) -> tuple[Int64, Int32, Int32, Int32]:
     """Return the K scale array of one block-sparse route.
 
-    Exact routes read ``k_scale`` over the KV tokens; proxy routes read
-    ``k_summary_scale`` over the summary sequence, whose length is the number
-    of KV blocks. The result is ``(base address, head stride, sequence
-    length)`` for :func:`load_k_scale`.
+    Exact routes read ``k_scale`` over the KV tokens with the recipe's K block
+    size; proxy routes read ``k_summary_scale`` over the summary sequence,
+    whose length is the number of KV blocks, with the summary K block size.
+    The result is ``(base address, head stride, sequence length, log2 block
+    size)`` for :func:`load_k_scale`.
     """
     scale_addr = k_scale_ptr.toint()
     head_stride = k_scale_head_stride
     seq_len = seq_len_kv
+    log2_block = Int32(log2_block_size(cfg.sage_k_block_size))
     if cutlass.const_expr(cfg.use_block_sparse_proxy_routes):
         if route_is_proxy:
             scale_addr = k_summary_scale_ptr.toint()
             head_stride = k_summary_scale_head_stride
             seq_len = Int32(cfg.num_proxy_summaries)
-    return scale_addr, head_stride, seq_len
+            log2_block = Int32(log2_block_size(cfg.sage_k_summary_block_size))
+    return scale_addr, head_stride, seq_len, log2_block
 
 
 def staged_v_channel_scale_entries(cfg: FmhaDecodeConfig) -> int:

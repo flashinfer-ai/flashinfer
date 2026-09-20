@@ -430,7 +430,13 @@ the block-sparse provider moves the loads off the softmax warps, the load
 warp resolving and staging the route's `sfK` words (`sage_k_scale_words` per
 route, ordered by consuming half and lane array) next to the route metadata
 from the route's K64 atom origins; a proxy route switches the K source to
-`k_summary_scale` indexed by summary position (`block_sparse_k_scale_source`).
+`k_summary_scale` indexed by summary position with the summary K block size
+(`block_sparse_k_scale_source`). When `sage_k_summary_block_size` differs
+from `sage_k_block_size` (`sage_mixed_k_geometry`), each softmax instance
+holds one `sfK` strategy per route kind, the staging area covers the larger
+word count, and the max and P passes select the strategy and its scale-group
+count per tile on the CTA-uniform route kind; equal block sizes keep the
+single geometry.
 Tokens beyond the sequence end and Q rows beyond the valid count clamp to the
 last valid slot, so masked columns keep a finite scale and exponentiate to
 zero.

@@ -1237,8 +1237,12 @@ class FmhaDecodeConfig:
     # and E4M3 V with one scale per channel. A nonzero K block size enables
     # the feature; the Q block size is a power of two up to ``tile_size_q``.
     # ``sage_v_mean`` adds a per-channel V mean back after normalization.
+    # ``sage_k_summary_block_size`` is the K block size of a proxy plan's
+    # summary scales; zero on every plan without proxy routes, so exact-only
+    # and dense plans share one kernel per recipe.
     sage_q_block_size: int = 0
     sage_k_block_size: int = 0
+    sage_k_summary_block_size: int = 0
     sage_v_mean: bool = False
     # Nonzero means each K/V stage covers only this many head-dim columns.
     # H256 SwapsMmaAb uses 128-column stages to keep TMA and TMEM layouts valid.
@@ -1806,22 +1810,41 @@ class FmhaDecodeConfig:
         """Validate the qualified host profile of a Sage attention launch.
 
         The scale block sizes follow the recipe: ``sage_k_block_size`` is one
-        of ``SAGE_K_BLOCK_SIZES`` and ``sage_q_block_size`` is a power of two
-        no larger than the Q tile. The launch needs contiguous K/V with
-        ``headdim=128``, a streamed two-instance Keeps profile and the
-        direct-output grid. Without Sage attention the other recipe fields
-        must stay unset. The dtype recipe is validated by ``validate_dtypes``.
+        of ``SAGE_K_BLOCK_SIZES``, ``sage_k_summary_block_size`` is one of them
+        on a proxy plan and zero otherwise, and ``sage_q_block_size`` is a
+        power of two no larger than the Q tile. The launch needs contiguous
+        K/V with ``headdim=128``, a streamed two-instance Keeps profile and
+        the direct-output grid. Without Sage attention the other recipe
+        fields must stay unset. The dtype recipe is validated by
+        ``validate_dtypes``.
         """
         if not self.use_sage_attention:
-            if self.sage_q_block_size != 0 or self.sage_v_mean:
+            if (
+                self.sage_q_block_size != 0
+                or self.sage_k_summary_block_size != 0
+                or self.sage_v_mean
+            ):
                 raise ValueError(
-                    "sage_q_block_size and sage_v_mean require sage_k_block_size"
+                    "sage_q_block_size, sage_k_summary_block_size and sage_v_mean "
+                    "require sage_k_block_size"
                 )
             return
         if self.sage_k_block_size not in SAGE_K_BLOCK_SIZES:
             raise ValueError(
                 f"sage_k_block_size must be one of {SAGE_K_BLOCK_SIZES}, "
                 f"got {self.sage_k_block_size}"
+            )
+        if self.use_block_sparse_proxy_routes:
+            if self.sage_k_summary_block_size not in SAGE_K_BLOCK_SIZES:
+                raise ValueError(
+                    "sage_k_summary_block_size must be one of "
+                    f"{SAGE_K_BLOCK_SIZES} on a proxy plan, "
+                    f"got {self.sage_k_summary_block_size}"
+                )
+        elif self.sage_k_summary_block_size != 0:
+            raise ValueError(
+                "sage_k_summary_block_size applies to proxy plans only, "
+                f"got {self.sage_k_summary_block_size}"
             )
         q_block_size = self.sage_q_block_size
         if not is_power_of_two(q_block_size) or q_block_size > self.tile_size_q:
@@ -2306,21 +2329,52 @@ class FmhaDecodeConfig:
         """Return the warps of one softmax instance."""
         return self.softmax0_num_warps if inst_id == 0 else self.softmax1_num_warps
 
-    @property
-    def sage_k_groups_per_fragment(self) -> int:
+    def sage_k_groups_for_block(self, k_block_size: int) -> int:
         """Return the K scale groups inside one streamed K32 score fragment.
 
         A fragment holds ``softmax_score_fragment_regs`` consecutive KV tokens,
         so a 16-token K block splits it into two compile-time groups; larger
         blocks share one scale across the whole fragment.
         """
-        if not self.use_sage_attention:
-            return 1
-        return max(1, self.softmax_score_fragment_regs // self.sage_k_block_size)
+        return max(1, self.softmax_score_fragment_regs // k_block_size)
 
     @property
-    def sage_k_scales_in_smem(self) -> bool:
-        """Whether a tile's ``sfK`` words live in SMEM instead of lane registers.
+    def sage_k_groups_per_fragment(self) -> int:
+        """Return the scale groups per fragment of an exact route or dense tile."""
+        if not self.use_sage_attention:
+            return 1
+        return self.sage_k_groups_for_block(self.sage_k_block_size)
+
+    @property
+    def sage_summary_k_groups_per_fragment(self) -> int:
+        """Return the scale groups per fragment of a proxy route's summaries."""
+        if not self.use_block_sparse_proxy_routes:
+            return self.sage_k_groups_per_fragment
+        return self.sage_k_groups_for_block(self.sage_k_summary_block_size)
+
+    def sage_k_groups_per_fragment_for(self, proxy: bool) -> int:
+        """Return the scale groups per fragment of one route kind."""
+        if proxy:
+            return self.sage_summary_k_groups_per_fragment
+        return self.sage_k_groups_per_fragment
+
+    @property
+    def sage_mixed_k_geometry(self) -> bool:
+        """Whether exact and proxy routes use different scale-group geometries.
+
+        Then the softmax passes hold one ``sfK`` strategy per route kind and
+        select it per tile on the CTA-uniform route kind; with equal block
+        sizes every plan runs the single geometry of its exact routes.
+        """
+        return (
+            self.use_sage_attention
+            and self.use_block_sparse_proxy_routes
+            and self.sage_summary_k_groups_per_fragment
+            != self.sage_k_groups_per_fragment
+        )
+
+    def sage_k_scales_in_smem_for(self, groups: int) -> bool:
+        """Whether a tile with ``groups`` scale groups per fragment keeps ``sfK`` in SMEM.
 
         With four or more scale groups per K32 fragment (K blocks of 4 or 1
         token) a lane would hold 16 or more multipliers per tile, so the tile
@@ -2328,9 +2382,16 @@ class FmhaDecodeConfig:
         both softmax passes read one fragment's groups with 16-byte loads;
         the larger blocks keep the rotating register array. The two forms are
         the strategies ``SmemSageKScales`` and ``RegisterSageKScales`` of the
-        scale module; this predicate selects between them.
+        scale module; this predicate selects between them. Forcing every
+        block size onto the SMEM form measured 2% to 4.5% slower on the
+        16-token recipes, so both forms stay.
         """
-        return self.use_sage_attention and self.sage_k_groups_per_fragment >= 4
+        return self.use_sage_attention and groups >= 4
+
+    @property
+    def sage_k_scales_in_smem(self) -> bool:
+        """Whether exact routes and dense tiles keep their ``sfK`` words in SMEM."""
+        return self.sage_k_scales_in_smem_for(self.sage_k_groups_per_fragment)
 
     @property
     def matches_kv256_task_topology(self) -> bool:
