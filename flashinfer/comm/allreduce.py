@@ -75,6 +75,7 @@ from .trtllm_ar import trtllm_moe_finalize_allreduce_fusion
 
 from .mapping import Mapping
 
+from .comm_backend import MPIBackend, TorchDistBackend
 from .mnnvl import (
     CommBackend,
     SymmDeviceMemory,
@@ -461,6 +462,163 @@ def _workspace_creation_heuristic(
 
 
 @flashinfer_api
+def _support_agreement_comm(
+    world_size: int,
+    comm_backend: CommBackend | None,
+    group: "ProcessGroup | None",
+) -> "CommBackend | None":
+    """The collective used to agree on backend support, if one is reachable.
+
+    ``None`` means the caller configured no collective scoped to ``world_size``,
+    so there is nothing to agree over. That configuration is already documented
+    as unsupported when ranks differ in capability; a warning is logged rather
+    than a collective being invented, because process-group creation here would
+    outlive the caller's own setup and is what the workspace constructors do
+    themselves.
+    """
+    if world_size <= 1:
+        return None
+    comm = comm_backend
+    if comm is None:
+        import torch.distributed as dist
+
+        if dist.is_initialized():
+            comm = TorchDistBackend(group=group)
+        else:
+            try:
+                comm = MPIBackend()
+            except ImportError as exc:
+                # mpi4py is optional. With no caller-supplied collective and no
+                # initialized process group there is no way to reach the other
+                # ranks from here, and a variable *launch* environment must not
+                # turn a working rank-local decision into an exception.
+                logger.debug(
+                    "[allreduce-fusion] no support-agreement collective (%s); "
+                    "each rank decides on its own",
+                    exc,
+                )
+                return None
+    comm_size = comm.Get_size()
+    if comm_size != world_size:
+        logger.warning(
+            "[allreduce-fusion] support-agreement comm size %d != world_size %d; "
+            "each rank decides on its own. Pass a comm_backend/group scoped to "
+            "the workspace ranks to have the group agree before construction.",
+            comm_size,
+            world_size,
+        )
+        return None
+    return comm
+
+
+def _agree_on_support(
+    local_verdict: tuple[bool, str | None, str | None, str | None],
+    world_size: int,
+    comm_backend: CommBackend | None,
+    group: "ProcessGroup | None",
+) -> tuple[bool, str | None, str | None, str | None]:
+    """Agree the per-rank support verdict across the group, then return it.
+
+    The verdict is ``(supported, exception_name, message, selected_backend)`` as
+    plain data, so no rank raises before the group has been consulted: all ranks
+    must build the same workspace type or the constructor's rendezvous deadlocks,
+    and a rank that raised on its own would leave the others waiting there.
+    Disagreement -- one rank supporting a backend another cannot run, or two
+    ranks selecting different backends -- is reported on every rank.
+    """
+    comm = _support_agreement_comm(world_size, comm_backend, group)
+    if comm is None:
+        return local_verdict
+    verdicts = comm.allgather(local_verdict)
+    if len(set(verdicts)) != 1:
+        raise BackendSupportedError(
+            "AllReduce-fusion backend support differs across ranks: "
+            + "; ".join(
+                f"rank(s) {sorted(i for i, v in enumerate(verdicts) if v == verdict)}"
+                f" -> supported={verdict[0]}, backend={verdict[3]!r}, reason={verdict[2]!r}"
+                for verdict in sorted(set(verdicts))
+            )
+            + ". Every rank must support the same backend; a group mixing compute "
+            "capabilities cannot share one workspace."
+        )
+    return local_verdict
+
+
+def _local_support_verdict(
+    backend: str,
+    world_size: int,
+    rank: int,
+    max_token_num: int,
+    hidden_dim: int,
+    dtype: torch.dtype,
+    gpus_per_node: int,
+    comm_backend: CommBackend | None,
+    group: "ProcessGroup | None",
+) -> tuple[bool, str | None, str | None, str | None]:
+    """This rank's verdict as data, so the group can agree before any raise."""
+    if backend != "auto":
+        if not _has_backend(backend):
+            return (
+                False,
+                BackendSupportedError.__name__,
+                f"Unknown backend {backend!r} for "
+                f"{create_allreduce_fusion_workspace.__name__}; expected one of "
+                f"{sorted(_BACKEND_CHECKS)} or 'auto'",
+                None,
+            )
+        capability = _device_capability()
+        if not _is_backend_supported(backend, capability):
+            return (
+                False,
+                BackendSupportedError.__name__,
+                f"Backend {backend!r} does not support compute capability {capability}",
+                None,
+            )
+        return (True, None, None, backend)
+
+    capability = _device_capability()
+    # Find suitable backends (any problem size check still belongs to kernel
+    # runtime, since there is no tensor available at this point)
+    suitable_backends = []
+    if _trtllm_workspace_check(
+        backend=backend,
+        world_size=world_size,
+        rank=rank,
+        max_token_num=max_token_num,
+        hidden_dim=hidden_dim,
+        dtype=dtype,
+    ) and _is_backend_supported("trtllm", capability):
+        suitable_backends.append("trtllm")
+    # Voted on by every rank even when this rank's architecture already rules
+    # MNNVL out: the vote is a collective, so no rank may skip it.
+    local_mnnvl_supported = is_multicast_supported(torch.cuda.current_device())
+    mnnvl_available = all_ranks_support_mnnvl(
+        local_mnnvl_supported, world_size, comm_backend, group
+    )
+    if mnnvl_available and _is_backend_supported("mnnvl", capability):
+        suitable_backends.append("mnnvl")
+
+    if not suitable_backends:
+        return (
+            False,
+            ValueError.__name__,
+            f"No suitable backend found for compute capability {capability}. "
+            f"Supported backends: {sorted(_BACKEND_CHECKS)}",
+            None,
+        )
+
+    selected = _workspace_creation_heuristic(
+        suitable_backends=suitable_backends,
+        backend=backend,
+        world_size=world_size,
+        rank=rank,
+        max_token_num=max_token_num,
+        hidden_dim=hidden_dim,
+        dtype=dtype,
+    )
+    return (True, None, None, selected[0])
+
+
 def create_allreduce_fusion_workspace(
     backend: Literal["trtllm", "mnnvl", "auto"] = "auto",
     world_size: int = None,
@@ -558,69 +716,32 @@ def create_allreduce_fusion_workspace(
     ... )
 
     """
-    if backend != "auto":
-        # Refuse an unusable explicit backend before anything is allocated or
-        # rendezvoused. Each rank decides from its own device: a backend's
-        # kernels either exist for this architecture or never will, and a group
-        # spanning two architecture families is not a configuration these
-        # collectives support.
-        if not _has_backend(backend):
-            raise BackendSupportedError(
-                f"Unknown backend {backend!r} for "
-                f"{create_allreduce_fusion_workspace.__name__}; expected one of "
-                f"{sorted(_BACKEND_CHECKS)} or 'auto'"
-            )
-        capability = _device_capability()
-        if not _is_backend_supported(backend, capability):
-            raise BackendSupportedError(
-                f"Backend {backend!r} does not support compute capability {capability}"
-            )
-
     if gpus_per_node is None:
         gpus_per_node = min(torch.cuda.device_count(), world_size)
-    # Determine the actual backend to use
-    if backend == "auto":
-        capability = _device_capability()
-        # Find suitable backends (any problem size check still belongs to kernel
-        # runtime, since there is no tensor available at this point)
-        suitable_backends = []
-        if _trtllm_workspace_check(
-            backend=backend,
-            world_size=world_size,
-            rank=rank,
-            max_token_num=max_token_num,
-            hidden_dim=hidden_dim,
-            dtype=dtype,
-        ) and _is_backend_supported("trtllm", capability):
-            suitable_backends.append("trtllm")
-        # Voted on by every rank even when this rank's architecture already
-        # rules MNNVL out: the vote is a collective, so no rank may skip it.
-        local_mnnvl_supported = is_multicast_supported(torch.cuda.current_device())
-        mnnvl_available = all_ranks_support_mnnvl(
-            local_mnnvl_supported, world_size, comm_backend, group
-        )
-        if mnnvl_available and _is_backend_supported("mnnvl", capability):
-            suitable_backends.append("mnnvl")
 
-        if not suitable_backends:
-            raise ValueError(
-                f"No suitable backend found for compute capability {capability}. "
-                f"Supported backends: {sorted(_BACKEND_CHECKS)}"
-            )
-
-        # Apply heuristic to select best backend
-        selected = _workspace_creation_heuristic(
-            suitable_backends=suitable_backends,
-            backend=backend,
-            world_size=world_size,
-            rank=rank,
-            max_token_num=max_token_num,
-            hidden_dim=hidden_dim,
-            dtype=dtype,
-        )
-        actual_backend = selected[0]
-    else:
-        actual_backend = backend
+    # Decide as data first, agree as a group, and only then raise or allocate:
+    # a rank that refuses on its own while another enters a workspace
+    # constructor leaves the second one waiting in a rendezvous that can never
+    # complete. The group agreement is what turns that hang into one error on
+    # every rank.
+    verdict = _local_support_verdict(
+        backend=backend,
+        world_size=world_size,
+        rank=rank,
+        max_token_num=max_token_num,
+        hidden_dim=hidden_dim,
+        dtype=dtype,
+        gpus_per_node=gpus_per_node,
+        comm_backend=comm_backend,
+        group=group,
+    )
+    supported, exception_name, message, actual_backend = _agree_on_support(
+        verdict, world_size=world_size, comm_backend=comm_backend, group=group
+    )
+    if not supported:
+        if exception_name == ValueError.__name__:
+            raise ValueError(message)
+        raise BackendSupportedError(message)
 
     # Create workspace for selected backend using workspace constructors
     if actual_backend == "trtllm":

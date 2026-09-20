@@ -484,6 +484,110 @@ def test_each_rank_reports_its_own_reason_when_arguments_differ():
 
 
 # ---------------------------------------------------------------------------
+# Group agreement before any workspace constructor
+# ---------------------------------------------------------------------------
+
+
+class _FakeComm:
+    """Collective that reports the verdicts of the whole (fake) group."""
+
+    def __init__(self, size, all_verdicts):
+        self._size = size
+        self._all = all_verdicts
+        self.gathers = 0
+
+    def Get_size(self):
+        return self._size
+
+    def allgather(self, local):
+        self.gathers += 1
+        return tuple(self._all)
+
+
+_SUPPORTED = (True, None, None, "trtllm")
+_REFUSED = (
+    False,
+    "BackendSupportedError",
+    f"Backend 'trtllm' does not support compute capability {L20_COMPUTE_CAPABILITY}",
+    None,
+)
+
+
+def test_unanimous_support_returns_the_agreed_verdict():
+    """B1-13: an agreed verdict is returned unchanged, from one collective."""
+    comm = _FakeComm(2, [_SUPPORTED, _SUPPORTED])
+    assert allreduce._agree_on_support(_SUPPORTED, 2, comm, None) == _SUPPORTED
+    assert comm.gathers == 1
+
+
+def test_a_rank_that_supports_the_backend_still_refuses_a_mixed_group():
+    """B1-13: the supported rank must not reach a constructor alone.
+
+    Rank 0 can run trtllm, rank 1 cannot. Without an agreement rank 0 enters the
+    workspace constructor and waits in a rendezvous rank 1 will never join.
+    """
+    for local in (_SUPPORTED, _REFUSED):
+        with pytest.raises(BackendSupportedError) as excinfo:
+            allreduce._agree_on_support(
+                local, 2, _FakeComm(2, [_SUPPORTED, _REFUSED]), None
+            )
+        message = str(excinfo.value)
+        assert "differs across ranks" in message
+        assert f"compute capability {L20_COMPUTE_CAPABILITY}" in message
+
+
+def test_divergent_backend_selections_are_refused_as_a_group():
+    """B1-13: two ranks supporting different backends cannot share a workspace."""
+    other = (True, None, None, "mnnvl")
+    with pytest.raises(BackendSupportedError, match="differs across ranks"):
+        allreduce._agree_on_support(
+            _SUPPORTED, 2, _FakeComm(2, [_SUPPORTED, other]), None
+        )
+
+
+def test_a_unanimous_refusal_keeps_one_reason_for_every_rank():
+    """B1-13: the verdict survives the agreement, so all ranks report one reason."""
+    assert allreduce._agree_on_support(
+        _REFUSED, 2, _FakeComm(2, [_REFUSED, _REFUSED]), None
+    ) == (_REFUSED)
+
+
+def test_comm_scoped_to_other_ranks_warns_and_decides_locally(monkeypatch):
+    """B1-13: a mismatched comm is not used; the local verdict stands."""
+    warnings = []
+    monkeypatch.setattr(
+        allreduce.logger,
+        "warning",
+        lambda message, *args: warnings.append(message % args),
+    )
+
+    class _NeverGathers(_FakeComm):
+        def allgather(self, local):
+            raise AssertionError("a mismatched comm must not be used")
+
+    assert (
+        allreduce._agree_on_support(_SUPPORTED, 8, _NeverGathers(4, None), None)
+        == _SUPPORTED
+    )
+    assert len(warnings) == 1
+    assert "support-agreement comm size 4 != world_size 8" in warnings[0]
+
+
+def test_absent_collective_leaves_the_rank_local_decision_alone(monkeypatch):
+    """B1-13: mpi4py is optional, so no collective means no new failure."""
+
+    class _NoMpi:
+        def __init__(self):
+            raise ImportError("mpi4py is not installed")
+
+    monkeypatch.setattr(allreduce, "MPIBackend", _NoMpi)
+    monkeypatch.setattr(dist, "is_initialized", lambda: False)
+
+    assert allreduce._agree_on_support(_SUPPORTED, 2, None, None) == _SUPPORTED
+    assert allreduce._agree_on_support(_REFUSED, 2, None, None) == _REFUSED
+
+
+# ---------------------------------------------------------------------------
 # Positive path on an architecture the kernels cover
 # ---------------------------------------------------------------------------
 
