@@ -495,11 +495,14 @@ def _mnnvl_cutedsl_allreduce_fusion(
                 device=device,
                 alignment=16,
             )
-        # With the norm compiled out the kernel writes only
-        # residual_output; passing it as norm_output too satisfies the
-        # signature and is never written through.
+        # With the norm compiled out the kernel writes only residual_output.
+        # Allocate that slot here when the caller omitted it, and hand the same
+        # tensor to norm_output: letting the protocol allocate the two slots
+        # independently would leave the returned norm buffer unwritten.
+        if not workspace.apply_rms_norm and residual_out is None:
+            residual_out = torch.empty((m, hidden), dtype=torch.bfloat16, device=device)
         norm_target = norm_out if workspace.apply_rms_norm else residual_out
-        norm_out, _ = workspace._all_reduce_rms_norm(
+        norm_out, residual_out = workspace._all_reduce_rms_norm(
             input,
             residual_in,
             rms_gamma,
@@ -507,7 +510,7 @@ def _mnnvl_cutedsl_allreduce_fusion(
             norm_output=norm_target,
             residual_output=residual_out,
         )
-        return norm_out
+        return norm_out if workspace.apply_rms_norm else residual_out
 
     if pattern == AllReduceFusionPattern.kMoEFinalizeARResidualRMSNorm:
         if expanded_idx_to_permuted_idx is None:
@@ -586,11 +589,14 @@ def _mnnvl_cutedsl_allreduce_fusion(
                 device=device,
                 alignment=16,
             )
-        # With the norm compiled out the kernel writes only
-        # residual_output; passing it as norm_output too satisfies the
-        # signature and is never written through.
+        # With the norm compiled out the kernel writes only residual_output.
+        # Allocate that slot here when the caller omitted it, and hand the same
+        # tensor to norm_output: letting the protocol allocate the two slots
+        # independently would leave the returned norm buffer unwritten.
+        if not workspace.apply_rms_norm and residual_out is None:
+            residual_out = torch.empty((m, hidden), dtype=torch.bfloat16, device=device)
         norm_target = norm_out if workspace.apply_rms_norm else residual_out
-        norm_out, _ = workspace._finalize_all_reduce_rms_norm(
+        norm_out, residual_out = workspace._finalize_all_reduce_rms_norm(
             input,
             expert_scale_factor,
             expanded_idx_to_permuted_idx,
@@ -601,6 +607,6 @@ def _mnnvl_cutedsl_allreduce_fusion(
             norm_output=norm_target,
             residual_output=residual_out,
         )
-        return norm_out
+        return norm_out if workspace.apply_rms_norm else residual_out
 
     raise AssertionError("unreachable")

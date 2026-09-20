@@ -169,6 +169,58 @@ def test_disabled_norm_materializes_all_reduced_finalize(distributed_group, prot
         workspace.destroy()
 
 
+@pytest.mark.parametrize("protocol", ("ll", "bt"))
+@torch.inference_mode()
+def test_disabled_norm_returns_reduce_when_output_not_preallocated(
+    distributed_group, protocol
+):
+    """The returned tensor holds the reduce even when residual_out is omitted.
+
+    With the norm compiled out the kernel writes only the residual slot. If the
+    wrapper lets the protocol allocate an unrelated norm buffer and returns
+    that, the caller gets uninitialised memory instead of the reduced value.
+    """
+    group = distributed_group
+    rank = dist.get_rank(group)
+    m = dist.get_world_size(group)
+    workspace = _workspace(protocol, m, group, add_residual=False, apply_rms_norm=False)
+    try:
+        generator = torch.Generator(device="cuda").manual_seed(4700 + rank)
+        routed = torch.randn(
+            m * TOP_K,
+            HIDDEN_SIZE,
+            generator=generator,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        weights = torch.randn(
+            m, TOP_K, generator=generator, dtype=torch.bfloat16, device="cuda"
+        )
+        shared = torch.randn(
+            m, HIDDEN_SIZE, generator=generator, dtype=torch.bfloat16, device="cuda"
+        )
+        indices = torch.arange(m * TOP_K, dtype=torch.int32, device="cuda").reshape(
+            m, TOP_K
+        )
+        returned = allreduce_fusion(
+            input=routed,
+            workspace=workspace,
+            pattern=AllReduceFusionPattern.kMoEFinalizeARResidualRMSNorm,
+            launch_with_pdl=True,
+            expanded_idx_to_permuted_idx=indices,
+            expert_scale_factor=weights,
+            shared_expert_output=shared,
+        )
+        expected = _sanitize_negative_zero(
+            _ordered_reduce(
+                _local_finalize(routed, weights, indices, shared), group
+            ).to(torch.bfloat16)
+        )
+        assert torch.equal(returned.view(torch.int16), expected.view(torch.int16))
+    finally:
+        workspace.destroy()
+
+
 @torch.inference_mode()
 def test_disabled_norm_rejects_norm_operands(distributed_group):
     """rms_gamma and norm_out are meaningless once the norm is compiled out."""
