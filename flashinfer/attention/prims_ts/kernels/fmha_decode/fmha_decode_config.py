@@ -1169,8 +1169,8 @@ class FmhaDecodeConfig:
     # page-four table:
     # locator = physical_page * subpages_per_storage_page + subpage.
     storage_tokens_per_page: int = 0
-    # Prepared single-head compact caches can view all storage pages as rows
-    # of one TensorMap, while retaining the same encoded fragment indices.
+    # Prepared compact caches can view physical pages and heads as tensor rows.
+    # The paired metadata plan selects the corresponding locator head span.
     use_flat_native_kv_tma: bool = False
     # Prepared locators count the complete physical head span between pages.
     flat_native_kv_num_heads: int = 1

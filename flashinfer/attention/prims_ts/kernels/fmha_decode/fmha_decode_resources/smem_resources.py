@@ -177,7 +177,7 @@ def _decode_native_page_locator(
     page_locator: Int32,
     kv_head: Int32 = 0,
 ) -> tuple[Int32, Int32]:
-    """Return ``(token_offset, physical_page)`` for one native table entry."""
+    """Return token/page TMA coordinates for one prepared locator."""
     if cutlass.const_expr(cfg.use_flat_native_kv_tma):
         # The prepared locator is the head-zero origin in the compact cache.
         # Keep the entire fragment OOB when adding a head offset to a sentinel.
