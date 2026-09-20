@@ -32,8 +32,10 @@ import torch.distributed as dist
 from flashinfer.comm import AllReduceFusionPattern, allreduce_fusion
 from flashinfer.comm.mnnvl_cutedsl import (
     BT_ONLY_CONFIG,
+    DEFAULT_CONFIG,
     HT_ONLY_CONFIG,
     LL_ONLY_CONFIG,
+    NO_NORM_CONFIG,
 )
 from flashinfer.comm.mnnvl_cutedsl_ar import MNNVLCuteDSLAllReduceFusionWorkspace
 from flashinfer.utils import is_sm100a_supported
@@ -283,3 +285,124 @@ def test_high_throughput_rejects_disabled_norm(distributed_group):
         pytest.skip(f"no HT profile at tp_size={tp_size}, hidden={HIDDEN_SIZE}")
     with pytest.raises(NotImplementedError, match="apply_rms_norm"):
         _workspace("ht", tp_size, group, add_residual=False, apply_rms_norm=False)
+
+
+@torch.inference_mode()
+def test_no_norm_config_routes_without_a_norm_tail(distributed_group):
+    """NO_NORM_CONFIG covers this shape and never routes to HT.
+
+    HT cannot compile the norm out, so a norm-free config has no HT tail; BT
+    carries the range to the top.
+    """
+    group = distributed_group
+    tp_size = dist.get_world_size(group)
+    profile = NO_NORM_CONFIG.resolve(
+        tp_size=tp_size,
+        hidden_size=HIDDEN_SIZE,
+        top_k=TOP_K,
+        dtype=torch.bfloat16,
+        capacity_m=4096,
+    )
+    for routes in (profile.finalize_routes, profile.all_reduce_routes):
+        protocols = {target.protocol.value for target in routes.targets}
+        assert "ht" not in protocols
+        assert routes.is_unbounded
+
+
+@torch.inference_mode()
+def test_norm_free_config_rejects_norm_on_workspace(distributed_group):
+    """NO_NORM_CONFIG's boundaries are only valid for norm-free kernels."""
+    group = distributed_group
+    m = dist.get_world_size(group)
+    with pytest.raises(ValueError, match="apply_rms_norm"):
+        MNNVLCuteDSLAllReduceFusionWorkspace(
+            tp_size=m,
+            tp_rank=dist.get_rank(group),
+            max_token_num=m,
+            hidden_dim=HIDDEN_SIZE,
+            dtype=torch.bfloat16,
+            group=group,
+            top_k=TOP_K,
+            rms_eps=RMS_EPS,
+            apply_rms_norm=True,
+            config=NO_NORM_CONFIG,
+        )
+
+
+@torch.inference_mode()
+def test_norm_on_config_rejects_norm_free_workspace(distributed_group):
+    """DEFAULT_CONFIG's boundaries were measured with the norm enabled."""
+    group = distributed_group
+    m = dist.get_world_size(group)
+    with pytest.raises(ValueError, match="apply_rms_norm"):
+        MNNVLCuteDSLAllReduceFusionWorkspace(
+            tp_size=m,
+            tp_rank=dist.get_rank(group),
+            max_token_num=m,
+            hidden_dim=HIDDEN_SIZE,
+            dtype=torch.bfloat16,
+            group=group,
+            top_k=TOP_K,
+            rms_eps=RMS_EPS,
+            add_residual=False,
+            apply_rms_norm=False,
+            config=DEFAULT_CONFIG,
+        )
+
+
+@torch.inference_mode()
+def test_no_norm_config_materializes_all_reduced_finalize(distributed_group):
+    """End to end through NO_NORM_CONFIG's own routing."""
+    group = distributed_group
+    rank = dist.get_rank(group)
+    m = dist.get_world_size(group)
+    workspace = MNNVLCuteDSLAllReduceFusionWorkspace(
+        tp_size=m,
+        tp_rank=rank,
+        max_token_num=m,
+        hidden_dim=HIDDEN_SIZE,
+        dtype=torch.bfloat16,
+        group=group,
+        top_k=TOP_K,
+        rms_eps=RMS_EPS,
+        add_residual=False,
+        apply_rms_norm=False,
+        config=NO_NORM_CONFIG,
+    )
+    torch.cuda.synchronize()
+    dist.barrier(group)
+    try:
+        generator = torch.Generator(device="cuda").manual_seed(4900 + rank)
+        routed = torch.randn(
+            m * TOP_K,
+            HIDDEN_SIZE,
+            generator=generator,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        weights = torch.randn(
+            m, TOP_K, generator=generator, dtype=torch.bfloat16, device="cuda"
+        )
+        shared = torch.randn(
+            m, HIDDEN_SIZE, generator=generator, dtype=torch.bfloat16, device="cuda"
+        )
+        indices = torch.arange(m * TOP_K, dtype=torch.int32, device="cuda").reshape(
+            m, TOP_K
+        )
+        returned = allreduce_fusion(
+            input=routed,
+            workspace=workspace,
+            pattern=AllReduceFusionPattern.kMoEFinalizeARResidualRMSNorm,
+            launch_with_pdl=True,
+            expanded_idx_to_permuted_idx=indices,
+            expert_scale_factor=weights,
+            shared_expert_output=shared,
+        )
+        expected = _sanitize_negative_zero(
+            _ordered_reduce(
+                _local_finalize(routed, weights, indices, shared), group
+            ).to(torch.bfloat16)
+        )
+        assert torch.equal(returned.view(torch.int16), expected.view(torch.int16))
+    finally:
+        workspace.destroy()

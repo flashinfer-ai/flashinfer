@@ -301,10 +301,10 @@ class HTProtocol:
         self.add_residual = add_residual
         self.write_residual_output = write_residual_output
         if not apply_rms_norm:
-            # This kernel is warp-specialised: a dedicated RMS warp group
-            # owns the sum-of-squares, its named barriers and its shared
-            # staging, so the norm is not a guardable block the way it is
-            # in the LL and BT tails.
+            # Not implemented rather than impossible: a dedicated RMS warp
+            # group owns the sum-of-squares and its barriers, so removing the
+            # norm means restructuring that warp specialisation, not adding a
+            # const_expr guard as in the LL and BT tails.
             raise NotImplementedError(
                 "apply_rms_norm=False is not supported by the "
                 "high-throughput protocol; select the LL or BT protocol"

@@ -54,6 +54,8 @@ Options::
                           accepts bt0/bt1, which pin the BT route to a
                           single preset so the preset split is measurable.
     --patterns ar,finalize
+    --no-rms-norm         Compile the collective without its RMSNorm
+                          (apply_rms_norm=False); LL and BT only
     --no-baseline         Skip the unfused NCCL + fused_add_rmsnorm reference
     --csv FILE            Also write the raw rows to CSV (rank 0 only)
     --dry-run-iters N     Warmup replays per point (default: 10)
@@ -171,7 +173,10 @@ def _single_bt_preset_config(preset_index: int, tp_size: int, top_k: int):
                     _BT_ALL_REDUCE_PRESETS[tp_size][preset_index]
                 ),
             ),
-        )
+        ),
+        # Protocol-pinned like the shipped *_ONLY configs, so it suits either
+        # apply_rms_norm setting.
+        applies_rms_norm=None,
     )
 
 
@@ -253,11 +258,20 @@ class Inputs:
         return self._indices[key]
 
 
-def _fused_call(inputs: Inputs, workspace, pattern_name: str, m: int, top_k: int):
+def _fused_call(
+    inputs: Inputs,
+    workspace,
+    pattern_name: str,
+    m: int,
+    top_k: int,
+    apply_rms_norm: bool = True,
+):
     """Return a zero-arg closure running one fused call at token count ``m``."""
     residual_out = inputs.residual_out[:m]
-    norm_out = inputs.norm_out[:m]
-    gamma = inputs.gamma
+    # With the norm compiled out these operands must be absent; the reduced
+    # value lands in residual_out instead.
+    norm_out = inputs.norm_out[:m] if apply_rms_norm else None
+    gamma = inputs.gamma if apply_rms_norm else None
     if pattern_name == "ar":
         local = inputs.local[:m]
         residual_in = inputs.residual[:m]
@@ -352,7 +366,9 @@ def _baseline_call(inputs: Inputs, group, pattern_name: str, m: int, top_k: int)
     return run_finalize
 
 
-def _build_workspace(protocol: str, top_k: int, capacity_m: int, group):
+def _build_workspace(
+    protocol: str, top_k: int, capacity_m: int, group, apply_rms_norm: bool = True
+):
     """Construct a protocol-pinned workspace, or ``(None, reason)``."""
     try:
         workspace = MNNVLCuteDSLAllReduceFusionWorkspace(
@@ -365,9 +381,10 @@ def _build_workspace(protocol: str, top_k: int, capacity_m: int, group):
             top_k=top_k,
             rms_eps=RMS_EPS,
             weight_bias=WEIGHT_BIAS,
+            apply_rms_norm=apply_rms_norm,
             config=_config_for(protocol, dist.get_world_size(group), top_k),
         )
-    except (ValueError, KeyError, RuntimeError) as error:
+    except (ValueError, KeyError, RuntimeError, NotImplementedError) as error:
         return None, str(error)
     torch.cuda.synchronize()
     dist.barrier(group)
@@ -446,7 +463,14 @@ def _sweep(rank, args, inputs, workspaces, group, top_k, pattern_name, rows) -> 
         cells = []
         measured = {}
         for protocol in active:
-            run = _fused_call(inputs, workspaces[protocol], pattern_name, m, top_k)
+            run = _fused_call(
+                inputs,
+                workspaces[protocol],
+                pattern_name,
+                m,
+                top_k,
+                apply_rms_norm=not args.no_rms_norm,
+            )
             try:
                 micros = _measure(run, group, args)
             except Exception as error:  # noqa: BLE001 - record and keep sweeping
@@ -505,6 +529,7 @@ def main() -> int:
     parser.add_argument("--top-k", type=str, default=",".join(map(str, TOP_K_STAGES)))
     parser.add_argument("--protocols", type=str, default="ll,bt,ht")
     parser.add_argument("--patterns", type=str, default="ar,finalize")
+    parser.add_argument("--no-rms-norm", action="store_true")
     parser.add_argument("--no-baseline", action="store_true")
     parser.add_argument("--csv", type=str, default=None)
     parser.add_argument("--dry-run-iters", type=int, default=10)
@@ -560,7 +585,9 @@ def main() -> int:
     for top_k in top_ks:
         workspaces = {}
         for protocol in args.protocols:
-            workspace, error = _build_workspace(protocol, top_k, max_m, group)
+            workspace, error = _build_workspace(
+                protocol, top_k, max_m, group, apply_rms_norm=not args.no_rms_norm
+            )
             if workspace is None:
                 _log(rank, f"\n[skip] {protocol.upper()} top_k={top_k}: {error}")
             workspaces[protocol] = workspace

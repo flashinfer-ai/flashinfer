@@ -74,6 +74,7 @@ __all__ = [
     "DEFAULT_CONFIG",
     "HT_ONLY_CONFIG",
     "LL_ONLY_CONFIG",
+    "NO_NORM_CONFIG",
 ]
 
 
@@ -251,6 +252,64 @@ def _h5120_default_all_reduce(tp: int) -> MRangeDispatch:
     return MRangeDispatch(upper_bounds=bounds, targets=targets)
 
 
+# Norm-free boundaries, measured with `apply_rms_norm=False` and
+# `add_residual=True`. They differ from the tables above because dropping the
+# norm frees LL of a cluster-wide barrier while BT only loses a store, so LL
+# stays ahead further (tp=4 top_k=6 finalize: 42 -> 64); turning off
+# add_residual shifts them again (-> ~96), so re-measure for that case.
+#
+# LL -> BT only. HT is structurally unreachable at tp >= 8 here, and at tp = 4
+# it has no norm-free kernel yet -- unimplemented, not impossible, and worth
+# ~11% at M=2048 and ~25% at M=8192. See kernel_ht/protocol.py.
+_H5120_NO_NORM_FINALIZE_LL_MAX = {(4, 6): 64, (4, 3): 56, (8, 6): 28, (8, 3): 28}
+_H5120_NO_NORM_ALL_REDUCE_LL_MAX = {4: 40, 8: 28}
+_H5120_NO_NORM_FINALIZE_BT_SPLIT = {(4, 6): 64, (4, 3): 32, (8, 6): 96, (8, 3): 48}
+_H5120_NO_NORM_ALL_REDUCE_BT_SPLIT = {4: 128, 8: 512}
+
+
+def _no_norm_routes(ll_preset, bt_presets, ll_max: int, bt_split: int):
+    """LL up to `ll_max`, then BT, splitting presets at `bt_split`.
+
+    When the split falls at or below the LL bound (tp=4 finalize), LL already
+    covers everything PRESET_0 would win, so BT starts directly on PRESET_1.
+    """
+    preset_0, preset_1 = bt_presets
+    if bt_split <= ll_max:
+        return MRangeDispatch(
+            upper_bounds=(ll_max, None),
+            targets=(
+                _target(ProtocolKind.LL, ll_preset),
+                _target(ProtocolKind.BT, preset_1),
+            ),
+        )
+    return MRangeDispatch(
+        upper_bounds=(ll_max, bt_split, None),
+        targets=(
+            _target(ProtocolKind.LL, ll_preset),
+            _target(ProtocolKind.BT, preset_0),
+            _target(ProtocolKind.BT, preset_1),
+        ),
+    )
+
+
+def _h5120_no_norm_finalize(tp: int, k: int) -> MRangeDispatch:
+    return _no_norm_routes(
+        _LL_H5120_FINALIZE[(tp, k)],
+        _BT_H5120_FINALIZE[(tp, k)],
+        _H5120_NO_NORM_FINALIZE_LL_MAX[(tp, k)],
+        _H5120_NO_NORM_FINALIZE_BT_SPLIT[(tp, k)],
+    )
+
+
+def _h5120_no_norm_all_reduce(tp: int) -> MRangeDispatch:
+    return _no_norm_routes(
+        _LL_H5120_ALL_REDUCE[tp],
+        _BT_H5120_ALL_REDUCE[tp],
+        _H5120_NO_NORM_ALL_REDUCE_LL_MAX[tp],
+        _H5120_NO_NORM_ALL_REDUCE_BT_SPLIT[tp],
+    )
+
+
 def _h5120_profiles(
     finalize_routes: Callable[[int, int], MRangeDispatch],
     all_reduce_routes: Callable[[int], MRangeDispatch],
@@ -328,7 +387,10 @@ LL_ONLY_CONFIG = MNNVLCuteDSLConfig(
             ),
         ),
         *_h5120_profiles(_h5120_ll_only_finalize, _h5120_ll_only_all_reduce),
-    )
+    ),
+    # Protocol-pinned: these ranges force one protocol rather than describe a
+    # crossover, so the config suits either apply_rms_norm setting.
+    applies_rms_norm=None,
 )
 
 
@@ -399,7 +461,10 @@ BT_ONLY_CONFIG = MNNVLCuteDSLConfig(
             ),
         ),
         *_h5120_profiles(_h5120_bt_only_finalize, _h5120_bt_only_all_reduce),
-    )
+    ),
+    # Protocol-pinned: these ranges force one protocol rather than describe a
+    # crossover, so the config suits either apply_rms_norm setting.
+    applies_rms_norm=None,
 )
 
 
@@ -456,7 +521,10 @@ HT_ONLY_CONFIG = MNNVLCuteDSLConfig(
         *_h5120_profiles(
             _h5120_ht_only_finalize, _h5120_ht_only_all_reduce, tp_sizes=(4,)
         ),
-    )
+    ),
+    # Protocol-pinned: these ranges force one protocol rather than describe a
+    # crossover, so the config suits either apply_rms_norm setting.
+    applies_rms_norm=None,
 )
 
 
@@ -560,4 +628,10 @@ DEFAULT_CONFIG = MNNVLCuteDSLConfig(
         ),
         *_h5120_profiles(_h5120_default_finalize, _h5120_default_all_reduce),
     )
+)
+
+
+NO_NORM_CONFIG = MNNVLCuteDSLConfig(
+    profiles=_h5120_profiles(_h5120_no_norm_finalize, _h5120_no_norm_all_reduce),
+    applies_rms_norm=False,
 )

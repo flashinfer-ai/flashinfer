@@ -116,12 +116,28 @@ class MNNVLCuteDSLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         apply_rms_norm: bool = True,
         config: MNNVLCuteDSLConfig = DEFAULT_CONFIG,
     ) -> None:
+        # Every validation below raises before super().__init__() can set this,
+        # and __del__ reads it. Mark the object destroyed up front so a rejected
+        # construction tears down quietly instead of raising AttributeError
+        # inside __del__.
+        self._destroyed = True
         if tp_size not in (2, 4, 8, 16):
             raise ValueError("tp_size must be 2, 4, 8, or 16")
         if not 0 <= tp_rank < tp_size:
             raise ValueError("tp_rank must be in [0, tp_size)")
         if max_token_num <= 0:
             raise ValueError("max_token_num must be positive")
+        if (
+            config.applies_rms_norm is not None
+            and config.applies_rms_norm != apply_rms_norm
+        ):
+            raise ValueError(
+                "config routing boundaries were measured with "
+                f"apply_rms_norm={config.applies_rms_norm}, but the workspace "
+                f"requests apply_rms_norm={apply_rms_norm}; pair a norm-on "
+                "config with apply_rms_norm=True and NO_NORM_CONFIG with "
+                "apply_rms_norm=False"
+            )
         if not apply_rms_norm and not write_residual_output:
             raise ValueError(
                 "write_residual_output must be True when apply_rms_norm is False; "
