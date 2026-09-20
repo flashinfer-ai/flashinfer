@@ -459,12 +459,16 @@ jobs:
             sudo chmod -R a+rX junit
           fi
 
-      - name: Upload JUnit XML
+      - name: Upload JUnit XML and telemetry
         if: ${{ always() && matrix.kind == 'h100' }}
         uses: actions/upload-artifact@v4
         with:
           name: junit-h100-${{ github.run_id }}-${{ github.run_attempt }}
-          path: junit/**/*.xml
+          path: |
+            junit/**/*.xml
+            junit/**/*.telemetry.json
+            junit/**/*.meta.json
+            junit/**/*.memory.csv
           if-no-files-found: warn
           retention-days: 30
 
