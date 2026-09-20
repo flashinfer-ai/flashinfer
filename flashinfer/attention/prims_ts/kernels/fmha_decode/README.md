@@ -386,7 +386,7 @@ Every Sage branch is a compile-time predicate on the configuration, so a
 that do not depend on the element width are written once and shared by every
 dtype: the exponent addend formed once per row, the rolled masked max pass
 with a compile-time tail location, the seeded probability sum chains, the CLC
-response slots in the unified SMEM block and one correction store wait per O
+response slot in the unified SMEM block and one correction store wait per O
 stage. The byte-wide-only policies (`prefetches_next_p_fragment`,
 `splits_kv_tile_256_tail_columns`, the four-stage KV256 ring) are measured
 performance choices gated on `use_8bit_qkv`, not dtype requirements.

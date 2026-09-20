@@ -127,6 +127,12 @@ from .reduction import (  # noqa: F401
 )
 
 _PERSISTENT_SCHEDULE_TOKEN_STAGES = 2
+# Response slots of the CLC work-queue fetch pipeline. Every warp role
+# consumes the queue one tile behind the scheduler warp, so a second slot
+# buys no lookahead; it only adds a loop-carried stage index to each role's
+# per-tile state, which the over-subscribed uniform register file demotes
+# to local memory. One slot makes the index a constant.
+_WORK_QUEUE_STAGES = 1
 
 
 def _block_sparse_bshd_tma_strides(
@@ -862,7 +868,7 @@ def _build_decode_gen_schedule(
     if use_clc_dynamic:
         num_consumer_threads = cfg.threads_per_cta
         wq_pipeline_config = PipelineConfig.create_clc_fetch_async_pipeline_cfg(
-            num_stages=_PERSISTENT_SCHEDULE_TOKEN_STAGES,
+            num_stages=_WORK_QUEUE_STAGES,
             num_bytes=16,
             producer_group=pipeline.CooperativeGroup(Agent.Thread),
             consumer_group=pipeline.CooperativeGroup(
@@ -1438,7 +1444,7 @@ def _build_decode_gen_schedule(
                     SmemAllocation(
                         "clc_response",
                         dtype=cutlass.Int128,
-                        count=_PERSISTENT_SCHEDULE_TOKEN_STAGES,
+                        count=_WORK_QUEUE_STAGES,
                         alignment=16,
                     )
                 )
