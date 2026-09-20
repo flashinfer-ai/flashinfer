@@ -4,6 +4,10 @@ from typing import Union
 
 import pytest
 import torch
+from tests.test_helpers.parametrize import (
+    pairwise_product_cases,
+    parametrize_product,
+)
 from tests.test_helpers.utils_fp4 import (
     cast_from_fp4,
     recover_swizzled_scales,
@@ -1173,54 +1177,53 @@ def test_trtllm_batch_decode_same_dtype_gqa_grouping(q_len_per_req: int):
     )
 
 
-@pytest.mark.parametrize("backend", ["trtllm-gen"])
-@pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
-@pytest.mark.parametrize(
-    "batch_size,q_len_per_req,page_size,num_kv_heads,head_grp_size",
-    [
-        (4, 1, 16, 2, 1),
-        (4, 1, 32, 2, 5),
-        (4, 2, 64, 2, 5),
-        (4, 3, 32, 2, 5),
-        (4, 3, 64, 2, 1),
-        (4, 4, 64, 4, 1),
-        (4, 5, 64, 4, 8),
-        (128, 1, 64, 2, 5),
-        (128, 2, 32, 4, 1),
-        (128, 3, 16, 4, 8),
-        (128, 4, 16, 2, 5),
-        (128, 5, 16, 2, 5),
-        (256, 1, 64, 4, 8),
-        (256, 2, 16, 2, 8),
-        (256, 3, 64, 4, 5),
-        (256, 4, 32, 2, 8),
-        (256, 5, 32, 2, 1),
-    ],
+@parametrize_product(
+    {
+        "backend": ["trtllm-gen"],
+        "kv_layout": ["HND", "NHD"],
+        "batch_size,q_len_per_req,page_size,num_kv_heads,head_grp_size": [
+            (4, 1, 16, 2, 1),
+            (4, 1, 32, 2, 5),
+            (4, 2, 64, 2, 5),
+            (4, 3, 32, 2, 5),
+            (4, 3, 64, 2, 1),
+            (4, 4, 64, 4, 1),
+            (4, 5, 64, 4, 8),
+            (128, 1, 64, 2, 5),
+            (128, 2, 32, 4, 1),
+            (128, 3, 16, 4, 8),
+            (128, 4, 16, 2, 5),
+            (128, 5, 16, 2, 5),
+            (256, 1, 64, 4, 8),
+            (256, 2, 16, 2, 8),
+            (256, 3, 64, 4, 5),
+            (256, 4, 32, 2, 8),
+            (256, 5, 32, 2, 1),
+        ],
+        "window_left": [-1, 127],
+        "q_dtype,kv_dtype,o_dtype": [
+            ("bf16", "bf16", "bf16"),
+            ("fp16", "fp16", "fp16"),
+            ("bf16", "fp8", "bf16"),
+            ("fp16", "fp8", "fp16"),
+            ("bf16", "fp8", "fp8"),
+            ("fp16", "fp8", "fp8"),
+            ("fp8", "fp8", "bf16"),
+            ("fp8", "fp8", "fp16"),
+            ("fp8", "fp8", "fp8"),
+            ("fp8", "fp8", "nvfp4"),
+            ("fp8", "nvfp4", "fp8"),
+        ],
+        "enable_pdl": [True, False, None],
+        "enable_sink": [True, False],
+        "max_in_kv_len": [110],
+        "head_dim": [128, 256],
+        "non_contiguous_query": [False, True],
+        "skips_softmax": [False, True],
+        "uses_shared_paged_kv_idx": [True, False],
+    },
+    regular=pairwise_product_cases,
 )
-@pytest.mark.parametrize("window_left", [-1, 127])
-@pytest.mark.parametrize(
-    "q_dtype,kv_dtype,o_dtype",
-    [
-        ("bf16", "bf16", "bf16"),
-        ("fp16", "fp16", "fp16"),
-        ("bf16", "fp8", "bf16"),
-        ("fp16", "fp8", "fp16"),
-        ("bf16", "fp8", "fp8"),
-        ("fp16", "fp8", "fp8"),
-        ("fp8", "fp8", "bf16"),
-        ("fp8", "fp8", "fp16"),
-        ("fp8", "fp8", "fp8"),
-        ("fp8", "fp8", "nvfp4"),
-        ("fp8", "nvfp4", "fp8"),
-    ],
-)
-@pytest.mark.parametrize("enable_pdl", [True, False, None])
-@pytest.mark.parametrize("enable_sink", [True, False])
-@pytest.mark.parametrize("max_in_kv_len", [110])
-@pytest.mark.parametrize("head_dim", [128, 256])
-@pytest.mark.parametrize("non_contiguous_query", [False, True])
-@pytest.mark.parametrize("skips_softmax", [False, True])
-@pytest.mark.parametrize("uses_shared_paged_kv_idx", [True, False])
 def test_trtllm_batch_decode(
     backend: str,
     kv_layout: str,
@@ -1501,28 +1504,25 @@ def test_bf16q_fp8kv_transform_modes_run():
     )
 
 
-@pytest.mark.parametrize("kv_layout", ["HND"])  # trtllm-gen only support HND
-@pytest.mark.parametrize(
-    "batch_size,q_len_per_req,page_size,num_kv_heads,head_grp_size",
-    [
-        (1, 1, 16, 8, 8),
-        (1, 1, 32, 8, 8),
-    ],
+@parametrize_product(
+    {
+        "kv_layout": ["HND"],
+        "batch_size,q_len_per_req,page_size,num_kv_heads,head_grp_size": [
+            (1, 1, 16, 8, 8),
+            (1, 1, 32, 8, 8),
+        ],
+        "window_left": [-1],
+        "q_dtype,kv_dtype,o_dtype": [("fp8", "fp8", "fp8")],
+        "enable_pdl": [None],
+        "enable_sink": [False],
+        "max_in_kv_len": [4096, 8192],
+        "head_dim": [128],
+        "device_scale": [True, False],
+        "skips_softmax": [False, True],
+        "uses_shared_paged_kv_idx": [True, False],
+    },
+    regular=pairwise_product_cases,
 )
-@pytest.mark.parametrize("window_left", [-1])
-@pytest.mark.parametrize(
-    "q_dtype,kv_dtype,o_dtype",
-    [
-        ("fp8", "fp8", "fp8"),
-    ],
-)
-@pytest.mark.parametrize("enable_pdl", [None])
-@pytest.mark.parametrize("enable_sink", [False])
-@pytest.mark.parametrize("max_in_kv_len", [4096, 8192])
-@pytest.mark.parametrize("head_dim", [128])
-@pytest.mark.parametrize("device_scale", [True, False])
-@pytest.mark.parametrize("skips_softmax", [False, True])
-@pytest.mark.parametrize("uses_shared_paged_kv_idx", [True, False])
 def test_trtllm_batch_decode_bs1(
     kv_layout: str,
     batch_size: int,
@@ -1589,39 +1589,38 @@ def test_trtllm_batch_decode_gpt_oss_counter_reuse():
     )
 
 
-@pytest.mark.parametrize("kv_layout", ["HND"])  # trtllm-gen only support HND
-@pytest.mark.parametrize(
-    "batch_size,q_len_per_req,page_size,num_kv_heads,head_grp_size",
-    [
-        (4, 1, 16, 2, 1),
-        (4, 1, 32, 2, 5),
-        (4, 3, 64, 2, 1),
-        (4, 4, 64, 4, 1),
-        (128, 3, 16, 4, 8),
-        (128, 4, 16, 2, 5),
-        (256, 4, 32, 2, 8),
-        (256, 5, 32, 2, 1),
-    ],
+@parametrize_product(
+    {
+        "kv_layout": ["HND"],
+        "batch_size,q_len_per_req,page_size,num_kv_heads,head_grp_size": [
+            (4, 1, 16, 2, 1),
+            (4, 1, 32, 2, 5),
+            (4, 3, 64, 2, 1),
+            (4, 4, 64, 4, 1),
+            (128, 3, 16, 4, 8),
+            (128, 4, 16, 2, 5),
+            (256, 4, 32, 2, 8),
+            (256, 5, 32, 2, 1),
+        ],
+        "window_left": [-1],
+        "q_dtype,kv_dtype,o_dtype": [
+            ("bf16", "bf16", "bf16"),
+            ("fp16", "fp16", "fp16"),
+            ("fp8", "fp8", "fp16"),
+            ("fp8", "fp8", "fp8"),
+            ("fp8", "fp8", "nvfp4"),
+            ("fp8", "nvfp4", "fp8"),
+        ],
+        "enable_pdl": [None],
+        "enable_sink": [False],
+        "max_in_kv_len": [110],
+        "head_dim": [256],
+        "device_scale": [True, False],
+        "skips_softmax": [False, True],
+        "uses_shared_paged_kv_idx": [True, False],
+    },
+    regular=pairwise_product_cases,
 )
-@pytest.mark.parametrize("window_left", [-1])
-@pytest.mark.parametrize(
-    "q_dtype,kv_dtype,o_dtype",
-    [
-        ("bf16", "bf16", "bf16"),
-        ("fp16", "fp16", "fp16"),
-        ("fp8", "fp8", "fp16"),
-        ("fp8", "fp8", "fp8"),
-        ("fp8", "fp8", "nvfp4"),
-        ("fp8", "nvfp4", "fp8"),
-    ],
-)
-@pytest.mark.parametrize("enable_pdl", [None])
-@pytest.mark.parametrize("enable_sink", [False])
-@pytest.mark.parametrize("max_in_kv_len", [110])
-@pytest.mark.parametrize("head_dim", [256])
-@pytest.mark.parametrize("device_scale", [True, False])
-@pytest.mark.parametrize("skips_softmax", [False, True])
-@pytest.mark.parametrize("uses_shared_paged_kv_idx", [True, False])
 def test_trtllm_batch_decode_head_dim_256(
     kv_layout: str,
     batch_size: int,
@@ -1664,34 +1663,33 @@ def test_trtllm_batch_decode_head_dim_256(
     )
 
 
-@pytest.mark.parametrize("kv_layout", ["HND"])  # trtllm-gen only support HND
-@pytest.mark.parametrize(
-    "batch_size,q_len_per_req,page_size,num_kv_heads,head_grp_size",
-    [
-        (1, 1, 16, 2, 1),
-        (1, 1, 32, 2, 5),
-        (1, 3, 64, 2, 1),
-        (1, 4, 64, 4, 1),
-        (32, 4, 16, 2, 8),
-        (32, 8, 16, 2, 8),
-        (32, 16, 16, 2, 8),
-    ],
+@parametrize_product(
+    {
+        "kv_layout": ["HND"],
+        "batch_size,q_len_per_req,page_size,num_kv_heads,head_grp_size": [
+            (1, 1, 16, 2, 1),
+            (1, 1, 32, 2, 5),
+            (1, 3, 64, 2, 1),
+            (1, 4, 64, 4, 1),
+            (32, 4, 16, 2, 8),
+            (32, 8, 16, 2, 8),
+            (32, 16, 16, 2, 8),
+        ],
+        "window_left": [-1],
+        "q_dtype,kv_dtype,o_dtype": [
+            ("bf16", "bf16", "bf16"),
+            ("fp8", "fp8", "fp8"),
+        ],
+        "enable_pdl": [None],
+        "enable_sink": [False],
+        "max_in_kv_len": [4096, 8192, 16384, 32768, 65536, 131072],
+        "head_dim": [128],
+        "device_scale": [True, False],
+        "skips_softmax": [False],
+        "uses_shared_paged_kv_idx": [True, False],
+    },
+    regular=pairwise_product_cases,
 )
-@pytest.mark.parametrize("window_left", [-1])
-@pytest.mark.parametrize(
-    "q_dtype,kv_dtype,o_dtype",
-    [
-        ("bf16", "bf16", "bf16"),
-        ("fp8", "fp8", "fp8"),
-    ],
-)
-@pytest.mark.parametrize("enable_pdl", [None])
-@pytest.mark.parametrize("enable_sink", [False])
-@pytest.mark.parametrize("max_in_kv_len", [4096, 8192, 16384, 32768, 65536, 131072])
-@pytest.mark.parametrize("head_dim", [128])
-@pytest.mark.parametrize("device_scale", [True, False])
-@pytest.mark.parametrize("skips_softmax", [False])
-@pytest.mark.parametrize("uses_shared_paged_kv_idx", [True, False])
 def test_trtllm_batch_decode_long_sequence_length(
     kv_layout: str,
     batch_size: int,
@@ -1734,11 +1732,16 @@ def test_trtllm_batch_decode_long_sequence_length(
     )
 
 
-@pytest.mark.parametrize("page_size", [128, 256, 512, 1024])
-@pytest.mark.parametrize("q_len_per_req", [1, 2])
-@pytest.mark.parametrize("window_left", [-1, 127])
-@pytest.mark.parametrize("uses_shared_paged_kv_idx", [True, False])
-@pytest.mark.parametrize("head_grp_size", [1, 5])
+@parametrize_product(
+    {
+        "page_size": [128, 256, 512, 1024],
+        "q_len_per_req": [1, 2],
+        "window_left": [-1, 127],
+        "uses_shared_paged_kv_idx": [True, False],
+        "head_grp_size": [1, 5],
+    },
+    regular=pairwise_product_cases,
+)
 def test_trtllm_batch_decode_dynamic_page_size(
     page_size: int,
     q_len_per_req: int,
@@ -1767,35 +1770,34 @@ def test_trtllm_batch_decode_dynamic_page_size(
     )
 
 
-@pytest.mark.parametrize("kv_layout", ["HND"])  # trtllm-gen only support HND
-@pytest.mark.parametrize(
-    "batch_size,q_len_per_req,page_size,num_kv_heads,head_grp_size",
-    [
-        (4, 1, 16, 2, 1),
-        (4, 1, 32, 2, 5),
-        (4, 3, 64, 4, 1),
-        (128, 3, 16, 4, 8),
-        (1, 6, 64, 2, 8),
-        (4, 8, 64, 2, 8),
-    ],
+@parametrize_product(
+    {
+        "kv_layout": ["HND"],
+        "batch_size,q_len_per_req,page_size,num_kv_heads,head_grp_size": [
+            (4, 1, 16, 2, 1),
+            (4, 1, 32, 2, 5),
+            (4, 3, 64, 4, 1),
+            (128, 3, 16, 4, 8),
+            (1, 6, 64, 2, 8),
+            (4, 8, 64, 2, 8),
+        ],
+        "window_left": [-1],
+        "q_dtype,kv_dtype,o_dtype": [
+            ("bf16", "bf16", "bf16"),
+            ("fp16", "fp16", "fp16"),
+            ("fp8", "fp8", "fp8"),
+            ("fp8", "fp8", "bf16"),
+        ],
+        "enable_pdl": [None],
+        "enable_sink": [False],
+        "max_in_kv_len": [110, 4096, 8192],
+        "head_dim": [512],
+        "device_scale": [True, False],
+        "skips_softmax": [False, True],
+        "uses_shared_paged_kv_idx": [True, False],
+    },
+    regular=pairwise_product_cases,
 )
-@pytest.mark.parametrize("window_left", [-1])
-@pytest.mark.parametrize(
-    "q_dtype,kv_dtype,o_dtype",
-    [
-        ("bf16", "bf16", "bf16"),
-        ("fp16", "fp16", "fp16"),
-        ("fp8", "fp8", "fp8"),
-        ("fp8", "fp8", "bf16"),
-    ],
-)
-@pytest.mark.parametrize("enable_pdl", [None])
-@pytest.mark.parametrize("enable_sink", [False])
-@pytest.mark.parametrize("max_in_kv_len", [110, 4096, 8192])
-@pytest.mark.parametrize("head_dim", [512])
-@pytest.mark.parametrize("device_scale", [True, False])
-@pytest.mark.parametrize("skips_softmax", [False, True])
-@pytest.mark.parametrize("uses_shared_paged_kv_idx", [True, False])
 def test_trtllm_batch_decode_head_dim_512(
     kv_layout: str,
     batch_size: int,
@@ -1979,53 +1981,52 @@ def make_query_non_contiguous(
     return q_non_contiguous
 
 
-@pytest.mark.parametrize("backend", ["trtllm-gen"])
-@pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
-@pytest.mark.parametrize(
-    "batch_size,max_q_len,page_size,num_kv_heads,head_grp_size,head_dim",
-    [
-        (4, 1, 16, 2, 1, 128),
-        (4, 1, 32, 2, 5, 128),
-        (4, 2, 64, 2, 5, 128),
-        (4, 3, 32, 2, 5, 128),
-        (4, 3, 64, 2, 1, 128),
-        (4, 4, 64, 4, 1, 128),
-        (4, 5, 64, 4, 8, 128),
-        # Iterate over head_dim 128, 256 for these configs to simplify
-        *[(bs, 4, 64, 4, 16, hd) for bs in [4, 8, 16, 32] for hd in [128, 256]],
-        (128, 1, 64, 2, 5, 128),
-        (128, 2, 32, 4, 1, 128),
-        (128, 3, 16, 4, 8, 128),
-        (128, 4, 16, 2, 5, 128),
-        (128, 5, 16, 2, 5, 128),
-        (256, 1, 64, 4, 8, 256),
-        (256, 2, 16, 2, 8, 256),
-        (256, 3, 64, 4, 5, 256),
-        (256, 4, 32, 2, 8, 256),
-        (256, 16, 32, 2, 8, 256),
-    ],
+@parametrize_product(
+    {
+        "backend": ["trtllm-gen"],
+        "kv_layout": ["HND", "NHD"],
+        "batch_size,max_q_len,page_size,num_kv_heads,head_grp_size,head_dim": [
+            (4, 1, 16, 2, 1, 128),
+            (4, 1, 32, 2, 5, 128),
+            (4, 2, 64, 2, 5, 128),
+            (4, 3, 32, 2, 5, 128),
+            (4, 3, 64, 2, 1, 128),
+            (4, 4, 64, 4, 1, 128),
+            (4, 5, 64, 4, 8, 128),
+            # Iterate over head_dim 128, 256 for these configs to simplify
+            *[(bs, 4, 64, 4, 16, hd) for bs in [4, 8, 16, 32] for hd in [128, 256]],
+            (128, 1, 64, 2, 5, 128),
+            (128, 2, 32, 4, 1, 128),
+            (128, 3, 16, 4, 8, 128),
+            (128, 4, 16, 2, 5, 128),
+            (128, 5, 16, 2, 5, 128),
+            (256, 1, 64, 4, 8, 256),
+            (256, 2, 16, 2, 8, 256),
+            (256, 3, 64, 4, 5, 256),
+            (256, 4, 32, 2, 8, 256),
+            (256, 16, 32, 2, 8, 256),
+        ],
+        "window_left": [-1, 127],
+        "q_dtype,kv_dtype,o_dtype": [
+            ("bf16", "bf16", "bf16"),
+            ("fp16", "fp16", "fp16"),
+            ("bf16", "fp8", "bf16"),
+            ("fp16", "fp8", "fp16"),
+            ("bf16", "fp8", "fp8"),
+            ("fp16", "fp8", "fp8"),
+            ("fp8", "fp8", "bf16"),
+            ("fp8", "fp8", "fp16"),
+            ("fp8", "fp8", "fp8"),
+            ("fp8", "fp8", "nvfp4"),
+        ],
+        "enable_pdl": [True, False, None],
+        "enable_sink": [True, False],
+        "max_in_kv_len": [110],
+        "skips_softmax": [False, True],
+        "uses_shared_paged_kv_idx": [False, True],
+    },
+    regular=pairwise_product_cases,
 )
-@pytest.mark.parametrize("window_left", [-1, 127])
-@pytest.mark.parametrize(
-    "q_dtype,kv_dtype,o_dtype",
-    [
-        ("bf16", "bf16", "bf16"),
-        ("fp16", "fp16", "fp16"),
-        ("bf16", "fp8", "bf16"),
-        ("fp16", "fp8", "fp16"),
-        ("bf16", "fp8", "fp8"),
-        ("fp16", "fp8", "fp8"),
-        ("fp8", "fp8", "bf16"),
-        ("fp8", "fp8", "fp16"),
-        ("fp8", "fp8", "fp8"),
-        ("fp8", "fp8", "nvfp4"),
-    ],
-)
-@pytest.mark.parametrize("enable_pdl", [True, False, None])
-@pytest.mark.parametrize("enable_sink", [True, False])
-@pytest.mark.parametrize("max_in_kv_len", [110])
-@pytest.mark.parametrize("skips_softmax", [False, True])
-@pytest.mark.parametrize("uses_shared_paged_kv_idx", [False, True])
 def test_trtllm_batch_decode_spec(
     backend: str,
     kv_layout: str,
