@@ -123,6 +123,26 @@ def test_qk_normalization_reference_and_graph(dtype):
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("q_rows,k_rows", [(1, 17), (63, 65), (65, 63)])
+@pytest.mark.parametrize("storage_offsets", [(0, 0), (1, 3)])
+def test_qk_normalization_partial_tiles(dtype, q_rows, k_rows, storage_offsets):
+    """Check independent row tails and contiguous views with unaligned bases."""
+    device = _supported_device()
+    from flashinfer.gdn_kernels.qk_l2norm import normalize_qk
+
+    torch.manual_seed(2026)
+    inputs = []
+    for rows, offset in zip((q_rows, k_rows), storage_offsets, strict=True):
+        storage = torch.randn(rows * 128 + offset, device=device, dtype=dtype)
+        inputs.append(storage[offset:].view(rows, 1, 128))
+    outputs = normalize_qk(*inputs)
+    for actual, source in zip(outputs, inputs, strict=True):
+        torch.testing.assert_close(
+            actual, _normalize_reference(source).to(dtype), rtol=1e-3, atol=1e-3
+        )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("q_rows,k_rows", [(0, 0), (0, 7), (7, 0)])
 def test_qk_normalization_empty_inputs(dtype, q_rows, k_rows):
     device = _supported_device()
