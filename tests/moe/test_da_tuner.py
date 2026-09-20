@@ -432,6 +432,39 @@ def test_singleton_pruning_preserves_preferred_distribution_eager_winner():
     assert compiled.eager_tactic == preferred_tactic
 
 
+def test_singleton_collapses_equivalent_selector_exemplars():
+    compiler = DAPlanCompiler(num_experts=4, guard_enabled=False)
+    tactic = FactorizedTactic((16, 4), tile_n=16, fc1=0, fc2=0)
+
+    compiled = compiler.compile(
+        (
+            _selection("uniform", [[0, 0], [1, 1]], tactic),
+            _selection("ddist:4", [[2, 2], [3, 3]], tactic),
+        ),
+        baseline_tactic=(64, 0),
+    )
+
+    assert compiled.policy is DAPlanMode.DA_SINGLE_BODY
+    assert len(compiled.selections) == 1
+    assert compiled.bodies == (tactic,)
+    assert compiled.exemplar_body_indices == (0,)
+
+
+def test_switch_rejects_equivalent_selector_exemplars():
+    compiler = DAPlanCompiler(num_experts=4, guard_enabled=False)
+    first_tactic = FactorizedTactic((16, 4), tile_n=16, fc1=0, fc2=0)
+    second_tactic = FactorizedTactic((32, 7), tile_n=32, fc1=1, fc2=1)
+
+    with pytest.raises(ValueError, match="selector exemplars must remain unique"):
+        compiler.compile(
+            (
+                _selection("uniform", [[0, 0], [1, 1]], first_tactic),
+                _selection("ddist:4", [[2, 2], [3, 3]], second_tactic),
+            ),
+            baseline_tactic=(64, 0),
+        )
+
+
 def test_nonlocal_assignment_changes_do_not_change_local_spectrum():
     first = torch.tensor([[4, 0], [4, 1], [5, 2], [6, 3]], dtype=torch.int32)
     second = torch.tensor([[4, 8], [4, 9], [5, 10], [6, 11]], dtype=torch.int32)
