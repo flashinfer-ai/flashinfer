@@ -280,7 +280,6 @@ def _issue_sparse_page_copies(
     kv_head,
     head_dim_stage: Constexpr[int],
     head_dim_stage_offset: Constexpr[int],
-    section: Constexpr[FmhaStage],
 ):
     """Issue physical page fragments through the selected loader schedule.
 
@@ -331,15 +330,16 @@ def _issue_sparse_page_copies(
         return
     if cutlass.const_expr(
         cfg.use_fp8_qkv
-        and section == FmhaStage.Loop
+        and cfg.use_flat_native_kv_tma
+        and cfg.use_persistent_scheduler
         and chunks > 1
         and fragments % cfg.load_num_warps == 0
     ):
         # A warp owns complete fragments across head planes. Its locator is
         # genuinely uniform: expose that before election so both TMA copies
         # reuse uniform coordinates instead of serializing lane operands.
-        # Keep lane-parallel reads in the prologue/drain, where sequential
-        # shared loads cannot hide behind the steady-state compute pipeline.
+        # General addressing retains its lane-parallel decode. One-shot
+        # kernels keep parallel shared loads to minimize startup latency.
         uniform_fragments_per_warp = fragments // cfg.load_num_warps
         uniform_warp = _load_task_warp_rank(cfg)
         for fragment_idx in cutlass.range_constexpr(uniform_fragments_per_warp):
@@ -1259,7 +1259,6 @@ class SmemKvTileResource(DecodeGenResourceBase):
                         logical_h_k_idx,
                         head_dim_stage,
                         head_dim_stage_offset,
-                        section,
                     )
                     return
                 if prims.elect_sync() and _load_task_warp_rank(cfg) < Int32(
@@ -1323,7 +1322,6 @@ class SmemKvTileResource(DecodeGenResourceBase):
                         logical_h_k_idx,
                         head_dim_stage,
                         head_dim_stage_offset,
-                        section,
                     )
                     return
                 # Bind the Array on every lane before entering staged control flow.
@@ -2843,7 +2841,6 @@ class SmemKvResource(DecodeGenResourceBase):
                         logical_h_k_idx,
                         head_dim_stage,
                         head_dim_stage_offset,
-                        section,
                     )
                     return
                 if cutlass.const_expr(cached_page_ids is None):
