@@ -796,12 +796,16 @@ def create_allreduce_fusion_workspace(
 # to every API it decorates. That decorator is not applicable here: it reads the
 # compute capability from a tensor argument, and workspace creation runs before
 # any tensor exists, so it would filter every backend out as unknown-capability.
-create_allreduce_fusion_workspace.is_backend_supported = _is_backend_supported
-create_allreduce_fusion_workspace.is_compute_capability_supported = (
+create_allreduce_fusion_workspace.is_backend_supported = (  # type: ignore[attr-defined]
+    _is_backend_supported
+)
+create_allreduce_fusion_workspace.is_compute_capability_supported = (  # type: ignore[attr-defined]
     _is_compute_capability_supported
 )
-create_allreduce_fusion_workspace.has_backend = _has_backend
-create_allreduce_fusion_workspace.has_backend_choices = _has_backend_choices
+create_allreduce_fusion_workspace.has_backend = _has_backend  # type: ignore[attr-defined]
+create_allreduce_fusion_workspace.has_backend_choices = (  # type: ignore[attr-defined]
+    _has_backend_choices
+)
 
 
 # ============================================================================
