@@ -280,12 +280,18 @@ Tensor ulysses_pcie_input_landing(fptr_t handle, TensorView output) {
   return *buffer->landing_owner;
 }
 
-void ulysses_pcie_exchange(fptr_t handle, TensorView input, TensorView output, int64_t mode,
-                           int64_t batch, int64_t seq, int64_t heads, int64_t dim) {
-  auto* transport = fi::AsTransport(handle);
-  ffi::CUDADeviceGuard device_guard(transport->device);
-  transport->EnsureHealthy();
-  auto* buffer = FindBuffer(transport, output);
+namespace {
+
+struct ExchangeBytes {
+  int64_t input;
+  int64_t output;
+};
+
+// The per-call operand checks shared by every route. Side-effect free, so the
+// RDMA routes can run them inside their abort envelope.
+ExchangeBytes ValidateExchangeOperands(const Transport* transport, const Buffer* buffer,
+                                       TensorView input, TensorView output, int64_t mode,
+                                       int64_t batch, int64_t seq, int64_t heads, int64_t dim) {
   TVM_FFI_ICHECK(buffer->connected) << "PCIe Ulysses output is not connected";
   const int64_t input_bytes = ValidateGeometry(input, mode, batch, seq, heads, dim,
                                                transport->world_size, false, transport->use_rdma);
@@ -302,12 +308,27 @@ void ulysses_pcie_exchange(fptr_t handle, TensorView input, TensorView output, i
       << "output is on the wrong CUDA device";
   TVM_FFI_ICHECK_EQ(input_bytes, output_bytes) << "input/output byte size mismatch";
   fi::CheckNoOverlap(input.data_ptr(), input_bytes, output.data_ptr(), output_bytes);
-  const auto current = get_stream(input.device());
+  return {input_bytes, output_bytes};
+}
+
+}  // namespace
+
+void ulysses_pcie_exchange(fptr_t handle, TensorView input, TensorView output, int64_t mode,
+                           int64_t batch, int64_t seq, int64_t heads, int64_t dim) {
+  auto* transport = fi::AsTransport(handle);
+  ffi::CUDADeviceGuard device_guard(transport->device);
+  transport->EnsureHealthy();
+  auto* buffer = FindBuffer(transport, output);
+  // `output` is the registered tensor FindBuffer just matched, so its device
+  // is the transport's even before the operands are validated.
+  const auto current = get_stream(output.device());
 
   if (!transport->use_rdma) {
+    const ExchangeBytes bytes =
+        ValidateExchangeOperands(transport, buffer, input, output, mode, batch, seq, heads, dim);
     fi::BindGeometry(transport, buffer, mode, batch, seq, heads, dim, get_element_size(input),
-                     output_bytes);
-    const void* source = fi::BindInput(transport, buffer, input, input_bytes, current);
+                     bytes.output);
+    const void* source = fi::BindInput(transport, buffer, input, bytes.input, current);
     try {
       fi::CheckCuda(
           fi::EnqueueBarrier(buffer->signals, buffer->peer_signals.data(), transport->world_size,
@@ -331,11 +352,16 @@ void ulysses_pcie_exchange(fptr_t handle, TensorView input, TensorView output, i
   }
 
   try {
-    // Keep every shape rebind and staging operation inside the hybrid failure
-    // envelope. A local UMR/CUDA setup failure can then publish the sticky abort
-    // immediately instead of making peers consume the full barrier timeout.
+    // Keep the operand checks, every shape rebind and staging operation inside
+    // the hybrid failure envelope. A rank that rejects its own operands, or
+    // fails UMR/CUDA setup, then publishes the sticky abort immediately instead
+    // of leaving peers already in the opening barrier waiting without a
+    // deadline.
+    const ExchangeBytes bytes =
+        ValidateExchangeOperands(transport, buffer, input, output, mode, batch, seq, heads, dim);
+    const int64_t input_bytes = bytes.input;
     fi::BindGeometry(transport, buffer, mode, batch, seq, heads, dim, get_element_size(input),
-                     output_bytes);
+                     bytes.output);
     const void* source = fi::BindInput(transport, buffer, input, input_bytes, current);
 
     const uint32_t payload = fi::CheckedPayload(input_bytes, transport->world_size);
