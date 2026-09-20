@@ -29,6 +29,11 @@ from ...jit.core import JitSpec, gen_jit_spec, logger, sm103a_nvcc_flags
 
 _OPERATOR_DIR = "cake_mxfp8_megamoe_ep16"
 _MANIFEST = "cake_mxfp8_megamoe_ep16_manifest.json"
+_POLICIES = {
+    f"{family}_{protocol}": (tile_n, protocol)
+    for family, tile_n in (("mixed", "mixed"), ("n16", 16), ("n32", 32))
+    for protocol in ("cta0", "all_cta")
+}
 
 
 def _get_csrc_root() -> Path:
@@ -58,20 +63,64 @@ def _get_flashinfer_header_dirs() -> list[Path]:
     raise FileNotFoundError("FlashInfer JIT headers were not found")
 
 
-def _read_manifest() -> tuple[Path, dict[str, Any]]:
-    csrc_root = _get_csrc_root()
+def _read_manifest(csrc_root: Path | None = None) -> tuple[Path, dict[str, Any]]:
+    csrc_root = _get_csrc_root() if csrc_root is None else Path(csrc_root)
     path = csrc_root / _OPERATOR_DIR / _MANIFEST
     manifest = json.loads(path.read_text())
-    if manifest.get("schema") != "flashinfer.experimental.source_closure.v1":
+    if manifest.get("schema") != "flashinfer.experimental.source_closure.v2":
         raise RuntimeError("Cake MXFP8 MegaMoE manifest has an unexpected schema")
     sequences = manifest.get("sequences")
-    if not isinstance(sequences, list) or len(sequences) != 1:
-        raise RuntimeError("Cake MXFP8 MegaMoE manifest must contain one sequence")
-    sequence = sequences[0]
+    if not isinstance(sequences, list) or len(sequences) != len(_POLICIES):
+        raise RuntimeError(
+            "Cake MXFP8 MegaMoE manifest must contain six policy sequences"
+        )
+    if any(not isinstance(sequence, dict) for sequence in sequences):
+        raise RuntimeError("Cake MXFP8 MegaMoE policy sequences must be mappings")
+    ids = [sequence.get("policy_id") for sequence in sequences]
+    if any(not isinstance(policy_id, str) for policy_id in ids) or set(ids) != set(
+        _POLICIES
+    ):
+        raise RuntimeError(
+            "Cake MXFP8 MegaMoE manifest has missing or duplicate policies"
+        )
+    reducers = set()
+    devices = set()
+    bindings = set()
+    for sequence in sequences:
+        _validate_sequence(csrc_root, sequence)
+        units = sequence["translation_units"]
+        devices.update(units["devices"])
+        reducers.add(
+            (
+                units["devices"][1],
+                sequence["closure"][1]["sha256"],
+                sequence["reducer_symbol"],
+            )
+        )
+        bindings.add(units["binding"])
+    if len(reducers) != 1 or len(devices) != 7 or len(bindings) != 6:
+        raise RuntimeError(
+            "Cake MXFP8 MegaMoE policies must share exactly one ordered reducer"
+        )
+    return csrc_root, manifest
+
+
+def _validate_sequence(csrc_root: Path, sequence: dict[str, Any]) -> None:
+    tile_n, protocol = _POLICIES[sequence["policy_id"]]
     if (
         sequence.get("arch") != "sm_103a"
         or sequence.get("ffi_entry") != "run"
         or sequence.get("setup_ffi_entry") != "setup_tma"
+        or sequence.get("tile_n") != tile_n
+        or sequence.get("return_protocol") != protocol
+        or sequence.get("row_segments")
+        != ([32, 16, 16] if tile_n == "mixed" else [tile_n] * (64 // tile_n))
+        or sequence.get("runtime_tokens_per_rank") != [1, 64]
+        or sequence.get("launches_per_call") != 2
+        or sequence.get("setup_launches") != 1
+        or sequence.get("tma_descriptor_count") != 8
+        or sequence.get("dynamic_smem_bytes") != (72704 if tile_n == 16 else 76800)
+        or sequence.get("compile_flags") != ["--use_fast_math"]
     ):
         raise RuntimeError("Cake MXFP8 MegaMoE manifest has an unexpected ABI")
 
@@ -93,7 +142,9 @@ def _read_manifest() -> tuple[Path, dict[str, Any]]:
         relative = PurePosixPath(raw_path)
         if (
             relative.is_absolute()
-            or relative.parts[:1] != ("csrc",)
+            or relative.parts[:3] != ("csrc", _OPERATOR_DIR, "sm_103a")
+            or len(relative.parts) != 4
+            or relative.suffix != ".cu"
             or ".." in relative.parts
         ):
             raise RuntimeError(f"invalid generated source path: {relative}")
@@ -114,7 +165,7 @@ def _read_manifest() -> tuple[Path, dict[str, Any]]:
     binding = translation_units.get("binding")
     if (
         not isinstance(devices, list)
-        or len(devices) != 3
+        or len(devices) != 2
         or not all(isinstance(path, str) for path in devices)
         or not isinstance(binding, str)
         or closure_paths != [*devices, binding]
@@ -143,15 +194,20 @@ def _read_manifest() -> tuple[Path, dict[str, Any]]:
         digest = hashlib.sha256(source.read_bytes()).hexdigest()
         if digest != artifact["sha256"]:
             raise RuntimeError(f"generated source digest mismatch: {source}")
-    return csrc_root, manifest
 
 
 @functools.cache
-def gen_cake_mxfp8_megamoe_ep16_module() -> JitSpec:
+def gen_cake_mxfp8_megamoe_ep16_module(policy_id: str = "mixed_cta0") -> JitSpec:
     """Create the exact-SM103a JIT specification from the sealed closure."""
 
     csrc_root, manifest = _read_manifest()
-    sequence = manifest["sequences"][0]
+    if policy_id not in _POLICIES:
+        raise ValueError(f"unsupported Cake MXFP8 MegaMoE policy: {policy_id!r}")
+    sequence = next(
+        sequence
+        for sequence in manifest["sequences"]
+        if sequence["policy_id"] == policy_id
+    )
     translation_units = sequence["translation_units"]
     relative_sources = [
         *translation_units["devices"],
@@ -191,17 +247,19 @@ def _check_exact_sm103a(device: Any = None) -> None:
 
 
 @functools.cache
-def _build_and_load() -> Any:
-    module = gen_cake_mxfp8_megamoe_ep16_module().build_and_load()
+def _build_and_load(policy_id: str) -> Any:
+    module = gen_cake_mxfp8_megamoe_ep16_module(policy_id).build_and_load()
     logger.info("Loaded Cake MXFP8 MegaMoE EP16 module")
     return module
 
 
-def load_cake_mxfp8_megamoe_ep16_module(*, device: Any = None) -> Any:
+def load_cake_mxfp8_megamoe_ep16_module(
+    *, device: Any = None, policy_id: str = "mixed_cta0"
+) -> Any:
     """Build or load the generated module for an exact SM103a device."""
 
     _check_exact_sm103a(device)
-    return _build_and_load()
+    return _build_and_load(policy_id)
 
 
 __all__ = [

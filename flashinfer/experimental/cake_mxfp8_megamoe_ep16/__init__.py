@@ -28,8 +28,7 @@ if TYPE_CHECKING:
 
 
 def preprocess_weights(
-    w13: torch.Tensor,
-    w2: torch.Tensor,
+    w13: torch.Tensor, w2: torch.Tensor
 ) -> CakeMxfp8MegaMoeEp16Weights:
     from .backend import preprocess_cake_mxfp8_megamoe_ep16_weights
 
@@ -41,6 +40,8 @@ def create_session(
     topk_ids: torch.Tensor,
     *,
     process_group: dist.ProcessGroup | None = None,
+    tile_n: int | str = "mixed",
+    return_protocol: str = "auto",
 ) -> Any:
     from .backend import CakeMxfp8MegaMoeEp16
 
@@ -48,6 +49,8 @@ def create_session(
         weights,
         topk_ids,
         process_group=process_group,
+        tile_n=tile_n,
+        return_protocol=return_protocol,
     )
 
 

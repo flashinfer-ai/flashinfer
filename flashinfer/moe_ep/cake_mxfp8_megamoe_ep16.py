@@ -29,7 +29,7 @@ from ..api_logging import flashinfer_experimental_api
 
 @dataclass(frozen=True)
 class CakeMxfp8MegaMoeEp16Weights:
-    """Kernel-ready rank-local MXFP8 weights and packed E8M0 scales."""
+    """Reusable kernel-ready rank-local MXFP8 weights and packed E8M0 scales."""
 
     w13: torch.Tensor
     w13_scale: torch.Tensor
@@ -39,11 +39,9 @@ class CakeMxfp8MegaMoeEp16Weights:
 
 @flashinfer_experimental_api(feature="Cake MXFP8 MegaMoE EP16 weight preprocessing")
 def preprocess_cake_mxfp8_megamoe_ep16_weights(
-    w13: torch.Tensor,
-    w2: torch.Tensor,
+    w13: torch.Tensor, w2: torch.Tensor
 ) -> CakeMxfp8MegaMoeEp16Weights:
-    """Prepare rank-local BF16 expert weights for the specialized backend."""
-
+    """Prepare rank-local BF16 expert weights once for reuse across sessions."""
     from ..experimental.cake_mxfp8_megamoe_ep16 import preprocess_weights
 
     return preprocess_weights(w13, w2)
@@ -55,12 +53,24 @@ def CakeMxfp8MegaMoeEp16(
     topk_ids: torch.Tensor,
     *,
     process_group: dist.ProcessGroup | None = None,
+    tile_n: int | str = "mixed",
+    return_protocol: str = "auto",
 ) -> Any:
-    """Create a prepared session for the specialized EP16 execution path."""
+    """Create a prepared EP16 session with a runtime batch extent of 1..64.
 
+    ``tile_n="mixed"`` is the throughput route. Pin ``tile_n=16`` or ``32``
+    across sessions for uniform arithmetic. ``return_protocol`` independently
+    chooses ``"cta0"``, ``"all_cta"`` or automatic selection.
+    """
     from ..experimental.cake_mxfp8_megamoe_ep16 import create_session
 
-    return create_session(weights, topk_ids, process_group=process_group)
+    return create_session(
+        weights,
+        topk_ids,
+        process_group=process_group,
+        tile_n=tile_n,
+        return_protocol=return_protocol,
+    )
 
 
 __all__ = [
