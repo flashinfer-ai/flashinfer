@@ -1432,9 +1432,9 @@ def _correctness_body(rank, world_size, group, backend):
 
 def _destination_passing_body(rank, world_size, group, backend):
     B, S_local, H, D = 2, 7, 24, 32
-    max_elems = B * S_local * H * D
+    max_bytes = B * S_local * H * D * torch.bfloat16.itemsize
     comm = UlyssesCommunicator(
-        group, max_elems=max_elems, dtype=torch.bfloat16, backend=backend
+        group, max_bytes=max_bytes, dtype=torch.bfloat16, backend=backend
     )
     assert comm.backend == backend
     workspace = comm.create_workspace()
@@ -1521,7 +1521,7 @@ def _head_chunk_body(rank, world_size, group, arg):
     max_payload_elems = 3 * B * S_local * world_size * max(schedule) * D
     comm = UlyssesCommunicator(
         group,
-        max_elems=max_payload_elems,
+        max_bytes=max_payload_elems * dtype.itemsize,
         dtype=dtype,
         backend=backend,
     )
