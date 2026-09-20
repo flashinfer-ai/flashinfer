@@ -485,6 +485,9 @@ def test_summary_block_size_reaches_only_proxy_kernels(use_proxy_routes: bool) -
     assert cfg.sage_k_summary_block_size == (1 if use_proxy_routes else 0)
     assert cfg.sage_mixed_k_geometry == use_proxy_routes
     assert cfg.sage_summary_k_groups_per_fragment == (32 if use_proxy_routes else 2)
+    # One scale per summary score: the max pass writes proxy tiles back
+    # dequantized and the P pass needs no summary scales.
+    assert cfg.sage_summary_scores_dequantized == use_proxy_routes
     if use_proxy_routes:
         assert cfg.sage_k_scales_in_smem_for(cfg.sage_summary_k_groups_per_fragment)
         assert not cfg.sage_k_scales_in_smem

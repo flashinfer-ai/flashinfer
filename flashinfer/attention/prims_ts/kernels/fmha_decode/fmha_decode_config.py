@@ -2353,6 +2353,24 @@ class FmhaDecodeConfig:
             != self.sage_k_groups_per_fragment
         )
 
+    @property
+    def sage_summary_scores_dequantized(self) -> bool:
+        """Whether the max pass writes a proxy tile's summary scores back dequantized.
+
+        A mixed geometry whose summaries take one scale per score dequantizes
+        each score while folding its maximum: ``(s - bias) * sfK`` is the
+        fold's own product, and the write-back carries it in place of the
+        quantized score. The P pass then exponentiates every summary score
+        with the row's single ``c * sfQ`` multiplier and needs neither the
+        summary scales nor the bias. Proxy tiles of a mixed plan always take
+        the rolled masked pass, which is the pass that writes fragments back.
+        """
+        return (
+            self.sage_mixed_k_geometry
+            and self.sage_summary_k_groups_per_fragment
+            == self.softmax_score_fragment_regs
+        )
+
     def sage_k_scales_in_smem_for(self, groups: int) -> bool:
         """Whether a tile with ``groups`` scale groups per fragment keeps ``sfK`` in SMEM.
 

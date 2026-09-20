@@ -362,12 +362,14 @@ take one scale per summary (`k_summary_block_size=1`) while its exact routes
 keep the 16-token block; the kernel then reads the two route kinds' scales
 with their own group geometry and strategy (register array for blocks of 16
 and larger, an SMEM ring for 4 and 1), selected per tile on the route kind.
-A mixed geometry costs: the proxy kernel carries both geometries' softmax
-passes and gathers the summary scales in its softmax warps, so SOL proxy runs
-at 1.23x (INT8) and 1.26x (FP8) the time of equal block sizes with a one-token
-summary block (B200, CUDA Graph replay minimum; exact-only plans are
-unaffected); use it where the summary precision (INT8 summaries with widely
-spread block magnitudes) is worth it, and equal block sizes otherwise. `v_summary` holds the per-block V means (the final partial
+A mixed geometry costs: the proxy kernel carries both geometries' max
+passes and gathers the summary scales in its softmax warps (a one-token
+summary block writes its scores back dequantized, so its P pass needs no
+summary scales), so SOL proxy runs at 1.12x (INT8) and 1.07x (FP8) the time
+of equal block sizes with a one-token summary block (B200, CUDA Graph replay
+minimum; exact-only plans are unaffected); use it where the summary precision
+(INT8 summaries with widely spread block magnitudes) is worth it, and equal
+block sizes otherwise. `v_summary` holds the per-block V means (the final partial
 block averages only its structural tokens) quantized to E4M3 with the shared
 `v_scale`; with `v_mean`, build them from `V - v_mean`. A proxy block stands
 for as many identical tokens as it covers, so its mass enters the proxy

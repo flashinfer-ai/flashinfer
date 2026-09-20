@@ -474,14 +474,43 @@ class SmemPResource(DecodeGenResourceBase):
         exp_scale = None
         scales_view = None
         summary_view = None
-        mixed_scales: Constexpr[bool] = cfg.sage_mixed_k_geometry
+        # Summary scores that come back dequantized from the max pass take the
+        # row's ``c * sfQ`` as their only multiplier and carry no bias. When
+        # the exact strategy reads the routed register words, a proxy tile's
+        # words are ones and that strategy serves every tile unchanged; an
+        # exact strategy reading its SMEM ring (which a proxy tile leaves
+        # unfilled) keeps the per-fragment selection, with the row multiplier
+        # on the proxy side. Other mixed geometries select the summary
+        # strategy per fragment.
+        summary_dequantized: Constexpr[bool] = cfg.sage_summary_scores_dequantized
+        exact_scales_in_smem: Constexpr[bool] = cfg.sage_k_scales_in_smem_for(
+            cfg.sage_k_groups_per_fragment
+        )
+        unified_scales: Constexpr[bool] = (
+            summary_dequantized and not exact_scales_in_smem
+        )
+        mixed_scales: Constexpr[bool] = cfg.sage_mixed_k_geometry and not unified_scales
+        score_bias = None
+        row_multipliers = None
+        row_addends = None
         if cutlass.const_expr(cfg.use_sage_attention):
             exp_scale = self.scale_softmax_log2 * sage_q_scale
             scales_view = self.sage_k_scales.open(stage_info, sage_scale_arr, exp_scale)
-            if cutlass.const_expr(mixed_scales):
+            if cutlass.const_expr(mixed_scales and not summary_dequantized):
                 summary_view = self.sage_summary_k_scales.open(
                     stage_info, sage_scale_arr, exp_scale
                 )
+            if cutlass.const_expr(mixed_scales and summary_dequantized):
+                row_multipliers = cutlass.Array(
+                    Float32, 1, space=cutlass.AddressSpace.rmem
+                )
+                row_addends = cutlass.Array(Float32, 1, space=cutlass.AddressSpace.rmem)
+                row_multipliers[0] = exp_scale
+                row_addends[0] = exponent_addend
+            if cutlass.const_expr(unified_scales and cfg.uses_int32_scores):
+                score_bias = Float32(INT32_SCORE_BIAS)
+                if route_is_proxy:
+                    score_bias = Float32(0.0)
 
         # The loop scales a whole fragment before its first exponential and
         # issues the next fragment's TMEM load once the scale FFMAs have
@@ -511,13 +540,18 @@ class SmemPResource(DecodeGenResourceBase):
                 # in place with its own strategy and scale-group geometry, so
                 # nothing but the scores crosses the branch.
                 if route_is_proxy:
-                    self._scale_fragment_with(
-                        self.sage_summary_k_scales,
-                        summary_view,
-                        fragment,
-                        s_arr,
-                        exponent_addend,
-                    )
+                    if cutlass.const_expr(summary_dequantized):
+                        self._scale_fragment_pairs(
+                            s_arr, row_addends, row_multipliers, groups=1
+                        )
+                    else:
+                        self._scale_fragment_with(
+                            self.sage_summary_k_scales,
+                            summary_view,
+                            fragment,
+                            s_arr,
+                            exponent_addend,
+                        )
                 else:
                     self._scale_fragment_with(
                         self.sage_k_scales,
@@ -534,7 +568,7 @@ class SmemPResource(DecodeGenResourceBase):
                     )
                     self.sage_k_scales.advance(scales_view)
                 group_multipliers, group_addends = self._fragment_exponent_terms(
-                    fragment_multipliers, exponent_addend
+                    fragment_multipliers, exponent_addend, score_bias=score_bias
                 )
                 self._scale_fragment_pairs(s_arr, group_addends, group_multipliers)
             # The last iteration reloads its own fragment so the loop body
@@ -696,6 +730,7 @@ class SmemPResource(DecodeGenResourceBase):
         fragment_multipliers: cutlass.Array | None,
         exponent_addend: Float32,
         groups: Constexpr[int | None] = None,
+        score_bias: Float32 | None = None,
     ) -> tuple[cutlass.Array, cutlass.Array]:
         """Return one fragment's exponent multipliers and addends per scale group.
 
@@ -703,10 +738,14 @@ class SmemPResource(DecodeGenResourceBase):
         from the scale strategy (``fragment_multipliers``); without Sage the
         single group holds the softmax scale. Every group starts from the
         row's addend; biased INT32 scores subtract ``bias * multiplier`` per
-        group.
+        group, with ``score_bias`` (the row's bias, zero on a tile whose
+        scores come back dequantized) in place of the constant when given.
         """
         cfg = self.cfg
         groups = _groups_or_default(cfg, groups)
+        neg_bias = Float32(-INT32_SCORE_BIAS)
+        if cutlass.const_expr(score_bias is not None):
+            neg_bias = -score_bias
         group_multipliers = cutlass.Array(
             Float32, groups, space=cutlass.AddressSpace.rmem
         )
@@ -725,7 +764,7 @@ class SmemPResource(DecodeGenResourceBase):
             # noise. Groups leave in pairs through one packed FMA, so the
             # one-token K block (one score per group) spends the same
             # instruction count as a packed subtract per score pair would.
-            bias_pair = (Float32(-INT32_SCORE_BIAS), Float32(-INT32_SCORE_BIAS))
+            bias_pair = (neg_bias, neg_bias)
             for group_base in cutlass.range_constexpr(0, groups - groups % 2, 2):
                 group_addends[group_base], group_addends[group_base + 1] = (
                     cute.arch.fma_packed_f32x2(
@@ -740,7 +779,7 @@ class SmemPResource(DecodeGenResourceBase):
             if cutlass.const_expr(groups % 2 == 1):
                 group_addends[groups - 1] = Float32(
                     cute.math.fma(
-                        Float32(-INT32_SCORE_BIAS),
+                        neg_bias,
                         Float32(group_multipliers[groups - 1]),
                         exponent_addend,
                     )
