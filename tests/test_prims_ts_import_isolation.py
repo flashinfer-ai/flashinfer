@@ -196,3 +196,8 @@ def test_prims_ts_directory_still_collects_without_cutlass_experimental(tmp_path
         "module scope, add it to collect_ignore in tests/prims_ts/conftest.py.\n"
         f"exit={result.returncode}\n{result.stdout}\n{result.stderr}"
     )
+    assert "test_moe_compile_cache.py" not in result.stdout
+    assert (
+        "test_moe_api_signature.py::test_prims_ts_fp8_positional_contract_matches_trtllm"
+        in result.stdout
+    )
