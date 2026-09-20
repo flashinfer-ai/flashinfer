@@ -3709,23 +3709,26 @@ def test_grouped_q_token_kv_block_sparse_physical_sparse_pages_match_torch_refer
 
 
 @_REQUIRES_PRIMS_TS_ATTENTION
-def test_fp8_grouped_cache_stride_rebinding_graph() -> None:
+@pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float8_e4m3fn))
+@pytest.mark.parametrize("kv_heads", (1, 2))
+def test_grouped_cache_stride_rebinding_graph(
+    dtype: torch.dtype, kv_heads: int
+) -> None:
     """Compact and padded page strides must not share incompatible TensorMaps."""
     torch.manual_seed(82173)
-    group, heads, dim, page, context, topk = 8, 12, 256, 20, 1280, 16
+    group, dim, page, context, topk = 8, 256, 20, 1280, 16
+    heads = 12 * kv_heads
     rows, pages = 20, context // page
-    query = torch.randn(rows, heads, dim, device="cuda", dtype=torch.bfloat16).to(
-        torch.float8_e4m3fn
-    )
+    query = torch.randn(rows, heads, dim, device="cuda", dtype=torch.bfloat16).to(dtype)
     cache = tuple(
-        torch.randn(2 * pages, 1, page, dim, device="cuda", dtype=torch.bfloat16).to(
-            query.dtype
-        )
+        torch.randn(
+            2 * pages, kv_heads, page, dim, device="cuda", dtype=torch.bfloat16
+        ).to(query.dtype)
         for _ in range(2)
     )
     padded = tuple(
         torch.zeros(
-            2 * pages, 1, page + 4, dim, device="cuda", dtype=torch.bfloat16
+            2 * pages, kv_heads, page + 4, dim, device="cuda", dtype=torch.bfloat16
         ).to(query.dtype)[:, :, :page]
         for _ in range(2)
     )
@@ -3771,7 +3774,7 @@ def test_fp8_grouped_cache_stride_rebinding_graph() -> None:
         qo_indptr.numel() - 1,
         group,
         heads,
-        1,
+        kv_heads,
         dim,
         4,
         page,
@@ -3786,17 +3789,32 @@ def test_fp8_grouped_cache_stride_rebinding_graph() -> None:
     )
     tokens = torch.arange(context, device="cuda")
     physical = table[requests.long()[:, None], tokens[None, :] // page].long()
-    keys = cache[0][physical, 0, tokens[None, :] % page].float()
-    values = cache[1][physical, 0, tokens[None, :] % page].float()
+    head = torch.arange(kv_heads, device="cuda")
+    keys = cache[0][
+        physical[:, :, None], head, (tokens[None, :] % page)[:, :, None]
+    ].float()
+    values = cache[1][
+        physical[:, :, None], head, (tokens[None, :] % page)[:, :, None]
+    ].float()
 
     def check():
         visible = (tokens[None, :, None] // 4 == blocks[:, None, :]).any(-1)
         visible |= tokens[None, :] // 4 == (positions[:, None] + 1) // 4
         visible &= tokens[None, :] <= positions[:, None]
-        scores = torch.einsum("qhd,qtd->qht", query.float(), keys) * dim**-0.5
-        scores.masked_fill_(~visible[:, None, :], -torch.inf)
-        expected = torch.einsum("qht,qtd->qhd", scores.softmax(-1), values)
-        torch.testing.assert_close(output.float(), expected, rtol=0.05, atol=0.05)
+        scores = (
+            torch.einsum(
+                "qhrd,qthd->qhrt", query.float().view(rows, kv_heads, 12, dim), keys
+            )
+            * dim**-0.5
+        )
+        scores.masked_fill_(~visible[:, None, None, :], -torch.inf)
+        expected = torch.einsum(
+            "qhrt,qthd->qhrd", scores.softmax(-1), values
+        ).reshape_as(output)
+        tolerance = 0.02 if dtype == torch.bfloat16 else 0.05
+        torch.testing.assert_close(
+            output.float(), expected, rtol=tolerance, atol=tolerance
+        )
 
     for bound_cache in (cache, padded, cache):
 

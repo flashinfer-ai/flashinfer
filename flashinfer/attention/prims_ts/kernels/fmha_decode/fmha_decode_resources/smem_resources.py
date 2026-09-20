@@ -273,7 +273,7 @@ def _issue_sparse_page_copies(
     head_dim_stage: Constexpr[int],
     head_dim_stage_offset: Constexpr[int],
 ):
-    """Partition (head-dim chunk, physical fragment) copies across loader lanes.
+    """Issue physical page fragments through the selected loader schedule.
 
     The cache writer zero-fills page padding: full-fragment tail loads rely
     on this because score masking alone does not sanitize NaN/Inf in V.
@@ -281,10 +281,46 @@ def _issue_sparse_page_copies(
     chunk_hd = min(head_dim_stage, 128 if cfg.use_fp8_qkv else 64)
     chunks = head_dim_stage // chunk_hd
     fragments = cfg.tile_size_kv // cfg.num_tokens_per_page
+    warp = _load_task_warp_rank(cfg)
+    if cutlass.const_expr(
+        cfg.use_flat_native_kv_tma
+        and cfg.kv_dtype == cutlass.BFloat16
+        and fragments % cfg.load_num_warps == 0
+    ):
+        # Prefetch warp-owned locators before TMA issue and reuse each across
+        # BF16's head chunks. Static indexing keeps the small array in registers.
+        fragments_per_warp = fragments // cfg.load_num_warps
+        if prims.elect_sync():
+            locators = cutlass.Array(
+                Int32, (fragments_per_warp,), space=cutlass.AddressSpace.rmem
+            )
+            for i in cutlass.range_constexpr(fragments_per_warp):
+                fragment = warp * Int32(fragments_per_warp) + Int32(i)
+                locators[i] = page_offsets.page_id(tile_idx, local_tile_idx, fragment)
+            for i in cutlass.range_constexpr(fragments_per_warp):
+                fragment = warp * Int32(fragments_per_warp) + Int32(i)
+                token_offset, physical_page = _decode_native_page_locator(
+                    cfg, locators[i]
+                )
+                for chunk in cutlass.range_constexpr(chunks):
+                    smem_offset = Int32(
+                        chunk * chunk_hd * cfg.tile_size_kv
+                    ) + fragment * Int32(chunk_hd * cfg.num_tokens_per_page)
+                    prims.cp_async_bulk_tensor_shared_cta_global(
+                        stage_base.subview(smem_offset),
+                        tma_desc,
+                        (
+                            Int32(head_dim_stage_offset + chunk * chunk_hd),
+                            token_offset,
+                            kv_head,
+                            physical_page,
+                        ),
+                        barrier,
+                    )
+        return
     copies = fragments * chunks
     copies_per_warp = (copies + cfg.load_num_warps - 1) // cfg.load_num_warps
     lane = cute.arch.thread_idx()[0] & Int32(31)
-    warp = _load_task_warp_rank(cfg)
     for iteration in cutlass.range_constexpr((copies_per_warp + 31) // 32):
         local_copy = lane + Int32(iteration * 32)
         copy = warp * Int32(copies_per_warp) + local_copy

@@ -3405,7 +3405,7 @@ def _prepare_prims_ts_batch_decode_plan(
         flat_native_kv_tma=(
             use_q_token_kv_block_sparse_route
             and spec.config.uses_staged_one_inst_tmem_p
-            and spec.config.use_fp8_qkv
+            and query.dtype in (torch.bfloat16, torch.float8_e4m3fn)
             and spec.config.has_storage_subpages
             and num_kv_heads == 1
             and k_cache.is_contiguous()
