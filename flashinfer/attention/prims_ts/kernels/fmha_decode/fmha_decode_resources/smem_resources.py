@@ -328,6 +328,43 @@ def _issue_sparse_page_copies(
                         barrier,
                     )
         return
+    if cutlass.const_expr(
+        cfg.use_fp8_qkv and chunks > 1 and fragments % cfg.load_num_warps == 0
+    ):
+        # A warp owns complete fragments across head planes. Its locator is
+        # genuinely uniform: expose that before election so both TMA copies
+        # reuse uniform coordinates instead of serializing lane operands.
+        uniform_fragments_per_warp = fragments // cfg.load_num_warps
+        uniform_warp = _load_task_warp_rank(cfg)
+        for fragment_idx in cutlass.range_constexpr(uniform_fragments_per_warp):
+            uniform_fragment = uniform_warp * Int32(uniform_fragments_per_warp) + Int32(
+                fragment_idx
+            )
+            uniform_locator = cute.arch.make_warp_uniform(
+                page_offsets.page_id(tile_idx, local_tile_idx, uniform_fragment)
+            )
+            uniform_token_offset, uniform_page = _decode_native_page_locator(
+                cfg, uniform_locator, kv_head
+            )
+            if prims.elect_sync():
+                for head_chunk in cutlass.range_constexpr(chunks):
+                    uniform_smem_offset = Int32(
+                        head_chunk * chunk_hd * cfg.tile_size_kv
+                    ) + uniform_fragment * Int32(chunk_hd * cfg.num_tokens_per_page)
+                    prims.cp_async_bulk_tensor_shared_cta_global(
+                        stage_base.subview(uniform_smem_offset),
+                        tma_desc,
+                        (
+                            Int32(head_dim_stage_offset + head_chunk * chunk_hd),
+                            uniform_token_offset,
+                            Int32(0)
+                            if cutlass.const_expr(cfg.use_flat_native_kv_tma)
+                            else kv_head,
+                            uniform_page,
+                        ),
+                        barrier,
+                    )
+        return
     copies = fragments * chunks
     copies_per_warp = (copies + cfg.load_num_warps - 1) // cfg.load_num_warps
     lane = cute.arch.thread_idx()[0] & Int32(31)
