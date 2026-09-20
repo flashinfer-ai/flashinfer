@@ -695,16 +695,12 @@ class DAPlanCompiler:
         if baseline_tactic is None:
             raise ValueError("A DA plan requires an ordinary baseline tactic")
 
-        # Preserve unique exemplars in upload order while deduplicating exact complete tactics
-        # into stable first-seen conditional bodies.
-        exemplar_fingerprints: set[bytes] = set()
+        # Deduplicate exact complete tactics before requiring selector identity. A singleton plan
+        # never runs the selector, so equivalent spectra can safely share one uploaded row. A
+        # multi-body plan must keep every selector spectrum distinct to avoid ambiguous dispatch.
         bodies: list[FactorizedTactic] = []
         body_indices: list[int] = []
         for selection in selections:
-            fingerprint = self._selector_spectrum_fingerprint(selection)
-            if fingerprint in exemplar_fingerprints:
-                raise ValueError("DA selector exemplars must remain unique")
-            exemplar_fingerprints.add(fingerprint)
             if selection.selected_tactic not in bodies:
                 bodies.append(selection.selected_tactic)
             body_indices.append(bodies.index(selection.selected_tactic))
@@ -716,6 +712,18 @@ class DAPlanCompiler:
         candidate_policy = (
             DAPlanMode.DA_SINGLE_BODY if len(bodies) == 1 else DAPlanMode.DA_SWITCH
         )
+        published_selections: list[DAProfileSelection] = []
+        published_body_indices: list[int] = []
+        exemplar_fingerprints: set[bytes] = set()
+        for selection, body_index in zip(selections, body_indices, strict=True):
+            fingerprint = self._selector_spectrum_fingerprint(selection)
+            if fingerprint in exemplar_fingerprints:
+                if candidate_policy is DAPlanMode.DA_SWITCH:
+                    raise ValueError("DA selector exemplars must remain unique")
+                continue
+            exemplar_fingerprints.add(fingerprint)
+            published_selections.append(selection)
+            published_body_indices.append(body_index)
         admitted, reason = self._guard_admits(candidate_policy, selections)
         policy = candidate_policy if admitted else DAPlanMode.DA_FALLBACK
         eager_tactic, eager_distribution = self._select_eager_tactic(
@@ -724,9 +732,9 @@ class DAPlanCompiler:
         return DACompiledPlan(
             candidate_policy=candidate_policy,
             policy=policy,
-            selections=tuple(selections),
+            selections=tuple(published_selections),
             bodies=tuple(bodies),
-            exemplar_body_indices=tuple(body_indices),
+            exemplar_body_indices=tuple(published_body_indices),
             baseline_tactic=baseline_tactic,
             eager_tactic=eager_tactic,
             eager_distribution=eager_distribution,
