@@ -66,11 +66,13 @@ from .helpers_common import (
     _sparse_task_cache_route_count,
     _warp_broadcast_i32,
 )
+from ....sage import log2_block_size
 from .sage_scales import (
     SageKScales,
     block_sparse_k_scale_source,
     load_k_scale,
     route_scale_word_position,
+    sage_word_position,
     sage_k_scale_words,
     sage_staged_k_scale_words,
 )
@@ -1237,57 +1239,159 @@ class SmemBlockSparseSoftmaxMetadataResource(DecodeGenResourceBase):
         kv_head_idx, batch_idx = _logical_head_batch(
             stage_info, self.h_k_idx, self.b_idx
         )
-        scale_addr, scale_head_stride, scale_seq_len, log2_k_block_size = scale_source
         exact_groups = cfg.sage_k_groups_per_fragment
-        summary_groups = cfg.sage_summary_k_groups_per_fragment
-        num_words = Int32(sage_k_scale_words(cfg, exact_groups))
-        if cutlass.const_expr(cfg.sage_mixed_k_geometry):
-            # Both geometries resolve every word at trace time; the route kind
-            # selects between them, so the load warp stays branch-free.
-            if route_is_proxy:
-                num_words = Int32(sage_k_scale_words(cfg, summary_groups))
         num_origins = self.route_layout.logical_origins_per_route
         lane_idx = cute.arch.thread_idx()[0] & Int32(0x1F)
-        max_words = sage_staged_k_scale_words(cfg)
-        for chunk in cutlass.range_constexpr((max_words + 31) // 32):
-            word_idx = lane_idx + Int32(chunk * 32)
-            atom_idx, token_offset = route_scale_word_position(
-                cfg, word_idx, exact_groups
+        # A staged-array view built here keeps its base pointer outside the
+        # rolled loop, which the store inside the loop then reuses.
+        staged = cutlass.Array(
+            self._smem_scales.data_ptr(),
+            dtype=Float32,
+            shape=(self.staging_layout.total_words,),
+            addrspace=3,
+        )
+        if cutlass.const_expr(cfg.sage_mixed_k_geometry):
+            # Proxy routes of a mixed plan gather their summary scales in the
+            # softmax warps (``load_route_sage_k_scales``), where the loads
+            # hide behind the score wait; staging them here would put their
+            # latency on the load warp between two routes. Exact routes stage
+            # as usual.
+            if not route_is_proxy:
+                self._stage_route_sage_k_scale_words(
+                    staged,
+                    stage_base,
+                    resolved_record_word,
+                    resolved_origin1,
+                    scale_source,
+                    kv_head_idx,
+                    batch_idx,
+                    lane_idx=lane_idx,
+                    groups=exact_groups,
+                    num_origins=num_origins,
+                )
+        else:
+            self._stage_route_sage_k_scale_words(
+                staged,
+                stage_base,
+                resolved_record_word,
+                resolved_origin1,
+                scale_source,
+                kv_head_idx,
+                batch_idx,
+                lane_idx=lane_idx,
+                groups=exact_groups,
+                num_origins=num_origins,
             )
-            if cutlass.const_expr(cfg.sage_mixed_k_geometry):
-                summary_atom_idx, summary_token_offset = route_scale_word_position(
-                    cfg, word_idx, summary_groups
-                )
-                if route_is_proxy:
-                    atom_idx = summary_atom_idx
-                    token_offset = summary_token_offset
-            atom_idx = cute.math.min(atom_idx, Int32(num_origins - 1))
-            if cutlass.const_expr(
-                num_origins == 2 and not self.route_layout.uses_one_warp_transport
-            ):
-                origin = Int32(resolved_record_word)
-                if atom_idx != Int32(0):
-                    origin = Int32(resolved_origin1)
-            else:
-                origin = Int32(
-                    cute.arch.shuffle_sync(Int32(resolved_record_word), atom_idx)
-                )
-            if word_idx < Int32(num_words):
-                k_scale = load_k_scale(
+
+    @cute.jit
+    def _stage_route_sage_k_scale_words(
+        self,
+        staged: cutlass.Array,
+        stage_base: Int32,
+        resolved_record_word: Int32,
+        resolved_origin1: Int32,
+        scale_source: tuple,
+        kv_head_idx: Int32,
+        batch_idx: Int32,
+        *,
+        lane_idx: Int32,
+        groups: Constexpr[int],
+        num_origins: Constexpr[int],
+    ) -> None:
+        """Stage the ``sfK`` words of one scale-group geometry, consecutive words per lane.
+
+        Lane ``l`` owns words ``l * words_per_lane`` onward. Consecutive words
+        of one lane lie in one fragment of one spatial half (``words_per_lane``
+        divides the group count), so the lane resolves one atom origin and
+        loads its words at the group stride in one batch, and the geometry
+        with 32 groups per fragment stages 256 words with eight loads per lane
+        instead of eight dependent chunks.
+        """
+
+        cfg = self.cfg
+        scale_addr, scale_head_stride, scale_seq_len, log2_k_block_size = scale_source
+        num_words = sage_k_scale_words(cfg, groups)
+        words_per_lane = max(1, num_words // 32)
+        assert words_per_lane * 32 >= num_words and groups % words_per_lane == 0
+        group_tokens = cfg.softmax_score_fragment_regs // groups
+        first_word = lane_idx * Int32(words_per_lane)
+        atom_idx, token_offset = route_scale_word_position(cfg, first_word, groups)
+        atom_idx = cute.math.min(atom_idx, Int32(num_origins - 1))
+        if cutlass.const_expr(
+            num_origins == 2 and not self.route_layout.uses_one_warp_transport
+        ):
+            origin = Int32(resolved_record_word)
+            if atom_idx != Int32(0):
+                origin = Int32(resolved_origin1)
+        else:
+            origin = Int32(
+                cute.arch.shuffle_sync(Int32(resolved_record_word), atom_idx)
+            )
+        if first_word < Int32(num_words):
+            first_token = cute.math.max(origin, Int32(0)) + token_offset
+            word_base = (
+                stage_base
+                + Int32(self.staging_layout.sage_scale_words_word_offset)
+                + first_word
+            )
+            for entry in cutlass.range_constexpr(words_per_lane):
+                staged[word_base + Int32(entry)] = load_k_scale(
                     cfg,
                     scale_addr,
                     scale_head_stride,
                     kv_head_idx=kv_head_idx,
                     batch_idx=batch_idx,
                     seq_len_kv=scale_seq_len,
-                    kv_token_idx=cute.math.max(origin, Int32(0)) + token_offset,
+                    kv_token_idx=first_token + Int32(entry * group_tokens),
                     log2_k_block_size=log2_k_block_size,
                 )
-                self._smem_scales[
-                    stage_base
-                    + Int32(self.staging_layout.sage_scale_words_word_offset)
-                    + word_idx
-                ] = k_scale
+
+    @cute.jit
+    def _gather_route_summary_scales(
+        self, stage_info: StageInfo, stage_base: Int32, words: cutlass.Array
+    ) -> None:
+        """Fill the summary strategy's tile with ``k_summary_scale`` words from global memory.
+
+        A proxy route of a mixed-geometry plan stages no scale words: the
+        instance's threads read the route's atom origins from the staged
+        record and gather one summary scale per word into the SMEM ring,
+        ahead of the score wait that hides the loads.
+        """
+
+        cfg = self.cfg
+        groups = cfg.sage_summary_k_groups_per_fragment
+        num_origins = self.staging_layout.num_origin_words
+        origins = cutlass.Array(Int32, num_origins, space=cutlass.AddressSpace.rmem)
+        for atom in cutlass.range_constexpr(num_origins):
+            origins[atom] = Int32(self._smem_words[stage_base + Int32(atom)])
+        kv_head_idx, batch_idx = _logical_head_batch(
+            stage_info, self.h_k_idx, self.b_idx
+        )
+        scale_addr = self.k_summary_scale_ptr.toint()
+        scale_head_stride = self.k_summary_scale_head_stride
+        summary_seq_len = Int32(cfg.num_proxy_summaries)
+        log2_k_block_size = Int32(log2_block_size(cfg.sage_k_summary_block_size))
+
+        def word_value(word_idx: Int32, half: Int32, lane_entry: Int32) -> Float32:
+            _ = word_idx
+            atom_idx, token_offset = sage_word_position(cfg, half, lane_entry, groups)
+            atom_idx = cute.math.min(atom_idx, Int32(num_origins - 1))
+            origin = Int32(origins[0])
+            for atom in cutlass.range_constexpr(1, num_origins):
+                if atom_idx == Int32(atom):
+                    origin = Int32(origins[atom])
+            return load_k_scale(
+                cfg,
+                scale_addr,
+                scale_head_stride,
+                kv_head_idx=kv_head_idx,
+                batch_idx=batch_idx,
+                seq_len_kv=summary_seq_len,
+                kv_token_idx=cute.math.max(origin, Int32(0)) + token_offset,
+                log2_k_block_size=log2_k_block_size,
+            )
+
+        self.sage_summary_k_scales.load_tile(stage_info, word_value, words)
 
     @consumer_work(returns=softmax_sage_k_scales)
     @cute.jit
@@ -1326,7 +1430,7 @@ class SmemBlockSparseSoftmaxMetadataResource(DecodeGenResourceBase):
                 )
             )
             if route_is_proxy:
-                self.sage_summary_k_scales.load_tile(stage_info, word_value, words)
+                self._gather_route_summary_scales(stage_info, stage_base, words)
             else:
                 self.sage_k_scales.load_tile(stage_info, word_value, words)
         else:

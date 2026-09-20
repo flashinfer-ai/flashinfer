@@ -160,11 +160,13 @@ def sage_k_scale_words(cfg: FmhaDecodeConfig, groups: int | None = None) -> int:
 
 
 def sage_staged_k_scale_words(cfg: FmhaDecodeConfig) -> int:
-    """Return the ``sfK`` words a block-sparse route stages: the larger geometry."""
-    return max(
-        sage_k_scale_words(cfg, cfg.sage_k_groups_per_fragment),
-        sage_k_scale_words(cfg, cfg.sage_summary_k_groups_per_fragment),
-    )
+    """Return the ``sfK`` words a block-sparse route stages.
+
+    Exact routes stage their words; proxy routes of a mixed-geometry plan
+    gather theirs in the softmax warps, so the staged area covers the exact
+    geometry alone.
+    """
+    return sage_k_scale_words(cfg, cfg.sage_k_groups_per_fragment)
 
 
 @cute.jit

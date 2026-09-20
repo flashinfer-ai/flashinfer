@@ -488,7 +488,9 @@ def test_summary_block_size_reaches_only_proxy_kernels(use_proxy_routes: bool) -
     if use_proxy_routes:
         assert cfg.sage_k_scales_in_smem_for(cfg.sage_summary_k_groups_per_fragment)
         assert not cfg.sage_k_scales_in_smem
-        assert sage_scales.sage_staged_k_scale_words(cfg) == 2 * 4 * 32
+        # Proxy routes gather their words in the softmax warps; staging
+        # covers the exact geometry.
+        assert sage_scales.sage_staged_k_scale_words(cfg) == 2 * 4 * 2
     else:
         assert sage_scales.sage_staged_k_scale_words(cfg) == 2 * 4 * 2
 
