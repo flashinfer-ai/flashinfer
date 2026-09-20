@@ -23,8 +23,14 @@ boundary itself observable.
 
 ``allocate_guarded`` returns ONE owning allocation laid out as::
 
-    owner: [ prefix guard | padding | payload | suffix guard | slack ]
-            ^0             ^guard_bytes  ^payload_start ^payload_end
+    owner: [ padding | prefix guard | payload | suffix guard | slack ]
+            ^0        ^payload_start-guard_bytes ^payload_start ^payload_end
+
+* The prefix guard sits *immediately* before the payload, so a store that
+  lands at ``payload_start - 1`` is inside the guard instead of in unreachable
+  alignment padding.  (The padding in front of that guard stays 0x00 and is the
+  one region a guarded run does not scan; it exists only to satisfy the
+  alignment step.)
 
 * ``payload`` is a view of ``owner`` -- one allocation, one free.  No separate
   guard allocation can be freed while the payload is still in flight, and the
@@ -63,6 +69,7 @@ replace, ``compute-sanitizer --tool memcheck`` for a device-wide claim.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Sequence
 
@@ -161,9 +168,11 @@ def allocate_guarded(
     sliced, expanded), a nonzero storage offset, a view into a larger storage,
     and non-strided layouts (sparse / quantized / nested).
 
-    The guards are armed before this returns, so a bare ``verify_guards()``
-    right after the call is already meaningful.  ``guard_bytes`` bounds the
-    largest overrun the test intends to catch.
+    The payload is aligned to ``alignment`` while its storage offset stays a
+    multiple of the element size, so a narrow ``alignment`` never makes the
+    payload un-viewable.  The guards are armed before this returns, so a bare
+    ``verify_guards()`` right after the call is already meaningful.
+    ``guard_bytes`` bounds the largest overrun the test intends to catch.
     """
     if isinstance(shape, torch.Tensor):
         template = shape
@@ -205,14 +214,22 @@ def allocate_guarded(
     for dim in shape:
         payload_nbytes *= dim
 
-    # ``alignment`` extra bytes absorb the padding needed to align the payload
-    # at whatever address the allocator hands back; the remainder past the
-    # suffix guard is slack of the same size, left at the 0x00 fill.
+    # The payload offset has to satisfy two constraints at once: the caller's
+    # address alignment, and the dtype view's requirement that the storage
+    # offset be a multiple of ``dtype.itemsize`` (``owner[1:].view(torch.float32)``
+    # is rejected even though the bytes are there).  The least common multiple
+    # is the smallest step satisfying both, so an ``alignment`` smaller than the
+    # element size -- ``alignment=1`` with float32, which the tests use -- still
+    # produces a legal view instead of being rejected or misaligned.
+    step = math.lcm(alignment, dtype.itemsize)
+    # ``step`` extra bytes absorb the padding needed to align the payload at
+    # whatever address the allocator hands back; everything past the suffix
+    # guard is slack, left at the 0x00 fill.
     device = torch.device(device)
     owner = torch.zeros(
-        2 * guard_bytes + alignment + payload_nbytes, dtype=torch.uint8, device=device
+        2 * guard_bytes + step + payload_nbytes, dtype=torch.uint8, device=device
     )
-    payload_start = guard_bytes + (-(owner.data_ptr() + guard_bytes) % alignment)
+    payload_start = guard_bytes + (-(owner.data_ptr() + guard_bytes) % step)
     payload_end = payload_start + payload_nbytes
     payload = owner[payload_start:payload_end].view(dtype).view(shape)
     assert payload.data_ptr() == owner.data_ptr() + payload_start
@@ -221,7 +238,7 @@ def allocate_guarded(
     buffer = GuardedBuffer(
         owner=owner,
         payload=payload,
-        prefix_guard=owner[:guard_bytes],
+        prefix_guard=owner[payload_start - guard_bytes : payload_start],
         suffix_guard=owner[payload_end : payload_end + guard_bytes],
         payload_start=payload_start,
         payload_end=payload_end,
@@ -341,7 +358,12 @@ def _write_guards(buffer: GuardedBuffer) -> None:
 
 def _scan(buffer: GuardedBuffer) -> list[GuardCorruption]:
     regions = (
-        ("prefix", buffer.prefix_guard, PREFIX_SENTINEL, 0),
+        (
+            "prefix",
+            buffer.prefix_guard,
+            PREFIX_SENTINEL,
+            buffer.payload_start - buffer.guard_bytes,
+        ),
         ("suffix", buffer.suffix_guard, SUFFIX_SENTINEL, buffer.payload_end),
     )
     hits = []

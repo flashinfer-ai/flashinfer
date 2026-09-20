@@ -21,6 +21,8 @@ integration lives in ``test_guard_zone_kernel.py`` (A3-12).
 import gc
 import weakref
 
+import math
+
 import pytest
 import torch
 
@@ -54,14 +56,22 @@ def test_layout_is_one_allocation_with_a_tight_suffix_guard():
 
     assert buffer.owner.dtype == torch.uint8
     assert buffer.owner.numel() == (
-        2 * buffer.guard_bytes + buffer.alignment + buffer.payload_nbytes
+        2 * buffer.guard_bytes
+        + math.lcm(buffer.alignment, buffer.payload.element_size())
+        + buffer.payload_nbytes
     )
-    assert buffer.prefix_guard.data_ptr() == buffer.owner.data_ptr()
+    # The prefix guard ends where the payload starts -- no unscanned padding
+    # between them, so a store at ``payload_start - 1`` is inside the guard.
+    assert (
+        buffer.prefix_guard.data_ptr() == buffer.payload.data_ptr() - buffer.guard_bytes
+    )
     assert buffer.payload.data_ptr() == buffer.owner.data_ptr() + buffer.payload_start
     assert buffer.payload_start >= buffer.guard_bytes
-    # Padding between the prefix guard and the payload is smaller than the
-    # alignment it exists to satisfy.
-    assert buffer.payload_start - buffer.guard_bytes < buffer.alignment
+    # Padding in front of the prefix guard is smaller than the alignment step
+    # it exists to satisfy.
+    assert buffer.payload_start - buffer.guard_bytes < math.lcm(
+        buffer.alignment, buffer.payload.element_size()
+    )
     # Payload and both guards share one storage: one allocation, one free, so
     # the guards cannot be released out from under a running kernel.
     assert (
@@ -88,7 +98,7 @@ def test_padding_and_slack_are_initialized_but_never_compared(device):
     """A3-01: only guard bytes are armed; the rest of the owner stays 0x00."""
     buffer = allocate_guarded((3, 5), torch.uint8, device, alignment=256)
 
-    padding = buffer.owner[buffer.guard_bytes : buffer.payload_start]
+    padding = buffer.owner[: buffer.payload_start - buffer.guard_bytes]
     slack = buffer.owner[buffer.payload_end + buffer.guard_bytes :]
     assert int(padding.count_nonzero()) == 0
     assert int(slack.count_nonzero()) == 0
@@ -117,6 +127,54 @@ def test_prefix_injection_reports_region_and_offset():
     assert hit.expected == PREFIX_SENTINEL
     assert hit.corrupted_bytes == 8
     assert hit.device == torch.device("cuda", torch.cuda.current_device())
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_the_byte_before_the_payload_is_guarded(device):
+    """A3-07: an underrun that stops one byte short of the payload is caught.
+
+    The payload offset is aligned, so padding can precede it.  A prefix guard
+    anchored at the owner start instead of next to the payload would leave that
+    padding unscanned and report a clean run for a store at ``payload_start-1``.
+    """
+    buffer = allocate_guarded((4, 32), torch.float32, device, alignment=256)
+    buffer.owner[buffer.payload_start - 1] = 0x00
+
+    with pytest.raises(GuardZoneCorruption) as excinfo:
+        verify_guards()
+    (hit,) = excinfo.value.hits
+    assert hit.region == "prefix"
+    assert hit.offset == buffer.guard_bytes - 1
+    assert hit.owner_offset == buffer.payload_start - 1
+    assert hit.actual == 0x00
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_alignment_below_the_element_size_keeps_the_payload_viewable(device):
+    """A3-08: alignment=1 with float32 still yields a legal, aligned payload.
+
+    The payload offset must satisfy the address alignment *and* keep the storage
+    offset a multiple of the element size, which a raw ``% alignment`` can miss
+    when ``guard_bytes`` is not a multiple of ``itemsize``.
+    """
+    buffer = allocate_guarded((5, 3), torch.float32, device, guard_bytes=7, alignment=1)
+
+    # ``storage_offset`` is in payload elements, so the byte offset the dtype
+    # view had to divide evenly is ``storage_offset * element_size``.
+    assert (
+        buffer.payload.storage_offset() * buffer.payload.element_size()
+        == buffer.payload_start
+    )
+    assert buffer.payload.data_ptr() % 1 == 0
+    assert buffer.payload.dtype == torch.float32
+    assert buffer.payload.shape == torch.Size((5, 3))
+    # The prefix guard still ends exactly at the payload.
+    assert (
+        buffer.prefix_guard.data_ptr() == buffer.payload.data_ptr() - buffer.guard_bytes
+    )
+    reset_guards()
+    buffer.payload.fill_(2.5)
+    verify_guards()
 
 
 def test_suffix_injection_reports_region_and_offset():
@@ -230,7 +288,9 @@ def test_odd_shapes_and_alignments_keep_the_payload_legal(
     assert buffer.payload.shape == torch.Size(shape)
     assert buffer.payload.dtype == dtype
     assert buffer.payload.data_ptr() == buffer.owner.data_ptr() + buffer.payload_start
-    assert buffer.payload_start - buffer.guard_bytes < alignment
+    assert buffer.payload_start - buffer.guard_bytes < math.lcm(
+        alignment, buffer.payload.element_size()
+    )
 
     # Round-tripping the whole payload, odd byte count included, neither reads
     # a guard byte nor writes one.
