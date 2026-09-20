@@ -84,26 +84,30 @@ def test_registered_template_discovery_is_import_order_independent():
 
 def test_formerly_order_dependent_templates_are_discovered():
     labels = {label for _, _, label in collect_registered_trace_templates()}
-    assert {
-        "concat_mla_k",
-        "ulysses_scatter_heads",
-        "ulysses_gather_heads",
-    } <= labels
+    assert "concat_mla_k" in labels
 
+    # Modules whose import may legitimately fail on a host (missing CUDA
+    # runtime pieces, optional dependencies); their templates are required
+    # only where the module imports.
     optional_labels = {
-        "flashinfer.comm.allreduce": "allreduce_fusion",
-        "flashinfer.comm.dcp_alltoall": "decode_cp_a2a_alltoall",
-        "flashinfer.cute_dsl.attention.wrappers.batch_mla": ("cute_dsl_batch_mla_run"),
+        "flashinfer.comm.allreduce": ("allreduce_fusion",),
+        "flashinfer.comm.dcp_alltoall": ("decode_cp_a2a_alltoall",),
+        "flashinfer.comm.ulysses": (
+            "ulysses_scatter_heads",
+            "ulysses_gather_heads",
+            "ulysses_exchange_chunks",
+        ),
+        "flashinfer.cute_dsl.attention.wrappers.batch_mla": ("cute_dsl_batch_mla_run",),
         "flashinfer.cute_dsl.attention.wrappers.batch_prefill": (
-            "cute_dsl_batch_prefill_run"
+            "cute_dsl_batch_prefill_run",
         ),
     }
-    for module_name, label in optional_labels.items():
+    for module_name, module_labels in optional_labels.items():
         try:
             importlib.import_module(module_name)
         except ImportError:
             continue
-        assert label in labels
+        assert set(module_labels) <= labels, module_name
 
 
 def _collect_parametrized_nodeids(

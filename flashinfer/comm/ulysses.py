@@ -187,9 +187,12 @@ class UlyssesCommunicator:
 
     - ``backend="auto"``: the fused-transpose NVLink-P2P kernel when the group
       is a verified single-node all-pairs NVLink mesh with a supported world
-      size (2/4/6/8); NCCL otherwise — including when NVLink runtime
-      initialization fails after a positive topology decision. Inspect
-      :attr:`backend` and :attr:`fallback_reason` for the outcome.
+      size (2/4/6/8); where NVLink is unavailable and
+      ``FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1`` is set on every rank,
+      the experimental PCIe transport below (it warns once); NCCL otherwise —
+      including when NVLink runtime initialization fails after a positive
+      topology decision. Inspect :attr:`backend` and :attr:`fallback_reason`
+      for the outcome.
     - ``backend="nvlink"``: force the fused kernel; raises on every rank
       (before any IPC/JIT for topology failures) when it cannot be used.
     - ``backend="pcie"``: explicitly enable the experimental single-node PCIe
@@ -199,8 +202,9 @@ class UlyssesCommunicator:
       ``FLASHINFER_ULYSSES_PCIE_ROUTE`` (``auto``/``p2p``/``rdma``/``hybrid``)
       forces all-P2P, all-RDMA at any multi-rank world size, or the
       eight-rank 4+4 NUMA hybrid (same-NUMA CUDA P2P plus cross-NUMA mlx5).
-      It uses explicitly allocated outputs registered at ``max_bytes``, and
-      is never selected by ``"auto"``.
+      Multi-rank outputs are registered up front with :meth:`allocate_output`
+      (there are no staging workspaces); ``"auto"`` reaches this backend only
+      behind the opt-in above.
     - ``backend="nccl"``: force the ``dist.all_to_all_single`` path; skips
       the topology/NVML probe and all IPC/JIT entirely (the constructor
       still resolves and guards the CUDA device and performs CUDA-backed
@@ -248,10 +252,17 @@ class UlyssesCommunicator:
     - Multi-rank PCIe calls require an explicit ``out`` returned by
       :meth:`allocate_output`. This keeps registration lifetime and overwrite
       points explicit; pre-register one output per live result and geometry.
-    - A PCIe transport failure is not recoverable: registered buffers, queue
+    - A rejection before native code runs (a bad operand, a refused capture,
+      a second stream) is decided from the call's own arguments, so under the
+      SPMD contract every rank rejects it: the RDMA routes raise the ordinary
+      error and stay usable, while the all-P2P route, whose barrier has no
+      abort protocol, poisons teardown and enters BROKEN. A failure inside
+      the transport is fail-stop on every route: registered buffers, queue
       pairs and the GPU epoch counters may already be half-mutated, so the
-      communicator enters a BROKEN state that rejects further collectives and
-      permits only a collective :meth:`close`.
+      communicator enters BROKEN and permits only a collective :meth:`close`.
+      On the RDMA routes it publishes a sticky abort that releases the peers
+      and ``close()`` completes; on all-P2P ``close()`` refuses to synchronize
+      and reports that the process must exit.
     - Each rank may use a different CUDA device (e.g. ``cuda:rank``); ranks
       must agree on ``max_bytes``, ``dtype`` and ``backend``.
 
@@ -313,7 +324,10 @@ class UlyssesCommunicator:
             ``torch.float8_e5m2``.
         backend : str, default = "auto"
             Backend selection policy. ``"auto"`` probes topology and prefers
-            NVLink when supported, otherwise falls back to NCCL. ``"nvlink"``
+            NVLink when supported, then the experimental PCIe transport where
+            NVLink is unavailable and
+            ``FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1`` is set on every
+            rank, otherwise falls back to NCCL. ``"nvlink"``
             forces the NVLink backend and raises if unavailable. ``"pcie"``
             explicitly enables the experimental single-node 1/2/4/8-rank
             PCIe transport. ``"nccl"`` forces the NCCL path.
@@ -1510,18 +1524,18 @@ class UlyssesCommunicator:
             Preallocated contiguous output with shape
             ``[B, S_local * world_size, H // world_size, D]``. Supplying it
             removes the public output allocation. It must not alias ``x``
-            when ``world_size > 1``.
-        workspace : UlyssesWorkspace, optional
-            Reusable NCCL pack/receive storage. Supplying it removes the two
-            NCCL staging allocations. It is validated but unused by the
-            NVLink backend, which owns IPC staging internally.
-            Multi-rank PCIe requires an output returned by
-            :meth:`allocate_output`.
+            when ``world_size > 1``. Multi-rank PCIe requires an output
+            returned by :meth:`allocate_output`.
         dtype : torch.dtype, optional
             Element type for this call, overriding the communicator dtype.
             pcie backend only. ``max_bytes`` is denominated in bytes, so a
             narrower dtype here simply fits more elements in the same
             capacity.
+        workspace : UlyssesWorkspace, optional
+            Reusable NCCL pack/receive storage. Supplying it removes the two
+            NCCL staging allocations. It is validated but unused by the
+            NVLink backend, which owns IPC staging internally, and rejected
+            by the multi-rank pcie backend, which has no staging buffers.
 
         Returns
         -------
@@ -1834,18 +1848,18 @@ class UlyssesCommunicator:
             Preallocated contiguous output with shape
             ``[B, S_global // world_size, H_local * world_size, D]``.
             Supplying it removes the public output allocation. It must not
-            alias ``x`` when ``world_size > 1``.
-        workspace : UlyssesWorkspace, optional
-            Reusable NCCL pack/receive storage. Supplying it removes the two
-            NCCL staging allocations. It is validated but unused by the
-            NVLink backend.
-            Multi-rank PCIe requires an output returned by
-            :meth:`allocate_output`.
+            alias ``x`` when ``world_size > 1``. Multi-rank PCIe requires an
+            output returned by :meth:`allocate_output`.
         dtype : torch.dtype, optional
             Element type for this call, overriding the communicator dtype.
             pcie backend only. ``max_bytes`` is denominated in bytes, so a
             narrower dtype here simply fits more elements in the same
             capacity.
+        workspace : UlyssesWorkspace, optional
+            Reusable NCCL pack/receive storage. Supplying it removes the two
+            NCCL staging allocations. It is validated but unused by the
+            NVLink backend, and rejected by the multi-rank pcie backend,
+            which has no staging buffers.
 
         Returns
         -------
@@ -2344,7 +2358,15 @@ def missing_ulysses_pcie_dependencies() -> List[str]:
     """Names of the rdma-core libraries this machine does not provide.
 
     Cheap and side-effect free (compiles nothing), so an environment guard can
-    distinguish an unsupported host from a real build failure.
+    distinguish an unsupported host from a real build failure. It probes the
+    shared libraries only; the development headers the JIT build also needs
+    surface as a compile error instead.
+
+    Returns
+    -------
+    List[str]
+        ``"libibverbs"`` and/or ``"libmlx5"`` when absent; empty when both
+        are found.
     """
     import ctypes.util
 
