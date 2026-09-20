@@ -348,6 +348,40 @@ def test_pcie_p2p_pre_enqueue_failure_poisons_collective_close(
     assert comm._state == ulysses_mod._CLOSING
 
 
+def test_multirank_pcie_refuses_workspaces_and_head_chunk_primitives(monkeypatch):
+    """The PCIe transport has no staging buffers: every workspace-shaped entry
+    point names allocate_output() instead of silently ignoring the argument or
+    falling through to the NCCL staging path."""
+    ulysses_mod = importlib.import_module("flashinfer.comm.ulysses")
+    comm = _make_mock_pcie_comm()
+    comm.transport = "p2p"
+    module = SimpleNamespace(
+        exchange=lambda *_args: pytest.fail("native exchange must not run"),
+    )
+    monkeypatch.setattr(ulysses_mod, "get_ulysses_pcie_module", lambda: module)
+    monkeypatch.setattr(torch.cuda, "device", lambda _device: contextlib.nullcontext())
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+
+    x = torch.empty((1, 2, 4, 2), dtype=torch.float16)
+    with pytest.raises(NotImplementedError, match="allocate_output"):
+        comm.create_workspace()
+    with pytest.raises(NotImplementedError, match="allocate_output"):
+        comm.scatter_qkv_head_chunk(x, x, x, head_offset=0, head_count=2)
+    with pytest.raises(NotImplementedError, match="allocate_output"):
+        comm.gather_output_head_chunk(x, local_heads=2, head_offset=0, out=x)
+    # Capability errors are raised identically on every rank before any
+    # collective work, so they leave the communicator usable.
+    assert comm._state == ulysses_mod._OPEN
+
+    # A workspace handed to a PCIe collective is a caller error inside the
+    # collective's failure envelope, like a bad shape.
+    out = torch.empty((1, 4, 2, 2), dtype=torch.float16)
+    comm._pcie_outputs[out.data_ptr()] = 0
+    with pytest.raises(RuntimeError, match="takes no workspace="):
+        comm.scatter_heads(x, out=out, workspace=object())
+    assert comm._state == ulysses_mod._BROKEN
+
+
 def test_pcie_p2p_wrapper_failure_poison_is_sticky(monkeypatch):
     """Wrapper dispatch can fail after stream bookkeeping but before native enqueue."""
     ulysses_mod = importlib.import_module("flashinfer.comm.ulysses")
