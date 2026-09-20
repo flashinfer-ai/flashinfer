@@ -116,22 +116,30 @@ with autotune():
 ```
 
 Route, domain order, and exact stage identities participate in the cache key.
-Normal execution reuses the measured winner. This searches the declared domains;
-full catalog coverage requires explicitly supplying all supported records.
-Record actual engines, coverage, and full-MoE scope when reporting performance.
+Normal execution reuses the measured winner for the active autotuning policy.
+This searches the declared domains; full catalog coverage requires explicitly
+supplying all supported records. Record actual engines, coverage, and full-MoE
+scope when reporting performance.
+
+When multiple backends are configured, their comparison follows the active
+autotuning execution and measurement policies. Select graph or eager execution
+and warm or cold cache conditions to match the intended workload. Backend choices
+are scoped to the actual token count, routing mode and measurement policy; a
+single backend retains its normal token-count tuning buckets. Cache replay and
+autotuning-disabled calls reuse an applicable cached choice or the first usable
+configured backend without starting a new profiling pass. `reset_winner()` clears
+the layer's choices; the next call consults the autotuner again.
 
 On a frontend with the new Frost MoE scheduler option, the existing public
 `cudnn.knob_type.SCHED_POLICY` field can select dynamic (omitted/0) or static (1)
-in each stage record. This is independent of the tile geometry. A static plan
-omits the scheduler reset; ordinary pointwise graph plans may also compile
-absolute-A addressing and compatible shared-A wide MMA. These optimizations are
-in the open-source Frost engine; the `cudnn` adapter name alone does not identify
-the engine that executed. Record actual plans and kernel traces.
+in each stage record. This is independent of the tile geometry. These options
+belong to the open-source Frost engine; the `cudnn` adapter name alone does not
+identify the engine that executed. Record actual plans and kernel traces.
 
 This is exhaustive only over the declared Cartesian product. Preparation costs
 grow with distinct stage plans and routes, so retain a measured winner
-for normal execution. FI's cross-runner graph selection and a separately reported
-cold-L2 measurement can use different cache conditions; record both scopes.
+for normal execution. Report the execution and cache conditions used for both
+selection and subsequent measurements, including any differences between them.
 
 `grouped_mm_bf16` and `grouped_mm_fp8` participate in ordinary `autotune()` using
 exact shape keys and uniform offsets. All grouped cuDNN APIs accept stable
