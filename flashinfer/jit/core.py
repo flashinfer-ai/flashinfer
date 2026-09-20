@@ -302,6 +302,18 @@ class JitSpec(abc.ABC):
         """Paths of all on-disk artifacts used by this spec."""
         return (self.get_library_path(),)
 
+    def get_built_library_path(self) -> Path:
+        """Path of the artifact this spec's own build writes.
+
+        ``get_library_path`` answers "what should a runtime consumer load" and
+        may therefore prefer a prebuilt AOT artifact. Packaging asks a
+        different question -- "what did the build just produce" -- so it must
+        not inherit that preference: with ``skip_prebuilt=False`` a freshly
+        rebuilt library would otherwise be packaged as the stale AOT copy.
+        Specs with no prebuilt artifact simply build where they load.
+        """
+        return self.get_library_path()
+
     @abc.abstractmethod
     def try_load(self) -> Optional[Any]:
         """Return the cached artifact, or None when absent or not known-valid.
@@ -470,6 +482,9 @@ class JitSpecNvcc(JitSpec):
     def get_library_path(self) -> Path:
         if self.is_aot:
             return self.aot_path
+        return self.jit_library_path
+
+    def get_built_library_path(self) -> Path:
         return self.jit_library_path
 
     def get_library_paths(self) -> tuple[Path, ...]:
