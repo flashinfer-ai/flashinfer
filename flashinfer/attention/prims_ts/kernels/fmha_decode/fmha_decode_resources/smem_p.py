@@ -483,32 +483,25 @@ class SmemPResource(DecodeGenResourceBase):
                     stage_info, sage_scale_arr, exp_scale
                 )
 
-        # With ``prefetches_next_p_fragment`` the loop loads the next fragment
-        # behind the scale FFMAs and carries the running sum as a packed pair;
-        # otherwise it loads, waits, scales and exponentiates each fragment in
-        # place with a scalar running sum.
-        prefetches_next = cfg.prefetches_next_p_fragment
+        # The loop scales a whole fragment before its first exponential and
+        # issues the next fragment's TMEM load once the scale FFMAs have
+        # consumed the current scores, so the load reuses the score registers
+        # and its latency hides behind the exponentials; the running sum is a
+        # packed pair folded once after the loop. Scaling ahead on its own
+        # lengthens the exponent chains and the load on its own needs a
+        # second fragment of registers; the combination measured faster on
+        # the byte-wide SOL kernels and on the 16-bit dense and Q128 kernels
+        # and within noise on the 16-bit SOL kernels.
         num_fragments = cfg.num_softmax_score_fragments
         last_fragment = Int32(num_fragments - 1)
-        total_sum = Float32(0.0)
         total_sum_pair = (Float32(0.0), Float32(0.0))
         s_arr = cutlass.Array(Float32, fragment_regs, space=cutlass.AddressSpace.rmem)
         pending_scores = cutlass.Array(
             Float32, fragment_regs, space=cutlass.AddressSpace.rmem
         )
-        if cutlass.const_expr(prefetches_next):
-            self._load_score_fragment(tmem_base, Int32(0), pending_scores)
+        self._load_score_fragment(tmem_base, Int32(0), pending_scores)
         for fragment_idx in cutlass.range(cfg.num_softmax_score_fragments, unroll=1):
             fragment = Int32(fragment_idx)
-            fragment_multipliers = None
-            if cutlass.const_expr(cfg.use_sage_attention and not mixed_scales):
-                # Issued before the score wait so an SMEM read hides behind it.
-                fragment_multipliers = self.sage_k_scales.fragment(
-                    scales_view, fragment
-                )
-                self.sage_k_scales.advance(scales_view)
-            if cutlass.const_expr(not prefetches_next):
-                self._load_score_fragment(tmem_base, fragment, pending_scores)
             prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
             for score_idx in cutlass.range_constexpr(fragment_regs):
                 s_arr[score_idx] = pending_scores[score_idx]
@@ -516,10 +509,7 @@ class SmemPResource(DecodeGenResourceBase):
             if cutlass.const_expr(mixed_scales):
                 # The route kind is CTA-uniform; each kind scales the fragment
                 # in place with its own strategy and scale-group geometry, so
-                # nothing but the scores crosses the branch. The next
-                # fragment's load then sits between the scaling and the
-                # exponentials, as on the single-geometry path.
-                assert prefetches_next
+                # nothing but the scores crosses the branch.
                 if route_is_proxy:
                     self._scale_fragment_with(
                         self.sage_summary_k_scales,
@@ -536,35 +526,25 @@ class SmemPResource(DecodeGenResourceBase):
                         s_arr,
                         exponent_addend,
                     )
-                next_fragment = fragment + Int32(1)
-                if next_fragment > last_fragment:
-                    next_fragment = last_fragment
-                self._load_score_fragment(tmem_base, next_fragment, pending_scores)
-                local_sum_pair = self._exponentiate_fragment_pairs(
-                    s_arr, None, None, scaled=True
-                )
             else:
+                fragment_multipliers = None
+                if cutlass.const_expr(cfg.use_sage_attention):
+                    fragment_multipliers = self.sage_k_scales.fragment(
+                        scales_view, fragment
+                    )
+                    self.sage_k_scales.advance(scales_view)
                 group_multipliers, group_addends = self._fragment_exponent_terms(
                     fragment_multipliers, exponent_addend
                 )
-                if cutlass.const_expr(prefetches_next):
-                    self._scale_fragment_pairs(s_arr, group_addends, group_multipliers)
-                    # The last iteration reloads its own fragment so the loop
-                    # body stays branch-free; the wait after the loop retires
-                    # it.
-                    next_fragment = fragment + Int32(1)
-                    if next_fragment > last_fragment:
-                        next_fragment = last_fragment
-                    self._load_score_fragment(tmem_base, next_fragment, pending_scores)
-                local_sum_pair = self._exponentiate_fragment_pairs(
-                    s_arr, group_addends, group_multipliers, scaled=prefetches_next
-                )
-            if cutlass.const_expr(prefetches_next):
-                total_sum_pair = cute.arch.add_packed_f32x2(
-                    total_sum_pair, local_sum_pair
-                )
-            else:
-                local_sum = Float32(local_sum_pair[0] + local_sum_pair[1])
+                self._scale_fragment_pairs(s_arr, group_addends, group_multipliers)
+            # The last iteration reloads its own fragment so the loop body
+            # stays branch-free; the wait after the loop retires it.
+            next_fragment = fragment + Int32(1)
+            if next_fragment > last_fragment:
+                next_fragment = last_fragment
+            self._load_score_fragment(tmem_base, next_fragment, pending_scores)
+            local_sum_pair = self._exponentiate_fragment_pairs(s_arr)
+            total_sum_pair = cute.arch.add_packed_f32x2(total_sum_pair, local_sum_pair)
 
             if cutlass.const_expr(cfg.use_fp8_qkv or cfg.v_dtype_bytes == 1):
                 packed_regs = cutlass.Array(
@@ -587,11 +567,8 @@ class SmemPResource(DecodeGenResourceBase):
                     .bitcast(Int32)
                 )
             self._publish_p_fragment(tmem_base, fragment, packed_p, publishes_fragment)
-            if cutlass.const_expr(not prefetches_next):
-                total_sum += local_sum
-        if cutlass.const_expr(prefetches_next):
-            prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
-            total_sum = Float32(total_sum_pair[0] + total_sum_pair[1])
+        prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
+        total_sum = Float32(total_sum_pair[0] + total_sum_pair[1])
         self.tmem_s_ref.store_p_local_sum(0, total_sum)
 
     @cute.jit
@@ -775,22 +752,12 @@ class SmemPResource(DecodeGenResourceBase):
 
     @cute.jit
     def _exponentiate_fragment_pairs(
-        self,
-        s_arr: cutlass.Array,
-        group_addends: cutlass.Array | None,
-        group_multipliers: cutlass.Array | None,
-        *,
-        scaled: Constexpr[bool],
-        groups: Constexpr[int | None] = None,
+        self, s_arr: cutlass.Array
     ) -> tuple[Float32, Float32]:
-        """Turn one fragment of scores into probabilities in place.
+        """Turn one fragment of log2 exponents into probabilities in place.
 
-        ``scaled`` tells whether ``_scale_fragment_pairs`` has already turned
-        the scores into log2 exponents, in which case ``group_addends`` and
-        ``group_multipliers`` are unused (and may be ``None``); otherwise each pair is scaled with
-        the multiplier and addend of its compile-time scale group right before
-        its exponential. Returns the fragment's probability sum as a packed
-        pair.
+        ``_scale_fragment_pairs`` has already applied each pair's multiplier
+        and addend. Returns the fragment's probability sum as a packed pair.
         Eight independent chains keep the denominator update off one long
         dependency chain; the first four pairs seed the chains, because an add
         to zero is a real FADD under IEEE semantics. A configurable subset of
@@ -801,13 +768,8 @@ class SmemPResource(DecodeGenResourceBase):
         sum_chains = cutlass.Array(Float32, 8, space=cutlass.AddressSpace.rmem)
         for pair_idx in cutlass.range_constexpr(pairs_per_fragment):
             value_idx = pair_idx * 2
-            if cutlass.const_expr(scaled):
-                p0 = Float32(s_arr[value_idx])
-                p1 = Float32(s_arr[value_idx + 1])
-            else:
-                p0, p1 = self._exponent_pair(
-                    s_arr, value_idx, group_addends, group_multipliers, groups
-                )
+            p0 = Float32(s_arr[value_idx])
+            p1 = Float32(s_arr[value_idx + 1])
             if cutlass.const_expr(
                 _pair_uses_ex2_emulation(pair_idx, pairs_per_fragment)
             ):

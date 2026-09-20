@@ -1125,26 +1125,6 @@ class FmhaDecodeConfig:
         return self.q_dtype_bytes == 1
 
     @property
-    def prefetches_next_p_fragment(self) -> bool:
-        """Whether the P pass loads the next score fragment behind the scale FFMAs.
-
-        With this order the pass scales a whole fragment before its first
-        exponential and issues the next fragment's TMEM load once the scale
-        FFMAs have consumed the current scores, so the load reuses the score
-        registers and the loop body stays single; it also carries the running
-        sum as a packed pair folded once after the loop. Only the combination
-        pays off: scaling ahead on its own lengthens the exponent chains, and
-        the load on its own needs a second fragment of registers. The 16-bit
-        profiles measured slower with the same order and keep the fused
-        load-wait-scale-exponentiate body with a scalar running sum. The gain
-        depends on the surrounding schedule, so re-measure it whenever the
-        max pass, the tail
-        pack or the fragment width changes. This is a performance policy that
-        follows the element width, not a dtype requirement.
-        """
-        return self.use_8bit_qkv
-
-    @property
     def use_fp8_output(self) -> bool:
         """Whether final O is stored as FP8 E4M3."""
         return self.out_dtype == Float8E4M3FN
