@@ -3295,9 +3295,16 @@ kernel_cake_kda_tf32_4409b00951db691ca33b764132c53a194cabef81f6f94dde882398b1fdc
                                     : "r"(taddr + (unsigned int)tmem_row + (unsigned int)(state_buffer * 128) + (unsigned int)(io_part_1 * 32)));
                                 asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                                 {
+                                    const float2 final_scale_pair = make_float2(281474976710656.0f, 281474976710656.0f);
                                     #pragma unroll
-                                    for (int word_16 = 0; word_16 < 32; word_16++) {
-                                        _tmem_load_46[word_16] = _tmem_load_46[word_16] * 281474976710656.0f;
+                                    for (int final_pair_index = 0; final_pair_index < 16; final_pair_index++) {
+                                        float2 final_input_pair = make_float2(_tmem_load_46[final_pair_index * 2], _tmem_load_46[final_pair_index * 2 + 1]);
+                                        float2 final_scaled_pair;
+                                        asm("mul.rn.ftz.f32x2 %0, %1, %2;"
+                                            : "=l"(*(unsigned long long*)&final_scaled_pair)
+                                            : "l"(*(const unsigned long long*)&final_input_pair), "l"(*(const unsigned long long*)&final_scale_pair));
+                                        _tmem_load_46[final_pair_index * 2] = final_scaled_pair.x;
+                                        _tmem_load_46[final_pair_index * 2 + 1] = final_scaled_pair.y;
                                     }
                                 }
                                 {

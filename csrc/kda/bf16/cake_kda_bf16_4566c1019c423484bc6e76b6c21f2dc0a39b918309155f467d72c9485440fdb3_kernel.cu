@@ -2011,8 +2011,18 @@ kernel_cake_kda_bf16_4566c1019c423484bc6e76b6c21f2dc0a39b918309155f467d72c948544
                         : "r"(state_addr));
                     asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                     #pragma unroll
-                    for (int state_item = 0; state_item < 32; state_item++) {
-                        state_values_2[state_item] = state_values_2[state_item] * smem_gt_all[first_page_stage * 10496 + (unsigned int)(state_panel_2 * 32) + (unsigned int)state_item];
+                    for (int state_quad = 0; state_quad < 8; state_quad++) {
+                        const float4 decay_scales = *reinterpret_cast<const float4*>(smem_gt_all + first_page_stage * 10496 + (unsigned int)(state_panel_2 * 32) + (unsigned int)(state_quad * 4));
+                        const float2 state_decay_lo = mul_f32x2_rn_ftz(
+                            make_float2(state_values_2[state_quad * 4], state_values_2[state_quad * 4 + 1]),
+                            make_float2(decay_scales.x, decay_scales.y));
+                        const float2 state_decay_hi = mul_f32x2_rn_ftz(
+                            make_float2(state_values_2[state_quad * 4 + 2], state_values_2[state_quad * 4 + 3]),
+                            make_float2(decay_scales.z, decay_scales.w));
+                        state_values_2[state_quad * 4] = state_decay_lo.x;
+                        state_values_2[state_quad * 4 + 1] = state_decay_lo.y;
+                        state_values_2[state_quad * 4 + 2] = state_decay_hi.x;
+                        state_values_2[state_quad * 4 + 3] = state_decay_hi.y;
                     }
                     tmem_st_x32_f32(state_addr, state_values_2);
                 }

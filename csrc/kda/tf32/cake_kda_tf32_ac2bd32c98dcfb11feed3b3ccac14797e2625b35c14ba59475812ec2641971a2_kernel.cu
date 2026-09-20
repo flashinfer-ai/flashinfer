@@ -3316,6 +3316,15 @@ kernel_cake_kda_tf32_ac2bd32c98dcfb11feed3b3ccac14797e2625b35c14ba59475812ec2641
                                             : "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_45[0])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_45[1])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_45[2])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_45[3])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_45[4])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_45[5])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_45[6])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_45[7])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_45[8])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_45[9])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_45[10])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_45[11])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_45[12])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_45[13])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_45[14])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_45[15]))
                                             : "r"(taddr + (unsigned int)tmem_row + (unsigned int)(row_band_3 * 16 << 16) + 256 + 64));
                                         asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+                                        float2 output_scale_pair = make_float2(output_scale, output_scale);
+                                        #pragma unroll
+                                        for (int output_pair = 0; output_pair < 8; output_pair++) {
+                                            float2 output_values_pair = make_float2(_tmem_load_45[output_pair * 2], _tmem_load_45[output_pair * 2 + 1]);
+                                            float2 scaled_output_pair;
+                                            asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_output_pair) : "l"(*(const unsigned long long*)&output_values_pair), "l"(*(const unsigned long long*)&output_scale_pair));
+                                            _tmem_load_45[output_pair * 2] = scaled_output_pair.x;
+                                            _tmem_load_45[output_pair * 2 + 1] = scaled_output_pair.y;
+                                        }
                                         #pragma unroll
                                         for (int group_4 = 0; group_4 < 4; group_4++) {
                                             #pragma unroll
@@ -3326,7 +3335,7 @@ kernel_cake_kda_tf32_ac2bd32c98dcfb11feed3b3ccac14797e2625b35c14ba59475812ec2641
                                                     long long token_1 = token_base_1 + (long long)(group_4 * 8) + (long long)lane_column + (long long)adjacent_3;
                                                     if (token_1 < eos_1) {
                                                         {
-                                                            out[(token_1 * (long long)num_heads + (long long)head_idx_1) * 128 + (long long)sr_3] = _tmem_load_45[group_4 * 4 + pair_row_4 * 2 + adjacent_3] * output_scale;
+                                                            out[(token_1 * (long long)num_heads + (long long)head_idx_1) * 128 + (long long)sr_3] = _tmem_load_45[group_4 * 4 + pair_row_4 * 2 + adjacent_3];
                                                         }
                                                     }
                                                 }
