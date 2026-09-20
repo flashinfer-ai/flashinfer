@@ -497,10 +497,9 @@ once per scale group (exact on the unit spacing; `-FLT_MAX` is unchanged by
 it), so masked tiles share the FP32 path: `-FLT_MAX` on masked lanes, the
 proxy tail shift applied in FP32. The P pass folds `-bias * c * sfQ * sfK_g`
 into each group's exponent addend with one FMA per group, so the per-element
-work is the same FFMA/EX2 stream as for FP32 scores; with the one-token K
-block, where every score is its own group, the P pass subtracts the bias from
-each score pair with one packed add instead (`sage_int32_bias_per_score`).
-Two roundings differ
+work is the same FFMA/EX2 stream as for FP32 scores for every K block size
+(with the one-token K block every score is its own group, so the fold costs
+one FMA per score). Two roundings differ
 from converting every element, both below the INT8 quantization noise: the
 per-group addend is rounded once, to at most half an ulp of
 `bias * c * sfQ * sfK_g` (at most 0.75 quantized score units), and the proxy

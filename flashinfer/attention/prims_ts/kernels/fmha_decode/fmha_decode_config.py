@@ -2333,21 +2333,6 @@ class FmhaDecodeConfig:
         return self.use_sage_attention and self.sage_k_groups_per_fragment >= 4
 
     @property
-    def sage_int32_bias_per_score(self) -> bool:
-        """Whether the P pass removes the INT32 score bias per score, not per group.
-
-        With one score per scale group (the one-token K block) an addend per
-        group costs one FMA per score, while subtracting the bias from each
-        score pair with one packed add and using the row's addend costs half
-        of that. The subtraction is exact: biased scores are integers below
-        ``2**24``.
-        """
-        return (
-            self.uses_int32_scores
-            and self.sage_k_groups_per_fragment == self.softmax_score_fragment_regs
-        )
-
-    @property
     def matches_kv256_task_topology(self) -> bool:
         """Whether task roles match KV256's validated 16-warp layout."""
 

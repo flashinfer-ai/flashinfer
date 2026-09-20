@@ -634,20 +634,16 @@ class SmemPResource(DecodeGenResourceBase):
 
         Both scores of a pair share a scale group unless the group is one
         score wide (the one-token K block), so each takes the multiplier and
-        addend of its own group. Biased INT32 scores drop their bias first.
+        addend of its own group; a biased INT32 score's bias is already in
+        the group addend.
         """
         group_regs = (
             self.cfg.softmax_score_fragment_regs // self.cfg.sage_k_groups_per_fragment
         )
         group0: Constexpr[int] = value_idx // group_regs
         group1: Constexpr[int] = (value_idx + 1) // group_regs
-        scores = (Float32(s_arr[value_idx]), Float32(s_arr[value_idx + 1]))
-        if cutlass.const_expr(self.cfg.sage_int32_bias_per_score):
-            scores = cute.arch.add_packed_f32x2(
-                scores, (Float32(-INT32_SCORE_BIAS), Float32(-INT32_SCORE_BIAS))
-            )
         return cute.arch.fma_packed_f32x2(
-            scores,
+            (Float32(s_arr[value_idx]), Float32(s_arr[value_idx + 1])),
             (Float32(group_multipliers[group0]), Float32(group_multipliers[group1])),
             (Float32(group_addends[group0]), Float32(group_addends[group1])),
         )
@@ -677,24 +673,38 @@ class SmemPResource(DecodeGenResourceBase):
                 group_multipliers[group_idx] = Float32(fragment_multipliers[group_idx])
         else:
             group_multipliers[0] = self.scale_softmax_log2
-        for group_idx in cutlass.range_constexpr(groups):
-            group_addends[group_idx] = exponent_addend
-            if cutlass.const_expr(
-                cfg.uses_int32_scores and not cfg.sage_int32_bias_per_score
-            ):
-                # Every biased score carries ``INT32_SCORE_BIAS``, so the
-                # addend removes ``bias * multiplier`` for its group: one
-                # rounding of the addend per group instead of one conversion
-                # per element. The rounding is at most half an ulp of
-                # ``bias * multiplier``, below one quantized score unit and far
-                # below the INT8 quantization noise.
-                group_addends[group_idx] = Float32(
+        if cutlass.const_expr(cfg.uses_int32_scores):
+            # Every biased score carries ``INT32_SCORE_BIAS``, so the addend
+            # removes ``bias * multiplier`` for its group: one rounding of the
+            # addend per group instead of one conversion per element. The
+            # rounding is at most half an ulp of ``bias * multiplier``, below
+            # one quantized score unit and far below the INT8 quantization
+            # noise. Groups leave in pairs through one packed FMA, so the
+            # one-token K block (one score per group) spends the same
+            # instruction count as a packed subtract per score pair would.
+            bias_pair = (Float32(-INT32_SCORE_BIAS), Float32(-INT32_SCORE_BIAS))
+            for group_base in cutlass.range_constexpr(0, groups - groups % 2, 2):
+                group_addends[group_base], group_addends[group_base + 1] = (
+                    cute.arch.fma_packed_f32x2(
+                        bias_pair,
+                        (
+                            Float32(group_multipliers[group_base]),
+                            Float32(group_multipliers[group_base + 1]),
+                        ),
+                        (exponent_addend, exponent_addend),
+                    )
+                )
+            if cutlass.const_expr(groups % 2 == 1):
+                group_addends[groups - 1] = Float32(
                     cute.math.fma(
                         Float32(-INT32_SCORE_BIAS),
-                        Float32(group_multipliers[group_idx]),
+                        Float32(group_multipliers[groups - 1]),
                         exponent_addend,
                     )
                 )
+        else:
+            for group_idx in cutlass.range_constexpr(groups):
+                group_addends[group_idx] = exponent_addend
         return group_multipliers, group_addends
 
     @cute.jit
