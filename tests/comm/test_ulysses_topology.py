@@ -641,9 +641,7 @@ def test_opt_in_does_not_make_auto_prefer_pcie_over_nvlink():
     assert decision.backend == "nvlink"
 
 
-@pytest.mark.parametrize(
-    "gate,expect_pcie_probe", [(False, False), (True, True)]
-)
+@pytest.mark.parametrize("gate,expect_pcie_probe", [(False, False), (True, True)])
 def test_auto_probes_the_pcie_side_only_when_it_may_use_it(
     gloo_pg, monkeypatch, gate, expect_pcie_probe
 ):
