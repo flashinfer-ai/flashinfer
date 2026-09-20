@@ -2079,16 +2079,24 @@ kernel_cake_kda_tf32_ac2bd32c98dcfb11feed3b3ccac14797e2625b35c14ba59475812ec2641
                                             float2 _f2_45 = make_float2(0.0f, 0.0f);
                                             float2 dot_pair = _f2_45;
                                             #pragma unroll
-                                            for (int half_3 = 0; half_3 < 8; half_3++) {
+                                            for (int half_3 = 0; half_3 < 8; half_3 += 2) {
                                                 if (target_row_1 < distance) {
                                                     weight[half_3] = 0.0f;
+                                                    weight[half_3 + 1] = 0.0f;
                                                 }
-                                                float weighted_k = other_k[half_3] * weight[half_3];
+                                                float2 wide_weights = make_float2(weight[half_3], weight[half_3 + 1]);
+                                                float2 wide_keys = make_float2(other_k[half_3], other_k[half_3 + 1]);
+                                                float2 wide_gates = make_float2(row_gate[half_3], row_gate[half_3 + 1]);
+                                                float2 weighted_keys = mul_f32x2_rn_ftz(wide_keys, wide_weights);
+                                                float2 next_weights = mul_f32x2_rn_ftz(wide_weights, wide_gates);
                                                 float2 _f2_46 = make_float2(row_q[half_3], row_k[half_3]);
-                                                float2 _f2_47 = make_float2(weighted_k, weighted_k);
+                                                float2 _f2_47 = make_float2(weighted_keys.x, weighted_keys.x);
                                                 dot_pair = fma_f32x2_rn_ftz(_f2_46, _f2_47, dot_pair);
-                                                float decay_1 = row_gate[half_3];
-                                                weight[half_3] = weight[half_3] * decay_1;
+                                                weight[half_3] = next_weights.x;
+                                                float2 wide_next_qk = make_float2(row_q[half_3 + 1], row_k[half_3 + 1]);
+                                                float2 wide_next_key = make_float2(weighted_keys.y, weighted_keys.y);
+                                                dot_pair = fma_f32x2_rn_ftz(wide_next_qk, wide_next_key, dot_pair);
+                                                weight[half_3 + 1] = next_weights.y;
                                             }
                                             float dot_q = dot_pair.x;
                                             float dot_k = dot_pair.y;
@@ -2114,7 +2122,8 @@ kernel_cake_kda_tf32_ac2bd32c98dcfb11feed3b3ccac14797e2625b35c14ba59475812ec2641
                                                 smem_qk_plain[qk_index_1] = smem_qk_plain[qk_index_1] + dot_q;
                                                 smem_abt[kk_index_1] = smem_abt[kk_index_1] + dot_k;
                                             }
-                                            int _vote_5 = __all_sync(0xFFFFFFFF, weight[0] == 0.0f && weight[1] == 0.0f && weight[2] == 0.0f && weight[3] == 0.0f && weight[4] == 0.0f && weight[5] == 0.0f && weight[6] == 0.0f && weight[7] == 0.0f);
+                                            unsigned int weight_exponent_union = (__float_as_uint(weight[0]) | __float_as_uint(weight[1]) | __float_as_uint(weight[2]) | __float_as_uint(weight[3]) | __float_as_uint(weight[4]) | __float_as_uint(weight[5]) | __float_as_uint(weight[6]) | __float_as_uint(weight[7])) & 0x7f800000U;
+                                            int _vote_5 = __all_sync(0xFFFFFFFF, weight_exponent_union == 0U);
                                             int exhausted = _vote_5;
                                             if (exhausted != 0) {
                                                 break;
@@ -2222,8 +2231,12 @@ kernel_cake_kda_tf32_ac2bd32c98dcfb11feed3b3ccac14797e2625b35c14ba59475812ec2641
                                             wide_prefix *= smem_gate[prep_instance * 18688 + gate_row_1 * 128 + prep_tid];
                                             int q_index_1 = (unsigned int)(tid / 128 * 18688) + (prep_tid / 32 * 8192 + gate_row_1 * 128 + prep_tid % 32 * 4 ^ (prep_tid / 32 * 8192 + gate_row_1 * 128 + prep_tid % 32 * 4 >> 7 & 7) << 4) / 4;
                                             int k_index_1 = (unsigned int)(tid / 128 * 18688) + (prep_tid / 32 * 8192 + gate_row_1 * 128 + prep_tid % 32 * 4 ^ (prep_tid / 32 * 8192 + gate_row_1 * 128 + prep_tid % 32 * 4 >> 7 & 7) << 4) / 4;
-                                            smem_qd[q_index_1] = smem_qd[q_index_1] * wide_prefix;
-                                            smem_kd[k_index_1] = smem_kd[k_index_1] * wide_prefix;
+                                            float2 wide_qk_values = make_float2(smem_qd[q_index_1], smem_kd[k_index_1]);
+                                            float2 wide_prefix_pair = make_float2(wide_prefix, wide_prefix);
+                                            float2 scaled_wide_qk;
+                                            asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&scaled_wide_qk) : "l"(*(const unsigned long long*)&wide_qk_values), "l"(*(const unsigned long long*)&wide_prefix_pair));
+                                            smem_qd[q_index_1] = scaled_wide_qk.x;
+                                            smem_kd[k_index_1] = scaled_wide_qk.y;
                                         }
                                     }
                                 }
