@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Guard-zone helper semantics (gh #3978, work order cases A3-01 .. A3-11).
+"""Guard-zone helper semantics (gh #3978, work order cases A3-01 .. A3-11, review regressions A3-13/A3-14).
 
 The helper under test is ``tests/test_helpers/guard_zone.py``; the real-kernel
 integration lives in ``test_guard_zone_kernel.py`` (A3-12).
@@ -131,7 +131,7 @@ def test_prefix_injection_reports_region_and_offset():
 
 @pytest.mark.parametrize("device", DEVICES)
 def test_the_byte_before_the_payload_is_guarded(device):
-    """A3-07: an underrun that stops one byte short of the payload is caught.
+    """A3-13: an underrun that stops one byte short of the payload is caught.
 
     The payload offset is aligned, so padding can precede it.  A prefix guard
     anchored at the owner start instead of next to the payload would leave that
@@ -151,7 +151,7 @@ def test_the_byte_before_the_payload_is_guarded(device):
 
 @pytest.mark.parametrize("device", DEVICES)
 def test_alignment_below_the_element_size_keeps_the_payload_viewable(device):
-    """A3-08: alignment=1 with float32 still yields a legal, aligned payload.
+    """A3-14: alignment=1 with float32 still yields a legal, aligned payload.
 
     The payload offset must satisfy the address alignment *and* keep the storage
     offset a multiple of the element size, which a raw ``% alignment`` can miss
