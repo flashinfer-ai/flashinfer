@@ -28,16 +28,85 @@ def test_sm120_w4a8_graph_compile_bucket_selection() -> None:
         256: 256,
         257: 320,
         320: 320,
+        321: 384,
+        384: 384,
+        385: 512,
+        512: 512,
+        513: 1024,
+        1024: 1024,
+        1025: 2048,
+        2048: 2048,
+        2049: 4096,
+        4096: 4096,
         capacity: capacity,
     }
     for requested, bucket in expected.items():
         assert select_graph_compile_bucket(requested, capacity) == bucket
     assert select_graph_compile_bucket(None, capacity) == capacity
     with warnings.catch_warnings(record=True) as caught:
-        assert select_graph_compile_bucket(4096, capacity) == capacity
+        assert select_graph_compile_bucket(321, capacity) == 384
     assert not caught
     with pytest.warns(RuntimeWarning, match="falling back to workspace capacity"):
-        assert select_graph_compile_bucket(321, capacity) == capacity
+        from flashinfer.moe_ep.kernel_src.sm120.split_cutedsl_megakernel.shim import (
+            runtime,
+        )
+
+        runtime._WARNED_DECODE_CAPACITY_FALLBACKS.discard(capacity)
+        assert select_graph_compile_bucket(4097, capacity) == capacity
+
+
+@pytest.mark.parametrize("capacity", (4, 300, 384, 700, 2048, 8192, 16384))
+def test_sm120_w4a8_buckets_respect_capacity(capacity: int) -> None:
+    from flashinfer.moe_ep.kernel_src.sm120.split_cutedsl_megakernel.shim import runtime
+
+    buckets = sorted(
+        {b for b in runtime.DECODE_GRAPH_COMPILE_BUCKETS if b <= capacity} | {capacity}
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        for requested in range(1, capacity + 1):
+            chosen = runtime.select_graph_compile_bucket(requested, capacity)
+            assert chosen == next(b for b in buckets if b >= requested)
+    for invalid in (-1, 0, capacity + 1):
+        with pytest.raises(ValueError):
+            runtime.select_graph_compile_bucket(invalid, capacity)
+
+
+@pytest.mark.parametrize(
+    "bucket,expected_n", ((384, 64), (512, 64), (1024, 128), (2048, 128), (4096, 128))
+)
+def test_sm120_w4a8_medium_buckets_select_distinct_kernel_specs(
+    bucket, expected_n
+) -> None:
+    from flashinfer.moe_ep.kernel_src.sm120.split_cutedsl_megakernel import (
+        bootstrap_paths,
+    )
+
+    bootstrap_paths()
+    from moe_sm120_mxfp4mxfp8_split.api import MegaMoEProblemSpec, select_compile_spec
+
+    def spec(tokens):
+        return select_compile_spec(
+            problem=MegaMoEProblemSpec(
+                tokens_per_rank=tokens,
+                num_topk=6,
+                num_total_experts=256,
+                hidden=4096,
+                intermediate=4096,
+                expert_parallel_size=4,
+                expert_parallel_rank=0,
+            ),
+            ep_same_numa_peer_count=3,
+            ep_cross_numa_peer_count=0,
+            num_sms=110,
+            sm_min_partition=8,
+            sm_partition_alignment=8,
+        )
+
+    selected = spec(bucket)
+    assert selected.kernel.k1_tile[1] == expected_n
+    assert selected.kernel.k2_tile[1] == expected_n
+    assert selected.cache_key != spec(8192).cache_key
 
 
 def test_sm120_w4a8_dp4_decode_320_uses_n32_and_unique_cache_key() -> None:
@@ -95,6 +164,49 @@ def test_sm120_w4a8_frontend_graph_cache_key_includes_bucket() -> None:
     assert key256[-1] == 256
     assert key320[-1] == 320
     assert key256 != key320
+    keys = [
+        runtime._frontend_graph_cache_key(weights, output, bucket)
+        for bucket in runtime.DECODE_GRAPH_COMPILE_BUCKETS
+    ]
+    assert len(set(keys)) == len(keys)
+    assert len({key[:-1] for key in keys}) == 1
+
+
+@pytest.mark.arch_sm120
+@pytest.mark.parametrize("bucket", (384, 512, 1024, 2048, 4096))
+def test_sm120_w4a8_medium_bucket_shrink_and_graph_replay(bucket: int) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    if int(os.environ.get("WORLD_SIZE", "1")) != 1:
+        pytest.skip("single-rank test")
+
+    problem = _problem(0, 1, tokens=bucket - 1, capacity=8192)
+    small = _problem(0, 1, tokens=7, capacity=8192, seed_offset=19)["inputs"]
+    layer = _make_layer(0, 1, problem)
+    try:
+        layer.stage_inputs(problem["inputs"], compile_tokens_per_rank=bucket)
+        expected = layer.compute_staged(output=None).clone()
+        torch.cuda.synchronize()
+        reference = _torch_reference(problem)
+        rel_l2 = (expected.float() - reference).norm() / reference.norm().clamp_min(
+            1e-6
+        )
+        assert rel_l2.item() < 0.03
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            layer.stage_inputs(problem["inputs"], compile_tokens_per_rank=bucket)
+            captured = layer.compute_staged(output=None)
+        for _ in range(2):
+            layer.stage_inputs(small, compile_tokens_per_rank=7)
+            layer.compute_staged(output=None)
+            for _ in range(16):
+                graph.replay()
+                torch.cuda.synchronize()
+                torch.testing.assert_close(expected, captured, atol=0.0, rtol=0.0)
+        assert layer._workspace.config.max_tokens_per_rank == 8192
+        assert set(layer._workspace._storages) == {7, bucket}
+    finally:
+        layer.destroy()
 
 
 def _packed_e2m1(shape: tuple[int, ...], generator: torch.Generator) -> torch.Tensor:
@@ -467,6 +579,17 @@ def test_sm120_w4a8_two_layers_share_workspace() -> None:
 @pytest.mark.gpu_4
 @pytest.mark.arch_sm120
 @pytest.mark.parametrize(
+    "tokens_by_rank",
+    (
+        (67, 64, 19, 1),
+        (383, 192, 7, 0),
+        (511, 256, 7, 0),
+        (1023, 512, 7, 0),
+        (2047, 1024, 7, 0),
+        (4095, 2048, 7, 0),
+    ),
+)
+@pytest.mark.parametrize(
     "knobs",
     (
         None,
@@ -481,6 +604,7 @@ def test_sm120_w4a8_two_layers_share_workspace() -> None:
 )
 def test_sm120_w4a8_four_rank_tail_wave_and_cuda_graph_replay(
     knobs: dict | None,
+    tokens_by_rank: tuple[int, ...],
 ) -> None:
     import torch.distributed as dist
 
@@ -492,7 +616,6 @@ def test_sm120_w4a8_four_rank_tail_wave_and_cuda_graph_replay(
     # Exercise a real tail wave: every rank enters the collective kernel, but
     # the amount of useful work differs substantially. The one-row rank also
     # guards against accidentally requiring every rank to fill a tile.
-    tokens_by_rank = (67, 64, 19, 1)
     problem = _problem(
         rank,
         world_size,
@@ -513,7 +636,12 @@ def test_sm120_w4a8_four_rank_tail_wave_and_cuda_graph_replay(
         dist.barrier()
         torch.testing.assert_close(eager0, eager1, atol=0.0, rtol=0.0)
 
-        reference = _torch_reference(_global_weight_problem(problem))
+        global_problem = _global_weight_problem(problem)
+        reference = (
+            _torch_reference(global_problem)
+            if tokens_by_rank[rank]
+            else torch.empty_like(problem["inputs"].hidden_states, dtype=torch.float32)
+        )
         rel_l2 = (eager0.float() - reference).norm() / reference.norm().clamp_min(1e-6)
         assert rel_l2.item() < 0.03, f"rank {rank} rel_l2={rel_l2.item():.5f}"
 

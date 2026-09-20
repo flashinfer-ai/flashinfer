@@ -25,6 +25,7 @@ except ImportError:  # pragma: no cover -- fallback for wheels without cute.iket
 from .moe_utils import spin_wait
 from .sm120_ptx_helpers import (
     atomic_cas_gpu_i32_raw,
+    ldg_acquire_gpu_b32_raw,
     lds_b32_raw,
     red_add_relaxed_sys_v2_bf16x2_raw,
 )
@@ -802,9 +803,10 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
                     elif cache_old > Int32(0):
                         cache_master_pool = cache_old - Int32(1)
                         if lane_idx == Int32(0):
-                            cache_master_sf_axis = dispatch_rank_cache_sf_axis[
-                                cache_key
-                            ]
+                            cache_master_sf_axis = ldg_acquire_gpu_b32_raw(
+                                dispatch_rank_cache_sf_axis.iterator.toint()
+                                + Int64(cache_key) * Int64(4)
+                            )
                         cache_master_sf_axis = cute.arch.shuffle_sync(
                             cache_master_sf_axis, offset=0
                         )
@@ -1007,7 +1009,12 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
                                     j,
                                     num_k_atoms=self.sf_uint32_per_token,
                                 )
-                                sf_value = fc1_input_sf_buffer[cached_sf_pos]
+                                # The lane-0 cache claim does not replace each
+                                # consumer lane's ordered payload read.
+                                sf_value = ldg_acquire_gpu_b32_raw(
+                                    fc1_input_sf_buffer.iterator.toint()
+                                    + Int64(cached_sf_pos) * Int64(4)
+                                )
                             else:
                                 sf_addr = (
                                     inp_sf_local_base

@@ -21,8 +21,21 @@ from .comm import (
 from .staging import ACTIVATION_DTYPE
 from .weights import SCALE_DTYPE, TransformedWeights, ceil_div, round_up
 
-
-DECODE_GRAPH_COMPILE_BUCKETS = (7, 16, 32, 64, 128, 168, 256, 320)
+DECODE_GRAPH_COMPILE_BUCKETS = (
+    7,
+    16,
+    32,
+    64,
+    128,
+    168,
+    256,
+    320,
+    384,
+    512,
+    1024,
+    2048,
+    4096,
+)
 _WARNED_DECODE_CAPACITY_FALLBACKS: set[int] = set()
 
 
@@ -32,9 +45,8 @@ def select_graph_compile_bucket(
 ) -> int:
     """Map a collective graph row count to a kernel specialization.
 
-    Buckets above the decode range intentionally fall back to the full
-    workspace capacity. This keeps the prefill policy unchanged while decode
-    graphs use the measured low-latency specializations.
+    Keep fine-grained decode buckets and sparse medium/prefill buckets. The
+    workspace capacity remains the final fallback and is never exceeded.
     """
     if workspace_capacity <= 0:
         raise ValueError("workspace_capacity must be positive")
@@ -56,17 +68,16 @@ def select_graph_compile_bucket(
     if (
         selected == workspace_capacity
         and requested_tokens_per_rank < workspace_capacity
-        and requested_tokens_per_rank <= 2 * DECODE_GRAPH_COMPILE_BUCKETS[-1]
+        and requested_tokens_per_rank > DECODE_GRAPH_COMPILE_BUCKETS[-1]
         and workspace_capacity not in _WARNED_DECODE_CAPACITY_FALLBACKS
     ):
         _WARNED_DECODE_CAPACITY_FALLBACKS.add(workspace_capacity)
         warnings.warn(
-            "SM120 W4A8 MegaMoE decode compile request "
+            "SM120 W4A8 MegaMoE compile request "
             f"({requested_tokens_per_rank} rows) exceeds the largest dedicated "
-            f"decode graph bucket ({DECODE_GRAPH_COMPILE_BUCKETS[-1]}); "
+            f"graph bucket ({DECODE_GRAPH_COMPILE_BUCKETS[-1]}); "
             f"falling back to workspace capacity ({workspace_capacity}). "
-            "Decode performance may regress because this selects the prefill "
-            "kernel heuristic.",
+            "Padding and the selected kernel heuristic may affect performance.",
             RuntimeWarning,
             stacklevel=2,
         )
@@ -420,6 +431,7 @@ class MegaMoESm120W4A8Frontend:
                 f"tail_reclaim={kernel.k2_tail_reclaim} "
                 f"rank_cache={kernel.dispatch_rank_cache} "
                 f"rank_combine={kernel.rank_local_combine} "
+                f"dispatch_warps={spec.jit.dispatch_warp_count} "
                 f"green={kernel.k1_sms}/{kernel.k2_sms}",
                 flush=True,
             )
@@ -492,6 +504,32 @@ class MegaMoESm120W4A8Frontend:
                 green_trace=green_trace,
             )
             self.workspace._storages[self.compile_bucket] = storage
+            if os.environ.get("FLASHINFER_MEGAMOE_LOG_COMPILE_SPEC") == "1":
+                # Logical buffer bytes include NVSHMEM views; CUDA allocator
+                # counters alone do not account for their symmetric heap.
+                storage_bytes = sum(
+                    tensor.numel() * tensor.element_size()
+                    for item in self.workspace._storages.values()
+                    for tensor in (
+                        item.local_workspace,
+                        item.shared_workspace,
+                        item.combine_output,
+                        item.rank_combine_ready,
+                        item.green_trace,
+                        *item.epilogue_args,
+                    )
+                    if tensor is not None
+                )
+                print(
+                    "[FlashInfer MegaMoE buffers] "
+                    f"rank={self.config.rank} bucket={self.compile_bucket} "
+                    f"capacity={self.config.max_tokens_per_rank} "
+                    f"prepared_buckets={sorted(self.workspace._storages)} "
+                    f"logical_execution_bytes={storage_bytes} "
+                    f"torch_allocated={torch.cuda.memory_allocated()} "
+                    f"torch_reserved={torch.cuda.memory_reserved()}",
+                    flush=True,
+                )
         execution = _ExecutionBuffers(
             bundle=bundle,
             spec=spec,

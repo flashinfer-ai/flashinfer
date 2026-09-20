@@ -2,7 +2,17 @@
 
 The raw source under `src/` comes from `bangyus/cutedsl_megamoe`, branch
 `hanyueh/sm120-mxfp4mxfp8-split`, commit
-`ea790c8d3e3aaed42439920d89b7ab6a7c46f9e5`.
+`6aa25a07fe14afcf0c05323139551cd0533c07b0`.
+
+This update includes N64 compact SFB loads, cached-scale GPU-acquire visibility,
+and shape-bounded local-combine prefill tuning (`KERNEL_CACHE_ABI=35`).
+FlashInfer-specific child-graph capture and vendored import adaptations are
+preserved when applying upstream kernel changes.
+
+The local frontend experiment adds 384/512/1024/2048/4096 row buckets between
+the existing decode buckets and caller-provided workspace capacity. Buckets
+are prepared lazily and remain part of the kernel and frontend graph cache
+keys; they are not additional workspace capacities.
 
 The raw package is named `moe_sm120_mxfp4mxfp8_split`; its weight/activation
 contract is MXFP4 E2M1 x MXFP8 E4M3 with E8M0 K32 scales.

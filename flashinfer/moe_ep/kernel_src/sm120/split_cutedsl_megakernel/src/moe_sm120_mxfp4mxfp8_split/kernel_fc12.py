@@ -47,6 +47,7 @@ from .sm120_ptx_helpers import (
     clamp_gate_upper_f32,
     clamp_symmetric_f32,
     lds_b32_raw,
+    lds_b32_raw_ordered,
 )
 from .split_timestamp import (
     FIELD_FIRST_WORK,
@@ -4371,7 +4372,7 @@ class Sm120SwapABSwigluMxfp8Fc12Kernel:
             tCrSFB = sm100_utils.partition_fragment_SFB(
                 sSFB[None, None, 0], thr_mma, tidx
             )
-            if cutlass.const_expr(self.mma_tiler[1] in (16, 32)):
+            if cutlass.const_expr(self.mma_tiler[1] in (16, 32, 64)):
                 # One packed K128 scale word per N8 output group. The runtime
                 # N128 sub-tile is folded into the SMEM load address.
                 rSFBCompact = cute.make_rmem_tensor(
@@ -4669,7 +4670,7 @@ class Sm120SwapABSwigluMxfp8Fc12Kernel:
                         tCsSFA_p_filtered[None, 0, 0],
                         tCrSFA_copy_view_filtered[None, 0, 0],
                     )
-                    if cutlass.const_expr(self.mma_tiler[1] in (16, 32)):
+                    if cutlass.const_expr(self.mma_tiler[1] in (16, 32, 64)):
                         sfb_tiles_per_tma = 128 // self.mma_tiler[1]
                         sfb_tile_slot = (
                             work_tile_info.tile_n_idx
@@ -4688,32 +4689,25 @@ class Sm120SwapABSwigluMxfp8Fc12Kernel:
                                 + (lane_scale_row // cutlass.Int32(32))
                                 * cutlass.Int32(4)
                             )
-                            rSFBCompactI32[ng] = lds_b32_raw(
+                            sfb_compact_addr = (
                                 sSFB.iterator
                                 + sfb_lane_byte_base
                                 + handle_b.index * cutlass.Int32(512)
                             )
+                            if cutlass.const_expr(self.mma_tiler[1] == 64):
+                                rSFBCompactI32[ng] = lds_b32_raw_ordered(
+                                    sfb_compact_addr
+                                )
+                            else:
+                                rSFBCompactI32[ng] = lds_b32_raw(
+                                    sfb_compact_addr
+                                )
                     else:
                         cute.copy(
                             smem_tiled_copy_SFB,
                             tCsSFB_p_filtered[None, None, 0],
                             tCrSFB_copy_view_filtered[None, 0, 0, None],
                         )
-                    tCrSFB_mma_lo = tCrSFB
-                    tCrSFB_mma_hi = tCrSFB
-                    sfb_tile_slot = cutlass.Int32(0)
-                    if cutlass.const_expr(self.mma_tiler[1] == 64):
-                        # N64 consumes either half of the N128 SFB staging
-                        # tile. Keep both fragment bases static so ptxas does
-                        # not lower the register fragment through local memory.
-                        tCrSFB_mma_hi = cute.make_tensor(
-                            tCrSFB.iterator + n_groups // 4,
-                            tCrSFB.layout,
-                        )
-                        sfb_tile_slot = (
-                            work_tile_info.tile_n_idx % cutlass.Int32(2)
-                        )
-
                     if trace_k_detail != cutlass.Int32(0):
                         if is_phase_linear1:
                             iket.range_push("sm120_fc1_k128_compute")
@@ -4742,7 +4736,7 @@ class Sm120SwapABSwigluMxfp8Fc12Kernel:
                                 tCrSFA_copy_view_filtered[None, 0, k_inner_next],
                             )
                             if cutlass.const_expr(
-                                self.mma_tiler[1] not in (16, 32)
+                                self.mma_tiler[1] not in (16, 32, 64)
                             ):
                                 cute.copy(
                                     smem_tiled_copy_SFB,
@@ -4752,7 +4746,7 @@ class Sm120SwapABSwigluMxfp8Fc12Kernel:
                                     ],
                                 )
                         if cutlass.const_expr(
-                            self.mma_tiler[1] in (16, 32)
+                            self.mma_tiler[1] in (16, 32, 64)
                         ):
                             for ng in cutlass.range_constexpr(0, n_groups):
                                 issue_m64n8k32_mxfp8_packed_sfb(
@@ -4772,38 +4766,21 @@ class Sm120SwapABSwigluMxfp8Fc12Kernel:
                                 )
                         else:
                             for ng in cutlass.range_constexpr(0, n_groups):
-                                if sfb_tile_slot == cutlass.Int32(1):
-                                    issue_m64n8k32_mxfp8(
-                                        tiled_mma,
-                                        accumulators[None, None, ng],
-                                        tCrA,
-                                        tCrB,
-                                        tCrSFA,
-                                        tCrSFB_mma_hi,
-                                        n_group=ng,
-                                        active_n_groups=n_groups,
-                                        sfa_m_group=0,
-                                        k_inner=k_inner_mma,
-                                        a_dtype=self.a_dtype,
-                                        b_dtype=self.b_dtype,
-                                        sf_dtype=self.sf_dtype,
-                                    )
-                                else:
-                                    issue_m64n8k32_mxfp8(
-                                        tiled_mma,
-                                        accumulators[None, None, ng],
-                                        tCrA,
-                                        tCrB,
-                                        tCrSFA,
-                                        tCrSFB_mma_lo,
-                                        n_group=ng,
-                                        active_n_groups=n_groups,
-                                        sfa_m_group=0,
-                                        k_inner=k_inner_mma,
-                                        a_dtype=self.a_dtype,
-                                        b_dtype=self.b_dtype,
-                                        sf_dtype=self.sf_dtype,
-                                    )
+                                issue_m64n8k32_mxfp8(
+                                    tiled_mma,
+                                    accumulators[None, None, ng],
+                                    tCrA,
+                                    tCrB,
+                                    tCrSFA,
+                                    tCrSFB,
+                                    n_group=ng,
+                                    active_n_groups=n_groups,
+                                    sfa_m_group=0,
+                                    k_inner=k_inner_mma,
+                                    a_dtype=self.a_dtype,
+                                    b_dtype=self.b_dtype,
+                                    sf_dtype=self.sf_dtype,
+                                )
                     if trace_k_detail != cutlass.Int32(0):
                         iket.range_pop()
                     handle_a.release()

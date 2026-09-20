@@ -91,8 +91,14 @@ paths use exact compact SFB selection from the fixed N128 scale staging tile.
 Same-NUMA P2P may also cache one dispatched activation/scale row per
 `(source token, destination rank)` when the estimated duplicate traffic is
 large enough. At 8192 tokens/rank or above, the heuristic may use owner-local
-BF16 combine before the final K3 reduction. Both choices are part of the
-compile spec and therefore part of the graph/JIT cache key.
+BF16 combine before the final K3 reduction. On the validated 110-SM EP4
+DSV4-flash shape (H4096/I4096/E256/topk6), that threshold is 4096. DSV4
+(H7168/I6144/E384/topk6) retains the 8192 threshold. Through 24576 rows/rank,
+these local-combine paths use one dispatch warp; Flash also keeps K2 N128
+at stage3. Other shapes and explicit overrides retain their existing policy.
+The owner-local reduction rounds BF16 partial sums per owner, so its numerical
+contract differs slightly from direct top-k reduction. Both choices are part
+of the compile spec and therefore part of the graph/JIT cache key.
 
 ## Framework API and JIT Cache
 

@@ -35,6 +35,16 @@ _ENABLE_PRODUCTION_DECODE_N16 = True
 _DUAL_N8_DEFAULT_BUCKETS = (7, 16, 32, 64)
 
 
+def _rank_local_combine_tuning_min_tokens(
+    hidden: int, intermediate: int, num_topk: int, num_total_experts: int
+) -> Optional[int]:
+    # Bounded same-NUMA EP4 presets measured with the cache acquire fix.
+    return {
+        (4096, 4096, 6, 256): 4096,
+        (7168, 6144, 6, 384): 8192,
+    }.get((hidden, intermediate, num_topk, num_total_experts))
+
+
 def _select_decode_row_bucket(rows_per_rank: int) -> Optional[int]:
     if rows_per_rank <= 0:
         raise ValueError("rows_per_rank must be positive")
@@ -593,18 +603,23 @@ def select_megamoe_config(
         and shape.expected_dispatch_rank_cache_saved_fraction
         >= _DISPATCH_RANK_CACHE_MIN_SAVED_FRACTION
     )
-    # Owner-local combine becomes profitable once the long EP4 path is
-    # peer-store bound.  Same-GPU A/B on DSV4-flash and DSV4 validates the
-    # crossover at 8K tokens/rank for H >= 4096.  It adds one BF16 partial per
-    # owner rank, so keep the alternate numerical contract out of shorter
-    # prefill and decode shapes.
+    # The 110-SM retune moves only the validated Flash shape's crossover to
+    # 4K. Other geometries keep the existing 8K numerical-contract boundary.
+    combine_tuning_min_tokens = _rank_local_combine_tuning_min_tokens(
+        shape.hidden, shape.intermediate, shape.num_topk, shape.num_total_experts
+    )
+    combine_min_tokens = (
+        combine_tuning_min_tokens
+        if shape.num_sms == 110 and combine_tuning_min_tokens is not None
+        else 8192
+    )
     rank_local_combine = (
         not cross_numa
         and shape.expert_parallel_size == 4
         and shape.ep_same_numa_peer_count == 3
         and shape.tensor_parallel_size == 1
         and shape.hidden >= 4096
-        and shape.tokens_per_rank >= 8192
+        and shape.tokens_per_rank >= combine_min_tokens
     )
 
     # Except for the bounded small-message window above, keep production on
@@ -677,6 +692,21 @@ def select_megamoe_config(
     )
     if overrides is not None:
         config = config.with_overrides(overrides)
+    if (
+        config.rank_local_combine
+        and config.kernel_comm_backend == "p2p_direct"
+        and shape.expert_parallel_size == 4
+        and shape.tensor_parallel_size == 1
+        and shape.num_sms == 110
+        and combine_tuning_min_tokens == 4096
+        and 4096 <= shape.tokens_per_rank <= 24576
+        and config.k2_tile == (64, 128, 128)
+        and (
+            overrides is None
+            or (overrides.k2_tile is None and overrides.k2_stages is None)
+        )
+    ):
+        config = replace(config, k2_stages=3)
     if config.dispatch_rank_cache and config.kernel_comm_backend != "p2p_direct":
         if overrides is not None and overrides.dispatch_rank_cache is True:
             raise ValueError(

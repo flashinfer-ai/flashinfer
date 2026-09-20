@@ -85,6 +85,24 @@ def ldg_b32_cv_raw(addr: Int64, *, loc=None, ip=None) -> Int32:
 
 
 @dsl_user_op
+def ldg_acquire_gpu_b32_raw(addr: Int64, *, loc=None, ip=None) -> Int32:
+    """Read dispatch-cache payload with explicit device/compiler ordering."""
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [addr.ir_value(loc=loc, ip=ip)],
+            "ld.acquire.gpu.global.u32 $0, [$1];",
+            "=r,l,~{memory}",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def atomic_cas_gpu_i32_raw(
     addr: Int64,
     compare: Int32,
@@ -160,6 +178,23 @@ def lds_b32_raw(addr, *, loc=None, ip=None) -> Int32:
             "ld.shared.u32 $0, [$1];",
             "=r,r",
             has_side_effects=False,
+            asm_dialect=0,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def lds_b32_raw_ordered(addr, *, loc=None, ip=None) -> Int32:
+    """Load TMA-produced shared memory without compiler reordering."""
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [addr.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip)],
+            "ld.shared.u32 $0, [$1];",
+            "=r,r",
+            has_side_effects=True,
             asm_dialect=0,
             loc=loc,
             ip=ip,

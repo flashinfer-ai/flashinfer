@@ -14,6 +14,7 @@ import json
 from typing import Any, Dict, Literal, Optional, Tuple
 
 from .heuristic import (
+    _rank_local_combine_tuning_min_tokens,
     MegaMoEHeuristicInput,
     MegaMoEHeuristicOverrides,
     MegaMoEKernelConfig,
@@ -30,7 +31,11 @@ from .jit_config import Sm120JitConfig
 # Revision 26 adds the opt-in dispatch rank-cache workspace and code path.
 # Revision 31 adds rank-local combine on top of the rank-cache workspace.
 # Revision 32 uses the public 128-byte online TMA descriptor stride.
-KERNEL_CACHE_ABI = 32
+# Revision 33 moves the N64 SFB half selection out of the QMMA hot loop by
+# loading the selected N64 scale tile into the packed compact fragment.
+# Revision 34 orders the raw compact-fragment load after its TMA/mbarrier
+# producer so cached v34 CUBINs cannot retain the weaker load semantics.
+KERNEL_CACHE_ABI = 35
 
 
 @dataclass(frozen=True)
@@ -187,10 +192,8 @@ def _select_dispatch_warp_count(
 ) -> int:
     """Select the K1 ingest width for the compiled kernel.
 
-    RTX Pro 5000 scans show one dispatch warp reduces first-ready latency for
-    short to mid-sized same-NUMA P2P waves, while larger waves need the
-    historical four-warp ingest bandwidth. Express the rule in rows/expert so
-    it is portable across top-k and expert-parallel degree.
+    Short waves use one warp. The bounded local-combine retune also uses one
+    warp at large sizes; other shapes keep the historical four-warp ingest.
     """
 
     if (
@@ -198,6 +201,19 @@ def _select_dispatch_warp_count(
         or kernel.token_back_mode != "epi_warps"
     ):
         return 4
+    tuning_min_tokens = _rank_local_combine_tuning_min_tokens(
+        problem.hidden, problem.intermediate, problem.num_topk,
+        problem.num_total_experts,
+    )
+    if (
+        kernel.rank_local_combine
+        and kernel.total_sms == 110
+        and problem.expert_parallel_size == 4
+        and problem.tensor_parallel_size == 1
+        and tuning_min_tokens is not None
+        and tuning_min_tokens <= problem.tokens_per_rank <= 24576
+    ):
+        return 1
     return (
         1
         if kernel.expected_rows_per_expert
