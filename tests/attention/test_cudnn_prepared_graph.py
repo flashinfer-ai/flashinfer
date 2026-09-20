@@ -22,6 +22,11 @@ import torch
 import flashinfer
 from flashinfer.cudnn import prefill as cudnn_prefill
 
+pytestmark = pytest.mark.skipif(
+    not cudnn_prefill.CUDNN_AVAILABLE,
+    reason="requires the cudnn-frontend python package (cuDNN graph backend)",
+)
+
 
 def _reference(q, k, v, q_lens, kv_lens, scale):
     outputs, stats = [], []
