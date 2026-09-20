@@ -24,7 +24,7 @@ from typing import Any, Dict, List, Literal, Optional, Tuple, Union, overload
 
 import torch
 
-from .api_logging import flashinfer_api
+from .api_logging import flashinfer_api, flashinfer_experimental_api
 from .cudnn import cudnn_batch_prefill_with_kv_cache
 from .cudnn.prefill import _cudnn_supports_direct_seqlens
 from .jit import (
@@ -7575,3 +7575,23 @@ def trtllm_fmha_v2_prefill(
         return out, lse
     else:
         return out
+
+
+@flashinfer_experimental_api
+def prepare_nvfp4_attention(q, k, v, out, *, causal=False, backend="cake"):
+    """Prepare NVFP4 attention from contiguous BF16 [B,H,S,128] tensors.
+
+    The experimental Cake backend requires SM103 and noncausal S divisible
+    by 512. Preparation quantizes Q/K/V to block-scaled E2M1 and returns an
+    NVFP4AttentionRunner. Calling the runner executes QK, softmax and PV
+    attention and writes the caller-owned BF16 output without CUDA allocation.
+    Prepare a new runner after changing input values or bindings. CUDA Graph
+    ownership remains with the caller.
+    """
+    if backend != "cake":
+        raise ValueError("NVFP4 attention currently supports backend='cake'")
+    from .experimental.nvfp4_attention.cake_backend import (
+        prepare_nvfp4_attention as prepare,
+    )
+
+    return prepare(q, k, v, out, causal=causal, backend="cake")

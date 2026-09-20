@@ -70,6 +70,7 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*"]
 "flashinfer.data.cccl" = "3rdparty/cccl"
 
 [tool.setuptools.package-data]
+"flashinfer.experimental.nvfp4_attention" = ["csrc/**"]
 "flashinfer" = ["_build_meta.py"]
 "flashinfer.prims_ts.moe" = ["prims_ts_moe_configs.json"]
 # Capability surface of the NVFP4 MSA decode and prefill kernels, loaded at runtime via
