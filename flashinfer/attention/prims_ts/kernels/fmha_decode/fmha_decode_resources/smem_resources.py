@@ -281,7 +281,6 @@ def _issue_sparse_page_copies(
     chunk_hd = min(head_dim_stage, 128 if cfg.use_fp8_qkv else 64)
     chunks = head_dim_stage // chunk_hd
     fragments = cfg.tile_size_kv // cfg.num_tokens_per_page
-    warp = _load_task_warp_rank(cfg)
     if cutlass.const_expr(
         cfg.use_flat_native_kv_tma
         and cfg.kv_dtype == cutlass.BFloat16
@@ -290,6 +289,7 @@ def _issue_sparse_page_copies(
         # Prefetch warp-owned locators before TMA issue and reuse each across
         # BF16's head chunks. Static indexing keeps the small array in registers.
         fragments_per_warp = fragments // cfg.load_num_warps
+        warp = _load_task_warp_rank(cfg)
         if prims.elect_sync():
             locators = cutlass.Array(
                 Int32, (fragments_per_warp,), space=cutlass.AddressSpace.rmem
@@ -321,6 +321,7 @@ def _issue_sparse_page_copies(
     copies = fragments * chunks
     copies_per_warp = (copies + cfg.load_num_warps - 1) // cfg.load_num_warps
     lane = cute.arch.thread_idx()[0] & Int32(31)
+    warp = _load_task_warp_rank(cfg)
     for iteration in cutlass.range_constexpr((copies_per_warp + 31) // 32):
         local_copy = lane + Int32(iteration * 32)
         copy = warp * Int32(copies_per_warp) + local_copy
