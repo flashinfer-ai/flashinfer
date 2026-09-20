@@ -147,7 +147,7 @@ def benchmark_case(args, rank, world, length):
 
     with UlyssesCommunicator(
         dist.group.WORLD,
-        max_elems=q.numel(),
+        max_bytes=max(q.nbytes, int(spec["payload_bytes"])),
         dtype=q.dtype,
         backend="nccl",
         device=device,

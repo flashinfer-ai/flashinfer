@@ -12,7 +12,7 @@ Fused amax/pack and aligned-only receiver implementations are deferred.
 Use the existing `UlyssesCommunicator` with two additional methods:
 
 ```python
-with UlyssesCommunicator(group, max_elems=q.numel(), dtype=q.dtype,
+with UlyssesCommunicator(group, max_bytes=3 * q.nbytes, dtype=q.dtype,
                          device=q.device, backend="auto") as comm:
     workspace = comm.prepare_qkv(q.shape, used_sequence=U)
     encoded = comm.scatter_qkv(q, k, v, workspace=workspace)
@@ -30,9 +30,15 @@ be recovered this way. Ordinary `create_workspace` remains local.
 The dedicated `UlyssesQKVWorkspace` fixes owner, shape, P, dtype, layout and U.
 It reuses the statistics receive buffer and mixed-dtype payload storage;
 existing local statistics may still allocate temporaries. Capacity is derived
-internally from the selected layout. Each logical Q/K/V must fit `max_elems`,
-but that floating operand capacity does not limit the joint payload bytes or
-represent the total workspace memory.
+internally from the selected layout. The communicator's `max_bytes` must cover
+the complete packed Q/K/V operand, including scales and chunk alignment.
+`3 * q.nbytes` (the original floating Q/K/V total) is a conservative budget for
+both supported layouts; a single floating Q tensor's size is insufficient.
+Preparation checks the exact byte requirement before allocating wire buffers.
+NCCL allocates the actual wire size, not the full budget. Statistics and final
+outputs are separate storage, so this limit is not a total memory budget.
+Ordinary `UlyssesWorkspace` and `create_workspace(max_elems=...)` continue to
+express their staging capacities in elements.
 
 `UlyssesQKV` is a named tuple with six tensor fields (`q`, `k`, `v`, `q_scale`,
 `k_scale`, `v_scale`) and `layout`, `logical_sequence`, `used_sequence`,
@@ -43,10 +49,17 @@ contiguous result so its lifetime does not depend on statistical scratch.
 
 The prepared path accepts FP16/BF16, D64/D128, and P2/4/8 on homogeneous SM90
 or SM120 groups. It preserves the primitive stride and input-padding contract.
-Statistics AllGather and packed uint8 AllToAll use NCCL on the existing group;
-`workspace.transport` exposes that choice. `comm.backend` still selects
-ordinary scatter/gather, including NVLink output communication. No additional
-backend configuration, public byte transport or constructor argument is added.
+Statistics AllGather uses NCCL on the existing group. Packed uint8 AllToAll
+uses the communicator's `exchange_chunks` interface: `[P, chunk_bytes]` becomes
+`[1, 1, P, chunk_bytes]` through a zero-copy view, with destination-major send
+and source-major receive ordering. The current `nccl` and `nvlink` backends
+both use NCCL for chunks; `workspace.transport` exposes that choice. Ordinary
+scatter/gather retains its NCCL or fused NVLink route. `allocate_output`
+provides ordinary PyTorch receive storage; no PCIe registration is introduced.
+The constructor's `max_bytes`, chunk exchange and output allocation follow
+the API proposed in PR #4876, without adding that PR's PCIe/RDMA implementation.
+Only chunk exchange supports overriding the communicator dtype, including
+`torch.uint8`; dtype selection never performs quantization or conversion.
 All operations are serialized on the current stream. There is no ordinary
 floating `scatter_qkv` mode, automatic workspace cache or Sage package dependency.
 

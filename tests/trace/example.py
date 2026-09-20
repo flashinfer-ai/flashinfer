@@ -13,6 +13,7 @@ The output directory is controlled by FLASHINFER_TRACE_DUMP_DIR.
 Requires a CUDA-capable GPU.
 
 Results:
+- ulysses_exchange_chunks_ws1_c256.json
 - ulysses_lowp_k_sum_v_amax_h8_d64.json
 - ulysses_lowp_q_grouped_amax_h8_d64_p8.json
 - ulysses_lowp_k_grouped_amax_h8_d64_p8.json
@@ -2668,6 +2669,25 @@ with contextlib.suppress(Exception):
 
 
 # Ulysses trace schemas can be generated on CPU, independently of kernel support.
+def dump_ulysses_exchange_chunks_trace(save_dir):
+    from types import SimpleNamespace
+
+    from flashinfer.comm import UlyssesCommunicator
+
+    # A schema-only single-rank reference. No communicator construction or
+    # collective is needed; real multi-rank payloads are tested in tests/comm/.
+    definition = UlyssesCommunicator.exchange_chunks.fi_trace(
+        self=SimpleNamespace(world_size=1),
+        x=torch.empty(1, 1, 1, 256, dtype=torch.uint8),
+        dtype=torch.uint8,
+    )
+    path = save_dir / f"{definition['name']}.json"
+    path.write_text(json.dumps(definition, indent=2) + "\n")
+
+
+dump_ulysses_exchange_chunks_trace(SAVE_DIR)
+
+
 def dump_ulysses_lowp_traces(save_dir):
     from flashinfer.comm import _ulysses_lowp as lowp
 

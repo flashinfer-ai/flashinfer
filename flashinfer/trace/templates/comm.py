@@ -364,6 +364,93 @@ pcie_ipc_all_reduce_trace = TraceTemplate(
 )
 
 
+# ── Ulysses packed chunk exchange ──────────────────────────────────────────
+
+
+@torch.no_grad()
+def _ulysses_single_rank_reference(
+    x: torch.Tensor, out: torch.Tensor = None, **_unused
+) -> torch.Tensor:
+    """Single-rank reference; multi-rank permutation is tested under tests/comm."""
+    result = x.clone()
+    if out is not None:
+        out.copy_(result)
+        return out
+    return result
+
+
+class _UlyssesSingleRankTraceTemplate(TraceTemplate):
+    """Read the real group size so trace-apply cannot route multi-rank calls here."""
+
+    def _build_axis_extractors(self):
+        extractors = super()._build_axis_extractors()
+
+        def extract_world_size(kwargs):
+            communicator = kwargs.get("self")
+            world_size = getattr(communicator, "world_size", None)
+            return None if world_size is None else int(world_size)
+
+        extractors["world_size"] = extract_world_size
+        return extractors
+
+
+_ulysses_exchange_chunks_template = _UlyssesSingleRankTraceTemplate(
+    op_type="comm",
+    name_prefix="ulysses_exchange_chunks",
+    description=(
+        "Equal-length chunk all-to-all over an already-packed payload: chunk "
+        "r goes to peer r and lands in slot rank there. No element conversion "
+        "or layout permutation is performed. The reference models the "
+        "world_size=1 identity; multi-rank correctness is tested under tests/comm/."
+    ),
+    axes={
+        "batch_size": Const(abbrev="", description="Pinned to 1."),
+        "seq_len": Const(abbrev="", description="Pinned to 1."),
+        "chunk_count": Const(abbrev="", description="One contiguous chunk per peer."),
+        "world_size": Const(
+            value=1,
+            abbrev="ws",
+            description="fi_trace models the single-rank identity case only.",
+        ),
+        "chunk": Const(abbrev="c", description="Elements in one peer's chunk."),
+    },
+    inputs={
+        "x": Tensor(["batch_size", "seq_len", "chunk_count", "chunk"]),
+    },
+    outputs={
+        "output": Tensor(
+            ["batch_size", "seq_len", "chunk_count", "chunk"],
+            dtype_from="x",
+            param="out",
+        )
+    },
+    constraints=[
+        "batch_size == 1",
+        "seq_len == 1",
+        "world_size == 1",
+        "chunk_count == world_size",
+        "chunk > 0",
+    ],
+    tags=["stage:comm"],
+    reference=_ulysses_single_rank_reference,
+)
+
+
+def ulysses_exchange_chunks_trace(**kwargs):
+    """Trace only the identity case; multi-rank collectives need all peer inputs."""
+    communicator = kwargs.get("self")
+    return (
+        _ulysses_exchange_chunks_template
+        if getattr(communicator, "world_size", None) == 1
+        else None
+    )
+
+
+ulysses_exchange_chunks_trace.templates = (  # type: ignore[attr-defined]
+    _ulysses_exchange_chunks_template,
+)
+
+
 # ── Low-precision Ulysses A2A (flashinfer.comm._ulysses_lowp) ────────────────
 #
 # Quantization primitives around the sequence->head all-to-all of Ulysses
@@ -784,7 +871,8 @@ def _make_ulysses_scatter_qkv_trace(layout):
         description=(
             "Distributed SageAttention2 QKV preparation: local statistics, one "
             "FP32 NCCL AllGather, rank-ordered statistics finalization, quantize/pack, "
-            "one uint8 NCCL AllToAll, and unpack. Requires an existing communicator "
+            "one uint8 NCCL AllToAll through exchange_chunks, and unpack. "
+            "Requires an existing communicator "
             "and prepare_qkv workspace on every rank, in the same collective order. "
             "This schema describes a distributed operation; it has no single-GPU "
             "reference or automatic process-group/workspace initializer. Returned "

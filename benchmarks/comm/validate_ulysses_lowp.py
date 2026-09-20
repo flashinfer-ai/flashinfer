@@ -57,7 +57,7 @@ def compare_communicator(shard, used, reference, payload, recv):
 
     with UlyssesCommunicator(
         dist.group.WORLD,
-        max_elems=shard[0].numel(),
+        max_bytes=max(shard[0].nbytes, payload.nbytes),
         dtype=shard[0].dtype,
         backend="nccl",
         device=shard[0].device,

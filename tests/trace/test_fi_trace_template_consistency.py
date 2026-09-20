@@ -312,6 +312,12 @@ def _make_sample_kwargs(template: TraceTemplate, axis_size: int = 4) -> Dict[str
             workspace=SimpleNamespace(world_size=8, used_sequence=513),
         )
 
+    if template.name_prefix == "ulysses_exchange_chunks":
+        kwargs.update(
+            self=SimpleNamespace(world_size=1),
+            x=torch.empty(1, 1, 1, axis_size, dtype=torch.uint8),
+        )
+
     return kwargs
 
 

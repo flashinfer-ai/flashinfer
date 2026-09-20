@@ -1,6 +1,6 @@
 {
   "name": "ulysses_scatter_qkv_sage2_sm90_h8_d128_p8_u513",
-  "description": "Distributed SageAttention2 QKV preparation: local statistics, one FP32 NCCL AllGather, rank-ordered statistics finalization, quantize/pack, one uint8 NCCL AllToAll, and unpack. Requires an existing communicator and prepare_qkv workspace on every rank, in the same collective order. This schema describes a distributed operation; it has no single-GPU reference or automatic process-group/workspace initializer. Returned UlyssesQKV fields are listed in tuple order; when out is supplied, its six tensors are filled and the same result record is returned. Input rows outside the global used_sequence prefix must already be zero.",
+  "description": "Distributed SageAttention2 QKV preparation: local statistics, one FP32 NCCL AllGather, rank-ordered statistics finalization, quantize/pack, one uint8 NCCL AllToAll through exchange_chunks, and unpack. Requires an existing communicator and prepare_qkv workspace on every rank, in the same collective order. This schema describes a distributed operation; it has no single-GPU reference or automatic process-group/workspace initializer. Returned UlyssesQKV fields are listed in tuple order; when out is supplied, its six tensors are filled and the same result record is returned. Input rows outside the global used_sequence prefix must already be zero.",
   "op_type": "comm",
   "tags": [
     "fi_api:flashinfer.comm.ulysses.UlyssesCommunicator.scatter_qkv",

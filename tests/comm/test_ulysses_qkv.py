@@ -33,6 +33,23 @@ def _shards(rank, world, batch, length, dim, dtype, used, *, contiguous=False):
     return tuple(t.contiguous() for t in shard) if contiguous else shard
 
 
+def _payload_bytes(shape, world):
+    cls = (
+        lowp.UlyssesLowpSageLayoutSM90
+        if torch.cuda.get_device_capability() == (9, 0)
+        else lowp.UlyssesLowpSageLayout
+    )
+    batch, length, heads, dim = shape
+    return int(
+        cls(head_dim=dim).payload_spec(
+            batch_size=batch,
+            local_sequence=length,
+            num_heads=heads,
+            world_size=world,
+        )["payload_bytes"]
+    )
+
+
 def _standalone(shard, rank, world, group, used):
     """Retain the pre-communicator execution chain as the byte-level oracle."""
     cls = (
@@ -105,19 +122,37 @@ def _correctness_body(rank, world, group, dim):
             shard[2].zero_()
         expected, payload, recv = _standalone(shard, rank, world, group, used)
         with UlyssesCommunicator(
-            group, max_elems=shard[0].numel(), dtype=dtype, backend="nccl"
+            group,
+            max_bytes=_payload_bytes(shard[0].shape, world),
+            dtype=dtype,
+            backend="nccl",
         ) as comm:
             workspace = comm.prepare_qkv(shard[0].shape, used_sequence=used)
             assert workspace.transport == "nccl"
             assert comm.backend == "nccl"
-            actual = comm.scatter_qkv(*shard, workspace=workspace)
+            exchange = comm.exchange_chunks
+            calls = []
+
+            def recording_exchange(x, *, out=None, dtype=None):
+                assert x.shape == (1, 1, world, payload.shape[-1])
+                assert x.data_ptr() == workspace._send_buffer.data_ptr()
+                assert out.data_ptr() == workspace._recv_buffer.data_ptr()
+                assert dtype == torch.uint8
+                calls.append(x.shape)
+                return exchange(x, out=out, dtype=dtype)
+
+            with pytest.MonkeyPatch.context() as patch:
+                patch.setattr(comm, "exchange_chunks", recording_exchange)
+                actual = comm.scatter_qkv(*shard, workspace=workspace)
+            assert len(calls) == 1
             _assert_result(
                 actual, expected, used=used, total=world * length, dtype=dtype
             )
             _assert_bytes(workspace._send_buffer, payload)
             _assert_bytes(workspace._recv_buffer, recv)
-            # Byte workspace can exceed the original floating-operand budget.
-            assert workspace._send_buffer.numel() > shard[0].numel() * dtype.itemsize
+            # The budget covers the joint wire payload, including scales/padding.
+            assert workspace._send_buffer.nbytes == comm.max_bytes
+            assert comm.max_bytes > shard[0].nbytes
             reused = comm.scatter_qkv(*shard, workspace=workspace, out=actual)
             assert reused is actual
             _assert_result(
@@ -138,11 +173,40 @@ def test_qkv_matches_standalone(world_size, head_dim):
     _run_multi_rank(_correctness_body, world_size, head_dim, timeout=600)
 
 
+def _payload_capacity_body(rank, world, group, _arg):
+    shard = _shards(rank, world, 1, 65, 64, torch.bfloat16, 129)
+    payload_bytes = _payload_bytes(shard[0].shape, world)
+    assert payload_bytes > shard[0].nbytes
+    with UlyssesCommunicator(
+        group, max_bytes=shard[0].nbytes, dtype=shard[0].dtype, backend="nccl"
+    ) as comm:
+        with pytest.raises((ValueError, RuntimeError), match="max_bytes|capacity"):
+            comm.prepare_qkv(shard[0].shape, used_sequence=129)
+        # Rejecting the Lowp wire size does not invalidate ordinary communication.
+        assert comm.scatter_heads(shard[0].contiguous()).numel() == shard[0].numel()
+    with UlyssesCommunicator(
+        group, max_bytes=payload_bytes, dtype=shard[0].dtype, backend="nccl"
+    ) as comm:
+        workspace = comm.prepare_qkv(shard[0].shape, used_sequence=129)
+        assert workspace._send_buffer.nbytes == payload_bytes
+        expected, _, _ = _standalone(shard, rank, world, group, 129)
+        actual = comm.scatter_qkv(*shard, workspace=workspace)
+        _assert_result(
+            actual, expected, used=129, total=world * 65, dtype=shard[0].dtype
+        )
+    return "ok", "joint QKV wire capacity includes scales and alignment"
+
+
+def test_qkv_capacity_covers_joint_payload():
+    _require_gpus(2)
+    _run_multi_rank(_payload_capacity_body, 2, None, timeout=600)
+
+
 def _ownership_body(rank, world, group, _arg):
     shape = (2, 128, world, 64)
     dtype = torch.bfloat16
     with UlyssesCommunicator(
-        group, max_elems=2 * 128 * world * 64, dtype=dtype, backend="nccl"
+        group, max_bytes=_payload_bytes(shape, world), dtype=dtype, backend="nccl"
     ) as comm:
         workspace = comm.prepare_qkv(shape, used_sequence=129)
         shard = _shards(rank, world, 2, 128, 64, dtype, 129)
@@ -193,7 +257,10 @@ def _ownership_body(rank, world, group, _arg):
             comm.scatter_qkv(misaligned, *shard[1:], workspace=workspace)
         with (
             UlyssesCommunicator(
-                group, max_elems=shard[0].numel(), dtype=dtype, backend="nccl"
+                group,
+                max_bytes=_payload_bytes(shard[0].shape, world),
+                dtype=dtype,
+                backend="nccl",
             ) as other,
             pytest.raises((ValueError, TypeError)),
         ):
@@ -215,7 +282,10 @@ def test_qkv_output_ownership_and_validation():
 def _mutated_tensor_body(rank, world, group, _arg):
     shard = _shards(rank, world, 1, 65, 64, torch.bfloat16, 129)
     with UlyssesCommunicator(
-        group, max_elems=shard[0].numel(), dtype=shard[0].dtype, backend="nccl"
+        group,
+        max_bytes=_payload_bytes(shard[0].shape, world),
+        dtype=shard[0].dtype,
+        backend="nccl",
     ) as comm:
         workspace = comm.prepare_qkv(shard[0].shape, used_sequence=129)
         output = comm.scatter_qkv(*shard, workspace=workspace)
@@ -308,7 +378,10 @@ def test_qkv_standalone_primitives_keep_public_validation():
 def _prepare_failure_body(rank, world, group, _arg):
     shape = (1, 128, world, 64)
     with UlyssesCommunicator(
-        group, max_elems=2 * 128 * world * 128, dtype=torch.bfloat16, backend="nccl"
+        group,
+        max_bytes=_payload_bytes((2, 128, world, 128), world),
+        dtype=torch.bfloat16,
+        backend="nccl",
     ) as comm:
         workspace = comm.prepare_qkv(shape, used_sequence=129)
         shard = _shards(rank, world, 1, 128, 64, torch.bfloat16, 129)
@@ -361,7 +434,10 @@ def test_qkv_prepare_failures_are_collective_and_recoverable():
 def _mixed_backend_body(rank, world, group, _arg):
     shard = _shards(rank, world, 1, 65, 64, torch.bfloat16, 129)
     with UlyssesCommunicator(
-        group, max_elems=shard[0].numel(), dtype=shard[0].dtype, backend="nvlink"
+        group,
+        max_bytes=_payload_bytes(shard[0].shape, world),
+        dtype=shard[0].dtype,
+        backend="nvlink",
     ) as comm:
         workspace = comm.prepare_qkv(shard[0].shape, used_sequence=129)
         assert comm.backend == "nvlink" and workspace.transport == "nccl"
@@ -381,7 +457,7 @@ def test_qkv_nccl_input_nvlink_output():
 def _single_rank_body(rank, world, group, _arg):
     x = torch.randn(1, 8, 2, 64, dtype=torch.bfloat16, device="cuda")
     with UlyssesCommunicator(
-        group, max_elems=x.numel(), dtype=x.dtype, backend="nccl"
+        group, max_bytes=x.nbytes, dtype=x.dtype, backend="nccl"
     ) as comm:
         with pytest.raises((ValueError, RuntimeError)):
             comm.prepare_qkv(x.shape)
@@ -401,7 +477,7 @@ def _non_nccl_group_body(rank, world, group, _arg):
         x = torch.full((1, 4, world, 64), rank + 1, dtype=torch.bfloat16, device="cuda")
         with UlyssesCommunicator(
             metadata_group,
-            max_elems=x.numel(),
+            max_bytes=x.nbytes,
             dtype=x.dtype,
             backend="nvlink",
         ) as comm:
