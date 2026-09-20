@@ -260,8 +260,7 @@ def _resolution(spec, family: _Family) -> _Resolution:
             sorted(
                 str(path.relative_to(link))
                 for path in link.rglob("*")
-                if path.is_file()
-                and not path.name.endswith((".tmp", ".lock"))
+                if path.is_file() and not path.name.endswith((".tmp", ".lock"))
             )
         ),
     )
@@ -370,12 +369,14 @@ def test_generating_b_does_not_rewrite_a(workspace, monkeypatch):
     assert "kernel_b_" in (root_b / "flashinferMetaInfo.h").read_text()
     assert "kernel_b_" not in manifest_a
     # A's export symlink still points at A's publish, not at B's.
-    assert _export_link(root_a, BMM).resolve() == (
-        workspace.cubin / _BMM_PIN_A / "include" / BMM.export_dir
-    ).resolve()
-    assert _export_link(root_b, BMM).resolve() == (
-        workspace.cubin / _BMM_PIN_B / "include" / BMM.export_dir
-    ).resolve()
+    assert (
+        _export_link(root_a, BMM).resolve()
+        == (workspace.cubin / _BMM_PIN_A / "include" / BMM.export_dir).resolve()
+    )
+    assert (
+        _export_link(root_b, BMM).resolve()
+        == (workspace.cubin / _BMM_PIN_B / "include" / BMM.export_dir).resolve()
+    )
     # ... and A's build file only ever references A's include root.
     ninja_a = spec_a.ninja_path.read_text()
     assert f"-I{root_a.resolve()}" in ninja_a
@@ -501,9 +502,9 @@ def test_concurrent_versions_share_a_cache_without_cross_redirect(
         assert resolution.headers == tuple(sorted(BMM.headers))
         expected, kept, _ = filter_metainfo(_manifest(tag), BLACKWELL_CUBIN_ARCHS)
         assert kept == 2
-        assert resolution.manifest_sha256 == hashlib.sha256(
-            expected.encode()
-        ).hexdigest()
+        assert (
+            resolution.manifest_sha256 == hashlib.sha256(expected.encode()).hexdigest()
+        )
 
 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="needs the fork start method")
