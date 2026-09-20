@@ -293,35 +293,20 @@ def test_pcie_registration_failure_poisons_and_defers_cleanup(
     assert comm._state == ulysses_mod._CLOSED
 
 
+@pytest.mark.parametrize("route", ["p2p", "hybrid"])
 @pytest.mark.parametrize(
-    "failure_stage", ["missing_output", "capture", "current_stream"]
+    "failure_stage", ["missing_output", "bad_out", "capture", "current_stream"]
 )
-def test_pcie_p2p_pre_enqueue_failure_poisons_collective_close(
-    monkeypatch, failure_stage
-):
-    """A local pre-enqueue failure may strand a peer's asynchronous barrier."""
-    ulysses_mod = importlib.import_module("flashinfer.comm.ulysses")
-    comm = _make_mock_pcie_comm()
-    comm.transport = "p2p"
-    module = SimpleNamespace(
-        teardown_safe=lambda *_args: pytest.fail(
-            "Python poison must reject close without trusting a native query"
-        ),
-    )
-    monkeypatch.setattr(ulysses_mod, "get_ulysses_pcie_module", lambda: module)
-    monkeypatch.setattr(torch.cuda, "device", lambda _device: contextlib.nullcontext())
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
-    monkeypatch.setattr(
-        torch.cuda,
-        "synchronize",
-        lambda *_args: pytest.fail("poisoned close must not synchronize"),
-    )
-
+def _pre_enqueue_failure(monkeypatch, comm, failure_stage):
+    """Drive one collective into a failure before native code; return the call."""
     x = torch.empty((1, 2, 4, 2), dtype=torch.float16)
     out = torch.empty((1, 4, 2, 2), dtype=torch.float16)
     comm._pcie_outputs[out.data_ptr()] = 0
     if failure_stage == "missing_output":
         out = None
+    elif failure_stage == "bad_out":
+        out = torch.empty((1, 4, 2, 2), dtype=torch.uint8)
+        comm._pcie_outputs[out.data_ptr()] = 0
     elif failure_stage == "capture":
         monkeypatch.setattr(
             torch.cuda,
@@ -336,16 +321,74 @@ def test_pcie_p2p_pre_enqueue_failure_poisons_collective_close(
                 RuntimeError("injected current-stream failure")
             ),
         )
+    return lambda: comm.scatter_heads(x, out=out)
+
+
+@pytest.mark.parametrize(
+    "failure_stage", ["missing_output", "bad_out", "capture", "current_stream"]
+)
+def test_pcie_p2p_pre_enqueue_failure_poisons_collective_close(
+    monkeypatch, failure_stage
+):
+    """A local pre-enqueue failure may strand a peer's asynchronous barrier,
+    and the all-P2P barrier has no abort protocol to release it. A rejected
+    call also never binds the communicator to the caller's stream."""
+    ulysses_mod = importlib.import_module("flashinfer.comm.ulysses")
+    comm = _make_mock_pcie_comm()
+    comm.transport = "p2p"
+    module = SimpleNamespace(
+        exchange=lambda *_args: pytest.fail("native exchange must not run"),
+        teardown_safe=lambda *_args: pytest.fail(
+            "Python poison must reject close without trusting a native query"
+        ),
+    )
+    monkeypatch.setattr(ulysses_mod, "get_ulysses_pcie_module", lambda: module)
+    monkeypatch.setattr(torch.cuda, "device", lambda _device: contextlib.nullcontext())
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(
+        torch.cuda,
+        "synchronize",
+        lambda *_args: pytest.fail("poisoned close must not synchronize"),
+    )
+    call = _pre_enqueue_failure(monkeypatch, comm, failure_stage)
 
     with pytest.raises(RuntimeError, match="BROKEN state"):
-        comm.scatter_heads(x, out=out)
+        call()
 
     assert comm._state == ulysses_mod._BROKEN
     assert comm._pcie_python_teardown_safe is False
+    assert comm._pcie_stream is None
 
     with pytest.raises(RuntimeError, match="process termination required"):
         comm.close()
     assert comm._state == ulysses_mod._CLOSING
+
+
+@pytest.mark.parametrize(
+    "failure_stage", ["missing_output", "bad_out", "capture", "current_stream"]
+)
+def test_pcie_rdma_pre_enqueue_failure_stays_open(monkeypatch, failure_stage):
+    """On the RDMA routes a rejection decided from the call's own arguments is
+    rank-uniform under the SPMD contract, so it is an ordinary error: the
+    communicator stays OPEN, native is never reached, no stream is bound."""
+    ulysses_mod = importlib.import_module("flashinfer.comm.ulysses")
+    comm = _make_mock_pcie_comm()
+    assert comm.transport == "hybrid"
+    module = SimpleNamespace(
+        exchange=lambda *_args: pytest.fail("native exchange must not run"),
+    )
+    monkeypatch.setattr(ulysses_mod, "get_ulysses_pcie_module", lambda: module)
+    monkeypatch.setattr(torch.cuda, "device", lambda _device: contextlib.nullcontext())
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    call = _pre_enqueue_failure(monkeypatch, comm, failure_stage)
+
+    with pytest.raises((ValueError, RuntimeError)) as info:
+        call()
+    assert "BROKEN" not in str(info.value)
+
+    assert comm._state == ulysses_mod._OPEN
+    assert comm._pcie_python_teardown_safe is True
+    assert comm._pcie_stream is None
 
 
 def test_multirank_pcie_refuses_workspaces_and_head_chunk_primitives(monkeypatch):
@@ -2959,6 +3002,66 @@ def test_pcie_p2p_validation_fail_stop_two_ranks(bad_kind):
     rejection lands as the all-P2P fail-stop contract (BROKEN, close refused),
     not as a recoverable error."""
     _run_multi_rank("_pcie_p2p_fail_stop_body", 2, bad_kind, allow_skip=True)
+
+
+def _pcie_native_validation_breaks_group_body(rank, world_size, group, _arg):
+    """A native rejection on the RDMA route publishes the abort before anything moves.
+
+    The per-call operand checks run inside the transport's abort envelope, so
+    a rank whose operand native rejects releases the peer already waiting in
+    the opening barrier instead of leaving it there without a deadline. Both
+    ranks end BROKEN, and because the abort was published, close() completes
+    on both.
+    """
+    device = torch.device("cuda", rank)
+    missing = missing_ulysses_pcie_dependencies()
+    if missing:
+        raise UlyssesBackendError(
+            f"PCIe transport needs {', '.join(missing)}, missing on this machine"
+        )
+    ulysses_mod = importlib.import_module("flashinfer.comm.ulysses")
+    os.environ["FLASHINFER_ULYSSES_PCIE_ROUTE"] = "rdma"
+    torch.manual_seed(4700 + rank)
+    good = torch.randn((1, 8, world_size * 2, 16), dtype=torch.bfloat16, device=device)
+    comm = UlyssesCommunicator(
+        max_bytes=good.nbytes, dtype=torch.bfloat16, backend="pcie", device=device
+    )
+    if comm.transport not in ("hybrid", "rdma"):
+        raise UlyssesBackendError(
+            f"forced rdma fell back to {comm.transport}; this case is about the "
+            "RDMA abort envelope"
+        )
+    out = comm.allocate_output(good, "scatter_heads")
+    comm.scatter_heads(good, out=out)
+    torch.cuda.synchronize(device)
+
+    if rank == 0:
+        # Bypass the Python dtype check so the mismatch reaches native, which
+        # re-checks the operands against the registered buffer.
+        comm._validate_out = lambda *_args, **_kwargs: None
+        bad = good.view(torch.float16)
+        try:
+            comm.scatter_heads(bad, out=out, dtype=torch.float16)
+            raise AssertionError("native must reject the dtype mismatch")
+        except RuntimeError as e:
+            assert "BROKEN" in str(e) and "dtype" in str(e), e
+    else:
+        try:
+            comm.scatter_heads(good, out=out)
+            raise AssertionError("the peer's abort must break this exchange")
+        except RuntimeError as e:
+            assert "BROKEN" in str(e) and "aborted" in str(e), e
+
+    # The abort was published natively, so teardown stays safe on both ranks.
+    comm.close()
+    assert comm._state == ulysses_mod._CLOSED
+    return ("ok", world_size)
+
+
+def test_pcie_native_validation_failure_breaks_group_rdma():
+    _run_multi_rank(
+        "_pcie_native_validation_breaks_group_body", 2, None, allow_skip=True
+    )
 
 
 def _pcie_mixed_dtype_body(rank, world_size, group, _arg):
