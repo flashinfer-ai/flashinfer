@@ -70,21 +70,28 @@ def test_sampling_last_valid_fallback(vocab_size, indices_dtype, deterministic):
 
 
 @pytest.mark.parametrize("vocab_size", [4095, 4096, 4097, 16387])
-@pytest.mark.parametrize("sampling_type", ["plain", "top_k", "top_p", "min_p", "joint"])
+@pytest.mark.parametrize(
+    "sampling_type,mass",
+    [(name, 1.0) for name in ["plain", "top_k", "top_p", "min_p", "joint"]]
+    + [(name, 1e-20) for name in ["plain", "top_k", "top_p", "joint"]],
+)
 @pytest.mark.parametrize("deterministic", [False, True])
-def test_sampling_masked_tiles_graph(vocab_size, sampling_type, deterministic):
+def test_sampling_masked_tiles_graph(vocab_size, sampling_type, mass, deterministic):
+    # Tiny mass forces fallback; min-p scales its uniform by the eligible mass,
+    # so its one-hot input only covers normal selection.
+    # k=2 prevents a bad zero-probability fallback from being hidden by a retry.
     probs = torch.zeros(4, vocab_size, device="cuda")
     positions = torch.tensor([0, 1023, 2047, vocab_size - 1], device="cuda")
     rows = torch.arange(4, device="cuda")
-    probs[rows, positions] = 1
+    probs[rows, positions] = mass
     ops = {
         "plain": (flashinfer.sampling.sampling_from_probs, {}),
-        "top_k": (flashinfer.sampling.top_k_sampling_from_probs, {"top_k": 1}),
+        "top_k": (flashinfer.sampling.top_k_sampling_from_probs, {"top_k": 2}),
         "top_p": (flashinfer.sampling.top_p_sampling_from_probs, {"top_p": 0.9}),
         "min_p": (flashinfer.sampling.min_p_sampling_from_probs, {"min_p": 0.1}),
         "joint": (
             flashinfer.sampling.top_k_top_p_sampling_from_probs,
-            {"top_k": 1, "top_p": 0.9, "filter_apply_order": "joint"},
+            {"top_k": 2, "top_p": 0.9, "filter_apply_order": "joint"},
         ),
     }
     op, kwargs = ops[sampling_type]
@@ -102,7 +109,7 @@ def test_sampling_masked_tiles_graph(vocab_size, sampling_type, deterministic):
     # A later replay must not retain the previous call's local fallback candidate.
     probs.zero_()
     positions = vocab_size - 1 - positions
-    probs[rows, positions] = 1
+    probs[rows, positions] = mass
     graph.replay()
     torch.testing.assert_close(samples, positions.to(torch.int32), atol=0, rtol=0)
 
