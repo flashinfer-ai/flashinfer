@@ -352,7 +352,6 @@ def validate_cuda_config(config: Any, repo_root: Path) -> None:
         _string(entry, "image", context, IMAGE_PATTERN)
         _string(entry, "cudnn_version", context, CUDNN_PATTERN)
         runtime_by_label[label] = entry
-        _validate_devcontainer(repo_root, entry, context)
 
     jit_by_label: dict[str, dict[str, Any]] = {}
     for index, entry in enumerate(jit_entries):
@@ -363,6 +362,9 @@ def validate_cuda_config(config: Any, repo_root: Path) -> None:
         _architecture_array(entry, "x86_64_provider_architectures", context)
         _architecture_array(entry, "aarch64_provider_architectures", context)
         jit_by_label[label] = entry
+
+    for index, entry in enumerate(runtime_entries):
+        _validate_devcontainer(repo_root, entry, f"runtime[{index}]")
 
     missing_jit = sorted(runtime_by_label.keys() - jit_by_label.keys())
     if missing_jit:

@@ -89,6 +89,19 @@ def test_provider_release_matrix_rejects_duplicate_architectures(
         cuda_config_module.validate_cuda_config(invalid_config, REPO_ROOT)
 
 
+def test_duplicate_architecture_error_precedes_devcontainer_validation(
+    cuda_config_module, tmp_path
+):
+    config = json.loads((REPO_ROOT / "ci" / "cuda-versions.json").read_text())
+    invalid_config = deepcopy(config)
+    invalid_config["jit_cache"][0]["x86_64_provider_architectures"].append("8.0")
+
+    with pytest.raises(
+        cuda_config_module.ConfigError, match="contains duplicate architectures"
+    ):
+        cuda_config_module.validate_cuda_config(invalid_config, tmp_path)
+
+
 def test_release_verifier_rejects_duplicate_wheel_distributions(
     monkeypatch, tmp_path, release_verifier_module
 ):
