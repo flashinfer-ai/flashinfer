@@ -352,6 +352,14 @@ class _Stage:
         )
 
     def plan_index(self, tactic):
+        if type(tactic) is int:
+            if tactic == -1 or tactic in self.tactic_indices.values():
+                return tactic
+        elif isinstance(tactic, tuple):
+            try:
+                return self.tactic_indices[tactic]
+            except (KeyError, TypeError):
+                pass
         index = _plan_index(self.graph, tactic)
         if index != -1 and index not in self.tactic_indices.values():
             raise ValueError(
