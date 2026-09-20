@@ -118,7 +118,7 @@ def prepare(shape, *, backend="nvlink", group=None, inputs=None, outputs=None):
         )
     communicator = UlyssesCommunicator(
         group,
-        max_elems=batch * sequence * heads * head_dim,
+        max_bytes=batch * sequence * heads * head_dim * dtype.itemsize,
         dtype=dtype,
         backend=backend,
     )
