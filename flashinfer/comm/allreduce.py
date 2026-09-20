@@ -475,6 +475,21 @@ def _support_agreement_comm(
     than a collective being invented, because process-group creation here would
     outlive the caller's own setup and is what the workspace constructors do
     themselves.
+
+    Parameters
+    ----------
+    world_size : int
+        Number of ranks that will share the workspace.
+    comm_backend : Optional[CommBackend]
+        The caller's collective, when it supplied one.
+    group : Optional[ProcessGroup]
+        Process group to wrap when no ``comm_backend`` was supplied and torch
+        distributed is initialized.
+
+    Returns
+    -------
+    Optional[CommBackend]
+        The collective to agree over, or ``None`` when none is reachable.
     """
     if world_size <= 1:
         return None
@@ -525,6 +540,28 @@ def _agree_on_support(
     and a rank that raised on its own would leave the others waiting there.
     Disagreement -- one rank supporting a backend another cannot run, or two
     ranks selecting different backends -- is reported on every rank.
+
+    Parameters
+    ----------
+    local_verdict : tuple
+        This rank's ``(supported, exception_name, message, selected_backend)``.
+    world_size : int
+        Number of ranks that will share the workspace.
+    comm_backend : Optional[CommBackend]
+        The caller's collective, when it supplied one.
+    group : Optional[ProcessGroup]
+        Process group to wrap when no ``comm_backend`` was supplied and torch
+        distributed is initialized.
+
+    Returns
+    -------
+    tuple
+        The agreed verdict, in the same shape as ``local_verdict``.
+
+    Raises
+    ------
+    BackendSupportedError
+        When the ranks do not agree, so no rank may build a workspace.
     """
     comm = _support_agreement_comm(world_size, comm_backend, group)
     if comm is None:
@@ -555,7 +592,29 @@ def _local_support_verdict(
     comm_backend: CommBackend | None,
     group: "ProcessGroup | None",
 ) -> tuple[bool, str | None, str | None, str | None]:
-    """This rank's verdict as data, so the group can agree before any raise."""
+    """This rank's verdict as data, so the group can agree before any raise.
+
+    Parameters
+    ----------
+    backend : str
+        ``"trtllm"``, ``"mnnvl"`` or ``"auto"``.
+    world_size, rank, max_token_num, hidden_dim : int
+        The configuration being created.
+    dtype : torch.dtype
+        Activation dtype the workspace will serve.
+    gpus_per_node : int
+        Ranks the process launcher placed on one node.
+    comm_backend : Optional[CommBackend]
+        The caller's collective, when it supplied one.
+    group : Optional[ProcessGroup]
+        Process group passed through to the capability vote.
+
+    Returns
+    -------
+    tuple
+        ``(supported, exception_name, message, selected_backend)`` with
+        ``exception_name``/``message`` set only when ``supported`` is False.
+    """
     if backend != "auto":
         if not _has_backend(backend):
             return (
