@@ -564,11 +564,15 @@ def _repro(cfg: Cfg) -> str:
 
 
 class _CaseFailure(Exception):
-    """An invariant this case violated, held so the ledger can be consulted."""
+    """An invariant failure; only an independently diagnosed #5339 is waivable."""
+
+    def __init__(self, message, category="contract"):
+        super().__init__(message)
+        self.category = category
 
 
-def _fail(cfg: Cfg, why: str) -> None:
-    raise _CaseFailure("\n".join([why, _describe(cfg), _repro(cfg)]))
+def _fail(cfg: Cfg, why: str, *, category: str = "contract") -> None:
+    raise _CaseFailure("\n".join([why, _describe(cfg), _repro(cfg)]), category=category)
 
 
 # ---------------------------------------------------------------------------
@@ -633,7 +637,7 @@ def test_sampling_fuzz(cfg: Cfg):
     try:
         _run_case(cfg)
     except _CaseFailure as exc:
-        if finding is not None:
+        if finding is not None and exc.category == "row_threshold":
             pytest.xfail(f"[sampling] {cfg.label}: {finding.reason}\n{exc}")
         pytest.fail(str(exc), pytrace=False)
     # A passing case is not reported as an unexpected pass: one generated case is not
@@ -679,6 +683,19 @@ def _run_case(cfg: Cfg) -> None:
     if not (torch.all(samples >= 0) and torch.all(samples < cfg.vocab)):
         _fail(cfg, f"sample index out of range [0,{cfg.vocab})")
 
+    # Same seed/offset replays exactly on the same path.
+    replay, _ = _draw_samples(cfg, probs, seed, single_chunk=True)
+    first, _ = _draw_samples(cfg, probs, seed, single_chunk=True)
+    if not torch.equal(first, replay):
+        _fail(cfg, "same seed/offset did not replay identically")
+
+    # Same generator state -> identical output (documented deterministic path).
+    if cfg.use_indices:
+        _check_generator_replay(cfg, probs)
+
+    # Replay and structural contracts are checked before any known-failure waiver.
+    wrong_row_signature = _matches_wrong_row_top_k(cfg, probs64, samples, dist_idx)
+
     ok = may[dist_idx.long(), samples.long()]
     if not bool(ok.all()):
         i = int((~ok).nonzero()[0, 0].item())
@@ -687,6 +704,7 @@ def _run_case(cfg: Cfg) -> None:
             cfg,
             f"dist {d}: drew class {tok} (p={probs64[d, tok].item():.3e}) outside the "
             f"support (|support|={int(may[d].sum().item())})",
+            category="row_threshold" if wrong_row_signature else "support",
         )
 
     # Mirror: a required class with a high enough expected count must appear. The count
@@ -711,17 +729,23 @@ def _run_case(cfg: Cfg) -> None:
             f"dist {d}: class {tok} is required by the support with at least "
             f"~{expected[d, tok].item():.0f} expected draws but was never drawn "
             f"({int(n_per_row[d].item())} draws for this row)",
+            category="row_threshold" if wrong_row_signature else "required_draw",
         )
 
-    # Same seed/offset replays exactly on the same path.
-    replay, _ = _draw_samples(cfg, probs, seed, single_chunk=True)
-    first, _ = _draw_samples(cfg, probs, seed, single_chunk=True)
-    if not torch.equal(first, replay):
-        _fail(cfg, "same seed/offset did not replay identically")
-
-    # Same generator state -> identical output (documented deterministic path).
-    if cfg.use_indices:
-        _check_generator_replay(cfg, probs)
+    # Individual must-draw classes do not encode the number of tied classes
+    # that a legal top-k implementation has to retain. Test that separately,
+    # without selecting which tied class should win.
+    if cfg.api == "top_k":
+        for d in range(nd):
+            k = cfg.top_k[d if cfg.per_request else 0]
+            minimum = reference_top_k_min_observed(probs64[d], k, int(n_per_row[d]))
+            distinct = int((obs[d] > 0).sum())
+            if distinct < minimum:
+                _fail(
+                    cfg,
+                    f"dist {d}: observed {distinct} classes, need at least {minimum}",
+                    category="row_threshold" if wrong_row_signature else "support_cardinality",
+                )
 
 
 def _draw_samples(cfg: Cfg, probs, seed, single_chunk: bool = False):
@@ -800,14 +824,10 @@ _PROBE_CFG = Cfg(
 
 
 def _run_indexed_top_k_probe() -> Optional[str]:
-    """Return None when per-request top_k follows indices, else what went wrong.
+    """Return a detail only for #5339's swapped-threshold signature.
 
-    Output 0 reads row 1 with k=4 and must reach all four classes; output 1 reads
-    row 0 with k=1 and must always be the argmax. Reading k by output position
-    swaps the two, so output 1 leaves class 0 with probability 1/2 per launch and
-    output 0 never leaves it. Over 256 launches a wrong kernel escapes with
-    probability 2**-256, and a correct one is misreported with probability at most
-    4 * (7/8)**256 ~ 5e-15.
+    Other failures are not known failures, even when this configuration matches
+    the ledger. The two rows keep the unfixed output-position read in bounds.
     """
     sampling = _flashinfer().sampling
     probs = torch.tensor([_PROBE_ROW, _PROBE_ROW], dtype=_DTYPE, device=_DEVICE)
@@ -816,17 +836,30 @@ def _run_indexed_top_k_probe() -> Optional[str]:
     seen = torch.zeros(2, len(_PROBE_ROW), dtype=torch.bool, device=_DEVICE)
     lanes = torch.arange(2, device=_DEVICE)
     for launch in range(_PROBE_LAUNCHES):
-        out = sampling.top_k_sampling_from_probs(
-            probs, top_k, indices=indices, seed=0x5339 + launch, offset=0
+        out, valid = sampling.top_k_sampling_from_probs(
+            probs,
+            top_k,
+            indices=indices,
+            seed=0x5339 + launch,
+            offset=0,
+            return_valid=True,
         )
+        assert out.shape == indices.shape and out.dtype == indices.dtype
+        assert valid.shape == indices.shape and valid.dtype == torch.bool
+        assert bool(valid.all())
+        assert bool(((out >= 0) & (out < probs.size(1))).all())
         seen[lanes, out.long()] = True
     torch.cuda.synchronize()
     wide, narrow = seen[0].tolist(), seen[1].tolist()
-    if not all(wide):
-        return f"output 0 (row 1, k=4) reached only {wide}, expected every class"
-    if narrow != [True, False, False, False]:
-        return f"output 1 (row 0, k=1) reached {narrow}, expected the argmax only"
-    return None
+    argmax_only = [True, False, False, False]
+    if all(wide) and narrow == argmax_only:
+        return None
+    if wide == argmax_only and all(narrow):
+        return "#5339 signature: output 0 used k=1 and output 1 used k=4"
+    raise _CaseFailure(
+        f"Unexpected indexed top-k probe support: output0={wide}, output1={narrow}",
+        category="probe_support",
+    )
 
 
 @_GPU_ONLY
@@ -1166,3 +1199,281 @@ def test_gof_result_shapes_and_range():
     assert 0.0 <= res.p_value <= 1.0
     assert res.tvd >= 0.0 and res.max_resid >= 0.0
     assert res.statistic >= 0.0
+
+
+def reference_top_k_min_observed(probs_row, top_k, num_draws):
+    """Minimum observed support size when the sampling budget makes it testable.
+
+    This does not choose a tie-break. If fewer than k classes are observed, all
+    draws lie in some subset of k-1 allowed classes. Every such subset omits a
+    class of probability at least pivot / allowed_mass. A union bound over those
+    subsets gives C(m, k-1) * exp(-num_draws * pivot / allowed_mass).
+    """
+    pivot = reference_top_k_pivot(probs_row, top_k)
+    if num_draws <= 0 or float(pivot) <= 0:
+        return 0
+    may = reference_top_k_support(probs_row, top_k) & (probs_row > 0)
+    m = int(may.sum())
+    k = min(top_k, m)
+    if k <= 0:
+        return 0
+    log_subsets = math.lgamma(m + 1) - math.lgamma(k) - math.lgamma(m - k + 2)
+    log_bound = log_subsets - num_draws * float(pivot / probs_row[may].sum())
+    return k if log_bound <= -64.0 else 0
+
+
+def _matches_wrong_row_top_k(cfg, probs64, samples, dist_idx):
+    """Check whether #5339's output-position thresholds explain the observations.
+
+    The tracked path reverses the rows and emits exactly one output per row in
+    each launch. Thus output-position indexing gives row d the threshold of row
+    num_dist-1-d. Merely matching the configuration is not enough for a waiver.
+    """
+    if not _indexed_per_request_top_k(cfg):
+        return False
+    if cfg.top_k == list(reversed(cfg.top_k)):
+        return False
+    samples = samples.detach().to("cpu", torch.int64)
+    dist_idx = dist_idx.detach().to("cpu", torch.int64)
+    for d in range(cfg.num_dist):
+        drawn = samples[dist_idx == d]
+        wrong_k = cfg.top_k[cfg.num_dist - 1 - d]
+        may, must = reference_support_bounds(
+            "top_k", probs64[d], wrong_k, None, "-", 0.0
+        )
+        if drawn.numel() == 0 or not bool(may[drawn].all()):
+            return False
+        counts = torch.bincount(drawn, minlength=cfg.vocab)
+        floor = _renorm_on(probs64[d], may)
+        if bool((must & (floor * drawn.numel() >= 64) & (counts == 0)).any()):
+            return False
+        minimum = reference_top_k_min_observed(probs64[d], wrong_k, drawn.numel())
+        if int((counts > 0).sum()) < minimum:
+            return False
+    return True
+
+
+@pytest.mark.parametrize(
+    "category",
+    [
+        "contract",
+        "shape",
+        "dtype",
+        "range",
+        "support",
+        "required_draw",
+        "seed_replay",
+        "generator_replay",
+        "probe_support",
+        "support_cardinality",
+    ],
+)
+def test_ledger_does_not_waive_other_invariants(monkeypatch, category):
+    """Matching the known configuration alone must not hide a different failure."""
+    cfg = Cfg(
+        0,
+        "top_k",
+        "-",
+        ["test", "test"],
+        4,
+        top_k=[1, 4],
+        per_request=True,
+        use_indices=True,
+    )
+    ledger = FuzzLedger(
+        "sampling-category-test",
+        findings=(Finding(match=lambda _: True, reason="#5339 test fixture"),),
+    )
+
+    def broken(_cfg):
+        raise _CaseFailure("injected failure", category=category)
+
+    monkeypatch.setitem(globals(), "_LEDGER", ledger)
+    monkeypatch.setitem(globals(), "_run_case", broken)
+    with pytest.raises(pytest.fail.Exception, match="injected failure"):
+        test_sampling_fuzz(cfg)
+
+
+def test_ledger_accepts_only_diagnosed_row_threshold(monkeypatch):
+    """A diagnosed tracked error remains an xfail, not a general suppression."""
+    cfg = Cfg(
+        0,
+        "top_k",
+        "-",
+        ["test", "test"],
+        4,
+        top_k=[1, 4],
+        per_request=True,
+        use_indices=True,
+    )
+    ledger = FuzzLedger(
+        "sampling-category-test",
+        findings=(Finding(match=lambda _: True, reason="#5339 test fixture"),),
+    )
+
+    def broken(_cfg):
+        raise _CaseFailure("diagnosed row threshold", category="row_threshold")
+
+    monkeypatch.setitem(globals(), "_LEDGER", ledger)
+    monkeypatch.setitem(globals(), "_run_case", broken)
+    with pytest.raises(pytest.xfail.Exception, match="#5339"):
+        test_sampling_fuzz(cfg)
+    monkeypatch.setitem(globals(), "_LEDGER", FuzzLedger("sampling-empty-test"))
+    with pytest.raises(pytest.fail.Exception, match="diagnosed row threshold"):
+        test_sampling_fuzz(cfg)
+
+
+def test_wrong_row_diagnosis_uses_the_observations():
+    """The wrong threshold explains one sequence, but not a correct or alien one."""
+    cfg = Cfg(
+        0,
+        "top_k",
+        "-",
+        ["test", "test"],
+        4,
+        top_k=[1, 4],
+        per_request=True,
+        use_indices=True,
+    )
+    rows = torch.tensor([[0.5, 0.25, 0.125, 0.125]] * 2, dtype=torch.float64)
+    idx = torch.tensor([1, 0] * 64)
+    wrong = torch.tensor(
+        [x for i in range(64) for x in (0, i % 4)], dtype=torch.int32
+    )
+    correct = torch.tensor(
+        [x for i in range(64) for x in (i % 4, 0)], dtype=torch.int32
+    )
+    assert _matches_wrong_row_top_k(cfg, rows, wrong, idx)
+    assert not _matches_wrong_row_top_k(cfg, rows, correct, idx)
+    alien = wrong.clone()
+    alien[0] = 1
+    assert not _matches_wrong_row_top_k(cfg, rows, alien, idx)
+
+
+@pytest.mark.parametrize("support", [[0, 1], [0, 2], [0, 1, 2]])
+def test_top_k_cardinality_does_not_choose_a_tie_break(monkeypatch, support):
+    """Either legal tied choice, or retaining the whole tie, passes."""
+    cfg = Cfg(0, "top_k", "-", ["test"], 3, top_k=[2])
+    row = torch.tensor([[0.5, 0.25, 0.25]], dtype=torch.float32)
+    samples = torch.tensor((support * 4096)[:4096], dtype=torch.int32)
+
+    def draw(_cfg, _probs, _seed, single_chunk=False):
+        return samples, torch.zeros(samples.numel(), dtype=torch.int64)
+
+    monkeypatch.setitem(globals(), "_DEVICE", "cpu")
+    monkeypatch.setitem(globals(), "_build_probs", lambda *_: row)
+    monkeypatch.setitem(globals(), "_draw_samples", draw)
+    monkeypatch.setitem(globals(), "_describe", lambda _: "CPU cardinality fixture")
+    _run_case(cfg)
+
+
+def test_top_k_cardinality_detects_dropping_all_optional_ties(monkeypatch):
+    """The original may/must checks alone accept argmax-only for this k=2 row."""
+    cfg = Cfg(0, "top_k", "-", ["test"], 3, top_k=[2])
+    row = torch.tensor([[0.5, 0.25, 0.25]], dtype=torch.float32)
+
+    def draw(_cfg, _probs, _seed, single_chunk=False):
+        return torch.zeros(4096, dtype=torch.int32), torch.zeros(
+            4096, dtype=torch.int64
+        )
+
+    monkeypatch.setitem(globals(), "_DEVICE", "cpu")
+    monkeypatch.setitem(globals(), "_build_probs", lambda *_: row)
+    monkeypatch.setitem(globals(), "_draw_samples", draw)
+    monkeypatch.setitem(globals(), "_describe", lambda _: "CPU cardinality fixture")
+    with pytest.raises(_CaseFailure) as err:
+        _run_case(cfg)
+    assert err.value.category == "support_cardinality"
+
+
+def test_top_k_cardinality_requires_an_adequate_sampling_budget():
+    """Do not demand observation of a class too rare for the allocated draws."""
+    row = torch.tensor([0.5, 0.25, 0.25], dtype=torch.float64)
+    assert reference_top_k_min_observed(row, 2, 4096) == 2
+    assert reference_top_k_min_observed(row, 2, 2) == 0
+    assert (
+        reference_top_k_min_observed(torch.tensor([1.0, 0.0]), 2, 4096) == 0
+    )
+
+
+@pytest.mark.parametrize("failure", ["seed", "generator"])
+def test_replay_checks_precede_a_known_support_failure(monkeypatch, failure):
+    """A #5339-shaped wrong answer must not prevent replay checks from running."""
+    cfg = Cfg(
+        0,
+        "top_k",
+        "-",
+        ["test", "test"],
+        4,
+        top_k=[1, 4],
+        per_request=True,
+        use_indices=True,
+    )
+    rows = torch.tensor([[0.5, 0.25, 0.125, 0.125]] * 2, dtype=torch.float32)
+    seen = {"single": 0, "generator": 0}
+
+    def draw(_cfg, _probs, _seed, single_chunk=False):
+        if single_chunk:
+            seen["single"] += 1
+            value = seen["single"] % 2 if failure == "seed" else 0
+            return torch.tensor([0, value], dtype=torch.int32), torch.tensor([1, 0])
+        values = [x for i in range(64) for x in (0, i % 4)]
+        return torch.tensor(values, dtype=torch.int32), torch.tensor([1, 0] * 64)
+
+    def generator_check(_cfg, _probs):
+        seen["generator"] += 1
+        if failure == "generator":
+            _fail(cfg, "injected generator mismatch")
+
+    monkeypatch.setitem(globals(), "_DEVICE", "cpu")
+    monkeypatch.setitem(globals(), "_build_probs", lambda *_: rows)
+    monkeypatch.setitem(globals(), "_draw_samples", draw)
+    monkeypatch.setitem(globals(), "_check_generator_replay", generator_check)
+    monkeypatch.setitem(globals(), "_describe", lambda _: "CPU replay fixture")
+    with pytest.raises(_CaseFailure) as err:
+        _run_case(cfg)
+    assert err.value.category == "contract"
+    assert seen["single"] == 2
+    if failure == "generator":
+        assert seen["generator"] == 1
+
+
+@pytest.mark.parametrize("mode", ["correct", "swapped", "unrelated", "bad_dtype"])
+def test_probe_distinguishes_known_and_unrelated_failures(monkeypatch, mode):
+    """Only the swapped-threshold signature is eligible for an expected failure."""
+    from types import SimpleNamespace
+
+    calls = [0]
+
+    def sample(*_args, **_kwargs):
+        value = calls[0] % 4
+        calls[0] += 1
+        out = [value, 0] if mode == "correct" else [0, value]
+        if mode == "unrelated":
+            out = [0, 0]
+        dtype = torch.float64 if mode == "bad_dtype" else torch.int32
+        return torch.tensor(out, dtype=dtype), torch.ones(2, dtype=torch.bool)
+
+    monkeypatch.setitem(globals(), "_DEVICE", "cpu")
+    monkeypatch.setitem(globals(), "_PROBE_ROW", [0.5, 0.25, 0.125, 0.125])
+    monkeypatch.setitem(globals(), "_PROBE_K", [1, 4])
+    monkeypatch.setitem(globals(), "_PROBE_INDICES", [1, 0])
+    monkeypatch.setitem(globals(), "_PROBE_LAUNCHES", 16)
+    monkeypatch.setitem(
+        globals(),
+        "_flashinfer",
+        lambda: SimpleNamespace(
+            sampling=SimpleNamespace(top_k_sampling_from_probs=sample)
+        ),
+    )
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    if mode == "unrelated":
+        with pytest.raises(_CaseFailure) as err:
+            _run_indexed_top_k_probe()
+        assert err.value.category == "probe_support"
+    elif mode == "bad_dtype":
+        with pytest.raises(AssertionError):
+            _run_indexed_top_k_probe()
+    else:
+        detail = _run_indexed_top_k_probe()
+        assert (detail is None) == (mode == "correct")
