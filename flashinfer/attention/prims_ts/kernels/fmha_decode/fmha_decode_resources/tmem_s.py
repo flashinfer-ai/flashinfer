@@ -83,6 +83,7 @@ from .helpers_common import (
     _logical_q_group_idx,
     _mma_k_step_qk,
     _mma_kind_for_qk,
+    _masked_tile_max_threshold,
     _neg_max_f32,
     _qk_accumulator_dtype,
     _softmax_scale_pair_width,
@@ -2899,7 +2900,14 @@ class TmemSResource(DecodeGenResourceBase):
         if cutlass.const_expr(cfg.use_sage_attention):
             # The chains hold ``gmax * sfK``; ``sfQ`` is one per-lane factor,
             # so it applies once here. A fully masked tile keeps the sentinel.
-            if tile_max != _neg_max_f32():
+            if cutlass.const_expr(cfg.sage_summary_scores_dequantized):
+                # Dequantized masked scores fold as ``-FLT_MAX * sfK``, so a
+                # fully masked tile ends far below the threshold.
+                if tile_max < _masked_tile_max_threshold():
+                    tile_max = _neg_max_f32()
+                else:
+                    tile_max = tile_max * sage_q_scale
+            elif tile_max != _neg_max_f32():
                 tile_max = tile_max * sage_q_scale
         if cutlass.const_expr(use_sparse and cfg.use_block_sparse_proxy_routes):
             # The mass enters before the anchor, so the P range is unchanged; a
@@ -3210,10 +3218,14 @@ class TmemSResource(DecodeGenResourceBase):
                 )
             for elem in cutlass.range_constexpr(width):
                 scaled_max = Float32(scaled[elem])
-                if cutlass.const_expr(may_be_masked):
+                if cutlass.const_expr(may_be_masked and not dequantize_scores):
                     if Float32(maxima[elem]) == _neg_max_f32():
                         scaled_max = _neg_max_f32()
                 if cutlass.const_expr(dequantize_scores):
+                    # A masked score scales to ``-FLT_MAX * sfK`` (or ``-inf``):
+                    # far below any score, so it exponentiates to zero, and
+                    # the caller restores the sentinel on a tile maximum below
+                    # the sentinel threshold instead of per score here.
                     scores[group_base + elem] = scaled_max
                 fold_chain: Constexpr[int] = (chain_base + group_base + elem) % 4
                 max_chains[fold_chain] = cute.math.max(
