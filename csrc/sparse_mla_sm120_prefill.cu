@@ -362,42 +362,67 @@ inline bool dispatch_dsv4_dual(int num_heads, int topk, int topk_extra, int extr
 
 // topk_extra is runtime; extra_page_block_size stays template because it
 // changes the KV stride. NH=8/16 use MG_N_HG_T=1; NH=8 is padded internally.
+//
+// Main topk is a template width (TK), but the kernel uses it only for the
+// index-row stride and the runtime-length clamp: the KV pipeline is a
+// 2-slot double buffer of BI=64-entry tiles and SmemLayoutMG has no TOPK
+// parameter, so wider TK instantiations cost no extra shared memory or
+// registers - only more loop trips. BF16 QK at every TK matches the numeric
+// route upstream main forces for all dual-cache shapes (QkBF16PvFP8 in
+// resolve_attention); the single-cache FP8 switch at topk >= 512 is a
+// throughput heuristic that does not apply to the dual path. TK=512 is the
+// DeepSeek-V4 vision shape (128-wide sliding window + 384 image tokens per
+// prefill row); 192/256 keep parity with the single-cache BF16 set.
 #define DISPATCH_DUAL_MG_CM(CM, NH, TK, PBSX, NHG)                                                \
   launch_prefill_mg_dual<ModelType::DSV4, ComputeMode::CM, NH, TK, 64, PBSX, NHG>(                \
       Q, KV, indices, KV_extra, idx_extra, attn_sink, output, out_lse, sm_scale, num_tokens,      \
       topk_extra, stride_kv_block, stride_kv_block_extra, topk_length_ptr, topk_length_extra_ptr, \
       stream)
 
-#define DISPATCH_BY_NH_PBSX(PBSX)                     \
-  do {                                                \
-    switch (num_heads) {                              \
-      case 8:                                         \
-        DISPATCH_DUAL_MG_CM(BF16, 8, 128, PBSX, 1);   \
-        return true;                                  \
-      case 16:                                        \
-        DISPATCH_DUAL_MG_CM(BF16, 16, 128, PBSX, 1);  \
-        return true;                                  \
-      case 32:                                        \
-        DISPATCH_DUAL_MG_CM(BF16, 32, 128, PBSX, 2);  \
-        return true;                                  \
-      case 64:                                        \
-        DISPATCH_DUAL_MG_CM(BF16, 64, 128, PBSX, 2);  \
-        return true;                                  \
-      case 128:                                       \
-        DISPATCH_DUAL_MG_CM(BF16, 128, 128, PBSX, 2); \
-        return true;                                  \
-      default:                                        \
-        return false;                                 \
-    }                                                 \
+#define DISPATCH_BY_NH_PBSX(PBSX, TK)                \
+  do {                                               \
+    switch (num_heads) {                             \
+      case 8:                                        \
+        DISPATCH_DUAL_MG_CM(BF16, 8, TK, PBSX, 1);   \
+        return true;                                 \
+      case 16:                                       \
+        DISPATCH_DUAL_MG_CM(BF16, 16, TK, PBSX, 1);  \
+        return true;                                 \
+      case 32:                                       \
+        DISPATCH_DUAL_MG_CM(BF16, 32, TK, PBSX, 2);  \
+        return true;                                 \
+      case 64:                                       \
+        DISPATCH_DUAL_MG_CM(BF16, 64, TK, PBSX, 2);  \
+        return true;                                 \
+      case 128:                                      \
+        DISPATCH_DUAL_MG_CM(BF16, 128, TK, PBSX, 2); \
+        return true;                                 \
+      default:                                       \
+        return false;                                \
+    }                                                \
   } while (0)
 
-  if (topk != 128) return false;
+#define DISPATCH_BY_TK_PBSX(PBSX)     \
+  do {                                \
+    if (topk == 128)                  \
+      DISPATCH_BY_NH_PBSX(PBSX, 128); \
+    else if (topk == 192)             \
+      DISPATCH_BY_NH_PBSX(PBSX, 192); \
+    else if (topk == 256)             \
+      DISPATCH_BY_NH_PBSX(PBSX, 256); \
+    else if (topk == 512)             \
+      DISPATCH_BY_NH_PBSX(PBSX, 512); \
+    else                              \
+      return false;                   \
+  } while (0)
+
   if (extra_page_block_size == 64) {
-    DISPATCH_BY_NH_PBSX(64);
+    DISPATCH_BY_TK_PBSX(64);
   } else if (extra_page_block_size == 2) {
-    DISPATCH_BY_NH_PBSX(2);
+    DISPATCH_BY_TK_PBSX(2);
   }
   return false;
+#undef DISPATCH_BY_TK_PBSX
 #undef DISPATCH_BY_NH_PBSX
 #undef DISPATCH_DUAL_MG_CM
 }

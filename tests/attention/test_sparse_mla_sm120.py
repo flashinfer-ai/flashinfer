@@ -1557,3 +1557,218 @@ def test_sparse_mla_sm120_prefill_dsv4_dual_runtime_extra_topk(
 
     torch.testing.assert_close(output, ref_out, atol=5e-2, rtol=5e-2)
     torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
+
+
+_DSV4_PREFILL_DUAL_WIDE_MAIN_CONFIGS = [
+    # (topk, extra_topk, extra_pbs). 512/512/64 is the DeepSeek-V4 vision
+    # prefill shape: 128-wide sliding window + 384 image tokens per row.
+    (192, 512, 64),
+    (256, 512, 64),
+    (512, 512, 64),
+    (512, 512, 2),
+]
+
+
+@pytest.mark.parametrize("num_heads", _DSV4_PREFILL_DUAL_HEADS)
+@pytest.mark.parametrize(
+    "topk,extra_topk,extra_pbs", _DSV4_PREFILL_DUAL_WIDE_MAIN_CONFIGS
+)
+def test_sparse_mla_sm120_prefill_dsv4_dual_wide_main_topk(
+    num_heads: int, topk: int, extra_topk: int, extra_pbs: int
+) -> None:
+    """DSv4 dual-cache prefill with a main top-k wider than 128."""
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    d_qk, d_v = 512, 512
+    main_pbs = 64
+    num_tokens = 128
+
+    main_num_blocks = 64
+    main_s_kv = main_num_blocks * main_pbs
+    extra_num_blocks = max((extra_topk + extra_pbs - 1) // extra_pbs * 2, 16)
+    extra_s_kv = extra_num_blocks * extra_pbs
+
+    main_bf16 = (
+        torch.randn(
+            main_num_blocks, main_pbs, 1, d_qk, device=device, dtype=torch.bfloat16
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    main_packed = quantize_kv_dsv4(main_bf16)
+    main_dequant = dequantize_kv_dsv4(main_packed)
+
+    extra_bf16 = (
+        torch.randn(
+            extra_num_blocks, extra_pbs, 1, d_qk, device=device, dtype=torch.bfloat16
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    extra_packed = quantize_kv_dsv4(extra_bf16)
+    extra_dequant = dequantize_kv_dsv4(extra_packed)
+
+    q = (
+        torch.randn(num_tokens, num_heads, d_qk, device=device, dtype=torch.bfloat16)
+        / 10.0
+    ).clamp(-1, 1)
+    main_idx = torch.randint(
+        0, main_s_kv, (num_tokens, topk), device=device, dtype=torch.int32
+    )
+    extra_idx = torch.randint(
+        0, extra_s_kv, (num_tokens, extra_topk), device=device, dtype=torch.int32
+    )
+    main_idx[:, topk // 2 :] = -1
+    extra_idx[:, extra_topk // 2 :] = -1
+
+    attn_sink = torch.randn(num_heads, device=device, dtype=torch.float32) * 2.0
+    sm_scale = d_qk**-0.5
+
+    virtual_kv = torch.cat(
+        [main_dequant.reshape(-1, d_qk), extra_dequant.reshape(-1, d_qk)], dim=0
+    ).reshape(-1, 1, 1, d_qk)
+    extra_idx_shifted = torch.where(extra_idx < 0, extra_idx, extra_idx + main_s_kv)
+    virtual_idx = torch.cat([main_idx, extra_idx_shifted], dim=-1)
+    ref_out, ref_lse = _ref_sparse_attn(
+        q, virtual_kv, virtual_idx, sm_scale, d_v, attn_sink=attn_sink
+    )
+
+    output = torch.zeros(
+        (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=device
+    )
+    out_lse = torch.zeros((num_tokens, num_heads), dtype=torch.float32, device=device)
+    sparse_mla_sm120_paged_attention(
+        q,
+        main_packed,
+        main_idx,
+        output,
+        out_lse,
+        sm_scale,
+        d_v=d_v,
+        attn_sink=attn_sink,
+        extra_kv_cache=extra_packed,
+        extra_indices=extra_idx,
+    )
+
+    torch.testing.assert_close(output, ref_out, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.parametrize("num_heads", [32])
+@pytest.mark.parametrize("with_sink", [False, True])
+def test_sparse_mla_sm120_prefill_dsv4_dual_wide_main_topk_length_truncation(
+    num_heads: int, with_sink: bool
+) -> None:
+    """DSv4 dual-cache prefill at main topk=512 honors per-row main and extra
+    topk_length, including zero-length and non-tile-aligned rows (the
+    DeepSeek-V4 vision swa_topk_lens semantics)."""
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    num_tokens = 128
+    d_qk, d_v = 512, 512
+    topk = 512
+    main_pbs = 64
+    extra_topk = 512
+    extra_pbs = 64
+
+    main_num_blocks = 64
+    main_s_kv = main_num_blocks * main_pbs
+    extra_num_blocks = max((extra_topk + extra_pbs - 1) // extra_pbs * 2, 16)
+    extra_s_kv = extra_num_blocks * extra_pbs
+
+    main_bf16 = (
+        torch.randn(
+            main_num_blocks, main_pbs, 1, d_qk, device=device, dtype=torch.bfloat16
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    main_packed = quantize_kv_dsv4(main_bf16)
+    main_dequant = dequantize_kv_dsv4(main_packed)
+
+    extra_bf16 = (
+        torch.randn(
+            extra_num_blocks, extra_pbs, 1, d_qk, device=device, dtype=torch.bfloat16
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    extra_packed = quantize_kv_dsv4(extra_bf16)
+    extra_dequant = dequantize_kv_dsv4(extra_packed)
+
+    q = (
+        torch.randn(num_tokens, num_heads, d_qk, device=device, dtype=torch.bfloat16)
+        / 10.0
+    ).clamp(-1, 1)
+    main_idx = torch.randint(
+        0, main_s_kv, (num_tokens, topk), device=device, dtype=torch.int32
+    )
+    extra_idx = torch.randint(
+        0, extra_s_kv, (num_tokens, extra_topk), device=device, dtype=torch.int32
+    )
+
+    topk_length = torch.randint(
+        0, topk + 1, (num_tokens,), dtype=torch.int32, device=device
+    )
+    extra_topk_length = torch.randint(
+        0, extra_topk + 1, (num_tokens,), dtype=torch.int32, device=device
+    )
+    # Pin the edge lengths: empty rows, sub-tile rows, tile boundaries, and
+    # the vision window/image split points.
+    edge_main = [0, 1, 63, 64, 65, 128, 133, 384, 511, 512]
+    edge_extra = [0, 1, 63, 64, 65, 128, 256, 384, 511, 512]
+    topk_length[: len(edge_main)] = torch.tensor(
+        edge_main, dtype=torch.int32, device=device
+    )
+    extra_topk_length[: len(edge_extra)] = torch.tensor(
+        edge_extra, dtype=torch.int32, device=device
+    )
+
+    attn_sink = (
+        torch.randn(num_heads, device=device, dtype=torch.float32) * 2.0
+        if with_sink
+        else None
+    )
+    sm_scale = d_qk**-0.5
+
+    ref_main_idx = main_idx.clone()
+    ref_extra_idx = extra_idx.clone()
+    ar_main = torch.arange(topk, device=device).unsqueeze(0)
+    ar_extra = torch.arange(extra_topk, device=device).unsqueeze(0)
+    ref_main_idx[ar_main >= topk_length.unsqueeze(-1)] = -1
+    ref_extra_idx[ar_extra >= extra_topk_length.unsqueeze(-1)] = -1
+
+    virtual_kv = torch.cat(
+        [main_dequant.reshape(-1, d_qk), extra_dequant.reshape(-1, d_qk)], dim=0
+    ).reshape(-1, 1, 1, d_qk)
+    extra_idx_shifted = torch.where(
+        ref_extra_idx < 0, ref_extra_idx, ref_extra_idx + main_s_kv
+    )
+    virtual_idx = torch.cat([ref_main_idx, extra_idx_shifted], dim=-1)
+    ref_out, ref_lse = _ref_sparse_attn(
+        q, virtual_kv, virtual_idx, sm_scale, d_v, attn_sink=attn_sink
+    )
+    if attn_sink is None:
+        # Kernel-family convention (shared with the SG/dsv3_2 kernels and
+        # asserted by the existing zero-length tests): a fully empty row
+        # reports LSE=-1e30, while the dense reference produces -inf.
+        empty_rows = (topk_length == 0) & (extra_topk_length == 0)
+        ref_lse[empty_rows] = -1e30
+
+    output = torch.zeros(
+        (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=device
+    )
+    out_lse = torch.zeros((num_tokens, num_heads), dtype=torch.float32, device=device)
+    sparse_mla_sm120_paged_attention(
+        q,
+        main_packed,
+        main_idx,
+        output,
+        out_lse,
+        sm_scale,
+        d_v=d_v,
+        attn_sink=attn_sink,
+        topk_length=topk_length,
+        extra_kv_cache=extra_packed,
+        extra_indices=extra_idx,
+        extra_topk_length=extra_topk_length,
+    )
+
+    torch.testing.assert_close(output, ref_out, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
