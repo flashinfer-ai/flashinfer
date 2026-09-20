@@ -2328,7 +2328,7 @@ class FmhaDecodeConfig:
     @property
     def sage_summary_k_groups_per_fragment(self) -> int:
         """Return the scale groups per fragment of a proxy route's summaries."""
-        if not self.use_block_sparse_proxy_routes:
+        if not self.use_sage_attention or not self.use_block_sparse_proxy_routes:
             return self.sage_k_groups_per_fragment
         return self.sage_k_groups_for_block(self.sage_k_summary_block_size)
 

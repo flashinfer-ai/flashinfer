@@ -2760,6 +2760,14 @@ class TmemSResource(DecodeGenResourceBase):
                         warp_scores_are_unmasked and tail_fragment_mask == Int32(0)
                     )
                 )
+        if cutlass.const_expr(mixed_scales):
+            # Proxy tiles take the rolled pass, so the summary geometry's fold
+            # exists once in the rolled body instead of once per unrolled
+            # fragment; the unrolled pass keeps the exact geometry alone. The
+            # route kind is CTA-uniform, so the branch condition stays uniform.
+            warp_scores_are_unmasked = cutlass.Boolean(
+                warp_scores_are_unmasked and not route_is_proxy
+            )
 
         score_tmem_addr = (
             task_cache[_TASK_CACHE_TMEM_BASE_OFFSET]
@@ -2782,7 +2790,7 @@ class TmemSResource(DecodeGenResourceBase):
 
         if warp_scores_are_unmasked:
             for fragment_idx in cutlass.range_constexpr(num_fragments):
-                if cutlass.const_expr(cfg.use_sage_attention and not mixed_scales):
+                if cutlass.const_expr(cfg.use_sage_attention):
                     # Issued ahead of the score load so an SMEM read hides
                     # behind the TMEM wait.
                     fragment_scales = self.sage_k_scales.fragment(
@@ -2798,28 +2806,7 @@ class TmemSResource(DecodeGenResourceBase):
                     offset=cfg.tile_size_kv // 2,
                 )
                 prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
-                if cutlass.const_expr(mixed_scales):
-                    # The route kind is CTA-uniform; each kind folds with its
-                    # own strategy and scale-group geometry.
-                    if route_is_proxy:
-                        self._fold_fragment_max_with(
-                            self.sage_summary_k_scales,
-                            summary_view,
-                            Int32(fragment_idx),
-                            loaded,
-                            max_chains,
-                            chain_base=fragment_idx * self.sage_summary_k_scales.groups,
-                        )
-                    else:
-                        self._fold_fragment_max_with(
-                            self.sage_k_scales,
-                            scales_view,
-                            Int32(fragment_idx),
-                            loaded,
-                            max_chains,
-                            chain_base=fragment_idx * self.sage_k_scales.groups,
-                        )
-                elif cutlass.const_expr(cfg.use_sage_attention):
+                if cutlass.const_expr(cfg.use_sage_attention):
                     self._fold_sage_fragment_max(
                         max_chains,
                         loaded,
@@ -2929,29 +2916,6 @@ class TmemSResource(DecodeGenResourceBase):
         old_max_arr[0] = old_max
         new_max_arr[0] = new_max
         return old_max_arr, sum_arr, new_max_arr, s_arr
-
-    @cute.jit
-    def _fold_fragment_max_with(
-        self,
-        scales: Constexpr[SageKScales],
-        view,
-        fragment: Int32,
-        scores,
-        max_chains: cutlass.Array,
-        *,
-        chain_base: Constexpr[int],
-    ) -> None:
-        """Fold one unmasked fragment's maxima with one route kind's strategy."""
-        fragment_scales = scales.fragment(view, fragment)
-        self._fold_sage_fragment_max(
-            max_chains,
-            scores,
-            fragment_scales=fragment_scales,
-            chain_base=chain_base,
-            may_be_masked=False,
-            groups=scales.groups,
-        )
-        scales.advance(view)
 
     @cute.jit
     def _mask_score_fragment_with(
