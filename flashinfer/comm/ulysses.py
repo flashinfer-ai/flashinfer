@@ -923,13 +923,7 @@ class UlyssesCommunicator:
 
     @staticmethod
     def _validate_no_overlap(x: torch.Tensor, out: torch.Tensor, op: str) -> None:
-        if x.device != out.device:
-            return
-        x_begin = x.data_ptr()
-        x_end = x_begin + x.numel() * x.element_size()
-        out_begin = out.data_ptr()
-        out_end = out_begin + out.numel() * out.element_size()
-        if x_begin < out_end and out_begin < x_end:
+        if _storage_ranges_overlap(x, out):
             raise ValueError(f"{op} out must not overlap input storage")
 
     def _pcie_exchange(self, x, out, mode: int) -> torch.Tensor:
@@ -1540,22 +1534,10 @@ class UlyssesCommunicator:
                 x, out, "scatter_heads", dtype, workspace=workspace
             )
         self._validate(x, "scatter_heads", dtype)
-        shape, _mode = self._output_geometry(x, "scatter_heads")
+        output_shape, _mode = self._output_geometry(x, "scatter_heads")
         # ulysses_a2a is parameterized by the [B, S_local, H, D] layout, which
         # is this operand's own shape for scatter_heads.
         B, S_local, H, D = x.shape
-        if H % self.world_size != 0:
-            raise ValueError(
-                f"scatter_heads requires the global head count (dim 2) to be "
-                f"divisible by world size {self.world_size}, got shape "
-                f"{tuple(x.shape)}"
-            )
-        output_shape = (
-            B,
-            S_local * self.world_size,
-            H // self.world_size,
-            D,
-        )
         out = self._prepare_out(x, out, output_shape, "scatter_heads")
         self._validate_workspace(workspace, x.numel(), "scatter_heads")
         self._validate_workspace_out_alias(out, workspace, "scatter_heads")
@@ -1876,16 +1858,10 @@ class UlyssesCommunicator:
                 x, out, "gather_heads", dtype, workspace=workspace
             )
         self._validate(x, "gather_heads", dtype)
-        B, S_global, H_local, D = x.shape
-        if S_global % self.world_size != 0:
-            raise ValueError(
-                f"gather_heads requires the global sequence length (dim 1) to "
-                f"be divisible by world size {self.world_size}, got shape "
-                f"{tuple(x.shape)}"
-            )
-        S_local = S_global // self.world_size
-        H = H_local * self.world_size
-        output_shape = (B, S_local, H, D)
+        output_shape, _mode = self._output_geometry(x, "gather_heads")
+        # ulysses_a2a is parameterized by the [B, S_local, H, D] layout, which
+        # is the result's shape for gather_heads.
+        B, S_local, H, D = output_shape
         out = self._prepare_out(x, out, output_shape, "gather_heads")
         self._validate_workspace(workspace, x.numel(), "gather_heads")
         self._validate_workspace_out_alias(out, workspace, "gather_heads")
