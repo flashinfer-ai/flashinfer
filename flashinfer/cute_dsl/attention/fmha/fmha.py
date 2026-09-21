@@ -117,6 +117,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         mask_type: fmha_utils.MaskEnum,
         enable_ex2_emulation: bool,
         enable_skip_correction: bool,
+        rescale_threshold: float = 8.0,
         use_tma_store: bool = True,
     ):
         """Initializes the configuration for a Blackwell Fused Multi-Head Attention (FMHA) kernel.
@@ -190,6 +191,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.is_persistent = is_persistent
         self.mask_type = mask_type
         self.enable_skip_correction = enable_skip_correction
+        self.rescale_threshold = rescale_threshold if enable_skip_correction else 0.0
         self.enable_ex2_emulation = enable_ex2_emulation
         self.use_tma_store = use_tma_store
 
@@ -334,7 +336,6 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.epi_stage = 2
 
         # Tunable parameters
-        self.rescale_threshold = 8.0 if self.enable_skip_correction else 0.0
         # FP8 P pre-scale: offset added to exp2 exponent so that P*2^offset fills
         # more of E4M3's [0, 448] range, improving quantization precision.
         # Derived from rescale_threshold to guarantee P*2^offset <= 448.
@@ -370,6 +371,11 @@ class BlackwellFusedMultiHeadAttentionForward:
         total_softmax_count: Optional[cute.Tensor],
         stream: cuda.CUstream,
         use_pdl: bool,
+        reserved_0=None,
+        reserved_1=None,
+        reserved_2=None,
+        reserved_3=None,
+        reserved_4=None,
     ):
         """Execute the Fused Multi-Head Attention operation on the provided tensors.
 

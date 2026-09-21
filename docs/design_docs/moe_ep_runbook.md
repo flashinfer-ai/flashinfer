@@ -37,7 +37,7 @@ srun --jobid="$SLURM_JOB_ID" \
   --pty bash -l
 
 # 3. (Re)build FlashInfer in editable mode (EP backends are on by default;
-#    NCCL-EP needs no build step — nccl4py is a base dependency)
+#    NCCL-EP needs no build step — nccl-extensions is a base dependency)
 BUILD_NIXL_EP=0 \
     pip install --no-cache-dir --no-build-isolation -e .
 ```
@@ -69,7 +69,7 @@ meant to compare against the reference tables.
 
 History: this section used to be a hard `==4.6.1` pin because 4.7.0 crashed
 every 4-rank `deep_gemm.fp8_fp4_mega_moe` launch with
-`CUDA_ERROR_MISALIGNED_ADDRESS` (bisected 2026-08-05 on prenyx B200). The
+`CUDA_ERROR_MISALIGNED_ADDRESS` (bisected 2026-08-05 on B200). The
 root cause was not deep_gemm or the dsl's bundled CUDA libs but the fused
 activation-quant staging (`DataPreprocess` in
 `kernel_src/cutedsl_megamoe/src/src/inputs_process.py`), shared by every mega
@@ -222,7 +222,7 @@ Notes:
 ### NCCL-EP low-latency device-kernel limits
 
 Two constraints of the `nccl.ep` LL device kernel (probed empirically on
-nccl4py 0.3.1; not enforced by `validate_fleet_params`, so they surface as
+nccl-extensions 0.1.0; not enforced by `validate_fleet_params`, so they surface as
 device-side aborts):
 
 - **Per-token row widths are whitelisted**: LL dispatch accepts bf16 rows of
@@ -541,7 +541,8 @@ def get_symm_buffer_for_<name>_mega_moe(
     world_size: int,            # self.ep_world_size
     *,
     kind=...,                   # dtype selector, if applicable
-    # ... kernel knobs: clamps, in_kernel_fc2_reduce, token_back_by_dispatch, ...
+    # ... session params: clamps, enable_in_kernel_fc2_reduce, ...
+    knobs=...,                  # tile/schedule/token-back tactics, or None
 ) -> <Name>SymmBuffer: ...
 ```
 
@@ -670,12 +671,12 @@ first — it needs more than the backend being built:
 
 ```python
 from flashinfer.moe_ep import supports_fault_tolerance
-supports_fault_tolerance("nccl_ep")   # needs nccl4py with GroupConfig.enable_mask
+supports_fault_tolerance("nccl_ep")   # needs nccl-extensions with GroupConfig.enable_mask
                                       # AND a libnccl_ep exporting ncclEpMask*
 supports_fault_tolerance("nixl_ep")   # true whenever the backend is staged
 ```
 
-If `nccl_ep` returns False, upgrade the nccl4py wheel that ships
+If `nccl_ep` returns False, upgrade the nccl-extensions wheel that ships
 `libnccl_ep.so` and confirm it is the one actually loaded
 (`python -m nccl show_versions`). The probe never raises, and the Fleet
 constructor fails with the same diagnosis rather than waiting for a real fault.

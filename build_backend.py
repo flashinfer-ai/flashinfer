@@ -31,8 +31,9 @@ _data_dir = _root / "flashinfer" / "data"
 
 # moe_ep build infra. Both EP backends are ON BY DEFAULT since the moe_ep
 # runtime deps moved into the base dependencies (`pip install .` is enough):
-#   NCCL-EP  — provided by the `nccl4py>=0.3.1` wheel (a base dep now); NO
-#              in-tree build.
+#   NCCL-EP  — provided by the `nccl-extensions>=0.1.0` wheel (a base dep
+#              now); NO in-tree build. (nccl.ep used to ship in nccl4py;
+#              nccl4py 0.4.1 dropped it — see requirements.txt.)
 #   NIXL-EP  — built in-tree from 3rdparty/nixl (meson). Missing build deps
 #              (meson/ninja/nvcc/UCX/...) skip the backend with a warning
 #              instead of failing the install (best-effort).
@@ -491,8 +492,9 @@ def _build_nccl_ep() -> None:
             shutil.copy(sopath, dst / soname)
             print(f"[BUILD_NVEP] staged: {soname}")
 
-    # NOTE: nccl_ep (ctypes wrapper from contrib/nccl_ep/python) and nccl4py
-    # (Cython bindings + Communicator(ptr=...) bridge) are NOT pip-installed
+    # NOTE: nccl_ep (ctypes wrapper from contrib/nccl_ep/python) and the
+    # nccl Python bindings (Cython bindings + Communicator(ptr=...) bridge)
+    # are NOT pip-installed
     # from this build hook. When `uv pip install` runs the FlashInfer build,
     # sys.executable points to uv's isolated build env (which has no pip), so
     # `python -m pip install` from here fails. Install them as a separate
@@ -500,11 +502,12 @@ def _build_nccl_ep() -> None:
     #
     #   pip install -e 3rdparty/nccl/contrib/nccl_ep/python
     #   CUDA_HOME=/usr/local/cuda pip install -e 3rdparty/nccl/bindings/nccl4py[cu13]
+    #   CUDA_HOME=/usr/local/cuda pip install -e 3rdparty/nccl-extensions/python[cu13]
     #
     # docker/Dockerfile.flashinfer-nvep already chains these after the main
     # `BUILD_NVEP=1 uv pip install ...` step.
     print(
-        "[BUILD_NVEP] nccl_ep + nccl4py pip-installs deferred to post-build "
+        "[BUILD_NVEP] nccl_ep + nccl4py/nccl-extensions pip-installs deferred to post-build "
         "step (see docker/Dockerfile.flashinfer-nvep). Skipping in hook."
     )
 
@@ -922,12 +925,12 @@ def _build_nvep_if_enabled() -> None:
         )
 
     # NCCL-EP is not built from source — it is provided by the released
-    # `nccl4py` wheel (>=0.3.1, the `nccl.ep` API + bundled libnccl_ep.so),
-    # which is a base dependency now. So BUILD_NCCL_EP requires no in-tree
-    # build step; we only note it here.
+    # `nccl-extensions` wheel (>=0.1.0, the `nccl.ep` API + bundled
+    # libnccl_ep.so), which is a base dependency now. So BUILD_NCCL_EP
+    # requires no in-tree build step; we only note it here.
     if _BUILD_NCCL_EP:
         print(
-            "[BUILD_NVEP] NCCL-EP is provided by the nccl4py wheel (>=0.3.1), "
+            "[BUILD_NVEP] NCCL-EP is provided by the nccl-extensions wheel (>=0.1.0), "
             "a base dependency of flashinfer-python; no in-tree build."
         )
         # torch's cu13 wheels pin nvidia-nccl-cu13 exactly (< the B200 EP
@@ -995,7 +998,7 @@ def _build_nvep_if_enabled() -> None:
 
     built = [b for b, is_enabled in (("NIXL-EP", built_nixl),) if is_enabled]
     if _BUILD_NCCL_EP:
-        built.append("NCCL-EP (via nccl4py wheel)")
+        built.append("NCCL-EP (via nccl-extensions wheel)")
     print(f"[BUILD_NVEP] done — built: {', '.join(built) if built else 'nothing'}")
 
 

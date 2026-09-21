@@ -264,6 +264,9 @@ struct TllmGenFmhaRunnerParams {
   void* oPtr;
   // The output scaling factor buffer.
   void* oSfPtr;
+  // DSv4 fused inverse-RoPE + FP8 quantization inputs/outputs.
+  float const* dsv4InvRopeCosSinCachePtr;
+  float* dsv4OScalePtr;
 
   // The stride between different tokens for Q.
   int qStrideTokens;
@@ -346,8 +349,12 @@ struct TllmGenFmhaRunnerParams {
   TrtllmGenSparseMlaType mSparseMlaType;
   // The top k value for sparse MLA.
   int mSparseMlaTopK;
+  // Padded token dimension of the DSv4 packed UE8M0 output-scale tensor.
+  int64_t mDsv4ScaleBufM;
   // Whether DSv4 sparse MLA should read tile 0 from slidingWindowKvPoolPtr.
   bool mHasSlidingWindowKvPool;
+  // Whether the fixed DSv4 inverse-RoPE + FP8 quant epilogue is selected.
+  bool mFusesDsv4InvRopeFp8Quant;
   // Transform mode for BF16 query + FP8 KV generation kernels.
   Bf16QFp8KvTransformMode mBf16QFp8KvTransformMode;
   // Whether the indices for K & V pages are shared as unified index.
@@ -426,6 +433,8 @@ struct TllmGenSelectKernelParams {
   bool mUseFp16Softmax;
   // Use spcompress or not.
   bool mUsesSpcompress;
+  // Select the DSv4 inverse-RoPE + E4M3/UE8M0 fused cubin when its exact key exists.
+  bool mFusesDsv4InvRopeFp8Quant;
   // The tile scheduler.
   TileScheduler mTileScheduler;
   // The tile size for Q.
@@ -456,6 +465,7 @@ struct TllmGenSelectKernelParams {
         mSkipsSoftmaxWhenPossible(params.mSkipsSoftmaxWhenPossible),
         mUseFp16Softmax(params.mUseFp16Softmax),
         mUsesSpcompress(params.mUsesSpcompress),
+        mFusesDsv4InvRopeFp8Quant(params.mFusesDsv4InvRopeFp8Quant),
         mTileScheduler(params.mTileScheduler),
         mTileSizeQ(128),
         mTileSizeKv(128),

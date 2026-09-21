@@ -100,7 +100,9 @@ class MegaMoENvfp4Config:
     flag_batch: int = 4
     epi_flag_batch: Tuple[int, int] = (1, 1)
     non_ubulk_fc2_store: bool = True
+    enable_in_kernel_fc2_reduce: bool = False
     in_kernel_fc2_reduce: bool = False
+    defer_topk_reduce: bool = False
     token_back_mode: Literal[
         "epi_warps", "standalone_warps", "reuse_dispatch_warps"
     ] = "epi_warps"
@@ -108,8 +110,12 @@ class MegaMoENvfp4Config:
     apply_topk_in_fc1: bool = True
     gate_up_clamp: Optional[float] = None
     enable_iket: bool = False
+    swiglu_alpha: Optional[float] = None
+    swiglu_beta: Optional[float] = None
 
     def __post_init__(self) -> None:
+        if (self.swiglu_alpha is None) != (self.swiglu_beta is None):
+            raise ValueError("swiglu_alpha and swiglu_beta must be set together.")
         if self.world_size < 1:
             raise ValueError(f"world_size must be >= 1, got {self.world_size}.")
         if self.rank < 0 or self.rank >= self.world_size:
@@ -162,12 +168,25 @@ class MegaMoENvfp4Config:
                     "token_back_mode='reuse_dispatch_warps'; got "
                     f"{self.token_back_mode!r}."
                 )
+        if self.in_kernel_fc2_reduce and not self.enable_in_kernel_fc2_reduce:
+            raise ValueError(
+                "in_kernel_fc2_reduce is selected but enable_in_kernel_fc2_reduce is False"
+            )
         if self.in_kernel_fc2_reduce and not self.apply_topk_in_fc1:
             # Mirrors the kernel ctor check; fail at config build, not compile.
             raise ValueError(
                 "in_kernel_fc2_reduce requires apply_topk_in_fc1=True; the REDG "
                 "path can only atomic-add terms whose topk score was already "
                 "absorbed before fc2."
+            )
+        if self.defer_topk_reduce and (
+            self.in_kernel_fc2_reduce
+            or self.combine_dtype != "bf16"
+            or not self.apply_topk_in_fc1
+        ):
+            raise ValueError(
+                "defer_topk_reduce requires in_kernel_fc2_reduce=False, "
+                "combine_dtype='bf16', and apply_topk_in_fc1=True."
             )
         if self.group_hint is not None and self.group_hint <= 0:
             raise ValueError(
@@ -251,6 +270,18 @@ class MegaMoENvfp4Frontend:
         self._gate_up_clamp = clamp
         self._invalidate_compile_cache()
 
+    def set_swiglu_params(self, alpha: Optional[float], beta: Optional[float]) -> None:
+        """Set uniform activation constants and invalidate the compiled session."""
+        if (alpha, beta) == (self._config.swiglu_alpha, self._config.swiglu_beta):
+            return
+        new_config = dataclasses.replace(
+            self.config, swiglu_alpha=alpha, swiglu_beta=beta
+        )
+        ensure_not_capturing("set_swiglu_params (activation change)")
+        self._release_workspace()
+        self._config = new_config
+        self._invalidate_compile_cache()
+
     def apply_knobs(self, knobs: Optional[dict]) -> None:
         """Apply tuner knobs (see :mod:`.tuner`) to the session config.
 
@@ -313,6 +344,11 @@ class MegaMoENvfp4Frontend:
         a validated-once fast path: validation and cute-tensor construction
         run only when the launch cache misses.
         """
+        if self.config.defer_topk_reduce:
+            raise RuntimeError(
+                "run() cannot return an unreduced output when "
+                "defer_topk_reduce=True; use the terminal adapter"
+            )
         resolved = self._resolve_num_tokens(inputs, num_tokens)
         if resolved == 0:
             return None
@@ -388,6 +424,29 @@ class MegaMoENvfp4Frontend:
 
         return thunk
 
+    def deferred_topk_reduce_workspace(
+        self,
+    ) -> Tuple[torch.Tensor, torch.Tensor, dict]:
+        """Return a zero-copy combine view and its canonical root descriptor."""
+        if not self.config.defer_topk_reduce:
+            raise RuntimeError("deferred TopK-reduce mode is not enabled")
+        mega = self._mega
+        if mega is None or mega.compiled is None:
+            raise RuntimeError(
+                "deferred TopK-reduce workspace is unavailable before compilation"
+            )
+        descriptor = mega.kernel.deferred_topk_reduce_region()
+        root = mega.shared_workspace
+        byte_offset = int(descriptor["byte_offset"])
+        nbytes = int(descriptor["nbytes"])
+        raw = root.narrow(0, byte_offset, nbytes)
+        partials = raw.view(torch.bfloat16).view(tuple(descriptor["shape"]))
+        if partials.data_ptr() != root.data_ptr() + byte_offset:
+            raise RuntimeError("borrowed combine view does not match its root offset")
+        if partials.data_ptr() % int(descriptor["alignment"]):
+            raise RuntimeError("borrowed combine view violates canonical alignment")
+        return partials, root, dict(descriptor)
+
     @staticmethod
     def _launch_cache_key(inputs: MegaMoENvfp4Inputs, num_tokens: int) -> tuple:
         # Keyed on the RAW (pre-slice) input pointers + the resolved token
@@ -437,10 +496,13 @@ class MegaMoENvfp4Frontend:
             c.epi_flag_batch,
             c.non_ubulk_fc2_store,
             c.in_kernel_fc2_reduce,
+            c.defer_topk_reduce,
             c.token_back_mode,
             c.combine_dtype,
             c.apply_topk_in_fc1,
             self._gate_up_clamp,
+            c.swiglu_alpha,
+            c.swiglu_beta,
             c.enable_iket,
         )
 
@@ -497,9 +559,12 @@ class MegaMoENvfp4Frontend:
             fc2_output_dtype=cutlass.BFloat16,
             non_ubulk_fc2_store=c.non_ubulk_fc2_store,
             in_kernel_fc2_reduce=c.in_kernel_fc2_reduce,
+            defer_topk_reduce=c.defer_topk_reduce,
             token_back_mode=c.token_back_mode,
             apply_topk_in_fc1=c.apply_topk_in_fc1,
             gate_up_clamp=self._gate_up_clamp,
+            swiglu_alpha=c.swiglu_alpha,
+            swiglu_beta=c.swiglu_beta,
             flag_batch=c.flag_batch,
             epi_flag_batch=c.epi_flag_batch,
             combine_format=combine_format,
@@ -534,12 +599,6 @@ class MegaMoENvfp4Frontend:
         self._mega_key = key
         self._mega = mega
         return self._mega
-
-    # NOTE: the new kernel drop reduces the top-k combine INSIDE the mega kernel
-    # (Sm100MegaMoEKernel.__call__), so there is no separate topk-reduce launch.
-    # The drop's moe_nvfp4_swapab.topk_reduce.TopkReduce class covers the
-    # standalone combine-reduce path, which moe_ep does not use; port it here
-    # (with a test) if a caller ever needs in_kernel_fc2_reduce=False combine.
 
     # ------------------------------------------------------------------
     # Launch helpers
@@ -1003,10 +1062,13 @@ def get_symm_buffer_for_mega_moe(
     rank: int,
     world_size: int,
     *,
+    swiglu_alpha: Optional[float] = None,
+    swiglu_beta: Optional[float] = None,
     gate_up_clamp: Optional[float] = None,
     activation_clamp: Optional[float] = None,
     apply_topk_in_fc1: bool = True,
-    in_kernel_fc2_reduce: bool = False,
+    enable_in_kernel_fc2_reduce: bool = False,
+    defer_topk_reduce: bool = False,
     combine_dtype: Literal["bf16", "mxfp8", "nvfp4"] = "bf16",
     fc1_alpha: Optional[PerExpertEpilogue] = None,
     fc2_alpha: Optional[PerExpertEpilogue] = None,
@@ -1021,6 +1083,11 @@ def get_symm_buffer_for_mega_moe(
 
     ``gate_up_clamp`` sets the kernel gate-up clamp.  ``activation_clamp`` is a
     deprecated alias for ``gate_up_clamp``.
+
+    ``swiglu_alpha`` / ``swiglu_beta`` are uniform per-layer activation
+    constants: ``(up + beta) * gate * sigmoid(alpha * gate)`` after clamping.
+    Set both or neither; None/None keeps standard SwiGLU. MiniMax-M3 uses
+    ``1.702`` / ``1.0``. These are distinct from the dequant ``fc1_alpha``.
 
     ``apply_topk_in_fc1`` mirrors ``mega_runner``'s
     ``ref_compute_graph == "deepgemm"`` behaviour when ``True`` (default).
@@ -1066,10 +1133,8 @@ def get_symm_buffer_for_mega_moe(
     # knobs=None -> pure lookup: offline-tuned cache entry for this session
     # key when present, else the built-in token-count heuristic.  An explicit
     # knobs= dict overrides both entirely.
-    if knobs is not None:
-        resolved_knobs, knob_source = dict(knobs), "explicit"
-    else:
-        resolved_knobs, knob_source = resolve_knobs(
+    if knobs is None:
+        knobs, _ = resolve_knobs(
             dtype="nvfp4",
             world_size=world_size,
             hidden=hidden,
@@ -1078,13 +1143,10 @@ def get_symm_buffer_for_mega_moe(
             topk=num_topk,
             max_tokens=num_max_tokens,
             combine_dtype=combine_dtype,
+            enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
         )
-    if knob_source == "heuristic" and combine_dtype != "bf16":
-        # The measured profiles pick the token-back mode freely, but a
-        # quantized combine wire is only wired for dispatch-warp token-back;
-        # explicit/cached knobs are the caller's/tuner's contract and are left
-        # untouched (the config validation rejects incompatible combos).
-        resolved_knobs["token_back_mode"] = "reuse_dispatch_warps"
+    else:
+        knobs = dict(knobs)
 
     cfg = MegaMoENvfp4Config(
         rank=rank,
@@ -1095,8 +1157,11 @@ def get_symm_buffer_for_mega_moe(
         hidden=hidden,
         intermediate=intermediate,
         gate_up_clamp=clamp,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
         apply_topk_in_fc1=apply_topk_in_fc1,
-        in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+        enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
+        defer_topk_reduce=defer_topk_reduce,
         combine_dtype=combine_dtype,
         # Constructed valid even before knobs land: quantized combine rejects
         # the default epi_warps token-back in __post_init__.
@@ -1104,13 +1169,14 @@ def get_symm_buffer_for_mega_moe(
             "reuse_dispatch_warps" if combine_dtype != "bf16" else "epi_warps"
         ),
     )
-    cfg = with_knobs(cfg, resolved_knobs)
-    if cfg.in_kernel_fc2_reduce != in_kernel_fc2_reduce:
-        # in_kernel_fc2_reduce is a caller-owned CORRECTNESS choice (it makes
-        # the combine accumulation order nondeterministic); cached/heuristic
-        # perf knobs must not flip it. Explicit knobs dicts already bypassed
-        # resolution above and keep full control.
-        cfg = dataclasses.replace(cfg, in_kernel_fc2_reduce=in_kernel_fc2_reduce)
+    cfg = with_knobs(cfg, knobs)
+    # TODO(Sep 2026) Previously we explicitly overrode the knobs here with the user request,
+    #   despite the autotuner supporting disabling ikr if it would be faster.
+    #   ikr is taken as permission to violate batch invariance so selecting different knobs is fine
+    #   We have now enabled varying the knobs here, revisit this if we see unexpected behavior
+    assert not cfg.in_kernel_fc2_reduce or cfg.enable_in_kernel_fc2_reduce, (
+        "in_kernel_fc2_reduce must be disabled if enable_in_kernel_fc2_reduce is False"
+    )
     frontend = MegaMoENvfp4Frontend(cfg)
 
     hidden_sf_cols = ceil_div(hidden, Nvfp4BlockSize)
@@ -1186,6 +1252,8 @@ def nvfp4_mega_moe(
     symm_buffer: MegaMoESymmBuffer,
     *,
     num_tokens: Optional[int] = None,
+    swiglu_alpha: Optional[float] = None,
+    swiglu_beta: Optional[float] = None,
     gate_up_clamp: Optional[float] = None,
     activation_clamp: Optional[float] = None,
     fast_math: bool = True,
@@ -1204,6 +1272,10 @@ def nvfp4_mega_moe(
     ``y`` receives the top-k-reduced bf16 output for ``[:num_tokens]``.
     ``gate_up_clamp`` updates the kernel clamp for this session when set.
     ``activation_clamp`` is a deprecated alias for ``gate_up_clamp``.
+    Set both ``swiglu_alpha`` / ``swiglu_beta`` to update the session
+    activation constants (recompiles outside CUDA graph capture). Omit both
+    to retain the allocation-time values; use ``1.0`` / ``0.0`` to restore
+    standard SwiGLU.
     ``fast_math`` is accepted for DeepGEMM API parity and has no effect here.
 
     ``sync=False`` (default): the kernel launch and the ``y`` copy are
@@ -1263,6 +1335,8 @@ def nvfp4_mega_moe(
         gate_up_clamp=gate_up_clamp,
         activation_clamp=activation_clamp,
     )
+    if swiglu_alpha is not None or swiglu_beta is not None:
+        symm_buffer._frontend.set_swiglu_params(swiglu_alpha, swiglu_beta)
     if clamp is not None:
         symm_buffer._frontend.set_gate_up_clamp(clamp)
 
@@ -1448,9 +1522,12 @@ def create_dummy_inputs(
     hidden: int,
     intermediate: int,
     *,
+    swiglu_alpha: Optional[float] = None,
+    swiglu_beta: Optional[float] = None,
     gate_up_clamp: Optional[float] = None,
     activation_clamp: Optional[float] = None,
     combine_dtype: Literal["bf16", "mxfp8", "nvfp4"] = "bf16",
+    enable_in_kernel_fc2_reduce: bool = False,
     fc1_alpha: Optional[PerExpertEpilogue] = None,
     fc2_alpha: Optional[PerExpertEpilogue] = None,
     fc1_norm_const: Optional[PerExpertEpilogue] = None,
@@ -1498,7 +1575,10 @@ def create_dummy_inputs(
         rank,
         world_size,
         gate_up_clamp=clamp,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
         combine_dtype=combine_dtype,
+        enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
         fc1_alpha=fc1_alpha,
         fc2_alpha=fc2_alpha,
         fc1_norm_const=fc1_norm_const,

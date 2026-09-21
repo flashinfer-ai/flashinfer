@@ -243,6 +243,8 @@ def _reference_nvfp4_mega_moe_staged(
         rank,
         world_size,
         gate_up_clamp=problem["gate_up_clamp"],
+        swiglu_alpha=problem.get("swiglu_alpha"),
+        swiglu_beta=problem.get("swiglu_beta"),
         combine_dtype=combine_dtype,
         fc1_alpha=problem["fc1_alpha"],
         fc2_alpha=problem["fc2_alpha"],
@@ -380,6 +382,8 @@ def _megakernel_config(problem: dict, *, epilogue_via_config: bool, **config_ext
         top_k=problem["topk"],
         gate_up_clamp=problem["gate_up_clamp"],
         fast_math=problem["fast_math"],
+        swiglu_alpha=problem.get("swiglu_alpha"),
+        swiglu_beta=problem.get("swiglu_beta"),
     )
     if epilogue_via_config:
         kwargs.update(
@@ -401,6 +405,8 @@ def _run_mega_layer(
     in_kernel_fc2_reduce: bool = False,
     combine_dtype: str = "bf16",
     check_output_view: bool = False,
+    swiglu_alpha: float | None = None,
+    swiglu_beta: float | None = None,
 ):
     import torch
     import torch.distributed as dist
@@ -428,8 +434,9 @@ def _run_mega_layer(
     problem = _mega_problem(
         rank, world_size, num_tokens=num_tokens, max_tokens=max_tokens
     )
+    problem.update(swiglu_alpha=swiglu_alpha, swiglu_beta=swiglu_beta)
     config_extra = dict(
-        in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+        enable_in_kernel_fc2_reduce=in_kernel_fc2_reduce,
         combine_dtype=combine_dtype,
     )
     kernel = create_mega_kernel(
@@ -809,7 +816,7 @@ def _run_mega_layer_zero_token_ikr_regression(
             fc1_norm_const=fc1_norm_const,
         ),
         epilogue_via_config=True,
-        in_kernel_fc2_reduce=True,
+        enable_in_kernel_fc2_reduce=True,
     )
 
     mega = MoEEpMegaLayer(
@@ -964,6 +971,8 @@ def _run_mega_torch_oracle(
     *,
     in_kernel_fc2_reduce: bool = False,
     combine_dtype: str = "bf16",
+    swiglu_alpha: float | None = None,
+    swiglu_beta: float | None = None,
 ):
     """Real-EP kernel launch vs a pure-torch oracle on the GLOBAL expert set.
 
@@ -1020,6 +1029,10 @@ def _run_mega_torch_oracle(
     ensure_moe_ep_cuda_device(bootstrap)
     problem = _mega_problem(rank, world_size)
     num_local = problem["num_experts"] // world_size
+    if swiglu_alpha is not None:
+        problem["hidden_states"].mul_(0.1)
+        problem["w13"].mul_(0.1)
+        problem["gate_up_clamp"] = 0.5
     # Identity epilogue scalars: the torch oracle has no alpha/norm-const legs.
     (
         problem["fc1_alpha"],
@@ -1038,7 +1051,7 @@ def _run_mega_torch_oracle(
         _megakernel_config(
             problem,
             epilogue_via_config=True,
-            in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+            enable_in_kernel_fc2_reduce=in_kernel_fc2_reduce,
             combine_dtype=combine_dtype,
         )
     )
@@ -1058,7 +1071,9 @@ def _run_mega_torch_oracle(
             rank,
             world_size,
             gate_up_clamp=problem["gate_up_clamp"],
-            in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            enable_in_kernel_fc2_reduce=in_kernel_fc2_reduce,
             combine_dtype=combine_dtype,
             fc1_alpha=problem["fc1_alpha"],
             fc2_alpha=problem["fc2_alpha"],
@@ -1141,6 +1156,8 @@ def _run_mega_torch_oracle(
                 intermediate=problem["intermediate"],
                 gate_up_clamp=problem["gate_up_clamp"],
                 term_transform=term_transform,
+                swiglu_alpha=swiglu_alpha,
+                swiglu_beta=swiglu_beta,
             )
 
             assert torch.isfinite(y_kernel).all()
@@ -1337,7 +1354,7 @@ def test_nvfp4_cutedsl_config_exposes_ikr_and_combine_dtype():
     cfg = Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
         intermediate_size=128,
         top_k=2,
-        in_kernel_fc2_reduce=True,
+        enable_in_kernel_fc2_reduce=True,
     )
     assert cfg.combine_dtype == "bf16"
     assert create_mega_kernel(cfg).kernel_name() == "sm100_nvfp4_nvfp4_bf16_cutedsl"
@@ -1363,6 +1380,7 @@ def test_nvfp4_shim_config_rejects_invalid_ikr_combos():
         num_total_experts=8,
         hidden=256,
         intermediate=256,
+        enable_in_kernel_fc2_reduce=True,
     )
     # ikr requires a bf16 combine wire.
     with pytest.raises(ValueError, match="in_kernel_fc2_reduce"):
@@ -1375,6 +1393,12 @@ def test_nvfp4_shim_config_rejects_invalid_ikr_combos():
     # ikr requires the topk score folded before fc2.
     with pytest.raises(ValueError, match="apply_topk_in_fc1"):
         MegaMoENvfp4Config(**base, in_kernel_fc2_reduce=True, apply_topk_in_fc1=False)
+    # ikr also needs the session's permission.
+    with pytest.raises(ValueError, match="enable_in_kernel_fc2_reduce"):
+        MegaMoENvfp4Config(
+            **{**base, "enable_in_kernel_fc2_reduce": False},
+            in_kernel_fc2_reduce=True,
+        )
     # quantized combine wires are only wired for dispatch-warp token-back.
     with pytest.raises(ValueError, match="reuse_dispatch_warps"):
         MegaMoENvfp4Config(**base, combine_dtype="mxfp8")
@@ -1408,18 +1432,39 @@ def test_autotune_nvfp4_candidates_cover_ikr():
         nvfp4_candidates,
     )
 
-    cands = nvfp4_candidates()
+    cands = nvfp4_candidates(enable_in_kernel_fc2_reduce=True)
     assert any(k["in_kernel_fc2_reduce"] for k in cands)
     assert any(not k["in_kernel_fc2_reduce"] for k in cands)
 
     # A quantized wire prunes to the valid subset: no ikr, dispatch-warp
     # token-back only.
-    qcands = nvfp4_candidates(combine_format="16e2m1xbf16")
+    qcands = nvfp4_candidates(
+        combine_format="16e2m1xbf16", enable_in_kernel_fc2_reduce=True
+    )
     assert qcands
     assert all(
         not k["in_kernel_fc2_reduce"] and k["token_back_mode"] == "reuse_dispatch_warps"
         for k in qcands
     )
 
-    pinned = nvfp4_candidates(allow_in_kernel_fc2_reduce=False)
+    # Without the session's permission the ikr axis disappears entirely.
+    pinned = nvfp4_candidates()
     assert pinned and all(not k["in_kernel_fc2_reduce"] for k in pinned)
+    assert len(pinned) * 2 == len(cands)
+
+
+@pytest.mark.gpu_2
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize("check", ["layer", "torch-oracle"])
+def test_nvfp4_minimax_multirank(check):
+    """MiniMax activation through the public layer and real EP vs torch math."""
+    _require_cuda()
+    pytest.importorskip("triton")
+    rank, world_size = _launcher_ranks()
+    if world_size < 2:
+        pytest.skip("needs >=2 ranks")
+    kwargs = dict(swiglu_alpha=1.702, swiglu_beta=1.0)
+    if check == "layer":
+        _run_mega_layer(rank, world_size, quantize_input=True, **kwargs)
+    else:
+        _run_mega_torch_oracle(rank, world_size, **kwargs)

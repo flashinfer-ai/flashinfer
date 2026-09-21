@@ -83,6 +83,7 @@ def compute_megamoe_reference(
     gate_up_clamp: Optional[float] = None,
     apply_topk_in_fc1: bool = False,
     return_fc1_gateup: bool = False,
+    gate_up_interleave: int = Fc1GateUpInterleave,
 ):
     """Return the per-topk combine reference for the multi-rank MegaMoE path.
 
@@ -96,6 +97,10 @@ def compute_megamoe_reference(
     weight is folded into the SwiGLU output before the BF16 hand-off cast;
     when False the per-topk combine terms stay unweighted (a downstream
     reduce applies them).
+
+    ``gate_up_interleave`` defaults to the BF16 kernel's 32-column pairing.
+    Mixed-weight callers whose FC1 epilogue uses a different pairing may
+    override it without changing the existing BF16 reference behavior.
 
     When ``return_fc1_gateup`` is True, additionally returns a
     ``{global_expert: (routed_tokens, intermediate) BF16}`` map of the raw
@@ -189,7 +194,7 @@ def compute_megamoe_reference(
             fc2_weight=w2_nk,
             intermediate=intermediate,
             hidden=hidden,
-            gate_up_interleave=Fc1GateUpInterleave,
+            gate_up_interleave=gate_up_interleave,
             gate_up_clamp=gate_up_clamp,
             topk_weights=gathered_topk_weights,
             ref_compute_graph=expert_graph,
