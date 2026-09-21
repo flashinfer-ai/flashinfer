@@ -843,9 +843,9 @@ class BlockSparseAttentionWrapper:
         if self._backend == "vsa_sm100_blk128":
             cc = get_compute_capability(self.device)
             arch = cc[0] * 10 + cc[1]
-            if cc not in ((10, 0), (10, 3)):
+            if cc not in ((10, 0), (10, 3), (10, 7)):
                 raise RuntimeError(
-                    f"vsa_sm100_blk128 backend requires SM100/SM103, "
+                    f"vsa_sm100_blk128 backend requires SM100/SM103/SM107, "
                     f"current device is SM{arch}"
                 )
             # BSA blk128 kernel uses 128-token compute tiles; block index granularity = R = C = 128.
@@ -937,9 +937,9 @@ class BlockSparseAttentionWrapper:
         if self._backend == "vsa_sm100_blk64":
             cc = get_compute_capability(self.device)
             arch = cc[0] * 10 + cc[1]
-            if cc not in ((10, 0), (10, 3)):
+            if cc not in ((10, 0), (10, 3), (10, 7)):
                 raise RuntimeError(
-                    f"vsa_sm100_blk64 backend requires SM100/SM103, "
+                    f"vsa_sm100_blk64 backend requires SM100/SM103/SM107, "
                     f"current device is SM{arch}"
                 )
             # blk64 kernel uses 64-token compute tiles; block index granularity = R = C = 64.
