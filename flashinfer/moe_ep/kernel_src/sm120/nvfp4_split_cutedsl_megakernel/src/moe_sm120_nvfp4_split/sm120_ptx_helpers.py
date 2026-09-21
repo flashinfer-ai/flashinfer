@@ -103,6 +103,35 @@ def st_release_sys_u64_raw(addr: Int64, val: Int64, *, loc=None, ip=None) -> Non
 
 
 @dsl_user_op
+def atomic_cas_gpu_i32_raw(
+    addr: Int64,
+    compare: Int32,
+    value: Int32,
+    *,
+    loc=None,
+    ip=None,
+) -> Int32:
+    """Claim one device-local dispatch cache slot and return its old value."""
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                addr.ir_value(loc=loc, ip=ip),
+                compare.ir_value(loc=loc, ip=ip),
+                value.ir_value(loc=loc, ip=ip),
+            ],
+            "atom.acquire.gpu.global.cas.b32 $0, [$1], $2, $3;",
+            "=r,l,r,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def spin_wait_i32_ge_cv_raw(
     addr: Int64,
     threshold: Int32,

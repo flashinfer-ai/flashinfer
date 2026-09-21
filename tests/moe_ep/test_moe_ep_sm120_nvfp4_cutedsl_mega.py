@@ -25,13 +25,13 @@ def _problem(
     *,
     tokens: int,
     capacity: int,
+    top_k: int = 2,
 ):
     from flashinfer.moe_ep import MoEEpTensors, MoEWeightPack
 
     hidden = 1024
     intermediate = 1024
     experts = 8
-    top_k = 2
     local_experts = experts // world_size
     generator = torch.Generator(device="cuda").manual_seed(91 + rank)
     weights = MoEWeightPack(
@@ -58,14 +58,13 @@ def _problem(
         * 0.05
     )
     rows = torch.arange(tokens, device="cuda")
-    topk_ids = torch.stack(
-        ((rows * 3 + rank) % experts, (rows * 5 + rank + 1) % experts), 1
-    ).to(torch.int32)
+    slots = torch.arange(top_k, device="cuda")
+    topk_ids = ((rows[:, None] * 3 + rank + slots) % experts).to(torch.int32)
     inputs = MoEEpTensors(
         hidden_states=hidden_states,
         topk_ids=topk_ids,
         topk_weights=torch.full(
-            (tokens, top_k), 0.5, dtype=torch.float32, device="cuda"
+            (tokens, top_k), 1.0 / top_k, dtype=torch.float32, device="cuda"
         ),
     )
     return {
@@ -79,7 +78,7 @@ def _problem(
     }
 
 
-def _make_layer(rank: int, world_size: int, problem: dict):
+def _make_layer(rank: int, world_size: int, problem: dict, *, knobs=None):
     from flashinfer.moe_ep import (
         BootstrapConfig,
         FleetParams,
@@ -101,6 +100,7 @@ def _make_layer(rank: int, world_size: int, problem: dict):
                 intermediate_size=problem["intermediate"],
                 top_k=problem["top_k"],
                 gate_up_clamp=10.0,
+                knobs=knobs,
             ),
             quantize_input=True,
             preprocess_weights=True,
@@ -135,6 +135,103 @@ def test_sm120_nvfp4_single_rank_replay_and_outer_cuda_graph() -> None:
         torch.testing.assert_close(replay0, replay1, atol=0.0, rtol=0.0)
     finally:
         layer.destroy()
+
+
+def _owner_grouped_reference(routes, ids, *, world_size, local_experts):
+    partials = []
+    for owner in range(world_size):
+        value = torch.zeros_like(routes[:, 0], dtype=torch.float32)
+        for slot in range(ids.shape[1]):
+            selected = (ids[:, slot] // local_experts) == owner
+            value += routes[:, slot].float() * selected[:, None]
+        partials.append(value.bfloat16())
+    total = torch.zeros_like(routes[:, 0], dtype=torch.float32)
+    for partial in partials:
+        total += partial.float()
+    return total.bfloat16()
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_sm120
+@pytest.mark.parametrize("rank_local_combine", (False, True))
+def test_sm120_nvfp4_rank_cache_and_combine_graph_epochs(rank_local_combine) -> None:
+    import torch.distributed as dist
+
+    if int(os.environ.get("WORLD_SIZE", "1")) != 4:
+        pytest.skip("requires exactly four ranks")
+    rank = int(os.environ["RANK"])
+    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    tokens = (124, 63, 7, 0)[rank]
+    bucket = 128
+    problem = _problem(rank, 4, tokens=tokens, capacity=256, top_k=6)
+    base_knobs = {"dispatch_rank_cache": False, "rank_local_combine": False}
+    candidate_knobs = {
+        "dispatch_rank_cache": True,
+        "rank_local_combine": rank_local_combine,
+    }
+    baseline = _make_layer(rank, 4, problem, knobs=base_knobs)
+    candidate = _make_layer(rank, 4, problem, knobs=candidate_knobs)
+    second_layer = _make_layer(rank, 4, problem, knobs=candidate_knobs)
+    try:
+        inputs = problem["inputs"]
+        for layer in (baseline, candidate, second_layer):
+            layer.stage_inputs(inputs, compile_tokens_per_rank=bucket)
+            layer.compute_staged(output=None)
+        torch.cuda.synchronize()
+        dist.barrier()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            candidate.stage_inputs(inputs, compile_tokens_per_rank=bucket)
+            captured0 = candidate.compute_staged(output=None).clone()
+            second_layer.stage_inputs(inputs, compile_tokens_per_rank=bucket)
+            captured1 = second_layer.compute_staged(output=None).clone()
+
+        storage = candidate._workspace._storages[bucket]
+        assert candidate._workspace is second_layer._workspace
+        for epoch in range(3):
+            # Change the source rows and omit an expert owner in epoch 1.
+            active_rows = tokens if epoch != 1 else tokens // 2
+            ids = inputs.topk_ids
+            rows = torch.arange(tokens, device="cuda")[:, None]
+            slots = torch.arange(problem["top_k"], device="cuda")[None, :]
+            ids.copy_((rows * 3 + slots + rank + epoch) % (6 if epoch == 1 else 8))
+            ids[active_rows:].fill_(-1)
+            inputs.hidden_states.mul_(-0.5 if epoch == 1 else 1.25)
+            inputs.topk_weights.mul_(0.75)
+            torch.cuda.synchronize()
+            dist.barrier()
+            baseline.stage_inputs(inputs, compile_tokens_per_rank=bucket)
+            expected_direct = baseline.compute_staged(output=None).clone()
+            routes = (
+                baseline._workspace._storages[bucket].combine_output[:tokens].clone()
+            )
+            expected = (
+                _owner_grouped_reference(routes, ids, world_size=4, local_experts=2)
+                if rank_local_combine
+                else expected_direct
+            )
+            torch.cuda.synchronize()
+            dist.barrier()
+            initial_generation = (
+                int(storage.rank_combine_ready[-1, 0]) if rank_local_combine else 0
+            )
+            for _ in range(40):
+                graph.replay()
+                torch.cuda.synchronize()
+                torch.testing.assert_close(
+                    captured0[:active_rows], expected[:active_rows], atol=0, rtol=0
+                )
+                torch.testing.assert_close(
+                    captured1[:active_rows], expected[:active_rows], atol=0, rtol=0
+                )
+                assert torch.isfinite(captured0[:active_rows]).all()
+            if rank_local_combine:
+                assert int(storage.rank_combine_ready[-1, 0]) == initial_generation + 80
+            dist.barrier()
+    finally:
+        second_layer.destroy()
+        candidate.destroy()
+        baseline.destroy()
 
 
 @pytest.mark.gpu_4

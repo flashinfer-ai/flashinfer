@@ -34,6 +34,18 @@ _SINGLE_DISPATCH_WARP_MAX_HIDDEN = 4096
 _SINGLE_DISPATCH_WARP_MAX_EXPERTS = 256
 _SINGLE_DISPATCH_WARP_MAX_TOPK = 6
 
+# Same-NUMA EP4 dispatch caches one activation row per (source rank, token)
+# and reuses it when several top-k routes land on the same expert owner.  Use
+# a traffic-derived threshold so the selector is independent of model names.
+_DISPATCH_RANK_CACHE_MIN_SAVED_BYTES = 64 * 1024
+_DISPATCH_RANK_CACHE_MIN_SAVED_FRACTION = 0.20
+
+# Rank-local combine is robust across balanced, power-law and zero-owner EP4
+# routes once each local expert wave reaches roughly 256 rows.  Below this
+# boundary, fixed sideband/K3 costs and owner imbalance can erase the P2P
+# savings even when the theoretical byte reduction is large.
+_RANK_LOCAL_COMBINE_MIN_ROWS_PER_EXPERT = 256.0
+
 # The measured RTX Pro 5000 presets remain the tuning anchors, but their SM
 # counts must scale to the physical device.  Green Context requires every
 # explicitly requested group except the final remainder to respect the
@@ -162,6 +174,53 @@ class MegaMoEHeuristicInput:
             * 2
         )
 
+    @property
+    def probability_one_owner_is_untouched(self) -> float:
+        """Uniform-route probability that top-k selects no expert on one owner."""
+
+        experts_per_owner = self.num_total_experts // self.expert_parallel_size
+        experts_outside_owner = self.num_total_experts - experts_per_owner
+        if self.num_topk > experts_outside_owner:
+            return 0.0
+        probability = 1.0
+        for index in range(self.num_topk):
+            probability *= (experts_outside_owner - index) / (
+                self.num_total_experts - index
+            )
+        return probability
+
+    @property
+    def expected_remote_route_rows(self) -> float:
+        return (
+            self.tokens_per_rank
+            * self.num_topk
+            * (self.expert_parallel_size - 1)
+            / self.expert_parallel_size
+        )
+
+    @property
+    def expected_duplicate_remote_owner_rows(self) -> float:
+        unique_remote_owner_rows = (
+            self.tokens_per_rank
+            * (self.expert_parallel_size - 1)
+            * (1.0 - self.probability_one_owner_is_untouched)
+        )
+        return max(self.expected_remote_route_rows - unique_remote_owner_rows, 0.0)
+
+    @property
+    def expected_dispatch_rank_cache_saved_bytes(self) -> float:
+        activation_row_bytes = (self.hidden + 1) // 2
+        scale_row_bytes = (self.hidden + 15) // 16
+        return self.expected_duplicate_remote_owner_rows * (
+            activation_row_bytes + scale_row_bytes
+        )
+
+    @property
+    def expected_dispatch_rank_cache_saved_fraction(self) -> float:
+        if self.expected_remote_route_rows == 0:
+            return 0.0
+        return self.expected_duplicate_remote_owner_rows / self.expected_remote_route_rows
+
     def validate(self) -> None:
         positive = {
             "tokens_per_rank": self.tokens_per_rank,
@@ -183,6 +242,8 @@ class MegaMoEHeuristicInput:
             raise ValueError(
                 "num_total_experts must be divisible by expert_parallel_size"
             )
+        if self.num_topk > self.num_total_experts:
+            raise ValueError("num_topk must not exceed num_total_experts")
         if self.ep_same_numa_peer_count < 0 or self.ep_cross_numa_peer_count < 0:
             raise ValueError("EP peer counts must be non-negative")
         if (
@@ -231,6 +292,8 @@ class MegaMoEHeuristicOverrides:
     tp_k3_chunks: Optional[int] = None
     dispatch_warps: Optional[int] = None
     dispatch_compute_overlap: Optional[bool] = None
+    dispatch_rank_cache: Optional[bool] = None
+    rank_local_combine: Optional[bool] = None
 
 
 @dataclass(frozen=True)
@@ -270,6 +333,8 @@ class MegaMoEKernelConfig:
     dispatch_warps: int
     dispatch_warps_per_tile: int
     dispatch_compute_overlap: bool
+    dispatch_rank_cache: bool
+    rank_local_combine: bool
     k1_ready_queue: bool
     k1_ready_queue_m_rotation: int
     k2_ready_queue: bool
@@ -580,6 +645,27 @@ def select_megamoe_config(
         else 4
     )
 
+    dispatch_rank_cache = (
+        not cross_numa
+        and shape.expert_parallel_size == 4
+        and shape.ep_same_numa_peer_count == 3
+        and shape.tensor_parallel_size == 1
+        and shape.expected_dispatch_rank_cache_saved_bytes
+        >= _DISPATCH_RANK_CACHE_MIN_SAVED_BYTES
+        and shape.expected_dispatch_rank_cache_saved_fraction
+        >= _DISPATCH_RANK_CACHE_MIN_SAVED_FRACTION
+    )
+
+    rank_local_combine = (
+        not cross_numa
+        and shape.expert_parallel_size == 4
+        and shape.ep_same_numa_peer_count == 3
+        and shape.tensor_parallel_size == 1
+        and shape.expert_parallel_size <= shape.num_topk
+        and dispatch_rank_cache
+        and rows >= _RANK_LOCAL_COMBINE_MIN_ROWS_PER_EXPERT
+    )
+
     # Except for the bounded small-message window above, keep production on
     # the shallow two-slot fast path. Fixed peer/channel CTA ownership and
     # independent terminal credits provide forward progress without growing
@@ -629,6 +715,13 @@ def select_megamoe_config(
         dispatch_warps=dispatch_warps,
         dispatch_warps_per_tile=8,
         dispatch_compute_overlap=shape.tokens_per_rank >= 1024,
+        dispatch_rank_cache=dispatch_rank_cache,
+        # This changes BF16 association order: contributions are first
+        # accumulated within each owner rank, rounded to BF16, and then
+        # reduced across owners. The conservative rows threshold keeps auto
+        # selection outside route-sensitive small-input buckets; callers can
+        # still force either semantic path through the explicit override.
+        rank_local_combine=rank_local_combine,
         k1_ready_queue=True,
         # Keep the production selector independent of DP layout.  The old
         # DP-only queue rotation was an experiment, not a portable heuristic.
@@ -655,6 +748,32 @@ def select_megamoe_config(
     )
     if overrides is not None:
         config = config.with_overrides(overrides)
+    if (
+        config.comm_backend != "p2p_direct"
+        and (overrides is None or overrides.rank_local_combine is None)
+    ):
+        # A transport override can move an otherwise eligible EP4 shape onto
+        # IBGDA. Auto mode follows the resolved backend; explicit ``on`` is
+        # intentionally rejected by the validation below.
+        config = replace(config, rank_local_combine=False)
+    explicit_dispatch_warps = (
+        overrides is not None and overrides.dispatch_warps is not None
+    )
+    explicit_k2_stages = (
+        overrides is not None and overrides.k2_stages is not None
+    )
+    if config.rank_local_combine:
+        # With token-back traffic grouped per owner, the measured critical
+        # path shifts back to K1/K2. One logical dispatcher is sufficient
+        # when rank caching is active, and N128 K2 benefits from stage3.
+        if (
+            not explicit_dispatch_warps
+            and config.dispatch_rank_cache
+            and config.comm_backend == "p2p_direct"
+        ):
+            config = replace(config, dispatch_warps=1)
+        if not explicit_k2_stages and config.k2_tile[1] == 128:
+            config = replace(config, k2_stages=3)
     if config.total_sms != shape.num_sms:
         raise ValueError(
             "resolved SM partitions must cover all device SMs: "
@@ -671,6 +790,21 @@ def select_megamoe_config(
             "reduced dispatch_warps is currently validated only for "
             "same-NUMA p2p_direct"
         )
+    if config.rank_local_combine:
+        if config.comm_backend != "p2p_direct":
+            raise ValueError("rank_local_combine requires p2p_direct")
+        if config.token_back_mode != "epi_warps":
+            raise ValueError("rank_local_combine requires epi_warps token-back")
+        if shape.expert_parallel_size > shape.num_topk:
+            raise ValueError(
+                "rank_local_combine requires expert_parallel_size <= num_topk"
+            )
+        if shape.tensor_parallel_size != 1:
+            raise ValueError("rank_local_combine is currently validated only for TP1")
+        if config.k2_tail_reclaim or config.k2_warps == 12:
+            raise ValueError(
+                "rank_local_combine is not compatible with experimental K2 tail paths"
+            )
     if config.dispatch_local_handoff_windows <= 0:
         raise ValueError("dispatch_local_handoff_windows must be positive")
     if config.dispatch_remote_handoff_windows <= 0:

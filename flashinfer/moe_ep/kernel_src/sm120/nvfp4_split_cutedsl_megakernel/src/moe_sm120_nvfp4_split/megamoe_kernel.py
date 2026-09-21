@@ -82,6 +82,10 @@ _NvlinkCounterCount = 2
 # advance one another's phase.
 _GridSyncSlotCount = 2
 
+# Rank-local combine partitions one hidden row into at most four independent
+# publication groups.  K1 and K2 must reserve an identical counter layout.
+RANK_COMBINE_MAX_GROUPS = 4
+
 
 # =============================================================================
 # Region spec + layout helpers
@@ -201,6 +205,8 @@ class Sm120MegaMoENvfp4SwapABKernel(Sm120SwapABSwigluNvfp4Fc12Kernel):
         dispatch_warps: int = 4,
         dispatch_warps_per_tile: int = 8,
         dispatch_compute_overlap: Optional[bool] = None,
+        dispatch_rank_cache: bool = False,
+        rank_local_combine: bool = False,
         fc1_ready_tile_tokens: Optional[int] = None,
         fc1_producer_tile_tokens: Optional[int] = None,
         k2_token_tile_tokens: Optional[int] = None,
@@ -606,6 +612,25 @@ class Sm120MegaMoENvfp4SwapABKernel(Sm120SwapABSwigluNvfp4Fc12Kernel):
                 "dispatch_compute_overlap must be resolved by heuristic.py"
             )
         assert dispatch_compute_overlap is not None
+        if dispatch_rank_cache and (
+            comm_backend != "p2p_direct"
+            or dispatch_pull_mode != "token_strided"
+        ):
+            raise ValueError(
+                "dispatch_rank_cache requires p2p_direct token-strided dispatch"
+            )
+        self.dispatch_rank_cache = dispatch_rank_cache
+        if rank_local_combine and (
+            comm_backend != "p2p_direct"
+            or token_back_mode != "epi_warps"
+            or dispatch_pull_mode != "token_strided"
+            or world_size > num_topk
+        ):
+            raise ValueError(
+                "rank_local_combine requires p2p_direct token-strided "
+                "epi-warp combine with world_size <= num_topk"
+            )
+        self.rank_local_combine = rank_local_combine
 
         self.token_comm = Sm120SysmemTokenInPullTokenBackPush(
             world_size=self.world_size,
@@ -634,6 +659,8 @@ class Sm120MegaMoENvfp4SwapABKernel(Sm120SwapABSwigluNvfp4Fc12Kernel):
             num_dispatch_warps=token_comm_num_dispatch_warps,
             dispatch_warps_per_tile=dispatch_warps_per_tile,
             dispatch_compute_overlap=dispatch_compute_overlap,
+            dispatch_rank_cache=dispatch_rank_cache,
+            rank_local_combine=rank_local_combine,
             streaming_fc12=self.streaming_fc12,
             k1_ready_queue=self.k1_ready_queue,
             k1_ready_queue_m_tiles=self.k1_ready_queue_m_tiles,
@@ -888,6 +915,51 @@ class Sm120MegaMoENvfp4SwapABKernel(Sm120SwapABSwigluNvfp4Fc12Kernel):
                 16,
             ),
         ]
+        if self.dispatch_rank_cache:
+            cache_slots = self.world_size * self.max_tokens_per_rank
+            specs.extend(
+                [
+                    _RegionSpec(
+                        "dispatch_rank_cache_state",
+                        cutlass.Int32,
+                        (cache_slots,),
+                        16,
+                    ),
+                    _RegionSpec(
+                        "dispatch_rank_cache_sf_axis",
+                        cutlass.Int32,
+                        (cache_slots,),
+                        16,
+                    ),
+                ]
+            )
+        if self.rank_local_combine:
+            source_tokens = self.world_size * self.max_tokens_per_rank
+            specs.extend(
+                [
+                    _RegionSpec(
+                        "rank_combine_route_map",
+                        cutlass.Int32,
+                        (source_tokens, self.num_topk),
+                        16,
+                    ),
+                    _RegionSpec(
+                        "rank_combine_route_output",
+                        self.fc2_output_dtype,
+                        (pool_token_capacity, 1, self.hidden),
+                        128,
+                    ),
+                    _RegionSpec(
+                        "rank_combine_tile_done",
+                        cutlass.Int32,
+                        (
+                            pool_token_capacity
+                            + (RANK_COMBINE_MAX_GROUPS + 1) * source_tokens,
+                        ),
+                        16,
+                    ),
+                ]
+            )
         if self.comm_backend == "nvshmem_ibgda":
             # NVSHMEM get_warp writes a contiguous local destination.  The
             # FC1 scale-factor pool is atom-swizzled, so use a compact plain
@@ -1019,6 +1091,17 @@ class Sm120MegaMoENvfp4SwapABKernel(Sm120SwapABSwigluNvfp4Fc12Kernel):
                 16,
             ),
         ]
+        if self.rank_local_combine:
+            specs.append(
+                _RegionSpec(
+                    "rank_combine_route_count",
+                    cutlass.Int32,
+                    (
+                        world_size * max_tokens_per_rank + world_size,
+                    ),
+                    16,
+                )
+            )
         return specs
 
     # =========================================================================
@@ -1240,6 +1323,26 @@ class Sm120MegaMoENvfp4SwapABKernel(Sm120SwapABSwigluNvfp4Fc12Kernel):
         token_src_metadata = self._view_local(
             local_workspace, "token_src_metadata",
         )
+        if cutlass.const_expr(self.dispatch_rank_cache):
+            dispatch_rank_cache_state = self._view_local(
+                local_workspace, "dispatch_rank_cache_state",
+            )
+            dispatch_rank_cache_sf_axis = self._view_local(
+                local_workspace, "dispatch_rank_cache_sf_axis",
+            )
+        else:
+            dispatch_rank_cache_state = None
+            dispatch_rank_cache_sf_axis = None
+        if cutlass.const_expr(self.rank_local_combine):
+            rank_combine_route_map = self._view_local(
+                local_workspace, "rank_combine_route_map",
+            )
+            rank_combine_route_output = self._view_local(
+                local_workspace, "rank_combine_route_output",
+            )
+        else:
+            rank_combine_route_map = None
+            rank_combine_route_output = None
         expert_send_count = self._view_local(
             local_workspace, "expert_send_count",
         )
@@ -1339,6 +1442,17 @@ class Sm120MegaMoENvfp4SwapABKernel(Sm120SwapABSwigluNvfp4Fc12Kernel):
             fc2_done_counter = None
             combine_output_u8 = combine_output
 
+        if cutlass.const_expr(self.rank_local_combine):
+            # Epi-warp combine does not consume the ordinary token-back
+            # counter.  Reuse its stable TokenCommArgs slot for immutable
+            # per-source-token contributor counts.
+            fc2_done_counter = self._view_shared(
+                shared_workspace, "rank_combine_route_count",
+            )
+            fc2_block_done_counter = self._view_local(
+                local_workspace, "rank_combine_tile_done",
+            )
+
         if cutlass.const_expr(self.comm_backend == "nvshmem_ibgda"):
             ibgda_sf_staging = self._view_local(
                 local_workspace, "ibgda_sf_staging",
@@ -1368,9 +1482,23 @@ class Sm120MegaMoENvfp4SwapABKernel(Sm120SwapABSwigluNvfp4Fc12Kernel):
             fc1_ready_counter=l1_arrival_count,
             token_src_metadata=token_src_metadata,
             combine_output=combine_output_u8,
-            combine_sf=ibgda_sf_staging,
-            fc2_output_workspace=fc2_output_workspace_u8,
-            fc2_output_sf=None,
+            combine_sf=(
+                rank_combine_route_map
+                if self.rank_local_combine
+                else ibgda_sf_staging
+            ),
+            # Epi-warp token-back leaves these optional fields unused. Carry
+            # the two dispatch-cache pointers through the stable argument ABI.
+            fc2_output_workspace=(
+                dispatch_rank_cache_state
+                if self.dispatch_rank_cache
+                else fc2_output_workspace_u8
+            ),
+            fc2_output_sf=(
+                dispatch_rank_cache_sf_axis
+                if self.dispatch_rank_cache
+                else None
+            ),
             fc2_done_counter=fc2_done_counter,
             token_back_schedule_counter=token_back_schedule_counter,
             nvlink_barrier_signal=nvlink_barrier_signal,
@@ -1400,7 +1528,9 @@ class Sm120MegaMoENvfp4SwapABKernel(Sm120SwapABSwigluNvfp4Fc12Kernel):
         # REDG modes use ``(max_tokens_per_rank, 1, hidden)`` and reduce in
         # kernel.  The epilogue return tile maps local pool rows back to the
         # source rank's token row through ``token_comm_args``.
-        if cutlass.const_expr(self.token_back_by_dispatch):
+        if cutlass.const_expr(self.rank_local_combine):
+            fc2_output_target = rank_combine_route_output
+        elif cutlass.const_expr(self.token_back_by_dispatch):
             fc2_output_target = fc2_output_workspace_native
         else:
             fc2_output_target = combine_output
@@ -1489,6 +1619,7 @@ class Sm120MegaMoENvfp4SwapABKernel(Sm120SwapABSwigluNvfp4Fc12Kernel):
         self,
         token_comm_args,
         token_comm_storage,
+        combine_ready_flags,
         k1_ready_queue_desc,
         k1_ready_queue_ready,
         k1_ready_queue_state,
@@ -1501,6 +1632,7 @@ class Sm120MegaMoENvfp4SwapABKernel(Sm120SwapABSwigluNvfp4Fc12Kernel):
             self.token_comm.dispatch_warp_body(
                 token_comm_args,
                 token_comm_storage,
+                combine_ready_flags,
                 k1_ready_queue_desc,
                 k1_ready_queue_ready,
                 k1_ready_queue_state,

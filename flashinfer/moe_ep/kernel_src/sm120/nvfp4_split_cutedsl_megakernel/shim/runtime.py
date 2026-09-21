@@ -129,6 +129,7 @@ class _ExecutionStorage:
     shared_workspace: torch.Tensor
     combine_output: torch.Tensor
     epilogue_args: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    rank_combine_ready: torch.Tensor | None = None
     green_trace: torch.Tensor | None = None
 
 
@@ -140,6 +141,7 @@ class _ExecutionBuffers:
     shared_workspace: torch.Tensor
     combine_output: torch.Tensor
     epilogue_args: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    rank_combine_ready: torch.Tensor | None = None
     green_trace: torch.Tensor | None = None
 
 
@@ -213,6 +215,8 @@ class MegaMoESm120Nvfp4Frontend:
         "k2_ready_queue_desc",
         "k2_ready_queue_ready",
         "k2_ready_queue_state",
+        "dispatch_rank_cache_state",
+        "rank_combine_tile_done",
     )
 
     # ``nvlink_barrier_counter`` is deliberately not reset by graph replay.
@@ -344,6 +348,7 @@ class MegaMoESm120Nvfp4Frontend:
         shared_workspace: torch.Tensor,
         combine_output: torch.Tensor,
         epilogue_args: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        rank_combine_ready: torch.Tensor | None,
         green_trace: torch.Tensor | None,
         stream,
     ) -> dict[str, Any]:
@@ -364,7 +369,11 @@ class MegaMoESm120Nvfp4Frontend:
             fc2_alpha=self._to_cute(fc2_alpha, assumed_align=4),
             fc1_norm_const=self._to_cute(fc1_norm_const, assumed_align=4),
             combine_output=self._to_cute(combine_output),
-            combine_ready_flags=None,
+            combine_ready_flags=(
+                self._to_cute(rank_combine_ready, assumed_align=4)
+                if rank_combine_ready is not None
+                else None
+            ),
             fc2_block_done_counter=None,
             local_workspace=self._to_cute(local_workspace, static_layout=True),
             shared_workspace=self._to_cute(shared_workspace),
@@ -399,6 +408,9 @@ class MegaMoESm120Nvfp4Frontend:
                 f"K2={kernel.k2_tile}/stage{kernel.k2_stages} "
                 f"bundle={kernel.ready_queue_bundle} "
                 f"tail_reclaim={getattr(kernel, 'k2_tail_reclaim', False)} "
+                f"rank_cache={kernel.dispatch_rank_cache} "
+                f"rank_combine={kernel.rank_local_combine} "
+                f"dispatch_warps={kernel.dispatch_warps} "
                 f"green={kernel.k1_sms}/{kernel.k2_sms}",
                 flush=True,
             )
@@ -431,6 +443,12 @@ class MegaMoESm120Nvfp4Frontend:
                 torch.bfloat16,
             )
             self.workspace._sym_roots.append(root)
+            rank_combine_ready = None
+            if spec.kernel.rank_local_combine:
+                rank_combine_ready = sym_zeros(
+                    (self.compile_bucket + 1, self.config.world_size), torch.int32
+                )
+                self.workspace._sym_roots.append(rank_combine_ready)
             epilogue_args = (
                 self.workspace.fc1_alpha,
                 self.workspace.fc2_alpha,
@@ -457,6 +475,7 @@ class MegaMoESm120Nvfp4Frontend:
                 shared_workspace=shared_workspace,
                 combine_output=combine_output,
                 epilogue_args=epilogue_args,
+                rank_combine_ready=rank_combine_ready,
                 green_trace=green_trace,
             )
             self.workspace._storages[self.compile_bucket] = storage
@@ -467,6 +486,7 @@ class MegaMoESm120Nvfp4Frontend:
             shared_workspace=storage.shared_workspace,
             combine_output=storage.combine_output,
             epilogue_args=storage.epilogue_args,
+            rank_combine_ready=storage.rank_combine_ready,
             green_trace=storage.green_trace,
         )
         self.workspace._executions[self.compile_bucket] = execution
@@ -479,7 +499,10 @@ class MegaMoESm120Nvfp4Frontend:
 
         import cuda.bindings.driver as cuda
         import cutlass.cute as cute
-        from moe_sm120_nvfp4_split.api import compile_combine_reduce
+        from moe_sm120_nvfp4_split.api import (
+            compile_combine_reduce,
+            compile_rank_local_combine,
+        )
         from moe_sm120_nvfp4_split.runtime.green_context import (
             NativeGreenContextGraph,
         )
@@ -506,6 +529,7 @@ class MegaMoESm120Nvfp4Frontend:
             shared_workspace,
             combine_output,
             epilogue_args,
+            execution.rank_combine_ready,
             green_trace,
             root_cuda,
         )
@@ -558,19 +582,32 @@ class MegaMoESm120Nvfp4Frontend:
 
         combine_bucket = combine_output[: self.compile_bucket]
         output_bucket = inputs.output[: self.compile_bucket]
-        k3_plan = compile_combine_reduce(
-            combine_bucket,
-            output_bucket,
-            None,
-            stream=root_cuda,
-        )
-        compiled_k3, combine_cute, output_cute, score_cute, k3_stream = k3_plan
-        runtime_k3 = dict(
-            combine_cute=combine_cute,
-            reduced_cute=output_cute,
-            topk_score_cute=score_cute,
-            stream=k3_stream,
-        )
+        if spec.kernel.rank_local_combine:
+            if execution.rank_combine_ready is None:
+                raise RuntimeError("NVFP4 rank-local combine ready storage is missing")
+            compiled_k3, runtime_k3 = compile_rank_local_combine(
+                combine_bucket,
+                execution.rank_combine_ready,
+                output_bucket,
+                inputs.topk_ids,
+                world_size=self.config.world_size,
+                num_experts_per_rank=self.config.local_experts,
+                stream=root_cuda,
+            )
+        else:
+            k3_plan = compile_combine_reduce(
+                combine_bucket,
+                output_bucket,
+                None,
+                stream=root_cuda,
+            )
+            compiled_k3, combine_cute, output_cute, score_cute, k3_stream = k3_plan
+            runtime_k3 = dict(
+                combine_cute=combine_cute,
+                reduced_cute=output_cute,
+                topk_score_cute=score_cute,
+                stream=k3_stream,
+            )
 
         k1_executor = compiled_k1.to(None)
         k2_executor = compiled_k2.to(None)
@@ -600,14 +637,11 @@ class MegaMoESm120Nvfp4Frontend:
                 else None
             ),
             launch_k3=lambda: k3_executor(**runtime_k3),
-            launch_reset=lambda: self._reset_execution(execution),
             k1_sm_count=spec.kernel.k1_sms,
             k1_grid_clusters=spec.kernel.k1_sms,
             k2_grid_clusters=k2_launch_clusters,
             k2_drain_grid_clusters=(
-                k2_drain_launch_clusters
-                if k2_drain_launch_clusters > 0
-                else None
+                k2_drain_launch_clusters if k2_drain_launch_clusters > 0 else None
             ),
         )
         graph_captured = time.monotonic()
@@ -650,6 +684,17 @@ class MegaMoESm120Nvfp4Frontend:
             offset = int(kernel._local_offsets[name])
             size = int(kernel._local_region_by_name[name].nbytes)
             execution.local_workspace[offset : offset + size].zero_()
+        if "rank_combine_route_map" in kernel._local_offsets:
+            name = "rank_combine_route_map"
+            offset = int(kernel._local_offsets[name])
+            size = int(kernel._local_region_by_name[name].nbytes)
+            execution.local_workspace[offset : offset + size].view(torch.int32).fill_(
+                -1
+            )
+        if execution.rank_combine_ready is not None:
+            # Shared by all layers using this bucket. A device increment also
+            # advances on every outer-graph replay, unlike a captured fill_(n).
+            execution.rank_combine_ready[-1, 0].add_(1)
         # The graph finalizer owns peer-written expert_recv_count and its
         # published sum. It clears both between two rank barriers; clearing
         # either here can erase an early peer's next-epoch dispatch write.
@@ -658,6 +703,9 @@ class MegaMoESm120Nvfp4Frontend:
 
     def run(self, inputs: MegaMoESm120Nvfp4Inputs) -> torch.Tensor:
         compiled = self._ensure_compiled(inputs)
+        # Caller reset -> launch_ready -> Green K1/K2/K3 -> launch_done. Keep
+        # cache admission outside the Green graph's kernel-node rebinding.
+        self._reset_execution(compiled.execution)
         compiled.graph.launch(torch.cuda.current_stream())
         return inputs.output
 

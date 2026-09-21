@@ -922,6 +922,7 @@ class Sm120SwapABSwigluNvfp4Fc12Kernel:
         self,
         token_comm_args,
         token_comm_storage,
+        combine_ready_flags,
         k1_ready_queue_desc,
         k1_ready_queue_ready,
         k1_ready_queue_state,
@@ -5843,6 +5844,7 @@ class Sm120SwapABSwigluNvfp4Fc12Kernel:
                         self.token_comm_hook_dispatch_warp_body(
                             token_comm_args,
                             token_comm_storage,
+                            combine_ready_flags,
                             k2_ready_queue_desc,
                             k2_ready_queue_ready,
                             k2_ready_queue_state,
@@ -5867,6 +5869,7 @@ class Sm120SwapABSwigluNvfp4Fc12Kernel:
                         self.token_comm_hook_dispatch_warp_body(
                             token_comm_args,
                             token_comm_storage,
+                            combine_ready_flags,
                             k2_ready_queue_desc,
                             k2_ready_queue_ready,
                             k2_ready_queue_state,

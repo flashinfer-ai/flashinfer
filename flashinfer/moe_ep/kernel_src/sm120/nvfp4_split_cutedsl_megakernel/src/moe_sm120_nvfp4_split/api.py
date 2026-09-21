@@ -29,7 +29,12 @@ from .jit_config import Sm120JitConfig
 # publishes K2 work only after every FC1 K bundle in the ready block completes.
 # Version 16 narrows rank-local queue/handoff publication to GPU scope and
 # removes reset/finalizer graph nodes from the ordinary tail-reclaim-off path.
-KERNEL_CACHE_ABI = 16
+# Version 17 adds opt-in dispatch-rank cache storage. Version 18 adds the
+# explicit rank-local combine workspace and K3 publication contract. Version
+# 19 publishes each source epoch through the device-side dispatch sideband.
+# Version 20 adds the rank-local replay-entry ownership barrier before any
+# peer-written sideband state is published.
+KERNEL_CACHE_ABI = 20
 
 
 @dataclass(frozen=True)
@@ -276,6 +281,8 @@ def build_split_kernels(spec: MegaMoECompileSpec) -> SplitKernelBundle:
         dispatch_warps=config.dispatch_warps,
         dispatch_warps_per_tile=config.dispatch_warps_per_tile,
         dispatch_compute_overlap=config.dispatch_compute_overlap,
+        dispatch_rank_cache=config.dispatch_rank_cache,
+        rank_local_combine=config.rank_local_combine,
         k1_ready_queue_workspace=config.k1_ready_queue,
         k2_ready_queue=config.k2_ready_queue,
         k2_ready_queue_bundle=config.ready_queue_bundle,
@@ -376,6 +383,14 @@ def compile_combine_reduce(*args, **kwargs):
     return compile_topk_reduce(*args, **kwargs)
 
 
+def compile_rank_local_combine(*args, **kwargs):
+    """Compile the explicit owner-local BF16 K3 reduction lazily."""
+
+    from .kernel_rank_local_combine import compile_rank_local_combine as compile_k3
+
+    return compile_k3(*args, **kwargs)
+
+
 __all__ = [
     "KERNEL_CACHE_ABI",
     "MegaMoECompileSpec",
@@ -385,5 +400,6 @@ __all__ = [
     "Sm120JitConfig",
     "build_split_kernels",
     "compile_combine_reduce",
+    "compile_rank_local_combine",
     "select_compile_spec",
 ]

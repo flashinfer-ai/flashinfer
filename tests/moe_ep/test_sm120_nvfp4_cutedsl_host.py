@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -178,3 +179,69 @@ def test_production_modules_do_not_import_mega_runner() -> None:
                 if any("mega_runner" in name for name in names):
                     offenders.append(str(source.relative_to(package)))
     assert not offenders
+
+
+@pytest.mark.parametrize("tokens,enabled", ((2048, False), (4096, True), (8192, True)))
+def test_rank_local_combine_heuristic_and_override(tokens, enabled) -> None:
+    bootstrap_paths()
+    from moe_sm120_nvfp4_split.api import MegaMoEProblemSpec, select_compile_spec
+    from moe_sm120_nvfp4_split.heuristic import MegaMoEHeuristicOverrides
+
+    problem = MegaMoEProblemSpec(
+        tokens_per_rank=tokens,
+        num_topk=6,
+        num_total_experts=256,
+        hidden=4096,
+        intermediate=8192,
+        expert_parallel_size=4,
+        expert_parallel_rank=0,
+    )
+    args = dict(
+        problem=problem,
+        ep_same_numa_peer_count=3,
+        ep_cross_numa_peer_count=0,
+        num_sms=110,
+        sm_min_partition=8,
+        sm_partition_alignment=8,
+    )
+    auto = select_compile_spec(**args)
+    direct = select_compile_spec(
+        **args, overrides=MegaMoEHeuristicOverrides(rank_local_combine=False)
+    )
+    assert auto.kernel.dispatch_rank_cache
+    assert auto.kernel.rank_local_combine is enabled
+    assert not direct.kernel.rank_local_combine
+    if enabled:
+        assert auto.kernel.dispatch_warps == 1
+        assert auto.kernel.k2_stages == 3
+        assert auto.cache_key != direct.cache_key
+
+
+def test_caller_reset_advances_shared_epoch_without_clearing_ready_flags() -> None:
+    from flashinfer.moe_ep.kernel_src.sm120.nvfp4_split_cutedsl_megakernel.shim.runtime import (
+        MegaMoESm120Nvfp4Frontend,
+    )
+
+    names = (
+        "dispatch_rank_cache_state",
+        "rank_combine_tile_done",
+        "rank_combine_route_map",
+    )
+    kernel = SimpleNamespace(
+        _local_offsets={name: index * 16 for index, name in enumerate(names)},
+        _local_region_by_name={name: SimpleNamespace(nbytes=16) for name in names},
+    )
+    storage = SimpleNamespace(
+        bundle=SimpleNamespace(k1=kernel),
+        local_workspace=torch.ones(48, dtype=torch.uint8),
+        rank_combine_ready=torch.full((8, 4), 17, dtype=torch.int32),
+        green_trace=None,
+    )
+    first = object.__new__(MegaMoESm120Nvfp4Frontend)
+    second = object.__new__(MegaMoESm120Nvfp4Frontend)
+    first._reset_execution(storage)
+    second._reset_execution(storage)
+    assert torch.count_nonzero(storage.local_workspace[:32]) == 0
+    assert torch.all(storage.local_workspace[32:].view(torch.int32) == -1)
+    assert storage.rank_combine_ready[-1, 0].item() == 19
+    assert torch.all(storage.rank_combine_ready[:-1] == 17)

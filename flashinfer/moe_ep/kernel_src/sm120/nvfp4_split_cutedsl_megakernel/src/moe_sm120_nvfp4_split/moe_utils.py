@@ -47,7 +47,6 @@ from dataclasses import dataclass
 from cutlass.utils.blockscaled_layout import tile_atom_to_shape_SF
 
 TensormapDescBytes = 128
-TensormapDescBytes = 64  # {$nv-internal-release}
 
 
 # =============================================================================
