@@ -188,10 +188,10 @@ def build_activation_pack_rank_major(
     m = flat.shape[0]
 
     idx = recv_topk_idx
-    if idx.dtype != torch.int64:
-        idx = idx.to(torch.int64)
+    if idx.dtype not in (torch.int32, torch.int64):
+        raise TypeError(f"recv_topk_idx must be int32 or int64, got {idx.dtype}.")
     weights = recv_topk_weights
-    if weights.dtype != torch.float32:
+    if weights.dtype not in (torch.float32, torch.bfloat16):
         weights = weights.to(torch.float32)
     if idx.shape != weights.shape or idx.shape[0] != m:
         raise ValueError(

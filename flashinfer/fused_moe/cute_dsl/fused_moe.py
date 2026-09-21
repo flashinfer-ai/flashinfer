@@ -375,6 +375,7 @@ def _moe_core_impl(
         permuted_idx_to_expanded_idx,
         total_num_padded_tokens,
         num_non_exiting_tiles,
+        _,
     ) = moe_sort(
         token_selected_experts=token_selected_experts,
         token_final_scales=token_final_scales,
