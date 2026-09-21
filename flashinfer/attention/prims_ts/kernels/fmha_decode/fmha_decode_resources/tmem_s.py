@@ -2734,7 +2734,6 @@ class TmemSResource(DecodeGenResourceBase):
         route_is_proxy = cutlass.Boolean(False)
         mixed_scales: Constexpr[bool] = use_sparse and cfg.sage_mixed_k_geometry
         exact_dequantized: Constexpr[bool] = cfg.sage_scores_dequantized_for(False)
-        summary_dequantized: Constexpr[bool] = cfg.sage_scores_dequantized_for(True)
         if cutlass.const_expr(use_sparse and cfg.use_block_sparse_proxy_routes):
             # The route kind and the tail location are the same for every
             # lane; stating that keeps the fold and the load/store branch
@@ -2925,15 +2924,13 @@ class TmemSResource(DecodeGenResourceBase):
         )
         if cutlass.const_expr(cfg.use_sage_attention):
             # The chains hold ``gmax * sfK``; ``sfQ`` is one per-lane factor,
-            # so it applies once here. A fully masked tile keeps the sentinel.
-            if cutlass.const_expr(exact_dequantized or summary_dequantized):
-                # Dequantized masked scores fold as ``-FLT_MAX * sfK``, so a
-                # fully masked tile ends far below the threshold.
-                if tile_max < _masked_tile_max_threshold():
-                    tile_max = _neg_max_f32()
-                else:
-                    tile_max = tile_max * sage_q_scale
-            elif tile_max != _neg_max_f32():
+            # so it applies once here. A masked group or score folds as
+            # ``-FLT_MAX * sfK`` (or ``-inf``), far below any score, so a
+            # fully masked tile ends below the threshold and takes back the
+            # exact sentinel here, once per tile.
+            if tile_max < _masked_tile_max_threshold():
+                tile_max = _neg_max_f32()
+            else:
                 tile_max = tile_max * sage_q_scale
         if cutlass.const_expr(use_sparse and cfg.use_block_sparse_proxy_routes):
             # The mass enters before the anchor, so the P range is unchanged; a
@@ -3249,10 +3246,9 @@ class TmemSResource(DecodeGenResourceBase):
         K blocks of 32 tokens and larger, leaves alone): a packed add removes
         the INT32 score bias (exact on the biased scores' unit spacing, and
         the sentinel is unchanged) and a packed multiply applies the
-        fragment's scales. A fully masked group must keep the exact
-        ``-FLT_MAX`` sentinel, as scaling would move it off the value the
-        anchor and tail logic compare against, so its scaled value is
-        replaced by the sentinel. Group ``g`` folds into chain
+        fragment's scales. A fully masked group folds as its scaled sentinel,
+        far below any score; the caller restores the exact sentinel on a
+        fully masked tile's maximum. Group ``g`` folds into chain
         ``(chain_base + g) % 4``: the unrolled unmasked pass spreads the
         fragments over the four chains, the rolled masked pass passes
         ``chain_base=0``; the final reduction over all chains is unaffected.
@@ -3293,9 +3289,6 @@ class TmemSResource(DecodeGenResourceBase):
                 )
             for elem in cutlass.range_constexpr(width):
                 scaled_max = Float32(scaled[elem])
-                if cutlass.const_expr(may_be_masked):
-                    if Float32(maxima[elem]) == _neg_max_f32():
-                        scaled_max = _neg_max_f32()
                 fold_chain: Constexpr[int] = (chain_base + group_base + elem) % 4
                 max_chains[fold_chain] = cute.math.max(
                     max_chains[fold_chain], scaled_max, ftz=True
