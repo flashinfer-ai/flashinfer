@@ -10,9 +10,20 @@ source "${SCRIPT_DIR}/jit_cache_build_common.sh"
 
 finish_sccache_stats() {
   local exit_code=$?
+  collect_ninja_diagnostics || true
   cleanup_jit_cache_python_build || true
   collect_sccache_stats || true
   return "${exit_code}"
+}
+
+collect_ninja_diagnostics() {
+  if [ "${BUILD_TARGET:-}" != "provider" ] || [ -z "${SCCACHE_STATS_DIR:-}" ]; then
+    return 0
+  fi
+
+  python3 "${SCRIPT_DIR}/collect_ninja_diagnostics.py" \
+    --build-root "${SCRIPT_DIR}/../build/aot-providers" \
+    --output-dir "${SCCACHE_STATS_DIR}/ninja"
 }
 
 trap finish_sccache_stats EXIT
@@ -114,7 +125,9 @@ if [ "${BUILD_TARGET}" = "provider" ]; then
   JIT_CACHE_NO_OUTPUT_TIMEOUT_SECONDS=${JIT_CACHE_NO_OUTPUT_TIMEOUT_SECONDS:-5400}
   JIT_CACHE_WATCHDOG_TERM_GRACE_SECONDS=${JIT_CACHE_WATCHDOG_TERM_GRACE_SECONDS:-120}
   WATCHDOG_DIAGNOSTICS_FILE=${SCCACHE_STATS_DIR:-/tmp}/jit-cache-watchdog.txt
+  export NINJA_STATUS="${NINJA_STATUS:-[%e sec | %f/%t finished | %r running | %u queued] }"
   echo "Provider build no-output timeout: ${JIT_CACHE_NO_OUTPUT_TIMEOUT_SECONDS}s"
+  echo "Ninja status format: ${NINJA_STATUS}"
   python "${SCRIPT_DIR}/run_with_output_watchdog.py" \
     --timeout-seconds "${JIT_CACHE_NO_OUTPUT_TIMEOUT_SECONDS}" \
     --term-grace-seconds "${JIT_CACHE_WATCHDOG_TERM_GRACE_SECONDS}" \

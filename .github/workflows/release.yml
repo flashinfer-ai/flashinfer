@@ -21,6 +21,7 @@ on:
       - 'scripts/build_flashinfer_jit_cache_artifact.sh'
       - 'scripts/build_flashinfer_jit_cache_whl.sh'
       - 'scripts/build_patched_sccache.sh'
+      - 'scripts/collect_ninja_diagnostics.py'
       - 'scripts/jit_cache_build_common.sh'
       - 'scripts/run_with_output_watchdog.py'
       - 'scripts/update_whl_index.py'
