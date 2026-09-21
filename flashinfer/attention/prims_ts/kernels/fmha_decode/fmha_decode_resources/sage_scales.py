@@ -198,19 +198,6 @@ def sage_word_position(
 
 
 @cute.jit
-def route_scale_word_position(
-    cfg: Constexpr[FmhaDecodeConfig],
-    word_idx: Int32,
-    groups: Constexpr[int],
-) -> tuple[Int32, Int32]:
-    """Return ``sage_word_position`` of word ``word_idx`` of the staged layout."""
-    arr_size = sage_scale_arr_size(cfg, groups)
-    return sage_word_position(
-        cfg, word_idx // Int32(arr_size), word_idx % Int32(arr_size), groups
-    )
-
-
-@cute.jit
 def _load_f32_chunks(ptr, count: Constexpr[int]) -> cutlass.Array:
     """Return ``count`` FP32 values from an aligned SMEM pointer in 16-byte loads."""
     assert count % 4 == 0
