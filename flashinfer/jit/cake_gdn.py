@@ -34,7 +34,7 @@ from .cpp_ext import get_cuda_path, get_nvcc_parallelism_flags
 CakeGDNArch = Literal["sm_100a", "sm_103a"]
 
 _EXPORT_SCHEMA = "flashinfer-cake-gdn-decode-standalone-export-v1"
-_MANIFEST_SHA256 = "836fa2ab739f31c9c037f2277b079a4593947363408caa350972be88d1d2517a"
+_MANIFEST_SHA256 = "6862a7f1f223d550a0d9329d545ea137c1eca1dfe9aa525531e975570bad8af0"
 _ARCH_ACTIVE_CLUSTERS: dict[CakeGDNArch, int] = {
     "sm_100a": 148,
     "sm_103a": 160,
@@ -135,12 +135,12 @@ def _manifest() -> dict[str, Any]:
         _EXPORT_SCHEMA,
         True,
         False,
-        1779,
-        3558,
-        3504,
+        1789,
+        3578,
+        3524,
         54,
-        104,
-        104,
+        108,
+        108,
         "one listed GDN non-CP variant or fail closed; no external fallback",
     )
     if observed != expected:
@@ -594,6 +594,16 @@ def select_cake_gdn_decode_variant(
             (8, 4, 4, 8, True, True, True, 4),
             (8, 2, 16, 64, True, False, False, 0),
             (8, 4, 16, 64, True, False, True, 5),
+            (1, 7, 8, 16, True, True, True, 7),
+            (2, 7, 8, 16, True, True, True, 7),
+            (3, 7, 8, 16, True, True, True, 7),
+            (4, 7, 8, 16, True, True, True, 7),
+            (5, 7, 8, 16, True, True, True, 7),
+            (6, 7, 8, 16, True, True, True, 7),
+            (7, 7, 8, 16, True, True, True, 7),
+            (8, 7, 8, 16, True, True, True, 7),
+            (1, 8, 8, 16, True, True, True, 8),
+            (1, 7, 16, 32, True, True, True, 7),
         }
         key = (
             batch_size,
@@ -612,6 +622,27 @@ def select_cake_gdn_decode_variant(
         ):
             raise CakeGDNUnsupportedError(
                 "BF16 decode is limited to the exact promoted indexed/verify rows"
+            )
+        if num_q_heads == 8 and num_v_heads == 16 and batch_size <= 4:
+            # Qwen3.5-35B-A3B TP=2 per-rank verify (speculative_num_draft_tokens=7
+            # verifies T=7; T=8 is the adjacent window): B<=4 runs the full-warp
+            # tile-v16 kernel with T_STEPS specialized, B>=5 falls through to wide32.
+            record = _variant_for(
+                domain="decode",
+                schedule_attr="gdn_decode_pretranspose_t4_bf16state_tile16",
+                specializations={
+                    "H": num_q_heads,
+                    "HV": num_v_heads,
+                    "INTERMEDIATE_BATCH_STRIDE": cache_steps * num_v_heads * 128 * 128,
+                    "INTERMEDIATE_TOKEN_STRIDE": num_v_heads * 128 * 128,
+                    "SCALE": scale,
+                    "STRIDED_INPUTS": 1,
+                    "T_STEPS": seq_len,
+                },
+            )
+            return CakeGDNRoute(
+                f"flashinfer.gdn_decode.indexed_bf16_verify_t{seq_len}.tile16_fullwarp",
+                record["name"],
             )
         if num_q_heads == 4 and num_v_heads == 8:
             if seq_len == 1:
