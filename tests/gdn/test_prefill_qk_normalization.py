@@ -203,6 +203,7 @@ def test_prefill_normalization_flag(dtype, use_cp, heads, use_qk_l2norm):
         initial_state=torch.randn(2, h, 128, 128, device=device) * 0.01,
         output_final_state=True,
         cu_seqlens=torch.tensor([0, 37, 104], device=device, dtype=torch.int64),
+        max_seqlen=67,
         use_cp=use_cp,
         backend="flashinfer",
     )
