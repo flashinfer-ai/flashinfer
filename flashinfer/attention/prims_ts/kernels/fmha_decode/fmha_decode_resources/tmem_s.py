@@ -977,8 +977,10 @@ class TmemSResource(DecodeGenResourceBase):
                     + Int32(page_vector_idx * 4),
                 )
             )
-            # Select one bit from each byte, then compact the four bits with
-            # a carry-free multiply. Padded Q rows cannot wrap into the byte.
+            # Select query q's bit from each byte (positions 0/8/16/24), then
+            # pack them into bits 0..3 with a carry-free uint32 multiply, not
+            # a first-set-bit search. Zero q >= 8 so the bounded shift cannot
+            # alias another query's bit.
             byte_bits = (memberships >> (q_token_idx & Int32(7))) & Uint32(0x01010101)
             packed_bits = (byte_bits * Uint32(0x01020408)) >> Uint32(24)
             packed_bits = cutlass.select_(

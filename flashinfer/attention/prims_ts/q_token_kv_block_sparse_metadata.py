@@ -1041,7 +1041,7 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
         split_kv,
         share_pattern_across_kv_heads,
     )
-    # Qualified FP8 G8/page-4 profiles consume one bit-plane per query.
+    # Eligible FP8 G2..G8/page-4 profiles consume one bit-plane per query.
     # Other profiles and the standalone metadata API retain page-byte masks.
     query_major_memberships = (
         sparse_block_size == 4
@@ -1544,7 +1544,15 @@ def _prepare_prims_ts_q_token_kv_block_sparse_metadata_plan(
     query_major_memberships: bool = False,
     locator_head_multiplier: int = 1,
 ) -> _PrimsTSQTokenKvBlockSparseMetadataPlan:
-    """Freeze validated metadata tensors and launch constants."""
+    """Freeze validated metadata tensors and launch constants.
+
+    Query-major memberships use a private logical [row, KV tile, query slot]
+    layout: each uint32 masks 32 four-token union fragments for one query.
+    The rank-two tensor flattens eight slots per tile, with unused slots and
+    tail bits zero. This encoding must match the attention plan. Standalone
+    metadata retains per-fragment membership bytes; Q/K/V layouts, the union,
+    and page indices are unchanged.
+    """
 
     sparse_block_size = _validate_sparse_block_size(sparse_block_size)
     rows = block_indices.shape[0]

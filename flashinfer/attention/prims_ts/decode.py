@@ -3327,7 +3327,9 @@ def _prepare_prims_ts_batch_decode_plan(
     spec = _resolve_decode_launch_spec(*policy_args)
     if query_major_memberships:
         if not spec.config.supports_query_major_memberships:
-            raise ValueError("query-major memberships require one G8 Keeps/page-4 CTA")
+            raise ValueError(
+                "query-major memberships require one G2..G8 Keeps/page-4 CTA"
+            )
         spec = replace(spec, config=replace(spec.config, query_major_memberships=True))
     if spec.config.uses_q_token_kv_block_sparse_page_membership:
         if q_token_kv_block_sparse_page_memberships is None:

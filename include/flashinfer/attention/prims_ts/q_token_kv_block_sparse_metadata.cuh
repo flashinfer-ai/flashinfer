@@ -326,9 +326,9 @@ __launch_bounds__(kQTokenKvBlockSparseQ1BlockThreads) void QTokenKvBlockSparseQ1
 }
 
 // Call after publishing the live membership bytes with a CTA barrier.
-// Both union algorithms emit the same eight-query/32-page tile, including
-// zero tail bits and a complete zero tile for an inert route.
-template <typename PositionType, int BlockThreads>
+// Both union algorithms emit the same eight-slot/32-fragment tile, including
+// zero unused query slots/tail bits and a complete zero tile for an inert route.
+template <typename PositionType, int BlockThreads, int GroupSize>
 __device__ __forceinline__ void StoreQueryMajorMemberships(
     const QTokenKvBlockSparseTouchedMetadataParams<PositionType>& params,
     const uint8_t* group_memberships, int union_pages) {
@@ -343,7 +343,7 @@ __device__ __forceinline__ void StoreQueryMajorMemberships(
     const uint32_t member = page < union_pages ? group_memberships[page] : 0;
     uint32_t own_word = 0;
 #pragma unroll
-    for (int query = 0; query < 8; ++query) {
+    for (int query = 0; query < GroupSize; ++query) {
       const uint32_t word = __ballot_sync(0xffffffffu, (member & (1u << query)) != 0);
       if (lane == query) own_word = word;
     }
@@ -532,7 +532,7 @@ __global__ __launch_bounds__(
       reinterpret_cast<uint8_t*>(params.q_token_kv_block_sparse_page_memberships +
                                  static_cast<int64_t>(blockIdx.x) * params.membership_words);
   if constexpr (QueryMajor) {
-    static_assert(GroupSize == 8);
+    static_assert(GroupSize >= 2 && GroupSize <= 8);
     static_assert(sizeof(shared.sorted_logical_blocks) >= kMaximumCandidates);
     // The private entry point requires one page-4 fragment per semantic block.
     // No extra shared allocation or intermediate GMEM membership write is needed.
@@ -577,8 +577,8 @@ __global__ __launch_bounds__(
   __syncthreads();
 
   if constexpr (QueryMajor) {
-    StoreQueryMajorMemberships<PositionType, kBlockThreads>(params, group_memberships,
-                                                            shared.union_pages);
+    StoreQueryMajorMemberships<PositionType, kBlockThreads, GroupSize>(params, group_memberships,
+                                                                       shared.union_pages);
   }
 }
 
@@ -951,7 +951,7 @@ __launch_bounds__(kQTokenKvBlockSparseBitmapBlockThreads) void QTokenKvBlockSpar
   // that storage for private query bytes instead of writing an intermediate
   // GMEM representation. The byte-map allocation covers every live union.
   if constexpr (QueryMajor) {
-    static_assert(GroupSize == 8);
+    static_assert(GroupSize >= 2 && GroupSize <= 8);
     group_memberships = reinterpret_cast<uint8_t*>(block_map);
   }
   // Resolve independent page-table loads before publishing each output batch.
@@ -1012,8 +1012,8 @@ __launch_bounds__(kQTokenKvBlockSparseBitmapBlockThreads) void QTokenKvBlockSpar
   }
   __syncthreads();
   if constexpr (QueryMajor) {
-    StoreQueryMajorMemberships<PositionType, kBlockThreads>(params, group_memberships,
-                                                            shared.union_pages);
+    StoreQueryMajorMemberships<PositionType, kBlockThreads, GroupSize>(params, group_memberships,
+                                                                       shared.union_pages);
   }
 }
 
@@ -1118,37 +1118,36 @@ cudaError_t LaunchQTokenKvBlockSparseTouchedMetadata(
     return cudaSuccess;
   }
   if constexpr (QueryMajor) {
-    if (group_size != 8 || params.sparse_block_size != 4 || params.fragment_size != 4) {
+    if (group_size < 2 || group_size > 8 || params.sparse_block_size != 4 ||
+        params.fragment_size != 4) {
       return cudaErrorInvalidValue;
     }
-    return detail::LaunchQTokenKvBlockSparseTouchedMetadataTyped<PositionType, 8, PackedQuery,
-                                                                 true>(params, stream);
   }
   switch (group_size) {
     case 1:
       return detail::LaunchQTokenKvBlockSparseQ1MetadataTyped<PositionType, PackedQuery>(params,
                                                                                          stream);
     case 2:
-      return detail::LaunchQTokenKvBlockSparseTouchedMetadataTyped<PositionType, 2, PackedQuery>(
-          params, stream);
+      return detail::LaunchQTokenKvBlockSparseTouchedMetadataTyped<PositionType, 2, PackedQuery,
+                                                                   QueryMajor>(params, stream);
     case 3:
-      return detail::LaunchQTokenKvBlockSparseTouchedMetadataTyped<PositionType, 3, PackedQuery>(
-          params, stream);
+      return detail::LaunchQTokenKvBlockSparseTouchedMetadataTyped<PositionType, 3, PackedQuery,
+                                                                   QueryMajor>(params, stream);
     case 4:
-      return detail::LaunchQTokenKvBlockSparseTouchedMetadataTyped<PositionType, 4, PackedQuery>(
-          params, stream);
+      return detail::LaunchQTokenKvBlockSparseTouchedMetadataTyped<PositionType, 4, PackedQuery,
+                                                                   QueryMajor>(params, stream);
     case 5:
-      return detail::LaunchQTokenKvBlockSparseTouchedMetadataTyped<PositionType, 5, PackedQuery>(
-          params, stream);
+      return detail::LaunchQTokenKvBlockSparseTouchedMetadataTyped<PositionType, 5, PackedQuery,
+                                                                   QueryMajor>(params, stream);
     case 6:
-      return detail::LaunchQTokenKvBlockSparseTouchedMetadataTyped<PositionType, 6, PackedQuery>(
-          params, stream);
+      return detail::LaunchQTokenKvBlockSparseTouchedMetadataTyped<PositionType, 6, PackedQuery,
+                                                                   QueryMajor>(params, stream);
     case 7:
-      return detail::LaunchQTokenKvBlockSparseTouchedMetadataTyped<PositionType, 7, PackedQuery>(
-          params, stream);
+      return detail::LaunchQTokenKvBlockSparseTouchedMetadataTyped<PositionType, 7, PackedQuery,
+                                                                   QueryMajor>(params, stream);
     case 8:
-      return detail::LaunchQTokenKvBlockSparseTouchedMetadataTyped<PositionType, 8, PackedQuery>(
-          params, stream);
+      return detail::LaunchQTokenKvBlockSparseTouchedMetadataTyped<PositionType, 8, PackedQuery,
+                                                                   QueryMajor>(params, stream);
     default:
       return cudaErrorInvalidValue;
   }

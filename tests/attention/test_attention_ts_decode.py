@@ -7265,6 +7265,12 @@ def test_attention_ts_decode_page_cache_sliding_product(
         # FP8 page fragments with padded Q rows and non-power-of-two storage.
         (8, 256, 12, 4, 20, True, False, 256, torch.float8_e4m3fn),
         # Query-oriented memberships across one/two-instance and Q64/Q128 profiles.
+        pytest.param(2, 64, 32, 4, 20, False, True, 2, _FP8, id="fp8-query-g2"),
+        pytest.param(3, 128, 12, 4, 20, True, False, 2, _FP8, id="fp8-query-g3"),
+        pytest.param(4, 256, 12, 4, 20, False, True, 256, _FP8, id="fp8-query-g4"),
+        pytest.param(5, 256, 12, 4, 20, True, False, 2, _FP8, id="fp8-query-g5"),
+        pytest.param(6, 128, 12, 4, 20, False, False, 2, _FP8, id="fp8-query-g6"),
+        pytest.param(7, 256, 12, 4, 20, True, True, 256, _FP8, id="fp8-query-g7"),
         pytest.param(
             8,
             64,
@@ -7417,28 +7423,28 @@ def test_q_token_sparse_geometry_graph(
         selected = (tokens // block == ids[..., None]).any(-2)
         tail = tokens // block == (positions[..., None, None] + 1) // block
         visible = (selected | tail) & (tokens <= positions[..., None, None])
-        scores = (
-            torch.einsum(
-                "bghrd,bkhd->bghrk",
-                q.view(batch, group, hkv, ratio, dim).float(),
-                keys,
-            )
-            * dim**-0.5
+        scores = torch.einsum(
+            "bghrd,bkhd->bghrk",
+            q.view(batch, group, hkv, ratio, dim).float(),
+            keys,
         )
         scores.masked_fill_(~visible[..., None, :], -torch.inf)
         if dtype == _FP8:
-            # This union fits one KV tile. Match the FP8 P operand and FP32
-            # denominator, as in _fp8_decode_reference, without relaxing error
-            # tolerances for the page/membership geometry being tested.
+            # This union fits one KV tile. Match FP8 P and its FP32 denominator.
+            # The kernel incorporates P's scale into the log2 exponent before
+            # the FMA. exp(score-max)*448 can round to a different FP8 bin.
             assert group * (topk + 1) * block <= _FP8_KV_TILE_SIZE
-            probabilities = (
-                scores - scores.amax(-1, keepdim=True)
-            ).exp() * _FP8_PROBABILITY_SCALE
+            scale = torch.tensor(
+                dim**-0.5 * math.log2(math.e), device="cuda", dtype=torch.float32
+            )
+            bias = -scores.amax(-1, keepdim=True) * scale
+            bias = bias + math.log2(_FP8_PROBABILITY_SCALE)
+            probabilities = torch.addcmul(bias, scores, scale).exp2()
             weights = probabilities.to(_FP8).float() / probabilities.sum(
                 -1, keepdim=True
             )
         else:
-            weights = scores.softmax(-1)
+            weights = (scores * dim**-0.5).softmax(-1)
         expected = torch.einsum("bghrk,bkhd->bghrd", weights, values)
         torch.testing.assert_close(
             out.reshape(rows, hkv * ratio, dim).float(),

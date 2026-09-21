@@ -644,6 +644,8 @@ def _reference(
         first_row = route_offsets[group]
         group_end = route_offsets[group + 1]
         group_query_len = group_end - first_row
+        if group_query_len == 0:
+            continue
         request = int(requests[first_row].item())
         first_position = int(positions[first_row].item())
         valid = 0 <= request < table.shape[0]
@@ -1009,6 +1011,7 @@ def test_q_token_kv_block_sparse_sort_union_matches_reference(
         # Bit maps, dynamic-SMEM opt-in, and the bounded-sort fallback.
         (4, False, 1024 * 1024 + 1),
         (2, True, 4 * 1024 * 1024),
+        (5, False, 4 * 1024 * 1024),
         (8, False, 8 * 1024 * 1024),
     ),
 )
@@ -1058,36 +1061,108 @@ def test_q_token_kv_block_sparse_sort_union_wide_context_matches_reference(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_q_token_kv_block_sparse_wide_model_many_routes() -> None:
-    """Changing map/sort occupancy must preserve the same logical union."""
-    group_size, model_bound, copies = 5, 4 * 1024 * 1024, 128
-    blocks, table, requests, positions, page_size, offsets = _make_wide_sort_union_case(
-        group_size, False, model_bound
+@pytest.mark.parametrize("group_size", range(2, 9))
+@pytest.mark.parametrize("packed", (False, True))
+def test_query_major_memberships_graph(group_size: int, packed: bool) -> None:
+    """Check eight-slot masks, ragged/inert routes and mask-tile boundaries."""
+    from flashinfer.attention.prims_ts.q_token_kv_block_sparse_metadata import (
+        _prepare_prims_ts_q_token_kv_block_sparse_metadata_plan,
     )
-    expected = _reference(
-        blocks, table, requests, positions, page_size, group_size, offsets
+
+    # The two context bounds exercise shared-map and bounded-sort producers.
+    context = 8 * 1024 * 1024 if packed else 8192
+    page_size, topk = 1600, 32
+    lengths = [group_size, 1, 0, group_size - 1] if packed else [group_size] * 4
+    offsets = list(accumulate(lengths, initial=0))
+    rows = offsets[-1]
+    qo_indptr = (
+        torch.tensor(offsets, dtype=torch.int32, device="cuda") if packed else None
     )
-    actual = build_prims_ts_q_token_kv_block_sparse_metadata(
-        blocks.repeat(copies, 1),
+    requests = torch.zeros(rows, dtype=torch.int32, device="cuda")
+    requests[offsets[-2] :] = -1  # Inert, addressable sentinel route.
+    positions = torch.tensor(
+        [context - group_size - 1 + q for length in lengths for q in range(length)],
+        dtype=torch.int64 if packed else torch.int32,
+        device="cuda",
+    )
+    table = (
+        torch.arange(
+            (context + page_size - 1) // page_size, dtype=torch.int32, device="cuda"
+        )
+        .flip(0)[None]
+        .contiguous()
+    )
+    blocks = torch.zeros((rows, topk), dtype=torch.int32, device="cuda")
+    capacity = (group_size * (topk + 1) + 31) // 32 * 32
+    indices = torch.empty((4, capacity), dtype=torch.int32, device="cuda")
+    members = torch.empty((4, capacity // 4), dtype=torch.int32, device="cuda")
+    seq_lens = torch.empty(4, dtype=torch.int32, device="cuda")
+    plan = _prepare_prims_ts_q_token_kv_block_sparse_metadata_plan(
+        blocks,
         table,
-        requests.repeat(copies),
-        positions.repeat(copies),
+        requests,
+        positions,
+        indices,
+        members,
+        seq_lens,
         group_size=group_size,
         storage_page_size=page_size,
-        max_seq_len_kv=model_bound,
+        max_seq_len_kv=context,
+        qo_indptr=qo_indptr,
+        query_major_memberships=True,
     )
-    _assert_metadata_matches(
-        actual,
-        tuple(
-            tensor.repeat((copies,) + (1,) * (tensor.ndim - 1)) for tensor in expected
-        ),
-    )
+    plan.run(blocks, table, requests, positions)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        plan.run(blocks, table, requests, positions)
+
+    tail_blocks = {
+        (position + 1) // 4
+        for position in positions[:group_size].cpu().tolist()
+        if (position + 1) % 4
+    }
+    for union_pages in (31, 32, 33):
+        # Duplicated selections leave an exact 31/32/33-fragment first union.
+        selected = union_pages - len(tail_blocks)
+        blocks.copy_(torch.arange(topk, device="cuda") % selected)
+        members.fill_(-1)  # Replay must zero unused slots and final tile bits.
+        graph.replay()
+        expected = _reference(
+            blocks, table, requests, positions, page_size, group_size, qo_indptr
+        )
+        assert (int(seq_lens[0]) + 3) // 4 == union_pages
+        planes = members.reshape(4, -1, 8).to(torch.int64)
+        bits = torch.arange(32, device="cuda")
+        queries = torch.arange(8, device="cuda")
+        page_bytes = (
+            (((planes[..., None] >> bits) & 1) << queries[None, None, :, None])
+            .sum(2)
+            .to(torch.uint8)
+            .reshape(4, -1)
+        )
+        for row, length in enumerate(seq_lens.cpu().tolist()):
+            live_pages = (length + 3) // 4
+            tiles = (live_pages + 31) // 32
+            assert torch.all(planes[row, :tiles, lengths[row] :] == 0)
+            assert torch.all(page_bytes[row, live_pages : tiles * 32] == 0)
+        columns = expected[0].shape[1]
+        words = expected[1].shape[1]
+        _assert_metadata_matches(
+            (
+                indices[:, :columns],
+                page_bytes[:, : words * 4].contiguous().view(torch.int32),
+                seq_lens,
+            ),
+            expected,
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_q_token_kv_block_sparse_ignores_nonlive_indexer_entries() -> None:
-    """Grouped metadata must not prefetch an unwritten indexer suffix."""
+    """Run under initcheck to detect grouped prefetch of an unwritten suffix."""
     group_size, topk, page_size = 5, 512, 16
+    # Live prefixes are [0, 0, 0, 1, 1]. Leave the suffix unwritten so initcheck
+    # catches speculative reads even if later masking preserves the result.
     blocks = torch.empty((group_size, topk), dtype=torch.int32, device="cuda")
     blocks[3:, 0] = 0
     table = torch.zeros((1, 1), dtype=torch.int32, device="cuda")

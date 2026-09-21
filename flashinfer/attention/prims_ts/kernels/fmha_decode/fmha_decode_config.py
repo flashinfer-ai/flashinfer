@@ -764,11 +764,11 @@ class FmhaDecodeConfig:
 
     @property
     def supports_query_major_memberships(self) -> bool:
-        """Whether this CTA can read one eight-query/page-4 membership tile."""
+        """Whether this CTA can read eight-slot/page-4 query masks for G2..G8."""
         return (
             self.uses_q_token_kv_block_sparse_page_membership
             and self.use_keeps_mma_ab
-            and self.max_seq_len_q == 8
+            and 2 <= self.max_seq_len_q <= 8
             and self.has_single_q_cta
             and self.num_tokens_per_page == 4
             and self.tile_size_kv == 128
@@ -807,6 +807,12 @@ class FmhaDecodeConfig:
 
     @property
     def softmax_task_num_registers(self) -> int | None:
+        """Softmax's preferred grant, capped by the CTA's initial register pool.
+
+        Dense and sparse Keeps kernels share this rule. Full 128-score rows
+        can use 232 registers only when the pool permits; active producer and
+        correction grants are unchanged. KV256 keeps its separate budget.
+        """
         if not self.uses_task_register_reallocation:
             return None
         # Complete Q128 rows keep 128 scores live through masking and P

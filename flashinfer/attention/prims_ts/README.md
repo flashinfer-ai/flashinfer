@@ -116,8 +116,9 @@ no caller-owned workspace. Shared patterns prepare one row per
 group; independent patterns prepare one per group and KV head. G1 resolves
 selected blocks and the causal tail inside attention, without a metadata launch.
 
-Prepared FP8 G8/page-4 routes store query-oriented membership words internally,
-with complete tail tiles reserved in the workspace. Standalone metadata outputs
+Eligible prepared FP8 G2–G8/page-4 Keeps routes store query-oriented membership
+words internally, with eight query slots and complete tail tiles reserved in
+the workspace. Unused slots and tail bits are zero. Standalone metadata outputs
 retain four membership bytes per Int32 word; the public plan/run API is unchanged.
 
 Nonsplit sparse grids larger than one service wave use the common CLC

@@ -3045,8 +3045,14 @@ def fmha_decode_launch(
         if cutlass.const_expr(use_native_paged_kv):
             storage_tokens_per_page = Int32(cfg.effective_storage_tokens_per_page)
             if cutlass.const_expr(cfg.use_flat_native_kv_tma):
-                # Planning checked compact K/V and signed-32-bit
-                # row coordinates. Only the descriptor changes, not the cache.
+                # Reinterpret compact HND rows, without copying/repacking KV
+                # or requiring contiguous sparse selections. Planning checked
+                # signed-32-bit row bounds; other bindings use the general map.
+                # For S tokens/page, F tokens/fragment and H heads, metadata
+                # emits A = page*H*(S/F) + subpage. Attention addresses row
+                # (A + head*(S/F))*F, avoiding per-copy page/subpage divmod.
+                # Bytes and TMA count are unchanged; rank-2 issuing below is a
+                # separate optimization of this descriptor-only flat view.
                 flat_tokens = (
                     num_physical_kv_pages
                     * Int64(storage_tokens_per_page)

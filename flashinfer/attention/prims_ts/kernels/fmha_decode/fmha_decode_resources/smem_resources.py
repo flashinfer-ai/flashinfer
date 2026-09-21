@@ -1838,7 +1838,7 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
         """Read a private, tail-padded query bit-plane without transposing it."""
         cfg = self.cfg
         assert cfg.query_major_memberships and cfg.num_tokens_per_page == 4
-        assert cfg.tile_size_kv == 128 and cfg.max_seq_len_q == 8
+        assert cfg.tile_size_kv == 128 and 2 <= cfg.max_seq_len_q <= 8
         query = q_token_idx & Int32(7)
         word = Uint32(0)
         if cutlass.const_expr(self.cache_memberships_in_smem):

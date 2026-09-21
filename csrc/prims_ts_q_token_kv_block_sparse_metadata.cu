@@ -176,8 +176,13 @@ QTokenKvBlockSparseMetadataGeometry ValidateInputs(
   int64_t minimum_pages = min_block_capacity * (sparse_block_size / fragment_size);
   int64_t maximum_pages = max_block_capacity * (sparse_block_size / fragment_size);
   if constexpr (QueryMajor) {
-    TVM_FFI_ICHECK(group_size == 8 && sparse_block_size == 4 && fragment_size == 4)
-        << "query-major metadata requires G8 and page-4 sparse blocks";
+    // Private eight-slot format: each uint32 masks the 32 four-token fragments
+    // in a KV128 tile for one query. Unused query slots are zero. This is a
+    // writer/reader specialization, not an ISA or physical storage-page limit.
+    // Whole-tile capacity keeps the final mask-word loads addressable.
+    TVM_FFI_ICHECK(group_size >= 2 && group_size <= 8 && sparse_block_size == 4 &&
+                   fragment_size == 4)
+        << "query-major metadata requires G2..G8 and page-4 sparse blocks";
     minimum_pages = (minimum_pages + 31) / 32 * 32;
     maximum_pages = (maximum_pages + 31) / 32 * 32;
     TVM_FFI_ICHECK_EQ(page_capacity % 32, 0) << "query-major capacity must cover complete tiles";
