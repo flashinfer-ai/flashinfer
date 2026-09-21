@@ -50,6 +50,8 @@ def make_case(m, n, k, seed=42):
         (17, 129, 80),
         (31, 513, 192),
         (33, 127, 4112),
+        (65, 129, 192),
+        (129, 257, 384),
     ],
 )
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
@@ -118,7 +120,9 @@ def test_all_finite_e4m3_scales_preserve_fp4_values():
 
 
 @pytest.mark.parametrize("enable_pdl", [True, False])
-@pytest.mark.parametrize("m,n,k", [(3, 513, 512), (1, 129, 2048), (33, 129, 80)])
+@pytest.mark.parametrize(
+    "m,n,k", [(3, 513, 512), (1, 129, 2048), (33, 129, 80), (65, 129, 192)]
+)
 def test_graph_replay_reads_live_alpha_and_inputs_on_current_stream(
     enable_pdl, m, n, k
 ):
@@ -169,6 +173,8 @@ def test_graph_replay_reads_live_alpha_and_inputs_on_current_stream(
         (2, 256, 1024, 0.375, torch.float16),
         (17, 129, 80, None, torch.bfloat16),
         (33, 513, 192, -0.5, torch.float16),
+        (65, 129, 192, None, torch.bfloat16),
+        (129, 257, 384, -0.5, torch.float16),
     ],
 )
 def test_autotuned_tactic_matches_reference(m, n, k, alpha_value, out_dtype):
@@ -207,11 +213,12 @@ def test_output_alias_is_rejected():
 
 
 @pytest.mark.parametrize("unaligned", ["activation", "weight", "scale"])
-def test_unaligned_canonical_buffers_use_valid_tactics(unaligned):
+@pytest.mark.parametrize("m", [3, 65])
+def test_unaligned_canonical_buffers_use_valid_tactics(unaligned, m):
     """A valid narrow-aligned buffer must not reach a 16-byte asynchronous load."""
     from flashinfer.gemm.kernels.native_bf16_fp4.runner import get_runner
 
-    a, b, sf, weight = make_case(3, 129, 128)
+    a, b, sf, weight = make_case(m, 129, 128)
     tensors = {"activation": a, "weight": b, "scale": sf}
     original = tensors[unaligned]
     offset = 4 if unaligned == "weight" else 1
@@ -222,11 +229,12 @@ def test_unaligned_canonical_buffers_use_valid_tactics(unaligned):
     shifted.copy_(original)
     tensors[unaligned] = shifted
     a, b, sf = (tensors[key] for key in ("activation", "weight", "scale"))
-    out = torch.empty((3, 129), device="cuda", dtype=torch.bfloat16)
+    out = torch.empty((m, 129), device="cuda", dtype=torch.bfloat16)
     runner = get_runner()
     inputs = [a, b, sf, None, out, True]
     assert all(
-        tactic[0] != "staged" for tactic in runner.get_valid_tactics(inputs, None)
+        tactic[0] not in ("staged", "tiled")
+        for tactic in runner.get_valid_tactics(inputs, None)
     )
     result = mm_bf16_fp4(a, b, sf, backend=BACKEND, out=out)
     torch.testing.assert_close(
@@ -245,3 +253,29 @@ def test_staging_preserves_bf16_activation_range(exponent):
     expected = (a.float() @ weight.T).to(torch.bfloat16)
     assert torch.isfinite(result).all()
     torch.testing.assert_close(result, expected, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("splits", [1, 2])
+def test_tiled_traversal_preserves_outputs_with_m_and_n_tails(splits):
+    """Changing independent block traversal must preserve every output bit."""
+    from flashinfer.gemm.kernels.native_bf16_fp4.runner import _compile
+
+    m, n, k = 193, 257, 384
+    a, b, sf, weight = make_case(m, n, k)
+    alpha = torch.tensor([-0.375], device="cuda")
+    out = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
+    partial = (
+        torch.empty((splits, m, n), device="cuda", dtype=torch.float32)
+        if splits > 1
+        else None
+    )
+    outputs = []
+    for raster_m in (False, True):
+        tactic = ("tiled", 128, 8, splits, 2, 64, raster_m)
+        compiled = _compile(m, n, k, out.dtype, True, True, tactic)
+        compiled(a.view(torch.int32), b.view(torch.int32), sf, alpha, out, partial)
+        outputs.append(out.clone())
+    assert torch.equal(outputs[0].view(torch.int16), outputs[1].view(torch.int16))
+    torch.testing.assert_close(
+        out.float(), (a.float() @ weight.T) * alpha, atol=2e-3, rtol=8e-3
+    )

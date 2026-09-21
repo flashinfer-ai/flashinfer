@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""Cached CuTe DSL launch and bounded small-M tuning."""
+"""Cached CuTe DSL launch and bounded native W4A16 tuning."""
 
 from functools import cache
 from typing import Any
@@ -20,7 +20,7 @@ def _compile(m, n, k, dtype, has_alpha, enable_pdl, tactic):
 
     from ....cute_dsl import fp4_common
     from ....jit.cute_dsl_core import build_and_load_cute_dsl_kernel
-    from . import kernel, staged_kernel
+    from . import kernel, staged_kernel, tiled_staged_kernel
 
     kind, extent, warps, splits = tactic[:4]
     if kind == "n64":
@@ -29,7 +29,7 @@ def _compile(m, n, k, dtype, has_alpha, enable_pdl, tactic):
         if dtype != torch.bfloat16 or not has_alpha:
             raise ValueError("The 64-column tactic needs BF16 output and alpha")
         return compile_n64(m, n, k, enable_pdl, tactic[1:])
-    staged = kind == "staged"
+    staged = kind in ("staged", "tiled")
     out_type = cutlass.BFloat16 if dtype == torch.bfloat16 else cutlass.Float16
     a = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32 if staged else cutlass.BFloat16,
@@ -55,7 +55,11 @@ def _compile(m, n, k, dtype, has_alpha, enable_pdl, tactic):
     out = cute.runtime.make_fake_compact_tensor(
         out_type, (m, n), stride_order=(1, 0), assumed_align=2
     )
-    if staged:
+    if kind == "tiled":
+        op = tiled_staged_kernel.NativeBf16Fp4TiledStagedKernel(
+            splits, warps, enable_pdl, extent, *tactic[4:]
+        )
+    elif staged:
         op = staged_kernel.NativeBf16Fp4StagedKernel(
             splits, warps, enable_pdl, extent, tactic[4]
         )
@@ -79,6 +83,8 @@ def _compile(m, n, k, dtype, has_alpha, enable_pdl, tactic):
     name = f"m{m}_n{n}_k{k}_{dtype_key}_a{int(has_alpha)}_p{int(enable_pdl)}_{kind}{extent}_w{warps}_s{splits}"
     if staged:
         name += f"_st{tactic[4]}"
+    if kind == "tiled":
+        name += f"_tm{tactic[5]}_rm{int(tactic[6])}"
     return build_and_load_cute_dsl_kernel(
         "native_bf16_fp4_sm12x",
         name,
@@ -87,6 +93,7 @@ def _compile(m, n, k, dtype, has_alpha, enable_pdl, tactic):
             __file__,
             kernel.__file__,
             staged_kernel.__file__,
+            tiled_staged_kernel.__file__,
             fp4_common.__file__,
         ),
     )
@@ -94,11 +101,7 @@ def _compile(m, n, k, dtype, has_alpha, enable_pdl, tactic):
 
 def _can_stage(inputs):
     a, b, sf = inputs[:3]
-    return (
-        a.shape[0] <= 16
-        and a.shape[1] % 64 == 0
-        and all(t.data_ptr() % 16 == 0 for t in (a, b, sf))
-    )
+    return a.shape[1] % 64 == 0 and all(t.data_ptr() % 16 == 0 for t in (a, b, sf))
 
 
 class NativeBf16Fp4Runner(TunableRunner):
@@ -116,7 +119,21 @@ class NativeBf16Fp4Runner(TunableRunner):
         m, k = inputs[0].shape
         n = inputs[1].shape[0]
         if m > 16:
-            return [("mma", 4 if n >= 512 else 1, w, 1) for w in (4, 8)]
+            tactics = [("mma", 4 if n >= 512 else 1, w, 1) for w in (4, 8)]
+            if _can_stage(inputs):
+                tactics += [
+                    ("tiled", tk, w, s, stages, tm, raster_m)
+                    for tm, tk, w, s, stages, raster_m in (
+                        (64, 64, 8, 1, 3, False),
+                        (64, 128, 8, 2, 2, False),
+                        (128, 64, 4, 1, 2, False),
+                        (128, 128, 8, 1, 2, False),
+                        (64, 64, 4, 1, 3, True),
+                        (128, 128, 8, 1, 2, True),
+                    )
+                    if k % tk == 0 and s <= k // tk
+                ]
+            return tactics
         rows = sorted({1, min(m, 2), min(m, 4)})
         simd_splits = (
             [s for s in (1, 2, 4, 8) if s <= (k + 255) // 256] if m == 1 else [1]
@@ -173,7 +190,11 @@ class NativeBf16Fp4Runner(TunableRunner):
             raise ValueError("Invalid native W4A16 tactic")
         if tactic == -1:
             if m > 16:
-                tactic = ("mma", 4 if n >= 512 else 1, 4, 1)
+                tactic = (
+                    ("tiled", 64, 4, 1, 3, 64, True)
+                    if _can_stage(inputs)
+                    else ("mma", 4 if n >= 512 else 1, 4, 1)
+                )
             elif _can_stage(inputs):
                 tk = 128 if k % 128 == 0 else 64
                 splits = min(4 if n < 8192 else 1, k // tk)
@@ -207,7 +228,7 @@ class NativeBf16Fp4Runner(TunableRunner):
                 )
             _COMPILED[key] = compiled
         operands = [
-            a.view(torch.int32) if tactic[0] in ("staged", "n64") else a,
+            a.view(torch.int32) if tactic[0] in ("staged", "n64", "tiled") else a,
             b.view(torch.int32),
             sf.view(torch.float8_e4m3fn).view(-1),
             alpha,
