@@ -46,7 +46,16 @@ def _sweep_geometries() -> List[Dict[str, Any]]:
     seen = set()
     for table in HEURISTIC_CONFIGS.values():
         for c in table.values():
-            key = (c.swap_ab, c.pingpong, c.mma_tiler_mnk, c.cluster_shape_mnk)
+            # The scheduler companions (group_hint / tail_split_pairs) were
+            # tuned with the geometry, so they travel with it.
+            key = (
+                c.swap_ab,
+                c.pingpong,
+                c.mma_tiler_mnk,
+                c.cluster_shape_mnk,
+                c.group_hint,
+                c.tail_split_pairs,
+            )
             if key in seen:
                 continue
             seen.add(key)
@@ -57,6 +66,8 @@ def _sweep_geometries() -> List[Dict[str, Any]]:
                     "mma_tiler_mnk": tuple(c.mma_tiler_mnk),
                     "cluster_shape_mnk": tuple(c.cluster_shape_mnk),
                     "fp8_accum_mode": "1xacc",
+                    "group_hint": c.group_hint,
+                    "tail_split_pairs": c.tail_split_pairs,
                 }
             )
     return out
