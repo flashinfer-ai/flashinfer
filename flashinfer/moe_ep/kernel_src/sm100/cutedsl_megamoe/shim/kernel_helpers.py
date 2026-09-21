@@ -16,7 +16,7 @@ what the dtype shims already import at load).  The ``mega_runner`` /
 ``mega_reference`` helpers pull ``cutlass`` transitively (see
 ``moe_nvfp4_swapab/mega_runner.py`` ``import cutlass``), so they are exposed
 lazily via module ``__getattr__`` to keep ``import
-flashinfer.moe_ep.kernel_src.cutedsl_megamoe`` usable on CPU-only hosts.
+flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe`` usable on CPU-only hosts.
 """
 
 from __future__ import annotations

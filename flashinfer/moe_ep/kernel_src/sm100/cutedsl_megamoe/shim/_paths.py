@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
-"""Put ``kernel_src/cutedsl_megamoe/src`` on ``sys.path`` so kernel packages resolve.
+"""Put ``kernel_src/sm100/cutedsl_megamoe/src`` on ``sys.path`` so kernel packages resolve.
 
 This is shim glue, not kernel-team code, so it lives in ``shim/`` (never inside
 ``src/`` — that directory is a *verbatim* drop from the kernel team).  It adds
