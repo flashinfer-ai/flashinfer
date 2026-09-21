@@ -494,7 +494,7 @@ is written by one `kind::f16` MMA step over constant BF16 operands
 (one BF16 tile as both operands, every `K = 16` row `[1024, 1024, 1024, 0]`
 repeated, so the twelve products `2^20` sum to exactly `1.5 * 2^23`) issued
 right before the INT8 K steps
-(`_seed_score_bias` in `tmem_s.py`); the tensor core writes the slot at
+(`_seed_scores` in `tmem_s.py`); the tensor core writes the slot at
 accumulator bandwidth and the INT8 steps accumulate onto it in tcgen05 issue
 order. Seeding the 64 KiB slot with `tcgen05.cp` or `tcgen05.st` costs several
 times more than the conversions the bias removes.

@@ -621,7 +621,21 @@ class SmemPResource(DecodeGenResourceBase):
                     .to(cfg.v_dtype)
                     .bitcast(Int32)
                 )
-            self._publish_p_fragment(tmem_base, fragment, packed_p, publishes_fragment)
+            # The packed fragment's TMEM store is made visible to the async
+            # proxy and ordered before the barrier arrive; one lane per warp
+            # arrives so the MMA warp can start the fragment's PV k-slice.
+            _keeps_tcgen05_st(
+                cfg,
+                prims.make_tmem_ptr(
+                    tmem_base + fragment * Int32(cfg.fragment_p_packed_cols), Int32
+                ),
+                packed_p,
+                offset=cfg.tmem_p_cols_per_inst,
+            )
+            cute.arch.fence_view_async_tmem_store()
+            prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
+            if publishes_fragment:
+                prims.mbarrier_arrive(self._fragment_ready.data_ptr() + fragment)
         prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
         total_sum = Float32(total_sum_pair[0] + total_sum_pair[1])
         self.tmem_s_ref.store_p_local_sum(0, total_sum)
@@ -645,34 +659,6 @@ class SmemPResource(DecodeGenResourceBase):
         self._scale_fragment_pairs(
             s_arr, group_addends, group_multipliers, groups=groups
         )
-
-    @cute.jit
-    def _publish_p_fragment(
-        self,
-        tmem_base: Int32,
-        fragment: Int32,
-        packed_p,
-        publishes_fragment: cutlass.Boolean,
-    ) -> None:
-        """Store one packed K32 P fragment to TMEM and signal its barrier.
-
-        The store is made visible to the async proxy and ordered before the
-        barrier arrive; one lane per warp (``publishes_fragment``) arrives so
-        the MMA warp can start the fragment's PV k-slice.
-        """
-        cfg = self.cfg
-        _keeps_tcgen05_st(
-            cfg,
-            prims.make_tmem_ptr(
-                tmem_base + fragment * Int32(cfg.fragment_p_packed_cols), Int32
-            ),
-            packed_p,
-            offset=cfg.tmem_p_cols_per_inst,
-        )
-        cute.arch.fence_view_async_tmem_store()
-        prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
-        if publishes_fragment:
-            prims.mbarrier_arrive(self._fragment_ready.data_ptr() + fragment)
 
     @cute.jit
     def _load_score_fragment(
@@ -709,39 +695,24 @@ class SmemPResource(DecodeGenResourceBase):
         Each score pair uses the exponent multiplier and addend of its
         compile-time scale group; without Sage attention there is one group
         holding the softmax scale. ``groups`` is the route kind's scale
-        groups per fragment.
+        groups per fragment. Both scores of a pair share a scale group unless
+        the group is one score wide (the one-token K block), so each takes
+        the multiplier and addend of its own group; a biased INT32 score's
+        bias is already in the group addend.
         """
-        for pair_idx in cutlass.range_constexpr(
-            self.cfg.softmax_score_fragment_regs // 2
-        ):
-            s_arr[pair_idx * 2], s_arr[pair_idx * 2 + 1] = self._exponent_pair(
-                s_arr, pair_idx * 2, group_addends, group_multipliers, groups
+        fragment_regs = self.cfg.softmax_score_fragment_regs
+        group_regs = fragment_regs // groups
+        for value_idx in cutlass.range_constexpr(0, fragment_regs, 2):
+            group0: Constexpr[int] = value_idx // group_regs
+            group1: Constexpr[int] = (value_idx + 1) // group_regs
+            s_arr[value_idx], s_arr[value_idx + 1] = cute.arch.fma_packed_f32x2(
+                (Float32(s_arr[value_idx]), Float32(s_arr[value_idx + 1])),
+                (
+                    Float32(group_multipliers[group0]),
+                    Float32(group_multipliers[group1]),
+                ),
+                (Float32(group_addends[group0]), Float32(group_addends[group1])),
             )
-
-    @cute.jit
-    def _exponent_pair(
-        self,
-        s_arr: cutlass.Array,
-        value_idx: Constexpr[int],
-        group_addends: cutlass.Array,
-        group_multipliers: cutlass.Array,
-        groups: Constexpr[int],
-    ) -> tuple[Float32, Float32]:
-        """Return the log2 exponents of the score pair at ``value_idx``.
-
-        Both scores of a pair share a scale group unless the group is one
-        score wide (the one-token K block), so each takes the multiplier and
-        addend of its own group; a biased INT32 score's bias is already in
-        the group addend.
-        """
-        group_regs = self.cfg.softmax_score_fragment_regs // groups
-        group0: Constexpr[int] = value_idx // group_regs
-        group1: Constexpr[int] = (value_idx + 1) // group_regs
-        return cute.arch.fma_packed_f32x2(
-            (Float32(s_arr[value_idx]), Float32(s_arr[value_idx + 1])),
-            (Float32(group_multipliers[group0]), Float32(group_multipliers[group1])),
-            (Float32(group_addends[group0]), Float32(group_addends[group1])),
-        )
 
     @cute.jit
     def _fragment_exponent_terms(

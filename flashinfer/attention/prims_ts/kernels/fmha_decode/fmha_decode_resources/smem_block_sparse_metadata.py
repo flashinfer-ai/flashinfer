@@ -1184,116 +1184,100 @@ class SmemBlockSparseSoftmaxMetadataResource(DecodeGenResourceBase):
                     + lane_idx
                 ] = Int32(token_word)
         if cutlass.const_expr(self.cfg.use_sage_attention):
-            self._stage_route_sage_k_scales(
-                stage_info,
-                stage_base,
-                resolved_record_word,
-                resolved_origin1,
+            # The route's ``sfK`` words are staged in the exact geometry,
+            # consecutive words per lane: lane ``l`` owns words
+            # ``l * words_per_lane`` onward. Consecutive words of one lane lie
+            # in one fragment of one spatial half (``words_per_lane`` divides
+            # the group count), so the lane resolves one atom origin from the
+            # lane-distributed record (or the broadcast origin pair of a
+            # two-atom route without one-warp transport) and loads its words
+            # at the group stride in one batch. Invalid atoms carry origin
+            # ``-1``; their scores are masked, so the clamp to token zero only
+            # keeps the load in bounds. Proxy routes of an equal-geometry plan
+            # stage their summary scales the same way; proxy routes of a
+            # mixed-geometry plan stage nothing, since the softmax warps
+            # gather their summary scales (``load_route_sage_k_scales``) where
+            # the loads hide behind the score wait instead of sitting on the
+            # load warp between two routes.
+            cfg = self.cfg
+            assert self.staging_layout.sage_scale_words_word_offset is not None
+            route_is_proxy = cutlass.Boolean(False)
+            if cutlass.const_expr(cfg.use_block_sparse_proxy_routes):
+                route_is_proxy = cutlass.Boolean(
+                    (
+                        _warp_broadcast_i32(
+                            resolved_record_word,
+                            self.route_layout.route_flags_word_offset,
+                        )
+                        & Int32(_PREPARED_ROUTE_IS_PROXY_FLAG)
+                    )
+                    != Int32(0)
+                )
+            task_cache = _decode_gen_task_cache(stage_info)
+            scale_addr, scale_head_stride, scale_seq_len, log2_k_block_size = (
+                block_sparse_k_scale_source(
+                    cfg,
+                    k_scale_ptr=self.k_scale_ptr,
+                    k_scale_head_stride=self.k_scale_head_stride,
+                    k_summary_scale_ptr=self.k_summary_scale_ptr,
+                    k_summary_scale_head_stride=self.k_summary_scale_head_stride,
+                    seq_len_kv=Int32(task_cache[_TASK_CACHE_SEQ_LEN_KV]),
+                    route_is_proxy=route_is_proxy,
+                )
             )
+            kv_head_idx, batch_idx = _logical_head_batch(
+                stage_info, self.h_k_idx, self.b_idx
+            )
+            groups: Constexpr[int] = cfg.sage_k_groups_per_fragment
+            num_words: Constexpr[int] = sage_k_scale_words(cfg, groups)
+            words_per_lane: Constexpr[int] = max(1, num_words // 32)
+            assert words_per_lane * 32 >= num_words and groups % words_per_lane == 0
+            group_tokens: Constexpr[int] = cfg.softmax_score_fragment_regs // groups
+            arr_size: Constexpr[int] = sage_scale_arr_size(cfg, groups)
+            # A staged-array view built here keeps its base pointer outside
+            # the dynamic branch below, which the store inside then reuses.
+            staged = cutlass.Array(
+                self._smem_scales.data_ptr(),
+                dtype=Float32,
+                shape=(self.staging_layout.total_words,),
+                addrspace=3,
+            )
+            if cutlass.const_expr(not cfg.sage_mixed_k_geometry) or not route_is_proxy:
+                first_word = lane_idx * Int32(words_per_lane)
+                atom_idx, token_offset = sage_word_position(
+                    cfg,
+                    first_word // Int32(arr_size),
+                    first_word % Int32(arr_size),
+                    groups,
+                )
+                atom_idx = cute.math.min(atom_idx, Int32(num_origins - 1))
+                if cutlass.const_expr(num_origins == 2 and not uses_one_warp_transport):
+                    origin = Int32(resolved_record_word)
+                    if atom_idx != Int32(0):
+                        origin = Int32(resolved_origin1)
+                else:
+                    origin = Int32(
+                        cute.arch.shuffle_sync(Int32(resolved_record_word), atom_idx)
+                    )
+                if first_word < Int32(num_words):
+                    first_token = cute.math.max(origin, Int32(0)) + token_offset
+                    word_base = (
+                        stage_base
+                        + Int32(self.staging_layout.sage_scale_words_word_offset)
+                        + first_word
+                    )
+                    for entry in cutlass.range_constexpr(words_per_lane):
+                        staged[word_base + Int32(entry)] = load_k_scale(
+                            cfg,
+                            scale_addr,
+                            scale_head_stride,
+                            kv_head_idx=kv_head_idx,
+                            batch_idx=batch_idx,
+                            seq_len_kv=scale_seq_len,
+                            kv_token_idx=first_token + Int32(entry * group_tokens),
+                            log2_k_block_size=log2_k_block_size,
+                        )
         cute.arch.sync_warp()
-
-    @cute.jit
-    def _stage_route_sage_k_scales(
-        self,
-        stage_info: StageInfo,
-        stage_base: Int32,
-        resolved_record_word: Int32,
-        resolved_origin1: Int32,
-    ) -> None:
-        """Stage one route's ``sfK`` words in the exact geometry, consecutive words per lane.
-
-        Lane ``l`` owns words ``l * words_per_lane`` onward. Consecutive words
-        of one lane lie in one fragment of one spatial half (``words_per_lane``
-        divides the group count), so the lane resolves one atom origin from
-        the lane-distributed record (or the broadcast origin pair of a
-        two-atom route without one-warp transport) and loads its words at the
-        group stride in one batch. Invalid atoms carry origin ``-1``; their
-        scores are masked, so the clamp to token zero only keeps the load in
-        bounds. Proxy routes of an equal-geometry plan stage their summary
-        scales the same way; proxy routes of a mixed-geometry plan stage
-        nothing, since the softmax warps gather their summary scales
-        (``load_route_sage_k_scales``) where the loads hide behind the score
-        wait instead of sitting on the load warp between two routes.
-        """
-
-        cfg = self.cfg
-        assert self.staging_layout.sage_scale_words_word_offset is not None
-        route_is_proxy = cutlass.Boolean(False)
-        if cutlass.const_expr(cfg.use_block_sparse_proxy_routes):
-            route_is_proxy = cutlass.Boolean(
-                (
-                    _warp_broadcast_i32(
-                        resolved_record_word, self.route_layout.route_flags_word_offset
-                    )
-                    & Int32(_PREPARED_ROUTE_IS_PROXY_FLAG)
-                )
-                != Int32(0)
-            )
-        task_cache = _decode_gen_task_cache(stage_info)
-        scale_addr, scale_head_stride, scale_seq_len, log2_k_block_size = (
-            block_sparse_k_scale_source(
-                cfg,
-                k_scale_ptr=self.k_scale_ptr,
-                k_scale_head_stride=self.k_scale_head_stride,
-                k_summary_scale_ptr=self.k_summary_scale_ptr,
-                k_summary_scale_head_stride=self.k_summary_scale_head_stride,
-                seq_len_kv=Int32(task_cache[_TASK_CACHE_SEQ_LEN_KV]),
-                route_is_proxy=route_is_proxy,
-            )
-        )
-        kv_head_idx, batch_idx = _logical_head_batch(
-            stage_info, self.h_k_idx, self.b_idx
-        )
-        groups: Constexpr[int] = cfg.sage_k_groups_per_fragment
-        num_origins: Constexpr[int] = self.route_layout.logical_origins_per_route
-        num_words: Constexpr[int] = sage_k_scale_words(cfg, groups)
-        words_per_lane: Constexpr[int] = max(1, num_words // 32)
-        assert words_per_lane * 32 >= num_words and groups % words_per_lane == 0
-        group_tokens: Constexpr[int] = cfg.softmax_score_fragment_regs // groups
-        arr_size: Constexpr[int] = sage_scale_arr_size(cfg, groups)
-        lane_idx = cute.arch.thread_idx()[0] & Int32(0x1F)
-        # A staged-array view built here keeps its base pointer outside the
-        # dynamic branch below, which the store inside then reuses.
-        staged = cutlass.Array(
-            self._smem_scales.data_ptr(),
-            dtype=Float32,
-            shape=(self.staging_layout.total_words,),
-            addrspace=3,
-        )
-        if cutlass.const_expr(not cfg.sage_mixed_k_geometry) or not route_is_proxy:
-            first_word = lane_idx * Int32(words_per_lane)
-            atom_idx, token_offset = sage_word_position(
-                cfg, first_word // Int32(arr_size), first_word % Int32(arr_size), groups
-            )
-            atom_idx = cute.math.min(atom_idx, Int32(num_origins - 1))
-            if cutlass.const_expr(
-                num_origins == 2 and not self.route_layout.uses_one_warp_transport
-            ):
-                origin = Int32(resolved_record_word)
-                if atom_idx != Int32(0):
-                    origin = Int32(resolved_origin1)
-            else:
-                origin = Int32(
-                    cute.arch.shuffle_sync(Int32(resolved_record_word), atom_idx)
-                )
-            if first_word < Int32(num_words):
-                first_token = cute.math.max(origin, Int32(0)) + token_offset
-                word_base = (
-                    stage_base
-                    + Int32(self.staging_layout.sage_scale_words_word_offset)
-                    + first_word
-                )
-                for entry in cutlass.range_constexpr(words_per_lane):
-                    staged[word_base + Int32(entry)] = load_k_scale(
-                        cfg,
-                        scale_addr,
-                        scale_head_stride,
-                        kv_head_idx=kv_head_idx,
-                        batch_idx=batch_idx,
-                        seq_len_kv=scale_seq_len,
-                        kv_token_idx=first_token + Int32(entry * group_tokens),
-                        log2_k_block_size=log2_k_block_size,
-                    )
 
     @cute.jit
     def _gather_route_summary_scales(

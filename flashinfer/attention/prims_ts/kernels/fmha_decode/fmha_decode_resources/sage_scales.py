@@ -198,18 +198,6 @@ def sage_word_position(
 
 
 @cute.jit
-def _load_f32_chunks(ptr, count: Constexpr[int]) -> cutlass.Array:
-    """Return ``count`` FP32 values from an aligned SMEM pointer in 16-byte loads."""
-    assert count % 4 == 0
-    values = cutlass.Array(Float32, count, space=cutlass.AddressSpace.rmem)
-    for chunk in cutlass.range_constexpr(0, count, 4):
-        loaded = (ptr + Int32(chunk)).load(count=4, alignment=16)
-        for elem in cutlass.range_constexpr(4):
-            values[chunk + elem] = Float32(loaded[elem])
-    return values
-
-
-@cute.jit
 def dense_k_scale_token(
     cfg: Constexpr[FmhaDecodeConfig], half: Int32, lane_entry, tile_offset_k: Int32
 ) -> Int32:
@@ -451,14 +439,19 @@ class SmemSageKScales:
     def fragment(self, view: tuple, fragment_idx: Int32) -> cutlass.Array:
         """Return ``factor * sfK`` of one fragment's groups.
 
+        The words are read from the aligned SMEM ring in 16-byte loads.
         Callers issue it ahead of the fragment's score wait so the SMEM
         latency hides behind it.
         """
         buffer, half_base, factor = view
         groups = self.groups
-        values = _load_f32_chunks(
-            buffer.data_ptr() + half_base + fragment_idx * Int32(groups), groups
-        )
+        assert groups % 4 == 0
+        words_ptr = buffer.data_ptr() + half_base + fragment_idx * Int32(groups)
+        values = cutlass.Array(Float32, groups, space=cutlass.AddressSpace.rmem)
+        for chunk in cutlass.range_constexpr(0, groups, 4):
+            loaded = (words_ptr + Int32(chunk)).load(count=4, alignment=16)
+            for elem in cutlass.range_constexpr(4):
+                values[chunk + elem] = Float32(loaded[elem])
         if cutlass.const_expr(factor is not None):
             scale_pairs_in_place(values, factor, groups)
         return values
