@@ -31,13 +31,26 @@ from tvm_ffi import cpp
 from . import env as jit_env
 from .cpp_ext import get_cuda_path, get_nvcc_parallelism_flags
 
-CakeGDNArch = Literal["sm_100a", "sm_103a"]
+CakeGDNArch = Literal["sm_100a", "sm_103a", "sm_107a"]
 
 _EXPORT_SCHEMA = "flashinfer-cake-gdn-decode-standalone-export-v1"
 _MANIFEST_SHA256 = "6cf2de07b0bbcd663e87a171746eb8d53ea91fe7b433897dcb348b0f725f6bae"
 _ARCH_ACTIVE_CLUSTERS: dict[CakeGDNArch, int] = {
     "sm_100a": 148,
     "sm_103a": 160,
+    # SM107 inherits the SM103 kernel portfolio (see _MANIFEST_ARCH below), so it
+    # also inherits its active-cluster count for the dvsplit heuristic: the route
+    # tables were tuned against it, and the SM107 parts measured so far report
+    # 208-216 SMs -- close enough that retuning is a follow-up, not a blocker.
+    "sm_107a": 160,
+}
+# The frozen inventory was exported for the two Blackwell labels. SM107 compiles
+# the identical, arch-neutral source tree natively (--gpu-architecture=sm_107a)
+# and inherits the SM103 kernel portfolio from the manifest.
+_MANIFEST_ARCH: dict[CakeGDNArch, str] = {
+    "sm_100a": "sm_100a",
+    "sm_103a": "sm_103a",
+    "sm_107a": "sm_103a",
 }
 
 
@@ -160,7 +173,9 @@ def _kernel_record(name: str) -> dict[str, Any]:
 
 def _cuda_record(record: dict[str, Any], arch: CakeGDNArch) -> dict[str, Any]:
     outputs = [
-        output for output in record["outputs"] if arch in output["architectures"]
+        output
+        for output in record["outputs"]
+        if _MANIFEST_ARCH[arch] in output["architectures"]
     ]
     if len(outputs) != 1:
         raise ValueError(f"kernel {record['name']!r} does not support {arch}")
@@ -812,8 +827,11 @@ def arch_for_compute_capability(major: int, minor: int) -> CakeGDNArch:
         return "sm_100a"
     if (major, minor) == (10, 3):
         return "sm_103a"
+    if (major, minor) == (10, 7):
+        return "sm_107a"
     raise CakeGDNUnsupportedError(
-        f"Cake GDN supports only SM100a/SM103a, got compute capability {major}.{minor}"
+        "Cake GDN supports only SM100a/SM103a/SM107a, "
+        f"got compute capability {major}.{minor}"
     )
 
 
