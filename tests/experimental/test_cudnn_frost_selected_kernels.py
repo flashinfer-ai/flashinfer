@@ -13,18 +13,26 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from flashinfer.experimental.cudnn_frost_selected_kernels import capabilities
-from flashinfer.experimental.cudnn_frost_selected_kernels.bf16 import moe as bf16_moe
-from flashinfer.experimental.cudnn_frost_selected_kernels.activations import (
+from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm import (
+    capabilities,
+)
+from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.bf16 import (
+    moe as bf16_moe,
+)
+from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.activations import (
     ACTIVATIONS,
     activation_name,
 )
-from flashinfer.experimental.cudnn_frost_selected_kernels.mxfp8 import runtime as mxfp8
-from flashinfer.experimental.cudnn_frost_selected_kernels.mxfp8_mxfp4 import (
+from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.mxfp8 import (
+    runtime as mxfp8,
+)
+from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.mxfp8_mxfp4 import (
     runtime as mxfp8_mxfp4,
 )
-from flashinfer.experimental.cudnn_frost_selected_kernels.nvfp4 import runtime as nvfp4
-from flashinfer.experimental.cudnn_frost_selected_kernels.source_template import (
+from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.nvfp4 import (
+    runtime as nvfp4,
+)
+from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.source_template import (
     extract_template,
     render_source,
 )
@@ -445,7 +453,7 @@ def test_bf16_original_layer_api_can_execute_winning_cudnn_frost_and_replay(
 
 @pytest.mark.parametrize("activation", list(ACTIVATIONS.values()))
 def test_bf16_auto_admission_uses_validated_architecture_profiles(activation):
-    from flashinfer.experimental.cudnn_frost_selected_kernels.bf16.support import (
+    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.bf16.support import (
         large_bf16_moe,
     )
 
@@ -484,7 +492,9 @@ def test_bf16_auto_admission_uses_validated_architecture_profiles(activation):
 
 
 def test_bf16_artifact_architecture_and_swap_abi_isolation(monkeypatch):
-    from flashinfer.experimental.cudnn_frost_selected_kernels.bf16 import runtime
+    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.bf16 import (
+        runtime,
+    )
 
     for capability in ((10, 0), (10, 7), (10, 3)):
         monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: capability)
@@ -510,7 +520,9 @@ def test_bf16_artifact_architecture_and_swap_abi_isolation(monkeypatch):
 
 
 def test_bf16_source_distribution_has_no_binary_or_cudnn_frost_dependency():
-    from flashinfer.experimental.cudnn_frost_selected_kernels.bf16 import runtime
+    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.bf16 import (
+        runtime,
+    )
 
     root = runtime.artifact_root("bf16")
     manifest = json.loads((root / runtime._MANIFEST).read_text())
@@ -539,7 +551,9 @@ def test_bf16_source_distribution_has_no_binary_or_cudnn_frost_dependency():
 
 
 def test_bf16_source_manifest_rejects_tampering_and_legacy_objects(tmp_path):
-    from flashinfer.experimental.cudnn_frost_selected_kernels.bf16 import runtime
+    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.bf16 import (
+        runtime,
+    )
 
     root = runtime.artifact_root("bf16")
     manifest = json.loads((root / runtime._MANIFEST).read_text())
@@ -736,7 +750,9 @@ def test_bf16_missing_compiler_preserves_layer_backend(
 
 
 def test_bf16_moe_shortlist_limits_stages_and_maps_token_profiles(tmp_path):
-    from flashinfer.experimental.cudnn_frost_selected_kernels import shortlist
+    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm import (
+        shortlist,
+    )
 
     entries = []
     for tokens, fc1 in ((16, ["a2", "a0"]), (128, ["a1", "a2"])):
@@ -787,7 +803,9 @@ def test_bf16_moe_shortlist_limits_stages_and_maps_token_profiles(tmp_path):
 
 
 def test_bf16_moe_shortlist_rejects_more_than_two_stage_candidates(tmp_path):
-    from flashinfer.experimental.cudnn_frost_selected_kernels import shortlist
+    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm import (
+        shortlist,
+    )
 
     entry = dict(
         arch="sm_107a",
@@ -905,8 +923,12 @@ def _assert_block_scale_geometry_roundtrip(
 
 
 def test_dtype_directories_are_symmetric_and_isolated():
-    from flashinfer.experimental.cudnn_frost_selected_kernels import runtime as shared
-    from flashinfer.experimental.cudnn_frost_selected_kernels.bf16 import runtime
+    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm import (
+        runtime as shared,
+    )
+    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.bf16 import (
+        runtime,
+    )
     from flashinfer.fused_moe.auto_candidates import _AUTO_CANDIDATES
 
     assert mxfp8.runtime is shared
@@ -955,7 +977,7 @@ def _assert_mxfp8_auto_admission(name, mixed=False):
 
     dtype = "mxfp8_mxfp4" if mixed else "mxfp8"
     support = importlib.import_module(
-        f"flashinfer.experimental.cudnn_frost_selected_kernels.{dtype}.support"
+        f"flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.{dtype}.support"
     )
     backend = CutlassMxfp8Mxfp4Config if mixed else CutlassMxfp8Config
 
@@ -1392,7 +1414,7 @@ def _assert_mxfp8_moe_full_pipeline_and_graph(name, swizzled, monkeypatch, mixed
 
     dtype = "mxfp8_mxfp4" if mixed else "mxfp8"
     moe = importlib.import_module(
-        f"flashinfer.experimental.cudnn_frost_selected_kernels.{dtype}.moe"
+        f"flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.{dtype}.moe"
     )
     backend = CutlassMxfp8Mxfp4Config if mixed else CutlassMxfp8Config
 
@@ -1517,7 +1539,9 @@ def test_mxfp8_moe_inference_mode_preparation_and_graph(monkeypatch):
 
 
 def test_mxfp8_moe_shortlist_uses_measured_two_by_two_buckets(monkeypatch):
-    from flashinfer.experimental.cudnn_frost_selected_kernels.mxfp8 import moe
+    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.mxfp8 import (
+        moe,
+    )
 
     _assert_moe_shortlist_buckets(moe, monkeypatch)
 
@@ -1530,7 +1554,9 @@ def _assert_moe_shortlist_buckets(moe, monkeypatch):
     monkeypatch.setattr(moe, "_kernels", lambda *args: (first, second))
     table = {key: {128: (("first2", "first0"), ("second1", "second2"))}}
     monkeypatch.setattr(moe, "_read", lambda roots: table)
-    from flashinfer.experimental.cudnn_frost_selected_kernels import shortlist
+    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm import (
+        shortlist,
+    )
 
     monkeypatch.setattr(shortlist, "_read", lambda roots: table)
     args = (4096, 14336, 8, 2, "cuda", SwiGLU())
@@ -1549,7 +1575,9 @@ def _assert_moe_shortlist_buckets(moe, monkeypatch):
 
 
 def test_mxfp8_plan_workspaces_preserve_prior_allocations(monkeypatch):
-    from flashinfer.experimental.cudnn_frost_selected_kernels.mxfp8 import moe
+    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.mxfp8 import (
+        moe,
+    )
 
     required_sizes = iter((257, 301, 400, 129, 513, 600, 599, 450, 350, 401, 450, 449))
     retained_modules = []
@@ -1656,7 +1684,9 @@ def test_nvfp4_reject_incompatible_numerical_contract(change, tmp_path):
 
 @pytest.mark.parametrize("name", ACTIVATIONS)
 def test_nvfp4_auto_admission_uses_logical_hidden_size(name):
-    from flashinfer.experimental.cudnn_frost_selected_kernels.nvfp4 import support
+    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.nvfp4 import (
+        support,
+    )
     from flashinfer.fused_moe import CutlassNvfp4Config, QuantFormat
 
     config = MoEConfig(
@@ -1874,7 +1904,9 @@ def _nvfp4_moe_reference(act, weights, activation, swizzled=False):
 @pytest.mark.parametrize("name", ACTIVATIONS)
 @pytest.mark.parametrize("swizzled", [False, True])
 def test_nvfp4_moe_full_pipeline_and_dynamic_graph(name, swizzled, monkeypatch):
-    from flashinfer.experimental.cudnn_frost_selected_kernels.nvfp4 import moe
+    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.nvfp4 import (
+        moe,
+    )
     from flashinfer.fused_moe import CutlassNvfp4Config, QuantFormat
 
     monkeypatch.setitem(sys.modules, "cudnn", None)
@@ -1987,19 +2019,25 @@ def test_nvfp4_moe_inference_mode_preparation_and_graph(monkeypatch):
 
 
 def test_nvfp4_moe_shortlist_uses_measured_two_by_two_buckets(monkeypatch):
-    from flashinfer.experimental.cudnn_frost_selected_kernels.nvfp4 import moe
+    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.nvfp4 import (
+        moe,
+    )
 
     _assert_moe_shortlist_buckets(moe, monkeypatch)
 
 
 def test_nvfp4_packaged_shortlists_resolve_all_profiles(monkeypatch):
-    from flashinfer.experimental.cudnn_frost_selected_kernels.nvfp4 import moe
+    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.nvfp4 import (
+        moe,
+    )
 
     _assert_packaged_shortlists_resolve_all_profiles(moe, monkeypatch)
 
 
 def _assert_packaged_shortlists_resolve_all_profiles(moe, monkeypatch):
-    from flashinfer.experimental.cudnn_frost_selected_kernels import shortlist
+    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm import (
+        shortlist,
+    )
 
     roots = moe._artifact_roots()
     table = shortlist._read(roots)
@@ -2135,13 +2173,17 @@ def test_mxfp8_mxfp4_moe_inference_mode_preparation_and_graph(monkeypatch):
 
 
 def test_mxfp8_mxfp4_moe_shortlist_uses_measured_two_by_two_buckets(monkeypatch):
-    from flashinfer.experimental.cudnn_frost_selected_kernels.mxfp8_mxfp4 import moe
+    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.mxfp8_mxfp4 import (
+        moe,
+    )
 
     _assert_moe_shortlist_buckets(moe, monkeypatch)
 
 
 def test_mxfp8_mxfp4_packaged_shortlists_resolve_all_profiles(monkeypatch):
-    from flashinfer.experimental.cudnn_frost_selected_kernels.mxfp8_mxfp4 import moe
+    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.mxfp8_mxfp4 import (
+        moe,
+    )
 
     _assert_packaged_shortlists_resolve_all_profiles(moe, monkeypatch)
 
@@ -2149,7 +2191,9 @@ def test_mxfp8_mxfp4_packaged_shortlists_resolve_all_profiles(monkeypatch):
 def test_frost_external_compiler_identity_tracks_executable_changes(
     tmp_path, monkeypatch
 ):
-    from flashinfer.experimental.cudnn_frost_selected_kernels import compiler
+    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm import (
+        compiler,
+    )
 
     monkeypatch.delenv(compiler._ENV, raising=False)
     assert compiler.compiler_identity() == {"backend": "bundled"}
@@ -2180,7 +2224,10 @@ def test_frost_external_compiler_identity_tracks_executable_changes(
 
 
 def test_frost_compiler_switch_invalidates_memory_and_tactic_keys(monkeypatch):
-    from flashinfer.experimental.cudnn_frost_selected_kernels import compiler, runtime
+    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm import (
+        compiler,
+        runtime,
+    )
 
     key = [""]
     monkeypatch.setattr(compiler, "identity_key", lambda: key[0])
@@ -2214,7 +2261,9 @@ def _frost_compiler_ir(binary_count=1):
 
 @pytest.mark.parametrize("binary_count", [0, 1, 2])
 def test_frost_external_binary_replacement_validates_and_restores(binary_count):
-    from flashinfer.experimental.cudnn_frost_selected_kernels import compiler
+    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm import (
+        compiler,
+    )
 
     module = _frost_compiler_ir(binary_count)
     compiled = SimpleNamespace(ir_module=module)
@@ -2246,7 +2295,9 @@ def test_frost_external_binary_replacement_validates_and_restores(binary_count):
 def test_frost_external_compiler_cache_paths_use_reassembled_binary(
     tmp_path, monkeypatch, mode
 ):
-    from flashinfer.experimental.cudnn_frost_selected_kernels import compiler
+    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm import (
+        compiler,
+    )
     from flashinfer.jit import cute_dsl_core
     import cutlass.cute as cute
     import cutlass.runtime as cutlass_runtime

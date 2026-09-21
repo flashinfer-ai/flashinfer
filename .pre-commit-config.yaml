@@ -42,7 +42,7 @@ repos:
     hooks:
       - id: check-added-large-files
         # Generated catalogs contain geometry records for all selected tactics.
-        exclude: ^flashinfer/experimental/cudnn_frost_selected_kernels/artifacts/[^/]+/cudnn_frost_selected_kernels\.json$
+        exclude: ^flashinfer/experimental/cudnn_frost_selected_kernels_moe_grouped_gemm/artifacts/[^/]+/cudnn_frost_selected_kernels\.json$
       - id: check-case-conflict
       - id: check-merge-conflict
       - id: check-symlinks
@@ -51,7 +51,7 @@ repos:
       - id: requirements-txt-fixer
       - id: trailing-whitespace
         # Frozen template bytes are authenticated by the artifact manifests.
-        exclude: ^flashinfer/experimental/cudnn_frost_selected_kernels/artifacts/[^/]+/sources/[^/]+\.py$
+        exclude: ^flashinfer/experimental/cudnn_frost_selected_kernels_moe_grouped_gemm/artifacts/[^/]+/sources/[^/]+\.py$
 
   # Changes tabs to spaces
   - repo: https://github.com/Lucas-C/pre-commit-hooks
@@ -79,7 +79,7 @@ repos:
           args: ["--config-file", "pyproject.toml", "--exclude", "flashinfer-cubin/"]
           files: ^flashinfer/
           # Geometry names in generated Frost templates are injected before JIT.
-          exclude: ^(flashinfer/experimental/cudnn_frost_selected_kernels/artifacts/[^/]+/sources/|flashinfer-cubin/|flashinfer/prims_ts/|flashinfer/attention/prims_ts/kernels/|3rdparty/|build/|flashinfer/cute_dsl/attention/fmha/(fmha\.py|fmha_blockscaled\.py|helpers/)|flashinfer/gemm/kernels/dense_blockscaled_gemm_sm107\.py|flashinfer/fused_moe/cute_dsl/rubin/(blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion\.py|blockscaled_contiguous_grouped_gemm_finalize_fusion\.py)|flashinfer/topk_varlen/kernels/filtered_topk_(util|decode)\.py|flashinfer/topk_varlen/kernels/(gvr2_topk_decode\.py|gvr2_topk_host\.py))
+          exclude: ^(flashinfer/experimental/cudnn_frost_selected_kernels_moe_grouped_gemm/artifacts/[^/]+/sources/|flashinfer-cubin/|flashinfer/prims_ts/|flashinfer/attention/prims_ts/kernels/|3rdparty/|build/|flashinfer/cute_dsl/attention/fmha/(fmha\.py|fmha_blockscaled\.py|helpers/)|flashinfer/gemm/kernels/dense_blockscaled_gemm_sm107\.py|flashinfer/fused_moe/cute_dsl/rubin/(blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion\.py|blockscaled_contiguous_grouped_gemm_finalize_fusion\.py)|flashinfer/topk_varlen/kernels/filtered_topk_(util|decode)\.py|flashinfer/topk_varlen/kernels/(gvr2_topk_decode\.py|gvr2_topk_host\.py))
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
     # Ruff version.

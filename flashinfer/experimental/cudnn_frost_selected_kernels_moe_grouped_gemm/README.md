@@ -1,5 +1,6 @@
-# cuDNN Frost-selected MoE kernel PoC
+# cuDNN Frost-selected MoE grouped GEMM kernels
 
+This package contains Frost-selected MoE grouped GEMM kernels.
 This experimental backend follows Cake's source-distribution model. cuDNN Frost is
 an offline generator: FlashInfer ships standalone Python/CuTe DSL kernels and a
 SHA-256 manifest, with no precompiled `.o` files. Required cuDNN Frost device helpers
@@ -180,7 +181,7 @@ multiplies the activation output for every FC1, including non-gated variants.
 Export a geometry using the same exporter as BF16:
 
 ```bash
-python -m flashinfer.experimental.cudnn_frost_selected_kernels.export \
+python -m flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.export \
   --dtype mxfp8 --op grouped_gemm1_swiglu \
   --config CONFIG_sm100_128x128x128_128x128x64_cluster1x1_1ctamma \
   --cta-group 1 --store-mode stg \
@@ -195,7 +196,7 @@ unexpected source difference is an error rather than a new geometry-named file.
 For prepared grouped execution:
 
 ```python
-from flashinfer.experimental.cudnn_frost_selected_kernels.mxfp8 import runtime as mxfp8
+from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.mxfp8 import runtime as mxfp8
 
 # x: grouped E4M3 [S,K]; gate/up: E4M3 [E,N,K]; offsets: int32 [G].
 # x_sf: logical E8M0 bytes [S,K/32]; gate_sf/up_sf: [E,N,K/32].
@@ -540,7 +541,7 @@ python benchmarks/bench_cudnn_frost_moe_bf16.py sweep --source-jit --adaptive \
   --output /tmp/cudnn_frost-sm107-refine.jsonl
 python benchmarks/bench_cudnn_frost_moe_bf16.py select \
   --artifacts /tmp/cudnn_frost-sm107 --results /tmp/cudnn_frost-sm107-refine.jsonl \
-  --selected-dir flashinfer/experimental/cudnn_frost_selected_kernels/artifacts/bf16 \
+  --selected-dir flashinfer/experimental/cudnn_frost_selected_kernels_moe_grouped_gemm/artifacts/bf16 \
   --output /tmp/cudnn_frost-sm107-selection.jsonl
 ```
 
@@ -658,9 +659,9 @@ these records, retaining its separate candidate pool.
 Example build-box export (repeat with the other tile/store modes and shape):
 
 ```bash
-python -m flashinfer.experimental.cudnn_frost_selected_kernels.export \
+python -m flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.export \
   --op grouped_gemm2 \
-  --output-dir flashinfer/experimental/cudnn_frost_selected_kernels/artifacts/bf16 \
+  --output-dir flashinfer/experimental/cudnn_frost_selected_kernels_moe_grouped_gemm/artifacts/bf16 \
   --cudnn-frost-revision 667fe4ce8ce437866217066f075fd4dcecad6eac \
   --config CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma \
   --cta-group 2 --store-mode stg --experts 12 --n 7168 --k 3072
@@ -709,8 +710,8 @@ Run on SM107a in the build environment containing the matching cuDNN Frost and
 CuTe DSL revisions:
 
 ```bash
-python -m flashinfer.experimental.cudnn_frost_selected_kernels.export \
-  --output-dir flashinfer/experimental/cudnn_frost_selected_kernels/artifacts/bf16 \
+python -m flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.export \
+  --output-dir flashinfer/experimental/cudnn_frost_selected_kernels_moe_grouped_gemm/artifacts/bf16 \
   --cudnn-frost-revision 667fe4ce8ce437866217066f075fd4dcecad6eac \
   --config CONFIG_sm100_128x128x128_128x128x32_cluster2x1_2ctamma \
   --store-mode tma \

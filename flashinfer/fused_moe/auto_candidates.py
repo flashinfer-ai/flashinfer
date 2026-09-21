@@ -21,24 +21,24 @@ class AutoCandidateSpec:
 
 _AUTO_CANDIDATES = {
     "cudnn_frost_bf16": AutoCandidateSpec(
-        "flashinfer.experimental.cudnn_frost_selected_kernels.bf16.support",
+        "flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.bf16.support",
         # Preserve this branch's user-requested unchanged-code BF16 PoC.
         # This exception must not become the default for other registrations.
         requires_opt_in=False,
     ),
     "cudnn_frost_mxfp8": AutoCandidateSpec(
-        "flashinfer.experimental.cudnn_frost_selected_kernels.mxfp8.support",
+        "flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.mxfp8.support",
         # The branch-local integration exposes measured MXFP8 shortlists to
         # unchanged MoELayer callers, matching the BF16 integration above.
         requires_opt_in=False,
     ),
     "cudnn_frost_nvfp4": AutoCandidateSpec(
-        "flashinfer.experimental.cudnn_frost_selected_kernels.nvfp4.support",
+        "flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.nvfp4.support",
         # Match this branch's measured BF16 and MXFP8 automatic integration.
         requires_opt_in=False,
     ),
     "cudnn_frost_mxfp8_mxfp4": AutoCandidateSpec(
-        "flashinfer.experimental.cudnn_frost_selected_kernels.mxfp8_mxfp4.support",
+        "flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.mxfp8_mxfp4.support",
         # Reuse the branch-local measured shortlist integration for mixed MX.
         requires_opt_in=False,
     ),
