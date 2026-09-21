@@ -239,6 +239,9 @@ H12_DIRECT_N32_EARLY_STATE_PACK_MAX_SEQ_LEN = 128
 BF16_N32_REGISTER_INVERSE_MIN_SEQ_LEN = 256
 INDEPENDENT_DVSPLIT_CTAS = 2
 INDEPENDENT_DVSPLIT_MIN_SEQ_LEN = 512
+# Architectures whose one-wave BF16 grid sweep selected the M64 value split over
+# every direct M128 tile (see _should_use_bf16_one_wave_dvsplit).
+BF16_ONE_WAVE_DVSPLIT_ARCHES = ("sm_100a", "sm_103a")
 BT16_CHUNK = 16
 BT16_VALUE_SPLITS = 2
 TF32_BT16_PREP_RESIDENT_CTAS = 6
@@ -650,6 +653,53 @@ def _should_use_independent_dvsplit(
         and (num_seqs == 1)
         and (max_seq_len >= INDEPENDENT_DVSPLIT_MIN_SEQ_LEN)
         and (INDEPENDENT_DVSPLIT_CTAS * num_heads <= sm_count)
+    )
+
+
+def _should_use_bf16_one_wave_dvsplit(
+    *,
+    gpu_arch: str,
+    sm_count: int,
+    total_tasks: int,
+    checkpoint_every_n_tokens: int,
+    bounded_gate: bool,
+    compute_dtype: str,
+    force_direct_m128: bool = False,
+    force_direct_m128_n32: bool = False,
+    n16_short_four_stage: bool = False,
+    beta_tma_refresh: bool = False,
+    num_heads: int = 0,
+    max_seq_len: int = 0,
+) -> bool:
+    """Replace a one-wave BF16 direct M128 grid with the M64 value split.
+
+    CUPTI grid sweeps on a 148-SM B200 and a 152-SM GB300 (H1/H6/H12/H24, 8
+    through 4096 tokens, uniform and mixed packed sequences, CP64 and NoCP,
+    BF16 logit and active FP32 beta) measured the two-CTA M64 value split
+    faster than every direct M128 tile (N16, N32, page64 N32x2) in every case
+    where both value CTAs of each task stay resident in one wave.  Beyond one
+    wave the direct tiles keep their measured preference.  The route requires
+    the bounded gate and a 32-token-aligned checkpoint interval; explicit
+    direct requests keep their physical tile.
+    """
+    return (
+        compute_dtype == "bf16"
+        and gpu_arch in BF16_ONE_WAVE_DVSPLIT_ARCHES
+        and bounded_gate
+        and (checkpoint_every_n_tokens % BF16_M128_CHUNK == 0)
+        and (0 < INDEPENDENT_DVSPLIT_CTAS * total_tasks <= sm_count)
+        and (not force_direct_m128)
+        and (not force_direct_m128_n32)
+        and (not n16_short_four_stage)
+        # BF16 logit beta whose token pitch is not TMA-encodable is refreshed
+        # into a padded carrier on every launch.  Only the short H12 direct
+        # tiles avoid that carrier (scalar beta loads), so only those grids
+        # keep their direct tile; every other direct tile pays the same copy.
+        and not (
+            beta_tma_refresh
+            and num_heads == 12
+            and max_seq_len <= H12_DIRECT_N32_MAX_SEQ_LEN
+        )
     )
 
 
@@ -2157,6 +2207,44 @@ class FlashKDABlackwellBF16FusedLaunch:
                     "forced N32 requires checkpoint_every_n_tokens to be a multiple of 32"
                 )
             route = BF16_ROUTE_DIRECT_M128_N16
+        # The M64 module is threaded only through the cuda_cpp backend; the
+        # direct PTX backend keeps its direct tile.
+        if (
+            route
+            in {
+                BF16_ROUTE_DIRECT_M128,
+                BF16_ROUTE_DIRECT_M128_N16,
+            }
+            and backend == "cuda_cpp"
+            and _should_use_bf16_one_wave_dvsplit(
+                gpu_arch=gpu_arch,
+                sm_count=sm_count,
+                total_tasks=total_tasks,
+                checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+                bounded_gate=gate_kind == KDAGateKind.LOWER_BOUND,
+                compute_dtype=compute_dtype,
+                force_direct_m128=self._force_direct_m128,
+                force_direct_m128_n32=self._force_direct_m128_n32,
+                n16_short_four_stage=self._n16_short_four_stage,
+                # Logit beta whose token pitch the 8x32 TMA box cannot encode is
+                # refreshed into a padded carrier each launch (see
+                # _pad_beta_tma_source); active FP32 beta never uses that box.
+                beta_tma_refresh=(
+                    not self._active_beta_f32
+                    and not (
+                        total_tokens >= BF16_M128_CHUNK
+                        and num_heads >= BF16_BETA_TMA_MIN_HEADS
+                        and beta.stride(1) * beta.element_size() % 16 == 0
+                    )
+                ),
+                num_heads=num_heads,
+                max_seq_len=max_seq_len,
+            )
+        ):
+            # The one-wave BF16 value split replaces every direct tile the
+            # policy above resolved, including the checkpoint-constrained and
+            # active-beta direct families; forced tiles were excluded above.
+            route = BF16_ROUTE_M64
         if compute_dtype == "tf32":
             if route in {
                 BF16_ROUTE_SMALL_BH_M128,
@@ -2827,11 +2915,12 @@ class FlashKDABlackwellBF16FusedLaunch:
                 if use_bt16_s9_chain
                 else "decomposed_bt16_prepare_chain_m64_wavefront"
             )
-        elif not (use_tf32_direct_m128 or use_tf32_owner_helper) and (
-            not (
-                use_independent_dvsplit
-                and (self._active_beta_f32 or compute_dtype == "tf32")
-            )
+        # Every M64 route builds its own module below; resolving the fused M128
+        # module here as well would compile an unused kernel and break the
+        # exporter's physical-stage inventory.
+        elif (
+            not (use_tf32_direct_m128 or use_tf32_owner_helper)
+            and not use_independent_dvsplit
         ):
             self.module = _build_kda_module(
                 partial(_factory, "compiled_bf16_fused_m128"),
@@ -4763,6 +4852,30 @@ class PreparedBF16ActiveBetaKDA:
                     num_heads=heads,
                     max_seq_len=max_seq_len,
                 )
+            )
+            or (
+                # The one-wave M64 value split consumes active FP32 beta
+                # natively, so its grids skip the logit conversion adapter.
+                # Long grids that the BF16 affine split would parallelize keep
+                # the adapter path; the affine windows only accept logit beta.
+                q.device.type == "cuda"
+                and _should_use_bf16_one_wave_dvsplit(
+                    gpu_arch=detect_gpu_arch(),
+                    sm_count=_device_sm_count(q.device),
+                    total_tasks=len(lengths) * heads,
+                    checkpoint_every_n_tokens=int(checkpoint_every_n_tokens),
+                    bounded_gate=lower_bound is not None,
+                    compute_dtype="bf16",
+                )
+                and _affine_split_part_count(
+                    sm_count=_device_sm_count(q.device),
+                    tasks=len(lengths) * heads,
+                    chunks=(max_seq_len + BF16_M128_CHUNK - 1) // BF16_M128_CHUNK,
+                    fp32_indexed_state=True,
+                    shared_tf32_factors=False,
+                    unbounded_softplus=lower_bound is None,
+                )
+                < 2
             )
         )
         self.direct_active_beta = bool(
