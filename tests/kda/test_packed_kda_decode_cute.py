@@ -44,8 +44,8 @@ def packed_kda_cute_device():
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
     device = torch.device("cuda")
-    if torch.cuda.get_device_capability(device) != (10, 0):
-        pytest.skip("packed-input CuTe KDA requires exact CC 10.0")
+    if torch.cuda.get_device_capability(device) not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("packed-input CuTe KDA requires CC 10.0, 10.3 or 10.7")
     return device
 
 

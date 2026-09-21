@@ -208,7 +208,7 @@ def _t1_fast_path_mode(
         or not output.is_contiguous()
     ):
         return None
-    if get_compute_capability(q.device) != (10, 0):
+    if get_compute_capability(q.device) not in ((10, 0), (10, 3), (10, 7)):
         return None
     if not is_cuda_version_at_least("12.8"):
         return None
