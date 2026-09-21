@@ -922,12 +922,11 @@ class TmemSResource(DecodeGenResourceBase):
         warp_grp_thread_idx: Int32,
         tile_row_idx: Int32,
     ) -> Uint32:
-        """Return one lane-local sixteen-page keep word for Q64/KV128."""
+        """Return a lane-local 16/32-page keep word for Q64/Q128 with KV128."""
 
         cfg = self.cfg
-        assert cfg.tile_size_q == 64
+        assert cfg.tile_size_q in (64, 128)
         assert cfg.tile_size_kv == 128
-        assert cfg.num_tokens_per_page == 4
         assert cfg.uses_q_token_kv_block_sparse_page_membership
         assert self.page_offsets_ref is not None
         q_token_idx, _ = _q_row_token_and_local_head(
@@ -945,7 +944,9 @@ class TmemSResource(DecodeGenResourceBase):
             cfg.softmax_score_fragment_regs,
         )
         keep_word = Uint32(0)
-        for page_vector_idx in cutlass.range_constexpr(4):
+        page_span = min(cfg.num_tokens_per_page, cfg.num_s_regs_per_thread)
+        pages_per_lane = cfg.num_s_regs_per_thread // page_span
+        for page_vector_idx in cutlass.range_constexpr(pages_per_lane // 4):
             memberships = (
                 self.page_offsets_ref.q_token_kv_block_sparse_page_memberships4(
                     stage_info,
@@ -960,6 +961,18 @@ class TmemSResource(DecodeGenResourceBase):
                     (memberships[vector_elem_idx] & membership_bit) != Uint32(0)
                 )
                 keep_word = keep_word | (page_is_member << Uint32(local_page_idx))
+        if cutlass.const_expr(pages_per_lane < 4):
+            for local_page_idx in cutlass.range_constexpr(pages_per_lane):
+                membership = (
+                    self.page_offsets_ref.q_token_kv_block_sparse_page_membership(
+                        stage_info,
+                        local_tile_idx,
+                        (col_base + Int32(local_page_idx * page_span))
+                        // Int32(cfg.num_tokens_per_page),
+                    )
+                )
+                member = Uint32((membership & membership_bit) != Uint32(0))
+                keep_word = keep_word | (member << Uint32(local_page_idx))
         return keep_word
 
     @cute.jit
@@ -1072,31 +1085,38 @@ class TmemSResource(DecodeGenResourceBase):
                     # beyond the causal endpoint within its page need masking.
                     causal_tail_tokens = causal_end & Int32(cfg.num_tokens_per_page - 1)
                     causal_tail_page_rel = causal_end_rel - causal_tail_tokens
-                    for local_page_idx in cutlass.range_constexpr(16):
+                    page_span = min(num_s_regs, cfg.num_tokens_per_page)
+                    for local_page_idx in cutlass.range_constexpr(
+                        num_s_regs // page_span
+                    ):
                         page_score_col = _keeps_score_col(
                             cfg,
                             warp_grp_thread_idx,
-                            local_page_idx * cfg.num_tokens_per_page,
+                            local_page_idx * page_span,
                             col_base,
                         )
+                        page_origin = (
+                            page_score_col // Int32(cfg.num_tokens_per_page)
+                        ) * Int32(cfg.num_tokens_per_page)
                         page_is_causal_tail = (
                             causal_tail_tokens != Int32(0)
-                            and page_score_col == causal_tail_page_rel
+                            and page_origin == causal_tail_page_rel
                         )
-                        for token_in_page in cutlass.range_constexpr(
-                            1, cfg.num_tokens_per_page
+                        # A KV128 block may span two lane-local 64-column halves.
+                        # The second half's first register can already be masked.
+                        for token_in_span in cutlass.range_constexpr(
+                            0 if cfg.num_tokens_per_page > num_s_regs else 1, page_span
                         ):
-                            token_is_valid = not (
+                            token_offset = (
+                                page_score_col - page_origin + Int32(token_in_span)
+                            )
+                            valid = not (
                                 page_is_causal_tail
-                                and Int32(token_in_page) >= causal_tail_tokens
+                                and token_offset >= causal_tail_tokens
                             )
-                            tail_reg_idx = (
-                                local_page_idx * cfg.num_tokens_per_page + token_in_page
-                            )
-                            s_vals[tail_reg_idx] = cutlass.select_(
-                                token_is_valid,
-                                s_vals[tail_reg_idx],
-                                _neg_max_f32(),
+                            reg = local_page_idx * page_span + token_in_span
+                            s_vals[reg] = cutlass.select_(
+                                valid, s_vals[reg], _neg_max_f32()
                             )
                 else:
                     for reg_idx in cutlass.range_constexpr(num_s_regs):
@@ -1113,19 +1133,18 @@ class TmemSResource(DecodeGenResourceBase):
                             s_vals[reg_idx] = _neg_max_f32()
 
         if cutlass.const_expr(cfg.uses_q_token_kv_block_sparse_page_membership):
-            # Q64/KV128 splits one logical score row across lanes xor 16.
-            # Each lane owns one contiguous 64-column half. The preloaded
-            # page word avoids carrying SMEM values through this dynamic
+            # Q64 lanes own a contiguous 64-column half; Q128 lanes own the
+            # complete 128-column row. The preloaded 16/32-page keep word
+            # avoids carrying SMEM values through this dynamic
             # masked/unmasked loader specialization.
             assert cfg.tile_size_kv == 128
-            for local_page_idx in cutlass.range_constexpr(16):
+            page_span = min(num_s_regs, cfg.num_tokens_per_page)
+            for local_page_idx in cutlass.range_constexpr(num_s_regs // page_span):
                 page_is_member = (
                     (membership_keep_word >> Uint32(local_page_idx)) & Uint32(1)
                 ) != Uint32(0)
-                for token_in_page in cutlass.range_constexpr(cfg.num_tokens_per_page):
-                    membership_reg_idx = (
-                        local_page_idx * cfg.num_tokens_per_page + token_in_page
-                    )
+                for token_in_page in cutlass.range_constexpr(page_span):
+                    membership_reg_idx = local_page_idx * page_span + token_in_page
                     s_vals[membership_reg_idx] = cutlass.select_(
                         page_is_member,
                         s_vals[membership_reg_idx],

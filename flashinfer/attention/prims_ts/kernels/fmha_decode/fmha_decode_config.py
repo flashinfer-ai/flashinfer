@@ -114,13 +114,25 @@ _GROUPED_KEEPS_STATIC_ONLY_PROFILES = {
 KV_TILE_256_SOFTMAX_TASK_REGISTERS = 152
 KV_TILE_256_CORRECTION_TASK_REGISTERS = 152
 
-# Sparse route unions use a Q64/KV128 profile with one D128 head band per stage.
-# The recipe is independent of query group size; route membership and Q
-# tile capacity are validated separately.
+# Sparse route unions reuse the dense Keeps staging: D64/D128 use two
+# unstaged K/V instances; D256 uses one instance with D128 head bands.
 _Q_TOKEN_KV_BLOCK_SPARSE_GROUPED_KEEPS_PROFILES = {
-    (BFloat16, BFloat16, BFloat16, 256, 128, 1, 1),
-    (Float8E4M3FN, Float8E4M3FN, Float16, 256, 128, 1, 1),
-    (Float8E4M3FN, Float8E4M3FN, BFloat16, 256, 128, 1, 1),
+    (
+        dtype,
+        dtype,
+        output,
+        dim,
+        128 if dim == 256 else 0,
+        1 if dim == 256 else 2,
+        1 if dim == 256 else 2,
+    )
+    for dim in (64, 128, 256)
+    for dtype, output in (
+        (Float16, Float16),
+        (BFloat16, BFloat16),
+        (Float8E4M3FN, Float16),
+        (Float8E4M3FN, BFloat16),
+    )
 }
 
 _KV_TILE_256_PHYSICAL_DEFAULTS: Mapping[str, ConfigValue] = {
@@ -521,6 +533,8 @@ class FmhaDecodeConfig:
     # sparse routes consume query membership from a separate packed-word table;
     # Q1 uses the same scattered page route without membership masking.
     use_q_token_kv_block_sparse_route: bool = False
+    # None preserves each sparse family's default in raw/static configs too.
+    share_pattern_across_kv_heads: bool | None = None
     # Allow the attention grid to acquire a programmatic launch dependency.
     # Callers must opt in only when a producer was launched immediately before
     # attention on the same stream and will release that dependency.
@@ -627,11 +641,11 @@ class FmhaDecodeConfig:
     # MmaTask: a single warp in WG3 issues tcgen05 MMA instructions for BMM1/BMM2.
     mma_warp_idx: int = 12  # WG3: warp 12
     mma_num_warps: int = 1
-    # LoadTask: a single warp in WG3 issues TMA loads for Q/K/V.
+    # LoadTask: one or more independently configured warps issue Q/K/V TMA.
     load_warp_idx: int = 13  # WG3: warp 13
     load_num_warps: int = 1
-    # PageTableTask (paged-KV only): warp 14 prefetches logical→physical
-    # page IDs that LoadTask consumes when issuing the TMA copies.
+    # PageTableTask (paged-KV only): prefetch logical→physical page IDs for
+    # LoadTask. Its warp count is independent of num_insts_kv and TMA issuers.
     page_offsets_warp_idx: int = 14  # WG3: warp 14 for paged-KV page table prefetch
     page_offsets_num_warps: int = 1
     # SMEM pipeline depth for the prefetched page-offset table.
@@ -683,6 +697,13 @@ class FmhaDecodeConfig:
         return self.has_storage_subpages or self.use_q_token_kv_block_sparse_route
 
     @property
+    def shares_sparse_pattern(self) -> bool:
+        """Q-block routes default to per-head patterns; token routes share."""
+        if self.share_pattern_across_kv_heads is None:
+            return not self.use_block_sparse
+        return self.share_pattern_across_kv_heads
+
+    @property
     def uses_q_token_kv_block_sparse_page_membership(self) -> bool:
         """Whether grouped sparse attention uses a packed-membership table."""
         return self.uses_q_token_kv_block_sparse_page_route and self.max_seq_len_q > 1
@@ -708,7 +729,7 @@ class FmhaDecodeConfig:
             self.use_paged_kv
             and not self.use_block_sparse
             and self.uses_scattered_page_route
-            and self.num_tokens_per_page == 4
+            and self.num_tokens_per_page in (4, 8, 16, 32, 64, 128)
             and self.groups_tokens_heads_q
             and self.use_q_token_kv_block_sparse_route
             and 0 < self.max_seq_len_q <= Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIP_BITS
@@ -732,6 +753,12 @@ class FmhaDecodeConfig:
     def uses_task_register_reallocation(self) -> bool:
         return self.use_keeps_mma_ab and (
             self.tile_size_q == 128
+            # Persistent grouped masks keep additional routing/softmax state
+            # live. Reuse the same CTA-pool budgets to give it register headroom.
+            or (
+                self.use_persistent_scheduler
+                and self.uses_q_token_kv_block_sparse_page_membership
+            )
             or (
                 self.tile_size_q == 64
                 and self.tile_size_kv == 256
@@ -743,7 +770,27 @@ class FmhaDecodeConfig:
     def softmax_task_num_registers(self) -> int | None:
         if not self.uses_task_register_reallocation:
             return None
-        return KV_TILE_256_SOFTMAX_TASK_REGISTERS if self.tile_size_kv == 256 else 184
+        preferred = (
+            KV_TILE_256_SOFTMAX_TASK_REGISTERS if self.tile_size_kv == 256 else 184
+        )
+        # setmaxnreg redistributes the CTA's initial register pool, not the
+        # whole SM register file. Complete 8-register/thread quanta leave
+        # unused SM registers when a CTA has more than 16 warps.
+        total_warps = self.threads_per_cta // WARP_THREADS
+        initial_regs = 65536 // (self.threads_per_cta * 8) * 8
+        softmax_warps = self.softmax0_num_warps + (
+            self.softmax1_num_warps if self.num_insts_kv != 1 else 0
+        )
+        other_warps = total_warps - softmax_warps - self.correction_num_warps
+        correction_regs = self.correction_task_num_registers
+        producer_regs = self.mma_load_task_num_registers
+        assert correction_regs is not None and producer_regs is not None
+        available = (
+            total_warps * initial_regs
+            - self.correction_num_warps * correction_regs
+            - other_warps * producer_regs
+        )
+        return min(preferred, available // (softmax_warps * 8) * 8)
 
     @property
     def correction_task_num_registers(self) -> int | None:
@@ -1384,9 +1431,11 @@ class FmhaDecodeConfig:
             raise ValueError(
                 "paged-KV staging supports 1, 2, 4, 8, 16, or 32 pages per KV tile"
             )
-        if self.page_offsets_num_warps != 1:
+        max_page_producers = 2 if self.uses_q_token_kv_block_sparse_page_route else 1
+        if not 1 <= self.page_offsets_num_warps <= max_page_producers:
             raise ValueError(
-                "paged-KV page-offset staging requires exactly one producer warp"
+                "paged-KV page-offset staging requires one producer warp, "
+                "or up to two for QToken-KvBlock-Sparse-Attention"
             )
 
     def validate_block_sparse_profile(self, *, heads_q_per_kv: int) -> None:
@@ -2000,15 +2049,10 @@ class FmhaDecodeConfig:
         common_profile = (
             self.use_keeps_mma_ab
             and self.groups_tokens_heads_q
-            and self.tile_size_q == 64
-            and self.headdim == 256
-            and self.head_dim_per_stage_kv == 128
-            and self.num_insts_kv == 1
-            and self.o_stages == 1
+            and self.tile_size_q in (64, 128)
             and self.uses_q_token_kv_block_sparse_page_route
             and self.mask_type == CAUSAL
             and not self.use_cluster_smem_reduction
-            and not self.use_persistent_scheduler
             and not self.use_attention_sinks
         )
         kv128_profile = (
@@ -2020,9 +2064,9 @@ class FmhaDecodeConfig:
         )
         if not (common_profile and kv128_profile):
             raise ValueError(
-                "QToken-KvBlock-Sparse-Attention grouped KeepsMmaAb requires an encoded page-4 Q group "
-                "that fits Q64, the qualified D256/KV128 arithmetic recipe, "
-                "and a supported causal direct or split launch"
+                "QToken-KvBlock-Sparse-Attention grouped KeepsMmaAb requires an encoded sparse Q group "
+                "that fits Q64/Q128, a supported D64/D128/D256 KV128 recipe, "
+                "and a supported causal direct, persistent or split launch"
             )
 
     @property
@@ -2788,6 +2832,7 @@ def enumerate_auto_splits_kv(
     num_insts_kv: int,
     num_q_tiles: int,
     service_capacity: int,
+    split_kv: bool = True,
 ) -> tuple[int, ...]:
     """Enumerate direct and useful split fanouts for an under-filled Q grid.
 
@@ -2795,6 +2840,8 @@ def enumerate_auto_splits_kv(
     the empirical score. The latter is important when a partially filled wave
     cannot be completed by any uniform integer fanout.
     """
+    if not split_kv:
+        return (1,)
     if num_q_tiles <= 0:
         raise ValueError("num_q_tiles must be positive")
     if service_capacity <= 0:
@@ -2827,6 +2874,7 @@ def select_splits_kv(
     requested_splits_kv: int = -1,
     max_splits_kv: int | None = None,
     min_loop_iters_per_split: int = MIN_LOOP_ITERS_PER_SPLIT,
+    split_kv: bool = True,
 ) -> int:
     """
     Select a Q-grid-aware split-KV fanout.
@@ -2838,6 +2886,8 @@ def select_splits_kv(
     default preserves the dense-decode policy; specialized bounded-work routes
     may choose a lower positive iteration floor explicitly.
     """
+    if not split_kv:
+        return 1
     if num_q_tiles <= 0:
         raise ValueError("num_q_tiles must be positive")
     max_by_seq = _max_splits_kv_by_work(
@@ -2880,6 +2930,8 @@ def _select_auto_launch_mode(
     tile_size_kv: int = AUTO_LAUNCH_TILE_SIZE_KV,
     persistent_min_waves: int = 1,
     persistent_min_tiles_per_cta: int = 1,
+    split_kv: bool = True,
+    service_capacity: int | None = None,
 ) -> str:
     """Pick the launch mode that best matches the kernel's parallelism budget.
 
@@ -2913,14 +2965,15 @@ def _select_auto_launch_mode(
     """
     if seq_len_kv <= 0 or batch_size <= 0 or num_heads_kv <= 0 or num_q_tiles <= 0:
         return "static"
-    hardware_info = utils.HardwareInfo()
-    sm_count = hardware_info.get_device_multiprocessor_count()
+    sm_count = service_capacity
+    if sm_count is None:
+        sm_count = utils.HardwareInfo().get_device_multiprocessor_count()
     sm_count = FALLBACK_SM_COUNT_B200 if sm_count <= 0 else sm_count
     ctas = batch_size * num_heads_kv * num_q_tiles
     waves = ctas / sm_count
     tiles_per_cta = (seq_len_kv + tile_size_kv - 1) // tile_size_kv
     kv_tokens_per_cta = tiles_per_cta * tile_size_kv
-    if waves < 1 and kv_tokens_per_cta >= SPLIT_KV_MIN_TOKENS_PER_CTA:
+    if split_kv and waves < 1 and kv_tokens_per_cta >= SPLIT_KV_MIN_TOKENS_PER_CTA:
         return "gmem_reduction"
     if (
         ctas > persistent_min_waves * sm_count
@@ -3233,6 +3286,7 @@ def _resolve_grouped_q_launch_candidates(
     num_heads_q: int,
     num_heads_kv: int,
     service_capacity: int,
+    split_kv: bool = True,
 ) -> tuple[GroupedQLaunchCandidate, ...]:
     """Resolve one TileQ with Q-grid-aware direct and split recipes.
 
@@ -3286,6 +3340,7 @@ def _resolve_grouped_q_launch_candidates(
         num_insts_kv=cost_num_insts_kv,
         num_q_tiles=candidate.q_tiles,
         service_capacity=service_capacity,
+        split_kv=split_kv,
     )
     recipes = []
     for candidate_splits_kv in split_candidates:
@@ -3332,6 +3387,7 @@ def _apply_auto_grouped_q_mma_config(
     num_heads_kv: int,
     splits_kv: int,
     max_splits_kv: int | None,
+    split_kv: bool = True,
 ) -> GroupedQLaunchCandidate | None:
     """Select a legal fixed multi-Q MMA and KV-split recipe when unpinned.
 
@@ -3377,6 +3433,7 @@ def _apply_auto_grouped_q_mma_config(
             num_heads_q=num_heads_q,
             num_heads_kv=num_heads_kv,
             service_capacity=service_capacity,
+            split_kv=split_kv,
         )
     )
     if not supported:
@@ -3533,6 +3590,7 @@ def _apply_auto_launch_mode(
     num_heads_kv: int,
     seq_len_kv: int,
     seq_len_q: int,
+    split_kv: bool = True,
 ) -> str:
     """Apply the static/persistent/split-KV launch heuristic when it is allowed."""
     if not _should_auto_select_launch_mode(
@@ -3549,14 +3607,11 @@ def _apply_auto_launch_mode(
         seq_len_kv=seq_len_kv,
         num_q_tiles=_num_q_tiles_for_launch(cfg),
         tile_size_kv=cfg.tile_size_kv,
+        split_kv=split_kv,
     )
-    if (cfg.use_variable_seqlens_q or cfg.use_sliding_window_causal) and mode == (
-        "gmem_reduction"
-    ):
-        # Runtime Q offsets and sliding-window bounds are compatible with CLC
-        # work discovery, but they deliberately remain nonsplit. Underfilled
-        # grids therefore stay direct while grids above one resident wave use
-        # the same structural persistence rule as fixed-Q decode.
+    if cfg.use_sliding_window_causal and mode == ("gmem_reduction"):
+        # Automatic sliding-window split recipes are not qualified. Query
+        # storage layout alone does not restrict split selection.
         return split_kv_mode
     if mode not in ("gmem_reduction", "persistent"):
         return split_kv_mode
@@ -3960,7 +4015,10 @@ def _validate_profile_support(
             not use_groups_tokens_heads_q and heads_q_per_kv == tile_size_q
         ) or use_groups_tokens_heads_q
         separate_reduction_unstaged_supported = (
-            headdim == 128
+            (
+                headdim == 128
+                or (headdim == 64 and cfg.uses_q_token_kv_block_sparse_page_route)
+            )
             and tile_size_q in (64, 128)
             and effective_head_dim_stage == 0
             and effective_num_insts_kv == 2
@@ -4008,7 +4066,7 @@ def _validate_profile_support(
             raise ValueError(
                 "separate reduction keepsMmaAb profiles require "
                 "the established D128/Q64-Q128, D256/Q128, or "
-                "QToken-KvBlock-Sparse-Attention D256/Q64-KV128 profiles, or a "
+                "QToken-KvBlock-Sparse-Attention D64/D128/D256 Q64/Q128-KV128 profiles, or a "
                 "fixed FP8/page-32 D64/Q64-Q128 or D256/Q64 profile; valid "
                 "reduction dtypes, Q layout, and static split-KV are required"
             )
@@ -4058,7 +4116,7 @@ def _validate_profile_support(
         and (
             tile_size_q in (16, 32)
             or qualified_fp8_q8_separate_reduction_supported
-            # The sparse D256 publisher and standalone reducer both index
+            # The sparse publisher and standalone reducer both index
             # actual logical rows, so a partial TileQ8 is also valid.
             or (tile_size_q == 8 and cfg.uses_q_token_kv_block_sparse_page_route)
         )
@@ -4094,8 +4152,8 @@ def normalize_qkv_layout(qkv_layout: str) -> str:
 
 def validate_page_size(num_tokens_per_page: int) -> None:
     """Validate a paged-KV page size against supported tile shapes."""
-    if num_tokens_per_page not in (4, 16, 32, 64, 128):
-        raise ValueError("num_tokens_per_page must be one of 4, 16, 32, 64, or 128")
+    if num_tokens_per_page not in (4, 8, 16, 32, 64, 128):
+        raise ValueError("num_tokens_per_page must be one of 4, 8, 16, 32, 64, or 128")
     if 128 % num_tokens_per_page != 0:
         raise ValueError("num_tokens_per_page must divide the 128-token KV tile")
 
@@ -4114,10 +4172,6 @@ def validate_storage_page_size(
     if storage_tokens_per_page % num_tokens_per_page != 0:
         raise ValueError(
             "storage_tokens_per_page must be divisible by num_tokens_per_page"
-        )
-    if storage_tokens_per_page != num_tokens_per_page and num_tokens_per_page != 4:
-        raise ValueError(
-            "encoded subpage locators currently require num_tokens_per_page=4"
         )
 
 
@@ -4144,6 +4198,7 @@ def make_decode_config(
     mask_type: str | None = None,
     use_attention_sinks: bool = False,
     auto_tuner: bool = True,
+    split_kv: bool = True,
 ) -> FmhaDecodeConfig:
     """Build the static decode kernel config and apply auto-selection policy.
 
@@ -4173,10 +4228,10 @@ def make_decode_config(
        the smallest qualified Q64/Q128 Keeps tile. Other profile families use
        exact-width ungrouped Keeps or ungrouped Swaps head bands as a fallback.
     3. Shapes outside that qualified Q/launch selector retain the general launch
-       policy: under-filled fixed-Q long-sequence grids use split-KV GMEM
+       policy: under-filled long-sequence grids may use split-KV GMEM
        reduction, direct grids above one resident wave use persistent
-       scheduling, and the rest stay static. Packed-Q and sliding-window grids
-       remain nonsplit but use the same structural persistence boundary. An
+       scheduling, and the rest stay static. Query packing does not disable
+       splits; automatic sliding-window splits remain unqualified. An
        unsupported automatic mode falls back to direct.
     4. If split-KV is selected or requested, compute the split fanout from the
        effective KV length, requested split count, max split cap, SM count, and
@@ -4190,15 +4245,29 @@ def make_decode_config(
 
     Attention-sink paths skip automatic launch-mode selection. Explicit launch
     modes are still validated.
+
+    ``split_kv`` is a common planning control for every FMHA kernel family.
+    True permits supported automatic split recipes; False restricts selection
+    to nonsplit recipes without disabling Q-tile or persistence selection.
+    It is independent of fixed/packed Q. Pass False for prefill and True for
+    decode. Explicit split modes/fanouts conflict with False. The resulting
+    ``cfg.use_split_kv`` describes the selected launch, not this permission.
     """
+    if not isinstance(split_kv, bool):
+        raise TypeError("split_kv must be a bool")
+    if not split_kv and (split_kv_mode != "disabled" or splits_kv > 1):
+        raise ValueError("split_kv=False conflicts with an explicit split mode/fanout")
     shape_values = (seq_len_kv, batch_size, num_heads_q, num_heads_kv)
     if all(value is None for value in shape_values):
-        return _make_static_decode_config(
+        cfg = _make_static_decode_config(
             headdim,
             args,
             mask_type=mask_type,
             sliding_window_causal=sliding_window_causal,
         )
+        if not split_kv and cfg.use_split_kv:
+            raise ValueError("split_kv=False conflicts with use_split_kv=True")
+        return cfg
     if any(value is None for value in shape_values):
         raise ValueError(
             "seq_len_kv, batch_size, num_heads_q, and num_heads_kv are all "
@@ -4208,6 +4277,8 @@ def make_decode_config(
     validate_sliding_window_args(sliding_window_causal, attention_window_size)
     cfg = FmhaDecodeConfig(headdim=headdim)
     explicit_fields = _apply_config_source(cfg, args)
+    if not split_kv and (cfg.use_split_kv or cfg.splits_kv > 1):
+        raise ValueError("split_kv=False conflicts with an explicit split config")
     splits_kv, max_splits_kv = _resolve_explicit_split_controls(
         cfg,
         explicit_fields=explicit_fields,
@@ -4277,6 +4348,7 @@ def make_decode_config(
         num_heads_kv=num_heads_kv,
         splits_kv=splits_kv,
         max_splits_kv=max_splits_kv,
+        split_kv=split_kv,
     )
     if selected_grouped_q_recipe is None:
         selected_wide_keeps = _try_apply_default_wide_keeps_config(
@@ -4333,8 +4405,8 @@ def make_decode_config(
         )
 
     # Auto launch-mode selection. Only kicks in if the caller has not already
-    # opted into a specific mode. Packed-Q and sliding-window shapes may select
-    # CLC persistence, but remain nonsplit.
+    # opted into a specific mode. The caller's split permission is independent
+    # of Q storage; unsupported automatic recipes retain their direct fallback.
     if selected_grouped_q_recipe is not None:
         if selected_grouped_q_recipe.splits_kv > 1:
             split_kv_mode = selected_grouped_q_recipe.split_kv_mode
@@ -4353,6 +4425,7 @@ def make_decode_config(
                 num_heads_kv=num_heads_kv,
                 seq_len_kv=seq_len_kv,
                 seq_len_q=seq_len_q,
+                split_kv=split_kv,
             )
 
     reduction_mode_preconfigured = (
@@ -4363,7 +4436,6 @@ def make_decode_config(
         and launch_mode_was_auto
         and split_kv_mode == "gmem_reduction"
         and not reduction_mode_preconfigured
-        and not cfg.use_variable_seqlens_q
         and not cfg.use_sliding_window_causal
         and not cfg.use_attention_sinks
     )

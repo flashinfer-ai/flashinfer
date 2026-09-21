@@ -38,6 +38,7 @@ from .gated_act_mxfp8 import (
 from .attention import BatchAttention as BatchAttention
 from .attention import (
     BatchAttentionWithAttentionSinkWrapper as BatchAttentionWithAttentionSinkWrapper,
+    BatchPrefillWithCausalBidirectionalRangesWrapper as BatchPrefillWithCausalBidirectionalRangesWrapper,
 )
 from .autotune_cache import MeasurementPolicy as MeasurementPolicy
 from .autotune_cache import autotune_v2 as autotune_v2
@@ -406,3 +407,6 @@ def _log_import_version() -> None:
 
 _log_import_version()
 del _log_import_version
+
+from .kda_prefill import prepare_tf32_kda_prefill as prepare_tf32_kda_prefill
+from .kda_prefill import prepare_bf16_kda_prefill as prepare_bf16_kda_prefill

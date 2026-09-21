@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 """Shared MegaMoE frontend utilities (dist bootstrap, sym heap, compile state).
 
-Ported from ``kernel_src/cutedsl_megamoe/shim/comm.py``: the SM90 drop's
+Ported from ``kernel_src/sm100/cutedsl_megamoe/shim/comm.py``: the SM90 drop's
 ``src.bootstrap`` / ``src.sym_buffer`` are the same runtime (formatting-only
 diffs), so the helpers carry over verbatim.  The ``from src...`` imports below
 resolve against THIS tree's vendored ``src/`` via ``shim._paths``.

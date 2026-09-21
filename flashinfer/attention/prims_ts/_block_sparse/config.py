@@ -84,6 +84,7 @@ class _BlockSparseCompileKey:
     sparse_format: Literal["bsr", "bitmask"] = "bsr"
     use_proxy_routes: bool = False
     page_size: int | None = None
+    share_pattern_across_kv_heads: bool = False
 
 
 @dataclass(frozen=True)
@@ -122,6 +123,7 @@ class _BlockSparseStaticProfile:
     use_kv_valid_bits: bool
     max_blocks_per_row: int | None
     page_size: int | None = None
+    share_pattern_across_kv_heads: bool = False
 
 
 def _select_block_sparse_kv_route_size(
@@ -303,9 +305,12 @@ def _validate_block_sparse_static_profile(
     output_dtype: torch.dtype | None,
     max_blocks_per_row: object = _CAPACITY_UNSET,
     page_size: int | None = None,
+    share_pattern_across_kv_heads: bool = False,
 ) -> _BlockSparseStaticProfile:
     """Validate static policy before any device work or BSR inspection."""
 
+    if not isinstance(share_pattern_across_kv_heads, bool):
+        raise TypeError("share_pattern_across_kv_heads must be a bool")
     batch_size = _validate_positive_int(batch_size, "batch_size")
     seq_len_q = _validate_positive_int(seq_len_q, "seq_len_q")
     seq_len_kv = _validate_positive_int(seq_len_kv, "seq_len_kv")
@@ -391,6 +396,7 @@ def _validate_block_sparse_static_profile(
         use_kv_valid_bits=use_kv_valid_bits,
         max_blocks_per_row=validated_max_blocks_per_row,
         page_size=page_size,
+        share_pattern_across_kv_heads=share_pattern_across_kv_heads,
     )
 
 
@@ -418,6 +424,7 @@ def _make_block_sparse_config(key: _BlockSparseCompileKey) -> "FmhaDecodeConfig"
         "tile_size_kv": key.kv_route_size,
         "groups_tokens_heads_q": True,
         "use_block_sparse": True,
+        "share_pattern_across_kv_heads": key.share_pattern_across_kv_heads,
         "q_block_size": key.q_block_size,
         "kv_block_size": key.kv_block_size,
         "use_kv_valid_bits": key.use_kv_valid_bits,
@@ -447,6 +454,7 @@ def _make_block_sparse_config(key: _BlockSparseCompileKey) -> "FmhaDecodeConfig"
         o_dtype=dtype,
         split_kv_mode="disabled",
         splits_kv=1,
+        split_kv=False,
         mask_type=key.mask_type,
         auto_tuner=False,
         **layout_args,
@@ -472,6 +480,7 @@ def _resolve_block_sparse_launch_spec(
     sparse_format: Literal["bsr", "bitmask"] = "bsr",
     use_proxy_routes: bool = False,
     page_size: int | None = None,
+    share_pattern_across_kv_heads: bool = False,
 ) -> _BlockSparseLaunchSpec:
     """Resolve and cache one validated static or CLC launch.
 
@@ -519,6 +528,7 @@ def _resolve_block_sparse_launch_spec(
         sparse_format=sparse_format,
         use_proxy_routes=use_proxy_routes,
         page_size=page_size,
+        share_pattern_across_kv_heads=share_pattern_across_kv_heads,
     )
     try:
         config = _make_block_sparse_config(compile_key)
