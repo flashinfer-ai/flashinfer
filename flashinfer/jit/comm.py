@@ -448,8 +448,7 @@ def gen_dcp_lse_reduce_module() -> JitSpec:
             (
                 path
                 for path in nccl_lib_candidates
-                if (path / "libnccl.so").exists()
-                or any(path.glob("libnccl.so.*"))
+                if (path / "libnccl.so").exists() or any(path.glob("libnccl.so.*"))
             ),
             nccl_home_path / "lib",
         )
