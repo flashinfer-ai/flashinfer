@@ -24,6 +24,7 @@ PrefillLaunchResult dispatch_prefill(const execution::AttentionParams& p,
                          p.topk_length,       p.extra_topk_length,
                          p.extra_kv,          p.extra_indices,
                          m.extra_page_size,   m.page_size};
+  cold.lse_scale = p.lse_scale;
   if (cache_format_info(mt).inline_scale) cold.kv_stride_bytes = m.row_stride_bytes;
   if (mt == ModelType::DSV4 || mt == ModelType::DOTS3_SWA) {
     cold.main_div = flashinfer::uint_fastdiv(uint32_t(m.page_size));

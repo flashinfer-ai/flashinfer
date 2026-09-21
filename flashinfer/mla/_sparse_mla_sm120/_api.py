@@ -580,6 +580,7 @@ def get_sparse_mla_sm120_module():
         mid_out: Optional[torch.Tensor],
         mid_lse: Optional[torch.Tensor],
         extra_fp4: bool = False,
+        lse_scale: float = 1.0,
     ) -> None:
         num_tokens = q.shape[0]
         _require_d_v(d_v, model_type)
@@ -609,6 +610,7 @@ def get_sparse_mla_sm120_module():
             mid_out,
             mid_lse,
             extra_fp4,
+            lse_scale=lse_scale,
         )
 
     @register_fake_op("flashinfer::sparse_mla_sm120_paged_attention")
@@ -642,6 +644,7 @@ def _sparse_mla_sm120_paged_attention(
     mid_lse: Optional[torch.Tensor] = None,
     prefill_impl: Optional[str] = None,
     extra_fp4: bool = False,
+    lse_scale: float = 1.0,
 ) -> None:
     r"""Internal Sparse-MLA paged attention on SM120.
 
@@ -747,6 +750,10 @@ def _sparse_mla_sm120_paged_attention(
         always raises. Pitch and page-gap restrictions are checked only when
         prefill is selected; legal decode calls keep their runtime layouts.
 
+    lse_scale : float
+        Multiplier on final base-2 LSE only. Defaults to 1.0; use
+        ``math.log(2)`` for base-e. Empty-row sentinels are unchanged.
+
     Notes
     -----
     Requires SM120a / SM121a (block-scaled MXFP8 MMA + cp.async.bulk TMA).
@@ -783,6 +790,7 @@ def _sparse_mla_sm120_paged_attention(
         mid_out,
         mid_lse,
         extra_fp4,
+        lse_scale,
     )
 
 
@@ -957,8 +965,13 @@ class _SparseMLAPagedAttentionRunner:
         mid_lse: Optional[torch.Tensor] = None,
         prefill_impl: Optional[str] = None,
         return_lse: bool = False,
+        lse_scale: float = 1.0,
     ) -> Optional[torch.Tensor]:
         """Run sparse-MLA paged attention.
+
+        ``lse_scale`` multiplies final base-2 LSE values: 1.0 preserves
+        base-2 and ``math.log(2)`` selects base-e. Split-K scratch remains
+        base-2; attention output and empty-row sentinels are unchanged.
 
         Mutates ``output`` and an LSE buffer in place. When ``out_lse`` is
         passed, that buffer is used; otherwise the wrapper uses an internal
@@ -966,12 +979,12 @@ class _SparseMLAPagedAttentionRunner:
         LSE buffer sized to the actual ``num_tokens``; otherwise returns
         ``None``.
 
-        Final LSE uses base 2. If lengths and indices leave no valid KV in
-        either cache for a query head, its output is zero and its LSE is
+        Final LSE uses base 2 by default. If lengths and indices leave no
+        valid KV in either cache for a query head, its output is zero and its LSE is
         ``-inf`` when no sink contributes. A finite ``attn_sink`` contributes
         denominator mass: an empty KV row still has zero output, with LSE
-        ``attn_sink * log2(e)``. This final-output contract does not apply to
-        internal split-K scratch sentinels.
+        ``attn_sink * log2(e) * lse_scale``. This final-output contract does
+        not apply to internal split-K scratch sentinels.
 
         Accepts ``q``/``output`` either as 3-D ``[num_tokens, num_heads, head_dim]``
         or as 4-D ``[num_tokens, 1, num_heads, head_dim]`` (some callers carry
@@ -1011,6 +1024,7 @@ class _SparseMLAPagedAttentionRunner:
             mid_lse=mid_lse,
             prefill_impl=prefill_impl,
             return_lse=return_lse,
+            lse_scale=lse_scale,
         )
 
 
@@ -1068,6 +1082,7 @@ def sparse_mla_sm120_decode_dsv3_2(
     attn_sink: Optional[torch.Tensor] = None,
     model_type: int = _MODEL_TYPE_DSV3_2,
     chunks_per_block: Optional[int] = None,
+    lse_scale: float = 1.0,
 ) -> torch.Tensor:
     """Sparse-MLA paged decode (DSv3.2 / GLM-NSA kernel) on SM120.
 
@@ -1119,6 +1134,7 @@ def sparse_mla_sm120_decode_dsv3_2(
             mid_lse,
             False,
             decode_only=True,
+            lse_scale=lse_scale,
         )
         return output
 
@@ -1136,6 +1152,7 @@ def sparse_mla_sm120_decode_dsv3_2(
         attn_sink,
         int(model_type),
         cpb_override,
+        lse_scale,
     )
     return output
 
@@ -1159,6 +1176,7 @@ def sparse_mla_sm120_decode_dsv4(
     chunks_per_block: Optional[int] = None,
     model_type: Optional[int] = None,
     extra_fp4: bool = False,
+    lse_scale: float = 1.0,
 ) -> torch.Tensor:
     r"""Sparse-MLA paged decode (DSv4 standalone kernel) on SM120.
 
@@ -1270,6 +1288,7 @@ def sparse_mla_sm120_decode_dsv4(
             mid_lse,
             extra_fp4,
             decode_only=True,
+            lse_scale=lse_scale,
         )
         return output
 
@@ -1291,6 +1310,7 @@ def sparse_mla_sm120_decode_dsv4(
         model_type,
         cpb_override,
         extra_fp4,
+        lse_scale,
     )
     return output
 
