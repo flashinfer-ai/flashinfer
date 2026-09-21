@@ -359,7 +359,7 @@ def test_cake_fmha_decode_native_bf16_exact_sink_grid_matches_selector(
     )
     assert launch_override["grid"] == ["Q_LEN", "NUM_KV_HEADS", "BATCH_SIZE"]
     assert launch_override["use_pdl"] is True
-    assert len(cake_jit._FLASHINFER_BINDINGS) == 12
+    assert len(cake_jit._FLASHINFER_BINDINGS) == 13
     assert sink_binding not in cake_jit._FLASHINFER_BINDINGS
     assert (
         cake_jit._sha256(get_cake_fmha_csrc_dir() / sink_binding)
