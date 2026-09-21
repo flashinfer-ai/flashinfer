@@ -168,9 +168,11 @@ __device__ __forceinline__ uint32_t philox_randint(int64_t seed, int64_t offset)
 // ~12-instruction software emulation there — measured +99% SR cost at b1024 vs
 // +24% on B200 (2026-07-13).  sm_110a / sm_120a lack `.rs` (ptxas errors) → they
 // correctly fall to the software path below.  Extend the list only after
-// confirming `cvt.rs.f16x2.f32` assembles for the new arch.
+// confirming `cvt.rs.f16x2.f32` assembles for the new arch.  sm_107a: verified with
+// the CUDA 13.4 ptxas (sm_110a/sm_120a still reject `.rs`).
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000 && \
-    (defined(__CUDA_ARCH_FEAT_SM100_ALL) || defined(__CUDA_ARCH_FEAT_SM103_ALL))
+    (defined(__CUDA_ARCH_FEAT_SM100_ALL) || defined(__CUDA_ARCH_FEAT_SM103_ALL) || \
+     defined(__CUDA_ARCH_FEAT_SM107_ALL))
 #define FLASHINFER_MAMBA_HAS_CVT_RS 1
 #else
 #define FLASHINFER_MAMBA_HAS_CVT_RS 0
