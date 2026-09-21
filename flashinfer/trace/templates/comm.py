@@ -14,6 +14,8 @@
 
 """TraceTemplates for distributed communication ops."""
 
+from typing import Any, cast
+
 import torch
 
 from ..template import Const, Scalar, Tensor, TraceTemplate, Var
@@ -359,4 +361,625 @@ pcie_ipc_all_reduce_trace = TraceTemplate(
     tags=["status:verified", "stage:comm"],
     reference=_pcie_ipc_all_reduce_reference,
     init=_pcie_ipc_all_reduce_init,
+)
+
+
+# ── Ulysses packed chunk exchange ──────────────────────────────────────────
+
+
+@torch.no_grad()
+def _ulysses_single_rank_reference(
+    x: torch.Tensor, out: torch.Tensor = None, **_unused
+) -> torch.Tensor:
+    """Single-rank reference; multi-rank permutation is tested under tests/comm."""
+    result = x.clone()
+    if out is not None:
+        out.copy_(result)
+        return out
+    return result
+
+
+class _UlyssesSingleRankTraceTemplate(TraceTemplate):
+    """Read the real group size so trace-apply cannot route multi-rank calls here."""
+
+    def _build_axis_extractors(self):
+        extractors = super()._build_axis_extractors()
+
+        def extract_world_size(kwargs):
+            communicator = kwargs.get("self")
+            world_size = getattr(communicator, "world_size", None)
+            return None if world_size is None else int(world_size)
+
+        extractors["world_size"] = extract_world_size
+        return extractors
+
+
+_ulysses_exchange_chunks_template = _UlyssesSingleRankTraceTemplate(
+    op_type="comm",
+    name_prefix="ulysses_exchange_chunks",
+    description=(
+        "Equal-length chunk all-to-all over an already-packed payload: chunk "
+        "r goes to peer r and lands in slot rank there. No element conversion "
+        "or layout permutation is performed. The reference models the "
+        "world_size=1 identity; multi-rank correctness is tested under tests/comm/."
+    ),
+    axes={
+        "batch_size": Const(abbrev="", description="Pinned to 1."),
+        "seq_len": Const(abbrev="", description="Pinned to 1."),
+        "chunk_count": Const(abbrev="", description="One contiguous chunk per peer."),
+        "world_size": Const(
+            value=1,
+            abbrev="ws",
+            description="fi_trace models the single-rank identity case only.",
+        ),
+        "chunk": Const(abbrev="c", description="Elements in one peer's chunk."),
+    },
+    inputs={
+        "x": Tensor(["batch_size", "seq_len", "chunk_count", "chunk"]),
+    },
+    outputs={
+        "output": Tensor(
+            ["batch_size", "seq_len", "chunk_count", "chunk"],
+            dtype_from="x",
+            param="out",
+        )
+    },
+    constraints=[
+        "batch_size == 1",
+        "seq_len == 1",
+        "world_size == 1",
+        "chunk_count == world_size",
+        "chunk > 0",
+    ],
+    tags=["stage:comm"],
+    reference=_ulysses_single_rank_reference,
+)
+
+
+def ulysses_exchange_chunks_trace(**kwargs):
+    """Trace only the identity case; multi-rank collectives need all peer inputs."""
+    communicator = kwargs.get("self")
+    return (
+        _ulysses_exchange_chunks_template
+        if getattr(communicator, "world_size", None) == 1
+        else None
+    )
+
+
+ulysses_exchange_chunks_trace.templates = (  # type: ignore[attr-defined]
+    _ulysses_exchange_chunks_template,
+)
+
+
+# ── Low-precision Ulysses A2A (flashinfer.comm._ulysses_lowp) ────────────────
+#
+# Quantization primitives around the sequence->head all-to-all of Ulysses
+# attention: INT8 Q/K on SageAttention2's global 32/64-token grids, FP8 V per
+# channel, packed into a destination-major uint8 payload (ABI v3), and the
+# receiver-side unpack into the pre-quantized operands SageAttention consumes.
+# Shapes below use the MiniMax-H3 deployment as defaults (56 heads, D=128,
+# Ulysses P=8, shard L=4736 = 37 x 128).
+
+
+def _ulysses_lowp_amax_check(
+    reference_outputs,
+    actual_outputs,
+    *,
+    rtol=None,
+    atol=None,
+    max_mismatch_pct=0.0,
+    min_cos_sim=None,
+):
+    from flashinfer.trace import default_check
+
+    # Reductions over bf16/fp16 values converted to fp32: only the fp32
+    # summation order differs from torch, so the tolerance is a few ULPs of the
+    # channel sums (tests/comm/test_ulysses_lowp.py uses the same oracle).
+    rtol = 1e-3 if rtol is None else rtol
+    atol = 1e-2 if atol is None else atol
+    return default_check(
+        reference_outputs,
+        actual_outputs,
+        rtol=rtol,
+        atol=atol,
+        max_mismatch_pct=max_mismatch_pct,
+        min_cos_sim=min_cos_sim,
+    )
+
+
+@torch.no_grad()
+def _ulysses_lowp_k_sum_v_amax_reference(k, v, **_unused):
+    """Per-(batch, head, channel) fp32 K sum and V |max| over the local shard."""
+    return k.float().sum(dim=1), v.float().abs().amax(dim=1)
+
+
+def _ulysses_lowp_k_sum_v_amax_init(
+    *,
+    batch: int = 1,
+    local_sequence: int = 4736,
+    num_heads: int = 56,
+    head_dim: int = 128,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.comm._ulysses_lowp.k_sum_v_amax`` (one
+    MiniMax-H3 Ulysses shard at P=8)."""
+    torch.manual_seed(seed)
+    k = torch.randn(
+        batch, local_sequence, num_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
+    return {"k": k, "v": torch.randn_like(k)}
+
+
+ulysses_lowp_k_sum_v_amax_trace = TraceTemplate(
+    op_type="comm",
+    name_prefix="ulysses_lowp_k_sum_v_amax",
+    description=(
+        "Local statistics for low-precision Ulysses A2A: per-channel K sum and "
+        "V absolute maximum over this rank's sequence shard (two-stage, "
+        "deterministic fp32 reduction). The caller AllGathers them to form "
+        "the global K mean and V scale."
+    ),
+    axes={
+        "batch": Var(),
+        "local_sequence": Var(description="Tokens on this rank's shard."),
+        "num_heads": Const(abbrev="h"),
+        "head_dim": Const(abbrev="d", description="Head dimension, 64 or 128."),
+    },
+    inputs={
+        "k": Tensor(["batch", "local_sequence", "num_heads", "head_dim"]),
+        "v": Tensor(["batch", "local_sequence", "num_heads", "head_dim"]),
+    },
+    outputs={
+        "k_sum": Tensor(["batch", "num_heads", "head_dim"], dtype="float32"),
+        "v_amax": Tensor(["batch", "num_heads", "head_dim"], dtype="float32"),
+    },
+    constraints=["head_dim in [64, 128]"],
+    tags=["status:verified", "stage:comm"],
+    reference=_ulysses_lowp_k_sum_v_amax_reference,
+    check=_ulysses_lowp_amax_check,
+    init=_ulysses_lowp_k_sum_v_amax_init,
+)
+
+
+def _ulysses_lowp_grouped_amax_reference(x, group, rank, world_size, mean=None):
+    """Global-grid grouped |x| (or |x - mean|) amax of this rank's shard: slot
+    s holds global group ``group_first + s``, floored at 1e-7; untouched slots
+    of the ``slots(L, group)`` allocation stay zero."""
+    batch, local_sequence, num_heads, _ = x.shape
+    slots = (local_sequence + 2 * group - 2) // group
+    group_first = (rank * local_sequence) // group
+    group_last = (rank * local_sequence + local_sequence - 1) // group
+    xf = x.float()
+    if mean is not None:
+        xf = xf - mean.float().unsqueeze(1)
+    out = torch.zeros(batch, num_heads, slots, dtype=torch.float32, device=x.device)
+    for slot, g in enumerate(range(group_first, group_last + 1)):
+        lo = max(g * group, rank * local_sequence) - rank * local_sequence
+        hi = min((g + 1) * group, (rank + 1) * local_sequence) - rank * local_sequence
+        out[:, :, slot] = xf[:, lo:hi].abs().amax(dim=(1, 3)).clamp_(min=1e-7)
+    return out
+
+
+@torch.no_grad()
+def _ulysses_lowp_q_grouped_amax_reference(q, rank, world_size, **_unused):
+    return _ulysses_lowp_grouped_amax_reference(q, 32, rank, world_size)
+
+
+# The rendered reference source must be self-contained (see
+# _render_reference_source): declare the shared helper as a dependency.
+cast(Any, _ulysses_lowp_q_grouped_amax_reference)._trace_reference_dependencies = (
+    _ulysses_lowp_grouped_amax_reference,
+)
+
+
+def _ulysses_lowp_q_grouped_amax_init(
+    *,
+    batch: int = 1,
+    local_sequence: int = 4736,
+    q_slots: int = 0,  # derived
+    num_heads: int = 56,
+    head_dim: int = 128,
+    rank: int = 0,
+    world_size: int = 8,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    del q_slots  # derived from local_sequence: slots(L, 32)
+    torch.manual_seed(seed)
+    q = torch.randn(
+        batch, local_sequence, num_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
+    return {"q": q, "rank": int(rank), "world_size": int(world_size)}
+
+
+ulysses_lowp_q_grouped_amax_trace = TraceTemplate(
+    op_type="comm",
+    name_prefix="ulysses_lowp_q_grouped_amax",
+    description=(
+        "Per-32-token-group |Q| amax on the GLOBAL sequence grid for this "
+        "rank's shard (SageAttention2 per-warp Q scale); slot s is global "
+        "group group_first(rank)+s."
+    ),
+    axes={
+        "batch": Var(),
+        "local_sequence": Var(),
+        "q_slots": Var(description="slots(local_sequence, 32) allocation."),
+        "num_heads": Const(abbrev="h"),
+        "head_dim": Const(abbrev="d", description="Head dimension, 64 or 128."),
+        "world_size": Const(abbrev="p", description="Ulysses group size."),
+    },
+    inputs={
+        "q": Tensor(["batch", "local_sequence", "num_heads", "head_dim"]),
+        "rank": Scalar("int32"),
+        "world_size": Scalar("int32"),
+    },
+    outputs={
+        "amax": Tensor(["batch", "num_heads", "q_slots"], dtype="float32"),
+    },
+    constraints=["head_dim in [64, 128]", "q_slots == (local_sequence + 62) // 32"],
+    tags=["status:verified", "stage:comm"],
+    reference=_ulysses_lowp_q_grouped_amax_reference,
+    check=_ulysses_lowp_amax_check,
+    init=_ulysses_lowp_q_grouped_amax_init,
+)
+
+
+@torch.no_grad()
+def _ulysses_lowp_k_grouped_amax_reference(
+    k, k_mean_global, rank, world_size, used_sequence=None, **_unused
+):
+    """Grouped |K - k_mean| amax with the API's live-prefix repair: when the
+    packed sequence carries a zero tail in rows ``[used_sequence, S)``, the ONE
+    64-token group mixing live and padded rows is reduced over its live rows
+    only (a zero row would contribute |0 - k_mean|); fully padded groups keep
+    the plain value and are never consumed."""
+    out = _ulysses_lowp_grouped_amax_reference(
+        k, 64, rank, world_size, mean=k_mean_global
+    )
+    local_sequence = k.shape[1]
+    global_sequence = local_sequence * world_size
+    if (
+        used_sequence is None
+        or used_sequence >= global_sequence
+        or used_sequence % 64 == 0
+    ):
+        return out
+    tail_group = (used_sequence - 1) // 64
+    group_first = (rank * local_sequence) // 64
+    group_last = (rank * local_sequence + local_sequence - 1) // 64
+    if not group_first <= tail_group <= group_last:
+        return out
+    lo = max(tail_group * 64, rank * local_sequence) - rank * local_sequence
+    hi = min(used_sequence, (rank + 1) * local_sequence) - rank * local_sequence
+    if hi > lo:
+        kc = k[:, lo:hi].float() - k_mean_global.float().unsqueeze(1)
+        out[:, :, tail_group - group_first] = kc.abs().amax(dim=(1, 3)).clamp_(min=1e-7)
+    else:
+        out[:, :, tail_group - group_first] = 1e-7
+    return out
+
+
+cast(Any, _ulysses_lowp_k_grouped_amax_reference)._trace_reference_dependencies = (
+    _ulysses_lowp_grouped_amax_reference,
+)
+
+
+def _ulysses_lowp_k_grouped_amax_init(
+    *,
+    batch: int = 1,
+    local_sequence: int = 4736,
+    k_slots: int = 0,  # derived
+    num_heads: int = 56,
+    head_dim: int = 128,
+    rank: int = 0,
+    world_size: int = 8,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    del k_slots  # derived from local_sequence: slots(L, 64)
+    torch.manual_seed(seed)
+    k = torch.randn(
+        batch, local_sequence, num_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
+    k_mean_global = k.float().mean(dim=1).to(k.dtype).contiguous()
+    return {
+        "k": k,
+        "k_mean_global": k_mean_global,
+        "rank": int(rank),
+        "world_size": int(world_size),
+    }
+
+
+ulysses_lowp_k_grouped_amax_trace = TraceTemplate(
+    op_type="comm",
+    name_prefix="ulysses_lowp_k_grouped_amax",
+    description=(
+        "Per-64-token-group |K - k_mean| amax on the GLOBAL sequence grid for "
+        "this rank's shard (SageAttention2 smooth-K per-block scale). "
+        "``used_sequence`` repairs the one group that mixes live and "
+        "zero-padded rows."
+    ),
+    axes={
+        "batch": Var(),
+        "local_sequence": Var(),
+        "k_slots": Var(description="slots(local_sequence, 64) allocation."),
+        "num_heads": Const(abbrev="h"),
+        "head_dim": Const(abbrev="d", description="Head dimension, 64 or 128."),
+        "world_size": Const(abbrev="p", description="Ulysses group size."),
+    },
+    inputs={
+        "k": Tensor(["batch", "local_sequence", "num_heads", "head_dim"]),
+        "k_mean_global": Tensor(
+            ["batch", "num_heads", "head_dim"],
+            description="Global K channel mean in K's dtype.",
+        ),
+        "rank": Scalar("int32"),
+        "world_size": Scalar("int32"),
+        "used_sequence": Scalar("int32", optional=True),
+    },
+    outputs={
+        "amax": Tensor(["batch", "num_heads", "k_slots"], dtype="float32"),
+    },
+    constraints=["head_dim in [64, 128]", "k_slots == (local_sequence + 126) // 64"],
+    tags=["status:verified", "stage:comm"],
+    reference=_ulysses_lowp_k_grouped_amax_reference,
+    check=_ulysses_lowp_amax_check,
+    init=_ulysses_lowp_k_grouped_amax_init,
+)
+
+
+ulysses_lowp_quant_qkv_pack_trace = TraceTemplate(
+    op_type="comm",
+    name_prefix="ulysses_lowp_quant_qkv_pack",
+    description=(
+        "Split-path quantize+pack of one Ulysses shard with externally "
+        "finalized per-group Q/K amax (stats protocol 2: groups may straddle "
+        "ranks and were max-merged / derived across the group). Byte contract validated in "
+        "tests/comm/test_ulysses_lowp.py."
+    ),
+    axes={
+        "batch": Var(),
+        "local_sequence": Var(),
+        "q_slots": Var(),
+        "k_slots": Var(),
+        "chunk_bytes": Var(),
+        "num_heads": Const(abbrev="h"),
+        "head_dim": Const(abbrev="d", description="Head dimension, 64 or 128."),
+        "world_size": Const(abbrev="p", description="Ulysses group size."),
+    },
+    inputs={
+        "q": Tensor(["batch", "local_sequence", "num_heads", "head_dim"]),
+        "k": Tensor(["batch", "local_sequence", "num_heads", "head_dim"]),
+        "v": Tensor(["batch", "local_sequence", "num_heads", "head_dim"]),
+        "k_mean_global": Tensor(["batch", "num_heads", "head_dim"]),
+        "q_amax_final": Tensor(["batch", "num_heads", "q_slots"]),
+        "k_amax_final": Tensor(["batch", "num_heads", "k_slots"]),
+        "v_scale_global": Tensor(["batch", "num_heads", "head_dim"]),
+        "rank": Scalar("int32"),
+        "world_size": Scalar("int32"),
+    },
+    outputs={
+        "payload": Tensor(["world_size", "chunk_bytes"], dtype="uint8"),
+    },
+    constraints=[
+        "head_dim in [64, 128]",
+        "q_slots == (local_sequence + 62) // 32",
+        "k_slots == (local_sequence + 126) // 64",
+        # chunk_bytes = round_up(3*B*L*(H/P)*D + 4*B*(H/P)*(q_slots+k_slots), 128)
+    ],
+    tags=["stage:comm", "quantization:float8_e4m3fn"],
+)
+
+
+ulysses_lowp_unpack_for_sage_trace = TraceTemplate(
+    op_type="comm",
+    name_prefix="ulysses_lowp_unpack_for_sage",
+    description=(
+        "Receiver side of the low-precision Ulysses A2A: rebuild this rank's "
+        "heads over the full logical sequence from the received per-source "
+        "chunks -- INT8 Q/K [B,S,h,D], FP8 V in SageAttention's 16-token "
+        "permuted [B,D,h,padded_S] layout, and the fp32 Q/K group scales at "
+        "the consumer's width. Pure byte movement; validated bit-for-bit in "
+        "tests/comm/test_ulysses_lowp.py."
+    ),
+    axes={
+        "batch_size": Var(),
+        "local_sequence": Var(),
+        "logical_sequence": Var(description="local_sequence * world_size."),
+        "padded_sequence": Var(description="ceil(logical_sequence / 64) * 64."),
+        "q_scale_width": Var(),
+        "k_scale_width": Var(),
+        "chunk_bytes": Var(),
+        "local_heads": Const(abbrev="h", description="Heads this rank attends."),
+        "head_dim": Const(abbrev="d", description="Head dimension, 64 or 128."),
+        "world_size": Const(abbrev="p", description="Ulysses group size."),
+    },
+    inputs={
+        "recv_u8": Tensor(
+            ["world_size", "chunk_bytes"],
+            description="Received payload; row s came from source rank s.",
+        ),
+        "batch_size": Scalar("int32"),
+        "local_sequence": Scalar("int32"),
+        "local_heads": Scalar("int32"),
+        "head_dim": Scalar("int32"),
+        "world_size": Scalar("int32"),
+        "aligned": Scalar("int32", optional=True),
+        "scale_sequence": Scalar("int32", optional=True),
+    },
+    outputs={
+        "q_int8": Tensor(
+            ["batch_size", "logical_sequence", "local_heads", "head_dim"],
+            dtype="int8",
+        ),
+        "k_int8": Tensor(
+            ["batch_size", "logical_sequence", "local_heads", "head_dim"],
+            dtype="int8",
+        ),
+        "v_fp8_packed": Tensor(
+            ["batch_size", "head_dim", "local_heads", "padded_sequence"],
+            dtype="float8_e4m3fn",
+        ),
+        "q_scale": Tensor(
+            ["batch_size", "local_heads", "q_scale_width"], dtype="float32"
+        ),
+        "k_scale": Tensor(
+            ["batch_size", "local_heads", "k_scale_width"], dtype="float32"
+        ),
+    },
+    constraints=[
+        "head_dim in [64, 128]",
+        "logical_sequence == local_sequence * world_size",
+        "padded_sequence == (logical_sequence + 63) // 64 * 64",
+        "q_scale_width % 4 == 0",
+        "0 < q_scale_width <= (logical_sequence + 127) // 128 * 4",
+        "0 < k_scale_width <= (logical_sequence + 63) // 64",
+        "q_scale_width == (k_scale_width + 1) // 2 * 4",
+        # chunk_bytes = round_up(3*B*L*local_heads*D + 4*B*local_heads*(slots(L,32)+slots(L,64)), 128)
+    ],
+    tags=["stage:comm"],
+)
+
+
+class _UlyssesQKVTraceTemplate(TraceTemplate):
+    """Read prepared QKV metadata without preparing or running collectives."""
+
+    def build_fi_trace_fn(self, fi_api):
+        build_definition = super().build_fi_trace_fn(fi_api)
+
+        def fi_trace(save_dir=None, name=None, **kwargs):
+            kwargs = dict(kwargs)
+            workspace = kwargs.get("workspace")
+            if workspace is None:
+                raise ValueError(
+                    "scatter_qkv tracing requires prepared workspace metadata"
+                )
+            kwargs["world_size"] = workspace.world_size
+            kwargs["used_sequence"] = workspace.used_sequence
+            return build_definition(save_dir=save_dir, name=name, **kwargs)
+
+        return fi_trace
+
+
+def _make_ulysses_scatter_qkv_trace(layout):
+    sm90 = layout == "sage2_sm90"
+    q_tile, k_group, v_alignment = (64, 128, 128) if sm90 else (128, 64, 64)
+    return _UlyssesQKVTraceTemplate(
+        op_type="comm",
+        name_prefix=f"ulysses_scatter_qkv_{layout}",
+        description=(
+            "Distributed SageAttention2 QKV preparation: local statistics, one "
+            "FP32 NCCL AllGather, rank-ordered statistics finalization, quantize/pack, "
+            "one uint8 NCCL AllToAll through exchange_chunks, and unpack. "
+            "Requires an existing communicator "
+            "and prepare_qkv workspace on every rank, in the same collective order. "
+            "This schema describes a distributed operation; it has no single-GPU "
+            "reference or automatic process-group/workspace initializer. Returned "
+            "UlyssesQKV fields are listed in tuple order; when out is supplied, its "
+            "six tensors are filled and the same result record is returned. Input "
+            "rows outside the global used_sequence prefix must already be zero."
+        ),
+        axes={
+            "batch": Var(),
+            "local_sequence": Var(),
+            "logical_sequence": Var(),
+            "padded_sequence": Var(),
+            "local_heads": Var(),
+            "q_scale_width": Var(),
+            "k_scale_width": Var(),
+            "num_heads": Const(abbrev="h"),
+            "head_dim": Const(abbrev="d"),
+            "world_size": Const(abbrev="p"),
+            # Identical tensor shapes can carry different valid prefixes.
+            "used_sequence": Const(abbrev="u"),
+        },
+        inputs={
+            "q": Tensor(["batch", "local_sequence", "num_heads", "head_dim"]),
+            "k": Tensor(["batch", "local_sequence", "num_heads", "head_dim"]),
+            "v": Tensor(["batch", "local_sequence", "num_heads", "head_dim"]),
+            "world_size": Scalar(
+                "int32",
+                optional=True,
+                description="Prepared workspace metadata, not a scatter_qkv argument.",
+            ),
+            "used_sequence": Scalar(
+                "int32",
+                optional=True,
+                description="Prepared global live prefix, not a scatter_qkv argument.",
+            ),
+        },
+        outputs={
+            "q": Tensor(
+                ["batch", "logical_sequence", "local_heads", "head_dim"],
+                dtype="int8",
+            ),
+            "k": Tensor(
+                ["batch", "logical_sequence", "local_heads", "head_dim"],
+                dtype="int8",
+            ),
+            "v": Tensor(
+                ["batch", "head_dim", "local_heads", "padded_sequence"],
+                dtype="float8_e4m3fn",
+                description=f"SageAttention2 packed V layout: {layout}.",
+            ),
+            "q_scale": Tensor(
+                ["batch", "local_heads", "q_scale_width"], dtype="float32"
+            ),
+            "k_scale": Tensor(
+                ["batch", "local_heads", "k_scale_width"], dtype="float32"
+            ),
+            "v_scale": Tensor(["batch", "local_heads", "head_dim"], dtype="float32"),
+            "layout": Scalar("string", description=f"Always {layout!r}."),
+            "logical_sequence": Scalar(
+                "int32", description="world_size * local_sequence."
+            ),
+            "used_sequence": Scalar(
+                "int32", description="Prepared global live prefix."
+            ),
+            "input_dtype": Scalar("dtype", description="Original Q/K/V dtype."),
+        },
+        constraints=[
+            "batch > 0",
+            "local_sequence > 0",
+            "num_heads > 0",
+            "head_dim in [64, 128]",
+            "world_size in [2, 4, 8]",
+            "num_heads % world_size == 0",
+            "local_heads == num_heads // world_size",
+            "logical_sequence == world_size * local_sequence",
+            "0 < used_sequence <= logical_sequence",
+            f"padded_sequence == (logical_sequence + {v_alignment - 1}) // {v_alignment} * {v_alignment}",
+            f"q_scale_width == (used_sequence + {q_tile - 1}) // {q_tile} * 4",
+            f"k_scale_width == (used_sequence + {k_group - 1}) // {k_group}",
+        ],
+        tags=[
+            "stage:comm",
+            "distributed:multi-rank",
+            "transport:nccl",
+            "quantization:sage2",
+            f"layout:{layout}",
+        ],
+    )
+
+
+ulysses_scatter_qkv_sm90_trace = _make_ulysses_scatter_qkv_trace("sage2_sm90")
+ulysses_scatter_qkv_sm120_trace = _make_ulysses_scatter_qkv_trace("sage2_sm89_sm120")
+
+
+def ulysses_scatter_qkv_trace_dispatch(save_dir=None, name=None, **kwargs):
+    """Select by prepared layout; never inspect a GPU or create a process group."""
+    workspace = kwargs.get("workspace")
+    if workspace is None:
+        raise ValueError("scatter_qkv tracing requires prepared workspace metadata")
+    if workspace.layout == "sage2_sm90":
+        return ulysses_scatter_qkv_sm90_trace
+    if workspace.layout == "sage2_sm89_sm120":
+        return ulysses_scatter_qkv_sm120_trace
+    raise ValueError(f"Unsupported Ulysses QKV trace layout: {workspace.layout!r}")
+
+
+ulysses_scatter_qkv_trace_dispatch.templates = (  # type: ignore[attr-defined]
+    ulysses_scatter_qkv_sm90_trace,
+    ulysses_scatter_qkv_sm120_trace,
 )

@@ -13,6 +13,21 @@ The output directory is controlled by FLASHINFER_TRACE_DUMP_DIR.
 Requires a CUDA-capable GPU.
 
 Results:
+- ulysses_exchange_chunks_ws1_c256.json
+- ulysses_lowp_k_sum_v_amax_h8_d64.json
+- ulysses_lowp_q_grouped_amax_h8_d64_p8.json
+- ulysses_lowp_k_grouped_amax_h8_d64_p8.json
+- ulysses_lowp_quant_qkv_pack_h8_d64_p8.json
+- ulysses_lowp_unpack_for_sage_h1_d64_p8.json
+- ulysses_lowp_k_sum_v_amax_h8_d128.json
+- ulysses_lowp_q_grouped_amax_h8_d128_p8.json
+- ulysses_lowp_k_grouped_amax_h8_d128_p8.json
+- ulysses_lowp_quant_qkv_pack_h8_d128_p8.json
+- ulysses_lowp_unpack_for_sage_h1_d128_p8.json
+- ulysses_scatter_qkv_sage2_sm90_h8_d64_p8_u513.json
+- ulysses_scatter_qkv_sage2_sm90_h8_d128_p8_u513.json
+- ulysses_scatter_qkv_sage2_sm89_sm120_h8_d64_p8_u513.json
+- ulysses_scatter_qkv_sage2_sm89_sm120_h8_d128_p8_u513.json
 - We would get these example json files under fi_trace_out directory:
 alphamoe_fused_router_e512_k8_bm16_shared0.json
 bmm_mxfp8_N128_K128.json
@@ -2701,3 +2716,99 @@ with contextlib.suppress(Exception):
             _fp4_in["seq_lens"],
             _fp4_in["max_seq_len"],
         )
+
+
+# Ulysses trace schemas can be generated on CPU, independently of kernel support.
+def dump_ulysses_exchange_chunks_trace(save_dir):
+    from types import SimpleNamespace
+
+    from flashinfer.comm import UlyssesCommunicator
+
+    # A schema-only single-rank reference. No communicator construction or
+    # collective is needed; real multi-rank payloads are tested in tests/comm/.
+    definition = UlyssesCommunicator.exchange_chunks.fi_trace(
+        self=SimpleNamespace(world_size=1),
+        x=torch.empty(1, 1, 1, 256, dtype=torch.uint8),
+        dtype=torch.uint8,
+    )
+    path = save_dir / f"{definition['name']}.json"
+    path.write_text(json.dumps(definition, indent=2) + "\n")
+
+
+dump_ulysses_exchange_chunks_trace(SAVE_DIR)
+
+
+def dump_ulysses_lowp_traces(save_dir):
+    from flashinfer.comm import _ulysses_lowp as lowp
+
+    for head_dim in (64, 128):
+        q = torch.empty(1, 65, 8, head_dim, dtype=torch.bfloat16)
+        mean = torch.empty(1, 8, head_dim, dtype=q.dtype)
+        qs = torch.empty(1, 8, 3, dtype=torch.float32)
+        ks = torch.empty(1, 8, 2, dtype=torch.float32)
+        spec = lowp.payload_spec(
+            batch_size=1,
+            local_sequence=65,
+            num_heads=8,
+            head_dim=head_dim,
+            world_size=8,
+        )
+        calls = (
+            (lowp.k_sum_v_amax, dict(k=q, v=q)),
+            (lowp.q_grouped_amax, dict(q=q, rank=0, world_size=8)),
+            (lowp.k_grouped_amax, dict(k=q, k_mean_global=mean, rank=0, world_size=8)),
+            (
+                lowp.quant_qkv_pack,
+                dict(
+                    q=q,
+                    k=q,
+                    v=q,
+                    k_mean_global=mean,
+                    q_amax_final=qs,
+                    k_amax_final=ks,
+                    v_scale_global=mean.float(),
+                    rank=0,
+                    world_size=8,
+                ),
+            ),
+            (
+                lowp.unpack_for_sage,
+                dict(
+                    recv_u8=torch.empty(8, spec["chunk_bytes"], dtype=torch.uint8),
+                    batch_size=1,
+                    local_sequence=65,
+                    local_heads=1,
+                    head_dim=head_dim,
+                    world_size=8,
+                ),
+            ),
+        )
+        for fn, kwargs in calls:
+            definition = fn.fi_trace(**kwargs)
+            path = save_dir / f"{definition['name']}.json"
+            path.write_text(json.dumps(definition, indent=2) + "\n")
+
+
+dump_ulysses_lowp_traces(SAVE_DIR)
+
+
+def dump_ulysses_qkv_traces(save_dir):
+    from types import SimpleNamespace
+
+    from flashinfer.comm import UlyssesCommunicator
+
+    # Schema generation only. Real execution obtains this metadata from
+    # comm.prepare_qkv(), called collectively by all ranks before inference.
+    # Do not create a communicator or launch collectives in this example.
+    for layout in ("sage2_sm90", "sage2_sm89_sm120"):
+        metadata = SimpleNamespace(layout=layout, world_size=8, used_sequence=513)
+        for head_dim in (64, 128):
+            q = torch.empty(1, 65, 8, head_dim, dtype=torch.bfloat16)
+            definition = UlyssesCommunicator.scatter_qkv.fi_trace(
+                q=q, k=q, v=q, workspace=metadata
+            )
+            path = save_dir / f"{definition['name']}.json"
+            path.write_text(json.dumps(definition, indent=2) + "\n")
+
+
+dump_ulysses_qkv_traces(SAVE_DIR)

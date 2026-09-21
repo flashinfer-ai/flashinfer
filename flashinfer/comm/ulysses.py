@@ -20,10 +20,12 @@ limitations under the License.
 
 import contextlib
 import ctypes
+import dataclasses
 import functools
+import math
 import re
 from types import SimpleNamespace
-from typing import Any, List, Optional, Tuple, Union
+from typing import Any, List, NamedTuple, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -31,6 +33,10 @@ from torch.distributed import ProcessGroup
 
 from ..api_logging import flashinfer_api
 from ..jit.comm import gen_ulysses_a2a_module
+from ..trace.templates.comm import (
+    ulysses_exchange_chunks_trace,
+    ulysses_scatter_qkv_trace_dispatch,
+)
 from ..utils import register_custom_op
 from .ulysses_topology import (
     SUPPORTED_WORLD_SIZES,
@@ -40,6 +46,8 @@ from .ulysses_topology import (
 
 _INT32_MAX = 2**31 - 1
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+_CHUNK_DTYPES = (*_SUPPORTED_DTYPES, torch.uint8)
+_MAX_CAPACITY_BYTES = _INT32_MAX * max(dtype.itemsize for dtype in _SUPPORTED_DTYPES)
 
 # communicator lifecycle states; CLOSED is only reached after a fully
 # successful teardown so a failed close() can be retried
@@ -60,6 +68,21 @@ def _storage_ranges_overlap(left: torch.Tensor, right: torch.Tensor) -> bool:
         return tensor.data_ptr() + (max_element_offset + 1) * tensor.element_size()
 
     return left.data_ptr() < storage_end(right) and right.data_ptr() < storage_end(left)
+
+
+def _qkv_byte_range(tensor: torch.Tensor) -> Tuple[int, int]:
+    """Byte extent of a validated tensor on the QKV communicator's device."""
+    numel = tensor.numel()
+    if numel == 0:
+        return (0, 0)
+    start = tensor.data_ptr()
+    if tensor.is_contiguous():
+        return start, start + numel * tensor.element_size()
+    max_element_offset = sum(
+        (size - 1) * stride
+        for size, stride in zip(tensor.shape, tensor.stride(), strict=True)
+    )
+    return start, start + (max_element_offset + 1) * tensor.element_size()
 
 
 class UlyssesWorkspace:
@@ -137,6 +160,148 @@ class UlyssesWorkspace:
         return self._recv_buffer
 
 
+class UlyssesQKV(NamedTuple):
+    """Pre-quantized SageAttention2 operands returned by ``scatter_qkv``.
+
+    ``q`` and ``k`` are contiguous INT8 ``[B, S, H/P, D]`` tensors. ``v``
+    is FP8 E4M3 ``[B, D, H/P, S_pad]`` in the consumer's permuted layout.
+    Q/K scales are FP32 ``[B, H/P, width]``; V scales are FP32
+    ``[B, H/P, D]``. Scale widths use ``used_sequence``, whereas Q/K/V
+    storage covers ``logical_sequence``. ``layout`` identifies the Sage
+    consumer: ``"sage2_sm90"`` or ``"sage2_sm89_sm120"``.
+
+    The record is immutable, but its six tensors may be overwritten by an
+    explicit ``out=`` call. Attention and its softmax scale remain the
+    caller's responsibility; ``input_dtype`` is the floating output dtype.
+    """
+
+    q: torch.Tensor
+    k: torch.Tensor
+    v: torch.Tensor
+    q_scale: torch.Tensor
+    k_scale: torch.Tensor
+    v_scale: torch.Tensor
+    layout: str
+    logical_sequence: int
+    used_sequence: int
+    input_dtype: torch.dtype
+
+
+@dataclasses.dataclass(frozen=True, init=False, repr=False, eq=False)
+class UlyssesQKVWorkspace:
+    """Prepared Lowp geometry and reusable communication storage.
+
+    Created collectively by :meth:`UlyssesCommunicator.prepare_qkv`; direct
+    construction is not supported. Metadata is read-only. The workspace is
+    bound to its owner communicator and cannot be used after that owner is
+    closed, on another communicator, or concurrently across streams.
+
+    ``qkv_shape``, ``world_size``, ``dtype``, ``device``, ``used_sequence``,
+    ``quantization`` and ``layout`` describe the prepared operation.
+    ``transport`` is always ``"nccl"``, independently of the ordinary
+    scatter/gather backend. Storage follows PyTorch tensor lifetimes and
+    owns neither an extra process group nor a separate close protocol.
+    """
+
+    qkv_shape: Tuple[int, int, int, int]
+    world_size: int
+    dtype: torch.dtype
+    device: torch.device
+    used_sequence: int
+    quantization: str
+    layout: str
+    transport: str
+    _owner: "UlyssesCommunicator"
+    _layout_impl: Any
+    _module: Any
+    _enable_pdl: bool
+    _q_scale_offset: int
+    _wire_shape: Tuple[int, int]
+    _stats_numel: int
+    _output_specs: Tuple[Tuple[Tuple[int, ...], torch.dtype], ...]
+    _send_buffer: torch.Tensor
+    _recv_buffer: torch.Tensor
+    _stats_gather: torch.Tensor
+
+    def __init__(self):
+        raise TypeError("use UlyssesCommunicator.prepare_qkv() to create a workspace")
+
+    @property
+    def logical_sequence(self) -> int:
+        """Full sequence length, including any zero-padded suffix."""
+        return self.qkv_shape[1] * self.world_size
+
+    @classmethod
+    def _allocate(cls, owner, qkv_shape, used_sequence, layout, layout_impl):
+        from . import _ulysses_lowp as lowp
+
+        batch, local_sequence, heads, head_dim = qkv_shape
+        world = owner.world_size
+        local_heads = heads // world
+        spec = layout_impl.payload_spec(
+            batch_size=batch,
+            local_sequence=local_sequence,
+            num_heads=heads,
+            world_size=world,
+        )
+        q_width, k_width = layout_impl.scale_widths(used_sequence)
+        wire_shape = (world, int(spec["chunk_bytes"]))
+        sequence = world * local_sequence
+        # K sum + V amax + two Q descriptors + two raw-K min/max slices.
+        stats_numel = batch * heads * (6 * head_dim + 2)
+        q_shape = (batch, sequence, local_heads, head_dim)
+        output_specs = (
+            (q_shape, torch.int8),
+            (q_shape, torch.int8),
+            (
+                (batch, head_dim, local_heads, int(spec["padded_sequence"])),
+                torch.float8_e4m3fn,
+            ),
+            ((batch, local_heads, q_width), torch.float32),
+            ((batch, local_heads, k_width), torch.float32),
+            ((batch, local_heads, head_dim), torch.float32),
+        )
+        workspace = object.__new__(cls)
+        values = dict(
+            qkv_shape=qkv_shape,
+            world_size=world,
+            dtype=owner.dtype,
+            device=owner.device,
+            used_sequence=used_sequence,
+            quantization="sage2",
+            layout=layout,
+            transport="nccl",
+            _owner=owner,
+            _layout_impl=layout_impl,
+            _q_scale_offset=int(spec["q_scale_offset"]),
+            _wire_shape=wire_shape,
+            _stats_numel=stats_numel,
+            _output_specs=output_specs,
+        )
+        with torch.cuda.device(owner.device):
+            values["_module"] = (
+                lowp.get_ulysses_lowp_sm90_module()
+                if layout == "sage2_sm90"
+                else lowp.get_ulysses_lowp_module()
+            )
+            values["_enable_pdl"] = bool(lowp.device_support_pdl(owner.device))
+            values["_send_buffer"] = torch.empty(
+                wire_shape, dtype=torch.uint8, device=owner.device
+            )
+            recv = owner.allocate_output(
+                values["_send_buffer"].view(1, 1, *wire_shape),
+                "exchange_chunks",
+                dtype=torch.uint8,
+            )
+            values["_recv_buffer"] = recv.view(wire_shape)
+            values["_stats_gather"] = torch.empty(
+                world * stats_numel, dtype=torch.float32, device=owner.device
+            )
+        for name, value in values.items():
+            object.__setattr__(workspace, name, value)
+        return workspace
+
+
 class UlyssesCommunicator:
     r"""Ulysses context-parallelism all-to-all communicator.
 
@@ -154,7 +319,14 @@ class UlyssesCommunicator:
     ``S_global = S_local * world_size``. Both backends produce bit-identical
     results.
 
-    Backend selection happens in the constructor, strictly before any IPC
+    :meth:`exchange_chunks` exchanges already-packed destination-major
+    chunks. Both current backends use NCCL for this operation.
+    :meth:`prepare_qkv` and :meth:`scatter_qkv` additionally provide Sage2
+    INT8/FP8 QKV preparation, using this chunk exchange and a statistics
+    AllGather on the same NCCL group.
+
+    Backend selection for ordinary scatter/gather happens in the constructor,
+    strictly before any IPC
     allocation or JIT compilation (see
     :func:`~flashinfer.comm.resolve_ulysses_backend`):
 
@@ -196,22 +368,27 @@ class UlyssesCommunicator:
       communicator concurrently from multiple streams or threads.
     - Operand tensors must be contiguous 4-D CUDA tensors of the construction
       ``dtype`` (float16 / bfloat16 / float32) on the construction device,
-      with every dim positive and total elements at most ``max_elems``;
+      with every dim positive, at most ``2**31 - 1`` elements and at most
+      ``max_bytes`` bytes. :meth:`exchange_chunks` also accepts packed uint8
+      with a per-call ``dtype`` override;
       :meth:`scatter_heads` additionally requires ``H % world_size == 0`` and
       :meth:`gather_heads` requires ``S_global % world_size == 0``.
     - Each rank may use a different CUDA device (e.g. ``cuda:rank``); ranks
-      must agree on ``max_elems``, ``dtype`` and ``backend``.
+      must agree on ``max_bytes``, ``dtype`` and ``backend``.
 
     Parameters
     ----------
     group : torch.distributed.ProcessGroup, optional
         Process group of the Ulysses ranks. Defaults to ``dist.group.WORLD``.
-    max_elems : int
-        Capacity: the largest element count of any single all-to-all operand
-        (input and output have equal ``numel``, so this is ``B*S_local*H*D``
-        for the largest call). Must be at most ``2**31 - 1`` (the kernel's
-        int32 index range). Sizes the NVLink staging buffer once at
-        construction.
+    max_bytes : int
+        Per-rank byte capacity of one communication operand, shared across
+        dtypes and transforms. Sizes the NVLink staging buffer once at
+        construction. For quantized QKV this must cover the complete packed
+        Q/K/V payload, including scales and alignment, rather than one
+        floating input. Statistics and other workspace allocations are
+        separate; this is not a total memory budget. The maximum is
+        ``(2**31 - 1) * 4`` bytes, and each call separately enforces the
+        int32 element-index limit.
     dtype : torch.dtype
         Element type of all operands (float16 / bfloat16 / float32); enforced
         on every call.
@@ -224,7 +401,7 @@ class UlyssesCommunicator:
 
     Examples
     --------
-    >>> with UlyssesCommunicator(group, max_elems=B*S*H*D, dtype=torch.bfloat16) as comm:
+    >>> with UlyssesCommunicator(group, max_bytes=B*S*H*D*2, dtype=torch.bfloat16) as comm:
     ...     q_ = comm.scatter_heads(q)   # [B,S_local,H,D] -> [B,S_global,H_local,D]
     ...     ...
     ...     o = comm.gather_heads(o_)    # [B,S_global,H_local,D] -> [B,S_local,H,D]
@@ -235,7 +412,7 @@ class UlyssesCommunicator:
         self,
         group: Optional[ProcessGroup] = None,
         *,
-        max_elems: int,
+        max_bytes: int,
         dtype: torch.dtype,
         backend: str = "auto",
         device: Optional[Union[torch.device, str, int]] = None,
@@ -247,9 +424,10 @@ class UlyssesCommunicator:
         group : Optional[ProcessGroup], optional
             Process group spanning the participating ranks. ``None`` uses
             ``torch.distributed.group.WORLD``.
-        max_elems : int
-            Per-rank upper bound on the number of elements communicated by a
-            single collective call. Used to size the backend workspace.
+        max_bytes : int
+            Per-rank upper bound in bytes on one communication operand.
+            Quantized QKV requires the complete packed payload to fit.
+            Used to size the backend workspace.
         dtype : torch.dtype
             Element dtype for collective operands. Must be one of
             ``torch.float16``, ``torch.bfloat16``, or ``torch.float32``.
@@ -294,12 +472,12 @@ class UlyssesCommunicator:
         # identical list jointly so an invalid single-rank config raises the
         # same error on every rank instead of hanging peers in a later gather.
         # Devices are validated per rank but may legitimately differ across
-        # ranks (cuda:rank); only max_elems and dtype must match.
-        config = self._encode_config(max_elems, dtype, device)
+        # ranks (cuda:rank); only max_bytes and dtype must match.
+        config = self._encode_config(max_bytes, dtype, device)
         configs = self._gather(config)
         self._validate_configs_jointly(configs)
 
-        self.max_elems = max_elems
+        self.max_bytes = max_bytes
         self.dtype = dtype
 
         # ---- backend selection: strictly before any IPC/JIT -----------------
@@ -438,11 +616,11 @@ class UlyssesCommunicator:
             return torch.device("cuda", 0)
 
     @classmethod
-    def _encode_config(cls, max_elems, dtype, device) -> Tuple[str, str, str]:
-        if type(max_elems) is not int:  # bool is an int subclass: reject it too
-            elems = f"<invalid type: {type(max_elems).__name__}>"
+    def _encode_config(cls, max_bytes, dtype, device) -> Tuple[str, str, str]:
+        if type(max_bytes) is not int:  # bool is an int subclass: reject it too
+            nbytes = f"<invalid type: {type(max_bytes).__name__}>"
         else:
-            elems = str(max_elems)
+            nbytes = str(max_bytes)
         if isinstance(dtype, torch.dtype):
             dt = str(dtype)
         else:
@@ -457,19 +635,20 @@ class UlyssesCommunicator:
             dev = "cuda"
         else:
             dev = f"cuda:{index}"
-        return (elems, dt, dev)
+        return (nbytes, dt, dev)
 
     def _validate_configs_jointly(self, configs) -> None:
         supported = tuple(str(d) for d in _SUPPORTED_DTYPES)
         problems = {}
-        for r, (elems, dt, dev) in enumerate(configs):
+        for r, (nbytes, dt, dev) in enumerate(configs):
             errs = []
-            if not elems.isdigit() or int(elems) <= 0:
-                errs.append(f"max_elems must be a positive int, got {elems}")
-            elif int(elems) > _INT32_MAX:
+            if not nbytes.isdigit() or int(nbytes) <= 0:
+                errs.append(f"max_bytes must be a positive int, got {nbytes}")
+            elif int(nbytes) > _MAX_CAPACITY_BYTES:
                 errs.append(
-                    f"max_elems must be at most {_INT32_MAX} (int32 kernel "
-                    f"index range), got {elems}"
+                    f"max_bytes must be at most {_MAX_CAPACITY_BYTES} (int32 "
+                    f"kernel index range at the widest supported element), "
+                    f"got {nbytes}"
                 )
             if dt not in supported:
                 errs.append(f"dtype must be one of {supported}, got {dt}")
@@ -479,11 +658,11 @@ class UlyssesCommunicator:
                 problems[r] = "; ".join(errs)
         if problems:
             raise ValueError(f"invalid UlyssesCommunicator config by rank: {problems}")
-        shared = {(elems, dt) for (elems, dt, _dev) in configs}
+        shared = {(nbytes, dt) for (nbytes, dt, _dev) in configs}
         if len(shared) > 1:
             raise ValueError(
                 f"inconsistent UlyssesCommunicator configs across ranks: "
-                f"(max_elems, dtype) = {sorted(shared)}; all ranks must agree"
+                f"(max_bytes, dtype) = {sorted(shared)}; all ranks must agree"
             )
 
     # ---- staged NVLink initialization (collective-safe transaction) -----------
@@ -514,7 +693,7 @@ class UlyssesCommunicator:
             return err  # nothing allocated anywhere yet
 
         # stage A: allocate this rank's export buffers and IPC handles
-        out_bytes = self.max_elems * self.dtype.itemsize
+        out_bytes = self.max_bytes
         handles: Optional[Tuple[Any, Any]] = None
         try:
             from .cuda_ipc import cudart
@@ -765,7 +944,8 @@ class UlyssesCommunicator:
         ----------
         max_elems : int, optional
             Capacity of each send and receive staging buffer in elements.
-            ``None`` uses the communicator's ``max_elems`` capacity.
+            ``None`` fills the communicator's ``max_bytes`` capacity at the
+            communicator dtype.
 
         Returns
         -------
@@ -777,20 +957,552 @@ class UlyssesCommunicator:
                 "create_workspace called on a "
                 f"{self._state} UlyssesCommunicator (use-after-close)"
             )
+        capacity_elems = self.max_bytes // self.dtype.itemsize
         if max_elems is None:
-            max_elems = self.max_elems
+            max_elems = capacity_elems
         if type(max_elems) is not int or max_elems <= 0:
             raise ValueError(f"max_elems must be a positive int, got {max_elems!r}")
-        if max_elems > self.max_elems:
+        if max_elems > capacity_elems:
             raise ValueError(
                 f"workspace max_elems={max_elems} exceeds communicator "
-                f"capacity max_elems={self.max_elems}"
+                f"capacity max_bytes={self.max_bytes} ({capacity_elems} elements "
+                f"of {self.dtype.itemsize} bytes)"
             )
         return UlyssesWorkspace(
             max_elems=max_elems, dtype=self.dtype, device=self.device
         )
 
+    @flashinfer_api
+    def prepare_qkv(
+        self,
+        qkv_shape: Sequence[int],
+        *,
+        quantization: str = "sage2",
+        used_sequence: Optional[int] = None,
+    ) -> UlyssesQKVWorkspace:
+        r"""Collectively prepare Sage2 QKV communication and reusable storage.
+
+        Every rank must call this method in the same order, outside CUDA
+        graph capture. Shape/configuration, layout/JIT availability, and
+        allocation outcomes are agreed in three separate stages. A
+        recoverable preparation failure releases only this call's storage;
+        it does not close the communicator or invalidate existing workspaces.
+        Missing participants and CUDA/process-group failures are not recoverable
+        through this protocol.
+
+        This method does not change ``backend``. Quantized QKV always uses
+        the group's CUDA NCCL backend, even when ordinary scatter/gather
+        uses NVLink. Supports homogeneous SM90 or SM120 groups of 2/4/8 ranks.
+
+        Parameters
+        ----------
+        qkv_shape : Sequence[int]
+            Common local ``[B, L, H, D]`` shape, with positive dimensions,
+            ``D`` equal to 64 or 128, and ``H`` divisible by the group size.
+            Each Q/K/V and the combined byte payload must fit the int32
+            element-index limit. The complete packed QKV payload, including
+            scales and alignment, must fit ``max_bytes``. Statistics are
+            allocated separately.
+        quantization : str, default = "sage2"
+            QKV encoding policy. Only ``"sage2"`` is supported: grouped INT8
+            Q/K and channel-scaled FP8 E4M3 V, using the device's Sage2 layout.
+            The communicator dtype must be FP16 or BF16.
+        used_sequence : int, optional
+            Global live prefix length ``U`` in ``(0, world_size * L]``.
+            ``None`` uses the whole sequence. Callers must zero input rows
+            outside this prefix; this method does not initialize inputs.
+
+        Returns
+        -------
+        UlyssesQKVWorkspace
+            Owner-bound, read-only geometry with reusable send/receive and
+            statistics-gather buffers. Shape or live-length changes require
+            another collective preparation call.
+        """
+        # Validate inside the outcome envelope: a bad argument on one rank
+        # must not skip a collective that every other rank is entering.
+        outcome: Tuple[Any, ...]
+        try:
+            self._require_open("prepare_qkv")
+            if type(qkv_shape) not in (tuple, list, torch.Size):
+                raise TypeError(
+                    "qkv_shape must be a tuple/list/torch.Size of four ints"
+                )
+            shape = tuple(qkv_shape)
+            if len(shape) != 4 or any(type(n) is not int or n <= 0 for n in shape):
+                raise ValueError("qkv_shape must contain four positive integers")
+            batch, local_sequence, heads, head_dim = shape
+            if type(quantization) is not str or quantization != "sage2":
+                raise ValueError("quantization must be 'sage2'")
+            if self.dtype not in (torch.float16, torch.bfloat16):
+                raise ValueError(
+                    "Sage2 QKV requires a float16 or bfloat16 communicator"
+                )
+            if self.world_size not in (2, 4, 8):
+                raise ValueError("Sage2 QKV requires world_size in {2, 4, 8}")
+            if head_dim not in (64, 128) or heads % self.world_size:
+                raise ValueError(
+                    "Sage2 QKV requires D in {64, 128} and H % world_size == 0"
+                )
+            if math.prod(shape) > _INT32_MAX:
+                raise ValueError("each Q/K/V must fit the int32 element-index range")
+            used = (
+                self.world_size * local_sequence
+                if used_sequence is None
+                else used_sequence
+            )
+            if (
+                type(used) is not int
+                or not 0 < used <= self.world_size * local_sequence
+            ):
+                raise ValueError(
+                    "used_sequence must be an integer in (0, world_size * L]"
+                )
+            supported, observed = self._group_supports_cuda_alltoall()
+            if not supported:
+                raise ValueError(
+                    f"Sage2 QKV requires a CUDA NCCL process group, got {observed}"
+                )
+            outcome = (
+                "ok",
+                (
+                    shape,
+                    quantization,
+                    used,
+                    str(self.dtype),
+                    self.world_size,
+                    self.max_bytes,
+                ),
+            )
+        except Exception as e:  # noqa: BLE001 — all ranks must vote before raising
+            outcome = (
+                "err",
+                f"rank {self.rank} QKV configuration: {type(e).__name__}: {e}",
+            )
+        outcomes = self._gather(outcome)
+        err = self._first_error(outcomes)
+        if err is not None:
+            raise ValueError(f"prepare_qkv failed: {err}")
+        if any(item != outcomes[0] for item in outcomes[1:]):
+            raise ValueError(
+                f"inconsistent prepare_qkv configuration across ranks: {outcomes}"
+            )
+
+        try:
+            from . import _ulysses_lowp as lowp
+
+            with torch.cuda.device(self.device):
+                cap = lowp.capability(self.device)
+                if (
+                    cap["device_capability"] not in ((9, 0), (12, 0))
+                    or not cap["supported"]
+                ):
+                    raise RuntimeError(
+                        f"Sage2 QKV kernels unavailable on SM90/SM120: {cap}"
+                    )
+                if head_dim not in cap["supported_head_dims"]:
+                    raise RuntimeError(
+                        f"Sage2 QKV module does not support D={head_dim}"
+                    )
+                layout_impl = getattr(lowp, cap["layout_class"])(head_dim=head_dim)
+                spec = layout_impl.payload_spec(
+                    batch_size=batch,
+                    local_sequence=local_sequence,
+                    num_heads=heads,
+                    world_size=self.world_size,
+                )
+                payload_bytes = self.world_size * int(spec["chunk_bytes"])
+                self._validate_capacity(
+                    payload_bytes, "prepare_qkv packed payload", dtype=torch.uint8
+                )
+            layout = (
+                "sage2_sm90"
+                if cap["device_capability"] == (9, 0)
+                else "sage2_sm89_sm120"
+            )
+            outcome = (
+                "ok",
+                (
+                    cap["device_capability"],
+                    layout,
+                    layout_impl.Q_GROUP,
+                    layout_impl.K_GROUP,
+                ),
+            )
+        except Exception as e:  # noqa: BLE001 — JIT failure is a group outcome
+            outcome = (
+                "err",
+                f"rank {self.rank} QKV layout/JIT: {type(e).__name__}: {e}",
+            )
+        outcomes = self._gather(outcome)
+        err = self._first_error(outcomes)
+        if err is not None:
+            raise RuntimeError(f"prepare_qkv failed: {err}")
+        if any(item != outcomes[0] for item in outcomes[1:]):
+            raise ValueError(
+                f"inconsistent QKV hardware/layout across ranks: {outcomes}"
+            )
+
+        workspace = None
+        try:
+            workspace = UlyssesQKVWorkspace._allocate(
+                self, shape, used, layout, layout_impl
+            )
+            outcome = ("ok",)
+        except Exception as e:  # noqa: BLE001 — release only this attempted allocation
+            outcome = (
+                "err",
+                f"rank {self.rank} QKV allocation: {type(e).__name__}: {e}",
+            )
+        err = self._first_error(self._gather(outcome))
+        if err is not None:
+            workspace = None
+            raise RuntimeError(f"prepare_qkv failed: {err}")
+        return workspace
+
+    @flashinfer_api(trace=ulysses_scatter_qkv_trace_dispatch)
+    def scatter_qkv(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        workspace: UlyssesQKVWorkspace,
+        out: Optional[UlyssesQKV] = None,
+    ) -> UlyssesQKV:
+        r"""Quantize and exchange QKV for the prepared SageAttention2 layout.
+
+        Runs one FP32 statistics AllGather and one jointly packed uint8
+        AllToAll on ``group``, using NCCL independently of ``backend``.
+        Execution uses the current CUDA stream; all ranks must issue the
+        same sequence of calls with valid inputs. There is no per-call
+        metadata collective, implicit preparation, or precision fallback.
+        Local statistics still allocate temporary tensors.
+
+        Parameters
+        ----------
+        q, k, v : torch.Tensor
+            FP16/BF16 CUDA tensors matching the prepared ``[B,L,H,D]`` shape,
+            dtype and device. D must be contiguous; the base pointer and
+            each outer stride must preserve 16-byte row alignment. Projection
+            views satisfying those constraints do not require copies. Input
+            rows outside the prepared global live prefix must already be zero.
+        workspace : UlyssesQKVWorkspace
+            Workspace returned by this communicator's ``prepare_qkv``.
+            Must not be shared by concurrent operations or another communicator.
+        out : UlyssesQKV, optional
+            Reuse these six output tensors. Shapes, dtypes, device, layout,
+            logical/live lengths and input dtype must match the preparation.
+            Outputs must be contiguous and cannot overlap each other, the
+            inputs, or workspace storage. ``None`` allocates independent
+            final storage that remains valid after later workspace reuse.
+
+        Returns
+        -------
+        UlyssesQKV
+            Pre-quantized Q/K/V and three FP32 scales, with consumer metadata.
+            Returns ``out`` itself when supplied. Attention uses the live
+            prefix; the caller restores a full-length floating output before
+            invoking ``gather_heads``.
+        """
+        from . import _ulysses_lowp as lowp
+
+        self._require_open("scatter_qkv")
+        if (
+            not isinstance(workspace, UlyssesQKVWorkspace)
+            or workspace._owner is not self
+        ):
+            raise ValueError(
+                "scatter_qkv workspace must be prepared by this communicator"
+            )
+        lowp._validate_qkv(q, k, v)
+        if (
+            tuple(q.shape) != workspace.qkv_shape
+            or q.dtype != workspace.dtype
+            or q.device != workspace.device
+        ):
+            raise ValueError(
+                "Q/K/V shape, dtype and device must match the prepared workspace"
+            )
+        # Re-read each tensor's extent once per call, then compare integers.
+        # Repeated pairwise metadata queries are costly on this hot path;
+        # a cross-call cache would miss resized or rebound tensor storage.
+        checked_ranges = [_qkv_byte_range(x) for x in (q, k, v)]
+        staging = (
+            (workspace._send_buffer, workspace._wire_shape, torch.uint8),
+            (workspace._recv_buffer, workspace._wire_shape, torch.uint8),
+            (
+                workspace._stats_gather,
+                (workspace.world_size * workspace._stats_numel,),
+                torch.float32,
+            ),
+        )
+        for buffer, shape, dtype in staging:
+            lowp._validate_tensor_spec(
+                "QKV workspace buffer", buffer, shape, dtype, self.device
+            )
+            start, end = _qkv_byte_range(buffer)
+            if any(
+                start < other_end and other_start < end
+                for other_start, other_end in checked_ranges
+            ):
+                raise ValueError(
+                    "QKV workspace buffers must not overlap inputs or one another"
+                )
+            checked_ranges.append((start, end))
+        result = self._prepare_qkv_out(workspace, out, checked_ranges, lowp)
+        layout = workspace._layout_impl
+        _batch, local_sequence, heads, _head_dim = workspace.qkv_shape
+        local_heads = heads // self.world_size
+        with torch.cuda.device(self.device):
+            with torch.cuda.nvtx.range("lowp_local_stats"):
+                send, ctx = lowp._local_stats_impl(
+                    q,
+                    k,
+                    v,
+                    self.rank,
+                    self.world_size,
+                    workspace.used_sequence,
+                    layout.Q_GROUP,
+                    layout.K_GROUP,
+                    workspace._enable_pdl,
+                    workspace._module,
+                )
+            with torch.cuda.nvtx.range("lowp_stats_allgather"):
+                dist.all_gather_into_tensor(
+                    workspace._stats_gather, send, group=self.group
+                )
+            with torch.cuda.nvtx.range("lowp_finalize_stats"):
+                stats = lowp._finalize_stats_impl(
+                    workspace._stats_gather,
+                    ctx,
+                    k,
+                    workspace._enable_pdl,
+                    workspace._module,
+                )
+            with torch.cuda.nvtx.range("lowp_quant_pack"):
+                lowp._quant_and_pack_impl(
+                    q,
+                    k,
+                    v,
+                    stats,
+                    workspace._send_buffer,
+                    workspace._q_scale_offset,
+                    workspace._enable_pdl,
+                    workspace._module,
+                )
+            with torch.cuda.nvtx.range("lowp_input_a2a"):
+                self._exchange_qkv_payload(
+                    workspace._send_buffer, workspace._recv_buffer
+                )
+            with torch.cuda.nvtx.range("lowp_unpack"):
+                lowp._unpack_for_sage_impl(
+                    workspace._recv_buffer,
+                    result[:5],
+                    local_sequence,
+                    self.world_size,
+                    workspace.used_sequence,
+                    workspace._enable_pdl,
+                    workspace._module,
+                )
+            with torch.cuda.nvtx.range("lowp_v_scale"):
+                head_start = self.rank * local_heads
+                result.v_scale.copy_(
+                    stats.v_scale_global[:, head_start : head_start + local_heads]
+                )
+        return result
+
+    def _exchange_qkv_payload(self, send: torch.Tensor, recv: torch.Tensor) -> None:
+        # The two-dimensional kernel payload is already destination-major.
+        # These views preserve storage; exchange_chunks supplies the shared
+        # transport contract and validates the current byte budget.
+        self.exchange_chunks(
+            send.view(1, 1, *send.shape),
+            out=recv.view(1, 1, *recv.shape),
+            dtype=torch.uint8,
+        )
+
+    def _prepare_qkv_out(self, workspace, out, checked_ranges, lowp) -> UlyssesQKV:
+        metadata = (
+            workspace.layout,
+            workspace.logical_sequence,
+            workspace.used_sequence,
+            workspace.dtype,
+        )
+        if out is None:
+            tensors = tuple(
+                torch.empty(shape, dtype=dtype, device=self.device)
+                for shape, dtype in workspace._output_specs
+            )
+            return UlyssesQKV(
+                tensors[0],
+                tensors[1],
+                tensors[2],
+                tensors[3],
+                tensors[4],
+                tensors[5],
+                workspace.layout,
+                workspace.logical_sequence,
+                workspace.used_sequence,
+                workspace.dtype,
+            )
+        if not isinstance(out, UlyssesQKV):
+            raise TypeError("out must be a UlyssesQKV result")
+        if out[6:] != metadata:
+            raise ValueError(
+                "out layout, logical_sequence, used_sequence and input_dtype must match"
+            )
+        for index, (tensor, (shape, dtype)) in enumerate(
+            zip(out[:6], workspace._output_specs, strict=True)
+        ):
+            lowp._validate_tensor_spec(
+                f"out.{UlyssesQKV._fields[index]}", tensor, shape, dtype, self.device
+            )
+            start, end = _qkv_byte_range(tensor)
+            if any(
+                start < other_end and other_start < end
+                for other_start, other_end in checked_ranges
+            ):
+                raise ValueError(
+                    "out tensors must not overlap inputs, workspace storage or each other"
+                )
+            checked_ranges.append((start, end))
+        return out
+
     # ---- collectives -----------------------------------------------------------
+
+    @flashinfer_api
+    def allocate_output(
+        self, x: torch.Tensor, op: str, *, dtype: Optional[torch.dtype] = None
+    ) -> torch.Tensor:
+        r"""Allocate output storage for one Ulysses transform.
+
+        This is a rank-local allocation for the currently supported backends.
+        Call it during setup and pass the result as ``out`` to reuse storage.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Contiguous 4-D CUDA operand with the shape consumed by ``op``.
+        op : str
+            ``"scatter_heads"``, ``"gather_heads"`` or ``"exchange_chunks"``.
+        dtype : torch.dtype, optional
+            Per-call dtype override for ``exchange_chunks`` only. The input
+            must have this dtype; no conversion is performed. In particular,
+            packed byte payloads pass ``torch.uint8``.
+
+        Returns
+        -------
+        torch.Tensor
+            Output-shaped storage on the same device and with the same dtype
+            as ``x``. The communicator does not own this allocation.
+        """
+        if op not in ("scatter_heads", "gather_heads", "exchange_chunks"):
+            raise ValueError(
+                "op must be 'scatter_heads', 'gather_heads' or 'exchange_chunks'"
+            )
+        self._validate(x, op, dtype)
+        shape, _mode = self._output_geometry(x, op)
+        return torch.empty(shape, dtype=x.dtype, device=x.device)
+
+    @flashinfer_api(trace=ulysses_exchange_chunks_trace)
+    def exchange_chunks(
+        self,
+        x: torch.Tensor,
+        *,
+        out: Optional[torch.Tensor] = None,
+        dtype: Optional[torch.dtype] = None,
+    ) -> torch.Tensor:
+        r"""``[1, 1, W, C] -> [1, 1, W, C]``: equal-length chunk all-to-all.
+
+        Input chunk ``r`` goes to peer ``r`` and lands in slot ``rank`` of
+        that peer's output. The payload is already packed destination-major;
+        no layout conversion or quantization is performed. Both current
+        backends use NCCL because the fused NVLink kernel implements only
+        head-axis layout transforms. All ranks must issue matching shapes,
+        dtypes and call order, on their current CUDA streams.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Contiguous CUDA tensor shaped ``[1, 1, world_size, chunk]``.
+            ``chunk`` counts elements; it counts bytes for a uint8 payload.
+        out : torch.Tensor, optional
+            Contiguous output of the same shape, dtype and device, with no
+            overlap with ``x`` when ``world_size > 1``. May be created using
+            :meth:`allocate_output`.
+        dtype : torch.dtype, optional
+            Override the communicator dtype for this operation: float16,
+            bfloat16, float32 or uint8. The input must already have this dtype.
+            Omit to use the communicator dtype. The byte budget is unchanged.
+
+        Returns
+        -------
+        torch.Tensor
+            Source-major chunks of the same shape, device and dtype as ``x``.
+            With one rank, returns ``x`` when no output is supplied; otherwise
+            copies into and returns ``out``.
+        """
+        self._validate(x, "exchange_chunks", dtype)
+        shape, _mode = self._output_geometry(x, "exchange_chunks")
+        out = self._prepare_out(x, out, shape, "exchange_chunks")
+        if self.world_size == 1:
+            if out is None or out is x:
+                return x
+            out.copy_(x)
+            return out
+        if self.backend == "nvlink":
+            supported, observed = self._group_supports_cuda_alltoall()
+            if not supported:
+                raise ValueError(
+                    "exchange_chunks requires a CUDA NCCL process group, "
+                    f"got {observed}"
+                )
+        if out is None:
+            out = torch.empty_like(x)
+        dist.all_to_all_single(out.view(-1), x.view(-1), group=self.group)
+        return out
+
+    def _output_geometry(self, x: torch.Tensor, op: str) -> Tuple[Tuple[int, ...], int]:
+        """Common output shape and native mode for allocation and exchange."""
+        batch, sequence, heads, head_dim = x.shape
+        if op == "exchange_chunks":
+            if batch != 1 or sequence != 1:
+                raise ValueError(
+                    "exchange_chunks expects [1, 1, world_size, chunk], "
+                    f"got shape {tuple(x.shape)}"
+                )
+            if heads != self.world_size:
+                raise ValueError(
+                    "exchange_chunks requires one chunk per peer (dim 2 == "
+                    f"world size {self.world_size}), got shape {tuple(x.shape)}"
+                )
+            return (batch, sequence, heads, head_dim), 2
+        if op == "scatter_heads":
+            if heads % self.world_size:
+                raise ValueError(
+                    "scatter_heads requires the global head count (dim 2) to be "
+                    f"divisible by world size {self.world_size}, got shape "
+                    f"{tuple(x.shape)}"
+                )
+            return (
+                batch,
+                sequence * self.world_size,
+                heads // self.world_size,
+                head_dim,
+            ), 0
+        if sequence % self.world_size:
+            raise ValueError(
+                "gather_heads requires the global sequence length (dim 1) to "
+                f"be divisible by world size {self.world_size}, got shape "
+                f"{tuple(x.shape)}"
+            )
+        return (
+            batch,
+            sequence // self.world_size,
+            heads * self.world_size,
+            head_dim,
+        ), 1
 
     @flashinfer_api
     def scatter_heads(
@@ -798,6 +1510,7 @@ class UlyssesCommunicator:
         x: torch.Tensor,
         *,
         out: Optional[torch.Tensor] = None,
+        dtype: Optional[torch.dtype] = None,
         workspace: Optional[UlyssesWorkspace] = None,
     ) -> torch.Tensor:
         r"""``[B, S_local, H, D] -> [B, S_global, H_local, D]``.
@@ -817,6 +1530,9 @@ class UlyssesCommunicator:
             ``[B, S_local * world_size, H // world_size, D]``. Supplying it
             removes the public output allocation. It must not alias ``x``
             when ``world_size > 1``.
+        dtype : torch.dtype, optional
+            Reserved per-call dtype override. Must be ``None`` for ordinary
+            layout transforms on the currently supported backends.
         workspace : UlyssesWorkspace, optional
             Reusable NCCL pack/receive storage. Supplying it removes the two
             NCCL staging allocations. It is validated but unused by the
@@ -828,20 +1544,9 @@ class UlyssesCommunicator:
             Tensor with shape ``[B, S_global, H_local, D]`` on the same device
             and dtype as ``x``.
         """
-        self._validate(x, "scatter_heads")
+        self._validate(x, "scatter_heads", dtype)
         B, S_local, H, D = x.shape
-        if H % self.world_size != 0:
-            raise ValueError(
-                f"scatter_heads requires the global head count (dim 2) to be "
-                f"divisible by world size {self.world_size}, got shape "
-                f"{tuple(x.shape)}"
-            )
-        output_shape = (
-            B,
-            S_local * self.world_size,
-            H // self.world_size,
-            D,
-        )
+        output_shape, _mode = self._output_geometry(x, "scatter_heads")
         out = self._prepare_out(x, out, output_shape, "scatter_heads")
         self._validate_workspace(workspace, x.numel(), "scatter_heads")
         self._validate_workspace_out_alias(out, workspace, "scatter_heads")
@@ -1048,6 +1753,7 @@ class UlyssesCommunicator:
         x: torch.Tensor,
         *,
         out: Optional[torch.Tensor] = None,
+        dtype: Optional[torch.dtype] = None,
         workspace: Optional[UlyssesWorkspace] = None,
     ) -> torch.Tensor:
         r"""``[B, S_global, H_local, D] -> [B, S_local, H, D]``.
@@ -1065,6 +1771,9 @@ class UlyssesCommunicator:
             ``[B, S_global // world_size, H_local * world_size, D]``.
             Supplying it removes the public output allocation. It must not
             alias ``x`` when ``world_size > 1``.
+        dtype : torch.dtype, optional
+            Reserved per-call dtype override. Must be ``None`` for ordinary
+            layout transforms on the currently supported backends.
         workspace : UlyssesWorkspace, optional
             Reusable NCCL pack/receive storage. Supplying it removes the two
             NCCL staging allocations. It is validated but unused by the
@@ -1076,17 +1785,11 @@ class UlyssesCommunicator:
             Tensor with shape ``[B, S_local, H, D]`` on the same device and
             dtype as ``x``.
         """
-        self._validate(x, "gather_heads")
+        self._validate(x, "gather_heads", dtype)
         B, S_global, H_local, D = x.shape
-        if S_global % self.world_size != 0:
-            raise ValueError(
-                f"gather_heads requires the global sequence length (dim 1) to "
-                f"be divisible by world size {self.world_size}, got shape "
-                f"{tuple(x.shape)}"
-            )
         S_local = S_global // self.world_size
         H = H_local * self.world_size
-        output_shape = (B, S_local, H, D)
+        output_shape, _mode = self._output_geometry(x, "gather_heads")
         out = self._prepare_out(x, out, output_shape, "gather_heads")
         self._validate_workspace(workspace, x.numel(), "gather_heads")
         self._validate_workspace_out_alias(out, workspace, "gather_heads")
@@ -1352,14 +2055,27 @@ class UlyssesCommunicator:
                 f"{op} called on a {self._state} UlyssesCommunicator (use-after-close)"
             )
 
-    def _validate_capacity(self, required_elems: int, op: str) -> None:
-        if required_elems > self.max_elems:
+    def _validate_capacity(
+        self,
+        required_elems: int,
+        op: str,
+        dtype: Optional[torch.dtype] = None,
+    ) -> None:
+        if required_elems > _INT32_MAX:
             raise ValueError(
-                f"{op} payload has {required_elems} elements, exceeding the "
-                f"communicator capacity max_elems={self.max_elems}"
+                f"{op} payload has {required_elems} elements, over the int32 "
+                f"index range {_INT32_MAX}"
+            )
+        element_dtype = self.dtype if dtype is None else dtype
+        required_bytes = required_elems * element_dtype.itemsize
+        if required_bytes > self.max_bytes:
+            raise ValueError(
+                f"{op} payload is {required_bytes} bytes ({required_elems} "
+                f"elements of {element_dtype.itemsize}), exceeding the "
+                f"communicator capacity max_bytes={self.max_bytes}"
             )
 
-    def _validate(self, x, op: str) -> None:
+    def _validate(self, x, op: str, dtype: Optional[torch.dtype] = None) -> None:
         self._require_open(op)
         if not isinstance(x, torch.Tensor):
             raise TypeError(f"{op} expects a torch.Tensor, got {type(x).__name__}")
@@ -1373,10 +2089,21 @@ class UlyssesCommunicator:
                 f"{op} tensor is on {x.device}, but this communicator is bound "
                 f"to {self.device}"
             )
-        if x.dtype != self.dtype:
+        if dtype is not None:
+            if op != "exchange_chunks":
+                raise ValueError(
+                    f"{op} per-call dtype is not supported on the {self.backend} "
+                    "backend; only exchange_chunks accepts a dtype override"
+                )
+            if dtype not in _CHUNK_DTYPES:
+                raise ValueError(
+                    f"{op} per-call dtype {dtype} is not one of {_CHUNK_DTYPES}"
+                )
+        expected_dtype = self.dtype if dtype is None else dtype
+        if x.dtype != expected_dtype:
             raise ValueError(
-                f"{op} tensor dtype {x.dtype} does not match the communicator "
-                f"dtype {self.dtype}"
+                f"{op} tensor dtype {x.dtype} does not match the expected "
+                f"dtype {expected_dtype}"
             )
         if not x.is_contiguous():
             raise ValueError(f"{op} tensor must be contiguous")
@@ -1384,12 +2111,7 @@ class UlyssesCommunicator:
             raise ValueError(
                 f"{op} tensor dims must all be positive, got shape {tuple(x.shape)}"
             )
-        if x.numel() > self.max_elems:
-            raise ValueError(
-                f"{op} tensor has {x.numel()} elements, exceeding the "
-                f"communicator capacity max_elems={self.max_elems} "
-                f"(which is capped at the int32 index range {_INT32_MAX})"
-            )
+        self._validate_capacity(x.numel(), op, expected_dtype)
 
     def _prepare_out(
         self,

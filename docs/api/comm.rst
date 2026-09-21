@@ -310,14 +310,14 @@ idempotent. Rank-local failures inside the NVLink initialization or a
 collective ``close`` are exchanged as group outcomes so all ranks jointly
 clean up and raise (or fall back) instead of deadlocking, and a failed
 ``close`` may be retried. All ranks must request the same ``backend`` and
-agree on ``max_elems`` and ``dtype``; each rank may bind a different CUDA
+agree on ``max_bytes`` and ``dtype``; each rank may bind a different CUDA
 device (``device`` accepts ``torch.device``, ``str`` or an ``int`` ordinal,
 e.g. ``cuda:rank``). With ``world_size > 1`` the NCCL backend (forced or
 fallen back to) requires ``group`` to support CUDA all-to-all (an NCCL
 process group), checked at construction. Operands must be contiguous 4-D
 CUDA tensors of the construction ``dtype`` (float16 / bfloat16 / float32
-only) on the construction device, every dim positive, at most ``max_elems``
-(≤ 2^31 − 1) elements; ``scatter_heads`` requires ``H % world_size == 0``
+only) on the construction device, every dim positive, at most ``max_bytes``
+bytes and 2^31 − 1 elements; ``scatter_heads`` requires ``H % world_size == 0``
 and ``gather_heads`` requires ``S_global % world_size == 0``. Collectives
 run on the current CUDA stream; all ranks must issue the same call sequence
 with consistent shapes, one collective in flight per communicator at a
@@ -352,7 +352,7 @@ the communicator.
 `wan example <https://github.com/flashinfer-ai/flashinfer/tree/main/examples/pytorch/wan>`_
 for the full integration)::
 
-    with UlyssesCommunicator(group, max_elems=B * S_local * H * D,
+    with UlyssesCommunicator(group, max_bytes=q.nbytes,
                              dtype=torch.bfloat16) as comm:
         q_ = comm.scatter_heads(q)   # [B,S_local,H,D] -> [B,S_global,H_local,D]
         k_ = comm.scatter_heads(k)
@@ -367,6 +367,24 @@ Preallocated outputs and NCCL staging can be reused across serialized calls::
                            dtype=q.dtype, device=q.device)
     comm.scatter_heads(q, out=q_global, workspace=workspace)
 
+**Packed chunk exchange.** ``exchange_chunks`` follows the byte-oriented
+communicator API: it accepts contiguous ``[1, 1, P, C]`` tensors, sends chunk
+``r`` to rank ``r``, and receives chunks in source-rank order. A packed Lowp
+payload uses ``dtype=torch.uint8``; this describes its existing encoding and
+does not quantize or cast it. Both current backends use NCCL for this operation;
+the fused NVLink kernel applies only to the ordinary head-layout transforms.
+No PCIe or RDMA backend is added. A one-rank exchange is an identity.
+
+``allocate_output(x, op, dtype=...)`` creates ordinary PyTorch output storage
+for ``scatter_heads``, ``gather_heads`` or ``exchange_chunks``. No transport
+registration is needed by these backends. ``create_workspace(max_elems=...)``
+and ``UlyssesWorkspace`` retain their element-based staging capacities::
+
+    # send_u8: destination-major, contiguous uint8 [P, chunk_bytes].
+    chunks = send_u8.view(1, 1, P, -1)
+    received = comm.allocate_output(chunks, "exchange_chunks", dtype=torch.uint8)
+    comm.exchange_chunks(chunks, out=received, dtype=torch.uint8)
+
 .. autoclass:: UlyssesCommunicator
     :members:
     :show-inheritance:
@@ -378,6 +396,64 @@ Preallocated outputs and NCCL staging can be reused across serialized calls::
     :show-inheritance:
 
     .. automethod:: __init__
+
+Prepared Low-Precision QKV Exchange
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The public Lowp interface is :class:`UlyssesCommunicator` together with
+:class:`UlyssesQKVWorkspace` and :class:`UlyssesQKV`. Statistics, quantization
+and payload primitives are private implementation details. See the
+:download:`design document <../design_docs/ulysses_lowp.md>` for the numerical
+contract and kernel-level validation.
+
+``prepare_qkv`` is a collective preparation method; all ranks call it in the
+same order before attention. It allocates a dedicated mixed-dtype workspace
+from the local QKV shape. Ordinary ``create_workspace`` remains rank-local.
+``scatter_qkv`` currently supports the SageAttention2 encoding only::
+
+    # The original floating Q/K/V total is a conservative wire-byte budget.
+    with UlyssesCommunicator(group, max_bytes=3 * q.nbytes, dtype=q.dtype,
+                             device=q.device, backend="auto") as comm:
+        workspace = comm.prepare_qkv(q.shape, used_sequence=used)
+        encoded = comm.scatter_qkv(q, k, v, workspace=workspace)
+        # A framework adapter calls Sage with encoded.q/k/v and the scales.
+        # It returns [B, P*L, H/P, D], in encoded.input_dtype, with a zero tail.
+        output = comm.gather_heads(sage_adapter(encoded))
+        # After the previous attention has consumed the buffers:
+        encoded = comm.scatter_qkv(q_next, k_next, v_next,
+                                   workspace=workspace, out=encoded)
+
+The result contains INT8 Q/K, FP8 E4M3 V, three FP32 scales, the Sage layout,
+logical and used sequence lengths, and the original input dtype. It accepts
+FP16/BF16 inputs on homogeneous SM90 or SM120 groups, D=64/128, and P=2/4/8.
+The last input dimension is dense and each row must be 16-byte aligned;
+projection views need not be fully contiguous. The input padding after the
+used global prefix must already be zero.
+
+Statistics use NCCL on the communicator's group. The packed payload goes
+through ``exchange_chunks``; its current NCCL and NVLink backend implementations
+both use NCCL without another layout conversion or payload copy.
+``workspace.transport`` reports that actual transport. Preparation checks NCCL
+capability even for an NVLink communicator.
+``max_bytes`` must cover the full combined Q/K/V payload, including scales and
+chunk alignment. Preparation computes and validates the exact requirement;
+one floating Q tensor's byte size is generally insufficient. The example's
+``3 * q.nbytes`` covers both supported layouts. NCCL preparation allocates the
+actual payload size, not the full budget. Statistics and final outputs are
+additional allocations, so ``max_bytes`` is not a total memory budget.
+
+``out=None`` returns independent storage. ``out=`` requires matching tensor
+geometry and metadata, including the exact used length and original dtype.
+Output fields must not overlap one another, inputs or workspace scratch.
+A workspace belongs to its creating communicator and cannot be used after
+that communicator closes. Calls are serialized on the current CUDA stream.
+Prepared QKV workspaces and ordinary staging workspaces are not interchangeable.
+
+.. autoclass:: UlyssesQKV
+    :members:
+
+.. autoclass:: UlyssesQKVWorkspace
+    :members:
 
 Head-Chunk Layout and Transport Primitives
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
