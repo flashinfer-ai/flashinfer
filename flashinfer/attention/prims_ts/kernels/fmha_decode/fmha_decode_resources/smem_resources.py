@@ -336,25 +336,26 @@ def _issue_sparse_page_copies(
         # kernels keep parallel shared loads to minimize startup latency.
         uniform_fragments_per_warp = fragments // cfg.load_num_warps
         uniform_warp = _load_task_warp_rank(cfg)
+        uniform_first_fragment = uniform_warp * Int32(uniform_fragments_per_warp)
+        uniform_page_ptr = page_offsets.page_id_pointer(
+            tile_idx, local_tile_idx, uniform_first_fragment
+        )
+        uniform_destination_ptr = stage_base.data_ptr(
+            uniform_first_fragment * Int32(chunk_hd * cfg.num_tokens_per_page)
+        )
         # Reuse a compact set of uniform address operands across fragments;
-        # keep the head-plane copies unrolled inside each iteration.
-        for fragment_idx in cutlass.range(uniform_fragments_per_warp, unroll=1):
-            uniform_fragment = uniform_warp * Int32(uniform_fragments_per_warp) + Int32(
-                fragment_idx
-            )
-            uniform_locator = cute.arch.make_warp_uniform(
-                page_offsets.page_id(tile_idx, local_tile_idx, uniform_fragment)
-            )
+        # advance staged locators and SMEM destinations independently of the
+        # scattered global coordinates. Head-plane copies stay unrolled.
+        for _fragment_idx in cutlass.range(uniform_fragments_per_warp, unroll=1):
+            uniform_locator = cute.arch.make_warp_uniform(Int32(uniform_page_ptr[0]))
             uniform_token_offset, _ = _decode_native_page_locator(
                 cfg, uniform_locator, kv_head
             )
             if prims.elect_sync():
                 for head_chunk in cutlass.range_constexpr(chunks):
-                    uniform_smem_offset = Int32(
-                        head_chunk * chunk_hd * cfg.tile_size_kv
-                    ) + uniform_fragment * Int32(chunk_hd * cfg.num_tokens_per_page)
                     prims.cp_async_bulk_tensor_shared_cta_global(
-                        stage_base.subview(uniform_smem_offset),
+                        uniform_destination_ptr
+                        + Int32(head_chunk * chunk_hd * cfg.tile_size_kv),
                         tma_desc,
                         (
                             Int32(head_dim_stage_offset + head_chunk * chunk_hd),
@@ -362,6 +363,10 @@ def _issue_sparse_page_copies(
                         ),
                         barrier,
                     )
+            uniform_page_ptr = uniform_page_ptr + Int32(1)
+            uniform_destination_ptr = uniform_destination_ptr + Int32(
+                chunk_hd * cfg.num_tokens_per_page
+            )
         return
     copies = fragments * chunks
     copies_per_warp = (copies + cfg.load_num_warps - 1) // cfg.load_num_warps
@@ -1728,10 +1733,10 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
         return self._smem_page_offsets.load(offset, vector_size=1, alignment=4)
 
     @cute.jit
-    def page_id(
+    def page_id_pointer(
         self, tile_idx: Int32, local_tile_idx: Int32, page_frag: Int32
-    ) -> Int32:
-        """Load a tile's locator; offset stages are independent of K/V data stages."""
+    ) -> cutlass.Pointer:
+        """Locate a staged ID independently of the K/V data-buffer stage."""
         cfg = self.cfg
         pages_per_tile = cfg.tile_size_kv // cfg.num_tokens_per_page
         if cutlass.const_expr(self.holds_encoded_locator_window):
@@ -1745,7 +1750,14 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
         else:
             group_page_idx = (tile_idx * Int32(pages_per_tile)) & Int32(31)
             offset = self.consumer_work_stage * Int32(32) + group_page_idx
-        return Int32(self._smem_page_offsets[offset + page_frag])
+        return self._smem_page_offsets.data_ptr(offset + page_frag)
+
+    @cute.jit
+    def page_id(
+        self, tile_idx: Int32, local_tile_idx: Int32, page_frag: Int32
+    ) -> Int32:
+        """Load one locator from the active page-offset stage."""
+        return Int32(self.page_id_pointer(tile_idx, local_tile_idx, page_frag)[0])
 
     @cute.jit
     def _q_token_kv_block_sparse_membership_word(
