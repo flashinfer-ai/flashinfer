@@ -18,7 +18,6 @@ import hashlib
 import itertools
 import json
 import multiprocessing
-import os
 import shutil
 import statistics
 import subprocess
@@ -32,29 +31,24 @@ import torch
 
 from flashinfer.experimental.cudnn_frost_selected_kernels.activations import ACTIVATIONS
 
-
-def check_idle_gpu(gpu_uuid):
-    """Fail instead of reporting timings contaminated by another GPU process."""
-    uuid = str(gpu_uuid).removeprefix("GPU-").lower()
-    output = subprocess.check_output(
-        [
-            "nvidia-smi",
-            "--query-compute-apps=gpu_uuid,pid",
-            "--format=csv,noheader,nounits",
-        ],
-        text=True,
+if __package__:
+    from .bench_cudnn_frost_common import (
+        activation_reference,
+        capture,
+        check_idle_gpu,
+        emit,
+        error,
+        measure,
     )
-    peers = []
-    for line in output.splitlines():
-        device, pid = (value.strip() for value in line.split(",", 1))
-        if device.removeprefix("GPU-").lower() == uuid and int(pid) != os.getpid():
-            peers.append(int(pid))
-    if peers:
-        raise RuntimeError(
-            f"Other compute processes on benchmark GPU: {peers}. "
-            "Aborting: any timing from this interrupted run is not an isolated "
-            "performance result. Retry when this GPU is idle; do not stop others' jobs."
-        )
+else:
+    from bench_cudnn_frost_common import (
+        activation_reference,
+        capture,
+        check_idle_gpu,
+        emit,
+        error,
+        measure,
+    )
 
 
 def configure_source_jit():
@@ -94,7 +88,10 @@ def benchmark(args):
     torch.manual_seed(41)
     e, h, i = args.experts, args.hidden, args.intermediate
     if args.artifact_root is not None:
-        from flashinfer.experimental.cudnn_frost_selected_kernels import fc2, runtime
+        from flashinfer.experimental.cudnn_frost_selected_kernels.bf16 import (
+            fc2,
+            runtime,
+        )
 
         # Use one explicit pool, so re-testing an export after packaging it does
         # not produce duplicate artifact ids. Neither runtime module is changed
@@ -202,7 +199,7 @@ def benchmark(args):
         # Benchmark-only dispatcher ablation, never a change to an existing runner.
         layers["original"]._additional_candidates = lambda *args: []
         if args.probe_cudnn_frost:
-            from flashinfer.experimental.cudnn_frost_selected_kernels.moe import (
+            from flashinfer.experimental.cudnn_frost_selected_kernels.bf16.moe import (
                 CudnnFrostBf16MoeRunner,
             )
 
@@ -370,17 +367,6 @@ def benchmark(args):
             print(json.dumps(dict(tokens=tokens, cudnn_frost_sweep=ranked)), flush=True)
 
 
-def emit(file, record, *, quiet=False):
-    file.write(json.dumps(record) + "\n")
-    if quiet:
-        return
-    file.flush()
-    print(
-        json.dumps({k: v for k, v in record.items() if k not in ("ranked", "samples")}),
-        flush=True,
-    )
-
-
 def configs(small=False, wide_swap=False):
     # CTA M/N, MMA M, CTA group, cluster N. K is 128 bytes.
     normal = [(128, 128, 128, 1, 1)]
@@ -485,7 +471,9 @@ def export_task(opts):
     try:
         kernel = export_one(opts)
         if opts.warm_source_jit:
-            from flashinfer.experimental.cudnn_frost_selected_kernels import runtime
+            from flashinfer.experimental.cudnn_frost_selected_kernels.bf16 import (
+                runtime,
+            )
 
             # Instantiate the shared template before compiling. The rendered
             # digest includes geometry, preventing cross-configuration cache hits.
@@ -657,60 +645,6 @@ def export(args, file):
     )
 
 
-def capture(fn, batch, warmup=3):
-    for _ in range(warmup):
-        fn()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        for _ in range(batch):
-            fn()
-    return graph
-
-
-def measure(graph, iterations, batch, *, warmup=True):
-    if warmup:
-        graph.replay()
-    start, end = (torch.cuda.Event(enable_timing=True) for _ in range(2))
-    start.record()
-    for _ in range(iterations):
-        graph.replay()
-    end.record()
-    end.synchronize()
-    return start.elapsed_time(end) / (iterations * batch)
-
-
-def error(out, ref):
-    value = (
-        (out.float() - ref.float()).norm() / ref.float().norm().clamp_min(1e-20)
-    ).item()
-    if not torch.isfinite(out).all().item() or not value < 0.01:
-        raise RuntimeError(f"cuDNN Frost numerical check failed: relative L2={value}")
-    return value
-
-
-def activation_reference(values, name):
-    import torch.nn.functional as F
-
-    if ACTIVATIONS[name]().is_gated:
-        up, gate = values.chunk(2, dim=-1)
-        if name == "swiglu":
-            return F.silu(gate) * up
-        if name == "swiglu_step":
-            return F.silu(gate).clamp(max=7.0) * up.clamp(-7.0, 7.0)
-        if name == "situ":
-            return (4.0 * torch.tanh(gate / 4.0) * torch.sigmoid(gate)) * (
-                25.0 * torch.tanh(up / 25.0)
-            )
-        return F.gelu(gate, approximate="tanh" if name == "geglu_tanh" else "none") * up
-    return {
-        "relu2": lambda x: F.relu(x).square(),
-        "relu": F.relu,
-        "gelu": F.gelu,
-        "silu": F.silu,
-        "identity": lambda x: x,
-    }[name](values)
-
-
 def reference(act, w1, w2, activation="swiglu"):
     x, ids, scores = act.hidden_states_q, act.topk_ids, act.topk_weights
     expanded = torch.zeros(*ids.shape, x.shape[1], device=x.device, dtype=torch.float32)
@@ -754,7 +688,11 @@ def measure_stage(fn, out, ref, args):
 
 
 def sweep(args, file):
-    from flashinfer.experimental.cudnn_frost_selected_kernels import fc2, moe, runtime
+    from flashinfer.experimental.cudnn_frost_selected_kernels.bf16 import (
+        fc2,
+        moe,
+        runtime,
+    )
     from flashinfer.fused_moe import MoEActivationPack
 
     runtime._artifact_roots = lambda: (args.artifacts,)

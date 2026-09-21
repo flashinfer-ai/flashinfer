@@ -1,4 +1,4 @@
-"""Export standalone cuDNN Frost BF16 Python kernels for FlashInfer runtime JIT."""
+"""Export standalone cuDNN Frost grouped kernels for FlashInfer runtime JIT."""
 
 from __future__ import annotations
 
@@ -31,9 +31,17 @@ def _build_graph(
     experts: int,
     groups: int,
     op: str = "grouped_gemm1_swiglu",
+    dtype: str = "bf16",
 ):
     import cudnn
 
+    if dtype not in ("bf16", "mxfp8"):
+        raise ValueError(f"unsupported export dtype {dtype!r}")
+    if dtype == "mxfp8" and (n % 128 or k % 128):
+        raise ValueError("MXFP8 export requires N and K divisible by 128")
+    data_type = (
+        cudnn.data_type.FP8_E4M3 if dtype == "mxfp8" else cudnn.data_type.BFLOAT16
+    )
     graph = cudnn.pygraph(
         io_data_type=cudnn.data_type.BFLOAT16,
         intermediate_data_type=cudnn.data_type.FLOAT,
@@ -43,14 +51,32 @@ def _build_graph(
         name="token",
         dim=[1, s, k],
         stride=[s * k, k, 1],
-        data_type=cudnn.data_type.BFLOAT16,
+        data_type=data_type,
     )
     gate = graph.tensor(
         name="gate_weight",
         dim=[experts, k, n],
         stride=[k * n, 1, k],
-        data_type=cudnn.data_type.BFLOAT16,
+        data_type=data_type,
     )
+
+    def dequantize(tensor, name, token=False):
+        if dtype == "bf16":
+            return tensor
+        sf_k = k // 32
+        scales = graph.tensor(
+            name=name,
+            dim=[1, s, sf_k] if token else [experts, sf_k, n],
+            stride=[s * sf_k, sf_k, 1] if token else [sf_k * n, 1, sf_k],
+            data_type=cudnn.data_type.FP8_E8M0,
+            reordering_type=cudnn.tensor_reordering.F8_128x4,
+        )
+        return graph.block_scale_dequantize(
+            input=tensor, descale=scales, block_size=[1, 32] if token else [32, 1]
+        )
+
+    token = dequantize(token, "token_scale", token=True)
+    gate = dequantize(gate, "gate_weight_scale")
     if op == "grouped_gemm2":
         offsets = graph.tensor(
             name="first_token_offset",
@@ -75,8 +101,9 @@ def _build_graph(
         name="up_weight",
         dim=[experts, k, n],
         stride=[k * n, 1, k],
-        data_type=cudnn.data_type.BFLOAT16,
+        data_type=data_type,
     )
+    up = dequantize(up, "up_weight_scale")
     offsets = graph.tensor(
         name="first_token_offset",
         dim=[groups, 1, 1],
@@ -337,7 +364,6 @@ def export_one(args: argparse.Namespace) -> dict[str, Any]:
         config = next((c for c in tile_config.CATALOG if c.name == args.config), None)
         if config is None:
             raise ValueError(f"unknown cuDNN Frost tile config {args.config!r}")
-    swap_ab = getattr(config, "swap_ab", False)
     if getattr(config, "split_k_slices", 1) != 1:
         raise ValueError(
             "the exported MoE ABI does not support split-K launch sequences"
@@ -348,9 +374,20 @@ def export_one(args: argparse.Namespace) -> dict[str, Any]:
     if target != arch.replace("_", ""):
         raise ValueError("CUTE_DSL_ARCH must match the export GPU architecture")
     op = getattr(args, "op", "grouped_gemm1_swiglu")
-    graph = _build_graph(args.s, args.n, args.k, args.experts, args.groups, op)
+    dtype = getattr(args, "dtype", "bf16")
+    graph = _build_graph(args.s, args.n, args.k, args.experts, args.groups, op, dtype)
     with force_stg_epi(args.store_mode == "stg"):
         compiled = _compile_graph(graph, config, args.cta_group, args.scheduler)
+    return _export_compiled(args, compiled, config, arch)
+
+
+def _export_compiled(args, compiled, config, arch):
+    """Seal a producer result, also usable by source-only export tooling."""
+    if getattr(config, "cta_group", args.cta_group) != args.cta_group:
+        raise ValueError("exported CTA group must match the rendered tile config")
+    op = getattr(args, "op", "grouped_gemm1_swiglu")
+    dtype = getattr(args, "dtype", "bf16")
+    swap_ab = getattr(config, "swap_ab", False)
     activation = (
         op.removeprefix("grouped_gemm1_") if op != "grouped_gemm2" else "identity"
     )
@@ -359,6 +396,8 @@ def export_one(args: argparse.Namespace) -> dict[str, Any]:
         raise RuntimeError(
             f"cuDNN Frost did not compile {op} as {expected_gemms} grouped GEMM(s)"
         )
+    if compiled.chain.has_block_scale != (dtype == "mxfp8"):
+        raise RuntimeError("cuDNN Frost compiled the wrong quantization pipeline")
     store_modes = tuple(compiled.store_modes)
     if len(store_modes) != 1 or store_modes[0] not in ("stg", "tma"):
         raise RuntimeError(
@@ -370,7 +409,7 @@ def export_one(args: argparse.Namespace) -> dict[str, Any]:
             f"cuDNN Frost did not produce the requested TMA-store kernel for {config.name}"
         )
     template = _select_template(compiled.chain, config, args.cta_group, args.scheduler)
-    prefix = op
+    prefix = op if dtype == "bf16" else f"block_scale_{op}"
     artifact_id = args.id or _slug(
         f"{prefix}_{arch}_e{args.experts}_n{args.n}_k{args.k}_"
         f"g{args.groups}_{config.name}_{args.cta_group}cta_{args.scheduler}_"
@@ -382,11 +421,11 @@ def export_one(args: argparse.Namespace) -> dict[str, Any]:
         output_dir,
         artifact_id,
         replace=args.replace,
-        template_family=f"{op}_bf16_{'swap_ab' if swap_ab else 'normal'}_{actual_store_mode}",
+        template_family=f"{op}_{dtype}_{'swap_ab' if swap_ab else 'normal'}_{actual_store_mode}",
         swap_ab=swap_ab,
     )
     tma_slots: frozenset[int] = getattr(compiled, "tma_slots", frozenset())
-    aux_names = list(compiled.aux_names)
+    aux_names = [aux.name for aux in compiled.chain.aux_tensors]
     launch_tail = aux_names + ["output"] if 0 in tma_slots else ["output"] + aux_names
     expected_aux = (
         {"scale", "gate_scale", "linear_scale"} if activation == "situ" else {"scale"}
@@ -397,9 +436,9 @@ def export_one(args: argparse.Namespace) -> dict[str, Any]:
         launch_tail = ["output"]
     return {
         "id": artifact_id,
-        "op": op,
+        "op": prefix,
         "arch": arch,
-        "abi": f"cudnn_frost_{op}{'_swap_ab' if swap_ab else ''}_v1",
+        "abi": f"cudnn_frost_{prefix}{'_swap_ab' if swap_ab else ''}_v1",
         "source": source,
         "workspace_bytes": int(compiled.workspace_bytes),
         "launch": {"tail": launch_tail},
@@ -409,10 +448,20 @@ def export_one(args: argparse.Namespace) -> dict[str, Any]:
             "k": args.k,
             "experts": args.experts,
             "groups": args.groups,
-            "token_dtype": "bfloat16",
-            "weight_dtype": "bfloat16",
+            "token_dtype": "float8_e4m3fn" if dtype == "mxfp8" else "bfloat16",
+            "weight_dtype": "float8_e4m3fn" if dtype == "mxfp8" else "bfloat16",
             "output_dtype": "bfloat16",
             "activation": activation,
+            **(
+                {
+                    "scale_dtype": "float8_e8m0fnu",
+                    "block_size": 32,
+                    "scale_layout": "F8_128x4",
+                    "token_scale_layout": "segmented_F8_128x4",
+                }
+                if dtype == "mxfp8"
+                else {}
+            ),
         },
         "tactic": {
             "swap_ab": swap_ab,
@@ -463,6 +512,7 @@ def _write_manifest(output_dir: Path, kernel: dict[str, Any], replace: bool) -> 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--dtype", choices=("bf16", "mxfp8"), default="bf16")
     parser.add_argument(
         "--op",
         choices=(*(f"grouped_gemm1_{name}" for name in ACTIVATIONS), "grouped_gemm2"),

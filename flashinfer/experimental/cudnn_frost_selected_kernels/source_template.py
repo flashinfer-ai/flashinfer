@@ -48,8 +48,10 @@ def _bf16_tma_store(constants: dict[str, str], swap: bool) -> str:
 
     n = value("epi_n")
     rows = value("epi_tile_mn")[0]
-    packed = value("epi_packed_lanes")
-    dp22 = value("epi_dp22")
+    # Block-scale templates use full epilogue warps and omit these dense-only
+    # constants. extract_template still verifies the reconstructed source AST.
+    packed = ast.literal_eval(constants.get("epi_packed_lanes", "False"))
+    dp22 = ast.literal_eval(constants.get("epi_dp22", "False"))
     row_elems = value("epi_row_elems")
     if constants["epi_store_dtype"] != "cutlass.BFloat16":
         raise ValueError("TMA source templates currently support BF16 output only")
@@ -149,8 +151,17 @@ def render_source(template: str, parameters: dict) -> str:
 
 def extract_template(source: str, *, swap_ab: bool) -> tuple[str, dict]:
     """Factor a concrete source; refuse any non-equivalent reconstruction."""
-    begin = source.index("# Tile config:")
-    end = source.index("# Tensormap workspace slots", begin)
+    header = (
+        "# Block-scale config:"
+        if "# Block-scale config:" in source
+        else "# Tile config:"
+    )
+    begin = source.index(header)
+    end = source.find("# Tensormap workspace slots", begin)
+    if end < 0:
+        # The block-scale swap-AB template starts its workspace formulas
+        # directly, without the dense/normal template's section comment.
+        end = source.index("moe_desc_slots =", begin)
     constants = []
     for statement in ast.parse(source[begin:end]).body:
         if not (

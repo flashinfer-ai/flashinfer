@@ -1,4 +1,4 @@
-# cuDNN Frost-selected BF16 MoE kernel PoC
+# cuDNN Frost-selected MoE kernel PoC
 
 This experimental backend follows Cake's source-distribution model. cuDNN Frost is
 an offline generator: FlashInfer ships standalone Python/CuTe DSL kernels and a
@@ -36,6 +36,21 @@ the target architecture. Set `FLASHINFER_CUTE_DSL_DISABLE_CACHE=1` to compile
 without persisting CuTe DSL artifacts; neither mode writes compiled objects
 into the installed package.
 
+An explicit `FLASHINFER_CUDNN_FROST_PTXAS=/path/to/ptxas` selects an external
+assembler for both BF16 and MXFP8. CuTe still generates the original PTX and
+host/TVM-FFI wrapper. Frost assembles that PTX with the selected executable,
+replaces the GPU binary initializer in standard compiler IR, and exports a new
+host object through CuTe's existing interface. The source, tensor descriptors,
+launch arguments and kernel algorithm are unchanged. The resolved executable
+path, version and SHA-256 participate in memory, disk and tactic cache identities.
+Disabled disk caching and failed persistence also execute the external binary.
+
+The current SM107 MXFP8 validation uses CUDA 13.5 PTXAS: the installed DSL's
+bundled CUDA 13.4 assembler produced incorrect dynamic tensor-map dimension
+updates in the original kernels. Setting `CUDA_HOME` alone does not select the
+external assembler. Without the explicit Frost option, the existing bundled
+compiler path remains in use; it is not covered by this compiler workaround.
+
 The original operation in this prototype is cuDNN Frost's fused dual grouped GEMM1:
 
 ```text
@@ -52,6 +67,203 @@ scatter are outside this API.
 An independent FC2 grouped-GEMM PoC and a full `CudnnFrostBf16MoeRunner` are also
 implemented. The old cuDNN Frost-FC1/CUTLASS-FC2 hybrid integration has been removed
 completely; the new runner does not call an existing backend.
+
+## Runtime layout
+
+All data types have a sibling package (`bf16/`, `mxfp8/`) with a
+`runtime.py` for their numerical contracts and launch arguments. The shared
+root `runtime.py` handles source verification, template materialization,
+compilation, caching and CUDA streams. Artifact paths are always selected by
+an explicit dtype through `artifact_root(dtype)`.
+
+Both dtype packages provide `moe.py` for full MoELayer integration and a
+lightweight `support.py` for numerical-contract admission and deferred runner
+construction. The root `support.py` contains the shared model/top-k and token-range
+policy. BF16 also provides its standalone `fc2.py`; MXFP8's grouped FC1 and FC2 share the same
+block-scale runtime.
+
+## Artifact layout
+
+Artifacts are grouped by operand dtype under a common root:
+
+```text
+artifacts/
+  bf16/
+    cudnn_frost_selected_kernels.json
+    moe_shortlists.json
+    sources/
+  mxfp8/
+    cudnn_frost_selected_kernels.json
+    moe_shortlists.json
+    sources/
+```
+
+Manifest source paths are relative to their dtype directory. Runtime discovery
+selects that directory; export/benchmark `--output-dir`, `--artifacts`, and
+`--selected-dir` refer to a dtype directory, not the shared parent. Source
+packaging and generated-file exclusions cover the same layout for future dtypes.
+
+## MXFP8 block-scale grouped pipelines
+
+`mxfp8/runtime.py` provides explicit prepared execution of frozen MXFP8 × MXFP8
+FC1/activation and FC2 pipelines on SM107a. Both operands use E4M3 data with E8M0
+scales per 32 K elements. Both grouped stages produce BF16 output.
+`mxfp8/moe.py` and `csrc/moe_mxfp8.cu` compose them into the automatic
+`cudnn_frost_mxfp8` MoELayer candidate:
+
+```text
+precomputed top-k ids/weights
+  -> histogram + prefix + gather E4M3 data and E8M0 scales
+  -> frozen FC1 + activation -> BF16
+  -> per-32-element MXFP8 requantization + segmented scale packing
+  -> frozen FC2 -> BF16
+  -> FP32 weighted reduction -> BF16 output
+```
+
+The runner consumes the existing `cutlass_mxfp8` weight view, including its
+packed per-expert weight scales. Activation scales may use linear or swizzled
+F8_128x4 layout. Gated weights retain the canonical **[up, gate]** data layout;
+their scale buffers are split into the frozen kernels' contiguous expert layout
+during preparation. Per-expert FC1/FC2 input scales must be one. Bias, shared
+experts, expert parallelism, non-default activation parameters and logits-based
+routing are unsupported.
+
+Automatic admission requires SM107a, MXFP8 operands, BF16 finalized output,
+precomputed routing and a matching measured shortlist. As for BF16, each
+`(activation,E,H,I,top_k,tokens)` profile supplies two FC1/activation and two
+FC2 configurations, giving four complete plans to autotune against the original
+eligible backends. Intermediate token counts use the next measured profile;
+native plans use the exact input shape. Calls beyond the largest token profile
+or without a matching table entry retain their original candidates.
+
+Prepare and autotune outside CUDA Graph capture. Activation data, activation
+scales, expert ids and routing weights may change between graph replays.
+Prepared weights and weight scales must remain static. For ordinary tensors,
+changing weight scales and repacking refreshes the copied scale buffers, and
+existing graphs must be captured again. Inference tensors have no version
+counter: replace the tensor object when changing prepared weights or scales.
+Keep the layer alive for its graphs and use one instance per stream/thread.
+
+The `artifacts/mxfp8/` pool retains 169 selected configurations in 39 source
+templates, with 400 measured two-by-two profiles. The offline pool covers all
+44 families: ten FC1 activations and one shared FC2, each with normal/swap-AB
+and STG/TMA output variants. Only families used by the selected profiles ship.
+Geometry records share these templates. CTA/MMA/cluster geometry,
+pipeline stages, scale-factor geometry, and persistent grid parameters live
+in `source.parameters`, not in duplicated Python implementations. At runtime
+`source_template.py` injects them before JIT; they remain compiler constants,
+not dynamic device branches. The exporter requires AST equality between
+every reconstructed source and the original Frost-rendered source.
+
+Export success alone does not establish correctness or performance. Validate
+and select candidates on the deployment GPU: shared-memory, L2 and persistent
+grid budgets are part of the compiled specialization. Each dtype has its own
+manifest and shortlist under the same artifact layout.
+
+All ten default activation contracts are included: gated `SwiGLU`, `GeGLU`,
+`GeGLUTanh`, `SwiGLUStep`, `SiTU`; non-gated `Identity`, `ReLU`, `ReLU2`,
+`GELU`, `SiLU`. SiTU binds gate/linear scales 4/25 in the generated auxiliary
+argument order; SwiGLUStep uses limit 7. FC1 fuses activation on FP32
+accumulators before the BF16 output conversion. The optional `scale` argument
+multiplies the activation output for every FC1, including non-gated variants.
+
+Export a geometry using the same exporter as BF16:
+
+```bash
+python -m flashinfer.experimental.cudnn_frost_selected_kernels.export \
+  --dtype mxfp8 --op grouped_gemm1_swiglu \
+  --config CONFIG_sm100_128x128x128_128x128x64_cluster1x1_1ctamma \
+  --cta-group 1 --store-mode stg \
+  --s 1024 --n 256 --k 128 --experts 8 \
+  --output-dir "$ARTIFACT_DIR" --cudnn-frost-revision "$FROST_REVISION"
+```
+
+Use `--op grouped_gemm2` for FC2. Changing geometry while retaining the same
+operation, dtype, orientation and output store reuses the source file; an
+unexpected source difference is an error rather than a new geometry-named file.
+
+For prepared grouped execution:
+
+```python
+from flashinfer.experimental.cudnn_frost_selected_kernels.mxfp8 import runtime as mxfp8
+
+# x: grouped E4M3 [S,K]; gate/up: E4M3 [E,N,K]; offsets: int32 [G].
+# x_sf: logical E8M0 bytes [S,K/32]; gate_sf/up_sf: [E,N,K/32].
+# Choose an artifact matching the operation, architecture and shape contract.
+kernel = next(k for k in mxfp8.discover()
+              if k.fc1 and k.activation == "swiglu" and not k.swap_ab)
+plan = mxfp8.PreparedMxfp8GroupedGemm(
+    kernel, x, (gate, up), offsets,
+    mxfp8.pack_token_scales(x_sf, offsets),
+    (mxfp8.pack_weight_scales(gate_sf), mxfp8.pack_weight_scales(up_sf)),
+    output,  # BF16 [S,N], caller-owned
+)
+plan()  # launch on the current stream; supports subsequent CUDA Graph capture
+```
+
+Non-gated FC1 and FC2 take one weight/scale tuple. Group `g` uses expert `g % E`; empty and
+uneven groups are supported. N and K must be divisible by 128 in this initial
+runtime contract. Scale packing preserves E8M0 bytes, pads each token group
+independently to 128 rows, and applies F8_128x4 ordering. The token allocation
+reserves capacity for every partition with the same S/G. Preparation reads
+offsets on the host and must run outside capture. If group boundaries change,
+repack token scales for those boundaries before replaying the plan. Each
+concurrent stream needs its own plan/workspace. No cuDNN import is required
+for discovery, scale packing, JIT, or execution.
+
+### MXFP8 benchmarks
+
+The `benchmark` subcommand measures the complete MoELayer pipeline and compares
+the original eligible backend pool, the same pool with automatic Frost
+admission, and Frost alone:
+
+```bash
+python benchmarks/bench_cudnn_frost_moe_mxfp8.py benchmark \
+  --activation swiglu --experts 8 --hidden 4096 --intermediate 14336 \
+  --top-k 2 --tokens 1,16,128,512,2048,4096,8192,12288 \
+  --routing uniform --verify-locked-clocks --output "$RESULT_DIR/mxfp8_e2e.jsonl"
+```
+
+The benchmark preserves the original backend tactics, checks all four Frost
+plans eagerly and through CUDA Graph replay, and records actual autotune winners.
+It alternates timing order over batched graph replays and reports numerical
+error, raw timings, source identities and GPU telemetry. Use `--artifacts DIR`
+to benchmark another selected pool containing `moe_shortlists.json`; the output
+records the exact artifact, shortlist, source and compiler environment identities.
+Backend eligibility
+follows the existing registry: on SM107, the current original MXFP8 pool is
+CUTLASS; TRT-LLM MXFP8 supports SM100/SM103. Stage timing cannot establish an
+end-to-end improvement.
+
+`benchmarks/bench_cudnn_frost_moe_mxfp8.py` validates and times the prepared
+grouped stages. Select an idle GPU with `CUDA_VISIBLE_DEVICES` and set
+`RESULT_DIR` to a directory for results:
+
+```bash
+python benchmarks/bench_cudnn_frost_moe_mxfp8.py \
+  --activation all --stage both --tokens 128,1024 \
+  --experts 8 --hidden 1024 --intermediate 512 --top-k 2 \
+  --output "$RESULT_DIR/mxfp8.jsonl"
+```
+
+This sweeps all matching geometry, normal/swap-AB and STG/TMA candidates for
+all ten FC1 activations and the shared FC2. FC2 runs once per shape, independently
+of the selected FC1 activations. `--tokens` counts tokens before routing;
+each stage processes `tokens * top_k` grouped rows. Use `--activation NAME`
+and `--stage fc1|fc2` to narrow the sweep, `--artifacts DIR` to select another
+MXFP8 artifact directory, or repeat `--kernel-id ID` to restrict its candidates.
+The output must be a new file. JSONL `candidate` records contain each artifact's
+geometry, timing samples and numerical error; `best` records rank candidates
+separately for each stage, activation and shape.
+
+Every candidate is checked against a dequantized FP64 GEMM reference with FP32
+activation and BF16 output, both eagerly and through CUDA Graph replay, before
+timing. FC1 and FC2 use independent random inputs. Timings include workspace
+reset, grouped GEMM and the fused FC1 activation; they exclude routing, scale
+packing, intermediate requantization, finalization, reference calculation and
+compilation. Repeated graph replay uses hot inputs. These stage timings must
+not be summed into a full MoE latency or compared directly with the BF16
+script's complete routed MoE measurements.
 
 ## Activation sources
 
@@ -88,8 +300,8 @@ precomputed top-k ids/weights
   -> vectorized FP32 weighted reduction -> BF16 output
 ```
 
-`moe.py` owns support validation, compound tactics, native plans and workspace.
-`csrc/moe.cu` owns routing/finalize and calls the two native exported functions
+`bf16/moe.py` owns support validation, compound tactics, native plans and workspace.
+`csrc/moe_bf16.cu` owns routing/finalize and calls the two native exported functions
 directly, without a Python callback between stages. Both the small embedding
 module and the GEMM kernels are compiled on first use through FlashInfer's JIT
 infrastructure. Workspace counters
@@ -130,8 +342,8 @@ exact-shape plans are never reused across rounded token-count buckets.
 
 Automatic candidates are registered lazily through
 `fused_moe/auto_candidates.py`; the layer does not contain cuDNN Frost-specific shape
-checks, runner fields, or cache branches. `support.py` owns admission and the
-deferred runner factory. Winner keys include the eligible automatic candidate
+checks, runner fields, or cache branches. Each dtype's `support.py` owns admission
+and the deferred runner factory. Winner keys include the eligible automatic candidate
 set and exact input shape, so incompatible weight views cannot reuse a cuDNN Frost
 winner. Other registrations require the normal experimental-auto gate; the
 branch-local cuDNN Frost exception described below remains explicit.
@@ -145,7 +357,7 @@ they do not specify the source kernel's target architecture.
 
 The SM107a pool has 400 shape profiles across SwiGLU, GeGLU, GeGLUTanh,
 SwiGLUStep, SiTU, GELU, Identity, ReLU, ReLU2 and SiLU.
-`artifacts/moe_shortlists.json` registers two FC1 and two FC2 artifact identities
+`artifacts/bf16/moe_shortlists.json` registers two FC1 and two FC2 artifact identities
 per profile. Only those kernels are compiled and combined: online autotuning
 sees at most four complete MoE plans, then compares the winning Frost plan
 against every original eligible backend.
@@ -165,7 +377,7 @@ routing inputs, and caches their source-qualified tactic identities.
 
 Small-shape configurations cover normal/swap AB and STG/TMA for graph tests.
 Legacy gated and FC2 configurations remain available through explicit selection.
-The package contains 458 configurations and 44 source templates: ten FC1
+The BF16 pool contains 458 configurations and 44 source templates: ten FC1
 activations plus FC2, each with normal/swap AB and STG/TMA variants. Each family
 has one maintained implementation; historical producer bodies are removed.
 The templates use the MoE implementation in cuDNN Frontend revision
@@ -198,9 +410,11 @@ the external [up, gate]/down weight layout and grouped workspace layout stay the
 same. Normal-ABI records without `swap_ab` remain valid. Contradictory ABI
 metadata is rejected before loading a kernel.
 
-`benchmarks/bench_cudnn_frost_moe_bf16.py` is the single manual benchmark and tuning
-entry point. Run it with `--help`, or `<command> --help` for command-specific
-options:
+`benchmarks/bench_cudnn_frost_moe_bf16.py` is the BF16 manual benchmark and tuning
+entry point. Its `benchmark` command measures complete routed MoE calls;
+the [MXFP8 benchmark](#mxfp8-benchmarks) provides both grouped stage measurements
+and a complete MoELayer `benchmark` command.
+Run the BF16 script with `--help`, or `<command> --help` for command-specific options:
 
 | Command | Purpose |
 | --- | --- |
@@ -233,7 +447,7 @@ python benchmarks/bench_cudnn_frost_moe_bf16.py sweep --source-jit --adaptive \
   --output /tmp/cudnn_frost-sm107-refine.jsonl
 python benchmarks/bench_cudnn_frost_moe_bf16.py select \
   --artifacts /tmp/cudnn_frost-sm107 --results /tmp/cudnn_frost-sm107-refine.jsonl \
-  --selected-dir flashinfer/experimental/cudnn_frost_selected_kernels/artifacts \
+  --selected-dir flashinfer/experimental/cudnn_frost_selected_kernels/artifacts/bf16 \
   --output /tmp/cudnn_frost-sm107-selection.jsonl
 ```
 
@@ -324,7 +538,7 @@ selected for packaging.
 
 ## Standalone cuDNN Frost FC2 PoC
 
-`fc2.py` implements an internal prepared launcher for:
+`bf16/fc2.py` implements an internal prepared launcher for:
 
 ```text
 grouped_intermediate[S,I] @ down_weight[expert,H,I].T -> grouped_output[S,H]
@@ -353,7 +567,7 @@ Example build-box export (repeat with the other tile/store modes and shape):
 ```bash
 python -m flashinfer.experimental.cudnn_frost_selected_kernels.export \
   --op grouped_gemm2 \
-  --output-dir flashinfer/experimental/cudnn_frost_selected_kernels/artifacts \
+  --output-dir flashinfer/experimental/cudnn_frost_selected_kernels/artifacts/bf16 \
   --cudnn-frost-revision 667fe4ce8ce437866217066f075fd4dcecad6eac \
   --config CONFIG_sm100_128x256x128_128x256x32_cluster2x1_2ctamma \
   --cta-group 2 --store-mode stg --experts 12 --n 7168 --k 3072
@@ -390,9 +604,11 @@ backend-specific implementation and shape admission stay in this directory.
 The standalone FC1 API, offline exporter, FC2 prepared launcher and packaged
 source kernels remain. Core correctness and integration tests live in
 `tests/experimental/test_cudnn_frost_selected_kernels.py`; redundant standalone and
-auxiliary mock tests are omitted. Benchmarking and offline tuning share
+auxiliary mock tests are omitted. BF16 benchmarking and offline tuning share
 `benchmarks/bench_cudnn_frost_moe_bf16.py`; the earlier standalone FC1/FC2 benchmark
-scripts have been removed. These tools do not restore the removed hybrid hooks.
+scripts have been removed. MXFP8 grouped-stage measurements use
+`benchmarks/bench_cudnn_frost_moe_mxfp8.py`. These tools do not restore the removed
+hybrid hooks.
 
 ## Generate artifacts
 
@@ -401,7 +617,7 @@ CuTe DSL revisions:
 
 ```bash
 python -m flashinfer.experimental.cudnn_frost_selected_kernels.export \
-  --output-dir flashinfer/experimental/cudnn_frost_selected_kernels/artifacts \
+  --output-dir flashinfer/experimental/cudnn_frost_selected_kernels/artifacts/bf16 \
   --cudnn-frost-revision 667fe4ce8ce437866217066f075fd4dcecad6eac \
   --config CONFIG_sm100_128x128x128_128x128x32_cluster2x1_2ctamma \
   --store-mode tma \
