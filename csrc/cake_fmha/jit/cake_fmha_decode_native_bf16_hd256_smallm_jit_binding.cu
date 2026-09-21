@@ -30,6 +30,9 @@
 #ifndef GROUP
 #error "GROUP must be supplied by the route-specific JIT"
 #endif
+#ifndef Q_BOX_ROWS
+#error "Q_BOX_ROWS must be supplied by the route-specific JIT"
+#endif
 #ifndef NUM_SPLIT
 #error "NUM_SPLIT must be supplied by the route-specific JIT"
 #endif
@@ -286,7 +289,8 @@ CUtensorMap EncodeTmaPackedQ(TensorView tensor) {
                             static_cast<uint64_t>(tensor.size(0)), 4u};
   uint64_t global_strides[3] = {static_cast<uint64_t>(tensor.stride(1) * 2),
                                 static_cast<uint64_t>(tensor.stride(0) * 2), 128u};
-  uint32_t box_dim[4] = {64u, static_cast<uint32_t>(GROUP), static_cast<uint32_t>(Q_LEN), 2u};
+  // The box always fills the whole packed-row tile: Q_BOX_ROWS = rows / GROUP tokens.
+  uint32_t box_dim[4] = {64u, static_cast<uint32_t>(GROUP), static_cast<uint32_t>(Q_BOX_ROWS), 2u};
   uint32_t elem_strides[4] = {1u, 1u, 1u, 1u};
   CUtensorMap tm;
   CUresult result = cuTensorMapEncodeTiled(
@@ -349,7 +353,10 @@ void cake_paged_attention_decode(
     Optional<TensorView> sparse_mla_top_k_lens) {
   constexpr int kHeadDim = 256;
   constexpr int kNumRows = CAKE_FMHA_SMALLM_N_ROWS;
-  static_assert(Q_LEN * GROUP == kNumRows, "Q_LEN * GROUP must equal the packed row count");
+  static_assert(Q_LEN * GROUP <= kNumRows && Q_LEN * GROUP > kNumRows / 2,
+                "Q_LEN * GROUP must fit the smallest 32/64-row tile (rows above it are padding)");
+  static_assert(kNumRows % GROUP == 0 && Q_BOX_ROWS * GROUP == kNumRows,
+                "Q_BOX_ROWS * GROUP must cover the whole packed-row tile");
   TVM_FFI_ICHECK_EQ(query.dtype(), dl_bfloat16);
   TVM_FFI_ICHECK_EQ(key_cache.dtype(), dl_bfloat16);
   TVM_FFI_ICHECK_EQ(value_cache.dtype(), dl_bfloat16);

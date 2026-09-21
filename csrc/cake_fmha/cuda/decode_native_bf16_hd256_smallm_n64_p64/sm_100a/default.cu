@@ -90,6 +90,9 @@ static_assert(alignof(CakeFmhaTensorMap) >= alignof(CUtensorMap), "CakeFmhaTenso
 #ifndef GROUP
 #define GROUP 8
 #endif
+#ifndef Q_BOX_ROWS
+#define Q_BOX_ROWS 8
+#endif
 #ifndef NUM_SPLIT
 #define NUM_SPLIT 148
 #endif
@@ -899,27 +902,29 @@ kernel_cake_fmha_decode_native_bf16_hd256_smallm_n64_p64(CakeFmhaTensorMap const
                             }
                             out[k_3] = total_k * inv_sum;
                         }
-                        int j_row = r / GROUP;
-                        int h_row = r % GROUP;
-                        int q_row = batch_idx * Q_LEN + j_row;
-                        int q_head = kv_head_idx * GROUP + h_row;
-                        int o_idx = (q_row * num_q_heads + q_head) * HEAD_DIM + d0;
-                        {
-                            __nv_bfloat162 _pk[4];
-                            _pk[0] = __floats2bfloat162_rn(out[0 + 0], out[0 + 1]);
-                            _pk[1] = __floats2bfloat162_rn(out[0 + 2], out[0 + 3]);
-                            _pk[2] = __floats2bfloat162_rn(out[0 + 4], out[0 + 5]);
-                            _pk[3] = __floats2bfloat162_rn(out[0 + 6], out[0 + 7]);
-                            *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(O_ptr + o_idx))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
-                        }
-                        if (lane_in_warp == 0) {
-                            float merged_lse = -CAKE_FMHA_INF;
-                            if (weight_sum > 0.0f) {
-                                float _log2_0;
-                                asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_0) : "f"(weight_sum));
-                                merged_lse = merged_max + _log2_0;
+                        if (r < Q_LEN * GROUP) {
+                            int j_row = r / GROUP;
+                            int h_row = r % GROUP;
+                            int q_row = batch_idx * Q_LEN + j_row;
+                            int q_head = kv_head_idx * GROUP + h_row;
+                            int o_idx = (q_row * num_q_heads + q_head) * HEAD_DIM + d0;
+                            {
+                                __nv_bfloat162 _pk[4];
+                                _pk[0] = __floats2bfloat162_rn(out[0 + 0], out[0 + 1]);
+                                _pk[1] = __floats2bfloat162_rn(out[0 + 2], out[0 + 3]);
+                                _pk[2] = __floats2bfloat162_rn(out[0 + 4], out[0 + 5]);
+                                _pk[3] = __floats2bfloat162_rn(out[0 + 6], out[0 + 7]);
+                                *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(O_ptr + o_idx))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
                             }
-                            *(reinterpret_cast<float*>(LSE_ptr + (q_row * num_q_heads + q_head)) + (0)) = merged_lse;
+                            if (lane_in_warp == 0) {
+                                float merged_lse = -CAKE_FMHA_INF;
+                                if (weight_sum > 0.0f) {
+                                    float _log2_0;
+                                    asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_0) : "f"(weight_sum));
+                                    merged_lse = merged_max + _log2_0;
+                                }
+                                *(reinterpret_cast<float*>(LSE_ptr + (q_row * num_q_heads + q_head)) + (0)) = merged_lse;
+                            }
                         }
                     }
                     asm volatile("barrier.sync 10, 384;" ::: "memory");
@@ -1210,27 +1215,29 @@ kernel_cake_fmha_decode_native_bf16_hd256_smallm_n64_p64(CakeFmhaTensorMap const
                             }
                             out_1[k_6] = total_k_1 * inv_sum_1;
                         }
-                        int j_row_1 = r_1 / GROUP;
-                        int h_row_1 = r_1 % GROUP;
-                        int q_row_1 = batch_idx_1 * Q_LEN + j_row_1;
-                        int q_head_1 = kv_head_idx_1 * GROUP + h_row_1;
-                        int o_idx_1 = (q_row_1 * num_q_heads + q_head_1) * HEAD_DIM + d0_1;
-                        {
-                            __nv_bfloat162 _pk[4];
-                            _pk[0] = __floats2bfloat162_rn(out_1[0 + 0], out_1[0 + 1]);
-                            _pk[1] = __floats2bfloat162_rn(out_1[0 + 2], out_1[0 + 3]);
-                            _pk[2] = __floats2bfloat162_rn(out_1[0 + 4], out_1[0 + 5]);
-                            _pk[3] = __floats2bfloat162_rn(out_1[0 + 6], out_1[0 + 7]);
-                            *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(O_ptr + o_idx_1))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
-                        }
-                        if (lane_in_warp_1 == 0) {
-                            float merged_lse_1 = -CAKE_FMHA_INF;
-                            if (weight_sum_1 > 0.0f) {
-                                float _log2_2;
-                                asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_2) : "f"(weight_sum_1));
-                                merged_lse_1 = merged_max_1 + _log2_2;
+                        if (r_1 < Q_LEN * GROUP) {
+                            int j_row_1 = r_1 / GROUP;
+                            int h_row_1 = r_1 % GROUP;
+                            int q_row_1 = batch_idx_1 * Q_LEN + j_row_1;
+                            int q_head_1 = kv_head_idx_1 * GROUP + h_row_1;
+                            int o_idx_1 = (q_row_1 * num_q_heads + q_head_1) * HEAD_DIM + d0_1;
+                            {
+                                __nv_bfloat162 _pk[4];
+                                _pk[0] = __floats2bfloat162_rn(out_1[0 + 0], out_1[0 + 1]);
+                                _pk[1] = __floats2bfloat162_rn(out_1[0 + 2], out_1[0 + 3]);
+                                _pk[2] = __floats2bfloat162_rn(out_1[0 + 4], out_1[0 + 5]);
+                                _pk[3] = __floats2bfloat162_rn(out_1[0 + 6], out_1[0 + 7]);
+                                *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(O_ptr + o_idx_1))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
                             }
-                            *(reinterpret_cast<float*>(LSE_ptr + (q_row_1 * num_q_heads + q_head_1)) + (0)) = merged_lse_1;
+                            if (lane_in_warp_1 == 0) {
+                                float merged_lse_1 = -CAKE_FMHA_INF;
+                                if (weight_sum_1 > 0.0f) {
+                                    float _log2_2;
+                                    asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_2) : "f"(weight_sum_1));
+                                    merged_lse_1 = merged_max_1 + _log2_2;
+                                }
+                                *(reinterpret_cast<float*>(LSE_ptr + (q_row_1 * num_q_heads + q_head_1)) + (0)) = merged_lse_1;
+                            }
                         }
                     }
                     asm volatile("barrier.sync 10, 384;" ::: "memory");

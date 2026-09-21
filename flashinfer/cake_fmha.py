@@ -630,6 +630,28 @@ def _smallm_sm_count(device: torch.device) -> int:
     return int(torch.cuda.get_device_properties(device).multi_processor_count)
 
 
+def _smallm_tile_rows(packed_rows: int) -> int | None:
+    """Instance tile (32 or 64 rows) holding ``q_len * group`` packed rows.
+
+    Rows in (16, 32] use the 32-row instance and rows in (32, 64] the 64-row
+    instance; rows above the packed count are tile padding the kernel never
+    stores.  Fewer than 17 rows are left to other routes.
+    """
+
+    if packed_rows <= 16 or packed_rows > 64:
+        return None
+    return 32 if packed_rows <= 32 else 64
+
+
+def _smallm_tile_rows_for(q_len: int, group: int) -> int | None:
+    """Tile rows for ``q_len * group`` packed rows when ``group`` divides the tile."""
+
+    n_rows = _smallm_tile_rows(q_len * group)
+    if n_rows is None or group <= 0 or n_rows % group:
+        return None
+    return n_rows
+
+
 def _smallm_num_split(
     *, tiles: int, sm_count: int, max_seq_len: int, n_rows: int
 ) -> int:
@@ -1081,19 +1103,19 @@ def select_cake_fmha_decode_route(
     no_block_scales = key_block_scales is None and value_block_scales is None
     if dtypes == (torch.bfloat16,) * 4:
         group = num_q_heads // num_kv_heads
-        smallm_rows = q_len * group
+        smallm_rows = _smallm_tile_rows_for(q_len, group)
         smallm_tiles = batch_size * num_kv_heads
         smallm_sm_count = _smallm_sm_count(device)
         smallm_num_split = _smallm_num_split(
             tiles=smallm_tiles,
             sm_count=smallm_sm_count,
             max_seq_len=max_seq_len,
-            n_rows=smallm_rows,
+            n_rows=smallm_rows or 64,
         )
         if (
             query.is_contiguous()
             and query.shape[2] == 256
-            and smallm_rows in (32, 64)
+            and smallm_rows is not None
             and page_size in (16, 32, 64)
             and key_cache.shape[3] == 256
             and kv_layout == "HND"
@@ -1377,7 +1399,7 @@ def _resolve_cake_fmha_decode_module(
         return (
             loader(
                 route.target,
-                route.q_len * group,
+                _smallm_tile_rows_for(route.q_len, group),
                 route.page_size,
                 route.q_len,
                 group,

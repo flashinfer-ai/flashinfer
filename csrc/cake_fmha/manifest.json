@@ -1171,52 +1171,52 @@
       "sha256": "84f1be6fd2eea536358c014b8721885c2d5a58b66e97d4088eb26198ad6ba20b"
     },
     "cuda/decode_native_bf16_hd256_smallm_n32_p16/sm_100a/default.cu": {
-      "bytes": 85686,
-      "sha256": "1eb1a8733d45cb403c538ef5ee7deee216d934e5770a0270a5355a67cf3c1277"
+      "bytes": 86061,
+      "sha256": "b9ab0ac16f96bd367ffcf25b57c63083a0941f3512f064fccaa6ab1b9ec2d17e"
     },
     "cuda/decode_native_bf16_hd256_smallm_n32_p16/sm_103a/default.cu": {
-      "bytes": 85589,
-      "sha256": "2c063f4c33cb7a59fbd6d0813e87cd71ddd2349791a8b1e41aa4aceec424e4ee"
+      "bytes": 85964,
+      "sha256": "4f53b19b1e6c304de78981cb347259169eacc4949e323a581a2a0be09590f0d1"
     },
     "cuda/decode_native_bf16_hd256_smallm_n32_p32/sm_100a/default.cu": {
-      "bytes": 85686,
-      "sha256": "7d7434d29046a9366cdbf28500200388ec227e975799a58c069ee97feda23b02"
+      "bytes": 86061,
+      "sha256": "9cbce23fae89c6fe0d7eacb19740b4a7c8c965a4a2700d7b4d7ab5bead4e692b"
     },
     "cuda/decode_native_bf16_hd256_smallm_n32_p32/sm_103a/default.cu": {
-      "bytes": 85589,
-      "sha256": "8abe109c2fba334392de6983458f7740e4d50f145b7fc1fc87dd2f520535d238"
+      "bytes": 85964,
+      "sha256": "e8b73ba6641c4aed5199478e0c4de4eb0ab57319f6036c49f6e95cc869bb1b2f"
     },
     "cuda/decode_native_bf16_hd256_smallm_n32_p64/sm_100a/default.cu": {
-      "bytes": 85686,
-      "sha256": "9f2b1e85acf460e39be6611efee354f4a7e960ac1ea5f06398a0eaad2313b42e"
+      "bytes": 86061,
+      "sha256": "6836b6275a02c0be5d4fe4887fa37acc01a94f5d4fe9c997f949ffb288a120bc"
     },
     "cuda/decode_native_bf16_hd256_smallm_n32_p64/sm_103a/default.cu": {
-      "bytes": 85589,
-      "sha256": "cab64d22c028271ffe219427db9e4074a1fdc974c6dac29b894eb3d01686f604"
+      "bytes": 85964,
+      "sha256": "e74a5d9fedae17de95025e5f3acb20d941e380c5d1db1dd4a527f7654ec7c8ae"
     },
     "cuda/decode_native_bf16_hd256_smallm_n64_p16/sm_100a/default.cu": {
-      "bytes": 87213,
-      "sha256": "928626d429abd63d699471841b71a6c0b3e43a9f4a55159abdee1d081f932784"
+      "bytes": 87588,
+      "sha256": "1519792ceaf01389dd788500b9815d0d743c960fe41cd1f7806f235c077fb57a"
     },
     "cuda/decode_native_bf16_hd256_smallm_n64_p16/sm_103a/default.cu": {
-      "bytes": 87116,
-      "sha256": "b9de36d5103399654b0b6195404023e6824d57d4f81331d39678d042b5e91397"
+      "bytes": 87491,
+      "sha256": "5d308aa7763ea77d2e9e1fcf5b747d0c68886b65441713a0568f891eedc88b44"
     },
     "cuda/decode_native_bf16_hd256_smallm_n64_p32/sm_100a/default.cu": {
-      "bytes": 87213,
-      "sha256": "882bd63f21e204c23462b8ad64822ff0dc6271864d2f85e80a1007262848b8da"
+      "bytes": 87588,
+      "sha256": "b8683f86fe4e59770a8e1a09d090e9e3c9df8482b7dcf18f3fd66cdd6a368a39"
     },
     "cuda/decode_native_bf16_hd256_smallm_n64_p32/sm_103a/default.cu": {
-      "bytes": 87116,
-      "sha256": "73ecc5cd702fd12e14db2a45ba582c0bd1cf1f3ff73155c0f5b2071f9e988e46"
+      "bytes": 87491,
+      "sha256": "e93508cb389746da79da62a9ee0d0e2b8f6a85734edee2fc64d15592c3f41f09"
     },
     "cuda/decode_native_bf16_hd256_smallm_n64_p64/sm_100a/default.cu": {
-      "bytes": 87213,
-      "sha256": "3ad30e67a9fe5c80386bd507497d3bf0797be528585c104c7ede4b90d85aab40"
+      "bytes": 87588,
+      "sha256": "b9b168a8b6828de8a86ca8e2a7f346e790abe6c5c4b01f7a058df8f18eb4adda"
     },
     "cuda/decode_native_bf16_hd256_smallm_n64_p64/sm_103a/default.cu": {
-      "bytes": 87116,
-      "sha256": "e00f542464c15c412a0701f4ab18271b5c57431e0f07992df6ea3732b2f04c21"
+      "bytes": 87491,
+      "sha256": "56dc2c02b005d149ce056600e7586e219dce4b97d4afaba98dca8c93612620b2"
     },
     "cuda/decode_native_fp16_hd512/has_window0_retain_kv_l20_use_scale_ptr0.cu": {
       "bytes": 204916,
@@ -1428,12 +1428,13 @@
     "gap_counts": {},
     "raw_cases": 80768,
     "route_counts": {
-      "cake_fmha_compat_v1": 55482,
+      "cake_fmha_compat_v1": 55476,
       "ctx_bf16_hnd_hd128_hgpack_03df_v2": 640,
       "ctx_fp16_nhd_hd256_stage16_v1": 40,
       "ctx_fp8_bf16_nhd_hd256_stage16_v1": 40,
       "ctx_fp8_hnd_hd128_hgpack_48b5_v1": 640,
       "ctx_nvfp4_hnd_hd128_dequant_fp8_hg_v1": 6,
+      "decode_native_bf16_hd256_smallm_v1": 6,
       "decode_native_bf16_v1_bece": 120,
       "decode_native_fp16_nhd_v1_f32d": 240,
       "decode_quantized_bf16q_9d8b_v1": 48,
@@ -3467,7 +3468,7 @@
       ],
       "parametric_axes": [
         {
-          "constraint": "positive integer; Q_LEN * GROUP == packed rows of the component",
+          "constraint": "positive integer; rows/2 < Q_LEN * GROUP <= packed rows of the component",
           "defaults": {
             "Q_LEN": 8
           },
@@ -3476,12 +3477,21 @@
           ]
         },
         {
-          "constraint": "num_q_heads // num_kv_heads; Q_LEN * GROUP == packed rows of the component",
+          "constraint": "num_q_heads // num_kv_heads; divides the packed rows of the component",
           "defaults": {
             "GROUP": 8
           },
           "macros": [
             "GROUP"
+          ]
+        },
+        {
+          "constraint": "packed rows // GROUP tokens per Q TMA box (the box fills the whole tile)",
+          "defaults": {
+            "Q_BOX_ROWS": 8
+          },
+          "macros": [
+            "Q_BOX_ROWS"
           ]
         },
         {
@@ -3499,8 +3509,8 @@
         {
           "selector": {},
           "sha256": {
-            "sm_100a": "1eb1a8733d45cb403c538ef5ee7deee216d934e5770a0270a5355a67cf3c1277",
-            "sm_103a": "2c063f4c33cb7a59fbd6d0813e87cd71ddd2349791a8b1e41aa4aceec424e4ee"
+            "sm_100a": "b9ab0ac16f96bd367ffcf25b57c63083a0941f3512f064fccaa6ab1b9ec2d17e",
+            "sm_103a": "4f53b19b1e6c304de78981cb347259169eacc4949e323a581a2a0be09590f0d1"
           },
           "sources": {
             "sm_100a": "cuda/decode_native_bf16_hd256_smallm_n32_p16/sm_100a/default.cu",
@@ -3589,7 +3599,7 @@
       ],
       "parametric_axes": [
         {
-          "constraint": "positive integer; Q_LEN * GROUP == packed rows of the component",
+          "constraint": "positive integer; rows/2 < Q_LEN * GROUP <= packed rows of the component",
           "defaults": {
             "Q_LEN": 8
           },
@@ -3598,12 +3608,21 @@
           ]
         },
         {
-          "constraint": "num_q_heads // num_kv_heads; Q_LEN * GROUP == packed rows of the component",
+          "constraint": "num_q_heads // num_kv_heads; divides the packed rows of the component",
           "defaults": {
             "GROUP": 8
           },
           "macros": [
             "GROUP"
+          ]
+        },
+        {
+          "constraint": "packed rows // GROUP tokens per Q TMA box (the box fills the whole tile)",
+          "defaults": {
+            "Q_BOX_ROWS": 8
+          },
+          "macros": [
+            "Q_BOX_ROWS"
           ]
         },
         {
@@ -3621,8 +3640,8 @@
         {
           "selector": {},
           "sha256": {
-            "sm_100a": "7d7434d29046a9366cdbf28500200388ec227e975799a58c069ee97feda23b02",
-            "sm_103a": "8abe109c2fba334392de6983458f7740e4d50f145b7fc1fc87dd2f520535d238"
+            "sm_100a": "9cbce23fae89c6fe0d7eacb19740b4a7c8c965a4a2700d7b4d7ab5bead4e692b",
+            "sm_103a": "e8b73ba6641c4aed5199478e0c4de4eb0ab57319f6036c49f6e95cc869bb1b2f"
           },
           "sources": {
             "sm_100a": "cuda/decode_native_bf16_hd256_smallm_n32_p32/sm_100a/default.cu",
@@ -3711,7 +3730,7 @@
       ],
       "parametric_axes": [
         {
-          "constraint": "positive integer; Q_LEN * GROUP == packed rows of the component",
+          "constraint": "positive integer; rows/2 < Q_LEN * GROUP <= packed rows of the component",
           "defaults": {
             "Q_LEN": 8
           },
@@ -3720,12 +3739,21 @@
           ]
         },
         {
-          "constraint": "num_q_heads // num_kv_heads; Q_LEN * GROUP == packed rows of the component",
+          "constraint": "num_q_heads // num_kv_heads; divides the packed rows of the component",
           "defaults": {
             "GROUP": 8
           },
           "macros": [
             "GROUP"
+          ]
+        },
+        {
+          "constraint": "packed rows // GROUP tokens per Q TMA box (the box fills the whole tile)",
+          "defaults": {
+            "Q_BOX_ROWS": 8
+          },
+          "macros": [
+            "Q_BOX_ROWS"
           ]
         },
         {
@@ -3743,8 +3771,8 @@
         {
           "selector": {},
           "sha256": {
-            "sm_100a": "9f2b1e85acf460e39be6611efee354f4a7e960ac1ea5f06398a0eaad2313b42e",
-            "sm_103a": "cab64d22c028271ffe219427db9e4074a1fdc974c6dac29b894eb3d01686f604"
+            "sm_100a": "6836b6275a02c0be5d4fe4887fa37acc01a94f5d4fe9c997f949ffb288a120bc",
+            "sm_103a": "e74a5d9fedae17de95025e5f3acb20d941e380c5d1db1dd4a527f7654ec7c8ae"
           },
           "sources": {
             "sm_100a": "cuda/decode_native_bf16_hd256_smallm_n32_p64/sm_100a/default.cu",
@@ -3833,7 +3861,7 @@
       ],
       "parametric_axes": [
         {
-          "constraint": "positive integer; Q_LEN * GROUP == packed rows of the component",
+          "constraint": "positive integer; rows/2 < Q_LEN * GROUP <= packed rows of the component",
           "defaults": {
             "Q_LEN": 8
           },
@@ -3842,12 +3870,21 @@
           ]
         },
         {
-          "constraint": "num_q_heads // num_kv_heads; Q_LEN * GROUP == packed rows of the component",
+          "constraint": "num_q_heads // num_kv_heads; divides the packed rows of the component",
           "defaults": {
             "GROUP": 8
           },
           "macros": [
             "GROUP"
+          ]
+        },
+        {
+          "constraint": "packed rows // GROUP tokens per Q TMA box (the box fills the whole tile)",
+          "defaults": {
+            "Q_BOX_ROWS": 8
+          },
+          "macros": [
+            "Q_BOX_ROWS"
           ]
         },
         {
@@ -3865,8 +3902,8 @@
         {
           "selector": {},
           "sha256": {
-            "sm_100a": "928626d429abd63d699471841b71a6c0b3e43a9f4a55159abdee1d081f932784",
-            "sm_103a": "b9de36d5103399654b0b6195404023e6824d57d4f81331d39678d042b5e91397"
+            "sm_100a": "1519792ceaf01389dd788500b9815d0d743c960fe41cd1f7806f235c077fb57a",
+            "sm_103a": "5d308aa7763ea77d2e9e1fcf5b747d0c68886b65441713a0568f891eedc88b44"
           },
           "sources": {
             "sm_100a": "cuda/decode_native_bf16_hd256_smallm_n64_p16/sm_100a/default.cu",
@@ -3955,7 +3992,7 @@
       ],
       "parametric_axes": [
         {
-          "constraint": "positive integer; Q_LEN * GROUP == packed rows of the component",
+          "constraint": "positive integer; rows/2 < Q_LEN * GROUP <= packed rows of the component",
           "defaults": {
             "Q_LEN": 8
           },
@@ -3964,12 +4001,21 @@
           ]
         },
         {
-          "constraint": "num_q_heads // num_kv_heads; Q_LEN * GROUP == packed rows of the component",
+          "constraint": "num_q_heads // num_kv_heads; divides the packed rows of the component",
           "defaults": {
             "GROUP": 8
           },
           "macros": [
             "GROUP"
+          ]
+        },
+        {
+          "constraint": "packed rows // GROUP tokens per Q TMA box (the box fills the whole tile)",
+          "defaults": {
+            "Q_BOX_ROWS": 8
+          },
+          "macros": [
+            "Q_BOX_ROWS"
           ]
         },
         {
@@ -3987,8 +4033,8 @@
         {
           "selector": {},
           "sha256": {
-            "sm_100a": "882bd63f21e204c23462b8ad64822ff0dc6271864d2f85e80a1007262848b8da",
-            "sm_103a": "73ecc5cd702fd12e14db2a45ba582c0bd1cf1f3ff73155c0f5b2071f9e988e46"
+            "sm_100a": "b8683f86fe4e59770a8e1a09d090e9e3c9df8482b7dcf18f3fd66cdd6a368a39",
+            "sm_103a": "e93508cb389746da79da62a9ee0d0e2b8f6a85734edee2fc64d15592c3f41f09"
           },
           "sources": {
             "sm_100a": "cuda/decode_native_bf16_hd256_smallm_n64_p32/sm_100a/default.cu",
@@ -4077,7 +4123,7 @@
       ],
       "parametric_axes": [
         {
-          "constraint": "positive integer; Q_LEN * GROUP == packed rows of the component",
+          "constraint": "positive integer; rows/2 < Q_LEN * GROUP <= packed rows of the component",
           "defaults": {
             "Q_LEN": 8
           },
@@ -4086,12 +4132,21 @@
           ]
         },
         {
-          "constraint": "num_q_heads // num_kv_heads; Q_LEN * GROUP == packed rows of the component",
+          "constraint": "num_q_heads // num_kv_heads; divides the packed rows of the component",
           "defaults": {
             "GROUP": 8
           },
           "macros": [
             "GROUP"
+          ]
+        },
+        {
+          "constraint": "packed rows // GROUP tokens per Q TMA box (the box fills the whole tile)",
+          "defaults": {
+            "Q_BOX_ROWS": 8
+          },
+          "macros": [
+            "Q_BOX_ROWS"
           ]
         },
         {
@@ -4109,8 +4164,8 @@
         {
           "selector": {},
           "sha256": {
-            "sm_100a": "3ad30e67a9fe5c80386bd507497d3bf0797be528585c104c7ede4b90d85aab40",
-            "sm_103a": "e00f542464c15c412a0701f4ab18271b5c57431e0f07992df6ea3732b2f04c21"
+            "sm_100a": "b9b168a8b6828de8a86ca8e2a7f346e790abe6c5c4b01f7a058df8f18eb4adda",
+            "sm_103a": "56dc2c02b005d149ce056600e7586e219dce4b97d4afaba98dca8c93612620b2"
           },
           "sources": {
             "sm_100a": "cuda/decode_native_bf16_hd256_smallm_n64_p64/sm_100a/default.cu",
@@ -5677,27 +5732,27 @@
       "components": [
         {
           "component": "decode_native_bf16_hd256_smallm_n32_p16",
-          "condition": "q_len * (num_q_heads // num_kv_heads) == 32 and page_size == 16"
+          "condition": "16 < q_len * (num_q_heads // num_kv_heads) <= 32 and page_size == 16"
         },
         {
           "component": "decode_native_bf16_hd256_smallm_n32_p32",
-          "condition": "q_len * (num_q_heads // num_kv_heads) == 32 and page_size == 32"
+          "condition": "16 < q_len * (num_q_heads // num_kv_heads) <= 32 and page_size == 32"
         },
         {
           "component": "decode_native_bf16_hd256_smallm_n32_p64",
-          "condition": "q_len * (num_q_heads // num_kv_heads) == 32 and page_size == 64"
+          "condition": "16 < q_len * (num_q_heads // num_kv_heads) <= 32 and page_size == 64"
         },
         {
           "component": "decode_native_bf16_hd256_smallm_n64_p16",
-          "condition": "q_len * (num_q_heads // num_kv_heads) == 64 and page_size == 16"
+          "condition": "32 < q_len * (num_q_heads // num_kv_heads) <= 64 and page_size == 16"
         },
         {
           "component": "decode_native_bf16_hd256_smallm_n64_p32",
-          "condition": "q_len * (num_q_heads // num_kv_heads) == 64 and page_size == 32"
+          "condition": "32 < q_len * (num_q_heads // num_kv_heads) <= 64 and page_size == 32"
         },
         {
           "component": "decode_native_bf16_hd256_smallm_n64_p64",
-          "condition": "q_len * (num_q_heads // num_kv_heads) == 64 and page_size == 64"
+          "condition": "32 < q_len * (num_q_heads // num_kv_heads) <= 64 and page_size == 64"
         }
       ],
       "standalone_ready": true,

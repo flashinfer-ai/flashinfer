@@ -22,11 +22,11 @@ CakeFmhaTarget = Literal["sm100a", "sm103a"]
 CakeFmhaContextExactProfile = Literal["q511", "q257"]
 
 CAKE_FMHA_MANIFEST_SHA256 = (
-    "d8f012fa69baf48af30cae2a16f8dd0d22d71d5398bcfeac4b6f65f2d071337c"
+    "999fa231548cadf1326f1945a5f1d52abe415948f8d41099edc8f7f30e4b2e2d"
 )
 CAKE_FMHA_FLASHINFER_MATRIX_REVISION = "5b8da12050f80a5b5cb2bab9e87d9635a8872e5b"
 CAKE_FMHA_FLASHINFER_BINDINGS_SHA256 = (
-    "6d231d15449908dafc789bdd6d6b67ab09dbb1c98f42fe17b27f9ee4057552eb"
+    "cd7ddb53da6b746e72f0ee9012fcfa36a5a25a3d92afdae32006ab284e7d6bf8"
 )
 
 _FLASHINFER_BINDINGS = (
@@ -1414,8 +1414,14 @@ def _validate_smallm_specialization(
     if target not in _TARGET_FLAGS:
         raise ValueError(f"unsupported Cake FMHA target: {target}")
     component = cake_fmha_smallm_component_name(n_rows, page_size)
-    if q_len <= 0 or group <= 0 or q_len * group != n_rows:
-        raise ValueError("small-M hd256 decode requires q_len * group == packed rows")
+    if q_len <= 0 or group <= 0 or not (n_rows // 2 < q_len * group <= n_rows):
+        raise ValueError(
+            "small-M hd256 decode packs q_len * group rows into the smallest 32/64-row tile"
+        )
+    if n_rows % group:
+        raise ValueError(
+            "small-M hd256 decode requires the GQA group to divide the tile rows"
+        )
     if not 1 <= num_split <= CAKE_FMHA_SMALLM_MAX_NUM_SPLIT:
         raise ValueError("small-M hd256 decode NUM_SPLIT must be in [1, 256]")
     return component
@@ -1465,6 +1471,7 @@ def gen_cake_fmha_decode_native_bf16_hd256_smallm_module(
             "-use_fast_math",
             f"-DQ_LEN={q_len}",
             f"-DGROUP={group}",
+            f"-DQ_BOX_ROWS={n_rows // group}",
             f"-DNUM_SPLIT={num_split}",
             f"-DCAKE_FMHA_SMALLM_N_ROWS={n_rows}",
             f"-DCAKE_FMHA_SMALLM_PAGE_SIZE={page_size}",

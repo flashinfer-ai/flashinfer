@@ -65,7 +65,7 @@ def test_cake_fmha_manifest_is_authenticated_and_complete() -> None:
     assert manifest["capability"]["cake_coverage_ratio"] == 1.0
     assert manifest["capability"]["upstream_valid_cases"] == 57_280
     assert manifest["capability"]["cake_covered_cases"] == 57_280
-    assert manifest["capability"]["route_counts"]["cake_fmha_compat_v1"] == 55_482
+    assert manifest["capability"]["route_counts"]["cake_fmha_compat_v1"] == 55_476
     assert len(manifest["route_probes"]) == 29
     assert {probe["label"] for probe in manifest["route_probes"]} >= {
         "correctness_compat_decode_fp8_nhd_separate_group5",
@@ -101,8 +101,8 @@ def test_cake_fmha_registry_accounts_for_manifest_routes_and_components() -> Non
     manifest_route_counts = manifest["capability"]["route_counts"]
     manifest_optimized_routes = set(manifest_route_counts) - {"cake_fmha_compat_v1"}
     assert manifest_optimized_routes <= set(cake_api._PRODUCT_ROUTE_COMPONENTS)
-    assert cake_api._manifest_optimized_route_accounting() == (1_798, 1_798)
-    assert cake_api._manifest_authenticated_route_accounting() == (1_798, 1_798)
+    assert cake_api._manifest_optimized_route_accounting() == (1_804, 1_804)
+    assert cake_api._manifest_authenticated_route_accounting() == (1_804, 1_804)
     for route_name, components in cake_api._PRODUCT_ROUTE_COMPONENTS.items():
         manifest_components = tuple(
             dict.fromkeys(
@@ -132,13 +132,13 @@ def test_cake_fmha_high_level_selectors_match_pinned_capability_corpus(
     assert PINNED_FLASHINFER_REVISION == CAKE_FMHA_FLASHINFER_MATRIX_REVISION
     assert report.raw_cases == 80_768
     assert report.valid_cases == 57_280
-    assert report.optimized_cases == 1_798
-    assert report.compat_cases == 55_482
+    assert report.optimized_cases == 1_804
+    assert report.compat_cases == 55_476
     assert report.route_counts == dict(
         sorted(manifest["capability"]["route_counts"].items())
     )
     assert report.digest == (
-        "d47bf01c2d27409c6a39759d02e30bb9df65e98c353f53d7335081dd26b3f3a8"
+        "5068efc8ee2f999381a2ee4608746edab6dd7299cfea1e9df041fde6a5e8b764"
     )
 
 
@@ -2866,6 +2866,7 @@ def test_cake_fmha_decode_native_bf16_hd256_smallm_jit_selects_component(
         for s in spec.sources
     )
     assert "-DQ_LEN=8" in spec.extra_cuda_cflags
+    assert "-DQ_BOX_ROWS=8" in spec.extra_cuda_cflags
     assert "-DGROUP=8" in spec.extra_cuda_cflags
     assert "-DNUM_SPLIT=148" in spec.extra_cuda_cflags
     assert "-DCAKE_FMHA_SMALLM_N_ROWS=64" in spec.extra_cuda_cflags
@@ -2912,7 +2913,10 @@ def test_cake_fmha_smallm_num_split_is_one_resident_wave() -> None:
         "max_in_kv_len",
     ),
     (
-        # Qwen3.5-35B-A3B TP=2 rank: 8 heads over one KV head, 7 draft tokens.
+        # Qwen3.5-35B-A3B TP=2 rank: 8 heads over one KV head.  SGLang NEXTN with 7
+        # draft tokens verifies 7 query rows (56 packed rows padded to 64); a
+        # 7-draft + root verify gives 8 rows (64 packed).
+        (1, 7, 1, 8, 64, 60000),
         (1, 8, 1, 8, 64, 60000),
         (1, 8, 1, 8, 16, 8192),
         # TP=1 rank with four draft tokens: two KV heads, 64 packed rows each.
