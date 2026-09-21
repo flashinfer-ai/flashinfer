@@ -29,15 +29,6 @@ replace, what to audit) lives in `SKILL.md`.
 
 ## Pending local diffs vs upstream
 
-- `src/moe_nvfp4_swapab/{epilogue_refactor,kernel_fc12,megamoe_kernel}.py`
-  carries the MiniMax-M3 parameterized SwiGLU semantic port from
-  [TensorRT-LLM PR #18605](https://github.com/NVIDIA/TensorRT-LLM/pull/18605),
-  head `f26e4766f9d4082cb0f747abc465562e17b2fa08`: paired uniform
-  `swiglu_alpha` / `swiglu_beta`, beta added after clamping, and activation
-  constants in kernel names. This targeted port leaves the existing standard
-  SwiGLU path intact; TRT-LLM model/communication integration is not imported.
-  Preserve this delta until the kernel-team drop incorporates equivalent support.
-
 - `src/src/inputs_process.py` is synced **ahead** of the recorded drop, to
   upstream commit `50117315dbcd2ffb1e8c1c4dab4be9b42cad24ab`
   (`src/inputs_process.py` in the internal repo), taken 2026-08-10: the kernel team's fix for the fused activation-quant
