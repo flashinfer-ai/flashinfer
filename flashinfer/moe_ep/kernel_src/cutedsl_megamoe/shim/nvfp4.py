@@ -110,8 +110,12 @@ class MegaMoENvfp4Config:
     apply_topk_in_fc1: bool = True
     gate_up_clamp: Optional[float] = None
     enable_iket: bool = False
+    swiglu_alpha: Optional[float] = None
+    swiglu_beta: Optional[float] = None
 
     def __post_init__(self) -> None:
+        if (self.swiglu_alpha is None) != (self.swiglu_beta is None):
+            raise ValueError("swiglu_alpha and swiglu_beta must be set together.")
         if self.world_size < 1:
             raise ValueError(f"world_size must be >= 1, got {self.world_size}.")
         if self.rank < 0 or self.rank >= self.world_size:
@@ -264,6 +268,18 @@ class MegaMoENvfp4Frontend:
         ensure_not_capturing("set_gate_up_clamp (clamp change)")
         self._release_workspace()
         self._gate_up_clamp = clamp
+        self._invalidate_compile_cache()
+
+    def set_swiglu_params(self, alpha: Optional[float], beta: Optional[float]) -> None:
+        """Set uniform activation constants and invalidate the compiled session."""
+        if (alpha, beta) == (self._config.swiglu_alpha, self._config.swiglu_beta):
+            return
+        new_config = dataclasses.replace(
+            self.config, swiglu_alpha=alpha, swiglu_beta=beta
+        )
+        ensure_not_capturing("set_swiglu_params (activation change)")
+        self._release_workspace()
+        self._config = new_config
         self._invalidate_compile_cache()
 
     def apply_knobs(self, knobs: Optional[dict]) -> None:
@@ -485,6 +501,8 @@ class MegaMoENvfp4Frontend:
             c.combine_dtype,
             c.apply_topk_in_fc1,
             self._gate_up_clamp,
+            c.swiglu_alpha,
+            c.swiglu_beta,
             c.enable_iket,
         )
 
@@ -545,6 +563,8 @@ class MegaMoENvfp4Frontend:
             token_back_mode=c.token_back_mode,
             apply_topk_in_fc1=c.apply_topk_in_fc1,
             gate_up_clamp=self._gate_up_clamp,
+            swiglu_alpha=c.swiglu_alpha,
+            swiglu_beta=c.swiglu_beta,
             flag_batch=c.flag_batch,
             epi_flag_batch=c.epi_flag_batch,
             combine_format=combine_format,
@@ -1042,6 +1062,8 @@ def get_symm_buffer_for_mega_moe(
     rank: int,
     world_size: int,
     *,
+    swiglu_alpha: Optional[float] = None,
+    swiglu_beta: Optional[float] = None,
     gate_up_clamp: Optional[float] = None,
     activation_clamp: Optional[float] = None,
     apply_topk_in_fc1: bool = True,
@@ -1061,6 +1083,11 @@ def get_symm_buffer_for_mega_moe(
 
     ``gate_up_clamp`` sets the kernel gate-up clamp.  ``activation_clamp`` is a
     deprecated alias for ``gate_up_clamp``.
+
+    ``swiglu_alpha`` / ``swiglu_beta`` are uniform per-layer activation
+    constants: ``(up + beta) * gate * sigmoid(alpha * gate)`` after clamping.
+    Set both or neither; None/None keeps standard SwiGLU. MiniMax-M3 uses
+    ``1.702`` / ``1.0``. These are distinct from the dequant ``fc1_alpha``.
 
     ``apply_topk_in_fc1`` mirrors ``mega_runner``'s
     ``ref_compute_graph == "deepgemm"`` behaviour when ``True`` (default).
@@ -1130,6 +1157,8 @@ def get_symm_buffer_for_mega_moe(
         hidden=hidden,
         intermediate=intermediate,
         gate_up_clamp=clamp,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
         apply_topk_in_fc1=apply_topk_in_fc1,
         enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
         defer_topk_reduce=defer_topk_reduce,
@@ -1223,6 +1252,8 @@ def nvfp4_mega_moe(
     symm_buffer: MegaMoESymmBuffer,
     *,
     num_tokens: Optional[int] = None,
+    swiglu_alpha: Optional[float] = None,
+    swiglu_beta: Optional[float] = None,
     gate_up_clamp: Optional[float] = None,
     activation_clamp: Optional[float] = None,
     fast_math: bool = True,
@@ -1241,6 +1272,10 @@ def nvfp4_mega_moe(
     ``y`` receives the top-k-reduced bf16 output for ``[:num_tokens]``.
     ``gate_up_clamp`` updates the kernel clamp for this session when set.
     ``activation_clamp`` is a deprecated alias for ``gate_up_clamp``.
+    Set both ``swiglu_alpha`` / ``swiglu_beta`` to update the session
+    activation constants (recompiles outside CUDA graph capture). Omit both
+    to retain the allocation-time values; use ``1.0`` / ``0.0`` to restore
+    standard SwiGLU.
     ``fast_math`` is accepted for DeepGEMM API parity and has no effect here.
 
     ``sync=False`` (default): the kernel launch and the ``y`` copy are
@@ -1300,6 +1335,8 @@ def nvfp4_mega_moe(
         gate_up_clamp=gate_up_clamp,
         activation_clamp=activation_clamp,
     )
+    if swiglu_alpha is not None or swiglu_beta is not None:
+        symm_buffer._frontend.set_swiglu_params(swiglu_alpha, swiglu_beta)
     if clamp is not None:
         symm_buffer._frontend.set_gate_up_clamp(clamp)
 
@@ -1485,6 +1522,8 @@ def create_dummy_inputs(
     hidden: int,
     intermediate: int,
     *,
+    swiglu_alpha: Optional[float] = None,
+    swiglu_beta: Optional[float] = None,
     gate_up_clamp: Optional[float] = None,
     activation_clamp: Optional[float] = None,
     combine_dtype: Literal["bf16", "mxfp8", "nvfp4"] = "bf16",
@@ -1536,6 +1575,8 @@ def create_dummy_inputs(
         rank,
         world_size,
         gate_up_clamp=clamp,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
         combine_dtype=combine_dtype,
         enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
         fc1_alpha=fc1_alpha,
