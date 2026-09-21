@@ -56,6 +56,7 @@ def make_cfg(
     *,
     activation=ActivationType.Swiglu,
     fastmath=False,
+    enable_pdl=False,
     situ_beta=SITU_BETA,
     situ_linear_beta=SITU_LINEAR_BETA,
 ):
@@ -95,6 +96,7 @@ def make_cfg(
         activation=moe_activation.make_gated_activation(
             activation, fastmath, situ_beta=situ_beta, situ_linear_beta=situ_linear_beta
         ),
+        enable_pdl=enable_pdl,
     )
 
 
@@ -131,9 +133,7 @@ def make_a_sfa_partitions(
     )
     if cutlass.const_expr(swap):
         gSFA_mkl = cute.local_tile(
-            tma_tensor_sfa,
-            (sfa_tile_m, cute.size(sSFA, mode=[1])),
-            (None, None, None),
+            tma_tensor_sfa, (sfa_tile_m, cute.size(sSFA, mode=[1])), (None, None, None)
         )
     else:
         sf_m_off = compute_padded_offset(tile.m_offset, tile.group, cutlass.Int32(128))
@@ -193,9 +193,7 @@ def make_b_sfb_partitions(
             tma_tensor_b, cute.slice_(tile_mnk, (0, None, None)), (None, None, None)
         )
         gSFB_nkl = cute.local_tile(
-            tma_tensor_sfb,
-            (sfb_tile_n, cute.size(sSFB, mode=[1])),
-            (None, None, None),
+            tma_tensor_sfb, (sfb_tile_n, cute.size(sSFB, mode=[1])), (None, None, None)
         )
     tBsB, tBgB = cpasync.tma_partition(
         tma_atom_b,
@@ -369,9 +367,7 @@ def make_b_sfb_gate_partitions(
         (None, None, None),
     )
     gSFB_nkl = cute.local_tile(
-        tma_tensor_sfb,
-        (tile_mnk[1], cute.size(sSFB, mode=[1])),
-        (None, None, None),
+        tma_tensor_sfb, (tile_mnk[1], cute.size(sSFB, mode=[1])), (None, None, None)
     )
     gSFG_nkl = cute.local_tile(
         cute.domain_offset((n_gate_off, 0, 0), tma_tensor_sfb),
@@ -442,9 +438,7 @@ def make_a_sfa_gate_partitions_swap(
         (None, None, None),
     )
     gSFA_mkl = cute.local_tile(
-        tma_tensor_sfa,
-        (tile_mnk[0], cute.size(sSFA, mode=[1])),
-        (None, None, None),
+        tma_tensor_sfa, (tile_mnk[0], cute.size(sSFA, mode=[1])), (None, None, None)
     )
     gSFG_mkl = cute.local_tile(
         cute.domain_offset((n_gate_off, 0, 0), tma_tensor_sfa),
@@ -985,6 +979,7 @@ class CuteDslSm120MoeNvfp4Fc1ActQ1:
             block=[self.threads, 1, 1],
             stream=stream,
             min_blocks_per_mp=1,
+            use_pdl=cfg.enable_pdl,
         )
 
     @cute.kernel
@@ -1114,6 +1109,8 @@ class CuteDslSm120MoeNvfp4Fc1ActQ1:
                 prod.publish_sentinel(sWork, sfull, sempty)
 
             if warp_idx == self.load_warp_0:
+                if cutlass.const_expr(cfg.enable_pdl and not swap):
+                    cute.arch.griddepcontrol_wait()
                 wstage, wphase = i32(0), i32(1)
                 epi_empty_phase = i32(1)
                 cons = moe_scheduler.MoeSchedConsumer.create(cfg.sched_stages)
@@ -1193,6 +1190,8 @@ class CuteDslSm120MoeNvfp4Fc1ActQ1:
                     tile = cons.get_next_tile(sWork, sfull, sempty)
 
             if warp_idx == self.load_warp_1:
+                if cutlass.const_expr(cfg.enable_pdl and swap):
+                    cute.arch.griddepcontrol_wait()
                 wstage, wphase = i32(0), i32(1)
                 epi_empty_phase = i32(1)
                 cons = moe_scheduler.MoeSchedConsumer.create(cfg.sched_stages)
@@ -1277,6 +1276,8 @@ class CuteDslSm120MoeNvfp4Fc1ActQ1:
                 thr_r2s = tiled_r2s.get_slice(tidx)
                 thr_s2r = tiled_s2r.get_slice(tidx)
             rstage, rphase = i32(0), i32(0)
+            if cutlass.const_expr(cfg.enable_pdl):
+                cute.arch.griddepcontrol_wait()
             cons = moe_scheduler.MoeSchedConsumer.create(cfg.sched_stages)
             tile = cons.get_next_tile(sWork, sfull, sempty)
             while tile.valid != i32(0):
@@ -1360,6 +1361,10 @@ class CuteDslSm120MoeNvfp4Fc1ActQ1:
                         up_scale[tile.group].to(cutlass.Float32),
                         gate_scale[tile.group].to(cutlass.Float32),
                     )
+                if cutlass.const_expr(cfg.enable_pdl):
+                    next_tile = cons.get_next_tile(sWork, sfull, sempty)
+                    if next_tile.valid == i32(0):
+                        cute.arch.griddepcontrol_launch_dependents()
                 if cutlass.const_expr(swap):
                     moe_epilogue.store_wg_nvfp4_q1_swap(
                         acc,
@@ -1393,7 +1398,10 @@ class CuteDslSm120MoeNvfp4Fc1ActQ1:
                         cfg.epi_bar_id,
                         cfg.mma_threads,
                     )
-                tile = cons.get_next_tile(sWork, sfull, sempty)
+                if cutlass.const_expr(cfg.enable_pdl):
+                    tile = next_tile
+                else:
+                    tile = cons.get_next_tile(sWork, sfull, sempty)
 
 
 def _stream():
