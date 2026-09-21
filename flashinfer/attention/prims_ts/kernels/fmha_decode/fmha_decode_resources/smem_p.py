@@ -469,44 +469,48 @@ class SmemPResource(DecodeGenResourceBase):
         tidx, _, _ = cute.arch.thread_idx()
         publishes_fragment = (tidx & Int32(31)) == Int32(0)
 
-        # ``c * sfQ`` is one factor per lane and tile; the strategy applies it
-        # to the raw ``sfK`` words where that is cheapest for its storage.
-        exp_scale = None
-        scales_view = None
-        summary_view = None
-        # Summary scores that come back dequantized from the max pass take the
-        # row's ``c * sfQ`` as their only multiplier and carry no bias. When
-        # the exact strategy reads the routed register words, a proxy tile's
-        # words are ones and that strategy serves every tile unchanged; an
-        # exact strategy reading its SMEM ring (which a proxy tile leaves
-        # unfilled) keeps the per-fragment selection, with the row multiplier
-        # on the proxy side. Other mixed geometries select the summary
-        # strategy per fragment.
-        summary_dequantized: Constexpr[bool] = cfg.sage_summary_scores_dequantized
+        # ``c * sfQ`` is one factor per lane and tile. A route kind whose scores
+        # come back dequantized from the max pass takes it as its only
+        # multiplier and carries no bias; the other kinds fold it into their
+        # strategy's raw ``sfK`` words. In a mixed geometry whose summary
+        # scores are dequantized and whose exact strategy reads the routed
+        # register words, a proxy tile's words are ones and the exact strategy
+        # serves every tile unchanged; otherwise the kinds are selected per
+        # fragment on the CTA-uniform route kind.
+        exact_dequantized: Constexpr[bool] = cfg.sage_scores_dequantized_for(False)
+        summary_dequantized: Constexpr[bool] = cfg.sage_scores_dequantized_for(True)
         exact_scales_in_smem: Constexpr[bool] = cfg.sage_k_scales_in_smem_for(
             cfg.sage_k_groups_per_fragment
         )
         unified_scales: Constexpr[bool] = (
-            summary_dequantized and not exact_scales_in_smem
+            cfg.sage_mixed_k_geometry
+            and summary_dequantized
+            and not exact_scales_in_smem
         )
         mixed_scales: Constexpr[bool] = cfg.sage_mixed_k_geometry and not unified_scales
+        exp_scale = None
+        scales_view = None
+        summary_view = None
         score_bias = None
         row_multipliers = None
         row_addends = None
         if cutlass.const_expr(cfg.use_sage_attention):
             exp_scale = self.scale_softmax_log2 * sage_q_scale
-            scales_view = self.sage_k_scales.open(stage_info, sage_scale_arr, exp_scale)
-            if cutlass.const_expr(mixed_scales and not summary_dequantized):
-                summary_view = self.sage_summary_k_scales.open(
-                    stage_info, sage_scale_arr, exp_scale
-                )
-            if cutlass.const_expr(mixed_scales and summary_dequantized):
+            if cutlass.const_expr(exact_dequantized or summary_dequantized):
                 row_multipliers = cutlass.Array(
                     Float32, 1, space=cutlass.AddressSpace.rmem
                 )
                 row_addends = cutlass.Array(Float32, 1, space=cutlass.AddressSpace.rmem)
                 row_multipliers[0] = exp_scale
                 row_addends[0] = exponent_addend
+            if cutlass.const_expr(not exact_dequantized):
+                scales_view = self.sage_k_scales.open(
+                    stage_info, sage_scale_arr, exp_scale
+                )
+            if cutlass.const_expr(mixed_scales and not summary_dequantized):
+                summary_view = self.sage_summary_k_scales.open(
+                    stage_info, sage_scale_arr, exp_scale
+                )
             if cutlass.const_expr(unified_scales and cfg.uses_int32_scores):
                 score_bias = Float32(INT32_SCORE_BIAS)
                 if route_is_proxy:
@@ -553,13 +557,22 @@ class SmemPResource(DecodeGenResourceBase):
                             exponent_addend,
                         )
                 else:
-                    self._scale_fragment_with(
-                        self.sage_k_scales,
-                        scales_view,
-                        fragment,
-                        s_arr,
-                        exponent_addend,
-                    )
+                    if cutlass.const_expr(exact_dequantized):
+                        self._scale_fragment_pairs(
+                            s_arr, row_addends, row_multipliers, groups=1
+                        )
+                    else:
+                        self._scale_fragment_with(
+                            self.sage_k_scales,
+                            scales_view,
+                            fragment,
+                            s_arr,
+                            exponent_addend,
+                        )
+            elif cutlass.const_expr(exact_dequantized):
+                self._scale_fragment_pairs(
+                    s_arr, row_addends, row_multipliers, groups=1
+                )
             else:
                 fragment_multipliers = None
                 if cutlass.const_expr(cfg.use_sage_attention):

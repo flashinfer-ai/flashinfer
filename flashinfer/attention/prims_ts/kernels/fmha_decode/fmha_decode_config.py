@@ -2355,21 +2355,20 @@ class FmhaDecodeConfig:
             != self.sage_k_groups_per_fragment
         )
 
-    @property
-    def sage_summary_scores_dequantized(self) -> bool:
-        """Whether the max pass writes a proxy tile's summary scores back dequantized.
+    def sage_scores_dequantized_for(self, proxy: bool) -> bool:
+        """Whether the max pass writes one route kind's scores back dequantized.
 
-        A mixed geometry whose summaries take one scale per score dequantizes
-        each score while folding its maximum: ``(s - bias) * sfK`` is the
-        fold's own product, and the write-back carries it in place of the
-        quantized score. The P pass then exponentiates every summary score
-        with the row's single ``c * sfQ`` multiplier and needs neither the
-        summary scales nor the bias. Proxy tiles of a mixed plan always take
-        the rolled masked pass, which is the pass that writes fragments back.
+        A geometry with one scale per score (the one-token K block) makes
+        ``(s - bias) * sfK`` the fold's own product, so the max pass writes
+        each score back dequantized and the P pass exponentiates that kind's
+        tiles with the row's single ``c * sfQ`` multiplier, reading neither
+        ``sfK`` nor the bias. Coarser geometries keep the scores quantized:
+        their fold scales group maxima alone, and a write-back on the unmasked
+        pass would put a TMEM round trip on every tile of the SOL shapes.
         """
         return (
-            self.sage_mixed_k_geometry
-            and self.sage_summary_k_groups_per_fragment
+            self.use_sage_attention
+            and self.sage_k_groups_per_fragment_for(proxy)
             == self.softmax_score_fragment_regs
         )
 

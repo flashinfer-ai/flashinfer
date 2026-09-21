@@ -362,10 +362,11 @@ take one scale per summary (`k_summary_block_size=1`) while its exact routes
 keep the 16-token block; the kernel then reads the two route kinds' scales
 with their own group geometry and strategy (register array for blocks of 16
 and larger, an SMEM ring for 4 and 1), selected per tile on the route kind.
+A route kind with one scale per score (the one-token K block) has its
+scores written back dequantized by the max pass, so its P pass reads no
+`sfK`; this is what makes the one-token block cheaper than the four-token one.
 A mixed geometry costs little: the proxy kernel carries both geometries'
-max passes and gathers the summary scales in its softmax warps (a one-token
-summary block writes its scores back dequantized, so its P pass needs no
-summary scales), and SOL proxy runs at 1.03x the time of equal block sizes
+max passes and gathers the summary scales in its softmax warps, and SOL proxy runs at 1.03x the time of equal block sizes
 with a one-token summary block for both INT8 and FP8 (B200, CUDA Graph
 replay minimum; exact-only plans are unaffected). `v_summary` holds the per-block V means (the final partial
 block averages only its structural tokens) quantized to E4M3 with the shared
