@@ -1221,7 +1221,7 @@ def _test_verify_kernel_mtp(
     print(f"✓ MTP kernel test passed (batch={B}, seq_len={T}, dtype={dtype})")
 
 
-@pytest.mark.parametrize("cache_intermediate_states", [True])
+@pytest.mark.parametrize("cache_intermediate_states", [True, False])
 @pytest.mark.parametrize("beta", [True])
 @pytest.mark.parametrize("alpha", [True])
 @pytest.mark.parametrize("scale", [1.0])
@@ -1530,7 +1530,7 @@ def _test_mtp_fp32_state_pool(
 
 @pytest.mark.parametrize("cache_intermediate_states", [False, True])
 @pytest.mark.parametrize("use_separate_output_indices", [False, True])
-@pytest.mark.parametrize("seq_len", [4])
+@pytest.mark.parametrize("seq_len", [2, 4])
 @pytest.mark.parametrize("batch_size", [1, 4, 16])
 def test_mtp_fp32_state_pool(
     batch_size: int,
@@ -1667,7 +1667,7 @@ def _test_mtp_fp32_state_pool_non_contiguous(
 
 
 @pytest.mark.parametrize("stride_multiplier", [2, 3])
-@pytest.mark.parametrize("seq_len", [4])
+@pytest.mark.parametrize("seq_len", [2, 4])
 @pytest.mark.parametrize("batch_size", [1, 4])
 def test_mtp_fp32_state_pool_non_contiguous(
     batch_size: int,
@@ -2410,7 +2410,7 @@ except ImportError:
     [(16, 16, 64)],
 )
 # tile_v is an explicit axis here, so B adds no specialization.
-@pytest.mark.parametrize("batch_size", [16])
+@pytest.mark.parametrize("batch_size", [16, 64])
 @pytest.mark.parametrize("dtype", ["bfloat16"])
 def test_gdn_decode_bf16_state_wide_vec_mtp_kernel(
     monkeypatch,
@@ -3382,7 +3382,7 @@ def test_gdn_decode_bf16_state_mtp_split_pool(
 
 @pytest.mark.parametrize("pool_size_multiplier", [1, 4])
 @pytest.mark.parametrize("batch_size", [1, 8, 32])
-@pytest.mark.parametrize("seq_len", [4])
+@pytest.mark.parametrize("seq_len", [2, 4])
 def test_gdn_decode_bf16_state_mtp_pool_larger_than_batch(
     batch_size: int,
     seq_len: int,
@@ -3531,7 +3531,8 @@ def test_gdn_decode_bf16_state_mtp_pool_larger_than_batch(
 
 @pytest.mark.parametrize("split_pool", [False, True])
 @pytest.mark.parametrize("max_T", [2, 8])
-@pytest.mark.parametrize("batch_size", [1, 4, 16])
+# B=128 keeps pool_size*HV past the Int32 byte-offset boundary (#3502 widen).
+@pytest.mark.parametrize("batch_size", [1, 4, 16, 128])
 @pytest.mark.parametrize(
     "num_q_heads, num_k_heads, num_v_heads",
     [(16, 16, 64)],
@@ -4242,7 +4243,7 @@ def test_decode_nontranspose_packed_qkv(batch_size: int):
 
 
 @pytest.mark.parametrize("batch_size", [2, 8, 64])
-@pytest.mark.parametrize("seq_len", [4])
+@pytest.mark.parametrize("seq_len", [2, 4])
 def test_mtp_packed_qkv(batch_size: int, seq_len: int):
     """MTP decode must accept packed q/k/v (bit-identical to contiguous)."""
     _skip_if_not_sm90_or_later()
