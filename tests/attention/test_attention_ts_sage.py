@@ -482,7 +482,7 @@ def test_summary_block_size_reaches_only_proxy_kernels(use_proxy_routes: bool) -
     )
     cfg = block_sparse_config._make_block_sparse_config(key)
     assert cfg.sage_k_block_size == 16
-    assert cfg.sage_k_summary_block_size == (1 if use_proxy_routes else 0)
+    assert cfg.sage_k_summary_block_size == (1 if use_proxy_routes else 16)
     assert cfg.sage_mixed_k_geometry == use_proxy_routes
     assert cfg.sage_summary_k_groups_per_fragment == (32 if use_proxy_routes else 2)
     # One scale per summary score: the max pass writes proxy tiles back
@@ -499,13 +499,13 @@ def test_summary_block_size_reaches_only_proxy_kernels(use_proxy_routes: bool) -
 
 
 def test_summary_block_size_is_validated() -> None:
-    """A proxy plan needs a supported summary block; other plans must leave it unset."""
+    """The summary block is a supported size and equals the token block without proxy routes."""
 
     with pytest.raises(ValueError, match="sage_k_summary_block_size"):
         make_sage_decode_config(
             tile_size_q=64,
             tile_size_kv=256,
-            sage_args={"sage_k_block_size": 16, "sage_k_summary_block_size": 16},
+            sage_args={"sage_k_block_size": 16, "sage_k_summary_block_size": 1},
         )
     from flashinfer.attention.prims_ts._block_sparse import (
         config as block_sparse_config,

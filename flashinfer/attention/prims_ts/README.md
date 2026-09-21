@@ -294,7 +294,7 @@ positive; the kernel does not check the values.
 | Output dtype (`o_data_type`) | `torch.bfloat16` (default with `sage`) or `torch.float16` |
 | `SageAttentionConfig.q_block_size` | Power of two no larger than the Q tile (64 or 128, see below); default 1 |
 | `SageAttentionConfig.k_block_size` | One of `SAGE_K_BLOCK_SIZES == (1, 4, 16, 32, 64, 128, 256)`; default 16 |
-| `SageAttentionConfig.k_summary_block_size` | K block size of a proxy plan's summary scales, one of `SAGE_K_BLOCK_SIZES`; default `None` = `k_block_size`. Ignored without proxy routes |
+| `SageAttentionConfig.k_summary_block_size` | K block size of a proxy plan's summary scales, one of `SAGE_K_BLOCK_SIZES`; default `None` = `k_block_size`. A plan without proxy routes uses `k_block_size` |
 | `SageAttentionConfig.v_mean` | `True` when every run supplies `v_mean`; default `False` |
 | Head dimension | 128 |
 | K/V storage | Contiguous `[B, S, Hkv, D]` only; the paged wrappers accept neither `sage` nor INT8 |

@@ -133,6 +133,7 @@ def make_sage_decode_config(
     }
     if sage_args is not None:
         args.update(sage_args)
+    args.setdefault("sage_k_summary_block_size", args["sage_k_block_size"])
     heads_q_per_kv = 1 if tile_size_q == 64 else 8
     return make_decode_config(
         headdim=HEAD_DIM,

@@ -1217,9 +1217,10 @@ class FmhaDecodeConfig:
     # and E4M3 V with one scale per channel. A nonzero K block size enables
     # the feature; the Q block size is a power of two up to ``tile_size_q``.
     # ``sage_v_mean`` adds a per-channel V mean back after normalization.
-    # ``sage_k_summary_block_size`` is the K block size of a proxy plan's
-    # summary scales; zero on every plan without proxy routes, so exact-only
-    # and dense plans share one kernel per recipe.
+    # ``sage_k_summary_block_size`` is the K block size of the proxy routes'
+    # summary scales, the second scale geometry of a plan; a plan without
+    # proxy routes carries the token block size there, so exact-only and
+    # dense plans share one kernel per recipe.
     sage_q_block_size: int = 0
     sage_k_block_size: int = 0
     sage_k_summary_block_size: int = 0
@@ -1789,9 +1790,9 @@ class FmhaDecodeConfig:
     def validate_sage_profile(self) -> None:
         """Validate the qualified host profile of a Sage attention launch.
 
-        The scale block sizes follow the recipe: ``sage_k_block_size`` is one
-        of ``SAGE_K_BLOCK_SIZES``, ``sage_k_summary_block_size`` is one of them
-        on a proxy plan and zero otherwise, and ``sage_q_block_size`` is a
+        The scale block sizes follow the recipe: ``sage_k_block_size`` and
+        ``sage_k_summary_block_size`` are each one of ``SAGE_K_BLOCK_SIZES``
+        (equal on a plan without proxy routes), and ``sage_q_block_size`` is a
         power of two no larger than the Q tile. The launch needs contiguous
         K/V with ``headdim=128``, a streamed two-instance Keeps profile and
         the direct-output grid. Without Sage attention the other recipe
@@ -1814,17 +1815,19 @@ class FmhaDecodeConfig:
                 f"sage_k_block_size must be one of {SAGE_K_BLOCK_SIZES}, "
                 f"got {self.sage_k_block_size}"
             )
-        if self.use_block_sparse_proxy_routes:
-            if self.sage_k_summary_block_size not in SAGE_K_BLOCK_SIZES:
-                raise ValueError(
-                    "sage_k_summary_block_size must be one of "
-                    f"{SAGE_K_BLOCK_SIZES} on a proxy plan, "
-                    f"got {self.sage_k_summary_block_size}"
-                )
-        elif self.sage_k_summary_block_size != 0:
+        if self.sage_k_summary_block_size not in SAGE_K_BLOCK_SIZES:
             raise ValueError(
-                "sage_k_summary_block_size applies to proxy plans only, "
+                f"sage_k_summary_block_size must be one of {SAGE_K_BLOCK_SIZES}, "
                 f"got {self.sage_k_summary_block_size}"
+            )
+        if (
+            not self.use_block_sparse_proxy_routes
+            and self.sage_k_summary_block_size != self.sage_k_block_size
+        ):
+            raise ValueError(
+                "sage_k_summary_block_size must equal sage_k_block_size without "
+                f"proxy routes, got {self.sage_k_summary_block_size} and "
+                f"{self.sage_k_block_size}"
             )
         q_block_size = self.sage_q_block_size
         if not is_power_of_two(q_block_size) or q_block_size > self.tile_size_q:
@@ -2328,8 +2331,8 @@ class FmhaDecodeConfig:
     @property
     def sage_summary_k_groups_per_fragment(self) -> int:
         """Return the scale groups per fragment of a proxy route's summaries."""
-        if not self.use_sage_attention or not self.use_block_sparse_proxy_routes:
-            return self.sage_k_groups_per_fragment
+        if not self.use_sage_attention:
+            return 1
         return self.sage_k_groups_for_block(self.sage_k_summary_block_size)
 
     def sage_k_groups_per_fragment_for(self, proxy: bool) -> int:
@@ -2348,7 +2351,6 @@ class FmhaDecodeConfig:
         """
         return (
             self.use_sage_attention
-            and self.use_block_sparse_proxy_routes
             and self.sage_summary_k_groups_per_fragment
             != self.sage_k_groups_per_fragment
         )

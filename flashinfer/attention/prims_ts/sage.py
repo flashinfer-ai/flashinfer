@@ -58,7 +58,8 @@ class SageAttentionConfig:
     ``SAGE_K_BLOCK_SIZES``; ``None`` follows ``k_block_size``. Summaries are
     block means whose magnitudes spread more than the tokens', so an INT8
     recipe may want finer summary blocks than token blocks; exact routes keep
-    ``k_block_size`` either way. Plans without proxy routes ignore the field.
+    ``k_block_size`` either way. A plan without proxy routes has no summaries
+    and uses ``k_block_size`` for both geometries.
     """
 
     q_block_size: int = 1

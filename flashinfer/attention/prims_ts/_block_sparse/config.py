@@ -583,7 +583,9 @@ def _make_block_sparse_config(key: _BlockSparseCompileKey) -> "FmhaDecodeConfig"
                 "sage_q_block_size": key.sage.q_block_size,
                 "sage_k_block_size": key.sage.k_block_size,
                 "sage_k_summary_block_size": (
-                    key.sage.summary_k_block_size if key.use_proxy_routes else 0
+                    key.sage.summary_k_block_size
+                    if key.use_proxy_routes
+                    else key.sage.k_block_size
                 ),
                 "sage_v_mean": key.sage.v_mean,
             }
