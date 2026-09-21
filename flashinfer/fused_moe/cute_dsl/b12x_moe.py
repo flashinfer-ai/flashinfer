@@ -80,6 +80,7 @@ def b12x_fused_moe(
     activation_precision: str = "fp4",
     quant_mode: Optional[str] = None,
     source_format: str = "modelopt",
+    use_fused_finalize: bool = True,
 ) -> torch.Tensor:
     r"""Run fused MoE on SM120/SM121 using b12x CuTe-DSL kernels.
 
@@ -150,11 +151,41 @@ def b12x_fused_moe(
     source_format : str
         Source weight format for ``quant_mode="w4a16"`` — ``"modelopt"`` or
         ``"compressed_tensors"``.  Defaults to ``"modelopt"``.
+    use_fused_finalize : bool
+        Whether the top-k expert reduction ("finalize") may be fused into the
+        FC2 epilogue.  Defaults to ``True`` for best performance.  The fused
+        epilogue of the micro and dynamic backends reduces expert outputs via
+        non-associative BF16 atomics, so results are not deterministic
+        run-to-run.  Set to ``False`` to use the deterministic finalize path:
+        every launch runs the static backend, which stores each route's
+        contribution separately and sums them per token in FP32 in a fixed
+        order.  Inputs larger than the static backend's routed-row band are
+        processed in token chunks, which costs throughput above that band.
+        Not supported for ``quant_mode="w4a16"`` (``NotImplementedError``).
 
     Returns
     -------
     torch.Tensor
         Output tensor of shape ``[num_tokens, hidden_size]``.
+
+    Notes
+    -----
+    Bit-for-bit repeatability of two calls with identical inputs:
+
+    * ``use_fused_finalize=False`` (``"nvfp4"`` and ``"mxfp4"``): repeatable at
+      every token count, within a process and across processes.
+    * ``use_fused_finalize=True`` (default): depends on the backend the call
+      lands on, which follows its shape and the dispatch thresholds.  The
+      micro backend (decode batches, by default at most 8 tokens and 40
+      routed rows) and the dynamic backend (routed rows above the static
+      cutover, by default 1024 for NVFP4 and 640 for MXFP4) add FC2 partials
+      into the BF16 output atomically, so the rounding depends on arrival
+      order and they are not repeatable.  The static backend and the direct
+      micro backend (NVFP4 decode with ``intermediate_size <= 512``) sum in a
+      fixed order and are repeatable.
+    * ``quant_mode="w4a16"``: not repeatable, and has no fixed-order option.
+
+    This covers identical inputs only; it is not a batch-invariance guarantee.
     """
     from ...jit.cpp_ext import get_cuda_version
 
@@ -228,6 +259,7 @@ def b12x_fused_moe(
         activation_precision=activation_precision,
         quant_mode=quant_mode,
         source_format=source_format,
+        use_fused_finalize=use_fused_finalize,
     )
 
 
@@ -236,6 +268,13 @@ class B12xMoEWrapper:
 
     Pre-allocates workspace buffers for CUDA graph compatibility.
     Automatically selects micro/static/dynamic backend per call.
+
+    By default outputs are not bit-for-bit repeatable run-to-run: the micro
+    and dynamic backends add expert outputs into the BF16 output atomically,
+    and quant_mode="w4a16" is not repeatable either. Pass
+    use_fused_finalize=False (NVFP4/MXFP4 only) to run every call on the
+    static backend, which sums in a fixed order and is repeatable; see
+    :func:`b12x_fused_moe` for the per-backend contract.
 
     Args:
         num_experts: Total number of experts.
@@ -256,6 +295,10 @@ class B12xMoEWrapper:
             When set, this selects the backend and internal workspace family.
         source_format: Source weight format for quant_mode="w4a16".
             Supports "modelopt" and "compressed_tensors". Default: "modelopt".
+        use_fused_finalize: True (default) allows the fused atomic finalize
+            of the micro and dynamic backends, which is not deterministic
+            run-to-run. False selects the deterministic finalize path (static
+            backend only, token-chunked). Not supported for quant_mode="w4a16".
         shared_static_workspace, shared_dynamic_workspace, shared_output:
             Optional externally-allocated buffers reused instead of fresh
             allocations. Callers running many identically-shaped wrappers
@@ -289,6 +332,7 @@ class B12xMoEWrapper:
         activation_precision: str = "fp4",
         quant_mode: Optional[str] = None,
         source_format: str = "modelopt",
+        use_fused_finalize: bool = True,
         shared_static_workspace: Optional[object] = None,
         shared_dynamic_workspace: Optional[object] = None,
         shared_output: Optional[torch.Tensor] = None,
@@ -337,6 +381,16 @@ class B12xMoEWrapper:
         source_format : str
             Source weight format for ``quant_mode="w4a16"`` —
             ``"modelopt"`` (default) or ``"compressed_tensors"``.
+        use_fused_finalize : bool
+            Whether the top-k expert reduction ("finalize") may be fused into
+            the FC2 epilogue.  Defaults to ``True`` for best performance; the
+            fused epilogue of the micro and dynamic backends reduces expert
+            outputs via non-associative BF16 atomics, so results are not
+            deterministic run-to-run.  Set to ``False`` to use the
+            deterministic finalize path; see :func:`b12x_fused_moe`.  With
+            ``use_cuda_graph=True`` only a static workspace sized for one
+            token chunk is allocated.  Not supported for
+            ``quant_mode="w4a16"`` (``NotImplementedError``).
         shared_static_workspace, shared_dynamic_workspace : Optional[object]
             Externally allocated workspaces reused instead of fresh
             allocations.  Callers running many identically-shaped wrappers
@@ -394,6 +448,13 @@ class B12xMoEWrapper:
             self.quant_mode
         )
         self.source_format = source_format
+        self.use_fused_finalize = use_fused_finalize
+        if not use_fused_finalize and self.quant_mode == "w4a16":
+            raise NotImplementedError(
+                "use_fused_finalize=False is not supported for "
+                "quant_mode='w4a16': the W4A16 kernels have no fixed-order "
+                "finalize."
+            )
 
         # Pre-allocated objects. Both workspace slots may be populated so
         # run() can pick per-call; without this, the backend would be locked
@@ -463,6 +524,7 @@ class B12xMoEWrapper:
         from .blackwell_sm12x.moe_dispatch import (
             allocate_sm120_moe_workspace,
             select_sm120_moe_backend,
+            _fixed_order_chunk_tokens,
             _get_static_compact_cutover_pairs,
         )
 
@@ -498,7 +560,8 @@ class B12xMoEWrapper:
         # dynamic kernel indexes row_counts/expert_write_rows with topk_ids
         # (sized by num_local_experts), so it requires num_local == num_experts.
         needs_dynamic = (
-            select_sm120_moe_backend(
+            self.use_fused_finalize
+            and select_sm120_moe_backend(
                 num_tokens=self.max_num_tokens,
                 num_topk=self.top_k,
                 activation_precision=self.activation_precision,
@@ -521,6 +584,12 @@ class B12xMoEWrapper:
             if needs_dynamic
             else max_routed_rows
         )
+        if not self.use_fused_finalize:
+            # The fixed-order path launches the static kernel per token chunk.
+            static_max_rows = min(
+                max_routed_rows,
+                _fixed_order_chunk_tokens(self.top_k, self.quant_mode) * self.top_k,
+            )
         if self._static_workspace is None:
             self._static_workspace = allocate_sm120_moe_workspace(
                 state_E=self.num_local_experts,
@@ -649,7 +718,8 @@ class B12xMoEWrapper:
             if self.quant_mode == "w4a16":
                 workspace = self._static_workspace
             elif (
-                self._dynamic_workspace is not None
+                self.use_fused_finalize
+                and self._dynamic_workspace is not None
                 and select_sm120_moe_backend(
                     num_tokens=num_tokens,
                     num_topk=self.top_k,
@@ -765,6 +835,7 @@ class B12xMoEWrapper:
             activation_precision=self.activation_precision,
             quant_mode=self.quant_mode,
             source_format=self.source_format,
+            use_fused_finalize=self.use_fused_finalize,
             _workspace=workspace,
             _weight_views=self._weight_views,
         )
