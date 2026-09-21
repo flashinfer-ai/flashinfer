@@ -5,13 +5,10 @@ The Rubin backends support NVFP4 and MXFP8 E4M3/E5M2 inference through
 MegaMoE `1667b47a`; [VENDOR.md](../../flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/VENDOR.md)
 records the full source and exporter revisions.
 
-## Results
+## Correctness coverage
 
 At FlashInfer `5bd5aeef60c44a99341e6b6a183968d73bf582e7`, native tests passed
-50 single-GPU cases and 16 EP4 cases on each rank, with no failures, errors,
-or skips. The EP4 benchmark completed all 420 records. See the
-[results](moe_ep_sm107_results.md) for the runtime, measurements, and raw logs.
-That report also lists configurations not covered by these runs.
+50 single-GPU cases and 16 EP4 cases on each rank.
 
 ## Setup
 
@@ -24,9 +21,8 @@ python -m pip install --no-build-isolation -e '.[sm107]'
 ```
 
 Set the target before importing CuTe DSL. The shim uses native Rubin APIs
-available in CuTe DSL 4.8.0.dev0 and compatible newer builds. The tested ARM
-PyTorch Rubin stack is pinned in the results; the minimum public DSL build
-has not been tested on Rubin.
+available in CuTe DSL 4.8.0.dev0 and compatible newer builds. The minimum
+public DSL build has not been tested on Rubin.
 
 For each run, save the source revision and any local diff, `python -m
 flashinfer.collect_env`, `nvidia-smi -q`, and `nvidia-smi topo -m`. Record
@@ -143,7 +139,7 @@ added for the specific code or deployment being validated.
 
 [TUNING.md](../../flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/TUNING.md)
 defines the two geometries, timing scopes, cache policies, and rank statistics.
-The completed campaign uses compute/eager with L2 flushing for historical
+Use compute/eager with L2 flushing for historical
 comparisons and kernel/forward × eager/graph without flushing. Each point has
 20 warmups, 50 timed iterations, and three process repetitions.
 

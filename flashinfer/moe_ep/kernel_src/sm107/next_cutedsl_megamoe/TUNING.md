@@ -10,18 +10,10 @@ kernel, not new measurements; tuning caches from that drop are invalidated.
 Qualify correctness first using the [Rubin runbook](../../../../../docs/design_docs/moe_ep_sm107_qualification.md).
 All three formats (NVFP4, MXFP8 E4M3, MXFP8 E5M2) require native SM107 and
 a compatible CuTe DSL build. Export `CUTE_DSL_ARCH=sm_107a` before Python
-starts. The original PR's internal-build performance claims are not a
-baseline for this implementation. Record the compiler stack and absolute
-latency with each result.
+starts. Record the compiler stack and absolute latency with each result.
 
-## Completed EP4 campaign
-
-At FlashInfer `5bd5aeef`, all 84 compute-reference records and 336
-kernel/forward records passed on September 18, 2026. Runs used four Rubin GPUs
-and the prepared ARM PyTorch image, after single-GPU and EP4 correctness passed.
-The [results and repetition ranges](../../../../../docs/design_docs/moe_ep_sm107_results.md)
-cover both geometries, seven token counts, separate BF16 reduction, and IKR.
-GenPhase, SiTU, `combine_nvfp4`, and `combine_mxfp8` are future integration work.
+Single-GPU and EP4 correctness passed at FlashInfer `5bd5aeef`: 50 single-GPU
+cases and 16 EP4 cases per rank.
 
 ## What the benchmark measures
 
@@ -171,7 +163,7 @@ done
 ```
 
 The second geometry's historical table contains only 8/64/512/2048/8192 rows;
-its 1024/4096 Rubin results have no published counterpart in that table.
+its 1024/4096 token-count cases have no counterpart in that table.
 Separate supplementary runs can study tuned profiles, other formats,
 fixed-large-capacity decode, balanced/power-law skew, and reported PR knobs.
 

@@ -257,8 +257,7 @@ python tests/moe_ep/qualify_sm107.py --suite all --world-size 4 \
 For individual suites, use `bash tests/moe_ep/run_tests.sh oracle_sm107`
 (single GPU) or `NPROC_MULTIRANK=4 bash tests/moe_ep/run_tests.sh mega_sm107`.
 The distributed target also accepts 2 or 8 ranks. See the
-[validation guide](moe_ep_sm107_qualification.md) and
-[completed single-GPU/EP4 results](moe_ep_sm107_results.md).
+[validation guide](moe_ep_sm107_qualification.md).
 
 ### Hopper performance benchmark
 

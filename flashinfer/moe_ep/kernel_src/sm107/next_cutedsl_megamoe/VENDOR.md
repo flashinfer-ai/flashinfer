@@ -5,24 +5,23 @@ This directory contains one upstream kernel snapshot.
 
 ## Upstream
 
-- **Repo**: <https://gitlab-master.nvidia.com/bangyus/cutedsl_megamoe>
-  (NVIDIA-internal GitLab; see the shared
-  [acknowledgements](../../sm100/cutedsl_megamoe/ACKNOWLEDGEMENT.md)).
+- **Source**: the kernel team's `cutedsl_megamoe` repository; see the shared
+  [acknowledgements](../../sm100/cutedsl_megamoe/ACKNOWLEDGEMENT.md).
 - **Vendored commit**:
-  [`1667b47a3c911ecade464ab524baf192a0bf5962`](https://gitlab-master.nvidia.com/bangyus/cutedsl_megamoe/-/commit/1667b47a3c911ecade464ab524baf192a0bf5962),
+  `1667b47a3c911ecade464ab524baf192a0bf5962`,
   committed 2026-09-16, the upstream `main` snapshot selected for this refresh.
 - **Last synced**: 2026-09-16, using the upstream exporter from that same commit.
   Previous drop: `92dd334af2eeedb36087834354b58ace08e880c6` (2026-08-15), inherited
   from FlashInfer PR #4601. The older `47881ad2` reference described equivalent
   inference files in that previous drop; it is not the current source pin.
-- **Exporter**: [`next/export_src.py`](https://gitlab-master.nvidia.com/bangyus/cutedsl_megamoe/-/blob/1667b47a3c911ecade464ab524baf192a0bf5962/next/export_src.py),
+- **Exporter**: `next/export_src.py` at the vendored commit,
   SHA-256 `a1deca5d171a4ba92ee56b5ee82f064d5dc8f44cdf52b9ce49c88d46f10fb523`.
 - **Selected kernels**: `RubinInferenceMegaMoE` and `RubinInferenceGenphaseMegaMoE`.
   Their dependency closure is exported to `src/sources/`: 32 implementation
   modules and nine generated package initializers, 41 files total.
 - **Verification**: two independent exports at the pinned commit produced
-  identical file lists and bytes; the installed `src/sources/` matches that
-  output exactly. The exporter validates internal import closure and rejects
+  identical file lists and bytes. The local comment edit is listed below.
+  The exporter validates internal import closure and rejects
   unresolved imports and dependencies outside its external-module allowlist.
 
 The export command, from a checkout at the pinned SHA, is:
@@ -76,17 +75,14 @@ The shim checks capabilities and the target captured at import.
 The older `92dd334` payload passed integration correctness at FlashInfer revision
 `9a414e73c8f4246746b281f98db2217a515819cb`, including EP2/4/8. That evidence is for
 the older drop. This export passed native single-GPU (50 cases) and EP4
-(16 cases per rank) correctness at FlashInfer `5bd5aeef` on the recorded ARM
-Rubin stack, followed by all 420 planned benchmark records on September 18,
-2026. See the [results](../../../../../docs/design_docs/moe_ep_sm107_results.md)
-and [qualification guide](../../../../../docs/design_docs/moe_ep_sm107_qualification.md).
-EP2/EP8 on this export remain unmeasured. Tuning-cache entries use revision
+(16 cases per rank) correctness at FlashInfer `5bd5aeef`. See the
+[qualification guide](../../../../../docs/design_docs/moe_ep_sm107_qualification.md).
+EP2/EP8 on this export have not been validated. Tuning-cache entries use revision
 `sm107-block-scaled-1667b47a-v3`, so the previous drop's timings are not reused.
 
 ## Export transformations
 
-There are **no handwritten changes** to the export. Upstream's exporter
-materializes three `COPY_FROM_IMPORT` markers at the pinned commit:
+Upstream's exporter materializes three `COPY_FROM_IMPORT` markers at the pinned commit:
 
 | Exported file under `src/sources/kernel_src/` | Upstream source under `next/sources/kernel_src/` |
 | --- | --- |
@@ -99,6 +95,14 @@ It also generates nine `__init__.py` files and rewrites one import statement in
 implementation modules. The generated root exposes the two selected aliases;
 intermediate package initializers are empty. These are upstream exporter
 transformations, not manual FlashInfer patches.
+
+## Local differences
+
+The comment above `pusher_cta_count` in
+`src/sources/kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel_gen_specialized.py`
+describes the residency requirement without device-specific counts. Kernel
+logic and configuration values are unchanged. All other exported files match
+the pinned upstream export.
 
 ## Related trees
 
