@@ -15,7 +15,7 @@ Layout::
 
 Usage::
 
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
         get_symm_buffer_for_mega_moe,
         init_dist,
         nvfp4_mega_moe,
@@ -24,7 +24,7 @@ Usage::
 
 from __future__ import annotations
 
-# Importing the shim puts ``kernel_src/cutedsl_megamoe/src`` on sys.path (via
+# Importing the shim puts ``kernel_src/sm100/cutedsl_megamoe/src`` on sys.path (via
 # shim/_paths.bootstrap_paths) before its modules resolve the raw kernel
 # packages (moe_nvfp4_swapab, common, ...).  ``bootstrap_paths`` is re-exported
 # here so callers (e.g. core runtime) reach it through this public boundary.

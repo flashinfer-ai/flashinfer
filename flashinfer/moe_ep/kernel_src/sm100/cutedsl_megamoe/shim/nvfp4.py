@@ -10,7 +10,7 @@ shapes.  Input generation and reference checks live in
 
 Example (multi-rank; launch with ``torchrun``)::
 
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim import (
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim import (
         MegaMoENvfp4Config,
         MegaMoENvfp4Frontend,
         MegaMoENvfp4Inputs,
@@ -34,7 +34,7 @@ Example (multi-rank; launch with ``torchrun``)::
 Single-rank smoke (no NVSHMEM)::
 
     MEGA_NO_DIST=1 CUDA_VISIBLE_DEVICES=0 python -u \\
-        -m flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim \\
+        -m flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim \\
         --num_tokens_per_rank 128 ...
 """
 
