@@ -29,7 +29,9 @@ from pathlib import Path
 
 import torch
 
-from flashinfer.experimental.cudnn_frost_selected_kernels.activations import ACTIVATIONS
+from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.activations import (
+    ACTIVATIONS,
+)
 
 if __package__:
     from .bench_cudnn_frost_common import (
@@ -88,7 +90,7 @@ def benchmark(args):
     torch.manual_seed(41)
     e, h, i = args.experts, args.hidden, args.intermediate
     if args.artifact_root is not None:
-        from flashinfer.experimental.cudnn_frost_selected_kernels.bf16 import (
+        from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.bf16 import (
             fc2,
             runtime,
         )
@@ -199,7 +201,7 @@ def benchmark(args):
         # Benchmark-only dispatcher ablation, never a change to an existing runner.
         layers["original"]._additional_candidates = lambda *args: []
         if args.probe_cudnn_frost:
-            from flashinfer.experimental.cudnn_frost_selected_kernels.bf16.moe import (
+            from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.bf16.moe import (
                 CudnnFrostBf16MoeRunner,
             )
 
@@ -422,7 +424,9 @@ def catalog_configs(op, e, n, k, file):
     from cudnn.gemm.frost import tile_config
     from cudnn.gemm.frost.compiler import probe_chain
     from cudnn.gemm.frost.graph_analyzer import analyze
-    from flashinfer.experimental.cudnn_frost_selected_kernels.export import _build_graph
+    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.export import (
+        _build_graph,
+    )
 
     chain = analyze(_build_graph(1024, n, k, e, e, op))
     for original in tile_config.CATALOG:
@@ -465,13 +469,15 @@ def catalog_configs(op, e, n, k, file):
 
 def export_task(opts):
     """A CPU compiler worker; no benchmark timing is collected in this phase."""
-    from flashinfer.experimental.cudnn_frost_selected_kernels.export import export_one
+    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.export import (
+        export_one,
+    )
 
     start = time.monotonic()
     try:
         kernel = export_one(opts)
         if opts.warm_source_jit:
-            from flashinfer.experimental.cudnn_frost_selected_kernels.bf16 import (
+            from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.bf16 import (
                 runtime,
             )
 
@@ -688,7 +694,7 @@ def measure_stage(fn, out, ref, args):
 
 
 def sweep(args, file):
-    from flashinfer.experimental.cudnn_frost_selected_kernels.bf16 import (
+    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.bf16 import (
         fc2,
         moe,
         runtime,
@@ -1004,10 +1010,12 @@ def sweep(args, file):
 
 def select(args, file):
     """Copy the union of full-MoE winners, preserving existing architectures."""
-    from flashinfer.experimental.cudnn_frost_selected_kernels.export import (
+    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.export import (
         _write_manifest,
     )
-    from flashinfer.experimental.cudnn_frost_selected_kernels.runtime import _safe_child
+    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.runtime import (
+        _safe_child,
+    )
 
     results = [json.loads(line) for line in args.results.read_text().splitlines()]
     options = results[0]["options"]

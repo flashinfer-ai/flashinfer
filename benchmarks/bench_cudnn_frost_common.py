@@ -7,7 +7,9 @@ import subprocess
 
 import torch
 
-from flashinfer.experimental.cudnn_frost_selected_kernels.activations import ACTIVATIONS
+from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.activations import (
+    ACTIVATIONS,
+)
 
 
 def check_idle_gpu(gpu_uuid):

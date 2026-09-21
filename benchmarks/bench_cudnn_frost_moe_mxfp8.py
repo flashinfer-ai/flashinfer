@@ -43,12 +43,16 @@ from pathlib import Path
 
 import torch
 
-from flashinfer.experimental.cudnn_frost_selected_kernels import runtime
-from flashinfer.experimental.cudnn_frost_selected_kernels.activations import (
+from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm import (
+    runtime,
+)
+from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.activations import (
     ACTIVATIONS,
     is_gated,
 )
-from flashinfer.experimental.cudnn_frost_selected_kernels.mxfp8 import runtime as mxfp8
+from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.mxfp8 import (
+    runtime as mxfp8,
+)
 
 if __package__:
     from .bench_cudnn_frost_common import (
@@ -895,7 +899,9 @@ def benchmark(args):
         output = args.output.open("x")
     try:
         if args.artifacts is not None:
-            from flashinfer.experimental.cudnn_frost_selected_kernels.mxfp8 import moe
+            from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.mxfp8 import (
+                moe,
+            )
 
             # Keep normal MoELayer admission and tuning, using this campaign's pool.
             original_artifact_roots = moe._artifact_roots
