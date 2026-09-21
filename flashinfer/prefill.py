@@ -4777,9 +4777,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 num_qo_heads,
                 causal,
             )
-            self._max_qo_len = torch.max(
-                self._qo_indptr_buf[1:] - self._qo_indptr_buf[:-1]
-            ).item()
+            self._max_qo_len = max_qo_len
         elif self._backend == "fmha_v2":
             # fmha_v2 handles planning internally — no JIT module plan needed
             pass
