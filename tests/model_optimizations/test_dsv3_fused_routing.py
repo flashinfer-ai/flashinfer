@@ -466,8 +466,9 @@ def test_dsv3_fused_routing_backend_correctness(
     if backend == "cake" and torch.cuda.get_device_capability() not in (
         (10, 0),
         (10, 3),
+        (10, 7),
     ):
-        pytest.skip("Cake fused routing requires SM100 or SM103")
+        pytest.skip("Cake fused routing requires SM100, SM103 or SM107")
 
     num_tokens = 7
     torch.manual_seed(42)
