@@ -110,7 +110,19 @@ fi
 
 # Build the wheel using the build module for better isolation
 echo "Building wheel..."
-python -m build --wheel
+if [ "${BUILD_TARGET}" = "provider" ]; then
+  JIT_CACHE_NO_OUTPUT_TIMEOUT_SECONDS=${JIT_CACHE_NO_OUTPUT_TIMEOUT_SECONDS:-5400}
+  JIT_CACHE_WATCHDOG_TERM_GRACE_SECONDS=${JIT_CACHE_WATCHDOG_TERM_GRACE_SECONDS:-120}
+  WATCHDOG_DIAGNOSTICS_FILE=${SCCACHE_STATS_DIR:-/tmp}/jit-cache-watchdog.txt
+  echo "Provider build no-output timeout: ${JIT_CACHE_NO_OUTPUT_TIMEOUT_SECONDS}s"
+  python "${SCRIPT_DIR}/run_with_output_watchdog.py" \
+    --timeout-seconds "${JIT_CACHE_NO_OUTPUT_TIMEOUT_SECONDS}" \
+    --term-grace-seconds "${JIT_CACHE_WATCHDOG_TERM_GRACE_SECONDS}" \
+    --diagnostics-file "${WATCHDOG_DIAGNOSTICS_FILE}" \
+    -- python -m build --wheel
+else
+  python -m build --wheel
+fi
 
 echo ""
 echo "✓ Build completed successfully"

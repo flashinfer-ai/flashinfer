@@ -22,6 +22,7 @@ on:
       - 'scripts/build_flashinfer_jit_cache_whl.sh'
       - 'scripts/build_patched_sccache.sh'
       - 'scripts/jit_cache_build_common.sh'
+      - 'scripts/run_with_output_watchdog.py'
       - 'scripts/update_whl_index.py'
       - 'scripts/verify_jit_cache_provider_release.py'
       - 'scripts/jit_cache_provider_validation.py'
@@ -323,6 +324,15 @@ jobs:
           SCCACHE_REGION: ${{ vars.SCCACHE_REGION || 'us-west-2' }}
         run: bash scripts/build_flashinfer_jit_cache_artifact.sh
         timeout-minutes: 360
+
+      - name: Upload provider build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jit-cache-diagnostics-${{ matrix.cuda_label }}-${{ matrix.cpu_architecture }}-${{ matrix.provider_tag }}
+          path: sccache-stats/
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Upload provider artifact
         uses: actions/upload-artifact@v4

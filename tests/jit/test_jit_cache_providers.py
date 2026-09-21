@@ -381,13 +381,13 @@ test "${{PIP_BUILD_CONSTRAINT}}" = /tmp/original-build-constraint
     assert trap_marker.is_file()
 
 
-def test_sccache_setup_bounds_nvcc_compilation(tmp_path):
+def test_sccache_setup_uses_server_side_compilation(tmp_path):
     common_script = (
         Path(__file__).resolve().parents[2] / "scripts" / "jit_cache_build_common.sh"
     )
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
-    for command in ("sccache", "timeout"):
+    for command in ("sccache",):
         executable = fake_bin / command
         executable.write_text("#!/bin/bash\nexit 0\n")
         executable.chmod(0o755)
@@ -401,11 +401,11 @@ install_sccache() {{
 }}
 export PATH="{fake_bin}:$PATH"
 export SCCACHE_BUCKET=test-bucket
+export SCCACHE_CLIENT_SIDE=1
 setup_sccache test-prefix "{tmp_path}"
-test "${{SCCACHE_CLIENT_SIDE}}" = 1
+test -z "${{SCCACHE_CLIENT_SIDE:-}}"
 test "${{FLASHINFER_CXX_LAUNCHER}}" = sccache
-test "${{FLASHINFER_NVCC_LAUNCHER}}" = \
-  "timeout --verbose --signal=TERM --kill-after=2m 90m sccache"
+test "${{FLASHINFER_NVCC_LAUNCHER}}" = sccache
 """
 
     subprocess.run(["bash", "-c", script], check=True)
