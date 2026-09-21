@@ -19,7 +19,7 @@ from typing import Optional, Tuple, Union
 
 import torch
 
-from .api_logging import flashinfer_api
+from .api_logging import flashinfer_api, flashinfer_experimental_api
 from .trace.templates.attention import (
     block_sparse_attention_run_trace,
     variable_block_sparse_attention_run_trace,
@@ -1632,6 +1632,80 @@ class BlockSparseAttentionWrapper:
             )
 
         return (out, lse) if return_lse else out
+
+
+@flashinfer_experimental_api(feature="adaptive sparse block-mask selection")
+def adaptive_sparse_block_mask(
+    block_logits: torch.Tensor,
+    q_seq_lens: torch.Tensor,
+    kv_seq_lens: torch.Tensor,
+    num_prompt_tokens: torch.Tensor,
+    *,
+    block_size: int = 128,
+    alpha: float = 1.0,
+    initial_blocks: int = 4,
+    window_size: int = 4,
+    medium_rate: float = 0.2,
+    medium_bias: int = 30,
+    large_rate: float = 0.1,
+    large_bias: int = 30,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    r"""Build an adaptive per-head block mask from proxy attention logits.
+
+    The CUDA kernel applies the Stem/TPD selection policy: each live query
+    block receives a prompt-length-dependent top-k budget, then the first
+    ``initial_blocks`` and a causal diagonal window are forced into the mask.
+    The result is a contiguous ``torch.bool`` tensor with the same shape as
+    ``block_logits`` and can be passed as a block mask to compatible sparse
+    attention backends.
+
+    This API is experimental and JIT-only.  It is adapted from Tencent
+    hpc-ops' Stem TPD kernel; ties at the selected threshold may produce more
+    set bits than the nominal budget.
+
+    Parameters
+    ----------
+    block_logits : torch.Tensor
+        Contiguous BF16 proxy scores shaped ``[B, H, Qb, Kb]``. Non-finite
+        scores are never selected by top-k, though mandatory prefix/window
+        positions are still enabled.
+    q_seq_lens, kv_seq_lens, num_prompt_tokens : torch.Tensor
+        Contiguous CUDA int32 vectors shaped ``[B]``. Lengths are expressed in
+        tokens; ``num_prompt_tokens`` controls the adaptive budget and is
+        intentionally independent of the current chunk length.
+    block_size : int
+        Number of tokens represented by one query/key block.
+    alpha : float
+        Late-query budget multiplier. Values in ``[0, 1]`` progressively
+        reduce the budget; ``1`` keeps it constant.
+    initial_blocks, window_size : int
+        Number of prefix blocks and causal-diagonal blocks forced into every
+        live row.
+    medium_rate, medium_bias, large_rate, large_bias
+        Budget policy coefficients. Prompt lengths below 56 blocks stay
+        dense; prompts below 160 blocks use the medium rule; longer prompts
+        use the large rule.
+    out : Optional[torch.Tensor]
+        Optional contiguous CUDA bool output with the same shape.
+    """
+    from .experimental.adaptive_sparse_block_mask import run
+
+    return run(
+        block_logits,
+        q_seq_lens,
+        kv_seq_lens,
+        num_prompt_tokens,
+        block_size=block_size,
+        alpha=alpha,
+        initial_blocks=initial_blocks,
+        window_size=window_size,
+        medium_rate=medium_rate,
+        medium_bias=medium_bias,
+        large_rate=large_rate,
+        large_bias=large_bias,
+        out=out,
+    )
 
 
 class VariableBlockSparseAttentionWrapper:
