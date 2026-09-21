@@ -282,6 +282,7 @@ def _vsa_reshape_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
 
 
 def _vsa_finish_output(o_bsa, lse_bsa, out, lse, return_lse):
+    """Remove the implicit batch dimension and copy results into user buffers."""
     output = o_bsa[0]  # [1, M, H, D] -> [M, H, D]
     if out is not None:
         check_shape_dtype_device(out, output.shape, output.dtype, output.device, "out")

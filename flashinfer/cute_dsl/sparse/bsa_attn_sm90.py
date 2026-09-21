@@ -35,6 +35,7 @@ torch2cute_dtype_map = {
 
 
 def _ceil_div(a: int, b: int) -> int:
+    """Return ``ceil(a / b)`` using integer arithmetic."""
     return (a + b - 1) // b
 
 

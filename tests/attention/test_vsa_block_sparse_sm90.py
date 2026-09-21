@@ -33,10 +33,12 @@ HEAD_DIM = 128
 
 @pytest.fixture(scope="module")
 def workspace():
+    """Allocate the workspace shared by the SM90 attention tests."""
     return torch.empty(512 * 1024 * 1024, dtype=torch.uint8, device="cuda")
 
 
 def _reference(q, k, v, block_mask, sm_scale=None):
+    """Compute a dense block-masked attention reference result."""
     _, num_qo_heads, head_dim = q.shape
     gqa_ratio = num_qo_heads // k.shape[1]
     if sm_scale is None:
@@ -55,6 +57,7 @@ def _reference(q, k, v, block_mask, sm_scale=None):
 
 
 def _bsr_from_mask(mask):
+    """Convert a boolean block mask to BSR row pointers and column indices."""
     counts = mask.sum(dim=-1, dtype=torch.int32)
     indptr = torch.nn.functional.pad(counts.cumsum(0, dtype=torch.int32), (1, 0))
     indices = mask.nonzero(as_tuple=False)[:, 1].to(torch.int32)
@@ -79,6 +82,7 @@ def test_vsa_sm90_accuracy(
     sm_scale,
     workspace,
 ):
+    """Check SM90 VSA output and LSE against the dense reference."""
     torch.manual_seed(42)
     device = torch.device("cuda")
     q = torch.randn(MB * R, num_qo_heads, HEAD_DIM, dtype=dtype, device=device)
@@ -129,6 +133,7 @@ def test_vsa_sm90_accuracy(
 
 
 def test_vsa_sm90_compact_metadata_and_empty_row(workspace):
+    """Check compact BSR metadata handling, including an empty query row."""
     torch.manual_seed(43)
     device = torch.device("cuda")
     MB = NB = 4

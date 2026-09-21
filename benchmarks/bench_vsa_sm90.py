@@ -28,6 +28,7 @@ def build_bsr(MB: int, NB: int, k: int, device):
 
 
 def main():
+    """Parse benchmark options and report timings for each selected backend."""
     ap = argparse.ArgumentParser()
     ap.add_argument("--seq", type=int, default=109632)
     ap.add_argument("--heads", type=int, default=7)
