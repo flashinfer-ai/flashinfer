@@ -40,13 +40,14 @@ reported:
 All paths use the same deterministic tensors and seeds. Eager timing rotates
 preinitialized state buffers so every invocation sees the same initial state.
 Graph timing captures one state slot and reinitializes it before each timing
-block; state values then evolve across replays. The candidate lets
-``recurrent_kda`` allocate its own output, so no
-backend is charged a copy another avoids; the FlashKDA peer scopes keep the
-preallocated outputs ``_fwd_raw`` requires. Cake and CuTe DSL update the state
-slot in the kernel, while cuDNN allocates its final state and copies it back
-inside the timed scope. Metadata, sequence ordering, build/JIT, graph capture,
-and state-pool reset are outside the measured region.
+block; state values then evolve across replays. Eager candidate timing lets
+``recurrent_kda`` allocate its own output, so no backend is charged a copy
+another avoids. CUDA graph capture supplies a stable caller-owned output for
+every backend. The FlashKDA peer scopes keep the preallocated outputs
+``_fwd_raw`` requires. Cake and CuTe DSL update the state slot in the kernel,
+while cuDNN allocates its final state and copies it back inside the timed scope.
+Metadata, sequence ordering, build/JIT, graph capture, and state-pool reset are
+outside the measured region.
 """
 
 import argparse
@@ -464,6 +465,7 @@ def _make_case(
         * 0.25
     ).to(STATE_DTYPE)
     candidate_state_pool = _make_state_pool(initial_state, state_rotations)
+    candidate_output = torch.empty_like(q) if cuda_graph else None
     candidate_workspace = (
         RecurrentKDAPrefillWorkspace(q.device)
         if candidate_route == "nonpersistent" and candidate_backend != "cudnn"
@@ -520,6 +522,7 @@ def _make_case(
             dt_bias=dt_bias,
             scale=scale,
             initial_state=candidate_state_pool[state_index],
+            output=candidate_output,
             output_final_state=True,
             use_qk_l2norm_in_kernel=True,
             use_gate_in_kernel=True,
