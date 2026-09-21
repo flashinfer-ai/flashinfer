@@ -8242,9 +8242,6 @@ class SM12xNvfp4Runner(MoERunner):
             raise NotImplementedError(
                 "SM12x NVFP4 quantizes BF16 activations internally."
             )
-        if self.config.execution.enable_pdl is not False:
-            raise NotImplementedError("SM12x NVFP4 does not support PDL yet.")
-
     @staticmethod
     def _topk_version(topk_ids: torch.Tensor) -> int | None:
         try:
@@ -8404,6 +8401,7 @@ class SM12xNvfp4Runner(MoERunner):
         ) = inputs[:15]
         workspace = self._workspace_cls(*inputs[15:])
         act_kwargs = _sm12x_nvfp4_activation_kwargs(self.config.activation)
+        enable_pdl = self.config.execution.enable_pdl is not False
         output.zero_()
         offsets, token_map, route_weights, a_q, a_scale = self._route(
             x,
@@ -8412,7 +8410,7 @@ class SM12xNvfp4Runner(MoERunner):
             self.config.routing.num_experts,
             q0_global_scale,
             workspace=workspace,
-            enable_pdl=False,
+            enable_pdl=enable_pdl,
         )
         self._fc1(
             a_q,
@@ -8424,6 +8422,7 @@ class SM12xNvfp4Runner(MoERunner):
             gate_scale,
             q1_global_scale,
             tune=False,
+            enable_pdl=enable_pdl,
             out_q=q1,
             out_sf=sf1,
             **act_kwargs,
@@ -8439,7 +8438,7 @@ class SM12xNvfp4Runner(MoERunner):
             w2_alpha,
             x.shape[0],
             tune=False,
-            enable_pdl=False,
+            enable_pdl=enable_pdl,
             out=output,
         )
         return output

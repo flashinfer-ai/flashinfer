@@ -72,7 +72,8 @@ def _make_weight(rows, columns, seed):
 
 
 @pytest.mark.parametrize("tokens", [8, 129])
-def test_sm12x_nvfp4_unified_runner_matches_composed_ops(tokens):
+@pytest.mark.parametrize("enable_pdl", [False, True])
+def test_sm12x_nvfp4_unified_runner_matches_composed_ops(tokens, enable_pdl):
     if not (torch.cuda.is_available() and is_sm120a_supported(torch.device("cuda"))):
         pytest.skip("requires an SM120a device")
     torch.manual_seed(11)
@@ -116,7 +117,7 @@ def test_sm12x_nvfp4_unified_runner_matches_composed_ops(tokens):
         experts=ExpertConfig(intermediate_size=intermediate, local_num_experts=experts),
         activation=SwiGLU(),
         backend=BackendOptions(candidates=(SM12xNvfp4Config(),)),
-        execution=ExecutionConfig(enable_pdl=False),
+        execution=ExecutionConfig(enable_pdl=enable_pdl),
     )
     got = MoELayer(config, device=x.device)(act, weights)
 
@@ -164,14 +165,3 @@ def test_sm12x_nvfp4_unified_runner_matches_composed_ops(tokens):
         captured_ids.copy_(ids)
     graph.replay()
     assert torch.equal(captured_ids, ids)
-
-    pdl_config = MoEConfig(
-        routing=config.routing,
-        quant=config.quant,
-        experts=config.experts,
-        activation=config.activation,
-        backend=config.backend,
-        execution=ExecutionConfig(),
-    )
-    with pytest.raises(NotImplementedError, match="does not support PDL"):
-        SM12xNvfp4Runner(pdl_config, x.device)._check_support()
