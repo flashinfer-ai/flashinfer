@@ -15,7 +15,7 @@ __all__ = [
 def __getattr__(name):
     # A deferred support-check import must not load the execution implementation.
     if name in __all__:
-        from . import runtime
+        from .bf16 import runtime
 
         return getattr(runtime, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
