@@ -57,6 +57,59 @@ if SwapABBlockwiseFc1GroupChunks not in SwapABBlockwiseFc1GroupChunkChoices:
 WarpThreadCount = 32
 EpiWarpCount = 4
 
+
+@cute.jit
+def transpose_token_group_bf16x8(r_pack: cute.Tensor, lane_group):
+    """Redistribute one swap-AB token group so every lane holds 8 consecutive
+    output columns of one row.
+
+    ``r_pack[2*v + b]`` is value ``v = 2*m_sub + token_sel`` at column
+    ``lane_group + 8*b``.  After two 32-bit butterfly levels (lane xor 16 / 8)
+    and a 16-bit exchange (xor 4) the lane holds columns ``[bit0*8, bit0*8+8)``
+    of value ``v = 2*bit2 + bit1`` (lane_group bits), low half first, for one
+    16-byte store at column ``bit2*64 + local_warp*16 + bit0*8`` of token
+    ``token0 + bit1``.  All 32 lanes must execute this."""
+    w_u32 = cute.recast_tensor(r_pack, cutlass.Uint32)
+    w0 = cutlass.Uint32(w_u32[0])
+    w1 = cutlass.Uint32(w_u32[1])
+    w2 = cutlass.Uint32(w_u32[2])
+    w3 = cutlass.Uint32(w_u32[3])
+
+    lane_group_bit2_set = (lane_group & cutlass.Int32(4)) != cutlass.Int32(0)
+    lane_group_bit1_set = (lane_group & cutlass.Int32(2)) != cutlass.Int32(0)
+    lane_group_bit0_set = (lane_group & cutlass.Int32(1)) != cutlass.Int32(0)
+
+    # 32-bit levels on lane_group bits 2 / 1 (lane xor 16 / 8): the lane then
+    # holds the (b=0, b=1) column pairs of the four lane groups sharing bit 0.
+    y0, y1, y2, y3 = bfly_transpose4_u32(
+        w0, w1, w2, w3, lane_group_bit2_set, lane_group_bit1_set, 16, 8,
+    )
+
+    # 16-bit level on lane_group bit 0 (xor 4): even groups keep the low halves,
+    # odd groups the high halves.  prmt selectors (nibble i = source byte of
+    # {b,a}): 0x5410 (a.lo,b.lo) 0x7632 (a.hi,b.hi) 0x7610 (a.lo,b.hi)
+    # 0x3254 (b.lo,a.hi) 0x3276 (b.hi,a.hi).
+    sel_send = (
+        cutlass.Uint32(0x5410) if lane_group_bit0_set else cutlass.Uint32(0x7632)
+    )
+    v0 = cutlass.Uint32(cute.arch.prmt(y0, y1, sel_send))
+    v1 = cutlass.Uint32(cute.arch.prmt(y2, y3, sel_send))
+    p0 = cute.arch.shuffle_sync_bfly(v0, 4)
+    p1 = cute.arch.shuffle_sync_bfly(v1, 4)
+    # Word j = (column 2j, 2j+1): even groups (mine, partner), odd (partner, mine).
+    sel_a = (
+        cutlass.Uint32(0x3254) if lane_group_bit0_set else cutlass.Uint32(0x5410)
+    )
+    sel_b = (
+        cutlass.Uint32(0x3276) if lane_group_bit0_set else cutlass.Uint32(0x7610)
+    )
+    o0 = cutlass.Uint32(cute.arch.prmt(y0, p0, sel_a))
+    o1 = cutlass.Uint32(cute.arch.prmt(y1, p0, sel_b))
+    o2 = cutlass.Uint32(cute.arch.prmt(y2, p1, sel_a))
+    o3 = cutlass.Uint32(cute.arch.prmt(y3, p1, sel_b))
+    return o0, o1, o2, o3
+
+
 # =============================================================================
 # SwapABFp8GluEpilogue
 # =============================================================================
@@ -367,6 +420,7 @@ class SwapABFp8GluEpilogue:
         output_rcp: Float32,
         real_topk_scores: cute.Tensor,
         token_tile_base,
+        c_ctx,
     ) -> None:
         thread_in_warp = tidx % WarpThreadCount
         lane_group = thread_in_warp // 4
@@ -391,6 +445,11 @@ class SwapABFp8GluEpilogue:
             )
             r_up[dst + 1] = (
                 accumulators[src + 3] * fc1_act_weight_dequant_scale
+            )
+        if cutlass.const_expr(self._generate_c):
+            self._store_fc1_c_group_swapab(
+                r_gate, r_up, c_ctx[0], c_ctx[1], c_ctx[2], token0, lane_group,
+                c_ctx[3], c_ctx[4],
             )
 
         r_swiglu = cute.make_rmem_tensor(group_layout.shape, self.acc_dtype)
@@ -457,16 +516,11 @@ class SwapABFp8GluEpilogue:
         token_tile_base = work_tile_info.tile_n_idx * cutlass.Int32(
             self._token_tile_n
         )
+        c_ctx = None
         if cutlass.const_expr(self._generate_c):
-            self._store_fc1_c_swapab(
-                work_tile_info=work_tile_info,
-                accumulators=accumulators,
-                n_half=n_half,
-                gmem_fc1_c=gmem_fc1_c,
-                token_tile_base=token_tile_base,
-                local_warp_idx=local_warp_idx,
-                tidx=tidx,
-                c_scale=fc1_act_weight_dequant_scale,
+            c_ctx = self._fc1_c_context_swapab(
+                work_tile_info, n_half, gmem_fc1_c, token_tile_base,
+                local_warp_idx, tidx,
             )
 
         for token_group in cutlass.range_constexpr(self._token_group_count):
@@ -480,6 +534,7 @@ class SwapABFp8GluEpilogue:
                 output_rcp=output_rcp,
                 real_topk_scores=real_topk_scores,
                 token_tile_base=token_tile_base,
+                c_ctx=c_ctx,
             )
         if _iket_active:
             iket.range_pop()  # swapab_fc1_epi_m{token_tile_n}n64_pt
@@ -490,6 +545,8 @@ class SwapABFp8GluEpilogue:
         chunk_idx: cutlass.Constexpr,
         accumulators: cute.Tensor,
         r_swiglu: cute.Tensor,
+        tidx,
+        c_ctx,
     ) -> None:
         groups_per_chunk = self._blockwise_fc1_groups_per_chunk
         folded_values_per_chunk_m64 = 2 * groups_per_chunk
@@ -513,6 +570,16 @@ class SwapABFp8GluEpilogue:
                 r_gate[dst + 1] = accumulators[src + 1]
                 r_up[dst + 0] = accumulators[src + 2]
                 r_up[dst + 1] = accumulators[src + 3]
+            if cutlass.const_expr(self._generate_c):
+                thread_in_warp = tidx % WarpThreadCount
+                token0 = (
+                    cutlass.Int32(token_group * 8)
+                    + (thread_in_warp % 4) * cutlass.Int32(2)
+                )
+                self._store_fc1_c_group_swapab(
+                    r_gate, r_up, c_ctx[0], c_ctx[1], c_ctx[2], token0,
+                    thread_in_warp // 4, c_ctx[3], c_ctx[4],
+                )
             group_swiglu_view = cute.make_tensor(
                 r_swiglu.iterator + pair_base, group_swiglu_layout
             )
@@ -525,105 +592,63 @@ class SwapABFp8GluEpilogue:
             )
 
     @cute.jit
-    def _store_fc1_c_swapab(
+    def _store_fc1_c_group_swapab(
+        self,
+        r_gate: cute.Tensor,
+        r_up: cute.Tensor,
+        g_c: cute.Tensor,
+        c_row_base,
+        c_col,
+        token0,
+        lane_group,
+        c_valid_tokens,
+        c_valid_gateup_n,
+    ) -> None:
+        """Store one token group of pre-SwiGLU gate/up values as BF16 (generate_c).
+
+        Fused into the SwiGLU pass so the accumulators are read once and die
+        group by group instead of staying live across a separate C pass.
+        """
+        r_pack = cute.make_rmem_tensor(8, cutlass.BFloat16)
+        w_u32 = cute.recast_tensor(r_pack, cutlass.Uint32)
+        for v in cutlass.range_constexpr(4):
+            w_u32[v] = pack_f32x2_to_bf16x2(r_gate[v], r_up[v])
+        o0, o1, o2, o3 = transpose_token_group_bf16x8(r_pack, lane_group)
+        token = token0 + ((lane_group >> cutlass.Int32(1)) & cutlass.Int32(1))
+        if token < c_valid_tokens and c_col < c_valid_gateup_n:
+            stg_128b_bf16x8(g_c, o0, o1, o2, o3, c_row_base + token, c_col)
+
+    @cute.jit
+    def _fc1_c_context_swapab(
         self,
         work_tile_info,
-        accumulators: cute.Tensor,
         n_half: cutlass.Constexpr,
         gmem_fc1_c: cute.Tensor,
         token_tile_base,
         local_warp_idx: int,
         tidx,
-        c_scale: Float32,
-    ) -> None:
-        """Store pre-clamp, pre-SwiGLU, unweighted FC1 output as BF16.
-
-        Preserve the kernel's gate/up-interleaved column order.
-        c_scale is the per-tensor dequantization factor, or 1.0 for blockwise.
-        """
-        thread_in_warp = tidx % WarpThreadCount
-        lane_group = thread_in_warp // 4
-        lane_mod = thread_in_warp % 4
-        valid_tokens = work_tile_info.valid_tokens_in_cta_tile
-        valid_gateup_n = cutlass.Int32(gmem_fc1_c.shape[1])
+    ):
+        """Per-task constants of the generate_c store: pool slice, row base,
+        this lane's 8-column block (kernel gate/up-interleaved order), bounds."""
+        lane_group = (tidx % WarpThreadCount) // 4
         g_c = cute.slice_(gmem_fc1_c, (None, None, 0))
-        row_base = work_tile_info.cumulative_data_physical_row + token_tile_base
-        c_col_base = (
-            work_tile_info.tile_m_idx * cutlass.Int32(self._wgmma_fragment_count)
-            + cutlass.Int32(n_half)
-        ) * cutlass.Int32(128)
-        lane_group_bit2_set = (lane_group & cutlass.Int32(4)) != cutlass.Int32(0)
-        lane_group_bit1_set = (lane_group & cutlass.Int32(2)) != cutlass.Int32(0)
-        lane_group_bit0_set = (lane_group & cutlass.Int32(1)) != cutlass.Int32(0)
-        lane_group_bit2 = (lane_group >> cutlass.Int32(2)) & cutlass.Int32(1)
-        lane_group_bit1 = (lane_group >> cutlass.Int32(1)) & cutlass.Int32(1)
-        lane_group_bit0 = lane_group & cutlass.Int32(1)
-        # Lane-group bits select the M64 fragment, token row, and gate/up block.
-        col = (
-            c_col_base
-            + lane_group_bit2 * cutlass.Int32(64)
+        c_row_base = work_tile_info.cumulative_data_physical_row + token_tile_base
+        c_col = (
+            (
+                work_tile_info.tile_m_idx * cutlass.Int32(self._wgmma_fragment_count)
+                + cutlass.Int32(n_half)
+            ) * cutlass.Int32(128)
+            + ((lane_group >> cutlass.Int32(2)) & cutlass.Int32(1)) * cutlass.Int32(64)
             + cutlass.Int32(local_warp_idx * 16)
-            + lane_group_bit0 * cutlass.Int32(8)
+            + (lane_group & cutlass.Int32(1)) * cutlass.Int32(8)
         )
-        # prmt.b32 selectors (nibble i picks source byte i of {b, a}):
-        # 0x5410 = (a.lo, b.lo), 0x7632 = (a.hi, b.hi), 0x7610 = (a.lo, b.hi),
-        # 0x3254 = (b.lo, a.hi), 0x3276 = (b.hi, a.hi).
-        sel_send = (
-            cutlass.Uint32(0x5410) if lane_group_bit0_set else cutlass.Uint32(0x7632)
+        return (
+            g_c,
+            c_row_base,
+            c_col,
+            work_tile_info.valid_tokens_in_cta_tile,
+            cutlass.Int32(gmem_fc1_c.shape[1]),
         )
-        sel_a = (
-            cutlass.Uint32(0x3254) if lane_group_bit0_set else cutlass.Uint32(0x5410)
-        )
-        sel_b = (
-            cutlass.Uint32(0x3276) if lane_group_bit0_set else cutlass.Uint32(0x7610)
-        )
-        for token_group in cutlass.range_constexpr(self._token_group_count):
-            token0 = cutlass.Int32(token_group * 8) + lane_mod * cutlass.Int32(2)
-            # W[k] = gate_k | up_k << 16 for k = m_sub*2 + t (acc regs: src+0/1
-            # gate token0/1, src+2/3 up token0/1), i.e. classes (2k, 2k+1)
-            # share one word.
-            first_fragment_accum_base = token_group * 4
-            second_fragment_accum_base = self._accum_regs_per_m64 + token_group * 4
-            w0 = pack_f32x2_to_bf16x2(
-                accumulators[first_fragment_accum_base + 0] * c_scale,
-                accumulators[first_fragment_accum_base + 2] * c_scale,
-            )
-            w1 = pack_f32x2_to_bf16x2(
-                accumulators[first_fragment_accum_base + 1] * c_scale,
-                accumulators[first_fragment_accum_base + 3] * c_scale,
-            )
-            w2 = pack_f32x2_to_bf16x2(
-                accumulators[second_fragment_accum_base + 0] * c_scale,
-                accumulators[second_fragment_accum_base + 2] * c_scale,
-            )
-            w3 = pack_f32x2_to_bf16x2(
-                accumulators[second_fragment_accum_base + 1] * c_scale,
-                accumulators[second_fragment_accum_base + 3] * c_scale,
-            )
-            # 32-bit levels: lane_group bit 2 <-> lane bit 4 (xor 16), bit 1
-            # <-> lane bit 3 (xor 8).  Afterwards the lane holds, for classes
-            # adjacent gate/up classes packed low/high, the words of the four
-            # lane groups sharing bit 0, in ascending lane-group order.
-            y0, y1, y2, y3 = bfly_transpose4_u32(
-                w0, w1, w2, w3, lane_group_bit2_set, lane_group_bit1_set, 16, 8,
-            )
-            # 16-bit level on lane_group bit 0 (xor 4): even lane groups keep
-            # the gate (low) halves and receive the odd groups' gate halves;
-            # odd lane groups keep the up (high) halves and receive the even
-            # groups' up halves.
-            v0 = cutlass.Uint32(cute.arch.prmt(y0, y1, sel_send))
-            v1 = cutlass.Uint32(cute.arch.prmt(y2, y3, sel_send))
-            p0 = cute.arch.shuffle_sync_bfly(v0, 4)
-            p1 = cute.arch.shuffle_sync_bfly(v1, 4)
-            # Final word j = (row 2j, row 2j+1) of class g: even g = (mine,
-            # partner's), odd g = (partner's, mine).
-            o0 = cutlass.Uint32(cute.arch.prmt(y0, p0, sel_a))
-            o1 = cutlass.Uint32(cute.arch.prmt(y1, p0, sel_b))
-            o2 = cutlass.Uint32(cute.arch.prmt(y2, p1, sel_a))
-            o3 = cutlass.Uint32(cute.arch.prmt(y3, p1, sel_b))
-            token = token0 + lane_group_bit1
-            if token < valid_tokens and col < valid_gateup_n:
-                stg_128b_bf16x8(g_c, o0, o1, o2, o3, row_base + token, col)
 
     @cute.jit
     def _apply_fc1_topk_swapab(
@@ -911,16 +936,11 @@ class SwapABFp8GluEpilogue:
         token_tile_base = work_tile_info.tile_n_idx * cutlass.Int32(
             self._token_tile_n
         )
+        c_ctx = None
         if cutlass.const_expr(self._generate_c):
-            self._store_fc1_c_swapab(
-                work_tile_info=work_tile_info,
-                accumulators=accumulators,
-                n_half=n_half,
-                gmem_fc1_c=gmem_fc1_c,
-                token_tile_base=token_tile_base,
-                local_warp_idx=local_warp_idx,
-                tidx=tidx,
-                c_scale=Float32(1.0),
+            c_ctx = self._fc1_c_context_swapab(
+                work_tile_info, n_half, gmem_fc1_c, token_tile_base,
+                local_warp_idx, tidx,
             )
 
         for chunk_idx in cutlass.range_constexpr(
@@ -931,6 +951,8 @@ class SwapABFp8GluEpilogue:
                 chunk_idx=chunk_idx,
                 accumulators=accumulators,
                 r_swiglu=r_swiglu,
+                tidx=tidx,
+                c_ctx=c_ctx,
             )
             self._apply_fc1_topk_chunk_swapab(
                 chunk_idx=chunk_idx,
@@ -1088,122 +1110,169 @@ class SwapABFp8GluEpilogue:
         valid_tokens = work_tile_info.valid_tokens_in_cta_tile
         token0 = cutlass.Int32(token_group * 8) + lane_mod * cutlass.Int32(2)
         token1 = token0 + cutlass.Int32(1)
-        pair_layout = cute.make_layout(4)
-        for m_sub in cutlass.range_constexpr(2):
-            accum_base = m_sub * self._accum_regs_per_m64 + token_group * 4
-            r_fp32 = cute.make_rmem_tensor(pair_layout.shape, self.acc_dtype)
-            for i in cutlass.range_constexpr(4):
-                r_fp32[i] = (
-                    accumulators[accum_base + i]
-                    * fc2_act_weight_dequant_scale
-                )
-            r_bf16 = cute.make_rmem_tensor(pair_layout.shape, cutlass.BFloat16)
-            r_bf16.store(r_fp32.load().to(cutlass.BFloat16))
-            hidden0 = (
-                work_tile_info.tile_m_idx
-                * cutlass.Int32(self._raw_cta_tile_m)
-                + cutlass.Int32(n_half * self._wg_raw_tile_m)
-                + cutlass.Int32(m_sub * 64)
-                + cutlass.Int32(local_warp_idx * 16)
-                + lane_group
+        hidden_base = (
+            work_tile_info.tile_m_idx * cutlass.Int32(self._raw_cta_tile_m)
+            + cutlass.Int32(n_half * self._wg_raw_tile_m)
+        )
+        use_mega_dest = cutlass.const_expr(
+            token_comm_args is not None and not self._token_back_by_dispatch
+        )
+        if cutlass.const_expr(use_mega_dest and self._fc2_in_kernel_topk_reduce):
+            metadata_u32 = cute.recast_tensor(
+                token_comm_args.token_src_metadata, cutlass.Uint32,
             )
-            hidden1 = hidden0 + cutlass.Int32(8)
-
-            if cutlass.const_expr(
-                token_comm_args is not None and not self._token_back_by_dispatch
-            ):
-                metadata_u32 = cute.recast_tensor(
-                    token_comm_args.token_src_metadata, cutlass.Uint32,
-                )
-                fc2_output_dest = Fc2OutputDest(
-                    tensor=token_comm_args.combine_output,
-                    metadata=metadata_u32,
-                    peer_rank_ptr_mapper=token_comm_args.peer_rank_ptr_mapper,
-                    reduce_topk_in_kernel=self._fc2_in_kernel_topk_reduce,
-                )
-                if cutlass.const_expr(self._fc2_in_kernel_topk_reduce):
-                    # Four lane-groups own four adjacent hidden cells for the
-                    # same token. Gather them into two packed bf16x2 registers
-                    # so one vector REDG covers the full 8-byte segment.
-                    r_bf16_u16 = cute.recast_tensor(r_bf16, cutlass.Uint16)
-                    source_lane_base = (
-                        (lane_group // cutlass.Int32(4)) * cutlass.Int32(16)
-                        + lane_mod
+            fc2_output_dest = Fc2OutputDest(
+                tensor=token_comm_args.combine_output,
+                metadata=metadata_u32,
+                peer_rank_ptr_mapper=token_comm_args.peer_rank_ptr_mapper,
+                reduce_topk_in_kernel=True,
+            )
+            pair_layout = cute.make_layout(4)
+            for m_sub in cutlass.range_constexpr(2):
+                accum_base = m_sub * self._accum_regs_per_m64 + token_group * 4
+                r_fp32 = cute.make_rmem_tensor(pair_layout.shape, self.acc_dtype)
+                for i in cutlass.range_constexpr(4):
+                    r_fp32[i] = (
+                        accumulators[accum_base + i]
+                        * fc2_act_weight_dequant_scale
                     )
-                    for value_idx in cutlass.range_constexpr(4):
-                        raw = cutlass.Uint32(r_bf16_u16[value_idx])
-                        value0 = cute.arch.shuffle_sync(raw, source_lane_base)
-                        value1 = cute.arch.shuffle_sync(
-                            raw, source_lane_base + cutlass.Int32(4),
+                r_bf16 = cute.make_rmem_tensor(pair_layout.shape, cutlass.BFloat16)
+                r_bf16.store(r_fp32.load().to(cutlass.BFloat16))
+                hidden0 = (
+                    hidden_base
+                    + cutlass.Int32(m_sub * 64)
+                    + cutlass.Int32(local_warp_idx * 16)
+                    + lane_group
+                )
+                hidden1 = hidden0 + cutlass.Int32(8)
+                # Four lane-groups own four adjacent hidden cells for the
+                # same token. Gather them into two packed bf16x2 registers
+                # so one vector REDG covers the full 8-byte segment.
+                r_bf16_u16 = cute.recast_tensor(r_bf16, cutlass.Uint16)
+                source_lane_base = (
+                    (lane_group // cutlass.Int32(4)) * cutlass.Int32(16)
+                    + lane_mod
+                )
+                for value_idx in cutlass.range_constexpr(4):
+                    raw = cutlass.Uint32(r_bf16_u16[value_idx])
+                    value0 = cute.arch.shuffle_sync(raw, source_lane_base)
+                    value1 = cute.arch.shuffle_sync(
+                        raw, source_lane_base + cutlass.Int32(4),
+                    )
+                    value2 = cute.arch.shuffle_sync(
+                        raw, source_lane_base + cutlass.Int32(8),
+                    )
+                    value3 = cute.arch.shuffle_sync(
+                        raw, source_lane_base + cutlass.Int32(12),
+                    )
+                    packed0 = value0 | (value1 << cutlass.Uint32(16))
+                    packed1 = value2 | (value3 << cutlass.Uint32(16))
+                    token = token0
+                    hidden = hidden0
+                    if cutlass.const_expr(value_idx % 2 == 1):
+                        token = token1
+                    if cutlass.const_expr(value_idx >= 2):
+                        hidden = hidden1
+                    if (
+                        lane_group % cutlass.Int32(4) == cutlass.Int32(0)
+                        and token < valid_tokens
+                        and hidden < valid_hidden
+                    ):
+                        dest_row = fc2_output_dest.resolve_token_row(
+                            pool_token_base + token
                         )
-                        value2 = cute.arch.shuffle_sync(
-                            raw, source_lane_base + cutlass.Int32(8),
+                        dest_ptr = cute.make_ptr(
+                            cutlass.BFloat16,
+                            dest_row.iterator.toint()
+                            + hidden * cutlass.Int64(2),
+                            cute.AddressSpace.gmem,
+                            assumed_align=8,
                         )
-                        value3 = cute.arch.shuffle_sync(
-                            raw, source_lane_base + cutlass.Int32(12),
+                        red_add_relaxed_sys_v2_bf16x2(
+                            dest_ptr, packed0, packed1,
                         )
-                        packed0 = value0 | (value1 << cutlass.Uint32(16))
-                        packed1 = value2 | (value3 << cutlass.Uint32(16))
-                        token = token0
-                        hidden = hidden0
-                        if cutlass.const_expr(value_idx % 2 == 1):
-                            token = token1
-                        if cutlass.const_expr(value_idx >= 2):
-                            hidden = hidden1
-                        if (
-                            lane_group % cutlass.Int32(4) == cutlass.Int32(0)
-                            and token < valid_tokens
-                            and hidden < valid_hidden
-                        ):
-                            dest_row = fc2_output_dest.resolve_token_row(
-                                pool_token_base + token
-                            )
-                            dest_ptr = cute.make_ptr(
-                                cutlass.BFloat16,
-                                dest_row.iterator.toint()
-                                + hidden * cutlass.Int64(2),
-                                cute.AddressSpace.gmem,
-                                assumed_align=8,
-                            )
-                            red_add_relaxed_sys_v2_bf16x2(
-                                dest_ptr, packed0, packed1,
-                            )
-                else:
-                    if token0 < valid_tokens:
-                        dest_row0 = fc2_output_dest.resolve_token_row(
-                            pool_token_base + token0
-                        )
-                        if hidden0 < valid_hidden:
-                            dest_row0[hidden0] = r_bf16[0]
-                        if hidden1 < valid_hidden:
-                            dest_row0[hidden1] = r_bf16[2]
-                    if token1 < valid_tokens:
-                        dest_row1 = fc2_output_dest.resolve_token_row(
-                            pool_token_base + token1
-                        )
-                        if hidden0 < valid_hidden:
-                            dest_row1[hidden0] = r_bf16[1]
-                        if hidden1 < valid_hidden:
-                            dest_row1[hidden1] = r_bf16[3]
-            else:
+        elif cutlass.const_expr(use_mega_dest):
+            # Scalar stores: the 16-byte variant regressed N16 / N8 token tiles on BF16.
+            metadata_u32 = cute.recast_tensor(
+                token_comm_args.token_src_metadata, cutlass.Uint32,
+            )
+            fc2_output_dest = Fc2OutputDest(
+                tensor=token_comm_args.combine_output,
+                metadata=metadata_u32,
+                peer_rank_ptr_mapper=token_comm_args.peer_rank_ptr_mapper,
+                reduce_topk_in_kernel=False,
+            )
+            pair_layout = cute.make_layout(4)
+            for m_sub in cutlass.range_constexpr(2):
+                accum_base = m_sub * self._accum_regs_per_m64 + token_group * 4
+                r_fp32 = cute.make_rmem_tensor(pair_layout.shape, self.acc_dtype)
+                for i in cutlass.range_constexpr(4):
+                    r_fp32[i] = (
+                        accumulators[accum_base + i]
+                        * fc2_act_weight_dequant_scale
+                    )
+                r_bf16 = cute.make_rmem_tensor(pair_layout.shape, cutlass.BFloat16)
+                r_bf16.store(r_fp32.load().to(cutlass.BFloat16))
+                hidden0 = (
+                    hidden_base
+                    + cutlass.Int32(m_sub * 64)
+                    + cutlass.Int32(local_warp_idx * 16)
+                    + lane_group
+                )
+                hidden1 = hidden0 + cutlass.Int32(8)
                 if token0 < valid_tokens:
+                    dest_row0 = fc2_output_dest.resolve_token_row(
+                        pool_token_base + token0
+                    )
                     if hidden0 < valid_hidden:
-                        real_fc2_output[
-                            token_tile_base + token0, hidden0, 0
-                        ] = r_bf16[0]
+                        dest_row0[hidden0] = r_bf16[0]
                     if hidden1 < valid_hidden:
-                        real_fc2_output[
-                            token_tile_base + token0, hidden1, 0
-                        ] = r_bf16[2]
+                        dest_row0[hidden1] = r_bf16[2]
                 if token1 < valid_tokens:
+                    dest_row1 = fc2_output_dest.resolve_token_row(
+                        pool_token_base + token1
+                    )
                     if hidden0 < valid_hidden:
-                        real_fc2_output[
-                            token_tile_base + token1, hidden0, 0
-                        ] = r_bf16[1]
+                        dest_row1[hidden0] = r_bf16[1]
                     if hidden1 < valid_hidden:
-                        real_fc2_output[
-                            token_tile_base + token1, hidden1, 0
-                        ] = r_bf16[3]
+                        dest_row1[hidden1] = r_bf16[3]
+        else:
+            # Local fc2 output: the lane's 8 scaled values (v = 2*m_sub + token_sel
+            # at columns lane_group / lane_group + 8) become 8 consecutive hidden
+            # columns of one token: one 16-byte store instead of eight 2-byte ones.
+            r_fp32 = cute.make_rmem_tensor(8, self.acc_dtype)
+            for m_sub in cutlass.range_constexpr(2):
+                accum_base = m_sub * self._accum_regs_per_m64 + token_group * 4
+                for token_sel in cutlass.range_constexpr(2):
+                    value_idx = 2 * m_sub + token_sel
+                    r_fp32[2 * value_idx] = (
+                        accumulators[accum_base + token_sel]
+                        * fc2_act_weight_dequant_scale
+                    )
+                    r_fp32[2 * value_idx + 1] = (
+                        accumulators[accum_base + 2 + token_sel]
+                        * fc2_act_weight_dequant_scale
+                    )
+            r_pack = cute.make_rmem_tensor(8, cutlass.BFloat16)
+            r_pack.store(r_fp32.load().to(cutlass.BFloat16))
+            o0, o1, o2, o3 = transpose_token_group_bf16x8(r_pack, lane_group)
+
+            # Lane-group bits: M64 fragment, token row, 8-column half.
+            lane_group_bit2 = (lane_group >> cutlass.Int32(2)) & cutlass.Int32(1)
+            lane_group_bit1 = (lane_group >> cutlass.Int32(1)) & cutlass.Int32(1)
+            lane_group_bit0 = lane_group & cutlass.Int32(1)
+            token = token0 + lane_group_bit1
+            hidden = (
+                hidden_base
+                + lane_group_bit2 * cutlass.Int32(64)
+                + cutlass.Int32(local_warp_idx * 16)
+                + lane_group_bit0 * cutlass.Int32(8)
+            )
+            g_out = cute.slice_(real_fc2_output, (None, None, 0))
+            if token < valid_tokens and hidden < valid_hidden:
+                stg_128b_bf16x8(
+                    g_out, o0, o1, o2, o3, token_tile_base + token, hidden,
+                )
 
     @cute.jit
     def _run_fc2_epilogue(

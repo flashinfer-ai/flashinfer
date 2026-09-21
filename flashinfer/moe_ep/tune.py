@@ -10,7 +10,7 @@ machinery lives in ``backends/mega/kernel/tuning.py``.
 
 The sweep runs the collective autotune OUTSIDE any serving engine and
 persists the winners in the knob cache (see
-``kernel_src/cutedsl_megamoe/shim/knob_cache.py``). After tuning, an engine
+``kernel_src/sm100/cutedsl_megamoe/shim/knob_cache.py``). After tuning, an engine
 that constructs the mega layer with ``knobs=None`` (the default) resolves the
 recorded winner with a pure dict lookup — no compiles, no collectives, no
 timing on the hot path.
@@ -158,8 +158,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
     elif args.dtype.startswith("sm90_fp8"):
         from .backends.mega.kernel.sm90.fp8_fp8_bf16_pull_cutedsl.tuner import (
-            run_tuning,
+            run_tuning as run_sm90_tuning,
         )
+
+        return run_sm90_tuning(args)
     elif args.dtype == "bf16":
         from .backends.mega.kernel.sm100.bf16_bf16_bf16_cutedsl.tuner import (
             run_tuning,

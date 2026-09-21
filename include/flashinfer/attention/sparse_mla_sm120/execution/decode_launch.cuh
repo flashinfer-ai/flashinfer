@@ -59,7 +59,7 @@ cudaError_t launch_decode(const AttentionParams& p, const ExecutionPlan& plan,
   merge<<<dim3(p.num_tokens, q_heads), dim3(MERGE_THREADS),
           size_t(p.allocated_splits) * sizeof(float), stream>>>(
       p.mid_out, p.mid_lse, p.output, p.out_lse, p.attn_sink, p.num_tokens, p.allocated_splits,
-      q_heads, h_blocks * HPB, p.out_lse_stride_elems);
+      q_heads, h_blocks * HPB, p.out_lse_stride_elems, p.lse_scale);
   return cudaGetLastError();
 }
 
