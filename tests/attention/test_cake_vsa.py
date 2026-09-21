@@ -26,11 +26,11 @@ from flashinfer.sparse import BlockSparseAttentionWrapper
 def _is_sm100_or_sm103() -> bool:
     if not torch.cuda.is_available():
         return False
-    return torch.cuda.get_device_capability() in ((10, 0), (10, 3))
+    return torch.cuda.get_device_capability() in ((10, 0), (10, 3), (10, 7))
 
 
 pytestmark = pytest.mark.skipif(
-    not _is_sm100_or_sm103(), reason="Cake VSA requires SM100 or SM103"
+    not _is_sm100_or_sm103(), reason="Cake VSA requires SM100, SM103 or SM107"
 )
 
 
