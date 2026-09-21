@@ -46,9 +46,9 @@ static_assert(alignof(CakeFmhaTensorMap) >= alignof(CUtensorMap), "CakeFmhaTenso
 #define SMEM_SMEM_ST_B_OFF 208000
 #define SMEM_SMEM_ST_B_STAGE_BYTES 16512
 #define SMEM_SMEM_ST_B_STRIDE 16512
-#define SMEM_SMEM_SCALE_OFF 2048
-#define SMEM_SMEM_SCALE_STAGE_BYTES 256
-#define SMEM_SMEM_SCALE_STRIDE 256
+#define SMEM_SMEM_SCALE_OFF 5120
+#define SMEM_SMEM_SCALE_STAGE_BYTES 512
+#define SMEM_SMEM_SCALE_STRIDE 512
 #define SMEM_SMEM_SUM_OFF 2304
 #define SMEM_SMEM_SUM_STAGE_BYTES 256
 #define SMEM_SMEM_SUM_STRIDE 256
@@ -538,8 +538,8 @@ kernel_cake_fmha_decode_native_bf16_hd256_smallm_n64_p16(CakeFmhaTensorMap const
     const int smem_st_a_addr = smem + 191488;
     float* smem_st_b = reinterpret_cast<float*>(smem_raw + 208000);
     const int smem_st_b_addr = smem + 208000;
-    float* smem_scale = reinterpret_cast<float*>(smem_raw + 2048);
-    const int smem_scale_addr = smem + 2048;
+    float* smem_scale = reinterpret_cast<float*>(smem_raw + 5120);
+    const int smem_scale_addr = smem + 5120;
     float* smem_sum = reinterpret_cast<float*>(smem_raw + 2304);
     const int smem_sum_addr = smem + 2304;
     float* smem_max = reinterpret_cast<float*>(smem_raw + 2560);
@@ -710,7 +710,7 @@ kernel_cake_fmha_decode_native_bf16_hd256_smallm_n64_p16(CakeFmhaTensorMap const
                     acc_scale = _exp2_0;
                 }
                 if (quarter == 0) {
-                    smem_scale[my_col] = acc_scale;
+                    smem_scale[sm_stage * 64 + my_col] = acc_scale;
                 }
                 mbarrier_arrive(corr_scale_addr);
                 float safe_max = ((new_max == -CAKE_FMHA_INF) ? 0.0f : new_max);
@@ -973,10 +973,11 @@ kernel_cake_fmha_decode_native_bf16_hd256_smallm_n64_p16(CakeFmhaTensorMap const
                     mbarrier_wait(o_ready_addr, _phase_o_ready_0);
                     _phase_o_ready_0 ^= 1;
                     asm volatile("tcgen05.fence::after_thread_sync;");
+                    int sc_off = n_1 % NUM_KV_STAGES * 64;
                     int need = 0;
                     #pragma unroll
                     for (int c_1 = 0; c_1 < 64; c_1++) {
-                        need = need | ((smem_scale[c_1] != 1.0f) ? 1 : 0);
+                        need = need | ((smem_scale[sc_off + c_1] != 1.0f) ? 1 : 0);
                     }
                     int _vote_0 = __any_sync(0xFFFFFFFF, need != 0);
                     if (_vote_0 != 0) {
@@ -993,7 +994,7 @@ kernel_cake_fmha_decode_native_bf16_hd256_smallm_n64_p16(CakeFmhaTensorMap const
                                     : "r"(o_base + chunk * 32));
                                 #pragma unroll
                                 for (int c_2 = 0; c_2 < 32; c_2++) {
-                                    _tmem_load_1[c_2] = _tmem_load_1[c_2] * smem_scale[chunk * 32 + c_2];
+                                    _tmem_load_1[c_2] = _tmem_load_1[c_2] * smem_scale[sc_off + chunk * 32 + c_2];
                                 }
                                 tmem_st_x32_f32(o_base + chunk * 32, _tmem_load_1);
                             }
