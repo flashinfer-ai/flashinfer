@@ -962,14 +962,19 @@ class FmhaDecodeConfig:
 
     @property
     def uses_2d_flat_kv_tma(self) -> bool:
-        """Whether uniform FP8 issuing can omit the flat map's singleton axes."""
+        """Whether warp-owned issuing can omit the flat map's singleton axes."""
         return (
-            self.use_fp8_qkv
-            and self.use_flat_native_kv_tma
-            and self.use_persistent_scheduler
-            and self.head_dim_kv_stage // 128 > 1
+            self.use_flat_native_kv_tma
             and (self.tile_size_kv // self.num_tokens_per_page) % self.load_num_warps
             == 0
+            and (
+                self.kv_dtype == BFloat16
+                or (
+                    self.use_fp8_qkv
+                    and self.use_persistent_scheduler
+                    and self.head_dim_kv_stage // 128 > 1
+                )
+            )
         )
 
     @property

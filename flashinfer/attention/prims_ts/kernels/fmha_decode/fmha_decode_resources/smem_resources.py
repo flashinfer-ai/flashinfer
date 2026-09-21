@@ -289,11 +289,7 @@ def _issue_sparse_page_copies(
     chunk_hd = min(head_dim_stage, 128 if cfg.use_fp8_qkv else 64)
     chunks = head_dim_stage // chunk_hd
     fragments = cfg.tile_size_kv // cfg.num_tokens_per_page
-    if cutlass.const_expr(
-        cfg.use_flat_native_kv_tma
-        and cfg.kv_dtype == cutlass.BFloat16
-        and fragments % cfg.load_num_warps == 0
-    ):
+    if cutlass.const_expr(cfg.uses_2d_flat_kv_tma and cfg.kv_dtype == cutlass.BFloat16):
         # Prefetch warp-owned locators before TMA issue and reuse each across
         # BF16's head chunks. Static indexing keeps the small array in registers.
         fragments_per_warp = fragments // cfg.load_num_warps
@@ -307,9 +303,7 @@ def _issue_sparse_page_copies(
                 locators[i] = page_offsets.page_id(tile_idx, local_tile_idx, fragment)
             for i in cutlass.range_constexpr(fragments_per_warp):
                 fragment = warp * Int32(fragments_per_warp) + Int32(i)
-                token_offset, physical_page = _decode_native_page_locator(
-                    cfg, locators[i], kv_head
-                )
+                token_offset, _ = _decode_native_page_locator(cfg, locators[i], kv_head)
                 for chunk in cutlass.range_constexpr(chunks):
                     smem_offset = Int32(
                         chunk * chunk_hd * cfg.tile_size_kv
@@ -320,10 +314,6 @@ def _issue_sparse_page_copies(
                         (
                             Int32(head_dim_stage_offset + chunk * chunk_hd),
                             token_offset,
-                            Int32(0)
-                            if cutlass.const_expr(cfg.use_flat_native_kv_tma)
-                            else kv_head,
-                            physical_page,
                         ),
                         barrier,
                     )
