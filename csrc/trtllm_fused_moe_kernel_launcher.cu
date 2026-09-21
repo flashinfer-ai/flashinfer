@@ -6168,7 +6168,12 @@ Array<Array<int64_t>> trtllm_get_valid_moe_factorizations(
   auto const gemm1BiasType =
       has_gemm1_lora_delta ? batchedGemm::gemm::BiasType::Mn : batchedGemm::gemm::BiasType::None;
   bool const useDeepSeekFp8 = fp8_quantization_type == Fp8QuantizationType::DeepSeekFp8;
-  bool const usePerTokenScalingGemm2 = use_per_token_scaling && dtypeAct == btg::Dtype::E2m1;
+  bool const useFp8PerChannelScaling =
+      fp8_quantization_type == Fp8QuantizationType::PerChannelFp8 && dtypeAct == btg::Dtype::E4m3 &&
+      dtypeWeights == btg::Dtype::E4m3;
+  bool const usePerTokenScalingGemm1 = use_per_token_scaling || useFp8PerChannelScaling;
+  bool const usePerTokenScalingGemm2 =
+      (use_per_token_scaling && dtypeAct == btg::Dtype::E2m1) || useFp8PerChannelScaling;
   bool const useWeightsOnlyConstructor = dtypeAct == btg::Dtype::E4m3 &&
                                          dtypeWeights == btg::Dtype::E4m3 && useDeepSeekFp8 &&
                                          gemm1BiasType == batchedGemm::gemm::BiasType::None;
@@ -6186,12 +6191,13 @@ Array<Array<int64_t>> trtllm_get_valid_moe_factorizations(
       if (useWeightsOnlyConstructor) {
         runner = std::make_unique<tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner>(
             dtypeWeights, useDeepSeekFp8, static_cast<int>(tileN), use_shuffled_weight,
-            matrixLayout, use_per_token_scaling, usePerTokenScalingGemm2, false, false);
+            matrixLayout, usePerTokenScalingGemm1, usePerTokenScalingGemm2, useFp8PerChannelScaling,
+            useFp8PerChannelScaling);
       } else {
         runner = std::make_unique<tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner>(
             dtypeAct, dtypeWeights, useDeepSeekFp8, static_cast<int>(tileN), activationType,
-            use_shuffled_weight, matrixLayout, gemm1BiasType, use_per_token_scaling,
-            usePerTokenScalingGemm2, false, false);
+            use_shuffled_weight, matrixLayout, gemm1BiasType, usePerTokenScalingGemm1,
+            usePerTokenScalingGemm2, useFp8PerChannelScaling, useFp8PerChannelScaling);
       }
       runnerIt = runners.emplace(tileN, std::move(runner)).first;
     }
