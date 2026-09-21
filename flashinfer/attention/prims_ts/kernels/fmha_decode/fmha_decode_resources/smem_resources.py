@@ -328,13 +328,7 @@ def _issue_sparse_page_copies(
                         barrier,
                     )
         return
-    if cutlass.const_expr(
-        cfg.use_fp8_qkv
-        and cfg.use_flat_native_kv_tma
-        and cfg.use_persistent_scheduler
-        and chunks > 1
-        and fragments % cfg.load_num_warps == 0
-    ):
+    if cutlass.const_expr(cfg.uses_2d_flat_kv_tma):
         # A warp owns complete fragments across head planes. Its locator is
         # genuinely uniform: expose that before election so both TMA copies
         # reuse uniform coordinates instead of serializing lane operands.
@@ -349,7 +343,7 @@ def _issue_sparse_page_copies(
             uniform_locator = cute.arch.make_warp_uniform(
                 page_offsets.page_id(tile_idx, local_tile_idx, uniform_fragment)
             )
-            uniform_token_offset, uniform_page = _decode_native_page_locator(
+            uniform_token_offset, _ = _decode_native_page_locator(
                 cfg, uniform_locator, kv_head
             )
             if prims.elect_sync():
@@ -363,10 +357,6 @@ def _issue_sparse_page_copies(
                         (
                             Int32(head_dim_stage_offset + head_chunk * chunk_hd),
                             uniform_token_offset,
-                            Int32(0)
-                            if cutlass.const_expr(cfg.use_flat_native_kv_tma)
-                            else kv_head,
-                            uniform_page,
                         ),
                         barrier,
                     )

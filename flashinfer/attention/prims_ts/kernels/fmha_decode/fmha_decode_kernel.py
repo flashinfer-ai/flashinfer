@@ -3064,24 +3064,34 @@ def fmha_decode_launch(
                     h_k,
                     num_physical_kv_pages,
                 )
-            k_layout = cute.make_layout(
-                kv_shape,
-                stride=(
-                    1,
-                    k_token_stride,
-                    k_head_stride,
-                    k_page_stride,
-                ),
-            )
-            v_layout = cute.make_layout(
-                kv_shape,
-                stride=(
-                    1,
-                    v_token_stride,
-                    v_head_stride,
-                    v_page_stride,
-                ),
-            )
+            if cutlass.const_expr(cfg.uses_2d_flat_kv_tma):
+                # The prepared flat view has no head/page coordinates. Keep
+                # the same physical rows and SW128 tile without repacking KV.
+                k_layout = cute.make_layout(
+                    (kv_shape[0], kv_shape[1]), stride=(1, k_token_stride)
+                )
+                v_layout = cute.make_layout(
+                    (kv_shape[0], kv_shape[1]), stride=(1, v_token_stride)
+                )
+            else:
+                k_layout = cute.make_layout(
+                    kv_shape,
+                    stride=(
+                        1,
+                        k_token_stride,
+                        k_head_stride,
+                        k_page_stride,
+                    ),
+                )
+                v_layout = cute.make_layout(
+                    kv_shape,
+                    stride=(
+                        1,
+                        v_token_stride,
+                        v_head_stride,
+                        v_page_stride,
+                    ),
+                )
             k_tma = cute.make_tensor(k_iter, k_layout)
             v_tma = cute.make_tensor(v_iter, v_layout)
         else:
@@ -3211,16 +3221,24 @@ def fmha_decode_launch(
             stride_order=(0, 1, 2, 3, 4),
             swizzle=tma_swizzle_qk,
         )
+    if cutlass.const_expr(cfg.uses_2d_flat_kv_tma):
+        k_box_dims = (tma_box0_k, tma_kv_tokens)
+        v_box_dims = (tma_box0_v, tma_kv_tokens)
+        kv_stride_order = (0, 1)
+    else:
+        k_box_dims = (tma_box0_k, tma_kv_tokens, 1, 1)
+        v_box_dims = (tma_box0_v, tma_kv_tokens, 1, 1)
+        kv_stride_order = (0, 1, 2, 3)
     tma_desc_k = create_tensor_map_tiled_from_view(
         k_tma,
-        box_dims=(tma_box0_k, tma_kv_tokens, 1, 1),
-        stride_order=(0, 1, 2, 3),
+        box_dims=k_box_dims,
+        stride_order=kv_stride_order,
         swizzle=tma_swizzle_qk,
     )
     tma_desc_v = create_tensor_map_tiled_from_view(
         v_tma,
-        box_dims=(tma_box0_v, tma_kv_tokens, 1, 1),
-        stride_order=(0, 1, 2, 3),
+        box_dims=v_box_dims,
+        stride_order=kv_stride_order,
         swizzle=tma_swizzle_v,
     )
 

@@ -961,6 +961,18 @@ class FmhaDecodeConfig:
         return (self.headdim + self.head_dim_kv_stage - 1) // self.head_dim_kv_stage
 
     @property
+    def uses_2d_flat_kv_tma(self) -> bool:
+        """Whether uniform FP8 issuing can omit the flat map's singleton axes."""
+        return (
+            self.use_fp8_qkv
+            and self.use_flat_native_kv_tma
+            and self.use_persistent_scheduler
+            and self.head_dim_kv_stage // 128 > 1
+            and (self.tile_size_kv // self.num_tokens_per_page) % self.load_num_warps
+            == 0
+        )
+
+    @property
     def tmem_o_cols_per_head_dim_stage(self) -> int:
         """TMEM O columns owned by one head-dim stage."""
         if self.use_keeps_mma_ab:
