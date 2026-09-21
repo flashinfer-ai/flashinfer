@@ -46,7 +46,7 @@ def packed_kda_device():
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
     device = torch.device("cuda")
-    if torch.cuda.get_device_capability(device) not in ((10, 0), (10, 3)):
+    if torch.cuda.get_device_capability(device) not in ((10, 0), (10, 3), (10, 7)):
         pytest.skip(
             "packed KDA T=1 requires exact CC 10.0 (SM100a) or CC 10.3 (SM103a)"
         )
@@ -710,6 +710,8 @@ def test_kernel_facade_selects_optimized_variant_and_caller_stream_cpu(monkeypat
         ((10, 3), {"12.8": True, "12.9": True}, "sm100f"),
         ((10, 0), {"12.8": False}, None),
         ((10, 3), {"12.8": True, "12.9": False}, None),
+        ((10, 7), {"12.8": True, "12.9": True, "13.0": True}, "sm100f"),
+        ((10, 7), {"12.8": True, "12.9": True, "13.0": False}, None),
         ((10, 1), {"12.8": True, "12.9": True}, None),
     ],
 )
