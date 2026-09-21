@@ -3532,7 +3532,7 @@ def test_gdn_decode_bf16_state_mtp_pool_larger_than_batch(
 
 @pytest.mark.parametrize("split_pool", [False, True])
 @pytest.mark.parametrize("max_T", [2, 8])
-# B=128 keeps pool_size*HV past the Int32 byte-offset boundary (#3502 widen).
+# B=1 dispatches the MTP kernel, B>=4 the wide-vec kernel; keep both sides.
 @pytest.mark.parametrize("batch_size", [1, 4, 16, 128])
 @pytest.mark.parametrize(
     "num_q_heads, num_k_heads, num_v_heads",
