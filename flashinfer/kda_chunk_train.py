@@ -324,8 +324,8 @@ def chunk_kda_backward(
     k_rstd: torch.Tensor,
     v: torch.Tensor,
     g: torch.Tensor,
-    beta_logits: torch.Tensor,
     beta: torch.Tensor,
+    beta_logits: torch.Tensor | None = None,
     A_log: torch.Tensor,
     dt_bias: torch.Tensor,
     Aqk: torch.Tensor,
@@ -342,7 +342,11 @@ def chunk_kda_backward(
     - ``q_norm``, ``k_norm``: L2-normalized q/k, bf16 ``[B, T, H, 128]``; ``q_rstd``, ``k_rstd``:
       their inverse norms, fp32 ``[B, T, H]``.
     - ``v``, ``g``: bf16 ``[B, T, HV, 128]`` (``g`` are the raw gate pre-activations).
-    - ``beta_logits``: bf16 ``[B, T, HV]`` raw beta; ``beta``: fp32 ``[B, T, HV]`` = sigmoid(beta_logits).
+    - ``beta``: fp32 ``[B, T, HV]`` = the beta the forward consumed (sigmoid(beta_logits) when the
+      sigmoid is fused into the forward, otherwise the caller's post-sigmoid beta).
+    - ``beta_logits``: optional bf16 ``[B, T, HV]`` raw beta. When given, ``dbeta`` is the gradient
+      with respect to the logits (bf16, sigmoid backward fused); when ``None``, ``dbeta`` is the
+      gradient with respect to ``beta`` itself, returned in ``beta``'s dtype.
     - ``A_log``: fp32 ``[HV]``; ``dt_bias``: fp32 ``[HV * 128]``.
     - ``Aqk``, ``Akk``: bf16 ``[B, T, HV, 64]`` per-chunk matrices saved by the forward.
     - ``do``: bf16 ``[B, T, HV, 128]`` output gradient; ``scale``: attention scale;
@@ -382,8 +386,13 @@ def chunk_kda_backward(
     kr = _rows(k_rstd, rows).contiguous().float()
     v_r = _contiguous("v", _rows(v, rows), bf)
     g_r = _contiguous("g", _rows(g, rows), bf)
-    beta_raw = _contiguous("beta_logits", _rows(beta_logits, rows), bf)
     beta_s = _contiguous("beta", _rows(beta, rows), f32)
+    if beta_logits is not None:
+        beta_raw = _contiguous("beta_logits", _rows(beta_logits, rows), bf)
+    else:
+        # post-sigmoid beta: the gate epilogue's fused sigmoid backward output is not used;
+        # it still needs a bf16 operand of the right shape.
+        beta_raw = beta_s.to(bf)
     do_r = _contiguous("do", _rows(do, rows), bf)
     aqk = _contiguous("Aqk", _rows(Aqk, rows), bf)
     akk = _contiguous("Akk", _rows(Akk, rows), bf)
@@ -460,7 +469,11 @@ def chunk_kda_backward(
         "dq": dq.reshape(batch0, seq0, h, kd),
         "dk": dk.reshape(batch0, seq0, h, kd),
         "dv": dv.reshape(batch0, seq0, hv, kd),
-        "dbeta": dbeta.reshape(batch0, seq0, hv),
+        "dbeta": (
+            dbeta.reshape(batch0, seq0, hv)
+            if beta_logits is not None
+            else db_i.reshape(batch0, seq0, hv).to(beta.dtype)
+        ),
         "dg": dg.reshape(batch0, seq0, hv, kd),
         "dA_log": dA_log_grad,
         "dt_bias": dt_bias_grad,

@@ -77,11 +77,13 @@ def _inputs(batch, seq_len, heads, value_heads, *, seed, packed=False):
     )
 
 
-def _reference(inp):
+def _reference(inp, *, beta_is_logit=True):
     leaves = {
         n: inp[n].detach().clone().requires_grad_(True)
         for n in ("q", "k", "v", "g", "beta", "A_log", "dt_bias")
     }
+    if not beta_is_logit:
+        leaves["beta"] = inp["beta"].float().sigmoid().detach().requires_grad_(True)
     cu = inp["cu_seqlens"]
     out = chunk_kda(
         leaves["q"],
@@ -93,7 +95,7 @@ def _reference(inp):
         output_final_state=False,
         use_qk_l2norm_in_kernel=True,
         use_gate_in_kernel=True,
-        use_beta_sigmoid_in_kernel=True,
+        use_beta_sigmoid_in_kernel=beta_is_logit,
         allow_neg_eigval=False,
         safe_gate=True,
         lower_bound=LOWER_BOUND,
@@ -118,11 +120,15 @@ def _reference(inp):
     return {names[n]: g.detach() for n, g in zip(order, grads, strict=False)}
 
 
-def _saved(inp):
+def _saved(inp, *, beta_is_logit=True):
     with torch.no_grad():
         q_norm, q_rstd = l2norm_fwd(inp["q"])
         k_norm, k_rstd = l2norm_fwd(inp["k"])
-        beta = fused_beta_sigmoid_fwd(inp["beta"], 1.0)
+        beta = (
+            fused_beta_sigmoid_fwd(inp["beta"], 1.0)
+            if beta_is_logit
+            else inp["beta"].float().sigmoid()
+        )
         cu = inp["cu_seqlens"]
         chunk_indices = (
             None
@@ -159,7 +165,7 @@ def _saved(inp):
     )
 
 
-def _candidate(inp, saved):
+def _candidate(inp, saved, *, beta_is_logit=True):
     return chunk_kda_backward(
         q_norm=saved["q_norm"],
         k_norm=saved["k_norm"],
@@ -167,7 +173,7 @@ def _candidate(inp, saved):
         k_rstd=saved["k_rstd"],
         v=inp["v"],
         g=inp["g"],
-        beta_logits=inp["beta"],
+        beta_logits=inp["beta"] if beta_is_logit else None,
         beta=saved["beta"],
         A_log=inp["A_log"],
         dt_bias=inp["dt_bias"],
@@ -231,3 +237,27 @@ def test_rejects_unsupported_shapes():
     inp = _inputs(1, 192, 2, 2, seed=1)  # T % 128 != 0
     with pytest.raises(ValueError):
         _candidate(inp, _saved(inp))
+
+
+@pytest.mark.parametrize("batch,seq_len,heads,value_heads,packed", SHAPES[:3])
+def test_matches_reference_with_post_sigmoid_beta(
+    batch, seq_len, heads, value_heads, packed
+):
+    """beta handed in already sigmoided (fp32): dbeta is the gradient w.r.t. that beta, in its dtype."""
+    _requires_blackwell()
+    inp = _inputs(
+        batch, seq_len, heads, value_heads, seed=462_000 + seq_len, packed=packed
+    )
+    ref = _reference(inp, beta_is_logit=False)
+    got = _candidate(inp, _saved(inp, beta_is_logit=False), beta_is_logit=False)
+    assert got["dbeta"].dtype == torch.float32
+    for name in GRADS:
+        r, g = ref[name], got[name]
+        assert g.shape == r.shape, name
+        torch.testing.assert_close(
+            g.float(),
+            r.float(),
+            atol=1e-2,
+            rtol=1e-2,
+            msg=lambda m, n=name: f"{n}: {m}",
+        )
