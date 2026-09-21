@@ -73,6 +73,8 @@ def run(q, kv, kv_scales, weights, prefix_logits, cu_end, top_k, cand_cap, out, 
         )
     if top_k != 2048:
         raise ValueError("only top_k == 2048 is supported")
+    if not 49152 <= cand_cap <= (1 << 20):
+        raise ValueError("cand_cap must be in [49152, 2**20]")
     num_q, prefix_len = q.shape[0], prefix_logits.shape[-1]
     i32 = dict(dtype=torch.int32, device=q.device)
     if out is None:

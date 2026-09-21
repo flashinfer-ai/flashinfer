@@ -132,6 +132,10 @@ void dsa_indexer_topk(TensorView q, TensorView kv, TensorView kv_scales, TensorV
       << "prefix_logits rows must be contiguous and 16-byte aligned";
   TVM_FFI_ICHECK(cand_cap >= 49152 && cand_cap <= (1 << dsa_litetopk::kCandidateIndexBits))
       << "cand_cap must be in [49152, 2^20]";
+  for (const TensorView* t : {&q, &kv, &kv_scales, &weights}) {  // TMA global addresses
+    TVM_FFI_ICHECK_EQ(reinterpret_cast<uintptr_t>(t->data_ptr()) % 16, 0)
+        << "q, kv, kv_scales and weights must be 16-byte aligned";
+  }
   if (num_q == 0) return;
 
   ffi::CUDADeviceGuard device_guard(q.device().device_id);

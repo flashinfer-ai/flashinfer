@@ -41,6 +41,8 @@ def main():
     )
     parser.add_argument("--prefix", type=int, default=12288)
     args = parser.parse_args()
+    if not (2048 <= args.prefix <= 8192 or args.prefix == 12288):
+        parser.error("--prefix must be in [2048, 8192] or 12288")
     top_k, num_q, prefix_len = 2048, args.num_q, args.prefix
     print(
         " seq_kv  dense ms  fused ms  speedup  dense peak GiB  logits GiB  fused peak GiB"
