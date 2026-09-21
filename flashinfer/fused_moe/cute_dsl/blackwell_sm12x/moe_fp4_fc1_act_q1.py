@@ -89,6 +89,7 @@ class CuteDslSm120GroupedNvfp4Fc1ActQ1Op:
         out_dtype: torch.dtype,
         activation: ActivationType,
         epi=None,
+        enable_pdl=False,
         situ_beta=SITU_BETA,
         situ_linear_beta=SITU_LINEAR_BETA,
     ):
@@ -102,7 +103,7 @@ class CuteDslSm120GroupedNvfp4Fc1ActQ1Op:
             )
         self.n, self.k = n, k
         self.tile, self.out_dtype = tuple(tile), out_dtype
-        self.activation = activation
+        self.activation, self.enable_pdl = activation, enable_pdl
         self.situ_beta, self.situ_linear_beta = (situ_beta, situ_linear_beta)
         if epi is None:
             self.ab_stage, self.epi = resolve_stage_store(self.tile)
@@ -114,6 +115,7 @@ class CuteDslSm120GroupedNvfp4Fc1ActQ1Op:
             self.ab_stage,
             epi=self.epi,
             activation=activation,
+            enable_pdl=enable_pdl,
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
         )
@@ -212,6 +214,7 @@ def _op(
     out_dtype,
     activation,
     epi=None,
+    enable_pdl=False,
     situ_beta=SITU_BETA,
     situ_linear_beta=SITU_LINEAR_BETA,
 ):
@@ -222,6 +225,7 @@ def _op(
         out_dtype=out_dtype,
         activation=activation,
         epi=epi,
+        enable_pdl=enable_pdl,
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
     )
@@ -235,6 +239,7 @@ def compiled_kernel(sample_args, *, op, grid_x: int, sm_version: str):
         op.tactic,
         op.activation,
         op.out_dtype,
+        op.enable_pdl,
         op.situ_beta,
         op.situ_linear_beta,
         grid_x,
@@ -318,6 +323,7 @@ def cute_dsl_sm12x_fc1_act_q1_nvfp4(
     tile=None,
     epi=None,
     tune=None,
+    enable_pdl: bool = False,
     *,
     activation: ActivationType = ActivationType.Swiglu,
     situ_beta: float = SITU_BETA,
@@ -336,6 +342,9 @@ def cute_dsl_sm12x_fc1_act_q1_nvfp4(
         global_scale,
     )
     n, k = int(b_q.shape[1]) // 2, int(b_q.shape[2]) * 2
+    assert not enable_pdl or (out_q is not None and out_sf is not None), (
+        "PDL requires caller-owned out_q and out_sf"
+    )
     props = torch.cuda.get_device_properties(a_q.device)
     grid_x = props.multi_processor_count
     sm_version = f"sm_{props.major}{props.minor}"
@@ -357,7 +366,11 @@ def cute_dsl_sm12x_fc1_act_q1_nvfp4(
                     "cute_dsl_sm12x_fc1_act_q1_nvfp4",
                     [
                         _Fc1ActQ1Runner(
-                            out_dtype, activation, situ_beta, situ_linear_beta
+                            out_dtype,
+                            activation,
+                            enable_pdl,
+                            situ_beta,
+                            situ_linear_beta,
                         )
                     ],
                     TuningConfig(),
@@ -382,6 +395,7 @@ def cute_dsl_sm12x_fc1_act_q1_nvfp4(
         out_dtype,
         activation,
         epi,
+        enable_pdl,
         situ_beta,
         situ_linear_beta,
     )
@@ -435,12 +449,13 @@ class _Fc1ActQ1Runner(TunableRunner):
         self,
         out_dtype,
         activation,
+        enable_pdl=False,
         situ_beta=SITU_BETA,
         situ_linear_beta=SITU_LINEAR_BETA,
     ):
         self.out_dtype = out_dtype
         self._out = None
-        self.activation = activation
+        self.activation, self.enable_pdl = activation, enable_pdl
         self.situ_beta, self.situ_linear_beta = (situ_beta, situ_linear_beta)
 
     def __hash__(self) -> int:
@@ -513,6 +528,7 @@ class _Fc1ActQ1Runner(TunableRunner):
             self.out_dtype,
             self.activation,
             epi,
+            self.enable_pdl,
             self.situ_beta,
             self.situ_linear_beta,
         )
@@ -542,6 +558,7 @@ class _Fc1ActQ1Runner(TunableRunner):
             int(b_q.shape[2]) * 2,
             str(self.out_dtype),
             self.activation,
+            self.enable_pdl,
             self.situ_beta,
             self.situ_linear_beta,
             torch.cuda.get_device_capability(),
