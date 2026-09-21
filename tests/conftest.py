@@ -1,6 +1,7 @@
 import json
 import os
 import traceback
+import sys
 import types
 from pathlib import Path
 from typing import Any, Dict, Set
@@ -22,6 +23,14 @@ import pytest
 import torch
 from torch.torch_version import TorchVersion
 from torch.torch_version import __version__ as torch_version
+
+# Tests in this checkout must exercise this checkout: prepend the repo root
+# so `flashinfer` resolves to this source tree even when the invoking
+# environment exposes another importable flashinfer (for example an editable
+# install of a different worktree); a no-op when already on sys.path.
+_REPO_ROOT = str(Path(__file__).resolve().parents[1])
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 
 def _patch_cutlass_dsl_operand_major_mode():
