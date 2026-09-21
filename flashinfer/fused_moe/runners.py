@@ -24,6 +24,7 @@ fragile backend-specific kernel-launch code lives in exactly one place.
 from __future__ import annotations
 
 import functools
+import os
 import warnings
 import weakref
 from collections import OrderedDict
@@ -8215,9 +8216,9 @@ class SM12xNvfp4Runner(MoERunner):
         if self.device.type == "cuda" and self.device.index is None:
             self.device = torch.device("cuda", torch.cuda.current_device())
         self.tuning_config = TuningConfig()
-        self._topk_validation_receipt: (
-            tuple[torch.Tensor, int, int | None, int] | None
-        ) = None
+        self._validate_topk_ids = os.environ.get(
+            "FLASHINFER_SM12X_NVFP4_VALIDATE_TOPK_IDS", "1"
+        ) not in ("0", "")
 
     def _check_activation_parameters(self) -> None:
         _sm12x_nvfp4_activation_kwargs(self.config.activation)
@@ -8242,43 +8243,26 @@ class SM12xNvfp4Runner(MoERunner):
             raise NotImplementedError(
                 "SM12x NVFP4 quantizes BF16 activations internally."
             )
-    @staticmethod
-    def _topk_version(topk_ids: torch.Tensor) -> int | None:
-        try:
-            return int(topk_ids._version)
-        except RuntimeError:
-            return None
 
     def _validate_expert_id_range(
         self, topk_ids: torch.Tensor, num_experts: int
     ) -> None:
-        version = self._topk_version(topk_ids)
-        receipt = self._topk_validation_receipt
-        if (
-            receipt is not None
-            and receipt[0] is topk_ids
-            and receipt[1] == topk_ids.data_ptr()
-            and receipt[2] == version
-            and receipt[3] == num_experts
-        ):
+        if not self._validate_topk_ids:
             return
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
-                "SM12x NVFP4 topk_ids must be range-validated before CUDA Graph "
-                "capture; warm up this exact tensor version first."
+                "SM12x NVFP4 topk_ids validation is not CUDA Graph compatible; "
+                "set FLASHINFER_SM12X_NVFP4_VALIDATE_TOPK_IDS=0 to disable it."
             )
-        in_range = torch.logical_and(topk_ids >= 0, topk_ids < num_experts).all()
+        in_range = torch.logical_or(
+            topk_ids == -1,
+            torch.logical_and(topk_ids >= 0, topk_ids < num_experts),
+        ).all()
         if not bool(in_range.item()):
             raise ValueError(
-                "SM12xNvfp4Runner requires every topk_ids value to satisfy "
-                f"0 <= id < {num_experts}."
+                "SM12xNvfp4Runner requires topk_ids values in "
+                f"{{-1}} union [0, {num_experts})."
             )
-        self._topk_validation_receipt = (
-            topk_ids,
-            topk_ids.data_ptr(),
-            version,
-            num_experts,
-        )
 
     def _build(self) -> None:
         from .cute_dsl.blackwell_sm12x.moe_fp4_fc1_act_q1 import (
