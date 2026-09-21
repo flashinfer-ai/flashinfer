@@ -244,10 +244,11 @@ def _nvfp4_q0_route_direct_kernel(
         pair_idx = token_idx * top_k + slot_idx
         routed_row = tl.load(dst_rows + pair_idx)
         scale_row = tl.load(scale_dst_rows + pair_idx)
+        route_valid = routed_row != -1
         tl.store(
             q_out + routed_row * s_qom + (pair_col >> 1) * s_qok,
             packed,
-            mask=pair_valid,
+            mask=pair_valid & route_valid,
         )
         sf_index = (
             (sf_col & 3)
@@ -256,7 +257,7 @@ def _nvfp4_q0_route_direct_kernel(
             + ((scale_row & 127) >> 5) * 4
             + (scale_row >> 7) * 128 * padded_sf_cols
         )
-        tl.store(scale_out_fp8 + sf_index, sf, mask=sf_valid)
+        tl.store(scale_out_fp8 + sf_index, sf, mask=sf_valid & route_valid)
 
 
 def _validate(x, topk_ids, topk_weights, num_experts, global_scale):
