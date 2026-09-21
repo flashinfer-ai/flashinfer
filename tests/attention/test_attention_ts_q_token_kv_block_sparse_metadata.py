@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import inspect
 import math
+from itertools import accumulate
 
 import pytest
 import torch
@@ -3713,19 +3714,36 @@ def test_grouped_q_token_kv_block_sparse_physical_sparse_pages_match_torch_refer
 
 
 @_REQUIRES_PRIMS_TS_ATTENTION
-@pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float8_e4m3fn))
 @pytest.mark.parametrize(
-    ("kv_heads", "share_pattern"),
-    ((1, True), (2, True), (2, False), (4, True), (4, False)),
+    ("dtype", "kv_heads", "share_pattern", "multi_wave"),
+    [
+        (dtype, heads, shared, False)
+        for dtype in (torch.bfloat16, torch.float8_e4m3fn)
+        for heads, shared in ((1, True), (2, True), (2, False), (4, True), (4, False))
+    ]
+    + [
+        pytest.param(torch.float8_e4m3fn, 1, True, True, id="fp8-multi-wave-shared"),
+        pytest.param(torch.float8_e4m3fn, 2, False, True, id="fp8-multi-wave-per-head"),
+    ],
 )
 def test_grouped_cache_stride_rebinding_graph(
-    dtype: torch.dtype, kv_heads: int, share_pattern: bool
+    dtype: torch.dtype, kv_heads: int, share_pattern: bool, multi_wave: bool
 ) -> None:
     """Compact and padded page strides must not share incompatible TensorMaps."""
     torch.manual_seed(82173)
     group, dim, page, context, topk = 8, 256, 20, 1280, 16
     heads = 12 * kv_heads
-    rows, pages = 20, context // page
+    request_lengths = (9, 11)
+    if multi_wave:
+        # Exercise persistent work discovery and the flat FP8 issuer without
+        # making every dtype/head combination a large-grid test.
+        num_requests = (
+            torch.cuda.get_device_properties("cuda").multi_processor_count // kv_heads
+            + 1
+        )
+        request_lengths = tuple(7 + i % 2 for i in range(num_requests))
+        context = 320
+    rows, pages = sum(request_lengths), context // page
     query = torch.randn(rows, heads, dim, device="cuda", dtype=torch.bfloat16).to(dtype)
     cache = tuple(
         torch.randn(
@@ -3742,12 +3760,33 @@ def test_grouped_cache_stride_rebinding_graph(
     for target, source in zip(padded, cache, strict=True):
         target.copy_(source)
         assert not target.is_contiguous()
-    table = torch.randperm(2 * pages, device="cuda", dtype=torch.int32).view(2, pages)
-    requests = torch.tensor([0] * 9 + [1] * 11, device="cuda", dtype=torch.int32)
-    positions = torch.cat(
-        [torch.arange(context - count, context, device="cuda") for count in (9, 11)]
+    if multi_wave:
+        table = torch.stack(
+            [
+                torch.randperm(2 * pages, device="cuda", dtype=torch.int32)[:pages]
+                for _ in request_lengths
+            ]
+        )
+    else:
+        table = torch.randperm(2 * pages, device="cuda", dtype=torch.int32).view(
+            2, pages
+        )
+    requests = torch.tensor(
+        [
+            request
+            for request, count in enumerate(request_lengths)
+            for _ in range(count)
+        ],
+        device="cuda",
+        dtype=torch.int32,
     )
-    candidates = 256
+    positions = torch.cat(
+        [
+            torch.arange(context - count, context, device="cuda")
+            for count in request_lengths
+        ]
+    )
+    candidates = min(256, context // 4 - group)
     blocks = (
         torch.rand(rows, 1 if share_pattern else kv_heads, candidates, device="cuda")
         .argsort(-1)[..., :topk]
@@ -3757,7 +3796,7 @@ def test_grouped_cache_stride_rebinding_graph(
     if share_pattern:
         blocks = blocks[:, 0].contiguous()
     qo_indptr = make_prims_ts_q_token_kv_block_sparse_qo_indptr(
-        torch.tensor([0, 9, rows], dtype=torch.int32),
+        torch.tensor(list(accumulate((0, *request_lengths))), dtype=torch.int32),
         rows,
         group_size=group,
         device=query.device,

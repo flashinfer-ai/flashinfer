@@ -336,7 +336,9 @@ def _issue_sparse_page_copies(
         # kernels keep parallel shared loads to minimize startup latency.
         uniform_fragments_per_warp = fragments // cfg.load_num_warps
         uniform_warp = _load_task_warp_rank(cfg)
-        for fragment_idx in cutlass.range_constexpr(uniform_fragments_per_warp):
+        # Reuse a compact set of uniform address operands across fragments;
+        # keep the head-plane copies unrolled inside each iteration.
+        for fragment_idx in cutlass.range(uniform_fragments_per_warp, unroll=1):
             uniform_fragment = uniform_warp * Int32(uniform_fragments_per_warp) + Int32(
                 fragment_idx
             )
