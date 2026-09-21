@@ -521,10 +521,8 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
                            QuantizationSFLayout layout, int multiProcessorCount, bool enable_pdl,
                            bool use_row_wise_scale, bool inverse_scale,
                            NVFP4RecipeSpec const& recipe, cudaStream_t stream) {
-  // 4over6 is an FP16/BF16-only path, so the FP8 branch below deliberately ignores
-  // `recipe` and keeps the hardcoded off-recipe. A process-wide
-  // FLASHINFER_NVFP4_4OVER6=1 was already silently ignored for FP8 input; keeping an
-  // explicit recipe equally ignored avoids turning that into a new hard error.
+  // The FP8 branch ignores `recipe`: FP8->FP4 has no 4over6 kernel, and an env-driven
+  // recipe was always silently ignored there. Python rejects an explicit one.
 #ifdef ENABLE_FP8
   if constexpr (std::is_same_v<T, __nv_fp8_e4m3>) {
     // Use TMA kernel for large m (high throughput mode)

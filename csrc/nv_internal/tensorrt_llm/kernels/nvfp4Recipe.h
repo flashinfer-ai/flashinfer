@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -27,12 +27,17 @@ namespace tensorrt_llm::kernels {
 // kernels/quantization.h pulls in flashinfer::QuantizationSFLayout.
 using tensorrt_llm::common::NVFP44Over6ErrMode;
 
-// Wire format shared with flashinfer/quantization/nvfp4_quantization_utils.py
-// (see issue #5141). Keep the two sides in sync:
-//   -1  FROM_ENV  caller supplied nothing -> read the FLASHINFER_NVFP4_4OVER6* env vars
-//    0  STANDARD  4over6 off
-//   odd enabled; bit0=1, bit1=(e4m3Max == 256), bits2-3=errMode(0=MAE, 1=MSE),
-//       bit4=errUseFastMath
+// The recipe crosses the FFI as one int64 "code". The encoder is
+// nvfp4_4over6_code() in flashinfer/quantization/nvfp4_quantization_utils.py.
+// The decoder is resolveNVFP4Recipe() below. Keep the two in sync (issue #5141).
+//
+//   code == -1      FROM_ENV: the caller passed nothing. Read the
+//                   FLASHINFER_NVFP4_4OVER6* environment variables.
+//   bit 0 clear     STANDARD: 4over6 off (kNVFP44Over6Standard is 0).
+//   bit 0 set       an explicit 4over6 recipe. The remaining bits:
+//                     bit 1      e4m3Max: 0 -> 448, 1 -> 256
+//                     bits 2..3  errMode: 0 -> MAE, 1 -> MSE
+//                     bit 4      errUseFastMath
 inline constexpr int64_t kNVFP44Over6FromEnv = -1;
 inline constexpr int64_t kNVFP44Over6Standard = 0;
 

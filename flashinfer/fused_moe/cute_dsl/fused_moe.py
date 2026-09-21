@@ -357,18 +357,15 @@ def _moe_core_impl(
         situ_beta: When set with ActivationType.Swiglu, use the SiTU gate.
         situ_linear_beta: Optional SiTU tanh clamp for the up branch.
         nvfp4_4over6: NVFP4 4over6 recipe for the GEMM2-input quantization.
-            Omitted (the default) reads FLASHINFER_NVFP4_4OVER6 and friends
-            on every call, None turns 4over6 off regardless of the
-            environment, and an NVFP44Over6Config pins that exact recipe
-            with no per-field merge. Only consulted when
-            per_token_scale is given: without it the GEMM2 input comes out of
-            GEMM1's NVFP4 epilogue, which has no 4over6 variant. Pinning a
-            recipe also pins fc2_input_scale to 1 / (6 * e4m3_max) -- what
-            prepare_cute_dsl_nvfp4_weights(..., nvfp4_4over6=...) and
-            make_nvfp4_global_scale(..., per_token_activation=True) emit for
-            that recipe -- because the candidate search bakes that constant
-            into its dequantization; any other scale raises ValueError rather
-            than ranking the scale candidates on the wrong magnitudes.
+            - omitted (the default): read FLASHINFER_NVFP4_4OVER6* on every
+              call.
+            - None: 4over6 off regardless of the environment.
+            - NVFP44Over6Config: exactly that recipe, no per-field merge.
+            Only consulted with per_token_scale: otherwise the GEMM2 input
+            comes out of GEMM1's NVFP4 epilogue, which has no 4over6 variant.
+            A pinned recipe requires fc2_input_scale == 1 / (6 * e4m3_max)
+            (what prepare_cute_dsl_weights(..., nvfp4_4over6=...) emits), or
+            ValueError is raised.
 
     Returns:
         Output tensor [num_tokens, hidden_size].

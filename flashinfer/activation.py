@@ -235,11 +235,13 @@ def silu_and_mul_scaled_nvfp4_experts_quantize(
     a_global_sf : torch.Tensor
         Global scale factor of shape ``[1]`` with dtype ``float32``.
     nvfp4_4over6 : NVFP44Over6Config or None
-        NVFP4 "4over6" scale-candidate search.  Omitted (the default): the
-        recipe comes from the legacy ``FLASHINFER_NVFP4_4OVER6*`` environment
-        variables.  ``None``: 4over6 off, environment ignored.  An
-        :class:`NVFP44Over6Config`: on with exactly that recipe, environment
-        ignored.  Requires fp16/bf16 input.
+        NVFP4 "4over6" scale-candidate search. Requires fp16 / bf16 input.
+
+        - omitted (the default): read the legacy ``FLASHINFER_NVFP4_4OVER6*``
+          environment variables.
+        - ``None``: 4over6 off. The environment is ignored.
+        - :class:`NVFP44Over6Config`: on with exactly that recipe. The
+          environment is ignored.
 
     Returns
     -------

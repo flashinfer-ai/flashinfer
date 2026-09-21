@@ -2455,16 +2455,11 @@ def prepare_cute_dsl_weights(
     device : torch.device, optional
         Target device; defaults to ``w1_bf16.device``.
     nvfp4_4over6 : NVFP44Over6Config or None
-        The 4over6 recipe the *runtime activation* quantizer will be given.
-        It selects ``fc2_input_scale`` only -- the weights themselves are
-        quantized standard-NVFP4 either way, matching the separation
-        ``QuantConfig.nvfp4_4over6`` documents.  The GEMM2-input candidate
-        search bakes ``1 / (6 * e4m3_max)`` into its dequantization, so a
-        pinned recipe requires exactly that scale and
-        ``_moe_core_impl`` raises on anything else.  The default
-        ``None`` keeps the historical ``fc2_input_scale =
-        1.0``, which standard NVFP4 tolerates because it divides by the same
-        value it multiplied by.
+        The 4over6 recipe the runtime activation quantizer will be given.
+        Selects ``fc2_input_scale`` only (``1 / (6 * e4m3_max)``, the value
+        the GEMM2-input candidate search requires). The weights are quantized
+        standard-NVFP4 either way. ``None`` keeps the historical
+        ``fc2_input_scale = 1.0``.
 
     Returns
     -------
@@ -2551,10 +2546,8 @@ def prepare_cute_dsl_weights(
         "w2_alpha": ones,
     }
     if not is_mxfp4:
-        # A pinned recipe fixes the GEMM2-input scale to 1 / (6 * e4m3_max),
-        # the only value its candidate search dequantizes correctly.  The
-        # weight tensor is passed for its device alone: with
-        # per_token_activation=True the scale is a pure function of the recipe.
+        # A pinned recipe fixes the GEMM2-input scale to 1 / (6 * e4m3_max).
+        # w2_bf16 is passed for its device only.
         nvfp4_4over6_config = resolve_nvfp4_4over6(nvfp4_4over6)
         view["fc2_input_scale"] = (
             gs

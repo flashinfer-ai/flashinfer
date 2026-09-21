@@ -175,58 +175,34 @@ class QuantConfig:
         Whether activations carry a per-token scale (vs per-tensor / block).
         ``None`` → backend default.
     nvfp4_4over6 : NVFP44Over6Config or None
-        NVFP4 "4over6" scale-selection recipe for the **activation**
-        quantization the kernels perform at runtime.  Weight quantization is a
-        separate concern — it happens ahead of the call, in the caller's own
-        quantize step, and ``tests/moe/test_trtllm_gen_per_token_moe.py``
-        parametrizes ``use_4over6`` and ``weights_use_4over6`` independently for
-        exactly that reason.
+        NVFP4 "4over6" scale-candidate search for the **activation**
+        quantization the kernels perform at runtime. Weights are quantized
+        by the caller ahead of the call and are not affected.
 
-        Three cases, spelled by one ``Optional`` type plus the default:
+        - unset (the default): read the legacy ``FLASHINFER_NVFP4_4OVER6*``
+          environment variables on every call (byte-for-byte the old
+          behaviour).
+        - ``None``: 4over6 off. The environment is ignored.
+        - ``NVFP44Over6Config(...)``: on with exactly that recipe. The
+          environment is ignored, with no per-field merge.
 
-        Unset (the default)
-            Read ``FLASHINFER_NVFP4_4OVER6``; when ``"1"``, the other three
-            ``FLASHINFER_NVFP4_4OVER6_*`` variables supply the recipe.  Read on
-            every call.  Byte-for-byte the old behaviour; the environment
-            variables are a deprecated compatibility shim.
-        ``None``
-            4over6 off.  ``FLASHINFER_NVFP4_4OVER6=1`` cannot turn it back on.
-        ``NVFP44Over6Config(...)``
-            On with exactly this recipe; the environment is ignored and there
-            is **no** per-field merge with it.
-
-        This is the config knob ``SfLayout`` (above) was denied, and it earns
-        the exception on the same test: :class:`NVFP44Over6Config` (including
-        its :class:`NVFP44Over6ErrMode` field) has an eval-safe ``__repr__``,
-        so the ``eval(repr(cfg))`` round-trip still holds; an unset field is
-        simply not emitted.
-
-        A backend that has not threaded the setting into its quantizer rejects
-        an explicit value rather than silently dropping it; see
-        ``MoERunner.supports_nvfp4_4over6``.
-
-        Pinning an :class:`NVFP44Over6Config` also pins the GEMM2-input scale
-        of the weight pack, because the candidate search bakes
-        ``1 / (6 * e4m3_max)`` into the dequantization it measures its
-        candidates with.  Build the pack from the same setting —
+        Only NVFP4 activations accept an explicit value (``__post_init__``
+        raises otherwise). A runner that has not threaded the setting into
+        its quantizer rejects an explicit value instead of dropping it; see
+        ``MoERunner.supports_nvfp4_4over6``. A pinned recipe also pins the
+        GEMM2-input scale of the weight pack: build it with
         ``CuteDslConfig.prepare_weights(..., nvfp4_4over6=<the same value>)``
-        — or the call raises ``ValueError`` instead of quietly ranking the
-        scale candidates on the wrong magnitudes.
+        or the call raises ``ValueError``. An unset field is not emitted by
+        ``__repr__``, so the ``eval(repr(cfg))`` round-trip still holds.
 
     Raises
     ------
     ValueError
         If ``nvfp4_4over6`` is set (to ``None`` or a config) when
-        ``activation`` is not ``QuantFormat.NVFP4``.  An explicit ``None``
-        is rejected too: on a non-NVFP4 activation it is not a no-op to be
-        ignored but a statement about a quantization that is not happening,
-        and accepting it would make the field look meaningful where it is
-        not.
+        ``activation`` is not ``QuantFormat.NVFP4``.
     TypeError
         If ``nvfp4_4over6`` is neither ``None`` nor an
-        :class:`NVFP44Over6Config` (raised by
-        :func:`~flashinfer.resolve_nvfp4_4over6`, which ``__post_init__``
-        calls purely to type-check the value where it is written).
+        :class:`NVFP44Over6Config`.
     """
 
     weight: QuantFormat = QuantFormat.BF16
@@ -248,14 +224,11 @@ class QuantConfig:
                 )
         if self.nvfp4_4over6 is _UNSET:
             return
-        # Resolve once purely to type-check the setting: a config object that
-        # cannot be resolved should fail where it is written, not at launch.
+        # Type-check where the value is written, not at launch.
         resolve_nvfp4_4over6(self.nvfp4_4over6)
-        # A cross-field invalid combination, so it belongs here and not in a
-        # runner's _check_support(): MoELayer swallows those exceptions to
-        # filter backends, which would turn this mistake into "no backend
-        # available" instead of naming it. The recipe governs the runtime
-        # activation quantization, so it is keyed on the activation axis.
+        # Checked here rather than in a runner's _check_support(): MoELayer
+        # swallows those to filter candidates, which would report "no backend
+        # available" instead of naming the mistake.
         if self.activation is not QuantFormat.NVFP4:
             raise ValueError(
                 f"nvfp4_4over6={self.nvfp4_4over6!r} applies only to "
@@ -1653,10 +1626,10 @@ class CuteDslConfig:
         ``quant`` selects NVFP4×NVFP4, MXFP4×MXFP8, or NVFP4×BF16 (CuTe-DSL W4A16).
         Defaults to NVFP4×NVFP4.
 
-        Pass the same ``nvfp4_4over6`` as ``QuantConfig.nvfp4_4over6``: it
-        selects the ``fc2_input_scale`` in the NVFP4×NVFP4 pack, and a pinned
-        recipe accepts only the scale it implies.  The default keeps the
-        historical ``fc2_input_scale = 1.0``.
+        ``nvfp4_4over6`` must equal the layer's ``QuantConfig.nvfp4_4over6``
+        (see that field): it selects the NVFP4×NVFP4 pack's
+        ``fc2_input_scale``. The default keeps the historical
+        ``fc2_input_scale = 1.0``.
         """
         from .prepare import prepare_cute_dsl_weights
 

@@ -589,9 +589,8 @@ class MoERunner(TunableRunner):
     def _assert_nvfp4_4over6_supported(self) -> None:
         """Reject an explicit 4over6 recipe on a backend that has not opted in.
 
-        Silence is the contract only for an unset field.  A pinned
-        recipe that the backend would quietly ignore is the exact failure mode
-        the field exists to eliminate, so it must be loud.
+        Only an unset field may pass silently: a pinned recipe the backend
+        would ignore is the failure the field exists to prevent.
         """
         setting = self.config.quant.nvfp4_4over6
         if setting is _UNSET or self.supports_nvfp4_4over6:
@@ -692,11 +691,8 @@ class MoERunner(TunableRunner):
             # Declared quant flags are keyed before runners begin consuming them.
             self.config.quant.per_token_scale,
             self.config.quant.swizzled_scale_factors,
-            # The 4over6 recipe changes the quantized values a tactic is timed
-            # and ranked on, and nothing else in this tuple reflects it: before
-            # this entry, tuning with FLASHINFER_NVFP4_4OVER6=1 and then running
-            # with it off replayed the stale tactic, and the persisted key
-            # collided across processes as well.
+            # The 4over6 recipe changes the values a tactic is timed on and
+            # nothing else in this tuple reflects it.
             self._nvfp4_4over6_key,
         )
 
@@ -4269,11 +4265,9 @@ class CuteDslRunner(MoERunner):
             raise NotImplementedError(
                 f"CuteDslRunner does not support {self.config.quant}."
             )
-        # Forwarded only when the caller pinned a recipe, so the default path
-        # stays byte-identical to the pre-existing env-driven behaviour (the
-        # same "only forward an explicit value" rule use_fused_finalize follows).
-        # It rides on **kwargs through the inner tuning runner and lands on
-        # _cute_dsl_fused_moe_nvfp4_impl.
+        # Forwarded only when explicit (like use_fused_finalize), so the
+        # default path stays byte-identical to the env-driven behaviour. It
+        # rides on **kwargs down to _cute_dsl_fused_moe_nvfp4_impl.
         self._forward_kwargs = (
             {}
             if self.config.quant.nvfp4_4over6 is _UNSET

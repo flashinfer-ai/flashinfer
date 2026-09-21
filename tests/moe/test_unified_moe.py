@@ -1946,13 +1946,11 @@ def _make_4over6_runner_class(supports: bool):
 
 
 class TestRunner4Over6Support:
-    """``MoERunner.supports_nvfp4_4over6`` is an opt-in, and silence is a bug.
+    """``MoERunner.supports_nvfp4_4over6`` is an opt-in.
 
-    A backend whose activation quantizer still reads
-    ``FLASHINFER_NVFP4_4OVER6*`` directly cannot honor a pinned recipe.
-    Accepting one and quantizing with whatever the environment happens to say
-    is the exact failure mode issue #5141 exists to remove, so the runner must
-    refuse loudly.
+    A runner whose quantizer still reads ``FLASHINFER_NVFP4_4OVER6*`` cannot
+    honor a pinned recipe and must refuse it instead of quantizing with
+    whatever the environment says.
     """
 
     @staticmethod
@@ -2005,14 +2003,10 @@ class TestRunner4Over6Support:
     def test_moe_layer_names_the_setting_when_no_backend_can_honor_it(
         self, monkeypatch
     ):
-        """A pinned recipe nobody implements must be diagnosable.
+        """A pinned recipe nobody implements must be named in the error.
 
-        ``MoELayer`` catches ``NotImplementedError`` from ``check_support()``
-        to filter backends, so without deliberate reporting the user sees only
-        "none of the configured backends are usable on arch sm100" — with no
-        hint that the 4over6 recipe is what disqualified them.  The whole point
-        of the field is to replace a silent environment read with a loud
-        contract, so the message must name ``nvfp4_4over6``.
+        ``MoELayer`` swallows ``check_support()`` failures to filter backends,
+        so the "no usable backend" message has to mention ``nvfp4_4over6``.
         """
         from flashinfer.fused_moe import layer as layer_mod
 

@@ -253,10 +253,8 @@ class MoELayer:
                 f"activation={config.quant.activation.name}, "
                 f"output={config.quant.output.name}."
             )
-            # Same shape as the hint above: _check_support() raises a precise
-            # NotImplementedError, but the filter loop swallows it, so the
-            # reason has to be reconstructed here or the user only sees "no
-            # backend available".
+            # Name the runners that implement an explicit recipe; the filter
+            # loop swallowed their _check_support() reasons.
             if config.quant.nvfp4_4over6 is not _UNSET:
                 supporting = ", ".join(
                     r.__name__
@@ -266,14 +264,11 @@ class MoELayer:
                 hint += (
                     f" Note nvfp4_4over6={config.quant.nvfp4_4over6!r}: an "
                     f"explicit NVFP4 4over6 setting is implemented only by "
-                    f"[{supporting}] (and only on the paths that runner "
-                    f"documents); every other backend reads the "
-                    f"FLASHINFER_NVFP4_4OVER6* environment variables directly, "
-                    f"so leaving the field unset restores them."
+                    f"[{supporting}]; other backends read the "
+                    f"FLASHINFER_NVFP4_4OVER6* environment variables, which "
+                    f"leaving the field unset restores."
                 )
-            # The reasons come last: they are the ground truth, while the
-            # hints above are generic and can point at a backend the user
-            # already selected.
+            # Per-runner reasons last: they are the ground truth.
             reasons = ""
             if rejected:
                 reasons = " Backends rejected this configuration: " + "; ".join(

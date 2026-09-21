@@ -323,12 +323,10 @@ class TestReprRoundTrip:
 
 
 class TestPickleAndDeepcopy:
-    """The unset sentinel must stay a singleton: ``is _UNSET`` is load-bearing.
+    """``is _UNSET`` must survive ``pickle`` and ``deepcopy``.
 
-    ``resolve_nvfp4_4over6`` dispatches with ``is _UNSET``, so a config that
-    came back from ``pickle`` (a torch DataLoader worker, a cached framework
-    config) or ``deepcopy`` with a mere equal-but-distinct sentinel would
-    silently resolve as an unknown setting and raise ``TypeError``.
+    ``resolve_nvfp4_4over6`` dispatches on identity; a distinct copy of the
+    sentinel would be an unknown setting and raise ``TypeError``.
     """
 
     def test_pickle_preserves_identity(self):
@@ -431,13 +429,10 @@ class TestWireFormat:
 
 
 class TestCacheKey:
-    """Backwards compatibility of every user's on-disk CuTe-DSL artifact name.
-
-    ``_nvfp4_kernel_name`` has always appended ``_4over6_<e4m3>_<mode>_<fast>``;
-    ``nvfp4_4over6_cache_key`` must keep producing exactly that suffix or the
-    whole cache silently invalidates (and recompiles) on upgrade.  The
-    cross-check against the kernel-name function itself lives in
-    ``tests/jit/test_cute_dsl_cache.py``, which can import the CuTe-DSL module.
+    """``nvfp4_4over6_cache_key`` must keep the ``_4over6_<e4m3>_<mode>_<fast>``
+    suffix ``_nvfp4_kernel_name`` has always used, or every on-disk CuTe-DSL
+    artifact is invalidated on upgrade. The cross-check against the
+    kernel-name function is in ``tests/jit/test_cute_dsl_cache.py``.
     """
 
     def test_off(self):
