@@ -32,6 +32,16 @@ _AUTO_CANDIDATES = {
         # unchanged MoELayer callers, matching the BF16 integration above.
         requires_opt_in=False,
     ),
+    "cudnn_frost_nvfp4": AutoCandidateSpec(
+        "flashinfer.experimental.cudnn_frost_selected_kernels.nvfp4.support",
+        # Match this branch's measured BF16 and MXFP8 automatic integration.
+        requires_opt_in=False,
+    ),
+    "cudnn_frost_mxfp8_mxfp4": AutoCandidateSpec(
+        "flashinfer.experimental.cudnn_frost_selected_kernels.mxfp8_mxfp4.support",
+        # Reuse the branch-local measured shortlist integration for mixed MX.
+        requires_opt_in=False,
+    ),
 }
 
 

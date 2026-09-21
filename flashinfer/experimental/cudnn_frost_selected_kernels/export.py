@@ -35,45 +35,70 @@ def _build_graph(
 ):
     import cudnn
 
-    if dtype not in ("bf16", "mxfp8"):
+    if dtype not in ("bf16", "mxfp8", "nvfp4", "mxfp8_mxfp4"):
         raise ValueError(f"unsupported export dtype {dtype!r}")
-    if dtype == "mxfp8" and (n % 128 or k % 128):
-        raise ValueError("MXFP8 export requires N and K divisible by 128")
-    data_type = (
-        cudnn.data_type.FP8_E4M3 if dtype == "mxfp8" else cudnn.data_type.BFLOAT16
-    )
+    if dtype != "bf16" and (n % 128 or k % 128):
+        raise ValueError(f"{dtype.upper()} export requires N and K divisible by 128")
+    token_type, weight_type = {
+        "bf16": (cudnn.data_type.BFLOAT16, cudnn.data_type.BFLOAT16),
+        "mxfp8": (cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E4M3),
+        "nvfp4": (cudnn.data_type.FP4_E2M1, cudnn.data_type.FP4_E2M1),
+        "mxfp8_mxfp4": (cudnn.data_type.FP8_E4M3, cudnn.data_type.FP4_E2M1),
+    }[dtype]
+    block_size = 16 if dtype == "nvfp4" else 32
     graph = cudnn.pygraph(
         io_data_type=cudnn.data_type.BFLOAT16,
         intermediate_data_type=cudnn.data_type.FLOAT,
         compute_data_type=cudnn.data_type.FLOAT,
     )
+    # Graph extents/strides count logical elements. FP4 runtime tensors pack
+    # two E2M1 values per byte, so their contiguous K extent/row stride is k/2.
     token = graph.tensor(
         name="token",
         dim=[1, s, k],
         stride=[s * k, k, 1],
-        data_type=data_type,
+        data_type=token_type,
     )
     gate = graph.tensor(
         name="gate_weight",
         dim=[experts, k, n],
         stride=[k * n, 1, k],
-        data_type=data_type,
+        data_type=weight_type,
     )
 
     def dequantize(tensor, name, token=False):
         if dtype == "bf16":
             return tensor
-        sf_k = k // 32
+        sf_k = k // block_size
         scales = graph.tensor(
             name=name,
             dim=[1, s, sf_k] if token else [experts, sf_k, n],
             stride=[s * sf_k, sf_k, 1] if token else [sf_k * n, 1, sf_k],
-            data_type=cudnn.data_type.FP8_E8M0,
+            data_type=(
+                cudnn.data_type.FP8_E4M3
+                if dtype == "nvfp4"
+                else cudnn.data_type.FP8_E8M0
+            ),
             reordering_type=cudnn.tensor_reordering.F8_128x4,
         )
         return graph.block_scale_dequantize(
-            input=tensor, descale=scales, block_size=[1, 32] if token else [32, 1]
+            input=tensor,
+            descale=scales,
+            block_size=[1, block_size] if token else [block_size, 1],
         )
+
+    def apply_gemm_scale(tensor, name):
+        if dtype != "nvfp4":
+            return tensor
+        # NVFP4 global descales belong before the nonlinear activation. Each
+        # group supplies the product of its activation and weight descales.
+        alpha = graph.tensor(
+            name=name,
+            dim=[groups, 1, 1],
+            stride=[1, 1, 1],
+            data_type=cudnn.data_type.FLOAT,
+        )
+        return graph.mul(a=tensor, b=alpha, name=f"apply_{name}")
 
     token = dequantize(token, "token_scale", token=True)
     gate = dequantize(gate, "gate_weight_scale")
@@ -92,6 +117,7 @@ def _build_graph(
             compute_data_type=cudnn.data_type.FLOAT,
             name="fc2",
         )
+        output = apply_gemm_scale(output, "alpha")
         output.set_data_type(cudnn.data_type.BFLOAT16).set_output(True)
         return graph
     activation = op.removeprefix("grouped_gemm1_")
@@ -101,7 +127,7 @@ def _build_graph(
         name="up_weight",
         dim=[experts, k, n],
         stride=[k * n, 1, k],
-        data_type=data_type,
+        data_type=weight_type,
     )
     up = dequantize(up, "up_weight_scale")
     offsets = graph.tensor(
@@ -124,6 +150,7 @@ def _build_graph(
         compute_data_type=cudnn.data_type.FLOAT,
         name="gate_gemm",
     )
+    gate_out = apply_gemm_scale(gate_out, "gate_alpha")
     up_out = None
     if is_gated(activation):
         up_out = graph.moe_grouped_matmul(
@@ -134,6 +161,7 @@ def _build_graph(
             compute_data_type=cudnn.data_type.FLOAT,
             name="up_gemm",
         )
+        up_out = apply_gemm_scale(up_out, "up_alpha")
     unary = {
         "swiglu": "swish",
         "swiglu_step": "swish",
@@ -396,7 +424,7 @@ def _export_compiled(args, compiled, config, arch):
         raise RuntimeError(
             f"cuDNN Frost did not compile {op} as {expected_gemms} grouped GEMM(s)"
         )
-    if compiled.chain.has_block_scale != (dtype == "mxfp8"):
+    if compiled.chain.has_block_scale != (dtype != "bf16"):
         raise RuntimeError("cuDNN Frost compiled the wrong quantization pipeline")
     store_modes = tuple(compiled.store_modes)
     if len(store_modes) != 1 or store_modes[0] not in ("stg", "tma"):
@@ -430,10 +458,21 @@ def _export_compiled(args, compiled, config, arch):
     expected_aux = (
         {"scale", "gate_scale", "linear_scale"} if activation == "situ" else {"scale"}
     )
+    if dtype == "nvfp4":
+        expected_aux |= {"gate_alpha"}
+        if is_gated(activation):
+            expected_aux |= {"up_alpha"}
     if op != "grouped_gemm2" and set(aux_names) != expected_aux:
         raise RuntimeError(f"Unexpected FC1 auxiliary tensors: {aux_names}")
     if op == "grouped_gemm2":
-        launch_tail = ["output"]
+        if set(aux_names) != ({"alpha"} if dtype == "nvfp4" else set()):
+            raise RuntimeError(f"Unexpected FC2 auxiliary tensors: {aux_names}")
+    token_dtype, weight_dtype = {
+        "bf16": ("bfloat16", "bfloat16"),
+        "mxfp8": ("float8_e4m3fn", "float8_e4m3fn"),
+        "nvfp4": ("float4_e2m1fn_x2", "float4_e2m1fn_x2"),
+        "mxfp8_mxfp4": ("float8_e4m3fn", "float4_e2m1fn_x2"),
+    }[dtype]
     return {
         "id": artifact_id,
         "op": prefix,
@@ -448,18 +487,30 @@ def _export_compiled(args, compiled, config, arch):
             "k": args.k,
             "experts": args.experts,
             "groups": args.groups,
-            "token_dtype": "float8_e4m3fn" if dtype == "mxfp8" else "bfloat16",
-            "weight_dtype": "float8_e4m3fn" if dtype == "mxfp8" else "bfloat16",
+            "token_dtype": token_dtype,
+            "weight_dtype": weight_dtype,
             "output_dtype": "bfloat16",
             "activation": activation,
             **(
                 {
-                    "scale_dtype": "float8_e8m0fnu",
-                    "block_size": 32,
+                    "scale_dtype": (
+                        "float8_e4m3fn" if dtype == "nvfp4" else "float8_e8m0fnu"
+                    ),
+                    "block_size": 16 if dtype == "nvfp4" else 32,
                     "scale_layout": "F8_128x4",
                     "token_scale_layout": "segmented_F8_128x4",
                 }
-                if dtype == "mxfp8"
+                if dtype != "bf16"
+                else {}
+            ),
+            **(
+                {
+                    "elements_per_byte": 2,
+                    "global_scale_dtype": "float32",
+                    "global_scale_layout": "per_group",
+                    "global_scale_position": "gemm_output_before_activation",
+                }
+                if dtype == "nvfp4"
                 else {}
             ),
         },
@@ -512,7 +563,9 @@ def _write_manifest(output_dir: Path, kernel: dict[str, Any], replace: bool) -> 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dtype", choices=("bf16", "mxfp8"), default="bf16")
+    parser.add_argument(
+        "--dtype", choices=("bf16", "mxfp8", "nvfp4", "mxfp8_mxfp4"), default="bf16"
+    )
     parser.add_argument(
         "--op",
         choices=(*(f"grouped_gemm1_{name}" for name in ACTIVATIONS), "grouped_gemm2"),
@@ -533,7 +586,7 @@ def main() -> None:
         "--k",
         type=int,
         required=True,
-        help="GEMM reduction width (FC2: intermediate size)",
+        help="logical GEMM reduction width (FC2: intermediate size)",
     )
     parser.add_argument("--experts", type=int, required=True)
     parser.add_argument("--groups", type=int, help="defaults to --experts")

@@ -1514,7 +1514,7 @@ def frost_template_kernel(
                     _op_0 = _c_0_a * (cutlass.full_like(_c_0_a, _aux_scale_pre.to(cutlass.Float32)))
                     _r_0 = (_op_0).to(cutlass.BFloat16)
                     vec_out = (_r_0).to(cutlass.BFloat16)
-
+                    
 
                     # @@FROST_TMA_STORE@@
 

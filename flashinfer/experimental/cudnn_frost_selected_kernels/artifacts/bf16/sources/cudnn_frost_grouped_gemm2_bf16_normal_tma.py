@@ -1532,7 +1532,7 @@ def frost_template_kernel(
 
                     _r_mm = (vec_f32).to(cutlass.BFloat16)
                     vec_out = (_r_mm).to(cutlass.BFloat16)
-
+                    
 
                     # @@FROST_TMA_STORE@@
 
