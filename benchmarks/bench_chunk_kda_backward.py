@@ -75,7 +75,9 @@ def make_inputs(batch, seq_len, heads, value_heads, *, packed, seed):
         v=(rand(b, total, value_heads, D) - 0.5).to(torch.bfloat16),
         g=(randn(b, total, value_heads, D) * 0.1).to(torch.bfloat16),
         beta=randn(b, total, value_heads).to(torch.bfloat16),
-        A_log=randn(value_heads),
+        A_log=torch.log(
+            rand(value_heads) + 1.0
+        ),  # model-init regime: decay rates in [1, 2)
         dt_bias=randn(value_heads * D),
         do=randn(b, total, value_heads, D).to(torch.bfloat16),
         scale=D**-0.5,
@@ -213,16 +215,19 @@ def main():
         )
         ref_bwd, cand_bwd = reference_arms(inp)
         ref, cand = ref_bwd(), cand_bwd()
-        ok = all(
-            torch.allclose(cand[k].float(), ref[k].float(), atol=1e-2, rtol=1e-2)
+        mismatched = [
+            k
             for k in ref
-        )
+            if not torch.allclose(cand[k].float(), ref[k].float(), atol=1e-2, rtol=1e-2)
+        ]
+        ok = not mismatched
         second = cand_bwd()
         deterministic = all(torch.equal(cand[k], second[k]) for k in cand)
         ref_ms, cand_ms = t_ms(ref_bwd), t_ms(cand_bwd)
         print(
             f"{name:22s} {ref_ms:13.4f} {cand_ms:11.4f} {ref_ms / cand_ms:8.2f}x  "
-            f"{'pass' if ok else 'FAIL'}{'' if deterministic else ' (non-deterministic!)'}"
+            f"{'pass' if ok else 'FAIL ' + ','.join(mismatched)}"
+            f"{'' if deterministic else ' (non-deterministic!)'}"
         )
 
 

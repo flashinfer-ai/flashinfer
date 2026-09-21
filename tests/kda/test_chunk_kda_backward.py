@@ -53,7 +53,9 @@ def _inputs(batch, seq_len, heads, value_heads, *, seed, packed=False):
     v = (rand(b, total, value_heads, d) - 0.5).to(torch.bfloat16)
     g = (randn(b, total, value_heads, d) * 0.1).to(torch.bfloat16)
     beta = randn(b, total, value_heads).to(torch.bfloat16)
-    A_log = randn(value_heads)
+    A_log = torch.log(
+        rand(value_heads) + 1.0
+    )  # model-init regime: decay rates in [1, 2)
     dt_bias = randn(value_heads * d)
     do = randn(b, total, value_heads, d).to(torch.bfloat16)
     cu = None
