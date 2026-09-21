@@ -49,8 +49,10 @@ def _validate_inputs(
     if not rowwise and not colwise:
         raise ValueError("at least one of rowwise or colwise must be enabled")
     major, minor = get_compute_capability(gated_input.device)
-    if (major, minor) not in ((10, 0), (10, 3)):
-        raise RuntimeError("fused gated MXFP8 quantization requires SM100 or SM103")
+    if (major, minor) not in ((10, 0), (10, 3), (10, 7)):
+        raise RuntimeError(
+            "fused gated MXFP8 quantization requires SM100, SM103 or SM107"
+        )
     if grad_output is not None:
         if not isinstance(grad_output, torch.Tensor) or not grad_output.is_cuda:
             raise ValueError("grad_output must be a CUDA tensor")
