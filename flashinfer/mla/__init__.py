@@ -29,6 +29,8 @@ _SPARSE_MLA_SM120_LAZY_EXPORTS = frozenset(
         "SparseMLASm120Wrapper",
         "calibrate_sparse_mla_sm120",
         "supported_sparse_mla_sm120_configs",
+        "dsv41_fp4_quantize_append_sparse_mla_cache",
+        "dsv41_fp4_quantize_pack_sparse_mla_cache",
     }
 )
 
@@ -56,9 +58,9 @@ def __getattr__(name: str):
         globals()[name] = value
         return value
     if name in _SPARSE_MLA_NVFP4_SM120_LAZY_EXPORTS:
-        from . import _sparse_mla_nvfp4_sm120
+        from ._sparse_mla_sm120 import _dsv4_nvfp4
 
-        value = getattr(_sparse_mla_nvfp4_sm120, name)
+        value = getattr(_dsv4_nvfp4, name)
         globals()[name] = value
         return value
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

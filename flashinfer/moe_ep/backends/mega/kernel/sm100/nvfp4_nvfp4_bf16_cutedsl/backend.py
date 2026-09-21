@@ -132,9 +132,11 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             self.ep_rank,
             self.ep_world_size,
             gate_up_clamp=_resolve_gate_up_clamp(k),
+            swiglu_alpha=k.swiglu_alpha,
+            swiglu_beta=k.swiglu_beta,
             activation_clamp=k.activation_clamp,
             apply_topk_in_fc1=k.apply_topk_in_fc1,
-            in_kernel_fc2_reduce=k.in_kernel_fc2_reduce,
+            enable_in_kernel_fc2_reduce=k.enable_in_kernel_fc2_reduce,
             defer_topk_reduce=self._uses_native_topk_reduce(fleet_params),
             combine_dtype=k.combine_dtype,
             fc1_alpha=k.fc1_alpha,
@@ -152,7 +154,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             and fleet_params.max_tokens_per_rank in (256, 4096)
             and fleet_params.token_hidden_size == 4096
             and k.top_k == 6
-            and not k.in_kernel_fc2_reduce
+            and not k.enable_in_kernel_fc2_reduce
             and k.combine_dtype == "bf16"
             and k.apply_topk_in_fc1
         )
@@ -286,6 +288,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
     ) -> tuple:
         kcfg = self._kernel_config
         fe = workspace._frontend
+        fe.set_swiglu_params(kcfg.swiglu_alpha, kcfg.swiglu_beta)
         clamp = _resolve_gate_up_clamp(kcfg)
         if clamp is not None:
             fe.set_gate_up_clamp(clamp)
@@ -350,6 +353,8 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
                 transformed_weights[1],
                 workspace,
                 num_tokens=num_tokens,
+                swiglu_alpha=kcfg.swiglu_alpha,
+                swiglu_beta=kcfg.swiglu_beta,
                 gate_up_clamp=_resolve_gate_up_clamp(kcfg),
                 activation_clamp=kcfg.activation_clamp,
             )
@@ -364,7 +369,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         # reuse. The stream is part of the key because the thunk's launch
         # kwargs bind it at build time — a graph capture runs on a capture
         # stream and must get its own thunk or the kernel launch escapes the
-        # graph. A knobs/clamp change nulls the frontend's compiled session,
+        # graph. A knobs/activation change nulls the compiled session,
         # changing the key and forcing a rebuild through the validated path.
         state = self._prepared_thunk_state(workspace, transformed_weights)
         key, thunk, out_buf = state
@@ -422,8 +427,10 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             fp.token_hidden_size,
             2 * k.intermediate_size,
             _resolve_gate_up_clamp(k),
+            k.swiglu_alpha,
+            k.swiglu_beta,
             k.apply_topk_in_fc1,
-            k.in_kernel_fc2_reduce,
+            k.enable_in_kernel_fc2_reduce,
             self._uses_native_topk_reduce(fleet_params),
             k.combine_dtype,
             epilogue_pool_key(k.fc1_alpha),

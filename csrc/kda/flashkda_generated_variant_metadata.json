@@ -1,5 +1,5 @@
 {
-  "physical_selector_index_sha256": "d13fe2c6ea524e8758472be368ebfb45bb6c044a6fb7e43be3d1436ee71b48af",
+  "physical_selector_index_sha256": "d3c977168b08de1c4315a03d330550e4278a0880614811e956128e1973882d19",
   "physical_selector_schema_version": 1,
   "runtime_source_contract_receipt_sha256_by_arch": {
     "sm_100a": "55ccd82579c32a42406c720f6fddf432e65793ae130ff9467ff2c5fd8fbd8fb4",
@@ -15134,10 +15134,10 @@
         "grid_policy": "persistent_vtile_tasks",
         "grid_policy_evidence": "observed_positive_1d_grid",
         "observed_route_roles": [
-          "source599_vtile_m128:main"
+          "vtile_m128:main"
         ],
         "pair_packed_beta": false,
-        "route_role": "source599_vtile_m128:main",
+        "route_role": "vtile_m128:main",
         "schema_version": 2,
         "sources": {
           "affine_dependency_contract": "route_role + compiled state slots + PDL flag",
@@ -15155,7 +15155,7 @@
         "value_rows": 128,
         "value_tma_rank": 4
       },
-      "launch_contract_sha256": "6db1e12334320bfb3e3948973e088c66488153d6e1071bb3199dd4988386dfa2",
+      "launch_contract_sha256": "197d1fe372e2cb5b24ae14004c9ff673475a5bd22e603ee8f155ceca511084f8",
       "module_ident": "flashkda_bf16_fused_m128_vtile_11bf731116",
       "normalized_equivalence_sha256": "d7510230c0853eb65605ca3335a4a7635ef2315c4bc1969fad7fd15db876b38f",
       "original_body_sha256": "688c5e2ea5d8230e0943485816a3f8f44fd34b4bbbd23151edb76275e37b3ba4",
@@ -15219,14 +15219,14 @@
                 true
               ]
             ],
-            "route": "source599_vtile_m128",
+            "route": "vtile_m128",
             "route_role": "main",
             "state_mode": "fp32"
           },
-          "selector_key_sha256": "cdcae074f4abb999ca0a2c8737365bacb63c60fd4c537180bab1aa0b3cdf148a"
+          "selector_key_sha256": "3ecf61f597ce46b7a55598c8c114b8b2a2ccd5dfa97006091705b3a993ec486d"
         }
       ],
-      "physical_selectors_sha256": "b46b3c13295d5d8df435e91f4dfc31d25a89ca6c46603fa3a86568d4071d38fa",
+      "physical_selectors_sha256": "9008b1578849137d66b3955c5624588caa0d30bf4238cac37949dcba1458ecda",
       "public_common_include_relpath": "csrc/kda/flashkda_binding_common.cuh",
       "runtime_arg_count": 31,
       "sanitized_body_sha256": "5d2e3ce26fab1abcba296d261738e6425ce690751a15c2ad3cab81040be5d335",
@@ -15291,10 +15291,10 @@
         "grid_policy": "persistent_vtile_tasks",
         "grid_policy_evidence": "observed_positive_1d_grid",
         "observed_route_roles": [
-          "source599_vtile_m128:main"
+          "vtile_m128:main"
         ],
         "pair_packed_beta": false,
-        "route_role": "source599_vtile_m128:main",
+        "route_role": "vtile_m128:main",
         "schema_version": 2,
         "sources": {
           "affine_dependency_contract": "route_role + compiled state slots + PDL flag",
@@ -15312,7 +15312,7 @@
         "value_rows": 128,
         "value_tma_rank": 4
       },
-      "launch_contract_sha256": "6db1e12334320bfb3e3948973e088c66488153d6e1071bb3199dd4988386dfa2",
+      "launch_contract_sha256": "197d1fe372e2cb5b24ae14004c9ff673475a5bd22e603ee8f155ceca511084f8",
       "module_ident": "flashkda_bf16_fused_m128_vtile_4b7d3b6523",
       "normalized_equivalence_sha256": "039fc690f3fe494dc573e3106e97661b44e0c1fa617aa2cd5ca8d1a5ffe3f1ff",
       "original_body_sha256": "829674cdffbe315261155d13fc49254d5f0aac6c9b0a102e087c9e7c268de4dd",
@@ -15376,14 +15376,14 @@
                 true
               ]
             ],
-            "route": "source599_vtile_m128",
+            "route": "vtile_m128",
             "route_role": "main",
             "state_mode": "fp32"
           },
-          "selector_key_sha256": "73a8c0ec0aa627fdebfdd3af4eb3739104ae46ccde2b806b3c9cf69ab809b94b"
+          "selector_key_sha256": "2bb422b4a0fce2c39bd8e2f4008a4ecd3c81928b6525d637b666287688bbac2a"
         }
       ],
-      "physical_selectors_sha256": "5e9294834437660081d66f1c05906b2f990fc9094c2c5d6e446ea6c35f4e159e",
+      "physical_selectors_sha256": "16a17407f3936335294485ddbb65c4d856e58d9d8a4b9355939877cd9ff37a3a",
       "public_common_include_relpath": "csrc/kda/flashkda_binding_common.cuh",
       "runtime_arg_count": 31,
       "sanitized_body_sha256": "d658c80fe803d70b98986cff63d6c71796e60c3e81d97fcdedd542df2b5b1e70",
@@ -15448,10 +15448,10 @@
         "grid_policy": "persistent_vtile_tasks",
         "grid_policy_evidence": "observed_positive_1d_grid",
         "observed_route_roles": [
-          "source599_vtile_m128:main"
+          "vtile_m128:main"
         ],
         "pair_packed_beta": false,
-        "route_role": "source599_vtile_m128:main",
+        "route_role": "vtile_m128:main",
         "schema_version": 2,
         "sources": {
           "affine_dependency_contract": "route_role + compiled state slots + PDL flag",
@@ -15469,7 +15469,7 @@
         "value_rows": 128,
         "value_tma_rank": 4
       },
-      "launch_contract_sha256": "6db1e12334320bfb3e3948973e088c66488153d6e1071bb3199dd4988386dfa2",
+      "launch_contract_sha256": "197d1fe372e2cb5b24ae14004c9ff673475a5bd22e603ee8f155ceca511084f8",
       "module_ident": "flashkda_bf16_fused_m128_vtile_603e2d906d",
       "normalized_equivalence_sha256": "aecd0315df1784cb6849f1814609bdbf81b61f40b4aff122d85b9cde6a6bd02f",
       "original_body_sha256": "507f032987aac8f3959f75176ae088f1c4a8834c44c30be65005260a9ba5c723",
@@ -15533,14 +15533,14 @@
                 false
               ]
             ],
-            "route": "source599_vtile_m128",
+            "route": "vtile_m128",
             "route_role": "main",
             "state_mode": "bf16"
           },
-          "selector_key_sha256": "aeb9da4bd86f1877ed56ecb2871a0968a78d03fe86a58a1db0a16dd5cb1ae24b"
+          "selector_key_sha256": "531078093ee091cc8184d63a1a1e6d1aae12f8a5e36be8d10cd0641f24c4fd53"
         }
       ],
-      "physical_selectors_sha256": "77e3926aff261a2006b36150aa70b4b6854076455f69b6844b118a7dfa6ac4b5",
+      "physical_selectors_sha256": "9426122c1185e2f6a8f3b4b2341209a704d466af519ca5fc6dc804c4d7abbf10",
       "public_common_include_relpath": "csrc/kda/flashkda_binding_common.cuh",
       "runtime_arg_count": 31,
       "sanitized_body_sha256": "5764d78a8852b5937fa1a40937d74e60e05d1d81b34620707377dfb99b07f56c",
@@ -15605,10 +15605,10 @@
         "grid_policy": "persistent_vtile_tasks",
         "grid_policy_evidence": "observed_positive_1d_grid",
         "observed_route_roles": [
-          "source599_vtile_m128:main"
+          "vtile_m128:main"
         ],
         "pair_packed_beta": false,
-        "route_role": "source599_vtile_m128:main",
+        "route_role": "vtile_m128:main",
         "schema_version": 2,
         "sources": {
           "affine_dependency_contract": "route_role + compiled state slots + PDL flag",
@@ -15626,7 +15626,7 @@
         "value_rows": 128,
         "value_tma_rank": 4
       },
-      "launch_contract_sha256": "6db1e12334320bfb3e3948973e088c66488153d6e1071bb3199dd4988386dfa2",
+      "launch_contract_sha256": "197d1fe372e2cb5b24ae14004c9ff673475a5bd22e603ee8f155ceca511084f8",
       "module_ident": "flashkda_bf16_fused_m128_vtile_a8f9b5a463",
       "normalized_equivalence_sha256": "f5381f3e3b3565ae81eb216c1ff206d27cec068cc95af040327231cacef73269",
       "original_body_sha256": "0952ce58bd5764b8dabb840b797ea5fd0b7b983d23904b3e0d01ede682fd1d00",
@@ -15690,14 +15690,14 @@
                 true
               ]
             ],
-            "route": "source599_vtile_m128",
+            "route": "vtile_m128",
             "route_role": "main",
             "state_mode": "fp32"
           },
-          "selector_key_sha256": "ceacc712fe0a77daeae788e1b49da3deca6c5e0aada0b512c0ba4a01d8315884"
+          "selector_key_sha256": "3bccc15f97b5be317c3f9fff7e2a061c1a728e7fb4ad2a86ba6d7b71d1a57874"
         }
       ],
-      "physical_selectors_sha256": "39487e946130acb11ac030a604f6d3df7dfa52475839bb522fed1dbc81da3926",
+      "physical_selectors_sha256": "dbff78cd02b624d5b3842561437c24d3eefa7518153e8e7bdc65d75bde315400",
       "public_common_include_relpath": "csrc/kda/flashkda_binding_common.cuh",
       "runtime_arg_count": 31,
       "sanitized_body_sha256": "49dc86e1b37348f16ee545a9db9e699089b6aec1e454701ffdc8d5ec32a52601",
@@ -15762,10 +15762,10 @@
         "grid_policy": "persistent_vtile_tasks",
         "grid_policy_evidence": "observed_positive_1d_grid",
         "observed_route_roles": [
-          "source599_vtile_m128:main"
+          "vtile_m128:main"
         ],
         "pair_packed_beta": false,
-        "route_role": "source599_vtile_m128:main",
+        "route_role": "vtile_m128:main",
         "schema_version": 2,
         "sources": {
           "affine_dependency_contract": "route_role + compiled state slots + PDL flag",
@@ -15783,7 +15783,7 @@
         "value_rows": 128,
         "value_tma_rank": 4
       },
-      "launch_contract_sha256": "6db1e12334320bfb3e3948973e088c66488153d6e1071bb3199dd4988386dfa2",
+      "launch_contract_sha256": "197d1fe372e2cb5b24ae14004c9ff673475a5bd22e603ee8f155ceca511084f8",
       "module_ident": "flashkda_bf16_fused_m128_vtile_b784466ef6",
       "normalized_equivalence_sha256": "f8f1a6b400ebad1e7168790b65ebcefcc0cd4154125cfb3c5f3e439bf53bb2f1",
       "original_body_sha256": "90ded726ae5f19410fea4f903a03d0952ede0492f8a9cf75d1cee4eef1a4c4ec",
@@ -15847,14 +15847,14 @@
                 false
               ]
             ],
-            "route": "source599_vtile_m128",
+            "route": "vtile_m128",
             "route_role": "main",
             "state_mode": "bf16"
           },
-          "selector_key_sha256": "71d07c7b5f3ca5206530d84375f4f62b465d9d038b6aa8d99694c892e94c2599"
+          "selector_key_sha256": "0a8fcd569e7c8f6e63f4eb311587dbdde7ea2fc92c4c25f4fa6d2c87b37cc07b"
         }
       ],
-      "physical_selectors_sha256": "831e3bf772d4da0eb819f722753ba7c4539dacf5d283c20397282e493733e124",
+      "physical_selectors_sha256": "f3247757dcd1508eafeb2cbdbba11ad9457d519c402c502095e39b36a0e60e54",
       "public_common_include_relpath": "csrc/kda/flashkda_binding_common.cuh",
       "runtime_arg_count": 31,
       "sanitized_body_sha256": "a08e29c936013620e16fb7d88e55ee7b42a67f0b83c051179db203cd80ab814a",
@@ -15919,10 +15919,10 @@
         "grid_policy": "persistent_vtile_tasks",
         "grid_policy_evidence": "observed_positive_1d_grid",
         "observed_route_roles": [
-          "source599_vtile_m128:main"
+          "vtile_m128:main"
         ],
         "pair_packed_beta": false,
-        "route_role": "source599_vtile_m128:main",
+        "route_role": "vtile_m128:main",
         "schema_version": 2,
         "sources": {
           "affine_dependency_contract": "route_role + compiled state slots + PDL flag",
@@ -15940,7 +15940,7 @@
         "value_rows": 128,
         "value_tma_rank": 4
       },
-      "launch_contract_sha256": "6db1e12334320bfb3e3948973e088c66488153d6e1071bb3199dd4988386dfa2",
+      "launch_contract_sha256": "197d1fe372e2cb5b24ae14004c9ff673475a5bd22e603ee8f155ceca511084f8",
       "module_ident": "flashkda_bf16_fused_m128_vtile_d589dad375",
       "normalized_equivalence_sha256": "5d18ee21e55b91811c00692dbd21bce467f7a633c01ef713bb5aeb13f7cd2d95",
       "original_body_sha256": "657063e63f984a31d92cf4b6b166aee635163aa0440de65b5a058998b7422883",
@@ -16004,14 +16004,14 @@
                 false
               ]
             ],
-            "route": "source599_vtile_m128",
+            "route": "vtile_m128",
             "route_role": "main",
             "state_mode": "bf16"
           },
-          "selector_key_sha256": "fff77b3fa17aa012e724a3a3b98996f029aaab01efdfc03c504dfc89792c66b2"
+          "selector_key_sha256": "be94810e15caa26264aca1e4819e3d656bdacba4370066111b1d159adf4dac13"
         }
       ],
-      "physical_selectors_sha256": "f75172e884d50f1f375cae8560344e2d3286b674eeaae15d4106a94694f1bf26",
+      "physical_selectors_sha256": "9e765912ddedcfa000fae3a1359e524254455853d9420978ca67c25ef4caa047",
       "public_common_include_relpath": "csrc/kda/flashkda_binding_common.cuh",
       "runtime_arg_count": 31,
       "sanitized_body_sha256": "aa6ec727b1daa0e51d8cd43ac5665ec4ea09f062f41521971c191d147fb1237c",

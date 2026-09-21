@@ -1,0 +1,651 @@
+{
+  "cuda_headers": [
+    {
+      "path": "cuda/cake_gdn_cp_common.cuh",
+      "sha256": "58977b0805adba62e0f07df9e3e90d4b46754fc672f02deef6c27f0b55952777"
+    }
+  ],
+  "kernels": [
+    {
+      "host_binding": {
+        "entry": "run_qk_norm",
+        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_qk_norm_f16_v1_ce46676b6e",
+        "path": "host/cake_gdn_cp_qk_norm.cc",
+        "sha256": "0a13097c2e839931749dcdb1d9290f585fc39d4886e70d3c4f3d95fc3f34f3cd"
+      },
+      "name": "qk_norm",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_100a",
+            "sm_103a"
+          ],
+          "path": "cuda/cake_gdn_cp_qk_norm.cu",
+          "sha256": "ba941d048ed69b841dc55f04943ed422cb30844d5d435a6d5bb73e7d3a7528cb"
+        }
+      ]
+    },
+    {
+      "host_binding": {
+        "entry": "run_qk_norm_bf16",
+        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_qk_norm_bf16_v1_8342e61030",
+        "path": "host/cake_gdn_cp_qk_norm_bf16.cc",
+        "sha256": "6bddbaabdc8f3a6b7185a2051b83794c07e098a076e54ea21ffca2ade79c651c"
+      },
+      "name": "qk_norm_bf16",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_100a",
+            "sm_103a"
+          ],
+          "path": "cuda/cake_gdn_cp_qk_norm_bf16.cu",
+          "sha256": "fd48b6fb21d5a09301344b4fb795046b0f52c2fb00eb4caca31f3ab342cd18e8"
+        }
+      ]
+    },
+    {
+      "host_binding": {
+        "entry": "run_t_precompute",
+        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_t_precompute_v1_7fd81ceb1b",
+        "path": "host/cake_gdn_cp_t_precompute.cc",
+        "sha256": "fc27b570aed43cf7415860cf540cb9a7c7b0604ffa7ce6556508afea798587f7"
+      },
+      "name": "t_precompute",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_100a",
+            "sm_103a"
+          ],
+          "path": "cuda/cake_gdn_cp_t_precompute.cu",
+          "sha256": "271d12fc1960431fb81964ee6015ff40e8f6ab1e3ccaf2cca464a7a78af2d039"
+        }
+      ]
+    },
+    {
+      "host_binding": {
+        "entry": "run_t_precompute_bf16",
+        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_t_precompute_bf16_v1_75841827ff",
+        "path": "host/cake_gdn_cp_t_precompute_bf16.cc",
+        "sha256": "34ea9d53b6d6b7f12af3a10aeccd94f24bfc23f0f8e280362d57cd108527a2b6"
+      },
+      "name": "t_precompute_bf16",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_100a",
+            "sm_103a"
+          ],
+          "path": "cuda/cake_gdn_cp_t_precompute_bf16.cu",
+          "sha256": "a45243735072bee72f4ebc7e3dc912225360410b779fc553b4239d3f1e416f62"
+        }
+      ]
+    },
+    {
+      "host_binding": {
+        "entry": "run_t_precompute_gb300_hv48_min6",
+        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_t_precompute_v1_gb300_hv48_min6_6ea8bfdf97",
+        "path": "host/cake_gdn_cp_t_precompute_gb300_hv48_min6.cc",
+        "sha256": "1203323cbb3e7b5dc3d135e9816181cdb8fe7ffb95e38558d6df626deb2e4b7f"
+      },
+      "name": "t_precompute_gb300_hv48_min6",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_103a"
+          ],
+          "path": "cuda/cake_gdn_cp_t_precompute_gb300_hv48_min6.sm_103a.cu",
+          "sha256": "9e8fd7971fa3a37d5213ef85da383244a4b2c2619820859b29e4459eca1207f0"
+        }
+      ]
+    },
+    {
+      "host_binding": {
+        "entry": "run_mn_precompute",
+        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_mn_precompute_v1_b57ef1a2f1",
+        "path": "host/cake_gdn_cp_mn_precompute.cc",
+        "sha256": "1b06657c0e0ad5e6617e4fc13fa38ef4802091df229bedcf1daa1687f2d24f47"
+      },
+      "name": "mn_precompute",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_100a",
+            "sm_103a"
+          ],
+          "path": "cuda/cake_gdn_cp_mn_precompute.cu",
+          "sha256": "bbad5121439d12484483dd4dcae44fbfb2bd23c3702bd67a72918d7dbff1bc12"
+        }
+      ]
+    },
+    {
+      "host_binding": {
+        "entry": "run_mn_precompute_bf16",
+        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_mn_precompute_bf16_v1_4081f2c0ac",
+        "path": "host/cake_gdn_cp_mn_precompute_bf16.cc",
+        "sha256": "216a40648ee3909b333b75df30a8e85f7ea249215e943c2b536436215ef78cc9"
+      },
+      "name": "mn_precompute_bf16",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_100a",
+            "sm_103a"
+          ],
+          "path": "cuda/cake_gdn_cp_mn_precompute_bf16.cu",
+          "sha256": "adac193f319e9276b2220264046fd657de6e02575bcbff2a871f5d4d48b1ba07"
+        }
+      ]
+    },
+    {
+      "host_binding": {
+        "entry": "run_state_fixup_simt_row4",
+        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_fixup_v1_0191fade82",
+        "path": "host/cake_gdn_cp_state_fixup_simt_row4.cc",
+        "sha256": "025a568e22f0bfba357d3c49192878c4f83ef815f51ae53359af03f7d3a0cd5f"
+      },
+      "name": "state_fixup_simt_row4",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_100a",
+            "sm_103a"
+          ],
+          "path": "cuda/cake_gdn_cp_state_fixup_simt_row4.cu",
+          "sha256": "d0138621d0219deb663a13da28210813d1877bcb8193ed7f3108fa33eccbed3e"
+        }
+      ]
+    },
+    {
+      "host_binding": {
+        "entry": "run_normalized_final_state",
+        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_final_state_v1_e62e24437e",
+        "path": "host/cake_gdn_cp_normalized_final_state.cc",
+        "sha256": "c5bb3bc7b207018d6a31df8bb59b21d5b37fadf89d3d13412d3637d74a8f4176"
+      },
+      "name": "normalized_final_state",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_100a",
+            "sm_103a"
+          ],
+          "path": "cuda/cake_gdn_cp_normalized_final_state.cu",
+          "sha256": "c7284ea76e7ae2fc9904359db223c6003c211db296640080891c4cbe80f36e81"
+        }
+      ]
+    },
+    {
+      "host_binding": {
+        "entry": "run_normalized_final_state_bf16",
+        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_final_state_bf16_v1_d6bc7179dc",
+        "path": "host/cake_gdn_cp_normalized_final_state_bf16.cc",
+        "sha256": "a5aab424cf95b8d22485a8ceb638a863600c8fed5afe14af961986468a2178ff"
+      },
+      "name": "normalized_final_state_bf16",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_100a",
+            "sm_103a"
+          ],
+          "path": "cuda/cake_gdn_cp_normalized_final_state_bf16.cu",
+          "sha256": "37c14e8e194c741b3504736ba1ec84b8d6a1209c2da624acb2ca5a7d4c1e4411"
+        }
+      ]
+    },
+    {
+      "host_binding": {
+        "entry": "run_state_gather_fp32",
+        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_state_gather_fp32_v1_3b0042d7ba",
+        "path": "host/cake_gdn_cp_state_gather_fp32.cc",
+        "sha256": "7433a9278caa50462ba61f1bc217076fd3c41c396f6558562633b58d7cf695a2"
+      },
+      "name": "state_gather_fp32",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_100a",
+            "sm_103a"
+          ],
+          "path": "cuda/cake_gdn_cp_state_gather_fp32.cu",
+          "sha256": "fc409ef34d707a6d9921ca7f6adc19bc6980365a1ce6d835b61647d8696ecd88"
+        }
+      ]
+    },
+    {
+      "host_binding": {
+        "entry": "run_state_gather_fp16",
+        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_state_gather_fp16_v1_86932d768d",
+        "path": "host/cake_gdn_cp_state_gather_fp16.cc",
+        "sha256": "dfb5dc43c19d3965d0d60480e209fd11c39111ab6027ffc94a82de983fe30947"
+      },
+      "name": "state_gather_fp16",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_100a",
+            "sm_103a"
+          ],
+          "path": "cuda/cake_gdn_cp_state_gather_fp16.cu",
+          "sha256": "6afc5ccbf1a9a5c8dc8339a98ea6c310ac89721a3bf1cc9e4e0c49543ac69939"
+        }
+      ]
+    },
+    {
+      "host_binding": {
+        "entry": "run_state_gather_bf16",
+        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_state_gather_bf16_v1_665cd7a56a",
+        "path": "host/cake_gdn_cp_state_gather_bf16.cc",
+        "sha256": "85db5f93bc63988aa14dd05f07117993a545f50fb44e3a6d0d2c3982b17fce0c"
+      },
+      "name": "state_gather_bf16",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_100a",
+            "sm_103a"
+          ],
+          "path": "cuda/cake_gdn_cp_state_gather_bf16.cu",
+          "sha256": "64c4d3041a2c14841c293bbb86cd6b6761ec9ec71f09aa9e7bc9c721d349efef"
+        }
+      ]
+    },
+    {
+      "host_binding": {
+        "entry": "run_state_gather_fp32_int64",
+        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_state_gather_fp32_int64_v1_2dd85fe047",
+        "path": "host/cake_gdn_cp_state_gather_fp32_int64.cc",
+        "sha256": "4599f471a9d0b1d13257260a3b16d8f75f2eb50b1e869d6d28379e8f7208fdcc"
+      },
+      "name": "state_gather_fp32_int64",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_100a",
+            "sm_103a"
+          ],
+          "path": "cuda/cake_gdn_cp_state_gather_fp32_int64.cu",
+          "sha256": "d489c7009c9c2af712a6d92ed8950df39db13606e4959485282b30b88b9228ba"
+        }
+      ]
+    },
+    {
+      "host_binding": {
+        "entry": "run_state_gather_fp16_int64",
+        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_state_gather_fp16_int64_v1_2b5960f72c",
+        "path": "host/cake_gdn_cp_state_gather_fp16_int64.cc",
+        "sha256": "3a2104ded4792fd5f9c73f203e5f119568febc70445dca385a3a28c4f0319a14"
+      },
+      "name": "state_gather_fp16_int64",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_100a",
+            "sm_103a"
+          ],
+          "path": "cuda/cake_gdn_cp_state_gather_fp16_int64.cu",
+          "sha256": "aa6b94c673db6e5381462d3b48b7fac562ef3175e6378245a8f31a09c6102150"
+        }
+      ]
+    },
+    {
+      "host_binding": {
+        "entry": "run_state_gather_bf16_int64",
+        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_state_gather_bf16_int64_v1_5a09e13ec3",
+        "path": "host/cake_gdn_cp_state_gather_bf16_int64.cc",
+        "sha256": "63dff8b783bc0a8fb9577902ff088ac8eaef269d41e1e9663d59bea5be7a7030"
+      },
+      "name": "state_gather_bf16_int64",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_100a",
+            "sm_103a"
+          ],
+          "path": "cuda/cake_gdn_cp_state_gather_bf16_int64.cu",
+          "sha256": "91a21c49ef0748527251bb5390431aa461532715de146c01b53de9537c411054"
+        }
+      ]
+    },
+    {
+      "host_binding": {
+        "entry": "run_state_scatter_fp32",
+        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_state_scatter_fp32_v1_03ed3ee1b9",
+        "path": "host/cake_gdn_cp_state_scatter_fp32.cc",
+        "sha256": "11a3657724141a075da986a052e66d9faceed83a4fa2d9876a0147867c0654c9"
+      },
+      "name": "state_scatter_fp32",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_100a",
+            "sm_103a"
+          ],
+          "path": "cuda/cake_gdn_cp_state_scatter_fp32.cu",
+          "sha256": "98f5c4de83f98aa792bd2873a2db1c3794f5c8dbd4f26c9ff29955c8a1269148"
+        }
+      ]
+    },
+    {
+      "host_binding": {
+        "entry": "run_state_scatter_fp16",
+        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_state_scatter_fp16_v1_03aee7553b",
+        "path": "host/cake_gdn_cp_state_scatter_fp16.cc",
+        "sha256": "5ef20931c8fd166cdb0473f23e1d70c37514950fe421b6eee2aa37e5e37457cb"
+      },
+      "name": "state_scatter_fp16",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_100a",
+            "sm_103a"
+          ],
+          "path": "cuda/cake_gdn_cp_state_scatter_fp16.cu",
+          "sha256": "f71711a15e1d5eb5c422bef71408d3534a77dd2a4ab6fbda5eab67a2c7b85812"
+        }
+      ]
+    },
+    {
+      "host_binding": {
+        "entry": "run_state_scatter_bf16",
+        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_state_scatter_bf16_v1_e3d96fd173",
+        "path": "host/cake_gdn_cp_state_scatter_bf16.cc",
+        "sha256": "9cd15aa9c75d76681598cb09d66c668a75a4bbe38df6ab204cac0d7cc4109f67"
+      },
+      "name": "state_scatter_bf16",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_100a",
+            "sm_103a"
+          ],
+          "path": "cuda/cake_gdn_cp_state_scatter_bf16.cu",
+          "sha256": "86f834409532d84fd850651fd4b280c95affd1308eebbfe5335a83d91f9f6de5"
+        }
+      ]
+    },
+    {
+      "host_binding": {
+        "entry": "run_state_scatter_fp32_int64",
+        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_state_scatter_fp32_int64_v1_7316f26992",
+        "path": "host/cake_gdn_cp_state_scatter_fp32_int64.cc",
+        "sha256": "42f87dee00275f86ddf658a05e66b7ea2f5af18117c246d72dcac535bb443a88"
+      },
+      "name": "state_scatter_fp32_int64",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_100a",
+            "sm_103a"
+          ],
+          "path": "cuda/cake_gdn_cp_state_scatter_fp32_int64.cu",
+          "sha256": "0bd37815d1d023e33ea54db7234fa15eddc822ab159879c0e244929dbdd52c1b"
+        }
+      ]
+    },
+    {
+      "host_binding": {
+        "entry": "run_state_scatter_fp16_int64",
+        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_state_scatter_fp16_int64_v1_2aef11f178",
+        "path": "host/cake_gdn_cp_state_scatter_fp16_int64.cc",
+        "sha256": "1975666addeb43c0530ef3a7421dff2415ad90f1663bbb506557610642386d7e"
+      },
+      "name": "state_scatter_fp16_int64",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_100a",
+            "sm_103a"
+          ],
+          "path": "cuda/cake_gdn_cp_state_scatter_fp16_int64.cu",
+          "sha256": "db74597700508575f03ac086b809a3ff8133a1e05b90d9c6483bb96560694b3a"
+        }
+      ]
+    },
+    {
+      "host_binding": {
+        "entry": "run_state_scatter_bf16_int64",
+        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_state_scatter_bf16_int64_v1_c266bcbd46",
+        "path": "host/cake_gdn_cp_state_scatter_bf16_int64.cc",
+        "sha256": "f92abaf72b01ccfc1b93aef9fe923243ac16b30fa5f88566831c0088d56454ee"
+      },
+      "name": "state_scatter_bf16_int64",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_100a",
+            "sm_103a"
+          ],
+          "path": "cuda/cake_gdn_cp_state_scatter_bf16_int64.cu",
+          "sha256": "f584ebed8ab1aaa8c7349dff048a2a6fb375946822d2360dd8637d745eec0fc9"
+        }
+      ]
+    },
+    {
+      "host_binding": {
+        "entry": "run_state_fixup_utcmma64",
+        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_fixup_utcmma64_v1_e12079adf3",
+        "path": "host/cake_gdn_cp_state_fixup_utcmma64.cc",
+        "sha256": "ce566c71a16f6283578d2f144cc6c1e238053d4c528f60166f84a9dc69bfde6b"
+      },
+      "name": "state_fixup_utcmma64",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_100a",
+            "sm_103a"
+          ],
+          "path": "cuda/cake_gdn_cp_state_fixup_utcmma64.cu",
+          "sha256": "4cb8c699a32b04ced0a2912e64480b86981844cf90c1165b74737016ab5a81e1"
+        }
+      ]
+    },
+    {
+      "host_binding": {
+        "entry": "run_state_fixup_utcmma128",
+        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_fixup_utcmma128_v1_c3f835ae4f",
+        "path": "host/cake_gdn_cp_state_fixup_utcmma128.cc",
+        "sha256": "93157d636a9bfe2431604d450f58093177d30574ea14f8654fab69ed324793d1"
+      },
+      "name": "state_fixup_utcmma128",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_100a",
+            "sm_103a"
+          ],
+          "path": "cuda/cake_gdn_cp_state_fixup_utcmma128.cu",
+          "sha256": "6b57aa044446c0f21defe988c30f605f48fd20def0d6b3a82c9fb778fb4d4167"
+        }
+      ]
+    },
+    {
+      "host_binding": {
+        "entry": "run_cp_prefill",
+        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_final_v1_fefee14703",
+        "path": "host/cake_gdn_cp_cp_prefill.cc",
+        "sha256": "8aef8212d7ec00b0a05f6603185b035373ef300ee0a8af2d49936ffae227ca2b"
+      },
+      "name": "cp_prefill",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_100a"
+          ],
+          "path": "cuda/cake_gdn_cp_cp_prefill.sm_100a.cu",
+          "sha256": "c592d7989e93746bb74e27dfe9eaaa98ddb81a4a37e7412939ca3b3ae38bec5c"
+        },
+        {
+          "architectures": [
+            "sm_103a"
+          ],
+          "path": "cuda/cake_gdn_cp_cp_prefill.sm_103a.cu",
+          "sha256": "be31753fe629665b9029051fcdfb0b9885b50e84608d1cbf3cf40c8dacd428cc"
+        }
+      ]
+    },
+    {
+      "host_binding": {
+        "entry": "run_cp_prefill_checkpoint",
+        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_final_v1_972249da36",
+        "path": "host/cake_gdn_cp_cp_prefill_checkpoint.cc",
+        "sha256": "f721c7c159df10abd60b018bcdeb2cd9015b8fe041b7123ecafd8f669ef6da7c"
+      },
+      "name": "cp_prefill_checkpoint",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_100a"
+          ],
+          "path": "cuda/cake_gdn_cp_cp_prefill_checkpoint.sm_100a.cu",
+          "sha256": "be31753fe629665b9029051fcdfb0b9885b50e84608d1cbf3cf40c8dacd428cc"
+        }
+      ]
+    },
+    {
+      "host_binding": {
+        "entry": "run_cp_prefill_equal_head",
+        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_final_equal_head_v1_6b9596645a",
+        "path": "host/cake_gdn_cp_cp_prefill_equal_head.cc",
+        "sha256": "15003ed47e0245c11b7272f2307d9f65d547ffc3a8d259ae6a276f081393a7fd"
+      },
+      "name": "cp_prefill_equal_head",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_103a"
+          ],
+          "path": "cuda/cake_gdn_cp_cp_prefill_equal_head.sm_103a.cu",
+          "sha256": "9b03122b110820e56e8ce5b9a1b70c30f9a3074ef885931aa501c1c587759dff"
+        },
+        {
+          "architectures": [
+            "sm_100a"
+          ],
+          "path": "cuda/cake_gdn_cp_cp_prefill_equal_head.sm_100a.cu",
+          "sha256": "d55d338dbe4f12374d848b0b20a935098fdcdecec87088928a0763cde4159e4b"
+        }
+      ]
+    },
+    {
+      "host_binding": {
+        "entry": "run_cp_prefill_equal_head_checkpoint",
+        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_final_equal_head_v1_20fa68f0c4",
+        "path": "host/cake_gdn_cp_cp_prefill_equal_head_checkpoint.cc",
+        "sha256": "8822c06f1ddd1225a05a85809e312b3c3101f964f172d18a973d709bc2484a31"
+      },
+      "name": "cp_prefill_equal_head_checkpoint",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_100a"
+          ],
+          "path": "cuda/cake_gdn_cp_cp_prefill_equal_head_checkpoint.sm_100a.cu",
+          "sha256": "9b03122b110820e56e8ce5b9a1b70c30f9a3074ef885931aa501c1c587759dff"
+        }
+      ]
+    },
+    {
+      "host_binding": {
+        "entry": "run_cp_prefill_equal_head_h32",
+        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_final_equal_head_h32_v1_491d534d72",
+        "path": "host/cake_gdn_cp_cp_prefill_equal_head_h32.cc",
+        "sha256": "cbbca190eb15845f17803185208aebc324d282439ee925f4400f251f6fe4fc6d"
+      },
+      "name": "cp_prefill_equal_head_h32",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_103a"
+          ],
+          "path": "cuda/cake_gdn_cp_cp_prefill_equal_head_h32.sm_103a.cu",
+          "sha256": "c30390861164b5f409f55132ded1f4fe244ae521fbd33ff7ba11998a25b78a2a"
+        }
+      ]
+    },
+    {
+      "host_binding": {
+        "entry": "run_cp_prefill_bf16",
+        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_final_bf16_v1_4affd36e88",
+        "path": "host/cake_gdn_cp_cp_prefill_bf16.cc",
+        "sha256": "37cddbc2825774f96d9761dc0921b0d67b2d033b57bf3d5c59fed23678d6d813"
+      },
+      "name": "cp_prefill_bf16",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_100a",
+            "sm_103a"
+          ],
+          "path": "cuda/cake_gdn_cp_cp_prefill_bf16.cu",
+          "sha256": "4542bc6f4576d9a00d59ce7437f010322a592e3df390d33a678cee24b0fe5e32"
+        }
+      ]
+    },
+    {
+      "host_binding": {
+        "entry": "run_cp_prefill_generic",
+        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_final_generic_v1_240d57767a",
+        "path": "host/cake_gdn_cp_cp_prefill_generic.cc",
+        "sha256": "3c11a6dacb9d01dedb2d7b55d47931ed8e8b22e39e917c5a509739b7ce135027"
+      },
+      "name": "cp_prefill_generic",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_100a"
+          ],
+          "path": "cuda/cake_gdn_cp_cp_prefill_generic.sm_100a.cu",
+          "sha256": "a6649e6db0b52500a2ac674a6981eba33bb1220f32d39647b74e97b2be20a32e"
+        },
+        {
+          "architectures": [
+            "sm_103a"
+          ],
+          "path": "cuda/cake_gdn_cp_cp_prefill_generic.sm_103a.cu",
+          "sha256": "9babe124f6164c198154c0eb16bae6fc5a7a9eb37810a8802f62de89462d116a"
+        }
+      ]
+    },
+    {
+      "host_binding": {
+        "entry": "run_cp_prefill_generic_checkpoint",
+        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_final_generic_v1_60056dbe9c",
+        "path": "host/cake_gdn_cp_cp_prefill_generic_checkpoint.cc",
+        "sha256": "9f9fc2d8c76578375cb1832d9530de36f898692e8cb865aa657192d5898b536d"
+      },
+      "name": "cp_prefill_generic_checkpoint",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_100a"
+          ],
+          "path": "cuda/cake_gdn_cp_cp_prefill_generic_checkpoint.sm_100a.cu",
+          "sha256": "9babe124f6164c198154c0eb16bae6fc5a7a9eb37810a8802f62de89462d116a"
+        }
+      ]
+    },
+    {
+      "host_binding": {
+        "entry": "run_cp_prefill_generic_bf16",
+        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_final_generic_bf16_v1_3d3b0d5235",
+        "path": "host/cake_gdn_cp_cp_prefill_generic_bf16.cc",
+        "sha256": "56f971e4694c81edc9f92c6ee9fa760f60317429f5eb7b4c8db57b99a54dcf22"
+      },
+      "name": "cp_prefill_generic_bf16",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_100a",
+            "sm_103a"
+          ],
+          "path": "cuda/cake_gdn_cp_cp_prefill_generic_bf16.cu",
+          "sha256": "151e14ba5213d71af9c84937287c28deebc4985300e57e16aeff4ff62b0d3ae5"
+        }
+      ]
+    }
+  ],
+  "schema": "flashinfer.gdn_cp.runtime_manifest.v1"
+}

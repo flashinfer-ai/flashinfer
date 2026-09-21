@@ -1926,7 +1926,7 @@ def test_persistent_policy_uses_physical_arch_and_sm_count_independently():
             "direct_m128",
         ),
         (
-            "source599_vtile_m128",
+            "vtile_m128",
             "main",
             "bf16",
             {

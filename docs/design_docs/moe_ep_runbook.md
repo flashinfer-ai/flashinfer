@@ -69,7 +69,7 @@ meant to compare against the reference tables.
 
 History: this section used to be a hard `==4.6.1` pin because 4.7.0 crashed
 every 4-rank `deep_gemm.fp8_fp4_mega_moe` launch with
-`CUDA_ERROR_MISALIGNED_ADDRESS` (bisected 2026-08-05 on prenyx B200). The
+`CUDA_ERROR_MISALIGNED_ADDRESS` (bisected 2026-08-05 on B200). The
 root cause was not deep_gemm or the dsl's bundled CUDA libs but the fused
 activation-quant staging (`DataPreprocess` in
 `kernel_src/cutedsl_megamoe/src/src/inputs_process.py`), shared by every mega
@@ -541,7 +541,8 @@ def get_symm_buffer_for_<name>_mega_moe(
     world_size: int,            # self.ep_world_size
     *,
     kind=...,                   # dtype selector, if applicable
-    # ... kernel knobs: clamps, in_kernel_fc2_reduce, token_back_by_dispatch, ...
+    # ... session params: clamps, enable_in_kernel_fc2_reduce, ...
+    knobs=...,                  # tile/schedule/token-back tactics, or None
 ) -> <Name>SymmBuffer: ...
 ```
 

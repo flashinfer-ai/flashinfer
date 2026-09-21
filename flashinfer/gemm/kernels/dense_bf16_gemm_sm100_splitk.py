@@ -24,9 +24,6 @@ from cutlass.cute.nvgpu import tcgen05
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
 
-from ...jit.cute_dsl_core import build_and_load_cute_dsl_kernel
-
-
 #: Per-CTA SMEM capacity reported by CuTeDSL on SM100/SM103.
 _SMEM_CAPACITY_BYTES = utils.get_smem_capacity_in_bytes("sm_100")
 
@@ -857,9 +854,9 @@ def _bmm_bias(
 
 
 def _from_dlpack_dynamic(tensor, leading_dim: int, assumed_align: int = 32):
-    return from_dlpack(tensor, assumed_align=assumed_align).mark_layout_dynamic(
-        leading_dim=leading_dim
-    )
+    return from_dlpack(
+        tensor.detach(), assumed_align=assumed_align
+    ).mark_layout_dynamic(leading_dim=leading_dim)
 
 
 def _detect_leading_dim(tensor: _torch.Tensor) -> int:
@@ -913,18 +910,24 @@ def _make_compile_repr_tensors(
     )
 
 
-def _make_swapped_tensors(a, b, out, bias):
+def _to_cute_swap(a, b, out, bias):
     tensors = (
         b.unsqueeze(0).transpose(-2, -1),
         a.unsqueeze(0).transpose(-2, -1),
         out.unsqueeze(0).transpose(-2, -1),
     )
+    leading_dims = tuple(_detect_leading_dim(tensor) for tensor in tensors)
     return (
-        *tensors,
-        bias.as_strided(size=tensors[2].shape, stride=(0, 1, 0))
+        *(
+            _from_dlpack_dynamic(tensor, leading_dim)
+            for tensor, leading_dim in zip(tensors, leading_dims, strict=True)
+        ),
+        _from_dlpack_dynamic(
+            bias.as_strided(size=tensors[2].shape, stride=(0, 1, 0)), 1, 2
+        )
         if bias is not None
         else None,
-        tuple(_detect_leading_dim(tensor) for tensor in tensors),
+        leading_dims,
     )
 
 
@@ -942,25 +945,13 @@ def _get_compiled_splitk_kernel(
             f"split-K dense GEMM supports {_SUPPORTED_TORCH_DTYPES}; got {dtype}"
         )
 
-    def compile_kernel():
+    with _torch.cuda.device(device_index):
         compile_tensors = _make_compile_repr_tensors(dtype, has_bias, *leading_dims)
         return cute_ext.compile(
             _bmm_bias if has_bias else _bmm_no_bias,
             SplitKDenseGemmKernel(tactic=tactic, use_pdl=use_pdl, has_bias=has_bias),
             *(compile_tensors if has_bias else compile_tensors[:3]),
-            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-            options="--enable-tvm-ffi",
-        )
-
-    with _torch.cuda.device(device_index):
-        return build_and_load_cute_dsl_kernel(
-            "dense_bf16_gemm_sm100_splitk",
-            f"{str(dtype).removeprefix('torch.')}_m{tactic.mma_m}_n{tactic.mma_n}"
-            f"_split{tactic.split_k}_stages{tactic.ab_stages}"
-            f"_la{leading_dims[0]}_lb{leading_dims[1]}_lc{leading_dims[2]}"
-            f"_pdl{int(use_pdl)}_bias{int(has_bias)}",
-            compile_kernel,
-            extra_key_files=(__file__,),
+            _cuda.CUstream(_torch.cuda.current_stream().cuda_stream),
         )
 
 
@@ -1016,8 +1007,8 @@ def run_splitk_dense(
     """Run ``A[M,K] @ B[K,N]`` with the ``mm_bf16`` layouts."""
     validate_tactic(tactic, *_validate_runtime_tensors(a, b, bias, out))
     has_bias = bias is not None
-    tensors = _make_swapped_tensors(a, b, out, bias)
     with _torch.cuda.device(a.device):
+        tensors = _to_cute_swap(a, b, out, bias)
         compiled = _get_compiled_splitk_kernel(
             device_index=a.get_device(),
             dtype=a.dtype,
@@ -1026,5 +1017,8 @@ def run_splitk_dense(
             has_bias=has_bias,
             leading_dims=tensors[4],
         )
-        compiled(*(tensors[:4] if has_bias else tensors[:3]))
+        compiled(
+            *(tensors[:4] if has_bias else tensors[:3]),
+            _cuda.CUstream(_torch.cuda.current_stream(a.device).cuda_stream),
+        )
     return out

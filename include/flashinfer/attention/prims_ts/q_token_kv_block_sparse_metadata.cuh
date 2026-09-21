@@ -29,13 +29,20 @@ namespace flashinfer {
 namespace attention {
 namespace prims_ts {
 
-constexpr int kQTokenKvBlockSparseSparseBlockSize = 4;
 constexpr int kQTokenKvBlockSparseMaxBlockTopK = 512;
 constexpr int kQTokenKvBlockSparseMembershipsPerWord = 4;
 constexpr int kQTokenKvBlockSparseQ1BlockThreads = 256;
 
 template <int GroupSize>
-struct QTokenKvBlockSparseTouchedMetadataKernelTraits;
+struct QTokenKvBlockSparseTouchedMetadataKernelTraits {
+  static_assert(GroupSize >= 3 && GroupSize <= 8);
+  static constexpr int kMaxCandidates = GroupSize * (kQTokenKvBlockSparseMaxBlockTopK + 1);
+  // Increase per-thread storage only when four keys would exceed the CUDA
+  // 1024-thread CTA limit. Round the resulting CTA up to a complete warp.
+  static constexpr int kItemsPerThread = kMaxCandidates <= 1024 * 4 ? 4 : 8;
+  static constexpr int kBlockThreads =
+      ((kMaxCandidates + 32 * kItemsPerThread - 1) / (32 * kItemsPerThread)) * 32;
+};
 
 // Keep enough independent warps to fill a Blackwell wave when decode exposes
 // only a few query groups.  The per-group traits keep schedule tuning separate
@@ -45,18 +52,6 @@ template <>
 struct QTokenKvBlockSparseTouchedMetadataKernelTraits<2> {
   static constexpr int kBlockThreads = 384;
   static constexpr int kItemsPerThread = 3;
-};
-
-template <>
-struct QTokenKvBlockSparseTouchedMetadataKernelTraits<4> {
-  static constexpr int kBlockThreads = 544;
-  static constexpr int kItemsPerThread = 4;
-};
-
-template <>
-struct QTokenKvBlockSparseTouchedMetadataKernelTraits<5> {
-  static constexpr int kBlockThreads = 672;
-  static constexpr int kItemsPerThread = 4;
 };
 
 template <typename PositionType>
@@ -75,6 +70,7 @@ struct QTokenKvBlockSparseTouchedMetadataParams {
 
   int64_t block_indices_row_stride;
   int64_t block_indices_column_stride;
+  int64_t block_indices_head_stride;
   int64_t block_table_request_stride;
   int64_t block_table_page_stride;
 
@@ -88,9 +84,14 @@ struct QTokenKvBlockSparseTouchedMetadataParams {
   int32_t max_seq_len_kv;
   int32_t model_block_bound;
   int32_t model_radix_end_bit;
+  int32_t sparse_block_size;
+  int32_t sparse_block_shift;
+  int32_t fragment_size;
+  int32_t fragments_per_block;
 
   uint_fastdiv candidates_per_query;
   uint_fastdiv subpages_per_storage_page;
+  uint_fastdiv pattern_heads;
   bool release_pdl;
 };
 
@@ -162,13 +163,14 @@ __device__ __forceinline__ void InitRoute(
   int32_t first_row;
   int32_t row_end;
   bool valid;
+  const uint32_t group = blockIdx.x / params.pattern_heads;
   if constexpr (PackedQuery) {
-    first_row = params.qo_indptr[blockIdx.x];
-    row_end = params.qo_indptr[blockIdx.x + 1];
+    first_row = params.qo_indptr[group];
+    row_end = params.qo_indptr[group + 1];
     valid = first_row >= 0 && row_end > first_row && row_end <= params.rows &&
             row_end - first_row <= GroupSize;
   } else {
-    first_row = static_cast<int32_t>(blockIdx.x) * GroupSize;
+    first_row = static_cast<int32_t>(group) * GroupSize;
     row_end = first_row + GroupSize;
     valid = row_end <= params.rows;
   }
@@ -207,33 +209,51 @@ __device__ __forceinline__ void InitRoute(
 }
 
 template <typename PositionType>
-__device__ __forceinline__ void StorePageMetadata(
-    const QTokenKvBlockSparseTouchedMetadataParams<PositionType>& params,
-    const QTokenKvBlockSparseRouteState& route, uint32_t logical_block, uint8_t membership,
-    int32_t output_rank, int32_t* group_indices, uint8_t* group_memberships) {
+__device__ __forceinline__ int32_t
+ResolveFragment(const QTokenKvBlockSparseTouchedMetadataParams<PositionType>& params,
+                const QTokenKvBlockSparseRouteState& route, uint32_t logical_fragment) {
   uint32_t storage_page;
   uint32_t subpage;
-  params.subpages_per_storage_page.divmod(logical_block, storage_page, subpage);
-
-  int32_t locator = -1;
-  uint8_t output_membership = 0;
+  params.subpages_per_storage_page.divmod(logical_fragment, storage_page, subpage);
   if (storage_page < static_cast<uint32_t>(params.page_table_width)) {
     const int32_t physical_page =
         params.block_table[static_cast<int64_t>(route.request) * params.block_table_request_stride +
                            static_cast<int64_t>(storage_page) * params.block_table_page_stride];
     if (physical_page >= 0) {
-      // The prepared plan proves that the cache's largest encoded locator
-      // fits signed Int32. Dense block-table entries are trusted cache-page
-      // IDs under the same contract, so no per-union-page Int64 proof belongs
-      // in this hot path.
-      locator = static_cast<int32_t>(static_cast<uint32_t>(physical_page) *
-                                         static_cast<uint32_t>(params.subpages_per_storage_page) +
-                                     subpage);
-      output_membership = membership;
+      return static_cast<int32_t>(static_cast<uint32_t>(physical_page) *
+                                      static_cast<uint32_t>(params.subpages_per_storage_page) +
+                                  subpage);
     }
   }
-  group_indices[output_rank] = locator;
-  group_memberships[output_rank] = output_membership;
+  return -1;
+}
+
+template <typename PositionType>
+__device__ __forceinline__ void StorePageMetadata(
+    const QTokenKvBlockSparseTouchedMetadataParams<PositionType>& params,
+    const QTokenKvBlockSparseRouteState& route, uint32_t logical_block, uint8_t membership,
+    int32_t output_rank, int32_t* group_indices, uint8_t* group_memberships) {
+  // Sort semantic blocks once. Only split their output when a physical cache
+  // boundary requires smaller TMA fragments; adjacent logical pages need not
+  // be adjacent physical pages.
+  for (int fragment = 0; fragment < params.fragments_per_block; ++fragment) {
+    const int rank = output_rank * params.fragments_per_block + fragment;
+    const uint32_t logical_fragment = logical_block * params.fragments_per_block + fragment;
+    const int32_t locator =
+        static_cast<int64_t>(logical_fragment) * params.fragment_size <= route.last_position
+            ? ResolveFragment(params, route, logical_fragment)
+            : -1;
+    uint32_t fragment_membership = membership;
+    if (params.fragments_per_block > 1) {
+      const int64_t first_visible_query =
+          static_cast<int64_t>(logical_fragment) * params.fragment_size - route.first_position;
+      if (first_visible_query > 0) {
+        fragment_membership &= first_visible_query < 8 ? (0xffu << first_visible_query) : 0u;
+      }
+    }
+    group_indices[rank] = locator;
+    group_memberships[rank] = locator >= 0 ? static_cast<uint8_t>(fragment_membership) : 0;
+  }
 }
 
 template <typename PositionType, bool PackedQuery>
@@ -250,81 +270,45 @@ __launch_bounds__(kQTokenKvBlockSparseQ1BlockThreads) void QTokenKvBlockSparseQ1
 
   int32_t* row_indices = params.q_token_kv_block_sparse_page_indices +
                          static_cast<int64_t>(blockIdx.x) * params.page_capacity;
-  const int64_t visible_tokens = route.valid ? route.first_position + 1 : 0;
-  const int32_t complete_blocks =
-      static_cast<int32_t>(visible_tokens / kQTokenKvBlockSparseSparseBlockSize < params.block_topk
-                               ? visible_tokens / kQTokenKvBlockSparseSparseBlockSize
-                               : params.block_topk);
+  const int32_t visible = route.valid ? static_cast<int32_t>(route.first_position + 1) : 0;
+  const int32_t causal_blocks = visible >> params.sparse_block_shift;
+  const int32_t complete_blocks = min(causal_blocks, params.block_topk);
+  const int32_t tail = visible & (params.sparse_block_size - 1);
+  const int32_t compact_length = complete_blocks * params.sparse_block_size + tail;
+  const int32_t live_fragments = (compact_length + params.fragment_size - 1) / params.fragment_size;
+  const uint32_t head = blockIdx.x % params.pattern_heads;
 
-  // Initialize the complete fixed-capacity row on every replay. Attention may
-  // speculatively load a rounded page tile before token-lane predicates apply.
-  for (int32_t output_rank = threadIdx.x; output_rank < params.page_capacity;
-       output_rank += kQTokenKvBlockSparseQ1BlockThreads) {
+  // Initialize the complete capacity: rounded speculative page staging may
+  // read padding before its token predicates apply.
+  for (int rank = threadIdx.x; rank < params.page_capacity;
+       rank += kQTokenKvBlockSparseQ1BlockThreads) {
     int32_t locator = -1;
-    if (route.valid && output_rank < complete_blocks) {
-      const int32_t logical_block = params.block_indices[static_cast<int64_t>(route.first_row) *
-                                                             params.block_indices_row_stride +
-                                                         static_cast<int64_t>(output_rank) *
-                                                             params.block_indices_column_stride];
-      if (logical_block >= 0 &&
-          logical_block < visible_tokens / kQTokenKvBlockSparseSparseBlockSize &&
-          logical_block < params.model_block_bound) {
-        uint32_t storage_page;
-        uint32_t subpage;
-        params.subpages_per_storage_page.divmod(static_cast<uint32_t>(logical_block), storage_page,
-                                                subpage);
-        if (storage_page < static_cast<uint32_t>(params.page_table_width)) {
-          const int32_t physical_page =
-              params
-                  .block_table[static_cast<int64_t>(route.request) *
-                                   params.block_table_request_stride +
-                               static_cast<int64_t>(storage_page) * params.block_table_page_stride];
-          if (physical_page >= 0) {
-            locator =
-                static_cast<int32_t>(static_cast<uint32_t>(physical_page) *
-                                         static_cast<uint32_t>(params.subpages_per_storage_page) +
-                                     subpage);
-          }
-        }
+    if (route.valid && rank < live_fragments) {
+      const int block_rank = rank / params.fragments_per_block;
+      int32_t logical = causal_blocks;
+      if (block_rank < complete_blocks) {
+        logical =
+            params.block_indices[static_cast<int64_t>(route.first_row) *
+                                     params.block_indices_row_stride +
+                                 static_cast<int64_t>(head) * params.block_indices_head_stride +
+                                 static_cast<int64_t>(block_rank) *
+                                     params.block_indices_column_stride];
+        if (logical < 0 || logical >= causal_blocks) logical = -1;
+      }
+      if (logical >= 0 && logical < params.model_block_bound) {
+        locator = ResolveFragment(params, route,
+                                  static_cast<uint32_t>(logical) * params.fragments_per_block +
+                                      rank % params.fragments_per_block);
       }
     }
-    row_indices[output_rank] = locator;
+    row_indices[rank] = locator;
   }
-  __syncthreads();
-
   if (threadIdx.x == 0) {
-    const int32_t tail_tokens =
-        route.valid ? static_cast<int32_t>(visible_tokens % kQTokenKvBlockSparseSparseBlockSize)
-                    : 0;
-    if (tail_tokens != 0) {
-      const uint32_t tail_logical_block =
-          static_cast<uint32_t>(visible_tokens / kQTokenKvBlockSparseSparseBlockSize);
-      uint32_t storage_page;
-      uint32_t subpage;
-      params.subpages_per_storage_page.divmod(tail_logical_block, storage_page, subpage);
-      if (storage_page < static_cast<uint32_t>(params.page_table_width)) {
-        const int32_t physical_page =
-            params.block_table[static_cast<int64_t>(route.request) *
-                                   params.block_table_request_stride +
-                               static_cast<int64_t>(storage_page) * params.block_table_page_stride];
-        if (physical_page >= 0) {
-          row_indices[complete_blocks] =
-              static_cast<int32_t>(static_cast<uint32_t>(physical_page) *
-                                       static_cast<uint32_t>(params.subpages_per_storage_page) +
-                                   subpage);
-        }
-      }
-    }
-    const int32_t compact_length =
-        complete_blocks * kQTokenKvBlockSparseSparseBlockSize + tail_tokens;
-    params.seq_lens[blockIdx.x] = route.valid ? (compact_length > 0 ? compact_length : 1) : 1;
+    params.seq_lens[blockIdx.x] = max(compact_length, 1);
   }
   __syncthreads();
-
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   if (params.release_pdl) {
-    // Keep the CTA-uniform CUDA builtin semantics. Repeated thread-level PTX
-    // invocations have no additional effect after this CTA has signaled.
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
   }
 #endif
@@ -356,13 +340,15 @@ __device__ __forceinline__ int BuildTouchedUnion(
     if (shared.route.valid && query < static_cast<uint32_t>(shared.route.query_count) &&
         candidate_rank < static_cast<uint32_t>(GroupSize * (params.block_topk + 1))) {
       const int64_t visible_tokens = shared.route.first_position + query + 1;
-      const int64_t complete_block_count = visible_tokens / kQTokenKvBlockSparseSparseBlockSize;
+      const int64_t complete_block_count = (visible_tokens >> params.sparse_block_shift);
       const int32_t selected_count = static_cast<int32_t>(
           complete_block_count < params.block_topk ? complete_block_count : params.block_topk);
       if (query_item < static_cast<uint32_t>(selected_count)) {
         const int32_t row = shared.route.first_row + query;
         const int32_t selected_block =
             params.block_indices[static_cast<int64_t>(row) * params.block_indices_row_stride +
+                                 static_cast<int64_t>(blockIdx.x % params.pattern_heads) *
+                                     params.block_indices_head_stride +
                                  static_cast<int64_t>(query_item) *
                                      params.block_indices_column_stride];
         // Selected IDs may only name complete causal blocks. The partial
@@ -373,8 +359,8 @@ __device__ __forceinline__ int BuildTouchedUnion(
           logical_block = selected_block;
         }
       } else if (query_item == static_cast<uint32_t>(params.block_topk) &&
-                 visible_tokens % kQTokenKvBlockSparseSparseBlockSize != 0) {
-        logical_block = visible_tokens / kQTokenKvBlockSparseSparseBlockSize;
+                 (visible_tokens & (params.sparse_block_size - 1)) != 0) {
+        logical_block = (visible_tokens >> params.sparse_block_shift);
       }
     }
 
@@ -467,9 +453,9 @@ __global__ __launch_bounds__(
   __syncthreads();
 
   const int64_t causal_block_bound =
-      shared.route.valid ? (shared.route.last_position + kQTokenKvBlockSparseSparseBlockSize) /
-                               kQTokenKvBlockSparseSparseBlockSize
-                         : 0;
+      shared.route.valid
+          ? (shared.route.last_position + params.sparse_block_size) >> params.sparse_block_shift
+          : 0;
   const uint32_t active_logical_capacity = static_cast<uint32_t>(
       causal_block_bound < params.model_block_bound ? causal_block_bound
                                                     : params.model_block_bound);
@@ -498,15 +484,13 @@ __global__ __launch_bounds__(
   if (threadIdx.x == 0) {
     if (shared.route.valid && shared.union_pages > 0) {
       const int tail_tokens =
-          static_cast<int>((shared.route.last_position + 1) % kQTokenKvBlockSparseSparseBlockSize);
-      const int tail_padding =
-          tail_tokens == 0 ? 0 : kQTokenKvBlockSparseSparseBlockSize - tail_tokens;
-      params.seq_lens[blockIdx.x] =
-          shared.union_pages * kQTokenKvBlockSparseSparseBlockSize - tail_padding;
+          static_cast<int>((shared.route.last_position + 1) & (params.sparse_block_size - 1));
+      const int tail_padding = tail_tokens == 0 ? 0 : params.sparse_block_size - tail_tokens;
+      params.seq_lens[blockIdx.x] = shared.union_pages * params.sparse_block_size - tail_padding;
       // Attention reads packed Uint32 words. Initialize only the last word's
       // padding bytes so that its masked load never reads unwritten memory.
-      for (int byte = shared.union_pages; byte % kQTokenKvBlockSparseMembershipsPerWord != 0;
-           ++byte) {
+      for (int byte = shared.union_pages * params.fragments_per_block;
+           byte % kQTokenKvBlockSparseMembershipsPerWord != 0; ++byte) {
         group_memberships[byte] = 0;
       }
     } else {
@@ -535,7 +519,8 @@ cudaError_t LaunchQTokenKvBlockSparseTouchedMetadataTyped(
   constexpr int kBlockThreads =
       QTokenKvBlockSparseTouchedMetadataKernelTraits<GroupSize>::kBlockThreads;
   auto kernel = QTokenKvBlockSparseTouchedMetadataKernel<PositionType, GroupSize, PackedQuery>;
-  kernel<<<params.groups, kBlockThreads, 0, stream>>>(params);
+  kernel<<<params.groups* static_cast<uint32_t>(params.pattern_heads), kBlockThreads, 0, stream>>>(
+      params);
   return cudaGetLastError();
 }
 
@@ -543,7 +528,8 @@ template <typename PositionType, bool PackedQuery>
 cudaError_t LaunchQTokenKvBlockSparseQ1MetadataTyped(
     QTokenKvBlockSparseTouchedMetadataParams<PositionType> params, cudaStream_t stream) {
   auto kernel = QTokenKvBlockSparseQ1MetadataKernel<PositionType, PackedQuery>;
-  kernel<<<params.groups, kQTokenKvBlockSparseQ1BlockThreads, 0, stream>>>(params);
+  kernel<<<params.groups* static_cast<uint32_t>(params.pattern_heads),
+           kQTokenKvBlockSparseQ1BlockThreads, 0, stream>>>(params);
   return cudaGetLastError();
 }
 
@@ -564,11 +550,23 @@ cudaError_t LaunchQTokenKvBlockSparseTouchedMetadata(
     case 2:
       return detail::LaunchQTokenKvBlockSparseTouchedMetadataTyped<PositionType, 2, PackedQuery>(
           params, stream);
+    case 3:
+      return detail::LaunchQTokenKvBlockSparseTouchedMetadataTyped<PositionType, 3, PackedQuery>(
+          params, stream);
     case 4:
       return detail::LaunchQTokenKvBlockSparseTouchedMetadataTyped<PositionType, 4, PackedQuery>(
           params, stream);
     case 5:
       return detail::LaunchQTokenKvBlockSparseTouchedMetadataTyped<PositionType, 5, PackedQuery>(
+          params, stream);
+    case 6:
+      return detail::LaunchQTokenKvBlockSparseTouchedMetadataTyped<PositionType, 6, PackedQuery>(
+          params, stream);
+    case 7:
+      return detail::LaunchQTokenKvBlockSparseTouchedMetadataTyped<PositionType, 7, PackedQuery>(
+          params, stream);
+    case 8:
+      return detail::LaunchQTokenKvBlockSparseTouchedMetadataTyped<PositionType, 8, PackedQuery>(
           params, stream);
     default:
       return cudaErrorInvalidValue;

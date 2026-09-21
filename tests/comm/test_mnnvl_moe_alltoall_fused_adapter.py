@@ -55,6 +55,7 @@ def test_fused_module_keeps_the_public_python_contract():
             "enable_rank_mask",
             "active_rank_mask",
             "backend",
+            "recv_view_cache",
         ),
         "moe_a2a_combine": (
             "payload",
@@ -106,6 +107,7 @@ def test_fused_module_keeps_the_public_python_contract():
             "enable_rank_mask": False,
             "active_rank_mask": None,
             "backend": "trtllm",
+            "recv_view_cache": None,
         },
         "moe_a2a_combine": {
             "payload_in_workspace": False,
