@@ -2486,23 +2486,6 @@ def _set_if_implicit(
         setattr(cfg, field_name, value)
 
 
-def _set_explicit(
-    cfg: FmhaDecodeConfig,
-    field_name: str,
-    value: ConfigValue,
-    explicit_fields: set[str],
-) -> None:
-    """Set a field and add it to explicit fields."""
-    current = getattr(cfg, field_name)
-    if field_name in explicit_fields and current != value:
-        raise ValueError(
-            f"conflicting {field_name} selections: "
-            f"config overrides requested {current}, but this profile requires {value}"
-        )
-    setattr(cfg, field_name, value)
-    explicit_fields.add(field_name)
-
-
 def _finalize_static_decode_config(
     cfg: FmhaDecodeConfig,
     explicit_fields: set[str],
@@ -2511,10 +2494,6 @@ def _finalize_static_decode_config(
     cfg.validate_boolean_fields()
     cfg.validate_dtypes()
 
-    # When using paged KV, the WG3's spare warps are taken.
-    # Force num_insts_kv == 1 to have enough warps for the transformed-KV task.
-    if cfg.use_transform_kv and cfg.use_paged_kv:
-        _set_explicit(cfg, "num_insts_kv", 1, explicit_fields)
     uses_full_wg_transform = cfg.use_transform_kv and cfg.num_insts_kv == 1
     if uses_full_wg_transform:
         _set_if_implicit(cfg, "transform_kv_warp_idx", 4, explicit_fields)
@@ -2523,6 +2502,9 @@ def _finalize_static_decode_config(
     if not use_keeps_mma_ab and cfg.headdim > 128:
         _set_if_implicit(cfg, "head_dim_per_stage_kv", 128, explicit_fields)
         _set_if_implicit(cfg, "num_insts_kv", 2, explicit_fields)
+    if cfg.use_transform_kv and cfg.use_paged_kv:
+        # Force using 1 instances kv to allow more warps for transform kv tasks.
+        _set_if_implicit(cfg, "num_insts_kv", 1, explicit_fields)
 
     if use_keeps_mma_ab:
         tile_size_q = cfg.tile_size_q if "tile_size_q" in explicit_fields else 64
