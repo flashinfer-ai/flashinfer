@@ -532,8 +532,9 @@ kernel_cake_fmha_decode_native_bf16_hd256_smallm_n32_p16(CakeFmhaTensorMap const
     #define corr_scale_addr (mbar_base + 56)
     #define p_full_addr (mbar_base + 64)
     #define o_ready_addr (mbar_base + 72)
-    #define stats_full_addr (mbar_base + 80)
-    #define tmem_dealloc_addr (mbar_base + 88)
+    #define p_empty_addr (mbar_base + 80)
+    #define stats_full_addr (mbar_base + 88)
+    #define tmem_dealloc_addr (mbar_base + 96)
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
@@ -578,8 +579,8 @@ kernel_cake_fmha_decode_native_bf16_hd256_smallm_n32_p16(CakeFmhaTensorMap const
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)(K)) : "memory");
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)(V)) : "memory");
 
-    // Mbarrier init (9 pipeline groups, 0 ordered-sequence groups, 12 barriers)
-    // Mbarriers at smem_raw[0..96)
+    // Mbarrier init (10 pipeline groups, 0 ordered-sequence groups, 13 barriers)
+    // Mbarriers at smem_raw[0..104)
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -601,10 +602,12 @@ kernel_cake_fmha_decode_native_bf16_hd256_smallm_n32_p16(CakeFmhaTensorMap const
             mbarrier_init(smem + 64, 384);
             // o_ready: 1 barriers, init_count=1
             mbarrier_init(smem + 72, 1);
+            // p_empty: 1 barriers, init_count=1
+            mbarrier_init(smem + 80, 1);
             // stats_full: 1 barriers, init_count=256
-            mbarrier_init(smem + 80, 256);
+            mbarrier_init(smem + 88, 256);
             // tmem_dealloc: 1 barriers, init_count=128
-            mbarrier_init(smem + 88, 128);
+            mbarrier_init(smem + 96, 128);
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
@@ -612,9 +615,9 @@ kernel_cake_fmha_decode_native_bf16_hd256_smallm_n32_p16(CakeFmhaTensorMap const
     __syncwarp();
 
     // TMEM alloc (256 columns, 224 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 96);
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 104);
     if (warp == 0) {
-        int _tmem_hold = smem + 96;
+        int _tmem_hold = smem + 104;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(256) : "memory");
         __syncwarp();
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
@@ -672,6 +675,7 @@ kernel_cake_fmha_decode_native_bf16_hd256_smallm_n32_p16(CakeFmhaTensorMap const
             float psum = 0.0f;
             int sm_stage = 0;
             int sm_phase = 0;
+            unsigned int _phase_p_empty_0 = 1;
             #pragma unroll 1
             for (int n = 0; n < cnt; n++) {
                 mbarrier_wait(s_full_addr + (sm_stage) * 8, sm_phase);
@@ -738,6 +742,8 @@ kernel_cake_fmha_decode_native_bf16_hd256_smallm_n32_p16(CakeFmhaTensorMap const
                 }
                 psum = psum * acc_scale + lsum;
                 row_max = new_max;
+                mbarrier_wait(p_empty_addr, _phase_p_empty_0);
+                _phase_p_empty_0 ^= 1;
                 int k_run = 0;
                 unsigned int regs_p[4];
                 #pragma unroll
@@ -1562,6 +1568,7 @@ kernel_cake_fmha_decode_native_bf16_hd256_smallm_n32_p16(CakeFmhaTensorMap const
                         }
                     }
                     elect_commit2(kv_empty_addr + (stage) * 8, o_ready_addr);
+                    elect_commit(p_empty_addr);
                     first_pv = 0;
                 }
             }
