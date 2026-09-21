@@ -8,11 +8,11 @@ _SHORTLIST_TOP_K = {
 }
 
 
-def shortlisted_moe_geometry(config, act):
+def shortlisted_moe_geometry(config, act, *, hidden_size=None):
     """Check the model/top-k and token range covered by offline stage selection."""
     geometry = (
         config.routing.num_experts,
-        act.hidden_states_q.shape[1],
+        act.hidden_states_q.shape[1] if hidden_size is None else hidden_size,
         config.experts.intermediate_size,
     )
     return (

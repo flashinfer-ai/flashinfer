@@ -37,7 +37,7 @@ without persisting CuTe DSL artifacts; neither mode writes compiled objects
 into the installed package.
 
 An explicit `FLASHINFER_CUDNN_FROST_PTXAS=/path/to/ptxas` selects an external
-assembler for both BF16 and MXFP8. CuTe still generates the original PTX and
+assembler for every Frost dtype. CuTe still generates the original PTX and
 host/TVM-FFI wrapper. Frost assembles that PTX with the selected executable,
 replaces the GPU binary initializer in standard compiler IR, and exports a new
 host object through CuTe's existing interface. The source, tensor descriptors,
@@ -45,9 +45,10 @@ launch arguments and kernel algorithm are unchanged. The resolved executable
 path, version and SHA-256 participate in memory, disk and tactic cache identities.
 Disabled disk caching and failed persistence also execute the external binary.
 
-The current SM107 MXFP8 validation uses CUDA 13.5 PTXAS: the installed DSL's
-bundled CUDA 13.4 assembler produced incorrect dynamic tensor-map dimension
-updates in the original kernels. Setting `CUDA_HOME` alone does not select the
+The SM107 MXFP8, NVFP4 and MXFP8 × MXFP4 validation uses CUDA 13.5 PTXAS:
+the installed DSL's bundled CUDA 13.4 assembler produced incorrect dynamic
+tensor-map dimension updates in the original MXFP8 kernels. Setting `CUDA_HOME`
+alone does not select the
 external assembler. Without the explicit Frost option, the existing bundled
 compiler path remains in use; it is not covered by this compiler workaround.
 
@@ -70,13 +71,14 @@ completely; the new runner does not call an existing backend.
 
 ## Runtime layout
 
-All data types have a sibling package (`bf16/`, `mxfp8/`) with a
+All data types have a sibling package (`bf16/`, `mxfp8/`, `nvfp4/`,
+`mxfp8_mxfp4/`) with a
 `runtime.py` for their numerical contracts and launch arguments. The shared
 root `runtime.py` handles source verification, template materialization,
 compilation, caching and CUDA streams. Artifact paths are always selected by
 an explicit dtype through `artifact_root(dtype)`.
 
-Both dtype packages provide `moe.py` for full MoELayer integration and a
+Each dtype package provides `moe.py` for full MoELayer integration and a
 lightweight `support.py` for numerical-contract admission and deferred runner
 construction. The root `support.py` contains the shared model/top-k and token-range
 policy. BF16 also provides its standalone `fc2.py`; MXFP8's grouped FC1 and FC2 share the same
@@ -93,6 +95,14 @@ artifacts/
     moe_shortlists.json
     sources/
   mxfp8/
+    cudnn_frost_selected_kernels.json
+    moe_shortlists.json
+    sources/
+  nvfp4/
+    cudnn_frost_selected_kernels.json
+    moe_shortlists.json
+    sources/
+  mxfp8_mxfp4/
     cudnn_frost_selected_kernels.json
     moe_shortlists.json
     sources/
@@ -227,9 +237,8 @@ python benchmarks/bench_cudnn_frost_moe_mxfp8.py benchmark \
 The benchmark preserves the original backend tactics, checks all four Frost
 plans eagerly and through CUDA Graph replay, and records actual autotune winners.
 It alternates timing order over batched graph replays and reports numerical
-error, raw timings, source identities and GPU telemetry. Use `--artifacts DIR`
-to benchmark another selected pool containing `moe_shortlists.json`; the output
-records the exact artifact, shortlist, source and compiler environment identities.
+error, raw timings and GPU telemetry. Use `--artifacts DIR` to benchmark another
+selected pool containing `moe_shortlists.json`.
 Backend eligibility
 follows the existing registry: on SM107, the current original MXFP8 pool is
 CUTLASS; TRT-LLM MXFP8 supports SM100/SM103. Stage timing cannot establish an
@@ -264,6 +273,90 @@ packing, intermediate requantization, finalization, reference calculation and
 compilation. Repeated graph replay uses hot inputs. These stage timings must
 not be summed into a full MoE latency or compared directly with the BF16
 script's complete routed MoE measurements.
+
+## NVFP4 block-scale grouped pipelines
+
+`nvfp4/runtime.py`, `nvfp4/moe.py` and `csrc/moe_nvfp4.cu` provide the
+corresponding NVFP4 × NVFP4 pipeline and `cudnn_frost_nvfp4` automatic
+candidate. Both operands contain two E2M1 values per byte, with E4M3 block
+scales per 16 logical K elements. Logical N and K must be divisible by 128;
+packing halves the tensor's last storage dimension, not its logical K.
+Both grouped stages produce BF16. The native pipeline gathers packed inputs,
+runs fused FC1/activation, requantizes the intermediate to NVFP4, runs FC2,
+and reduces routed outputs in FP32 before the final BF16 conversion.
+
+The runner consumes the canonical `cutlass_nvfp4` weight view. Activation
+scales may use linear or F8_128x4 layout. FC1 dequantization multiplies the
+FP32 GEMM accumulators **before** activation; the standalone grouped API
+accepts separate per-group gate and up multipliers through `gemm_scales`.
+FC2 applies its dequantization multiplier before BF16 conversion. The
+intermediate quantizer uses `fc2_act_global_scale`, whose reciprocal is
+already part of the canonical `fc2_dequant_scale`. Global scales must be
+positive and finite. Default activation contracts and shape/shortlist
+admission follow the same policy as MXFP8.
+
+Automatic admission requires the caller to prepare the `cutlass_nvfp4`
+weight view. The default NVFP4 backend list does not prepare this view;
+Frost skips weight packs that lack it. Use
+`CutlassNvfp4Config.prepare_weights(...)` and
+`weight_pack.prepare_for("cutlass_nvfp4", view)` before calling the layer
+inside `flashinfer.autotune()`. An already usable backend selection can remain
+unchanged. `MoELayer` construction still requires a configured native backend
+that supports the activation; explicitly include `CutlassNvfp4Config()` for
+activations unsupported by the default backend list. If this view is already
+present, Frost reuses it without another
+copy; otherwise, retaining it alongside other backend views consumes
+additional weight memory. Frost does not convert other backends' views.
+
+`artifacts/nvfp4/` retains 154 selected configurations in 34 geometry-parameterized
+source templates and 400 measured two-by-two profiles. The offline sweep
+covers all 44 operation/orientation/store families, including every default
+gated and non-gated activation and the shared FC2. Only templates referenced
+by the selected profiles are packaged.
+
+Use `--dtype nvfp4` with the shared exporter. The corresponding stage and
+full-layer benchmark is `benchmarks/bench_cudnn_frost_moe_nvfp4.py`, with
+the same command-line structure as the MXFP8 benchmark. Its default input
+standard deviation is 1.0: tiny inputs combined with unit global scales
+can underflow E4M3 intermediate scales after gated activations. Full-layer
+validation checks both other eligible backends and an independent
+dequantized reference. On SM107, the benchmark checks lower-level activation
+support as well as registry declarations before including a backend. It also
+autotunes and times each original backend separately, preserving its complete
+tactic pool and including GPU work performed by `pack_inputs`.
+
+## MXFP8 × MXFP4 block-scale grouped pipelines
+
+`mxfp8_mxfp4/runtime.py`, `mxfp8_mxfp4/moe.py` and
+`csrc/moe_mxfp8_mxfp4.cu` provide the mixed pipeline and
+`cudnn_frost_mxfp8_mxfp4` automatic candidate. Activations use E4M3 data;
+weights pack two E2M1 values per byte. Both operands use E8M0 block scales
+per 32 logical K elements. Logical N and K must be divisible by 128.
+FC1/activation and FC2 produce BF16, with MXFP8 intermediate requantization.
+
+The runner reuses the canonical `cutlass_mxfp8_mxfp4` weight view, including
+its packed weights, F8_128x4 scales and unit input multipliers. Input scales
+may be linear or F8_128x4. Automatic admission requires this view; callers
+with other backend views must first add it using
+`CutlassMxfp8Mxfp4Config.prepare_weights(...)` and
+`weight_pack.prepare_for("cutlass_mxfp8_mxfp4", view)`. As with NVFP4, an
+additional view consumes weight memory, while an existing view is reused.
+`MoELayer` still requires at least one usable configured native backend;
+include `CutlassMxfp8Mxfp4Config()` for activations unsupported by the default
+backend list. Automatic Frost candidates are added when the layer is called.
+The quantization configuration uses
+`QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8)`.
+
+`artifacts/mxfp8_mxfp4/` retains 169 selected configurations in 42
+geometry-parameterized source templates and 400 measured two-by-two profiles.
+The offline pool covers all 44 operation/orientation/store families.
+
+Use `--dtype mxfp8_mxfp4` with the shared exporter and
+`benchmarks/bench_cudnn_frost_moe_mxfp8_mxfp4.py` for stage sweeps or full
+MoELayer benchmarks. The benchmark preserves the complete eligible backend
+pools and also times each original backend individually. On SM107, CUTLASS
+supports all ten activations and TRTLLM supports SwiGLU, GeGLU and ReLU2;
+the current CuTe DSL runner rejects W4A8 on this architecture.
 
 ## Activation sources
 

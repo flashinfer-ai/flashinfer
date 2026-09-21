@@ -50,6 +50,8 @@ repos:
       - id: mixed-line-ending
       - id: requirements-txt-fixer
       - id: trailing-whitespace
+        # Frozen template bytes are authenticated by the artifact manifests.
+        exclude: ^flashinfer/experimental/cudnn_frost_selected_kernels/artifacts/[^/]+/sources/[^/]+\.py$
 
   # Changes tabs to spaces
   - repo: https://github.com/Lucas-C/pre-commit-hooks
