@@ -1391,14 +1391,15 @@ def get_cake_fmha_decode_native_fp16_hd512_uri(
 
 
 @functools.cache
-
 def cake_fmha_smallm_component_name(n_rows: int, page_size: int) -> str:
     """Manifest component of one small-M hd256 structural instance."""
 
     if n_rows not in CAKE_FMHA_SMALLM_ROWS:
         raise ValueError(f"small-M hd256 decode packs 32 or 64 rows, got {n_rows}")
     if page_size not in CAKE_FMHA_SMALLM_PAGE_SIZES:
-        raise ValueError(f"small-M hd256 decode supports page sizes 16/32/64, got {page_size}")
+        raise ValueError(
+            f"small-M hd256 decode supports page sizes 16/32/64, got {page_size}"
+        )
     return f"decode_native_bf16_hd256_smallm_n{n_rows}_p{page_size}"
 
 
@@ -1428,7 +1429,9 @@ def get_cake_fmha_decode_native_bf16_hd256_smallm_uri(
     group: int,
     num_split: int,
 ) -> str:
-    component = _validate_smallm_specialization(target, n_rows, page_size, q_len, group, num_split)
+    component = _validate_smallm_specialization(
+        target, n_rows, page_size, q_len, group, num_split
+    )
     return f"cake_fmha_{component}_{target}_q{q_len}_g{group}_s{num_split}"
 
 
@@ -1442,7 +1445,9 @@ def gen_cake_fmha_decode_native_bf16_hd256_smallm_module(
 ) -> JitSpec:
     """Build one small-M BF16 head-dim-256 speculative decode specialization."""
 
-    component = _validate_smallm_specialization(target, n_rows, page_size, q_len, group, num_split)
+    component = _validate_smallm_specialization(
+        target, n_rows, page_size, q_len, group, num_split
+    )
     manifest_component = get_cake_fmha_manifest()["components"][component]
     sources = _get_component_sources(
         component,

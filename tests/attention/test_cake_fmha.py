@@ -2861,7 +2861,10 @@ def test_cake_fmha_decode_native_bf16_hd256_smallm_jit_selects_component(
         "cake_fmha_decode_native_bf16_hd256_smallm_n64_p64_binding.cu",
         "cake_fmha_decode_native_bf16_hd256_smallm_jit_binding.cu",
     }
-    assert any("decode_native_bf16_hd256_smallm_n64_p64/sm_100a/" in str(s) for s in spec.sources)
+    assert any(
+        "decode_native_bf16_hd256_smallm_n64_p64/sm_100a/" in str(s)
+        for s in spec.sources
+    )
     assert "-DQ_LEN=8" in spec.extra_cuda_cflags
     assert "-DGROUP=8" in spec.extra_cuda_cflags
     assert "-DNUM_SPLIT=148" in spec.extra_cuda_cflags
@@ -2872,21 +2875,42 @@ def test_cake_fmha_decode_native_bf16_hd256_smallm_jit_selects_component(
         in spec.extra_cuda_cflags
     )
     with pytest.raises(ValueError):
-        gen_cake_fmha_decode_native_bf16_hd256_smallm_module("sm100a", 64, 64, 4, 8, 148)
+        gen_cake_fmha_decode_native_bf16_hd256_smallm_module(
+            "sm100a", 64, 64, 4, 8, 148
+        )
     with pytest.raises(ValueError):
         cake_fmha_smallm_component_name(64, 128)
 
 
 def test_cake_fmha_smallm_num_split_is_one_resident_wave() -> None:
-    assert cake_api._smallm_num_split(tiles=1, sm_count=148, max_seq_len=60008, n_rows=64) == 148
-    assert cake_api._smallm_num_split(tiles=2, sm_count=148, max_seq_len=60004, n_rows=64) == 74
-    assert cake_api._smallm_num_split(tiles=1, sm_count=148, max_seq_len=1032, n_rows=64) == 64
-    assert cake_api._smallm_num_split(tiles=200, sm_count=148, max_seq_len=1032, n_rows=64) == 0
+    assert (
+        cake_api._smallm_num_split(tiles=1, sm_count=148, max_seq_len=60008, n_rows=64)
+        == 148
+    )
+    assert (
+        cake_api._smallm_num_split(tiles=2, sm_count=148, max_seq_len=60004, n_rows=64)
+        == 74
+    )
+    assert (
+        cake_api._smallm_num_split(tiles=1, sm_count=148, max_seq_len=1032, n_rows=64)
+        == 64
+    )
+    assert (
+        cake_api._smallm_num_split(tiles=200, sm_count=148, max_seq_len=1032, n_rows=64)
+        == 0
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
 @pytest.mark.parametrize(
-    ("batch_size", "q_len_per_req", "num_kv_heads", "head_grp_size", "page_size", "max_in_kv_len"),
+    (
+        "batch_size",
+        "q_len_per_req",
+        "num_kv_heads",
+        "head_grp_size",
+        "page_size",
+        "max_in_kv_len",
+    ),
     (
         # Qwen3.5-35B-A3B TP=2 rank: 8 heads over one KV head, 7 draft tokens.
         (1, 8, 1, 8, 64, 60000),
@@ -2933,8 +2957,12 @@ def test_cake_decode_bf16_hd256_smallm_route_is_selected() -> None:
         pytest.skip("Cake FMHA requires SM100 or SM103")
     batch, q_len, heads, kv_heads, page, kv_len = 1, 8, 8, 1, 64, 60008
     pages = (kv_len + page - 1) // page
-    query = torch.randn((batch * q_len, heads, 256), dtype=torch.bfloat16, device=device)
-    key_cache = torch.randn((pages, kv_heads, page, 256), dtype=torch.bfloat16, device=device)
+    query = torch.randn(
+        (batch * q_len, heads, 256), dtype=torch.bfloat16, device=device
+    )
+    key_cache = torch.randn(
+        (pages, kv_heads, page, 256), dtype=torch.bfloat16, device=device
+    )
     value_cache = torch.randn_like(key_cache)
     out = torch.empty_like(query)
     workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
