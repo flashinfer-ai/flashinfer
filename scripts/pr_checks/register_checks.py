@@ -71,8 +71,8 @@ CHECKS: tuple[CheckMeta, ...] = (
     ),
     CheckMeta(
         QUICKREF_PATHS,
-        "CLAUDE.md Quick-Ref Paths",
-        "Paths referenced in CLAUDE.md must exist.",
+        "AGENTS.md Quick-Ref Paths",
+        "Paths referenced in AGENTS.md must exist.",
     ),
     CheckMeta(
         SKILL_REFS,

@@ -262,7 +262,7 @@ The generated files can be passed directly to ``flashinfer-bench``:
 Adding Trace Support to a New Kernel
 --------------------------------------
 
-When adding a new kernel (see ``CLAUDE.md`` and ``.claude/skills/add-cuda-kernel/SKILL.md``
+When adding a new kernel (see ``AGENTS.md`` and ``.claude/skills/add-cuda-kernel/SKILL.md``
 for the full tutorial), attach a ``TraceTemplate`` to the ``@flashinfer_api`` decorator:
 
 .. code-block:: python

@@ -19,7 +19,7 @@ FLASHINFER_PKG: Path = FLASHINFER_ROOT / "flashinfer"
 DOCS_DIR: Path = FLASHINFER_ROOT / "docs"
 DOCS_API_DIR: Path = DOCS_DIR / "api"
 CSRC_DIR: Path = FLASHINFER_ROOT / "csrc"
-CLAUDE_MD: Path = FLASHINFER_ROOT / "CLAUDE.md"
+AGENTS_MD: Path = FLASHINFER_ROOT / "AGENTS.md"
 SKILLS_DIR: Path = FLASHINFER_ROOT / ".claude" / "skills"
 
 OUTPUT_DIR: Path = Path(
@@ -36,7 +36,7 @@ __all__ = (
     "DOCS_DIR",
     "DOCS_API_DIR",
     "CSRC_DIR",
-    "CLAUDE_MD",
+    "AGENTS_MD",
     "SKILLS_DIR",
     "OUTPUT_DIR",
 )

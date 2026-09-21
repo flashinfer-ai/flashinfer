@@ -280,7 +280,7 @@ maintainability are **not** required at admission.
 
 ### Relaxations vs. the stable-API checklist
 
-Relative to the "Adding a New Operation" checklist in the root `CLAUDE.md`:
+Relative to the "Adding a New Operation" checklist in the root `AGENTS.md`:
 
 - **Trace templates** (`flashinfer/trace/templates/`) are optional for
   experimental APIs (needed for graduation).
@@ -353,7 +353,7 @@ To graduate a feature to stable:
    user-visible.
 3. Replace `@flashinfer_experimental_api` with `@flashinfer_api` and remove
    `require_experimental` calls from the entry point.
-4. Complete the full stable-API checklist in the root `CLAUDE.md` (trace
+4. Complete the full stable-API checklist in the root `AGENTS.md` (trace
    template, `tests/trace/example.py`, docs page, top-level export).
 5. Register in `flashinfer/aot.py` if the feature should ship pre-compiled.
 6. Move tests from `tests/experimental/` to the corresponding stable test
