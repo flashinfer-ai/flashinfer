@@ -147,9 +147,9 @@ def bsa_attn_sm100_blk64_fwd(
     assert v.shape == (batch_size, seqlen_k, num_head_kv, head_dim_v)
 
     arch = _get_device_arch(q.device.index)
-    if arch not in (100, 103):
+    if arch not in (100, 103, 107):
         raise RuntimeError(
-            f"bsa_attn_sm100_blk64_fwd only supports SM100/SM103, got SM{arch}"
+            f"bsa_attn_sm100_blk64_fwd only supports SM100/SM103/SM107, got SM{arch}"
         )
 
     auto_kv_splits = isinstance(kv_splits, str)
