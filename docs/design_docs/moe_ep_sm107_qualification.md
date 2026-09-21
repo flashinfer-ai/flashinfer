@@ -1,5 +1,7 @@
 # SM107 MegaMoE validation
 
+**Scope**: Validation requirements, correctness tests, and qualification procedures for the SM107 MegaMoE backends.
+
 The Rubin backends support NVFP4 and MXFP8 E4M3/E5M2 inference through
 `MoEEpLayer`, with BF16 combine and output. The kernel comes from CuTe DSL
 MegaMoE `1667b47a`; [VENDOR.md](../../flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/VENDOR.md)
