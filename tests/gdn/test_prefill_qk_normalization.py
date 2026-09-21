@@ -100,26 +100,116 @@ def test_prefill_normalization_preserves_backend_rejection(
     normalize.assert_not_called()
 
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_qk_normalization_reference_and_graph(dtype):
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("d", [96, 128, 129, 513])
+def test_qk_normalization_reference_and_graph(dtype, d):
     device = _supported_device()
     from flashinfer.gdn_kernels.qk_l2norm import normalize_qk
 
     torch.manual_seed(2026)
-    q = torch.randn(37, 32, 128, device=device, dtype=dtype) * 3
-    k = torch.randn(37, 16, 128, device=device, dtype=dtype) * 4
+    q = torch.randn(37, 32, d, device=device, dtype=dtype) * 3
+    k = torch.randn(37, 16, d, device=device, dtype=dtype) * 4
     q[0] = 0
     k[0] = 1e-5
     expected = [_normalize_reference(x).to(dtype) for x in (q, k)]
     outputs = normalize_qk(q, k)
     for actual, reference in zip(outputs, expected, strict=True):
-        torch.testing.assert_close(actual, reference, rtol=1e-3, atol=1e-3)
+        torch.testing.assert_close(
+            actual,
+            reference,
+            rtol=1e-5 if dtype == torch.float32 else 1e-3,
+            atol=1e-6 if dtype == torch.float32 else 1e-3,
+        )
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         graph_outputs = normalize_qk(q, k)
     graph.replay()
     for actual, reference in zip(graph_outputs, outputs, strict=True):
         torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "dtype,d",
+    [
+        pytest.param(dtype, d, id=f"{str(dtype).split('.')[-1]}-d{d}")
+        for dtype in (torch.bfloat16, torch.float16, torch.float32)
+        for d in (
+            1,
+            7,
+            8,
+            31,
+            32,
+            33,
+            63,
+            64,
+            65,
+            96,
+            127,
+            129,
+            130,
+            132,
+            192,
+            255,
+            256,
+            257,
+            511,
+            512,
+            513,
+            1024,
+            1025,
+            2048,
+            2049,
+            4096,
+            8192,
+            16383,
+            16384,
+            32767,
+            32768,
+        )
+        if d * dtype.itemsize <= 65536
+    ],
+)
+def test_qk_normalization_general_dimensions(dtype, d):
+    """Exercise vector alignment, column/row tails, and cross-warp reductions."""
+    device = _supported_device()
+    from flashinfer.gdn_kernels.qk_l2norm import normalize_qk
+
+    torch.manual_seed(2026)
+    inputs = []
+    for rows, offset in ((65, 1), (17, 3)):
+        storage = torch.randn(rows * d + offset, device=device, dtype=dtype)
+        x = storage[offset:].view(rows, 1, d)
+        x[0] = 0
+        x[1] = 1e-5
+        x[2] = 0
+        x[2, 0, -1] = 300
+        inputs.append(x)
+    outputs = normalize_qk(*inputs)
+    for actual, source in zip(outputs, inputs, strict=True):
+        torch.testing.assert_close(
+            actual,
+            _normalize_reference(source).to(dtype),
+            rtol=1e-5 if dtype == torch.float32 else 1e-3,
+            atol=1e-6 if dtype == torch.float32 else 1e-3,
+        )
+
+
+@pytest.mark.parametrize(
+    "dtype,d", [(torch.float16, 0), (torch.bfloat16, 32769), (torch.float32, 16385)]
+)
+def test_qk_normalization_rejects_invalid_row_size(dtype, d):
+    from flashinfer.gdn_kernels.qk_l2norm import normalize_qk
+
+    x = torch.empty(0, d, dtype=dtype)
+    with pytest.raises(ValueError, match="positive row size up to 64 KiB"):
+        normalize_qk(x, x)
+
+
+def test_qk_normalization_rejects_mismatched_dimensions():
+    from flashinfer.gdn_kernels.qk_l2norm import normalize_qk
+
+    with pytest.raises(ValueError, match="matching last dimensions"):
+        normalize_qk(torch.empty(1, 96), torch.empty(1, 128))
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
@@ -142,15 +232,16 @@ def test_qk_normalization_partial_tiles(dtype, q_rows, k_rows, storage_offsets):
         )
 
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("d", [128, 129, 513])
 @pytest.mark.parametrize("q_rows,k_rows", [(0, 0), (0, 7), (7, 0)])
-def test_qk_normalization_empty_inputs(dtype, q_rows, k_rows):
+def test_qk_normalization_empty_inputs(dtype, d, q_rows, k_rows):
     device = _supported_device()
     from flashinfer.gdn_kernels.qk_l2norm import normalize_qk
 
     torch.manual_seed(2026)
-    q = torch.randn(q_rows, 32, 128, device=device, dtype=dtype)
-    k = torch.randn(k_rows, 16, 128, device=device, dtype=dtype)
+    q = torch.randn(q_rows, 32, d, device=device, dtype=dtype)
+    k = torch.randn(k_rows, 16, d, device=device, dtype=dtype)
     outputs = normalize_qk(q, k)
     for actual, source in zip(outputs, (q, k), strict=True):
         torch.testing.assert_close(
