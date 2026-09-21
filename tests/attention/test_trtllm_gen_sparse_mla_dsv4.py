@@ -879,7 +879,7 @@ def _skip_unless_sm100_or_sm103() -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for TRTLLM-GEN sparse MLA tests")
     compute_capability = get_compute_capability(torch.device("cuda"))
-    if compute_capability not in ((10, 0), (10, 3)):
+    if compute_capability not in ((10, 0), (10, 3), (10, 7)):
         pytest.skip(
             "TRTLLM-GEN DeepSeek V4 sparse MLA requires SM100/SM103, "
             f"got SM{compute_capability[0]}{compute_capability[1]}"
@@ -1299,7 +1299,7 @@ def _inverse_rope_reference(
 def test_trtllm_gen_dsv4_rope_quant_correctness(batch_size, q_len, topk, is_varlen):
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
-    if get_compute_capability(torch.device("cuda")) not in ((10, 0), (10, 3)):
+    if get_compute_capability(torch.device("cuda")) not in ((10, 0), (10, 3), (10, 7)):
         pytest.skip("TRTLLM-GEN DSv4 RopeQuant requires SM100/SM103")
 
     torch.manual_seed(7)
