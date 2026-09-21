@@ -27,7 +27,6 @@ Three APIs are provided:
 - gated_delta_rule_mtp: Multi-token processing (T > 1) for speculative decoding
 """
 
-import math
 from typing import Literal, Optional, Tuple
 
 import torch
@@ -672,7 +671,7 @@ def gated_delta_rule_decode_pretranspose(
                     a=a,
                     dt_bias=dt_bias,
                     b=b,
-                    scale=1.0 / math.sqrt(K) if scale is None else scale,
+                    scale=K**-0.5 if scale is None else scale,
                     use_qk_l2norm=use_qk_l2norm,
                     output=output,
                     initial_state_indices=initial_state_indices,
@@ -703,7 +702,7 @@ def gated_delta_rule_decode_pretranspose(
                 f"initial_state_indices must be int32 or int64, "
                 f"got {initial_state_indices.dtype}"
             )
-        scale_val = 1.0 / math.sqrt(K) if scale is None else scale
+        scale_val = K**-0.5 if scale is None else scale
         # The BF16 path is pool-only. When the caller uses non-pool semantics
         # (passes ``state`` instead of ``initial_state``), treat ``state`` as
         # a pool of size B and synthesize sequential indices arange(B).
@@ -837,7 +836,7 @@ def gated_delta_rule_decode_pretranspose(
 
     # Set default scale
     if scale is None:
-        scale = 1.0 / math.sqrt(K)
+        scale = K**-0.5
 
     # Allocate output if not provided
     # Note: kernel outputs bfloat16, we'll convert to q.dtype if needed
@@ -1006,7 +1005,7 @@ def gated_delta_rule_decode(
 
     # Set default scale
     if scale is None:
-        scale = 1.0 / math.sqrt(K)
+        scale = K**-0.5
 
     # Allocate output if not provided
     output_provided = output is not None
@@ -1257,7 +1256,7 @@ def gated_delta_rule_mtp(
 
     # Set default scale
     if scale is None:
-        scale = 1.0 / math.sqrt(K)
+        scale = K**-0.5
 
     # Allocate output if not provided
     output_provided = output is not None
