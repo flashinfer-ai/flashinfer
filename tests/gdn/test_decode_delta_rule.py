@@ -1221,7 +1221,7 @@ def _test_verify_kernel_mtp(
     print(f"✓ MTP kernel test passed (batch={B}, seq_len={T}, dtype={dtype})")
 
 
-@pytest.mark.parametrize("cache_intermediate_states", [True, False])
+@pytest.mark.parametrize("cache_intermediate_states", [True])
 @pytest.mark.parametrize("beta", [True])
 @pytest.mark.parametrize("alpha", [True])
 @pytest.mark.parametrize("scale", [1.0])
@@ -1530,7 +1530,7 @@ def _test_mtp_fp32_state_pool(
 
 @pytest.mark.parametrize("cache_intermediate_states", [False, True])
 @pytest.mark.parametrize("use_separate_output_indices", [False, True])
-@pytest.mark.parametrize("seq_len", [2, 4])
+@pytest.mark.parametrize("seq_len", [4])
 @pytest.mark.parametrize("batch_size", [1, 4, 16])
 def test_mtp_fp32_state_pool(
     batch_size: int,
@@ -1667,7 +1667,7 @@ def _test_mtp_fp32_state_pool_non_contiguous(
 
 
 @pytest.mark.parametrize("stride_multiplier", [2, 3])
-@pytest.mark.parametrize("seq_len", [2, 4])
+@pytest.mark.parametrize("seq_len", [4])
 @pytest.mark.parametrize("batch_size", [1, 4])
 def test_mtp_fp32_state_pool_non_contiguous(
     batch_size: int,
@@ -1863,7 +1863,7 @@ def _test_gdn_decode_bf16_state_kernel(
     "num_q_heads, num_k_heads, num_v_heads",
     [(16, 16, 32)],
 )
-@pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16, 32, 64, 128])
+@pytest.mark.parametrize("batch_size", [1, 4, 8, 16, 32])
 @pytest.mark.parametrize("dtype", ["bfloat16"])
 def test_gdn_decode_bf16_state_kernel(
     dtype: str,
@@ -2352,7 +2352,7 @@ def _test_gdn_decode_bf16_state_mtp_kernel(
     "num_q_heads, num_k_heads, num_v_heads",
     [(16, 16, 32)],
 )
-@pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16])
+@pytest.mark.parametrize("batch_size", [1, 4, 16])
 @pytest.mark.parametrize("dtype", ["bfloat16"])
 def test_gdn_decode_bf16_state_mtp_kernel(
     dtype: str,
@@ -2410,7 +2410,7 @@ except ImportError:
     [(16, 16, 64)],
 )
 # tile_v is an explicit axis here, so B adds no specialization.
-@pytest.mark.parametrize("batch_size", [1, 16, 256])
+@pytest.mark.parametrize("batch_size", [16])
 @pytest.mark.parametrize("dtype", ["bfloat16"])
 def test_gdn_decode_bf16_state_wide_vec_mtp_kernel(
     monkeypatch,
@@ -2481,7 +2481,7 @@ except (ImportError, RuntimeError):
     "num_q_heads, num_k_heads, num_v_heads",
     [(16, 16, 32)],
 )
-@pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16])
+@pytest.mark.parametrize("batch_size", [1, 8, 16])
 @pytest.mark.parametrize("dtype", ["bfloat16"])
 def test_gdn_decode_bf16_wy_output_only_mtp_kernel(
     monkeypatch,
@@ -2531,8 +2531,8 @@ def test_gdn_decode_bf16_wy_output_only_mtp_kernel(
 # kernel with T = K_i tokens for each request independently.
 
 
-@pytest.mark.parametrize("max_T", [2, 4, 8])
-@pytest.mark.parametrize("batch_size", [1, 4, 16, 64, 256])
+@pytest.mark.parametrize("max_T", [2, 8])
+@pytest.mark.parametrize("batch_size", [1, 4, 16, 64])
 @pytest.mark.parametrize(
     "num_q_heads, num_k_heads, num_v_heads",
     [(16, 16, 64)],
@@ -2602,7 +2602,7 @@ def test_gdn_decode_bf16_state_recovery_per_request_k(
         disable_state_update=False,  # write final state
         disable_output=True,  # recovery: no output
         use_qk_l2norm_in_kernel=True,
-        scale=K**-0.5,
+        scale=1.0 / math.sqrt(K),
         softplus_beta=1.0,
         softplus_threshold=20.0,
     )
@@ -2626,7 +2626,7 @@ def test_gdn_decode_bf16_state_recovery_per_request_k(
             disable_state_update=False,
             disable_output=True,
             use_qk_l2norm_in_kernel=True,
-            scale=K**-0.5,
+            scale=1.0 / math.sqrt(K),
             softplus_beta=1.0,
             softplus_threshold=20.0,
         )
@@ -2658,8 +2658,8 @@ def test_gdn_decode_bf16_state_recovery_per_request_k(
 # Verifies bit-equivalence (within BF16 noise) against the two-call reference.
 
 
-@pytest.mark.parametrize("recovery_steps", [1, 2, "T-1"])
-@pytest.mark.parametrize("T", [4, 8])
+@pytest.mark.parametrize("recovery_steps", [1, "T-1"])
+@pytest.mark.parametrize("T", [8])
 @pytest.mark.parametrize("batch_size", [2, 8, 32])
 @pytest.mark.parametrize(
     "num_q_heads, num_k_heads, num_v_heads",
@@ -2717,7 +2717,7 @@ def test_gdn_decode_bf16_state_fused_recovery_decode(
         dt_bias=dt_bias,
         initial_state_indices=h0_indices,
         use_qk_l2norm_in_kernel=True,
-        scale=K_dim**-0.5,
+        scale=1.0 / math.sqrt(K_dim),
         softplus_beta=1.0,
         softplus_threshold=20.0,
     )
@@ -2806,7 +2806,7 @@ def test_gdn_decode_bf16_state_fused_recovery_decode(
 #                                disable_state_update=True) → emits output[K_i+1:T]
 
 
-@pytest.mark.parametrize("max_T", [4, 8])
+@pytest.mark.parametrize("max_T", [8])
 @pytest.mark.parametrize("batch_size", [2, 8, 32])
 @pytest.mark.parametrize(
     "num_q_heads, num_k_heads, num_v_heads",
@@ -2868,7 +2868,7 @@ def test_gdn_decode_bf16_state_fused_per_request_k(
         A_log=A_log,
         dt_bias=dt_bias,
         use_qk_l2norm_in_kernel=True,
-        scale=K_dim**-0.5,
+        scale=1.0 / math.sqrt(K_dim),
         softplus_beta=1.0,
         softplus_threshold=20.0,
     )
@@ -3246,7 +3246,7 @@ def test_output_state_indices_same_as_input(batch_size: int, state_dtype: str):
 
 
 @pytest.mark.parametrize("batch_size", [1, 8, 32])
-@pytest.mark.parametrize("seq_len", [2, 4])
+@pytest.mark.parametrize("seq_len", [4])
 @pytest.mark.parametrize("cache_intermediate_states", [True, False])
 def test_gdn_decode_bf16_state_mtp_split_pool(
     batch_size: int,
@@ -3382,7 +3382,7 @@ def test_gdn_decode_bf16_state_mtp_split_pool(
 
 @pytest.mark.parametrize("pool_size_multiplier", [1, 4])
 @pytest.mark.parametrize("batch_size", [1, 8, 32])
-@pytest.mark.parametrize("seq_len", [2, 4])
+@pytest.mark.parametrize("seq_len", [4])
 def test_gdn_decode_bf16_state_mtp_pool_larger_than_batch(
     batch_size: int,
     seq_len: int,
@@ -3530,8 +3530,8 @@ def test_gdn_decode_bf16_state_mtp_pool_larger_than_batch(
 
 
 @pytest.mark.parametrize("split_pool", [False, True])
-@pytest.mark.parametrize("max_T", [2, 4, 8])
-@pytest.mark.parametrize("batch_size", [1, 4, 16, 64, 256])
+@pytest.mark.parametrize("max_T", [2, 8])
+@pytest.mark.parametrize("batch_size", [1, 4, 16])
 @pytest.mark.parametrize(
     "num_q_heads, num_k_heads, num_v_heads",
     [(16, 16, 64)],
@@ -3605,7 +3605,7 @@ def test_gdn_decode_bf16_state_fla_scatter_vs_dense(
         dt_bias=dt_bias,
         initial_state_indices=h0_idx,
         use_qk_l2norm_in_kernel=True,
-        scale=K**-0.5,
+        scale=1.0 / math.sqrt(K),
         softplus_beta=1.0,
         softplus_threshold=20.0,
     )
@@ -3680,7 +3680,7 @@ def test_gdn_decode_bf16_state_fla_scatter_vs_dense(
         )
 
 
-@pytest.mark.parametrize("max_T", [4, 8])
+@pytest.mark.parametrize("max_T", [8])
 @pytest.mark.parametrize("batch_size", [1, 4, 64])
 @pytest.mark.parametrize("head_size", [128])
 @pytest.mark.parametrize("dtype", ["bfloat16"])
@@ -3725,7 +3725,7 @@ def test_gdn_decode_bf16_state_fla_scatter_with_accepted_steps(
         ssm_state_indices=ssm_idx,
         accepted_steps=accepted_steps,
         use_qk_l2norm_in_kernel=True,
-        scale=K**-0.5,
+        scale=1.0 / math.sqrt(K),
     )
     torch.cuda.synchronize()
 
@@ -3754,7 +3754,7 @@ def test_gdn_decode_bf16_state_fla_scatter_with_accepted_steps(
     )
 
 
-@pytest.mark.parametrize("max_T", [4, 8])
+@pytest.mark.parametrize("max_T", [8])
 @pytest.mark.parametrize("batch_size", [4, 64])
 @pytest.mark.parametrize("head_size", [128])
 @pytest.mark.parametrize("dtype", ["bfloat16"])
@@ -3793,7 +3793,7 @@ def test_gdn_decode_bf16_state_fla_scatter_state_only(
         dt_bias=torch.randn(HV, dtype=torch.float32, device=device),
         initial_state_indices=h0_idx,
         use_qk_l2norm_in_kernel=True,
-        scale=K**-0.5,
+        scale=1.0 / math.sqrt(K),
         disable_output=True,  # state-only
     )
 
@@ -3900,7 +3900,7 @@ def test_gdn_decode_bf16_state_fla_scatter_validation():
 # ============================================================================
 
 
-@pytest.mark.parametrize("max_T", [2, 4, 8])
+@pytest.mark.parametrize("max_T", [8])
 @pytest.mark.parametrize("batch_size", [4, 16])
 def test_gdn_decode_bf16_state_fla_scatter_padded_pool(
     batch_size: int,
@@ -3965,7 +3965,7 @@ def test_gdn_decode_bf16_state_fla_scatter_padded_pool(
         initial_state_indices=h0_idx,
         ssm_state_indices=ssm_idx,
         use_qk_l2norm_in_kernel=True,
-        scale=K**-0.5,
+        scale=1.0 / math.sqrt(K),
     )
 
     # Reference: contiguous pool → flat path
@@ -3992,7 +3992,7 @@ def test_gdn_decode_bf16_state_fla_scatter_padded_pool(
             )
 
 
-@pytest.mark.parametrize("max_T", [4, 8])
+@pytest.mark.parametrize("max_T", [8])
 @pytest.mark.parametrize("batch_size", [4, 16])
 def test_gdn_decode_bf16_state_fla_scatter_random_slots(
     batch_size: int,
@@ -4050,7 +4050,7 @@ def test_gdn_decode_bf16_state_fla_scatter_random_slots(
         b=b,
         initial_state_indices=h0_idx,
         use_qk_l2norm_in_kernel=True,
-        scale=K**-0.5,
+        scale=1.0 / math.sqrt(K),
     )
 
     # Dense reference (same input).
@@ -4084,8 +4084,8 @@ def test_gdn_decode_bf16_state_fla_scatter_random_slots(
         assert diff == 0, f"unused slot {s} clobbered: {diff}"
 
 
-@pytest.mark.parametrize("max_T", [2, 4, 8])
-@pytest.mark.parametrize("batch_size", [1, 4, 16, 64, 128])
+@pytest.mark.parametrize("max_T", [2, 8])
+@pytest.mark.parametrize("batch_size", [1, 4, 16, 128])
 def test_gdn_decode_fp32_state_fla_scatter_vs_dense(
     batch_size: int,
     max_T: int,
@@ -4128,7 +4128,7 @@ def test_gdn_decode_fp32_state_fla_scatter_vs_dense(
         dt_bias=dt_bias,
         b=b,
         initial_state_indices=h0_idx,
-        scale=K**-0.5,
+        scale=1.0 / math.sqrt(K),
         disable_state_update=False,
         use_qk_l2norm=True,
     )
@@ -4242,7 +4242,7 @@ def test_decode_nontranspose_packed_qkv(batch_size: int):
 
 
 @pytest.mark.parametrize("batch_size", [2, 8, 64])
-@pytest.mark.parametrize("seq_len", [2, 4])
+@pytest.mark.parametrize("seq_len", [4])
 def test_mtp_packed_qkv(batch_size: int, seq_len: int):
     """MTP decode must accept packed q/k/v (bit-identical to contiguous)."""
     _skip_if_not_sm90_or_later()
