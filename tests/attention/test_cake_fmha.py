@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,6 +14,9 @@ import flashinfer.prefill as prefill
 import pytest
 import torch
 from flashinfer.jit.cake_fmha import (
+    cake_fmha_smallm_component_name,
+    gen_cake_fmha_decode_native_bf16_hd256_smallm_module,
+    get_cake_fmha_decode_native_bf16_hd256_smallm_uri,
     CAKE_FMHA_FLASHINFER_BINDINGS_SHA256,
     CAKE_FMHA_FLASHINFER_MATRIX_REVISION,
     CAKE_FMHA_MANIFEST_SHA256,
@@ -67,7 +72,9 @@ def test_cake_fmha_manifest_is_authenticated_and_complete() -> None:
         "correctness_compat_decode_fp8_hnd_shared_group8_partial",
         "correctness_decode_fp8_hnd_shared_group8_full_blocks",
     }
-    assert len(manifest["artifacts"]) == 143
+    # 143 base/composed artifacts plus the six CAKE-459 small-M hd256 decode
+    # instances (two arch bodies + one launch binding each).
+    assert len(manifest["artifacts"]) == 161
     dcp_addon = manifest["add_ons"]["cake_fmha_dcp_spec"]
     assert dcp_addon["installed"] is True
     assert dcp_addon["selection_key"] == "causal_seqlens_kv_global"
@@ -2832,3 +2839,166 @@ def test_cake_base_decode_cuda_graph_capture_replay() -> None:
     graph.replay()
     torch.cuda.synchronize()
     torch.testing.assert_close(out, expected, atol=0, rtol=0)
+
+
+def test_cake_fmha_decode_native_bf16_hd256_smallm_jit_selects_component(
+    monkeypatch,
+) -> None:
+    import flashinfer.jit.core as jit_core
+
+    monkeypatch.setattr(jit_core, "check_cuda_arch", lambda: None)
+    spec = gen_cake_fmha_decode_native_bf16_hd256_smallm_module(
+        "sm100a", 64, 64, 8, 8, 148
+    )
+    assert spec.name == get_cake_fmha_decode_native_bf16_hd256_smallm_uri(
+        "sm100a", 64, 64, 8, 8, 148
+    )
+    assert cake_fmha_smallm_component_name(64, 64) == (
+        "decode_native_bf16_hd256_smallm_n64_p64"
+    )
+    assert {Path(source).name for source in spec.sources} == {
+        "default.cu",
+        "cake_fmha_decode_native_bf16_hd256_smallm_n64_p64_binding.cu",
+        "cake_fmha_decode_native_bf16_hd256_smallm_jit_binding.cu",
+    }
+    assert any("decode_native_bf16_hd256_smallm_n64_p64/sm_100a/" in str(s) for s in spec.sources)
+    assert "-DQ_LEN=8" in spec.extra_cuda_cflags
+    assert "-DGROUP=8" in spec.extra_cuda_cflags
+    assert "-DNUM_SPLIT=148" in spec.extra_cuda_cflags
+    assert "-DCAKE_FMHA_SMALLM_N_ROWS=64" in spec.extra_cuda_cflags
+    assert "-DCAKE_FMHA_SMALLM_PAGE_SIZE=64" in spec.extra_cuda_cflags
+    assert (
+        "-DCAKE_FMHA_SMALLM_LAUNCH=cake_fmha_launch_decode_native_bf16_hd256_smallm_n64_p64"
+        in spec.extra_cuda_cflags
+    )
+    with pytest.raises(ValueError):
+        gen_cake_fmha_decode_native_bf16_hd256_smallm_module("sm100a", 64, 64, 4, 8, 148)
+    with pytest.raises(ValueError):
+        cake_fmha_smallm_component_name(64, 128)
+
+
+def test_cake_fmha_smallm_num_split_is_one_resident_wave() -> None:
+    assert cake_api._smallm_num_split(tiles=1, sm_count=148, max_seq_len=60008, n_rows=64) == 148
+    assert cake_api._smallm_num_split(tiles=2, sm_count=148, max_seq_len=60004, n_rows=64) == 74
+    assert cake_api._smallm_num_split(tiles=1, sm_count=148, max_seq_len=1032, n_rows=64) == 64
+    assert cake_api._smallm_num_split(tiles=200, sm_count=148, max_seq_len=1032, n_rows=64) == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
+@pytest.mark.parametrize(
+    ("batch_size", "q_len_per_req", "num_kv_heads", "head_grp_size", "page_size", "max_in_kv_len"),
+    (
+        # Qwen3.5-35B-A3B TP=2 rank: 8 heads over one KV head, 7 draft tokens.
+        (1, 8, 1, 8, 64, 60000),
+        (1, 8, 1, 8, 16, 8192),
+        # TP=1 rank with four draft tokens: two KV heads, 64 packed rows each.
+        (1, 4, 2, 8, 64, 4096),
+        # 32 packed rows.
+        (2, 4, 1, 8, 32, 1024),
+    ),
+)
+def test_cake_decode_bf16_hd256_smallm_matches_flashinfer_reference(
+    batch_size, q_len_per_req, num_kv_heads, head_grp_size, page_size, max_in_kv_len
+) -> None:
+    device = torch.device("cuda")
+    if torch.cuda.get_device_capability(device) not in ((10, 0), (10, 3)):
+        pytest.skip("Cake FMHA requires SM100 or SM103")
+    from tests.attention.test_trtllm_gen_attention_decode import (
+        _test_trtllm_batch_decode,
+    )
+
+    _test_trtllm_batch_decode(
+        backend="cake",
+        kv_layout="HND",
+        batch_size=batch_size,
+        q_len_per_req=q_len_per_req,
+        page_size=page_size,
+        num_kv_heads=num_kv_heads,
+        head_grp_size=head_grp_size,
+        window_left=-1,
+        q_dtype="bf16",
+        o_dtype="bf16",
+        kv_dtype="bf16",
+        enable_pdl=False,
+        enable_sink=False,
+        max_in_kv_len=max_in_kv_len,
+        head_dim=256,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
+def test_cake_decode_bf16_hd256_smallm_route_is_selected() -> None:
+    device = torch.device("cuda")
+    if torch.cuda.get_device_capability(device) not in ((10, 0), (10, 3)):
+        pytest.skip("Cake FMHA requires SM100 or SM103")
+    batch, q_len, heads, kv_heads, page, kv_len = 1, 8, 8, 1, 64, 60008
+    pages = (kv_len + page - 1) // page
+    query = torch.randn((batch * q_len, heads, 256), dtype=torch.bfloat16, device=device)
+    key_cache = torch.randn((pages, kv_heads, page, 256), dtype=torch.bfloat16, device=device)
+    value_cache = torch.randn_like(key_cache)
+    out = torch.empty_like(query)
+    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
+    block_tables = torch.arange(pages, dtype=torch.int32, device=device).view(1, pages)
+    seq_lens = torch.tensor([kv_len], dtype=torch.int32, device=device)
+    route = cake_api.select_cake_fmha_decode_route(
+        device,
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        out=out,
+        workspace_buffer=workspace,
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        batch_size=batch,
+        q_len=q_len,
+        max_seq_len=kv_len,
+        window_left=-1,
+        bmm1_scale=256**-0.5,
+        bmm2_scale=1.0,
+        o_scale=None,
+        sinks=None,
+        kv_layout="HND",
+        uses_shared_paged_kv_idx=True,
+        cum_seq_lens_q=None,
+        key_block_scales=None,
+        value_block_scales=None,
+        skip_softmax_threshold_scale_factor=None,
+        enable_block_sparse_attention=False,
+    )
+    assert route is not None
+    assert route.component == "decode_native_bf16_hd256_smallm"
+    assert route.page_size == page
+    sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+    assert route.num_split == min(sm_count, 256)
+    assert cake_api.cake_fmha_route_is_optimized(route)
+
+    # Run the public API through the selected route and check O and LSE against
+    # dense bottom-right-causal attention (BF16 atol=rtol=1e-2, LSE 1e-2).
+    scale = 256**-0.5
+    out, lse = decode.trtllm_batch_decode_with_kv_cache(
+        query,
+        torch.stack((key_cache, value_cache), dim=1),
+        workspace,
+        block_tables,
+        seq_lens,
+        kv_len,
+        bmm1_scale=scale,
+        bmm2_scale=1.0,
+        backend="cake",
+        q_len_per_req=q_len,
+        kv_layout="HND",
+        return_lse=True,
+    )
+    keys = key_cache.reshape(pages * page, kv_heads, 256)[:kv_len].float()
+    values = value_cache.reshape(pages * page, kv_heads, 256)[:kv_len].float()
+    keys = keys.repeat_interleave(heads // kv_heads, dim=1)
+    values = values.repeat_interleave(heads // kv_heads, dim=1)
+    scores = torch.einsum("qhd,khd->hqk", query.float(), keys) * scale
+    positions = torch.arange(kv_len, device=device)
+    visible = (kv_len - q_len) + torch.arange(q_len, device=device)[:, None]
+    scores.masked_fill_((positions[None, :] > visible).unsqueeze(0), float("-inf"))
+    probabilities = torch.softmax(scores, dim=-1)
+    expected = torch.einsum("hqk,khd->qhd", probabilities, values)
+    expected_lse = torch.logsumexp(scores, dim=-1).transpose(0, 1) * math.log2(math.e)
+    torch.testing.assert_close(out.float(), expected, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(lse.float(), expected_lse, atol=1e-2, rtol=1e-2)
