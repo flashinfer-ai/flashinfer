@@ -34,7 +34,7 @@ from .cpp_ext import get_cuda_path, get_nvcc_parallelism_flags
 CakeGDNArch = Literal["sm_100a", "sm_103a"]
 
 _EXPORT_SCHEMA = "flashinfer-cake-gdn-decode-standalone-export-v1"
-_MANIFEST_SHA256 = "6862a7f1f223d550a0d9329d545ea137c1eca1dfe9aa525531e975570bad8af0"
+_MANIFEST_SHA256 = "6cf2de07b0bbcd663e87a171746eb8d53ea91fe7b433897dcb348b0f725f6bae"
 _ARCH_ACTIVE_CLUSTERS: dict[CakeGDNArch, int] = {
     "sm_100a": 148,
     "sm_103a": 160,
@@ -135,9 +135,9 @@ def _manifest() -> dict[str, Any]:
         _EXPORT_SCHEMA,
         True,
         False,
-        1789,
-        3578,
-        3524,
+        1799,
+        3598,
+        3544,
         54,
         108,
         108,
@@ -604,6 +604,18 @@ def select_cake_gdn_decode_variant(
             (8, 7, 8, 16, True, True, True, 7),
             (1, 8, 8, 16, True, True, True, 8),
             (1, 7, 16, 32, True, True, True, 7),
+            # SGLang hands the verify step contiguous [B, T, H, K] views; the
+            # STRIDED_INPUTS=1 variants above serve them through runtime strides.
+            (1, 7, 8, 16, False, True, True, 7),
+            (2, 7, 8, 16, False, True, True, 7),
+            (3, 7, 8, 16, False, True, True, 7),
+            (4, 7, 8, 16, False, True, True, 7),
+            (5, 7, 8, 16, False, True, True, 7),
+            (6, 7, 8, 16, False, True, True, 7),
+            (7, 7, 8, 16, False, True, True, 7),
+            (8, 7, 8, 16, False, True, True, 7),
+            (1, 8, 8, 16, False, True, True, 8),
+            (1, 7, 16, 32, False, True, True, 7),
         }
         key = (
             batch_size,
@@ -693,7 +705,9 @@ def select_cake_gdn_decode_variant(
                     num_v_heads * 128 * 128 if cache_intermediate_states else 128 * 128
                 ),
                 "SCALE": scale,
-                "STRIDED_INPUTS": int(strided_inputs),
+                # The T>=7 wide32 variants exist only as STRIDED_INPUTS=1 and take
+                # their strides at runtime, so contiguous callers use them too.
+                "STRIDED_INPUTS": int(strided_inputs or seq_len >= 7),
                 "TILE_V_WIDE": tile_v,
                 "T_STEPS": seq_len,
                 "UPDATE_STATE": int(update_state),
