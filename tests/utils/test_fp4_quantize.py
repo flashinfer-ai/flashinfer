@@ -2156,6 +2156,40 @@ _SILU_4OVER6_CASES = _pairwise(
 )
 
 
+def test_cute_dsl_nvfp4_quantize_resolves_recipe_on_empty_input():
+    """Empty inputs must still validate the recipe (and reject fp8 + recipe)."""
+    device = torch.device("cuda")
+    if not _is_fp4_supported(device):
+        pytest.skip("Nvfp4 Requires compute capability of 10 or above")
+    if not _is_cute_dsl_available():
+        pytest.skip("CuTe-DSL not available")
+    from flashinfer.quantization.kernels.nvfp4_quantize import (
+        nvfp4_quantize_cute_dsl,
+        silu_and_mul_nvfp4_quantize_cute_dsl,
+    )
+
+    global_scale = torch.ones(1, dtype=torch.float32, device=device)
+    empty_bf16 = torch.empty(0, 64, dtype=torch.bfloat16, device=device)
+    empty_fp8 = torch.empty(0, 64, dtype=torch.float8_e4m3fn, device=device)
+    with pytest.raises(TypeError, match="nvfp4_4over6"):
+        nvfp4_quantize_cute_dsl(empty_bf16, global_scale, nvfp4_4over6="yes")
+    with pytest.raises(ValueError, match="requires fp16 or bf16"):
+        nvfp4_quantize_cute_dsl(
+            empty_fp8, global_scale, nvfp4_4over6=NVFP44Over6Config()
+        )
+    with pytest.raises(TypeError, match="nvfp4_4over6"):
+        silu_and_mul_nvfp4_quantize_cute_dsl(
+            torch.empty(0, 128, dtype=torch.bfloat16, device=device),
+            global_scale,
+            nvfp4_4over6="yes",
+        )
+    # A valid explicit recipe on an empty input still returns empty outputs.
+    q, sf = nvfp4_quantize_cute_dsl(
+        empty_bf16, global_scale, nvfp4_4over6=NVFP44Over6Config()
+    )
+    assert q.shape == (0, 32) and sf.shape[0] == 0
+
+
 def _silu_4over6_case_id(value):
     """Return a readable ID for 4over6 configurations."""
     return value.id if isinstance(value, NVFP44Over6TestConfig) else None

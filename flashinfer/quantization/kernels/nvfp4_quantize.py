@@ -2339,6 +2339,12 @@ def nvfp4_quantize_cute_dsl(
         f"K ({k}) must be divisible by NVFP4_SF_VEC_SIZE={NVFP4_SF_VEC_SIZE}"
     )
 
+    # Resolve before the empty-input return so an invalid or fp8-incompatible
+    # recipe is rejected (and the environment shim warns) regardless of shape.
+    nvfp4_4over6_config = resolve_nvfp4_4over6(nvfp4_4over6)
+    if nvfp4_4over6_config is not None and input.dtype == torch.float8_e4m3fn:
+        raise nvfp4_4over6_fp8_input_error(input.dtype)
+
     # Return explicit empty shapes before compiling or launching. In
     # particular, K == 0 would make _compute_optimal_threads divide by zero.
     if m == 0 or k == 0:
@@ -2382,9 +2388,6 @@ def nvfp4_quantize_cute_dsl(
     disable_fp4_quant_fast_math = _env_flag_enabled(
         "FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH"
     )
-    nvfp4_4over6_config = resolve_nvfp4_4over6(nvfp4_4over6)
-    if nvfp4_4over6_config is not None and input.dtype == torch.float8_e4m3fn:
-        raise nvfp4_4over6_fp8_input_error(input.dtype)
     # The TMA kernel has no recipe parameter, so it is only eligible for
     # standard NVFP4.
     is_sm107 = get_compute_capability(input.device) == (10, 7)
@@ -2611,6 +2614,8 @@ def nvfp4_quantize_smooth_cute_dsl(
         pre_quant_scale = pre_quant_scale.clone()
     global_scale_arg = global_scale.float().reshape(1).contiguous().to(input.device)
     enable_pdl = device_support_pdl(input.device) if enable_pdl is not False else False
+    # Resolved before the empty-input return, see nvfp4_quantize_cute_dsl.
+    nvfp4_4over6_config = resolve_nvfp4_4over6(nvfp4_4over6)
 
     num_sf_blocks_per_row = k // NVFP4_SF_VEC_SIZE
     padded_m = _round_up(m, ROW_TILE_SIZE)
@@ -2630,7 +2635,7 @@ def nvfp4_quantize_smooth_cute_dsl(
         SF_LAYOUT_128x4,
         enable_pdl,
         _env_flag_enabled("FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH"),
-        resolve_nvfp4_4over6(nvfp4_4over6),
+        nvfp4_4over6_config,
         global_scale_is_tensor=True,
         smooth_quant=True,
     )
@@ -2714,6 +2719,8 @@ def silu_and_mul_nvfp4_quantize_cute_dsl(
     m = 1
     for dim in input.shape[:-1]:
         m *= int(dim)
+    # Resolved before the empty-input return, see nvfp4_quantize_cute_dsl.
+    nvfp4_4over6_config = resolve_nvfp4_4over6(nvfp4_4over6)
 
     # Return empty outputs without compiling or launching.
     if m == 0 or k == 0:
@@ -2754,7 +2761,6 @@ def silu_and_mul_nvfp4_quantize_cute_dsl(
     disable_fp4_quant_fast_math = _env_flag_enabled(
         "FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH"
     )
-    nvfp4_4over6_config = resolve_nvfp4_4over6(nvfp4_4over6)
 
     # SwiGLU fusion uses the non-TMA vectorized-load kernels only.
     kernel_fn, block_unit = _get_compiled_kernel_nvfp4(
