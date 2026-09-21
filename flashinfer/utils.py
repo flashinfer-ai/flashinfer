@@ -715,7 +715,8 @@ def is_sm12x_supported(device: torch.device) -> bool:
 def is_cvt_rs_supported(device: torch.device = None) -> bool:
     """Check if the GPU supports the PTX cvt.rs.f16x2.f32 instruction.
 
-    Datacenter-Blackwell only: SM100 (B200, cc 10.0) and SM103 (B300, cc 10.3).
+    Datacenter Blackwell and Rubin only: SM100 (B200, cc 10.0), SM103 (B300,
+    cc 10.3) and SM107 (Rubin, cc 10.7 — `.rs` verified with CUDA 13.4 ptxas).
     ptxas REJECTS `.rs` on SM110a (cc 11.0) and it is absent on SM120 (consumer
     Blackwell) — both must return False, else the kernels silently compile the
     ~12-instruction software-emulation fallback and stochastic rounding runs
@@ -728,7 +729,7 @@ def is_cvt_rs_supported(device: torch.device = None) -> bool:
     # Match the CUDA guard exactly: only the arches where cvt.rs actually
     # assembles (verified via ptxas).  NOT a `major == 10/11` check — SM110a
     # (major 11) has no `.rs` feature.
-    return get_compute_capability(device) in ((10, 0), (10, 3))
+    return get_compute_capability(device) in ((10, 0), (10, 3), (10, 7))
 
 
 def determine_mla_backend(device: torch.device) -> str:
