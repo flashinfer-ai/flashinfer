@@ -187,9 +187,9 @@ def test_sage_scale_arr_size_follows_fragment_groups(
     assert not cfg.uses_int32_scores
     assert cfg.num_softmax_score_fragments == 4
     assert cfg.sage_k_groups_per_fragment == groups
-    assert sage_scales.sage_scale_arr_size(cfg) == 4 * groups
+    assert sage_scales.sage_scale_arr_size(cfg, groups) == 4 * groups
     assert cfg.sage_k_scales_in_smem == (k_block_size < 16)
-    assert sage_scales.sage_k_scale_words(cfg) == (
+    assert sage_scales.sage_k_scale_words(cfg, groups) == (
         (2 if tile_size_q == 64 else 1) * 4 * groups
     )
 

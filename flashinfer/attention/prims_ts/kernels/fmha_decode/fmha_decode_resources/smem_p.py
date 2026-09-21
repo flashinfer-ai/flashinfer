@@ -82,7 +82,7 @@ from .helpers_softmax import (
     _pack_float4_to_fp8_e4m3,
     _pack_float4_to_fp8_e4m3_inline,
 )
-from .sage_scales import SageKScales, _groups_or_default
+from .sage_scales import SageKScales
 from .smem_block_sparse_metadata import _route_is_proxy
 from .tmem_s import TmemSResource
 
@@ -568,9 +568,17 @@ class SmemPResource(DecodeGenResourceBase):
                     )
                     self.sage_k_scales.advance(scales_view)
                 group_multipliers, group_addends = self._fragment_exponent_terms(
-                    fragment_multipliers, exponent_addend, score_bias=score_bias
+                    fragment_multipliers,
+                    exponent_addend,
+                    groups=cfg.sage_k_groups_per_fragment,
+                    score_bias=score_bias,
                 )
-                self._scale_fragment_pairs(s_arr, group_addends, group_multipliers)
+                self._scale_fragment_pairs(
+                    s_arr,
+                    group_addends,
+                    group_multipliers,
+                    groups=cfg.sage_k_groups_per_fragment,
+                )
             # The last iteration reloads its own fragment so the loop body
             # stays branch-free; the wait after the loop retires it.
             next_fragment = fragment + Int32(1)
@@ -681,14 +689,14 @@ class SmemPResource(DecodeGenResourceBase):
         s_arr: cutlass.Array,
         group_addends: cutlass.Array,
         group_multipliers: cutlass.Array,
-        groups: Constexpr[int | None] = None,
+        groups: Constexpr[int],
     ) -> None:
         """Turn one fragment of scores into log2 exponents in place.
 
         Each score pair uses the exponent multiplier and addend of its
         compile-time scale group; without Sage attention there is one group
         holding the softmax scale. ``groups`` is the route kind's scale
-        groups per fragment, the exact-route geometry by default.
+        groups per fragment.
         """
         for pair_idx in cutlass.range_constexpr(
             self.cfg.softmax_score_fragment_regs // 2
@@ -704,7 +712,7 @@ class SmemPResource(DecodeGenResourceBase):
         value_idx: Constexpr[int],
         group_addends: cutlass.Array,
         group_multipliers: cutlass.Array,
-        groups: Constexpr[int | None] = None,
+        groups: Constexpr[int],
     ) -> tuple[Float32, Float32]:
         """Return the log2 exponents of the score pair at ``value_idx``.
 
@@ -713,9 +721,7 @@ class SmemPResource(DecodeGenResourceBase):
         addend of its own group; a biased INT32 score's bias is already in
         the group addend.
         """
-        group_regs = self.cfg.softmax_score_fragment_regs // _groups_or_default(
-            self.cfg, groups
-        )
+        group_regs = self.cfg.softmax_score_fragment_regs // groups
         group0: Constexpr[int] = value_idx // group_regs
         group1: Constexpr[int] = (value_idx + 1) // group_regs
         return cute.arch.fma_packed_f32x2(
@@ -729,7 +735,7 @@ class SmemPResource(DecodeGenResourceBase):
         self,
         fragment_multipliers: cutlass.Array | None,
         exponent_addend: Float32,
-        groups: Constexpr[int | None] = None,
+        groups: Constexpr[int],
         score_bias: Float32 | None = None,
     ) -> tuple[cutlass.Array, cutlass.Array]:
         """Return one fragment's exponent multipliers and addends per scale group.
@@ -742,7 +748,6 @@ class SmemPResource(DecodeGenResourceBase):
         scores come back dequantized) in place of the constant when given.
         """
         cfg = self.cfg
-        groups = _groups_or_default(cfg, groups)
         neg_bias = Float32(-INT32_SCORE_BIAS)
         if cutlass.const_expr(score_bias is not None):
             neg_bias = -score_bias

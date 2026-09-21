@@ -99,7 +99,6 @@ from .smem_block_sparse_metadata import (
 )
 from .sage_scales import (
     SageKScales,
-    _groups_or_default,
     dense_k_scale_token,
     load_k_scale,
     load_q_scale,
@@ -2814,6 +2813,7 @@ class TmemSResource(DecodeGenResourceBase):
                         fragment_scales=fragment_scales,
                         chain_base=fragment_idx * cfg.sage_k_groups_per_fragment,
                         may_be_masked=False,
+                        groups=cfg.sage_k_groups_per_fragment,
                     )
                     self.sage_k_scales.advance(scales_view)
                 else:
@@ -2982,9 +2982,7 @@ class TmemSResource(DecodeGenResourceBase):
         """
         cfg = self.cfg
         num_fragments = cfg.num_softmax_score_fragments
-        groups: Constexpr[int | None] = None
-        if cutlass.const_expr(cfg.use_sage_attention):
-            groups = cfg.sage_k_groups_per_fragment_for(proxy_kind)
+        groups: Constexpr[int] = cfg.sage_k_groups_per_fragment_for(proxy_kind)
         for fragment in cutlass.range(num_fragments, unroll=1):
             fragment_scales = None
             if cutlass.const_expr(cfg.use_sage_attention and proxy_kind):
@@ -3028,7 +3026,7 @@ class TmemSResource(DecodeGenResourceBase):
         tail_fragment_mask: Int32,
         tail_shift: Float32,
         tail_lane: Constexpr[int],
-        groups: Constexpr[int | None] = None,
+        groups: Constexpr[int],
         dequantize_scores: Constexpr[bool] = False,
     ) -> None:
         """Mask one K32 score fragment in place, fold its maximum, write it back.
@@ -3069,7 +3067,7 @@ class TmemSResource(DecodeGenResourceBase):
                     lane_shift = tail_shift
                     if cutlass.const_expr(cfg.use_sage_attention):
                         tail_group: Constexpr[int] = tail_lane // (
-                            fragment_regs // _groups_or_default(cfg, groups)
+                            fragment_regs // groups
                         )
                         lane_shift = tail_shift * cute.math.rcp(
                             Float32(fragment_scales[tail_group]), approx=True
@@ -3104,7 +3102,7 @@ class TmemSResource(DecodeGenResourceBase):
         scores,
         first: Constexpr[int],
         may_be_masked: Constexpr[bool],
-        groups: Constexpr[int | None] = None,
+        groups: Constexpr[int],
     ) -> Float32:
         """Return the maximum of one scale group's scores.
 
@@ -3116,7 +3114,7 @@ class TmemSResource(DecodeGenResourceBase):
         score's sentinel stays exact.
         """
         cfg = self.cfg
-        group_regs = cfg.softmax_score_fragment_regs // _groups_or_default(cfg, groups)
+        group_regs = cfg.softmax_score_fragment_regs // groups
         if cutlass.const_expr(group_regs < 4):
             group_max = Float32(scores[first])
             for elem in cutlass.range_constexpr(1, group_regs):
@@ -3151,7 +3149,7 @@ class TmemSResource(DecodeGenResourceBase):
         fragment_scales: cutlass.Array,
         chain_base: Constexpr[int],
         may_be_masked: Constexpr[bool],
-        groups: Constexpr[int | None] = None,
+        groups: Constexpr[int],
         dequantize_scores: Constexpr[bool] = False,
     ) -> None:
         """Fold one fragment's dequantized group maxima into the max chains.
@@ -3182,7 +3180,6 @@ class TmemSResource(DecodeGenResourceBase):
         slower than the per-lane compare.
         """
         cfg = self.cfg
-        groups = _groups_or_default(cfg, groups)
         group_regs = cfg.softmax_score_fragment_regs // groups
         width: Constexpr[int] = 1 if groups == 1 else 2
         assert groups % width == 0

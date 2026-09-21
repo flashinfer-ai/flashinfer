@@ -130,20 +130,16 @@ def load_k_scale(
     return _load_scale(k_scale_addr, kv_head_idx * k_scale_head_stride + slot)
 
 
-def _groups_or_default(cfg: FmhaDecodeConfig, groups: int | None) -> int:
-    return cfg.sage_k_groups_per_fragment if groups is None else groups
-
-
-def sage_scale_arr_size(cfg: FmhaDecodeConfig, groups: int | None = None) -> int:
+def sage_scale_arr_size(cfg: FmhaDecodeConfig, groups: int) -> int:
     """Return the number of ``sfK`` words one softmax lane holds per tile.
 
-    ``groups`` is the scale groups per fragment of the tile's route kind; the
-    exact-route geometry is the default.
+    ``groups`` is the scale groups per fragment of the tile's route kind
+    (``FmhaDecodeConfig.sage_k_groups_per_fragment_for``).
     """
-    return cfg.num_softmax_score_fragments * _groups_or_default(cfg, groups)
+    return cfg.num_softmax_score_fragments * groups
 
 
-def sage_k_scale_words(cfg: FmhaDecodeConfig, groups: int | None = None) -> int:
+def sage_k_scale_words(cfg: FmhaDecodeConfig, groups: int) -> int:
     """Return the number of ``sfK`` words that cover one KV tile for every spatial half.
 
     Zero without Sage attention, so the block-sparse staging layout can take
@@ -174,7 +170,7 @@ def sage_word_position(
     cfg: Constexpr[FmhaDecodeConfig],
     half: Int32,
     lane_entry,
-    groups: Constexpr[int | None] = None,
+    groups: Constexpr[int],
 ) -> tuple[Int32, Int32]:
     """Return ``(atom, token offset in the atom)`` of one ``sfK`` word.
 
@@ -187,9 +183,8 @@ def sage_word_position(
     (``FmhaDecodeConfig.keeps_fragments_per_atom``), which block-sparse routes
     share as their route atom. A constant ``lane_entry`` folds everything but
     the half interleave at trace time. ``groups`` is the route kind's scale
-    groups per fragment, the exact-route geometry by default.
+    groups per fragment.
     """
-    groups = _groups_or_default(cfg, groups)
     fragments_per_atom = cfg.keeps_fragments_per_atom
     fragment_regs = cfg.softmax_score_fragment_regs
     group_tokens = fragment_regs // groups
@@ -206,7 +201,7 @@ def sage_word_position(
 def route_scale_word_position(
     cfg: Constexpr[FmhaDecodeConfig],
     word_idx: Int32,
-    groups: Constexpr[int | None] = None,
+    groups: Constexpr[int],
 ) -> tuple[Int32, Int32]:
     """Return ``sage_word_position`` of word ``word_idx`` of the staged layout."""
     arr_size = sage_scale_arr_size(cfg, groups)
@@ -237,7 +232,9 @@ def dense_k_scale_token(
     the word's position (``sage_word_position``) in a route of layout atoms
     names the token.
     """
-    atom_idx, token_offset = sage_word_position(cfg, half, lane_entry)
+    atom_idx, token_offset = sage_word_position(
+        cfg, half, lane_entry, cfg.sage_k_groups_per_fragment
+    )
     return tile_offset_k + atom_idx * Int32(cfg.keeps_atom_tokens) + token_offset
 
 
