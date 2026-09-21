@@ -477,8 +477,12 @@ class SmemPResource(DecodeGenResourceBase):
         # register words, a proxy tile's words are ones and the exact strategy
         # serves every tile unchanged; otherwise the kinds are selected per
         # fragment on the CTA-uniform route kind.
-        exact_dequantized: Constexpr[bool] = cfg.sage_scores_dequantized_for(False)
-        summary_dequantized: Constexpr[bool] = cfg.sage_scores_dequantized_for(True)
+        exact_dequantized: Constexpr[bool] = cfg.sage_scores_dequantized_for(
+            proxy=False
+        )
+        summary_dequantized: Constexpr[bool] = cfg.sage_scores_dequantized_for(
+            proxy=True
+        )
         exact_scales_in_smem: Constexpr[bool] = cfg.sage_k_scales_in_smem_for(
             cfg.sage_k_groups_per_fragment
         )

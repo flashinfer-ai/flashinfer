@@ -2730,7 +2730,12 @@ class TmemSResource(DecodeGenResourceBase):
         shifts_tail: Constexpr[bool] = False
         route_is_proxy = cutlass.Boolean(False)
         mixed_scales: Constexpr[bool] = use_sparse and cfg.sage_mixed_k_geometry
-        exact_dequantized: Constexpr[bool] = cfg.sage_scores_dequantized_for(False)
+        # The unmasked pass below carries the exact geometry alone: a mixed
+        # plan's proxy tiles take the rolled masked pass, and on every other
+        # plan the proxy routes share the exact geometry.
+        exact_dequantized: Constexpr[bool] = cfg.sage_scores_dequantized_for(
+            proxy=False
+        )
         if cutlass.const_expr(use_sparse and cfg.use_block_sparse_proxy_routes):
             # The route kind and the tail location are the same for every
             # lane; stating that keeps the fold and the load/store branch
@@ -3005,8 +3010,10 @@ class TmemSResource(DecodeGenResourceBase):
         cfg = self.cfg
         num_fragments = cfg.num_softmax_score_fragments
         fragment_regs = cfg.softmax_score_fragment_regs
-        groups: Constexpr[int] = cfg.sage_k_groups_per_fragment_for(proxy_kind)
-        dequantize_scores: Constexpr[bool] = cfg.sage_scores_dequantized_for(proxy_kind)
+        groups: Constexpr[int] = cfg.sage_k_groups_per_fragment_for(proxy=proxy_kind)
+        dequantize_scores: Constexpr[bool] = cfg.sage_scores_dequantized_for(
+            proxy=proxy_kind
+        )
         for fragment in cutlass.range(num_fragments, unroll=1):
             fragment_scales = None
             if cutlass.const_expr(cfg.use_sage_attention and proxy_kind):
