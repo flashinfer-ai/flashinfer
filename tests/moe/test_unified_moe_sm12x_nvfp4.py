@@ -73,14 +73,19 @@ def _make_weight(rows, columns, seed):
 
 @pytest.mark.parametrize("tokens", [8, 129])
 @pytest.mark.parametrize("enable_pdl", [False, True])
-def test_sm12x_nvfp4_unified_runner_matches_composed_ops(tokens, enable_pdl):
+def test_sm12x_nvfp4_unified_runner_matches_composed_ops(
+    tokens, enable_pdl, monkeypatch
+):
     if not (torch.cuda.is_available() and is_sm120a_supported(torch.device("cuda"))):
         pytest.skip("requires an SM120a device")
     torch.manual_seed(11)
+    validation_env = "FLASHINFER_SM12X_NVFP4_VALIDATE_TOPK_IDS"
+    monkeypatch.delenv(validation_env, raising=False)
     experts, top_k, hidden, intermediate = 4, 2, 512, 512
     x = torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16) / 10
     token = torch.arange(tokens, device="cuda")
     ids = torch.stack([token % experts, (token + 1) % experts], dim=1).to(torch.int32)
+    ids[-1, :] = -1
     route_weights = torch.softmax(torch.randn(tokens, top_k, device="cuda"), dim=1)
     w1, w1_sf = zip(
         *(
@@ -148,16 +153,27 @@ def test_sm12x_nvfp4_unified_runner_matches_composed_ops(tokens, enable_pdl):
         tune=False,
     )
     torch.testing.assert_close(got, ref, rtol=0, atol=0.0625)
+    torch.testing.assert_close(got[-1], torch.zeros_like(got[-1]), rtol=0, atol=0)
 
-    for bad_id in (-1, experts):
-        ids[0, 0] = bad_id
-        with pytest.raises(ValueError, match="0 <= id"):
-            MoELayer(config, device=x.device)(act, weights)
+    ids[0, 0] = experts
+    with pytest.raises(ValueError, match="union"):
+        MoELayer(config, device=x.device)(act, weights)
     ids[0, 0] = 0
 
-    runner = object.__new__(SM12xNvfp4Runner)
-    runner._topk_validation_receipt = None
+    runner = SM12xNvfp4Runner(config, x.device)
+    assert runner._validate_topk_ids
     runner._validate_expert_id_range(ids, experts)
+    original_capture_check = torch.cuda.is_current_stream_capturing
+    torch.cuda.is_current_stream_capturing = lambda: True
+    try:
+        with pytest.raises(RuntimeError, match="VALIDATE_TOPK_IDS=0"):
+            runner._validate_expert_id_range(ids, experts)
+    finally:
+        torch.cuda.is_current_stream_capturing = original_capture_check
+
+    monkeypatch.setenv(validation_env, "0")
+    runner = SM12xNvfp4Runner(config, x.device)
+    assert not runner._validate_topk_ids
     graph = torch.cuda.CUDAGraph()
     captured_ids = torch.empty_like(ids)
     with torch.cuda.graph(graph):
