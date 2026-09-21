@@ -2087,6 +2087,7 @@ def test_cake_public_context_route_miss_canonicalizes_only_pinned_noop_skip(
     )
 
     assert result.shape == query.shape
+    assert len(observed["args"]) == 34
     assert observed["args"][26] == expected_ffi_value
 
 
