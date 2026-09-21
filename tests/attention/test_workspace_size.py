@@ -112,6 +112,45 @@ def test_batch_decode_workspace_size_plans_with_exact_buffers(use_cuda_graph):
     assert wrapper._plan_info is not None
 
 
+@pytest.mark.parametrize("q_len_per_req", [0, -1])
+@pytest.mark.parametrize("disable_split_kv", [False, True])
+@pytest.mark.parametrize("use_tensor_cores", [False, True])
+@pytest.mark.parametrize("use_cuda_graph", [False, True])
+def test_batch_decode_workspace_size_rejects_nonpositive_query_length(
+    q_len_per_req, disable_split_kv, use_tensor_cores, use_cuda_graph
+):
+    indptr, indices, last_page_len = _paged_kv_inputs(2, 4, 1)
+    kwargs = {}
+    if use_cuda_graph:
+        kwargs = {
+            "paged_kv_indptr_buffer": torch.empty_like(indptr),
+            "paged_kv_indices_buffer": torch.empty_like(indices),
+            "paged_kv_last_page_len_buffer": torch.empty_like(last_page_len),
+        }
+    wrapper = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
+        _byte_workspace(32 * 1024 * 1024),
+        use_cuda_graph=use_cuda_graph,
+        use_tensor_cores=use_tensor_cores,
+        backend="fa2",
+        **kwargs,
+    )
+
+    with pytest.raises(
+        ValueError, match=rf"q_len_per_req must be >= 1, got {q_len_per_req}"
+    ):
+        wrapper.workspace_size(
+            indptr,
+            indices,
+            last_page_len,
+            16,
+            2,
+            128,
+            1,
+            disable_split_kv=disable_split_kv,
+            q_len_per_req=q_len_per_req,
+        )
+
+
 @pytest.mark.parametrize("q_len_per_req", [1, 3])
 def test_batch_decode_workspace_size_plans_fa2_no_split_cuda_graph(q_len_per_req):
     batch_size = 2

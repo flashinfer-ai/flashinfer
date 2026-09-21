@@ -1261,6 +1261,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         ... )
         >>> wrapper.plan(...)
         """
+        if q_len_per_req < 1:
+            raise ValueError(f"q_len_per_req must be >= 1, got {q_len_per_req}")
         _check_workspace_buffer_alignment(
             self._float_workspace_buffer, "float_workspace_buffer"
         )
