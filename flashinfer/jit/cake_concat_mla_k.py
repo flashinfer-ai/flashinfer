@@ -16,12 +16,14 @@ from .core import (
     logger,
     sm100f_nvcc_flags,
     sm103a_nvcc_flags,
+    sm107a_nvcc_flags,
 )
 
-CakeConcatMLAKTarget = Literal["sm100f", "sm103a"]
+CakeConcatMLAKTarget = Literal["sm100f", "sm103a", "sm107a"]
 _TARGET_FLAGS = {
     "sm100f": sm100f_nvcc_flags,
     "sm103a": sm103a_nvcc_flags,
+    "sm107a": sm107a_nvcc_flags,
 }
 
 _MANIFEST_NAME = "cake_concat_mla_k_import_manifest.json"
@@ -300,9 +302,16 @@ def cake_concat_mla_k_target(device) -> CakeConcatMLAKTarget:
         return "sm100f"
     if capability == (10, 3):
         return "sm103a"
+    if capability == (10, 7):
+        if not is_cuda_version_at_least("13.0"):
+            raise RuntimeError(
+                "Cake concat MLA K on compute capability 10.7 requires CUDA "
+                "13.0 or newer for the sm_107a target"
+            )
+        return "sm107a"
     raise RuntimeError(
         "the Cake concat MLA K backend requires compute capability 10.0 "
-        f"(SM100f) or 10.3 (SM103a), got {capability[0]}.{capability[1]}"
+        f"(SM100f), 10.3 (SM103a) or 10.7 (SM107a), got {capability[0]}.{capability[1]}"
     )
 
 
