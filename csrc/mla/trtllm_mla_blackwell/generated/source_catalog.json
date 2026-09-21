@@ -1,0 +1,259 @@
+{
+  "schema_version": 3,
+  "target_order": [
+    "sm_103a_152"
+  ],
+  "targets": {
+    "sm_103a_152": {
+      "arch": "sm_103a",
+      "multi_processor_count": 152
+    }
+  },
+  "domain_order": [
+    "mla_bf16_vquarter",
+    "mla_bf16_vhalf",
+    "mla_bf16_unsplit",
+    "mla_bf16_clc",
+    "mla_bf16_tail",
+    "mla_fp8_tail",
+    "mla_fp8_p32_qk_l2",
+    "mla_fp8_page64_pdl",
+    "mla_bf16_native_split8_pdl"
+  ],
+  "domains": {
+    "mla_bf16_vquarter": {
+      "host_source": {
+        "path": "host/mla_bf16_vquarter.cpp",
+        "sha256": "cb7d0b90025ce917788c81b2e9378a94f65fc6bb1d0f95755c7f21cff00a3c0c"
+      },
+      "device_sources": {
+        "sm_103a_152": [
+          {
+            "path": "device/sm_103a_152/mla_decode_value_split_paged_bf16_ee41d3ceea.cu",
+            "sha256": "24650a23aa99b16d99a91a7f75c21b1bf307d355c43dd4981bd2c3a7b3e2adca",
+            "module_ident": "mla_decode_value_split_paged_bf16_ee41d3ceea",
+            "compile_flags": [
+              "--use_fast_math"
+            ]
+          }
+        ]
+      }
+    },
+    "mla_bf16_vhalf": {
+      "host_source": {
+        "path": "host/mla_bf16_vhalf.cpp",
+        "sha256": "f528a64812a56db2fd519f800b0141482ff5805fc3821e9331a65ebbf19ede93"
+      },
+      "device_sources": {
+        "sm_103a_152": [
+          {
+            "path": "device/sm_103a_152/mla_decode_value_split_paged_bf16_fa7b59f3a7.cu",
+            "sha256": "34663b398c802fc40c0e7681730cd5b8e46ecdcb92925c91c228e2b1d49a3263",
+            "module_ident": "mla_decode_value_split_paged_bf16_fa7b59f3a7",
+            "compile_flags": [
+              "--use_fast_math"
+            ]
+          }
+        ]
+      }
+    },
+    "mla_bf16_unsplit": {
+      "host_source": {
+        "path": "host/mla_bf16_unsplit.cpp",
+        "sha256": "6aa4b7154454e81122872ead8cec35cc0b9c967ae4c23e1ada7f59f7462b65c1"
+      },
+      "device_sources": {
+        "sm_103a_152": [
+          {
+            "path": "device/sm_103a_152/mla_decode_value_split_paged_bf16_5c36fe8228.cu",
+            "sha256": "842d57f47f3cc2de2f09ded4468922c1ebfb96ca64a62ff9267b7ffd67c1cb02",
+            "module_ident": "mla_decode_value_split_paged_bf16_5c36fe8228",
+            "compile_flags": [
+              "--use_fast_math"
+            ]
+          }
+        ]
+      }
+    },
+    "mla_bf16_clc": {
+      "host_source": {
+        "path": "host/mla_bf16_clc.cpp",
+        "sha256": "dc3b02f67db356908a21338fcab100a7579508cf9c50faff720980d8360ecc41"
+      },
+      "device_sources": {
+        "sm_103a_152": [
+          {
+            "path": "device/sm_103a_152/mla_decode_exact_live_bf16_clc_0584ed27d1.cu",
+            "sha256": "6843541ea969cd09c9ac16f1c75db800e9b21f434c85c0caa60ab0efe8691c06",
+            "module_ident": "mla_decode_exact_live_bf16_clc_0584ed27d1",
+            "compile_flags": [
+              "--use_fast_math"
+            ]
+          },
+          {
+            "path": "device/sm_103a_152/mla_decode_exact_live_bf16_clc_2156c28515.cu",
+            "sha256": "38b10de49a1523ff4db86780501e88dbc0adeb6b1a2f60db01c019faf2c43f7e",
+            "module_ident": "mla_decode_exact_live_bf16_clc_2156c28515",
+            "compile_flags": [
+              "--use_fast_math"
+            ]
+          },
+          {
+            "path": "device/sm_103a_152/mla_decode_exact_live_bf16_clc_23ac982d1b.cu",
+            "sha256": "9544d748c2933d89043ca4f20ee889ab7f2ce6b4f2917f0d62489604526c161c",
+            "module_ident": "mla_decode_exact_live_bf16_clc_23ac982d1b",
+            "compile_flags": [
+              "--use_fast_math"
+            ]
+          },
+          {
+            "path": "device/sm_103a_152/mla_decode_exact_live_bf16_clc_4634ab4d25.cu",
+            "sha256": "5d51b11c9fab0519878ac7753a129afebec07c4addb5304fb1e86b0246d4d6da",
+            "module_ident": "mla_decode_exact_live_bf16_clc_4634ab4d25",
+            "compile_flags": [
+              "--use_fast_math"
+            ]
+          },
+          {
+            "path": "device/sm_103a_152/mla_decode_exact_live_bf16_clc_46457f7f5b.cu",
+            "sha256": "8f3e8871fb61a4d45f5662b86cfcf7bc983ba33dc3a003269745495b7fa2252a",
+            "module_ident": "mla_decode_exact_live_bf16_clc_46457f7f5b",
+            "compile_flags": [
+              "--use_fast_math"
+            ]
+          },
+          {
+            "path": "device/sm_103a_152/mla_decode_exact_live_bf16_clc_7538e3766e.cu",
+            "sha256": "c1c2eb6c642f3516d819319eb8a3d44ac05cb58cbb1b0b58756cb1d04306d808",
+            "module_ident": "mla_decode_exact_live_bf16_clc_7538e3766e",
+            "compile_flags": [
+              "--use_fast_math"
+            ]
+          },
+          {
+            "path": "device/sm_103a_152/mla_decode_exact_live_bf16_clc_ab485aea76.cu",
+            "sha256": "4d7983b5e956b2b63c3041584c12ceacb7872249c52ee4b28b46efadebe97e38",
+            "module_ident": "mla_decode_exact_live_bf16_clc_ab485aea76",
+            "compile_flags": [
+              "--use_fast_math"
+            ]
+          },
+          {
+            "path": "device/sm_103a_152/mla_decode_exact_live_bf16_clc_f2b7cb67bf.cu",
+            "sha256": "2ce7969898611bff7decccf63bc59d9833601eceebfdf4dede9919ebfb54cdb9",
+            "module_ident": "mla_decode_exact_live_bf16_clc_f2b7cb67bf",
+            "compile_flags": [
+              "--use_fast_math"
+            ]
+          }
+        ]
+      }
+    },
+    "mla_bf16_tail": {
+      "host_source": {
+        "path": "host/mla_bf16_tail.cpp",
+        "sha256": "045ba76c818fd3d849dfe939917afd391f938da2d6c959d7ed6176f9e83e4e89"
+      },
+      "device_sources": {
+        "sm_103a_152": [
+          {
+            "path": "device/sm_103a_152/full_abi_tail_bf16_83451b7317.cu",
+            "sha256": "c98b67d0ccfc468c1942885d6d1bfb69f161fdea74af1b67557d5043eb4f5962",
+            "module_ident": "full_abi_tail_bf16_83451b7317",
+            "compile_flags": [
+              "--use_fast_math"
+            ]
+          }
+        ]
+      }
+    },
+    "mla_fp8_tail": {
+      "host_source": {
+        "path": "host/mla_fp8_tail.cpp",
+        "sha256": "8211124df7b910a33662895a31b3ae26bc0dc97d3c2cb46f8390603c9707a576"
+      },
+      "device_sources": {
+        "sm_103a_152": [
+          {
+            "path": "device/sm_103a_152/full_abi_tail_fp8_26b36022eb.cu",
+            "sha256": "b1a59925f7c575ef3aba9496e217fc714f5da60c378ba22c15e5e4fc5fde3ef2",
+            "module_ident": "full_abi_tail_fp8_26b36022eb",
+            "compile_flags": [
+              "--use_fast_math"
+            ]
+          }
+        ]
+      }
+    },
+    "mla_fp8_p32_qk_l2": {
+      "host_source": {
+        "path": "host/mla_fp8_p32_qk_l2.cpp",
+        "sha256": "57d9d49712844df776da710343ce6ae3a9f7c95ff1e2d5cd4d43fb6020c37de4"
+      },
+      "device_sources": {
+        "sm_103a_152": [
+          {
+            "path": "device/sm_103a_152/fp8_p32_exact_producer_105fd84009.cu",
+            "sha256": "2f4402efaf50df389e9306b0fe15e9f3ded64c1b62642c56615b267e8759c794",
+            "module_ident": "fp8_p32_exact_producer_105fd84009",
+            "compile_flags": [
+              "--use_fast_math"
+            ]
+          }
+        ]
+      }
+    },
+    "mla_fp8_page64_pdl": {
+      "host_source": {
+        "path": "host/mla_fp8_page64_pdl.cpp",
+        "sha256": "93497913cdf83a5eb0acf257f96398f9204d9f7dfc36178bd6d9274b8cc56c1b"
+      },
+      "device_sources": {
+        "sm_103a_152": [
+          {
+            "path": "device/sm_103a_152/page64_keeps_gmem_separate_reduce_cea01a87e9.cu",
+            "sha256": "0255711ffe766bd5499cda419f43ed3b0eaa16fca59a627ae5819b5354c75158",
+            "module_ident": "page64_keeps_gmem_separate_reduce_cea01a87e9",
+            "compile_flags": [
+              "--use_fast_math"
+            ]
+          },
+          {
+            "path": "device/sm_103a_152/trtllm_mla_decode_fp8_6fe1e0de09.cu",
+            "sha256": "386cc5bcdb054f452631e0c40890d8916b83800ab9eb437d3094f338592b4ae1",
+            "module_ident": "trtllm_mla_decode_fp8_6fe1e0de09",
+            "compile_flags": [
+              "--use_fast_math"
+            ]
+          }
+        ]
+      }
+    },
+    "mla_bf16_native_split8_pdl": {
+      "host_source": {
+        "path": "host/mla_bf16_native_split8_pdl.cpp",
+        "sha256": "cb5d6ec3aa37b7210858109e8b09e3234051111319f828f5148a031e654118db"
+      },
+      "device_sources": {
+        "sm_103a_152": [
+          {
+            "path": "device/sm_103a_152/mla_decode_v32_paged_bf16_c80238a3c3.cu",
+            "sha256": "eaee2652ed19052ff265a1c05cba04db99c295582943e55cd889ad59a2ee7fe6",
+            "module_ident": "mla_decode_v32_paged_bf16_c80238a3c3",
+            "compile_flags": [
+              "--use_fast_math"
+            ]
+          },
+          {
+            "path": "device/sm_103a_152/mla_decode_v32_reduce_1db619cce9.cu",
+            "sha256": "7a8ef76e7f8f798b11098f79a229efd8c998ab75f1810494f08d3191eaec3f48",
+            "module_ident": "mla_decode_v32_reduce_1db619cce9",
+            "compile_flags": [
+              "--use_fast_math"
+            ]
+          }
+        ]
+      }
+    }
+  }
+}
