@@ -1,0 +1,1175 @@
+{
+  "arch": "sm_103a",
+  "programs": {
+    "cake_mixed_fp8_fp4_gemm_sm103a_06b961a0f0335648f346_kernel": {
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "A"
+        ],
+        [
+          "tma_buffer",
+          "B"
+        ],
+        [
+          "tma_buffer",
+          "SFA"
+        ],
+        [
+          "tma_buffer",
+          "SFB"
+        ],
+        [
+          "tma_buffer",
+          "C_tma"
+        ],
+        [
+          "parameter",
+          "M"
+        ],
+        [
+          "parameter",
+          "N"
+        ],
+        [
+          "parameter",
+          "K"
+        ],
+        [
+          "parameter",
+          "grid_m"
+        ],
+        [
+          "parameter",
+          "grid_n"
+        ],
+        [
+          "parameter",
+          "K_tiles"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "closure_sha256": "d4b4b009f555111f15af82432c04e1386ac75eb0b5033f07acb6e3dcd9f54b22",
+      "compile_flags": [],
+      "ffi_entry": "run",
+      "name": "cake_mixed_fp8_fp4_gemm_sm103a_06b961a0f0335648f346",
+      "role": "kernel",
+      "sources": [
+        "csrc/experimental/deepgemm_mixed_gemm/generated/sm_103a/cake_mixed_fp8_fp4_gemm_sm103a_06b961a0f0335648f346_kernel.cu",
+        "csrc/experimental/deepgemm_mixed_gemm/generated/sm_103a/cake_mixed_fp8_fp4_gemm_sm103a_06b961a0f0335648f346_binding.cu"
+      ],
+      "tma_workspace_bytes": 0
+    },
+    "cake_mixed_fp8_fp4_gemm_sm103a_10cdf761451540869d76_kernel": {
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "A"
+        ],
+        [
+          "tma_buffer",
+          "B"
+        ],
+        [
+          "tma_buffer",
+          "SFA"
+        ],
+        [
+          "tma_buffer",
+          "SFB"
+        ],
+        [
+          "tma_buffer",
+          "C_tma"
+        ],
+        [
+          "parameter",
+          "M"
+        ],
+        [
+          "parameter",
+          "N"
+        ],
+        [
+          "parameter",
+          "K"
+        ],
+        [
+          "parameter",
+          "grid_m"
+        ],
+        [
+          "parameter",
+          "grid_n"
+        ],
+        [
+          "parameter",
+          "K_tiles"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "closure_sha256": "0112e35632de309be3d503a7b655af96243e1aee85ba25350898dcb7c89682eb",
+      "compile_flags": [],
+      "ffi_entry": "run",
+      "name": "cake_mixed_fp8_fp4_gemm_sm103a_10cdf761451540869d76",
+      "role": "kernel",
+      "sources": [
+        "csrc/experimental/deepgemm_mixed_gemm/generated/sm_103a/cake_mixed_fp8_fp4_gemm_sm103a_10cdf761451540869d76_kernel.cu",
+        "csrc/experimental/deepgemm_mixed_gemm/generated/sm_103a/cake_mixed_fp8_fp4_gemm_sm103a_10cdf761451540869d76_binding.cu"
+      ],
+      "tma_workspace_bytes": 0
+    },
+    "cake_mixed_fp8_fp4_gemm_sm103a_1227956dc12937d633eb_kernel": {
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "SFA"
+        ],
+        [
+          "tma_buffer",
+          "SFB"
+        ],
+        [
+          "tma_buffer",
+          "A"
+        ],
+        [
+          "tma_buffer",
+          "B"
+        ],
+        [
+          "tma_buffer",
+          "C_tma"
+        ],
+        [
+          "parameter",
+          "M"
+        ],
+        [
+          "parameter",
+          "N"
+        ],
+        [
+          "parameter",
+          "K"
+        ],
+        [
+          "parameter",
+          "grid_m"
+        ],
+        [
+          "parameter",
+          "grid_n"
+        ],
+        [
+          "parameter",
+          "K_tiles"
+        ],
+        [
+          "workspace",
+          "tma_descriptor_workspace"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "closure_sha256": "e7e31da101d0e636b5f877344e49639925f55484bdbac99d0db01d349b8ef953",
+      "compile_flags": [],
+      "ffi_entry": "run",
+      "name": "cake_mixed_fp8_fp4_gemm_sm103a_1227956dc12937d633eb",
+      "role": "kernel",
+      "sources": [
+        "csrc/experimental/deepgemm_mixed_gemm/generated/sm_103a/cake_mixed_fp8_fp4_gemm_sm103a_1227956dc12937d633eb_kernel.cu",
+        "csrc/experimental/deepgemm_mixed_gemm/generated/sm_103a/cake_mixed_fp8_fp4_gemm_sm103a_1227956dc12937d633eb_cached_binding.cu"
+      ],
+      "tma_workspace_bytes": 640
+    },
+    "cake_mixed_fp8_fp4_gemm_sm103a_2ce73a0161d86b8b12af_kernel": {
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "A"
+        ],
+        [
+          "tma_buffer",
+          "B"
+        ],
+        [
+          "tma_buffer",
+          "SFA"
+        ],
+        [
+          "tma_buffer",
+          "SFB"
+        ],
+        [
+          "tma_buffer",
+          "C_tma"
+        ],
+        [
+          "parameter",
+          "M"
+        ],
+        [
+          "parameter",
+          "N"
+        ],
+        [
+          "parameter",
+          "K"
+        ],
+        [
+          "parameter",
+          "grid_m"
+        ],
+        [
+          "parameter",
+          "grid_n"
+        ],
+        [
+          "parameter",
+          "K_tiles"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "closure_sha256": "80b1bd3c7d5449e08499c14550d80d55b7e49d4bb3fcd5e31340e0441a38a992",
+      "compile_flags": [],
+      "ffi_entry": "run",
+      "name": "cake_mixed_fp8_fp4_gemm_sm103a_2ce73a0161d86b8b12af",
+      "role": "kernel",
+      "sources": [
+        "csrc/experimental/deepgemm_mixed_gemm/generated/sm_103a/cake_mixed_fp8_fp4_gemm_sm103a_2ce73a0161d86b8b12af_kernel.cu",
+        "csrc/experimental/deepgemm_mixed_gemm/generated/sm_103a/cake_mixed_fp8_fp4_gemm_sm103a_2ce73a0161d86b8b12af_binding.cu"
+      ],
+      "tma_workspace_bytes": 0
+    },
+    "cake_mixed_fp8_fp4_gemm_sm103a_3085b3af75cec72980ab_kernel": {
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "A"
+        ],
+        [
+          "tma_buffer",
+          "B"
+        ],
+        [
+          "tma_buffer",
+          "SFA"
+        ],
+        [
+          "tma_buffer",
+          "SFB"
+        ],
+        [
+          "tma_buffer",
+          "C_tma"
+        ],
+        [
+          "parameter",
+          "M"
+        ],
+        [
+          "parameter",
+          "N"
+        ],
+        [
+          "parameter",
+          "K"
+        ],
+        [
+          "parameter",
+          "grid_m"
+        ],
+        [
+          "parameter",
+          "grid_n"
+        ],
+        [
+          "parameter",
+          "K_tiles"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "closure_sha256": "3ca78e592f4cda5420f247aa74c84829b6a6f14acf34fe278710f809c73a948b",
+      "compile_flags": [],
+      "ffi_entry": "run",
+      "name": "cake_mixed_fp8_fp4_gemm_sm103a_3085b3af75cec72980ab",
+      "role": "kernel",
+      "sources": [
+        "csrc/experimental/deepgemm_mixed_gemm/generated/sm_103a/cake_mixed_fp8_fp4_gemm_sm103a_3085b3af75cec72980ab_kernel.cu",
+        "csrc/experimental/deepgemm_mixed_gemm/generated/sm_103a/cake_mixed_fp8_fp4_gemm_sm103a_3085b3af75cec72980ab_binding.cu"
+      ],
+      "tma_workspace_bytes": 0
+    },
+    "cake_mixed_fp8_fp4_gemm_sm103a_63403ebdf1b8575ad206_kernel": {
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "A"
+        ],
+        [
+          "tma_buffer",
+          "B"
+        ],
+        [
+          "tma_buffer",
+          "SFA"
+        ],
+        [
+          "tma_buffer",
+          "SFB"
+        ],
+        [
+          "tma_buffer",
+          "C_tma"
+        ],
+        [
+          "parameter",
+          "M"
+        ],
+        [
+          "parameter",
+          "N"
+        ],
+        [
+          "parameter",
+          "K"
+        ],
+        [
+          "parameter",
+          "grid_m"
+        ],
+        [
+          "parameter",
+          "grid_n"
+        ],
+        [
+          "parameter",
+          "K_tiles"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "closure_sha256": "a4717c2ef8f74d3d454d53418266393cffcdad96537e063d16c06bf2d3a0d183",
+      "compile_flags": [],
+      "ffi_entry": "run",
+      "name": "cake_mixed_fp8_fp4_gemm_sm103a_63403ebdf1b8575ad206",
+      "role": "kernel",
+      "sources": [
+        "csrc/experimental/deepgemm_mixed_gemm/generated/sm_103a/cake_mixed_fp8_fp4_gemm_sm103a_63403ebdf1b8575ad206_kernel.cu",
+        "csrc/experimental/deepgemm_mixed_gemm/generated/sm_103a/cake_mixed_fp8_fp4_gemm_sm103a_63403ebdf1b8575ad206_binding.cu"
+      ],
+      "tma_workspace_bytes": 0
+    },
+    "cake_mixed_fp8_fp4_gemm_sm103a_924709fdbade6e235685_kernel": {
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "A"
+        ],
+        [
+          "tma_buffer",
+          "B"
+        ],
+        [
+          "tma_buffer",
+          "SFA"
+        ],
+        [
+          "tma_buffer",
+          "SFB"
+        ],
+        [
+          "tma_buffer",
+          "C_tma"
+        ],
+        [
+          "parameter",
+          "M"
+        ],
+        [
+          "parameter",
+          "N"
+        ],
+        [
+          "parameter",
+          "K"
+        ],
+        [
+          "parameter",
+          "grid_m"
+        ],
+        [
+          "parameter",
+          "grid_n"
+        ],
+        [
+          "parameter",
+          "K_tiles"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "closure_sha256": "60cd97f24a6bdc2f6d048d1baf6c94ee5ef613ede7799f570d8b3c4006848adc",
+      "compile_flags": [],
+      "ffi_entry": "run",
+      "name": "cake_mixed_fp8_fp4_gemm_sm103a_924709fdbade6e235685",
+      "role": "kernel",
+      "sources": [
+        "csrc/experimental/deepgemm_mixed_gemm/generated/sm_103a/cake_mixed_fp8_fp4_gemm_sm103a_924709fdbade6e235685_kernel.cu",
+        "csrc/experimental/deepgemm_mixed_gemm/generated/sm_103a/cake_mixed_fp8_fp4_gemm_sm103a_924709fdbade6e235685_binding.cu"
+      ],
+      "tma_workspace_bytes": 0
+    },
+    "cake_mixed_fp8_fp4_gemm_sm103a_a90a14eb58200a059fd9_kernel": {
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "A"
+        ],
+        [
+          "tma_buffer",
+          "B"
+        ],
+        [
+          "tma_buffer",
+          "SFA"
+        ],
+        [
+          "tma_buffer",
+          "SFB"
+        ],
+        [
+          "tma_buffer",
+          "C_tma"
+        ],
+        [
+          "parameter",
+          "M"
+        ],
+        [
+          "parameter",
+          "N"
+        ],
+        [
+          "parameter",
+          "K"
+        ],
+        [
+          "parameter",
+          "grid_m"
+        ],
+        [
+          "parameter",
+          "grid_n"
+        ],
+        [
+          "parameter",
+          "K_tiles"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "closure_sha256": "435742a62cb02eb2cdbc6a33d69adf06576b007ef13b35f2c653eef859de9384",
+      "compile_flags": [],
+      "ffi_entry": "run",
+      "name": "cake_mixed_fp8_fp4_gemm_sm103a_a90a14eb58200a059fd9",
+      "role": "kernel",
+      "sources": [
+        "csrc/experimental/deepgemm_mixed_gemm/generated/sm_103a/cake_mixed_fp8_fp4_gemm_sm103a_a90a14eb58200a059fd9_kernel.cu",
+        "csrc/experimental/deepgemm_mixed_gemm/generated/sm_103a/cake_mixed_fp8_fp4_gemm_sm103a_a90a14eb58200a059fd9_binding.cu"
+      ],
+      "tma_workspace_bytes": 0
+    },
+    "cake_mixed_fp8_fp4_gemm_sm103a_cfb256106f9e3a6a90b8_kernel": {
+      "arg_plan": [
+        [
+          "buffer",
+          "SFA"
+        ],
+        [
+          "buffer",
+          "SFB"
+        ],
+        [
+          "tma_buffer",
+          "A"
+        ],
+        [
+          "tma_buffer",
+          "B"
+        ],
+        [
+          "tma_buffer",
+          "C_tma"
+        ],
+        [
+          "parameter",
+          "M"
+        ],
+        [
+          "parameter",
+          "N"
+        ],
+        [
+          "parameter",
+          "K"
+        ],
+        [
+          "parameter",
+          "grid_m"
+        ],
+        [
+          "parameter",
+          "grid_n"
+        ],
+        [
+          "parameter",
+          "K_tiles"
+        ],
+        [
+          "workspace",
+          "tma_descriptor_workspace"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "closure_sha256": "b62098676f2bf506fe2d3130f17809343625c0a25901ddf4e89956c336221b07",
+      "compile_flags": [],
+      "ffi_entry": "run",
+      "name": "cake_mixed_fp8_fp4_gemm_sm103a_cfb256106f9e3a6a90b8",
+      "role": "kernel",
+      "sources": [
+        "csrc/experimental/deepgemm_mixed_gemm/generated/sm_103a/cake_mixed_fp8_fp4_gemm_sm103a_cfb256106f9e3a6a90b8_kernel.cu",
+        "csrc/experimental/deepgemm_mixed_gemm/generated/sm_103a/cake_mixed_fp8_fp4_gemm_sm103a_cfb256106f9e3a6a90b8_cached_binding.cu"
+      ],
+      "tma_workspace_bytes": 384
+    },
+    "cake_mixed_fp8_fp4_gemm_sm103a_f329a333df92b18f38d0_kernel": {
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "SFA"
+        ],
+        [
+          "tma_buffer",
+          "SFB"
+        ],
+        [
+          "tma_buffer",
+          "A"
+        ],
+        [
+          "tma_buffer",
+          "B"
+        ],
+        [
+          "tma_buffer",
+          "C_tma"
+        ],
+        [
+          "parameter",
+          "M"
+        ],
+        [
+          "parameter",
+          "N"
+        ],
+        [
+          "parameter",
+          "K"
+        ],
+        [
+          "parameter",
+          "grid_m"
+        ],
+        [
+          "parameter",
+          "grid_n"
+        ],
+        [
+          "parameter",
+          "K_tiles"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "closure_sha256": "8b8bbc7e17f1acee19fec820be1725f1799de909f1166b27378051af4170b260",
+      "compile_flags": [],
+      "ffi_entry": "run",
+      "name": "cake_mixed_fp8_fp4_gemm_sm103a_f329a333df92b18f38d0",
+      "role": "kernel",
+      "sources": [
+        "csrc/experimental/deepgemm_mixed_gemm/generated/sm_103a/cake_mixed_fp8_fp4_gemm_sm103a_f329a333df92b18f38d0_kernel.cu",
+        "csrc/experimental/deepgemm_mixed_gemm/generated/sm_103a/cake_mixed_fp8_fp4_gemm_sm103a_f329a333df92b18f38d0_binding.cu"
+      ],
+      "tma_workspace_bytes": 0
+    },
+    "cake_mixed_fp8_fp4_gemm_sm103a_f7a8370f9078e4614fc7_kernel": {
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "SFA"
+        ],
+        [
+          "tma_buffer",
+          "SFB"
+        ],
+        [
+          "tma_buffer",
+          "A"
+        ],
+        [
+          "tma_buffer",
+          "B"
+        ],
+        [
+          "tma_buffer",
+          "C_tma"
+        ],
+        [
+          "parameter",
+          "M"
+        ],
+        [
+          "parameter",
+          "N"
+        ],
+        [
+          "parameter",
+          "K"
+        ],
+        [
+          "parameter",
+          "grid_m"
+        ],
+        [
+          "parameter",
+          "grid_n"
+        ],
+        [
+          "parameter",
+          "K_tiles"
+        ],
+        [
+          "workspace",
+          "tma_descriptor_workspace"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "closure_sha256": "2e8d07b603b83fb9b050eb46723e9419519384d3f5c16b2352d962200268e6b1",
+      "compile_flags": [],
+      "ffi_entry": "run",
+      "name": "cake_mixed_fp8_fp4_gemm_sm103a_f7a8370f9078e4614fc7",
+      "role": "kernel",
+      "sources": [
+        "csrc/experimental/deepgemm_mixed_gemm/generated/sm_103a/cake_mixed_fp8_fp4_gemm_sm103a_f7a8370f9078e4614fc7_kernel.cu",
+        "csrc/experimental/deepgemm_mixed_gemm/generated/sm_103a/cake_mixed_fp8_fp4_gemm_sm103a_f7a8370f9078e4614fc7_cached_binding.cu"
+      ],
+      "tma_workspace_bytes": 640
+    },
+    "cake_mixed_fp8_fp4_gemm_sm103a_ff4bf8b60793193f1a64_kernel": {
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "A"
+        ],
+        [
+          "tma_buffer",
+          "B"
+        ],
+        [
+          "tma_buffer",
+          "SFA"
+        ],
+        [
+          "tma_buffer",
+          "SFB"
+        ],
+        [
+          "tma_buffer",
+          "C_tma"
+        ],
+        [
+          "parameter",
+          "M"
+        ],
+        [
+          "parameter",
+          "N"
+        ],
+        [
+          "parameter",
+          "K"
+        ],
+        [
+          "parameter",
+          "grid_m"
+        ],
+        [
+          "parameter",
+          "grid_n"
+        ],
+        [
+          "parameter",
+          "K_tiles"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "closure_sha256": "3e4be788ac14a94034e7404554ea4b3a92cd16588b81094b8d1a09f09b5537d4",
+      "compile_flags": [],
+      "ffi_entry": "run",
+      "name": "cake_mixed_fp8_fp4_gemm_sm103a_ff4bf8b60793193f1a64",
+      "role": "kernel",
+      "sources": [
+        "csrc/experimental/deepgemm_mixed_gemm/generated/sm_103a/cake_mixed_fp8_fp4_gemm_sm103a_ff4bf8b60793193f1a64_kernel.cu",
+        "csrc/experimental/deepgemm_mixed_gemm/generated/sm_103a/cake_mixed_fp8_fp4_gemm_sm103a_ff4bf8b60793193f1a64_binding.cu"
+      ],
+      "tma_workspace_bytes": 0
+    }
+  },
+  "routes": {
+    "128:4608:5120:152:None:128:32": {
+      "config": {
+        "K_tiles": 40,
+        "gran_k_a": 32,
+        "grid": [
+          152,
+          1,
+          1
+        ],
+        "grid_m": 4,
+        "grid_n": 36,
+        "input_m": 128,
+        "output_m": 128,
+        "sfa_layout": "native",
+        "sfa_mn": 128,
+        "sfa_words": 40,
+        "sfb_mn": 4608,
+        "sfb_words": 40
+      },
+      "program": "cake_mixed_fp8_fp4_gemm_sm103a_3085b3af75cec72980ab_kernel"
+    },
+    "128:5120:2304:152:None:128:32": {
+      "config": {
+        "K_tiles": 18,
+        "gran_k_a": 32,
+        "grid": [
+          152,
+          1,
+          1
+        ],
+        "grid_m": 3,
+        "grid_n": 40,
+        "input_m": 128,
+        "output_m": 128,
+        "sfa_layout": "native",
+        "sfa_mn": 128,
+        "sfa_words": 18,
+        "sfb_mn": 5120,
+        "sfb_words": 18
+      },
+      "program": "cake_mixed_fp8_fp4_gemm_sm103a_ff4bf8b60793193f1a64_kernel"
+    },
+    "16:4608:5120:152:None:128:32": {
+      "config": {
+        "K_tiles": 40,
+        "gran_k_a": 32,
+        "grid": [
+          152,
+          1,
+          1
+        ],
+        "grid_m": 1,
+        "grid_n": 36,
+        "input_m": 16,
+        "output_m": 16,
+        "sfa_layout": "native",
+        "sfa_mn": 16,
+        "sfa_words": 40,
+        "sfb_mn": 4608,
+        "sfb_words": 40
+      },
+      "program": "cake_mixed_fp8_fp4_gemm_sm103a_06b961a0f0335648f346_kernel"
+    },
+    "16:5120:2304:152:None:128:32": {
+      "config": {
+        "K_tiles": 18,
+        "gran_k_a": 32,
+        "grid": [
+          152,
+          1,
+          1
+        ],
+        "grid_m": 1,
+        "grid_n": 40,
+        "input_m": 16,
+        "output_m": 16,
+        "sfa_layout": "native",
+        "sfa_mn": 16,
+        "sfa_words": 18,
+        "sfb_mn": 5120,
+        "sfb_words": 18
+      },
+      "program": "cake_mixed_fp8_fp4_gemm_sm103a_63403ebdf1b8575ad206_kernel"
+    },
+    "1:4608:5120:152:None:128:32": {
+      "config": {
+        "K_tiles": 40,
+        "gran_k_a": 32,
+        "grid": [
+          152,
+          1,
+          1
+        ],
+        "grid_m": 1,
+        "grid_n": 36,
+        "input_m": 1,
+        "output_m": 1,
+        "sfa_layout": "native",
+        "sfa_mn": 4,
+        "sfa_words": 40,
+        "sfb_mn": 4608,
+        "sfb_words": 40
+      },
+      "program": "cake_mixed_fp8_fp4_gemm_sm103a_06b961a0f0335648f346_kernel"
+    },
+    "1:5120:2304:152:None:128:32": {
+      "config": {
+        "K_tiles": 18,
+        "gran_k_a": 32,
+        "grid": [
+          152,
+          1,
+          1
+        ],
+        "grid_m": 1,
+        "grid_n": 40,
+        "input_m": 1,
+        "output_m": 1,
+        "sfa_layout": "native",
+        "sfa_mn": 4,
+        "sfa_words": 18,
+        "sfb_mn": 5120,
+        "sfb_words": 18
+      },
+      "program": "cake_mixed_fp8_fp4_gemm_sm103a_63403ebdf1b8575ad206_kernel"
+    },
+    "256:128:256:152:bk256_s4:128:128": {
+      "config": {
+        "K_tiles": 1,
+        "gran_k_a": 128,
+        "grid": [
+          2,
+          1,
+          1
+        ],
+        "grid_m": 2,
+        "grid_n": 1,
+        "input_m": 256,
+        "output_m": 256,
+        "sfa_layout": "broadcast_gran128",
+        "sfa_mn": 256,
+        "sfa_words": 2,
+        "sfb_mn": 128,
+        "sfb_words": 2
+      },
+      "program": "cake_mixed_fp8_fp4_gemm_sm103a_cfb256106f9e3a6a90b8_kernel"
+    },
+    "256:224:128:152:bk128_s6:128:128": {
+      "config": {
+        "K_tiles": 1,
+        "gran_k_a": 128,
+        "grid": [
+          2,
+          1,
+          1
+        ],
+        "grid_m": 2,
+        "grid_n": 1,
+        "input_m": 256,
+        "output_m": 256,
+        "sfa_layout": "native",
+        "sfa_mn": 256,
+        "sfa_words": 1,
+        "sfb_mn": 224,
+        "sfb_words": 1
+      },
+      "program": "cake_mixed_fp8_fp4_gemm_sm103a_f329a333df92b18f38d0_kernel"
+    },
+    "256:256:256:152:None:128:32": {
+      "config": {
+        "K_tiles": 2,
+        "gran_k_a": 32,
+        "grid": [
+          4,
+          1,
+          1
+        ],
+        "grid_m": 2,
+        "grid_n": 2,
+        "input_m": 256,
+        "output_m": 256,
+        "sfa_layout": "native",
+        "sfa_mn": 256,
+        "sfa_words": 2,
+        "sfb_mn": 256,
+        "sfb_words": 2
+      },
+      "program": "cake_mixed_fp8_fp4_gemm_sm103a_f7a8370f9078e4614fc7_kernel"
+    },
+    "4096:4608:5120:152:None:128:32": {
+      "config": {
+        "K_tiles": 40,
+        "gran_k_a": 32,
+        "grid": [
+          152,
+          1,
+          1
+        ],
+        "grid_m": 32,
+        "grid_n": 18,
+        "input_m": 4096,
+        "output_m": 4096,
+        "sfa_layout": "native",
+        "sfa_mn": 4096,
+        "sfa_words": 40,
+        "sfb_mn": 4608,
+        "sfb_words": 40
+      },
+      "program": "cake_mixed_fp8_fp4_gemm_sm103a_2ce73a0161d86b8b12af_kernel"
+    },
+    "4096:5120:2304:152:None:128:32": {
+      "config": {
+        "K_tiles": 18,
+        "gran_k_a": 32,
+        "grid": [
+          152,
+          1,
+          1
+        ],
+        "grid_m": 32,
+        "grid_n": 23,
+        "input_m": 4096,
+        "output_m": 4096,
+        "sfa_layout": "native",
+        "sfa_mn": 4096,
+        "sfa_words": 18,
+        "sfb_mn": 5120,
+        "sfb_words": 18
+      },
+      "program": "cake_mixed_fp8_fp4_gemm_sm103a_924709fdbade6e235685_kernel"
+    },
+    "4096:7168:4096:152:None:224:128": {
+      "config": {
+        "K_tiles": 32,
+        "gran_k_a": 128,
+        "grid": [
+          152,
+          1,
+          1
+        ],
+        "grid_m": 32,
+        "grid_n": 32,
+        "input_m": 4096,
+        "output_m": 4096,
+        "sfa_layout": "native",
+        "sfa_mn": 4096,
+        "sfa_words": 8,
+        "sfb_mn": 7168,
+        "sfb_words": 32
+      },
+      "program": "cake_mixed_fp8_fp4_gemm_sm103a_1227956dc12937d633eb_kernel"
+    },
+    "4096:7168:4096:152:bk128_s6:128:128": {
+      "config": {
+        "K_tiles": 32,
+        "gran_k_a": 128,
+        "grid": [
+          152,
+          1,
+          1
+        ],
+        "grid_m": 32,
+        "grid_n": 32,
+        "input_m": 4096,
+        "output_m": 4096,
+        "sfa_layout": "native",
+        "sfa_mn": 4096,
+        "sfa_words": 8,
+        "sfb_mn": 7168,
+        "sfb_words": 32
+      },
+      "program": "cake_mixed_fp8_fp4_gemm_sm103a_f329a333df92b18f38d0_kernel"
+    },
+    "512:4608:5120:152:None:128:32": {
+      "config": {
+        "K_tiles": 40,
+        "gran_k_a": 32,
+        "grid": [
+          152,
+          1,
+          1
+        ],
+        "grid_m": 4,
+        "grid_n": 36,
+        "input_m": 512,
+        "output_m": 512,
+        "sfa_layout": "native",
+        "sfa_mn": 512,
+        "sfa_words": 40,
+        "sfb_mn": 4608,
+        "sfb_words": 40
+      },
+      "program": "cake_mixed_fp8_fp4_gemm_sm103a_a90a14eb58200a059fd9_kernel"
+    },
+    "512:5120:2304:152:None:128:32": {
+      "config": {
+        "K_tiles": 18,
+        "gran_k_a": 32,
+        "grid": [
+          152,
+          1,
+          1
+        ],
+        "grid_m": 4,
+        "grid_n": 32,
+        "input_m": 512,
+        "output_m": 512,
+        "sfa_layout": "native",
+        "sfa_mn": 512,
+        "sfa_words": 18,
+        "sfb_mn": 5120,
+        "sfb_words": 18
+      },
+      "program": "cake_mixed_fp8_fp4_gemm_sm103a_10cdf761451540869d76_kernel"
+    }
+  },
+  "schema": "mixed_fp8_fp4_gemm.v1"
+}

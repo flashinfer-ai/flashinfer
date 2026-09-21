@@ -1,0 +1,2120 @@
+{
+  "arch": "sm_103a",
+  "programs": {
+    "cake_mega_mhc_sm103a_08d4dff776a1693dfd68_kernel": {
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "residual_map"
+        ],
+        [
+          "tma_buffer",
+          "x_map"
+        ],
+        [
+          "tma_buffer",
+          "fn_map"
+        ],
+        [
+          "tma_buffer",
+          "post_map"
+        ],
+        [
+          "tma_buffer",
+          "comb_map"
+        ],
+        [
+          "tma_buffer",
+          "prev_map"
+        ],
+        [
+          "tma_buffer",
+          "new_residual_map"
+        ],
+        [
+          "tma_buffer",
+          "y_map"
+        ],
+        [
+          "buffer",
+          "mix_scales"
+        ],
+        [
+          "buffer",
+          "mix_bases"
+        ],
+        [
+          "buffer",
+          "new_prev_mix"
+        ],
+        [
+          "buffer",
+          "new_post_mix"
+        ],
+        [
+          "buffer",
+          "new_comb_res_mix"
+        ],
+        [
+          "buffer",
+          "rmsnorm_weight"
+        ],
+        [
+          "buffer",
+          "new_residual"
+        ],
+        [
+          "buffer",
+          "y_bf16"
+        ],
+        [
+          "buffer",
+          "y_fp8"
+        ],
+        [
+          "buffer",
+          "y_primary_sf"
+        ],
+        [
+          "buffer",
+          "y_shared_sf"
+        ],
+        [
+          "buffer",
+          "scratch"
+        ],
+        [
+          "buffer",
+          "split_barriers"
+        ],
+        [
+          "buffer",
+          "launch_epochs"
+        ],
+        [
+          "parameter",
+          "num_tokens"
+        ],
+        [
+          "parameter",
+          "hc_norm_eps"
+        ],
+        [
+          "parameter",
+          "hc_pre_eps"
+        ],
+        [
+          "parameter",
+          "hc_post_scale"
+        ],
+        [
+          "parameter",
+          "sinkhorn_eps"
+        ],
+        [
+          "parameter",
+          "num_sinkhorn_iters"
+        ],
+        [
+          "parameter",
+          "rmsnorm_eps"
+        ],
+        [
+          "parameter",
+          "rmsnorm_scale"
+        ],
+        [
+          "parameter",
+          "primary_sf_stride_token"
+        ],
+        [
+          "parameter",
+          "primary_sf_stride_word"
+        ],
+        [
+          "parameter",
+          "shared_sf_stride_word"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "closure_sha256": "4e4510ee9254f8632becaba2de8dbde9806baacedb25c43a075489e18bf4cb58",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "name": "cake_mega_mhc_sm103a_08d4dff776a1693dfd68",
+      "role": "kernel",
+      "sources": [
+        "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/cake_mega_mhc_sm103a_08d4dff776a1693dfd68_kernel.cu",
+        "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/cake_mega_mhc_sm103a_08d4dff776a1693dfd68_binding.cu"
+      ],
+      "tma_workspace_bytes": 0
+    },
+    "cake_mega_mhc_sm103a_08ea3973de387a1f2b1c_kernel": {
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "residual_map"
+        ],
+        [
+          "tma_buffer",
+          "x_map"
+        ],
+        [
+          "tma_buffer",
+          "fn_map"
+        ],
+        [
+          "tma_buffer",
+          "post_map"
+        ],
+        [
+          "tma_buffer",
+          "comb_map"
+        ],
+        [
+          "tma_buffer",
+          "prev_map"
+        ],
+        [
+          "tma_buffer",
+          "new_residual_map"
+        ],
+        [
+          "tma_buffer",
+          "y_map"
+        ],
+        [
+          "buffer",
+          "mix_scales"
+        ],
+        [
+          "buffer",
+          "mix_bases"
+        ],
+        [
+          "buffer",
+          "new_prev_mix"
+        ],
+        [
+          "buffer",
+          "new_post_mix"
+        ],
+        [
+          "buffer",
+          "new_comb_res_mix"
+        ],
+        [
+          "buffer",
+          "rmsnorm_weight"
+        ],
+        [
+          "buffer",
+          "new_residual"
+        ],
+        [
+          "buffer",
+          "y_bf16"
+        ],
+        [
+          "buffer",
+          "y_fp8"
+        ],
+        [
+          "buffer",
+          "y_primary_sf"
+        ],
+        [
+          "buffer",
+          "y_shared_sf"
+        ],
+        [
+          "buffer",
+          "scratch"
+        ],
+        [
+          "buffer",
+          "split_barriers"
+        ],
+        [
+          "buffer",
+          "launch_epochs"
+        ],
+        [
+          "parameter",
+          "num_tokens"
+        ],
+        [
+          "parameter",
+          "hc_norm_eps"
+        ],
+        [
+          "parameter",
+          "hc_pre_eps"
+        ],
+        [
+          "parameter",
+          "hc_post_scale"
+        ],
+        [
+          "parameter",
+          "sinkhorn_eps"
+        ],
+        [
+          "parameter",
+          "num_sinkhorn_iters"
+        ],
+        [
+          "parameter",
+          "rmsnorm_eps"
+        ],
+        [
+          "parameter",
+          "rmsnorm_scale"
+        ],
+        [
+          "parameter",
+          "primary_sf_stride_token"
+        ],
+        [
+          "parameter",
+          "primary_sf_stride_word"
+        ],
+        [
+          "parameter",
+          "shared_sf_stride_word"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "closure_sha256": "331bda18dd2e6ae96cd3db27c810bb94540c4005d5acb11791a7c3f35c7c1898",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "name": "cake_mega_mhc_sm103a_08ea3973de387a1f2b1c",
+      "role": "kernel",
+      "sources": [
+        "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/cake_mega_mhc_sm103a_08ea3973de387a1f2b1c_kernel.cu",
+        "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/cake_mega_mhc_sm103a_08ea3973de387a1f2b1c_binding.cu"
+      ],
+      "tma_workspace_bytes": 0
+    },
+    "cake_mega_mhc_sm103a_0b8da22ad1929b0f9de6_kernel": {
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "residual_map"
+        ],
+        [
+          "tma_buffer",
+          "x_map"
+        ],
+        [
+          "tma_buffer",
+          "fn_map"
+        ],
+        [
+          "tma_buffer",
+          "post_map"
+        ],
+        [
+          "tma_buffer",
+          "comb_map"
+        ],
+        [
+          "tma_buffer",
+          "prev_map"
+        ],
+        [
+          "tma_buffer",
+          "new_residual_map"
+        ],
+        [
+          "tma_buffer",
+          "y_map"
+        ],
+        [
+          "buffer",
+          "mix_scales"
+        ],
+        [
+          "buffer",
+          "mix_bases"
+        ],
+        [
+          "buffer",
+          "new_prev_mix"
+        ],
+        [
+          "buffer",
+          "new_post_mix"
+        ],
+        [
+          "buffer",
+          "new_comb_res_mix"
+        ],
+        [
+          "buffer",
+          "rmsnorm_weight"
+        ],
+        [
+          "buffer",
+          "new_residual"
+        ],
+        [
+          "buffer",
+          "y_bf16"
+        ],
+        [
+          "buffer",
+          "y_fp8"
+        ],
+        [
+          "buffer",
+          "y_primary_sf"
+        ],
+        [
+          "buffer",
+          "y_shared_sf"
+        ],
+        [
+          "buffer",
+          "scratch"
+        ],
+        [
+          "buffer",
+          "split_barriers"
+        ],
+        [
+          "buffer",
+          "launch_epochs"
+        ],
+        [
+          "parameter",
+          "num_tokens"
+        ],
+        [
+          "parameter",
+          "hc_norm_eps"
+        ],
+        [
+          "parameter",
+          "hc_pre_eps"
+        ],
+        [
+          "parameter",
+          "hc_post_scale"
+        ],
+        [
+          "parameter",
+          "sinkhorn_eps"
+        ],
+        [
+          "parameter",
+          "num_sinkhorn_iters"
+        ],
+        [
+          "parameter",
+          "rmsnorm_eps"
+        ],
+        [
+          "parameter",
+          "rmsnorm_scale"
+        ],
+        [
+          "parameter",
+          "primary_sf_stride_token"
+        ],
+        [
+          "parameter",
+          "primary_sf_stride_word"
+        ],
+        [
+          "parameter",
+          "shared_sf_stride_word"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "closure_sha256": "accbe46149199fe88e55719f10db1378a44498c12fc04e614860d21d817fa17a",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "name": "cake_mega_mhc_sm103a_0b8da22ad1929b0f9de6",
+      "role": "kernel",
+      "sources": [
+        "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/cake_mega_mhc_sm103a_0b8da22ad1929b0f9de6_kernel.cu",
+        "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/cake_mega_mhc_sm103a_0b8da22ad1929b0f9de6_binding.cu"
+      ],
+      "tma_workspace_bytes": 0
+    },
+    "cake_mega_mhc_sm103a_0bc523b64eead2e681f2_kernel": {
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "residual_map"
+        ],
+        [
+          "tma_buffer",
+          "x_map"
+        ],
+        [
+          "tma_buffer",
+          "fn_map"
+        ],
+        [
+          "tma_buffer",
+          "post_map"
+        ],
+        [
+          "tma_buffer",
+          "comb_map"
+        ],
+        [
+          "tma_buffer",
+          "prev_map"
+        ],
+        [
+          "tma_buffer",
+          "new_residual_map"
+        ],
+        [
+          "tma_buffer",
+          "y_map"
+        ],
+        [
+          "buffer",
+          "mix_scales"
+        ],
+        [
+          "buffer",
+          "mix_bases"
+        ],
+        [
+          "buffer",
+          "new_prev_mix"
+        ],
+        [
+          "buffer",
+          "new_post_mix"
+        ],
+        [
+          "buffer",
+          "new_comb_res_mix"
+        ],
+        [
+          "buffer",
+          "rmsnorm_weight"
+        ],
+        [
+          "buffer",
+          "new_residual"
+        ],
+        [
+          "buffer",
+          "y_bf16"
+        ],
+        [
+          "buffer",
+          "y_fp8"
+        ],
+        [
+          "buffer",
+          "y_primary_sf"
+        ],
+        [
+          "buffer",
+          "y_shared_sf"
+        ],
+        [
+          "buffer",
+          "scratch"
+        ],
+        [
+          "buffer",
+          "split_barriers"
+        ],
+        [
+          "buffer",
+          "launch_epochs"
+        ],
+        [
+          "parameter",
+          "num_tokens"
+        ],
+        [
+          "parameter",
+          "hc_norm_eps"
+        ],
+        [
+          "parameter",
+          "hc_pre_eps"
+        ],
+        [
+          "parameter",
+          "hc_post_scale"
+        ],
+        [
+          "parameter",
+          "sinkhorn_eps"
+        ],
+        [
+          "parameter",
+          "num_sinkhorn_iters"
+        ],
+        [
+          "parameter",
+          "rmsnorm_eps"
+        ],
+        [
+          "parameter",
+          "rmsnorm_scale"
+        ],
+        [
+          "parameter",
+          "primary_sf_stride_token"
+        ],
+        [
+          "parameter",
+          "primary_sf_stride_word"
+        ],
+        [
+          "parameter",
+          "shared_sf_stride_word"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "closure_sha256": "57fafa1effce8d1dd458a0ae6d20f751e1171b9d29b9c287539c35fb3de732f9",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "name": "cake_mega_mhc_sm103a_0bc523b64eead2e681f2",
+      "role": "kernel",
+      "sources": [
+        "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/cake_mega_mhc_sm103a_0bc523b64eead2e681f2_kernel.cu",
+        "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/cake_mega_mhc_sm103a_0bc523b64eead2e681f2_binding.cu"
+      ],
+      "tma_workspace_bytes": 0
+    },
+    "cake_mega_mhc_sm103a_0e55a440af22c96477a7_kernel": {
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "residual_map"
+        ],
+        [
+          "tma_buffer",
+          "x_map"
+        ],
+        [
+          "tma_buffer",
+          "fn_map"
+        ],
+        [
+          "tma_buffer",
+          "post_map"
+        ],
+        [
+          "tma_buffer",
+          "comb_map"
+        ],
+        [
+          "tma_buffer",
+          "prev_map"
+        ],
+        [
+          "tma_buffer",
+          "new_residual_map"
+        ],
+        [
+          "tma_buffer",
+          "y_map"
+        ],
+        [
+          "buffer",
+          "mix_scales"
+        ],
+        [
+          "buffer",
+          "mix_bases"
+        ],
+        [
+          "buffer",
+          "new_prev_mix"
+        ],
+        [
+          "buffer",
+          "new_post_mix"
+        ],
+        [
+          "buffer",
+          "new_comb_res_mix"
+        ],
+        [
+          "buffer",
+          "rmsnorm_weight"
+        ],
+        [
+          "buffer",
+          "new_residual"
+        ],
+        [
+          "buffer",
+          "y_bf16"
+        ],
+        [
+          "buffer",
+          "y_fp8"
+        ],
+        [
+          "buffer",
+          "y_primary_sf"
+        ],
+        [
+          "buffer",
+          "y_shared_sf"
+        ],
+        [
+          "buffer",
+          "scratch"
+        ],
+        [
+          "buffer",
+          "split_barriers"
+        ],
+        [
+          "buffer",
+          "launch_epochs"
+        ],
+        [
+          "parameter",
+          "num_tokens"
+        ],
+        [
+          "parameter",
+          "hc_norm_eps"
+        ],
+        [
+          "parameter",
+          "hc_pre_eps"
+        ],
+        [
+          "parameter",
+          "hc_post_scale"
+        ],
+        [
+          "parameter",
+          "sinkhorn_eps"
+        ],
+        [
+          "parameter",
+          "num_sinkhorn_iters"
+        ],
+        [
+          "parameter",
+          "rmsnorm_eps"
+        ],
+        [
+          "parameter",
+          "rmsnorm_scale"
+        ],
+        [
+          "parameter",
+          "primary_sf_stride_token"
+        ],
+        [
+          "parameter",
+          "primary_sf_stride_word"
+        ],
+        [
+          "parameter",
+          "shared_sf_stride_word"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "closure_sha256": "fde198728f886b77c1f25190d44172a109d66083d50c733f6c324e7bc0c1ccc4",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "name": "cake_mega_mhc_sm103a_0e55a440af22c96477a7",
+      "role": "kernel",
+      "sources": [
+        "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/cake_mega_mhc_sm103a_0e55a440af22c96477a7_kernel.cu",
+        "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/cake_mega_mhc_sm103a_0e55a440af22c96477a7_binding.cu"
+      ],
+      "tma_workspace_bytes": 0
+    },
+    "cake_mega_mhc_sm103a_4916d9c77e07589b4879_kernel": {
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "residual_map"
+        ],
+        [
+          "tma_buffer",
+          "x_map"
+        ],
+        [
+          "tma_buffer",
+          "fn_map"
+        ],
+        [
+          "tma_buffer",
+          "post_map"
+        ],
+        [
+          "tma_buffer",
+          "comb_map"
+        ],
+        [
+          "tma_buffer",
+          "prev_map"
+        ],
+        [
+          "tma_buffer",
+          "new_residual_map"
+        ],
+        [
+          "tma_buffer",
+          "y_map"
+        ],
+        [
+          "buffer",
+          "mix_scales"
+        ],
+        [
+          "buffer",
+          "mix_bases"
+        ],
+        [
+          "buffer",
+          "new_prev_mix"
+        ],
+        [
+          "buffer",
+          "new_post_mix"
+        ],
+        [
+          "buffer",
+          "new_comb_res_mix"
+        ],
+        [
+          "buffer",
+          "rmsnorm_weight"
+        ],
+        [
+          "buffer",
+          "new_residual"
+        ],
+        [
+          "buffer",
+          "y_bf16"
+        ],
+        [
+          "buffer",
+          "y_fp8"
+        ],
+        [
+          "buffer",
+          "y_primary_sf"
+        ],
+        [
+          "buffer",
+          "y_shared_sf"
+        ],
+        [
+          "buffer",
+          "scratch"
+        ],
+        [
+          "buffer",
+          "split_barriers"
+        ],
+        [
+          "buffer",
+          "launch_epochs"
+        ],
+        [
+          "parameter",
+          "num_tokens"
+        ],
+        [
+          "parameter",
+          "hc_norm_eps"
+        ],
+        [
+          "parameter",
+          "hc_pre_eps"
+        ],
+        [
+          "parameter",
+          "hc_post_scale"
+        ],
+        [
+          "parameter",
+          "sinkhorn_eps"
+        ],
+        [
+          "parameter",
+          "num_sinkhorn_iters"
+        ],
+        [
+          "parameter",
+          "rmsnorm_eps"
+        ],
+        [
+          "parameter",
+          "rmsnorm_scale"
+        ],
+        [
+          "parameter",
+          "primary_sf_stride_token"
+        ],
+        [
+          "parameter",
+          "primary_sf_stride_word"
+        ],
+        [
+          "parameter",
+          "shared_sf_stride_word"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "closure_sha256": "ba1d941c0b636b75a855c431796fcdd2e89e3a7e3f41a97cebac9f0970e4dce5",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "name": "cake_mega_mhc_sm103a_4916d9c77e07589b4879",
+      "role": "kernel",
+      "sources": [
+        "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/cake_mega_mhc_sm103a_4916d9c77e07589b4879_kernel.cu",
+        "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/cake_mega_mhc_sm103a_4916d9c77e07589b4879_binding.cu"
+      ],
+      "tma_workspace_bytes": 0
+    },
+    "cake_mega_mhc_sm103a_6b9259805ab3085116eb_kernel": {
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "residual_map"
+        ],
+        [
+          "tma_buffer",
+          "x_map"
+        ],
+        [
+          "tma_buffer",
+          "fn_map"
+        ],
+        [
+          "tma_buffer",
+          "post_map"
+        ],
+        [
+          "tma_buffer",
+          "comb_map"
+        ],
+        [
+          "tma_buffer",
+          "prev_map"
+        ],
+        [
+          "tma_buffer",
+          "new_residual_map"
+        ],
+        [
+          "tma_buffer",
+          "y_map"
+        ],
+        [
+          "buffer",
+          "mix_scales"
+        ],
+        [
+          "buffer",
+          "mix_bases"
+        ],
+        [
+          "buffer",
+          "new_prev_mix"
+        ],
+        [
+          "buffer",
+          "new_post_mix"
+        ],
+        [
+          "buffer",
+          "new_comb_res_mix"
+        ],
+        [
+          "buffer",
+          "rmsnorm_weight"
+        ],
+        [
+          "buffer",
+          "new_residual"
+        ],
+        [
+          "buffer",
+          "y_bf16"
+        ],
+        [
+          "buffer",
+          "y_fp8"
+        ],
+        [
+          "buffer",
+          "y_primary_sf"
+        ],
+        [
+          "buffer",
+          "y_shared_sf"
+        ],
+        [
+          "buffer",
+          "scratch"
+        ],
+        [
+          "buffer",
+          "split_barriers"
+        ],
+        [
+          "buffer",
+          "launch_epochs"
+        ],
+        [
+          "parameter",
+          "num_tokens"
+        ],
+        [
+          "parameter",
+          "hc_norm_eps"
+        ],
+        [
+          "parameter",
+          "hc_pre_eps"
+        ],
+        [
+          "parameter",
+          "hc_post_scale"
+        ],
+        [
+          "parameter",
+          "sinkhorn_eps"
+        ],
+        [
+          "parameter",
+          "num_sinkhorn_iters"
+        ],
+        [
+          "parameter",
+          "rmsnorm_eps"
+        ],
+        [
+          "parameter",
+          "rmsnorm_scale"
+        ],
+        [
+          "parameter",
+          "primary_sf_stride_token"
+        ],
+        [
+          "parameter",
+          "primary_sf_stride_word"
+        ],
+        [
+          "parameter",
+          "shared_sf_stride_word"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "closure_sha256": "a77f1cf48174588e92480f271fddb3d4c131ee0e5ed36536553a2d9c06c9e16d",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "name": "cake_mega_mhc_sm103a_6b9259805ab3085116eb",
+      "role": "kernel",
+      "sources": [
+        "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/cake_mega_mhc_sm103a_6b9259805ab3085116eb_kernel.cu",
+        "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/cake_mega_mhc_sm103a_6b9259805ab3085116eb_binding.cu"
+      ],
+      "tma_workspace_bytes": 0
+    },
+    "cake_mega_mhc_sm103a_726127dc32e98a9e8e35_kernel": {
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "residual_map"
+        ],
+        [
+          "tma_buffer",
+          "x_map"
+        ],
+        [
+          "tma_buffer",
+          "fn_map"
+        ],
+        [
+          "tma_buffer",
+          "post_map"
+        ],
+        [
+          "tma_buffer",
+          "comb_map"
+        ],
+        [
+          "tma_buffer",
+          "prev_map"
+        ],
+        [
+          "tma_buffer",
+          "new_residual_map"
+        ],
+        [
+          "tma_buffer",
+          "y_map"
+        ],
+        [
+          "buffer",
+          "mix_scales"
+        ],
+        [
+          "buffer",
+          "mix_bases"
+        ],
+        [
+          "buffer",
+          "new_prev_mix"
+        ],
+        [
+          "buffer",
+          "new_post_mix"
+        ],
+        [
+          "buffer",
+          "new_comb_res_mix"
+        ],
+        [
+          "buffer",
+          "rmsnorm_weight"
+        ],
+        [
+          "buffer",
+          "new_residual"
+        ],
+        [
+          "buffer",
+          "y_bf16"
+        ],
+        [
+          "buffer",
+          "y_fp8"
+        ],
+        [
+          "buffer",
+          "y_primary_sf"
+        ],
+        [
+          "buffer",
+          "y_shared_sf"
+        ],
+        [
+          "buffer",
+          "scratch"
+        ],
+        [
+          "buffer",
+          "split_barriers"
+        ],
+        [
+          "buffer",
+          "launch_epochs"
+        ],
+        [
+          "parameter",
+          "num_tokens"
+        ],
+        [
+          "parameter",
+          "hc_norm_eps"
+        ],
+        [
+          "parameter",
+          "hc_pre_eps"
+        ],
+        [
+          "parameter",
+          "hc_post_scale"
+        ],
+        [
+          "parameter",
+          "sinkhorn_eps"
+        ],
+        [
+          "parameter",
+          "num_sinkhorn_iters"
+        ],
+        [
+          "parameter",
+          "rmsnorm_eps"
+        ],
+        [
+          "parameter",
+          "rmsnorm_scale"
+        ],
+        [
+          "parameter",
+          "primary_sf_stride_token"
+        ],
+        [
+          "parameter",
+          "primary_sf_stride_word"
+        ],
+        [
+          "parameter",
+          "shared_sf_stride_word"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "closure_sha256": "d035d02783ad5f8013b4d3a3d6b7b8e5b0e718913f5c39ddab7f2f374a981494",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "name": "cake_mega_mhc_sm103a_726127dc32e98a9e8e35",
+      "role": "kernel",
+      "sources": [
+        "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/cake_mega_mhc_sm103a_726127dc32e98a9e8e35_kernel.cu",
+        "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/cake_mega_mhc_sm103a_726127dc32e98a9e8e35_binding.cu"
+      ],
+      "tma_workspace_bytes": 0
+    },
+    "cake_mega_mhc_sm103a_7b83dfacef84639596df_kernel": {
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "residual_map"
+        ],
+        [
+          "tma_buffer",
+          "x_map"
+        ],
+        [
+          "tma_buffer",
+          "fn_map"
+        ],
+        [
+          "tma_buffer",
+          "post_map"
+        ],
+        [
+          "tma_buffer",
+          "comb_map"
+        ],
+        [
+          "tma_buffer",
+          "prev_map"
+        ],
+        [
+          "tma_buffer",
+          "new_residual_map"
+        ],
+        [
+          "tma_buffer",
+          "y_map"
+        ],
+        [
+          "buffer",
+          "mix_scales"
+        ],
+        [
+          "buffer",
+          "mix_bases"
+        ],
+        [
+          "buffer",
+          "new_prev_mix"
+        ],
+        [
+          "buffer",
+          "new_post_mix"
+        ],
+        [
+          "buffer",
+          "new_comb_res_mix"
+        ],
+        [
+          "buffer",
+          "rmsnorm_weight"
+        ],
+        [
+          "buffer",
+          "new_residual"
+        ],
+        [
+          "buffer",
+          "y_bf16"
+        ],
+        [
+          "buffer",
+          "y_fp8"
+        ],
+        [
+          "buffer",
+          "y_primary_sf"
+        ],
+        [
+          "buffer",
+          "y_shared_sf"
+        ],
+        [
+          "buffer",
+          "scratch"
+        ],
+        [
+          "buffer",
+          "split_barriers"
+        ],
+        [
+          "buffer",
+          "launch_epochs"
+        ],
+        [
+          "parameter",
+          "num_tokens"
+        ],
+        [
+          "parameter",
+          "hc_norm_eps"
+        ],
+        [
+          "parameter",
+          "hc_pre_eps"
+        ],
+        [
+          "parameter",
+          "hc_post_scale"
+        ],
+        [
+          "parameter",
+          "sinkhorn_eps"
+        ],
+        [
+          "parameter",
+          "num_sinkhorn_iters"
+        ],
+        [
+          "parameter",
+          "rmsnorm_eps"
+        ],
+        [
+          "parameter",
+          "rmsnorm_scale"
+        ],
+        [
+          "parameter",
+          "primary_sf_stride_token"
+        ],
+        [
+          "parameter",
+          "primary_sf_stride_word"
+        ],
+        [
+          "parameter",
+          "shared_sf_stride_word"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "closure_sha256": "3a37bd0fc31f7fed74f9b389c7b1bf6426c1604a295b2593915478147a237d3b",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "name": "cake_mega_mhc_sm103a_7b83dfacef84639596df",
+      "role": "kernel",
+      "sources": [
+        "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/cake_mega_mhc_sm103a_7b83dfacef84639596df_kernel.cu",
+        "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/cake_mega_mhc_sm103a_7b83dfacef84639596df_binding.cu"
+      ],
+      "tma_workspace_bytes": 0
+    },
+    "cake_mega_mhc_sm103a_a6a8380c413df94a7a02_kernel": {
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "residual_map"
+        ],
+        [
+          "tma_buffer",
+          "x_map"
+        ],
+        [
+          "tma_buffer",
+          "fn_map"
+        ],
+        [
+          "tma_buffer",
+          "post_map"
+        ],
+        [
+          "tma_buffer",
+          "comb_map"
+        ],
+        [
+          "tma_buffer",
+          "prev_map"
+        ],
+        [
+          "tma_buffer",
+          "new_residual_map"
+        ],
+        [
+          "tma_buffer",
+          "y_map"
+        ],
+        [
+          "buffer",
+          "mix_scales"
+        ],
+        [
+          "buffer",
+          "mix_bases"
+        ],
+        [
+          "buffer",
+          "new_prev_mix"
+        ],
+        [
+          "buffer",
+          "new_post_mix"
+        ],
+        [
+          "buffer",
+          "new_comb_res_mix"
+        ],
+        [
+          "buffer",
+          "rmsnorm_weight"
+        ],
+        [
+          "buffer",
+          "new_residual"
+        ],
+        [
+          "buffer",
+          "y_bf16"
+        ],
+        [
+          "buffer",
+          "y_fp8"
+        ],
+        [
+          "buffer",
+          "y_primary_sf"
+        ],
+        [
+          "buffer",
+          "y_shared_sf"
+        ],
+        [
+          "buffer",
+          "scratch"
+        ],
+        [
+          "buffer",
+          "split_barriers"
+        ],
+        [
+          "buffer",
+          "launch_epochs"
+        ],
+        [
+          "parameter",
+          "num_tokens"
+        ],
+        [
+          "parameter",
+          "hc_norm_eps"
+        ],
+        [
+          "parameter",
+          "hc_pre_eps"
+        ],
+        [
+          "parameter",
+          "hc_post_scale"
+        ],
+        [
+          "parameter",
+          "sinkhorn_eps"
+        ],
+        [
+          "parameter",
+          "num_sinkhorn_iters"
+        ],
+        [
+          "parameter",
+          "rmsnorm_eps"
+        ],
+        [
+          "parameter",
+          "rmsnorm_scale"
+        ],
+        [
+          "parameter",
+          "primary_sf_stride_token"
+        ],
+        [
+          "parameter",
+          "primary_sf_stride_word"
+        ],
+        [
+          "parameter",
+          "shared_sf_stride_word"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "closure_sha256": "921c955db155d508a5342b4ddfa848ac824a0247e3f6b7346a0dd64df967e572",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "name": "cake_mega_mhc_sm103a_a6a8380c413df94a7a02",
+      "role": "kernel",
+      "sources": [
+        "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/cake_mega_mhc_sm103a_a6a8380c413df94a7a02_kernel.cu",
+        "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/cake_mega_mhc_sm103a_a6a8380c413df94a7a02_binding.cu"
+      ],
+      "tma_workspace_bytes": 0
+    },
+    "cake_mega_mhc_sm103a_e2dac0fa74ee625f71de_kernel": {
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "residual_map"
+        ],
+        [
+          "tma_buffer",
+          "x_map"
+        ],
+        [
+          "tma_buffer",
+          "fn_map"
+        ],
+        [
+          "tma_buffer",
+          "post_map"
+        ],
+        [
+          "tma_buffer",
+          "comb_map"
+        ],
+        [
+          "tma_buffer",
+          "prev_map"
+        ],
+        [
+          "tma_buffer",
+          "new_residual_map"
+        ],
+        [
+          "tma_buffer",
+          "y_map"
+        ],
+        [
+          "buffer",
+          "mix_scales"
+        ],
+        [
+          "buffer",
+          "mix_bases"
+        ],
+        [
+          "buffer",
+          "new_prev_mix"
+        ],
+        [
+          "buffer",
+          "new_post_mix"
+        ],
+        [
+          "buffer",
+          "new_comb_res_mix"
+        ],
+        [
+          "buffer",
+          "rmsnorm_weight"
+        ],
+        [
+          "buffer",
+          "new_residual"
+        ],
+        [
+          "buffer",
+          "y_bf16"
+        ],
+        [
+          "buffer",
+          "y_fp8"
+        ],
+        [
+          "buffer",
+          "y_primary_sf"
+        ],
+        [
+          "buffer",
+          "y_shared_sf"
+        ],
+        [
+          "buffer",
+          "scratch"
+        ],
+        [
+          "buffer",
+          "split_barriers"
+        ],
+        [
+          "buffer",
+          "launch_epochs"
+        ],
+        [
+          "parameter",
+          "num_tokens"
+        ],
+        [
+          "parameter",
+          "hc_norm_eps"
+        ],
+        [
+          "parameter",
+          "hc_pre_eps"
+        ],
+        [
+          "parameter",
+          "hc_post_scale"
+        ],
+        [
+          "parameter",
+          "sinkhorn_eps"
+        ],
+        [
+          "parameter",
+          "num_sinkhorn_iters"
+        ],
+        [
+          "parameter",
+          "rmsnorm_eps"
+        ],
+        [
+          "parameter",
+          "rmsnorm_scale"
+        ],
+        [
+          "parameter",
+          "primary_sf_stride_token"
+        ],
+        [
+          "parameter",
+          "primary_sf_stride_word"
+        ],
+        [
+          "parameter",
+          "shared_sf_stride_word"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "closure_sha256": "ec1c88ce81f3451b12c5b156b85a6048f6d752c00d4309ea7599f2700166048c",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "name": "cake_mega_mhc_sm103a_e2dac0fa74ee625f71de",
+      "role": "kernel",
+      "sources": [
+        "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/cake_mega_mhc_sm103a_e2dac0fa74ee625f71de_kernel.cu",
+        "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/cake_mega_mhc_sm103a_e2dac0fa74ee625f71de_binding.cu"
+      ],
+      "tma_workspace_bytes": 0
+    },
+    "cake_mega_mhc_sm103a_faa1d3cbba42074eed6c_kernel": {
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "residual_map"
+        ],
+        [
+          "tma_buffer",
+          "x_map"
+        ],
+        [
+          "tma_buffer",
+          "fn_map"
+        ],
+        [
+          "tma_buffer",
+          "post_map"
+        ],
+        [
+          "tma_buffer",
+          "comb_map"
+        ],
+        [
+          "tma_buffer",
+          "prev_map"
+        ],
+        [
+          "tma_buffer",
+          "new_residual_map"
+        ],
+        [
+          "tma_buffer",
+          "y_map"
+        ],
+        [
+          "buffer",
+          "mix_scales"
+        ],
+        [
+          "buffer",
+          "mix_bases"
+        ],
+        [
+          "buffer",
+          "new_prev_mix"
+        ],
+        [
+          "buffer",
+          "new_post_mix"
+        ],
+        [
+          "buffer",
+          "new_comb_res_mix"
+        ],
+        [
+          "buffer",
+          "rmsnorm_weight"
+        ],
+        [
+          "buffer",
+          "new_residual"
+        ],
+        [
+          "buffer",
+          "y_bf16"
+        ],
+        [
+          "buffer",
+          "y_fp8"
+        ],
+        [
+          "buffer",
+          "y_primary_sf"
+        ],
+        [
+          "buffer",
+          "y_shared_sf"
+        ],
+        [
+          "buffer",
+          "scratch"
+        ],
+        [
+          "buffer",
+          "split_barriers"
+        ],
+        [
+          "buffer",
+          "launch_epochs"
+        ],
+        [
+          "parameter",
+          "num_tokens"
+        ],
+        [
+          "parameter",
+          "hc_norm_eps"
+        ],
+        [
+          "parameter",
+          "hc_pre_eps"
+        ],
+        [
+          "parameter",
+          "hc_post_scale"
+        ],
+        [
+          "parameter",
+          "sinkhorn_eps"
+        ],
+        [
+          "parameter",
+          "num_sinkhorn_iters"
+        ],
+        [
+          "parameter",
+          "rmsnorm_eps"
+        ],
+        [
+          "parameter",
+          "rmsnorm_scale"
+        ],
+        [
+          "parameter",
+          "primary_sf_stride_token"
+        ],
+        [
+          "parameter",
+          "primary_sf_stride_word"
+        ],
+        [
+          "parameter",
+          "shared_sf_stride_word"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "closure_sha256": "4c514cea1178ab66dea72cde95d86a735f7fc841fbc61dcb53e7e270493e3947",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "name": "cake_mega_mhc_sm103a_faa1d3cbba42074eed6c",
+      "role": "kernel",
+      "sources": [
+        "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/cake_mega_mhc_sm103a_faa1d3cbba42074eed6c_kernel.cu",
+        "csrc/experimental/deepgemm_mega_mhc/generated/sm_103a/cake_mega_mhc_sm103a_faa1d3cbba42074eed6c_binding.cu"
+      ],
+      "tma_workspace_bytes": 0
+    }
+  },
+  "routes": {
+    "1025:5120:152:False:True:0:False": {
+      "config": {
+        "num_launch_sms": 152,
+        "num_sms": 152,
+        "num_splits": 16
+      },
+      "program": "cake_mega_mhc_sm103a_726127dc32e98a9e8e35_kernel"
+    },
+    "1025:5120:152:False:True:224:False": {
+      "config": {
+        "num_launch_sms": 152,
+        "num_sms": 152,
+        "num_splits": 16
+      },
+      "program": "cake_mega_mhc_sm103a_7b83dfacef84639596df_kernel"
+    },
+    "1025:5120:152:True:True:0:False": {
+      "config": {
+        "num_launch_sms": 152,
+        "num_sms": 152,
+        "num_splits": 16
+      },
+      "program": "cake_mega_mhc_sm103a_e2dac0fa74ee625f71de_kernel"
+    },
+    "1025:5120:152:True:True:224:False": {
+      "config": {
+        "num_launch_sms": 152,
+        "num_sms": 152,
+        "num_splits": 16
+      },
+      "program": "cake_mega_mhc_sm103a_08d4dff776a1693dfd68_kernel"
+    },
+    "1:5120:152:False:True:0:False": {
+      "config": {
+        "num_launch_sms": 152,
+        "num_sms": 152,
+        "num_splits": 40
+      },
+      "program": "cake_mega_mhc_sm103a_0e55a440af22c96477a7_kernel"
+    },
+    "1:5120:152:False:True:224:False": {
+      "config": {
+        "num_launch_sms": 152,
+        "num_sms": 152,
+        "num_splits": 40
+      },
+      "program": "cake_mega_mhc_sm103a_a6a8380c413df94a7a02_kernel"
+    },
+    "1:5120:152:True:True:0:False": {
+      "config": {
+        "num_launch_sms": 152,
+        "num_sms": 152,
+        "num_splits": 40
+      },
+      "program": "cake_mega_mhc_sm103a_6b9259805ab3085116eb_kernel"
+    },
+    "1:5120:152:True:True:224:False": {
+      "config": {
+        "num_launch_sms": 152,
+        "num_sms": 152,
+        "num_splits": 40
+      },
+      "program": "cake_mega_mhc_sm103a_08ea3973de387a1f2b1c_kernel"
+    },
+    "200:5120:152:False:True:0:False": {
+      "config": {
+        "num_launch_sms": 152,
+        "num_sms": 152,
+        "num_splits": 27
+      },
+      "program": "cake_mega_mhc_sm103a_faa1d3cbba42074eed6c_kernel"
+    },
+    "200:5120:152:False:True:224:False": {
+      "config": {
+        "num_launch_sms": 152,
+        "num_sms": 152,
+        "num_splits": 27
+      },
+      "program": "cake_mega_mhc_sm103a_4916d9c77e07589b4879_kernel"
+    },
+    "200:5120:152:True:True:0:False": {
+      "config": {
+        "num_launch_sms": 152,
+        "num_sms": 152,
+        "num_splits": 27
+      },
+      "program": "cake_mega_mhc_sm103a_0bc523b64eead2e681f2_kernel"
+    },
+    "200:5120:152:True:True:224:False": {
+      "config": {
+        "num_launch_sms": 152,
+        "num_sms": 152,
+        "num_splits": 27
+      },
+      "program": "cake_mega_mhc_sm103a_0b8da22ad1929b0f9de6_kernel"
+    },
+    "4096:5120:152:False:True:0:False": {
+      "config": {
+        "num_launch_sms": 152,
+        "num_sms": 152,
+        "num_splits": 16
+      },
+      "program": "cake_mega_mhc_sm103a_726127dc32e98a9e8e35_kernel"
+    },
+    "4096:5120:152:False:True:224:False": {
+      "config": {
+        "num_launch_sms": 152,
+        "num_sms": 152,
+        "num_splits": 16
+      },
+      "program": "cake_mega_mhc_sm103a_7b83dfacef84639596df_kernel"
+    },
+    "4096:5120:152:True:True:0:False": {
+      "config": {
+        "num_launch_sms": 152,
+        "num_sms": 152,
+        "num_splits": 16
+      },
+      "program": "cake_mega_mhc_sm103a_e2dac0fa74ee625f71de_kernel"
+    },
+    "4096:5120:152:True:True:224:False": {
+      "config": {
+        "num_launch_sms": 152,
+        "num_sms": 152,
+        "num_splits": 16
+      },
+      "program": "cake_mega_mhc_sm103a_08d4dff776a1693dfd68_kernel"
+    },
+    "64:5120:152:False:True:0:False": {
+      "config": {
+        "num_launch_sms": 152,
+        "num_sms": 152,
+        "num_splits": 40
+      },
+      "program": "cake_mega_mhc_sm103a_0e55a440af22c96477a7_kernel"
+    },
+    "64:5120:152:False:True:224:False": {
+      "config": {
+        "num_launch_sms": 152,
+        "num_sms": 152,
+        "num_splits": 40
+      },
+      "program": "cake_mega_mhc_sm103a_a6a8380c413df94a7a02_kernel"
+    },
+    "64:5120:152:True:True:0:False": {
+      "config": {
+        "num_launch_sms": 80,
+        "num_sms": 152,
+        "num_splits": 40
+      },
+      "program": "cake_mega_mhc_sm103a_6b9259805ab3085116eb_kernel"
+    },
+    "64:5120:152:True:True:224:False": {
+      "config": {
+        "num_launch_sms": 80,
+        "num_sms": 152,
+        "num_splits": 40
+      },
+      "program": "cake_mega_mhc_sm103a_08ea3973de387a1f2b1c_kernel"
+    },
+    "65:5120:152:False:True:0:False": {
+      "config": {
+        "num_launch_sms": 152,
+        "num_sms": 152,
+        "num_splits": 40
+      },
+      "program": "cake_mega_mhc_sm103a_0e55a440af22c96477a7_kernel"
+    },
+    "65:5120:152:False:True:224:False": {
+      "config": {
+        "num_launch_sms": 152,
+        "num_sms": 152,
+        "num_splits": 40
+      },
+      "program": "cake_mega_mhc_sm103a_a6a8380c413df94a7a02_kernel"
+    },
+    "65:5120:152:True:True:0:False": {
+      "config": {
+        "num_launch_sms": 152,
+        "num_sms": 152,
+        "num_splits": 40
+      },
+      "program": "cake_mega_mhc_sm103a_6b9259805ab3085116eb_kernel"
+    },
+    "65:5120:152:True:True:224:False": {
+      "config": {
+        "num_launch_sms": 152,
+        "num_sms": 152,
+        "num_splits": 40
+      },
+      "program": "cake_mega_mhc_sm103a_08ea3973de387a1f2b1c_kernel"
+    }
+  },
+  "schema": "mega_mhc.v1"
+}

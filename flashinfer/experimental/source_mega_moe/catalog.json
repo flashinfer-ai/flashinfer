@@ -1,0 +1,5247 @@
+{
+  "schema": "source_mega_moe.v1",
+  "programs": {
+    "cake_source_mega_moe_sm103a_13182425108b6fc20217_kernel": {
+      "ffi_entry": "run",
+      "ffi_prepare_entry": "run_prepare",
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "A1"
+        ],
+        [
+          "tma_buffer",
+          "A2"
+        ],
+        [
+          "tma_buffer",
+          "SA1"
+        ],
+        [
+          "tma_buffer",
+          "SA2"
+        ],
+        [
+          "tma_buffer",
+          "B1"
+        ],
+        [
+          "tma_buffer",
+          "B2"
+        ],
+        [
+          "tma_buffer",
+          "SB1"
+        ],
+        [
+          "tma_buffer",
+          "SB2"
+        ],
+        [
+          "tma_buffer",
+          "SFA1"
+        ],
+        [
+          "tma_buffer",
+          "SFA2"
+        ],
+        [
+          "tma_buffer",
+          "SSFA1"
+        ],
+        [
+          "tma_buffer",
+          "SSFA2"
+        ],
+        [
+          "tma_buffer",
+          "SFB1"
+        ],
+        [
+          "tma_buffer",
+          "SFB2"
+        ],
+        [
+          "tma_buffer",
+          "SSFB1"
+        ],
+        [
+          "tma_buffer",
+          "SSFB2"
+        ],
+        [
+          "tma_buffer",
+          "L1Output"
+        ],
+        [
+          "tma_buffer",
+          "SharedL1Output"
+        ],
+        [
+          "buffer",
+          "X"
+        ],
+        [
+          "buffer",
+          "XSF"
+        ],
+        [
+          "buffer",
+          "TopK"
+        ],
+        [
+          "buffer",
+          "Weights"
+        ],
+        [
+          "buffer",
+          "L1Acts"
+        ],
+        [
+          "buffer",
+          "L1SF"
+        ],
+        [
+          "buffer",
+          "L1Weights"
+        ],
+        [
+          "buffer",
+          "L2SF"
+        ],
+        [
+          "buffer",
+          "SharedL2SF"
+        ],
+        [
+          "buffer",
+          "SourceIndices"
+        ],
+        [
+          "buffer",
+          "TokenMetadata"
+        ],
+        [
+          "buffer",
+          "GridCounters"
+        ],
+        [
+          "buffer",
+          "NvlCounter"
+        ],
+        [
+          "buffer",
+          "NvlSignals"
+        ],
+        [
+          "buffer",
+          "PeerGrid"
+        ],
+        [
+          "buffer",
+          "ReadyGrid"
+        ],
+        [
+          "buffer",
+          "SendCounts"
+        ],
+        [
+          "buffer",
+          "RecvCounts"
+        ],
+        [
+          "buffer",
+          "RecvSum"
+        ],
+        [
+          "buffer",
+          "L1Full"
+        ],
+        [
+          "buffer",
+          "L1Empty"
+        ],
+        [
+          "buffer",
+          "L2Mask"
+        ],
+        [
+          "buffer",
+          "L2Empty"
+        ],
+        [
+          "buffer",
+          "SharedFull"
+        ],
+        [
+          "buffer",
+          "L1Counter"
+        ],
+        [
+          "buffer",
+          "L2Counter"
+        ],
+        [
+          "buffer",
+          "SharedL1Counter"
+        ],
+        [
+          "buffer",
+          "SharedL2Counter"
+        ],
+        [
+          "buffer",
+          "Combine"
+        ],
+        [
+          "buffer",
+          "CombineBytes"
+        ],
+        [
+          "buffer",
+          "Y"
+        ],
+        [
+          "parameter",
+          "num_tokens"
+        ],
+        [
+          "workspace",
+          "tma_descriptor_workspace"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [],
+      "closure_sha256": "4d3481900116102d5897c6291745492ecc8652da259de293013d0f0a6358c6f9",
+      "tma_workspace_bytes": 2304,
+      "sources": [
+        "csrc/experimental/source_mega_moe/generated/sm_103a/cake_source_mega_moe_sm103a_13182425108b6fc20217_kernel.cu",
+        "csrc/experimental/source_mega_moe/generated/sm_103a/cake_source_mega_moe_sm103a_13182425108b6fc20217_binding.cu"
+      ]
+    },
+    "cake_source_mega_moe_sm103a_2cd593da73685df5f270_kernel": {
+      "ffi_entry": "run",
+      "ffi_prepare_entry": "run_prepare",
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "A1"
+        ],
+        [
+          "tma_buffer",
+          "A2"
+        ],
+        [
+          "tma_buffer",
+          "SA1"
+        ],
+        [
+          "tma_buffer",
+          "SA2"
+        ],
+        [
+          "tma_buffer",
+          "B1"
+        ],
+        [
+          "tma_buffer",
+          "B2"
+        ],
+        [
+          "tma_buffer",
+          "SB1"
+        ],
+        [
+          "tma_buffer",
+          "SB2"
+        ],
+        [
+          "tma_buffer",
+          "SFA1"
+        ],
+        [
+          "tma_buffer",
+          "SFA2"
+        ],
+        [
+          "tma_buffer",
+          "SSFA1"
+        ],
+        [
+          "tma_buffer",
+          "SSFA2"
+        ],
+        [
+          "tma_buffer",
+          "SFB1"
+        ],
+        [
+          "tma_buffer",
+          "SFB2"
+        ],
+        [
+          "tma_buffer",
+          "SSFB1"
+        ],
+        [
+          "tma_buffer",
+          "SSFB2"
+        ],
+        [
+          "tma_buffer",
+          "L1Output"
+        ],
+        [
+          "tma_buffer",
+          "SharedL1Output"
+        ],
+        [
+          "buffer",
+          "X"
+        ],
+        [
+          "buffer",
+          "XSF"
+        ],
+        [
+          "buffer",
+          "TopK"
+        ],
+        [
+          "buffer",
+          "Weights"
+        ],
+        [
+          "buffer",
+          "L1Acts"
+        ],
+        [
+          "buffer",
+          "L1SF"
+        ],
+        [
+          "buffer",
+          "L1Weights"
+        ],
+        [
+          "buffer",
+          "L2SF"
+        ],
+        [
+          "buffer",
+          "SharedL2SF"
+        ],
+        [
+          "buffer",
+          "SourceIndices"
+        ],
+        [
+          "buffer",
+          "TokenMetadata"
+        ],
+        [
+          "buffer",
+          "GridCounters"
+        ],
+        [
+          "buffer",
+          "NvlCounter"
+        ],
+        [
+          "buffer",
+          "NvlSignals"
+        ],
+        [
+          "buffer",
+          "PeerGrid"
+        ],
+        [
+          "buffer",
+          "ReadyGrid"
+        ],
+        [
+          "buffer",
+          "SendCounts"
+        ],
+        [
+          "buffer",
+          "RecvCounts"
+        ],
+        [
+          "buffer",
+          "RecvSum"
+        ],
+        [
+          "buffer",
+          "L1Full"
+        ],
+        [
+          "buffer",
+          "L1Empty"
+        ],
+        [
+          "buffer",
+          "L2Mask"
+        ],
+        [
+          "buffer",
+          "L2Empty"
+        ],
+        [
+          "buffer",
+          "SharedFull"
+        ],
+        [
+          "buffer",
+          "L1Counter"
+        ],
+        [
+          "buffer",
+          "L2Counter"
+        ],
+        [
+          "buffer",
+          "SharedL1Counter"
+        ],
+        [
+          "buffer",
+          "SharedL2Counter"
+        ],
+        [
+          "buffer",
+          "Combine"
+        ],
+        [
+          "buffer",
+          "CombineBytes"
+        ],
+        [
+          "buffer",
+          "Y"
+        ],
+        [
+          "parameter",
+          "num_tokens"
+        ],
+        [
+          "workspace",
+          "tma_descriptor_workspace"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [],
+      "closure_sha256": "b8439f93ec9c5f05e3e39e7363f6cf5169ae1e6d365e8ea405f275dad5f1f53b",
+      "tma_workspace_bytes": 2304,
+      "sources": [
+        "csrc/experimental/source_mega_moe/generated/sm_103a/cake_source_mega_moe_sm103a_2cd593da73685df5f270_kernel.cu",
+        "csrc/experimental/source_mega_moe/generated/sm_103a/cake_source_mega_moe_sm103a_2cd593da73685df5f270_binding.cu"
+      ]
+    },
+    "cake_source_mega_moe_sm103a_3eafbb6a52f5cd3fe7b4_kernel": {
+      "ffi_entry": "run",
+      "ffi_prepare_entry": "run_prepare",
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "A1"
+        ],
+        [
+          "tma_buffer",
+          "A2"
+        ],
+        [
+          "tma_buffer",
+          "SA1"
+        ],
+        [
+          "tma_buffer",
+          "SA2"
+        ],
+        [
+          "tma_buffer",
+          "B1"
+        ],
+        [
+          "tma_buffer",
+          "B2"
+        ],
+        [
+          "tma_buffer",
+          "SB1"
+        ],
+        [
+          "tma_buffer",
+          "SB2"
+        ],
+        [
+          "tma_buffer",
+          "SFA1"
+        ],
+        [
+          "tma_buffer",
+          "SFA2"
+        ],
+        [
+          "tma_buffer",
+          "SSFA1"
+        ],
+        [
+          "tma_buffer",
+          "SSFA2"
+        ],
+        [
+          "tma_buffer",
+          "SFB1"
+        ],
+        [
+          "tma_buffer",
+          "SFB2"
+        ],
+        [
+          "tma_buffer",
+          "SSFB1"
+        ],
+        [
+          "tma_buffer",
+          "SSFB2"
+        ],
+        [
+          "tma_buffer",
+          "L1Output"
+        ],
+        [
+          "tma_buffer",
+          "SharedL1Output"
+        ],
+        [
+          "buffer",
+          "X"
+        ],
+        [
+          "buffer",
+          "XSF"
+        ],
+        [
+          "buffer",
+          "TopK"
+        ],
+        [
+          "buffer",
+          "Weights"
+        ],
+        [
+          "buffer",
+          "L1Acts"
+        ],
+        [
+          "buffer",
+          "L1SF"
+        ],
+        [
+          "buffer",
+          "L1Weights"
+        ],
+        [
+          "buffer",
+          "L2SF"
+        ],
+        [
+          "buffer",
+          "SharedL2SF"
+        ],
+        [
+          "buffer",
+          "SourceIndices"
+        ],
+        [
+          "buffer",
+          "TokenMetadata"
+        ],
+        [
+          "buffer",
+          "GridCounters"
+        ],
+        [
+          "buffer",
+          "NvlCounter"
+        ],
+        [
+          "buffer",
+          "NvlSignals"
+        ],
+        [
+          "buffer",
+          "PeerGrid"
+        ],
+        [
+          "buffer",
+          "ReadyGrid"
+        ],
+        [
+          "buffer",
+          "SendCounts"
+        ],
+        [
+          "buffer",
+          "RecvCounts"
+        ],
+        [
+          "buffer",
+          "RecvSum"
+        ],
+        [
+          "buffer",
+          "L1Full"
+        ],
+        [
+          "buffer",
+          "L1Empty"
+        ],
+        [
+          "buffer",
+          "L2Mask"
+        ],
+        [
+          "buffer",
+          "L2Empty"
+        ],
+        [
+          "buffer",
+          "SharedFull"
+        ],
+        [
+          "buffer",
+          "L1Counter"
+        ],
+        [
+          "buffer",
+          "L2Counter"
+        ],
+        [
+          "buffer",
+          "SharedL1Counter"
+        ],
+        [
+          "buffer",
+          "SharedL2Counter"
+        ],
+        [
+          "buffer",
+          "Combine"
+        ],
+        [
+          "buffer",
+          "CombineBytes"
+        ],
+        [
+          "buffer",
+          "Y"
+        ],
+        [
+          "parameter",
+          "num_tokens"
+        ],
+        [
+          "workspace",
+          "tma_descriptor_workspace"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [],
+      "closure_sha256": "cc242c5bfa13f0af5f6b8a3e781565dd391384be6d03b2c525ac591faf497a95",
+      "tma_workspace_bytes": 2304,
+      "sources": [
+        "csrc/experimental/source_mega_moe/generated/sm_103a/cake_source_mega_moe_sm103a_3eafbb6a52f5cd3fe7b4_kernel.cu",
+        "csrc/experimental/source_mega_moe/generated/sm_103a/cake_source_mega_moe_sm103a_3eafbb6a52f5cd3fe7b4_binding.cu"
+      ]
+    },
+    "cake_source_mega_moe_sm103a_4db01334a3fc2408a988_kernel": {
+      "ffi_entry": "run",
+      "ffi_prepare_entry": "run_prepare",
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "A1"
+        ],
+        [
+          "tma_buffer",
+          "A2"
+        ],
+        [
+          "tma_buffer",
+          "SA1"
+        ],
+        [
+          "tma_buffer",
+          "SA2"
+        ],
+        [
+          "tma_buffer",
+          "B1"
+        ],
+        [
+          "tma_buffer",
+          "B2"
+        ],
+        [
+          "tma_buffer",
+          "SB1"
+        ],
+        [
+          "tma_buffer",
+          "SB2"
+        ],
+        [
+          "tma_buffer",
+          "SFA1"
+        ],
+        [
+          "tma_buffer",
+          "SFA2"
+        ],
+        [
+          "tma_buffer",
+          "SSFA1"
+        ],
+        [
+          "tma_buffer",
+          "SSFA2"
+        ],
+        [
+          "tma_buffer",
+          "SFB1"
+        ],
+        [
+          "tma_buffer",
+          "SFB2"
+        ],
+        [
+          "tma_buffer",
+          "SSFB1"
+        ],
+        [
+          "tma_buffer",
+          "SSFB2"
+        ],
+        [
+          "tma_buffer",
+          "L1Output"
+        ],
+        [
+          "tma_buffer",
+          "SharedL1Output"
+        ],
+        [
+          "buffer",
+          "X"
+        ],
+        [
+          "buffer",
+          "XSF"
+        ],
+        [
+          "buffer",
+          "TopK"
+        ],
+        [
+          "buffer",
+          "Weights"
+        ],
+        [
+          "buffer",
+          "L1Acts"
+        ],
+        [
+          "buffer",
+          "L1SF"
+        ],
+        [
+          "buffer",
+          "L1Weights"
+        ],
+        [
+          "buffer",
+          "L2SF"
+        ],
+        [
+          "buffer",
+          "SharedL2SF"
+        ],
+        [
+          "buffer",
+          "SourceIndices"
+        ],
+        [
+          "buffer",
+          "TokenMetadata"
+        ],
+        [
+          "buffer",
+          "GridCounters"
+        ],
+        [
+          "buffer",
+          "NvlCounter"
+        ],
+        [
+          "buffer",
+          "NvlSignals"
+        ],
+        [
+          "buffer",
+          "PeerGrid"
+        ],
+        [
+          "buffer",
+          "ReadyGrid"
+        ],
+        [
+          "buffer",
+          "SendCounts"
+        ],
+        [
+          "buffer",
+          "RecvCounts"
+        ],
+        [
+          "buffer",
+          "RecvSum"
+        ],
+        [
+          "buffer",
+          "L1Full"
+        ],
+        [
+          "buffer",
+          "L1Empty"
+        ],
+        [
+          "buffer",
+          "L2Mask"
+        ],
+        [
+          "buffer",
+          "L2Empty"
+        ],
+        [
+          "buffer",
+          "SharedFull"
+        ],
+        [
+          "buffer",
+          "L1Counter"
+        ],
+        [
+          "buffer",
+          "L2Counter"
+        ],
+        [
+          "buffer",
+          "SharedL1Counter"
+        ],
+        [
+          "buffer",
+          "SharedL2Counter"
+        ],
+        [
+          "buffer",
+          "Combine"
+        ],
+        [
+          "buffer",
+          "CombineBytes"
+        ],
+        [
+          "buffer",
+          "Y"
+        ],
+        [
+          "parameter",
+          "num_tokens"
+        ],
+        [
+          "workspace",
+          "tma_descriptor_workspace"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [],
+      "closure_sha256": "abf7eb1853d0fd7da75907642b6257a886a373d9b1569b99437d39bda593e393",
+      "tma_workspace_bytes": 2304,
+      "sources": [
+        "csrc/experimental/source_mega_moe/generated/sm_103a/cake_source_mega_moe_sm103a_4db01334a3fc2408a988_kernel.cu",
+        "csrc/experimental/source_mega_moe/generated/sm_103a/cake_source_mega_moe_sm103a_4db01334a3fc2408a988_binding.cu"
+      ]
+    },
+    "cake_source_mega_moe_sm103a_54957edeca677b892d53_kernel": {
+      "ffi_entry": "run",
+      "ffi_prepare_entry": "run_prepare",
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "A1"
+        ],
+        [
+          "tma_buffer",
+          "A2"
+        ],
+        [
+          "tma_buffer",
+          "SA1"
+        ],
+        [
+          "tma_buffer",
+          "SA2"
+        ],
+        [
+          "tma_buffer",
+          "B1"
+        ],
+        [
+          "tma_buffer",
+          "B2"
+        ],
+        [
+          "tma_buffer",
+          "SB1"
+        ],
+        [
+          "tma_buffer",
+          "SB2"
+        ],
+        [
+          "tma_buffer",
+          "SFA1"
+        ],
+        [
+          "tma_buffer",
+          "SFA2"
+        ],
+        [
+          "tma_buffer",
+          "SSFA1"
+        ],
+        [
+          "tma_buffer",
+          "SSFA2"
+        ],
+        [
+          "tma_buffer",
+          "SFB1"
+        ],
+        [
+          "tma_buffer",
+          "SFB2"
+        ],
+        [
+          "tma_buffer",
+          "SSFB1"
+        ],
+        [
+          "tma_buffer",
+          "SSFB2"
+        ],
+        [
+          "tma_buffer",
+          "L1Output"
+        ],
+        [
+          "tma_buffer",
+          "SharedL1Output"
+        ],
+        [
+          "buffer",
+          "X"
+        ],
+        [
+          "buffer",
+          "XSF"
+        ],
+        [
+          "buffer",
+          "TopK"
+        ],
+        [
+          "buffer",
+          "Weights"
+        ],
+        [
+          "buffer",
+          "L1Acts"
+        ],
+        [
+          "buffer",
+          "L1SF"
+        ],
+        [
+          "buffer",
+          "L1Weights"
+        ],
+        [
+          "buffer",
+          "L2SF"
+        ],
+        [
+          "buffer",
+          "SharedL2SF"
+        ],
+        [
+          "buffer",
+          "SourceIndices"
+        ],
+        [
+          "buffer",
+          "TokenMetadata"
+        ],
+        [
+          "buffer",
+          "GridCounters"
+        ],
+        [
+          "buffer",
+          "NvlCounter"
+        ],
+        [
+          "buffer",
+          "NvlSignals"
+        ],
+        [
+          "buffer",
+          "PeerGrid"
+        ],
+        [
+          "buffer",
+          "ReadyGrid"
+        ],
+        [
+          "buffer",
+          "SendCounts"
+        ],
+        [
+          "buffer",
+          "RecvCounts"
+        ],
+        [
+          "buffer",
+          "RecvSum"
+        ],
+        [
+          "buffer",
+          "L1Full"
+        ],
+        [
+          "buffer",
+          "L1Empty"
+        ],
+        [
+          "buffer",
+          "L2Mask"
+        ],
+        [
+          "buffer",
+          "L2Empty"
+        ],
+        [
+          "buffer",
+          "SharedFull"
+        ],
+        [
+          "buffer",
+          "L1Counter"
+        ],
+        [
+          "buffer",
+          "L2Counter"
+        ],
+        [
+          "buffer",
+          "SharedL1Counter"
+        ],
+        [
+          "buffer",
+          "SharedL2Counter"
+        ],
+        [
+          "buffer",
+          "Combine"
+        ],
+        [
+          "buffer",
+          "CombineBytes"
+        ],
+        [
+          "buffer",
+          "Y"
+        ],
+        [
+          "parameter",
+          "num_tokens"
+        ],
+        [
+          "workspace",
+          "tma_descriptor_workspace"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [],
+      "closure_sha256": "014423bfcd295ca3d569d656315fb693fa192d7bd8653a8d04b1f59d31e68497",
+      "tma_workspace_bytes": 2304,
+      "sources": [
+        "csrc/experimental/source_mega_moe/generated/sm_103a/cake_source_mega_moe_sm103a_54957edeca677b892d53_kernel.cu",
+        "csrc/experimental/source_mega_moe/generated/sm_103a/cake_source_mega_moe_sm103a_54957edeca677b892d53_binding.cu"
+      ]
+    },
+    "cake_source_mega_moe_sm103a_906b5e9aab5134361a7f_kernel": {
+      "ffi_entry": "run",
+      "ffi_prepare_entry": "run_prepare",
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "A1"
+        ],
+        [
+          "tma_buffer",
+          "A2"
+        ],
+        [
+          "tma_buffer",
+          "SA1"
+        ],
+        [
+          "tma_buffer",
+          "SA2"
+        ],
+        [
+          "tma_buffer",
+          "B1"
+        ],
+        [
+          "tma_buffer",
+          "B2"
+        ],
+        [
+          "tma_buffer",
+          "SB1"
+        ],
+        [
+          "tma_buffer",
+          "SB2"
+        ],
+        [
+          "tma_buffer",
+          "SFA1"
+        ],
+        [
+          "tma_buffer",
+          "SFA2"
+        ],
+        [
+          "tma_buffer",
+          "SSFA1"
+        ],
+        [
+          "tma_buffer",
+          "SSFA2"
+        ],
+        [
+          "tma_buffer",
+          "SFB1"
+        ],
+        [
+          "tma_buffer",
+          "SFB2"
+        ],
+        [
+          "tma_buffer",
+          "SSFB1"
+        ],
+        [
+          "tma_buffer",
+          "SSFB2"
+        ],
+        [
+          "tma_buffer",
+          "L1Output"
+        ],
+        [
+          "tma_buffer",
+          "SharedL1Output"
+        ],
+        [
+          "buffer",
+          "X"
+        ],
+        [
+          "buffer",
+          "XSF"
+        ],
+        [
+          "buffer",
+          "TopK"
+        ],
+        [
+          "buffer",
+          "Weights"
+        ],
+        [
+          "buffer",
+          "L1Acts"
+        ],
+        [
+          "buffer",
+          "L1SF"
+        ],
+        [
+          "buffer",
+          "L1Weights"
+        ],
+        [
+          "buffer",
+          "L2SF"
+        ],
+        [
+          "buffer",
+          "SharedL2SF"
+        ],
+        [
+          "buffer",
+          "SourceIndices"
+        ],
+        [
+          "buffer",
+          "TokenMetadata"
+        ],
+        [
+          "buffer",
+          "GridCounters"
+        ],
+        [
+          "buffer",
+          "NvlCounter"
+        ],
+        [
+          "buffer",
+          "NvlSignals"
+        ],
+        [
+          "buffer",
+          "PeerGrid"
+        ],
+        [
+          "buffer",
+          "ReadyGrid"
+        ],
+        [
+          "buffer",
+          "SendCounts"
+        ],
+        [
+          "buffer",
+          "RecvCounts"
+        ],
+        [
+          "buffer",
+          "RecvSum"
+        ],
+        [
+          "buffer",
+          "L1Full"
+        ],
+        [
+          "buffer",
+          "L1Empty"
+        ],
+        [
+          "buffer",
+          "L2Mask"
+        ],
+        [
+          "buffer",
+          "L2Empty"
+        ],
+        [
+          "buffer",
+          "SharedFull"
+        ],
+        [
+          "buffer",
+          "L1Counter"
+        ],
+        [
+          "buffer",
+          "L2Counter"
+        ],
+        [
+          "buffer",
+          "SharedL1Counter"
+        ],
+        [
+          "buffer",
+          "SharedL2Counter"
+        ],
+        [
+          "buffer",
+          "Combine"
+        ],
+        [
+          "buffer",
+          "CombineBytes"
+        ],
+        [
+          "buffer",
+          "Y"
+        ],
+        [
+          "parameter",
+          "num_tokens"
+        ],
+        [
+          "workspace",
+          "tma_descriptor_workspace"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [],
+      "closure_sha256": "e6531ae363328e73c6b6ce72a6223c565d8a1842b78613aa6d4a70899eb9bff3",
+      "tma_workspace_bytes": 2304,
+      "sources": [
+        "csrc/experimental/source_mega_moe/generated/sm_103a/cake_source_mega_moe_sm103a_906b5e9aab5134361a7f_kernel.cu",
+        "csrc/experimental/source_mega_moe/generated/sm_103a/cake_source_mega_moe_sm103a_906b5e9aab5134361a7f_binding.cu"
+      ]
+    },
+    "cake_source_mega_moe_sm103a_a92082997fb1fe68e445_kernel": {
+      "ffi_entry": "run",
+      "ffi_prepare_entry": "run_prepare",
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "A1"
+        ],
+        [
+          "tma_buffer",
+          "A2"
+        ],
+        [
+          "tma_buffer",
+          "SA1"
+        ],
+        [
+          "tma_buffer",
+          "SA2"
+        ],
+        [
+          "tma_buffer",
+          "B1"
+        ],
+        [
+          "tma_buffer",
+          "B2"
+        ],
+        [
+          "tma_buffer",
+          "SB1"
+        ],
+        [
+          "tma_buffer",
+          "SB2"
+        ],
+        [
+          "tma_buffer",
+          "SFA1"
+        ],
+        [
+          "tma_buffer",
+          "SFA2"
+        ],
+        [
+          "tma_buffer",
+          "SSFA1"
+        ],
+        [
+          "tma_buffer",
+          "SSFA2"
+        ],
+        [
+          "tma_buffer",
+          "SFB1"
+        ],
+        [
+          "tma_buffer",
+          "SFB2"
+        ],
+        [
+          "tma_buffer",
+          "SSFB1"
+        ],
+        [
+          "tma_buffer",
+          "SSFB2"
+        ],
+        [
+          "tma_buffer",
+          "L1Output"
+        ],
+        [
+          "tma_buffer",
+          "SharedL1Output"
+        ],
+        [
+          "buffer",
+          "X"
+        ],
+        [
+          "buffer",
+          "XSF"
+        ],
+        [
+          "buffer",
+          "TopK"
+        ],
+        [
+          "buffer",
+          "Weights"
+        ],
+        [
+          "buffer",
+          "L1Acts"
+        ],
+        [
+          "buffer",
+          "L1SF"
+        ],
+        [
+          "buffer",
+          "L1Weights"
+        ],
+        [
+          "buffer",
+          "L2SF"
+        ],
+        [
+          "buffer",
+          "SharedL2SF"
+        ],
+        [
+          "buffer",
+          "SourceIndices"
+        ],
+        [
+          "buffer",
+          "TokenMetadata"
+        ],
+        [
+          "buffer",
+          "GridCounters"
+        ],
+        [
+          "buffer",
+          "NvlCounter"
+        ],
+        [
+          "buffer",
+          "NvlSignals"
+        ],
+        [
+          "buffer",
+          "PeerGrid"
+        ],
+        [
+          "buffer",
+          "ReadyGrid"
+        ],
+        [
+          "buffer",
+          "SendCounts"
+        ],
+        [
+          "buffer",
+          "RecvCounts"
+        ],
+        [
+          "buffer",
+          "RecvSum"
+        ],
+        [
+          "buffer",
+          "L1Full"
+        ],
+        [
+          "buffer",
+          "L1Empty"
+        ],
+        [
+          "buffer",
+          "L2Mask"
+        ],
+        [
+          "buffer",
+          "L2Empty"
+        ],
+        [
+          "buffer",
+          "SharedFull"
+        ],
+        [
+          "buffer",
+          "L1Counter"
+        ],
+        [
+          "buffer",
+          "L2Counter"
+        ],
+        [
+          "buffer",
+          "SharedL1Counter"
+        ],
+        [
+          "buffer",
+          "SharedL2Counter"
+        ],
+        [
+          "buffer",
+          "Combine"
+        ],
+        [
+          "buffer",
+          "CombineBytes"
+        ],
+        [
+          "buffer",
+          "Y"
+        ],
+        [
+          "parameter",
+          "num_tokens"
+        ],
+        [
+          "workspace",
+          "tma_descriptor_workspace"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [],
+      "closure_sha256": "41fe30d4c2e16c49f571cfd4c02e8cac1fd4412b3bdac14201f097be0507bfd0",
+      "tma_workspace_bytes": 2304,
+      "sources": [
+        "csrc/experimental/source_mega_moe/generated/sm_103a/cake_source_mega_moe_sm103a_a92082997fb1fe68e445_kernel.cu",
+        "csrc/experimental/source_mega_moe/generated/sm_103a/cake_source_mega_moe_sm103a_a92082997fb1fe68e445_binding.cu"
+      ]
+    },
+    "cake_source_mega_moe_sm103a_e57c823f233c17b77c6f_kernel": {
+      "ffi_entry": "run",
+      "ffi_prepare_entry": "run_prepare",
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "A1"
+        ],
+        [
+          "tma_buffer",
+          "A2"
+        ],
+        [
+          "tma_buffer",
+          "SA1"
+        ],
+        [
+          "tma_buffer",
+          "SA2"
+        ],
+        [
+          "tma_buffer",
+          "B1"
+        ],
+        [
+          "tma_buffer",
+          "B2"
+        ],
+        [
+          "tma_buffer",
+          "SB1"
+        ],
+        [
+          "tma_buffer",
+          "SB2"
+        ],
+        [
+          "tma_buffer",
+          "SFA1"
+        ],
+        [
+          "tma_buffer",
+          "SFA2"
+        ],
+        [
+          "tma_buffer",
+          "SSFA1"
+        ],
+        [
+          "tma_buffer",
+          "SSFA2"
+        ],
+        [
+          "tma_buffer",
+          "SFB1"
+        ],
+        [
+          "tma_buffer",
+          "SFB2"
+        ],
+        [
+          "tma_buffer",
+          "SSFB1"
+        ],
+        [
+          "tma_buffer",
+          "SSFB2"
+        ],
+        [
+          "tma_buffer",
+          "L1Output"
+        ],
+        [
+          "tma_buffer",
+          "SharedL1Output"
+        ],
+        [
+          "buffer",
+          "X"
+        ],
+        [
+          "buffer",
+          "XSF"
+        ],
+        [
+          "buffer",
+          "TopK"
+        ],
+        [
+          "buffer",
+          "Weights"
+        ],
+        [
+          "buffer",
+          "L1Acts"
+        ],
+        [
+          "buffer",
+          "L1SF"
+        ],
+        [
+          "buffer",
+          "L1Weights"
+        ],
+        [
+          "buffer",
+          "L2SF"
+        ],
+        [
+          "buffer",
+          "SharedL2SF"
+        ],
+        [
+          "buffer",
+          "SourceIndices"
+        ],
+        [
+          "buffer",
+          "TokenMetadata"
+        ],
+        [
+          "buffer",
+          "GridCounters"
+        ],
+        [
+          "buffer",
+          "NvlCounter"
+        ],
+        [
+          "buffer",
+          "NvlSignals"
+        ],
+        [
+          "buffer",
+          "PeerGrid"
+        ],
+        [
+          "buffer",
+          "ReadyGrid"
+        ],
+        [
+          "buffer",
+          "SendCounts"
+        ],
+        [
+          "buffer",
+          "RecvCounts"
+        ],
+        [
+          "buffer",
+          "RecvSum"
+        ],
+        [
+          "buffer",
+          "L1Full"
+        ],
+        [
+          "buffer",
+          "L1Empty"
+        ],
+        [
+          "buffer",
+          "L2Mask"
+        ],
+        [
+          "buffer",
+          "L2Empty"
+        ],
+        [
+          "buffer",
+          "SharedFull"
+        ],
+        [
+          "buffer",
+          "L1Counter"
+        ],
+        [
+          "buffer",
+          "L2Counter"
+        ],
+        [
+          "buffer",
+          "SharedL1Counter"
+        ],
+        [
+          "buffer",
+          "SharedL2Counter"
+        ],
+        [
+          "buffer",
+          "Combine"
+        ],
+        [
+          "buffer",
+          "CombineBytes"
+        ],
+        [
+          "buffer",
+          "Y"
+        ],
+        [
+          "parameter",
+          "num_tokens"
+        ],
+        [
+          "workspace",
+          "tma_descriptor_workspace"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [],
+      "closure_sha256": "96b7498e5280649a14ce2d89d9c4cc5be291e2304b9793d9502241d70eb28ea8",
+      "tma_workspace_bytes": 2304,
+      "sources": [
+        "csrc/experimental/source_mega_moe/generated/sm_103a/cake_source_mega_moe_sm103a_e57c823f233c17b77c6f_kernel.cu",
+        "csrc/experimental/source_mega_moe/generated/sm_103a/cake_source_mega_moe_sm103a_e57c823f233c17b77c6f_binding.cu"
+      ]
+    },
+    "cake_source_mega_moe_sm103a_e7e1b1b67bb8ba5a1e7c_kernel": {
+      "ffi_entry": "run",
+      "ffi_prepare_entry": "run_prepare",
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "A1"
+        ],
+        [
+          "tma_buffer",
+          "A2"
+        ],
+        [
+          "tma_buffer",
+          "SA1"
+        ],
+        [
+          "tma_buffer",
+          "SA2"
+        ],
+        [
+          "tma_buffer",
+          "B1"
+        ],
+        [
+          "tma_buffer",
+          "B2"
+        ],
+        [
+          "tma_buffer",
+          "SB1"
+        ],
+        [
+          "tma_buffer",
+          "SB2"
+        ],
+        [
+          "tma_buffer",
+          "SFA1"
+        ],
+        [
+          "tma_buffer",
+          "SFA2"
+        ],
+        [
+          "tma_buffer",
+          "SSFA1"
+        ],
+        [
+          "tma_buffer",
+          "SSFA2"
+        ],
+        [
+          "tma_buffer",
+          "SFB1"
+        ],
+        [
+          "tma_buffer",
+          "SFB2"
+        ],
+        [
+          "tma_buffer",
+          "SSFB1"
+        ],
+        [
+          "tma_buffer",
+          "SSFB2"
+        ],
+        [
+          "tma_buffer",
+          "L1Output"
+        ],
+        [
+          "tma_buffer",
+          "SharedL1Output"
+        ],
+        [
+          "buffer",
+          "X"
+        ],
+        [
+          "buffer",
+          "XSF"
+        ],
+        [
+          "buffer",
+          "TopK"
+        ],
+        [
+          "buffer",
+          "Weights"
+        ],
+        [
+          "buffer",
+          "L1Acts"
+        ],
+        [
+          "buffer",
+          "L1SF"
+        ],
+        [
+          "buffer",
+          "L1Weights"
+        ],
+        [
+          "buffer",
+          "L2SF"
+        ],
+        [
+          "buffer",
+          "SharedL2SF"
+        ],
+        [
+          "buffer",
+          "SourceIndices"
+        ],
+        [
+          "buffer",
+          "TokenMetadata"
+        ],
+        [
+          "buffer",
+          "GridCounters"
+        ],
+        [
+          "buffer",
+          "NvlCounter"
+        ],
+        [
+          "buffer",
+          "NvlSignals"
+        ],
+        [
+          "buffer",
+          "PeerGrid"
+        ],
+        [
+          "buffer",
+          "ReadyGrid"
+        ],
+        [
+          "buffer",
+          "SendCounts"
+        ],
+        [
+          "buffer",
+          "RecvCounts"
+        ],
+        [
+          "buffer",
+          "RecvSum"
+        ],
+        [
+          "buffer",
+          "L1Full"
+        ],
+        [
+          "buffer",
+          "L1Empty"
+        ],
+        [
+          "buffer",
+          "L2Mask"
+        ],
+        [
+          "buffer",
+          "L2Empty"
+        ],
+        [
+          "buffer",
+          "SharedFull"
+        ],
+        [
+          "buffer",
+          "L1Counter"
+        ],
+        [
+          "buffer",
+          "L2Counter"
+        ],
+        [
+          "buffer",
+          "SharedL1Counter"
+        ],
+        [
+          "buffer",
+          "SharedL2Counter"
+        ],
+        [
+          "buffer",
+          "Combine"
+        ],
+        [
+          "buffer",
+          "CombineBytes"
+        ],
+        [
+          "buffer",
+          "Y"
+        ],
+        [
+          "parameter",
+          "num_tokens"
+        ],
+        [
+          "workspace",
+          "tma_descriptor_workspace"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [],
+      "closure_sha256": "ad7b3bddaed6012d58fd854b8b4a34d0ecb875cd45472de5047e3cff391b44f0",
+      "tma_workspace_bytes": 2304,
+      "sources": [
+        "csrc/experimental/source_mega_moe/generated/sm_103a/cake_source_mega_moe_sm103a_e7e1b1b67bb8ba5a1e7c_kernel.cu",
+        "csrc/experimental/source_mega_moe/generated/sm_103a/cake_source_mega_moe_sm103a_e7e1b1b67bb8ba5a1e7c_binding.cu"
+      ]
+    },
+    "cake_source_mega_moe_sm103a_ef04e08911e9d56ee4b5_kernel": {
+      "ffi_entry": "run",
+      "ffi_prepare_entry": "run_prepare",
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "A1"
+        ],
+        [
+          "tma_buffer",
+          "A2"
+        ],
+        [
+          "tma_buffer",
+          "SA1"
+        ],
+        [
+          "tma_buffer",
+          "SA2"
+        ],
+        [
+          "tma_buffer",
+          "B1"
+        ],
+        [
+          "tma_buffer",
+          "B2"
+        ],
+        [
+          "tma_buffer",
+          "SB1"
+        ],
+        [
+          "tma_buffer",
+          "SB2"
+        ],
+        [
+          "tma_buffer",
+          "SFA1"
+        ],
+        [
+          "tma_buffer",
+          "SFA2"
+        ],
+        [
+          "tma_buffer",
+          "SSFA1"
+        ],
+        [
+          "tma_buffer",
+          "SSFA2"
+        ],
+        [
+          "tma_buffer",
+          "SFB1"
+        ],
+        [
+          "tma_buffer",
+          "SFB2"
+        ],
+        [
+          "tma_buffer",
+          "SSFB1"
+        ],
+        [
+          "tma_buffer",
+          "SSFB2"
+        ],
+        [
+          "tma_buffer",
+          "L1Output"
+        ],
+        [
+          "tma_buffer",
+          "SharedL1Output"
+        ],
+        [
+          "buffer",
+          "X"
+        ],
+        [
+          "buffer",
+          "XSF"
+        ],
+        [
+          "buffer",
+          "TopK"
+        ],
+        [
+          "buffer",
+          "Weights"
+        ],
+        [
+          "buffer",
+          "L1Acts"
+        ],
+        [
+          "buffer",
+          "L1SF"
+        ],
+        [
+          "buffer",
+          "L1Weights"
+        ],
+        [
+          "buffer",
+          "L2SF"
+        ],
+        [
+          "buffer",
+          "SharedL2SF"
+        ],
+        [
+          "buffer",
+          "SourceIndices"
+        ],
+        [
+          "buffer",
+          "TokenMetadata"
+        ],
+        [
+          "buffer",
+          "GridCounters"
+        ],
+        [
+          "buffer",
+          "NvlCounter"
+        ],
+        [
+          "buffer",
+          "NvlSignals"
+        ],
+        [
+          "buffer",
+          "PeerGrid"
+        ],
+        [
+          "buffer",
+          "ReadyGrid"
+        ],
+        [
+          "buffer",
+          "SendCounts"
+        ],
+        [
+          "buffer",
+          "RecvCounts"
+        ],
+        [
+          "buffer",
+          "RecvSum"
+        ],
+        [
+          "buffer",
+          "L1Full"
+        ],
+        [
+          "buffer",
+          "L1Empty"
+        ],
+        [
+          "buffer",
+          "L2Mask"
+        ],
+        [
+          "buffer",
+          "L2Empty"
+        ],
+        [
+          "buffer",
+          "SharedFull"
+        ],
+        [
+          "buffer",
+          "L1Counter"
+        ],
+        [
+          "buffer",
+          "L2Counter"
+        ],
+        [
+          "buffer",
+          "SharedL1Counter"
+        ],
+        [
+          "buffer",
+          "SharedL2Counter"
+        ],
+        [
+          "buffer",
+          "Combine"
+        ],
+        [
+          "buffer",
+          "CombineBytes"
+        ],
+        [
+          "buffer",
+          "Y"
+        ],
+        [
+          "parameter",
+          "num_tokens"
+        ],
+        [
+          "workspace",
+          "tma_descriptor_workspace"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [],
+      "closure_sha256": "5a6e1710d5e2b583aa5d4f985d415ef1bf07a253406c8704ef16f19a0b773b60",
+      "tma_workspace_bytes": 2304,
+      "sources": [
+        "csrc/experimental/source_mega_moe/generated/sm_103a/cake_source_mega_moe_sm103a_ef04e08911e9d56ee4b5_kernel.cu",
+        "csrc/experimental/source_mega_moe/generated/sm_103a/cake_source_mega_moe_sm103a_ef04e08911e9d56ee4b5_binding.cu"
+      ]
+    }
+  },
+  "routes": {
+    "{\"activation_clamp\":10.0,\"fast_math\":true,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":384,\"num_shared_experts\":1,\"num_sms\":152,\"num_tokens\":1,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}": {
+      "program": "cake_source_mega_moe_sm103a_a92082997fb1fe68e445_kernel",
+      "layout": {
+        "config": {
+          "num_tokens": 1,
+          "num_experts": 384,
+          "top_k": 6,
+          "hidden": 5120,
+          "intermediate": 2304,
+          "num_shared_experts": 1,
+          "num_ranks": 1,
+          "block_m": 16
+        },
+        "num_sms": 152,
+        "nbytes": 355896704,
+        "signals_bytes": 21140864,
+        "workspace_bytes": 25334144,
+        "max_tokens": 1920,
+        "ring_tokens": 15360,
+        "pool_tokens": 103680,
+        "fields": {
+          "grid_sync_count": {
+            "offset": 0,
+            "shape": [
+              4
+            ],
+            "dtype": "uint32",
+            "nbytes": 16
+          },
+          "nvl_barrier_counter": {
+            "offset": 16,
+            "shape": [
+              1
+            ],
+            "dtype": "uint32",
+            "nbytes": 4
+          },
+          "nvl_barrier_signals": {
+            "offset": 20,
+            "shape": [
+              2
+            ],
+            "dtype": "int32",
+            "nbytes": 8
+          },
+          "l1_task_count": {
+            "offset": 28,
+            "shape": [
+              1
+            ],
+            "dtype": "uint32",
+            "nbytes": 4
+          },
+          "l2_task_count": {
+            "offset": 32,
+            "shape": [
+              1
+            ],
+            "dtype": "uint32",
+            "nbytes": 4
+          },
+          "shared_l1_task_count": {
+            "offset": 36,
+            "shape": [
+              1
+            ],
+            "dtype": "uint32",
+            "nbytes": 4
+          },
+          "shared_l2_task_count": {
+            "offset": 40,
+            "shape": [
+              1
+            ],
+            "dtype": "uint32",
+            "nbytes": 4
+          },
+          "combine_ready_grid_idx": {
+            "offset": 128,
+            "shape": [
+              72
+            ],
+            "dtype": "uint64",
+            "nbytes": 576
+          },
+          "peer_grid_idx": {
+            "offset": 768,
+            "shape": [
+              72
+            ],
+            "dtype": "uint64",
+            "nbytes": 576
+          },
+          "expert_send_count": {
+            "offset": 1408,
+            "shape": [
+              2048
+            ],
+            "dtype": "uint64",
+            "nbytes": 16384
+          },
+          "expert_recv_count": {
+            "offset": 17792,
+            "shape": [
+              2048
+            ],
+            "dtype": "uint64",
+            "nbytes": 16384
+          },
+          "expert_recv_count_sum": {
+            "offset": 34176,
+            "shape": [
+              512
+            ],
+            "dtype": "uint64",
+            "nbytes": 4096
+          },
+          "l1_full_count": {
+            "offset": 38272,
+            "shape": [
+              1048576
+            ],
+            "dtype": "uint32",
+            "nbytes": 4194304
+          },
+          "l1_empty_count": {
+            "offset": 4232576,
+            "shape": [
+              1048576
+            ],
+            "dtype": "uint32",
+            "nbytes": 4194304
+          },
+          "l2_full_mask": {
+            "offset": 8426880,
+            "shape": [
+              1048576
+            ],
+            "dtype": "uint64",
+            "nbytes": 8388608
+          },
+          "l2_empty_count": {
+            "offset": 16815488,
+            "shape": [
+              1048576
+            ],
+            "dtype": "uint32",
+            "nbytes": 4194304
+          },
+          "shared_l2_full_count": {
+            "offset": 21009792,
+            "shape": [
+              32768
+            ],
+            "dtype": "uint32",
+            "nbytes": 131072
+          },
+          "src_token_topk": {
+            "offset": 21140864,
+            "shape": [
+              384,
+              1920
+            ],
+            "dtype": "uint32",
+            "nbytes": 2949120
+          },
+          "token_src_metadata": {
+            "offset": 24089984,
+            "shape": [
+              103680,
+              3
+            ],
+            "dtype": "uint32",
+            "nbytes": 1244160
+          },
+          "x": {
+            "offset": 25334144,
+            "shape": [
+              1920,
+              5120
+            ],
+            "dtype": "float8_e4m3fn",
+            "nbytes": 9830400
+          },
+          "x_sf": {
+            "offset": 35164544,
+            "shape": [
+              1920,
+              40
+            ],
+            "dtype": "int32",
+            "nbytes": 307200
+          },
+          "topk_idx": {
+            "offset": 35471744,
+            "shape": [
+              1920,
+              6
+            ],
+            "dtype": "int64",
+            "nbytes": 92160
+          },
+          "topk_weights": {
+            "offset": 35563904,
+            "shape": [
+              1920,
+              6
+            ],
+            "dtype": "float32",
+            "nbytes": 46080
+          },
+          "shared_l1_sf": {
+            "offset": 35609984,
+            "shape": [
+              40,
+              30720
+            ],
+            "dtype": "int32",
+            "nbytes": 4915200
+          },
+          "shared_l2_acts": {
+            "offset": 40525184,
+            "shape": [
+              1920,
+              2304
+            ],
+            "dtype": "float8_e4m3fn",
+            "nbytes": 4423680
+          },
+          "shared_l2_sf": {
+            "offset": 44948864,
+            "shape": [
+              18,
+              30720
+            ],
+            "dtype": "int32",
+            "nbytes": 2211840
+          },
+          "l1_acts": {
+            "offset": 47160704,
+            "shape": [
+              15360,
+              5120
+            ],
+            "dtype": "float8_e4m3fn",
+            "nbytes": 78643200
+          },
+          "l1_sf": {
+            "offset": 125803904,
+            "shape": [
+              40,
+              245760
+            ],
+            "dtype": "int32",
+            "nbytes": 39321600
+          },
+          "l1_topk_weights": {
+            "offset": 165125504,
+            "shape": [
+              15360
+            ],
+            "dtype": "float32",
+            "nbytes": 61440
+          },
+          "l2_acts": {
+            "offset": 165186944,
+            "shape": [
+              15360,
+              2304
+            ],
+            "dtype": "float8_e4m3fn",
+            "nbytes": 35389440
+          },
+          "l2_sf": {
+            "offset": 200576384,
+            "shape": [
+              18,
+              245760
+            ],
+            "dtype": "int32",
+            "nbytes": 17694720
+          },
+          "combine": {
+            "offset": 218271104,
+            "shape": [
+              7,
+              1920,
+              5120
+            ],
+            "dtype": "bfloat16",
+            "nbytes": 137625600
+          }
+        }
+      }
+    },
+    "{\"activation_clamp\":10.0,\"fast_math\":true,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":384,\"num_shared_experts\":1,\"num_sms\":152,\"num_tokens\":16,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}": {
+      "program": "cake_source_mega_moe_sm103a_4db01334a3fc2408a988_kernel",
+      "layout": {
+        "config": {
+          "num_tokens": 16,
+          "num_experts": 384,
+          "top_k": 6,
+          "hidden": 5120,
+          "intermediate": 2304,
+          "num_shared_experts": 1,
+          "num_ranks": 1,
+          "block_m": 16
+        },
+        "num_sms": 152,
+        "nbytes": 355896704,
+        "signals_bytes": 21140864,
+        "workspace_bytes": 25334144,
+        "max_tokens": 1920,
+        "ring_tokens": 15360,
+        "pool_tokens": 103680,
+        "fields": {
+          "grid_sync_count": {
+            "offset": 0,
+            "shape": [
+              4
+            ],
+            "dtype": "uint32",
+            "nbytes": 16
+          },
+          "nvl_barrier_counter": {
+            "offset": 16,
+            "shape": [
+              1
+            ],
+            "dtype": "uint32",
+            "nbytes": 4
+          },
+          "nvl_barrier_signals": {
+            "offset": 20,
+            "shape": [
+              2
+            ],
+            "dtype": "int32",
+            "nbytes": 8
+          },
+          "l1_task_count": {
+            "offset": 28,
+            "shape": [
+              1
+            ],
+            "dtype": "uint32",
+            "nbytes": 4
+          },
+          "l2_task_count": {
+            "offset": 32,
+            "shape": [
+              1
+            ],
+            "dtype": "uint32",
+            "nbytes": 4
+          },
+          "shared_l1_task_count": {
+            "offset": 36,
+            "shape": [
+              1
+            ],
+            "dtype": "uint32",
+            "nbytes": 4
+          },
+          "shared_l2_task_count": {
+            "offset": 40,
+            "shape": [
+              1
+            ],
+            "dtype": "uint32",
+            "nbytes": 4
+          },
+          "combine_ready_grid_idx": {
+            "offset": 128,
+            "shape": [
+              72
+            ],
+            "dtype": "uint64",
+            "nbytes": 576
+          },
+          "peer_grid_idx": {
+            "offset": 768,
+            "shape": [
+              72
+            ],
+            "dtype": "uint64",
+            "nbytes": 576
+          },
+          "expert_send_count": {
+            "offset": 1408,
+            "shape": [
+              2048
+            ],
+            "dtype": "uint64",
+            "nbytes": 16384
+          },
+          "expert_recv_count": {
+            "offset": 17792,
+            "shape": [
+              2048
+            ],
+            "dtype": "uint64",
+            "nbytes": 16384
+          },
+          "expert_recv_count_sum": {
+            "offset": 34176,
+            "shape": [
+              512
+            ],
+            "dtype": "uint64",
+            "nbytes": 4096
+          },
+          "l1_full_count": {
+            "offset": 38272,
+            "shape": [
+              1048576
+            ],
+            "dtype": "uint32",
+            "nbytes": 4194304
+          },
+          "l1_empty_count": {
+            "offset": 4232576,
+            "shape": [
+              1048576
+            ],
+            "dtype": "uint32",
+            "nbytes": 4194304
+          },
+          "l2_full_mask": {
+            "offset": 8426880,
+            "shape": [
+              1048576
+            ],
+            "dtype": "uint64",
+            "nbytes": 8388608
+          },
+          "l2_empty_count": {
+            "offset": 16815488,
+            "shape": [
+              1048576
+            ],
+            "dtype": "uint32",
+            "nbytes": 4194304
+          },
+          "shared_l2_full_count": {
+            "offset": 21009792,
+            "shape": [
+              32768
+            ],
+            "dtype": "uint32",
+            "nbytes": 131072
+          },
+          "src_token_topk": {
+            "offset": 21140864,
+            "shape": [
+              384,
+              1920
+            ],
+            "dtype": "uint32",
+            "nbytes": 2949120
+          },
+          "token_src_metadata": {
+            "offset": 24089984,
+            "shape": [
+              103680,
+              3
+            ],
+            "dtype": "uint32",
+            "nbytes": 1244160
+          },
+          "x": {
+            "offset": 25334144,
+            "shape": [
+              1920,
+              5120
+            ],
+            "dtype": "float8_e4m3fn",
+            "nbytes": 9830400
+          },
+          "x_sf": {
+            "offset": 35164544,
+            "shape": [
+              1920,
+              40
+            ],
+            "dtype": "int32",
+            "nbytes": 307200
+          },
+          "topk_idx": {
+            "offset": 35471744,
+            "shape": [
+              1920,
+              6
+            ],
+            "dtype": "int64",
+            "nbytes": 92160
+          },
+          "topk_weights": {
+            "offset": 35563904,
+            "shape": [
+              1920,
+              6
+            ],
+            "dtype": "float32",
+            "nbytes": 46080
+          },
+          "shared_l1_sf": {
+            "offset": 35609984,
+            "shape": [
+              40,
+              30720
+            ],
+            "dtype": "int32",
+            "nbytes": 4915200
+          },
+          "shared_l2_acts": {
+            "offset": 40525184,
+            "shape": [
+              1920,
+              2304
+            ],
+            "dtype": "float8_e4m3fn",
+            "nbytes": 4423680
+          },
+          "shared_l2_sf": {
+            "offset": 44948864,
+            "shape": [
+              18,
+              30720
+            ],
+            "dtype": "int32",
+            "nbytes": 2211840
+          },
+          "l1_acts": {
+            "offset": 47160704,
+            "shape": [
+              15360,
+              5120
+            ],
+            "dtype": "float8_e4m3fn",
+            "nbytes": 78643200
+          },
+          "l1_sf": {
+            "offset": 125803904,
+            "shape": [
+              40,
+              245760
+            ],
+            "dtype": "int32",
+            "nbytes": 39321600
+          },
+          "l1_topk_weights": {
+            "offset": 165125504,
+            "shape": [
+              15360
+            ],
+            "dtype": "float32",
+            "nbytes": 61440
+          },
+          "l2_acts": {
+            "offset": 165186944,
+            "shape": [
+              15360,
+              2304
+            ],
+            "dtype": "float8_e4m3fn",
+            "nbytes": 35389440
+          },
+          "l2_sf": {
+            "offset": 200576384,
+            "shape": [
+              18,
+              245760
+            ],
+            "dtype": "int32",
+            "nbytes": 17694720
+          },
+          "combine": {
+            "offset": 218271104,
+            "shape": [
+              7,
+              1920,
+              5120
+            ],
+            "dtype": "bfloat16",
+            "nbytes": 137625600
+          }
+        }
+      }
+    },
+    "{\"activation_clamp\":10.0,\"fast_math\":true,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":384,\"num_shared_experts\":1,\"num_sms\":152,\"num_tokens\":128,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}": {
+      "program": "cake_source_mega_moe_sm103a_e57c823f233c17b77c6f_kernel",
+      "layout": {
+        "config": {
+          "num_tokens": 128,
+          "num_experts": 384,
+          "top_k": 6,
+          "hidden": 5120,
+          "intermediate": 2304,
+          "num_shared_experts": 1,
+          "num_ranks": 1,
+          "block_m": 16
+        },
+        "num_sms": 152,
+        "nbytes": 355896704,
+        "signals_bytes": 21140864,
+        "workspace_bytes": 25334144,
+        "max_tokens": 1920,
+        "ring_tokens": 15360,
+        "pool_tokens": 103680,
+        "fields": {
+          "grid_sync_count": {
+            "offset": 0,
+            "shape": [
+              4
+            ],
+            "dtype": "uint32",
+            "nbytes": 16
+          },
+          "nvl_barrier_counter": {
+            "offset": 16,
+            "shape": [
+              1
+            ],
+            "dtype": "uint32",
+            "nbytes": 4
+          },
+          "nvl_barrier_signals": {
+            "offset": 20,
+            "shape": [
+              2
+            ],
+            "dtype": "int32",
+            "nbytes": 8
+          },
+          "l1_task_count": {
+            "offset": 28,
+            "shape": [
+              1
+            ],
+            "dtype": "uint32",
+            "nbytes": 4
+          },
+          "l2_task_count": {
+            "offset": 32,
+            "shape": [
+              1
+            ],
+            "dtype": "uint32",
+            "nbytes": 4
+          },
+          "shared_l1_task_count": {
+            "offset": 36,
+            "shape": [
+              1
+            ],
+            "dtype": "uint32",
+            "nbytes": 4
+          },
+          "shared_l2_task_count": {
+            "offset": 40,
+            "shape": [
+              1
+            ],
+            "dtype": "uint32",
+            "nbytes": 4
+          },
+          "combine_ready_grid_idx": {
+            "offset": 128,
+            "shape": [
+              72
+            ],
+            "dtype": "uint64",
+            "nbytes": 576
+          },
+          "peer_grid_idx": {
+            "offset": 768,
+            "shape": [
+              72
+            ],
+            "dtype": "uint64",
+            "nbytes": 576
+          },
+          "expert_send_count": {
+            "offset": 1408,
+            "shape": [
+              2048
+            ],
+            "dtype": "uint64",
+            "nbytes": 16384
+          },
+          "expert_recv_count": {
+            "offset": 17792,
+            "shape": [
+              2048
+            ],
+            "dtype": "uint64",
+            "nbytes": 16384
+          },
+          "expert_recv_count_sum": {
+            "offset": 34176,
+            "shape": [
+              512
+            ],
+            "dtype": "uint64",
+            "nbytes": 4096
+          },
+          "l1_full_count": {
+            "offset": 38272,
+            "shape": [
+              1048576
+            ],
+            "dtype": "uint32",
+            "nbytes": 4194304
+          },
+          "l1_empty_count": {
+            "offset": 4232576,
+            "shape": [
+              1048576
+            ],
+            "dtype": "uint32",
+            "nbytes": 4194304
+          },
+          "l2_full_mask": {
+            "offset": 8426880,
+            "shape": [
+              1048576
+            ],
+            "dtype": "uint64",
+            "nbytes": 8388608
+          },
+          "l2_empty_count": {
+            "offset": 16815488,
+            "shape": [
+              1048576
+            ],
+            "dtype": "uint32",
+            "nbytes": 4194304
+          },
+          "shared_l2_full_count": {
+            "offset": 21009792,
+            "shape": [
+              32768
+            ],
+            "dtype": "uint32",
+            "nbytes": 131072
+          },
+          "src_token_topk": {
+            "offset": 21140864,
+            "shape": [
+              384,
+              1920
+            ],
+            "dtype": "uint32",
+            "nbytes": 2949120
+          },
+          "token_src_metadata": {
+            "offset": 24089984,
+            "shape": [
+              103680,
+              3
+            ],
+            "dtype": "uint32",
+            "nbytes": 1244160
+          },
+          "x": {
+            "offset": 25334144,
+            "shape": [
+              1920,
+              5120
+            ],
+            "dtype": "float8_e4m3fn",
+            "nbytes": 9830400
+          },
+          "x_sf": {
+            "offset": 35164544,
+            "shape": [
+              1920,
+              40
+            ],
+            "dtype": "int32",
+            "nbytes": 307200
+          },
+          "topk_idx": {
+            "offset": 35471744,
+            "shape": [
+              1920,
+              6
+            ],
+            "dtype": "int64",
+            "nbytes": 92160
+          },
+          "topk_weights": {
+            "offset": 35563904,
+            "shape": [
+              1920,
+              6
+            ],
+            "dtype": "float32",
+            "nbytes": 46080
+          },
+          "shared_l1_sf": {
+            "offset": 35609984,
+            "shape": [
+              40,
+              30720
+            ],
+            "dtype": "int32",
+            "nbytes": 4915200
+          },
+          "shared_l2_acts": {
+            "offset": 40525184,
+            "shape": [
+              1920,
+              2304
+            ],
+            "dtype": "float8_e4m3fn",
+            "nbytes": 4423680
+          },
+          "shared_l2_sf": {
+            "offset": 44948864,
+            "shape": [
+              18,
+              30720
+            ],
+            "dtype": "int32",
+            "nbytes": 2211840
+          },
+          "l1_acts": {
+            "offset": 47160704,
+            "shape": [
+              15360,
+              5120
+            ],
+            "dtype": "float8_e4m3fn",
+            "nbytes": 78643200
+          },
+          "l1_sf": {
+            "offset": 125803904,
+            "shape": [
+              40,
+              245760
+            ],
+            "dtype": "int32",
+            "nbytes": 39321600
+          },
+          "l1_topk_weights": {
+            "offset": 165125504,
+            "shape": [
+              15360
+            ],
+            "dtype": "float32",
+            "nbytes": 61440
+          },
+          "l2_acts": {
+            "offset": 165186944,
+            "shape": [
+              15360,
+              2304
+            ],
+            "dtype": "float8_e4m3fn",
+            "nbytes": 35389440
+          },
+          "l2_sf": {
+            "offset": 200576384,
+            "shape": [
+              18,
+              245760
+            ],
+            "dtype": "int32",
+            "nbytes": 17694720
+          },
+          "combine": {
+            "offset": 218271104,
+            "shape": [
+              7,
+              1920,
+              5120
+            ],
+            "dtype": "bfloat16",
+            "nbytes": 137625600
+          }
+        }
+      }
+    },
+    "{\"activation_clamp\":10.0,\"fast_math\":true,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":384,\"num_shared_experts\":1,\"num_sms\":152,\"num_tokens\":512,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}": {
+      "program": "cake_source_mega_moe_sm103a_e7e1b1b67bb8ba5a1e7c_kernel",
+      "layout": {
+        "config": {
+          "num_tokens": 512,
+          "num_experts": 384,
+          "top_k": 6,
+          "hidden": 5120,
+          "intermediate": 2304,
+          "num_shared_experts": 1,
+          "num_ranks": 1,
+          "block_m": 16
+        },
+        "num_sms": 152,
+        "nbytes": 355896704,
+        "signals_bytes": 21140864,
+        "workspace_bytes": 25334144,
+        "max_tokens": 1920,
+        "ring_tokens": 15360,
+        "pool_tokens": 103680,
+        "fields": {
+          "grid_sync_count": {
+            "offset": 0,
+            "shape": [
+              4
+            ],
+            "dtype": "uint32",
+            "nbytes": 16
+          },
+          "nvl_barrier_counter": {
+            "offset": 16,
+            "shape": [
+              1
+            ],
+            "dtype": "uint32",
+            "nbytes": 4
+          },
+          "nvl_barrier_signals": {
+            "offset": 20,
+            "shape": [
+              2
+            ],
+            "dtype": "int32",
+            "nbytes": 8
+          },
+          "l1_task_count": {
+            "offset": 28,
+            "shape": [
+              1
+            ],
+            "dtype": "uint32",
+            "nbytes": 4
+          },
+          "l2_task_count": {
+            "offset": 32,
+            "shape": [
+              1
+            ],
+            "dtype": "uint32",
+            "nbytes": 4
+          },
+          "shared_l1_task_count": {
+            "offset": 36,
+            "shape": [
+              1
+            ],
+            "dtype": "uint32",
+            "nbytes": 4
+          },
+          "shared_l2_task_count": {
+            "offset": 40,
+            "shape": [
+              1
+            ],
+            "dtype": "uint32",
+            "nbytes": 4
+          },
+          "combine_ready_grid_idx": {
+            "offset": 128,
+            "shape": [
+              72
+            ],
+            "dtype": "uint64",
+            "nbytes": 576
+          },
+          "peer_grid_idx": {
+            "offset": 768,
+            "shape": [
+              72
+            ],
+            "dtype": "uint64",
+            "nbytes": 576
+          },
+          "expert_send_count": {
+            "offset": 1408,
+            "shape": [
+              2048
+            ],
+            "dtype": "uint64",
+            "nbytes": 16384
+          },
+          "expert_recv_count": {
+            "offset": 17792,
+            "shape": [
+              2048
+            ],
+            "dtype": "uint64",
+            "nbytes": 16384
+          },
+          "expert_recv_count_sum": {
+            "offset": 34176,
+            "shape": [
+              512
+            ],
+            "dtype": "uint64",
+            "nbytes": 4096
+          },
+          "l1_full_count": {
+            "offset": 38272,
+            "shape": [
+              1048576
+            ],
+            "dtype": "uint32",
+            "nbytes": 4194304
+          },
+          "l1_empty_count": {
+            "offset": 4232576,
+            "shape": [
+              1048576
+            ],
+            "dtype": "uint32",
+            "nbytes": 4194304
+          },
+          "l2_full_mask": {
+            "offset": 8426880,
+            "shape": [
+              1048576
+            ],
+            "dtype": "uint64",
+            "nbytes": 8388608
+          },
+          "l2_empty_count": {
+            "offset": 16815488,
+            "shape": [
+              1048576
+            ],
+            "dtype": "uint32",
+            "nbytes": 4194304
+          },
+          "shared_l2_full_count": {
+            "offset": 21009792,
+            "shape": [
+              32768
+            ],
+            "dtype": "uint32",
+            "nbytes": 131072
+          },
+          "src_token_topk": {
+            "offset": 21140864,
+            "shape": [
+              384,
+              1920
+            ],
+            "dtype": "uint32",
+            "nbytes": 2949120
+          },
+          "token_src_metadata": {
+            "offset": 24089984,
+            "shape": [
+              103680,
+              3
+            ],
+            "dtype": "uint32",
+            "nbytes": 1244160
+          },
+          "x": {
+            "offset": 25334144,
+            "shape": [
+              1920,
+              5120
+            ],
+            "dtype": "float8_e4m3fn",
+            "nbytes": 9830400
+          },
+          "x_sf": {
+            "offset": 35164544,
+            "shape": [
+              1920,
+              40
+            ],
+            "dtype": "int32",
+            "nbytes": 307200
+          },
+          "topk_idx": {
+            "offset": 35471744,
+            "shape": [
+              1920,
+              6
+            ],
+            "dtype": "int64",
+            "nbytes": 92160
+          },
+          "topk_weights": {
+            "offset": 35563904,
+            "shape": [
+              1920,
+              6
+            ],
+            "dtype": "float32",
+            "nbytes": 46080
+          },
+          "shared_l1_sf": {
+            "offset": 35609984,
+            "shape": [
+              40,
+              30720
+            ],
+            "dtype": "int32",
+            "nbytes": 4915200
+          },
+          "shared_l2_acts": {
+            "offset": 40525184,
+            "shape": [
+              1920,
+              2304
+            ],
+            "dtype": "float8_e4m3fn",
+            "nbytes": 4423680
+          },
+          "shared_l2_sf": {
+            "offset": 44948864,
+            "shape": [
+              18,
+              30720
+            ],
+            "dtype": "int32",
+            "nbytes": 2211840
+          },
+          "l1_acts": {
+            "offset": 47160704,
+            "shape": [
+              15360,
+              5120
+            ],
+            "dtype": "float8_e4m3fn",
+            "nbytes": 78643200
+          },
+          "l1_sf": {
+            "offset": 125803904,
+            "shape": [
+              40,
+              245760
+            ],
+            "dtype": "int32",
+            "nbytes": 39321600
+          },
+          "l1_topk_weights": {
+            "offset": 165125504,
+            "shape": [
+              15360
+            ],
+            "dtype": "float32",
+            "nbytes": 61440
+          },
+          "l2_acts": {
+            "offset": 165186944,
+            "shape": [
+              15360,
+              2304
+            ],
+            "dtype": "float8_e4m3fn",
+            "nbytes": 35389440
+          },
+          "l2_sf": {
+            "offset": 200576384,
+            "shape": [
+              18,
+              245760
+            ],
+            "dtype": "int32",
+            "nbytes": 17694720
+          },
+          "combine": {
+            "offset": 218271104,
+            "shape": [
+              7,
+              1920,
+              5120
+            ],
+            "dtype": "bfloat16",
+            "nbytes": 137625600
+          }
+        }
+      }
+    },
+    "{\"activation_clamp\":10.0,\"fast_math\":true,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":384,\"num_shared_experts\":1,\"num_sms\":152,\"num_tokens\":1024,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}": {
+      "program": "cake_source_mega_moe_sm103a_54957edeca677b892d53_kernel",
+      "layout": {
+        "config": {
+          "num_tokens": 1024,
+          "num_experts": 384,
+          "top_k": 6,
+          "hidden": 5120,
+          "intermediate": 2304,
+          "num_shared_experts": 1,
+          "num_ranks": 1,
+          "block_m": 32
+        },
+        "num_sms": 152,
+        "nbytes": 355896704,
+        "signals_bytes": 21140864,
+        "workspace_bytes": 25334144,
+        "max_tokens": 1920,
+        "ring_tokens": 15360,
+        "pool_tokens": 103680,
+        "fields": {
+          "grid_sync_count": {
+            "offset": 0,
+            "shape": [
+              4
+            ],
+            "dtype": "uint32",
+            "nbytes": 16
+          },
+          "nvl_barrier_counter": {
+            "offset": 16,
+            "shape": [
+              1
+            ],
+            "dtype": "uint32",
+            "nbytes": 4
+          },
+          "nvl_barrier_signals": {
+            "offset": 20,
+            "shape": [
+              2
+            ],
+            "dtype": "int32",
+            "nbytes": 8
+          },
+          "l1_task_count": {
+            "offset": 28,
+            "shape": [
+              1
+            ],
+            "dtype": "uint32",
+            "nbytes": 4
+          },
+          "l2_task_count": {
+            "offset": 32,
+            "shape": [
+              1
+            ],
+            "dtype": "uint32",
+            "nbytes": 4
+          },
+          "shared_l1_task_count": {
+            "offset": 36,
+            "shape": [
+              1
+            ],
+            "dtype": "uint32",
+            "nbytes": 4
+          },
+          "shared_l2_task_count": {
+            "offset": 40,
+            "shape": [
+              1
+            ],
+            "dtype": "uint32",
+            "nbytes": 4
+          },
+          "combine_ready_grid_idx": {
+            "offset": 128,
+            "shape": [
+              72
+            ],
+            "dtype": "uint64",
+            "nbytes": 576
+          },
+          "peer_grid_idx": {
+            "offset": 768,
+            "shape": [
+              72
+            ],
+            "dtype": "uint64",
+            "nbytes": 576
+          },
+          "expert_send_count": {
+            "offset": 1408,
+            "shape": [
+              2048
+            ],
+            "dtype": "uint64",
+            "nbytes": 16384
+          },
+          "expert_recv_count": {
+            "offset": 17792,
+            "shape": [
+              2048
+            ],
+            "dtype": "uint64",
+            "nbytes": 16384
+          },
+          "expert_recv_count_sum": {
+            "offset": 34176,
+            "shape": [
+              512
+            ],
+            "dtype": "uint64",
+            "nbytes": 4096
+          },
+          "l1_full_count": {
+            "offset": 38272,
+            "shape": [
+              1048576
+            ],
+            "dtype": "uint32",
+            "nbytes": 4194304
+          },
+          "l1_empty_count": {
+            "offset": 4232576,
+            "shape": [
+              1048576
+            ],
+            "dtype": "uint32",
+            "nbytes": 4194304
+          },
+          "l2_full_mask": {
+            "offset": 8426880,
+            "shape": [
+              1048576
+            ],
+            "dtype": "uint64",
+            "nbytes": 8388608
+          },
+          "l2_empty_count": {
+            "offset": 16815488,
+            "shape": [
+              1048576
+            ],
+            "dtype": "uint32",
+            "nbytes": 4194304
+          },
+          "shared_l2_full_count": {
+            "offset": 21009792,
+            "shape": [
+              32768
+            ],
+            "dtype": "uint32",
+            "nbytes": 131072
+          },
+          "src_token_topk": {
+            "offset": 21140864,
+            "shape": [
+              384,
+              1920
+            ],
+            "dtype": "uint32",
+            "nbytes": 2949120
+          },
+          "token_src_metadata": {
+            "offset": 24089984,
+            "shape": [
+              103680,
+              3
+            ],
+            "dtype": "uint32",
+            "nbytes": 1244160
+          },
+          "x": {
+            "offset": 25334144,
+            "shape": [
+              1920,
+              5120
+            ],
+            "dtype": "float8_e4m3fn",
+            "nbytes": 9830400
+          },
+          "x_sf": {
+            "offset": 35164544,
+            "shape": [
+              1920,
+              40
+            ],
+            "dtype": "int32",
+            "nbytes": 307200
+          },
+          "topk_idx": {
+            "offset": 35471744,
+            "shape": [
+              1920,
+              6
+            ],
+            "dtype": "int64",
+            "nbytes": 92160
+          },
+          "topk_weights": {
+            "offset": 35563904,
+            "shape": [
+              1920,
+              6
+            ],
+            "dtype": "float32",
+            "nbytes": 46080
+          },
+          "shared_l1_sf": {
+            "offset": 35609984,
+            "shape": [
+              40,
+              30720
+            ],
+            "dtype": "int32",
+            "nbytes": 4915200
+          },
+          "shared_l2_acts": {
+            "offset": 40525184,
+            "shape": [
+              1920,
+              2304
+            ],
+            "dtype": "float8_e4m3fn",
+            "nbytes": 4423680
+          },
+          "shared_l2_sf": {
+            "offset": 44948864,
+            "shape": [
+              18,
+              30720
+            ],
+            "dtype": "int32",
+            "nbytes": 2211840
+          },
+          "l1_acts": {
+            "offset": 47160704,
+            "shape": [
+              15360,
+              5120
+            ],
+            "dtype": "float8_e4m3fn",
+            "nbytes": 78643200
+          },
+          "l1_sf": {
+            "offset": 125803904,
+            "shape": [
+              40,
+              245760
+            ],
+            "dtype": "int32",
+            "nbytes": 39321600
+          },
+          "l1_topk_weights": {
+            "offset": 165125504,
+            "shape": [
+              15360
+            ],
+            "dtype": "float32",
+            "nbytes": 61440
+          },
+          "l2_acts": {
+            "offset": 165186944,
+            "shape": [
+              15360,
+              2304
+            ],
+            "dtype": "float8_e4m3fn",
+            "nbytes": 35389440
+          },
+          "l2_sf": {
+            "offset": 200576384,
+            "shape": [
+              18,
+              245760
+            ],
+            "dtype": "int32",
+            "nbytes": 17694720
+          },
+          "combine": {
+            "offset": 218271104,
+            "shape": [
+              7,
+              1920,
+              5120
+            ],
+            "dtype": "bfloat16",
+            "nbytes": 137625600
+          }
+        }
+      }
+    },
+    "{\"activation_clamp\":10.0,\"fast_math\":true,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":384,\"num_shared_experts\":1,\"num_sms\":152,\"num_tokens\":4096,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}": {
+      "program": "cake_source_mega_moe_sm103a_906b5e9aab5134361a7f_kernel",
+      "layout": {
+        "config": {
+          "num_tokens": 4096,
+          "num_experts": 384,
+          "top_k": 6,
+          "hidden": 5120,
+          "intermediate": 2304,
+          "num_shared_experts": 1,
+          "num_ranks": 1,
+          "block_m": 128
+        },
+        "num_sms": 152,
+        "nbytes": 702364544,
+        "signals_bytes": 21140864,
+        "workspace_bytes": 31508864,
+        "max_tokens": 5760,
+        "ring_tokens": 17280,
+        "pool_tokens": 126720,
+        "fields": {
+          "grid_sync_count": {
+            "offset": 0,
+            "shape": [
+              4
+            ],
+            "dtype": "uint32",
+            "nbytes": 16
+          },
+          "nvl_barrier_counter": {
+            "offset": 16,
+            "shape": [
+              1
+            ],
+            "dtype": "uint32",
+            "nbytes": 4
+          },
+          "nvl_barrier_signals": {
+            "offset": 20,
+            "shape": [
+              2
+            ],
+            "dtype": "int32",
+            "nbytes": 8
+          },
+          "l1_task_count": {
+            "offset": 28,
+            "shape": [
+              1
+            ],
+            "dtype": "uint32",
+            "nbytes": 4
+          },
+          "l2_task_count": {
+            "offset": 32,
+            "shape": [
+              1
+            ],
+            "dtype": "uint32",
+            "nbytes": 4
+          },
+          "shared_l1_task_count": {
+            "offset": 36,
+            "shape": [
+              1
+            ],
+            "dtype": "uint32",
+            "nbytes": 4
+          },
+          "shared_l2_task_count": {
+            "offset": 40,
+            "shape": [
+              1
+            ],
+            "dtype": "uint32",
+            "nbytes": 4
+          },
+          "combine_ready_grid_idx": {
+            "offset": 128,
+            "shape": [
+              72
+            ],
+            "dtype": "uint64",
+            "nbytes": 576
+          },
+          "peer_grid_idx": {
+            "offset": 768,
+            "shape": [
+              72
+            ],
+            "dtype": "uint64",
+            "nbytes": 576
+          },
+          "expert_send_count": {
+            "offset": 1408,
+            "shape": [
+              2048
+            ],
+            "dtype": "uint64",
+            "nbytes": 16384
+          },
+          "expert_recv_count": {
+            "offset": 17792,
+            "shape": [
+              2048
+            ],
+            "dtype": "uint64",
+            "nbytes": 16384
+          },
+          "expert_recv_count_sum": {
+            "offset": 34176,
+            "shape": [
+              512
+            ],
+            "dtype": "uint64",
+            "nbytes": 4096
+          },
+          "l1_full_count": {
+            "offset": 38272,
+            "shape": [
+              1048576
+            ],
+            "dtype": "uint32",
+            "nbytes": 4194304
+          },
+          "l1_empty_count": {
+            "offset": 4232576,
+            "shape": [
+              1048576
+            ],
+            "dtype": "uint32",
+            "nbytes": 4194304
+          },
+          "l2_full_mask": {
+            "offset": 8426880,
+            "shape": [
+              1048576
+            ],
+            "dtype": "uint64",
+            "nbytes": 8388608
+          },
+          "l2_empty_count": {
+            "offset": 16815488,
+            "shape": [
+              1048576
+            ],
+            "dtype": "uint32",
+            "nbytes": 4194304
+          },
+          "shared_l2_full_count": {
+            "offset": 21009792,
+            "shape": [
+              32768
+            ],
+            "dtype": "uint32",
+            "nbytes": 131072
+          },
+          "src_token_topk": {
+            "offset": 21140864,
+            "shape": [
+              384,
+              5760
+            ],
+            "dtype": "uint32",
+            "nbytes": 8847360
+          },
+          "token_src_metadata": {
+            "offset": 29988224,
+            "shape": [
+              126720,
+              3
+            ],
+            "dtype": "uint32",
+            "nbytes": 1520640
+          },
+          "x": {
+            "offset": 31508864,
+            "shape": [
+              5760,
+              5120
+            ],
+            "dtype": "float8_e4m3fn",
+            "nbytes": 29491200
+          },
+          "x_sf": {
+            "offset": 61000064,
+            "shape": [
+              5760,
+              40
+            ],
+            "dtype": "int32",
+            "nbytes": 921600
+          },
+          "topk_idx": {
+            "offset": 61921664,
+            "shape": [
+              5760,
+              6
+            ],
+            "dtype": "int64",
+            "nbytes": 276480
+          },
+          "topk_weights": {
+            "offset": 62198144,
+            "shape": [
+              5760,
+              6
+            ],
+            "dtype": "float32",
+            "nbytes": 138240
+          },
+          "shared_l1_sf": {
+            "offset": 62336384,
+            "shape": [
+              40,
+              92160
+            ],
+            "dtype": "int32",
+            "nbytes": 14745600
+          },
+          "shared_l2_acts": {
+            "offset": 77081984,
+            "shape": [
+              5760,
+              2304
+            ],
+            "dtype": "float8_e4m3fn",
+            "nbytes": 13271040
+          },
+          "shared_l2_sf": {
+            "offset": 90353024,
+            "shape": [
+              18,
+              92160
+            ],
+            "dtype": "int32",
+            "nbytes": 6635520
+          },
+          "l1_acts": {
+            "offset": 96988544,
+            "shape": [
+              17280,
+              5120
+            ],
+            "dtype": "float8_e4m3fn",
+            "nbytes": 88473600
+          },
+          "l1_sf": {
+            "offset": 185462144,
+            "shape": [
+              40,
+              276480
+            ],
+            "dtype": "int32",
+            "nbytes": 44236800
+          },
+          "l1_topk_weights": {
+            "offset": 229698944,
+            "shape": [
+              17280
+            ],
+            "dtype": "float32",
+            "nbytes": 69120
+          },
+          "l2_acts": {
+            "offset": 229768064,
+            "shape": [
+              17280,
+              2304
+            ],
+            "dtype": "float8_e4m3fn",
+            "nbytes": 39813120
+          },
+          "l2_sf": {
+            "offset": 269581184,
+            "shape": [
+              18,
+              276480
+            ],
+            "dtype": "int32",
+            "nbytes": 19906560
+          },
+          "combine": {
+            "offset": 289487744,
+            "shape": [
+              7,
+              5760,
+              5120
+            ],
+            "dtype": "bfloat16",
+            "nbytes": 412876800
+          }
+        }
+      }
+    },
+    "{\"activation_clamp\":10.0,\"fast_math\":true,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":384,\"num_shared_experts\":1,\"num_sms\":152,\"num_tokens\":16,\"routed_weight_dtype\":\"fp8\",\"top_k\":6}": {
+      "program": "cake_source_mega_moe_sm103a_ef04e08911e9d56ee4b5_kernel",
+      "layout": {
+        "config": {
+          "num_tokens": 16,
+          "num_experts": 384,
+          "top_k": 6,
+          "hidden": 5120,
+          "intermediate": 2304,
+          "num_shared_experts": 1,
+          "num_ranks": 1,
+          "block_m": 16
+        },
+        "num_sms": 152,
+        "nbytes": 355896704,
+        "signals_bytes": 21140864,
+        "workspace_bytes": 25334144,
+        "max_tokens": 1920,
+        "ring_tokens": 15360,
+        "pool_tokens": 103680,
+        "fields": {
+          "grid_sync_count": {
+            "offset": 0,
+            "shape": [
+              4
+            ],
+            "dtype": "uint32",
+            "nbytes": 16
+          },
+          "nvl_barrier_counter": {
+            "offset": 16,
+            "shape": [
+              1
+            ],
+            "dtype": "uint32",
+            "nbytes": 4
+          },
+          "nvl_barrier_signals": {
+            "offset": 20,
+            "shape": [
+              2
+            ],
+            "dtype": "int32",
+            "nbytes": 8
+          },
+          "l1_task_count": {
+            "offset": 28,
+            "shape": [
+              1
+            ],
+            "dtype": "uint32",
+            "nbytes": 4
+          },
+          "l2_task_count": {
+            "offset": 32,
+            "shape": [
+              1
+            ],
+            "dtype": "uint32",
+            "nbytes": 4
+          },
+          "shared_l1_task_count": {
+            "offset": 36,
+            "shape": [
+              1
+            ],
+            "dtype": "uint32",
+            "nbytes": 4
+          },
+          "shared_l2_task_count": {
+            "offset": 40,
+            "shape": [
+              1
+            ],
+            "dtype": "uint32",
+            "nbytes": 4
+          },
+          "combine_ready_grid_idx": {
+            "offset": 128,
+            "shape": [
+              72
+            ],
+            "dtype": "uint64",
+            "nbytes": 576
+          },
+          "peer_grid_idx": {
+            "offset": 768,
+            "shape": [
+              72
+            ],
+            "dtype": "uint64",
+            "nbytes": 576
+          },
+          "expert_send_count": {
+            "offset": 1408,
+            "shape": [
+              2048
+            ],
+            "dtype": "uint64",
+            "nbytes": 16384
+          },
+          "expert_recv_count": {
+            "offset": 17792,
+            "shape": [
+              2048
+            ],
+            "dtype": "uint64",
+            "nbytes": 16384
+          },
+          "expert_recv_count_sum": {
+            "offset": 34176,
+            "shape": [
+              512
+            ],
+            "dtype": "uint64",
+            "nbytes": 4096
+          },
+          "l1_full_count": {
+            "offset": 38272,
+            "shape": [
+              1048576
+            ],
+            "dtype": "uint32",
+            "nbytes": 4194304
+          },
+          "l1_empty_count": {
+            "offset": 4232576,
+            "shape": [
+              1048576
+            ],
+            "dtype": "uint32",
+            "nbytes": 4194304
+          },
+          "l2_full_mask": {
+            "offset": 8426880,
+            "shape": [
+              1048576
+            ],
+            "dtype": "uint64",
+            "nbytes": 8388608
+          },
+          "l2_empty_count": {
+            "offset": 16815488,
+            "shape": [
+              1048576
+            ],
+            "dtype": "uint32",
+            "nbytes": 4194304
+          },
+          "shared_l2_full_count": {
+            "offset": 21009792,
+            "shape": [
+              32768
+            ],
+            "dtype": "uint32",
+            "nbytes": 131072
+          },
+          "src_token_topk": {
+            "offset": 21140864,
+            "shape": [
+              384,
+              1920
+            ],
+            "dtype": "uint32",
+            "nbytes": 2949120
+          },
+          "token_src_metadata": {
+            "offset": 24089984,
+            "shape": [
+              103680,
+              3
+            ],
+            "dtype": "uint32",
+            "nbytes": 1244160
+          },
+          "x": {
+            "offset": 25334144,
+            "shape": [
+              1920,
+              5120
+            ],
+            "dtype": "float8_e4m3fn",
+            "nbytes": 9830400
+          },
+          "x_sf": {
+            "offset": 35164544,
+            "shape": [
+              1920,
+              40
+            ],
+            "dtype": "int32",
+            "nbytes": 307200
+          },
+          "topk_idx": {
+            "offset": 35471744,
+            "shape": [
+              1920,
+              6
+            ],
+            "dtype": "int64",
+            "nbytes": 92160
+          },
+          "topk_weights": {
+            "offset": 35563904,
+            "shape": [
+              1920,
+              6
+            ],
+            "dtype": "float32",
+            "nbytes": 46080
+          },
+          "shared_l1_sf": {
+            "offset": 35609984,
+            "shape": [
+              40,
+              30720
+            ],
+            "dtype": "int32",
+            "nbytes": 4915200
+          },
+          "shared_l2_acts": {
+            "offset": 40525184,
+            "shape": [
+              1920,
+              2304
+            ],
+            "dtype": "float8_e4m3fn",
+            "nbytes": 4423680
+          },
+          "shared_l2_sf": {
+            "offset": 44948864,
+            "shape": [
+              18,
+              30720
+            ],
+            "dtype": "int32",
+            "nbytes": 2211840
+          },
+          "l1_acts": {
+            "offset": 47160704,
+            "shape": [
+              15360,
+              5120
+            ],
+            "dtype": "float8_e4m3fn",
+            "nbytes": 78643200
+          },
+          "l1_sf": {
+            "offset": 125803904,
+            "shape": [
+              40,
+              245760
+            ],
+            "dtype": "int32",
+            "nbytes": 39321600
+          },
+          "l1_topk_weights": {
+            "offset": 165125504,
+            "shape": [
+              15360
+            ],
+            "dtype": "float32",
+            "nbytes": 61440
+          },
+          "l2_acts": {
+            "offset": 165186944,
+            "shape": [
+              15360,
+              2304
+            ],
+            "dtype": "float8_e4m3fn",
+            "nbytes": 35389440
+          },
+          "l2_sf": {
+            "offset": 200576384,
+            "shape": [
+              18,
+              245760
+            ],
+            "dtype": "int32",
+            "nbytes": 17694720
+          },
+          "combine": {
+            "offset": 218271104,
+            "shape": [
+              7,
+              1920,
+              5120
+            ],
+            "dtype": "bfloat16",
+            "nbytes": 137625600
+          }
+        }
+      }
+    },
+    "{\"activation_clamp\":10.0,\"fast_math\":true,\"hidden\":256,\"intermediate\":256,\"num_experts\":8,\"num_shared_experts\":1,\"num_sms\":2,\"num_tokens\":17,\"routed_weight_dtype\":\"fp4\",\"top_k\":2}": {
+      "program": "cake_source_mega_moe_sm103a_2cd593da73685df5f270_kernel",
+      "layout": {
+        "config": {
+          "num_tokens": 17,
+          "num_experts": 8,
+          "top_k": 2,
+          "hidden": 256,
+          "intermediate": 256,
+          "num_shared_experts": 1,
+          "num_ranks": 1,
+          "block_m": 16
+        },
+        "num_sms": 2,
+        "nbytes": 28721024,
+        "signals_bytes": 21140864,
+        "workspace_bytes": 21271424,
+        "max_tokens": 1920,
+        "ring_tokens": 3840,
+        "pool_tokens": 5760,
+        "fields": {
+          "grid_sync_count": {
+            "offset": 0,
+            "shape": [
+              4
+            ],
+            "dtype": "uint32",
+            "nbytes": 16
+          },
+          "nvl_barrier_counter": {
+            "offset": 16,
+            "shape": [
+              1
+            ],
+            "dtype": "uint32",
+            "nbytes": 4
+          },
+          "nvl_barrier_signals": {
+            "offset": 20,
+            "shape": [
+              2
+            ],
+            "dtype": "int32",
+            "nbytes": 8
+          },
+          "l1_task_count": {
+            "offset": 28,
+            "shape": [
+              1
+            ],
+            "dtype": "uint32",
+            "nbytes": 4
+          },
+          "l2_task_count": {
+            "offset": 32,
+            "shape": [
+              1
+            ],
+            "dtype": "uint32",
+            "nbytes": 4
+          },
+          "shared_l1_task_count": {
+            "offset": 36,
+            "shape": [
+              1
+            ],
+            "dtype": "uint32",
+            "nbytes": 4
+          },
+          "shared_l2_task_count": {
+            "offset": 40,
+            "shape": [
+              1
+            ],
+            "dtype": "uint32",
+            "nbytes": 4
+          },
+          "combine_ready_grid_idx": {
+            "offset": 128,
+            "shape": [
+              72
+            ],
+            "dtype": "uint64",
+            "nbytes": 576
+          },
+          "peer_grid_idx": {
+            "offset": 768,
+            "shape": [
+              72
+            ],
+            "dtype": "uint64",
+            "nbytes": 576
+          },
+          "expert_send_count": {
+            "offset": 1408,
+            "shape": [
+              2048
+            ],
+            "dtype": "uint64",
+            "nbytes": 16384
+          },
+          "expert_recv_count": {
+            "offset": 17792,
+            "shape": [
+              2048
+            ],
+            "dtype": "uint64",
+            "nbytes": 16384
+          },
+          "expert_recv_count_sum": {
+            "offset": 34176,
+            "shape": [
+              512
+            ],
+            "dtype": "uint64",
+            "nbytes": 4096
+          },
+          "l1_full_count": {
+            "offset": 38272,
+            "shape": [
+              1048576
+            ],
+            "dtype": "uint32",
+            "nbytes": 4194304
+          },
+          "l1_empty_count": {
+            "offset": 4232576,
+            "shape": [
+              1048576
+            ],
+            "dtype": "uint32",
+            "nbytes": 4194304
+          },
+          "l2_full_mask": {
+            "offset": 8426880,
+            "shape": [
+              1048576
+            ],
+            "dtype": "uint64",
+            "nbytes": 8388608
+          },
+          "l2_empty_count": {
+            "offset": 16815488,
+            "shape": [
+              1048576
+            ],
+            "dtype": "uint32",
+            "nbytes": 4194304
+          },
+          "shared_l2_full_count": {
+            "offset": 21009792,
+            "shape": [
+              32768
+            ],
+            "dtype": "uint32",
+            "nbytes": 131072
+          },
+          "src_token_topk": {
+            "offset": 21140864,
+            "shape": [
+              8,
+              1920
+            ],
+            "dtype": "uint32",
+            "nbytes": 61440
+          },
+          "token_src_metadata": {
+            "offset": 21202304,
+            "shape": [
+              5760,
+              3
+            ],
+            "dtype": "uint32",
+            "nbytes": 69120
+          },
+          "x": {
+            "offset": 21271424,
+            "shape": [
+              1920,
+              256
+            ],
+            "dtype": "float8_e4m3fn",
+            "nbytes": 491520
+          },
+          "x_sf": {
+            "offset": 21762944,
+            "shape": [
+              1920,
+              2
+            ],
+            "dtype": "int32",
+            "nbytes": 15360
+          },
+          "topk_idx": {
+            "offset": 21778304,
+            "shape": [
+              1920,
+              2
+            ],
+            "dtype": "int64",
+            "nbytes": 30720
+          },
+          "topk_weights": {
+            "offset": 21809024,
+            "shape": [
+              1920,
+              2
+            ],
+            "dtype": "float32",
+            "nbytes": 15360
+          },
+          "shared_l1_sf": {
+            "offset": 21824384,
+            "shape": [
+              2,
+              30720
+            ],
+            "dtype": "int32",
+            "nbytes": 245760
+          },
+          "shared_l2_acts": {
+            "offset": 22070144,
+            "shape": [
+              1920,
+              256
+            ],
+            "dtype": "float8_e4m3fn",
+            "nbytes": 491520
+          },
+          "shared_l2_sf": {
+            "offset": 22561664,
+            "shape": [
+              2,
+              30720
+            ],
+            "dtype": "int32",
+            "nbytes": 245760
+          },
+          "l1_acts": {
+            "offset": 22807424,
+            "shape": [
+              3840,
+              256
+            ],
+            "dtype": "float8_e4m3fn",
+            "nbytes": 983040
+          },
+          "l1_sf": {
+            "offset": 23790464,
+            "shape": [
+              2,
+              61440
+            ],
+            "dtype": "int32",
+            "nbytes": 491520
+          },
+          "l1_topk_weights": {
+            "offset": 24281984,
+            "shape": [
+              3840
+            ],
+            "dtype": "float32",
+            "nbytes": 15360
+          },
+          "l2_acts": {
+            "offset": 24297344,
+            "shape": [
+              3840,
+              256
+            ],
+            "dtype": "float8_e4m3fn",
+            "nbytes": 983040
+          },
+          "l2_sf": {
+            "offset": 25280384,
+            "shape": [
+              2,
+              61440
+            ],
+            "dtype": "int32",
+            "nbytes": 491520
+          },
+          "combine": {
+            "offset": 25771904,
+            "shape": [
+              3,
+              1920,
+              256
+            ],
+            "dtype": "bfloat16",
+            "nbytes": 2949120
+          }
+        }
+      }
+    },
+    "{\"activation_clamp\":10.0,\"fast_math\":true,\"hidden\":256,\"intermediate\":256,\"num_experts\":8,\"num_shared_experts\":1,\"num_sms\":2,\"num_tokens\":17,\"routed_weight_dtype\":\"fp8\",\"top_k\":2}": {
+      "program": "cake_source_mega_moe_sm103a_3eafbb6a52f5cd3fe7b4_kernel",
+      "layout": {
+        "config": {
+          "num_tokens": 17,
+          "num_experts": 8,
+          "top_k": 2,
+          "hidden": 256,
+          "intermediate": 256,
+          "num_shared_experts": 1,
+          "num_ranks": 1,
+          "block_m": 16
+        },
+        "num_sms": 2,
+        "nbytes": 28721024,
+        "signals_bytes": 21140864,
+        "workspace_bytes": 21271424,
+        "max_tokens": 1920,
+        "ring_tokens": 3840,
+        "pool_tokens": 5760,
+        "fields": {
+          "grid_sync_count": {
+            "offset": 0,
+            "shape": [
+              4
+            ],
+            "dtype": "uint32",
+            "nbytes": 16
+          },
+          "nvl_barrier_counter": {
+            "offset": 16,
+            "shape": [
+              1
+            ],
+            "dtype": "uint32",
+            "nbytes": 4
+          },
+          "nvl_barrier_signals": {
+            "offset": 20,
+            "shape": [
+              2
+            ],
+            "dtype": "int32",
+            "nbytes": 8
+          },
+          "l1_task_count": {
+            "offset": 28,
+            "shape": [
+              1
+            ],
+            "dtype": "uint32",
+            "nbytes": 4
+          },
+          "l2_task_count": {
+            "offset": 32,
+            "shape": [
+              1
+            ],
+            "dtype": "uint32",
+            "nbytes": 4
+          },
+          "shared_l1_task_count": {
+            "offset": 36,
+            "shape": [
+              1
+            ],
+            "dtype": "uint32",
+            "nbytes": 4
+          },
+          "shared_l2_task_count": {
+            "offset": 40,
+            "shape": [
+              1
+            ],
+            "dtype": "uint32",
+            "nbytes": 4
+          },
+          "combine_ready_grid_idx": {
+            "offset": 128,
+            "shape": [
+              72
+            ],
+            "dtype": "uint64",
+            "nbytes": 576
+          },
+          "peer_grid_idx": {
+            "offset": 768,
+            "shape": [
+              72
+            ],
+            "dtype": "uint64",
+            "nbytes": 576
+          },
+          "expert_send_count": {
+            "offset": 1408,
+            "shape": [
+              2048
+            ],
+            "dtype": "uint64",
+            "nbytes": 16384
+          },
+          "expert_recv_count": {
+            "offset": 17792,
+            "shape": [
+              2048
+            ],
+            "dtype": "uint64",
+            "nbytes": 16384
+          },
+          "expert_recv_count_sum": {
+            "offset": 34176,
+            "shape": [
+              512
+            ],
+            "dtype": "uint64",
+            "nbytes": 4096
+          },
+          "l1_full_count": {
+            "offset": 38272,
+            "shape": [
+              1048576
+            ],
+            "dtype": "uint32",
+            "nbytes": 4194304
+          },
+          "l1_empty_count": {
+            "offset": 4232576,
+            "shape": [
+              1048576
+            ],
+            "dtype": "uint32",
+            "nbytes": 4194304
+          },
+          "l2_full_mask": {
+            "offset": 8426880,
+            "shape": [
+              1048576
+            ],
+            "dtype": "uint64",
+            "nbytes": 8388608
+          },
+          "l2_empty_count": {
+            "offset": 16815488,
+            "shape": [
+              1048576
+            ],
+            "dtype": "uint32",
+            "nbytes": 4194304
+          },
+          "shared_l2_full_count": {
+            "offset": 21009792,
+            "shape": [
+              32768
+            ],
+            "dtype": "uint32",
+            "nbytes": 131072
+          },
+          "src_token_topk": {
+            "offset": 21140864,
+            "shape": [
+              8,
+              1920
+            ],
+            "dtype": "uint32",
+            "nbytes": 61440
+          },
+          "token_src_metadata": {
+            "offset": 21202304,
+            "shape": [
+              5760,
+              3
+            ],
+            "dtype": "uint32",
+            "nbytes": 69120
+          },
+          "x": {
+            "offset": 21271424,
+            "shape": [
+              1920,
+              256
+            ],
+            "dtype": "float8_e4m3fn",
+            "nbytes": 491520
+          },
+          "x_sf": {
+            "offset": 21762944,
+            "shape": [
+              1920,
+              2
+            ],
+            "dtype": "int32",
+            "nbytes": 15360
+          },
+          "topk_idx": {
+            "offset": 21778304,
+            "shape": [
+              1920,
+              2
+            ],
+            "dtype": "int64",
+            "nbytes": 30720
+          },
+          "topk_weights": {
+            "offset": 21809024,
+            "shape": [
+              1920,
+              2
+            ],
+            "dtype": "float32",
+            "nbytes": 15360
+          },
+          "shared_l1_sf": {
+            "offset": 21824384,
+            "shape": [
+              2,
+              30720
+            ],
+            "dtype": "int32",
+            "nbytes": 245760
+          },
+          "shared_l2_acts": {
+            "offset": 22070144,
+            "shape": [
+              1920,
+              256
+            ],
+            "dtype": "float8_e4m3fn",
+            "nbytes": 491520
+          },
+          "shared_l2_sf": {
+            "offset": 22561664,
+            "shape": [
+              2,
+              30720
+            ],
+            "dtype": "int32",
+            "nbytes": 245760
+          },
+          "l1_acts": {
+            "offset": 22807424,
+            "shape": [
+              3840,
+              256
+            ],
+            "dtype": "float8_e4m3fn",
+            "nbytes": 983040
+          },
+          "l1_sf": {
+            "offset": 23790464,
+            "shape": [
+              2,
+              61440
+            ],
+            "dtype": "int32",
+            "nbytes": 491520
+          },
+          "l1_topk_weights": {
+            "offset": 24281984,
+            "shape": [
+              3840
+            ],
+            "dtype": "float32",
+            "nbytes": 15360
+          },
+          "l2_acts": {
+            "offset": 24297344,
+            "shape": [
+              3840,
+              256
+            ],
+            "dtype": "float8_e4m3fn",
+            "nbytes": 983040
+          },
+          "l2_sf": {
+            "offset": 25280384,
+            "shape": [
+              2,
+              61440
+            ],
+            "dtype": "int32",
+            "nbytes": 491520
+          },
+          "combine": {
+            "offset": 25771904,
+            "shape": [
+              3,
+              1920,
+              256
+            ],
+            "dtype": "bfloat16",
+            "nbytes": 2949120
+          }
+        }
+      }
+    },
+    "{\"activation_clamp\":10.0,\"fast_math\":true,\"hidden\":512,\"intermediate\":256,\"num_experts\":8,\"num_shared_experts\":1,\"num_sms\":2,\"num_tokens\":241,\"routed_weight_dtype\":\"fp4\",\"top_k\":8}": {
+      "program": "cake_source_mega_moe_sm103a_13182425108b6fc20217_kernel",
+      "layout": {
+        "config": {
+          "num_tokens": 241,
+          "num_experts": 8,
+          "top_k": 8,
+          "hidden": 512,
+          "intermediate": 256,
+          "num_shared_experts": 1,
+          "num_ranks": 1,
+          "block_m": 192
+        },
+        "num_sms": 2,
+        "nbytes": 43750784,
+        "signals_bytes": 21140864,
+        "workspace_bytes": 21409664,
+        "max_tokens": 1920,
+        "ring_tokens": 1920,
+        "pool_tokens": 17280,
+        "fields": {
+          "grid_sync_count": {
+            "offset": 0,
+            "shape": [
+              4
+            ],
+            "dtype": "uint32",
+            "nbytes": 16
+          },
+          "nvl_barrier_counter": {
+            "offset": 16,
+            "shape": [
+              1
+            ],
+            "dtype": "uint32",
+            "nbytes": 4
+          },
+          "nvl_barrier_signals": {
+            "offset": 20,
+            "shape": [
+              2
+            ],
+            "dtype": "int32",
+            "nbytes": 8
+          },
+          "l1_task_count": {
+            "offset": 28,
+            "shape": [
+              1
+            ],
+            "dtype": "uint32",
+            "nbytes": 4
+          },
+          "l2_task_count": {
+            "offset": 32,
+            "shape": [
+              1
+            ],
+            "dtype": "uint32",
+            "nbytes": 4
+          },
+          "shared_l1_task_count": {
+            "offset": 36,
+            "shape": [
+              1
+            ],
+            "dtype": "uint32",
+            "nbytes": 4
+          },
+          "shared_l2_task_count": {
+            "offset": 40,
+            "shape": [
+              1
+            ],
+            "dtype": "uint32",
+            "nbytes": 4
+          },
+          "combine_ready_grid_idx": {
+            "offset": 128,
+            "shape": [
+              72
+            ],
+            "dtype": "uint64",
+            "nbytes": 576
+          },
+          "peer_grid_idx": {
+            "offset": 768,
+            "shape": [
+              72
+            ],
+            "dtype": "uint64",
+            "nbytes": 576
+          },
+          "expert_send_count": {
+            "offset": 1408,
+            "shape": [
+              2048
+            ],
+            "dtype": "uint64",
+            "nbytes": 16384
+          },
+          "expert_recv_count": {
+            "offset": 17792,
+            "shape": [
+              2048
+            ],
+            "dtype": "uint64",
+            "nbytes": 16384
+          },
+          "expert_recv_count_sum": {
+            "offset": 34176,
+            "shape": [
+              512
+            ],
+            "dtype": "uint64",
+            "nbytes": 4096
+          },
+          "l1_full_count": {
+            "offset": 38272,
+            "shape": [
+              1048576
+            ],
+            "dtype": "uint32",
+            "nbytes": 4194304
+          },
+          "l1_empty_count": {
+            "offset": 4232576,
+            "shape": [
+              1048576
+            ],
+            "dtype": "uint32",
+            "nbytes": 4194304
+          },
+          "l2_full_mask": {
+            "offset": 8426880,
+            "shape": [
+              1048576
+            ],
+            "dtype": "uint64",
+            "nbytes": 8388608
+          },
+          "l2_empty_count": {
+            "offset": 16815488,
+            "shape": [
+              1048576
+            ],
+            "dtype": "uint32",
+            "nbytes": 4194304
+          },
+          "shared_l2_full_count": {
+            "offset": 21009792,
+            "shape": [
+              32768
+            ],
+            "dtype": "uint32",
+            "nbytes": 131072
+          },
+          "src_token_topk": {
+            "offset": 21140864,
+            "shape": [
+              8,
+              1920
+            ],
+            "dtype": "uint32",
+            "nbytes": 61440
+          },
+          "token_src_metadata": {
+            "offset": 21202304,
+            "shape": [
+              17280,
+              3
+            ],
+            "dtype": "uint32",
+            "nbytes": 207360
+          },
+          "x": {
+            "offset": 21409664,
+            "shape": [
+              1920,
+              512
+            ],
+            "dtype": "float8_e4m3fn",
+            "nbytes": 983040
+          },
+          "x_sf": {
+            "offset": 22392704,
+            "shape": [
+              1920,
+              4
+            ],
+            "dtype": "int32",
+            "nbytes": 30720
+          },
+          "topk_idx": {
+            "offset": 22423424,
+            "shape": [
+              1920,
+              8
+            ],
+            "dtype": "int64",
+            "nbytes": 122880
+          },
+          "topk_weights": {
+            "offset": 22546304,
+            "shape": [
+              1920,
+              8
+            ],
+            "dtype": "float32",
+            "nbytes": 61440
+          },
+          "shared_l1_sf": {
+            "offset": 22607744,
+            "shape": [
+              4,
+              30720
+            ],
+            "dtype": "int32",
+            "nbytes": 491520
+          },
+          "shared_l2_acts": {
+            "offset": 23099264,
+            "shape": [
+              1920,
+              256
+            ],
+            "dtype": "float8_e4m3fn",
+            "nbytes": 491520
+          },
+          "shared_l2_sf": {
+            "offset": 23590784,
+            "shape": [
+              2,
+              30720
+            ],
+            "dtype": "int32",
+            "nbytes": 245760
+          },
+          "l1_acts": {
+            "offset": 23836544,
+            "shape": [
+              1920,
+              512
+            ],
+            "dtype": "float8_e4m3fn",
+            "nbytes": 983040
+          },
+          "l1_sf": {
+            "offset": 24819584,
+            "shape": [
+              4,
+              30720
+            ],
+            "dtype": "int32",
+            "nbytes": 491520
+          },
+          "l1_topk_weights": {
+            "offset": 25311104,
+            "shape": [
+              1920
+            ],
+            "dtype": "float32",
+            "nbytes": 7680
+          },
+          "l2_acts": {
+            "offset": 25318784,
+            "shape": [
+              1920,
+              256
+            ],
+            "dtype": "float8_e4m3fn",
+            "nbytes": 491520
+          },
+          "l2_sf": {
+            "offset": 25810304,
+            "shape": [
+              2,
+              30720
+            ],
+            "dtype": "int32",
+            "nbytes": 245760
+          },
+          "combine": {
+            "offset": 26056064,
+            "shape": [
+              9,
+              1920,
+              512
+            ],
+            "dtype": "bfloat16",
+            "nbytes": 17694720
+          }
+        }
+      }
+    }
+  }
+}

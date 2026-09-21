@@ -1,0 +1,2554 @@
+{
+  "schema": "mega_moe_v3.v1",
+  "programs": {
+    "cake_mega_moe_v3_sm103a_25056122573221721a93_kernel": {
+      "ffi_entry": "run",
+      "arg_plan": [
+        [
+          "buffer",
+          "topk_idx_i32"
+        ],
+        [
+          "buffer",
+          "topk_weights"
+        ],
+        [
+          "buffer",
+          "x_fp8"
+        ],
+        [
+          "buffer",
+          "x_sf"
+        ],
+        [
+          "tma_buffer",
+          "A"
+        ],
+        [
+          "buffer",
+          "pool_fp8"
+        ],
+        [
+          "buffer",
+          "pool_sf"
+        ],
+        [
+          "buffer",
+          "routing_weight_pool"
+        ],
+        [
+          "buffer",
+          "token_to_permuted"
+        ],
+        [
+          "buffer",
+          "meta_token"
+        ],
+        [
+          "buffer",
+          "meta_slot"
+        ],
+        [
+          "buffer",
+          "expert_counts"
+        ],
+        [
+          "buffer",
+          "expert_row_offsets"
+        ],
+        [
+          "buffer",
+          "expert_scatter_offsets"
+        ],
+        [
+          "buffer",
+          "tile_expert"
+        ],
+        [
+          "buffer",
+          "tile_m_local"
+        ],
+        [
+          "buffer",
+          "total_m_tiles_out"
+        ],
+        [
+          "tma_buffer",
+          "B1"
+        ],
+        [
+          "tma_buffer",
+          "SFB1"
+        ],
+        [
+          "tma_buffer",
+          "I_fp8_w"
+        ],
+        [
+          "buffer",
+          "SF_I_w"
+        ],
+        [
+          "buffer",
+          "l1_bf16_capture"
+        ],
+        [
+          "tma_buffer",
+          "A2"
+        ],
+        [
+          "buffer",
+          "SFA2"
+        ],
+        [
+          "tma_buffer",
+          "B2"
+        ],
+        [
+          "tma_buffer",
+          "SFB2"
+        ],
+        [
+          "buffer",
+          "expert_output"
+        ],
+        [
+          "buffer",
+          "y"
+        ],
+        [
+          "buffer",
+          "histogram_done"
+        ],
+        [
+          "buffer",
+          "prefix_done"
+        ],
+        [
+          "buffer",
+          "dispatch_done"
+        ],
+        [
+          "buffer",
+          "l1_arrival"
+        ],
+        [
+          "buffer",
+          "l2_done"
+        ],
+        [
+          "parameter",
+          "num_tokens"
+        ],
+        [
+          "parameter",
+          "top_k"
+        ],
+        [
+          "parameter",
+          "num_experts"
+        ],
+        [
+          "parameter",
+          "N1"
+        ],
+        [
+          "parameter",
+          "K1"
+        ],
+        [
+          "parameter",
+          "grid_n1"
+        ],
+        [
+          "parameter",
+          "K1_tiles"
+        ],
+        [
+          "parameter",
+          "N2"
+        ],
+        [
+          "parameter",
+          "K2"
+        ],
+        [
+          "parameter",
+          "grid_n2"
+        ],
+        [
+          "parameter",
+          "K2_tiles"
+        ],
+        [
+          "parameter",
+          "total_m_tiles"
+        ],
+        [
+          "parameter",
+          "M_total"
+        ],
+        [
+          "parameter",
+          "activation_clamp"
+        ],
+        [
+          "buffer",
+          "PrivateCounters"
+        ],
+        [
+          "buffer",
+          "PrivateMasks"
+        ],
+        [
+          "buffer",
+          "PublicExpertOutput"
+        ],
+        [
+          "buffer",
+          "PrivateSFBlockOffsets"
+        ],
+        [
+          "tma_buffer",
+          "PrivateSF1"
+        ],
+        [
+          "tma_buffer",
+          "PrivateSF2"
+        ],
+        [
+          "buffer",
+          "PrivateSF1Words"
+        ],
+        [
+          "buffer",
+          "PrivateSF2Bytes"
+        ],
+        [
+          "workspace",
+          "tma_descriptor_workspace"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "closure_sha256": "901b9701855dcf6922e542c473ccfc28c240a23d223adf69da6e3840ecd0ceef",
+      "ffi_prepare_entry": "run_prepare",
+      "tma_workspace_bytes": 1152,
+      "sources": [
+        "csrc/experimental/mega_moe_v3/generated/sm_103a/cake_mega_moe_v3_sm103a_25056122573221721a93_kernel.cu",
+        "csrc/experimental/mega_moe_v3/generated/sm_103a/cake_mega_moe_v3_sm103a_25056122573221721a93_binding.cu"
+      ]
+    },
+    "cake_mega_moe_v3_sm103a_357f423bb481759e10c9_kernel": {
+      "ffi_entry": "run",
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "A"
+        ],
+        [
+          "tma_buffer",
+          "B1"
+        ],
+        [
+          "buffer",
+          "SFA1"
+        ],
+        [
+          "buffer",
+          "SFB1"
+        ],
+        [
+          "buffer",
+          "routing_weights"
+        ],
+        [
+          "buffer",
+          "I_fp8_w"
+        ],
+        [
+          "buffer",
+          "SF_I_w"
+        ],
+        [
+          "tma_buffer",
+          "A2"
+        ],
+        [
+          "tma_buffer",
+          "B2"
+        ],
+        [
+          "buffer",
+          "SFA2"
+        ],
+        [
+          "buffer",
+          "SFB2"
+        ],
+        [
+          "buffer",
+          "Out"
+        ],
+        [
+          "buffer",
+          "tile_expert"
+        ],
+        [
+          "buffer",
+          "tile_m_local"
+        ],
+        [
+          "buffer",
+          "expert_row_offsets"
+        ],
+        [
+          "buffer",
+          "l1_arrival"
+        ],
+        [
+          "parameter",
+          "M_total"
+        ],
+        [
+          "parameter",
+          "N1"
+        ],
+        [
+          "parameter",
+          "K1"
+        ],
+        [
+          "parameter",
+          "grid_n1"
+        ],
+        [
+          "parameter",
+          "K1_tiles"
+        ],
+        [
+          "parameter",
+          "N2"
+        ],
+        [
+          "parameter",
+          "K2"
+        ],
+        [
+          "parameter",
+          "grid_n2"
+        ],
+        [
+          "parameter",
+          "K2_tiles"
+        ],
+        [
+          "parameter",
+          "total_m_tiles"
+        ],
+        [
+          "workspace",
+          "tma_descriptor_workspace"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "closure_sha256": "b1ca07ba3f18542d71574b3412a7ae7dbd71f30dd2823eb19b0fa4a3cd83daff",
+      "ffi_prepare_entry": "run_prepare",
+      "tma_workspace_bytes": 512,
+      "sources": [
+        "csrc/experimental/mega_moe_v3/generated/sm_103a/cake_mega_moe_v3_sm103a_357f423bb481759e10c9_kernel.cu",
+        "csrc/experimental/mega_moe_v3/generated/sm_103a/cake_mega_moe_v3_sm103a_357f423bb481759e10c9_binding.cu"
+      ]
+    },
+    "cake_mega_moe_v3_sm103a_449586525e4a9bc31aa9_kernel": {
+      "ffi_entry": "run",
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "A"
+        ],
+        [
+          "tma_buffer",
+          "B"
+        ],
+        [
+          "tma_buffer",
+          "SFA"
+        ],
+        [
+          "tma_buffer",
+          "SFB"
+        ],
+        [
+          "buffer",
+          "Out"
+        ],
+        [
+          "buffer",
+          "tile_expert"
+        ],
+        [
+          "buffer",
+          "tile_m_local"
+        ],
+        [
+          "buffer",
+          "expert_row_offsets"
+        ],
+        [
+          "parameter",
+          "M_total"
+        ],
+        [
+          "parameter",
+          "N"
+        ],
+        [
+          "parameter",
+          "K"
+        ],
+        [
+          "parameter",
+          "grid_n"
+        ],
+        [
+          "parameter",
+          "K_tiles"
+        ],
+        [
+          "parameter",
+          "total_m_tiles"
+        ],
+        [
+          "workspace",
+          "tma_descriptor_workspace"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "closure_sha256": "58a79c272c80d4c52bc7eed00bd5026dcddd61ac7aeb36cf90480087d1aa9b4c",
+      "ffi_prepare_entry": "run_prepare",
+      "tma_workspace_bytes": 512,
+      "sources": [
+        "csrc/experimental/mega_moe_v3/generated/sm_103a/cake_mega_moe_v3_sm103a_449586525e4a9bc31aa9_kernel.cu",
+        "csrc/experimental/mega_moe_v3/generated/sm_103a/cake_mega_moe_v3_sm103a_449586525e4a9bc31aa9_binding.cu"
+      ]
+    },
+    "cake_mega_moe_v3_sm103a_464d3bbb1dde03846c66_kernel": {
+      "ffi_entry": "run",
+      "arg_plan": [
+        [
+          "buffer",
+          "topk_idx_i32"
+        ],
+        [
+          "buffer",
+          "topk_weights"
+        ],
+        [
+          "buffer",
+          "x_fp8"
+        ],
+        [
+          "buffer",
+          "x_sf"
+        ],
+        [
+          "tma_buffer",
+          "A"
+        ],
+        [
+          "buffer",
+          "pool_fp8"
+        ],
+        [
+          "buffer",
+          "pool_sf"
+        ],
+        [
+          "buffer",
+          "routing_weight_pool"
+        ],
+        [
+          "buffer",
+          "token_to_permuted"
+        ],
+        [
+          "buffer",
+          "meta_token"
+        ],
+        [
+          "buffer",
+          "meta_slot"
+        ],
+        [
+          "buffer",
+          "expert_counts"
+        ],
+        [
+          "buffer",
+          "expert_row_offsets"
+        ],
+        [
+          "buffer",
+          "expert_scatter_offsets"
+        ],
+        [
+          "buffer",
+          "tile_expert"
+        ],
+        [
+          "buffer",
+          "tile_m_local"
+        ],
+        [
+          "buffer",
+          "total_m_tiles_out"
+        ],
+        [
+          "tma_buffer",
+          "B1"
+        ],
+        [
+          "tma_buffer",
+          "SFB1"
+        ],
+        [
+          "tma_buffer",
+          "I_fp8_w"
+        ],
+        [
+          "buffer",
+          "SF_I_w"
+        ],
+        [
+          "buffer",
+          "l1_bf16_capture"
+        ],
+        [
+          "tma_buffer",
+          "A2"
+        ],
+        [
+          "buffer",
+          "SFA2"
+        ],
+        [
+          "tma_buffer",
+          "B2"
+        ],
+        [
+          "tma_buffer",
+          "SFB2"
+        ],
+        [
+          "buffer",
+          "expert_output"
+        ],
+        [
+          "buffer",
+          "y"
+        ],
+        [
+          "buffer",
+          "histogram_done"
+        ],
+        [
+          "buffer",
+          "prefix_done"
+        ],
+        [
+          "buffer",
+          "dispatch_done"
+        ],
+        [
+          "buffer",
+          "l1_arrival"
+        ],
+        [
+          "buffer",
+          "l2_done"
+        ],
+        [
+          "parameter",
+          "num_tokens"
+        ],
+        [
+          "parameter",
+          "top_k"
+        ],
+        [
+          "parameter",
+          "num_experts"
+        ],
+        [
+          "parameter",
+          "N1"
+        ],
+        [
+          "parameter",
+          "K1"
+        ],
+        [
+          "parameter",
+          "grid_n1"
+        ],
+        [
+          "parameter",
+          "K1_tiles"
+        ],
+        [
+          "parameter",
+          "N2"
+        ],
+        [
+          "parameter",
+          "K2"
+        ],
+        [
+          "parameter",
+          "grid_n2"
+        ],
+        [
+          "parameter",
+          "K2_tiles"
+        ],
+        [
+          "parameter",
+          "total_m_tiles"
+        ],
+        [
+          "parameter",
+          "M_total"
+        ],
+        [
+          "parameter",
+          "activation_clamp"
+        ],
+        [
+          "buffer",
+          "PrivateCounters"
+        ],
+        [
+          "buffer",
+          "PrivateMasks"
+        ],
+        [
+          "buffer",
+          "PublicExpertOutput"
+        ],
+        [
+          "buffer",
+          "PrivateSFBlockOffsets"
+        ],
+        [
+          "tma_buffer",
+          "PrivateSF1"
+        ],
+        [
+          "tma_buffer",
+          "PrivateSF2"
+        ],
+        [
+          "buffer",
+          "PrivateSF1Words"
+        ],
+        [
+          "buffer",
+          "PrivateSF2Bytes"
+        ],
+        [
+          "workspace",
+          "tma_descriptor_workspace"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--use_fast_math",
+        "--ptxas-options=--register-usage-level=10"
+      ],
+      "closure_sha256": "37a86a07d9aeaa7286b868ec950b9740d590913b980468c9cddc88018fba4fa7",
+      "ffi_prepare_entry": "run_prepare",
+      "tma_workspace_bytes": 1152,
+      "sources": [
+        "csrc/experimental/mega_moe_v3/generated/sm_103a/cake_mega_moe_v3_sm103a_464d3bbb1dde03846c66_kernel.cu",
+        "csrc/experimental/mega_moe_v3/generated/sm_103a/cake_mega_moe_v3_sm103a_464d3bbb1dde03846c66_binding.cu"
+      ]
+    },
+    "cake_mega_moe_v3_sm103a_49300ccdc211370698ae_kernel": {
+      "ffi_entry": "run",
+      "arg_plan": [
+        [
+          "buffer",
+          "src_a"
+        ],
+        [
+          "buffer",
+          "src_b"
+        ],
+        [
+          "buffer",
+          "dst_a"
+        ],
+        [
+          "buffer",
+          "dst_b"
+        ],
+        [
+          "parameter",
+          "a_rows"
+        ],
+        [
+          "parameter",
+          "b_rows"
+        ],
+        [
+          "parameter",
+          "b_group_rows"
+        ],
+        [
+          "parameter",
+          "words"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "closure_sha256": "084d963cf55c24b3c41223996b0c5c0d30c82b8a93fb1f84de846df3bf6c2925",
+      "tma_workspace_bytes": 0,
+      "sources": [
+        "csrc/experimental/mega_moe_v3/generated/sm_103a/cake_mega_moe_v3_sm103a_49300ccdc211370698ae_kernel.cu",
+        "csrc/experimental/mega_moe_v3/generated/sm_103a/cake_mega_moe_v3_sm103a_49300ccdc211370698ae_binding.cu"
+      ]
+    },
+    "cake_mega_moe_v3_sm103a_5d2267bdf1f9b67cbebb_kernel": {
+      "ffi_entry": "run",
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "A"
+        ],
+        [
+          "tma_buffer",
+          "B"
+        ],
+        [
+          "buffer",
+          "SFA"
+        ],
+        [
+          "buffer",
+          "SFB"
+        ],
+        [
+          "buffer",
+          "C_fp8"
+        ],
+        [
+          "buffer",
+          "SF_out"
+        ],
+        [
+          "buffer",
+          "routing_weights"
+        ],
+        [
+          "buffer",
+          "tile_expert"
+        ],
+        [
+          "buffer",
+          "tile_m_local"
+        ],
+        [
+          "buffer",
+          "expert_row_offsets"
+        ],
+        [
+          "parameter",
+          "M_total"
+        ],
+        [
+          "parameter",
+          "N"
+        ],
+        [
+          "parameter",
+          "K"
+        ],
+        [
+          "parameter",
+          "grid_n"
+        ],
+        [
+          "parameter",
+          "K_tiles"
+        ],
+        [
+          "parameter",
+          "total_m_tiles"
+        ],
+        [
+          "workspace",
+          "tma_descriptor_workspace"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "closure_sha256": "22fdf77a5a946e8801c6db0365a9cb9de33121cbe2b7f2428c200d7d23a5262c",
+      "ffi_prepare_entry": "run_prepare",
+      "tma_workspace_bytes": 256,
+      "sources": [
+        "csrc/experimental/mega_moe_v3/generated/sm_103a/cake_mega_moe_v3_sm103a_5d2267bdf1f9b67cbebb_kernel.cu",
+        "csrc/experimental/mega_moe_v3/generated/sm_103a/cake_mega_moe_v3_sm103a_5d2267bdf1f9b67cbebb_binding.cu"
+      ]
+    },
+    "cake_mega_moe_v3_sm103a_66a66e1725eff2419b2c_kernel": {
+      "ffi_entry": "run",
+      "arg_plan": [
+        [
+          "buffer",
+          "topk_idx_i32"
+        ],
+        [
+          "buffer",
+          "topk_weights"
+        ],
+        [
+          "buffer",
+          "x_fp8"
+        ],
+        [
+          "buffer",
+          "x_sf"
+        ],
+        [
+          "tma_buffer",
+          "A"
+        ],
+        [
+          "buffer",
+          "pool_fp8"
+        ],
+        [
+          "buffer",
+          "pool_sf"
+        ],
+        [
+          "buffer",
+          "routing_weight_pool"
+        ],
+        [
+          "buffer",
+          "token_to_permuted"
+        ],
+        [
+          "buffer",
+          "meta_token"
+        ],
+        [
+          "buffer",
+          "meta_slot"
+        ],
+        [
+          "buffer",
+          "expert_counts"
+        ],
+        [
+          "buffer",
+          "expert_row_offsets"
+        ],
+        [
+          "buffer",
+          "expert_scatter_offsets"
+        ],
+        [
+          "buffer",
+          "tile_expert"
+        ],
+        [
+          "buffer",
+          "tile_m_local"
+        ],
+        [
+          "buffer",
+          "total_m_tiles_out"
+        ],
+        [
+          "tma_buffer",
+          "B1"
+        ],
+        [
+          "tma_buffer",
+          "SFB1"
+        ],
+        [
+          "tma_buffer",
+          "I_fp8_w"
+        ],
+        [
+          "buffer",
+          "SF_I_w"
+        ],
+        [
+          "buffer",
+          "l1_bf16_capture"
+        ],
+        [
+          "tma_buffer",
+          "A2"
+        ],
+        [
+          "buffer",
+          "SFA2"
+        ],
+        [
+          "tma_buffer",
+          "B2"
+        ],
+        [
+          "tma_buffer",
+          "SFB2"
+        ],
+        [
+          "buffer",
+          "expert_output"
+        ],
+        [
+          "buffer",
+          "y"
+        ],
+        [
+          "buffer",
+          "histogram_done"
+        ],
+        [
+          "buffer",
+          "prefix_done"
+        ],
+        [
+          "buffer",
+          "dispatch_done"
+        ],
+        [
+          "buffer",
+          "l1_arrival"
+        ],
+        [
+          "buffer",
+          "l2_done"
+        ],
+        [
+          "parameter",
+          "num_tokens"
+        ],
+        [
+          "parameter",
+          "top_k"
+        ],
+        [
+          "parameter",
+          "num_experts"
+        ],
+        [
+          "parameter",
+          "N1"
+        ],
+        [
+          "parameter",
+          "K1"
+        ],
+        [
+          "parameter",
+          "grid_n1"
+        ],
+        [
+          "parameter",
+          "K1_tiles"
+        ],
+        [
+          "parameter",
+          "N2"
+        ],
+        [
+          "parameter",
+          "K2"
+        ],
+        [
+          "parameter",
+          "grid_n2"
+        ],
+        [
+          "parameter",
+          "K2_tiles"
+        ],
+        [
+          "parameter",
+          "total_m_tiles"
+        ],
+        [
+          "parameter",
+          "M_total"
+        ],
+        [
+          "parameter",
+          "activation_clamp"
+        ],
+        [
+          "buffer",
+          "PrivateCounters"
+        ],
+        [
+          "buffer",
+          "PrivateMasks"
+        ],
+        [
+          "buffer",
+          "PublicExpertOutput"
+        ],
+        [
+          "buffer",
+          "PrivateSFBlockOffsets"
+        ],
+        [
+          "tma_buffer",
+          "PrivateSF1"
+        ],
+        [
+          "tma_buffer",
+          "PrivateSF2"
+        ],
+        [
+          "buffer",
+          "PrivateSF1Words"
+        ],
+        [
+          "buffer",
+          "PrivateSF2Bytes"
+        ],
+        [
+          "workspace",
+          "tma_descriptor_workspace"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "closure_sha256": "eaf83eedcd7cf50ad0a584a5137f62b310439f0ac9a07eed5b4f99a708930aa1",
+      "ffi_prepare_entry": "run_prepare",
+      "tma_workspace_bytes": 1152,
+      "sources": [
+        "csrc/experimental/mega_moe_v3/generated/sm_103a/cake_mega_moe_v3_sm103a_66a66e1725eff2419b2c_kernel.cu",
+        "csrc/experimental/mega_moe_v3/generated/sm_103a/cake_mega_moe_v3_sm103a_66a66e1725eff2419b2c_binding.cu"
+      ]
+    },
+    "cake_mega_moe_v3_sm103a_77db2be22799cb44b3e9_kernel": {
+      "ffi_entry": "run",
+      "arg_plan": [
+        [
+          "buffer",
+          "topk_idx_i32"
+        ],
+        [
+          "buffer",
+          "topk_weights"
+        ],
+        [
+          "buffer",
+          "x_fp8"
+        ],
+        [
+          "buffer",
+          "x_sf"
+        ],
+        [
+          "tma_buffer",
+          "A"
+        ],
+        [
+          "buffer",
+          "pool_fp8"
+        ],
+        [
+          "buffer",
+          "pool_sf"
+        ],
+        [
+          "buffer",
+          "routing_weight_pool"
+        ],
+        [
+          "buffer",
+          "token_to_permuted"
+        ],
+        [
+          "buffer",
+          "meta_token"
+        ],
+        [
+          "buffer",
+          "meta_slot"
+        ],
+        [
+          "buffer",
+          "expert_counts"
+        ],
+        [
+          "buffer",
+          "expert_row_offsets"
+        ],
+        [
+          "buffer",
+          "expert_scatter_offsets"
+        ],
+        [
+          "buffer",
+          "tile_expert"
+        ],
+        [
+          "buffer",
+          "tile_m_local"
+        ],
+        [
+          "buffer",
+          "total_m_tiles_out"
+        ],
+        [
+          "tma_buffer",
+          "B1"
+        ],
+        [
+          "tma_buffer",
+          "SFB1"
+        ],
+        [
+          "tma_buffer",
+          "I_fp8_w"
+        ],
+        [
+          "buffer",
+          "SF_I_w"
+        ],
+        [
+          "buffer",
+          "l1_bf16_capture"
+        ],
+        [
+          "tma_buffer",
+          "A2"
+        ],
+        [
+          "buffer",
+          "SFA2"
+        ],
+        [
+          "tma_buffer",
+          "B2"
+        ],
+        [
+          "tma_buffer",
+          "SFB2"
+        ],
+        [
+          "buffer",
+          "expert_output"
+        ],
+        [
+          "buffer",
+          "y"
+        ],
+        [
+          "buffer",
+          "histogram_done"
+        ],
+        [
+          "buffer",
+          "prefix_done"
+        ],
+        [
+          "buffer",
+          "dispatch_done"
+        ],
+        [
+          "buffer",
+          "l1_arrival"
+        ],
+        [
+          "buffer",
+          "l2_done"
+        ],
+        [
+          "parameter",
+          "num_tokens"
+        ],
+        [
+          "parameter",
+          "top_k"
+        ],
+        [
+          "parameter",
+          "num_experts"
+        ],
+        [
+          "parameter",
+          "N1"
+        ],
+        [
+          "parameter",
+          "K1"
+        ],
+        [
+          "parameter",
+          "grid_n1"
+        ],
+        [
+          "parameter",
+          "K1_tiles"
+        ],
+        [
+          "parameter",
+          "N2"
+        ],
+        [
+          "parameter",
+          "K2"
+        ],
+        [
+          "parameter",
+          "grid_n2"
+        ],
+        [
+          "parameter",
+          "K2_tiles"
+        ],
+        [
+          "parameter",
+          "total_m_tiles"
+        ],
+        [
+          "parameter",
+          "M_total"
+        ],
+        [
+          "parameter",
+          "activation_clamp"
+        ],
+        [
+          "buffer",
+          "PrivateCounters"
+        ],
+        [
+          "buffer",
+          "PrivateMasks"
+        ],
+        [
+          "buffer",
+          "PublicExpertOutput"
+        ],
+        [
+          "buffer",
+          "PrivateSFBlockOffsets"
+        ],
+        [
+          "tma_buffer",
+          "PrivateSF1"
+        ],
+        [
+          "tma_buffer",
+          "PrivateSF2"
+        ],
+        [
+          "buffer",
+          "PrivateSF1Words"
+        ],
+        [
+          "buffer",
+          "PrivateSF2Bytes"
+        ],
+        [
+          "workspace",
+          "tma_descriptor_workspace"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "closure_sha256": "95f15b2bb4e966edd70ea7154fd79f7d8bf1c0e553f41c1a83ab755699f041f7",
+      "ffi_prepare_entry": "run_prepare",
+      "tma_workspace_bytes": 1152,
+      "sources": [
+        "csrc/experimental/mega_moe_v3/generated/sm_103a/cake_mega_moe_v3_sm103a_77db2be22799cb44b3e9_kernel.cu",
+        "csrc/experimental/mega_moe_v3/generated/sm_103a/cake_mega_moe_v3_sm103a_77db2be22799cb44b3e9_binding.cu"
+      ]
+    },
+    "cake_mega_moe_v3_sm103a_7a6e8a5c66a210c69806_kernel": {
+      "ffi_entry": "run",
+      "arg_plan": [
+        [
+          "buffer",
+          "topk_idx_i32"
+        ],
+        [
+          "buffer",
+          "topk_weights"
+        ],
+        [
+          "buffer",
+          "x_fp8"
+        ],
+        [
+          "buffer",
+          "x_sf"
+        ],
+        [
+          "tma_buffer",
+          "A"
+        ],
+        [
+          "buffer",
+          "pool_fp8"
+        ],
+        [
+          "buffer",
+          "pool_sf"
+        ],
+        [
+          "buffer",
+          "routing_weight_pool"
+        ],
+        [
+          "buffer",
+          "token_to_permuted"
+        ],
+        [
+          "buffer",
+          "meta_token"
+        ],
+        [
+          "buffer",
+          "meta_slot"
+        ],
+        [
+          "buffer",
+          "expert_counts"
+        ],
+        [
+          "buffer",
+          "expert_row_offsets"
+        ],
+        [
+          "buffer",
+          "expert_scatter_offsets"
+        ],
+        [
+          "buffer",
+          "tile_expert"
+        ],
+        [
+          "buffer",
+          "tile_m_local"
+        ],
+        [
+          "buffer",
+          "total_m_tiles_out"
+        ],
+        [
+          "tma_buffer",
+          "B1"
+        ],
+        [
+          "buffer",
+          "SFB1"
+        ],
+        [
+          "buffer",
+          "I_fp8_w"
+        ],
+        [
+          "buffer",
+          "SF_I_w"
+        ],
+        [
+          "buffer",
+          "l1_bf16_capture"
+        ],
+        [
+          "tma_buffer",
+          "A2"
+        ],
+        [
+          "buffer",
+          "SFA2"
+        ],
+        [
+          "tma_buffer",
+          "B2"
+        ],
+        [
+          "buffer",
+          "SFB2"
+        ],
+        [
+          "buffer",
+          "expert_output"
+        ],
+        [
+          "buffer",
+          "y"
+        ],
+        [
+          "buffer",
+          "histogram_done"
+        ],
+        [
+          "buffer",
+          "prefix_done"
+        ],
+        [
+          "buffer",
+          "dispatch_done"
+        ],
+        [
+          "buffer",
+          "l1_arrival"
+        ],
+        [
+          "buffer",
+          "l2_done"
+        ],
+        [
+          "parameter",
+          "num_tokens"
+        ],
+        [
+          "parameter",
+          "top_k"
+        ],
+        [
+          "parameter",
+          "num_experts"
+        ],
+        [
+          "parameter",
+          "N1"
+        ],
+        [
+          "parameter",
+          "K1"
+        ],
+        [
+          "parameter",
+          "grid_n1"
+        ],
+        [
+          "parameter",
+          "K1_tiles"
+        ],
+        [
+          "parameter",
+          "N2"
+        ],
+        [
+          "parameter",
+          "K2"
+        ],
+        [
+          "parameter",
+          "grid_n2"
+        ],
+        [
+          "parameter",
+          "K2_tiles"
+        ],
+        [
+          "parameter",
+          "total_m_tiles"
+        ],
+        [
+          "parameter",
+          "M_total"
+        ],
+        [
+          "parameter",
+          "activation_clamp"
+        ],
+        [
+          "workspace",
+          "tma_descriptor_workspace"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "closure_sha256": "d83e78741754816a7e85ba8133834de14d3eb2eed94a31c8e29ba2e62292ec4f",
+      "ffi_prepare_entry": "run_prepare",
+      "tma_workspace_bytes": 512,
+      "sources": [
+        "csrc/experimental/mega_moe_v3/generated/sm_103a/cake_mega_moe_v3_sm103a_7a6e8a5c66a210c69806_kernel.cu",
+        "csrc/experimental/mega_moe_v3/generated/sm_103a/cake_mega_moe_v3_sm103a_7a6e8a5c66a210c69806_binding.cu"
+      ]
+    },
+    "cake_mega_moe_v3_sm103a_c37663a2b4195a741053_kernel": {
+      "ffi_entry": "run",
+      "arg_plan": [
+        [
+          "buffer",
+          "topk_idx_i32"
+        ],
+        [
+          "buffer",
+          "topk_weights"
+        ],
+        [
+          "buffer",
+          "x_fp8"
+        ],
+        [
+          "buffer",
+          "x_sf"
+        ],
+        [
+          "tma_buffer",
+          "A"
+        ],
+        [
+          "buffer",
+          "pool_fp8"
+        ],
+        [
+          "buffer",
+          "pool_sf"
+        ],
+        [
+          "buffer",
+          "routing_weight_pool"
+        ],
+        [
+          "buffer",
+          "token_to_permuted"
+        ],
+        [
+          "buffer",
+          "meta_token"
+        ],
+        [
+          "buffer",
+          "meta_slot"
+        ],
+        [
+          "buffer",
+          "expert_counts"
+        ],
+        [
+          "buffer",
+          "expert_row_offsets"
+        ],
+        [
+          "buffer",
+          "expert_scatter_offsets"
+        ],
+        [
+          "buffer",
+          "tile_expert"
+        ],
+        [
+          "buffer",
+          "tile_m_local"
+        ],
+        [
+          "buffer",
+          "total_m_tiles_out"
+        ],
+        [
+          "tma_buffer",
+          "B1"
+        ],
+        [
+          "tma_buffer",
+          "SFB1"
+        ],
+        [
+          "tma_buffer",
+          "I_fp8_w"
+        ],
+        [
+          "buffer",
+          "SF_I_w"
+        ],
+        [
+          "buffer",
+          "l1_bf16_capture"
+        ],
+        [
+          "tma_buffer",
+          "A2"
+        ],
+        [
+          "buffer",
+          "SFA2"
+        ],
+        [
+          "tma_buffer",
+          "B2"
+        ],
+        [
+          "tma_buffer",
+          "SFB2"
+        ],
+        [
+          "buffer",
+          "expert_output"
+        ],
+        [
+          "buffer",
+          "y"
+        ],
+        [
+          "buffer",
+          "histogram_done"
+        ],
+        [
+          "buffer",
+          "prefix_done"
+        ],
+        [
+          "buffer",
+          "dispatch_done"
+        ],
+        [
+          "buffer",
+          "l1_arrival"
+        ],
+        [
+          "buffer",
+          "l2_done"
+        ],
+        [
+          "parameter",
+          "num_tokens"
+        ],
+        [
+          "parameter",
+          "top_k"
+        ],
+        [
+          "parameter",
+          "num_experts"
+        ],
+        [
+          "parameter",
+          "N1"
+        ],
+        [
+          "parameter",
+          "K1"
+        ],
+        [
+          "parameter",
+          "grid_n1"
+        ],
+        [
+          "parameter",
+          "K1_tiles"
+        ],
+        [
+          "parameter",
+          "N2"
+        ],
+        [
+          "parameter",
+          "K2"
+        ],
+        [
+          "parameter",
+          "grid_n2"
+        ],
+        [
+          "parameter",
+          "K2_tiles"
+        ],
+        [
+          "parameter",
+          "total_m_tiles"
+        ],
+        [
+          "parameter",
+          "M_total"
+        ],
+        [
+          "parameter",
+          "activation_clamp"
+        ],
+        [
+          "buffer",
+          "PrivateCounters"
+        ],
+        [
+          "buffer",
+          "PrivateMasks"
+        ],
+        [
+          "buffer",
+          "PublicExpertOutput"
+        ],
+        [
+          "buffer",
+          "PrivateSFBlockOffsets"
+        ],
+        [
+          "tma_buffer",
+          "PrivateSF1"
+        ],
+        [
+          "tma_buffer",
+          "PrivateSF2"
+        ],
+        [
+          "buffer",
+          "PrivateSF1Words"
+        ],
+        [
+          "buffer",
+          "PrivateSF2Bytes"
+        ],
+        [
+          "workspace",
+          "tma_descriptor_workspace"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--use_fast_math",
+        "--ptxas-options=--register-usage-level=10"
+      ],
+      "closure_sha256": "2b9bc52975d00eb82fc24c43f6155f1a0f1f5d60c3a5ec337777e538fcb9e84d",
+      "ffi_prepare_entry": "run_prepare",
+      "tma_workspace_bytes": 1152,
+      "sources": [
+        "csrc/experimental/mega_moe_v3/generated/sm_103a/cake_mega_moe_v3_sm103a_c37663a2b4195a741053_kernel.cu",
+        "csrc/experimental/mega_moe_v3/generated/sm_103a/cake_mega_moe_v3_sm103a_c37663a2b4195a741053_binding.cu"
+      ]
+    },
+    "cake_mega_moe_v3_sm103a_ec3b946b3c7cf28769a2_kernel": {
+      "ffi_entry": "run",
+      "arg_plan": [
+        [
+          "buffer",
+          "topk_idx_i32"
+        ],
+        [
+          "buffer",
+          "topk_weights"
+        ],
+        [
+          "buffer",
+          "x_fp8"
+        ],
+        [
+          "buffer",
+          "x_sf"
+        ],
+        [
+          "tma_buffer",
+          "A"
+        ],
+        [
+          "buffer",
+          "pool_fp8"
+        ],
+        [
+          "buffer",
+          "pool_sf"
+        ],
+        [
+          "buffer",
+          "routing_weight_pool"
+        ],
+        [
+          "buffer",
+          "token_to_permuted"
+        ],
+        [
+          "buffer",
+          "meta_token"
+        ],
+        [
+          "buffer",
+          "meta_slot"
+        ],
+        [
+          "buffer",
+          "expert_counts"
+        ],
+        [
+          "buffer",
+          "expert_row_offsets"
+        ],
+        [
+          "buffer",
+          "expert_scatter_offsets"
+        ],
+        [
+          "buffer",
+          "tile_expert"
+        ],
+        [
+          "buffer",
+          "tile_m_local"
+        ],
+        [
+          "buffer",
+          "total_m_tiles_out"
+        ],
+        [
+          "tma_buffer",
+          "B1"
+        ],
+        [
+          "buffer",
+          "SFB1"
+        ],
+        [
+          "buffer",
+          "I_fp8_w"
+        ],
+        [
+          "buffer",
+          "SF_I_w"
+        ],
+        [
+          "buffer",
+          "l1_bf16_capture"
+        ],
+        [
+          "tma_buffer",
+          "A2"
+        ],
+        [
+          "buffer",
+          "SFA2"
+        ],
+        [
+          "tma_buffer",
+          "B2"
+        ],
+        [
+          "buffer",
+          "SFB2"
+        ],
+        [
+          "buffer",
+          "expert_output"
+        ],
+        [
+          "buffer",
+          "y"
+        ],
+        [
+          "buffer",
+          "histogram_done"
+        ],
+        [
+          "buffer",
+          "prefix_done"
+        ],
+        [
+          "buffer",
+          "dispatch_done"
+        ],
+        [
+          "buffer",
+          "l1_arrival"
+        ],
+        [
+          "buffer",
+          "l2_done"
+        ],
+        [
+          "parameter",
+          "num_tokens"
+        ],
+        [
+          "parameter",
+          "top_k"
+        ],
+        [
+          "parameter",
+          "num_experts"
+        ],
+        [
+          "parameter",
+          "N1"
+        ],
+        [
+          "parameter",
+          "K1"
+        ],
+        [
+          "parameter",
+          "grid_n1"
+        ],
+        [
+          "parameter",
+          "K1_tiles"
+        ],
+        [
+          "parameter",
+          "N2"
+        ],
+        [
+          "parameter",
+          "K2"
+        ],
+        [
+          "parameter",
+          "grid_n2"
+        ],
+        [
+          "parameter",
+          "K2_tiles"
+        ],
+        [
+          "parameter",
+          "total_m_tiles"
+        ],
+        [
+          "parameter",
+          "M_total"
+        ],
+        [
+          "parameter",
+          "activation_clamp"
+        ],
+        [
+          "workspace",
+          "tma_descriptor_workspace"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "closure_sha256": "562bafbd8a6ecadfd4242c2c8d93109a4601cbb1edd86317a2e0e901ea1699e8",
+      "ffi_prepare_entry": "run_prepare",
+      "tma_workspace_bytes": 512,
+      "sources": [
+        "csrc/experimental/mega_moe_v3/generated/sm_103a/cake_mega_moe_v3_sm103a_ec3b946b3c7cf28769a2_kernel.cu",
+        "csrc/experimental/mega_moe_v3/generated/sm_103a/cake_mega_moe_v3_sm103a_ec3b946b3c7cf28769a2_binding.cu"
+      ]
+    }
+  },
+  "routes": {
+    "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":384,\"num_tokens\":1,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}]": {
+      "metadata": {
+        "surface": "pipeline",
+        "grid": [
+          152,
+          1,
+          1
+        ],
+        "extent": {
+          "grid_derivation": "original distinct top-k lower bound saturates 152SM",
+          "minimum_tiles": 480
+        },
+        "reset_scope": "contiguous uint32 zero then main kernel",
+        "source_prepared_callback": "captured reset+main graph",
+        "args": {
+          "num_experts": 384,
+          "top_k": 6,
+          "num_tokens": 1,
+          "hidden": 5120,
+          "intermediate": 2304,
+          "routed_weight_dtype": "fp4",
+          "activation_clamp": 10.0
+        }
+      },
+      "stages": [
+        {
+          "name": "pipeline",
+          "program": "cake_mega_moe_v3_sm103a_77db2be22799cb44b3e9_kernel"
+        }
+      ]
+    },
+    "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":384,\"num_tokens\":16,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}]": {
+      "metadata": {
+        "surface": "pipeline",
+        "grid": [
+          152,
+          1,
+          1
+        ],
+        "extent": {
+          "grid_derivation": "original distinct top-k lower bound saturates 152SM",
+          "minimum_tiles": 480
+        },
+        "reset_scope": "contiguous uint32 zero then main kernel",
+        "source_prepared_callback": "captured reset+main graph",
+        "args": {
+          "num_experts": 384,
+          "top_k": 6,
+          "num_tokens": 16,
+          "hidden": 5120,
+          "intermediate": 2304,
+          "routed_weight_dtype": "fp4",
+          "activation_clamp": 10.0
+        }
+      },
+      "stages": [
+        {
+          "name": "pipeline",
+          "program": "cake_mega_moe_v3_sm103a_25056122573221721a93_kernel"
+        }
+      ]
+    },
+    "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":384,\"num_tokens\":128,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}]": {
+      "metadata": {
+        "surface": "pipeline",
+        "grid": [
+          152,
+          1,
+          1
+        ],
+        "extent": {
+          "grid_derivation": "original distinct top-k lower bound saturates 152SM",
+          "minimum_tiles": 480
+        },
+        "reset_scope": "contiguous uint32 zero then main kernel",
+        "source_prepared_callback": "captured reset+main graph",
+        "args": {
+          "num_experts": 384,
+          "top_k": 6,
+          "num_tokens": 128,
+          "hidden": 5120,
+          "intermediate": 2304,
+          "routed_weight_dtype": "fp4",
+          "activation_clamp": 10.0
+        }
+      },
+      "stages": [
+        {
+          "name": "pipeline",
+          "program": "cake_mega_moe_v3_sm103a_c37663a2b4195a741053_kernel"
+        }
+      ]
+    },
+    "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":384,\"num_tokens\":512,\"routed_weight_dtype\":\"fp4\",\"top_k\":6}]": {
+      "metadata": {
+        "surface": "pipeline",
+        "grid": [
+          152,
+          1,
+          1
+        ],
+        "extent": {
+          "grid_derivation": "original distinct top-k lower bound saturates 152SM",
+          "minimum_tiles": 480
+        },
+        "reset_scope": "contiguous uint32 zero then main kernel",
+        "source_prepared_callback": "captured reset+main graph",
+        "args": {
+          "num_experts": 384,
+          "top_k": 6,
+          "num_tokens": 512,
+          "hidden": 5120,
+          "intermediate": 2304,
+          "routed_weight_dtype": "fp4",
+          "activation_clamp": 10.0
+        }
+      },
+      "stages": [
+        {
+          "name": "pipeline",
+          "program": "cake_mega_moe_v3_sm103a_464d3bbb1dde03846c66_kernel"
+        }
+      ]
+    },
+    "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":5120,\"intermediate\":2304,\"num_experts\":384,\"num_tokens\":16,\"routed_weight_dtype\":\"fp8\",\"top_k\":6}]": {
+      "metadata": {
+        "surface": "pipeline",
+        "grid": [
+          152,
+          1,
+          1
+        ],
+        "extent": {
+          "grid_derivation": "original distinct top-k lower bound saturates 152SM",
+          "minimum_tiles": 480
+        },
+        "reset_scope": "contiguous uint32 zero then main kernel",
+        "source_prepared_callback": "captured reset+main graph",
+        "args": {
+          "num_experts": 384,
+          "top_k": 6,
+          "num_tokens": 16,
+          "hidden": 5120,
+          "intermediate": 2304,
+          "routed_weight_dtype": "fp8",
+          "activation_clamp": 10.0
+        }
+      },
+      "stages": [
+        {
+          "name": "pipeline",
+          "program": "cake_mega_moe_v3_sm103a_66a66e1725eff2419b2c_kernel"
+        }
+      ]
+    },
+    "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":512,\"intermediate\":256,\"num_experts\":8,\"num_tokens\":16,\"routed_weight_dtype\":\"fp4\",\"top_k\":2}]": {
+      "metadata": {
+        "surface": "pipeline",
+        "grid": [
+          64,
+          1,
+          1
+        ],
+        "extent": {
+          "id": "smoke-moe-fp4-t16",
+          "M_total": 2048,
+          "total_m_tiles": 16,
+          "persistent_grid": 64,
+          "topk_idx": [
+            [
+              7,
+              1
+            ],
+            [
+              6,
+              1
+            ],
+            [
+              4,
+              1
+            ],
+            [
+              0,
+              3
+            ],
+            [
+              0,
+              7
+            ],
+            [
+              5,
+              2
+            ],
+            [
+              1,
+              5
+            ],
+            [
+              6,
+              1
+            ],
+            [
+              4,
+              3
+            ],
+            [
+              0,
+              5
+            ],
+            [
+              7,
+              6
+            ],
+            [
+              5,
+              6
+            ],
+            [
+              0,
+              6
+            ],
+            [
+              3,
+              5
+            ],
+            [
+              2,
+              4
+            ],
+            [
+              7,
+              1
+            ]
+          ],
+          "expert_counts": [
+            4,
+            6,
+            2,
+            3,
+            3,
+            5,
+            5,
+            4
+          ],
+          "seed": 0,
+          "weight_format": "fp4"
+        },
+        "reset_scope": "seven original counter zero calls then main kernel",
+        "source_prepared_callback": "reset+main callable",
+        "args": {
+          "num_experts": 8,
+          "top_k": 2,
+          "num_tokens": 16,
+          "hidden": 512,
+          "intermediate": 256,
+          "routed_weight_dtype": "fp4",
+          "activation_clamp": 10.0
+        }
+      },
+      "stages": [
+        {
+          "name": "pipeline",
+          "program": "cake_mega_moe_v3_sm103a_7a6e8a5c66a210c69806_kernel"
+        }
+      ]
+    },
+    "[\"pipeline\",{\"activation_clamp\":10.0,\"hidden\":512,\"intermediate\":256,\"num_experts\":8,\"num_tokens\":16,\"routed_weight_dtype\":\"fp8\",\"top_k\":2}]": {
+      "metadata": {
+        "surface": "pipeline",
+        "grid": [
+          64,
+          1,
+          1
+        ],
+        "extent": {
+          "id": "smoke-moe-fp8-t16",
+          "M_total": 2048,
+          "total_m_tiles": 16,
+          "persistent_grid": 64,
+          "topk_idx": [
+            [
+              7,
+              1
+            ],
+            [
+              6,
+              1
+            ],
+            [
+              4,
+              1
+            ],
+            [
+              0,
+              3
+            ],
+            [
+              0,
+              7
+            ],
+            [
+              5,
+              2
+            ],
+            [
+              1,
+              5
+            ],
+            [
+              6,
+              1
+            ],
+            [
+              4,
+              3
+            ],
+            [
+              0,
+              5
+            ],
+            [
+              7,
+              6
+            ],
+            [
+              5,
+              6
+            ],
+            [
+              0,
+              6
+            ],
+            [
+              3,
+              5
+            ],
+            [
+              2,
+              4
+            ],
+            [
+              7,
+              1
+            ]
+          ],
+          "expert_counts": [
+            4,
+            6,
+            2,
+            3,
+            3,
+            5,
+            5,
+            4
+          ],
+          "seed": 0,
+          "weight_format": "fp8"
+        },
+        "reset_scope": "seven original counter zero calls then main kernel",
+        "source_prepared_callback": "reset+main callable",
+        "args": {
+          "num_experts": 8,
+          "top_k": 2,
+          "num_tokens": 16,
+          "hidden": 512,
+          "intermediate": 256,
+          "routed_weight_dtype": "fp8",
+          "activation_clamp": 10.0
+        }
+      },
+      "stages": [
+        {
+          "name": "pipeline",
+          "program": "cake_mega_moe_v3_sm103a_ec3b946b3c7cf28769a2_kernel"
+        }
+      ]
+    },
+    "[\"grouped_fused\",{\"hidden\":7168,\"intermediate\":3072,\"num_experts\":4,\"per_expert_M\":[1024,1024,1024,1024]}]": {
+      "metadata": {
+        "surface": "grouped_fused",
+        "grid": [
+          152,
+          1,
+          1
+        ],
+        "M_total": 4096,
+        "total_m_tiles": 32,
+        "reset_scope": "l1_arrival.zero_ then main",
+        "required_repack_each_invocation": false,
+        "args": {
+          "benchmark": true,
+          "hidden": 7168,
+          "intermediate": 3072,
+          "num_experts": 4,
+          "per_expert_M": [
+            1024,
+            1024,
+            1024,
+            1024
+          ]
+        }
+      },
+      "stages": [
+        {
+          "name": "main",
+          "program": "cake_mega_moe_v3_sm103a_357f423bb481759e10c9_kernel"
+        }
+      ]
+    },
+    "[\"grouped_l2\",{\"hidden\":7168,\"intermediate\":3072,\"num_experts\":4,\"per_expert_M\":[1024,1024,1024,1024]}]": {
+      "metadata": {
+        "surface": "grouped_l2",
+        "grid": [
+          152,
+          1,
+          1
+        ],
+        "M_total": 4096,
+        "total_m_tiles": 32,
+        "reset_scope": "no reset",
+        "required_repack_each_invocation": true,
+        "args": {
+          "benchmark": true,
+          "hidden": 7168,
+          "intermediate": 3072,
+          "num_experts": 4,
+          "per_expert_M": [
+            1024,
+            1024,
+            1024,
+            1024
+          ]
+        }
+      },
+      "stages": [
+        {
+          "name": "scale_layout",
+          "program": "cake_mega_moe_v3_sm103a_49300ccdc211370698ae_kernel"
+        },
+        {
+          "name": "main",
+          "program": "cake_mega_moe_v3_sm103a_449586525e4a9bc31aa9_kernel"
+        }
+      ]
+    },
+    "[\"grouped_l1\",{\"K\":512,\"N\":256,\"num_experts\":4,\"per_expert_M\":[256,256,256,256]}]": {
+      "metadata": {
+        "surface": "grouped_l1",
+        "grid": [
+          16,
+          1,
+          1
+        ],
+        "M_total": 1024,
+        "total_m_tiles": 8,
+        "reset_scope": "no reset",
+        "required_repack_each_invocation": false,
+        "args": {
+          "num_experts": 4,
+          "per_expert_M": [
+            256,
+            256,
+            256,
+            256
+          ],
+          "N": 256,
+          "K": 512,
+          "benchmark": false
+        }
+      },
+      "stages": [
+        {
+          "name": "main",
+          "program": "cake_mega_moe_v3_sm103a_5d2267bdf1f9b67cbebb_kernel"
+        }
+      ]
+    }
+  }
+}
