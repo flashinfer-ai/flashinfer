@@ -132,12 +132,10 @@ one process under different recipes. When the shim is retired the default of
 
     :func:`~flashinfer.quantization.make_nvfp4_global_scale` and
     :func:`~flashinfer.quantization.nvfp4_e4m3_max` take the **resolved**
-    recipe as ``nvfp4_4over6_config=`` and default to ``None``; they never
-    read the environment. Their pre-existing contract is that passing nothing
-    means "no 4over6", and promoting that to an environment read would change
-    the scale returned to every existing caller. When the quantize call leaves
-    ``nvfp4_4over6`` unset, pass ``resolve_nvfp4_4over6()`` to the scale helper
-    so both sides agree.
+    recipe as ``nvfp4_4over6_config=`` and never read the environment
+    (``None``, their default, has always meant standard NVFP4). When the
+    quantize call leaves ``nvfp4_4over6`` unset, pass
+    ``resolve_nvfp4_4over6()`` to the scale helper so both sides agree.
 
 Resolution happens in exactly one place,
 :func:`~flashinfer.quantization.resolve_nvfp4_4over6`. Below it, every kernel

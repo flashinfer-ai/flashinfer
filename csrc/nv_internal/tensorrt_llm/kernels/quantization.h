@@ -61,10 +61,9 @@ template <typename T>
 void invokeRowWiseAmax(uint32_t m, uint32_t n, T const* input, float* output, float scale = 1.0f,
                        int32_t* expanded_idx_to_permuted_idx = nullptr, cudaStream_t stream = 0);
 
-// `recipe` is deliberately mandatory (no default) on the three entry points below:
-// a defaulted trailing parameter would let a future call site compile while silently
-// ignoring an explicitly requested NVFP4 recipe. Callers with nothing to say pass
-// resolveNVFP4Recipe(kNVFP44Over6FromEnv). See issue #5141.
+// `recipe` has no default on purpose: a defaulted parameter would let a new call site
+// silently drop an explicit recipe. Pass resolveNVFP4Recipe(kNVFP44Over6FromEnv) for
+// the legacy env-driven behaviour.
 template <typename T, int SF_VEC_SIZE>
 void invokeFP4Quantization(int b, int m, int n, T const* input, float const* globalScale,
                            int64_t* output, int32_t* SFOutput, bool useUE8M0,

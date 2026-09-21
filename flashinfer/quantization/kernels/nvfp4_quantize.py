@@ -2543,11 +2543,13 @@ def nvfp4_quantize_cute_dsl(
         Whether to enable Programmatic Dependent Launch.  Auto-detected
         from device capability (SM >= 9.0) when ``None``.
     nvfp4_4over6 : NVFP44Over6Config or None
-        NVFP4 "4over6" scale-candidate search.  Omitted (the default): the
-        recipe comes from the legacy ``FLASHINFER_NVFP4_4OVER6*`` environment
-        variables.  ``None``: 4over6 off, environment ignored.  An
-        :class:`NVFP44Over6Config`: on with exactly that recipe, environment
-        ignored.  Requires fp16/bf16 input.
+        NVFP4 "4over6" scale-candidate search. Requires fp16 / bf16 input.
+
+        - omitted (the default): read the legacy ``FLASHINFER_NVFP4_4OVER6*``
+          environment variables.
+        - ``None``: 4over6 off. The environment is ignored.
+        - :class:`NVFP44Over6Config`: on with exactly that recipe. The
+          environment is ignored.
 
     Returns
     -------
@@ -2923,11 +2925,13 @@ def silu_and_mul_nvfp4_quantize_cute_dsl(
     enable_pdl : bool, optional
         Enable Programmatic Dependent Launch. Auto-detected when None.
     nvfp4_4over6 : NVFP44Over6Config or None
-        NVFP4 "4over6" scale-candidate search.  Omitted (the default): the
-        recipe comes from the legacy ``FLASHINFER_NVFP4_4OVER6*`` environment
-        variables.  ``None``: 4over6 off, environment ignored.  An
-        :class:`NVFP44Over6Config`: on with exactly that recipe, environment
-        ignored.  Requires fp16/bf16 input.
+        NVFP4 "4over6" scale-candidate search. Requires fp16 / bf16 input.
+
+        - omitted (the default): read the legacy ``FLASHINFER_NVFP4_4OVER6*``
+          environment variables.
+        - ``None``: 4over6 off. The environment is ignored.
+        - :class:`NVFP44Over6Config`: on with exactly that recipe. The
+          environment is ignored.
 
     Returns
     -------
@@ -3127,11 +3131,13 @@ def nvfp4_quantize_per_token_cute_dsl(
         downstream output scalar needs no separate pass. Does not change
         ``fp4_output`` or ``scale_output``.
     nvfp4_4over6 : NVFP44Over6Config or None
-        NVFP4 "4over6" scale-candidate search.  Omitted (the default): the
-        recipe comes from the legacy ``FLASHINFER_NVFP4_4OVER6*`` environment
-        variables.  ``None``: 4over6 off, environment ignored.  An
-        :class:`NVFP44Over6Config`: on with exactly that recipe, environment
-        ignored.  Requires fp16/bf16 input.
+        NVFP4 "4over6" scale-candidate search. Requires fp16 / bf16 input.
+
+        - omitted (the default): read the legacy ``FLASHINFER_NVFP4_4OVER6*``
+          environment variables.
+        - ``None``: 4over6 off. The environment is ignored.
+        - :class:`NVFP44Over6Config`: on with exactly that recipe. The
+          environment is ignored.
 
     Returns
     -------
