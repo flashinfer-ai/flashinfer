@@ -2072,6 +2072,13 @@ class BatchDecodeWithPagedKVCacheWrapper:
             * self._float_workspace_buffer.element_size()
         )
 
+        # The planner and the kernels read these through raw data pointers, and
+        # ``.to(device)`` keeps a strided view strided, so normalize them (they
+        # are tiny) rather than silently misreading non-contiguous inputs.
+        indptr = indptr.contiguous()
+        indices = indices.contiguous()
+        last_page_len = last_page_len.contiguous()
+
         batch_size = len(last_page_len)
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
@@ -4873,6 +4880,11 @@ def fast_decode_plan(
     compatible prepared graphs are still reused. The copy-elision below is
     specific to the FA2/FA3 module, not cuDNN's metadata contract.
     """
+    # Kernels read these through raw data pointers; ``.contiguous()`` is a
+    # no-op for the usual contiguous inputs and fixes strided views.
+    indptr = indptr.contiguous()
+    indices = indices.contiguous()
+    last_page_len = last_page_len.contiguous()
     batch_size = len(last_page_len)
     wants_cudnn = self._backend == "cudnn"
     if self._requested_backend == "auto":

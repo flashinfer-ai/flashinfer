@@ -668,6 +668,14 @@ class BlockSparseAttentionWrapper:
         kv_data_type = canonicalize_torch_dtype(kv_data_type)
         self._o_dtype = canonicalize_torch_dtype(o_data_type)
 
+        # The planner and the kernels read these through raw data pointers, and
+        # ``.to(device)`` keeps a strided view strided, so normalize them (they
+        # are tiny) rather than silently misreading non-contiguous inputs.
+        if indptr is not None:
+            indptr = indptr.contiguous()
+        if indices is not None:
+            indices = indices.contiguous()
+
         if self._backend != "vsa_sm100_blk64" and (
             kv_splits is not None
             or use_clc is not None
