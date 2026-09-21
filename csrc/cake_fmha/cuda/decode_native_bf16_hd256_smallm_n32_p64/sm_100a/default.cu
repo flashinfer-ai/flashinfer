@@ -514,8 +514,8 @@ __global__ __launch_bounds__(512) void
 kernel_cake_fmha_decode_native_bf16_hd256_smallm_n32_p64(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap const* K, CakeFmhaTensorMap const* V, __nv_bfloat16* __restrict__ partial_O_ptr, float* __restrict__ partial_LSE_ptr, __nv_bfloat16* __restrict__ O_ptr, float* __restrict__ LSE_ptr, unsigned int* __restrict__ counters, int* __restrict__ page_table, int* __restrict__ seq_lens, int max_pages_per_seq, float softmax_scale_log2, int num_q_heads, int num_kv_heads)
 {
     const int tid = threadIdx.x;
-    const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
-    const uint32_t lane = static_cast<uint32_t>(tid) & 31u;
+    const int warp = make_warp_uniform(tid / 32);
+    const int lane = tid % 32;
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
@@ -657,7 +657,7 @@ kernel_cake_fmha_decode_native_bf16_hd256_smallm_n32_p64(CakeFmhaTensorMap const
             int wg = warp / 4;
             const int warp_in_wg = warp % 4;
             const int lane_base = warp_in_wg * 32;
-            int wg_tid = (unsigned int)(warp_in_wg * 32) + lane;
+            int wg_tid = warp_in_wg * 32 + lane;
             int col_local = wg_tid / 8;
             int quarter = wg_tid % 8;
             int col_base = wg * 16;
@@ -675,7 +675,7 @@ kernel_cake_fmha_decode_native_bf16_hd256_smallm_n32_p64(CakeFmhaTensorMap const
                 mbarrier_wait(s_full_addr + (sm_stage) * 8, sm_phase);
                 float _tmem_load_0[16];
                 tmem_ld_x16(&_tmem_load_0[0], my_s_base + sm_stage * 32);
-                int tok_w = (unsigned int)lane_base + lane;
+                int tok_w = lane_base + lane;
                 #pragma unroll
                 for (int c = 0; c < 16; c++) {
                     st_ptr[c * 129 + tok_w] = _tmem_load_0[c];
@@ -959,7 +959,7 @@ kernel_cake_fmha_decode_native_bf16_hd256_smallm_n32_p64(CakeFmhaTensorMap const
             int prefix_1 = kv_len_1 - Q_LEN;
             const int warp_in_wg_c = warp % 4;
             const int corr_row = warp_in_wg_c * 32 << 16;
-            int d_idx = (unsigned int)(warp_in_wg_c * 32) + lane;
+            int d_idx = warp_in_wg_c * 32 + lane;
             unsigned int _phase_corr_scale_0 = 0;
             unsigned int _phase_o_ready_0 = 0;
             #pragma unroll 1
@@ -1073,7 +1073,7 @@ kernel_cake_fmha_decode_native_bf16_hd256_smallm_n32_p64(CakeFmhaTensorMap const
             if (warp_in_wg_c == 0) {
                 #pragma unroll
                 for (int chunk_2 = 0; chunk_2 < 1; chunk_2++) {
-                    int r_l = (unsigned int)(chunk_2 * 32) + lane;
+                    int r_l = chunk_2 * 32 + lane;
                     float m_l = smem_max[r_l];
                     float s_l = smem_sum[r_l];
                     float lse_l = -CAKE_FMHA_INF;
