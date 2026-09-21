@@ -149,6 +149,8 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
         generate_c: bool = False,
         # Tail-split pair tasks (see fc1_fc2_fuse_sched); needs a 2-CTA token cluster.
         tail_split_pairs: bool = False,
+        # Receiver-side dispatch rank cache (token_comm); exclusive with dedup_dispatch.
+        dispatch_rank_cache: bool = False,
     ) -> None:
         # Folding TMA-A / TMA-B / scheduler into the idle dispatch slots is
         # only possible with a single active dispatch warp.  Without the
@@ -397,6 +399,7 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
             sf_atom_swizzled=(self.fp8_scale_mode != "blockwise"),
             flag_batch=flag_batch,
             dedup_dispatch=dedup_dispatch,
+            dispatch_rank_cache=dispatch_rank_cache,
             max_tokens_per_rank=max_tokens_per_rank,
             active_dispatch_warps=active_dispatch_warps,
             # Only the active dispatch warps get a pull-buffer slot; the idle
@@ -404,6 +407,7 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
             compact_pull_buffer=compact_pull_buffer,
         )
         self.dedup_dispatch = dedup_dispatch
+        self.dispatch_rank_cache = dispatch_rank_cache
 
         # Region layout (same call drives both get_workspace_sizes() and the
         # __call__ partition).
@@ -576,9 +580,10 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
                 )
             )
 
-        if self.dedup_dispatch:
+        if self.dedup_dispatch or self.dispatch_rank_cache:
             # (src_rank, src_token) -> carrier pool row rendezvous, one u64
-            # per entry (bit63 valid | sf_row<<31 | data_row).  Lives in the
+            # per entry (bit63 valid | sf_row<<31 | data_row; the rank cache
+            # also uses 1 as its in-flight claim marker).  Lives in the
             # zeroed counter prefix so kernel_tail resets it per launch.
             specs.append(
                 _RegionSpec(
@@ -1082,7 +1087,7 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
             16,
         )
 
-        if cutlass.const_expr(self.dedup_dispatch):
+        if cutlass.const_expr(self.dedup_dispatch or self.dispatch_rank_cache):
             carrier_row_table = self._view_local(
                 local_workspace, "carrier_row_table",
             )

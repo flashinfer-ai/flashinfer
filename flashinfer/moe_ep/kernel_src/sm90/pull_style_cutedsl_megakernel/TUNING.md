@@ -468,6 +468,32 @@ token-back modes — 38 candidates.
 - `dedup_dispatch`, `grouped_token_back`, `combine_format` — top-k dedup
   on dispatch / combine and the quantized combine wire; see
   `dedup_topk_design.md`.
+- `dispatch_rank_cache` (default False; exclusive with `dedup_dispatch`) —
+  the receiver-side-only variant of the dispatch dedup, after the kernel
+  team's SM120 "same-NUMA dispatch reuse": the first top-k route that brings
+  a (src_rank, src_token) row to this rank claims a rank-local table entry
+  with a device-scope CAS, pulls over NVLink and publishes its pool row
+  (`st.release.gpu`); later routes for the same row copy the local pool row
+  (payload + SF, same pull pipeline as the dedup duplicate path) when they
+  find the entry published, and fall back to the plain peer pull WITHOUT
+  waiting when the first pull is still in flight.  No sender election, no
+  route-word flags — rank-local, not collective — and no wait edges; the
+  price is that in-flight duplicates are not saved.  Bit-exact (the
+  `test_..._dispatch_rank_cache_*` multirank cases: both scale modes,
+  swap-AB, reuse_dispatch_warps, 12-expert top-6).  Measured 2026-09-21
+  (4x H200, DSV4-Pro P03 geometry, 2 interleaved rounds, e2e median): geomean
+  **−0.05%** (per_tensor −0.09%, blockwise −0.02%), every bucket within
+  ±0.7% — neutral, like `dedup_dispatch` in the same session (single round:
+  bw4096 +3.4%, pt4096 +1.9%, pt8192 −1.7%, the rest within ±1.3%).  At this
+  geometry ~45% of the remote routes are duplicates (top-6 over 96 experts
+  per rank: 4.5 remote routes but only ~2.5 distinct remote owners per
+  token), so the saved NVLink bytes are real, but dispatch is overlapped
+  with the GEMMs and off the critical path at every bucket, and the small
+  buckets are latency-bound (the CAS + two shuffles per remote route show
+  as −0.3..−0.7% there).  Kept as an off-by-default knob for
+  dispatch-bound deployments (narrow NVLink, PCIe/sysmem peers, skewed
+  routing) where the non-collective variant is preferable to
+  `dedup_dispatch`.
 - `fp8_accum_mode`, `kind` (e4m3/e5m2), clamps.
 
 ## Sweep methodology + environment (reproduce recipe)

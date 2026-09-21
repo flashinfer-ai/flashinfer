@@ -363,6 +363,49 @@ def red_add_release_gpu_u64_raw(addr: Int64, val: Int64, *, loc=None, ip=None) -
 
 
 @dsl_user_op
+def atom_cas_acquire_gpu_u64_raw(
+    addr: Int64, compare: Int64, value: Int64, *, loc=None, ip=None
+) -> Int64:
+    """``atom.acquire.gpu.global.cas.b64`` via raw int64 byte address.
+
+    Returns the old value.  Device scope: the dispatch rank cache table is
+    rank-local; the acquire pairs with the owner's ``st.release.gpu`` publish
+    so a hit sees the owner's pool row (payload + SF) as complete.
+    """
+    return Int64(
+        llvm.inline_asm(
+            T.i64(),
+            [addr.ir_value(), compare.ir_value(), value.ir_value()],
+            "atom.acquire.gpu.global.cas.b64 $0, [$1], $2, $3;",
+            "=l,l,l,l",
+            has_side_effects=True,
+            asm_dialect=0,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def st_release_gpu_u64_raw(addr: Int64, val: Int64, *, loc=None, ip=None) -> None:
+    """``st.release.gpu.global.b64`` via raw int64 byte address.
+
+    Publishes a value whose slot is already owned (claimed by a CAS), where
+    the additive ``red`` publish would sum onto the claim marker.
+    """
+    llvm.inline_asm(
+        None,
+        [addr.ir_value(), val.ir_value()],
+        "st.release.gpu.global.b64 [$0], $1;",
+        "l,l",
+        has_side_effects=True,
+        asm_dialect=0,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def red_add_relaxed_sys_u64_raw(addr: Int64, val: Int64, *, loc=None, ip=None) -> None:
     """``red.relaxed.sys.global.add.u64`` via raw int64 byte address.
 

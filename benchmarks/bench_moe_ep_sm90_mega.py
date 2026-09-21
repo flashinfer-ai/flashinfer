@@ -241,6 +241,14 @@ def _parse_args() -> argparse.Namespace:
         "(duplicate top-k routes copy the carrier's pool row locally)",
     )
     p.add_argument(
+        "--dispatch-rank-cache",
+        action="store_true",
+        help="receiver-side dispatch rank cache: duplicate (src_rank, token) "
+        "rows copy the first route's pool row once published and fall back "
+        "to the peer pull while it is in flight (no waiting; rank-local, "
+        "exclusive with --dedup-dispatch)",
+    )
+    p.add_argument(
         "--grouped-token-back",
         action="store_true",
         help="combine dedup: pre-reduce each (src_rank, src_token) group in "
@@ -606,6 +614,7 @@ def _megakernel_config(args, scale_mode: str, operand_order: str, tile, tokens=N
         ),
         pingpong=pingpong,
         dedup_dispatch=args.dedup_dispatch,
+        dispatch_rank_cache=args.dispatch_rank_cache,
         grouped_token_back=args.grouped_token_back,
         combine_format=args.combine_format,
         active_dispatch_warps=args.active_dispatch_warps,

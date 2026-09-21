@@ -384,6 +384,7 @@ def _megakernel_config(
     in_kernel_fc2_reduce: bool = False,
     token_back_mode: str | None = None,
     dedup_dispatch: bool = False,
+    dispatch_rank_cache: bool = False,
     grouped_token_back: bool = False,
     combine_format: str = "bf16",
     active_dispatch_warps: int = 1,
@@ -416,6 +417,7 @@ def _megakernel_config(
             "reuse_dispatch_warps" if grouped_token_back else token_back_mode
         ),
         dedup_dispatch=dedup_dispatch,
+        dispatch_rank_cache=dispatch_rank_cache,
         grouped_token_back=grouped_token_back,
         combine_format=combine_format,
         active_dispatch_warps=active_dispatch_warps,
@@ -440,6 +442,7 @@ def _run_mega_layer(
     in_kernel_fc2_reduce: bool = False,
     token_back_mode: str | None = None,
     dedup_dispatch: bool = False,
+    dispatch_rank_cache: bool = False,
     grouped_token_back: bool = False,
     combine_format: str = "bf16",
     active_dispatch_warps: int = 1,
@@ -492,6 +495,7 @@ def _run_mega_layer(
             in_kernel_fc2_reduce=in_kernel_fc2_reduce,
             token_back_mode=token_back_mode,
             dedup_dispatch=dedup_dispatch,
+            dispatch_rank_cache=dispatch_rank_cache,
             grouped_token_back=grouped_token_back,
             combine_format=combine_format,
             active_dispatch_warps=active_dispatch_warps,
@@ -547,6 +551,7 @@ def _run_mega_layer(
                     in_kernel_fc2_reduce=in_kernel_fc2_reduce,
                     token_back_mode=token_back_mode,
                     dedup_dispatch=dedup_dispatch,
+                    dispatch_rank_cache=dispatch_rank_cache,
                     grouped_token_back=grouped_token_back,
                     combine_format=combine_format,
                     active_dispatch_warps=active_dispatch_warps,
@@ -1140,6 +1145,76 @@ def test_moe_ep_sm90_pull_fp8_mega_layer_dedup_dispatch_in_kernel_reduce():
     print(
         f"rank {rank}: sm90_fp8_fp8_bf16_pull_cutedsl mega layer "
         "(dedup_dispatch + in_kernel_fc2_reduce) matches reference"
+    )
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_hopper
+@pytest.mark.parametrize(
+    "fp8_scale_mode,swap_ab,token_back_mode",
+    [
+        ("per_tensor", False, None),
+        ("blockwise", False, None),
+        ("per_tensor", True, None),
+        ("per_tensor", False, "reuse_dispatch_warps"),
+    ],
+)
+def test_moe_ep_sm90_pull_fp8_mega_layer_dispatch_rank_cache_matches_reference(
+    fp8_scale_mode, swap_ab, token_back_mode
+):
+    """The receiver-side dispatch rank cache is bit-exact with the reference.
+
+    Same 8-expert/4-rank/top-4 problem as the dedup test: most tokens route
+    to both experts of some rank, so every outcome of the cache claim (owner
+    publish, published hit copied from the local pool, in-flight fallback to
+    the peer pull) occurs, and every pool row must carry the same bytes as a
+    plain pull.  Blockwise covers the SF-row copy, swap-AB the other layout
+    and reuse_dispatch_warps the dispatch warps shared with the push-back.
+    """
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size < 4:
+        pytest.skip("needs >=4 ranks")
+    rank = _run_mega_layer(
+        rank,
+        world_size,
+        quantize_input=True,
+        fp8_scale_mode=fp8_scale_mode,
+        swap_ab=swap_ab,
+        token_back_mode=token_back_mode,
+        dispatch_rank_cache=True,
+    )
+    print(
+        f"rank {rank}: sm90_fp8_fp8_bf16_pull_cutedsl mega layer "
+        f"({fp8_scale_mode}, swap_ab={swap_ab}, token_back={token_back_mode}, "
+        "dispatch_rank_cache) matches reference"
+    )
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_hopper
+def test_moe_ep_sm90_pull_fp8_mega_layer_dispatch_rank_cache_multi_route():
+    """Rank cache with two-or-three routes per (src_rank, token) and top-6.
+
+    12 experts / 4 ranks (3 local) / top-6: several routes race for one cache
+    entry, so a published entry is hit by more than one later route.
+    """
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size < 4:
+        pytest.skip("needs >=4 ranks")
+    rank = _run_mega_layer(
+        rank,
+        world_size,
+        quantize_input=True,
+        fp8_scale_mode="blockwise",
+        dispatch_rank_cache=True,
+        num_experts=12,
+        topk=6,
+    )
+    print(
+        f"rank {rank}: sm90_fp8_fp8_bf16_pull_cutedsl mega layer "
+        "(dispatch_rank_cache, 12 experts top-6) matches reference"
     )
 
 
