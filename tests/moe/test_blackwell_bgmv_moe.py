@@ -34,8 +34,8 @@ _FP16_SHAPES = [
 def _require_sm100():
     if not torch.cuda.is_available():
         pytest.skip("CUDA is unavailable")
-    if torch.cuda.get_device_capability() != (10, 0):
-        pytest.skip("generated Blackwell BGMV MoE tests require exact SM100")
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("generated Blackwell BGMV MoE tests require SM100, SM103 or SM107")
 
 
 def _make_inputs(hidden_size, num_tokens, dtype, *, arbitrary_routes=False):
@@ -236,7 +236,7 @@ def test_cpu_input_reports_device_requirement():
     x = torch.empty((1, 2688), dtype=torch.bfloat16)
     empty_i64 = torch.empty((1,), dtype=torch.int64)
     empty_f32 = torch.empty((1,), dtype=torch.float32)
-    with pytest.raises(ValueError, match="exact SM100 CUDA device"):
+    with pytest.raises(ValueError, match="SM100-family CUDA device"):
         prepare_bgmv_moe(
             x,
             [],

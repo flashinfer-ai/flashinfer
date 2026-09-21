@@ -370,7 +370,8 @@ def prepare_bgmv_moe(
     """Prepare the generated SM100 BGMV MoE pipeline for graph replay.
 
     This optimized path currently supports one LoRA slice, rank 32, hidden
-    sizes 2688 or 3072, BF16/FP16 inputs, and exact SM100 devices. Routing may
+    sizes 2688 or 3072, BF16/FP16 inputs, and SM100-family devices (SM100,
+    SM103, SM107). Routing may
     be arbitrary; each output has one owner that accumulates routes in fixed
     input order, so identical prepared replays are bitwise reproducible. The
     contiguous top-k=2 layout takes the optimized fast path.
@@ -402,7 +403,7 @@ def prepare_bgmv_moe(
     if (
         not torch.cuda.is_available()
         or not x.is_cuda
-        or torch.cuda.get_device_capability(x.device) != (10, 0)
+        or torch.cuda.get_device_capability(x.device) not in ((10, 0), (10, 3), (10, 7))
     ):
         capability = (
             torch.cuda.get_device_capability(x.device)
@@ -410,7 +411,8 @@ def prepare_bgmv_moe(
             else None
         )
         raise ValueError(
-            "Blackwell BGMV MoE requires an exact SM100 CUDA device; "
+            "Blackwell BGMV MoE requires an SM100-family CUDA device "
+            "(compute capability 10.0, 10.3 or 10.7); "
             f"got capability={capability}"
         )
     if len(lora_a_weights) != 1 or len(lora_b_weights) != 1:
@@ -500,10 +502,12 @@ def prepare_bgmv_moe(
         BLACKWELL_BGMV_MOE_SCHEDULE_IDS,
         get_blackwell_bgmv_moe_module,
         select_blackwell_bgmv_moe_schedule,
+        select_blackwell_bgmv_moe_target,
     )
 
     schedule = select_blackwell_bgmv_moe_schedule(hidden_size, num_tokens)
-    module = get_blackwell_bgmv_moe_module(hidden_size, dtype_name)
+    target = select_blackwell_bgmv_moe_target(x.device)
+    module = get_blackwell_bgmv_moe_module(hidden_size, dtype_name, target)
     return BGMVMoEBlackwellPlan(
         module,
         y_accum=y_accum,
