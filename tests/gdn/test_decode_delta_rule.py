@@ -3973,8 +3973,12 @@ def test_gdn_decode_bf16_state_fla_scatter_padded_pool(
     gated_delta_rule_mtp(**common, initial_state_source=pool_ref)
     torch.cuda.synchronize()
 
-    # Under test: padded pool → slot-slice fallback
-    pool_under_test = pool_padded.clone()
+    # Under test: padded pool → slot-slice fallback. Clone the backing
+    # allocation, not the view: clone() of a non-dense view comes back
+    # contiguous and would take the flat path again.
+    big_under_test = big.clone()
+    pool_under_test = big_under_test[:, :HV, :, :]
+    assert not pool_under_test.is_contiguous()
     gated_delta_rule_mtp(**common, initial_state_source=pool_under_test)
     torch.cuda.synchronize()
 
@@ -3990,6 +3994,16 @@ def test_gdn_decode_bf16_state_fla_scatter_padded_pool(
                 rtol=0,
                 msg=f"padded-pool fallback diverged at (i={i}, t={t}, slot={slot})",
             )
+
+    # The per-slot padding belongs to the caller (vLLM keeps conv state there).
+    torch.testing.assert_close(
+        big_under_test[:, HV:],
+        big[:, HV:],
+        atol=0,
+        rtol=0,
+        equal_nan=True,
+        msg="padded-pool fallback wrote into the per-slot padding",
+    )
 
 
 @pytest.mark.parametrize("max_T", [4, 8])
