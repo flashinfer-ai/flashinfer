@@ -35,27 +35,22 @@ chunk factors to a workspace and reads them back, this variant keeps them in
 shared memory and never leaves the kernel.
 
 Everything this variant owns lives here: its CTA topology, its SMEM images and
-swizzles, its inline PTX, its TMA descriptors, the device kernel, the compiled
-entry, its descriptor and call-plan caches, and its current-stream launch.
-Only the mechanisms it shares with :mod:`.decomp` come from :mod:`.runtime`.
+swizzles, its variant-specific inline PTX, its TMA descriptors, the device
+kernel, the compiled entry, its descriptor and call-plan caches, and its
+current-stream launch.  What it shares with :mod:`.decomp` comes from two
+sibling modules: host mechanisms from :mod:`.runtime`, and the device-side PTX
+wrappers, fragment constants and S128 geometry from :mod:`.device_common`.
 
-The two variants are not folded together and do not import one another.  Their
-layouts, PTX helpers and descriptor encodings diverged far enough that a shared
-spelling would be a shared name over two different meanings -- the fused
+The two variants do not import one another.  A same-named helper whose
+specialization, rounding or barrier ownership differs between them -- the fused
 ``pairwise_a_ptr`` and the decomp ``pairwise_a_fragment_ptr`` address different
-images -- and the plan is explicit that a same-named helper whose
-specialization, rounding or barrier ownership differs stays in its variant.
+images -- stays in its variant rather than becoming one name over two meanings.
 
 The 512-thread CTA topology, the warp role ownership, the SMEM arena, the gate
 numeric boundaries and the state/output alias contract are fixed implementation
 choices shared by the host plan, device code and tests.
 """
 
-import ctypes
-import os
-import threading
-import weakref
-from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any
 
@@ -67,29 +62,76 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import dsl_user_op
 
 from .runtime import (
-    GRAPH_PINS,
-    SM120_CODE_TARGET,
-    BoundedDeviceCache,
-    KDAPrefillValidationError,
     assert_tvm_ffi_dispatched,
+    BoundedDeviceCache,
     build_kernel,
     capturing,
     check_flat_output_range,
-    current_stream_ptr,
+    DESCRIPTOR_BYTES,
+    descriptor_cache_key,
+    DK,
+    DV,
+    execute,
     flat_view,
-    is_exact_alias,
+    GRAPH_PINS,
+    KDAPrefillValidationError,
+    LOG2_E,
     max_grid_dims,
-    resource_cache_token,
+    NORM_FLOOR,
+    PlanMemo,
+    PREFIX_FLOOR,
     require_sm120a,
+    SM120_CODE_TARGET,
     sm120a_compile_options,
-    tensor_identity,
-    tensor_version,
+    STATE_ONLY_PLAN,
+    TensorMapSpec,
+)
+from .device_common import (
+    BF16_SEGMENT_ELEMS,
+    BF16_SEGMENT_STRIDE,
+    BT,
+    F32_GROUP_ELEMS,
+    F32_SEGMENT_ELEMS,
+    F32_SEGMENT_STRIDE,
+    KEY_BLOCKS,
+    STATE_BF16_ROWS_PER_VALUE,
+    STATE_F32_ROWS_PER_VALUE,
+    a_to_b,
+    bf16_round,
+    clear_tail_rows,
+    f16_round,
+    fence_tensormap_acquire,
+    ldmatrix_x2,
+    ldmatrix_x2_trans,
+    ldmatrix_x4,
+    ldmatrix_x4_trans,
+    mma_16x16,
+    mma_16x16_f16,
+    mma_c_coord,
+    mma_n8,
+    movmatrix_b16,
+    mul_bf16x2,
+    pack_bf16x2,
+    pack_f16x2,
+    pairwise_sw32,
+    raw_bf16_s128,
+    raw_f32_s128,
+    state_bf16_idx,
+    stmatrix_x2,
+    stmatrix_x2_trans,
+    stmatrix_x4,
+    store_vec8_bf16,
+    sub_bf16x2,
+    tma_load_3d,
+    tma_store_3d,
+    tma_store_commit_group,
+    tma_store_wait_read,
+    unpack_bf16x2,
+    vec8_bf16,
+    vec_at,
+    warp_arrive,
 )
 
-
-# --------------------------------------------------------------------------
-# Section 1: CTA topology, SMEM arena and barrier ids
-# --------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # Target
@@ -98,19 +140,6 @@ from .runtime import (
 #: The kernel guards on this exactly; other capabilities do not fall back here.
 DEVICE_CC = (12, 0)
 
-#: Production code target.  ``setmaxnreg`` requires an architecture-specific
-#: Blackwell target, so plain ``sm_120`` cannot build a releasable kernel
-#:.  This string is part of the compile cache key.
-CODE_TARGET = "sm_120a"
-
-# ---------------------------------------------------------------------------
-# Problem geometry
-# ---------------------------------------------------------------------------
-
-BT = 16
-DK = 128
-DV = 128
-
 # ---------------------------------------------------------------------------
 # CTA shape and warp ownership
 # ---------------------------------------------------------------------------
@@ -118,7 +147,7 @@ DV = 128
 THREADS = 512
 WARPS = 16
 
-#: W0-W3 gate/norm/materialize, and produce Ak.T.
+#: W0-W3 gate, normalize and materialize Qd/Kd/Ki.
 PREPARE_WARPS = 4
 #: W4-W11, each permanently owning 16 value columns of the recurrent state.
 RECURRENCE_WARPS = 8
@@ -130,144 +159,53 @@ WARP_VALUES = DV // RECURRENCE_WARPS  # 16
 TMA_WARP = 12
 QK_WARP = 13
 IO_WARP = 14
-INV_WARP = 15
 
-#: Key dimensions one prepare warp owns: ``[32 * p, 32 * p + 32)``.
-PREPARE_WARP_DIMS = DK // PREPARE_WARPS  # 32
-
-#: ``m16n8k16`` steps of one ``[16, 128] @ [128, *]`` reduction.
-KEY_BLOCKS = DK // BT  # 8
 
 # ---------------------------------------------------------------------------
-# Warpgroup register budgets -- REQUESTED, NOT GRANTED
+# Warpgroup register budgets
 #
-# These four numbers describe the redistribution the design asks for.  It does
-# not currently happen -- but not for the reason recorded here earlier, and the
-# real reason is addressable.
-#
-# The DSL is not at fault.  Dumped at all three levels, on 4.3 and 4.7 alike,
-# the MLIR carries three ``setmaxregister`` ops and the PTX carries three
-# ``setmaxnreg`` instructions with exactly the immediates below -- 120, 64, 160.
-# They vanish between PTX and SASS, and ptxas says why:
-#
-#     (C7508) Potential Performance Loss: 'setmaxnreg' ignored;
-#             unable to determine register count at entry.
-#
-# Not "unsupported on this target".  sm_120a *does* have the instruction; it is
-# spelled ``USETMAXREG.DEALLOC.CTAPOOL`` / ``USETMAXREG.TRY_ALLOC.CTAPOOL``
-# rather than Hopper's ``SETMAXNREG``, which is why an earlier search of this
-# kernel's SASS for the Hopper mnemonic returned a confident zero.  Feed ptxas
-# a minimal kernel with ``.maxnreg 128`` and both forms appear in the SASS.
-#
-# What our PTX lacks is that entry bound: it carries ``.reqntid`` from the block
-# size and no ``.maxnreg``, so ptxas cannot compute the post-dec/inc budget and
-# drops the request.  See the ``min_blocks_per_mp`` note below -- that is the
-# one knob the DSL exposes that would supply it, and the measurement recorded
-# there was taken while ``setmaxnreg`` was silently a no-op, so it does not yet
-# say what the pair of them does together.
-#
-# Until the bound is supplied, every warp gets ``LAUNCH_MAXNREG`` and nothing
-# else.  The consequence is not cosmetic: a recurrence warp holds 96 registers
-# of state (h32's 64 plus h16's 32) inside 128, leaving ~32 to work in, and
-# ptxas spills four of them once per chunk.  Those four instructions are 0.1% of
-# the instruction count and 93.8% of the L1TEX sector requests, because local
-# memory is per-thread and a warp's 32 lanes land on 32 separate sectors.
-#
-# Raising these constants alone does nothing -- three variants that
-# redistributed the 1,024 registers the budget leaves free measured
-# byte-identical spill, which is exactly what a dropped instruction predicts.
+# The ``setmaxnreg`` immediates the kernel issues after barrier init.  They are
+# requested, not granted: the PTX carries no ``.maxnreg`` entry bound, so ptxas
+# cannot compute the post-dec/inc budget and drops the instructions.  Every
+# warp therefore runs on the uniform launch budget of 128 registers per thread
+# (``THREADS * 128`` is the whole register file), and a recurrence warp keeps
+# its 96 registers of state (h32's 64 plus h16's 32) inside that.
+# ---------------------------------------------------------------------------
 WG0_MAXNREG = 120  # W0-W3   prepare
-WG1_MAXNREG = 160  # W4-W7   recurrence
-WG2_MAXNREG = 160  # W8-W11  recurrence
+WG1_MAXNREG = 160  # W4-W11  recurrence
 WG3_MAXNREG = 64  # W12-W15 TMA, QK/Aq, I/O, KK/inverse
 
-#: Registers the launch reserves per thread before redistribution.
-LAUNCH_MAXNREG = 128
-
-#: What the requested split would have cost, kept only so the test that pins
-#: it against the pool keeps meaning something.  The *actual* allocation is
-#: uniform: ``THREADS * LAUNCH_MAXNREG == 512 * 128 == 65,536``, the whole file.
-CTA_REGISTER_BUDGET = (
-    4 * WG0_MAXNREG + 4 * WG1_MAXNREG + 4 * WG2_MAXNREG + 4 * WG3_MAXNREG
-) * 32
-
-#: The allocation that actually happens, every warp alike.
-CTA_REGISTERS_ACTUAL = THREADS * LAUNCH_MAXNREG
-CTA_REGISTER_POOL = 65536
 
 # ---------------------------------------------------------------------------
 # SMEM arena
 # ---------------------------------------------------------------------------
 
-MAIN_SLOTS = 3
+#: Four: with three, the TMA producer sat on the slot-free wait while prepare
+#: waited on ``qkg_ready`` -- it was short of a slot to write into, not of
+#: bandwidth.  The fourth slot fits in the arena the CTA already owns.
+MAIN_SLOTS = 4
 MAIN_SLOT_BYTES = 16384
-V_STAGES = 3
+
+#: Must equal :data:`MAIN_SLOTS`.  ``tma_role`` and ``recurrence_role`` index
+#: the V stage with ``main_slot(c)``, the *main* slot index, so a shorter V
+#: ring is an out-of-bounds read rather than a smaller ring.
+V_STAGES = MAIN_SLOTS
 V_STAGE_BYTES = 4096
 
-MAIN_OFFSET = 0
-V_STAGE_OFFSET = MAIN_SLOTS * MAIN_SLOT_BYTES  # 49152
-CONTROL_OFFSET = V_STAGE_OFFSET + V_STAGES * V_STAGE_BYTES  # 61440
+V_STAGE_OFFSET = MAIN_SLOTS * MAIN_SLOT_BYTES  # 65536
+CONTROL_OFFSET = V_STAGE_OFFSET + V_STAGES * V_STAGE_BYTES  # 81920
 CONTROL_BYTES = 1024
 
-DYNAMIC_SMEM_BYTES = CONTROL_OFFSET + CONTROL_BYTES  # 62464
+DYNAMIC_SMEM_BYTES = CONTROL_OFFSET + CONTROL_BYTES  # 82944
 
-#: SM120's per-CTA opt-in maximum.  The arena deliberately leaves 38,912 B
-#: unused rather than adding a fourth main_slot.
-SM120_SMEM_LIMIT = 101376
-
-#: The design target and the acceptance result alike -- but deliberately *not*
-#: passed to the launch as ``min_blocks_per_mp``.
-#:
-#: ``__launch_bounds__(512, 1)`` tells ptxas it may use at most 65,536 / 512 =
-#: 128 registers per thread.  Measured on GB202: constraining it costs 6,457
-#: local-memory instructions against 240 without, so it stays off.
-#:
-#: The original reasoning here was that the bound would defeat
-#: ``setmaxnreg.inc``.  Read again, that has it backwards: an entry register
-#: count is the *precondition* for ``setmaxnreg`` rather than an obstacle to it,
-#: and this is the only knob the DSL offers that supplies one.
-#:
-#: That pairing has now been measured, and it settles the question against the
-#: split.  With ``min_blocks_per_mp=1`` the PTX gains ``.minnctapersm``, ptxas
-#: stops reporting C7508, and three ``USETMAXREG.*.CTAPOOL`` appear in the SASS:
-#: the manual 120/64/160 split is honoured, exactly as designed.  It is also
-#: 1.23x to 1.72x slower, median 1.62x, on seven shapes, bit-identical output,
-#: 68/68 GPU tests passing.
-#:
-#: The SASS says why.  ``setmaxnreg`` moves a *runtime* hardware budget, but
-#: ptxas assigns register *numbers* statically, once, for a kernel body that all
-#: sixteen warps enter.  It must therefore satisfy the smallest warpgroup, and
-#: WG3 asks for 64 -- so the whole kernel is compiled into 61 registers and
-#: spills, 241 LDL and 148 STL against zero without the bound.  The recurrence
-#: warps' extra registers exist at runtime and are unreachable, because nothing
-#: was ever numbered above R61.
-#:
-#: This is the real obstacle, and it is structural rather than a missing flag:
-#: warp-specialized register redistribution needs ptxas to compile per-role
-#: register footprints, which one function entered by every role does not give
-#: it.  The bound stays off.
-#:
-#: Worth noting separately: the shipped build does not spill at all.  DSL 4.7
-#: compiles this kernel to R123 with zero LDL and zero STL, 4.3 to R125 with one
-#: LDL and three STL.  The spill this note used to be about is gone.
-#:
-#: Dropping the bound costs no occupancy.  62,464 B of dynamic shared memory
-#: already limits this kernel to one CTA per SM on its own, which NCU confirms
-#: (``launch__occupancy_limit_shared_mem == 1``).
-MIN_BLOCKS_PER_MP = 1
 
 # ---------------------------------------------------------------------------
-# Main main_slot phases, relative to ``16384 * main_slot``
+# Main slot phases, relative to ``MAIN_SLOT_BYTES * main_slot(c)``
 # ---------------------------------------------------------------------------
 
-SLOT_Q = 0  # Qraw -> Qd -> O
 SLOT_K = 4096  # Kraw -> Kd
 SLOT_G_LO = 8192  # raw G / E lower -> Ki -> Ak.T
-SLOT_G_HI = 12288  # raw G / E upper -> factor records
 
-#: Aliases naming the phase a consumer actually addresses.
-SLOT_QD = SLOT_Q
-SLOT_OUT = SLOT_Q
 SLOT_KD = SLOT_K
 SLOT_KI = SLOT_G_LO
 SLOT_AKT = SLOT_G_LO
@@ -276,36 +214,33 @@ SLOT_AKT = SLOT_G_LO
 SLOT_AINV_BETA = 12288  # [16, 16] BF16 SW32, 512 B
 SLOT_AQ = 12800  # [16, 16] BF16 SW32, 512 B
 SLOT_GTOTAL = 13312  # [128]    FP32,      512 B
-SLOT_RESERVED = 13824  # production must not touch [13824, 16384)
 
 # ---------------------------------------------------------------------------
-# Control arena, relative to CONTROL_OFFSET
+# Control arena, relative to CONTROL_OFFSET.  It holds the mbarriers, from
+# offset 0; the rest of it is unused.
 # ---------------------------------------------------------------------------
 
-#: 128 B per main_slot: 16 FP32 q_inv then 16 FP32 k_inv.
-SCRATCH_OFFSET = 0
-SCRATCH_SLOT_BYTES = 128
-SCRATCH_K_INV = 64
+#: One mbarrier per main slot per event, eight bytes each.  Derived from the
+#: slot count so that raising ``MAIN_SLOTS`` cannot overlap one event's
+#: barriers with the next event's.
+_BAR_STRIDE = MAIN_SLOTS * 8  # 32
 
-BARRIER_OFFSET = 384
-
-#: ``(relative byte offset, arrival count)``; ``None`` marks a transaction
-#: barrier, which is initialized with an arrival count of 1 and completed by
-#: ``arrive_expect_tx``.  Every event but ``state_io`` has one object per main_slot.
-BAR_QKG_READY = 384
-BAR_V_READY = 408
-BAR_MATERIALIZED = 432
-BAR_QK_DONE = 456
-BAR_AINV_READY = 480
-BAR_AQ_READY = 504
-BAR_AK_READY = 528
-BAR_PROJECTION_DONE = 552
-BAR_R_FORMED = 576
-BAR_OUTPUT_READY = 600
-BAR_OUTPUT_READ_DONE = 624
-BAR_STATE_DONE = 648
-BAR_STATE_IO = 672
-BAR_RESERVED = 680
+#: Byte offset of each event's barrier group, relative to ``CONTROL_OFFSET``.
+#: Every event but ``state_io`` has one mbarrier per main slot.  ``qkg_ready``,
+#: ``v_ready`` and ``state_io`` are transaction barriers: arrival count 1,
+#: completed by ``arrive_expect_tx``.  Group index 3 is unused.
+BAR_QKG_READY = 0 * _BAR_STRIDE
+BAR_V_READY = 1 * _BAR_STRIDE
+BAR_MATERIALIZED = 2 * _BAR_STRIDE
+BAR_AINV_READY = 4 * _BAR_STRIDE
+BAR_AQ_READY = 5 * _BAR_STRIDE
+BAR_AK_READY = 6 * _BAR_STRIDE
+BAR_PROJECTION_DONE = 7 * _BAR_STRIDE
+BAR_R_FORMED = 8 * _BAR_STRIDE
+BAR_OUTPUT_READY = 9 * _BAR_STRIDE
+BAR_OUTPUT_READ_DONE = 10 * _BAR_STRIDE
+BAR_STATE_DONE = 11 * _BAR_STRIDE
+BAR_STATE_IO = 12 * _BAR_STRIDE
 
 #: Arrival counts.  Transaction barriers take 1.
 ARRIVALS_TX = 1
@@ -313,22 +248,16 @@ ARRIVALS_PREPARE = PREPARE_WARPS  # 4
 ARRIVALS_RECURRENCE = RECURRENCE_WARPS  # 8
 ARRIVALS_SINGLE = 1
 
-#: ``(name, byte offset, arrivals, per-main_slot)`` .3 table order.
-BARRIER_TABLE = (
-    ("qkg_ready", BAR_QKG_READY, ARRIVALS_TX, True),
-    ("v_ready", BAR_V_READY, ARRIVALS_TX, True),
-    ("materialized", BAR_MATERIALIZED, ARRIVALS_PREPARE, True),
-    ("qk_done", BAR_QK_DONE, ARRIVALS_SINGLE, True),
-    ("ainv_ready", BAR_AINV_READY, ARRIVALS_SINGLE, True),
-    ("aq_ready", BAR_AQ_READY, ARRIVALS_SINGLE, True),
-    ("ak_ready", BAR_AK_READY, ARRIVALS_PREPARE, True),
-    ("projection_done", BAR_PROJECTION_DONE, ARRIVALS_RECURRENCE, True),
-    ("r_formed", BAR_R_FORMED, ARRIVALS_RECURRENCE, True),
-    ("output_ready", BAR_OUTPUT_READY, ARRIVALS_RECURRENCE, True),
-    ("output_read_done", BAR_OUTPUT_READ_DONE, ARRIVALS_SINGLE, True),
-    ("state_done", BAR_STATE_DONE, ARRIVALS_RECURRENCE, True),
-    ("state_io", BAR_STATE_IO, ARRIVALS_TX, False),
-)
+#: ``ainv_ready`` counts two: W15 arrives when AinvBeta exists, W13 when it has
+#: finished reading ``Ki``.  The Ak.T stores need *both* before they may
+#: overwrite Ki, so one barrier carries both conditions.
+ARRIVALS_AINV_READY = 2
+
+#: ``ak_ready`` counts two: W13 and W14 publish two Ak.T strips each.  The 2/2
+#: split is also an SMSP split; putting all four strips on one warp slowed
+#: every warp sharing its SMSP.  See ``qk_role`` and ``io_role``.
+ARRIVALS_AK = 2
+
 
 #: The prepare group's named barrier: ``bar.sync 1, 128``.
 PREPARE_BARRIER_ID = 1
@@ -352,21 +281,18 @@ STATE_F32_WINDOWS = 4
 # Numeric constants
 # ---------------------------------------------------------------------------
 
-LOG2_E = 1.4426950408889634
-PREFIX_FLOOR = -126.0
-NORM_FLOOR = 1.0e-24
 SOFTPLUS_CUT = 20.0
 
 #: ``lower_bound`` is validated against this closed interval, not compiled in.
 LOWER_BOUND_RANGE = (-5.0, 0.0)
 
 # ---------------------------------------------------------------------------
-# Three-main_slot phase algebra
+# Slot and phase algebra
 # ---------------------------------------------------------------------------
 
 
 def main_slot(chunk: int) -> int:
-    """Main main_slot and V stage index of chunk ``chunk``.
+    """Main slot and V stage index of chunk ``chunk``.
 
     Spelled without ``%`` so the identical expression evaluates for a Python
     ``int`` on the host and for a ``cutlass.Int32`` on the device.
@@ -375,7 +301,7 @@ def main_slot(chunk: int) -> int:
 
 
 def generation(chunk: int) -> int:
-    """How many times chunk ``chunk``'s main_slot has been used before it."""
+    """How many times chunk ``chunk``'s main slot has been used before it."""
     return chunk // MAIN_SLOTS
 
 
@@ -389,7 +315,7 @@ def ready_parity(chunk: int) -> int:
 
 
 def reuse_parity(chunk: int) -> int:
-    """Phase a *producer* waits on before overwriting chunk ``chunk``'s main_slot.
+    """Phase a *producer* waits on before overwriting chunk ``chunk``'s main slot.
 
     Generation 0 yields 1, which passes immediately against a freshly
     initialized phase-0 barrier.  That is what lets W12 run one uniform loop
@@ -398,103 +324,29 @@ def reuse_parity(chunk: int) -> int:
     return 1 ^ ((chunk // MAIN_SLOTS) & 1)
 
 
-def chunks_for_seqlen(seqlen: int) -> int:
-    return (seqlen + BT - 1) // BT
-
-
 def grid(sequences: int, heads: int) -> tuple[int, int, int]:
     """One CTA per ``(sequence, head)``."""
     return (sequences, heads, 1)
 
 
 # --------------------------------------------------------------------------
-# Section 2: SMEM images and fragment maps
+# SMEM images and fragment maps
 # --------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # S128 image parameters
 # ---------------------------------------------------------------------------
 
-#: A 128-byte segment is 64 BF16 or 32 FP32; a 16-byte group is 8 or 4.
-BF16_SEGMENT_ELEMS = 64
-BF16_GROUP_ELEMS = 8
-BF16_SEGMENTS = DK // BF16_SEGMENT_ELEMS  # 2
-BF16_SEGMENT_STRIDE = BT * BF16_SEGMENT_ELEMS  # 1024 elements
-
-F32_SEGMENT_ELEMS = 32
-F32_GROUP_ELEMS = 4
-F32_SEGMENTS = DK // F32_SEGMENT_ELEMS  # 4
-F32_SEGMENT_STRIDE = BT * F32_SEGMENT_ELEMS  # 512 elements
 
 #: Constant coordinate permutations.  A constant XOR of a *coordinate* is not
 #: expressible as a CuTe ``Swizzle`` (which only folds higher offset bits into
 #: lower ones), so these stay explicit transforms outside the layout objects.
 AK_TOKEN_XOR = BT // 2  # 8
-PAIRWISE_COL_XOR = 8
-PAIRWISE_ROW_STRIDE = BT
-
-#: Rows of the state image one value spans, by element width.
-STATE_BF16_ROWS_PER_VALUE = DK // BF16_SEGMENT_ELEMS  # 2
-STATE_F32_ROWS_PER_VALUE = DK // F32_SEGMENT_ELEMS  # 4
-
-#: Value columns one FP32 boundary window carries.
-STATE_F32_WINDOW_VALUES = 32
-
-SWIZZLE_S128_BYTES = (3, 4, 3)
-SWIZZLE_SW32_BYTES = (1, 4, 3)
 
 
 # ---------------------------------------------------------------------------
-# Section 4.1-4.5: SMEM images
+# SMEM images
 # ---------------------------------------------------------------------------
-
-
-def raw_bf16_s128(row, dim):
-    """BF16 element index of logical ``(row, dim)`` in a ``[16, 128]`` tile.
-
-    The image behind Q, K, V, Qd, Kd, Ki and O.  Byte-unit
-    swizzle ``Swizzle<3, 4, 3>``.
-    """
-    segment = dim // BF16_SEGMENT_ELEMS
-    local = dim - segment * BF16_SEGMENT_ELEMS
-    group = local // BF16_GROUP_ELEMS
-    inner = local - group * BF16_GROUP_ELEMS
-    return (
-        segment * BF16_SEGMENT_STRIDE
-        + row * BF16_SEGMENT_ELEMS
-        + (group ^ (row & 7)) * BF16_GROUP_ELEMS
-        + inner
-    )
-
-
-def raw_f32_s128(row, dim):
-    """FP32 element index of logical ``(row, dim)``.
-
-    Raw ``G`` lands here.  ``E`` overwrites the same region but no longer at the
-    same addresses -- see :func:`gate_e_f32` -- which is why the rendezvous
-    between the gate's reads and its stores is now unconditional.
-    """
-    segment = dim // F32_SEGMENT_ELEMS
-    local = dim - segment * F32_SEGMENT_ELEMS
-    group = local // F32_GROUP_ELEMS
-    inner = local - group * F32_GROUP_ELEMS
-    return (
-        segment * F32_SEGMENT_STRIDE
-        + row * F32_SEGMENT_ELEMS
-        + (group ^ (row & 7)) * F32_GROUP_ELEMS
-        + inner
-    )
-
-
-def pairwise_sw32(row, col):
-    """BF16 element index of a ``[16, 16]`` pairwise tile.
-
-    Carries ``AinvBeta`` and ``Aq``.  The ``col ^ 8`` term is a coordinate
-    permutation applied before the SW32 swizzle.
-    """
-    storage_col = col ^ PAIRWISE_COL_XOR
-    byte0 = 2 * (PAIRWISE_ROW_STRIDE * row + storage_col)
-    return (byte0 ^ (((byte0 >> 7) & 1) << 4)) // 2
 
 
 def ak_t_s128(token, key):
@@ -506,24 +358,6 @@ def ak_t_s128(token, key):
     ``ldmatrix.x4.trans`` and no register shuffle afterwards.
     """
     return raw_bf16_s128(token ^ AK_TOKEN_XOR, key)
-
-
-def state_bf16_idx(v, k):
-    """BF16 element index of external state ``[V, K]`` element ``(v, k)``.
-
-    ``v`` is the CTA-global value in ``[0, 128)``: the two
-    16 KiB halves are main slots 0 and 1, which are adjacent, so one index
-    function spans both.  The unswizzled address is ``v * 128 + k`` -- physical
-    ``[V, K]`` row-major and logical ``[K, V]`` column-major at once, which is
-    what lets an external ``[V, K]`` state land by TMA with no transpose and
-    still be read as ``H[K, V]``.
-    """
-    segment = k // BF16_SEGMENT_ELEMS
-    local = k - segment * BF16_SEGMENT_ELEMS
-    line = STATE_BF16_ROWS_PER_VALUE * v + segment
-    group = local // BF16_GROUP_ELEMS
-    inner = local - group * BF16_GROUP_ELEMS
-    return line * BF16_SEGMENT_ELEMS + (group ^ (line & 7)) * BF16_GROUP_ELEMS + inner
 
 
 def state_f32_window_idx(v_local, k):
@@ -540,63 +374,9 @@ def state_f32_window_idx(v_local, k):
     return line * F32_SEGMENT_ELEMS + (group ^ (line & 7)) * F32_GROUP_ELEMS + inner
 
 
-def gtotal_idx(k):
-    """``GTotal`` is a contiguous FP32 ``[128]`` record with no swizzle."""
-    return k
-
-
 # ---------------------------------------------------------------------------
-# Section 4.6: H register layout
+# H register layout
 # ---------------------------------------------------------------------------
-
-
-def h32_idx(kb, nb, reg):
-    """Flat index of FP32 master-state register ``(kb, nb, reg)``, 64 per lane."""
-    return (kb * 2 + nb) * 4 + reg
-
-
-def h16_idx(kb, nb, reg):
-    """Flat index of packed BF16 state register ``(kb, nb, reg)``, 32 per lane."""
-    return (kb * 2 + nb) * 2 + reg
-
-
-def h32_coord(lane, kb, nb, reg, v_base):
-    """Logical ``(k, v)`` of FP32 state register ``(kb, nb, reg)``.
-
-    The native C map of an ``m16n8k16`` tile whose rows are keys and whose
-    columns are the eight values at ``v_base + 8 * nb``.
-    """
-    g = lane >> 2
-    q = lane & 3
-    k = kb * BT + g + 8 * (reg >> 1)
-    v = v_base + 8 * nb + 2 * q + (reg & 1)
-    return (k, v)
-
-
-def h16_pair_coords(lane, kb, nb, reg, v_base):
-    """The two ``(k, v)`` coordinates packed into H16 register ``reg``.
-
-    H16 register ``reg`` holds ``pack(c[2 * reg], c[2 * reg + 1])``, which is
-    one key row and two adjacent values.
-    """
-    return (
-        h32_coord(lane, kb, nb, 2 * reg, v_base),
-        h32_coord(lane, kb, nb, 2 * reg + 1, v_base),
-    )
-
-
-def h_b_coords(lane, kb, nb, reg, v_base):
-    """The two ``(k, v)`` coordinates of B register ``reg`` after ``movmatrix``.
-
-    ``movmatrix.sync.aligned.m8n8.trans.b16`` on each of the
-    two packed H16 registers is a bitwise C-to-B conversion, so no rounding
-    happens here and the projection reads the state the MMA's B operand wants.
-    """
-    g = lane >> 2
-    q = lane & 3
-    k = kb * BT + 2 * q + 8 * reg
-    v = v_base + 8 * nb + g
-    return ((k, v), (k + 1, v))
 
 
 # ---------------------------------------------------------------------------
@@ -632,22 +412,14 @@ def h32t_coord(lane, kt, reg, v_base):
     """Logical ``(k, v)`` of transposed FP32 state register ``(kt, reg)``.
 
     The native C map of an ``m16n8k16`` tile whose rows are *values* and whose
-    columns are the eight keys at ``8 * kt`` -- the transpose of
-    :func:`h32_coord`.
+    columns are the eight keys at ``8 * kt``.  Each lane carries two adjacent
+    keys for each of two values separated by eight rows.
     """
     g = lane >> 2
     q = lane & 3
     v = v_base + g + 8 * (reg >> 1)
     k = HT_TILE_KEYS * kt + 2 * q + (reg & 1)
     return (k, v)
-
-
-def h16t_pair_coords(lane, kt, reg, v_base):
-    """The two ``(k, v)`` coordinates packed into transposed H16 register."""
-    return (
-        h32t_coord(lane, kt, 2 * reg, v_base),
-        h32t_coord(lane, kt, 2 * reg + 1, v_base),
-    )
 
 
 def h_a_reg(j, r):
@@ -690,9 +462,8 @@ def gtotal_shuffle_source(lane, kt, half):
 def ak_b_ptr(lane, j):
     """``Ak.T`` ``ldmatrix.x4.trans`` producing the ``[token, key]`` B operand.
 
-    :func:`ak_a_ptr` delivers the A operand the un-transposed recurrence wants;
-    the transposed one needs Ak as B, and the image is contiguous in key while
-    a B register wants two adjacent *tokens*, hence ``.trans``.
+    The transposed recurrence needs Ak as B.  The image is contiguous in key,
+    while a B register wants two adjacent *tokens*, hence ``.trans``.
     """
     r = lane >> 3
     token = lane - 8 * r
@@ -702,7 +473,7 @@ def ak_b_ptr(lane, j):
 def state_x2t_ptr(lane, kt, value_base):
     """Boundary-state ``ldmatrix.x2`` / ``stmatrix.x2``, transposed recurrence.
 
-    No ``.trans``, unlike :func:`state_x2_ptr`.  The image is physically
+    No ``.trans``: the image is physically
     ``[V, K]`` and the transposed C tile wants one value and two adjacent keys,
     which is the image's own contiguous direction -- the transpose that the
     un-transposed recurrence needed here disappears with it.
@@ -737,32 +508,8 @@ def vo_x2t_ptr(lane, value_base, nb):
 
 
 # ---------------------------------------------------------------------------
-# Section 9.1: native m16n8k16 fragment coordinates
+# Native m16n8k16 fragment coordinates
 # ---------------------------------------------------------------------------
-
-
-def mma_a_coords(lane, reg):
-    """Logical ``(row, k)`` of the two 16-bit halves in A register ``reg``."""
-    g = lane >> 2
-    q = lane & 3
-    row = g + 8 * (reg & 1)
-    k = 2 * q + 8 * (reg >> 1)
-    return ((row, k), (row, k + 1))
-
-
-def mma_b_coords(lane, reg):
-    """Logical ``(k, n)`` of the two 16-bit halves in B register ``reg``."""
-    g = lane >> 2
-    q = lane & 3
-    k = 2 * q + 8 * reg
-    return ((k, g), (k + 1, g))
-
-
-def mma_c_coord(lane, reg, n_base=0):
-    """Logical ``(row, n)`` of FP32 accumulator register ``reg``."""
-    g = lane >> 2
-    q = lane & 3
-    return (g + 8 * (reg >> 1), n_base + 2 * q + (reg & 1))
 
 
 def mma_c16_coord(lane, slot):
@@ -776,14 +523,13 @@ def mma_c16_coord(lane, slot):
 
 
 # ---------------------------------------------------------------------------
-# Section 9.2: SMEM pointer maps
+# SMEM pointer maps
 #
 # ``factor_a_ptr`` and ``ki_b_ptr`` are NOT the same lane map.  The A map takes
 # its row half from ``m & 1`` and its column half from ``m >> 1``; the B map
 # takes the row half from lane bit 4 and the column half from lane bit 3.  Using
 # the A map with a ``.trans`` modifier in place of the B map silently
-# transposes the operand, which is why the two are separate functions and why
-# the plan pins an exhaustive probe on the difference.
+# transposes the operand, which is why the two are separate functions.
 # ---------------------------------------------------------------------------
 
 
@@ -815,14 +561,6 @@ def pairwise_a_ptr(lane):
 pairwise_store_ptr = pairwise_a_ptr
 
 
-def ak_a_ptr(lane, kb):
-    """Ak.T ``ldmatrix.x4.trans`` producing the ``[key, token]`` A operand."""
-    m = lane // 8
-    logical_t = 8 * (m >> 1) + (lane - m * 8)
-    key = BT * kb + 8 * (m & 1)
-    return raw_bf16_s128(logical_t ^ AK_TOKEN_XOR, key)
-
-
 def ak_store_ptr(lane, key_base):
     """``stmatrix.x4`` of one ``[16, 16]`` Ak.T tile at ``key_base``."""
     m = lane // 8
@@ -831,47 +569,8 @@ def ak_store_ptr(lane, key_base):
     return ak_t_s128(token, key)
 
 
-def vo_x2_ptr(lane, value_base):
-    """V ``ldmatrix.x2`` / O ``stmatrix.x2`` over a ``[16, 8]`` value block.
-
-    Non-transposed in both directions: the stage is token-major and the C
-    tile's rows are tokens, so the load and the store share this map.
-    """
-    matrix = (lane // 8) & 1
-    token = (lane - (lane // 8) * 8) + 8 * matrix
-    return raw_bf16_s128(token, value_base)
-
-
-def state_x2_ptr(lane, kb, value_base):
-    """Boundary-state ``ldmatrix.x2.trans`` / ``stmatrix.x2.trans`` map.
-
-    The state image is physically ``[V, K]``; ``.trans`` turns those 16 rows
-    into the ``[K, V]`` C tile the registers hold, so the prologue load and the
-    epilogue store use one map and differ only in instruction direction.  Lanes
-    16-31 are ignored by an x2 copy.
-    """
-    matrix = (lane // 8) & 1
-    v = value_base + (lane - (lane // 8) * 8)
-    key = BT * kb + 8 * matrix
-    return state_bf16_idx(v, key)
-
-
-def state_f32_window_reg_coord(lane, kb, nb, reg, local_v_base):
-    """``(v_local, k)`` an FP32 boundary window read/writes for H32 ``reg``.
-
-    the FP32 boundary has no matrix-copy path, so
-    each lane addresses its four accumulator elements individually through
-    :func:`state_f32_window_idx`.
-    """
-    g = lane >> 2
-    q = lane & 3
-    k = BT * kb + g + 8 * (reg >> 1)
-    v_local = local_v_base + 8 * nb + 2 * q + (reg & 1)
-    return (v_local, k)
-
-
 # ---------------------------------------------------------------------------
-# Section 3.5: prepare-warp ownership
+# Prepare-warp ownership
 # ---------------------------------------------------------------------------
 
 
@@ -883,18 +582,6 @@ def gate_owner_dim(warp, lane):
 def norm_row(warp, lane):
     """Token row lane ``lane`` of prepare warp ``warp`` helps normalize."""
     return 4 * warp + (lane // 8)
-
-
-def norm_dims(lane):
-    """The 16 feature indices a norm lane squares, in accumulation order.
-
-    The order is part of the contract: the FP32 sum is not reassociated, so a
-    different traversal is a different number.
-    """
-    lane_in_row = lane & 7
-    return [8 * lane_in_row + i for i in range(8)] + [
-        64 + 8 * lane_in_row + i for i in range(8)
-    ]
 
 
 def materialize_coords(warp, lane, j, nb, r):
@@ -918,42 +605,6 @@ E_GROUP_ELEMS = 4
 E_GROUPS = BT // E_GROUP_ELEMS  # 4
 
 
-def gate_e_group_xor(key):
-    """Token-group permutation of ``key`` in the E image.
-
-    Two *separated* key bit pairs, not one.  The store's phase holds eight
-    consecutive keys and the load's holds four keys eight apart, and a
-    permutation driven by ``key & 3`` alone leaves whichever of the two it does
-    not address two-way conflicted.  Folding ``key >> 2`` in as well is what
-    makes both conflict-free at once.
-    """
-    return (key ^ (key >> 2)) & 3
-
-
-def gate_e_f32(key, token):
-    """FP32 element index of E at ``(key, token)`` in a ``[128, 16]`` tile.
-
-    E is *transposed* relative to the raw G image it overwrites: raw G arrives
-    from TMA as ``[token, key]`` because that is what TMA lands, but both sides
-    of E's exchange walk along ``token`` -- the gate owns one key and writes
-    sixteen tokens, the materializer wants two adjacent tokens at one key.  A
-    ``[key, token]`` image makes each side contiguous, turning sixteen scalar
-    stores into four vector ones and sixteen scalar loads into eight pair
-    loads.
-
-    The permutation above is a constant XOR of a *coordinate*, like
-    :data:`AK_TOKEN_XOR`, not a CuTe ``Swizzle``.  ``token``'s low two bits are
-    left alone so a token pair ``(t, t + 1)`` with even ``t`` stays adjacent,
-    which is what the materializer's pair load requires.
-
-    Total size is ``128 * 16 * 4 = 8192`` bytes, exactly ``SLOT_G_LO``: the
-    conflict-free form needs no padding.
-    """
-    group = token // E_GROUP_ELEMS
-    inner = token - group * E_GROUP_ELEMS
-    return BT * key + E_GROUP_ELEMS * (group ^ gate_e_group_xor(key)) + inner
-
-
 def materialize_b_ptr(warp, lane, j):
     """Raw Q/K ``ldmatrix.x4.trans`` delivering :func:`materialize_coords`.
 
@@ -967,44 +618,14 @@ def materialize_b_ptr(warp, lane, j):
     The eight elements each addressed row contributes are keys ``base`` to
     ``base + 7`` of one token, and :func:`raw_bf16_s128` is contiguous in
     ``dim`` inside an eight-aligned group, so the S128 swizzle is absorbed
-    entirely into the row address -- unlike :func:`ak_a_ptr`, no coordinate
-    XOR is needed.
+    entirely into the row address.  Raw Q/K need no token-coordinate XOR,
+    unlike the Ak.T image.
     """
     reg = lane >> 3
     row = lane - 8 * reg
     nb = reg >> 1
     r = reg - 2 * nb
     return raw_bf16_s128(8 * r + row, 32 * warp + BT * j + 8 * nb)
-
-
-def kr_b_coords(warp, lane, j, nb, r):
-    """The two ``(token, key)`` coordinates of Kr B register ``2 * nb + r``.
-
-    Identical to :func:`materialize_coords`; named separately because plan
-    Section 9.3 pins the Kr B-fragment mapping as its own contract -- Kr is the
-    one factor that is never published to SMEM, so this map is the only
-    definition of where its values live.
-    """
-    t0, t1, key = materialize_coords(warp, lane, j, nb, r)
-    return ((t0, key), (t1, key))
-
-
-# ---------------------------------------------------------------------------
-# Section 9.3: fixed register permutations
-# ---------------------------------------------------------------------------
-
-#: A-layout -> B-layout of the same matrix: transpose each 8x8 quadrant.
-MOVMATRIX_A_TO_B = (0, 1, 2, 3)
-
-#: A-layout -> A-layout of the transpose: the off-diagonal quadrants exchange.
-MOVMATRIX_A_TO_AT = (0, 2, 1, 3)
-
-#: C-layout -> B-layout of a packed 16x8 tile (H16 and the residual R).
-MOVMATRIX_C_TO_B = (0, 1)
-
-#: Quadrant order of the packed A fragment the inverse chain works in
-#:: top-left, bottom-left, top-right, bottom-right.
-INVERSE_FRAG_QUADRANTS = ("TL", "BL", "TR", "BR")
 
 
 # ---------------------------------------------------------------------------
@@ -1026,45 +647,8 @@ def beta_global_index(token, head, heads):
     return token * heads + head
 
 
-# ---------------------------------------------------------------------------
-# CuTe layout objects (TMA descriptors only)
-# ---------------------------------------------------------------------------
-
-
-def make_cute_layouts():
-    """Build the three composed layouts the images above describe.
-
-    Imported lazily so host-only consumers -- the layout tests, the reference
-    and the validation matrix -- do not need the CUTLASS DSL installed.
-    """
-    import cutlass.cute as cute
-
-    raw_bf16 = cute.make_composed_layout(
-        cute.make_swizzle(*SWIZZLE_S128_BYTES),
-        0,
-        cute.make_layout(
-            (BT, (BF16_SEGMENT_ELEMS, BF16_SEGMENTS)),
-            stride=(BF16_SEGMENT_ELEMS, (1, BF16_SEGMENT_STRIDE)),
-        ),
-    )
-    raw_f32 = cute.make_composed_layout(
-        cute.make_swizzle(*SWIZZLE_S128_BYTES),
-        0,
-        cute.make_layout(
-            (BT, (F32_SEGMENT_ELEMS, F32_SEGMENTS)),
-            stride=(F32_SEGMENT_ELEMS, (1, F32_SEGMENT_STRIDE)),
-        ),
-    )
-    pairwise = cute.make_composed_layout(
-        cute.make_swizzle(*SWIZZLE_SW32_BYTES),
-        0,
-        cute.make_layout((BT, BT), stride=(PAIRWISE_ROW_STRIDE, 1)),
-    )
-    return raw_bf16, raw_f32, pairwise
-
-
 # --------------------------------------------------------------------------
-# Section 3: inline PTX the fused kernel issues
+# Inline PTX the fused kernel issues
 # --------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
@@ -1072,130 +656,20 @@ def make_cute_layouts():
 # ---------------------------------------------------------------------------
 
 
-def _ldmatrix(count: str, trans: str, smem_ptr, num: int, *, loc=None, ip=None):
-    from cutlass._mlir.extras import types as _T
-
-    outs = ", ".join(f"${i}" for i in range(num))
-    struct = llvm.inline_asm(
-        llvm.StructType.get_literal([_T.IntegerType.get_signless(32)] * num),
-        [smem_ptr.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip)],
-        f"ldmatrix.sync.aligned.m8n8{count}{trans}.shared.b16 {{{outs}}}, [${num}];",
-        ",".join(["=r"] * num) + ",r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-    return tuple(
-        cutlass.Int32(
-            llvm.extractvalue(
-                _T.IntegerType.get_signless(32), struct, [i], loc=loc, ip=ip
-            )
-        )
-        for i in range(num)
-    )
-
-
-@dsl_user_op
-def ldmatrix_x4(smem_ptr, *, loc=None, ip=None):
-    """``ldmatrix.sync.aligned.m8n8.x4.shared.b16`` -> four b32.
-
-    Qd/Kd A operands, the Ki B operand and the pairwise tiles.  Which of those
-    it produces is entirely a property of the pointer map it is given.
-    """
-    return _ldmatrix(".x4", "", smem_ptr, 4, loc=loc, ip=ip)
-
-
-@dsl_user_op
-def ldmatrix_x4_trans(smem_ptr, *, loc=None, ip=None):
-    """``ldmatrix...x4.trans``: Ak.T -> the ``[key, token]`` Ak A operand."""
-    return _ldmatrix(".x4", ".trans", smem_ptr, 4, loc=loc, ip=ip)
-
-
-@dsl_user_op
-def ldmatrix_x2(smem_ptr, *, loc=None, ip=None):
-    """``ldmatrix...x2``: one ``[16, 8]`` V tile.  Only lanes 0-15 address."""
-    return _ldmatrix(".x2", "", smem_ptr, 2, loc=loc, ip=ip)
-
-
-@dsl_user_op
-def ldmatrix_x2_trans(smem_ptr, *, loc=None, ip=None):
-    """``ldmatrix...x2.trans``: the boundary state's C-layout view.
-
-    The physical state image is ``[V, K]``; reading down its columns is what
-    turns it into the ``[K, V]`` accumulator layout H32/H16 are held in.
-    """
-    return _ldmatrix(".x2", ".trans", smem_ptr, 2, loc=loc, ip=ip)
-
-
-def _stmatrix(count: str, trans: str, smem_ptr, regs, *, loc=None, ip=None):
-    ins = ", ".join(f"${i + 1}" for i in range(len(regs)))
-    llvm.inline_asm(
-        None,
-        [
-            smem_ptr.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip),
-            *[cutlass.Int32(r).ir_value(loc=loc, ip=ip) for r in regs],
-        ],
-        f"stmatrix.sync.aligned.m8n8{count}{trans}.shared.b16 [$0], {{{ins}}};",
-        ",".join(["r"] * (len(regs) + 1)),
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
-def stmatrix_x4(smem_ptr, r0, r1, r2, r3, *, loc=None, ip=None):
-    """``stmatrix...x4``: Qd/Kd/Ki publication, AinvBeta, Aq and Ak.T."""
-    _stmatrix(".x4", "", smem_ptr, (r0, r1, r2, r3), loc=loc, ip=ip)
-
-
-@dsl_user_op
-def stmatrix_x4_trans(smem_ptr, r0, r1, r2, r3, *, loc=None, ip=None):
-    """``stmatrix...x4.trans``: publish a B-layout fragment to the A image.
-
-    The transpose the store performs is per 8x8 tile with the register order
-    unchanged, which is exactly :func:`~...kernel.a_to_b`'s
-    ``MOVMATRIX_A_TO_B = (0, 1, 2, 3)``.  Using this instead costs four
-    ``movmatrix`` less per factor and lands the same image; the equality is
-    checked against the host store model in the layout tests.
-    """
-    _stmatrix(".x4", ".trans", smem_ptr, (r0, r1, r2, r3), loc=loc, ip=ip)
-
-
-@dsl_user_op
-def stmatrix_x2(smem_ptr, r0, r1, *, loc=None, ip=None):
-    """``stmatrix...x2``: the output tile."""
-    _stmatrix(".x2", "", smem_ptr, (r0, r1), loc=loc, ip=ip)
-
-
-@dsl_user_op
-def stmatrix_x2_trans(smem_ptr, r0, r1, *, loc=None, ip=None):
-    """``stmatrix...x2.trans``: exactly inverts :func:`ldmatrix_x2_trans`."""
-    _stmatrix(".x2", ".trans", smem_ptr, (r0, r1), loc=loc, ip=ip)
-
-
 @dsl_user_op
 def fresh_b32(value, *, loc=None, ip=None):
     """A byte-identity ``prmt.b32``: same value, a *different* register.
 
-    This computes nothing.  It exists to keep the MMA's operand register
-    distinct from the persistent H16 state register, and removing it is a
-    measured 4% regression, not a cleanup.
-
-    The transposed recurrence hands H16 straight to the MMA as its A operand.
-    Without an intervening value, ptxas must satisfy the MMA's register
-    constraints on registers that are live across the entire kernel, and with
-    96 of a recurrence warp's 160 registers already pinned to h32/h16 it
-    resolves that by spilling -- measured, ``LDL`` rises 6.3x and the kernel
-    slows by 4.0%.  Standing this instruction in the same place keeps spill
-    unchanged and gains 4.2%.
+    This computes nothing.  It keeps the MMA's operand register distinct from
+    the persistent H16 state register: the transposed recurrence hands H16
+    straight to the MMA as its A operand, and without an intervening value
+    ptxas must satisfy the MMA's register constraints on registers that are
+    live across the entire kernel, which -- with 96 registers already pinned
+    to h32/h16 -- it resolves by spilling.  Removing this is a measured
+    regression, not a cleanup.
 
     ``prmt`` rather than ``mov`` because ptxas folds an identity move; the
-    byte-permute survives, which the opcode counts confirm.
+    byte-permute survives.
     """
     from cutlass._mlir.extras import types as _T
 
@@ -1214,182 +688,9 @@ def fresh_b32(value, *, loc=None, ip=None):
     )
 
 
-@dsl_user_op
-def movmatrix_b16(value, *, loc=None, ip=None):
-    """``movmatrix.sync.aligned.m8n8.trans.b16``: transpose one packed 8x8.
-
-    Bit-exact: this moves 16-bit lanes between registers and never rounds, which
-    is what makes the H16 C-to-B conversion free of a second rounding boundary.
-    """
-    from cutlass._mlir.extras import types as _T
-
-    return cutlass.Int32(
-        llvm.inline_asm(
-            _T.IntegerType.get_signless(32),
-            [cutlass.Int32(value).ir_value(loc=loc, ip=ip)],
-            "movmatrix.sync.aligned.m8n8.trans.b16 $0, $1;",
-            "=r,r",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-            loc=loc,
-            ip=ip,
-        )
-    )
-
-
-# ---------------------------------------------------------------------------
-# Tensor Core
-# ---------------------------------------------------------------------------
-
-
-def _mma_m16n8k16(
-    kind: str, a0, a1, a2, a3, b0, b1, c0, c1, c2, c3, *, loc=None, ip=None
-):
-    from cutlass._mlir.extras import types as _T
-
-    struct = llvm.inline_asm(
-        llvm.StructType.get_literal([_T.F32Type.get()] * 4),
-        [
-            cutlass.Int32(a0).ir_value(loc=loc, ip=ip),
-            cutlass.Int32(a1).ir_value(loc=loc, ip=ip),
-            cutlass.Int32(a2).ir_value(loc=loc, ip=ip),
-            cutlass.Int32(a3).ir_value(loc=loc, ip=ip),
-            cutlass.Int32(b0).ir_value(loc=loc, ip=ip),
-            cutlass.Int32(b1).ir_value(loc=loc, ip=ip),
-            cutlass.Float32(c0).ir_value(loc=loc, ip=ip),
-            cutlass.Float32(c1).ir_value(loc=loc, ip=ip),
-            cutlass.Float32(c2).ir_value(loc=loc, ip=ip),
-            cutlass.Float32(c3).ir_value(loc=loc, ip=ip),
-        ],
-        f"mma.sync.aligned.m16n8k16.row.col.f32.{kind}.{kind}.f32 "
-        "{$0, $1, $2, $3}, {$4, $5, $6, $7}, {$8, $9}, {$10, $11, $12, $13};",
-        "=f,=f,=f,=f,r,r,r,r,r,r,f,f,f,f",
-        has_side_effects=False,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-    return tuple(
-        cutlass.Float32(
-            llvm.extractvalue(_T.F32Type.get(), struct, [i], loc=loc, ip=ip)
-        )
-        for i in range(4)
-    )
-
-
-@dsl_user_op
-def mma_m16n8k16_bf16(a0, a1, a2, a3, b0, b1, c0, c1, c2, c3, *, loc=None, ip=None):
-    """``mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32``: every BF16 MMA."""
-    return _mma_m16n8k16("bf16", a0, a1, a2, a3, b0, b1, c0, c1, c2, c3, loc=loc, ip=ip)
-
-
-@dsl_user_op
-def mma_m16n8k16_f16(a0, a1, a2, a3, b0, b1, c0, c1, c2, c3, *, loc=None, ip=None):
-    """``...f32.f16.f16.f32``: the blockwise inverse's twelve MMAs, and only those."""
-    return _mma_m16n8k16("f16", a0, a1, a2, a3, b0, b1, c0, c1, c2, c3, loc=loc, ip=ip)
-
-
 # ---------------------------------------------------------------------------
 # Packed conversion and arithmetic
 # ---------------------------------------------------------------------------
-
-
-def _pack(instr: str, lo, hi, *, loc=None, ip=None):
-    from cutlass._mlir.extras import types as _T
-
-    return cutlass.Int32(
-        llvm.inline_asm(
-            _T.IntegerType.get_signless(32),
-            [
-                cutlass.Float32(hi).ir_value(loc=loc, ip=ip),
-                cutlass.Float32(lo).ir_value(loc=loc, ip=ip),
-            ],
-            f"{instr} $0, $1, $2;",
-            "=r,f,f",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-            loc=loc,
-            ip=ip,
-        )
-    )
-
-
-@dsl_user_op
-def pack_bf16x2(lo, hi, *, loc=None, ip=None):
-    """``cvt.rn.bf16x2.f32``; ``lo`` lands in the low half."""
-    return _pack("cvt.rn.bf16x2.f32", lo, hi, loc=loc, ip=ip)
-
-
-@dsl_user_op
-def pack_f16x2(lo, hi, *, loc=None, ip=None):
-    """``cvt.rn.f16x2.f32``; ``lo`` lands in the low half.
-
-    The inverse chain's pack.  it must not go through BF16
-    first -- the three extra significand bits are the point.
-    """
-    return _pack("cvt.rn.f16x2.f32", lo, hi, loc=loc, ip=ip)
-
-
-def _binary_packed(instr: str, a, b, *, loc=None, ip=None):
-    from cutlass._mlir.extras import types as _T
-
-    return cutlass.Int32(
-        llvm.inline_asm(
-            _T.IntegerType.get_signless(32),
-            [
-                cutlass.Int32(a).ir_value(loc=loc, ip=ip),
-                cutlass.Int32(b).ir_value(loc=loc, ip=ip),
-            ],
-            f"{instr} $0, $1, $2;",
-            "=r,r,r",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-            loc=loc,
-            ip=ip,
-        )
-    )
-
-
-@dsl_user_op
-def mul_bf16x2(a, b, *, loc=None, ip=None):
-    """``mul.rn.bf16x2``: two BF16 products, each rounded once."""
-    return _binary_packed("mul.rn.bf16x2", a, b, loc=loc, ip=ip)
-
-
-@dsl_user_op
-def sub_bf16x2(a, b, *, loc=None, ip=None):
-    """``sub.rn.bf16x2``: the residual ``BF16(V - X)`` for two tokens at once."""
-    return _binary_packed("sub.rn.bf16x2", a, b, loc=loc, ip=ip)
-
-
-@dsl_user_op
-def unpack_bf16x2(value, *, loc=None, ip=None):
-    """Widen a packed BF16 pair to two FP32, low half first."""
-    from cutlass._mlir.extras import types as _T
-
-    struct = llvm.inline_asm(
-        llvm.StructType.get_literal([_T.F32Type.get()] * 2),
-        [cutlass.Int32(value).ir_value(loc=loc, ip=ip)],
-        "{ .reg .b16 lo, hi;"
-        "  mov.b32 {lo, hi}, $2;"
-        "  cvt.f32.bf16 $0, lo; cvt.f32.bf16 $1, hi; }",
-        "=f,=f,r",
-        has_side_effects=False,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-    return tuple(
-        cutlass.Float32(
-            llvm.extractvalue(_T.F32Type.get(), struct, [i], loc=loc, ip=ip)
-        )
-        for i in range(2)
-    )
 
 
 @dsl_user_op
@@ -1398,9 +699,8 @@ def rcp_approx_ftz(x, *, loc=None, ip=None):
 
     ``.ftz`` flushes subnormal *inputs* to zero, so ``E < 2^-126`` would return
     ``+Inf`` and ``0 * Inf`` would poison a whole KK row.  The
-    :data:`PREFIX_FLOOR` clamp on the gate
-    prefix is what keeps ``E`` at or above the smallest normal, which is why
-    that clamp is not optional.
+    :data:`PREFIX_FLOOR` clamp on the gate prefix is what keeps ``E`` at or
+    above the smallest normal, which is why that clamp is not optional.
     """
     from cutlass._mlir.extras import types as _T
 
@@ -1428,10 +728,10 @@ def rcp_approx_ftz(x, *, loc=None, ip=None):
 def mbarrier_test_wait_parity(mbar_ptr, phase, *, loc=None, ip=None):
     """``mbarrier.test_wait.parity.acquire.cta``: a single non-blocking probe.
 
-    the design allows this in the first-ready loop and forbids
-    ``try_wait``, which may suspend the warp for up to 10,000,000 ns.  The
-    result only *selects* a branch; the chosen branch still performs the real
-    32-lane acquire, because a broadcast predicate gives the other 31 lanes no
+    Used in the first-ready loop in place of ``try_wait``, which may suspend
+    the warp for an implementation-defined time limit.  The result only
+    *selects* a branch; the chosen branch still performs the real 32-lane
+    acquire, because a broadcast predicate gives the other 31 lanes no
     visibility of the producer's shared-memory stores.
 
     Branch-free on purpose: an inline-asm label would have to be unique per
@@ -1468,11 +768,10 @@ def mbarrier_test_wait_parity(mbar_ptr, phase, *, loc=None, ip=None):
 # ---------------------------------------------------------------------------
 
 
-#: DSL 4.7 renamed these and deprecated the old spellings; 4.3 only has the old
-#: ones.  Resolve once at import so the tree builds on both without emitting a
-#: DeprecationWarning per traced call site under 4.7.  Both spellings lower to
-#: the same op -- which on ``sm_120a`` is dropped entirely, see
-#: Section 1.
+#: Newer DSL releases renamed these and deprecated the old spellings; older
+#: releases only have the old names.  Resolve once at import so both build
+#: without a DeprecationWarning per traced call site.  Both spellings lower to
+#: the same op, which ptxas currently drops -- see the ``WG*_MAXNREG`` note.
 _REG_DEC = (
     getattr(cute.arch, "setmaxregister_decrease", None)
     or cute.arch.warpgroup_reg_dealloc
@@ -1499,270 +798,18 @@ def setmaxnreg_inc(count: int, *, loc=None, ip=None):
     _REG_INC(count, loc=loc, ip=ip)
 
 
-# ---------------------------------------------------------------------------
-# TMA
-# ---------------------------------------------------------------------------
-
-
-@dsl_user_op
-def fence_tensormap_acquire(desc_addr, *, loc=None, ip=None):
-    """``fence.proxy.tensormap::generic.acquire.gpu [desc], 128``.
-
-    The descriptor is written by the host and read by the TMA unit through a
-    different proxy, so the kernel must acquire it before first use.
-    """
-    llvm.inline_asm(
-        None,
-        [cutlass.Int64(desc_addr).ir_value(loc=loc, ip=ip)],
-        "fence.proxy.tensormap::generic.acquire.gpu [$0], 128;",
-        "l",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
-def tma_load_3d(smem_ptr, desc_addr, mbar_ptr, c0, c1, c2, *, loc=None, ip=None):
-    """One ``cp.async.bulk.tensor.3d`` box, global to shared.
-
-    ``shared::cta``, not ``shared::cluster``: SM120 has no thread block
-    clusters.  Completion is reported to ``mbar_ptr`` as transaction bytes, so
-    the consumer waits on the mbarrier rather than on a commit group.
-    """
-    llvm.inline_asm(
-        None,
-        [
-            smem_ptr.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip),
-            cutlass.Int64(desc_addr).ir_value(loc=loc, ip=ip),
-            mbar_ptr.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip),
-            cutlass.Int32(c0).ir_value(loc=loc, ip=ip),
-            cutlass.Int32(c1).ir_value(loc=loc, ip=ip),
-            cutlass.Int32(c2).ir_value(loc=loc, ip=ip),
-        ],
-        "cp.async.bulk.tensor.3d.shared::cta.global.tile"
-        ".mbarrier::complete_tx::bytes [$0], [$1, {$3, $4, $5}], [$2];",
-        "r,l,r,r,r,r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
-def tma_store_3d(desc_addr, smem_ptr, c0, c1, c2, *, loc=None, ip=None):
-    """One ``cp.async.bulk.tensor.3d`` box, shared to global.
-
-    Stores carry no mbarrier; they are tracked with bulk commit groups, and
-    :func:`tma_store_wait_read` is what releases the source SMEM.
-    """
-    llvm.inline_asm(
-        None,
-        [
-            cutlass.Int64(desc_addr).ir_value(loc=loc, ip=ip),
-            smem_ptr.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip),
-            cutlass.Int32(c0).ir_value(loc=loc, ip=ip),
-            cutlass.Int32(c1).ir_value(loc=loc, ip=ip),
-            cutlass.Int32(c2).ir_value(loc=loc, ip=ip),
-        ],
-        "cp.async.bulk.tensor.3d.global.shared::cta.tile.bulk_group"
-        " [$0, {$2, $3, $4}], [$1];",
-        "l,r,r,r,r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
-def tma_store_commit_group(*, loc=None, ip=None):
-    """``cp.async.bulk.commit_group``."""
-    llvm.inline_asm(
-        None,
-        [],
-        "cp.async.bulk.commit_group;",
-        "",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
-def tma_store_wait_read(keep: int, *, loc=None, ip=None):
-    """``cp.async.bulk.wait_group.read``: a source-reuse guarantee.
-
-    It does not claim the store is globally visible, only that the TMA engine
-    has finished *reading* the SMEM it came from -- which is exactly the
-    condition for recycling the slot.
-    """
-    llvm.inline_asm(
-        None,
-        [],
-        f"cp.async.bulk.wait_group.read {keep};",
-        "",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-
-
 # --------------------------------------------------------------------------
-# Section 4: TMA descriptors
+# TMA descriptors
 # --------------------------------------------------------------------------
 
-DESCRIPTOR_BYTES = 128
 DESCRIPTOR_ALIGN = 64
-GLOBAL_BASE_ALIGN = 16
 
-#: the design fixes this order; the launch path indexes uploads by it.
+#: This order is fixed; the launch path indexes uploads by it.
 DESCRIPTOR_ROLES = ("q", "k", "g", "v", "out", "state_in", "state_out")
 
-_TMA_DTYPES = {
-    torch.bfloat16: "CU_TENSOR_MAP_DATA_TYPE_BFLOAT16",
-    torch.float32: "CU_TENSOR_MAP_DATA_TYPE_FLOAT32",
-}
-
-
-@dataclass(frozen=True)
-class TensorMapSpec:
-    """One descriptor's complete encoder configuration.
-
-    Only the fields below vary between roles; everything else in the encoder
-    call is fixed by the design and is not representable as a difference.
-    """
-
-    dtype: torch.dtype
-    base: int
-    global_dims: tuple[int, ...]
-    global_stride_bytes: tuple[int, ...]
-    box_dims: tuple[int, ...]
-    #: Present so the cache key and the equality test cover them, even though
-    #: the contract pins all three.
-    element_strides: tuple[int, ...] = (1, 1, 1)
-    interleave: str = "NONE"
-    swizzle: str = "128B"
-    l2_promotion: str = "128B"
-    oob_fill: str = "NONE"
-
-    @property
-    def rank(self) -> int:
-        return len(self.global_dims)
-
-    @property
-    def element_size(self) -> int:
-        return torch.empty(0, dtype=self.dtype).element_size()
-
-    @property
-    def box_bytes(self) -> int:
-        n = 1
-        for b in self.box_dims:
-            n *= b
-        return n * self.element_size
-
-    def key(self, device) -> tuple:
-        """Full cache key: device plus every encoder field."""
-        index = device.index if isinstance(device, torch.device) else device
-        return (
-            index,
-            self.base,
-            self.dtype,
-            self.rank,
-            self.global_dims,
-            self.global_stride_bytes,
-            self.box_dims,
-            self.element_strides,
-            self.interleave,
-            self.swizzle,
-            self.l2_promotion,
-            self.oob_fill,
-        )
-
-    def validate(self) -> None:
-        """Check what the driver will not.
-
-        The driver rejects some of this itself, but with an error that names a
-        parameter index rather than a role, and it accepts a misaligned global
-        base outright -- the corruption from that shows up as wrong numbers in
-        one head, far from here.
-        """
-        if self.rank != 3:
-            raise ValueError(f"TMA rank must be 3, got {self.rank}")
-        if self.base % GLOBAL_BASE_ALIGN:
-            raise ValueError(
-                f"TMA global base must be {GLOBAL_BASE_ALIGN}-byte aligned, "
-                f"got {self.base:#x}"
-            )
-        if any(d <= 0 for d in self.global_dims):
-            raise ValueError(
-                f"TMA global dims must be positive, got {self.global_dims}"
-            )
-        if len(self.global_stride_bytes) != self.rank - 1:
-            raise ValueError(
-                "TMA global strides cover dimensions 1..rank-1 only, got "
-                f"{len(self.global_stride_bytes)} for rank {self.rank}"
-            )
-        for s in self.global_stride_bytes:
-            if s <= 0 or s % GLOBAL_BASE_ALIGN:
-                raise ValueError(
-                    f"TMA global strides must be positive and "
-                    f"{GLOBAL_BASE_ALIGN}-byte aligned, got {self.global_stride_bytes}"
-                )
-        if len(self.box_dims) != self.rank:
-            raise ValueError(f"TMA box must have rank {self.rank}")
-        if any(not 1 <= b <= 256 for b in self.box_dims):
-            raise ValueError(
-                f"TMA box extents must be in [1, 256], got {self.box_dims}"
-            )
-        inner_bytes = self.box_dims[0] * self.element_size
-        if inner_bytes != 128:
-            raise ValueError(
-                f"a 128B-swizzled inner box must be exactly 128 bytes, "
-                f"got {inner_bytes}"
-            )
-        if self.dtype not in _TMA_DTYPES:
-            raise ValueError(f"unsupported TMA element type {self.dtype}")
-
-    def encode(self) -> bytes:
-        """Encode this spec as its 128 raw descriptor bytes."""
-        import cuda.bindings.driver as drv
-
-        self.validate()
-        return _encode_tiled(drv, self)
-
-
-def _encode_tiled(drv, spec: TensorMapSpec) -> bytes:
-    err, tmap = drv.cuTensorMapEncodeTiled(
-        getattr(drv.CUtensorMapDataType, _TMA_DTYPES[spec.dtype]),
-        spec.rank,
-        spec.base,
-        [drv.cuuint64_t(d) for d in spec.global_dims],
-        [drv.cuuint64_t(s) for s in spec.global_stride_bytes],
-        [drv.cuuint32_t(b) for b in spec.box_dims],
-        [drv.cuuint32_t(e) for e in spec.element_strides],
-        drv.CUtensorMapInterleave.CU_TENSOR_MAP_INTERLEAVE_NONE,
-        drv.CUtensorMapSwizzle.CU_TENSOR_MAP_SWIZZLE_128B,
-        drv.CUtensorMapL2promotion.CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
-        drv.CUtensorMapFloatOOBfill.CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE,
-    )
-    if int(err) != 0:
-        raise RuntimeError(f"cuTensorMapEncodeTiled failed: {err}")
-    # cuda-python wraps the descriptor, so take its address via getPtr().
-    return bytes(ctypes.string_at(tmap.getPtr(), DESCRIPTOR_BYTES))
-
 
 # ---------------------------------------------------------------------------
-# Section 6.1: activations
+# Activations
 # ---------------------------------------------------------------------------
 
 
@@ -1784,17 +831,8 @@ def activation_spec(t: torch.Tensor, total_tokens: int, heads: int) -> TensorMap
     )
 
 
-def activation_segments(dtype: torch.dtype) -> int:
-    """Boxes one ``[16, 128]`` tile takes: 2 at BF16, 4 at FP32."""
-    return 2 if dtype is torch.bfloat16 else 4
-
-
-def activation_segment_elems(dtype: torch.dtype) -> int:
-    return BF16_SEGMENT_ELEMS if dtype is torch.bfloat16 else F32_SEGMENT_ELEMS
-
-
 # ---------------------------------------------------------------------------
-# Section 6.2: state boundary
+# State boundary
 # ---------------------------------------------------------------------------
 
 
@@ -1831,16 +869,6 @@ def state_calls(dtype: torch.dtype) -> int:
     return 2 if dtype is torch.bfloat16 else 4
 
 
-def state_box_rows(dtype: torch.dtype) -> int:
-    """Line rows one state box covers: 128 either way, at 16 KiB per box."""
-    rows_per_value = (
-        STATE_BF16_ROWS_PER_VALUE
-        if dtype is torch.bfloat16
-        else STATE_F32_ROWS_PER_VALUE
-    )
-    return rows_per_value * DK // state_calls(dtype)
-
-
 # ---------------------------------------------------------------------------
 # Upload
 # ---------------------------------------------------------------------------
@@ -1857,7 +885,6 @@ class TensorMapUpload:
 
     storage: torch.Tensor
     addresses: dict[str, int]
-    specs: dict[str, TensorMapSpec]
 
     def address(self, role: str) -> int:
         """Descriptor address of ``role``, or 0 when the role is absent.
@@ -1872,11 +899,11 @@ class TensorMapUpload:
 def build_upload(specs: dict[str, TensorMapSpec], device) -> TensorMapUpload:
     """Encode, deduplicate and upload the descriptors for one launch.
 
-    Deduplication is by full spec equality, which is exactly the design's
-    rule: ``v is out`` and an exact state in/out alias produce identical specs
-    and share one descriptor, while anything that differs in a single encoder
-    field gets its own.  Direction is still decided by the PTX instruction, so
-    sharing a descriptor between a load and a store is safe.
+    Deduplication is by full spec equality: ``v is out`` and an exact state
+    in/out alias produce identical specs and share one descriptor, while
+    anything that differs in a single encoder field gets its own.  Direction
+    is still decided by the PTX instruction, so sharing a descriptor between a
+    load and a store is safe.
     """
     blobs: list[bytes] = []
     slot_of: dict[TensorMapSpec, int] = {}
@@ -1894,7 +921,7 @@ def build_upload(specs: dict[str, TensorMapSpec], device) -> TensorMapUpload:
 
     if not blobs:
         empty = torch.empty(0, dtype=torch.uint8, device=device)
-        return TensorMapUpload(storage=empty, addresses={}, specs=dict(specs))
+        return TensorMapUpload(storage=empty, addresses={})
 
     packed = bytearray()
     for blob in blobs:
@@ -1909,11 +936,11 @@ def build_upload(specs: dict[str, TensorMapSpec], device) -> TensorMapUpload:
     addresses = {
         role: base + slot * DESCRIPTOR_BYTES for role, slot in role_slot.items()
     }
-    return TensorMapUpload(storage=storage, addresses=addresses, specs=dict(specs))
+    return TensorMapUpload(storage=storage, addresses=addresses)
 
 
 # --------------------------------------------------------------------------
-# Section 5: the fused device kernel
+# The fused device kernel
 # --------------------------------------------------------------------------
 
 #: Barrier arena indices, in 8-byte units from the start of dynamic SMEM.
@@ -1921,7 +948,6 @@ _BAR = CONTROL_OFFSET // 8
 BAR_QKG = _BAR + BAR_QKG_READY // 8
 BAR_V = _BAR + BAR_V_READY // 8
 BAR_MAT = _BAR + BAR_MATERIALIZED // 8
-BAR_QKD = _BAR + BAR_QK_DONE // 8
 BAR_AINV = _BAR + BAR_AINV_READY // 8
 BAR_AQ = _BAR + BAR_AQ_READY // 8
 BAR_AK = _BAR + BAR_AK_READY // 8
@@ -1936,13 +962,10 @@ BAR_STATEIO = _BAR + BAR_STATE_IO // 8
 SLOT16 = MAIN_SLOT_BYTES // 2  # 8192 BF16
 SLOT32 = MAIN_SLOT_BYTES // 4  # 4096 FP32
 VSTAGE16 = V_STAGE_BYTES // 2  # 2048 BF16
-V_BASE16 = V_STAGE_OFFSET // 2  # 24576
-CTRL32 = CONTROL_OFFSET // 4  # 15360
+V_BASE16 = V_STAGE_OFFSET // 2  # 32768
 
-#: Quadrant slot pairs of an N=16 accumulator: TL, BL, TR, BR (plan Sec. 2.2).
+#: Quadrant slot pairs of an N=16 accumulator: TL, BL, TR, BR.
 QUAD_TL = (0, 1)
-QUAD_BL = (2, 3)
-QUAD_TR = (4, 5)
 QUAD_BR = (6, 7)
 DIAGONAL_SLOTS = QUAD_TL + QUAD_BR
 
@@ -1953,71 +976,20 @@ DIAGONAL_SLOTS = QUAD_TL + QUAD_BR
 
 
 @cute.jit
-def vec_at(ptr, idx, elems):
-    """``ptr + idx`` as an ``elems``-long tensor, keeping 16-byte access width.
-
-    ``Pointer.__add__`` drops the alignment attribute for any dynamic offset --
-    even ``ptr + 8 * dyn``, since it does not reason about the multiplier -- and
-    ``autovec_copy`` honours that attribute.  Without the divisibility claim
-    every 8-element BF16 access lowers to eight scalar ones.  Each index
-    reaching this helper is a multiple of ``elems`` by construction, which the
-    layout tests check exhaustively.
-    """
-    return cute.make_tensor(
-        ptr + cute.assume(cutlass.Int32(idx), divby=elems), cute.make_layout(elems)
-    )
+def load_vec4_f32(ptr, idx):
+    """Four adjacent FP32 at ``ptr + idx`` as one 16-byte load."""
+    frag = cute.make_rmem_tensor(4, cutlass.Float32)
+    cute.autovec_copy(vec_at(ptr, idx, 4), frag)
+    return frag
 
 
 @cute.jit
-def vec8_bf16(ptr, idx):
+def store_vec8_bf16_from_f32(ptr, idx, values):
+    """Eight FP32 rounded to BF16 and written as one 16-byte store."""
     frag = cute.make_rmem_tensor(8, cutlass.BFloat16)
-    cute.autovec_copy(vec_at(ptr, idx, 8), frag)
-    return frag
-
-
-@cute.jit
-def zero_vec8_bf16(ptr, idx):
-    zeros = cute.make_rmem_tensor(8, cutlass.BFloat16)
     for i in cutlass.range_constexpr(8):
-        zeros[i] = cutlass.BFloat16(0.0)
-    cute.autovec_copy(zeros, vec_at(ptr, idx, 8))
-
-
-@cute.jit
-def store_vec4_f32(ptr, idx, values, base):
-    """``values[base:base + 4]`` to ``ptr + idx`` as one 16-byte store."""
-    vec = cute.make_rmem_tensor(4, cutlass.Float32)
-    for i in cutlass.range_constexpr(4):
-        vec[i] = values[base + i]
-    cute.autovec_copy(vec, vec_at(ptr, idx, 4))
-
-
-@cute.jit
-def load_vec2_f32(ptr, idx):
-    """Two adjacent FP32 at ``ptr + idx`` as one 8-byte load."""
-    frag = cute.make_rmem_tensor(2, cutlass.Float32)
-    cute.autovec_copy(vec_at(ptr, idx, 2), frag)
-    return frag
-
-
-@cute.jit
-def zero_vec4_f32(ptr, idx):
-    zeros = cute.make_rmem_tensor(4, cutlass.Float32)
-    for i in cutlass.range_constexpr(4):
-        zeros[i] = cutlass.Float32(0.0)
-    cute.autovec_copy(zeros, vec_at(ptr, idx, 4))
-
-
-@cute.jit
-def bf16_round(x):
-    """R16: ``cvt.rn.bf16.f32`` widened back to FP32."""
-    return x.to(cutlass.BFloat16).to(cutlass.Float32)
-
-
-@cute.jit
-def f16_round(x):
-    """R_F16: FP32 -> FP16 -> FP32, the inverse chain's boundary."""
-    return x.to(cutlass.Float16).to(cutlass.Float32)
+        frag[i] = values[i].to(cutlass.BFloat16)
+    store_vec8_bf16(ptr, idx, frag)
 
 
 @cute.jit
@@ -2030,43 +1002,6 @@ def zero4():
 def zero8():
     z = cutlass.Float32(0.0)
     return (z, z, z, z, z, z, z, z)
-
-
-@cute.jit
-def mma_n8(a, b, c):
-    """One native ``m16n8k16``: A is four registers, B two, C four."""
-    return mma_m16n8k16_bf16(a[0], a[1], a[2], a[3], b[0], b[1], c[0], c[1], c[2], c[3])
-
-
-@cute.jit
-def mma_16x16(a, b, c):
-    """One logical ``m16n16k16``: the N=8 low half, then the high half.
-
-    the design fixes that order and forbids any rounding between the two
-    halves or inside the K reduction.
-    """
-    n0 = mma_m16n8k16_bf16(a[0], a[1], a[2], a[3], b[0], b[1], c[0], c[1], c[2], c[3])
-    n1 = mma_m16n8k16_bf16(a[0], a[1], a[2], a[3], b[2], b[3], c[4], c[5], c[6], c[7])
-    return (n0[0], n0[1], n0[2], n0[3], n1[0], n1[1], n1[2], n1[3])
-
-
-@cute.jit
-def mma_16x16_f16(a, b, c):
-    """:func:`mma_16x16` with FP16 operands: the twelve inverse MMAs."""
-    n0 = mma_m16n8k16_f16(a[0], a[1], a[2], a[3], b[0], b[1], c[0], c[1], c[2], c[3])
-    n1 = mma_m16n8k16_f16(a[0], a[1], a[2], a[3], b[2], b[3], c[4], c[5], c[6], c[7])
-    return (n0[0], n0[1], n0[2], n0[3], n1[0], n1[1], n1[2], n1[3])
-
-
-@cute.jit
-def a_to_b(f):
-    """A-layout -> B-layout of the same matrix; register order unchanged."""
-    return (
-        movmatrix_b16(f[0]),
-        movmatrix_b16(f[1]),
-        movmatrix_b16(f[2]),
-        movmatrix_b16(f[3]),
-    )
 
 
 @cute.jit
@@ -2107,20 +1042,6 @@ def pack_a_f16(c):
 
 
 @cute.jit
-def warp_arrive(mbar, lane):
-    """One arrival per warp on a warp-counted barrier.
-
-    ``mbarrier.arrive`` counts per thread, so 32 lanes arriving would overshoot
-    a count of 4 or 8.  The warp synchronization before the elected arrival is
-    what makes the other 31 lanes' shared-memory stores visible to whoever
-    observes it; the arrival itself carries release semantics at CTA scope.
-    """
-    cute.arch.sync_warp()
-    if lane == 0:
-        cute.arch.mbarrier_arrive(mbar)
-
-
-@cute.jit
 def clamp_rows(token_end, token_base):
     """``min(16, token_end - token_base)``."""
     v = token_end - token_base
@@ -2158,8 +1079,8 @@ def blockwise_inverse(l_acc, lane):
 
     Both update steps must be a product against an exact-zero C followed by a
     *separate* FP32 scalar add of the re-rounded seed.  Passing the seed as the
-    MMA's C operand saves an instruction and changes the result, so plan
-    Section 2.2 forbids it.  ``B0 = I - D`` likewise comes from the widened
+    MMA's C operand saves an instruction and changes the result, so it is
+    forbidden here.  ``B0 = I - D`` likewise comes from the widened
     BF16 diagonal of ``L``, not from the already-FP16-rounded ``D``.
     """
     zero_r = cutlass.Int32(0)
@@ -2219,40 +1140,6 @@ def blockwise_inverse(l_acc, lane):
 
 
 @cute.jit
-def clear_tail_rows(p_q, p_k, p_g_raw, valid_rows, tidx, G_FP32: cutlass.Constexpr):
-    """Zero the invalid rows of the raw stages.
-
-    TMA only zero-fills coordinates outside the *tensor*, and a short chunk
-    sits mid-tensor: the rows past ``valid_rows`` hold the next sequence's
-    tokens, so the copy faithfully loaded real data there.  The task map
-    matches the loads' 16-byte width so the writes stay one vector wide.
-    """
-    for rep in cutlass.range_constexpr(2):
-        task = tidx + rep * PREPARE_BARRIER_THREADS
-        row = task // BT
-        d0 = (task - row * BT) * 8
-        if row >= valid_rows:
-            idx = raw_bf16_s128(row, d0)
-            zero_vec8_bf16(p_q, idx)
-            zero_vec8_bf16(p_k, idx)
-
-    if cutlass.const_expr(G_FP32):
-        for rep in cutlass.range_constexpr(4):
-            task = tidx + rep * PREPARE_BARRIER_THREADS
-            row = task // 32
-            d0 = (task - row * 32) * 4
-            if row >= valid_rows:
-                zero_vec4_f32(p_g_raw, raw_f32_s128(row, d0))
-    else:
-        for rep in cutlass.range_constexpr(2):
-            task = tidx + rep * PREPARE_BARRIER_THREADS
-            row = task // BT
-            d0 = (task - row * BT) * 8
-            if row >= valid_rows:
-                zero_vec8_bf16(p_g_raw, raw_bf16_s128(row, d0))
-
-
-@cute.jit
 def gate_column(
     smem_e,
     smem_g_bf16,
@@ -2266,11 +1153,11 @@ def gate_column(
 ):
     """The 16 gate values of one key dimension, as ``E = exp2(clamped prefix)``.
 
-    Three things here are contract, not style: the
-    invalid-row mask selects an exact ``+0.0`` *increment* -- zeroing raw ``G``
-    is not enough, because ``dt_bias`` still produces a non-zero increment; the
-    scan uses the pairwise bracketing rather than a plain running sum; and the
-    clamp happens after the complete scan and before ``exp2``.
+    Three things here are contract, not style: the invalid-row mask selects
+    an exact ``+0.0`` *increment* -- zeroing raw ``G`` is not enough, because
+    ``dt_bias`` still produces a non-zero increment; the scan uses the pairwise
+    bracketing rather than a plain running sum; and the clamp happens after
+    the complete scan and before ``exp2``.
     """
     regs = [cutlass.Float32(0.0) for _ in range(BT)]
     for r in cutlass.range_constexpr(BT):
@@ -2326,7 +1213,7 @@ def gate_column(
 def row_sum_8(value):
     """Reduce the eight lanes that cooperate on one token row.
 
-    the design pins the butterfly offsets to 4 -> 2 -> 1 and each step to
+    The butterfly offsets are pinned to 4 -> 2 -> 1 and each step to
     a single FP32 add.  A tree or vector reduction reassociates, which is a
     different number.
     """
@@ -2353,12 +1240,10 @@ def prepare_head(
 ):
     """Chunk ``c``'s gate column: wait for raw Q/K/G, clear its tail, scan it.
 
-    This is the stage the pipeline moves.  It is everything from ``qkg_ready``
-    up to and including ``gate_column`` -- 51 MUFU, the longest dependent chain
-    in prepare -- and it depends on nothing the previous chunk produces, which
-    is what makes it hoistable ahead of the previous chunk's ``ainv_ready``
-    wait.  It returns the whole column because ``e_col`` is the only thing the
-    rest of the chunk needs from it; ``gt_owned`` is its last element.
+    Everything from ``qkg_ready`` up to and including ``gate_column``, the
+    longest dependent chain in prepare.  It returns the whole column because
+    ``e_col`` is the only thing the rest of the chunk needs from it;
+    ``gt_owned`` is its last element.
     """
     s = main_slot(c)
     pr = ready_parity(c)
@@ -2377,7 +1262,9 @@ def prepare_head(
 
     cute.arch.mbarrier_wait(p64 + (BAR_QKG + s), pr)
     if valid_rows < BT:
-        clear_tail_rows(p_q, p_k, p_g_raw, valid_rows, tidx, G_FP32)
+        clear_tail_rows(
+            p_q, p_k, p_g_raw, valid_rows, tidx, G_FP32, PREPARE_BARRIER_THREADS
+        )
     # Rendezvous 1: raw operands are readable only once every tail row of
     # every stage has been cleared.
     prepare_rendezvous()
@@ -2407,17 +1294,21 @@ def prepare_body(
     dim,
     norm_token,
     lane_in_row,
-    q_reg,
-    packed_scale,
+    s16_scale,
     token_start,
     token_end,
 ):
-    """Publish E, normalize, and materialize Qd/Kd/Ki; hand Kr to the tail.
+    """Publish E row-major, then normalize and materialize in one ownership.
 
-    Everything here belongs to chunk ``c`` alone and ends at
-    ``materialized``.  ``kr_b`` is returned rather than stored because Kr is
-    the one factor that never reaches SMEM -- it stays in the B layout it was
-    built in until the tail multiplies it by AinvBeta.
+    The lane that reduces a token row also normalizes it, decays it and
+    publishes it, so ``q_inv``/``k_inv`` never leave a register and the raw
+    Q/K operands are read from shared memory once.  The cost is E, which must
+    be readable as ``(token, 16 features)`` and so uses the row-major image
+    raw ``G`` uses -- sixteen scalar stores from the gate's column ownership
+    rather than four vector ones.
+
+    ``kn`` and ``qn`` stay FP32 into the rounding; nothing is published
+    between the norm and the decay.
     """
     s = main_slot(c)
     s16 = s * SLOT16
@@ -2428,175 +1319,150 @@ def prepare_body(
     p_k = p16 + (s16 + SLOT_K // 2)
     p_ki = p16 + (s16 + SLOT_KI // 2)
     p_e = p32 + (s32 + SLOT_G_LO // 4)
+    smem_e = cute.make_tensor(p_e, cute.make_layout(BT * DK))
     smem_gt = cute.make_tensor(p32 + (s32 + SLOT_GTOTAL // 4), cute.make_layout(DK))
-    scratch = cute.make_tensor(
-        p32 + (CTRL32 + s * (SCRATCH_SLOT_BYTES // 4)), cute.make_layout(32)
-    )
     gt_owned = e_col[BT - 1]
 
-    # Rendezvous 2: one lane's E store can land on a raw element another
-    # lane has not read yet.  This used to be skipped for FP32 G, where the
-    # E map and the raw map coincided and each lane rewrote exactly what it
-    # read.  E is transposed now, so the two maps no longer coincide for
-    # either width and the barrier is unconditional -- one `bar.sync 1, 128`
-    # per chunk, bought for twenty fewer shared accesses per warp.
+    # Rendezvous 2: E overwrites raw G's bytes.
     prepare_rendezvous()
-    for grp in cutlass.range_constexpr(E_GROUPS):
-        store_vec4_f32(
-            p_e,
-            gate_e_f32(dim, E_GROUP_ELEMS * grp),
-            e_col,
-            E_GROUP_ELEMS * grp,
-        )
 
-    # --- norm: four token rows per warp, eight lanes per row ---------------
+    # E row-major, at raw G's own addresses.  The gate owns one key and holds
+    # sixteen tokens, so this is sixteen scalar stores; the consumer below owns
+    # one token and sixteen keys and reads four vectors.
+    for r in cutlass.range_constexpr(BT):
+        smem_e[raw_f32_s128(r, dim)] = e_col[r]
+
+    # Rendezvous 3: E is published and every read below is another warp's.
+    prepare_rendezvous()
+
+    # --- norm, in the ownership that will also materialize -----------------
+    # Both halves stay in registers for the materialize step below: sixteen
+    # registers per lane.
+    fq0 = vec8_bf16(p_q, raw_bf16_s128(norm_token, 8 * lane_in_row))
+    fk0 = vec8_bf16(p_k, raw_bf16_s128(norm_token, 8 * lane_in_row))
+    fq1 = vec8_bf16(p_q, raw_bf16_s128(norm_token, 64 + 8 * lane_in_row))
+    fk1 = vec8_bf16(p_k, raw_bf16_s128(norm_token, 64 + 8 * lane_in_row))
     q_ss = cutlass.Float32(0.0)
     k_ss = cutlass.Float32(0.0)
-    for h in cutlass.range_constexpr(2):
-        base = raw_bf16_s128(norm_token, 64 * h + 8 * lane_in_row)
-        fq = vec8_bf16(p_q, base)
-        fk = vec8_bf16(p_k, base)
-        for i in cutlass.range_constexpr(8):
-            qv = cutlass.Float32(fq[i])
-            kv = cutlass.Float32(fk[i])
-            q_ss = q_ss + qv * qv
-            k_ss = k_ss + kv * kv
+    for i in cutlass.range_constexpr(8):
+        qv = cutlass.Float32(fq0[i])
+        kv = cutlass.Float32(fk0[i])
+        q_ss = q_ss + qv * qv
+        k_ss = k_ss + kv * kv
+    for i in cutlass.range_constexpr(8):
+        qv = cutlass.Float32(fq1[i])
+        kv = cutlass.Float32(fk1[i])
+        q_ss = q_ss + qv * qv
+        k_ss = k_ss + kv * kv
     q_ss = row_sum_8(q_ss)
     k_ss = row_sum_8(k_ss)
-    # All eight lanes hold the reduced value; only the row's lane 0 stores.
-    if lane_in_row == 0:
-        q_inv = cutlass.Float32(0.0)
-        k_inv = cutlass.Float32(0.0)
-        if norm_token < valid_rows:
-            qf = q_ss
-            if qf < cutlass.Float32(NORM_FLOOR):
-                qf = cutlass.Float32(NORM_FLOOR)
-            kf = k_ss
-            if kf < cutlass.Float32(NORM_FLOOR):
-                kf = cutlass.Float32(NORM_FLOOR)
-            q_inv = cutlass.Float32(cute.math.rsqrt(qf, fastmath=True))
-            k_inv = cutlass.Float32(cute.math.rsqrt(kf, fastmath=True))
-        scratch[norm_token] = q_inv
-        scratch[BT + norm_token] = k_inv
+    # Every lane of the row computes the reciprocal: eight redundant MUFU are
+    # cheaper than a store, a 128-thread rendezvous and eight scalar reads.
+    q_inv = cutlass.Float32(0.0)
+    k_inv = cutlass.Float32(0.0)
+    if norm_token < valid_rows:
+        qf = q_ss
+        if qf < cutlass.Float32(NORM_FLOOR):
+            qf = cutlass.Float32(NORM_FLOOR)
+        kf = k_ss
+        if kf < cutlass.Float32(NORM_FLOOR):
+            kf = cutlass.Float32(NORM_FLOOR)
+        q_inv = cutlass.Float32(cute.math.rsqrt(qf, fastmath=True))
+        k_inv = cutlass.Float32(cute.math.rsqrt(kf, fastmath=True))
 
-    # Rendezvous 3: E and the norm scratch are published together.  The
-    # norm's row owners are not the dimension owners that read them back,
-    # which is exactly why q_inv/k_inv need shared scratch at all.
+    # --- E for this lane's own sixteen features ----------------------------
+    e0 = load_vec4_f32(p_e, raw_f32_s128(norm_token, 8 * lane_in_row))
+    e1 = load_vec4_f32(p_e, raw_f32_s128(norm_token, 8 * lane_in_row + 4))
+    e2 = load_vec4_f32(p_e, raw_f32_s128(norm_token, 64 + 8 * lane_in_row))
+    e3 = load_vec4_f32(p_e, raw_f32_s128(norm_token, 64 + 8 * lane_in_row + 4))
+
+    # Rendezvous 4: E is in registers everywhere, its bytes may become Ki.
     prepare_rendezvous()
 
-    # --- capture E at the materializer's own coordinates -------------------
-    e_cap = [cutlass.Float32(0.0) for _ in range(16)]
-    for j in cutlass.range_constexpr(2):
-        for nb in cutlass.range_constexpr(2):
-            for r in cutlass.range_constexpr(2):
-                t0, _t1, key = materialize_coords(p, lane, j, nb, r)
-                idx = ((j * 2 + nb) * 2 + r) * 2
-                # ``t0`` is even and ``t1 = t0 + 1``, so the pair never
-                # straddles a group boundary and one load covers both.
-                pair = load_vec2_f32(p_e, gate_e_f32(key, t0))
-                e_cap[idx] = pair[0]
-                e_cap[idx + 1] = pair[1]
-    # t0/t1 depend only on (q, r), so eight scalar reads cover all tiles.
-    q_inv_t = [
-        scratch[2 * q_reg],
-        scratch[2 * q_reg + 1],
-        scratch[2 * q_reg + 8],
-        scratch[2 * q_reg + 9],
-    ]
-    k_inv_t = [
-        scratch[BT + 2 * q_reg],
-        scratch[BT + 2 * q_reg + 1],
-        scratch[BT + 2 * q_reg + 8],
-        scratch[BT + 2 * q_reg + 9],
-    ]
-
-    # Rendezvous 4: every prepare warp now holds its whole E set in
-    # registers, so E's bytes may be overwritten by Ki and factor records.
-    prepare_rendezvous()
+    # GTotal only after rendezvous 4: SLOT_GTOTAL is 13,312 and E spans
+    # 8,192 to 16,384, so this store lands *inside* E and may not happen
+    # while another warp is still reading it.
     smem_gt[dim] = gt_owned
-
-    kr_b = [cutlass.Int32(0) for _ in range(8)]
-    for j in cutlass.range_constexpr(2):
-        kd_b = [cutlass.Int32(0) for _ in range(4)]
-        ki_b = [cutlass.Int32(0) for _ in range(4)]
-        qd_b = [cutlass.Int32(0) for _ in range(4)]
-        # The whole [16, 16] tile in one instruction per factor: the
-        # materializer's coordinates *are* the native B fragment, which is
-        # what `.trans` delivers over a [token, key] image.  Both tiles are
-        # read before this iteration's factor stores overwrite them, and
-        # the two j values address disjoint key halves, so hoisting the
-        # loads above the stores is safe for j = 1 as well.
-        k_raw = ldmatrix_x4_trans(p_k + materialize_b_ptr(p, lane, j))
-        q_raw = ldmatrix_x4_trans(p_q + materialize_b_ptr(p, lane, j))
-        for nb in cutlass.range_constexpr(2):
-            for r in cutlass.range_constexpr(2):
-                # Only the key is still needed as a coordinate -- the two
-                # token rows are now implicit in the fragment the tile load
-                # delivered -- but it comes from the same map, because the
-                # shuffle below depends on it agreeing with the gate's
-                # ownership.
-                key = materialize_coords(p, lane, j, nb, r)[2]
-                idx = ((j * 2 + nb) * 2 + r) * 2
-                e0 = e_cap[idx]
-                e1 = e_cap[idx + 1]
-                qi0 = q_inv_t[2 * r]
-                qi1 = q_inv_t[2 * r + 1]
-                ki0 = k_inv_t[2 * r]
-                ki1 = k_inv_t[2 * r + 1]
-
-                # `cvt.f32.bf16` is the same widening the scalar load's
-                # Float32() did, and it is exact, so the products below are
-                # the same FP32 numbers as before.
-                kv0, kv1 = unpack_bf16x2(k_raw[2 * nb + r])
-                kn0 = kv0 * ki0
-                kn1 = kv1 * ki1
-                e16 = pack_bf16x2(e0, e1)
-                kd_b[2 * nb + r] = mul_bf16x2(pack_bf16x2(kn0, kn1), e16)
-                ki_b[2 * nb + r] = pack_bf16x2(
-                    kn0 * rcp_approx_ftz(e0), kn1 * rcp_approx_ftz(e1)
-                )
-                qv0, qv1 = unpack_bf16x2(q_raw[2 * nb + r])
-                qn16 = pack_bf16x2(qv0 * qi0, qv1 * qi1)
-                qd_b[2 * nb + r] = mul_bf16x2(mul_bf16x2(qn16, e16), packed_scale)
-
-                # GTotal of ``key`` belongs to its gate owner, which is a
-                # different lane than the one materializing this element.
-                gt16 = bf16_round(
-                    cutlass.Float32(cute.arch.shuffle_sync(gt_owned, key - 32 * p))
-                )
-                kr_b[4 * j + 2 * nb + r] = mul_bf16x2(
-                    ki_b[2 * nb + r], pack_bf16x2(gt16, gt16)
-                )
-
-        # B layout -> A layout rides the store: `stmatrix.x4.trans`
-        # transposes each 8x8 tile with the register order unchanged, which
-        # is what the three `a_to_b` calls used to spend twelve movmatrix
-        # doing.  Kr alone stays in the B layout it was built in and never
-        # reaches SMEM.
-        store_at = factor_a_ptr(lane, 2 * p + j)
-        stmatrix_x4_trans(p_q + store_at, qd_b[0], qd_b[1], qd_b[2], qd_b[3])
-        stmatrix_x4_trans(p_k + store_at, kd_b[0], kd_b[1], kd_b[2], kd_b[3])
-        stmatrix_x4_trans(p_ki + store_at, ki_b[0], ki_b[1], ki_b[2], ki_b[3])
-
+    qd = [cutlass.Float32(0.0) for _ in range(16)]
+    kd = [cutlass.Float32(0.0) for _ in range(16)]
+    ki = [cutlass.Float32(0.0) for _ in range(16)]
+    for half in cutlass.range_constexpr(2):
+        fq = fq0 if cutlass.const_expr(half == 0) else fq1
+        fk = fk0 if cutlass.const_expr(half == 0) else fk1
+        lo = e0 if cutlass.const_expr(half == 0) else e2
+        hi = e1 if cutlass.const_expr(half == 0) else e3
+        for i in cutlass.range_constexpr(8):
+            ev = lo[i] if cutlass.const_expr(i < 4) else hi[i - 4]
+            e16 = bf16_round(ev)
+            kn = cutlass.Float32(fk[i]) * k_inv
+            qn = cutlass.Float32(fq[i]) * q_inv
+            idx = 8 * half + i
+            kd[idx] = bf16_round(bf16_round(kn) * e16)
+            ki[idx] = bf16_round(kn * rcp_approx_ftz(ev))
+            qd[idx] = bf16_round(bf16_round(bf16_round(qn) * e16) * s16_scale)
+    store_vec8_bf16_from_f32(p_q, raw_bf16_s128(norm_token, 8 * lane_in_row), qd[0:8])
+    store_vec8_bf16_from_f32(p_k, raw_bf16_s128(norm_token, 8 * lane_in_row), kd[0:8])
+    store_vec8_bf16_from_f32(p_ki, raw_bf16_s128(norm_token, 8 * lane_in_row), ki[0:8])
+    store_vec8_bf16_from_f32(
+        p_q, raw_bf16_s128(norm_token, 64 + 8 * lane_in_row), qd[8:16]
+    )
+    store_vec8_bf16_from_f32(
+        p_k, raw_bf16_s128(norm_token, 64 + 8 * lane_in_row), kd[8:16]
+    )
+    store_vec8_bf16_from_f32(
+        p_ki, raw_bf16_s128(norm_token, 64 + 8 * lane_in_row), ki[8:16]
+    )
     warp_arrive(p64 + (BAR_MAT + s), lane)
-    return kr_b
 
 
 @cute.jit
-def prepare_tail(c, kr_b, p16, p64, lane, p):
-    """``Ak.T = AinvBeta.T * Kr``, once W15 publishes the inverse.
+def build_kr(p16, p32, lane, s16, s32, p):
+    """Kr for strip ``p`` -- ``Ki * Diag(exp2 GTotal)`` -- from published data.
 
-    The wait here is the 7.5% window the pipeline exists to fill: whatever the
-    caller schedules between ``prepare_body`` and this call runs while W15 is
-    still inverting.
+    Needs only what ``materialized`` guarantees: Ki and GTotal are
+    ``prepare_body``'s stores, and nothing touches the Ki bytes before the
+    Ak.T stores, which wait for ``ainv_ready``.  Building it ahead of that
+    wait made no measurable difference, so the caller runs it wherever reads
+    simplest.
+
+    The caller passes ``p`` as a Python constant; four lanes share each key
+    and shared memory broadcasts the read.
     """
-    s = main_slot(c)
-    pr = ready_parity(c)
-    p_ki = p16 + (s * SLOT16 + SLOT_KI // 2)
-    p_ainvb = p16 + (s * SLOT16 + SLOT_AINV_BETA // 2)
+    p_ki = p16 + (s16 + SLOT_KI // 2)
+    smem_gt = cute.make_tensor(p32 + (s32 + SLOT_GTOTAL // 4), cute.make_layout(DK))
+    kr_b = [cutlass.Int32(0) for _ in range(8)]
+    for j in cutlass.range_constexpr(2):
+        ki_r = ldmatrix_x4_trans(p_ki + materialize_b_ptr(p, lane, j))
+        for nb in cutlass.range_constexpr(2):
+            for r in cutlass.range_constexpr(2):
+                key = materialize_coords(p, lane, j, nb, r)[2]
+                gt16 = bf16_round(cutlass.Float32(smem_gt[key]))
+                kr_b[4 * j + 2 * nb + r] = mul_bf16x2(
+                    ki_r[2 * nb + r], pack_bf16x2(gt16, gt16)
+                )
+    return (
+        kr_b[0],
+        kr_b[1],
+        kr_b[2],
+        kr_b[3],
+        kr_b[4],
+        kr_b[5],
+        kr_b[6],
+        kr_b[7],
+    )
 
-    cute.arch.mbarrier_wait(p64 + (BAR_AINV + s), pr)
-    ainvb_t = a_to_at(ldmatrix_x4(p_ainvb + pairwise_a_ptr(lane)))
+
+@cute.jit
+def akt_store(p16, lane, s16, p, ainvb_t, kr_b):
+    """``Ak.T = AinvBeta.T @ Kr`` for strip ``p``, over the Ki bytes.
+
+    This step needs ``ainv_ready``: AinvBeta is W15's solve output, and the
+    stores overwrite Ki, which the barrier's two arrivals (W15 published, W13
+    has read) make safe.  Strips are disjoint by key -- ``ak_t_s128`` permutes
+    tokens, never keys -- so W13 (strips 0, 1) and W14 (strips 2, 3) need no
+    ordering against each other.
+    """
+    p_ki = p16 + (s16 + SLOT_KI // 2)
     for tile in cutlass.range_constexpr(2):
         acc = mma_16x16(
             ainvb_t,
@@ -2609,12 +1475,6 @@ def prepare_tail(c, kr_b, p16, p64, lane, p):
             zero8(),
         )
         frag = pack_a_bf16(acc)
-        if cutlass.const_expr(tile == 0):
-            # Ki dies for W13 at qk_done and for W15 at ainv_ready; both
-            # are required before the first byte of Ak.T lands on it.  This
-            # is usually already satisfied, but the wait may not be elided
-            # on that assumption.
-            cute.arch.mbarrier_wait(p64 + (BAR_QKD + s), pr)
         stmatrix_x4(
             p_ki + ak_store_ptr(lane, 32 * p + BT * tile),
             frag[0],
@@ -2622,7 +1482,6 @@ def prepare_tail(c, kr_b, p16, p64, lane, p):
             frag[2],
             frag[3],
         )
-    warp_arrive(p64 + (BAR_AK + s), lane)
 
 
 @cute.jit
@@ -2644,17 +1503,16 @@ def prepare_role(
     G_FP32: cutlass.Constexpr,
     SAFE_GATE: cutlass.Constexpr,
 ):
-    """Gate, normalize, materialize Qd/Kd/Ki, retain Kr, then publish Ak.T.
+    """Gate, normalize, and materialize Qd/Kd/Ki.
 
-    A prepare warp uses three different ownerships inside one chunk, and they
-    do not compose into "warp p owns 32 dimensions": the gate is one dimension
-    per lane, the norm is one token row per eight lanes, and the materializer
-    works in the MMA **B** fragment's coordinates.  Conflating them is the
-    easiest way to get this stage subtly wrong.
+    A prepare warp uses two different ownerships inside one chunk, and they
+    do not compose into "warp p owns 32 dimensions": the gate is one key
+    dimension per lane, while the norm and the materialize step are one token
+    row per eight lanes.  Conflating them is the easiest way to get this stage
+    subtly wrong.
 
-    The chunk is split into ``prepare_head`` / ``prepare_body`` /
-    ``prepare_tail`` so the head can be software-pipelined one chunk ahead of
-    the tail's ``ainv_ready`` wait; see the comment on the loop below.
+    Ak.T is not published here: W13 and W14 do that (:func:`akt_store`), so
+    this warp never waits on ``ainv_ready``.
     """
     p = warp_id
     dim = gate_owner_dim(p, lane)
@@ -2672,42 +1530,17 @@ def prepare_role(
     a_val = cutlass.Float32(cute.arch.shuffle_sync(a_seed, 0))
 
     s16_scale = bf16_round(scale)
-    packed_scale = pack_bf16x2(s16_scale, s16_scale)
 
     norm_token = norm_row(p, lane)
     lane_in_row = lane & 7
-    q_reg = lane & 3
 
-    # --- the software pipeline -------------------------------------------
-    #
-    # ``head(c + 1)`` is issued before ``tail(c)``, so the gate's exp2 chain
-    # for the next chunk runs while W15 is still inverting this one.  The
-    # shape is the textbook one -- prologue, ``n - 1`` steady-state
-    # iterations, epilogue -- and deliberately contains no runtime predicate:
-    # an earlier attempt guarded the hoisted head with
-    # ``if c + 1 < num_chunks``, and that dynamic ``if`` was the entire source
-    # of its trouble.  Drawing the loop boundary here needs none.
-    #
-    # ``e_col`` (16 FP32) is the only value carried across the iteration
-    # boundary, and ``kr_b`` (8 packed pairs) the only one live across the
-    # hoisted head.  Both fit: ~82 registers are free at the ``ainv_ready``
-    # wait, because Qd/Kd/Ki have just gone to SMEM.
-    #
-    # The guard is required and is not the predicate that caused the earlier
-    # trouble.  A packed varlen batch may contain a zero-length sequence, and
-    # such a block runs with ``num_chunks == 0``.  Every other role spells its
-    # work as ``for c in range(num_chunks)``, which is simply empty then; this
-    # role no longer does, because the prologue sits outside the loop.  An
-    # unguarded prologue waits on ``qkg_ready`` for a chunk W12's own empty
-    # loop will never produce, and W0-W3 hang there forever.  ``last`` would
-    # also be -1 and index a slot that does not exist.
-    #
-    # Unlike ``if c + 1 < num_chunks`` inside the loop, this carries nothing
-    # across the branch: the whole pipeline is on one side and the block has
-    # no work at all on the other.
-    if num_chunks > 0:
+    # A straight loop is the pipeline: ``head(c)`` waits only on TMA, which
+    # runs MAIN_SLOTS chunks ahead, and nothing here consumes ``ainv_ready``
+    # (the Ak.T tail runs on W13/W14 as :func:`akt_store`), so there is no
+    # wait left for a software-pipelined skew to hide.
+    for c in range(num_chunks):
         e_col = prepare_head(
-            cutlass.Int32(0),
+            c,
             p16,
             p32,
             p64,
@@ -2721,43 +1554,8 @@ def prepare_role(
             G_FP32,
             SAFE_GATE,
         )
-        for c in range(num_chunks - 1):
-            kr_b = prepare_body(
-                c,
-                e_col,
-                p16,
-                p32,
-                p64,
-                lane,
-                p,
-                dim,
-                norm_token,
-                lane_in_row,
-                q_reg,
-                packed_scale,
-                token_start,
-                token_end,
-            )
-            e_col = prepare_head(
-                c + 1,
-                p16,
-                p32,
-                p64,
-                tidx,
-                dim,
-                dt_value,
-                a_val,
-                gate_scale_log2,
-                token_start,
-                token_end,
-                G_FP32,
-                SAFE_GATE,
-            )
-            prepare_tail(c, kr_b, p16, p64, lane, p)
-
-        last = num_chunks - 1
-        kr_b = prepare_body(
-            last,
+        prepare_body(
+            c,
             e_col,
             p16,
             p32,
@@ -2767,12 +1565,10 @@ def prepare_role(
             dim,
             norm_token,
             lane_in_row,
-            q_reg,
-            packed_scale,
+            s16_scale,
             token_start,
             token_end,
         )
-        prepare_tail(last, kr_b, p16, p64, lane, p)
 
 
 # ---------------------------------------------------------------------------
@@ -2795,12 +1591,13 @@ def tma_role(
     desc_v,
     G_FP32: cutlass.Constexpr,
 ):
-    """Prefetch Q/K/G and V three chunks ahead, against independent barriers.
+    """Prefetch Q/K/G and V ``MAIN_SLOTS`` chunks ahead, on independent barriers.
 
     Generation 0's reuse parity is 1, which passes immediately on a freshly
     initialized phase-0 barrier, so this is one uniform loop from ``c = 0``
-    with no prologue special case: the first three iterations fall straight
-    through and only ``c >= 3`` is throttled by the release of slot ``c - 3``.
+    with no prologue special case: the first ``MAIN_SLOTS`` iterations fall
+    straight through and only ``c >= MAIN_SLOTS`` is throttled by the release
+    of slot ``c - MAIN_SLOTS``.
 
     All three release conditions are required and none subsumes another:
     ``r_formed`` frees the V stage, ``output_read_done`` the output half of the
@@ -2873,18 +1670,26 @@ def tma_role(
 
 
 @cute.jit
-def qk_role(p16, p64, lane, num_chunks):
-    """Causal ``QK = tril(Qd @ Ki.T)``, then ``Aq = QK @ AinvBeta``.
+def qk_role(p16, p32, p64, lane, num_chunks):
+    """Causal ``QK = tril(Qd @ Ki.T)``, then Ak.T strips 0-1, then ``Aq``.
 
     ``QK_A`` stays in registers across the wait for ``ainv_ready``; staging it
-    through SMEM would need a region the arena does not have.  ``qk_done`` is
-    released as soon as ``Ki`` has been read, long before ``Aq`` exists,
-    because W0-W3 need it to start overwriting ``Ki`` with ``Ak.T``.
+    through SMEM would need a region the arena does not have.  The arrival
+    after the QK loop says ``Ki`` has been read -- the license (together with
+    W15's own arrival) for this same warp to come back and overwrite ``Ki``
+    with ``Ak.T``.
+
+    Ak.T before Aq, not after: ``h_branch`` consumes Ak.T and feeds
+    ``state_done``, which gates W12's slot reuse four chunks out, while Aq
+    only feeds the O branch and W14's store.  The recurrence's first-ready
+    probe takes whichever lands first, and this order lands the one with the
+    longer consequence chain first.
     """
     for c in range(num_chunks):
         s = main_slot(c)
         pr = ready_parity(c)
         s16 = s * SLOT16
+        s32 = s * SLOT32
         p_qd = p16 + s16
         p_ki = p16 + (s16 + SLOT_KI // 2)
         p_ainvb = p16 + (s16 + SLOT_AINV_BETA // 2)
@@ -2906,9 +1711,21 @@ def qk_role(p16, p64, lane, num_chunks):
                 v = acc[slot]
             masked[slot] = bf16_round(v)
         qk_a = pack_a_bf16(tuple(masked))
-        warp_arrive(p64 + (BAR_QKD + s), lane)
+        # Ki has been read.  This is ``ainv_ready``'s second arrival, not a
+        # barrier of its own: the Ak.T stores need this *and* W15's AinvBeta,
+        # so one barrier counting two says exactly that.
+        warp_arrive(p64 + (BAR_AINV + s), lane)
 
         cute.arch.mbarrier_wait(p64 + (BAR_AINV + s), pr)
+        # Strips 0 and 1; W14 carries 2 and 3.  The 2/2 split is also an SMSP
+        # split: concentrating all four strips' ldmatrix/stmatrix bursts on one
+        # warp slowed the prepare and recurrence warps sharing its SMSP.  Kr is
+        # built per strip, eight registers at a time.
+        ainvb_t = a_to_at(ldmatrix_x4(p_ainvb + pairwise_a_ptr(lane)))
+        for strip in cutlass.range_constexpr(2):
+            kr_b = build_kr(p16, p32, lane, s16, s32, strip)
+            akt_store(p16, lane, s16, strip, ainvb_t, kr_b)
+        warp_arrive(p64 + (BAR_AK + s), lane)
         ainvb_b = a_to_b(ldmatrix_x4(p_ainvb + pairwise_a_ptr(lane)))
         frag = pack_a_bf16(mma_16x16(qk_a, ainvb_b, zero8()))
         stmatrix_x4(p_aq + pairwise_store_ptr(lane), frag[0], frag[1], frag[2], frag[3])
@@ -2930,7 +1747,29 @@ def inverse_role(
     value and every row or column access is a ``shuffle_sync``.  An invalid
     token's activated beta must be an exact ``+0.0`` -- it scales a whole
     strict-lower row, so anything else leaks the tail into ``Ainv``.
+
+    The logit is loaded one whole chunk early.  It is a strided column read
+    out of ``[T, H]`` -- sixteen lanes, one sector each, nothing coalesces --
+    and when the inputs do not sit in L2 it is a full DRAM latency.  On such a
+    shape W15 is the laggard, so its ``materialized`` wait is too short to
+    hide that latency, and the exposed part lands on the ``ainv_ready`` chain
+    that W13, the Ak.T strips and both recurrence branches sit behind.
+    Hiding a DRAM load takes a chunk of distance, not a barrier of distance:
+    chunk ``c + 1``'s load is issued before chunk ``c``'s activation and lands
+    behind ``c``'s entire KK + solve + wait.  One FP32 register carries it
+    across.
+
+    The last iteration re-reads its own chunk's logit (the ``nc`` clamp)
+    rather than predicating the load away: a dead in-bounds load is cheaper
+    than a dynamic guard on the hoisted load.
     """
+    logit_next = cutlass.Float32(0.0)
+    if num_chunks > 0:
+        if lane < BT:
+            if lane < clamp_rows(token_end, token_start):
+                logit_next = cutlass.Float32(
+                    gbeta[beta_global_index(token_start + lane, head, heads)]
+                )
     for c in range(num_chunks):
         s = main_slot(c)
         pr = ready_parity(c)
@@ -2941,18 +1780,28 @@ def inverse_role(
         token_base = token_start + c * BT
         valid_rows = clamp_rows(token_end, token_base)
 
-        # Issued before the wait: this is a strided column read out of [T, H]
-        # that cannot coalesce, so it should be in flight during the KK loop.
+        logit_own = logit_next
         beta_owned = cutlass.Float32(0.0)
         if lane < BT:
             if lane < valid_rows:
-                logit = cutlass.Float32(
-                    gbeta[beta_global_index(token_base + lane, head, heads)]
-                )
                 half = cutlass.Float32(0.5)
                 beta_owned = (
-                    cutlass.Float32(cute.math.tanh(logit * half, fastmath=True)) * half
+                    cutlass.Float32(cute.math.tanh(logit_own * half, fastmath=True))
+                    * half
                     + half
+                )
+
+        # The next chunk's logit, issued right here on purpose: it lands
+        # behind this chunk's whole KK + solve, which is what hides it.
+        nc = c + 1
+        if nc >= num_chunks:
+            nc = num_chunks - 1
+        next_base = token_start + nc * BT
+        logit_next = cutlass.Float32(0.0)
+        if lane < BT:
+            if lane < clamp_rows(token_end, next_base):
+                logit_next = cutlass.Float32(
+                    gbeta[beta_global_index(next_base + lane, head, heads)]
                 )
 
         cute.arch.mbarrier_wait(p64 + (BAR_MAT + s), pr)
@@ -3006,9 +1855,16 @@ def inverse_role(
 
 @cute.jit
 def io_role(
-    gout, p16, p64, lane, head, heads, token_start, token_end, num_chunks, desc_out
+    gout, p16, p32, p64, lane, head, heads, token_start, token_end, num_chunks, desc_out
 ):
-    """Publish each chunk's output, then release the slot.
+    """Ak.T strips 2-3 at each iteration's top, then chunk ``c``'s output.
+
+    Because strips(c) run after store(c - 1), this warp's ``ak_ready`` arrival
+    trails W13's.  The alternatives do no better: all four strips on W13
+    concentrates the burst on one SMSP; a one-chunk skew is this same
+    instruction sequence with the loop boundary redrawn; and a two-chunk skew
+    blocks the store path behind a future chunk's ``ainv_ready``.  The late
+    arrival is ring slack the recurrence's first-ready probe re-absorbs.
 
     A partial chunk must not go out by TMA: the box is 16 rows wide, and in a
     packed sequence the rows past ``valid_rows`` belong to the *next* sequence,
@@ -3019,44 +1875,71 @@ def io_role(
     condition for W12 to overwrite the slot.
     """
     for c in range(num_chunks):
-        s = main_slot(c)
-        pr = ready_parity(c)
-        p_out = p16 + s * SLOT16
-        token_base = token_start + c * BT
-        valid_rows = clamp_rows(token_end, token_base)
+        io_strips(p16, p32, p64, lane, c)
+        io_store_one(
+            gout, p16, p64, lane, head, heads, token_start, token_end, c, desc_out
+        )
 
-        cute.arch.mbarrier_wait(p64 + (BAR_OUTR + s), pr)
-        if valid_rows == BT:
-            cute.arch.fence_view_async_shared()
-            cute.arch.sync_warp()
-            if lane == 0:
-                for seg in cutlass.range_constexpr(2):
-                    tma_store_3d(
-                        desc_out,
-                        p_out + seg * BF16_SEGMENT_STRIDE,
-                        seg * BF16_SEGMENT_ELEMS,
-                        token_base,
-                        head,
-                    )
-                tma_store_commit_group()
-                tma_store_wait_read(0)
-        else:
-            for rep in cutlass.range_constexpr(8):
-                task = lane + rep * 32
-                if task < valid_rows * BT:
-                    row = task // BT
-                    d0 = (task - row * BT) * 8
-                    frag = vec8_bf16(p_out, raw_bf16_s128(row, d0))
-                    cute.autovec_copy(
-                        frag,
-                        vec_at(
-                            gout.iterator,
-                            out_global_index(token_base + row, head, heads, d0),
-                            8,
-                        ),
-                    )
-            cute.arch.sync_warp()
-        warp_arrive(p64 + (BAR_OUTD + s), lane)
+
+@cute.jit
+def io_strips(p16, p32, p64, lane, c):
+    """W14's half of Ak.T -- strips 2 and 3 of chunk ``c``."""
+    s = main_slot(c)
+    pr = ready_parity(c)
+    s16 = s * SLOT16
+    s32 = s * SLOT32
+    p_ainvb = p16 + (s16 + SLOT_AINV_BETA // 2)
+    cute.arch.mbarrier_wait(p64 + (BAR_AINV + s), pr)
+    ainvb_t = a_to_at(ldmatrix_x4(p_ainvb + pairwise_a_ptr(lane)))
+    for strip in cutlass.range_constexpr(2):
+        kr_b = build_kr(p16, p32, lane, s16, s32, strip + 2)
+        akt_store(p16, lane, s16, strip + 2, ainvb_t, kr_b)
+    warp_arrive(p64 + (BAR_AK + s), lane)
+
+
+@cute.jit
+def io_store_one(
+    gout, p16, p64, lane, head, heads, token_start, token_end, c, desc_out
+):
+    """Wait for chunk ``c``'s output, publish it, release the slot."""
+    s = main_slot(c)
+    pr = ready_parity(c)
+    p_out = p16 + s * SLOT16
+    token_base = token_start + c * BT
+    valid_rows = clamp_rows(token_end, token_base)
+
+    cute.arch.mbarrier_wait(p64 + (BAR_OUTR + s), pr)
+    if valid_rows == BT:
+        cute.arch.fence_view_async_shared()
+        cute.arch.sync_warp()
+        if lane == 0:
+            for seg in cutlass.range_constexpr(2):
+                tma_store_3d(
+                    desc_out,
+                    p_out + seg * BF16_SEGMENT_STRIDE,
+                    seg * BF16_SEGMENT_ELEMS,
+                    token_base,
+                    head,
+                )
+            tma_store_commit_group()
+            tma_store_wait_read(0)
+    else:
+        for rep in cutlass.range_constexpr(8):
+            task = lane + rep * 32
+            if task < valid_rows * BT:
+                row = task // BT
+                d0 = (task - row * BT) * 8
+                frag = vec8_bf16(p_out, raw_bf16_s128(row, d0))
+                cute.autovec_copy(
+                    frag,
+                    vec_at(
+                        gout.iterator,
+                        out_global_index(token_base + row, head, heads, d0),
+                        8,
+                    ),
+                )
+        cute.arch.sync_warp()
+    warp_arrive(p64 + (BAR_OUTD + s), lane)
 
 
 # ---------------------------------------------------------------------------
@@ -3072,12 +1955,12 @@ def h_branch(p_akt, smem_gt, h32, h16, res_a, lane, bar_ak, bar_state, parity):
     keys, so ``pack_bf16x2`` alone leaves H16 in the A-fragment order the
     projection wants and no ``movmatrix`` is needed anywhere.
 
-    GTotal now indexes the *column* axis, so a lane needs the two adjacent keys
+    GTotal indexes the *column* axis, so a lane needs the two adjacent keys
     of each tile rather than two rows shared across both value blocks -- 32
     values per lane instead of 16.  They are loaded as scalars, not as a pair:
     the live range is what matters here, not the instruction count, and a
-    16-byte or 8-byte load imposes a register-pair alignment this warp has
-    already been measured unable to afford.
+    16-byte or 8-byte load imposes a register-pair alignment this
+    register-bound warp cannot afford.
 
     The blocking wait is the real acquire: the first-ready probe only *chose*
     this branch, and a broadcast predicate gives the other 31 lanes no
@@ -3180,8 +2063,8 @@ def recurrence_role(
         # --- projection: H.T is the A operand, straight out of H16 ----------
         # `h_a_reg` is a selection, not a conversion: key block j's A fragment
         # is h16[4j..4j+3] already.  `fresh_b32` computes nothing -- it keeps
-        # the MMA's operand off the persistent state registers, which is worth
-        # 8 percentage points; see its docstring.
+        # the MMA's operand off the persistent state registers; see its
+        # docstring.
         x_acc = [zero4(), zero4()]
         o_acc = [zero4(), zero4()]
         for j in cutlass.range_constexpr(KEY_BLOCKS):
@@ -3199,8 +2082,8 @@ def recurrence_role(
         warp_arrive(p64 + (BAR_PROJ + s), lane)
 
         # --- residual -------------------------------------------------------
-        # A packed register now holds one value and *two adjacent tokens*, so
-        # the tail is no longer one predicate per register: the two halves can
+        # A packed register holds one value and *two adjacent tokens*, so the
+        # tail is not one predicate per register: the two halves can
         # straddle `valid_rows`.  The mask is applied after the subtract and
         # leaves an exact packed zero on an invalid token, which is what the
         # contract requires -- V is not tail-cleared in prepare, so its rows
@@ -3228,10 +2111,12 @@ def recurrence_role(
         # --- first-ready branch selection -------------
         # The two branches share no data, so whichever factor lands first can
         # run.  Only lane 0 probes, with TEST rather than TRY -- a try-wait
-        # would suspend the warp for up to 10 ms and turn a scheduling hint
-        # into a stall -- and the result is broadcast so the branch stays
-        # warp-uniform.  H wins a tie: it is the next chunk's projection
-        # dependency, while O can still overlap W14's store.
+        # may suspend the warp and turn a scheduling hint into a stall -- and
+        # the result is broadcast so the branch stays warp-uniform.  O wins a
+        # tie: O-first fires `output_ready` mid-iteration, so W14's store and
+        # the Ak.T strips gated behind it start earlier.  H-first would not
+        # help the next chunk's projection, since proj(c + 1) starts only
+        # after the whole iteration retires, whichever half ran first.
         bar_ak = p64 + (BAR_AK + s)
         bar_aq = p64 + (BAR_AQ + s)
         bar_proj = p64 + (BAR_PROJ + s)
@@ -3245,10 +2130,10 @@ def recurrence_role(
                     if mbarrier_test_wait_parity(bar_proj, pr):
                         flags = flags + 2
             flags = cutlass.Int32(cute.arch.shuffle_sync(flags, 0))
-            if (flags & 1) != 0:
-                sel = cutlass.Int32(1)
-            elif (flags & 2) != 0:
+            if (flags & 2) != 0:
                 sel = cutlass.Int32(2)
+            elif (flags & 1) != 0:
+                sel = cutlass.Int32(1)
 
         bar_state = p64 + (BAR_STATED + s)
         bar_out = p64 + (BAR_OUTR + s)
@@ -3341,7 +2226,7 @@ def state_prologue_recurrence(
     HAS_STATE_IN: cutlass.Constexpr,
     STATE_FP32: cutlass.Constexpr,
 ):
-    """Bring the external state into registers (step 3 of the design)."""
+    """Bring the external state into registers."""
     if cutlass.const_expr(not HAS_STATE_IN):
         for i in cutlass.range_constexpr(64):
             h32[i] = cutlass.Float32(0.0)
@@ -3546,7 +2431,7 @@ def fused_kda_kernel(
 
     # --- fixed arena ------------------------------------
     # One allocation of exactly DYNAMIC_SMEM_BYTES, so the launch parameter is
-    # the plan's number and every region base is a compile-time constant.
+    # that same number and every region base is a compile-time constant.
     alloc = cutlass.utils.SmemAllocator()
     p_base = alloc.allocate(DYNAMIC_SMEM_BYTES, 1024)
     p16 = cute.recast_ptr(p_base, dtype=cutlass.BFloat16)
@@ -3559,10 +2444,9 @@ def fused_kda_kernel(
                 cute.arch.mbarrier_init(p64 + (BAR_QKG + s), ARRIVALS_TX)
                 cute.arch.mbarrier_init(p64 + (BAR_V + s), ARRIVALS_TX)
                 cute.arch.mbarrier_init(p64 + (BAR_MAT + s), ARRIVALS_PREPARE)
-                cute.arch.mbarrier_init(p64 + (BAR_QKD + s), ARRIVALS_SINGLE)
-                cute.arch.mbarrier_init(p64 + (BAR_AINV + s), ARRIVALS_SINGLE)
+                cute.arch.mbarrier_init(p64 + (BAR_AINV + s), ARRIVALS_AINV_READY)
                 cute.arch.mbarrier_init(p64 + (BAR_AQ + s), ARRIVALS_SINGLE)
-                cute.arch.mbarrier_init(p64 + (BAR_AK + s), ARRIVALS_PREPARE)
+                cute.arch.mbarrier_init(p64 + (BAR_AK + s), ARRIVALS_AK)
                 cute.arch.mbarrier_init(p64 + (BAR_PROJ + s), ARRIVALS_RECURRENCE)
                 cute.arch.mbarrier_init(p64 + (BAR_RFORM + s), ARRIVALS_RECURRENCE)
                 cute.arch.mbarrier_init(p64 + (BAR_OUTR + s), ARRIVALS_RECURRENCE)
@@ -3584,9 +2468,9 @@ def fused_kda_kernel(
 
     # --- warpgroup register redistribution --------------
     # setmaxnreg is a warpgroup instruction: all four warps of a group must
-    # execute the same action with the same immediate at the same point.  The
-    # decreases have to land -- and be observed CTA-wide -- before any increase,
-    # or the pool is momentarily oversubscribed.
+    # execute the same action with the same immediate at the same point, and
+    # the decreases must be observed CTA-wide before any increase.  ptxas
+    # currently drops the request; see the ``WG*_MAXNREG`` note.
     if warp_id < PREPARE_WARPS:
         setmaxnreg_dec(WG0_MAXNREG)
     if warp_id >= TMA_WARP:
@@ -3608,9 +2492,8 @@ def fused_kda_kernel(
     if warp_id >= RECURRENCE_WARP0 and warp_id < TMA_WARP:
         rec_id = warp_id - RECURRENCE_WARP0
         v_base = rec_id * WARP_VALUES
-        # Declared here, not in the common region: their 96 values would
-        # otherwise be live across the service warps' code and ptxas could not
-        # prove the 64-register budget for WG3.
+        # Declared here, not in the common region, so their 96 values are not
+        # live across the service warps' code.
         h32 = cute.make_rmem_tensor(64, cutlass.Float32)
         h16 = cute.make_rmem_tensor(32, cutlass.Int32)
         state_prologue_recurrence(
@@ -3687,11 +2570,12 @@ def fused_kda_kernel(
                 G_FP32,
             )
         elif warp_id == QK_WARP:
-            qk_role(p16, p64, lane, num_chunks)
+            qk_role(p16, p32, p64, lane, num_chunks)
         elif warp_id == IO_WARP:
             io_role(
                 gout,
                 p16,
+                p32,
                 p64,
                 lane,
                 head,
@@ -3726,15 +2610,13 @@ def fused_kda_kernel(
 
 
 # --------------------------------------------------------------------------
-# Section 6: compiled entry, descriptor cache and launch
+# Compiled entry, descriptor cache and launch
 # --------------------------------------------------------------------------
-
-#: Devices already proven to be CC 12.0.  ``get_device_capability`` is a driver
 
 
 @dataclass(frozen=True)
 class KernelKey:
-    """the design's ordered compile key.  Fields may not be merged."""
+    """The ordered compile key.  Fields may not be merged."""
 
     device: int
     device_cc: tuple[int, int]
@@ -3744,7 +2626,6 @@ class KernelKey:
     state_dtype: torch.dtype | None
     has_initial_state: bool
     has_final_state: bool
-    input_mode: str
 
     def __post_init__(self) -> None:
         has_state = self.has_initial_state or self.has_final_state
@@ -3754,8 +2635,6 @@ class KernelKey:
                 f"initial={self.has_initial_state}, final={self.has_final_state}, "
                 f"dtype={self.state_dtype}"
             )
-        if self.input_mode not in ("fixed", "packed"):
-            raise ValueError(f"unknown input mode {self.input_mode!r}")
 
 
 _KERNEL_CACHE: dict[KernelKey, object] = {}
@@ -3772,14 +2651,6 @@ def clear_kernel_caches() -> None:
     _DESCRIPTOR_CACHE.clear()
 
 
-def kernel_cache_size() -> int:
-    return len(_KERNEL_CACHE)
-
-
-def descriptor_cache_stats(device):
-    return _DESCRIPTOR_CACHE.stats(device)
-
-
 def build_descriptors(
     *,
     q: torch.Tensor,
@@ -3793,7 +2664,7 @@ def build_descriptors(
     sequences: int,
     heads: int,
 ) -> TensorMapUpload:
-    """Encode (or reuse) the seven The descriptors."""
+    """Encode (or reuse) the TMA descriptors for one launch."""
     specs: dict[str, TensorMapSpec] = {
         "q": activation_spec(q, total_tokens, heads),
         "k": activation_spec(k, total_tokens, heads),
@@ -3807,9 +2678,7 @@ def build_descriptors(
         specs["state_out"] = state_spec(final_state, sequences, heads)
 
     device = q.device
-    key = tuple(
-        (role, specs[role].key(device)) for role in DESCRIPTOR_ROLES if role in specs
-    )
+    key = descriptor_cache_key(specs, device, DESCRIPTOR_ROLES)
     hit = _DESCRIPTOR_CACHE.get(device, key)
     if hit is not None:
         return hit
@@ -3822,61 +2691,21 @@ def build_descriptors(
     return _DESCRIPTOR_CACHE.put(device, key, upload, (upload.storage,))
 
 
-def descriptor_cache_key(specs: dict[str, TensorMapSpec], device) -> tuple:
-    """The key :func:`build_descriptors` would use.  For capture pre-checks."""
-    return tuple(
-        (role, specs[role].key(device)) for role in DESCRIPTOR_ROLES if role in specs
-    )
-
-
 #: The traced entry, built on first use.  ``@cute.jit`` decoration is not free
-#: and the result is a constant, so rebuilding it per call was pure waste.
+#: and the result is a constant, so it is built once.
 _ENTRY: tuple | None = None
 
 
-#: Whether to hand ptxas an entry register count, which is the precondition for
-#: the manual W0-W15 register split to survive to SASS at all.
-#:
-#: ``min_blocks_per_mp=1`` compiles to ``__launch_bounds__(512, 1)``, from which
-#: ptxas derives 65,536 / 512 = 128 registers per thread at entry.  That is not
-#: the final allocation -- it is the baseline the three ``setmaxnreg``
-#: instructions move away from, down to 120 and 64 and up to 160.  Without it
-#: ptxas reports ``(C7508) 'setmaxnreg' ignored; unable to determine register
-#: count at entry`` and holds every warp at 128, which is the uniform split the
-#: design does not want.
-#:
-#: Off by default until the pairing is measured: the bound acting *alone*, with
-#: the redistribution still dropped, was measured at 6,457 local-memory
-#: instructions against 240 (see :mod:`config`).  Set ``KDA_LAUNCH_BOUNDS=1`` to
-#: build the other variant.
-_LAUNCH_BOUNDS = (
-    {"min_blocks_per_mp": 1} if os.environ.get("KDA_LAUNCH_BOUNDS") == "1" else {}
-)
-
-
 def _entry_module():
-    """Import the device kernel lazily and build the entry once.
+    """Build the traced entry once and memoize it.
 
-    Host-only consumers -- validation, metadata, the layout tests -- must not
-    need the CUTLASS DSL installed, and importing it costs seconds, so this
-    stays out of module import.  The memo is what keeps it off the hot path.
-
-    This is also why this module must not carry ``from __future__ import
-    annotations``.  ``cutlass`` is a local of this function, not a module
-    global, so ``_fused_entry``'s parameter annotations below can only be
-    resolved as real objects at ``def`` time.  Postponed annotations would
-    leave them as the strings ``"cutlass.Int64"`` and friends, and the DSL
-    resolves a jit function's signature with ``inspect.get_annotations(...,
-    eval_str=True)``, which evaluates them against this module's globals --
-    where ``cutlass`` is not bound.  DSL 4.3 never looked; 4.7 does, and every
-    GPU test failed with ``NameError: name 'cutlass' is not defined`` raised
-    from inside ``inspect``.
+    The DSL resolves a jit function's signature from its parameter
+    annotations, so ``_fused_entry``'s ``cutlass.*`` annotations are written
+    as real objects rather than postponed strings.
     """
     global _ENTRY
     if _ENTRY is not None:
         return _ENTRY
-    import cutlass
-    import cutlass.cute as cute
 
     @cute.jit
     def _fused_entry(
@@ -3930,7 +2759,6 @@ def _entry_module():
             block=(THREADS, 1, 1),
             smem=DYNAMIC_SMEM_BYTES,
             stream=stream,
-            **_LAUNCH_BOUNDS,
         )
 
     _ENTRY = (cutlass, cute, _fused_entry)
@@ -3947,8 +2775,8 @@ class LaunchPlan:
     reference: the argument tuple carries raw device addresses into it, and
     letting the upload die would leave the kernel reading freed memory.
 
-    ``stream`` is baked into ``args``, which is why the cache above this must
-    key on it -- replaying a plan from another stream would launch against the
+    ``stream`` is baked into ``args``, which is why the call-plan cache keys
+    on it -- replaying a plan from another stream would launch against the
     wrong one, correctly ordered against the wrong work.
     """
 
@@ -3981,7 +2809,6 @@ def prepare_launch(
     final_state: torch.Tensor | None,
     state_dtype: torch.dtype | None,
     safe_gate: bool,
-    input_mode: str,
     stream=None,
 ) -> LaunchPlan:
     """Compile (or reuse) and assemble everything one fused forward needs.
@@ -3995,8 +2822,8 @@ def prepare_launch(
     require_sm120a(q.device)
     # ``out_global_index`` feeds ``vec_at``, which casts to ``Int32``, and the
     # DSL packs the flat view's extent as INT32 as well -- so the shape is
-    # bounded here, before anything is allocated.  This half had no such check
-    # at all, and the wrapped index is not an error but a negative offset.
+    # bounded here, before anything is allocated; a wrapped index is not an
+    # error but a negative offset.
     check_flat_output_range(total_tokens, heads)
     cutlass, _cute, entry = _entry_module()
 
@@ -4023,12 +2850,9 @@ def prepare_launch(
 
     grid_x, grid_y, _ = grid(sequences, heads)
     # grid_y is the head count, and nothing upstream bounds it against the
-    # device.  The decomposed variant checks its own grid (recurrence.py); this
-    # one did not, so a call with more heads than maxGridSize[1] -- 65535 on
-    # every current part, against 2^31-1 on axis 0 -- reached the driver and
-    # failed there.  A short, stateless call at H = 65536 fits in memory
-    # perfectly well, so nothing else would have stopped it.
-
+    # device: maxGridSize[1] is 65535 where axis 0 allows 2^31-1, and a short,
+    # stateless call at H = 65536 fits in memory perfectly well, so this is
+    # the only check that stops it before the driver.
     limits = max_grid_dims(q.device)
     for axis, (extent, limit) in enumerate(zip((grid_x, grid_y), limits, strict=False)):
         if extent > limit:
@@ -4073,13 +2897,12 @@ def prepare_launch(
             else torch.cuda.current_device()
         ),
         device_cc=DEVICE_CC,
-        code_target=CODE_TARGET,
+        code_target=SM120_CODE_TARGET,
         g_dtype=g.dtype,
         safe_gate=bool(safe_gate),
         state_dtype=state_dtype,
         has_initial_state=initial_state is not None,
         has_final_state=final_state is not None,
-        input_mode=input_mode,
     )
     compiled = _KERNEL_CACHE.get(key)
     if compiled is None:
@@ -4105,13 +2928,6 @@ def prepare_launch(
         )
         _KERNEL_CACHE[key] = compiled
     return LaunchPlan(key=key, descriptors=descriptors, compiled=compiled, args=args)
-
-
-def launch_fused(**kwargs) -> tuple[KernelKey, TensorMapUpload, object]:
-    """Prepare and launch in one step.  Used by tests and one-shot callers."""
-    plan = prepare_launch(**kwargs)
-    plan.run()
-    return plan.key, plan.descriptors, plan.compiled
 
 
 # --------------------------------------------------------------------------
@@ -4150,26 +2966,19 @@ def kernel_name(key: "KernelKey") -> str:
             state,
             "si" if key.has_initial_state else "nosi",
             "so" if key.has_final_state else "noso",
-            key.input_mode,
         )
     )
 
 
 # --------------------------------------------------------------------------
-# Section 7: the host path
+# The host path
 #
-# Structurally the same idea as the decomposed variant's: an LRU on a
-# tensor- and workspace-identity key, an object-identity fast path in front of
-# it, a state-only shortcut, and the stream in the key because a plan bakes its
-# ``CUstream`` into the argument tuple.
-#
-# The two are not folded together, and the difference is load-bearing rather
-# than stylistic.  This half carries ``safe_gate``, which the other refuses
-# outright; it has one descriptor set where the other has two plus a shared
-# factor slab; and it has no chunk tables at all, because a fused CTA owns a
-# whole (sequence, head) and never needs a chunk-to-sequence map.  A merged
-# "call plan cache" would have to carry the union of those and branch on the
-# variant at every step, which is the same code with an extra way to be wrong.
+# An LRU of launch plans on a tensor- and workspace-identity key, an
+# object-identity fast path in front of it, a state-only shortcut, and the
+# stream in the key because a plan bakes its ``CUstream`` into the argument
+# tuple.  It is separate from the decomposed variant's cache: this one carries
+# ``safe_gate``, has a single descriptor set and needs no chunk tables, since
+# a fused CTA owns a whole (sequence, head).
 #
 # Three things are deliberately not cached, because caching them would be wrong
 # rather than merely slow:
@@ -4180,150 +2989,15 @@ def kernel_name(key: "KernelKey") -> str:
 # * plans across streams, for the reason above.
 # --------------------------------------------------------------------------
 
-#: One entry per distinct set of buffers a caller uses; a serving loop that
-#: reuses its activations needs exactly one.
 
-#: 16 is a ceiling on *how many rotating buffer sets stay fast*, not a memory
-#: budget, and lowering it does not trade speed for memory -- it buys nothing
-#: until the workload exceeds it and then costs everything.  Measured on the
-#: 110-SM part at ``[1, 1024, 8, 128]``, rotating N buffer sets:
-#:
-#: ===  ==================  ==================
-#: cap  N = 4               N = 8
-#: ===  ==================  ==================
-#: 16   101 us / 40.6 MiB   116 us / 72.7 MiB
-#: 4    105 us / 40.6 MiB   7145 us / 40.6 MiB
-#: 2    7670 us / 24.6 MiB  7546 us / 24.6 MiB
-#: ===  ==================  ==================
-#:
-#: Below the cap the retention is identical whatever the cap is; at the cap the
-#: hit becomes a rebuild, and a rebuild is ~7.3 ms against a ~100 us hit.  A
-#: deployment that needs the memory back should reduce how many buffer sets it
-#: rotates, or call ``clear_kda_prefill_sm120_caches()``; shrinking this number
-#: only moves the same allocation into a 70x slower path.
-CALL_PLAN_MAX_ENTRIES = 16
-_CALL_PLANS: OrderedDict = OrderedDict()
-
-#: The previous call's tensors, versions, scalars, workspace, stream and plan. Strong
-#: references, one slot: keying on ``id()`` would be unsound, since a freed
-#: tensor's id can be reused by a different one and the plan would then be
-#: handed to the wrong buffers, and weak references would cost a dereference
-#: per tensor to save pinning a single call's worth.
-_LAST: tuple | None = None
-
-#: Marks "this call has no tokens", so the zero-token path is reached on a plan
-#: hit without re-deriving the metadata that proves it.
-_STATE_ONLY = object()
-
-#: Serializes the cache-miss path: plan construction, descriptor encoding and
-#: the compile behind it.
-#:
-#: The launch lock below is not enough on its own, and the reason is worth
-#: recording. Four host threads issuing the same shape share one factor arena
-#: and one launch lock, so their *enqueues* interleave correctly -- but a cold
-#: build is not an enqueue. It encodes descriptors, writes shared scratch and
-#: calls into the CuTe DSL compiler, none of which is re-entrant: the legacy
-#: implementation, given the same four threads, does not produce wrong numbers
-#: so much as raise ``_fwd_entry() requires a code object with 0 free vars`` and
-#: "Please start a session before accessing session data" from inside the DSL.
-#: Measured here, the first thread's output was wrong in 1515 of 32768 elements
-#: while the other three were exact -- the signature of the builder racing its
-#: own build.
-#:
-#: A module-level lock is the right shape for that. It is taken only on a miss,
-#: so a serving loop that reuses its buffers never sees it, and the two cache
-#: layers in front of it are checked before it is acquired.
-_BUILD_LOCK = threading.RLock()
+#: This variant's call memo; see :class:`~.runtime.PlanMemo`.
+_MEMO = PlanMemo()
 
 
 def clear_caches() -> None:
     """Drop every cache this variant owns."""
-    global _LAST
-    _CALL_PLANS.clear()
-    _LAST = None
+    _MEMO.clear()
     clear_kernel_caches()
-
-
-def call_plan_stats() -> dict:
-    return {"plans": len(_CALL_PLANS), "last_call_warm": _LAST is not None}
-
-
-def _identity(device, tensors, scale, lower_bound, safe_gate, resources) -> tuple:
-    # The stream of the *inputs'* device: ``prepare_launch`` bakes
-    # ``torch.cuda.current_stream(q.device)`` into the plan's argument tuple,
-    # so a key built from the current device's stream would let two streams on
-    # the input's device share one entry and reuse the first one's plan.
-    return (
-        tuple(tensor_identity(t) for t in tensors),
-        float(scale),
-        float(lower_bound),
-        bool(safe_gate),
-        resource_cache_token(resources),
-        current_stream_ptr(device),
-    )
-
-
-def _fast_path(device, tensors, scale, lower_bound, safe_gate, resources):
-    """The previous call's plan if this call is identical to it, else ``None``."""
-    if _LAST is None:
-        return None
-    (
-        last_tensors,
-        last_versions,
-        last_scalars,
-        last_resources,
-        last_stream,
-        plan,
-    ) = _LAST
-    if last_scalars != (float(scale), float(lower_bound), bool(safe_gate)):
-        return None
-    if last_resources is not resource_cache_token(resources):
-        return None
-    if last_stream != current_stream_ptr(device):
-        return None
-    if len(last_tensors) != len(tensors):
-        return None
-    for ref, tensor in zip(last_tensors, tensors, strict=True):
-        if ref is None:
-            if tensor is not None:
-                return None
-        elif ref() is not tensor:
-            return None
-    for tensor, version in zip(tensors, last_versions, strict=True):
-        if tensor is not None and tensor_version(tensor) != version:
-            return None
-    return plan
-
-
-def _remember(device, tensors, scale, lower_bound, safe_gate, resources, plan) -> None:
-    global _LAST
-    # Weak, like the plan LRU above: this entry outlives the call, and strong
-    # references to q, k, v, g and out would hold one whole activation set off
-    # the caching allocator until the next call replaced it.
-    _LAST = (
-        tuple(None if t is None else weakref.ref(t) for t in tensors),
-        tuple(None if t is None else tensor_version(t) for t in tensors),
-        (float(scale), float(lower_bound), bool(safe_gate)),
-        resource_cache_token(resources),
-        current_stream_ptr(device),
-        plan,
-    )
-
-
-def _state_only(initial_state, final_state) -> None:
-    """The zero-token path.
-
-    No kernel launches and no zero-extent descriptor is built: a TensorMap with
-    a zero global dimension is invalid, and there is nothing for it to describe.
-    """
-    if final_state is None:
-        return
-    if initial_state is None:
-        final_state.zero_()
-        return
-    if is_exact_alias(initial_state, final_state):
-        return
-    final_state.copy_(initial_state)
 
 
 def _packed(t: torch.Tensor | None) -> torch.Tensor | None:
@@ -4356,11 +3030,13 @@ def run(
     offsets,
     resources=None,
     safe_gate: bool = True,
-) -> None:
+) -> Any:
     """Launch the fused prefill, writing ``out`` and ``final_state`` in place.
 
     ``info`` and ``offsets`` come from :mod:`.runtime`: the facade validates and
-    canonicalizes once, so this is not a second validation pass.
+    canonicalizes once, so this is not a second validation pass.  Returns the
+    plan it ran, or :data:`STATE_ONLY_PLAN`, which the facade memoizes together
+    with :func:`execute`.
     """
     tensors = (
         q,
@@ -4376,16 +3052,15 @@ def run(
         cu_seqlens,
     )
 
-    plan = _fast_path(q.device, tensors, scale, lower_bound, safe_gate, resources)
+    scalars = (float(scale), float(lower_bound), bool(safe_gate))
+    plan = _MEMO.fast_path(q.device, tensors, scalars, resources)
     if plan is None:
-        key = _identity(q.device, tensors, scale, lower_bound, safe_gate, resources)
-        # See ``_BUILD_LOCK``: the miss path is not re-entrant, and the two
-        # cache layers in front of it mean a warm caller never reaches it.
-        with _BUILD_LOCK:
-            plan = _CALL_PLANS.get(key)
-            if plan is not None:
-                _CALL_PLANS.move_to_end(key)
-            else:
+        key = _MEMO.identity(q.device, tensors, scalars, resources)
+        # See ``PlanMemo.build_lock``: the miss path is not re-entrant, and
+        # the two memo levels in front of it mean a warm caller never reaches it.
+        with _MEMO.build_lock:
+            plan = _MEMO.get(key)
+            if plan is None:
                 plan = _build_plan(
                     q=q,
                     k=k,
@@ -4405,29 +3080,11 @@ def run(
                     resources=resources,
                     safe_gate=safe_gate,
                 )
-                _CALL_PLANS[key] = plan
-                while len(_CALL_PLANS) > CALL_PLAN_MAX_ENTRIES:
-                    _CALL_PLANS.popitem(last=False)
-            _remember(q.device, tensors, scale, lower_bound, safe_gate, resources, plan)
+                _MEMO.remember_plan(key, plan)
+            _MEMO.remember(q.device, tensors, scalars, resources, plan)
 
     execute(plan, initial_state, final_state)
     return plan
-
-
-def execute(plan, initial_state, final_state) -> None:
-    """Run an already-resolved plan.
-
-    Split out so the facade, which has its own memo on the same tensor
-    identities, does not have to repeat the comparison this module's fast path
-    would do to find the same plan again. Two layers each walking eleven
-    tensors cost about 6 us per call -- nothing against a 1 ms kernel, and a
-    third of the whole call at B=1 T=16 H=4.
-    """
-    if plan is _STATE_ONLY:
-        # Real work the caller expects on every call, so a hit redoes it.
-        _state_only(initial_state, final_state)
-        return
-    plan.run()
 
 
 def _build_plan(
@@ -4458,7 +3115,7 @@ def _build_plan(
     require_sm120a(q.device)
 
     if info.total_tokens == 0:
-        return _STATE_ONLY
+        return STATE_ONLY_PLAN
 
     if info.input_mode == "fixed":
         pq, pk, pv, pg = (_packed(t) for t in (q, k, v, g))
@@ -4507,7 +3164,6 @@ def _build_plan(
         final_state=final_state,
         state_dtype=info.state_dtype,
         safe_gate=bool(safe_gate),
-        input_mode=info.input_mode,
     )
 
     if resources is not None:
@@ -4563,10 +3219,8 @@ def dynamic_smem_bytes() -> int:
 
 
 __all__ = [
-    "CALL_PLAN_MAX_ENTRIES",
     "KernelKey",
     "LaunchPlan",
-    "call_plan_stats",
     "clear_caches",
     "clear_kernel_caches",
     "code_target",

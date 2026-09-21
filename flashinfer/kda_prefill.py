@@ -27,6 +27,7 @@ import functools
 import heapq
 import math
 import threading
+import weakref
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -523,18 +524,15 @@ class _RecurrentKDAPrefillWorkspaceBase:
         self._bound_stream_ptr: Optional[int] = None
         self._captured = False
         # The SM120 backend's per-workspace state, created on first use by
-        # ``_sm120_prefill_resources``. A Cake-only caller carries this one
-        # ``None`` field and never imports CuTe DSL; composing rather than
-        # subclassing keeps ``RecurrentKDAPrefillWorkspace`` the single public
-        # workspace type while letting each backend own the buffers only it
-        # understands.
+        # ``_sm120_prefill_resources``.  Composed rather than subclassed so
+        # ``RecurrentKDAPrefillWorkspace`` stays the single public workspace
+        # type while each backend owns the buffers only it understands; a
+        # Cake-only caller carries one ``None`` field and never imports CuTe DSL.
         self._sm120_state: Optional[object] = None
-        #: Guards the creation of ``_sm120_state``.  Two threads reaching a
-        #: workspace's first SM120 call would otherwise both read ``None`` and
-        #: both construct: one assignment wins and the loser runs against an
-        #: orphan with its own lock, its own scratch and its own capture flag,
-        #: so nothing serializes the launch sequence, device memory doubles,
-        #: and a capture is recorded where no one will look for it.
+        #: Guards the creation of ``_sm120_state``: two threads reaching a
+        #: workspace's first SM120 call must not each construct one, since the
+        #: loser would run against an orphan with its own lock, scratch and
+        #: capture flag.
         self._sm120_state_lock = threading.Lock()
 
 
@@ -6857,37 +6855,26 @@ def _sm120_kda_prefill_rejection_reason(
     the reason, while a caller who forced this backend wants to be told which
     of thirty conditions it missed.
     """
-    if not _is_plain_multi_token_prefill(q, cu_seqlens, num_spec_tokens):
-        return "not an ordinary multi-token prefill"
-    if num_accepted_tokens is not None:
-        return "num_accepted_tokens is a speculative-decode argument"
-    if initial_state_source is not None or initial_state_indices is not None:
-        return "initial_state_source/initial_state_indices are unsupported"
-    if ssm_state_indices is not None:
-        return "ssm_state_indices (state pooling) is unsupported"
-    if seq_order is not None:
-        return "seq_order is unsupported"
-    if (
-        checkpoint_every_n_tokens != 0
-        or state_checkpoints is not None
-        or checkpoint_cu_starts is not None
-    ):
-        return "prefill state checkpoints are unsupported"
-    if not use_qk_l2norm_in_kernel:
-        return "use_qk_l2norm_in_kernel=False is unsupported"
-    if not use_gate_in_kernel:
-        return "use_gate_in_kernel=False is unsupported"
-    if not beta_is_logit:
-        return "beta_is_logit=False is unsupported"
-    if lower_bound is None or not math.isfinite(float(lower_bound)):
-        return "lower_bound must be a finite negative float"
-    if not _SM120_KDA_LOWER_BOUND_MIN <= float(lower_bound) < 0.0:
-        return (
-            f"lower_bound must be in [{_SM120_KDA_LOWER_BOUND_MIN}, 0.0), got "
-            f"{lower_bound}"
-        )
-    if scale is not None and not math.isfinite(float(scale)):
-        return "scale must be finite"
+    reason = _sm120_kda_prefill_flag_rejection_reason(
+        q=q,
+        cu_seqlens=cu_seqlens,
+        num_spec_tokens=num_spec_tokens,
+        num_accepted_tokens=num_accepted_tokens,
+        initial_state_source=initial_state_source,
+        initial_state_indices=initial_state_indices,
+        ssm_state_indices=ssm_state_indices,
+        seq_order=seq_order,
+        checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+        state_checkpoints=state_checkpoints,
+        checkpoint_cu_starts=checkpoint_cu_starts,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        use_gate_in_kernel=use_gate_in_kernel,
+        beta_is_logit=beta_is_logit,
+        lower_bound=lower_bound,
+        scale=scale,
+    )
+    if reason is not None:
+        return reason
 
     if not q.is_cuda:
         return "q must be a CUDA tensor"
@@ -7007,6 +6994,166 @@ def _sm120_kda_prefill_rejection_reason(
     return None
 
 
+def _sm120_kda_prefill_flag_rejection_reason(
+    *,
+    q: torch.Tensor,
+    cu_seqlens: Optional[torch.Tensor],
+    num_spec_tokens: Optional[int],
+    num_accepted_tokens: Optional[torch.Tensor],
+    initial_state_source: Optional[torch.Tensor],
+    initial_state_indices: Optional[torch.Tensor],
+    ssm_state_indices: Optional[torch.Tensor],
+    seq_order: Optional[torch.Tensor],
+    checkpoint_every_n_tokens: int,
+    state_checkpoints: Optional[torch.Tensor],
+    checkpoint_cu_starts: Optional[torch.Tensor],
+    use_qk_l2norm_in_kernel: bool,
+    use_gate_in_kernel: bool,
+    beta_is_logit: bool,
+    lower_bound: Optional[float],
+    scale: Optional[float],
+) -> Optional[str]:
+    """The host-side half of :func:`_sm120_kda_prefill_rejection_reason`.
+
+    Everything here is a flag, a scalar or the presence of an argument: no
+    tensor is inspected beyond ``q``'s rank and the offsets' presence.  It is
+    what the dispatcher checks before asking the backend for a memoized plan,
+    so the warm path answers these questions and nothing else.
+    """
+    if not _is_plain_multi_token_prefill(q, cu_seqlens, num_spec_tokens):
+        return "not an ordinary multi-token prefill"
+    if num_accepted_tokens is not None:
+        return "num_accepted_tokens is a speculative-decode argument"
+    if initial_state_source is not None or initial_state_indices is not None:
+        return "initial_state_source/initial_state_indices are unsupported"
+    if ssm_state_indices is not None:
+        return "ssm_state_indices (state pooling) is unsupported"
+    if seq_order is not None:
+        return "seq_order is unsupported"
+    if (
+        checkpoint_every_n_tokens != 0
+        or state_checkpoints is not None
+        or checkpoint_cu_starts is not None
+    ):
+        return "prefill state checkpoints are unsupported"
+    if not use_qk_l2norm_in_kernel:
+        return "use_qk_l2norm_in_kernel=False is unsupported"
+    if not use_gate_in_kernel:
+        return "use_gate_in_kernel=False is unsupported"
+    if not beta_is_logit:
+        return "beta_is_logit=False is unsupported"
+    if lower_bound is None or not math.isfinite(float(lower_bound)):
+        return "lower_bound must be a finite negative float"
+    if not _SM120_KDA_LOWER_BOUND_MIN <= float(lower_bound) < 0.0:
+        return (
+            f"lower_bound must be in [{_SM120_KDA_LOWER_BOUND_MIN}, 0.0), got "
+            f"{lower_bound}"
+        )
+    if scale is not None and not math.isfinite(float(scale)):
+        return "scale must be finite"
+    return None
+
+
+#: Per-device answer to "can this process build ``sm_120a`` for it?".  The
+#: backend's own predicate re-derives it from the driver on every call, which
+#: is fine once per plan and not fine once per layer.
+_SM120_DEVICE_OK: dict[int, bool] = {}
+
+
+def _sm120_kda_prefill_warm_call(
+    *,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    A_log: Optional[torch.Tensor],
+    dt_bias: Optional[torch.Tensor],
+    scale: Optional[float],
+    initial_state: Optional[torch.Tensor],
+    output_final_state: bool,
+    use_qk_l2norm_in_kernel: bool,
+    use_gate_in_kernel: bool,
+    lower_bound: Optional[float],
+    cu_seqlens: Optional[torch.Tensor],
+    ssm_state_indices: Optional[torch.Tensor],
+    num_spec_tokens: Optional[int],
+    num_accepted_tokens: Optional[torch.Tensor],
+    output: Optional[torch.Tensor],
+    initial_state_source: Optional[torch.Tensor],
+    initial_state_indices: Optional[torch.Tensor],
+    beta_is_logit: bool,
+    seq_order: Optional[torch.Tensor],
+    prefill_workspace: Optional[RecurrentKDAPrefillWorkspace],
+    state_checkpoints: Optional[torch.Tensor],
+    checkpoint_cu_starts: Optional[torch.Tensor],
+    checkpoint_every_n_tokens: int,
+) -> Optional[tuple[torch.Tensor, Optional[torch.Tensor]]]:
+    """Run this call from the SM120 backend's memo, or return ``None``.
+
+    The dispatcher's fast path.  A memoized plan exists only for a call that
+    passed :func:`_sm120_kda_prefill_is_eligible` and the backend's own
+    validation with tensors the memo verifies by object identity, address,
+    layout and version -- so on a hit both are implied and neither is repeated.
+    What the memo cannot see are this contract's flags, which is why they are
+    checked here and folded into the memo key.  A miss costs the flag checks
+    and one memo probe; the full path then runs as it always has.
+    """
+    if A_log is None or dt_bias is None or not q.is_cuda:
+        return None
+    index = q.device.index
+    if index is None:
+        index = torch.cuda.current_device()
+    device_ok = _SM120_DEVICE_OK.get(index)
+    if device_ok is None:
+        from . import kda_kernels
+
+        can_implement = kda_kernels.can_implement_kda_prefill_sm120
+        device_ok = can_implement is not None and bool(can_implement(q=q))
+        _SM120_DEVICE_OK[index] = device_ok
+    if not device_ok:
+        return None
+    if (
+        _sm120_kda_prefill_flag_rejection_reason(
+            q=q,
+            cu_seqlens=cu_seqlens,
+            num_spec_tokens=num_spec_tokens,
+            num_accepted_tokens=num_accepted_tokens,
+            initial_state_source=initial_state_source,
+            initial_state_indices=initial_state_indices,
+            ssm_state_indices=ssm_state_indices,
+            seq_order=seq_order,
+            checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+            state_checkpoints=state_checkpoints,
+            checkpoint_cu_starts=checkpoint_cu_starts,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            use_gate_in_kernel=use_gate_in_kernel,
+            beta_is_logit=beta_is_logit,
+            lower_bound=lower_bound,
+            scale=scale,
+        )
+        is not None
+    ):
+        return None
+    return _run_sm120_kda_prefill(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        scale=scale,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        lower_bound=lower_bound,
+        cu_seqlens=cu_seqlens,
+        output=output,
+        prefill_workspace=prefill_workspace,
+        lookup_only=True,
+    )
+
+
 def _check_sm120_output_overlaps(output: torch.Tensor, inputs) -> bool:
     """Does ``output`` share any bytes with an input?
 
@@ -7041,6 +7188,43 @@ def _sm120_kda_prefill_is_eligible(**kwargs) -> bool:
 
     can_implement = kda_kernels.can_implement_kda_prefill_sm120
     return can_implement is not None and can_implement(**kwargs)
+
+
+#: ``[H * 128]`` -> ``[H, 128]`` views by source tensor, held weakly.  One
+#: entry per parameter tensor; a model has one ``dt_bias`` per KDA layer.
+_SM120_DT_BIAS_VIEWS: dict[int, tuple] = {}
+
+
+def _sm120_dt_bias_view(dt_bias: torch.Tensor, heads: int) -> torch.Tensor:
+    """The ``[H, 128]`` view of a rank-1 ``dt_bias``, the same object each time.
+
+    A view shares its source's storage, so its contents follow the source and
+    only the source's identity and layout can invalidate it; both are checked.
+    """
+    key = id(dt_bias)
+    cached = _SM120_DT_BIAS_VIEWS.get(key)
+    if cached is not None:
+        ref, view, data_ptr, numel = cached
+        if (
+            ref() is dt_bias
+            and view.shape[0] == heads
+            and dt_bias.data_ptr() == data_ptr
+            and dt_bias.numel() == numel
+        ):
+            return view
+        _SM120_DT_BIAS_VIEWS.pop(key, None)
+    view = dt_bias.view(heads, _FLASH_KDA_HEAD_DIM)
+
+    def _purge(_ref, _key=key):
+        _SM120_DT_BIAS_VIEWS.pop(_key, None)
+
+    _SM120_DT_BIAS_VIEWS[key] = (
+        weakref.ref(dt_bias, _purge),
+        view,
+        dt_bias.data_ptr(),
+        dt_bias.numel(),
+    )
+    return view
 
 
 def _sm120_prefill_resources(
@@ -7111,7 +7295,8 @@ def _run_sm120_kda_prefill(
     cu_seqlens: Optional[torch.Tensor],
     output: Optional[torch.Tensor],
     prefill_workspace: Optional[RecurrentKDAPrefillWorkspace],
-) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    lookup_only: bool = False,
+) -> Optional[tuple[torch.Tensor, Optional[torch.Tensor]]]:
     """Run the SM120 backend and adapt its result to the public contract.
 
     The state semantics are the public ones, not the backend's:
@@ -7123,8 +7308,18 @@ def _run_sm120_kda_prefill(
       different contract than the one they called;
     * without an initial state but with ``output_final_state=True`` a bfloat16
       final state is allocated, or taken from the workspace when one is bound.
+
+    With ``lookup_only`` the backend is asked for its memoized plan and
+    nothing else; ``None`` comes back on a miss.  A probe also declines, rather
+    than raising, at every refusal below: the dispatcher falls through to the
+    full path, which raises for the caller's contract or hands the call to
+    another backend.  ``output_final_state`` is part of the memo key because
+    it decides which state buffer the launch writes, which the memo could not
+    otherwise tell apart.
     """
     if output is None and torch.cuda.is_current_stream_capturing():
+        if lookup_only:
+            return None
         raise RuntimeError(
             "CUDA graph capture requires a preallocated output tensor for "
             "recurrent_kda prefill"
@@ -7134,17 +7329,24 @@ def _run_sm120_kda_prefill(
 
     run = kda_kernels.run_kda_prefill_sm120
     if run is None:
+        if lookup_only:
+            return None
         raise RuntimeError(
             "the SM120 KDA CuTe DSL prefill backend is unavailable"
         ) from kda_kernels._kda_sm120_import_error
 
     # ``[H * 128]`` adapts with a no-copy view; the backend's ABI is ``[H, 128]``.
+    # The view is cached per source tensor: the backend memoizes on object
+    # identity, and a view built here on every call is a new object every call,
+    # which turned every warm call into a plan rebuild.
     if dt_bias.ndim == 1:
-        dt_bias = dt_bias.view(q.shape[2], _FLASH_KDA_HEAD_DIM)
+        dt_bias = _sm120_dt_bias_view(dt_bias, q.shape[2])
 
     if prefill_workspace is not None and prefill_workspace._captured:
         # Check the shared shell before creating its SM120 state: it may have
         # been spent by a captured Cake call that never needed these resources.
+        if lookup_only:
+            return None
         raise RuntimeError(
             "RecurrentKDAPrefillWorkspace has participated in CUDA graph "
             "capture and cannot be reused or mutated; create another one"
@@ -7156,33 +7358,40 @@ def _run_sm120_kda_prefill(
     num_sequences = q.shape[0] if cu_seqlens is None else cu_seqlens.numel() - 1
 
     def _resolve_final_state():
-        """The public state contract, applied here rather than in the backend.
+        """Apply the public state contract; returns ``(final_state, is_private)``.
 
         The backend's ABI is the kernels' own -- ``initial_state`` read,
-        ``final_state`` written, the exact alias between them allowed -- and the
-        public promise is a different one: a supplied initial state is updated
-        in place, whether or not a final state was requested. Aliasing the two
-        is how that promise is kept, and doing it here preserves the backend's
-        direct validation ABI.
+        ``final_state`` written, the exact alias between them allowed -- while
+        the public promise is that a supplied initial state is updated in place
+        whether or not a final state was requested.  Aliasing the two here is
+        how that promise is kept.  ``is_private`` says this call allocated the
+        buffer for itself, which lets the backend keep its call memo warm across
+        a buffer that is a new object every time.
 
         Callable rather than a value because the workspace branch resolves it
         under ``resources.lock``: the middle case can *replace* workspace-owned
-        scratch, and doing that outside the hold that guards the spent flag lets
-        a second thread drop the buffer a first thread's live graph reads at its
-        captured address.
+        scratch, which must not happen outside the hold that guards the spent
+        flag.
         """
         if initial_state is not None:
-            return initial_state
+            return initial_state, False
         if output_final_state:
-            return _sm120_final_state_scratch(
+            state = _sm120_final_state_scratch(
                 num_sequences, q.shape[2], q.device, resources
             )
+            # Without a workspace that is a fresh buffer on every call, existing
+            # only to be written and then handed back.  The backend has to key
+            # its call memo on the address rather than on the object, or every
+            # such call misses and rebuilds its plan.  The workspace branch
+            # returns one stable buffer and needs no such licence.
+            return state, resources is None
         # Nothing to store: the kernels skip the state write entirely rather
         # than filling a buffer the caller will not read.
-        return None
+        return None, False
 
-    def _launch(final_state):
-        run(
+    def _launch(resolved):
+        final_state, final_state_is_private = resolved
+        ran = run(
             q=q,
             k=k,
             v=v,
@@ -7194,10 +7403,15 @@ def _run_sm120_kda_prefill(
             lower_bound=float(lower_bound),
             initial_state=initial_state,
             final_state=final_state,
+            final_state_is_private=final_state_is_private,
             cu_seqlens=cu_seqlens,
             output=out,
             resources=resources,
+            lookup_only=lookup_only,
+            call_key=(bool(output_final_state),),
         )
+        if ran is None:
+            return None
         # ``output_final_state=False`` returns None even when a state was
         # updated in place: returning it because it happens to exist would be a
         # different contract than the one the caller asked for.
@@ -7205,19 +7419,17 @@ def _run_sm120_kda_prefill(
 
     if resources is None:
         # Refuse capture here, at the outermost adapter, rather than relying on
-        # the guards further down.  Those sit on cache *misses* -- the
-        # device-to-host read for cu_seqlens, the canonical-offsets allocation
-        # -- so a warm cache walks straight past them and the capture succeeds.
-        #
-        # It must not.  Without an explicit workspace, the descriptors and
-        # scratch a capture records belong to a bounded LRU, and the graph holds
-        # their raw addresses.  Nothing pins them: the next distinct shape can
-        # evict the entry, and clear_kda_prefill_sm120_caches() drops it
-        # outright.  Replay then reads freed memory, arbitrarily far from the
-        # call that captured it, and the symptom is wrong output rather than an
-        # error.  An explicit workspace is what makes those addresses the
-        # caller's to keep alive.
+        # the guards further down: those sit on cache *misses* (the
+        # device-to-host read for cu_seqlens, the canonical-offsets allocation),
+        # so a warm cache walks straight past them.  Without an explicit
+        # workspace the descriptors and scratch a capture records belong to a
+        # bounded LRU: the next distinct shape can evict them and
+        # clear_kda_prefill_sm120_caches() drops them outright, after which
+        # replay reads freed memory and the symptom is wrong output rather than
+        # an error.
         if torch.cuda.is_current_stream_capturing():
+            if lookup_only:
+                return None
             raise RuntimeError(
                 "CUDA graph capture of the SM120 KDA prefill backend requires "
                 "an explicit workspace: without one the graph would record "
@@ -7230,23 +7442,20 @@ def _run_sm120_kda_prefill(
     # The workspace serializes its own launch sequence: the decomposed variant
     # enqueues two kernels that share one scratch arena, and two host threads
     # interleaving those pairs would have the second prepare overwrite factors
-    # the first recurrence has not read yet.
-    #
-    # One hold covers the spent check, the scratch resolution and the launch.
-    # Split, they race each other: a thread that read ``captured`` as False can
-    # replace ``state_scratch`` after another thread's capture has recorded the
-    # old buffer's address, and two threads wanting different state shapes can
-    # each install their own, leaving the loser holding a ``final_state`` the
-    # workspace no longer owns. The backend re-checks the flag, which orders the
-    # launches, but it cannot undo a replacement that already happened.
+    # the first recurrence has not read yet.  One hold covers the spent check,
+    # the scratch resolution and the launch; split, a thread that read
+    # ``captured`` as False could replace ``state_scratch`` after another
+    # thread's capture recorded the old buffer's address.
     with resources.lock:
         if resources.captured:
+            if lookup_only:
+                return None
             raise RuntimeError(
                 "RecurrentKDAPrefillWorkspace has participated in CUDA graph "
                 "capture and cannot be reused or mutated; create another one"
             )
         result = _launch(_resolve_final_state())
-        if torch.cuda.is_current_stream_capturing():
+        if result is not None and torch.cuda.is_current_stream_capturing():
             # A workspace that has been captured is spent: replay reads its
             # buffers at the addresses capture recorded, and handing it back to
             # Python -- eagerly or for a second capture -- would let those
