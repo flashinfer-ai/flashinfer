@@ -2747,6 +2747,14 @@ class BatchPrefillWithPagedKVCacheWrapper:
         if fixed_split_size is None:
             fixed_split_size = -1
 
+        # The planner and the kernels read these through raw data pointers, and
+        # ``.to(device)`` keeps a strided view strided, so normalize them (they
+        # are tiny) rather than silently misreading non-contiguous inputs.
+        qo_indptr = qo_indptr.contiguous()
+        paged_kv_indptr = paged_kv_indptr.contiguous()
+        paged_kv_indices = paged_kv_indices.contiguous()
+        paged_kv_last_page_len = paged_kv_last_page_len.contiguous()
+
         batch_size = len(qo_indptr) - 1
         self._batch_size = batch_size
         self._num_qo_heads = num_qo_heads
@@ -4293,6 +4301,16 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             fixed_split_size = -1
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
+
+        # The planner and the kernels read these through raw data pointers, and
+        # ``.to(device)`` keeps a strided view strided, so normalize them (they
+        # are tiny) rather than silently misreading non-contiguous inputs.
+        qo_indptr = qo_indptr.contiguous()
+        kv_indptr = kv_indptr.contiguous()
+        if o_indptr is not None:
+            o_indptr = o_indptr.contiguous()
+        if v_indptr is not None:
+            v_indptr = v_indptr.contiguous()
 
         batch_size = len(qo_indptr) - 1
         if len(kv_indptr) != batch_size + 1:
