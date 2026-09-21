@@ -197,12 +197,14 @@ def _torch_nvfp4_mega_reference(
     intermediate,
     gate_up_clamp,
     term_transform=None,
+    swiglu_alpha=None,
+    swiglu_beta=None,
 ):
     """Pure-torch NVFP4 MegaMoE oracle (apply_topk_in_fc1=True graph).
 
     Mirrors the kernel's data path — dequant → fp32 fc1 GEMM → 16-interleaved
     SwiGLU fold (+clamp) → per-token topk weight folded in BEFORE the fc1-out
-    NVFP4 round-trip → fp32 fc2 GEMM — so kernel-vs-oracle disagreement is
+    NVFP4 round-trip → fp32 fc2 GEMM → bf16 terms — so disagreement is
     bounded by NVFP4 RTNE flips at fc1-out plus GEMM accumulation-order noise.
 
     ``term_transform``, when set, is applied to each per-(token, topk) fc2
@@ -245,7 +247,11 @@ def _torch_nvfp4_mega_reference(
             limit = abs(float(gate_up_clamp))
             gate = gate.clamp(max=limit)
             up = up.clamp(min=-limit, max=limit)
-        swiglu = (gate * torch.sigmoid(gate) * up).reshape(m, intermediate)
+        alpha = 1.0 if swiglu_alpha is None else swiglu_alpha
+        beta = 0.0 if swiglu_beta is None else swiglu_beta
+        swiglu = (gate * torch.sigmoid(alpha * gate) * (up + beta)).reshape(
+            m, intermediate
+        )
 
         # apply_topk_in_fc1=True: weight folded in before the fp4 round-trip
         # (post-hoc weighting would NOT match — quant changes the magnitude).
@@ -258,6 +264,8 @@ def _torch_nvfp4_mega_reference(
             fc2_weight[expert], fc2_sf[expert], logical_cols=intermediate
         )  # (hidden, I)
         fc2_out = swiglu_rt @ fc2_w.transpose(0, 1)
+        # FC2 stores each expert term in BF16 before the top-k reduction.
+        fc2_out = fc2_out.to(torch.bfloat16).float()
         if term_transform is not None:
             fc2_out = term_transform(fc2_out)
         out[tokens, slots] = fc2_out
@@ -334,18 +342,20 @@ def test_nvfp4_preprocess_fp4_weights_match_plain_quant():
 
 @pytest.mark.arch_blackwell
 @pytest.mark.parametrize(
-    "hidden,intermediate,num_experts,topk",
+    "hidden,intermediate,num_experts,topk,activation_clamp",
     [
-        pytest.param(2048, 1024, 4, 4, id="regular-e4"),
+        pytest.param(2048, 1024, 4, 4, "standard", id="regular-e4"),
         # 128-misaligned (hidden % 128 == 64): exercises the ceil-div K-tail
         # and predicated epilogue paths the %64 validation relaxation opened
         # up (gpt-oss-120b geometry class).
-        pytest.param(2880, 2880, 4, 4, id="tail-e4"),
-        pytest.param(2048, 1024, 1, 1, id="singleton-e1"),
+        pytest.param(2880, 2880, 4, 4, "standard", id="tail-e4"),
+        pytest.param(2048, 1024, 1, 1, "standard", id="singleton-e1"),
+        pytest.param(2048, 1024, 4, 4, 0.5, id="minimax-clamp"),
+        pytest.param(2048, 1024, 4, 4, None, id="minimax-no-clamp"),
     ],
 )
 def test_nvfp4_kernel_matches_torch_reference(
-    monkeypatch, hidden, intermediate, num_experts, topk
+    monkeypatch, hidden, intermediate, num_experts, topk, activation_clamp
 ):
     """Single-rank ``nvfp4_mega_moe`` output matches the pure-torch oracle."""
     _require_cuda()
@@ -380,6 +390,14 @@ def test_nvfp4_kernel_matches_torch_reference(
         num_experts=num_experts,
         topk=topk,
     )
+    activation_pairs = [(None, None)]
+    if activation_clamp != "standard":
+        problem["gate_up_clamp"] = activation_clamp
+        # Keep gates near zero so ignoring alpha changes the output visibly.
+        # A 0.5 clamp exercises both saturated and unsaturated gate/up values.
+        problem["hidden_states"].mul_(0.1)
+        problem["w13"].mul_(0.1)
+        activation_pairs = [(1.702, 1.0), (1.0, 1.0), (1.0, 0.0), (1.702, 1.0)]
     rank = 0
     world_size = 1
     num_tokens = problem["num_tokens"]
@@ -404,6 +422,8 @@ def test_nvfp4_kernel_matches_torch_reference(
         2 * problem["intermediate"],
         rank,
         world_size,
+        swiglu_alpha=activation_pairs[0][0],
+        swiglu_beta=activation_pairs[0][1],
         gate_up_clamp=problem["gate_up_clamp"],
     )
     try:
@@ -417,49 +437,53 @@ def test_nvfp4_kernel_matches_torch_reference(
             symm_buffer.topk_weights,
         )
 
-        y_ref = _torch_nvfp4_mega_reference(
-            act_packed=symm_buffer.x[:num_tokens],
-            act_sf=symm_buffer.x_sf[:num_tokens],
-            topk_idx=symm_buffer.topk_idx[:num_tokens],
-            topk_weights=symm_buffer.topk_weights[:num_tokens],
-            fc1_weight=fc1_plain,
-            fc1_sf=fc1_sf,
-            fc2_weight=fc2_plain,
-            fc2_sf=fc2_sf,
-            hidden=problem["hidden"],
-            intermediate=problem["intermediate"],
-            gate_up_clamp=problem["gate_up_clamp"],
-        )
+        for step, (alpha, beta) in enumerate(activation_pairs):
+            y_ref = _torch_nvfp4_mega_reference(
+                act_packed=symm_buffer.x[:num_tokens],
+                act_sf=symm_buffer.x_sf[:num_tokens],
+                topk_idx=symm_buffer.topk_idx[:num_tokens],
+                topk_weights=symm_buffer.topk_weights[:num_tokens],
+                fc1_weight=fc1_plain,
+                fc1_sf=fc1_sf,
+                fc2_weight=fc2_plain,
+                fc2_sf=fc2_sf,
+                hidden=problem["hidden"],
+                intermediate=problem["intermediate"],
+                gate_up_clamp=problem["gate_up_clamp"],
+                swiglu_alpha=alpha,
+                swiglu_beta=beta,
+            )
 
-        y_kernel = torch.empty(
-            num_tokens, problem["hidden"], dtype=torch.bfloat16, device="cuda"
-        )
-        nvfp4_mega_moe(
-            y_kernel,
-            transformed_l1,
-            transformed_l2,
-            symm_buffer,
-            num_tokens=num_tokens,
-            gate_up_clamp=problem["gate_up_clamp"],
-        )
-        torch.cuda.synchronize()
+            y_kernel = torch.empty(
+                num_tokens, problem["hidden"], dtype=torch.bfloat16, device="cuda"
+            )
+            nvfp4_mega_moe(
+                y_kernel,
+                transformed_l1,
+                transformed_l2,
+                symm_buffer,
+                **({} if step == 0 else dict(swiglu_alpha=alpha, swiglu_beta=beta)),
+                num_tokens=num_tokens,
+                gate_up_clamp=problem["gate_up_clamp"],
+            )
+            torch.cuda.synchronize()
 
-        assert torch.isfinite(y_kernel).all()
-        yk = y_kernel.to(torch.float32)
-        yr = y_ref.to(torch.float32)
-        rel_l2 = (yk - yr).norm() / yr.norm().clamp_min(1e-6)
-        print(
-            f"[nvfp4 oracle] rel_l2={rel_l2.item():.4g} "
-            f"max|Δ|={(yk - yr).abs().max().item():.4g} "
-            f"amax(ref)={yr.abs().max().item():.4g}"
-        )
-        # The oracle shares the kernel's quantized operands, so the residual is
-        # NVFP4 RTNE flips at fc1-out + accumulation-order noise (measured
-        # rel_l2≈0.0027 on GB200; kernel is bit-exact vs the CuTeDSL reference
-        # launcher on the same operands). atol scales with the output range
-        # (random unscaled weights put |y|~1e4 here).
-        atol = 2e-3 * yr.abs().max().item()
-        torch.testing.assert_close(yk, yr, atol=atol, rtol=0.05)
-        assert rel_l2.item() < 0.02
+            assert torch.isfinite(y_kernel).all()
+            yk = y_kernel.to(torch.float32)
+            yr = y_ref.to(torch.float32)
+            rel_l2 = (yk - yr).norm() / yr.norm().clamp_min(1e-6)
+            print(
+                f"[nvfp4 oracle alpha={alpha} beta={beta}] rel_l2={rel_l2.item():.4g} "
+                f"max|Δ|={(yk - yr).abs().max().item():.4g} "
+                f"amax(ref)={yr.abs().max().item():.4g}"
+            )
+            # The oracle shares the kernel's quantized operands, so the residual is
+            # NVFP4 RTNE flips at fc1-out + accumulation-order noise (measured
+            # rel_l2≈0.0027 on GB200; kernel is bit-exact vs the CuTeDSL reference
+            # launcher on the same operands). atol scales with the output range
+            # (random unscaled weights put |y|~1e4 here).
+            atol = 2e-3 * yr.abs().max().item()
+            torch.testing.assert_close(yk, yr, atol=atol, rtol=0.05)
+            assert rel_l2.item() < 0.02
     finally:
         symm_buffer.destroy()
