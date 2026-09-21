@@ -19,6 +19,11 @@ from ....fused_moe.api import QuantFormat, RoutingInputMode, SwiGLU
 from ....fused_moe.runners import MoERunner, _validate_prerouted_inputs
 from ....utils import get_compute_capability
 from . import fc2, runtime
+from ..cache import (
+    LRUCache,
+    require_graph_resource_retention,
+    retain_graph_resources,
+)
 from ..capabilities import require_compiler
 from ..activations import ACTIVATIONS, activation_name
 from .support import large_bf16_moe
@@ -154,7 +159,7 @@ class CudnnFrostBf16MoeRunner(MoERunner):
         self.device = torch.device(device)
         if self.device.type == "cuda" and self.device.index is None:
             self.device = torch.device("cuda", torch.cuda.current_device())
-        self._plans = {}
+        self._plans = LRUCache()
         self._workspace_pool = {}
 
     def _check_support(self):
@@ -189,6 +194,7 @@ class CudnnFrostBf16MoeRunner(MoERunner):
                 }
             )
         )
+        require_graph_resource_retention()
         require_compiler(arch, sources)
 
     def _build(self):
@@ -336,7 +342,13 @@ class CudnnFrostBf16MoeRunner(MoERunner):
         return tactic == -1 or tactic in self.get_valid_tactics(inputs, None)
 
     def forward(
-        self, inputs, tactic: Any = -1, do_preparation=False, *, launch_state=None
+        self,
+        inputs,
+        tactic: Any = -1,
+        do_preparation=False,
+        *,
+        launch_state=None,
+        **kwargs: Any,
     ):
         self._require_built()
         state = launch_state or self.launch_state_for(inputs)
@@ -348,6 +360,7 @@ class CudnnFrostBf16MoeRunner(MoERunner):
             tactic = next(iter(state.launches))
         if tactic not in state.launches:
             raise ValueError(f"Unknown or stale cuDNN Frost MoE tactic: {tactic!r}")
+        retain_graph_resources(state, inputs)
         state.launches[tactic](*inputs, state.workspace)
         return inputs[0]
 

@@ -80,16 +80,17 @@ def cudnn_frost_grouped_gemm1_swiglu(
             f"got dtype={workspace.dtype}, numel={workspace.numel()}"
         )
     runner = CudnnFrostGroupedGemm1SwiGLURunner()
-    # There are no dynamic profile dimensions, so the autotuner reuses the
-    # caller's real tensors, including the content-bearing grouped offsets.
-    # This avoids synthesizing invalid routing metadata while still allowing
-    # every matching offline-generated cuDNN Frost artifact to race as a tactic.
-    runner, tactic = AutoTuner.get().choose_one(
-        "cudnn_frost_grouped_gemm1_swiglu",
-        [runner],
-        TuningConfig(profiling_repeat=30),
-        inputs,
-    )
+    if tactic == -1:
+        # There are no dynamic profile dimensions, so the autotuner reuses the
+        # caller's real tensors, including the content-bearing grouped offsets.
+        # This avoids synthesizing invalid routing metadata while still allowing
+        # every matching offline-generated cuDNN Frost artifact to race as a tactic.
+        runner, tactic = AutoTuner.get().choose_one(
+            "cudnn_frost_grouped_gemm1_swiglu",
+            [runner],
+            TuningConfig(profiling_repeat=30),
+            inputs,
+        )
     return runner(inputs=inputs, tactic=tactic)
 
 

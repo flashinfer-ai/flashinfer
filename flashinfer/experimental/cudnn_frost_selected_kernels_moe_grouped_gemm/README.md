@@ -32,6 +32,11 @@ and later compiler/runtime failures remain errors; static capability checks do
 not guarantee compiler correctness. Validation uses the installed internal DSL
 build, not a public 4.8 wheel; public 4.8+ remains the planned deployment baseline.
 This backend does not change the repository-wide dependency floor.
+MoE runners additionally require PyTorch's
+`CUDAGraph.get_currently_capturing_graph()` and
+`CUDAGraph.retain_object(..., synchronize_before_release=True)` APIs, verified
+with PyTorch 2.14. Missing graph ownership capabilities decline automatic
+admission and raise `NotImplementedError` for explicit MoE runner use.
 The native routing/finalize adapter additionally needs a CUDA toolkit supporting
 the target architecture. Set `FLASHINFER_CUTE_DSL_DISABLE_CACHE=1` to compile
 without persisting CuTe DSL artifacts; neither mode writes compiled objects
@@ -154,6 +159,16 @@ changing weight scales and repacking refreshes the copied scale buffers, and
 existing graphs must be captured again. Inference tensors have no version
 counter: replace the tensor object when changing prepared weights or scales.
 Keep the layer alive for its graphs and use one instance per stream/thread.
+Preparation lookup caches retain at most 32 exact-shape plans, four packed
+FC1 scale views, and 32 scale-validation records per runner. Scale keys weakly
+reference their source tensors; unused records disappear when their sources
+die. Active packed inputs and captured PyTorch graphs own the resources they
+use independently of lookup eviction. Graph reset/destruction synchronizes its
+replay streams before releasing these resources. Replaying through raw CUDA
+graph handles bypasses that PyTorch lifetime tracking and is unsupported.
+A shape or scale version evicted from lookup must be prepared again outside
+capture before capturing a new call. MoELayer keeps at most 128 winner entries;
+`reset_winner()` clears them as before.
 
 The `artifacts/mxfp8/` pool retains 169 selected configurations in 39 source
 templates, with 400 measured two-by-two profiles. The offline pool covers all
@@ -197,12 +212,31 @@ For prepared grouped execution:
 
 ```python
 from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.mxfp8 import runtime as mxfp8
+from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.runtime import (
+    _arch_for, _dimension_matches,
+)
 
 # x: grouped E4M3 [S,K]; gate/up: E4M3 [E,N,K]; offsets: int32 [G].
 # x_sf: logical E8M0 bytes [S,K/32]; gate_sf/up_sf: [E,N,K/32].
 # Choose an artifact matching the operation, architecture and shape contract.
-kernel = next(k for k in mxfp8.discover()
-              if k.fc1 and k.activation == "swiglu" and not k.swap_ab)
+arch = _arch_for(x.device)
+geometry = dict(
+    s=x.shape[0], n=gate.shape[1], k=x.shape[1],
+    experts=gate.shape[0], groups=offsets.numel(),
+)
+kernel = next(
+    (k for k in mxfp8.discover()
+     if k.fc1 and k.activation == "swiglu" and not k.swap_ab
+     and k.arch == arch
+     and all(_dimension_matches(value, k.contract.get(name))
+             for name, value in geometry.items())),
+    None,
+)
+if kernel is None:
+    raise RuntimeError(
+        f"No packaged MXFP8 SwiGLU kernel matches {arch}, {geometry}; "
+        "export a matching artifact before preparing this grouped GEMM."
+    )
 plan = mxfp8.PreparedMxfp8GroupedGemm(
     kernel, x, (gate, up), offsets,
     mxfp8.pack_token_scales(x_sf, offsets),

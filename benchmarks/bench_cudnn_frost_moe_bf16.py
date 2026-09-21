@@ -274,7 +274,8 @@ def benchmark(args):
             for label, out in outputs.items()
             if label != "original"
         }
-        assert all(error < 0.015 for error in errors.values()), errors
+        if not all(error < 0.015 for error in errors.values()):
+            raise RuntimeError(f"MoE backend correctness check failed: {errors}")
         samples = {label: [] for label in graphs}
         for round_idx in range(args.rounds):
             check_idle_gpu(gpu_uuid)

@@ -143,8 +143,10 @@ def _discover(
 
 def clear_artifact_cache() -> None:
     from ..shortlist import _read
+    from .fc2 import discover as discover_fc2
 
     _discover.cache_clear()
+    discover_fc2.cache_clear()
     _clear_source_cache()
     _read.cache_clear()
 

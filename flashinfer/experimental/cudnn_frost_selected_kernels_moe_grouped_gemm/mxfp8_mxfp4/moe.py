@@ -21,6 +21,12 @@ from ....fused_moe.runners import MoERunner, _validate_prerouted_inputs
 from ....utils import get_compute_capability
 from .. import runtime as common
 from ..activations import ACTIVATIONS, activation_name
+from ..cache import (
+    LRUCache,
+    require_graph_resource_retention,
+    retain_graph_resources,
+    TensorCache,
+)
 from ..capabilities import require_compiler
 from ..shortlist import _read, select
 from . import runtime
@@ -221,8 +227,9 @@ class CudnnFrostMxfp8Mxfp4MoeRunner(MoERunner):
         self.config, self.device = config, torch.device(device)
         if self.device.type == "cuda" and self.device.index is None:
             self.device = torch.device("cuda", torch.cuda.current_device())
-        self._plans, self._workspace_pool, self._identity_scales = {}, {}, {}
-        self._fc1_scale_views = {}
+        self._plans, self._workspace_pool = LRUCache(), {}
+        self._identity_scales = TensorCache(maxsize=32)
+        self._fc1_scale_views = TensorCache()
 
     def _check_support(self):
         super()._check_support()
@@ -246,6 +253,7 @@ class CudnnFrostMxfp8Mxfp4MoeRunner(MoERunner):
                 }
             )
         )
+        require_graph_resource_retention()
         require_compiler("sm_107a", sources)
 
     def _build(self):
@@ -255,10 +263,8 @@ class CudnnFrostMxfp8Mxfp4MoeRunner(MoERunner):
         # Canonical preparation creates static identity global scales. The
         # frozen FC1 applies activation internally, so arbitrary global GEMM
         # multipliers cannot be silently substituted by an output multiplier.
-        key = id(value)
         version = _tensor_version(value)
-        cached = self._identity_scales.get(key)
-        if cached is not None and cached[0] is value and cached[1] == version:
+        if self._identity_scales.get(value, version) is not None:
             return
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
@@ -268,7 +274,7 @@ class CudnnFrostMxfp8Mxfp4MoeRunner(MoERunner):
             raise ValueError(
                 "cuDNN Frost MXFP8 × MXFP4 requires identity per-expert global scales"
             )
-        self._identity_scales[key] = (value, version)
+        self._identity_scales.put(value, version, True)
 
     def _validate_pack(self, act, weights):
         if act.routing_input_mode not in self.supported_routing_modes:
@@ -384,8 +390,8 @@ class CudnnFrostMxfp8Mxfp4MoeRunner(MoERunner):
         t, h, i, e, k, w1, w2, sf1, sf2, xsf = self._validate_pack(act, weights)
         mult = 2 if self.config.activation.is_gated else 1
         version = _tensor_version(sf1)
-        cached = self._fc1_scale_views.get(id(sf1))
-        if cached is None or cached[0] is not sf1 or cached[1] != version:
+        cached = self._fc1_scale_views.get(sf1, version)
+        if cached is None:
             with torch.cuda.device(self.device):
                 if torch.cuda.is_current_stream_capturing():
                     raise RuntimeError(
@@ -396,9 +402,9 @@ class CudnnFrostMxfp8Mxfp4MoeRunner(MoERunner):
                 packed_sf1 = (
                     sf1.reshape(e, mult, i, h // 32).transpose(0, 1).contiguous()
                 )
-            cached = (sf1, version, packed_sf1)
-            self._fc1_scale_views[id(sf1)] = cached
-        sf1 = cached[2]
+            cached = packed_sf1
+            self._fc1_scale_views.put(sf1, version, cached)
+        sf1 = cached
         first, second = _selected_kernels(
             t, h, i, e, k, self.device, self.config.activation
         )
@@ -479,7 +485,13 @@ class CudnnFrostMxfp8Mxfp4MoeRunner(MoERunner):
         return tactic == -1 or tactic in self.get_valid_tactics(inputs, None)
 
     def forward(
-        self, inputs, tactic: Any = -1, do_preparation=False, *, launch_state=None
+        self,
+        inputs,
+        tactic: Any = -1,
+        do_preparation=False,
+        *,
+        launch_state=None,
+        **kwargs: Any,
     ):
         self._require_built()
         state = launch_state or self.launch_state_for(inputs)
@@ -491,6 +503,7 @@ class CudnnFrostMxfp8Mxfp4MoeRunner(MoERunner):
             tactic = next(iter(state.launches))
         if tactic not in state.launches:
             raise ValueError(f"Unknown or stale cuDNN Frost MoE tactic: {tactic!r}")
+        retain_graph_resources(state, inputs)
         state.launches[tactic](*inputs, state.workspace)
         return inputs[0]
 

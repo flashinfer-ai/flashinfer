@@ -20,6 +20,7 @@ by measuring each runner's best tactic, then dispatches to the winner.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import replace
 from statistics import median
 from typing import Any, Dict, List, Optional, Tuple, Type, Union
@@ -296,7 +297,9 @@ class MoELayer:
         # caches its own winner; the mode qualifier keeps a winner tuned for
         # one routing input style (e.g. pre-routed → CuteDSL) from being
         # dispatched a pack it cannot execute (FromLogits).
-        self._winners: Dict[tuple, Tuple[_RunnerT, Any]] = {}
+        # Exact-shape automatic candidates can introduce arbitrarily many keys;
+        # retain only the 128 most recently used selections.
+        self._winners: OrderedDict[tuple, Tuple[_RunnerT, Any]] = OrderedDict()
         # Backend key selected on the most recent call (introspection hook).
         self._last_winner_backend: Optional[str] = None
 
@@ -378,6 +381,10 @@ class MoELayer:
         if winner is None:
             winner = self._select_winner(act_pack, weight_pack, runners)
             self._winners[winner_key] = winner
+            if len(self._winners) > 128:
+                self._winners.popitem(last=False)
+        else:
+            self._winners.move_to_end(winner_key)
         runner, tactic = winner
         self._last_winner_backend = runner.backend_key
         if any(runner is candidate for candidate in additional):
