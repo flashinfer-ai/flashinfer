@@ -480,9 +480,10 @@ def test_decode_resolver_fails_closed_outside_child_contract() -> None:
 def test_architecture_mapping_is_exact() -> None:
     assert cake_gdn.arch_for_compute_capability(10, 0) == "sm_100a"
     assert cake_gdn.arch_for_compute_capability(10, 3) == "sm_103a"
+    assert cake_gdn.arch_for_compute_capability(10, 7) == "sm_107a"
     with pytest.raises(
         cake_gdn.CakeGDNUnsupportedError,
-        match="supports only SM100a/SM103a",
+        match="supports only SM100a/SM103a/SM107a",
     ):
         cake_gdn.arch_for_compute_capability(12, 0)
 
