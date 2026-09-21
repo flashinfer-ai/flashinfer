@@ -319,8 +319,8 @@ def _issue_sparse_page_copies(
                     )
         return
     if cutlass.const_expr(cfg.uses_2d_flat_kv_tma):
-        # A warp owns complete fragments across head planes. Its locator is
-        # genuinely uniform: expose that before election so both TMA copies
+        # A warp owns complete fragments across head planes. Its staged token
+        # coordinate is uniform: expose that before election so both TMA copies
         # reuse uniform coordinates instead of serializing lane operands.
         # General addressing retains its lane-parallel decode. One-shot
         # kernels keep parallel shared loads to minimize startup latency.
@@ -337,9 +337,8 @@ def _issue_sparse_page_copies(
         # advance staged locators and SMEM destinations independently of the
         # scattered global coordinates. Head-plane copies stay unrolled.
         for _fragment_idx in cutlass.range(uniform_fragments_per_warp, unroll=1):
-            uniform_locator = cute.arch.make_warp_uniform(Int32(uniform_page_ptr[0]))
-            uniform_token_offset, _ = _decode_native_page_locator(
-                cfg, uniform_locator, kv_head
+            uniform_token_offset = cute.arch.make_warp_uniform(
+                Int32(uniform_page_ptr[0])
             )
             if prims.elect_sync():
                 for head_chunk in cutlass.range_constexpr(chunks):
@@ -1976,14 +1975,19 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
         lane,
         warp_rank,
         route_state,
+        kv_head,
     ):
         """Stage int32 IDs with cp.async and resolve direct inputs in place.
 
         Copy and mapping use the same lane ownership, so the per-thread
         wait suffices before in-place mapping. The existing TS full barrier
         then publishes all lanes' final locators to the TMA load task.
-        Materialized locators need no translation. Direct inputs contain only
-        selected block IDs; their causal tail locators are synthesized here.
+        Direct inputs contain only selected block IDs; their causal tail
+        locators are synthesized here.
+        The uniform FP8 issuer consumes flat token coordinates, decoded here
+        per staged entry rather than in the issuer. Held windows share these
+        across K/V; the streamed K/V staging cadence is unchanged. Other
+        issuers consume IDs.
         """
         entries = self.page_ids_per_stage
         stage_base = stage_info.stage_idx * Int32(entries)
@@ -2045,6 +2049,14 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
                 elif slot > last:
                     # cp.async zero-fill is not the invalid-locator sentinel.
                     self._smem_page_offsets[stage_base + offset] = Int32(-1)
+                if cutlass.const_expr(
+                    self.cfg.use_fp8_qkv and self.cfg.uses_2d_flat_kv_tma
+                ):
+                    locator = Int32(self._smem_page_offsets[stage_base + offset])
+                    token_offset, _ = _decode_native_page_locator(
+                        self.cfg, locator, kv_head
+                    )
+                    self._smem_page_offsets[stage_base + offset] = token_offset
 
     @cute.jit
     def _producer_load_page_offsets(
@@ -2260,6 +2272,7 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
                 lane_idx,
                 page_warp_rank,
                 direct_route,
+                logical_h_idx,
             )
         elif cutlass.const_expr(self.holds_encoded_locator_window):
             # Stripe whole KV tiles: with two producers, warps own even/odd
