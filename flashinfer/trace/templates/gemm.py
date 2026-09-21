@@ -938,7 +938,8 @@ def _mm_bf16_fp4_native_reference(
     weight = lut[codes] * sf
     if alpha is not None:
         weight = weight * alpha.float()
-    result = (a.float() @ weight.T).to(out_dtype or a.dtype)
+    result_dtype = out.dtype if out is not None else (out_dtype or a.dtype)
+    result = (a.float() @ weight.T).to(result_dtype)
     if out is not None:
         out.copy_(result)
         return out

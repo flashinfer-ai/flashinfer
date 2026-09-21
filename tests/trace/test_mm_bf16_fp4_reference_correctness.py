@@ -73,6 +73,38 @@ def test_mm_bf16_fp4_reference_correctness(backend, shape_kwargs):
         torch.cuda.synchronize()
 
 
+@pytest.mark.parametrize("out_dtype", [None, torch.bfloat16, torch.float16])
+def test_native_trace_reference_uses_output_buffer_dtype(out_dtype):
+    """An FP16 output buffer must not receive an intermediate BF16 rounding."""
+    import flashinfer
+    from flashinfer.trace.templates.gemm import mm_bf16_fp4_trace_dispatch
+
+    a = torch.zeros((1, 16), dtype=torch.bfloat16)
+    a[0, 0], a[0, 1] = 1, 1 / 256
+    b = torch.full((1, 8), 0x22, dtype=torch.uint8)
+    sf = torch.ones(512, dtype=torch.float8_e4m3fn)
+    out = torch.empty((1, 1), dtype=torch.float16)
+    kwargs = dict(
+        a=a,
+        b=b,
+        b_descale=sf,
+        backend="cute-dsl-native",
+        out_dtype=out_dtype,
+        out=out,
+    )
+    definition = flashinfer.fi_trace(flashinfer.mm_bf16_fp4, **kwargs)
+    assert definition["outputs"]["C"]["dtype"] == "float16"
+    namespace = {}
+    exec(definition["reference"], namespace)
+    template = mm_bf16_fp4_trace_dispatch(**kwargs)
+    result = namespace[template.reference.__name__](
+        a, b, sf, out_dtype=out_dtype, out=out
+    )
+    assert result is out
+    expected = torch.tensor([[1 + 1 / 256]], dtype=torch.float16)
+    torch.testing.assert_close(result, expected, atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("m", [3, 33])
 @pytest.mark.parametrize("scale_shape", [(1024,), (256, 4), (2, 1, 32, 4, 4)])
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
