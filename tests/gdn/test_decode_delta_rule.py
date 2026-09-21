@@ -2386,7 +2386,7 @@ def test_gdn_decode_bf16_state_mtp_kernel(
 # ==============================================================================
 # Reuses _test_gdn_decode_bf16_state_mtp_kernel by monkey-patching the module's
 # `gdn_decode_bf16_state_mtp` symbol for the scope of this test only. The
-# parametrization is wider (B up to 256, T up to 8, HV in {32, 64}) because
+# parametrization is wider (B up to 64, T up to 8, HV in {32, 64}) because
 # wide_vec's sweet spot is at large work-sizes; we want coverage where it
 # matters. See results/bf16_mtp_optimization_apr18/wide_vec_design.md for the design.
 
@@ -2634,8 +2634,9 @@ def test_gdn_decode_bf16_state_recovery_per_request_k(
         state_ref[i] = pool_i[0]
 
     # BF16 epsilon is 2^-8 ≈ 0.0039. Noise scales with sqrt(N) where N is
-    # accumulation count (B * K * K-dim reductions). At B=256, T=8, expected
-    # noise envelope is ~0.05 — set tolerance just above.
+    # accumulation count (B * K * K-dim reductions). At B=64, T=8 the envelope
+    # is ~0.025; the 0.06 bound predates the removal of B=256 and is left
+    # deliberately conservative.
     diff = (pool_state_perreq - state_ref).abs().max().item()
     assert diff <= 0.06, (
         f"per-request kernel deviates from per-request reference: "
