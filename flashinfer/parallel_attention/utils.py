@@ -42,10 +42,10 @@ def split_varlen_input(tensor, seq_len_list, world_size, rank, tensor_layout="HN
 
     Given a tensor whose sequence dimension is the concatenation of multiple
     sub-sequences, split each sub-sequence into ``world_size`` chunks and return
-    the ``rank``-th chunk concatenated together. The first ``world_size - 1``
-    ranks each get ``ceil(seq_len / world_size)`` tokens per sub-sequence;
-    the last rank gets the remainder. The result is zero-padded so that all
-    ranks have the same total sequence length.
+    the ``rank``-th chunk concatenated together. Each rank gets up to
+    ``ceil(seq_len / world_size)`` tokens per sub-sequence; ranks beyond the
+    end of a short sub-sequence get an empty chunk. The result is zero-padded
+    so that all ranks have the same total sequence length.
 
     Args:
         tensor: Input tensor of shape ``[H, total_seq_len, D]`` (HND) or
@@ -79,16 +79,14 @@ def split_varlen_input(tensor, seq_len_list, world_size, rank, tensor_layout="HN
     offset = 0
     for seq_len in seq_len_list:
         seq_len = int(seq_len)
-        # First (world_size - 1) ranks get ceil(seq_len / world_size),
-        # last rank gets whatever is left.
         base = (seq_len + world_size - 1) // world_size
-        if rank < world_size - 1:
-            chunk_len = base
-            start = offset + base * rank
-        else:
-            # Last rank gets the remainder
-            start = offset + base * (world_size - 1)
-            chunk_len = seq_len - base * (world_size - 1)
+        # When a sequence is shorter than ``world_size``, ranks beyond its
+        # extent own an empty chunk. Clamp the relative start so even a
+        # zero-length ``narrow`` begins at the end of the sequence rather than
+        # past the packed tensor.
+        relative_start = min(base * rank, seq_len)
+        start = offset + relative_start
+        chunk_len = min(base, seq_len - relative_start)
 
         chunks.append(tensor.narrow(chunk_dim, start, chunk_len))
         offset += seq_len
