@@ -344,6 +344,40 @@ class TestPrimsTsUnifiedGpu:
         direct_out = runner.forward(packed, tactic=-1)
         _bf16_check(direct_out, reference, "prims_ts bf16 direct")
 
+    def test_tuning_pre_hook_binds_each_packs_static_extras(self):
+        """Two packs on one runner: each pack's tuning pre-hook installs its own
+        inner static extras, so tactic enumeration never reads the other's."""
+        shape = dict(
+            hidden_size=256,
+            intermediate_size=256,
+            num_experts=8,
+            top_k=2,
+            max_tokens=16,
+        )
+        packed_act, weights, config, _ = _make_bf16_packs_and_config(16, **shape)
+        unpacked_act, _, _, _ = _make_bf16_packs_and_config(
+            16, routing_input_mode=RoutingInputMode.UnpackedPrecomputed, **shape
+        )
+        _, weights, config = _with_prims_ts_backend(
+            packed_act, weights, config, "trtllm_bf16_routed"
+        )
+        runner = _build_direct_runner(
+            PrimsTsRunner, config, packed_act.hidden_states_q.device
+        )
+        packed = runner.pack_inputs(packed_act, weights)
+        unpacked = runner.pack_inputs(unpacked_act, weights)
+
+        def mode_after_pre_hook(inputs):
+            hook = runner.tuning_config_for(inputs).inputs_pre_hook
+            hook([t.clone() if t is not None else None for t in inputs])
+            return dict(runner._inner._cache_key_static_extras)["routing_input_mode"]
+
+        assert mode_after_pre_hook(packed) == int(RoutingInputMode.PackedPrecomputed)
+        assert mode_after_pre_hook(unpacked) == int(
+            RoutingInputMode.UnpackedPrecomputed
+        )
+        assert mode_after_pre_hook(packed) == int(RoutingInputMode.PackedPrecomputed)
+
     def test_nvfp4_cuda_graph_replay_matches_eager(self):
         from flashinfer.autotuner import autotune
 

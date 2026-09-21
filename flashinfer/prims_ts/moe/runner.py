@@ -163,9 +163,10 @@ def _staged_routing_mode(
     """Resolve staged-routing mode, preferring the explicit kwarg.
 
     The C++ launcher infers packed vs unpacked vs logits from tensor rank,
-    not from ``routing_input_mode``. When the caller omitted the kwarg
-    (flat APIs), reconstruct the same rule: 2-D nonempty ids+weights are
-    unpacked, 2-D nonempty ids alone are packed, otherwise logits.
+    not from ``routing_input_mode``. The in-tree flat ops and the unified
+    runner always pass the kwarg; when a direct inner-runner caller omits
+    it, reconstruct the same rule: 2-D nonempty ids+weights are unpacked,
+    2-D nonempty ids alone are packed, otherwise logits.
     """
     mode = kwargs.get("routing_input_mode")
     if mode is not None:

@@ -28,6 +28,7 @@ import warnings
 import weakref
 from collections import OrderedDict
 from contextlib import suppress
+import dataclasses
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, ClassVar, List, Literal, Mapping, Optional
@@ -6715,7 +6716,6 @@ class PrimsTsRunner(_TrtllmRunnerBase):
             enable_pdl = device_support_pdl(device)
         self._enable_pdl = enable_pdl
         self._inner: Any = None
-        self._last_launch_state: _TrtllmLaunchState | None = None
 
     def _weight_layout(self) -> int:
         from flashinfer.tllm_enums import WeightLayout
@@ -6759,20 +6759,16 @@ class PrimsTsRunner(_TrtllmRunnerBase):
         self, inputs: List[torch.Tensor], profile: Any
     ) -> List[Any]:
         self._require_built()
-        self._sync_inner_static_extras(inputs)
+        # Under autotune the pack's ``inputs_pre_hook`` has already synced the
+        # inner extras; a direct call with the packed list syncs here.
+        self._sync_inner_static_extras(getattr(inputs, "launch_state", None))
         return self._inner.get_valid_tactics(inputs, profile)
 
-    def _sync_inner_static_extras(
-        self,
-        inputs: List[torch.Tensor],
-        launch_state: _TrtllmLaunchState | None = None,
-    ) -> None:
-        # Autotune synthesizes a plain tensor list, so fall back to the
-        # launch state from the most recent pack_inputs.
-        if launch_state is None:
-            launch_state = getattr(inputs, "launch_state", None)
-        if not isinstance(launch_state, _TrtllmLaunchState):
-            launch_state = self._last_launch_state
+    def _sync_inner_static_extras(self, launch_state: Any) -> None:
+        # The inner enumerates tactics from view-derived flags (bias / OA
+        # presence) it keeps as static extras, so they must be set from the
+        # launch state of the call being tuned or launched, never from a
+        # previous pack.
         if isinstance(launch_state, _TrtllmLaunchState) and self._inner is not None:
             self._inner.set_cache_key_static_extras(**launch_state.static_kwargs)
 
@@ -6785,7 +6781,9 @@ class PrimsTsRunner(_TrtllmRunnerBase):
     ) -> torch.Tensor | List[torch.Tensor]:
         self._require_built()
         launch_state = kwargs.pop("launch_state", None)
-        self._sync_inner_static_extras(inputs, launch_state)
+        if launch_state is None:
+            launch_state = getattr(inputs, "launch_state", None)
+        self._sync_inner_static_extras(launch_state)
         return self._forward_inner(inputs, tactic, do_preparation, launch_state)
 
     def _gemm1_oa_launch_kwargs(self, view: dict) -> dict[str, Any]:
@@ -6971,7 +6969,18 @@ class PrimsTsRunner(_TrtllmRunnerBase):
             tuning_kwargs["act_sf_layout"] = SfLayout.layout_linear
         tuning_config = self._inner._make_tuning_config(moe_inputs, **tuning_kwargs)
         launch_state = _TrtllmLaunchState(static_kwargs)
-        self._last_launch_state = launch_state
+        # The autotuner calls get_valid_tactics(tensors, profile) with no
+        # launch kwargs, but runs inputs_pre_hook first; bind this pack's
+        # static extras there so tuning never reads another pack's state.
+        inner, inner_hook = self._inner, tuning_config.inputs_pre_hook
+
+        def _bind_static_extras(tensors: List[torch.Tensor]) -> List[torch.Tensor]:
+            inner.set_cache_key_static_extras(**launch_state.static_kwargs)
+            return inner_hook(tensors) if inner_hook is not None else tensors
+
+        tuning_config = dataclasses.replace(
+            tuning_config, inputs_pre_hook=_bind_static_extras
+        )
         return _TrtllmPackedInputs(
             moe_inputs.to_list(),
             tuning_config=tuning_config,
