@@ -19,6 +19,10 @@ import math
 import pytest
 import torch
 from tests.test_helpers.test_helpers import clear_cuda_cache
+from tests.test_helpers.parametrize import (
+    parametrize_product,
+    pairwise_product_cases,
+)
 
 import flashinfer
 from flashinfer.jit import build_jit_specs
@@ -351,16 +355,21 @@ def test_batch_mla_without_kpe(backend):
     torch.testing.assert_close(lse, lse_ref.flatten(0, 1), rtol=1e-3, atol=1e-3)
 
 
-@pytest.mark.parametrize("batch_size", [1, 3, 5, 7])
-@pytest.mark.parametrize("kv_len_0", [0, 1, 3, 11])
-@pytest.mark.parametrize("kv_len_1", [17, 33, 79, 114])
-@pytest.mark.parametrize("kv_len_2", [514, 2743, 8736])
-@pytest.mark.parametrize("qo_len", [1, 3, 5, 7, 9, 11, 13, 15, 17])
-@pytest.mark.parametrize("num_heads", [16, 64])
-@pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("page_size", [1])
-@pytest.mark.parametrize("backend", ["fa2", "fa3"])
-@pytest.mark.parametrize("dtype", [torch.half])
+@parametrize_product(
+    {
+        "batch_size": [1, 3, 5, 7],
+        "kv_len_0": [0, 1, 3, 11],
+        "kv_len_1": [17, 33, 79, 114],
+        "kv_len_2": [514, 2743, 8736],
+        "qo_len": [1, 3, 5, 7, 9, 11, 13, 15, 17],
+        "num_heads": [16, 64],
+        "causal": [False, True],
+        "page_size": [1],
+        "backend": ["fa2", "fa3"],
+        "dtype": [torch.half],
+    },
+    regular=pairwise_product_cases,
+)
 def test_batch_mla_varlen_page_attention(
     batch_size,
     kv_len_0,
