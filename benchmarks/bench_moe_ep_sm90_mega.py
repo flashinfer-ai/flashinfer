@@ -98,14 +98,15 @@ CSV_HEADER = "BENCH_CSV," + CSV_FIELDS
 # --heuristic so the file records what each point actually launched).
 HEUR_CSV_FIELDS = (
     "heur_swap_ab,heur_pingpong,heur_tile_m,heur_tile_n,heur_tile_k,"
-    "heur_cga_m,heur_cga_n,heur_accum_mode,heur_token_back,heur_token_bucket"
+    "heur_cga_m,heur_cga_n,heur_accum_mode,heur_token_back,heur_token_bucket,"
+    "heur_group_hint,heur_tail_split"
 )
 
 
 def _heuristic_cols(scale_mode: str, operand_order: str, tokens: int) -> list[str]:
     """The launch config the shim resolves for this point (heuristic mode)."""
     if operand_order != "heuristic":
-        return [""] * 10
+        return [""] * 12
     from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel import (
         bootstrap_paths,
     )
@@ -126,6 +127,8 @@ def _heuristic_cols(scale_mode: str, operand_order: str, tokens: int) -> list[st
         c.accum_mode,
         c.token_back_mode,
         str(sel.token_bucket),
+        "" if c.group_hint is None else str(c.group_hint),
+        str(int(c.tail_split_pairs)),
     ]
 
 

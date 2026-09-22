@@ -691,6 +691,7 @@ def _make_calibration_calls(
                 extra_topk_length,
                 cpb,
                 False,
+                1.0,
             )
 
         return call
@@ -708,6 +709,7 @@ def _make_calibration_calls(
             extra_cache,
             extra_indices,
             extra_topk_length,
+            1.0,
         )
 
     return build_decode, prefill

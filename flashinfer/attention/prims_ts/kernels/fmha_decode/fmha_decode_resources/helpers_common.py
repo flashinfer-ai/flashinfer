@@ -164,6 +164,30 @@ def _mma_k_step(cfg: FmhaDecodeConfig) -> int:
     return 32 if cfg.use_fp8_qkv else 16
 
 
+def _mma_kind_for_qk(cfg: FmhaDecodeConfig) -> prims.Tcgen05MMAKind:
+    """Select the tcgen05 MMA opcode family for the QK GEMM."""
+    if cfg.use_fp8_qkv or cfg.k_dtype_bytes == 1:
+        return prims.Tcgen05MMAKind.F8F6F4
+    return prims.Tcgen05MMAKind.F16
+
+
+def _mma_k_step_qk(cfg: FmhaDecodeConfig) -> int:
+    """Return the K dimension advanced by one QK-GEMM MMA instruction."""
+    return 32 if (cfg.use_fp8_qkv or cfg.k_dtype_bytes == 1) else 16
+
+
+def _mma_kind_for_pv(cfg: FmhaDecodeConfig) -> prims.Tcgen05MMAKind:
+    """Select the tcgen05 MMA opcode family for the PV GEMM."""
+    if cfg.use_fp8_qkv or cfg.v_dtype_bytes == 1:
+        return prims.Tcgen05MMAKind.F8F6F4
+    return prims.Tcgen05MMAKind.F16
+
+
+def _mma_k_step_pv(cfg: FmhaDecodeConfig) -> int:
+    """Return the K dimension advanced by one PV-GEMM MMA instruction."""
+    return 32 if (cfg.use_fp8_qkv or cfg.v_dtype_bytes == 1) else 16
+
+
 @cute.jit
 def _freeze_smem_descriptor(desc):
     """Copy a SMEM descriptor through a register before MMA integer offsets."""

@@ -42,6 +42,7 @@ from moe_hopper_fp8.epilogue_fp8_common import (
     consume_next_pingpong_work,
     pack_f32x2_to_bf16x2,
     stg_128b_bf16x8,
+    stg_128b_bf16x8_at,
     stg_fc1_block_scale_row,
     tma_store_fc1_output,
     tma_store_fc2_output,
@@ -450,6 +451,8 @@ class Fp8GluEpilogue:
                     real_topk_scores[token_tile_base + token_row1]
                 )
             if cutlass.const_expr(self._generate_c):
+                if _iket_active:
+                    iket.range_push("nswap_fc1_c_store")
                 self._store_fc1_c_m64_half(
                     work_tile_info=work_tile_info,
                     accumulators=accumulators,
@@ -462,6 +465,8 @@ class Fp8GluEpilogue:
                     tidx=tidx,
                     c_scale=fc1_act_weight_dequant_scale,
                 )
+                if _iket_active:
+                    iket.range_pop()
             for subtile_idx in cutlass.range_constexpr(
                 subtile_begin, subtile_end, 1
             ):
@@ -790,6 +795,8 @@ class Fp8GluEpilogue:
                     real_topk_scores[token_tile_base + token_row1]
                 )
             if cutlass.const_expr(self._generate_c):
+                if _iket_active:
+                    iket.range_push("nswap_fc1_c_store")
                 self._store_fc1_c_m64_half(
                     work_tile_info=work_tile_info,
                     accumulators=accumulators,
@@ -802,6 +809,8 @@ class Fp8GluEpilogue:
                     tidx=tidx,
                     c_scale=Float32(1.0),
                 )
+                if _iket_active:
+                    iket.range_pop()
             swiglu = cute.make_rmem_tensor(r_layout.shape, self.acc_dtype)
             for subtile_idx in cutlass.range_constexpr(
                 subtile_begin, subtile_end, 1
@@ -1116,9 +1125,16 @@ class Fp8GluEpilogue:
             cute.nvgpu.CopyUniversalOp(), cutlass.BFloat16, num_bits_per_copy=32,
         )
 
-        if cutlass.const_expr(
+        use_mega_dest = cutlass.const_expr(
             token_comm_args is not None and not self._token_back_by_dispatch
-        ):
+        )
+        # Quad lane transpose (lane xor 2 / 1): lane q gets hidden columns [8q, 8q+8)
+        # of one row, so each row is one 16-byte STG and one destination lookup.
+        q_hi_set = (lane_mod & cutlass.Int32(2)) != cutlass.Int32(0)
+        q_lo_set = (lane_mod & cutlass.Int32(1)) != cutlass.Int32(0)
+        vec_col = lane_mod * cutlass.Int32(8)
+        vec_hidden = hidden_col_start + vec_col
+        if cutlass.const_expr(use_mega_dest and self._fc2_in_kernel_topk_reduce):
             metadata_u32 = cute.recast_tensor(
                 token_comm_args.token_src_metadata, cutlass.Uint32,
             )
@@ -1126,20 +1142,12 @@ class Fp8GluEpilogue:
                 tensor=token_comm_args.combine_output,
                 metadata=metadata_u32,
                 peer_rank_ptr_mapper=token_comm_args.peer_rank_ptr_mapper,
-                reduce_topk_in_kernel=self._fc2_in_kernel_topk_reduce,
+                reduce_topk_in_kernel=True,
             )
             r_bf16_u32 = cute.recast_tensor(r_bf16, cutlass.Uint32)
             for rep in cutlass.range_constexpr(Fc2SubtileN // 8):
                 col_pair = cutlass.Int32(rep * 8) + lane_mod * cutlass.Int32(2)
                 hidden_off = hidden_col_start + col_pair
-                row0_regs = cute.make_tensor(
-                    r_bf16.iterator + rep * 4,
-                    cute.make_layout(2),
-                )
-                row1_regs = cute.make_tensor(
-                    r_bf16.iterator + rep * 4 + 2,
-                    cute.make_layout(2),
-                )
                 row0_packed = cutlass.Uint32(r_bf16_u32[rep * 2])
                 row1_packed = cutlass.Uint32(r_bf16_u32[rep * 2 + 1])
                 row0_next = cute.arch.shuffle_sync(
@@ -1161,15 +1169,9 @@ class Fp8GluEpilogue:
                         cute.AddressSpace.gmem,
                         assumed_align=4,
                     )
-                    if cutlass.const_expr(self._fc2_in_kernel_topk_reduce):
-                        if lane_mod % cutlass.Int32(2) == cutlass.Int32(0):
-                            red_add_relaxed_sys_v2_bf16x2(
-                                dest_ptr0, row0_packed, row0_next,
-                            )
-                    else:
-                        cute.copy(
-                            stg_atom, row0_regs,
-                            cute.make_tensor(dest_ptr0, cute.make_layout(2)),
+                    if lane_mod % cutlass.Int32(2) == cutlass.Int32(0):
+                        red_add_relaxed_sys_v2_bf16x2(
+                            dest_ptr0, row0_packed, row0_next,
                         )
                 if token_row1 < valid_tokens and hidden_off < valid_hidden:
                     pool_token1 = (
@@ -1184,16 +1186,43 @@ class Fp8GluEpilogue:
                         cute.AddressSpace.gmem,
                         assumed_align=4,
                     )
-                    if cutlass.const_expr(self._fc2_in_kernel_topk_reduce):
-                        if lane_mod % cutlass.Int32(2) == cutlass.Int32(0):
-                            red_add_relaxed_sys_v2_bf16x2(
-                                dest_ptr1, row1_packed, row1_next,
-                            )
-                    else:
-                        cute.copy(
-                            stg_atom, row1_regs,
-                            cute.make_tensor(dest_ptr1, cute.make_layout(2)),
+                    if lane_mod % cutlass.Int32(2) == cutlass.Int32(0):
+                        red_add_relaxed_sys_v2_bf16x2(
+                            dest_ptr1, row1_packed, row1_next,
                         )
+        elif cutlass.const_expr(use_mega_dest):
+            metadata_u32 = cute.recast_tensor(
+                token_comm_args.token_src_metadata, cutlass.Uint32,
+            )
+            fc2_output_dest = Fc2OutputDest(
+                tensor=token_comm_args.combine_output,
+                metadata=metadata_u32,
+                peer_rank_ptr_mapper=token_comm_args.peer_rank_ptr_mapper,
+                reduce_topk_in_kernel=False,
+            )
+            r_bf16_u32 = cute.recast_tensor(r_bf16, cutlass.Uint32)
+            for row in cutlass.range_constexpr(2):
+                w0 = cutlass.Uint32(r_bf16_u32[0 * 2 + row])
+                w1 = cutlass.Uint32(r_bf16_u32[1 * 2 + row])
+                w2 = cutlass.Uint32(r_bf16_u32[2 * 2 + row])
+                w3 = cutlass.Uint32(r_bf16_u32[3 * 2 + row])
+                o0, o1, o2, o3 = bfly_transpose4_u32(
+                    w0, w1, w2, w3, q_hi_set, q_lo_set, 2, 1,
+                )
+                token_row = token_row0
+                if cutlass.const_expr(row == 1):
+                    token_row = token_row1
+                if token_row < valid_tokens and vec_hidden < valid_hidden:
+                    pool_token = (
+                        work_tile_info.cumulative_data_physical_row
+                        + work_tile_info.tile_m_idx * cutlass.Int32(self._cta_tile_m)
+                        + token_row
+                    )
+                    dest_row = fc2_output_dest.resolve_token_row(pool_token)
+                    stg_128b_bf16x8_at(
+                        dest_row.iterator.toint() + vec_hidden * cutlass.Int64(2),
+                        o0, o1, o2, o3,
+                    )
         else:
             if cutlass.const_expr(self._use_fc2_tma_store):
                 sD_stage = cute.slice_(
@@ -1230,52 +1259,21 @@ class Fp8GluEpilogue:
                 g_fc2_slice = cute.slice_(
                     g_fc2_output_tile, (None, None, 0),
                 )
-                for rep in cutlass.range_constexpr(Fc2SubtileN // 8):
-                    col_pair = (
-                        cutlass.Int32(rep * 8)
-                        + lane_mod * cutlass.Int32(2)
+                r_bf16_u32 = cute.recast_tensor(r_bf16, cutlass.Uint32)
+                for row in cutlass.range_constexpr(2):
+                    w0 = cutlass.Uint32(r_bf16_u32[0 * 2 + row])
+                    w1 = cutlass.Uint32(r_bf16_u32[1 * 2 + row])
+                    w2 = cutlass.Uint32(r_bf16_u32[2 * 2 + row])
+                    w3 = cutlass.Uint32(r_bf16_u32[3 * 2 + row])
+                    o0, o1, o2, o3 = bfly_transpose4_u32(
+                        w0, w1, w2, w3, q_hi_set, q_lo_set, 2, 1,
                     )
-                    col_pair_tile = col_pair // cutlass.Int32(2)
-                    hidden_off = hidden_col_start + col_pair
-                    row0_regs = cute.make_tensor(
-                        r_bf16.iterator + rep * 4,
-                        cute.make_layout(2),
-                    )
-                    row1_regs = cute.make_tensor(
-                        r_bf16.iterator + rep * 4 + 2,
-                        cute.make_layout(2),
-                    )
-                    if token_row0 < valid_tokens and hidden_off < valid_hidden:
-                        g_row0 = cute.local_tile(
-                            g_fc2_slice, (1, 2),
-                            (token_row0, col_pair_tile),
-                        )
-                        g_flat0 = cute.coalesce(g_row0)
-                        aligned_iter0 = cute.make_ptr(
-                            cutlass.BFloat16,
-                            g_flat0.iterator.toint(),
-                            cute.AddressSpace.gmem,
-                            assumed_align=4,
-                        )
-                        cute.copy(
-                            stg_atom, row0_regs,
-                            cute.make_tensor(aligned_iter0, g_flat0.layout),
-                        )
-                    if token_row1 < valid_tokens and hidden_off < valid_hidden:
-                        g_row1 = cute.local_tile(
-                            g_fc2_slice, (1, 2),
-                            (token_row1, col_pair_tile),
-                        )
-                        g_flat1 = cute.coalesce(g_row1)
-                        aligned_iter1 = cute.make_ptr(
-                            cutlass.BFloat16,
-                            g_flat1.iterator.toint(),
-                            cute.AddressSpace.gmem,
-                            assumed_align=4,
-                        )
-                        cute.copy(
-                            stg_atom, row1_regs,
-                            cute.make_tensor(aligned_iter1, g_flat1.layout),
+                    token_row = token_row0
+                    if cutlass.const_expr(row == 1):
+                        token_row = token_row1
+                    if token_row < valid_tokens and vec_hidden < valid_hidden:
+                        stg_128b_bf16x8(
+                            g_fc2_slice, o0, o1, o2, o3, token_row, vec_col,
                         )
 
         if _iket_active:
