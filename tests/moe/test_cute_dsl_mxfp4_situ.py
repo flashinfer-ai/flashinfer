@@ -152,7 +152,9 @@ def test_e2m1_and_ue8m0_encoding():
     assert torch.isnan(scale[-1])
 
 
-@pytest.mark.parametrize("distribution", ["balanced", "empty", "hot", "all_remote"])
+@pytest.mark.parametrize(
+    "distribution", ["balanced", "empty", "hot", "all_remote", "remote_dominated"]
+)
 def test_routing_global_ids(distribution):
     ids, weights = make_routing(128, 896, 16, 112, 336, distribution, device="cpu")
     assert ids.min() >= 0 and ids.max() < 896
@@ -162,6 +164,9 @@ def test_routing_global_ids(distribution):
     local = (ids >= 336) & (ids < 448)
     if distribution == "all_remote":
         assert not local.any()
+    if distribution == "remote_dominated":
+        assert local.sum() == 128 and (local.sum(dim=1) == 1).all()
+        assert ids[local].unique().numel() == 112
     if distribution == "hot":
         assert (ids == 336).sum() == 128
     if distribution == "empty":
@@ -788,11 +793,10 @@ def test_concurrent_caller_streams():
 
 
 def _check_concurrent_caller_streams(
-    cases, *, repeats, noise_size, prepared_weights=None
+    cases, *, repeats, noise_size, prepared_weights=None, prepare=None
 ):
-    prepared = [
-        prepare_candidate(case, prepared_weights=prepared_weights) for case in cases
-    ]
+    prepare = prepare_candidate if prepare is None else prepare
+    prepared = [prepare(case, prepared_weights=prepared_weights) for case in cases]
     streams = [torch.cuda.Stream() for _ in range(len(cases) + 1)]
     expected = []
     for plan, output, _ in prepared:
@@ -845,7 +849,9 @@ def full_kimi_case():
 
 
 @pytest.mark.parametrize("tokens", [1, 16, 128, 512, 2048])
-@pytest.mark.parametrize("distribution", ["balanced", "empty", "hot"])
+@pytest.mark.parametrize(
+    "distribution", ["balanced", "empty", "hot", "remote_dominated"]
+)
 def test_full_kimi_paired_fp64(full_kimi_case, tokens, distribution, record_property):
     base = full_kimi_case
     ids, weights = make_routing(tokens, 896, 16, 112, 336, distribution)

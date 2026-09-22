@@ -129,8 +129,11 @@ def make_routing(
     """Unique global expert IDs per token with explicit controlled imbalance.
 
     balanced cycles globally; empty concentrates on a small local subset and
-    remote experts; hot assigns one local expert to every token. These are
-    synthetic probes, not estimates of a production routing distribution.
+    remote experts; hot assigns one local expert to every token; all_remote
+    never selects a local expert; remote_dominated keeps ``top_k // 10`` local
+    slots per token (at least 90% of routes leave the local interval) and
+    cycles those slots through the local experts. These are synthetic probes,
+    not estimates of a production routing distribution.
     """
     if not (0 <= local_expert_offset < num_experts):
         raise ValueError("invalid local expert offset")
@@ -174,6 +177,22 @@ def make_routing(
                 raise ValueError("not enough remote experts for all_remote")
             pool = torch.tensor(remote, dtype=torch.int64)
             ids = pool[(t[:, None] * top_k + k) % len(pool)]
+        elif distribution == "remote_dominated":
+            local_slots = top_k // 10
+            remote_slots = top_k - local_slots
+            if len(remote) < remote_slots:
+                raise ValueError("not enough remote experts for remote_dominated")
+            pool = torch.tensor(remote, dtype=torch.int64)
+            ids = torch.empty((tokens, top_k), dtype=torch.int64)
+            ids[:, :remote_slots] = pool[
+                (t[:, None] * remote_slots + torch.arange(remote_slots)) % len(pool)
+            ]
+            if local_slots:
+                local_pool = torch.tensor(local, dtype=torch.int64)
+                ids[:, remote_slots:] = local_pool[
+                    (t[:, None] * local_slots + torch.arange(local_slots))
+                    % len(local_pool)
+                ]
         else:
             raise ValueError(f"unknown routing distribution: {distribution}")
     generator = torch.Generator().manual_seed(seed)
@@ -194,6 +213,30 @@ def routing_histogram(case):
         "local": local.tolist(),
         "local_assignments": int(local.sum()),
         "empty_local_experts": int((local == 0).sum()),
+    }
+
+
+def parallel_routing_histogram(topk_ids, num_experts, ep_size):
+    """Global and per-rank assignment counts for uniform EP rank intervals.
+
+    Under MoE tensor parallelism every rank sees the global histogram, so
+    callers pass ``ep_size=1`` and the single per-rank entry equals it.
+    """
+    if num_experts % ep_size:
+        raise ValueError("num_experts must be divisible by ep_size")
+    counts = torch.bincount(topk_ids.cpu().long().flatten(), minlength=num_experts)
+    local = num_experts // ep_size
+    ranks = counts.reshape(ep_size, local)
+    return {
+        "global": counts.tolist(),
+        "ep_size": ep_size,
+        "per_rank": ranks.tolist(),
+        "per_rank_assignments": ranks.sum(dim=1).tolist(),
+        "per_rank_empty_experts": (ranks == 0).sum(dim=1).tolist(),
+        "remote_fraction_per_rank": [
+            float(1.0 - int(ranks[rank].sum()) / max(1, int(counts.sum())))
+            for rank in range(ep_size)
+        ],
     }
 
 
