@@ -2072,9 +2072,13 @@ class FlashKDABlackwellBF16FusedLaunch:
         # BF16 checkpoint rows keep the legacy BF16 carrier: the body's
         # CHECKPOINT_DTYPE_IS_FP32 specialization also types the checkpoint
         # rows, so the FP32 carrier is only legal without rows or with FP32 rows.
+        # Affine split parts (_n32_ft_slab) carry workspace slabs, not the
+        # caller's state pool, and run outside the serving-native ABI: they
+        # keep the BF16 carrier the composite was measured with.
         fp32_carrier_request = fp32_checkpoint_request or (
             unbounded_softplus
             and self._state_dtype_is_fp32
+            and not self._n32_ft_slab
             and compute_dtype == "bf16"
             and state_checkpoints is None
         )
@@ -2907,6 +2911,7 @@ class FlashKDABlackwellBF16FusedLaunch:
         fp32_carrier = fp32_checkpoints or (
             unbounded_softplus
             and self._state_dtype_is_fp32
+            and not self._n32_ft_slab
             and compute_dtype == "bf16"
             and uses_default_fused_m128
             and state_checkpoints is None
