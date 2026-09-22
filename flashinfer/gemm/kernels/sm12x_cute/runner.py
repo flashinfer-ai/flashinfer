@@ -81,22 +81,56 @@ def _compile(m, n, k, tactic, *, compute_capability=None):
     from ....cute_dsl import utils as cute_dsl_utils
     from ....jit.cute_dsl_core import build_and_load_cute_dsl_kernel
     from ... import gemm_mm_fp4_cute_dsl as helpers
-    from .. import dense_blockscaled_gemm_sm120_b12x as b12x
-    from . import blockscaled_gemm_dispatch, narrow, raw
+    from . import blockscaled_gemm_dispatch, raw
 
     family = tactic[0]
-    if family == "cooperative" and (
-        compute_capability != (12, 1)
-        or not policy.compatible(m, n, k, tactic, compute_capability=compute_capability)
-    ):
-        raise ValueError("Invalid SM121 cooperative tactic")
-    single_tile = family == "b12x_single_cta"
-    if single_tile and not policy.compatible(
-        m, n, k, tactic, compute_capability=compute_capability
-    ):
-        raise ValueError("Invalid SM121 single-CTA tactic")
-    # This nonpersistent specialization must launch every output tile.
-    mac = 544 if single_tile else cute_dsl_utils.get_max_active_clusters(1)
+    if family in ("independent", "independent_tma"):
+        from . import independent_small, independent_tma
+
+        small = family == "independent"
+        module = independent_small if small else independent_tma
+        op = (
+            module.IndependentSmall(m, n, k)
+            if small
+            else module.IndependentMedium(m, n, k)
+        )
+        scalar = cutlass.Int32 if small else cutlass.Uint8
+        divisor = 8 if small else 2
+        operands = [
+            cute.runtime.make_fake_compact_tensor(
+                scalar, (rows, k // divisor), stride_order=(1, 0), assumed_align=32
+            )
+            for rows in (m, n)
+        ]
+        operands += [
+            cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32,
+                (((rows + 127) // 128) * 128 * (k // 64),),
+                assumed_align=16,
+            )
+            for rows in (m, n)
+        ]
+        operands += [
+            cute.runtime.make_fake_compact_tensor(
+                cutlass.Float32, (1,), assumed_align=4
+            ),
+            cute.runtime.make_fake_compact_tensor(
+                cutlass.BFloat16, (m, n), stride_order=(1, 0), assumed_align=16
+            ),
+        ]
+        stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+        return build_and_load_cute_dsl_kernel(
+            f"{policy.VERSION}_{family}",
+            f"m{m}_n{n}_k{k}",
+            lambda: cute.compile(
+                op.launch if small else op,
+                *operands,
+                stream,
+                options="--enable-tvm-ffi",
+            ),
+            extra_key_files=(__file__, module.__file__),
+        )
+    mac = cute_dsl_utils.get_max_active_clusters(1)
     if family == "raw":
         if len(tactic) == 6:
             _, epi_m, epi_n, swizzle, elected, raster_m = tactic
@@ -212,55 +246,6 @@ def _compile(m, n, k, tactic, *, compute_capability=None):
         if register_redistribution:
             shape_name += "regs24_240_"
         module = raw
-    else:
-        _, tile_m, tile_n, tile_k = tactic
-        if family == "cooperative":
-            from . import cooperative
-
-            module = cooperative
-        else:
-            module = narrow if family == "narrow" else b12x
-        cls = module.DenseGemmKernel
-        if not cls.can_implement(
-            cutlass.Float4E2M1FN,
-            cutlass.Float8E4M3FN,
-            16,
-            cutlass.BFloat16,
-            (tile_m, tile_n),
-            (1, 1),
-            n,
-            k,
-            1,
-            "k",
-            "k",
-            "n",
-            load_path="tma",
-            swap_ab=False,
-            tile_k=tile_k,
-        ):
-            raise ValueError("SM12x cute-dsl narrow kernel rejected the tactic")
-        kernel = cls(
-            16,
-            (tile_m, tile_n),
-            (1, 1),
-            mma_k=64,
-            tile_k=tile_k,
-            single_work_tile_per_cta=single_tile,
-            use_prefetch=False,
-            enable_pdl=False,
-            direct_one_m_tile_scheduler=False,
-            split_k_slices=1,
-            split_k_atomic_bf16=False,
-            use_m1_non_tma_a=False,
-            use_m1_non_tma_c=False,
-            use_m1_non_tma_sfa=False,
-            load_path="tma",
-            swap_ab=False,
-            enable_iket=False,
-        )
-        # The existing helper and narrow wrapper use dynamic M/N/K and SF extents.
-        shape_name = "dynamic_"
-
     compile_fn = helpers._make_blockscaled_gemm_compile_fn(
         kernel,
         cutlass.Uint8,
@@ -332,7 +317,7 @@ class Sm12xCuTeFp4GemmRunner(TunableRunner):
     def _get_compiled(self, inputs, tactic):
         a, b = inputs[:2]
         m, n, k = a.shape[0], b.shape[1], a.shape[1] * 2
-        shape = (m, n, k) if tactic[0] == "raw" else ()
+        shape = (m, n, k)
         compute_capability = get_compute_capability(a.device)
         key = (get_device_index(a.device), compute_capability, tactic, shape)
         if key not in _COMPILED:
@@ -366,24 +351,36 @@ class Sm12xCuTeFp4GemmRunner(TunableRunner):
                 m, n, k, compute_capability=get_compute_capability(a.device)
             )
         compiled = self._get_compiled(inputs, tactic)
-        args = (
-            a,
-            b.T,
-            out,
-            (m + 127) // 128,
-            (n + 127) // 128,
-            k // 64,
-            sfa.data_ptr(),
-            sfb.data_ptr(),
-            launch_alpha,
-        )
-        # Exported b12x wrappers retain their three optional SVDQuant arguments.
-        compiled(*(args if tactic[0] == "raw" else (*args, None, None, None)))
+        if tactic[0] in ("independent", "independent_tma"):
+            packed_a, packed_b = a, b.T
+            if tactic[0] == "independent":
+                packed_a, packed_b = (
+                    packed_a.view(torch.int32),
+                    packed_b.view(torch.int32),
+                )
+            compiled(
+                packed_a,
+                packed_b,
+                sfa.view(torch.uint8).reshape(-1).view(torch.int32),
+                sfb.T.view(torch.uint8).reshape(-1).view(torch.int32),
+                launch_alpha.reshape(1),
+                out,
+            )
+        else:
+            compiled(
+                a,
+                b.T,
+                out,
+                (m + 127) // 128,
+                (n + 127) // 128,
+                k // 64,
+                sfa.data_ptr(),
+                sfb.data_ptr(),
+                launch_alpha,
+            )
         return out
 
 
 @cache
 def get_runner():
-    # PDL is an optional performance hint. This initial SM12x path uses only
-    # ordinary stream-ordered launches, for both values of public enable_pdl.
     return Sm12xCuTeFp4GemmRunner()
