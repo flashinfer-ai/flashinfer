@@ -14,21 +14,25 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import hashlib
 import math
 from collections import Counter
+from dataclasses import replace
 
 import pytest
 import torch
 
 from flashinfer.experimental.nvfp4_mla_decode import cake_backend
 from flashinfer.experimental.nvfp4_mla_decode.cake_backend import (
+    BALANCED_MIN_KV,
+    CLUSTER_PAIR,
+    DSV4_Q_LEN,
     FLAG_DIRECT_OUT,
     FLAG_SEED_SINK,
     HEAD_DIM,
     ITEM_FIELDS,
     MAX_SPLITS,
     PAGE_SIZE,
-    Q_LEN,
     ROW_BYTES,
     ROWS_PER_TILE,
     SF_ROW_BYTES,
@@ -36,6 +40,7 @@ from flashinfer.experimental.nvfp4_mla_decode.cake_backend import (
     SUPPORTED_COMPUTE_CAPABILITIES,
     V_HALVES,
     build_work_plan,
+    check_pairs,
     kv_tiles,
     max_nvfp4_mla_decode_workspace_size,
     nvfp4_mla_decode_workspace_size,
@@ -80,31 +85,39 @@ def _gather_dequant(cache, scale, block_table_row, kv_len):
 
 
 def reference(
-    query, query_scale, kv_cache, kv_scale, block_tables, kv_lens, sm_scale, sinks
+    query,
+    query_scale,
+    kv_cache,
+    kv_scale,
+    block_tables,
+    kv_lens,
+    q_len,
+    sm_scale,
+    sinks,
 ):
     """Returns ``(O bf16 [total_q, H, 512], LSE f32 [total_q, H])``."""
     batch = len(kv_lens)
     q_all = dequantize_nvfp4(query, query_scale)  # [total_q, H, D]
     num_heads = q_all.shape[1]
     O = torch.empty(
-        (batch * Q_LEN, num_heads, HEAD_DIM), dtype=torch.float32, device=q_all.device
+        (batch * q_len, num_heads, HEAD_DIM), dtype=torch.float32, device=q_all.device
     )
     LSE = torch.empty(
-        (batch * Q_LEN, num_heads), dtype=torch.float32, device=q_all.device
+        (batch * q_len, num_heads), dtype=torch.float32, device=q_all.device
     )
     for b in range(batch):
         kv_len = kv_lens[b]
         k = _gather_dequant(kv_cache, kv_scale, block_tables[b], kv_len)  # [kv_len, D]
         v = k
-        q = q_all[b * Q_LEN : (b + 1) * Q_LEN]  # [q_len, H, D]
+        q = q_all[b * q_len : (b + 1) * q_len]  # [q_len, H, D]
         logits = torch.einsum("rhd,nd->hrn", q, k) * sm_scale  # [H, q_len, kv_len]
         positions = torch.arange(kv_len, device=q.device)
-        row_limit = kv_len - Q_LEN + torch.arange(Q_LEN, device=q.device) + 1
+        row_limit = kv_len - q_len + torch.arange(q_len, device=q.device) + 1
         mask = positions[None, :] < row_limit[:, None]  # [q_len, kv_len]
         logits = logits.masked_fill(~mask[None], float("-inf"))
         row_max = logits.amax(dim=-1)  # [H, q_len]
         if sinks is not None:
-            sink = sinks[:, None].expand(num_heads, Q_LEN)
+            sink = sinks[:, None].expand(num_heads, q_len)
             row_max = torch.maximum(row_max, sink)
         probs = torch.exp(logits - row_max[..., None])
         denom = probs.sum(dim=-1)
@@ -112,12 +125,12 @@ def reference(
             denom = denom + torch.exp(sink - row_max)
         out = torch.einsum("hrn,nd->hrd", probs, v) / denom[..., None]
         lse = row_max + torch.log(denom)
-        O[b * Q_LEN : (b + 1) * Q_LEN] = out.permute(1, 0, 2)
-        LSE[b * Q_LEN : (b + 1) * Q_LEN] = lse.permute(1, 0)
+        O[b * q_len : (b + 1) * q_len] = out.permute(1, 0, 2)
+        LSE[b * q_len : (b + 1) * q_len] = lse.permute(1, 0)
     return O.to(torch.bfloat16), LSE
 
 
-def make_inputs(kv_lens, num_heads, *, enable_sink, device, seed=0):
+def make_inputs(kv_lens, num_heads, *, q_len, enable_sink, device, seed=0):
     """Deterministic NVFP4 paged decode inputs with a peaked softmax."""
     gen = torch.Generator(device=device).manual_seed(seed)
     batch = len(kv_lens)
@@ -135,15 +148,15 @@ def make_inputs(kv_lens, num_heads, *, enable_sink, device, seed=0):
     for b, count in enumerate(pages_per_seq):
         block_tables[b, :count] = permutation[offset : offset + count]
         offset += count
-    q = torch.randn((batch * Q_LEN, num_heads, HEAD_DIM), generator=gen, device=device)
+    q = torch.randn((batch * q_len, num_heads, HEAD_DIM), generator=gen, device=device)
     for b in range(batch):
-        for i in range(Q_LEN):
-            visible = kv_lens[b] - Q_LEN + i + 1
+        for i in range(q_len):
+            visible = kv_lens[b] - q_len + i + 1
             target = int(
                 torch.randint(0, visible, (1,), generator=gen, device=device).item()
             )
             page = int(block_tables[b, target // PAGE_SIZE].item())
-            q[b * Q_LEN + i] += 0.2 * k_full[page, target % PAGE_SIZE]
+            q[b * q_len + i] += 0.2 * k_full[page, target % PAGE_SIZE]
     query, query_scale = quantize_nvfp4(q)
     kv_cache, kv_scale = quantize_nvfp4(k_full)
     sinks = None
@@ -158,6 +171,7 @@ def make_inputs(kv_lens, num_heads, *, enable_sink, device, seed=0):
         block_tables=block_tables,
         seq_lens=seq_lens,
         sinks=sinks,
+        q_len=q_len,
         sm_scale=HEAD_DIM**-0.5,
     )
 
@@ -171,6 +185,12 @@ def check_outputs(out, lse, ref_out, ref_lse):
     assert float(rel.max()) <= REL_L2_MAX, float(rel.max())
     assert torch.isfinite(lse).all()
     torch.testing.assert_close(lse, ref_lse, atol=LSE_ATOL, rtol=LSE_RTOL)
+
+
+def _plan_digest(plan):
+    return hashlib.sha256(
+        repr([tuple(int(v) for v in it) for it in plan.items]).encode()
+    ).hexdigest()[:16]
 
 
 # ---------------------------------------------------------------------------
@@ -190,7 +210,7 @@ def test_rejects_unknown_backend():
 
 
 def test_rejects_host_tensors_and_bad_shapes():
-    inputs = make_inputs([64, 100], 2, enable_sink=False, device="cpu")
+    inputs = make_inputs([64, 100], 2, q_len=6, enable_sink=False, device="cpu")
     workspace = torch.empty(1 << 20, dtype=torch.uint8)
     with pytest.raises(ValueError, match="CUDA"):
         prepare_nvfp4_batch_decode_with_kv_cache_mla(
@@ -203,23 +223,19 @@ def test_rejects_host_tensors_and_bad_shapes():
             workspace,
             sm_scale=inputs["sm_scale"],
         )
+    args = (
+        inputs["kv_cache"],
+        inputs["kv_scale"],
+        inputs["block_tables"],
+        inputs["seq_lens"],
+    )
     with pytest.raises(ValueError, match="query must be"):
         cake_backend.validate_nvfp4_mla_decode_inputs(
-            inputs["query"][..., :128],
-            inputs["query_scale"],
-            inputs["kv_cache"],
-            inputs["kv_scale"],
-            inputs["block_tables"],
-            inputs["seq_lens"],
+            inputs["query"][..., :128], inputs["query_scale"], *args
         )
-    with pytest.raises(ValueError, match="query tokens per request"):
+    with pytest.raises(ValueError, match="batch \\* q_len"):
         cake_backend.validate_nvfp4_mla_decode_inputs(
-            inputs["query"][:-1],
-            inputs["query_scale"][:-1],
-            inputs["kv_cache"],
-            inputs["kv_scale"],
-            inputs["block_tables"],
-            inputs["seq_lens"],
+            inputs["query"][:-1], inputs["query_scale"][:-1], *args
         )
     with pytest.raises(ValueError, match="int32"):
         cake_backend.validate_nvfp4_mla_decode_inputs(
@@ -232,11 +248,223 @@ def test_rejects_host_tensors_and_bad_shapes():
         )
 
 
+@pytest.mark.parametrize("q_len", [1, 6])
+def test_q_len_is_derived_from_query_rows(q_len):
+    inputs = make_inputs(
+        [64, 100, 130], 4, q_len=q_len, enable_sink=False, device="cpu"
+    )
+    batch, num_heads, num_pages, got = cake_backend.validate_nvfp4_mla_decode_inputs(
+        inputs["query"],
+        inputs["query_scale"],
+        inputs["kv_cache"],
+        inputs["kv_scale"],
+        inputs["block_tables"],
+        inputs["seq_lens"],
+    )
+    assert (batch, num_heads, num_pages, got) == (
+        3,
+        4,
+        inputs["kv_cache"].shape[0],
+        q_len,
+    )
+
+
+# Expected values computed once from the source host plan module for the same
+# shapes (cluster of two CTAs per unit; balanced schedule over num_sms // 2
+# units; uniform schedule pairs consecutive items). Columns: schedule, kv_lens,
+# q_len, num_heads, num_sms, tiles_per_split, enable_sink -> (num_items,
+# num_units, grid_x, max_splits, tiles_per_split, item digest).
+PLAN_EXPECTATIONS = [
+    (
+        "balanced",
+        [256, 300],
+        6,
+        64,
+        148,
+        None,
+        True,
+        (16, 3, 6, 2, None, "e1be1df6a1068135"),
+    ),
+    (
+        "balanced",
+        [8192] * 4,
+        6,
+        64,
+        148,
+        None,
+        False,
+        (168, 74, 148, 7, None, "bce7f7a800a4cb91"),
+    ),
+    # contract row partial_pages_h8
+    (
+        "balanced",
+        [1000, 8192, 5000],
+        6,
+        8,
+        148,
+        None,
+        True,
+        (56, 27, 54, 16, None, "3592220b611a0c8b"),
+    ),
+    (
+        "balanced",
+        [131072, 64],
+        1,
+        64,
+        148,
+        None,
+        False,
+        (76, 37, 74, 37, None, "a98e3fabd5f652ba"),
+    ),
+    # contract row bs32_q6_kv8k (auto -> balanced at the 8K threshold)
+    (
+        "auto",
+        [8192] * 32,
+        6,
+        64,
+        148,
+        None,
+        True,
+        (336, 74, 148, 2, None, "d05e6b3d8872ab59"),
+    ),
+    (
+        "uniform",
+        [64, 4096],
+        6,
+        64,
+        148,
+        32,
+        False,
+        (18, 9, 18, 2, 32, "9bcf8e5442f91a15"),
+    ),
+    # contract row smoke, forced to two splits (tiles_per_split = ceil(5 / 2))
+    ("auto", [256, 300], 6, 64, 148, 3, True, (24, 12, 24, 2, 3, "2dd204fdabaf9bf2")),
+    (
+        "uniform",
+        [8192] * 32,
+        6,
+        64,
+        148,
+        None,
+        False,
+        (192, 96, 192, 1, 128, "2549a4d3ff721985"),
+    ),
+    (
+        "uniform",
+        [777, 65],
+        1,
+        64,
+        148,
+        None,
+        True,
+        (4, 2, 4, 1, 13, "7e8e47b4623f60b9"),
+    ),
+    # contract row no_sink_q1 (auto -> uniform)
+    (
+        "auto",
+        [64, 65, 4096, 777],
+        1,
+        64,
+        148,
+        None,
+        False,
+        (8, 4, 8, 1, 64, "95fe7983a25d234f"),
+    ),
+    (
+        "uniform",
+        [16384, 12000],
+        6,
+        64,
+        148,
+        None,
+        False,
+        (12, 6, 12, 1, 256, "73cfcd1186a5db80"),
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "schedule,kv_lens,q_len,num_heads,num_sms,tiles_per_split,enable_sink,expected",
+    PLAN_EXPECTATIONS,
+)
+def test_plan_matches_source_host_plan(
+    schedule, kv_lens, q_len, num_heads, num_sms, tiles_per_split, enable_sink, expected
+):
+    plan = build_work_plan(
+        kv_lens,
+        num_heads=num_heads,
+        num_sms=num_sms,
+        q_len=q_len,
+        enable_sink=enable_sink,
+        schedule=schedule,
+        tiles_per_split=tiles_per_split,
+    )
+    got = (
+        plan.num_items,
+        plan.num_units,
+        plan.grid[0],
+        plan.max_splits,
+        plan.tiles_per_split,
+        _plan_digest(plan),
+    )
+    assert got == expected
+    assert plan.grid == (CLUSTER_PAIR * plan.num_units, 1, 1)
+    if schedule == "auto":
+        assert plan.schedule == (
+            "balanced" if max(kv_lens) >= BALANCED_MIN_KV else "uniform"
+        )
+    if plan.schedule == "uniform":
+        assert plan.unit_first == tuple(range(0, plan.num_items + 1, CLUSTER_PAIR))
+
+
+def test_balanced_unit_first_matches_source():
+    plan = build_work_plan(
+        [256, 300],
+        num_heads=64,
+        num_sms=148,
+        q_len=6,
+        enable_sink=True,
+        schedule="balanced",
+    )
+    assert plan.unit_first == (0, 6, 12, 16)
+    plan = build_work_plan(
+        [8192] * 32,
+        num_heads=64,
+        num_sms=148,
+        q_len=6,
+        enable_sink=True,
+        schedule="balanced",
+    )
+    assert plan.unit_first[:4] == (0, 4, 8, 12) and plan.unit_first[-3:] == (
+        328,
+        332,
+        336,
+    )
+
+
+def test_pair_invariant_holds_and_is_enforced():
+    plan = build_work_plan(
+        [1000, 8192, 5000], num_heads=8, num_sms=148, q_len=6, enable_sink=True
+    )
+    check_pairs(plan)
+    items = list(plan.items)
+    items[0], items[1] = items[1], items[0]
+    with pytest.raises(ValueError, match="v_half pair"):
+        check_pairs(replace(plan, items=tuple(items)))
+    with pytest.raises(ValueError, match="even count"):
+        check_pairs(replace(plan, unit_first=(0, 1, plan.num_items)))
+
+
 def test_uniform_plan_partitions_every_request():
     plan = build_work_plan(
-        [256, 300], num_heads=64, num_sms=148, enable_sink=True, schedule="uniform"
+        [256, 300],
+        num_heads=64,
+        num_sms=148,
+        q_len=6,
+        enable_sink=True,
+        schedule="uniform",
     )
-    m_tiles = math.ceil(Q_LEN * 64 / ROWS_PER_TILE)
+    m_tiles = math.ceil(6 * 64 / ROWS_PER_TILE)
     for b, kv in enumerate([256, 300]):
         ranges = sorted({(it[3], it[4]) for it in plan.items if it[0] == b})
         assert ranges[0][0] == 0 and ranges[-1][1] == kv_tiles(kv)
@@ -251,20 +479,21 @@ def test_uniform_plan_partitions_every_request():
         for it in plan.items
     )
     assert all(((it[7] & FLAG_DIRECT_OUT) != 0) == (it[6] == 1) for it in plan.items)
-    assert plan.unit_first == tuple(range(plan.num_items + 1))
 
 
 @pytest.mark.parametrize(
     "kv_len,want_splits", [(8192, 1), (16384, 2), (32768, 2), (65536, 2), (131072, 2)]
 )
 def test_uniform_split_policy_matches_measured_winners(kv_len, want_splits):
-    plan = build_work_plan([kv_len] * 32, num_heads=64, num_sms=148, schedule="uniform")
+    plan = build_work_plan(
+        [kv_len] * 32, num_heads=64, num_sms=148, q_len=6, schedule="uniform"
+    )
     assert plan.max_splits == want_splits
     assert all(it[4] - it[3] >= 8 for it in plan.items)
 
 
 @pytest.mark.parametrize(
-    "kv_lens,num_heads,units",
+    "kv_lens,num_heads,num_sms",
     [
         ([131072] * 32, 64, 148),
         ([8192] * 32, 64, 148),
@@ -273,22 +502,23 @@ def test_uniform_split_policy_matches_measured_winners(kv_len, want_splits):
         ([131072], 64, 148),
     ],
 )
-def test_balanced_plan_covers_every_page_once(kv_lens, num_heads, units):
+def test_balanced_plan_covers_every_page_once(kv_lens, num_heads, num_sms):
     plan = build_work_plan(
         kv_lens,
         num_heads=num_heads,
-        num_sms=units,
+        num_sms=num_sms,
+        q_len=6,
         enable_sink=True,
         schedule="balanced",
     )
-    assert plan.max_splits <= MAX_SPLITS
+    assert plan.max_splits <= MAX_SPLITS and plan.num_units <= num_sms // CLUSTER_PAIR
     assert plan.unit_first[0] == 0 and plan.unit_first[-1] == plan.num_items
     covered = Counter()
     for it in plan.items:
         assert 0 <= it[3] < it[4]
         for t in range(it[3], it[4]):
             covered[(it[0], it[1], it[2], t)] += 1
-    m_tiles = math.ceil(Q_LEN * num_heads / ROWS_PER_TILE)
+    m_tiles = math.ceil(6 * num_heads / ROWS_PER_TILE)
     want = sum(kv_tiles(kv) for kv in kv_lens) * m_tiles * V_HALVES
     assert len(covered) == want and max(covered.values()) == 1
     pages = [
@@ -296,25 +526,23 @@ def test_balanced_plan_covers_every_page_once(kv_lens, num_heads, units):
         for a, b in zip(plan.unit_first, plan.unit_first[1:], strict=False)
     ]
     assert max(pages) - min(pages) <= 2
-    by_piece = {}
-    for it in plan.items:
-        by_piece.setdefault((it[0], it[1], it[5]), set()).add(
-            (it[2], it[3], it[4], it[6], it[7])
-        )
-    for variants in by_piece.values():
-        assert len({v[1:] for v in variants}) == 1 and {v[0] for v in variants} == {
-            0,
-            1,
-        }
 
 
 def test_auto_schedule_threshold():
-    assert build_work_plan([8192] * 32, num_heads=64, num_sms=148).schedule == "uniform"
     assert (
-        build_work_plan([16384] * 32, num_heads=64, num_sms=148).schedule == "balanced"
+        build_work_plan(
+            [BALANCED_MIN_KV - 1] * 32, num_heads=64, num_sms=148, q_len=6
+        ).schedule
+        == "uniform"
+    )
+    assert (
+        build_work_plan(
+            [BALANCED_MIN_KV] * 32, num_heads=64, num_sms=148, q_len=6
+        ).schedule
+        == "balanced"
     )
     with pytest.raises(ValueError, match="kv_len >= q_len"):
-        build_work_plan([Q_LEN - 1], num_heads=64, num_sms=148)
+        build_work_plan([5], num_heads=64, num_sms=148, q_len=6)
 
 
 def test_work_table_clears_direct_out_when_any_request_splits():
@@ -322,13 +550,19 @@ def test_work_table_clears_direct_out_when_any_request_splits():
         [64, 65, 4096, 777],
         num_heads=64,
         num_sms=148,
+        q_len=1,
         schedule="uniform",
         tiles_per_split=4096,
     )
     assert single.max_splits == 1
     assert bool((work_table_rows(single)[:, 7] & FLAG_DIRECT_OUT).all())
     mixed = build_work_plan(
-        [64, 4096], num_heads=64, num_sms=148, schedule="uniform", tiles_per_split=32
+        [64, 4096],
+        num_heads=64,
+        num_sms=148,
+        q_len=6,
+        schedule="uniform",
+        tiles_per_split=32,
     )
     table = work_table_rows(mixed)
     assert mixed.max_splits == 2 and table.shape == (mixed.num_items, ITEM_FIELDS)
@@ -338,11 +572,16 @@ def test_work_table_clears_direct_out_when_any_request_splits():
 
 def test_workspace_sizing():
     kv_lens = [8192] * 32
-    plan = build_work_plan(kv_lens, num_heads=64, num_sms=148)
-    layout = workspace_layout(plan, batch=32, num_heads=64)
-    total_q = 32 * Q_LEN
+    plan = build_work_plan(
+        kv_lens, num_heads=64, num_sms=148, q_len=6, enable_sink=True
+    )
+    layout = workspace_layout(plan, batch=32, num_heads=64, q_len=6)
+    total_q = 32 * 6
+    assert plan.max_splits == 2
     assert layout["partial_o"][1] == total_q * 64 * plan.max_splits * HEAD_DIM * 4
+    assert layout["partial_lse"][1] == total_q * 64 * plan.max_splits * 4
     assert layout["work_table"][1] == plan.num_items * ITEM_FIELDS * 4
+    assert layout["unit_first"][1] == (plan.num_units + 1) * 4
     offsets = [
         layout[k][0]
         for k in (
@@ -356,8 +595,20 @@ def test_workspace_sizing():
         )
     ]
     assert offsets == sorted(offsets) and all(o % 256 == 0 for o in offsets)
-    assert nvfp4_mla_decode_workspace_size(kv_lens, 64, num_sms=148) == layout["total"]
-    assert layout["total"] <= max_nvfp4_mla_decode_workspace_size(32, 64)
+    assert (
+        nvfp4_mla_decode_workspace_size(
+            kv_lens, 64, num_sms=148, q_len=6, enable_sink=True
+        )
+        == layout["total"]
+    )
+    assert layout["total"] <= max_nvfp4_mla_decode_workspace_size(32, 64, q_len=6)
+    single = build_work_plan([64, 65, 4096, 777], num_heads=64, num_sms=148, q_len=1)
+    single_layout = workspace_layout(single, batch=4, num_heads=64, q_len=1)
+    assert (
+        single.max_splits == 1
+        and single_layout["partial_o"][1] == 4
+        and single_layout["partial_lse"][1] == 4
+    )
     assert max_nvfp4_mla_decode_workspace_size(
         32, 64, max_splits=1
     ) < max_nvfp4_mla_decode_workspace_size(32, 64, max_splits=2)
@@ -396,11 +647,13 @@ def test_quantize_nvfp4_roundtrip_and_saturation():
     )
 
 
-@pytest.mark.parametrize("enable_sink", [False, True])
-def test_reference_matches_masked_softmax(enable_sink):
+@pytest.mark.parametrize("q_len,enable_sink", [(6, False), (6, True), (1, True)])
+def test_reference_matches_masked_softmax(q_len, enable_sink):
     """The ported reference equals a plain softmax with the sink as an extra logit."""
     kv_lens = [70, 130]
-    inputs = make_inputs(kv_lens, 4, enable_sink=enable_sink, device="cpu", seed=3)
+    inputs = make_inputs(
+        kv_lens, 4, q_len=q_len, enable_sink=enable_sink, device="cpu", seed=3
+    )
     out, lse = reference(
         inputs["query"],
         inputs["query_scale"],
@@ -408,6 +661,7 @@ def test_reference_matches_masked_softmax(enable_sink):
         inputs["kv_scale"],
         inputs["block_tables"],
         kv_lens,
+        q_len,
         inputs["sm_scale"],
         inputs["sinks"],
     )
@@ -416,20 +670,20 @@ def test_reference_matches_masked_softmax(enable_sink):
         k = _gather_dequant(
             inputs["kv_cache"], inputs["kv_scale"], inputs["block_tables"][b], kv_len
         )
-        for i in range(Q_LEN):
-            visible = kv_len - Q_LEN + i + 1
+        for i in range(q_len):
+            visible = kv_len - q_len + i + 1
             logits = (
-                q_all[b * Q_LEN + i] @ k[:visible].T * inputs["sm_scale"]
+                q_all[b * q_len + i] @ k[:visible].T * inputs["sm_scale"]
             )  # [H, visible]
             if enable_sink:
                 logits = torch.cat([logits, inputs["sinks"][:, None]], dim=-1)
             probs = torch.softmax(logits, dim=-1)
             expected = probs[:, :visible] @ k[:visible]
             torch.testing.assert_close(
-                out[b * Q_LEN + i].float(), expected, atol=2e-2, rtol=2e-2
+                out[b * q_len + i].float(), expected, atol=2e-2, rtol=2e-2
             )
             torch.testing.assert_close(
-                lse[b * Q_LEN + i],
+                lse[b * q_len + i],
                 torch.logsumexp(logits, dim=-1),
                 atol=1e-5,
                 rtol=1e-5,
@@ -456,7 +710,7 @@ def test_rejects_unsupported_compute_capability():
         pytest.skip("CUDA required")
     if torch.cuda.get_device_capability() in SUPPORTED_COMPUTE_CAPABILITIES:
         pytest.skip("device is supported; nothing to reject")
-    inputs = make_inputs([64], 2, enable_sink=False, device="cuda")
+    inputs = make_inputs([64], 2, q_len=1, enable_sink=False, device="cuda")
     workspace = torch.empty(1 << 20, dtype=torch.uint8, device="cuda")
     with pytest.raises(ValueError, match="compute capability"):
         prepare_nvfp4_batch_decode_with_kv_cache_mla(
@@ -472,39 +726,39 @@ def test_rejects_unsupported_compute_capability():
 
 
 @pytest.mark.parametrize(
-    "label,kv_lens,num_heads,enable_sink,schedule,tiles_per_split",
+    "label,kv_lens,q_len,num_heads,enable_sink,tiles_per_split",
     [
-        ("smoke_forced_two_splits", [256, 300], 64, True, "uniform", 3),
-        ("bs4_kv1k_sink_direct", [1000, 700, 1024, 64], 64, True, "auto", None),
-        ("bs32_q6_kv8k", [8192] * 32, 64, False, "auto", None),
-        ("bs2_kv16k_balanced", [16384, 12000], 64, False, "auto", None),
+        ("smoke_forced_two_splits", [256, 300], 6, 64, True, 3),
+        ("partial_pages_h8", [1000, 8192, 5000], 6, 8, True, None),
+        ("no_sink_q1", [64, 65, 4096, 777], 1, 64, False, None),
+        ("bs32_q6_kv8k", [8192] * 32, 6, 64, True, None),
+        ("bs2_kv16k_mixed", [16384, 12000], 6, 64, False, None),
     ],
 )
 def test_nvfp4_mla_decode(
-    label, kv_lens, num_heads, enable_sink, schedule, tiles_per_split
+    label, kv_lens, q_len, num_heads, enable_sink, tiles_per_split
 ):
     reason = _gpu_skip_reason()
     if reason:
         pytest.skip(reason)
-    inputs = make_inputs(kv_lens, num_heads, enable_sink=enable_sink, device="cuda")
-    num_sms = torch.cuda.get_device_properties(0).multi_processor_count
-    nbytes = (
-        nvfp4_mla_decode_workspace_size(
-            kv_lens,
-            num_heads,
-            num_sms=num_sms,
-            enable_sink=enable_sink,
-            schedule=schedule,
-        )
-        if tiles_per_split is None
-        else max_nvfp4_mla_decode_workspace_size(len(kv_lens), num_heads)
+    inputs = make_inputs(
+        kv_lens, num_heads, q_len=q_len, enable_sink=enable_sink, device="cuda"
     )
+    num_sms = torch.cuda.get_device_properties(0).multi_processor_count
+    if tiles_per_split is None:
+        nbytes = nvfp4_mla_decode_workspace_size(
+            kv_lens, num_heads, num_sms=num_sms, q_len=q_len, enable_sink=enable_sink
+        )
+    else:
+        nbytes = max_nvfp4_mla_decode_workspace_size(
+            len(kv_lens), num_heads, q_len=q_len
+        )
     workspace = torch.empty(nbytes, dtype=torch.uint8, device="cuda")
     out = torch.empty(
-        (len(kv_lens) * Q_LEN, num_heads, HEAD_DIM), dtype=torch.bfloat16, device="cuda"
+        (len(kv_lens) * q_len, num_heads, HEAD_DIM), dtype=torch.bfloat16, device="cuda"
     )
     lse = torch.full(
-        (len(kv_lens) * Q_LEN, num_heads),
+        (len(kv_lens) * q_len, num_heads),
         float("nan"),
         dtype=torch.float32,
         device="cuda",
@@ -522,9 +776,10 @@ def test_nvfp4_mla_decode(
         out=out,
         lse=lse,
         return_lse=True,
-        schedule=schedule,
         tiles_per_split=tiles_per_split,
     )
+    assert decode.main_kwargs["grid"] == (CLUSTER_PAIR * decode.plan.num_units, 1, 1)
+    assert decode.main_kwargs["q_len"] == q_len
     if tiles_per_split is not None:
         assert decode.plan.max_splits >= 2 and decode.reduce_kwargs is not None
     result = decode()
@@ -537,6 +792,7 @@ def test_nvfp4_mla_decode(
         inputs["kv_scale"],
         inputs["block_tables"],
         kv_lens,
+        q_len,
         inputs["sm_scale"],
         inputs["sinks"],
     )
@@ -555,10 +811,10 @@ def test_public_api_returns_out_without_lse():
     if reason:
         pytest.skip(reason)
     kv_lens = [512, 300]
-    inputs = make_inputs(kv_lens, 8, enable_sink=False, device="cuda")
+    inputs = make_inputs(kv_lens, 8, q_len=DSV4_Q_LEN, enable_sink=False, device="cuda")
     num_sms = torch.cuda.get_device_properties(0).multi_processor_count
     workspace = torch.empty(
-        nvfp4_mla_decode_workspace_size(kv_lens, 8, num_sms=num_sms),
+        nvfp4_mla_decode_workspace_size(kv_lens, 8, num_sms=num_sms, q_len=DSV4_Q_LEN),
         dtype=torch.uint8,
         device="cuda",
     )
@@ -575,7 +831,7 @@ def test_public_api_returns_out_without_lse():
     )
     out = decode()
     assert isinstance(out, torch.Tensor) and out.shape == (
-        len(kv_lens) * Q_LEN,
+        len(kv_lens) * DSV4_Q_LEN,
         8,
         HEAD_DIM,
     )
@@ -587,6 +843,7 @@ def test_public_api_returns_out_without_lse():
         inputs["kv_scale"],
         inputs["block_tables"],
         kv_lens,
+        DSV4_Q_LEN,
         inputs["sm_scale"],
         None,
     )

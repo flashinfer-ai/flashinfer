@@ -7,30 +7,31 @@ backend selection. Tracking: flashinfer-ai/flashinfer#5403.
 
 `flashinfer.mla.prepare_nvfp4_batch_decode_with_kv_cache_mla(...)` serves the
 DeepSeek-V4 main-attention decode geometry: paged MQA over one 512-wide NVFP4
-latent row per token that is both K and V, 64-token pages, six query tokens
-per request with a causal mask inside the block against the request's last
-tokens, an optional per-head attention sink, BF16 output and natural-log FP32
+latent row per token that is both K and V, 64-token pages, `q_len` query
+tokens per request (derived from the query rows; six for DeepSeek-V4) with a
+causal mask inside the block against the request's last tokens, an optional per-head attention sink, BF16 output and natural-log FP32
 LSE. Query and KV are E2M1 values packed two per byte (256 bytes per row)
 with UE4M3 block-16 scales (32 bytes per row); `quantize_nvfp4` in
 `cake_backend.py` produces both from a float tensor.
 
 | Tensor | Shape | dtype |
 | --- | --- | --- |
-| `query` | `[batch * 6, num_heads, 256]` | uint8 (packed E2M1) |
-| `query_scale` | `[batch * 6, num_heads, 32]` | uint8 (UE4M3) |
+| `query` | `[batch * q_len, num_heads, 256]` | uint8 (packed E2M1) |
+| `query_scale` | `[batch * q_len, num_heads, 32]` | uint8 (UE4M3) |
 | `kv_cache` | `[num_pages, 64, 256]` | uint8 (packed E2M1) |
 | `kv_scale` | `[num_pages, 64, 32]` | uint8 (UE4M3) |
 | `block_tables` | `[batch, max_pages]` | int32 |
 | `seq_lens` | `[batch]` | int32 |
 | `sinks` (optional) | `[num_heads]` | float32 |
-| `out` | `[batch * 6, num_heads, 512]` | bfloat16 |
-| `lse` | `[batch * 6, num_heads]` | float32 (natural log) |
+| `out` | `[batch * q_len, num_heads, 512]` | bfloat16 |
+| `lse` | `[batch * q_len, num_heads]` | float32 (natural log) |
 
 Preparation validates the inputs, builds the host work plan from the
 sequence lengths (one device-to-host copy unless `seq_lens_cpu` is passed),
 carves the FP32 split partials and plan tables out of `workspace_buffer`, and
-returns an `NVFP4MLADecodeRunner`. Calling the runner launches the persistent
-decode kernel and, when the plan has more than one KV split per request, the
+returns an `NVFP4MLADecodeRunner`. The decode kernel launches one cluster of
+two CTAs per work unit (the two output halves of a row tile share a multicast
+page stream). Calling the runner launches the persistent decode kernel and, when the plan has more than one KV split per request, the
 split-KV combine kernel, with no CUDA allocation or host synchronization:
 
 ```python
@@ -68,7 +69,8 @@ bounds the workspace for any plan; the runner's `main_kwargs` /
 `lse` are the exact tensors passed by the caller.
 
 Limits of the current route: head dimension 512 with shared K/V rows (MQA),
-page size 64, exactly six query tokens per request, causal masking inside the
+page size 64, the same number of query tokens per request across the batch,
+causal masking inside the
 query block, optional sinks, SM100 (B200) and SM103 (B300) only (SM120/SM121
 lack the block-scaled tensor-core path). At most 64 KV splits per request.
 

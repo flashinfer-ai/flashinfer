@@ -32,7 +32,12 @@ PAGE_SIZE = 64  # tokens per page; one page is one KV tile of the decode kernel
 SF_VEC = 16  # E2M1 values per UE4M3 block scale
 ROW_BYTES = HEAD_DIM // 2  # 256 packed E2M1 bytes per Q / KV row
 SF_ROW_BYTES = HEAD_DIM // SF_VEC  # 32 UE4M3 bytes per Q / KV row
-Q_LEN = 6  # query tokens per request (causal inside the block)
+DSV4_Q_LEN = (
+    6  # DeepSeek-V4 default: query tokens per request (derived from the query shape)
+)
+CLUSTER_PAIR = (
+    2  # the two v_half CTAs of a row tile form one cluster (multicast page stream)
+)
 ROWS_PER_TILE = 128  # packed query rows (token * H + head) per work item
 V_HALVES = 2  # each work item accumulates 256 of the 512 output dims
 LOG2E = 1.4426950408889634
@@ -44,7 +49,7 @@ FLAG_SEED_SINK = 1  # split 0 folds the attention sink into the online softmax
 FLAG_DIRECT_OUT = 2  # single-split request: write O / LSE directly
 MAX_SPLITS = 64  # split-KV combine kernel capacity per row
 MIN_PAGES_PER_UNIT = 8  # balanced schedule: minimum pages per CTA
-BALANCED_MIN_KV = 16384  # auto schedule: balanced partition from this KV length on
+BALANCED_MIN_KV = 8192  # auto schedule: balanced partition from this KV length on
 WORKSPACE_ALIGNMENT = 256
 
 # Keyword names the two stages are bound with (arg plans refer to these names).
@@ -132,9 +137,10 @@ class WorkPlan:
     """Flat work table of the persistent decode kernel.
 
     One item is ``(request, m_tile, v_half, tile_start, tile_end, split,
-    num_splits, flags)``; CTA ``u`` runs items ``unit_first[u] ..
-    unit_first[u + 1]``. Requests with more than one split go through the
-    FP32 partials and the split-KV combine kernel.
+    num_splits, flags)``; cluster ``u`` (``CLUSTER_PAIR`` CTAs) runs items
+    ``unit_first[u] .. unit_first[u + 1]``, always whole (v_half 0, v_half 1)
+    pairs of one piece. Requests with more than one split go through the FP32
+    partials and the split-KV combine kernel.
     """
 
     schedule: str
@@ -150,6 +156,11 @@ class WorkPlan:
     @property
     def num_units(self) -> int:
         return len(self.unit_first) - 1
+
+    @property
+    def grid(self) -> tuple:
+        """Launch grid: one cluster of ``CLUSTER_PAIR`` CTAs per unit."""
+        return (CLUSTER_PAIR * self.num_units, 1, 1)
 
 
 def kv_tiles(kv_len: int) -> int:
@@ -204,7 +215,7 @@ def choose_tiles_per_split(
 
 
 def _uniform_plan(kv_lens, *, q_len, num_heads, num_sms, enable_sink, tiles_per_split):
-    """Request-major table, one item per CTA (all CTAs of a split are adjacent)."""
+    """Request-major table, one v_half pair per cluster (all CTAs of a split are adjacent)."""
     if tiles_per_split is None:
         tiles_per_split = choose_tiles_per_split(
             kv_lens, q_len=q_len, num_heads=num_heads, num_sms=num_sms
@@ -232,7 +243,7 @@ def _uniform_plan(kv_lens, *, q_len, num_heads, num_sms, enable_sink, tiles_per_
     return WorkPlan(
         schedule="uniform",
         items=tuple(items),
-        unit_first=tuple(range(len(items) + 1)),
+        unit_first=tuple(range(0, len(items) + 1, CLUSTER_PAIR)),
         max_splits=max_splits,
         tiles_per_split=tiles_per_split,
     )
@@ -305,26 +316,44 @@ def _balanced_plan(kv_lens, *, q_len, num_heads, num_units, enable_sink):
     )
 
 
+def check_pairs(plan: WorkPlan) -> None:
+    """Every unit holds consecutive (v_half 0, v_half 1) items of the same piece."""
+    items, unit_first = plan.items, plan.unit_first
+    for u in range(len(unit_first) - 1):
+        lo, hi = unit_first[u], unit_first[u + 1]
+        if (hi - lo) % CLUSTER_PAIR:
+            raise ValueError(
+                f"unit {u} holds {hi - lo} items; the cluster pairing needs an even count"
+            )
+        for i in range(lo, hi, CLUSTER_PAIR):
+            a, b = items[i], items[i + 1]
+            if (a[2], b[2]) != (0, 1) or a[:2] != b[:2] or a[3:7] != b[3:7]:
+                raise ValueError(
+                    f"items {i},{i + 1} are not a v_half pair of one piece: {a} / {b}"
+                )
+
+
 def build_work_plan(
     kv_lens: Sequence[int],
     *,
     num_heads: int,
     num_sms: int,
-    q_len: int = Q_LEN,
+    q_len: int,
     enable_sink: bool = False,
     schedule: str = "auto",
     tiles_per_split: Optional[int] = None,
 ) -> WorkPlan:
     """Build the host work plan for one batch.
 
-    ``schedule="auto"`` uses the balanced partition over ``num_sms`` CTAs when
-    the longest request reaches ``BALANCED_MIN_KV`` tokens and the uniform
-    split policy otherwise; ``"balanced"`` / ``"uniform"`` force one of them.
-    ``tiles_per_split`` fixes the uniform split granularity (pages per split).
+    ``schedule="auto"`` uses the balanced partition over ``num_sms //
+    CLUSTER_PAIR`` clusters when the longest request reaches
+    ``BALANCED_MIN_KV`` tokens and the uniform split policy otherwise;
+    ``"balanced"`` / ``"uniform"`` force one of them. ``tiles_per_split``
+    fixes the uniform split granularity (pages per split).
     """
     kv_lens = [int(v) for v in kv_lens]
-    if not kv_lens or min(kv_lens) < q_len:
-        raise ValueError("every request needs kv_len >= q_len")
+    if q_len < 1 or not kv_lens or min(kv_lens) < q_len:
+        raise ValueError("every request needs kv_len >= q_len >= 1")
     if schedule == "auto":
         schedule = "balanced" if max(kv_lens) >= BALANCED_MIN_KV else "uniform"
     if schedule == "balanced":
@@ -332,7 +361,7 @@ def build_work_plan(
             kv_lens,
             q_len=q_len,
             num_heads=num_heads,
-            num_units=num_sms,
+            num_units=num_sms // CLUSTER_PAIR,
             enable_sink=enable_sink,
         )
     elif schedule == "uniform":
@@ -350,6 +379,7 @@ def build_work_plan(
         raise ValueError(
             f"work plan needs {plan.max_splits} KV splits; the combine kernel supports {MAX_SPLITS}"
         )
+    check_pairs(plan)
     return plan
 
 
@@ -376,20 +406,31 @@ def _align(nbytes: int) -> int:
     )
 
 
-def workspace_layout(
-    plan: WorkPlan, *, batch: int, num_heads: int, q_len: int = Q_LEN
-) -> dict:
+def partial_shapes(plan: WorkPlan, *, total_q: int, num_heads: int) -> tuple:
+    """Shapes of ``partial_o`` / ``partial_lse``; one dummy element each for single-split plans."""
+    if plan.max_splits == 1:
+        return (1,), (1,)
+    return (total_q, num_heads, plan.max_splits, HEAD_DIM), (
+        total_q,
+        num_heads,
+        plan.max_splits,
+    )
+
+
+def workspace_layout(plan: WorkPlan, *, batch: int, num_heads: int, q_len: int) -> dict:
     """Byte offsets and sizes of every workspace region plus ``"total"``.
 
     Regions: FP32 ``partial_o [total_q, H, max_splits, 512]`` and
-    ``partial_lse [total_q, H, max_splits]`` (only read when
-    ``max_splits > 1``), int32 ``work_table``, ``unit_first``, ``row_splits``,
-    ``q_indptr`` and FP32 ``sinks [H]``.
+    ``partial_lse [total_q, H, max_splits]`` (one dummy element each when the
+    plan has a single split and the kernel writes ``O`` / ``LSE`` directly),
+    int32 ``work_table``, ``unit_first``, ``row_splits``, ``q_indptr`` and
+    FP32 ``sinks [H]``.
     """
     total_q = batch * q_len
+    o_shape, lse_shape = partial_shapes(plan, total_q=total_q, num_heads=num_heads)
     sizes = (
-        ("partial_o", total_q * num_heads * plan.max_splits * HEAD_DIM * 4),
-        ("partial_lse", total_q * num_heads * plan.max_splits * 4),
+        ("partial_o", math.prod(o_shape) * 4),
+        ("partial_lse", math.prod(lse_shape) * 4),
         ("work_table", plan.num_items * ITEM_FIELDS * 4),
         ("unit_first", (plan.num_units + 1) * 4),
         ("row_splits", total_q * 4),
@@ -410,7 +451,7 @@ def nvfp4_mla_decode_workspace_size(
     num_heads: int,
     *,
     num_sms: int,
-    q_len: int = Q_LEN,
+    q_len: int = DSV4_Q_LEN,
     enable_sink: bool = False,
     schedule: str = "auto",
 ) -> int:
@@ -429,7 +470,7 @@ def nvfp4_mla_decode_workspace_size(
 
 
 def max_nvfp4_mla_decode_workspace_size(
-    batch: int, num_heads: int, *, q_len: int = Q_LEN, max_splits: int = MAX_SPLITS
+    batch: int, num_heads: int, *, q_len: int = DSV4_Q_LEN, max_splits: int = MAX_SPLITS
 ) -> int:
     """Upper bound of the workspace for any plan with at most ``max_splits`` splits.
 
@@ -554,7 +595,7 @@ def validate_nvfp4_mla_decode_inputs(
     out=None,
     lse=None,
 ) -> tuple:
-    """Shape / dtype validation shared by ``prepare``; returns ``(batch, H, num_pages)``.
+    """Shape / dtype validation shared by ``prepare``; returns ``(batch, H, num_pages, q_len)``.
 
     Device placement and compute capability are checked separately so this
     part runs on host tensors too.
@@ -567,10 +608,11 @@ def validate_nvfp4_mla_decode_inputs(
     if block_tables.ndim != 2 or block_tables.dtype != torch.int32:
         raise ValueError("block_tables must be an int32 [batch, max_pages] tensor")
     batch = int(block_tables.shape[0])
-    if batch <= 0 or num_heads <= 0 or total_q != batch * Q_LEN:
+    if batch <= 0 or num_heads <= 0 or total_q < batch or total_q % batch:
         raise ValueError(
-            f"this route serves {Q_LEN} query tokens per request: total_q must be batch * {Q_LEN}"
+            "query rows must be batch * q_len with the same number of query tokens per request"
         )
+    q_len = total_q // batch
     if seq_lens.shape != (batch,) or seq_lens.dtype != torch.int32:
         raise ValueError("seq_lens must be an int32 [batch] tensor")
     if kv_cache.ndim != 3 or tuple(kv_cache.shape[1:]) != (PAGE_SIZE, ROW_BYTES):
@@ -596,7 +638,7 @@ def validate_nvfp4_mla_decode_inputs(
         lse.shape != (total_q, num_heads) or lse.dtype != torch.float32
     ):
         raise ValueError("lse must be a float32 [total_q, num_heads] tensor")
-    return batch, num_heads, num_pages
+    return batch, num_heads, num_pages, q_len
 
 
 def prepare_nvfp4_batch_decode_with_kv_cache_mla(
@@ -627,7 +669,7 @@ def prepare_nvfp4_batch_decode_with_kv_cache_mla(
     """
     if backend != "cake":
         raise ValueError("NVFP4 MLA decode supports backend='cake'")
-    batch, num_heads, num_pages = validate_nvfp4_mla_decode_inputs(
+    batch, num_heads, num_pages, q_len = validate_nvfp4_mla_decode_inputs(
         query,
         query_scale,
         kv_cache,
@@ -658,21 +700,22 @@ def prepare_nvfp4_batch_decode_with_kv_cache_mla(
     if len(kv_lens) != batch:
         raise ValueError("seq_lens_cpu must hold one length per request")
     max_pages = int(block_tables.shape[1])
-    if min(kv_lens) < Q_LEN or max(kv_lens) > max_pages * PAGE_SIZE:
+    if min(kv_lens) < q_len or max(kv_lens) > max_pages * PAGE_SIZE:
         raise ValueError(
-            f"every request needs {Q_LEN} <= seq_len <= max_pages * {PAGE_SIZE}"
+            f"every request needs q_len ({q_len}) <= seq_len <= max_pages * {PAGE_SIZE}"
         )
-    total_q = batch * Q_LEN
+    total_q = batch * q_len
     num_sms = torch.cuda.get_device_properties(device).multi_processor_count
     plan = build_work_plan(
         kv_lens,
         num_heads=num_heads,
         num_sms=num_sms,
+        q_len=q_len,
         enable_sink=sinks is not None,
         schedule=schedule,
         tiles_per_split=tiles_per_split,
     )
-    layout = workspace_layout(plan, batch=batch, num_heads=num_heads)
+    layout = workspace_layout(plan, batch=batch, num_heads=num_heads, q_len=q_len)
     flat = workspace_buffer.view(-1).view(torch.uint8)
     if flat.numel() < layout["total"]:
         raise ValueError(
@@ -687,16 +730,9 @@ def prepare_nvfp4_batch_decode_with_kv_cache_mla(
         lse = torch.empty((total_q, num_heads), dtype=torch.float32, device=device)
 
     max_splits = plan.max_splits
-    partial_o = _carve(
-        flat,
-        layout,
-        "partial_o",
-        torch.float32,
-        (total_q, num_heads, max_splits, HEAD_DIM),
-    )
-    partial_lse = _carve(
-        flat, layout, "partial_lse", torch.float32, (total_q, num_heads, max_splits)
-    )
+    o_shape, lse_shape = partial_shapes(plan, total_q=total_q, num_heads=num_heads)
+    partial_o = _carve(flat, layout, "partial_o", torch.float32, o_shape)
+    partial_lse = _carve(flat, layout, "partial_lse", torch.float32, lse_shape)
     work_table = _carve(
         flat, layout, "work_table", torch.int32, (plan.num_items, ITEM_FIELDS)
     )
@@ -711,7 +747,7 @@ def prepare_nvfp4_batch_decode_with_kv_cache_mla(
     work_table.copy_(work_table_rows(plan))
     unit_first.copy_(torch.tensor(plan.unit_first, dtype=torch.int32))
     row_splits.fill_(max_splits)
-    q_indptr.copy_(torch.arange(0, total_q + 1, Q_LEN, dtype=torch.int32))
+    q_indptr.copy_(torch.arange(0, total_q + 1, q_len, dtype=torch.int32))
     if sinks is None:
         sink_buffer.zero_()
     else:
@@ -733,11 +769,11 @@ def prepare_nvfp4_batch_decode_with_kv_cache_mla(
         q_indptr=q_indptr,
         sinks=sink_buffer,
         num_heads=num_heads,
-        q_len=Q_LEN,
+        q_len=q_len,
         max_pages=max_pages,
         max_splits=max_splits,
         scale_log2=float(sm_scale) * LOG2E,
-        grid=(plan.num_units, 1, 1),
+        grid=plan.grid,
     )
     reduce_kwargs = None
     if max_splits > 1:

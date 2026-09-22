@@ -31,9 +31,9 @@ import statistics
 import torch
 
 from flashinfer.experimental.nvfp4_mla_decode.cake_backend import (
+    DSV4_Q_LEN,
     HEAD_DIM,
     PAGE_SIZE,
-    Q_LEN,
     ROW_BYTES,
     SF_ROW_BYTES,
     nvfp4_mla_decode_workspace_size,
@@ -45,10 +45,10 @@ from flashinfer.testing import bench_gpu_time_with_cupti
 DEFAULT_KV = (8192, 16384, 32768, 65536, 131072)
 
 
-def make_inputs(batch, kv_len, num_heads, device, seed=0):
+def make_inputs(batch, kv_len, num_heads, q_len, device, seed=0):
     gen = torch.Generator(device=device).manual_seed(seed)
     pages = batch * (kv_len // PAGE_SIZE)
-    q = torch.randn((batch * Q_LEN, num_heads, HEAD_DIM), generator=gen, device=device)
+    q = torch.randn((batch * q_len, num_heads, HEAD_DIM), generator=gen, device=device)
     kv = torch.randn((pages, PAGE_SIZE, HEAD_DIM), generator=gen, device=device)
     query, query_scale = quantize_nvfp4(q)
     kv_cache, kv_scale = quantize_nvfp4(kv)
@@ -66,13 +66,15 @@ def median_ms(fn):
     return float(statistics.median(times))
 
 
-def bench_cake(batch, kv_len, num_heads, device):
+def bench_cake(batch, kv_len, num_heads, q_len, device):
     _, _, query, query_scale, kv_cache, kv_scale, block_tables, seq_lens = make_inputs(
-        batch, kv_len, num_heads, device
+        batch, kv_len, num_heads, q_len, device
     )
     num_sms = torch.cuda.get_device_properties(device).multi_processor_count
     workspace = torch.empty(
-        nvfp4_mla_decode_workspace_size([kv_len] * batch, num_heads, num_sms=num_sms),
+        nvfp4_mla_decode_workspace_size(
+            [kv_len] * batch, num_heads, num_sms=num_sms, q_len=q_len
+        ),
         dtype=torch.uint8,
         device=device,
     )
@@ -90,7 +92,7 @@ def bench_cake(batch, kv_len, num_heads, device):
     return median_ms(decode), decode.plan
 
 
-def bench_trtllm_fp8(batch, kv_len, num_heads, device):
+def bench_trtllm_fp8(batch, kv_len, num_heads, q_len, device):
     """Informational trtllm-gen FP8 MLA decode (576-wide rows, q_len 6) or None."""
     try:
         from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
@@ -100,7 +102,7 @@ def bench_trtllm_fp8(batch, kv_len, num_heads, device):
         gen = torch.Generator(device=device).manual_seed(0)
         pages = batch * (kv_len // PAGE_SIZE)
         query = torch.randn(
-            (batch, Q_LEN, num_heads, 576), generator=gen, device=device
+            (batch, q_len, num_heads, 576), generator=gen, device=device
         ).to(torch.float8_e4m3fn)
         kv = torch.randn((pages, 1, PAGE_SIZE, 576), generator=gen, device=device).to(
             torch.float8_e4m3fn
@@ -142,6 +144,7 @@ def main():
     )
     parser.add_argument("--batch", type=int, default=32)
     parser.add_argument("--heads", type=int, default=64)
+    parser.add_argument("--q-len", type=int, default=DSV4_Q_LEN)
     parser.add_argument("--kv", type=int, nargs="+", default=list(DEFAULT_KV))
     parser.add_argument(
         "--with-trtllm",
@@ -152,22 +155,22 @@ def main():
     device = torch.device("cuda")
     name = torch.cuda.get_device_name(device)
     print(
-        f"{name}: NVFP4 DeepSeek-V4 decode, batch {args.batch}, q_len {Q_LEN}, heads {args.heads}"
+        f"{name}: NVFP4 DeepSeek-V4 decode, batch {args.batch}, q_len {args.q_len}, heads {args.heads}"
     )
     header = f"{'kv_len':>8} {'splits':>6} {'schedule':>9} {'ms':>9} {'TFLOPS':>8} {'GB/s':>8}"
     if args.with_trtllm:
         header += f" {'trtllm fp8 ms':>14}"
     print(header)
     for kv_len in args.kv:
-        ms, plan = bench_cake(args.batch, kv_len, args.heads, device)
-        rows = args.batch * Q_LEN * args.heads
+        ms, plan = bench_cake(args.batch, kv_len, args.heads, args.q_len, device)
+        rows = args.batch * args.q_len * args.heads
         flops = 2.0 * rows * kv_len * (2 * HEAD_DIM)
         nbytes = args.batch * kv_len * (ROW_BYTES + SF_ROW_BYTES) + rows * (
             ROW_BYTES + SF_ROW_BYTES + 2 * HEAD_DIM
         )
         line = f"{kv_len:>8} {plan.max_splits:>6} {plan.schedule:>9} {ms:>9.4f} {flops / (ms * 1e9):>8.1f} {nbytes / (ms * 1e6):>8.1f}"
         if args.with_trtllm:
-            ref = bench_trtllm_fp8(args.batch, kv_len, args.heads, device)
+            ref = bench_trtllm_fp8(args.batch, kv_len, args.heads, args.q_len, device)
             line += f" {ref:>14.4f}" if ref is not None else f" {'n/a':>14}"
         print(line)
     assert math.isfinite(ms)

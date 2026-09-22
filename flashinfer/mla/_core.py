@@ -4373,12 +4373,13 @@ def prepare_nvfp4_batch_decode_with_kv_cache_mla(
 ):
     """Prepare NVFP4 DeepSeek-V4 paged MQA decode attention.
 
-    The experimental Cake backend serves ``[batch * 6, num_heads, 512]``
-    queries against a shared paged K/V cache of 64-token pages, both stored
-    as packed E2M1 bytes (256 per row) with UE4M3 block-16 scales (32 per
-    row), with a causal mask inside the six-token query block, optional
-    per-head attention sinks, BF16 output and natural-log FP32 LSE. It
-    requires compute capability 10.0 or 10.3.
+    The experimental Cake backend serves ``[batch * q_len, num_heads, 512]``
+    queries (``q_len`` query tokens per request, derived from the query
+    rows; six for DeepSeek-V4) against a shared paged K/V cache of 64-token
+    pages, both stored as packed E2M1 bytes (256 per row) with UE4M3
+    block-16 scales (32 per row), with a causal mask inside each request's
+    query block, optional per-head attention sinks, BF16 output and
+    natural-log FP32 LSE. It requires compute capability 10.0 or 10.3.
 
     Preparation validates inputs, builds the host work plan from the
     sequence lengths (one device-to-host copy unless ``seq_lens_cpu`` is
