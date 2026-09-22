@@ -37,6 +37,7 @@ from ..jit import gen_trtllm_gen_fmha_module, setup_cubin_loader
 from ..utils import (
     _check_block_tables_shape,
     check_shape_dtype_device,
+    check_trtllm_gen_fmha_arch,
     check_trtllm_gen_sm107_only_feature,
     device_support_pdl,
     get_compute_capability,
@@ -3688,6 +3689,12 @@ def _trtllm_batch_decode_with_kv_cache_mla_impl(
             backend = "sparse"
         elif cc[0] != 10:
             backend = "xqa"
+    elif backend == "trtllm-gen":
+        check_trtllm_gen_fmha_arch(
+            query.device,
+            sm12x_alternative="backend='sparse' (sparse_mla_top_k > 0) or "
+            "backend='xqa' (dense decode); backend='auto' picks between them",
+        )
 
     # The native no-rope trtllm-gen/cute-dsl kernels require the per-token
     # active top-k length; the SM120 sparse backend bounds each row by its

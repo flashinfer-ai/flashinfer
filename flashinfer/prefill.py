@@ -101,6 +101,7 @@ from .utils import (
     register_custom_op,
     register_fake_op,
     round_up,
+    check_trtllm_gen_fmha_arch,
     check_trtllm_gen_sm107_only_feature,
 )
 
@@ -5982,6 +5983,10 @@ def trtllm_ragged_attention_deepseek(
     check_trtllm_gen_sm107_only_feature(
         uses_spcompress, "uses_spcompress", query.device
     )
+    if backend == "trtllm-gen":
+        check_trtllm_gen_fmha_arch(
+            query.device, sm12x_alternative="BatchPrefillWithRaggedKVCacheWrapper"
+        )
     is_dsr1 = query.shape[2] == 192 and key.shape[2] == 192 and value.shape[2] == 128
     is_smaller_dimensions = (
         query.shape[2] == 128 and key.shape[2] == 128 and value.shape[2] == 128
@@ -6667,6 +6672,10 @@ def trtllm_batch_context_with_kv_cache(
     if backend not in ("trtllm-gen", "cake"):
         raise ValueError(
             "trtllm_batch_context_with_kv_cache backend must be 'trtllm-gen' or 'cake'"
+        )
+    if backend == "trtllm-gen":
+        check_trtllm_gen_fmha_arch(
+            query.device, sm12x_alternative="BatchPrefillWithPagedKVCacheWrapper"
         )
     if not causal and window_left >= 0:
         raise NotImplementedError(
