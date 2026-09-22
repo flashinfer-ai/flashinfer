@@ -11,11 +11,15 @@ if TYPE_CHECKING:
 
 @dataclass
 class Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
-    """Kernel params for ``kernel_src.cutedsl_megamoe.nvfp4_mega_moe``.
+    """Kernel params for ``kernel_src.sm100.cutedsl_megamoe.nvfp4_mega_moe``.
 
     Expert weights must be NVFP4 at kernel launch; supply bf16 ``MoEWeightPack``
     and enable ``MegaConfig.preprocess_weights`` (default), or pass pre-quantized
     NVFP4 weights with ``w13_scale`` / ``w2_scale``.
+
+    Set ``swiglu_alpha=1.702`` and ``swiglu_beta=1.0`` for MiniMax-M3:
+    ``(up + beta) * gate * sigmoid(alpha * gate)``, after ``gate_up_clamp``.
+    These are scalar activation constants, distinct from ``fc1_alpha``.
     """
 
     intermediate_size: int
@@ -40,10 +44,17 @@ class Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     fc1_alpha: Optional["torch.Tensor"] = None
     fc2_alpha: Optional["torch.Tensor"] = None
     fc1_norm_const: Optional["torch.Tensor"] = None
-    # Kernel tuning knobs (see kernel_src.cutedsl_megamoe.shim.tuner); overrides
+    # Kernel tuning knobs (see kernel_src.sm100.cutedsl_megamoe.shim.tuner); overrides
     # the token-count default heuristic entirely when set, e.g. a winner from the
     # kernel repo's tester sweep. None -> tuner.default_knobs(num_max_tokens).
     # "auto" -> online autotune at the first forward: collectively time the
     # shim.autotune candidate set on the live problem and keep the winner
     # (one cute.compile per candidate, paid once per session).
     knobs: dict | str | None = None
+    # Uniform per-layer SwiGLU constants; None/None keeps standard SwiGLU.
+    swiglu_alpha: float | None = None
+    swiglu_beta: float | None = None
+
+    def __post_init__(self) -> None:
+        if (self.swiglu_alpha is None) != (self.swiglu_beta is None):
+            raise ValueError("swiglu_alpha and swiglu_beta must be set together.")

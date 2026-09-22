@@ -147,6 +147,8 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
         fc1_early_done_publish: bool = False,
         fold_producer_warps: bool = True,
         generate_c: bool = False,
+        # Tail-split pair tasks (see fc1_fc2_fuse_sched); needs a 2-CTA token cluster.
+        tail_split_pairs: bool = False,
     ) -> None:
         # Folding TMA-A / TMA-B / scheduler into the idle dispatch slots is
         # only possible with a single active dispatch warp.  Without the
@@ -207,6 +209,7 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
             epi_flag_batch=epi_flag_batch,
             gate_up_clamp=gate_up_clamp,
             generate_c=generate_c,
+            tail_split_pairs=tail_split_pairs,
         )
 
         self.enable_token_comm = True
@@ -351,6 +354,20 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
             )
         else:
             fc2_publishes = 0
+        # Tail-split pair tasks: a split tail block publishes fc2_done
+        # token_cluster * ceil(W2/2) times; the walker needs the CTA tile size.
+        fc2_publishes_split_tail = 0
+        cta_tile_tokens = None
+        if token_back_by_dispatch and tail_split_pairs:
+            if token_cluster != 2 or hidden_cluster != 1:
+                raise ValueError(
+                    "tail_split_pairs requires a token-side cluster of 2 and a "
+                    f"weight-side cluster of 1; got cluster_shape_mnk="
+                    f"{tuple(cluster_shape_mnk)} (swap_ab={is_swap_ab})."
+                )
+            hidden_tiles = (self.hidden + hidden_tile - 1) // hidden_tile
+            fc2_publishes_split_tail = token_cluster * ((hidden_tiles + 1) // 2)
+            cta_tile_tokens = self.cluster_tile_tokens // token_cluster
 
         self.token_comm = TokenInPullTokenBackPush(
             world_size=self.world_size,
@@ -363,6 +380,8 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
             fc1_token_dtype=self.ab_dtype,
             token_back_by_dispatch=token_back_by_dispatch,
             fc2_publishes_per_token_cluster_tile=fc2_publishes,
+            fc2_publishes_per_split_tail_tile=fc2_publishes_split_tail,
+            cta_tile_tokens=cta_tile_tokens,
             token_back_reduce_topk=(
                 token_back_by_dispatch and fc2_in_kernel_topk_reduce
             ),

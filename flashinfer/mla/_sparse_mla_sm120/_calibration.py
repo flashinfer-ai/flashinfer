@@ -712,6 +712,7 @@ def _make_decode_call_builder(
                     _model_type_for_family(family),
                     cpb,
                     False,  # extra_fp4: calibration times single-cache shapes
+                    1.0,
                 )
 
         else:
@@ -731,6 +732,7 @@ def _make_decode_call_builder(
                     None,
                     model_type,
                     cpb,
+                    1.0,
                 )
 
         return call
@@ -2060,6 +2062,7 @@ def _measure_ordinary_bucket(
                 ctx.extra,
                 ex,
                 extra_lengths,
+                1.0,
             )
 
         return time_calibration_calls(call, arguments, device)

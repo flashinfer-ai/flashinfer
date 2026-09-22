@@ -322,6 +322,7 @@ def test_execute_descriptor_graph_and_mismatch(precision):
             None,
             None,
             None,
+            1.0,
         )
 
     call()
@@ -399,7 +400,7 @@ def test_resolved_execution_matches_legacy(model, variant, heads):
         )
     else:
         module.sparse_mla_sm120_decode_dsv3_2(
-            q, cache, idx, mid, mlse, out, lse, 2, 512**-0.5, None, None, model, 1
+            q, cache, idx, mid, mlse, out, lse, 2, 512**-0.5, None, None, model, 1, 1.0
         )
     expected = out.clone(), lse.clone()
 
@@ -419,6 +420,7 @@ def test_resolved_execution_matches_legacy(model, variant, heads):
             None,
             None,
             None,
+            1.0,
         )
 
     call()
@@ -513,6 +515,7 @@ def test_dual_resolved_execution_and_optional_mismatch(model, variant, extra_fp4
             model,
             1,
             extra_fp4,
+            1.0,
         )
     expected = out.clone(), lse.clone()
 
@@ -532,6 +535,7 @@ def test_dual_resolved_execution_and_optional_mismatch(model, variant, extra_fp4
             extra,
             idx,
             None,
+            1.0,
         )
 
     call()
@@ -591,6 +595,7 @@ def test_nvfp4_legacy_rejects_width_before_narrowing(operand, sm12x):
             None,
             1,
             False,
+            1.0,
         )
 
 
@@ -670,7 +675,7 @@ def test_dsv4_nvfp4_execute_plan_graph(cpb, prefill, stage1):
     module = gen_sparse_mla_sm120_module().build_and_load()
     if prefill:
         module.sparse_mla_sm120_nvfp4_prefill(
-            q, cache, idx, out, lse, 512**-0.5, None, None, None, None, None
+            q, cache, idx, out, lse, 512**-0.5, None, None, None, None, None, 1.0
         )
     else:
         module.sparse_mla_sm120_nvfp4_decode(
@@ -690,6 +695,7 @@ def test_dsv4_nvfp4_execute_plan_graph(cpb, prefill, stage1):
             None,
             cpb,
             stage1,
+            1.0,
         )
     partial, split_lse, _ = plan.workspace()
     exact_mid = mid.flatten()[: partial[0][0]] if partial[2] else None
@@ -713,6 +719,7 @@ def test_dsv4_nvfp4_execute_plan_graph(cpb, prefill, stage1):
             None,
             None,
             None,
+            1.0,
         )
 
     call()
@@ -767,6 +774,7 @@ def test_dsv4_nvfp4_execute_plan_graph(cpb, prefill, stage1):
         None,
         None,
         None,
+        1.0,
     )
     torch.cuda.synchronize()
     if not stage1:
@@ -1206,6 +1214,7 @@ def _standalone_call(tensors, route="fp8"):
             None,
             3,
             1,
+            1.0,
         )
     else:
         module.sparse_mla_sm120_decode_dsv4(
@@ -1226,6 +1235,7 @@ def _standalone_call(tensors, route="fp8"):
             1,
             1,
             False,
+            1.0,
         )
     torch.cuda.synchronize()
 

@@ -39,6 +39,8 @@ _patch_cutlass_dsl_operand_major_mode()
 import flashinfer
 from flashinfer.jit import MissingJITCacheError
 
+pytest_plugins = ["tests.test_helpers.parametrize"]
+
 # Global tracking for JIT cache coverage
 # Store tuples of (test_name, module_name, spec_info)
 _MISSING_JIT_CACHE_MODULES: Set[tuple] = set()
