@@ -42,6 +42,7 @@ from .flashinfer_benchmark_utils import (
     print_perf_metrics,
     is_close_stats,
     filter_backends_by_compute_capability,
+    to_float8,
 )
 
 TRTLLM_RAGGED_ROW_ACTIVITY_MODES = (
@@ -700,6 +701,8 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
         return res
     kv_init_dtype = torch.float16 if kv_dtype == torch.float16 else torch.bfloat16
 
+    v_dtype = dtype_str_to_torch_dtype(args.v_dtype) if args.v_dtype else kv_dtype
+
     o_data_type = (
         dtype_str_to_torch_dtype(args.out_dtype) if args.out_dtype else q_dtype
     )
@@ -762,22 +765,41 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
         if remove_fa2_tc:
             backends.remove("fa2_tc")
 
-    if "cudnn" in backends:
+    for cudnn_backend in ("cudnn", "cudnn-native"):
+        if cudnn_backend not in backends:
+            continue
         remove_cudnn = False
-        if speculative_decode:
-            print("[INFO] cuDNN backend does not support speculative decode. Skipping.")
+        if speculative_decode and cudnn_backend == "cudnn-native":
+            # The wrapper backend forwards q_len_per_req > 1 (bottom-right
+            # causal rows); the standalone call here is shaped for one row.
+            print(
+                f"[INFO] {cudnn_backend} backend does not support speculative decode. Skipping."
+            )
             remove_cudnn = True
-        if o_data_type != torch.bfloat16:
-            print("[INFO] cuDNN decode requires BF16 output. Skipping.")
+        elif speculative_decode and spec_dec_mask_mode != "causal":
+            # The cudnn graph applies the bottom-right causal diagonal to
+            # multi-token rows; it takes no explicit draft-block mask.
+            print(
+                f"[INFO] {cudnn_backend} backend applies the causal mask to multi-token "
+                f"decode; spec_dec_mask={spec_dec_mask_mode!r} is not supported. Skipping."
+            )
             remove_cudnn = True
-        if q_dtype in [torch.float8_e4m3fn, torch.float8_e5m2] or kv_dtype in [
-            torch.float8_e4m3fn,
-            torch.float8_e5m2,
-        ]:
-            print("[INFO] cuDNN backend does not support FP8. Skipping.")
+        if not (q_dtype == kv_dtype == o_data_type) or q_dtype not in (
+            torch.bfloat16,
+            torch.float16,
+        ):
+            print(
+                f"[INFO] {cudnn_backend} decode requires one fp16/bf16 dtype for q, kv and out. Skipping."
+            )
+            remove_cudnn = True
+        elif q_dtype == torch.float16 and not CUDNN_AVAILABLE:
+            print(
+                f"[INFO] {cudnn_backend} fp16 decode requires the cudnn-frontend python package "
+                "(the fallback cubin path is bf16-only). Skipping."
+            )
             remove_cudnn = True
         if remove_cudnn:
-            backends.remove("cudnn")
+            backends.remove(cudnn_backend)
 
     if "auto" in backends:
         remove_auto = False
@@ -797,6 +819,18 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
             _drop_backend(backends, "prims-ts", "does not support NVFP4 K/V")
         elif q_dtype != kv_dtype:
             _drop_backend(backends, "prims-ts", "requires matching Q and K/V dtypes")
+        elif v_dtype not in (torch.float16, torch.bfloat16, torch.float8_e4m3fn):
+            _drop_backend(
+                backends, "prims-ts", "supports only FP16, BF16, or FP8-E4M3 V"
+            )
+        elif v_dtype != kv_dtype and not (
+            kv_dtype == torch.bfloat16 and v_dtype == torch.float8_e4m3fn
+        ):
+            _drop_backend(
+                backends,
+                "prims-ts",
+                "requires matching K/V dtypes, except QK-BF16/PV-FP8",
+            )
         elif head_dim_qk != head_dim_vo or head_dim_qk not in (64, 128, 256):
             _drop_backend(
                 backends,
@@ -1011,7 +1045,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
     backend_wrappers = {}
     resolved_backends = {}
     for backend in backends:
-        if backend in ["fa2", "fa2_tc", "auto", "trtllm-gen"]:
+        if backend in ["fa2", "fa2_tc", "auto", "trtllm-gen", "cudnn"]:
             plan_kv_indptr = (
                 kv_indptr.clone().detach() if backend == "trtllm-gen" else kv_indptr
             )
@@ -1022,7 +1056,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 workspace_buffer,
                 "HND",
                 use_cuda_graph=is_cuda_graph_compatible,
-                use_tensor_cores=(backend != "fa2"),
+                use_tensor_cores=(backend not in ("fa2", "cudnn")),
                 paged_kv_indptr_buffer=plan_kv_indptr,
                 paged_kv_indices_buffer=kv_indices,
                 paged_kv_last_page_len_buffer=kv_last_page_len,
@@ -1040,6 +1074,9 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 data_type=kv_dtype,
                 o_data_type=o_data_type,
                 block_tables=block_tables,
+                # Multi-token rows are a plan-time property (the deprecated
+                # run-time q_len_per_req only validates against it).
+                q_len_per_req=s_qo,
             )
             resolved_backends[backend] = backend_wrappers[backend]._backend
         else:
@@ -1074,20 +1111,38 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
 
     prims_ts_kv_cache = None
     prims_ts_out = None
+    prims_ts_bmm2_scale = None
     if "prims-ts" in backends:
         prims_ts = _get_prims_ts_module()
         prims_ts_mask_type = (
             "causal" if not speculative_decode or effective_causal else "dense"
         )
-        # The common fixture intentionally exposes nonstandard outer strides;
-        # PrimTS accepts compact HND pages, so preserve the logical values in a
-        # backend-specific compact cache.
-        prims_ts_kv_cache = kv_cache.contiguous()
         prims_ts_q_shape = (
             (batch_size, num_qo_heads, head_dim_qk)
             if s_qo == 1
             else (batch_size, s_qo, num_qo_heads, head_dim_qk)
         )
+        # The common fixture intentionally exposes nonstandard outer strides;
+        # PrimTS accepts compact HND pages, so preserve the logical values in a
+        # backend-specific compact cache. Matching K/V dtypes keep the combined
+        # cache so both operands stay in one allocation.
+        if v_dtype != kv_dtype:
+            prims_ts_k_cache = kv_cache[:, 0].contiguous()
+            prims_ts_v_cache, prims_ts_v_scale_t = to_float8(
+                kv_cache[:, 1].contiguous(), v_dtype
+            )
+            prims_ts_v_scale = prims_ts_v_scale_t.item()
+            prims_ts_kv_cache = (prims_ts_k_cache, prims_ts_v_cache)
+            # Write the FP8-rounded V back into the caches every other backend
+            # reads so --refcheck compares the same V across backends.
+            v_dequant = prims_ts_v_cache.to(torch.float32) * prims_ts_v_scale
+            kv_cache[:, 1].copy_(v_dequant)
+            if "trtllm-gen" in backends:
+                kv_cache_for_trt[:, 1].copy_(v_dequant)
+        else:
+            prims_ts_v_scale = v_scale
+            prims_ts_kv_cache = kv_cache.contiguous()
+        prims_ts_bmm2_scale = 1.0 if prims_ts_v_scale is None else prims_ts_v_scale
         prims_ts_out = torch.empty(prims_ts_q_shape, device=device, dtype=o_data_type)
         backend_wrappers["prims-ts"] = prims_ts.BatchDecodePagedTSWrapper("HND")
         backend_wrappers["prims-ts"].plan(
@@ -1101,7 +1156,8 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
             max_seq_len_q=s_qo,
             packed_query=False,
             q_data_type=q_dtype,
-            kv_data_type=kv_dtype,
+            k_data_type=kv_dtype,
+            v_data_type=v_dtype,
             o_data_type=o_data_type,
             mask_type=prims_ts_mask_type,
             seq_lens=actual_seq_lens_kv.flatten().tolist(),
@@ -1134,7 +1190,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
         speculative_mask,
         out,
     ):
-        if backend in ["fa2", "fa2_tc", "auto", "trtllm-gen"]:
+        if backend in ["fa2", "fa2_tc", "auto", "trtllm-gen", "cudnn"]:
             wrapper_kv = kv_cache_nvfp4 if is_nvfp4_kv else kv_cache
             return backend_wrappers[backend].run(
                 q,
@@ -1146,7 +1202,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 enable_pdl=args.enable_pdl,
                 out=out,
             )
-        elif backend == "cudnn":
+        elif backend == "cudnn-native":
             return flashinfer.decode.cudnn_batch_decode_with_kv_cache(
                 q,
                 k_cache,
@@ -1194,7 +1250,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 None,
                 block_tables,
                 bmm1_scale=scale if k_scale is None else k_scale * scale,
-                bmm2_scale=1.0 if v_scale is None else v_scale,
+                bmm2_scale=prims_ts_bmm2_scale,
                 out=out,
                 validate=False,
             )
@@ -1211,8 +1267,8 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
         workspace_buffer.zero_()
         runtime_kv_cache = prims_ts_kv_cache if cur_backend == "prims-ts" else kv_cache
         runtime_out = backend_outputs[cur_backend]
-        runtime_k_cache = k_cache if cur_backend == "cudnn" else None
-        runtime_v_cache = v_cache if cur_backend == "cudnn" else None
+        runtime_k_cache = k_cache if cur_backend == "cudnn-native" else None
+        runtime_v_cache = v_cache if cur_backend == "cudnn-native" else None
         runtime_workspace = None if cur_backend == "prims-ts" else workspace_buffer
         if run_refcheck:
             outputs[cur_backend] = (
@@ -1286,7 +1342,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 None,
                 block_tables,
                 bmm1_scale=scale if k_scale is None else k_scale * scale,
-                bmm2_scale=1.0 if v_scale is None else v_scale,
+                bmm2_scale=prims_ts_bmm2_scale,
                 out=prims_ts_out,
                 validate=False,
             ),
@@ -1351,7 +1407,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 median_time,
                 q_dtype=q_dtype,
                 k_dtype=kv_dtype,
-                v_dtype=kv_dtype,
+                v_dtype=v_dtype if backend == "prims-ts" else kv_dtype,
                 o_dtype=o_data_type,
             )
             resolved_backend = resolved_backends.get(backend, backend)
@@ -1389,6 +1445,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 cur_res["causal"] = effective_causal
                 cur_res["q_dtype"] = q_dtype
                 cur_res["kv_dtype"] = kv_dtype
+                cur_res["v_dtype"] = v_dtype if backend == "prims-ts" else kv_dtype
                 cur_res["out_dtype"] = o_data_type
                 cur_res["avg_actual_seq_len"] = avg_seq_len_kv
                 cur_res["random_actual_seq_len"] = args.random_actual_seq_len
@@ -1763,15 +1820,6 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
         print(f"[VVERBOSE] {kv_indices.shape = }")
         print(f"[VVERBOSE] {kv_last_page_len.shape = }")
         print(f"[VVERBOSE] {scale = }")
-
-    # Helper function to convert to FP8 (matches test_trtllm_gen_attention_decode.py approach)
-    def to_float8(x, dtype=torch.float8_e4m3fn):
-        finfo = torch.finfo(dtype)
-        min_val, max_val = x.aminmax()
-        amax = torch.maximum(min_val.abs(), max_val.abs()).clamp(min=1e-12)
-        scale = finfo.max / amax * 0.1
-        x_scl_sat = (x * scale).clamp(min=finfo.min, max=finfo.max)
-        return x_scl_sat.to(dtype), scale.float().reciprocal()
 
     # Compute scales and convert to FP8 if needed (before creating wrappers)
     q_scale, k_scale, v_scale = None, None, None

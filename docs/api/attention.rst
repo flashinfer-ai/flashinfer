@@ -18,45 +18,10 @@ for the public entry points, supported contracts, and examples. Current accuracy
 and performance signoff is on SM100a/B200; SM103a/B300 is architecture-gated
 but not yet signoff-qualified.
 
-.. currentmodule:: flashinfer.attention.prims_ts
-
-FMHA Context/Prefill
---------------------
-
-.. autosummary::
-    :toctree: ../generated
-
-    batch_prefill
-    batch_prefill_with_paged_kv_cache
-
-.. autoclass:: BatchPrefillTSWrapper
-    :members:
-
-    .. automethod:: __init__
-
-.. autoclass:: BatchPrefillPagedTSWrapper
-    :members:
-
-    .. automethod:: __init__
-
-FMHA Decode
------------
-
-.. autosummary::
-    :toctree: ../generated
-
-    batch_decode_with_paged_kv_cache
-    get_prims_ts_batch_decode_workspace_size
-    prepare_prims_ts_batch_decode_with_kv_cache
-    prims_ts_batch_decode_with_kv_cache
-
-.. autoclass:: PrimsTSBatchDecodePlan
-    :members:
-
-.. autoclass:: BatchDecodePagedTSWrapper
-    :members:
-
-    .. automethod:: __init__
+Calling these APIs is an explicit opt-in and emits an
+``ExperimentalWarning`` once per decorated function. They provide no API
+compatibility guarantee; generated stable API reference entries are deferred
+until graduation. Logging and existing ``fi_trace`` bindings remain available.
 
 QToken-KvBlock-Sparse-Attention
 --------------------------------
@@ -68,53 +33,6 @@ QToken-KvBlock-Sparse-Attention consumes per-query
 ``kv_block_size`` is the semantic sparse K/V atom and currently supports
 only four tokens. The wrapper plans capacity outside CUDA Graph capture and
 runs live route metadata on the hot path.
-
-.. autosummary::
-    :toctree: ../generated
-
-    QTokenKvBlockSparsePagedTSWrapper
-    get_q_token_kv_block_sparse_workspace_size
-    q_token_kv_block_sparse_attention_with_paged_kv_cache
-    validate_q_token_kv_block_sparse_group_size
-    suggest_q_token_kv_block_sparse_group_size
-    make_q_token_kv_block_sparse_qo_indptr
-
-.. autoclass:: QTokenKvBlockSparsePagedTSWrapper
-    :members:
-
-Block-Sparse FMHA
------------------
-
-.. autosummary::
-    :toctree: ../generated
-
-    block_sparse_attention
-    block_sparse_attention_with_paged_kv_cache
-
-.. autoclass:: BlockSparseTSWrapper
-    :members:
-
-    .. automethod:: __init__
-
-.. autoclass:: BlockSparsePagedTSWrapper
-    :members:
-
-    .. automethod:: __init__
-
-MLA Decode
-----------
-
-.. autosummary::
-    :toctree: ../generated
-
-    batch_mla_decode_with_paged_kv_cache
-    get_prims_ts_batch_mla_decode_workspace_size
-    prims_ts_batch_mla_decode_with_kv_cache
-
-.. autoclass:: BatchMLADecodePagedTSWrapper
-    :members:
-
-    .. automethod:: __init__
 
 
 flashinfer.decode
@@ -238,6 +156,25 @@ Batch Prefill/Append Attention
     .. automethod:: __init__
 
 
+Causal + Bidirectional Ranges Prefill
+-------------------------------------
+
+.. currentmodule:: flashinfer.attention
+
+A batch-prefill wrapper whose fa2 attention variant owns the whole mask:
+causal, plus an inclusive per-query key span attended in both directions. The
+spans are handed to :meth:`BatchPrefillWithCausalBidirectionalRangesWrapper.run`
+as a compact ``int32 [total_q, 2]`` tensor and no mask is materialized, so
+nothing scales with ``qo_len * kv_len``. The JIT module is specialized in the
+constructor, and the inherited options the variant makes meaningless are
+rejected rather than ignored.
+
+.. autoclass:: BatchPrefillWithCausalBidirectionalRangesWrapper
+    :members:
+
+    .. automethod:: __init__
+
+
 Unified BatchAttention
 ----------------------
 
@@ -291,6 +228,8 @@ PageAttention for MLA
     trtllm_batch_decode_sparse_mla_dsv4
     nvfp4_quantize_pack_sparse_mla_cache
     nvfp4_quantize_append_sparse_mla_cache
+    dsv41_fp4_quantize_pack_sparse_mla_cache
+    dsv41_fp4_quantize_append_sparse_mla_cache
     convert_compressed_page_aligned_sparse_indices_to_hca_metadata
     DSV4HCAMetadata
     xqa_batch_decode_with_kv_cache_mla

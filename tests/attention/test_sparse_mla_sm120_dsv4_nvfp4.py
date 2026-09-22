@@ -1,0 +1,1606 @@
+# Copyright (c) 2026 by FlashInfer team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import inspect
+import math
+
+import pytest
+import torch
+
+import flashinfer
+from flashinfer.mla import (
+    nvfp4_quantize_append_sparse_mla_cache,
+    nvfp4_quantize_pack_sparse_mla_cache,
+)
+from flashinfer.mla._core import _nvfp4_sparse_mla_workspace
+from flashinfer.mla._sparse_mla_sm120._prepared import _workspace_tensor_view
+from flashinfer.mla._sparse_mla_sm120._dsv4_nvfp4 import (
+    _nvfp4_sparse_mla_decode,
+    _nvfp4_sparse_mla_prefill,
+    _nvfp4_sparse_mla_m16n8k64_candidate_major,
+    _nvfp4_sparse_mla_m16n32k64,
+)
+from flashinfer.utils import is_sm12x_supported
+from tests.attention.sparse_mla_test_utils import (
+    _D_NOPE,
+    _D_ROPE,
+    _PACKED_NOPE_BYTES,
+    _BYTES_PER_TOKEN,
+    _split_cache,
+    _reference_rows,
+    _dequantize_linear_nvfp4,
+    _dequantize_nvfp4_cache,
+    _dequantize_nvfp4_query,
+    _reference_sparse_attention,
+)
+
+
+def test_nvfp4_sparse_mla_reuses_fp8_public_api() -> None:
+    """The format selector is additive, keyword-only, and FP8 by default."""
+    parameter = inspect.signature(
+        flashinfer.mla.trtllm_batch_decode_sparse_mla_dsv4
+    ).parameters["kv_cache_format"]
+
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameter.default == "fp8"
+
+    wrapper_parameter = inspect.signature(
+        flashinfer.mla.SparseMLASm120Wrapper.__init__
+    ).parameters["kv_cache_format"]
+    assert wrapper_parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    assert wrapper_parameter.default == "fp8"
+
+
+def _require_sm120() -> None:
+    if not torch.cuda.is_available() or not is_sm12x_supported(torch.device("cuda")):
+        pytest.skip("NVFP4 sparse MLA requires SM12x")
+
+
+@pytest.mark.parametrize("page_size", [2, 64])
+@pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
+def test_nvfp4_sparse_mla_full_page_pack(page_size, kv_layout):
+    _require_sm120()
+    torch.manual_seed(42)
+    latent_kv = torch.randn(
+        2, page_size, _D_NOPE + _D_ROPE, dtype=torch.bfloat16, device="cuda"
+    )
+
+    cache = nvfp4_quantize_pack_sparse_mla_cache(latent_kv, kv_layout=kv_layout)
+    data, scales = _split_cache(cache)
+    packed_ref, scales_ref, rope_ref = _reference_rows(latent_kv)
+
+    assert cache.dtype == torch.uint8
+    expected_shape = (
+        (2, 1, page_size, _BYTES_PER_TOKEN)
+        if kv_layout == "HND"
+        else (2, page_size, 1, _BYTES_PER_TOKEN)
+    )
+    assert cache.shape == expected_shape
+    torch.testing.assert_close(
+        data[..., :_PACKED_NOPE_BYTES].reshape_as(packed_ref), packed_ref
+    )
+    torch.testing.assert_close(
+        data[..., _PACKED_NOPE_BYTES:].reshape_as(rope_ref), rope_ref
+    )
+    torch.testing.assert_close(scales[..., :28].reshape_as(scales_ref), scales_ref)
+    assert torch.count_nonzero(scales[..., 28:]) == 0
+
+
+@pytest.mark.parametrize("page_size", [2, 64])
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+def test_nvfp4_sparse_mla_incremental_append_matches_full_pack(page_size, index_dtype):
+    _require_sm120()
+    torch.manual_seed(7)
+    num_pages = 2
+    latent_kv = torch.randn(
+        num_pages,
+        page_size,
+        _D_NOPE + _D_ROPE,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    full_cache = nvfp4_quantize_pack_sparse_mla_cache(latent_kv)
+    append_cache = torch.full_like(full_cache, 0xA5)
+    slots = torch.arange(num_pages * page_size, dtype=index_dtype, device="cuda")
+
+    nvfp4_quantize_append_sparse_mla_cache(
+        latent_kv.reshape(-1, _D_NOPE + _D_ROPE), slots, append_cache
+    )
+    torch.testing.assert_close(append_cache, full_cache)
+
+
+def test_nvfp4_sparse_mla_incremental_append_accepts_3d_cache() -> None:
+    """vLLM uses the latent-head-free [pages, page_size, bytes] shorthand."""
+    _require_sm120()
+    torch.manual_seed(8)
+    latent_kv = torch.randn(2, 64, 512, dtype=torch.bfloat16, device="cuda")
+    expected = nvfp4_quantize_pack_sparse_mla_cache(latent_kv, kv_layout="NHD").squeeze(
+        2
+    )
+    actual = torch.empty_like(expected)
+    slots = torch.arange(128, dtype=torch.int64, device="cuda")
+    nvfp4_quantize_append_sparse_mla_cache(latent_kv.reshape(-1, 512), slots, actual)
+    torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("page_size", [2, 64])
+def test_nvfp4_sparse_mla_pack_and_append_accept_page_stride(page_size: int) -> None:
+    """Packed vLLM pools leave padding between logical cache pages."""
+    _require_sm120()
+    torch.manual_seed(9 + page_size)
+    num_pages = 3
+    latent_kv = torch.randn(
+        num_pages, page_size, 512, dtype=torch.bfloat16, device="cuda"
+    )
+    expected = nvfp4_quantize_pack_sparse_mla_cache(latent_kv, kv_layout="NHD").squeeze(
+        2
+    )
+    logical_page_bytes = page_size * _BYTES_PER_TOKEN
+    page_stride = logical_page_bytes + 3 * _BYTES_PER_TOKEN
+
+    def make_strided_cache() -> torch.Tensor:
+        backing = torch.full(
+            (num_pages * page_stride,), 0xA5, dtype=torch.uint8, device="cuda"
+        )
+        return torch.as_strided(
+            backing,
+            size=(num_pages, page_size, _BYTES_PER_TOKEN),
+            stride=(page_stride, _BYTES_PER_TOKEN, 1),
+        )
+
+    append_cache = make_strided_cache()
+    slots = torch.arange(num_pages * page_size, dtype=torch.int64, device="cuda")
+    nvfp4_quantize_append_sparse_mla_cache(
+        latent_kv.reshape(-1, 512), slots, append_cache
+    )
+
+    # A page is internally opaque but contiguous, so compare its complete byte
+    # payload against the independently packed contiguous implementation.
+    for page in range(num_pages):
+        torch.testing.assert_close(
+            append_cache[page].reshape(-1), expected[page].reshape(-1), atol=0, rtol=0
+        )
+
+
+@pytest.mark.parametrize("page_size", [2, 64])
+def test_nvfp4_sparse_mla_append_writes_only_selected_slots(page_size):
+    _require_sm120()
+    torch.manual_seed(11)
+    num_pages = 2
+    inputs = torch.randn(4, _D_NOPE + _D_ROPE, dtype=torch.bfloat16, device="cuda")
+    slots = torch.tensor(
+        [0, num_pages * page_size - 1, -1, num_pages * page_size],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    cache = torch.full(
+        (num_pages, 1, page_size, _BYTES_PER_TOKEN),
+        0xA5,
+        dtype=torch.uint8,
+        device="cuda",
+    )
+
+    nvfp4_quantize_append_sparse_mla_cache(inputs, slots, cache)
+    data, scales = _split_cache(cache)
+    packed_ref, scales_ref, rope_ref = _reference_rows(inputs)
+
+    for input_idx, slot in enumerate((0, num_pages * page_size - 1)):
+        page_idx, entry_idx = divmod(slot, page_size)
+        torch.testing.assert_close(
+            data[page_idx, entry_idx, :_PACKED_NOPE_BYTES], packed_ref[input_idx]
+        )
+        torch.testing.assert_close(
+            data[page_idx, entry_idx, _PACKED_NOPE_BYTES:], rope_ref[input_idx]
+        )
+        torch.testing.assert_close(
+            scales[page_idx, entry_idx, :28], scales_ref[input_idx]
+        )
+        assert torch.count_nonzero(scales[page_idx, entry_idx, 28:]) == 0
+
+    if page_size > 2:
+        assert torch.all(data[0, 1] == 0xA5)
+        assert torch.all(scales[0, 1] == 0xA5)
+
+
+@pytest.mark.parametrize("misaligned", ["input", "cache_base", "page_stride"])
+def test_nvfp4_sparse_mla_append_rejects_misaligned_vector_accesses(
+    misaligned: str,
+) -> None:
+    """Vectorized BF16/uint4 accesses require a 16-byte-aligned cache ABI."""
+    _require_sm120()
+    latent_kv = torch.empty(1, 512, dtype=torch.bfloat16, device="cuda")
+    slots = torch.zeros(1, dtype=torch.int32, device="cuda")
+    cache = torch.empty(2, 2, _BYTES_PER_TOKEN, dtype=torch.uint8, device="cuda")
+    expected_error = "kv_cache"
+
+    if misaligned == "input":
+        input_storage = torch.empty(513, dtype=torch.bfloat16, device="cuda")
+        latent_kv = input_storage[1:].view(1, 512)
+        expected_error = "latent_kv"
+    elif misaligned == "cache_base":
+        cache_storage = torch.empty(cache.numel() + 1, dtype=torch.uint8, device="cuda")
+        cache = cache_storage[1:].view_as(cache)
+    else:
+        page_stride = 2 * _BYTES_PER_TOKEN + 1
+        cache_storage = torch.empty(
+            page_stride + 2 * _BYTES_PER_TOKEN,
+            dtype=torch.uint8,
+            device="cuda",
+        )
+        cache = torch.as_strided(
+            cache_storage,
+            size=(2, 2, _BYTES_PER_TOKEN),
+            stride=(page_stride, _BYTES_PER_TOKEN, 1),
+        )
+
+    with pytest.raises(RuntimeError, match=rf"{expected_error}.*16"):
+        nvfp4_quantize_append_sparse_mla_cache(latent_kv, slots, cache)
+
+
+@pytest.mark.parametrize("num_tokens", [4, 257])
+@pytest.mark.parametrize("slot_dtype", [torch.int32, torch.int64])
+def test_nvfp4_sparse_mla_append_duplicate_slots_use_first_row(
+    num_tokens: int, slot_dtype: torch.dtype
+) -> None:
+    _require_sm120()
+    torch.manual_seed(20260907 + num_tokens)
+    latent_kv = torch.randn(num_tokens, 512, dtype=torch.bfloat16, device="cuda")
+    slots = torch.full((num_tokens,), -1, dtype=slot_dtype, device="cuda")
+    slots[0] = 0
+    slots[-1] = 0
+    cache = torch.full((1, 2, _BYTES_PER_TOKEN), 0xA5, dtype=torch.uint8, device="cuda")
+
+    nvfp4_quantize_append_sparse_mla_cache(latent_kv, slots, cache)
+    expected = nvfp4_quantize_pack_sparse_mla_cache(latent_kv[:1].view(1, 1, 512))
+    actual_data, actual_scales = _split_cache(cache)
+    expected_data, expected_scales = _split_cache(expected)
+
+    torch.testing.assert_close(actual_data[0, 0], expected_data[0, 0], rtol=0, atol=0)
+    torch.testing.assert_close(
+        actual_scales[0, 0], expected_scales[0, 0], rtol=0, atol=0
+    )
+    assert torch.all(actual_data[0, 1] == 0xA5)
+    assert torch.all(actual_scales[0, 1] == 0xA5)
+
+
+def test_nvfp4_sparse_mla_pack_rejects_wrong_dtype():
+    _require_sm120()
+    latent_kv = torch.empty(1, 2, 512, dtype=torch.float16, device="cuda")
+    with pytest.raises(ValueError, match="bfloat16"):
+        nvfp4_quantize_pack_sparse_mla_cache(latent_kv)
+
+
+def test_nvfp4_sparse_mla_known_encoding_and_nonfinite_contract():
+    _require_sm120()
+    latent_kv = torch.zeros(1, 2, 512, dtype=torch.bfloat16, device="cuda")
+    latent_kv[0, 0, :16] = torch.tensor(
+        [
+            0.0,
+            -0.0,
+            0.5,
+            -0.5,
+            1.0,
+            -1.0,
+            1.5,
+            -1.5,
+            2.0,
+            -2.0,
+            3.0,
+            -3.0,
+            4.0,
+            -4.0,
+            6.0,
+            -6.0,
+        ],
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    latent_kv[0, 1, :16] = torch.tensor(
+        [
+            float("nan"),
+            float("inf"),
+            -float("inf"),
+            torch.finfo(torch.bfloat16).max,
+            torch.finfo(torch.bfloat16).tiny,
+            -torch.finfo(torch.bfloat16).tiny,
+            0.25,
+            -0.25,
+            0.75,
+            -0.75,
+            1.25,
+            -1.25,
+            2.5,
+            -2.5,
+            5.0,
+            -5.0,
+        ],
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+
+    cache = nvfp4_quantize_pack_sparse_mla_cache(latent_kv)
+    data, scales = _split_cache(cache)
+    packed_ref, scales_ref, _ = _reference_rows(latent_kv)
+
+    # Low nibble is the earlier element. With scale=1, these are the exact
+    # positive/negative E2M1 codes from zero through six.
+    expected = torch.tensor(
+        [0x80, 0x91, 0xA2, 0xB3, 0xC4, 0xD5, 0xE6, 0xF7],
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    torch.testing.assert_close(data[0, 0, :8], expected)
+    assert scales[0, 0, 0].item() == 0x38  # E4M3 encoding of 1.0.
+
+    # NaN/Inf, BF16 max/min-normal, and decision-boundary behavior is defined
+    # to match FlashInfer's existing linear NVFP4 KV quantizer byte-for-byte.
+    torch.testing.assert_close(
+        data[..., :_PACKED_NOPE_BYTES].reshape_as(packed_ref), packed_ref
+    )
+    torch.testing.assert_close(scales[..., :28].reshape_as(scales_ref), scales_ref)
+
+
+@pytest.mark.parametrize("iterations", [1, 7])
+def test_nvfp4_sparse_mla_m16n32k64_matches_reference(iterations):
+    _require_sm120()
+    torch.manual_seed(20260831)
+    a_bf16 = (torch.randn(16, 64, device="cuda") / 3).to(torch.bfloat16)
+    b_bf16 = (torch.randn(32, 64, device="cuda") / 3).to(torch.bfloat16)
+    global_scale = torch.ones(1, dtype=torch.float32, device="cuda")
+    a, sfa = flashinfer.nvfp4_kv_quantize(a_bf16, global_scale)
+    b, sfb = flashinfer.nvfp4_kv_quantize(b_bf16, global_scale)
+
+    output = _nvfp4_sparse_mla_m16n32k64(
+        a,
+        b,
+        sfa.view(torch.float8_e4m3fn),
+        sfb.view(torch.float8_e4m3fn),
+        iterations=iterations,
+    )
+    a_dequant = _dequantize_linear_nvfp4(a, sfa)
+    b_dequant = _dequantize_linear_nvfp4(b, sfb)
+    reference = torch.matmul(a_dequant, b_dequant.T) * iterations
+    torch.testing.assert_close(output, reference, atol=2e-4, rtol=2e-4)
+
+
+@pytest.mark.parametrize("iterations", [1, 7])
+def test_nvfp4_sparse_mla_candidate_major_pv_tile_matches_reference(iterations):
+    _require_sm120()
+    torch.manual_seed(20260901)
+    a_bf16 = (torch.randn(16, 64, device="cuda") / 3).to(torch.bfloat16)
+    # Quantize V in the mathematical [N, K] orientation, then repack its raw
+    # E2M1 codes into sparse MLA's candidate-major [K, packed-N] cache view.
+    b_bf16 = (torch.randn(8, 64, device="cuda") / 3).to(torch.bfloat16)
+    global_scale = torch.ones(1, dtype=torch.float32, device="cuda")
+    a, sfa = flashinfer.nvfp4_kv_quantize(a_bf16, global_scale)
+    b_row_major, sfb = flashinfer.nvfp4_kv_quantize(b_bf16, global_scale)
+    b_codes = torch.stack((b_row_major & 0xF, b_row_major >> 4), dim=-1).reshape(8, 64)
+    b_codes_candidate_major = b_codes.T.contiguous()
+    b_candidate_major = (
+        b_codes_candidate_major[:, 0::2] | (b_codes_candidate_major[:, 1::2] << 4)
+    ).contiguous()
+
+    output = _nvfp4_sparse_mla_m16n8k64_candidate_major(
+        a,
+        b_candidate_major,
+        sfa.view(torch.float8_e4m3fn),
+        sfb.view(torch.float8_e4m3fn),
+        iterations=iterations,
+    )
+    a_dequant = _dequantize_linear_nvfp4(a, sfa)
+    b_dequant = _dequantize_linear_nvfp4(b_row_major, sfb)
+    reference = torch.matmul(a_dequant, b_dequant.T) * iterations
+    torch.testing.assert_close(output, reference, atol=2e-4, rtol=2e-4)
+
+
+def test_nvfp4_sparse_mla_decode_workspace_has_no_global_vt(monkeypatch) -> None:
+    """Decode scratch contains only split outputs/LSE, not materialized V^T."""
+    from flashinfer.mla._sparse_mla_sm120 import _execution as execution
+
+    def unexpected_module():
+        pytest.fail("legacy workspace precondition reached the compiled module")
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(
+            execution, "get_sparse_mla_dsv4_nvfp4_module", unexpected_module
+        )
+        for prefill, required in [(False, 526848), (True, 512)]:
+            phase = "prefill" if prefill else "decode"
+            for tokens in (0, -1):
+                with pytest.raises(ValueError) as error:
+                    _nvfp4_sparse_mla_workspace(
+                        torch.empty(0, dtype=torch.uint8),
+                        num_tokens=tokens,
+                        num_heads=128,
+                        topk=128,
+                        extra_topk=128,
+                        use_prefill=prefill,
+                    )
+                assert str(error.value) == (
+                    f"NVFP4 sparse MLA {phase} requires at least {required} "
+                    "workspace bytes for one token, got 0"
+                )
+    _require_sm120()
+    num_tokens, num_heads, topk, extra_topk = 2, 128, 128, 128
+    from flashinfer.mla._sparse_mla_sm120._execution import resolve_dsv4_nvfp4
+    from flashinfer.mla._sparse_mla_sm120._prepared import device_caps
+
+    sm_count, shared = device_caps(torch.device("cuda"))
+    resolved = resolve_dsv4_nvfp4(
+        tokens=num_tokens,
+        heads=num_heads,
+        topk=topk,
+        extra_topk=extra_topk,
+        page_size=64,
+        extra_page_size=64,
+        page_stride_bytes=64 * 384,
+        extra_page_stride_bytes=64 * 384,
+        cpb=1,
+        sm_count=sm_count,
+        max_shared_bytes=shared,
+    )
+    specs = resolved.workspace()
+    assert len(specs) == 3
+    assert tuple(specs[0][0]) == (2 * 128 * 4 * 512,)
+    assert tuple(specs[1][0]) == (2 * 128 * 4,)
+    assert tuple(specs[2][0]) == (2, 128)
+    num_splits = 4
+    workspace = torch.empty(
+        sum(spec[2] for spec in specs), dtype=torch.uint8, device="cuda"
+    )
+    chunk_tokens, mid_out, mid_lse, scratch_lse = _nvfp4_sparse_mla_workspace(
+        workspace,
+        num_tokens=num_tokens,
+        num_heads=num_heads,
+        topk=topk,
+        extra_topk=extra_topk,
+        use_prefill=False,
+    )
+
+    assert chunk_tokens == num_tokens
+    assert mid_out is not None and mid_lse is not None
+    assert mid_out.shape == (num_tokens, num_heads, num_splits, 512)
+    assert mid_lse.shape == (num_tokens, num_heads, num_splits)
+    assert scratch_lse.shape == (num_tokens, num_heads)
+    assert mid_out.data_ptr() == workspace.data_ptr()
+
+
+def test_workspace_tensor_view_aligns_sliced_storage_without_allocating(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _require_sm120()
+    storage = torch.empty(4096 + 16, dtype=torch.uint8, device="cuda")
+    workspace = storage[1:]
+    assert workspace.is_contiguous()
+    assert workspace.data_ptr() % 16 == 1
+    previous_default = torch.get_default_device()
+    torch.set_default_device("cuda")
+    try:
+        with monkeypatch.context() as context:
+
+            def reject_tensor_allocation(*args, **kwargs):
+                raise AssertionError(
+                    "workspace partitioning must not allocate a tensor"
+                )
+
+            context.setattr(torch, "empty", reject_tensor_allocation)
+            view, byte_end = _workspace_tensor_view(
+                workspace,
+                byte_offset=0,
+                shape=(2, 8, 64),
+                dtype=torch.bfloat16,
+            )
+    finally:
+        torch.set_default_device(previous_default)
+
+    assert view is not None
+    assert view.data_ptr() % 16 == 0
+    assert byte_end <= workspace.numel()
+
+
+@pytest.mark.parametrize("phase", ["decode", "prefill"])
+@pytest.mark.parametrize(
+    "optional_name,optional_dtype,logical_size",
+    [
+        ("topk_length", torch.int32, 2),
+        ("extra_topk_length", torch.int32, 2),
+        ("attn_sink", torch.float32, 16),
+    ],
+)
+def test_nvfp4_sparse_mla_rejects_strided_optional_tensors(
+    phase: str,
+    optional_name: str,
+    optional_dtype: torch.dtype,
+    logical_size: int,
+) -> None:
+    _require_sm120()
+    num_tokens, num_heads, topk = 2, 16, 128
+    q = torch.zeros(num_tokens, num_heads, 512, dtype=torch.bfloat16, device="cuda")
+    cache = torch.empty(2, 64, _BYTES_PER_TOKEN, dtype=torch.uint8, device="cuda")
+    indices = torch.zeros(num_tokens, topk, dtype=torch.int32, device="cuda")
+    strided = torch.zeros(logical_size * 2, dtype=optional_dtype, device="cuda")[::2]
+    kwargs = {optional_name: strided}
+    if optional_name == "extra_topk_length":
+        kwargs.update(
+            extra_kv_cache=torch.empty(
+                1, 2, _BYTES_PER_TOKEN, dtype=torch.uint8, device="cuda"
+            ),
+            extra_indices=torch.zeros(
+                num_tokens, topk, dtype=torch.int32, device="cuda"
+            ),
+        )
+    attention = (
+        _nvfp4_sparse_mla_decode if phase == "decode" else _nvfp4_sparse_mla_prefill
+    )
+
+    with pytest.raises(RuntimeError, match=rf"{optional_name} must be contiguous"):
+        attention(q, cache, indices, 1.0 / math.sqrt(512), **kwargs)
+
+
+@pytest.mark.parametrize(
+    "topk,chunks_per_block,topk_len", [(128, 2, 111), (512, 6, 389)]
+)
+@pytest.mark.parametrize("with_sink", [False, True])
+def test_nvfp4_sparse_mla_decode_matches_dequantized_reference(
+    topk: int, chunks_per_block: int, topk_len: int, with_sink: bool
+) -> None:
+    """Cover the direct and two-split epilogues with online quantization."""
+    _require_sm120()
+    torch.manual_seed(20260902 + topk + int(with_sink))
+    num_tokens, num_heads = 2, 128
+    num_pages, page_size = 16, 64
+    kv_bf16 = (
+        torch.randn(
+            num_pages,
+            page_size,
+            1,
+            _D_NOPE + _D_ROPE,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    q = (
+        torch.randn(
+            num_tokens,
+            num_heads,
+            _D_NOPE + _D_ROPE,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    indices = torch.randint(
+        0,
+        num_pages * page_size,
+        (num_tokens, topk),
+        dtype=torch.int32,
+        device="cuda",
+    )
+    # Exercise both the explicit length and negative-index masks.
+    indices[:, topk_len - 7 : topk_len] = -1
+    topk_length = torch.full((num_tokens,), topk_len, dtype=torch.int32, device="cuda")
+    attn_sink = (
+        torch.linspace(-1.0, 1.0, num_heads, dtype=torch.float32, device="cuda")
+        if with_sink
+        else None
+    )
+    sm_scale = (_D_NOPE + _D_ROPE) ** -0.5
+
+    cache = nvfp4_quantize_pack_sparse_mla_cache(kv_bf16.squeeze(2))
+    q_dequant = _dequantize_nvfp4_query(q)
+    kv_dequant = _dequantize_nvfp4_cache(cache)
+    reference, reference_lse = _reference_sparse_attention(
+        q_dequant,
+        kv_dequant,
+        indices,
+        sm_scale,
+        topk_length=topk_length,
+        attn_sink=attn_sink,
+    )
+    output, lse = _nvfp4_sparse_mla_decode(
+        q,
+        cache,
+        indices,
+        sm_scale,
+        topk_length=topk_length,
+        attn_sink=attn_sink,
+        chunks_per_block_override=chunks_per_block,
+    )
+
+    # Q/K use the exact dequantized NVFP4 operands above. The remaining delta
+    # comes from online P quantization and the candidate-axis V requantization.
+    torch.testing.assert_close(output, reference, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(lse, reference_lse, atol=2e-2, rtol=2e-2)
+
+    prefill_output, prefill_lse = _nvfp4_sparse_mla_prefill(
+        q,
+        cache,
+        indices,
+        sm_scale,
+        topk_length=topk_length,
+        attn_sink=attn_sink,
+    )
+    torch.testing.assert_close(prefill_output, reference, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(prefill_lse, reference_lse, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("num_tokens", [2, 65])
+def test_nvfp4_sparse_mla_shared_wrapper_matches_reference(num_tokens: int) -> None:
+    """The existing SM120 wrapper routes NVFP4 through its independent planner."""
+    _require_sm120()
+    torch.manual_seed(20260911 + num_tokens)
+    num_heads, topk = 16, 128
+    kv_bf16 = (
+        torch.randn(4, 64, 512, dtype=torch.bfloat16, device="cuda") / 10.0
+    ).clamp(-1, 1)
+    q = (
+        torch.randn(num_tokens, num_heads, 512, dtype=torch.bfloat16, device="cuda")
+        / 10.0
+    ).clamp(-1, 1)
+    indices = torch.randint(
+        0, 4 * 64, (num_tokens, topk), dtype=torch.int32, device="cuda"
+    )
+    cache = nvfp4_quantize_pack_sparse_mla_cache(kv_bf16)
+    output = torch.empty_like(q)
+    runner = flashinfer.mla.SparseMLASm120Wrapper(
+        max_num_tokens=num_tokens,
+        max_num_heads=num_heads,
+        kv_cache_format="nvfp4",
+        device=q.device,
+    )
+    lse = runner.run(
+        q,
+        cache,
+        indices,
+        output,
+        512**-0.5,
+        return_lse=True,
+    )
+
+    reference, reference_lse = _reference_sparse_attention(
+        _dequantize_nvfp4_query(q),
+        _dequantize_nvfp4_cache(cache),
+        indices,
+        512**-0.5,
+    )
+    torch.testing.assert_close(output, reference, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(lse, reference_lse, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("num_tokens", [2, 65])
+def test_nvfp4_sparse_mla_shared_wrapper_normalizes_singleton_indices(
+    num_tokens: int,
+) -> None:
+    """The shared FP8/NVFP4 ABI accepts [T, 1, topk] for both cache sections."""
+    _require_sm120()
+    torch.manual_seed(20260912 + num_tokens)
+    num_heads, topk = 16, 128
+    main_kv = torch.randn(4, 64, 512, dtype=torch.bfloat16, device="cuda") / 10
+    extra_kv = torch.randn(64, 2, 512, dtype=torch.bfloat16, device="cuda") / 10
+    q = (
+        torch.randn(num_tokens, num_heads, 512, dtype=torch.bfloat16, device="cuda")
+        / 10
+    )
+    indices = torch.randint(
+        0, 4 * 64, (num_tokens, topk), dtype=torch.int32, device="cuda"
+    )
+    extra_indices = torch.randint(
+        0, 64 * 2, (num_tokens, topk), dtype=torch.int32, device="cuda"
+    )
+    main_cache = nvfp4_quantize_pack_sparse_mla_cache(main_kv)
+    extra_cache = nvfp4_quantize_pack_sparse_mla_cache(extra_kv)
+    output_2d = torch.empty_like(q)
+    output_3d = torch.empty_like(q)
+    runner = flashinfer.mla.SparseMLASm120Wrapper(
+        max_num_tokens=num_tokens,
+        max_num_heads=num_heads,
+        kv_cache_format="nvfp4",
+        device=q.device,
+    )
+
+    lse_2d = runner.run(
+        q,
+        main_cache,
+        indices,
+        output_2d,
+        512**-0.5,
+        extra_kv_cache=extra_cache,
+        extra_indices=extra_indices,
+        return_lse=True,
+    ).clone()
+    lse_3d = runner.run(
+        q,
+        main_cache,
+        indices.unsqueeze(1),
+        output_3d,
+        512**-0.5,
+        extra_kv_cache=extra_cache,
+        extra_indices=extra_indices.unsqueeze(1),
+        return_lse=True,
+    )
+
+    torch.testing.assert_close(output_3d, output_2d, atol=0, rtol=0)
+    torch.testing.assert_close(lse_3d, lse_2d, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("extra_page_size,extra_topk", [(2, 128), (64, 512)])
+@pytest.mark.parametrize("with_sink", [False, True])
+def test_nvfp4_sparse_mla_decode_dual_cache_matches_reference(
+    extra_page_size: int, extra_topk: int, with_sink: bool
+) -> None:
+    """Main and C4A/C128A cache sections share one online softmax."""
+    _require_sm120()
+    torch.manual_seed(20260904 + extra_page_size + int(with_sink))
+    num_tokens, num_heads, main_topk = 2, 128, 128
+    main_pages, main_page_size = 8, 64
+    extra_pages = max(16, (extra_topk + extra_page_size - 1) // extra_page_size)
+    main_bf16 = (
+        torch.randn(
+            main_pages,
+            main_page_size,
+            _D_NOPE + _D_ROPE,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    extra_bf16 = (
+        torch.randn(
+            extra_pages,
+            extra_page_size,
+            _D_NOPE + _D_ROPE,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    q = (
+        torch.randn(
+            num_tokens,
+            num_heads,
+            _D_NOPE + _D_ROPE,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    main_indices = torch.randint(
+        0,
+        main_pages * main_page_size,
+        (num_tokens, main_topk),
+        dtype=torch.int32,
+        device="cuda",
+    )
+    extra_indices = torch.randint(
+        0,
+        extra_pages * extra_page_size,
+        (num_tokens, extra_topk),
+        dtype=torch.int32,
+        device="cuda",
+    )
+    main_lengths = torch.tensor([111, 97], dtype=torch.int32, device="cuda")
+    extra_lengths = torch.tensor(
+        [extra_topk - 13, max(1, extra_topk - 29)],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    main_indices[:, 91:96] = -1
+    extra_indices[:, 37:43] = -1
+    attn_sink = (
+        torch.linspace(-1.0, 1.0, num_heads, dtype=torch.float32, device="cuda")
+        if with_sink
+        else None
+    )
+    sm_scale = (_D_NOPE + _D_ROPE) ** -0.5
+
+    main_cache = nvfp4_quantize_pack_sparse_mla_cache(main_bf16)
+    extra_cache = nvfp4_quantize_pack_sparse_mla_cache(extra_bf16)
+    main_dequant = _dequantize_nvfp4_cache(main_cache)
+    extra_dequant = _dequantize_nvfp4_cache(extra_cache)
+    q_dequant = _dequantize_nvfp4_query(q)
+
+    ref_main_indices = main_indices.clone()
+    ref_extra_indices = extra_indices.clone()
+    for token in range(num_tokens):
+        ref_main_indices[token, int(main_lengths[token].item()) :] = -1
+        ref_extra_indices[token, int(extra_lengths[token].item()) :] = -1
+    main_rows = main_pages * main_page_size
+    virtual_kv = torch.cat(
+        (main_dequant.reshape(-1, 512), extra_dequant.reshape(-1, 512)), dim=0
+    ).reshape(1, -1, 1, 512)
+    virtual_indices = torch.cat(
+        (
+            ref_main_indices,
+            torch.where(
+                ref_extra_indices < 0,
+                ref_extra_indices,
+                ref_extra_indices + main_rows,
+            ),
+        ),
+        dim=1,
+    )
+    reference, reference_lse = _reference_sparse_attention(
+        q_dequant,
+        virtual_kv,
+        virtual_indices,
+        sm_scale,
+        attn_sink=attn_sink,
+    )
+
+    total_splits = (main_topk + 63) // 64 + (extra_topk + 63) // 64
+    output, lse = _nvfp4_sparse_mla_decode(
+        q,
+        main_cache,
+        main_indices,
+        sm_scale,
+        topk_length=main_lengths,
+        attn_sink=attn_sink,
+        extra_kv_cache=extra_cache,
+        extra_indices=extra_indices,
+        extra_topk_length=extra_lengths,
+        chunks_per_block_override=(total_splits + 1) // 2,
+    )
+
+    torch.testing.assert_close(output, reference, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(lse, reference_lse, atol=2e-2, rtol=2e-2)
+
+    prefill_output, prefill_lse = _nvfp4_sparse_mla_prefill(
+        q,
+        main_cache,
+        main_indices,
+        sm_scale,
+        topk_length=main_lengths,
+        attn_sink=attn_sink,
+        extra_kv_cache=extra_cache,
+        extra_indices=extra_indices,
+        extra_topk_length=extra_lengths,
+    )
+    torch.testing.assert_close(prefill_output, reference, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(prefill_lse, reference_lse, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("num_heads", [16, 32, 64])
+def test_nvfp4_sparse_mla_supported_head_counts(num_heads: int) -> None:
+    """Decode and prefill share the vLLM padded-head dispatch set."""
+    _require_sm120()
+    torch.manual_seed(20260905 + num_heads)
+    num_tokens, topk = 1, 128
+    kv_bf16 = (
+        torch.randn(4, 64, 512, dtype=torch.bfloat16, device="cuda") / 10.0
+    ).clamp(-1, 1)
+    q = (
+        torch.randn(num_tokens, num_heads, 512, dtype=torch.bfloat16, device="cuda")
+        / 10.0
+    ).clamp(-1, 1)
+    indices = torch.randint(
+        0, 4 * 64, (num_tokens, topk), dtype=torch.int32, device="cuda"
+    )
+    cache = nvfp4_quantize_pack_sparse_mla_cache(kv_bf16)
+    reference, reference_lse = _reference_sparse_attention(
+        _dequantize_nvfp4_query(q),
+        _dequantize_nvfp4_cache(cache),
+        indices,
+        512**-0.5,
+    )
+
+    decode_output, decode_lse = _nvfp4_sparse_mla_decode(
+        q,
+        cache,
+        indices,
+        512**-0.5,
+        chunks_per_block_override=2,
+    )
+    prefill_output, prefill_lse = _nvfp4_sparse_mla_prefill(
+        q, cache, indices, 512**-0.5
+    )
+    torch.testing.assert_close(decode_output, reference, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(decode_lse, reference_lse, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(prefill_output, reference, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(prefill_lse, reference_lse, atol=2e-2, rtol=2e-2)
+
+
+def test_nvfp4_sparse_mla_public_api_decode_dual_cache() -> None:
+    """The DSv4 public dispatcher routes both NVFP4 cache segments."""
+    _require_sm120()
+    torch.manual_seed(20260906)
+    num_tokens, num_heads = 2, 16
+    main_topk, extra_topk = 128, 128
+    main_pages, main_page_size = 4, 64
+    extra_pages, extra_page_size = 64, 2
+    main_bf16 = (
+        torch.randn(
+            main_pages,
+            main_page_size,
+            512,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    extra_bf16 = (
+        torch.randn(
+            extra_pages,
+            extra_page_size,
+            512,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    q = (
+        torch.randn(num_tokens, num_heads, 512, dtype=torch.bfloat16, device="cuda")
+        / 10.0
+    ).clamp(-1, 1)
+    main_indices = torch.randint(
+        0,
+        main_pages * main_page_size,
+        (num_tokens, main_topk),
+        dtype=torch.int32,
+        device="cuda",
+    )
+    extra_indices = torch.randint(
+        0,
+        extra_pages * extra_page_size,
+        (num_tokens, extra_topk),
+        dtype=torch.int32,
+        device="cuda",
+    )
+    main_lengths = torch.tensor([111, 97], dtype=torch.int32, device="cuda")
+    extra_lengths = torch.tensor([119, 103], dtype=torch.int32, device="cuda")
+    main_cache = nvfp4_quantize_pack_sparse_mla_cache(main_bf16)
+    extra_cache = nvfp4_quantize_pack_sparse_mla_cache(extra_bf16)
+
+    main_ref_indices = main_indices.clone()
+    extra_ref_indices = extra_indices.clone()
+    for token in range(num_tokens):
+        main_ref_indices[token, int(main_lengths[token].item()) :] = -1
+        extra_ref_indices[token, int(extra_lengths[token].item()) :] = -1
+    main_rows = main_pages * main_page_size
+    virtual_kv = torch.cat(
+        (
+            _dequantize_nvfp4_cache(main_cache).reshape(-1, 512),
+            _dequantize_nvfp4_cache(extra_cache).reshape(-1, 512),
+        ),
+        dim=0,
+    ).reshape(1, -1, 1, 512)
+    virtual_indices = torch.cat(
+        (
+            main_ref_indices,
+            torch.where(
+                extra_ref_indices < 0,
+                extra_ref_indices,
+                extra_ref_indices + main_rows,
+            ),
+        ),
+        dim=1,
+    )
+    reference, _ = _reference_sparse_attention(
+        _dequantize_nvfp4_query(q),
+        virtual_kv,
+        virtual_indices,
+        512**-0.5,
+    )
+    workspace_storage = torch.empty((1 << 20) + 1, dtype=torch.uint8, device="cuda")
+    workspace = workspace_storage[1:]
+    assert workspace.data_ptr() % 16 == 1
+    output = torch.empty_like(q)
+    returned = flashinfer.mla.trtllm_batch_decode_sparse_mla_dsv4(
+        query=q,
+        swa_kv_cache=main_cache,
+        workspace_buffer=workspace,
+        sparse_indices=main_indices,
+        compressed_kv_cache=extra_cache,
+        swa_topk_lens=main_lengths,
+        extra_sparse_indices=extra_indices,
+        extra_sparse_topk_lens=extra_lengths,
+        out=output,
+        bmm1_scale=512**-0.5,
+        backend="sparse",
+        kv_cache_format="nvfp4",
+    )
+
+    assert returned.data_ptr() == output.data_ptr()
+    torch.testing.assert_close(output, reference, atol=5e-2, rtol=5e-2)
+    with pytest.raises(ValueError, match="head dim 584"):
+        flashinfer.mla.trtllm_batch_decode_sparse_mla_dsv4(
+            query=q,
+            swa_kv_cache=main_cache,
+            workspace_buffer=workspace,
+            sparse_indices=main_indices,
+            swa_topk_lens=main_lengths,
+            bmm1_scale=512**-0.5,
+            backend="sparse",
+        )
+    with pytest.raises(ValueError, match="workspace"):
+        flashinfer.mla.trtllm_batch_decode_sparse_mla_dsv4(
+            query=q,
+            swa_kv_cache=main_cache,
+            workspace_buffer=torch.empty(1, dtype=torch.uint8, device="cuda"),
+            sparse_indices=main_indices,
+            swa_topk_lens=main_lengths,
+            bmm1_scale=512**-0.5,
+            backend="sparse",
+            kv_cache_format="nvfp4",
+        )
+
+
+def test_nvfp4_sparse_mla_public_api_prefill_minimal_workspace() -> None:
+    """Streaming prefill only reserves the caller-owned final LSE scratch."""
+    _require_sm120()
+    torch.manual_seed(20260907)
+    num_tokens, num_heads, topk = 129, 16, 128
+    kv_bf16 = (
+        torch.randn(4, 64, 512, dtype=torch.bfloat16, device="cuda") / 10.0
+    ).clamp(-1, 1)
+    q = (
+        torch.randn(num_tokens, num_heads, 512, dtype=torch.bfloat16, device="cuda")
+        / 10.0
+    ).clamp(-1, 1)
+    indices = torch.randint(
+        0, 4 * 64, (num_tokens, topk), dtype=torch.int32, device="cuda"
+    )
+    lengths = torch.full((num_tokens,), 117, dtype=torch.int32, device="cuda")
+    cache = nvfp4_quantize_pack_sparse_mla_cache(kv_bf16)
+    reference, _ = _reference_sparse_attention(
+        _dequantize_nvfp4_query(q),
+        _dequantize_nvfp4_cache(cache),
+        indices,
+        512**-0.5,
+        topk_length=lengths,
+    )
+    bytes_per_token = num_heads * 4
+    workspace = torch.empty(
+        num_tokens * bytes_per_token, dtype=torch.uint8, device="cuda"
+    )
+    output = torch.empty_like(q)
+
+    flashinfer.mla.trtllm_batch_decode_sparse_mla_dsv4(
+        query=q,
+        swa_kv_cache=cache,
+        workspace_buffer=workspace,
+        sparse_indices=indices,
+        swa_topk_lens=lengths,
+        out=output,
+        bmm1_scale=512**-0.5,
+        backend="sparse",
+        kv_cache_format="nvfp4",
+    )
+    torch.testing.assert_close(output, reference, atol=5e-2, rtol=5e-2)
+
+
+def test_nvfp4_sparse_mla_public_api_empty_pp_slice() -> None:
+    """Empty PP/CUDA-graph metadata is a no-op, not a workspace error."""
+    _require_sm120()
+    num_heads, topk = 16, 128
+    q = torch.empty((0, num_heads, 512), dtype=torch.bfloat16, device="cuda")
+    # vLLM prefill metadata retains its singleton q-length dimension.
+    indices = torch.empty((0, 1, topk), dtype=torch.int32, device="cuda")
+    lengths = torch.empty((0, 1), dtype=torch.int32, device="cuda")
+    cache = torch.empty((1, 1, 64, _BYTES_PER_TOKEN), dtype=torch.uint8, device="cuda")
+    workspace = torch.empty(1, dtype=torch.uint8, device="cuda")
+    output = torch.empty_like(q)
+
+    returned = flashinfer.mla.trtllm_batch_decode_sparse_mla_dsv4(
+        query=q,
+        swa_kv_cache=cache,
+        workspace_buffer=workspace,
+        sparse_indices=indices,
+        swa_topk_lens=lengths,
+        out=output,
+        bmm1_scale=512**-0.5,
+        backend="sparse",
+        kv_cache_format="nvfp4",
+    )
+
+    assert returned.data_ptr() == output.data_ptr()
+    assert returned.shape == (0, num_heads, 512)
+
+
+@pytest.mark.parametrize("num_tokens", [2, 65])
+def test_nvfp4_sparse_mla_public_api_cuda_graph(num_tokens: int) -> None:
+    """Both public decode and prefill routes are replayable in a CUDA Graph."""
+    _require_sm120()
+    torch.manual_seed(20260908 + num_tokens)
+    num_heads, topk = 16, 128
+    kv_bf16 = (
+        torch.randn(4, 64, 512, dtype=torch.bfloat16, device="cuda") / 10.0
+    ).clamp(-1, 1)
+    q = (
+        torch.randn(num_tokens, num_heads, 512, dtype=torch.bfloat16, device="cuda")
+        / 10.0
+    ).clamp(-1, 1)
+    replay_q = (torch.randn_like(q, dtype=torch.bfloat16, device="cuda") / 10.0).clamp(
+        -1, 1
+    )
+    indices = torch.randint(
+        0, 4 * 64, (num_tokens, topk), dtype=torch.int32, device="cuda"
+    )
+    lengths = torch.full((num_tokens,), topk, dtype=torch.int32, device="cuda")
+    cache = nvfp4_quantize_pack_sparse_mla_cache(kv_bf16)
+    workspace = torch.empty(8 << 20, dtype=torch.uint8, device="cuda")
+    output = torch.empty_like(q)
+
+    def run() -> None:
+        flashinfer.mla.trtllm_batch_decode_sparse_mla_dsv4(
+            query=q,
+            swa_kv_cache=cache,
+            workspace_buffer=workspace,
+            sparse_indices=indices,
+            swa_topk_lens=lengths,
+            out=output,
+            bmm1_scale=512**-0.5,
+            backend="sparse",
+            kv_cache_format="nvfp4",
+        )
+
+    run()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    q.copy_(replay_q)
+    graph.replay()
+    torch.cuda.synchronize()
+    reference, _ = _reference_sparse_attention(
+        _dequantize_nvfp4_query(replay_q),
+        _dequantize_nvfp4_cache(cache),
+        indices,
+        512**-0.5,
+        topk_length=lengths,
+    )
+    torch.testing.assert_close(output, reference, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.parametrize("with_sink", [False, True])
+def test_nvfp4_sparse_mla_decode_zero_topk_length(with_sink: bool) -> None:
+    """An empty sparse row produces zero output and sink-aware LSE."""
+    _require_sm120()
+    torch.manual_seed(20260903)
+    num_heads, topk = 128, 128
+    kv = torch.randn(1, 64, _D_NOPE + _D_ROPE, dtype=torch.bfloat16, device="cuda")
+    q = torch.randn(
+        1, num_heads, _D_NOPE + _D_ROPE, dtype=torch.bfloat16, device="cuda"
+    )
+    cache = nvfp4_quantize_pack_sparse_mla_cache(kv)
+    indices = torch.zeros((1, topk), dtype=torch.int32, device="cuda")
+    topk_length = torch.zeros(1, dtype=torch.int32, device="cuda")
+    attn_sink = (
+        torch.linspace(-2.0, 2.0, num_heads, dtype=torch.float32, device="cuda")
+        if with_sink
+        else None
+    )
+
+    output, lse = _nvfp4_sparse_mla_decode(
+        q,
+        cache,
+        indices,
+        (_D_NOPE + _D_ROPE) ** -0.5,
+        topk_length=topk_length,
+        attn_sink=attn_sink,
+        chunks_per_block_override=2,
+    )
+
+    assert torch.count_nonzero(output) == 0
+    if attn_sink is None:
+        assert torch.isneginf(lse).all()
+    else:
+        torch.testing.assert_close(lse, attn_sink.unsqueeze(0) * math.log2(math.e))
+
+
+@pytest.mark.parametrize("with_sink", [False, True])
+def test_nvfp4_sparse_mla_invalid_nonempty_chunks_have_zero_probability(
+    with_sink: bool,
+) -> None:
+    """Negative candidates stay masked when topk_length itself is nonzero."""
+    _require_sm120()
+    torch.manual_seed(20260913 + int(with_sink))
+    num_heads, topk = 16, 128
+    kv = torch.randn(2, 64, 512, dtype=torch.bfloat16, device="cuda")
+    q = torch.randn(1, num_heads, 512, dtype=torch.bfloat16, device="cuda")
+    cache = nvfp4_quantize_pack_sparse_mla_cache(kv)
+    indices = torch.full((1, topk), -1, dtype=torch.int32, device="cuda")
+    attn_sink = (
+        torch.linspace(-2.0, 2.0, num_heads, dtype=torch.float32, device="cuda")
+        if with_sink
+        else None
+    )
+
+    for attention in (_nvfp4_sparse_mla_decode, _nvfp4_sparse_mla_prefill):
+        output, lse = attention(
+            q,
+            cache,
+            indices,
+            512**-0.5,
+            attn_sink=attn_sink,
+        )
+        assert torch.count_nonzero(output) == 0
+        if attn_sink is None:
+            assert torch.isneginf(lse).all()
+        else:
+            torch.testing.assert_close(lse, attn_sink.unsqueeze(0) * math.log2(math.e))
+
+
+@pytest.mark.parametrize("invalid_chunk", ["first", "last"])
+def test_nvfp4_sparse_mla_skips_fully_invalid_chunk_in_nonempty_row(
+    invalid_chunk: str,
+) -> None:
+    """An invalid tile must not change the online softmax around a valid tile."""
+    _require_sm120()
+    torch.manual_seed(20260915 + int(invalid_chunk == "last"))
+    num_heads, topk = 16, 128
+    kv = (torch.randn(2, 64, 512, dtype=torch.bfloat16, device="cuda") / 10).clamp(
+        -1, 1
+    )
+    q = (
+        torch.randn(1, num_heads, 512, dtype=torch.bfloat16, device="cuda") / 10
+    ).clamp(-1, 1)
+    cache = nvfp4_quantize_pack_sparse_mla_cache(kv)
+    indices = torch.randint(0, 128, (1, topk), dtype=torch.int32, device="cuda")
+    invalid_slice = slice(0, 64) if invalid_chunk == "first" else slice(64, 128)
+    indices[:, invalid_slice] = -1
+    reference, reference_lse = _reference_sparse_attention(
+        _dequantize_nvfp4_query(q),
+        _dequantize_nvfp4_cache(cache),
+        indices,
+        512**-0.5,
+    )
+
+    for attention in (_nvfp4_sparse_mla_decode, _nvfp4_sparse_mla_prefill):
+        output, lse = attention(q, cache, indices, 512**-0.5)
+        torch.testing.assert_close(output, reference, atol=5e-2, rtol=5e-2)
+        torch.testing.assert_close(lse, reference_lse, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize(
+    "heads,topk,cpbs,dual",
+    [(16, 128, (2, 1), False), (128, 512, (1,), True)],
+)
+@pytest.mark.parametrize("sink_value", [None, -1000.0, 2.0])
+def test_nvfp4_sparse_mla_empty_store_families(heads, topk, cpbs, dual, sink_value):
+    _require_sm120()
+    torch.manual_seed(4484)
+    q = torch.randn(6, heads, 512, device="cuda", dtype=torch.bfloat16) * 0.1
+    cache = nvfp4_quantize_pack_sparse_mla_cache(
+        torch.randn(2, 64, 512, device="cuda", dtype=torch.bfloat16) * 0.1
+    )
+    idx = torch.randint(128, (6, topk), device="cuda", dtype=torch.int32)
+    idx[1] = -1
+    lengths = torch.full((6,), topk, device="cuda", dtype=torch.int32)
+    lengths[0] = 0
+    sink = (
+        torch.full((heads,), sink_value, device="cuda")
+        if sink_value is not None
+        else None
+    )
+    kwargs = dict(topk_length=lengths, attn_sink=sink)
+    virtual = _dequantize_nvfp4_cache(cache).reshape(-1, 512)
+    masked = idx.masked_fill(
+        torch.arange(topk, device="cuda")[None] >= lengths[:, None], -1
+    )
+    if dual:
+        extra_idx = torch.randint(128, (6, 128), device="cuda", dtype=torch.int32)
+        extra_idx[:3] = -1
+        idx[3] = -1
+        masked[3] = -1
+        kwargs.update(extra_kv_cache=cache, extra_indices=extra_idx)
+        virtual = torch.cat([virtual, virtual])
+        masked = torch.cat(
+            [masked, torch.where(extra_idx < 0, extra_idx, extra_idx + 128)], -1
+        )
+    reference, reference_lse = _reference_sparse_attention(
+        _dequantize_nvfp4_query(q),
+        virtual,
+        masked,
+        512**-0.5,
+        attn_sink=sink,
+    )
+    calls = [
+        (_nvfp4_sparse_mla_decode, dict(chunks_per_block_override=cpb)) for cpb in cpbs
+    ]
+    calls.append((_nvfp4_sparse_mla_prefill, {}))
+    for attention, extra_kwargs in calls:
+        output, lse = attention(q, cache, idx, 512**-0.5, **kwargs, **extra_kwargs)
+        assert torch.count_nonzero(output[:2]) == 0
+        torch.testing.assert_close(output, reference, atol=0.05, rtol=0.05)
+        torch.testing.assert_close(lse, reference_lse, atol=0.02, rtol=0.02)
+
+
+def _nvfp4_lse_case(num_tokens, num_heads, topk, with_sink):
+    """Quantized reference inputs with one empty row and varying valid lengths."""
+    torch.manual_seed(4650 + topk + num_heads)
+    kv = (torch.randn(16, 64, 512, device="cuda", dtype=torch.bfloat16) / 10).clamp(
+        -1, 1
+    )
+    q = (
+        torch.randn(num_tokens, num_heads, 512, device="cuda", dtype=torch.bfloat16)
+        / 10
+    ).clamp(-1, 1)
+    cache = nvfp4_quantize_pack_sparse_mla_cache(kv)
+    indices = torch.randint(
+        0, 1024, (num_tokens, topk), device="cuda", dtype=torch.int32
+    )
+    indices[:, -3:] = -1
+    indices[1] = -1  # fully masked despite a nonzero topk_length
+    lengths = torch.full((num_tokens,), topk, device="cuda", dtype=torch.int32)
+    lengths[0] = 0
+    lengths[-1] = topk - 19
+    sink = (
+        torch.linspace(-1, 1, num_heads, device="cuda", dtype=torch.float32)
+        if with_sink
+        else None
+    )
+    reference, reference_lse = _reference_sparse_attention(
+        _dequantize_nvfp4_query(q),
+        _dequantize_nvfp4_cache(cache),
+        indices,
+        512**-0.5,
+        topk_length=lengths,
+        attn_sink=sink,
+    )
+    return q, cache, indices, lengths, sink, reference, reference_lse
+
+
+_NVFP4_LSE_PATHS = [
+    pytest.param("decode", 3, 16, 128, 2, id="ungrouped-direct"),
+    # H128 has two 64-head groups; T8 satisfies the grouped-grid threshold.
+    pytest.param("decode", 8, 128, 512, 8, id="grouped-direct"),
+    pytest.param("decode", 3, 16, 512, 4, id="merge2"),
+    pytest.param("decode", 3, 16, 512, 2, id="generic-merge4"),
+    pytest.param("prefill", 65, 16, 128, None, id="streaming-prefill"),
+]
+
+
+@pytest.mark.parametrize("phase,num_tokens,num_heads,topk,cpb", _NVFP4_LSE_PATHS)
+@pytest.mark.parametrize("with_sink", [False, True])
+def test_nvfp4_sparse_mla_lse_scale_final_stores(
+    phase, num_tokens, num_heads, topk, cpb, with_sink
+):
+    """Every final store converts base-2 once, after sink merging, preserving sentinels."""
+    _require_sm120()
+    q, cache, indices, lengths, sink, reference, reference_lse = _nvfp4_lse_case(
+        num_tokens, num_heads, topk, with_sink
+    )
+    attention = (
+        _nvfp4_sparse_mla_decode if phase == "decode" else _nvfp4_sparse_mla_prefill
+    )
+    kwargs = dict(topk_length=lengths, attn_sink=sink)
+    if phase == "decode":
+        kwargs["chunks_per_block_override"] = cpb
+    results = []
+    for scale in (None, 1.0, math.log(2)):
+        scale_kwargs = {} if scale is None else {"lse_scale": scale}
+        output, lse = attention(q, cache, indices, 512**-0.5, **kwargs, **scale_kwargs)
+        expected_lse = reference_lse * (1.0 if scale is None else scale)
+        torch.testing.assert_close(output, reference, atol=5e-2, rtol=5e-2)
+        torch.testing.assert_close(lse, expected_lse, atol=2e-2, rtol=2e-2)
+        if not with_sink:
+            assert torch.equal(lse[0], torch.full_like(lse[0], -float("inf")))
+        results.append((output, lse))
+    assert torch.equal(results[0][1], results[1][1])
+    assert torch.equal(results[0][0], results[1][0])
+    assert torch.equal(results[0][0], results[2][0])
+    finite_rows = torch.isfinite(reference_lse)
+    torch.testing.assert_close(
+        results[2][1][finite_rows],
+        results[1][1][finite_rows] * math.log(2),
+        atol=2e-6,
+        rtol=2e-6,
+    )
+
+
+@pytest.mark.parametrize(
+    "num_tokens,num_heads,topk,cpb",
+    [
+        pytest.param(3, 16, 512, 2, id="ungrouped"),
+        pytest.param(8, 128, 512, 3, id="grouped"),
+    ],
+)
+def test_nvfp4_sparse_mla_lse_scale_keeps_partials_base2(
+    num_tokens, num_heads, topk, cpb
+):
+    """Stage-one scratch stays base-2, independently checked by merging its LSE."""
+    _require_sm120()
+    from flashinfer.mla._sparse_mla_sm120._dsv4_nvfp4 import (
+        get_sparse_mla_nvfp4_sm120_module,
+    )
+
+    q, cache, indices, lengths, _, _, reference_lse = _nvfp4_lse_case(
+        num_tokens, num_heads, topk, False
+    )
+    num_splits = (topk + 63) // 64
+    active_splits = (num_splits + cpb - 1) // cpb
+    module = get_sparse_mla_nvfp4_sm120_module()
+    partials = []
+    for scale in (1.0, math.log(2)):
+        mid_out = torch.full(
+            (num_tokens, num_heads, num_splits, 512),
+            float("nan"),
+            dtype=torch.bfloat16,
+            device=q.device,
+        )
+        mid_lse = torch.full(
+            (num_tokens, num_heads, num_splits),
+            float("nan"),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        output = torch.empty_like(q)
+        out_lse = torch.full((num_tokens, num_heads), float("nan"), device=q.device)
+        module.sparse_mla_sm120_nvfp4_decode(
+            q,
+            cache,
+            indices,
+            mid_out,
+            mid_lse,
+            output,
+            out_lse,
+            num_splits,
+            512**-0.5,
+            lengths,
+            None,
+            None,
+            None,
+            None,
+            cpb,
+            True,
+            scale,
+        )
+        # The launcher packs active splits at the front of the allocated scratch.
+        partial = mid_lse.flatten()[: num_tokens * num_heads * active_splits].reshape(
+            num_tokens, num_heads, active_splits
+        )
+        assert torch.isfinite(partial).all()
+        assert torch.isnan(out_lse).all(), "stage1_only must not write final LSE"
+        merged_base_e = torch.logsumexp(
+            torch.where(partial == -1e30, -torch.inf, partial * math.log(2)), dim=-1
+        )
+        torch.testing.assert_close(
+            merged_base_e / math.log(2), reference_lse, atol=2e-2, rtol=2e-2
+        )
+        partials.append(partial.clone())
+    assert torch.equal(partials[0], partials[1])
+
+
+@pytest.mark.parametrize("use_prefill", [False, True])
+@pytest.mark.parametrize("surface", ["wrapper", "facade"])
+def test_nvfp4_sparse_mla_lse_scale_wrapper_buffer(monkeypatch, use_prefill, surface):
+    """The shared wrapper forwards scale to native stores in the caller's LSE buffer."""
+    _require_sm120()
+    from flashinfer.mla import _core
+    from flashinfer.mla._sparse_mla_sm120 import _dsv4_nvfp4_policy as plan_mod
+    from flashinfer.mla._sparse_mla_sm120 import _prepared
+
+    # Each forced dispatch needs a fresh plan, independent of earlier tests.
+    monkeypatch.setattr(_prepared, "_functional_plans", {})
+    num_tokens = 65 if use_prefill else 3
+    q, cache, indices, lengths, sink, reference, reference_lse = _nvfp4_lse_case(
+        num_tokens, 16, 128, True
+    )
+    variant = (
+        plan_mod.NVFP4KernelVariant.PREFILL_STREAMING
+        if use_prefill
+        else plan_mod.NVFP4KernelVariant.DECODE_SPLITK
+    )
+    # Pin only the planner decision so cached calibration cannot skip either native path.
+    monkeypatch.setattr(
+        plan_mod,
+        "plan_nvfp4_sparse_mla_sm120",
+        lambda *args, **kwargs: plan_mod.NVFP4PlannedCall(
+            variant, 0 if use_prefill else 2
+        ),
+    )
+    runner = flashinfer.mla.SparseMLASm120Wrapper(
+        kv_cache_format="nvfp4", device=q.device
+    )
+    caller_lse = torch.full((num_tokens + 1, 16), 12345.0, device=q.device)
+    output = torch.empty_like(q)
+    workspace = torch.empty(4 << 20, dtype=torch.uint8, device=q.device)
+    results = []
+    for scale in (None, 1.0, math.log(2)):
+        scale_kwargs = {} if scale is None else {"lse_scale": scale}
+        if surface == "wrapper":
+            returned = runner.run(
+                q,
+                cache,
+                indices,
+                output,
+                512**-0.5,
+                topk_length=lengths,
+                attn_sink=sink,
+                out_lse=caller_lse,
+                return_lse=True,
+                **scale_kwargs,
+            )
+        else:
+            caller_view = caller_lse[:num_tokens]
+            output_view = output.unsqueeze(1)
+            returned_output, returned = _core._trtllm_batch_decode_sparse_mla_sm120(
+                query=q.unsqueeze(1),
+                kv_cache=cache,
+                workspace_buffer=workspace,
+                sparse_mla_segments=[_core._SparseMLASegment(indices, lengths)],
+                out=output_view,
+                sm_scale=512**-0.5,
+                sinks=sink,
+                lse=caller_view,
+                return_lse=True,
+                lse_scale=1.0 if scale is None else scale,
+                kv_scale_format="auto",
+                kv_cache_format="nvfp4",
+            )
+            assert returned_output is output_view
+            assert returned is caller_view
+        assert returned.data_ptr() == caller_lse.data_ptr()
+        assert returned.shape == (num_tokens, 16)
+        assert torch.equal(caller_lse[-1], torch.full_like(caller_lse[-1], 12345.0))
+        torch.testing.assert_close(output, reference, atol=5e-2, rtol=5e-2)
+        torch.testing.assert_close(
+            returned,
+            reference_lse * (1.0 if scale is None else scale),
+            atol=2e-2,
+            rtol=2e-2,
+        )
+        results.append((output.clone(), returned.clone()))
+    assert torch.equal(results[0][1], results[1][1])
+    assert torch.equal(results[0][0], results[1][0])
+    assert torch.equal(results[0][0], results[2][0])
+
+
+def test_nvfp4_sparse_mla_lse_scale_calibration_native_calls():
+    """Fresh calibration closures launch both native signatures with identity scale."""
+    _require_sm120()
+    from types import SimpleNamespace
+    from flashinfer.mla._sparse_mla_sm120._dsv4_nvfp4 import (
+        get_sparse_mla_nvfp4_sm120_module,
+    )
+    from flashinfer.mla._sparse_mla_sm120._dsv4_nvfp4_policy import (
+        _make_calibration_calls,
+    )
+
+    q, cache, indices, _, _, _, _ = _nvfp4_lse_case(2, 16, 128, False)
+    native = get_sparse_mla_nvfp4_sm120_module()
+    results = []
+
+    def decode(*args):
+        assert args[-1] == 1.0
+        native.sparse_mla_sm120_nvfp4_decode(*args)
+        results.append((args[5].clone(), args[6].clone()))
+
+    def prefill(*args):
+        assert args[-1] == 1.0
+        native.sparse_mla_sm120_nvfp4_prefill(*args)
+        results.append((args[3].clone(), args[4].clone()))
+
+    build_decode, run_prefill = _make_calibration_calls(
+        module=SimpleNamespace(
+            sparse_mla_sm120_nvfp4_decode=decode,
+            sparse_mla_sm120_nvfp4_prefill=prefill,
+        ),
+        device=q.device,
+        num_tokens=2,
+        num_heads=16,
+        topk=128,
+        primary_cache=cache,
+        extra_topk=0,
+        extra_cache=None,
+        has_topk_length=True,
+        has_extra_topk_length=False,
+        has_attn_sink=True,
+    )
+    build_decode(2)(indices, None)
+    run_prefill(indices, None)
+    assert len(results) == 2
+    torch.testing.assert_close(results[0][0], results[1][0], atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(results[0][1], results[1][1], atol=2e-2, rtol=2e-2)

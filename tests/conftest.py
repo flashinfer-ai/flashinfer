@@ -1,5 +1,6 @@
 import json
 import os
+import traceback
 import types
 from pathlib import Path
 from typing import Any, Dict, Set
@@ -37,6 +38,8 @@ _patch_cutlass_dsl_operand_major_mode()
 
 import flashinfer
 from flashinfer.jit import MissingJITCacheError
+
+pytest_plugins = ["tests.test_helpers.parametrize"]
 
 # Global tracking for JIT cache coverage
 # Store tuples of (test_name, module_name, spec_info)
@@ -259,13 +262,40 @@ def is_cuda_oom_error_str(e: str) -> bool:
     return "CUDA" in e and "out of memory" in e
 
 
+def _release_cuda_oom(e: BaseException) -> bool:
+    """Return whether ``e`` or a linked exception is a CUDA OOM; if so, free its frames.
+
+    torch.testing.assert_close re-raises an OOM from inside its comparison as a
+    RuntimeError caused by the OOM, so both ``__cause__`` and ``__context__`` are
+    followed. The skip exception keeps these exceptions alive, and their
+    tracebacks would keep the test's frames and GPU tensors allocated into the
+    tests that follow.
+    """
+    chain: list[BaseException] = []
+    pending: list[BaseException | None] = [e]
+    while pending:
+        x = pending.pop()
+        if x is None or any(x is seen for seen in chain):
+            continue
+        chain.append(x)
+        pending += [x.__cause__, x.__context__]
+    if not any(
+        isinstance(x, torch.cuda.OutOfMemoryError) or is_cuda_oom_error_str(str(x))
+        for x in chain
+    ):
+        return False
+    for x in chain:
+        traceback.clear_frames(x.__traceback__)
+    return True
+
+
 @pytest.hookimpl(wrapper=True)
 def pytest_runtest_call(item):
     # skip OOM error and missing JIT cache errors
     try:
         yield
     except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
-        if isinstance(e, torch.cuda.OutOfMemoryError) or is_cuda_oom_error_str(str(e)):
+        if _release_cuda_oom(e):
             pytest.skip("Skipping due to OOM")
         elif isinstance(e, MissingJITCacheError):
             # Record the test that was skipped due to missing JIT cache
