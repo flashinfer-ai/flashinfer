@@ -434,6 +434,12 @@ class _HeterogeneousAOTModule:
     def __getitem__(self, key: Any) -> Any:
         return self._get_dispatched_attribute(lambda module: module[key])
 
+    def _resolve_for_current_device(self) -> Any:
+        """Resolve an AOT copy or build the fallback before a captured call."""
+        return self._select_attribute(
+            lambda module: module, self._loaded_modules, (), {}
+        )
+
 
 @dataclasses.dataclass
 class JitSpecNvcc(JitSpec):

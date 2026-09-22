@@ -784,7 +784,7 @@ def get_batch_prefill_module(backend, *args):
                 routed_paged_run_func = paged_run_func
             else:
                 assert lazy_independent_module is not None
-                routed_paged_run_func = lazy_independent_module.get().paged_run
+                routed_paged_run_func = lazy_independent_module.get(q.device).paged_run
             routed_paged_run_func(
                 float_workspace_buffer,
                 int_workspace_buffer,
@@ -3034,7 +3034,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 f"got backend={self._backend!r}."
             )
         assert self._cached_module is not None
-        self._cached_module.prewarm_paged_kv_stride_variant(variant)
+        with torch.cuda.device(self.device):
+            self._cached_module.prewarm_paged_kv_stride_variant(variant)
 
     begin_forward = plan
 

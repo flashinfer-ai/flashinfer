@@ -255,9 +255,7 @@ class BatchAttention:
             raise RuntimeError(
                 "plan() must complete before prewarming a paged-KV-stride variant."
             )
-        if not self._independent_module.is_loaded:
-            with torch.cuda.device(self.float_workspace_buffer.device):
-                self._independent_module.prewarm()
+        self._independent_module.prewarm(self.float_workspace_buffer.device)
 
     @flashinfer_api(trace=batch_attention_run_trace)
     def run(
@@ -350,12 +348,7 @@ class BatchAttention:
 
         module = self.module
         if k_cache.stride()[:3] != v_cache.stride()[:3]:
-            # Warm holders avoid a device-context switch and capture query.
-            if self._independent_module.is_loaded:
-                module = self._independent_module.get()
-            else:
-                with torch.cuda.device(q.device):
-                    module = self._independent_module.get()
+            module = self._independent_module.get(q.device)
 
         module.run(
             self.float_workspace_buffer,
