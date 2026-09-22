@@ -21,7 +21,6 @@ from ......sm90_routing import (
     generate_sm90_routing_numpy,
     normalize_sm90_routing_profile,
     sm90_benchmark_mode_from_routing_profile,
-    sm90_route_ids_sha256,
 )
 
 
@@ -251,16 +250,6 @@ def tune_one(args, rank: int, world_size: int, max_tokens: int) -> dict:
             candidates[0],
         )
         if rank == 0:
-            route_ids_sha256 = sm90_route_ids_sha256(
-                generate_sm90_routing_numpy(
-                    routing_profile=routing_profile,
-                    world_size=world_size,
-                    tokens=live_tokens,
-                    topk=args.topk,
-                    total_experts=args.num_experts,
-                    seed=_ROUTING_SEED + args.seed,
-                )
-            )
             print(
                 f"[moe_ep-tune] sm90_mxfp4 {mode} canonical data: "
                 f"weight_seed=0x{_MXFP4_WEIGHT_SEED + args.seed:x}+rank "
@@ -268,8 +257,7 @@ def tune_one(args, rank: int, world_size: int, max_tokens: int) -> dict:
                 f"routing_seed={_ROUTING_SEED + args.seed} "
                 f"routing_profile={routing_profile} "
                 "routing_mode="
-                f"{sm90_benchmark_mode_from_routing_profile(routing_profile)} "
-                f"route_ids_sha256={route_ids_sha256}",
+                f"{sm90_benchmark_mode_from_routing_profile(routing_profile)}",
                 flush=True,
             )
         tune_fn = pkg.autotune_hopper_mxfp4_mega_moe

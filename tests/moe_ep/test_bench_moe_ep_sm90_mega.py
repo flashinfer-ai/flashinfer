@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import csv
 import importlib.util
 import json
 from io import StringIO
@@ -41,13 +42,6 @@ def _routing_modules(extra_moe_ep=None):
     routing.sm90_routing_profile_from_benchmark_mode = profile_from_mode
     routing.normalize_sm90_routing_profile = lambda value: str(value)
     routing.generate_sm90_routing_numpy = lambda **kwargs: kwargs
-    routing.generate_sm90_published_exact_balanced_routes_numpy = (
-        lambda **kwargs: kwargs
-    )
-    routing.sm90_routing_audit_payload = lambda routes, **kwargs: {
-        **kwargs,
-        "route_ids_sha256": "0" * 64,
-    }
     if extra_moe_ep:
         for name, value in extra_moe_ep.items():
             setattr(moe_ep, name, value)
@@ -81,60 +75,6 @@ class _ConfigCapture:
 
 def _mxfp4_args(*extra):
     return bench._parse_args(["--backend", bench.MXFP4_BACKEND, *extra])
-
-
-def _resolved_fused_metadata(
-    args, *, store=False, early=True, fold=True, tail_split_pairs=False
-):
-    tactic = bench._mxfp4_fused_tactic(args, (256, 32))
-    tactic["tail_split_pairs"] = tail_split_pairs
-    cluster = tactic["cluster_shape_mnk"]
-    config = SimpleNamespace(
-        swap_ab=tactic["swap_ab"],
-        pingpong=tactic["pingpong"],
-        mma_tiler_mnk=tactic["mma_tiler_mnk"],
-        cluster_shape_mnk=cluster,
-        fp8_accum_mode=tactic["fp8_accum_mode"],
-        load_balance_mode=tactic["load_balance_mode"],
-        resolved_token_back_mode=tactic["token_back_mode"],
-        group_hint=tactic["group_hint"],
-        tail_split_pairs=tail_split_pairs,
-        num_sched_stages=tactic["num_sched_stages"],
-        in_kernel_fc2_reduce=tactic["in_kernel_fc2_reduce"],
-        routing_profile=bench.sm90_routing_profile_from_benchmark_mode(
-            args.routing_mode
-        ),
-        **{name: tactic[name] for name in bench._FUSED_EXECUTION_TACTIC_FIELDS},
-    )
-    kernel = SimpleNamespace(
-        group_hint=tactic["group_hint"],
-        tail_split_pairs=tail_split_pairs,
-        num_sched_stages=tactic["num_sched_stages"],
-        dedup_dispatch=tactic["dedup_dispatch"],
-        grouped_token_back=tactic["grouped_token_back"],
-        combine_format=SimpleNamespace(name=tactic["combine_format"]),
-        token_comm=SimpleNamespace(
-            active_dispatch_warps=tactic["active_dispatch_warps"]
-        ),
-        fc1_store_offload=store,
-        fc1_early_done_publish=early,
-        fold_producer_warps=fold,
-    )
-    effective_tactic = dict(tactic)
-    effective_tactic.update(
-        fc1_store_offload=store,
-        fc1_early_done_publish=early,
-        fold_producer_warps=fold,
-    )
-    frontend = SimpleNamespace(
-        config=config,
-        _mega=SimpleNamespace(kernel=kernel),
-        requested_tactic=mock.Mock(return_value=tactic),
-        effective_tactic=mock.Mock(return_value=effective_tactic),
-    )
-    return bench._mxfp4_fused_runtime_metadata(
-        args, SimpleNamespace(_frontend=frontend)
-    )
 
 
 class BenchmarkContracts(TestCase):
@@ -230,76 +170,75 @@ class BenchmarkContracts(TestCase):
             with self.subTest(flags=flags), self.assertRaisesRegex(ValueError, message):
                 bench._resolve_sweep(_mxfp4_args(*flags), 4)
 
-    def test_mxfp4_optional_strategies_have_complete_runtime_identity(self):
-        args = _mxfp4_args("--mxfp4-fc2-tail-n8", "--mxfp4-fc1-ready-mode", "k256")
-        tactic = bench._mxfp4_fused_tactic(args, (256, 64))
-        self.assertTrue(tactic["fc2_tail_n8"])
-        self.assertEqual(tactic["fc1_ready_mode"], "k256")
-        self.assertEqual(set(tactic), bench.MXFP4_FUSED_RUNTIME_TACTIC_FIELDS)
-        enabled = bench._runtime_tactic_envelope("mxfp4_fused", tactic)
-        disabled = bench._runtime_tactic_envelope(
-            "mxfp4_fused", dict(tactic, fc2_tail_n8=False, fc1_ready_mode="tile")
+    def test_mxfp4_candidates_round_trip_through_json_and_config(self):
+        from flashinfer.moe_ep.kernel_src.sm90 import (
+            pull_style_cutedsl_megakernel as sm90,
         )
-        self.assertNotEqual(
-            enabled["runtime_tactic_sha256"], disabled["runtime_tactic_sha256"]
-        )
-        incomplete = dict(tactic)
-        incomplete.pop("fc1_ready_mode")
-        with self.assertRaisesRegex(RuntimeError, "fields differ"):
-            bench._runtime_tactic_envelope("mxfp4_fused", incomplete)
 
-    def test_tail_split_pairs_changes_runtime_identity(self):
-        args = _mxfp4_args(
-            "--mma-tiler",
-            "128,128,128",
-            "--cga",
-            "1,2",
-            "--group-hint",
-            "264",
-            "--num-sched-stages",
-            "2",
+        candidates = sm90.hopper_mxfp4_optimization_candidates(
+            2048,
+            hidden=7168,
+            intermediate=3072,
+            num_experts=384,
+            world_size=4,
         )
-        mx = [
-            _resolved_fused_metadata(args, tail_split_pairs=value)
-            for value in (False, True)
-        ]
-        self.assertNotEqual(
-            mx[0]["runtime_tactic_sha256"], mx[1]["runtime_tactic_sha256"]
+        self.assertTrue(any(c["tail_split_pairs"] for c in candidates))
+        for candidate in candidates:
+            with self.subTest(candidate=candidate):
+                args = _mxfp4_args("--mxfp4-knobs-json", json.dumps(candidate))
+                _, orders, tile = bench._resolve_sweep(args, 4)
+                config = bench._megakernel_config(args, "mxfp4_hybrid", orders[0], tile)
+                self.assertEqual(config.knobs, candidate)
+                self.assertEqual(tile, candidate["mma_tiler_mnk"][:2])
+
+    def test_fp8_runtime_record_uses_compiled_values_and_can_be_replayed(self):
+        from flashinfer.moe_ep.kernel_src.sm90 import (
+            pull_style_cutedsl_megakernel as sm90,
         )
+
         for scale in ("blockwise", "per_tensor"):
-            records = []
-            for enabled in (False, True):
-                tactic = bench._mxfp4_fused_tactic(args, (128, 128))
-                tactic.update(tail_split_pairs=enabled)
-                config = SimpleNamespace(
-                    **tactic,
-                    fp8_scale_mode=scale,
+            tactic = next(
+                c
+                for c in sm90.hopper_fp8_candidates(
+                    fp8_scale_mode=scale, max_tokens=2048
+                )
+                if c["tail_split_pairs"]
+            )
+            tactic = dict(bench._mxfp4_fused_tactic(_mxfp4_args()), **tactic)
+            config = SimpleNamespace(
+                **dict(
+                    tactic,
                     flag_batch=1,
                     epi_flag_batch=(1, 1),
                     compact_pull_buffer=True,
                     generate_c=False,
                     resolved_token_back_mode=tactic["token_back_mode"],
-                )
-                kernel = SimpleNamespace(
-                    **tactic,
-                    token_comm=SimpleNamespace(active_dispatch_warps=1),
-                )
-                frontend = SimpleNamespace(
+                ),
+            )
+            effective = dict(
+                tactic,
+                group_hint=264,
+                num_sched_stages=2,
+                fc1_store_offload=False,
+                fc1_early_done_publish=True,
+            )
+            kernel = SimpleNamespace(
+                **effective, token_comm=SimpleNamespace(active_dispatch_warps=1)
+            )
+            workspace = SimpleNamespace(
+                _frontend=SimpleNamespace(
                     config=config, _mega=SimpleNamespace(kernel=kernel)
                 )
-                workspace = SimpleNamespace(_frontend=frontend)
-                fp8_args = bench._parse_args(["--scale-mode", scale])
-                metadata = bench._fp8_runtime_metadata(fp8_args, workspace)
-                self.assertEqual(
-                    metadata["runtime_tactic"]["tail_split_pairs"], enabled
-                )
-                records.append(metadata)
-                kernel.tail_split_pairs = not enabled
-                with self.assertRaisesRegex(RuntimeError, "compiled tail_split_pairs"):
-                    bench._fp8_runtime_metadata(fp8_args, workspace)
-            self.assertNotEqual(
-                records[0]["runtime_tactic_sha256"], records[1]["runtime_tactic_sha256"]
             )
+            args = bench._parse_args(["--scale-mode", scale])
+            record = bench._runtime_tactic(args, workspace)
+            self.assertTrue(record["tail_split_pairs"])
+            self.assertFalse(record["fc1_store_offload"])
+            self.assertTrue(record["fc1_early_done_publish"])
+            self.assertEqual(record["group_hint"], 264)
+            replay = bench._parse_args(["--fp8-knobs-json", json.dumps(record)])
+            bench._resolve_sweep(replay, 4)
+            self.assertEqual(replay.knobs, record)
 
     def test_mxfp4_strategy_flags_rejected_on_fp8_and_cache(self):
         for prefix in (
@@ -322,10 +261,7 @@ class BenchmarkContracts(TestCase):
         self.assertEqual(header[0], "BENCH_CSV")
         self.assertEqual(header[1 : 1 + len(historical)], historical)
         self.assertIn("compute_max_rank_median_us", header)
-        self.assertEqual(
-            header[-10:],
-            bench.FUSED_EXECUTION_RUNTIME_CSV_FIELDS.split(","),
-        )
+        self.assertEqual(header[-1], "runtime_tactic")
         self.assertNotIn("input_audit", header)
         self.assertIn("compute_launch_mode", header)
         self.assertFalse(any("graph" in field or "split" in field for field in header))
@@ -394,14 +330,14 @@ class BenchmarkContracts(TestCase):
             "token_back_mode": "epi_warps",
         }
         args = bench._parse_args(["--fp8-knobs-json", "{}"])
-        with mock.patch.object(bench, "_parse_fp8_knobs_json", return_value=candidate):
+        with mock.patch.object(bench, "_parse_knobs_json", return_value=candidate):
             self.assertEqual(
                 bench._resolve_sweep(args, 4),
                 (("per_tensor", "blockwise"), ("swap_ab",), (256, 32)),
             )
         explicit_layout = bench._parse_args(["--fp8-knobs-json", "{}", "--swap-ab"])
         with (
-            mock.patch.object(bench, "_parse_fp8_knobs_json", return_value=candidate),
+            mock.patch.object(bench, "_parse_knobs_json", return_value=candidate),
             self.assertRaisesRegex(ValueError, "mutually exclusive"),
         ):
             bench._resolve_sweep(explicit_layout, 4)
@@ -419,17 +355,15 @@ class BenchmarkContracts(TestCase):
             for candidate in candidates:
                 with self.subTest(scale_mode=scale_mode, candidate=candidate):
                     payload = json.dumps(candidate)
-                    self.assertEqual(bench._parse_fp8_knobs_json(payload), candidate)
+                    self.assertEqual(
+                        bench._parse_knobs_json(payload, bench.FP8_BACKEND), candidate
+                    )
                     args = bench._parse_args(["--fp8-knobs-json", payload])
                     _, orders, tile = bench._resolve_sweep(args, 4)
                     config = bench._megakernel_config(
                         args, scale_mode, orders[0], tile, tokens=2048
                     )
                     self.assertEqual(config.knobs, candidate)
-                    self.assertEqual(
-                        bench._fp8_effective_explicit_knobs(args)["tail_split_pairs"],
-                        candidate["tail_split_pairs"],
-                    )
 
     def test_fp8_json_tail_split_pairs_requires_boolean(self):
         from flashinfer.moe_ep.kernel_src.sm90 import (
@@ -442,8 +376,9 @@ class BenchmarkContracts(TestCase):
                 self.subTest(value=value),
                 self.assertRaisesRegex(ValueError, "tail_split_pairs must be boolean"),
             ):
-                bench._parse_fp8_knobs_json(
-                    json.dumps({**candidate, "tail_split_pairs": value})
+                bench._parse_knobs_json(
+                    json.dumps({**candidate, "tail_split_pairs": value}),
+                    bench.FP8_BACKEND,
                 )
 
     def test_mxfp4_cga_conflicts_with_cache_selection(self):
@@ -476,7 +411,7 @@ class BenchmarkContracts(TestCase):
             bench._resolve_sweep(args, 4),
             (("mxfp4_hybrid",), ("swap_ab",), (256, 32)),
         )
-        tactic = bench._mxfp4_fused_tactic(args, (256, 32))
+        tactic = bench._mxfp4_fused_tactic(args)
         self.assertEqual(tactic["mma_tiler_mnk"], (256, 32, 256))
         self.assertEqual(tactic["cluster_shape_mnk"], (2, 1, 1))
         self.assertEqual(tactic["group_hint"], 512)
@@ -489,10 +424,6 @@ class BenchmarkContracts(TestCase):
         self.assertFalse(tactic["fc1_store_offload"])
         self.assertTrue(tactic["fc1_early_done_publish"])
         self.assertFalse(tactic["fold_producer_warps"])
-        self.assertEqual(
-            set(tactic),
-            bench.MXFP4_FUSED_RUNTIME_TACTIC_FIELDS,
-        )
         modules = _routing_modules(
             {
                 "Sm90_Fp8_Mxfp4_Bf16_PullCutedsl_MegaMoeConfig": _ConfigCapture,
@@ -524,87 +455,104 @@ class BenchmarkContracts(TestCase):
         self.assertIsNone(config.knobs)
         self.assertIsNone(config.load_balance_mode)
 
-    def test_compiled_effective_execution_fields_drive_runtime_sha(self):
+    def test_mxfp4_effective_tactic_is_used_for_replay(self):
         args = _mxfp4_args(
             "--mma-tiler",
             "256,32,256",
-            "--cga",
-            "2,1",
             "--group-hint",
             "512",
             "--num-sched-stages",
             "2",
         )
-        metadata = _resolved_fused_metadata(
-            args,
-            store=False,
-            early=True,
-            fold=True,
+        bench._resolve_sweep(args, 4)
+        effective = dict(
+            args.knobs, fc1_store_offload=False, fc1_early_done_publish=True
         )
-        requested = metadata["execution_knobs_requested"]
-        effective = metadata["execution_knobs_effective"]
-        self.assertTrue(requested["fc1_store_offload"])
-        self.assertFalse(requested["fc1_early_done_publish"])
-        self.assertFalse(effective["fc1_store_offload"])
-        self.assertTrue(effective["fc1_early_done_publish"])
-        self.assertEqual(metadata["runtime_tactic"]["fc1_store_offload"], False)
-        self.assertEqual(
-            metadata["runtime_tactic_sha256"],
-            bench._canonical_runtime_tactic_sha256(
-                "mxfp4_fused", metadata["runtime_tactic"]
-            ),
-        )
-        result = bench.PointResult(
-            "pass",
-            [1.0] * 4,
-            [2.0] * 4,
-            [2.0] * 4,
-            [3.0] * 4,
-            [3.0] * 4,
-            runtime_metadata=[metadata] * 4,
-        )
-        cols = bench._fused_execution_runtime_cols(args, result, 4)
-        self.assertEqual(cols, ["0", "0", "bf16", "1", "1", "0", "0", "1", "1", "1"])
+        frontend = SimpleNamespace(effective_tactic=mock.Mock(return_value=effective))
+        record = bench._runtime_tactic(args, SimpleNamespace(_frontend=frontend))
+        frontend.effective_tactic.assert_called_once_with()
+        replay = _mxfp4_args("--mxfp4-knobs-json", json.dumps(record))
+        bench._resolve_sweep(replay, 4)
+        self.assertEqual(replay.knobs, effective)
 
-    def test_stdout_and_file_csv_rows_match_their_headers(self):
-        args = bench._parse_args(["--output-csv", "none", "--swap-ab"])
-        result = bench.PointResult("failed", [], [], [], [], [], error="")
-        stdout = StringIO()
-        csv_file = StringIO()
-        with contextlib.redirect_stdout(stdout):
-            bench._emit_row(
-                args,
-                scale_mode="per_tensor",
-                operand_order="swap_ab",
-                tile=(256, 32),
-                tokens=8,
-                world_size=4,
-                result=result,
-                header_done=False,
-                csv_file=csv_file,
-            )
-        stdout_header, stdout_row = stdout.getvalue().strip().splitlines()
-        self.assertEqual(len(stdout_header.split(",")), len(stdout_row.split(",")))
-        file_header, file_row = csv_file.getvalue().strip().splitlines()
-        self.assertEqual(len(file_header.split(",")), len(file_row.split(",")))
-        for header, row in ((stdout_header, stdout_row), (file_header, file_row)):
-            values = dict(zip(header.split(","), row.split(","), strict=True))
-            self.assertEqual(values["compute_launch_mode"], "direct")
+    def test_json_replay_rejects_conflicting_manual_and_cache_settings(self):
+        for backend, option in (
+            (bench.FP8_BACKEND, "--fp8-knobs-json"),
+            (bench.MXFP4_BACKEND, "--mxfp4-knobs-json"),
+        ):
+            for flags in (
+                ("--pingpong", "on"),
+                ("--load-balance-mode", "static"),
+                ("--active-dispatch-warps", "2"),
+                ("--fc1-early-pub",),
+                ("--mxfp4-tactic-source", "cache_or_heuristic"),
+            ):
+                with (
+                    self.subTest(backend=backend, flags=flags),
+                    self.assertRaises(ValueError),
+                ):
+                    args = bench._parse_args(
+                        ["--backend", backend, option, "{}", *flags]
+                    )
+                    bench._resolve_sweep(args, 4)
 
-    def test_official_score_is_max_of_rank_local_medians(self):
+    def test_rank_agreement_compares_the_full_tactic(self):
+        tactic = dict(
+            bench._mxfp4_fused_tactic(_mxfp4_args()), group_hint=132, num_sched_stages=1
+        )
+        stats = [("pass", 2.0, 2.0, 3.0, 3.0, dict(tactic), "") for _ in range(4)]
+        self.assertEqual(bench._summarize_ranks(stats).runtime_tactic, tactic)
+        stats[-1][5]["tail_split_pairs"] = True
+        failed = bench._summarize_ranks(stats)
+        self.assertEqual(failed.status, "failed")
+        self.assertIn("differs across ranks", failed.error)
+        stats[-1] = ("skip_oom", 0, 0, 0, 0, {}, "out of memory")
+        self.assertEqual(bench._summarize_ranks(stats).status, "skip_oom")
+
+    def test_stdout_and_file_csv_round_trip_and_historical_statistics(self):
         args = _mxfp4_args()
-        result = bench.PointResult(
-            "pass",
-            [1.0] * 4,
-            [2.0] * 4,
-            [2.0] * 4,
-            [3.0] * 4,
-            [7.0, 10.0, 8.0, 9.0],
-            runtime_metadata=None,
-        )
-        self.assertEqual(
-            bench._formal_tuning_cols(args, (128, 32), result)[0], "10.000000"
-        )
+        bench._resolve_sweep(args, 4)
+        tactic = dict(args.knobs, group_hint=132, num_sched_stages=1)
+        for status in ("pass", "failed", "skip_oom"):
+            result = bench.PointResult(
+                status,
+                [10.0, 20.0, 30.0, 40.0],
+                [8.0, 18.0, 28.0, 38.0],
+                [2.0, 4.0, 6.0, 8.0],
+                [7.0, 10.0, 8.0, 9.0],
+                runtime_tactic=tactic if status == "pass" else None,
+            )
+            stdout, csv_file = StringIO(), StringIO()
+            with contextlib.redirect_stdout(stdout):
+                bench._emit_row(
+                    args,
+                    scale_mode="mxfp4_hybrid",
+                    operand_order="swap_ab",
+                    tile=(128, 32),
+                    tokens=8,
+                    world_size=4,
+                    result=result,
+                    header_done=False,
+                    csv_file=csv_file,
+                )
+            for text in (stdout.getvalue(), csv_file.getvalue()):
+                header, row = list(csv.reader(StringIO(text)))
+                values = dict(zip(header, row, strict=True))
+                self.assertEqual(values["compute_launch_mode"], "direct")
+                self.assertEqual(values["routing_seed"], str(bench.ROUTING_SEED))
+                if status == "pass":
+                    self.assertEqual(
+                        json.loads(values["runtime_tactic"]),
+                        json.loads(json.dumps(tactic)),
+                    )
+                    self.assertEqual(values["e2e_mean_us"], "25.00")
+                    self.assertEqual(values["e2e_median_us"], "23.00")
+                    self.assertEqual(values["compute_max_us"], "8.00")
+                    self.assertEqual(values["compute_median_us"], "8.50")
+                    self.assertEqual(values["compute_max_rank_median_us"], "10.000000")
+                else:
+                    self.assertEqual(values["runtime_tactic"], "")
+                    self.assertEqual(values["compute_mean_us"], "nan")
 
     def test_timing_invokes_each_sample_directly_with_cuda_events(self):
         calls = []

@@ -113,9 +113,9 @@ not picked them up):
 ## MXFP4 local overlay
 
 The fused Humming MXFP4-weight/FP8-activation backend is layered on the FP8
-implementation merged by #4688. `VENDOR_PROVENANCE.md` records its historical
-source snapshots and subsequent local changes; those hashes do not describe
-the current edited tree. Preserve the FP8 extensions above when updating it.
+implementation merged by #4688. `VENDOR_PROVENANCE.md` records the upstream
+FP8 revisions and local MXFP4 changes. Preserve the FP8 extensions above when
+updating it.
 
 MXFP4 adds packed weights, safe tiny-value quantization, guarded communication
 optimizations, and dedicated tuning/cache identities. FP8 and MXFP4 share the
@@ -143,7 +143,7 @@ kernel_src/sm90/pull_style_cutedsl_megakernel/
 │   ├── hopper_mxfp4.py     ← fused Humming MXFP4 frontend
 │   └── kernel_helpers.py   ← lazy re-export point for raw-kernel helpers/reference
 ├── SKILL.md                ← this file (drop-update workflow)
-├── VENDOR_PROVENANCE.md    ← historical source identities and local overlays
+├── VENDOR_PROVENANCE.md    ← upstream revisions and local overlays
 └── TUNING.md               ← measured perf vs the kernel drop's reference sweep,
                               benchmark methodology, knob surface, next levers
 ```

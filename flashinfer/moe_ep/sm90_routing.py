@@ -16,7 +16,6 @@ vendored CuTe DSL packages.
 
 from __future__ import annotations
 
-import hashlib
 from typing import Any, Literal
 
 
@@ -287,83 +286,6 @@ def generate_sm90_routing_numpy(
     )
 
 
-def sm90_route_ids_sha256(routes: Any) -> str:
-    """Hash global route IDs as contiguous little-endian signed int64 bytes."""
-
-    import numpy as np
-
-    canonical = np.ascontiguousarray(routes, dtype="<i8")
-    if canonical.ndim != 3:
-        raise ValueError(
-            "global routes must have shape [world_size, tokens, topk], got "
-            f"{canonical.shape!r}"
-        )
-    return hashlib.sha256(canonical.tobytes()).hexdigest()
-
-
-def sm90_routing_audit_payload(
-    routes: Any,
-    *,
-    routing_profile: object,
-    seed: int,
-    total_experts: int,
-    world_size: int,
-) -> dict[str, object]:
-    """Return the official global route hash, balance, and tile-task audit."""
-
-    import numpy as np
-
-    profile = normalize_sm90_routing_profile(routing_profile)
-    _validate_geometry(
-        world_size=world_size,
-        tokens=0,
-        topk=1,
-        total_experts=total_experts,
-    )
-    canonical = np.ascontiguousarray(routes, dtype="<i8")
-    if canonical.ndim != 3 or canonical.shape[0] != world_size:
-        raise ValueError(
-            "global routes must have shape [world_size, tokens, topk] with "
-            f"world_size={world_size}, got {canonical.shape!r}"
-        )
-    if canonical.shape[2] <= 0:
-        raise ValueError("global routes must have a positive topk dimension")
-    if canonical.size and (
-        int(canonical.min()) < 0 or int(canonical.max()) >= total_experts
-    ):
-        raise ValueError("global routes contain an out-of-range expert ID")
-
-    counts = np.bincount(canonical.reshape(-1), minlength=total_experts)
-    local_experts = total_experts // world_size
-    owners = []
-    for owner in range(world_size):
-        owner_counts = counts[owner * local_experts : (owner + 1) * local_experts]
-        owners.append(
-            {
-                "owner": owner,
-                "rows": int(owner_counts.sum()),
-                "expert_count_min": int(owner_counts.min()),
-                "expert_count_max": int(owner_counts.max()),
-                "n32_tile_tasks": int(((owner_counts + 31) // 32).sum()),
-                "n64_tile_tasks": int(((owner_counts + 63) // 64).sum()),
-                "n128_tile_tasks": int(((owner_counts + 127) // 128).sum()),
-            }
-        )
-    return {
-        "mode": sm90_benchmark_mode_from_routing_profile(profile),
-        "routing_profile": profile,
-        "seed": seed,
-        "world_size": world_size,
-        "tokens_per_rank": int(canonical.shape[1]),
-        "top_k": int(canonical.shape[2]),
-        "num_experts": total_experts,
-        "route_ids_sha256": sm90_route_ids_sha256(canonical),
-        "expert_count_min": int(counts.min()),
-        "expert_count_max": int(counts.max()),
-        "owners": owners,
-    }
-
-
 __all__ = [
     "SM90_BENCHMARK_ROUTING_MODE_BLOCK_PERMUTATION",
     "SM90_BENCHMARK_ROUTING_MODE_PUBLISHED_EXACT_BALANCED",
@@ -374,7 +296,5 @@ __all__ = [
     "generate_sm90_routing_numpy",
     "normalize_sm90_routing_profile",
     "sm90_benchmark_mode_from_routing_profile",
-    "sm90_route_ids_sha256",
-    "sm90_routing_audit_payload",
     "sm90_routing_profile_from_benchmark_mode",
 ]

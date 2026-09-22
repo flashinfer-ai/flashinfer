@@ -897,7 +897,18 @@ OMP_NUM_THREADS=4 torchrun --standalone --nproc_per_node=4 \
   --warmup 10 --iters 50 --cooldown-s 5
 ```
 
-Check the recorded requested/effective tactic: a cache miss uses the heuristic.
+Check the `runtime_tactic` JSON column: it contains the effective configuration;
+a cache miss uses the heuristic. To replay one selected MXFP4 point, use the
+same geometry, token count, routing and timing flags, replace
+`--mxfp4-tactic-source cache_or_heuristic` with `--mxfp4-knobs-json`, and pass
+that complete JSON object as its argument. FP8 uses `--fp8-knobs-json`.
+Manual tactic flags cannot be combined with JSON replay.
+
+The benchmark preserves the original FP8 CSV prefix and its statistics.
+`compute_max_rank_median_us` reports the maximum rank median separately;
+`routing_mode`, `routing_profile`, `routing_seed` and `compute_launch_mode`
+identify the workload. Configuration is recorded once in `runtime_tactic`.
+Compilation is absorbed by warmup; no separate cold-call timing is collected.
 The public tuner's synchronized host-clock score is different from the
 event-based selection used for the table. These commands reproduce public
 tuning and direct benchmark runs; reproducing the table's selection and

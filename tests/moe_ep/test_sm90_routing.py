@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+
 import numpy as np
 import pytest
 
@@ -68,7 +70,8 @@ def test_published_exact_standard_hashes_do_not_change(
         total_experts=384,
         seed=1234,
     )
-    assert routing.sm90_route_ids_sha256(routes) == expected_hash
+    canonical = np.ascontiguousarray(routes, dtype="<i8")
+    assert hashlib.sha256(canonical.tobytes()).hexdigest() == expected_hash
     repeated = routing.generate_sm90_published_exact_balanced_routes_numpy(
         world_size=4,
         tokens=tokens,
