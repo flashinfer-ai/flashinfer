@@ -23,7 +23,11 @@ from typing import Optional, Sequence
 import torch
 import tvm_ffi
 
-from .cake_jit import MODULES, select_module
+from .cake_jit import (
+    MODULES,
+    load_cake_nvfp4_mla_decode_module,
+    select_module,
+)
 
 # DeepSeek-V4 main-attention decode geometry served by the generated program:
 # MQA over one 512-wide NVFP4 latent row that is both K and V, 64-token pages.
@@ -551,23 +555,36 @@ def bind_decode_payload(
 ) -> NVFP4MLADecodeRunner:
     """Bind the prepared buffers to the generated physical argument order."""
     module_name = select_module(arch)
-    # TODO(cake_nvfp4_mla_decode ABI freeze, flashinfer-ai/flashinfer#5403):
-    # once ``cake_jit.MODULES`` is populated, bind as nvfp4_attention does:
-    #   record = MODULES[module_name]
-    #   main_arguments = tuple(<grid_x/grid_y/grid_z from main_kwargs["grid"]>
-    #       if kind == "grid" else main_kwargs[name]
-    #       for kind, name in record["arg_plan"])
-    #   reduce_arguments = same over record["reduce_arg_plan"] / reduce_kwargs
-    #       (empty when reduce_kwargs is None, i.e. plan.max_splits == 1)
-    #   module = load_cake_nvfp4_mla_decode_module(module_name)
-    #   main_entry = getattr(module, record["ffi_entry"])
-    #   reduce_entry = getattr(module, record["reduce_ffi_entry"]) or None
-    # The kwargs assembled by ``prepare`` already follow MAIN_KWARGS /
-    # REDUCE_KWARGS; only the export's arg plans, FFI entry names and
-    # closure digest are missing.
-    raise NotImplementedError(
-        f"launch binding for {module_name} is pending the generated-program "
-        "export (flashinfer-ai/flashinfer#5403)"
+    record = MODULES[module_name]
+
+    def arguments(kwargs, physical):
+        grid = dict(zip(("grid_x", "grid_y", "grid_z"), kwargs["grid"], strict=True))
+        return tuple(
+            grid[name] if kind == "grid" else kwargs[name]
+            for kind, name in physical["arg_plan"]
+        )
+
+    main_module = load_cake_nvfp4_mla_decode_module(module_name, "main")
+    main_entry = getattr(main_module, record["main"]["ffi_entry"])
+    main_arguments = arguments(main_kwargs, record["main"])
+    reduce_entry = None
+    reduce_arguments = ()
+    if reduce_kwargs is not None:
+        reduce_module = load_cake_nvfp4_mla_decode_module(module_name, "reduce")
+        reduce_entry = getattr(reduce_module, record["reduce"]["ffi_entry"])
+        reduce_arguments = arguments(reduce_kwargs, record["reduce"])
+    return NVFP4MLADecodeRunner(
+        module_name,
+        plan,
+        main_kwargs,
+        reduce_kwargs,
+        out,
+        lse,
+        return_lse,
+        main_entry,
+        main_arguments,
+        reduce_entry,
+        reduce_arguments,
     )
 
 
