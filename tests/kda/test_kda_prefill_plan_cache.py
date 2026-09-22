@@ -29,7 +29,7 @@ pytestmark = pytest.mark.skipif(
 HEAD_DIM = 128
 
 
-def _inputs(lengths, heads, *, seed, storage_extra=0):
+def _inputs(lengths, heads, *, seed, storage_extra=0, state_dtype=torch.float32):
     generator = torch.Generator(device="cuda")
     generator.manual_seed(seed)
     tokens = sum(lengths)
@@ -53,7 +53,7 @@ def _inputs(lengths, heads, *, seed, storage_extra=0):
         A_log=torch.zeros(heads, device="cuda"),
         dt_bias=torch.full((heads, HEAD_DIM), -2.0, device="cuda"),
         out=torch.empty(1, tokens, heads, HEAD_DIM, device="cuda", dtype=torch.bfloat16),
-        pool=randn(pool_slots, heads, HEAD_DIM, HEAD_DIM, dtype=torch.float32) * 0.1,
+        pool=randn(pool_slots, heads, HEAD_DIM, HEAD_DIM, dtype=state_dtype) * 0.1,
         state_indices=torch.arange(len(lengths), device="cuda", dtype=torch.int32) + 1,
         cu_seqlens=torch.tensor(offsets, device="cuda", dtype=torch.int64),
         checkpoint_cu_starts=torch.tensor(cp_offsets, device="cuda", dtype=torch.int64),
@@ -165,10 +165,11 @@ def test_cache_keys_on_sequence_lengths_and_interleaves_entries():
 
 
 def test_split_sequence_affine_route_is_pass_through():
-    # Without a checkpoint request a long unbounded sequence still takes the
-    # affine split route, whose multi-launch plan is not cached.
+    # A long unbounded sequence on a BF16 state pool without a checkpoint
+    # request still takes the affine split route, whose multi-launch plan is
+    # not cached.
     cache = KDAPrefillPlanCache(8)
-    d = _inputs([8192], 12, seed=5)
+    d = _inputs([8192], 12, seed=5, state_dtype=torch.bfloat16)
     pool = d["pool"].clone()
     call = _run(d, cache, checkpoints=False)
     assert "affine" in str(call.schedule)
@@ -179,20 +180,22 @@ def test_split_sequence_affine_route_is_pass_through():
     _assert_same(got, _snapshot(d))
 
 
-def test_checkpointed_long_unbounded_sequence_runs_sequentially_and_caches():
-    # A checkpoint request on an unbounded sequence pins the sequential fused
+@pytest.mark.parametrize("checkpoints", [True, False])
+def test_long_unbounded_sequence_on_fp32_state_runs_sequentially_and_caches(checkpoints):
+    # The FP32 external state pool is the serving contract: with or without a
+    # checkpoint request an unbounded sequence takes the sequential fused
     # direct M128 body (FP32 chunk carrier, no affine composition error), and
     # that single-launch plan is cacheable.
     cache = KDAPrefillPlanCache(8)
     d = _inputs([8192], 12, seed=5)
     pool = d["pool"].clone()
-    call = _run(d, cache)
+    call = _run(d, cache, checkpoints=checkpoints)
     schedule = str(call.schedule)
     assert "fused" in schedule and "affine" not in schedule
     assert cache.uncacheable == 0 and len(cache) == 1
     got = _snapshot(d)
     d["pool"].copy_(pool)
-    _run(d, cache)
+    _run(d, cache, checkpoints=checkpoints)
     assert cache.hits == 1
     _assert_same(got, _snapshot(d))
 

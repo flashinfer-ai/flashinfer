@@ -2065,7 +2065,14 @@ class FlashKDABlackwellBF16FusedLaunch:
             and state_checkpoints is not None
             and state_checkpoints.dtype == torch.float32
         )
-        force_direct_m128_n32 = self._force_direct_m128_n32 or fp32_checkpoint_request
+        # The FP32 chunk carrier also serves unbounded BF16-compute prefill on
+        # the FP32 external state pool without a checkpoint request: its final
+        # state resumes decode, and the BF16 carrier drifts to 0.02-0.05 rel L2
+        # on real 8K activations (Triton 0.002).
+        fp32_carrier_request = fp32_checkpoint_request or (
+            unbounded_softplus and self._state_dtype_is_fp32 and compute_dtype == "bf16"
+        )
+        force_direct_m128_n32 = self._force_direct_m128_n32 or fp32_carrier_request
         needs_direct_m128 = (
             unbounded_softplus
             or self._force_direct_m128
@@ -2889,6 +2896,14 @@ class FlashKDABlackwellBF16FusedLaunch:
                 "FP32 intermediate states are only carried by the fused direct M128 body; "
                 f"route {route!r} writes BF16 checkpoints"
             )
+        # FP32 chunk carrier: FP32 checkpoint rows, or unbounded BF16-compute
+        # prefill on the FP32 external state pool (see fp32_carrier_request).
+        fp32_carrier = fp32_checkpoints or (
+            unbounded_softplus
+            and self._state_dtype_is_fp32
+            and compute_dtype == "bf16"
+            and uses_default_fused_m128
+        )
         if backend != "cuda_cpp" and (
             compute_dtype == "tf32"
             or not (uses_default_fused_m128 or use_persistent_m128)
@@ -2979,10 +2994,10 @@ class FlashKDABlackwellBF16FusedLaunch:
             not (use_tf32_direct_m128 or use_tf32_owner_helper)
             and not use_independent_dvsplit
         ):
-            if fp32_checkpoints and use_direct_m128_n16:
+            if fp32_carrier and use_direct_m128_n16:
                 raise NotImplementedError(
-                    "FP32 intermediate states require the N32 direct M128 body; "
-                    "the N16 checkpoint-TMA body only writes BF16 rows"
+                    "the FP32 chunk carrier requires the N32 direct M128 body; "
+                    "the N16 checkpoint-TMA body only carries BF16 state"
                 )
             self.module = _build_kda_module(
                 partial(_factory, "compiled_bf16_fused_m128"),
@@ -2990,7 +3005,7 @@ class FlashKDABlackwellBF16FusedLaunch:
                 serving_native_abi=serving_native_abi,
                 gate_kind=gate_kind,
                 checkpoint_tma=bool(checkpoint_every_n_tokens and use_direct_m128_n16),
-                **({"checkpoint_dtype_is_fp32": True} if fp32_checkpoints else {}),
+                **({"checkpoint_dtype_is_fp32": True} if fp32_carrier else {}),
                 pair_packed_beta=use_pair_packed_beta,
                 scalar_beta=use_scalar_beta,
                 active_beta_f32=self._active_beta_f32,
@@ -3035,6 +3050,8 @@ class FlashKDABlackwellBF16FusedLaunch:
             )
             if fp32_checkpoints:
                 self.schedule += "_fp32_checkpoints"
+            elif fp32_carrier:
+                self.schedule += "_fp32_carrier"
         if use_tf32_owner_helper:
             n32_value_rows = (
                 64 if 2 * SMALL_BH_GROUP_SIZE * total_tasks <= sm_count else 128
@@ -4677,15 +4694,21 @@ def _supports_affine_split_launch(args, kwargs) -> bool:
         or checkpoint_every_n_tokens != 64
     ):
         return False
-    if argument(9, "lower_bound") is None and checkpoint_request:
-        # Checkpointed unbounded (softplus) prefill feeds the radix cache and
-        # is validated per chunk against Triton.  The split's per-part map and
-        # correction passes each add BF16 error proportional to the whole
-        # state, and slow unbounded gates do not damp it: on real 8K
-        # activations the checkpoints drift from 0.002 to 0.03 rel L2 across
-        # twelve composed parts (Triton flat at 0.003), independent of map
-        # storage precision.  The sequential direct M128 recurrence with the
-        # FP32 carrier stays at Triton level, so it owns this contract.
+    if argument(9, "lower_bound") is None and (
+        checkpoint_request or initial_state.dtype == torch.float32
+    ):
+        # Unbounded (softplus) prefill on the FP32 external state pool is the
+        # serving contract: its final state resumes decode and, when
+        # checkpointed, feeds the radix cache, and both are validated against
+        # Triton.  The split's per-part map and correction passes each add
+        # BF16 error proportional to the whole state, and slow unbounded gates
+        # do not damp it: on real 8K activations the state drifts from 0.002
+        # to 0.03 rel L2 across twelve composed parts (Triton flat at 0.003),
+        # independent of map storage precision.  The split's multi-launch plan
+        # is also rebuilt on every call (about 2.4 ms of host work at 8K),
+        # while the sequential direct M128 recurrence with the FP32 carrier
+        # stays at Triton level and its single-launch plan is cacheable, so it
+        # owns this contract.  BF16-state callers keep the split.
         return False
     lengths = _launch_sequence_lengths(q, cu_seqlens, argument(19, "sequence_lengths"))
     if not lengths or min(lengths) <= 0:
