@@ -665,6 +665,7 @@ class _BatchMLAPagedAttentionTrtllmGenBackend:
             skip_softmax_threshold_scale_factor,  # skip_softmax_threshold_scale_factor
             True,  # uses_shared_paged_kv_idx
             lse,  # lse
+            1.0,  # lse_scale: planned TRT-LLM LSE is base-2
             lse_stride_tokens,  # lse_stride_tokens
             lse_stride_heads,  # lse_stride_heads
             False,  # enable_block_sparse_attention

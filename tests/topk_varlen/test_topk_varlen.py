@@ -1317,7 +1317,7 @@ def test_backend_heuristic_priority():
         "radix",
         "radix_cutlass",
     ]
-    # hint-free fp32 (gvr_2 runs on its synthetic anchor): gvr_2 still first
+    # hint-free fp32 (gvr_2 runs its hint-free engines): gvr_2 still first
     # everywhere except the one measured loss — K >= 2048, N <= 4096, single
     # row — where radix_filter leads and gvr_2 follows; a real hint restores
     # gvr_2 to the front there.
@@ -1337,6 +1337,12 @@ def test_backend_heuristic_priority():
     assert order_k(all5, 1, 4096, 1024, False)[0] == "gvr_2"
     assert order_k(all5, 2, 4096, 2048, False)[0] == "gvr_2"
     assert order_k(all5, 1, 4096, 2048, False)[:2] == ["radix_filter", "gvr_2"]
+    # N <= top_k: every row is the identity answer; radix_filter emits it
+    # cheaper than gvr_2's short-path launch, with or without a hint
+    assert order_k(all5, 16, 2048, 2048, False)[:2] == ["radix_filter", "gvr_2"]
+    assert order_k(all5, 16, 2048, 2048, True)[:2] == ["radix_filter", "gvr_2"]
+    assert order_k(all5, 4, 1000, 1024, True)[:2] == ["radix_filter", "gvr_2"]
+    assert order_k(all5, 4, 1025, 1024, True)[0] == "gvr_2"
     assert order_k(all4, 1, 4096, 2048, False)[0] == "gvr_2"  # no radix_filter
     # (a meta pre_idx fails the CUDA-device check and counts as absent; a hint
     # on the logits device is exercised by the GPU tests)
@@ -1384,6 +1390,78 @@ def test_cross_backend_value_consistency():
         assert torch.allclose(vr, vg2, rtol=1e-4, atol=1e-4), (
             f"row={row}: radix vs gvr_2 value multisets differ"
         )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
+@pytest.mark.parametrize(
+    "backend", ["radix", "radix_cutlass", "radix_filter", "gvr", "gvr_2"]
+)
+def test_seq_len_below_next_n_all_backends(backend):
+    """seq_len < next_n - t makes ``seq_len - next_n + t + 1`` negative.
+
+    Padded / evicted requests reach every backend with such rows. Each must
+    treat them as empty (all -1) and stay inside its own row: a negative
+    length is neither an unsigned count (radix_cutlass) nor a write offset
+    before the row (radix / gvr identity epilogues). The caller buffer is
+    over-allocated and pre-filled with a sentinel so any write that lands
+    outside a row is detected, and full rows preceding the empty rows are
+    checked exactly so a write into a neighbour's tail is caught too.
+    """
+    if backend != "radix_cutlass" and not _IS_BLACKWELL:
+        pytest.skip(f"{backend} requires Blackwell (sm_100+) and nvidia-cutlass-dsl")
+    from flashinfer.utils import get_compute_capability
+
+    major, minor = get_compute_capability(torch.device("cuda"))
+    if not flashinfer.top_k_varlen.is_backend_supported(backend, major * 10 + minor):
+        pytest.skip(f"{backend} unsupported on this device")
+    top_k, N, next_n = 512, 8192, 3
+    # request seq_lens: three that make some numerators negative
+    # (0 -> -2,-1,0; 1 -> -1,0,1; 2 -> 0,1,2), one straddling top_k, two full.
+    # The zero-length request goes FIRST: an unclamped kernel writes row 0's
+    # `-1` padding from offset -2, i.e. into the guard row, where nothing
+    # overwrites it. Behind a full row the same stray writes land in that
+    # row's tail and are racily repaired by the full row's own kernel.
+    req_lens = [0, 1, 2, top_k + 2, N, N]
+    num_req = len(req_lens)
+    num_rows = num_req * next_n
+    torch.manual_seed(7)
+    logits = torch.randn(num_rows, N, dtype=torch.float32, device="cuda")
+    seq_lens = torch.tensor(req_lens, dtype=torch.int32, device="cuda")
+    pre_idx = torch.arange(top_k, dtype=torch.int32, device="cuda").repeat(num_req, 1)
+    sentinel = 0x7EADBEEF
+    # one guard row before and after the caller's buffer
+    arena = torch.full(
+        (num_rows + 2, top_k), sentinel, dtype=torch.int32, device="cuda"
+    )
+    out = arena[1 : num_rows + 1]
+    kwargs = {"backend": backend, "next_n": next_n, "out_indices": out}
+    if backend in ("gvr", "gvr_2"):
+        kwargs["pre_idx"] = pre_idx
+    idx, _ = flashinfer.top_k_varlen(logits, seq_lens, top_k, **kwargs)
+    torch.cuda.synchronize()
+    assert idx.data_ptr() == out.data_ptr()
+    assert (arena[0] == sentinel).all() and (arena[-1] == sentinel).all(), (
+        "write landed outside the caller's buffer"
+    )
+    arena_cpu = arena.cpu()
+    for r in range(num_rows):
+        length = max(0, req_lens[r // next_n] - next_n + (r % next_n) + 1)
+        row = arena_cpu[r + 1].tolist()
+        assert sentinel not in row, f"row={r}: slot never written"
+        valid = [i for i in row if i >= 0]
+        assert row.count(-1) == top_k - len(valid), f"row={r}: bad -1 padding"
+        if length <= top_k:
+            assert sorted(valid) == list(range(length)), (
+                f"row={r}: length={length} must select exactly [0,{length}); "
+                f"got {len(valid)} indices"
+            )
+        else:
+            assert len(valid) == top_k and max(valid) < length, (
+                f"row={r}: index past length={length}"
+            )
+            got = logits[r][torch.tensor(valid, device="cuda")].sort().values
+            ref = logits[r, :length].topk(top_k).values.sort().values
+            assert torch.equal(got, ref), f"row={r}: wrong top-k value set"
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
@@ -1449,7 +1527,7 @@ def test_malformed_hint_is_discarded_with_warning(kind):
     """A malformed ``pre_idx`` (wrong shape, dtype, device, layout or
     alignment) is dropped with a RuntimeWarning and the call runs hint-free
     and exact, under ``auto``, under an explicit hint-free backend, and under
-    ``gvr_2`` (which runs on its synthetic anchor). ``gvr`` cannot run
+    ``gvr_2`` (which runs its hint-free engines). ``gvr`` cannot run
     without a hint and refuses the call up front instead of failing inside
     the kernel."""
     from flashinfer.utils import BackendSupportedError
@@ -1480,10 +1558,12 @@ def test_malformed_hint_is_discarded_with_warning(kind):
     assert bool(((indices >= 0) & (indices < n)).all()), "index out of range"
     assert torch.equal(torch.sort(logits.gather(1, indices.long()), dim=1).values, ref)
     # gvr_2: the hint is dropped with the warning and the call runs exact on
-    # the host's synthetic anchor (checked and skip_check paths alike)
+    # the hint-free engines (checked and skip_check paths alike)
     if flashinfer.top_k_varlen.is_backend_supported("gvr_2", cc):
         for skip in (False, True):
-            with pytest.warns(RuntimeWarning, match="synthetic sampling anchor"):
+            with pytest.warns(
+                RuntimeWarning, match="falls back to its hint-free engines"
+            ):
                 indices, _ = flashinfer.top_k_varlen(
                     logits,
                     seq_lens,

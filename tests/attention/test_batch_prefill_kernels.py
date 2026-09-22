@@ -28,6 +28,23 @@ from tests.test_helpers.utils_fp4 import create_nvfp4_kv, nvfp4_to_float
 from flashinfer.utils import get_compute_capability, has_flashinfer_jit_cache
 
 
+def _reset_workspace_for_plan(wrapper, *plan_args, **plan_kwargs):
+    try:
+        float_size, int_size = wrapper.workspace_size(
+            *[t.to("cuda:0") if torch.is_tensor(t) else t for t in plan_args],
+            **plan_kwargs,
+        )
+    except NotImplementedError:
+        # Only the FA2 planner reports its size, and it is the only one that
+        # reserves split-KV partials. FA3 (auto on SM90) stores work indices
+        # alone, so the fixed workspace is enough for it.
+        return
+    wrapper.reset_workspace_buffer(
+        torch.empty(float_size, dtype=torch.uint8, device="cuda:0"),
+        torch.empty(int_size, dtype=torch.uint8, device="cuda:0"),
+    )
+
+
 def head_dim_512_supported() -> bool:
     # 16-bit FA2 head_dim > 256 uses the Ampere+ large-head path.
     return get_compute_capability(torch.device("cuda:0"))[0] >= 8
@@ -127,10 +144,6 @@ def test_batch_prefill_with_paged_kv_cache(
     return_lse,
     contiguous_kv,
 ):
-    if use_cuda_graph:
-        pytest.xfail(
-            "NOTE(Zihao): temporarily disable cuda graph until we fully fix the workspace buffer overflow issue for prefill + cudagraph"
-        )
     if qo_len > kv_len and causal:
         pytest.skip("qo_len > kv_len and causal is not supported")
     q = torch.randn(
@@ -227,6 +240,22 @@ def test_batch_prefill_with_paged_kv_cache(
             paged_kv_indptr_buf=kv_indptr_buffer,
             paged_kv_indices_buf=kv_indices_buffer,
             paged_kv_last_page_len_buf=kv_last_page_len_buffer,
+        )
+        # Graph buffers must not move between capture and replay, so reserve what
+        # the final plan needs up front instead of a fixed-size workspace.
+        _reset_workspace_for_plan(
+            wrapper,
+            q_indptr_cpu,
+            kv_indptr_cpu,
+            kv_indices_cpu,
+            kv_last_page_len_cpu,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            causal=causal,
+            pos_encoding_mode=pos_encoding_mode,
+            logits_soft_cap=logits_soft_cap,
         )
         q_indptr_warmup = torch.arange(0, batch_size + 1).int() * qo_len
         kv_indptr_warmup = torch.arange(0, batch_size + 1).int()
@@ -638,10 +667,6 @@ def test_batch_prefill_with_tuple_paged_kv_cache(
     return_lse,
     contiguous_kv,
 ):
-    if use_cuda_graph:
-        pytest.xfail(
-            "NOTE(Zihao): temporarily disable cuda graph until we fully fix the workspace buffer overflow issue for prefill + cudagraph"
-        )
     if qo_len > kv_len and causal:
         pytest.skip("qo_len > kv_len and causal is not supported")
     q = torch.randn(
@@ -737,6 +762,22 @@ def test_batch_prefill_with_tuple_paged_kv_cache(
             paged_kv_indptr_buf=kv_indptr_buffer,
             paged_kv_indices_buf=kv_indices_buffer,
             paged_kv_last_page_len_buf=kv_last_page_len_buffer,
+        )
+        # Graph buffers must not move between capture and replay, so reserve what
+        # the final plan needs up front instead of a fixed-size workspace.
+        _reset_workspace_for_plan(
+            wrapper,
+            q_indptr_cpu,
+            kv_indptr_cpu,
+            kv_indices_cpu,
+            kv_last_page_len_cpu,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            causal=causal,
+            pos_encoding_mode=pos_encoding_mode,
+            logits_soft_cap=logits_soft_cap,
         )
         q_indptr_warmup = torch.arange(0, batch_size + 1).int() * qo_len
         kv_indptr_warmup = torch.arange(0, batch_size + 1).int()
@@ -2759,3 +2800,121 @@ def test_paged_prefill_split_kv_preserves_fp32_partials():
     split_mismatches = torch.count_nonzero(output != rounded_reference).item()
     whole_mismatches = torch.count_nonzero(whole_output != rounded_reference).item()
     assert split_mismatches <= whole_mismatches + reference.numel() // 100
+
+@pytest.mark.parametrize("kv_cache", ["paged", "ragged"])
+def test_batch_prefill_cuda_graph_padding_without_split_kv(kv_cache):
+    """Under CUDA graphs the prefill kernels are launched over padded_batch_size
+    CTAs; the plan writes request / tile indices only for the real ones, and the
+    padding CTAs must be masked off whether or not the batch is split. The pinned
+    int workspace is poisoned before the plan so that an unmasked padding CTA
+    would read an absurd request index."""
+    page_size, batch_size, qo_len = 16, 4, 4
+    num_qo_heads, num_kv_heads, head_dim = 8, 2, 128
+    kv_lens = [64, 65, 127, 128]
+    paged = kv_cache == "paged"
+
+    q = torch.randn(
+        batch_size * qo_len,
+        num_qo_heads,
+        head_dim,
+        dtype=torch.float16,
+        device="cuda:0",
+    )
+    qo_indptr = torch.arange(0, batch_size + 1).int() * qo_len
+
+    if paged:
+        pages = [(kv_len + page_size - 1) // page_size for kv_len in kv_lens]
+        kv_indptr = torch.tensor([0] + pages).int().cumsum(0).int()
+        kv_indices = torch.arange(0, sum(pages)).int()
+        kv_last_page_len = torch.tensor(
+            [(kv_len - 1) % page_size + 1 for kv_len in kv_lens]
+        ).int()
+        kv_data = torch.randn(
+            sum(pages),
+            2,
+            page_size,
+            num_kv_heads,
+            head_dim,
+            dtype=torch.float16,
+            device="cuda:0",
+        )
+        graph_bufs = {
+            "qo_indptr_buf": qo_indptr.to(0),
+            "paged_kv_indptr_buf": kv_indptr.to(0),
+            "paged_kv_indices_buf": kv_indices.to(0),
+            "paged_kv_last_page_len_buf": kv_last_page_len.to(0),
+        }
+        plan_args = (
+            kv_indptr.to(0),
+            kv_indices.to(0),
+            kv_last_page_len.to(0),
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+        )
+        run_args = (kv_data,)
+        cls = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper
+    else:
+        kv_indptr = torch.tensor([0] + kv_lens).int().cumsum(0).int()
+        k = torch.randn(
+            sum(kv_lens),
+            num_kv_heads,
+            head_dim,
+            dtype=torch.float16,
+            device="cuda:0",
+        )
+        v = torch.randn_like(k)
+        graph_bufs = {
+            "qo_indptr_buf": qo_indptr.to(0),
+            "kv_indptr_buf": kv_indptr.to(0),
+        }
+        plan_args = (kv_indptr.to(0), num_qo_heads, num_kv_heads, head_dim)
+        run_args = (k, v)
+        cls = flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper
+
+    def plan(wrapper):
+        wrapper.plan(
+            qo_indptr.to(0),
+            *plan_args,
+            causal=True,
+            disable_split_kv=True,
+            q_data_type=torch.float16,
+            kv_data_type=torch.float16,
+        )
+
+    def workspace():
+        return torch.empty(128 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
+
+    ref_wrapper = cls(workspace(), "NHD", backend="fa2")
+    plan(ref_wrapper)
+    o_ref = ref_wrapper.run(q, *run_args)
+
+    wrapper = cls(workspace(), "NHD", backend="fa2", use_cuda_graph=True, **graph_bufs)
+    wrapper._pin_memory_int_workspace_buffer.fill_(0x7F)
+    plan(wrapper)
+
+    # padded_batch_size is derived from the device's SM count, so whether a plan pads
+    # at all depends on the GPU. Say so rather than passing vacuously where it doesn't.
+    # Fields are positional, in PrefillPlanInfo::ToVector order (scheduler.cuh).
+    info = wrapper._plan_info
+    padded_batch_size = info[0]
+    block_valid_mask_offset = info[12]
+    enable_cuda_graph, split_kv = info[13], info[14]
+    # The unsplit path is the one under test; a split plan masks its padding already.
+    assert enable_cuda_graph and not split_kv
+    mask = wrapper._int_workspace_buffer[
+        block_valid_mask_offset : block_valid_mask_offset + padded_batch_size
+    ].bool()
+    # The plan without CUDA graphs has no padding: its batch is the real CTA count.
+    num_real = ref_wrapper._plan_info[0]
+    if padded_batch_size == num_real:
+        pytest.skip(
+            f"plan did not pad on this device (padded_batch_size={padded_batch_size})"
+        )
+    # Check the mask itself, so a plan that leaves it unwritten fails instead of skipping.
+    expected_mask = torch.arange(padded_batch_size, device="cuda:0") < num_real
+    torch.testing.assert_close(mask, expected_mask)
+
+    o = wrapper.run(q, *run_args)
+    torch.testing.assert_close(o, o_ref, rtol=1e-3, atol=1e-3)

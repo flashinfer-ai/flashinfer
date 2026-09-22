@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any, Optional
 
 import torch
@@ -116,5 +117,6 @@ class _BatchMLAPagedAttentionCuteDslMonolithicBackend(
             self._execution_state.Int32(0),
             launch_args[10],
             *launch_args[11:],
+            self._execution_state.Float32(math.log(2.0)),  # planned LSE is base-e
         )
         self._execution_state.compiled_kernel(*monolithic_launch_args)

@@ -38,9 +38,9 @@ flashinfer/moe_ep/             @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzhe
 tests/moe_ep/                  @aleozlx @yzh119 @jiahanc @IwakuraRein @nv-yunzheq @samuellees @Anerudhan @feih-nv @Aneureka @Jingfan-Sun @YangXu1990uiuc @bkryu
 
 # ── Communication ──
-flashinfer/comm/               @aleozlx @yzh119 @jimmyzho @bkryu @nv-yunzheq @Anerudhan @Jingfan-Sun @YangXu1990uiuc
-include/flashinfer/comm/       @aleozlx @yzh119 @jimmyzho @bkryu @nv-yunzheq @Anerudhan @Jingfan-Sun @YangXu1990uiuc
-tests/comm/                    @aleozlx @yzh119 @jimmyzho @bkryu @nv-yunzheq @Anerudhan @Jingfan-Sun @YangXu1990uiuc
+flashinfer/comm/               @aleozlx @yzh119 @jimmyzho @bkryu @nv-yunzheq @Anerudhan @feih-nv @Aneureka @Jingfan-Sun @YangXu1990uiuc
+include/flashinfer/comm/       @aleozlx @yzh119 @jimmyzho @bkryu @nv-yunzheq @Anerudhan @feih-nv @Aneureka @Jingfan-Sun @YangXu1990uiuc
+tests/comm/                    @aleozlx @yzh119 @jimmyzho @bkryu @nv-yunzheq @Anerudhan @feih-nv @Aneureka @Jingfan-Sun @YangXu1990uiuc
 
 # ── Norm ──
 flashinfer/norm.py             @kahyunnam @yzh119 @bkryu @yongwww @aleozlx @Jingfan-Sun @YangXu1990uiuc

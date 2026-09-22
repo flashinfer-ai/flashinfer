@@ -61,6 +61,9 @@ cp -a "${SOURCE_WORKSPACE}/pytest.ini" "${TEST_RUN_DIR}/"
 # Run test shard
 echo "Running test shard ${TEST_SHARD}..."
 export SKIP_INSTALL=1
+# Converted parameter matrices select representative cases by default. Nightly
+# package validation exercises their complete Cartesian products.
+export PYTEST_ADDOPTS="${PYTEST_ADDOPTS:+${PYTEST_ADDOPTS} }--full"
 
 # Pass through JIT cache report file if set
 if [ -n "${FLASHINFER_JIT_CACHE_REPORT_FILE}" ]; then

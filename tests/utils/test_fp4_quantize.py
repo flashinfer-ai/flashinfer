@@ -1183,7 +1183,21 @@ def test_nvfp4_quantize_cute_dsl_device_scale_cuda_graph(device: str) -> None:
     torch.testing.assert_close(scale_graph, scale_ref, rtol=0, atol=0)
 
 
-NVFP4_FP8_SHAPES = [(128, 64), (256, 128), (512, 256), (128, 1024)]
+# FP8 input pairs two SF blocks per thread when K/16 is even; the extra shapes
+# cover the unpaired odd-block path (K=80), pairing with padded scale columns
+# (K=96), the linear-layout tail predicate (odd total block count), the
+# column-loop path with padding (K=8224), and tiny M.
+NVFP4_FP8_SHAPES = [
+    (128, 64),
+    (256, 128),
+    (512, 256),
+    (128, 1024),
+    (37, 48),
+    (64, 80),
+    (100, 96),
+    (3, 1040),
+    (129, 8224),
+]
 
 
 @pytest.mark.parametrize("shape", NVFP4_FP8_SHAPES)
@@ -1347,8 +1361,8 @@ def test_nvfp4_quantize_tma_backend_parity(
     if not _is_cute_dsl_available():
         pytest.skip("CuTe-DSL not available")
 
-    # TMA is disabled by default (flashinfer#3905); force it on so this test
-    # still exercises the CuTe-DSL TMA kernel.
+    # TMA is opt-in outside SM107's large FP16/BF16 regime; force it on so this
+    # test also exercises it on other architectures and input dtypes.
     monkeypatch.setenv("FLASHINFER_NVFP4_QUANTIZE_USE_TMA", "1")
 
     torch.set_default_device(device)

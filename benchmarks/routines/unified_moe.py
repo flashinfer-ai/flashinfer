@@ -501,6 +501,21 @@ def run_unified_moe_test(args):
         backend_config = config_type()
         config = _config_for_backend(args, activation, backend_config)
         try:
+            backend_activations = activations
+            if config_type is CutlassNvfp4Config:
+                # CUTLASS NVFP4 consumes the TRT-LLM canonical pre-quantized
+                # pack; b12x / cuTile NVFP4 quantize BF16 in-kernel. Inside the
+                # guard so an unaligned hidden_size skips this backend like any
+                # other unsupported configuration.
+                x_q, x_sf = CutlassNvfp4Config.prepare_activations(
+                    activations.hidden_states_q
+                )
+                backend_activations = MoEActivationPack(
+                    hidden_states_q=x_q,
+                    hidden_states_scale=x_sf,
+                    topk_ids=activations.topk_ids,
+                    topk_weights=activations.topk_weights,
+                )
             layer = MoELayer(config, device=device)
             runner = layer.runners[0]
             view = _prepare_weight_view(
@@ -515,7 +530,7 @@ def run_unified_moe_test(args):
             )
             weights = MoEWeightPack()
             weights.prepare_for(runner.backend_key, view)
-            inputs = runner.pack_inputs(activations, weights)
+            inputs = runner.pack_inputs(backend_activations, weights)
             # Like mm_fp4, execute the fallback once to reject configurations
             # that pass the coarse architecture check but fail at runtime.
             runner.forward(inputs, tactic=-1, do_preparation=True)
@@ -569,7 +584,9 @@ def run_unified_moe_test(args):
             median_time,
             torch.bfloat16,
             weight_dtype,
-            input_format=None,
+            # CUTLASS NVFP4 reads a pre-quantized FP4 + E4M3-scale pack; the
+            # other NVFP4 backends read BF16 and quantize in-kernel.
+            input_format="nvfp4" if config_type is CutlassNvfp4Config else None,
             weight_format=weight_format,
             routing_logits_dtype=None,
             active_experts=active_experts,

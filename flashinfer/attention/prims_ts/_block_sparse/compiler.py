@@ -21,6 +21,7 @@ import torch
 
 from flashinfer.utils import ceil_div
 
+from .common import _num_sparse_pattern_heads
 from .config import _BlockSparseCompileKey, _make_block_sparse_config
 
 
@@ -44,9 +45,12 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
     )
 
     config = _make_block_sparse_config(key)
+    pattern_heads = _num_sparse_pattern_heads(
+        key.num_kv_heads, key.share_pattern_across_kv_heads
+    )
     prepare_kwargs = {
         "batch_size": key.batch_size,
-        "num_kv_heads": key.num_kv_heads,
+        "num_kv_heads": pattern_heads,
         "seq_len_q": key.seq_len_q,
         "seq_len_kv": key.seq_len_kv,
         "q_block_size": key.q_block_size,
@@ -384,7 +388,7 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
     num_kv_blocks = ceil_div(key.seq_len_kv, key.kv_block_size)
     indptr_fake = fake_compact(
         Int32,
-        (key.batch_size, key.num_kv_heads, num_q_blocks + 1),
+        (key.batch_size, pattern_heads, num_q_blocks + 1),
         4,
     )
     indices_fake = fake_compact(Int32, (logical_nnz,), 4)
@@ -395,7 +399,7 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
     )
     row_route_offsets_fake = fake_compact(
         Int32,
-        (key.batch_size * key.num_kv_heads * num_q_blocks + 1,),
+        (key.batch_size * pattern_heads * num_q_blocks + 1,),
         4,
     )
     route_workspace_fake = fake_compact(
@@ -415,13 +419,13 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
             key.num_kv_heads,
             key.head_dim,
         )
-        k_fake = fake_compact(config.kv_dtype, kv_shape, 16)
-        v_fake = fake_compact(config.kv_dtype, kv_shape, 16)
+        k_fake = fake_compact(config.k_dtype, kv_shape, 16)
+        v_fake = fake_compact(config.v_dtype, kv_shape, 16)
         exact_bits_fake = fake_compact(
             cutlass.Uint32,
             (
                 key.batch_size,
-                key.num_kv_heads,
+                pattern_heads,
                 num_q_blocks,
                 ceil_div(num_kv_blocks, 32),
             ),
@@ -462,8 +466,8 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
                 key.num_kv_heads,
                 key.head_dim,
             )
-            k_summary_fake = fake_compact(config.kv_dtype, summary_shape, 16)
-            v_summary_fake = fake_compact(config.kv_dtype, summary_shape, 16)
+            k_summary_fake = fake_compact(config.k_dtype, summary_shape, 16)
+            v_summary_fake = fake_compact(config.v_dtype, summary_shape, 16)
             proxy_prefix = (
                 q_fake,
                 k_fake,
@@ -486,8 +490,8 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
                 key.num_kv_heads,
                 key.head_dim,
             )
-            k_summary_fake = fake_compact(config.kv_dtype, summary_shape, 16)
-            v_summary_fake = fake_compact(config.kv_dtype, summary_shape, 16)
+            k_summary_fake = fake_compact(config.k_dtype, summary_shape, 16)
+            v_summary_fake = fake_compact(config.v_dtype, summary_shape, 16)
             tensor_adapter = proxy_bitmask_adapter
             dynamic_args = (
                 q_fake,
@@ -516,7 +520,7 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
             key.head_dim,
         )
         k_fake = cute.runtime.make_fake_tensor(
-            config.kv_dtype,
+            config.k_dtype,
             kv_shape,
             stride=(
                 k_outer_stride,
@@ -527,7 +531,7 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
             assumed_align=16,
         )
         v_fake = cute.runtime.make_fake_tensor(
-            config.kv_dtype,
+            config.v_dtype,
             kv_shape,
             stride=(
                 v_outer_stride,

@@ -88,7 +88,7 @@ Fold these into a committed upstream state on the next re-sync.
 
 ## Related trees
 
-- `kernel_src/cutedsl_megamoe/` is the mother-repo snapshot (SM100 NVFP4 +
+- `kernel_src/sm100/cutedsl_megamoe/` is the mother-repo snapshot (SM100 NVFP4 +
   MXFP8 kernels). This tree is a **separate snapshot** of a fork carrying the
   SM120 MXFP8 swap-AB kernel; it is not merged into the mother tree on
   purpose: one kernel_src dir = one upstream commit. If upstream merges the

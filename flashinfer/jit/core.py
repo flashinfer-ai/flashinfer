@@ -803,4 +803,14 @@ def build_jit_specs(
     with FileLock(tmpdir / "flashinfer_jit.lock", thread_local=False):
         ninja_path = tmpdir / "flashinfer_jit.ninja"
         write_if_different(ninja_path, "\n".join(lines))
-        run_ninja(jit_env.FLASHINFER_JIT_DIR, ninja_path, verbose)
+        prebuild_max_jobs = os.environ.get("FLASHINFER_JIT_PREBUILD_MAX_JOBS")
+        run_ninja(
+            jit_env.FLASHINFER_JIT_DIR,
+            ninja_path,
+            verbose,
+            max_jobs=(
+                int(prebuild_max_jobs)
+                if prebuild_max_jobs is not None and prebuild_max_jobs.isdigit()
+                else None
+            ),
+        )

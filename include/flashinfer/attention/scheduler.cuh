@@ -862,27 +862,61 @@ inline cudaError_t PrefillPlanImpl(
     if constexpr (MATERIALIZE) {
       float_allocator = AlignedAllocator(float_buffer, float_workspace_size_in_bytes);
     }
+    // tmp_v/tmp_s hold one partial output per (query row, kv chunk). The kernel
+    // addresses them at o_indptr[request] + qo_idx * num_kv_chunks + kv_tile_idx,
+    // so the row count is sum_i qo_len_i * num_chunks_i.
+    //
+    // cta_tile_q counts *packed* (row, head) indices, so one CTA spans
+    // cta_tile_q / gqa_group_size query rows rather than cta_tile_q of them.
+    // Sizing the buffers by padded_batch_size * cta_tile_q therefore
+    // over-allocates by the GQA group size.
+    //
+    // The bound below is tight. qo_len_i * gqa_group_size <= num_tiles_q_i *
+    // cta_tile_q by construction, so the row count is at most cta_tile_q /
+    // gqa_group_size times sum_i num_tiles_q_i * num_chunks_i, and that sum is
+    // new_batch_size, which PrefillSplitQOKVIndptr bounds by padded_batch_size.
+    // It is built from the same plan-time constants as the old expression, so
+    // it is exactly as stable across CUDA-graph replans.
+    const uint32_t gqa_group_size = num_qo_heads / num_kv_heads;
+    const size_t max_partial_rows =
+        ceil_div(static_cast<size_t>(padded_batch_size) * cta_tile_q, gqa_group_size);
+    // plan() runs before every launch, replays included, so this covers each
+    // batch the buffers are actually used for.
+    if (!o_indptr_vec.empty()) {
+      const size_t partial_rows = static_cast<size_t>(o_indptr_vec.back());
+      FLASHINFER_CHECK(partial_rows <= max_partial_rows, "batch_prefill partial outputs need",
+                       partial_rows, "rows but the plan reserved", max_partial_rows);
+    }
     plan_info.v_offset = float_allocator.aligned_alloc_offset(
-        num_qo_heads * padded_batch_size * cta_tile_q * head_dim_vo * sizeof(float), 16,
-        "batch_prefill_tmp_v");
+        num_qo_heads * max_partial_rows * head_dim_vo * sizeof(float), 16, "batch_prefill_tmp_v");
     plan_info.s_offset = float_allocator.aligned_alloc_offset(
-        num_qo_heads * padded_batch_size * cta_tile_q * sizeof(float), 16, "batch_prefill_tmp_s");
+        num_qo_heads * max_partial_rows * sizeof(float), 16, "batch_prefill_tmp_s");
     plan_info.merge_indptr_offset = int_allocator.aligned_alloc_offset(
         sizeof(IdType) * (plan_info.total_num_rows + 1), 16, "batch_prefill_merge_indptr");
-    plan_info.block_valid_mask_offset = int_allocator.aligned_alloc_offset(
-        sizeof(bool) * padded_batch_size, 16, "batch_prefill_block_valid_mask");
 
     if constexpr (MATERIALIZE) {
       IdType* merge_indptr_h =
           GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.merge_indptr_offset);
+      std::copy(merge_indptr_vec.begin(), merge_indptr_vec.end(), merge_indptr_h);
+    } else {
+      (void)merge_indptr_vec;
+    }
+  }
+
+  // Under CUDA graphs the kernel is launched over padded_batch_size CTAs whatever the
+  // batch turned out to be, and the plan only writes request/tile indices for the
+  // new_batch_size real ones; the mask is what keeps the padding CTAs from reading
+  // whatever the workspace held. It must therefore exist whenever there is padding,
+  // not only when the batch is split.
+  if (enable_cuda_graph) {
+    plan_info.block_valid_mask_offset = int_allocator.aligned_alloc_offset(
+        sizeof(bool) * padded_batch_size, 16, "batch_prefill_block_valid_mask");
+    if constexpr (MATERIALIZE) {
       bool* block_valid_mask_h =
           GetPtrFromBaseOffset<bool>(page_locked_int_buffer, plan_info.block_valid_mask_offset);
-      std::copy(merge_indptr_vec.begin(), merge_indptr_vec.end(), merge_indptr_h);
       for (uint32_t i = 0; i < padded_batch_size; ++i) {
         block_valid_mask_h[i] = i < new_batch_size;
       }
-    } else {
-      (void)merge_indptr_vec;
     }
   }
 

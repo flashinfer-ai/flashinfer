@@ -386,7 +386,12 @@ def _get_num_workers() -> Optional[int]:
     return None
 
 
-def run_ninja(workdir: Path, ninja_file: Path, verbose: bool) -> None:
+def run_ninja(
+    workdir: Path,
+    ninja_file: Path,
+    verbose: bool,
+    max_jobs: Optional[int] = None,
+) -> None:
     workdir.mkdir(parents=True, exist_ok=True)
     command = [
         "ninja",
@@ -396,7 +401,7 @@ def run_ninja(workdir: Path, ninja_file: Path, verbose: bool) -> None:
         "-f",
         str(ninja_file.resolve()),
     ]
-    num_workers = _get_num_workers()
+    num_workers = max_jobs if max_jobs is not None else _get_num_workers()
     if num_workers is not None:
         command += ["-j", str(num_workers)]
 

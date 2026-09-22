@@ -22,11 +22,11 @@ CakeFmhaTarget = Literal["sm100a", "sm103a"]
 CakeFmhaContextExactProfile = Literal["q511", "q257"]
 
 CAKE_FMHA_MANIFEST_SHA256 = (
-    "a19cf3b7f929dc8a8a93581883e1383305223701beeaf753ef19bb2e3027acfa"
+    "0e92fadf80f4d03b1c7bb2f704e548bce91b35d1a7e671888670e9a303810bd1"
 )
 CAKE_FMHA_FLASHINFER_MATRIX_REVISION = "5b8da12050f80a5b5cb2bab9e87d9635a8872e5b"
 CAKE_FMHA_FLASHINFER_BINDINGS_SHA256 = (
-    "e74a47a3c0023fa72ddda40b8c7634bc3bb8303170d54c7ca351f76bfdacafcd"
+    "cd7ddb53da6b746e72f0ee9012fcfa36a5a25a3d92afdae32006ab284e7d6bf8"
 )
 
 _FLASHINFER_BINDINGS = (
@@ -35,6 +35,7 @@ _FLASHINFER_BINDINGS = (
     "jit/cake_fmha_context_fp8_jit_binding.cu",
     "jit/cake_fmha_context_hd256_jit_binding.cu",
     "jit/cake_fmha_decode_native_bf16_jit_binding.cu",
+    "jit/cake_fmha_decode_native_bf16_hd256_smallm_jit_binding.cu",
     "jit/cake_fmha_decode_native_fp16_hd512_jit_binding.cu",
     "jit/cake_fmha_decode_native_fp16_nhd_jit_binding.cu",
     "jit/cake_fmha_decode_quant_bf16q_jit_binding.cu",
@@ -50,6 +51,12 @@ _TARGET_FLAGS = {
 }
 _TARGET_MANIFEST_ARCH = {"sm100a": "sm_100a", "sm103a": "sm_103a"}
 _DECODE_NATIVE_BF16_JIT_BINDING = "jit/cake_fmha_decode_native_bf16_jit_binding.cu"
+_DECODE_NATIVE_BF16_HD256_SMALLM_JIT_BINDING = (
+    "jit/cake_fmha_decode_native_bf16_hd256_smallm_jit_binding.cu"
+)
+CAKE_FMHA_SMALLM_ROWS = (32, 64)
+CAKE_FMHA_SMALLM_PAGE_SIZES = (16, 32, 64)
+CAKE_FMHA_SMALLM_MAX_NUM_SPLIT = 256
 _DECODE_NATIVE_FP16_HD512_JIT_BINDING = (
     "jit/cake_fmha_decode_native_fp16_hd512_jit_binding.cu"
 )
@@ -1384,6 +1391,112 @@ def get_cake_fmha_decode_native_fp16_hd512_uri(
 
 
 @functools.cache
+def cake_fmha_smallm_component_name(n_rows: int, page_size: int) -> str:
+    """Manifest component of one small-M hd256 structural instance."""
+
+    if n_rows not in CAKE_FMHA_SMALLM_ROWS:
+        raise ValueError(f"small-M hd256 decode packs 32 or 64 rows, got {n_rows}")
+    if page_size not in CAKE_FMHA_SMALLM_PAGE_SIZES:
+        raise ValueError(
+            f"small-M hd256 decode supports page sizes 16/32/64, got {page_size}"
+        )
+    return f"decode_native_bf16_hd256_smallm_n{n_rows}_p{page_size}"
+
+
+def _validate_smallm_specialization(
+    target: CakeFmhaTarget,
+    n_rows: int,
+    page_size: int,
+    q_len: int,
+    group: int,
+    num_split: int,
+) -> str:
+    if target not in _TARGET_FLAGS:
+        raise ValueError(f"unsupported Cake FMHA target: {target}")
+    component = cake_fmha_smallm_component_name(n_rows, page_size)
+    if q_len <= 0 or group <= 0 or not (n_rows // 2 < q_len * group <= n_rows):
+        raise ValueError(
+            "small-M hd256 decode packs q_len * group rows into the smallest 32/64-row tile"
+        )
+    if n_rows % group:
+        raise ValueError(
+            "small-M hd256 decode requires the GQA group to divide the tile rows"
+        )
+    if not 1 <= num_split <= CAKE_FMHA_SMALLM_MAX_NUM_SPLIT:
+        raise ValueError("small-M hd256 decode NUM_SPLIT must be in [1, 256]")
+    return component
+
+
+def get_cake_fmha_decode_native_bf16_hd256_smallm_uri(
+    target: CakeFmhaTarget,
+    n_rows: int,
+    page_size: int,
+    q_len: int,
+    group: int,
+    num_split: int,
+) -> str:
+    component = _validate_smallm_specialization(
+        target, n_rows, page_size, q_len, group, num_split
+    )
+    return f"cake_fmha_{component}_{target}_q{q_len}_g{group}_s{num_split}"
+
+
+def gen_cake_fmha_decode_native_bf16_hd256_smallm_module(
+    target: CakeFmhaTarget,
+    n_rows: int,
+    page_size: int,
+    q_len: int,
+    group: int,
+    num_split: int,
+) -> JitSpec:
+    """Build one small-M BF16 head-dim-256 speculative decode specialization."""
+
+    component = _validate_smallm_specialization(
+        target, n_rows, page_size, q_len, group, num_split
+    )
+    manifest_component = get_cake_fmha_manifest()["components"][component]
+    sources = _get_component_sources(
+        component,
+        target,
+        {},
+        _DECODE_NATIVE_BF16_HD256_SMALLM_JIT_BINDING,
+    )
+    spec = gen_jit_spec(
+        name=get_cake_fmha_decode_native_bf16_hd256_smallm_uri(
+            target, n_rows, page_size, q_len, group, num_split
+        ),
+        sources=list(sources),
+        extra_cuda_cflags=[
+            *_TARGET_FLAGS[target],
+            "-use_fast_math",
+            f"-DQ_LEN={q_len}",
+            f"-DGROUP={group}",
+            f"-DQ_BOX_ROWS={n_rows // group}",
+            f"-DNUM_SPLIT={num_split}",
+            f"-DCAKE_FMHA_SMALLM_N_ROWS={n_rows}",
+            f"-DCAKE_FMHA_SMALLM_PAGE_SIZE={page_size}",
+            f"-DCAKE_FMHA_SMALLM_LAUNCH={manifest_component['launch_binding']}",
+        ],
+        extra_include_paths=[get_cake_fmha_csrc_dir(), jit_env.FLASHINFER_CSRC_DIR],
+    )
+    logger.info("Generated Cake FMHA small-M hd256 decode JIT spec: %s", spec.name)
+    return spec
+
+
+@functools.cache
+def load_cake_fmha_decode_native_bf16_hd256_smallm_module(
+    target: CakeFmhaTarget,
+    n_rows: int,
+    page_size: int,
+    q_len: int,
+    group: int,
+    num_split: int,
+):
+    return gen_cake_fmha_decode_native_bf16_hd256_smallm_module(
+        target, n_rows, page_size, q_len, group, num_split
+    ).build_and_load()
+
+
 def gen_cake_fmha_decode_native_fp16_hd512_module(
     target: CakeFmhaTarget,
     batch_size: int,

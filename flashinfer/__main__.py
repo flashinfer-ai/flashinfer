@@ -16,9 +16,11 @@ limitations under the License.
 
 import copy
 from email.parser import BytesParser
+from importlib.util import find_spec
 import os
 from pathlib import Path
 import re
+from shutil import which
 import subprocess
 import sys
 import tempfile
@@ -321,6 +323,21 @@ def _build_jit_cache_index_url(cuda_index_label: str, nightly: bool) -> str:
     return f"{base_url}/{cuda_index_label}"
 
 
+def _get_pip_install_cmd() -> list[str]:
+    uv = which("uv")
+    if uv is not None:
+        try:
+            config = (Path(sys.prefix) / "pyvenv.cfg").read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            config = ""
+        created_by_uv = any(
+            line.partition("=")[0].strip() == "uv" for line in config.splitlines()
+        )
+        if created_by_uv or find_spec("pip") is None:
+            return [uv, "pip", "install", "--python", sys.executable]
+    return [sys.executable, "-m", "pip", "install"]
+
+
 def _build_pip_install_cmd(
     requirements: str | list[str],
     index_url: str,
@@ -329,13 +346,7 @@ def _build_pip_install_cmd(
 ) -> list[str]:
     if isinstance(requirements, str):
         requirements = [requirements]
-    cmd = [
-        sys.executable,
-        "-m",
-        "pip",
-        "install",
-        "--upgrade",
-    ]
+    cmd = [*_get_pip_install_cmd(), "--upgrade"]
     if no_deps:
         cmd.append("--no-deps")
     if nightly:

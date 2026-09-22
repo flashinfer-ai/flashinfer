@@ -112,7 +112,7 @@ def _empty_batch():
 def _allocate_reference_workspace(
     problem: dict, capacity: int, rank: int, world_size: int
 ):
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
         get_symm_buffer_for_mega_moe,
     )
 
@@ -139,7 +139,7 @@ def _reference_forward(t, workspace, transformed_weights, problem: dict):
     from flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl import (
         staging,
     )
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import nvfp4_mega_moe
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import nvfp4_mega_moe
 
     # Allocate the owned output before staging.  Nothing that can allocate or
     # synchronize is inserted between the staged collective round and compute.

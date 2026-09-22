@@ -13,8 +13,14 @@
 # limitations under the License.
 
 import dataclasses
+import os
+import subprocess
+import sys
+import textwrap
 import importlib
+import inspect
 import math
+import typing
 from types import SimpleNamespace
 
 import pytest
@@ -22,11 +28,19 @@ import torch
 import torch.nn.functional as F
 from packaging.version import Version
 
+from flashinfer import recurrent_kda as public_recurrent_kda
 from flashinfer.kda_decode import recurrent_kda
 
 kda_decode_module = importlib.import_module("flashinfer.kda_decode")
 recurrent_module = importlib.import_module("flashinfer.kda_kernels.recurrent_kda")
 cake_decode_jit_module = importlib.import_module("flashinfer.jit.cake_kda_decode")
+
+# This file is the deprecated facade's regression suite, so its own deprecation
+# is expected rather than a finding. Matched by message so unrelated
+# DeprecationWarnings still surface.
+pytestmark = pytest.mark.filterwarnings(
+    "ignore:flashinfer.kda_decode.recurrent_kda is deprecated:DeprecationWarning"
+)
 
 _D = 128
 _T = 5
@@ -283,6 +297,108 @@ def test_public_backend_option_rejects_unknown_value_cpu(monkeypatch):
     tensors = [object() for _ in range(5)]
     with pytest.raises(ValueError, match="backend must be"):
         recurrent_kda(*tensors, backend="unknown")
+
+
+def test_decode_facade_deprecation_points_at_the_canonical_entry_point_cpu(
+    monkeypatch,
+):
+    """The shim warns, and blames the caller's line rather than its own."""
+    monkeypatch.setattr(
+        kda_decode_module, "_run_recurrent_kda", lambda **kwargs: (object(), None)
+    )
+    tensors = [object() for _ in range(5)]
+    with pytest.warns(DeprecationWarning, match=r"flashinfer\.recurrent_kda") as record:
+        recurrent_kda(*tensors)
+    assert record[0].filename == __file__
+
+
+def test_decode_facade_deprecation_blames_the_caller_under_api_logging_cpu():
+    """Attribution must survive FLASHINFER_LOGLEVEL>0 (see #5248 review).
+
+    The loglevel fixes the decorator chain's depth at import time, so it cannot
+    be varied in-process; a subprocess is the only way to pin it.
+    """
+
+    program = textwrap.dedent(
+        """
+        import warnings
+        from flashinfer.kda_decode import recurrent_kda
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            try:
+                recurrent_kda(*[object()] * 5)
+            except Exception:
+                pass
+        blamed = [w for w in caught if issubclass(w.category, DeprecationWarning)]
+        print(blamed[0].filename if blamed else "NONE")
+        """
+    )
+    env = {**os.environ, "FLASHINFER_LOGLEVEL": "1"}
+    result = subprocess.run(
+        [sys.executable, "-c", program],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=True,
+    )
+    blamed = result.stdout.strip().splitlines()[-1]
+    assert blamed == "<string>", f"warning blamed {blamed!r}, not the caller"
+
+
+def test_omitted_backend_stays_distinguishable_from_explicit_cute_dsl_cpu():
+    """``None`` records "not requested", which an explicit value cannot.
+
+    Both resolve to ``"cute-dsl"`` today -- see
+    ``test_public_backend_option_forwards_to_kernel_layer_cpu`` -- so the only
+    thing this pins is that the distinction survives, which is what lets a
+    later release converge omitted calls onto ``"auto"`` without overriding
+    callers who named ``"cute-dsl"``.
+    """
+    assert inspect.signature(recurrent_kda).parameters["backend"].default is None
+
+
+def _backend_enum(func) -> set[str]:
+    """The ``backend`` annotation's literal values, through any ``Optional``.
+
+    ``get_args`` on ``Optional[Literal[...]]`` yields the inner ``Literal`` and
+    ``NoneType`` rather than the strings, so the enum has to be unwrapped one
+    level to be assertable at all.
+    """
+
+    annotation = inspect.signature(func).parameters["backend"].annotation
+    args = typing.get_args(annotation)
+    values = {arg for arg in args if isinstance(arg, str)}
+    for arg in args:
+        values |= {inner for inner in typing.get_args(arg) if isinstance(inner, str)}
+    return values
+
+
+def test_decode_facade_rejects_cudnn_by_naming_the_phase_neutral_facade_cpu(
+    monkeypatch,
+):
+    """The two facades' ``backend`` enums differ on purpose, so say why.
+
+    ``"cudnn"`` is valid on ``flashinfer.recurrent_kda`` and not here, because
+    the cuDNN engine serves ordinary multi-token prefill only. A caller who
+    switches import paths should learn that from the error rather than read it
+    as an unrecognised value.
+    """
+    monkeypatch.setattr(
+        kda_decode_module,
+        "_run_recurrent_kda",
+        lambda **kwargs: pytest.fail(f"unexpected kernel call: {kwargs}"),
+    )
+    tensors = [object() for _ in range(5)]
+    with pytest.raises(ValueError, match="flashinfer.recurrent_kda"):
+        recurrent_kda(*tensors, backend="cudnn")
+
+    top_level = importlib.import_module("flashinfer.kda").recurrent_kda
+    assert "cudnn" in _backend_enum(top_level)
+    assert "cudnn" not in _backend_enum(recurrent_kda)
+    # Without this the negative assertion above passes vacuously whenever the
+    # annotation stops being unwrappable, which is how it read before #5248.
+    assert "cute-dsl" in _backend_enum(recurrent_kda)
 
 
 def test_cake_backend_rejects_empty_packed_decode_instead_of_noop_cpu():
@@ -2062,6 +2178,82 @@ def _unbounded_softplus_cake_ineligible_case(device, *, num_sequences, num_heads
 
 
 @pytest.mark.parametrize("num_sequences", [2, 4])
+def test_t1_unbounded_softplus_default_auto_falls_back_with_dense_state(
+    flash_kda_device, monkeypatch, num_sequences
+):
+    """The public default preserves caller-owned state when Cake rejects.
+
+    Two and four sequences straddle the grouped-CTA/one-warp threshold at 32
+    heads while exercising the same dense, unindexed state contract.
+    """
+
+    num_heads = 32
+    case = _unbounded_softplus_cake_ineligible_case(
+        flash_kda_device,
+        num_sequences=num_sequences,
+        num_heads=num_heads,
+        seed=4941,
+    )
+    assert case["cu_seqlens"] is None
+    assert case["ssm_state_indices"] is None
+    assert case["initial_state"].is_contiguous()
+
+    baseline_case = dict(case)
+    for name in ("q", "k", "v", "g", "beta", "A_log", "dt_bias"):
+        baseline_case[name] = case[name].clone()
+    baseline_state = case["initial_state"].clone()
+    expected_output, expected_state = recurrent_kda(
+        **_call_kwargs(
+            baseline_case,
+            state=baseline_state,
+            output=torch.empty_like(case["output"]),
+        ),
+        backend="cute-dsl",
+    )
+
+    selected_variants = []
+    select_flash_kda_variant = recurrent_module._select_flash_kda_decode_variant
+
+    def track_flash_kda_selection(**kwargs):
+        variant = select_flash_kda_variant(**kwargs)
+        selected_variants.append(variant)
+        return variant
+
+    monkeypatch.setattr(
+        recurrent_module,
+        "_select_flash_kda_decode_variant",
+        track_flash_kda_selection,
+    )
+    monkeypatch.setattr(
+        recurrent_module,
+        "_run_flash_kda_decode",
+        lambda *args, **kwargs: pytest.fail("Cake must not launch after selector miss"),
+    )
+    actual_state = case["initial_state"].clone()
+    actual_before = actual_state.clone()
+    actual_output, actual_state_result = public_recurrent_kda(
+        **_call_kwargs(
+            dict(case),
+            state=actual_state,
+            output=torch.empty_like(case["output"]),
+        )
+    )
+
+    assert selected_variants == [None]
+    assert actual_state_result is actual_state
+    torch.testing.assert_close(
+        actual_output.float(), expected_output.float(), atol=0, rtol=0
+    )
+    torch.testing.assert_close(
+        actual_state_result.float(), expected_state.float(), atol=0, rtol=0
+    )
+    torch.testing.assert_close(
+        actual_state.float(), baseline_state.float(), atol=0, rtol=0
+    )
+    assert torch.count_nonzero(actual_state != actual_before).item() > 0
+
+
+@pytest.mark.parametrize("num_sequences", [2, 4])
 def test_t1_unbounded_softplus_auto_fallback_handles_absent_and_strided_state(
     flash_kda_device, num_sequences
 ):
@@ -2126,6 +2318,18 @@ def test_t1_unbounded_softplus_auto_fallback_handles_absent_and_strided_state(
         flash_kda_device, num_sequences=num_sequences, num_heads=num_heads, seed=4939
     )
     case.update(ssm_state_indices=state_indices)
+    before = strided_pool.clone()
+    with pytest.raises(ValueError, match="non-contiguous initial_state"):
+        recurrent_kda(
+            **_call_kwargs(
+                dict(case),
+                state=strided_pool,
+                output=torch.empty_like(case["output"]),
+            ),
+            backend="cute-dsl",
+        )
+    torch.testing.assert_close(strided_pool, before, atol=0, rtol=0)
+
     baseline_pool = strided_pool.contiguous().clone()
     expected = recurrent_kda(
         **_call_kwargs(
@@ -2135,7 +2339,6 @@ def test_t1_unbounded_softplus_auto_fallback_handles_absent_and_strided_state(
         ),
         backend="auto",
     )
-    before = strided_pool.clone()
     actual = recurrent_kda(
         **_call_kwargs(
             dict(case), state=strided_pool, output=torch.empty_like(case["output"])

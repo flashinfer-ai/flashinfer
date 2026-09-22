@@ -8,6 +8,14 @@ import torch
 
 from ..utils import get_compute_capability
 from ._blackwell_sm100 import MSASparseAttentionWorkspace
+from ._nvfp4_decode_sm100 import (
+    msa_decode_nvfp4_specialized_stats,
+    warm as msa_decode_nvfp4_specialized_warmup,
+)
+from ._nvfp4_prefill_sm100 import (
+    msa_prefill_nvfp4_specialized_stats,
+    warm as msa_prefill_nvfp4_specialized_warmup,
+)
 from .proxy_score import (
     msa_proxy_score,
     msa_proxy_score_fp4,
@@ -33,6 +41,10 @@ def supports_packed_kv(device: torch.device | str) -> bool:
 __all__ = [
     "MSASparseAttentionWorkspace",
     "SUPPORTS_PACKED_KV",
+    "msa_decode_nvfp4_specialized_stats",
+    "msa_decode_nvfp4_specialized_warmup",
+    "msa_prefill_nvfp4_specialized_stats",
+    "msa_prefill_nvfp4_specialized_warmup",
     "msa_proxy_score",
     "msa_proxy_score_fp4",
     "msa_sparse_attention",

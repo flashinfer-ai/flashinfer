@@ -156,6 +156,25 @@ Batch Prefill/Append Attention
     .. automethod:: __init__
 
 
+Causal + Bidirectional Ranges Prefill
+-------------------------------------
+
+.. currentmodule:: flashinfer.attention
+
+A batch-prefill wrapper whose fa2 attention variant owns the whole mask:
+causal, plus an inclusive per-query key span attended in both directions. The
+spans are handed to :meth:`BatchPrefillWithCausalBidirectionalRangesWrapper.run`
+as a compact ``int32 [total_q, 2]`` tensor and no mask is materialized, so
+nothing scales with ``qo_len * kv_len``. The JIT module is specialized in the
+constructor, and the inherited options the variant makes meaningless are
+rejected rather than ignored.
+
+.. autoclass:: BatchPrefillWithCausalBidirectionalRangesWrapper
+    :members:
+
+    .. automethod:: __init__
+
+
 Unified BatchAttention
 ----------------------
 
@@ -209,6 +228,8 @@ PageAttention for MLA
     trtllm_batch_decode_sparse_mla_dsv4
     nvfp4_quantize_pack_sparse_mla_cache
     nvfp4_quantize_append_sparse_mla_cache
+    dsv41_fp4_quantize_pack_sparse_mla_cache
+    dsv41_fp4_quantize_append_sparse_mla_cache
     convert_compressed_page_aligned_sparse_indices_to_hca_metadata
     DSV4HCAMetadata
     xqa_batch_decode_with_kv_cache_mla

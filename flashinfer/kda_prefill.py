@@ -104,7 +104,7 @@ _FLASH_KDA_ROUTE_DIRECT_M128_N16 = "direct_m128_n16"
 _FLASH_KDA_ROUTE_HEAD_GROUPED_M128 = "head_grouped_persistent_m128"
 _FLASH_KDA_ROUTE_LPT_M128 = "lpt_persistent_m128"
 _FLASH_KDA_ROUTE_SCALAR_CHUNK_LPT_M128 = "scalar_chunk_lpt_m128"
-_FLASH_KDA_ROUTE_SOURCE_VTILE_M128 = "source599_vtile_m128"
+_FLASH_KDA_ROUTE_SOURCE_VTILE_M128 = "vtile_m128"
 _FLASH_KDA_ROUTE_PERSISTENT_M128 = "persistent_m128"
 _FLASH_KDA_ROUTE_PIECE_PERSISTENT_M128 = "piece_persistent_m128"
 _FLASH_KDA_ROUTE_M64 = "independent_dvsplit_m64"
@@ -7254,3 +7254,210 @@ def _run_sm120_kda_prefill(
             resources.captured = True
             prefill_workspace._captured = True
     return result
+
+
+def prepare_tf32_kda_prefill(
+    q,
+    k,
+    v,
+    g,
+    beta,
+    *,
+    A_log,
+    dt_bias,
+    out,
+    initial_state=None,
+    final_state=None,
+    scale=None,
+    lower_bound=-5.0,
+    cu_seqlens=None,
+    sequence_lengths=None,
+    state_indices=None,
+    state_checkpoints=None,
+    checkpoint_cu_starts=None,
+    checkpoint_every_n_tokens=0,
+    beta_is_logit=True,
+):
+    """Prepare a TF32 KDA inference call on SM100a or SM103a.
+
+    Q/K/V and output are BF16; initial/final state must be FP32. Checkpoints
+    remain BF16. Packed calls require host ``sequence_lengths`` matching
+    ``cu_seqlens``; checkpoint offsets are their canonical chunk-count prefix
+    sums. Tensor storage must remain alive and at the same addresses.
+
+    Preparation allocates workspace and compiles on first use. The returned
+    object's ``launch()`` only submits work on the current stream and may be
+    captured in a caller-owned CUDA graph. Beta may contain BF16 logits or
+    active FP32 probabilities. Training is unsupported.
+    """
+    return _prepare_kda_prefill(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        out=out,
+        initial_state=initial_state,
+        final_state=final_state,
+        scale=scale,
+        lower_bound=lower_bound,
+        cu_seqlens=cu_seqlens,
+        sequence_lengths=sequence_lengths,
+        state_indices=state_indices,
+        state_checkpoints=state_checkpoints,
+        checkpoint_cu_starts=checkpoint_cu_starts,
+        checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+        beta_is_logit=beta_is_logit,
+        compute_dtype="tf32",
+    )
+
+
+def prepare_bf16_kda_prefill(
+    q,
+    k,
+    v,
+    g,
+    beta,
+    *,
+    A_log,
+    dt_bias,
+    out,
+    initial_state=None,
+    final_state=None,
+    scale=None,
+    lower_bound=-5.0,
+    cu_seqlens=None,
+    sequence_lengths=None,
+    state_indices=None,
+    state_checkpoints=None,
+    checkpoint_cu_starts=None,
+    checkpoint_every_n_tokens=0,
+    beta_is_logit=True,
+):
+    """Prepare a BF16 KDA inference call on SM100a or SM103a.
+
+    Q/K/V and output are BF16; external initial/final state is FP32 and
+    checkpoints are BF16. Packed calls require host ``sequence_lengths``
+    matching ``cu_seqlens``; checkpoint offsets are canonical chunk-count
+    prefix sums. Tensor storage must remain alive and at the same addresses.
+
+    Beta contains BF16 logits by default. With ``beta_is_logit=False``, beta
+    contains active FP32 probabilities. Routes requiring logits convert beta
+    with ``logit(eps=1e-6)`` and a BF16 copy on every ``launch()``. Padded or
+    strided beta storage is allowed; only logical token rows are converted.
+
+    Preparation allocates workspace and compiles on first use. The returned
+    object's ``launch()`` submits the complete operation on the current stream
+    and supports caller-owned CUDA graph capture. Training is unsupported.
+    """
+    return _prepare_kda_prefill(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        out=out,
+        initial_state=initial_state,
+        final_state=final_state,
+        scale=scale,
+        lower_bound=lower_bound,
+        cu_seqlens=cu_seqlens,
+        sequence_lengths=sequence_lengths,
+        state_indices=state_indices,
+        state_checkpoints=state_checkpoints,
+        checkpoint_cu_starts=checkpoint_cu_starts,
+        checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+        beta_is_logit=beta_is_logit,
+        compute_dtype="bf16",
+    )
+
+
+def _prepare_kda_prefill(
+    q,
+    k,
+    v,
+    g,
+    beta,
+    *,
+    A_log,
+    dt_bias,
+    out,
+    initial_state,
+    final_state,
+    scale,
+    lower_bound,
+    cu_seqlens,
+    sequence_lengths,
+    state_indices,
+    state_checkpoints,
+    checkpoint_cu_starts,
+    checkpoint_every_n_tokens,
+    beta_is_logit,
+    compute_dtype,
+):
+    from .cake_kda_tf32_runtime import (
+        FlashKDABlackwellLaunch,
+        PreparedBF16ActiveBetaKDA,
+        prepare_active_beta_fwd,
+    )
+    import torch
+
+    if any(
+        t is not None and t.requires_grad
+        for t in (q, k, v, g, beta, A_log, dt_bias, initial_state)
+    ):
+        raise NotImplementedError(
+            f"{compute_dtype.upper()} KDA training is not supported"
+        )
+    if compute_dtype == "bf16":
+        for name, state in (
+            ("initial_state", initial_state),
+            ("final_state", final_state),
+        ):
+            if state is not None and state.dtype != torch.float32:
+                raise ValueError(
+                    f"BF16 KDA export requires FP32 external {name}; got {state.dtype}"
+                )
+    from .jit.cake_kda_tf32 import device_arch, prepare_descriptors
+
+    device_arch(q.device)
+    kwargs = dict(
+        initial_state=initial_state,
+        final_state=final_state,
+        cu_seqlens=cu_seqlens,
+        sequence_lengths=sequence_lengths,
+        state_indices=state_indices,
+        state_checkpoints=state_checkpoints,
+        checkpoint_cu_starts=checkpoint_cu_starts,
+        checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+        compute_dtype=compute_dtype,
+    )
+    args = (
+        q,
+        k,
+        v,
+        g,
+        beta,
+        128**-0.5 if scale is None else scale,
+        out,
+        A_log,
+        dt_bias,
+        lower_bound,
+    )
+    with torch.cuda.device(q.device):
+        if beta_is_logit:
+            prepared = FlashKDABlackwellLaunch(*args, **kwargs)
+        elif compute_dtype == "bf16":
+            prepared = PreparedBF16ActiveBetaKDA(*args, **kwargs)
+        else:
+            if lower_bound is None:
+                raise NotImplementedError(
+                    "Active-beta TF32 export requires a bounded gate"
+                )
+            prepared = prepare_active_beta_fwd(*args, **kwargs)
+        prepare_descriptors(getattr(prepared, "prepared", prepared))
+    return prepared
