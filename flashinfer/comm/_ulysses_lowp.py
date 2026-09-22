@@ -2921,11 +2921,12 @@ def quant_v_fp8_with_scale(
     """Quantize canonical NHD V to canonical E4M3 bit patterns.
 
     Args:
-        v: Contiguous ``[B, S, H, D]`` BF16/FP16 CUDA tensor.
+        v: Contiguous ``[B, S, H, D]`` BF16/FP16 CUDA tensor with a 16-byte-aligned
+            data pointer.
         v_scale_global: Contiguous ``[B, H, D]`` FP32 global per-channel
             divisor. The payload contract requires it to be produced as
             ``global_amax / 2.25`` from BF16/FP16 V values; this preserves
-            pinned Sage FP8 bits.
+            pinned Sage FP8 bits. Its data pointer must be 16-byte aligned.
         scale_max: Format guard. Only ``2.25`` is supported.
         enable_pdl: Whether to enable Programmatic Dependent Launch.
             ``None`` selects according to device support.

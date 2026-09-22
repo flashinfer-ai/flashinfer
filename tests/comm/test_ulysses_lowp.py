@@ -696,6 +696,56 @@ def test_ffi_shard_alignment(head_dim, dtype, view_kind):
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("view_kind", ["input", "scale", "output", "aligned_offsets"])
+def test_ffi_canonical_v_alignment(head_dim, dtype, view_kind):
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    cc = torch.cuda.get_device_capability()
+    if cc not in {(8, 9), (9, 0), (12, 0)}:
+        pytest.skip("requires SM89, SM90 or SM120")
+    module = (
+        lowp.get_ulysses_lowp_sm90_module()
+        if cc == (9, 0)
+        else lowp.get_ulysses_lowp_module()
+    )
+    numel = 2 * 7 * 3 * head_dim
+    scale_numel = 2 * 3 * head_dim
+    # Exercise non-zero storage offsets even in the valid case. In particular,
+    # uint2 output stores require 8-byte, not 16-byte, alignment.
+    input_offset = 1 if view_kind == "input" else 8
+    scale_offset = 1 if view_kind == "scale" else 4
+    output_offset = 1 if view_kind == "output" else 8
+    v = torch.empty(numel + input_offset, device="cuda", dtype=dtype)[
+        input_offset:
+    ].view(2, 7, 3, head_dim)
+    scale = torch.ones(scale_numel + scale_offset, device="cuda")[scale_offset:].view(
+        2, 3, head_dim
+    )
+    output_storage = torch.full(
+        (numel + output_offset,), 255, device="cuda", dtype=torch.uint8
+    )
+    output = output_storage[output_offset:].view_as(v)
+    v.copy_((torch.arange(numel, device="cuda") % 9 - 4).view_as(v))
+    assert v.is_contiguous() and scale.is_contiguous() and output.is_contiguous()
+    if view_kind != "aligned_offsets":
+        alignment = 8 if view_kind == "output" else 16
+        with pytest.raises(
+            Exception, match=f"{view_kind} must have {alignment}-byte alignment"
+        ):
+            module.ulysses_lowp_quant_v_fp8_with_scale(v, scale, output, False)
+        assert torch.all(output_storage == 255)
+        return
+    assert v.data_ptr() % 16 == 0 and scale.data_ptr() % 16 == 0
+    assert output.data_ptr() % 16 == 8
+    module.ulysses_lowp_quant_v_fp8_with_scale(v, scale, output, False)
+    # scale=1 gives reconstructed amax=2.25 exactly in both input dtypes.
+    expected = v.to(torch.float8_e4m3fn).view(torch.uint8)
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+    assert torch.all(output_storage[:output_offset] == 255)
+
+
 # ---------------------------------------------------------------------------
 # 9. unpack_for_sage(scale_sequence=) emits consumer-width scale tensors
 # ---------------------------------------------------------------------------

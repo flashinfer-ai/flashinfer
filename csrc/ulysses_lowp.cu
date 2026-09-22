@@ -138,6 +138,13 @@ void ulysses_lowp_quant_v_fp8_with_scale(TensorView input, TensorView scale, Ten
   CHECK_INPUT_TYPE(output, dl_uint8);
   CHECK_DEVICE(input, scale);
   CHECK_DEVICE(input, output);
+  // Contiguous storage-offset views need not meet the vector access alignment.
+  TVM_FFI_ICHECK_EQ(reinterpret_cast<uintptr_t>(input.data_ptr()) % 16, 0)
+      << "input must have 16-byte alignment";
+  TVM_FFI_ICHECK_EQ(reinterpret_cast<uintptr_t>(scale.data_ptr()) % 16, 0)
+      << "scale must have 16-byte alignment";
+  TVM_FFI_ICHECK_EQ(reinterpret_cast<uintptr_t>(output.data_ptr()) % 8, 0)
+      << "output must have 8-byte alignment";
   TVM_FFI_ICHECK(input.size(0) > 0 && input.size(1) > 0 && input.size(2) > 0)
       << "input batch, sequence, and head dimensions must be non-zero";
   TVM_FFI_ICHECK(supports_head_dim(input.size(3))) << "head dimension must be 64 or 128";
