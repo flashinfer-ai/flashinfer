@@ -481,8 +481,6 @@ class CuteDslFusedMoERunner(TunableRunner):
         use_per_token_activation: Whether inputs include per-token row scales
             for GEMM1.
         use_cuda_graph: Whether autotuning profiles CUDA Graph replay.
-        cuda_graph_max_tokens: If set, only profiles at or below this token
-            count use CUDA Graph replay; larger profiles use eager launches.
         localized_weights: Optional per-locality-domain weight shards.
         localized_streams: One green-context stream per localized shard.
         localized_sm_count: SM count assigned to each localized shard.
@@ -513,7 +511,6 @@ class CuteDslFusedMoERunner(TunableRunner):
         use_per_token_activation: bool = False,
         quant_mode: str = "w4a4",
         use_cuda_graph: bool = False,
-        cuda_graph_max_tokens: Optional[int] = None,
         localized_weights: Optional[list] = None,
         localized_streams: Optional[list] = None,
         localized_sm_count: Optional[int] = None,
@@ -546,17 +543,10 @@ class CuteDslFusedMoERunner(TunableRunner):
         self.use_per_token_activation = use_per_token_activation
         self.quant_mode = quant_mode
         self.use_cuda_graph = use_cuda_graph
-        self.cuda_graph_max_tokens = cuda_graph_max_tokens
         self.localized_weights = localized_weights
         self.localized_streams = localized_streams
         self.localized_sm_count = localized_sm_count
         self.localized_memset_stream = localized_memset_stream
-
-        if cuda_graph_max_tokens is not None:
-            if not use_cuda_graph:
-                raise ValueError("cuda_graph_max_tokens requires use_cuda_graph=True")
-            if cuda_graph_max_tokens <= 0:
-                raise ValueError("cuda_graph_max_tokens must be positive")
 
         if localized_weights is not None and (
             len(localized_weights) != 2
@@ -680,11 +670,6 @@ class CuteDslFusedMoERunner(TunableRunner):
             # representative of production cold-cache conditions.
             use_cold_l2_cache=True,
             use_cuda_graph=use_cuda_graph,
-            cuda_graph_profile_shape_limit=(
-                (0, 0, cuda_graph_max_tokens)
-                if cuda_graph_max_tokens is not None
-                else None
-            ),
         )
 
     def _localization_signature(self) -> tuple:
@@ -722,7 +707,6 @@ class CuteDslFusedMoERunner(TunableRunner):
                 self.use_per_token_activation,
                 self.quant_mode,
                 self.use_cuda_graph,
-                self.cuda_graph_max_tokens,
                 self._localization_signature(),
             )
         )
@@ -743,7 +727,7 @@ class CuteDslFusedMoERunner(TunableRunner):
             self.enable_pdl,
         )
         if self.use_cuda_graph:
-            extras += ("cuda_graph", self.cuda_graph_max_tokens)
+            extras += ("cuda_graph",)
         return extras + self._localization_signature()
 
     def _weights_for_tuning(
