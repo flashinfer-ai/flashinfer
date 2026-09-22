@@ -2782,3 +2782,79 @@ def test_frost_moe_declines_missing_graph_ownership(method, monkeypatch):
     monkeypatch.setattr(torch.cuda.CUDAGraph, method, None, raising=False)
     with pytest.raises(NotImplementedError, match=method):
         require_graph_resource_retention()
+
+
+@supported_gpu
+@pytest.mark.parametrize(
+    "tokens,hidden,experts,intermediate,topk",
+    [(t, 128, 8, 256, 2) for t in (1, 17, 256, 257)]
+    + [(t, 2048, 64, 1408, 6) for t in (1, 8, 9)],
+)
+def test_bf16_moe_workspace_reuse_and_small_routing_boundary(
+    tokens, hidden, experts, intermediate, topk
+):
+    """Stale workspace and graph replay must match a fresh call bit-for-bit."""
+    torch.manual_seed(3442)
+    act, weights = bf16_packs(tokens, topk, experts, hidden, intermediate)
+    runner = bf16_moe.CudnnFrostBf16MoeRunner(
+        bf16_config(topk, experts, intermediate), "cuda"
+    )
+    runner.check_support()
+    runner.build()
+    inputs = runner.pack_inputs(act, weights)
+    state = inputs.launch_state
+    # Mathematical accuracy is covered by the existing compound/model tests.
+    # This regression checks invocation state, so require exact equivalence to
+    # a fresh call instead of adding a new geometry-dependent error budget.
+    for tactic in runner.get_valid_tactics(inputs, None):
+        state.workspace.zero_()
+        fresh = runner.forward(inputs, tactic).clone()
+        assert torch.isfinite(fresh).all().item()
+        state.workspace.fill_(173)
+        torch.testing.assert_close(
+            runner.forward(inputs, tactic), fresh, atol=0, rtol=0
+        )
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            runner.forward(inputs, tactic)
+        original_ids = act.topk_ids.clone()
+        act.topk_ids.fill_(experts - 1)
+        act.topk_ids[::2] = -1
+        act.topk_ids[1::4] = experts
+        state.workspace.zero_()
+        fresh_changed = runner.forward(inputs, tactic).clone()
+        assert torch.isfinite(fresh_changed).all().item()
+        state.workspace.fill_(217)
+        inputs[0].fill_(float("nan"))
+        for _ in range(3):
+            graph.replay()
+        torch.testing.assert_close(inputs[0], fresh_changed, atol=0, rtol=0)
+        act.topk_ids.copy_(original_ids)
+        graph.replay()
+        torch.testing.assert_close(inputs[0], fresh, atol=0, rtol=0)
+        graph.reset()
+
+
+def test_bf16_source_hosts_own_scheduler_initialization():
+    """Native plans rely on frozen hosts initializing scheduler state each call."""
+    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.bf16 import (
+        runtime,
+    )
+
+    paths = tuple((runtime.artifact_root("bf16") / "sources").glob("*.py"))
+    assert paths
+    for path in paths:
+        tree = ast.parse(path.read_text())
+        host = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_host"
+        )
+        resets = [
+            node
+            for node in ast.walk(host)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_dynamic_scheduler_counter_initialization"
+        ]
+        assert len(resets) == 1, path.name

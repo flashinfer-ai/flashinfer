@@ -63,6 +63,54 @@ __global__ void gather(const __nv_bfloat16* x, const int32_t* ids, int32_t* curs
   }
 }
 
+// Small batches prepare group metadata and materialize rows in one launch.
+// Each CTA computes a stable destination, independently of CTA scheduling.
+__global__ void route_small(const __nv_bfloat16* x, const int32_t* ids, int32_t* offsets,
+                            int32_t* mapping, __nv_bfloat16* grouped, float* scale, int rows,
+                            int hidden, int topk, int experts) {
+  const int r = blockIdx.x;
+  const int lane = threadIdx.x % 32;
+  const int warp = threadIdx.x / 32;
+  const bool active = r < rows;
+  const int raw = active ? ids[r] : 0;
+  const bool valid = active && raw >= 0 && raw < experts;
+  const int expert = valid ? raw : 0;
+  int before = 0, group_begin = 0;
+  for (int j = threadIdx.x; j < rows; j += blockDim.x) {
+    const int value = ids[j];
+    const int e = value >= 0 && value < experts ? value : 0;
+    before += (e < expert || (e == expert && j < r));
+    group_begin += e < r;
+  }
+  before = __reduce_add_sync(0xffffffff, before);
+  group_begin = __reduce_add_sync(0xffffffff, group_begin);
+  __shared__ int partial[2][4];
+  __shared__ int destination;
+  if (lane == 0) {
+    partial[0][warp] = before;
+    partial[1][warp] = group_begin;
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    destination = partial[0][0] + partial[0][1] + partial[0][2] + partial[0][3];
+    if (active) mapping[r] = destination;
+    if (r < experts) offsets[r] = partial[1][0] + partial[1][1] + partial[1][2] + partial[1][3];
+    if (r == 0) {
+      scale[0] = 1.f;
+      scale[1] = 4.f;
+      scale[2] = 25.f;
+    }
+  }
+  __syncthreads();
+  if (active) {
+    auto source = reinterpret_cast<const int4*>(x) + (r / topk) * (hidden / 8);
+    auto target = reinterpret_cast<int4*>(grouped) + int64_t(destination) * (hidden / 8);
+    for (int h = threadIdx.x; h < hidden / 8; h += blockDim.x)
+      target[h] = valid ? source[h] : make_int4(0, 0, 0, 0);
+  }
+}
+
+template <bool SplitColumns = false>
 __global__ void finalize(const __nv_bfloat16* grouped, const int32_t* ids, const int32_t* mapping,
                          const float* scores, __nv_bfloat16* out, int tokens, int hidden, int topk,
                          int experts) {
@@ -70,10 +118,13 @@ __global__ void finalize(const __nv_bfloat16* grouped, const int32_t* ids, const
     int4 words;
     __nv_bfloat16 values[8];
   };
-  // One CTA per token: no per-element division, 128-bit data loads/stores,
-  // and deterministic FP32 top-k reduction before a single BF16 conversion.
-  for (int64_t t = blockIdx.x; t < tokens; t += gridDim.x) {
-    for (int h = threadIdx.x; h < hidden / 8; h += blockDim.x) {
+  // Vectorized data accesses and deterministic FP32 top-k reduction before
+  // a single BF16 conversion. Small batches expose independent column tiles.
+  const int tiles = SplitColumns ? (hidden / 8 + 127) / 128 : 1;
+  for (int64_t task = blockIdx.x; task < int64_t(tokens) * tiles; task += gridDim.x) {
+    const int64_t t = task / tiles;
+    const int part = task % tiles;
+    for (int h = part * blockDim.x + threadIdx.x; h < hidden / 8; h += blockDim.x * tiles) {
       float sum[8] = {};
       for (int k = 0; k < topk; ++k) {
         int64_t r = t * topk + k;
@@ -196,13 +247,19 @@ class CudnnFrostMoePlan final : public tvm::ffi::ModuleObj {
     auto scale = reinterpret_cast<float*>(base + scale_pos_);
     auto scratch = reinterpret_cast<int64_t*>(base + scratch_pos_);
     auto expert_ids = static_cast<int32_t*>(ids.data_ptr());
-    checked(cudaMemsetAsync(counts, 0, e_ * 4, stream));
-    histogram<<<std::min<int64_t>((s_ + 255) / 256, 1024), 256, 0, stream>>>(expert_ids, counts, s_,
-                                                                             e_);
-    prefix<<<1, 1, 0, stream>>>(counts, offsets, cursors, e_, scale);
-    gather<<<std::min<int64_t>(s_, 4096), 128, 0, stream>>>(
-        static_cast<__nv_bfloat16*>(x.data_ptr()), expert_ids, cursors, mapping, gx, s_, h_, k_,
-        e_);
+    if (s_ <= 512 && e_ <= 256) {
+      route_small<<<std::max(s_, e_), 128, 0, stream>>>(
+          static_cast<const __nv_bfloat16*>(x.data_ptr()), expert_ids, offsets, mapping, gx, scale,
+          s_, h_, k_, e_);
+    } else {
+      checked(cudaMemsetAsync(counts, 0, e_ * 4, stream));
+      histogram<<<std::min<int64_t>((s_ + 255) / 256, 1024), 256, 0, stream>>>(expert_ids, counts,
+                                                                               s_, e_);
+      prefix<<<1, 1, 0, stream>>>(counts, offsets, cursors, e_, scale);
+      gather<<<std::min<int64_t>(s_, 4096), 128, 0, stream>>>(
+          static_cast<__nv_bfloat16*>(x.data_ptr()), expert_ids, cursors, mapping, gx, s_, h_, k_,
+          e_);
+    }
     checked(cudaGetLastError());
 
     int64_t xshape[]{s_, h_, 1}, mshape[]{s_, i_, 1};
@@ -228,8 +285,8 @@ class CudnnFrostMoePlan final : public tvm::ffi::ModuleObj {
     DLTensor tm_sw{mid, device_, 3, dl_bfloat16, mshape_sw, mstride_sw, 0};
     DLTensor ty_sw{gy, device_, 3, dl_bfloat16, yshape_sw, ystride_sw, 0};
     auto fc1_out = swap1_ ? &tm_sw : &tm;
-    // Persistent scheduler state must be reset on every invocation, including replay.
-    checked(cudaMemsetAsync(scratch, 0, scratch1_, stream));
+    // The frozen host initializes its scheduler counter on every invocation.
+    // Descriptor storage is populated by the kernel before it is consumed.
     // AnyView borrows the TensorView descriptor; keep every descriptor alive
     // until CallPacked returns (temporary TensorViews would dangle).
     std::array<TensorView, 9> tensors{TensorView(&first),
@@ -249,14 +306,19 @@ class CudnnFrostMoePlan final : public tvm::ffi::ModuleObj {
     args[argc++] = static_cast<void*>(stream);
     tvm::ffi::Any result;
     fc1_.CallPacked(args, argc, &result);
-    checked(cudaMemsetAsync(scratch, 0, scratch2_, stream));
     dshape[0] = scratch2_ / 8;
     fc2_(problem2_, TensorView(&first), TensorView(&desc), TensorView(swap2_ ? &down : &tm),
          TensorView(swap2_ ? &tm : &down), TensorView(swap2_ ? &ty_sw : &ty),
          static_cast<void*>(stream));
-    finalize<<<std::min<int64_t>(t_, 4096), 128, 0, stream>>>(
-        gy, expert_ids, mapping, static_cast<float*>(scores.data_ptr()),
-        static_cast<__nv_bfloat16*>(out.data_ptr()), t_, h_, k_, e_);
+    if (t_ <= 8) {
+      finalize<true><<<std::min<int64_t>(t_ * ((h_ / 8 + 127) / 128), 4096), 128, 0, stream>>>(
+          gy, expert_ids, mapping, static_cast<float*>(scores.data_ptr()),
+          static_cast<__nv_bfloat16*>(out.data_ptr()), t_, h_, k_, e_);
+    } else {
+      finalize<false><<<std::min<int64_t>(t_, 4096), 128, 0, stream>>>(
+          gy, expert_ids, mapping, static_cast<float*>(scores.data_ptr()),
+          static_cast<__nv_bfloat16*>(out.data_ptr()), t_, h_, k_, e_);
+    }
     checked(cudaGetLastError());
   }
 
