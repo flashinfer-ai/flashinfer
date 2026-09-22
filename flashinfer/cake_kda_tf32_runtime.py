@@ -2056,6 +2056,16 @@ class FlashKDABlackwellBF16FusedLaunch:
             host_task_ids, host_task_offsets, lpt_loads = _make_lpt_task_bins(
                 ordered_seq_lens, num_heads=num_heads, worker_count=sm_count
             )
+        # FP32 intermediate states are carried only by the fused direct M128
+        # N32 body (the M64 value split, the N16 tile and the owner/helper
+        # routes write BF16 rows), so an FP32 checkpoint request pins that
+        # tile exactly like an explicit N32 request.
+        fp32_checkpoint_request = bool(
+            checkpoint_every_n_tokens
+            and state_checkpoints is not None
+            and state_checkpoints.dtype == torch.float32
+        )
+        force_direct_m128_n32 = self._force_direct_m128_n32 or fp32_checkpoint_request
         needs_direct_m128 = (
             unbounded_softplus
             or self._force_direct_m128
@@ -2185,7 +2195,7 @@ class FlashKDABlackwellBF16FusedLaunch:
             checkpoint_every_n_tokens=checkpoint_every_n_tokens,
             gate_kind=gate_kind,
             force_direct_m128=self._force_direct_m128,
-            force_direct_m128_n32=self._force_direct_m128_n32,
+            force_direct_m128_n32=force_direct_m128_n32,
             n16_short_four_stage=self._n16_short_four_stage,
         ):
             route = BF16_ROUTE_M64
@@ -2195,7 +2205,7 @@ class FlashKDABlackwellBF16FusedLaunch:
                 num_heads=num_heads,
                 max_seq_len=max_seq_len,
                 force_direct_m128=self._force_direct_m128,
-                force_direct_m128_n32=self._force_direct_m128_n32,
+                force_direct_m128_n32=force_direct_m128_n32,
                 unbounded_softplus=unbounded_softplus,
                 n16_short_four_stage=self._n16_short_four_stage,
                 state_dtype_is_fp32=self._state_dtype_is_fp32,
@@ -2262,7 +2272,7 @@ class FlashKDABlackwellBF16FusedLaunch:
                 bounded_gate=gate_kind == KDAGateKind.LOWER_BOUND,
                 compute_dtype=compute_dtype,
                 force_direct_m128=self._force_direct_m128,
-                force_direct_m128_n32=self._force_direct_m128_n32,
+                force_direct_m128_n32=force_direct_m128_n32,
                 n16_short_four_stage=self._n16_short_four_stage,
                 # Logit beta whose token pitch the 8x32 TMA box cannot encode is
                 # refreshed into a padded carrier each launch (see
