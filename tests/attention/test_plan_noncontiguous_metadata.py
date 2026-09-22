@@ -13,10 +13,18 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Regression tests for https://github.com/flashinfer-ai/flashinfer/issues/5260:
-``plan()`` must accept non-contiguous (strided) index tensors. Before the fix,
-strided views were handed to the planner / kernels as raw pointers, causing
-illegal memory accesses, planner errors, or silently wrong output.
+Regression tests for https://github.com/flashinfer-ai/flashinfer/issues/5260.
+
+``plan()``, ``fast_decode_plan()`` and ``workspace_size()`` must accept
+non-contiguous (strided) index tensors -- indptr, indices, last_page_len and
+``seq_lens``. The host planners and the kernels read them through raw data
+pointers, and ``.to(device)`` keeps a strided CUDA view strided while
+``.to("cpu")`` is a no-op for a strided CPU tensor, so before the fix a strided
+view was misread: illegal memory accesses (fa2 prefill, fa3 paged prefill with
+``seq_lens``), planner check failures, or silently wrong output (fa3 paged
+prefill, paged decode, block-sparse). These tensors are tiny and ``plan()``
+already copies them between host and device, so the fix normalizes them instead
+of rejecting them.
 """
 
 import pytest
@@ -104,19 +112,24 @@ def test_ragged_prefill_plan_noncontiguous_indptr(metadata_device, backend):
     _assert_same(*outs)
 
 
+@pytest.mark.parametrize("pass_seq_lens", [False, True])
 @pytest.mark.parametrize("metadata_device", ["cuda", "cpu"])
 @pytest.mark.parametrize("backend", ["fa2", "fa3"])
-def test_paged_prefill_plan_noncontiguous_metadata(metadata_device, backend):
+def test_paged_prefill_plan_noncontiguous_metadata(
+    metadata_device, backend, pass_seq_lens
+):
     _skip_unsupported(backend)
     torch.manual_seed(0)
     kv_indptr, kv_indices, last_page_len, kv_cache = _paged_metadata()
     qo_indptr = _indptr(QO_LENS)
+    kv_lens = torch.tensor(KV_LENS, dtype=torch.int32)
     q = torch.randn(
         int(qo_indptr[-1]), NUM_QO_HEADS, HEAD_DIM, dtype=DTYPE, device="cuda"
     )
 
     outs = []
     for make in (lambda t: t, _strided):
+        extra = {"seq_lens": make(kv_lens.to(metadata_device))} if pass_seq_lens else {}
         wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
             _workspace(), "NHD", backend=backend
         )
@@ -131,20 +144,26 @@ def test_paged_prefill_plan_noncontiguous_metadata(metadata_device, backend):
             PAGE_SIZE,
             causal=True,
             q_data_type=DTYPE,
+            **extra,
         )
         outs.append(wrapper.run(q, kv_cache))
     _assert_same(*outs)
 
 
+@pytest.mark.parametrize("pass_seq_lens", [False, True])
 @pytest.mark.parametrize("metadata_device", ["cuda", "cpu"])
 @pytest.mark.parametrize("use_tensor_cores", [False, True])
-def test_paged_decode_plan_noncontiguous_metadata(metadata_device, use_tensor_cores):
+def test_paged_decode_plan_noncontiguous_metadata(
+    metadata_device, use_tensor_cores, pass_seq_lens
+):
     torch.manual_seed(0)
     kv_indptr, kv_indices, last_page_len, kv_cache = _paged_metadata()
+    kv_lens = torch.tensor(KV_LENS, dtype=torch.int32)
     q = torch.randn(len(KV_LENS), NUM_QO_HEADS, HEAD_DIM, dtype=DTYPE, device="cuda")
 
     outs = []
     for make in (lambda t: t, _strided):
+        extra = {"seq_lens": make(kv_lens.to(metadata_device))} if pass_seq_lens else {}
         wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
             _workspace(), "NHD", use_tensor_cores=use_tensor_cores
         )
@@ -157,9 +176,55 @@ def test_paged_decode_plan_noncontiguous_metadata(metadata_device, use_tensor_co
             HEAD_DIM,
             PAGE_SIZE,
             q_data_type=DTYPE,
+            **extra,
         )
         outs.append(wrapper.run(q, kv_cache))
     _assert_same(*outs)
+
+
+@pytest.mark.parametrize("metadata_device", ["cuda", "cpu"])
+@pytest.mark.parametrize(
+    "wrapper_kind", ["decode", "decode_tensor_cores", "prefill_fa2"]
+)
+def test_workspace_size_noncontiguous_metadata(metadata_device, wrapper_kind):
+    """workspace_size() must size the same problem regardless of strides.
+
+    (The prefill fa3 backend has no workspace_size().)
+    """
+    kv_indptr, kv_indices, last_page_len, _ = _paged_metadata()
+    qo_indptr = _indptr(QO_LENS)
+    kv_lens = torch.tensor(KV_LENS, dtype=torch.int32)
+
+    sizes = []
+    for make in (lambda t: t, _strided):
+        meta = [
+            make(t.to(metadata_device)) for t in (kv_indptr, kv_indices, last_page_len)
+        ]
+        seq_lens = make(kv_lens.to(metadata_device))
+        if wrapper_kind.startswith("decode"):
+            wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+                _workspace(),
+                "NHD",
+                use_tensor_cores=wrapper_kind == "decode_tensor_cores",
+            )
+            args = meta
+        else:
+            wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+                _workspace(), "NHD", backend=wrapper_kind.split("_")[1]
+            )
+            args = [make(qo_indptr.to(metadata_device)), *meta]
+        sizes.append(
+            wrapper.workspace_size(
+                *args,
+                NUM_QO_HEADS,
+                NUM_KV_HEADS,
+                HEAD_DIM,
+                PAGE_SIZE,
+                q_data_type=DTYPE,
+                seq_lens=seq_lens,
+            )
+        )
+    assert sizes[0] == sizes[1]
 
 
 @pytest.mark.parametrize("metadata_device", ["cuda", "cpu"])
@@ -189,4 +254,50 @@ def test_block_sparse_plan_noncontiguous_metadata(metadata_device):
             HEAD_DIM,
         )
         outs.append(wrapper.run(q, k, v))
+    _assert_same(*outs)
+
+
+def test_fast_decode_plan_noncontiguous_metadata():
+    """``fast_decode_plan`` elides the metadata copies, so it normalizes too.
+
+    CUDA metadata only: the function exists to skip the host-to-device copies,
+    so it hands the caller's tensors straight to the kernel and already faults
+    on *contiguous* CPU metadata, independently of this fix.
+    """
+    metadata_device = "cuda"
+    torch.manual_seed(0)
+    kv_indptr, kv_indices, last_page_len, kv_cache = _paged_metadata()
+    q = torch.randn(len(KV_LENS), NUM_QO_HEADS, HEAD_DIM, dtype=DTYPE, device="cuda")
+
+    outs = []
+    for make in (lambda t: t, _strided):
+        # An explicit backend keeps fast_decode_plan on its copy-eliding path
+        # instead of delegating to plan() for an auto/cuDNN decision. That path
+        # replans the module a standard plan() built, so warm one first -- the
+        # same order the multi-step draft backend uses.
+        wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+            _workspace(), "NHD", backend="fa2"
+        )
+        wrapper.plan(
+            kv_indptr.to(metadata_device),
+            kv_indices.to(metadata_device),
+            last_page_len.to(metadata_device),
+            NUM_QO_HEADS,
+            NUM_KV_HEADS,
+            HEAD_DIM,
+            PAGE_SIZE,
+            q_data_type=DTYPE,
+        )
+        flashinfer.decode.fast_decode_plan(
+            wrapper,
+            make(kv_indptr.to(metadata_device)),
+            make(kv_indices.to(metadata_device)),
+            make(last_page_len.to(metadata_device)),
+            NUM_QO_HEADS,
+            NUM_KV_HEADS,
+            HEAD_DIM,
+            PAGE_SIZE,
+            q_data_type=DTYPE,
+        )
+        outs.append(wrapper.run(q, kv_cache))
     _assert_same(*outs)

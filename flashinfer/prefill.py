@@ -2500,6 +2500,14 @@ class BatchPrefillWithPagedKVCacheWrapper:
         if fixed_split_size is None:
             fixed_split_size = -1
 
+        # Normalized like plan(): the native size query reads raw pointers (#5260).
+        qo_indptr = qo_indptr.contiguous()
+        paged_kv_indptr = paged_kv_indptr.contiguous()
+        paged_kv_indices = paged_kv_indices.contiguous()
+        paged_kv_last_page_len = paged_kv_last_page_len.contiguous()
+        if seq_lens is not None:
+            seq_lens = seq_lens.contiguous()
+
         batch_size = len(qo_indptr) - 1
         qo_indptr_host = qo_indptr.to("cpu")
         total_num_rows = int(qo_indptr_host[-1])
@@ -2780,13 +2788,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
         if fixed_split_size is None:
             fixed_split_size = -1
 
-        # The planner and the kernels read these through raw data pointers, and
-        # ``.to(device)`` keeps a strided view strided, so normalize them (they
-        # are tiny) rather than silently misreading non-contiguous inputs.
+        # Normalized: the planner and kernels read these as raw pointers (#5260).
         qo_indptr = qo_indptr.contiguous()
         paged_kv_indptr = paged_kv_indptr.contiguous()
         paged_kv_indices = paged_kv_indices.contiguous()
         paged_kv_last_page_len = paged_kv_last_page_len.contiguous()
+        if seq_lens is not None:
+            seq_lens = seq_lens.contiguous()
 
         batch_size = len(qo_indptr) - 1
         self._batch_size = batch_size
@@ -4573,9 +4581,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
 
-        # The planner and the kernels read these through raw data pointers, and
-        # ``.to(device)`` keeps a strided view strided, so normalize them (they
-        # are tiny) rather than silently misreading non-contiguous inputs.
+        # Normalized: the planner and kernels read these as raw pointers (#5260).
         qo_indptr = qo_indptr.contiguous()
         kv_indptr = kv_indptr.contiguous()
         if o_indptr is not None:
