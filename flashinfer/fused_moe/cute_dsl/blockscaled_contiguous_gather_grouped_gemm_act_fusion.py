@@ -472,12 +472,12 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
     vectorized_f32: bool = True,
     raster_along_m: bool = False,
     sm_count: Optional[int] = None,
-    # locality-domain half-GEMM (Rubin only): partition_id >= 0 makes this partition write
+    # locality-domain half-GEMM (Rubin only): domain_id >= 0 makes this partition write
     # its N-half (this die's slice of the intermediate dimension) into the
     # caller-provided shared full-width `out` at a column offset, using a
     # full-width row stride -- two dies fill one buffer with no copy-back and no
-    # reduction. partition_id < 0 -> normal contiguous output.
-    partition_id: int = -1,
+    # reduction. domain_id < 0 -> normal contiguous output.
+    domain_id: int = -1,
     # Rubin-specific parameters (optional; when set, use SM107 kernel)
     mma_tiler: Optional[Tuple[int, int, int]] = None,
     mma_inst_shape: Optional[Tuple[int, int, int]] = None,
@@ -521,6 +521,11 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
              For FP4 output, shape is (permuted_m, intermediate_size//2) uint8.
         out_scale: Optional output scale factor tensor for block-scaled
             quantized output.
+        domain_id: Locality-domain index (0 or 1), or -1 for ordinary output.
+            Localized NVFP4 execution requires contiguous uint8 out/out_scale
+            on the input device. With I = this shard's intermediate_size and
+            M = permuted_m, their full-width shapes are (M, I) and
+            (32, 4, M//128, 4, ceil(2*I/64), 1), respectively.
         global_scale: Global scale factor for FP4 output quantization, shape
             (1,), float32.
         a_per_token_scale: Optional per-token row scale for operand A,
@@ -685,6 +690,55 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
             f"the device is SM{major}{minor}."
         )
 
+    localized_half_gemm = domain_id >= 0
+    if localized_half_gemm:
+        if not is_rubin:
+            raise ValueError(
+                "locality-domain half-GEMM (domain_id >= 0) is Rubin (SM107) only"
+            )
+        if domain_id >= 2:
+            raise ValueError(f"domain_id must be 0 or 1, got {domain_id}")
+        if not generate_sfc or c_dtype != "float4_e2m1fn" or sf_vec_size != 16:
+            raise ValueError(
+                "locality-domain half-GEMM requires the NVFP4 output path (quantize_output=True, "
+                "c_dtype='float4_e2m1fn', sf_vec_size=16): the "
+                "kernel derives its shared-SF full_c_shape from localized_half_gemm."
+            )
+        if out is None or out_scale is None:
+            raise ValueError(
+                "locality-domain half-GEMM requires caller-provided full-width out/out_scale. "
+                "Both dies write into one shared buffer; a dispatcher-allocated one "
+                "would be private to this call and only half the required width."
+            )
+        # Validate before allocation: each launch writes into the same full-width
+        # buffers, including the scale-factor layout spanning both partitions.
+        full_intermediate_size = 2 * intermediate_size
+        scale_atom_n = sf_vec_size * 4
+        expected_scale_shape = (
+            32,
+            4,
+            permuted_m // 128,
+            4,
+            (full_intermediate_size + scale_atom_n - 1) // scale_atom_n,
+            1,
+        )
+        for name, tensor, shape in (
+            ("out", out, (permuted_m, full_intermediate_size // 2)),
+            ("out_scale", out_scale, expected_scale_shape),
+        ):
+            if tensor.shape != shape:
+                raise ValueError(
+                    f"localized {name} must have shape {shape}, got {tuple(tensor.shape)}"
+                )
+            if tensor.dtype != torch.uint8:
+                raise TypeError(f"localized {name} must have dtype torch.uint8")
+            if tensor.device != a.device:
+                raise ValueError(
+                    f"localized {name} must be on {a.device}, got {tensor.device}"
+                )
+            if not tensor.is_contiguous():
+                raise ValueError(f"localized {name} must be contiguous")
+
     # Validate configuration
     a_dtype_cutlass = get_cutlass_dtype(a_dtype)
     b_dtype_cutlass = get_cutlass_dtype(b_dtype)
@@ -788,37 +842,19 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
     # c_sf_n_tile_offset does the same for the tiled SF buffer -- whose layout is
     # indexed by subtile, so a byte offset would not work there. No copy-back and
     # no reduction: the split is exact.
-    localized_half_gemm = partition_id >= 0
     if localized_half_gemm:
-        if not is_rubin:
-            raise ValueError(
-                "locality-domain half-GEMM (partition_id >= 0) is Rubin (SM107) only"
-            )
-        if partition_id >= 2:
-            raise ValueError(f"partition_id must be 0 or 1, got {partition_id}")
-        if not generate_sfc:
-            raise ValueError(
-                "locality-domain half-GEMM requires the NVFP4 output path (generate_sfc): the "
-                "kernel derives its shared-SF full_c_shape from localized_half_gemm."
-            )
-        if out is None or out_scale is None:
-            raise ValueError(
-                "locality-domain half-GEMM requires caller-provided full-width out/out_scale. "
-                "Both dies write into one shared buffer; a dispatcher-allocated one "
-                "would be private to this call and only half the required width."
-            )
         c_stride_m_val = cutlass.Int64(out.shape[1] * 2)
-        c_sf_n_tile_offset_val = cutlass.Int64(partition_id * intermediate_size // 64)
+        c_sf_n_tile_offset_val = cutlass.Int64(domain_id * intermediate_size // 64)
         # fp4 packs 2 values per byte, hence // 2 for this partition's column start.
-        c_data_ptr = out.data_ptr() + partition_id * intermediate_size // 2
+        c_data_ptr = out.data_ptr() + domain_id * intermediate_size // 2
     else:
         c_stride_m_val = cutlass.Int64(0)
         c_sf_n_tile_offset_val = cutlass.Int64(0)
         c_data_ptr = out.data_ptr()
 
     localized_moe_trace(
-        f"fc1-p{partition_id}",
-        f"FC1 partition_id={partition_id} localized_half_gemm={localized_half_gemm} "
+        f"fc1-domain-{domain_id}",
+        f"FC1 domain_id={domain_id} localized_half_gemm={localized_half_gemm} "
         f"is_rubin={is_rubin} | b.shape[1]={n} intermediate_size={intermediate_size} "
         f"out.shape={tuple(out.shape)} permuted_m={permuted_m} | "
         f"sm_count={sm_count}/{total_sm} "

@@ -557,7 +557,7 @@ def _moe_core_impl(
                 mma_tiler=gemm1_mma_tiler,
                 mma_inst_shape=gemm1_mma_inst_shape,
                 sm_count=sm_count,
-                partition_id=i,
+                domain_id=i,
                 enable_pdl=enable_pdl,
                 activation_type=activation.value,
                 swiglu_alpha=swiglu_alpha,
@@ -1406,7 +1406,6 @@ def cute_dsl_fused_moe(
     localized_memset_stream: Optional[torch.cuda.Stream] = None,
     localized_allow_nonlocalized: bool = False,
     autotune_use_cuda_graph: bool = False,
-    autotune_cuda_graph_max_tokens: Optional[int] = None,
 ) -> torch.Tensor:
     r"""Run a fused MoE forward pass using CuTe-DSL block-scaled kernels.
 
@@ -1503,9 +1502,6 @@ def cute_dsl_fused_moe(
         supplied. The caller must retain usable full-width weights.
     autotune_use_cuda_graph : bool
         Profile tactics through CUDA Graph replay.
-    autotune_cuda_graph_max_tokens : Optional[int]
-        When CUDA Graph profiling is enabled, use it only at or below this
-        token count. Larger tuning buckets use eager launches.
 
     Returns
     -------
@@ -1541,10 +1537,6 @@ def cute_dsl_fused_moe(
     tuner = AutoTuner.get()
     runners: list[CuteDslFusedMoERunner | CuteDslFusedMoEW4A16Runner]
 
-    if autotune_cuda_graph_max_tokens is not None and not autotune_use_cuda_graph:
-        raise ValueError(
-            "autotune_cuda_graph_max_tokens requires autotune_use_cuda_graph=True"
-        )
     if localized_weights is not None and quant_mode != "w4a4":
         raise NotImplementedError(
             "locality-domain localization is implemented for the W4A4 path "
@@ -1580,7 +1572,6 @@ def cute_dsl_fused_moe(
             use_per_token_activation=use_per_token_activation,
             quant_mode=quant_mode,
             use_cuda_graph=autotune_use_cuda_graph,
-            cuda_graph_max_tokens=autotune_cuda_graph_max_tokens,
         )
         if localized_weights is None:
             runners = [CuteDslFusedMoERunner(**runner_kwargs)]
@@ -1731,7 +1722,6 @@ def cute_dsl_fused_moe_nvfp4(
     localized_memset_stream: Optional[torch.cuda.Stream] = None,
     localized_allow_nonlocalized: bool = False,
     autotune_use_cuda_graph: bool = False,
-    autotune_cuda_graph_max_tokens: Optional[int] = None,
 ) -> torch.Tensor:
     r"""Run a fused MoE forward pass using the CuTe-DSL NVFP4 kernels.
 
@@ -1784,7 +1774,6 @@ def cute_dsl_fused_moe_nvfp4(
         localized_memset_stream=localized_memset_stream,
         localized_allow_nonlocalized=localized_allow_nonlocalized,
         autotune_use_cuda_graph=autotune_use_cuda_graph,
-        autotune_cuda_graph_max_tokens=autotune_cuda_graph_max_tokens,
     )
 
 

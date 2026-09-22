@@ -493,9 +493,6 @@ class TuningConfig:
             sample's start event, so its cost is excluded from the reported
             kernel latency.
         use_cuda_graph (bool): Whether to use CUDA graph for the tuning process.
-        cuda_graph_profile_shape_limit (tuple[int, int, int] | None): Optional
-            (input_idx, dim_idx, inclusive_max) gate for CUDA Graph profiling.
-            Profiles above the limit use eager launches.
         cuda_graph_profile_replays (int): Number of CUDA graph samples per
             profiling repeat. With ``use_cold_l2_cache=False`` these are
             back-to-back replays and measure sustained execution. With
@@ -534,7 +531,6 @@ class TuningConfig:
     tensor_initializers: tuple[tuple[int, TensorInitializer], ...] = ()
     use_cold_l2_cache: bool = False
     use_cuda_graph: bool = False
-    cuda_graph_profile_shape_limit: tuple[int, int, int] | None = None
     cuda_graph_profile_replays: int = 1
     profiling_repeat: int | None = None
     use_cold_l2_graph_replay: bool = False
@@ -547,22 +543,6 @@ class TuningConfig:
     # for inputs whose default tensor_initializer would be random
     # (e.g. token_selected_experts in MoE workloads).
     inputs_pre_hook: Callable | None = None
-
-    def should_use_cuda_graph(self, inputs: list[Any]) -> bool:
-        """Return whether this concrete profile should use CUDA Graph replay."""
-        if not self.use_cuda_graph:
-            return False
-        if self.cuda_graph_profile_shape_limit is None:
-            return True
-
-        input_idx, dim_idx, inclusive_max = self.cuda_graph_profile_shape_limit
-        profile_input = inputs[input_idx]
-        if not isinstance(profile_input, torch.Tensor):
-            raise TypeError(
-                "cuda_graph_profile_shape_limit must reference a torch.Tensor "
-                f"input, got {type(profile_input)!r} at index {input_idx}"
-            )
-        return profile_input.shape[dim_idx] <= inclusive_max
 
 
 class ValueProfileArena:
@@ -2158,9 +2138,6 @@ class AutoTuner:
             tensor_initializers=tuning_config.tensor_initializers,
             use_cold_l2_cache=tuning_config.use_cold_l2_cache,
             use_cuda_graph=tuning_config.use_cuda_graph,
-            cuda_graph_profile_shape_limit=(
-                tuning_config.cuda_graph_profile_shape_limit
-            ),
             cuda_graph_profile_replays=(
                 profile_replays
                 if profile_replays is not None
@@ -2389,14 +2366,9 @@ class AutoTuner:
                             # the per-tactic profile loop.
                             if tuning_config.inputs_pre_hook is not None:
                                 tensors = list(tuning_config.inputs_pre_hook(tensors))
-                            profile_tuning_config = tuning_config
-                            if not tuning_config.should_use_cuda_graph(tensors):
-                                profile_tuning_config = replace(
-                                    tuning_config, use_cuda_graph=False
-                                )
                             prepared_input_batches = (
                                 self._prepare_input_tensors_with_batches(
-                                    tensors, profile_tuning_config
+                                    tensors, tuning_config
                                 )
                             )
                         except (torch.cuda.OutOfMemoryError, MemoryError):
@@ -2475,7 +2447,7 @@ class AutoTuner:
                                         r,
                                         tensors,
                                         tac,
-                                        profile_tuning_config,
+                                        tuning_config,
                                         input_tensor_batches=prepared_input_batches,
                                         **kwargs,
                                     )
@@ -2812,9 +2784,6 @@ class AutoTuner:
                 "inside it -- close the autotune_v2/autotune context before "
                 "the framework captures the model."
             )
-
-        if not tuning_config.should_use_cuda_graph(inputs):
-            tuning_config = replace(tuning_config, use_cuda_graph=False)
 
         # MeasurementPolicy(timer="cupti") routes to per-iteration GPU-span
         # measurement; "auto"/"events" (and cupti-python unavailable) use

@@ -74,27 +74,6 @@ class DummyRunner(TunableRunner):
         return inputs[0]
 
 
-@pytest.mark.parametrize(
-    "use_cuda_graph,shape_limit,num_tokens,expected",
-    [
-        (False, None, 64, False),
-        (True, None, 8192, True),
-        (True, (0, 0, 256), 64, True),
-        (True, (0, 0, 256), 256, True),
-        (True, (0, 0, 256), 257, False),
-        (True, (0, 0, 256), 8192, False),
-    ],
-)
-def test_tuning_config_cuda_graph_profile_shape_gate(
-    use_cuda_graph, shape_limit, num_tokens, expected
-):
-    config = TuningConfig(
-        use_cuda_graph=use_cuda_graph,
-        cuda_graph_profile_shape_limit=shape_limit,
-    )
-    assert config.should_use_cuda_graph([torch.empty((num_tokens, 1))]) is expected
-
-
 def test_repeating_tensor_initializer_preserves_runtime_values():
     source = torch.tensor([[10, 11, 12], [20, 21, 22]], dtype=torch.int32)
     initializer = make_repeating_tensor_initializer(source)
@@ -1172,8 +1151,6 @@ def test_tuning_overrides_preserve_tensor_initializers():
             ),
         ),
         tensor_initializers=((0, initializer),),
-        use_cuda_graph=True,
-        cuda_graph_profile_shape_limit=(0, 0, 256),
         profiling_repeat=100,
     )
 
@@ -1181,10 +1158,6 @@ def test_tuning_overrides_preserve_tensor_initializers():
         overridden = tuner._apply_tuning_overrides(config)
 
     assert overridden.tensor_initializers == config.tensor_initializers
-    assert (
-        overridden.cuda_graph_profile_shape_limit
-        == config.cuda_graph_profile_shape_limit
-    )
     assert overridden.profiling_repeat == 100
 
 

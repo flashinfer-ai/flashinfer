@@ -372,7 +372,6 @@ def test_localized_runner_uses_shard_shapes_and_separate_cache_key():
         "top_k": 1,
         "num_local_experts": 2,
         "use_cuda_graph": True,
-        "cuda_graph_max_tokens": 256,
     }
     full_runner = CuteDslFusedMoERunner(**kwargs)
     localized_runner = CuteDslFusedMoERunner(
@@ -389,11 +388,6 @@ def test_localized_runner_uses_shard_shapes_and_separate_cache_key():
     assert tuning_w1 is shards[0]["w1_weight"]
     assert tuning_w2 is shards[0]["w2_weight"]
     assert localized_runner.tuning_config.use_cuda_graph
-    assert localized_runner.tuning_config.cuda_graph_profile_shape_limit == (
-        0,
-        0,
-        256,
-    )
     assert full_runner.get_cache_key_extras(inputs) != (
         localized_runner.get_cache_key_extras(inputs)
     )
@@ -512,6 +506,100 @@ def test_adaptive_localization_executes_autotuner_selected_runner(monkeypatch):
 # =============================================================================
 # Test Class: GEMM input validation
 # =============================================================================
+
+
+@cute_dsl_available
+@pytest.mark.parametrize("domain_id", [0, 1])
+@pytest.mark.parametrize("buffer_name", ["out", "out_scale"])
+@pytest.mark.parametrize(
+    "invalid_kind,exception,match",
+    [
+        ("missing", ValueError, "caller-provided full-width"),
+        ("half_width", ValueError, "must have shape"),
+        ("dtype", TypeError, "dtype torch.uint8"),
+        ("device", ValueError, "must be on cuda:0"),
+        ("other_gpu", ValueError, "must be on cuda:0"),
+        ("contiguous", ValueError, "must be contiguous"),
+        (None, None, None),
+    ],
+)
+def test_localized_gather_validates_shared_buffers_before_allocation(
+    monkeypatch, domain_id, buffer_name, invalid_kind, exception, match
+):
+    import importlib
+
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    module = importlib.import_module(
+        "flashinfer.fused_moe.cute_dsl."
+        "blockscaled_contiguous_gather_grouped_gemm_act_fusion"
+    )
+
+    # Fake tensors exercise device/stride metadata without requiring Rubin or
+    # launching kernels with deliberately malformed output buffers.
+    with FakeTensorMode():
+        kwargs = {
+            "a": torch.empty((4, 64), dtype=torch.uint8, device="cuda:0"),
+            "b": torch.empty((2, 512, 64), dtype=torch.uint8, device="cuda:0"),
+            "token_id_mapping": torch.empty(128, dtype=torch.int32, device="cuda:0"),
+            "out": torch.empty((128, 256), dtype=torch.uint8, device="cuda:0"),
+            "out_scale": torch.empty(
+                (32, 4, 1, 4, 8, 1), dtype=torch.uint8, device="cuda:0"
+            ),
+        }
+        shape = list(kwargs[buffer_name].shape)
+        if invalid_kind == "missing":
+            kwargs[buffer_name] = None
+        elif invalid_kind == "half_width":
+            shape[1 if buffer_name == "out" else 4] //= 2
+            kwargs[buffer_name] = torch.empty(shape, dtype=torch.uint8, device="cuda:0")
+        elif invalid_kind == "dtype":
+            kwargs[buffer_name] = torch.empty(
+                shape, dtype=torch.float32, device="cuda:0"
+            )
+        elif invalid_kind in ("device", "other_gpu"):
+            kwargs[buffer_name] = torch.empty(
+                shape,
+                dtype=torch.uint8,
+                device="cpu" if invalid_kind == "device" else "cuda:1",
+            )
+        elif invalid_kind == "contiguous":
+            shape[-1] *= 2
+            kwargs[buffer_name] = torch.empty(
+                shape, dtype=torch.uint8, device="cuda:0"
+            )[..., ::2]
+
+    monkeypatch.setattr(module, "get_compute_capability", lambda device: (10, 7))
+
+    class ValidationPassed(Exception):
+        pass
+
+    def stop_before_kernel_setup(*args, **kwargs):
+        raise ValidationPassed
+
+    def forbid_allocation(*args, **kwargs):
+        pytest.fail("localized output validation must precede allocation")
+
+    monkeypatch.setattr(module, "get_cutlass_dtype", stop_before_kernel_setup)
+    monkeypatch.setattr(torch, "empty", forbid_allocation)
+    # These operands are not read until kernel setup; only output validation
+    # is under test here.
+    kwargs.update(
+        a_scale=None,
+        b_scale=None,
+        alpha=None,
+        tile_idx_to_expert_idx=None,
+        tile_idx_to_mn_limit=None,
+        num_non_exiting_tiles=None,
+        global_scale=object(),
+        c_dtype="float4_e2m1fn",
+        quantize_output=True,
+        domain_id=domain_id,
+        mma_tiler=(128, 128, 128),
+        mma_inst_shape=(128, 128, 64),
+    )
+    with pytest.raises(exception or ValidationPassed, match=match):
+        module.blockscaled_contiguous_gather_grouped_gemm_act_fusion(**kwargs)
 
 
 @cute_dsl_available
