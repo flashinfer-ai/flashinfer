@@ -54,6 +54,12 @@ cross-product this decomposition removed; prefer the standalone file.
 
 - `tile_tokens_dim` is an explicit argument: the permutation and padding
   outputs depend on the token-tile size the downstream grouped GEMM would use.
+- Routing writes -1 to unused `permuted_idx_to_token_idx` entries within active
+  tiles to suppress TMA gathers; allocation slack beyond the actual padded count
+  stays undefined. `test_routing_tile_padding` poisons the map before eager calls
+  and graph replays, changes routing on fixed buffers, and checks live mappings,
+  tile padding, and canaries across the block, cluster, cooperative and offsets
+  paths, including expert-parallel shards.
 - Routing weights are always `bfloat16` — `Routing::Runner` hard-codes
   `mDtypeOutput = Bfloat16` for every method, regardless of the logits dtype.
 - The kernels emit **no** expert ids in from-logits mode: `mPtrTopKIds` is
