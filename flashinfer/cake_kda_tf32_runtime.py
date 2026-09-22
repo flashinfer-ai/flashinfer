@@ -215,7 +215,7 @@ def _build_kda_module(factory, *args, **kwargs):
 
 'FlashKDA-compatible runtime for Blackwell schedules.\n\nMinimum architecture: sm_100a.\n\nThe public ``fwd`` boundary adds ``compute_dtype="bf16"`` to the FlashKDA\narguments. BF16 compute retains BF16/FP32 external state support; TF32 compute\nrequires FP32 initial/final state. Checkpoints remain BF16. Families without\na validated TF32 implementation report an explicit unsupported request. BF16 H12 dispatches\nbetween the chunk-16 and chunk-32 direct M128 bodies at their measured sequence\nlength crossover; sequences that fit in one 16-token tile and checkpoint\nintervals that require a physical 16-token boundary retain chunk-16.\nActive-FP32-beta H12 checkpoint64 requests on 152-SM GB300 use the M64 value\nsplit for 129-256-token residuals whose doubled task grid fits one SM wave.\nOther head counts dispatch among those direct bodies, the source static-binned\npersistent M128 body, its cross-CTA recurrence-piece specialization for\nquantization-bound uniform grids, and the M64 value-row split. FP32 state\nreuses those physical schedules as state-I/O specializations where validated.\nUnder-parallelized ultra-long fixed layouts additionally use a split-sequence\naffine-prefix DAG derived from FlashInfer PR4779; its main, map, and correction\nwindows reuse the same variable-shape direct-M128 identity. Remaining regions\nretain the source-derived compatibility fallback.\n'
 import heapq
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cache
 from typing import TYPE_CHECKING, Any
 
@@ -4443,6 +4443,14 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
         import torch
         import tvm_ffi
 
+        if self._descriptors_stale:
+            # A plan-cache hit under CUDA-graph capture marks the composite;
+            # every part re-encodes its descriptors in its own stream context.
+            for sub_name in AFFINE_SUB_LAUNCHES:
+                sub = getattr(self, sub_name, None)
+                if sub is not None:
+                    sub._descriptors_stale = True
+            self._descriptors_stale = False
         with tvm_ffi.use_torch_stream():
             for destination, source in self._affine_input_refreshes:
                 destination.copy_(source)
@@ -4856,10 +4864,53 @@ class RebindPlan:
     views: tuple[_RebindView, ...]
     addresses: tuple[_RebindAddress, ...]
     owned_keepalive: tuple[Any, ...]
+    sub_owned_keepalive: dict[str, tuple[Any, ...]] = field(default_factory=dict)
+
+
+# Split-sequence affine composites hold three prepared part launches plus a
+# few caller-aliasing attributes of their own; their containers are addressed
+# as "<sub launch>.<container>" so one rebind plan covers the whole DAG.
+AFFINE_SUB_LAUNCHES = ("_main", "_map", "_correction")
+AFFINE_REBIND_ATTRIBUTES = (
+    "_state_indices",
+    "_initial_pool",
+    "_initial_pool_pointer",
+    "_final_pool",
+    "_checkpoint_output",
+    "_checkpoint_start",
+    "_out_tail",
+)
+
+
+def _rebind_owner(impl, container_name: str):
+    """Resolve (owner object, base container name) for a plan container."""
+    if "." in container_name:
+        sub_name, base = container_name.split(".", 1)
+        return getattr(impl, sub_name), base
+    return impl, container_name
 
 
 def _rebind_containers(impl) -> dict[str, Any]:
-    containers: dict[str, Any] = {"args": impl.args}
+    if hasattr(impl, "_main"):
+        containers: dict[str, Any] = {}
+        for sub_name in AFFINE_SUB_LAUNCHES:
+            sub = getattr(impl, sub_name, None)
+            if sub is None:
+                continue
+            for key, value in _rebind_containers(sub).items():
+                containers[f"{sub_name}.{key}"] = value
+        containers["attributes"] = {
+            name: getattr(impl, name)
+            for name in AFFINE_REBIND_ATTRIBUTES
+            if getattr(impl, name, None) is not None
+        }
+        refreshes = getattr(impl, "_affine_input_refreshes", ())
+        if refreshes:
+            containers["affine_refresh_sources"] = {
+                index: source for index, (_, source) in enumerate(refreshes)
+            }
+        return containers
+    containers = {"args": impl.args}
     prepare_args = getattr(impl, "prepare_args", None)
     if prepare_args:
         containers["prepare_args"] = prepare_args
@@ -4892,8 +4943,6 @@ def capture_rebind_plan(impl, inputs: dict) -> RebindPlan:
     """
     import torch
 
-    if hasattr(impl, "_main"):
-        raise TypeError("split-sequence affine launches are not rebindable")
     storages: dict[int, tuple[str, Any, int]] = {}
     for name in REBIND_INPUT_NAMES:
         tensor = inputs.get(name)
@@ -4941,16 +4990,25 @@ def capture_rebind_plan(impl, inputs: dict) -> RebindPlan:
                             )
                         )
                         break
-    owned = tuple(
-        item
-        for item in getattr(impl, "_keepalive", ())
-        if not (isinstance(item, torch.Tensor) and classify(item) is not None)
-    )
+    def owned_items(owner):
+        return tuple(
+            item
+            for item in getattr(owner, "_keepalive", ())
+            if not (isinstance(item, torch.Tensor) and classify(item) is not None)
+        )
+
+    sub_owned = {}
+    if hasattr(impl, "_main"):
+        for sub_name in AFFINE_SUB_LAUNCHES:
+            sub = getattr(impl, sub_name, None)
+            if sub is not None:
+                sub_owned[sub_name] = owned_items(sub)
     return RebindPlan(
         signature=rebind_signature(inputs),
         views=tuple(views),
         addresses=tuple(addresses),
-        owned_keepalive=owned,
+        owned_keepalive=owned_items(impl),
+        sub_owned_keepalive=sub_owned,
     )
 
 
@@ -5010,32 +5068,51 @@ def rebind_prepared_launch(
         resolved[cache_key] = tensor
         return tensor
 
+    stale_owners: list = []
     for spec in plan.views:
         container = containers[spec.container]
         replacement = view_for(spec)
         if (
-            not tma_moved
-            and isinstance(spec.key, str)
+            isinstance(spec.key, str)
             and spec.key.endswith("_tma")
             and container[spec.key].data_ptr() != replacement.data_ptr()
         ):
             tma_moved = True
+            owner, _ = _rebind_owner(impl, spec.container)
+            if owner is not impl and owner not in stale_owners:
+                stale_owners.append(owner)
         container[spec.key] = replacement
     for spec in plan.addresses:
         containers[spec.container][spec.key] = (
             inputs[spec.input_name].data_ptr() + spec.byte_offset
         )
-    refresh_sources = containers.get("refresh_sources")
-    if refresh_sources is not None:
-        impl._token_storage_refreshes = tuple(
-            (destination, refresh_sources[index])
-            for index, (destination, _) in enumerate(impl._token_storage_refreshes)
-        )
-    for name, value in containers.get("attributes", {}).items():
-        setattr(impl, name, value)
-    impl._keepalive = plan.owned_keepalive + tuple(
+    new_inputs = tuple(
         inputs[name] for name in REBIND_INPUT_NAMES if inputs.get(name) is not None
     )
+    for container_name, container in containers.items():
+        owner, base = _rebind_owner(impl, container_name)
+        if base == "refresh_sources":
+            owner._token_storage_refreshes = tuple(
+                (destination, container[index])
+                for index, (destination, _) in enumerate(owner._token_storage_refreshes)
+            )
+        elif base == "affine_refresh_sources":
+            owner._affine_input_refreshes = tuple(
+                (destination, container[index])
+                for index, (destination, _) in enumerate(owner._affine_input_refreshes)
+            )
+        elif base == "attributes":
+            for name, value in container.items():
+                setattr(owner, name, value)
+    for sub_name, owned in plan.sub_owned_keepalive.items():
+        sub = getattr(impl, sub_name, None)
+        if sub is not None:
+            sub._keepalive = owned + new_inputs
+    for owner in stale_owners:
+        # Part launches re-encode their own descriptors inside their launch
+        # stream context (see _launch_uncaptured).
+        owner._descriptors_stale = True
+    impl._keepalive = plan.owned_keepalive + new_inputs
     return tma_moved
 
 

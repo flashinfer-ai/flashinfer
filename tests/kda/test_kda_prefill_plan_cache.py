@@ -164,21 +164,24 @@ def test_cache_keys_on_sequence_lengths_and_interleaves_entries():
         _assert_same(want, _snapshot(d))
 
 
-def test_split_sequence_affine_route_is_pass_through():
-    # A long bounded-gate sequence without a checkpoint request still takes
-    # the affine split route, whose multi-launch plan is not cached (the
-    # prepared API only accepts the FP32 state pool, on which unbounded
-    # sequences are routed sequentially).
+def test_split_sequence_affine_route_caches_and_rebinds():
+    # A long bounded-gate sequence without a checkpoint request takes the
+    # affine split route.  Its main/map/correction part launches and the
+    # composite's own caller-aliasing attributes are covered by one rebind
+    # plan, so a hit on a new address set reproduces a fresh preparation.
     cache = KDAPrefillPlanCache(8)
-    d = _inputs([8192], 12, seed=5)
-    pool = d["pool"].clone()
-    call = _run(d, cache, checkpoints=False, lower_bound=-5.0)
-    assert "affine" in str(call.schedule)
-    assert cache.uncacheable == 1 and len(cache) == 0
-    got = _snapshot(d)
-    d["pool"].copy_(pool)
-    _run(d, checkpoints=False, lower_bound=-5.0)
-    _assert_same(got, _snapshot(d))
+    first = _inputs([8192], 12, seed=5)
+    second = _inputs([8192], 12, seed=6)
+    pool_second = second["pool"].clone()
+    miss = _run(first, cache, checkpoints=False, lower_bound=-5.0)
+    assert "affine" in str(miss.schedule)
+    assert cache.uncacheable == 0 and len(cache) == 1
+    hit = _run(second, cache, checkpoints=False, lower_bound=-5.0)
+    assert hit is miss and cache.hits == 1
+    got = _snapshot(second)
+    second["pool"].copy_(pool_second)
+    _run(second, checkpoints=False, lower_bound=-5.0)
+    _assert_same(got, _snapshot(second))
 
 
 @pytest.mark.parametrize("checkpoints", [True, False])

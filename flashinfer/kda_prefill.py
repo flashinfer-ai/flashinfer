@@ -7487,7 +7487,7 @@ class KDAPrefillPlanCache:
         from .cake_kda_tf32_runtime import capture_rebind_plan
 
         owner = getattr(prepared, "_impl", prepared)
-        if hasattr(owner, "_main") or not hasattr(owner, "args"):
+        if not (hasattr(owner, "args") or hasattr(owner, "_main")):
             self.uncacheable += 1
             return False
         plan = capture_rebind_plan(owner, inputs)
