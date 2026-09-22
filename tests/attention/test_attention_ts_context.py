@@ -5390,3 +5390,59 @@ def test_attention_ts_context_mla_prefill(
         wrapper.run(q, k, v, qo, ko, out=torch.empty_like(q, dtype=torch.bfloat16))
     with pytest.raises(ValueError, match="v must have"):
         wrapper.run(q, k, torch.empty_like(k), qo, ko)
+
+
+# ---------------------------------------------------------------------------
+# Two-CTA UMMA (SM103 dense contiguous D128)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("pv_dtype", (torch.bfloat16, _FP8), ids=("pv-bf16", "pv-fp8"))
+@pytest.mark.arch_blackwell
+@_REQUIRES_CONTEXT_GPU
+def test_attention_ts_context_two_cta_matches_single_cta(monkeypatch, pv_dtype):
+    """The paired kernel reproduces the single-CTA kernel and the reference.
+
+    8456 tokens give 33 query tiles per (batch, head): the odd count exercises the
+    even-grid padding of the cluster launch, and the 8-row remainder exercises the
+    partial last tile under two-CTA. Two batches and two heads make the pairing
+    cross batch and head boundaries. The device default is overridden both ways
+    so the kernel is exercised on SM100 as well as SM103, where it is the default.
+    """
+
+    case = _make_context_case(
+        q_lengths=(8456, 8456),
+        k_lengths=(8456, 8456),
+        num_qo_heads=2,
+        num_kv_heads=2,
+        qkv_dtype=torch.bfloat16,
+        packed=False,
+        mask_type="dense",
+        output_dtype=torch.bfloat16,
+        output_scale=1.0,
+        seed=2026092201,
+    )
+    if pv_dtype is _FP8:
+        case = replace(case, v=case.v.to(_FP8))
+
+    monkeypatch.setattr(
+        context_module, "_default_two_cta_umma", lambda device_index: True
+    )
+    two_cta = BatchPrefillTSWrapper()
+    _plan_wrapper(two_cta, case)
+    assert two_cta._plan_state is not None
+    assert dict(two_cta._plan_state.policy)["scheduler"] == "nonpersistent"
+    out_two_cta = _run_wrapper(two_cta, case)
+    _assert_context_correct(out_two_cta, case)
+
+    monkeypatch.setattr(
+        context_module, "_default_two_cta_umma", lambda device_index: False
+    )
+    single_cta = BatchPrefillTSWrapper()
+    _plan_wrapper(single_cta, case)
+    out_single_cta = _run_wrapper(single_cta, case)
+    # Same per-row arithmetic in both forms; only the MMA M extent and the K/V
+    # staging differ, so the outputs agree to bf16 rounding.
+    torch.testing.assert_close(
+        out_two_cta.float(), out_single_cta.float(), atol=2e-3, rtol=1e-2
+    )
