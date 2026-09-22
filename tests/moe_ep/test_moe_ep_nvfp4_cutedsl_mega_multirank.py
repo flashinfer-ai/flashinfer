@@ -1236,6 +1236,7 @@ def _run_mega_torch_oracle(
         (True, "bf16", "swiglu"),
         (False, "nvfp4", "swiglu"),
         (False, "mxfp8", "swiglu"),
+        (False, "bf16", "situ"),
     ],
 )
 def test_moe_ep_nvfp4_cutedsl_mega_multirank_torch_oracle(
@@ -1259,19 +1260,6 @@ def test_moe_ep_nvfp4_cutedsl_mega_multirank_torch_oracle(
         f"combine={combine_dtype}, activation={activation}) matches the "
         "multi-rank torch oracle"
     )
-
-
-@pytest.mark.gpu_2
-@pytest.mark.arch_blackwell
-def test_moe_ep_nvfp4_cutedsl_mega_situ_multirank_torch_oracle():
-    """SiTU with real cross-rank dispatch/combine vs the global torch oracle."""
-    _require_cuda()
-    pytest.importorskip("triton")
-    rank, world_size = _launcher_ranks()
-    if world_size < 2:
-        pytest.skip("needs >=2 ranks")
-    rank = _run_mega_torch_oracle(rank, world_size, activation="situ")
-    print(f"rank {rank}: NVFP4 MegaMoE SiTU matches the multi-rank torch oracle")
 
 
 @pytest.mark.arch_blackwell
