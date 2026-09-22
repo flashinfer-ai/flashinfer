@@ -1823,7 +1823,7 @@ def create_throughput_latency_mma_task(
     )
 
 
-def create_keeps_mma_ab_mma_task(
+def create_single_kv_pipe_mma_task(
     smem_q,
     smem_kv,
     tmem_s,
@@ -1836,13 +1836,25 @@ def create_keeps_mma_ab_mma_task(
     task_class=MlaDecodeTask,
     **kw,
 ) -> Task:
-    """Create the keeps-MMA-AB single-pipe MMA task.
+    """Schedule one QK/PV stream with SMEM P (swap) or TMEM P (keep).
 
-    HEAD computes QK for K[0]. LOOP computes QK for K[n] before PV for
-    K[n-1], and TAIL drains PV for K[last].
+    HEAD computes the first QK; TAIL drains the last PV. Retaining one BF16
+    BK128 tile requires PV-before-next-QK; two retained tiles permit overlap.
     """
 
     work_tile_skip_if = runtime_work_tile_skip_if(work_queue)
+    swap = cfg.single_stream_swap
+    pv_mma = staged_pv_mma if swap else staged_pv_mma_tmem_p
+    pv_loop = "pv_mma_loop_0" if swap else "pv_mma_loop_tmem_p"
+    pv_tail = "pv_mma_tail_0" if swap else "pv_mma_tail_tmem_p"
+    v_desc = "v_desc_reused_0" if swap else "v_desc_reused"
+    if not cfg.sparse_reuse_kv:
+        v_desc = "v_desc_0"
+    pv_before_qk = (
+        cfg.sparse_reuse_kv
+        and not cfg.is_fp8_qkv()
+        and (swap or cfg.tile_size_kv == 128)
+    )
 
     @schedule
     def mma_schedule(
@@ -1853,16 +1865,20 @@ def create_keeps_mma_ab_mma_task(
         tmem_o,
         work_queue=None,
     ):
-        """Captured keeps-MMA-AB schedule with TMEM P."""
+        """Capture identical pipeline ownership for the two P layouts."""
         smem_q.init_descriptor_state()
         smem_kv.init_descriptor_state()
         tmem_o.init_mma_state()
-        tmem_p.init_stage_state()
+        if swap:
+            tmem_p.init_descriptor_state()
+        else:
+            tmem_p.init_stage_state()
 
         with work_tile_schedule_loop(work_queue, skip_if=work_tile_skip_if):
             if work_queue is not None:
                 tmem_s.reset_softmax_work_tile_state()
-                tmem_p.init_stage_work_tile_state()
+                if not swap:
+                    tmem_p.init_stage_work_tile_state()
             smem_q.wait()
             q_desc, q_desc_rope = smem_q.q_desc()
             tmem_s.set_q_desc(q_desc=q_desc, q_desc_rope=q_desc_rope)
@@ -1874,22 +1890,15 @@ def create_keeps_mma_ab_mma_task(
                 release_k=not cfg.sparse_reuse_kv,
             )
             with domain_loop(0, domain, 1):
-                # BK128 BF16 retains one K tile: consume PV before the next
-                # QK to release its stages. Native FP8 and BK64 BF16 retain
-                # two K tiles and keep QK-next/PV-previous overlap.
-                if (
-                    cfg.sparse_reuse_kv
-                    and not cfg.is_fp8_qkv()
-                    and cfg.tile_size_kv == 128
-                ):
-                    staged_pv_mma_tmem_p(
+                if pv_before_qk:
+                    pv_mma(
                         smem_kv,
                         tmem_p,
                         tmem_o,
                         head_dim_stages=cfg.v_head_dim_stages,
-                        consumer_label="v_desc_reused",
+                        consumer_label=v_desc,
                         reuse_k=True,
-                        producer_label="pv_mma_loop_tmem_p",
+                        producer_label=pv_loop,
                     )
                 staged_qk_mma(
                     smem_kv,
@@ -1898,144 +1907,24 @@ def create_keeps_mma_ab_mma_task(
                     consumer_label="k_desc_0",
                     release_k=not cfg.sparse_reuse_kv,
                 )
-                if (
-                    not cfg.sparse_reuse_kv
-                    or cfg.is_fp8_qkv()
-                    or cfg.tile_size_kv == 64
-                ):
-                    staged_pv_mma_tmem_p(
+                if not pv_before_qk:
+                    pv_mma(
                         smem_kv,
                         tmem_p,
                         tmem_o,
                         head_dim_stages=cfg.v_head_dim_stages,
-                        consumer_label=(
-                            "v_desc_reused" if cfg.sparse_reuse_kv else "v_desc_0"
-                        ),
+                        consumer_label=v_desc,
                         reuse_k=cfg.sparse_reuse_kv,
-                        producer_label="pv_mma_loop_tmem_p",
+                        producer_label=pv_loop,
                     )
-            staged_pv_mma_tmem_p(
+            pv_mma(
                 smem_kv,
                 tmem_p,
                 tmem_o,
                 head_dim_stages=cfg.v_head_dim_stages,
-                consumer_label="v_desc_reused" if cfg.sparse_reuse_kv else "v_desc_0",
+                consumer_label=v_desc,
                 reuse_k=cfg.sparse_reuse_kv,
-                producer_label="pv_mma_tail_tmem_p",
-            )
-            smem_q.release()
-
-    schedule_result = (
-        mma_schedule(smem_q, smem_kv, tmem_s, tmem_p, tmem_o)
-        if work_queue is None
-        else mma_schedule(smem_q, smem_kv, tmem_s, tmem_p, tmem_o, work_queue)
-    )
-    src = [smem_q, smem_kv, tmem_p]
-    if work_queue is not None:
-        src.append(work_queue)
-    return task_class(
-        src_resources=src,
-        dst_resources=[tmem_s, tmem_o],
-        cfg=cfg,
-        warp_idx=cfg.mma_warp_idx,
-        num_warps=cfg.mma_num_warps,
-        schedule=schedule_result,
-        num_registers=cfg.mma_load_regs,
-        name="MmaTask",
-        **kw,
-    )
-
-
-def create_single_swap_mma_task(
-    smem_q,
-    smem_kv,
-    tmem_s,
-    tmem_p,
-    tmem_o,
-    work_queue: WorkQueue | None,
-    cfg,
-    *,
-    domain,
-    task_class=MlaDecodeTask,
-    **kw,
-) -> Task:
-    """Create the swaps-MMA-AB single-pipe MMA task.
-
-    HEAD computes QK for K[0]. LOOP computes QK for K[n] before PV for
-    K[n-1], and TAIL drains PV for K[last].
-    """
-
-    work_tile_skip_if = runtime_work_tile_skip_if(work_queue)
-
-    @schedule
-    def mma_schedule(
-        smem_q,
-        smem_kv,
-        tmem_s,
-        tmem_p,
-        tmem_o,
-        work_queue=None,
-    ):
-        """Captured single-stream swap schedule with SMEM P."""
-        smem_q.init_descriptor_state()
-        smem_kv.init_descriptor_state()
-        tmem_o.init_mma_state()
-        tmem_p.init_descriptor_state()
-
-        with work_tile_schedule_loop(work_queue, skip_if=work_tile_skip_if):
-            if work_queue is not None:
-                tmem_s.reset_softmax_work_tile_state()
-            smem_q.wait()
-            q_desc, q_desc_rope = smem_q.q_desc()
-            tmem_s.set_q_desc(q_desc=q_desc, q_desc_rope=q_desc_rope)
-            staged_qk_mma(
-                smem_kv,
-                tmem_s,
-                head_dim_stages=cfg.qk_head_dim_stages,
-                consumer_label="k_desc_0",
-                release_k=not cfg.sparse_reuse_kv,
-            )
-            with domain_loop(0, domain, 1):
-                # BF16 retains one full K tile: consume its PV before the
-                # next QK so that four stages can be reused without deadlock.
-                # FP8 retains two tiles and keeps QK/PV overlap.
-                if cfg.sparse_reuse_kv and not cfg.is_fp8_qkv():
-                    staged_pv_mma(
-                        smem_kv,
-                        tmem_p,
-                        tmem_o,
-                        head_dim_stages=cfg.v_head_dim_stages,
-                        consumer_label="v_desc_reused_0",
-                        reuse_k=True,
-                        producer_label="pv_mma_loop_0",
-                    )
-                staged_qk_mma(
-                    smem_kv,
-                    tmem_s,
-                    head_dim_stages=cfg.qk_head_dim_stages,
-                    consumer_label="k_desc_0",
-                    release_k=not cfg.sparse_reuse_kv,
-                )
-                if not cfg.sparse_reuse_kv or cfg.is_fp8_qkv():
-                    staged_pv_mma(
-                        smem_kv,
-                        tmem_p,
-                        tmem_o,
-                        head_dim_stages=cfg.v_head_dim_stages,
-                        consumer_label=(
-                            "v_desc_reused_0" if cfg.sparse_reuse_kv else "v_desc_0"
-                        ),
-                        reuse_k=cfg.sparse_reuse_kv,
-                        producer_label="pv_mma_loop_0",
-                    )
-            staged_pv_mma(
-                smem_kv,
-                tmem_p,
-                tmem_o,
-                head_dim_stages=cfg.v_head_dim_stages,
-                consumer_label="v_desc_reused_0" if cfg.sparse_reuse_kv else "v_desc_0",
-                reuse_k=cfg.sparse_reuse_kv,
-                producer_label="pv_mma_tail_0",
+                producer_label=pv_tail,
             )
             smem_q.release()
 

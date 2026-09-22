@@ -68,11 +68,7 @@ def _base_fp8(rows, heads, capacity, sm_count):
     cluster_splits = 1 << ((capacity + 255) // 256 - 1).bit_length()
     m8_work = rows * ((heads + 7) // 8)
     one_tile_splits = (capacity + 127) // 128
-    if (
-        heads in (32, 64)
-        and capacity >= 512
-        and (rows >= (sm_count if heads == 32 else 2 * sm_count))
-    ):
+    if heads == 32 and capacity >= 512 and rows >= sm_count:
         return SparseMlaProfile(
             family="keep",
             direct_inputs=False,
@@ -346,15 +342,6 @@ def _choose_bf16(rows, heads, query_length, capacity, sm_count):
 
 def _size_buffers(profile, *, rows, heads, query_length, capacity, dtype, sm_count):
     if (
-        dtype == "bf16"
-        and profile.family == "keep"
-        and (profile.reuse_kv_stages == 5)
-        and (heads in (32, 64))
-        and (rows * 2 >= sm_count)
-        and (capacity >= 512)
-    ):
-        profile = replace(profile, gather_issue_warps=8, uniform_offset_cache=True)
-    if (
         dtype == "fp8"
         and heads == 128
         and (capacity >= 2048)
@@ -368,7 +355,13 @@ def _size_buffers(profile, *, rows, heads, query_length, capacity, dtype, sm_cou
         and (profile.reuse_kv_stages == 5)
         and (heads in (32, 64))
     ):
-        profile = replace(profile, defer_max_update=True)
+        # Both prefill and decode wide-BF16 reuse schedules share this budget.
+        profile = replace(
+            profile,
+            gather_issue_warps=8,
+            uniform_offset_cache=True,
+            defer_max_update=True,
+        )
         if query_length <= 8 and rows >= 2 * sm_count:
             profile = replace(profile, scheduler="clc", direct_inputs=True)
         if (

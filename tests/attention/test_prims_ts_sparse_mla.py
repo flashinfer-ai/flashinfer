@@ -355,6 +355,9 @@ def prepare_sparse_mla_metadata(
         pytest.param(64, 1, 128, 513, True, False, False, True, id="two-cta"),
         pytest.param(0, 1, 96, 513, True, False, False, True, id="partial-wide-heads"),
         pytest.param(
+            0, 1, 8, 513, True, False, False, True, id="single-stream-short-kv"
+        ),
+        pytest.param(
             0, 2, 8, 2049, True, False, False, True, id="small-head-long-kv-reuse"
         ),
         pytest.param(1, 0, 64, 513, True, False, False, True, id="multiwave-prefill"),
@@ -367,7 +370,7 @@ def prepare_sparse_mla_metadata(
 def test_native_graph(
     dtype, batch, queries, heads, topk, extra, packed, independent, prefix
 ):
-    # Scale the two multiwave cases with hardware, without asserting exact
+    # Scale throughput cases with hardware, without asserting exact
     # tiles, split counts, register budgets or private policy identities.
     sms = torch.cuda.get_device_properties(0).multi_processor_count
     batch = batch or sms

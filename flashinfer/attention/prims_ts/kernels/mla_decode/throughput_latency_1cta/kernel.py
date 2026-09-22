@@ -74,8 +74,7 @@ from .tasks import (
     MlaDecodeTask,
     create_throughput_latency_correction_task,
     create_keeps_mma_ab_correction_task,
-    create_keeps_mma_ab_mma_task,
-    create_single_swap_mma_task,
+    create_single_kv_pipe_mma_task,
     create_keeps_mma_ab_softmax_task,
     create_load_page_offsets_task,
     create_padding_task,
@@ -1483,11 +1482,7 @@ def _make_single_kv_pipe_task_graph(
                 task_class=MlaDecodeTask,
                 **task_domain_kwargs,
             ),
-            (
-                create_single_swap_mma_task
-                if cfg.single_stream_swap
-                else create_keeps_mma_ab_mma_task
-            )(
+            create_single_kv_pipe_mma_task(
                 smem_q,
                 smem_kv,
                 tmem_s,
@@ -2602,43 +2597,20 @@ class ThroughputLatencyMlaDecodeTs:
         cfg = self._make_config()
 
         if cutlass.const_expr(cfg.sparse_direct):
-            from ..sparse_views import (
-                SparseRouteView,
-                SparseLengthView,
-                SparseBatchRouteView,
-                SparseBatchLengthView,
-            )
+            from ..sparse_views import bind_sparse_views
 
             si, ci, sl, cl, sm, qs, ss, os, sinks = sparse_scale_params
-            if cutlass.const_expr(cfg.use_persistent_scheduler == 1):
-                page_offsets = SparseBatchRouteView(
-                    (si, ci, sl, cl),
-                    cfg.total_kv_tiles * cfg.tile_size_kv,
-                )
-                cache_seqs = SparseBatchLengthView((sl, cl))
-            else:
+            request = None
+            if cutlass.const_expr(cfg.use_persistent_scheduler != 1):
                 request = cutlass.Int64(cute.arch.block_idx()[2])
-                swa_length = Int32(sl[request])
-                compressed_length = Int32(cl[request])
-                selected_length = cute.math.max(
-                    (
-                        (swa_length + Int32(127)) // Int32(128)
-                        + (compressed_length + Int32(127)) // Int32(128)
-                    )
-                    * Int32(128),
-                    Int32(1),
-                )
-                page_offsets = SparseRouteView(
-                    (
-                        si,
-                        ci,
-                        swa_length,
-                        compressed_length,
-                        request,
-                    ),
-                    cfg.total_kv_tiles * cfg.tile_size_kv,
-                )
-                cache_seqs = SparseLengthView((selected_length, si.shape[0]))
+            page_offsets, cache_seqs = bind_sparse_views(
+                si,
+                ci,
+                sl,
+                cl,
+                cfg.total_kv_tiles * cfg.tile_size_kv,
+                request=request,
+            )
             if cutlass.const_expr(not cfg.sparse_static_scales):
                 softmax_scale_log2 = (
                     cutlass.Float32(sm[0])

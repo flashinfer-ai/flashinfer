@@ -84,20 +84,8 @@ class SparseRouteView:
             origin = self.primary_span if compressed else Int32(0)
             length = self.cl if compressed else self.sl
             return SparsePrefixMask((origin, length))
-        primary_ptr = self.si.iterator.toint() + self.row * Int64(
-            self.si.stride[0]
-        ) * Int64(4)
-        extra_ptr = self.ci.iterator.toint() + self.row * Int64(
-            self.ci.stride[0]
-        ) * Int64(4)
-        address = extra_ptr if compressed else primary_ptr
-        origin = self.primary_span if compressed else Int32(0)
-        length = self.cl if compressed else self.sl
-        indices = cute.make_tensor(
-            cute.make_ptr(Int32, address, assumed_align=4),
-            cute.make_layout((self.capacity,), stride=(1,)),
-        )
-        return SparseTileMask((indices, origin, length))
+        routes = self.routes_for_tile(token)
+        return SparseTileMask((routes.indices, routes.origin, routes.length))
 
     @cute.jit
     def is_invalid(self, token, request):
@@ -295,8 +283,35 @@ class SparseBatchLengthView:
 
     @cute.jit
     def __getitem__(self, request):
-        swa = (Int32(self.sl[request]) + Int32(127)) // Int32(128)
-        compressed = (Int32(self.cl[request]) + Int32(127)) // Int32(128)
-        # Keep one masked tile for an empty request so fused output publishes
-        # the sink-only result, matching the existing nonpersistent route.
-        return cute.math.max((swa + compressed) * Int32(128), Int32(1))
+        return _sparse_execution_length(
+            Int32(self.sl[request]), Int32(self.cl[request])
+        )
+
+
+@cute.jit
+def _sparse_execution_length(primary_length, extra_length):
+    primary_tiles = (primary_length + Int32(127)) // Int32(128)
+    extra_tiles = (extra_length + Int32(127)) // Int32(128)
+    # Empty requests still execute a masked tile to publish O=0 and LSE=-inf.
+    return cute.math.max((primary_tiles + extra_tiles) * Int32(128), Int32(1))
+
+
+@cute.jit
+def bind_sparse_views(
+    si,
+    ci,
+    sl,
+    cl,
+    capacity: cutlass.Constexpr[int],
+    *,
+    request=None,
+    assume_valid_prefix: cutlass.Constexpr[bool] = False,
+):
+    """Bind source lists to a work queue or to one nonpersistent request."""
+    routes = SparseBatchRouteView((si, ci, sl, cl), capacity, assume_valid_prefix)
+    if cutlass.const_expr(request is None):
+        return routes, SparseBatchLengthView((sl, cl))
+    else:
+        current = routes.for_request(request)
+        length = _sparse_execution_length(current.sl, current.cl)
+        return current, SparseLengthView((length, si.shape[0]))

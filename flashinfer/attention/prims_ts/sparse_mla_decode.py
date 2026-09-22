@@ -72,6 +72,18 @@ class SparseMLAPreparedMetadata(NamedTuple):
     scale_params: torch.Tensor | None = None
 
 
+def _fake_sparse_tensor(dtype, shape):
+    """Compact, four-byte-aligned ABI shared by sparse finishing kernels."""
+    import cutlass.cute as cute
+
+    return cute.runtime.make_fake_compact_tensor(
+        dtype,
+        shape,
+        stride_order=tuple(reversed(range(len(shape)))),
+        assumed_align=4,
+    )
+
+
 @functools.cache
 def _compile_finish(device_index, heads, independent):
     import cutlass
@@ -80,18 +92,10 @@ def _compile_finish(device_index, heads, independent):
 
     rows = cute.sym_int()
 
-    def tensor(dtype, shape):
-        return cute.runtime.make_fake_compact_tensor(
-            dtype,
-            shape,
-            stride_order=tuple(reversed(range(len(shape)))),
-            assumed_align=4,
-        )
-
     with torch.cuda.device(device_index):
-        partial = tensor(cutlass.BFloat16, (rows, heads, 512))
-        lse = tensor(cutlass.Float32, (rows, heads))
-        lens = tensor(cutlass.Int32, (rows,))
+        partial = _fake_sparse_tensor(cutlass.BFloat16, (rows, heads, 512))
+        lse = _fake_sparse_tensor(cutlass.Float32, (rows, heads))
+        lens = _fake_sparse_tensor(cutlass.Int32, (rows,))
         return cute.compile[cute.FrontendNext](
             FinishSparseMla(independent),
             partial,
@@ -100,7 +104,7 @@ def _compile_finish(device_index, heads, independent):
             lse,
             lens,
             lens,
-            tensor(cutlass.Float32, (heads,)),
+            _fake_sparse_tensor(cutlass.Float32, (heads,)),
             partial,
             lse,
             cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
@@ -116,23 +120,15 @@ def _compile_sparse_reduce(device_index, heads, storage_heads, splits, direct=Fa
 
     rows = cute.sym_int()
 
-    def tensor(dtype, shape):
-        return cute.runtime.make_fake_compact_tensor(
-            dtype,
-            shape,
-            stride_order=tuple(reversed(range(len(shape)))),
-            assumed_align=4,
-        )
-
     with torch.cuda.device(device_index):
         return cute.compile[cute.FrontendNext](
             FinishSparseMlaSplit(splits, direct),
-            tensor(cutlass.BFloat16, (rows, storage_heads, splits, 512)),
-            tensor(cutlass.Float32, (rows, storage_heads, splits)),
-            tensor(cutlass.Int32, (rows,)),
-            tensor(cutlass.Float32, (heads,)),
-            tensor(cutlass.BFloat16, (rows, heads, 512)),
-            tensor(cutlass.Float32, (rows, heads)),
+            _fake_sparse_tensor(cutlass.BFloat16, (rows, storage_heads, splits, 512)),
+            _fake_sparse_tensor(cutlass.Float32, (rows, storage_heads, splits)),
+            _fake_sparse_tensor(cutlass.Int32, (rows,)),
+            _fake_sparse_tensor(cutlass.Float32, (heads,)),
+            _fake_sparse_tensor(cutlass.BFloat16, (rows, heads, 512)),
+            _fake_sparse_tensor(cutlass.Float32, (rows, heads)),
             cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
             options="--enable-tvm-ffi --opt-level 2",
         )

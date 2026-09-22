@@ -169,12 +169,9 @@ def invalid_sparse_token(
     invalid = token >= length
     if cutlass.const_expr(sparse):
         if token < length:
-            if cutlass.const_expr(hasattr(routes, "is_invalid")):
-                invalid = routes.is_invalid(token, request)
-            else:
-                invalid = (Int32(routes[token, request]) & Int32(0x7FFFFFFF)) == Int32(
-                    0x7FFFFFFF
-                )
+            invalid = (Int32(routes[token, request]) & Int32(0x7FFFFFFF)) == Int32(
+                0x7FFFFFFF
+            )
     return invalid
 
 

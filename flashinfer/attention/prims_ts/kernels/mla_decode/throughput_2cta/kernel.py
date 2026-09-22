@@ -1014,6 +1014,26 @@ class MlaDecodeTs:
             self.parallel_reduction_topology = topology
             self.use_parallel_reduction = True
 
+    def _make_config(self):
+        """Share geometry and resource settings between launch and device code."""
+        return make_mla_decode_config(
+            mma_qk_tiler_mn=self.mma_qk_tiler_mn,
+            mma_pv_tiler_mn=self.mma_pv_tiler_mn,
+            rope_dim=self.rope_dim,
+            page_size=self.page_size,
+            qkv_dtype=self.qkv_dtype,
+            o_dtype=self.out_dtype,
+            max_active_clusters=self.max_active_clusters,
+            is_persistent=self.is_persistent,
+            is_var_seq=self.is_var_seq,
+            is_var_split_kv=self.is_var_split_kv,
+            mask_type=self.mask_type,
+            sparse_gather_warps=self.sparse_gather_warps,
+            sparse_kv_stages=self.sparse_kv_stages,
+            cache_uniform_sparse_pages=self.sparse_uniform_pages,
+            balance_sparse_registers=self.sparse_balanced_registers,
+        )
+
     @cute.jit
     def __call__(
         self,
@@ -1061,23 +1081,7 @@ class MlaDecodeTs:
                 raise ValueError(
                     "direct sparse 2CTA requires native FP8/BF16 D512 and fused output"
                 )
-        cfg = make_mla_decode_config(
-            mma_qk_tiler_mn=self.mma_qk_tiler_mn,
-            mma_pv_tiler_mn=self.mma_pv_tiler_mn,
-            rope_dim=self.rope_dim,
-            page_size=self.page_size,
-            qkv_dtype=self.qkv_dtype,
-            o_dtype=self.out_dtype,
-            max_active_clusters=self.max_active_clusters,
-            is_persistent=self.is_persistent,
-            is_var_seq=self.is_var_seq,
-            is_var_split_kv=self.is_var_split_kv,
-            mask_type=self.mask_type,
-            sparse_gather_warps=self.sparse_gather_warps,
-            sparse_kv_stages=self.sparse_kv_stages,
-            cache_uniform_sparse_pages=self.sparse_uniform_pages,
-            balance_sparse_registers=self.sparse_balanced_registers,
-        )
+        cfg = self._make_config()
         physical_tile_rows = self.mma_qk_tiler_mn[0]
         num_query_tiles = self.num_q_tiles
         # Fixed public tensors retain [H,D,SQ,B]/[H,SQ,B]; variable-Q tensors
@@ -1467,12 +1471,7 @@ class MlaDecodeTs:
     ) -> None:
         """MLA decode TS kernel: persistent tile-scheduled execution."""
         if cutlass.const_expr(self.direct_sparse):
-            from ..sparse_views import (
-                SparseRouteView,
-                SparseLengthView,
-                SparseBatchRouteView,
-                SparseBatchLengthView,
-            )
+            from ..sparse_views import bind_sparse_views
 
             si, ci, sl, cl, sm, qs, ss, os, sinks = block_split_kvs
             capacity = cutlass.const_expr(
@@ -1485,42 +1484,23 @@ class MlaDecodeTs:
                     * 128,
                 )
             )
-            if cutlass.const_expr(self.is_persistent):
-                page_offsets = SparseBatchRouteView(
-                    (si, ci, sl, cl),
-                    capacity,
-                    self.assume_valid_prefix,
-                )
-                cache_seqs = SparseBatchLengthView((sl, cl))
-            else:
+            request = None
+            if cutlass.const_expr(not self.is_persistent):
                 _, row = divmod_constexpr_power_of_two_or_fdd(
                     cute.arch.block_idx()[1],
                     None,
                     tile_sched_params.problem_shape_b_fdd,
                 )
                 request = Int64(row)
-                swa_length = Int32(sl[request])
-                compressed_length = Int32(cl[request])
-                selected_length = cute.math.max(
-                    (
-                        (swa_length + Int32(127)) // Int32(128)
-                        + (compressed_length + Int32(127)) // Int32(128)
-                    )
-                    * Int32(128),
-                    Int32(1),
-                )
-                page_offsets = SparseRouteView(
-                    (
-                        si,
-                        ci,
-                        swa_length,
-                        compressed_length,
-                        request,
-                    ),
-                    capacity,
-                    self.assume_valid_prefix,
-                )
-                cache_seqs = SparseLengthView((selected_length, si.shape[0]))
+            page_offsets, cache_seqs = bind_sparse_views(
+                si,
+                ci,
+                sl,
+                cl,
+                capacity,
+                request=request,
+                assume_valid_prefix=self.assume_valid_prefix,
+            )
             if cutlass.const_expr(not self.direct_static_scales):
                 softmax_scale_log2 = (
                     Float32(sm[0]) * Float32(qs[0]) * Float32(ss[0]) * LOG2_E
@@ -1533,23 +1513,7 @@ class MlaDecodeTs:
                 sinks = cute.make_tensor(
                     block_split_kvs.iterator + 2, cute.make_layout(self.num_heads)
                 )
-        cfg = make_mla_decode_config(
-            mma_qk_tiler_mn=self.mma_qk_tiler_mn,
-            mma_pv_tiler_mn=self.mma_pv_tiler_mn,
-            rope_dim=self.rope_dim,
-            page_size=self.page_size,
-            qkv_dtype=self.qkv_dtype,
-            o_dtype=self.out_dtype,
-            max_active_clusters=self.max_active_clusters,
-            is_persistent=self.is_persistent,
-            is_var_seq=self.is_var_seq,
-            is_var_split_kv=self.is_var_split_kv,
-            mask_type=self.mask_type,
-            sparse_gather_warps=self.sparse_gather_warps,
-            sparse_kv_stages=self.sparse_kv_stages,
-            cache_uniform_sparse_pages=self.sparse_uniform_pages,
-            balance_sparse_registers=self.sparse_balanced_registers,
-        )
+        cfg = self._make_config()
         num_query_tiles = self.num_q_tiles
         use_clc_dynamic = self.is_persistent and not cfg.is_fp8_qkv()
         tiled_mma_qk = None
