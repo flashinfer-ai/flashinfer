@@ -15,8 +15,16 @@ from flashinfer.attention.prims_ts import BatchSparseMLADecodePagedTSWrapper
 from flashinfer.testing.sparse_mla_metadata import prepare_sparse_mla_metadata
 
 w = BatchSparseMLADecodePagedTSWrapper()
-w.plan(q.device, B, H, max_topk=K, max_seq_len_q=SQ,
-       q_data_type=q.dtype, has_sinks=True, return_lse=True)
+w.plan(
+    q.device,
+    B,
+    H,
+    max_topk=K,
+    max_seq_len_q=SQ,
+    q_data_type=q.dtype,
+    has_sinks=True,
+    return_lse=True,
+)
 # Testing adapter; applications can provide equivalent metadata themselves.
 meta = prepare_sparse_mla_metadata(w, q, kv, indices, lengths, sinks=sinks)
 out, lse = w.run(q, kv, meta, sinks=sinks)

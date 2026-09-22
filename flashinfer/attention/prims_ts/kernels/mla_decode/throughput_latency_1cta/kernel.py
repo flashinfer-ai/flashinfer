@@ -1713,7 +1713,6 @@ class ThroughputLatencyMlaDecodeTs:
         self.fuse_sparse_epilogue = fuse_sparse_epilogue
         self.fuse_sparse_cluster_epilogue = False
         self.external_sparse_reduction = external_sparse_reduction
-        self.compact_sparse_loader = False
         self.balanced_sparse_registers = False
         self.direct_sparse = False
         self.direct_static_scales = False
@@ -1867,13 +1866,7 @@ class ThroughputLatencyMlaDecodeTs:
                 raise ValueError(
                     "gather tuning requires sparse swap-M8/M16/M32 or keep-M64"
                 )
-            if self.compact_sparse_loader:
-                if self.gather_issue_warps != 1:
-                    raise ValueError("compact sparse loader uses one issuing warp")
-                cfg = dataclass_replace(
-                    cfg, sparse_offset_cache=self.sparse_offset_cache
-                )
-            elif cfg.kernel_variant == "keeps_mma_ab":
+            if cfg.kernel_variant == "keeps_mma_ab":
                 cfg = dataclass_replace(
                     cfg,
                     threads_per_cta=640 if self.gather_issue_warps == 8 else 512,
@@ -1885,7 +1878,8 @@ class ThroughputLatencyMlaDecodeTs:
                     mma_load_regs=64,
                 )
             else:
-                # Keep all issuer-count experiments on the same 20-warp layout.
+                # Keep compute-role warp IDs fixed; eight issuers expand the
+                # CTA from 20 to 24 warps.
                 # M32 trades 16 softmax registers for its larger correction
                 # footprint while preserving the task manager's CTA budget.
                 cfg = dataclass_replace(

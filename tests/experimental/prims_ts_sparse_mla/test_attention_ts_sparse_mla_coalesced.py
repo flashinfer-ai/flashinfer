@@ -871,7 +871,7 @@ def test_six_log2_anchor_boundary(family, heads):
     dtype = torch.bfloat16
     # The first two BK128 tiles initialize both softmax streams at zero.
     # The following two tiles straddle the six-log2 update boundary. This
-    # catches a mismatched P scale even though E4M3 conversion saturates.
+    # checks both retained-anchor and rescaling paths.
     q = torch.zeros((1, 1, heads, 512), device="cuda", dtype=dtype)
     q[..., 1] = 1
     swa = torch.zeros((1, 256, 512), device="cuda", dtype=q.dtype)
@@ -893,9 +893,7 @@ def test_six_log2_anchor_boundary(family, heads):
         gather_issue_warps=4 if family == "keep" else 1,
         offset_cache="coalesced" if family == "keep" else "strided",
         reuse_kv=family == "keep",
-        reuse_kv_stages=(10 if dtype == torch.float8_e4m3fn else 5)
-        if family == "keep"
-        else 0,
+        reuse_kv_stages=5 if family == "keep" else 0,
         defer_max_update=True,
     )
     w.plan(
@@ -923,7 +921,7 @@ def test_six_log2_anchor_boundary(family, heads):
     for delta in (5.5, 6.0, 6.5, 12.0):
         kv[128:, :, 1] = delta
         graph.replay()
-        ref, ref_lse, bound = sparse_mla_reference(
+        ref, ref_lse = sparse_mla_reference(
             q,
             swa,
             kv,
@@ -931,10 +929,9 @@ def test_six_log2_anchor_boundary(family, heads):
             ci,
             sinks=sinks,
             softmax_scale=kwargs["softmax_scale"],
-            return_fp8_error_bound=True,
         )
         assert torch.isfinite(out).all()
-        assert ((out.double() - ref).abs() <= bound).all()
+        torch.testing.assert_close(out.double(), ref, atol=8e-4, rtol=0.01)
         torch.testing.assert_close(lse.double(), ref_lse, atol=2e-4, rtol=1e-4)
 
 

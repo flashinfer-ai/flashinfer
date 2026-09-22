@@ -279,7 +279,6 @@ class SparseMLADecodePlan:
                 mask_type="dense",
                 device_scales=True,
             )
-            kernel.compact_sparse_loader = tuning.compact_loader
             kernel.balanced_sparse_registers = tuning.balanced_registers
             kernel.reuse_sparse_kv = tuning.reuse_kv
             kernel.sparse_kv_tile_size = tuning.kv_tile_size
@@ -944,7 +943,9 @@ def batch_sparse_mla_decode_with_paged_kv_cache(
     Use a planned wrapper for CUDA Graph replay. Preparation remains external.
     """
     if torch.cuda.is_current_stream_capturing():
-        raise RuntimeError("plan SparseMLADecodePlan before CUDA Graph capture")
+        raise RuntimeError(
+            "plan BatchSparseMLADecodePagedTSWrapper before CUDA Graph capture"
+        )
     if not isinstance(metadata, SparseMLAPreparedMetadata):
         raise TypeError("metadata must be SparseMLAPreparedMetadata")
     packed = query.ndim == 3

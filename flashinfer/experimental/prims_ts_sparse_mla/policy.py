@@ -39,7 +39,6 @@ class _SparseMlaTuning:
     offset_cache: str = "strided"
     fuse_epilogue: bool = False
     direct_inputs: bool = False
-    compact_loader: bool = False
     balanced_registers: bool = False
     reuse_kv: bool = False
     reuse_kv_stages: int = 0
