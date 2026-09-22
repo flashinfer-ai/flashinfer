@@ -1,0 +1,750 @@
+{
+  "architecture": "sm_110a",
+  "files": {
+    "sm_110a/sm110_xqa_decode_fp16_contiguous_binding.cu": {
+      "sha256": "30d25d991c2d0fd6ea8af178fb50b8c597fbe1e111e16fa6d2374d1c7e77ccdf"
+    },
+    "sm_110a/sm110_xqa_decode_fp16_contiguous_kernel.cu": {
+      "sha256": "b9f285fcb0cd3fd8538d29594d6bfd0a4c820559b3ffdd51ee10d83cfcda414d"
+    },
+    "sm_110a/sm110_xqa_decode_fp16_contiguous_single_partition_binding.cu": {
+      "sha256": "3c425b0a2add7015cb7996bd209689f00df3b477975723a8257915834e1b46d2"
+    },
+    "sm_110a/sm110_xqa_decode_fp16_contiguous_single_partition_kernel.cu": {
+      "sha256": "9db559643dde027f3fd80a12efbf58817f53f7a64aae142f992c00069486600f"
+    },
+    "sm_110a/sm110_xqa_decode_merge_binding.cu": {
+      "sha256": "843e12279bc1ca9cec9e68423a34ac9bfe108cbec5fc7e5192495df790b143c0"
+    },
+    "sm_110a/sm110_xqa_decode_merge_kernel.cu": {
+      "sha256": "8caa8dc2eb6e6b136ebf09087b8f8f4b1d528a8aa75f14a9f28711d92d75a17b"
+    },
+    "sm_110a/sm110_xqa_tree_fp16_contiguous_binding.cu": {
+      "sha256": "3447c68e901843e5bce794b742f896f9a16d7a8cb7491eb3dcc735ef359e008b"
+    },
+    "sm_110a/sm110_xqa_tree_fp16_contiguous_kernel.cu": {
+      "sha256": "ca8ca959534144b18756cab5c5288e4a9cef88153786e7ac742b55f475f9ac18"
+    },
+    "sm_110a/sm110_xqa_tree_fp16_paged_binding.cu": {
+      "sha256": "a291f25e709abbd60aa74f60eb6bc9c11b508ef352184fd3f4a0803ca026dc48"
+    },
+    "sm_110a/sm110_xqa_tree_fp16_paged_kernel.cu": {
+      "sha256": "2213de7d2f75879529a8bb223e23131c51d283659286d936f3c0e8d5f9082348"
+    },
+    "sm_110a/sm110_xqa_tree_fp8_contiguous_binding.cu": {
+      "sha256": "f114800fff81ec7092824080927b505326be0472842ab159d13fc7e331a6be76"
+    },
+    "sm_110a/sm110_xqa_tree_fp8_contiguous_kernel.cu": {
+      "sha256": "094c8e88f8a32ffbccb9390ef352127f05fb163a6f50de94fc4838fbbedfd052"
+    },
+    "sm_110a/sm110_xqa_tree_fp8_paged_binding.cu": {
+      "sha256": "59a4b291c580b8b3a423c06db4038ce0af9dd7d9875bd9524954d2b6601941b1"
+    },
+    "sm_110a/sm110_xqa_tree_fp8_paged_kernel.cu": {
+      "sha256": "5bf260c9792e85fd1ed6679b57fb4c525a9c23416732a47cfd0e7d1b90842e5f"
+    }
+  },
+  "routes": {
+    "decode_fp16_contiguous": {
+      "block": [
+        128,
+        1,
+        1
+      ],
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "cooperative": false,
+      "counter_initialization": "zero_at_prepare",
+      "device_parameters": [
+        {
+          "ctype": "const __half*",
+          "kind": "pointer",
+          "name": "q"
+        },
+        {
+          "ctype": "const __half*",
+          "kind": "pointer",
+          "name": "kv"
+        },
+        {
+          "ctype": "const int*",
+          "kind": "pointer",
+          "name": "sequence_lengths"
+        },
+        {
+          "ctype": "__half*",
+          "kind": "pointer",
+          "name": "output"
+        },
+        {
+          "ctype": "float*",
+          "kind": "pointer",
+          "name": "partial"
+        },
+        {
+          "ctype": "float*",
+          "kind": "pointer",
+          "name": "statistics"
+        },
+        {
+          "ctype": "uint32_t*",
+          "kind": "pointer",
+          "name": "counters"
+        },
+        {
+          "ctype": "uint32_t",
+          "kind": "value",
+          "name": "heads"
+        },
+        {
+          "ctype": "uint32_t",
+          "kind": "value",
+          "name": "ratio"
+        },
+        {
+          "ctype": "uint32_t",
+          "kind": "value",
+          "name": "capacity"
+        },
+        {
+          "ctype": "uint32_t",
+          "kind": "value",
+          "name": "partitions"
+        },
+        {
+          "ctype": "uint32_t",
+          "kind": "value",
+          "name": "partition_tokens"
+        },
+        {
+          "ctype": "float",
+          "kind": "value",
+          "name": "attention_scale"
+        }
+      ],
+      "dynamic_smem_bytes": 50176,
+      "ffi_entry": "run_decode",
+      "fused_merge": true,
+      "half_warp_merge": true,
+      "kernel_symbol": "kernel_sm110_xqa_decode_fp16_contiguous",
+      "merge_stats_cache": true,
+      "nvcc_options": [
+        "--use_fast_math"
+      ],
+      "partition_tokens": 256,
+      "single_partition_route": "decode_fp16_contiguous_single_partition",
+      "sources": [
+        "sm_110a/sm110_xqa_decode_fp16_contiguous_kernel.cu",
+        "sm_110a/sm110_xqa_decode_fp16_contiguous_binding.cu"
+      ],
+      "tmem_columns": 256,
+      "use_pdl": false,
+      "workspace_replay": "ordered"
+    },
+    "decode_fp16_contiguous_single_partition": {
+      "block": [
+        128,
+        1,
+        1
+      ],
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "cooperative": false,
+      "counter_initialization": "zero_at_prepare",
+      "device_parameters": [
+        {
+          "ctype": "const __half*",
+          "kind": "pointer",
+          "name": "q"
+        },
+        {
+          "ctype": "const __half*",
+          "kind": "pointer",
+          "name": "kv"
+        },
+        {
+          "ctype": "const int*",
+          "kind": "pointer",
+          "name": "sequence_lengths"
+        },
+        {
+          "ctype": "__half*",
+          "kind": "pointer",
+          "name": "output"
+        },
+        {
+          "ctype": "float*",
+          "kind": "pointer",
+          "name": "partial"
+        },
+        {
+          "ctype": "float*",
+          "kind": "pointer",
+          "name": "statistics"
+        },
+        {
+          "ctype": "uint32_t*",
+          "kind": "pointer",
+          "name": "counters"
+        },
+        {
+          "ctype": "uint32_t",
+          "kind": "value",
+          "name": "heads"
+        },
+        {
+          "ctype": "uint32_t",
+          "kind": "value",
+          "name": "ratio"
+        },
+        {
+          "ctype": "uint32_t",
+          "kind": "value",
+          "name": "capacity"
+        },
+        {
+          "ctype": "uint32_t",
+          "kind": "value",
+          "name": "partitions"
+        },
+        {
+          "ctype": "uint32_t",
+          "kind": "value",
+          "name": "partition_tokens"
+        },
+        {
+          "ctype": "float",
+          "kind": "value",
+          "name": "attention_scale"
+        }
+      ],
+      "dynamic_smem_bytes": 50176,
+      "ffi_entry": "run_decode",
+      "fused_merge": true,
+      "half_warp_merge": true,
+      "kernel_symbol": "kernel_sm110_xqa_decode_fp16_contiguous_single_partition",
+      "merge_stats_cache": false,
+      "nvcc_options": [
+        "--use_fast_math"
+      ],
+      "partition_tokens": 256,
+      "sources": [
+        "sm_110a/sm110_xqa_decode_fp16_contiguous_single_partition_kernel.cu",
+        "sm_110a/sm110_xqa_decode_fp16_contiguous_single_partition_binding.cu"
+      ],
+      "tmem_columns": 256,
+      "use_pdl": false,
+      "workspace_replay": "ordered"
+    },
+    "decode_merge": {
+      "block": [
+        128,
+        1,
+        1
+      ],
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "cooperative": false,
+      "device_parameters": [
+        {
+          "ctype": "const float*",
+          "kind": "pointer",
+          "name": "partial"
+        },
+        {
+          "ctype": "const float*",
+          "kind": "pointer",
+          "name": "statistics"
+        },
+        {
+          "ctype": "__half*",
+          "kind": "pointer",
+          "name": "output"
+        },
+        {
+          "ctype": "uint32_t",
+          "kind": "value",
+          "name": "partitions"
+        }
+      ],
+      "dynamic_smem_bytes": 0,
+      "ffi_entry": "run_decode_merge",
+      "kernel_symbol": "kernel_sm110_xqa_decode_merge",
+      "nvcc_options": [
+        "--use_fast_math"
+      ],
+      "sources": [
+        "sm_110a/sm110_xqa_decode_merge_kernel.cu",
+        "sm_110a/sm110_xqa_decode_merge_binding.cu"
+      ],
+      "tmem_columns": 0,
+      "use_pdl": false
+    },
+    "tree_fp16_contiguous": {
+      "block": [
+        256,
+        1,
+        1
+      ],
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "cooperative": false,
+      "copy_warps": 8,
+      "device_parameters": [
+        {
+          "ctype": "uint32_t",
+          "kind": "value",
+          "name": "q_seq_len"
+        },
+        {
+          "ctype": "uint32_t",
+          "kind": "value",
+          "name": "num_kv_heads"
+        },
+        {
+          "ctype": "uint32_t",
+          "kind": "value",
+          "name": "head_group_size"
+        },
+        {
+          "ctype": "const uint32_t*",
+          "kind": "pointer",
+          "name": "q_cu_seq_lens"
+        },
+        {
+          "ctype": "float",
+          "kind": "value",
+          "name": "attention_scale"
+        },
+        {
+          "ctype": "__half*",
+          "kind": "pointer",
+          "name": "output"
+        },
+        {
+          "ctype": "const __half*",
+          "kind": "pointer",
+          "name": "q"
+        },
+        {
+          "ctype": "const uint32_t*",
+          "kind": "pointer",
+          "name": "mask"
+        },
+        {
+          "ctype": "const uint8_t*",
+          "kind": "pointer",
+          "name": "cache"
+        },
+        {
+          "ctype": "const int*",
+          "kind": "pointer",
+          "name": "sequence_lengths"
+        },
+        {
+          "ctype": "const int*",
+          "kind": "pointer",
+          "name": "page_list"
+        },
+        {
+          "ctype": "uint32_t",
+          "kind": "value",
+          "name": "capacity"
+        },
+        {
+          "ctype": "uint32_t",
+          "kind": "value",
+          "name": "max_pages"
+        },
+        {
+          "ctype": "float",
+          "kind": "value",
+          "name": "k_cache_scale"
+        },
+        {
+          "ctype": "float",
+          "kind": "value",
+          "name": "v_cache_scale"
+        }
+      ],
+      "dynamic_smem_bytes": 164864,
+      "ffi_entry": "run_tree",
+      "fp16_k_prefetch": true,
+      "fp16_v_qk_overlap": true,
+      "kernel_symbol": "kernel_sm110_xqa_tree_fp16_contiguous",
+      "nvcc_options": [
+        "--use_fast_math"
+      ],
+      "output_tile_columns": 256,
+      "page_hoist": false,
+      "prefix_fastpath": true,
+      "raw_fp8_prefetch": false,
+      "raw_fp8_stage": false,
+      "sources": [
+        "sm_110a/sm110_xqa_tree_fp16_contiguous_kernel.cu",
+        "sm_110a/sm110_xqa_tree_fp16_contiguous_binding.cu"
+      ],
+      "tile_rows": 64,
+      "tmem_columns": 512,
+      "use_pdl": false
+    },
+    "tree_fp16_paged": {
+      "block": [
+        256,
+        1,
+        1
+      ],
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "cooperative": false,
+      "copy_warps": 8,
+      "device_parameters": [
+        {
+          "ctype": "uint32_t",
+          "kind": "value",
+          "name": "q_seq_len"
+        },
+        {
+          "ctype": "uint32_t",
+          "kind": "value",
+          "name": "num_kv_heads"
+        },
+        {
+          "ctype": "uint32_t",
+          "kind": "value",
+          "name": "head_group_size"
+        },
+        {
+          "ctype": "const uint32_t*",
+          "kind": "pointer",
+          "name": "q_cu_seq_lens"
+        },
+        {
+          "ctype": "float",
+          "kind": "value",
+          "name": "attention_scale"
+        },
+        {
+          "ctype": "__half*",
+          "kind": "pointer",
+          "name": "output"
+        },
+        {
+          "ctype": "const __half*",
+          "kind": "pointer",
+          "name": "q"
+        },
+        {
+          "ctype": "const uint32_t*",
+          "kind": "pointer",
+          "name": "mask"
+        },
+        {
+          "ctype": "const uint8_t*",
+          "kind": "pointer",
+          "name": "cache"
+        },
+        {
+          "ctype": "const int*",
+          "kind": "pointer",
+          "name": "sequence_lengths"
+        },
+        {
+          "ctype": "const int*",
+          "kind": "pointer",
+          "name": "page_list"
+        },
+        {
+          "ctype": "uint32_t",
+          "kind": "value",
+          "name": "capacity"
+        },
+        {
+          "ctype": "uint32_t",
+          "kind": "value",
+          "name": "max_pages"
+        },
+        {
+          "ctype": "float",
+          "kind": "value",
+          "name": "k_cache_scale"
+        },
+        {
+          "ctype": "float",
+          "kind": "value",
+          "name": "v_cache_scale"
+        }
+      ],
+      "dynamic_smem_bytes": 164864,
+      "ffi_entry": "run_tree",
+      "fp16_k_prefetch": true,
+      "fp16_v_qk_overlap": true,
+      "kernel_symbol": "kernel_sm110_xqa_tree_fp16_paged",
+      "nvcc_options": [
+        "--use_fast_math"
+      ],
+      "output_tile_columns": 256,
+      "page_hoist": true,
+      "prefix_fastpath": true,
+      "raw_fp8_prefetch": false,
+      "raw_fp8_stage": false,
+      "sources": [
+        "sm_110a/sm110_xqa_tree_fp16_paged_kernel.cu",
+        "sm_110a/sm110_xqa_tree_fp16_paged_binding.cu"
+      ],
+      "tile_rows": 64,
+      "tmem_columns": 512,
+      "use_pdl": false
+    },
+    "tree_fp8_contiguous": {
+      "block": [
+        256,
+        1,
+        1
+      ],
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "cooperative": false,
+      "copy_warps": 8,
+      "device_parameters": [
+        {
+          "ctype": "uint32_t",
+          "kind": "value",
+          "name": "q_seq_len"
+        },
+        {
+          "ctype": "uint32_t",
+          "kind": "value",
+          "name": "num_kv_heads"
+        },
+        {
+          "ctype": "uint32_t",
+          "kind": "value",
+          "name": "head_group_size"
+        },
+        {
+          "ctype": "const uint32_t*",
+          "kind": "pointer",
+          "name": "q_cu_seq_lens"
+        },
+        {
+          "ctype": "float",
+          "kind": "value",
+          "name": "attention_scale"
+        },
+        {
+          "ctype": "__half*",
+          "kind": "pointer",
+          "name": "output"
+        },
+        {
+          "ctype": "const __half*",
+          "kind": "pointer",
+          "name": "q"
+        },
+        {
+          "ctype": "const uint32_t*",
+          "kind": "pointer",
+          "name": "mask"
+        },
+        {
+          "ctype": "const uint8_t*",
+          "kind": "pointer",
+          "name": "cache"
+        },
+        {
+          "ctype": "const int*",
+          "kind": "pointer",
+          "name": "sequence_lengths"
+        },
+        {
+          "ctype": "const int*",
+          "kind": "pointer",
+          "name": "page_list"
+        },
+        {
+          "ctype": "uint32_t",
+          "kind": "value",
+          "name": "capacity"
+        },
+        {
+          "ctype": "uint32_t",
+          "kind": "value",
+          "name": "max_pages"
+        },
+        {
+          "ctype": "float",
+          "kind": "value",
+          "name": "k_cache_scale"
+        },
+        {
+          "ctype": "float",
+          "kind": "value",
+          "name": "v_cache_scale"
+        }
+      ],
+      "dynamic_smem_bytes": 214016,
+      "ffi_entry": "run_tree",
+      "fp16_k_prefetch": false,
+      "fp16_v_qk_overlap": false,
+      "kernel_symbol": "kernel_sm110_xqa_tree_fp8_contiguous",
+      "nvcc_options": [
+        "--use_fast_math"
+      ],
+      "output_tile_columns": 256,
+      "page_hoist": false,
+      "prefix_fastpath": true,
+      "raw_fp8_prefetch": true,
+      "raw_fp8_stage": true,
+      "sources": [
+        "sm_110a/sm110_xqa_tree_fp8_contiguous_kernel.cu",
+        "sm_110a/sm110_xqa_tree_fp8_contiguous_binding.cu"
+      ],
+      "tile_rows": 64,
+      "tmem_columns": 512,
+      "use_pdl": false
+    },
+    "tree_fp8_paged": {
+      "block": [
+        256,
+        1,
+        1
+      ],
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "cooperative": false,
+      "copy_warps": 8,
+      "device_parameters": [
+        {
+          "ctype": "uint32_t",
+          "kind": "value",
+          "name": "q_seq_len"
+        },
+        {
+          "ctype": "uint32_t",
+          "kind": "value",
+          "name": "num_kv_heads"
+        },
+        {
+          "ctype": "uint32_t",
+          "kind": "value",
+          "name": "head_group_size"
+        },
+        {
+          "ctype": "const uint32_t*",
+          "kind": "pointer",
+          "name": "q_cu_seq_lens"
+        },
+        {
+          "ctype": "float",
+          "kind": "value",
+          "name": "attention_scale"
+        },
+        {
+          "ctype": "__half*",
+          "kind": "pointer",
+          "name": "output"
+        },
+        {
+          "ctype": "const __half*",
+          "kind": "pointer",
+          "name": "q"
+        },
+        {
+          "ctype": "const uint32_t*",
+          "kind": "pointer",
+          "name": "mask"
+        },
+        {
+          "ctype": "const uint8_t*",
+          "kind": "pointer",
+          "name": "cache"
+        },
+        {
+          "ctype": "const int*",
+          "kind": "pointer",
+          "name": "sequence_lengths"
+        },
+        {
+          "ctype": "const int*",
+          "kind": "pointer",
+          "name": "page_list"
+        },
+        {
+          "ctype": "uint32_t",
+          "kind": "value",
+          "name": "capacity"
+        },
+        {
+          "ctype": "uint32_t",
+          "kind": "value",
+          "name": "max_pages"
+        },
+        {
+          "ctype": "float",
+          "kind": "value",
+          "name": "k_cache_scale"
+        },
+        {
+          "ctype": "float",
+          "kind": "value",
+          "name": "v_cache_scale"
+        }
+      ],
+      "dynamic_smem_bytes": 214016,
+      "ffi_entry": "run_tree",
+      "fp16_k_prefetch": false,
+      "fp16_v_qk_overlap": false,
+      "kernel_symbol": "kernel_sm110_xqa_tree_fp8_paged",
+      "nvcc_options": [
+        "--use_fast_math"
+      ],
+      "output_tile_columns": 256,
+      "page_hoist": true,
+      "prefix_fastpath": true,
+      "raw_fp8_prefetch": true,
+      "raw_fp8_stage": true,
+      "sources": [
+        "sm_110a/sm110_xqa_tree_fp8_paged_kernel.cu",
+        "sm_110a/sm110_xqa_tree_fp8_paged_binding.cu"
+      ],
+      "tile_rows": 64,
+      "tmem_columns": 512,
+      "use_pdl": false
+    }
+  },
+  "schema": "flashinfer.sm110_xqa.v1",
+  "shape_count": 7,
+  "shape_denominator": [
+    "tree_fp16_contiguous",
+    "tree_fp16_paged",
+    "tree_fp8_contiguous",
+    "tree_fp8_paged",
+    "decode_b1_c1024",
+    "decode_b2_c512",
+    "decode_b4_c256"
+  ],
+  "shape_ledger_sha256": "a23f0c1a390d8feb860b7cdbd4c99f17b9f806d70cb429602c86d094a88c4b8d",
+  "validation_status": "source_only_unvalidated"
+}
