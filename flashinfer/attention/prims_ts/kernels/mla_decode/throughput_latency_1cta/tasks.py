@@ -14,6 +14,7 @@
 
 """Captured task schedules for the throughput-latency 1CTA MLA TS path."""
 
+import cutlass
 import cutlass.cute as cute
 from cutlass import Int32
 from cutlass.experimental import primitives as prims
@@ -66,6 +67,10 @@ class MlaDecodeTask(Task):
         self._local_warp_idx = Int32(0)
         self._lane_idx = Int32(0)
         self._seq_len_kv = Int32(0)
+        self._k_tile_start = Int32(0)
+        self._partial_idx = Int32(0)
+        self._split_count = Int32(1)
+        self._descriptor_tile_count = Int32(0)
 
     def init_variables(self, context=None):
         """Initialize per-task thread cache and TMEM base state."""
@@ -98,15 +103,71 @@ class MlaDecodeTask(Task):
             self._local_warp_idx,
             self._lane_idx,
             self._seq_len_kv,
-            Int32(0),
-            Int32(0),
-            Int32(0),
+            self._k_tile_start,
+            self._partial_idx,
+            self._split_count,
+            self._descriptor_tile_count,
         )
 
     def get_domain(self, tile_coord):
         """Return the runtime loop domain for the current 1CTA work tile."""
         if self.cfg is None:
             return self.domain
+
+        if cutlass.const_expr(self.cfg.use_balanced_scheduler):
+            packed_batch_head_idx = Int32(tile_coord[2])
+            descriptor_capacity = Int32(self.cfg.balanced_descriptor_capacity)
+            descriptor_idx = packed_batch_head_idx % descriptor_capacity
+            work_queue = self.work_queue
+            request_idx = Int32(
+                work_queue.balanced_work_descriptors[descriptor_idx, Int32(0)]
+            )
+            self._k_tile_start = Int32(
+                work_queue.balanced_work_descriptors[descriptor_idx, Int32(1)]
+            )
+            k_tile_end = Int32(
+                work_queue.balanced_work_descriptors[descriptor_idx, Int32(2)]
+            )
+            split_info = Int32(
+                work_queue.balanced_work_descriptors[descriptor_idx, Int32(3)]
+            )
+            is_split = split_info & Int32(1)
+            descriptor_tile_count = k_tile_end - self._k_tile_start
+            self._descriptor_tile_count = descriptor_tile_count
+            self._partial_idx = is_split * ((split_info >> Int32(1)) & Int32(0xFFF)) - (
+                Int32(1) - is_split
+            )
+            self._split_count = is_split * ((split_info >> Int32(13)) & Int32(0x7F)) + (
+                Int32(1) - is_split
+            )
+            self._seq_len_kv = runtime_base_seq_len_kv(
+                self.cfg, self.seqlens_kv, request_idx
+            )
+            cta_idx_q = Int32(tile_coord[0])
+            seq_len_kv = runtime_seq_len_kv_from_task_cache(
+                self.cfg,
+                self.make_task_cache(),
+                cta_idx_q,
+                self.cu_seqlens_q,
+                request_idx,
+            )
+            total_kv_tiles = runtime_local_kv_tiles(self.cfg, seq_len_kv)
+            # In balanced mode runtime_local_kv_tiles reflects the synthetic
+            # rectangular capacity. The descriptor owns an absolute K range,
+            # so clamp it against the real unpartitioned tile count instead.
+            total_kv_tiles = (seq_len_kv + Int32(self.cfg.tile_size_kv - 1)) // Int32(
+                self.cfg.tile_size_kv
+            )
+            local_kv_tiles = cute.math.min(
+                descriptor_tile_count,
+                cute.math.max(total_kv_tiles - self._k_tile_start, Int32(0)),
+            )
+            remaining_kv_tiles = cute.math.max(
+                local_kv_tiles - Int32(self.cfg.num_insts_kv), Int32(0)
+            )
+            num_insts_kv = Int32(self.cfg.num_insts_kv)
+            loop_domain = (remaining_kv_tiles + num_insts_kv - Int32(1)) // num_insts_kv
+            return loop_domain + Int32(self.domain_bias)
 
         # Persistent 1CTA coordinates combine batch and head tile in z;
         # non-persistent grids keep z as batch. cache_seqs remains batch-owned.
@@ -210,14 +271,15 @@ def create_throughput_latency_softmax_task_impl(
             )
             tmem_softmax_local.commit()
 
-        def init_work_tile_state():
+        def init_register_work_tile_state():
+            """Create the register-resident state used by both variants."""
             return tmem_s.init_softmax_work_tile_state()
 
         with work_tile_schedule_loop(
             work_queue,
             skip_if=work_tile_skip_if,
             non_skippable_prelude=(
-                init_work_tile_state if work_queue is not None else None
+                init_register_work_tile_state if work_queue is not None else None
             ),
         ) as (_, work_tile_state):
             if work_queue is not None:
@@ -228,6 +290,12 @@ def create_throughput_latency_softmax_task_impl(
                     local_sum_arr,
                     s_arr,
                 ) = work_tile_state
+                # The prelude above refreshes all register arrays for both
+                # variants. Keeps-MMA-AB additionally carries its q64 running
+                # max/sum through shared scratch; swaps-MMA-AB has no analogous
+                # scratch state to reset.
+                if cfg.kernel_variant == "keeps_mma_ab":
+                    tmem_s.reset_keeps_softmax_work_tile_scratch()
             with domain_loop(0, domain, 1) as d:
                 tmem_s.wait()
                 (

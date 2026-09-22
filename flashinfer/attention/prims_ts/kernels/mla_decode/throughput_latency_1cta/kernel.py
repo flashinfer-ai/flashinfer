@@ -94,7 +94,20 @@ from .parallel_reduction import (
     supports_parallel_gmem_reduction,
 )
 from .reduction import gmem_reduction_launch_shape, run_gmem_reduction_kernel
-from ..helpers.constants import TMEM_LIFECYCLE_BARRIER_ID
+from ..throughput_2cta.config import (
+    REDUCTION_ROWS_PER_CTA as BALANCED_REDUCTION_ROWS_PER_CTA,
+    REDUCTION_THREADS_PER_CTA as BALANCED_REDUCTION_THREADS_PER_CTA,
+)
+from ..throughput_2cta.reduction import (
+    run_reduction_kernel as run_balanced_reduction_kernel,
+    zero_balanced_inactive_outputs,
+)
+from ..helpers.constants import (
+    TMEM_LIFECYCLE_BARRIER_ID,
+    balanced_partial_capacity,
+    balanced_reducer_capacity,
+    balanced_work_descriptor_capacity,
+)
 from ..helpers.mask import MaskType, normalize_mask_type
 from ..helpers.tile import (
     runtime_query_tile_is_active,
@@ -111,6 +124,12 @@ from ..parallel_reduction_topology import (
 
 # Softmax uses exp2, so natural-scale scores are multiplied by log2(e).
 LOG2_E = 1.4426950408889634
+
+
+def ceil_div(a, b):
+    """Return the ceiling of a divided by b."""
+
+    return (a + b - 1) // b
 
 
 @cute.jit
@@ -306,6 +325,98 @@ class ThroughputLatencyMlaStaticWorkQueue(WorkQueue):
 
 
 @dataclass(kw_only=True)
+class ThroughputLatencyMlaBalancedWorkQueue(WorkQueue):
+    """Descriptor-backed persistent queue for balanced 1CTA MLA.
+
+    One physical CTA is assigned to each (partition, V slice, Q-head tile).
+    It walks that partition's descriptor range and all effective Q groups in
+    lockstep across the captured PrimsTS tasks. The descriptor index is packed
+    into the ordinary batch/head coordinate so existing resource APIs retain
+    their three-coordinate work-tile contract.
+    """
+
+    cfg: cutlass.Constexpr[MlaConfig] = None
+    balanced_work_descriptors: object = None
+    balanced_partition_offsets: object = None
+    enable_runtime_skip: cutlass.Constexpr[bool] = False
+
+    def __init__(
+        self,
+        tile_scheduler_config: TileSchedulerConfig,
+        *,
+        cfg,
+        balanced_work_descriptors,
+        balanced_partition_offsets,
+        **kwargs,
+    ) -> None:
+        WorkQueue.__init__(self, tile_scheduler_config=tile_scheduler_config, **kwargs)
+        self.cfg = cfg
+        self.balanced_work_descriptors = balanced_work_descriptors
+        self.balanced_partition_offsets = balanced_partition_offsets
+
+    @cute.jit
+    def _physical_indices(self):
+        physical_idx = Int32(cute.arch.block_idx()[2])
+        head_tiles = Int32(self.cfg.num_ctas_for_all_heads)
+        head_work = head_tiles * Int32(self.cfg.num_ctas_per_head_dim)
+        partition_idx = physical_idx // head_work
+        head_slot = physical_idx - partition_idx * head_work
+        cta_idx_head_dim = head_slot // head_tiles
+        head_tile_idx = head_slot - cta_idx_head_dim * head_tiles
+        return partition_idx, cta_idx_head_dim, head_tile_idx
+
+    @cute.jit
+    def _work_tile(self, descriptor_idx, cta_idx_q, is_valid):
+        partition_idx, cta_idx_head_dim, head_tile_idx = self._physical_indices()
+        del partition_idx
+        capacity = Int32(self.cfg.balanced_descriptor_capacity)
+        safe_descriptor_idx = cute.math.min(
+            cute.math.max(Int32(descriptor_idx), Int32(0)), capacity - Int32(1)
+        )
+        request_idx = Int32(
+            self.balanced_work_descriptors[safe_descriptor_idx, Int32(0)]
+        )
+        request_idx = cute.math.min(
+            cute.math.max(request_idx, Int32(0)), Int32(self.cfg.batch_size - 1)
+        )
+        batch_head_idx = (
+            request_idx * Int32(self.cfg.num_ctas_for_all_heads) + head_tile_idx
+        )
+        packed_batch_head_idx = batch_head_idx * capacity + safe_descriptor_idx
+        return WorkTileInfo(
+            (cta_idx_q, cta_idx_head_dim, packed_batch_head_idx), is_valid
+        )
+
+    @cute.jit
+    def _make_initial_work_tile(self):
+        partition_idx, _, _ = self._physical_indices()
+        descriptor_idx = Int32(self.balanced_partition_offsets[partition_idx])
+        descriptor_end = Int32(self.balanced_partition_offsets[partition_idx + 1])
+        return self._work_tile(
+            descriptor_idx, Int32(0), descriptor_idx < descriptor_end
+        )
+
+    @cute.jit
+    def initial_work_tile_info(self):
+        return self._make_initial_work_tile()
+
+    @cute.jit
+    def _get_and_advance_work_tile_impl(self, stage_info):
+        cta_idx_q, _, packed_batch_head_idx = stage_info.work_tile.tile_idx
+        capacity = Int32(self.cfg.balanced_descriptor_capacity)
+        descriptor_idx = Int32(packed_batch_head_idx) % capacity
+        cta_idx_q = Int32(cta_idx_q) + Int32(1)
+        if cta_idx_q >= Int32(self.cfg.num_ctas_per_seq_q):
+            cta_idx_q = Int32(0)
+            descriptor_idx += Int32(1)
+        partition_idx, _, _ = self._physical_indices()
+        descriptor_end = Int32(self.balanced_partition_offsets[partition_idx + 1])
+        return self._work_tile(
+            descriptor_idx, cta_idx_q, descriptor_idx < descriptor_end
+        )
+
+
+@dataclass(kw_only=True)
 class ThroughputLatencyMlaClcWorkQueue(WorkQueue):
     """CLC work queue shim for throughput-latency 1CTA captured schedules."""
 
@@ -371,12 +482,25 @@ def _make_static_work_queue(
     cache_seqs,
     cu_seqlens_q,
     name: str,
+    balanced_work_descriptors=None,
+    balanced_partition_offsets=None,
 ):
     """Create the static persistent work queue shared by both 1CTA variants."""
-    return ThroughputLatencyMlaStaticWorkQueue(
-        tile_scheduler_config=TileSchedulerConfig.create_static_persistent_tile_scheduler_params(
+    tile_scheduler_config = (
+        TileSchedulerConfig.create_static_persistent_tile_scheduler_params(
             tile_scheduler_params=tile_sched_params,
-        ),
+        )
+    )
+    if cfg.use_balanced_scheduler:
+        return ThroughputLatencyMlaBalancedWorkQueue(
+            tile_scheduler_config=tile_scheduler_config,
+            cfg=cfg,
+            balanced_work_descriptors=balanced_work_descriptors,
+            balanced_partition_offsets=balanced_partition_offsets,
+            name=name,
+        )
+    return ThroughputLatencyMlaStaticWorkQueue(
+        tile_scheduler_config=tile_scheduler_config,
         cfg=cfg,
         batch_size=cute.size(cache_seqs),
         cache_seqs=cache_seqs,
@@ -465,6 +589,8 @@ def build_throughput_latency_mla_task_manager(
     clc_response_ptr=None,
     use_clc_dynamic_scheduler: bool = False,
     use_static_persistent_scheduler: bool = False,
+    balanced_work_descriptors=None,
+    balanced_partition_offsets=None,
     verbose: bool = False,
     exhaustive_deadlock_race_check: bool = False,
 ) -> tuple[TaskManager, object]:
@@ -514,6 +640,8 @@ def build_throughput_latency_mla_task_manager(
             clc_response_ptr=clc_response_ptr,
             use_clc_dynamic_scheduler=use_clc_dynamic_scheduler,
             use_static_persistent_scheduler=use_static_persistent_scheduler,
+            balanced_work_descriptors=balanced_work_descriptors,
+            balanced_partition_offsets=balanced_partition_offsets,
             verbose=verbose,
             exhaustive_deadlock_race_check=exhaustive_deadlock_race_check,
         )
@@ -644,6 +772,8 @@ def build_throughput_latency_mla_task_manager(
             cache_seqs,
             cu_seqlens_q,
             "ll_mla_work_queue",
+            balanced_work_descriptors,
+            balanced_partition_offsets,
         )
 
     smem_page_offsets = SmemPageOffsetsResource(
@@ -1040,6 +1170,8 @@ def _make_keeps_mma_ab_task_graph(
     clc_response_ptr=None,
     use_clc_dynamic_scheduler: bool = False,
     use_static_persistent_scheduler: bool = False,
+    balanced_work_descriptors=None,
+    balanced_partition_offsets=None,
     verbose: bool = False,
     exhaustive_deadlock_race_check: bool = False,
 ) -> tuple[TaskManager, object]:
@@ -1136,6 +1268,8 @@ def _make_keeps_mma_ab_task_graph(
             cache_seqs,
             cu_seqlens_q,
             "ll_mla_q64_work_queue",
+            balanced_work_descriptors,
+            balanced_partition_offsets,
         )
     if use_clc_dynamic:
         scheduler_group = pipeline.CooperativeGroup(agent.Thread, 32)
@@ -1449,6 +1583,7 @@ class ThroughputLatencyMlaDecodeTs:
         explicit_split_kv: int | None = None,
         explicit_persistent: bool | None = None,
         mask_type: MaskType | str = MaskType.CAUSAL,
+        use_balanced_scheduler: bool = False,
     ):
         """Initialize one selected physical tile profile over logical flat Q rows."""
         import cutlass as _cutlass
@@ -1477,8 +1612,38 @@ class ThroughputLatencyMlaDecodeTs:
         self.explicit_split_kv = explicit_split_kv
         self.explicit_persistent = explicit_persistent
         self.mask_type = normalize_mask_type(mask_type)
+        self.use_balanced_scheduler = use_balanced_scheduler
+        self.balanced_num_partitions = max_active_clusters
+        self.balanced_descriptor_capacity = (
+            balanced_work_descriptor_capacity(batch_size, max_active_clusters)
+            if use_balanced_scheduler
+            else 0
+        )
+        self.balanced_partial_capacity = (
+            balanced_partial_capacity(batch_size, max_active_clusters)
+            if use_balanced_scheduler
+            else 0
+        )
+        self.balanced_reducer_capacity = (
+            balanced_reducer_capacity(batch_size, max_active_clusters)
+            if use_balanced_scheduler
+            else 0
+        )
 
         cfg = self._make_config()
+        if use_balanced_scheduler:
+            head_work = cfg.num_ctas_for_all_heads * cfg.num_ctas_per_head_dim
+            self.balanced_num_partitions = max(max_active_clusters // head_work, 1)
+            self.balanced_descriptor_capacity = balanced_work_descriptor_capacity(
+                batch_size, self.balanced_num_partitions
+            )
+            self.balanced_partial_capacity = balanced_partial_capacity(
+                batch_size, self.balanced_num_partitions
+            )
+            self.balanced_reducer_capacity = balanced_reducer_capacity(
+                batch_size, self.balanced_num_partitions
+            )
+            cfg = self._make_config()
         # Parallel standalone reduction requires a fixed split profile and a
         # static producer schedule so its topology and workspace contract are
         # compile-time invariant. Other profiles use the general reducer.
@@ -1487,6 +1652,7 @@ class ThroughputLatencyMlaDecodeTs:
             and lse_dtype == _cutlass.Float32
             and cfg.use_persistent_scheduler == 0
             and cfg.use_clc_dynamic_persistent_scheduler == 0
+            and not use_balanced_scheduler
         )
         self.parallel_reduction_topology = None
         self.parallel_reduction_elements_per_slice = (
@@ -1494,7 +1660,11 @@ class ThroughputLatencyMlaDecodeTs:
             if cfg.tile_size_q in (8, 16, 32)
             else PARALLEL_GMEM_REDUCTION_ELEMENTS_PER_SLICE
         )
-        if cfg.use_multi_ctas_kv == 1 and cfg.use_cluster_reduction != 1:
+        if (
+            cfg.use_multi_ctas_kv == 1
+            and cfg.use_cluster_reduction != 1
+            and not use_balanced_scheduler
+        ):
             # Both reducer implementations use the same normalized partial-O
             # workspace. Validate every separate-GMEM launch against it.
             validate_parallel_reduction_workspace(
@@ -1591,6 +1761,9 @@ class ThroughputLatencyMlaDecodeTs:
             explicit_split_kv=self.explicit_split_kv,
             explicit_persistent=self.explicit_persistent,
             mask_type=self.mask_type,
+            use_balanced_scheduler=self.use_balanced_scheduler,
+            balanced_descriptor_capacity=self.balanced_descriptor_capacity,
+            balanced_partial_capacity=self.balanced_partial_capacity,
         )
         return cfg
 
@@ -1662,7 +1835,11 @@ class ThroughputLatencyMlaDecodeTs:
         split_kv: cutlass.Int32,
         cache_seqs: cute.Tensor,
         cu_seqlens_q: cute.Tensor | None,
-        block_split_kvs: cute.Tensor,
+        block_split_kvs: cute.Tensor | None,
+        balanced_work_descriptors: cute.Tensor | None,
+        balanced_partition_offsets: cute.Tensor | None,
+        balanced_combine_descriptors: cute.Tensor | None,
+        balanced_num_combine_descriptors: cute.Tensor | None,
         softmax_scale: cutlass.Float32,
         output_scale: cutlass.Float32,
         stream: object,
@@ -1729,11 +1906,14 @@ class ThroughputLatencyMlaDecodeTs:
             )
         workspace_split_kv = split_kv
         if cutlass.const_expr(cfg.use_multi_ctas_kv == 1):
-            workspace_split_kv = cutlass.Int32(cfg.num_ctas_per_seq_kv)
-            runtime_assert(
-                split_kv >= workspace_split_kv,
-                "split_kv is smaller than the configured multi-CTA-KV split count",
-            )
+            if cutlass.const_expr(cfg.use_balanced_scheduler):
+                workspace_split_kv = cutlass.Int32(self.balanced_partial_capacity)
+            else:
+                workspace_split_kv = cutlass.Int32(cfg.num_ctas_per_seq_kv)
+                runtime_assert(
+                    split_kv >= workspace_split_kv,
+                    "split_kv is smaller than the configured multi-CTA-KV split count",
+                )
 
         if cutlass.const_expr(cu_seqlens_q is not None):
             q_latent_tma = cute.make_tensor(
@@ -1859,7 +2039,11 @@ class ThroughputLatencyMlaDecodeTs:
             cutlass.Int32(cfg.num_heads_q),
             cfg.head_dim_v,
             cutlass.Int32(cfg.seq_len_q),
-            batch_size,
+            (
+                cutlass.Int32(1)
+                if cutlass.const_expr(cfg.use_balanced_scheduler)
+                else batch_size
+            ),
             workspace_split_kv,
             workspace if use_gmem_reduction else None,
         )
@@ -1895,6 +2079,14 @@ class ThroughputLatencyMlaDecodeTs:
                 tile_sched_params,
                 self.max_active_clusters,
             )
+            if cutlass.const_expr(cfg.use_balanced_scheduler):
+                grid = (
+                    1,
+                    1,
+                    self.balanced_num_partitions
+                    * cfg.num_ctas_for_all_heads
+                    * cfg.num_ctas_per_head_dim,
+                )
         else:
             grid = (
                 cfg.num_ctas_for_all_heads
@@ -1923,6 +2115,8 @@ class ThroughputLatencyMlaDecodeTs:
             softmax_scale_log2,
             output_scale,
             tile_sched_params,
+            balanced_work_descriptors,
+            balanced_partition_offsets,
         ).launch(
             grid=grid,
             block=[cfg.threads_per_cta, 1, 1],
@@ -1932,6 +2126,34 @@ class ThroughputLatencyMlaDecodeTs:
             use_pdl=acc_o is not None,
         )
         if cutlass.const_expr(acc_o is not None):
+            if cutlass.const_expr(cfg.use_balanced_scheduler):
+                self.balanced_gmem_reduction_kernel(
+                    o,
+                    lse,
+                    acc_o,
+                    acc_lse,
+                    cache_seqs,
+                    cu_seqlens_q,
+                    balanced_combine_descriptors,
+                    balanced_num_combine_descriptors,
+                ).launch(
+                    grid=(
+                        ceil_div(cfg.num_heads_q, BALANCED_REDUCTION_ROWS_PER_CTA),
+                        cfg.seq_len_q,
+                        self.balanced_reducer_capacity,
+                    ),
+                    block=[BALANCED_REDUCTION_THREADS_PER_CTA, 1, 1],
+                    smem=(
+                        BALANCED_REDUCTION_ROWS_PER_CTA
+                        * 127
+                        * self.lse_dtype.width
+                        // 8
+                    ),
+                    stream=stream,
+                    min_blocks_per_mp=2,
+                    use_pdl=True,
+                )
+                return
             if cutlass.const_expr(self.use_parallel_reduction):
                 topology = self.parallel_reduction_topology
                 reduction_grid, reduction_cluster = (
@@ -2028,6 +2250,8 @@ class ThroughputLatencyMlaDecodeTs:
         softmax_scale_log2: cutlass.Float32,
         output_scale: cutlass.Float32,
         tile_sched_params: object,
+        balanced_work_descriptors: cute.Tensor | None,
+        balanced_partition_offsets: cute.Tensor | None,
     ):
         """Execute one flat-Q, batch, KV-split, and V head-dimension tile."""
         cfg = self._make_config()
@@ -2088,7 +2312,9 @@ class ThroughputLatencyMlaDecodeTs:
             cta_idx_q = None
             batch_idx = None
             cta_idx_head_dim_v = None
-            cta_idx_kv = Int32(0)
+            cta_idx_kv = (
+                None if cutlass.const_expr(cfg.use_balanced_scheduler) else Int32(0)
+            )
             head_idx = None
         use_clc_dynamic = cutlass.const_expr(
             cfg.use_clc_dynamic_persistent_scheduler == 1
@@ -2138,6 +2364,8 @@ class ThroughputLatencyMlaDecodeTs:
             clc_response_ptr=clc_response_ptr,
             use_clc_dynamic_scheduler=use_clc_dynamic,
             use_static_persistent_scheduler=use_static_persistent,
+            balanced_work_descriptors=balanced_work_descriptors,
+            balanced_partition_offsets=balanced_partition_offsets,
         )
         task_manager.setup_resources_and_tasks()
         smem_allocator = task_manager.smem_allocator
@@ -2253,6 +2481,61 @@ class ThroughputLatencyMlaDecodeTs:
             cfg,
             num_reduction_ctas,
         )
+
+    @cute.kernel
+    def balanced_gmem_reduction_kernel(
+        self,
+        output: cute.Tensor,
+        lse: cute.Tensor,
+        acc_output: cute.Tensor,
+        acc_lse: cute.Tensor,
+        cache_seqs: cute.Tensor,
+        cu_seqlens_q: cute.Tensor,
+        balanced_combine_descriptors: cute.Tensor,
+        balanced_num_combine_descriptors: cute.Tensor,
+    ):
+        """Run the replay-stable compact balanced reducer for 1CTA partials."""
+
+        # Pair with the dense producer's LAUNCH_DEPENDENTS signal before any
+        # descriptor or split-partial load. The balanced reducer is launched
+        # with PDL just like the ordinary standalone reducer.
+        prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
+        cfg = self._make_config()
+        _, _, combine_slot = cute.arch.block_idx()
+        # Zero-KV requests have no producer or combine descriptor, so the
+        # normal main/reduction paths cannot publish their result. Keep the
+        # compact fixed grid and stride it over every logical request slot.
+        zero_balanced_inactive_outputs(
+            self,
+            output,
+            lse,
+            cache_seqs,
+            cu_seqlens_q,
+            cfg,
+            self.balanced_reducer_capacity,
+            BALANCED_REDUCTION_ROWS_PER_CTA,
+        )
+        if combine_slot < Int32(balanced_num_combine_descriptors[Int32(0)]):
+            batch_idx = Int32(balanced_combine_descriptors[combine_slot, Int32(0)])
+            split_count = Int32(balanced_combine_descriptors[combine_slot, Int32(1)])
+            split_begin = Int32(balanced_combine_descriptors[combine_slot, Int32(2)])
+            run_balanced_reduction_kernel(
+                self,
+                output,
+                lse,
+                acc_output,
+                acc_lse,
+                Int32(127),
+                cache_seqs,
+                cu_seqlens_q,
+                None,
+                split_count,
+                split_begin,
+                cfg,
+                127,
+                BALANCED_REDUCTION_ROWS_PER_CTA,
+                batch_idx,
+            )
 
     @cute.kernel
     def parallel_gmem_reduction_kernel(

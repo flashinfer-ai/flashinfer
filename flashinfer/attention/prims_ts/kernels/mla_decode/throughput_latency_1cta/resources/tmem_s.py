@@ -268,6 +268,30 @@ class TmemSResource(MlaResource):
         del stage_info
         return self._make_initial_softmax_vars()
 
+    @consumer_work(work_attrs=WorkAttr.AUXILIARY)
+    @cute.jit
+    def reset_keeps_softmax_work_tile_scratch(self, stage_info: StageInfo) -> None:
+        """Reset the keeps-only shared q64 state for one persistent work tile.
+
+        Both variants recreate their register arrays through
+        ``init_softmax_work_tile_state``. Swaps-MMA-AB does not carry online
+        softmax max/sum in this shared scratch and therefore needs no matching
+        operation.
+        """
+        del stage_info
+        if cutlass.const_expr(self.cfg.kernel_variant == "keeps_mma_ab"):
+            state_ptr = self._softmax_scratch.data_ptr(cute.arch.thread_idx()[0])
+            state_ptr.store(
+                float_to_u32_bits(neg_max_f32()),
+                is_volatile=True,
+                alignment=4,
+            )
+            softmax_sum_state_ptr(state_ptr).store(
+                float_to_u32_bits(Float32(0.0)),
+                is_volatile=True,
+                alignment=4,
+            )
+
     @producer_work(work_attrs=WorkAttr.AUXILIARY)
     @cute.jit
     def reset_softmax_work_tile_state(self, stage_info: StageInfo) -> None:
@@ -481,7 +505,8 @@ class TmemSResource(MlaResource):
 
         batch_idx = batch_idx_for_stage_cfg(self.batch_idx, cfg, stage_info)
         cta_idx_q = cta_idx_q_for_stage(self.cta_idx_q, stage_info)
-        cta_idx_kv = cta_idx_kv_for_stage(self.cta_idx_kv, stage_info)
+        task_cache = decode_gen_task_cache(stage_info)
+        cta_idx_kv = cta_idx_kv_for_stage(self.cta_idx_kv, stage_info, task_cache, cfg)
         seq_len_kv = runtime_seq_len_kv_from_task_cache(
             cfg,
             task_cache,
@@ -490,7 +515,9 @@ class TmemSResource(MlaResource):
             batch_idx,
         )
         local_tile_idx = softmax_kv_tile_idx(cfg, stage_info, self.inst_id)
-        tile_idx = global_kv_tile_idx(cfg, local_tile_idx, seq_len_kv, cta_idx_kv)
+        tile_idx = global_kv_tile_idx(
+            cfg, local_tile_idx, seq_len_kv, cta_idx_kv, task_cache
+        )
         tile_offset_k = tile_idx * Int32(cfg.tile_size_kv)
         next_tile_offset_k = tile_offset_k + Int32(cfg.tile_size_kv)
         should_apply_dense_mask = (
@@ -529,6 +556,8 @@ class TmemSResource(MlaResource):
                         local_row_idx,
                         self.cu_seqlens_q,
                     )
+                    if cutlass.const_expr(cfg.use_balanced_scheduler):
+                        row_seq_len_kv = cute.math.min(seq_len_kv, row_seq_len_kv)
                 for reg_idx in cutlass.range_constexpr(num_s_regs_per_thread(cfg)):
                     token_idx = tile_offset_k + local_col_base + Int32(reg_idx)
                     if token_idx >= row_seq_len_kv:
@@ -568,6 +597,9 @@ class TmemSResource(MlaResource):
                             row_in_tile_1,
                             self.cu_seqlens_q,
                         )
+                        if cutlass.const_expr(cfg.use_balanced_scheduler):
+                            seq_len_kv_0 = cute.math.min(seq_len_kv, seq_len_kv_0)
+                            seq_len_kv_1 = cute.math.min(seq_len_kv, seq_len_kv_1)
                     s_base = repeat_idx * 4
                     s_second_panel_base = q_repeats * 4 + s_base
                     token_idx = tile_offset_k + local_idx_k0

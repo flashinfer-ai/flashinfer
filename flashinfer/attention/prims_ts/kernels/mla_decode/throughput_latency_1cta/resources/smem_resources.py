@@ -509,10 +509,13 @@ class SmemPageOffsetsResource(MlaResource):
         if lane_idx < pages_per_tile:
             batch_idx = batch_idx_for_stage_cfg(self.batch_idx, cfg, stage_info)
             cta_idx_q = cta_idx_q_for_stage(self.cta_idx_q, stage_info)
-            cta_idx_kv = cta_idx_kv_for_stage(self.cta_idx_kv, stage_info)
+            task_cache = decode_gen_task_cache(stage_info)
+            cta_idx_kv = cta_idx_kv_for_stage(
+                self.cta_idx_kv, stage_info, task_cache, cfg
+            )
             seq_len_kv = runtime_seq_len_kv_from_task_cache(
                 cfg,
-                decode_gen_task_cache(stage_info),
+                task_cache,
                 cta_idx_q,
                 self.cu_seqlens_q,
                 batch_idx,
@@ -520,7 +523,9 @@ class SmemPageOffsetsResource(MlaResource):
             local_tile_idx = local_kv_tile_idx(
                 cfg, stage_info, inst_id, is_v, section=section
             )
-            tile_idx = global_kv_tile_idx(cfg, local_tile_idx, seq_len_kv, cta_idx_kv)
+            tile_idx = global_kv_tile_idx(
+                cfg, local_tile_idx, seq_len_kv, cta_idx_kv, task_cache
+            )
             last_valid_page = cute.math.max(
                 (seq_len_kv + Int32(cfg.num_tokens_per_page - 1))
                 // Int32(cfg.num_tokens_per_page)
@@ -819,15 +824,18 @@ class SmemKvResource(MlaResource):
         )
         batch_idx = batch_idx_for_stage_cfg(self.batch_idx, cfg, stage_info)
         cta_idx_q = cta_idx_q_for_stage(self.cta_idx_q, stage_info)
-        cta_idx_kv = cta_idx_kv_for_stage(self.cta_idx_kv, stage_info)
+        task_cache = decode_gen_task_cache(stage_info)
+        cta_idx_kv = cta_idx_kv_for_stage(self.cta_idx_kv, stage_info, task_cache, cfg)
         seq_len_kv = runtime_seq_len_kv_from_task_cache(
             cfg,
-            decode_gen_task_cache(stage_info),
+            task_cache,
             cta_idx_q,
             self.cu_seqlens_q,
             batch_idx,
         )
-        tile_idx = global_kv_tile_idx(cfg, local_tile_idx, seq_len_kv, cta_idx_kv)
+        tile_idx = global_kv_tile_idx(
+            cfg, local_tile_idx, seq_len_kv, cta_idx_kv, task_cache
+        )
         stage_base = self._stage_base(stage_info)
         inner_width = min(tma_inner_dim_elems(cfg), active_width)
         uses_compact_fp8_rope_stage = (
