@@ -1780,6 +1780,558 @@ def test_rope_quantize_fp8_cutile_rejects_unsupported(unsupported):
         flashinfer.rope.rope_quantize_fp8(**kwargs)
 
 
+def _make_qk_norm_rope_store_inputs_hy3(
+    mode,
+    num_q_heads,
+    num_kv_heads,
+    cache_dtype,
+    batch_size=3,
+    *,
+    q_lens=None,
+    prefixes=None,
+    page_size=16,
+    non_identity_block_table=False,
+):
+    device = "cuda:0"
+    head_dim = 128
+    if q_lens is None:
+        if mode == "decode":
+            q_lens = [1] * batch_size
+        elif mode == "mtp":
+            q_lens = [3] * batch_size
+        else:
+            q_lens = [2 + (request_id % 4) for request_id in range(batch_size)]
+    if prefixes is None:
+        prefixes = [1 + (request_id * 7) % 13 for request_id in range(batch_size)]
+    assert len(q_lens) == batch_size
+    assert len(prefixes) == batch_size
+    sequence_lengths_list = [
+        prefix + q_len for prefix, q_len in zip(prefixes, q_lens, strict=True)
+    ]
+    max_position = max(sequence_lengths_list) + 8
+    max_pages_per_request = (max(sequence_lengths_list) + page_size - 1) // page_size
+    block_table = torch.arange(
+        batch_size * max_pages_per_request, dtype=torch.int32, device=device
+    )
+    if non_identity_block_table:
+        block_table = block_table.flip(0)
+    block_table = block_table.reshape(batch_size, max_pages_per_request)
+    q_indptr_list = [0]
+    for q_len in q_lens:
+        q_indptr_list.append(q_indptr_list[-1] + q_len)
+    num_rows = q_indptr_list[-1]
+
+    generator = torch.Generator(device=device).manual_seed(
+        20260830 + num_q_heads * 17 + num_kv_heads
+    )
+    packed_width = (num_q_heads + 2 * num_kv_heads) * head_dim
+    packed_qkv = torch.randn(
+        num_rows,
+        packed_width,
+        dtype=torch.bfloat16,
+        device=device,
+        generator=generator,
+    )
+    positions = torch.arange(max_position, dtype=torch.float32, device=device)
+    inverse_frequency = 1.0 / (
+        10000.0
+        ** (torch.arange(0, head_dim, 2, dtype=torch.float32, device=device) / head_dim)
+    )
+    frequencies = torch.outer(positions, inverse_frequency)
+    cos_sin_cache = torch.cat((frequencies.cos(), frequencies.sin()), dim=-1)
+    cache_shape = (
+        batch_size * max_pages_per_request,
+        page_size,
+        num_kv_heads,
+        head_dim,
+    )
+    key_cache = torch.randn(
+        cache_shape,
+        dtype=torch.bfloat16,
+        device=device,
+        generator=generator,
+    )
+    value_cache = torch.randn(
+        cache_shape,
+        dtype=torch.bfloat16,
+        device=device,
+        generator=generator,
+    )
+    if cache_dtype == torch.float8_e4m3fn:
+        key_cache = key_cache.float().clamp(-448, 448).to(cache_dtype)
+        value_cache = value_cache.float().clamp(-448, 448).to(cache_dtype)
+    return {
+        "packed_qkv": packed_qkv,
+        "cos_sin_cache": cos_sin_cache,
+        "sequence_lengths": torch.tensor(
+            sequence_lengths_list, dtype=torch.int32, device=device
+        ),
+        "q_indptr": torch.tensor(q_indptr_list, dtype=torch.int32, device=device),
+        "block_table": block_table,
+        "key_cache": key_cache,
+        "value_cache": value_cache,
+        "q_lens": q_lens,
+        "sequence_lengths_list": sequence_lengths_list,
+        "num_q_heads": num_q_heads,
+        "num_kv_heads": num_kv_heads,
+        "page_size": page_size,
+        "max_sequence_length": max(q_lens),
+    }
+
+
+def _qk_norm_rope_store_reference_hy3(
+    inputs, norm_policy, quant_policy, *, redirect_k=False, redirect_v=False
+):
+    packed_qkv = inputs["packed_qkv"]
+    num_q_heads = inputs["num_q_heads"]
+    num_kv_heads = inputs["num_kv_heads"]
+    head_dim = 128
+    q_width = num_q_heads * head_dim
+    k_width = num_kv_heads * head_dim
+    q = packed_qkv[:, :q_width].float().reshape(-1, num_q_heads, head_dim)
+    k = (
+        packed_qkv[:, q_width : q_width + k_width]
+        .float()
+        .reshape(-1, num_kv_heads, head_dim)
+    )
+    v = packed_qkv[:, q_width + k_width :].reshape(-1, num_kv_heads, head_dim)
+    q_weight = torch.linspace(0.75, 1.25, head_dim, device=packed_qkv.device)
+    k_weight = torch.linspace(1.25, 0.75, head_dim, device=packed_qkv.device)
+
+    def rms_norm(x, weight):
+        return x * torch.rsqrt(x.square().mean(dim=-1, keepdim=True) + 1e-6) * weight
+
+    if norm_policy == 2:
+        q = rms_norm(q, q_weight)
+        k = rms_norm(k, k_weight)
+    token_positions = []
+    for sequence_length, q_len in zip(
+        inputs["sequence_lengths_list"], inputs["q_lens"], strict=True
+    ):
+        token_positions.extend(range(sequence_length - q_len, sequence_length))
+    token_positions = torch.tensor(
+        token_positions, dtype=torch.long, device=packed_qkv.device
+    )
+    cos_sin = inputs["cos_sin_cache"].index_select(0, token_positions)
+    half = head_dim // 2
+
+    def neox_rope(x):
+        first, second = x[..., :half], x[..., half:]
+        cosine = cos_sin[:, None, :half]
+        sine = cos_sin[:, None, half:]
+        return torch.cat(
+            (first * cosine - second * sine, second * cosine + first * sine),
+            dim=-1,
+        )
+
+    q = neox_rope(q)
+    k = neox_rope(k)
+    if norm_policy == 1:
+        q = rms_norm(q, q_weight)
+        k = rms_norm(k, k_weight)
+
+    dynamic_scale = None
+    if quant_policy == 0:
+        out_q = q.to(torch.bfloat16)
+        stored_k = k.to(torch.bfloat16)
+        stored_v = v
+    else:
+        if quant_policy == 1:
+            dynamic_scale = q.abs().amax(dim=-1).clamp_min(1e-6) / 448.0
+            q_multiplier = dynamic_scale.reciprocal()[..., None]
+        else:
+            q_multiplier = torch.tensor(2.0, device=q.device)
+        out_q = (q * q_multiplier).clamp(-448, 448).to(torch.float8_e4m3fn)
+        stored_k = (k / 0.5).clamp(-448, 448).to(torch.float8_e4m3fn)
+        stored_v = (v.float() / 0.25).clamp(-448, 448).to(torch.float8_e4m3fn)
+
+    key_cache = inputs["key_cache"].clone()
+    value_cache = inputs["value_cache"].clone()
+    token = 0
+    for request_id, (sequence_length, q_len) in enumerate(
+        zip(inputs["sequence_lengths_list"], inputs["q_lens"], strict=True)
+    ):
+        for position in range(sequence_length - q_len, sequence_length):
+            logical_page, page_offset = divmod(position, inputs["page_size"])
+            physical_page = int(inputs["block_table"][request_id, logical_page])
+            if not redirect_k:
+                key_cache[physical_page, page_offset] = stored_k[token]
+            if not redirect_v:
+                value_cache[physical_page, page_offset] = stored_v[token]
+            token += 1
+        logical_page, page_offset = divmod(sequence_length - 1, inputs["page_size"])
+        physical_page = int(inputs["block_table"][request_id, logical_page])
+        key_cache[physical_page, page_offset + 1 :] = 0
+        value_cache[physical_page, page_offset + 1 :] = 0
+    return (
+        out_q,
+        dynamic_scale,
+        key_cache,
+        value_cache,
+        q_weight,
+        k_weight,
+        stored_k,
+        stored_v,
+    )
+
+
+@pytest.mark.parametrize("num_q_heads,num_kv_heads", [(8, 1), (64, 8)])
+@pytest.mark.parametrize("mode", ["prefill", "decode", "mtp"])
+@pytest.mark.parametrize("norm_policy", [0, 1, 2])
+@pytest.mark.parametrize(
+    "cache_dtype,quant_policy",
+    [
+        (torch.bfloat16, 0),
+        (torch.float8_e4m3fn, 1),
+        (torch.float8_e4m3fn, 2),
+    ],
+)
+def test_qk_rmsnorm_rope_append_paged_kv_cache_hy3(
+    num_q_heads, num_kv_heads, mode, norm_policy, cache_dtype, quant_policy
+):
+    inputs = _make_qk_norm_rope_store_inputs_hy3(
+        mode, num_q_heads, num_kv_heads, cache_dtype
+    )
+    expected = _qk_norm_rope_store_reference_hy3(inputs, norm_policy, quant_policy)
+    key_cache = inputs["key_cache"].clone()
+    value_cache = inputs["value_cache"].clone()
+    q_weight = expected[4] if norm_policy else None
+    k_weight = expected[5] if norm_policy else None
+    k_scale = (
+        torch.tensor([0.5], dtype=torch.float32, device="cuda:0")
+        if quant_policy
+        else None
+    )
+    v_scale = (
+        torch.tensor([0.25], dtype=torch.float32, device="cuda:0")
+        if quant_policy
+        else None
+    )
+    q_scale_inverse = (
+        torch.tensor([2.0], dtype=torch.float32, device="cuda:0")
+        if quant_policy == 2
+        else None
+    )
+    split_k_flag = (
+        torch.full(
+            (inputs["sequence_lengths"].shape[0], inputs["num_kv_heads"]),
+            -1,
+            dtype=torch.int32,
+            device=inputs["packed_qkv"].device,
+        )
+        if quant_policy != 0
+        else None
+    )
+    output = flashinfer.rope.qk_rmsnorm_rope_append_paged_kv_cache_hy3(
+        inputs["packed_qkv"],
+        inputs["cos_sin_cache"],
+        inputs["sequence_lengths"],
+        inputs["q_indptr"],
+        inputs["block_table"],
+        (key_cache, value_cache),
+        mode == "prefill",
+        q_norm_weight=q_weight,
+        k_norm_weight=k_weight,
+        norm_policy=norm_policy,
+        quant_policy=quant_policy,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        q_scale_inverse=q_scale_inverse,
+        max_sequence_length=inputs["max_sequence_length"],
+        split_k_flag=split_k_flag,
+    )
+    if quant_policy == 0:
+        torch.testing.assert_close(output[0], expected[0], atol=8e-2, rtol=1e-5)
+        torch.testing.assert_close(key_cache, expected[2], atol=8e-2, rtol=1e-5)
+        torch.testing.assert_close(value_cache, expected[3], atol=0, rtol=0)
+        assert output[1] is None and output[2] is None
+    else:
+        torch.testing.assert_close(
+            output[0].float(), expected[0].float(), atol=1, rtol=0
+        )
+        torch.testing.assert_close(
+            key_cache.float() * k_scale[0],
+            expected[2].float() * k_scale[0],
+            atol=0.5,
+            rtol=0,
+        )
+        torch.testing.assert_close(
+            value_cache.float() * v_scale[0],
+            expected[3].float() * v_scale[0],
+            atol=0.5,
+            rtol=0,
+        )
+        assert torch.equal(output[2], torch.zeros_like(output[2]))
+        if quant_policy == 1:
+            if mode == "prefill":
+                cursor = 0
+                for request_id, q_len in enumerate(inputs["q_lens"]):
+                    actual_scale = output[1][request_id, :, :q_len].transpose(0, 1)
+                    torch.testing.assert_close(
+                        actual_scale,
+                        expected[1][cursor : cursor + q_len],
+                        rtol=2e-4,
+                        atol=1e-7,
+                    )
+                    cursor += q_len
+            else:
+                torch.testing.assert_close(output[1], expected[1], rtol=2e-4, atol=1e-7)
+        else:
+            assert output[1] is None
+
+
+def test_qk_rmsnorm_rope_hy3_multipage_non_identity_and_redirected_outputs():
+    inputs = _make_qk_norm_rope_store_inputs_hy3(
+        "mtp",
+        8,
+        1,
+        torch.float8_e4m3fn,
+        batch_size=2,
+        q_lens=[4, 5],
+        prefixes=[14, 30],
+        non_identity_block_table=True,
+    )
+    expected = _qk_norm_rope_store_reference_hy3(
+        inputs, norm_policy=2, quant_policy=1, redirect_k=True, redirect_v=True
+    )
+    identity_block_table = torch.arange(
+        inputs["block_table"].numel(), dtype=torch.int32, device="cuda:0"
+    ).reshape_as(inputs["block_table"])
+    assert not torch.equal(inputs["block_table"], identity_block_table)
+    for sequence_length, q_len in zip(
+        inputs["sequence_lengths_list"], inputs["q_lens"], strict=True
+    ):
+        assert (sequence_length - q_len) // inputs["page_size"] != (
+            sequence_length - 1
+        ) // inputs["page_size"]
+
+    key_cache = inputs["key_cache"].clone()
+    value_cache = inputs["value_cache"].clone()
+    out_q = torch.empty_like(expected[0])
+    out_q_scale = torch.empty_like(expected[1])
+    split_k_flag = torch.full(
+        (2, 1), -1, dtype=torch.int32, device=inputs["packed_qkv"].device
+    )
+    out_k = torch.empty_like(expected[6])
+    out_v = torch.empty_like(expected[7])
+    k_scale = torch.tensor([0.5], dtype=torch.float32, device="cuda:0")
+    v_scale = torch.tensor([0.25], dtype=torch.float32, device="cuda:0")
+
+    output = flashinfer.rope.qk_rmsnorm_rope_append_paged_kv_cache_hy3(
+        inputs["packed_qkv"],
+        inputs["cos_sin_cache"],
+        inputs["sequence_lengths"],
+        inputs["q_indptr"],
+        inputs["block_table"],
+        (key_cache, value_cache),
+        False,
+        q_norm_weight=expected[4],
+        k_norm_weight=expected[5],
+        norm_policy=2,
+        quant_policy=1,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        max_sequence_length=inputs["max_sequence_length"],
+        out_q=out_q,
+        out_q_scale=out_q_scale,
+        split_k_flag=split_k_flag,
+        out_k=out_k,
+        out_v=out_v,
+    )
+
+    assert tuple(tensor.data_ptr() for tensor in output) == tuple(
+        tensor.data_ptr() for tensor in (out_q, out_q_scale, split_k_flag, out_k, out_v)
+    )
+    torch.testing.assert_close(output[0].float(), expected[0].float(), atol=1, rtol=0)
+    torch.testing.assert_close(output[1], expected[1], rtol=2e-4, atol=1e-7)
+    assert torch.equal(output[2], torch.zeros_like(output[2]))
+    torch.testing.assert_close(
+        output[3].float() * k_scale[0],
+        expected[6].float() * k_scale[0],
+        atol=0.5,
+        rtol=0,
+    )
+    torch.testing.assert_close(
+        output[4].float() * v_scale[0],
+        expected[7].float() * v_scale[0],
+        atol=0.5,
+        rtol=0,
+    )
+    torch.testing.assert_close(
+        key_cache.float() * k_scale[0],
+        expected[2].float() * k_scale[0],
+        atol=0.5,
+        rtol=0,
+    )
+    torch.testing.assert_close(
+        value_cache.float() * v_scale[0],
+        expected[3].float() * v_scale[0],
+        atol=0.5,
+        rtol=0,
+    )
+
+
+@pytest.mark.parametrize(
+    "buffer_name,wrong_dtype,expected_dtype",
+    [
+        ("out_q_scale", torch.float16, "float32"),
+        ("split_k_flag", torch.int8, "int32"),
+    ],
+)
+def test_qk_rmsnorm_rope_hy3_rejects_preallocated_output_dtype(
+    buffer_name, wrong_dtype, expected_dtype
+):
+    inputs = _make_qk_norm_rope_store_inputs_hy3(
+        "decode", 8, 1, torch.float8_e4m3fn, batch_size=2
+    )
+    shapes = {
+        "out_q_scale": (inputs["packed_qkv"].shape[0], 8),
+        "split_k_flag": (inputs["sequence_lengths"].shape[0], 1),
+    }
+    invalid_buffer = torch.empty(
+        shapes[buffer_name], dtype=wrong_dtype, device=inputs["packed_qkv"].device
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=rf"{buffer_name} must have shape .* and dtype {expected_dtype}",
+    ):
+        flashinfer.rope.qk_rmsnorm_rope_append_paged_kv_cache_hy3(
+            inputs["packed_qkv"],
+            inputs["cos_sin_cache"],
+            inputs["sequence_lengths"],
+            inputs["q_indptr"],
+            inputs["block_table"],
+            (inputs["key_cache"], inputs["value_cache"]),
+            False,
+            quant_policy=1,
+            k_scale=torch.tensor([0.5], dtype=torch.float32, device="cuda:0"),
+            v_scale=torch.tensor([0.25], dtype=torch.float32, device="cuda:0"),
+            **{buffer_name: invalid_buffer},
+        )
+
+
+def test_qk_rmsnorm_rope_hy3_uses_current_non_default_stream():
+    inputs = _make_qk_norm_rope_store_inputs_hy3(
+        "mtp", 8, 1, torch.bfloat16, batch_size=2
+    )
+    expected = _qk_norm_rope_store_reference_hy3(inputs, norm_policy=0, quant_policy=0)
+
+    # Warm up lazy module loading so it cannot hide an accidental default-stream launch.
+    warmup_caches = (inputs["key_cache"].clone(), inputs["value_cache"].clone())
+    flashinfer.rope.qk_rmsnorm_rope_append_paged_kv_cache_hy3(
+        inputs["packed_qkv"],
+        inputs["cos_sin_cache"],
+        inputs["sequence_lengths"],
+        inputs["q_indptr"],
+        inputs["block_table"],
+        warmup_caches,
+        False,
+        norm_policy=0,
+        quant_policy=0,
+    )
+    torch.cuda.current_stream().synchronize()
+
+    source_qkv = inputs["packed_qkv"]
+    delayed_qkv = torch.zeros_like(source_qkv)
+    key_cache = inputs["key_cache"].clone()
+    value_cache = inputs["value_cache"].clone()
+    out_q = torch.empty_like(expected[0])
+    stream = torch.cuda.Stream()
+    assert stream.cuda_stream != torch.cuda.default_stream().cuda_stream
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        # A kernel launched on the default stream would consume the zero input before
+        # this delayed producer runs; a current-stream launch is ordered after the copy.
+        torch.cuda._sleep(20_000_000)
+        delayed_qkv.copy_(source_qkv)
+        output = flashinfer.rope.qk_rmsnorm_rope_append_paged_kv_cache_hy3(
+            delayed_qkv,
+            inputs["cos_sin_cache"],
+            inputs["sequence_lengths"],
+            inputs["q_indptr"],
+            inputs["block_table"],
+            (key_cache, value_cache),
+            False,
+            norm_policy=0,
+            quant_policy=0,
+            out_q=out_q,
+        )
+    stream.synchronize()
+
+    assert output[0].data_ptr() == out_q.data_ptr()
+    assert output[1:] == (None, None, None, None)
+    torch.testing.assert_close(output[0], expected[0], atol=8e-2, rtol=1e-5)
+    torch.testing.assert_close(key_cache, expected[2], atol=8e-2, rtol=1e-5)
+    torch.testing.assert_close(value_cache, expected[3], atol=0, rtol=0)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability(0) != (10, 0),
+    reason="SM100 fast-path parity test",
+)
+def test_qk_rmsnorm_rope_hy3_sm100_uniform_decode_and_preallocated_outputs():
+    inputs = _make_qk_norm_rope_store_inputs_hy3(
+        "decode", 64, 8, torch.float8_e4m3fn, batch_size=256
+    )
+    q_weight = torch.linspace(0.75, 1.25, 128, device="cuda:0")
+    k_weight = torch.linspace(1.25, 0.75, 128, device="cuda:0")
+    scales = (
+        torch.tensor([0.5], dtype=torch.float32, device="cuda:0"),
+        torch.tensor([0.25], dtype=torch.float32, device="cuda:0"),
+    )
+    reference_caches = (inputs["key_cache"].clone(), inputs["value_cache"].clone())
+    optimized_caches = (inputs["key_cache"].clone(), inputs["value_cache"].clone())
+    reference = flashinfer.rope.qk_rmsnorm_rope_append_paged_kv_cache_hy3(
+        inputs["packed_qkv"],
+        inputs["cos_sin_cache"],
+        inputs["sequence_lengths"],
+        inputs["q_indptr"],
+        inputs["block_table"],
+        reference_caches,
+        False,
+        q_norm_weight=q_weight,
+        k_norm_weight=k_weight,
+        norm_policy=2,
+        quant_policy=1,
+        k_scale=scales[0],
+        v_scale=scales[1],
+        uniform_one_token_decode=False,
+    )
+    out_q = torch.empty_like(reference[0])
+    out_scale = torch.empty_like(reference[1])
+    split_flag = torch.full_like(reference[2], -1)
+    pointers = (out_q.data_ptr(), out_scale.data_ptr(), split_flag.data_ptr())
+    optimized = flashinfer.rope.qk_rmsnorm_rope_append_paged_kv_cache_hy3(
+        inputs["packed_qkv"],
+        inputs["cos_sin_cache"],
+        inputs["sequence_lengths"],
+        inputs["q_indptr"],
+        inputs["block_table"],
+        optimized_caches,
+        False,
+        q_norm_weight=q_weight,
+        k_norm_weight=k_weight,
+        norm_policy=2,
+        quant_policy=1,
+        k_scale=scales[0],
+        v_scale=scales[1],
+        out_q=out_q,
+        out_q_scale=out_scale,
+        split_k_flag=split_flag,
+        uniform_one_token_decode=True,
+    )
+    assert pointers == (
+        optimized[0].data_ptr(),
+        optimized[1].data_ptr(),
+        optimized[2].data_ptr(),
+    )
+    for actual, expected in zip(optimized[:3], reference[:3], strict=True):
+        assert torch.equal(actual, expected)
+    assert torch.equal(optimized_caches[0], reference_caches[0])
+    assert torch.equal(optimized_caches[1], reference_caches[1])
+
+
 if __name__ == "__main__":
     # test_rope(2, 1, 8, 8, 1, 128, "llama", 1.0, False)
     # test_rope_pos_ids(2, 1, 8, 8, 1, 128, "llama31", 1.0, False)
