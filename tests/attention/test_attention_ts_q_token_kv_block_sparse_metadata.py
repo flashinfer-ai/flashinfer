@@ -39,7 +39,7 @@ from flashinfer.decode import (
 # below remain CUDA-wide; even workspace sizing can enter the attention resolver.
 _REQUIRES_PRIMS_TS_ATTENTION = pytest.mark.skipif(
     not torch.cuda.is_available()
-    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)),
     reason="QToken-KvBlock-Sparse-Attention tests require SM100 or SM103",
 )
 
