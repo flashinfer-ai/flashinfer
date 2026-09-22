@@ -1,5 +1,5 @@
 """
-Copyright (c) 2025 by FlashInfer team.
+Copyright (c) 2025-2026 by FlashInfer team.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -54,11 +54,10 @@ from .fp4_common import (
     # PTX intrinsics - basic ops
     st_global_u64,
     get_ptr_as_int64,
-    get_smem_ptr_as_int32,
-    ld_shared_v4_u32,
     rcp_approx_ftz,
     fmin_f32,
     fmax_f32,
+    fabs_f32,
     # Half2 SIMD intrinsics
     hmax2,
     hmax_to_f32,
@@ -69,6 +68,7 @@ from .fp4_common import (
     cvt_f32x2_to_half2,
     cvt_f32_to_e4m3,
     fp8_e4m3_to_f32_and_rcp,
+    nvfp4_compute_output_scale,
     cvt_f32_to_ue8m0,
     ue8m0_to_output_scale,
     # Reduction utilities
@@ -88,31 +88,6 @@ from .fp4_common import (
     load_f32_16_from_smem,
     compute_y_and_max_abs_f32,
 )
-
-
-@cute.jit
-def _load_8_half2_from_smem(
-    sX: cute.Tensor,
-    sW: cute.Tensor,
-    row_idx: Int32,
-    col_offset: Int32,
-    row_stride: int,
-):
-    """Load 16 packed fp16/bf16 values from each shared-memory tile."""
-    x_h2 = cute.make_rmem_tensor((8,), Uint32)
-    w_h2 = cute.make_rmem_tensor((8,), Uint32)
-    base = row_idx * row_stride + col_offset
-
-    x_addr0 = get_smem_ptr_as_int32(sX, base)
-    x_addr1 = get_smem_ptr_as_int32(sX, base + Int32(8))
-    x_h2[0], x_h2[1], x_h2[2], x_h2[3] = ld_shared_v4_u32(x_addr0)
-    x_h2[4], x_h2[5], x_h2[6], x_h2[7] = ld_shared_v4_u32(x_addr1)
-
-    w_addr0 = get_smem_ptr_as_int32(sW, base)
-    w_addr1 = get_smem_ptr_as_int32(sW, base + Int32(8))
-    w_h2[0], w_h2[1], w_h2[2], w_h2[3] = ld_shared_v4_u32(w_addr0)
-    w_h2[4], w_h2[5], w_h2[6], w_h2[7] = ld_shared_v4_u32(w_addr1)
-    return x_h2, w_h2
 
 
 # =============================================================================
@@ -345,8 +320,10 @@ class AddRMSNormFP4QuantKernel:
         tile_bytes = rows_per_block * cols_per_tile * elem_size
 
         if cluster_n == 1:
-            # 4 tiles: sX, sR, sW, sH + reduction buffer
-            return 4 * tile_bytes + rows_per_block * warps_per_row * 4
+            # NVFP4 retains the FP32 sum through normalization.
+            h_elem_size = 4 if block_size == 16 else elem_size
+            h_tile_bytes = rows_per_block * cols_per_tile * h_elem_size
+            return 3 * tile_bytes + h_tile_bytes + rows_per_block * warps_per_row * 4
         else:
             # 2 tiles: sX, sR + larger reduction buffer + mbarrier
             return 2 * tile_bytes + rows_per_block * warps_per_row * cluster_n * 4 + 8
@@ -377,7 +354,8 @@ class AddRMSNormFP4QuantKernel:
 
         if self.cluster_n == 1:
             w_tile_bytes = self.rows_per_block * self.cols_per_tile * elem_size
-            h_tile_bytes = self.rows_per_block * self.cols_per_tile * elem_size
+            h_elem_size = 4 if self.block_size == 16 else elem_size
+            h_tile_bytes = self.rows_per_block * self.cols_per_tile * h_elem_size
             reduction_bytes = self.rows_per_block * self.warps_per_row * 4
         else:
             w_tile_bytes = 0
@@ -480,14 +458,8 @@ class AddRMSNormFP4QuantKernel:
     ):
         """Device kernel with cluster sync and Half2 SIMD.
 
-        Performs:
-        1. h = input + residual (writes h back to mR in-place)
-        2. y = h * rstd * w / global_scale = rmsnorm(h, w) / global_scale
-        3. quantizes y to FP4
-
-        mGlobalScale contains the global scale value. The kernel reads it and
-        computes 1/global_scale, which is multiplied with rstd to apply:
-        y = h * rstd * w / global_scale = rmsnorm(h, w) / global_scale
+        The global scale multiplies E4M3 block scales; it does not divide the
+        normalized values. Dequantization divides the scaled FP4 values by it.
         """
         tidx, _, _ = cute.arch.thread_idx()
 
@@ -537,7 +509,7 @@ class AddRMSNormFP4QuantKernel:
                 byte_alignment=16,
             )
             sH = smem.allocate_tensor(
-                mX.element_type,
+                Float32 if block_size == 16 else mX.element_type,
                 cute.make_ordered_layout(tiler_mn, order=(1, 0)),
                 byte_alignment=16,
             )
@@ -651,8 +623,9 @@ class AddRMSNormFP4QuantKernel:
         tRrO.store(h_vals.to(self.dtype))
 
         if cutlass.const_expr(cluster_n == 1):
-            h_elem = h_vals.to(mX.element_type)
-            tHsH.store(h_elem)
+            # The residual output is rounded, but normalization must use the
+            # same FP32 sum as the variance, not the rounded residual output.
+            tHsH.store(h_vals.to(sH.element_type))
 
         sum_sq = row_reduce(
             h_sq,
@@ -705,33 +678,29 @@ class AddRMSNormFP4QuantKernel:
 
                     if cutlass.const_expr(block_size == 16):
                         if cutlass.const_expr(cluster_n == 1):
-                            h_h2, w_h2 = _load_8_half2_from_smem(
-                                sH,
-                                sW,
-                                row_in_block,
-                                block_start,
-                                self.cols_per_tile,
-                            )
-                            if cutlass.const_expr(is_fp16):
-                                h_f32 = half2_to_float16(h_h2, Float32(1.0))
-                                w_f32 = half2_to_float16(w_h2, Float32(1.0))
-                            else:
-                                h_f32 = bfloat2_to_float16(h_h2, Float32(1.0))
-                                w_f32 = bfloat2_to_float16(w_h2, Float32(1.0))
-                            y_f32, max_abs = compute_y_and_max_abs_f32(
-                                h_f32, w_f32, rstd
-                            )
+                            y_f32 = cute.make_rmem_tensor((16,), Float32)
+                            max_abs = Float32(0.0)
+                            for i in cutlass.range_constexpr(16):
+                                h = sH[row_in_block, block_start + i]
+                                w = sW[row_in_block, block_start + i].to(Float32)
+                                # Match materializing RMSNorm in the input dtype
+                                # before a separate NVFP4 quantization call. This
+                                # rounding must also apply when y_out is omitted.
+                                y = (h * rstd * w).to(mX.element_type).to(Float32)
+                                y_f32[i] = y
+                                max_abs = fmax_f32(max_abs, fabs_f32(y))
 
                             # E4M3: global_scale is incorporated into block scale
-                            scale_float = global_scale_val * max_abs * fp4_max_rcp
+                            scale_float = global_scale_val * (max_abs * fp4_max_rcp)
                             scale_float = fmin_f32(
                                 scale_float, Float32(FLOAT8_E4M3_MAX)
                             )
                             scale_fp8_u32 = cvt_f32_to_e4m3(scale_float)
                             scale_fp8 = Uint8(scale_fp8_u32 & Uint32(0xFF))
-                            inv_scale = (
-                                fp8_e4m3_to_f32_and_rcp(scale_fp8_u32)
-                                * global_scale_val
+                            # Preserve the CUDA quantizer's reciprocal order;
+                            # algebraic reassociation changes FP4 tie rounding.
+                            inv_scale = nvfp4_compute_output_scale(
+                                scale_fp8_u32, global_scale_val
                             )
 
                             if cutlass.const_expr(self.output_both_sf_layouts):
@@ -1273,8 +1242,7 @@ def add_rmsnorm_fp4quant(
     Computes:
         1. ``residual = residual + input`` (in-place update)
         2. ``y = RMSNorm(residual) * weight``
-        3. Optionally applies global scaling (``y = y / global_scale``)
-        4. Quantizes ``y`` to FP4
+        3. Quantizes ``y`` to FP4, incorporating ``global_scale`` into E4M3 scales
 
     The residual tensor is modified in-place to contain the fused value.
 
@@ -1309,10 +1277,10 @@ def add_rmsnorm_fp4quant(
         for UE8M0 format. If ``None``, will be allocated automatically.
     global_scale : torch.Tensor, optional
         Global scale factor tensor of shape ``(1,)`` with dtype ``torch.float32``.
-        If provided, the RMSNorm output is divided by this value before quantization:
-        ``y = rmsnorm(h, w) / global_scale`` where ``h = input + residual``.
-        This is used for NVFP4 format where a pre-computed global scale lifts
-        per-block scales into optimal dynamic range.
+        For E4M3 scales, the per-block maximum divided by 6 is multiplied by
+        this value before rounding the scale to E4M3. Dequantization recovers
+        ``y`` as ``fp4_value * block_scale / global_scale``. The normalized
+        values stored in ``y_out`` are not globally scaled.
         If ``None``, no global scaling is applied (equivalent to global_scale=1.0).
     eps : float
         Epsilon for numerical stability in RMSNorm. Default is ``1e-6``.
@@ -1380,6 +1348,11 @@ def add_rmsnorm_fp4quant(
 
     Notes
     -----
+    - The single-CTA NVFP4 path accumulates the residual sum and normalizes in
+      FP32, then rounds to the input dtype before FP4 quantization, matching a
+      materialized add-RMSNorm followed by NVFP4 quantization. Reduction order
+      can still cause rounding differences from a separate RMSNorm kernel.
+      This numerical contract does not extend to the multi-CTA or MXFP4 paths.
     - Requires SM100+ (Blackwell) for FP4 quantization PTX intrinsics.
     - For block_size=16 (NVFP4): uses E4M3 scale factors (max value 448.0).
     - For block_size=32 (MXFP4): uses UE8M0 scale factors (power-of-2 scales).
