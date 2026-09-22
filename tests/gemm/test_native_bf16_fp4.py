@@ -214,9 +214,16 @@ def test_output_alias_is_rejected():
 
 @pytest.mark.parametrize("unaligned", ["activation", "weight", "scale"])
 @pytest.mark.parametrize("m", [3, 65])
-def test_unaligned_canonical_buffers_use_valid_tactics(unaligned, m):
-    """A valid narrow-aligned buffer must not reach a 16-byte asynchronous load."""
-    from flashinfer.gemm.kernels.native_bf16_fp4.runner import get_runner
+def test_unaligned_canonical_buffers_use_valid_tactics(unaligned, m, monkeypatch):
+    """Offset views must tune through aligned clones and reuse a safe cached tactic."""
+    from flashinfer.autotuner import AutoTuner
+    from flashinfer.gemm.kernels.native_bf16_fp4.runner import (
+        _TUNING_CONFIG,
+        get_runner,
+    )
+
+    tuner = AutoTuner(warmup=1, repeat=2)
+    monkeypatch.setattr(AutoTuner, "_instance", tuner)
 
     a, b, sf, weight = make_case(m, 129, 128)
     tensors = {"activation": a, "weight": b, "scale": sf}
@@ -236,7 +243,37 @@ def test_unaligned_canonical_buffers_use_valid_tactics(unaligned, m):
         tactic[0] not in ("staged", "tiled")
         for tactic in runner.get_valid_tactics(inputs, None)
     )
+    aligned = [t.clone() if isinstance(t, torch.Tensor) else t for t in inputs]
+    for tactic in runner.get_valid_tactics(inputs, None):
+        assert runner.validate_tactic(aligned, tactic)
+    for tactic in runner.get_valid_tactics(aligned, None):
+        if tactic[0] in ("staged", "tiled", "n64"):
+            assert not runner.validate_tactic(inputs, tactic)
     result = mm_bf16_fp4(a, b, sf, backend=BACKEND, out=out)
+    torch.testing.assert_close(
+        result.float(), a.float() @ weight.T, atol=2e-3, rtol=8e-3
+    )
+    with autotune(True):
+        result = mm_bf16_fp4(a, b, sf, backend=BACKEND, out=out)
+    hit, _, tactic, _ = tuner.search_cache(
+        "native_bf16_fp4_sm12x",
+        [runner],
+        tuner._get_input_sizes(inputs),
+        _TUNING_CONFIG,
+        inputs=inputs,
+    )
+    assert hit and tactic != -1
+    torch.testing.assert_close(
+        result.float(), a.float() @ weight.T, atol=2e-3, rtol=8e-3
+    )
+
+    def unexpected_profile(*args, **kwargs):
+        pytest.fail("A repeated call must reuse the cached tactic")
+
+    monkeypatch.setattr(tuner, "_profile_single_kernel", unexpected_profile)
+    a.neg_()
+    with autotune(True):
+        result = mm_bf16_fp4(a, b, sf, backend=BACKEND, out=out)
     torch.testing.assert_close(
         result.float(), a.float() @ weight.T, atol=2e-3, rtol=8e-3
     )

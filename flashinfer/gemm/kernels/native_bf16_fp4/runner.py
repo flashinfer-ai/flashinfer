@@ -116,6 +116,10 @@ class NativeBf16Fp4Runner(TunableRunner):
         )
 
     def get_valid_tactics(self, inputs, profile):
+        return self._get_tactics(inputs, for_tuning=True)
+
+    def _get_tactics(self, inputs, *, for_tuning):
+        """Prune fallback tactics for tuning without rejecting safe execution."""
         m, k = inputs[0].shape
         n = inputs[1].shape[0]
         if m > 16:
@@ -140,7 +144,7 @@ class NativeBf16Fp4Runner(TunableRunner):
         )
         tactics = [("simd", r, w, s) for r in rows for w in (4, 8) for s in simd_splits]
         if _can_stage(inputs):
-            if m > 1:
+            if m > 1 and for_tuning:
                 tactics = []
             tactics += [
                 ("staged", tk, w, s, stages)
@@ -167,7 +171,8 @@ class NativeBf16Fp4Runner(TunableRunner):
                     )
                     <= 49152
                 ]
-            return tactics
+            if for_tuning:
+                return tactics
         mma_splits = (
             (1, 2, 4, 8, 16, 32, 64) if n < 8192 and k >= 4096 else (1, 2, 4, 8)
         )
@@ -180,7 +185,8 @@ class NativeBf16Fp4Runner(TunableRunner):
         return tactics
 
     def validate_tactic(self, inputs, tactic):
-        return tactic == -1 or tactic in self.get_valid_tactics(inputs, None)
+        # Cold-L2 profiling clones can be more aligned than the caller's views.
+        return tactic == -1 or tactic in self._get_tactics(inputs, for_tuning=False)
 
     def forward(self, inputs, tactic=-1, do_preparation=False, **kwargs):
         a, b, sf, alpha, out, enable_pdl = inputs
