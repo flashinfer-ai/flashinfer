@@ -4678,6 +4678,16 @@ def _supports_affine_split_launch(args, kwargs) -> bool:
         or checkpoint_every_n_tokens != 64
     ):
         return False
+    if argument(9, "lower_bound") is None and checkpoint_request:
+        # Checkpointed unbounded (softplus) prefill feeds the radix cache and
+        # is validated per chunk against Triton.  The split's per-part map and
+        # correction passes each add BF16 error proportional to the whole
+        # state, and slow unbounded gates do not damp it: on real 8K
+        # activations the checkpoints drift from 0.002 to 0.03 rel L2 across
+        # twelve composed parts (Triton flat at 0.003), independent of map
+        # storage precision.  The sequential direct M128 recurrence with the
+        # FP32 carrier stays at Triton level, so it owns this contract.
+        return False
     lengths = _launch_sequence_lengths(q, cu_seqlens, argument(19, "sequence_lengths"))
     if not lengths or min(lengths) <= 0:
         return False
