@@ -83,7 +83,6 @@ from .helpers_common import (
     _logical_q_group_idx,
     _mma_k_step_qk,
     _mma_kind_for_qk,
-    _masked_tile_max_threshold,
     _neg_max_f32,
     _qk_accumulator_dtype,
     _softmax_scale_pair_width,
@@ -2572,8 +2571,9 @@ class TmemSResource(DecodeGenResourceBase):
         fragments are written back to TMEM so the P pass can reload them
         without any mask logic. Sage attention reduces the quantized scores
         per scale group and publishes the dequantized row maximum; the
-        scores themselves stay quantized in TMEM. INT32 scores of Int8 Q/K
-        arrive as biased FP32 (see ``INT32_SCORE_BIAS``), so both formats
+        scores stay quantized unless the geometry has one scale per score.
+        INT32 scores of Int8 Q/K arrive as biased FP32 (see
+        ``INT32_SCORE_BIAS``), so both formats
         share this code; the bias leaves with the group maxima. The
         ``sage_k_scales`` strategy hands each fragment its raw ``sfK`` words
         (from the routed ``sage_scale_arr`` or the instance's SMEM ring), the
@@ -2803,8 +2803,11 @@ class TmemSResource(DecodeGenResourceBase):
             + self._softmax_loop_stage_slot_offset(stage_info)
         )
         max_chains = cutlass.Array(Float32, 4, space=cutlass.AddressSpace.rmem)
+        max_identity = _neg_max_f32()
+        if cutlass.const_expr(cfg.use_sage_attention):
+            max_identity = Float32(float("-inf"))
         for chain_idx in cutlass.range_constexpr(4):
-            max_chains[chain_idx] = _neg_max_f32()
+            max_chains[chain_idx] = max_identity
         # The strategy hands each fragment its raw ``sfK`` words; ``sfQ`` is one
         # per-lane factor and applies once to the tile maximum below.
         scales_view = None
@@ -2864,7 +2867,6 @@ class TmemSResource(DecodeGenResourceBase):
                         loaded,
                         fragment_scales=fragment_scales,
                         chain_base=fragment_idx * cfg.sage_k_groups_per_fragment,
-                        may_be_masked=False,
                         groups=cfg.sage_k_groups_per_fragment,
                     )
                     self.sage_k_scales.advance(scales_view)
@@ -2951,11 +2953,11 @@ class TmemSResource(DecodeGenResourceBase):
         )
         if cutlass.const_expr(cfg.use_sage_attention):
             # The chains hold ``gmax * sfK``; ``sfQ`` is one per-lane factor,
-            # so it applies once here. A masked group or score folds as
-            # ``-FLT_MAX * sfK`` (or ``-inf``), far below any score, so a
-            # fully masked tile ends below the threshold and takes back the
-            # exact sentinel here, once per tile.
-            if tile_max < _masked_tile_max_threshold():
+            # so it applies once here. Masked scores stay -inf under positive
+            # scales. Translate only that reduction identity to the running
+            # state's finite sentinel: a real pre-sfQ maximum can equal
+            # -FLT_MAX and become an ordinary score after sfQ compensates it.
+            if tile_max == Float32(float("-inf")):
                 tile_max = _neg_max_f32()
             else:
                 tile_max = tile_max * sage_q_scale
@@ -2993,9 +2995,10 @@ class TmemSResource(DecodeGenResourceBase):
         held in a local would be flattened as a loop-carried value.
 
         Each K32 fragment is masked in place, its maximum folded and the
-        fragment written back. Scores whose keep bit is clear become the
-        ``-FLT_MAX`` sentinel. A fragment that holds a proxy route's ragged
-        final summary adds the summary's mass shortfall to that score: a
+        fragment written back. Scores whose keep bit is clear become
+        ``-inf`` with Sage, otherwise the ``-FLT_MAX`` sentinel. A fragment
+        that holds a proxy route's ragged final summary adds the summary's
+        mass shortfall to that score: a
         score-unit shift that leaves a masked score at the sentinel in FP32.
         Sage scores are quantized, so the shift (already divided by ``sfQ``
         by the caller) is divided by the tail group's ``sfK`` (the fragment's
@@ -3042,7 +3045,10 @@ class TmemSResource(DecodeGenResourceBase):
                     0
                 )
                 if not score_is_kept:
-                    score = _neg_max_f32()
+                    if cutlass.const_expr(cfg.use_sage_attention):
+                        score = Float32(float("-inf"))
+                    else:
+                        score = _neg_max_f32()
                 if cutlass.const_expr(may_hold_tail and score_idx == tail_lane):
                     if ((tail_fragment_mask >> Int32(fragment)) & Int32(1)) != Int32(0):
                         lane_shift = tail_shift
@@ -3075,7 +3081,6 @@ class TmemSResource(DecodeGenResourceBase):
                     masked_scores,
                     fragment_scales=fragment_scales,
                     chain_base=0,
-                    may_be_masked=True,
                     groups=groups,
                 )
             _keeps_tcgen05_st(
@@ -3104,8 +3109,8 @@ class TmemSResource(DecodeGenResourceBase):
         share a group unless the group is one score wide); biased INT32
         scores fold ``-bias * sfK`` into the same packed FMA, the rounding
         the P pass already accepts for its group addends. A masked score
-        scales to ``-FLT_MAX * sfK`` or ``-inf``, far below any score, and the
-        caller restores the exact sentinel on the tile maximum alone.
+        stays ``-inf`` under any positive finite scale, so it cannot outrank
+        a kept score from another scale group.
         """
         cfg = self.cfg
         fragment_regs = cfg.softmax_score_fragment_regs
@@ -3155,7 +3160,6 @@ class TmemSResource(DecodeGenResourceBase):
         *,
         fragment_scales: cutlass.Array,
         chain_base: Constexpr[int],
-        may_be_masked: Constexpr[bool],
         groups: Constexpr[int],
     ) -> None:
         """Fold one fragment's dequantized group maxima into the max chains.
@@ -3164,18 +3168,16 @@ class TmemSResource(DecodeGenResourceBase):
         ``(group_max - bias) * sfK_g`` is folded, so the running maximum is
         the dequantized one up to the row's ``sfQ``, which the caller applies
         once to the tile maximum, while the scores stay quantized. Groups of
-        four or more scores reduce over four chains; on the unmasked path the
-        chains start from the group's first four scores, so a group of ``n``
-        scores costs ``n - 1`` maxima, while a masked fragment seeds them
-        with the sentinel. Smaller groups (the one-token K block has one
-        score per group) reduce in one chain, so a masked score's sentinel
-        stays exact. Group maxima leave in pairs (a fragment with one group,
+        four or more scores reduce over four chains seeded from the group's
+        first four scores, so a group of ``n`` scores costs ``n - 1`` maxima.
+        Masked scores already contain ``-inf``, so the same reduction handles
+        partially and fully masked groups. Smaller groups reduce in one chain.
+        Group maxima leave in pairs (a fragment with one group,
         K blocks of 32 tokens and larger, leaves alone): a packed add removes
         the INT32 score bias (exact on the biased scores' unit spacing, and
         the sentinel is unchanged) and a packed multiply applies the
-        fragment's scales. A fully masked group folds as its scaled sentinel,
-        far below any score; the caller restores the exact sentinel on a
-        fully masked tile's maximum. Group ``g`` folds into chain
+        fragment's scales. A fully masked group stays ``-inf`` and leaves the
+        tile maximum's reduction identity unchanged. Group ``g`` folds into chain
         ``(chain_base + g) % 4``: the unrolled unmasked pass spreads the
         fragments over the four chains, the rolled masked pass passes
         ``chain_base=0``; the final reduction over all chains is unaffected.
@@ -3198,12 +3200,8 @@ class TmemSResource(DecodeGenResourceBase):
                 else:
                     chains = cutlass.Array(Float32, 4, space=cutlass.AddressSpace.rmem)
                     for chain_idx in cutlass.range_constexpr(4):
-                        if cutlass.const_expr(may_be_masked):
-                            chains[chain_idx] = _neg_max_f32()
-                        else:
-                            chains[chain_idx] = Float32(scores[first + chain_idx])
-                    seeded_elems = 0 if may_be_masked else 4
-                    for score_elem in cutlass.range_constexpr(seeded_elems, group_regs):
+                        chains[chain_idx] = Float32(scores[first + chain_idx])
+                    for score_elem in cutlass.range_constexpr(4, group_regs):
                         chain_idx: Constexpr[int] = score_elem % 4
                         chains[chain_idx] = cute.math.max(
                             chains[chain_idx],

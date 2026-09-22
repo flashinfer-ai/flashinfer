@@ -442,15 +442,6 @@ def _neg_max_f32() -> Float32:
     return Float32(NEG_FLT_MAX)
 
 
-def _masked_tile_max_threshold() -> Float32:
-    """Return the bound below which a tile maximum can only be a scaled sentinel.
-
-    Dequantized scores are bounded by the quantized range times the scales,
-    far above ``-2**100``; a sentinel scaled by any ``sfK`` is far below it.
-    """
-    return Float32(-(2.0**100))
-
-
 @cute.jit
 def _masked_weighted_sum(terms: tuple) -> Float32:
     """Return the sum of ``value * weight`` over ``(uses, value, weight)`` terms.

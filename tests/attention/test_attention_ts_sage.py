@@ -72,6 +72,18 @@ from tests.attention.sage_quant_reference import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _ieee_float32_references(monkeypatch: pytest.MonkeyPatch):
+    """Keep FP32 references independent of the environment's TF32 preference."""
+    monkeypatch.setenv("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE", "0")
+    previous_precision = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("highest")
+    try:
+        yield
+    finally:
+        torch.set_float32_matmul_precision(previous_precision)
+
+
 # ---------------------------------------------------------------------------
 # Flat scale layout
 # ---------------------------------------------------------------------------
@@ -1424,6 +1436,107 @@ def test_dense_sage_recipe_tracks_bf16_attention(
     _assert_recipe_close(actual, expected, q_magnitude=q_magnitude, qk_dtype=qk_dtype)
 
 
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize("k_block_size", (1, 4, 16))
+@pytest.mark.parametrize(
+    ("mode", "qk_dtype"),
+    (
+        pytest.param("large_k", _FP8, id="large_k-fp8"),
+        pytest.param("large_k", torch.int8, id="large_k-int8"),
+        pytest.param("masked_small_k", _FP8, id="masked_small_k-fp8"),
+        pytest.param("masked_small_k", torch.int8, id="masked_small_k-int8"),
+        pytest.param("mixed_mask", _FP8, id="mixed_mask-fp8"),
+        pytest.param("mixed_mask", torch.int8, id="mixed_mask-int8"),
+        pytest.param("finite_sentinel", _FP8, id="finite_sentinel-fp8"),
+    ),
+)
+@torch.no_grad()
+def test_sage_row_mask_does_not_depend_on_scale_magnitude(
+    k_block_size: int, qk_dtype: torch.dtype, mode: str
+) -> None:
+    """Mask validity survives scales on either side of any score threshold.
+
+    A large K scale and reciprocal Q scale leave dense logits unchanged,
+    while an all-masked row must stay zero even with a tiny K scale. A masked
+    group's smaller scale must not let its sentinel dominate a kept score.
+    """
+
+    device = torch.device("cuda", 0)
+    use_sparse = mode in ("masked_small_k", "mixed_mask")
+    case_type = _SparseSageCase if use_sparse else _DenseSageCase
+    case = case_type(
+        name="scale_magnitude_mask",
+        batch_size=1,
+        seq_len_q=64,
+        seq_len_kv=256,
+        num_qo_heads=1,
+        num_kv_heads=1,
+        q_block_size=64,
+        kv_block_size=64,
+        expected_kv_tile=256,
+        out_dtype=torch.bfloat16,
+        qk_dtype=qk_dtype,
+        sage_k_block_size=k_block_size,
+        scheduler="static",
+        **({"use_proxy_routes": False, "use_token_mask": True} if use_sparse else {}),
+    )
+    wrapper = _plan_sage(case, device, max_blocks_per_row=4 if use_sparse else None)
+    q = torch.full((1, 64, 1, _HEAD_DIM), 2.0, device=device).to(qk_dtype)
+    k = torch.full((1, 256, 1, _HEAD_DIM), -2.0, device=device).to(qk_dtype)
+    v = torch.ones((1, 256, 1, _HEAD_DIM), device=device).to(_FP8)
+    params = SageAttentionParams(
+        q_scale=torch.ones((1, 64), device=device),
+        k_scale=torch.ones((1, flat_scale_numel(1, 256, k_block_size)), device=device),
+        v_scale=torch.ones((1, _HEAD_DIM), device=device),
+    )
+    routing = {}
+    if use_sparse:
+        patterns = ((((0, 1, 2, 3),),),)
+        valid = set(range(k_block_size)) if mode == "mixed_mask" else set()
+        if mode == "mixed_mask" and k_block_size == 16:
+            # The first score pack can be masked while later scores in the
+            # same scale group remain valid.
+            valid = set(range(4, 16))
+        routing = {
+            **_sparse_routing(case, patterns, device),
+            "kv_valid_bits": pack_token_mask(256, (valid,), device),
+        }
+    if mode == "masked_small_k":
+        expected = torch.zeros_like(q, dtype=torch.bfloat16)
+        scaled_params = replace(params, k_scale=params.k_scale * 2.0**-100)
+    elif mode == "mixed_mask":
+        # Every intermediate multiplier is normal FP32, including the masked
+        # groups' c * 2**-120. Their V values expose any leaked masked mass.
+        v_values = torch.full((1, 256, 1, _HEAD_DIM), 4.0, device=device)
+        v_values[:, :k_block_size] = 1.0
+        v = v_values.to(_FP8)
+        expected = wrapper.run(q, k, v, sage=params, **routing)
+        k_scales = params.k_scale * 2.0**-40
+        k_scales[:, 0] = 2.0**80
+        scaled_params = replace(
+            params, q_scale=params.q_scale * 2.0**-80, k_scale=k_scales
+        )
+    else:
+        # Reciprocal scales preserve the real logits. The unit-scale control
+        # includes the kernel's ordinary INT8/P quantization error.
+        expected = wrapper.run(q, k, v, sage=params)
+        assert expected.float().min() > 0.95
+        k_factor = 2.0**100
+        if mode == "finite_sentinel":
+            # A finite pre-Q score can equal the online state's -FLT_MAX
+            # sentinel exactly; after applying sfQ its real value is -512.
+            k_factor = torch.finfo(torch.float32).max / 512.0
+        scaled_params = replace(
+            params,
+            q_scale=params.q_scale / k_factor,
+            k_scale=params.k_scale * k_factor,
+        )
+    actual = wrapper.run(q, k, v, sage=scaled_params, **routing)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 def _recipe_elementwise_tolerance(qk_dtype: torch.dtype) -> tuple[float, float]:
     """TensorRT-LLM's unit-test bounds per recipe: INT8 ``(5e-1, 5e-1)``."""
 
@@ -2110,7 +2223,7 @@ def test_block_sparse_int8_masked_lanes_carry_no_mass_at_floor_scales(
 
     Zero K rows (padding) drive a 16-token block's scale down to the quantizer
     floor ``1e-3 / 126.9``, and a zero or tiny Q token does the same for
-    ``sfQ``. Masked lanes of the INT32 path are rewritten as FP32 ``-FLT_MAX``
+    ``sfQ``. Masked lanes of the INT32 path are rewritten as FP32 ``-inf``
     and must exponentiate to zero regardless of how small ``sfQ * sfK`` gets;
     an integer sentinel scaled by the multiplier would leak most of a kept
     lane's weight here. Masked tokens carry a constant V well away from the

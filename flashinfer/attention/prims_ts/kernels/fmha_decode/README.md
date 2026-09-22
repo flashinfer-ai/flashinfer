@@ -500,8 +500,8 @@ order. Seeding the 64 KiB slot with `tcgen05.cp` or `tcgen05.st` costs several
 times more than the conversions the bias removes.
 
 The max pass reduces biased scores with FP32 maxima and subtracts the bias
-once per scale group (exact on the unit spacing; `-FLT_MAX` is unchanged by
-it), so masked tiles share the FP32 path: `-FLT_MAX` on masked lanes, the
+once per scale group (exact on the unit spacing; `-inf` is unchanged by
+it), so masked tiles share the FP32 path: `-inf` on masked lanes, the
 proxy tail shift applied in FP32. The P pass folds `-bias * c * sfQ * sfK_g`
 into each group's exponent addend with one FMA per group, so the per-element
 work is the same FFMA/EX2 stream as for FP32 scores for every K block size
@@ -513,12 +513,18 @@ per-group addend is rounded once, to at most half an ulp of
 tail shift lands on the biased score's unit spacing (at most 0.5 quantized
 score units on that one lane).
 
+Sage masked scores remain `-inf` through dequantization, so their scale
+cannot make them outrank a kept score. The tile maximum chains start at
+`-inf`; only a fully masked tile retains that reduction identity and maps
+back to the online state's finite `-FLT_MAX` sentinel. This keeps its
+exponent anchor finite without confusing a finite pre-Q maximum with a mask.
+
 ### Precision notes
 
 - P is E4M3 with the static scale `FP8_P_QUANT_SCALE = 448`, which represents
   probabilities down to about 4.4e-6 with 3-bit relative precision. Row sums
-  are accumulated from the quantized P so the tail truncation cancels in
-  normalization.
+  are accumulated in FP32 before P is quantized for PV. P rounding and
+  truncation affect the numerator and do not cancel in normalization.
 - `defers_softmax_anchor_updates` is off for every 8-bit profile: the 448
   scale requires `p <= 1`, which a deferred anchor (lag up to `2^8`) would
   violate, so FP8 P always anchors on the exact row maximum and pays the
