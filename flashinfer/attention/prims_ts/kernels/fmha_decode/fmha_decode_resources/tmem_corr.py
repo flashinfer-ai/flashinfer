@@ -958,6 +958,7 @@ class TmemCorrResource(DecodeGenResourceBase):
         *,
         first_col: Int32,
         count: Constexpr[int],
+        row_has_mass: cutlass.Boolean,
     ) -> Float32 | None:
         """Dequantize ``count`` normalized output columns per V channel in place.
 
@@ -967,6 +968,9 @@ class TmemCorrResource(DecodeGenResourceBase):
         scale. The scales come from the SMEM copy staged by
         ``init_epilogue_state``. Without Sage attention the values and
         ``norm_scale`` pass through untouched.
+
+        Empty attention rows have no V contribution, so their channel mean
+        must remain zero even when the recipe restores a mean on other rows.
 
         ``None`` is the unit scale on both sides. The packed multiply is a
         library call that no compiler folds for a constant one, so the unit
@@ -982,6 +986,10 @@ class TmemCorrResource(DecodeGenResourceBase):
             first_col=first_col,
             count=count,
         )
+        if cutlass.const_expr(cfg.sage_v_mean):
+            if not row_has_mass:
+                for value_idx in cutlass.range_constexpr(count):
+                    v_means[value_idx] = Float32(0.0)
         for pair_idx in cutlass.range_constexpr(count // 2):
             val_base = pair_idx * 2
             column_scales = (v_scales[val_base], v_scales[val_base + 1])
@@ -2544,6 +2552,7 @@ class TmemCorrResource(DecodeGenResourceBase):
         fragment_col: Int32,
         dst_row_base: Int64,
         norm_scale: Float32,
+        row_has_mass: cutlass.Boolean,
         valid_output_row: cutlass.Boolean,
         o_is_32b_aligned: cutlass.Boolean,
     ) -> None:
@@ -2575,6 +2584,7 @@ class TmemCorrResource(DecodeGenResourceBase):
                     norm_scale,
                     first_col=Int32(output_col),
                     count=16,
+                    row_has_mass=row_has_mass,
                 )
                 self._store_final_o_columns(
                     final_o_dst,
@@ -2780,6 +2790,7 @@ class TmemCorrResource(DecodeGenResourceBase):
                         fragment_col=fragment_col,
                         dst_row_base=row_base,
                         norm_scale=row_scale,
+                        row_has_mass=denominator > Float32(0.0),
                         valid_output_row=valid_output_row,
                         o_is_32b_aligned=o_is_32b_aligned,
                     )
@@ -3115,6 +3126,7 @@ class TmemCorrResource(DecodeGenResourceBase):
                     fragment_col=owned_col_base + fragment_offset,
                     dst_row_base=row_base,
                     norm_scale=row_scale,
+                    row_has_mass=denominator > Float32(0.0),
                     valid_output_row=valid_output_row,
                     o_is_32b_aligned=o_is_32b_aligned,
                 )
@@ -3637,6 +3649,7 @@ class TmemCorrResource(DecodeGenResourceBase):
                     None,
                     first_col=col_base + Int32(chunk_col),
                     count=8,
+                    row_has_mass=reduced_sum_0 > Float32(0.0),
                 )
                 regs_o_chunk = self._pack_final_o_regs(final_vals, None, 8)
             dst_ptr = cutlass.inttoptr(

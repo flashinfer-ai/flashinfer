@@ -728,6 +728,7 @@ class _SparseSageCase(_SageCase):
     use_proxy_routes: bool
     use_token_mask: bool = False
     sparse_format: str = "bsr"
+    mask_type: str = "dense"
 
     @property
     def num_kv_blocks(self) -> int:
@@ -1122,6 +1123,7 @@ def _plan_sage(
             "use_kv_valid_bits": case.use_token_mask,
             "sparse_format": case.sparse_format,
             "use_proxy_routes": case.use_proxy_routes,
+            "mask_type": case.mask_type,
         }
     else:
         selector_name = "_select_persistent_launch"
@@ -2210,6 +2212,74 @@ def test_block_sparse_sage_matches_dequantized_reference(case: _SparseSageCase) 
     # average them out; a misaddressed scale would move the output by far
     # more than this bound.
     torch.testing.assert_close(actual.float(), expected, rtol=2e-2, atol=2e-2)
+
+
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize("kv_tile", (128, 256))
+@pytest.mark.parametrize("qk_dtype", (_FP8, torch.int8), ids=("fp8", "int8"))
+@pytest.mark.parametrize("scheduler", ("static", "persistent"))
+@pytest.mark.parametrize("mask", ("sparse", "causal"))
+@torch.no_grad()
+def test_sage_v_mean_is_not_added_to_empty_rows(
+    kv_tile: int, qk_dtype: torch.dtype, scheduler: str, mask: str
+) -> None:
+    """Restore the channel mean only for rows with visible attention mass."""
+    q_block = 16 if kv_tile == 128 else 64
+    heads = 8 if kv_tile == 128 else 1
+    case = _SparseSageCase(
+        name="mean_empty_rows",
+        batch_size=1,
+        seq_len_q=3 * q_block,
+        seq_len_kv=256,
+        num_qo_heads=heads,
+        num_kv_heads=1,
+        q_block_size=q_block,
+        kv_block_size=64,
+        expected_kv_tile=kv_tile,
+        out_dtype=torch.bfloat16,
+        qk_dtype=qk_dtype,
+        with_mean=True,
+        use_proxy_routes=False,
+        use_token_mask=True,
+        mask_type="causal" if mask == "causal" else "dense",
+        scheduler=scheduler,
+    )
+    device = torch.device("cuda", 0)
+    wrapper = _plan_sage(case, device, max_blocks_per_row=1)
+    q = torch.zeros((1, case.seq_len_q, heads, _HEAD_DIM), device=device).to(qk_dtype)
+    k = torch.zeros((1, 256, 1, _HEAD_DIM), device=device).to(qk_dtype)
+    v = torch.ones((1, 256, 1, _HEAD_DIM), device=device).to(_FP8)
+    params = SageAttentionParams(
+        q_scale=torch.ones((heads, case.seq_len_q), device=device),
+        k_scale=torch.ones((1, 16), device=device),
+        v_scale=torch.ones((1, _HEAD_DIM), device=device),
+        v_mean=torch.full((1, _HEAD_DIM), 3.0, device=device),
+    )
+    if mask == "causal":
+        # Only one token is valid. Within the first CTA, the first half of Q
+        # cannot see it and the second half can, so the guard must be per row.
+        token = case.seq_len_kv - case.seq_len_q + q_block // 2
+        block = token // case.kv_block_size
+        patterns = ((((block,), (block,), ()),),)
+        valid_tokens = {token}
+        first_visible_query = q_block // 2
+    else:
+        # The first query block has routes but every token is masked; the
+        # second has visible tokens; the third has no routes at all.
+        patterns = ((((0,), (1,), ()),),)
+        valid_tokens = set(range(64, 128))
+        first_visible_query = q_block
+    routing = {
+        **_sparse_routing(case, patterns, device),
+        "kv_valid_bits": pack_token_mask(256, (valid_tokens,), device),
+    }
+    actual = wrapper.run(q, k, v, sage=params, **routing)
+    torch.cuda.synchronize()
+    expected = torch.zeros_like(actual)
+    expected[:, first_visible_query : 2 * q_block] = 4.0
+    assert torch.count_nonzero(actual[expected == 0]).item() == 0
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
 
 @_REQUIRES_PRIMTS_GPU
