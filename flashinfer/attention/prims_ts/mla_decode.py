@@ -1203,8 +1203,6 @@ def _get_compiled_mla_decode(
             scalar,
             scalar,
             sink,
-            cutlass.Int32(1),
-            cutlass.Int32(1),
         )
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 

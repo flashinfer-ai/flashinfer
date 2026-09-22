@@ -893,7 +893,6 @@ class MlaDecodeTs:
         self.sparse_defer_max_update = False
         self.assume_valid_prefix = False
         self.direct_static_scales = False
-        self.direct_sparse_pages = (1, 1)
         self.direct_sparse_capacities = (0, 0)
         self.query_tile_layout = FlatQueryTileLayout.for_tile(
             num_heads, seq_len_q, mma_qk_tiler_mn[0]
@@ -951,7 +950,6 @@ class MlaDecodeTs:
             self.direct_sparse,
             self.assume_valid_prefix,
             self.direct_static_scales,
-            self.direct_sparse_pages,
             self.direct_sparse_capacities,
             self.sparse_gather_warps,
             self.sparse_kv_stages,
@@ -1472,16 +1470,14 @@ class MlaDecodeTs:
     ) -> None:
         """MLA decode TS kernel: persistent tile-scheduled execution."""
         if cutlass.const_expr(self.direct_sparse):
-            from flashinfer.experimental.prims_ts_sparse_mla.views import (
+            from ..sparse_views import (
                 SparseRouteView,
                 SparseLengthView,
                 SparseBatchRouteView,
                 SparseBatchLengthView,
             )
 
-            si, ci, sl, cl, sm, qs, ss, os, sinks, swa_stride, compressed_stride = (
-                block_split_kvs
-            )
+            si, ci, sl, cl, sm, qs, ss, os, sinks = block_split_kvs
             capacity = cutlass.const_expr(
                 max(
                     256,
@@ -1494,8 +1490,7 @@ class MlaDecodeTs:
             )
             if cutlass.const_expr(self.is_persistent):
                 page_offsets = SparseBatchRouteView(
-                    (si, ci, sl, cl, swa_stride, compressed_stride),
-                    self.direct_sparse_pages,
+                    (si, ci, sl, cl),
                     capacity,
                     self.assume_valid_prefix,
                 )
@@ -1524,10 +1519,7 @@ class MlaDecodeTs:
                         swa_length,
                         compressed_length,
                         request,
-                        swa_stride,
-                        compressed_stride,
                     ),
-                    self.direct_sparse_pages,
                     capacity,
                     self.assume_valid_prefix,
                 )

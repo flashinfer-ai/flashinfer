@@ -1118,13 +1118,13 @@ def build_throughput_latency_mla_task_manager(
             )
             idle.name = "MergedLoadGroupPadding"
             tasks.append(idle)
-    from ..helpers.task_manager import MlaTaskManager
-
-    manager_type = MlaTaskManager if cfg.serial_swap_reuse else TaskManager
-    task_manager = manager_type(
+    task_manager = TaskManager(
         tasks=tasks,
         resource_dependency_graph=deps,
         dma_consumer_release_labels=dma_release_labels,
+        # DSL 4.7's bounded credit simulation can stop before delayed KV
+        # releases drain. Its warning mode still runs all schedule checks.
+        skip_validation=cfg.serial_swap_reuse,
         smem_allocator=smem_allocator,
         tmem_allocator=tmem_allocator,
         verbose=verbose,
@@ -1622,15 +1622,13 @@ def _make_single_kv_pipe_task_graph(
     tmem_allocator.add_resource(tmem_o)
     tmem_allocator.compute_layout()
 
-    from ..helpers.task_manager import MlaTaskManager
-
-    manager_type = (
-        MlaTaskManager if cfg.sparse_reuse_kv and not cfg.is_fp8_qkv() else TaskManager
-    )
-    task_manager = manager_type(
+    task_manager = TaskManager(
         tasks=tasks,
         resource_dependency_graph=deps,
         dma_consumer_release_labels=dma_release_labels,
+        # See the delayed-release schedule above: keep the stock checks in
+        # warning mode for BF16 reuse instead of maintaining a second verifier.
+        skip_validation=cfg.sparse_reuse_kv and not cfg.is_fp8_qkv(),
         smem_allocator=smem_allocator,
         tmem_allocator=tmem_allocator,
         verbose=verbose,
@@ -1716,7 +1714,6 @@ class ThroughputLatencyMlaDecodeTs:
         self.balanced_sparse_registers = False
         self.direct_sparse = False
         self.direct_static_scales = False
-        self.direct_sparse_pages = (1, 1)
         self.direct_sparse_capacities = (0, 0)
 
         cfg = self._make_config()
@@ -2059,7 +2056,6 @@ class ThroughputLatencyMlaDecodeTs:
                 cfg,
                 sparse_direct=True,
                 sparse_static_scales=self.direct_static_scales,
-                sparse_direct_pages=self.direct_sparse_pages,
                 sparse_direct_capacities=self.direct_sparse_capacities,
             )
         if self.single_sparse_stream:
@@ -2606,20 +2602,17 @@ class ThroughputLatencyMlaDecodeTs:
         cfg = self._make_config()
 
         if cutlass.const_expr(cfg.sparse_direct):
-            from flashinfer.experimental.prims_ts_sparse_mla.views import (
+            from ..sparse_views import (
                 SparseRouteView,
                 SparseLengthView,
                 SparseBatchRouteView,
                 SparseBatchLengthView,
             )
 
-            si, ci, sl, cl, sm, qs, ss, os, sinks, swa_stride, compressed_stride = (
-                sparse_scale_params
-            )
+            si, ci, sl, cl, sm, qs, ss, os, sinks = sparse_scale_params
             if cutlass.const_expr(cfg.use_persistent_scheduler == 1):
                 page_offsets = SparseBatchRouteView(
-                    (si, ci, sl, cl, swa_stride, compressed_stride),
-                    cfg.sparse_direct_pages,
+                    (si, ci, sl, cl),
                     cfg.total_kv_tiles * cfg.tile_size_kv,
                 )
                 cache_seqs = SparseBatchLengthView((sl, cl))
@@ -2642,10 +2635,7 @@ class ThroughputLatencyMlaDecodeTs:
                         swa_length,
                         compressed_length,
                         request,
-                        swa_stride,
-                        compressed_stride,
                     ),
-                    cfg.sparse_direct_pages,
                     cfg.total_kv_tiles * cfg.tile_size_kv,
                 )
                 cache_seqs = SparseLengthView((selected_length, si.shape[0]))

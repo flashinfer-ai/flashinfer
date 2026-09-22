@@ -9,7 +9,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CTA-local views of live sparse metadata, without a preparation launch.
+"""CTA-local views of caller-prepared storage-row indices.
 
 One nonpersistent CTA owns one virtual query request. Prefix lengths are
 loaded once; row mapping is evaluated when the page-loader consumes indices.
@@ -21,13 +21,12 @@ from cutlass import Int32, Int64
 
 
 class SparseRouteView:
-    def __init__(self, values, pages, capacity, assume_valid_prefix=False):
+    def __init__(self, values, capacity, assume_valid_prefix=False):
         self.values = values
-        self.pages = pages
         self.capacity = capacity
         self.assume_valid_prefix = assume_valid_prefix
-        self.si, self.ci, self.sl, self.cl, self.row, self.ss, self.cs = values
-        self.swa_span = (self.sl + Int32(127)) // Int32(128) * Int32(128)
+        self.si, self.ci, self.sl, self.cl, self.row = values
+        self.primary_span = (self.sl + Int32(127)) // Int32(128) * Int32(128)
         self.shape = (capacity, self.si.shape[0])
 
     def __extract_mlir_values__(self):
@@ -36,7 +35,6 @@ class SparseRouteView:
     def __new_from_mlir_values__(self, values):
         return SparseRouteView(
             cutlass.new_from_mlir_values(self.values, values),
-            self.pages,
             self.capacity,
             self.assume_valid_prefix,
         )
@@ -48,21 +46,19 @@ class SparseRouteView:
         if token < self.sl:
             index = Int32(self.si[self.row, token])
             if index >= 0:
-                result = index // self.pages[0] * self.ss + index % self.pages[0]
-        elif token >= self.swa_span:
+                result = index
+        elif token >= self.primary_span:
             result = Int32(-1)
-            position = token - self.swa_span
+            position = token - self.primary_span
             if position < self.cl:
                 index = Int32(self.ci[self.row, position])
                 if index >= 0:
-                    result = (
-                        index // self.pages[1] * self.cs + index % self.pages[1]
-                    ) | Int32(-2147483648)
+                    result = index | Int32(-2147483648)
         return result
 
     @cute.jit
     def routes_for_tile(self, token, request=None):
-        compressed = token >= self.swa_span
+        compressed = token >= self.primary_span
         primary_ptr = self.si.iterator.toint() + self.row * Int64(
             self.si.stride[0]
         ) * Int64(4)
@@ -70,28 +66,22 @@ class SparseRouteView:
             self.ci.stride[0]
         ) * Int64(4)
         address = extra_ptr if compressed else primary_ptr
-        origin = self.swa_span if compressed else Int32(0)
+        origin = self.primary_span if compressed else Int32(0)
         length = self.cl if compressed else self.sl
-        shift = (
-            Int32(self.pages[1].bit_length() - 1)
-            if compressed
-            else Int32(self.pages[0].bit_length() - 1)
-        )
-        stride = self.cs if compressed else self.ss
         tag = Int32(-2147483648) if compressed else Int32(0)
         indices = cute.make_tensor(
             cute.make_ptr(Int32, address, assumed_align=4),
             cute.make_layout((self.capacity,), stride=(1,)),
         )
-        return SparseTileRoutes((indices, origin, length, shift, stride, tag))
+        return SparseTileRoutes((indices, origin, length, tag))
 
     @cute.jit
     def mask_for_tile(self, token, request=None):
         # Source boundaries are 128-row aligned. Select the pointer and prefix
         # once per score tile, outside the unrolled register mask loop.
-        compressed = token >= self.swa_span
+        compressed = token >= self.primary_span
         if cutlass.const_expr(self.assume_valid_prefix):
-            origin = self.swa_span if compressed else Int32(0)
+            origin = self.primary_span if compressed else Int32(0)
             length = self.cl if compressed else self.sl
             return SparsePrefixMask((origin, length))
         primary_ptr = self.si.iterator.toint() + self.row * Int64(
@@ -101,7 +91,7 @@ class SparseRouteView:
             self.ci.stride[0]
         ) * Int64(4)
         address = extra_ptr if compressed else primary_ptr
-        origin = self.swa_span if compressed else Int32(0)
+        origin = self.primary_span if compressed else Int32(0)
         length = self.cl if compressed else self.sl
         indices = cute.make_tensor(
             cute.make_ptr(Int32, address, assumed_align=4),
@@ -198,9 +188,7 @@ class SparseTileRoutes:
 
     def __init__(self, values):
         self.values = values
-        self.indices, self.origin, self.length, self.shift, self.stride, self.tag = (
-            values
-        )
+        self.indices, self.origin, self.length, self.tag = values
 
     def __extract_mlir_values__(self):
         return cutlass.extract_mlir_values(self.values)
@@ -217,10 +205,7 @@ class SparseTileRoutes:
         )
         index = Int32(self.indices[safe])
         valid = (position >= Int32(0)) & (position < self.length) & (index >= Int32(0))
-        mapped = (index >> self.shift) * self.stride + (
-            index & ((Int32(1) << self.shift) - Int32(1))
-        )
-        return (mapped if valid else Int32(0x7FFFFFFF)) | self.tag
+        return (index if valid else Int32(0x7FFFFFFF)) | self.tag
 
     @cute.jit
     def mapped_quad(self, token):
@@ -233,21 +218,9 @@ class SparseTileRoutes:
             values = cutlass.Pointer(
                 self.indices.iterator + position, dtype=Int32
             ).load(count=4, alignment=4)
-            if self.stride == (Int32(1) << self.shift):
-                for j in cutlass.range_constexpr(4):
-                    index = Int32(values[j])
-                    rows[j] = (
-                        index if index >= Int32(0) else Int32(0x7FFFFFFF)
-                    ) | self.tag
-            else:
-                for j in cutlass.range_constexpr(4):
-                    index = Int32(values[j])
-                    mapped = (index >> self.shift) * self.stride + (
-                        index & ((Int32(1) << self.shift) - Int32(1))
-                    )
-                    rows[j] = (
-                        mapped if index >= Int32(0) else Int32(0x7FFFFFFF)
-                    ) | self.tag
+            for j in cutlass.range_constexpr(4):
+                index = Int32(values[j])
+                rows[j] = (index if index >= Int32(0) else Int32(0x7FFFFFFF)) | self.tag
         elif position + Int32(3) >= Int32(0) and position < self.length:
             for j in cutlass.range_constexpr(4):
                 rows[j] = self.mapped_row(token + Int32(j))
@@ -257,10 +230,9 @@ class SparseTileRoutes:
 class SparseBatchRouteView:
     """Bind live source metadata to the request currently owned by a work tile."""
 
-    def __init__(self, values, pages, capacity, assume_valid_prefix=False):
+    def __init__(self, values, capacity, assume_valid_prefix=False):
         self.values = values
-        self.si, self.ci, self.sl, self.cl, self.ss, self.cs = values
-        self.pages = pages
+        self.si, self.ci, self.sl, self.cl = values
         self.capacity = capacity
         self.assume_valid_prefix = assume_valid_prefix
         self.shape = (capacity, self.si.shape[0])
@@ -271,7 +243,6 @@ class SparseBatchRouteView:
     def __new_from_mlir_values__(self, values):
         return SparseBatchRouteView(
             cutlass.new_from_mlir_values(self.values, values),
-            self.pages,
             self.capacity,
             self.assume_valid_prefix,
         )
@@ -286,10 +257,7 @@ class SparseBatchRouteView:
                 Int32(self.sl[row]),
                 Int32(self.cl[row]),
                 row,
-                self.ss,
-                self.cs,
             ),
-            self.pages,
             self.capacity,
             self.assume_valid_prefix,
         )

@@ -176,7 +176,6 @@ class MlaConfig:
     external_sparse_reduction: bool = False
     sparse_direct: bool = False
     sparse_static_scales: bool = False
-    sparse_direct_pages: tuple[int, int] = (1, 1)
     sparse_direct_capacities: tuple[int, int] = (0, 0)
     page_offsets_num_warps: int = 1
     scheduler_num_warps: int = 1

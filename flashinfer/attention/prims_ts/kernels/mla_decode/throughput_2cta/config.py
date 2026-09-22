@@ -434,7 +434,7 @@ def make_mla_decode_config(
 
     if sparse_gather_warps != 1:
         if sparse_gather_warps not in (4, 8) or qkv_dtype != "bf16" or page_size != 1:
-            raise ValueError("four-warp combined loading requires BF16 sparse 2CTA")
+            raise ValueError("multi-warp combined loading requires BF16 sparse 2CTA")
         cfg.load_num_warps = sparse_gather_warps
         cfg.load_tma_warp_id = 12
         cfg.load_k_warp_id = 12
@@ -445,15 +445,14 @@ def make_mla_decode_config(
 
     if sparse_kv_stages:
         if qkv_dtype != "bf16" or page_size != 1 or sparse_gather_warps not in (4, 8):
-            raise ValueError("pipeline tuning requires four-warp BF16 sparse 2CTA")
-        if sparse_kv_stages:
-            if sparse_kv_stages < 4:
-                raise ValueError("combined KV pipeline requires at least four stages")
-            cfg.load_kv_stage = sparse_kv_stages
+            raise ValueError("pipeline tuning requires multi-warp BF16 sparse 2CTA")
+        if sparse_kv_stages < 4:
+            raise ValueError("combined KV pipeline requires at least four stages")
+        cfg.load_kv_stage = sparse_kv_stages
 
     if cache_uniform_sparse_pages:
         if qkv_dtype != "bf16" or page_size != 1 or sparse_gather_warps not in (4, 8):
-            raise ValueError("uniform K cache requires four-warp BF16 sparse loading")
+            raise ValueError("uniform K cache requires multi-warp BF16 sparse loading")
         cfg.cache_uniform_sparse_pages = True
         cfg.softmax_reg_num = 128
         cfg.correction_reg_num = 160 if sparse_gather_warps == 8 else 192

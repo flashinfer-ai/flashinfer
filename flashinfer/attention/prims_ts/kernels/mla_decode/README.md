@@ -209,23 +209,18 @@ page_size, pages_per_request = 32, 4
 num_pages = B * pages_per_request
 
 query = torch.randn(
-    B,
-    1,
-    H,
-    latent_dim + rope_dim,
+    B, 1, H, latent_dim + rope_dim,
     device=device,
     dtype=torch.bfloat16,
 )
 kv_cache = torch.randn(
-    num_pages,
-    page_size,
-    latent_dim + rope_dim,
+    num_pages, page_size, latent_dim + rope_dim,
     device=device,
     dtype=torch.bfloat16,
 )
-block_tables = torch.arange(num_pages, device=device, dtype=torch.int32).view(
-    B, pages_per_request
-)
+block_tables = torch.arange(
+    num_pages, device=device, dtype=torch.int32
+).view(B, pages_per_request)
 seq_lens = torch.full(
     (B,), pages_per_request * page_size, device=device, dtype=torch.int32
 )
@@ -253,9 +248,7 @@ assert out.shape == (B, 1, H, latent_dim)
 q_lens = (1, 3)
 qo_indptr = torch.tensor((0, 1, 4), device=device, dtype=torch.int32)
 packed_query = torch.randn(
-    sum(q_lens),
-    H,
-    latent_dim + rope_dim,
+    sum(q_lens), H, latent_dim + rope_dim,
     device=device,
     dtype=torch.bfloat16,
 )

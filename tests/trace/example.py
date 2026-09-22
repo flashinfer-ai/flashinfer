@@ -10,11 +10,6 @@ shape.  Subsequent calls with the same shape are deduplicated (no re-write).
 
 The output directory is controlled by FLASHINFER_TRACE_DUMP_DIR.
 
-Native sparse MLA also emits
-`prims_ts_sparse_mla_bf16_sink_lse_b2_sq1_h16_d512_ps1_pe1_k128_ke64.json`
-and its `bf16_valid_prefix_sink_lse` specialization. The source-neutral example
-also emits a `prims_ts_sparse_mla` one-source definition.
-
 Requires a CUDA-capable GPU.
 
 Results:
@@ -2708,14 +2703,3 @@ with contextlib.suppress(Exception):
             _fp4_in["seq_lens"],
             _fp4_in["max_seq_len"],
         )
-
-# Native two-source sparse MLA (SM100/SM103).
-with contextlib.suppress(Exception):
-    from tests.trace.sparse_mla_example import (
-        generate_sparse_mla_example,
-        generate_prepared_sparse_mla_example,
-    )
-
-    generate_sparse_mla_example(device=device)
-    generate_sparse_mla_example(device=device, assume_valid_prefix=True)
-    generate_prepared_sparse_mla_example(device=device)
