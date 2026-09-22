@@ -29,7 +29,7 @@ from ...cute_dsl.utils import make_ptr
 from .moe_utils import get_max_num_tiles
 
 
-_route_preprocess_kernel_cache = {}
+_route_preprocess_kernel_cache: dict = {}
 
 _SORT_BUFFER_NAMES = (
     "out_tile_idx_to_expert_idx",

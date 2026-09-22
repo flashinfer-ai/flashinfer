@@ -827,13 +827,13 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
     situ_beta_stride = 0
     situ_linear_beta_stride = 0
     if isinstance(situ_beta, torch.Tensor):
-        for name, value in (
-            ("situ_beta", situ_beta),
-            ("situ_linear_beta", situ_linear_beta),
-        ):
-            if value is not None and (
-                value.device != a.device or value.numel() not in (1, num_experts)
-            ):
+        # validate_cute_dsl_moe_situ_config() already requires a tensor
+        # situ_beta to pair with a tensor (or absent) situ_linear_beta.
+        runtime_situ_tensors = [("situ_beta", situ_beta)]
+        if isinstance(situ_linear_beta, torch.Tensor):
+            runtime_situ_tensors.append(("situ_linear_beta", situ_linear_beta))
+        for name, value in runtime_situ_tensors:
+            if value.device != a.device or value.numel() not in (1, num_experts):
                 raise ValueError(
                     f"{name} must be on the input device and contain one or "
                     "num_local_experts values"
@@ -842,7 +842,7 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
             cutlass.Float32, situ_beta.data_ptr(), cute.AddressSpace.gmem
         )
         situ_beta_stride = int(situ_beta.numel() != 1)
-        if situ_linear_beta is not None:
+        if isinstance(situ_linear_beta, torch.Tensor):
             runtime_situ_linear_beta_ptr = make_ptr(
                 cutlass.Float32, situ_linear_beta.data_ptr(), cute.AddressSpace.gmem
             )
