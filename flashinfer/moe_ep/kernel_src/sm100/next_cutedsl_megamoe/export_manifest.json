@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "upstream": {
+    "repository": "https://gitlab-master.nvidia.com/bangyus/cutedsl_megamoe",
+    "commit": "e522facf28197c45db443f90693c319c4003abf6",
+    "base_main_commit": "e8df888670a44b099e9d7009d5338a4ab45bf848"
+  },
+  "exporter": {
+    "path": "next/export_src.py",
+    "sha256": "14f23b270f6912e02fab0506bddba45b40d9cecba5936d1d6643908391aa4b90"
+  },
+  "kernels": [
+    "BlackwellInferenceMegaMoE"
+  ],
+  "files": {
+    "sources/__init__.py": "e54d649c624547f825961a0afb9592546eba9d8b51940b88d22ff0941c98a747",
+    "sources/api.py": "dc585a31e5810fc4dda00e55b07c6bfde2fd75c34985b7dbe618378642bdc4b8",
+    "sources/communication/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "sources/communication/nvlink_domain/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "sources/communication/nvlink_domain/symmetric_buffer.py": "315da23c5bf66deb796b5837f7b8c4beb8d20cdd1a7ec158b2e75d64100719aa",
+    "sources/communication/nvlink_domain/token_comm.py": "b3086c8af1cc00b5962aebc54899c69bc77076efd4f848ec090745d59ab9ad4e",
+    "sources/communication/token_protocol.py": "5a342ca0a2a89761ee7d0ad3cd07b6bf2a2b54e714d475a75a95c22a90e30b72",
+    "sources/helpers/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "sources/helpers/constants.py": "4af7ec124e769b0db2839ac42f90cbfc41fbfe693723f79c471f4b4fff8d0cb8",
+    "sources/helpers/cute_py_helpers.py": "868871ef468436bcfbfb638c4b8778805f05d6772ee2dea0ba9a5c9b4901d6cc",
+    "sources/helpers/device_workspace.py": "d92c61b501a7544e15c06de94d66177ebd060ee31194d3b8ba3dab4d73433aa0",
+    "sources/helpers/dlb_expert_count.py": "8450a03a98b6015726edc10773ad4af8f678e830e919f13e66c74345df2977f8",
+    "sources/helpers/dsl_helpers.py": "d531c11140576dcb22d3b53624b216bbcc8f090283259bcad74d6a0544a24581",
+    "sources/helpers/flag_batch.py": "c9c129755b57ec5bb105e58b301c0a9ece44142b59fabb69613e41aecf076ca3",
+    "sources/helpers/helper_weight_ready_gate.py": "c3933c44eeaf7729be322fbe23fb53aaeb2132a3490a20cb8bb65e2cfe7c5719",
+    "sources/helpers/iket_compat.py": "4b8a3c3e231793f87d6b1bcd5dffee8b5c19c384c3a719fbb4ed895d9929ba29",
+    "sources/helpers/megamoe_aot.py": "d2e040c51abcefc84b746f632b538c90bb6be1db25c6b20ebcbd1004071b0399",
+    "sources/helpers/ptx_helpers.py": "96de50cd0bf4d3b023323ad964592e6617510c5cd02fe45e85c185ff8ac30be5",
+    "sources/helpers/smem_workspace.py": "91478bee142314688ec56aec5129e46c392597a24fa88cb4d1031b612a031d7c",
+    "sources/helpers/software_sync.py": "f12c4a4df541d4e80346e4cb256f788fc825283696ed69670df13c72c2811525",
+    "sources/helpers/utils.py": "39a95432034901e309c9da1b815153ba85eeaa0b17c3e0386a66067f41ee6b22",
+    "sources/kernel_src/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "sources/kernel_src/blackwell/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "sources/kernel_src/blackwell/custom_mix_cga_helpers.py": "fbea697f91fe5c5f1623568cb3ed45951905c2428bf2a49f330943ed910df4bc",
+    "sources/kernel_src/blackwell/inference/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "sources/kernel_src/blackwell/inference/mega/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "sources/kernel_src/blackwell/inference/mega/block_scaled_swap_ab_fc12_epilogue.py": "f21bd92d5aff20676c982243a7971594f8144c7789db86c750ae52ac2e32daec",
+    "sources/kernel_src/blackwell/inference/mega/block_scaled_swap_ab_fc12_extension.py": "6bcc0597390d8f564f2dec5f08a372974b81fd581af77b287046cb45bf188c43",
+    "sources/kernel_src/blackwell/inference/mega/block_scaled_swap_ab_fc12_mainloop.py": "d0b22cf1e8e6313df26a9e92c8ab9fc7f97754313e15150be326dc2ab9877114",
+    "sources/kernel_src/blackwell/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py": "403519ced48a3febe819a8722735279f8ec1ce698a3ec7b4864085fabbeda4e3",
+    "sources/kernel_src/blackwell/inference/mega/dynamic_mainloop.py": "c1298916e9d2c0980b9f6a8c8f78b6c14ac85b87646f7fb049ba7a0fa45322a5",
+    "sources/kernel_src/blackwell/inference/mega/topk_reduce.py": "455ce46b38634642d48311e0e6be9c945a727a9169e25566a9d24e763a076a3d",
+    "sources/kernel_src/function_mapping.py": "81689f9850af024d9ec22416d4c2a1535d73946d455b7e22042d321534918642",
+    "sources/kernel_src/schedulers/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "sources/kernel_src/schedulers/base.py": "22a68aede7b609cd7f770954d428098207bcb504c12cb71b0bb2198ca339cc04",
+    "sources/kernel_src/schedulers/fc12_mapping.py": "bf754355af676f767eca31dee76dade21bd9e440a755c159861c943ab45b57c6",
+    "sources/kernel_src/schedulers/fc12_scheduler.py": "064ec4be8d675a4c08cd45f9489f255fbf0edab3094583de5eabc6b8d6f52971",
+    "sources/kernel_src/schedulers/non_clc_mixed_cga.py": "c43fc6e1b0858191776e82e702b2f1c373d3984b14f58a8d5011764d20ce7f47",
+    "sources/kernel_src/schedulers/work_id_claim.py": "7b116a8adfecd85197f90e81f14d16d55704210fa3e583ba9f71d80c96b2af79",
+    "sources/quant_def.py": "b88290f0cc90713b16e0fd8c60d12d5168027e42497b629251cd47c05ceecfe5"
+  }
+}
