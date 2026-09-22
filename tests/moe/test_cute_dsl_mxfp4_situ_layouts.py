@@ -203,7 +203,11 @@ def _run_ranks(unsharded, layouts, *, prepared=None, **wrapper_kwargs):
         plan.run()
         partials.append(output)
         refs.append(reference_moe(rank_case, modes=("ideal_fp64",))["ideal_fp64"])
-        del plan
+        # Release this rank's prepared bank and FP64 scratch before the next
+        # rank: eight full-Kimi ranks otherwise exhaust a 268 GiB device.
+        del plan, rank_case
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
     return partials, refs
 
 
@@ -342,13 +346,13 @@ def test_tp_workspace_size_follows_intermediate_shard():
     ep_swap = mx.CuteDslMxfp4MoEWrapper(
         896, 16, 7168, 3072, parallel_layout=layout("expert_parallel", 8, 3)
     )
-    assert (tp_swap.swapab_max_tokens, ep_swap.swapab_max_tokens) == (256, 1024)
+    assert (tp_swap.swapab_max_tokens, ep_swap.swapab_max_tokens) == (1024, 1024)
     for tokens in (1, 16):
         assert ep_swap.get_workspace_size(tokens) < ep.get_workspace_size(tokens)
         assert tp_swap.get_workspace_size(tokens) < tp.get_workspace_size(tokens)
     assert ep_swap.get_workspace_size(17) != ep.get_workspace_size(17)
     assert ep_swap.get_workspace_size(1025) == ep.get_workspace_size(1025)
-    assert tp_swap.get_workspace_size(257) == tp.get_workspace_size(257)
+    assert tp_swap.get_workspace_size(1025) == tp.get_workspace_size(1025)
     # Documented sizes of the 128-row layout; expert parallelism keeps it.
     assert [ep.get_workspace_size(t) for t in (1, 16, 4096)] == [
         6499072,

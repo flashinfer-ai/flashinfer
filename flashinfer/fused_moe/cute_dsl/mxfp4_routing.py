@@ -42,10 +42,13 @@ _SORT_BUFFER_NAMES = (
 
 
 class _RoutePreprocess:
-    def __init__(self, mode, threads):
+    def __init__(self, mode, threads, clear=True):
         self.packed = mode == "packed"
         self.convert_weights = mode != "separate_fp32"
         self.threads = threads
+        # ``clear=False``: the finalize kernel overwrites every output row, so
+        # only the route conversion runs (grid sized by routes).
+        self.clear = clear
 
     @cute.jit
     def __call__(
@@ -81,9 +84,12 @@ class _RoutePreprocess:
         output_words = cute.make_tensor(
             output_words_ptr, cute.make_layout((tokens * (hidden_size // 2),))
         )
-        # Size the grid for output clearing. The separate route grid-stride
-        # loop remains correct even when its domain is larger than this one.
-        tasks = tokens * (hidden_size // 2)
+        # Size the grid for output clearing (one 16-byte store per thread).
+        # The separate route grid-stride loop remains correct even when its
+        # domain is larger than this one.
+        tasks = tokens * (hidden_size // 8)
+        if cutlass.const_expr(not self.clear):
+            tasks = tokens * top_k
         self.kernel(ids_src, weights_src, ids_dst, weights_dst, output_words).launch(
             grid=(cute.ceil_div(tasks, self.threads), 1, 1),
             block=(self.threads, 1, 1),
@@ -119,9 +125,19 @@ class _RoutePreprocess:
                 # a numeric conversion of the packed integer itself.
                 weights_dst[route] = weights_src[(token, slot)].to(cutlass.Float32)
 
-        for word in cutlass.range(first, cute.size(output_words), task_stride):
-            # One aligned u32 store writes two BF16 +0 values.
-            output_words[word] = cutlass.Uint32(0)
+        if cutlass.const_expr(self.clear):
+            # One aligned 16-byte store writes eight BF16 +0 values (the
+            # hidden size is a multiple of 8, so the word count divides by 4).
+            zeros = cute.make_rmem_tensor((4,), cutlass.Uint32)
+            for i in cutlass.range_constexpr(4):
+                zeros[i] = cutlass.Uint32(0)
+            num_vec = cute.size(output_words) // 4
+            for vec in cutlass.range(first, num_vec, task_stride):
+                base = cute.assume(vec * 4, divby=4)
+                g_out = cute.make_tensor(
+                    output_words.iterator + base, layout=cute.make_layout((4,))
+                )
+                cute.autovec_copy(zeros, g_out)
 
 
 @dsl_user_op
@@ -158,13 +174,31 @@ def _routing_warp_inclusive(value: cutlass.Int32, lane: cutlass.Int32):
     return value
 
 
+# Routes (token, slot) one fused sorting CTA handles: T*top_k up to 4096, i.e.
+# T <= 256 for Kimi's top-16. Beyond that the generic conversion kernel and
+# ``moe_sort`` run.
+FUSED_ROUTE_MAX_ROUTES = 4096
+
+
 class _FusedRoutePreprocess:
-    def __init__(self, mode, threads, single_tile_per_expert=False):
+    def __init__(
+        self,
+        mode,
+        threads,
+        single_tile_per_expert=False,
+        max_routes=FUSED_ROUTE_MAX_ROUTES,
+        clear=True,
+    ):
         self.single_tile_per_expert = single_tile_per_expert
         self.packed = mode == "packed"
         self.convert_weights = mode != "separate_fp32"
         self.threads = threads
         self.warps = threads // 32
+        # Per-route rank / local-expert scratch for T*top_k > threads.
+        self.max_routes = max_routes
+        # ``clear=False``: only CTA 0 (the sort) runs; the two-stage finalize
+        # overwrites every output row itself.
+        self.clear = clear
 
     @cute.jit
     def __call__(
@@ -240,7 +274,13 @@ class _FusedRoutePreprocess:
             local_offset,
             tile_size,
         ).launch(
-            grid=(cute.ceil_div(cute.size(output), self.threads), 1, 1),
+            grid=(
+                cute.ceil_div(cute.size(output), self.threads)
+                if cutlass.const_expr(self.clear)
+                else 1,
+                1,
+                1,
+            ),
             block=(self.threads, 1, 1),
             stream=stream,
         )
@@ -272,25 +312,33 @@ class _FusedRoutePreprocess:
         counts = smem.allocate_tensor(cutlass.Int32, cute.make_layout((self.threads,)))
         bases = smem.allocate_tensor(cutlass.Int32, cute.make_layout((self.threads,)))
         warp_sums = smem.allocate_tensor(cutlass.Int32, cute.make_layout((self.warps,)))
+        rank_buf = smem.allocate_tensor(
+            cutlass.Int32, cute.make_layout((self.max_routes,))
+        )
+        local_buf = smem.allocate_tensor(
+            cutlass.Int32, cute.make_layout((self.max_routes,))
+        )
+        num_routes = cute.size(expanded)
 
         # The branch is uniform across the entire CTA. Each barrier below has
         # all threads of CTA0 participating; no named or cluster barriers.
         if block == 0:
             counts[tid] = cutlass.Int32(0)
             cute.arch.sync_threads()
-            local = cutlass.Int32(-1)
-            rank = cutlass.Int32(-1)
-            if tid < cute.size(expanded):
-                token = tid // ids_src.shape[1]
-                slot = tid % ids_src.shape[1]
+            # Histogram: every route of the CTA (grid-stride over the threads)
+            # converts its ID/weight and takes a rank within its local expert.
+            for r in cutlass.range(tid, num_routes, self.threads):
+                token = r // ids_src.shape[1]
+                slot = r % ids_src.shape[1]
                 expert = ids_src[(token, slot)]
                 if cutlass.const_expr(self.packed):
                     expert = expert >> 16
-                    ids_dst[tid] = expert
+                    ids_dst[r] = expert
                 if cutlass.const_expr(self.convert_weights):
-                    weights_dst[tid] = weights_src[(token, slot)].to(cutlass.Float32)
+                    weights_dst[r] = weights_src[(token, slot)].to(cutlass.Float32)
                 local = expert - local_offset
-                expanded[tid] = cutlass.Int32(-1)
+                expanded[r] = cutlass.Int32(-1)
+                rank = cutlass.Int32(-1)
                 if (
                     (expert >= 0)
                     & (expert < num_experts)
@@ -299,6 +347,8 @@ class _FusedRoutePreprocess:
                 ):
                     address = (counts.iterator + local).toint().to(cutlass.Int32)
                     rank = _routing_shared_add(address, cutlass.Int32(1))
+                rank_buf[r] = rank
+                local_buf[r] = local
             cute.arch.sync_threads()
 
             count = counts[tid]
@@ -342,15 +392,18 @@ class _FusedRoutePreprocess:
                 active_total[0] = active
                 padded_total[0] = active * tile_size
             cute.arch.sync_threads()
-            if rank >= 0:
-                row = bases[local] + rank
-                expanded[tid] = row
-                permuted[row] = tid
+            for r in cutlass.range(tid, num_routes, self.threads):
+                rank = rank_buf[r]
+                if rank >= 0:
+                    row = bases[local_buf[r]] + rank
+                    expanded[r] = row
+                    permuted[row] = r
 
-        # Each word is covered once, independently of the assignment count.
-        word = block * self.threads + tid
-        if word < cute.size(output):
-            output[word] = cutlass.Uint32(0)
+        if cutlass.const_expr(self.clear):
+            # Each word is covered once, independently of the assignment count.
+            word = block * self.threads + tid
+            if word < cute.size(output):
+                output[word] = cutlass.Uint32(0)
 
 
 class _RoutePreprocessPlan:
@@ -421,6 +474,7 @@ def _plan_route_preprocess(
     local_expert_offset=0,
     tile_size=128,
     _single_tile_per_expert=False,
+    clear_output=True,
 ):
     """Compile, bind and enqueue one warmup, outside CUDA Graph capture.
 
@@ -460,10 +514,18 @@ def _plan_route_preprocess(
     top_k = topk_ids.shape[1]
     if not 1 <= top_k <= 32 or hidden_size <= 0 or hidden_size % 2 or tokens < 1:
         raise ValueError("require T>=1, top_k=1..32 and positive even hidden_size")
-    if moe_sort_buffers is not None and tokens > 16:
-        # The fused sort is a single-CTA decode kernel; the conversion + output
-        # clear kernel is grid-strided and serves any token count.
-        raise ValueError("fused decode sorting requires T=1..16")
+    if moe_sort_buffers is None and hidden_size % 8:
+        raise ValueError(
+            "route preprocessing clears the output with 16-byte stores; the "
+            "hidden size must be a multiple of 8"
+        )
+    if moe_sort_buffers is not None and tokens * top_k > FUSED_ROUTE_MAX_ROUTES:
+        # The fused sort is a single-CTA kernel bounded by its per-route smem
+        # scratch; the conversion + output clear kernel is grid-strided and
+        # serves any token count (moe_sort then groups the rows).
+        raise ValueError(
+            f"fused route sorting handles at most {FUSED_ROUTE_MAX_ROUTES} routes"
+        )
     if threads not in (128, 256):
         raise ValueError("route preprocessing supports 128 or 256 threads per block")
     device = output.device
@@ -471,9 +533,10 @@ def _plan_route_preprocess(
     _check_tensor(
         "output", output, (tokens, hidden_size), torch.bfloat16, device, contiguous=True
     )
-    if output.data_ptr() % 4:
+    if output.data_ptr() % (4 if moe_sort_buffers is not None else 16):
         raise ValueError(
-            "output must be aligned to 4 bytes for paired BF16 zero stores"
+            "output must be aligned to 4 bytes (fused decode sort) or 16 bytes "
+            "(generic conversion + clear) for the BF16 zero stores"
         )
     _check_tensor("topk_ids", topk_ids, shape, torch.int32, device)
     writable = [("output", output)]
@@ -503,7 +566,9 @@ def _plan_route_preprocess(
             tensor = moe_sort_buffers[name]
             _check_tensor(name, tensor, expected, torch.int32, device, contiguous=True)
             writable.append((name, tensor))
-        required = max(256, tokens * top_k, num_local_experts)
+        # 1024 threads: the histogram/scatter loops stride over T * top_k
+        # routes (4096 at T=256), and a 256-thread CTA took 12 us there.
+        required = max(1024, num_local_experts)
         threads = 1 << (required - 1).bit_length()
 
     if topk_weights is None:
@@ -646,14 +711,21 @@ def _plan_route_preprocess(
             arch,
             sorts_tokens,
             single_tile_per_expert,
+            bool(clear_output),
         )
         compiled = _route_preprocess_kernel_cache.get(cache_key)
         stream = cuda.CUstream(torch.cuda.current_stream(device).cuda_stream)
         if compiled is None:
             kernel = (
-                _FusedRoutePreprocess(mode, threads, single_tile_per_expert)
+                _FusedRoutePreprocess(
+                    mode,
+                    threads,
+                    single_tile_per_expert,
+                    max_routes=FUSED_ROUTE_MAX_ROUTES,
+                    clear=bool(clear_output),
+                )
                 if sorts_tokens
-                else _RoutePreprocess(mode, threads)
+                else _RoutePreprocess(mode, threads, clear=bool(clear_output))
             )
             compiled = cute.compile(kernel, *arguments, stream=stream)
             _route_preprocess_kernel_cache[cache_key] = compiled

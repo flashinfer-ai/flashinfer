@@ -219,6 +219,11 @@ def main():
     parser.add_argument("--repeats", type=int, default=30)
     parser.add_argument("--accuracy", action="store_true")
     parser.add_argument("--offline-tactics", type=Path)
+    parser.add_argument(
+        "--untuned-baseline",
+        action="store_true",
+        help="skip trtllm-gen autotuning (default: tuned baseline, as in production)",
+    )
     parser.add_argument("--run-id", default="default")
     parser.add_argument(
         "--candidate-impl",
@@ -253,6 +258,7 @@ def main():
         parser.error("token counts, repeats and warmup must be positive")
     if not set(distributions) <= {
         "balanced",
+        "cycle",
         "empty",
         "hot",
         "all_remote",
@@ -514,6 +520,7 @@ def main():
                     baseline_weights,
                     packed=packed,
                     do_finalize=do_finalize,
+                    autotune=not args.untuned_baseline,
                 )
                 candidate_run = plan.run
                 if args.candidate_impl == "swapab":
@@ -664,6 +671,7 @@ def main():
                         "parallel_routing_histogram": rank_histogram,
                         "candidate_impl": args.candidate_impl,
                         "deferred": args.deferred,
+                        "baseline_autotuned": not args.untuned_baseline,
                         "swapab_max_tokens": args.swapab_max_tokens,
                         "workspace_bytes": workspace.numel(),
                         "output_bytes": output.numel() * output.element_size(),

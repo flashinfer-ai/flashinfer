@@ -228,6 +228,9 @@ def _moe_core_impl(
     output_dtype: torch.dtype = torch.bfloat16,
     use_async_memset: bool = True,
     use_fused_finalize: bool = True,
+    gemm2_partial_out: Optional[torch.Tensor] = None,
+    skip_unpermute: bool = False,
+    weight_l2_hint: Optional[int] = None,
     enable_pdl: bool = True,
     activation_type: int = ActivationType.Swiglu.value,
     swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
@@ -313,8 +316,8 @@ def _moe_core_impl(
         raise ValueError("per_token_scale is not supported when quant_mode='w4a8'")
     if is_mxfp8 and output_dtype is not torch.bfloat16:
         raise ValueError("quant_mode='w4a8' supports only torch.bfloat16 output")
-    if is_mxfp8 and not use_fused_finalize:
-        raise ValueError("quant_mode='w4a8' requires use_fused_finalize=True")
+    # W4A8 supports both finalize forms: the atomic epilogue and the
+    # expanded-row GEMM2 output reduced by ``moe_unpermute``.
     validate_cute_dsl_moe_situ_config(activation, situ_beta, situ_linear_beta)
     if is_mxfp8:
         validate_w4a8_inputs(
@@ -436,6 +439,7 @@ def _moe_core_impl(
             mma_inst_shape=gemm1_mma_inst_shape,
             enable_pdl=enable_pdl,
             activation_type=activation.value,
+            weight_l2_hint=weight_l2_hint,
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
@@ -476,6 +480,15 @@ def _moe_core_impl(
         else:
             moe_output_memset_inplace(moe_output, _prepared_launches=_prepared_launches)
         gemm2_output = moe_output
+    elif gemm2_partial_out is not None:
+        # Caller-owned expanded-row buffer (workspace) for the two-stage
+        # finalize; rows are (token, slot) indexed.
+        if gemm2_partial_out.shape[0] < num_tokens * top_k or (
+            gemm2_partial_out.shape[1] != hidden_size
+            or gemm2_partial_out.dtype != output_dtype
+        ):
+            raise ValueError("gemm2_partial_out must be [>= T * top_k, H] output rows")
+        gemm2_output = gemm2_partial_out[: num_tokens * top_k]
     else:
         gemm2_output = torch.empty(
             (num_tokens * top_k, hidden_size),
@@ -508,13 +521,19 @@ def _moe_core_impl(
         cluster_shape_mn=gemm2_cluster_shape_mn,
         enable_pdl=enable_pdl,
         use_fused_finalize=use_fused_finalize,
+        weight_l2_hint=weight_l2_hint,
         _prepared_launches=_prepared_launches,
         _enable_narrow_a=_enable_decode_specialization,
     )
 
     # Step 4: Deterministic routing-weight reduction
-    if not use_fused_finalize:
-        moe_unpermute(
+    if not use_fused_finalize and skip_unpermute:
+        # The caller reduces the expanded rows itself (see
+        # ``mxfp4_finalize.plan_finalize_rows(expanded_rows=True)``).
+        if _prepared_launches is not None:
+            _prepared_launches["gemm2_partial"] = gemm2_output
+    elif not use_fused_finalize:
+        unpermute_kwargs = dict(
             permuted_input=gemm2_output,
             output=moe_output,
             expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
@@ -524,6 +543,11 @@ def _moe_core_impl(
             input_is_expanded=True,
             enable_pdl=enable_pdl,
         )
+        moe_unpermute(**unpermute_kwargs)
+        if _prepared_launches is not None:
+            # Fixed-address replay of the reduction (the expanded-row buffer
+            # is retained through the kwargs).
+            _prepared_launches["unpermute"] = (moe_unpermute, unpermute_kwargs)
 
     return moe_output[:num_tokens]
 

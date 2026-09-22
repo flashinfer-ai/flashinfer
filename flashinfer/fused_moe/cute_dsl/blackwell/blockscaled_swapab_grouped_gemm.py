@@ -98,12 +98,14 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         num_tile_stages: int = 8,
         meta_in_sched: bool = True,
         perf_probe: int = 0,
+        weight_l2_hint: Optional[int] = None,
     ):
         if epilogue_kind not in EPILOGUE_KINDS:
             raise ValueError(f"unknown epilogue_kind {epilogue_kind!r}")
         if n_tile not in (8, 16, 32):
-            # 64/128-row groups fail validation (wrong GEMM1 output, non-finite
-            # finalize at T=2048) and lose to the dense path anyway; not offered.
+            # 64/128-row groups are slower than two 32-row groups (the single
+            # gather warp bounds the row operand: TP8 T=1024 GEMM2 393 us at 64
+            # vs 246 us at 32) and 64 still faults at T=2048; not offered.
             raise ValueError("n_tile must be 8, 16 or 32")
         if k_blocks_per_stage not in (4, 8, 12):
             # The gather warp addresses whole 128-element K atoms (one 128-byte
@@ -135,10 +137,12 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         # warps themselves one tile ahead in registers (False).
         self.meta_in_sched = bool(meta_in_sched)
         # Timing attribution only (output invalid): 1 skips the epilogue
-        # store/reduce, 2 also skips the TMEM accumulator load.
+        # store/reduce, 2 also skips the TMEM accumulator load, 3 skips the
+        # gather warp's row-operand cp.async copies (barriers still cycle).
         self.perf_probe = perf_probe
-        # Timing attribution only (output invalid): 1 skips the epilogue math,
-        # 2 the S2T/MMA issue, 3 the row-operand cp.async copies.
+        # Optional L2 cache policy (``createpolicy`` encoding) for the weight
+        # and weight-scale TMA loads; weights stream once per row group.
+        self.weight_l2_hint = weight_l2_hint
         self.acc_dtype = cutlass.Float32
         self.cta_group = tcgen05.CtaGroup.ONE
         self.cluster_shape_mn = (1, 1)
@@ -1006,8 +1010,27 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                     ab_pipeline.producer_acquire(
                         ab_producer_state, peek_ab_empty_status
                     )
-                    cute.copy(tma_atom_a, tAgA_k, tAsA_pipe, tma_bar_ptr=tma_bar)
-                    cute.copy(tma_atom_sfa, tAgSFA_k, tAsSFA_pipe, tma_bar_ptr=tma_bar)
+                    if cutlass.const_expr(self.weight_l2_hint is not None):
+                        w_policy = cutlass.Int64(self.weight_l2_hint)
+                        cute.copy(
+                            tma_atom_a,
+                            tAgA_k,
+                            tAsA_pipe,
+                            tma_bar_ptr=tma_bar,
+                            cache_policy=w_policy,
+                        )
+                        cute.copy(
+                            tma_atom_sfa,
+                            tAgSFA_k,
+                            tAsSFA_pipe,
+                            tma_bar_ptr=tma_bar,
+                            cache_policy=w_policy,
+                        )
+                    else:
+                        cute.copy(tma_atom_a, tAgA_k, tAsA_pipe, tma_bar_ptr=tma_bar)
+                        cute.copy(
+                            tma_atom_sfa, tAgSFA_k, tAsSFA_pipe, tma_bar_ptr=tma_bar
+                        )
                     ab_producer_state.advance()
                     peek_ab_empty_status = cutlass.Boolean(1)
                     if ab_producer_state.count < k_tile_cnt:
@@ -1046,8 +1069,9 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
             lane_g = tidx % self.threads_per_warp
             # Row tile in smem: SW128 K-major; per 128-element K atom the
             # logical byte(row, k) = kt*n_tile*128 + row*128 + k (the swizzled
-            # smem iterator applies the 128B XOR pattern). SF smem atom: byte
-            # (row, kblock) = kt*512 + row*16 + kblock (atom 0 of 128 rows).
+            # smem iterator applies the 128B XOR pattern). SF smem atom (128
+            # rows x 4 K blocks = 512 bytes per 128-element K atom): byte
+            # (row, kblock) = kt*512 + (row % 32)*16 + (row // 32)*4 + kblock.
             chunk = lane_g % 8
             row_in_pass = lane_g // 8
             n_pass = n_tile // 4  # 4 rows x 8 16-byte chunks per warp pass
@@ -1112,7 +1136,7 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                     k0 = b_producer_state.count * k_stage
                     sB_stage = sB.iterator + stage * b_bytes_per_stage
                     sSFB_stage = sSFB.iterator + stage * sf_bytes_per_stage
-                    if cutlass.const_expr(True):
+                    if cutlass.const_expr(self.perf_probe != 3):
                         for kt in cutlass.range_constexpr(n_kt):
                             for p in cutlass.range_constexpr(n_pass):
                                 row = p * 4 + row_in_pass
@@ -1146,7 +1170,7 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                                     layout=cute.make_layout((4,)),
                                 )
                                 sf_s = cute.make_tensor(
-                                    sSFB_stage + kt * 512 + srow * 16,
+                                    sSFB_stage + kt * 512 + lane_g * 16 + q * 4,
                                     layout=cute.make_layout((4,)),
                                 )
                                 pred1[0] = sf_ok[q]

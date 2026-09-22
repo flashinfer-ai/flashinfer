@@ -178,6 +178,8 @@ CUDA Graph Support:
 
 
 # TODO: Remove this hook helper function after nvidia-cutlass-dsl 4.3.x is no longer supported.
+
+
 def hooked_PersistentTileSchedulerParams_init(
     self,
     problem_shape_ntile_mnl: cute.Shape,
@@ -436,6 +438,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         use_a_per_token_scale: bool = False,
         runtime_situ: bool = False,
         runtime_situ_linear_beta: bool = False,
+        weight_l2_hint: Optional[int] = None,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel with
         gather operation and FC1 activation fusion.
@@ -603,6 +606,10 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         self.situ_linear_beta = situ_linear_beta
         self.runtime_situ = runtime_situ
         self.runtime_situ_linear_beta = runtime_situ_linear_beta
+        # Optional L2 eviction policy (createpolicy encoding) for the weight and
+        # weight-scale TMA loads: weights streamed once prefer EVICT_FIRST so the
+        # activations gathered by several CTAs stay resident.
+        self.weight_l2_hint = weight_l2_hint
 
     def _setup_attributes(self):
         """Set up configurations that are dependent on GEMM inputs
@@ -2182,22 +2189,42 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                     tma_bar = b_pipeline.producer_get_barrier(b_producer_state)
 
                     # TMA load B
-                    cute.copy(
-                        tma_atom_b,
-                        tBgB_k,
-                        tBsB_pipe,
-                        tma_bar_ptr=tma_bar,
-                        mcast_mask=b_full_mcast_mask,
-                    )
+                    if cutlass.const_expr(self.weight_l2_hint is not None):
+                        cute.copy(
+                            tma_atom_b,
+                            tBgB_k,
+                            tBsB_pipe,
+                            tma_bar_ptr=tma_bar,
+                            mcast_mask=b_full_mcast_mask,
+                            cache_policy=cutlass.Int64(self.weight_l2_hint),
+                        )
+                    else:
+                        cute.copy(
+                            tma_atom_b,
+                            tBgB_k,
+                            tBsB_pipe,
+                            tma_bar_ptr=tma_bar,
+                            mcast_mask=b_full_mcast_mask,
+                        )
 
                     # TMA load SFB
-                    cute.copy(
-                        tma_atom_sfb,
-                        tBgSFB_k,
-                        tBsSFB_pipe,
-                        tma_bar_ptr=tma_bar,
-                        mcast_mask=sfb_full_mcast_mask,
-                    )
+                    if cutlass.const_expr(self.weight_l2_hint is not None):
+                        cute.copy(
+                            tma_atom_sfb,
+                            tBgSFB_k,
+                            tBsSFB_pipe,
+                            tma_bar_ptr=tma_bar,
+                            mcast_mask=sfb_full_mcast_mask,
+                            cache_policy=cutlass.Int64(self.weight_l2_hint),
+                        )
+                    else:
+                        cute.copy(
+                            tma_atom_sfb,
+                            tBgSFB_k,
+                            tBsSFB_pipe,
+                            tma_bar_ptr=tma_bar,
+                            mcast_mask=sfb_full_mcast_mask,
+                        )
 
                     # Peek (try_wait) AB buffer empty for k_tile = prefetch_k_tile_cnt + k_tile + 1
                     b_producer_state.advance()

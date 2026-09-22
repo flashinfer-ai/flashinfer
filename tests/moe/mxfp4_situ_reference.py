@@ -162,6 +162,10 @@ def make_routing(
             active = local[: max(1, top_k - len(remote))] + remote
             pool = torch.tensor(active, dtype=torch.int64)
             ids = pool[(t[:, None] * top_k + k) % len(active)]
+        elif distribution == "cycle":
+            # Contract ``uniform_cycle``: consecutive slots of a token go to
+            # consecutive experts; every expert receives T * top_k / E rows.
+            ids = (t[:, None] * top_k + k) % num_experts
         elif distribution == "hot":
             pool = torch.tensor(
                 [e for e in range(num_experts) if e != local[0]], dtype=torch.int64
@@ -598,8 +602,15 @@ def prepare_trt_weights(case):
     return tuple(result)
 
 
-def make_trt_baseline(case, prepared_weights=None, *, packed=True, do_finalize=True):
+def make_trt_baseline(
+    case, prepared_weights=None, *, packed=True, do_finalize=True, autotune=True
+):
     """Prepare the explicit TRT-LLM Gen baseline outside timed execution.
+
+    ``autotune=True`` runs one call under ``flashinfer.autotuner.autotune`` so
+    the timed baseline uses trtllm-gen's tuned tactic for this shape, as a
+    production caller (and the Cake contract) would; the untuned default
+    tactic is 25-40% slower for T >= 512 and would inflate every ratio.
 
     With ``do_finalize=False`` the returned ``run`` stores the unfinalized
     triple ``[gemm2_rows, expert_weights, expanded_idx_to_permuted_idx]`` in
@@ -654,6 +665,22 @@ def make_trt_baseline(case, prepared_weights=None, *, packed=True, do_finalize=T
         output=output,
         tune_max_num_tokens=max(8192, case.x.shape[0]),
     )
+
+    def _tune(fn):
+        if autotune:
+            import os
+
+            from flashinfer.autotuner import autotune as autotune_ctx
+
+            # ``MXFP4_SITU_AUTOTUNE_CACHE`` names a JSON file that persists
+            # the tuned trtllm-gen tactics across processes (the 896-expert
+            # TP8 profiles take minutes per token bucket).
+            cache = os.environ.get("MXFP4_SITU_AUTOTUNE_CACHE") or None
+            with torch.cuda.device(case.x.device):
+                with autotune_ctx(True, cache=cache):
+                    fn()
+                torch.cuda.synchronize()
+
     if not do_finalize:
         holder = {}
 
@@ -661,10 +688,12 @@ def make_trt_baseline(case, prepared_weights=None, *, packed=True, do_finalize=T
             holder["value"] = trtllm_fp4_block_scale_routed_moe(**kwargs)
             return holder["value"]
 
+        _tune(run_deferred)
         return run_deferred, holder
 
     def run():
         trtllm_fp4_block_scale_routed_moe(**kwargs)
         return output
 
+    _tune(run)
     return run, output

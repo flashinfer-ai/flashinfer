@@ -33,9 +33,60 @@ import torch
 from ...tllm_enums import ActivationType
 from .fused_moe import _moe_core_impl, validate_w4a8_inputs
 from .moe_utils import get_max_num_tiles, moe_sort
-from .mxfp4_routing import _plan_route_preprocess
+from .mxfp4_finalize import plan_finalize_rows
+from .mxfp4_routing import FUSED_ROUTE_MAX_ROUTES, _plan_route_preprocess
 from .swapab_moe import SWAP_ROW_TILE, swapab_gemm1_situ, swapab_gemm2
 from .tuner import DEFAULT_BLACKWELL_MOE_TACTIC, canonicalize_w4a8_tactic
+
+# Swap-AB finalize form by token count. T <= this bound reduce-adds
+# ``alpha * route_weight * acc`` straight from the GEMM2 epilogue
+# (``red.global.add.bf16x2`` into the zero-filled output). Above it GEMM2
+# writes ``alpha * acc`` rows in permuted order into workspace and a separate
+# gather kernel applies the route weights: the per-element reductions cost
+# ~80-160 G adds/s, which at TP8 T=1024 (8192 local rows x 7168) added
+# ~380 us to a 244 us GEMM2, while the two-stage form streams the rows once.
+SWAP_ATOMIC_FINALIZE_MAX_TOKENS = int(
+    os.environ.get("SWAPAB_ATOMIC_FINALIZE_MAX_TOKENS", "16")
+)
+# Two-stage finalize only pays off with a narrow GEMM2 K (short per-tile
+# mainloops cannot hide the epilogue's reductions): TP8 (K=384) T=128 saved
+# 38 us, EP8 (K=3072) T=128..1024 lost 6-28 us against the fused epilogue.
+SWAP_TWO_STAGE_MAX_SHARD = int(os.environ.get("SWAPAB_TWO_STAGE_MAX_SHARD", "512"))
+# Largest token count whose swap-AB GEMM2 uses 4-K-block stages (deeper
+# pipeline); above it the intermediate shard streams in one 12-block stage.
+SWAP_GEMM2_SHORT_STAGE_MAX_TOKENS = int(
+    os.environ.get("SWAPAB_GEMM2_SHORT_STAGE_MAX_TOKENS", "256")
+)
+# L2 eviction policy for the dense grouped GEMMs' weight TMA loads (CUTLASS
+# SM90 TMA cache-hint encodings). Weights stream once per token tile while the
+# gathered activations are re-read by every N tile of an expert: EVICT_FIRST
+# keeps the activations resident (B300, TP8 T=2048 balanced: GEMM1 530 ->
+# 511 us, GEMM2 345 -> 316 us; T=4096: 1049 -> 930 us total).
+_DENSE_L2_HINTS = {
+    "none": None,
+    "first": 0x12F0000000000000,
+    "last": 0x14F0000000000000,
+}
+DENSE_WEIGHT_L2_HINT = _DENSE_L2_HINTS[os.environ.get("MXFP4_DENSE_L2HINT", "first")]
+# Swap-AB path: EVICT_FIRST on the weight loads helps every shape whose
+# experts stream their weights once (decode -3..-15 us, single-group prefill
+# -5..-14 us on B300, same-GPU pairs) and hurts a hot expert whose groups
+# re-read them (EP8 T=128 hot +10 us, balanced +4 us).  The policy below is
+# per layout and token count (see ``_swap_weight_l2_hint``): every layout
+# uses it for decode; an expert-parallel rank skips it inside
+# ``SWAP_EP_L2HINT_SKIP`` where the hot rows are thin.
+SWAP_WEIGHT_L2_HINT_MAX_TOKENS = int(os.environ.get("SWAPAB_L2HINT_MAX_TOKENS", "16"))
+SWAP_EP_L2HINT_SKIP = (
+    SWAP_WEIGHT_L2_HINT_MAX_TOKENS + 1,
+    int(os.environ.get("SWAPAB_EP_L2HINT_SKIP_MAX_TOKENS", "255")),
+)
+# Dense-path (T > swapab_max_tokens) W4A8 tactic measured on B300 (Kimi K3):
+# 256-wide MMA N halves the GEMM2 tile count (TP8 T=2048 GEMM2 444 -> 344 us,
+# T=4096 564 -> 459 us) and matches GEMM1; used when no offline table covers T.
+B300_SITU_DENSE_TACTIC = (128, ((128, 256), (1, 1), False), ((128, 256), (1, 1), False))
+# Experimental: dense-path GEMM2 writes expanded rows and ``moe_unpermute``
+# applies the route weights (no bulk reduce-add into the output).
+DENSE_TWO_STAGE_FINALIZE = os.environ.get("MXFP4_DENSE_TWO_STAGE", "0") == "1"
 
 
 _PARALLEL_MODES = ("single", "expert_parallel", "moe_tensor_parallel")
@@ -360,8 +411,19 @@ class Mxfp4MoEPlan:
             _moe_core_impl(**self._kwargs, _prepared_launches=launches)
         self._sort, self._sort_args = launches["sort"]
         self._gather, self._gather_args, self._gather_kwargs = launches["gather"]
-        self._memset, self._memset_args = launches["memset"]
+        # No memset in the expanded-row (non-fused) finalize form.
+        self._memset, self._memset_args = launches.get("memset", (None, None))
         self._finalize, self._finalize_args = launches["finalize"]
+        self._unpermute = launches.get("unpermute")
+        self._finalize_rows = None
+        if "gemm2_partial" in launches:
+            self._finalize_rows = plan_finalize_rows(
+                launches["gemm2_partial"],
+                self._kwargs["moe_sort_buffers"]["out_expanded_idx_to_permuted_idx"],
+                self._route_weights,
+                self.output,
+                expanded_rows=True,
+            )
         if self.output.shape[0] <= 16:
             self._route_preprocess = _plan_route_preprocess(
                 self._topk_ids,
@@ -417,9 +479,14 @@ class Mxfp4MoEPlan:
             ):
                 self._sort(*self._sort_args, stream_ptr)
             self._gather(*self._gather_args, stream=stream, **self._gather_kwargs)
-            if self._route_preprocess is None:
+            if self._route_preprocess is None and self._memset is not None:
                 self._memset(*self._memset_args, stream_ptr)
             self._finalize(*self._finalize_args, stream=stream)
+            if self._unpermute is not None:
+                unpermute, unpermute_kwargs = self._unpermute
+                unpermute(**unpermute_kwargs)
+            if self._finalize_rows is not None:
+                self._finalize_rows.run(stream)
         return self.output
 
 
@@ -430,7 +497,11 @@ class Mxfp4MoESwapAbPlan:
     contract as :class:`Mxfp4MoEPlan`: fixed buffer addresses,
     graph-capturable ``run``. ``finalize=False`` is the deferred form: GEMM2
     writes ``alpha * acc`` rows in permuted order into ``output`` and the plan
-    exposes ``expanded_idx_to_permuted_idx`` / ``route_weights``.
+    exposes ``expanded_idx_to_permuted_idx`` / ``route_weights``. With
+    ``finalize=True`` and T > ``SWAP_ATOMIC_FINALIZE_MAX_TOKENS`` the same
+    permuted rows go to the ``partial_rows`` workspace region and a fifth
+    launch (:func:`plan_finalize_rows`) applies the route weights
+    (``two_stage``); at or below the bound GEMM2 reduce-adds into ``output``.
     """
 
     def __init__(
@@ -461,6 +532,13 @@ class Mxfp4MoESwapAbPlan:
         self.n_tile = n_tile
         self.finalize = bool(finalize)
         self.deferred = not self.finalize
+        self.two_stage = (
+            self.finalize
+            and x.shape[0] > SWAP_ATOMIC_FINALIZE_MAX_TOKENS
+            and wrapper.intermediate_shard <= SWAP_TWO_STAGE_MAX_SHARD
+        )
+        self._partial_rows = buffers["partial_rows"] if self.two_stage else None
+        self._finalize_rows = None
         # Deferred-finalize outputs (valid after ``run``): row of each
         # (token, slot) assignment (-1 when not local) and FP32 route weights.
         self.expanded_idx_to_permuted_idx = buffers["out_expanded_idx_to_permuted_idx"]
@@ -512,11 +590,21 @@ class Mxfp4MoESwapAbPlan:
         # The route preprocess kernel clears the finalize output; in the
         # deferred form the first T rows of the row buffer stand in (they are
         # overwritten or padding, so the clear is harmless).
-        clear_target = self.output if self.finalize else self.output[:num_tokens]
+        # In the deferred and two-stage forms the first T permuted rows stand
+        # in (overwritten or padding, so the clear is harmless): the finalize
+        # kernel writes every output row itself.
+        if self.finalize and not self.two_stage:
+            clear_target = self.output
+        elif self.two_stage:
+            clear_target = self._partial_rows[:num_tokens]
+        else:
+            clear_target = self.output[:num_tokens]
         with torch.cuda.device(self.device):
-            if num_tokens <= 16:
-                # Fused decode routing: ID unpack, FP32 weights, n_tile-row
-                # groups and the output zero-fill in one launch.
+            if num_tokens * w.top_k <= FUSED_ROUTE_MAX_ROUTES:
+                # Fused routing (T <= 256 for top-16): ID unpack, FP32
+                # weights, n_tile-row groups and the output zero-fill in one
+                # single-CTA launch instead of the conversion kernel plus
+                # ``moe_sort`` (about 3 us against 11 us at T=128).
                 self._route_preprocess = _plan_route_preprocess(
                     topk_ids,
                     topk_weights,
@@ -529,6 +617,7 @@ class Mxfp4MoESwapAbPlan:
                     local_expert_offset=w.local_expert_offset,
                     tile_size=self.n_tile,
                     _single_tile_per_expert=self.n_tile >= num_tokens,
+                    clear_output=not self.two_stage,
                 )
             else:
                 # Generic routing: one conversion + output-clear launch, then
@@ -539,6 +628,7 @@ class Mxfp4MoESwapAbPlan:
                     route_ids=self._route_ids,
                     route_weights=self._route_weights,
                     output=clear_target,
+                    clear_output=not self.two_stage,
                 )
                 moe_sort(
                     token_selected_experts=self._route_ids,
@@ -571,31 +661,54 @@ class Mxfp4MoESwapAbPlan:
                 zero_output=None,
                 n_tile=self.n_tile,
                 enable_pdl=w.enable_pdl,
+                weight_l2_hint=w._swap_weight_l2_hint(num_tokens),
                 _prepared_launches=launches,
             )
+            fused_finalize = self.finalize and not self.two_stage
+            # Short GEMM2 stages (4 K blocks) pipeline deeper and win 6-10 us
+            # on the wide expert-parallel shard while every expert fits one
+            # row group (T <= 256); the 384-wide single stage of a narrow
+            # MoE-TP shard is faster from T = 512 up and for few hot experts.
+            gemm2_k_blocks = None
+            if (
+                num_tokens <= SWAP_GEMM2_SHORT_STAGE_MAX_TOKENS
+                and w.intermediate_shard > SWAP_TWO_STAGE_MAX_SHARD
+                and not os.environ.get("SWAPAB_KBLOCKS2")
+            ):
+                gemm2_k_blocks = 4
             swapab_gemm2(
                 w2=w2,
                 w2_sf=w2_sf,
                 act=b["gemm1_out"],
                 act_sf=b["gemm1_out_scale"],
-                out=self.output,
+                out=self._partial_rows if self.two_stage else self.output,
                 tile_idx_to_expert_idx=b["out_tile_idx_to_expert_idx"],
                 tile_idx_to_mn_limit=b["out_tile_idx_to_mn_limit"],
                 num_non_exiting_tiles=b["out_num_non_exiting_tiles"],
                 alpha=b["w2_alpha"],
                 permuted_idx_to_expanded_idx=b["out_permuted_idx_to_expanded_idx"],
-                token_final_scales=self._route_weights if self.finalize else None,
+                token_final_scales=self._route_weights if fused_finalize else None,
                 top_k=w.top_k,
-                finalize=self.finalize,
+                finalize=fused_finalize,
                 n_tile=self.n_tile,
+                k_blocks_per_stage=gemm2_k_blocks,
                 enable_pdl=w.enable_pdl,
+                weight_l2_hint=w._swap_weight_l2_hint(num_tokens),
                 _prepared_launches=launches,
             )
             self._gemm1, self._gemm1_args = launches["swap_gemm1"]
             self._gemm2, self._gemm2_args = launches["swap_gemm2"]
+            if self.two_stage:
+                self._finalize_rows = plan_finalize_rows(
+                    self._partial_rows,
+                    b["out_expanded_idx_to_permuted_idx"],
+                    self._route_weights,
+                    self.output,
+                )
 
     def run(self) -> torch.Tensor:
-        """Enqueue three (T <= 16) or four launches on the caller's stream."""
+        """Enqueue three (T <= 16), four (deferred) or five (two-stage
+        finalize) launches on the caller's stream."""
         with torch.cuda.device(self.device):
             stream_ptr = torch.cuda.current_stream().cuda_stream
             stream = cuda.CUstream(stream_ptr)
@@ -604,6 +717,8 @@ class Mxfp4MoESwapAbPlan:
                 self._sort(*self._sort_args, stream_ptr)
             self._gemm1(*self._gemm1_args, stream=stream)
             self._gemm2(*self._gemm2_args, stream=stream)
+            if self._finalize_rows is not None:
+                self._finalize_rows.run(stream)
         return self.output
 
 
@@ -674,18 +789,15 @@ class CuteDslMxfp4MoEWrapper:
                     (int(t) if int(t) > 0 else (1 << 62), int(n))
                     for t, n in (item.split(":") for item in env_policy.split(","))
                 )
-            else:
-                # B300: 8-row groups win up to T=256 (2-3 local rows per
-                # expert); 32-row groups from T=512 (one group per expert).
-                policy = ((256, 8), (1 << 62, 32))
-        policy = tuple((int(t), int(n)) for t, n in policy)
-        if any(n not in (8, 16, 32) for _, n in policy) or any(
-            policy[i][0] >= policy[i + 1][0] for i in range(len(policy) - 1)
-        ):
-            raise ValueError(
-                "swapab_tile_policy must be ascending (max_tokens, tile in {8,16,32})"
-            )
-        self.swapab_tile_policy = policy
+        if policy is not None:
+            policy = tuple((int(t), int(n)) for t, n in policy)
+            if any(n not in (8, 16, 32) for _, n in policy) or any(
+                policy[i][0] >= policy[i + 1][0] for i in range(len(policy) - 1)
+            ):
+                raise ValueError(
+                    "swapab_tile_policy must be ascending (max_tokens, tile in {8,16,32})"
+                )
+        self._swapab_tile_policy = policy
         supported = mxfp4_moe_capability(
             gpu_arch=103,
             hidden_size=hidden_size,
@@ -706,11 +818,27 @@ class CuteDslMxfp4MoEWrapper:
         self.local_expert_offset = self.layout.local_expert_offset
         self.intermediate_shard = self.layout.intermediate_shard
         if self.swapab_max_tokens is None:
-            # Measured on B300 (Kimi K3 geometry): the swap path beats the
-            # dense grouped GEMMs up to T=1024 with the full intermediate
-            # size (EP) and up to T=256 with a narrow MoE-TP shard, whose
-            # 3-k-step GEMM2 tiles amortise less per weight byte.
-            self.swapab_max_tokens = 1024 if self.intermediate_shard >= 1024 else 256
+            env_max = os.environ.get("SWAPAB_MAX_TOKENS")
+            if env_max:
+                self.swapab_max_tokens = int(env_max)
+            else:
+                # Measured on B300 (Kimi K3 geometry, two-stage finalize): the
+                # swap path beats the dense grouped GEMMs up to T=1024 in both
+                # layouts; beyond that every expert needs a second 32-row
+                # group (weights re-streamed) and wider groups pay more in
+                # the row operand and finalize than they save.
+                self.swapab_max_tokens = 1024
+        if self._swapab_tile_policy is None:
+            # Measured on B300 (Kimi K3). The group width follows the local
+            # rows per expert (T/56 under balanced routing) so that no expert
+            # needs a second group, while a wider group caps the weight
+            # re-streaming of a hot expert; the narrow MoE-TP shard has 8x
+            # the local rows of an EP8 rank at the same T.
+            if self.intermediate_shard >= 1024:
+                self._swapab_tile_policy = ((128, 16), (1 << 62, 32))
+            else:
+                self._swapab_tile_policy = ((128, 8), (256, 16), (1 << 62, 32))
+        self.swapab_tile_policy = self._swapab_tile_policy
         self._offline_tactics = sorted(
             (int(limit), canonicalize_w4a8_tactic(tactic))
             for limit, tactic in (offline_tactics or {}).items()
@@ -739,6 +867,8 @@ class CuteDslMxfp4MoEWrapper:
         for limit, tactic in self._offline_tactics:
             if num_tokens <= limit:
                 return tactic
+        if self.activation_type == ActivationType.Situ:
+            return B300_SITU_DENSE_TACTIC
         return DEFAULT_BLACKWELL_MOE_TACTIC
 
     def _use_swapab(self, num_tokens, do_finalize=True):
@@ -748,6 +878,20 @@ class CuteDslMxfp4MoEWrapper:
             and self.activation_type == ActivationType.Situ
             and not self.enable_pdl
         )
+
+    def _dense_two_stage(self, num_tokens):
+        # Dense path: expanded-row GEMM2 output + finalize kernel instead of
+        # the bulk reduce-add epilogue (experimental, env-gated).
+        return DENSE_TWO_STAGE_FINALIZE and num_tokens > SWAP_ATOMIC_FINALIZE_MAX_TOKENS
+
+    def _swap_weight_l2_hint(self, num_tokens):
+        """L2 policy for the swap GEMMs' weight loads at this token count."""
+        if num_tokens <= SWAP_WEIGHT_L2_HINT_MAX_TOKENS:
+            return _DENSE_L2_HINTS["first"]
+        lo, hi = SWAP_EP_L2HINT_SKIP
+        if self.parallel_mode == "expert_parallel" and lo <= num_tokens <= hi:
+            return None
+        return _DENSE_L2_HINTS["first"]
 
     def _swap_tile(self, num_tokens):
         if num_tokens <= 16:
@@ -792,6 +936,16 @@ class CuteDslMxfp4MoEWrapper:
                 ("w1_alpha", (self.num_local_experts,), torch.float32, 4),
                 ("w2_alpha", (self.num_local_experts,), torch.float32, 4),
             ]
+            if (
+                do_finalize
+                and num_tokens > SWAP_ATOMIC_FINALIZE_MAX_TOKENS
+                and self.intermediate_shard <= SWAP_TWO_STAGE_MAX_SHARD
+            ):
+                # Two-stage finalize: GEMM2's alpha-scaled rows in permuted
+                # order, reduced by the finalize kernel.
+                specs.append(
+                    ("partial_rows", (rows, self.hidden_size), torch.bfloat16, 2)
+                )
             fields, offset = [], 0
             for name, shape, dtype, itemsize in specs:
                 offset = _align(offset)
@@ -803,6 +957,18 @@ class CuteDslMxfp4MoEWrapper:
         tiles = get_max_num_tiles(num_tokens, self.top_k, self.num_local_experts, tile)
         rows = tiles * tile
         specs = [
+            *(
+                [
+                    (
+                        "partial_rows",
+                        (num_tokens * self.top_k, self.hidden_size),
+                        torch.bfloat16,
+                        2,
+                    )
+                ]
+                if self._dense_two_stage(num_tokens)
+                else []
+            ),
             ("out_tile_idx_to_expert_idx", (tiles,), torch.int32, 4),
             ("out_tile_idx_to_mn_limit", (tiles,), torch.int32, 4),
             (
@@ -1118,6 +1284,7 @@ class CuteDslMxfp4MoEWrapper:
                 and gemm2 == ((128, 128), (1, 1), False)
             )
             route_ids = buffers["route_ids"] if topk_weights is None else topk_ids
+            dense_two_stage = self._dense_two_stage(num_tokens)
             kwargs = dict(
                 x=x,
                 x_sf=x_sf,
@@ -1149,7 +1316,10 @@ class CuteDslMxfp4MoEWrapper:
                 moe_output=output,
                 output_dtype=torch.bfloat16,
                 use_async_memset=False,
-                use_fused_finalize=True,
+                use_fused_finalize=not dense_two_stage,
+                gemm2_partial_out=buffers["partial_rows"] if dense_two_stage else None,
+                skip_unpermute=dense_two_stage,
+                weight_l2_hint=DENSE_WEIGHT_L2_HINT,
                 enable_pdl=self.enable_pdl,
                 activation_type=self.activation_type.value,
                 situ_beta=beta,

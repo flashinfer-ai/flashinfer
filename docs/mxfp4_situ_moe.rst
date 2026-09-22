@@ -110,10 +110,11 @@ The default decode forward then launches GEMM1 and GEMM2 with finalize:
 three device-kernel launches in total. Expert IDs must be unique within each
 token and lie in ``[0, num_experts)``, as in standard top-k routing.
 PDL-enabled decode retains separate
-native sorting. Above T=16 the same conversion + output-clear kernel runs
-without the fused sort (it is grid-strided over any token count), followed
-by the native ``moe_sort``; PDL-enabled prefill keeps the torch conversion
-and separate memset.
+native sorting. The fused sort covers every T with ``T * top_k <= 4096``
+(T <= 256 for Kimi K3, see "Kernel selection" below); above that the same
+conversion + output-clear kernel runs without the fused sort (it is
+grid-strided over any token count), followed by the native ``moe_sort``;
+PDL-enabled prefill keeps the torch conversion and separate memset.
 
 Deferred finalize
 ~~~~~~~~~~~~~~~~~
@@ -137,7 +138,7 @@ mirroring ``trtllm_fp4_block_scale_routed_moe(do_finalize=False)``.
   ``sum_k route_weights[t, k] * output[map[t, k]]`` over the local slots.
 * The deferred form is provided by the swap-AB path (SiTU, PDL disabled) at
   every token count, in both parallel layouts: routing preprocessing (plus
-  ``moe_sort`` above T=16), GEMM1 and GEMM2 with the plain-store epilogue.
+  ``moe_sort`` above T=256), GEMM1 and GEMM2 with the plain-store epilogue.
   ``mxfp4_moe_capability(..., do_finalize=False)`` reports it through
   ``deferred_output`` and ``get_workspace_size(T, do_finalize=False)``
   sizes its workspace. The plan is CUDA Graph capturable exactly like the
@@ -249,8 +250,73 @@ The padded-row bound is ``tile_size * max_tiles``, where
 
 The runner accepts an offline tactic table mapping token-count upper bounds
 to existing W4A8 tactic tuples. It chooses the smallest covering bucket using
-host shape metadata, with the conservative Blackwell tactic as the fallback.
+host shape metadata; without a covering bucket the SiTU dense path uses the
+B300-measured ``(128, ((128, 256), (1, 1)), ((128, 256), (1, 1)))`` tactic
+(256-wide MMA N halves the GEMM2 tile count against the conservative
+M128/N128 tactic) and other activations keep the conservative tactic.
 It never inspects device routing on the host or autotunes during execution.
+
+Kernel selection by token count is host-side and layout-aware. Both parallel
+layouts run the swap-AB grouped GEMMs (weights as MMA-M, ``n_tile``-row
+expert groups as MMA-N) up to ``swapab_max_tokens`` (1024 on either layout)
+and the dense grouped GEMMs above. The group width follows the expected rows
+per local expert: with the balanced routing of the benchmarks every expert
+receives T/56 rows, and as soon as that exceeds the group width every expert
+needs a second group, which streams its weight tile a second time and costs
+both swap GEMMs 40-50% on B300 (the per-tile cost is set by the tile count,
+not by the bytes). A wider group also caps the weight re-streaming of a hot
+expert (T=128 hot: 16 groups of 8 rows re-read 34 MB of weights each). The
+defaults are 16 rows up to T=128 and 32 above for an expert-parallel rank;
+8 up to T=128, 16 up to T=256 and 32 above for a 384-wide MoE-TP shard,
+whose rank sees eight times the local rows. Both follow
+``swapab_tile_policy``/``SWAPAB_TILE_POLICY`` and
+``swapab_max_tokens``/``SWAPAB_MAX_TOKENS``. On an expert-parallel rank
+(full 3072-wide shard) GEMM2 streams its K in 4-K-block (128-wide) stages up
+to T=256 (a deeper pipeline for the single-group case, 6-10 us) and in one
+384-wide stage above (``SWAP_GEMM2_SHORT_STAGE_MAX_TOKENS``); the 384-wide
+MoE-TP shard always uses one stage. Groups wider than 32 rows were measured
+and rejected: a single-warp 64-row TP8 GEMM2 ran 393 us against 246 us for
+two 32-row groups, and a four-warp gather did not close the gap, so above
+T=1024 the dense path is faster on both layouts.
+
+Every weight TMA load (swap-AB and dense) can carry an L2 eviction hint.
+The dense GEMMs mark their B/SFB streams ``EVICT_FIRST`` (CUTLASS SM90 TMA
+cache-hint encoding; ``MXFP4_DENSE_L2HINT`` = ``none``/``first``/``last``)
+so the streamed expert weights stop evicting the activation rows that every
+tile re-reads: TP8 T=2048 balanced 892 -> 843 us and T=4096 1049 -> 930 us
+on B300. The swap-AB GEMMs apply the same hint per layout and token count
+(``_swap_weight_l2_hint``, ``SWAPAB_L2HINT`` overrides): always for decode
+(EP8 T=1 29.4 -> 26.1 us, T=16 194 -> 184 us; TP8 T=16 209 -> 194 us) and for
+every prefill T on the MoE-TP shard (T=128..1024 -5..-14 us), but not for an
+expert-parallel rank at T=17..255 (``SWAPAB_EP_L2HINT_SKIP_MAX_TOKENS``),
+where a hot expert's 8-16 groups re-read its weights from L2 and the hint
+costs +10 us (balanced +4 us); from T=256 the 32-row groups make it a
+5-14 us win there too. All deltas are same-GPU paired medians.
+
+Routing preprocessing (expert histogram, permutation, per-row scale, output
+clear) runs as one fused CuTe kernel whenever ``T * top_k <= 4096``
+(``FUSED_ROUTE_MAX_ROUTES``), i.e. T <= 256 for Kimi K3, and as the shared
+``moe_sort`` path above. The fused kernel is a single block (or a grid that
+also clears the output when the swap epilogue reduce-adds into it) and
+replaces the unpack/conversion kernels, ``moe_sort`` and the memset
+(about 10.6 us at T=128) with roughly 3 us; the generic clear kernel uses
+16-byte stores.
+
+The finalize (route-weight reduction) has two forms on the swap-AB path.
+Up to T=16, and for shards wider than 512 at every T, GEMM2 reduce-adds
+``alpha * route_weight * acc`` into the zero-filled output from its epilogue
+(``red.global.add.bf16x2``); the long GEMM2 mainloops of a wide shard hide
+those reductions. For a shard of at most 512 columns and T > 16 (two-stage
+finalize) GEMM2 instead writes ``alpha * acc`` rows in permuted order into
+the ``partial_rows`` workspace region and a fifth launch,
+``mxfp4_finalize.plan_finalize_rows``, gathers each token's local slots
+with FP32 accumulation and one BF16 rounding, overwriting every output row
+(the route preprocess then skips the output clear). On the 384-wide TP8
+shard the epilogue reductions cost about 380 us at T=1024 (8192 local rows
+of 7168) against a 244 us GEMM2; the two-stage form replaces them with a
+46 us gather. ``get_workspace_size`` includes the region whenever the
+two-stage form applies; the deferred form (``do_finalize=False``) uses the
+caller's row buffer instead.
 ``mxfp4_moe_capability`` checks architecture, quantization, activation,
 dimensions, top-k and the explicit parallel metadata before a plan is
 constructed. Its result reports ``supported``, ``reason``, ``cuda_graph``
@@ -348,7 +414,13 @@ took 260.092 seconds.
 
 Earlier baseline racecheck passed with zero hazards; its synccheck was
 skipped after a hard 20-second timeout. Those results remain source-specific:
-ordinary numerical/API checks do not establish a new sanitizer pass.
+ordinary numerical/API checks do not establish a new sanitizer pass. The
+current revision was re-run under compute-sanitizer on B300 through the
+wrapper (finalized and ``do_finalize=False`` plans in one process; EP=8
+rank 3 at T=16/128 hot and T=256 balanced, MoE TP=8 rank 0 at T=16/128 hot
+and T=1024 balanced): ``synccheck`` and ``memcheck`` both report zero
+errors (``--report-api-errors no``; the runtime's own ``cuGetProcAddress``
+capability probes are the only reports otherwise).
 
 Numerical semantics and limits
 ------------------------------
@@ -457,18 +529,31 @@ Comparative performance
 Swap-AB path results (current revision)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Since the swap-AB grouped GEMMs (weights as the MMA-M operand, ``n_tile``-row
+The swap-AB grouped GEMMs (weights as the MMA-M operand, ``n_tile``-row
 groups of routed rows as MMA-N; ``swapab_moe.py`` and
-``blackwell/blockscaled_swapab_grouped_gemm.py``) serve T <= 1024 with the
-full intermediate size and T <= 256 with the 384-wide MoE-TP shard, with the
-dense grouped GEMMs above, every row of the required matrix is faster than
-TRT-LLM Gen on B300. Method: ``benchmarks/bench_mxfp4_situ_moe.py --full
---accuracy`` per layout, same process, CUPTI activity tracing with an L2
-flush before every sample, alternating arm order per row, 10 warmup and 30
-timed iterations, medians; kernel sum is the sum of correlated kernel
-durations, e2e the synchronized runner latency. Ratios are TRT-LLM Gen
-divided by candidate. Both arms record their error against the FP64
-oracles on every row (relative L2 0.026-0.027 for both).
+``blackwell/blockscaled_swapab_grouped_gemm.py``) serve T <= 1024 in both
+layouts, with the two-stage finalize on the 384-wide MoE-TP shard for
+T > 16 and the dense grouped GEMMs above T=1024. Method:
+``benchmarks/bench_mxfp4_situ_moe.py --full --accuracy`` per layout, same
+process, CUPTI activity tracing with an L2 flush before every sample,
+alternating arm order per row, 10 warmup and 30 timed iterations, medians;
+kernel sum is the sum of correlated kernel durations, e2e the synchronized
+runner latency. Ratios are TRT-LLM Gen divided by candidate. The TRT-LLM
+Gen arm runs once under ``flashinfer.autotuner.autotune`` before timing, as
+a serving stack does: its tuned tactics are 25-40% faster than the default
+tactic for T >= 512 (TP8 T=512: 710 us tuned vs 993 us untuned), while
+decode and T <= 256 are unaffected; earlier revisions of these tables
+compared against the untuned default (``--untuned-baseline`` reproduces
+that). The autotuner's cache key does not include the routing, so the
+tuned tactic is the one that won on the routing it was shown: every table
+here tunes on the balanced routing of each token count (the benchmark
+lists ``balanced`` first), the input a serving stack would tune with.
+Tuning on the ``empty`` routing instead (T=128, MoE-TP shard) picks a
+tactic that runs that row in 87 us (against 195 us for the
+balanced-tuned tactic and 144 us for the candidate) but costs the same
+shard's balanced row 5% (709 us against 676 us); no single tactic wins
+both, and the per-row-oracle baseline is not one a caller can deploy. Both arms record their error against the FP64 oracles on every row
+(relative L2 0.026-0.027 for both).
 
 .. list-table:: Paired kernel-sum ratios (TRT / candidate), all required rows
    :header-rows: 1
@@ -482,26 +567,26 @@ oracles on every row (relative L2 0.026-0.027 for both).
    * - EP=8 (rank 3, 112 local experts)
      - Graph
      - 44
-     - 1.233
-     - 1.034 (T16 balanced)
+     - 1.223
+     - 1.033 (T128 balanced)
      - 0
    * - EP=8
      - eager
      - 44
-     - 1.237
-     - 1.032 (T16 balanced)
+     - 1.228
+     - 1.033 (T128 remote dominated)
      - 0
    * - MoE TP=8 (rank 0, shard 384)
      - Graph
      - 33
-     - 1.301
-     - 1.013 (T128 balanced)
+     - 1.200
+     - 1.027 (T1024 empty)
      - 0
    * - MoE TP=8
      - eager
      - 33
-     - 1.302
-     - 1.013 (T256 balanced)
+     - 1.205
+     - 1.026 (T1024 empty)
      - 0
 
 Per-``T`` Graph-mode rows, EP=8 (kernel-sum milliseconds for balanced
@@ -514,17 +599,17 @@ graph-replay e2e ratio for balanced routing):
    ====  ================  ===============  ==============  =========  ===========  =================  ==================
    T     balanced cand ms  balanced TRT ms  balanced ratio  hot ratio  empty ratio  remote-dom. ratio  balanced e2e ratio
    ====  ================  ===============  ==============  =========  ===========  =================  ==================
-   1     0.0295            0.0318           1.079           1.076      1.100        1.070              1.091             
-   2     0.0470            0.0501           1.066           1.104      1.101        1.090              1.066             
-   4     0.0699            0.0730           1.044           1.086      1.103        1.074              1.050             
-   8     0.1170            0.1233           1.054           1.314      1.309        1.118              1.053             
-   16    0.1960            0.2026           1.034           1.299      1.330        1.053              1.035             
-   128   0.6076            0.7279           1.198           1.163      1.224        1.198              1.193             
-   256   0.6135            0.7569           1.234           1.117      1.335        1.242              1.227             
-   512   0.6356            0.6969           1.096           1.057      1.191        1.110              1.095             
-   1024  0.6529            0.9530           1.460           1.312      1.405        1.536              1.448             
-   2048  0.8395            1.3175           1.569           1.522      1.670        1.613              1.557             
-   4096  0.8838            1.2373           1.400           1.410      1.696        1.584              1.384             
+   1     0.0268            0.0318           1.185           1.094      1.091        1.087              1.135             
+   2     0.0406            0.0496           1.221           1.082      1.081        1.179              1.203             
+   4     0.0601            0.0736           1.224           1.100      1.104        1.237              1.196             
+   8     0.1046            0.1222           1.168           1.311      1.317        1.305              1.157             
+   16    0.1849            0.2011           1.088           1.331      1.365        1.170              1.087             
+   128   0.5947            0.6144           1.033           1.039      1.244        1.034              1.038             
+   256   0.6070            0.6445           1.062           1.052      1.217        1.055              1.063             
+   512   0.6217            0.6985           1.124           1.058      1.308        1.129              1.120             
+   1024  0.6334            0.7604           1.201           1.086      1.378        1.216              1.195             
+   2048  0.8176            1.2398           1.516           1.453      1.572        1.536              1.504             
+   4096  0.8523            1.2291           1.442           1.395      1.933        1.529              1.428             
    ====  ================  ===============  ==============  =========  ===========  =================  ==================
 
 Per-``T`` Graph-mode rows, MoE TP=8:
@@ -535,35 +620,90 @@ Per-``T`` Graph-mode rows, MoE TP=8:
    ====  ================  ===============  ==============  =========  ===========  ==================
    T     balanced cand ms  balanced TRT ms  balanced ratio  hot ratio  empty ratio  balanced e2e ratio
    ====  ================  ===============  ==============  =========  ===========  ==================
-   1     0.0297            0.0342           1.151           1.144      1.157        1.127             
-   2     0.0475            0.0526           1.108           1.125      1.137        1.086             
-   4     0.0720            0.0758           1.053           1.087      1.146        1.067             
-   8     0.1230            0.1300           1.057           1.088      1.331        1.060             
-   16    0.2090            0.2190           1.048           1.064      1.362        1.052             
-   128   0.6687            0.6774           1.013           1.027      1.140        1.012             
-   256   0.6858            0.6974           1.017           1.022      1.064        1.015             
-   512   0.8888            0.9932           1.117           1.069      5.590        1.117             
-   1024  0.9338            1.2853           1.376           1.518      3.960        1.371             
-   2048  1.0165            1.3969           1.374           1.537      2.348        1.367             
-   4096  1.1910            1.4842           1.246           1.442      1.373        1.243             
+   1     0.0271            0.0329           1.216           1.265      1.273        1.146             
+   2     0.0411            0.0499           1.214           1.237      1.398        1.181             
+   4     0.0621            0.0748           1.203           1.228      1.273        1.169             
+   8     0.1072            0.1318           1.229           1.275      1.534        1.210             
+   16    0.1997            0.2187           1.095           1.134      1.504        1.092             
+   128   0.6150            0.6776           1.102           1.101      1.250        1.099             
+   256   0.6341            0.6926           1.092           1.093      1.114        1.088             
+   512   0.6706            0.7169           1.069           1.077      1.511        1.067             
+   1024  0.7212            0.7837           1.087           1.070      1.027        1.083             
+   2048  0.8406            0.8883           1.057           1.044      1.504        1.057             
+   4096  0.9498            1.1027           1.161           1.173      1.236        1.159             
    ====  ================  ===============  ==============  =========  ===========  ==================
 
-Eager-mode ratios match the Graph-mode ones within 1% on every row. The
-thinnest margins are the MoE-TP T128/T256 balanced and hot rows (1.3-2.7%):
-GEMM1 ties TRT-LLM Gen and GEMM2 (K = 384, one operand stage per tile) is
-bounded by its finalize epilogue; the 8-deep tile-info ring with
-scheduler-warp metadata is the best measured variant there (a 2-deep ring
-costs that GEMM2 about 20%, the epilogue-side prefetch 3-5%).
+Eager-mode ratios match the Graph-mode ones within 1% on every row, and
+the synchronized graph-replay e2e ratio is above one on every row as well
+(minimum 1.036 EP=8, 1.025 MoE TP=8). The thinnest
+margins are the EP=8 T128 balanced/remote-dominated rows (3.3-3.4%), where
+both arms stream the rank's 3.9 GB of expert weights at about 6.4 TB/s, and
+the MoE-TP T1024 empty row (2.7%), where the few active experts leave the
+32-row groups' finalize epilogue as the GEMM2 bound.
 
 The deferred form (``plan(..., do_finalize=False)`` against
 ``trtllm_fp4_block_scale_routed_moe(do_finalize=False)``, both arms without
-the route-weight reduction) measured with ``--deferred`` on the same rows:
-EP=8 Graph geometric mean 1.092 (T <= 2048 within 0.99-1.99, T4096 rows
-0.67-0.92 and T512 empty 0.93 below one), MoE TP=8 Graph geometric mean
-1.143 (every row above one except T4096 at 0.53-0.76). The deferred form is
-always served by the swap-AB path, which loses to the dense grouped GEMMs at
-these largest token counts; the finalized path switches to the dense GEMMs
-there.
+the route-weight reduction) measured with ``--deferred`` on the same rows
+(Graph mode, same method and tuned baseline): EP=8 geometric mean 1.081
+over 44 rows, MoE TP=8 1.022 over 33 rows. Every T <= 1024 row is above one
+on the MoE-TP shard (1.04-1.63) and on EP=8 except four rows that tie
+within 2.5% (T1/T4 empty, hot, remote-dominated at about 24 us both arms,
+T1024 empty 0.976). The deferred form is always served by the swap-AB
+path, which the finalized path leaves at T=1024 for the dense grouped
+GEMMs; above that the swap-AB GEMMs lose to trtllm-gen's dense GEMM2
+(EP=8 T2048 hot 0.948, T4096 0.62-0.76; MoE TP=8 T2048/T4096 0.39-0.72).
+Serving the deferred output from the dense path is the open follow-up for
+those token counts.
+
+.. table:: Deferred finalize, Graph mode, EP=8 (trtllm-gen do_finalize=False / candidate do_finalize=False)
+   :widths: auto
+
+   ====  ================  ===============  ==============  =========  ===========  =================
+   T     balanced cand ms  balanced TRT ms  balanced ratio  hot ratio  empty ratio  remote-dom. ratio
+   ====  ================  ===============  ==============  =========  ===========  =================
+   1     0.0268            0.0293           1.094           0.986      0.985        0.992            
+   2     0.0406            0.0471           1.160           1.003      1.005        1.124            
+   4     0.0606            0.0734           1.211           0.985      0.987        1.139            
+   8     0.1040            0.1185           1.139           1.196      1.181        1.249            
+   16    0.1844            0.1977           1.072           1.195      1.197        1.135            
+   128   0.6000            0.6052           1.009           1.003      1.123        1.012            
+   256   0.6097            0.6334           1.039           1.030      1.044        1.037            
+   512   0.6248            0.6841           1.095           1.029      1.008        1.116            
+   1024  0.6343            0.7407           1.168           1.052      0.976        1.181            
+   2048  1.0515            1.2063           1.147           0.948      1.468        1.891            
+   4096  1.5496            1.1741           0.758           0.621      1.247        1.119            
+   ====  ================  ===============  ==============  =========  ===========  =================
+
+.. table:: Deferred finalize, Graph mode, MoE TP=8
+   :widths: auto
+
+   ====  ================  ===============  ==============  =========  ===========
+   T     balanced cand ms  balanced TRT ms  balanced ratio  hot ratio  empty ratio
+   ====  ================  ===============  ==============  =========  ===========
+   1     0.0259            0.0298           1.151           1.140      1.133      
+   2     0.0393            0.0474           1.207           1.217      1.158      
+   4     0.0591            0.0707           1.197           1.215      1.161      
+   8     0.1048            0.1244           1.186           1.246      1.353      
+   16    0.1875            0.2124           1.133           1.156      1.410      
+   128   0.6116            0.6556           1.072           1.077      1.259      
+   256   0.6330            0.6700           1.058           1.058      1.112      
+   512   0.6472            0.6920           1.069           1.080      1.634      
+   1024  0.6714            0.7323           1.091           1.078      1.043      
+   2048  1.1240            0.8069           0.718           0.685      0.529      
+   4096  1.6774            0.9497           0.566           0.531      0.391      
+   ====  ================  ===============  ==============  =========  ===========
+
+Long prefill (optional rows)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The optional T=8192/16384/32768 rows (finalized path, dense grouped GEMMs,
+same paired method, Graph mode) are measured and reported but not tuned:
+EP=8 geometric mean 1.389 over 12 rows with T8192 balanced 0.799, hot 0.809
+and T16384 remote-dominated 0.846 below one; MoE TP=8 geometric mean 1.033
+over 9 rows with T8192 balanced 0.909 / hot 0.965, T16384 balanced 0.974 /
+empty 0.958 and T32768 empty 0.954 below one. The dense path runs the fixed
+B300 tactic there while the trtllm-gen arm autotunes per token count; an
+offline tactic table for T >= 8192 is the follow-up.
 
 Dense-path evaluation history
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

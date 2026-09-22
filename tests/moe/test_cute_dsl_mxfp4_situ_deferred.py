@@ -146,7 +146,17 @@ def test_deferred_workspace_and_row_queries(tokens, mode):
     deferred = wrapper.get_workspace_size(tokens, do_finalize=False)
     assert deferred > 0 and deferred % 256 == 0
     if wrapper._use_swapab(tokens):
-        assert deferred == wrapper.get_workspace_size(tokens)
+        finalized = wrapper.get_workspace_size(tokens)
+        if (
+            tokens > m.SWAP_ATOMIC_FINALIZE_MAX_TOKENS
+            and wrapper.intermediate_shard <= m.SWAP_TWO_STAGE_MAX_SHARD
+        ):
+            # Two-stage finalize keeps the permuted rows in workspace; the
+            # deferred caller owns that buffer instead.
+            partial = rows * 7168 * 2
+            assert finalized - deferred == partial + (-partial) % 256
+        else:
+            assert deferred == finalized
     with pytest.raises(ValueError):
         wrapper.get_deferred_output_rows(0)
     pdl = m.CuteDslMxfp4MoEWrapper(

@@ -274,6 +274,7 @@ def _get_compiled_gather_kernel(
     runtime_situ_linear_beta_ptr=None,
     situ_beta_stride: int = 0,
     situ_linear_beta_stride: int = 0,
+    weight_l2_hint: Optional[int] = None,
 ):
     """Get or compile the gather grouped GEMM with FC1 activation fusion.
 
@@ -329,6 +330,7 @@ def _get_compiled_gather_kernel(
         else situ_linear_beta,
         gated,
         use_a_per_token_scale,
+        weight_l2_hint,
     )
 
     if cache_key not in _gather_kernel_cache:
@@ -388,6 +390,7 @@ def _get_compiled_gather_kernel(
                 use_a_per_token_scale=use_a_per_token_scale,
                 runtime_situ=runtime_situ,
                 runtime_situ_linear_beta=runtime_situ and situ_linear_beta is not None,
+                weight_l2_hint=weight_l2_hint,
             )
         wrapper_fn = gemm.wrapper
 
@@ -475,6 +478,7 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
     mma_inst_shape: Optional[Tuple[int, int, int]] = None,
     enable_pdl: bool = True,
     activation_type: Union[int, ActivationType] = ActivationType.Swiglu.value,
+    weight_l2_hint: Optional[int] = None,
     swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
     swiglu_beta: float = DEFAULT_SWIGLU_BETA,
     swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
@@ -918,6 +922,7 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         situ_linear_beta=situ_linear_beta,
         gated=gated,
         use_a_per_token_scale=use_a_per_token_scale,
+        weight_l2_hint=weight_l2_hint,
         runtime_situ_beta_ptr=runtime_situ_beta_ptr,
         runtime_situ_linear_beta_ptr=runtime_situ_linear_beta_ptr,
         situ_beta_stride=situ_beta_stride,

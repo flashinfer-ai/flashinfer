@@ -63,6 +63,21 @@ def gemm2_k_blocks_per_stage(k: int) -> int:
 
 
 SWAP_PERF_PROBE = int(os.environ.get("SWAPAB_PROBE", "0"))
+# L2 eviction priority for the streamed weight TMA loads; the encodings follow
+# CUTLASS's SM90 TMA cache hints. The launchers take the policy per call
+# (``weight_l2_hint``); SWAPAB_L2HINT = none | first | last overrides it.
+TMA_L2_EVICT_FIRST = 0x12F0000000000000
+TMA_L2_EVICT_LAST = 0x14F0000000000000
+_L2_HINTS = {"none": None, "first": TMA_L2_EVICT_FIRST, "last": TMA_L2_EVICT_LAST}
+_ENV_L2HINT = os.environ.get("SWAPAB_L2HINT")
+
+
+def _resolve_weight_l2_hint(weight_l2_hint: Optional[int]) -> Optional[int]:
+    if _ENV_L2HINT:
+        return _L2_HINTS[_ENV_L2HINT]
+    return weight_l2_hint
+
+
 # Pipeline depth knobs (SWAPAB_STAGES / SWAPAB_ACC_STAGES override for tuning).
 SWAP_MAX_AB_STAGES = int(os.environ.get("SWAPAB_STAGES", "12"))
 SWAP_ACC_STAGES = int(os.environ.get("SWAPAB_ACC_STAGES", "2"))
@@ -145,6 +160,7 @@ def _get_compiled_swapab_kernel(
     stream: cuda.CUstream,
     tiled_a: bool = False,
     zero_fill: bool = False,
+    weight_l2_hint: Optional[int] = None,
 ):
     import os
     import sys
@@ -163,6 +179,7 @@ def _get_compiled_swapab_kernel(
         SWAP_TILE_STAGES,
         SWAP_META_IN_SCHED,
         SWAP_PERF_PROBE,
+        weight_l2_hint,
         tiled_a,
         # ``zero_output`` is a compile-time specialisation (None vs pointer).
         zero_fill,
@@ -182,6 +199,7 @@ def _get_compiled_swapab_kernel(
             num_tile_stages=SWAP_TILE_STAGES,
             meta_in_sched=SWAP_META_IN_SCHED,
             perf_probe=SWAP_PERF_PROBE,
+            weight_l2_hint=weight_l2_hint,
         )
         _swapab_kernel_cache[key] = cute.compile(
             kernel.wrapper,
@@ -215,6 +233,7 @@ def swapab_gemm1_situ(
     linear_beta: Optional[torch.Tensor],
     top_k: int,
     zero_output: Optional[torch.Tensor] = None,
+    weight_l2_hint: Optional[int] = None,
     n_tile: int = SWAP_ROW_TILE,
     k_blocks_per_stage: Optional[int] = None,
     enable_pdl: bool = False,
@@ -295,6 +314,7 @@ def swapab_gemm1_situ(
         stream=stream,
         tiled_a=bool(SWAP_TILED_WEIGHTS & 1),
         zero_fill=zero_output is not None,
+        weight_l2_hint=_resolve_weight_l2_hint(weight_l2_hint),
     )
     if _prepared_launches is not None:
         _prepared_launches["swap_gemm1"] = (compiled, args)
@@ -319,6 +339,7 @@ def swapab_gemm2(
     n_tile: int = SWAP_ROW_TILE,
     k_blocks_per_stage: Optional[int] = None,
     enable_pdl: bool = False,
+    weight_l2_hint: Optional[int] = None,
     _prepared_launches: Optional[Dict[str, Any]] = None,
 ) -> None:
     """GEMM2 (down) on the swap path.
@@ -399,6 +420,7 @@ def swapab_gemm2(
         max_active_clusters=max_active_clusters,
         stream=stream,
         tiled_a=bool(SWAP_TILED_WEIGHTS & 2),
+        weight_l2_hint=_resolve_weight_l2_hint(weight_l2_hint),
     )
     if _prepared_launches is not None:
         _prepared_launches["swap_gemm2"] = (compiled, args)
