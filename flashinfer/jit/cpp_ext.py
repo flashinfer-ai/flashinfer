@@ -120,7 +120,8 @@ def host_compiler_is_gcc() -> bool:
     """
     from torch.utils.cpp_extension import check_compiler_is_gcc, get_cxx_compiler
 
-    return check_compiler_is_gcc(get_cxx_compiler())
+    host_compiler = os.environ.get("CC", get_cxx_compiler())
+    return check_compiler_is_gcc(host_compiler)
 
 
 def join_multiline(vs: List[str]) -> str:
