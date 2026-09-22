@@ -6,6 +6,10 @@ import torch
 
 from flashinfer import xqa, xqa_mla
 from flashinfer.utils import get_compute_capability
+from tests.test_helpers.parametrize import (
+    parametrize_product,
+    pairwise_product_cases,
+)
 
 
 def set_random_seed(seed=0):
@@ -124,10 +128,6 @@ def ref_attention(
     get_compute_capability(torch.device(device="cuda"))[0] not in [9, 10, 12],
     reason="XQA is only supported on SM90, SM100, SM120/SM121 GPUs",
 )
-@pytest.mark.parametrize("enable_pdl", [True, False])
-@pytest.mark.parametrize("use_sliding_window", [True, False])
-@pytest.mark.parametrize("input_type", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("use_attention_sinks", [True, False])
 @pytest.mark.parametrize(
     "seq_len",
     [
@@ -144,22 +144,28 @@ def ref_attention(
         ),
     ],
 )
-@pytest.mark.parametrize("batch_size", [1, 4])
-@pytest.mark.parametrize("nb_k_heads", [2, 4])
-@pytest.mark.parametrize("tokens_per_page", [16, 64])
-@pytest.mark.parametrize("valid_elems_per_head", [32, 128])
-@pytest.mark.parametrize("head_grp_size", [8, 16])
-@pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
-@pytest.mark.parametrize("q_scale", [1.0, 0.5])
-@pytest.mark.parametrize(
-    "fp8_kv_cache,kv_scale,use_fp8_output",
-    [
-        (False, 1.0, False),  # Non-FP8 KV cache: kv_scale=1.0, no FP8 output
-        (True, 1.0, False),  # FP8 KV cache: kv_scale=1.0, no FP8 output
-        (True, 1.0, True),  # FP8 KV cache: kv_scale=1.0, with FP8 output
-        (True, 0.5, False),  # FP8 KV cache: kv_scale=0.5, no FP8 output
-        (True, 0.5, True),  # FP8 KV cache: kv_scale=0.5, with FP8 output
-    ],
+@parametrize_product(
+    {
+        "enable_pdl": [True, False],
+        "use_sliding_window": [True, False],
+        "input_type": [torch.float16, torch.bfloat16],
+        "use_attention_sinks": [True, False],
+        "batch_size": [1, 4],
+        "nb_k_heads": [2, 4],
+        "tokens_per_page": [16, 64],
+        "valid_elems_per_head": [32, 128],
+        "head_grp_size": [8, 16],
+        "kv_layout": ["NHD", "HND"],
+        "q_scale": [1.0, 0.5],
+        "fp8_kv_cache,kv_scale,use_fp8_output": [
+            (False, 1.0, False),
+            (True, 1.0, False),
+            (True, 1.0, True),
+            (True, 0.5, False),
+            (True, 0.5, True),
+        ],
+    },
+    regular=pairwise_product_cases,
 )
 def test_xqa(
     batch_size,
