@@ -4245,6 +4245,65 @@ def test_wrapper_run_validate_false_skips_explicit_checks(
         wrapper.run(*tensors, validate="no")
 
 
+@pytest.mark.parametrize(
+    "with_mean", (None, False, True), ids=("plain", "sage", "mean")
+)
+def test_dense_wrapper_unchecked_run_preserves_optional_slots(
+    monkeypatch: pytest.MonkeyPatch, with_mean: bool | None
+) -> None:
+    """Trusted dense runs need no dummy mask and bind the same ABI as checked runs."""
+
+    recipe = (
+        None if with_mean is None else prims_ts.SageAttentionConfig(v_mean=with_mean)
+    )
+    dtype = torch.float16 if recipe is None else _FP8
+    state = _plan_state_stub(
+        seq_len_q=64,
+        seq_len_kv=128,
+        q_block_size=64,
+        kv_block_size=64,
+        use_block_sparse=False,
+        q_dtype=dtype,
+        kv_dtype=dtype,
+        v_dtype=dtype,
+        sage=recipe,
+    )
+    scales = (
+        None
+        if recipe is None
+        else make_sage_params(
+            batch_size=1,
+            seq_len_q=64,
+            seq_len_kv=128,
+            num_qo_heads=1,
+            num_kv_heads=1,
+            with_mean=with_mean,
+        )
+    )
+    q = torch.empty((1, 64, 1, _HEAD_DIM), dtype=dtype)
+    k = torch.empty((1, 128, 1, _HEAD_DIM), dtype=dtype)
+    out = torch.empty(q.shape, dtype=state.output_dtype)
+    wrapper = block_sparse_module.BlockSparseTSWrapper()
+    wrapper._plan_state = state
+    runs = []
+
+    def launch(_state, run_args, _stream):
+        runs.append(run_args)
+        return run_args.out
+
+    monkeypatch.setattr(wrapper, "_launch_validated_run", launch)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda _device: object())
+    for validate in (True, False):
+        assert wrapper.run(q, k, k, out=out, sage=scales, validate=validate) is out
+    assert all(run.kv_valid_bits is None for run in runs)
+    assert all(
+        checked is unchecked
+        for checked, unchecked in zip(
+            runs[0].sage_slots, runs[1].sage_slots, strict=True
+        )
+    )
+
+
 def test_paged_inspection_launches_share_one_summary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -6511,6 +6570,8 @@ def test_dense_contiguous_run_matches_reference(case: _Case, mask_type: str) -> 
     assert policy["scheduler"] == case.scheduler
 
     actual = wrapper.run(q, k, v, sm_scale=sm_scale)
+    unchecked = wrapper.run(q, k, v, sm_scale=sm_scale, validate=False)
     torch.cuda.synchronize()
+    assert torch.equal(actual, unchecked)
     tolerance = 2e-2 if case.dtype is torch.bfloat16 else 1e-2
     torch.testing.assert_close(actual, expected, rtol=tolerance, atol=tolerance)

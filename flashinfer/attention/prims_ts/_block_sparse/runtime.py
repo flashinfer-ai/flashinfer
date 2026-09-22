@@ -552,7 +552,8 @@ def prepare_block_sparse_run_unchecked(
         effective_kv_valid_bits = kv_valid_bits
     else:
         effective_kv_valid_bits = state.dummy_kv_valid_bits
-    assert effective_kv_valid_bits is not None
+    if state.use_block_sparse:
+        assert effective_kv_valid_bits is not None
     if out is None:
         out = torch.empty(
             (state.batch_size, state.seq_len_q, state.num_qo_heads, state.head_dim),

@@ -1092,7 +1092,9 @@ def _run_dense_sage(
 
     wrapper = _plan_sage(case, device)
     actual = wrapper.run(q, k, v, sage=params, sm_scale=sm_scale)
+    unchecked = wrapper.run(q, k, v, sage=params, sm_scale=sm_scale, validate=False)
     torch.cuda.synchronize()
+    assert torch.equal(actual, unchecked)
     return actual
 
 
