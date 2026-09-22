@@ -10,6 +10,8 @@ helpers below.
 from .core import (
     _CUDNN_MOE_MIN_VERSION,
     _check_cudnn_version,
+    _cudnn_moe_block_scale_grouped_gemm_plan_count,
+    _cudnn_moe_grouped_gemm_plan_count,
     _run_cudnn_moe_block_scale_grouped_gemm_fp4,
     _run_cudnn_moe_block_scale_grouped_gemm_mxfp8,
     _run_cudnn_moe_grouped_gemm,
@@ -18,6 +20,8 @@ from .core import (
 __all__ = [
     "_CUDNN_MOE_MIN_VERSION",
     "_check_cudnn_version",
+    "_cudnn_moe_block_scale_grouped_gemm_plan_count",
+    "_cudnn_moe_grouped_gemm_plan_count",
     "_run_cudnn_moe_block_scale_grouped_gemm_fp4",
     "_run_cudnn_moe_block_scale_grouped_gemm_mxfp8",
     "_run_cudnn_moe_grouped_gemm",
