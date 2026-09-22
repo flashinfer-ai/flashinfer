@@ -94,7 +94,7 @@ def test_wrap_never_caches_large_tensors(fake_nccl_ep, bypass_build_checks):
     assert key not in handle._hot
 
 
-def test_wrap_bounds_cache_size_by_clearing(fake_nccl_ep, bypass_build_checks):
+def test_wrap_bounds_cache_size_by_evicting_wrappers(fake_nccl_ep, bypass_build_checks):
     import torch
 
     handle = _make_handle(_make_fleet(fake_nccl_ep))
@@ -105,6 +105,41 @@ def test_wrap_bounds_cache_size_by_clearing(fake_nccl_ep, bypass_build_checks):
     # The bound is enforced by clearing, so the cache never grows unbounded
     # (a small overshoot past MAX_ENTRIES before the clear triggers is fine).
     assert len(handle._hot) <= handle._WRAP_MEMO_MAX_ENTRIES + 2
+
+
+@pytest.mark.parametrize("algo_name", ["LOW_LATENCY", "HIGH_THROUGHPUT"])
+def test_wrap_eviction_preserves_transport_buffers_and_configs(
+    fake_nccl_ep, bypass_build_checks, algo_name
+):
+    """Memo churn must not replace allocations an existing graph references."""
+    import weakref
+
+    import torch
+
+    from flashinfer.moe_ep.config import CombineInputParams, EpAlgorithm
+
+    fleet = _make_fleet(fake_nccl_ep, algorithm=EpAlgorithm[algo_name])
+    handle = _make_handle(fleet)
+    x = torch.zeros(16, 2048, dtype=torch.bfloat16)
+    first = _dispatch(handle, x)
+    handle.combine(CombineInputParams(x=[first.expert_tensors]))
+    dispatch_outputs = handle._dispatch_outputs
+    named_entries = {
+        key: value
+        for key, value in fleet._hot_cache.items()
+        if isinstance(key, str) or isinstance(key[0], str)
+    }
+    ephemeral = weakref.ref(handle._wrap(torch.zeros(1)))
+
+    for _ in range(handle._WRAP_MEMO_MAX_ENTRIES + 1):
+        handle._wrap(torch.zeros(1))
+
+    assert ephemeral() is None, "eviction must release old wrapper allocations"
+    for key, value in named_entries.items():
+        assert fleet._hot_cache.get(key) is value, f"eviction replaced {key!r}"
+    second = _dispatch(handle, x)
+    assert second.expert_tensors.data_ptr() == first.expert_tensors.data_ptr()
+    assert handle._dispatch_outputs is dispatch_outputs
 
 
 # ----------------------------------------------------- LL dispatch hot cache

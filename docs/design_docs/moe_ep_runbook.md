@@ -830,6 +830,9 @@ a fresh eager output there retained it until a cache flush, causing bounded
 memory retention and allocation churn, rather than unbounded growth. Eager
 combine outputs bypass that memo; graph-state outputs may be cached because
 their addresses are reused.
+Wrapper eviction preserves the fleet's receive buffers, counters, and configs.
+Those allocations must retain their addresses when eager forwards interleave
+with replay of an existing graph.
 
 The smoke harness includes the layer graph tests for both available backends,
 the W4A16 graph tests on Blackwell, and the NCCL handle graph and output-memo

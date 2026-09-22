@@ -91,10 +91,9 @@ class NcclEpHandle(Handle):
         # long-lived Fleet makes the recv buffers, counter tensors and FFI
         # descriptor objects reusable across forwards. Tensor wrappers are
         # memoized by (data_ptr, dtype, shape), so an entry can only ever
-        # describe the same memory layout it was built for; the dict is cleared
-        # when it grows past a bound (entries are then rebuilt, which is always
-        # safe — each handle only needs address stability within its own
-        # lifetime).
+        # describe the same memory layout it was built for. Only those wrappers
+        # are evicted at the size bound: workspace buffers must stay alive at
+        # their existing addresses for graphs captured against this fleet.
         self._hot = fleet._hot_cache
         self._handle_knobs = _index_knobs(algo_knobs)
         self._stream = self._knob_stream()
@@ -250,7 +249,16 @@ class NcclEpHandle(Handle):
         w = hot.get(key)
         if w is None:
             if len(hot) > self._WRAP_MEMO_MAX_ENTRIES:
-                hot.clear()
+                # Named entries own recv buffers, counters and configs. A
+                # captured graph may still reference their allocations after
+                # later eager calls fill the wrapper memo, so preserve them.
+                for cached_key in list(hot):
+                    if (
+                        isinstance(cached_key, tuple)
+                        and len(cached_key) == 3
+                        and isinstance(cached_key[0], int)
+                    ):
+                        del hot[cached_key]
             w = self._ep.Tensor(t)
             hot[key] = w
         return w

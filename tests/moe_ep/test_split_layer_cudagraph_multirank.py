@@ -207,6 +207,21 @@ def test_split_layer_forward_is_capturable(backend, algo_name):
     replay_newx = captured.clone()
     dist.barrier()
 
+    if backend == "nccl_ep":
+        # Force wrapper eviction without a long workload. Receive buffers
+        # captured above must survive an eviction and another eager dispatch.
+        handle = state._handle
+        for _ in range(handle._WRAP_MEMO_MAX_ENTRIES + 1):
+            handle._wrap(torch.empty(1, dtype=torch.bfloat16, device="cuda"))
+    t.hidden_states.copy_(x_orig)
+    layer.forward(t, graph_state=state)
+    t.hidden_states.mul_(-3.0)
+    graph.replay()
+    torch.cuda.synchronize()
+    replay_after_eager = captured.clone()
+    dist.barrier()
+
+    del graph
     state.destroy()
     layer.destroy()
     dist.barrier()
@@ -216,6 +231,7 @@ def test_split_layer_forward_is_capturable(backend, algo_name):
     # holds for both algorithms.
     torch.testing.assert_close(replay_same, eager, atol=5e-2, rtol=5e-2)
     torch.testing.assert_close(replay_newx, eager_newx, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(replay_after_eager, eager_newx, atol=5e-2, rtol=5e-2)
     # A replay that re-ran tracks the rewritten activations; one that did not
     # would still hold the previous result. True for both algorithms, and the
     # assertion that actually distinguishes them.
