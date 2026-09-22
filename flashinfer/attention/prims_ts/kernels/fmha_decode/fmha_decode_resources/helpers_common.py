@@ -163,6 +163,8 @@ def _mma_kind_for_qk(cfg: FmhaDecodeConfig) -> prims.Tcgen05MMAKind:
     """Select the tcgen05 MMA kind of the QK GEMM from ``qk_mma_dtype``.
 
     Int8 accumulates INT32 scores; E4M3 and the 16-bit types accumulate FP32.
+    The INT8 kind exists on SM100 alone, so planning admits Int8 Q/K only on
+    that architecture (``_validate_int8_qk_device``).
     """
     if cfg.qk_mma_dtype == Int8:
         return prims.Tcgen05MMAKind.INT8

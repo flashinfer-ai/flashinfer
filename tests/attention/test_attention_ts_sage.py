@@ -1188,6 +1188,18 @@ def _run_dense_sage(
 
 
 @_REQUIRES_PRIMTS_GPU
+def test_int8_qk_plans_only_on_sm100(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Int8 Q/K need the INT8 tcgen05 MMA, which later architectures drop."""
+
+    (case,) = _cases_named(_DENSE_SAGE_CASES, "kv256_int8_k16_q1_bf16")
+    monkeypatch.setattr(
+        torch.cuda, "get_device_capability", lambda *_args, **_kwargs: (10, 3)
+    )
+    with pytest.raises(NotImplementedError, match="SM100a/B200"):
+        _plan_sage(case, torch.device("cuda", 0))
+
+
+@_REQUIRES_PRIMTS_GPU
 @pytest.mark.arch_blackwell
 @pytest.mark.parametrize("case", _DENSE_SAGE_CASES, ids=lambda case: case.name)
 @torch.no_grad()

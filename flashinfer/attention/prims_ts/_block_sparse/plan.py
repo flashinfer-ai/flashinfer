@@ -40,6 +40,24 @@ from .prepared import _BlockSparseRouteLayout
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
 
+# The tcgen05 MMA kind INT8 that Int8 Q/K score with exists on SM100 alone;
+# SM103 and later drop it, so those GPUs take the Float8E4M3FN Q/K recipe.
+_INT8_QK_COMPUTE_CAPABILITIES = ((10, 0),)
+
+
+def _validate_int8_qk_device(q_dtype: torch.dtype, device_index: int) -> None:
+    """Reject Int8 Q/K on GPUs without the INT8 tcgen05 MMA."""
+
+    if q_dtype != torch.int8:
+        return
+    capability = torch.cuda.get_device_capability(device_index)
+    if capability not in _INT8_QK_COMPUTE_CAPABILITIES:
+        raise NotImplementedError(
+            "Int8 Q/K Sage attention requires an SM100a/B200 GPU, whose tcgen05 "
+            "MMA supports INT8 operands; use the torch.float8_e4m3fn Q/K recipe "
+            f"on device cuda:{device_index} with compute capability {capability}"
+        )
+
 
 class _PlanLockOwner(Protocol):
     """Structural type required by the plan-serialization decorator."""
@@ -246,6 +264,7 @@ def _build_block_sparse_plan_state(
 
     if static.page_size is not None:
         assert sparse_format == "bsr" and not use_proxy_routes
+    _validate_int8_qk_device(static.q_dtype, device_index)
     num_rows, max_row_route_capacity = _block_sparse_route_capacity(
         static, use_proxy_routes=use_proxy_routes
     )
