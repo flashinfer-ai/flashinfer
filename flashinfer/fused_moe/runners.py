@@ -2887,6 +2887,12 @@ _CUTILE_BF16_DEFAULT_GEMM_CONFIGS = {
     120: (128, 32, 4),
     121: (128, 32, 4),
 }
+# The sorted GEMM2 input only pays off when GEMM2's K (the intermediate size) is
+# long enough for TMA tiles to beat the per-row gather and the routing batch is
+# large enough for the tuner to land on narrow-K tiles: on SM120 it won 19% at
+# K=1856 with 49k assignments, was neutral at 25k, and lost 6% at K=512.
+_CUTILE_BF16_SORTED_IO_MIN_ASSIGNMENTS = 32768
+_CUTILE_BF16_SORTED_IO_MIN_INTERMEDIATE = 1024
 _CUTILE_BF16_GEMM_CONFIGS = (
     (128, 32, 4),
     (128, 64, 1),
@@ -3242,13 +3248,20 @@ class CuTileBf16Runner(MoERunner):
                 is_gated=self.config.activation.is_gated,
                 block_sizes=self._block_sizes,
                 device=self.device,
-                **self._workspace_kwargs(),
+                **self._workspace_kwargs(capacity * self.config.routing.top_k),
             )
             self._workspace_cache[key] = workspace
         self._workspace = workspace
 
-    def _workspace_kwargs(self) -> dict[str, Any]:
-        return {}
+    def _use_sorted_io(self, num_assignments: int) -> bool:
+        return (
+            num_assignments >= _CUTILE_BF16_SORTED_IO_MIN_ASSIGNMENTS
+            and self.config.experts.intermediate_size
+            >= _CUTILE_BF16_SORTED_IO_MIN_INTERMEDIATE
+        )
+
+    def _workspace_kwargs(self, max_num_assignments: int) -> dict[str, Any]:
+        return {"sorted_io": self._use_sorted_io(max_num_assignments)}
 
     def _validate_inputs(self, act: MoEActivationPack) -> tuple[torch.Tensor, int, int]:
         self._require_built()
@@ -3523,6 +3536,7 @@ class CuTileBf16Runner(MoERunner):
             block_size=block_size,
             gemm1_config=gemm1_config,
             gemm2_config=gemm2_config,
+            sorted_io=self._use_sorted_io(inputs[2].numel()),
         )
 
     def _cache_key_extras(self) -> tuple:
@@ -3750,7 +3764,8 @@ class _CuTileFp8Runner(CuTileBf16Runner):
 
         self._kernel_module = fp8
 
-    def _workspace_kwargs(self) -> dict[str, Any]:
+    def _workspace_kwargs(self, max_num_assignments: int) -> dict[str, Any]:
+        del max_num_assignments
         return dict(
             activation_fp8=self._activation_fp8, block_scaled=self._block_scaled
         )

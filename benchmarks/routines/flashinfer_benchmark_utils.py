@@ -391,6 +391,20 @@ def is_close_stats(input, other, rtol=1e-5, atol=1e-8):
     )
 
 
+def to_float8(x, dtype=torch.float8_e4m3fn):
+    """Quantize ``x`` to FP8 with a per-tensor scale and return the inverse scale.
+
+    Matches the test_trtllm_gen_attention_decode.py approach: the scale keeps a
+    10x headroom below the FP8 max so attention inputs do not saturate.
+    """
+    finfo = torch.finfo(dtype)
+    min_val, max_val = x.aminmax()
+    amax = torch.maximum(min_val.abs(), max_val.abs()).clamp(min=1e-12)
+    scale = finfo.max / amax * 0.1
+    x_scl_sat = (x * scale).clamp(min=finfo.min, max=finfo.max)
+    return x_scl_sat.to(dtype), scale.float().reciprocal()
+
+
 def dtype_str_to_torch_dtype(dtype_str):
     if dtype_str == "bfloat16":
         return torch.bfloat16
