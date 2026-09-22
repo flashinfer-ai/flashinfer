@@ -112,6 +112,17 @@ jobs:
       - name: Validate CUDA configuration
         run: python3 ci/validate_cuda_versions.py
 
+      # Tripwire for targeted_lane_scope.py's parse of the shard scripts: empty
+      # coverage exits non-zero, so a change that breaks the parse fails here, on the
+      # PR that made it, rather than silently un-scheduling every later targeted
+      # A10G/T4 run.
+      - name: Validate bare-run coverage parse
+        run: |
+          python3 scripts/pr_checks/targeted_lane_scope.py --coverage-only \
+            --scripts scripts/task_jit_run_tests_part{1,2,3,4,5}.sh
+          python3 scripts/pr_checks/targeted_lane_scope.py --coverage-only \
+            --scripts scripts/task_jit_run_tests_part3.sh
+
       - name: Get Docker Tag
         id: get-tag
         run: |

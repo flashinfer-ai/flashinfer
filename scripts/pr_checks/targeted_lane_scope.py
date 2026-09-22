@@ -22,6 +22,13 @@ Usage::
 Prints the narrowed scope, space-separated, on one line (an empty line when no
 target is covered). Targets are paths under ``tests/``, files or directories, as
 validated by ``experimental_test_scope.py``; ``::`` selectors are not accepted.
+
+An empty *intersection* is normal (the lane is not scheduled). Empty *coverage* --
+the shard scripts parsing to zero ``pytest`` lines -- is always parser drift (a
+script switched to ``python -m pytest``, a loop over a list variable, ...) and
+would otherwise silently turn every later targeted run into "lane not scheduled",
+so it exits non-zero. ``pr-test.yml`` also runs ``--coverage-only`` on every
+setup so drift fails the PR that introduces it.
 """
 
 from __future__ import annotations
@@ -141,6 +148,27 @@ def _selftest() -> int:
         )
         check("prefix is not containment", intersect(["tests/att"], cov), [])
 
+        drifted = Path(td) / "drifted.sh"
+        drifted.write_text("#!/bin/bash\npython -m pytest tests/attention/test_a.py\n")
+        argv = sys.argv
+        try:
+            sys.argv = [
+                "x",
+                "--scripts",
+                str(drifted),
+                "--targets",
+                "tests/attention/test_a.py",
+            ]
+            try:
+                main()
+                check("empty coverage exits non-zero", "returned", "SystemExit")
+            except SystemExit as exc:
+                check("empty coverage exit is an error", bool(exc.code), True)
+            sys.argv = ["x", "--scripts", str(part), "--targets", "tests/kda/test_x.py"]
+            check("empty intersection exits zero", main(), 0)
+        finally:
+            sys.argv = argv
+
     for failure in failures:
         print(failure)
     print("selftest: FAILED" if failures else "selftest: all cases pass")
@@ -179,6 +207,11 @@ def main() -> int:
         )
         return 2
     covered = coverage(args.scripts)
+    if not covered:
+        names = ", ".join(map(str, args.scripts))
+        sys.exit(
+            f"targeted_lane_scope: no pytest targets parsed from {names} -- parser drift?"
+        )
     result = covered if args.coverage_only else intersect(args.targets.split(), covered)
     print(" ".join(result))
     return 0
