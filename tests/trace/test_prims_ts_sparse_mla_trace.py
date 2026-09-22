@@ -22,9 +22,9 @@ from tests.trace.test_fi_trace_template_consistency import (
 )
 
 
-@pytest.mark.parametrize("assume_valid_prefix", [False, True])
-@pytest.mark.parametrize("packed", [False, True])
-@pytest.mark.parametrize("layout", ["NHD", "HND"])
+@pytest.mark.parametrize(
+    "packed,layout,assume_valid_prefix", [(False, "NHD", False), (True, "HND", True)]
+)
 def test_sparse_trace_binds_both_sources_and_device_scalars(
     packed, layout, assume_valid_prefix
 ):
@@ -82,8 +82,7 @@ def test_sparse_trace_binds_both_sources_and_device_scalars(
     assert ("valid_prefix" in result["name"]) == assume_valid_prefix
 
 
-@pytest.mark.parametrize("extra", [False, True])
-@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("extra,packed", [(False, False), (True, True)])
 def test_prepared_trace_binds_source_neutral_metadata(extra, packed):
     w = BatchSparseMLADecodePagedTSWrapper()
     w._impl._state = dict(

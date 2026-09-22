@@ -16,7 +16,6 @@ of one query token. The reference never infers causality from physical indices.
 These helpers are for validation/fixture preparation, outside timed regions.
 """
 
-import hashlib
 import math
 
 import torch
@@ -39,6 +38,7 @@ def sparse_mla_reference(
     sinks: torch.Tensor | None = None,
     reference_dtype: torch.dtype = torch.float64,
     return_fp8_error_bound: bool = False,
+    chunk_rows: int = 32,
 ) -> tuple[torch.Tensor, ...]:
     """Return unrounded O and natural-log LSE, excluding sink from LSE.
 
@@ -71,7 +71,9 @@ def sparse_mla_reference(
         raise ValueError("compressed lengths require a compressed cache")
     rows = math.prod(query.shape[:-2])
     heads, dim = query.shape[-2:]
-    q = query.reshape(rows, heads, dim).to(reference_dtype) * q_scale
+    if chunk_rows < 1:
+        raise ValueError("chunk_rows must be positive")
+    q = query.reshape(rows, heads, dim)
     out = torch.zeros((rows, heads, 512), device=query.device, dtype=reference_dtype)
     lse = torch.full(
         (rows, heads), -torch.inf, device=query.device, dtype=reference_dtype
@@ -114,69 +116,60 @@ def sparse_mla_reference(
                 raise ValueError("source length exceeds index capacity")
         sources.append((cache, idx, lens, descale))
 
-    # Bound temporary memory by one query's selected KV, rather than the full
-    # batch times top-k. This also gives FP64 a straightforward independent oracle.
-    for row in range(rows):
-        values = []
+    # Batch independent query rows while bounding selected-KV temporary storage.
+    # Invalid slots are zeroed before matmul, including poisoned page padding.
+    for start in range(0, rows, chunk_rows):
+        end = min(rows, start + chunk_rows)
+        values, masks = [], []
         for cache, indices, lengths, descale in sources:
-            idx = indices[row, : int(lengths[row])].to(torch.int64)
-            if ((idx < -1) | (idx >= cache.shape[0] * cache.shape[1])).any():
+            idx = indices[start:end].to(torch.int64)
+            active = (
+                torch.arange(idx.shape[-1], device=query.device)[None, :]
+                < lengths[start:end, None]
+            )
+            if (active & ((idx < -1) | (idx >= cache.shape[0] * cache.shape[1]))).any():
                 raise ValueError("active index is outside its source pool")
-            idx = idx[idx != -1]
-            # Advanced indexing respects padded page strides and preserves
-            # duplicates. No physical row is accessed for an empty selection.
-            values.append(
-                cache[idx // cache.shape[1], idx % cache.shape[1]].to(reference_dtype)
+            valid = active & (idx >= 0)
+            safe = idx.masked_fill(~valid, 0)
+            selected = (
+                cache[safe // cache.shape[1], safe % cache.shape[1]].to(reference_dtype)
                 * descale
             )
-        kv = torch.cat(values, dim=0)
-        if kv.shape[0] == 0:
-            continue
-        logits = (q[row] @ kv.T) * softmax_scale
+            selected.masked_fill_(~valid[..., None], 0)
+            values.append(selected)
+            masks.append(valid)
+        kv, valid = torch.cat(values, dim=1), torch.cat(masks, dim=1)
+        empty = ~valid.any(-1)
+        logits = (
+            torch.bmm(q[start:end].to(reference_dtype) * q_scale, kv.transpose(1, 2))
+            * softmax_scale
+        )
+        logits.masked_fill_(~valid[:, None, :], -torch.inf)
         row_lse = logits.logsumexp(-1)
-        normalizer = row_lse if sinks is None else torch.logaddexp(row_lse, sinks)
-        weights = (logits - normalizer[:, None]).exp()
-        out[row] = (weights @ kv[:, :512]) * output_scale
-        lse[row] = row_lse
+        normalizer = (
+            row_lse if sinks is None else torch.logaddexp(row_lse, sinks[None, :])
+        )
+        normalizer = normalizer.masked_fill(empty[:, None], 0)
+        weights = (logits - normalizer[..., None]).exp()
+        out[start:end] = torch.bmm(weights, kv[..., :512]) * output_scale
+        lse[start:end] = row_lse
         if error_bound is not None:
-            absolute_v = kv[:, :512].abs()
-            # RN E4M3 has normal relative error <= 2^-4. Its smallest
-            # subnormal is 2^-9; P is scaled by 448 before rounding.
-            # Every local online-softmax maximum is <= the global maximum,
-            # so the underflow term below bounds all independently scaled tiles.
-            sensitivity = weights @ absolute_v
-            underflow = (logits.amax(-1) - normalizer).exp()[:, None] * absolute_v.sum(
-                0
-            )
-            error_bound[row] = (
+            # RN E4M3: relative error <= 2^-4, minimum subnormal 2^-9.
+            # P uses scale 448; include three BF16 partial/output roundings.
+            absolute_v = kv[..., :512].abs()
+            sensitivity = torch.bmm(weights, absolute_v)
+            underflow = (logits.amax(-1) - normalizer).exp()[
+                ..., None
+            ] * absolute_v.sum(1)[:, None, :]
+            error_bound[start:end] = (
                 output_scale
                 * (
                     (2**-4 + 3 * 2**-8 + 1e-5) * sensitivity
                     + (2**-10 / 448) * underflow
                 )
                 + 1e-6
-            )
+            ).masked_fill(empty[:, None, None], 0)
     result = (out.reshape(*query.shape[:-1], 512), lse.reshape(*query.shape[:-1]))
     if error_bound is not None:
         return (*result, error_bound.reshape(*query.shape[:-1], 512))
     return result
-
-
-def sparse_mla_input_fingerprint(**inputs) -> str:
-    """Hash actual fixture bytes and layout; synchronizes, so never time this.
-
-    Use this on the same canonical fixture before and after all backend runs.
-    Lossless backend-specific layout adapters need a separate decoded-value check.
-    """
-    digest = hashlib.sha256()
-    for name, value in sorted(inputs.items()):
-        digest.update(name.encode())
-        if isinstance(value, torch.Tensor):
-            digest.update(
-                str((value.dtype, tuple(value.shape), value.stride())).encode()
-            )
-            data = value.detach().contiguous().reshape(-1).view(torch.uint8).cpu()
-            digest.update(data.numpy().tobytes())
-        else:
-            digest.update(repr(value).encode())
-    return digest.hexdigest()

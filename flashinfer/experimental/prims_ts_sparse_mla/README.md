@@ -113,35 +113,32 @@ two K and two V stages, reducing spills and shared-memory pressure.
 ## Validation and reproduction
 
 ```bash
-pytest tests/experimental/prims_ts_sparse_mla/ tests/attention/test_attention_ts_mla_d512.py tests/attention/test_prims_ts_schedule_verification.py tests/trace/test_prims_ts_sparse_mla_trace.py
+pytest tests/experimental/prims_ts_sparse_mla/ tests/attention/test_prims_ts_schedule_verification.py tests/trace/test_prims_ts_sparse_mla_trace.py
 python tests/trace/sparse_mla_example.py
-python benchmarks/bench_attention_ts_sparse_mla_models.py --output /tmp/sparse-mla-results --replays 12
+python benchmarks/bench_attention_ts_sparse_mla.py --indices 38,39,449,479 --output /tmp/sparse-mla.json
 ```
 
 The model suite contains 480 configurations: BF16/FP8, H=8/16/32/64/128,
 top-k=512/1024/2048, raw context 32768; prefill B=1/SQ=8192 and decode
 B=1/4/16/64/256, SQ=1/4/8. Top-k uses FlashMLA-test-style random scores,
 masked to valid lengths, followed by sorted top-k and random physical pages.
-Both backends receive the same Q/KV/indices; fingerprints detect mutation.
+Both backends receive the same Q/KV/indices and are checked against one oracle.
 The FP64 oracle includes sinks and scales. FP8 uses a probability-quantization
 and BF16-output-rounding bound; comparator failures remain invalid comparisons.
 
 Timing uses CUDA Graphs and a 4xL2 eviction before every measured invocation.
 Metadata preparation and eviction time are excluded for both backends;
 attention reductions, finishing and counter resets remain timed. Backend order
-alternates between replays. `--include-preparation` explicitly measures external
-preparation plus attention; `--no-swa` exercises a single source. The TRT DSV4
-ABI requires an invalid 128-entry first segment for that comparison.
+alternates between replays. Omit `--indices` to run all 480 configurations;
+`--compression-ratio 128` exercises HCA and `--no-swa` uses one selected source.
+The TRT DSV4 ABI requires an invalid 128-entry first segment for that comparison.
+The optional JSON report records shape, precision, environment, seed, timing
+quantiles and accuracy failures. Speedup is TRT latency divided by Prims-TS
+latency. Both backends share the same actual input tensors.
 
-Post-rebase GB300 validation (CUDA 13.0, DSL 4.7.0): 293 focused tests,
-31 cleanup rechecks, 38 upstream dense tests and 794 trace checks passed
-(one trace skip); two memcheck cases reported zero errors. Twelve dense
-pairs against upstream main produced bitwise-identical outputs, with a
-worst latency change of +0.17%. Nineteen selected model-suite cases remained
-within 5% of TRT-LLM (worst slowdown 3.76%); the full 480-case suite was not
-rerun for this cleanup. Example paired attention latencies:
-
-| Dtype | B / SQ / H / top-k | Prims-TS µs | TRT-LLM µs |
-|---|---|---|---|
-| BF16 | 64 / 8 / 32 / 2048 | 249.664 | 241.984 |
-| E4M3 | 256 / 8 / 128 / 2048 | 531.424 | 526.912 |
+The focused tests cover automatic dispatch across small/large grids, packed
+queries, one/two sources, both native dtypes, live graph metadata/scales,
+padded pages, empty rows and caller-owned outputs/workspace. Separate checks
+cover metadata mapping/causality and the softmax score-update boundary. The
+short direct-loader regression tests late masked tiles and omitted packed
+metadata. No test locks down exact performance-policy selections.

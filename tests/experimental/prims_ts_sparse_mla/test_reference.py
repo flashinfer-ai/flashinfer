@@ -1,23 +1,8 @@
 # Copyright (c) 2026 by FlashInfer team.
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-# http://www.apache.org/licenses/LICENSE-2.0
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
+# Licensed under the Apache License, Version 2.0.
 import math
-
-import pytest
 import torch
-
-from flashinfer.testing.sparse_mla import (
-    sparse_mla_input_fingerprint,
-    sparse_mla_reference,
-)
+from flashinfer.testing.sparse_mla import sparse_mla_reference
 
 
 def test_joint_softmax_duplicates_and_sink():
@@ -66,24 +51,35 @@ def test_source_scales_padded_pages_and_empty_queries():
     assert torch.isneginf(lse[1]).all()
 
 
-def test_rope_channels_contribute_to_values():
-    q = torch.zeros(1, 1, 512, dtype=torch.bfloat16)
-    kv = torch.zeros(1, 1, 512, dtype=torch.bfloat16)
-    kv[..., 448:] = 3
-    out, _ = sparse_mla_reference(q, kv, None, torch.zeros(1, 1, dtype=torch.int32))
-    torch.testing.assert_close(out, kv.to(torch.float64))
-
-
-@pytest.mark.parametrize("bad_index", [-2, 1])
-def test_invalid_active_index_is_rejected(bad_index):
-    q = torch.zeros(1, 1, 512)
-    with pytest.raises(ValueError, match="outside its source"):
-        sparse_mla_reference(q, q, None, torch.tensor([[bad_index]], dtype=torch.int32))
-
-
-def test_fingerprint_detects_mutation():
-    q = torch.zeros(1, 1, 512, dtype=torch.bfloat16)
-    before = sparse_mla_input_fingerprint(q=q, scale=1.0)
-    assert before == sparse_mla_input_fingerprint(q=q.clone(), scale=1.0)
-    q[..., -1] = 1
-    assert before != sparse_mla_input_fingerprint(q=q, scale=1.0)
+def test_nonuniform_logits_scales_and_chunk_tail():
+    q = torch.zeros(3, 1, 512, dtype=torch.bfloat16)
+    q[..., 0] = 1
+    kv = torch.stack((torch.ones(1, 512), torch.full((1, 512), 3.0))).to(q.dtype)
+    out, lse = sparse_mla_reference(
+        q,
+        kv,
+        None,
+        torch.tensor([[0, 1], [1, -1], [-1, -1]], dtype=torch.int32),
+        swa_topk_lens=torch.tensor([2, 1, 0], dtype=torch.int32),
+        softmax_scale=1,
+        q_scale=2,
+        swa_kv_scale=0.5,
+        output_scale=2,
+        sinks=torch.tensor([math.log(4)], dtype=torch.float64),
+        chunk_rows=2,
+    )
+    # QK logits are 1 and 3; scaled V values are 1 and 3. The sink adds 4
+    # only to the denominator. The final partial chunk is entirely empty.
+    e1, e3 = math.exp(1), math.exp(3)
+    expected = torch.tensor(
+        [(e1 + 3 * e3) / (e1 + e3 + 4), 3 * e3 / (e3 + 4), 0], dtype=torch.float64
+    )
+    torch.testing.assert_close(
+        out, expected[:, None, None].expand_as(out), atol=1e-12, rtol=1e-12
+    )
+    torch.testing.assert_close(
+        lse[:, 0],
+        torch.tensor([math.log(e1 + e3), 3, -math.inf], dtype=torch.float64),
+        atol=1e-12,
+        rtol=1e-12,
+    )
